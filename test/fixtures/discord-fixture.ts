@@ -61,6 +61,9 @@ export class DiscordFixture implements DiscordPlatform {
 	readonly sendAttempts: DiscordFixtureSend[] = [];
 	readonly acknowledgements: DiscordFixtureAcknowledgement[] = [];
 	readonly reactions: DiscordFixtureReaction[] = [];
+	connectCount = 0;
+	disconnectCount = 0;
+
 	readonly #handlers = new Set<DiscordMessageHandler>();
 	readonly #now: () => number;
 	#sendId: (input: { channelId: string; text: string; nonce: string; ordinal: number }) => string;
@@ -79,10 +82,12 @@ export class DiscordFixture implements DiscordPlatform {
 
 	async connect(): Promise<void> {
 		this.#connected = true;
+		this.connectCount += 1;
 	}
 
 	async disconnect(): Promise<void> {
 		this.#connected = false;
+		this.disconnectCount += 1;
 	}
 
 	/** Simulates an unexpected gateway disconnect; reconnect is explicit. */

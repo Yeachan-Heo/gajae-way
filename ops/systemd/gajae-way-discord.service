@@ -1,0 +1,50 @@
+# The adapter has no durable local state: the gajae-way daemon owns checkpoints
+# and the journal. The credential source must be root-owned and mode 0600.
+[Unit]
+Description=Gajae Way Discord adapter
+
+Requires=gajae-way.service
+BindsTo=gajae-way.service
+After=network-online.target gajae-way.service
+Wants=network-online.target
+StartLimitIntervalSec=60s
+StartLimitBurst=3
+
+[Service]
+Type=simple
+User=gajae-way
+Group=gajae-way
+UMask=0077
+Environment=HOME=/var/lib/gajae-way
+Environment=WAY_STATE_DIR=/var/lib/gajae-way
+Environment=WAY_PROFILE=/etc/gajae-way/profile.toml
+# Install /etc/gajae-way/credentials/discord-token as root:root, mode 0600.
+# %d is this unit's private credentials directory, not a secret value.
+LoadCredential=discord-token:/etc/gajae-way/credentials/discord-token
+Environment=WAY_DISCORD_TOKEN_FILE=%d/discord-token
+ExecStart=/usr/local/bin/way-discord --state-dir /var/lib/gajae-way --profile /etc/gajae-way/profile.toml
+Restart=on-failure
+RestartSec=5s
+TimeoutStopSec=30s
+KillMode=mixed
+MemoryMax=512M
+TasksMax=128
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+PrivateDevices=yes
+LockPersonality=yes
+RestrictSUIDSGID=yes
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+# The adapter may connect to this UDS but owns no persistent data there.
+ReadOnlyPaths=/var/lib/gajae-way
+
+[Install]
+WantedBy=multi-user.target

@@ -1,4 +1,4 @@
-//! Minimal sd_notify STATUS support. The gateway deliberately treats an absent
+//! Minimal sd_notify support. The gateway deliberately treats an absent
 //! NOTIFY_SOCKET as ordinary non-systemd execution.
 
 use std::{env, io};
@@ -7,22 +7,29 @@ use std::{env, io};
 use std::os::unix::net::UnixDatagram;
 
 /// Sends `STATUS=<status>` to systemd when `NOTIFY_SOCKET` is present.
-///
-/// No readiness or watchdog claims are made here: P3 only needs the observable
-/// fail-closed status update before its bounded linger window.
 pub fn notify_status(status: &str) -> io::Result<()> {
+	notify(&format!("STATUS={status}"))
+}
+
+/// Marks the process ready after its UDS RPC endpoint and strict-resumed main
+/// session are both available. A status accompanies readiness for `systemctl`
+/// and journal observability.
+pub fn notify_ready(status: &str) -> io::Result<()> {
+	notify(&format!("READY=1\nSTATUS={status}"))
+}
+
+fn notify(payload: &str) -> io::Result<()> {
 	let Ok(target) = env::var("NOTIFY_SOCKET") else {
 		return Ok(());
 	};
 	if target.is_empty() {
 		return Ok(());
 	}
-	let payload = format!("STATUS={status}");
 	#[cfg(unix)]
 	{
 		let socket = UnixDatagram::unbound()?;
 		if let Some(abstract_name) = target.strip_prefix('@') {
-			return send_abstract_status(&socket, abstract_name, payload.as_bytes());
+			return send_abstract(&socket, abstract_name, payload.as_bytes());
 		}
 		socket.send_to(payload.as_bytes(), target)?;
 		return Ok(());
@@ -35,7 +42,7 @@ pub fn notify_status(status: &str) -> io::Result<()> {
 }
 
 #[cfg(target_os = "linux")]
-fn send_abstract_status(socket: &UnixDatagram, name: &str, payload: &[u8]) -> io::Result<()> {
+fn send_abstract(socket: &UnixDatagram, name: &str, payload: &[u8]) -> io::Result<()> {
 	use std::{mem, os::fd::AsRawFd};
 
 	if name.is_empty() || name.as_bytes().contains(&0) {
@@ -68,7 +75,7 @@ fn send_abstract_status(socket: &UnixDatagram, name: &str, payload: &[u8]) -> io
 }
 
 #[cfg(all(unix, not(target_os = "linux")))]
-fn send_abstract_status(_socket: &UnixDatagram, _name: &str, _payload: &[u8]) -> io::Result<()> {
+fn send_abstract(_socket: &UnixDatagram, _name: &str, _payload: &[u8]) -> io::Result<()> {
 	// systemd's abstract namespace is Linux-specific. A service manager on other
 	// Unix platforms can still use a filesystem socket.
 	Ok(())

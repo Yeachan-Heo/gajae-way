@@ -15,6 +15,8 @@ import { createMainSessionHost, type MainSessionHost } from "./main-session/host
 import { approveProfile, previewProfileApproval } from "./main-session/profile-approval";
 import { ResumeError, strictResumeMainSession } from "./main-session/resume";
 import { createPublishedSdk } from "./main-session/sdk";
+import { createE2eFileSdk } from "./main-session/e2e-sdk";
+
 import { GatewayStateError, GatewayStateStore } from "./main-session/state";
 import { ProfileRevisionTracker } from "./profile";
 
@@ -63,6 +65,11 @@ function failureReason(error: unknown): string {
 	if (error instanceof ResumeError || error instanceof GatewayStateError) return error.reason;
 	if (error instanceof Error && error.name === "ProfileValidationError") return "profile_invalid";
 	return "startup_failed";
+}
+
+function createRuntimeSdk() {
+	if (Bun.env.NODE_ENV === "test" && Bun.env.WAY_E2E_FILE_SDK === "1") return createE2eFileSdk();
+	return createPublishedSdk();
 }
 
 function healthFilePath(stateDirectory: string): string {
@@ -170,6 +177,7 @@ async function serveWay(config: WayConfig): Promise<void> {
 	const core = loadWayCore().WayCore.open(config.stateDir);
 	const closures = createClosureExecutor({ core });
 	const state = new GatewayStateStore(core);
+	const sdk = createRuntimeSdk();
 	const profiles = new ProfileRevisionTracker();
 	const profileHandler = profileBridgeHandler(state, config, profiles);
 	let mainSessionHandler: RpcBridgeHandler | undefined;
@@ -180,6 +188,11 @@ async function serveWay(config: WayConfig): Promise<void> {
 	};
 	core.startRpcServer(path.join(config.stateDir, "rpc.sock"), createRpcBridge(core, bridgeHandler));
 	core.setRpcHealth("verifying");
+	try {
+		core.sdNotifyStatus("gajae-way verifying durable state and main session");
+	} catch {
+		// A notification transport failure must not turn a healthy daemon into a failed-closed one.
+	}
 	let host: MainSessionHost | undefined;
 	let reconciler: BrokerReconciler | undefined;
 	try {
@@ -192,7 +205,7 @@ async function serveWay(config: WayConfig): Promise<void> {
 				isOwnerSurface: profile.ownerSurfaces.some(owner => owner.id === surface.id),
 			})),
 		);
-		const recovery = await recoverBootstrap({ profile, state, sdk: createPublishedSdk() });
+		const recovery = await recoverBootstrap({ profile, state, sdk });
 		if (recovery.kind === "bootstrap_required") {
 			// The durable state remains ABSENT so an explicit `way bootstrap --confirm`
 			// can proceed after this unhealthy daemon exits.
@@ -202,7 +215,7 @@ async function serveWay(config: WayConfig): Promise<void> {
 		const resumed = await strictResumeMainSession({
 			profile,
 			state,
-			sdk: createPublishedSdk(),
+			sdk,
 			onInjectionLog: entry => console.warn(`way injection ${entry.kind}: ${entry.path}`),
 		});
 		host = createMainSessionHost({
@@ -235,7 +248,13 @@ async function serveWay(config: WayConfig): Promise<void> {
 			pollMs: config.reconcilePollMs,
 		});
 		reconciler.start();
+		try {
+			core.sdNotifyReady("gajae-way running");
+		} catch {
+			// Readiness remains observable through RPC and health.json if notification delivery fails.
+		}
 		await waitForShutdown(core, host, closures, reconciler);
+
 	} catch (error) {
 		if (error instanceof FailedClosedExit) {
 			await closures.shutdown();
@@ -261,7 +280,7 @@ async function bootstrapCommand(config: WayConfig, arguments_: readonly string[]
 	const state = new GatewayStateStore(core);
 	const profiles = new ProfileRevisionTracker();
 	const profile = profiles.load(config.profilePath);
-	const sdk = createPublishedSdk();
+	const sdk = createRuntimeSdk();
 	const recovery = await recoverBootstrap({ profile, state, sdk });
 	if (recovery.kind === "failed_closed") throw new Error(`Bootstrap recovery is failed closed: ${recovery.reason}`);
 	if (recovery.kind === "committed") {

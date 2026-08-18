@@ -41,6 +41,11 @@ export declare class WayCore {
    * no-op when this process was not started with NOTIFY_SOCKET.
    */
   sdNotifyStatus(status: string): void
+  /**
+   * Sends systemd `READY=1` and STATUS after the daemon is fully usable.
+   * It is a no-op when the process was not started with NOTIFY_SOCKET.
+   */
+  sdNotifyReady(status: string): void
   gatewayMetaRead(keys: Array<string>): GatewayMetaReadOutput
   /**
    * Applies a compare-and-set metadata update and optional journal event in

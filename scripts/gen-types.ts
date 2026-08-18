@@ -10,6 +10,7 @@ export const requiredGeneratedBindingSymbols = [
 	"WayCore",
 	"healthInfo",
 	"sdNotifyStatus",
+	"sdNotifyReady",
 	"setRpcHealth",
 	"setMainSessionStatus",
 	"setJournalDegraded",

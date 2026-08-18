@@ -1,13 +1,52 @@
-# Example only: gajae-way itself hardcodes no corpus, persona, or platform identity.
+# Example deployment profile. gajae-way hardcodes no persona, corpus, platform,
+# or credential. Replace every /srv path and identifier for the real operator.
 [corpus]
-path = "/srv/gaebal-gajae/corpus"
-workspace = "/srv/gaebal-gajae/workspace"
+path = "/srv/gajae-way/corpus"
+workspace = "/srv/gajae-way/workspace"
 
 [injection]
-# The P3 loader preserves this identity-sensitive order.
+# Ordered and digest-bound: SOUL -> USER -> daily(today + prior days) -> MEMORY.
 files = ["SOUL.md", "USER.md", "daily/{date}.md", "MEMORY.md"]
+
+[security.restricted_files]
+# These paths are relative to corpus.path. Keep private memory out of all
+# non-owner construction paths.
+main = []
+conversation = ["MEMORY.md"]
+lane = ["MEMORY.md"]
+job = ["MEMORY.md"]
+unknown = ["MEMORY.md"]
 
 [surfaces.owner]
 id = "discord:owner-dm"
 platform = "discord"
 kind = "dm"
+
+[operator]
+# Any fields here are canonicalized into the digest-bound operator identity.
+id = "gaebal-gajae-operator"
+display_name = "Gaebal Gajae operator"
+
+# Everything below is mutable tuning, excluded from the resume identity digest.
+[tunables]
+log_level = "info"
+
+[poll]
+interval_ms = 15000
+
+[ack]
+budget_ms = 2000
+
+[policy]
+# v1 records these generic policy tunables but does not activate v2 scheduling.
+engagement_enabled = false
+
+[adapter.discord]
+# In systemd, LoadCredential supplies WAY_DISCORD_TOKEN_FILE and takes
+# precedence. This env-name fallback is convenient for local development only.
+token_env = "WAY_DISCORD_BOT_TOKEN"
+channel_id = "123456789012345678"
+surface_id = "discord:owner-dm"
+ack_budget_ms = 2000
+claim_ttl_ms = 5000
+read_wait_ms = 1000

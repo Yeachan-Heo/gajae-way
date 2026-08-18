@@ -1,16 +1,63 @@
 # Profile digest approval
 
-Identity/security profile changes (corpus path/workspace, injection order,
-restricted-file policy, owner surfaces, or operator identity) intentionally
-fail strict resume with `profile_drift` until an operator records approval:
+## When approval is required
 
-```text
-way profile approve --confirm --state-dir /var/lib/gajae-way --profile /etc/gajae-way/profile.toml
-```
+Strict resume binds a versioned SHA-256 projection of identity/security fields.
+Changing any of the following intentionally produces `profile_drift` until an
+operator approves it:
 
-The command emits the secret-free projection diff and writes the new digest,
-projection, approval receipt, and `profile_approved` journal event atomically.
-It opens durable state directly while the daemon is down. During the bounded
-failed-closed linger window it uses the owner-authenticated UDS RPC instead.
-Poll intervals, acknowledgement budgets, policy tuning, and adapter credential
-rotation remain outside this digest and do not require approval.
+- `[corpus] path` or `workspace`;
+- ordered `[injection] files`;
+- `[security.restricted_files]` (or the supported top-level equivalent);
+- `[surfaces.owner]`, `[owner_surfaces]`, or `[owner_surface]`; and
+- `[operator]` or `[identity]` values.
+
+Do not approve an unexpected change. Treat it as possible profile or corpus
+configuration tampering, restore the intended file, and investigate before
+continuing.
+
+## Approved change procedure
+
+1. Preserve the old profile in the deployment/change record and review the
+   exact planned identity/security change. Keep secrets out of both versions.
+2. Stop the adapter so it cannot make new external effects while the profile is
+   being changed. For a routine planned change, stop the daemon too:
+
+   ```sh
+   sudo systemctl stop gajae-way-discord.service gajae-way.service
+   ```
+
+3. Install the reviewed profile as `/etc/gajae-way/profile.toml`, retaining
+   `root:gajae-way` ownership and mode `0640`.
+4. Run the exact explicit approval command as the daemon identity:
+
+   ```sh
+   sudo -u gajae-way -H /usr/local/bin/way profile approve --confirm \
+     --state-dir /var/lib/gajae-way --profile /etc/gajae-way/profile.toml
+   ```
+
+   The command first prints a secret-free projection diff. It then writes the
+   next digest, projection, approval timestamp, receipt ID, and
+   `profile_approved` journal event atomically. Store the emitted `receipt_id`
+   and event cursor with the change record.
+5. Start the gateway, check `way.health` and `way.status`, then start the
+   adapter:
+
+   ```sh
+   sudo systemctl start gajae-way.service
+   sudo systemctl start gajae-way-discord.service
+   ```
+
+During the bounded failed-closed linger window, the same command detects the
+running UDS and sends its owner-authenticated `profile.approve` RPC instead of
+opening SQLite directly. Run it as `gajae-way`; after the approval it is normal
+for the old failed-closed process to exit 78, and the systemd unit will not loop
+on that exit code.
+
+## Mutable tunables
+
+`[tunables]`, `[poll]`, `[ack]`, `[adapter]`/`[adapters]`, and `[policy]` are
+excluded from the digest. Credential rotation and polling/acknowledgement
+values therefore do not need profile approval. They are not an exemption from
+change review or the single-writer rule. In v1 there is no profile file watcher:
+restart the affected daemon or adapter to load a mutable configuration change.

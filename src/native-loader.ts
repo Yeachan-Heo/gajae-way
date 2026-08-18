@@ -43,6 +43,7 @@ export interface WayCoreHandle {
 	setMainSessionStatus(turnState: "idle" | "busy", followUpQueueDepth: number): void;
 	setJournalDegraded(degraded: boolean): void;
 	sdNotifyStatus(status: string): void;
+	sdNotifyReady(status: string): void;
 	lockAcquire(input: {
 		label: string;
 		class?: "interactive" | "batch";
