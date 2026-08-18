@@ -21,6 +21,7 @@ use crate::{
 		AcquireRequest, AcquireResult, HolderKind, Lease, LeaseHolder, LockClass, LockError, LockManager, LockStatus,
 		ReleaseResult, IN_DAEMON_EXECUTOR_CONN_ID,
 	},
+	registry::{self, RegistryAnnotation, RegistryError, RegistryListFilter},
 	store::{unix_epoch_ms, Store, StoreError},
 };
 
@@ -522,6 +523,10 @@ impl RpcDispatcher {
 			"gitlock.clear_quarantine" => {
 				self.idempotent(&method, &params, || self.lock_clear_quarantine(params.clone())).await
 			}
+			"registry.list" => self.registry_list(params).await,
+			"registry.get" => self.registry_get(params).await,
+			"registry.annotate" => self.idempotent(&method, &params, || self.registry_annotate(params.clone())).await,
+			"surface.resolve" => self.surface_resolve(params).await,
 			"main.events.read" => self.main_events_read(params, cancellation).await,
 			"consumer.claim" => self.consumer_claim(params).await,
 			"consumer.commit" => self.consumer_commit(params).await,
@@ -563,13 +568,25 @@ impl RpcDispatcher {
 		let locks = self.locks.clone();
 		let journal = self.journal.clone();
 		let store = self.store.clone();
-		let (lock_status, head_cursor, write_mode, profile_digest, profile_version) = tokio::task::spawn_blocking(move || {
+		let (lock_status, head_cursor, write_mode, profile_digest, profile_version, reconcile_last_ok_at, reconcile_cycle_ms, reconcile_drift_count) = tokio::task::spawn_blocking(move || {
 			let lock_status = locks.status();
 			let head_cursor = journal.head_cursor();
 			let write_mode = store.get_meta("write_mode");
 			let profile_digest = store.get_meta("profile_digest");
 			let profile_version = store.get_meta("profile_digest_version");
-			(lock_status, head_cursor, write_mode, profile_digest, profile_version)
+			let reconcile_last_ok_at = store.get_meta("reconcile_last_ok_at");
+			let reconcile_cycle_ms = store.get_meta("reconcile_cycle_ms");
+			let reconcile_drift_count = store.get_meta("reconcile_drift_count");
+			(
+				lock_status,
+				head_cursor,
+				write_mode,
+				profile_digest,
+				profile_version,
+				reconcile_last_ok_at,
+				reconcile_cycle_ms,
+				reconcile_drift_count,
+			)
 		})
 		.await
 		.map_err(|error| RpcError::internal(format!("status worker failed: {error}")))?;
@@ -578,6 +595,9 @@ impl RpcDispatcher {
 		let write_mode = write_mode.map_err(store_error)?;
 		let profile_digest = profile_digest.map_err(store_error)?;
 		let profile_version = profile_version.map_err(store_error)?;
+		let reconcile_last_ok_at = reconcile_last_ok_at.map_err(store_error)?;
+		let reconcile_cycle_ms = reconcile_cycle_ms.map_err(store_error)?;
+		let reconcile_drift_count = reconcile_drift_count.map_err(store_error)?;
 		let queue_len = lock_status.queue.len();
 		let mut response = health.as_object().cloned().expect("health response is an object");
 		response.insert("turn_state".to_owned(), json!(main_session.turn_state));
@@ -590,7 +610,14 @@ impl RpcDispatcher {
 			json!({ "head_cursor": head_cursor.to_string(), "degraded": main_session.journal_degraded }),
 		);
 		response.insert("consumers".to_owned(), json!([]));
-		response.insert("reconcile".to_owned(), json!({ "last_ok_at": Value::Null, "cycle_ms": Value::Null, "drift_count": 0 }));
+		response.insert(
+			"reconcile".to_owned(),
+			json!({
+				"last_ok_at": reconcile_last_ok_at.and_then(|value| value.parse::<i64>().ok()),
+				"cycle_ms": reconcile_cycle_ms.and_then(|value| value.parse::<i64>().ok()),
+				"drift_count": reconcile_drift_count.and_then(|value| value.parse::<u64>().ok()).unwrap_or(0),
+			}),
+		);
 		response.insert("write_mode".to_owned(), json!(write_mode.as_deref() == Some("on")));
 		response.insert(
 			"profile".to_owned(),
@@ -777,6 +804,72 @@ impl RpcDispatcher {
 			.map_err(lock_error)?;
 		Ok(lock_status_json(status))
 	}
+
+	async fn registry_list(&self, params: Value) -> Result<Value, RpcError> {
+		let request = parse_registry_list_request(&params)?;
+		let store = self.store.clone();
+		let listed = tokio::task::spawn_blocking(move || registry::list(&store, request))
+			.await
+			.map_err(|error| RpcError::internal(format!("registry list worker failed: {error}")))?
+			.map_err(registry_error)?;
+		Ok(json!({
+			"rows": listed.rows.into_iter().map(registry_row_json).collect::<Vec<_>>(),
+			"total": listed.total,
+		}))
+	}
+
+	async fn registry_get(&self, params: Value) -> Result<Value, RpcError> {
+		let object = params_object(&params)?;
+		ensure_allowed_keys(object, &["session_id"])?;
+		let session_id = required_string(object, "session_id")?.to_owned();
+		let store = self.store.clone();
+		let row = tokio::task::spawn_blocking(move || registry::get(&store, &session_id))
+			.await
+			.map_err(|error| RpcError::internal(format!("registry get worker failed: {error}")))?
+			.map_err(registry_error)?;
+		Ok(json!({ "row": registry_row_json(row) }))
+	}
+
+	async fn registry_annotate(&self, params: Value) -> Result<Value, RpcError> {
+		let object = params_object(&params)?;
+		ensure_allowed_keys(object, &["session_id", "purpose", "brief", "idempotency_key"])?;
+		let session_id = required_string(object, "session_id")?.to_owned();
+		let purpose = optional_string(object, "purpose")?;
+		let brief = optional_string(object, "brief")?;
+		if purpose.is_none() && brief.is_none() {
+			return Err(RpcError::invalid_params("registry.annotate requires purpose or brief"));
+		}
+		let store = self.store.clone();
+		let row = tokio::task::spawn_blocking(move || {
+			registry::annotate(&store, RegistryAnnotation { session_id, purpose, brief, observed_at: unix_epoch_ms() })
+		})
+		.await
+		.map_err(|error| RpcError::internal(format!("registry annotate worker failed: {error}")))?
+		.map_err(registry_error)?;
+		Ok(json!({ "row": registry_row_json(row) }))
+	}
+
+	async fn surface_resolve(&self, params: Value) -> Result<Value, RpcError> {
+		let object = params_object(&params)?;
+		ensure_allowed_keys(object, &["surface_id"])?;
+		let surface_id = required_string(object, "surface_id")?.to_owned();
+		let store = self.store.clone();
+		let resolved = tokio::task::spawn_blocking(move || registry::resolve_surface(&store, &surface_id))
+			.await
+			.map_err(|error| RpcError::internal(format!("surface resolve worker failed: {error}")))?
+			.map_err(registry_error)?;
+		Ok(json!({
+			"surface": {
+				"surface_id": resolved.surface.surface_id,
+				"platform": resolved.surface.platform,
+				"kind": resolved.surface.kind,
+				"is_owner_surface": resolved.surface.is_owner_surface,
+			},
+			"session_id": resolved.session_id,
+			"policy": { "owner": resolved.surface.is_owner_surface },
+			"quarantined": resolved.quarantined,
+		}))
+	}
 }
 
 struct MainEventsReadRequest {
@@ -880,6 +973,23 @@ fn parse_consumer_commit_request(params: &Value) -> Result<ConsumerCommitRequest
 	})
 }
 
+fn parse_registry_list_request(params: &Value) -> Result<RegistryListFilter, RpcError> {
+	let object = params_object(params)?;
+	ensure_allowed_keys(object, &["kind", "status", "surface_id", "limit", "offset"])?;
+	let limit = optional_u64(object, "limit")?.unwrap_or(u64::from(registry::DEFAULT_LIST_LIMIT));
+	let limit = u32::try_from(limit).map_err(|_| RpcError::invalid_params("limit must be in 1..=500"))?;
+	if !(1..=registry::MAX_LIST_LIMIT).contains(&limit) {
+		return Err(RpcError::invalid_params("limit must be in 1..=500"));
+	}
+	Ok(RegistryListFilter {
+		kind: optional_string(object, "kind")?,
+		status: optional_string(object, "status")?,
+		surface_id: optional_string(object, "surface_id")?,
+		limit,
+		offset: optional_u64(object, "offset")?.unwrap_or(0),
+	})
+}
+
 fn journal_read_json(read: JournalRead) -> Value {
 	let events = read
 		.events
@@ -918,6 +1028,45 @@ fn consumer_claim_json(claim: ConsumerClaim) -> Value {
 	})
 }
 
+
+fn registry_row_json(row: registry::RegistryRow) -> Value {
+	let locator = row
+		.locator
+		.as_deref()
+		.and_then(|value| serde_json::from_str::<Value>(value).ok())
+		.unwrap_or(Value::Null);
+	json!({
+		"session_id": row.session_id,
+		"kind": row.kind,
+		"purpose": row.purpose,
+		"brief": row.brief,
+		"status": row.status,
+		"surface_id": row.surface_id,
+		"locator": locator,
+		"endpoint_generation": row.endpoint_generation,
+		"host_incarnation": row.host_incarnation,
+		"identity_provenance": row.identity_provenance,
+		"index_seq": row.index_seq,
+		"live": row.live,
+		"deleted": row.deleted,
+		"terminal_uncertain": row.terminal_uncertain,
+		"ambiguous": row.ambiguous,
+		"activity_state": row.activity_state,
+		"activity_at": row.activity_at,
+		"last_heartbeat_at": row.last_heartbeat_at,
+		"meta_name": row.meta_name,
+		"meta_cwd": row.meta_cwd,
+		"meta_kind": row.meta_kind,
+		"metadata_state": row.metadata_state,
+		"metadata_at": row.metadata_at,
+		"source": row.source,
+		"created_at": row.created_at,
+		"last_seen_at": row.last_seen_at,
+		"closed_at": row.closed_at,
+		"registry_rev": row.registry_rev,
+		"quarantined": row.quarantined,
+	})
+}
 fn journal_error(error: JournalError) -> RpcError {
 	match error {
 		JournalError::CursorBeforeRetention(gap) => RpcError::with_data(1600, "cursor_before_retention", journal_gap_json(gap)),
@@ -956,6 +1105,20 @@ fn store_error(error: StoreError) -> RpcError {
 	match error {
 		StoreError::IdempotencyConflict => RpcError::app(1500, None),
 		error => RpcError::internal(format!("store failure: {error}")),
+	}
+}
+
+fn registry_error(error: RegistryError) -> RpcError {
+	if let Some(code) = error.code() {
+		return RpcError::app(i64::from(code), None);
+	}
+	match error {
+		RegistryError::InvalidInput(message) => RpcError::invalid_params(message),
+		RegistryError::Store(error) => store_error(error),
+		RegistryError::Overflow => RpcError::internal("registry numeric overflow"),
+		RegistryError::UnknownSession | RegistryError::UnknownSurface | RegistryError::SessionQuarantined => {
+			unreachable!("registry application errors have codes")
+		}
 	}
 }
 

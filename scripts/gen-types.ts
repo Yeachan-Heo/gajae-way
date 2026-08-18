@@ -17,6 +17,18 @@ export const requiredGeneratedBindingSymbols = [
 	"lockFencingValid",
 	"openWithTestHardCap",
 	"processIdentity",
+	"RegistryRowOutput",
+	"registryApplyBrokerSnapshot",
+	"registryList",
+	"registryGet",
+	"registryAnnotate",
+	"registryApplyMetadata",
+	"registryMarkMetadataUnavailable",
+	"registryConfigureSurfaces",
+	"registryBindSurface",
+	"registryRegisterGatewaySession",
+	"surfaceResolve",
+	"setReconcileStatus",
 ] as const;
 
 export function validateGeneratedBindingSource(bindings: string): void {

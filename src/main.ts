@@ -4,6 +4,8 @@ import * as net from "node:net";
 import * as os from "node:os";
 import * as path from "node:path";
 import { parseWayConfig, type WayConfig } from "./config";
+import { BrokerCli } from "./broker/cli";
+import { BrokerReconciler } from "./broker/reconcile";
 import { createMainAdmissionHandler } from "./main-session/admission";
 import { createMainGateAnswerHandler } from "./main-session/gates";
 import { createClosureExecutor, runClosureWorker, type ClosureExecutor } from "./main-session/closure";
@@ -20,7 +22,7 @@ import { loadWayCore, type WayCoreHandle } from "./native-loader";
 import { createRpcBridge, RpcBridgeException, type RpcBridgeHandler } from "./rpc-bridge";
 
 const usage = `Usage:
-  way [serve] [--state-dir PATH] [--profile PATH] [--fail-closed-linger-ms MS]
+  way [serve] [--state-dir PATH] [--profile PATH] [--fail-closed-linger-ms MS] [--broker-cli PATH] [--reconcile-poll-ms MS]
   way bootstrap --confirm [--state-dir PATH] [--profile PATH]
   way profile approve --confirm [--state-dir PATH] [--profile PATH]
   way --health | --version`;
@@ -147,12 +149,18 @@ function profileBridgeHandler(
 	};
 }
 
-async function waitForShutdown(core: WayCoreHandle, host: MainSessionHost, closures: ClosureExecutor): Promise<void> {
+async function waitForShutdown(
+	core: WayCoreHandle,
+	host: MainSessionHost,
+	closures: ClosureExecutor,
+	reconciler: BrokerReconciler,
+): Promise<void> {
 	await new Promise<void>(resolve => {
 		const stop = () => resolve();
 		process.once("SIGINT", stop);
 		process.once("SIGTERM", stop);
 	});
+	reconciler.stop();
 	await closures.shutdown();
 	await host.dispose();
 	core.shutdownRpcServer();
@@ -173,8 +181,17 @@ async function serveWay(config: WayConfig): Promise<void> {
 	core.startRpcServer(path.join(config.stateDir, "rpc.sock"), createRpcBridge(core, bridgeHandler));
 	core.setRpcHealth("verifying");
 	let host: MainSessionHost | undefined;
+	let reconciler: BrokerReconciler | undefined;
 	try {
 		const profile = profiles.load(config.profilePath);
+		core.registryConfigureSurfaces(
+			profile.knownSurfaces.map(surface => ({
+				surfaceId: surface.id,
+				platform: surface.platform,
+				kind: surface.kind,
+				isOwnerSurface: profile.ownerSurfaces.some(owner => owner.id === surface.id),
+			})),
+		);
 		const recovery = await recoverBootstrap({ profile, state, sdk: createPublishedSdk() });
 		if (recovery.kind === "bootstrap_required") {
 			// The durable state remains ABSENT so an explicit `way bootstrap --confirm`
@@ -194,7 +211,16 @@ async function serveWay(config: WayConfig): Promise<void> {
 			state,
 			journal: core,
 		});
-		const admissionHandler = createMainAdmissionHandler(host, profile, core);
+		const admissionHandler = createMainAdmissionHandler(host, profile, core, {
+			isSurfaceQuarantined: surface => {
+				try {
+					return core.surfaceResolve(surface.id).quarantined;
+				} catch {
+					// A configured routing surface without a durable resolver is unsafe to submit through.
+					return true;
+				}
+			},
+		});
 		const gateAnswerHandler = createMainGateAnswerHandler(host, core);
 		mainSessionHandler = async (method, params) => {
 			if (method === "main.submit") return await admissionHandler(params);
@@ -203,13 +229,21 @@ async function serveWay(config: WayConfig): Promise<void> {
 		};
 		core.setRpcHealth("running");
 		await writeHealthFile(config.stateDir, { status: "healthy", state: "running" });
-		await waitForShutdown(core, host, closures);
+		reconciler = new BrokerReconciler({
+			core,
+			broker: new BrokerCli({ executable: config.brokerCliPath }),
+			pollMs: config.reconcilePollMs,
+		});
+		reconciler.start();
+		await waitForShutdown(core, host, closures, reconciler);
 	} catch (error) {
 		if (error instanceof FailedClosedExit) {
 			await closures.shutdown();
+			reconciler?.stop();
 			throw error;
 		}
 		if (host) await host.dispose();
+		reconciler?.stop();
 		await closures.shutdown();
 		await enterFailedClosed(core, state, config, failureReason(error));
 	}

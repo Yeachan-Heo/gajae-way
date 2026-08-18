@@ -76,6 +76,17 @@ export declare class WayCore {
   consumerCommit(input: ConsumerCommitInput): ConsumerCommitOutput
   consumerCursor(consumerId: string): string | null
   consumerOutbox(consumerId: string): Array<OutboxRowOutput>
+  registryApplyBrokerSnapshot(input: RegistryApplyBrokerSnapshotInput): RegistrySnapshotApplyOutput
+  registryList(input?: RegistryListInput | undefined | null): RegistryListOutput
+  registryGet(sessionId: string): RegistryRowOutput
+  registryAnnotate(input: RegistryAnnotationInput): RegistryRowOutput
+  registryApplyMetadata(input: RegistryMetadataInput): RegistryRowOutput
+  registryMarkMetadataUnavailable(input: RegistryMetadataUnavailableInput): RegistryRowOutput
+  registryConfigureSurfaces(surfaces: Array<RegistrySurfaceInput>, observedAt?: number | undefined | null): void
+  registryBindSurface(surfaceId: string, sessionId: string, observedAt?: number | undefined | null): void
+  registryRegisterGatewaySession(input: RegistryGatewaySessionInput): RegistryRowOutput
+  surfaceResolve(surfaceId: string): SurfaceResolutionOutput
+  setReconcileStatus(input: ReconcileStatusInput): void
   idempotencyReplay(input: IdempotencyReplayInput): IdempotencyReplayOutput
   idempotencyStore(input: IdempotencyStoreInput): void
 }
@@ -284,6 +295,123 @@ export interface QueueEntryOutput {
   waitedMs: number
 }
 
+export interface ReconcileStatusInput {
+  lastOkAt: number
+  cycleMs: number
+  driftCount: number
+}
+
+export interface RegistryAnnotationInput {
+  sessionId: string
+  purpose?: string
+  brief?: string
+  observedAt?: number
+}
+
+export interface RegistryApplyBrokerSnapshotInput {
+  observedAt: number
+  rows: Array<RegistryBrokerRowInput>
+}
+
+export interface RegistryBrokerRowInput {
+  sessionId: string
+  /** Canonical JSON for the SDK's credential-free locator object. */
+  locator: string
+  endpointGeneration: number
+  hostIncarnation?: string
+  identityProvenance?: string
+  indexSeq: number
+  live: boolean
+  deleted: boolean
+  terminalUncertain: boolean
+  ambiguous: boolean
+  activityState?: string
+  activityAt?: number
+  lastHeartbeatAt?: number
+}
+
+export interface RegistryGatewaySessionInput {
+  sessionId: string
+  kind: string
+  purpose?: string
+  brief?: string
+  status: string
+  surfaceId?: string
+  observedAt?: number
+}
+
+export interface RegistryListInput {
+  kind?: string
+  status?: string
+  surfaceId?: string
+  limit?: number
+  offset?: number
+}
+
+export interface RegistryListOutput {
+  rows: Array<RegistryRowOutput>
+  total: number
+}
+
+export interface RegistryMetadataInput {
+  sessionId: string
+  name: string
+  cwd: string
+  kind: string
+  observedAt: number
+}
+
+export interface RegistryMetadataUnavailableInput {
+  sessionId: string
+  observedAt: number
+}
+
+export interface RegistryRowOutput {
+  sessionId: string
+  kind: string
+  purpose?: string
+  brief?: string
+  status: string
+  surfaceId?: string
+  locator?: string
+  endpointGeneration?: number
+  hostIncarnation?: string
+  identityProvenance?: string
+  indexSeq?: number
+  live: boolean
+  deleted: boolean
+  terminalUncertain: boolean
+  ambiguous: boolean
+  activityState?: string
+  activityAt?: number
+  lastHeartbeatAt?: number
+  metaName?: string
+  metaCwd?: string
+  metaKind?: string
+  metadataState: string
+  metadataAt?: number
+  source: string
+  createdAt: number
+  lastSeenAt?: number
+  closedAt?: number
+  registryRev: number
+  quarantined: boolean
+}
+
+export interface RegistrySnapshotApplyOutput {
+  newSessionIds: Array<string>
+  changedSessionIds: Array<string>
+  changedIndexSeqSessionIds: Array<string>
+  driftCount: number
+}
+
+export interface RegistrySurfaceInput {
+  surfaceId: string
+  platform: string
+  kind: string
+  isOwnerSurface: boolean
+}
+
 export interface RpcBridgeStats {
   inFlight: number
   overloads: number
@@ -291,4 +419,10 @@ export interface RpcBridgeStats {
   duplicateCompletions: number
   lateCompletions: number
   queueClosed: number
+}
+
+export interface SurfaceResolutionOutput {
+  surface: RegistrySurfaceInput
+  sessionId?: string
+  quarantined: boolean
 }

@@ -441,6 +441,9 @@ fn migrate(connection: &mut Connection) -> StoreResult<()> {
 		("journal_floor_seq", "0"),
 		("lock_fencing_token", "0"),
 		("write_mode", "on"),
+		("reconcile_last_ok_at", "null"),
+		("reconcile_cycle_ms", "null"),
+		("reconcile_drift_count", "0"),
 	];
 	for (key, value) in defaults {
 		connection.execute(
@@ -507,6 +510,45 @@ mod tests {
 				.unwrap();
 			assert_eq!(found.as_deref(), Some(table));
 		}
+		let mut statement = connection.prepare("PRAGMA table_info(sessions)").unwrap();
+		let session_columns = statement
+			.query_map([], |row| row.get::<_, String>(1))
+			.unwrap()
+			.collect::<Result<Vec<_>, _>>()
+			.unwrap();
+		for column in [
+			"session_id",
+			"kind",
+			"purpose",
+			"brief",
+			"status",
+			"surface_id",
+			"locator",
+			"endpoint_generation",
+			"host_incarnation",
+			"identity_provenance",
+			"index_seq",
+			"live",
+			"deleted",
+			"terminal_uncertain",
+			"ambiguous",
+			"activity_state",
+			"activity_at",
+			"last_heartbeat_at",
+			"meta_name",
+			"meta_cwd",
+			"meta_kind",
+			"metadata_state",
+			"metadata_at",
+			"source",
+			"created_at",
+			"last_seen_at",
+			"closed_at",
+			"registry_rev",
+		] {
+			assert!(session_columns.iter().any(|candidate| candidate == column), "sessions.{column} is missing");
+		}
+		drop(statement);
 		drop(connection);
 		fs::remove_dir_all(state_dir).unwrap();
 	}

@@ -18,6 +18,10 @@ use crate::{
 		AcquireRequest, AcquireResult, HolderKind, Lease, LeaseHolder, LockClass, LockError, LockManager, LockStatus,
 		ProcessObservation, ProcessProbe, QueueEntry, ReleaseResult, SystemProcessProbe, HARD_HOLD_CAP_MS,
 	},
+	registry::{
+		BrokerSessionRow, BrokerSnapshot, GatewaySession, MetadataEnrichment, RegistryAnnotation, RegistryListFilter,
+		SurfaceRecord,
+	},
 	store::{meta_get_tx, meta_set_tx, unix_epoch_ms, Store, StoreError},
 };
 use crate::rpc::{
@@ -314,6 +318,191 @@ pub struct GatewayMetaTransactionOutput {
 	pub cursor: Option<String>,
 }
 
+
+#[napi(object)]
+pub struct RegistryBrokerRowInput {
+	#[napi(js_name = "sessionId")]
+	pub session_id: String,
+	/// Canonical JSON for the SDK's credential-free locator object.
+	pub locator: String,
+	#[napi(js_name = "endpointGeneration")]
+	pub endpoint_generation: f64,
+	#[napi(js_name = "hostIncarnation")]
+	pub host_incarnation: Option<String>,
+	#[napi(js_name = "identityProvenance")]
+	pub identity_provenance: Option<String>,
+	#[napi(js_name = "indexSeq")]
+	pub index_seq: f64,
+	pub live: bool,
+	pub deleted: bool,
+	#[napi(js_name = "terminalUncertain")]
+	pub terminal_uncertain: bool,
+	pub ambiguous: bool,
+	#[napi(js_name = "activityState")]
+	pub activity_state: Option<String>,
+	#[napi(js_name = "activityAt")]
+	pub activity_at: Option<f64>,
+	#[napi(js_name = "lastHeartbeatAt")]
+	pub last_heartbeat_at: Option<f64>,
+}
+
+#[napi(object)]
+pub struct RegistryApplyBrokerSnapshotInput {
+	#[napi(js_name = "observedAt")]
+	pub observed_at: f64,
+	pub rows: Vec<RegistryBrokerRowInput>,
+}
+
+#[napi(object)]
+pub struct RegistrySnapshotApplyOutput {
+	#[napi(js_name = "newSessionIds")]
+	pub new_session_ids: Vec<String>,
+	#[napi(js_name = "changedSessionIds")]
+	pub changed_session_ids: Vec<String>,
+	#[napi(js_name = "changedIndexSeqSessionIds")]
+	pub changed_index_seq_session_ids: Vec<String>,
+	#[napi(js_name = "driftCount")]
+	pub drift_count: f64,
+}
+
+#[napi(object)]
+pub struct RegistryListInput {
+	pub kind: Option<String>,
+	pub status: Option<String>,
+	#[napi(js_name = "surfaceId")]
+	pub surface_id: Option<String>,
+	pub limit: Option<u32>,
+	pub offset: Option<f64>,
+}
+
+#[napi(object)]
+pub struct RegistryRowOutput {
+	#[napi(js_name = "sessionId")]
+	pub session_id: String,
+	pub kind: String,
+	pub purpose: Option<String>,
+	pub brief: Option<String>,
+	pub status: String,
+	#[napi(js_name = "surfaceId")]
+	pub surface_id: Option<String>,
+	pub locator: Option<String>,
+	#[napi(js_name = "endpointGeneration")]
+	pub endpoint_generation: Option<f64>,
+	#[napi(js_name = "hostIncarnation")]
+	pub host_incarnation: Option<String>,
+	#[napi(js_name = "identityProvenance")]
+	pub identity_provenance: Option<String>,
+	#[napi(js_name = "indexSeq")]
+	pub index_seq: Option<f64>,
+	pub live: bool,
+	pub deleted: bool,
+	#[napi(js_name = "terminalUncertain")]
+	pub terminal_uncertain: bool,
+	pub ambiguous: bool,
+	#[napi(js_name = "activityState")]
+	pub activity_state: Option<String>,
+	#[napi(js_name = "activityAt")]
+	pub activity_at: Option<f64>,
+	#[napi(js_name = "lastHeartbeatAt")]
+	pub last_heartbeat_at: Option<f64>,
+	#[napi(js_name = "metaName")]
+	pub meta_name: Option<String>,
+	#[napi(js_name = "metaCwd")]
+	pub meta_cwd: Option<String>,
+	#[napi(js_name = "metaKind")]
+	pub meta_kind: Option<String>,
+	#[napi(js_name = "metadataState")]
+	pub metadata_state: String,
+	#[napi(js_name = "metadataAt")]
+	pub metadata_at: Option<f64>,
+	pub source: String,
+	#[napi(js_name = "createdAt")]
+	pub created_at: f64,
+	#[napi(js_name = "lastSeenAt")]
+	pub last_seen_at: Option<f64>,
+	#[napi(js_name = "closedAt")]
+	pub closed_at: Option<f64>,
+	#[napi(js_name = "registryRev")]
+	pub registry_rev: f64,
+	pub quarantined: bool,
+}
+
+#[napi(object)]
+pub struct RegistryListOutput {
+	pub rows: Vec<RegistryRowOutput>,
+	pub total: f64,
+}
+
+#[napi(object)]
+pub struct RegistryAnnotationInput {
+	#[napi(js_name = "sessionId")]
+	pub session_id: String,
+	pub purpose: Option<String>,
+	pub brief: Option<String>,
+	#[napi(js_name = "observedAt")]
+	pub observed_at: Option<f64>,
+}
+
+#[napi(object)]
+pub struct RegistryMetadataInput {
+	#[napi(js_name = "sessionId")]
+	pub session_id: String,
+	pub name: String,
+	pub cwd: String,
+	pub kind: String,
+	#[napi(js_name = "observedAt")]
+	pub observed_at: f64,
+}
+
+#[napi(object)]
+pub struct RegistryMetadataUnavailableInput {
+	#[napi(js_name = "sessionId")]
+	pub session_id: String,
+	#[napi(js_name = "observedAt")]
+	pub observed_at: f64,
+}
+
+#[napi(object)]
+pub struct RegistrySurfaceInput {
+	#[napi(js_name = "surfaceId")]
+	pub surface_id: String,
+	pub platform: String,
+	pub kind: String,
+	#[napi(js_name = "isOwnerSurface")]
+	pub is_owner_surface: bool,
+}
+
+#[napi(object)]
+pub struct RegistryGatewaySessionInput {
+	#[napi(js_name = "sessionId")]
+	pub session_id: String,
+	pub kind: String,
+	pub purpose: Option<String>,
+	pub brief: Option<String>,
+	pub status: String,
+	#[napi(js_name = "surfaceId")]
+	pub surface_id: Option<String>,
+	#[napi(js_name = "observedAt")]
+	pub observed_at: Option<f64>,
+}
+
+#[napi(object)]
+pub struct SurfaceResolutionOutput {
+	pub surface: RegistrySurfaceInput,
+	#[napi(js_name = "sessionId")]
+	pub session_id: Option<String>,
+	pub quarantined: bool,
+}
+
+#[napi(object)]
+pub struct ReconcileStatusInput {
+	#[napi(js_name = "lastOkAt")]
+	pub last_ok_at: f64,
+	#[napi(js_name = "cycleMs")]
+	pub cycle_ms: f64,
+	#[napi(js_name = "driftCount")]
+	pub drift_count: f64,
+}
 #[napi(object)]
 pub struct GatewayMetaReadOutput {
 	pub entries: Vec<GatewayMetaEntry>,
@@ -646,6 +835,132 @@ impl WayCore {
 			.map_err(journal_napi_error)
 	}
 
+	#[napi(js_name = "registryApplyBrokerSnapshot")]
+	pub fn registry_apply_broker_snapshot(
+		&self,
+		input: RegistryApplyBrokerSnapshotInput,
+	) -> napi::Result<RegistrySnapshotApplyOutput> {
+		let snapshot = broker_snapshot_from_napi(input)?;
+		registry::apply_broker_snapshot(&self.store, snapshot)
+			.map(snapshot_apply_output)
+			.map_err(registry_napi_error)
+	}
+
+	#[napi(js_name = "registryList")]
+	pub fn registry_list(&self, input: Option<RegistryListInput>) -> napi::Result<RegistryListOutput> {
+		let filter = registry_list_filter_from_napi(input)?;
+		registry::list(&self.store, filter)
+			.map(|listed| RegistryListOutput {
+				rows: listed.rows.into_iter().map(registry_row_output).collect(),
+				total: listed.total as f64,
+			})
+			.map_err(registry_napi_error)
+	}
+
+	#[napi(js_name = "registryGet")]
+	pub fn registry_get(&self, session_id: String) -> napi::Result<RegistryRowOutput> {
+		registry::get(&self.store, &session_id)
+			.map(registry_row_output)
+			.map_err(registry_napi_error)
+	}
+
+	#[napi(js_name = "registryAnnotate")]
+	pub fn registry_annotate(&self, input: RegistryAnnotationInput) -> napi::Result<RegistryRowOutput> {
+		let observed_at = input.observed_at.map(napi_i64).transpose()?.unwrap_or_else(unix_epoch_ms);
+		registry::annotate(
+			&self.store,
+			RegistryAnnotation { session_id: input.session_id, purpose: input.purpose, brief: input.brief, observed_at },
+		)
+		.map(registry_row_output)
+		.map_err(registry_napi_error)
+	}
+
+	#[napi(js_name = "registryApplyMetadata")]
+	pub fn registry_apply_metadata(&self, input: RegistryMetadataInput) -> napi::Result<RegistryRowOutput> {
+		let observed_at = napi_i64(input.observed_at)?;
+		registry::apply_metadata(
+			&self.store,
+			MetadataEnrichment { session_id: input.session_id, name: input.name, cwd: input.cwd, kind: input.kind, observed_at },
+		)
+		.map(registry_row_output)
+		.map_err(registry_napi_error)
+	}
+
+	#[napi(js_name = "registryMarkMetadataUnavailable")]
+	pub fn registry_mark_metadata_unavailable(&self, input: RegistryMetadataUnavailableInput) -> napi::Result<RegistryRowOutput> {
+		registry::mark_metadata_unavailable(&self.store, &input.session_id, napi_i64(input.observed_at)?)
+			.map(registry_row_output)
+			.map_err(registry_napi_error)
+	}
+
+	#[napi(js_name = "registryConfigureSurfaces")]
+	pub fn registry_configure_surfaces(&self, surfaces: Vec<RegistrySurfaceInput>, observed_at: Option<f64>) -> napi::Result<()> {
+		let observed_at = observed_at.map(napi_i64).transpose()?.unwrap_or_else(unix_epoch_ms);
+		let surfaces = surfaces
+			.into_iter()
+			.map(|surface| SurfaceRecord {
+				surface_id: surface.surface_id,
+				platform: surface.platform,
+				kind: surface.kind,
+				is_owner_surface: surface.is_owner_surface,
+			})
+			.collect::<Vec<_>>();
+		registry::configure_surfaces(&self.store, &surfaces, observed_at).map_err(registry_napi_error)
+	}
+
+	#[napi(js_name = "registryBindSurface")]
+	pub fn registry_bind_surface(&self, surface_id: String, session_id: String, observed_at: Option<f64>) -> napi::Result<()> {
+		let observed_at = observed_at.map(napi_i64).transpose()?.unwrap_or_else(unix_epoch_ms);
+		registry::bind_surface(&self.store, &surface_id, &session_id, observed_at).map_err(registry_napi_error)
+	}
+
+	#[napi(js_name = "registryRegisterGatewaySession")]
+	pub fn registry_register_gateway_session(&self, input: RegistryGatewaySessionInput) -> napi::Result<RegistryRowOutput> {
+		let observed_at = input.observed_at.map(napi_i64).transpose()?.unwrap_or_else(unix_epoch_ms);
+		registry::register_gateway_session(
+			&self.store,
+			GatewaySession {
+				session_id: input.session_id,
+				kind: input.kind,
+				purpose: input.purpose,
+				brief: input.brief,
+				status: input.status,
+				surface_id: input.surface_id,
+				observed_at,
+			},
+		)
+		.map(registry_row_output)
+		.map_err(registry_napi_error)
+	}
+
+	#[napi(js_name = "surfaceResolve")]
+	pub fn surface_resolve(&self, surface_id: String) -> napi::Result<SurfaceResolutionOutput> {
+		registry::resolve_surface(&self.store, &surface_id)
+			.map(|resolved| SurfaceResolutionOutput {
+				surface: RegistrySurfaceInput {
+					surface_id: resolved.surface.surface_id,
+					platform: resolved.surface.platform,
+					kind: resolved.surface.kind,
+					is_owner_surface: resolved.surface.is_owner_surface,
+				},
+				session_id: resolved.session_id,
+				quarantined: resolved.quarantined,
+			})
+			.map_err(registry_napi_error)
+	}
+
+	#[napi(js_name = "setReconcileStatus")]
+	pub fn set_reconcile_status(&self, input: ReconcileStatusInput) -> napi::Result<()> {
+		let last_ok_at = napi_i64(input.last_ok_at)?;
+		let cycle_ms = napi_i64(input.cycle_ms)?;
+		let drift_count = napi_u64(input.drift_count)?;
+		self.store.set_meta("reconcile_last_ok_at", &last_ok_at.to_string()).map_err(store_napi_error)?;
+		self.store.set_meta("reconcile_cycle_ms", &cycle_ms.to_string()).map_err(store_napi_error)?;
+		self.store
+			.set_meta("reconcile_drift_count", &drift_count.to_string())
+			.map_err(store_napi_error)
+	}
+
 	#[napi(js_name = "idempotencyReplay")]
 	pub fn idempotency_replay(&self, input: IdempotencyReplayInput) -> napi::Result<IdempotencyReplayOutput> {
 		self.store
@@ -826,6 +1141,106 @@ fn outbox_row_output(row: OutboxRow) -> OutboxRowOutput {
 		platform_msg_id: row.platform_msg_id,
 		dedupe_key: row.dedupe_key,
 	}
+}
+
+fn napi_u64(value: f64) -> napi::Result<u64> {
+	if !value.is_finite() || value < 0.0 || value.fract() != 0.0 || value > 9_007_199_254_740_991.0 {
+		return Err(napi::Error::from_reason("numeric value must be a non-negative safe integer"));
+	}
+	Ok(value as u64)
+}
+
+fn napi_i64(value: f64) -> napi::Result<i64> {
+	let value = napi_u64(value)?;
+	i64::try_from(value).map_err(|_| napi::Error::from_reason("numeric value exceeds i64"))
+}
+
+fn broker_snapshot_from_napi(input: RegistryApplyBrokerSnapshotInput) -> napi::Result<BrokerSnapshot> {
+	let observed_at = napi_i64(input.observed_at)?;
+	let rows = input
+		.rows
+		.into_iter()
+		.map(|row| {
+			Ok(BrokerSessionRow {
+				session_id: row.session_id,
+				locator: row.locator,
+				endpoint_generation: napi_u64(row.endpoint_generation)?,
+				host_incarnation: row.host_incarnation,
+				identity_provenance: row.identity_provenance,
+				index_seq: napi_u64(row.index_seq)?,
+				live: row.live,
+				deleted: row.deleted,
+				terminal_uncertain: row.terminal_uncertain,
+				ambiguous: row.ambiguous,
+				activity_state: row.activity_state,
+				activity_at: row.activity_at.map(napi_i64).transpose()?,
+				last_heartbeat_at: row.last_heartbeat_at.map(napi_i64).transpose()?,
+			})
+		})
+		.collect::<napi::Result<Vec<_>>>()?;
+	Ok(BrokerSnapshot { observed_at, rows })
+}
+
+fn registry_list_filter_from_napi(input: Option<RegistryListInput>) -> napi::Result<RegistryListFilter> {
+	let Some(input) = input else {
+		return Ok(RegistryListFilter::default());
+	};
+	let offset = input.offset.map(napi_u64).transpose()?.unwrap_or(0);
+	Ok(RegistryListFilter {
+		kind: input.kind,
+		status: input.status,
+		surface_id: input.surface_id,
+		limit: input.limit.unwrap_or(registry::DEFAULT_LIST_LIMIT),
+		offset,
+	})
+}
+
+fn snapshot_apply_output(result: registry::SnapshotApplyResult) -> RegistrySnapshotApplyOutput {
+	RegistrySnapshotApplyOutput {
+		new_session_ids: result.new_session_ids,
+		changed_session_ids: result.changed_session_ids,
+		changed_index_seq_session_ids: result.changed_index_seq_session_ids,
+		drift_count: result.drift_count as f64,
+	}
+}
+
+fn registry_row_output(row: registry::RegistryRow) -> RegistryRowOutput {
+	RegistryRowOutput {
+		session_id: row.session_id,
+		kind: row.kind,
+		purpose: row.purpose,
+		brief: row.brief,
+		status: row.status,
+		surface_id: row.surface_id,
+		locator: row.locator,
+		endpoint_generation: row.endpoint_generation.map(|value| value as f64),
+		host_incarnation: row.host_incarnation,
+		identity_provenance: row.identity_provenance,
+		index_seq: row.index_seq.map(|value| value as f64),
+		live: row.live,
+		deleted: row.deleted,
+		terminal_uncertain: row.terminal_uncertain,
+		ambiguous: row.ambiguous,
+		activity_state: row.activity_state,
+		activity_at: row.activity_at.map(|value| value as f64),
+		last_heartbeat_at: row.last_heartbeat_at.map(|value| value as f64),
+		meta_name: row.meta_name,
+		meta_cwd: row.meta_cwd,
+		meta_kind: row.meta_kind,
+		metadata_state: row.metadata_state,
+		metadata_at: row.metadata_at.map(|value| value as f64),
+		source: row.source,
+		created_at: row.created_at as f64,
+		last_seen_at: row.last_seen_at.map(|value| value as f64),
+		closed_at: row.closed_at.map(|value| value as f64),
+		registry_rev: row.registry_rev as f64,
+		quarantined: row.quarantined,
+	}
+}
+
+fn registry_napi_error(error: registry::RegistryError) -> napi::Error {
+	let prefix = error.code().map(|code| format!("{code} ")).unwrap_or_default();
+	napi::Error::from_reason(format!("{prefix}{error}"))
 }
 
 fn lock_napi_error(error: LockError) -> napi::Error {

@@ -80,6 +80,88 @@ export interface WayCoreHandle {
 	lockClearQuarantine(verificationReceiptId: string, confirm: boolean): { held: boolean; quarantined: boolean };
 	gatewayMetaRead(keys: readonly string[]): GatewayMetaReadOutput;
 	gatewayMetaTransaction(input: GatewayMetaTransactionInput): GatewayMetaTransactionOutput;
+	registryApplyBrokerSnapshot(input: {
+		observedAt: number;
+		rows: Array<{
+			sessionId: string;
+			locator: string;
+			endpointGeneration: number;
+			hostIncarnation?: string;
+			identityProvenance?: "composite" | "legacy";
+			indexSeq: number;
+			live: boolean;
+			deleted: boolean;
+			terminalUncertain: boolean;
+			ambiguous: boolean;
+			activityState?: "active" | "idle";
+			activityAt?: number;
+			lastHeartbeatAt?: number;
+		}>;
+	}): { newSessionIds: string[]; changedSessionIds: string[]; changedIndexSeqSessionIds: string[]; driftCount: number };
+	registryList(input?: { kind?: string; status?: string; surfaceId?: string; limit?: number; offset?: number }): {
+		rows: Array<{
+			sessionId: string;
+			kind: string;
+			purpose?: string;
+			brief?: string;
+			status: string;
+			surfaceId?: string;
+			locator?: string;
+			endpointGeneration?: number;
+			hostIncarnation?: string;
+			identityProvenance?: string;
+			indexSeq?: number;
+			live: boolean;
+			deleted: boolean;
+			terminalUncertain: boolean;
+			ambiguous: boolean;
+			activityState?: "active" | "idle";
+			activityAt?: number;
+			lastHeartbeatAt?: number;
+			metaName?: string;
+			metaCwd?: string;
+			metaKind?: string;
+			metadataState: "pending" | "enriched" | "unavailable";
+			metadataAt?: number;
+			source: "gateway" | "reconciler";
+			createdAt: number;
+			lastSeenAt?: number;
+			closedAt?: number;
+			registryRev: number;
+			quarantined: boolean;
+		}>;
+		total: number;
+	};
+	registryGet(sessionId: string): ReturnType<WayCoreHandle["registryList"]>["rows"][number];
+	registryAnnotate(input: { sessionId: string; purpose?: string; brief?: string; observedAt?: number }): ReturnType<WayCoreHandle["registryList"]>["rows"][number];
+	registryApplyMetadata(input: {
+		sessionId: string;
+		name: string;
+		cwd: string;
+		kind: string;
+		observedAt: number;
+	}): ReturnType<WayCoreHandle["registryList"]>["rows"][number];
+	registryMarkMetadataUnavailable(input: { sessionId: string; observedAt: number }): ReturnType<WayCoreHandle["registryList"]>["rows"][number];
+	registryConfigureSurfaces(
+		surfaces: Array<{ surfaceId: string; platform: string; kind: string; isOwnerSurface: boolean }>,
+		observedAt?: number,
+	): void;
+	registryBindSurface(surfaceId: string, sessionId: string, observedAt?: number): void;
+	registryRegisterGatewaySession(input: {
+		sessionId: string;
+		kind: "main" | "conversation" | "lane" | "job";
+		purpose?: string;
+		brief?: string;
+		status: "discovered" | "starting" | "active" | "idle" | "closing" | "closed" | "lost";
+		surfaceId?: string;
+		observedAt?: number;
+	}): ReturnType<WayCoreHandle["registryList"]>["rows"][number];
+	surfaceResolve(surfaceId: string): {
+		surface: { surfaceId: string; platform: string; kind: string; isOwnerSurface: boolean };
+		sessionId?: string;
+		quarantined: boolean;
+	};
+	setReconcileStatus(input: { lastOkAt: number; cycleMs: number; driftCount: number }): void;
 	journalAppend(kind: string, payloadJson: string): { cursor: string; seq: string };
 	journalRead(cursor?: string, limit?: number): {
 		events: Array<{ seq: string; ts: number; kind: string; payloadJson: string }>;
