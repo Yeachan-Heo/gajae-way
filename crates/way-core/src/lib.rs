@@ -413,6 +413,27 @@ impl WayCore {
 		Ok(())
 	}
 
+	/// Publishes the live main-session admission state used by `way.status`.
+	#[napi(js_name = "setMainSessionStatus")]
+	pub fn set_main_session_status(&self, turn_state: String, follow_up_queue_depth: u32) -> napi::Result<()> {
+		if !matches!(turn_state.as_str(), "idle" | "busy") {
+			return Err(napi::Error::from_reason("turnState must be idle or busy"));
+		}
+		let server = self.rpc_server.lock().map_err(|_| napi::Error::from_reason("RPC server lock was poisoned"))?;
+		let server = server.as_ref().ok_or_else(|| napi::Error::from_reason("RPC server is not running"))?;
+		server.set_main_session_status(turn_state, u64::from(follow_up_queue_depth));
+		Ok(())
+	}
+
+	/// Marks journal-derived delivery as halted after a synchronous append failure.
+	#[napi(js_name = "setJournalDegraded")]
+	pub fn set_journal_degraded(&self, degraded: bool) -> napi::Result<()> {
+		let server = self.rpc_server.lock().map_err(|_| napi::Error::from_reason("RPC server lock was poisoned"))?;
+		let server = server.as_ref().ok_or_else(|| napi::Error::from_reason("RPC server is not running"))?;
+		server.set_journal_degraded(degraded);
+		Ok(())
+	}
+
 	/// Sends a best-effort systemd STATUS notification. It is intentionally a
 	/// no-op when this process was not started with NOTIFY_SOCKET.
 	#[napi(js_name = "sdNotifyStatus")]

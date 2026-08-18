@@ -17,11 +17,36 @@ export class StrictSdkOpenError extends Error {
 	}
 }
 
+export interface HostedSdkGate {
+	readonly gateId: string;
+	readonly sessionId: string;
+	readonly expiresAt?: number;
+	readonly payload: unknown;
+}
+
+export type HostedSdkGateResolution = "resolved" | "already_resolved" | "expired" | "not_found" | "rejected";
+
+export class HostedSdkGateError extends Error {
+	readonly reason: "not_found" | "expired";
+
+	constructor(reason: "not_found" | "expired") {
+		super(reason);
+		this.name = "HostedSdkGateError";
+		this.reason = reason;
+	}
+}
+
+
 export interface HostedSdkSession {
 	readonly sessionFile: string;
 	readonly sessionId: string;
 	subscribe(listener: (event: unknown) => void): () => void;
+	subscribeGates(listener: (gate: HostedSdkGate) => void): () => void;
 	prompt(text: string): Promise<void>;
+	steer(text: string): Promise<void>;
+	followUp(text: string): Promise<void>;
+	followUpQueueDepth(): number;
+	answerGate(gateId: string, answer: unknown, idempotencyKey: string): Promise<HostedSdkGateResolution>;
 	/** Sends the nonce-bearing first user message and waits for the SDK turn. */
 	sendBootstrapMessage(nonce: string): Promise<void>;
 	dispose(): Promise<void>;
@@ -71,13 +96,63 @@ function requireSessionFile(session: { sessionFile?: string; sessionId: string }
 }
 
 function adaptSession(session: RealAgentSession): HostedSdkSession {
-
 	const sessionFile = requireSessionFile(session);
 	return {
 		sessionFile,
 		sessionId: session.sessionId,
 		subscribe: listener => session.subscribe(listener),
+		subscribeGates: listener => {
+			const emitter = session.getWorkflowGateEmitter();
+			if (!emitter?.onGateEmitted) return () => undefined;
+			return emitter.onGateEmitted(gate => {
+				listener({ gateId: gate.gate_id, sessionId: session.sessionId, payload: gate });
+			});
+		},
 		prompt: text => session.prompt(text),
+		steer: text => session.steer(text),
+		followUp: text => session.followUp(text),
+		followUpQueueDepth: () => session.pendingMessageCounts.followUp,
+		async answerGate(gateId, answer, idempotencyKey) {
+			const emitter = session.getWorkflowGateEmitter();
+			if (
+				!emitter?.resolveGate ||
+				!emitter.lookupCompletedResolution ||
+				!emitter.prepareTerminalization ||
+				!emitter.clearPreparedTerminalization
+			) {
+				throw new HostedSdkGateError("not_found");
+			}
+			const response = { gate_id: gateId, answer, idempotency_key: idempotencyKey };
+			let completed = emitter.lookupCompletedResolution(response);
+			if (completed.kind === "completed") return "already_resolved";
+			if (completed.kind === "accepted_incomplete") {
+				if (!emitter.recoverAcceptedGates) throw new HostedSdkGateError("not_found");
+				await emitter.recoverAcceptedGates();
+				completed = emitter.lookupCompletedResolution(response);
+				if (completed.kind === "completed") return "already_resolved";
+				if (completed.kind === "accepted_incomplete") throw new Error("Workflow gate resolution is uncertain.");
+			}
+			if (!emitter.prepareTerminalization(gateId, "not_published")) {
+				if (emitter.listPendingGates?.().some(gate => gate.gate_id === gateId)) return "rejected";
+				return "already_resolved";
+			}
+			try {
+				const resolution = await emitter.resolveGate(response);
+				if (resolution.status === "rejected") {
+					emitter.clearPreparedTerminalization(gateId);
+					return "rejected";
+				}
+				return "resolved";
+			} catch (error) {
+				const code = (error as { code?: unknown }).code;
+				if (code === "unknown_gate") throw new HostedSdkGateError("not_found");
+				if (code === "already_resolved") return "already_resolved";
+				const stillPending = emitter.listPendingGates?.().some(gate => gate.gate_id === gateId) === true;
+				if (stillPending) emitter.clearPreparedTerminalization(gateId);
+				else emitter.quarantineGate?.(gateId);
+				throw error;
+			}
+		},
 		sendBootstrapMessage: nonce => session.prompt(bootstrapNonceMarker(nonce)),
 		dispose: () => session.dispose(),
 	};

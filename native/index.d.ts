@@ -26,6 +26,10 @@ export declare class WayCore {
    * listener. Durable failure reasons are stored separately in gateway_meta.
    */
   setRpcHealth(state: string, reason?: string | undefined | null): void
+  /** Publishes the live main-session admission state used by `way.status`. */
+  setMainSessionStatus(turnState: string, followUpQueueDepth: number): void
+  /** Marks journal-derived delivery as halted after a synchronous append failure. */
+  setJournalDegraded(degraded: boolean): void
   /**
    * Sends a best-effort systemd STATUS notification. It is intentionally a
    * no-op when this process was not started with NOTIFY_SOCKET.

@@ -129,6 +129,14 @@ impl RpcServerHandle {
 	pub fn set_gateway_state(&self, state: dispatch::GatewayState, reason: Option<String>) {
 		self.dispatcher.set_gateway_state(state, reason);
 	}
+
+	pub fn set_main_session_status(&self, turn_state: String, follow_up_queue_depth: u64) {
+		self.dispatcher.set_main_session_status(turn_state, follow_up_queue_depth);
+	}
+
+	pub fn set_journal_degraded(&self, degraded: bool) {
+		self.dispatcher.set_journal_degraded(degraded);
+	}
 }
 
 impl Drop for RpcServerHandle {

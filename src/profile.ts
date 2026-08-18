@@ -77,6 +77,8 @@ export interface WayProfile {
 	readonly ownerSurfaces: readonly OwnerSurface[];
 	/** Compatibility convenience for the first owner surface; ownerSurfaces is authoritative. */
 	readonly ownerSurface: OwnerSurface;
+	/** All profile-known admissible surfaces. Owner surfaces are included. */
+	readonly knownSurfaces: readonly OwnerSurface[];
 	readonly operator: Readonly<Record<string, CanonicalValue>>;
 	readonly tunables: Readonly<Record<string, CanonicalValue>>;
 	readonly tunablesCanonical: string;
@@ -188,11 +190,9 @@ function ownerSurfaces(document: TomlRecord): OwnerSurface[] {
 	const sources: Array<{ value: unknown; field: string }> = [];
 	if (document.owner_surface !== undefined) sources.push({ value: document.owner_surface, field: "owner_surface" });
 	const surfaces = optionalRecord(document.surfaces, "surfaces");
+	if (surfaces) noUnknownKeys(surfaces, ["owner", "known"], "surfaces");
 	if (surfaces?.owner !== undefined) {
-		noUnknownKeys(surfaces, ["owner"], "surfaces");
 		sources.push({ value: surfaces.owner, field: "surfaces.owner" });
-	} else if (surfaces) {
-		noUnknownKeys(surfaces, ["owner"], "surfaces");
 	}
 	if (document.owner_surfaces !== undefined) {
 		if (Array.isArray(document.owner_surfaces)) {
@@ -217,6 +217,32 @@ function ownerSurfaces(document: TomlRecord): OwnerSurface[] {
 		ids.add(surface.id);
 	}
 	return normalized.sort((left, right) => left.id.localeCompare(right.id));
+}
+
+/**
+ * Non-owner routes are declared as `[[surfaces.known]]`; owner routes remain
+ * authoritative from the digest-bound owner mapping above.
+ */
+function knownSurfaces(document: TomlRecord, owners: readonly OwnerSurface[]): OwnerSurface[] {
+	const surfaces = optionalRecord(document.surfaces, "surfaces");
+	const known = surfaces?.known;
+	if (known === undefined) return [...owners];
+	if (!Array.isArray(known)) fail("invalid_type", "surfaces.known", "must be an array of surface tables.");
+	const result = [...owners];
+	const byId = new Map(result.map(surface => [surface.id, surface]));
+	for (const [index, value] of known.entries()) {
+		const surface = normalizeOwnerSurface(value, `surfaces.known[${index}]`);
+		const existing = byId.get(surface.id);
+		if (existing) {
+			if (existing.platform !== surface.platform || existing.kind !== surface.kind) {
+				fail("invalid_value", `surfaces.known[${index}]`, `conflicts with configured owner surface ${surface.id}.`);
+			}
+			continue;
+		}
+		byId.set(surface.id, surface);
+		result.push(surface);
+	}
+	return result.sort((left, right) => left.id.localeCompare(right.id));
 }
 
 function parseRestrictedFiles(document: TomlRecord): Readonly<Record<SessionKind, readonly string[]>> {
@@ -324,6 +350,7 @@ export function loadWayProfile(profilePath: string, options: LoadProfileOptions 
 	const rawOperator = document.operator ?? document.identity ?? {};
 	const operator = canonicalValue(requiredRecord(rawOperator, "operator"), "operator") as Readonly<Record<string, CanonicalValue>>;
 	const normalizedOwnerSurfaces = ownerSurfaces(document);
+	const normalizedKnownSurfaces = knownSurfaces(document, normalizedOwnerSurfaces);
 	const projection: ProfileIdentityProjection = {
 		corpus: { path: corpusPath, workspace },
 		injectionFiles: files,
@@ -340,6 +367,7 @@ export function loadWayProfile(profilePath: string, options: LoadProfileOptions 
 		restrictedFiles,
 		ownerSurfaces: normalizedOwnerSurfaces,
 		ownerSurface: normalizedOwnerSurfaces[0] as OwnerSurface,
+		knownSurfaces: normalizedKnownSurfaces,
 		operator,
 		tunables,
 		tunablesCanonical: canonicalSerialize(tunables),

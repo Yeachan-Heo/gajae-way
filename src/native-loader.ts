@@ -40,6 +40,8 @@ export interface WayCoreHandle {
 	rpcBridgeStats(): RpcBridgeStats;
 	rpcDroppedNotificationCount(): number;
 	setRpcHealth(state: "booting" | "verifying" | "running" | "failed_closed" | "degraded", reason?: string): void;
+	setMainSessionStatus(turnState: "idle" | "busy", followUpQueueDepth: number): void;
+	setJournalDegraded(degraded: boolean): void;
 	sdNotifyStatus(status: string): void;
 	gatewayMetaRead(keys: readonly string[]): GatewayMetaReadOutput;
 	gatewayMetaTransaction(input: GatewayMetaTransactionInput): GatewayMetaTransactionOutput;
@@ -49,6 +51,23 @@ export interface WayCoreHandle {
 		nextCursor: string;
 		gap?: { missingFrom: string; missingTo: string; resyncCursor: string };
 	};
+	consumerClaim(consumerId: string, claimTtlMs?: number): { claimId: string; cursor: string; expiresAt: number };
+	consumerCommit(input: {
+		consumerId: string;
+		claimId: string;
+		cursor: string;
+		proofs: Array<{ seq: string; platformMsgId?: string; dedupeKey?: string }>;
+	}): { committedCursor: string };
+	consumerCursor(consumerId: string): string | undefined;
+	consumerOutbox(consumerId: string): Array<{
+		consumerId: string;
+		seq: string;
+		state: string;
+		platformMsgId?: string;
+		dedupeKey?: string;
+	}>;
+	idempotencyReplay(input: { scope: string; key: string; requestJson: string }): { replayed: boolean; responseJson?: string };
+	idempotencyStore(input: { scope: string; key: string; requestJson: string; responseJson: string }): void;
 }
 
 export interface WayCoreConstructor {

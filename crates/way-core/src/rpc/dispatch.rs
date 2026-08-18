@@ -7,7 +7,7 @@ use std::{
 		atomic::{AtomicBool, AtomicU64, Ordering},
 		Arc, Mutex,
 	},
-	time::Instant,
+	time::{Duration, Instant},
 };
 
 use napi::threadsafe_function::{ThreadsafeFunction, ThreadsafeFunctionCallMode};
@@ -16,7 +16,7 @@ use serde_json::{json, Map, Value};
 use tokio::{sync::oneshot, time::Instant as TokioInstant};
 
 use crate::{
-	events::EventJournal,
+	events::{ConsumerClaim, Cursor, DeliveryProof, EventJournal, JournalError, JournalGap, JournalRead},
 	lock::{AcquireRequest, AcquireResult, HolderKind, Lease, LeaseHolder, LockClass, LockError, LockManager, LockStatus, ReleaseResult},
 	store::{unix_epoch_ms, Store, StoreError},
 };
@@ -25,6 +25,20 @@ use super::CancellationToken;
 
 pub const BRIDGE_TIMEOUT_MS: u64 = 30_000;
 pub const MAX_BRIDGE_IN_FLIGHT: usize = 64;
+
+pub const MAIN_EVENT_KINDS: &[&str] = &[
+	"assistant_message",
+	"turn_start",
+	"turn_end",
+	"gate_open",
+	"gate_resolved",
+	"health_change",
+	"registry_change",
+	"lock_event",
+	"follow_up_attempted",
+	"follow_up_confirmed",
+	"profile_approved",
+];
 
 static NEXT_CORRELATION_ID: AtomicU64 = AtomicU64::new(1);
 
@@ -407,6 +421,19 @@ struct GatewayHealth {
 	reason: Option<String>,
 }
 
+#[derive(Debug, Clone)]
+struct MainSessionStatus {
+	turn_state: String,
+	follow_up_queue_depth: u64,
+	journal_degraded: bool,
+}
+
+impl Default for MainSessionStatus {
+	fn default() -> Self {
+		Self { turn_state: "idle".to_owned(), follow_up_queue_depth: 0, journal_degraded: false }
+	}
+}
+
 /// State and method table used by each UDS connection.
 #[derive(Clone)]
 pub struct RpcDispatcher {
@@ -415,6 +442,7 @@ pub struct RpcDispatcher {
 	journal: EventJournal,
 	bridge: TsfnBridge,
 	health: Arc<Mutex<GatewayHealth>>,
+	main_session: Arc<Mutex<MainSessionStatus>>,
 	started_at: Arc<Instant>,
 }
 
@@ -432,6 +460,7 @@ impl RpcDispatcher {
 			journal,
 			bridge,
 			health: Arc::new(Mutex::new(GatewayHealth { state: GatewayState::Running, reason: None })),
+			main_session: Arc::new(Mutex::new(MainSessionStatus::default())),
 			started_at: Arc::new(Instant::now()),
 		}
 	}
@@ -444,6 +473,19 @@ impl RpcDispatcher {
 		if let Ok(mut health) = self.health.lock() {
 			health.state = state;
 			health.reason = reason;
+		}
+	}
+
+	pub fn set_main_session_status(&self, turn_state: String, follow_up_queue_depth: u64) {
+		if let Ok(mut status) = self.main_session.lock() {
+			status.turn_state = turn_state;
+			status.follow_up_queue_depth = follow_up_queue_depth;
+		}
+	}
+
+	pub fn set_journal_degraded(&self, degraded: bool) {
+		if let Ok(mut status) = self.main_session.lock() {
+			status.journal_degraded = degraded;
 		}
 	}
 
@@ -477,6 +519,9 @@ impl RpcDispatcher {
 			"gitlock.clear_quarantine" => {
 				self.idempotent(&method, &params, || self.lock_clear_quarantine(params.clone())).await
 			}
+			"main.events.read" => self.main_events_read(params, cancellation).await,
+			"consumer.claim" => self.consumer_claim(params).await,
+			"consumer.commit" => self.consumer_commit(params).await,
 			method if method.starts_with("main.") || method == "profile.approve" => {
 				self.bridge_method(method, params, cancellation).await
 			}
@@ -507,6 +552,11 @@ impl RpcDispatcher {
 	async fn status_response(&self, params: Value) -> Result<Value, RpcError> {
 		ensure_empty_params(&params)?;
 		let health = self.health_response(Value::Object(Map::new()))?;
+		let main_session = self
+			.main_session
+			.lock()
+			.map_err(|_| RpcError::internal("main session status lock poisoned"))?
+			.clone();
 		let locks = self.locks.clone();
 		let journal = self.journal.clone();
 		let store = self.store.clone();
@@ -527,12 +577,15 @@ impl RpcDispatcher {
 		let profile_version = profile_version.map_err(store_error)?;
 		let queue_len = lock_status.queue.len();
 		let mut response = health.as_object().cloned().expect("health response is an object");
-		response.insert("turn_state".to_owned(), json!("idle"));
-		response.insert("follow_up_queue_depth".to_owned(), json!(0));
+		response.insert("turn_state".to_owned(), json!(main_session.turn_state));
+		response.insert("follow_up_queue_depth".to_owned(), json!(main_session.follow_up_queue_depth));
 		let mut lock = lock_status_json(lock_status);
 		lock.as_object_mut().expect("lock status is an object").insert("queue_len".to_owned(), json!(queue_len));
 		response.insert("lock".to_owned(), lock);
-		response.insert("journal".to_owned(), json!({ "head_cursor": head_cursor.to_string(), "degraded": false }));
+		response.insert(
+			"journal".to_owned(),
+			json!({ "head_cursor": head_cursor.to_string(), "degraded": main_session.journal_degraded }),
+		);
 		response.insert("consumers".to_owned(), json!([]));
 		response.insert("reconcile".to_owned(), json!({ "last_ok_at": Value::Null, "cycle_ms": Value::Null, "drift_count": 0 }));
 		response.insert("write_mode".to_owned(), json!(write_mode.as_deref() == Some("on")));
@@ -557,6 +610,58 @@ impl RpcDispatcher {
 			Err(BridgeFailure::CallFailed(status)) => Err(RpcError::internal(format!("bridge TSFN call failed: {status}"))),
 			Err(BridgeFailure::Remote(error)) => Err(remote_bridge_error(error)),
 		}
+	}
+
+	async fn main_events_read(&self, params: Value, cancellation: CancellationToken) -> Result<Value, RpcError> {
+		let request = parse_main_events_read_request(&params)?;
+		let journal = self.journal.clone();
+		let mut cursor = match request.consumer_id {
+			Some(consumer_id) => tokio::task::spawn_blocking(move || journal.consumer_cursor(&consumer_id))
+				.await
+				.map_err(|error| RpcError::internal(format!("consumer cursor worker failed: {error}")))?
+				.map_err(journal_error)?,
+			None => request.cursor,
+		};
+		let deadline = TokioInstant::now() + Duration::from_millis(request.wait_ms);
+		loop {
+			let journal = self.journal.clone();
+			let kinds = request.kinds.clone();
+			let read = tokio::task::spawn_blocking(move || journal.read_filtered(cursor, request.limit, &kinds))
+				.await
+				.map_err(|error| RpcError::internal(format!("event read worker failed: {error}")))?
+				.map_err(journal_error)?;
+			if read.gap.is_some() || !read.events.is_empty() || request.wait_ms == 0 || TokioInstant::now() >= deadline {
+				return Ok(journal_read_json(read));
+			}
+			cursor = Some(read.next_cursor);
+			let pause = Duration::from_millis(25).min(deadline.saturating_duration_since(TokioInstant::now()));
+			tokio::select! {
+				_ = cancellation.cancelled() => return Err(RpcError::internal("request cancelled")),
+				_ = tokio::time::sleep(pause) => {}
+			}
+		}
+	}
+
+	async fn consumer_claim(&self, params: Value) -> Result<Value, RpcError> {
+		let request = parse_consumer_claim_request(&params)?;
+		let journal = self.journal.clone();
+		let claim = tokio::task::spawn_blocking(move || journal.claim_consumer(&request.consumer_id, request.claim_ttl_ms))
+			.await
+			.map_err(|error| RpcError::internal(format!("consumer claim worker failed: {error}")))?
+			.map_err(journal_error)?;
+		Ok(consumer_claim_json(claim))
+	}
+
+	async fn consumer_commit(&self, params: Value) -> Result<Value, RpcError> {
+		let request = parse_consumer_commit_request(&params)?;
+		let journal = self.journal.clone();
+		let cursor = tokio::task::spawn_blocking(move || {
+			journal.commit_consumer(&request.consumer_id, &request.claim_id, request.cursor, &request.proofs)
+		})
+		.await
+		.map_err(|error| RpcError::internal(format!("consumer commit worker failed: {error}")))?
+		.map_err(journal_error)?;
+		Ok(json!({ "committed_cursor": cursor.to_string() }))
 	}
 
 	async fn idempotent<F, Fut>(&self, method: &str, params: &Value, operation: F) -> Result<Value, RpcError>
@@ -671,6 +776,164 @@ impl RpcDispatcher {
 	}
 }
 
+struct MainEventsReadRequest {
+	consumer_id: Option<String>,
+	cursor: Option<Cursor>,
+	limit: u32,
+	wait_ms: u64,
+	kinds: Vec<String>,
+}
+
+struct ConsumerClaimRequest {
+	consumer_id: String,
+	claim_ttl_ms: Option<u64>,
+}
+
+struct ConsumerCommitRequest {
+	consumer_id: String,
+	claim_id: String,
+	cursor: Cursor,
+	proofs: Vec<DeliveryProof>,
+}
+
+fn parse_main_events_read_request(params: &Value) -> Result<MainEventsReadRequest, RpcError> {
+	let object = params_object(params)?;
+	ensure_allowed_keys(object, &["consumer_id", "cursor", "limit", "wait_ms", "kinds"])?;
+	let consumer_id = optional_string(object, "consumer_id")?;
+	let cursor = optional_string(object, "cursor")?
+		.map(|value| value.parse::<Cursor>().map_err(|_| RpcError::invalid_params("cursor must be journal_generation:seq")))
+		.transpose()?;
+	if consumer_id.is_some() && cursor.is_some() {
+		return Err(RpcError::invalid_params("consumer_id and cursor are mutually exclusive"));
+	}
+	let limit = optional_u64(object, "limit")?.unwrap_or(100);
+	let limit = u32::try_from(limit).map_err(|_| RpcError::invalid_params("limit must be in 1..=500"))?;
+	if !(1..=500).contains(&limit) {
+		return Err(RpcError::invalid_params("limit must be in 1..=500"));
+	}
+	let wait_ms = optional_u64(object, "wait_ms")?.unwrap_or(0);
+	if wait_ms > 60_000 {
+		return Err(RpcError::invalid_params("wait_ms must be in 0..=60000"));
+	}
+	let kinds = match object.get("kinds") {
+		None => Vec::new(),
+		Some(Value::Array(values)) if !values.is_empty() => {
+			let mut kinds = Vec::with_capacity(values.len());
+			for value in values {
+				let kind = value
+					.as_str()
+					.filter(|value| !value.is_empty())
+					.ok_or_else(|| RpcError::invalid_params("kinds must contain non-empty strings"))?;
+				if !MAIN_EVENT_KINDS.contains(&kind) {
+					return Err(RpcError::invalid_params(format!("unsupported event kind: {kind}")));
+				}
+				if kinds.iter().any(|existing| existing == kind) {
+					return Err(RpcError::invalid_params("kinds must not contain duplicates"));
+				}
+				kinds.push(kind.to_owned());
+			}
+			kinds
+		}
+		Some(Value::Array(_)) => return Err(RpcError::invalid_params("kinds must not be empty")),
+		Some(_) => return Err(RpcError::invalid_params("kinds must be an array of event kinds")),
+	};
+	Ok(MainEventsReadRequest { consumer_id, cursor, limit, wait_ms, kinds })
+}
+
+fn parse_consumer_claim_request(params: &Value) -> Result<ConsumerClaimRequest, RpcError> {
+	let object = params_object(params)?;
+	ensure_allowed_keys(object, &["consumer_id", "claim_ttl_ms"])?;
+	Ok(ConsumerClaimRequest {
+		consumer_id: required_string(object, "consumer_id")?.to_owned(),
+		claim_ttl_ms: optional_u64(object, "claim_ttl_ms")?,
+	})
+}
+
+fn parse_consumer_commit_request(params: &Value) -> Result<ConsumerCommitRequest, RpcError> {
+	let object = params_object(params)?;
+	ensure_allowed_keys(object, &["consumer_id", "claim_id", "cursor", "proofs"])?;
+	let cursor = required_string(object, "cursor")?
+		.parse::<Cursor>()
+		.map_err(|_| RpcError::invalid_params("cursor must be journal_generation:seq"))?;
+	let proofs_value = object.get("proofs").ok_or_else(|| RpcError::invalid_params("proofs is required"))?;
+	let proofs_array = proofs_value.as_array().ok_or_else(|| RpcError::invalid_params("proofs must be an array"))?;
+	let mut proofs = Vec::with_capacity(proofs_array.len());
+	for proof in proofs_array {
+		let proof = proof.as_object().ok_or_else(|| RpcError::invalid_params("proofs entries must be objects"))?;
+		ensure_allowed_keys(proof, &["seq", "platform_msg_id", "dedupe_key"])?;
+		let sequence = proof.get("seq").ok_or_else(|| RpcError::invalid_params("proofs[].seq is required"))?;
+		let seq = parse_u64(sequence, "proofs[].seq")?;
+		proofs.push(DeliveryProof {
+			seq,
+			platform_msg_id: optional_string(proof, "platform_msg_id")?,
+			dedupe_key: Some(required_string(proof, "dedupe_key")?.to_owned()),
+		});
+	}
+	Ok(ConsumerCommitRequest {
+		consumer_id: required_string(object, "consumer_id")?.to_owned(),
+		claim_id: required_string(object, "claim_id")?.to_owned(),
+		cursor,
+		proofs,
+	})
+}
+
+fn journal_read_json(read: JournalRead) -> Value {
+	let events = read
+		.events
+		.into_iter()
+		.map(|event| {
+			json!({
+				"seq": event.seq,
+				"ts": event.ts,
+				"kind": event.kind,
+				"payload": serde_json::from_str::<Value>(&event.payload_json).expect("stored journal payload is valid JSON"),
+			})
+		})
+		.collect::<Vec<_>>();
+	let mut response = Map::new();
+	response.insert("events".to_owned(), Value::Array(events));
+	response.insert("next_cursor".to_owned(), Value::String(read.next_cursor.to_string()));
+	if let Some(gap) = read.gap {
+		response.insert("gap".to_owned(), journal_gap_json(gap));
+	}
+	Value::Object(response)
+}
+
+fn journal_gap_json(gap: JournalGap) -> Value {
+	json!({
+		"missing_from": gap.missing_from.to_string(),
+		"missing_to": gap.missing_to.to_string(),
+		"resync_cursor": gap.resync_cursor.to_string(),
+	})
+}
+
+fn consumer_claim_json(claim: ConsumerClaim) -> Value {
+	json!({
+		"claim_id": claim.claim_id,
+		"cursor": claim.cursor.to_string(),
+		"expires_at": claim.expires_at,
+	})
+}
+
+fn journal_error(error: JournalError) -> RpcError {
+	match error {
+		JournalError::CursorBeforeRetention(gap) => RpcError::with_data(1600, "cursor_before_retention", journal_gap_json(gap)),
+		JournalError::ConsumerClaimHeld => RpcError::app(1601, None),
+		JournalError::InvalidPayload
+		| JournalError::InvalidKind
+		| JournalError::InvalidLimit
+		| JournalError::InvalidClaimTtl
+		| JournalError::InvalidCursor
+		| JournalError::ClaimNotHeld
+		| JournalError::ClaimExpired
+		| JournalError::CursorRegression
+		| JournalError::CursorAheadOfHead
+		| JournalError::InvalidProof(_) => RpcError::invalid_params(error.to_string()),
+		JournalError::Store(error) => store_error(error),
+		JournalError::Overflow => RpcError::internal("journal overflow"),
+	}
+}
+
 fn remote_bridge_error(error: Value) -> RpcError {
 	let Some(object) = error.as_object() else {
 		return RpcError::internal("bridge_exception");
@@ -736,6 +999,27 @@ fn required_string<'a>(object: &'a Map<String, Value>, key: &str) -> Result<&'a 
 		.and_then(Value::as_str)
 		.filter(|value| !value.is_empty())
 		.ok_or_else(|| RpcError::invalid_params(format!("{key} must be a non-empty string")))
+}
+
+fn optional_string(object: &Map<String, Value>, key: &str) -> Result<Option<String>, RpcError> {
+	let Some(value) = object.get(key) else {
+		return Ok(None);
+	};
+	let value = value
+		.as_str()
+		.filter(|value| !value.is_empty())
+		.ok_or_else(|| RpcError::invalid_params(format!("{key} must be a non-empty string")))?;
+	Ok(Some(value.to_owned()))
+}
+
+fn parse_u64(value: &Value, key: &str) -> Result<u64, RpcError> {
+	match value {
+		Value::Number(number) => number.as_u64().ok_or_else(|| RpcError::invalid_params(format!("{key} must be an unsigned integer"))),
+		Value::String(value) => value
+			.parse::<u64>()
+			.map_err(|_| RpcError::invalid_params(format!("{key} must be an unsigned integer"))),
+		_ => Err(RpcError::invalid_params(format!("{key} must be an unsigned integer"))),
+	}
 }
 
 fn required_bool(object: &Map<String, Value>, key: &str) -> Result<bool, RpcError> {
@@ -947,6 +1231,80 @@ mod tests {
 			.await
 			.unwrap_err();
 		assert_eq!(error.code, 1500);
+	}
+
+	#[tokio::test]
+	async fn main_event_reads_filter_known_kinds_and_return_generation_gaps() {
+		let store = Store::default();
+		let locks = LockManager::new(store.clone());
+		let journal = EventJournal::new(store.clone());
+		let dispatcher = RpcDispatcher::new(store, locks, journal.clone(), TsfnBridge::unavailable());
+		journal.append("assistant_message", r#"{"text":"skip"}"#).unwrap();
+		journal.append("turn_start", r#"{"turn":"one"}"#).unwrap();
+
+		let filtered = dispatcher
+			.dispatch(
+				"main.events.read".to_owned(),
+				json!({ "cursor": "1:0", "kinds": ["turn_start"] }),
+				super::super::CancellationToken::new(),
+			)
+			.await
+			.unwrap();
+		assert_eq!(filtered["events"].as_array().unwrap().len(), 1);
+		assert_eq!(filtered["events"][0]["kind"], "turn_start");
+		assert_eq!(filtered["next_cursor"], "1:2");
+
+		let gap = dispatcher
+			.dispatch(
+				"main.events.read".to_owned(),
+				json!({ "cursor": "0:0" }),
+				super::super::CancellationToken::new(),
+			)
+			.await
+			.unwrap();
+		assert_eq!(gap["gap"]["resync_cursor"], "1:0");
+	}
+
+	#[tokio::test]
+	async fn consumer_claim_and_commit_dispatch_the_durable_settlement_protocol() {
+		let store = Store::default();
+		let locks = LockManager::new(store.clone());
+		let journal = EventJournal::new(store.clone());
+		let dispatcher = RpcDispatcher::new(store, locks, journal.clone(), TsfnBridge::unavailable());
+		let event = journal.append("assistant_message", r#"{"text":"deliver"}"#).unwrap();
+		let claim = dispatcher
+			.dispatch(
+				"consumer.claim".to_owned(),
+				json!({ "consumer_id": "discord" }),
+				super::super::CancellationToken::new(),
+			)
+			.await
+			.unwrap();
+		let held = dispatcher
+			.dispatch(
+				"consumer.claim".to_owned(),
+				json!({ "consumer_id": "discord" }),
+				super::super::CancellationToken::new(),
+			)
+			.await
+			.unwrap_err();
+		assert_eq!(held.code, 1601);
+		let committed = dispatcher
+			.dispatch(
+				"consumer.commit".to_owned(),
+				json!({
+					"consumer_id": "discord",
+					"claim_id": claim["claim_id"],
+					"cursor": event.to_string(),
+					"proofs": [{ "seq": event.seq, "dedupe_key": "discord:1" }],
+				}),
+				super::super::CancellationToken::new(),
+			)
+			.await
+			.unwrap();
+		assert_eq!(committed["committed_cursor"], event.to_string());
+		assert_eq!(journal.consumer_cursor("discord").unwrap(), Some(event));
+		assert_eq!(journal.outbox_rows("discord").unwrap().len(), 1);
 	}
 
 	#[tokio::test(start_paused = true)]

@@ -4,6 +4,8 @@ import * as net from "node:net";
 import * as os from "node:os";
 import * as path from "node:path";
 import { parseWayConfig, type WayConfig } from "./config";
+import { createMainAdmissionHandler } from "./main-session/admission";
+import { createMainGateAnswerHandler } from "./main-session/gates";
 
 import { bootstrapMainSession, recoverBootstrap } from "./main-session/bootstrap";
 import { createMainSessionHost, type MainSessionHost } from "./main-session/host";
@@ -158,7 +160,14 @@ async function serveWay(config: WayConfig): Promise<void> {
 	const core = loadWayCore().WayCore.open(config.stateDir);
 	const state = new GatewayStateStore(core);
 	const profiles = new ProfileRevisionTracker();
-	core.startRpcServer(path.join(config.stateDir, "rpc.sock"), createRpcBridge(core, profileBridgeHandler(state, config, profiles)));
+	const profileHandler = profileBridgeHandler(state, config, profiles);
+	let mainSessionHandler: RpcBridgeHandler | undefined;
+	const bridgeHandler: RpcBridgeHandler = async (method, params) => {
+		if (method === "profile.approve") return await profileHandler(method, params);
+		if (!mainSessionHandler) throw new RpcBridgeException(1301, "unknown_session");
+		return await mainSessionHandler(method, params);
+	};
+	core.startRpcServer(path.join(config.stateDir, "rpc.sock"), createRpcBridge(core, bridgeHandler));
 	core.setRpcHealth("verifying");
 	let host: MainSessionHost | undefined;
 	try {
@@ -182,6 +191,13 @@ async function serveWay(config: WayConfig): Promise<void> {
 			state,
 			journal: core,
 		});
+		const admissionHandler = createMainAdmissionHandler(host, profile, core);
+		const gateAnswerHandler = createMainGateAnswerHandler(host, core);
+		mainSessionHandler = async (method, params) => {
+			if (method === "main.submit") return await admissionHandler(params);
+			if (method === "main.gate.answer") return await gateAnswerHandler(params);
+			throw new RpcBridgeException(-32601, `method not found: ${method}`);
+		};
 		core.setRpcHealth("running");
 		await writeHealthFile(config.stateDir, { status: "healthy", state: "running" });
 		await waitForShutdown(core, host);

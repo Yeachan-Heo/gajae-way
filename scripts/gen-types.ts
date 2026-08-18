@@ -11,6 +11,8 @@ export const requiredGeneratedBindingSymbols = [
 	"healthInfo",
 	"sdNotifyStatus",
 	"setRpcHealth",
+	"setMainSessionStatus",
+	"setJournalDegraded",
 ] as const;
 
 export function validateGeneratedBindingSource(bindings: string): void {

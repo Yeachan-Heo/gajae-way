@@ -232,8 +232,7 @@ test("host writes growth intent before prompt, refreshes it after append, and jo
 	await host.prompt("hello");
 	expect(state.read().growthIntent).toBeUndefined();
 	expect(state.read().mainIdentity?.size).toBeGreaterThan(resumed.identity.size);
-	expect(journal).toHaveLength(1);
-	expect(journal[0]?.kind).toBe("main_session_event");
+	expect(journal.map(event => event.kind)).toEqual(["turn_start", "assistant_message", "turn_end"]);
 	expect(backend.events).toHaveLength(0);
 	await host.dispose();
 });
@@ -242,6 +241,7 @@ test("journal append failure degrades the host without losing its growth refresh
 	const { profilePath, state, sdk } = await committedFixture();
 	const resumed = await strictResumeMainSession({ profile: loadWayProfile(profilePath), state, sdk });
 	let reportedReason: string | undefined;
+	let journalDegraded = false;
 	const host = createMainSessionHost({
 		session: resumed.session,
 		identity: resumed.identity,
@@ -253,11 +253,15 @@ test("journal append failure degrades the host without losing its growth refresh
 			setRpcHealth: (_state, reason) => {
 				reportedReason = reason;
 			},
+			setJournalDegraded: degraded => {
+				journalDegraded = degraded;
+			},
 		},
 	});
 	await host.prompt("event triggers durable journal failure");
 	expect(host.degraded).toBe(true);
 	expect(reportedReason).toBe("journal_append_failed");
+	expect(journalDegraded).toBe(true);
 	expect(state.read().growthIntent).toBeUndefined();
 	await host.dispose();
 });

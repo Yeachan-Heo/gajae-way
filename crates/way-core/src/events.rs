@@ -7,7 +7,7 @@ use std::{
 	sync::Arc,
 };
 
-use rusqlite::{params, OptionalExtension, Transaction};
+use rusqlite::{params, params_from_iter, OptionalExtension, ToSql, Transaction};
 use serde_json::Value;
 
 use crate::store::{meta_get_tx, meta_set_tx, Clock, Store, StoreError, SystemClock};
@@ -219,6 +219,13 @@ impl EventJournal {
 	}
 
 	pub fn read(&self, cursor: Option<Cursor>, limit: u32) -> JournalResult<JournalRead> {
+		self.read_filtered(cursor, limit, &[])
+	}
+
+	/// Reads journal frames after `cursor`, optionally filtering to selected kinds.
+	/// A filtered read advances past nonmatching frames so a consumer cannot spin
+	/// forever on events it explicitly elected not to receive.
+	pub fn read_filtered(&self, cursor: Option<Cursor>, limit: u32, kinds: &[String]) -> JournalResult<JournalRead> {
 		if !(1..=500).contains(&limit) {
 			return Err(JournalError::InvalidLimit);
 		}
@@ -243,22 +250,38 @@ impl EventJournal {
 			return Ok(JournalRead { events: Vec::new(), next_cursor: gap.resync_cursor, gap: Some(gap) });
 		}
 
-		let mut statement = connection.prepare(
-			"SELECT seq, ts, kind, payload_json FROM events WHERE seq > ?1 ORDER BY seq ASC LIMIT ?2",
-		)?;
-		let rows = statement.query_map(params![requested.seq as i64, i64::from(limit)], |row| {
-			Ok(EventFrame {
-				seq: row.get::<_, i64>(0)? as u64,
-				ts: row.get(1)?,
-				kind: row.get(2)?,
-				payload_json: row.get(3)?,
-			})
-		})?;
-		let events = rows.collect::<Result<Vec<_>, _>>()?;
-		let next_cursor = events
-			.last()
-			.map(|event| Cursor::new(generation, event.seq))
-			.unwrap_or(requested);
+		let requested_seq = i64::try_from(requested.seq).map_err(|_| JournalError::Overflow)?;
+		let limit = i64::from(limit);
+		let sql = if kinds.is_empty() {
+			"SELECT seq, ts, kind, payload_json FROM events WHERE seq > ?1 ORDER BY seq ASC LIMIT ?2".to_owned()
+		} else {
+			let placeholders = (0..kinds.len()).map(|_| "?").collect::<Vec<_>>().join(", ");
+			format!(
+				"SELECT seq, ts, kind, payload_json FROM events WHERE seq > ? AND kind IN ({placeholders}) ORDER BY seq ASC LIMIT ?"
+			)
+		};
+		let mut statement = connection.prepare(&sql)?;
+		let events = if kinds.is_empty() {
+			statement
+				.query_map(params![requested_seq, limit], event_frame_from_row)?
+				.collect::<Result<Vec<_>, _>>()?
+		} else {
+			let mut values: Vec<&dyn ToSql> = Vec::with_capacity(kinds.len() + 2);
+			values.push(&requested_seq);
+			for kind in kinds {
+				values.push(kind);
+			}
+			values.push(&limit);
+			statement
+				.query_map(params_from_iter(values), event_frame_from_row)?
+				.collect::<Result<Vec<_>, _>>()?
+		};
+		let head: i64 = connection.query_row("SELECT COALESCE(MAX(seq), 0) FROM events", [], |row| row.get(0))?;
+		let next_cursor = if events.len() < usize::try_from(limit).map_err(|_| JournalError::Overflow)? {
+			Cursor::new(generation, head.try_into().map_err(|_| JournalError::Overflow)?)
+		} else {
+			events.last().map(|event| Cursor::new(generation, event.seq)).unwrap_or(requested)
+		};
 		Ok(JournalRead { events, next_cursor, gap: None })
 	}
 
@@ -423,6 +446,15 @@ impl EventJournal {
 		transaction.commit()?;
 		Ok(next)
 	}
+}
+
+fn event_frame_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<EventFrame> {
+	Ok(EventFrame {
+		seq: row.get::<_, i64>(0)? as u64,
+		ts: row.get(1)?,
+		kind: row.get(2)?,
+		payload_json: row.get(3)?,
+	})
 }
 
 pub(crate) fn append_in_transaction(
