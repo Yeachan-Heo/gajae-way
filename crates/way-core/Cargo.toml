@@ -9,14 +9,17 @@ name = "way_core"
 crate-type = ["cdylib"]
 
 [dependencies]
-napi = { version = "3", features = ["napi10"] }
+napi = { version = "3", features = ["napi10", "tokio_rt"] }
 napi-derive = "3"
 libc = "0.2"
 rusqlite = { version = "0.37", features = ["bundled"] }
 serde_json = "1"
+tokio = { version = "1", features = ["io-util", "macros", "net", "rt-multi-thread", "sync", "time"] }
 
 [dev-dependencies]
 proptest = "1"
+
+tokio = { version = "1", features = ["test-util"] }
 
 [build-dependencies]
 napi-build = "2"

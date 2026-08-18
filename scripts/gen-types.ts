@@ -1,7 +1,7 @@
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 
-export const requiredGeneratedBindingSymbols = ["HealthInfo", "WayCore", "healthInfo"] as const;
+export const requiredGeneratedBindingSymbols = ["BridgeRequest", "HealthInfo", "RpcBridgeStats", "WayCore", "healthInfo"] as const;
 
 export function validateGeneratedBindingSource(bindings: string): void {
 	for (const symbol of requiredGeneratedBindingSymbols) {
@@ -18,5 +18,5 @@ export async function validateGeneratedBindings(nativeDir = path.join(import.met
 
 if (import.meta.main) {
 	await validateGeneratedBindings();
-	console.log("Generated native bindings contain the required P0 exports.");
+	console.log("Generated native bindings contain the required RPC exports.");
 }

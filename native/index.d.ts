@@ -8,6 +8,19 @@ export declare class WayCore {
    */
   static open(stateDir: string): WayCore
   get stateDir(): string
+  /**
+   * Starts the hardened state-directory UDS server and registers the TSFN
+   * bridge callback before accepting any client request.
+   */
+  startRpcServer(socketPath: string, bridgeCallback: (err: null | Error, request: BridgeRequest) => void): void
+  /**
+   * Resolves one TypeScript bridge request. The completion payload is a JSON
+   * result, or `{\"error\": ...}` for a typed bridge-side failure.
+   */
+  bridgeComplete(requestId: number, resultJson: string): boolean
+  shutdownRpcServer(): void
+  rpcBridgeStats(): RpcBridgeStats
+  rpcDroppedNotificationCount(): number
   lockAcquire(input: LockAcquireInput): LockAcquireOutput
   lockRenew(leaseId: string): LockRenewOutput
   lockRelease(leaseId: string): LockReleaseOutput
@@ -23,6 +36,13 @@ export declare class WayCore {
   consumerOutbox(consumerId: string): Array<OutboxRowOutput>
   idempotencyReplay(input: IdempotencyReplayInput): IdempotencyReplayOutput
   idempotencyStore(input: IdempotencyStoreInput): void
+}
+
+/** Request data delivered from Rust's TSFN into the thin TypeScript shim. */
+export interface BridgeRequest {
+  reqId: number
+  method: string
+  paramsJson: string
 }
 
 export interface ConsumerClaimOutput {
@@ -170,4 +190,13 @@ export interface QueueEntryOutput {
   class: string
   label: string
   waitedMs: number
+}
+
+export interface RpcBridgeStats {
+  inFlight: number
+  overloads: number
+  timeouts: number
+  duplicateCompletions: number
+  lateCompletions: number
+  queueClosed: number
 }

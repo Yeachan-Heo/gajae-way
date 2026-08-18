@@ -35,3 +35,11 @@ jobs:
       - run: bun scripts/compile.ts
       - run: cargo test -p way-core
       - run: bun test
+
+  peer-auth-linux:
+    name: linux-so-peercred-cross-user
+    runs-on: ubuntu-24.04
+    container: rust:latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: WAY_CORE_CROSS_UID_TEST=1 cargo test -p way-core rpc::auth::tests::linux_second_os_user_is_rejected_by_real_so_peercred_when_enabled -- --exact

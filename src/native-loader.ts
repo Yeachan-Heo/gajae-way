@@ -9,8 +9,30 @@ export interface HealthInfo {
 	bootEpoch: number;
 }
 
+export interface RpcBridgeRequest {
+	reqId: number;
+	method: string;
+	paramsJson: string;
+}
+
+export interface RpcBridgeStats {
+	inFlight: number;
+	overloads: number;
+	timeouts: number;
+	duplicateCompletions: number;
+	lateCompletions: number;
+	queueClosed: number;
+}
+
+export type RpcBridgeCallback = (error: Error | null, request: RpcBridgeRequest) => void;
+
 export interface WayCoreHandle {
 	readonly stateDir: string;
+	startRpcServer(socketPath: string, bridgeCallback: RpcBridgeCallback): void;
+	bridgeComplete(reqId: number, resultJson: string): boolean;
+	shutdownRpcServer(): void;
+	rpcBridgeStats(): RpcBridgeStats;
+	rpcDroppedNotificationCount(): number;
 }
 
 export interface WayCoreConstructor {

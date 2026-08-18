@@ -1,10 +1,11 @@
 //! N-API surface for the gajae-way durable runtime.
 //!
-//! P1 keeps TypeScript thin: SQLite state, fenced lock ownership, durable
-//! journal settlement, and idempotency are all executed in Rust.
+//! Rust owns SQLite state, fenced lock ownership, journal settlement,
+//! idempotency, and the authenticated P2 UDS RPC boundary.
 
-use std::{str::FromStr, sync::OnceLock, time::SystemTime};
+use std::{path::PathBuf, str::FromStr, sync::{Mutex, OnceLock}, time::SystemTime};
 
+use napi::threadsafe_function::ThreadsafeFunction;
 use napi_derive::napi;
 
 use crate::{
@@ -14,6 +15,10 @@ use crate::{
 		QueueEntry, ReleaseResult,
 	},
 	store::{unix_epoch_ms, Store, StoreError},
+};
+use crate::rpc::{
+	dispatch::{BridgeRequest, RpcBridgeStats, RpcDispatcher, TsfnBridge},
+	RpcServerHandle,
 };
 
 pub mod events;
@@ -259,6 +264,7 @@ pub struct WayCore {
 	store: Store,
 	locks: LockManager,
 	journal: EventJournal,
+	rpc_server: Mutex<Option<RpcServerHandle>>,
 }
 
 #[napi]
@@ -273,12 +279,68 @@ impl WayCore {
 		let store = Store::open(&state_dir).map_err(store_napi_error)?;
 		let locks = LockManager::new(store.clone());
 		let journal = EventJournal::new(store.clone());
-		Ok(Self { state_dir, store, locks, journal })
+		Ok(Self { state_dir, store, locks, journal, rpc_server: Mutex::new(None) })
 	}
 
 	#[napi(getter, js_name = "stateDir")]
 	pub fn state_dir(&self) -> String {
 		self.state_dir.clone()
+	}
+
+	/// Starts the hardened state-directory UDS server and registers the TSFN
+	/// bridge callback before accepting any client request.
+	#[napi(js_name = "startRpcServer", ts_args_type = "socketPath: string, bridgeCallback: (err: null | Error, request: BridgeRequest) => void")]
+	pub fn start_rpc_server(&self, socket_path: String, bridge_callback: ThreadsafeFunction<BridgeRequest>) -> napi::Result<()> {
+		if socket_path.trim().is_empty() {
+			return Err(napi::Error::from_reason("socketPath must not be empty"));
+		}
+		let mut server = self.rpc_server.lock().map_err(|_| napi::Error::from_reason("RPC server lock was poisoned"))?;
+		if server.is_some() {
+			return Err(napi::Error::from_reason("RPC server is already running"));
+		}
+		let bridge = TsfnBridge::new(bridge_callback);
+		let dispatcher = RpcDispatcher::new(self.store.clone(), self.locks.clone(), self.journal.clone(), bridge);
+		let handle = RpcServerHandle::start(PathBuf::from(socket_path), PathBuf::from(&self.state_dir), dispatcher)
+			.map_err(|error| napi::Error::from_reason(error.to_string()))?;
+		*server = Some(handle);
+		Ok(())
+	}
+
+	/// Resolves one TypeScript bridge request. The completion payload is a JSON
+	/// result, or `{\"error\": ...}` for a typed bridge-side failure.
+	#[napi(js_name = "bridgeComplete")]
+	pub fn bridge_complete(&self, request_id: i64, result_json: String) -> napi::Result<bool> {
+		let request_id = u64::try_from(request_id).map_err(|_| napi::Error::from_reason("reqId must be a positive integer"))?;
+		let server = self.rpc_server.lock().map_err(|_| napi::Error::from_reason("RPC server lock was poisoned"))?;
+		Ok(server.as_ref().is_some_and(|server| server.bridge_complete(request_id, &result_json)))
+	}
+
+	#[napi(js_name = "shutdownRpcServer")]
+	pub fn shutdown_rpc_server(&self) -> napi::Result<()> {
+		let server = self.rpc_server.lock().map_err(|_| napi::Error::from_reason("RPC server lock was poisoned"))?.take();
+		if let Some(server) = server {
+			server.shutdown();
+		}
+		Ok(())
+	}
+
+	#[napi(js_name = "rpcBridgeStats")]
+	pub fn rpc_bridge_stats(&self) -> napi::Result<RpcBridgeStats> {
+		let server = self.rpc_server.lock().map_err(|_| napi::Error::from_reason("RPC server lock was poisoned"))?;
+		server
+			.as_ref()
+			.map(RpcServerHandle::bridge_stats)
+			.ok_or_else(|| napi::Error::from_reason("RPC server is not running"))
+	}
+
+	#[napi(js_name = "rpcDroppedNotificationCount")]
+	pub fn rpc_dropped_notification_count(&self) -> napi::Result<i64> {
+		let server = self.rpc_server.lock().map_err(|_| napi::Error::from_reason("RPC server lock was poisoned"))?;
+		let count = server
+			.as_ref()
+			.map(RpcServerHandle::dropped_notification_count)
+			.ok_or_else(|| napi::Error::from_reason("RPC server is not running"))?;
+		Ok(i64::try_from(count).unwrap_or(i64::MAX))
 	}
 
 	#[napi(js_name = "lockAcquire")]

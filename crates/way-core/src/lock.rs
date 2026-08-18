@@ -474,6 +474,7 @@ pub enum LockError {
 	InvalidHolder(String),
 	FencingOverflow,
 	ConfirmationRequired,
+	Cancelled,
 }
 
 impl LockError {
@@ -511,6 +512,7 @@ impl fmt::Display for LockError {
 			Self::InvalidWait => formatter.write_str("lock wait_ms must be in 0..=300000 ms"),
 			Self::InvalidHolder(message) => write!(formatter, "invalid lock holder: {message}"),
 			Self::FencingOverflow => formatter.write_str("fencing token exhausted u64"),
+			Self::Cancelled => formatter.write_str("lock wait was cancelled"),
 			Self::ConfirmationRequired => formatter.write_str("operator confirmation is required"),
 		}
 	}
@@ -646,6 +648,16 @@ impl LockManager {
 	}
 
 	pub fn acquire(&self, request: AcquireRequest) -> LockResult<AcquireResult> {
+		self.acquire_with_cancel(request, None)
+	}
+
+	/// Acquires a lock while allowing a connection-owned long-poll to remove its
+	/// in-memory waiter as soon as that connection goes away.
+	pub fn acquire_cancellable(&self, request: AcquireRequest, cancelled: &AtomicBool) -> LockResult<AcquireResult> {
+		self.acquire_with_cancel(request, Some(cancelled))
+	}
+
+	fn acquire_with_cancel(&self, request: AcquireRequest, cancelled: Option<&AtomicBool>) -> LockResult<AcquireResult> {
 		validate_request(&request)?;
 		self.reconcile()?;
 		if let Some(lease) = self.current_lease()? {
@@ -679,6 +691,10 @@ impl LockManager {
 		let ticket = self.enqueue(request.class, request.holder.label.clone(), enqueued_at)?;
 		let deadline = Instant::now() + Duration::from_millis(request.wait_ms);
 		loop {
+			if cancelled.is_some_and(|flag| flag.load(Ordering::Acquire)) {
+				self.remove_waiter(ticket)?;
+				return Err(LockError::Cancelled);
+			}
 			self.reconcile()?;
 			if let Some(lease) = self.current_lease()? {
 				if lease.holder.session_id == request.holder.session_id {
