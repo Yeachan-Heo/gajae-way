@@ -37,9 +37,12 @@ const usage = `Usage:
   way --health [--state-dir PATH] | --version`;
 
 class FailedClosedExit extends Error {
-	constructor() {
+	readonly forceExit: boolean;
+
+	constructor(forceExit = false) {
 		super("failed_closed");
 		this.name = "FailedClosedExit";
+		this.forceExit = forceExit;
 	}
 }
 
@@ -90,7 +93,7 @@ function createRuntimeSdk(): MainSessionSdk {
 	return createE2eEndpointProbeSdk(sdk, endpointPath);
 }
 
-/** Test-only UDS probe that follows the E2E file SDK session's actual disposal lifecycle. */
+/** Test-only UDS probe that follows E2E session disposal and can retain ingress for the forced fail-stop drill. */
 async function createE2eEndpointProbeSession(
 	session: HostedSdkSession,
 	endpointPath: string,
@@ -112,6 +115,7 @@ async function createE2eEndpointProbeSession(
 		});
 	});
 	let disposed = false;
+	const rejectDisposeForE2e = Bun.env.WAY_E2E_SDK_DISPOSE_REJECT === "1";
 	return {
 		sessionFile: session.sessionFile,
 		sessionId: session.sessionId,
@@ -127,17 +131,32 @@ async function createE2eEndpointProbeSession(
 			if (disposed) return;
 			disposed = true;
 			try {
+				if (rejectDisposeForE2e) {
+					throw new Error("forced E2E SDK session disposal rejection");
+				}
 				await session.dispose();
 			} finally {
-				await new Promise<void>((resolve, reject) => server.close((error) => (error ? reject(error) : resolve())));
-				try {
-					fs.unlinkSync(resolvedPath);
-				} catch (error) {
-					if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+				if (!rejectDisposeForE2e) {
+					await new Promise<void>((resolve, reject) => server.close((error) => (error ? reject(error) : resolve())));
+					try {
+						fs.unlinkSync(resolvedPath);
+					} catch (error) {
+						if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+					}
 				}
 			}
 		},
 	};
+}
+
+function failBeforeMainHostForE2e(): void {
+	if (
+		Bun.env.NODE_ENV === "test" &&
+		Bun.env.WAY_E2E_FILE_SDK === "1" &&
+		Bun.env.WAY_E2E_FAIL_BEFORE_MAIN_HOST === "1"
+	) {
+		throw new Error("forced E2E pre-host startup failure");
+	}
 }
 
 function createE2eEndpointProbeSdk(delegate: MainSessionSdk, endpointPath: string): MainSessionSdk {
@@ -167,6 +186,7 @@ async function enterFailedClosed(
 	config: WayConfig,
 	reason: string,
 	persist = true,
+	linger = true,
 ): Promise<never> {
 	if (persist) {
 		try {
@@ -202,13 +222,13 @@ async function enterFailedClosed(
 	} catch {
 		// NOTIFY_SOCKET is optional and status notification is best effort.
 	}
-	await Bun.sleep(config.failClosedLingerMs);
+	if (linger) await Bun.sleep(config.failClosedLingerMs);
 	try {
 		core.shutdownRpcServer();
 	} catch {
 		// Shutdown is idempotent from the process' point of view.
 	}
-	throw new FailedClosedExit();
+	throw new FailedClosedExit(!linger);
 }
 
 function profileBridgeHandler(
@@ -912,17 +932,33 @@ async function disposeUnhostedMainSession(core: WayCoreHandle, session: HostedSd
 	}
 }
 
+type MainSessionStartupDisposalOutcome =
+	| { readonly kind: "not_owned" | "disposed" }
+	| { readonly kind: "failed"; readonly error: unknown };
+
+function logMainSessionStartupDisposalFailure(error: unknown): void {
+	const message = error instanceof Error ? error.message : String(error);
+	const stack = error instanceof Error ? error.stack : undefined;
+	console.error(`main session teardown failed before failed-closed shutdown: ${message}${stack ? `\n${stack}` : ""}`);
+}
+
 async function disposeMainSessionAfterStartupFailure(
 	core: WayCoreHandle,
 	host: MainSessionHost | undefined,
 	resumedSession: HostedSdkSession | undefined,
-): Promise<void> {
+): Promise<MainSessionStartupDisposalOutcome> {
 	try {
-		if (host) await disposeMainSession(core, host);
-		else if (resumedSession) await disposeUnhostedMainSession(core, resumedSession);
-	} catch {
-		// A teardown failure cannot suppress the failed-closed transition. The
-		// session disposal attempt still occurs before health is published.
+		if (host) {
+			await disposeMainSession(core, host);
+			return { kind: "disposed" };
+		}
+		if (resumedSession) {
+			await disposeUnhostedMainSession(core, resumedSession);
+			return { kind: "disposed" };
+		}
+		return { kind: "not_owned" };
+	} catch (error) {
+		return { kind: "failed", error };
 	}
 }
 
@@ -990,6 +1026,7 @@ async function serveWay(config: WayConfig): Promise<void> {
 			onInjectionLog: (entry) => console.warn(`way injection ${entry.kind}: ${entry.path}`),
 		});
 		resumedSession = resumed.session;
+		failBeforeMainHostForE2e();
 		await reconcilePendingClosureOperation(core, closures, profile.corpusPath, resumed.identity.sessionId);
 		host = createMainSessionHost({
 			session: resumed.session,
@@ -1032,14 +1069,21 @@ async function serveWay(config: WayConfig): Promise<void> {
 		await waitForShutdown(core, host, closures, reconciler);
 	} catch (error) {
 		if (error instanceof FailedClosedExit) {
-			await disposeMainSessionAfterStartupFailure(core, host, resumedSession);
+			const disposal = await disposeMainSessionAfterStartupFailure(core, host, resumedSession);
+			if (disposal.kind === "failed") logMainSessionStartupDisposalFailure(disposal.error);
 			await closures.shutdown();
 			reconciler?.stop();
 			throw error;
 		}
-		await disposeMainSessionAfterStartupFailure(core, host, resumedSession);
+		const disposal = await disposeMainSessionAfterStartupFailure(core, host, resumedSession);
+		if (disposal.kind === "failed") logMainSessionStartupDisposalFailure(disposal.error);
 		reconciler?.stop();
 		await closures.shutdown();
+		if (disposal.kind === "failed") {
+			// A rejected SDK disposal leaves external ingress uncertain. Publish the
+			// failed-closed state, but fail-stop rather than holding the normal linger.
+			await enterFailedClosed(core, state, config, failureReason(error), true, false);
+		}
 		await enterFailedClosed(core, state, config, failureReason(error));
 	}
 }
@@ -1178,6 +1222,7 @@ if (import.meta.main && process.env.WAY_INTERNAL_CLOSURE_WORKER === "1") {
 		await runWay();
 	} catch (error) {
 		if (error instanceof FailedClosedExit) {
+			if (error.forceExit) process.exit(78);
 			process.exitCode = 78;
 		} else {
 			console.error(error instanceof Error ? error.message : String(error));

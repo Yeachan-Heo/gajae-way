@@ -103,6 +103,19 @@ async function failedClosedHealth(client: RpcClient): Promise<Record<string, unk
 	}, "compiled daemon did not become failed_closed");
 }
 
+async function failedClosedHealthFile(stateDirectory: string): Promise<Record<string, unknown>> {
+	return await eventually(() => {
+		try {
+			const health = JSON.parse(fs.readFileSync(path.join(stateDirectory, "health.json"), "utf8")) as unknown;
+			return health && typeof health === "object" && (health as { state?: unknown }).state === "failed_closed"
+				? (health as Record<string, unknown>)
+				: undefined;
+		} catch {
+			return undefined;
+		}
+	}, "compiled daemon did not publish failed-closed health");
+}
+
 async function eventually<T>(
 	read: () => T | undefined | Promise<T | undefined>,
 	description: string,
@@ -477,6 +490,7 @@ test("compiled daemon makes corpus closures durable, replayable, and single-flig
 		await run(["git", "-C", remoteAdvance, "commit", "-m", "advance remote beyond recovery evidence"]);
 		await run(["git", "-C", remoteAdvance, "push"]);
 
+		const successfulDisposalFailedClosedStartedAt = performance.now();
 		daemon = Bun.spawn({
 			cmd: [executable, "serve", "--state-dir", state, "--profile", profilePath, "--fail-closed-linger-ms", "3000"],
 			cwd: repositoryRoot,
@@ -496,7 +510,9 @@ test("compiled daemon makes corpus closures durable, replayable, and single-flig
 		expect(await endpointReachable(endpointPath)).toBe(false);
 		client.close();
 		client = undefined;
-		expect(await daemon.exited).toBe(78);
+		const successfulDisposalExitCode = await daemon.exited;
+		expect(successfulDisposalExitCode).toBe(78);
+		expect(performance.now() - successfulDisposalFailedClosedStartedAt).toBeGreaterThanOrEqual(2_000);
 	} finally {
 		for (const extraClient of extraClients) extraClient.close();
 		client?.close();
@@ -510,3 +526,69 @@ test("compiled daemon makes corpus closures durable, replayable, and single-flig
 		fs.rmSync(root, { force: true, recursive: true });
 	}
 }, 60_000);
+
+test("compiled daemon exits promptly when pre-host session disposal rejects", async () => {
+	const executable = compiledWay();
+	const root = fs.mkdtempSync(path.join(os.tmpdir(), "gajae-way-disposal-rejection-"));
+	const corpus = path.join(root, "corpus");
+	const workspace = path.join(root, "workspace");
+	const state = path.join(root, "state");
+	const profilePath = path.join(root, "profile.toml");
+	const endpointPath = path.join(os.tmpdir(), `way-disposal-rejection-${process.pid}-${Date.now()}.sock`);
+	const environment = {
+		...process.env,
+		NODE_ENV: "test",
+		WAY_E2E_FILE_SDK: "1",
+		WAY_BROKER_CLI: "/usr/bin/false",
+		WAY_RECONCILE_POLL_MS: "600000",
+	};
+	let daemon: ReturnType<typeof Bun.spawn> | undefined;
+	try {
+		fs.mkdirSync(corpus);
+		fs.mkdirSync(workspace);
+		fs.writeFileSync(profilePath, profile(corpus, workspace));
+		await run(
+			[executable, "bootstrap", "--confirm", "--state-dir", state, "--profile", profilePath],
+			repositoryRoot,
+			environment,
+		);
+
+		const promptExitDeadlineMs = 1_500;
+		const failedClosedStartedAt = performance.now();
+		const rejectedDaemon = Bun.spawn({
+			cmd: [executable, "serve", "--state-dir", state, "--profile", profilePath, "--fail-closed-linger-ms", "5000"],
+			cwd: repositoryRoot,
+			env: {
+				...environment,
+				WAY_E2E_SDK_ENDPOINT_PATH: endpointPath,
+				WAY_E2E_SDK_DISPOSE_REJECT: "1",
+				WAY_E2E_FAIL_BEFORE_MAIN_HOST: "1",
+			},
+			stdout: "ignore",
+			stderr: "pipe",
+		});
+		daemon = rejectedDaemon;
+		const failedClosedHealth = await failedClosedHealthFile(state);
+		expect(failedClosedHealth).toMatchObject({
+			status: "unhealthy",
+			state: "failed_closed",
+			reason: "startup_failed",
+		});
+		const exitCode = await Promise.race([rejectedDaemon.exited, Bun.sleep(promptExitDeadlineMs).then(() => undefined)]);
+		expect(exitCode).toBe(78);
+		expect(performance.now() - failedClosedStartedAt).toBeLessThan(promptExitDeadlineMs);
+		const stderr = await new Response(rejectedDaemon.stderr).text();
+		expect(stderr).toContain(
+			"main session teardown failed before failed-closed shutdown: forced E2E SDK session disposal rejection",
+		);
+	} finally {
+		if (daemon?.exitCode === null) daemon.kill("SIGTERM");
+		if (daemon) {
+			await Promise.race([daemon.exited, Bun.sleep(2_000)]);
+			if (daemon.exitCode === null) daemon.kill("SIGKILL");
+			await daemon.exited;
+		}
+		fs.rmSync(endpointPath, { force: true });
+		fs.rmSync(root, { force: true, recursive: true });
+	}
+}, 10_000);
