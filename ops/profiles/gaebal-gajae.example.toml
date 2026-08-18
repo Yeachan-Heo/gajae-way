@@ -1,0 +1,13 @@
+# Example only: gajae-way itself hardcodes no corpus, persona, or platform identity.
+[corpus]
+path = "/srv/gaebal-gajae/corpus"
+workspace = "/srv/gaebal-gajae/workspace"
+
+[injection]
+# The P3 loader preserves this identity-sensitive order.
+files = ["SOUL.md", "USER.md", "daily/{date}.md", "MEMORY.md"]
+
+[surfaces.owner]
+id = "discord:owner-dm"
+platform = "discord"
+kind = "dm"

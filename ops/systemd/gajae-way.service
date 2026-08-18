@@ -1,0 +1,11 @@
+# P0 placeholder only. P8 replaces this with the hardened deployment unit.
+[Unit]
+Description=Gajae Way operator-agent runtime
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/way
+Restart=no
+
+[Install]
+WantedBy=multi-user.target
