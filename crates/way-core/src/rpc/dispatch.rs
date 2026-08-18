@@ -484,6 +484,16 @@ impl RpcDispatcher {
 		}
 	}
 
+	/// Clears live main-session facts when the host is disposed or the daemon
+	/// enters failed-closed mode. Durable bootstrap state is intentionally kept.
+	pub fn reset_main_session_status(&self) {
+		if let Ok(mut status) = self.main_session.lock() {
+			status.resumed = false;
+			status.turn_state = "idle".to_owned();
+			status.follow_up_queue_depth = 0;
+		}
+	}
+
 	pub fn set_journal_degraded(&self, degraded: bool) {
 		if let Ok(mut status) = self.main_session.lock() {
 			status.journal_degraded = degraded;
@@ -1445,6 +1455,17 @@ mod tests {
 		assert_eq!(status["consumers"][0]["consumer_id"], "discord");
 		assert_eq!(status["consumers"][0]["claim_id"], claim.claim_id);
 		assert_eq!(status["consumers"][0]["cursor"], claim.cursor.to_string());
+
+		// Disposing the host or entering failed-closed clears only live runtime
+		// publication; durable identity remains available for a later strict resume.
+		dispatcher.reset_main_session_status();
+		dispatcher.set_gateway_state(GatewayState::FailedClosed, Some("host_disposed".to_owned()));
+		let disposed_health = dispatcher
+			.dispatch("way.health".to_owned(), json!({}), super::super::CancellationToken::new())
+			.await
+			.unwrap();
+		assert_eq!(disposed_health["main"]["resumed"], false);
+		assert!(disposed_health["main"]["session_id"].is_null());
 	}
 
 	#[test]

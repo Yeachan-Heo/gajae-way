@@ -202,6 +202,14 @@ test("compiled daemon makes corpus closures durable, replayable, and single-flig
 			code: -32602,
 			message: "main.corpus.close idempotency_key must be a non-empty string.",
 		});
+		const invalidPath = await client.request(
+			"main.corpus.close",
+			closureParams("../outside.txt", "invalid closure path", "invalid-path-key"),
+		);
+		expect(invalidPath.error).toMatchObject({
+			code: -32602,
+			message: "main.corpus.close paths must remain inside the corpus and cannot name the corpus root.",
+		});
 
 		fs.writeFileSync(path.join(corpus, "compiled-close.txt"), "closed by compiled daemon\n");
 		const firstParams = closureParams("compiled-close.txt", "compiled daemon closure", "compiled-daemon-closure");
@@ -267,6 +275,66 @@ test("compiled daemon makes corpus closures durable, replayable, and single-flig
 		subjects = await run(["git", `--git-dir=${remote}`, "log", "--format=%s", "main"]);
 		expect(subjects.split("\n").filter((subject) => subject === "single-flight closure")).toHaveLength(1);
 		fs.rmSync(concurrentPushHook, { force: true });
+
+		// Kill the compiled daemon after `git push` succeeds but before the bridge
+		// can persist its public idempotency response. Restart reconciliation must
+		// derive the original response from the bound operation/recovery evidence.
+		client.close();
+		client = undefined;
+		if (daemon?.exitCode === null) daemon.kill("SIGTERM");
+		if (daemon) await daemon.exited;
+		const crashMarker = path.join(root, "after-push-marker");
+		const crashRelease = path.join(root, "after-push-release");
+		daemon = Bun.spawn({
+			cmd: [executable, "serve", "--state-dir", state, "--profile", profilePath],
+			cwd: repositoryRoot,
+			env: {
+				...environment,
+				WAY_E2E_CLOSURE_AFTER_PUSH_MARKER: crashMarker,
+				WAY_E2E_CLOSURE_AFTER_PUSH_RELEASE: crashRelease,
+			},
+			stdout: "ignore",
+			stderr: "pipe",
+		});
+		client = await connectHealthy(socketPath);
+		fs.writeFileSync(path.join(corpus, "crash-reconcile.txt"), "recover after daemon death\n");
+		const crashParams = closureParams("crash-reconcile.txt", "push-crash closure", "push-crash-key");
+		const interrupted = client.request("main.corpus.close", crashParams, { timeoutMs: 10_000 }).catch(() => undefined);
+		await eventually(
+			() => (fs.existsSync(crashMarker) ? true : undefined),
+			"closure did not reach the post-push crash boundary",
+		);
+		const originalBoundary = JSON.parse(fs.readFileSync(crashMarker, "utf8")) as { readonly response: unknown };
+		daemon.kill("SIGKILL");
+		await daemon.exited;
+		await interrupted;
+		client.close();
+		client = undefined;
+		expect(await run(["git", `--git-dir=${remote}`, "show", "main:crash-reconcile.txt"])).toBe(
+			"recover after daemon death\n",
+		);
+		subjects = await run(["git", `--git-dir=${remote}`, "log", "--format=%s", "main"]);
+		expect(subjects.split("\n").filter((subject) => subject === "push-crash closure")).toHaveLength(1);
+
+		daemon = Bun.spawn({
+			cmd: [executable, "serve", "--state-dir", state, "--profile", profilePath],
+			cwd: repositoryRoot,
+			env: environment,
+			stdout: "ignore",
+			stderr: "pipe",
+		});
+		client = await connectHealthy(socketPath);
+		const recoveredAfterRestart = await client.request("main.corpus.close", crashParams, { timeoutMs: 10_000 });
+		expect(recoveredAfterRestart.result).toEqual(originalBoundary.response);
+		const replayAfterRestart = await client.request("main.corpus.close", crashParams);
+		expect(replayAfterRestart.result).toEqual(recoveredAfterRestart.result);
+		const crashConflict = await client.request(
+			"main.corpus.close",
+			closureParams("crash-reconcile.txt", "conflicting push-crash closure", "push-crash-key"),
+		);
+		expect(crashConflict.error).toMatchObject({ code: 1500, message: "idempotency_conflict" });
+		subjects = await run(["git", `--git-dir=${remote}`, "log", "--format=%s", "main"]);
+		expect(subjects.split("\n").filter((subject) => subject === "push-crash closure")).toHaveLength(1);
 	} finally {
 		for (const extraClient of extraClients) extraClient.close();
 		client?.close();
@@ -278,4 +346,4 @@ test("compiled daemon makes corpus closures durable, replayable, and single-flig
 		}
 		fs.rmSync(root, { force: true, recursive: true });
 	}
-}, 30_000);
+}, 45_000);

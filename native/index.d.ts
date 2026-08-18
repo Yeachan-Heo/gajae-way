@@ -34,6 +34,8 @@ export declare class WayCore {
   setRpcHealth(state: string, reason?: string | undefined | null): void
   /** Publishes live main-session state after strict resume for `way.status`. */
   setMainSessionStatus(turnState: string, followUpQueueDepth: number): void
+  /** Clears process-local resume facts once the hosted main session is gone. */
+  resetMainSessionStatus(): void
   /** Marks journal-derived delivery as halted after a synchronous append failure. */
   setJournalDegraded(degraded: boolean): void
   /**
@@ -99,6 +101,13 @@ export declare class WayCore {
   setReconcileStatus(input: ReconcileStatusInput): void
   idempotencyReplay(input: IdempotencyReplayInput): IdempotencyReplayOutput
   idempotencyStore(input: IdempotencyStoreInput): void
+  /** Claims a corpus closure's durable intent before its Git effect begins. */
+  closureOperationClaim(input: ClosureOperationClaimInput): ClosureOperationClaimOutput
+  /**
+   * Atomically publishes a completed corpus closure response and removes its
+   * active intent only when the exact original intent still owns the key.
+   */
+  closureOperationFinalize(input: ClosureOperationFinalizeInput): ClosureOperationFinalizeOutput
 }
 
 /** Request data delivered from Rust's TSFN into the thin TypeScript shim. */
@@ -106,6 +115,32 @@ export interface BridgeRequest {
   reqId: number
   method: string
   paramsJson: string
+}
+
+export interface ClosureOperationClaimInput {
+  scope: string
+  key: string
+  requestJson: string
+  intentJson: string
+  operationJson: string
+}
+
+export interface ClosureOperationClaimOutput {
+  claimed: boolean
+  responseJson?: string
+}
+
+export interface ClosureOperationFinalizeInput {
+  scope: string
+  key: string
+  requestJson: string
+  intentJson: string
+  responseJson: string
+  operationJson: string
+}
+
+export interface ClosureOperationFinalizeOutput {
+  responseJson: string
 }
 
 export interface ConsumerClaimOutput {

@@ -16,6 +16,7 @@ use rusqlite::{Connection, OptionalExtension, Transaction};
 pub const DATABASE_FILENAME: &str = "way-core.sqlite3";
 pub const SCHEMA_VERSION: u32 = 2;
 pub const IDEMPOTENCY_WINDOW_MS: i64 = 24 * 60 * 60 * 1_000;
+pub const CLOSURE_OPERATION_META_KEY: &str = "gitlock_closure_operation";
 
 /// A clock is injected into protocol tests so expiry and retention behavior
 /// never depends on wall-clock sleeps.
@@ -50,6 +51,9 @@ pub enum StoreError {
     UnsupportedSchema(u32),
     InvalidMetadata(String),
     IdempotencyConflict,
+    ClosureOperationInProgress,
+    ClosureOperationMissing,
+    ClosureOperationChanged,
 }
 
 impl fmt::Display for StoreError {
@@ -71,6 +75,9 @@ impl fmt::Display for StoreError {
             Self::IdempotencyConflict => {
                 formatter.write_str("idempotency key was reused for a different request")
             }
+            Self::ClosureOperationInProgress => formatter.write_str("another corpus closure operation is pending recovery"),
+            Self::ClosureOperationMissing => formatter.write_str("closure operation intent is missing"),
+            Self::ClosureOperationChanged => formatter.write_str("closure operation intent changed before finalization"),
         }
     }
 }
@@ -98,6 +105,12 @@ impl From<rusqlite::Error> for StoreError {
 }
 
 pub type StoreResult<T> = Result<T, StoreError>;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ClosureOperationClaim {
+    Claimed,
+    Existing { response_json: String },
+}
 
 struct StoreInner {
     connection: Mutex<Connection>,
@@ -252,6 +265,97 @@ impl Store {
 		)?;
         transaction.commit()?;
         Ok(())
+    }
+
+    /// Atomically reserves a corpus-closure idempotency key and writes the
+    /// matching durable operation intent before Git is allowed to mutate.
+    pub fn claim_closure_operation(
+        &self,
+        scope: &str,
+        key: &str,
+        request_json: &str,
+        intent_json: &str,
+        operation_json: &str,
+        now_ms: i64,
+    ) -> StoreResult<ClosureOperationClaim> {
+        let expires_at = now_ms.checked_add(IDEMPOTENCY_WINDOW_MS).ok_or_else(|| {
+            StoreError::InvalidMetadata("idempotency expiration overflowed i64".to_owned())
+        })?;
+        let mut connection = self.connection()?;
+        let transaction = connection.transaction()?;
+        transaction.execute("DELETE FROM idempotency WHERE expires_at <= ?1", [now_ms])?;
+        let existing = transaction
+            .query_row(
+                "SELECT request_json, response_json FROM idempotency WHERE scope = ?1 AND idempotency_key = ?2",
+                rusqlite::params![scope, key],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            )
+            .optional()?;
+        match existing {
+            Some((stored_request, _)) if stored_request != request_json => return Err(StoreError::IdempotencyConflict),
+            Some((_, response_json)) => {
+                transaction.commit()?;
+                return Ok(ClosureOperationClaim::Existing { response_json });
+            }
+            None => {}
+        }
+        if meta_get_tx(&transaction, CLOSURE_OPERATION_META_KEY)?.is_some() {
+            return Err(StoreError::ClosureOperationInProgress);
+        }
+        transaction.execute(
+            "INSERT INTO idempotency(scope, idempotency_key, request_json, response_json, created_at, expires_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            rusqlite::params![scope, key, request_json, intent_json, now_ms, expires_at],
+        )?;
+        meta_set_tx(&transaction, CLOSURE_OPERATION_META_KEY, operation_json)?;
+        transaction.commit()?;
+        Ok(ClosureOperationClaim::Claimed)
+    }
+
+    /// Atomically replaces a previously claimed intent with its completed
+    /// response and removes its active-operation record.
+    pub fn finalize_closure_operation(
+        &self,
+        scope: &str,
+        key: &str,
+        request_json: &str,
+        intent_json: &str,
+        operation_json: &str,
+        response_json: &str,
+        now_ms: i64,
+    ) -> StoreResult<String> {
+        let expires_at = now_ms.checked_add(IDEMPOTENCY_WINDOW_MS).ok_or_else(|| {
+            StoreError::InvalidMetadata("idempotency expiration overflowed i64".to_owned())
+        })?;
+        let mut connection = self.connection()?;
+        let transaction = connection.transaction()?;
+        let existing = transaction
+            .query_row(
+                "SELECT request_json, response_json FROM idempotency WHERE scope = ?1 AND idempotency_key = ?2",
+                rusqlite::params![scope, key],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            )
+            .optional()?;
+        let Some((stored_request, stored_response)) = existing else {
+            return Err(StoreError::ClosureOperationMissing);
+        };
+        if stored_request != request_json {
+            return Err(StoreError::IdempotencyConflict);
+        }
+        if stored_response != intent_json {
+            transaction.commit()?;
+            return Ok(stored_response);
+        }
+        if meta_get_tx(&transaction, CLOSURE_OPERATION_META_KEY)?.as_deref() != Some(operation_json) {
+            return Err(StoreError::ClosureOperationChanged);
+        }
+        transaction.execute(
+            "UPDATE idempotency SET response_json = ?1, expires_at = ?2 WHERE scope = ?3 AND idempotency_key = ?4",
+            rusqlite::params![response_json, expires_at, scope, key],
+        )?;
+        transaction.execute("DELETE FROM gateway_meta WHERE k = ?1", [CLOSURE_OPERATION_META_KEY])?;
+        transaction.commit()?;
+        Ok(response_json.to_owned())
     }
 }
 
@@ -513,7 +617,10 @@ mod tests {
         sync::atomic::{AtomicU64, Ordering},
     };
 
-    use super::{DATABASE_FILENAME, IDEMPOTENCY_WINDOW_MS, SCHEMA_VERSION, Store};
+    use super::{
+        CLOSURE_OPERATION_META_KEY, DATABASE_FILENAME, IDEMPOTENCY_WINDOW_MS, SCHEMA_VERSION,
+        ClosureOperationClaim, Store, StoreError,
+    };
     use rusqlite::{Connection, OptionalExtension};
 
     static NEXT_TEMP_DIR: AtomicU64 = AtomicU64::new(0);
@@ -710,5 +817,45 @@ mod tests {
                 .unwrap(),
             None
         );
+    }
+
+    #[test]
+    fn closure_operation_intent_binds_idempotency_before_final_response() {
+        let store = Store::default();
+        let scope = "main.corpus.close";
+        let request = r#"{"commit_message":"close","idempotency_key":"key","paths":["file.txt"]}"#;
+        let intent = r#"{"operationId":"operation","requestHash":"hash"}"#;
+        let operation = r#"{"intentJson":"{\"operationId\":\"operation\",\"requestHash\":\"hash\"}","state":"intent"}"#;
+        let response = r#"{"committed":true,"fencing_token":"2","lease_id":"lease"}"#;
+
+        assert_eq!(
+            store
+                .claim_closure_operation(scope, "key", request, intent, operation, 100)
+                .unwrap(),
+            ClosureOperationClaim::Claimed
+        );
+        assert_eq!(
+            store.get_meta(CLOSURE_OPERATION_META_KEY).unwrap().as_deref(),
+            Some(operation)
+        );
+        assert_eq!(
+            store
+                .claim_closure_operation(scope, "key", request, intent, operation, 101)
+                .unwrap(),
+            ClosureOperationClaim::Existing { response_json: intent.to_owned() }
+        );
+        assert!(matches!(
+            store.claim_closure_operation(scope, "key", r#"{"different":true}"#, intent, operation, 101),
+            Err(StoreError::IdempotencyConflict)
+        ));
+
+        assert_eq!(
+            store
+                .finalize_closure_operation(scope, "key", request, intent, operation, response, 102)
+                .unwrap(),
+            response
+        );
+        assert_eq!(store.get_meta(CLOSURE_OPERATION_META_KEY).unwrap(), None);
+        assert_eq!(store.replay_idempotency(scope, "key", request, 103).unwrap().as_deref(), Some(response));
     }
 }

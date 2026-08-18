@@ -25,7 +25,7 @@ use crate::{
 		LockStatus, ProcessObservation, ProcessProbe, QuarantineReceiptEvidence, QueueEntry, ReleaseResult, SystemProcessProbe,
 	},
 	registry::{BrokerSessionRow, BrokerSnapshot, GatewaySession, MetadataEnrichment, RegistryAnnotation, RegistryListFilter, SurfaceRecord},
-	store::{Store, StoreError, meta_get_tx, meta_set_tx, unix_epoch_ms},
+	store::{ClosureOperationClaim, Store, StoreError, meta_get_tx, meta_set_tx, unix_epoch_ms},
 };
 
 pub mod events;
@@ -296,6 +296,45 @@ pub struct IdempotencyStoreInput {
 	pub key: String,
 	#[napi(js_name = "requestJson")]
 	pub request_json: String,
+	#[napi(js_name = "responseJson")]
+	pub response_json: String,
+}
+
+#[napi(object)]
+pub struct ClosureOperationClaimInput {
+	pub scope: String,
+	pub key: String,
+	#[napi(js_name = "requestJson")]
+	pub request_json: String,
+	#[napi(js_name = "intentJson")]
+	pub intent_json: String,
+	#[napi(js_name = "operationJson")]
+	pub operation_json: String,
+}
+
+#[napi(object)]
+pub struct ClosureOperationClaimOutput {
+	pub claimed: bool,
+	#[napi(js_name = "responseJson")]
+	pub response_json: Option<String>,
+}
+
+#[napi(object)]
+pub struct ClosureOperationFinalizeInput {
+	pub scope: String,
+	pub key: String,
+	#[napi(js_name = "requestJson")]
+	pub request_json: String,
+	#[napi(js_name = "intentJson")]
+	pub intent_json: String,
+	#[napi(js_name = "responseJson")]
+	pub response_json: String,
+	#[napi(js_name = "operationJson")]
+	pub operation_json: String,
+}
+
+#[napi(object)]
+pub struct ClosureOperationFinalizeOutput {
 	#[napi(js_name = "responseJson")]
 	pub response_json: String,
 }
@@ -657,6 +696,15 @@ impl WayCore {
 		Ok(())
 	}
 
+	/// Clears process-local resume facts once the hosted main session is gone.
+	#[napi(js_name = "resetMainSessionStatus")]
+	pub fn reset_main_session_status(&self) -> napi::Result<()> {
+		let server = self.rpc_server.lock().map_err(|_| napi::Error::from_reason("RPC server lock was poisoned"))?;
+		let server = server.as_ref().ok_or_else(|| napi::Error::from_reason("RPC server is not running"))?;
+		server.reset_main_session_status();
+		Ok(())
+	}
+
 	/// Marks journal-derived delivery as halted after a synchronous append failure.
 	#[napi(js_name = "setJournalDegraded")]
 	pub fn set_journal_degraded(&self, degraded: bool) -> napi::Result<()> {
@@ -1007,6 +1055,47 @@ impl WayCore {
 		self.store
 			.store_idempotency_response(&input.scope, &input.key, &input.request_json, &input.response_json, unix_epoch_ms())
 			.map_err(store_napi_error)
+	}
+
+	/// Claims a corpus closure's durable intent before its Git effect begins.
+	#[napi(js_name = "closureOperationClaim")]
+	pub fn closure_operation_claim(&self, input: ClosureOperationClaimInput) -> napi::Result<ClosureOperationClaimOutput> {
+		match self
+			.store
+			.claim_closure_operation(
+				&input.scope,
+				&input.key,
+				&input.request_json,
+				&input.intent_json,
+				&input.operation_json,
+				unix_epoch_ms(),
+			)
+			.map_err(store_napi_error)?
+		{
+			ClosureOperationClaim::Claimed => Ok(ClosureOperationClaimOutput { claimed: true, response_json: None }),
+			ClosureOperationClaim::Existing { response_json } => {
+				Ok(ClosureOperationClaimOutput { claimed: false, response_json: Some(response_json) })
+			}
+		}
+	}
+
+	/// Atomically publishes a completed corpus closure response and removes its
+	/// active intent only when the exact original intent still owns the key.
+	#[napi(js_name = "closureOperationFinalize")]
+	pub fn closure_operation_finalize(&self, input: ClosureOperationFinalizeInput) -> napi::Result<ClosureOperationFinalizeOutput> {
+		let response_json = self
+			.store
+			.finalize_closure_operation(
+				&input.scope,
+				&input.key,
+				&input.request_json,
+				&input.intent_json,
+				&input.operation_json,
+				&input.response_json,
+				unix_epoch_ms(),
+			)
+			.map_err(store_napi_error)?;
+		Ok(ClosureOperationFinalizeOutput { response_json })
 	}
 }
 

@@ -40,6 +40,7 @@ export interface WayCoreHandle {
 	rpcDroppedNotificationCount(): number;
 	setRpcHealth(state: "booting" | "verifying" | "running" | "failed_closed" | "degraded", reason?: string): void;
 	setMainSessionStatus(turnState: "idle" | "busy", followUpQueueDepth: number): void;
+	resetMainSessionStatus(): void;
 	setJournalDegraded(degraded: boolean): void;
 	sdNotifyStatus(status: string): void;
 	sdNotifyReady(status: string): void;
@@ -212,6 +213,21 @@ export interface WayCoreHandle {
 		responseJson?: string;
 	};
 	idempotencyStore(input: { scope: string; key: string; requestJson: string; responseJson: string }): void;
+	closureOperationClaim(input: {
+		scope: string;
+		key: string;
+		requestJson: string;
+		intentJson: string;
+		operationJson: string;
+	}): { claimed: boolean; responseJson?: string };
+	closureOperationFinalize(input: {
+		scope: string;
+		key: string;
+		requestJson: string;
+		intentJson: string;
+		operationJson: string;
+		responseJson: string;
+	}): { responseJson: string };
 }
 
 export interface WayCoreConstructor {

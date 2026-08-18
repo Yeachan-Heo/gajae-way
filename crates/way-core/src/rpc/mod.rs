@@ -132,6 +132,10 @@ impl RpcServerHandle {
 		self.dispatcher.set_main_session_status(turn_state, follow_up_queue_depth);
 	}
 
+	pub fn reset_main_session_status(&self) {
+		self.dispatcher.reset_main_session_status();
+	}
+
 	pub fn set_journal_degraded(&self, degraded: bool) {
 		self.dispatcher.set_journal_degraded(degraded);
 	}

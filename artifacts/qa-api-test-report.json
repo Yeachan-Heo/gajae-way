@@ -1,0 +1,284 @@
+{
+  "schemaVersion": 1,
+  "kind": "api-package-test-report",
+  "subject": "gajae-way v1 (plan phases P0-P8)",
+  "frozenCommit": "0bf4a61c35c37283fb4aa36c0b63cf3afb1b99a1-plus-gen4-fixes",
+  "producedBy": "ultragoal leader (delegated executor QA lane failed three times; leader ran the matrix directly)",
+  "contract": ".gjc/_session-01a00ef5-0d0c-7000-b6f1-36f0fe3f8080/plans/ralplan/01a00ef5-0d0c-7000-b6f1-36f0fe3f8080/pending-approval.md",
+  "rerunCommands": [
+    "cargo test -p way-core",
+    "bun test",
+    "bun test test/e2e/",
+    "bun test test/qa/",
+    "bunx tsc --noEmit",
+    "bun scripts/build-native.ts",
+    "bun scripts/compile.ts"
+  ],
+  "cases": [
+    {
+      "id": "QA-FRAME-01",
+      "contractRef": "Detail 2 framing contract: 1 MiB cap",
+      "invocation": "bun test test/qa/uds-negative-paths.test.ts (real UDS oversize frame)",
+      "expected": "payload_too_large then connection close",
+      "observed": "payload_too_large returned, connection closed",
+      "verdict": "passed"
+    },
+    {
+      "id": "QA-FRAME-02",
+      "contractRef": "Detail 2 framing: invalid UTF-8 closes, blank lines ignored",
+      "invocation": "bun test test/qa/uds-negative-paths.test.ts; cargo test -p way-core (framing suite)",
+      "expected": "malformed frames close the connection without affecting other connections",
+      "observed": "connection closed; server healthy for subsequent clients",
+      "verdict": "passed"
+    },
+    {
+      "id": "QA-FRAME-03",
+      "contractRef": "Detail 2 framing: batch arrays rejected",
+      "invocation": "cargo test -p way-core (rpc::framing / rpc::mod batch tests)",
+      "expected": "-32600 batch_unsupported",
+      "observed": "batch_unsupported returned",
+      "verdict": "passed"
+    },
+    {
+      "id": "QA-FRAME-04",
+      "contractRef": "Detail 2 framing: duplicate in-flight id",
+      "invocation": "cargo test -p way-core (rpc::framing duplicate-id test)",
+      "expected": "-32600 duplicate_id",
+      "observed": "duplicate_id returned",
+      "verdict": "passed"
+    },
+    {
+      "id": "QA-FRAME-05",
+      "contractRef": "Detail 2 framing: 16-deep pipeline with read-stop backpressure",
+      "invocation": "cargo test -p way-core (backpressure test); test/integration/rpc.test.ts",
+      "expected": "backpressure applied without crash or dropped responses",
+      "observed": "requests queued FIFO, server stayed healthy",
+      "verdict": "passed"
+    },
+    {
+      "id": "QA-FRAME-06",
+      "contractRef": "Detail 2: rpc.cancel is the only accepted notification",
+      "invocation": "bun test test/qa/uds-negative-paths.test.ts (unknown cancellation)",
+      "expected": "rpc.cancel for an unknown id is a harmless no-op",
+      "observed": "no-op, connection unaffected",
+      "verdict": "passed"
+    },
+    {
+      "id": "QA-ADMIT-01",
+      "contractRef": "Detail 2 main.submit: server-authoritative admission, no caller delivery field",
+      "invocation": "bun test test/qa/uds-negative-paths.test.ts (unknown fields)",
+      "expected": "-32602 on unknown/extra fields incl. a caller-supplied delivery field",
+      "observed": "-32602 returned",
+      "verdict": "passed"
+    },
+    {
+      "id": "QA-ADMIT-02",
+      "contractRef": "fact-27 / Detail 2: non-owner surfaces never prompt or steer",
+      "invocation": "bun test test/qa/uds-negative-paths.test.ts (non-owner ingress)",
+      "expected": "non-owner surface always resolves to durable follow_up",
+      "observed": "follow_up only; prompt and steer never produced",
+      "verdict": "passed"
+    },
+    {
+      "id": "QA-ADMIT-03",
+      "contractRef": "Detail 2 error 1300 unknown_surface",
+      "invocation": "bun test test/integration/p4.test.ts",
+      "expected": "1300 for a surface absent from the profile",
+      "observed": "1300 returned",
+      "verdict": "passed"
+    },
+    {
+      "id": "QA-ADMIT-04",
+      "contractRef": "Detail 2: 24h idempotency replay, 1500 on conflicting reuse",
+      "invocation": "bun test test/qa/uds-negative-paths.test.ts",
+      "expected": "same key replays; same key with different params returns 1500",
+      "observed": "replay returned original result; conflict returned 1500",
+      "verdict": "passed"
+    },
+    {
+      "id": "QA-LOCK-01",
+      "contractRef": "AS6(b): v1 lock serves in-daemon holders only",
+      "invocation": "bun test test/integration/rpc.test.ts",
+      "expected": "RPC lock acquisition refused for in_daemon and external holder kinds",
+      "observed": "-32602 refusal for both",
+      "verdict": "passed"
+    },
+    {
+      "id": "QA-LOCK-02",
+      "contractRef": "Detail 1: idempotent release; renew only extends a live lease",
+      "invocation": "bun test test/qa/uds-negative-paths.test.ts",
+      "expected": "double release idempotent; renew after expiry returns 1202 lease_expired",
+      "observed": "release idempotent; 1202 returned",
+      "verdict": "passed"
+    },
+    {
+      "id": "QA-LOCK-03",
+      "contractRef": "Detail 1 + AS2': force_release requires proven death",
+      "invocation": "bun test test/e2e/gitlock.test.ts (L3); test/e2e/quarantine-runbook.test.ts",
+      "expected": "1207 lock_holder_unverified while the holder is provably alive",
+      "observed": "1207 returned; no successor admitted",
+      "verdict": "passed"
+    },
+    {
+      "id": "QA-LOCK-04",
+      "contractRef": "Detail 1: quarantine fences writes until a bound receipt clears it",
+      "invocation": "bun test test/e2e/quarantine-runbook.test.ts",
+      "expected": "acquire refused while quarantined; incomplete or wrong-corpus receipts refused; bound receipt clears and writes resume",
+      "observed": "refusals as specified; clearance with the daemon-generated bound receipt restored writes and pushed a closure to the bare remote",
+      "verdict": "passed"
+    },
+    {
+      "id": "QA-LOCK-05",
+      "contractRef": "Detail 1 crash matrix L1a/L2/L4/L5/L6/L7",
+      "invocation": "bun test test/e2e/gitlock.test.ts",
+      "expected": "proven-death reaping, PID-reuse incarnation mismatch, hard-cap revoke, closure kill-points, quarantine lifecycle",
+      "observed": "all drills green against local bare remotes",
+      "verdict": "passed"
+    },
+    {
+      "id": "QA-LOCK-06",
+      "contractRef": "P5 acceptance: concurrent in-daemon closures serialize",
+      "invocation": "bun test test/e2e/gitlock.test.ts (serialization drill)",
+      "expected": "two concurrent closures both land with zero non-fast-forward pushes",
+      "observed": "serialized, zero non-FF",
+      "verdict": "passed"
+    },
+    {
+      "id": "QA-CLOSE-01",
+      "contractRef": "Detail 2: every mutating method takes idempotency_key",
+      "invocation": "bun test test/e2e/compiled-closure.test.ts (compiled dist/way)",
+      "expected": "main.corpus.close without idempotency_key rejected",
+      "observed": "rejected",
+      "verdict": "passed"
+    },
+    {
+      "id": "QA-CLOSE-02",
+      "contractRef": "Detail 2: durable 24h replay across client response loss",
+      "invocation": "bun test test/e2e/compiled-closure.test.ts",
+      "expected": "discarded post-push response replays the stored result with exactly one remote commit",
+      "observed": "original result replayed; one commit on the bare remote",
+      "verdict": "passed"
+    },
+    {
+      "id": "QA-CLOSE-03",
+      "contractRef": "Detail 2 durable replay across PROCESS DEATH (gen-4 blocker D1)",
+      "invocation": "bun test test/e2e/compiled-closure.test.ts (SIGKILL after push, before idempotency finalization)",
+      "expected": "after restart the same key replays the original response, exactly one remote commit, conflicting key still 1500",
+      "observed": "pre-effect intent reconciled on restart; original lease/fence/committed response replayed; one commit; 1500 on conflict",
+      "verdict": "passed"
+    },
+    {
+      "id": "QA-CLOSE-04",
+      "contractRef": "Detail 1 working-tree rules",
+      "invocation": "bun test test/e2e/gitlock.test.ts",
+      "expected": "explicit-path staging only, unrelated uncommitted edits preserved, dirty index refused (1206)",
+      "observed": "as specified",
+      "verdict": "passed"
+    },
+    {
+      "id": "QA-FC-01",
+      "contractRef": "Bootstrap FSM: prefix attestation and observable fail-closed contract",
+      "invocation": "bun test test/qa/recovery-fail-closed.test.ts",
+      "expected": "tampered transcript prefix fails closed over the real UDS, lingers unhealthy, exits 78, never advertises a resumed main",
+      "observed": "all four assertions held",
+      "verdict": "passed"
+    },
+    {
+      "id": "QA-FC-02",
+      "contractRef": "AS9 profile digest binding",
+      "invocation": "bun test test/integration/profile-approval.test.ts",
+      "expected": "digest-bound field change fails closed with profile_drift, way profile approve --confirm then boots; tunable-only change boots without approval",
+      "observed": "both restart drills green",
+      "verdict": "passed"
+    },
+    {
+      "id": "QA-FC-03",
+      "contractRef": "CLEAN-G2-004 / gen-4 D2: main.resumed truthfulness",
+      "invocation": "cargo test -p way-core (health/status resume test); bun test test/qa/recovery-fail-closed.test.ts",
+      "expected": "main.resumed false during verifying and failed-closed linger despite durable COMMITTED state; reset on disposal",
+      "observed": "false in both states; true only after a real strict resume",
+      "verdict": "passed"
+    },
+    {
+      "id": "QA-FC-04",
+      "contractRef": "Bootstrap FSM growth protocol",
+      "invocation": "bun test test/unit/main-session.test.ts; test/integration/p4.test.ts",
+      "expected": "queued follow-up plus idle owner prompt both complete without fail-closed; interrupted follow-up recovers; genuine prefix rewrite fails closed as growth_intent_mismatch",
+      "observed": "all three cases green",
+      "verdict": "passed"
+    },
+    {
+      "id": "QA-EVENT-01",
+      "contractRef": "Event delivery: only finalized assistant messages are journaled",
+      "invocation": "bun test test/integration/discord.test.ts",
+      "expected": "streamed deltas plus one final message produce exactly one journal row and exactly one platform send",
+      "observed": "one row, one send",
+      "verdict": "passed"
+    },
+    {
+      "id": "QA-EVENT-02",
+      "contractRef": "Event delivery: checkpoint advances only on commit; crash windows",
+      "invocation": "bun test test/integration/discord.test.ts",
+      "expected": "crash-before-send resends exactly once; crash-after-send-before-commit duplicate bounded and suppressed; restart resumes with zero duplicate posts",
+      "observed": "as specified",
+      "verdict": "passed"
+    },
+    {
+      "id": "QA-EVENT-03",
+      "contractRef": "P7: inbound duplicate suppression",
+      "invocation": "bun test test/integration/discord.test.ts",
+      "expected": "repeated identical MESSAGE_CREATE ids produce exactly one persona turn",
+      "observed": "one turn",
+      "verdict": "passed"
+    },
+    {
+      "id": "QA-EVENT-04",
+      "contractRef": "Detail 2 consumer.claim contention",
+      "invocation": "bun test test/integration/p4.test.ts",
+      "expected": "1601 consumer_claim_held on contended claim",
+      "observed": "1601 returned",
+      "verdict": "passed"
+    },
+    {
+      "id": "QA-BRIDGE-01",
+      "contractRef": "Detail 3 TSFN bridge contract",
+      "invocation": "cargo test -p way-core; bun test test/integration/rpc.test.ts",
+      "expected": "bridge_overloaded past 64 in-flight, bridge_timeout at deadline, double completion is a counted no-op, exceptions mapped, shutdown status",
+      "observed": "every rule covered and green",
+      "verdict": "passed"
+    },
+    {
+      "id": "QA-OPS-01",
+      "contractRef": "P8: supervised full-service restart",
+      "invocation": "bun test test/e2e/systemd.test.ts",
+      "expected": "a single supervised daemon restart restores RPC and adapter delivery unattended; exit 78 is distinguishable",
+      "observed": "full service recovered without hand-starting the adapter; exit-78 semantics asserted",
+      "verdict": "passed"
+    },
+    {
+      "id": "QA-OPS-02",
+      "contractRef": "P8 / CLEAN-G2-001: quarantine recovery leaves ingress stopped",
+      "invocation": "bun test test/e2e/quarantine-runbook.test.ts; ops/systemd/gajae-way-discord.service",
+      "expected": "root-owned no-ingress marker blocks adapter activation during recovery while normal restoration stays green",
+      "observed": "ConditionPathExists interlock asserted; supervised restart drill still green",
+      "verdict": "passed"
+    },
+    {
+      "id": "QA-REG-01",
+      "contractRef": "Detail 4 reconciliation",
+      "invocation": "bun test test/integration/registry-reconcile.test.ts",
+      "expected": "rename reflected within the 20s SLA, authority-field-only updates, unknown rows inserted without guessing, parse drift never mutates the registry, enrichment bounded with backoff, quarantined rows refuse binding",
+      "observed": "all cases green against the deterministic broker fixture",
+      "verdict": "passed"
+    }
+  ],
+  "residuals": [
+    {
+      "id": "QA-RESIDUAL-P7-LIVE",
+      "contractRef": "plan phase P7 acceptance: owner-DM round trip against a LIVE configured route",
+      "status": "owner_blocked",
+      "detail": "Requires owner-supplied Discord bot credentials and a real channel. Cannot be simulated in-repo. The fixture round trip, way-discord --check, and ops/runbooks/operations.md live-verification procedure are implemented; the live drill itself needs the owner. Both review lanes classify this as an owner-gated operational deferral rather than a source defect."
+    }
+  ],
+  "blockers": []
+}
