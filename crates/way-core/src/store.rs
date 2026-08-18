@@ -426,10 +426,16 @@ fn migrate(connection: &mut Connection) -> StoreResult<()> {
 
 	let defaults = [
 		("bootstrap_state", "ABSENT"),
+		("bootstrap_intent", "null"),
 		("main_identity", "null"),
 		("growth_intent", "null"),
 		("profile_digest", "null"),
 		("profile_digest_version", "0"),
+		("profile_projection", "null"),
+		("profile_tunables_revision", "0"),
+		("profile_approved_at", "null"),
+		("profile_approval_receipt", "null"),
+		("failed_closed_reason", "null"),
 		("journal_generation", "1"),
 		("boot_epoch", "0"),
 		("journal_floor_seq", "0"),

@@ -17,7 +17,7 @@ export class RpcClient {
 	private constructor(socket: Socket) {
 		this.socket = socket;
 		socket.setEncoding("utf8");
-		socket.on("data", chunk => this.onData(chunk));
+		socket.on("data", chunk => this.onData(String(chunk)));
 		socket.on("error", error => this.rejectAll(error));
 		socket.on("close", () => this.rejectAll(new Error("RPC socket closed")));
 	}

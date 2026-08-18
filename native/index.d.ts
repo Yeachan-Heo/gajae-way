@@ -21,6 +21,23 @@ export declare class WayCore {
   shutdownRpcServer(): void
   rpcBridgeStats(): RpcBridgeStats
   rpcDroppedNotificationCount(): number
+  /**
+   * Updates the in-memory health state exposed by the already-running RPC
+   * listener. Durable failure reasons are stored separately in gateway_meta.
+   */
+  setRpcHealth(state: string, reason?: string | undefined | null): void
+  /**
+   * Sends a best-effort systemd STATUS notification. It is intentionally a
+   * no-op when this process was not started with NOTIFY_SOCKET.
+   */
+  sdNotifyStatus(status: string): void
+  gatewayMetaRead(keys: Array<string>): GatewayMetaReadOutput
+  /**
+   * Applies a compare-and-set metadata update and optional journal event in
+   * one SQLite WAL transaction. A false `applied` result means no write or
+   * event was committed because an expected value changed.
+   */
+  gatewayMetaTransaction(input: GatewayMetaTransactionInput): GatewayMetaTransactionOutput
   lockAcquire(input: LockAcquireInput): LockAcquireOutput
   lockRenew(leaseId: string): LockRenewOutput
   lockRelease(leaseId: string): LockReleaseOutput
@@ -66,6 +83,49 @@ export interface DeliveryProofInput {
   seq: string
   platformMsgId?: string
   dedupeKey?: string
+}
+
+/**
+ * One metadata value returned from the durable gateway state store. A missing
+ * key is represented by an absent value rather than a synthetic default.
+ */
+export interface GatewayMetaEntry {
+  key: string
+  value?: string
+}
+
+/** A compare-and-set condition evaluated inside a single SQLite transaction. */
+export interface GatewayMetaExpectation {
+  key: string
+  value: string
+}
+
+/** A durable metadata write performed by `gatewayMetaTransaction`. */
+export interface GatewayMetaPut {
+  key: string
+  value: string
+}
+
+export interface GatewayMetaReadOutput {
+  entries: Array<GatewayMetaEntry>
+}
+
+/**
+ * Atomic metadata mutation used by the bootstrap, growth, and profile-approval
+ * protocols. `eventKind` and `eventPayloadJson` are committed in the same WAL
+ * transaction when present.
+ */
+export interface GatewayMetaTransactionInput {
+  expected: Array<GatewayMetaExpectation>
+  puts: Array<GatewayMetaPut>
+  deletes: Array<string>
+  eventKind?: string
+  eventPayloadJson?: string
+}
+
+export interface GatewayMetaTransactionOutput {
+  applied: boolean
+  cursor?: string
 }
 
 /** Returns the process-local boot identity used by the P0 health probe. */

@@ -65,7 +65,14 @@ async function compileExecutable(executable: Executable): Promise<void> {
 				"--no-compile-autoload-bunfig",
 				"--no-compile-autoload-dotenv",
 				"--no-compile-autoload-tsconfig",
+
 				"--no-compile-autoload-package-json",
+				// The published SDK intentionally leaves MuPDF external: its package
+				// has top-level await behind a CommonJS require and Bun cannot compile
+				// that edge into a standalone executable. This matches Gajae-Code's
+				// own supported compile policy.
+				"--external",
+				"mupdf",
 				"--root",
 				".",
 				"--target",

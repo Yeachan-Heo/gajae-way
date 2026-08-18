@@ -80,13 +80,14 @@ impl CancellationToken {
 	}
 }
 
-/// Owns the background listener and its associated TSFN bridge.
 pub struct RpcServerHandle {
 	shutdown: watch::Sender<bool>,
 	bridge: TsfnBridge,
+	dispatcher: RpcDispatcher,
 	_task: JoinHandle<()>,
 	counters: ConnectionCounters,
 }
+
 
 impl RpcServerHandle {
 	pub fn start(socket_path: PathBuf, state_dir: PathBuf, dispatcher: RpcDispatcher) -> Result<Self, SocketBootError> {
@@ -100,11 +101,13 @@ impl RpcServerHandle {
 		let bridge = dispatcher.bridge();
 		let counters = ConnectionCounters::default();
 		let listener_counters = counters.clone();
+		let dispatcher_handle = dispatcher.clone();
 		let task = rpc_runtime().spawn(async move {
 			run_listener(listener, dispatcher, shutdown_receiver, listener_counters, socket_path).await;
 		});
-		Ok(Self { shutdown, bridge, _task: task, counters })
+		Ok(Self { shutdown, bridge, dispatcher: dispatcher_handle, _task: task, counters })
 	}
+
 
 	pub fn shutdown(&self) {
 		self.bridge.shutdown();
@@ -121,6 +124,10 @@ impl RpcServerHandle {
 
 	pub fn dropped_notification_count(&self) -> u64 {
 		self.counters.dropped_notification_count()
+	}
+
+	pub fn set_gateway_state(&self, state: dispatch::GatewayState, reason: Option<String>) {
+		self.dispatcher.set_gateway_state(state, reason);
 	}
 }
 

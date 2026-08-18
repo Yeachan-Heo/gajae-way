@@ -73,15 +73,22 @@ function responseError(response: Awaited<ReturnType<RpcClient["request"]>>): { c
 	return response.error;
 }
 
-test("way serve serves health/status and git-lock lifecycle over its real UDS", async () => {
+test("native RPC server serves health/status and git-lock lifecycle over its real UDS", async () => {
 	const stateDirectory = temporaryStateDirectory("serve");
 	const socketPath = path.join(stateDirectory, "rpc.sock");
-	const child = Bun.spawn(["bun", "src/main.ts", "serve"], {
-		cwd: process.cwd(),
-		env: { ...process.env, WAY_STATE_DIR: stateDirectory },
-		stderr: "pipe",
-		stdout: "ignore",
-	});
+	const child = Bun.spawn(
+		[
+			"bun",
+			"-e",
+			`const { startWayServer } = await import("./src/main.ts"); const core = startWayServer(process.env.WAY_STATE_DIR); process.once("SIGTERM", () => { core.shutdownRpcServer(); process.exit(0); }); await new Promise(() => {});`,
+		],
+		{
+			cwd: process.cwd(),
+			env: { ...process.env, WAY_STATE_DIR: stateDirectory },
+			stderr: "pipe",
+			stdout: "ignore",
+		},
+	);
 	let client: RpcClient | undefined;
 	try {
 		client = await connectEventually(socketPath);

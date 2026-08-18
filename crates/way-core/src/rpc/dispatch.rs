@@ -452,9 +452,13 @@ impl RpcDispatcher {
 			return Err(RpcError::internal("request cancelled"));
 		}
 		let health = self.health.lock().map_err(|_| RpcError::internal("gateway health lock poisoned"))?.clone();
-		if health.state == GatewayState::FailedClosed && method != "way.health" && method != "way.status" {
+		if health.state == GatewayState::FailedClosed
+			&& method != "way.health"
+			&& method != "way.status"
+			&& method != "profile.approve" {
 			return Err(RpcError::app(1000, health.reason.map(|reason| json!({ "reason": reason }))));
 		}
+
 		match method.as_str() {
 			"way.health" => self.health_response(params),
 			"way.status" => self.status_response(params).await,
@@ -473,7 +477,10 @@ impl RpcDispatcher {
 			"gitlock.clear_quarantine" => {
 				self.idempotent(&method, &params, || self.lock_clear_quarantine(params.clone())).await
 			}
-			method if method.starts_with("main.") => self.bridge_method(method, params, cancellation).await,
+			method if method.starts_with("main.") || method == "profile.approve" => {
+				self.bridge_method(method, params, cancellation).await
+			}
+
 			_ => Err(RpcError::method_not_found(&method)),
 		}
 	}
@@ -878,7 +885,8 @@ mod tests {
 	}
 
 	#[tokio::test]
-	async fn failed_closed_serves_only_health_and_status() {
+	async fn failed_closed_serves_health_status_and_owner_profile_approval_only() {
+
 		let dispatcher = dispatcher();
 		dispatcher.set_gateway_state(GatewayState::FailedClosed, Some("profile_drift".to_owned()));
 		let cancellation = super::super::CancellationToken::new();
@@ -890,6 +898,11 @@ mod tests {
 			.await
 			.unwrap_err();
 		assert_eq!(error.code, 1000);
+		let approval = dispatcher
+			.dispatch("profile.approve".to_owned(), json!({}), super::super::CancellationToken::new())
+			.await
+			.unwrap_err();
+		assert_ne!(approval.code, 1000);
 	}
 
 	#[test]

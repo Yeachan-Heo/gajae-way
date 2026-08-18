@@ -15,7 +15,6 @@
     "way": "./dist/way",
     "way-discord": "./dist/way-discord"
   },
-  "// TODO(P3)": "Pin the published gajae-code SDK dependency here; P0 deliberately has no SDK dependency.",
   "devDependencies": {
     "@biomejs/biome": "2.5.2",
     "@napi-rs/cli": "3.6.2",
@@ -28,5 +27,8 @@
   "napi": {
     "binaryName": "way_core",
     "triples": {}
+  },
+  "dependencies": {
+    "@gajae-code/coding-agent": "0.14.0"
   }
 }

@@ -2,7 +2,13 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { createRequire } from "node:module";
+import type {
+	GatewayMetaReadOutput,
+	GatewayMetaTransactionInput,
+	GatewayMetaTransactionOutput,
+} from "./main-session/state";
 import { embeddedAddon } from "../native/embedded-addon";
+
 
 export interface HealthInfo {
 	version: string;
@@ -33,6 +39,16 @@ export interface WayCoreHandle {
 	shutdownRpcServer(): void;
 	rpcBridgeStats(): RpcBridgeStats;
 	rpcDroppedNotificationCount(): number;
+	setRpcHealth(state: "booting" | "verifying" | "running" | "failed_closed" | "degraded", reason?: string): void;
+	sdNotifyStatus(status: string): void;
+	gatewayMetaRead(keys: readonly string[]): GatewayMetaReadOutput;
+	gatewayMetaTransaction(input: GatewayMetaTransactionInput): GatewayMetaTransactionOutput;
+	journalAppend(kind: string, payloadJson: string): { cursor: string; seq: string };
+	journalRead(cursor?: string, limit?: number): {
+		events: Array<{ seq: string; ts: number; kind: string; payloadJson: string }>;
+		nextCursor: string;
+		gap?: { missingFrom: string; missingTo: string; resyncCursor: string };
+	};
 }
 
 export interface WayCoreConstructor {

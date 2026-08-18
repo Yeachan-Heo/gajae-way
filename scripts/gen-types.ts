@@ -1,7 +1,17 @@
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 
-export const requiredGeneratedBindingSymbols = ["BridgeRequest", "HealthInfo", "RpcBridgeStats", "WayCore", "healthInfo"] as const;
+export const requiredGeneratedBindingSymbols = [
+	"BridgeRequest",
+	"GatewayMetaReadOutput",
+	"GatewayMetaTransactionInput",
+	"HealthInfo",
+	"RpcBridgeStats",
+	"WayCore",
+	"healthInfo",
+	"sdNotifyStatus",
+	"setRpcHealth",
+] as const;
 
 export function validateGeneratedBindingSource(bindings: string): void {
 	for (const symbol of requiredGeneratedBindingSymbols) {

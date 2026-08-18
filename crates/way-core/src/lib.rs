@@ -3,23 +3,28 @@
 //! Rust owns SQLite state, fenced lock ownership, journal settlement,
 //! idempotency, and the authenticated P2 UDS RPC boundary.
 
-use std::{path::PathBuf, str::FromStr, sync::{Mutex, OnceLock}, time::SystemTime};
+use std::{collections::HashSet, path::PathBuf, str::FromStr, sync::{Mutex, OnceLock}, time::SystemTime};
+
 
 use napi::threadsafe_function::ThreadsafeFunction;
 use napi_derive::napi;
 
 use crate::{
-	events::{ConsumerClaim, Cursor, DeliveryProof, EventJournal, JournalError, JournalGap, JournalRead, OutboxRow},
+	events::{
+		append_in_transaction, ConsumerClaim, Cursor, DeliveryProof, EventJournal, JournalError, JournalGap,
+		JournalRead, OutboxRow,
+	},
 	lock::{
 		AcquireRequest, AcquireResult, HolderKind, Lease, LeaseHolder, LockClass, LockError, LockManager, LockStatus,
 		QueueEntry, ReleaseResult,
 	},
-	store::{unix_epoch_ms, Store, StoreError},
+	store::{meta_get_tx, meta_set_tx, unix_epoch_ms, Store, StoreError},
 };
 use crate::rpc::{
-	dispatch::{BridgeRequest, RpcBridgeStats, RpcDispatcher, TsfnBridge},
+	dispatch::{BridgeRequest, GatewayState, RpcBridgeStats, RpcDispatcher, TsfnBridge},
 	RpcServerHandle,
 };
+
 
 pub mod events;
 pub mod lock;
@@ -257,6 +262,53 @@ pub struct IdempotencyStoreInput {
 	pub response_json: String,
 }
 
+/// One metadata value returned from the durable gateway state store. A missing
+/// key is represented by an absent value rather than a synthetic default.
+#[napi(object)]
+pub struct GatewayMetaEntry {
+	pub key: String,
+	pub value: Option<String>,
+}
+
+/// A compare-and-set condition evaluated inside a single SQLite transaction.
+#[napi(object)]
+pub struct GatewayMetaExpectation {
+	pub key: String,
+	pub value: String,
+}
+
+/// A durable metadata write performed by `gatewayMetaTransaction`.
+#[napi(object)]
+pub struct GatewayMetaPut {
+	pub key: String,
+	pub value: String,
+}
+
+/// Atomic metadata mutation used by the bootstrap, growth, and profile-approval
+/// protocols. `eventKind` and `eventPayloadJson` are committed in the same WAL
+/// transaction when present.
+#[napi(object)]
+pub struct GatewayMetaTransactionInput {
+	pub expected: Vec<GatewayMetaExpectation>,
+	pub puts: Vec<GatewayMetaPut>,
+	pub deletes: Vec<String>,
+	#[napi(js_name = "eventKind")]
+	pub event_kind: Option<String>,
+	#[napi(js_name = "eventPayloadJson")]
+	pub event_payload_json: Option<String>,
+}
+
+#[napi(object)]
+pub struct GatewayMetaTransactionOutput {
+	pub applied: bool,
+	pub cursor: Option<String>,
+}
+
+#[napi(object)]
+pub struct GatewayMetaReadOutput {
+	pub entries: Vec<GatewayMetaEntry>,
+}
+
 /// N-API handle over a real, migrated SQLite state directory.
 #[napi]
 pub struct WayCore {
@@ -341,6 +393,81 @@ impl WayCore {
 			.map(RpcServerHandle::dropped_notification_count)
 			.ok_or_else(|| napi::Error::from_reason("RPC server is not running"))?;
 		Ok(i64::try_from(count).unwrap_or(i64::MAX))
+	}
+
+	/// Updates the in-memory health state exposed by the already-running RPC
+	/// listener. Durable failure reasons are stored separately in gateway_meta.
+	#[napi(js_name = "setRpcHealth")]
+	pub fn set_rpc_health(&self, state: String, reason: Option<String>) -> napi::Result<()> {
+		let state = match state.as_str() {
+			"booting" => GatewayState::Booting,
+			"verifying" => GatewayState::Verifying,
+			"running" => GatewayState::Running,
+			"failed_closed" => GatewayState::FailedClosed,
+			"degraded" => GatewayState::Degraded,
+			_ => return Err(napi::Error::from_reason("state must be booting, verifying, running, failed_closed, or degraded")),
+		};
+		let server = self.rpc_server.lock().map_err(|_| napi::Error::from_reason("RPC server lock was poisoned"))?;
+		let server = server.as_ref().ok_or_else(|| napi::Error::from_reason("RPC server is not running"))?;
+		server.set_gateway_state(state, reason);
+		Ok(())
+	}
+
+	/// Sends a best-effort systemd STATUS notification. It is intentionally a
+	/// no-op when this process was not started with NOTIFY_SOCKET.
+	#[napi(js_name = "sdNotifyStatus")]
+	pub fn sd_notify_status(&self, status: String) -> napi::Result<()> {
+		crate::systemd::notify_status(&status).map_err(|error| napi::Error::from_reason(error.to_string()))
+	}
+
+	#[napi(js_name = "gatewayMetaRead")]
+	pub fn gateway_meta_read(&self, keys: Vec<String>) -> napi::Result<GatewayMetaReadOutput> {
+		validate_meta_keys(&keys)?;
+		let mut connection = self.store.connection().map_err(store_napi_error)?;
+		let transaction = connection.transaction().map_err(|error| store_napi_error(error.into()))?;
+		let entries = keys
+			.into_iter()
+			.map(|key| {
+				let value = meta_get_tx(&transaction, &key).map_err(store_napi_error)?;
+				Ok(GatewayMetaEntry { key, value })
+			})
+			.collect::<napi::Result<Vec<_>>>()?;
+		transaction.commit().map_err(|error| store_napi_error(error.into()))?;
+		Ok(GatewayMetaReadOutput { entries })
+	}
+
+	/// Applies a compare-and-set metadata update and optional journal event in
+	/// one SQLite WAL transaction. A false `applied` result means no write or
+	/// event was committed because an expected value changed.
+	#[napi(js_name = "gatewayMetaTransaction")]
+	pub fn gateway_meta_transaction(&self, input: GatewayMetaTransactionInput) -> napi::Result<GatewayMetaTransactionOutput> {
+		validate_gateway_meta_transaction(&input)?;
+		let mut connection = self.store.connection().map_err(store_napi_error)?;
+		let transaction = connection.transaction().map_err(|error| store_napi_error(error.into()))?;
+
+		for expected in &input.expected {
+			if meta_get_tx(&transaction, &expected.key).map_err(store_napi_error)? != Some(expected.value.clone()) {
+				return Ok(GatewayMetaTransactionOutput { applied: false, cursor: None });
+			}
+		}
+		for put in &input.puts {
+			meta_set_tx(&transaction, &put.key, &put.value).map_err(store_napi_error)?;
+		}
+		for key in &input.deletes {
+			transaction.execute("DELETE FROM gateway_meta WHERE k = ?1", [key]).map_err(|error| store_napi_error(error.into()))?;
+
+		}
+		let cursor = match (&input.event_kind, &input.event_payload_json) {
+			(Some(kind), Some(payload_json)) => Some(
+				append_in_transaction(&transaction, kind, payload_json, unix_epoch_ms())
+					.map_err(journal_napi_error)?
+					.to_string(),
+			),
+			(None, None) => None,
+			_ => unreachable!("validated event fields"),
+		};
+		transaction.commit().map_err(|error| store_napi_error(error.into()))?;
+		Ok(GatewayMetaTransactionOutput { applied: true, cursor })
 	}
 
 	#[napi(js_name = "lockAcquire")]
@@ -616,4 +743,48 @@ fn journal_napi_error(error: JournalError) -> napi::Error {
 fn store_napi_error(error: StoreError) -> napi::Error {
 	let prefix = if matches!(error, StoreError::IdempotencyConflict) { "1500 " } else { "" };
 	napi::Error::from_reason(format!("{prefix}{error}"))
+}
+
+fn validate_meta_key(key: &str) -> napi::Result<()> {
+	if key.is_empty()
+		|| key.len() > 128
+		|| !key.bytes().all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.'))
+	{
+		return Err(napi::Error::from_reason("gateway metadata keys must be 1..=128 ASCII [A-Za-z0-9_.-] characters"));
+	}
+	Ok(())
+}
+
+fn validate_meta_keys(keys: &[String]) -> napi::Result<()> {
+	let mut unique = HashSet::new();
+	for key in keys {
+		validate_meta_key(key)?;
+		if !unique.insert(key) {
+			return Err(napi::Error::from_reason("gateway metadata keys must be unique"));
+		}
+	}
+	Ok(())
+}
+
+fn validate_gateway_meta_transaction(input: &GatewayMetaTransactionInput) -> napi::Result<()> {
+	let expected_keys = input.expected.iter().map(|entry| entry.key.clone()).collect::<Vec<_>>();
+	validate_meta_keys(&expected_keys)?;
+	let put_keys = input.puts.iter().map(|entry| entry.key.clone()).collect::<Vec<_>>();
+	validate_meta_keys(&put_keys)?;
+	validate_meta_keys(&input.deletes)?;
+	let put_key_set = put_keys.into_iter().collect::<HashSet<_>>();
+	if input.deletes.iter().any(|key| put_key_set.contains(key)) {
+		return Err(napi::Error::from_reason("a gateway metadata key cannot be both written and deleted"));
+	}
+	for entry in &input.puts {
+		if entry.value.len() > 4 * 1024 * 1024 {
+			return Err(napi::Error::from_reason("gateway metadata values must not exceed 4 MiB"));
+		}
+	}
+	match (&input.event_kind, &input.event_payload_json) {
+		(Some(_), Some(payload)) if payload.len() <= 4 * 1024 * 1024 => Ok(()),
+		(Some(_), Some(_)) => Err(napi::Error::from_reason("journal event payload must not exceed 4 MiB")),
+		(None, None) => Ok(()),
+		_ => Err(napi::Error::from_reason("eventKind and eventPayloadJson must be provided together")),
+	}
 }
