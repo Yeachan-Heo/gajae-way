@@ -4,6 +4,7 @@ import { createConnection } from "node:net";
 import * as path from "node:path";
 import { expect, test } from "bun:test";
 import { RpcClient } from "../../src/rpc-client";
+import { loadWayCore } from "../../src/native-loader";
 
 const repositoryRoot = path.resolve(import.meta.dir, "..", "..");
 
@@ -58,6 +59,48 @@ async function connectHealthy(socketPath: string): Promise<RpcClient> {
 	throw new Error(
 		`compiled daemon did not become healthy${lastError instanceof Error ? `: ${lastError.message}` : ""}`,
 	);
+}
+
+async function connectAvailable(socketPath: string): Promise<RpcClient> {
+	let lastError: unknown;
+	for (let attempt = 0; attempt < 200; attempt += 1) {
+		try {
+			return await RpcClient.connect(socketPath);
+		} catch (error) {
+			lastError = error;
+		}
+		await Bun.sleep(25);
+	}
+	throw new Error(
+		`compiled daemon did not expose its RPC listener${lastError instanceof Error ? `: ${lastError.message}` : ""}`,
+	);
+}
+
+async function endpointReachable(socketPath: string): Promise<boolean> {
+	return await new Promise<boolean>((resolve) => {
+		const socket = createConnection(socketPath);
+		let settled = false;
+		const finish = (reachable: boolean) => {
+			if (settled) return;
+			settled = true;
+			clearTimeout(timeout);
+			socket.destroy();
+			resolve(reachable);
+		};
+		const timeout = setTimeout(() => finish(false), 1_000);
+		socket.once("connect", () => finish(true));
+		socket.once("error", () => finish(false));
+	});
+}
+
+async function failedClosedHealth(client: RpcClient): Promise<Record<string, unknown>> {
+	return await eventually(async () => {
+		const response = await client.request("way.health", {}, { timeoutMs: 1_000 });
+		const health = response.result;
+		return health && typeof health === "object" && (health as { state?: unknown }).state === "failed_closed"
+			? (health as Record<string, unknown>)
+			: undefined;
+	}, "compiled daemon did not become failed_closed");
 }
 
 async function eventually<T>(
@@ -135,6 +178,7 @@ test("compiled daemon makes corpus closures durable, replayable, and single-flig
 	const state = path.join(root, "state");
 	const profilePath = path.join(root, "profile.toml");
 	const socketPath = path.join(state, "rpc.sock");
+	const endpointPath = path.join(os.tmpdir(), `way-e2-${process.pid}-${Date.now()}.sock`);
 	fs.mkdirSync(workspace);
 	fs.writeFileSync(profilePath, profile(corpus, workspace));
 	const environment = {
@@ -210,6 +254,51 @@ test("compiled daemon makes corpus closures durable, replayable, and single-flig
 			code: -32602,
 			message: "main.corpus.close paths must remain inside the corpus and cannot name the corpus root.",
 		});
+
+		// JSON accepts NUL-bearing strings, but no such request may reserve a
+		// durable operation because it cannot be passed to Git through execve.
+		const nulPath = await client.request(
+			"main.corpus.close",
+			closureParams("nul\u0000path.txt", "NUL path closure", "nul-path-key"),
+		);
+		expect(nulPath.error).toMatchObject({
+			code: -32602,
+			message: "main.corpus.close paths[] must be an execve-safe string.",
+		});
+		const nulCommitMessage = await client.request(
+			"main.corpus.close",
+			closureParams("compiled-close.txt", "NUL\u0000commit message", "nul-commit-key"),
+		);
+		expect(nulCommitMessage.error).toMatchObject({
+			code: -32602,
+			message: "main.corpus.close commit_message must be an execve-safe string.",
+		});
+		const nulIdempotencyKey = await client.request(
+			"main.corpus.close",
+			closureParams("compiled-close.txt", "NUL idempotency key", "nul\u0000idempotency-key"),
+		);
+		expect(nulIdempotencyKey.error).toMatchObject({
+			code: -32602,
+			message: "main.corpus.close idempotency_key must be an execve-safe string.",
+		});
+		expect(
+			loadWayCore().WayCore.open(state).gatewayMetaRead(["gitlock_closure_operation"]).entries[0]?.value,
+		).toBeUndefined();
+
+		// Restart before the next, unrelated closure. A stale intent would make
+		// strict startup reconciliation fail closed instead of becoming healthy.
+		client.close();
+		client = undefined;
+		if (daemon?.exitCode === null) daemon.kill("SIGTERM");
+		if (daemon) await daemon.exited;
+		daemon = Bun.spawn({
+			cmd: [executable, "serve", "--state-dir", state, "--profile", profilePath],
+			cwd: repositoryRoot,
+			env: environment,
+			stdout: "ignore",
+			stderr: "pipe",
+		});
+		client = await connectHealthy(socketPath);
 
 		fs.writeFileSync(path.join(corpus, "compiled-close.txt"), "closed by compiled daemon\n");
 		const firstParams = closureParams("compiled-close.txt", "compiled daemon closure", "compiled-daemon-closure");
@@ -335,6 +424,79 @@ test("compiled daemon makes corpus closures durable, replayable, and single-flig
 		expect(crashConflict.error).toMatchObject({ code: 1500, message: "idempotency_conflict" });
 		subjects = await run(["git", `--git-dir=${remote}`, "log", "--format=%s", "main"]);
 		expect(subjects.split("\n").filter((subject) => subject === "push-crash closure")).toHaveLength(1);
+
+		// A mismatched remote after post-push death makes reconciliation fail before
+		// host ownership. The temporary E2E SDK endpoint is live on a healthy
+		// resumed session, so the failed-closed probe proves that pre-host disposal
+		// closed the same session-owned endpoint.
+		client.close();
+		client = undefined;
+		if (daemon?.exitCode === null) daemon.kill("SIGTERM");
+		if (daemon) await daemon.exited;
+		fs.rmSync(endpointPath, { force: true });
+		const mismatchMarker = path.join(root, "recovery-mismatch-after-push-marker");
+		const mismatchRelease = path.join(root, "recovery-mismatch-after-push-release");
+		const endpointEnvironment = { ...environment, WAY_E2E_SDK_ENDPOINT_PATH: endpointPath };
+		daemon = Bun.spawn({
+			cmd: [executable, "serve", "--state-dir", state, "--profile", profilePath],
+			cwd: repositoryRoot,
+			env: {
+				...endpointEnvironment,
+				WAY_E2E_CLOSURE_AFTER_PUSH_MARKER: mismatchMarker,
+				WAY_E2E_CLOSURE_AFTER_PUSH_RELEASE: mismatchRelease,
+			},
+			stdout: "ignore",
+			stderr: "pipe",
+		});
+		client = await connectHealthy(socketPath);
+		expect(await endpointReachable(endpointPath)).toBe(true);
+		fs.writeFileSync(path.join(corpus, "recovery-mismatch.txt"), "mismatched remote state\n");
+		const mismatchParams = closureParams("recovery-mismatch.txt", "recovery-mismatch closure", "recovery-mismatch-key");
+		const mismatchRequest = client
+			.request("main.corpus.close", mismatchParams, { timeoutMs: 10_000 })
+			.catch(() => undefined);
+		await eventually(
+			() => (fs.existsSync(mismatchMarker) ? true : undefined),
+			"recovery-mismatch closure did not reach the post-push crash boundary",
+		);
+		daemon.kill("SIGKILL");
+		await daemon.exited;
+		await mismatchRequest;
+		client.close();
+		client = undefined;
+		// SIGKILL leaves a dead Unix-socket inode. Remove only that test-owned
+		// dead endpoint so strict resume must create and then dispose a fresh one.
+		fs.rmSync(endpointPath, { force: true });
+
+		const remoteAdvance = path.join(root, "recovery-mismatch-remote-advance");
+		await run(["git", "clone", remote, remoteAdvance]);
+		await run(["git", "-C", remoteAdvance, "config", "user.name", "Compiled Closure Drill"]);
+		await run(["git", "-C", remoteAdvance, "config", "user.email", "compiled-closure@example.test"]);
+		fs.writeFileSync(path.join(remoteAdvance, "remote-advance.txt"), "advance remote beyond recovery evidence\n");
+		await run(["git", "-C", remoteAdvance, "add", "--", "remote-advance.txt"]);
+		await run(["git", "-C", remoteAdvance, "commit", "-m", "advance remote beyond recovery evidence"]);
+		await run(["git", "-C", remoteAdvance, "push"]);
+
+		daemon = Bun.spawn({
+			cmd: [executable, "serve", "--state-dir", state, "--profile", profilePath, "--fail-closed-linger-ms", "3000"],
+			cwd: repositoryRoot,
+			env: endpointEnvironment,
+			stdout: "ignore",
+			stderr: "pipe",
+		});
+		client = await connectAvailable(socketPath);
+		const mismatchHealth = await failedClosedHealth(client);
+		expect(mismatchHealth).toMatchObject({
+			status: "unhealthy",
+			state: "failed_closed",
+			reason: "startup_failed",
+			main: { resumed: false, session_id: null },
+		});
+		// This is a real UDS connect probe, not merely an endpoint-file check.
+		expect(await endpointReachable(endpointPath)).toBe(false);
+		client.close();
+		client = undefined;
+		expect(await daemon.exited).toBe(78);
 	} finally {
 		for (const extraClient of extraClients) extraClient.close();
 		client?.close();
@@ -344,6 +506,7 @@ test("compiled daemon makes corpus closures durable, replayable, and single-flig
 			if (daemon.exitCode === null) daemon.kill("SIGKILL");
 			await daemon.exited;
 		}
+		fs.rmSync(endpointPath, { force: true });
 		fs.rmSync(root, { force: true, recursive: true });
 	}
-}, 45_000);
+}, 60_000);

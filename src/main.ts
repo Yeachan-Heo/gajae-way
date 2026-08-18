@@ -21,7 +21,7 @@ import { bootstrapMainSession, recoverBootstrap } from "./main-session/bootstrap
 import { createMainSessionHost, type MainSessionHost } from "./main-session/host";
 import { approveProfile, previewProfileApproval } from "./main-session/profile-approval";
 import { ResumeError, strictResumeMainSession } from "./main-session/resume";
-import { createPublishedSdk } from "./main-session/sdk";
+import { createPublishedSdk, type HostedSdkSession, type MainSessionSdk } from "./main-session/sdk";
 import { createE2eFileSdk } from "./main-session/e2e-sdk";
 
 import { GatewayStateError, GatewayStateStore } from "./main-session/state";
@@ -82,9 +82,71 @@ function failureReason(error: unknown): string {
 	return "startup_failed";
 }
 
-function createRuntimeSdk() {
-	if (Bun.env.NODE_ENV === "test" && Bun.env.WAY_E2E_FILE_SDK === "1") return createE2eFileSdk();
-	return createPublishedSdk();
+function createRuntimeSdk(): MainSessionSdk {
+	const sdk =
+		Bun.env.NODE_ENV === "test" && Bun.env.WAY_E2E_FILE_SDK === "1" ? createE2eFileSdk() : createPublishedSdk();
+	const endpointPath = Bun.env.WAY_E2E_SDK_ENDPOINT_PATH;
+	if (Bun.env.NODE_ENV !== "test" || Bun.env.WAY_E2E_FILE_SDK !== "1" || !endpointPath) return sdk;
+	return createE2eEndpointProbeSdk(sdk, endpointPath);
+}
+
+/** Test-only UDS probe that follows the E2E file SDK session's actual disposal lifecycle. */
+async function createE2eEndpointProbeSession(
+	session: HostedSdkSession,
+	endpointPath: string,
+): Promise<HostedSdkSession> {
+	if (endpointPath.includes("\0")) throw new Error("E2E SDK endpoint path must not contain a NUL byte.");
+	const resolvedPath = path.resolve(endpointPath);
+	await fsp.mkdir(path.dirname(resolvedPath), { recursive: true, mode: 0o700 });
+	if (fs.existsSync(resolvedPath)) throw new Error(`E2E SDK endpoint already exists: ${resolvedPath}`);
+	const server = net.createServer((socket) => socket.end());
+	await new Promise<void>((resolve, reject) => {
+		const fail = (error: Error) => {
+			server.close();
+			reject(error);
+		};
+		server.once("error", fail);
+		server.listen(resolvedPath, () => {
+			server.off("error", fail);
+			resolve();
+		});
+	});
+	let disposed = false;
+	return {
+		sessionFile: session.sessionFile,
+		sessionId: session.sessionId,
+		subscribe: (listener) => session.subscribe(listener),
+		subscribeGates: (listener) => session.subscribeGates(listener),
+		prompt: (text) => session.prompt(text),
+		steer: (text) => session.steer(text),
+		followUp: (text) => session.followUp(text),
+		followUpQueueDepth: () => session.followUpQueueDepth(),
+		answerGate: (gateId, answer, idempotencyKey) => session.answerGate(gateId, answer, idempotencyKey),
+		sendBootstrapMessage: (nonce) => session.sendBootstrapMessage(nonce),
+		async dispose() {
+			if (disposed) return;
+			disposed = true;
+			try {
+				await session.dispose();
+			} finally {
+				await new Promise<void>((resolve, reject) => server.close((error) => (error ? reject(error) : resolve())));
+				try {
+					fs.unlinkSync(resolvedPath);
+				} catch (error) {
+					if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+				}
+			}
+		},
+	};
+}
+
+function createE2eEndpointProbeSdk(delegate: MainSessionSdk, endpointPath: string): MainSessionSdk {
+	return {
+		createNew: (input) => delegate.createNew(input),
+		openExistingStrict: async (input) =>
+			await createE2eEndpointProbeSession(await delegate.openExistingStrict(input), endpointPath),
+		findBootstrapNonceCandidates: (workspace, nonce) => delegate.findBootstrapNonceCandidates(workspace, nonce),
+	};
 }
 
 function healthFilePath(stateDirectory: string): string {
@@ -246,13 +308,42 @@ function sha256(value: string): string {
 	return createHash("sha256").update(value).digest("hex");
 }
 
+/**
+ * `execve` cannot carry a NUL byte, and JavaScript lone surrogate code units
+ * would be rewritten during UTF-8 argument encoding. Reject both before any
+ * closure intent is made durable so no impossible Git invocation can wedge
+ * recovery.
+ */
+function isExecveSafeString(value: string): boolean {
+	if (value.includes("\0")) return false;
+	for (let index = 0; index < value.length; index += 1) {
+		const code = value.charCodeAt(index);
+		if (code >= 0xd800 && code <= 0xdbff) {
+			const next = value.charCodeAt(index + 1);
+			if (next < 0xdc00 || next > 0xdfff) return false;
+			index += 1;
+			continue;
+		}
+		if (code >= 0xdc00 && code <= 0xdfff) return false;
+	}
+	return true;
+}
+
+function requireExecveSafeClosureString(value: string, field: string): string {
+	if (!isExecveSafeString(value)) {
+		throw new RpcBridgeException(-32602, `main.corpus.close ${field} must be an execve-safe string.`);
+	}
+	return value;
+}
+
 function normalizeCorpusClosurePaths(corpusPath: string, candidates: readonly string[]): string[] {
-	const root = path.resolve(corpusPath);
+	const root = path.resolve(requireExecveSafeClosureString(corpusPath, "corpus_path"));
 	const paths = candidates.map((candidate) => {
-		if (!candidate || path.isAbsolute(candidate) || candidate.startsWith(":")) {
+		const argvSafeCandidate = requireExecveSafeClosureString(candidate, "paths[]");
+		if (!argvSafeCandidate || path.isAbsolute(argvSafeCandidate) || argvSafeCandidate.startsWith(":")) {
 			throw new RpcBridgeException(-32602, "main.corpus.close paths must be literal corpus-relative paths.");
 		}
-		const absolute = path.resolve(root, candidate);
+		const absolute = path.resolve(root, argvSafeCandidate);
 		const relative = path.relative(root, absolute);
 		if (!relative || relative === ".." || relative.startsWith(`..${path.sep}`)) {
 			throw new RpcBridgeException(
@@ -288,8 +379,8 @@ function parseCorpusClosureRequest(params: unknown, corpusPath: string): CorpusC
 		throw new RpcBridgeException(-32602, "main.corpus.close idempotency_key must be a non-empty string.");
 	}
 	const paths = normalizeCorpusClosurePaths(corpusPath, params.paths as string[]);
-	const commitMessage = params.commit_message;
-	const idempotencyKey = params.idempotency_key;
+	const commitMessage = requireExecveSafeClosureString(params.commit_message, "commit_message");
+	const idempotencyKey = requireExecveSafeClosureString(params.idempotency_key, "idempotency_key");
 	const requestJson = canonicalJson({ commit_message: commitMessage, idempotency_key: idempotencyKey, paths });
 	return { paths, commitMessage, idempotencyKey, requestJson, requestHash: sha256(requestJson) };
 }
@@ -813,6 +904,28 @@ async function disposeMainSession(core: WayCoreHandle, host: MainSessionHost): P
 	}
 }
 
+async function disposeUnhostedMainSession(core: WayCoreHandle, session: HostedSdkSession): Promise<void> {
+	try {
+		await session.dispose();
+	} finally {
+		core.resetMainSessionStatus();
+	}
+}
+
+async function disposeMainSessionAfterStartupFailure(
+	core: WayCoreHandle,
+	host: MainSessionHost | undefined,
+	resumedSession: HostedSdkSession | undefined,
+): Promise<void> {
+	try {
+		if (host) await disposeMainSession(core, host);
+		else if (resumedSession) await disposeUnhostedMainSession(core, resumedSession);
+	} catch {
+		// A teardown failure cannot suppress the failed-closed transition. The
+		// session disposal attempt still occurs before health is published.
+	}
+}
+
 async function waitForShutdown(
 	core: WayCoreHandle,
 	host: MainSessionHost,
@@ -852,6 +965,7 @@ async function serveWay(config: WayConfig): Promise<void> {
 	}
 	let host: MainSessionHost | undefined;
 	let reconciler: BrokerReconciler | undefined;
+	let resumedSession: HostedSdkSession | undefined;
 	try {
 		const profile = profiles.load(config.profilePath);
 		core.registryConfigureSurfaces(
@@ -875,6 +989,7 @@ async function serveWay(config: WayConfig): Promise<void> {
 			sdk,
 			onInjectionLog: (entry) => console.warn(`way injection ${entry.kind}: ${entry.path}`),
 		});
+		resumedSession = resumed.session;
 		await reconcilePendingClosureOperation(core, closures, profile.corpusPath, resumed.identity.sessionId);
 		host = createMainSessionHost({
 			session: resumed.session,
@@ -882,6 +997,7 @@ async function serveWay(config: WayConfig): Promise<void> {
 			state,
 			journal: core,
 		});
+		resumedSession = undefined;
 		const admissionHandler = createMainAdmissionHandler(host, profile, core, {
 			isSurfaceQuarantined: (surface) => {
 				try {
@@ -916,11 +1032,12 @@ async function serveWay(config: WayConfig): Promise<void> {
 		await waitForShutdown(core, host, closures, reconciler);
 	} catch (error) {
 		if (error instanceof FailedClosedExit) {
+			await disposeMainSessionAfterStartupFailure(core, host, resumedSession);
 			await closures.shutdown();
 			reconciler?.stop();
 			throw error;
 		}
-		if (host) await disposeMainSession(core, host);
+		await disposeMainSessionAfterStartupFailure(core, host, resumedSession);
 		reconciler?.stop();
 		await closures.shutdown();
 		await enterFailedClosed(core, state, config, failureReason(error));
