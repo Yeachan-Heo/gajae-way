@@ -44,9 +44,11 @@ non-fast-forward checks are incident backstops, not a concurrency plan.
 
 ## Monitor the live UDS service
 
-`way --health` is a local binary/version check, not a probe of the running
-daemon. Query the local UDS as the service user instead. In a shell entered by
-`sudo -u gajae-way -H -s`, define:
+`way --health --state-dir /var/lib/gajae-way` queries the running daemon over
+its UDS and exits non-zero with `status: "unhealthy", state: "unavailable",
+reason: "daemon_unreachable"` when that daemon cannot be reached. Use it for a
+concise liveness probe. Query the local UDS as the service user for `way.status`
+and operational RPCs. In a shell entered by `sudo -u gajae-way -H -s`, define:
 
 ```sh
 way_rpc() {
@@ -64,6 +66,7 @@ PY
 Probe both liveness and operational state:
 
 ```sh
+/usr/local/bin/way --health --state-dir /var/lib/gajae-way
 way_rpc way.health '{}'
 way_rpc way.status '{}'
 systemctl --no-pager status gajae-way.service gajae-way-discord.service
@@ -72,7 +75,7 @@ journalctl -u gajae-way.service -u gajae-way-discord.service --since '15 minutes
 
 A normal health response is `status: "healthy", state: "running"`. A
 failed-closed process first serves `status: "unhealthy", state:
-"failed_closed"` during its linger window and exits **78**. The daemon unit's
+`"failed_closed"` during its linger window and exits **78**. The daemon unit's
 `RestartPreventExitStatus=78` intentionally stops automatic restart loops;
 investigate the reported reason before an operator approves or repairs state.
 
@@ -87,11 +90,14 @@ way_rpc main.events.read '{"cursor":"1:0","limit":100}'
 ```
 
 Use `journalctl` for process lifecycle evidence and correlate event cursors
-with the SQLite journal. In v1, the durable receipt-bearing operations are
-profile approval (`profile_approved`) and quarantine clearing (`lock_event`);
-record their emitted `receipt_id` or `verification_receipt_id` with the
-operator change record. A generic receipt API is a v2/P10 feature, so do not
-claim that a v1 `receipt.list` command exists.
+with the SQLite journal. The state database uses WAL with `synchronous=FULL`:
+a successful journal, receipt, lease, or consumer-settlement transaction is a
+power-loss durability boundary, not merely a buffered acknowledgement. Do not
+downgrade that pragma. In v1, profile approval (`profile_approved`) and
+quarantine receipt recording/clearance (`lock_event`) carry durable audit
+evidence; record the daemon-generated `receipt_id` and its event cursor with
+the operator change record. A generic receipt API is a v2/P10 feature, so do
+not claim that a v1 `receipt.list` command exists.
 
 ## Backup and integrity check
 

@@ -7,7 +7,7 @@ import { parseWayConfig, type WayConfig } from "./config";
 import { BrokerCli } from "./broker/cli";
 import { BrokerReconciler } from "./broker/reconcile";
 import { createMainAdmissionHandler } from "./main-session/admission";
-import { createMainGateAnswerHandler } from "./main-session/gates";
+import { canonicalJson, createMainGateAnswerHandler } from "./main-session/gates";
 import { ClosureError, createClosureExecutor, runClosureWorker, type ClosureExecutor } from "./main-session/closure";
 
 import { bootstrapMainSession, recoverBootstrap } from "./main-session/bootstrap";
@@ -165,41 +165,161 @@ function profileBridgeHandler(
 		}
 	};
 }
-function closureBridgeHandler(closures: ClosureExecutor, corpusPath: string, sessionId: string): RpcBridgeHandler {
+const CORPUS_CLOSURE_IDEMPOTENCY_SCOPE = "main.corpus.close";
+
+interface CorpusClosureRequest {
+	readonly paths: readonly string[];
+	readonly commitMessage: string;
+	readonly idempotencyKey: string;
+	readonly requestJson: string;
+}
+
+interface CorpusClosureResponse {
+	readonly lease_id: string;
+	readonly fencing_token: string;
+	readonly committed: boolean;
+}
+
+interface InFlightCorpusClosure {
+	readonly requestJson: string;
+	readonly response: Promise<CorpusClosureResponse>;
+}
+
+function parseCorpusClosureRequest(params: unknown): CorpusClosureRequest {
+	if (!isRecord(params)) throw new RpcBridgeException(-32602, "main.corpus.close params must be an object.");
+	const allowed = new Set(["paths", "commit_message", "idempotency_key"]);
+	for (const key of Object.keys(params)) {
+		if (!allowed.has(key)) throw new RpcBridgeException(-32602, `unknown parameter: ${key}`);
+	}
+	if (
+		!Array.isArray(params.paths) ||
+		params.paths.length === 0 ||
+		params.paths.some((value) => typeof value !== "string" || value.length === 0)
+	) {
+		throw new RpcBridgeException(-32602, "main.corpus.close paths must be a non-empty array of non-empty strings.");
+	}
+	if (typeof params.commit_message !== "string" || params.commit_message.trim().length === 0) {
+		throw new RpcBridgeException(-32602, "main.corpus.close commit_message must be a non-empty string.");
+	}
+	if (typeof params.idempotency_key !== "string" || params.idempotency_key.trim().length === 0) {
+		throw new RpcBridgeException(-32602, "main.corpus.close idempotency_key must be a non-empty string.");
+	}
+	const paths = [...params.paths] as string[];
+	const commitMessage = params.commit_message;
+	const idempotencyKey = params.idempotency_key;
+	return {
+		paths,
+		commitMessage,
+		idempotencyKey,
+		requestJson: canonicalJson({ commit_message: commitMessage, idempotency_key: idempotencyKey, paths }),
+	};
+}
+
+function closureIdempotencyFailure(error: unknown): never {
+	if (error instanceof RpcBridgeException) throw error;
+	const message = error instanceof Error ? error.message : String(error);
+	if (message.includes("1500 ") || message.includes("idempotency conflict")) {
+		throw new RpcBridgeException(1500, "idempotency_conflict");
+	}
+	throw new RpcBridgeException(-32603, `main.corpus.close idempotency failed: ${message}`);
+}
+
+function replayCorpusClosureResponse(responseJson: string | undefined): CorpusClosureResponse {
+	if (!responseJson) throw new RpcBridgeException(-32603, "Stored main.corpus.close replay has no response.");
+	let response: unknown;
+	try {
+		response = JSON.parse(responseJson);
+	} catch {
+		throw new RpcBridgeException(-32603, "Stored main.corpus.close replay is invalid JSON.");
+	}
+	if (
+		!isRecord(response) ||
+		typeof response.lease_id !== "string" ||
+		typeof response.fencing_token !== "string" ||
+		typeof response.committed !== "boolean"
+	) {
+		throw new RpcBridgeException(-32603, "Stored main.corpus.close replay has an invalid shape.");
+	}
+	return {
+		lease_id: response.lease_id as string,
+		fencing_token: response.fencing_token as string,
+		committed: response.committed as boolean,
+	};
+}
+
+function closureExecutionFailure(error: unknown): never {
+	if (error instanceof RpcBridgeException) throw error;
+	if (error instanceof ClosureError && error.code !== undefined) {
+		throw new RpcBridgeException(error.code, error.message);
+	}
+	throw new RpcBridgeException(-32603, error instanceof Error ? error.message : String(error));
+}
+
+function closureBridgeHandler(
+	core: WayCoreHandle,
+	closures: ClosureExecutor,
+	corpusPath: string,
+	sessionId: string,
+): RpcBridgeHandler {
+	const inFlightByKey = new Map<string, InFlightCorpusClosure>();
 	return async (method, params) => {
 		if (method !== "main.corpus.close") throw new RpcBridgeException(-32601, `method not found: ${method}`);
-		if (!isRecord(params) || Object.keys(params).some((key) => key !== "paths" && key !== "commit_message")) {
-			throw new RpcBridgeException(-32602, "main.corpus.close requires { paths: string[], commit_message: string }.");
-		}
-		if (
-			!Array.isArray(params.paths) ||
-			params.paths.length === 0 ||
-			params.paths.some((value) => typeof value !== "string" || value.length === 0)
-		) {
-			throw new RpcBridgeException(-32602, "main.corpus.close paths must be a non-empty array of non-empty strings.");
-		}
-		if (typeof params.commit_message !== "string" || params.commit_message.trim().length === 0) {
-			throw new RpcBridgeException(-32602, "main.corpus.close commit_message must be a non-empty string.");
-		}
+		const request = parseCorpusClosureRequest(params);
+		let replay;
 		try {
-			const result = await closures.execute({
-				sessionId,
-				corpusPath,
-				label: `main-session-closure:${sessionId}`,
-				class: "batch",
-				paths: params.paths,
-				commitMessage: params.commit_message,
+			replay = core.idempotencyReplay({
+				scope: CORPUS_CLOSURE_IDEMPOTENCY_SCOPE,
+				key: request.idempotencyKey,
+				requestJson: request.requestJson,
 			});
-			return {
-				lease_id: result.leaseId,
-				fencing_token: result.fencingToken,
-				committed: result.committed,
-			};
 		} catch (error) {
-			if (error instanceof ClosureError && error.code !== undefined) {
-				throw new RpcBridgeException(error.code, error.message);
+			closureIdempotencyFailure(error);
+		}
+		if (replay?.replayed) return replayCorpusClosureResponse(replay.responseJson);
+
+		const existing = inFlightByKey.get(request.idempotencyKey);
+		if (existing) {
+			if (existing.requestJson !== request.requestJson) throw new RpcBridgeException(1500, "idempotency_conflict");
+			return await existing.response;
+		}
+
+		const response = (async (): Promise<CorpusClosureResponse> => {
+			let closure: Awaited<ReturnType<ClosureExecutor["execute"]>>;
+			try {
+				closure = await closures.execute({
+					sessionId,
+					corpusPath,
+					label: `main-session-closure:${sessionId}`,
+					class: "batch",
+					paths: request.paths,
+					commitMessage: request.commitMessage,
+				});
+			} catch (error) {
+				closureExecutionFailure(error);
 			}
-			throw new RpcBridgeException(-32603, error instanceof Error ? error.message : String(error));
+			const result: CorpusClosureResponse = {
+				lease_id: closure.leaseId,
+				fencing_token: closure.fencingToken,
+				committed: closure.committed,
+			};
+			try {
+				core.idempotencyStore({
+					scope: CORPUS_CLOSURE_IDEMPOTENCY_SCOPE,
+					key: request.idempotencyKey,
+					requestJson: request.requestJson,
+					responseJson: canonicalJson(result),
+				});
+			} catch (error) {
+				closureIdempotencyFailure(error);
+			}
+			return result;
+		})();
+		inFlightByKey.set(request.idempotencyKey, { requestJson: request.requestJson, response });
+		try {
+			return await response;
+		} finally {
+			if (inFlightByKey.get(request.idempotencyKey)?.response === response)
+				inFlightByKey.delete(request.idempotencyKey);
 		}
 	};
 }
@@ -283,7 +403,7 @@ async function serveWay(config: WayConfig): Promise<void> {
 			},
 		});
 		const gateAnswerHandler = createMainGateAnswerHandler(host, core);
-		const closureHandler = closureBridgeHandler(closures, profile.corpusPath, resumed.identity.sessionId);
+		const closureHandler = closureBridgeHandler(core, closures, profile.corpusPath, resumed.identity.sessionId);
 		mainSessionHandler = async (method, params) => {
 			if (method === "main.submit") return await admissionHandler(params);
 			if (method === "main.gate.answer") return await gateAnswerHandler(params);

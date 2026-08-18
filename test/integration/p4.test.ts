@@ -70,6 +70,8 @@ interface HostedServer {
 	readonly root: string;
 	readonly stateDirectory: string;
 	readonly core: WayCoreHandle;
+	readonly profile: ReturnType<typeof loadWayProfile>;
+	readonly state: GatewayStateStore;
 	readonly host: MainSessionHost;
 	readonly sdk: FileSdkDouble;
 	readonly sessionFile: string;
@@ -107,6 +109,8 @@ async function hostedServer(): Promise<HostedServer> {
 		root,
 		stateDirectory,
 		core,
+		profile,
+		state,
 		host,
 		sdk,
 		sessionFile: resumed.identity.canonicalPath,
@@ -168,6 +172,43 @@ test("main.submit derives delivery only from profile ownership and turn state", 
 			idempotency_key: "follow-up-1",
 		});
 		expect(replay.result).toEqual(followUp.result);
+	} finally {
+		await server.stop();
+	}
+});
+
+test("queued follow-up and owner prompt share one growth window and restart cleanly", async () => {
+	const server = await hostedServer();
+	try {
+		const queued = await server.client.request("main.submit", {
+			text: "queued follow-up",
+			surface_id: "guest",
+			idempotency_key: "queued-follow-up",
+		});
+		expect(queued.result).toMatchObject({ accepted: true, delivered_as: "follow_up" });
+		expect(server.host.followUpQueueDepth).toBe(1);
+		expect(server.state.read().growthIntent).toBeDefined();
+
+		// The queued SDK work may have appended before the next terminal turn while
+		// the host is otherwise idle. The owner admission must join this same window.
+		server.sdk.appendRaw(server.sessionFile, { type: "message", role: "user", content: "queued follow-up" });
+		server.sdk.appendRaw(server.sessionFile, { type: "message", role: "assistant", content: "queued follow-up completed" });
+		const ownerPrompt = await server.client.request("main.submit", {
+			text: "owner prompt while queued",
+			surface_id: "owner",
+			idempotency_key: "owner-prompt-while-queued",
+		});
+		expect(ownerPrompt.result).toMatchObject({ accepted: true, delivered_as: "prompt" });
+		expect(server.host.followUpQueueDepth).toBe(0);
+		expect(server.state.read()).toMatchObject({ bootstrapState: "COMMITTED", growthIntent: undefined, failedClosedReason: undefined });
+		const transcript = fs.readFileSync(server.sessionFile, "utf8");
+		expect(transcript).toContain("owner prompt while queued");
+		expect(transcript).toContain("queued follow-up completed");
+
+		await server.host.dispose();
+		const restarted = await strictResumeMainSession({ profile: server.profile, state: server.state, sdk: server.sdk });
+		expect(restarted.recoveredGrowthIntent).toBe(false);
+		await restarted.session.dispose();
 	} finally {
 		await server.stop();
 	}

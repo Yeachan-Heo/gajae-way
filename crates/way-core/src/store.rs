@@ -5,12 +5,10 @@
 //! short, blocking write transactions rather than an async executor.
 
 use std::{
-	fmt,
-	fs,
-	io,
-	path::{Path, PathBuf},
-	sync::{Arc, Mutex, MutexGuard},
-	time::{Duration, SystemTime, UNIX_EPOCH},
+    fmt, fs, io,
+    path::{Path, PathBuf},
+    sync::{Arc, Mutex, MutexGuard},
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use rusqlite::{Connection, OptionalExtension, Transaction};
@@ -22,283 +20,308 @@ pub const IDEMPOTENCY_WINDOW_MS: i64 = 24 * 60 * 60 * 1_000;
 /// A clock is injected into protocol tests so expiry and retention behavior
 /// never depends on wall-clock sleeps.
 pub trait Clock: Send + Sync {
-	fn now_ms(&self) -> i64;
+    fn now_ms(&self) -> i64;
 }
 
 #[derive(Debug, Default)]
 pub struct SystemClock;
 
 impl Clock for SystemClock {
-	fn now_ms(&self) -> i64 {
-		unix_epoch_ms()
-	}
+    fn now_ms(&self) -> i64 {
+        unix_epoch_ms()
+    }
 }
 
 pub fn unix_epoch_ms() -> i64 {
-	SystemTime::now()
-		.duration_since(UNIX_EPOCH)
-		.expect("system time must not precede the Unix epoch")
-		.as_millis()
-		.try_into()
-		.expect("Unix epoch milliseconds fit in i64")
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system time must not precede the Unix epoch")
+        .as_millis()
+        .try_into()
+        .expect("Unix epoch milliseconds fit in i64")
 }
 
 #[derive(Debug)]
 pub enum StoreError {
-	Io(io::Error),
-	Sql(rusqlite::Error),
-	Poisoned,
-	Integrity(String),
-	UnsupportedSchema(u32),
-	InvalidMetadata(String),
-	IdempotencyConflict,
+    Io(io::Error),
+    Sql(rusqlite::Error),
+    Poisoned,
+    Integrity(String),
+    UnsupportedSchema(u32),
+    InvalidMetadata(String),
+    IdempotencyConflict,
 }
 
 impl fmt::Display for StoreError {
-	fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-		match self {
-			Self::Io(error) => write!(formatter, "store I/O error: {error}"),
-			Self::Sql(error) => write!(formatter, "SQLite error: {error}"),
-			Self::Poisoned => formatter.write_str("SQLite connection mutex was poisoned"),
-			Self::Integrity(result) => write!(formatter, "SQLite integrity_check failed: {result}"),
-			Self::UnsupportedSchema(version) => {
-				write!(formatter, "database schema version {version} is newer than this gateway")
-			}
-			Self::InvalidMetadata(message) => write!(formatter, "invalid gateway metadata: {message}"),
-			Self::IdempotencyConflict => formatter.write_str("idempotency key was reused for a different request"),
-		}
-	}
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Io(error) => write!(formatter, "store I/O error: {error}"),
+            Self::Sql(error) => write!(formatter, "SQLite error: {error}"),
+            Self::Poisoned => formatter.write_str("SQLite connection mutex was poisoned"),
+            Self::Integrity(result) => write!(formatter, "SQLite integrity_check failed: {result}"),
+            Self::UnsupportedSchema(version) => {
+                write!(
+                    formatter,
+                    "database schema version {version} is newer than this gateway"
+                )
+            }
+            Self::InvalidMetadata(message) => {
+                write!(formatter, "invalid gateway metadata: {message}")
+            }
+            Self::IdempotencyConflict => {
+                formatter.write_str("idempotency key was reused for a different request")
+            }
+        }
+    }
 }
 
 impl std::error::Error for StoreError {
-	fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-		match self {
-			Self::Io(error) => Some(error),
-			Self::Sql(error) => Some(error),
-			_ => None,
-		}
-	}
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Io(error) => Some(error),
+            Self::Sql(error) => Some(error),
+            _ => None,
+        }
+    }
 }
 
 impl From<io::Error> for StoreError {
-	fn from(error: io::Error) -> Self {
-		Self::Io(error)
-	}
+    fn from(error: io::Error) -> Self {
+        Self::Io(error)
+    }
 }
 
 impl From<rusqlite::Error> for StoreError {
-	fn from(error: rusqlite::Error) -> Self {
-		Self::Sql(error)
-	}
+    fn from(error: rusqlite::Error) -> Self {
+        Self::Sql(error)
+    }
 }
 
 pub type StoreResult<T> = Result<T, StoreError>;
 
 struct StoreInner {
-	connection: Mutex<Connection>,
-	path: Option<PathBuf>,
+    connection: Mutex<Connection>,
+    path: Option<PathBuf>,
 }
 
 /// A cloneable handle to the durable gateway state database.
 #[derive(Clone)]
 pub struct Store {
-	inner: Arc<StoreInner>,
+    inner: Arc<StoreInner>,
 }
 
 impl fmt::Debug for Store {
-	fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-		formatter
-			.debug_struct("Store")
-			.field("path", &self.inner.path)
-			.finish_non_exhaustive()
-	}
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("Store")
+            .field("path", &self.inner.path)
+            .finish_non_exhaustive()
+    }
 }
 
 impl Default for Store {
-	fn default() -> Self {
-		Self::open_in_memory().expect("in-memory SQLite store must initialize")
-	}
+    fn default() -> Self {
+        Self::open_in_memory().expect("in-memory SQLite store must initialize")
+    }
 }
 
 impl Store {
-	/// Opens (and migrates) the state database in `state_dir`.
-	pub fn open(state_dir: impl AsRef<Path>) -> StoreResult<Self> {
-		let state_dir = state_dir.as_ref();
-		fs::create_dir_all(state_dir)?;
-		let path = state_dir.join(DATABASE_FILENAME);
-		let connection = Connection::open(&path)?;
-		Self::from_connection(connection, Some(path))
-	}
+    /// Opens (and migrates) the state database in `state_dir`.
+    pub fn open(state_dir: impl AsRef<Path>) -> StoreResult<Self> {
+        let state_dir = state_dir.as_ref();
+        fs::create_dir_all(state_dir)?;
+        let path = state_dir.join(DATABASE_FILENAME);
+        let connection = Connection::open(&path)?;
+        Self::from_connection(connection, Some(path))
+    }
 
-	/// Creates an isolated store for unit tests and small in-process callers.
-	pub fn open_in_memory() -> StoreResult<Self> {
-		Self::from_connection(Connection::open_in_memory()?, None)
-	}
+    /// Creates an isolated store for unit tests and small in-process callers.
+    pub fn open_in_memory() -> StoreResult<Self> {
+        Self::from_connection(Connection::open_in_memory()?, None)
+    }
 
-	fn from_connection(mut connection: Connection, path: Option<PathBuf>) -> StoreResult<Self> {
-		configure_connection(&mut connection)?;
-		migrate(&mut connection)?;
-		integrity_check(&connection)?;
-		Ok(Self { inner: Arc::new(StoreInner { connection: Mutex::new(connection), path }) })
-	}
+    fn from_connection(mut connection: Connection, path: Option<PathBuf>) -> StoreResult<Self> {
+        configure_connection(&mut connection)?;
+        migrate(&mut connection)?;
+        integrity_check(&connection)?;
+        Ok(Self {
+            inner: Arc::new(StoreInner {
+                connection: Mutex::new(connection),
+                path,
+            }),
+        })
+    }
 
-	pub fn database_path(&self) -> Option<&Path> {
-		self.inner.path.as_deref()
-	}
+    pub fn database_path(&self) -> Option<&Path> {
+        self.inner.path.as_deref()
+    }
 
-	pub(crate) fn connection(&self) -> StoreResult<MutexGuard<'_, Connection>> {
-		self.inner.connection.lock().map_err(|_| StoreError::Poisoned)
-	}
+    pub(crate) fn connection(&self) -> StoreResult<MutexGuard<'_, Connection>> {
+        self.inner
+            .connection
+            .lock()
+            .map_err(|_| StoreError::Poisoned)
+    }
 
-	pub fn get_meta(&self, key: &str) -> StoreResult<Option<String>> {
-		let connection = self.connection()?;
-		meta_get(&connection, key)
-	}
+    pub fn get_meta(&self, key: &str) -> StoreResult<Option<String>> {
+        let connection = self.connection()?;
+        meta_get(&connection, key)
+    }
 
-	pub fn set_meta(&self, key: &str, value: &str) -> StoreResult<()> {
-		let connection = self.connection()?;
-		connection.execute(
-			"INSERT INTO gateway_meta(k, v) VALUES (?1, ?2)
+    pub fn set_meta(&self, key: &str, value: &str) -> StoreResult<()> {
+        let connection = self.connection()?;
+        connection.execute(
+            "INSERT INTO gateway_meta(k, v) VALUES (?1, ?2)
 			 ON CONFLICT(k) DO UPDATE SET v = excluded.v",
-			rusqlite::params![key, value],
-		)?;
-		Ok(())
-	}
+            rusqlite::params![key, value],
+        )?;
+        Ok(())
+    }
 
+    pub fn journal_generation(&self) -> StoreResult<u64> {
+        let raw = self.get_meta("journal_generation")?.ok_or_else(|| {
+            StoreError::InvalidMetadata("journal_generation is missing".to_owned())
+        })?;
+        raw.parse()
+            .map_err(|_| StoreError::InvalidMetadata("journal_generation is not a u64".to_owned()))
+    }
 
-	pub fn journal_generation(&self) -> StoreResult<u64> {
-		let raw = self
-			.get_meta("journal_generation")?
-			.ok_or_else(|| StoreError::InvalidMetadata("journal_generation is missing".to_owned()))?;
-		raw.parse().map_err(|_| StoreError::InvalidMetadata("journal_generation is not a u64".to_owned()))
-	}
-
-	/// Returns a replayed response for the exact request, or records no state
-	/// when this key is unseen. Call `store_idempotency_response` after the
-	/// mutation has committed.
-	pub fn replay_idempotency(
-		&self,
-		scope: &str,
-		key: &str,
-		request_json: &str,
-		now_ms: i64,
-	) -> StoreResult<Option<String>> {
-		let mut connection = self.connection()?;
-		let transaction = connection.transaction()?;
-		transaction.execute("DELETE FROM idempotency WHERE expires_at <= ?1", [now_ms])?;
-		let existing = transaction
+    /// Returns a replayed response for the exact request, or records no state
+    /// when this key is unseen. Call `store_idempotency_response` after the
+    /// mutation has committed.
+    pub fn replay_idempotency(
+        &self,
+        scope: &str,
+        key: &str,
+        request_json: &str,
+        now_ms: i64,
+    ) -> StoreResult<Option<String>> {
+        let mut connection = self.connection()?;
+        let transaction = connection.transaction()?;
+        transaction.execute("DELETE FROM idempotency WHERE expires_at <= ?1", [now_ms])?;
+        let existing = transaction
 			.query_row(
 				"SELECT request_json, response_json FROM idempotency WHERE scope = ?1 AND idempotency_key = ?2",
 				rusqlite::params![scope, key],
 				|row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
 			)
 			.optional()?;
-		transaction.commit()?;
+        transaction.commit()?;
 
-		match existing {
-			Some((stored_request, _)) if stored_request != request_json => Err(StoreError::IdempotencyConflict),
-			Some((_, response)) => Ok(Some(response)),
-			None => Ok(None),
-		}
-	}
+        match existing {
+            Some((stored_request, _)) if stored_request != request_json => {
+                Err(StoreError::IdempotencyConflict)
+            }
+            Some((_, response)) => Ok(Some(response)),
+            None => Ok(None),
+        }
+    }
 
-	pub fn store_idempotency_response(
-		&self,
-		scope: &str,
-		key: &str,
-		request_json: &str,
-		response_json: &str,
-		now_ms: i64,
-	) -> StoreResult<()> {
-		let expires_at = now_ms.checked_add(IDEMPOTENCY_WINDOW_MS).ok_or_else(|| {
-			StoreError::InvalidMetadata("idempotency expiration overflowed i64".to_owned())
-		})?;
-		let mut connection = self.connection()?;
-		let transaction = connection.transaction()?;
-		transaction.execute("DELETE FROM idempotency WHERE expires_at <= ?1", [now_ms])?;
-		let existing = transaction
-			.query_row(
-				"SELECT request_json FROM idempotency WHERE scope = ?1 AND idempotency_key = ?2",
-				rusqlite::params![scope, key],
-				|row| row.get::<_, String>(0),
-			)
-			.optional()?;
-		if let Some(existing_request) = existing {
-			if existing_request != request_json {
-				return Err(StoreError::IdempotencyConflict);
-			}
-			transaction.commit()?;
-			return Ok(());
-		}
-		transaction.execute(
+    pub fn store_idempotency_response(
+        &self,
+        scope: &str,
+        key: &str,
+        request_json: &str,
+        response_json: &str,
+        now_ms: i64,
+    ) -> StoreResult<()> {
+        let expires_at = now_ms.checked_add(IDEMPOTENCY_WINDOW_MS).ok_or_else(|| {
+            StoreError::InvalidMetadata("idempotency expiration overflowed i64".to_owned())
+        })?;
+        let mut connection = self.connection()?;
+        let transaction = connection.transaction()?;
+        transaction.execute("DELETE FROM idempotency WHERE expires_at <= ?1", [now_ms])?;
+        let existing = transaction
+            .query_row(
+                "SELECT request_json FROM idempotency WHERE scope = ?1 AND idempotency_key = ?2",
+                rusqlite::params![scope, key],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?;
+        if let Some(existing_request) = existing {
+            if existing_request != request_json {
+                return Err(StoreError::IdempotencyConflict);
+            }
+            transaction.commit()?;
+            return Ok(());
+        }
+        transaction.execute(
 			"INSERT INTO idempotency(scope, idempotency_key, request_json, response_json, created_at, expires_at)
 			 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
 			rusqlite::params![scope, key, request_json, response_json, now_ms, expires_at],
 		)?;
-		transaction.commit()?;
-		Ok(())
-	}
+        transaction.commit()?;
+        Ok(())
+    }
 }
 
 pub(crate) fn meta_get(connection: &Connection, key: &str) -> StoreResult<Option<String>> {
-	connection
-		.query_row("SELECT v FROM gateway_meta WHERE k = ?1", [key], |row| row.get(0))
-		.optional()
-		.map_err(StoreError::from)
+    connection
+        .query_row("SELECT v FROM gateway_meta WHERE k = ?1", [key], |row| {
+            row.get(0)
+        })
+        .optional()
+        .map_err(StoreError::from)
 }
 
 pub(crate) fn meta_get_tx(transaction: &Transaction<'_>, key: &str) -> StoreResult<Option<String>> {
-	transaction
-		.query_row("SELECT v FROM gateway_meta WHERE k = ?1", [key], |row| row.get(0))
-		.optional()
-		.map_err(StoreError::from)
+    transaction
+        .query_row("SELECT v FROM gateway_meta WHERE k = ?1", [key], |row| {
+            row.get(0)
+        })
+        .optional()
+        .map_err(StoreError::from)
 }
 
-pub(crate) fn meta_set_tx(transaction: &Transaction<'_>, key: &str, value: &str) -> StoreResult<()> {
-	transaction.execute(
-		"INSERT INTO gateway_meta(k, v) VALUES (?1, ?2)
+pub(crate) fn meta_set_tx(
+    transaction: &Transaction<'_>,
+    key: &str,
+    value: &str,
+) -> StoreResult<()> {
+    transaction.execute(
+        "INSERT INTO gateway_meta(k, v) VALUES (?1, ?2)
 		 ON CONFLICT(k) DO UPDATE SET v = excluded.v",
-		rusqlite::params![key, value],
-	)?;
-	Ok(())
+        rusqlite::params![key, value],
+    )?;
+    Ok(())
 }
 
 fn configure_connection(connection: &mut Connection) -> StoreResult<()> {
-	connection.busy_timeout(Duration::from_secs(5))?;
-	// Lease transitions, journal receipts, and consumer settlements are durable
-	// proofs. FULL synchronizes each committing WAL transaction before success,
-	// trading throughput for a power-loss durability boundary operators can rely on.
-	connection.execute_batch(
-		"PRAGMA journal_mode = WAL;
+    connection.busy_timeout(Duration::from_secs(5))?;
+    // Lease transitions, journal receipts, and consumer settlements are durable
+    // proofs. FULL synchronizes each committing WAL transaction before success,
+    // trading throughput for a power-loss durability boundary operators can rely on.
+    connection.execute_batch(
+        "PRAGMA journal_mode = WAL;
 		 PRAGMA foreign_keys = ON;
 		 PRAGMA synchronous = FULL;",
-	)?;
-	Ok(())
+    )?;
+    Ok(())
 }
 
 fn migrate(connection: &mut Connection) -> StoreResult<()> {
-	connection.execute_batch(
-		"CREATE TABLE IF NOT EXISTS gateway_meta (
+    connection.execute_batch(
+        "CREATE TABLE IF NOT EXISTS gateway_meta (
 			k TEXT PRIMARY KEY NOT NULL,
 			v TEXT NOT NULL
 		);",
-	)?;
+    )?;
 
-	let current_version = meta_get(connection, "schema_version")?
-		.map(|value| {
-			value
-				.parse::<u32>()
-				.map_err(|_| StoreError::InvalidMetadata("schema_version is not a u32".to_owned()))
-		})
-		.transpose()?
-		.unwrap_or(0);
-	if current_version > SCHEMA_VERSION {
-		return Err(StoreError::UnsupportedSchema(current_version));
-	}
+    let current_version = meta_get(connection, "schema_version")?
+        .map(|value| {
+            value
+                .parse::<u32>()
+                .map_err(|_| StoreError::InvalidMetadata("schema_version is not a u32".to_owned()))
+        })
+        .transpose()?
+        .unwrap_or(0);
+    if current_version > SCHEMA_VERSION {
+        return Err(StoreError::UnsupportedSchema(current_version));
+    }
 
-	if current_version < 1 {
-		let transaction = connection.transaction()?;
-		transaction.execute_batch(
+    if current_version < 1 {
+        let transaction = connection.transaction()?;
+        transaction.execute_batch(
 			"CREATE TABLE sessions (
 				session_id TEXT PRIMARY KEY NOT NULL,
 				kind TEXT NOT NULL DEFAULT 'unknown' CHECK (kind IN ('main', 'conversation', 'lane', 'job', 'unknown')),
@@ -410,13 +433,13 @@ fn migrate(connection: &mut Connection) -> StoreResult<()> {
 			);
 			CREATE INDEX idempotency_expiry_idx ON idempotency(expires_at);",
 		)?;
-		meta_set_tx(&transaction, "schema_version", "1")?;
-		transaction.commit()?;
-	}
+        meta_set_tx(&transaction, "schema_version", "1")?;
+        transaction.commit()?;
+    }
 
-	if current_version < 2 {
-		let transaction = connection.transaction()?;
-		transaction.execute_batch(
+    if current_version < 2 {
+        let transaction = connection.transaction()?;
+        transaction.execute_batch(
 			"CREATE TABLE verification_receipts (
 				receipt_id TEXT PRIMARY KEY NOT NULL,
 				lease_id TEXT NOT NULL,
@@ -436,170 +459,202 @@ fn migrate(connection: &mut Connection) -> StoreResult<()> {
 			);
 			CREATE INDEX verification_receipts_lease_idx ON verification_receipts(lease_id, lock_name, consumed_at);",
 		)?;
-		meta_set_tx(&transaction, "schema_version", "2")?;
-		transaction.commit()?;
-	}
+        meta_set_tx(&transaction, "schema_version", "2")?;
+        transaction.commit()?;
+    }
 
-	let defaults = [
-		("bootstrap_state", "ABSENT"),
-		("bootstrap_intent", "null"),
-		("main_identity", "null"),
-		("growth_intent", "null"),
-		("profile_digest", "null"),
-		("profile_digest_version", "0"),
-		("profile_projection", "null"),
-		("profile_tunables_revision", "0"),
-		("profile_approved_at", "null"),
-		("profile_approval_receipt", "null"),
-		("failed_closed_reason", "null"),
-		("journal_generation", "1"),
-		("boot_epoch", "0"),
-		("journal_floor_seq", "0"),
-		("lock_fencing_token", "0"),
-		("write_mode", "on"),
-		("reconcile_last_ok_at", "null"),
-		("reconcile_cycle_ms", "null"),
-		("reconcile_drift_count", "0"),
-	];
-	for (key, value) in defaults {
-		connection.execute(
-			"INSERT INTO gateway_meta(k, v) VALUES (?1, ?2) ON CONFLICT(k) DO NOTHING",
-			rusqlite::params![key, value],
-		)?;
-	}
-	Ok(())
+    let defaults = [
+        ("bootstrap_state", "ABSENT"),
+        ("bootstrap_intent", "null"),
+        ("main_identity", "null"),
+        ("growth_intent", "null"),
+        ("profile_digest", "null"),
+        ("profile_digest_version", "0"),
+        ("profile_projection", "null"),
+        ("profile_tunables_revision", "0"),
+        ("profile_approved_at", "null"),
+        ("profile_approval_receipt", "null"),
+        ("failed_closed_reason", "null"),
+        ("journal_generation", "1"),
+        ("boot_epoch", "0"),
+        ("journal_floor_seq", "0"),
+        ("lock_fencing_token", "0"),
+        ("write_mode", "on"),
+        ("reconcile_last_ok_at", "null"),
+        ("reconcile_cycle_ms", "null"),
+        ("reconcile_drift_count", "0"),
+    ];
+    for (key, value) in defaults {
+        connection.execute(
+            "INSERT INTO gateway_meta(k, v) VALUES (?1, ?2) ON CONFLICT(k) DO NOTHING",
+            rusqlite::params![key, value],
+        )?;
+    }
+    Ok(())
 }
 
 fn integrity_check(connection: &Connection) -> StoreResult<()> {
-	let mut statement = connection.prepare("PRAGMA integrity_check")?;
-	let rows = statement.query_map([], |row| row.get::<_, String>(0))?;
-	for row in rows {
-		let result = row?;
-		if result != "ok" {
-			return Err(StoreError::Integrity(result));
-		}
-	}
-	Ok(())
+    let mut statement = connection.prepare("PRAGMA integrity_check")?;
+    let rows = statement.query_map([], |row| row.get::<_, String>(0))?;
+    for row in rows {
+        let result = row?;
+        if result != "ok" {
+            return Err(StoreError::Integrity(result));
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
-	use std::{
-		fs,
-		path::PathBuf,
-		sync::atomic::{AtomicU64, Ordering},
-	};
+    use std::{
+        fs,
+        path::PathBuf,
+        sync::atomic::{AtomicU64, Ordering},
+    };
 
-	use super::{DATABASE_FILENAME, IDEMPOTENCY_WINDOW_MS, SCHEMA_VERSION, Store};
-	use rusqlite::{Connection, OptionalExtension};
+    use super::{DATABASE_FILENAME, IDEMPOTENCY_WINDOW_MS, SCHEMA_VERSION, Store};
+    use rusqlite::{Connection, OptionalExtension};
 
-	static NEXT_TEMP_DIR: AtomicU64 = AtomicU64::new(0);
+    static NEXT_TEMP_DIR: AtomicU64 = AtomicU64::new(0);
 
-	fn temporary_state_dir(test_name: &str) -> PathBuf {
-		let unique = NEXT_TEMP_DIR.fetch_add(1, Ordering::Relaxed);
-		let path = std::env::temp_dir().join(format!(
-			"gajae-way-store-{test_name}-{}-{unique}",
-			std::process::id()
-		));
-		fs::create_dir_all(&path).unwrap();
-		path
-	}
+    fn temporary_state_dir(test_name: &str) -> PathBuf {
+        let unique = NEXT_TEMP_DIR.fetch_add(1, Ordering::Relaxed);
+        let path = std::env::temp_dir().join(format!(
+            "gajae-way-store-{test_name}-{}-{unique}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&path).unwrap();
+        path
+    }
 
-	#[test]
-	fn fresh_open_creates_the_full_schema_in_wal_mode() {
-		let state_dir = temporary_state_dir("fresh");
-		let store = Store::open(&state_dir).unwrap();
-		assert!(state_dir.join(DATABASE_FILENAME).is_file());
-		assert_eq!(store.get_meta("schema_version").unwrap(), Some(SCHEMA_VERSION.to_string()));
+    #[test]
+    fn fresh_open_creates_the_full_schema_in_wal_mode() {
+        let state_dir = temporary_state_dir("fresh");
+        let store = Store::open(&state_dir).unwrap();
+        assert!(state_dir.join(DATABASE_FILENAME).is_file());
+        assert_eq!(
+            store.get_meta("schema_version").unwrap(),
+            Some(SCHEMA_VERSION.to_string())
+        );
 
-		let connection = store.connection().unwrap();
-		let journal_mode: String = connection.query_row("PRAGMA journal_mode", [], |row| row.get(0)).unwrap();
-		assert_eq!(journal_mode.to_lowercase(), "wal");
-		let synchronous: i64 = connection.query_row("PRAGMA synchronous", [], |row| row.get(0)).unwrap();
-		assert_eq!(synchronous, 2, "durable proof tables require synchronous=FULL");
-		for table in ["sessions", "surfaces", "gateway_meta", "leases", "verification_receipts", "events", "consumer_checkpoints", "outbox", "idempotency"] {
-			let found: Option<String> = connection
-				.query_row(
-					"SELECT name FROM sqlite_master WHERE type = 'table' AND name = ?1",
-					[table],
-					|row| row.get(0),
-				)
-				.optional()
-				.unwrap();
-			assert_eq!(found.as_deref(), Some(table));
-		}
-		let mut statement = connection.prepare("PRAGMA table_info(sessions)").unwrap();
-		let session_columns = statement
-			.query_map([], |row| row.get::<_, String>(1))
-			.unwrap()
-			.collect::<Result<Vec<_>, _>>()
-			.unwrap();
-		for column in [
-			"session_id",
-			"kind",
-			"purpose",
-			"brief",
-			"status",
-			"surface_id",
-			"locator",
-			"endpoint_generation",
-			"host_incarnation",
-			"identity_provenance",
-			"index_seq",
-			"live",
-			"deleted",
-			"terminal_uncertain",
-			"ambiguous",
-			"activity_state",
-			"activity_at",
-			"last_heartbeat_at",
-			"meta_name",
-			"meta_cwd",
-			"meta_kind",
-			"metadata_state",
-			"metadata_at",
-			"source",
-			"created_at",
-			"last_seen_at",
-			"closed_at",
-			"registry_rev",
-		] {
-			assert!(session_columns.iter().any(|candidate| candidate == column), "sessions.{column} is missing");
-		}
-		drop(statement);
-		drop(connection);
-		fs::remove_dir_all(state_dir).unwrap();
-	}
+        let connection = store.connection().unwrap();
+        let journal_mode: String = connection
+            .query_row("PRAGMA journal_mode", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(journal_mode.to_lowercase(), "wal");
+        let synchronous: i64 = connection
+            .query_row("PRAGMA synchronous", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(
+            synchronous, 2,
+            "durable proof tables require synchronous=FULL"
+        );
+        for table in [
+            "sessions",
+            "surfaces",
+            "gateway_meta",
+            "leases",
+            "verification_receipts",
+            "events",
+            "consumer_checkpoints",
+            "outbox",
+            "idempotency",
+        ] {
+            let found: Option<String> = connection
+                .query_row(
+                    "SELECT name FROM sqlite_master WHERE type = 'table' AND name = ?1",
+                    [table],
+                    |row| row.get(0),
+                )
+                .optional()
+                .unwrap();
+            assert_eq!(found.as_deref(), Some(table));
+        }
+        let mut statement = connection.prepare("PRAGMA table_info(sessions)").unwrap();
+        let session_columns = statement
+            .query_map([], |row| row.get::<_, String>(1))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        for column in [
+            "session_id",
+            "kind",
+            "purpose",
+            "brief",
+            "status",
+            "surface_id",
+            "locator",
+            "endpoint_generation",
+            "host_incarnation",
+            "identity_provenance",
+            "index_seq",
+            "live",
+            "deleted",
+            "terminal_uncertain",
+            "ambiguous",
+            "activity_state",
+            "activity_at",
+            "last_heartbeat_at",
+            "meta_name",
+            "meta_cwd",
+            "meta_kind",
+            "metadata_state",
+            "metadata_at",
+            "source",
+            "created_at",
+            "last_seen_at",
+            "closed_at",
+            "registry_rev",
+        ] {
+            assert!(
+                session_columns.iter().any(|candidate| candidate == column),
+                "sessions.{column} is missing"
+            );
+        }
+        drop(statement);
+        drop(connection);
+        fs::remove_dir_all(state_dir).unwrap();
+    }
 
-	#[test]
-	fn reopen_is_idempotent_and_preserves_metadata() {
-		let state_dir = temporary_state_dir("reopen");
-		let first = Store::open(&state_dir).unwrap();
-		first.set_meta("bootstrap_state", "COMMITTED").unwrap();
-		drop(first);
+    #[test]
+    fn reopen_is_idempotent_and_preserves_metadata() {
+        let state_dir = temporary_state_dir("reopen");
+        let first = Store::open(&state_dir).unwrap();
+        first.set_meta("bootstrap_state", "COMMITTED").unwrap();
+        drop(first);
 
-		let second = Store::open(&state_dir).unwrap();
-		assert_eq!(second.get_meta("bootstrap_state").unwrap().as_deref(), Some("COMMITTED"));
-		assert_eq!(second.get_meta("schema_version").unwrap(), Some(SCHEMA_VERSION.to_string()));
-		drop(second);
-		fs::remove_dir_all(state_dir).unwrap();
-	}
+        let second = Store::open(&state_dir).unwrap();
+        assert_eq!(
+            second.get_meta("bootstrap_state").unwrap().as_deref(),
+            Some("COMMITTED")
+        );
+        assert_eq!(
+            second.get_meta("schema_version").unwrap(),
+            Some(SCHEMA_VERSION.to_string())
+        );
+        drop(second);
+        fs::remove_dir_all(state_dir).unwrap();
+    }
 
-	#[test]
-	fn v1_state_directory_migrates_to_bound_verification_receipts() {
-		let state_dir = temporary_state_dir("v1-migration");
-		let database_path = state_dir.join(DATABASE_FILENAME);
-		drop(Store::open(&state_dir).unwrap());
-		let connection = Connection::open(&database_path).unwrap();
-		connection
+    #[test]
+    fn v1_state_directory_migrates_to_bound_verification_receipts() {
+        let state_dir = temporary_state_dir("v1-migration");
+        let database_path = state_dir.join(DATABASE_FILENAME);
+        drop(Store::open(&state_dir).unwrap());
+        let connection = Connection::open(&database_path).unwrap();
+        connection
 			.execute_batch("DROP TABLE verification_receipts; UPDATE gateway_meta SET v = '1' WHERE k = 'schema_version';")
 			.unwrap();
-		drop(connection);
+        drop(connection);
 
-		let migrated = Store::open(&state_dir).unwrap();
-		assert_eq!(migrated.get_meta("schema_version").unwrap(), Some(SCHEMA_VERSION.to_string()));
-		let connection = migrated.connection().unwrap();
-		let found: Option<String> = connection
+        let migrated = Store::open(&state_dir).unwrap();
+        assert_eq!(
+            migrated.get_meta("schema_version").unwrap(),
+            Some(SCHEMA_VERSION.to_string())
+        );
+        let connection = migrated.connection().unwrap();
+        let found: Option<String> = connection
 			.query_row(
 				"SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'verification_receipts'",
 				[],
@@ -607,36 +662,53 @@ mod tests {
 			)
 			.optional()
 			.unwrap();
-		assert_eq!(found.as_deref(), Some("verification_receipts"));
-		drop(connection);
-		drop(migrated);
-		fs::remove_dir_all(state_dir).unwrap();
-	}
+        assert_eq!(found.as_deref(), Some("verification_receipts"));
+        drop(connection);
+        drop(migrated);
+        fs::remove_dir_all(state_dir).unwrap();
+    }
 
-	#[test]
-	fn round_trips_metadata_and_idempotency() {
-		let store = Store::default();
-		store.set_meta("health", "healthy").unwrap();
-		assert_eq!(store.get_meta("health").unwrap().as_deref(), Some("healthy"));
-		assert_eq!(store.get_meta("missing").unwrap(), None);
+    #[test]
+    fn round_trips_metadata_and_idempotency() {
+        let store = Store::default();
+        store.set_meta("health", "healthy").unwrap();
+        assert_eq!(
+            store.get_meta("health").unwrap().as_deref(),
+            Some("healthy")
+        );
+        assert_eq!(store.get_meta("missing").unwrap(), None);
 
-		assert_eq!(store.replay_idempotency("lock.acquire", "k", "{\"a\":1}", 10).unwrap(), None);
-		store
-			.store_idempotency_response("lock.acquire", "k", "{\"a\":1}", "{\"lease\":1}", 10)
-			.unwrap();
-		assert_eq!(
-			store.replay_idempotency("lock.acquire", "k", "{\"a\":1}", 11).unwrap().as_deref(),
-			Some("{\"lease\":1}")
-		);
-		assert!(store.replay_idempotency("lock.acquire", "k", "{\"a\":2}", 11).is_err());
-		assert!(store
-			.store_idempotency_response("lock.acquire", "k", "{\"a\":2}", "{\"lease\":2}", 11)
-			.is_err());
-		assert_eq!(
-			store
-				.replay_idempotency("lock.acquire", "k", "{\"a\":2}", 10 + IDEMPOTENCY_WINDOW_MS)
-				.unwrap(),
-			None
-		);
-	}
+        assert_eq!(
+            store
+                .replay_idempotency("lock.acquire", "k", "{\"a\":1}", 10)
+                .unwrap(),
+            None
+        );
+        store
+            .store_idempotency_response("lock.acquire", "k", "{\"a\":1}", "{\"lease\":1}", 10)
+            .unwrap();
+        assert_eq!(
+            store
+                .replay_idempotency("lock.acquire", "k", "{\"a\":1}", 11)
+                .unwrap()
+                .as_deref(),
+            Some("{\"lease\":1}")
+        );
+        assert!(
+            store
+                .replay_idempotency("lock.acquire", "k", "{\"a\":2}", 11)
+                .is_err()
+        );
+        assert!(
+            store
+                .store_idempotency_response("lock.acquire", "k", "{\"a\":2}", "{\"lease\":2}", 11)
+                .is_err()
+        );
+        assert_eq!(
+            store
+                .replay_idempotency("lock.acquire", "k", "{\"a\":2}", 10 + IDEMPOTENCY_WINDOW_MS)
+                .unwrap(),
+            None
+        );
+    }
 }

@@ -1,6 +1,7 @@
 import { MainSessionGateRegistry, type GateHandle } from "./gates";
 import type { HostedSdkGate, HostedSdkGateResolution, HostedSdkSession } from "./sdk";
 import {
+	attestAppendOnlyGrowth,
 	fingerprintSessionFile,
 	GatewayStateStore,
 	sameFingerprint,
@@ -26,7 +27,6 @@ export class MainSessionHostError extends Error {
 }
 
 export interface MainSessionHost {
-	readonly phase: "P4";
 	readonly sessionId: string;
 	readonly identity: SessionFingerprint;
 	readonly degraded: boolean;
@@ -94,9 +94,10 @@ interface FinalAssistantMessage {
 	};
 }
 
-interface FollowUpGrowth {
+interface GrowthWindow {
 	readonly intent: GrowthIntent;
-	started: boolean;
+	activeMutations: number;
+	activeTurns: number;
 }
 
 function finalizedAssistantMessage(event: Record<string, unknown>): FinalAssistantMessage | undefined {
@@ -142,7 +143,6 @@ function markFailedClosed(state: GatewayStateStore, reason: string): void {
 }
 
 class HostedMainSession implements MainSessionHost {
-	readonly phase = "P4" as const;
 	readonly sessionId: string;
 	readonly gates: MainSessionGateRegistry;
 	#identity: SessionFingerprint;
@@ -156,7 +156,7 @@ class HostedMainSession implements MainSessionHost {
 	#followUpQueueDepth = 0;
 	#degraded = false;
 	#failure: MainSessionHostError | undefined;
-	#followUpGrowth: FollowUpGrowth | undefined;
+	#growthWindow: GrowthWindow | undefined;
 	readonly #finalizedAssistantMessageKeys = new Set<string>();
 	#disposed = false;
 
@@ -249,34 +249,45 @@ class HostedMainSession implements MainSessionHost {
 		}
 	}
 
-	private beginFollowUpGrowth(): FollowUpGrowth {
-		if (this.#followUpGrowth) return this.#followUpGrowth;
-		const growth = { intent: this.beforeMutation(), started: false };
-		this.#followUpGrowth = growth;
+	/**
+	 * A durable growth intent covers one contiguous append-only transcript window.
+	 * Owner interrupts and queued follow-ups may both append inside that same
+	 * window; it is refreshed only after every active turn and queued follow-up
+	 * has settled.
+	 */
+	private beginGrowthWindow(): GrowthWindow {
+		const existing = this.#growthWindow;
+		if (existing) return existing;
+		const growth: GrowthWindow = {
+			intent: this.beforeMutation(),
+			activeMutations: 0,
+			activeTurns: this.#turnState === "busy" ? 1 : 0,
+		};
+		this.#growthWindow = growth;
 		return growth;
 	}
 
-	private abandonFollowUpGrowth(growth: FollowUpGrowth): void {
-		if (this.#failure || this.#followUpGrowth !== growth || growth.started) return;
-		this.#followUpGrowth = undefined;
-		try {
-			this.afterMutation(growth.intent);
-		} catch (error) {
-			this.enterFailure("growth_refresh_failed", error);
-		}
+	private beginMutation(): GrowthWindow {
+		const growth = this.beginGrowthWindow();
+		growth.activeMutations += 1;
+		return growth;
 	}
 
-	private completeFollowUpGrowth(): void {
-		const growth = this.#followUpGrowth;
-		if (!growth || !growth.started || this.#failure) return;
-		growth.started = false;
+	private finishMutation(growth: GrowthWindow): void {
+		if (this.#growthWindow !== growth) return;
+		growth.activeMutations = Math.max(0, growth.activeMutations - 1);
 		this.refreshFollowUpQueueDepth();
-		if (this.#followUpQueueDepth > 0) return;
-		this.#followUpGrowth = undefined;
+		this.finishGrowthWindowIfSettled();
+	}
+
+	private finishGrowthWindowIfSettled(): void {
+		const growth = this.#growthWindow;
+		if (!growth || growth.activeMutations > 0 || growth.activeTurns > 0 || this.#followUpQueueDepth > 0) return;
+		this.#growthWindow = undefined;
 		try {
 			this.afterMutation(growth.intent);
 		} catch (error) {
-			this.enterFailure("growth_refresh_failed", error);
+			this.enterFailure(error instanceof MainSessionHostError ? error.reason : "growth_refresh_failed", error);
 		}
 	}
 
@@ -303,17 +314,21 @@ class HostedMainSession implements MainSessionHost {
 		if (type === "turn_start" || type === "agent_start") {
 			this.#turnState = "busy";
 			this.refreshFollowUpQueueDepth();
+			if (type === "turn_start" && this.#growthWindow) this.#growthWindow.activeTurns += 1;
 			this.publishStatus();
-			if (this.appendJournalEvent("turn_start", event) && this.#followUpGrowth && !this.#followUpGrowth.started) {
-				this.#followUpGrowth.started = true;
-			}
+			this.appendJournalEvent("turn_start", event);
 			return;
 		}
 		if (type === "turn_end" || type === "agent_end") {
 			this.#turnState = "idle";
 			this.refreshFollowUpQueueDepth();
+			if (this.#growthWindow) {
+				if (type === "turn_end" && this.#growthWindow.activeTurns > 0) this.#growthWindow.activeTurns -= 1;
+				if (type === "agent_end") this.#growthWindow.activeTurns = 0;
+			}
 			this.publishStatus();
-			if (this.appendJournalEvent("turn_end", event)) this.completeFollowUpGrowth();
+			this.appendJournalEvent("turn_end", event);
+			this.finishGrowthWindowIfSettled();
 			return;
 		}
 		if (type === "gate_expired") {
@@ -374,16 +389,24 @@ class HostedMainSession implements MainSessionHost {
 		let refreshed: SessionFingerprint;
 		try {
 			refreshed = fingerprintSessionFile(intent.base.canonicalPath);
+			if (!attestAppendOnlyGrowth(intent.base, refreshed)) {
+				markFailedClosed(this.#state, "growth_intent_mismatch");
+				throw new MainSessionHostError("growth_intent_mismatch", "The transcript changed outside the active append-only growth window.");
+			}
 			this.#state.refreshAfterGrowth(intent, refreshed);
 			this.#identity = refreshed;
 		} catch (error) {
-			markFailedClosed(this.#state, "growth_refresh_failed");
-			throw new MainSessionHostError("growth_refresh_failed", error instanceof Error ? error.message : String(error));
+			if (!(error instanceof MainSessionHostError && error.reason === "growth_intent_mismatch")) {
+				markFailedClosed(this.#state, "growth_refresh_failed");
+			}
+			throw error instanceof MainSessionHostError
+				? error
+				: new MainSessionHostError("growth_refresh_failed", error instanceof Error ? error.message : String(error));
 		}
 	}
 
 	private async mutate(action: () => Promise<void>): Promise<void> {
-		const intent = this.beforeMutation();
+		const growth = this.beginMutation();
 		let mutationError: unknown;
 		try {
 			await action();
@@ -391,14 +414,13 @@ class HostedMainSession implements MainSessionHost {
 		} catch (error) {
 			mutationError = error;
 		}
-		let refreshError: unknown;
 		try {
-			this.afterMutation(intent);
+			this.finishMutation(growth);
 		} catch (error) {
-			refreshError = error;
+			if (!mutationError) mutationError = error;
 		}
 		if (mutationError) throw mutationError;
-		if (refreshError) throw refreshError;
+		this.assertUsable();
 	}
 
 	async prompt(text: string): Promise<void> {
@@ -413,17 +435,7 @@ class HostedMainSession implements MainSessionHost {
 
 	async followUp(text: string): Promise<void> {
 		if (!text.trim()) throw new MainSessionHostError("follow_up_empty", "A main-session follow-up must not be empty.");
-		this.assertUsable();
-		const existingGrowth = this.#followUpGrowth;
-		const growth = existingGrowth ?? this.beginFollowUpGrowth();
-		try {
-			await this.#session.followUp(text);
-			this.assertUsable();
-		} catch (error) {
-			if (!existingGrowth) this.abandonFollowUpGrowth(growth);
-			throw error;
-		}
-		this.refreshFollowUpQueueDepth();
+		await this.mutate(() => this.#session.followUp(text));
 		this.publishStatus();
 	}
 

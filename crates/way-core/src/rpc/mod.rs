@@ -3,15 +3,15 @@
 use std::{
 	path::PathBuf,
 	sync::{
-		atomic::{AtomicBool, Ordering},
 		Arc, OnceLock,
+		atomic::{AtomicBool, Ordering},
 	},
 };
 
 use tokio::{
 	net::UnixListener,
 	runtime::{Builder, Runtime},
-	sync::{watch, Notify},
+	sync::{Notify, watch},
 	task::JoinHandle,
 };
 
@@ -19,9 +19,9 @@ pub mod auth;
 pub mod dispatch;
 pub mod framing;
 
-use auth::{bind_socket, verify_peer, PeerAuth, SocketBootError};
+use auth::{PeerAuth, SocketBootError, bind_socket, verify_peer};
 use dispatch::{RpcBridgeStats, RpcDispatcher, TsfnBridge};
-use framing::{serve_connection, ConnectionCounters};
+use framing::{ConnectionCounters, serve_connection};
 
 static RPC_RUNTIME: OnceLock<Runtime> = OnceLock::new();
 
@@ -88,7 +88,6 @@ pub struct RpcServerHandle {
 	counters: ConnectionCounters,
 }
 
-
 impl RpcServerHandle {
 	pub fn start(socket_path: PathBuf, state_dir: PathBuf, dispatcher: RpcDispatcher) -> Result<Self, SocketBootError> {
 		let listener = bind_socket(&state_dir, &socket_path)?;
@@ -107,7 +106,6 @@ impl RpcServerHandle {
 		});
 		Ok(Self { shutdown, bridge, dispatcher: dispatcher_handle, _task: task, counters })
 	}
-
 
 	pub fn shutdown(&self) {
 		self.bridge.shutdown();
@@ -192,14 +190,14 @@ mod tests {
 		time::Duration,
 	};
 
-	use serde_json::{json, Value};
+	use serde_json::{Value, json};
 	use tokio::{
 		io::{AsyncReadExt, AsyncWriteExt},
 		net::UnixStream,
 		time::timeout,
 	};
 
-	use super::{dispatch::RpcDispatcher, dispatch::TsfnBridge, RpcServerHandle};
+	use super::{RpcServerHandle, dispatch::RpcDispatcher, dispatch::TsfnBridge};
 	use crate::{events::EventJournal, lock::LockManager, store::Store};
 
 	static NEXT_TEMP_DIR: AtomicU64 = AtomicU64::new(0);
@@ -217,7 +215,7 @@ mod tests {
 	fn start_server(state: &Path) -> (RpcServerHandle, LockManager) {
 		let store = Store::open(state).unwrap();
 		let locks = LockManager::new(store.clone());
-		let dispatcher = RpcDispatcher::new(store.clone(), locks.clone(), EventJournal::new(store), TsfnBridge::unavailable());
+		let dispatcher = RpcDispatcher::new(store.clone(), locks.clone(), EventJournal::new(store), TsfnBridge::for_tests());
 		let handle = RpcServerHandle::start(state.join("rpc.sock"), state.to_path_buf(), dispatcher).unwrap();
 		(handle, locks)
 	}
@@ -268,7 +266,9 @@ mod tests {
 		assert_eq!(batch["error"]["code"], -32600);
 		assert_eq!(batch["error"]["message"], "batch_unsupported");
 		stream
-			.write_all(b"{\"jsonrpc\":\"2.0\",\"method\":\"way.health\",\"params\":{}}\n{\"jsonrpc\":\"2.0\",\"id\":9,\"method\":\"way.health\",\"params\":{}}\n")
+			.write_all(
+				b"{\"jsonrpc\":\"2.0\",\"method\":\"way.health\",\"params\":{}}\n{\"jsonrpc\":\"2.0\",\"id\":9,\"method\":\"way.health\",\"params\":{}}\n",
+			)
 			.await
 			.unwrap();
 		let health: Value = serde_json::from_str(&read_line(&mut stream).await).unwrap();

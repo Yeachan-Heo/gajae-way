@@ -4,22 +4,22 @@ use std::{
 	collections::{HashMap, VecDeque},
 	fmt,
 	sync::{
-		atomic::{AtomicBool, AtomicU64, Ordering},
 		Arc, Mutex,
+		atomic::{AtomicBool, AtomicU64, Ordering},
 	},
 	time::{Duration, Instant},
 };
 
 use napi::threadsafe_function::{ThreadsafeFunction, ThreadsafeFunctionCallMode};
 use napi_derive::napi;
-use serde_json::{json, Map, Value};
+use serde_json::{Map, Value, json};
 use tokio::{sync::oneshot, time::Instant as TokioInstant};
 
 use crate::{
 	events::{ConsumerClaim, Cursor, DeliveryProof, EventJournal, JournalError, JournalGap, JournalRead},
 	lock::{Lease, LockError, LockManager, LockStatus, QuarantineReceiptEvidence, ReleaseResult},
 	registry::{self, RegistryAnnotation, RegistryError, RegistryListFilter},
-	store::{unix_epoch_ms, Store, StoreError},
+	store::{Store, StoreError, unix_epoch_ms},
 };
 
 use super::CancellationToken;
@@ -217,8 +217,9 @@ impl TsfnBridge {
 		Self { callback: Arc::new(Mutex::new(Some(callback))), state: Arc::new(BridgeState::default()) }
 	}
 
-	/// A deliberately unavailable bridge used by pure Rust dispatch tests.
-	pub fn unavailable() -> Self {
+	/// Builds a callback-free bridge for pure Rust dispatch tests.
+	#[cfg(test)]
+	pub fn for_tests() -> Self {
 		Self { callback: Arc::new(Mutex::new(None)), state: Arc::new(BridgeState::default()) }
 	}
 
@@ -248,10 +249,7 @@ impl TsfnBridge {
 		}
 		let request_id = self.state.next_request_id.fetch_add(1, Ordering::Relaxed);
 		let (responder, receiver) = oneshot::channel();
-		let pending_call = PendingBridgeCall {
-			deadline: TokioInstant::now() + std::time::Duration::from_millis(BRIDGE_TIMEOUT_MS),
-			responder,
-		};
+		let pending_call = PendingBridgeCall { deadline: TokioInstant::now() + std::time::Duration::from_millis(BRIDGE_TIMEOUT_MS), responder };
 		let deadline = pending_call.deadline;
 		pending.insert(request_id, pending_call);
 		Ok((request_id, receiver, deadline))
@@ -346,9 +344,7 @@ impl TsfnBridge {
 	/// deliberately observable but never overwrite the first result.
 	pub fn complete_json(&self, request_id: u64, result_json: &str) -> bool {
 		let completion = match serde_json::from_str::<Value>(result_json) {
-			Ok(Value::Object(mut object)) if object.contains_key("error") => {
-				BridgeCompletion::RemoteError(object.remove("error").unwrap_or(Value::Null))
-			}
+			Ok(Value::Object(mut object)) if object.contains_key("error") => BridgeCompletion::RemoteError(object.remove("error").unwrap_or(Value::Null)),
 			Ok(result) => BridgeCompletion::Success(result),
 			Err(_) => BridgeCompletion::RemoteError(json!({
 				"code": -32603,
@@ -424,6 +420,7 @@ struct GatewayHealth {
 
 #[derive(Debug, Clone)]
 struct MainSessionStatus {
+	resumed: bool,
 	turn_state: String,
 	follow_up_queue_depth: u64,
 	journal_degraded: bool,
@@ -431,7 +428,7 @@ struct MainSessionStatus {
 
 impl Default for MainSessionStatus {
 	fn default() -> Self {
-		Self { turn_state: "idle".to_owned(), follow_up_queue_depth: 0, journal_degraded: false }
+		Self { resumed: false, turn_state: "idle".to_owned(), follow_up_queue_depth: 0, journal_degraded: false }
 	}
 }
 
@@ -477,8 +474,11 @@ impl RpcDispatcher {
 		}
 	}
 
+	/// Publishes runtime main-session state only after strict resume has opened
+	/// the durable session for this daemon process.
 	pub fn set_main_session_status(&self, turn_state: String, follow_up_queue_depth: u64) {
 		if let Ok(mut status) = self.main_session.lock() {
+			status.resumed = true;
 			status.turn_state = turn_state;
 			status.follow_up_queue_depth = follow_up_queue_depth;
 		}
@@ -495,10 +495,7 @@ impl RpcDispatcher {
 			return Err(RpcError::internal("request cancelled"));
 		}
 		let health = self.health.lock().map_err(|_| RpcError::internal("gateway health lock poisoned"))?.clone();
-		if health.state == GatewayState::FailedClosed
-			&& method != "way.health"
-			&& method != "way.status"
-			&& method != "profile.approve" {
+		if health.state == GatewayState::FailedClosed && method != "way.health" && method != "way.status" && method != "profile.approve" {
 			return Err(RpcError::app(1000, health.reason.map(|reason| json!({ "reason": reason }))));
 		}
 
@@ -511,18 +508,10 @@ impl RpcDispatcher {
 			"gitlock.renew" => self.idempotent(&method, &params, || self.lock_renew(params.clone())).await,
 			"gitlock.release" => self.idempotent(&method, &params, || self.lock_release(params.clone())).await,
 			"gitlock.status" => self.lock_status(params).await,
-			"gitlock.force_release" => {
-				self.idempotent(&method, &params, || self.lock_force_release(params.clone())).await
-			}
-			"gitlock.quarantine_override" => {
-				self.idempotent(&method, &params, || self.lock_quarantine_override(params.clone())).await
-			}
-			"gitlock.clear_quarantine" => {
-				self.idempotent(&method, &params, || self.lock_clear_quarantine(params.clone())).await
-			}
-			"gitlock.record_quarantine_receipt" => {
-				self.idempotent(&method, &params, || self.lock_record_quarantine_receipt(params.clone())).await
-			}
+			"gitlock.force_release" => self.idempotent(&method, &params, || self.lock_force_release(params.clone())).await,
+			"gitlock.quarantine_override" => self.idempotent(&method, &params, || self.lock_quarantine_override(params.clone())).await,
+			"gitlock.clear_quarantine" => self.idempotent(&method, &params, || self.lock_clear_quarantine(params.clone())).await,
+			"gitlock.record_quarantine_receipt" => self.idempotent(&method, &params, || self.lock_record_quarantine_receipt(params.clone())).await,
 			"registry.list" => self.registry_list(params).await,
 			"registry.get" => self.registry_get(params).await,
 			"registry.annotate" => self.idempotent(&method, &params, || self.registry_annotate(params.clone())).await,
@@ -530,9 +519,7 @@ impl RpcDispatcher {
 			"main.events.read" => self.main_events_read(params, cancellation).await,
 			"consumer.claim" => self.consumer_claim(params).await,
 			"consumer.commit" => self.consumer_commit(params).await,
-			method if method.starts_with("main.") || method == "profile.approve" => {
-				self.bridge_method(method, params, cancellation).await
-			}
+			method if method.starts_with("main.") || method == "profile.approve" => self.bridge_method(method, params, cancellation).await,
 
 			_ => Err(RpcError::method_not_found(&method)),
 		}
@@ -541,19 +528,27 @@ impl RpcDispatcher {
 	fn health_response(&self, params: Value) -> Result<Value, RpcError> {
 		ensure_empty_params(&params)?;
 		let health = self.health.lock().map_err(|_| RpcError::internal("gateway health lock poisoned"))?.clone();
+		let main_session = self
+			.main_session
+			.lock()
+			.map_err(|_| RpcError::internal("main session status lock poisoned"))?
+			.clone();
+		let session_id = if main_session.resumed { Some(durable_main_session_id(&self.store)?) } else { None };
 		let generation = self.store.journal_generation().map_err(store_error)?;
-		let durable_main = durable_main_status(&self.store)?;
 		let mut response = json!({
 			"status": health.state.health_status(),
 			"state": health.state.as_str(),
-			"main": { "resumed": durable_main.resumed, "session_id": durable_main.session_id },
+			"main": { "resumed": main_session.resumed, "session_id": session_id },
 			"boot_epoch": crate::health_info().boot_epoch,
 			"journal_generation": generation,
 			"version": env!("CARGO_PKG_VERSION"),
 			"uptime_ms": self.started_at.elapsed().as_millis() as u64,
 		});
 		if let Some(reason) = health.reason {
-			response.as_object_mut().expect("health response is an object").insert("reason".to_owned(), Value::String(reason));
+			response
+				.as_object_mut()
+				.expect("health response is an object")
+				.insert("reason".to_owned(), Value::String(reason));
 		}
 		Ok(response)
 	}
@@ -621,7 +616,9 @@ impl RpcDispatcher {
 		response.insert("turn_state".to_owned(), json!(main_session.turn_state));
 		response.insert("follow_up_queue_depth".to_owned(), json!(main_session.follow_up_queue_depth));
 		let mut lock = lock_status_json(lock_status);
-		lock.as_object_mut().expect("lock status is an object").insert("queue_len".to_owned(), json!(queue_len));
+		lock.as_object_mut()
+			.expect("lock status is an object")
+			.insert("queue_len".to_owned(), json!(queue_len));
 		response.insert("lock".to_owned(), lock);
 		response.insert(
 			"journal".to_owned(),
@@ -629,15 +626,20 @@ impl RpcDispatcher {
 		);
 		response.insert(
 			"consumers".to_owned(),
-			json!(consumer_checkpoints.into_iter().map(|checkpoint| {
-				json!({
-					"consumer_id": checkpoint.consumer_id,
-					"cursor": checkpoint.cursor.to_string(),
-					"claim_id": checkpoint.claim_id,
-					"claim_expires_at": checkpoint.claim_expires_at,
-					"updated_at": checkpoint.updated_at,
-				})
-			}).collect::<Vec<_>>()),
+			json!(
+				consumer_checkpoints
+					.into_iter()
+					.map(|checkpoint| {
+						json!({
+							"consumer_id": checkpoint.consumer_id,
+							"cursor": checkpoint.cursor.to_string(),
+							"claim_id": checkpoint.claim_id,
+							"claim_expires_at": checkpoint.claim_expires_at,
+							"updated_at": checkpoint.updated_at,
+						})
+					})
+					.collect::<Vec<_>>()
+			),
 		);
 		response.insert(
 			"reconcile".to_owned(),
@@ -714,12 +716,10 @@ impl RpcDispatcher {
 	async fn consumer_commit(&self, params: Value) -> Result<Value, RpcError> {
 		let request = parse_consumer_commit_request(&params)?;
 		let journal = self.journal.clone();
-		let cursor = tokio::task::spawn_blocking(move || {
-			journal.commit_consumer(&request.consumer_id, &request.claim_id, request.cursor, &request.proofs)
-		})
-		.await
-		.map_err(|error| RpcError::internal(format!("consumer commit worker failed: {error}")))?
-		.map_err(journal_error)?;
+		let cursor = tokio::task::spawn_blocking(move || journal.commit_consumer(&request.consumer_id, &request.claim_id, request.cursor, &request.proofs))
+			.await
+			.map_err(|error| RpcError::internal(format!("consumer commit worker failed: {error}")))?
+			.map_err(journal_error)?;
 		Ok(json!({ "committed_cursor": cursor.to_string() }))
 	}
 
@@ -733,8 +733,7 @@ impl RpcDispatcher {
 		let request_json = serde_json::to_string(params).map_err(|_| RpcError::internal("could not encode idempotency request"))?;
 		match self.store.replay_idempotency(method, key, &request_json, unix_epoch_ms()) {
 			Ok(Some(response_json)) => {
-				return serde_json::from_str(&response_json)
-					.map_err(|_| RpcError::internal("stored idempotency response is invalid JSON"));
+				return serde_json::from_str(&response_json).map_err(|_| RpcError::internal("stored idempotency response is invalid JSON"));
 			}
 			Ok(None) => {}
 			Err(StoreError::IdempotencyConflict) => return Err(RpcError::app(1500, None)),
@@ -748,7 +747,6 @@ impl RpcDispatcher {
 			Err(error) => Err(store_error(error)),
 		}
 	}
-
 
 	async fn lock_renew(&self, params: Value) -> Result<Value, RpcError> {
 		let object = params_object(&params)?;
@@ -832,9 +830,7 @@ impl RpcDispatcher {
 		let locks = self.locks.clone();
 		let receipt_lease_id = lease_id.clone();
 		let receipt_corpus = corpus.clone();
-		let receipt_id = tokio::task::spawn_blocking(move || {
-			locks.record_quarantine_receipt(&receipt_lease_id, &receipt_corpus, evidence)
-		})
+		let receipt_id = tokio::task::spawn_blocking(move || locks.record_quarantine_receipt(&receipt_lease_id, &receipt_corpus, evidence))
 			.await
 			.map_err(|error| RpcError::internal(format!("record verification receipt worker failed: {error}")))?
 			.map_err(lock_error)?;
@@ -876,12 +872,11 @@ impl RpcDispatcher {
 			return Err(RpcError::invalid_params("registry.annotate requires purpose or brief"));
 		}
 		let store = self.store.clone();
-		let row = tokio::task::spawn_blocking(move || {
-			registry::annotate(&store, RegistryAnnotation { session_id, purpose, brief, observed_at: unix_epoch_ms() })
-		})
-		.await
-		.map_err(|error| RpcError::internal(format!("registry annotate worker failed: {error}")))?
-		.map_err(registry_error)?;
+		let row =
+			tokio::task::spawn_blocking(move || registry::annotate(&store, RegistryAnnotation { session_id, purpose, brief, observed_at: unix_epoch_ms() }))
+				.await
+				.map_err(|error| RpcError::internal(format!("registry annotate worker failed: {error}")))?
+				.map_err(registry_error)?;
 		Ok(json!({ "row": registry_row_json(row) }))
 	}
 
@@ -939,7 +934,11 @@ fn parse_main_events_read_request(params: &Value) -> Result<MainEventsReadReques
 	ensure_allowed_keys(object, &["consumer_id", "cursor", "limit", "wait_ms", "kinds"])?;
 	let consumer_id = optional_string(object, "consumer_id")?;
 	let cursor = optional_string(object, "cursor")?
-		.map(|value| value.parse::<Cursor>().map_err(|_| RpcError::invalid_params("cursor must be journal_generation:seq")))
+		.map(|value| {
+			value
+				.parse::<Cursor>()
+				.map_err(|_| RpcError::invalid_params("cursor must be journal_generation:seq"))
+		})
 		.transpose()?;
 	if consumer_id.is_some() && cursor.is_some() {
 		return Err(RpcError::invalid_params("consumer_id and cursor are mutually exclusive"));
@@ -973,7 +972,9 @@ fn parse_main_events_read_request(params: &Value) -> Result<MainEventsReadReques
 			kinds
 		}
 		Some(Value::Array(_)) => return Err(RpcError::invalid_params("kinds must not be empty")),
-		Some(_) => return Err(RpcError::invalid_params("kinds must be an array of event kinds")),
+		Some(_) => {
+			return Err(RpcError::invalid_params("kinds must be an array of event kinds"));
+		}
 	};
 	Ok(MainEventsReadRequest { consumer_id, cursor, limit, wait_ms, kinds })
 }
@@ -1094,7 +1095,6 @@ fn consumer_claim_json(claim: ConsumerClaim) -> Value {
 	})
 }
 
-
 fn registry_row_json(row: registry::RegistryRow) -> Value {
 	let locator = row
 		.locator
@@ -1133,38 +1133,26 @@ fn registry_row_json(row: registry::RegistryRow) -> Value {
 		"quarantined": row.quarantined,
 	})
 }
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct DurableMainStatus {
-	resumed: bool,
-	session_id: Option<String>,
-}
-
-fn durable_main_status(store: &Store) -> Result<DurableMainStatus, RpcError> {
-	let bootstrap_state = store.get_meta("bootstrap_state").map_err(store_error)?;
-	if bootstrap_state.as_deref() != Some("COMMITTED") {
-		return Ok(DurableMainStatus { resumed: false, session_id: None });
-	}
+fn durable_main_session_id(store: &Store) -> Result<String, RpcError> {
 	let raw_identity = store
 		.get_meta("main_identity")
 		.map_err(store_error)?
-		.ok_or_else(|| RpcError::internal("committed bootstrap is missing main_identity"))?;
-	let identity: Value = serde_json::from_str(&raw_identity)
-		.map_err(|_| RpcError::internal("main_identity gateway metadata is invalid"))?;
-	let session_id = identity
+		.ok_or_else(|| RpcError::internal("runtime main session is missing main_identity"))?;
+	let identity: Value = serde_json::from_str(&raw_identity).map_err(|_| RpcError::internal("main_identity gateway metadata is invalid"))?;
+	identity
 		.as_object()
 		.and_then(|object| object.get("sessionId"))
 		.and_then(Value::as_str)
 		.filter(|value| !value.is_empty())
-		.ok_or_else(|| RpcError::internal("committed main_identity has no sessionId"))?;
-	Ok(DurableMainStatus { resumed: true, session_id: Some(session_id.to_owned()) })
+		.map(str::to_owned)
+		.ok_or_else(|| RpcError::internal("runtime main session identity has no sessionId"))
 }
 
 fn metadata_json_optional_i64(raw: Option<&str>, key: &str) -> Result<Option<i64>, RpcError> {
 	let Some(raw) = raw else {
 		return Ok(None);
 	};
-	let value: Value = serde_json::from_str(raw)
-		.map_err(|_| RpcError::internal(format!("{key} gateway metadata is invalid")))?;
+	let value: Value = serde_json::from_str(raw).map_err(|_| RpcError::internal(format!("{key} gateway metadata is invalid")))?;
 	match value {
 		Value::Null => Ok(None),
 		Value::Number(number) if number.as_i64().is_some_and(|value| value >= 0) => Ok(number.as_i64()),
@@ -1232,10 +1220,9 @@ fn lock_error(error: LockError) -> RpcError {
 		return RpcError::app(i64::from(code), None);
 	}
 	match error {
-		LockError::InvalidTtl
-		| LockError::InvalidWait
-		| LockError::InvalidHolder(_)
-		| LockError::ConfirmationRequired => RpcError::invalid_params(error.to_string()),
+		LockError::InvalidTtl | LockError::InvalidWait | LockError::InvalidHolder(_) | LockError::ConfirmationRequired => {
+			RpcError::invalid_params(error.to_string())
+		}
 		LockError::Store(StoreError::IdempotencyConflict) => RpcError::app(1500, None),
 		error => RpcError::internal(format!("lock failure: {error}")),
 	}
@@ -1285,7 +1272,9 @@ fn optional_string(object: &Map<String, Value>, key: &str) -> Result<Option<Stri
 
 fn parse_u64(value: &Value, key: &str) -> Result<u64, RpcError> {
 	match value {
-		Value::Number(number) => number.as_u64().ok_or_else(|| RpcError::invalid_params(format!("{key} must be an unsigned integer"))),
+		Value::Number(number) => number
+			.as_u64()
+			.ok_or_else(|| RpcError::invalid_params(format!("{key} must be an unsigned integer"))),
 		Value::String(value) => value
 			.parse::<u64>()
 			.map_err(|_| RpcError::invalid_params(format!("{key} must be an unsigned integer"))),
@@ -1316,7 +1305,6 @@ fn optional_u64(object: &Map<String, Value>, key: &str) -> Result<Option<u64>, R
 		_ => Err(RpcError::invalid_params(format!("{key} must be an unsigned integer"))),
 	}
 }
-
 
 fn lock_release_json(result: ReleaseResult) -> Value {
 	json!({ "released": result.released, "held_ms": result.held_ms })
@@ -1356,20 +1344,19 @@ fn lock_status_json(status: LockStatus) -> Value {
 	})
 }
 
-
 #[cfg(test)]
 mod tests {
 
 	use serde_json::json;
 
-	use super::{app_error_name, GatewayState, RpcDispatcher, TsfnBridge, APP_ERROR_CODES, MAX_BRIDGE_IN_FLIGHT};
+	use super::{APP_ERROR_CODES, GatewayState, MAX_BRIDGE_IN_FLIGHT, RpcDispatcher, TsfnBridge, app_error_name};
 	use crate::{events::EventJournal, lock::LockManager, store::Store};
 
 	fn dispatcher() -> RpcDispatcher {
 		let store = Store::default();
 		let locks = LockManager::new(store.clone());
 		let journal = EventJournal::new(store.clone());
-		RpcDispatcher::new(store, locks, journal, TsfnBridge::unavailable())
+		RpcDispatcher::new(store, locks, journal, TsfnBridge::for_tests())
 	}
 
 	#[test]
@@ -1382,17 +1369,13 @@ mod tests {
 
 	#[tokio::test]
 	async fn failed_closed_serves_health_status_and_owner_profile_approval_only() {
-
 		let dispatcher = dispatcher();
 		dispatcher.set_gateway_state(GatewayState::FailedClosed, Some("profile_drift".to_owned()));
 		let cancellation = super::super::CancellationToken::new();
 		let health = dispatcher.dispatch("way.health".to_owned(), json!({}), cancellation.clone()).await.unwrap();
 		assert_eq!(health["status"], "unhealthy");
 		assert_eq!(health["reason"], "profile_drift");
-		let error = dispatcher
-			.dispatch("gitlock.status".to_owned(), json!({}), cancellation)
-			.await
-			.unwrap_err();
+		let error = dispatcher.dispatch("gitlock.status".to_owned(), json!({}), cancellation).await.unwrap_err();
 		assert_eq!(error.code, 1000);
 		let approval = dispatcher
 			.dispatch("profile.approve".to_owned(), json!({}), super::super::CancellationToken::new())
@@ -1402,7 +1385,7 @@ mod tests {
 	}
 
 	#[tokio::test]
-	async fn health_and_status_read_resumed_profile_and_consumer_facts_from_durable_state() {
+	async fn health_and_status_publish_main_resume_only_after_runtime_confirmation() {
 		let store = Store::default();
 		store.set_meta("bootstrap_state", "COMMITTED").unwrap();
 		store
@@ -1417,9 +1400,36 @@ mod tests {
 		let locks = LockManager::new(store.clone());
 		let journal = EventJournal::new(store.clone());
 		let claim = journal.claim_consumer("discord", Some(5_000)).unwrap();
-		let dispatcher = RpcDispatcher::new(store, locks, journal, TsfnBridge::unavailable());
-		dispatcher.set_gateway_state(GatewayState::Running, None);
+		let dispatcher = RpcDispatcher::new(store, locks, journal, TsfnBridge::for_tests());
 
+		// Verification starts from a false runtime publication even if a prior
+		// process committed the bootstrap record.
+		dispatcher.set_gateway_state(GatewayState::Verifying, None);
+		let verifying_health = dispatcher
+			.dispatch("way.health".to_owned(), json!({}), super::super::CancellationToken::new())
+			.await
+			.unwrap();
+		assert_eq!(verifying_health["main"]["resumed"], false);
+
+		// A committed prior bootstrap alone is never evidence that this daemon has
+		// opened the session. Failed-closed linger must not advertise it as resumed.
+		dispatcher.set_gateway_state(GatewayState::FailedClosed, Some("strict_resume_failed".to_owned()));
+		let lingering_health = dispatcher
+			.dispatch("way.health".to_owned(), json!({}), super::super::CancellationToken::new())
+			.await
+			.unwrap();
+		assert_eq!(lingering_health["main"]["resumed"], false);
+		assert!(lingering_health["main"]["session_id"].is_null());
+		let lingering_status = dispatcher
+			.dispatch("way.status".to_owned(), json!({}), super::super::CancellationToken::new())
+			.await
+			.unwrap();
+		assert_eq!(lingering_status["main"]["resumed"], false);
+
+		// This live publication occurs only after main.ts completes
+		// strictResumeMainSession and constructs its host.
+		dispatcher.set_gateway_state(GatewayState::Running, None);
+		dispatcher.set_main_session_status("idle".to_owned(), 0);
 		let health = dispatcher
 			.dispatch("way.health".to_owned(), json!({}), super::super::CancellationToken::new())
 			.await
@@ -1439,7 +1449,7 @@ mod tests {
 
 	#[test]
 	fn bridge_capacity_is_bounded_before_the_sixty_fifth_request() {
-		let bridge = TsfnBridge::unavailable();
+		let bridge = TsfnBridge::for_tests();
 		let mut reservations = Vec::new();
 		for _ in 0..MAX_BRIDGE_IN_FLIGHT {
 			reservations.push(bridge.reserve().unwrap());
@@ -1482,7 +1492,7 @@ mod tests {
 		let store = Store::default();
 		let locks = LockManager::new(store.clone());
 		let journal = EventJournal::new(store.clone());
-		let dispatcher = RpcDispatcher::new(store, locks, journal.clone(), TsfnBridge::unavailable());
+		let dispatcher = RpcDispatcher::new(store, locks, journal.clone(), TsfnBridge::for_tests());
 		journal.append("assistant_message", r#"{"text":"skip"}"#).unwrap();
 		journal.append("turn_start", r#"{"turn":"one"}"#).unwrap();
 
@@ -1499,11 +1509,7 @@ mod tests {
 		assert_eq!(filtered["next_cursor"], "1:2");
 
 		let gap = dispatcher
-			.dispatch(
-				"main.events.read".to_owned(),
-				json!({ "cursor": "0:0" }),
-				super::super::CancellationToken::new(),
-			)
+			.dispatch("main.events.read".to_owned(), json!({ "cursor": "0:0" }), super::super::CancellationToken::new())
 			.await
 			.unwrap();
 		assert_eq!(gap["gap"]["resync_cursor"], "1:0");
@@ -1514,7 +1520,7 @@ mod tests {
 		let store = Store::default();
 		let locks = LockManager::new(store.clone());
 		let journal = EventJournal::new(store.clone());
-		let dispatcher = RpcDispatcher::new(store, locks, journal.clone(), TsfnBridge::unavailable());
+		let dispatcher = RpcDispatcher::new(store, locks, journal.clone(), TsfnBridge::for_tests());
 		let event = journal.append("assistant_message", r#"{"text":"deliver"}"#).unwrap();
 		let claim = dispatcher
 			.dispatch(
@@ -1553,7 +1559,7 @@ mod tests {
 
 	#[tokio::test(start_paused = true)]
 	async fn bridge_deadline_times_out_and_ignores_a_late_completion() {
-		let bridge = TsfnBridge::unavailable();
+		let bridge = TsfnBridge::for_tests();
 		let (request_id, receiver, deadline) = bridge.reserve().unwrap();
 		let waiting_bridge = bridge.clone();
 		let waiting = tokio::spawn(async move {
@@ -1571,7 +1577,7 @@ mod tests {
 
 	#[test]
 	fn late_or_second_bridge_completion_is_a_counted_noop() {
-		let bridge = TsfnBridge::unavailable();
+		let bridge = TsfnBridge::for_tests();
 		let (request_id, receiver, _) = bridge.reserve().unwrap();
 		assert!(bridge.complete_json(request_id, "{\"ok\":true}"));
 		assert!(!bridge.complete_json(request_id, "{\"ok\":false}"));
@@ -1581,7 +1587,7 @@ mod tests {
 
 	#[test]
 	fn bridge_shutdown_marks_unresolved_calls_closed() {
-		let bridge = TsfnBridge::unavailable();
+		let bridge = TsfnBridge::for_tests();
 		let (_, mut receiver, _) = bridge.reserve().unwrap();
 		bridge.shutdown();
 		assert!(receiver.try_recv().is_ok());

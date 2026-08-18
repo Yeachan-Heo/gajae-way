@@ -34,6 +34,12 @@ server-owned journal/outbox. GJC sessions remain broker-owned and isolated;
 the gateway resumes only the configured main session by its full transcript
 fingerprint.
 
+Durable gateway state is SQLite WAL with `synchronous=FULL`: journal events,
+lease transitions, verification receipts, and consumer settlements acknowledge
+only after their committing transaction crosses the power-loss durability
+boundary. This does not replace backups of the corpus or strict-resume
+transcript.
+
 ## Install, configure, bootstrap, operate
 
 The release unit contains two compiled executables. Build them for the target
@@ -90,6 +96,16 @@ Then start the gateway and adapter:
 sudo systemctl enable --now gajae-way.service
 sudo systemctl enable --now gajae-way-discord.service
 ```
+
+Probe the running daemon, rather than only the executable version, with:
+
+```sh
+sudo -u gajae-way -H /usr/local/bin/way --health --state-dir /var/lib/gajae-way
+```
+
+The command queries the UDS and exits non-zero with `state: "unavailable"` if
+the daemon cannot be reached. The operations runbook covers `way.status` and
+full RPC monitoring.
 
 Use the runbooks below for the complete operational procedure and incident
 handling. Do not bootstrap a second state directory or start a second adapter

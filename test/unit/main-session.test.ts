@@ -160,14 +160,50 @@ test("open growth intent recovers append-only transcript growth by prefix attest
 	expect(state.read().mainIdentity?.size).toBeGreaterThan(initial.size);
 });
 
-test("tampering a growth prefix fails closed instead of accepting a transcript rewrite", async () => {
+test("queued follow-up interrupted mid-turn recovers through append-only prefix attestation", async () => {
 	const { profilePath, state, sdk } = await committedFixture();
 	const profile = loadWayProfile(profilePath);
-	const initial = state.read().mainIdentity;
-	if (!initial) throw new Error("missing initial identity");
-	state.writeGrowthIntent(initial, 777);
-	const transcript = fs.readFileSync(initial.canonicalPath, "utf8");
-	fs.writeFileSync(initial.canonicalPath, transcript.replace("way-bootstrap", "wayXbootstrap"));
+	const resumed = await strictResumeMainSession({ profile, state, sdk });
+	const host = createMainSessionHost({
+		session: resumed.session,
+		identity: resumed.identity,
+		state,
+		journal: { journalAppend: () => undefined },
+	});
+	await host.followUp("queued before interruption");
+	expect(state.read().growthIntent).toBeDefined();
+
+	sdk.emitEvent(resumed.identity.canonicalPath, { type: "turn_start" });
+	sdk.appendRaw(resumed.identity.canonicalPath, { type: "message", role: "user", content: "queued before interruption" });
+	// Simulate a process kill after transcript growth but before the terminal event.
+	await host.dispose();
+
+	const restarted = await strictResumeMainSession({ profile, state, sdk });
+	expect(restarted.recoveredGrowthIntent).toBe(true);
+	expect(state.read().mainIdentity?.size).toBeGreaterThan(resumed.identity.size);
+	expect(state.read()).toMatchObject({ bootstrapState: "COMMITTED", growthIntent: undefined, failedClosedReason: undefined });
+	await restarted.session.dispose();
+});
+
+test("tampering a queued follow-up growth prefix fails closed instead of accepting a transcript rewrite", async () => {
+	const { profilePath, state, sdk } = await committedFixture();
+	const profile = loadWayProfile(profilePath);
+	const resumed = await strictResumeMainSession({ profile, state, sdk });
+	const host = createMainSessionHost({
+		session: resumed.session,
+		identity: resumed.identity,
+		state,
+		journal: { journalAppend: () => undefined },
+	});
+	await host.followUp("queued before tampering");
+	sdk.emitEvent(resumed.identity.canonicalPath, { type: "turn_start" });
+	sdk.appendRaw(resumed.identity.canonicalPath, { type: "message", role: "user", content: "queued before tampering" });
+	const transcript = fs.readFileSync(resumed.identity.canonicalPath, "utf8");
+	fs.writeFileSync(resumed.identity.canonicalPath, transcript.replace("way-bootstrap", "wayXbootstrap"));
+	sdk.emitEvent(resumed.identity.canonicalPath, { type: "turn_end" });
+	expect(state.read()).toMatchObject({ bootstrapState: "FAILED_CLOSED", failedClosedReason: "growth_intent_mismatch" });
+	await host.dispose();
+
 	await expect(strictResumeMainSession({ profile, state, sdk })).rejects.toMatchObject({ reason: "growth_intent_mismatch" } satisfies Partial<ResumeError>);
 	expect(state.read()).toMatchObject({ bootstrapState: "FAILED_CLOSED", failedClosedReason: "growth_intent_mismatch" });
 });

@@ -3,33 +3,30 @@
 //! Rust owns SQLite state, fenced lock ownership, journal settlement,
 //! idempotency, and the authenticated P2 UDS RPC boundary.
 
-use std::{collections::HashSet, path::PathBuf, str::FromStr, sync::{Mutex, OnceLock}, time::SystemTime};
-
+use std::{
+	collections::HashSet,
+	path::PathBuf,
+	str::FromStr,
+	sync::{Mutex, OnceLock},
+	time::SystemTime,
+};
 
 use napi::threadsafe_function::ThreadsafeFunction;
 use napi_derive::napi;
 
-use crate::{
-	events::{
-		append_in_transaction, ConsumerClaim, Cursor, DeliveryProof, EventJournal, JournalError, JournalGap,
-		JournalRead, OutboxRow,
-	},
-	lock::{
-		AcquireRequest, AcquireResult, HolderKind, Lease, LeaseHolder, LockClass, LockError, LockManager, LockStatus,
-		ProcessObservation, ProcessProbe, QuarantineReceiptEvidence, QueueEntry, ReleaseResult, SystemProcessProbe,
-		HARD_HOLD_CAP_MS, IN_DAEMON_EXECUTOR_CONN_ID,
-	},
-	registry::{
-		BrokerSessionRow, BrokerSnapshot, GatewaySession, MetadataEnrichment, RegistryAnnotation, RegistryListFilter,
-		SurfaceRecord,
-	},
-	store::{meta_get_tx, meta_set_tx, unix_epoch_ms, Store, StoreError},
-};
 use crate::rpc::{
-	dispatch::{BridgeRequest, GatewayState, RpcBridgeStats, RpcDispatcher, TsfnBridge},
 	RpcServerHandle,
+	dispatch::{BridgeRequest, GatewayState, RpcBridgeStats, RpcDispatcher, TsfnBridge},
 };
-
+use crate::{
+	events::{ConsumerClaim, Cursor, DeliveryProof, EventJournal, JournalError, JournalGap, JournalRead, OutboxRow, append_in_transaction},
+	lock::{
+		AcquireRequest, AcquireResult, HARD_HOLD_CAP_MS, HolderKind, IN_DAEMON_EXECUTOR_CONN_ID, Lease, LeaseHolder, LockClass, LockError, LockManager,
+		LockStatus, ProcessObservation, ProcessProbe, QuarantineReceiptEvidence, QueueEntry, ReleaseResult, SystemProcessProbe,
+	},
+	registry::{BrokerSessionRow, BrokerSnapshot, GatewaySession, MetadataEnrichment, RegistryAnnotation, RegistryListFilter, SurfaceRecord},
+	store::{Store, StoreError, meta_get_tx, meta_set_tx, unix_epoch_ms},
+};
 
 pub mod events;
 pub mod lock;
@@ -47,7 +44,7 @@ pub struct HealthInfo {
 	pub boot_epoch: u32,
 }
 
-/// Returns the process-local boot identity used by the P0 health probe.
+/// Returns the process-local boot identity used by health probes.
 #[napi(js_name = "healthInfo")]
 pub fn health_info() -> HealthInfo {
 	let boot_epoch = *BOOT_EPOCH.get_or_init(|| {
@@ -56,7 +53,7 @@ pub fn health_info() -> HealthInfo {
 			.expect("system time must not precede the Unix epoch")
 			.as_secs()
 			.try_into()
-			.expect("P0 boot epoch fits in u32")
+			.expect("boot epoch fits in u32")
 	});
 
 	HealthInfo { version: env!("CARGO_PKG_VERSION").to_string(), boot_epoch }
@@ -345,7 +342,6 @@ pub struct GatewayMetaTransactionOutput {
 	pub cursor: Option<String>,
 }
 
-
 #[napi(object)]
 pub struct RegistryBrokerRowInput {
 	#[napi(js_name = "sessionId")]
@@ -572,7 +568,10 @@ impl WayCore {
 
 	/// Starts the hardened state-directory UDS server and registers the TSFN
 	/// bridge callback before accepting any client request.
-	#[napi(js_name = "startRpcServer", ts_args_type = "socketPath: string, bridgeCallback: (err: null | Error, request: BridgeRequest) => void")]
+	#[napi(
+		js_name = "startRpcServer",
+		ts_args_type = "socketPath: string, bridgeCallback: (err: null | Error, request: BridgeRequest) => void"
+	)]
 	pub fn start_rpc_server(&self, socket_path: String, bridge_callback: ThreadsafeFunction<BridgeRequest>) -> napi::Result<()> {
 		if socket_path.trim().is_empty() {
 			return Err(napi::Error::from_reason("socketPath must not be empty"));
@@ -636,7 +635,9 @@ impl WayCore {
 			"running" => GatewayState::Running,
 			"failed_closed" => GatewayState::FailedClosed,
 			"degraded" => GatewayState::Degraded,
-			_ => return Err(napi::Error::from_reason("state must be booting, verifying, running, failed_closed, or degraded")),
+			_ => {
+				return Err(napi::Error::from_reason("state must be booting, verifying, running, failed_closed, or degraded"));
+			}
 		};
 		let server = self.rpc_server.lock().map_err(|_| napi::Error::from_reason("RPC server lock was poisoned"))?;
 		let server = server.as_ref().ok_or_else(|| napi::Error::from_reason("RPC server is not running"))?;
@@ -644,7 +645,7 @@ impl WayCore {
 		Ok(())
 	}
 
-	/// Publishes the live main-session admission state used by `way.status`.
+	/// Publishes live main-session state after strict resume for `way.status`.
 	#[napi(js_name = "setMainSessionStatus")]
 	pub fn set_main_session_status(&self, turn_state: String, follow_up_queue_depth: u32) -> napi::Result<()> {
 		if !matches!(turn_state.as_str(), "idle" | "busy") {
@@ -713,8 +714,9 @@ impl WayCore {
 			meta_set_tx(&transaction, &put.key, &put.value).map_err(store_napi_error)?;
 		}
 		for key in &input.deletes {
-			transaction.execute("DELETE FROM gateway_meta WHERE k = ?1", [key]).map_err(|error| store_napi_error(error.into()))?;
-
+			transaction
+				.execute("DELETE FROM gateway_meta WHERE k = ?1", [key])
+				.map_err(|error| store_napi_error(error.into()))?;
 		}
 		let cursor = match (&input.event_kind, &input.event_payload_json) {
 			(Some(kind), Some(payload_json)) => Some(
@@ -779,19 +781,11 @@ impl WayCore {
 
 	#[napi(js_name = "lockForceRelease")]
 	pub fn lock_force_release(&self, lease_id: String, confirm: bool) -> napi::Result<LockReleaseOutput> {
-		self.locks
-			.force_release(&lease_id, confirm)
-			.map(lock_release_output)
-			.map_err(lock_napi_error)
+		self.locks.force_release(&lease_id, confirm).map(lock_release_output).map_err(lock_napi_error)
 	}
 
 	#[napi(js_name = "lockQuarantineOverride")]
-	pub fn lock_quarantine_override(
-		&self,
-		lease_id: String,
-		confirm: bool,
-		acknowledge_unverified: bool,
-	) -> napi::Result<LockStatusOutput> {
+	pub fn lock_quarantine_override(&self, lease_id: String, confirm: bool, acknowledge_unverified: bool) -> napi::Result<LockStatusOutput> {
 		self.locks
 			.quarantine_override(&lease_id, confirm, acknowledge_unverified)
 			.map(lock_status_output)
@@ -801,10 +795,7 @@ impl WayCore {
 	/// Persists a structurally complete operator verification receipt for the
 	/// exact quarantined corpus lease after runtime death proof.
 	#[napi(js_name = "lockRecordQuarantineReceipt")]
-	pub fn lock_record_quarantine_receipt(
-		&self,
-		input: LockQuarantineReceiptInput,
-	) -> napi::Result<LockQuarantineReceiptOutput> {
+	pub fn lock_record_quarantine_receipt(&self, input: LockQuarantineReceiptInput) -> napi::Result<LockQuarantineReceiptOutput> {
 		let evidence = QuarantineReceiptEvidence {
 			process_inspected: input.process_inspected,
 			git_status_checked: input.git_status_checked,
@@ -840,10 +831,7 @@ impl WayCore {
 		let cursor = cursor
 			.map(|value| Cursor::from_str(&value).map_err(|_| napi::Error::from_reason("invalid journal cursor")))
 			.transpose()?;
-		self.journal
-			.read(cursor, limit.unwrap_or(100))
-			.map(journal_read_output)
-			.map_err(journal_napi_error)
+		self.journal.read(cursor, limit.unwrap_or(100)).map(journal_read_output).map_err(journal_napi_error)
 	}
 
 	#[napi(js_name = "consumerClaim")]
@@ -891,10 +879,7 @@ impl WayCore {
 	}
 
 	#[napi(js_name = "registryApplyBrokerSnapshot")]
-	pub fn registry_apply_broker_snapshot(
-		&self,
-		input: RegistryApplyBrokerSnapshotInput,
-	) -> napi::Result<RegistrySnapshotApplyOutput> {
+	pub fn registry_apply_broker_snapshot(&self, input: RegistryApplyBrokerSnapshotInput) -> napi::Result<RegistrySnapshotApplyOutput> {
 		let snapshot = broker_snapshot_from_napi(input)?;
 		registry::apply_broker_snapshot(&self.store, snapshot)
 			.map(snapshot_apply_output)
@@ -905,18 +890,13 @@ impl WayCore {
 	pub fn registry_list(&self, input: Option<RegistryListInput>) -> napi::Result<RegistryListOutput> {
 		let filter = registry_list_filter_from_napi(input)?;
 		registry::list(&self.store, filter)
-			.map(|listed| RegistryListOutput {
-				rows: listed.rows.into_iter().map(registry_row_output).collect(),
-				total: listed.total as f64,
-			})
+			.map(|listed| RegistryListOutput { rows: listed.rows.into_iter().map(registry_row_output).collect(), total: listed.total as f64 })
 			.map_err(registry_napi_error)
 	}
 
 	#[napi(js_name = "registryGet")]
 	pub fn registry_get(&self, session_id: String) -> napi::Result<RegistryRowOutput> {
-		registry::get(&self.store, &session_id)
-			.map(registry_row_output)
-			.map_err(registry_napi_error)
+		registry::get(&self.store, &session_id).map(registry_row_output).map_err(registry_napi_error)
 	}
 
 	#[napi(js_name = "registryAnnotate")]
@@ -1011,9 +991,7 @@ impl WayCore {
 		let drift_count = napi_u64(input.drift_count)?;
 		self.store.set_meta("reconcile_last_ok_at", &last_ok_at.to_string()).map_err(store_napi_error)?;
 		self.store.set_meta("reconcile_cycle_ms", &cycle_ms.to_string()).map_err(store_napi_error)?;
-		self.store
-			.set_meta("reconcile_drift_count", &drift_count.to_string())
-			.map_err(store_napi_error)
+		self.store.set_meta("reconcile_drift_count", &drift_count.to_string()).map_err(store_napi_error)
 	}
 
 	#[napi(js_name = "idempotencyReplay")]
@@ -1027,13 +1005,7 @@ impl WayCore {
 	#[napi(js_name = "idempotencyStore")]
 	pub fn idempotency_store(&self, input: IdempotencyStoreInput) -> napi::Result<()> {
 		self.store
-			.store_idempotency_response(
-				&input.scope,
-				&input.key,
-				&input.request_json,
-				&input.response_json,
-				unix_epoch_ms(),
-			)
+			.store_idempotency_response(&input.scope, &input.key, &input.request_json, &input.response_json, unix_epoch_ms())
 			.map_err(store_napi_error)
 	}
 }
@@ -1070,15 +1042,18 @@ fn process_identity_output(pid: i32) -> napi::Result<ProcessIdentityOutput> {
 	}
 	let pgid_start_time = match probe.process_group(pgid) {
 		ProcessObservation::Present { start_time } => start_time.map(|value| value.to_string()),
-		ProcessObservation::Absent => return Err(napi::Error::from_reason("process group is absent")),
-		ProcessObservation::Unprovable => return Err(napi::Error::from_reason("process group incarnation is unprovable")),
+		ProcessObservation::Absent => {
+			return Err(napi::Error::from_reason("process group is absent"));
+		}
+		ProcessObservation::Unprovable => {
+			return Err(napi::Error::from_reason("process group incarnation is unprovable"));
+		}
 	};
 	Ok(ProcessIdentityOutput { pid, pid_start_time: pid_start_time.to_string(), pgid, pgid_start_time })
 }
 
 fn acquire_request_from_napi(input: LockAcquireInput) -> napi::Result<AcquireRequest> {
-	let holder_kind = HolderKind::from_str(&input.holder.holder_kind)
-		.map_err(|_| napi::Error::from_reason("holder.holderKind must be in_daemon"))?;
+	let holder_kind = HolderKind::from_str(&input.holder.holder_kind).map_err(|_| napi::Error::from_reason("holder.holderKind must be in_daemon"))?;
 	if holder_kind != HolderKind::InDaemon {
 		return Err(napi::Error::from_reason("v1 lockAcquire only accepts the in-daemon closure executor"));
 	}
@@ -1170,12 +1145,7 @@ fn journal_read_output(read: JournalRead) -> JournalReadOutput {
 		events: read
 			.events
 			.into_iter()
-			.map(|event| JournalEventOutput {
-				seq: event.seq.to_string(),
-				ts: event.ts as f64,
-				kind: event.kind,
-				payload_json: event.payload_json,
-			})
+			.map(|event| JournalEventOutput { seq: event.seq.to_string(), ts: event.ts as f64, kind: event.kind, payload_json: event.payload_json })
 			.collect(),
 		next_cursor: read.next_cursor.to_string(),
 		gap: read.gap.map(journal_gap_output),
@@ -1320,10 +1290,7 @@ fn store_napi_error(error: StoreError) -> napi::Error {
 }
 
 fn validate_meta_key(key: &str) -> napi::Result<()> {
-	if key.is_empty()
-		|| key.len() > 128
-		|| !key.bytes().all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.'))
-	{
+	if key.is_empty() || key.len() > 128 || !key.bytes().all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.')) {
 		return Err(napi::Error::from_reason("gateway metadata keys must be 1..=128 ASCII [A-Za-z0-9_.-] characters"));
 	}
 	Ok(())

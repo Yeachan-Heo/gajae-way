@@ -32,7 +32,7 @@ export declare class WayCore {
    * listener. Durable failure reasons are stored separately in gateway_meta.
    */
   setRpcHealth(state: string, reason?: string | undefined | null): void
-  /** Publishes the live main-session admission state used by `way.status`. */
+  /** Publishes live main-session state after strict resume for `way.status`. */
   setMainSessionStatus(turnState: string, followUpQueueDepth: number): void
   /** Marks journal-derived delivery as halted after a synchronous append failure. */
   setJournalDegraded(degraded: boolean): void
@@ -174,7 +174,7 @@ export interface GatewayMetaTransactionOutput {
   cursor?: string
 }
 
-/** Returns the process-local boot identity used by the P0 health probe. */
+/** Returns the process-local boot identity used by health probes. */
 export declare function healthInfo(): HealthInfo
 
 export interface HealthInfo {

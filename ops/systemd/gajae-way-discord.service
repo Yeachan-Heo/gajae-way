@@ -3,7 +3,10 @@
 [Unit]
 Description=Gajae Way Discord adapter
 
-# Stop with a failed daemon and restart with its supervised replacement.
+# The root-owned recovery marker below rejects every adapter activation while a
+# quarantine is being cleared, including the daemon's Wants= and restart paths.
+# The quarantine runbook removes it only after a bound receipt clears the fence.
+ConditionPathExists=!/etc/gajae-way/recovery/no-discord-ingress
 Requires=gajae-way.service
 BindsTo=gajae-way.service
 PartOf=gajae-way.service
