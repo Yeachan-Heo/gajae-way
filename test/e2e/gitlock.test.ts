@@ -116,11 +116,20 @@ function core(fixture: GitFixture, hardHoldCapMs?: number): WayCoreHandle {
 		: bindings.WayCore.openWithTestHardCap(fixture.state, hardHoldCapMs);
 }
 
-function request(fixture: GitFixture, sessionId: string, label: string, file: string, commitMessage: string): ClosureRequest {
+function request(
+	fixture: GitFixture,
+	sessionId: string,
+	label: string,
+	file: string,
+	commitMessage: string,
+): ClosureRequest {
 	return { sessionId, corpusPath: fixture.corpus, label, paths: [file], commitMessage };
 }
 
-async function execute(coreHandle: WayCoreHandle, closure: ClosureRequest): Promise<ReturnType<ClosureExecutor["execute"]>> {
+async function execute(
+	coreHandle: WayCoreHandle,
+	closure: ClosureRequest,
+): Promise<ReturnType<ClosureExecutor["execute"]>> {
 	const executor = createClosureExecutor({ core: coreHandle, heartbeatMs: 100 });
 	try {
 		return await executor.execute(closure);
@@ -129,7 +138,11 @@ async function execute(coreHandle: WayCoreHandle, closure: ClosureRequest): Prom
 	}
 }
 
-async function eventually<T>(read: () => T | undefined | Promise<T | undefined>, description: string, timeoutMs = 5_000): Promise<T> {
+async function eventually<T>(
+	read: () => T | undefined | Promise<T | undefined>,
+	description: string,
+	timeoutMs = 5_000,
+): Promise<T> {
 	const deadline = Date.now() + timeoutMs;
 	let lastError: unknown;
 	while (Date.now() < deadline) {
@@ -180,7 +193,7 @@ async function killHolder(holder: Holder): Promise<void> {
 		const code = (error as NodeJS.ErrnoException).code;
 		if (code !== "ESRCH" && code !== "EPERM") throw error;
 	}
-	await new Promise<void>(resolve => {
+	await new Promise<void>((resolve) => {
 		if (holder.child.exitCode !== null) return resolve();
 		holder.child.once("close", () => resolve());
 		setTimeout(resolve, 1_000);
@@ -201,6 +214,18 @@ function acquire(coreHandle: WayCoreHandle, holder: Holder, sessionId: string, l
 			...(holder.identity.pgidStartTime ? { pgidStartTime: holder.identity.pgidStartTime } : {}),
 			connId: "way.in_daemon_executor.v1",
 		},
+	});
+}
+
+function recordQuarantineReceipt(coreHandle: WayCoreHandle, leaseId: string) {
+	return coreHandle.lockRecordQuarantineReceipt({
+		leaseId,
+		corpus: "corpus",
+		processInspected: true,
+		gitStatusChecked: true,
+		gitLogChecked: true,
+		gitFsckChecked: true,
+		remoteVerified: true,
 	});
 }
 
@@ -237,7 +262,10 @@ test("L1a: daemon SIGKILL reaps the residual closure group and the same session 
 	await daemon.exited;
 
 	const restarted = core(value);
-	await eventually(() => (restarted.lockStatus().held ? undefined : true), "restart did not prove and release the residual lease");
+	await eventually(
+		() => (restarted.lockStatus().held ? undefined : true),
+		"restart did not prove and release the residual lease",
+	);
 	await eventually(() => {
 		try {
 			restarted.processIdentity(marker.childPid);
@@ -248,7 +276,7 @@ test("L1a: daemon SIGKILL reaps the residual closure group and the same session 
 	}, "restart did not reap the residual closure process group");
 	const recovered = await execute(restarted, closure);
 	expect(await recovered).toMatchObject({ committed: false });
-	expect((await remoteSubjects(value)).filter(subject => subject === "l1a committed once")).toHaveLength(1);
+	expect((await remoteSubjects(value)).filter((subject) => subject === "l1a committed once")).toHaveLength(1);
 });
 
 test("L2: expired and provably dead holder is journaled, reaped, and replaced", async () => {
@@ -269,7 +297,7 @@ test("L2: expired and provably dead holder is journaled, reaped, and replaced", 
 	await killHolder(successorHolder);
 }, 15_000);
 
-test("L3: expired live holder cannot transfer; force release fences through quarantine until receipt verification", async () => {
+test("L3: expired live holder cannot transfer; quarantine only reopens after death and a bound receipt", async () => {
 	const value = await initializedFixture("l3");
 	const coreHandle = core(value);
 	const liveHolder = await spawnHolder(coreHandle);
@@ -279,12 +307,17 @@ test("L3: expired live holder cannot transfer; force release fences through quar
 	expectNativeError(() => acquire(coreHandle, successor, "l3-successor", "l3-successor"), 1200);
 	expectNativeError(() => coreHandle.lockForceRelease(lease.leaseId, true), 1207);
 	coreHandle.lockQuarantineOverride(lease.leaseId, true, true);
+	expect(liveHolder.child.exitCode).toBeNull();
 	expectNativeError(() => acquire(coreHandle, successor, "l3-fenced", "l3-fenced"), 1208);
-	coreHandle.lockClearQuarantine("verified-l3-receipt", true);
+	expectNativeError(() => coreHandle.lockClearQuarantine("git-verify-00000000000000000000000000000000", true), 1207);
+	expectNativeError(() => recordQuarantineReceipt(coreHandle, lease.leaseId), 1207);
+	await killHolder(liveHolder);
+	const receipt = recordQuarantineReceipt(coreHandle, lease.leaseId);
+	expect(receipt.leaseId).toBe(lease.leaseId);
+	coreHandle.lockClearQuarantine(receipt.receiptId, true);
 	const admitted = acquire(coreHandle, successor, "l3-successor", "l3-successor");
 	expect(admitted.leaseId).not.toBe(lease.leaseId);
 	coreHandle.lockRelease(admitted.leaseId);
-	await killHolder(liveHolder);
 	await killHolder(successor);
 }, 15_000);
 
@@ -302,7 +335,9 @@ test("L4: PID and process-group incarnation mismatch is proven death without sig
 			pid: reused.identity.pid,
 			pidStartTime: `${BigInt(reused.identity.pidStartTime) + 1n}`,
 			pgid: reused.identity.pgid,
-			pgidStartTime: reused.identity.pgidStartTime ? `${BigInt(reused.identity.pgidStartTime) + 1n}` : `${BigInt(reused.identity.pidStartTime) + 1n}`,
+			pgidStartTime: reused.identity.pgidStartTime
+				? `${BigInt(reused.identity.pgidStartTime) + 1n}`
+				: `${BigInt(reused.identity.pidStartTime) + 1n}`,
 			connId: "way.in_daemon_executor.v1",
 		},
 	});
@@ -323,7 +358,10 @@ test("L5: shortened hard-cap revokes, kills, verifies, and releases the in-daemo
 	await Bun.sleep(350);
 	expect(coreHandle.lockFencingValid(lease.leaseId, lease.fencingToken)).toBe(false);
 	await eventually(() => (coreHandle.lockStatus().held ? undefined : true), "hard-cap lease did not release");
-	await eventually(() => (holder.child.exitCode === null && holder.child.signalCode === null ? undefined : true), "hard-cap did not kill the child group");
+	await eventually(
+		() => (holder.child.exitCode === null && holder.child.signalCode === null ? undefined : true),
+		"hard-cap did not kill the child group",
+	);
 	const successor = await spawnHolder(coreHandle);
 	const next = acquire(coreHandle, successor, "l5-successor", "l5-successor");
 	expect(BigInt(next.fencingToken)).toBeGreaterThan(BigInt(lease.fencingToken));
@@ -338,21 +376,29 @@ test("L6: pre-commit, post-commit, and mid-push kills rerun to exactly one remot
 	fs.writeFileSync(path.join(value.corpus, "pre.txt"), "pre\n");
 	const pre = createClosureExecutor({
 		core: coreHandle,
-		hooks: { after_stage: async context => await context.killChild() },
+		hooks: { after_stage: async (context) => await context.killChild() },
 	});
-	await expect(pre.execute(request(value, "l6-pre", "l6-pre", "pre.txt", "l6 pre"))).rejects.toBeInstanceOf(ClosureError);
+	await expect(pre.execute(request(value, "l6-pre", "l6-pre", "pre.txt", "l6 pre"))).rejects.toBeInstanceOf(
+		ClosureError,
+	);
 	await pre.shutdown();
 	expect((await gitResult(value.corpus, ["diff", "--cached", "--quiet"])).exitCode).toBe(0);
-	expect(await execute(coreHandle, request(value, "l6-pre", "l6-pre-retry", "pre.txt", "l6 pre"))).toMatchObject({ committed: true });
+	expect(await execute(coreHandle, request(value, "l6-pre", "l6-pre-retry", "pre.txt", "l6 pre"))).toMatchObject({
+		committed: true,
+	});
 
 	fs.writeFileSync(path.join(value.corpus, "post.txt"), "post\n");
 	const post = createClosureExecutor({
 		core: coreHandle,
-		hooks: { after_commit: async context => await context.killChild() },
+		hooks: { after_commit: async (context) => await context.killChild() },
 	});
-	await expect(post.execute(request(value, "l6-post", "l6-post", "post.txt", "l6 post"))).rejects.toBeInstanceOf(ClosureError);
+	await expect(post.execute(request(value, "l6-post", "l6-post", "post.txt", "l6 post"))).rejects.toBeInstanceOf(
+		ClosureError,
+	);
 	await post.shutdown();
-	expect(await execute(coreHandle, request(value, "l6-post", "l6-post-retry", "post.txt", "l6 post"))).toMatchObject({ committed: false });
+	expect(await execute(coreHandle, request(value, "l6-post", "l6-post-retry", "post.txt", "l6 post"))).toMatchObject({
+		committed: false,
+	});
 
 	const pushMarker = path.join(value.root, "mid-push");
 	const pushHook = path.join(value.corpus, ".git", "hooks", "pre-push");
@@ -362,7 +408,7 @@ test("L6: pre-commit, post-commit, and mid-push kills rerun to exactly one remot
 	const mid = createClosureExecutor({
 		core: coreHandle,
 		hooks: {
-			after_commit: context => {
+			after_commit: (context) => {
 				killScheduled = (async () => {
 					await eventually(() => (fs.existsSync(pushMarker) ? true : undefined), "push did not reach pre-push hook");
 					process.kill(-context.childPgid, "SIGKILL");
@@ -370,13 +416,18 @@ test("L6: pre-commit, post-commit, and mid-push kills rerun to exactly one remot
 			},
 		},
 	});
-	await expect(mid.execute(request(value, "l6-mid", "l6-mid", "mid.txt", "l6 mid"))).rejects.toBeInstanceOf(ClosureError);
+	await expect(mid.execute(request(value, "l6-mid", "l6-mid", "mid.txt", "l6 mid"))).rejects.toBeInstanceOf(
+		ClosureError,
+	);
 	await killScheduled;
 	await mid.shutdown();
 	fs.rmSync(pushHook, { force: true });
-	expect(await execute(coreHandle, request(value, "l6-mid", "l6-mid-retry", "mid.txt", "l6 mid"))).toMatchObject({ committed: false });
+	expect(await execute(coreHandle, request(value, "l6-mid", "l6-mid-retry", "mid.txt", "l6 mid"))).toMatchObject({
+		committed: false,
+	});
 	const subjects = await remoteSubjects(value);
-	for (const subject of ["l6 pre", "l6 post", "l6 mid"]) expect(subjects.filter(candidate => candidate === subject)).toHaveLength(1);
+	for (const subject of ["l6 pre", "l6 post", "l6 mid"])
+		expect(subjects.filter((candidate) => candidate === subject)).toHaveLength(1);
 }, 20_000);
 
 test("L7: revocation quarantines writes, kills the active group, and a receipt reopens closure writes", async () => {
@@ -404,7 +455,8 @@ test("L7: revocation quarantines writes, kills the active group, and a receipt r
 	}, "quarantine did not kill the active closure group");
 	const fencedHolder = await spawnHolder(coreHandle);
 	expectNativeError(() => acquire(coreHandle, fencedHolder, "l7-fenced", "l7-fenced"), 1208);
-	coreHandle.lockClearQuarantine("verified-l7-receipt", true);
+	const receipt = recordQuarantineReceipt(coreHandle, held.leaseId);
+	coreHandle.lockClearQuarantine(receipt.receiptId, true);
 	fs.rmSync(pushHook, { force: true });
 	fs.writeFileSync(path.join(value.corpus, "resumed.txt"), "resumed\n");
 	await execute(coreHandle, request(value, "l7-session", "l7-resumed", "resumed.txt", "l7 resumed"));
@@ -419,14 +471,14 @@ test("serialization: concurrent in-daemon closures serialize against one bare re
 	fs.writeFileSync(path.join(value.corpus, "second.txt"), "second\n");
 	const executor = createClosureExecutor({ core: coreHandle, heartbeatMs: 50 });
 	try {
-			const results = await Promise.all([
-				executor.execute(request(value, "serialize-first", "serialize-first", "first.txt", "serialize first")),
-				executor.execute(request(value, "serialize-second", "serialize-second", "second.txt", "serialize second")),
-			]);
-			expect(results).toHaveLength(2);
-		} finally {
-			await executor.shutdown();
-		}
+		const results = await Promise.all([
+			executor.execute(request(value, "serialize-first", "serialize-first", "first.txt", "serialize first")),
+			executor.execute(request(value, "serialize-second", "serialize-second", "second.txt", "serialize second")),
+		]);
+		expect(results).toHaveLength(2);
+	} finally {
+		await executor.shutdown();
+	}
 	const subjects = await remoteSubjects(value);
 	expect(subjects).toEqual(expect.arrayContaining(["serialize first", "serialize second"]));
 	const commits = (await remoteGit(value, ["log", "--format=%H", "--reverse", "main"])).trim().split("\n");
@@ -450,9 +502,11 @@ test("working-tree contract: unrelated edits survive while an unrelated dirty in
 	fs.writeFileSync(path.join(value.corpus, "blocked.txt"), "must not commit\n");
 	const executor = createClosureExecutor({ core: coreHandle });
 	try {
-			await expect(executor.execute(request(value, "dirty-index", "dirty-index", "blocked.txt", "blocked"))).rejects.toMatchObject({ code: 1206 });
+		await expect(
+			executor.execute(request(value, "dirty-index", "dirty-index", "blocked.txt", "blocked")),
+		).rejects.toMatchObject({ code: 1206 });
 	} finally {
-			await executor.shutdown();
+		await executor.shutdown();
 	}
 	expect((await git(value.corpus, ["diff", "--cached", "--name-only"])).trim()).toBe("indexed.txt");
 	await git(value.corpus, ["reset", "--", "indexed.txt"]);

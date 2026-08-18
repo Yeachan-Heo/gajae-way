@@ -8,7 +8,7 @@ import { DiscordOutbox } from "../../src/adapter/discord/outbox";
 import { DiscordRouteHandler } from "../../src/adapter/discord/route";
 import { createMainAdmissionHandler } from "../../src/main-session/admission";
 import { bootstrapMainSession } from "../../src/main-session/bootstrap";
-import { createMainSessionHost, type MainSessionHost } from "../../src/main-session/host";
+import { createMainSessionHost, type MainSessionHost, type MainSessionJournal } from "../../src/main-session/host";
 import { strictResumeMainSession } from "../../src/main-session/resume";
 import { GatewayStateStore } from "../../src/main-session/state";
 import { loadWayCore, type WayCoreHandle } from "../../src/native-loader";
@@ -75,8 +75,14 @@ async function journalGateway(name: string): Promise<JournalGateway> {
 
 interface OwnerHostGateway extends JournalGateway {
 	readonly host: MainSessionHost;
+	readonly profile: ReturnType<typeof loadWayProfile>;
+	readonly state: GatewayStateStore;
 	readonly sdk: FileSdkDouble;
 	readonly sessionFile: string;
+}
+
+interface OwnerHostGatewayOptions {
+	readonly journal?: MainSessionJournal;
 }
 
 function ownerProfile(corpus: string, workspace: string, adapter = ""): string {
@@ -94,7 +100,7 @@ kind = "dm"
 ${adapter}`;
 }
 
-async function ownerHostGateway(): Promise<OwnerHostGateway> {
+async function ownerHostGateway(options: OwnerHostGatewayOptions = {}): Promise<OwnerHostGateway> {
 	const root = temporaryDirectory("owner-host");
 	const corpus = path.join(root, "corpus");
 	const workspace = path.join(root, "workspace");
@@ -109,7 +115,7 @@ async function ownerHostGateway(): Promise<OwnerHostGateway> {
 	const sdk = new FileSdkDouble();
 	await bootstrapMainSession({ confirm: true, profile, state, sdk });
 	const resumed = await strictResumeMainSession({ profile, state, sdk });
-	const host = createMainSessionHost({ session: resumed.session, identity: resumed.identity, state, journal: core });
+	const host = createMainSessionHost({ session: resumed.session, identity: resumed.identity, state, journal: options.journal ?? core });
 	const submit = createMainAdmissionHandler(host, profile, core);
 	const handler: RpcBridgeHandler = async (method, params) => {
 		if (method === "main.submit") return await submit(params);
@@ -123,6 +129,8 @@ async function ownerHostGateway(): Promise<OwnerHostGateway> {
 		client,
 		stateDirectory,
 		host,
+		profile,
+		state,
 		sdk,
 		sessionFile: resumed.identity.canonicalPath,
 		async stop() {
@@ -181,12 +189,113 @@ test("Discord fixture inbound uses message-id idempotency, acknowledges before e
 	}
 });
 
+test("journal append failure rejects main.submit and leaves the main host visibly degraded", async () => {
+	let reportedReason: string | undefined;
+	const gateway = await ownerHostGateway({
+		journal: {
+			journalAppend: () => {
+				throw new Error("journal unavailable");
+			},
+			setJournalDegraded: () => undefined,
+			setRpcHealth: (_state, reason) => {
+				reportedReason = reason;
+			},
+		},
+	});
+	try {
+		const rejected = await gateway.client.request("main.submit", {
+			text: "must not be acknowledged without a journal row",
+			surface_id: "discord:owner-dm",
+			idempotency_key: "journal-failure",
+		});
+		expect(rejected.result).toBeUndefined();
+		expect(rejected.error).toMatchObject({ code: -32603, message: "bridge_exception" });
+		expect(gateway.host.degraded).toBe(true);
+		expect(reportedReason).toBe("journal_append_failed");
+		await expect(gateway.host.prompt("must fail after degradation")).rejects.toMatchObject({ reason: "journal_append_failed" });
+	} finally {
+		await gateway.stop();
+	}
+});
+
+test("streaming assistant deltas produce one finalized journal frame and one Discord send", async () => {
+	const gateway = await ownerHostGateway();
+	const fixture = new DiscordFixture();
+	await fixture.connect();
+	try {
+		const message = {
+			role: "assistant",
+			content: [{ type: "text", text: "final answer" }],
+			responseId: "stream-final-1",
+			timestamp: 1_234,
+		};
+		gateway.sdk.emitEvent(gateway.sessionFile, {
+			type: "message_update",
+			message: { ...message, content: [{ type: "text", text: "fi" }] },
+			assistantMessageEvent: { type: "text_delta", delta: "fi" },
+		});
+		gateway.sdk.emitEvent(gateway.sessionFile, {
+			type: "message_update",
+			message: { ...message, content: [{ type: "text", text: "final" }] },
+			assistantMessageEvent: { type: "text_delta", delta: "nal" },
+		});
+		gateway.sdk.emitEvent(gateway.sessionFile, {
+			type: "message_update",
+			message,
+			assistantMessageEvent: { type: "text_delta", delta: " answer" },
+		});
+		gateway.sdk.emitEvent(gateway.sessionFile, { type: "message_end", message });
+		gateway.sdk.emitEvent(gateway.sessionFile, { type: "message_end", message });
+
+		const assistantEvents = gateway.core
+			.journalRead(undefined, 10)
+			.events.filter(event => event.kind === "assistant_message");
+		expect(assistantEvents).toHaveLength(1);
+		expect(JSON.parse(assistantEvents[0]?.payloadJson ?? "{}"))
+			.toEqual({ finalized: true, text: "final answer", message_id: "stream-final-1", timestamp: 1_234 });
+		expect(await outbox(gateway.client, fixture).runOnce()).toBe("sent");
+		expect(fixture.sends).toEqual([
+			expect.objectContaining({ channelId: "123456789012345678", text: "final answer" }),
+		]);
+	} finally {
+		await fixture.disconnect();
+		await gateway.stop();
+	}
+});
+
+test("queued follow-up retains a growth intent until its finalized turn and then resumes cleanly", async () => {
+	const gateway = await ownerHostGateway();
+	try {
+		await gateway.host.followUp("deferred follow-up");
+		expect(gateway.state.read().growthIntent).toBeDefined();
+		const message = {
+			role: "assistant",
+			content: [{ type: "text", text: "follow-up completed" }],
+			responseId: "follow-up-final-1",
+			timestamp: 2_345,
+		};
+		gateway.sdk.appendRaw(gateway.sessionFile, { type: "message", role: "user", content: "deferred follow-up" });
+		gateway.sdk.appendRaw(gateway.sessionFile, { type: "message", role: "assistant", content: "follow-up completed" });
+		gateway.sdk.emitEvent(gateway.sessionFile, { type: "turn_start", turnIndex: 1 });
+		gateway.sdk.emitEvent(gateway.sessionFile, { type: "message_end", message });
+		gateway.sdk.emitEvent(gateway.sessionFile, { type: "turn_end", turnIndex: 1, message });
+		expect(gateway.state.read().growthIntent).toBeUndefined();
+
+		await gateway.host.dispose();
+		const resumed = await strictResumeMainSession({ profile: gateway.profile, state: gateway.state, sdk: gateway.sdk });
+		expect(resumed.recoveredGrowthIntent).toBe(false);
+		await resumed.session.dispose();
+	} finally {
+		await gateway.stop();
+	}
+});
+
 test("Discord egress sends before settlement and a normal restart does not repost", async () => {
 	const gateway = await journalGateway("settlement");
 	const fixture = new DiscordFixture();
 	await fixture.connect();
 	try {
-		const appended = gateway.core.journalAppend("assistant_message", JSON.stringify({ text: "settle this" }));
+		const appended = gateway.core.journalAppend("assistant_message", JSON.stringify({ finalized: true, text: "settle this" }));
 		let cursorAtSend: string | undefined;
 		const first = outbox(gateway.client, fixture, {
 			beforeSend: () => {
@@ -215,7 +324,7 @@ test("crash before Discord send leaves the server checkpoint and resumes from it
 	const fixture = new DiscordFixture();
 	await fixture.connect();
 	try {
-		const appended = gateway.core.journalAppend("assistant_message", JSON.stringify({ text: "retry before send" }));
+		const appended = gateway.core.journalAppend("assistant_message", JSON.stringify({ finalized: true, text: "retry before send" }));
 		const abort = new AbortController();
 		const interrupted = outbox(gateway.client, fixture, { beforeSend: () => abort.abort() });
 		await expect(interrupted.runOnce(abort.signal)).rejects.toMatchObject({ name: "AbortError" });
@@ -238,7 +347,7 @@ test("crash after Discord send but before commit is bounded by nonce dedupe on r
 	const fixture = new DiscordFixture();
 	await fixture.connect();
 	try {
-		const appended = gateway.core.journalAppend("assistant_message", JSON.stringify({ text: "retry after send" }));
+		const appended = gateway.core.journalAppend("assistant_message", JSON.stringify({ finalized: true, text: "retry after send" }));
 		const abort = new AbortController();
 		const interrupted = outbox(gateway.client, fixture, { afterSendBeforeCommit: () => abort.abort() });
 		await expect(interrupted.runOnce(abort.signal)).rejects.toMatchObject({ name: "AbortError" });

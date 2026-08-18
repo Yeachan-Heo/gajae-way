@@ -74,6 +74,11 @@ export declare class WayCore {
   lockStatus(): LockStatusOutput
   lockForceRelease(leaseId: string, confirm: boolean): LockReleaseOutput
   lockQuarantineOverride(leaseId: string, confirm: boolean, acknowledgeUnverified: boolean): LockStatusOutput
+  /**
+   * Persists a structurally complete operator verification receipt for the
+   * exact quarantined corpus lease after runtime death proof.
+   */
+  lockRecordQuarantineReceipt(input: LockQuarantineReceiptInput): LockQuarantineReceiptOutput
   lockClearQuarantine(verificationReceiptId: string, confirm: boolean): LockStatusOutput
   journalAppend(kind: string, payloadJson: string): JournalAppendOutput
   journalRead(cursor?: string | undefined | null, limit?: number | undefined | null): JournalReadOutput
@@ -258,6 +263,22 @@ export interface LockHolderInput {
   pgid: number
   pgidStartTime?: string
   connId?: string
+}
+
+export interface LockQuarantineReceiptInput {
+  leaseId: string
+  corpus: string
+  processInspected: boolean
+  gitStatusChecked: boolean
+  gitLogChecked: boolean
+  gitFsckChecked: boolean
+  remoteVerified: boolean
+}
+
+export interface LockQuarantineReceiptOutput {
+  receiptId: string
+  leaseId: string
+  corpus: string
 }
 
 export interface LockReleaseOutput {

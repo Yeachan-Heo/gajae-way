@@ -67,6 +67,14 @@ interface DeliveryProof {
 	readonly dedupe_key: string;
 }
 
+/** The only assistant-message payload accepted for Discord egress. */
+export interface FinalizedAssistantMessagePayload {
+	readonly finalized: true;
+	readonly text: string;
+	readonly message_id?: string;
+	readonly timestamp?: number;
+}
+
 /**
  * Pure RPC consumer loop. It holds no cursor, nonce map, or journal state
  * across process boundaries: the gateway checkpoint is the sole recovery
@@ -241,26 +249,10 @@ function eventToOutboxItem(event: EventFrame, route: DiscordRoute, cursor: strin
 	return { cursor, seq, text, dedupeKey, nonce: dedupeKey };
 }
 
-/** Extracts the finalized text shapes emitted by the v1 main-session host. */
+/** Rejects streaming/legacy shapes: egress must consume a terminal persisted message only. */
 export function assistantMessageText(payload: unknown): string {
-	if (typeof payload === "string") return payload;
-	if (!isRecord(payload)) return "";
-	for (const key of ["text", "content", "message"]) {
-		const value = payload[key];
-		if (typeof value === "string") return value;
-		if (isRecord(value)) {
-			for (const nestedKey of ["text", "content", "delta"]) {
-				if (typeof value[nestedKey] === "string") return value[nestedKey] as string;
-			}
-		}
-	}
-	const assistantEvent = payload.assistantMessageEvent;
-	if (isRecord(assistantEvent)) {
-		for (const key of ["text", "content", "delta"]) {
-			if (typeof assistantEvent[key] === "string") return assistantEvent[key] as string;
-		}
-	}
-	return "";
+	if (!isRecord(payload) || payload.finalized !== true || typeof payload.text !== "string") return "";
+	return payload.text;
 }
 
 function parseClaim(value: unknown): ConsumerClaim {

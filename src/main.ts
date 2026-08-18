@@ -8,7 +8,7 @@ import { BrokerCli } from "./broker/cli";
 import { BrokerReconciler } from "./broker/reconcile";
 import { createMainAdmissionHandler } from "./main-session/admission";
 import { createMainGateAnswerHandler } from "./main-session/gates";
-import { createClosureExecutor, runClosureWorker, type ClosureExecutor } from "./main-session/closure";
+import { ClosureError, createClosureExecutor, runClosureWorker, type ClosureExecutor } from "./main-session/closure";
 
 import { bootstrapMainSession, recoverBootstrap } from "./main-session/bootstrap";
 import { createMainSessionHost, type MainSessionHost } from "./main-session/host";
@@ -27,7 +27,7 @@ const usage = `Usage:
   way [serve] [--state-dir PATH] [--profile PATH] [--fail-closed-linger-ms MS] [--broker-cli PATH] [--reconcile-poll-ms MS]
   way bootstrap --confirm [--state-dir PATH] [--profile PATH]
   way profile approve --confirm [--state-dir PATH] [--profile PATH]
-  way --health | --version`;
+  way --health [--state-dir PATH] | --version`;
 
 class FailedClosedExit extends Error {
 	constructor() {
@@ -36,14 +36,19 @@ class FailedClosedExit extends Error {
 	}
 }
 
-export function healthPayload(): Record<string, unknown> {
-	const healthInfo = loadWayCore().healthInfo();
-	return {
-		status: "healthy",
-		state: "running",
-		version: healthInfo.version,
-		bootEpoch: healthInfo.bootEpoch,
-	};
+export async function healthPayload(stateDirectory = defaultStateDirectory()): Promise<Record<string, unknown>> {
+	try {
+		const result = await requestOwnerRpc(path.join(stateDirectory, "rpc.sock"), "way.health", {});
+		if (!isRecord(result)) throw new Error("daemon returned a non-object health response");
+		return result;
+	} catch {
+		return {
+			status: "unhealthy",
+			state: "unavailable",
+			reason: "daemon_unreachable",
+			version: loadWayCore().healthInfo().version,
+		};
+	}
 }
 
 export function defaultStateDirectory(): string {
@@ -51,7 +56,10 @@ export function defaultStateDirectory(): string {
 }
 
 /** Starts only the native RPC server; tests and later phases can host their own bridge. */
-export function startWayServer(stateDirectory = defaultStateDirectory(), bridgeHandler?: RpcBridgeHandler): WayCoreHandle {
+export function startWayServer(
+	stateDirectory = defaultStateDirectory(),
+	bridgeHandler?: RpcBridgeHandler,
+): WayCoreHandle {
 	const core = loadWayCore().WayCore.open(stateDirectory);
 	core.startRpcServer(path.join(stateDirectory, "rpc.sock"), createRpcBridge(core, bridgeHandler));
 	return core;
@@ -94,7 +102,8 @@ async function enterFailedClosed(
 	if (persist) {
 		try {
 			const durable = state.read();
-			if (durable.bootstrapState !== "FAILED_CLOSED" || durable.failedClosedReason !== reason) state.markFailedClosed(reason);
+			if (durable.bootstrapState !== "FAILED_CLOSED" || durable.failedClosedReason !== reason)
+				state.markFailedClosed(reason);
 		} catch {
 			// Health observability and exit 78 remain mandatory even when a secondary
 			// metadata write is unavailable.
@@ -104,7 +113,9 @@ async function enterFailedClosed(
 	try {
 		await writeHealthFile(config.stateDir, payload);
 	} catch (error) {
-		console.error(`Could not write failed-closed health file: ${error instanceof Error ? error.message : String(error)}`);
+		console.error(
+			`Could not write failed-closed health file: ${error instanceof Error ? error.message : String(error)}`,
+		);
 	}
 	try {
 		core.setRpcHealth("failed_closed", reason);
@@ -130,10 +141,9 @@ function profileBridgeHandler(
 	config: WayConfig,
 	profiles: ProfileRevisionTracker,
 ): RpcBridgeHandler {
-
 	return async (method, params) => {
 		if (method !== "profile.approve") throw new RpcBridgeException(-32601, `method not found: ${method}`);
-		if (!isRecord(params) || params.confirm !== true || Object.keys(params).some(key => key !== "confirm")) {
+		if (!isRecord(params) || params.confirm !== true || Object.keys(params).some((key) => key !== "confirm")) {
 			throw new RpcBridgeException(-32602, "profile.approve requires { confirm: true }.");
 		}
 		try {
@@ -155,6 +165,44 @@ function profileBridgeHandler(
 		}
 	};
 }
+function closureBridgeHandler(closures: ClosureExecutor, corpusPath: string, sessionId: string): RpcBridgeHandler {
+	return async (method, params) => {
+		if (method !== "main.corpus.close") throw new RpcBridgeException(-32601, `method not found: ${method}`);
+		if (!isRecord(params) || Object.keys(params).some((key) => key !== "paths" && key !== "commit_message")) {
+			throw new RpcBridgeException(-32602, "main.corpus.close requires { paths: string[], commit_message: string }.");
+		}
+		if (
+			!Array.isArray(params.paths) ||
+			params.paths.length === 0 ||
+			params.paths.some((value) => typeof value !== "string" || value.length === 0)
+		) {
+			throw new RpcBridgeException(-32602, "main.corpus.close paths must be a non-empty array of non-empty strings.");
+		}
+		if (typeof params.commit_message !== "string" || params.commit_message.trim().length === 0) {
+			throw new RpcBridgeException(-32602, "main.corpus.close commit_message must be a non-empty string.");
+		}
+		try {
+			const result = await closures.execute({
+				sessionId,
+				corpusPath,
+				label: `main-session-closure:${sessionId}`,
+				class: "batch",
+				paths: params.paths,
+				commitMessage: params.commit_message,
+			});
+			return {
+				lease_id: result.leaseId,
+				fencing_token: result.fencingToken,
+				committed: result.committed,
+			};
+		} catch (error) {
+			if (error instanceof ClosureError && error.code !== undefined) {
+				throw new RpcBridgeException(error.code, error.message);
+			}
+			throw new RpcBridgeException(-32603, error instanceof Error ? error.message : String(error));
+		}
+	};
+}
 
 async function waitForShutdown(
 	core: WayCoreHandle,
@@ -162,7 +210,7 @@ async function waitForShutdown(
 	closures: ClosureExecutor,
 	reconciler: BrokerReconciler,
 ): Promise<void> {
-	await new Promise<void>(resolve => {
+	await new Promise<void>((resolve) => {
 		const stop = () => resolve();
 		process.once("SIGINT", stop);
 		process.once("SIGTERM", stop);
@@ -198,11 +246,11 @@ async function serveWay(config: WayConfig): Promise<void> {
 	try {
 		const profile = profiles.load(config.profilePath);
 		core.registryConfigureSurfaces(
-			profile.knownSurfaces.map(surface => ({
+			profile.knownSurfaces.map((surface) => ({
 				surfaceId: surface.id,
 				platform: surface.platform,
 				kind: surface.kind,
-				isOwnerSurface: profile.ownerSurfaces.some(owner => owner.id === surface.id),
+				isOwnerSurface: profile.ownerSurfaces.some((owner) => owner.id === surface.id),
 			})),
 		);
 		const recovery = await recoverBootstrap({ profile, state, sdk });
@@ -216,7 +264,7 @@ async function serveWay(config: WayConfig): Promise<void> {
 			profile,
 			state,
 			sdk,
-			onInjectionLog: entry => console.warn(`way injection ${entry.kind}: ${entry.path}`),
+			onInjectionLog: (entry) => console.warn(`way injection ${entry.kind}: ${entry.path}`),
 		});
 		host = createMainSessionHost({
 			session: resumed.session,
@@ -225,7 +273,7 @@ async function serveWay(config: WayConfig): Promise<void> {
 			journal: core,
 		});
 		const admissionHandler = createMainAdmissionHandler(host, profile, core, {
-			isSurfaceQuarantined: surface => {
+			isSurfaceQuarantined: (surface) => {
 				try {
 					return core.surfaceResolve(surface.id).quarantined;
 				} catch {
@@ -235,9 +283,11 @@ async function serveWay(config: WayConfig): Promise<void> {
 			},
 		});
 		const gateAnswerHandler = createMainGateAnswerHandler(host, core);
+		const closureHandler = closureBridgeHandler(closures, profile.corpusPath, resumed.identity.sessionId);
 		mainSessionHandler = async (method, params) => {
 			if (method === "main.submit") return await admissionHandler(params);
 			if (method === "main.gate.answer") return await gateAnswerHandler(params);
+			if (method === "main.corpus.close") return await closureHandler(method, params);
 			throw new RpcBridgeException(-32601, `method not found: ${method}`);
 		};
 		core.setRpcHealth("running");
@@ -254,7 +304,6 @@ async function serveWay(config: WayConfig): Promise<void> {
 			// Readiness remains observable through RPC and health.json if notification delivery fails.
 		}
 		await waitForShutdown(core, host, closures, reconciler);
-
 	} catch (error) {
 		if (error instanceof FailedClosedExit) {
 			await closures.shutdown();
@@ -284,7 +333,9 @@ async function bootstrapCommand(config: WayConfig, arguments_: readonly string[]
 	const recovery = await recoverBootstrap({ profile, state, sdk });
 	if (recovery.kind === "failed_closed") throw new Error(`Bootstrap recovery is failed closed: ${recovery.reason}`);
 	if (recovery.kind === "committed") {
-		console.log(JSON.stringify({ state: "committed", session_id: recovery.identity.sessionId, recovered: recovery.nonce !== "" }));
+		console.log(
+			JSON.stringify({ state: "committed", session_id: recovery.identity.sessionId, recovered: recovery.nonce !== "" }),
+		);
 		return;
 	}
 	const committed = await bootstrapMainSession({ confirm: true, profile, state, sdk });
@@ -310,8 +361,8 @@ async function requestOwnerRpc(socketPath: string, method: string, params: unkno
 		};
 		const timeout = setTimeout(() => finish(() => reject(new Error("Timed out waiting for owner RPC."))), 5_000);
 		socket.setEncoding("utf8");
-		socket.once("error", error => finish(() => reject(error)));
-		socket.on("data", chunk => {
+		socket.once("error", (error) => finish(() => reject(error)));
+		socket.on("data", (chunk) => {
 			buffer += String(chunk);
 			const newline = buffer.indexOf("\n");
 			if (newline < 0) return;
@@ -330,7 +381,12 @@ async function requestOwnerRpc(socketPath: string, method: string, params: unkno
 }
 
 async function profileApproveCommand(config: WayConfig, arguments_: readonly string[]): Promise<void> {
-	if (arguments_.length !== 3 || arguments_[0] !== "profile" || arguments_[1] !== "approve" || arguments_[2] !== "--confirm") {
+	if (
+		arguments_.length !== 3 ||
+		arguments_[0] !== "profile" ||
+		arguments_[1] !== "approve" ||
+		arguments_[2] !== "--confirm"
+	) {
 		throw new Error(`profile approve requires --confirm.\n${usage}`);
 	}
 	const socketPath = path.join(config.stateDir, "rpc.sock");
@@ -343,9 +399,17 @@ async function profileApproveCommand(config: WayConfig, arguments_: readonly str
 	const state = new GatewayStateStore(core);
 	const profile = new ProfileRevisionTracker().load(config.profilePath);
 	const preview = previewProfileApproval(state, profile);
-	console.log(JSON.stringify({ previous_digest: preview.previousDigest, next_digest: preview.nextDigest, changes: preview.changes }, null, 2));
+	console.log(
+		JSON.stringify(
+			{ previous_digest: preview.previousDigest, next_digest: preview.nextDigest, changes: preview.changes },
+			null,
+			2,
+		),
+	);
 	const result = approveProfile(state, profile, true);
-	console.log(JSON.stringify({ receipt_id: result.receiptId, approved_at: result.approvedAt, cursor: result.cursor }, null, 2));
+	console.log(
+		JSON.stringify({ receipt_id: result.receiptId, approved_at: result.approvedAt, cursor: result.cursor }, null, 2),
+	);
 }
 
 /** CLI entrypoint. The daemon never calls bootstrap; it only strict-resumes a committed identity. */
@@ -358,11 +422,13 @@ export async function runWay(arguments_ = process.argv.slice(2)): Promise<void> 
 		console.log(`way ${loadWayCore().healthInfo().version}`);
 		return;
 	}
-	if (arguments_.includes("--health")) {
-		console.log(JSON.stringify(healthPayload()));
+	const parsed = parseWayConfig(arguments_);
+	if (parsed.remaining.length === 1 && parsed.remaining[0] === "--health") {
+		const payload = await healthPayload(parsed.config.stateDir);
+		console.log(JSON.stringify(payload));
+		if (payload.status !== "healthy") process.exitCode = 1;
 		return;
 	}
-	const parsed = parseWayConfig(arguments_);
 	if (parsed.remaining.length === 0 || (parsed.remaining.length === 1 && parsed.remaining[0] === "serve")) {
 		await serveWay(parsed.config);
 		return;

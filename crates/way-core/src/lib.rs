@@ -16,7 +16,8 @@ use crate::{
 	},
 	lock::{
 		AcquireRequest, AcquireResult, HolderKind, Lease, LeaseHolder, LockClass, LockError, LockManager, LockStatus,
-		ProcessObservation, ProcessProbe, QueueEntry, ReleaseResult, SystemProcessProbe, HARD_HOLD_CAP_MS,
+		ProcessObservation, ProcessProbe, QuarantineReceiptEvidence, QueueEntry, ReleaseResult, SystemProcessProbe,
+		HARD_HOLD_CAP_MS, IN_DAEMON_EXECUTOR_CONN_ID,
 	},
 	registry::{
 		BrokerSessionRow, BrokerSnapshot, GatewaySession, MetadataEnrichment, RegistryAnnotation, RegistryListFilter,
@@ -112,6 +113,32 @@ pub struct LockReleaseOutput {
 	pub released: bool,
 	#[napi(js_name = "heldMs")]
 	pub held_ms: f64,
+}
+
+#[napi(object)]
+pub struct LockQuarantineReceiptInput {
+	#[napi(js_name = "leaseId")]
+	pub lease_id: String,
+	pub corpus: String,
+	#[napi(js_name = "processInspected")]
+	pub process_inspected: bool,
+	#[napi(js_name = "gitStatusChecked")]
+	pub git_status_checked: bool,
+	#[napi(js_name = "gitLogChecked")]
+	pub git_log_checked: bool,
+	#[napi(js_name = "gitFsckChecked")]
+	pub git_fsck_checked: bool,
+	#[napi(js_name = "remoteVerified")]
+	pub remote_verified: bool,
+}
+
+#[napi(object)]
+pub struct LockQuarantineReceiptOutput {
+	#[napi(js_name = "receiptId")]
+	pub receipt_id: String,
+	#[napi(js_name = "leaseId")]
+	pub lease_id: String,
+	pub corpus: String,
 }
 
 #[napi(object)]
@@ -771,6 +798,27 @@ impl WayCore {
 			.map_err(lock_napi_error)
 	}
 
+	/// Persists a structurally complete operator verification receipt for the
+	/// exact quarantined corpus lease after runtime death proof.
+	#[napi(js_name = "lockRecordQuarantineReceipt")]
+	pub fn lock_record_quarantine_receipt(
+		&self,
+		input: LockQuarantineReceiptInput,
+	) -> napi::Result<LockQuarantineReceiptOutput> {
+		let evidence = QuarantineReceiptEvidence {
+			process_inspected: input.process_inspected,
+			git_status_checked: input.git_status_checked,
+			git_log_checked: input.git_log_checked,
+			git_fsck_checked: input.git_fsck_checked,
+			remote_verified: input.remote_verified,
+		};
+		let receipt_id = self
+			.locks
+			.record_quarantine_receipt(&input.lease_id, &input.corpus, evidence)
+			.map_err(lock_napi_error)?;
+		Ok(LockQuarantineReceiptOutput { receipt_id, lease_id: input.lease_id, corpus: input.corpus })
+	}
+
 	#[napi(js_name = "lockClearQuarantine")]
 	pub fn lock_clear_quarantine(&self, verification_receipt_id: String, confirm: bool) -> napi::Result<LockStatusOutput> {
 		self.locks
@@ -1030,7 +1078,13 @@ fn process_identity_output(pid: i32) -> napi::Result<ProcessIdentityOutput> {
 
 fn acquire_request_from_napi(input: LockAcquireInput) -> napi::Result<AcquireRequest> {
 	let holder_kind = HolderKind::from_str(&input.holder.holder_kind)
-		.map_err(|_| napi::Error::from_reason("holder.holderKind must be in_daemon or external"))?;
+		.map_err(|_| napi::Error::from_reason("holder.holderKind must be in_daemon"))?;
+	if holder_kind != HolderKind::InDaemon {
+		return Err(napi::Error::from_reason("v1 lockAcquire only accepts the in-daemon closure executor"));
+	}
+	if input.holder.conn_id.as_deref() != Some(IN_DAEMON_EXECUTOR_CONN_ID) {
+		return Err(napi::Error::from_reason("v1 lockAcquire requires the supervised in-daemon executor marker"));
+	}
 	let class = input
 		.class
 		.as_deref()

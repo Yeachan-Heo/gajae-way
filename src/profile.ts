@@ -75,8 +75,6 @@ export interface WayProfile {
 	readonly injection: ProfileInjection;
 	readonly restrictedFiles: Readonly<Record<SessionKind, readonly string[]>>;
 	readonly ownerSurfaces: readonly OwnerSurface[];
-	/** Compatibility convenience for the first owner surface; ownerSurfaces is authoritative. */
-	readonly ownerSurface: OwnerSurface;
 	/** All profile-known admissible surfaces. Owner surfaces are included. */
 	readonly knownSurfaces: readonly OwnerSurface[];
 	readonly operator: Readonly<Record<string, CanonicalValue>>;
@@ -366,7 +364,6 @@ export function loadWayProfile(profilePath: string, options: LoadProfileOptions 
 		injection: { files },
 		restrictedFiles,
 		ownerSurfaces: normalizedOwnerSurfaces,
-		ownerSurface: normalizedOwnerSurfaces[0] as OwnerSurface,
 		knownSurfaces: normalizedKnownSurfaces,
 		operator,
 		tunables,

@@ -17,10 +17,7 @@ use tokio::{sync::oneshot, time::Instant as TokioInstant};
 
 use crate::{
 	events::{ConsumerClaim, Cursor, DeliveryProof, EventJournal, JournalError, JournalGap, JournalRead},
-	lock::{
-		AcquireRequest, AcquireResult, HolderKind, Lease, LeaseHolder, LockClass, LockError, LockManager, LockStatus,
-		ReleaseResult, IN_DAEMON_EXECUTOR_CONN_ID,
-	},
+	lock::{Lease, LockError, LockManager, LockStatus, QuarantineReceiptEvidence, ReleaseResult},
 	registry::{self, RegistryAnnotation, RegistryError, RegistryListFilter},
 	store::{unix_epoch_ms, Store, StoreError},
 };
@@ -508,9 +505,9 @@ impl RpcDispatcher {
 		match method.as_str() {
 			"way.health" => self.health_response(params),
 			"way.status" => self.status_response(params).await,
-			"gitlock.acquire" => {
-				self.idempotent(&method, &params, || self.lock_acquire(params.clone(), cancellation.clone())).await
-			}
+			"gitlock.acquire" => Err(RpcError::invalid_params(
+				"gitlock.acquire is reserved for the daemon's supervised in-daemon closure executor in v1",
+			)),
 			"gitlock.renew" => self.idempotent(&method, &params, || self.lock_renew(params.clone())).await,
 			"gitlock.release" => self.idempotent(&method, &params, || self.lock_release(params.clone())).await,
 			"gitlock.status" => self.lock_status(params).await,
@@ -522,6 +519,9 @@ impl RpcDispatcher {
 			}
 			"gitlock.clear_quarantine" => {
 				self.idempotent(&method, &params, || self.lock_clear_quarantine(params.clone())).await
+			}
+			"gitlock.record_quarantine_receipt" => {
+				self.idempotent(&method, &params, || self.lock_record_quarantine_receipt(params.clone())).await
 			}
 			"registry.list" => self.registry_list(params).await,
 			"registry.get" => self.registry_get(params).await,
@@ -542,10 +542,11 @@ impl RpcDispatcher {
 		ensure_empty_params(&params)?;
 		let health = self.health.lock().map_err(|_| RpcError::internal("gateway health lock poisoned"))?.clone();
 		let generation = self.store.journal_generation().map_err(store_error)?;
+		let durable_main = durable_main_status(&self.store)?;
 		let mut response = json!({
 			"status": health.state.health_status(),
 			"state": health.state.as_str(),
-			"main": { "resumed": false },
+			"main": { "resumed": durable_main.resumed, "session_id": durable_main.session_id },
 			"boot_epoch": crate::health_info().boot_epoch,
 			"journal_generation": generation,
 			"version": env!("CARGO_PKG_VERSION"),
@@ -568,21 +569,36 @@ impl RpcDispatcher {
 		let locks = self.locks.clone();
 		let journal = self.journal.clone();
 		let store = self.store.clone();
-		let (lock_status, head_cursor, write_mode, profile_digest, profile_version, reconcile_last_ok_at, reconcile_cycle_ms, reconcile_drift_count) = tokio::task::spawn_blocking(move || {
+		let (
+			lock_status,
+			head_cursor,
+			consumer_checkpoints,
+			write_mode,
+			profile_digest,
+			profile_version,
+			profile_approved_at,
+			reconcile_last_ok_at,
+			reconcile_cycle_ms,
+			reconcile_drift_count,
+		) = tokio::task::spawn_blocking(move || {
 			let lock_status = locks.status();
 			let head_cursor = journal.head_cursor();
+			let consumer_checkpoints = journal.consumer_checkpoints();
 			let write_mode = store.get_meta("write_mode");
 			let profile_digest = store.get_meta("profile_digest");
 			let profile_version = store.get_meta("profile_digest_version");
+			let profile_approved_at = store.get_meta("profile_approved_at");
 			let reconcile_last_ok_at = store.get_meta("reconcile_last_ok_at");
 			let reconcile_cycle_ms = store.get_meta("reconcile_cycle_ms");
 			let reconcile_drift_count = store.get_meta("reconcile_drift_count");
 			(
 				lock_status,
 				head_cursor,
+				consumer_checkpoints,
 				write_mode,
 				profile_digest,
 				profile_version,
+				profile_approved_at,
 				reconcile_last_ok_at,
 				reconcile_cycle_ms,
 				reconcile_drift_count,
@@ -592,9 +608,11 @@ impl RpcDispatcher {
 		.map_err(|error| RpcError::internal(format!("status worker failed: {error}")))?;
 		let lock_status = lock_status.map_err(lock_error)?;
 		let head_cursor = head_cursor.map_err(|error| RpcError::internal(format!("journal status failed: {error}")))?;
+		let consumer_checkpoints = consumer_checkpoints.map_err(journal_error)?;
 		let write_mode = write_mode.map_err(store_error)?;
 		let profile_digest = profile_digest.map_err(store_error)?;
 		let profile_version = profile_version.map_err(store_error)?;
+		let profile_approved_at = profile_approved_at.map_err(store_error)?;
 		let reconcile_last_ok_at = reconcile_last_ok_at.map_err(store_error)?;
 		let reconcile_cycle_ms = reconcile_cycle_ms.map_err(store_error)?;
 		let reconcile_drift_count = reconcile_drift_count.map_err(store_error)?;
@@ -609,7 +627,18 @@ impl RpcDispatcher {
 			"journal".to_owned(),
 			json!({ "head_cursor": head_cursor.to_string(), "degraded": main_session.journal_degraded }),
 		);
-		response.insert("consumers".to_owned(), json!([]));
+		response.insert(
+			"consumers".to_owned(),
+			json!(consumer_checkpoints.into_iter().map(|checkpoint| {
+				json!({
+					"consumer_id": checkpoint.consumer_id,
+					"cursor": checkpoint.cursor.to_string(),
+					"claim_id": checkpoint.claim_id,
+					"claim_expires_at": checkpoint.claim_expires_at,
+					"updated_at": checkpoint.updated_at,
+				})
+			}).collect::<Vec<_>>()),
+		);
 		response.insert(
 			"reconcile".to_owned(),
 			json!({
@@ -624,7 +653,7 @@ impl RpcDispatcher {
 			json!({
 				"digest": profile_digest.filter(|digest| digest != "null"),
 				"digest_version": profile_version.and_then(|value| value.parse::<u64>().ok()).unwrap_or(0),
-				"approved_at": Value::Null,
+				"approved_at": metadata_json_optional_i64(profile_approved_at.as_deref(), "profile_approved_at")?,
 			}),
 		);
 		Ok(Value::Object(response))
@@ -720,16 +749,6 @@ impl RpcDispatcher {
 		}
 	}
 
-	async fn lock_acquire(&self, params: Value, cancellation: CancellationToken) -> Result<Value, RpcError> {
-		let request = parse_acquire_request(&params)?;
-		let locks = self.locks.clone();
-		let cancelled = cancellation.atomic_flag();
-		let result = tokio::task::spawn_blocking(move || locks.acquire_cancellable(request, &cancelled))
-			.await
-			.map_err(|error| RpcError::internal(format!("lock acquire worker failed: {error}")))?
-			.map_err(lock_error)?;
-		Ok(lock_acquire_json(result))
-	}
 
 	async fn lock_renew(&self, params: Value) -> Result<Value, RpcError> {
 		let object = params_object(&params)?;
@@ -803,6 +822,23 @@ impl RpcDispatcher {
 			.map_err(|error| RpcError::internal(format!("clear quarantine worker failed: {error}")))?
 			.map_err(lock_error)?;
 		Ok(lock_status_json(status))
+	}
+
+	async fn lock_record_quarantine_receipt(&self, params: Value) -> Result<Value, RpcError> {
+		let request = parse_quarantine_receipt_request(&params)?;
+		let lease_id = request.lease_id;
+		let corpus = request.corpus;
+		let evidence = request.evidence;
+		let locks = self.locks.clone();
+		let receipt_lease_id = lease_id.clone();
+		let receipt_corpus = corpus.clone();
+		let receipt_id = tokio::task::spawn_blocking(move || {
+			locks.record_quarantine_receipt(&receipt_lease_id, &receipt_corpus, evidence)
+		})
+			.await
+			.map_err(|error| RpcError::internal(format!("record verification receipt worker failed: {error}")))?
+			.map_err(lock_error)?;
+		Ok(json!({ "receipt_id": receipt_id, "lease_id": lease_id, "corpus": corpus }))
 	}
 
 	async fn registry_list(&self, params: Value) -> Result<Value, RpcError> {
@@ -892,6 +928,12 @@ struct ConsumerCommitRequest {
 	proofs: Vec<DeliveryProof>,
 }
 
+struct QuarantineReceiptRequest {
+	lease_id: String,
+	corpus: String,
+	evidence: QuarantineReceiptEvidence,
+}
+
 fn parse_main_events_read_request(params: &Value) -> Result<MainEventsReadRequest, RpcError> {
 	let object = params_object(params)?;
 	ensure_allowed_keys(object, &["consumer_id", "cursor", "limit", "wait_ms", "kinds"])?;
@@ -970,6 +1012,30 @@ fn parse_consumer_commit_request(params: &Value) -> Result<ConsumerCommitRequest
 		claim_id: required_string(object, "claim_id")?.to_owned(),
 		cursor,
 		proofs,
+	})
+}
+
+fn parse_quarantine_receipt_request(params: &Value) -> Result<QuarantineReceiptRequest, RpcError> {
+	let object = params_object(params)?;
+	ensure_allowed_keys(object, &["lease_id", "corpus", "checks", "idempotency_key"])?;
+	let checks = object
+		.get("checks")
+		.and_then(Value::as_object)
+		.ok_or_else(|| RpcError::invalid_params("checks must be an object"))?;
+	ensure_allowed_keys(
+		checks,
+		&["process_inspected", "git_status_checked", "git_log_checked", "git_fsck_checked", "remote_verified"],
+	)?;
+	Ok(QuarantineReceiptRequest {
+		lease_id: required_string(object, "lease_id")?.to_owned(),
+		corpus: required_string(object, "corpus")?.to_owned(),
+		evidence: QuarantineReceiptEvidence {
+			process_inspected: required_bool(checks, "process_inspected")?,
+			git_status_checked: required_bool(checks, "git_status_checked")?,
+			git_log_checked: required_bool(checks, "git_log_checked")?,
+			git_fsck_checked: required_bool(checks, "git_fsck_checked")?,
+			remote_verified: required_bool(checks, "remote_verified")?,
+		},
 	})
 }
 
@@ -1067,6 +1133,45 @@ fn registry_row_json(row: registry::RegistryRow) -> Value {
 		"quarantined": row.quarantined,
 	})
 }
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DurableMainStatus {
+	resumed: bool,
+	session_id: Option<String>,
+}
+
+fn durable_main_status(store: &Store) -> Result<DurableMainStatus, RpcError> {
+	let bootstrap_state = store.get_meta("bootstrap_state").map_err(store_error)?;
+	if bootstrap_state.as_deref() != Some("COMMITTED") {
+		return Ok(DurableMainStatus { resumed: false, session_id: None });
+	}
+	let raw_identity = store
+		.get_meta("main_identity")
+		.map_err(store_error)?
+		.ok_or_else(|| RpcError::internal("committed bootstrap is missing main_identity"))?;
+	let identity: Value = serde_json::from_str(&raw_identity)
+		.map_err(|_| RpcError::internal("main_identity gateway metadata is invalid"))?;
+	let session_id = identity
+		.as_object()
+		.and_then(|object| object.get("sessionId"))
+		.and_then(Value::as_str)
+		.filter(|value| !value.is_empty())
+		.ok_or_else(|| RpcError::internal("committed main_identity has no sessionId"))?;
+	Ok(DurableMainStatus { resumed: true, session_id: Some(session_id.to_owned()) })
+}
+
+fn metadata_json_optional_i64(raw: Option<&str>, key: &str) -> Result<Option<i64>, RpcError> {
+	let Some(raw) = raw else {
+		return Ok(None);
+	};
+	let value: Value = serde_json::from_str(raw)
+		.map_err(|_| RpcError::internal(format!("{key} gateway metadata is invalid")))?;
+	match value {
+		Value::Null => Ok(None),
+		Value::Number(number) if number.as_i64().is_some_and(|value| value >= 0) => Ok(number.as_i64()),
+		_ => Err(RpcError::internal(format!("{key} gateway metadata must be a non-negative integer or null"))),
+	}
+}
+
 fn journal_error(error: JournalError) -> RpcError {
 	match error {
 		JournalError::CursorBeforeRetention(gap) => RpcError::with_data(1600, "cursor_before_retention", journal_gap_json(gap)),
@@ -1212,64 +1317,6 @@ fn optional_u64(object: &Map<String, Value>, key: &str) -> Result<Option<u64>, R
 	}
 }
 
-fn required_i32(object: &Map<String, Value>, key: &str) -> Result<i32, RpcError> {
-	object
-		.get(key)
-		.and_then(Value::as_i64)
-		.and_then(|value| i32::try_from(value).ok())
-		.ok_or_else(|| RpcError::invalid_params(format!("{key} must be an i32")))
-}
-
-fn parse_acquire_request(params: &Value) -> Result<AcquireRequest, RpcError> {
-	let object = params_object(params)?;
-	ensure_allowed_keys(object, &["label", "class", "wait_ms", "ttl_ms", "holder", "idempotency_key"])?;
-	let label = required_string(object, "label")?.to_owned();
-	let class = match object.get("class") {
-		None => LockClass::Interactive,
-		Some(Value::String(value)) => value.parse().map_err(|_| RpcError::invalid_params("class must be interactive or batch"))?,
-		Some(_) => return Err(RpcError::invalid_params("class must be interactive or batch")),
-	};
-	let wait_ms = optional_u64(object, "wait_ms")?.unwrap_or(crate::lock::DEFAULT_WAIT_MS);
-	let ttl_ms = optional_u64(object, "ttl_ms")?.unwrap_or(crate::lock::DEFAULT_TTL_MS);
-	let holder_value = object.get("holder").ok_or_else(|| RpcError::invalid_params("holder is required"))?;
-	let holder_object = holder_value.as_object().ok_or_else(|| RpcError::invalid_params("holder must be an object"))?;
-	ensure_allowed_keys(
-		holder_object,
-		&["holder_kind", "session_id", "pid", "pid_start_time", "pgid", "pgid_start_time", "conn_id"],
-	)?;
-	let holder_kind = required_string(holder_object, "holder_kind")?
-		.parse::<HolderKind>()
-		.map_err(|_| RpcError::invalid_params("holder.holder_kind must be in_daemon"))?;
-	let pid_start_time = optional_u64(holder_object, "pid_start_time")?
-		.ok_or_else(|| RpcError::invalid_params("holder.pid_start_time is required"))?;
-	let holder = LeaseHolder {
-		holder_kind,
-		session_id: required_string(holder_object, "session_id")?.to_owned(),
-		label,
-		pid: required_i32(holder_object, "pid")?,
-		pid_start_time,
-		pgid: required_i32(holder_object, "pgid")?,
-		pgid_start_time: optional_u64(holder_object, "pgid_start_time")?,
-		conn_id: match holder_object.get("conn_id") {
-			None | Some(Value::Null) => None,
-			Some(Value::String(value)) if value == IN_DAEMON_EXECUTOR_CONN_ID => {
-				return Err(RpcError::invalid_params("holder.conn_id is reserved for the in-daemon executor"));
-			}
-			Some(Value::String(value)) if !value.is_empty() => Some(value.clone()),
-			Some(_) => return Err(RpcError::invalid_params("holder.conn_id must be a non-empty string when present")),
-		},
-	};
-	Ok(AcquireRequest { holder, class, wait_ms, ttl_ms })
-}
-
-fn lock_acquire_json(result: AcquireResult) -> Value {
-	json!({
-		"lease_id": result.lease_id,
-		"fencing_token": result.fencing_token.to_string(),
-		"expires_at": result.expires_at,
-		"queue_waited_ms": result.queue_waited_ms,
-	})
-}
 
 fn lock_release_json(result: ReleaseResult) -> Value {
 	json!({ "released": result.released, "held_ms": result.held_ms })
@@ -1309,10 +1356,6 @@ fn lock_status_json(status: LockStatus) -> Value {
 	})
 }
 
-/// Retained for callers that previously asserted the skeleton boundary.
-pub fn unavailable(method: &str) -> String {
-	format!("RPC method {method:?} is unavailable")
-}
 
 #[cfg(test)]
 mod tests {
@@ -1358,6 +1401,42 @@ mod tests {
 		assert_ne!(approval.code, 1000);
 	}
 
+	#[tokio::test]
+	async fn health_and_status_read_resumed_profile_and_consumer_facts_from_durable_state() {
+		let store = Store::default();
+		store.set_meta("bootstrap_state", "COMMITTED").unwrap();
+		store
+			.set_meta(
+				"main_identity",
+				r#"{"canonicalPath":"/tmp/main.jsonl","sessionId":"durable-main","device":"1","inode":"2","nlink":"1","size":"1","mtimeMs":"1","prefixSha256":"x"}"#,
+			)
+			.unwrap();
+		store.set_meta("profile_digest", "durable-profile-digest").unwrap();
+		store.set_meta("profile_digest_version", "1").unwrap();
+		store.set_meta("profile_approved_at", "1710000000000").unwrap();
+		let locks = LockManager::new(store.clone());
+		let journal = EventJournal::new(store.clone());
+		let claim = journal.claim_consumer("discord", Some(5_000)).unwrap();
+		let dispatcher = RpcDispatcher::new(store, locks, journal, TsfnBridge::unavailable());
+		dispatcher.set_gateway_state(GatewayState::Running, None);
+
+		let health = dispatcher
+			.dispatch("way.health".to_owned(), json!({}), super::super::CancellationToken::new())
+			.await
+			.unwrap();
+		assert_eq!(health["main"]["resumed"], true);
+		assert_eq!(health["main"]["session_id"], "durable-main");
+		let status = dispatcher
+			.dispatch("way.status".to_owned(), json!({}), super::super::CancellationToken::new())
+			.await
+			.unwrap();
+		assert_eq!(status["profile"]["approved_at"], 1_710_000_000_000_i64);
+		assert_eq!(status["profile"]["digest"], "durable-profile-digest");
+		assert_eq!(status["consumers"][0]["consumer_id"], "discord");
+		assert_eq!(status["consumers"][0]["claim_id"], claim.claim_id);
+		assert_eq!(status["consumers"][0]["cursor"], claim.cursor.to_string());
+	}
+
 	#[test]
 	fn bridge_capacity_is_bounded_before_the_sixty_fifth_request() {
 		let bridge = TsfnBridge::unavailable();
@@ -1371,35 +1450,31 @@ mod tests {
 	}
 
 	#[tokio::test]
-	async fn mutating_rpc_replays_idempotency_and_rejects_conflicting_reuse() {
+	async fn rpc_callers_cannot_mint_v1_in_daemon_or_external_lock_holders() {
 		let dispatcher = dispatcher();
-		let params = json!({
-			"label": "idempotent",
-			"holder": {
-				"holder_kind": "in_daemon",
-				"session_id": "idempotent-session",
-				"pid": std::process::id(),
-				"pid_start_time": "0",
-				"pgid": std::process::id(),
-			},
-			"idempotency_key": "same-key",
-		});
-		let first = dispatcher
-			.dispatch("gitlock.acquire".to_owned(), params.clone(), super::super::CancellationToken::new())
-			.await
-			.unwrap();
-		let replay = dispatcher
-			.dispatch("gitlock.acquire".to_owned(), params.clone(), super::super::CancellationToken::new())
-			.await
-			.unwrap();
-		assert_eq!(replay, first);
-		let mut conflicting = params;
-		conflicting.as_object_mut().unwrap().insert("label".to_owned(), json!("different"));
-		let error = dispatcher
-			.dispatch("gitlock.acquire".to_owned(), conflicting, super::super::CancellationToken::new())
-			.await
-			.unwrap_err();
-		assert_eq!(error.code, 1500);
+		for holder_kind in ["in_daemon", "external"] {
+			let error = dispatcher
+				.dispatch(
+					"gitlock.acquire".to_owned(),
+					json!({
+						"label": "forbidden",
+						"holder": {
+							"holder_kind": holder_kind,
+							"session_id": "caller-controlled",
+							"pid": std::process::id(),
+							"pid_start_time": "0",
+							"pgid": std::process::id(),
+							"conn_id": "way.in_daemon_executor.v1",
+						},
+						"idempotency_key": format!("forbidden-{holder_kind}"),
+					}),
+					super::super::CancellationToken::new(),
+				)
+				.await
+				.unwrap_err();
+			assert_eq!(error.code, -32602);
+			assert!(error.message.contains("supervised"));
+		}
 	}
 
 	#[tokio::test]

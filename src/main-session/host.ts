@@ -84,6 +84,50 @@ function gateFromEvent(event: unknown, fallbackSessionId: string): GateHandle | 
 	};
 }
 
+interface FinalAssistantMessage {
+	readonly key: string;
+	readonly payload: {
+		readonly finalized: true;
+		readonly text: string;
+		readonly message_id?: string;
+		readonly timestamp?: number;
+	};
+}
+
+interface FollowUpGrowth {
+	readonly intent: GrowthIntent;
+	started: boolean;
+}
+
+function finalizedAssistantMessage(event: Record<string, unknown>): FinalAssistantMessage | undefined {
+	if (event.type !== "message_end" || !isRecord(event.message) || event.message.role !== "assistant") return undefined;
+	const message = event.message;
+	const content = message.content;
+	const text =
+		typeof content === "string"
+			? content
+			: Array.isArray(content)
+				? content
+						.filter(isRecord)
+						.filter(block => block.type === "text" && typeof block.text === "string")
+						.map(block => block.text as string)
+						.join("")
+					: "";
+	if (!text.trim()) return undefined;
+	const messageId = eventString(message, "responseId", "id");
+	const timestamp = typeof message.timestamp === "number" && Number.isFinite(message.timestamp) ? message.timestamp : undefined;
+	const key = messageId ? `response:${messageId}` : `message:${timestamp ?? "unknown"}:${text}`;
+	return {
+		key,
+		payload: {
+			finalized: true,
+			text,
+			...(messageId ? { message_id: messageId } : {}),
+			...(timestamp === undefined ? {} : { timestamp }),
+		},
+	};
+}
+
 function journalPayload(event: unknown): string {
 	return JSON.stringify(event);
 }
@@ -111,7 +155,9 @@ class HostedMainSession implements MainSessionHost {
 	#turnState: "idle" | "busy" = "idle";
 	#followUpQueueDepth = 0;
 	#degraded = false;
-	#failedJournalEvents: Array<{ kind: string; payload: unknown }> = [];
+	#failure: MainSessionHostError | undefined;
+	#followUpGrowth: FollowUpGrowth | undefined;
+	readonly #finalizedAssistantMessageKeys = new Set<string>();
 	#disposed = false;
 
 	constructor(options: CreateMainSessionHostOptions) {
@@ -159,28 +205,78 @@ class HostedMainSession implements MainSessionHost {
 		this.#followUpQueueDepth = Math.min(depth, 0xffff_ffff);
 	}
 
-	private retainFailedJournalEvent(kind: string, payload: unknown): void {
-		this.#failedJournalEvents.push({ kind, payload });
-		if (this.#failedJournalEvents.length > 1_000) this.#failedJournalEvents.shift();
-	}
-
-	private appendJournalEvent(kind: string, payload: unknown): void {
-		if (this.#disposed) return;
-		if (this.#degraded) {
-			this.retainFailedJournalEvent(kind, payload);
-			return;
-		}
-		try {
-			this.#journal.journalAppend(kind, journalPayload(payload));
-		} catch {
-			this.retainFailedJournalEvent(kind, payload);
-			this.#degraded = true;
+	private enterFailure(reason: string, error: unknown, journalFailure = false): MainSessionHostError {
+		if (this.#failure) return this.#failure;
+		const detail = error instanceof Error ? error.message : String(error);
+		const failure = new MainSessionHostError(reason, `${reason}: ${detail}`);
+		this.#failure = failure;
+		this.#degraded = true;
+		if (journalFailure) {
 			try {
 				this.#journal.setJournalDegraded?.(true);
-				this.#journal.setRpcHealth?.("degraded", "journal_append_failed");
 			} catch {
-				// The durable journal failure is primary; RPC health is best effort.
+				// The journal failure remains authoritative if status publication is unavailable.
 			}
+		}
+		try {
+			this.#journal.setRpcHealth?.("degraded", reason);
+		} catch {
+			// The original durable failure remains authoritative when health reporting
+			// is also unavailable.
+		}
+		return failure;
+	}
+
+	private appendJournalEvent(kind: string, payload: unknown): boolean {
+		if (this.#disposed || this.#failure) return false;
+		try {
+			this.#journal.journalAppend(kind, journalPayload(payload));
+			return true;
+		} catch (error) {
+			this.enterFailure("journal_append_failed", error, true);
+			return false;
+		}
+	}
+
+	private appendFinalAssistantMessage(event: Record<string, unknown>): void {
+		const finalized = finalizedAssistantMessage(event);
+		if (!finalized || this.#finalizedAssistantMessageKeys.has(finalized.key)) return;
+		if (!this.appendJournalEvent("assistant_message", finalized.payload)) return;
+		this.#finalizedAssistantMessageKeys.add(finalized.key);
+		if (this.#finalizedAssistantMessageKeys.size > 1_000) {
+			const oldest = this.#finalizedAssistantMessageKeys.values().next().value;
+			if (oldest) this.#finalizedAssistantMessageKeys.delete(oldest);
+		}
+	}
+
+	private beginFollowUpGrowth(): FollowUpGrowth {
+		if (this.#followUpGrowth) return this.#followUpGrowth;
+		const growth = { intent: this.beforeMutation(), started: false };
+		this.#followUpGrowth = growth;
+		return growth;
+	}
+
+	private abandonFollowUpGrowth(growth: FollowUpGrowth): void {
+		if (this.#failure || this.#followUpGrowth !== growth || growth.started) return;
+		this.#followUpGrowth = undefined;
+		try {
+			this.afterMutation(growth.intent);
+		} catch (error) {
+			this.enterFailure("growth_refresh_failed", error);
+		}
+	}
+
+	private completeFollowUpGrowth(): void {
+		const growth = this.#followUpGrowth;
+		if (!growth || !growth.started || this.#failure) return;
+		growth.started = false;
+		this.refreshFollowUpQueueDepth();
+		if (this.#followUpQueueDepth > 0) return;
+		this.#followUpGrowth = undefined;
+		try {
+			this.afterMutation(growth.intent);
+		} catch (error) {
+			this.enterFailure("growth_refresh_failed", error);
 		}
 	}
 
@@ -208,14 +304,16 @@ class HostedMainSession implements MainSessionHost {
 			this.#turnState = "busy";
 			this.refreshFollowUpQueueDepth();
 			this.publishStatus();
-			this.appendJournalEvent("turn_start", event);
+			if (this.appendJournalEvent("turn_start", event) && this.#followUpGrowth && !this.#followUpGrowth.started) {
+				this.#followUpGrowth.started = true;
+			}
 			return;
 		}
 		if (type === "turn_end" || type === "agent_end") {
 			this.#turnState = "idle";
 			this.refreshFollowUpQueueDepth();
 			this.publishStatus();
-			this.appendJournalEvent("turn_end", event);
+			if (this.appendJournalEvent("turn_end", event)) this.completeFollowUpGrowth();
 			return;
 		}
 		if (type === "gate_expired") {
@@ -235,17 +333,12 @@ class HostedMainSession implements MainSessionHost {
 			if (gate && gate.expectedSessionId === this.sessionId) this.observeGateResolved(gate.gateId, event);
 			return;
 		}
-		if (
-			type === "assistant_message" ||
-			(type === "message_update" && isRecord(record?.assistantMessageEvent)) ||
-			(type === "message_end" && record?.role === "assistant")
-		) {
-			this.appendJournalEvent("assistant_message", event);
-		}
+		if (type === "message_end" && record) this.appendFinalAssistantMessage(record);
 	}
 
 	private assertUsable(): void {
 		if (this.#disposed) throw new MainSessionHostError("host_disposed");
+		if (this.#failure) throw this.#failure;
 		if (this.#degraded) throw new MainSessionHostError("journal_degraded");
 	}
 
@@ -291,11 +384,21 @@ class HostedMainSession implements MainSessionHost {
 
 	private async mutate(action: () => Promise<void>): Promise<void> {
 		const intent = this.beforeMutation();
+		let mutationError: unknown;
 		try {
 			await action();
-		} finally {
-			this.afterMutation(intent);
+			this.assertUsable();
+		} catch (error) {
+			mutationError = error;
 		}
+		let refreshError: unknown;
+		try {
+			this.afterMutation(intent);
+		} catch (error) {
+			refreshError = error;
+		}
+		if (mutationError) throw mutationError;
+		if (refreshError) throw refreshError;
 	}
 
 	async prompt(text: string): Promise<void> {
@@ -311,7 +414,15 @@ class HostedMainSession implements MainSessionHost {
 	async followUp(text: string): Promise<void> {
 		if (!text.trim()) throw new MainSessionHostError("follow_up_empty", "A main-session follow-up must not be empty.");
 		this.assertUsable();
-		await this.#session.followUp(text);
+		const existingGrowth = this.#followUpGrowth;
+		const growth = existingGrowth ?? this.beginFollowUpGrowth();
+		try {
+			await this.#session.followUp(text);
+			this.assertUsable();
+		} catch (error) {
+			if (!existingGrowth) this.abandonFollowUpGrowth(growth);
+			throw error;
+		}
 		this.refreshFollowUpQueueDepth();
 		this.publishStatus();
 	}
@@ -321,6 +432,7 @@ class HostedMainSession implements MainSessionHost {
 		const resolution = await this.#session.answerGate(gateId, answer, idempotencyKey);
 		if (resolution === "resolved") this.observeGateResolved(gateId, { answer });
 		if (resolution === "expired") this.gates.observeExpired(gateId);
+		this.assertUsable();
 		return resolution;
 	}
 

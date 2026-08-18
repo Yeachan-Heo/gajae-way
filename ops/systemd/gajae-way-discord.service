@@ -3,8 +3,10 @@
 [Unit]
 Description=Gajae Way Discord adapter
 
+# Stop with a failed daemon and restart with its supervised replacement.
 Requires=gajae-way.service
 BindsTo=gajae-way.service
+PartOf=gajae-way.service
 After=network-online.target gajae-way.service
 Wants=network-online.target
 StartLimitIntervalSec=60s

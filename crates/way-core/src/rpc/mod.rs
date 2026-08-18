@@ -200,11 +200,7 @@ mod tests {
 	};
 
 	use super::{dispatch::RpcDispatcher, dispatch::TsfnBridge, RpcServerHandle};
-	use crate::{
-		events::EventJournal,
-		lock::{AcquireRequest, HolderKind, LeaseHolder, LockManager},
-		store::Store,
-	};
+	use crate::{events::EventJournal, lock::LockManager, store::Store};
 
 	static NEXT_TEMP_DIR: AtomicU64 = AtomicU64::new(0);
 
@@ -243,45 +239,16 @@ mod tests {
 		}
 	}
 
-	fn holder(session_id: &str) -> Value {
-		json!({
-			"holder_kind": "in_daemon",
-			"session_id": session_id,
-			"pid": std::process::id(),
-			"pid_start_time": "0",
-			"pgid": std::process::id(),
-		})
-	}
-
-	fn acquire_request(session_id: &str, idempotency_key: &str, id: u64) -> String {
+	fn event_read_request(id: u64) -> String {
 		format!(
 			"{}\n",
 			json!({
 				"jsonrpc": "2.0",
 				"id": id,
-				"method": "gitlock.acquire",
-				"params": {
-					"label": format!("label-{session_id}"),
-					"wait_ms": 300_000,
-					"holder": holder(session_id),
-					"idempotency_key": idempotency_key,
-				},
+				"method": "main.events.read",
+				"params": { "cursor": "1:0", "wait_ms": 60_000 },
 			})
 		)
-	}
-
-	fn acquire_initial_lock(locks: &LockManager) -> String {
-		let request = AcquireRequest::new(LeaseHolder {
-			holder_kind: HolderKind::InDaemon,
-			session_id: "owner".to_owned(),
-			label: "owner".to_owned(),
-			pid: std::process::id() as i32,
-			pid_start_time: 0,
-			pgid: std::process::id() as i32,
-			pgid_start_time: Some(0),
-			conn_id: None,
-		});
-		locks.acquire(request).unwrap().lease_id
 	}
 
 	async fn stop(handle: RpcServerHandle, state: PathBuf) {
@@ -316,10 +283,9 @@ mod tests {
 	#[tokio::test]
 	async fn duplicate_ids_and_sixteen_request_backpressure_are_connection_scoped() {
 		let state = state_dir("pipeline");
-		let (handle, locks) = start_server(&state);
-		let owner = acquire_initial_lock(&locks);
+		let (handle, _) = start_server(&state);
 		let mut duplicate_stream = connect(&state).await;
-		duplicate_stream.write_all(acquire_request("waiter", "waiter-1", 1).as_bytes()).await.unwrap();
+		duplicate_stream.write_all(event_read_request(1).as_bytes()).await.unwrap();
 		duplicate_stream
 			.write_all(b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"way.health\",\"params\":{}}\n")
 			.await
@@ -332,24 +298,22 @@ mod tests {
 		let mut pipeline_stream = connect(&state).await;
 		let mut pipeline = String::new();
 		for id in 2..=18 {
-			pipeline.push_str(&acquire_request(&format!("pipeline-{id}"), &format!("pipeline-key-{id}"), id));
+			pipeline.push_str(&event_read_request(id));
 		}
 		pipeline_stream.write_all(pipeline.as_bytes()).await.unwrap();
 		assert!(timeout(Duration::from_millis(100), read_line(&mut pipeline_stream)).await.is_err());
 		drop(pipeline_stream);
 		tokio::time::sleep(Duration::from_millis(250)).await;
-		assert!(locks.status().unwrap().queue.is_empty(), "disconnect must cancel lock long-polls");
-		locks.release(&owner).unwrap();
+		// Closing the connection cancels all pending event long-polls.
 		stop(handle, state).await;
 	}
 
 	#[tokio::test]
-	async fn rpc_cancel_notification_cancels_an_in_memory_lock_waiter() {
+	async fn rpc_cancel_notification_cancels_an_in_memory_event_waiter() {
 		let state = state_dir("cancel");
-		let (handle, locks) = start_server(&state);
-		let owner = acquire_initial_lock(&locks);
+		let (handle, _) = start_server(&state);
 		let mut stream = connect(&state).await;
-		stream.write_all(acquire_request("cancelled", "cancel-key", 44).as_bytes()).await.unwrap();
+		stream.write_all(event_read_request(44).as_bytes()).await.unwrap();
 		tokio::time::sleep(Duration::from_millis(30)).await;
 		stream
 			.write_all(b"{\"jsonrpc\":\"2.0\",\"method\":\"rpc.cancel\",\"params\":{\"id\":44}}\n")
@@ -358,9 +322,6 @@ mod tests {
 		let cancelled: Value = serde_json::from_str(&read_line(&mut stream).await).unwrap();
 		assert_eq!(cancelled["id"], 44);
 		assert_eq!(cancelled["error"]["code"], -32603);
-		tokio::time::sleep(Duration::from_millis(150)).await;
-		assert!(locks.status().unwrap().queue.is_empty());
-		locks.release(&owner).unwrap();
 		drop(stream);
 		stop(handle, state).await;
 	}

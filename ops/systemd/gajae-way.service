@@ -3,8 +3,9 @@
 # below with the profile's exact writable paths before enabling the service.
 [Unit]
 Description=Gajae Way operator-agent runtime
-Wants=network-online.target
+Wants=network-online.target gajae-way-discord.service
 After=network-online.target
+Before=gajae-way-discord.service
 StartLimitIntervalSec=60s
 StartLimitBurst=3
 

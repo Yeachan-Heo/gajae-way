@@ -21,9 +21,12 @@ interface RunningDaemon {
 	readonly client: RpcClient;
 }
 
-interface RunningService {
-	readonly daemon: RunningDaemon;
-	readonly adapter: RunningDiscordAdapter;
+interface SupervisedServiceOptions {
+	readonly executable: string;
+	readonly stateDirectory: string;
+	readonly profilePath: string;
+	readonly environment: NodeJS.ProcessEnv;
+	readonly fixture: DiscordFixture;
 }
 
 afterEach(async () => {
@@ -167,6 +170,98 @@ async function stopDaemon(daemon: RunningDaemon | undefined): Promise<void> {
 	await awaitChildExit(daemon.child);
 }
 
+/**
+ * Portable model of the two systemd units. The test invokes only a daemon
+ * crash; BindsTo stops the adapter and PartOf restarts it with the daemon.
+ */
+class SupervisedService {
+	readonly #options: SupervisedServiceOptions;
+	#daemon: RunningDaemon | undefined;
+	#adapter: RunningDiscordAdapter | undefined;
+	#generation = 0;
+	#stopping = false;
+	#failure: unknown;
+
+	constructor(options: SupervisedServiceOptions) {
+		this.#options = options;
+	}
+
+	get daemon(): RunningDaemon {
+		if (!this.#daemon) throw new Error("supervised daemon is not running");
+		return this.#daemon;
+	}
+
+	async start(): Promise<void> {
+		await this.startGeneration();
+	}
+
+	async crashDaemon(): Promise<void> {
+		const generation = this.#generation;
+		this.daemon.child.kill("SIGKILL");
+		await eventually(
+			() => {
+				if (this.#failure) throw this.#failure;
+				return this.#generation > generation ? this.#daemon : undefined;
+			},
+			"systemd did not restore the daemon and adapter after daemon failure",
+			12_000,
+		);
+	}
+
+	async stop(): Promise<void> {
+		this.#stopping = true;
+		await stopAdapter(this.#adapter);
+		this.#adapter = undefined;
+		await stopDaemon(this.#daemon);
+		this.#daemon = undefined;
+	}
+
+	private async startGeneration(): Promise<void> {
+		const daemon = await startDaemon(
+			this.#options.executable,
+			this.#options.stateDirectory,
+			this.#options.profilePath,
+			this.#options.environment,
+		);
+		this.#daemon = daemon;
+		try {
+			this.#adapter = await startDiscordAdapter(
+				{
+					rpcSocketPath: path.join(this.#options.stateDirectory, "rpc.sock"),
+					token: "fixture-token",
+					route: { channelId: "123456789012345678", surfaceId: "discord:owner-dm" },
+					ackBudgetMs: 2_000,
+					claimTtlMs: 5_000,
+					readWaitMs: 0,
+				},
+				{ platformFactory: () => this.#options.fixture, onError: () => undefined },
+			);
+			this.#generation += 1;
+			void this.watchDaemon(daemon).catch(error => {
+				this.#failure = error;
+			});
+		} catch (error) {
+			await stopDaemon(daemon);
+			this.#daemon = undefined;
+			throw error;
+		}
+	}
+
+	private async watchDaemon(daemon: RunningDaemon): Promise<void> {
+		const exitCode = await daemon.child.exited;
+		daemon.client.close();
+		if (this.#daemon !== daemon) return;
+		await stopAdapter(this.#adapter);
+		this.#adapter = undefined;
+		if (this.#stopping || exitCode === 0 || restartPrevented(parseUnit("ops/systemd/gajae-way.service"), exitCode)) return;
+		try {
+			await this.startGeneration();
+		} catch (error) {
+			this.#failure = error;
+		}
+	}
+}
+
 async function eventually<T>(read: () => T | undefined | Promise<T | undefined>, description: string, timeoutMs = 10_000): Promise<T> {
 	const deadline = Date.now() + timeoutMs;
 	let lastError: unknown;
@@ -220,6 +315,8 @@ test("systemd units declare the required hardened daemon and bound adapter contr
 	expectValue(daemon, "Service", "KillMode", "mixed");
 	expectValue(daemon, "Service", "Restart", "on-failure");
 	expectValue(daemon, "Service", "RestartSec", "5s");
+	expectWords(daemon, "Unit", "Wants", ["network-online.target", "gajae-way-discord.service"]);
+	expectValue(daemon, "Unit", "Before", "gajae-way-discord.service");
 
 	expectValue(daemon, "Service", "RestartPreventExitStatus", "78");
 	expectValue(daemon, "Service", "ExecStart", "/usr/local/bin/way serve --state-dir /var/lib/gajae-way --profile /etc/gajae-way/profile.toml");
@@ -227,6 +324,7 @@ test("systemd units declare the required hardened daemon and bound adapter contr
 
 	expectValue(adapter, "Unit", "Requires", "gajae-way.service");
 	expectValue(adapter, "Unit", "BindsTo", "gajae-way.service");
+	expectValue(adapter, "Unit", "PartOf", "gajae-way.service");
 	expectWords(adapter, "Unit", "After", ["network-online.target", "gajae-way.service"]);
 	expectValue(adapter, "Unit", "StartLimitIntervalSec", "60s");
 	expectValue(adapter, "Unit", "StartLimitBurst", "3");
@@ -279,7 +377,7 @@ test("example profile covers the identity projection, mutable tunables, and Disc
 	expect(adapter).toMatchObject({ route: { channelId: "123456789012345678", surfaceId: "discord:owner-dm" }, ackBudgetMs: 2000, claimTtlMs: 5000, readWaitMs: 1000 });
 });
 
-test("supervised restart recovers compiled way RPC and fixture adapter delivery; exit 78 is restart-prevented", async () => {
+test("supervised daemon restart restores the PartOf-bound fixture adapter and compiled RPC delivery", async () => {
 	const executable = compiledWay();
 	const root = temporaryDirectory("sd");
 	const stateDirectory = path.join(root, "state");
@@ -295,49 +393,18 @@ test("supervised restart recovers compiled way RPC and fixture adapter delivery;
 	expect(bootstrap.stdout).toContain('"state":"committed"');
 
 	const fixture = new DiscordFixture();
-	let service: RunningService | undefined;
-	let restarted: RunningService | undefined;
+	let service: SupervisedService | undefined;
 	try {
-		const daemon = await startDaemon(executable, stateDirectory, profilePath, environment);
-		const adapter = await startDiscordAdapter(
-			{
-				rpcSocketPath: path.join(stateDirectory, "rpc.sock"),
-				token: "fixture-token",
-				route: { channelId: "123456789012345678", surfaceId: "discord:owner-dm" },
-				ackBudgetMs: 2_000,
-				claimTtlMs: 5_000,
-				readWaitMs: 0,
-			},
-			{ platformFactory: () => fixture, onError: () => undefined },
-		);
-		service = { daemon, adapter };
-		expect((await daemon.client.request("way.health")).result).toMatchObject({ status: "healthy", state: "running" });
+		service = new SupervisedService({ executable, stateDirectory, profilePath, environment, fixture });
+		await service.start();
+		expect((await service.daemon.client.request("way.health")).result).toMatchObject({ status: "healthy", state: "running" });
 
-		// This is the portable equivalent of systemd Restart=on-failure plus the
-		// adapter's BindsTo= relationship: the daemon dies without cleanup, then
-		// the supervisor recreates the daemon and its adapter.
-		service.daemon.child.kill("SIGKILL");
-		await service.daemon.child.exited;
-		service.daemon.client.close();
-		await stopAdapter(service.adapter);
-		service = undefined;
+		// The test only crashes the daemon. The unit topology causes BindsTo to stop
+		// the adapter and PartOf to bring it back with the daemon's restart.
+		await service.crashDaemon();
+		expect((await service.daemon.client.request("way.health")).result).toMatchObject({ status: "healthy", state: "running" });
 
-		const restartedDaemon = await startDaemon(executable, stateDirectory, profilePath, environment);
-		const restartedAdapter = await startDiscordAdapter(
-			{
-				rpcSocketPath: path.join(stateDirectory, "rpc.sock"),
-				token: "fixture-token",
-				route: { channelId: "123456789012345678", surfaceId: "discord:owner-dm" },
-				ackBudgetMs: 2_000,
-				claimTtlMs: 5_000,
-				readWaitMs: 0,
-			},
-			{ platformFactory: () => fixture, onError: () => undefined },
-		);
-		restarted = { daemon: restartedDaemon, adapter: restartedAdapter };
-		expect((await restartedDaemon.client.request("way.health")).result).toMatchObject({ status: "healthy", state: "running" });
-
-		const submitted = await restartedDaemon.client.request("main.submit", {
+		const submitted = await service.daemon.client.request("main.submit", {
 			text: "restart fixture delivery",
 			surface_id: "discord:owner-dm",
 			idempotency_key: "systemd-restart-delivery",
@@ -359,9 +426,6 @@ test("supervised restart recovers compiled way RPC and fixture adapter delivery;
 		expect(failClosed.exitCode, failClosed.stderr).toBe(78);
 		expect(restartPrevented(parseUnit("ops/systemd/gajae-way.service"), failClosed.exitCode)).toBe(true);
 	} finally {
-		await stopAdapter(restarted?.adapter);
-		await stopDaemon(restarted?.daemon);
-		await stopAdapter(service?.adapter);
-		await stopDaemon(service?.daemon);
+		await service?.stop();
 	}
 }, 30_000);

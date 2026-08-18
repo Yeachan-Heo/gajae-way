@@ -60,6 +60,7 @@ interface DoubleSessionRecord {
 	readonly gateListeners: Set<(gate: HostedSdkGate) => void>;
 	readonly gates: Map<string, { expiresAt?: number; state: "open" | "resolved" | "expired" }>;
 	followUpQueueDepth: number;
+	nextAssistantResponseId: number;
 }
 
 export interface FileSdkDoubleOptions {
@@ -107,6 +108,7 @@ export class FileSdkDouble implements MainSessionSdk {
 			gateListeners: new Set(),
 			gates: new Map(),
 			followUpQueueDepth: 0,
+			nextAssistantResponseId: 1,
 		};
 		this.#sessions.set(record.file, record);
 		this.createdSessionFiles.push(record.file);
@@ -169,6 +171,16 @@ export class FileSdkDouble implements MainSessionSdk {
 		for (const listener of [...record.listeners]) listener(event);
 	}
 
+	private finalAssistantMessage(record: DoubleSessionRecord, text: string): Record<string, unknown> {
+		const responseId = `${record.id}:assistant:${record.nextAssistantResponseId++}`;
+		return {
+			role: "assistant",
+			content: [{ type: "text", text }],
+			responseId,
+			timestamp: Date.now(),
+		};
+	}
+
 	private hosted(record: DoubleSessionRecord): HostedSdkSession {
 		return {
 			sessionFile: record.file,
@@ -185,13 +197,19 @@ export class FileSdkDouble implements MainSessionSdk {
 				if (!fs.existsSync(record.file)) throw new Error("session transcript has not persisted its first assistant message");
 				this.emit(record, { type: "turn_start" });
 				writeLine(record.file, { type: "message", role: "user", content: text });
-				this.emit(record, { type: "message_update", assistantMessageEvent: { type: "text_delta", delta: "ack" } });
-				this.emit(record, { type: "turn_end" });
+				const message = this.finalAssistantMessage(record, "ack");
+				writeLine(record.file, { type: "message", role: "assistant", content: "ack" });
+				this.emit(record, { type: "message_update", message, assistantMessageEvent: { type: "text_delta", delta: "ack" } });
+				this.emit(record, { type: "message_end", message });
+				this.emit(record, { type: "turn_end", message });
 			},
 			steer: async text => {
 				if (!fs.existsSync(record.file)) throw new Error("session transcript has not persisted its first assistant message");
 				writeLine(record.file, { type: "message", role: "user", content: text, delivery: "steer" });
-				this.emit(record, { type: "message_update", assistantMessageEvent: { type: "text_delta", delta: "steered" } });
+				const message = this.finalAssistantMessage(record, "steered");
+				writeLine(record.file, { type: "message", role: "assistant", content: "steered" });
+				this.emit(record, { type: "message_update", message, assistantMessageEvent: { type: "text_delta", delta: "steered" } });
+				this.emit(record, { type: "message_end", message });
 			},
 			followUp: async () => {
 				record.followUpQueueDepth += 1;

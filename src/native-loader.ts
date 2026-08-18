@@ -9,7 +9,6 @@ import type {
 } from "./main-session/state";
 import { embeddedAddon } from "../native/embedded-addon";
 
-
 export interface HealthInfo {
 	version: string;
 	bootEpoch: number;
@@ -74,10 +73,23 @@ export interface WayCoreHandle {
 		quarantined: boolean;
 	};
 	lockForceRelease(leaseId: string, confirm: boolean): { released: boolean; heldMs: number };
-	lockQuarantineOverride(leaseId: string, confirm: boolean, acknowledgeUnverified: boolean): {
+	lockQuarantineOverride(
+		leaseId: string,
+		confirm: boolean,
+		acknowledgeUnverified: boolean,
+	): {
 		held: boolean;
 		quarantined: boolean;
 	};
+	lockRecordQuarantineReceipt(input: {
+		leaseId: string;
+		corpus: string;
+		processInspected: boolean;
+		gitStatusChecked: boolean;
+		gitLogChecked: boolean;
+		gitFsckChecked: boolean;
+		remoteVerified: boolean;
+	}): { receiptId: string; leaseId: string; corpus: string };
 	lockClearQuarantine(verificationReceiptId: string, confirm: boolean): { held: boolean; quarantined: boolean };
 	gatewayMetaRead(keys: readonly string[]): GatewayMetaReadOutput;
 	gatewayMetaTransaction(input: GatewayMetaTransactionInput): GatewayMetaTransactionOutput;
@@ -134,7 +146,12 @@ export interface WayCoreHandle {
 		total: number;
 	};
 	registryGet(sessionId: string): ReturnType<WayCoreHandle["registryList"]>["rows"][number];
-	registryAnnotate(input: { sessionId: string; purpose?: string; brief?: string; observedAt?: number }): ReturnType<WayCoreHandle["registryList"]>["rows"][number];
+	registryAnnotate(input: {
+		sessionId: string;
+		purpose?: string;
+		brief?: string;
+		observedAt?: number;
+	}): ReturnType<WayCoreHandle["registryList"]>["rows"][number];
 	registryApplyMetadata(input: {
 		sessionId: string;
 		name: string;
@@ -142,7 +159,10 @@ export interface WayCoreHandle {
 		kind: string;
 		observedAt: number;
 	}): ReturnType<WayCoreHandle["registryList"]>["rows"][number];
-	registryMarkMetadataUnavailable(input: { sessionId: string; observedAt: number }): ReturnType<WayCoreHandle["registryList"]>["rows"][number];
+	registryMarkMetadataUnavailable(input: {
+		sessionId: string;
+		observedAt: number;
+	}): ReturnType<WayCoreHandle["registryList"]>["rows"][number];
 	registryConfigureSurfaces(
 		surfaces: Array<{ surfaceId: string; platform: string; kind: string; isOwnerSurface: boolean }>,
 		observedAt?: number,
@@ -164,7 +184,10 @@ export interface WayCoreHandle {
 	};
 	setReconcileStatus(input: { lastOkAt: number; cycleMs: number; driftCount: number }): void;
 	journalAppend(kind: string, payloadJson: string): { cursor: string; seq: string };
-	journalRead(cursor?: string, limit?: number): {
+	journalRead(
+		cursor?: string,
+		limit?: number,
+	): {
 		events: Array<{ seq: string; ts: number; kind: string; payloadJson: string }>;
 		nextCursor: string;
 		gap?: { missingFrom: string; missingTo: string; resyncCursor: string };
@@ -184,7 +207,10 @@ export interface WayCoreHandle {
 		platformMsgId?: string;
 		dedupeKey?: string;
 	}>;
-	idempotencyReplay(input: { scope: string; key: string; requestJson: string }): { replayed: boolean; responseJson?: string };
+	idempotencyReplay(input: { scope: string; key: string; requestJson: string }): {
+		replayed: boolean;
+		responseJson?: string;
+	};
 	idempotencyStore(input: { scope: string; key: string; requestJson: string; responseJson: string }): void;
 }
 
@@ -248,7 +274,7 @@ function assertWayCoreBindings(
 	bindings: Record<string, unknown>,
 	addonPath: string,
 ): asserts bindings is WayCoreBindings & Record<string, unknown> {
-	const missing = requiredExports.filter(symbol => typeof bindings[symbol] !== "function");
+	const missing = requiredExports.filter((symbol) => typeof bindings[symbol] !== "function");
 	if (missing.length > 0) {
 		throw new Error(`Native addon ${addonPath} is missing required exports: ${missing.join(", ")}.`);
 	}

@@ -24,56 +24,16 @@ async function stopCore(core: WayCoreHandle, stateDirectory: string): Promise<vo
 	fs.rmSync(stateDirectory, { force: true, recursive: true });
 }
 
-function processGroupId(pid: number): number {
-	const result = Bun.spawnSync({ cmd: ["ps", "-o", "pgid=", "-p", String(pid)], stdout: "pipe", stderr: "pipe" });
-	if (result.exitCode !== 0) throw new Error(new TextDecoder().decode(result.stderr));
-	const pgid = Number(new TextDecoder().decode(result.stdout).trim());
-	if (!Number.isSafeInteger(pgid) || pgid <= 0) throw new Error("could not determine process group id");
-	return pgid;
-}
-
-function processStartTime(pid: number): string {
-	if (process.platform === "linux") {
-		const stat = fs.readFileSync(`/proc/${pid}/stat`, "utf8");
-		const fields = stat.slice(stat.lastIndexOf(")") + 1).trim().split(/\s+/);
-		const startTime = fields[19];
-		if (!startTime) throw new Error("could not read Linux process start time");
-		return startTime;
-	}
-	if (process.platform === "darwin") {
-		const script = String.raw`
-import ctypes, os, sys
-class ProcBsdInfo(ctypes.Structure):
-    _fields_ = [("prefix", ctypes.c_uint32 * 12), ("comm", ctypes.c_char * 16), ("name", ctypes.c_char * 32), ("suffix", ctypes.c_uint32 * 6), ("seconds", ctypes.c_uint64), ("microseconds", ctypes.c_uint64)]
-info = ProcBsdInfo()
-lib = ctypes.CDLL("/usr/lib/libproc.dylib")
-size = lib.proc_pidinfo(int(sys.argv[1]), 3, 0, ctypes.byref(info), ctypes.sizeof(info))
-if size != ctypes.sizeof(info): raise SystemExit(1)
-print(info.seconds * 1000000 + info.microseconds)
-`;
-		const result = Bun.spawnSync({ cmd: ["python3", "-c", script, String(pid)], stdout: "pipe", stderr: "pipe" });
-		if (result.exitCode !== 0) throw new Error("could not read macOS process start time");
-		return new TextDecoder().decode(result.stdout).trim();
-	}
-	throw new Error(`unsupported test platform: ${process.platform}`);
-}
-
-function holder(sessionId: string, pid = process.pid): Record<string, unknown> {
-	return {
-		holder_kind: "in_daemon",
-		session_id: sessionId,
-		pid,
-		pid_start_time: processStartTime(pid),
-		pgid: processGroupId(pid),
-	};
-}
-
-function responseError(response: Awaited<ReturnType<RpcClient["request"]>>): { code: number; message: string; data?: unknown } {
+function responseError(response: Awaited<ReturnType<RpcClient["request"]>>): {
+	code: number;
+	message: string;
+	data?: unknown;
+} {
 	if (!response.error) throw new Error(`expected JSON-RPC error, got ${JSON.stringify(response)}`);
 	return response.error;
 }
 
-test("native RPC server serves health/status and git-lock lifecycle over its real UDS", async () => {
+test("native RPC server serves health/status and rejects all caller-controlled git-lock holder identities", async () => {
 	const stateDirectory = temporaryStateDirectory("serve");
 	const socketPath = path.join(stateDirectory, "rpc.sock");
 	const child = Bun.spawn(
@@ -97,43 +57,24 @@ test("native RPC server serves health/status and git-lock lifecycle over its rea
 		const status = await client.request("way.status");
 		expect(status.result).toMatchObject({ status: "healthy", lock: { held: false, queue_len: 0 } });
 
-		const acquired = await client.request("gitlock.acquire", {
-			label: "integration",
-			holder: holder("integration-owner"),
-			idempotency_key: "acquire-1",
-		});
-		const leaseId = (acquired.result as { lease_id: string }).lease_id;
-		expect(leaseId).toBeString();
-		const renewed = await client.request("gitlock.renew", { lease_id: leaseId, idempotency_key: "renew-1" });
-		expect((renewed.result as { expires_at: number }).expires_at).toBeGreaterThan(0);
-		const released = await client.request("gitlock.release", { lease_id: leaseId, idempotency_key: "release-1" });
-		expect(released.result).toMatchObject({ released: true });
-
-		const guarded = await client.request("gitlock.acquire", {
-			label: "guarded",
-			holder: holder("guarded-owner"),
-			idempotency_key: "acquire-guarded",
-		});
-		const guardedLeaseId = (guarded.result as { lease_id: string }).lease_id;
-		const forceRelease = await client.request("gitlock.force_release", {
-			lease_id: guardedLeaseId,
-			confirm: true,
-			idempotency_key: "force-guarded",
-		});
-		expect(responseError(forceRelease)).toMatchObject({ code: 1207, message: "lock_holder_unverified" });
-		const quarantined = await client.request("gitlock.quarantine_override", {
-			lease_id: guardedLeaseId,
-			confirm: true,
-			acknowledge_unverified: true,
-			idempotency_key: "quarantine-guarded",
-		});
-		expect(quarantined.result).toMatchObject({ quarantined: true });
-		const cleared = await client.request("gitlock.clear_quarantine", {
-			verification_receipt_id: "verified-receipt",
-			confirm: true,
-			idempotency_key: "clear-guarded",
-		});
-		expect(cleared.result).toMatchObject({ quarantined: false });
+		for (const holderKind of ["in_daemon", "external"]) {
+			const rejected = await client.request("gitlock.acquire", {
+				label: "integration",
+				holder: {
+					holder_kind: holderKind,
+					session_id: "caller-controlled",
+					pid: process.pid,
+					pid_start_time: "0",
+					pgid: process.pid,
+					conn_id: "way.in_daemon_executor.v1",
+				},
+				idempotency_key: `acquire-${holderKind}`,
+			});
+			expect(responseError(rejected)).toMatchObject({
+				code: -32602,
+				message: "gitlock.acquire is reserved for the daemon's supervised in-daemon closure executor in v1",
+			});
+		}
 	} finally {
 		client?.close();
 		child.kill("SIGTERM");
@@ -146,9 +87,12 @@ test("bridge maps JavaScript exceptions to correlated internal errors", async ()
 	const stateDirectory = temporaryStateDirectory("exception");
 	const socketPath = path.join(stateDirectory, "rpc.sock");
 	const core = loadWayCore().WayCore.open(stateDirectory);
-	core.startRpcServer(socketPath, createRpcBridge(core, () => {
-		throw new Error("bridge boom");
-	}));
+	core.startRpcServer(
+		socketPath,
+		createRpcBridge(core, () => {
+			throw new Error("bridge boom");
+		}),
+	);
 	const client = await connectEventually(socketPath);
 	try {
 		const response = await client.request("main.throw", {});

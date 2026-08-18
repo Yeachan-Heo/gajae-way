@@ -198,6 +198,27 @@ pub struct ReleaseResult {
 	pub held_ms: i64,
 }
 
+/// Operator-attested manual checks recorded before a quarantined corpus can
+/// reopen. Runtime liveness is independently re-proven at record and clear.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct QuarantineReceiptEvidence {
+	pub process_inspected: bool,
+	pub git_status_checked: bool,
+	pub git_log_checked: bool,
+	pub git_fsck_checked: bool,
+	pub remote_verified: bool,
+}
+
+impl QuarantineReceiptEvidence {
+	fn complete(self) -> bool {
+		self.process_inspected
+			&& self.git_status_checked
+			&& self.git_log_checked
+			&& self.git_fsck_checked
+			&& self.remote_verified
+	}
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct QueueEntry {
 	pub class: LockClass,
@@ -882,32 +903,169 @@ impl LockManager {
 		transaction.commit()?;
 		drop(connection);
 		self.notify_revocation(&lease.lease_id);
-		if self.can_revoke_group(&lease) {
-			let _ = self.revoker.revoke(&lease);
-		}
 		self.notify_waiters();
 		self.status()
+	}
+
+	/// Records the completed manual Git checks against the exact quarantined
+	/// lease. The receipt cannot be forged by choosing an opaque identifier:
+	/// this process generates it only after runtime death proof and stores the
+	/// recorded holder incarnation with it.
+	pub fn record_quarantine_receipt(
+		&self,
+		lease_id: &str,
+		corpus: &str,
+		evidence: QuarantineReceiptEvidence,
+	) -> LockResult<String> {
+		if corpus != "corpus" {
+			return Err(LockError::InvalidHolder("verification receipt corpus must be corpus".to_owned()));
+		}
+		if !evidence.complete() {
+			return Err(LockError::InvalidHolder(
+				"verification receipt must include process inspection and status/log/fsck/remote checks".to_owned(),
+			));
+		}
+		let lease = self.current_lease()?.ok_or(LockError::NotHolder)?;
+		if lease.lease_id != lease_id || lease.state != LeaseState::Quarantined || lease.lock_name != corpus {
+			return Err(LockError::NotHolder);
+		}
+		if self.prove_dead(&lease) != DeathCheck::ProvenDead {
+			return Err(LockError::HolderUnverified);
+		}
+
+		let now = self.clock.now_ms();
+		let mut connection = self.store.connection()?;
+		let transaction = connection.transaction()?;
+		let lock_name = transaction
+			.query_row(
+				"SELECT lock_name FROM leases WHERE lease_id = ?1 AND state = 'quarantined'",
+				[lease_id],
+				|row| row.get::<_, String>(0),
+			)
+			.optional()?
+			.ok_or(LockError::NotHolder)?;
+		if lock_name != corpus {
+			return Err(LockError::InvalidHolder("verification receipt corpus does not bind the lease".to_owned()));
+		}
+		let token: String = transaction.query_row("SELECT lower(hex(randomblob(16)))", [], |row| row.get(0))?;
+		let receipt_id = format!("git-verify-{token}");
+		transaction.execute(
+			"INSERT INTO verification_receipts(
+				receipt_id, lease_id, lock_name, pid, pid_start_time, pgid, pgid_start_time,
+				process_inspected, git_status_checked, git_log_checked, git_fsck_checked, remote_verified,
+				verified_at, consumed_at
+			) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 1, 1, 1, 1, 1, ?8, NULL)",
+			params![
+				&receipt_id,
+				lease_id,
+				corpus,
+				lease.holder.pid,
+				lease.holder.pid_start_time.to_string(),
+				lease.holder.pgid,
+				lease.holder.pgid_start_time.map(|value| value.to_string()),
+				now,
+			],
+		)?;
+		let payload = format!(
+			"{{\"action\":\"verification_receipt_recorded\",\"lease_id\":{},\"corpus\":{},\"verification_receipt_id\":{}}}",
+			json_string(lease_id),
+			json_string(corpus),
+			json_string(&receipt_id)
+		);
+		append_in_transaction(&transaction, "lock_event", &payload, now).map_err(|error| LockError::Journal(error.to_string()))?;
+		transaction.commit()?;
+		Ok(receipt_id)
 	}
 
 	pub fn clear_quarantine(&self, verification_receipt_id: &str, confirm: bool) -> LockResult<LockStatus> {
 		if !confirm {
 			return Err(LockError::ConfirmationRequired);
 		}
-		if verification_receipt_id.trim().is_empty() {
-			return Err(LockError::InvalidHolder("verification_receipt_id must not be empty".to_owned()));
+		if !valid_verification_receipt_id(verification_receipt_id) {
+			return Err(LockError::InvalidHolder("verification_receipt_id has an invalid format".to_owned()));
 		}
 		let lease = self.current_lease()?.ok_or(LockError::NotHolder)?;
 		if lease.state != LeaseState::Quarantined {
 			return Err(LockError::NotHolder);
 		}
+		// Receipt evidence supplements, never substitutes for, a fresh kernel
+		// liveness proof. A still-live or unprovable holder keeps the fence on.
+		if self.prove_dead(&lease) != DeathCheck::ProvenDead {
+			return Err(LockError::HolderUnverified);
+		}
+
 		let now = self.clock.now_ms();
 		let mut connection = self.store.connection()?;
 		let transaction = connection.transaction()?;
-		transaction.execute(
+		let receipt = transaction
+			.query_row(
+				"SELECT lease_id, lock_name, pid, pid_start_time, pgid, pgid_start_time,
+					process_inspected, git_status_checked, git_log_checked, git_fsck_checked, remote_verified, consumed_at
+				 FROM verification_receipts WHERE receipt_id = ?1",
+				[verification_receipt_id],
+				|row| {
+					Ok((
+						row.get::<_, String>(0)?,
+						row.get::<_, String>(1)?,
+						row.get::<_, i32>(2)?,
+						row.get::<_, String>(3)?,
+						row.get::<_, i32>(4)?,
+						row.get::<_, Option<String>>(5)?,
+						row.get::<_, i64>(6)?,
+						row.get::<_, i64>(7)?,
+						row.get::<_, i64>(8)?,
+						row.get::<_, i64>(9)?,
+						row.get::<_, i64>(10)?,
+						row.get::<_, Option<i64>>(11)?,
+					))
+				},
+			)
+			.optional()?
+			.ok_or_else(|| LockError::InvalidHolder("verification receipt does not exist".to_owned()))?;
+		let (
+			receipt_lease_id,
+			receipt_lock_name,
+			receipt_pid,
+			receipt_pid_start_time,
+			receipt_pgid,
+			receipt_pgid_start_time,
+			process_inspected,
+			git_status_checked,
+			git_log_checked,
+			git_fsck_checked,
+			remote_verified,
+			consumed_at,
+		) = receipt;
+		if receipt_lease_id != lease.lease_id
+			|| receipt_lock_name != lease.lock_name
+			|| receipt_pid != lease.holder.pid
+			|| receipt_pid_start_time != lease.holder.pid_start_time.to_string()
+			|| receipt_pgid != lease.holder.pgid
+			|| receipt_pgid_start_time != lease.holder.pgid_start_time.map(|value| value.to_string())
+			|| process_inspected != 1
+			|| git_status_checked != 1
+			|| git_log_checked != 1
+			|| git_fsck_checked != 1
+			|| remote_verified != 1
+			|| consumed_at.is_some()
+		{
+			return Err(LockError::InvalidHolder("verification receipt does not bind the quarantined corpus lease".to_owned()));
+		}
+		let released = transaction.execute(
 			"UPDATE leases SET state = 'released', released_at = ?2, release_reason = 'quarantine_cleared',
 			 quarantine_receipt_id = ?3 WHERE lease_id = ?1 AND state = 'quarantined'",
 			params![lease.lease_id, now, verification_receipt_id],
 		)?;
+		if released != 1 {
+			return Err(LockError::NotHolder);
+		}
+		let consumed = transaction.execute(
+			"UPDATE verification_receipts SET consumed_at = ?2 WHERE receipt_id = ?1 AND consumed_at IS NULL",
+			params![verification_receipt_id, now],
+		)?;
+		if consumed != 1 {
+			return Err(LockError::InvalidHolder("verification receipt was already consumed".to_owned()));
+		}
 		meta_set_tx(&transaction, "write_mode", "on")?;
 		let payload = format!(
 			"{{\"action\":\"quarantine_cleared\",\"lease_id\":{},\"verification_receipt_id\":{}}}",
@@ -1265,6 +1423,16 @@ fn validate_request(request: &AcquireRequest) -> LockResult<()> {
 	if request.holder.holder_kind != HolderKind::InDaemon {
 		return Err(LockError::InvalidHolder("external holders ship with the P9 supervisor".to_owned()));
 	}
+	if request.holder.conn_id.as_deref() != Some(IN_DAEMON_EXECUTOR_CONN_ID) {
+		return Err(LockError::InvalidHolder(
+			"in-daemon leases must be owned by the supervised closure executor".to_owned(),
+		));
+	}
+	if request.holder.pgid_start_time.is_none() {
+		return Err(LockError::InvalidHolder(
+			"in-daemon leases require a process-group start-time incarnation".to_owned(),
+		));
+	}
 	if request.holder.session_id.trim().is_empty() {
 		return Err(LockError::InvalidHolder("session_id must not be empty".to_owned()));
 	}
@@ -1292,6 +1460,12 @@ fn json_string(value: &str) -> String {
 	// serde_json string serialization cannot fail; using it keeps lease ids and
 	// receipt ids from ever breaking the durable journal payload.
 	serde_json::to_string(value).expect("serializing a string cannot fail")
+}
+
+fn valid_verification_receipt_id(value: &str) -> bool {
+	value
+		.strip_prefix("git-verify-")
+		.is_some_and(|token| token.len() == 32 && token.bytes().all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase()))
 }
 
 fn query_current_lease(connection: &rusqlite::Connection) -> rusqlite::Result<Option<Lease>> {
@@ -1387,7 +1561,8 @@ mod tests {
 
 	use super::{
 		AcquireRequest, Clock, DeathCheck, HolderKind, LeaseHolder, LockClass, LockError, LockManager, ProcessObservation,
-		ProcessProbe, QueueState, Revoker, BATCH_STARVATION_MS, HARD_HOLD_CAP_MS, IN_DAEMON_EXECUTOR_CONN_ID,
+		ProcessProbe, QuarantineReceiptEvidence, QueueState, Revoker, BATCH_STARVATION_MS, HARD_HOLD_CAP_MS,
+		IN_DAEMON_EXECUTOR_CONN_ID,
 	};
 	use crate::store::Store;
 
@@ -1608,7 +1783,7 @@ mod tests {
 	}
 
 	#[test]
-	fn quarantine_fences_acquires_until_a_receipt_clears_it() {
+	fn quarantine_fences_acquires_until_a_bound_receipt_and_fresh_death_proof_clear_it() {
 		let (manager, _, probe, _) = manager(Store::default());
 		probe.set_alive(22, 22, 100);
 		let first = manager.acquire(request("uncertain", 22)).unwrap();
@@ -1617,9 +1792,71 @@ mod tests {
 		let error = manager.acquire(request("fenced", 23)).unwrap_err();
 		assert_eq!(error.code(), Some(1208));
 		assert!(manager.status().unwrap().quarantined);
-		manager.clear_quarantine("receipt-verified", true).unwrap();
+		let error = manager.clear_quarantine("git-verify-00000000000000000000000000000000", true).unwrap_err();
+		assert_eq!(error.code(), Some(1207));
+		let error = manager
+			.record_quarantine_receipt(
+				&first.lease_id,
+				"corpus",
+				QuarantineReceiptEvidence {
+					process_inspected: true,
+					git_status_checked: true,
+					git_log_checked: true,
+					git_fsck_checked: true,
+					remote_verified: true,
+				},
+			)
+			.unwrap_err();
+		assert_eq!(error.code(), Some(1207));
+		probe.set_dead(22, 22);
+		let receipt = manager
+			.record_quarantine_receipt(
+				&first.lease_id,
+				"corpus",
+				QuarantineReceiptEvidence {
+					process_inspected: true,
+					git_status_checked: true,
+					git_log_checked: true,
+					git_fsck_checked: true,
+					remote_verified: true,
+				},
+			)
+			.unwrap();
+		assert!(receipt.starts_with("git-verify-"));
+		manager.clear_quarantine(&receipt, true).unwrap();
 		let second = manager.acquire(request("reopened", 23)).unwrap();
 		assert!(second.fencing_token > first.fencing_token);
+	}
+
+	#[test]
+	fn quarantine_receipt_is_bound_to_the_quarantined_lease_and_cannot_clear_a_successor_quarantine() {
+		let (manager, _, probe, _) = manager(Store::default());
+		probe.set_alive(28, 28, 100);
+		let first = manager.acquire(request("first-quarantine", 28)).unwrap();
+		manager.quarantine_override(&first.lease_id, true, true).unwrap();
+		probe.set_dead(28, 28);
+		let first_receipt = manager
+			.record_quarantine_receipt(
+				&first.lease_id,
+				"corpus",
+				QuarantineReceiptEvidence {
+					process_inspected: true,
+					git_status_checked: true,
+					git_log_checked: true,
+					git_fsck_checked: true,
+					remote_verified: true,
+				},
+			)
+			.unwrap();
+		manager.clear_quarantine(&first_receipt, true).unwrap();
+
+		probe.set_alive(29, 29, 100);
+		let second = manager.acquire(request("second-quarantine", 29)).unwrap();
+		manager.quarantine_override(&second.lease_id, true, true).unwrap();
+		probe.set_dead(29, 29);
+		let error = manager.clear_quarantine(&first_receipt, true).unwrap_err();
+		assert!(matches!(error, LockError::InvalidHolder(_)));
+		assert!(manager.status().unwrap().quarantined);
 	}
 
 	#[test]

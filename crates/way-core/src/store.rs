@@ -16,7 +16,7 @@ use std::{
 use rusqlite::{Connection, OptionalExtension, Transaction};
 
 pub const DATABASE_FILENAME: &str = "way-core.sqlite3";
-pub const SCHEMA_VERSION: u32 = 1;
+pub const SCHEMA_VERSION: u32 = 2;
 pub const IDEMPOTENCY_WINDOW_MS: i64 = 24 * 60 * 60 * 1_000;
 
 /// A clock is injected into protocol tests so expiry and retention behavior
@@ -165,17 +165,6 @@ impl Store {
 		Ok(())
 	}
 
-	/// P0-compatible convenience metadata round-trip. New protocol code should
-	/// use `set_meta` so it can propagate storage failures.
-	pub fn put(&self, key: impl AsRef<str>, value: impl AsRef<str>) {
-		self.set_meta(key.as_ref(), value.as_ref())
-			.expect("metadata write to an initialized SQLite store must succeed");
-	}
-
-	/// P0-compatible convenience metadata lookup.
-	pub fn get(&self, key: &str) -> Option<String> {
-		self.get_meta(key).ok().flatten()
-	}
 
 	pub fn journal_generation(&self) -> StoreResult<u64> {
 		let raw = self
@@ -276,12 +265,13 @@ pub(crate) fn meta_set_tx(transaction: &Transaction<'_>, key: &str, value: &str)
 
 fn configure_connection(connection: &mut Connection) -> StoreResult<()> {
 	connection.busy_timeout(Duration::from_secs(5))?;
-	// WAL is deliberately configured before every open. SQLite will preserve it
-	// for a file-backed database, and reports `memory` harmlessly for :memory:.
+	// Lease transitions, journal receipts, and consumer settlements are durable
+	// proofs. FULL synchronizes each committing WAL transaction before success,
+	// trading throughput for a power-loss durability boundary operators can rely on.
 	connection.execute_batch(
 		"PRAGMA journal_mode = WAL;
 		 PRAGMA foreign_keys = ON;
-		 PRAGMA synchronous = NORMAL;",
+		 PRAGMA synchronous = FULL;",
 	)?;
 	Ok(())
 }
@@ -424,6 +414,32 @@ fn migrate(connection: &mut Connection) -> StoreResult<()> {
 		transaction.commit()?;
 	}
 
+	if current_version < 2 {
+		let transaction = connection.transaction()?;
+		transaction.execute_batch(
+			"CREATE TABLE verification_receipts (
+				receipt_id TEXT PRIMARY KEY NOT NULL,
+				lease_id TEXT NOT NULL,
+				lock_name TEXT NOT NULL,
+				pid INTEGER NOT NULL,
+				pid_start_time TEXT NOT NULL,
+				pgid INTEGER NOT NULL,
+				pgid_start_time TEXT,
+				process_inspected INTEGER NOT NULL CHECK (process_inspected IN (0, 1)),
+				git_status_checked INTEGER NOT NULL CHECK (git_status_checked IN (0, 1)),
+				git_log_checked INTEGER NOT NULL CHECK (git_log_checked IN (0, 1)),
+				git_fsck_checked INTEGER NOT NULL CHECK (git_fsck_checked IN (0, 1)),
+				remote_verified INTEGER NOT NULL CHECK (remote_verified IN (0, 1)),
+				verified_at INTEGER NOT NULL,
+				consumed_at INTEGER,
+				FOREIGN KEY (lease_id) REFERENCES leases(lease_id)
+			);
+			CREATE INDEX verification_receipts_lease_idx ON verification_receipts(lease_id, lock_name, consumed_at);",
+		)?;
+		meta_set_tx(&transaction, "schema_version", "2")?;
+		transaction.commit()?;
+	}
+
 	let defaults = [
 		("bootstrap_state", "ABSENT"),
 		("bootstrap_intent", "null"),
@@ -475,7 +491,7 @@ mod tests {
 	};
 
 	use super::{DATABASE_FILENAME, IDEMPOTENCY_WINDOW_MS, SCHEMA_VERSION, Store};
-	use rusqlite::OptionalExtension;
+	use rusqlite::{Connection, OptionalExtension};
 
 	static NEXT_TEMP_DIR: AtomicU64 = AtomicU64::new(0);
 
@@ -499,7 +515,9 @@ mod tests {
 		let connection = store.connection().unwrap();
 		let journal_mode: String = connection.query_row("PRAGMA journal_mode", [], |row| row.get(0)).unwrap();
 		assert_eq!(journal_mode.to_lowercase(), "wal");
-		for table in ["sessions", "surfaces", "gateway_meta", "leases", "events", "consumer_checkpoints", "outbox", "idempotency"] {
+		let synchronous: i64 = connection.query_row("PRAGMA synchronous", [], |row| row.get(0)).unwrap();
+		assert_eq!(synchronous, 2, "durable proof tables require synchronous=FULL");
+		for table in ["sessions", "surfaces", "gateway_meta", "leases", "verification_receipts", "events", "consumer_checkpoints", "outbox", "idempotency"] {
 			let found: Option<String> = connection
 				.query_row(
 					"SELECT name FROM sqlite_master WHERE type = 'table' AND name = ?1",
@@ -568,11 +586,39 @@ mod tests {
 	}
 
 	#[test]
+	fn v1_state_directory_migrates_to_bound_verification_receipts() {
+		let state_dir = temporary_state_dir("v1-migration");
+		let database_path = state_dir.join(DATABASE_FILENAME);
+		drop(Store::open(&state_dir).unwrap());
+		let connection = Connection::open(&database_path).unwrap();
+		connection
+			.execute_batch("DROP TABLE verification_receipts; UPDATE gateway_meta SET v = '1' WHERE k = 'schema_version';")
+			.unwrap();
+		drop(connection);
+
+		let migrated = Store::open(&state_dir).unwrap();
+		assert_eq!(migrated.get_meta("schema_version").unwrap(), Some(SCHEMA_VERSION.to_string()));
+		let connection = migrated.connection().unwrap();
+		let found: Option<String> = connection
+			.query_row(
+				"SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'verification_receipts'",
+				[],
+				|row| row.get(0),
+			)
+			.optional()
+			.unwrap();
+		assert_eq!(found.as_deref(), Some("verification_receipts"));
+		drop(connection);
+		drop(migrated);
+		fs::remove_dir_all(state_dir).unwrap();
+	}
+
+	#[test]
 	fn round_trips_metadata_and_idempotency() {
 		let store = Store::default();
-		store.put("health", "healthy");
-		assert_eq!(store.get("health").as_deref(), Some("healthy"));
-		assert_eq!(store.get("missing"), None);
+		store.set_meta("health", "healthy").unwrap();
+		assert_eq!(store.get_meta("health").unwrap().as_deref(), Some("healthy"));
+		assert_eq!(store.get_meta("missing").unwrap(), None);
 
 		assert_eq!(store.replay_idempotency("lock.acquire", "k", "{\"a\":1}", 10).unwrap(), None);
 		store

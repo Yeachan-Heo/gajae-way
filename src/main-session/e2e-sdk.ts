@@ -110,9 +110,16 @@ class E2eFileSession implements HostedSdkSession {
 		this.emit({ type: "turn_start" });
 		this.append({ type: "message", role: "user", content: text, delivery });
 		const reply = `fixture reply: ${text}`;
+		const message = {
+			role: "assistant",
+			content: [{ type: "text", text: reply }],
+			responseId: crypto.randomUUID(),
+			timestamp: Date.now(),
+		};
 		this.append({ type: "message", role: "assistant", content: reply });
-		this.emit({ type: "message_update", assistantMessageEvent: { type: "text_delta", delta: reply } });
-		this.emit({ type: "turn_end" });
+		this.emit({ type: "message_update", message, assistantMessageEvent: { type: "text_delta", delta: reply } });
+		this.emit({ type: "message_end", message });
+		this.emit({ type: "turn_end", message });
 	}
 
 	private append(value: unknown): void {

@@ -3,7 +3,6 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { expect, test } from "bun:test";
 import { bootstrapMainSession } from "../../src/main-session/bootstrap";
-import { strictResumeMainSession } from "../../src/main-session/resume";
 import { GatewayStateStore } from "../../src/main-session/state";
 import { loadWayProfile } from "../../src/profile";
 import { loadWayCore } from "../../src/native-loader";
@@ -22,6 +21,62 @@ async function connectEventually(socketPath: string): Promise<RpcClient> {
 		await Bun.sleep(10);
 	}
 	throw new Error("RPC socket did not become available.");
+}
+
+interface RunningDaemon {
+	readonly child: ReturnType<typeof Bun.spawn>;
+	readonly client: RpcClient;
+}
+
+function daemonEnvironment(): NodeJS.ProcessEnv {
+	return {
+		...process.env,
+		NODE_ENV: "test",
+		WAY_E2E_FILE_SDK: "1",
+		WAY_BROKER_CLI: "/usr/bin/false",
+		WAY_RECONCILE_POLL_MS: "600000",
+	};
+}
+
+async function waitForHealth(client: RpcClient, expected: "running" | "failed_closed"): Promise<Record<string, unknown>> {
+	for (let attempt = 0; attempt < 100; attempt += 1) {
+		const response = await client.request("way.health");
+		if (response.result && (response.result as { state?: unknown }).state === expected) return response.result as Record<string, unknown>;
+		await Bun.sleep(10);
+	}
+	throw new Error(`Daemon did not reach ${expected}.`);
+}
+
+async function startDaemon(stateDirectory: string, profilePath: string, failClosedLingerMs?: number): Promise<RunningDaemon> {
+	const child = Bun.spawn(
+		[
+			"bun",
+			"src/main.ts",
+			"serve",
+			"--state-dir",
+			stateDirectory,
+			"--profile",
+			profilePath,
+			...(failClosedLingerMs === undefined ? [] : ["--fail-closed-linger-ms", String(failClosedLingerMs)]),
+		],
+		{ cwd: process.cwd(), env: daemonEnvironment(), stdout: "ignore", stderr: "ignore" },
+	);
+	try {
+		return { child, client: await connectEventually(path.join(stateDirectory, "rpc.sock")) };
+	} catch (error) {
+		if (child.exitCode === null) child.kill("SIGKILL");
+		await child.exited;
+		throw error;
+	}
+}
+
+async function stopDaemon(server: RunningDaemon | undefined): Promise<void> {
+	if (!server) return;
+	server.client.close();
+	if (server.child.exitCode === null) server.child.kill("SIGTERM");
+	await Promise.race([server.child.exited, Bun.sleep(3_000)]);
+	if (server.child.exitCode === null) server.child.kill("SIGKILL");
+	await server.child.exited;
 }
 
 function profileContents(corpus: string, workspace: string): string {
@@ -79,33 +134,22 @@ test("way profile approve --confirm updates a stopped daemon's bound projection"
 	}
 });
 
-test("owner RPC approves profile drift during failed-closed linger", async () => {
-	const root = fs.mkdtempSync(path.join(os.tmpdir(), "gajae-way-profile-rpc-"));
-	let server: ReturnType<typeof Bun.spawn> | undefined;
-	let client: RpcClient | undefined;
+test("digest-bound profile drift fails closed until approval, then the next daemon restart is healthy", async () => {
+	const root = fs.mkdtempSync(path.join(os.tmpdir(), "gajae-way-profile-restart-"));
+	let initial: RunningDaemon | undefined;
+	let failed: RunningDaemon | undefined;
+	let resumed: RunningDaemon | undefined;
 	try {
 		const setup = await bootstrapNativeState(root);
+		initial = await startDaemon(setup.stateDirectory, setup.profilePath);
+		expect(await waitForHealth(initial.client, "running")).toMatchObject({ status: "healthy", state: "running" });
+		await stopDaemon(initial);
+		initial = undefined;
 		fs.writeFileSync(setup.profilePath, fs.readFileSync(setup.profilePath, "utf8").replace('"SOUL.md", "USER.md"', '"USER.md", "SOUL.md"'));
-		server = Bun.spawn(
-			[
-				"bun",
-				"src/main.ts",
-				"serve",
-				"--state-dir",
-				setup.stateDirectory,
-				"--profile",
-				setup.profilePath,
-				"--fail-closed-linger-ms",
-				"2000",
-			],
-			{ cwd: process.cwd(), stdout: "ignore", stderr: "pipe" },
-		);
-		client = await connectEventually(path.join(setup.stateDirectory, "rpc.sock"));
-		for (let attempt = 0; attempt < 50; attempt += 1) {
-			const health = await client.request("way.health");
-			if ((health.result as { state?: string } | undefined)?.state === "failed_closed") break;
-			await Bun.sleep(10);
-		}
+		failed = await startDaemon(setup.stateDirectory, setup.profilePath, 2_000);
+		const unhealthy = await waitForHealth(failed.client, "failed_closed");
+		expect(unhealthy).toMatchObject({ status: "unhealthy", state: "failed_closed", reason: "profile_drift" });
+
 		const approval = Bun.spawnSync({
 			cmd: ["bun", "src/main.ts", "profile", "approve", "--confirm", "--state-dir", setup.stateDirectory, "--profile", setup.profilePath],
 			cwd: process.cwd(),
@@ -114,14 +158,40 @@ test("owner RPC approves profile drift during failed-closed linger", async () =>
 		});
 		expect(approval.exitCode).toBe(0);
 		expect(new TextDecoder().decode(approval.stdout)).toContain("receipt_id");
-		expect(await server.exited).toBe(78);
-		expect(setup.state.read().bootstrapState).toBe("COMMITTED");
-		const resumed = await strictResumeMainSession({ profile: loadWayProfile(setup.profilePath), state: setup.state, sdk: setup.sdk });
-		await resumed.session.dispose();
+		expect(await failed.child.exited).toBe(78);
+		expect(setup.state.read()).toMatchObject({ bootstrapState: "COMMITTED", failedClosedReason: undefined });
+
+		resumed = await startDaemon(setup.stateDirectory, setup.profilePath);
+		const healthy = await waitForHealth(resumed.client, "running");
+		expect(healthy).toMatchObject({ status: "healthy", state: "running" });
 	} finally {
-		client?.close();
-		if (server?.exitCode === null) server.kill("SIGTERM");
-		if (server) await server.exited;
+		await stopDaemon(resumed);
+		await stopDaemon(failed);
+		await stopDaemon(initial);
+		fs.rmSync(root, { recursive: true, force: true });
+	}
+}, 15_000);
+
+test("a tunable-only profile edit restarts healthy without profile approval", async () => {
+	const root = fs.mkdtempSync(path.join(os.tmpdir(), "gajae-way-profile-tunable-"));
+	let initial: RunningDaemon | undefined;
+	let restarted: RunningDaemon | undefined;
+	try {
+		const setup = await bootstrapNativeState(root);
+		const priorDigest = setup.state.read().profileDigest;
+		initial = await startDaemon(setup.stateDirectory, setup.profilePath);
+		expect(await waitForHealth(initial.client, "running")).toMatchObject({ status: "healthy", state: "running" });
+		await stopDaemon(initial);
+		initial = undefined;
+		fs.appendFileSync(setup.profilePath, "\n[poll]\ninterval_ms = 20000\n");
+		restarted = await startDaemon(setup.stateDirectory, setup.profilePath);
+		const healthy = await waitForHealth(restarted.client, "running");
+		expect(healthy).toMatchObject({ status: "healthy", state: "running" });
+		expect(setup.state.read().profileDigest).toBe(priorDigest);
+		expect(setup.state.read().bootstrapState).toBe("COMMITTED");
+	} finally {
+		await stopDaemon(restarted);
+		await stopDaemon(initial);
 		fs.rmSync(root, { recursive: true, force: true });
 	}
 }, 10_000);

@@ -258,7 +258,7 @@ test("journal append failure degrades the host without losing its growth refresh
 			},
 		},
 	});
-	await host.prompt("event triggers durable journal failure");
+	await expect(host.prompt("event triggers durable journal failure")).rejects.toMatchObject({ reason: "journal_append_failed" });
 	expect(host.degraded).toBe(true);
 	expect(reportedReason).toBe("journal_append_failed");
 	expect(journalDegraded).toBe(true);

@@ -93,6 +93,16 @@ pub struct ConsumerClaim {
 	pub expires_at: i64,
 }
 
+/// Durable delivery progress exposed through `way.status` for operators.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConsumerCheckpoint {
+	pub consumer_id: String,
+	pub cursor: Cursor,
+	pub claim_id: Option<String>,
+	pub claim_expires_at: Option<i64>,
+	pub updated_at: i64,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DeliveryProof {
 	pub seq: u64,
@@ -402,6 +412,25 @@ impl EventJournal {
 		)?;
 		transaction.commit()?;
 		Ok(cursor)
+	}
+
+	pub fn consumer_checkpoints(&self) -> JournalResult<Vec<ConsumerCheckpoint>> {
+		let connection = self.store.connection()?;
+		let mut statement = connection.prepare(
+			"SELECT consumer_id, cursor, claim_id, claim_expires_at, updated_at
+			 FROM consumer_checkpoints ORDER BY consumer_id ASC",
+		)?;
+		let rows = statement.query_map([], |row| -> rusqlite::Result<ConsumerCheckpoint> {
+			let cursor = row.get::<_, String>(1)?;
+			Ok(ConsumerCheckpoint {
+				consumer_id: row.get(0)?,
+				cursor: Cursor::from_str(&cursor).map_err(|_| rusqlite::Error::InvalidQuery)?,
+				claim_id: row.get(2)?,
+				claim_expires_at: row.get(3)?,
+				updated_at: row.get(4)?,
+			})
+		})?;
+		Ok(rows.collect::<Result<Vec<_>, _>>()?)
 	}
 
 	pub fn consumer_cursor(&self, consumer_id: &str) -> JournalResult<Option<Cursor>> {
