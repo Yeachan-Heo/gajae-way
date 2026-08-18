@@ -36,6 +36,9 @@ pub const DEFAULT_WAIT_MS: u64 = 30_000;
 pub const MAX_WAIT_MS: u64 = 300_000;
 pub const BATCH_STARVATION_MS: i64 = 60_000;
 pub const MAX_CONSECUTIVE_INTERACTIVE_GRANTS: u8 = 3;
+/// Durable marker written only by the daemon's direct closure executor. RPC
+/// lock callers cannot register a process group for fail-stop signalling.
+pub const IN_DAEMON_EXECUTOR_CONN_ID: &str = "way.in_daemon_executor.v1";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HolderKind {
@@ -399,36 +402,25 @@ fn macos_process(pid: i32) -> ProcessObservation {
 
 #[cfg(target_os = "macos")]
 fn macos_process_group(pgid: i32) -> ProcessObservation {
-	let byte_count = unsafe { libc::proc_listpgrppids(pgid, std::ptr::null_mut(), 0) };
-	if byte_count < 0 {
-		return ProcessObservation::Unprovable;
+	// `proc_listpgrppids` is not reliable for a just-created detached session on
+	// every supported macOS release. POSIX group signalling is the authority we
+	// actually use for revocation: it proves whether any member remains. The
+	// leader PID supplies the incarnation whenever it still exists.
+	match macos_process(pgid) {
+		ProcessObservation::Present { start_time } => ProcessObservation::Present { start_time },
+		ProcessObservation::Absent | ProcessObservation::Unprovable => macos_group_signal(pgid),
 	}
-	if byte_count == 0 {
-		return ProcessObservation::Absent;
-	}
-	let mut pids = vec![0_i32; byte_count as usize / std::mem::size_of::<i32>() + 1];
-	let result = unsafe {
-		libc::proc_listpgrppids(
-			pgid,
-			pids.as_mut_ptr().cast(),
-			(pids.len() * std::mem::size_of::<i32>()) as i32,
-		)
-	};
-	if result < 0 {
-		return ProcessObservation::Unprovable;
-	}
-	if result == 0 {
-		return ProcessObservation::Absent;
-	}
-	let member_count = result as usize / std::mem::size_of::<i32>();
-	let leader = pids.into_iter().take(member_count).find(|pid| *pid == pgid);
-	match leader {
-		Some(pid) => match macos_process(pid) {
-			ProcessObservation::Present { start_time } => ProcessObservation::Present { start_time },
-			ProcessObservation::Absent => ProcessObservation::Present { start_time: None },
-			ProcessObservation::Unprovable => ProcessObservation::Unprovable,
-		},
-		None => ProcessObservation::Present { start_time: None },
+}
+
+#[cfg(target_os = "macos")]
+fn macos_group_signal(pgid: i32) -> ProcessObservation {
+	let result = unsafe { libc::kill(-pgid, 0) };
+	if result == 0 || io::Error::last_os_error().raw_os_error() == Some(libc::EPERM) {
+		ProcessObservation::Present { start_time: None }
+	} else if io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH) {
+		ProcessObservation::Absent
+	} else {
+		ProcessObservation::Unprovable
 	}
 }
 
@@ -611,7 +603,9 @@ pub struct LockManager {
 	clock: Arc<dyn Clock>,
 	process_probe: Arc<dyn ProcessProbe>,
 	revoker: Arc<dyn Revoker>,
+	hard_hold_cap_ms: u64,
 	queue: Arc<QueueControl>,
+	revocations: Arc<Mutex<Vec<String>>>,
 	startup_recovery_complete: Arc<AtomicBool>,
 }
 
@@ -623,11 +617,24 @@ impl fmt::Debug for LockManager {
 
 impl LockManager {
 	pub fn new(store: Store) -> Self {
-		Self::with_components(
+		Self::with_components_and_hard_cap(
 			store,
 			Arc::new(SystemClock),
 			Arc::new(SystemProcessProbe),
 			Arc::new(SystemRevoker),
+			HARD_HOLD_CAP_MS,
+		)
+	}
+
+	/// The shortened cap is intentionally an in-process/native test seam. The
+	/// daemon never supplies it in normal operation.
+	pub fn with_hard_hold_cap(store: Store, hard_hold_cap_ms: u64) -> Self {
+		Self::with_components_and_hard_cap(
+			store,
+			Arc::new(SystemClock),
+			Arc::new(SystemProcessProbe),
+			Arc::new(SystemRevoker),
+			hard_hold_cap_ms,
 		)
 	}
 
@@ -637,12 +644,24 @@ impl LockManager {
 		process_probe: Arc<dyn ProcessProbe>,
 		revoker: Arc<dyn Revoker>,
 	) -> Self {
+		Self::with_components_and_hard_cap(store, clock, process_probe, revoker, HARD_HOLD_CAP_MS)
+	}
+
+	fn with_components_and_hard_cap(
+		store: Store,
+		clock: Arc<dyn Clock>,
+		process_probe: Arc<dyn ProcessProbe>,
+		revoker: Arc<dyn Revoker>,
+		hard_hold_cap_ms: u64,
+	) -> Self {
 		Self {
 			store,
 			clock,
 			process_probe,
 			revoker,
+			hard_hold_cap_ms,
 			queue: Arc::new(QueueControl::default()),
+			revocations: Arc::new(Mutex::new(Vec::new())),
 			startup_recovery_complete: Arc::new(AtomicBool::new(false)),
 		}
 	}
@@ -750,15 +769,51 @@ impl LockManager {
 		}
 		let ttl: i64 = lease.ttl_ms.try_into().map_err(|_| LockError::LeaseExpired)?;
 		let expires_at = now.checked_add(ttl).ok_or(LockError::LeaseExpired)?.min(lease.hard_expires_at);
-		let connection = self.store.connection()?;
-		let updated = connection.execute(
+		let mut connection = self.store.connection()?;
+		let transaction = connection.transaction()?;
+		let updated = transaction.execute(
 			"UPDATE leases SET expires_at = ?2 WHERE lease_id = ?1 AND state = 'active'",
 			params![lease_id, expires_at],
 		)?;
 		if updated != 1 {
 			return Err(LockError::LeaseExpired);
 		}
+		let payload = format!(
+			"{{\"action\":\"renewed\",\"lease_id\":{},\"expires_at\":{}}}",
+			json_string(lease_id),
+			expires_at
+		);
+		append_in_transaction(&transaction, "lock_event", &payload, now).map_err(|error| LockError::Journal(error.to_string()))?;
+		transaction.commit()?;
 		Ok(expires_at)
+	}
+
+	/// Checks the durable lease identity at a closure step boundary. A matching
+	/// token alone is insufficient: only the current, active, unexpired lease
+	/// authorizes another Git operation.
+	pub fn fencing_valid(&self, lease_id: &str, fencing_token: u64) -> LockResult<bool> {
+		self.reconcile()?;
+		let now = self.clock.now_ms();
+		let Some(lease) = self.current_lease()? else {
+			return Ok(false);
+		};
+		Ok(
+			lease.lease_id == lease_id
+				&& lease.fencing_token == fencing_token
+				&& lease.state == LeaseState::Active
+				&& now < lease.expires_at
+				&& now < lease.hard_expires_at,
+		)
+	}
+
+	/// Revocations are generated by the durable FSM and consumed by the
+	/// in-daemon closure executor, which owns the child handle required to reap
+	/// the process group. Draining is idempotent.
+	pub fn drain_revocations(&self) -> Vec<String> {
+		match self.revocations.lock() {
+			Ok(mut revocations) => std::mem::take(&mut *revocations),
+			Err(_) => Vec::new(),
+		}
 	}
 
 	pub fn release(&self, lease_id: &str) -> LockResult<ReleaseResult> {
@@ -826,6 +881,10 @@ impl LockManager {
 		append_in_transaction(&transaction, "lock_event", &payload, now).map_err(|error| LockError::Journal(error.to_string()))?;
 		transaction.commit()?;
 		drop(connection);
+		self.notify_revocation(&lease.lease_id);
+		if self.can_revoke_group(&lease) {
+			let _ = self.revoker.revoke(&lease);
+		}
 		self.notify_waiters();
 		self.status()
 	}
@@ -902,9 +961,10 @@ impl LockManager {
 			return Ok(());
 		}
 		let now = self.clock.now_ms();
-		// A daemon restart deliberately rechecks a resurrected lease even while
-		// its TTL remains in the future. It is still never transferred without
-		// proof; a live holder remains fenced by the row.
+		// A v1 holder is daemon-owned. A restarted daemon must fail-stop any
+		// residual matching group before it can consider the durable lease dead.
+		// A recycled PID/PGID is never signalled: an incarnation mismatch is
+		// already proof that the recorded holder is gone.
 		if startup_recovery {
 			match self.prove_dead(&lease) {
 				DeathCheck::ProvenDead => {
@@ -912,17 +972,39 @@ impl LockManager {
 					self.notify_waiters();
 					return Ok(());
 				}
+				DeathCheck::Alive if lease.holder.holder_kind == HolderKind::InDaemon && self.can_revoke_group(&lease) => {
+					self.notify_revocation(&lease.lease_id);
+					if self.revoke_and_prove_dead(&lease) {
+						self.release_lease(&lease.lease_id, "startup_in_daemon_reaped", now)?;
+						self.notify_waiters();
+					} else {
+						self.set_state(&lease.lease_id, LeaseState::Stuck)?;
+					}
+					return Ok(());
+				}
 				DeathCheck::Alive => {}
-				DeathCheck::Unprovable => self.set_state(&lease.lease_id, LeaseState::Stuck)?,
+				DeathCheck::Unprovable => {
+					self.set_state(&lease.lease_id, LeaseState::Stuck)?;
+					return Ok(());
+				}
 			}
 		}
 		if now > lease.hard_expires_at {
-			let revoked = self.revoker.revoke(&lease);
-			if revoked && self.prove_dead(&lease) == DeathCheck::ProvenDead {
-				self.release_lease(&lease.lease_id, "hard_cap_revoked", now)?;
-				self.notify_waiters();
-			} else {
-				self.set_state(&lease.lease_id, LeaseState::Stuck)?;
+			match self.prove_dead(&lease) {
+				DeathCheck::ProvenDead => {
+					self.release_lease(&lease.lease_id, "hard_cap_proven_death", now)?;
+					self.notify_waiters();
+				}
+				_ if self.can_revoke_group(&lease) => {
+					self.notify_revocation(&lease.lease_id);
+					if self.revoke_and_prove_dead(&lease) {
+						self.release_lease(&lease.lease_id, "hard_cap_revoked", now)?;
+						self.notify_waiters();
+					} else {
+						self.set_state(&lease.lease_id, LeaseState::Stuck)?;
+					}
+				}
+				_ => self.set_state(&lease.lease_id, LeaseState::Stuck)?,
 			}
 			return Ok(());
 		}
@@ -956,10 +1038,50 @@ impl LockManager {
 		}
 	}
 
+	fn can_revoke_group(&self, lease: &Lease) -> bool {
+		if lease.holder.holder_kind != HolderKind::InDaemon
+			|| lease.holder.conn_id.as_deref() != Some(IN_DAEMON_EXECUTOR_CONN_ID)
+		{
+			return false;
+		}
+		let expected = lease
+			.holder
+			.pgid_start_time
+			.or_else(|| (lease.holder.pid == lease.holder.pgid).then_some(lease.holder.pid_start_time));
+		match self.process_probe.process_group(lease.holder.pgid) {
+			ProcessObservation::Present { start_time: Some(actual) } => expected == Some(actual),
+			// A process group can outlive its leader while it reaps descendant Git
+			// processes. Once the recorded leader PID is absent, that group ID is
+			// still reserved by those descendants and is safe to kill as residual
+			// daemon-owned work. An unprovable leader remains fail-closed.
+			ProcessObservation::Present { start_time: None } if lease.holder.pid == lease.holder.pgid => match self.process_probe.process(lease.holder.pid) {
+				ProcessObservation::Absent => true,
+				ProcessObservation::Present { start_time: Some(actual) } => expected == Some(actual),
+				ProcessObservation::Present { start_time: None } | ProcessObservation::Unprovable => false,
+			},
+			_ => false,
+		}
+	}
+
+	fn revoke_and_prove_dead(&self, lease: &Lease) -> bool {
+		if !self.revoker.revoke(lease) {
+			return false;
+		}
+		for attempt in 0..=25 {
+			if self.prove_dead(lease) == DeathCheck::ProvenDead {
+				return true;
+			}
+			if attempt < 25 {
+				std::thread::sleep(Duration::from_millis(10));
+			}
+		}
+		false
+	}
+
 	fn grant(&self, request: &AcquireRequest, queue_waited_ms: i64) -> LockResult<AcquireResult> {
 		let now = self.clock.now_ms();
 		let ttl: i64 = request.ttl_ms.try_into().map_err(|_| LockError::InvalidTtl)?;
-		let hard_cap: i64 = HARD_HOLD_CAP_MS.try_into().map_err(|_| LockError::InvalidTtl)?;
+		let hard_cap: i64 = self.hard_hold_cap_ms.try_into().map_err(|_| LockError::InvalidTtl)?;
 		let hard_expires_at = now.checked_add(hard_cap).ok_or(LockError::InvalidTtl)?;
 		let expires_at = now.checked_add(ttl).ok_or(LockError::InvalidTtl)?.min(hard_expires_at);
 		let mut connection = self.store.connection()?;
@@ -1011,6 +1133,12 @@ impl LockManager {
 			],
 		)?;
 		meta_set_tx(&transaction, "lock_fencing_token", &fencing_token.to_string())?;
+		let payload = format!(
+			"{{\"action\":\"acquired\",\"lease_id\":{},\"fencing_token\":{}}}",
+			json_string(&lease_id),
+			json_string(&fencing_token.to_string())
+		);
+		append_in_transaction(&transaction, "lock_event", &payload, now).map_err(|error| LockError::Journal(error.to_string()))?;
 		transaction.commit()?;
 		Ok(AcquireResult { lease_id, fencing_token, expires_at, queue_waited_ms })
 	}
@@ -1026,21 +1154,43 @@ impl LockManager {
 	}
 
 	fn release_lease(&self, lease_id: &str, reason: &str, now: i64) -> LockResult<()> {
-		let connection = self.store.connection()?;
-		connection.execute(
+		let mut connection = self.store.connection()?;
+		let transaction = connection.transaction()?;
+		let updated = transaction.execute(
 			"UPDATE leases SET state = 'released', released_at = ?2, release_reason = ?3
 			 WHERE lease_id = ?1 AND state IN ('active', 'expiring', 'stuck', 'quarantined')",
 			params![lease_id, now, reason],
 		)?;
+		if updated != 1 {
+			return Err(LockError::LeaseExpired);
+		}
+		let payload = format!(
+			"{{\"action\":\"released\",\"lease_id\":{},\"reason\":{}}}",
+			json_string(lease_id),
+			json_string(reason)
+		);
+		append_in_transaction(&transaction, "lock_event", &payload, now).map_err(|error| LockError::Journal(error.to_string()))?;
+		transaction.commit()?;
 		Ok(())
 	}
 
 	fn set_state(&self, lease_id: &str, state: LeaseState) -> LockResult<()> {
-		let connection = self.store.connection()?;
-		connection.execute(
-			"UPDATE leases SET state = ?2 WHERE lease_id = ?1 AND state IN ('active', 'expiring', 'stuck')",
+		let now = self.clock.now_ms();
+		let mut connection = self.store.connection()?;
+		let transaction = connection.transaction()?;
+		let updated = transaction.execute(
+			"UPDATE leases SET state = ?2 WHERE lease_id = ?1 AND state IN ('active', 'expiring', 'stuck') AND state <> ?2",
 			params![lease_id, state.as_sql()],
 		)?;
+		if updated == 1 {
+			let payload = format!(
+				"{{\"action\":\"state_changed\",\"lease_id\":{},\"state\":{}}}",
+				json_string(lease_id),
+				json_string(state.as_sql())
+			);
+			append_in_transaction(&transaction, "lock_event", &payload, now).map_err(|error| LockError::Journal(error.to_string()))?;
+		}
+		transaction.commit()?;
 		Ok(())
 	}
 
@@ -1090,6 +1240,14 @@ impl LockManager {
 		let mut queue = self.queue.state.lock().map_err(|_| LockError::Store(StoreError::Poisoned))?;
 		queue.record_grant(class);
 		Ok(())
+	}
+
+	fn notify_revocation(&self, lease_id: &str) {
+		if let Ok(mut revocations) = self.revocations.lock() {
+			if !revocations.iter().any(|candidate| candidate == lease_id) {
+				revocations.push(lease_id.to_owned());
+			}
+		}
 	}
 
 	fn notify_waiters(&self) {
@@ -1229,7 +1387,7 @@ mod tests {
 
 	use super::{
 		AcquireRequest, Clock, DeathCheck, HolderKind, LeaseHolder, LockClass, LockError, LockManager, ProcessObservation,
-		ProcessProbe, QueueState, Revoker, BATCH_STARVATION_MS, HARD_HOLD_CAP_MS,
+		ProcessProbe, QueueState, Revoker, BATCH_STARVATION_MS, HARD_HOLD_CAP_MS, IN_DAEMON_EXECUTOR_CONN_ID,
 	};
 	use crate::store::Store;
 
@@ -1304,7 +1462,7 @@ mod tests {
 			pid_start_time: 100,
 			pgid: pid,
 			pgid_start_time: Some(100),
-			conn_id: None,
+			conn_id: Some(IN_DAEMON_EXECUTOR_CONN_ID.to_owned()),
 		}
 	}
 
@@ -1372,6 +1530,27 @@ mod tests {
 		probe.set_alive(15, 15, 100);
 		let second = manager.acquire(request("two", 15)).unwrap();
 		assert_eq!(second.fencing_token, first.fencing_token + 1);
+	}
+
+	#[test]
+	fn fencing_validity_requires_the_current_active_lease_and_exact_token() {
+		let (manager, _, probe, _) = manager(Store::default());
+		probe.set_alive(141, 141, 100);
+		let lease = manager.acquire(request("fence", 141)).unwrap();
+		assert!(manager.fencing_valid(&lease.lease_id, lease.fencing_token).unwrap());
+		assert!(!manager.fencing_valid(&lease.lease_id, lease.fencing_token + 1).unwrap());
+		manager.release(&lease.lease_id).unwrap();
+		assert!(!manager.fencing_valid(&lease.lease_id, lease.fencing_token).unwrap());
+	}
+
+	#[test]
+	fn quarantine_emits_a_revocation_for_the_in_daemon_executor() {
+		let (manager, _, probe, _) = manager(Store::default());
+		probe.set_alive(142, 142, 100);
+		let lease = manager.acquire(request("quarantine-notify", 142)).unwrap();
+		manager.quarantine_override(&lease.lease_id, true, true).unwrap();
+		assert_eq!(manager.drain_revocations(), vec![lease.lease_id]);
+		assert!(manager.drain_revocations().is_empty());
 	}
 
 	#[test]
@@ -1459,6 +1638,47 @@ mod tests {
 		second_probe.set_alive(25, 25, 100);
 		let second = second_manager.acquire(request("after-kill-9", 25)).unwrap();
 		assert!(second.fencing_token > first.fencing_token);
+		fs::remove_dir_all(state_dir).unwrap();
+	}
+
+	#[test]
+	fn startup_recovery_kills_a_matching_in_daemon_group_before_admitting_a_successor() {
+		let state_dir = temporary_state_dir("startup-revocation");
+		let store = Store::open(&state_dir).unwrap();
+		let (first_manager, _, first_probe, _) = manager(store.clone());
+		first_probe.set_alive(241, 241, 100);
+		let first = first_manager.acquire(request("daemon-killed", 241)).unwrap();
+		drop(first_manager);
+		drop(store);
+
+		let reopened = Store::open(&state_dir).unwrap();
+		let (second_manager, _, second_probe, second_revoker) = manager(reopened);
+		second_probe.set_alive(241, 241, 100);
+		second_probe.set_alive(242, 242, 100);
+		let successor = second_manager.acquire(request("after-startup-reap", 242)).unwrap();
+		assert!(successor.fencing_token > first.fencing_token);
+		assert_eq!(second_revoker.calls.load(Ordering::Relaxed), 1);
+		fs::remove_dir_all(state_dir).unwrap();
+	}
+
+	#[test]
+	fn startup_recovery_reaps_a_leaderless_residual_group() {
+		let state_dir = temporary_state_dir("startup-leaderless-group");
+		let store = Store::open(&state_dir).unwrap();
+		let (first_manager, _, first_probe, _) = manager(store.clone());
+		first_probe.set_alive(251, 251, 100);
+		let first = first_manager.acquire(request("daemon-descendant", 251)).unwrap();
+		drop(first_manager);
+		drop(store);
+
+		let reopened = Store::open(&state_dir).unwrap();
+		let (second_manager, _, second_probe, second_revoker) = manager(reopened);
+		second_probe.processes.lock().unwrap().insert(251, ProcessObservation::Absent);
+		second_probe.groups.lock().unwrap().insert(251, ProcessObservation::Present { start_time: None });
+		second_probe.set_alive(252, 252, 100);
+		let successor = second_manager.acquire(request("after-descendant-reap", 252)).unwrap();
+		assert!(successor.fencing_token > first.fencing_token);
+		assert_eq!(second_revoker.calls.load(Ordering::Relaxed), 1);
 		fs::remove_dir_all(state_dir).unwrap();
 	}
 

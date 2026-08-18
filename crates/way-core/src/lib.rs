@@ -16,7 +16,7 @@ use crate::{
 	},
 	lock::{
 		AcquireRequest, AcquireResult, HolderKind, Lease, LeaseHolder, LockClass, LockError, LockManager, LockStatus,
-		QueueEntry, ReleaseResult,
+		ProcessObservation, ProcessProbe, QueueEntry, ReleaseResult, SystemProcessProbe, HARD_HOLD_CAP_MS,
 	},
 	store::{meta_get_tx, meta_set_tx, unix_epoch_ms, Store, StoreError},
 };
@@ -156,6 +156,16 @@ pub struct LockStatusOutput {
 	pub queue: Vec<QueueEntryOutput>,
 	pub stuck: bool,
 	pub quarantined: bool,
+}
+
+#[napi(object)]
+pub struct ProcessIdentityOutput {
+	pub pid: i32,
+	#[napi(js_name = "pidStartTime")]
+	pub pid_start_time: String,
+	pub pgid: i32,
+	#[napi(js_name = "pgidStartTime")]
+	pub pgid_start_time: Option<String>,
 }
 
 #[napi(object)]
@@ -322,16 +332,21 @@ pub struct WayCore {
 #[napi]
 impl WayCore {
 	/// Opens the state directory, migrates it under SQLite WAL, and runs
-	/// `integrity_check` before exposing any mutation APIs.
+	/// `integrity_check` before exposing any mutation APIs. Startup also performs
+	/// the v1 in-daemon lease death-check before the daemon accepts work.
 	#[napi(factory)]
 	pub fn open(state_dir: String) -> napi::Result<Self> {
-		if state_dir.trim().is_empty() {
-			return Err(napi::Error::from_reason("stateDir must not be empty"));
+		open_way_core(state_dir, None)
+	}
+
+	/// Internal deterministic test seam for the ten-minute hard-cap protocol.
+	/// The shipped daemon always uses the fixed production cap.
+	#[napi(factory, js_name = "openWithTestHardCap")]
+	pub fn open_with_test_hard_cap(state_dir: String, hard_hold_cap_ms: u32) -> napi::Result<Self> {
+		if hard_hold_cap_ms == 0 || u64::from(hard_hold_cap_ms) > HARD_HOLD_CAP_MS {
+			return Err(napi::Error::from_reason("test hard hold cap must be in 1..=600000 ms"));
 		}
-		let store = Store::open(&state_dir).map_err(store_napi_error)?;
-		let locks = LockManager::new(store.clone());
-		let journal = EventJournal::new(store.clone());
-		Ok(Self { state_dir, store, locks, journal, rpc_server: Mutex::new(None) })
+		open_way_core(state_dir, Some(u64::from(hard_hold_cap_ms)))
 	}
 
 	#[napi(getter, js_name = "stateDir")]
@@ -505,6 +520,30 @@ impl WayCore {
 			.map_err(lock_napi_error)
 	}
 
+	/// Returns whether this exact lease/token still owns write authority at a
+	/// Git step boundary. A false result is a fail-stop instruction.
+	#[napi(js_name = "lockFencingValid")]
+	pub fn lock_fencing_valid(&self, lease_id: String, fencing_token: String) -> napi::Result<bool> {
+		let fencing_token = fencing_token
+			.parse::<u64>()
+			.map_err(|_| napi::Error::from_reason("fencingToken must be a u64 string"))?;
+		self.locks.fencing_valid(&lease_id, fencing_token).map_err(lock_napi_error)
+	}
+
+	/// Returns durable FSM revocation notices once. The in-daemon executor owns
+	/// the actual child handle and confirms process-group reaping.
+	#[napi(js_name = "lockDrainRevocations")]
+	pub fn lock_drain_revocations(&self) -> Vec<String> {
+		self.locks.drain_revocations()
+	}
+
+	/// Captures a process and process-group incarnation for an in-daemon child
+	/// before its lease row is created.
+	#[napi(js_name = "processIdentity")]
+	pub fn process_identity(&self, pid: i32) -> napi::Result<ProcessIdentityOutput> {
+		process_identity_output(pid)
+	}
+
 	#[napi(js_name = "lockRelease")]
 	pub fn lock_release(&self, lease_id: String) -> napi::Result<LockReleaseOutput> {
 		self.locks.release(&lease_id).map(lock_release_output).map_err(lock_napi_error)
@@ -627,6 +666,44 @@ impl WayCore {
 			)
 			.map_err(store_napi_error)
 	}
+}
+
+fn open_way_core(state_dir: String, hard_hold_cap_ms: Option<u64>) -> napi::Result<WayCore> {
+	if state_dir.trim().is_empty() {
+		return Err(napi::Error::from_reason("stateDir must not be empty"));
+	}
+	let store = Store::open(&state_dir).map_err(store_napi_error)?;
+	let locks = match hard_hold_cap_ms {
+		Some(hard_hold_cap_ms) => LockManager::with_hard_hold_cap(store.clone(), hard_hold_cap_ms),
+		None => LockManager::new(store.clone()),
+	};
+	locks.reconcile().map_err(lock_napi_error)?;
+	let journal = EventJournal::new(store.clone());
+	Ok(WayCore { state_dir, store, locks, journal, rpc_server: Mutex::new(None) })
+}
+
+fn process_identity_output(pid: i32) -> napi::Result<ProcessIdentityOutput> {
+	if pid <= 0 {
+		return Err(napi::Error::from_reason("pid must be positive"));
+	}
+	let probe = SystemProcessProbe;
+	let pid_start_time = match probe.process(pid) {
+		ProcessObservation::Present { start_time: Some(start_time) } => start_time,
+		ProcessObservation::Absent => return Err(napi::Error::from_reason("process is absent")),
+		ProcessObservation::Present { start_time: None } | ProcessObservation::Unprovable => {
+			return Err(napi::Error::from_reason("process incarnation is unprovable"));
+		}
+	};
+	let pgid = unsafe { libc::getpgid(pid) };
+	if pgid <= 0 {
+		return Err(napi::Error::from_reason("process group is unavailable"));
+	}
+	let pgid_start_time = match probe.process_group(pgid) {
+		ProcessObservation::Present { start_time } => start_time.map(|value| value.to_string()),
+		ProcessObservation::Absent => return Err(napi::Error::from_reason("process group is absent")),
+		ProcessObservation::Unprovable => return Err(napi::Error::from_reason("process group incarnation is unprovable")),
+	};
+	Ok(ProcessIdentityOutput { pid, pid_start_time: pid_start_time.to_string(), pgid, pgid_start_time })
 }
 
 fn acquire_request_from_napi(input: LockAcquireInput) -> napi::Result<AcquireRequest> {

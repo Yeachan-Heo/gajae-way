@@ -43,6 +43,41 @@ export interface WayCoreHandle {
 	setMainSessionStatus(turnState: "idle" | "busy", followUpQueueDepth: number): void;
 	setJournalDegraded(degraded: boolean): void;
 	sdNotifyStatus(status: string): void;
+	lockAcquire(input: {
+		label: string;
+		class?: "interactive" | "batch";
+		waitMs?: number;
+		ttlMs?: number;
+		holder: {
+			holderKind: "in_daemon";
+			sessionId: string;
+			pid: number;
+			pidStartTime: string;
+			pgid: number;
+			pgidStartTime?: string;
+			connId?: "way.in_daemon_executor.v1";
+		};
+	}): { leaseId: string; fencingToken: string; expiresAt: number; queueWaitedMs: number };
+	lockRenew(leaseId: string): { expiresAt: number };
+	lockRelease(leaseId: string): { released: boolean; heldMs: number };
+	lockFencingValid(leaseId: string, fencingToken: string): boolean;
+	lockDrainRevocations(): string[];
+	processIdentity(pid: number): { pid: number; pidStartTime: string; pgid: number; pgidStartTime?: string };
+	lockStatus(): {
+		held: boolean;
+		holder?: { leaseId: string; sessionId: string; pid: number; pgid: number; fencingToken: string; state: string };
+		expiresAt?: number;
+		fencingToken?: string;
+		queue: Array<{ class: string; label: string; waitedMs: number }>;
+		stuck: boolean;
+		quarantined: boolean;
+	};
+	lockForceRelease(leaseId: string, confirm: boolean): { released: boolean; heldMs: number };
+	lockQuarantineOverride(leaseId: string, confirm: boolean, acknowledgeUnverified: boolean): {
+		held: boolean;
+		quarantined: boolean;
+	};
+	lockClearQuarantine(verificationReceiptId: string, confirm: boolean): { held: boolean; quarantined: boolean };
 	gatewayMetaRead(keys: readonly string[]): GatewayMetaReadOutput;
 	gatewayMetaTransaction(input: GatewayMetaTransactionInput): GatewayMetaTransactionOutput;
 	journalAppend(kind: string, payloadJson: string): { cursor: string; seq: string };
@@ -72,6 +107,7 @@ export interface WayCoreHandle {
 
 export interface WayCoreConstructor {
 	open(stateDir: string): WayCoreHandle;
+	openWithTestHardCap(stateDir: string, hardHoldCapMs: number): WayCoreHandle;
 }
 
 export interface WayCoreBindings {

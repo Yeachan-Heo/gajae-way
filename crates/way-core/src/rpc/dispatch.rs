@@ -17,7 +17,10 @@ use tokio::{sync::oneshot, time::Instant as TokioInstant};
 
 use crate::{
 	events::{ConsumerClaim, Cursor, DeliveryProof, EventJournal, JournalError, JournalGap, JournalRead},
-	lock::{AcquireRequest, AcquireResult, HolderKind, Lease, LeaseHolder, LockClass, LockError, LockManager, LockStatus, ReleaseResult},
+	lock::{
+		AcquireRequest, AcquireResult, HolderKind, Lease, LeaseHolder, LockClass, LockError, LockManager, LockStatus,
+		ReleaseResult, IN_DAEMON_EXECUTOR_CONN_ID,
+	},
 	store::{unix_epoch_ms, Store, StoreError},
 };
 
@@ -1086,6 +1089,9 @@ fn parse_acquire_request(params: &Value) -> Result<AcquireRequest, RpcError> {
 		pgid_start_time: optional_u64(holder_object, "pgid_start_time")?,
 		conn_id: match holder_object.get("conn_id") {
 			None | Some(Value::Null) => None,
+			Some(Value::String(value)) if value == IN_DAEMON_EXECUTOR_CONN_ID => {
+				return Err(RpcError::invalid_params("holder.conn_id is reserved for the in-daemon executor"));
+			}
 			Some(Value::String(value)) if !value.is_empty() => Some(value.clone()),
 			Some(_) => return Err(RpcError::invalid_params("holder.conn_id must be a non-empty string when present")),
 		},

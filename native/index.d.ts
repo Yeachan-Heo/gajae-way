@@ -4,9 +4,15 @@
 export declare class WayCore {
   /**
    * Opens the state directory, migrates it under SQLite WAL, and runs
-   * `integrity_check` before exposing any mutation APIs.
+   * `integrity_check` before exposing any mutation APIs. Startup also performs
+   * the v1 in-daemon lease death-check before the daemon accepts work.
    */
   static open(stateDir: string): WayCore
+  /**
+   * Internal deterministic test seam for the ten-minute hard-cap protocol.
+   * The shipped daemon always uses the fixed production cap.
+   */
+  static openWithTestHardCap(stateDir: string, hardHoldCapMs: number): WayCore
   get stateDir(): string
   /**
    * Starts the hardened state-directory UDS server and registers the TSFN
@@ -44,6 +50,21 @@ export declare class WayCore {
   gatewayMetaTransaction(input: GatewayMetaTransactionInput): GatewayMetaTransactionOutput
   lockAcquire(input: LockAcquireInput): LockAcquireOutput
   lockRenew(leaseId: string): LockRenewOutput
+  /**
+   * Returns whether this exact lease/token still owns write authority at a
+   * Git step boundary. A false result is a fail-stop instruction.
+   */
+  lockFencingValid(leaseId: string, fencingToken: string): boolean
+  /**
+   * Returns durable FSM revocation notices once. The in-daemon executor owns
+   * the actual child handle and confirms process-group reaping.
+   */
+  lockDrainRevocations(): Array<string>
+  /**
+   * Captures a process and process-group incarnation for an in-daemon child
+   * before its lease row is created.
+   */
+  processIdentity(pid: number): ProcessIdentityOutput
   lockRelease(leaseId: string): LockReleaseOutput
   lockStatus(): LockStatusOutput
   lockForceRelease(leaseId: string, confirm: boolean): LockReleaseOutput
@@ -248,6 +269,13 @@ export interface OutboxRowOutput {
   state: string
   platformMsgId?: string
   dedupeKey?: string
+}
+
+export interface ProcessIdentityOutput {
+  pid: number
+  pidStartTime: string
+  pgid: number
+  pgidStartTime?: string
 }
 
 export interface QueueEntryOutput {

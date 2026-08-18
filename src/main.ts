@@ -6,6 +6,7 @@ import * as path from "node:path";
 import { parseWayConfig, type WayConfig } from "./config";
 import { createMainAdmissionHandler } from "./main-session/admission";
 import { createMainGateAnswerHandler } from "./main-session/gates";
+import { createClosureExecutor, runClosureWorker, type ClosureExecutor } from "./main-session/closure";
 
 import { bootstrapMainSession, recoverBootstrap } from "./main-session/bootstrap";
 import { createMainSessionHost, type MainSessionHost } from "./main-session/host";
@@ -146,18 +147,20 @@ function profileBridgeHandler(
 	};
 }
 
-async function waitForShutdown(core: WayCoreHandle, host: MainSessionHost): Promise<void> {
+async function waitForShutdown(core: WayCoreHandle, host: MainSessionHost, closures: ClosureExecutor): Promise<void> {
 	await new Promise<void>(resolve => {
 		const stop = () => resolve();
 		process.once("SIGINT", stop);
 		process.once("SIGTERM", stop);
 	});
+	await closures.shutdown();
 	await host.dispose();
 	core.shutdownRpcServer();
 }
 
 async function serveWay(config: WayConfig): Promise<void> {
 	const core = loadWayCore().WayCore.open(config.stateDir);
+	const closures = createClosureExecutor({ core });
 	const state = new GatewayStateStore(core);
 	const profiles = new ProfileRevisionTracker();
 	const profileHandler = profileBridgeHandler(state, config, profiles);
@@ -200,10 +203,14 @@ async function serveWay(config: WayConfig): Promise<void> {
 		};
 		core.setRpcHealth("running");
 		await writeHealthFile(config.stateDir, { status: "healthy", state: "running" });
-		await waitForShutdown(core, host);
+		await waitForShutdown(core, host, closures);
 	} catch (error) {
-		if (error instanceof FailedClosedExit) throw error;
+		if (error instanceof FailedClosedExit) {
+			await closures.shutdown();
+			throw error;
+		}
 		if (host) await host.dispose();
+		await closures.shutdown();
 		await enterFailedClosed(core, state, config, failureReason(error));
 	}
 }
@@ -318,7 +325,9 @@ export async function runWay(arguments_ = process.argv.slice(2)): Promise<void> 
 	throw new Error(`Unknown command: ${parsed.remaining.join(" ")}\n${usage}`);
 }
 
-if (import.meta.main) {
+if (import.meta.main && process.env.WAY_INTERNAL_CLOSURE_WORKER === "1") {
+	await runClosureWorker();
+} else if (import.meta.main) {
 	try {
 		await runWay();
 	} catch (error) {

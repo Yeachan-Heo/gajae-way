@@ -13,6 +13,10 @@ export const requiredGeneratedBindingSymbols = [
 	"setRpcHealth",
 	"setMainSessionStatus",
 	"setJournalDegraded",
+	"lockDrainRevocations",
+	"lockFencingValid",
+	"openWithTestHardCap",
+	"processIdentity",
 ] as const;
 
 export function validateGeneratedBindingSource(bindings: string): void {
