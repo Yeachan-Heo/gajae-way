@@ -15,8 +15,8 @@ platform credentials all belong in deployment configuration.
 
 ```text
                          Unix-domain JSON-RPC
-way console (local owner)  -------------------------->  way daemon
-way-discord adapter       -------------------------->  Bun + Rust single binary
+gajaeway console (local owner)  -------------------------->  gajaeway daemon
+gajaeway-discord adapter       -------------------------->  Bun + Rust single binary
 Discord gateway/REST                                      |
                                                            +-- Rust: SQLite, journal,
                                                            |   lock FSM, RPC, registry
@@ -27,8 +27,8 @@ Discord gateway/REST                                      |
                                                               isolated sessions
 ```
 
-`way` owns durable state, the UDS endpoint, and the only v1 in-daemon corpus
-lock holder. `way-discord` is a separate adapter process with no local
+`gajaeway` owns durable state, the UDS endpoint, and the only v1 in-daemon corpus
+lock holder. `gajaeway-discord` is a separate adapter process with no local
 checkpoint; it reconnects to the daemon and settles delivery through the
 server-owned journal/outbox. GJC sessions remain broker-owned and isolated;
 the gateway resumes only the configured main session by its full transcript
@@ -47,37 +47,37 @@ architecture before copying them to the Linux host:
 
 ```sh
 bun scripts/build-native.ts && bun scripts/compile.ts
-sudo install -m 0755 dist/way /usr/local/bin/way
-sudo install -m 0755 dist/way-discord /usr/local/bin/way-discord
+sudo install -m 0755 dist/gajaeway /usr/local/bin/gajaeway
+sudo install -m 0755 dist/gajaeway-discord /usr/local/bin/gajaeway-discord
 ```
 
 Create a dedicated service identity and protected configuration/state paths:
 
 ```sh
-sudo useradd --system --home-dir /var/lib/gajae-way --create-home \
-  --shell /usr/sbin/nologin gajae-way
-sudo install -d -o root -g gajae-way -m 0750 /etc/gajae-way
-sudo install -d -o root -g root -m 0700 /etc/gajae-way/credentials
-sudo install -d -o gajae-way -g gajae-way -m 0700 /var/lib/gajae-way
-sudo install -m 0644 ops/systemd/gajae-way.service /etc/systemd/system/gajae-way.service
-sudo install -m 0644 ops/systemd/gajae-way-discord.service /etc/systemd/system/gajae-way-discord.service
+sudo useradd --system --home-dir /var/lib/gajaeway --create-home \
+  --shell /usr/sbin/nologin gajaeway
+sudo install -d -o root -g gajaeway -m 0750 /etc/gajaeway
+sudo install -d -o root -g root -m 0700 /etc/gajaeway/credentials
+sudo install -d -o gajaeway -g gajaeway -m 0700 /var/lib/gajaeway
+sudo install -m 0644 ops/systemd/gajaeway.service /etc/systemd/system/gajaeway.service
+sudo install -m 0644 ops/systemd/gajaeway-discord.service /etc/systemd/system/gajaeway-discord.service
 ```
 
 Copy `ops/profiles/gaebal-gajae.example.toml` to
-`/etc/gajae-way/profile.toml`, replace every example identity and path, then
+`/etc/gajaeway/profile.toml`, replace every example identity and path, then
 make the profile readable by the service identity without making it writable:
 
 ```sh
-sudo install -m 0640 -o root -g gajae-way ops/profiles/gaebal-gajae.example.toml \
-  /etc/gajae-way/profile.toml
+sudo install -m 0640 -o root -g gajaeway ops/profiles/gaebal-gajae.example.toml \
+  /etc/gajaeway/profile.toml
 sudo install -m 0600 -o root -g root /path/to/discord-token \
-  /etc/gajae-way/credentials/discord-token
+  /etc/gajaeway/credentials/discord-token
 sudo systemctl daemon-reload
 ```
 
 Before installing or enabling the daemon, set `ReadWritePaths=` in the source
-unit (or in `/etc/systemd/system/gajae-way.service` after installation) to
-exactly match `[corpus].path` and `[corpus].workspace`; `/srv/gajae-way/...` is
+unit (or in `/etc/systemd/system/gajaeway.service` after installation) to
+exactly match `[corpus].path` and `[corpus].workspace`; `/srv/gajaeway/...` is
 only a placeholder. Run `sudo systemctl daemon-reload` after changing an
 installed unit. Review the `ProtectHome=` comment when either path is under
 `/home`.
@@ -85,22 +85,22 @@ installed unit. Review the `ProtectHome=` comment when either path is under
 Bootstrap is an explicit, one-time ceremony while the daemon is stopped:
 
 ```sh
-sudo systemctl stop gajae-way-discord.service gajae-way.service
-sudo -u gajae-way -H /usr/local/bin/way bootstrap --confirm \
-  --state-dir /var/lib/gajae-way --profile /etc/gajae-way/profile.toml
+sudo systemctl stop gajaeway-discord.service gajaeway.service
+sudo -u gajaeway -H /usr/local/bin/gajaeway bootstrap --confirm \
+  --state-dir /var/lib/gajaeway --profile /etc/gajaeway/profile.toml
 ```
 
 Then start the gateway and adapter:
 
 ```sh
-sudo systemctl enable --now gajae-way.service
-sudo systemctl enable --now gajae-way-discord.service
+sudo systemctl enable --now gajaeway.service
+sudo systemctl enable --now gajaeway-discord.service
 ```
 
 Probe the running daemon, rather than only the executable version, with:
 
 ```sh
-sudo -u gajae-way -H /usr/local/bin/way --health --state-dir /var/lib/gajae-way
+sudo -u gajaeway -H /usr/local/bin/gajaeway --health --state-dir /var/lib/gajaeway
 ```
 
 The command queries the UDS and exits non-zero with `state: "unavailable"` if
@@ -109,12 +109,12 @@ full RPC monitoring.
 
 ## Owner console and adapter final gates
 
-`way console` is the first-party, local owner acceptance surface. Run it as the
+`gajaeway console` is the first-party, local owner acceptance surface. Run it as the
 same service identity that owns the protected UDS socket:
 
 ```sh
-sudo -u gajae-way -H /usr/local/bin/way console \
-  --state-dir /var/lib/gajae-way --profile /etc/gajae-way/profile.toml
+sudo -u gajaeway -H /usr/local/bin/gajaeway console \
+  --state-dir /var/lib/gajaeway --profile /etc/gajaeway/profile.toml
 ```
 
 It reads `way.health` and `way.status` before accepting input, displays the
@@ -138,7 +138,7 @@ for the same configured route.
 ## Profile model
 
 The loader creates a versioned, canonical SHA-256 identity/security projection.
-Changes to these fields require `way profile approve --confirm` before strict
+Changes to these fields require `gajaeway profile approve --confirm` before strict
 resume can continue:
 
 - corpus path and workspace;

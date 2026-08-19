@@ -42,7 +42,7 @@ afterEach(async () => {
 });
 
 function temporaryDirectory(name: string): string {
-	const directory = fs.mkdtempSync(path.join(os.tmpdir(), `gajae-way-console-${name}-`));
+	const directory = fs.mkdtempSync(path.join(os.tmpdir(), `gajaeway-console-${name}-`));
 	temporaryDirectories.push(directory);
 	return directory;
 }
@@ -550,7 +550,7 @@ async function assertRawControlEscapesPermanentlyStalledOutput(control: "\u0003"
 		exitDrainMs: 25,
 	});
 	try {
-		await eventually(() => output.writes.includes("way> "), "raw console did not begin reading interactive input");
+		await eventually(() => output.writes.includes("gajaeway> "), "raw console did not begin reading interactive input");
 		for (const line of initial) input.send(`${line}\n`);
 		await eventually(() => submissions.length === initial.length, "raw console did not saturate owner operations");
 		await eventually(() => !terminal.rawPublicationPending, "initial raw echo did not flush");
@@ -610,7 +610,7 @@ async function assertRawSaturatedControlStartsBoundedDrain(control: "\u0003" | "
 	});
 	let completed = false;
 	try {
-		await eventually(() => output.writes.includes("way> "), "raw console did not begin reading interactive input");
+		await eventually(() => output.writes.includes("gajaeway> "), "raw console did not begin reading interactive input");
 		for (const line of initial) input.send(`${line}\n`);
 		await eventually(() => submissions.length === initial.length, "raw console did not saturate owner operations");
 		for (const line of queued) input.send(`${line}\n`);
@@ -645,7 +645,7 @@ test("console submits through real UDS, renders finalized replies before settlem
 	let cursorAtAssistantRender: string | undefined;
 	const recorded = recordingClient(gateway.client);
 	const rendered = recordedOutput((text) => {
-		if (text.startsWith("Assistant:\n")) cursorAtAssistantRender = gateway.core.consumerCursor("way-console");
+		if (text.startsWith("Assistant:\n")) cursorAtAssistantRender = gateway.core.consumerCursor("gajaeway-console");
 	});
 	let idempotencyCount = 0;
 	const consoleSurface = new OwnerConsole({
@@ -666,10 +666,10 @@ test("console submits through real UDS, renders finalized replies before settlem
 		expect(submit?.params).toEqual({ text: "owner request", surface_id: "owner", idempotency_key: "console-submit-1" });
 		expect(rendered.writes.join("")).toContain("Delivered as: prompt");
 		const consumerClaim = recorded.calls.find((call) => call.method === "consumer.claim");
-		expect(consumerClaim?.params).toEqual({ consumer_id: "way-console", claim_ttl_ms: 5_000 });
+		expect(consumerClaim?.params).toEqual({ consumer_id: "gajaeway-console", claim_ttl_ms: 5_000 });
 		const eventRead = recorded.calls.find((call) => call.method === "main.events.read");
 		expect(eventRead?.params).toEqual({
-			consumer_id: "way-console",
+			consumer_id: "gajaeway-console",
 			limit: 100,
 			wait_ms: 0,
 			kinds: [
@@ -686,13 +686,13 @@ test("console submits through real UDS, renders finalized replies before settlem
 		expect(rendered.writes.join("")).toContain("Assistant:\nack\n");
 		expect(rendered.writes.join("")).toContain("Main turn ended — idle.");
 		expect(cursorAtAssistantRender).toBe("1:0");
-		expect(gateway.core.consumerCursor("way-console")).toBe("1:3");
-		expect(gateway.core.consumerOutbox("way-console")).toHaveLength(3);
+		expect(gateway.core.consumerCursor("gajaeway-console")).toBe("1:3");
+		expect(gateway.core.consumerOutbox("gajaeway-console")).toHaveLength(3);
 		gateway.core.journalAppend("health_change", JSON.stringify({ state: "degraded", reason: "journal_append_failed" }));
 		expect(await consoleSurface.consumeOnce()).toBe("rendered");
 		expect(rendered.writes.join("")).toContain("Gateway health changed: degraded reason=journal_append_failed.");
-		expect(gateway.core.consumerCursor("way-console")).toBe("1:4");
-		expect(gateway.core.consumerOutbox("way-console")).toHaveLength(4);
+		expect(gateway.core.consumerCursor("gajaeway-console")).toBe("1:4");
+		expect(gateway.core.consumerOutbox("gajaeway-console")).toHaveLength(4);
 
 		gateway.client.close();
 		const restartedClient = await connectEventually(gateway.socketPath);
@@ -707,7 +707,7 @@ test("console submits through real UDS, renders finalized replies before settlem
 			expect((await restarted.start()).accepted).toBe(true);
 			expect(await restarted.consumeOnce()).toBe("idle");
 			expect(restartedOutput.writes.join("")).not.toContain("Assistant:\nack\n");
-			expect(gateway.core.consumerCursor("way-console")).toBe("1:4");
+			expect(gateway.core.consumerCursor("gajaeway-console")).toBe("1:4");
 		} finally {
 			restartedClient.close();
 		}
@@ -764,14 +764,14 @@ test("console sanitizes assistant CSI, OSC 52, C0, and C1 text before terminal p
 	}
 });
 
-test("console readiness refuses an existing way-console claim before it can submit owner work", async () => {
+test("console readiness refuses an existing gajaeway-console claim before it can submit owner work", async () => {
 	const gateway = await hostedConsoleGateway();
 	const holder = await connectEventually(gateway.socketPath);
 	const contender = await connectEventually(gateway.socketPath);
 	const rendered = recordedOutput();
 	try {
 		const claim = rpcResult<{ claim_id: string; cursor: string }>(
-			await holder.request("consumer.claim", { consumer_id: "way-console", claim_ttl_ms: 5_000 }),
+			await holder.request("consumer.claim", { consumer_id: "gajaeway-console", claim_ttl_ms: 5_000 }),
 			"consumer.claim",
 		);
 		const consoleSurface = new OwnerConsole({
@@ -782,12 +782,12 @@ test("console readiness refuses an existing way-console claim before it can subm
 		});
 		const startup = await consoleSurface.start();
 		expect(startup).toMatchObject({ accepted: false });
-		expect(rendered.writes.join("")).toContain("Another way console currently owns");
+		expect(rendered.writes.join("")).toContain("Another gajaeway console currently owns");
 		await expect(consoleSurface.submit("must not submit while delivery is elsewhere")).rejects.toBeInstanceOf(
 			ConsoleDeliveryUnavailableError,
 		);
 		await holder.request("consumer.commit", {
-			consumer_id: "way-console",
+			consumer_id: "gajaeway-console",
 			claim_id: claim.claim_id,
 			cursor: claim.cursor,
 			proofs: [],
@@ -813,11 +813,11 @@ test("console readiness terminates on a retention gap instead of accepting blind
 		const startup = await consoleSurface.start();
 		expect(startup).toMatchObject({ accepted: false });
 		expect(rendered.writes.join("")).toContain("behind journal retention");
-		expect(rendered.writes.join("")).toContain("restart way console");
+		expect(rendered.writes.join("")).toContain("restart gajaeway console");
 		await expect(consoleSurface.submit("must not submit without a recoverable checkpoint")).rejects.toBeInstanceOf(
 			ConsoleDeliveryUnavailableError,
 		);
-		expect(gateway.core.consumerCursor("way-console")).toBe("1:0");
+		expect(gateway.core.consumerCursor("gajaeway-console")).toBe("1:0");
 	} finally {
 		client.close();
 		await gateway.stop();
@@ -846,10 +846,10 @@ test("console commits only after an asynchronous terminal publication resolves",
 		delayAssistant = true;
 		const consume = consoleSurface.consumeOnce();
 		await Bun.sleep(25);
-		expect(gateway.core.consumerCursor("way-console")).toBe("1:0");
+		expect(gateway.core.consumerCursor("gajaeway-console")).toBe("1:0");
 		publication.resolve();
 		expect(await consume).toBe("rendered");
-		expect(gateway.core.consumerCursor("way-console")).toBe(appended.cursor);
+		expect(gateway.core.consumerCursor("gajaeway-console")).toBe(appended.cursor);
 	} finally {
 		await gateway.stop();
 	}
@@ -876,7 +876,7 @@ test("console leaves its checkpoint unadvanced and blocks input when terminal pu
 		);
 		failAssistant = true;
 		await expect(consoleSurface.consumeOnce()).rejects.toBeInstanceOf(ConsoleDeliveryUnavailableError);
-		expect(gateway.core.consumerCursor("way-console")).toBe("1:0");
+		expect(gateway.core.consumerCursor("gajaeway-console")).toBe("1:0");
 		await expect(consoleSurface.submit("must not submit after a publication failure")).rejects.toBeInstanceOf(
 			ConsoleDeliveryUnavailableError,
 		);
@@ -885,7 +885,7 @@ test("console leaves its checkpoint unadvanced and blocks input when terminal pu
 	}
 });
 
-test("actual way console CLI exits non-zero after a failed-closed startup refusal", async () => {
+test("actual gajaeway console CLI exits non-zero after a failed-closed startup refusal", async () => {
 	const root = temporaryDirectory("cli-refusal");
 	const corpus = path.join(root, "corpus");
 	const workspace = path.join(root, "workspace");
@@ -931,7 +931,7 @@ test("actual way console CLI exits non-zero after a failed-closed startup refusa
 
 test("healthy non-TTY CLI preserves the console checkpoint until a valid terminal can render pending events", async () => {
 	const gateway = await hostedConsoleGateway();
-	const checkpointBefore = gateway.core.consumerCursor("way-console");
+	const checkpointBefore = gateway.core.consumerCursor("gajaeway-console");
 	const pending = gateway.core.journalAppend(
 		"assistant_message",
 		JSON.stringify({ finalized: true, text: "pending before terminal validation" }),
@@ -951,17 +951,17 @@ test("healthy non-TTY CLI preserves the console checkpoint until a valid termina
 			new Response(child.stderr).text(),
 		]);
 		expect(exitCode).toBe(1);
-		expect(childStderr).toContain("way console requires an interactive TTY");
+		expect(childStderr).toContain("gajaeway console requires an interactive TTY");
 		expect(childStdout).toBe("");
-		expect(gateway.core.consumerCursor("way-console")).toBe(checkpointBefore);
-		expect(gateway.core.consumerOutbox("way-console")).toEqual([]);
+		expect(gateway.core.consumerCursor("gajaeway-console")).toBe(checkpointBefore);
+		expect(gateway.core.consumerOutbox("gajaeway-console")).toEqual([]);
 
 		const subsequent = scriptedTerminal(["/quit"]);
 		await runWayConsole({ stateDir: gateway.stateDirectory, profilePath: gateway.profilePath }, [], {
 			terminal: subsequent.terminal,
 		});
 		expect(subsequent.writes.join("")).toContain("Assistant:\npending before terminal validation\n");
-		expect(gateway.core.consumerCursor("way-console")).toBe(pending.cursor);
+		expect(gateway.core.consumerCursor("gajaeway-console")).toBe(pending.cursor);
 	} finally {
 		await gateway.stop();
 	}
@@ -1011,7 +1011,7 @@ test("console reports outstanding operations when exit grace elapses", async () 
 		await running;
 		expect(terminal.writes.join("")).toContain("Exit requested; 1 console operation is still outstanding.");
 		expect(terminal.writes.join("")).toContain(
-			"Results will remain available through the journal at the way-console consumer checkpoint.",
+			"Results will remain available through the journal at the gajaeway-console consumer checkpoint.",
 		);
 		const release = await gateway.client.request("main.gate.answer", {
 			gate_id: gateId,
@@ -1230,7 +1230,7 @@ test("raw same-chunk oversized input renders a refusal and leaves the owner comm
 		rpcConnect: async () => blockingSubmissionRpc(Promise.resolve(), submissions),
 	});
 	try {
-		await eventually(() => output.writes.includes("way> "), "raw console did not begin reading interactive input");
+		await eventually(() => output.writes.includes("gajaeway> "), "raw console did not begin reading interactive input");
 		input.send(`${oversized}\n`);
 		await eventually(
 			() => output.writes.join("").includes(`Input line exceeds ${MAX_RAW_CONSOLE_LINE_BYTES} bytes and was refused.`),
@@ -1272,7 +1272,7 @@ test("raw console coalesces mixed oversized and queue-full refusals while operat
 		rpcConnect: async () => blockingSubmissionRpc(release.promise, submissions),
 	});
 	try {
-		await eventually(() => output.writes.includes("way> "), "raw console did not begin reading interactive input");
+		await eventually(() => output.writes.includes("gajaeway> "), "raw console did not begin reading interactive input");
 		for (const line of inFlight) input.send(`${line}\n`);
 		await eventually(() => submissions.length === inFlight.length, "console did not saturate the owner-operation cap");
 		await Bun.sleep(0);
@@ -1328,7 +1328,7 @@ test("raw console bounds queued input, visibly refuses excess lines, and preserv
 		rpcConnect: async () => blockingSubmissionRpc(release.promise, submissions),
 	});
 	try {
-		await eventually(() => output.writes.includes("way> "), "raw console did not begin reading interactive input");
+		await eventually(() => output.writes.includes("gajaeway> "), "raw console did not begin reading interactive input");
 		for (const line of initial) input.send(`${line}\n`);
 		await eventually(() => submissions.length === initial.length, "console did not saturate the owner-operation cap");
 		for (const line of queued) input.send(`${line}\n`);
@@ -1448,7 +1448,7 @@ test("real console command loop admits an owner message typed during a busy turn
 	}
 }, 15_000);
 
-test("prompt repaint preserves complete assistant and gate frames while way> is active", async () => {
+test("prompt repaint preserves complete assistant and gate frames while gajaeway> is active", async () => {
 	const gateway = await hostedConsoleGateway();
 	const terminal = promptFrameTerminal();
 	const running = runWayConsole({ stateDir: gateway.stateDirectory, profilePath: gateway.profilePath }, [], {
@@ -1465,7 +1465,7 @@ test("prompt repaint preserves complete assistant and gate frames while way> is 
 			JSON.stringify({ gate_id: "gate-frame-visible", session_id: "session-frame-visible" }),
 		);
 		await eventually(
-			() => gateway.core.consumerCursor("way-console") === gate.cursor,
+			() => gateway.core.consumerCursor("gajaeway-console") === gate.cursor,
 			"console did not publish and commit the prompt-active frames",
 		);
 		const screen = terminal.snapshot();
@@ -1473,7 +1473,7 @@ test("prompt repaint preserves complete assistant and gate frames while way> is 
 		expect(screen).toContain("Assistant:\nassistant frame remains visible");
 		expect(screen).toContain("gate_id=gate-frame-visible");
 		expect(screen).toContain("expected_session_id=session-frame-visible");
-		expect(screen.endsWith("way> ")).toBe(true);
+		expect(screen.endsWith("gajaeway> ")).toBe(true);
 		terminal.send("/quit");
 		await running;
 	} finally {
@@ -1507,7 +1507,7 @@ test("console gate drill uses durable gate fencing, rejects a mismatched session
 		});
 		expect(await consoleSurface.consumeOnce()).toBe("rendered");
 		expect(rendered.writes.join("")).toContain("Gate resolved: gate_id=gate-live.");
-		expect(gateway.core.consumerCursor("way-console")).toBe("1:2");
+		expect(gateway.core.consumerCursor("gajaeway-console")).toBe("1:2");
 	} finally {
 		await gateway.stop();
 	}

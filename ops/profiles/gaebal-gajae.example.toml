@@ -1,8 +1,8 @@
-# Example deployment profile. gajae-way hardcodes no persona, corpus, platform,
+# Example deployment profile. gajaeway hardcodes no persona, corpus, platform,
 # or credential. Replace every /srv path and identifier for the real operator.
 [corpus]
-path = "/srv/gajae-way/corpus"
-workspace = "/srv/gajae-way/workspace"
+path = "/srv/gajaeway/corpus"
+workspace = "/srv/gajaeway/workspace"
 
 [injection]
 # Ordered and digest-bound: SOUL -> USER -> daily(today + prior days) -> MEMORY.
@@ -42,9 +42,9 @@ budget_ms = 2000
 engagement_enabled = false
 
 [adapter.discord]
-# In systemd, LoadCredential supplies WAY_DISCORD_TOKEN_FILE and takes
+# In systemd, LoadCredential supplies GAJAEWAY_DISCORD_TOKEN_FILE and takes
 # precedence. This env-name fallback is convenient for local development only.
-token_env = "WAY_DISCORD_BOT_TOKEN"
+token_env = "GAJAEWAY_DISCORD_BOT_TOKEN"
 channel_id = "123456789012345678"
 surface_id = "discord:owner-dm"
 ack_budget_ms = 2000

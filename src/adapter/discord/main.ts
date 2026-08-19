@@ -8,9 +8,9 @@ import { DiscordGatewayPlatform, validateDiscordToken, type DiscordFetch, type D
 import { DiscordRouteHandler } from "./route";
 
 const usage = `Usage:
-  way-discord [--state-dir PATH] [--profile PATH] [--rpc-socket PATH]
-  way-discord --check [--state-dir PATH] [--profile PATH] [--rpc-socket PATH]
-  way-discord --help | --version`;
+  gajaeway-discord [--state-dir PATH] [--profile PATH] [--rpc-socket PATH]
+  gajaeway-discord --check [--state-dir PATH] [--profile PATH] [--rpc-socket PATH]
+  gajaeway-discord --help | --version`;
 
 export interface DiscordAdapterDependencies {
 	readonly environment?: NodeJS.ProcessEnv;
@@ -44,7 +44,7 @@ export async function startDiscordAdapter(
 			...(config.apiBaseUrl ? { apiBaseUrl: config.apiBaseUrl } : {}),
 			...(config.gatewayUrl ? { gatewayUrl: config.gatewayUrl } : {}),
 		});
-	const onError = dependencies.onError ?? (error => console.error(`way-discord failed: ${error.message}`));
+	const onError = dependencies.onError ?? (error => console.error(`gajaeway-discord failed: ${error.message}`));
 	const router = new DiscordRouteHandler({
 		route: config.route,
 		rpc,
@@ -120,7 +120,7 @@ export async function runDiscordAdapter(
 		return;
 	}
 	if (arguments_.includes("--version") || arguments_.includes("-V")) {
-		console.log(`way-discord ${loadWayCore().healthInfo().version}`);
+		console.log(`gajaeway-discord ${loadWayCore().healthInfo().version}`);
 		return;
 	}
 	const environment = dependencies.environment ?? process.env;

@@ -48,10 +48,10 @@ test("native RPC server serves health/status and rejects all caller-controlled g
 		cmd: [
 			"bun",
 			"-e",
-			`const { startWayServer } = await import("./src/main.ts"); const core = startWayServer(process.env.WAY_STATE_DIR); process.once("SIGTERM", () => { core.shutdownRpcServer(); process.exit(0); }); await new Promise(() => {});`,
+			`const { startWayServer } = await import("./src/main.ts"); const core = startWayServer(process.env.GAJAEWAY_STATE_DIR); process.once("SIGTERM", () => { core.shutdownRpcServer(); process.exit(0); }); await new Promise(() => {});`,
 		],
 		cwd: process.cwd(),
-		env: { ...process.env, WAY_STATE_DIR: stateDirectory },
+		env: { ...process.env, GAJAEWAY_STATE_DIR: stateDirectory },
 		stderr: "pipe",
 	});
 	let client: RpcClient | undefined;

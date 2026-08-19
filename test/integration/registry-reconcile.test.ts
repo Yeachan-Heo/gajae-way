@@ -37,7 +37,7 @@ function fixtureBroker(root: string, statePath: string): string {
 	const wrapper = path.join(root, "fixture-gjc");
 	fs.writeFileSync(
 		wrapper,
-		`#!/bin/sh\nexport WAY_BROKER_FIXTURE_STATE=${shellQuote(statePath)}\nexec ${shellQuote(process.execPath)} ${shellQuote(fixtureScript)} "$@"\n`,
+		`#!/bin/sh\nexport GAJAEWAY_BROKER_FIXTURE_STATE=${shellQuote(statePath)}\nexec ${shellQuote(process.execPath)} ${shellQuote(fixtureScript)} "$@"\n`,
 	);
 	fs.chmodSync(wrapper, 0o755);
 	return wrapper;
@@ -151,7 +151,7 @@ test("reconciliation reflects rename within the shortened poll SLA and preserves
 		list: list([row("rename")]),
 		metadata: { rename: metadata("rename", "before rename") },
 	});
-	const configured = defaultConfig({ WAY_BROKER_CLI: fixture.broker.executable, WAY_RECONCILE_POLL_MS: "25" });
+	const configured = defaultConfig({ GAJAEWAY_BROKER_CLI: fixture.broker.executable, GAJAEWAY_RECONCILE_POLL_MS: "25" });
 	expect(configured).toMatchObject({ brokerCliPath: fixture.broker.executable, reconcilePollMs: 25 });
 	const reconciler = new BrokerReconciler({ core: fixture.core, broker: fixture.broker, pollMs: 25, cycleSlaMs: 2_000 });
 	try {

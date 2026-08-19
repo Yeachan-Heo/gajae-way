@@ -2,7 +2,7 @@
 
 ## Preconditions
 
-`way bootstrap --confirm` is the only creation path for a main identity. The
+`gajaeway bootstrap --confirm` is the only creation path for a main identity. The
 daemon never auto-bootstraps. Complete profile configuration first, including
 corpus/workspace, ordered injection files, restricted-file policy, owner
 surfaces, and operator identity. Ensure the service account can access the
@@ -12,9 +12,9 @@ The corpus must have no other writer. Stop the daemon and adapter before
 opening its state directory:
 
 ```sh
-sudo systemctl stop gajae-way-discord.service gajae-way.service
-sudo -u gajae-way -H /usr/local/bin/way bootstrap --confirm \
-  --state-dir /var/lib/gajae-way --profile /etc/gajae-way/profile.toml
+sudo systemctl stop gajaeway-discord.service gajaeway.service
+sudo -u gajaeway -H /usr/local/bin/gajaeway bootstrap --confirm \
+  --state-dir /var/lib/gajaeway --profile /etc/gajaeway/profile.toml
 ```
 
 The exact `--confirm` flag is mandatory. A successful command prints a JSON
@@ -28,7 +28,7 @@ The ceremony writes `CREATING { nonce, ts }` before SDK creation. Its first
 nonce-bearing message is persisted in the transcript. After two stable
 fingerprints, one durable transaction publishes the full transcript identity
 (canonical path, session ID, device/inode, link count, size, timestamps, and
-SHA-256) and the resolved profile digest. The next `way serve` can only resume
+SHA-256) and the resolved profile digest. The next `gajaeway serve` can only resume
 that exact identity.
 
 ## Interrupted ceremony recovery
@@ -52,8 +52,8 @@ cause or use the profile-approval ceremony when the reported reason is
 After a committed result, start only the configured units:
 
 ```sh
-sudo systemctl start gajae-way.service
-sudo systemctl start gajae-way-discord.service
+sudo systemctl start gajaeway.service
+sudo systemctl start gajaeway-discord.service
 ```
 
 Verify `way.health`, `way.status`, and the adapter through the operations

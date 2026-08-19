@@ -40,9 +40,9 @@ function daemonEnvironment(): NodeJS.ProcessEnv {
 	return {
 		...process.env,
 		NODE_ENV: "test",
-		WAY_E2E_FILE_SDK: "1",
-		WAY_BROKER_CLI: "/usr/bin/false",
-		WAY_RECONCILE_POLL_MS: "600000",
+		GAJAEWAY_E2E_FILE_SDK: "1",
+		GAJAEWAY_BROKER_CLI: "/usr/bin/false",
+		GAJAEWAY_RECONCILE_POLL_MS: "600000",
 	};
 }
 
@@ -118,8 +118,8 @@ async function bootstrapNativeState(root: string): Promise<{
 	return { stateDirectory, profilePath, state, sdk };
 }
 
-test("way profile approve --confirm updates a stopped daemon's bound projection", async () => {
-	const root = fs.mkdtempSync(path.join(os.tmpdir(), "gajae-way-profile-direct-"));
+test("gajaeway profile approve --confirm updates a stopped daemon's bound projection", async () => {
+	const root = fs.mkdtempSync(path.join(os.tmpdir(), "gajaeway-profile-direct-"));
 	try {
 		const setup = await bootstrapNativeState(root);
 		fs.writeFileSync(setup.profilePath, fs.readFileSync(setup.profilePath, "utf8").replace('"SOUL.md", "USER.md"', '"USER.md", "SOUL.md"'));

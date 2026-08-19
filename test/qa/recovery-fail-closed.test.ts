@@ -15,16 +15,16 @@ afterEach(async () => {
 
 
 function temporaryDirectory(name: string): string {
-	return fs.mkdtempSync(path.join(os.tmpdir(), `gajae-way-qa-${name}-`));
+	return fs.mkdtempSync(path.join(os.tmpdir(), `gajaeway-qa-${name}-`));
 }
 
 function daemonEnvironment(): NodeJS.ProcessEnv {
 	return {
 		...process.env,
 		NODE_ENV: "test",
-		WAY_E2E_FILE_SDK: "1",
-		WAY_BROKER_CLI: "/usr/bin/false",
-		WAY_RECONCILE_POLL_MS: "600000",
+		GAJAEWAY_E2E_FILE_SDK: "1",
+		GAJAEWAY_BROKER_CLI: "/usr/bin/false",
+		GAJAEWAY_RECONCILE_POLL_MS: "600000",
 	};
 }
 

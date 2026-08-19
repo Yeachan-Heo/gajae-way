@@ -255,10 +255,10 @@ test("quarantine runbook fences a live holder, records only a complete bound rec
 		expect(await run(["git", `--git-dir=${remote}`, "show", "main:reopened.txt"])).toBe("writes resumed\n");
 
 		const runbook = fs.readFileSync(path.join(repositoryRoot, "ops/runbooks/quarantine.md"), "utf8");
-		const adapterUnit = fs.readFileSync(path.join(repositoryRoot, "ops/systemd/gajae-way-discord.service"), "utf8");
-		expect(adapterUnit).toMatch(/^ConditionPathExists=!\/etc\/gajae-way\/recovery\/no-discord-ingress$/m);
-		expect(runbook).toContain("sudo install -o root -g root -m 0600 /dev/null /etc/gajae-way/recovery/no-discord-ingress");
-		expect(runbook).toContain("ConditionResult gajae-way-discord.service");
+		const adapterUnit = fs.readFileSync(path.join(repositoryRoot, "ops/systemd/gajaeway-discord.service"), "utf8");
+		expect(adapterUnit).toMatch(/^ConditionPathExists=!\/etc\/gajaeway\/recovery\/no-discord-ingress$/m);
+		expect(runbook).toContain("sudo install -o root -g root -m 0600 /dev/null /etc/gajaeway/recovery/no-discord-ingress");
+		expect(runbook).toContain("ConditionResult gajaeway-discord.service");
 		expect(runbook).toContain("gitlock.record_quarantine_receipt");
 		expect(runbook).toContain('"lease_id":"LEASE_ID","corpus":"corpus","checks"');
 		expect(runbook).toContain('"process_inspected":true');
@@ -269,7 +269,7 @@ test("quarantine runbook fences a live holder, records only a complete bound rec
 		expect(runbook).toContain('"verification_receipt_id":"RECEIPT_ID"');
 		const forceRelease = runbook.indexOf("gitlock.force_release");
 		const override = runbook.indexOf("gitlock.quarantine_override");
-		const manualGit = runbook.indexOf("git -C /srv/gajae-way/corpus status --porcelain=v1");
+		const manualGit = runbook.indexOf("git -C /srv/gajaeway/corpus status --porcelain=v1");
 		const recordReceipt = runbook.indexOf("gitlock.record_quarantine_receipt");
 		const clearQuarantine = runbook.indexOf("gitlock.clear_quarantine");
 		expect(forceRelease).toBeGreaterThanOrEqual(0);

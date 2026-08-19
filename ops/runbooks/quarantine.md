@@ -10,7 +10,7 @@ or replace a lock holder based on a timeout alone.
 The daemon must remain reachable long enough to record the durable quarantine
 override. Stop external ingress, legacy writers, and outbound jobs **after**
 the override below; do not stop the gateway before the UDS calls that establish
-the fence. Run `way_rpc` as `gajae-way` using the helper in
+the fence. Run `gajaeway_rpc` as `gajaeway` using the helper in
 [operations.md](operations.md#monitor-the-live-uds-service).
 
 ## 1. Detect the holder and set the durable write fence
@@ -18,7 +18,7 @@ the fence. Run `way_rpc` as `gajae-way` using the helper in
 Read the current lease and copy `lock.holder.lease_id` as `LEASE_ID`:
 
 ```sh
-way_rpc way.status '{}'
+gajaeway_rpc way.status '{}'
 ```
 
 Attempt normal proven-death release once. A successful release means this
@@ -26,14 +26,14 @@ runbook does not apply. Error 1207 means the holder is still alive or cannot be
 proven dead:
 
 ```sh
-way_rpc gitlock.force_release '{"lease_id":"LEASE_ID","confirm":true,"idempotency_key":"force-LEASE_ID"}'
+gajaeway_rpc gitlock.force_release '{"lease_id":"LEASE_ID","confirm":true,"idempotency_key":"force-LEASE_ID"}'
 ```
 
 Acknowledge the uncertainty and fence corpus writes:
 
 ```sh
-way_rpc gitlock.quarantine_override '{"lease_id":"LEASE_ID","confirm":true,"acknowledge_unverified":true,"idempotency_key":"quarantine-LEASE_ID"}'
-way_rpc way.status '{}'
+gajaeway_rpc gitlock.quarantine_override '{"lease_id":"LEASE_ID","confirm":true,"acknowledge_unverified":true,"idempotency_key":"quarantine-LEASE_ID"}'
+gajaeway_rpc way.status '{}'
 ```
 
 The second response must show `lock.quarantined: true` and `write_mode: false`.
@@ -42,23 +42,23 @@ fresh runtime death proof are both still required.
 
 ## 2. Stop external ingress and prepare gateway-only recovery
 
-The normal daemon unit has a `Wants=gajae-way-discord.service` edge so an
+The normal daemon unit has a `Wants=gajaeway-discord.service` edge so an
 ordinary daemon restart restores the adapter. Quarantine recovery uses the
 adapter unit's persistent, root-owned **no-ingress interlock**:
-`ConditionPathExists=!/etc/gajae-way/recovery/no-discord-ingress`. Creating the
+`ConditionPathExists=!/etc/gajaeway/recovery/no-discord-ingress`. Creating the
 marker blocks every adapter start, including the daemon's `Wants=` edge and
 automatic restart paths, until clearance removes it.
 
 ```sh
-sudo install -d -o root -g root -m 0700 /etc/gajae-way/recovery
-sudo install -o root -g root -m 0600 /dev/null /etc/gajae-way/recovery/no-discord-ingress
-sudo systemctl stop gajae-way-discord.service gajae-way.service
-if sudo systemctl is-active --quiet gajae-way-discord.service; then
+sudo install -d -o root -g root -m 0700 /etc/gajaeway/recovery
+sudo install -o root -g root -m 0600 /dev/null /etc/gajaeway/recovery/no-discord-ingress
+sudo systemctl stop gajaeway-discord.service gajaeway.service
+if sudo systemctl is-active --quiet gajaeway-discord.service; then
   echo 'Discord ingress is still active; do not continue.' >&2
   exit 1
 fi
-systemctl --no-pager status gajae-way.service gajae-way-discord.service
-pgrep -af '(^|/)(way|way-discord)( |$)' || true
+systemctl --no-pager status gajaeway.service gajaeway-discord.service
+pgrep -af '(^|/)(gajaeway|gajaeway-discord)( |$)' || true
 ```
 
 The process inspection must show no residual gateway, adapter, legacy writer,
@@ -74,10 +74,10 @@ commit, non-fast-forward history, dirty index, residual process, or push before
 recording a receipt.
 
 ```sh
-git -C /srv/gajae-way/corpus status --porcelain=v1
-git -C /srv/gajae-way/corpus fsck --full
-git -C /srv/gajae-way/corpus fetch --prune origin
-git -C /srv/gajae-way/corpus log --left-right --graph --cherry-pick origin/main...HEAD
+git -C /srv/gajaeway/corpus status --porcelain=v1
+git -C /srv/gajaeway/corpus fsck --full
+git -C /srv/gajaeway/corpus fetch --prune origin
+git -C /srv/gajaeway/corpus log --left-right --graph --cherry-pick origin/main...HEAD
 git --git-dir=/path/to/authoritative/remote.git fsck --full
 ```
 
@@ -93,11 +93,11 @@ The root-owned no-ingress marker remains in place, so this `start` may satisfy
 the daemon's normal `Wants=` edge but the adapter's condition rejects ingress:
 
 ```sh
-sudo systemctl start gajae-way.service
-sudo systemctl is-active --quiet gajae-way.service
-test "$(sudo systemctl show --value --property=ActiveState gajae-way-discord.service)" = inactive
-test "$(sudo systemctl show --value --property=ConditionResult gajae-way-discord.service)" = no
-sudo -u gajae-way -H /usr/local/bin/way --health --state-dir /var/lib/gajae-way
+sudo systemctl start gajaeway.service
+sudo systemctl is-active --quiet gajaeway.service
+test "$(sudo systemctl show --value --property=ActiveState gajaeway-discord.service)" = inactive
+test "$(sudo systemctl show --value --property=ConditionResult gajaeway-discord.service)" = no
+sudo -u gajaeway -H /usr/local/bin/gajaeway --health --state-dir /var/lib/gajaeway
 ```
 
 Do not remove the marker during this recovery phase. With the gateway-only
@@ -106,8 +106,8 @@ In v1 the sole corpus lock name is the literal string `corpus`; it is not the
 filesystem path.
 
 ```sh
-way_rpc way.status '{}'
-way_rpc gitlock.record_quarantine_receipt '{"lease_id":"LEASE_ID","corpus":"corpus","checks":{"process_inspected":true,"git_status_checked":true,"git_log_checked":true,"git_fsck_checked":true,"remote_verified":true},"idempotency_key":"quarantine-receipt-INCIDENT"}'
+gajaeway_rpc way.status '{}'
+gajaeway_rpc gitlock.record_quarantine_receipt '{"lease_id":"LEASE_ID","corpus":"corpus","checks":{"process_inspected":true,"git_status_checked":true,"git_log_checked":true,"git_fsck_checked":true,"remote_verified":true},"idempotency_key":"quarantine-receipt-INCIDENT"}'
 ```
 
 The RPC performs a fresh death proof and returns a daemon-generated
@@ -123,8 +123,8 @@ Clear exactly the generated receipt, then confirm the fence is open before the
 adapter is allowed back:
 
 ```sh
-way_rpc gitlock.clear_quarantine '{"verification_receipt_id":"RECEIPT_ID","confirm":true,"idempotency_key":"clear-INCIDENT"}'
-way_rpc way.status '{}'
+gajaeway_rpc gitlock.clear_quarantine '{"verification_receipt_id":"RECEIPT_ID","confirm":true,"idempotency_key":"clear-INCIDENT"}'
+gajaeway_rpc way.status '{}'
 ```
 
 The final status must show `lock.quarantined: false` and `write_mode: true`.
@@ -136,10 +136,10 @@ Only after that status check succeeds, restore external ingress by removing the
 root-owned interlock and starting the adapter:
 
 ```sh
-sudo rm -f /etc/gajae-way/recovery/no-discord-ingress
-sudo rmdir /etc/gajae-way/recovery 2>/dev/null || true
-sudo systemctl start gajae-way-discord.service
-sudo systemctl is-active --quiet gajae-way-discord.service
+sudo rm -f /etc/gajaeway/recovery/no-discord-ingress
+sudo rmdir /etc/gajaeway/recovery 2>/dev/null || true
+sudo systemctl start gajaeway-discord.service
+sudo systemctl is-active --quiet gajaeway-discord.service
 ```
 
 Retain the 1207 response, quarantine override, manual Git command evidence,

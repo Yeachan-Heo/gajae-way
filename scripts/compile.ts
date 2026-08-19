@@ -2,7 +2,7 @@ import * as fs from "node:fs/promises";
 import * as path from "node:path";
 
 type Executable = {
-	name: "way" | "way-discord";
+	name: "gajaeway" | "gajaeway-discord";
 	entrypoint: string;
 };
 
@@ -18,8 +18,8 @@ const bunTargets: Record<string, string> = {
 	"linux-arm64": "bun-linux-arm64",
 };
 const executables: readonly Executable[] = [
-	{ name: "way", entrypoint: "src/main.ts" },
-	{ name: "way-discord", entrypoint: "src/adapter/discord/main.ts" },
+	{ name: "gajaeway", entrypoint: "src/main.ts" },
+	{ name: "gajaeway-discord", entrypoint: "src/adapter/discord/main.ts" },
 ];
 
 if (!bunTargets[platformTag]) {
@@ -93,6 +93,9 @@ async function compileExecutable(executable: Executable): Promise<void> {
 
 await ensureNativeAddon();
 await fs.mkdir(distDir, { recursive: true });
+await Promise.all(
+	(await fs.readdir(distDir)).filter((entry) => entry.startsWith("way")).map((entry) => fs.rm(path.join(distDir, entry), { force: true, recursive: true })),
+);
 for (const executable of executables) {
 	console.log(`Compiling ${executable.name} for ${platformTag}…`);
 	await compileExecutable(executable);

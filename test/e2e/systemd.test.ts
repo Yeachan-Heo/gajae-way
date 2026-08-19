@@ -75,7 +75,7 @@ function expectWords(unit: ParsedUnit, section: string, directive: string, expec
 }
 
 function temporaryDirectory(name: string): string {
-	const directory = fs.mkdtempSync(path.join(os.tmpdir(), `gajae-way-${name}-`));
+	const directory = fs.mkdtempSync(path.join(os.tmpdir(), `gajaeway-${name}-`));
 	temporaryDirectories.push(directory);
 	return directory;
 }
@@ -99,16 +99,16 @@ function e2eEnvironment(): NodeJS.ProcessEnv {
 	return {
 		...process.env,
 		NODE_ENV: "test",
-		WAY_E2E_FILE_SDK: "1",
-		WAY_BROKER_CLI: "/usr/bin/false",
-		WAY_RECONCILE_POLL_MS: "600000",
+		GAJAEWAY_E2E_FILE_SDK: "1",
+		GAJAEWAY_BROKER_CLI: "/usr/bin/false",
+		GAJAEWAY_RECONCILE_POLL_MS: "600000",
 	};
 }
 
 function compiledWay(): string {
-	const executable = path.join(repositoryRoot, "dist", "way");
+	const executable = path.join(repositoryRoot, "dist", "gajaeway");
 	if (!fs.existsSync(executable)) {
-		throw new Error("The supervised restart drill requires dist/way. Run bun scripts/compile.ts before bun test.");
+		throw new Error("The supervised restart drill requires dist/gajaeway. Run bun scripts/compile.ts before bun test.");
 	}
 	return executable;
 }
@@ -248,7 +248,7 @@ class SupervisedService {
 		if (this.#daemon !== daemon) return;
 		await stopAdapter(this.#adapter);
 		this.#adapter = undefined;
-		if (this.#stopping || exitCode === 0 || restartPrevented(parseUnit("ops/systemd/gajae-way.service"), exitCode)) return;
+		if (this.#stopping || exitCode === 0 || restartPrevented(parseUnit("ops/systemd/gajaeway.service"), exitCode)) return;
 		try {
 			await this.startGeneration();
 		} catch (error) {
@@ -277,24 +277,24 @@ function restartPrevented(unit: ParsedUnit, exitCode: number): boolean {
 }
 
 test("systemd units declare the required hardened daemon and bound adapter contract", () => {
-	const daemon = parseUnit("ops/systemd/gajae-way.service");
-	const adapter = parseUnit("ops/systemd/gajae-way-discord.service");
+	const daemon = parseUnit("ops/systemd/gajaeway.service");
+	const adapter = parseUnit("ops/systemd/gajaeway-discord.service");
 
 	expectValue(daemon, "Unit", "StartLimitIntervalSec", "60s");
 	expectValue(daemon, "Unit", "StartLimitBurst", "3");
 	expectValue(daemon, "Service", "Type", "notify");
 	expectValue(daemon, "Service", "NotifyAccess", "main");
 	expectValue(daemon, "Service", "TimeoutStartSec", "6min");
-	expectValue(daemon, "Service", "User", "gajae-way");
-	expectValue(daemon, "Service", "Group", "gajae-way");
-	expectValue(daemon, "Service", "WorkingDirectory", "/var/lib/gajae-way");
-	expectValue(daemon, "Service", "Environment", "WAY_STATE_DIR=/var/lib/gajae-way");
-	expectValue(daemon, "Service", "Environment", "WAY_PROFILE=/etc/gajae-way/profile.toml");
+	expectValue(daemon, "Service", "User", "gajaeway");
+	expectValue(daemon, "Service", "Group", "gajaeway");
+	expectValue(daemon, "Service", "WorkingDirectory", "/var/lib/gajaeway");
+	expectValue(daemon, "Service", "Environment", "GAJAEWAY_STATE_DIR=/var/lib/gajaeway");
+	expectValue(daemon, "Service", "Environment", "GAJAEWAY_PROFILE=/etc/gajaeway/profile.toml");
 
 	expectValue(daemon, "Service", "UMask", "0077");
-	expectValue(daemon, "Service", "RuntimeDirectory", "gajae-way");
+	expectValue(daemon, "Service", "RuntimeDirectory", "gajaeway");
 	expectValue(daemon, "Service", "RuntimeDirectoryMode", "0700");
-	expectValue(daemon, "Service", "StateDirectory", "gajae-way");
+	expectValue(daemon, "Service", "StateDirectory", "gajaeway");
 	expectValue(daemon, "Service", "StateDirectoryMode", "0700");
 	expectValue(daemon, "Service", "NoNewPrivileges", "yes");
 	expectValue(daemon, "Service", "ProtectSystem", "strict");
@@ -310,25 +310,25 @@ test("systemd units declare the required hardened daemon and bound adapter contr
 	expectValue(daemon, "Service", "KillMode", "mixed");
 	expectValue(daemon, "Service", "Restart", "on-failure");
 	expectValue(daemon, "Service", "RestartSec", "5s");
-	expectWords(daemon, "Unit", "Wants", ["network-online.target", "gajae-way-discord.service"]);
-	expectValue(daemon, "Unit", "Before", "gajae-way-discord.service");
+	expectWords(daemon, "Unit", "Wants", ["network-online.target", "gajaeway-discord.service"]);
+	expectValue(daemon, "Unit", "Before", "gajaeway-discord.service");
 
 	expectValue(daemon, "Service", "RestartPreventExitStatus", "78");
-	expectValue(daemon, "Service", "ExecStart", "/usr/local/bin/way serve --state-dir /var/lib/gajae-way --profile /etc/gajae-way/profile.toml");
-	expectWords(daemon, "Service", "ReadWritePaths", ["/var/lib/gajae-way", "/srv/gajae-way/corpus", "/srv/gajae-way/workspace"]);
+	expectValue(daemon, "Service", "ExecStart", "/usr/local/bin/gajaeway serve --state-dir /var/lib/gajaeway --profile /etc/gajaeway/profile.toml");
+	expectWords(daemon, "Service", "ReadWritePaths", ["/var/lib/gajaeway", "/srv/gajaeway/corpus", "/srv/gajaeway/workspace"]);
 
-	expectValue(adapter, "Unit", "Requires", "gajae-way.service");
-	expectValue(adapter, "Unit", "BindsTo", "gajae-way.service");
-	expectValue(adapter, "Unit", "PartOf", "gajae-way.service");
-	expectWords(adapter, "Unit", "After", ["network-online.target", "gajae-way.service"]);
+	expectValue(adapter, "Unit", "Requires", "gajaeway.service");
+	expectValue(adapter, "Unit", "BindsTo", "gajaeway.service");
+	expectValue(adapter, "Unit", "PartOf", "gajaeway.service");
+	expectWords(adapter, "Unit", "After", ["network-online.target", "gajaeway.service"]);
 	expectValue(adapter, "Unit", "StartLimitIntervalSec", "60s");
 	expectValue(adapter, "Unit", "StartLimitBurst", "3");
 	expectValue(adapter, "Service", "Type", "simple");
-	expectValue(adapter, "Service", "User", "gajae-way");
-	expectValue(adapter, "Service", "Group", "gajae-way");
+	expectValue(adapter, "Service", "User", "gajaeway");
+	expectValue(adapter, "Service", "Group", "gajaeway");
 	expectValue(adapter, "Service", "UMask", "0077");
-	expectValue(adapter, "Service", "Environment", "WAY_STATE_DIR=/var/lib/gajae-way");
-	expectValue(adapter, "Service", "Environment", "WAY_PROFILE=/etc/gajae-way/profile.toml");
+	expectValue(adapter, "Service", "Environment", "GAJAEWAY_STATE_DIR=/var/lib/gajaeway");
+	expectValue(adapter, "Service", "Environment", "GAJAEWAY_PROFILE=/etc/gajaeway/profile.toml");
 	expectValue(adapter, "Service", "NoNewPrivileges", "yes");
 	expectValue(adapter, "Service", "PrivateTmp", "yes");
 	expectValue(adapter, "Service", "ProtectSystem", "strict");
@@ -342,16 +342,16 @@ test("systemd units declare the required hardened daemon and bound adapter contr
 	expectValue(adapter, "Service", "KillMode", "mixed");
 	expectValue(adapter, "Service", "MemoryMax", "512M");
 	expectValue(adapter, "Service", "TasksMax", "128");
-	expectValue(adapter, "Service", "LoadCredential", "discord-token:/etc/gajae-way/credentials/discord-token");
-	expectValue(adapter, "Service", "Environment", "WAY_DISCORD_TOKEN_FILE=%d/discord-token");
+	expectValue(adapter, "Service", "LoadCredential", "discord-token:/etc/gajaeway/credentials/discord-token");
+	expectValue(adapter, "Service", "Environment", "GAJAEWAY_DISCORD_TOKEN_FILE=%d/discord-token");
 	expect(adapter.source).toContain("mode 0600");
-	expectValue(adapter, "Service", "ExecStart", "/usr/local/bin/way-discord --state-dir /var/lib/gajae-way --profile /etc/gajae-way/profile.toml");
+	expectValue(adapter, "Service", "ExecStart", "/usr/local/bin/gajaeway-discord --state-dir /var/lib/gajaeway --profile /etc/gajaeway/profile.toml");
 	expectWords(adapter, "Service", "RestrictAddressFamilies", ["AF_UNIX", "AF_INET", "AF_INET6"]);
-	expectValue(adapter, "Service", "ReadOnlyPaths", "/var/lib/gajae-way");
+	expectValue(adapter, "Service", "ReadOnlyPaths", "/var/lib/gajaeway");
 
 	const mainSource = fs.readFileSync(path.join(repositoryRoot, "src/main.ts"), "utf8");
 	const notifySource = fs.readFileSync(path.join(repositoryRoot, "crates/way-core/src/systemd.rs"), "utf8");
-	expect(mainSource).toContain('core.sdNotifyReady("gajae-way running")');
+	expect(mainSource).toContain('core.sdNotifyReady("gajaeway running")');
 	expect(notifySource).toContain("READY=1\\nSTATUS=");
 });
 
@@ -366,8 +366,8 @@ test("example profile covers the identity projection, mutable tunables, and Disc
 	const adapter = loadDiscordAdapterConfig({
 		profile,
 		profilePath,
-		stateDir: "/var/lib/gajae-way",
-		environment: { WAY_DISCORD_BOT_TOKEN: "fixture-token" },
+		stateDir: "/var/lib/gajaeway",
+		environment: { GAJAEWAY_DISCORD_BOT_TOKEN: "fixture-token" },
 	});
 	expect(adapter).toMatchObject({ route: { channelId: "123456789012345678", surfaceId: "discord:owner-dm" }, ackBudgetMs: 2000, claimTtlMs: 5000, readWaitMs: 1000 });
 });
@@ -419,7 +419,7 @@ test("supervised daemon restart restores the PartOf-bound fixture adapter and co
 			environment,
 		);
 		expect(failClosed.exitCode, failClosed.stderr).toBe(78);
-		expect(restartPrevented(parseUnit("ops/systemd/gajae-way.service"), failClosed.exitCode)).toBe(true);
+		expect(restartPrevented(parseUnit("ops/systemd/gajaeway.service"), failClosed.exitCode)).toBe(true);
 	} finally {
 		await service?.stop();
 	}

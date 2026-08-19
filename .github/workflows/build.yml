@@ -58,4 +58,4 @@ jobs:
     container: rust:latest
     steps:
       - uses: actions/checkout@v4
-      - run: WAY_CORE_CROSS_UID_TEST=1 cargo test -p way-core rpc::auth::tests::linux_second_os_user_is_rejected_by_real_so_peercred_when_enabled -- --exact
+      - run: GAJAEWAY_CORE_CROSS_UID_TEST=1 cargo test -p way-core rpc::auth::tests::linux_second_os_user_is_rejected_by_real_so_peercred_when_enabled -- --exact

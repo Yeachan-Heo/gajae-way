@@ -180,9 +180,9 @@ test("Discord fixture inbound uses message-id idempotency, acknowledges before e
 		const delivery = outbox(gateway.client, fixture);
 		expect(await delivery.runOnce()).toBe("sent");
 		expect(fixture.sends).toEqual([
-			expect.objectContaining({ channelId: "123456789012345678", text: "ack", nonce: "way-discord:discord:owner-dm:2" }),
+			expect.objectContaining({ channelId: "123456789012345678", text: "ack", nonce: "gajaeway-discord:discord:owner-dm:2" }),
 		]);
-		expect(gateway.core.consumerCursor("way-discord")).toBe("1:3");
+		expect(gateway.core.consumerCursor("gajaeway-discord")).toBe("1:3");
 	} finally {
 		await fixture.disconnect();
 		await gateway.stop();
@@ -299,15 +299,15 @@ test("Discord egress sends before settlement and a normal restart does not repos
 		let cursorAtSend: string | undefined;
 		const first = outbox(gateway.client, fixture, {
 			beforeSend: () => {
-				cursorAtSend = gateway.core.consumerCursor("way-discord");
+				cursorAtSend = gateway.core.consumerCursor("gajaeway-discord");
 			},
 		});
 		expect(await first.runOnce()).toBe("sent");
 		expect(cursorAtSend).toBe("1:0");
 		expect(fixture.sends).toHaveLength(1);
-		expect(gateway.core.consumerCursor("way-discord")).toBe(appended.cursor);
-		expect(gateway.core.consumerOutbox("way-discord")).toEqual([
-			expect.objectContaining({ seq: appended.seq, state: "sent", platformMsgId: "discord-send-1", dedupeKey: "way-discord:discord:owner-dm:1" }),
+		expect(gateway.core.consumerCursor("gajaeway-discord")).toBe(appended.cursor);
+		expect(gateway.core.consumerOutbox("gajaeway-discord")).toEqual([
+			expect.objectContaining({ seq: appended.seq, state: "sent", platformMsgId: "discord-send-1", dedupeKey: "gajaeway-discord:discord:owner-dm:1" }),
 		]);
 
 		const restarted = outbox(gateway.client, fixture);
@@ -329,13 +329,13 @@ test("crash before Discord send leaves the server checkpoint and resumes from it
 		const interrupted = outbox(gateway.client, fixture, { beforeSend: () => abort.abort() });
 		await expect(interrupted.runOnce(abort.signal)).rejects.toMatchObject({ name: "AbortError" });
 		expect(fixture.sends).toHaveLength(0);
-		expect(gateway.core.consumerCursor("way-discord")).toBe("1:0");
+		expect(gateway.core.consumerCursor("gajaeway-discord")).toBe("1:0");
 
 		await Bun.sleep(5_100);
 		const restarted = outbox(gateway.client, fixture);
 		expect(await restarted.runOnce()).toBe("sent");
 		expect(fixture.sends).toHaveLength(1);
-		expect(gateway.core.consumerCursor("way-discord")).toBe(appended.cursor);
+		expect(gateway.core.consumerCursor("gajaeway-discord")).toBe(appended.cursor);
 	} finally {
 		await fixture.disconnect();
 		await gateway.stop();
@@ -352,7 +352,7 @@ test("crash after Discord send but before commit is bounded by nonce dedupe on r
 		const interrupted = outbox(gateway.client, fixture, { afterSendBeforeCommit: () => abort.abort() });
 		await expect(interrupted.runOnce(abort.signal)).rejects.toMatchObject({ name: "AbortError" });
 		expect(fixture.sends).toHaveLength(1);
-		expect(gateway.core.consumerCursor("way-discord")).toBe("1:0");
+		expect(gateway.core.consumerCursor("gajaeway-discord")).toBe("1:0");
 
 		await Bun.sleep(5_100);
 		const restarted = outbox(gateway.client, fixture);
@@ -360,16 +360,16 @@ test("crash after Discord send but before commit is bounded by nonce dedupe on r
 		expect(fixture.sends).toHaveLength(1);
 		expect(fixture.sendAttempts).toEqual([
 			expect.objectContaining({ duplicate: false }),
-			expect.objectContaining({ duplicate: true, nonce: "way-discord:discord:owner-dm:1" }),
+			expect.objectContaining({ duplicate: true, nonce: "gajaeway-discord:discord:owner-dm:1" }),
 		]);
-		expect(gateway.core.consumerCursor("way-discord")).toBe(appended.cursor);
+		expect(gateway.core.consumerCursor("gajaeway-discord")).toBe(appended.cursor);
 	} finally {
 		await fixture.disconnect();
 		await gateway.stop();
 	}
 }, 15_000);
 
-test("way-discord --check validates the configured token with mocked REST and gateway health", async () => {
+test("gajaeway-discord --check validates the configured token with mocked REST and gateway health", async () => {
 	const root = temporaryDirectory("check");
 	const corpus = path.join(root, "corpus");
 	const workspace = path.join(root, "workspace");
@@ -390,7 +390,7 @@ api_base_url = "https://discord.test/api/v10"
 `,
 		),
 	);
-	const environment = { TEST_DISCORD_TOKEN: "test-token", WAY_PROFILE: profilePath } as NodeJS.ProcessEnv;
+	const environment = { TEST_DISCORD_TOKEN: "test-token", GAJAEWAY_PROFILE: profilePath } as NodeJS.ProcessEnv;
 	const config = loadDiscordAdapterConfig({ environment, profilePath, stateDir: path.join(root, "state") });
 	const calls: string[] = [];
 	const rpc = {

@@ -128,7 +128,7 @@ function nativeClosureError(error: unknown): ClosureError {
 
 function workerEntrypoint(): string[] {
 	const sourceEntrypoint = fileURLToPath(new URL("../main.ts", import.meta.url));
-	// Tests and source-mode development run Bun itself. A compiled `way` binary
+	// Tests and source-mode development run Bun itself. A compiled `gajaeway` binary
 	// re-execs itself, where the environment flag selects the hidden worker path.
 	if (path.basename(process.execPath).startsWith("bun") && fs.existsSync(sourceEntrypoint)) {
 		return [process.execPath, sourceEntrypoint];
@@ -169,7 +169,7 @@ class ClosureWorker {
 		const command = workerEntrypoint();
 		const child = spawn(command[0] as string, command.slice(1), {
 			detached: true,
-			env: { ...process.env, WAY_INTERNAL_CLOSURE_WORKER: "1" },
+			env: { ...process.env, GAJAEWAY_INTERNAL_CLOSURE_WORKER: "1" },
 			stdio: ["pipe", "pipe", "pipe"],
 		});
 		const worker = new ClosureWorker(child);

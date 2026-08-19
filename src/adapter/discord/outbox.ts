@@ -7,7 +7,7 @@ import type { JsonRpcClient } from "../../rpc-client";
 import type { DiscordPlatform } from "./platform";
 import type { DiscordRoute } from "./route";
 
-export const DISCORD_CONSUMER_ID = "way-discord";
+export const DISCORD_CONSUMER_ID = "gajaeway-discord";
 export const DEFAULT_DISCORD_CLAIM_TTL_MS = 5_000;
 export const DEFAULT_DISCORD_READ_WAIT_MS = 1_000;
 
@@ -88,7 +88,7 @@ export class DiscordOutbox {
 		this.#hooks = options.hooks ?? {};
 		this.#idleDelayMs = boundedInteger(options.idleDelayMs ?? 50, "idleDelayMs", 0, 60_000);
 		this.#retryDelayMs = boundedInteger(options.retryDelayMs ?? 250, "retryDelayMs", 0, 60_000);
-		this.#onError = options.onError ?? (error => console.error(`way-discord outbox failed: ${error.message}`));
+		this.#onError = options.onError ?? (error => console.error(`gajaeway-discord outbox failed: ${error.message}`));
 		this.#consumer = new RpcJournalConsumer({
 			rpc: options.rpc,
 			consumerId,
@@ -136,7 +136,7 @@ export class DiscordOutbox {
 }
 
 export function discordDedupeKey(surfaceId: string, seq: string): string {
-	return `way-discord:${surfaceId}:${seq}`;
+	return `gajaeway-discord:${surfaceId}:${seq}`;
 }
 
 function eventToOutboxItem(event: RpcJournalEvent, route: DiscordRoute, cursor: string): DiscordOutboxItem {

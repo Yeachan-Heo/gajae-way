@@ -6,8 +6,8 @@ import type { WayConfig } from "../config";
 import { loadWayProfile, type WayProfile } from "../profile";
 import { RpcClient, rpcResult, type JsonRpcClient } from "../rpc-client";
 
-export const WAY_CONSOLE_CONSUMER_ID = "way-console";
-export const WAY_CONSOLE_EVENT_KINDS = [
+export const GAJAEWAY_CONSOLE_CONSUMER_ID = "gajaeway-console";
+export const GAJAEWAY_CONSOLE_EVENT_KINDS = [
 	"assistant_message",
 	"turn_start",
 	"turn_end",
@@ -25,7 +25,7 @@ export const MAX_RAW_CONSOLE_QUEUED_LINES = 16;
 export const MAX_RAW_CONSOLE_QUEUED_BYTES = 64 * 1024;
 export const MAX_RAW_CONSOLE_LINE_BYTES = 8 * 1024;
 
-export type WayConsoleEventKind = (typeof WAY_CONSOLE_EVENT_KINDS)[number];
+export type WayConsoleEventKind = (typeof GAJAEWAY_CONSOLE_EVENT_KINDS)[number];
 export type ConsoleConsumerRunResult = "rendered" | "idle";
 type RecordValue = Record<string, unknown>;
 type ConsoleWrite = (text: string) => void | Promise<void>;
@@ -335,7 +335,7 @@ export function resolveConsoleOwnerSurface(profile: WayProfile, requestedSurface
 	}
 	if (profile.ownerSurfaces.length === 1) return profile.ownerSurfaces[0]?.id as string;
 	throw new WayConsoleError(
-		"The profile defines multiple owner surfaces; pass way console --surface-id <configured-owner-surface-id>.",
+		"The profile defines multiple owner surfaces; pass gajaeway console --surface-id <configured-owner-surface-id>.",
 	);
 }
 
@@ -345,7 +345,7 @@ export class ConsoleEventConsumer {
 	readonly #idleDelayMs: number;
 
 	constructor(options: ConsoleEventConsumerOptions) {
-		const consumerId = options.consumerId ?? WAY_CONSOLE_CONSUMER_ID;
+		const consumerId = options.consumerId ?? GAJAEWAY_CONSOLE_CONSUMER_ID;
 		const claimTtlMs = boundedInteger(options.claimTtlMs ?? DEFAULT_CONSOLE_CLAIM_TTL_MS, "claimTtlMs", 5_000, 600_000);
 		const readWaitMs = boundedInteger(options.readWaitMs ?? DEFAULT_CONSOLE_READ_WAIT_MS, "readWaitMs", 0, 60_000);
 		if (readWaitMs >= claimTtlMs) throw new WayConsoleError("readWaitMs must be shorter than claimTtlMs.");
@@ -355,13 +355,13 @@ export class ConsoleEventConsumer {
 			consumerId,
 			claimTtlMs,
 			readWaitMs,
-			kinds: WAY_CONSOLE_EVENT_KINDS,
+			kinds: GAJAEWAY_CONSOLE_EVENT_KINDS,
 			now: options.now,
 			releaseOnAbort: true,
 			errorFactory: (message) => new ConsoleDeliveryUnavailableError(message),
 			gapError: (gap) =>
 				new ConsoleDeliveryUnavailableError(
-					`Console checkpoint ${gap.checkpoint} is behind journal retention. Interactive delivery is disabled; use the supported gateway journal-repair procedure to resync at ${gap.resyncCursor}, then restart way console.`,
+					`Console checkpoint ${gap.checkpoint} is behind journal retention. Interactive delivery is disabled; use the supported gateway journal-repair procedure to resync at ${gap.resyncCursor}, then restart gajaeway console.`,
 				),
 			publish: async (event) => {
 				const consoleEvent = toConsoleEvent(event);
@@ -382,7 +382,7 @@ export class ConsoleEventConsumer {
 			const result = await this.#consumer.runOnce(signal);
 			if (result === "claim_held") {
 				throw new ConsoleDeliveryUnavailableError(
-					"Another way console currently owns the way-console journal claim. Close that console or wait for its server-side claim to expire before retrying; no owner input was accepted.",
+					"Another gajaeway console currently owns the gajaeway-console journal claim. Close that console or wait for its server-side claim to expire before retrying; no owner input was accepted.",
 				);
 			}
 			return result === "published" ? "rendered" : "idle";
@@ -709,7 +709,7 @@ export async function runWayConsole(
 				signal: input.signal,
 				reportOutstanding: async (count) =>
 					await output.writeFrame(
-						`Exit requested; ${count} console operation${count === 1 ? " is" : "s are"} still outstanding. Results will remain available through the journal at the way-console consumer checkpoint.\n`,
+						`Exit requested; ${count} console operation${count === 1 ? " is" : "s are"} still outstanding. Results will remain available through the journal at the gajaeway-console consumer checkpoint.\n`,
 					),
 			});
 		} catch (error) {
@@ -781,7 +781,7 @@ async function readConsoleInput(
 				await waitForInputSlot(inFlight, [options.signal, exit.signal]);
 			}
 			if (stopped || options.signal?.aborted || exit.signal.aborted) break;
-			const line = await terminal.readLine("way> ");
+			const line = await terminal.readLine("gajaeway> ");
 			if (line === undefined) break;
 			const command = line.trim();
 			if (command === "/quit" || command === "/exit") break;
@@ -908,7 +908,7 @@ export class RawConsoleTerminal implements ConsoleTerminal {
 		this.#input = options.input ?? stdin;
 		this.#output = options.output ?? stdout;
 		if (!this.#input.isTTY || !this.#output.isTTY || !this.#input.setRawMode) {
-			throw new WayConsoleError("way console requires an interactive TTY on stdin and stdout.");
+			throw new WayConsoleError("gajaeway console requires an interactive TTY on stdin and stdout.");
 		}
 		this.#input.setEncoding("utf8");
 		this.#input.setRawMode(true);
@@ -1232,10 +1232,10 @@ function parseConsoleArguments(arguments_: readonly string[]): string | undefine
 	let surfaceId: string | undefined;
 	for (let index = 0; index < arguments_.length; index += 1) {
 		const argument = arguments_[index];
-		if (argument !== "--surface-id") throw new WayConsoleError(`Unknown way console argument: ${argument}`);
-		if (surfaceId) throw new WayConsoleError("way console --surface-id may only be supplied once.");
+		if (argument !== "--surface-id") throw new WayConsoleError(`Unknown gajaeway console argument: ${argument}`);
+		if (surfaceId) throw new WayConsoleError("gajaeway console --surface-id may only be supplied once.");
 		const value = arguments_[index + 1];
-		if (!value?.trim()) throw new WayConsoleError("way console --surface-id requires a value.");
+		if (!value?.trim()) throw new WayConsoleError("gajaeway console --surface-id requires a value.");
 		surfaceId = value;
 		index += 1;
 	}
@@ -1276,7 +1276,7 @@ function parseGateCommand(command: string): { gateId: string; expectedSessionId:
 }
 
 function toConsoleEvent(event: RpcJournalEvent): ConsoleEventFrame {
-	if (!WAY_CONSOLE_EVENT_KINDS.includes(event.kind as WayConsoleEventKind)) {
+	if (!GAJAEWAY_CONSOLE_EVENT_KINDS.includes(event.kind as WayConsoleEventKind)) {
 		throw new ConsoleDeliveryUnavailableError(
 			`main.events.read returned an unsupported console event kind: ${event.kind}`,
 		);

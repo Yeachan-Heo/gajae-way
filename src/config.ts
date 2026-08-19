@@ -21,11 +21,12 @@ export class ConfigValidationError extends Error {
 /** Process-level paths and liveness tuning; profile identity lives in profile.ts. */
 export function defaultConfig(environment: NodeJS.ProcessEnv = process.env): WayConfig {
 	return {
-		stateDir: path.resolve(environment.WAY_STATE_DIR || path.join(os.homedir(), ".local", "state", "gajae-way")),
-		profilePath: path.resolve(environment.WAY_PROFILE || "ops/profiles/gaebal-gajae.example.toml"),
-		failClosedLingerMs: parseLingerMs(environment.WAY_FAIL_CLOSED_LINGER_MS, "WAY_FAIL_CLOSED_LINGER_MS") ?? DEFAULT_FAIL_CLOSED_LINGER_MS,
-		brokerCliPath: environment.WAY_BROKER_CLI?.trim() || "gjc",
-		reconcilePollMs: parsePositiveMs(environment.WAY_RECONCILE_POLL_MS, "WAY_RECONCILE_POLL_MS") ?? 15_000,
+		stateDir: path.resolve(environment.GAJAEWAY_STATE_DIR || path.join(os.homedir(), ".local", "state", "gajaeway")),
+		profilePath: path.resolve(environment.GAJAEWAY_PROFILE || "ops/profiles/gaebal-gajae.example.toml"),
+		failClosedLingerMs:
+			parseLingerMs(environment.GAJAEWAY_FAIL_CLOSED_LINGER_MS, "GAJAEWAY_FAIL_CLOSED_LINGER_MS") ?? DEFAULT_FAIL_CLOSED_LINGER_MS,
+		brokerCliPath: environment.GAJAEWAY_BROKER_CLI?.trim() || "gjc",
+		reconcilePollMs: parsePositiveMs(environment.GAJAEWAY_RECONCILE_POLL_MS, "GAJAEWAY_RECONCILE_POLL_MS") ?? 15_000,
 	};
 }
 

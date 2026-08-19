@@ -317,7 +317,7 @@ export class DiscordGatewayPlatform implements DiscordPlatform {
 			d: {
 				token: this.#token,
 				intents: DIRECT_MESSAGES_INTENT | MESSAGE_CONTENT_INTENT,
-				properties: { os: process.platform, browser: "gajae-way", device: "gajae-way" },
+				properties: { os: process.platform, browser: "gajaeway", device: "gajaeway" },
 			},
 		});
 	}
@@ -338,7 +338,7 @@ export class DiscordGatewayPlatform implements DiscordPlatform {
 		if (!message) return;
 		for (const callback of this.#handlers) {
 			Promise.resolve(callback(message)).catch(error => {
-				console.error(`way-discord message handler failed: ${error instanceof Error ? error.message : String(error)}`);
+				console.error(`gajaeway-discord message handler failed: ${error instanceof Error ? error.message : String(error)}`);
 			});
 		}
 	}

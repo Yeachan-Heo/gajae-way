@@ -10,7 +10,7 @@ import { GatewayStateStore } from "../../src/main-session/state";
 import { loadWayProfile } from "../../src/profile";
 import { MemoryGatewayMeta } from "../helpers/main-session";
 
-const runIntegration = Bun.env.WAY_SDK_INTEGRATION === "1";
+const runIntegration = Bun.env.GAJAEWAY_SDK_INTEGRATION === "1";
 
 function fixtureModel(baseUrl: string): NonNullable<PublishedSdkOptions["model"]> {
 	return {

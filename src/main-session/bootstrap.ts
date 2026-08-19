@@ -159,7 +159,7 @@ function assertBootstrapIdentity(sessionId: string, identity: SessionFingerprint
  * the final file identity and profile digest.
  */
 export async function bootstrapMainSession(options: BootstrapOptions): Promise<BootstrapSuccess> {
-	if (!options.confirm) throw new BootstrapError("confirmation_required", "way bootstrap requires --confirm.");
+	if (!options.confirm) throw new BootstrapError("confirmation_required", "gajaeway bootstrap requires --confirm.");
 	const current = options.state.read();
 	if (current.bootstrapState !== "ABSENT") {
 		throw new BootstrapError("bootstrap_state_not_absent", `Cannot bootstrap while state is ${current.bootstrapState}.`);

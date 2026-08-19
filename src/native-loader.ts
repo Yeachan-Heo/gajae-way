@@ -256,7 +256,7 @@ function materializeEmbeddedAddon(): string {
 		throw new Error(`Embedded ${embeddedAddon.filename} cannot run on ${platformTag()}.`);
 	}
 
-	const cacheDir = path.join(os.tmpdir(), "gajae-way", "native", embeddedAddon.version, embeddedAddon.platformTag);
+	const cacheDir = path.join(os.tmpdir(), "gajaeway", "native", embeddedAddon.version, embeddedAddon.platformTag);
 	const targetPath = path.join(cacheDir, embeddedAddon.filename);
 	const sourceSize = fs.statSync(embeddedAddon.filePath).size;
 	try {

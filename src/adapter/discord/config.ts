@@ -4,7 +4,7 @@ import { defaultConfig } from "../../config";
 import { loadWayProfile, type CanonicalValue, type WayProfile } from "../../profile";
 import type { DiscordRoute } from "./route";
 
-export const DEFAULT_DISCORD_TOKEN_ENV = "WAY_DISCORD_BOT_TOKEN";
+export const DEFAULT_DISCORD_TOKEN_ENV = "GAJAEWAY_DISCORD_BOT_TOKEN";
 
 export interface DiscordAdapterConfig {
 	readonly rpcSocketPath: string;
@@ -46,13 +46,13 @@ export function loadDiscordAdapterConfig(options: LoadDiscordAdapterConfigOption
 	const routeTable = optionalRecord(adapter.route, "adapter.discord.route") ?? {};
 	validateKnownFields(routeTable, ["channel_id", "owner_dm_channel_id", "surface_id", "owner_surface_id"], "adapter.discord.route");
 	const channelId = envOrString(
-		environment.WAY_DISCORD_CHANNEL_ID,
+		environment.GAJAEWAY_DISCORD_CHANNEL_ID,
 		firstString(routeTable, ["channel_id", "owner_dm_channel_id"], "adapter.discord.route") ??
 			firstString(adapter, ["channel_id", "owner_dm_channel_id"], "adapter.discord"),
 		"Discord channel id",
 	);
 	const surfaceId = envOrString(
-		environment.WAY_DISCORD_SURFACE_ID,
+		environment.GAJAEWAY_DISCORD_SURFACE_ID,
 		firstString(routeTable, ["surface_id", "owner_surface_id"], "adapter.discord.route") ??
 			firstString(adapter, ["surface_id", "owner_surface_id"], "adapter.discord"),
 		"Discord surface id",
@@ -66,7 +66,7 @@ export function loadDiscordAdapterConfig(options: LoadDiscordAdapterConfigOption
 	const token = resolveToken(adapter, environment, path.dirname(profile.sourcePath));
 	const configuredSocket = firstString(adapter, ["rpc_socket", "rpc_socket_path"], "adapter.discord");
 	const stateDir = options.stateDir ?? processConfig.stateDir;
-	const rpcSocketPath = path.resolve(environment.WAY_DISCORD_RPC_SOCKET?.trim() || configuredSocket || path.join(stateDir, "rpc.sock"));
+	const rpcSocketPath = path.resolve(environment.GAJAEWAY_DISCORD_RPC_SOCKET?.trim() || configuredSocket || path.join(stateDir, "rpc.sock"));
 	const ackBudgetMs = optionalInteger(adapter.ack_budget_ms, "adapter.discord.ack_budget_ms", 1, 60_000) ?? 2_000;
 	const claimTtlMs = optionalInteger(adapter.claim_ttl_ms, "adapter.discord.claim_ttl_ms", 5_000, 600_000) ?? 5_000;
 	const readWaitMs = optionalInteger(adapter.read_wait_ms, "adapter.discord.read_wait_ms", 0, 60_000) ?? 1_000;
@@ -121,8 +121,8 @@ function resolveToken(adapter: Record<string, CanonicalValue>, environment: Node
 	if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(tokenEnv)) {
 		throw new DiscordAdapterConfigError("adapter.discord.token_env must be an environment variable name.");
 	}
-	const tokenFromEnvironment = environment[tokenEnv]?.trim() || environment.WAY_DISCORD_TOKEN?.trim();
-	const fileReference = environment.WAY_DISCORD_TOKEN_FILE?.trim() ?? firstString(adapter, ["token_file", "credential_file"], "adapter.discord");
+	const tokenFromEnvironment = environment[tokenEnv]?.trim() || environment.GAJAEWAY_DISCORD_TOKEN?.trim();
+	const fileReference = environment.GAJAEWAY_DISCORD_TOKEN_FILE?.trim() ?? firstString(adapter, ["token_file", "credential_file"], "adapter.discord");
 	if (tokenFromEnvironment && fileReference) {
 		throw new DiscordAdapterConfigError("Configure the Discord token through either an environment variable or a credential file, not both.");
 	}

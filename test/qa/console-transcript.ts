@@ -1,5 +1,5 @@
 /**
- * QA evidence generator (not a test): drives `way console` end to end against a real
+ * QA evidence generator (not a test): drives `gajaeway console` end to end against a real
  * in-process gateway over a real Unix socket and persists the complete terminal
  * write-stream as an app-automation transcript artifact.
  *
@@ -69,7 +69,7 @@ interface RecordedWrite {
 }
 
 async function main(): Promise<void> {
-	const root = fs.mkdtempSync(path.join(os.tmpdir(), "way-console-transcript-"));
+	const root = fs.mkdtempSync(path.join(os.tmpdir(), "gajaeway-console-transcript-"));
 	const corpus = path.join(root, "corpus");
 	const workspace = path.join(root, "workspace");
 	const stateDirectory = path.join(root, "state");
@@ -137,13 +137,13 @@ async function main(): Promise<void> {
 	const rendered = writes.map((w) => w.raw).join("");
 	const deliveredAsRendered = /Delivered as: (prompt|steer|follow_up)/.test(rendered);
 	if (!deliveredAsRendered) throw new Error("console transcript is missing the gateway-derived delivered_as frame.");
-	const cursorAfter = core.consumerCursor("way-console");
+	const cursorAfter = core.consumerCursor("gajaeway-console");
 	const stamp = (): string => new Date().toISOString();
 	const actions = [
 		{
 			ordinal: 1,
 			timestamp: stamp(),
-			selector: "process:way console",
+			selector: "process:gajaeway console",
 			type: "launch",
 			detail: "runWayConsole with a scripted ConsoleTerminal against the live gateway Unix socket",
 			result: "console started",
@@ -167,7 +167,7 @@ async function main(): Promise<void> {
 		{
 			ordinal: 4,
 			timestamp: stamp(),
-			selector: "stdin:way> prompt",
+			selector: "stdin:gajaeway> prompt",
 			type: "input",
 			detail: scripted[0],
 			result: "submitted through main.submit with a fresh idempotency key",
@@ -183,7 +183,7 @@ async function main(): Promise<void> {
 		{
 			ordinal: 6,
 			timestamp: stamp(),
-			selector: "stdin:way> prompt",
+			selector: "stdin:gajaeway> prompt",
 			type: "input",
 			detail: scripted[1],
 			result: "console exited cleanly",
@@ -191,9 +191,9 @@ async function main(): Promise<void> {
 		{
 			ordinal: 7,
 			timestamp: stamp(),
-			selector: 'rpc:consumerCursor("way-console")',
+			selector: 'rpc:consumerCursor("gajaeway-console")',
 			type: "observe",
-			detail: "way-console consumer checkpoint after the session",
+			detail: "gajaeway-console consumer checkpoint after the session",
 			result: cursorAfter,
 		},
 	] as const;
@@ -204,8 +204,8 @@ async function main(): Promise<void> {
 		tool: "bun (scripted ConsoleTerminal harness: test/qa/console-transcript.ts)",
 		surface: "cli",
 		surfaceNote:
-			"way console is a subcommand of the way CLI that renders to a terminal; the transcript records its terminal write-stream.",
-		subject: "way console (gajae-way local owner surface)",
+			"gajaeway console is a subcommand of the gajaeway CLI that renders to a terminal; the transcript records its terminal write-stream.",
+		subject: "gajaeway console (gajaeway local owner surface)",
 		producedBy: "test/qa/console-transcript.ts",
 		generatedAt: new Date().toISOString(),
 		harness:
@@ -219,7 +219,7 @@ async function main(): Promise<void> {
 			renderedBytes: rendered.length,
 			statusRendered: rendered.includes("Gateway status"),
 			readyLineRendered: rendered.includes("Owner console ready"),
-			promptRendered: rendered.includes("way>"),
+			promptRendered: rendered.includes("gajaeway>"),
 			deliveredAsRendered,
 			assistantReplyRendered: rendered.includes("Assistant:"),
 			consumerCursorAfter: cursorAfter,

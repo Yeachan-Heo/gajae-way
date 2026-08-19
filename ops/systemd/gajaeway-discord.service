@@ -1,33 +1,33 @@
-# The adapter has no durable local state: the gajae-way daemon owns checkpoints
+# The adapter has no durable local state: the gajaeway daemon owns checkpoints
 # and the journal. The credential source must be root-owned and mode 0600.
 [Unit]
-Description=Gajae Way Discord adapter
+Description=Gajaeway Discord adapter
 
 # The root-owned recovery marker below rejects every adapter activation while a
 # quarantine is being cleared, including the daemon's Wants= and restart paths.
 # The quarantine runbook removes it only after a bound receipt clears the fence.
-ConditionPathExists=!/etc/gajae-way/recovery/no-discord-ingress
-Requires=gajae-way.service
-BindsTo=gajae-way.service
-PartOf=gajae-way.service
-After=network-online.target gajae-way.service
+ConditionPathExists=!/etc/gajaeway/recovery/no-discord-ingress
+Requires=gajaeway.service
+BindsTo=gajaeway.service
+PartOf=gajaeway.service
+After=network-online.target gajaeway.service
 Wants=network-online.target
 StartLimitIntervalSec=60s
 StartLimitBurst=3
 
 [Service]
 Type=simple
-User=gajae-way
-Group=gajae-way
+User=gajaeway
+Group=gajaeway
 UMask=0077
-Environment=HOME=/var/lib/gajae-way
-Environment=WAY_STATE_DIR=/var/lib/gajae-way
-Environment=WAY_PROFILE=/etc/gajae-way/profile.toml
-# Install /etc/gajae-way/credentials/discord-token as root:root, mode 0600.
+Environment=HOME=/var/lib/gajaeway
+Environment=GAJAEWAY_STATE_DIR=/var/lib/gajaeway
+Environment=GAJAEWAY_PROFILE=/etc/gajaeway/profile.toml
+# Install /etc/gajaeway/credentials/discord-token as root:root, mode 0600.
 # %d is this unit's private credentials directory, not a secret value.
-LoadCredential=discord-token:/etc/gajae-way/credentials/discord-token
-Environment=WAY_DISCORD_TOKEN_FILE=%d/discord-token
-ExecStart=/usr/local/bin/way-discord --state-dir /var/lib/gajae-way --profile /etc/gajae-way/profile.toml
+LoadCredential=discord-token:/etc/gajaeway/credentials/discord-token
+Environment=GAJAEWAY_DISCORD_TOKEN_FILE=%d/discord-token
+ExecStart=/usr/local/bin/gajaeway-discord --state-dir /var/lib/gajaeway --profile /etc/gajaeway/profile.toml
 Restart=on-failure
 RestartSec=5s
 TimeoutStopSec=30s
@@ -49,7 +49,7 @@ LockPersonality=yes
 RestrictSUIDSGID=yes
 RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
 # The adapter may connect to this UDS but owns no persistent data there.
-ReadOnlyPaths=/var/lib/gajae-way
+ReadOnlyPaths=/var/lib/gajaeway
 
 [Install]
 WantedBy=multi-user.target

@@ -27,9 +27,9 @@ async function run(command: readonly string[], cwd = repositoryRoot, env?: NodeJ
 }
 
 function compiledWay(): string {
-	const executable = path.join(repositoryRoot, "dist", "way");
+	const executable = path.join(repositoryRoot, "dist", "gajaeway");
 	if (!fs.existsSync(executable))
-		throw new Error("The compiled closure drill requires dist/way. Run bun scripts/compile.ts before bun test.");
+		throw new Error("The compiled closure drill requires dist/gajaeway. Run bun scripts/compile.ts before bun test.");
 	return executable;
 }
 
@@ -195,22 +195,22 @@ async function requestAndDiscardResponse(
 
 test("compiled daemon makes corpus closures durable, replayable, and single-flight", async () => {
 	const executable = compiledWay();
-	const root = fs.mkdtempSync(path.join(os.tmpdir(), "gajae-way-compiled-closure-"));
+	const root = fs.mkdtempSync(path.join(os.tmpdir(), "gajaeway-compiled-closure-"));
 	const corpus = path.join(root, "corpus");
 	const remote = path.join(root, "remote.git");
 	const workspace = path.join(root, "workspace");
 	const state = path.join(root, "state");
 	const profilePath = path.join(root, "profile.toml");
 	const socketPath = path.join(state, "rpc.sock");
-	const endpointPath = path.join(os.tmpdir(), `way-e2-${process.pid}-${Date.now()}.sock`);
+	const endpointPath = path.join(os.tmpdir(), `gajaeway-e2-${process.pid}-${Date.now()}.sock`);
 	fs.mkdirSync(workspace);
 	fs.writeFileSync(profilePath, profile(corpus, workspace));
 	const environment = {
 		...process.env,
 		NODE_ENV: "test",
-		WAY_E2E_FILE_SDK: "1",
-		WAY_BROKER_CLI: "/usr/bin/false",
-		WAY_RECONCILE_POLL_MS: "600000",
+		GAJAEWAY_E2E_FILE_SDK: "1",
+		GAJAEWAY_BROKER_CLI: "/usr/bin/false",
+		GAJAEWAY_RECONCILE_POLL_MS: "600000",
 	};
 	let daemon: ReturnType<typeof Bun.spawn> | undefined;
 	let client: RpcClient | undefined;
@@ -386,8 +386,8 @@ test("compiled daemon makes corpus closures durable, replayable, and single-flig
 		const crashRelease = path.join(root, "after-push-release");
 		const crashEnvironment = {
 			...environment,
-			WAY_E2E_CLOSURE_AFTER_PUSH_MARKER: crashMarker,
-			WAY_E2E_CLOSURE_AFTER_PUSH_RELEASE: crashRelease,
+			GAJAEWAY_E2E_CLOSURE_AFTER_PUSH_MARKER: crashMarker,
+			GAJAEWAY_E2E_CLOSURE_AFTER_PUSH_RELEASE: crashRelease,
 		};
 		daemon = spawnCompiledDaemon([executable, "serve", "--state-dir", state, "--profile", profilePath], crashEnvironment);
 		client = await connectHealthy(socketPath);
@@ -433,13 +433,13 @@ test("compiled daemon makes corpus closures durable, replayable, and single-flig
 		fs.rmSync(endpointPath, { force: true });
 		const mismatchMarker = path.join(root, "recovery-mismatch-after-push-marker");
 		const mismatchRelease = path.join(root, "recovery-mismatch-after-push-release");
-		const endpointEnvironment = { ...environment, WAY_E2E_SDK_ENDPOINT_PATH: endpointPath };
+		const endpointEnvironment = { ...environment, GAJAEWAY_E2E_SDK_ENDPOINT_PATH: endpointPath };
 		daemon = spawnCompiledDaemon(
 			[executable, "serve", "--state-dir", state, "--profile", profilePath],
 			{
 				...endpointEnvironment,
-				WAY_E2E_CLOSURE_AFTER_PUSH_MARKER: mismatchMarker,
-				WAY_E2E_CLOSURE_AFTER_PUSH_RELEASE: mismatchRelease,
+				GAJAEWAY_E2E_CLOSURE_AFTER_PUSH_MARKER: mismatchMarker,
+				GAJAEWAY_E2E_CLOSURE_AFTER_PUSH_RELEASE: mismatchRelease,
 			},
 		);
 		client = await connectHealthy(socketPath);
@@ -501,18 +501,18 @@ test("compiled daemon makes corpus closures durable, replayable, and single-flig
 
 test("compiled daemon exits promptly when pre-host session disposal rejects", async () => {
 	const executable = compiledWay();
-	const root = fs.mkdtempSync(path.join(os.tmpdir(), "gajae-way-disposal-rejection-"));
+	const root = fs.mkdtempSync(path.join(os.tmpdir(), "gajaeway-disposal-rejection-"));
 	const corpus = path.join(root, "corpus");
 	const workspace = path.join(root, "workspace");
 	const state = path.join(root, "state");
 	const profilePath = path.join(root, "profile.toml");
-	const endpointPath = path.join(os.tmpdir(), `way-disposal-rejection-${process.pid}-${Date.now()}.sock`);
+	const endpointPath = path.join(os.tmpdir(), `gajaeway-disposal-rejection-${process.pid}-${Date.now()}.sock`);
 	const environment = {
 		...process.env,
 		NODE_ENV: "test",
-		WAY_E2E_FILE_SDK: "1",
-		WAY_BROKER_CLI: "/usr/bin/false",
-		WAY_RECONCILE_POLL_MS: "600000",
+		GAJAEWAY_E2E_FILE_SDK: "1",
+		GAJAEWAY_BROKER_CLI: "/usr/bin/false",
+		GAJAEWAY_RECONCILE_POLL_MS: "600000",
 	};
 	let daemon: ReturnType<typeof Bun.spawn> | undefined;
 	try {
@@ -531,9 +531,9 @@ test("compiled daemon exits promptly when pre-host session disposal rejects", as
 			[executable, "serve", "--state-dir", state, "--profile", profilePath, "--fail-closed-linger-ms", "5000"],
 			{
 				...environment,
-				WAY_E2E_SDK_ENDPOINT_PATH: endpointPath,
-				WAY_E2E_SDK_DISPOSE_REJECT: "1",
-				WAY_E2E_FAIL_BEFORE_MAIN_HOST: "1",
+				GAJAEWAY_E2E_SDK_ENDPOINT_PATH: endpointPath,
+				GAJAEWAY_E2E_SDK_DISPOSE_REJECT: "1",
+				GAJAEWAY_E2E_FAIL_BEFORE_MAIN_HOST: "1",
 			},
 		);
 		daemon = rejectedDaemon;

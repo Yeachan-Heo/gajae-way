@@ -32,11 +32,11 @@ import { loadWayCore, type WayCoreHandle } from "./native-loader";
 import { createRpcBridge, RpcBridgeException, type RpcBridgeHandler } from "./rpc-bridge";
 
 const usage = `Usage:
-  way [serve] [--state-dir PATH] [--profile PATH] [--fail-closed-linger-ms MS] [--broker-cli PATH] [--reconcile-poll-ms MS]
-  way console [--surface-id ID] [--state-dir PATH] [--profile PATH]
-  way bootstrap --confirm [--state-dir PATH] [--profile PATH]
-  way profile approve --confirm [--state-dir PATH] [--profile PATH]
-  way --health [--state-dir PATH] | --version`;
+  gajaeway [serve] [--state-dir PATH] [--profile PATH] [--fail-closed-linger-ms MS] [--broker-cli PATH] [--reconcile-poll-ms MS]
+  gajaeway console [--surface-id ID] [--state-dir PATH] [--profile PATH]
+  gajaeway bootstrap --confirm [--state-dir PATH] [--profile PATH]
+  gajaeway profile approve --confirm [--state-dir PATH] [--profile PATH]
+  gajaeway --health [--state-dir PATH] | --version`;
 
 class FailedClosedExit extends Error {
 	readonly forceExit: boolean;
@@ -64,7 +64,7 @@ export async function healthPayload(stateDirectory = defaultStateDirectory()): P
 }
 
 export function defaultStateDirectory(): string {
-	return process.env.WAY_STATE_DIR || path.join(os.homedir(), ".local", "state", "gajae-way");
+	return process.env.GAJAEWAY_STATE_DIR || path.join(os.homedir(), ".local", "state", "gajaeway");
 }
 
 /** Starts only the native RPC server; tests and later phases can host their own bridge. */
@@ -89,9 +89,9 @@ function failureReason(error: unknown): string {
 
 function createRuntimeSdk(): MainSessionSdk {
 	const sdk =
-		Bun.env.NODE_ENV === "test" && Bun.env.WAY_E2E_FILE_SDK === "1" ? createE2eFileSdk() : createPublishedSdk();
-	const endpointPath = Bun.env.WAY_E2E_SDK_ENDPOINT_PATH;
-	if (Bun.env.NODE_ENV !== "test" || Bun.env.WAY_E2E_FILE_SDK !== "1" || !endpointPath) return sdk;
+		Bun.env.NODE_ENV === "test" && Bun.env.GAJAEWAY_E2E_FILE_SDK === "1" ? createE2eFileSdk() : createPublishedSdk();
+	const endpointPath = Bun.env.GAJAEWAY_E2E_SDK_ENDPOINT_PATH;
+	if (Bun.env.NODE_ENV !== "test" || Bun.env.GAJAEWAY_E2E_FILE_SDK !== "1" || !endpointPath) return sdk;
 	return createE2eEndpointProbeSdk(sdk, endpointPath);
 }
 
@@ -117,7 +117,7 @@ async function createE2eEndpointProbeSession(
 		});
 	});
 	let disposed = false;
-	const rejectDisposeForE2e = Bun.env.WAY_E2E_SDK_DISPOSE_REJECT === "1";
+	const rejectDisposeForE2e = Bun.env.GAJAEWAY_E2E_SDK_DISPOSE_REJECT === "1";
 	return {
 		sessionFile: session.sessionFile,
 		sessionId: session.sessionId,
@@ -154,8 +154,8 @@ async function createE2eEndpointProbeSession(
 function failBeforeMainHostForE2e(): void {
 	if (
 		Bun.env.NODE_ENV === "test" &&
-		Bun.env.WAY_E2E_FILE_SDK === "1" &&
-		Bun.env.WAY_E2E_FAIL_BEFORE_MAIN_HOST === "1"
+		Bun.env.GAJAEWAY_E2E_FILE_SDK === "1" &&
+		Bun.env.GAJAEWAY_E2E_FAIL_BEFORE_MAIN_HOST === "1"
 	) {
 		throw new Error("forced E2E pre-host startup failure");
 	}
@@ -220,7 +220,7 @@ async function enterFailedClosed(
 		// The process can still terminate safely if the listener was already lost.
 	}
 	try {
-		core.sdNotifyStatus(`gajae-way failed_closed: ${reason}`);
+		core.sdNotifyStatus(`gajaeway failed_closed: ${reason}`);
 	} catch {
 		// NOTIFY_SOCKET is optional and status notification is best effort.
 	}
@@ -645,8 +645,8 @@ async function gitOutput(corpusPath: string, args: readonly string[]): Promise<s
 
 async function pauseAfterPushedClosure(operationId: string, evidence: ClosureOperationEvidence): Promise<void> {
 	if (Bun.env.NODE_ENV !== "test") return;
-	const markerPath = Bun.env.WAY_E2E_CLOSURE_AFTER_PUSH_MARKER;
-	const releasePath = Bun.env.WAY_E2E_CLOSURE_AFTER_PUSH_RELEASE;
+	const markerPath = Bun.env.GAJAEWAY_E2E_CLOSURE_AFTER_PUSH_MARKER;
+	const releasePath = Bun.env.GAJAEWAY_E2E_CLOSURE_AFTER_PUSH_RELEASE;
 	if (!markerPath || !releasePath) return;
 	if (!evidence.leaseId || !evidence.fencingToken || evidence.committed === undefined) {
 		throw new ClosureError("post-push closure evidence is incomplete");
@@ -997,7 +997,7 @@ async function serveWay(config: WayConfig): Promise<void> {
 	core.startRpcServer(path.join(config.stateDir, "rpc.sock"), createRpcBridge(core, bridgeHandler));
 	core.setRpcHealth("verifying");
 	try {
-		core.sdNotifyStatus("gajae-way verifying durable state and main session");
+		core.sdNotifyStatus("gajaeway verifying durable state and main session");
 	} catch {
 		// A notification transport failure must not turn a healthy daemon into a failed-closed one.
 	}
@@ -1016,7 +1016,7 @@ async function serveWay(config: WayConfig): Promise<void> {
 		);
 		const recovery = await recoverBootstrap({ profile, state, sdk });
 		if (recovery.kind === "bootstrap_required") {
-			// The durable state remains ABSENT so an explicit `way bootstrap --confirm`
+			// The durable state remains ABSENT so an explicit `gajaeway bootstrap --confirm`
 			// can proceed after this unhealthy daemon exits.
 			await enterFailedClosed(core, state, config, "bootstrap_required", false);
 		}
@@ -1025,7 +1025,7 @@ async function serveWay(config: WayConfig): Promise<void> {
 			profile,
 			state,
 			sdk,
-			onInjectionLog: (entry) => console.warn(`way injection ${entry.kind}: ${entry.path}`),
+			onInjectionLog: (entry) => console.warn(`gajaeway injection ${entry.kind}: ${entry.path}`),
 		});
 		resumedSession = resumed.session;
 		failBeforeMainHostForE2e();
@@ -1064,7 +1064,7 @@ async function serveWay(config: WayConfig): Promise<void> {
 		});
 		reconciler.start();
 		try {
-			core.sdNotifyReady("gajae-way running");
+			core.sdNotifyReady("gajaeway running");
 		} catch {
 			// Readiness remains observable through RPC and health.json if notification delivery fails.
 		}
@@ -1192,7 +1192,7 @@ export async function runWay(arguments_ = process.argv.slice(2)): Promise<void> 
 		return;
 	}
 	if (arguments_.includes("--version") || arguments_.includes("-V")) {
-		console.log(`way ${loadWayCore().healthInfo().version}`);
+		console.log(`gajaeway ${loadWayCore().healthInfo().version}`);
 		return;
 	}
 	const parsed = parseWayConfig(arguments_);
@@ -1221,7 +1221,7 @@ export async function runWay(arguments_ = process.argv.slice(2)): Promise<void> 
 	throw new Error(`Unknown command: ${parsed.remaining.join(" ")}\n${usage}`);
 }
 
-if (import.meta.main && process.env.WAY_INTERNAL_CLOSURE_WORKER === "1") {
+if (import.meta.main && process.env.GAJAEWAY_INTERNAL_CLOSURE_WORKER === "1") {
 	await runClosureWorker();
 } else if (import.meta.main) {
 	try {

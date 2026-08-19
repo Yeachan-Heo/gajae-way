@@ -344,7 +344,7 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn linux_second_os_user_is_rejected_by_real_so_peercred_when_enabled() {
-        if std::env::var_os("WAY_CORE_CROSS_UID_TEST").is_none() {
+        if std::env::var_os("GAJAEWAY_CORE_CROSS_UID_TEST").is_none() {
             return;
         }
         assert_eq!(

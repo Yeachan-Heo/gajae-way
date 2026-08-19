@@ -4,12 +4,12 @@ import * as path from "node:path";
 import { bootstrapNonceMarker, type HostedSdkGate, type HostedSdkGateResolution, type HostedSdkSession, type MainSessionSdk } from "./sdk";
 import { fingerprintSessionFile, sameFingerprint, type SessionFingerprint } from "./state";
 
-const E2E_SESSION_DIRECTORY = ".way-e2e-sessions";
+const E2E_SESSION_DIRECTORY = ".gajaeway-e2e-sessions";
 
 /**
  * Deterministic, file-backed SDK used only by the portable compiled-binary
  * restart drill. `main.ts` enables it only with NODE_ENV=test and an explicit
- * WAY_E2E_FILE_SDK=1 opt-in; deployed services always use the published SDK.
+ * GAJAEWAY_E2E_FILE_SDK=1 opt-in; deployed services always use the published SDK.
  */
 export function createE2eFileSdk(): MainSessionSdk {
 	return {

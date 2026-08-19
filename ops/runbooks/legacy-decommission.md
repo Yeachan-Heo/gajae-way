@@ -1,7 +1,7 @@
 # Legacy writer decommission
 
 This is an operator procedure, not a managed migration program. Before
-`gajae-way` becomes the writer for a corpus, stop and disable **every** legacy
+`gajaeway` becomes the writer for a corpus, stop and disable **every** legacy
 writer and outbound effect for that corpus: bot services, timers, cron jobs,
 launch agents, queue workers, webhook relays, and manual push automation. Do
 not run a gateway and a legacy bot together "just for validation".
@@ -41,9 +41,9 @@ not run a gateway and a legacy bot together "just for validation".
 3. Reconcile unexpected refs, a non-fast-forward history, a dirty index, or
    any residual push before proceeding. Preserve the inventory and verification
    evidence so a reversal can be planned without recovering copied secrets.
-4. Configure the gajae-way profile and systemd `ReadWritePaths=` for that one
-   corpus, then perform `way bootstrap --confirm` and start the two units using
-   the [operations runbook](operations.md). From that point, gajae-way is the
+4. Configure the gajaeway profile and systemd `ReadWritePaths=` for that one
+   corpus, then perform `gajaeway bootstrap --confirm` and start the two units using
+   the [operations runbook](operations.md). From that point, gajaeway is the
    sole permitted writer.
 
 Later re-authorizing a legacy job is not a blanket rollback. v2 P13 defines

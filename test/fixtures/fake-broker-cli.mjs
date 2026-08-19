@@ -1,9 +1,9 @@
 #!/usr/bin/env node
 import fs from "node:fs";
 
-const statePath = process.env.WAY_BROKER_FIXTURE_STATE;
+const statePath = process.env.GAJAEWAY_BROKER_FIXTURE_STATE;
 if (!statePath) {
-	console.error("WAY_BROKER_FIXTURE_STATE is required");
+	console.error("GAJAEWAY_BROKER_FIXTURE_STATE is required");
 	process.exitCode = 2;
 } else {
 	const state = JSON.parse(fs.readFileSync(statePath, "utf8"));

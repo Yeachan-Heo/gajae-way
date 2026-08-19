@@ -1,16 +1,16 @@
-# Install this unit after creating the dedicated gajae-way system user with a
-# home under /var/lib/gajae-way. Replace the corpus and workspace placeholders
+# Install this unit after creating the dedicated gajaeway system user with a
+# home under /var/lib/gajaeway. Replace the corpus and workspace placeholders
 # below with the profile's exact writable paths before enabling the service.
 [Unit]
-Description=Gajae Way operator-agent runtime
+Description=Gajaeway operator-agent runtime
 # Normal topology restores the adapter after daemon startup/restart: this Wants=
 # edge pulls it in; BindsTo= stops it on daemon loss and PartOf= follows restarts.
 # Quarantine recovery creates the root-owned no-ingress marker documented in the
 # quarantine runbook. The adapter's ConditionPathExists= rejects every start,
 # including Wants= and automatic restarts, until clearance removes that marker.
-Wants=network-online.target gajae-way-discord.service
+Wants=network-online.target gajaeway-discord.service
 After=network-online.target
-Before=gajae-way-discord.service
+Before=gajaeway-discord.service
 StartLimitIntervalSec=60s
 StartLimitBurst=3
 
@@ -20,18 +20,18 @@ NotifyAccess=main
 # The default failed-closed health linger is five minutes; let exit 78 reach
 # RestartPreventExitStatus instead of timing out while Type=notify is pending.
 TimeoutStartSec=6min
-User=gajae-way
-Group=gajae-way
+User=gajaeway
+Group=gajaeway
 UMask=0077
-WorkingDirectory=/var/lib/gajae-way
-Environment=HOME=/var/lib/gajae-way
-Environment=WAY_STATE_DIR=/var/lib/gajae-way
-Environment=WAY_PROFILE=/etc/gajae-way/profile.toml
-RuntimeDirectory=gajae-way
+WorkingDirectory=/var/lib/gajaeway
+Environment=HOME=/var/lib/gajaeway
+Environment=GAJAEWAY_STATE_DIR=/var/lib/gajaeway
+Environment=GAJAEWAY_PROFILE=/etc/gajaeway/profile.toml
+RuntimeDirectory=gajaeway
 RuntimeDirectoryMode=0700
-StateDirectory=gajae-way
+StateDirectory=gajaeway
 StateDirectoryMode=0700
-ExecStart=/usr/local/bin/way serve --state-dir /var/lib/gajae-way --profile /etc/gajae-way/profile.toml
+ExecStart=/usr/local/bin/gajaeway serve --state-dir /var/lib/gajaeway --profile /etc/gajaeway/profile.toml
 Restart=on-failure
 RestartSec=5s
 RestartPreventExitStatus=78
@@ -56,9 +56,9 @@ PrivateDevices=yes
 LockPersonality=yes
 RestrictSUIDSGID=yes
 RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
-# /var/lib/gajae-way is StateDirectory. The latter two paths are deployment
+# /var/lib/gajaeway is StateDirectory. The latter two paths are deployment
 # placeholders and must match [corpus] path/workspace in the installed profile.
-ReadWritePaths=/var/lib/gajae-way /srv/gajae-way/corpus /srv/gajae-way/workspace
+ReadWritePaths=/var/lib/gajaeway /srv/gajaeway/corpus /srv/gajaeway/workspace
 
 [Install]
 WantedBy=multi-user.target

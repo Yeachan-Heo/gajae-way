@@ -269,7 +269,7 @@ test("raw terminal publishes one production frame before an injected concurrent 
 	const input = new RawInputHarness();
 	const output = new RawOutputHarness();
 	const terminal = new RawConsoleTerminal({ input, output });
-	const pendingLine = terminal.readLine("way> ");
+	const pendingLine = terminal.readLine("gajaeway> ");
 	let injected = false;
 	output.onWrite = (text) => {
 		if (!injected && text.includes("assistant frame must remain whole")) {
@@ -281,11 +281,11 @@ test("raw terminal publishes one production frame before an injected concurrent 
 		await terminal.writeTrusted("Assistant:\nassistant frame must remain whole\n");
 		await Bun.sleep(0);
 		const frameWrites = output.writes.filter((write) => write.includes("assistant frame must remain whole"));
-		expect(frameWrites).toEqual(["\r\x1b[2KAssistant:\nassistant frame must remain whole\nway> "]);
+		expect(frameWrites).toEqual(["\r\x1b[2KAssistant:\nassistant frame must remain whole\ngajaeway> "]);
 		expect(output.writes.indexOf("x")).toBeGreaterThan(output.writes.indexOf(frameWrites[0] as string));
 		const screen = rawScreen(output.writes);
 		expect(screen).toContain("Assistant:\nassistant frame must remain whole");
-		expect(screen.endsWith("way> x")).toBe(true);
+		expect(screen.endsWith("gajaeway> x")).toBe(true);
 	} finally {
 		terminal.close();
 		await pendingLine;
@@ -297,11 +297,11 @@ test("raw terminal queues every complete line in a multi-line input chunk", asyn
 	const output = new RawOutputHarness();
 	const terminal = new RawConsoleTerminal({ input, output });
 	try {
-		const first = terminal.readLine("way> ");
+		const first = terminal.readLine("gajaeway> ");
 		input.send("first\nsecond\nthird\n");
 		expect(await first).toBe("first");
-		expect(await terminal.readLine("way> ")).toBe("second");
-		expect(await terminal.readLine("way> ")).toBe("third");
+		expect(await terminal.readLine("gajaeway> ")).toBe("second");
+		expect(await terminal.readLine("gajaeway> ")).toBe("third");
 	} finally {
 		terminal.close();
 	}
@@ -314,7 +314,7 @@ test("raw terminal bounds saturated queued input, refuses excess lines visibly, 
 	const accepted = Array.from({ length: MAX_RAW_CONSOLE_QUEUED_LINES }, (_value, index) => `queued-${index}`);
 	const rejected = Array.from({ length: 4 }, (_value, index) => `rejected-${index}`);
 	try {
-		const first = terminal.readLine("way> ");
+		const first = terminal.readLine("gajaeway> ");
 		input.send("first\n");
 		expect(await first).toBe("first");
 		for (const line of accepted) input.send(`${line}\n`);
@@ -331,7 +331,7 @@ test("raw terminal bounds saturated queued input, refuses excess lines visibly, 
 
 		const received: string[] = [];
 		for (let index = 0; index < accepted.length; index += 1) {
-			received.push((await terminal.readLine("way> ")) as string);
+			received.push((await terminal.readLine("gajaeway> ")) as string);
 		}
 		expect(received).toEqual(accepted);
 		expect(terminal.queuedLineCount).toBe(0);
@@ -349,7 +349,7 @@ test("raw terminal visibly refuses excess lines from a single paste after its bo
 		"\n",
 	);
 	try {
-		const first = terminal.readLine("way> ");
+		const first = terminal.readLine("gajaeway> ");
 		input.send("first\n");
 		expect(await first).toBe("first");
 		input.send(`${pasted}\n`);
@@ -373,7 +373,7 @@ test("raw terminal retains one refusal through transient backpressure without ec
 	const refusedPrefix = "REFUSED_PAYLOAD_MUST_NOT_ECHO";
 	const refusedBurst = Array.from({ length: 256 }, (_value, index) => `${refusedPrefix}-${index}`).join("\n");
 	try {
-		const direct = terminal.readLine("way> ");
+		const direct = terminal.readLine("gajaeway> ");
 		input.send("direct\n");
 		expect(await direct).toBe("direct");
 		await terminal.writeTrusted("");
@@ -408,7 +408,7 @@ test("raw terminal retains one refusal through transient backpressure without ec
 
 		const delivered: string[] = [];
 		for (let index = 0; index < accepted.length; index += 1) {
-			delivered.push((await terminal.readLine("way> ")) as string);
+			delivered.push((await terminal.readLine("gajaeway> ")) as string);
 		}
 		expect(delivered).toEqual(accepted);
 		expect(terminal.queuedLineCount).toBe(0);
@@ -425,7 +425,7 @@ test("raw terminal publishes a same-chunk oversized-line refusal and keeps the p
 	const oversized = "x".repeat(MAX_RAW_CONSOLE_LINE_BYTES + 1);
 	const usableLine = "normal line after oversized paste";
 	const fifoLines = ["first queued line after oversized paste", "second queued line after oversized paste"];
-	const pendingLine = terminal.readLine("way> ");
+	const pendingLine = terminal.readLine("gajaeway> ");
 	try {
 		input.send(`${oversized}\n`);
 		await eventually(
@@ -442,8 +442,8 @@ test("raw terminal publishes a same-chunk oversized-line refusal and keeps the p
 		input.send(`${usableLine}\n`);
 		expect(await pendingLine).toBe(usableLine);
 		input.send(`${fifoLines.join("\n")}\n`);
-		expect(await terminal.readLine("way> ")).toBe(fifoLines[0]);
-		expect(await terminal.readLine("way> ")).toBe(fifoLines[1]);
+		expect(await terminal.readLine("gajaeway> ")).toBe(fifoLines[0]);
+		expect(await terminal.readLine("gajaeway> ")).toBe(fifoLines[1]);
 	} finally {
 		terminal.close();
 	}
@@ -455,9 +455,9 @@ test("raw terminal retains a same-chunk oversized-line refusal through transient
 	const terminal = new RawConsoleTerminal({ input, output });
 	const oversized = "x".repeat(MAX_RAW_CONSOLE_LINE_BYTES + 1);
 	const usableLine = "normal line after recovered output";
-	const pendingLine = terminal.readLine("way> ");
+	const pendingLine = terminal.readLine("gajaeway> ");
 	try {
-		await eventually(() => output.writes.includes("way> "), "raw terminal did not render its prompt");
+		await eventually(() => output.writes.includes("gajaeway> "), "raw terminal did not render its prompt");
 		output.stall();
 		input.send(`${oversized}\n`);
 		await eventually(() => output.pendingWriteCount === 1, "oversized refusal did not begin its stalled publication");
@@ -492,7 +492,7 @@ test("raw terminal coalesces mixed refusal causes through transient output backp
 	const oversized = "x".repeat(MAX_RAW_CONSOLE_LINE_BYTES + 1);
 	const dropped = "MIXED_QUEUE_FULL_PAYLOAD_MUST_NOT_ECHO";
 	try {
-		const direct = terminal.readLine("way> ");
+		const direct = terminal.readLine("gajaeway> ");
 		input.send("direct\n");
 		expect(await direct).toBe("direct");
 		await terminal.writeTrusted("");
@@ -526,7 +526,7 @@ test("raw terminal coalesces mixed refusal causes through transient output backp
 
 		const delivered: string[] = [];
 		for (let index = 0; index < queued.length; index += 1) {
-			delivered.push((await terminal.readLine("way> ")) as string);
+			delivered.push((await terminal.readLine("gajaeway> ")) as string);
 		}
 		expect(delivered).toEqual(queued);
 	} finally {
@@ -543,7 +543,7 @@ test("raw terminal reports byte-capacity refusals with a distinct bounded cause"
 	);
 	const dropped = "BYTE_CAPACITY_PAYLOAD_MUST_NOT_ECHO";
 	try {
-		const direct = terminal.readLine("way> ");
+		const direct = terminal.readLine("gajaeway> ");
 		input.send("direct\n");
 		expect(await direct).toBe("direct");
 		await terminal.writeTrusted("");
@@ -565,7 +565,7 @@ test("raw terminal reports byte-capacity refusals with a distinct bounded cause"
 
 		const delivered: string[] = [];
 		for (let index = 0; index < queued.length; index += 1) {
-			delivered.push((await terminal.readLine("way> ")) as string);
+			delivered.push((await terminal.readLine("gajaeway> ")) as string);
 		}
 		expect(delivered).toEqual(queued);
 	} finally {
@@ -584,7 +584,7 @@ test("raw terminal retains Ctrl-C as an exit request while no line read is pendi
 		input.send("\u0003");
 		expect(exits).toBe(1);
 		expect(terminal.inputPaused).toBe(true);
-		expect(await terminal.readLine("way> ")).toBeUndefined();
+		expect(await terminal.readLine("gajaeway> ")).toBeUndefined();
 	} finally {
 		terminal.close();
 	}
@@ -601,7 +601,7 @@ test("raw terminal retains Ctrl-D as an exit request while no line read is pendi
 		input.send("\u0004");
 		expect(exits).toBe(1);
 		expect(terminal.inputPaused).toBe(true);
-		expect(await terminal.readLine("way> ")).toBeUndefined();
+		expect(await terminal.readLine("gajaeway> ")).toBeUndefined();
 	} finally {
 		terminal.close();
 	}

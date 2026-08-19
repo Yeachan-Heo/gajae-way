@@ -24,16 +24,16 @@ continuing.
    being changed. For a routine planned change, stop the daemon too:
 
    ```sh
-   sudo systemctl stop gajae-way-discord.service gajae-way.service
+   sudo systemctl stop gajaeway-discord.service gajaeway.service
    ```
 
-3. Install the reviewed profile as `/etc/gajae-way/profile.toml`, retaining
-   `root:gajae-way` ownership and mode `0640`.
+3. Install the reviewed profile as `/etc/gajaeway/profile.toml`, retaining
+   `root:gajaeway` ownership and mode `0640`.
 4. Run the exact explicit approval command as the daemon identity:
 
    ```sh
-   sudo -u gajae-way -H /usr/local/bin/way profile approve --confirm \
-     --state-dir /var/lib/gajae-way --profile /etc/gajae-way/profile.toml
+   sudo -u gajaeway -H /usr/local/bin/gajaeway profile approve --confirm \
+     --state-dir /var/lib/gajaeway --profile /etc/gajaeway/profile.toml
    ```
 
    The command first prints a secret-free projection diff. It then writes the
@@ -44,13 +44,13 @@ continuing.
    adapter:
 
    ```sh
-   sudo systemctl start gajae-way.service
-   sudo systemctl start gajae-way-discord.service
+   sudo systemctl start gajaeway.service
+   sudo systemctl start gajaeway-discord.service
    ```
 
 During the bounded failed-closed linger window, the same command detects the
 running UDS and sends its owner-authenticated `profile.approve` RPC instead of
-opening SQLite directly. Run it as `gajae-way`; after the approval it is normal
+opening SQLite directly. Run it as `gajaeway`; after the approval it is normal
 for the old failed-closed process to exit 78, and the systemd unit will not loop
 on that exit code.
 

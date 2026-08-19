@@ -3,10 +3,10 @@
   "kind": "app-automation-transcript",
   "tool": "bun (scripted ConsoleTerminal harness: test/qa/console-transcript.ts)",
   "surface": "cli",
-  "surfaceNote": "way console is a subcommand of the way CLI that renders to a terminal; the transcript records its terminal write-stream.",
-  "subject": "way console (gajae-way local owner surface)",
+  "surfaceNote": "gajaeway console is a subcommand of the gajaeway CLI that renders to a terminal; the transcript records its terminal write-stream.",
+  "subject": "gajaeway console (gajaeway local owner surface)",
   "producedBy": "test/qa/console-transcript.ts",
-  "generatedAt": "2026-08-19T09:24:49.250Z",
+  "generatedAt": "2026-08-19T13:47:48.626Z",
   "harness": "scripted ConsoleTerminal driving runWayConsole against a real in-process gateway over a real Unix-domain socket",
   "scriptedInput": [
     "hello from the automation transcript",
@@ -15,15 +15,15 @@
   "actions": [
     {
       "ordinal": 1,
-      "timestamp": "2026-08-19T09:24:49.250Z",
-      "selector": "process:way console",
+      "timestamp": "2026-08-19T13:47:48.626Z",
+      "selector": "process:gajaeway console",
       "type": "launch",
       "detail": "runWayConsole with a scripted ConsoleTerminal against the live gateway Unix socket",
       "result": "console started"
     },
     {
       "ordinal": 2,
-      "timestamp": "2026-08-19T09:24:49.250Z",
+      "timestamp": "2026-08-19T13:47:48.626Z",
       "selector": "stdout:\"Gateway status\"",
       "type": "observe",
       "detail": "gateway status block (daemon/main/journal/lock/reconcile)",
@@ -31,7 +31,7 @@
     },
     {
       "ordinal": 3,
-      "timestamp": "2026-08-19T09:24:49.250Z",
+      "timestamp": "2026-08-19T13:47:48.626Z",
       "selector": "stdout:\"Owner console ready\"",
       "type": "observe",
       "detail": "readiness announcement after delivery readiness established",
@@ -39,15 +39,15 @@
     },
     {
       "ordinal": 4,
-      "timestamp": "2026-08-19T09:24:49.250Z",
-      "selector": "stdin:way> prompt",
+      "timestamp": "2026-08-19T13:47:48.626Z",
+      "selector": "stdin:gajaeway> prompt",
       "type": "input",
       "detail": "hello from the automation transcript",
       "result": "submitted through main.submit with a fresh idempotency key"
     },
     {
       "ordinal": 5,
-      "timestamp": "2026-08-19T09:24:49.250Z",
+      "timestamp": "2026-08-19T13:47:48.626Z",
       "selector": "stdout:\"Delivered as:\"",
       "type": "observe",
       "detail": "server-derived delivered_as rendered verbatim",
@@ -55,18 +55,18 @@
     },
     {
       "ordinal": 6,
-      "timestamp": "2026-08-19T09:24:49.250Z",
-      "selector": "stdin:way> prompt",
+      "timestamp": "2026-08-19T13:47:48.626Z",
+      "selector": "stdin:gajaeway> prompt",
       "type": "input",
       "detail": "/quit",
       "result": "console exited cleanly"
     },
     {
       "ordinal": 7,
-      "timestamp": "2026-08-19T09:24:49.250Z",
-      "selector": "rpc:consumerCursor(\"way-console\")",
+      "timestamp": "2026-08-19T13:47:48.626Z",
+      "selector": "rpc:consumerCursor(\"gajaeway-console\")",
       "type": "observe",
-      "detail": "way-console consumer checkpoint after the session",
+      "detail": "gajaeway-console consumer checkpoint after the session",
       "result": "1:3"
     }
   ],
@@ -79,31 +79,31 @@
     },
     {
       "sequence": 1,
-      "atMs": 1006,
+      "atMs": 1004,
       "raw": "Owner console ready. Type /help for commands.\n",
       "containsEscape": false
     },
     {
       "sequence": 2,
-      "atMs": 1008,
+      "atMs": 1006,
       "raw": "Delivered as: prompt\n",
       "containsEscape": false
     },
     {
       "sequence": 3,
-      "atMs": 1009,
+      "atMs": 1006,
       "raw": "Main turn started — busy.\n",
       "containsEscape": false
     },
     {
       "sequence": 4,
-      "atMs": 1009,
+      "atMs": 1006,
       "raw": "Assistant:\nack\n",
       "containsEscape": false
     },
     {
       "sequence": 5,
-      "atMs": 1009,
+      "atMs": 1006,
       "raw": "Main turn ended — idle.\n",
       "containsEscape": false
     }
