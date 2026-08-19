@@ -1,13 +1,13 @@
 {
   "schemaVersion": 1,
   "kind": "api-package-test-report",
-  "subject": "gajae-way v1 (plan phases P0-P8)",
-  "frozenCommit": "0bf4a61c35c37283fb4aa36c0b63cf3afb1b99a1-plus-gen4-fixes",
+  "subject": "gajae-way v1 (plan phases P0-P8) plus owner-directed local console (G014); live chat-adapter acceptance deferred to the final gate",
+  "frozenCommit": "b4092cf (console scope; sourceHash sha256:cfabc3bb6a595e11fd2abb7ea5e67d6a0e6c1d7763bdc41603980241df68ac9e)",
   "producedBy": "ultragoal leader (delegated executor QA lane failed three times; leader ran the matrix directly)",
   "contract": ".gjc/_session-01a00ef5-0d0c-7000-b6f1-36f0fe3f8080/plans/ralplan/01a00ef5-0d0c-7000-b6f1-36f0fe3f8080/pending-approval.md",
   "rerunCommands": [
     "cargo test -p way-core",
-    "bun test",
+    "bun test (x5 consecutive)",
     "bun test test/e2e/",
     "bun test test/qa/",
     "bunx tsc --noEmit",
@@ -270,14 +270,86 @@
       "expected": "rename reflected within the 20s SLA, authority-field-only updates, unknown rows inserted without guessing, parse drift never mutates the registry, enrichment bounded with backoff, quarantined rows refuse binding",
       "observed": "all cases green against the deterministic broker fixture",
       "verdict": "passed"
+    },
+    {
+      "id": "QA-CONSOLE-01",
+      "contractRef": "G014 objective: startup fence",
+      "invocation": "bun test test/integration/console.test.ts",
+      "expected": "failed_closed/unhealthy daemon blocks interactive mode and the real CLI exits non-zero",
+      "observed": "refused with actionable text, exit 1",
+      "verdict": "passed"
+    },
+    {
+      "id": "QA-CONSOLE-02",
+      "contractRef": "G014: server-authoritative admission preserved",
+      "invocation": "bun test test/integration/console.test.ts",
+      "expected": "main.submit carries only text/surface_id/idempotency_key; delivered_as rendered verbatim from the server",
+      "observed": "exact request shape asserted; Delivered as: prompt rendered",
+      "verdict": "passed"
+    },
+    {
+      "id": "QA-CONSOLE-03",
+      "contractRef": "Event-delivery contract: publication proof before commit",
+      "invocation": "bun test test/integration/console.test.ts",
+      "expected": "checkpoint advances only after the terminal writer resolves",
+      "observed": "delayed writer held cursor at 1:0 until release then advanced; failing writer left cursor at 1:0 and blocked further submit",
+      "verdict": "passed"
+    },
+    {
+      "id": "QA-CONSOLE-04",
+      "contractRef": "G014: restart resumes from server checkpoint",
+      "invocation": "bun test test/integration/console.test.ts",
+      "expected": "no re-render of already-committed replies",
+      "observed": "resumed at committed cursor, committed reply not re-rendered",
+      "verdict": "passed"
+    },
+    {
+      "id": "QA-CONSOLE-05",
+      "contractRef": "G014: durable gate answering",
+      "invocation": "bun test test/integration/console.test.ts",
+      "expected": "owner answer resolves a durable gate; wrong expectedSessionId refused",
+      "observed": "1102 on mismatch; correct answer resolved and rendered gate_resolved",
+      "verdict": "passed"
+    },
+    {
+      "id": "QA-CONSOLE-06",
+      "contractRef": "Terminal trust boundary (review finding)",
+      "invocation": "bun test test/unit/console.test.ts",
+      "expected": "gateway-derived text cannot emit executable terminal control sequences",
+      "observed": "ESC/CSI/OSC, OSC 52, C0, DEL and C1 rendered as visible literal escapes; only console-owned ANSI emitted verbatim",
+      "verdict": "passed"
+    },
+    {
+      "id": "QA-CONSOLE-07",
+      "contractRef": "Delivery-readiness fence (review finding)",
+      "invocation": "bun test test/integration/console.test.ts",
+      "expected": "owner input impossible without a usable way-console claim",
+      "observed": "second client holding the claim causes startup refusal and submit rejection; retention gap refuses with actionable text and no checkpoint movement",
+      "verdict": "passed"
+    },
+    {
+      "id": "QA-CONSOLE-08",
+      "contractRef": "TTY validated before settlement (review finding)",
+      "invocation": "bun test test/integration/console.test.ts",
+      "expected": "a non-TTY invocation must not consume the console checkpoint",
+      "observed": "healthy daemon + piped stdio exits 1 with TTY error, checkpoint and outbox unchanged, then a valid terminal renders the pending event",
+      "verdict": "passed"
+    },
+    {
+      "id": "QA-HYGIENE-01",
+      "contractRef": "Suite reliability (leader-found defect)",
+      "invocation": "bun test x5 with pgrep after each run",
+      "expected": "no daemon survives a suite run; suite is not flaky",
+      "observed": "five consecutive runs 76 pass / 0 fail, zero surviving daemons after each; previously three daemons leaked for 22h",
+      "verdict": "passed"
     }
   ],
   "residuals": [
     {
       "id": "QA-RESIDUAL-P7-LIVE",
       "contractRef": "plan phase P7 acceptance: owner-DM round trip against a LIVE configured route",
-      "status": "owner_blocked",
-      "detail": "Requires owner-supplied Discord bot credentials and a real channel. Cannot be simulated in-repo. The fixture round trip, way-discord --check, and ops/runbooks/operations.md live-verification procedure are implemented; the live drill itself needs the owner. Both review lanes classify this as an owner-gated operational deferral rather than a source defect."
+      "status": "owner_deferred",
+      "detail": "Owner directed at runtime that the local console come first and chat adapters (live Discord route, future Telegram) be the final gate; that decision plus the explicit override of the v1 no-CLI Non-Goal is recorded in the ultragoal ledger. The drill needs an owner-authorized bot token with DM + Message Content intents and a real owner DM channel, none of which exist on this host. Tracked as story G013."
     }
   ],
   "blockers": []

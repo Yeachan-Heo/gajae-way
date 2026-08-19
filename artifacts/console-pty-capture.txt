@@ -1,0 +1,10 @@
+^Dhello from the pty probe
+/quit
+Gateway status
+  daemon: status=healthy state=running
+  main: resumed=true session_id=95999573-84c5-40cb-bd99-284ac563f21d turn_state=idle follow_up_queue_depth=0
+  journal: head_cursor=1:0 degraded=false
+  lock: held=false holder=none queue_len=0 stuck=false quarantined=false write_mode=true
+  reconcile: freshness=unknown last_ok_at=none cycle_ms=unknown drift_count=0
+Owner console ready. Type /help for commands.
+way> 
