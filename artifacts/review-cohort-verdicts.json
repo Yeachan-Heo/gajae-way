@@ -1,0 +1,90 @@
+{
+  "schemaVersion": 1,
+  "kind": "review-cohort-verdicts",
+  "subject": "gajae-way story G014 (local owner console) boundary review cohort",
+  "reviewedSourceCommit": "7ca20433a2a0e232a7885de180651218b41f0016",
+  "reviewedSourceHash": "sha256:83b9782839ad5a6d5d8b63557dcf6d59e71bcd5d6208ac361171012bd5418261",
+  "reviewGeneration": 14,
+  "note": "Persisted because agent:// lane outputs are transient. This file is committed as an artifact-only child of the reviewed source commit, so the reviewed tree hash above is by construction this file's parent; that self-reference is unavoidable and was previously reviewed as coherent provenance. Both lanes are read-only reviewers.",
+  "lanes": {
+    "cleaner": {
+      "agent": "24-CohortCleaner2",
+      "role": "ai-slop-cleaner (read-only detector)",
+      "architecturalStatus": "CLEAR",
+      "codeReviewRecommendation": "APPROVE",
+      "blockingFindings": 0,
+      "advisoryFindings": 0,
+      "summary": "Zero blocking findings remain. K-1 and L-1 are resolved, and this delta introduces no novel correctness, masked-failure, or resource-bound defect in shipped behavior. No advisory/hardening finding warrants another revision.",
+      "verifiedClaims": [
+        "Refusal state has a compile-time-fixed three-cause set (oversized-line, queue-full-lines, queue-full-bytes) stored in one fixed-size record (src/console/console.ts:60-69,1109-1122); it cannot grow with input variety or line count.",
+        "Each rejected line increments exactly one primary cause; an already-full line queue is classified as line-capacity refusal while byte-capacity refusal remains distinct when the byte bound is reached first (src/console/console.ts:1025-1041,1054-1068).",
+        "Same-chunk oversized input no longer clears its diagnostic at the terminating newline: discard state resets but pending refusal evidence remains until publication, exit, or close (src/console/console.ts:997-1006,1125-1127).",
+        "Multiple causes arriving before publication merge into the same bounded object; counts added while an earlier snapshot is blocked in output are subtracted only after that snapshot publishes, then emitted in the next bounded frame (src/console/console.ts:1129-1171,1180-1188).",
+        "The publication protocol is sound under backpressure: it snapshots all three counts plus a revision, emits one stream write, and clears only when no newer refusal arrived, preventing both lost causes and double-reporting.",
+        "Retained refusal does not improperly leak across saturation episodes; memory remains O(1); exit/close clears it without waiting on stdout.",
+        "New drills assert observable terminal results rather than shallow call order: same-chunk oversized refusal, continued command-loop usability, mixed-cause counts, transient-backpressure retention, distinct byte-capacity reporting, non-echo of rejected payloads, FIFO, and unchanged queue bounds."
+      ],
+      "notedNonBlocking": "Counters use JavaScript numbers; precision would theoretically degrade beyond Number.MAX_SAFE_INTEGER, but exceeding nine quadrillion refused lines in one unpublished process lifetime is not a credible shipped path and does not justify a blocker or advisory."
+    },
+    "architect": {
+      "agent": "25-CohortArchitect2",
+      "role": "architect three-lens review (read-only)",
+      "architectureStatus": "CLEAR",
+      "productStatus": "CLEAR",
+      "codeStatus": "CLEAR",
+      "codeReviewRecommendation": "APPROVE",
+      "blockingFindings": 0,
+      "advisoryFindings": 0,
+      "summary": "L-1 is resolved without weakening the previously cleared input, terminal, delivery, or resource-bound contracts. The delta uses one fixed-size refusal aggregate with per-cause counters and safely accounts for refusals that arrive before or during a backpressured publication.",
+      "verifiedClaims": [
+        "Refusal causes are a closed, fixed-size set (src/console/console.ts:61-68).",
+        "reportInputRefusal increments the appropriate counter in the single pending object instead of suppressing later causes (src/console/console.ts:1109-1122).",
+        "Publication snapshots counts and revision; refusals arriving during a stalled write remain in the same object and are emitted in a subsequent bounded frame rather than lost (src/console/console.ts:1129-1170,1180-1188).",
+        "Exit and close still clear pending refusal state immediately and do not wait for output recovery (src/console/console.ts:978-990,1077-1087).",
+        "Preserved contracts: accepted lines remain FIFO with the 16-line / 64 KiB / 8 KiB bounds; refused payloads are not echoed; Ctrl-C/Ctrl-D remain synchronously observable and independent of an active reader or output recovery; echo publication remains coalesced and bounded; admission remains gateway-authoritative; delivery readiness, publication-proof-before-commit, atomic terminal frames and bounded exit are unchanged.",
+        "Mixed-cause integration drill exercises operation-cap saturation plus one chunk containing an oversized line, 16 accepted lines and one excess normal command (test/integration/console.test.ts:1228-1290); the unit drill covers the same interaction while stdout is backpressured and verifies one combined frame after recovery (test/unit/console.test.ts:481-535)."
+      ],
+      "productRuling": "Product is CLEAR for this scoped checkpoint. The local owner console's refusal reporting is now complete and bounded. The owner-deferred live Discord configured-route round trip remains the separate G013 final gate and does not reduce this checkpoint's Product status."
+    }
+  },
+  "consoleReviewHistory": {
+    "generations": 8,
+    "blockersFoundByLanesAndFixed": [
+      "delivery-readiness fence missing before accepting owner input",
+      "unsanitized gateway text on a raw TTY (ANSI/OSC/OSC-52 injection)",
+      "checkpoint advanced before terminal publication was confirmed",
+      "startup refusal exited zero",
+      "duplicated settlement protocol between console and Discord outbox (extracted to a shared journal consumer)",
+      "TTY validated only after startup could claim/render/commit the console checkpoint",
+      "command loop went deaf during its own turn, making /gate unanswerable and steer impossible",
+      "raw-TTY frames could erase their own gateway-derived content under prompt redraw",
+      "input echo interleaved inside an otherwise complete frame",
+      "exit could hang unbounded on a stalled output tail",
+      "real TTY input silently discarded on multi-line paste and at cap saturation",
+      "unbounded input queue defeated the operation cap",
+      "pausing raw stdin at saturation made Ctrl-C/Ctrl-D undeliverable (deadlock)",
+      "unbounded echo publication under stalled stdout",
+      "queue-full refusal expired after 250 ms, silently losing discarded commands",
+      "same-chunk oversized line cleared its own refusal before publication",
+      "first-refusal-wins suppressed a later queue-full diagnostic"
+    ],
+    "defectsFoundByLeaderNotLanes": [
+      "three leaked test daemons with 22-hour lifetimes causing an intermittent full-suite failure; fixed by a shared ManagedProcessRegistry that tracks children and process groups, escalates SIGTERM to SIGKILL while waiting for real exit, and reaps in afterEach; verified by five consecutive clean full runs with zero surviving daemons",
+      "drain-on-exit regression introduced by the concurrency fix: quitting with an operation in flight silently discarded its result"
+    ],
+    "terminalCriticHistory": [
+      "pause terminus: OKAY (three times, while the live Discord route was the only blocker and before the owner deferred it)",
+      "completion terminus: ITERATE - found the command-loop deafness and the frame-erasure defects, and that the gate drill had bypassed the real command loop",
+      "completion terminus: ITERATE - found the QA evidence stale by seven commits and the CLEAR verdicts durable only in transient agent output; addressed by this artifact plus the refreshed QA report"
+    ]
+  },
+  "verificationAtReviewedSource": {
+    "typescript": "bunx tsc --noEmit clean",
+    "rust": "cargo test -p way-core: 55 passed",
+    "bun": "bun test: 103 pass / 2 skip / 0 fail",
+    "e2e": "bun test test/e2e/: 15 pass",
+    "transcript": "bun test/qa/console-transcript.ts: deliveredAsRendered true, assistantReplyRendered true, consumer cursor 1:3",
+    "build": "bun scripts/build-native.ts && bun scripts/compile.ts: native rebuilt, way and way-discord compiled",
+    "processHygiene": "pgrep -f 'dist/way|src/main.ts' returns zero after full runs"
+  }
+}

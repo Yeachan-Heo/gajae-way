@@ -2,15 +2,16 @@
   "schemaVersion": 1,
   "kind": "api-package-test-report",
   "subject": "gajae-way v1 (plan phases P0-P8) plus owner-directed local console (G014); live chat-adapter acceptance deferred to the final gate",
-  "frozenCommit": "730bc7d (console correctness generation; sourceHash sha256:4ab6efb9f80514557424949ed1017e26337c3dfd841b1bc86a25a30a8fe76cca)",
+  "frozenCommit": "7ca20433a2a0e232a7885de180651218b41f0016 (reviewed source; sourceHash sha256:83b9782839ad5a6d5d8b63557dcf6d59e71bcd5d6208ac361171012bd5418261). This report is committed as an artifact-only child of that commit.",
   "producedBy": "ultragoal leader (delegated executor QA lane failed three times; leader ran the matrix directly)",
   "contract": ".gjc/_session-01a00ef5-0d0c-7000-b6f1-36f0fe3f8080/plans/ralplan/01a00ef5-0d0c-7000-b6f1-36f0fe3f8080/pending-approval.md",
   "rerunCommands": [
-    "cargo test -p way-core",
-    "bun test (x5 consecutive)",
-    "bun test test/e2e/",
+    "cargo test -p way-core (55 passed)",
+    "bun test (103 pass / 2 skip / 0 fail)",
+    "bun test test/e2e/ (15 pass)",
     "bun test test/qa/",
-    "bunx tsc --noEmit",
+    "bun test/qa/console-transcript.ts (full round trip)",
+    "bunx tsc --noEmit (clean)",
     "bun scripts/build-native.ts",
     "bun scripts/compile.ts"
   ],
@@ -338,9 +339,9 @@
     {
       "id": "QA-HYGIENE-01",
       "contractRef": "Suite reliability (leader-found defect)",
-      "invocation": "bun test x5 with pgrep after each run",
+      "invocation": "bun test x5 with pgrep after each run (re-verified at the current snapshot)",
       "expected": "no daemon survives a suite run; suite is not flaky",
-      "observed": "five consecutive runs 76 pass / 0 fail, zero surviving daemons after each; previously three daemons leaked for 22h",
+      "observed": "Five consecutive runs clean with zero surviving daemons after each; at the current snapshot the suite stands at 103 pass / 2 skip / 0 fail (the original five-run verification was performed at the 76-test generation when the leak was found and fixed, and process hygiene has been re-checked at every snapshot since, always zero survivors).",
       "verdict": "passed"
     },
     {
@@ -390,6 +391,54 @@
       "expected": "multi-line paste processes every line in order; at the concurrency cap input is queued or explicitly refused, never discarded",
       "observed": "multi-line raw chunk and cap-saturation drills pass",
       "verdict": "passed"
+    },
+    {
+      "id": "QA-CONSOLE-15",
+      "contractRef": "Input bounds (cleaner CONSOLE-009)",
+      "invocation": "bun test test/unit/console.test.ts test/integration/console.test.ts",
+      "expected": "queued input is bounded rather than growing with the operation cap",
+      "observed": "bounded at 16 queued lines / 64 KiB queued / 8 KiB unfinished line with FIFO preserved",
+      "verdict": "passed"
+    },
+    {
+      "id": "QA-CONSOLE-16",
+      "contractRef": "Control observability at saturation (cleaner CONSOLE-010)",
+      "invocation": "bun test test/integration/console.test.ts",
+      "expected": "Ctrl-C/Ctrl-D must stay deliverable when every operation is stalled and the queue is full",
+      "observed": "stdin is never paused for saturation; raw \u0003 and \u0004 sent as real input bytes at full capacity are observed and start the bounded drain",
+      "verdict": "passed"
+    },
+    {
+      "id": "QA-CONSOLE-17",
+      "contractRef": "Echo publication bound (cleaner CONSOLE-011)",
+      "invocation": "bun test test/unit/console.test.ts",
+      "expected": "sustained input against stalled stdout must not grow publication state per character",
+      "observed": "echo coalesced to one pending redraw plus one active publisher (O(1)); refused payloads not echoed; controls parsed before any output publication",
+      "verdict": "passed"
+    },
+    {
+      "id": "QA-CONSOLE-18",
+      "contractRef": "Refusal survives transient backpressure (cleaner CONSOLE-012)",
+      "invocation": "bun test test/unit/console.test.ts",
+      "expected": "a discarded command must still be reported after output recovers",
+      "observed": "one retained refusal publishes exactly one frame after stdout recovers; no time-based expiry",
+      "verdict": "passed"
+    },
+    {
+      "id": "QA-CONSOLE-19",
+      "contractRef": "Same-chunk oversized line (architect K-1)",
+      "invocation": "bun test test/unit/console.test.ts test/integration/console.test.ts",
+      "expected": "an oversized line plus its newline in one chunk must not vanish silently",
+      "observed": "exactly one visible refusal, no line admitted, console remains usable afterwards",
+      "verdict": "passed"
+    },
+    {
+      "id": "QA-CONSOLE-20",
+      "contractRef": "Mixed refusal causes (architect L-1)",
+      "invocation": "bun test test/integration/console.test.ts test/unit/console.test.ts",
+      "expected": "overlapping refusal causes must all be reported, not just the first",
+      "observed": "one combined frame names every nonzero cause with correct per-cause counts; bounded fixed-size cause set retained",
+      "verdict": "passed"
     }
   ],
   "residuals": [
@@ -411,6 +460,12 @@
       "at": "2026-08-19T06:47:06.053Z",
       "by": "ultragoal leader",
       "detail": "Refreshed to the console correctness generation: QA-CONSOLE-05 restored to passed now that interactive gate answering runs through the real command loop, and six new cases added covering the two terminal-critic findings, the leader-found exit-drain regression, and the three follow-on blockers (echo/frame atomicity, bounded exit, input never dropped)."
+    },
+    {
+      "at": "2026-08-19T09:40:31.909Z",
+      "by": "ultragoal leader after terminal-critic ITERATE on evidence durability",
+      "detail": "Rebound this report from 730bc7d to the reviewed source 7ca2043, corrected the stale 76-test hygiene observation to the current 103-pass verification, added six cases binding the later console correctness fixes (input bounds, control observability at saturation, echo publication bound, refusal retention across backpressure, same-chunk oversized line, mixed refusal causes), and linked the durable review verdicts artifact."
     }
-  ]
+  ],
+  "reviewVerdicts": "artifacts/review-cohort-verdicts.json (cleaner CLEAR/APPROVE zero findings; architect Architecture/Product/Code CLEAR, APPROVE, no findings)"
 }
