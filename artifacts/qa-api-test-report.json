@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "kind": "api-package-test-report",
   "subject": "gajae-way v1 (plan phases P0-P8) plus owner-directed local console (G014); live chat-adapter acceptance deferred to the final gate",
-  "frozenCommit": "b4092cf (console scope; sourceHash sha256:cfabc3bb6a595e11fd2abb7ea5e67d6a0e6c1d7763bdc41603980241df68ac9e)",
+  "frozenCommit": "pending-commit (console correctness generation; supersedes b4092cf stamp)",
   "producedBy": "ultragoal leader (delegated executor QA lane failed three times; leader ran the matrix directly)",
   "contract": ".gjc/_session-01a00ef5-0d0c-7000-b6f1-36f0fe3f8080/plans/ralplan/01a00ef5-0d0c-7000-b6f1-36f0fe3f8080/pending-approval.md",
   "rerunCommands": [
@@ -308,9 +308,8 @@
       "contractRef": "G014: durable gate answering",
       "invocation": "bun test test/integration/console.test.ts",
       "expected": "owner answer resolves a durable gate; wrong expectedSessionId refused",
-      "observed": "CORRECTED after terminal-critic review: the drill invoked consoleSurface.answerGate(...) directly rather than typing /gate through the real command loop, so this case proved the gate RPC path (durable gate_id + expectedSessionId, 1102 on mismatch) but NOT interactive gate answering. Interactive coverage is being added under defect D-1.",
-      "verdict": "partial",
-      "note": "Do not read this row as evidence that an owner can answer a gate from the running console; that path was blocked by the command loop awaiting its own submit."
+      "observed": "RESOLVED on this snapshot: interactive gate answering is now exercised through the REAL command loop - a pending prompt opens a workflow gate, /gate is supplied via runWayConsole input (not a direct answerGate call), the gate resolves and the original turn completes. Mismatched expectedSessionId still returns 1102.",
+      "verdict": "passed"
     },
     {
       "id": "QA-CONSOLE-06",
@@ -343,6 +342,54 @@
       "expected": "no daemon survives a suite run; suite is not flaky",
       "observed": "five consecutive runs 76 pass / 0 fail, zero surviving daemons after each; previously three daemons leaked for 22h",
       "verdict": "passed"
+    },
+    {
+      "id": "QA-CONSOLE-09",
+      "contractRef": "G014 interactive concurrency (critic ITERATE finding D-1)",
+      "invocation": "bun test test/integration/console.test.ts",
+      "expected": "command loop stays readable while its own submit is in flight; a message typed during a busy turn is admitted as a steer",
+      "observed": "real-loop gate answer and busy-turn steer drills pass; gateway-derived Delivered as: steer observed",
+      "verdict": "passed"
+    },
+    {
+      "id": "QA-CONSOLE-10",
+      "contractRef": "G014 frame integrity (critic ITERATE finding D-2)",
+      "invocation": "bun test test/integration/console.test.ts",
+      "expected": "multi-part renders cannot erase their own content under prompt redraw; concurrent publishers cannot interleave mid-frame",
+      "observed": "prompt-repaint drill keeps full assistant text plus gate id and session id visible with way> active; concurrent-publisher serialization drill passes",
+      "verdict": "passed"
+    },
+    {
+      "id": "QA-CONSOLE-11",
+      "contractRef": "Exit drain (leader-found regression E-1)",
+      "invocation": "bun test test/integration/console.test.ts",
+      "expected": "quitting with an operation in flight must not silently discard its result",
+      "observed": "submit-then-quit renders delivered_as before close; grace-elapsed case emits an explicit outstanding-operations frame; delivery-loss teardown still closes immediately",
+      "verdict": "passed"
+    },
+    {
+      "id": "QA-CONSOLE-12",
+      "contractRef": "Echo/frame atomicity (architect finding F-1)",
+      "invocation": "bun test test/integration/console.test.ts",
+      "expected": "a keystroke arriving between terminal write phases cannot corrupt a frame",
+      "observed": "keystroke injected across the production write phases leaves the full frame, prompt and buffer intact",
+      "verdict": "passed"
+    },
+    {
+      "id": "QA-CONSOLE-13",
+      "contractRef": "Bounded exit (cleaner CONSOLE-007)",
+      "invocation": "bun test test/integration/console.test.ts",
+      "expected": "exit completes within a bound even if the output writer never resolves",
+      "observed": "permanently-stalled-writer drill exits within the bound",
+      "verdict": "passed"
+    },
+    {
+      "id": "QA-CONSOLE-14",
+      "contractRef": "Input never silently dropped (cleaner CONSOLE-008)",
+      "invocation": "bun test test/integration/console.test.ts",
+      "expected": "multi-line paste processes every line in order; at the concurrency cap input is queued or explicitly refused, never discarded",
+      "observed": "multi-line raw chunk and cap-saturation drills pass",
+      "verdict": "passed"
     }
   ],
   "residuals": [
@@ -359,6 +406,11 @@
       "at": "2026-08-19T04:47:52.162Z",
       "by": "ultragoal leader after terminal-critic ITERATE",
       "detail": "QA-CONSOLE-05 downgraded from passed to partial: it bypassed the interactive command loop. Two console defects were found by the critic and are being fixed: (D-1) the command loop cannot read input while its own submit is in flight, so /gate and steering are unreachable during a turn; (D-2) prompt redraw can erase multi-call rendered frames including assistant text and gate ids."
+    },
+    {
+      "at": "2026-08-19T06:47:06.053Z",
+      "by": "ultragoal leader",
+      "detail": "Refreshed to the console correctness generation: QA-CONSOLE-05 restored to passed now that interactive gate answering runs through the real command loop, and six new cases added covering the two terminal-critic findings, the leader-found exit-drain regression, and the three follow-on blockers (echo/frame atomicity, bounded exit, input never dropped)."
     }
   ]
 }

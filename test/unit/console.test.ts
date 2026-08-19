@@ -1,10 +1,80 @@
 import { expect, test } from "bun:test";
 import {
 	ConsoleOutput,
+	RawConsoleTerminal,
 	consoleStartupDecision,
 	renderConsoleStatusSummary,
 	sanitizeConsoleText,
 } from "../../src/console/console";
+
+class RawInputHarness {
+	readonly isTTY = true;
+	isRaw = false;
+	readonly #listeners = new Set<(chunk: string | Buffer) => void>();
+
+	setEncoding(_encoding: BufferEncoding): void {}
+
+	setRawMode(enabled: boolean): void {
+		this.isRaw = enabled;
+	}
+
+	resume(): void {}
+
+	pause(): void {}
+
+	on(_event: "data", listener: (chunk: string | Buffer) => void): void {
+		this.#listeners.add(listener);
+	}
+
+	off(_event: "data", listener: (chunk: string | Buffer) => void): void {
+		this.#listeners.delete(listener);
+	}
+
+	send(chunk: string): void {
+		for (const listener of [...this.#listeners]) listener(chunk);
+	}
+}
+
+class RawOutputHarness {
+	readonly isTTY = true;
+	readonly writes: string[] = [];
+	onWrite: ((text: string) => void) | undefined;
+
+	write(text: string, callback: (error?: Error | null) => void): boolean {
+		this.writes.push(text);
+		this.onWrite?.(text);
+		callback();
+		return true;
+	}
+
+	once(_event: "drain", _listener: () => void): void {}
+}
+
+function rawScreen(writes: readonly string[]): string {
+	const lines: string[] = [];
+	let current = "";
+	for (const write of writes) {
+		for (let index = 0; index < write.length; index += 1) {
+			const character = write[index] as string;
+			if (character === "\r") {
+				current = "";
+				continue;
+			}
+			if (character === "\x1b" && write.slice(index, index + 4) === "\x1b[2K") {
+				current = "";
+				index += 3;
+				continue;
+			}
+			if (character === "\n") {
+				lines.push(current);
+				current = "";
+				continue;
+			}
+			current += character;
+		}
+	}
+	return [...lines, current].join("\n");
+}
 
 const healthyHealth = {
 	status: "healthy",
@@ -111,4 +181,46 @@ test("console output serializes complete frames from concurrent publishers", asy
 	releaseFirst?.();
 	await Promise.all([first, second]);
 	expect(writes).toEqual(["first frame\n", "second frame\n"]);
+});
+
+test("raw terminal publishes one production frame before an injected concurrent keystroke", async () => {
+	const input = new RawInputHarness();
+	const output = new RawOutputHarness();
+	const terminal = new RawConsoleTerminal({ input, output });
+	const pendingLine = terminal.readLine("way> ");
+	let injected = false;
+	output.onWrite = (text) => {
+		if (!injected && text.includes("assistant frame must remain whole")) {
+			injected = true;
+			input.send("x");
+		}
+	};
+	try {
+		await terminal.writeTrusted("Assistant:\nassistant frame must remain whole\n");
+		await Bun.sleep(0);
+		const frameWrites = output.writes.filter((write) => write.includes("assistant frame must remain whole"));
+		expect(frameWrites).toEqual(["\r\x1b[2KAssistant:\nassistant frame must remain whole\nway> "]);
+		expect(output.writes.indexOf("x")).toBeGreaterThan(output.writes.indexOf(frameWrites[0] as string));
+		const screen = rawScreen(output.writes);
+		expect(screen).toContain("Assistant:\nassistant frame must remain whole");
+		expect(screen.endsWith("way> x")).toBe(true);
+	} finally {
+		terminal.close();
+		await pendingLine;
+	}
+});
+
+test("raw terminal queues every complete line in a multi-line input chunk", async () => {
+	const input = new RawInputHarness();
+	const output = new RawOutputHarness();
+	const terminal = new RawConsoleTerminal({ input, output });
+	try {
+		const first = terminal.readLine("way> ");
+		input.send("first\nsecond\nthird\n");
+		expect(await first).toBe("first");
+		expect(await terminal.readLine("way> ")).toBe("second");
+		expect(await terminal.readLine("way> ")).toBe("third");
+	} finally {
+		terminal.close();
+	}
 });

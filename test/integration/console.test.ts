@@ -765,6 +765,37 @@ test("console reports outstanding operations when exit grace elapses", async () 
 	}
 }, 15_000);
 
+test("console closes within a bound when a stalled terminal writer blocks the outstanding-operation frame", async () => {
+	const gateway = await hostedConsoleGateway();
+	const never = new Promise<void>(() => undefined);
+	let stallWrites = false;
+	const terminal = controlledTerminal({
+		onWrite: async () => {
+			if (stallWrites) await never;
+		},
+	});
+	const running = runWayConsole({ stateDir: gateway.stateDirectory, profilePath: gateway.profilePath }, [], {
+		terminal: terminal.terminal,
+		exitDrainMs: 25,
+	});
+	let finished = false;
+	try {
+		await eventually(terminal.isReading, "console did not begin reading interactive input");
+		stallWrites = true;
+		const startedAt = performance.now();
+		terminal.send("stall a completion frame");
+		terminal.send("/quit");
+		finished = await Promise.race([running.then(() => true), Bun.sleep(500).then(() => false)]);
+		expect(finished).toBe(true);
+		expect(performance.now() - startedAt).toBeLessThan(500);
+		expect(terminal.isClosed()).toBe(true);
+	} finally {
+		terminal.terminal.close();
+		await gateway.stop();
+		if (finished) await running.catch(() => undefined);
+	}
+}, 15_000);
+
 test("delivery loss closes immediately without waiting for outstanding owner operations", async () => {
 	const gateId = "gate-delivery-loss";
 	const sdk = new FileSdkDouble({ gateOnPrompt: { text: "hold through delivery loss", gateId } });
@@ -820,6 +851,91 @@ test("delivery loss closes immediately without waiting for outstanding owner ope
 				idempotency_key: "release-delivery-loss-cleanup",
 			})
 			.catch(() => undefined);
+		terminal.terminal.close();
+		await gateway.stop();
+		await running.catch(() => undefined);
+	}
+}, 15_000);
+
+test("console queues cap-saturated owner lines until all queued lines are admitted", async () => {
+	const gateway = await hostedConsoleGateway();
+	const terminal = controlledTerminal();
+	const submissionsReleased = deferred();
+	let submitCalls = 0;
+	let eventReads = 0;
+	const fakeRpc: JsonRpcClient = {
+		async request(method: string, _params?: unknown, options?: RpcRequestOptions): Promise<JsonRpcResponse> {
+			if (method === "way.health") {
+				return {
+					jsonrpc: "2.0",
+					id: 1,
+					result: { status: "healthy", state: "running", main: { resumed: true, session_id: "fake" } },
+				};
+			}
+			if (method === "way.status") {
+				return {
+					jsonrpc: "2.0",
+					id: 1,
+					result: {
+						status: "healthy",
+						state: "running",
+						main: { resumed: true, session_id: "fake" },
+						turn_state: "idle",
+						follow_up_queue_depth: 0,
+						journal: { head_cursor: "1:0", degraded: false },
+						lock: { held: false, queue_len: 0, stuck: false, quarantined: false },
+						write_mode: true,
+						reconcile: { drift_count: 0 },
+					},
+				};
+			}
+			if (method === "consumer.claim") {
+				return {
+					jsonrpc: "2.0",
+					id: 1,
+					result: { claim_id: `claim-${eventReads}`, cursor: "1:0", expires_at: Date.now() + 60_000 },
+				};
+			}
+			if (method === "main.events.read") {
+				eventReads += 1;
+				if (eventReads === 1) return { jsonrpc: "2.0", id: 1, result: { events: [], next_cursor: "1:0" } };
+				return await new Promise<JsonRpcResponse>((_resolve, reject) => {
+					const signal = options?.signal;
+					const abort = () => reject(new Error("events read aborted"));
+					if (signal?.aborted) return abort();
+					signal?.addEventListener("abort", abort, { once: true });
+				});
+			}
+			if (method === "consumer.commit") return { jsonrpc: "2.0", id: 1, result: {} };
+			if (method === "main.submit") {
+				submitCalls += 1;
+				await submissionsReleased.promise;
+				return {
+					jsonrpc: "2.0",
+					id: 1,
+					result: { accepted: true, op_ref: `op-${submitCalls}`, delivered_as: "prompt" },
+				};
+			}
+			throw new Error(`unexpected test RPC method: ${method}`);
+		},
+		close(): void {},
+	};
+	const running = runWayConsole({ stateDir: gateway.stateDirectory, profilePath: gateway.profilePath }, [], {
+		terminal: terminal.terminal,
+		profile: loadWayProfile(gateway.profilePath),
+		rpcConnect: async () => fakeRpc,
+	});
+	try {
+		await eventually(terminal.isReading, "console did not begin reading interactive input");
+		for (let index = 0; index < 17; index += 1) terminal.send(`queued owner line ${index}`);
+		terminal.send("/quit");
+		await eventually(() => submitCalls === 16, "console did not saturate the bounded input-operation cap");
+		submissionsReleased.resolve();
+		await running;
+		expect(submitCalls).toBe(17);
+		expect(terminal.writes.filter((write) => write === "Delivered as: prompt\n")).toHaveLength(17);
+	} finally {
+		submissionsReleased.resolve();
 		terminal.terminal.close();
 		await gateway.stop();
 		await running.catch(() => undefined);

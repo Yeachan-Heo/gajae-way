@@ -20,6 +20,7 @@ export const DEFAULT_CONSOLE_CLAIM_TTL_MS = 5_000;
 export const DEFAULT_CONSOLE_READ_WAIT_MS = 1_000;
 export const DEFAULT_CONSOLE_EXIT_DRAIN_MS = 2_000;
 const MAX_CONSOLE_INPUT_OPERATIONS = 16;
+const MAX_CONSOLE_EXIT_DIAGNOSTIC_MS = 250;
 
 export type WayConsoleEventKind = (typeof WAY_CONSOLE_EVENT_KINDS)[number];
 export type ConsoleConsumerRunResult = "rendered" | "idle";
@@ -50,6 +51,28 @@ export interface ConsoleTerminal {
 	writeTrusted(text: string): Promise<void>;
 	readLine(prompt: string): Promise<string | undefined>;
 	close(): void;
+}
+
+interface RawConsoleInputStream {
+	readonly isTTY?: boolean;
+	readonly isRaw?: boolean;
+	setEncoding(encoding: BufferEncoding): unknown;
+	setRawMode?(mode: boolean): unknown;
+	resume(): unknown;
+	pause(): unknown;
+	on(event: "data", listener: (chunk: string | Buffer) => void): unknown;
+	off(event: "data", listener: (chunk: string | Buffer) => void): unknown;
+}
+
+interface RawConsoleOutputStream {
+	readonly isTTY?: boolean;
+	write(text: string, callback: (error?: Error | null) => void): boolean;
+	once(event: "drain", listener: () => void): unknown;
+}
+
+export interface RawConsoleTerminalOptions {
+	readonly input?: RawConsoleInputStream;
+	readonly output?: RawConsoleOutputStream;
 }
 
 /**
@@ -680,7 +703,7 @@ export async function runWayConsole(
 		} finally {
 			input.abort();
 			events.abort();
-			await eventLoop;
+			if (!(await waitForConsoleLoopStop(eventLoop, MAX_CONSOLE_EXIT_DIAGNOSTIC_MS))) activeTerminal.close();
 		}
 		if (deliveryFailure) throw deliveryFailure;
 		if (inputFailure) throw inputFailure;
@@ -745,9 +768,12 @@ async function readConsoleInput(
 
 	if (!teardownImmediately && !options.signal?.aborted && inFlight.size > 0) {
 		const drainResult = await drainInputOperations(inFlight, options.exitDrainMs, options.signal);
-		if (drainResult === "expired" && !options.signal?.aborted) {
-			await Promise.resolve();
-			if (inFlight.size > 0) await options.reportOutstanding(inFlight.size);
+		if (drainResult === "expired" && !options.signal?.aborted && inFlight.size > 0) {
+			const published = await publishExitOutstandingFrame(
+				options.reportOutstanding(inFlight.size),
+				Math.min(options.exitDrainMs, MAX_CONSOLE_EXIT_DIAGNOSTIC_MS),
+			);
+			if (!published) terminal.close();
 		}
 	}
 	if (failure) throw failure;
@@ -777,6 +803,42 @@ async function drainInputOperations(
 	});
 }
 
+/** A stalled serialized terminal tail must not turn graceful exit into an unbounded wait. */
+async function publishExitOutstandingFrame(publication: Promise<void>, timeoutMs: number): Promise<boolean> {
+	return await new Promise((resolve) => {
+		let finished = false;
+		const finish = (published: boolean): void => {
+			if (finished) return;
+			finished = true;
+			clearTimeout(timeout);
+			resolve(published);
+		};
+		const timeout = setTimeout(() => finish(false), timeoutMs);
+		void publication.then(
+			() => finish(true),
+			() => finish(false),
+		);
+	});
+}
+
+/** A journal publisher stalled behind terminal output cannot block process teardown. */
+async function waitForConsoleLoopStop(loop: Promise<void>, timeoutMs: number): Promise<boolean> {
+	return await new Promise((resolve) => {
+		let finished = false;
+		const finish = (stopped: boolean): void => {
+			if (finished) return;
+			finished = true;
+			clearTimeout(timeout);
+			resolve(stopped);
+		};
+		const timeout = setTimeout(() => finish(false), timeoutMs);
+		void loop.then(
+			() => finish(true),
+			() => finish(true),
+		);
+	});
+}
+
 async function waitForInputSlot(inFlight: ReadonlySet<Promise<void>>, signal?: AbortSignal): Promise<void> {
 	if (!signal) {
 		await Promise.race(inFlight);
@@ -796,15 +858,19 @@ async function waitForInputSlot(inFlight: ReadonlySet<Promise<void>>, signal?: A
 	});
 }
 
-class RawConsoleTerminal implements ConsoleTerminal {
-	readonly #input = stdin;
-	readonly #output = stdout;
+export class RawConsoleTerminal implements ConsoleTerminal {
+	readonly #input: RawConsoleInputStream;
+	readonly #output: RawConsoleOutputStream;
 	#buffer = "";
+	readonly #queuedLines: string[] = [];
 	#prompt = "";
 	#resolveLine: ((line: string | undefined) => void) | undefined;
+	#writeTail: Promise<void> = Promise.resolve();
 	#closed = false;
 
-	constructor() {
+	constructor(options: RawConsoleTerminalOptions = {}) {
+		this.#input = options.input ?? stdin;
+		this.#output = options.output ?? stdout;
 		if (!this.#input.isTTY || !this.#output.isTTY || !this.#input.setRawMode) {
 			throw new WayConsoleError("way console requires an interactive TTY on stdin and stdout.");
 		}
@@ -816,24 +882,27 @@ class RawConsoleTerminal implements ConsoleTerminal {
 
 	async writeTrusted(text: string): Promise<void> {
 		if (this.#closed) throw new WayConsoleError("Console terminal is closed.");
-		if (!this.#resolveLine) {
-			await writeToStream(this.#output, text);
-			return;
-		}
-		await writeToStream(this.#output, "\r\x1b[2K");
-		await writeToStream(this.#output, text);
-		await writeToStream(this.#output, `${this.#prompt}${this.#buffer}`);
+		const frame = this.#resolveLine ? `\r\x1b[2K${text}${this.#prompt}${this.#buffer}` : text;
+		await this.write(frame);
 	}
 
 	async readLine(prompt: string): Promise<string | undefined> {
 		if (this.#closed) return undefined;
 		if (this.#resolveLine) throw new WayConsoleError("Console already has a pending input line.");
+		const queued = this.#queuedLines.shift();
+		if (queued !== undefined) return queued;
 		this.#prompt = prompt;
-		this.#buffer = "";
-		await writeToStream(this.#output, prompt);
-		return await new Promise((resolve) => {
+		const line = new Promise<string | undefined>((resolve) => {
 			this.#resolveLine = resolve;
 		});
+		if (this.#buffer) return await line;
+		try {
+			await this.write(prompt);
+		} catch (error) {
+			this.finishLine(undefined);
+			throw error;
+		}
+		return await line;
 	}
 
 	close(): void {
@@ -841,36 +910,47 @@ class RawConsoleTerminal implements ConsoleTerminal {
 		this.#closed = true;
 		this.#input.off("data", this.onData);
 		this.#input.pause();
-		if (this.#input.isRaw) this.#input.setRawMode(false);
+		if (this.#input.isRaw) this.#input.setRawMode?.(false);
 		this.finishLine(undefined);
 	}
 
 	private onData = (chunk: string | Buffer): void => {
 		for (const character of String(chunk)) {
-			if (!this.#resolveLine) return;
 			if (character === "\u0003" || character === "\u0004") {
-				this.#output.write("\r\n");
-				this.finishLine(undefined);
+				this.writeEcho("\r\n");
+				if (this.#resolveLine) this.finishLine(undefined);
 				return;
 			}
 			if (character === "\r" || character === "\n") {
 				const line = this.#buffer;
-				this.#output.write("\r\n");
-				this.finishLine(line);
-				return;
+				this.#buffer = "";
+				this.writeEcho("\r\n");
+				if (this.#resolveLine) this.finishLine(line);
+				else this.#queuedLines.push(line);
+				continue;
 			}
 			if (character === "\u007f" || character === "\b") {
 				if (!this.#buffer) continue;
 				this.#buffer = this.#buffer.slice(0, -1);
-				this.#output.write("\b \b");
+				this.writeEcho("\b \b");
 				continue;
 			}
 			if (character >= " ") {
 				this.#buffer += character;
-				this.#output.write(character);
+				this.writeEcho(character);
 			}
 		}
 	};
+
+	private async write(text: string): Promise<void> {
+		const publication = this.#writeTail.then(async () => await writeToStream(this.#output, text));
+		this.#writeTail = publication.catch(() => undefined);
+		await publication;
+	}
+
+	private writeEcho(text: string): void {
+		void this.write(text).catch(() => this.close());
+	}
 
 	private finishLine(line: string | undefined): void {
 		const resolve = this.#resolveLine;
@@ -977,7 +1057,7 @@ function sleep(milliseconds: number, signal: AbortSignal): Promise<void> {
 	});
 }
 
-function writeToStream(stream: NodeJS.WriteStream, text: string): Promise<void> {
+function writeToStream(stream: RawConsoleOutputStream, text: string): Promise<void> {
 	if (!text) return Promise.resolve();
 	return new Promise((resolve, reject) => {
 		let callbackDone = false;

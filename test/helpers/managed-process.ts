@@ -222,7 +222,7 @@ async function waitForBunExit(child: TrackedBunProcess, timeoutMs: number): Prom
 async function waitForNodeExit(child: ChildProcess, timeoutMs: number): Promise<boolean> {
 	if (!nodeChildRunning(child)) return true;
 	return await Promise.race([
-		new Promise<boolean>(resolve => child.once("close", () => resolve(true))),
+		new Promise<boolean>((resolve) => child.once("close", () => resolve(true))),
 		Bun.sleep(timeoutMs).then(() => false),
 	]);
 }
@@ -245,13 +245,14 @@ function directChildren(parentPid: number): number[] {
 	return new TextDecoder()
 		.decode(result.stdout)
 		.split(/\s+/)
-		.map(value => Number(value))
+		.map((value) => Number(value))
 		.filter((value): value is number => Number.isSafeInteger(value) && value > 0);
 }
 
 function processGroup(pid: number): number | undefined {
 	const result = Bun.spawnSync({ cmd: ["ps", "-o", "pgid=", "-p", String(pid)], stdout: "pipe", stderr: "ignore" });
-	if (result.exitCode !== 0) return undefined;
+	if (result.exitCode === 1) return undefined;
+	if (result.exitCode !== 0) throw new Error(`Could not inspect process group for managed process ${pid}.`);
 	const group = Number(new TextDecoder().decode(result.stdout).trim());
 	return Number.isSafeInteger(group) && group > 0 ? group : undefined;
 }
