@@ -880,7 +880,6 @@ export class RawConsoleTerminal implements ConsoleTerminal {
 	#bufferBytes = 0;
 	readonly #queuedLines: Array<{ readonly text: string; readonly bytes: number }> = [];
 	#queuedBytes = 0;
-	#queueBlocked = false;
 	#queueRefusalPublished = false;
 	#discardingOversizeLine = false;
 	#prompt = "";
@@ -933,8 +932,7 @@ export class RawConsoleTerminal implements ConsoleTerminal {
 		const queued = this.#queuedLines.shift();
 		if (queued) {
 			this.#queuedBytes -= queued.bytes;
-			this.#queueBlocked = false;
-			this.refreshInputFlow();
+			this.#queueRefusalPublished = false;
 			return queued.text;
 		}
 		this.#prompt = prompt;
@@ -981,7 +979,7 @@ export class RawConsoleTerminal implements ConsoleTerminal {
 				this.#buffer = "";
 				this.#bufferBytes = 0;
 				this.writeEcho("\r\n");
-				if (!this.acceptLine(line)) return;
+				this.acceptLine(line);
 				continue;
 			}
 			if (character === "\u007f" || character === "\b") {
@@ -1006,27 +1004,23 @@ export class RawConsoleTerminal implements ConsoleTerminal {
 		}
 	};
 
-	private acceptLine(line: string): boolean {
+	private acceptLine(line: string): void {
 		if (this.#resolveLine) {
 			this.finishLine(line);
-			return true;
+			return;
 		}
 		const bytes = Buffer.byteLength(line);
 		if (
 			this.#queuedLines.length >= MAX_RAW_CONSOLE_QUEUED_LINES ||
 			this.#queuedBytes + bytes > MAX_RAW_CONSOLE_QUEUED_BYTES
 		) {
-			this.#queueBlocked = true;
-			this.refreshInputFlow();
 			this.reportInputRefusal(
 				`Input queue is full (${MAX_RAW_CONSOLE_QUEUED_LINES} lines / ${MAX_RAW_CONSOLE_QUEUED_BYTES} bytes); additional pasted input was refused.`,
 			);
-			return false;
+			return;
 		}
 		this.#queuedLines.push({ text: line, bytes });
 		this.#queuedBytes += bytes;
-		this.refreshInputFlow();
-		return true;
 	}
 
 	private requestExit(): void {
@@ -1038,19 +1032,11 @@ export class RawConsoleTerminal implements ConsoleTerminal {
 	}
 
 	private refreshInputFlow(): void {
-		const shouldPause =
-			this.#closed ||
-			this.#exitRequested ||
-			this.#queueBlocked ||
-			this.#queuedLines.length >= MAX_RAW_CONSOLE_QUEUED_LINES ||
-			this.#queuedBytes >= MAX_RAW_CONSOLE_QUEUED_BYTES;
+		const shouldPause = this.#closed || this.#exitRequested;
 		if (shouldPause === this.#inputPaused) return;
 		this.#inputPaused = shouldPause;
 		if (shouldPause) this.#input.pause();
-		else {
-			this.#queueRefusalPublished = false;
-			this.#input.resume();
-		}
+		else this.#input.resume();
 	}
 
 	private reportInputRefusal(message: string): void {

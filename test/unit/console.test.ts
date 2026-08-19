@@ -254,21 +254,26 @@ test("raw terminal queues every complete line in a multi-line input chunk", asyn
 	}
 });
 
-test("raw terminal bounds saturated queued input, pauses stdin, and resumes FIFO delivery", async () => {
+test("raw terminal bounds saturated queued input, refuses excess lines visibly, and preserves FIFO delivery", async () => {
 	const input = new RawInputHarness();
 	const output = new RawOutputHarness();
 	const terminal = new RawConsoleTerminal({ input, output });
-	const accepted = Array.from({ length: MAX_RAW_CONSOLE_QUEUED_LINES + 4 }, (_value, index) => `queued-${index}`);
+	const accepted = Array.from({ length: MAX_RAW_CONSOLE_QUEUED_LINES }, (_value, index) => `queued-${index}`);
+	const rejected = Array.from({ length: 4 }, (_value, index) => `rejected-${index}`);
 	try {
 		const first = terminal.readLine("way> ");
 		input.send("first\n");
 		expect(await first).toBe("first");
 		for (const line of accepted) input.send(`${line}\n`);
+		for (const line of rejected) input.send(`${line}\n`);
+		await terminal.writeTrusted("");
 		expect(terminal.queuedLineCount).toBe(MAX_RAW_CONSOLE_QUEUED_LINES);
 		expect(terminal.queuedInputBytes).toBeLessThanOrEqual(MAX_RAW_CONSOLE_QUEUED_BYTES);
-		expect(terminal.inputPaused).toBe(true);
-		expect(input.isPaused).toBe(true);
-		expect(input.blockedChunkCount).toBe(4);
+		expect(terminal.inputPaused).toBe(false);
+		expect(input.isPaused).toBe(false);
+		expect(input.pauseCalls).toBe(0);
+		expect(input.blockedChunkCount).toBe(0);
+		expect(output.writes.join("")).toContain("Input queue is full");
 
 		const received: string[] = [];
 		for (let index = 0; index < accepted.length; index += 1) {
@@ -277,8 +282,6 @@ test("raw terminal bounds saturated queued input, pauses stdin, and resumes FIFO
 		expect(received).toEqual(accepted);
 		expect(terminal.queuedLineCount).toBe(0);
 		expect(terminal.queuedInputBytes).toBe(0);
-		expect(terminal.inputPaused).toBe(false);
-		expect(input.resumeCalls).toBeGreaterThan(1);
 	} finally {
 		terminal.close();
 	}
@@ -296,10 +299,11 @@ test("raw terminal visibly refuses excess lines from a single paste after its bo
 		input.send("first\n");
 		expect(await first).toBe("first");
 		input.send(`${pasted}\n`);
-		await Bun.sleep(0);
+		await terminal.writeTrusted("");
 		expect(terminal.queuedLineCount).toBe(MAX_RAW_CONSOLE_QUEUED_LINES);
 		expect(terminal.queuedInputBytes).toBeLessThanOrEqual(MAX_RAW_CONSOLE_QUEUED_BYTES);
-		expect(terminal.inputPaused).toBe(true);
+		expect(terminal.inputPaused).toBe(false);
+		expect(input.isPaused).toBe(false);
 		expect(output.writes.join("")).toContain("Input queue is full");
 		expect(output.writes.join("")).toContain("additional pasted input was refused");
 	} finally {

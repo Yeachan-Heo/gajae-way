@@ -181,7 +181,6 @@ interface ControlledTerminal {
 	readonly writes: string[];
 	readonly lifecycle: string[];
 	send(line: string): void;
-	signalControl(kind: "interrupt" | "eof"): void;
 	isReading(): boolean;
 	isClosed(): boolean;
 }
@@ -195,8 +194,6 @@ function controlledTerminal(options: ControlledTerminalOptions = {}): Controlled
 	const writes: string[] = [];
 	const lifecycle: string[] = [];
 	let resolveLine: ((line: string | undefined) => void) | undefined;
-	const exitListeners = new Set<() => void>();
-	let exitRequested = false;
 	let closed = false;
 	const send = (line: string): void => {
 		if (closed) throw new Error("terminal is closed");
@@ -208,20 +205,10 @@ function controlledTerminal(options: ControlledTerminalOptions = {}): Controlled
 		resolveLine = undefined;
 		resolve(line);
 	};
-	const signalControl = (kind: "interrupt" | "eof"): void => {
-		if (exitRequested) return;
-		exitRequested = true;
-		lifecycle.push(`control:${kind}`);
-		const resolve = resolveLine;
-		resolveLine = undefined;
-		resolve?.(undefined);
-		for (const listener of [...exitListeners]) listener();
-	};
 	return {
 		writes,
 		lifecycle,
 		send,
-		signalControl,
 		isReading: () => resolveLine !== undefined,
 		isClosed: () => closed,
 		terminal: {
@@ -232,17 +219,12 @@ function controlledTerminal(options: ControlledTerminalOptions = {}): Controlled
 				lifecycle.push(`write:${text}`);
 			},
 			async readLine(): Promise<string | undefined> {
-				if (closed || exitRequested) return undefined;
+				if (closed) return undefined;
 				const queued = pending.shift();
 				if (queued !== undefined) return queued;
 				return await new Promise((resolve) => {
 					resolveLine = resolve;
 				});
-			},
-			onExitRequested(listener: () => void): () => void {
-				exitListeners.add(listener);
-				if (exitRequested) listener();
-				return () => exitListeners.delete(listener);
 			},
 			close(): void {
 				if (closed) return;
@@ -324,7 +306,7 @@ class RawOutputHarness {
 	once(_event: "drain", _listener: () => void): void {}
 }
 
-interface PromptFrameTerminal extends Omit<ControlledTerminal, "signalControl"> {
+interface PromptFrameTerminal extends ControlledTerminal {
 	snapshot(): string;
 }
 
@@ -518,38 +500,47 @@ function blockingSubmissionRpc(release: Promise<void>, submissions: string[]): J
 	};
 }
 
-async function assertBusyControlStartsBoundedDrain(kind: "interrupt" | "eof"): Promise<void> {
+async function assertRawSaturatedControlStartsBoundedDrain(control: "\u0003" | "\u0004"): Promise<void> {
 	const gateway = await hostedConsoleGateway();
-	const terminal = controlledTerminal();
+	const input = new PausableRawInputHarness();
+	const output = new RawOutputHarness();
+	const terminal = new RawConsoleTerminal({ input, output });
 	const release = deferred();
 	const submissions: string[] = [];
+	const initial = Array.from({ length: 16 }, (_value, index) => `busy-${index}`);
+	const queued = Array.from({ length: MAX_RAW_CONSOLE_QUEUED_LINES }, (_value, index) => `queued-${index}`);
+	const rejected = ["rejected-after-saturation", "rejected-after-saturation-again"];
 	const running = runWayConsole({ stateDir: gateway.stateDirectory, profilePath: gateway.profilePath }, [], {
-		terminal: terminal.terminal,
+		terminal,
 		profile: loadWayProfile(gateway.profilePath),
 		rpcConnect: async () => blockingSubmissionRpc(release.promise, submissions),
 		exitDrainMs: 25,
 	});
 	let completed = false;
 	try {
-		await eventually(terminal.isReading, "console did not begin reading interactive input");
-		for (let index = 0; index < 16; index += 1) terminal.send(`busy-${index}`);
-		await eventually(
-			() => submissions.length === 16 && !terminal.isReading(),
-			"console did not enter a cap-saturated state without a pending line reader",
-		);
+		await eventually(() => output.writes.includes("way> "), "raw console did not begin reading interactive input");
+		for (const line of initial) input.send(`${line}\n`);
+		await eventually(() => submissions.length === initial.length, "raw console did not saturate owner operations");
+		for (const line of queued) input.send(`${line}\n`);
+		expect(terminal.queuedLineCount).toBe(MAX_RAW_CONSOLE_QUEUED_LINES);
+		expect(terminal.queuedInputBytes).toBeLessThanOrEqual(MAX_RAW_CONSOLE_QUEUED_BYTES);
+		expect(terminal.inputPaused).toBe(false);
+		expect(input.isPaused).toBe(false);
+		expect(input.pauseCalls).toBe(0);
+
 		const startedAt = performance.now();
-		terminal.signalControl(kind);
-		await running;
-		completed = true;
+		input.send(`${rejected.join("\n")}\n${control}`);
+		completed = await Promise.race([running.then(() => true), Bun.sleep(500).then(() => false)]);
+		expect(completed).toBe(true);
 		expect(performance.now() - startedAt).toBeLessThan(500);
-		expect(terminal.lifecycle).toContain(`control:${kind}`);
-		expect(terminal.writes.join("")).toContain("Exit requested; 16 console operations are still outstanding.");
-		expect(terminal.isClosed()).toBe(true);
+		expect(output.writes.join("")).toContain("Input queue is full");
+		expect(output.writes.join("")).toContain("Exit requested; 16 console operations are still outstanding.");
+		expect(terminal.inputPaused).toBe(true);
 	} finally {
 		release.resolve();
-		terminal.terminal.close();
+		terminal.close();
 		await gateway.stop();
-		if (completed) await running.catch(() => undefined);
+		await running.catch(() => undefined);
 	}
 }
 
@@ -1129,7 +1120,7 @@ test("console queues cap-saturated owner lines until all queued lines are admitt
 	}
 }, 15_000);
 
-test("raw console pauses bounded queued input after operation-cap saturation and resumes it FIFO", async () => {
+test("raw console bounds queued input, visibly refuses excess lines, and preserves FIFO after operation-cap saturation", async () => {
 	const gateway = await hostedConsoleGateway();
 	const input = new PausableRawInputHarness();
 	const output = new RawOutputHarness();
@@ -1137,7 +1128,8 @@ test("raw console pauses bounded queued input after operation-cap saturation and
 	const release = deferred();
 	const submissions: string[] = [];
 	const initial = Array.from({ length: 16 }, (_value, index) => `busy-${index}`);
-	const queued = Array.from({ length: MAX_RAW_CONSOLE_QUEUED_LINES + 4 }, (_value, index) => `queued-${index}`);
+	const queued = Array.from({ length: MAX_RAW_CONSOLE_QUEUED_LINES }, (_value, index) => `queued-${index}`);
+	const rejected = Array.from({ length: 4 }, (_value, index) => `rejected-${index}`);
 	const running = runWayConsole({ stateDir: gateway.stateDirectory, profilePath: gateway.profilePath }, [], {
 		terminal,
 		profile: loadWayProfile(gateway.profilePath),
@@ -1148,18 +1140,26 @@ test("raw console pauses bounded queued input after operation-cap saturation and
 		for (const line of initial) input.send(`${line}\n`);
 		await eventually(() => submissions.length === initial.length, "console did not saturate the owner-operation cap");
 		for (const line of queued) input.send(`${line}\n`);
+		for (const line of rejected) input.send(`${line}\n`);
 		expect(terminal.queuedLineCount).toBe(MAX_RAW_CONSOLE_QUEUED_LINES);
 		expect(terminal.queuedInputBytes).toBeLessThanOrEqual(MAX_RAW_CONSOLE_QUEUED_BYTES);
-		expect(terminal.inputPaused).toBe(true);
-		expect(input.isPaused).toBe(true);
-		expect(input.blockedChunkCount).toBe(4);
-		input.send("/quit\n");
-		expect(input.blockedChunkCount).toBe(5);
+		expect(terminal.inputPaused).toBe(false);
+		expect(input.isPaused).toBe(false);
+		expect(input.pauseCalls).toBe(0);
+		expect(input.blockedChunkCount).toBe(0);
+		await eventually(
+			() => output.writes.join("").includes("Input queue is full"),
+			"raw console did not visibly refuse excess saturated input",
+		);
 
 		release.resolve();
-		await running;
+		await eventually(
+			() => submissions.length === initial.length + queued.length,
+			"raw console did not admit every accepted queued line",
+		);
 		expect(submissions).toEqual([...initial, ...queued]);
-		expect(input.resumeCalls).toBeGreaterThan(1);
+		input.send("/quit\n");
+		await running;
 	} finally {
 		release.resolve();
 		terminal.close();
@@ -1167,12 +1167,12 @@ test("raw console pauses bounded queued input after operation-cap saturation and
 		await running.catch(() => undefined);
 	}
 }, 15_000);
-test("Ctrl-C during cap-saturated owner operations exits through bounded drain without a pending line reader", async () => {
-	await assertBusyControlStartsBoundedDrain("interrupt");
+test("raw Ctrl-C stays observable at saturated queue capacity and starts bounded drain", async () => {
+	await assertRawSaturatedControlStartsBoundedDrain("\u0003");
 }, 15_000);
 
-test("Ctrl-D during cap-saturated owner operations exits through bounded drain without a pending line reader", async () => {
-	await assertBusyControlStartsBoundedDrain("eof");
+test("raw Ctrl-D stays observable at saturated queue capacity and starts bounded drain", async () => {
+	await assertRawSaturatedControlStartsBoundedDrain("\u0004");
 }, 15_000);
 test("real console command loop answers a gate opened by its pending prompt and lets that turn complete", async () => {
 	const gateId = "gate-command-loop";

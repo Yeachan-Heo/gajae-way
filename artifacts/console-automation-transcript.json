@@ -6,7 +6,7 @@
   "surfaceNote": "way console is a subcommand of the way CLI that renders to a terminal; the transcript records its terminal write-stream.",
   "subject": "way console (gajae-way local owner surface)",
   "producedBy": "test/qa/console-transcript.ts",
-  "generatedAt": "2026-08-19T07:19:40.413Z",
+  "generatedAt": "2026-08-19T07:44:26.024Z",
   "harness": "scripted ConsoleTerminal driving runWayConsole against a real in-process gateway over a real Unix-domain socket",
   "scriptedInput": [
     "hello from the automation transcript",
@@ -15,7 +15,7 @@
   "actions": [
     {
       "ordinal": 1,
-      "timestamp": "2026-08-19T07:19:40.412Z",
+      "timestamp": "2026-08-19T07:44:26.024Z",
       "selector": "process:way console",
       "type": "launch",
       "detail": "runWayConsole with a scripted ConsoleTerminal against the live gateway Unix socket",
@@ -23,7 +23,7 @@
     },
     {
       "ordinal": 2,
-      "timestamp": "2026-08-19T07:19:40.413Z",
+      "timestamp": "2026-08-19T07:44:26.024Z",
       "selector": "stdout:\"Gateway status\"",
       "type": "observe",
       "detail": "gateway status block (daemon/main/journal/lock/reconcile)",
@@ -31,7 +31,7 @@
     },
     {
       "ordinal": 3,
-      "timestamp": "2026-08-19T07:19:40.413Z",
+      "timestamp": "2026-08-19T07:44:26.024Z",
       "selector": "stdout:\"Owner console ready\"",
       "type": "observe",
       "detail": "readiness announcement after delivery readiness established",
@@ -39,7 +39,7 @@
     },
     {
       "ordinal": 4,
-      "timestamp": "2026-08-19T07:19:40.413Z",
+      "timestamp": "2026-08-19T07:44:26.024Z",
       "selector": "stdin:way> prompt",
       "type": "input",
       "detail": "hello from the automation transcript",
@@ -47,7 +47,7 @@
     },
     {
       "ordinal": 5,
-      "timestamp": "2026-08-19T07:19:40.413Z",
+      "timestamp": "2026-08-19T07:44:26.024Z",
       "selector": "stdout:\"Delivered as:\"",
       "type": "observe",
       "detail": "server-derived delivered_as rendered verbatim",
@@ -55,7 +55,7 @@
     },
     {
       "ordinal": 6,
-      "timestamp": "2026-08-19T07:19:40.413Z",
+      "timestamp": "2026-08-19T07:44:26.024Z",
       "selector": "stdin:way> prompt",
       "type": "input",
       "detail": "/quit",
@@ -63,7 +63,7 @@
     },
     {
       "ordinal": 7,
-      "timestamp": "2026-08-19T07:19:40.413Z",
+      "timestamp": "2026-08-19T07:44:26.024Z",
       "selector": "rpc:consumerCursor(\"way-console\")",
       "type": "observe",
       "detail": "way-console consumer checkpoint after the session",
