@@ -5,6 +5,7 @@ import { afterEach, expect, test } from "bun:test";
 import {
 	ConsoleDeliveryUnavailableError,
 	ConsoleOutput,
+	MAX_RAW_CONSOLE_LINE_BYTES,
 	MAX_RAW_CONSOLE_QUEUED_BYTES,
 	MAX_RAW_CONSOLE_QUEUED_LINES,
 	OwnerConsole,
@@ -306,6 +307,37 @@ class RawOutputHarness {
 	once(_event: "drain", _listener: () => void): void {}
 }
 
+class PermanentlyStalledRawOutputHarness {
+	readonly isTTY = true;
+	readonly writes: string[] = [];
+	#stalled = false;
+	readonly #pending: Array<{ callback: (error?: Error | null) => void; drain?: () => void }> = [];
+
+	get pendingWriteCount(): number {
+		return this.#pending.length;
+	}
+
+	stall(): void {
+		this.#stalled = true;
+	}
+
+	write(text: string, callback: (error?: Error | null) => void): boolean {
+		this.writes.push(text);
+		if (!this.#stalled) {
+			callback();
+			return true;
+		}
+		this.#pending.push({ callback });
+		return false;
+	}
+
+	once(_event: "drain", listener: () => void): void {
+		const pending = this.#pending.at(-1);
+		if (!pending) throw new Error("drain listener was registered without a pending write");
+		pending.drain = listener;
+	}
+}
+
 interface PromptFrameTerminal extends ControlledTerminal {
 	snapshot(): string;
 }
@@ -500,6 +532,66 @@ function blockingSubmissionRpc(release: Promise<void>, submissions: string[]): J
 	};
 }
 
+async function assertRawControlEscapesPermanentlyStalledOutput(control: "\u0003" | "\u0004"): Promise<void> {
+	const gateway = await hostedConsoleGateway();
+	const input = new PausableRawInputHarness();
+	const output = new PermanentlyStalledRawOutputHarness();
+	const terminal = new RawConsoleTerminal({ input, output });
+	const release = deferred();
+	const submissions: string[] = [];
+	const initial = Array.from({ length: 16 }, (_value, index) => `busy-${index}`);
+	const queued = Array.from({ length: MAX_RAW_CONSOLE_QUEUED_LINES }, (_value, index) => `queued-${index}`);
+	const refusedPrefix = "REFUSED_PAYLOAD_MUST_NOT_ECHO";
+	const refusedBurst = Array.from({ length: 256 }, (_value, index) => `${refusedPrefix}-${index}`).join("\n");
+	const running = runWayConsole({ stateDir: gateway.stateDirectory, profilePath: gateway.profilePath }, [], {
+		terminal,
+		profile: loadWayProfile(gateway.profilePath),
+		rpcConnect: async () => blockingSubmissionRpc(release.promise, submissions),
+		exitDrainMs: 25,
+	});
+	try {
+		await eventually(() => output.writes.includes("way> "), "raw console did not begin reading interactive input");
+		for (const line of initial) input.send(`${line}\n`);
+		await eventually(() => submissions.length === initial.length, "raw console did not saturate owner operations");
+		await eventually(() => !terminal.rawPublicationPending, "initial raw echo did not flush");
+
+		output.stall();
+		const writesBeforeStall = output.writes.length;
+		input.send(`${queued[0]}\n`);
+		await eventually(() => output.pendingWriteCount === 1, "first stalled echo did not begin publication");
+		input.send(`${queued.slice(1).join("\n")}\n${refusedBurst}\n`);
+
+		expect(terminal.queuedLineCount).toBe(MAX_RAW_CONSOLE_QUEUED_LINES);
+		expect(terminal.queuedInputBytes).toBeLessThanOrEqual(MAX_RAW_CONSOLE_QUEUED_BYTES);
+		expect(terminal.bufferedInputBytes).toBeLessThanOrEqual(MAX_RAW_CONSOLE_LINE_BYTES);
+		expect(terminal.pendingEchoRedrawCount).toBe(1);
+		expect(terminal.rawPublicationPending).toBe(true);
+		expect(terminal.pendingRefusalPublicationCount).toBe(1);
+		expect(output.pendingWriteCount).toBe(1);
+		expect(output.writes.slice(writesBeforeStall)).toHaveLength(1);
+		expect(output.writes.join("")).not.toContain(refusedPrefix);
+		expect(input.pauseCalls).toBe(0);
+
+		await Bun.sleep(300);
+		expect(terminal.pendingRefusalPublicationCount).toBe(0);
+		expect(output.writes.slice(writesBeforeStall)).toHaveLength(1);
+
+		const startedAt = performance.now();
+		input.send(control);
+		const completed = await Promise.race([running.then(() => true), Bun.sleep(500).then(() => false)]);
+		expect(completed).toBe(true);
+		expect(performance.now() - startedAt).toBeLessThan(500);
+		expect(terminal.inputPaused).toBe(true);
+		expect(input.isPaused).toBe(true);
+		expect(output.writes.join("")).not.toContain(refusedPrefix);
+	} finally {
+		release.resolve();
+		terminal.close();
+		await gateway.stop();
+		await running.catch(() => undefined);
+	}
+}
+
 async function assertRawSaturatedControlStartsBoundedDrain(control: "\u0003" | "\u0004"): Promise<void> {
 	const gateway = await hostedConsoleGateway();
 	const input = new PausableRawInputHarness();
@@ -528,12 +620,16 @@ async function assertRawSaturatedControlStartsBoundedDrain(control: "\u0003" | "
 		expect(input.isPaused).toBe(false);
 		expect(input.pauseCalls).toBe(0);
 
+		input.send(`${rejected.join("\n")}\n`);
+		await eventually(
+			() => output.writes.join("").includes("Input queue is full"),
+			"raw console did not render its saturated-input refusal before control input",
+		);
 		const startedAt = performance.now();
-		input.send(`${rejected.join("\n")}\n${control}`);
+		input.send(control);
 		completed = await Promise.race([running.then(() => true), Bun.sleep(500).then(() => false)]);
 		expect(completed).toBe(true);
 		expect(performance.now() - startedAt).toBeLessThan(500);
-		expect(output.writes.join("")).toContain("Input queue is full");
 		expect(output.writes.join("")).toContain("Exit requested; 16 console operations are still outstanding.");
 		expect(terminal.inputPaused).toBe(true);
 	} finally {
@@ -1173,6 +1269,14 @@ test("raw Ctrl-C stays observable at saturated queue capacity and starts bounded
 
 test("raw Ctrl-D stays observable at saturated queue capacity and starts bounded drain", async () => {
 	await assertRawSaturatedControlStartsBoundedDrain("\u0004");
+}, 15_000);
+
+test("raw Ctrl-C remains observable through permanently stalled stdout at saturated queue capacity", async () => {
+	await assertRawControlEscapesPermanentlyStalledOutput("\u0003");
+}, 15_000);
+
+test("raw Ctrl-D remains observable through permanently stalled stdout at saturated queue capacity", async () => {
+	await assertRawControlEscapesPermanentlyStalledOutput("\u0004");
 }, 15_000);
 test("real console command loop answers a gate opened by its pending prompt and lets that turn complete", async () => {
 	const gateId = "gate-command-loop";

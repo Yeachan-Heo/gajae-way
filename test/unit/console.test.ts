@@ -1,6 +1,7 @@
 import { expect, test } from "bun:test";
 import {
 	ConsoleOutput,
+	MAX_RAW_CONSOLE_LINE_BYTES,
 	MAX_RAW_CONSOLE_QUEUED_BYTES,
 	MAX_RAW_CONSOLE_QUEUED_LINES,
 	RawConsoleTerminal,
@@ -77,6 +78,53 @@ class RawOutputHarness {
 	}
 
 	once(_event: "drain", _listener: () => void): void {}
+}
+
+class BackpressuredRawOutputHarness {
+	readonly isTTY = true;
+	readonly writes: string[] = [];
+	#stalled = false;
+	readonly #pending: Array<{ callback: (error?: Error | null) => void; drain?: () => void }> = [];
+
+	get pendingWriteCount(): number {
+		return this.#pending.length;
+	}
+
+	stall(): void {
+		this.#stalled = true;
+	}
+
+	write(text: string, callback: (error?: Error | null) => void): boolean {
+		this.writes.push(text);
+		if (!this.#stalled) {
+			callback();
+			return true;
+		}
+		this.#pending.push({ callback });
+		return false;
+	}
+
+	once(_event: "drain", listener: () => void): void {
+		const pending = this.#pending.at(-1);
+		if (!pending) throw new Error("drain listener was registered without a pending write");
+		pending.drain = listener;
+	}
+
+	releaseOne(): void {
+		const pending = this.#pending.shift();
+		if (!pending) throw new Error("no stalled write to release");
+		pending.callback();
+		pending.drain?.();
+	}
+}
+
+async function eventually(read: () => boolean, description: string, timeoutMs = 500): Promise<void> {
+	const deadline = Date.now() + timeoutMs;
+	while (Date.now() < deadline) {
+		if (read()) return;
+		await Bun.sleep(1);
+	}
+	throw new Error(description);
 }
 
 function rawScreen(writes: readonly string[]): string {
@@ -306,6 +354,58 @@ test("raw terminal visibly refuses excess lines from a single paste after its bo
 		expect(input.isPaused).toBe(false);
 		expect(output.writes.join("")).toContain("Input queue is full");
 		expect(output.writes.join("")).toContain("additional pasted input was refused");
+	} finally {
+		terminal.close();
+	}
+});
+
+test("raw terminal coalesces stalled echo, refuses saturated payload without echoing it, and retains FIFO", async () => {
+	const input = new RawInputHarness();
+	const output = new BackpressuredRawOutputHarness();
+	const terminal = new RawConsoleTerminal({ input, output });
+	const accepted = Array.from({ length: MAX_RAW_CONSOLE_QUEUED_LINES }, (_value, index) => `accepted-${index}`);
+	const refusedPrefix = "REFUSED_PAYLOAD_MUST_NOT_ECHO";
+	const refusedBurst = Array.from({ length: 256 }, (_value, index) => `${refusedPrefix}-${index}`).join("\n");
+	try {
+		const direct = terminal.readLine("way> ");
+		input.send("direct\n");
+		expect(await direct).toBe("direct");
+		await terminal.writeTrusted("");
+		await eventually(() => !terminal.rawPublicationPending, "initial raw echo did not flush");
+
+		output.stall();
+		const writesBeforeStall = output.writes.length;
+		input.send(`${accepted[0]}\n`);
+		await eventually(() => output.pendingWriteCount === 1, "first stalled echo did not begin publication");
+		input.send(`${accepted.slice(1).join("\n")}\n${refusedBurst}\n`);
+
+		expect(terminal.queuedLineCount).toBe(MAX_RAW_CONSOLE_QUEUED_LINES);
+		expect(terminal.queuedInputBytes).toBeLessThanOrEqual(MAX_RAW_CONSOLE_QUEUED_BYTES);
+		expect(terminal.bufferedInputBytes).toBeLessThanOrEqual(MAX_RAW_CONSOLE_LINE_BYTES);
+		expect(terminal.pendingEchoRedrawCount).toBe(1);
+		expect(terminal.rawPublicationPending).toBe(true);
+		expect(terminal.pendingRefusalPublicationCount).toBe(1);
+		expect(output.pendingWriteCount).toBe(1);
+		expect(output.writes.slice(writesBeforeStall)).toHaveLength(1);
+		expect(output.writes.join("")).not.toContain(refusedPrefix);
+
+		output.releaseOne();
+		await eventually(
+			() =>
+				output.pendingWriteCount === 1 &&
+				output.writes.slice(writesBeforeStall).some((write) => write.includes("Input queue is full")),
+			"bounded queue refusal did not begin after backpressure released",
+		);
+		expect(output.writes.slice(writesBeforeStall)).toHaveLength(2);
+		expect(output.writes.join("")).not.toContain(refusedPrefix);
+
+		const delivered: string[] = [];
+		for (let index = 0; index < accepted.length; index += 1) {
+			delivered.push((await terminal.readLine("way> ")) as string);
+		}
+		expect(delivered).toEqual(accepted);
+		expect(terminal.queuedLineCount).toBe(0);
+		expect(terminal.queuedInputBytes).toBe(0);
 	} finally {
 		terminal.close();
 	}
