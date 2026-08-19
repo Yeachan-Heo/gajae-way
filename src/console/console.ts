@@ -21,6 +21,9 @@ export const DEFAULT_CONSOLE_READ_WAIT_MS = 1_000;
 export const DEFAULT_CONSOLE_EXIT_DRAIN_MS = 2_000;
 const MAX_CONSOLE_INPUT_OPERATIONS = 16;
 const MAX_CONSOLE_EXIT_DIAGNOSTIC_MS = 250;
+export const MAX_RAW_CONSOLE_QUEUED_LINES = 16;
+export const MAX_RAW_CONSOLE_QUEUED_BYTES = 64 * 1024;
+export const MAX_RAW_CONSOLE_LINE_BYTES = 8 * 1024;
 
 export type WayConsoleEventKind = (typeof WAY_CONSOLE_EVENT_KINDS)[number];
 export type ConsoleConsumerRunResult = "rendered" | "idle";
@@ -51,6 +54,8 @@ export interface ConsoleTerminal {
 	writeTrusted(text: string): Promise<void>;
 	readLine(prompt: string): Promise<string | undefined>;
 	close(): void;
+	/** Notifies the input loop that terminal interrupt/EOF was received between reads. */
+	onExitRequested?(listener: () => void): () => void;
 }
 
 interface RawConsoleInputStream {
@@ -732,6 +737,8 @@ async function readConsoleInput(
 	options: ConsoleInputLoopOptions,
 ): Promise<void> {
 	const inFlight = new Set<Promise<void>>();
+	const exit = new AbortController();
+	const removeExitListener = terminal.onExitRequested?.(() => exit.abort());
 	let stopped = false;
 	let teardownImmediately = false;
 	let failure: Error | undefined;
@@ -754,29 +761,38 @@ async function readConsoleInput(
 		void operation.finally(() => inFlight.delete(operation));
 	};
 
-	while (!stopped && !options.signal?.aborted) {
-		while (!stopped && !options.signal?.aborted && inFlight.size >= MAX_CONSOLE_INPUT_OPERATIONS) {
-			await waitForInputSlot(inFlight, options.signal);
+	try {
+		while (!stopped && !options.signal?.aborted && !exit.signal.aborted) {
+			while (
+				!stopped &&
+				!options.signal?.aborted &&
+				!exit.signal.aborted &&
+				inFlight.size >= MAX_CONSOLE_INPUT_OPERATIONS
+			) {
+				await waitForInputSlot(inFlight, [options.signal, exit.signal]);
+			}
+			if (stopped || options.signal?.aborted || exit.signal.aborted) break;
+			const line = await terminal.readLine("way> ");
+			if (line === undefined) break;
+			const command = line.trim();
+			if (command === "/quit" || command === "/exit") break;
+			dispatch(line);
 		}
-		if (stopped || options.signal?.aborted) break;
-		const line = await terminal.readLine("way> ");
-		if (line === undefined) break;
-		const command = line.trim();
-		if (command === "/quit" || command === "/exit") break;
-		dispatch(line);
-	}
 
-	if (!teardownImmediately && !options.signal?.aborted && inFlight.size > 0) {
-		const drainResult = await drainInputOperations(inFlight, options.exitDrainMs, options.signal);
-		if (drainResult === "expired" && !options.signal?.aborted && inFlight.size > 0) {
-			const published = await publishExitOutstandingFrame(
-				options.reportOutstanding(inFlight.size),
-				Math.min(options.exitDrainMs, MAX_CONSOLE_EXIT_DIAGNOSTIC_MS),
-			);
-			if (!published) terminal.close();
+		if (!teardownImmediately && !options.signal?.aborted && inFlight.size > 0) {
+			const drainResult = await drainInputOperations(inFlight, options.exitDrainMs, options.signal);
+			if (drainResult === "expired" && !options.signal?.aborted && inFlight.size > 0) {
+				const published = await publishExitOutstandingFrame(
+					options.reportOutstanding(inFlight.size),
+					Math.min(options.exitDrainMs, MAX_CONSOLE_EXIT_DIAGNOSTIC_MS),
+				);
+				if (!published) terminal.close();
+			}
 		}
+		if (failure) throw failure;
+	} finally {
+		removeExitListener?.();
 	}
-	if (failure) throw failure;
 }
 
 async function drainInputOperations(
@@ -839,21 +855,20 @@ async function waitForConsoleLoopStop(loop: Promise<void>, timeoutMs: number): P
 	});
 }
 
-async function waitForInputSlot(inFlight: ReadonlySet<Promise<void>>, signal?: AbortSignal): Promise<void> {
-	if (!signal) {
-		await Promise.race(inFlight);
-		return;
-	}
-	if (signal.aborted) return;
+async function waitForInputSlot(
+	inFlight: ReadonlySet<Promise<void>>,
+	signals: readonly (AbortSignal | undefined)[],
+): Promise<void> {
+	if (signals.some((signal) => signal?.aborted)) return;
 	await new Promise<void>((resolve) => {
 		let settled = false;
 		const finish = (): void => {
 			if (settled) return;
 			settled = true;
-			signal.removeEventListener("abort", finish);
+			for (const signal of signals) signal?.removeEventListener("abort", finish);
 			resolve();
 		};
-		signal.addEventListener("abort", finish, { once: true });
+		for (const signal of signals) signal?.addEventListener("abort", finish, { once: true });
 		void Promise.race(inFlight).then(finish, finish);
 	});
 }
@@ -862,9 +877,17 @@ export class RawConsoleTerminal implements ConsoleTerminal {
 	readonly #input: RawConsoleInputStream;
 	readonly #output: RawConsoleOutputStream;
 	#buffer = "";
-	readonly #queuedLines: string[] = [];
+	#bufferBytes = 0;
+	readonly #queuedLines: Array<{ readonly text: string; readonly bytes: number }> = [];
+	#queuedBytes = 0;
+	#queueBlocked = false;
+	#queueRefusalPublished = false;
+	#discardingOversizeLine = false;
 	#prompt = "";
 	#resolveLine: ((line: string | undefined) => void) | undefined;
+	readonly #exitListeners = new Set<() => void>();
+	#exitRequested = false;
+	#inputPaused = false;
 	#writeTail: Promise<void> = Promise.resolve();
 	#closed = false;
 
@@ -880,6 +903,24 @@ export class RawConsoleTerminal implements ConsoleTerminal {
 		this.#input.on("data", this.onData);
 	}
 
+	get queuedLineCount(): number {
+		return this.#queuedLines.length;
+	}
+
+	get queuedInputBytes(): number {
+		return this.#queuedBytes;
+	}
+
+	get inputPaused(): boolean {
+		return this.#inputPaused;
+	}
+
+	onExitRequested(listener: () => void): () => void {
+		this.#exitListeners.add(listener);
+		if (this.#exitRequested) listener();
+		return () => this.#exitListeners.delete(listener);
+	}
+
 	async writeTrusted(text: string): Promise<void> {
 		if (this.#closed) throw new WayConsoleError("Console terminal is closed.");
 		const frame = this.#resolveLine ? `\r\x1b[2K${text}${this.#prompt}${this.#buffer}` : text;
@@ -887,10 +928,15 @@ export class RawConsoleTerminal implements ConsoleTerminal {
 	}
 
 	async readLine(prompt: string): Promise<string | undefined> {
-		if (this.#closed) return undefined;
+		if (this.#closed || this.#exitRequested) return undefined;
 		if (this.#resolveLine) throw new WayConsoleError("Console already has a pending input line.");
 		const queued = this.#queuedLines.shift();
-		if (queued !== undefined) return queued;
+		if (queued) {
+			this.#queuedBytes -= queued.bytes;
+			this.#queueBlocked = false;
+			this.refreshInputFlow();
+			return queued.text;
+		}
 		this.#prompt = prompt;
 		const line = new Promise<string | undefined>((resolve) => {
 			this.#resolveLine = resolve;
@@ -908,6 +954,7 @@ export class RawConsoleTerminal implements ConsoleTerminal {
 	close(): void {
 		if (this.#closed) return;
 		this.#closed = true;
+		this.#inputPaused = true;
 		this.#input.off("data", this.onData);
 		this.#input.pause();
 		if (this.#input.isRaw) this.#input.setRawMode?.(false);
@@ -918,29 +965,99 @@ export class RawConsoleTerminal implements ConsoleTerminal {
 		for (const character of String(chunk)) {
 			if (character === "\u0003" || character === "\u0004") {
 				this.writeEcho("\r\n");
-				if (this.#resolveLine) this.finishLine(undefined);
+				this.requestExit();
 				return;
 			}
 			if (character === "\r" || character === "\n") {
+				if (this.#discardingOversizeLine) {
+					this.#discardingOversizeLine = false;
+					this.#queueRefusalPublished = false;
+					this.#buffer = "";
+					this.#bufferBytes = 0;
+					this.writeEcho("\r\n");
+					continue;
+				}
 				const line = this.#buffer;
 				this.#buffer = "";
+				this.#bufferBytes = 0;
 				this.writeEcho("\r\n");
-				if (this.#resolveLine) this.finishLine(line);
-				else this.#queuedLines.push(line);
+				if (!this.acceptLine(line)) return;
 				continue;
 			}
 			if (character === "\u007f" || character === "\b") {
-				if (!this.#buffer) continue;
-				this.#buffer = this.#buffer.slice(0, -1);
+				if (!this.#buffer || this.#discardingOversizeLine) continue;
+				this.#buffer = [...this.#buffer].slice(0, -1).join("");
+				this.#bufferBytes = Buffer.byteLength(this.#buffer);
 				this.writeEcho("\b \b");
 				continue;
 			}
-			if (character >= " ") {
-				this.#buffer += character;
-				this.writeEcho(character);
+			if (character < " " || this.#discardingOversizeLine) continue;
+			const bytes = Buffer.byteLength(character);
+			if (this.#bufferBytes + bytes > MAX_RAW_CONSOLE_LINE_BYTES) {
+				this.#discardingOversizeLine = true;
+				this.#buffer = "";
+				this.#bufferBytes = 0;
+				this.reportInputRefusal(`Input line exceeds ${MAX_RAW_CONSOLE_LINE_BYTES} bytes and was refused.`);
+				continue;
 			}
+			this.#buffer += character;
+			this.#bufferBytes += bytes;
+			this.writeEcho(character);
 		}
 	};
+
+	private acceptLine(line: string): boolean {
+		if (this.#resolveLine) {
+			this.finishLine(line);
+			return true;
+		}
+		const bytes = Buffer.byteLength(line);
+		if (
+			this.#queuedLines.length >= MAX_RAW_CONSOLE_QUEUED_LINES ||
+			this.#queuedBytes + bytes > MAX_RAW_CONSOLE_QUEUED_BYTES
+		) {
+			this.#queueBlocked = true;
+			this.refreshInputFlow();
+			this.reportInputRefusal(
+				`Input queue is full (${MAX_RAW_CONSOLE_QUEUED_LINES} lines / ${MAX_RAW_CONSOLE_QUEUED_BYTES} bytes); additional pasted input was refused.`,
+			);
+			return false;
+		}
+		this.#queuedLines.push({ text: line, bytes });
+		this.#queuedBytes += bytes;
+		this.refreshInputFlow();
+		return true;
+	}
+
+	private requestExit(): void {
+		if (this.#exitRequested) return;
+		this.#exitRequested = true;
+		this.refreshInputFlow();
+		this.finishLine(undefined);
+		for (const listener of [...this.#exitListeners]) listener();
+	}
+
+	private refreshInputFlow(): void {
+		const shouldPause =
+			this.#closed ||
+			this.#exitRequested ||
+			this.#queueBlocked ||
+			this.#queuedLines.length >= MAX_RAW_CONSOLE_QUEUED_LINES ||
+			this.#queuedBytes >= MAX_RAW_CONSOLE_QUEUED_BYTES;
+		if (shouldPause === this.#inputPaused) return;
+		this.#inputPaused = shouldPause;
+		if (shouldPause) this.#input.pause();
+		else {
+			this.#queueRefusalPublished = false;
+			this.#input.resume();
+		}
+	}
+
+	private reportInputRefusal(message: string): void {
+		if (this.#queueRefusalPublished) return;
+		this.#queueRefusalPublished = true;
+		void this.writeTrusted(`${message}\n`).catch(() => this.close());
+	}
 
 	private async write(text: string): Promise<void> {
 		const publication = this.#writeTail.then(async () => await writeToStream(this.#output, text));
@@ -956,6 +1073,8 @@ export class RawConsoleTerminal implements ConsoleTerminal {
 		const resolve = this.#resolveLine;
 		this.#resolveLine = undefined;
 		this.#buffer = "";
+		this.#bufferBytes = 0;
+		this.#discardingOversizeLine = false;
 		this.#prompt = "";
 		resolve?.(line);
 	}

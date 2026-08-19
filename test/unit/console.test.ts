@@ -1,6 +1,8 @@
 import { expect, test } from "bun:test";
 import {
 	ConsoleOutput,
+	MAX_RAW_CONSOLE_QUEUED_BYTES,
+	MAX_RAW_CONSOLE_QUEUED_LINES,
 	RawConsoleTerminal,
 	consoleStartupDecision,
 	renderConsoleStatusSummary,
@@ -10,7 +12,15 @@ import {
 class RawInputHarness {
 	readonly isTTY = true;
 	isRaw = false;
+	isPaused = false;
+	pauseCalls = 0;
+	resumeCalls = 0;
 	readonly #listeners = new Set<(chunk: string | Buffer) => void>();
+	readonly #blockedChunks: string[] = [];
+
+	get blockedChunkCount(): number {
+		return this.#blockedChunks.length;
+	}
 
 	setEncoding(_encoding: BufferEncoding): void {}
 
@@ -18,9 +28,20 @@ class RawInputHarness {
 		this.isRaw = enabled;
 	}
 
-	resume(): void {}
+	resume(): void {
+		this.resumeCalls += 1;
+		if (!this.isPaused) return;
+		this.isPaused = false;
+		while (!this.isPaused && this.#blockedChunks.length > 0) {
+			const chunk = this.#blockedChunks.shift() as string;
+			this.deliver(chunk);
+		}
+	}
 
-	pause(): void {}
+	pause(): void {
+		this.pauseCalls += 1;
+		this.isPaused = true;
+	}
 
 	on(_event: "data", listener: (chunk: string | Buffer) => void): void {
 		this.#listeners.add(listener);
@@ -31,6 +52,14 @@ class RawInputHarness {
 	}
 
 	send(chunk: string): void {
+		if (this.isPaused) {
+			this.#blockedChunks.push(chunk);
+			return;
+		}
+		this.deliver(chunk);
+	}
+
+	private deliver(chunk: string): void {
 		for (const listener of [...this.#listeners]) listener(chunk);
 	}
 }
@@ -220,6 +249,93 @@ test("raw terminal queues every complete line in a multi-line input chunk", asyn
 		expect(await first).toBe("first");
 		expect(await terminal.readLine("way> ")).toBe("second");
 		expect(await terminal.readLine("way> ")).toBe("third");
+	} finally {
+		terminal.close();
+	}
+});
+
+test("raw terminal bounds saturated queued input, pauses stdin, and resumes FIFO delivery", async () => {
+	const input = new RawInputHarness();
+	const output = new RawOutputHarness();
+	const terminal = new RawConsoleTerminal({ input, output });
+	const accepted = Array.from({ length: MAX_RAW_CONSOLE_QUEUED_LINES + 4 }, (_value, index) => `queued-${index}`);
+	try {
+		const first = terminal.readLine("way> ");
+		input.send("first\n");
+		expect(await first).toBe("first");
+		for (const line of accepted) input.send(`${line}\n`);
+		expect(terminal.queuedLineCount).toBe(MAX_RAW_CONSOLE_QUEUED_LINES);
+		expect(terminal.queuedInputBytes).toBeLessThanOrEqual(MAX_RAW_CONSOLE_QUEUED_BYTES);
+		expect(terminal.inputPaused).toBe(true);
+		expect(input.isPaused).toBe(true);
+		expect(input.blockedChunkCount).toBe(4);
+
+		const received: string[] = [];
+		for (let index = 0; index < accepted.length; index += 1) {
+			received.push((await terminal.readLine("way> ")) as string);
+		}
+		expect(received).toEqual(accepted);
+		expect(terminal.queuedLineCount).toBe(0);
+		expect(terminal.queuedInputBytes).toBe(0);
+		expect(terminal.inputPaused).toBe(false);
+		expect(input.resumeCalls).toBeGreaterThan(1);
+	} finally {
+		terminal.close();
+	}
+});
+
+test("raw terminal visibly refuses excess lines from a single paste after its bounded queue fills", async () => {
+	const input = new RawInputHarness();
+	const output = new RawOutputHarness();
+	const terminal = new RawConsoleTerminal({ input, output });
+	const pasted = Array.from({ length: MAX_RAW_CONSOLE_QUEUED_LINES + 2 }, (_value, index) => `paste-${index}`).join(
+		"\n",
+	);
+	try {
+		const first = terminal.readLine("way> ");
+		input.send("first\n");
+		expect(await first).toBe("first");
+		input.send(`${pasted}\n`);
+		await Bun.sleep(0);
+		expect(terminal.queuedLineCount).toBe(MAX_RAW_CONSOLE_QUEUED_LINES);
+		expect(terminal.queuedInputBytes).toBeLessThanOrEqual(MAX_RAW_CONSOLE_QUEUED_BYTES);
+		expect(terminal.inputPaused).toBe(true);
+		expect(output.writes.join("")).toContain("Input queue is full");
+		expect(output.writes.join("")).toContain("additional pasted input was refused");
+	} finally {
+		terminal.close();
+	}
+});
+
+test("raw terminal retains Ctrl-C as an exit request while no line read is pending", async () => {
+	const input = new RawInputHarness();
+	const terminal = new RawConsoleTerminal({ input, output: new RawOutputHarness() });
+	let exits = 0;
+	terminal.onExitRequested(() => {
+		exits += 1;
+	});
+	try {
+		input.send("\u0003");
+		expect(exits).toBe(1);
+		expect(terminal.inputPaused).toBe(true);
+		expect(await terminal.readLine("way> ")).toBeUndefined();
+	} finally {
+		terminal.close();
+	}
+});
+
+test("raw terminal retains Ctrl-D as an exit request while no line read is pending", async () => {
+	const input = new RawInputHarness();
+	const terminal = new RawConsoleTerminal({ input, output: new RawOutputHarness() });
+	let exits = 0;
+	terminal.onExitRequested(() => {
+		exits += 1;
+	});
+	try {
+		input.send("\u0004");
+		expect(exits).toBe(1);
+		expect(terminal.inputPaused).toBe(true);
+		expect(await terminal.readLine("way> ")).toBeUndefined();
 	} finally {
 		terminal.close();
 	}

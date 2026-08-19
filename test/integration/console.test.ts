@@ -5,7 +5,10 @@ import { afterEach, expect, test } from "bun:test";
 import {
 	ConsoleDeliveryUnavailableError,
 	ConsoleOutput,
+	MAX_RAW_CONSOLE_QUEUED_BYTES,
+	MAX_RAW_CONSOLE_QUEUED_LINES,
 	OwnerConsole,
+	RawConsoleTerminal,
 	runWayConsole,
 	type ConsoleTerminal,
 } from "../../src/console/console";
@@ -178,6 +181,7 @@ interface ControlledTerminal {
 	readonly writes: string[];
 	readonly lifecycle: string[];
 	send(line: string): void;
+	signalControl(kind: "interrupt" | "eof"): void;
 	isReading(): boolean;
 	isClosed(): boolean;
 }
@@ -191,6 +195,8 @@ function controlledTerminal(options: ControlledTerminalOptions = {}): Controlled
 	const writes: string[] = [];
 	const lifecycle: string[] = [];
 	let resolveLine: ((line: string | undefined) => void) | undefined;
+	const exitListeners = new Set<() => void>();
+	let exitRequested = false;
 	let closed = false;
 	const send = (line: string): void => {
 		if (closed) throw new Error("terminal is closed");
@@ -202,10 +208,20 @@ function controlledTerminal(options: ControlledTerminalOptions = {}): Controlled
 		resolveLine = undefined;
 		resolve(line);
 	};
+	const signalControl = (kind: "interrupt" | "eof"): void => {
+		if (exitRequested) return;
+		exitRequested = true;
+		lifecycle.push(`control:${kind}`);
+		const resolve = resolveLine;
+		resolveLine = undefined;
+		resolve?.(undefined);
+		for (const listener of [...exitListeners]) listener();
+	};
 	return {
 		writes,
 		lifecycle,
 		send,
+		signalControl,
 		isReading: () => resolveLine !== undefined,
 		isClosed: () => closed,
 		terminal: {
@@ -216,12 +232,17 @@ function controlledTerminal(options: ControlledTerminalOptions = {}): Controlled
 				lifecycle.push(`write:${text}`);
 			},
 			async readLine(): Promise<string | undefined> {
-				if (closed) return undefined;
+				if (closed || exitRequested) return undefined;
 				const queued = pending.shift();
 				if (queued !== undefined) return queued;
 				return await new Promise((resolve) => {
 					resolveLine = resolve;
 				});
+			},
+			onExitRequested(listener: () => void): () => void {
+				exitListeners.add(listener);
+				if (exitRequested) listener();
+				return () => exitListeners.delete(listener);
 			},
 			close(): void {
 				if (closed) return;
@@ -235,7 +256,75 @@ function controlledTerminal(options: ControlledTerminalOptions = {}): Controlled
 	};
 }
 
-interface PromptFrameTerminal extends ControlledTerminal {
+class PausableRawInputHarness {
+	readonly isTTY = true;
+	isRaw = false;
+	isPaused = false;
+	pauseCalls = 0;
+	resumeCalls = 0;
+	readonly #listeners = new Set<(chunk: string | Buffer) => void>();
+	readonly #blockedChunks: string[] = [];
+
+	get blockedChunkCount(): number {
+		return this.#blockedChunks.length;
+	}
+
+	setEncoding(_encoding: BufferEncoding): void {}
+
+	setRawMode(enabled: boolean): void {
+		this.isRaw = enabled;
+	}
+
+	resume(): void {
+		this.resumeCalls += 1;
+		if (!this.isPaused) return;
+		this.isPaused = false;
+		while (!this.isPaused && this.#blockedChunks.length > 0) {
+			const chunk = this.#blockedChunks.shift() as string;
+			this.deliver(chunk);
+		}
+	}
+
+	pause(): void {
+		this.pauseCalls += 1;
+		this.isPaused = true;
+	}
+
+	on(_event: "data", listener: (chunk: string | Buffer) => void): void {
+		this.#listeners.add(listener);
+	}
+
+	off(_event: "data", listener: (chunk: string | Buffer) => void): void {
+		this.#listeners.delete(listener);
+	}
+
+	send(chunk: string): void {
+		if (this.isPaused) {
+			this.#blockedChunks.push(chunk);
+			return;
+		}
+		this.deliver(chunk);
+	}
+
+	private deliver(chunk: string): void {
+		for (const listener of [...this.#listeners]) listener(chunk);
+	}
+}
+
+class RawOutputHarness {
+	readonly isTTY = true;
+	readonly writes: string[] = [];
+
+	write(text: string, callback: (error?: Error | null) => void): boolean {
+		this.writes.push(text);
+		callback();
+		return true;
+	}
+
+	once(_event: "drain", _listener: () => void): void {}
+}
+
+interface PromptFrameTerminal extends Omit<ControlledTerminal, "signalControl"> {
 	snapshot(): string;
 }
 
@@ -364,6 +453,104 @@ function deferred(): { promise: Promise<void>; resolve(): void } {
 			resolve?.();
 		},
 	};
+}
+
+function blockingSubmissionRpc(release: Promise<void>, submissions: string[]): JsonRpcClient {
+	let eventReads = 0;
+	return {
+		async request(method: string, params?: unknown, options?: RpcRequestOptions): Promise<JsonRpcResponse> {
+			if (method === "way.health") {
+				return {
+					jsonrpc: "2.0",
+					id: 1,
+					result: { status: "healthy", state: "running", main: { resumed: true, session_id: "fake" } },
+				};
+			}
+			if (method === "way.status") {
+				return {
+					jsonrpc: "2.0",
+					id: 1,
+					result: {
+						status: "healthy",
+						state: "running",
+						main: { resumed: true, session_id: "fake" },
+						turn_state: "idle",
+						follow_up_queue_depth: 0,
+						journal: { head_cursor: "1:0", degraded: false },
+						lock: { held: false, queue_len: 0, stuck: false, quarantined: false },
+						write_mode: true,
+						reconcile: { drift_count: 0 },
+					},
+				};
+			}
+			if (method === "consumer.claim") {
+				return {
+					jsonrpc: "2.0",
+					id: 1,
+					result: { claim_id: `claim-${eventReads}`, cursor: "1:0", expires_at: Date.now() + 60_000 },
+				};
+			}
+			if (method === "main.events.read") {
+				eventReads += 1;
+				if (eventReads === 1) return { jsonrpc: "2.0", id: 1, result: { events: [], next_cursor: "1:0" } };
+				return await new Promise<JsonRpcResponse>((_resolve, reject) => {
+					const signal = options?.signal;
+					const abort = () => reject(new Error("events read aborted"));
+					if (signal?.aborted) return abort();
+					signal?.addEventListener("abort", abort, { once: true });
+				});
+			}
+			if (method === "consumer.commit") return { jsonrpc: "2.0", id: 1, result: {} };
+			if (method === "main.submit") {
+				const text = (params as { text?: unknown } | undefined)?.text;
+				if (typeof text !== "string") throw new Error("main.submit text was not a string");
+				submissions.push(text);
+				await release;
+				return {
+					jsonrpc: "2.0",
+					id: 1,
+					result: { accepted: true, op_ref: `op-${submissions.length}`, delivered_as: "prompt" },
+				};
+			}
+			throw new Error(`unexpected test RPC method: ${method}`);
+		},
+		close(): void {},
+	};
+}
+
+async function assertBusyControlStartsBoundedDrain(kind: "interrupt" | "eof"): Promise<void> {
+	const gateway = await hostedConsoleGateway();
+	const terminal = controlledTerminal();
+	const release = deferred();
+	const submissions: string[] = [];
+	const running = runWayConsole({ stateDir: gateway.stateDirectory, profilePath: gateway.profilePath }, [], {
+		terminal: terminal.terminal,
+		profile: loadWayProfile(gateway.profilePath),
+		rpcConnect: async () => blockingSubmissionRpc(release.promise, submissions),
+		exitDrainMs: 25,
+	});
+	let completed = false;
+	try {
+		await eventually(terminal.isReading, "console did not begin reading interactive input");
+		for (let index = 0; index < 16; index += 1) terminal.send(`busy-${index}`);
+		await eventually(
+			() => submissions.length === 16 && !terminal.isReading(),
+			"console did not enter a cap-saturated state without a pending line reader",
+		);
+		const startedAt = performance.now();
+		terminal.signalControl(kind);
+		await running;
+		completed = true;
+		expect(performance.now() - startedAt).toBeLessThan(500);
+		expect(terminal.lifecycle).toContain(`control:${kind}`);
+		expect(terminal.writes.join("")).toContain("Exit requested; 16 console operations are still outstanding.");
+		expect(terminal.isClosed()).toBe(true);
+	} finally {
+		release.resolve();
+		terminal.terminal.close();
+		await gateway.stop();
+		if (completed) await running.catch(() => undefined);
+	}
 }
 
 test("console submits through real UDS, renders finalized replies before settlement, and resumes its server checkpoint after restart", async () => {
@@ -942,6 +1129,51 @@ test("console queues cap-saturated owner lines until all queued lines are admitt
 	}
 }, 15_000);
 
+test("raw console pauses bounded queued input after operation-cap saturation and resumes it FIFO", async () => {
+	const gateway = await hostedConsoleGateway();
+	const input = new PausableRawInputHarness();
+	const output = new RawOutputHarness();
+	const terminal = new RawConsoleTerminal({ input, output });
+	const release = deferred();
+	const submissions: string[] = [];
+	const initial = Array.from({ length: 16 }, (_value, index) => `busy-${index}`);
+	const queued = Array.from({ length: MAX_RAW_CONSOLE_QUEUED_LINES + 4 }, (_value, index) => `queued-${index}`);
+	const running = runWayConsole({ stateDir: gateway.stateDirectory, profilePath: gateway.profilePath }, [], {
+		terminal,
+		profile: loadWayProfile(gateway.profilePath),
+		rpcConnect: async () => blockingSubmissionRpc(release.promise, submissions),
+	});
+	try {
+		await eventually(() => output.writes.includes("way> "), "raw console did not begin reading interactive input");
+		for (const line of initial) input.send(`${line}\n`);
+		await eventually(() => submissions.length === initial.length, "console did not saturate the owner-operation cap");
+		for (const line of queued) input.send(`${line}\n`);
+		expect(terminal.queuedLineCount).toBe(MAX_RAW_CONSOLE_QUEUED_LINES);
+		expect(terminal.queuedInputBytes).toBeLessThanOrEqual(MAX_RAW_CONSOLE_QUEUED_BYTES);
+		expect(terminal.inputPaused).toBe(true);
+		expect(input.isPaused).toBe(true);
+		expect(input.blockedChunkCount).toBe(4);
+		input.send("/quit\n");
+		expect(input.blockedChunkCount).toBe(5);
+
+		release.resolve();
+		await running;
+		expect(submissions).toEqual([...initial, ...queued]);
+		expect(input.resumeCalls).toBeGreaterThan(1);
+	} finally {
+		release.resolve();
+		terminal.close();
+		await gateway.stop();
+		await running.catch(() => undefined);
+	}
+}, 15_000);
+test("Ctrl-C during cap-saturated owner operations exits through bounded drain without a pending line reader", async () => {
+	await assertBusyControlStartsBoundedDrain("interrupt");
+}, 15_000);
+
+test("Ctrl-D during cap-saturated owner operations exits through bounded drain without a pending line reader", async () => {
+	await assertBusyControlStartsBoundedDrain("eof");
+}, 15_000);
 test("real console command loop answers a gate opened by its pending prompt and lets that turn complete", async () => {
 	const gateId = "gate-command-loop";
 	const sdk = new FileSdkDouble({ gateOnPrompt: { text: "wait for the workflow gate", gateId } });
