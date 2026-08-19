@@ -4,7 +4,7 @@ import * as fsp from "node:fs/promises";
 import * as net from "node:net";
 import * as os from "node:os";
 import * as path from "node:path";
-import { runWayConsole } from "./console/console";
+import { ConsoleStartupRefusalError, runWayConsole, sanitizeConsoleText } from "./console/console";
 import { parseWayConfig, type WayConfig } from "./config";
 import { BrokerCli } from "./broker/cli";
 import { BrokerReconciler } from "./broker/reconcile";
@@ -1230,8 +1230,10 @@ if (import.meta.main && process.env.WAY_INTERNAL_CLOSURE_WORKER === "1") {
 		if (error instanceof FailedClosedExit) {
 			if (error.forceExit) process.exit(78);
 			process.exitCode = 78;
+		} else if (error instanceof ConsoleStartupRefusalError) {
+			process.exitCode = 1;
 		} else {
-			console.error(error instanceof Error ? error.message : String(error));
+			console.error(sanitizeConsoleText(error instanceof Error ? error.message : String(error)));
 			process.exitCode = 1;
 		}
 	}

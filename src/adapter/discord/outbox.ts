@@ -1,4 +1,9 @@
-import { RpcResponseError, rpcResult, type JsonRpcClient } from "../../rpc-client";
+import {
+	RpcJournalConsumer,
+	type JournalDeliveryProof,
+	type RpcJournalEvent,
+} from "../../journal-consumer";
+import type { JsonRpcClient } from "../../rpc-client";
 import type { DiscordPlatform } from "./platform";
 import type { DiscordRoute } from "./route";
 
@@ -43,30 +48,6 @@ export class DiscordOutboxError extends Error {
 	}
 }
 
-interface ConsumerClaim {
-	readonly claim_id: string;
-	readonly cursor: string;
-	readonly expires_at: number;
-}
-
-interface EventRead {
-	readonly events: readonly EventFrame[];
-	readonly next_cursor: string;
-	readonly gap?: { readonly missing_from: string; readonly missing_to: string; readonly resync_cursor: string };
-}
-
-interface EventFrame {
-	readonly seq: string | number;
-	readonly kind: string;
-	readonly payload: unknown;
-}
-
-interface DeliveryProof {
-	readonly seq: string;
-	readonly platform_msg_id: string;
-	readonly dedupe_key: string;
-}
-
 /** The only assistant-message payload accepted for Discord egress. */
 export interface FinalizedAssistantMessagePayload {
 	readonly finalized: true;
@@ -81,41 +62,47 @@ export interface FinalizedAssistantMessagePayload {
  * authority and Discord receives the deterministic nonce on every retry.
  */
 export class DiscordOutbox {
-	readonly #rpc: JsonRpcClient;
 	readonly #platform: DiscordPlatform;
 	readonly #route: DiscordRoute;
-	readonly #consumerId: string;
-	readonly #claimTtlMs: number;
-	readonly #readWaitMs: number;
+	readonly #hooks: DiscordOutboxHooks;
+	readonly #consumer: RpcJournalConsumer;
 	readonly #idleDelayMs: number;
 	readonly #retryDelayMs: number;
-	readonly #now: () => number;
-	readonly #hooks: DiscordOutboxHooks;
 	readonly #onError: (error: Error) => void;
 
 	constructor(options: DiscordOutboxOptions) {
 		if (!options.route.surfaceId.trim() || !/^\d+$/.test(options.route.channelId)) {
 			throw new DiscordOutboxError("Discord outbox requires a valid configured route.");
 		}
-		this.#rpc = options.rpc;
-		this.#platform = options.platform;
-		this.#route = options.route;
-		this.#consumerId = options.consumerId ?? DISCORD_CONSUMER_ID;
-		this.#claimTtlMs = boundedInteger(
+		const consumerId = options.consumerId ?? DISCORD_CONSUMER_ID;
+		const claimTtlMs = boundedInteger(
 			options.claimTtlMs ?? DEFAULT_DISCORD_CLAIM_TTL_MS,
 			"claimTtlMs",
 			5_000,
 			600_000,
 		);
-		this.#readWaitMs = boundedInteger(options.readWaitMs ?? DEFAULT_DISCORD_READ_WAIT_MS, "readWaitMs", 0, 60_000);
-		if (this.#readWaitMs >= this.#claimTtlMs) {
-			throw new DiscordOutboxError("readWaitMs must be shorter than claimTtlMs.");
-		}
+		const readWaitMs = boundedInteger(options.readWaitMs ?? DEFAULT_DISCORD_READ_WAIT_MS, "readWaitMs", 0, 60_000);
+		if (readWaitMs >= claimTtlMs) throw new DiscordOutboxError("readWaitMs must be shorter than claimTtlMs.");
+		this.#platform = options.platform;
+		this.#route = options.route;
+		this.#hooks = options.hooks ?? {};
 		this.#idleDelayMs = boundedInteger(options.idleDelayMs ?? 50, "idleDelayMs", 0, 60_000);
 		this.#retryDelayMs = boundedInteger(options.retryDelayMs ?? 250, "retryDelayMs", 0, 60_000);
-		this.#now = options.now ?? Date.now;
-		this.#hooks = options.hooks ?? {};
 		this.#onError = options.onError ?? (error => console.error(`way-discord outbox failed: ${error.message}`));
+		this.#consumer = new RpcJournalConsumer({
+			rpc: options.rpc,
+			consumerId,
+			claimTtlMs,
+			readWaitMs,
+			kinds: ["assistant_message"],
+			now: options.now,
+			errorFactory: message => new DiscordOutboxError(message),
+			gapError: gap =>
+				new DiscordOutboxError(
+					`Discord consumer checkpoint ${gap.checkpoint} is behind journal retention; operator resync is required at ${gap.resyncCursor}.`,
+				),
+			publish: async (event, context) => await this.publish(event, context.cursor, context.signal),
+		});
 	}
 
 	async run(signal: AbortSignal): Promise<void> {
@@ -132,107 +119,19 @@ export class DiscordOutbox {
 	}
 
 	async runOnce(signal?: AbortSignal): Promise<DiscordOutboxRunResult> {
+		const result = await this.#consumer.runOnce(signal);
+		return result === "published" ? "sent" : result;
+	}
+
+	private async publish(event: RpcJournalEvent, cursor: string, signal?: AbortSignal): Promise<JournalDeliveryProof> {
+		const item = eventToOutboxItem(event, this.#route, cursor);
+		await this.#hooks.beforeSend?.(item);
 		throwIfAborted(signal);
-		let claim: ConsumerClaim;
-		try {
-			claim = parseClaim(
-				rpcResult<unknown>(
-					await this.#rpc.request("consumer.claim", { consumer_id: this.#consumerId, claim_ttl_ms: this.#claimTtlMs }, { signal }),
-					"consumer.claim",
-				),
-			);
-		} catch (error) {
-			if (error instanceof RpcResponseError && error.code === 1601) return "claim_held";
-			throw error;
-		}
-
-		try {
-			let readCursor = claim.cursor;
-			let readFromCheckpoint = true;
-			for (;;) {
-				throwIfAborted(signal);
-				const readParams = {
-					...(readFromCheckpoint ? { consumer_id: this.#consumerId } : { cursor: readCursor }),
-					limit: 100,
-					wait_ms: this.#readWaitMs,
-					kinds: ["assistant_message"],
-				};
-				const read = parseEventRead(
-					rpcResult<unknown>(
-						await this.#rpc.request(
-							"main.events.read",
-							readParams,
-							{ signal, timeoutMs: this.#readWaitMs + 2_000 },
-						),
-						"main.events.read",
-					),
-				);
-				readFromCheckpoint = false;
-				if (read.gap) {
-					throw new DiscordOutboxError(
-						`Discord consumer checkpoint ${claim.cursor} is behind journal retention; operator resync is required at ${read.gap.resync_cursor}.`,
-					);
-				}
-				if (read.events.length > 0) {
-					const proofs: DeliveryProof[] = [];
-					for (const event of read.events) {
-						const item = eventToOutboxItem(event, this.#route, read.next_cursor);
-						await this.#hooks.beforeSend?.(item);
-						throwIfAborted(signal);
-						const platformMessageId = await this.#platform.send(this.#route.channelId, item.text, item.nonce);
-						if (!platformMessageId) throw new DiscordOutboxError(`Discord returned no message id for journal event ${item.seq}.`);
-						await this.#hooks.afterSendBeforeCommit?.(item, platformMessageId);
-						throwIfAborted(signal);
-						proofs.push({ seq: item.seq, platform_msg_id: platformMessageId, dedupe_key: item.dedupeKey });
-					}
-					await this.commit(claim, read.next_cursor, proofs, signal);
-					return "sent";
-				}
-
-				if (read.next_cursor === readCursor || this.nearClaimExpiry(claim)) {
-					// Same-cursor commits are valid and release a claim without advancing
-					// it. This never turns an unconfirmed effect into a checkpoint.
-					await this.commit(claim, claim.cursor, [], signal);
-					return "idle";
-				}
-				// Filtered reads can safely skip unrelated events only in this volatile
-				// process loop. A later confirmed assistant send commits the resulting
-				// cursor atomically; a crash restarts from the server checkpoint.
-				readCursor = read.next_cursor;
-			}
-		} catch (error) {
-			if (!signal?.aborted) await this.releaseUnadvancedClaim(claim);
-			throw error;
-		}
-	}
-
-	private nearClaimExpiry(claim: ConsumerClaim): boolean {
-		return this.#now() + this.#readWaitMs + 250 >= claim.expires_at;
-	}
-
-	private async commit(claim: ConsumerClaim, cursor: string, proofs: readonly DeliveryProof[], signal?: AbortSignal): Promise<void> {
-		rpcResult<unknown>(
-			await this.#rpc.request(
-				"consumer.commit",
-				{
-					consumer_id: this.#consumerId,
-					claim_id: claim.claim_id,
-					cursor,
-					proofs,
-				},
-				{ signal },
-			),
-			"consumer.commit",
-		);
-	}
-
-	private async releaseUnadvancedClaim(claim: ConsumerClaim): Promise<void> {
-		try {
-			await this.commit(claim, claim.cursor, []);
-		} catch {
-			// A real process crash has the same result: the short server-side claim
-			// expiry fences the next adapter instance. Never advance after failure.
-		}
+		const platformMessageId = await this.#platform.send(this.#route.channelId, item.text, item.nonce);
+		if (!platformMessageId) throw new DiscordOutboxError(`Discord returned no message id for journal event ${item.seq}.`);
+		await this.#hooks.afterSendBeforeCommit?.(item, platformMessageId);
+		throwIfAborted(signal);
+		return { seq: item.seq, platform_msg_id: platformMessageId, dedupe_key: item.dedupeKey };
 	}
 }
 
@@ -240,7 +139,7 @@ export function discordDedupeKey(surfaceId: string, seq: string): string {
 	return `way-discord:${surfaceId}:${seq}`;
 }
 
-function eventToOutboxItem(event: EventFrame, route: DiscordRoute, cursor: string): DiscordOutboxItem {
+function eventToOutboxItem(event: RpcJournalEvent, route: DiscordRoute, cursor: string): DiscordOutboxItem {
 	if (event.kind !== "assistant_message") throw new DiscordOutboxError(`Unexpected event kind in Discord outbox: ${event.kind}.`);
 	const seq = sequenceString(event.seq);
 	const text = assistantMessageText(event.payload);
@@ -253,38 +152,6 @@ function eventToOutboxItem(event: EventFrame, route: DiscordRoute, cursor: strin
 export function assistantMessageText(payload: unknown): string {
 	if (!isRecord(payload) || payload.finalized !== true || typeof payload.text !== "string") return "";
 	return payload.text;
-}
-
-function parseClaim(value: unknown): ConsumerClaim {
-	if (!isRecord(value) || typeof value.claim_id !== "string" || typeof value.cursor !== "string" || typeof value.expires_at !== "number") {
-		throw new DiscordOutboxError("consumer.claim returned an invalid response.");
-	}
-	return { claim_id: value.claim_id, cursor: value.cursor, expires_at: value.expires_at };
-}
-
-function parseEventRead(value: unknown): EventRead {
-	if (!isRecord(value) || !Array.isArray(value.events) || typeof value.next_cursor !== "string") {
-		throw new DiscordOutboxError("main.events.read returned an invalid response.");
-	}
-	const events: EventFrame[] = [];
-	for (const event of value.events) {
-		if (!isRecord(event) || (typeof event.seq !== "number" && typeof event.seq !== "string") || typeof event.kind !== "string") {
-			throw new DiscordOutboxError("main.events.read returned an invalid event.");
-		}
-		events.push({ seq: event.seq, kind: event.kind, payload: event.payload });
-	}
-	let gap: EventRead["gap"];
-	if (value.gap !== undefined) {
-		if (!isRecord(value.gap) || typeof value.gap.missing_from !== "string" || typeof value.gap.missing_to !== "string" || typeof value.gap.resync_cursor !== "string") {
-			throw new DiscordOutboxError("main.events.read returned an invalid retention gap.");
-		}
-		gap = {
-			missing_from: value.gap.missing_from,
-			missing_to: value.gap.missing_to,
-			resync_cursor: value.gap.resync_cursor,
-		};
-	}
-	return { events, next_cursor: value.next_cursor, ...(gap ? { gap } : {}) };
 }
 
 function sequenceString(seq: string | number): string {

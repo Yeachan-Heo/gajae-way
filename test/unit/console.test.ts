@@ -1,5 +1,5 @@
 import { expect, test } from "bun:test";
-import { consoleStartupDecision, renderConsoleStatusSummary } from "../../src/console/console";
+import { ConsoleOutput, consoleStartupDecision, renderConsoleStatusSummary, sanitizeConsoleText } from "../../src/console/console";
 
 const healthyHealth = {
 	status: "healthy",
@@ -52,4 +52,29 @@ test("console refuses a failed-closed or unhealthy daemon before interactive inp
 	);
 	expect(unavailableDecision).toMatchObject({ interactive: false });
 	expect(unavailableDecision.refusal).toContain("not healthy");
+});
+
+test("untrusted gateway text escapes CSI, OSC 52, C0, and C1 controls before terminal publication", async () => {
+	const hostile = "readable \x1b[2J CSI \x1b]52;c;SGVsbG8=\u0007 OSC52 \u0000\b\t\n\r\u009b1A C1";
+	const sanitized = sanitizeConsoleText(hostile);
+	expect(sanitized).toContain("readable \\x1B[2J CSI");
+	expect(sanitized).toContain("\\x1B]52;c;SGVsbG8=\\u0007 OSC52");
+	expect(sanitized).toContain("\\u0000\\u0008\\t\\n\\r\\u009B1A C1");
+	expect(sanitized).not.toMatch(/[\u0000-\u001f\u007f-\u009f]/);
+
+	const writes: string[] = [];
+	const output = new ConsoleOutput(text => {
+		writes.push(text);
+	});
+	await output.writeTrusted("\x1b[2K");
+	await output.writeUntrusted(hostile);
+	expect(writes).toEqual(["\x1b[2K", sanitized]);
+	expect(writes[1]).not.toMatch(/[\u0000-\u001f\u007f-\u009f]/);
+
+	const hostileRefusal = consoleStartupDecision(
+		{ status: "unhealthy", state: "failed_closed", reason: "\x1b]52;c;SGVsbG8=\u0007" },
+		{ status: "unhealthy", state: "failed_closed", reason: "\x1b]52;c;SGVsbG8=\u0007" },
+	).refusal;
+	expect(hostileRefusal).toContain("\\x1B]52;c;SGVsbG8=\\u0007");
+	expect(hostileRefusal).not.toMatch(/[\u0000-\u001f\u007f-\u009f]/);
 });
