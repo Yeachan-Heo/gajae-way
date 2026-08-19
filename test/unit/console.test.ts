@@ -417,6 +417,72 @@ test("raw terminal retains one refusal through transient backpressure without ec
 	}
 });
 
+test("raw terminal publishes a same-chunk oversized-line refusal and keeps the pending read usable", async () => {
+	const input = new RawInputHarness();
+	const output = new RawOutputHarness();
+	const terminal = new RawConsoleTerminal({ input, output });
+	const oversized = "x".repeat(MAX_RAW_CONSOLE_LINE_BYTES + 1);
+	const usableLine = "normal line after oversized paste";
+	const fifoLines = ["first queued line after oversized paste", "second queued line after oversized paste"];
+	const pendingLine = terminal.readLine("way> ");
+	try {
+		input.send(`${oversized}\n`);
+		await eventually(
+			() => output.writes.join("").includes(`Input line exceeds ${MAX_RAW_CONSOLE_LINE_BYTES} bytes and was refused.`),
+			"same-chunk oversized input did not render a refusal",
+		);
+		expect(output.writes.filter((write) => write.includes("Input line exceeds"))).toHaveLength(1);
+		expect(output.writes.join("")).not.toContain(oversized.slice(0, 64));
+		expect(terminal.queuedLineCount).toBe(0);
+		expect(terminal.queuedInputBytes).toBe(0);
+		expect(terminal.bufferedInputBytes).toBe(0);
+		expect(terminal.pendingRefusalPublicationCount).toBe(0);
+
+		input.send(`${usableLine}\n`);
+		expect(await pendingLine).toBe(usableLine);
+		input.send(`${fifoLines.join("\n")}\n`);
+		expect(await terminal.readLine("way> ")).toBe(fifoLines[0]);
+		expect(await terminal.readLine("way> ")).toBe(fifoLines[1]);
+	} finally {
+		terminal.close();
+	}
+});
+
+test("raw terminal retains a same-chunk oversized-line refusal through transient output backpressure", async () => {
+	const input = new RawInputHarness();
+	const output = new BackpressuredRawOutputHarness();
+	const terminal = new RawConsoleTerminal({ input, output });
+	const oversized = "x".repeat(MAX_RAW_CONSOLE_LINE_BYTES + 1);
+	const usableLine = "normal line after recovered output";
+	const pendingLine = terminal.readLine("way> ");
+	try {
+		await eventually(() => output.writes.includes("way> "), "raw terminal did not render its prompt");
+		output.stall();
+		input.send(`${oversized}\n`);
+		await eventually(() => output.pendingWriteCount === 1, "oversized refusal did not begin its stalled publication");
+		await Bun.sleep(300);
+		expect(terminal.pendingRefusalPublicationCount).toBe(1);
+		expect(terminal.pendingEchoRedrawCount).toBe(0);
+		expect(terminal.rawPublicationPending).toBe(true);
+		expect(terminal.queuedLineCount).toBe(0);
+		expect(terminal.queuedInputBytes).toBe(0);
+		expect(terminal.bufferedInputBytes).toBe(0);
+
+		output.recover();
+		await eventually(
+			() => terminal.pendingRefusalPublicationCount === 0 && !terminal.rawPublicationPending,
+			"retained oversized refusal did not publish after output recovery",
+		);
+		expect(output.writes.filter((write) => write.includes("Input line exceeds"))).toHaveLength(1);
+		expect(output.writes.join("")).not.toContain(oversized.slice(0, 64));
+
+		input.send(`${usableLine}\n`);
+		expect(await pendingLine).toBe(usableLine);
+	} finally {
+		terminal.close();
+	}
+});
+
 test("raw terminal retains Ctrl-C as an exit request while no line read is pending", async () => {
 	const input = new RawInputHarness();
 	const terminal = new RawConsoleTerminal({ input, output: new RawOutputHarness() });

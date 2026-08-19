@@ -58,6 +58,12 @@ export interface ConsoleTerminal {
 	onExitRequested?(listener: () => void): () => void;
 }
 
+type RawConsoleRefusalKind = "queue-full" | "oversized-line";
+
+interface RawConsoleRefusal {
+	readonly kind: RawConsoleRefusalKind;
+	readonly message: string;
+}
 interface RawConsoleInputStream {
 	readonly isTTY?: boolean;
 	readonly isRaw?: boolean;
@@ -880,8 +886,8 @@ export class RawConsoleTerminal implements ConsoleTerminal {
 	#bufferBytes = 0;
 	readonly #queuedLines: Array<{ readonly text: string; readonly bytes: number }> = [];
 	#queuedBytes = 0;
-	#queueRefusalPublished = false;
-	#queueRefusal: { readonly message: string } | undefined;
+	#queueFullRefusalPublished = false;
+	#pendingRefusal: RawConsoleRefusal | undefined;
 	#discardingOversizeLine = false;
 	#discardingRefusedLine = false;
 	#prompt = "";
@@ -937,7 +943,7 @@ export class RawConsoleTerminal implements ConsoleTerminal {
 
 	/** At most one refusal diagnostic is retained until publication or episode end. */
 	get pendingRefusalPublicationCount(): number {
-		return this.#queueRefusal ? 1 : 0;
+		return this.#pendingRefusal ? 1 : 0;
 	}
 
 	onExitRequested(listener: () => void): () => void {
@@ -957,7 +963,7 @@ export class RawConsoleTerminal implements ConsoleTerminal {
 		const queued = this.#queuedLines.shift();
 		if (queued) {
 			this.#queuedBytes -= queued.bytes;
-			this.endQueueRefusalEpisode();
+			this.endQueueFullRefusalEpisode();
 			return queued.text;
 		}
 		this.#prompt = prompt;
@@ -979,7 +985,7 @@ export class RawConsoleTerminal implements ConsoleTerminal {
 		this.#closed = true;
 		this.#inputPaused = true;
 		this.#echoDirty = false;
-		this.clearQueueRefusal();
+		this.clearPendingRefusal();
 		this.#input.off("data", this.onData);
 		this.#input.pause();
 		if (this.#input.isRaw) this.#input.setRawMode?.(false);
@@ -994,10 +1000,8 @@ export class RawConsoleTerminal implements ConsoleTerminal {
 			}
 			if (character === "\r" || character === "\n") {
 				if (this.#discardingOversizeLine || this.#discardingRefusedLine) {
-					const resetRefusal = this.#discardingOversizeLine;
 					this.#discardingOversizeLine = false;
 					this.#discardingRefusedLine = false;
-					if (resetRefusal) this.endQueueRefusalEpisode();
 					this.#buffer = "";
 					this.#bufferBytes = 0;
 					continue;
@@ -1021,7 +1025,7 @@ export class RawConsoleTerminal implements ConsoleTerminal {
 				this.#discardingRefusedLine = true;
 				this.#buffer = "";
 				this.#bufferBytes = 0;
-				this.reportInputRefusal(this.queueFullRefusalMessage());
+				this.reportInputRefusal("queue-full", this.queueFullRefusalMessage());
 				continue;
 			}
 			const bytes = Buffer.byteLength(character);
@@ -1029,7 +1033,12 @@ export class RawConsoleTerminal implements ConsoleTerminal {
 				this.#discardingOversizeLine = true;
 				this.#buffer = "";
 				this.#bufferBytes = 0;
-				this.reportInputRefusal(`Input line exceeds ${MAX_RAW_CONSOLE_LINE_BYTES} bytes and was refused.`);
+				this.#echoDirty = false;
+				this.#echoFrame = "";
+				this.reportInputRefusal(
+					"oversized-line",
+					`Input line exceeds ${MAX_RAW_CONSOLE_LINE_BYTES} bytes and was refused.`,
+				);
 				continue;
 			}
 			this.#buffer += character;
@@ -1048,7 +1057,7 @@ export class RawConsoleTerminal implements ConsoleTerminal {
 			this.#queuedLines.length >= MAX_RAW_CONSOLE_QUEUED_LINES ||
 			this.#queuedBytes + bytes > MAX_RAW_CONSOLE_QUEUED_BYTES
 		) {
-			this.reportInputRefusal(this.queueFullRefusalMessage());
+			this.reportInputRefusal("queue-full", this.queueFullRefusalMessage());
 			return false;
 		}
 		this.#queuedLines.push({ text: line, bytes });
@@ -1070,7 +1079,7 @@ export class RawConsoleTerminal implements ConsoleTerminal {
 		if (this.#exitRequested) return;
 		this.#exitRequested = true;
 		this.#echoDirty = false;
-		this.clearQueueRefusal();
+		this.clearPendingRefusal();
 		this.refreshInputFlow();
 		this.finishLine(undefined);
 		for (const listener of [...this.#exitListeners]) listener();
@@ -1104,35 +1113,38 @@ export class RawConsoleTerminal implements ConsoleTerminal {
 		this.scheduleRawPublication();
 	}
 
-	private reportInputRefusal(message: string): void {
-		if (this.#closed || this.#exitRequested || this.#queueRefusalPublished || this.#queueRefusal) return;
-		this.#queueRefusalPublished = true;
-		this.#queueRefusal = { message };
+	private reportInputRefusal(kind: RawConsoleRefusalKind, message: string): void {
+		if (this.#closed || this.#exitRequested || this.#pendingRefusal) return;
+		if (kind === "queue-full") {
+			if (this.#queueFullRefusalPublished) return;
+			this.#queueFullRefusalPublished = true;
+		}
+		this.#pendingRefusal = { kind, message };
 		this.scheduleRawPublication();
 	}
 
-	private clearQueueRefusal(): void {
-		this.#queueRefusal = undefined;
+	private clearPendingRefusal(): void {
+		this.#pendingRefusal = undefined;
 	}
 
-	private endQueueRefusalEpisode(): void {
-		this.clearQueueRefusal();
-		this.#queueRefusalPublished = false;
+	private endQueueFullRefusalEpisode(): void {
+		if (this.#pendingRefusal?.kind === "queue-full") this.clearPendingRefusal();
+		this.#queueFullRefusalPublished = false;
 	}
 
 	private scheduleRawPublication(): void {
-		if (this.#closed || this.#rawPublicationPending || (!this.#echoDirty && !this.#queueRefusal)) return;
+		if (this.#closed || this.#rawPublicationPending || (!this.#echoDirty && !this.#pendingRefusal)) return;
 		this.#rawPublicationPending = true;
 		void this.enqueuePublication(async () => await this.publishRawPublication());
 	}
 
 	private async publishRawPublication(): Promise<void> {
 		try {
-			const refusal = this.#queueRefusal;
+			const refusal = this.#pendingRefusal;
 			if (refusal) {
 				this.#rawPublicationKind = "refusal";
 				await writeToStream(this.#output, this.formatTrustedFrame(`${refusal.message}\n`));
-				if (this.#queueRefusal === refusal) this.clearQueueRefusal();
+				if (this.#pendingRefusal === refusal) this.clearPendingRefusal();
 				return;
 			}
 			if (!this.#echoDirty || this.#closed || this.#exitRequested) return;

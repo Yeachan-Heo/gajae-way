@@ -1216,6 +1216,45 @@ test("console queues cap-saturated owner lines until all queued lines are admitt
 	}
 }, 15_000);
 
+test("raw same-chunk oversized input renders a refusal and leaves the owner command loop usable", async () => {
+	const gateway = await hostedConsoleGateway();
+	const input = new PausableRawInputHarness();
+	const output = new RawOutputHarness();
+	const terminal = new RawConsoleTerminal({ input, output });
+	const submissions: string[] = [];
+	const accepted = "submit after oversized input";
+	const oversized = "x".repeat(MAX_RAW_CONSOLE_LINE_BYTES + 1);
+	const running = runWayConsole({ stateDir: gateway.stateDirectory, profilePath: gateway.profilePath }, [], {
+		terminal,
+		profile: loadWayProfile(gateway.profilePath),
+		rpcConnect: async () => blockingSubmissionRpc(Promise.resolve(), submissions),
+	});
+	try {
+		await eventually(() => output.writes.includes("way> "), "raw console did not begin reading interactive input");
+		input.send(`${oversized}\n`);
+		await eventually(
+			() => output.writes.join("").includes(`Input line exceeds ${MAX_RAW_CONSOLE_LINE_BYTES} bytes and was refused.`),
+			"same-chunk oversized input did not render a refusal",
+		);
+		expect(output.writes.filter((write) => write.includes("Input line exceeds"))).toHaveLength(1);
+		expect(output.writes.join("")).not.toContain(oversized.slice(0, 64));
+		expect(terminal.queuedLineCount).toBe(0);
+		expect(terminal.queuedInputBytes).toBe(0);
+		expect(terminal.bufferedInputBytes).toBe(0);
+		expect(submissions).toEqual([]);
+
+		input.send(`${accepted}\n`);
+		await eventually(() => submissions.length === 1, "normal input after oversized refusal was not submitted");
+		expect(submissions).toEqual([accepted]);
+		input.send("/quit\n");
+		await running;
+	} finally {
+		terminal.close();
+		await gateway.stop();
+		await running.catch(() => undefined);
+	}
+}, 15_000);
+
 test("raw console bounds queued input, visibly refuses excess lines, and preserves FIFO after operation-cap saturation", async () => {
 	const gateway = await hostedConsoleGateway();
 	const input = new PausableRawInputHarness();
