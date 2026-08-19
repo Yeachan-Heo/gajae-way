@@ -573,7 +573,7 @@ async function assertRawControlEscapesPermanentlyStalledOutput(control: "\u0003"
 		expect(input.pauseCalls).toBe(0);
 
 		await Bun.sleep(300);
-		expect(terminal.pendingRefusalPublicationCount).toBe(0);
+		expect(terminal.pendingRefusalPublicationCount).toBe(1);
 		expect(output.writes.slice(writesBeforeStall)).toHaveLength(1);
 
 		const startedAt = performance.now();

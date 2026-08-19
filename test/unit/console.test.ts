@@ -116,6 +116,11 @@ class BackpressuredRawOutputHarness {
 		pending.callback();
 		pending.drain?.();
 	}
+
+	recover(): void {
+		this.#stalled = false;
+		while (this.#pending.length > 0) this.releaseOne();
+	}
 }
 
 async function eventually(read: () => boolean, description: string, timeoutMs = 500): Promise<void> {
@@ -359,7 +364,7 @@ test("raw terminal visibly refuses excess lines from a single paste after its bo
 	}
 });
 
-test("raw terminal coalesces stalled echo, refuses saturated payload without echoing it, and retains FIFO", async () => {
+test("raw terminal retains one refusal through transient backpressure without echoing refused input", async () => {
 	const input = new RawInputHarness();
 	const output = new BackpressuredRawOutputHarness();
 	const terminal = new RawConsoleTerminal({ input, output });
@@ -389,14 +394,15 @@ test("raw terminal coalesces stalled echo, refuses saturated payload without ech
 		expect(output.writes.slice(writesBeforeStall)).toHaveLength(1);
 		expect(output.writes.join("")).not.toContain(refusedPrefix);
 
-		output.releaseOne();
+		await Bun.sleep(300);
+		expect(terminal.pendingRefusalPublicationCount).toBe(1);
+		expect(output.pendingWriteCount).toBe(1);
+		output.recover();
 		await eventually(
-			() =>
-				output.pendingWriteCount === 1 &&
-				output.writes.slice(writesBeforeStall).some((write) => write.includes("Input queue is full")),
-			"bounded queue refusal did not begin after backpressure released",
+			() => terminal.pendingRefusalPublicationCount === 0 && !terminal.rawPublicationPending,
+			"retained refusal did not publish after output recovery",
 		);
-		expect(output.writes.slice(writesBeforeStall)).toHaveLength(2);
+		expect(output.writes.filter((write) => write.includes("Input queue is full"))).toHaveLength(1);
 		expect(output.writes.join("")).not.toContain(refusedPrefix);
 
 		const delivered: string[] = [];

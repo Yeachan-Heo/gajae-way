@@ -21,7 +21,6 @@ export const DEFAULT_CONSOLE_READ_WAIT_MS = 1_000;
 export const DEFAULT_CONSOLE_EXIT_DRAIN_MS = 2_000;
 const MAX_CONSOLE_INPUT_OPERATIONS = 16;
 const MAX_CONSOLE_EXIT_DIAGNOSTIC_MS = 250;
-const MAX_RAW_CONSOLE_REFUSAL_DIAGNOSTIC_MS = MAX_CONSOLE_EXIT_DIAGNOSTIC_MS;
 export const MAX_RAW_CONSOLE_QUEUED_LINES = 16;
 export const MAX_RAW_CONSOLE_QUEUED_BYTES = 64 * 1024;
 export const MAX_RAW_CONSOLE_LINE_BYTES = 8 * 1024;
@@ -882,8 +881,7 @@ export class RawConsoleTerminal implements ConsoleTerminal {
 	readonly #queuedLines: Array<{ readonly text: string; readonly bytes: number }> = [];
 	#queuedBytes = 0;
 	#queueRefusalPublished = false;
-	#queueRefusal: { readonly message: string; readonly expiresAt: number } | undefined;
-	#queueRefusalTimer: ReturnType<typeof setTimeout> | undefined;
+	#queueRefusal: { readonly message: string } | undefined;
 	#discardingOversizeLine = false;
 	#discardingRefusedLine = false;
 	#prompt = "";
@@ -937,7 +935,7 @@ export class RawConsoleTerminal implements ConsoleTerminal {
 		return this.#rawPublicationPending;
 	}
 
-	/** At most one deadline-bound refusal diagnostic is retained. */
+	/** At most one refusal diagnostic is retained until publication or episode end. */
 	get pendingRefusalPublicationCount(): number {
 		return this.#queueRefusal ? 1 : 0;
 	}
@@ -959,7 +957,7 @@ export class RawConsoleTerminal implements ConsoleTerminal {
 		const queued = this.#queuedLines.shift();
 		if (queued) {
 			this.#queuedBytes -= queued.bytes;
-			this.#queueRefusalPublished = false;
+			this.endQueueRefusalEpisode();
 			return queued.text;
 		}
 		this.#prompt = prompt;
@@ -999,7 +997,7 @@ export class RawConsoleTerminal implements ConsoleTerminal {
 					const resetRefusal = this.#discardingOversizeLine;
 					this.#discardingOversizeLine = false;
 					this.#discardingRefusedLine = false;
-					if (resetRefusal) this.#queueRefusalPublished = false;
+					if (resetRefusal) this.endQueueRefusalEpisode();
 					this.#buffer = "";
 					this.#bufferBytes = 0;
 					continue;
@@ -1107,23 +1105,19 @@ export class RawConsoleTerminal implements ConsoleTerminal {
 	}
 
 	private reportInputRefusal(message: string): void {
-		if (this.#closed || this.#exitRequested || this.#queueRefusalPublished) return;
+		if (this.#closed || this.#exitRequested || this.#queueRefusalPublished || this.#queueRefusal) return;
 		this.#queueRefusalPublished = true;
-		this.clearQueueRefusal();
-		const expiresAt = Date.now() + MAX_RAW_CONSOLE_REFUSAL_DIAGNOSTIC_MS;
-		this.#queueRefusal = { message, expiresAt };
-		this.#queueRefusalTimer = setTimeout(() => {
-			if (this.#queueRefusal?.expiresAt !== expiresAt) return;
-			this.#queueRefusal = undefined;
-			this.#queueRefusalTimer = undefined;
-		}, MAX_RAW_CONSOLE_REFUSAL_DIAGNOSTIC_MS);
+		this.#queueRefusal = { message };
 		this.scheduleRawPublication();
 	}
 
 	private clearQueueRefusal(): void {
-		if (this.#queueRefusalTimer) clearTimeout(this.#queueRefusalTimer);
-		this.#queueRefusalTimer = undefined;
 		this.#queueRefusal = undefined;
+	}
+
+	private endQueueRefusalEpisode(): void {
+		this.clearQueueRefusal();
+		this.#queueRefusalPublished = false;
 	}
 
 	private scheduleRawPublication(): void {
@@ -1134,10 +1128,11 @@ export class RawConsoleTerminal implements ConsoleTerminal {
 
 	private async publishRawPublication(): Promise<void> {
 		try {
-			const refusal = this.takeQueueRefusal();
+			const refusal = this.#queueRefusal;
 			if (refusal) {
 				this.#rawPublicationKind = "refusal";
-				await writeToStream(this.#output, this.formatTrustedFrame(`${refusal}\n`));
+				await writeToStream(this.#output, this.formatTrustedFrame(`${refusal.message}\n`));
+				if (this.#queueRefusal === refusal) this.clearQueueRefusal();
 				return;
 			}
 			if (!this.#echoDirty || this.#closed || this.#exitRequested) return;
@@ -1153,14 +1148,6 @@ export class RawConsoleTerminal implements ConsoleTerminal {
 			this.#rawPublicationPending = false;
 			this.scheduleRawPublication();
 		}
-	}
-
-	private takeQueueRefusal(): string | undefined {
-		const refusal = this.#queueRefusal;
-		if (!refusal) return undefined;
-		this.clearQueueRefusal();
-		if (Date.now() > refusal.expiresAt) return undefined;
-		return refusal.message;
 	}
 
 	private formatTrustedFrame(text: string): string {
