@@ -308,8 +308,9 @@
       "contractRef": "G014: durable gate answering",
       "invocation": "bun test test/integration/console.test.ts",
       "expected": "owner answer resolves a durable gate; wrong expectedSessionId refused",
-      "observed": "1102 on mismatch; correct answer resolved and rendered gate_resolved",
-      "verdict": "passed"
+      "observed": "CORRECTED after terminal-critic review: the drill invoked consoleSurface.answerGate(...) directly rather than typing /gate through the real command loop, so this case proved the gate RPC path (durable gate_id + expectedSessionId, 1102 on mismatch) but NOT interactive gate answering. Interactive coverage is being added under defect D-1.",
+      "verdict": "partial",
+      "note": "Do not read this row as evidence that an owner can answer a gate from the running console; that path was blocked by the command loop awaiting its own submit."
     },
     {
       "id": "QA-CONSOLE-06",
@@ -352,5 +353,12 @@
       "detail": "Owner directed at runtime that the local console come first and chat adapters (live Discord route, future Telegram) be the final gate; that decision plus the explicit override of the v1 no-CLI Non-Goal is recorded in the ultragoal ledger. The drill needs an owner-authorized bot token with DM + Message Content intents and a real owner DM channel, none of which exist on this host. Tracked as story G013."
     }
   ],
-  "blockers": []
+  "blockers": [],
+  "corrections": [
+    {
+      "at": "2026-08-19T04:47:52.162Z",
+      "by": "ultragoal leader after terminal-critic ITERATE",
+      "detail": "QA-CONSOLE-05 downgraded from passed to partial: it bypassed the interactive command loop. Two console defects were found by the critic and are being fixed: (D-1) the command loop cannot read input while its own submit is in flight, so /gate and steering are unreachable during a turn; (D-2) prompt redraw can erase multi-call rendered frames including assistant text and gate ids."
+    }
+  ]
 }

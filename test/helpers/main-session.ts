@@ -36,7 +36,7 @@ export class MemoryGatewayMeta implements GatewayMetaBackend {
 	readonly events: Array<{ kind: string; payloadJson: string }> = [];
 
 	gatewayMetaRead(keys: readonly string[]): GatewayMetaReadOutput {
-		return { entries: keys.map(key => ({ key, value: this.values.get(key) })) };
+		return { entries: keys.map((key) => ({ key, value: this.values.get(key) })) };
 	}
 
 	gatewayMetaTransaction(input: GatewayMetaTransactionInput): GatewayMetaTransactionOutput {
@@ -59,6 +59,7 @@ interface DoubleSessionRecord {
 	readonly listeners: Set<(event: unknown) => void>;
 	readonly gateListeners: Set<(gate: HostedSdkGate) => void>;
 	readonly gates: Map<string, { expiresAt?: number; state: "open" | "resolved" | "expired" }>;
+	readonly pendingPromptGates: Map<string, () => void>;
 	followUpQueueDepth: number;
 	nextAssistantResponseId: number;
 }
@@ -66,6 +67,8 @@ interface DoubleSessionRecord {
 export interface FileSdkDoubleOptions {
 	/** Simulates the SDK's deferred initial JSONL flush for timeout coverage. */
 	readonly persistBootstrapTranscript?: boolean;
+	/** Test seam: a matching prompt opens this gate and remains active until answered. */
+	readonly gateOnPrompt?: { readonly text: string; readonly gateId: string };
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -75,7 +78,6 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 function writeLine(file: string, value: unknown): void {
 	fs.appendFileSync(file, `${JSON.stringify(value)}\n`);
 }
-
 
 /**
  * Deterministic file-backed SDK double. Like the published SDK, `createNew`
@@ -87,11 +89,13 @@ export class FileSdkDouble implements MainSessionSdk {
 	readonly createdInputs: CreateSdkSessionInput[] = [];
 	readonly createdSessionFiles: string[] = [];
 	readonly #persistBootstrapTranscript: boolean;
+	readonly #gateOnPrompt: FileSdkDoubleOptions["gateOnPrompt"];
 	#nextId = 1;
 	readonly #sessions = new Map<string, DoubleSessionRecord>();
 
 	constructor(options: FileSdkDoubleOptions = {}) {
 		this.#persistBootstrapTranscript = options.persistBootstrapTranscript ?? true;
+		this.#gateOnPrompt = options.gateOnPrompt;
 	}
 
 	async createNew(input: CreateSdkSessionInput): Promise<HostedSdkSession> {
@@ -107,6 +111,7 @@ export class FileSdkDouble implements MainSessionSdk {
 			listeners: new Set(),
 			gateListeners: new Set(),
 			gates: new Map(),
+			pendingPromptGates: new Map(),
 			followUpQueueDepth: 0,
 			nextAssistantResponseId: 1,
 		};
@@ -127,14 +132,14 @@ export class FileSdkDouble implements MainSessionSdk {
 	async findBootstrapNonceCandidates(_workspace: string, nonce: string): Promise<readonly string[]> {
 		const marker = bootstrapNonceMarker(nonce);
 		return [...this.#sessions.values()]
-			.filter(record => {
+			.filter((record) => {
 				try {
 					return fs.readFileSync(record.file, "utf8").includes(marker);
 				} catch {
 					return false;
 				}
 			})
-			.map(record => record.file);
+			.map((record) => record.file);
 	}
 
 	async createOrphan(workspace: string, nonce: string): Promise<string> {
@@ -185,30 +190,46 @@ export class FileSdkDouble implements MainSessionSdk {
 		return {
 			sessionFile: record.file,
 			sessionId: record.id,
-			subscribe: listener => {
+			subscribe: (listener) => {
 				record.listeners.add(listener);
 				return () => record.listeners.delete(listener);
 			},
-			subscribeGates: listener => {
+			subscribeGates: (listener) => {
 				record.gateListeners.add(listener);
 				return () => record.gateListeners.delete(listener);
 			},
-			prompt: async text => {
-				if (!fs.existsSync(record.file)) throw new Error("session transcript has not persisted its first assistant message");
+			prompt: async (text) => {
+				if (!fs.existsSync(record.file))
+					throw new Error("session transcript has not persisted its first assistant message");
 				this.emit(record, { type: "turn_start" });
 				writeLine(record.file, { type: "message", role: "user", content: text });
+				const gateId = this.#gateOnPrompt?.text === text ? this.#gateOnPrompt.gateId : undefined;
+				if (gateId) {
+					const resolved = new Promise<void>((resolve) => record.pendingPromptGates.set(gateId, resolve));
+					this.openGate(record.file, gateId);
+					await resolved;
+				}
 				const message = this.finalAssistantMessage(record, "ack");
 				writeLine(record.file, { type: "message", role: "assistant", content: "ack" });
-				this.emit(record, { type: "message_update", message, assistantMessageEvent: { type: "text_delta", delta: "ack" } });
+				this.emit(record, {
+					type: "message_update",
+					message,
+					assistantMessageEvent: { type: "text_delta", delta: "ack" },
+				});
 				this.emit(record, { type: "message_end", message });
 				this.emit(record, { type: "turn_end", message });
 			},
-			steer: async text => {
-				if (!fs.existsSync(record.file)) throw new Error("session transcript has not persisted its first assistant message");
+			steer: async (text) => {
+				if (!fs.existsSync(record.file))
+					throw new Error("session transcript has not persisted its first assistant message");
 				writeLine(record.file, { type: "message", role: "user", content: text, delivery: "steer" });
 				const message = this.finalAssistantMessage(record, "steered");
 				writeLine(record.file, { type: "message", role: "assistant", content: "steered" });
-				this.emit(record, { type: "message_update", message, assistantMessageEvent: { type: "text_delta", delta: "steered" } });
+				this.emit(record, {
+					type: "message_update",
+					message,
+					assistantMessageEvent: { type: "text_delta", delta: "steered" },
+				});
 				this.emit(record, { type: "message_end", message });
 			},
 			followUp: async () => {
@@ -225,9 +246,12 @@ export class FileSdkDouble implements MainSessionSdk {
 				if (gate.state === "resolved") return "already_resolved";
 				gate.state = "resolved";
 				this.emit(record, { type: "gate_resolved", gate_id: gateId, session_id: record.id });
+				const resolvePrompt = record.pendingPromptGates.get(gateId);
+				record.pendingPromptGates.delete(gateId);
+				resolvePrompt?.();
 				return "resolved";
 			},
-			sendBootstrapMessage: async nonce => {
+			sendBootstrapMessage: async (nonce) => {
 				if (!this.#persistBootstrapTranscript) return;
 				fs.writeFileSync(record.file, `${JSON.stringify({ type: "session", id: record.id })}\n`);
 				writeLine(record.file, { type: "message", role: "user", content: bootstrapNonceMarker(nonce) });

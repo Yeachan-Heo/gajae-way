@@ -18,7 +18,13 @@ import { GatewayStateStore } from "../../src/main-session/state";
 import { loadWayCore, type WayCoreHandle } from "../../src/native-loader";
 import { loadWayProfile } from "../../src/profile";
 import { createRpcBridge, RpcBridgeException, type RpcBridgeHandler } from "../../src/rpc-bridge";
-import { RpcClient, rpcResult, type JsonRpcClient, type RpcRequestOptions, type JsonRpcResponse } from "../../src/rpc-client";
+import {
+	RpcClient,
+	rpcResult,
+	type JsonRpcClient,
+	type RpcRequestOptions,
+	type JsonRpcResponse,
+} from "../../src/rpc-client";
 import { FileSdkDouble } from "../helpers/main-session";
 import { ManagedProcessRegistry } from "../helpers/managed-process";
 
@@ -78,7 +84,7 @@ interface HostedConsoleGateway {
 	stop(): Promise<void>;
 }
 
-async function hostedConsoleGateway(): Promise<HostedConsoleGateway> {
+async function hostedConsoleGateway(options: { readonly sdk?: FileSdkDouble } = {}): Promise<HostedConsoleGateway> {
 	const root = temporaryDirectory("host");
 	const corpus = path.join(root, "corpus");
 	const workspace = path.join(root, "workspace");
@@ -90,7 +96,7 @@ async function hostedConsoleGateway(): Promise<HostedConsoleGateway> {
 	const profile = loadWayProfile(profilePath);
 	const core = loadWayCore().WayCore.open(stateDirectory);
 	const state = new GatewayStateStore(core);
-	const sdk = new FileSdkDouble();
+	const sdk = options.sdk ?? new FileSdkDouble();
 	await bootstrapMainSession({ confirm: true, profile, state, sdk });
 	const resumed = await strictResumeMainSession({ profile, state, sdk });
 	const host = createMainSessionHost({ session: resumed.session, identity: resumed.identity, state, journal: core });
@@ -143,7 +149,7 @@ function recordedOutput(writer?: (text: string) => void | Promise<void>): { outp
 	const writes: string[] = [];
 	return {
 		writes,
-		output: new ConsoleOutput(async text => {
+		output: new ConsoleOutput(async (text) => {
 			await writer?.(text);
 			writes.push(text);
 		}),
@@ -165,6 +171,164 @@ function scriptedTerminal(lines: readonly string[]): { terminal: ConsoleTerminal
 			close(): void {},
 		},
 	};
+}
+
+interface ControlledTerminal {
+	readonly terminal: ConsoleTerminal;
+	readonly writes: string[];
+	readonly lifecycle: string[];
+	send(line: string): void;
+	isReading(): boolean;
+	isClosed(): boolean;
+}
+
+interface ControlledTerminalOptions {
+	onWrite?(text: string): void | Promise<void>;
+}
+
+function controlledTerminal(options: ControlledTerminalOptions = {}): ControlledTerminal {
+	const pending: string[] = [];
+	const writes: string[] = [];
+	const lifecycle: string[] = [];
+	let resolveLine: ((line: string | undefined) => void) | undefined;
+	let closed = false;
+	const send = (line: string): void => {
+		if (closed) throw new Error("terminal is closed");
+		const resolve = resolveLine;
+		if (!resolve) {
+			pending.push(line);
+			return;
+		}
+		resolveLine = undefined;
+		resolve(line);
+	};
+	return {
+		writes,
+		lifecycle,
+		send,
+		isReading: () => resolveLine !== undefined,
+		isClosed: () => closed,
+		terminal: {
+			async writeTrusted(text: string): Promise<void> {
+				if (closed) throw new Error("terminal is closed");
+				await options.onWrite?.(text);
+				writes.push(text);
+				lifecycle.push(`write:${text}`);
+			},
+			async readLine(): Promise<string | undefined> {
+				if (closed) return undefined;
+				const queued = pending.shift();
+				if (queued !== undefined) return queued;
+				return await new Promise((resolve) => {
+					resolveLine = resolve;
+				});
+			},
+			close(): void {
+				if (closed) return;
+				closed = true;
+				lifecycle.push("close");
+				const resolve = resolveLine;
+				resolveLine = undefined;
+				resolve?.(undefined);
+			},
+		},
+	};
+}
+
+interface PromptFrameTerminal extends ControlledTerminal {
+	snapshot(): string;
+}
+
+/** Models RawConsoleTerminal's clear-line/repaint behavior for frame assertions. */
+function promptFrameTerminal(): PromptFrameTerminal {
+	const pending: string[] = [];
+	const writes: string[] = [];
+	const lifecycle: string[] = [];
+	const completedLines: string[] = [];
+	let currentLine = "";
+	let prompt = "";
+	let buffer = "";
+	let resolveLine: ((line: string | undefined) => void) | undefined;
+	let closed = false;
+	const append = (text: string): void => {
+		const segments = text.split("\n");
+		for (let index = 0; index < segments.length; index += 1) {
+			currentLine += segments[index] as string;
+			if (index < segments.length - 1) {
+				completedLines.push(currentLine);
+				currentLine = "";
+			}
+		}
+	};
+	const completeInput = (line: string): void => {
+		currentLine += line;
+		completedLines.push(currentLine);
+		currentLine = "";
+		prompt = "";
+		buffer = "";
+		const resolve = resolveLine;
+		resolveLine = undefined;
+		resolve?.(line);
+	};
+	const send = (line: string): void => {
+		if (closed) throw new Error("terminal is closed");
+		if (!resolveLine) {
+			pending.push(line);
+			return;
+		}
+		completeInput(line);
+	};
+	return {
+		writes,
+		lifecycle,
+		send,
+		isReading: () => resolveLine !== undefined,
+		isClosed: () => closed,
+		snapshot: () => [...completedLines, ...(currentLine ? [currentLine] : [])].join("\n"),
+		terminal: {
+			async writeTrusted(text: string): Promise<void> {
+				if (closed) throw new Error("terminal is closed");
+				writes.push(text);
+				lifecycle.push(`write:${text}`);
+				if (resolveLine) currentLine = "";
+				append(text);
+				if (resolveLine) currentLine += `${prompt}${buffer}`;
+			},
+			async readLine(nextPrompt: string): Promise<string | undefined> {
+				if (closed) return undefined;
+				prompt = nextPrompt;
+				buffer = "";
+				currentLine += prompt;
+				const queued = pending.shift();
+				if (queued !== undefined) {
+					completedLines.push(`${currentLine}${queued}`);
+					currentLine = "";
+					prompt = "";
+					return queued;
+				}
+				return await new Promise((resolve) => {
+					resolveLine = resolve;
+				});
+			},
+			close(): void {
+				if (closed) return;
+				closed = true;
+				lifecycle.push("close");
+				const resolve = resolveLine;
+				resolveLine = undefined;
+				resolve?.(undefined);
+			},
+		},
+	};
+}
+
+async function eventually(read: () => boolean, description: string, timeoutMs = 5_000): Promise<void> {
+	const deadline = Date.now() + timeoutMs;
+	while (Date.now() < deadline) {
+		if (read()) return;
+		await Bun.sleep(10);
+	}
+	throw new Error(description);
 }
 
 function retentionGapClient(delegate: RpcClient): JsonRpcClient {
@@ -191,7 +355,7 @@ function retentionGapClient(delegate: RpcClient): JsonRpcClient {
 
 function deferred(): { promise: Promise<void>; resolve(): void } {
 	let resolve: (() => void) | undefined;
-	const promise = new Promise<void>(resolvePromise => {
+	const promise = new Promise<void>((resolvePromise) => {
 		resolve = resolvePromise;
 	});
 	return {
@@ -206,8 +370,8 @@ test("console submits through real UDS, renders finalized replies before settlem
 	const gateway = await hostedConsoleGateway();
 	let cursorAtAssistantRender: string | undefined;
 	const recorded = recordingClient(gateway.client);
-	const rendered = recordedOutput(text => {
-		if (text === "Assistant:\n") cursorAtAssistantRender = gateway.core.consumerCursor("way-console");
+	const rendered = recordedOutput((text) => {
+		if (text.startsWith("Assistant:\n")) cursorAtAssistantRender = gateway.core.consumerCursor("way-console");
 	});
 	let idempotencyCount = 0;
 	const consoleSurface = new OwnerConsole({
@@ -219,22 +383,30 @@ test("console submits through real UDS, renders finalized replies before settlem
 	});
 	try {
 		expect((await consoleSurface.start()).accepted).toBe(true);
-		expect(recorded.calls.filter(call => call.method === "way.health")).toHaveLength(1);
-		expect(recorded.calls.filter(call => call.method === "way.status")).toHaveLength(1);
+		expect(recorded.calls.filter((call) => call.method === "way.health")).toHaveLength(1);
+		expect(recorded.calls.filter((call) => call.method === "way.status")).toHaveLength(1);
 		await consoleSurface.submit("owner request");
 		expect(await consoleSurface.consumeOnce()).toBe("rendered");
 
-		const submit = recorded.calls.find(call => call.method === "main.submit");
+		const submit = recorded.calls.find((call) => call.method === "main.submit");
 		expect(submit?.params).toEqual({ text: "owner request", surface_id: "owner", idempotency_key: "console-submit-1" });
 		expect(rendered.writes.join("")).toContain("Delivered as: prompt");
-		const consumerClaim = recorded.calls.find(call => call.method === "consumer.claim");
+		const consumerClaim = recorded.calls.find((call) => call.method === "consumer.claim");
 		expect(consumerClaim?.params).toEqual({ consumer_id: "way-console", claim_ttl_ms: 5_000 });
-		const eventRead = recorded.calls.find(call => call.method === "main.events.read");
+		const eventRead = recorded.calls.find((call) => call.method === "main.events.read");
 		expect(eventRead?.params).toEqual({
 			consumer_id: "way-console",
 			limit: 100,
 			wait_ms: 0,
-			kinds: ["assistant_message", "turn_start", "turn_end", "gate_open", "gate_resolved", "health_change", "lock_event"],
+			kinds: [
+				"assistant_message",
+				"turn_start",
+				"turn_end",
+				"gate_open",
+				"gate_resolved",
+				"health_change",
+				"lock_event",
+			],
 		});
 		expect(rendered.writes.join("")).toContain("Main turn started — busy.");
 		expect(rendered.writes.join("")).toContain("Assistant:\nack\n");
@@ -273,17 +445,23 @@ test("console submits through real UDS, renders finalized replies before settlem
 test("console sanitizes assistant CSI, OSC 52, C0, and C1 text before terminal publication", async () => {
 	const gateway = await hostedConsoleGateway();
 	const rendered = recordedOutput();
-	const consoleSurface = new OwnerConsole({ rpc: gateway.client, ownerSurfaceId: "owner", output: rendered.output, readWaitMs: 0 });
+	const consoleSurface = new OwnerConsole({
+		rpc: gateway.client,
+		ownerSurfaceId: "owner",
+		output: rendered.output,
+		readWaitMs: 0,
+	});
 	const hostile = "readable \x1b[2J CSI \x1b]52;c;SGVsbG8=\u0007 OSC52 \u0000\b\t\n\r\u009b1A C1";
 	try {
 		expect((await consoleSurface.start()).accepted).toBe(true);
 		gateway.core.journalAppend("assistant_message", JSON.stringify({ finalized: true, text: hostile }));
 		expect(await consoleSurface.consumeOnce()).toBe("rendered");
-		const assistantText = rendered.writes.find(text => text.includes("readable"));
+		const assistantText = rendered.writes.find((text) => text.includes("readable"));
 		expect(assistantText).toContain("\\x1B[2J");
 		expect(assistantText).toContain("\\x1B]52;c;SGVsbG8=\\u0007");
 		expect(assistantText).toContain("\\u0000\\u0008\\t\\n\\r\\u009B1A");
-		expect(assistantText).not.toMatch(/[\u0000-\u001f\u007f-\u009f]/);
+		if (!assistantText) throw new Error("assistant frame was not rendered");
+		expect(assistantText.slice("Assistant:\n".length, -1)).not.toMatch(/[\u0000-\u001f\u007f-\u009f]/);
 		const errorOutput = recordedOutput();
 		const hostileErrorRpc: JsonRpcClient = {
 			async request(method: string, params?: unknown, options?: RpcRequestOptions): Promise<JsonRpcResponse> {
@@ -294,13 +472,19 @@ test("console sanitizes assistant CSI, OSC 52, C0, and C1 text before terminal p
 			},
 			close(): void {},
 		};
-		const errorConsole = new OwnerConsole({ rpc: hostileErrorRpc, ownerSurfaceId: "owner", output: errorOutput.output, readWaitMs: 0 });
+		const errorConsole = new OwnerConsole({
+			rpc: hostileErrorRpc,
+			ownerSurfaceId: "owner",
+			output: errorOutput.output,
+			readWaitMs: 0,
+		});
 		expect((await errorConsole.start()).accepted).toBe(true);
 		expect(await errorConsole.handleInput("request that returns a hostile RPC error")).toBe(true);
-		const errorText = errorOutput.writes.find(text => text.includes("RPC main.submit failed"));
+		const errorText = errorOutput.writes.find((text) => text.includes("RPC main.submit failed"));
 		expect(errorText).toContain("\\x1B[2J");
 		expect(errorText).toContain("\\x1B]52;c;SGVsbG8=\\u0007");
-		expect(errorText).not.toMatch(/[\u0000-\u001f\u007f-\u009f]/);
+		if (!errorText) throw new Error("error frame was not rendered");
+		expect(errorText.slice("Request failed: ".length, -1)).not.toMatch(/[\u0000-\u001f\u007f-\u009f]/);
 	} finally {
 		await gateway.stop();
 	}
@@ -316,11 +500,18 @@ test("console readiness refuses an existing way-console claim before it can subm
 			await holder.request("consumer.claim", { consumer_id: "way-console", claim_ttl_ms: 5_000 }),
 			"consumer.claim",
 		);
-		const consoleSurface = new OwnerConsole({ rpc: contender, ownerSurfaceId: "owner", output: rendered.output, readWaitMs: 0 });
+		const consoleSurface = new OwnerConsole({
+			rpc: contender,
+			ownerSurfaceId: "owner",
+			output: rendered.output,
+			readWaitMs: 0,
+		});
 		const startup = await consoleSurface.start();
 		expect(startup).toMatchObject({ accepted: false });
 		expect(rendered.writes.join("")).toContain("Another way console currently owns");
-		await expect(consoleSurface.submit("must not submit while delivery is elsewhere")).rejects.toBeInstanceOf(ConsoleDeliveryUnavailableError);
+		await expect(consoleSurface.submit("must not submit while delivery is elsewhere")).rejects.toBeInstanceOf(
+			ConsoleDeliveryUnavailableError,
+		);
 		await holder.request("consumer.commit", {
 			consumer_id: "way-console",
 			claim_id: claim.claim_id,
@@ -349,7 +540,9 @@ test("console readiness terminates on a retention gap instead of accepting blind
 		expect(startup).toMatchObject({ accepted: false });
 		expect(rendered.writes.join("")).toContain("behind journal retention");
 		expect(rendered.writes.join("")).toContain("restart way console");
-		await expect(consoleSurface.submit("must not submit without a recoverable checkpoint")).rejects.toBeInstanceOf(ConsoleDeliveryUnavailableError);
+		await expect(consoleSurface.submit("must not submit without a recoverable checkpoint")).rejects.toBeInstanceOf(
+			ConsoleDeliveryUnavailableError,
+		);
 		expect(gateway.core.consumerCursor("way-console")).toBe("1:0");
 	} finally {
 		client.close();
@@ -361,13 +554,21 @@ test("console commits only after an asynchronous terminal publication resolves",
 	const gateway = await hostedConsoleGateway();
 	const publication = deferred();
 	let delayAssistant = false;
-	const rendered = recordedOutput(async text => {
-		if (delayAssistant && text === "delayed assistant") await publication.promise;
+	const rendered = recordedOutput(async (text) => {
+		if (delayAssistant && text === "Assistant:\ndelayed assistant\n") await publication.promise;
 	});
-	const consoleSurface = new OwnerConsole({ rpc: gateway.client, ownerSurfaceId: "owner", output: rendered.output, readWaitMs: 0 });
+	const consoleSurface = new OwnerConsole({
+		rpc: gateway.client,
+		ownerSurfaceId: "owner",
+		output: rendered.output,
+		readWaitMs: 0,
+	});
 	try {
 		expect((await consoleSurface.start()).accepted).toBe(true);
-		const appended = gateway.core.journalAppend("assistant_message", JSON.stringify({ finalized: true, text: "delayed assistant" }));
+		const appended = gateway.core.journalAppend(
+			"assistant_message",
+			JSON.stringify({ finalized: true, text: "delayed assistant" }),
+		);
 		delayAssistant = true;
 		const consume = consoleSurface.consumeOnce();
 		await Bun.sleep(25);
@@ -383,17 +584,28 @@ test("console commits only after an asynchronous terminal publication resolves",
 test("console leaves its checkpoint unadvanced and blocks input when terminal publication fails", async () => {
 	const gateway = await hostedConsoleGateway();
 	let failAssistant = false;
-	const rendered = recordedOutput(text => {
-		if (failAssistant && text === "terminal write rejected") throw new Error("simulated terminal writer failure");
+	const rendered = recordedOutput((text) => {
+		if (failAssistant && text === "Assistant:\nterminal write rejected\n")
+			throw new Error("simulated terminal writer failure");
 	});
-	const consoleSurface = new OwnerConsole({ rpc: gateway.client, ownerSurfaceId: "owner", output: rendered.output, readWaitMs: 0 });
+	const consoleSurface = new OwnerConsole({
+		rpc: gateway.client,
+		ownerSurfaceId: "owner",
+		output: rendered.output,
+		readWaitMs: 0,
+	});
 	try {
 		expect((await consoleSurface.start()).accepted).toBe(true);
-		gateway.core.journalAppend("assistant_message", JSON.stringify({ finalized: true, text: "terminal write rejected" }));
+		gateway.core.journalAppend(
+			"assistant_message",
+			JSON.stringify({ finalized: true, text: "terminal write rejected" }),
+		);
 		failAssistant = true;
 		await expect(consoleSurface.consumeOnce()).rejects.toBeInstanceOf(ConsoleDeliveryUnavailableError);
 		expect(gateway.core.consumerCursor("way-console")).toBe("1:0");
-		await expect(consoleSurface.submit("must not submit after a publication failure")).rejects.toBeInstanceOf(ConsoleDeliveryUnavailableError);
+		await expect(consoleSurface.submit("must not submit after a publication failure")).rejects.toBeInstanceOf(
+			ConsoleDeliveryUnavailableError,
+		);
 	} finally {
 		await gateway.stop();
 	}
@@ -410,18 +622,23 @@ test("actual way console CLI exits non-zero after a failed-closed startup refusa
 	fs.writeFileSync(profilePath, ownerProfile(corpus, workspace));
 	const core = loadWayCore().WayCore.open(stateDirectory);
 	const socketPath = path.join(stateDirectory, "rpc.sock");
-	core.startRpcServer(socketPath, createRpcBridge(core, () => {
-		throw new RpcBridgeException(-32601, "method not found");
-	}));
+	core.startRpcServer(
+		socketPath,
+		createRpcBridge(core, () => {
+			throw new RpcBridgeException(-32601, "method not found");
+		}),
+	);
 	core.setRpcHealth("failed_closed", "profile_drift");
 	try {
-		await connectEventually(socketPath).then(client => client.close());
-		const child = managedProcesses.trackBun(Bun.spawn({
-			cmd: ["bun", "src/main.ts", "console", "--state-dir", stateDirectory, "--profile", profilePath],
-			cwd: repositoryRoot,
-			stdout: "pipe",
-			stderr: "pipe",
-		}));
+		await connectEventually(socketPath).then((client) => client.close());
+		const child = managedProcesses.trackBun(
+			Bun.spawn({
+				cmd: ["bun", "src/main.ts", "console", "--state-dir", stateDirectory, "--profile", profilePath],
+				cwd: repositoryRoot,
+				stdout: "pipe",
+				stderr: "pipe",
+			}),
+		);
 		const [exitCode, childStdout, childStderr] = await Promise.all([
 			child.exited,
 			new Response(child.stdout).text(),
@@ -438,18 +655,22 @@ test("actual way console CLI exits non-zero after a failed-closed startup refusa
 	}
 });
 
-
 test("healthy non-TTY CLI preserves the console checkpoint until a valid terminal can render pending events", async () => {
 	const gateway = await hostedConsoleGateway();
 	const checkpointBefore = gateway.core.consumerCursor("way-console");
-	const pending = gateway.core.journalAppend("assistant_message", JSON.stringify({ finalized: true, text: "pending before terminal validation" }));
+	const pending = gateway.core.journalAppend(
+		"assistant_message",
+		JSON.stringify({ finalized: true, text: "pending before terminal validation" }),
+	);
 	try {
-		const child = managedProcesses.trackBun(Bun.spawn({
-			cmd: ["bun", "src/main.ts", "console", "--state-dir", gateway.stateDirectory, "--profile", gateway.profilePath],
-			cwd: repositoryRoot,
-			stdout: "pipe",
-			stderr: "pipe",
-		}));
+		const child = managedProcesses.trackBun(
+			Bun.spawn({
+				cmd: ["bun", "src/main.ts", "console", "--state-dir", gateway.stateDirectory, "--profile", gateway.profilePath],
+				cwd: repositoryRoot,
+				stdout: "pipe",
+				stderr: "pipe",
+			}),
+		);
 		const [exitCode, childStdout, childStderr] = await Promise.all([
 			child.exited,
 			new Response(child.stdout).text(),
@@ -462,28 +683,276 @@ test("healthy non-TTY CLI preserves the console checkpoint until a valid termina
 		expect(gateway.core.consumerOutbox("way-console")).toEqual([]);
 
 		const subsequent = scriptedTerminal(["/quit"]);
-		await runWayConsole(
-			{ stateDir: gateway.stateDirectory, profilePath: gateway.profilePath },
-			[],
-			{ terminal: subsequent.terminal },
-		);
+		await runWayConsole({ stateDir: gateway.stateDirectory, profilePath: gateway.profilePath }, [], {
+			terminal: subsequent.terminal,
+		});
 		expect(subsequent.writes.join("")).toContain("Assistant:\npending before terminal validation\n");
 		expect(gateway.core.consumerCursor("way-console")).toBe(pending.cursor);
 	} finally {
 		await gateway.stop();
 	}
 });
+test("console drains a submitted operation before closing after an immediate /quit", async () => {
+	const gateway = await hostedConsoleGateway();
+	const terminal = controlledTerminal();
+	const running = runWayConsole({ stateDir: gateway.stateDirectory, profilePath: gateway.profilePath }, [], {
+		terminal: terminal.terminal,
+	});
+	try {
+		await eventually(terminal.isReading, "console did not begin reading interactive input");
+		terminal.send("submit before immediate quit");
+		terminal.send("/quit");
+		await running;
+		const delivered = terminal.lifecycle.findIndex((entry) => entry === "write:Delivered as: prompt\n");
+		const closed = terminal.lifecycle.indexOf("close");
+		expect(delivered).toBeGreaterThanOrEqual(0);
+		expect(closed).toBeGreaterThan(delivered);
+	} finally {
+		terminal.terminal.close();
+		await gateway.stop();
+		await running.catch(() => undefined);
+	}
+}, 15_000);
+
+test("console reports outstanding operations when exit grace elapses", async () => {
+	const gateId = "gate-exit-grace";
+	const sdk = new FileSdkDouble({ gateOnPrompt: { text: "hold beyond exit grace", gateId } });
+	const gateway = await hostedConsoleGateway({ sdk });
+	const terminal = controlledTerminal();
+	const running = runWayConsole({ stateDir: gateway.stateDirectory, profilePath: gateway.profilePath }, [], {
+		terminal: terminal.terminal,
+		exitDrainMs: 25,
+	});
+	try {
+		await eventually(terminal.isReading, "console did not begin reading interactive input");
+		terminal.send("hold beyond exit grace");
+		await eventually(
+			() =>
+				terminal.writes
+					.join("")
+					.includes(`Gate opened: gate_id=${gateId} expected_session_id=${gateway.host.sessionId}`),
+			"prompt did not enter the pending workflow gate",
+		);
+		terminal.send("/quit");
+		await running;
+		expect(terminal.writes.join("")).toContain("Exit requested; 1 console operation is still outstanding.");
+		expect(terminal.writes.join("")).toContain(
+			"Results will remain available through the journal at the way-console consumer checkpoint.",
+		);
+		const release = await gateway.client.request("main.gate.answer", {
+			gate_id: gateId,
+			expected_session_id: gateway.host.sessionId,
+			answer: { selected: ["Yes"] },
+			idempotency_key: "release-exit-grace",
+		});
+		expect(rpcResult(release, "main.gate.answer")).toMatchObject({ accepted: true });
+		await eventually(
+			() => gateway.host.turnState === "idle",
+			"pending prompt did not settle after cleanup gate answer",
+		);
+	} finally {
+		await gateway.client
+			.request("main.gate.answer", {
+				gate_id: gateId,
+				expected_session_id: gateway.host.sessionId,
+				answer: { selected: ["Yes"] },
+				idempotency_key: "release-exit-grace-cleanup",
+			})
+			.catch(() => undefined);
+		terminal.terminal.close();
+		await gateway.stop();
+		await running.catch(() => undefined);
+	}
+}, 15_000);
+
+test("delivery loss closes immediately without waiting for outstanding owner operations", async () => {
+	const gateId = "gate-delivery-loss";
+	const sdk = new FileSdkDouble({ gateOnPrompt: { text: "hold through delivery loss", gateId } });
+	const gateway = await hostedConsoleGateway({ sdk });
+	let failPublication = false;
+	const terminal = controlledTerminal({
+		onWrite(text) {
+			if (failPublication && text === "Assistant:\nforce terminal delivery loss\n") {
+				throw new Error("simulated terminal delivery failure");
+			}
+		},
+	});
+	const running = runWayConsole({ stateDir: gateway.stateDirectory, profilePath: gateway.profilePath }, [], {
+		terminal: terminal.terminal,
+		exitDrainMs: 1_000,
+	});
+	try {
+		await eventually(terminal.isReading, "console did not begin reading interactive input");
+		terminal.send("hold through delivery loss");
+		await eventually(
+			() =>
+				terminal.writes
+					.join("")
+					.includes(`Gate opened: gate_id=${gateId} expected_session_id=${gateway.host.sessionId}`),
+			"prompt did not enter the pending workflow gate",
+		);
+		failPublication = true;
+		const startedAt = performance.now();
+		gateway.core.journalAppend(
+			"assistant_message",
+			JSON.stringify({ finalized: true, text: "force terminal delivery loss" }),
+		);
+		await expect(running).rejects.toBeInstanceOf(ConsoleDeliveryUnavailableError);
+		expect(performance.now() - startedAt).toBeLessThan(500);
+		expect(terminal.isClosed()).toBe(true);
+		const release = await gateway.client.request("main.gate.answer", {
+			gate_id: gateId,
+			expected_session_id: gateway.host.sessionId,
+			answer: { selected: ["Yes"] },
+			idempotency_key: "release-delivery-loss",
+		});
+		expect(rpcResult(release, "main.gate.answer")).toMatchObject({ accepted: true });
+		await eventually(
+			() => gateway.host.turnState === "idle",
+			"pending prompt did not settle after cleanup gate answer",
+		);
+	} finally {
+		await gateway.client
+			.request("main.gate.answer", {
+				gate_id: gateId,
+				expected_session_id: gateway.host.sessionId,
+				answer: { selected: ["Yes"] },
+				idempotency_key: "release-delivery-loss-cleanup",
+			})
+			.catch(() => undefined);
+		terminal.terminal.close();
+		await gateway.stop();
+		await running.catch(() => undefined);
+	}
+}, 15_000);
+
+test("real console command loop answers a gate opened by its pending prompt and lets that turn complete", async () => {
+	const gateId = "gate-command-loop";
+	const sdk = new FileSdkDouble({ gateOnPrompt: { text: "wait for the workflow gate", gateId } });
+	const gateway = await hostedConsoleGateway({ sdk });
+	const terminal = controlledTerminal();
+	const running = runWayConsole({ stateDir: gateway.stateDirectory, profilePath: gateway.profilePath }, [], {
+		terminal: terminal.terminal,
+	});
+	try {
+		await eventually(terminal.isReading, "console did not begin reading interactive input");
+		terminal.send("wait for the workflow gate");
+		await eventually(
+			() =>
+				terminal.writes
+					.join("")
+					.includes(`Gate opened: gate_id=${gateId} expected_session_id=${gateway.host.sessionId}`),
+			"pending prompt did not publish its workflow gate",
+		);
+		terminal.send(`/gate ${gateId} ${gateway.host.sessionId} {"selected":["Yes"]}`);
+		await eventually(
+			() => terminal.writes.join("").includes(`Gate ${gateId}: resolved`),
+			"command-loop gate answer did not complete",
+		);
+		await eventually(
+			() => terminal.writes.join("").includes("Main turn ended — idle."),
+			"original prompt did not complete after the command-loop gate answer",
+		);
+		expect(terminal.writes.join("")).toContain("Delivered as: prompt");
+		terminal.send("/quit");
+		await running;
+	} finally {
+		terminal.terminal.close();
+		await gateway.stop();
+		await running.catch(() => undefined);
+	}
+}, 15_000);
+
+test("real console command loop admits an owner message typed during a busy turn as a steer", async () => {
+	const gateId = "gate-steer";
+	const sdk = new FileSdkDouble({ gateOnPrompt: { text: "hold this turn open", gateId } });
+	const gateway = await hostedConsoleGateway({ sdk });
+	const terminal = controlledTerminal();
+	const running = runWayConsole({ stateDir: gateway.stateDirectory, profilePath: gateway.profilePath }, [], {
+		terminal: terminal.terminal,
+	});
+	try {
+		await eventually(terminal.isReading, "console did not begin reading interactive input");
+		terminal.send("hold this turn open");
+		await eventually(
+			() =>
+				terminal.writes
+					.join("")
+					.includes(`Gate opened: gate_id=${gateId} expected_session_id=${gateway.host.sessionId}`),
+			"pending prompt did not enter a busy gate state",
+		);
+		terminal.send("steer this busy turn");
+		await eventually(
+			() => terminal.writes.join("").includes("Delivered as: steer"),
+			"owner message typed during the busy turn was not admitted as a steer",
+		);
+		terminal.send(`/gate ${gateId} ${gateway.host.sessionId} {"selected":["Yes"]}`);
+		await eventually(
+			() => terminal.writes.join("").includes("Main turn ended — idle."),
+			"busy prompt did not finish after gate resolution",
+		);
+		terminal.send("/quit");
+		await running;
+	} finally {
+		terminal.terminal.close();
+		await gateway.stop();
+		await running.catch(() => undefined);
+	}
+}, 15_000);
+
+test("prompt repaint preserves complete assistant and gate frames while way> is active", async () => {
+	const gateway = await hostedConsoleGateway();
+	const terminal = promptFrameTerminal();
+	const running = runWayConsole({ stateDir: gateway.stateDirectory, profilePath: gateway.profilePath }, [], {
+		terminal: terminal.terminal,
+	});
+	try {
+		await eventually(terminal.isReading, "console did not leave an active prompt for frame rendering");
+		const assistant = gateway.core.journalAppend(
+			"assistant_message",
+			JSON.stringify({ finalized: true, text: "assistant frame remains visible" }),
+		);
+		const gate = gateway.core.journalAppend(
+			"gate_open",
+			JSON.stringify({ gate_id: "gate-frame-visible", session_id: "session-frame-visible" }),
+		);
+		await eventually(
+			() => gateway.core.consumerCursor("way-console") === gate.cursor,
+			"console did not publish and commit the prompt-active frames",
+		);
+		const screen = terminal.snapshot();
+		expect(assistant.cursor).not.toBe(gate.cursor);
+		expect(screen).toContain("Assistant:\nassistant frame remains visible");
+		expect(screen).toContain("gate_id=gate-frame-visible");
+		expect(screen).toContain("expected_session_id=session-frame-visible");
+		expect(screen.endsWith("way> ")).toBe(true);
+		terminal.send("/quit");
+		await running;
+	} finally {
+		terminal.terminal.close();
+		await gateway.stop();
+		await running.catch(() => undefined);
+	}
+}, 15_000);
+
 test("console gate drill uses durable gate fencing, rejects a mismatched session, and renders resolution", async () => {
 	const gateway = await hostedConsoleGateway();
 	const rendered = recordedOutput();
-	const consoleSurface = new OwnerConsole({ rpc: gateway.client, ownerSurfaceId: "owner", output: rendered.output, readWaitMs: 0 });
+	const consoleSurface = new OwnerConsole({
+		rpc: gateway.client,
+		ownerSurfaceId: "owner",
+		output: rendered.output,
+		readWaitMs: 0,
+	});
 	try {
 		expect((await consoleSurface.start()).accepted).toBe(true);
 		gateway.sdk.openGate(gateway.sessionFile, "gate-live");
 		expect(await consoleSurface.consumeOnce()).toBe("rendered");
 		expect(rendered.writes.join("")).toContain("Gate opened: gate_id=gate-live expected_session_id=");
 
-		await expect(consoleSurface.answerGate("gate-live", "wrong-session", { selected: ["Yes"] })).rejects.toMatchObject({ code: 1102 });
+		await expect(consoleSurface.answerGate("gate-live", "wrong-session", { selected: ["Yes"] })).rejects.toMatchObject({
+			code: 1102,
+		});
 		expect(await consoleSurface.answerGate("gate-live", gateway.host.sessionId, { selected: ["Yes"] })).toEqual({
 			accepted: true,
 			gateState: "resolved",

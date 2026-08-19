@@ -52,6 +52,15 @@ async function connectEventually(socketPath: string): Promise<RpcClient> {
 	throw new Error(`gateway socket never accepted: ${String(lastError)}`);
 }
 
+async function waitForRendered(read: () => boolean, description: string, timeoutMs = 5_000): Promise<void> {
+	const deadline = Date.now() + timeoutMs;
+	while (Date.now() < deadline) {
+		if (read()) return;
+		await Bun.sleep(10);
+	}
+	throw new Error(description);
+}
+
 interface RecordedWrite {
 	readonly sequence: number;
 	readonly atMs: number;
@@ -110,6 +119,12 @@ async function main(): Promise<void> {
 		},
 		async readLine(_prompt: string): Promise<string | undefined> {
 			if (cursor >= scripted.length) return undefined;
+			if (cursor === 1) {
+				await waitForRendered(
+					() => writes.some((write) => /^Delivered as: (prompt|steer|follow_up)\n$/.test(write.raw)),
+					"console did not render the gateway-derived delivered_as frame before /quit",
+				);
+			}
 			const line = scripted[cursor];
 			cursor += 1;
 			return line;
@@ -119,18 +134,68 @@ async function main(): Promise<void> {
 
 	await runWayConsole({ stateDir: stateDirectory, profilePath }, [], { terminal });
 
-	const rendered = writes.map(w => w.raw).join("");
+	const rendered = writes.map((w) => w.raw).join("");
+	const deliveredAsRendered = /Delivered as: (prompt|steer|follow_up)/.test(rendered);
+	if (!deliveredAsRendered) throw new Error("console transcript is missing the gateway-derived delivered_as frame.");
 	const cursorAfter = core.consumerCursor("way-console");
-
 	const stamp = (): string => new Date().toISOString();
 	const actions = [
-		{ ordinal: 1, timestamp: stamp(), selector: "process:way console", type: "launch", detail: "runWayConsole with a scripted ConsoleTerminal against the live gateway Unix socket", result: "console started" },
-		{ ordinal: 2, timestamp: stamp(), selector: "stdout:\"Gateway status\"", type: "observe", detail: "gateway status block (daemon/main/journal/lock/reconcile)", result: rendered.includes("Gateway status") ? "rendered" : "absent" },
-		{ ordinal: 3, timestamp: stamp(), selector: "stdout:\"Owner console ready\"", type: "observe", detail: "readiness announcement after delivery readiness established", result: rendered.includes("Owner console ready") ? "rendered" : "absent" },
-		{ ordinal: 4, timestamp: stamp(), selector: "stdin:way> prompt", type: "input", detail: scripted[0], result: "submitted through main.submit with a fresh idempotency key" },
-		{ ordinal: 5, timestamp: stamp(), selector: "stdout:\"Delivered as:\"", type: "observe", detail: "server-derived delivered_as rendered verbatim", result: /Delivered as: (prompt|steer|follow_up)/.exec(rendered)?.[0] ?? "absent" },
-		{ ordinal: 6, timestamp: stamp(), selector: "stdin:way> prompt", type: "input", detail: scripted[1], result: "console exited cleanly" },
-		{ ordinal: 7, timestamp: stamp(), selector: "rpc:consumerCursor(\"way-console\")", type: "observe", detail: "way-console consumer checkpoint after the session", result: cursorAfter },
+		{
+			ordinal: 1,
+			timestamp: stamp(),
+			selector: "process:way console",
+			type: "launch",
+			detail: "runWayConsole with a scripted ConsoleTerminal against the live gateway Unix socket",
+			result: "console started",
+		},
+		{
+			ordinal: 2,
+			timestamp: stamp(),
+			selector: 'stdout:"Gateway status"',
+			type: "observe",
+			detail: "gateway status block (daemon/main/journal/lock/reconcile)",
+			result: rendered.includes("Gateway status") ? "rendered" : "absent",
+		},
+		{
+			ordinal: 3,
+			timestamp: stamp(),
+			selector: 'stdout:"Owner console ready"',
+			type: "observe",
+			detail: "readiness announcement after delivery readiness established",
+			result: rendered.includes("Owner console ready") ? "rendered" : "absent",
+		},
+		{
+			ordinal: 4,
+			timestamp: stamp(),
+			selector: "stdin:way> prompt",
+			type: "input",
+			detail: scripted[0],
+			result: "submitted through main.submit with a fresh idempotency key",
+		},
+		{
+			ordinal: 5,
+			timestamp: stamp(),
+			selector: 'stdout:"Delivered as:"',
+			type: "observe",
+			detail: "server-derived delivered_as rendered verbatim",
+			result: /Delivered as: (prompt|steer|follow_up)/.exec(rendered)?.[0] ?? "absent",
+		},
+		{
+			ordinal: 6,
+			timestamp: stamp(),
+			selector: "stdin:way> prompt",
+			type: "input",
+			detail: scripted[1],
+			result: "console exited cleanly",
+		},
+		{
+			ordinal: 7,
+			timestamp: stamp(),
+			selector: 'rpc:consumerCursor("way-console")',
+			type: "observe",
+			detail: "way-console consumer checkpoint after the session",
+			result: cursorAfter,
+		},
 	] as const;
 
 	const transcript = {
@@ -138,11 +203,13 @@ async function main(): Promise<void> {
 		kind: "app-automation-transcript",
 		tool: "bun (scripted ConsoleTerminal harness: test/qa/console-transcript.ts)",
 		surface: "cli",
-		surfaceNote: "way console is a subcommand of the way CLI that renders to a terminal; the transcript records its terminal write-stream.",
+		surfaceNote:
+			"way console is a subcommand of the way CLI that renders to a terminal; the transcript records its terminal write-stream.",
 		subject: "way console (gajae-way local owner surface)",
 		producedBy: "test/qa/console-transcript.ts",
 		generatedAt: new Date().toISOString(),
-		harness: "scripted ConsoleTerminal driving runWayConsole against a real in-process gateway over a real Unix-domain socket",
+		harness:
+			"scripted ConsoleTerminal driving runWayConsole against a real in-process gateway over a real Unix-domain socket",
 		scriptedInput: scripted,
 		actions,
 		steps: writes,
@@ -153,7 +220,7 @@ async function main(): Promise<void> {
 			statusRendered: rendered.includes("Gateway status"),
 			readyLineRendered: rendered.includes("Owner console ready"),
 			promptRendered: rendered.includes("way>"),
-			deliveredAsRendered: /Delivered as: (prompt|steer|follow_up)/.test(rendered),
+			deliveredAsRendered,
 			assistantReplyRendered: rendered.includes("Assistant:"),
 			consumerCursorAfter: cursorAfter,
 		},

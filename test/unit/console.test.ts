@@ -1,5 +1,10 @@
 import { expect, test } from "bun:test";
-import { ConsoleOutput, consoleStartupDecision, renderConsoleStatusSummary, sanitizeConsoleText } from "../../src/console/console";
+import {
+	ConsoleOutput,
+	consoleStartupDecision,
+	renderConsoleStatusSummary,
+	sanitizeConsoleText,
+} from "../../src/console/console";
 
 const healthyHealth = {
 	status: "healthy",
@@ -29,7 +34,9 @@ test("console maps health and status into the owner-visible summary", () => {
 	expect(summary).toContain("daemon: status=healthy state=running");
 	expect(summary).toContain("main: resumed=true session_id=main-session turn_state=busy follow_up_queue_depth=2");
 	expect(summary).toContain("journal: head_cursor=7:42 degraded=false");
-	expect(summary).toContain("lock: held=true holder=session=main-session queue_len=1 stuck=false quarantined=true write_mode=false");
+	expect(summary).toContain(
+		"lock: held=true holder=session=main-session queue_len=1 stuck=false quarantined=true write_mode=false",
+	);
 	expect(summary).toContain("reconcile: freshness=fresh last_ok_at=10000 age_ms=5000 cycle_ms=5000 drift_count=3");
 });
 
@@ -63,7 +70,7 @@ test("untrusted gateway text escapes CSI, OSC 52, C0, and C1 controls before ter
 	expect(sanitized).not.toMatch(/[\u0000-\u001f\u007f-\u009f]/);
 
 	const writes: string[] = [];
-	const output = new ConsoleOutput(text => {
+	const output = new ConsoleOutput((text) => {
 		writes.push(text);
 	});
 	await output.writeTrusted("\x1b[2K");
@@ -77,4 +84,31 @@ test("untrusted gateway text escapes CSI, OSC 52, C0, and C1 controls before ter
 	).refusal;
 	expect(hostileRefusal).toContain("\\x1B]52;c;SGVsbG8=\\u0007");
 	expect(hostileRefusal).not.toMatch(/[\u0000-\u001f\u007f-\u009f]/);
+});
+
+test("console output serializes complete frames from concurrent publishers", async () => {
+	const writes: string[] = [];
+	let releaseFirst: (() => void) | undefined;
+	let signalFirst: (() => void) | undefined;
+	const firstBlocked = new Promise<void>((resolve) => {
+		releaseFirst = resolve;
+	});
+	const firstStarted = new Promise<void>((resolve) => {
+		signalFirst = resolve;
+	});
+	const output = new ConsoleOutput(async (text) => {
+		writes.push(text);
+		if (text === "first frame\n") {
+			signalFirst?.();
+			await firstBlocked;
+		}
+	});
+	const first = output.writeFrame("first frame\n");
+	await firstStarted;
+	const second = output.writeFrame("second frame\n");
+	await Bun.sleep(10);
+	expect(writes).toEqual(["first frame\n"]);
+	releaseFirst?.();
+	await Promise.all([first, second]);
+	expect(writes).toEqual(["first frame\n", "second frame\n"]);
 });

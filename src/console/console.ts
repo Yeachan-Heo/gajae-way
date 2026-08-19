@@ -1,10 +1,7 @@
 import { randomUUID } from "node:crypto";
 import * as path from "node:path";
 import { stdin, stdout } from "node:process";
-import {
-	RpcJournalConsumer,
-	type RpcJournalEvent,
-} from "../journal-consumer";
+import { RpcJournalConsumer, type RpcJournalEvent } from "../journal-consumer";
 import type { WayConfig } from "../config";
 import { loadWayProfile, type WayProfile } from "../profile";
 import { RpcClient, rpcResult, type JsonRpcClient } from "../rpc-client";
@@ -21,6 +18,8 @@ export const WAY_CONSOLE_EVENT_KINDS = [
 ] as const;
 export const DEFAULT_CONSOLE_CLAIM_TTL_MS = 5_000;
 export const DEFAULT_CONSOLE_READ_WAIT_MS = 1_000;
+export const DEFAULT_CONSOLE_EXIT_DRAIN_MS = 2_000;
+const MAX_CONSOLE_INPUT_OPERATIONS = 16;
 
 export type WayConsoleEventKind = (typeof WAY_CONSOLE_EVENT_KINDS)[number];
 export type ConsoleConsumerRunResult = "rendered" | "idle";
@@ -46,7 +45,7 @@ export interface ConsoleEventFrame {
 	readonly payload: unknown;
 }
 
-/** Raw-terminal operations reserved for console-controlled text and ANSI. */
+/** Raw-terminal operations reserved for complete console-controlled frames and ANSI. */
 export interface ConsoleTerminal {
 	writeTrusted(text: string): Promise<void>;
 	readLine(prompt: string): Promise<string | undefined>;
@@ -59,6 +58,7 @@ export interface ConsoleTerminal {
  */
 export class ConsoleOutput {
 	#write: ConsoleWrite;
+	#frameTail: Promise<void> = Promise.resolve();
 
 	constructor(write: ConsoleWrite) {
 		this.#write = write;
@@ -68,12 +68,20 @@ export class ConsoleOutput {
 		this.#write = write;
 	}
 
+	/** Publishes one complete terminal frame without interleaving another frame. */
+	async writeFrame(text: string): Promise<void> {
+		const writer = this.#write;
+		const frame = this.#frameTail.then(async () => await writer(text));
+		this.#frameTail = frame.catch(() => undefined);
+		await frame;
+	}
+
 	async writeTrusted(text: string): Promise<void> {
-		await this.#write(text);
+		await this.writeFrame(text);
 	}
 
 	async writeUntrusted(text: string): Promise<void> {
-		await this.writeTrusted(sanitizeConsoleText(text));
+		await this.writeFrame(sanitizeConsoleText(text));
 	}
 }
 
@@ -102,6 +110,8 @@ export interface RunWayConsoleDependencies {
 	readonly profile?: WayProfile;
 	readonly terminal?: ConsoleTerminal;
 	readonly idempotencyKey?: () => string;
+	/** Test seam for bounded graceful exit behavior. */
+	readonly exitDrainMs?: number;
 }
 
 interface MainSubmitResult {
@@ -219,8 +229,8 @@ export function consoleStartupDecision(healthPayload: unknown, statusPayload: un
 		};
 	}
 	const records = [healthPayload, statusPayload] as const;
-	const states = records.map(record => rawStringValue(record.state));
-	const statuses = records.map(record => rawStringValue(record.status));
+	const states = records.map((record) => rawStringValue(record.state));
+	const statuses = records.map((record) => rawStringValue(record.status));
 	const renderedStates = states.map(sanitizeConsoleText);
 	const renderedStatuses = statuses.map(sanitizeConsoleText);
 	const reason = firstString(records, "reason");
@@ -231,7 +241,7 @@ export function consoleStartupDecision(healthPayload: unknown, statusPayload: un
 			refusal: `Refusing interactive console: the gateway is failed closed${renderedReason ? ` (${renderedReason})` : ""}. The main persona is fenced; repair or explicitly approve it before sending owner input.`,
 		};
 	}
-	if (statuses.some(status => status !== "healthy")) {
+	if (statuses.some((status) => status !== "healthy")) {
 		return {
 			interactive: false,
 			refusal: `Refusing interactive console: the gateway is not healthy (health=${renderedStatuses.join(", ")}, state=${renderedStates.join(", ")})${renderedReason ? `: ${renderedReason}` : ""}. No owner input was sent.`,
@@ -249,8 +259,12 @@ export function renderConsoleStatusSummary(healthPayload: unknown, statusPayload
 	const holder = recordValue(lock.holder);
 	const journal = recordValue(status.journal);
 	const reconcile = recordValue(status.reconcile);
-	const lastOkAt = typeof reconcile.last_ok_at === "number" && Number.isFinite(reconcile.last_ok_at) ? reconcile.last_ok_at : undefined;
-	const cycleMs = typeof reconcile.cycle_ms === "number" && Number.isFinite(reconcile.cycle_ms) ? reconcile.cycle_ms : undefined;
+	const lastOkAt =
+		typeof reconcile.last_ok_at === "number" && Number.isFinite(reconcile.last_ok_at)
+			? reconcile.last_ok_at
+			: undefined;
+	const cycleMs =
+		typeof reconcile.cycle_ms === "number" && Number.isFinite(reconcile.cycle_ms) ? reconcile.cycle_ms : undefined;
 	const reconcileFreshness = renderReconcileFreshness(lastOkAt, cycleMs, now);
 	const reason = firstString([health, status], "reason");
 	const holderDescription = holder.session_id
@@ -278,12 +292,14 @@ function renderReconcileFreshness(lastOkAt: number | undefined, cycleMs: number 
 /** Resolves only a configured owner surface; an ambiguous profile needs an explicit selection. */
 export function resolveConsoleOwnerSurface(profile: WayProfile, requestedSurfaceId?: string): string {
 	if (requestedSurfaceId) {
-		const owner = profile.ownerSurfaces.find(surface => surface.id === requestedSurfaceId);
+		const owner = profile.ownerSurfaces.find((surface) => surface.id === requestedSurfaceId);
 		if (!owner) throw new WayConsoleError(`Console surface ${requestedSurfaceId} is not a configured owner surface.`);
 		return owner.id;
 	}
 	if (profile.ownerSurfaces.length === 1) return profile.ownerSurfaces[0]?.id as string;
-	throw new WayConsoleError("The profile defines multiple owner surfaces; pass way console --surface-id <configured-owner-surface-id>.");
+	throw new WayConsoleError(
+		"The profile defines multiple owner surfaces; pass way console --surface-id <configured-owner-surface-id>.",
+	);
 }
 
 /** Thin console-specific wrapper around the shared durable journal consumer. */
@@ -305,12 +321,12 @@ export class ConsoleEventConsumer {
 			kinds: WAY_CONSOLE_EVENT_KINDS,
 			now: options.now,
 			releaseOnAbort: true,
-			errorFactory: message => new ConsoleDeliveryUnavailableError(message),
-			gapError: gap =>
+			errorFactory: (message) => new ConsoleDeliveryUnavailableError(message),
+			gapError: (gap) =>
 				new ConsoleDeliveryUnavailableError(
 					`Console checkpoint ${gap.checkpoint} is behind journal retention. Interactive delivery is disabled; use the supported gateway journal-repair procedure to resync at ${gap.resyncCursor}, then restart way console.`,
 				),
-			publish: async event => {
+			publish: async (event) => {
 				const consoleEvent = toConsoleEvent(event);
 				await options.render(consoleEvent);
 				const sequence = sequenceString(consoleEvent.seq);
@@ -369,7 +385,7 @@ export class OwnerConsole {
 			consumerId: options.consumerId,
 			claimTtlMs: options.claimTtlMs,
 			readWaitMs: options.readWaitMs,
-			render: async event => await this.renderEvent(event),
+			render: async (event) => await this.renderEvent(event),
 		});
 	}
 
@@ -401,7 +417,9 @@ export class OwnerConsole {
 	/** Claims and validates delivery only after the caller has installed a terminal. */
 	async establishDeliveryReadiness(startup: ConsoleStartup): Promise<ConsoleStartup> {
 		if (!startup.accepted || !startup.health || !startup.status) {
-			throw new ConsoleDeliveryUnavailableError("Console health/status inspection did not produce an interactive startup state.");
+			throw new ConsoleDeliveryUnavailableError(
+				"Console health/status inspection did not produce an interactive startup state.",
+			);
 		}
 		try {
 			await this.#consumer.ensureReady();
@@ -435,9 +453,7 @@ export class OwnerConsole {
 				"main.submit",
 			),
 		);
-		await this.#output.writeTrusted("Delivered as: ");
-		await this.#output.writeUntrusted(result.deliveredAs);
-		await this.#output.writeTrusted("\n");
+		await this.#output.writeFrame(`Delivered as: ${sanitizeConsoleText(result.deliveredAs)}\n`);
 		return result;
 	}
 
@@ -454,11 +470,7 @@ export class OwnerConsole {
 				"main.gate.answer",
 			),
 		);
-		await this.#output.writeTrusted("Gate ");
-		await this.#output.writeUntrusted(gateId);
-		await this.#output.writeTrusted(": ");
-		await this.#output.writeUntrusted(result.gateState);
-		await this.#output.writeTrusted("\n");
+		await this.#output.writeFrame(`Gate ${sanitizeConsoleText(gateId)}: ${sanitizeConsoleText(result.gateState)}\n`);
 		return result;
 	}
 
@@ -467,7 +479,7 @@ export class OwnerConsole {
 			rpcResult<unknown>(await this.#rpc.request("way.health", {}, { timeoutMs: 5_000 }), "way.health"),
 			rpcResult<unknown>(await this.#rpc.request("way.status", {}, { timeoutMs: 5_000 }), "way.status"),
 		]);
-		await this.#output.writeTrusted(`${renderConsoleStatusSummary(health, status)}\n`);
+		await this.#output.writeFrame(`${renderConsoleStatusSummary(health, status)}\n`);
 	}
 
 	async consumeOnce(signal?: AbortSignal): Promise<ConsoleConsumerRunResult> {
@@ -499,7 +511,9 @@ export class OwnerConsole {
 		if (!command) return true;
 		if (command === "/quit" || command === "/exit") return false;
 		if (command === "/help") {
-			await this.#output.writeTrusted("Commands: /status, /gate <gate_id> <expected_session_id> <JSON answer>, /quit. Any other line is submitted to the main session.\n");
+			await this.#output.writeFrame(
+				"Commands: /status, /gate <gate_id> <expected_session_id> <JSON answer>, /quit. Any other line is submitted to the main session.\n",
+			);
 			return true;
 		}
 		try {
@@ -516,9 +530,7 @@ export class OwnerConsole {
 			return true;
 		} catch (error) {
 			if (error instanceof ConsoleDeliveryUnavailableError) return false;
-			await this.#output.writeTrusted("Request failed: ");
-			await this.#output.writeUntrusted(asError(error).message);
-			await this.#output.writeTrusted("\n");
+			await this.#output.writeFrame(`Request failed: ${sanitizeConsoleText(asError(error).message)}\n`);
 			return true;
 		}
 	}
@@ -526,7 +538,9 @@ export class OwnerConsole {
 	private assertDeliveryReady(): void {
 		if (this.#deliveryFailure) throw this.#deliveryFailure;
 		if (!this.#deliveryReady) {
-			throw new ConsoleDeliveryUnavailableError("Console delivery readiness has not been established; no owner input was accepted.");
+			throw new ConsoleDeliveryUnavailableError(
+				"Console delivery readiness has not been established; no owner input was accepted.",
+			);
 		}
 	}
 
@@ -542,82 +556,60 @@ export class OwnerConsole {
 	}
 
 	private async writeStatusSummary(health: RecordValue, status: RecordValue): Promise<void> {
-		await this.#output.writeTrusted(`${renderConsoleStatusSummary(health, status)}\n`);
+		await this.#output.writeFrame(`${renderConsoleStatusSummary(health, status)}\n`);
 	}
 
 	private async writeRefusal(message: string): Promise<void> {
-		await this.#output.writeUntrusted(message);
-		await this.#output.writeTrusted("\n");
+		await this.#output.writeFrame(`${sanitizeConsoleText(message)}\n`);
 	}
 
 	private async reportDeliveryFailure(failure: ConsoleDeliveryUnavailableError): Promise<void> {
 		try {
-			await this.#output.writeTrusted("Delivery unavailable; ending console: ");
-			await this.#output.writeUntrusted(failure.message);
-			await this.#output.writeTrusted("\n");
+			await this.#output.writeFrame(`Delivery unavailable; ending console: ${sanitizeConsoleText(failure.message)}\n`);
 		} catch {
 			// The original publication failure remains authoritative.
 		}
 	}
 
 	private async renderEvent(event: ConsoleEventFrame): Promise<void> {
-		switch (event.kind) {
-			case "assistant_message": {
-				const payload = recordValue(event.payload);
-				await this.#output.writeTrusted("Assistant:\n");
-				if (payload.finalized === true && typeof payload.text === "string") {
-					await this.#output.writeUntrusted(payload.text);
-				} else {
-					await this.#output.writeUntrusted(`Assistant message ${sequenceString(event.seq)} had an invalid finalized payload.`);
-				}
-				await this.#output.writeTrusted("\n");
-				return;
-			}
-			case "turn_start":
-				await this.#output.writeTrusted("Main turn started — busy.\n");
-				return;
-			case "turn_end":
-				await this.#output.writeTrusted("Main turn ended — idle.\n");
-				return;
-			case "gate_open": {
-				const payload = recordValue(event.payload);
-				const gateId = rawStringValue(firstValue(payload, ["gate_id", "gateId"]));
-				const sessionId = rawStringValue(firstValue(payload, ["session_id", "sessionId"]));
-				await this.#output.writeTrusted("Gate opened: gate_id=");
-				await this.#output.writeUntrusted(gateId);
-				await this.#output.writeTrusted(" expected_session_id=");
-				await this.#output.writeUntrusted(sessionId);
-				await this.#output.writeTrusted(". Answer with /gate ");
-				await this.#output.writeUntrusted(gateId);
-				await this.#output.writeTrusted(" ");
-				await this.#output.writeUntrusted(sessionId);
-				await this.#output.writeTrusted(" <JSON answer>.\n");
-				return;
-			}
-			case "gate_resolved": {
-				const payload = recordValue(event.payload);
-				await this.#output.writeTrusted("Gate resolved: gate_id=");
-				await this.#output.writeUntrusted(rawStringValue(firstValue(payload, ["gate_id", "gateId"])));
-				await this.#output.writeTrusted(".\n");
-				return;
-			}
-			case "health_change": {
-				const payload = recordValue(event.payload);
-				await this.#output.writeTrusted("Gateway health changed: ");
-				await this.#output.writeUntrusted(rawStringValue(payload.state, rawStringValue(payload.status)));
-				if (typeof payload.reason === "string") {
-					await this.#output.writeTrusted(" reason=");
-					await this.#output.writeUntrusted(payload.reason);
-				}
-				await this.#output.writeTrusted(".\n");
-				return;
-			}
-			case "lock_event":
-				await this.#output.writeTrusted("Lock state changed: ");
-				await this.#output.writeUntrusted(describeGatewayValue(event.payload));
-				await this.#output.writeTrusted("\n");
-				return;
+		await this.#output.writeFrame(renderConsoleEventFrame(event));
+	}
+}
+
+/** Composes each journal delivery into one fully sanitized terminal frame. */
+function renderConsoleEventFrame(event: ConsoleEventFrame): string {
+	switch (event.kind) {
+		case "assistant_message": {
+			const payload = recordValue(event.payload);
+			const text =
+				payload.finalized === true && typeof payload.text === "string"
+					? sanitizeConsoleText(payload.text)
+					: `Assistant message ${sequenceString(event.seq)} had an invalid finalized payload.`;
+			return `Assistant:\n${text}\n`;
 		}
+		case "turn_start":
+			return "Main turn started — busy.\n";
+		case "turn_end":
+			return "Main turn ended — idle.\n";
+		case "gate_open": {
+			const payload = recordValue(event.payload);
+			const gateId = sanitizeConsoleText(rawStringValue(firstValue(payload, ["gate_id", "gateId"])));
+			const sessionId = sanitizeConsoleText(rawStringValue(firstValue(payload, ["session_id", "sessionId"])));
+			return `Gate opened: gate_id=${gateId} expected_session_id=${sessionId}. Answer with /gate ${gateId} ${sessionId} <JSON answer>.\n`;
+		}
+		case "gate_resolved": {
+			const payload = recordValue(event.payload);
+			const gateId = sanitizeConsoleText(rawStringValue(firstValue(payload, ["gate_id", "gateId"])));
+			return `Gate resolved: gate_id=${gateId}.\n`;
+		}
+		case "health_change": {
+			const payload = recordValue(event.payload);
+			const state = sanitizeConsoleText(rawStringValue(payload.state, rawStringValue(payload.status)));
+			const reason = typeof payload.reason === "string" ? ` reason=${sanitizeConsoleText(payload.reason)}` : "";
+			return `Gateway health changed: ${state}${reason}.\n`;
+		}
+		case "lock_event":
+			return `Lock state changed: ${sanitizeConsoleText(describeGatewayValue(event.payload))}\n`;
 	}
 }
 
@@ -630,7 +622,13 @@ export async function runWayConsole(
 	const requestedSurfaceId = parseConsoleArguments(arguments_);
 	const profile = dependencies.profile ?? loadWayProfile(config.profilePath);
 	const ownerSurfaceId = resolveConsoleOwnerSurface(profile, requestedSurfaceId);
-	const output = new ConsoleOutput(async text => await writeToStream(stdout, text));
+	const exitDrainMs = boundedInteger(
+		dependencies.exitDrainMs ?? DEFAULT_CONSOLE_EXIT_DRAIN_MS,
+		"exitDrainMs",
+		1,
+		60_000,
+	);
+	const output = new ConsoleOutput(async (text) => await writeToStream(stdout, text));
 	let rpc: JsonRpcClient | undefined;
 	let terminal: ConsoleTerminal | undefined;
 	try {
@@ -650,36 +648,152 @@ export async function runWayConsole(
 		// through redirected stdout because they never enter delivery readiness.
 		terminal = dependencies.terminal ?? new RawConsoleTerminal();
 		const activeTerminal = terminal;
-		output.setWriter(async text => await activeTerminal.writeTrusted(text));
-		await output.writeTrusted(`${renderConsoleStatusSummary(inspected.health, inspected.status)}\n`);
+		output.setWriter(async (text) => await activeTerminal.writeTrusted(text));
+		await output.writeFrame(`${renderConsoleStatusSummary(inspected.health, inspected.status)}\n`);
 		const startup = await consoleSurface.establishDeliveryReadiness(inspected);
 		if (!startup.accepted) {
 			throw new ConsoleStartupRefusalError(startup.refusal ?? "Interactive console delivery readiness was refused.");
 		}
-		await output.writeTrusted("Owner console ready. Type /help for commands.\n");
+		await output.writeFrame("Owner console ready. Type /help for commands.\n");
 		const events = new AbortController();
+		const input = new AbortController();
 		let deliveryFailure: Error | undefined;
-		const eventLoop = consoleSurface.consume(events.signal).catch(error => {
+		const eventLoop = consoleSurface.consume(events.signal).catch((error) => {
 			if (!events.signal.aborted) {
 				deliveryFailure = asError(error);
+				input.abort();
 				activeTerminal.close();
 			}
 		});
+		let inputFailure: Error | undefined;
 		try {
-			for (;;) {
-				const line = await activeTerminal.readLine("way> ");
-				if (line === undefined) break;
-				if (!(await consoleSurface.handleInput(line))) break;
-			}
+			await readConsoleInput(activeTerminal, consoleSurface, {
+				exitDrainMs,
+				signal: input.signal,
+				reportOutstanding: async (count) =>
+					await output.writeFrame(
+						`Exit requested; ${count} console operation${count === 1 ? " is" : "s are"} still outstanding. Results will remain available through the journal at the way-console consumer checkpoint.\n`,
+					),
+			});
+		} catch (error) {
+			inputFailure = asError(error);
 		} finally {
+			input.abort();
 			events.abort();
 			await eventLoop;
 		}
 		if (deliveryFailure) throw deliveryFailure;
+		if (inputFailure) throw inputFailure;
 	} finally {
 		rpc?.close();
 		terminal?.close();
 	}
+}
+
+interface ConsoleInputLoopOptions {
+	readonly exitDrainMs: number;
+	readonly signal?: AbortSignal;
+	reportOutstanding(count: number): Promise<void>;
+}
+
+/**
+ * Starts each owner operation as soon as its line arrives so a busy prompt does
+ * not prevent a later /gate or steer from reaching the gateway. Calls are
+ * initiated in terminal-line order on the single RPC client; only completion
+ * frames may arrive later. The bound prevents untrusted input from building an
+ * unbounded local operation backlog.
+ */
+async function readConsoleInput(
+	terminal: ConsoleTerminal,
+	consoleSurface: OwnerConsole,
+	options: ConsoleInputLoopOptions,
+): Promise<void> {
+	const inFlight = new Set<Promise<void>>();
+	let stopped = false;
+	let teardownImmediately = false;
+	let failure: Error | undefined;
+	const dispatch = (line: string): void => {
+		const operation = consoleSurface
+			.handleInput(line)
+			.then((keepReading) => {
+				if (keepReading) return;
+				teardownImmediately = true;
+				stopped = true;
+				terminal.close();
+			})
+			.catch((error) => {
+				failure = asError(error);
+				teardownImmediately = true;
+				stopped = true;
+				terminal.close();
+			});
+		inFlight.add(operation);
+		void operation.finally(() => inFlight.delete(operation));
+	};
+
+	while (!stopped && !options.signal?.aborted) {
+		while (!stopped && !options.signal?.aborted && inFlight.size >= MAX_CONSOLE_INPUT_OPERATIONS) {
+			await waitForInputSlot(inFlight, options.signal);
+		}
+		if (stopped || options.signal?.aborted) break;
+		const line = await terminal.readLine("way> ");
+		if (line === undefined) break;
+		const command = line.trim();
+		if (command === "/quit" || command === "/exit") break;
+		dispatch(line);
+	}
+
+	if (!teardownImmediately && !options.signal?.aborted && inFlight.size > 0) {
+		const drainResult = await drainInputOperations(inFlight, options.exitDrainMs, options.signal);
+		if (drainResult === "expired" && !options.signal?.aborted) {
+			await Promise.resolve();
+			if (inFlight.size > 0) await options.reportOutstanding(inFlight.size);
+		}
+	}
+	if (failure) throw failure;
+}
+
+async function drainInputOperations(
+	inFlight: ReadonlySet<Promise<void>>,
+	graceMs: number,
+	signal?: AbortSignal,
+): Promise<"settled" | "expired" | "aborted"> {
+	if (inFlight.size === 0) return "settled";
+	if (signal?.aborted) return "aborted";
+	return await new Promise((resolve) => {
+		let finished = false;
+		let timeout: ReturnType<typeof setTimeout> | undefined;
+		const finish = (result: "settled" | "expired" | "aborted"): void => {
+			if (finished) return;
+			finished = true;
+			if (timeout) clearTimeout(timeout);
+			signal?.removeEventListener("abort", onAbort);
+			resolve(result);
+		};
+		const onAbort = () => finish("aborted");
+		timeout = setTimeout(() => finish("expired"), graceMs);
+		signal?.addEventListener("abort", onAbort, { once: true });
+		void Promise.allSettled([...inFlight]).then(() => finish("settled"));
+	});
+}
+
+async function waitForInputSlot(inFlight: ReadonlySet<Promise<void>>, signal?: AbortSignal): Promise<void> {
+	if (!signal) {
+		await Promise.race(inFlight);
+		return;
+	}
+	if (signal.aborted) return;
+	await new Promise<void>((resolve) => {
+		let settled = false;
+		const finish = (): void => {
+			if (settled) return;
+			settled = true;
+			signal.removeEventListener("abort", finish);
+			resolve();
+		};
+		signal.addEventListener("abort", finish, { once: true });
+		void Promise.race(inFlight).then(finish, finish);
+	});
 }
 
 class RawConsoleTerminal implements ConsoleTerminal {
@@ -717,7 +831,7 @@ class RawConsoleTerminal implements ConsoleTerminal {
 		this.#prompt = prompt;
 		this.#buffer = "";
 		await writeToStream(this.#output, prompt);
-		return await new Promise(resolve => {
+		return await new Promise((resolve) => {
 			this.#resolveLine = resolve;
 		});
 	}
@@ -782,7 +896,12 @@ function parseConsoleArguments(arguments_: readonly string[]): string | undefine
 }
 
 function parseMainSubmitResult(value: unknown): MainSubmitResult {
-	if (!isRecord(value) || value.accepted !== true || typeof value.op_ref !== "string" || typeof value.delivered_as !== "string") {
+	if (
+		!isRecord(value) ||
+		value.accepted !== true ||
+		typeof value.op_ref !== "string" ||
+		typeof value.delivered_as !== "string"
+	) {
 		throw new WayConsoleError("main.submit returned an invalid response.");
 	}
 	return { accepted: true, opRef: value.op_ref, deliveredAs: value.delivered_as };
@@ -799,7 +918,11 @@ function parseGateCommand(command: string): { gateId: string; expectedSessionId:
 	const match = /^\/gate\s+(\S+)\s+(\S+)\s+(.+)$/s.exec(command);
 	if (!match) throw new WayConsoleError("Usage: /gate <gate_id> <expected_session_id> <JSON answer>");
 	try {
-		return { gateId: match[1] as string, expectedSessionId: match[2] as string, answer: JSON.parse(match[3] as string) };
+		return {
+			gateId: match[1] as string,
+			expectedSessionId: match[2] as string,
+			answer: JSON.parse(match[3] as string),
+		};
 	} catch {
 		throw new WayConsoleError("Gate answers must be valid JSON.");
 	}
@@ -807,7 +930,9 @@ function parseGateCommand(command: string): { gateId: string; expectedSessionId:
 
 function toConsoleEvent(event: RpcJournalEvent): ConsoleEventFrame {
 	if (!WAY_CONSOLE_EVENT_KINDS.includes(event.kind as WayConsoleEventKind)) {
-		throw new ConsoleDeliveryUnavailableError(`main.events.read returned an unsupported console event kind: ${event.kind}`);
+		throw new ConsoleDeliveryUnavailableError(
+			`main.events.read returned an unsupported console event kind: ${event.kind}`,
+		);
 	}
 	return {
 		seq: event.seq,
@@ -840,7 +965,7 @@ function describeGatewayValue(value: unknown): string {
 
 function sleep(milliseconds: number, signal: AbortSignal): Promise<void> {
 	if (milliseconds === 0 || signal.aborted) return Promise.resolve();
-	return new Promise(resolve => {
+	return new Promise((resolve) => {
 		const timeout = setTimeout(finish, milliseconds);
 		const onAbort = () => finish();
 		function finish(): void {
@@ -874,7 +999,7 @@ function writeToStream(stream: NodeJS.WriteStream, text: string): Promise<void> 
 			finish();
 		};
 		try {
-			const accepted = stream.write(text, error => {
+			const accepted = stream.write(text, (error) => {
 				if (error) {
 					fail(error);
 					return;
