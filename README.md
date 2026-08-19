@@ -15,16 +15,16 @@ platform credentials all belong in deployment configuration.
 
 ```text
                          Unix-domain JSON-RPC
-way-discord adapter  <-------------------------->  way daemon
-Discord gateway/REST                                  Bun + Rust single binary
-                                                        |
-                                                        +-- Rust: SQLite, journal,
-                                                        |   lock FSM, RPC, registry
-                                                        +-- TypeScript: strict resume,
-                                                            profile injection, broker bridge
-                                                                  |
-                                                           gjc broker-owned,
-                                                           isolated sessions
+way console (local owner)  -------------------------->  way daemon
+way-discord adapter       -------------------------->  Bun + Rust single binary
+Discord gateway/REST                                      |
+                                                           +-- Rust: SQLite, journal,
+                                                           |   lock FSM, RPC, registry
+                                                           +-- TypeScript: strict resume,
+                                                               profile injection, broker bridge
+                                                                     |
+                                                              gjc broker-owned,
+                                                              isolated sessions
 ```
 
 `way` owns durable state, the UDS endpoint, and the only v1 in-daemon corpus
@@ -107,6 +107,30 @@ The command queries the UDS and exits non-zero with `state: "unavailable"` if
 the daemon cannot be reached. The operations runbook covers `way.status` and
 full RPC monitoring.
 
+## Owner console and adapter final gates
+
+`way console` is the first-party, local owner acceptance surface. Run it as the
+same service identity that owns the protected UDS socket:
+
+```sh
+sudo -u gajae-way -H /usr/local/bin/way console \
+  --state-dir /var/lib/gajae-way --profile /etc/gajae-way/profile.toml
+```
+
+It reads `way.health` and `way.status` before accepting input, displays the
+main-session resume state, journal cursor, lock/quarantine and write-mode
+state, and reconciliation freshness, and refuses a failed-closed or unhealthy
+daemon. Owner messages use the configured owner surface mapping; when a
+profile has more than one owner surface, select one explicitly with
+`--surface-id`. Replies, turn transitions, health changes, and workflow gates
+are read and checkpointed through the daemon-owned journal, so the console
+holds no local cursor or durable delivery state.
+
+The local console is the first acceptance surface, not a replacement for chat
+adapter validation. The configured live Discord route remains the final chat
+adapter gate, and a future Telegram adapter is subject to the same final-gate
+route drill after local-console acceptance succeeds.
+
 Use the runbooks below for the complete operational procedure and incident
 handling. Do not bootstrap a second state directory or start a second adapter
 for the same configured route.
@@ -132,7 +156,7 @@ or restart.
 ## Runbooks
 
 - [Operations](ops/runbooks/operations.md) — install/configure/bootstrap/operate,
-  monitoring, audit, backup, and Discord verification.
+  local owner console, monitoring, audit, backup, and chat-adapter final-gate verification.
 - [Bootstrap ceremony](ops/runbooks/bootstrap-ceremony.md) — atomic first-run
   identity binding and interrupted-ceremony recovery.
 - [Profile approval](ops/runbooks/profile-approve.md) — intentional

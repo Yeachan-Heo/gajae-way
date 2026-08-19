@@ -4,6 +4,7 @@ import * as fsp from "node:fs/promises";
 import * as net from "node:net";
 import * as os from "node:os";
 import * as path from "node:path";
+import { runWayConsole } from "./console/console";
 import { parseWayConfig, type WayConfig } from "./config";
 import { BrokerCli } from "./broker/cli";
 import { BrokerReconciler } from "./broker/reconcile";
@@ -32,6 +33,7 @@ import { createRpcBridge, RpcBridgeException, type RpcBridgeHandler } from "./rp
 
 const usage = `Usage:
   way [serve] [--state-dir PATH] [--profile PATH] [--fail-closed-linger-ms MS] [--broker-cli PATH] [--reconcile-poll-ms MS]
+  way console [--surface-id ID] [--state-dir PATH] [--profile PATH]
   way bootstrap --confirm [--state-dir PATH] [--profile PATH]
   way profile approve --confirm [--state-dir PATH] [--profile PATH]
   way --health [--state-dir PATH] | --version`;
@@ -1202,6 +1204,10 @@ export async function runWay(arguments_ = process.argv.slice(2)): Promise<void> 
 	}
 	if (parsed.remaining.length === 0 || (parsed.remaining.length === 1 && parsed.remaining[0] === "serve")) {
 		await serveWay(parsed.config);
+		return;
+	}
+	if (parsed.remaining[0] === "console") {
+		await runWayConsole(parsed.config, parsed.remaining.slice(1));
 		return;
 	}
 	if (parsed.remaining[0] === "bootstrap") {

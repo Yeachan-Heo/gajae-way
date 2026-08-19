@@ -79,6 +79,43 @@ failed-closed process first serves `status: "unhealthy", state:
 `RestartPreventExitStatus=78` intentionally stops automatic restart loops;
 investigate the reported reason before an operator approves or repairs state.
 
+## Local owner console
+
+`way console` is the first-party local owner surface and must run as the service
+identity that owns the UDS socket. It is a pure gateway RPC client: it has no
+local checkpoint and does not open the broker, SDK, corpus, or SQLite state.
+
+```sh
+sudo -u gajae-way -H /usr/local/bin/way console \
+  --state-dir /var/lib/gajae-way --profile /etc/gajae-way/profile.toml
+```
+
+Before presenting a prompt, the console calls `way.health` and `way.status` and
+shows daemon state, strict-resume status, journal head cursor, lock state
+(including `quarantined` and `write_mode`), and reconciliation freshness. It
+refuses interactive input when the daemon is failed closed or unhealthy; repair
+that condition first. Owner text is admitted only through `main.submit` with
+the configured owner surface, and the displayed `delivered_as` result is the
+gateway's authoritative admission decision. Replies, turn state, health
+changes, and gates use the named `way-console` journal consumer; rendering
+precedes `consumer.commit`, so a normal console restart resumes the
+server-owned checkpoint without replaying settled output.
+
+For a profile with multiple configured owner surfaces, name the intended one:
+
+```sh
+sudo -u gajae-way -H /usr/local/bin/way console --surface-id OWNER_SURFACE_ID \
+  --state-dir /var/lib/gajae-way --profile /etc/gajae-way/profile.toml
+```
+
+Answer a displayed gate using its durable values, never a guessed session ID:
+
+```text
+/gate GATE_ID EXPECTED_SESSION_ID {"selected":["Yes"]}
+```
+
+`main.gate.answer` rejects a mismatched expected session with code `1102`.
+
 ## Audit journal and receipt evidence
 
 The durable journal is exposed through `main.events.read`; begin at `1:0` only
@@ -121,7 +158,11 @@ policy as well; the SQLite database alone is not a replacement for the
 transcript or corpus. Stop automation and follow the quarantine runbook before
 any recovery that could change Git history or reopen write authority.
 
-## Discord adapter verification
+## Chat adapter final-gate verification
+
+The configured live Discord route is the final chat-adapter gate after local
+console acceptance. A future Telegram adapter is subject to the same final-gate
+route drill; neither chat adapter is accepted solely from local RPC fixtures.
 
 Enable Discord **Direct Messages** and **Message Content** intents. With the
 adapter unit running (so its systemd credential directory exists), verify the
