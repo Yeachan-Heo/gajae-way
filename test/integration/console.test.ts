@@ -6,6 +6,8 @@ import {
 	ConsoleDeliveryUnavailableError,
 	ConsoleOutput,
 	OwnerConsole,
+	runWayConsole,
+	type ConsoleTerminal,
 } from "../../src/console/console";
 import { createMainAdmissionHandler } from "../../src/main-session/admission";
 import { bootstrapMainSession } from "../../src/main-session/bootstrap";
@@ -142,6 +144,23 @@ function recordedOutput(writer?: (text: string) => void | Promise<void>): { outp
 			await writer?.(text);
 			writes.push(text);
 		}),
+	};
+}
+
+function scriptedTerminal(lines: readonly string[]): { terminal: ConsoleTerminal; writes: string[] } {
+	const pending = [...lines];
+	const writes: string[] = [];
+	return {
+		writes,
+		terminal: {
+			async writeTrusted(text: string): Promise<void> {
+				writes.push(text);
+			},
+			async readLine(): Promise<string | undefined> {
+				return pending.shift();
+			},
+			close(): void {},
+		},
 	};
 }
 
@@ -416,6 +435,41 @@ test("actual way console CLI exits non-zero after a failed-closed startup refusa
 	}
 });
 
+
+test("healthy non-TTY CLI preserves the console checkpoint until a valid terminal can render pending events", async () => {
+	const gateway = await hostedConsoleGateway();
+	const checkpointBefore = gateway.core.consumerCursor("way-console");
+	const pending = gateway.core.journalAppend("assistant_message", JSON.stringify({ finalized: true, text: "pending before terminal validation" }));
+	try {
+		const child = Bun.spawn({
+			cmd: ["bun", "src/main.ts", "console", "--state-dir", gateway.stateDirectory, "--profile", gateway.profilePath],
+			cwd: repositoryRoot,
+			stdout: "pipe",
+			stderr: "pipe",
+		});
+		const [exitCode, childStdout, childStderr] = await Promise.all([
+			child.exited,
+			new Response(child.stdout).text(),
+			new Response(child.stderr).text(),
+		]);
+		expect(exitCode).toBe(1);
+		expect(childStderr).toContain("way console requires an interactive TTY");
+		expect(childStdout).toBe("");
+		expect(gateway.core.consumerCursor("way-console")).toBe(checkpointBefore);
+		expect(gateway.core.consumerOutbox("way-console")).toEqual([]);
+
+		const subsequent = scriptedTerminal(["/quit"]);
+		await runWayConsole(
+			{ stateDir: gateway.stateDirectory, profilePath: gateway.profilePath },
+			[],
+			{ terminal: subsequent.terminal },
+		);
+		expect(subsequent.writes.join("")).toContain("Assistant:\npending before terminal validation\n");
+		expect(gateway.core.consumerCursor("way-console")).toBe(pending.cursor);
+	} finally {
+		await gateway.stop();
+	}
+});
 test("console gate drill uses durable gate fencing, rejects a mismatched session, and renders resolution", async () => {
 	const gateway = await hostedConsoleGateway();
 	const rendered = recordedOutput();

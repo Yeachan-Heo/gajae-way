@@ -3,7 +3,6 @@ import * as path from "node:path";
 import { stdin, stdout } from "node:process";
 import {
 	RpcJournalConsumer,
-	type JournalDeliveryProof,
 	type RpcJournalEvent,
 } from "../journal-consumer";
 import type { WayConfig } from "../config";
@@ -374,7 +373,8 @@ export class OwnerConsole {
 		});
 	}
 
-	async start(): Promise<ConsoleStartup> {
+	/** Queries the non-mutating health/status fence. It never claims journal delivery. */
+	async inspectStartup(): Promise<ConsoleStartup> {
 		let health: RecordValue;
 		let status: RecordValue;
 		try {
@@ -391,21 +391,35 @@ export class OwnerConsole {
 		}
 		const decision = consoleStartupDecision(health, status);
 		if (!decision.interactive) {
-			await this.#output.writeTrusted(`${renderConsoleStatusSummary(health, status)}\n`);
+			await this.writeStatusSummary(health, status);
 			await this.writeRefusal(decision.refusal ?? "The gateway refused interactive console startup.");
 			return { accepted: false, refusal: decision.refusal };
+		}
+		return { accepted: true, health, status };
+	}
+
+	/** Claims and validates delivery only after the caller has installed a terminal. */
+	async establishDeliveryReadiness(startup: ConsoleStartup): Promise<ConsoleStartup> {
+		if (!startup.accepted || !startup.health || !startup.status) {
+			throw new ConsoleDeliveryUnavailableError("Console health/status inspection did not produce an interactive startup state.");
 		}
 		try {
 			await this.#consumer.ensureReady();
 			this.#deliveryReady = true;
-			await this.#output.writeTrusted(`${renderConsoleStatusSummary(health, status)}\n`);
-			return { accepted: true, health, status };
+			return startup;
 		} catch (error) {
 			const failure = this.markDeliveryFailure(error);
 			const refusal = `Refusing interactive console: ${failure.message}`;
 			await this.writeRefusal(refusal);
 			return { accepted: false, refusal };
 		}
+	}
+
+	async start(): Promise<ConsoleStartup> {
+		const inspected = await this.inspectStartup();
+		if (!inspected.accepted || !inspected.health || !inspected.status) return inspected;
+		await this.writeStatusSummary(inspected.health, inspected.status);
+		return await this.establishDeliveryReadiness(inspected);
 	}
 
 	async submit(text: string): Promise<MainSubmitResult> {
@@ -527,6 +541,10 @@ export class OwnerConsole {
 		return failure;
 	}
 
+	private async writeStatusSummary(health: RecordValue, status: RecordValue): Promise<void> {
+		await this.#output.writeTrusted(`${renderConsoleStatusSummary(health, status)}\n`);
+	}
+
 	private async writeRefusal(message: string): Promise<void> {
 		await this.#output.writeUntrusted(message);
 		await this.#output.writeTrusted("\n");
@@ -623,13 +641,21 @@ export async function runWayConsole(
 			output,
 			idempotencyKey: dependencies.idempotencyKey,
 		});
-		const startup = await consoleSurface.start();
-		if (!startup.accepted) {
-			throw new ConsoleStartupRefusalError(startup.refusal ?? "Interactive console startup was refused.");
+		const inspected = await consoleSurface.inspectStartup();
+		if (!inspected.accepted || !inspected.health || !inspected.status) {
+			throw new ConsoleStartupRefusalError(inspected.refusal ?? "Interactive console startup was refused.");
 		}
+		// RawConsoleTerminal validates stdin/stdout before the first consumer claim,
+		// read, publication, or commit. Health/status refusals above remain usable
+		// through redirected stdout because they never enter delivery readiness.
 		terminal = dependencies.terminal ?? new RawConsoleTerminal();
 		const activeTerminal = terminal;
 		output.setWriter(async text => await activeTerminal.writeTrusted(text));
+		await output.writeTrusted(`${renderConsoleStatusSummary(inspected.health, inspected.status)}\n`);
+		const startup = await consoleSurface.establishDeliveryReadiness(inspected);
+		if (!startup.accepted) {
+			throw new ConsoleStartupRefusalError(startup.refusal ?? "Interactive console delivery readiness was refused.");
+		}
 		await output.writeTrusted("Owner console ready. Type /help for commands.\n");
 		const events = new AbortController();
 		let deliveryFailure: Error | undefined;
