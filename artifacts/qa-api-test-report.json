@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "kind": "api-package-test-report",
   "subject": "gajae-way v1 (plan phases P0-P8) plus owner-directed local console (G014); live chat-adapter acceptance deferred to the final gate",
-  "frozenCommit": "pending-commit (console correctness generation; supersedes b4092cf stamp)",
+  "frozenCommit": "730bc7d (console correctness generation; sourceHash sha256:4ab6efb9f80514557424949ed1017e26337c3dfd841b1bc86a25a30a8fe76cca)",
   "producedBy": "ultragoal leader (delegated executor QA lane failed three times; leader ran the matrix directly)",
   "contract": ".gjc/_session-01a00ef5-0d0c-7000-b6f1-36f0fe3f8080/plans/ralplan/01a00ef5-0d0c-7000-b6f1-36f0fe3f8080/pending-approval.md",
   "rerunCommands": [
