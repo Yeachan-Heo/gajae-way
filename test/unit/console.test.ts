@@ -327,6 +327,7 @@ test("raw terminal bounds saturated queued input, refuses excess lines visibly, 
 		expect(input.pauseCalls).toBe(0);
 		expect(input.blockedChunkCount).toBe(0);
 		expect(output.writes.join("")).toContain("Input queue is full");
+		expect(output.writes.join("")).toContain(`queue-full-lines=${rejected.length}`);
 
 		const received: string[] = [];
 		for (let index = 0; index < accepted.length; index += 1) {
@@ -478,6 +479,95 @@ test("raw terminal retains a same-chunk oversized-line refusal through transient
 
 		input.send(`${usableLine}\n`);
 		expect(await pendingLine).toBe(usableLine);
+	} finally {
+		terminal.close();
+	}
+});
+
+test("raw terminal coalesces mixed refusal causes through transient output backpressure", async () => {
+	const input = new RawInputHarness();
+	const output = new BackpressuredRawOutputHarness();
+	const terminal = new RawConsoleTerminal({ input, output });
+	const queued = Array.from({ length: MAX_RAW_CONSOLE_QUEUED_LINES }, (_value, index) => `accepted-${index}`);
+	const oversized = "x".repeat(MAX_RAW_CONSOLE_LINE_BYTES + 1);
+	const dropped = "MIXED_QUEUE_FULL_PAYLOAD_MUST_NOT_ECHO";
+	try {
+		const direct = terminal.readLine("way> ");
+		input.send("direct\n");
+		expect(await direct).toBe("direct");
+		await terminal.writeTrusted("");
+		await eventually(() => !terminal.rawPublicationPending, "initial raw echo did not flush");
+
+		output.stall();
+		input.send(`${oversized}\n${queued.join("\n")}\n${dropped}\n`);
+		await eventually(() => output.pendingWriteCount === 1, "combined refusal did not begin its stalled publication");
+		expect(terminal.pendingRefusalPublicationCount).toBe(1);
+		expect(terminal.pendingEchoRedrawCount).toBe(1);
+		expect(terminal.rawPublicationPending).toBe(true);
+		expect(terminal.queuedLineCount).toBe(MAX_RAW_CONSOLE_QUEUED_LINES);
+		expect(terminal.queuedInputBytes).toBeLessThanOrEqual(MAX_RAW_CONSOLE_QUEUED_BYTES);
+		expect(terminal.bufferedInputBytes).toBe(0);
+		await Bun.sleep(300);
+		expect(terminal.pendingRefusalPublicationCount).toBe(1);
+
+		output.recover();
+		await eventually(
+			() => terminal.pendingRefusalPublicationCount === 0 && !terminal.rawPublicationPending,
+			"combined refusal did not publish after output recovery",
+		);
+		const refusalFrames = output.writes.filter((write) => write.includes("Input refused:"));
+		expect(refusalFrames).toHaveLength(1);
+		const refusal = refusalFrames[0] as string;
+		expect(refusal).toContain("oversized-line=1");
+		expect(refusal).toContain("queue-full-lines=1");
+		expect(refusal).not.toContain("queue-full-bytes=");
+		expect(output.writes.join("")).not.toContain(oversized.slice(0, 64));
+		expect(output.writes.join("")).not.toContain(dropped);
+
+		const delivered: string[] = [];
+		for (let index = 0; index < queued.length; index += 1) {
+			delivered.push((await terminal.readLine("way> ")) as string);
+		}
+		expect(delivered).toEqual(queued);
+	} finally {
+		terminal.close();
+	}
+});
+
+test("raw terminal reports byte-capacity refusals with a distinct bounded cause", async () => {
+	const input = new RawInputHarness();
+	const output = new RawOutputHarness();
+	const terminal = new RawConsoleTerminal({ input, output });
+	const queued = Array.from({ length: MAX_RAW_CONSOLE_QUEUED_BYTES / MAX_RAW_CONSOLE_LINE_BYTES }, (_value, index) =>
+		`${index}`.padEnd(MAX_RAW_CONSOLE_LINE_BYTES, "b"),
+	);
+	const dropped = "BYTE_CAPACITY_PAYLOAD_MUST_NOT_ECHO";
+	try {
+		const direct = terminal.readLine("way> ");
+		input.send("direct\n");
+		expect(await direct).toBe("direct");
+		await terminal.writeTrusted("");
+		input.send(`${queued.join("\n")}\n${dropped}\n`);
+		await eventually(
+			() => output.writes.some((write) => write.includes("Input refused:")),
+			"byte-capacity refusal did not render",
+		);
+		const refusalFrames = output.writes.filter((write) => write.includes("Input refused:"));
+		expect(refusalFrames).toHaveLength(1);
+		const refusal = refusalFrames[0] as string;
+		expect(refusal).toContain("queue-full-bytes=1");
+		expect(refusal).not.toContain("queue-full-lines=");
+		expect(refusal).not.toContain("oversized-line=");
+		expect(output.writes.join("")).not.toContain(dropped);
+		expect(terminal.queuedLineCount).toBe(queued.length);
+		expect(terminal.queuedInputBytes).toBe(MAX_RAW_CONSOLE_QUEUED_BYTES);
+		expect(terminal.bufferedInputBytes).toBe(0);
+
+		const delivered: string[] = [];
+		for (let index = 0; index < queued.length; index += 1) {
+			delivered.push((await terminal.readLine("way> ")) as string);
+		}
+		expect(delivered).toEqual(queued);
 	} finally {
 		terminal.close();
 	}

@@ -58,11 +58,14 @@ export interface ConsoleTerminal {
 	onExitRequested?(listener: () => void): () => void;
 }
 
-type RawConsoleRefusalKind = "queue-full" | "oversized-line";
+const RAW_CONSOLE_REFUSAL_CAUSES = ["oversized-line", "queue-full-lines", "queue-full-bytes"] as const;
+
+type RawConsoleRefusalCause = (typeof RAW_CONSOLE_REFUSAL_CAUSES)[number];
+type RawConsoleRefusalCounts = Record<RawConsoleRefusalCause, number>;
 
 interface RawConsoleRefusal {
-	readonly kind: RawConsoleRefusalKind;
-	readonly message: string;
+	readonly counts: RawConsoleRefusalCounts;
+	revision: number;
 }
 interface RawConsoleInputStream {
 	readonly isTTY?: boolean;
@@ -886,7 +889,6 @@ export class RawConsoleTerminal implements ConsoleTerminal {
 	#bufferBytes = 0;
 	readonly #queuedLines: Array<{ readonly text: string; readonly bytes: number }> = [];
 	#queuedBytes = 0;
-	#queueFullRefusalPublished = false;
 	#pendingRefusal: RawConsoleRefusal | undefined;
 	#discardingOversizeLine = false;
 	#discardingRefusedLine = false;
@@ -963,7 +965,6 @@ export class RawConsoleTerminal implements ConsoleTerminal {
 		const queued = this.#queuedLines.shift();
 		if (queued) {
 			this.#queuedBytes -= queued.bytes;
-			this.endQueueFullRefusalEpisode();
 			return queued.text;
 		}
 		this.#prompt = prompt;
@@ -1021,11 +1022,12 @@ export class RawConsoleTerminal implements ConsoleTerminal {
 				continue;
 			}
 			if (character < " " || this.#discardingOversizeLine || this.#discardingRefusedLine) continue;
-			if (!this.#resolveLine && this.queueIsFull()) {
+			const queueFullCause = this.#resolveLine ? undefined : this.queueFullRefusalCause(0);
+			if (queueFullCause) {
 				this.#discardingRefusedLine = true;
 				this.#buffer = "";
 				this.#bufferBytes = 0;
-				this.reportInputRefusal("queue-full", this.queueFullRefusalMessage());
+				this.reportInputRefusal(queueFullCause);
 				continue;
 			}
 			const bytes = Buffer.byteLength(character);
@@ -1035,10 +1037,7 @@ export class RawConsoleTerminal implements ConsoleTerminal {
 				this.#bufferBytes = 0;
 				this.#echoDirty = false;
 				this.#echoFrame = "";
-				this.reportInputRefusal(
-					"oversized-line",
-					`Input line exceeds ${MAX_RAW_CONSOLE_LINE_BYTES} bytes and was refused.`,
-				);
+				this.reportInputRefusal("oversized-line");
 				continue;
 			}
 			this.#buffer += character;
@@ -1053,11 +1052,9 @@ export class RawConsoleTerminal implements ConsoleTerminal {
 			return true;
 		}
 		const bytes = Buffer.byteLength(line);
-		if (
-			this.#queuedLines.length >= MAX_RAW_CONSOLE_QUEUED_LINES ||
-			this.#queuedBytes + bytes > MAX_RAW_CONSOLE_QUEUED_BYTES
-		) {
-			this.reportInputRefusal("queue-full", this.queueFullRefusalMessage());
+		const queueFullCause = this.queueFullRefusalCause(bytes);
+		if (queueFullCause) {
+			this.reportInputRefusal(queueFullCause);
 			return false;
 		}
 		this.#queuedLines.push({ text: line, bytes });
@@ -1065,14 +1062,10 @@ export class RawConsoleTerminal implements ConsoleTerminal {
 		return true;
 	}
 
-	private queueIsFull(): boolean {
-		return (
-			this.#queuedLines.length >= MAX_RAW_CONSOLE_QUEUED_LINES || this.#queuedBytes >= MAX_RAW_CONSOLE_QUEUED_BYTES
-		);
-	}
-
-	private queueFullRefusalMessage(): string {
-		return `Input queue is full (${MAX_RAW_CONSOLE_QUEUED_LINES} lines / ${MAX_RAW_CONSOLE_QUEUED_BYTES} bytes); additional pasted input was refused.`;
+	private queueFullRefusalCause(additionalBytes: number): "queue-full-lines" | "queue-full-bytes" | undefined {
+		if (this.#queuedLines.length >= MAX_RAW_CONSOLE_QUEUED_LINES) return "queue-full-lines";
+		if (this.#queuedBytes + additionalBytes > MAX_RAW_CONSOLE_QUEUED_BYTES) return "queue-full-bytes";
+		return undefined;
 	}
 
 	private requestExit(): void {
@@ -1113,13 +1106,19 @@ export class RawConsoleTerminal implements ConsoleTerminal {
 		this.scheduleRawPublication();
 	}
 
-	private reportInputRefusal(kind: RawConsoleRefusalKind, message: string): void {
-		if (this.#closed || this.#exitRequested || this.#pendingRefusal) return;
-		if (kind === "queue-full") {
-			if (this.#queueFullRefusalPublished) return;
-			this.#queueFullRefusalPublished = true;
-		}
-		this.#pendingRefusal = { kind, message };
+	private reportInputRefusal(cause: RawConsoleRefusalCause): void {
+		if (this.#closed || this.#exitRequested) return;
+		const refusal = this.#pendingRefusal ?? {
+			counts: {
+				"oversized-line": 0,
+				"queue-full-lines": 0,
+				"queue-full-bytes": 0,
+			},
+			revision: 0,
+		};
+		refusal.counts[cause] += 1;
+		refusal.revision += 1;
+		this.#pendingRefusal = refusal;
 		this.scheduleRawPublication();
 	}
 
@@ -1127,9 +1126,48 @@ export class RawConsoleTerminal implements ConsoleTerminal {
 		this.#pendingRefusal = undefined;
 	}
 
-	private endQueueFullRefusalEpisode(): void {
-		if (this.#pendingRefusal?.kind === "queue-full") this.clearPendingRefusal();
-		this.#queueFullRefusalPublished = false;
+	private snapshotRefusalCounts(counts: RawConsoleRefusalCounts): RawConsoleRefusalCounts {
+		return {
+			"oversized-line": counts["oversized-line"],
+			"queue-full-lines": counts["queue-full-lines"],
+			"queue-full-bytes": counts["queue-full-bytes"],
+		};
+	}
+
+	private renderInputRefusal(counts: RawConsoleRefusalCounts): string {
+		const causes: string[] = [];
+		if (counts["oversized-line"] > 0) {
+			causes.push(
+				`oversized-line=${counts["oversized-line"]} (Input line exceeds ${MAX_RAW_CONSOLE_LINE_BYTES} bytes and was refused.)`,
+			);
+		}
+		if (counts["queue-full-lines"] > 0) {
+			causes.push(
+				`queue-full-lines=${counts["queue-full-lines"]} (Input queue is full (${MAX_RAW_CONSOLE_QUEUED_LINES} lines / ${MAX_RAW_CONSOLE_QUEUED_BYTES} bytes); additional pasted input was refused.)`,
+			);
+		}
+		if (counts["queue-full-bytes"] > 0) {
+			causes.push(
+				`queue-full-bytes=${counts["queue-full-bytes"]} (Input queue byte capacity is full (${MAX_RAW_CONSOLE_QUEUED_BYTES} bytes); additional pasted input was refused.)`,
+			);
+		}
+		return `Input refused: ${causes.join("; ")}\n`;
+	}
+
+	/** Keeps counts merged during a backpressured refusal write for the next bounded frame. */
+	private settlePublishedRefusal(
+		refusal: RawConsoleRefusal,
+		publishedCounts: RawConsoleRefusalCounts,
+		publishedRevision: number,
+	): void {
+		if (this.#pendingRefusal !== refusal) return;
+		if (refusal.revision === publishedRevision) {
+			this.clearPendingRefusal();
+			return;
+		}
+		for (const cause of RAW_CONSOLE_REFUSAL_CAUSES) {
+			refusal.counts[cause] -= publishedCounts[cause];
+		}
 	}
 
 	private scheduleRawPublication(): void {
@@ -1142,9 +1180,11 @@ export class RawConsoleTerminal implements ConsoleTerminal {
 		try {
 			const refusal = this.#pendingRefusal;
 			if (refusal) {
+				const counts = this.snapshotRefusalCounts(refusal.counts);
+				const revision = refusal.revision;
 				this.#rawPublicationKind = "refusal";
-				await writeToStream(this.#output, this.formatTrustedFrame(`${refusal.message}\n`));
-				if (this.#pendingRefusal === refusal) this.clearPendingRefusal();
+				await writeToStream(this.#output, this.formatTrustedFrame(this.renderInputRefusal(counts)));
+				this.settlePublishedRefusal(refusal, counts, revision);
 				return;
 			}
 			if (!this.#echoDirty || this.#closed || this.#exitRequested) return;

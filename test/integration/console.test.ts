@@ -1255,6 +1255,63 @@ test("raw same-chunk oversized input renders a refusal and leaves the owner comm
 	}
 }, 15_000);
 
+test("raw console coalesces mixed oversized and queue-full refusals while operation capacity is saturated", async () => {
+	const gateway = await hostedConsoleGateway();
+	const input = new PausableRawInputHarness();
+	const output = new RawOutputHarness();
+	const terminal = new RawConsoleTerminal({ input, output });
+	const release = deferred();
+	const submissions: string[] = [];
+	const inFlight = Array.from({ length: 16 }, (_value, index) => `busy-${index}`);
+	const queued = Array.from({ length: MAX_RAW_CONSOLE_QUEUED_LINES }, (_value, index) => `queued-${index}`);
+	const oversized = "x".repeat(MAX_RAW_CONSOLE_LINE_BYTES + 1);
+	const dropped = "MIXED_QUEUE_FULL_COMMAND_MUST_NOT_SUBMIT";
+	const running = runWayConsole({ stateDir: gateway.stateDirectory, profilePath: gateway.profilePath }, [], {
+		terminal,
+		profile: loadWayProfile(gateway.profilePath),
+		rpcConnect: async () => blockingSubmissionRpc(release.promise, submissions),
+	});
+	try {
+		await eventually(() => output.writes.includes("way> "), "raw console did not begin reading interactive input");
+		for (const line of inFlight) input.send(`${line}\n`);
+		await eventually(() => submissions.length === inFlight.length, "console did not saturate the owner-operation cap");
+		await Bun.sleep(0);
+
+		input.send(`${oversized}\n${queued.join("\n")}\n${dropped}\n`);
+		await eventually(
+			() => output.writes.some((write) => write.includes("Input refused:")),
+			"mixed-cause input did not render a refusal",
+		);
+		const refusalFrames = output.writes.filter((write) => write.includes("Input refused:"));
+		expect(refusalFrames).toHaveLength(1);
+		const refusal = refusalFrames[0] as string;
+		expect(refusal).toContain("oversized-line=1");
+		expect(refusal).toContain("queue-full-lines=1");
+		expect(refusal).not.toContain("queue-full-bytes=");
+		expect(output.writes.join("")).not.toContain(oversized.slice(0, 64));
+		expect(output.writes.join("")).not.toContain(dropped);
+		expect(terminal.pendingRefusalPublicationCount).toBe(0);
+		expect(terminal.queuedLineCount).toBe(MAX_RAW_CONSOLE_QUEUED_LINES);
+		expect(terminal.queuedInputBytes).toBeLessThanOrEqual(MAX_RAW_CONSOLE_QUEUED_BYTES);
+		expect(terminal.bufferedInputBytes).toBe(0);
+		expect(submissions).toEqual(inFlight);
+
+		release.resolve();
+		await eventually(
+			() => submissions.length === inFlight.length + queued.length,
+			"accepted queued input was not admitted after the operation cap released",
+		);
+		expect(submissions).toEqual([...inFlight, ...queued]);
+		input.send("/quit\n");
+		await running;
+	} finally {
+		release.resolve();
+		terminal.close();
+		await gateway.stop();
+		await running.catch(() => undefined);
+	}
+}, 15_000);
+
 test("raw console bounds queued input, visibly refuses excess lines, and preserves FIFO after operation-cap saturation", async () => {
 	const gateway = await hostedConsoleGateway();
 	const input = new PausableRawInputHarness();
