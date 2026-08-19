@@ -2,9 +2,16 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import { createConnection } from "node:net";
 import * as path from "node:path";
-import { expect, test } from "bun:test";
+import { afterEach, expect, test } from "bun:test";
 import { RpcClient } from "../../src/rpc-client";
 import { loadWayCore } from "../../src/native-loader";
+import { ManagedProcessRegistry, type ManagedBunProcess } from "../helpers/managed-process";
+
+const managedProcesses = new ManagedProcessRegistry();
+
+afterEach(async () => {
+	await managedProcesses.reapAll();
+});
 
 const repositoryRoot = path.resolve(import.meta.dir, "..", "..");
 
@@ -24,6 +31,10 @@ function compiledWay(): string {
 	if (!fs.existsSync(executable))
 		throw new Error("The compiled closure drill requires dist/way. Run bun scripts/compile.ts before bun test.");
 	return executable;
+}
+
+function spawnCompiledDaemon(command: readonly string[], environment: NodeJS.ProcessEnv): ManagedBunProcess {
+	return managedProcesses.spawnDaemon({ cmd: command, cwd: repositoryRoot, env: environment, stderr: "pipe" });
 }
 
 function profile(corpus: string, workspace: string): string {
@@ -239,13 +250,7 @@ test("compiled daemon makes corpus closures durable, replayable, and single-flig
 			repositoryRoot,
 			environment,
 		);
-		daemon = Bun.spawn({
-			cmd: [executable, "serve", "--state-dir", state, "--profile", profilePath],
-			cwd: repositoryRoot,
-			env: environment,
-			stdout: "ignore",
-			stderr: "pipe",
-		});
+		daemon = spawnCompiledDaemon([executable, "serve", "--state-dir", state, "--profile", profilePath], environment);
 		client = await connectHealthy(socketPath);
 		const cliHealth = JSON.parse(
 			await run([executable, "--health", "--state-dir", state], repositoryRoot, environment),
@@ -302,15 +307,8 @@ test("compiled daemon makes corpus closures durable, replayable, and single-flig
 		// strict startup reconciliation fail closed instead of becoming healthy.
 		client.close();
 		client = undefined;
-		if (daemon?.exitCode === null) daemon.kill("SIGTERM");
-		if (daemon) await daemon.exited;
-		daemon = Bun.spawn({
-			cmd: [executable, "serve", "--state-dir", state, "--profile", profilePath],
-			cwd: repositoryRoot,
-			env: environment,
-			stdout: "ignore",
-			stderr: "pipe",
-		});
+		if (daemon) await managedProcesses.stopDaemon(daemon);
+		daemon = spawnCompiledDaemon([executable, "serve", "--state-dir", state, "--profile", profilePath], environment);
 		client = await connectHealthy(socketPath);
 
 		fs.writeFileSync(path.join(corpus, "compiled-close.txt"), "closed by compiled daemon\n");
@@ -383,21 +381,15 @@ test("compiled daemon makes corpus closures durable, replayable, and single-flig
 		// derive the original response from the bound operation/recovery evidence.
 		client.close();
 		client = undefined;
-		if (daemon?.exitCode === null) daemon.kill("SIGTERM");
-		if (daemon) await daemon.exited;
+		if (daemon) await managedProcesses.stopDaemon(daemon);
 		const crashMarker = path.join(root, "after-push-marker");
 		const crashRelease = path.join(root, "after-push-release");
-		daemon = Bun.spawn({
-			cmd: [executable, "serve", "--state-dir", state, "--profile", profilePath],
-			cwd: repositoryRoot,
-			env: {
-				...environment,
-				WAY_E2E_CLOSURE_AFTER_PUSH_MARKER: crashMarker,
-				WAY_E2E_CLOSURE_AFTER_PUSH_RELEASE: crashRelease,
-			},
-			stdout: "ignore",
-			stderr: "pipe",
-		});
+		const crashEnvironment = {
+			...environment,
+			WAY_E2E_CLOSURE_AFTER_PUSH_MARKER: crashMarker,
+			WAY_E2E_CLOSURE_AFTER_PUSH_RELEASE: crashRelease,
+		};
+		daemon = spawnCompiledDaemon([executable, "serve", "--state-dir", state, "--profile", profilePath], crashEnvironment);
 		client = await connectHealthy(socketPath);
 		fs.writeFileSync(path.join(corpus, "crash-reconcile.txt"), "recover after daemon death\n");
 		const crashParams = closureParams("crash-reconcile.txt", "push-crash closure", "push-crash-key");
@@ -407,8 +399,7 @@ test("compiled daemon makes corpus closures durable, replayable, and single-flig
 			"closure did not reach the post-push crash boundary",
 		);
 		const originalBoundary = JSON.parse(fs.readFileSync(crashMarker, "utf8")) as { readonly response: unknown };
-		daemon.kill("SIGKILL");
-		await daemon.exited;
+		await managedProcesses.crashDaemon(daemon);
 		await interrupted;
 		client.close();
 		client = undefined;
@@ -418,13 +409,7 @@ test("compiled daemon makes corpus closures durable, replayable, and single-flig
 		subjects = await run(["git", `--git-dir=${remote}`, "log", "--format=%s", "main"]);
 		expect(subjects.split("\n").filter((subject) => subject === "push-crash closure")).toHaveLength(1);
 
-		daemon = Bun.spawn({
-			cmd: [executable, "serve", "--state-dir", state, "--profile", profilePath],
-			cwd: repositoryRoot,
-			env: environment,
-			stdout: "ignore",
-			stderr: "pipe",
-		});
+		daemon = spawnCompiledDaemon([executable, "serve", "--state-dir", state, "--profile", profilePath], environment);
 		client = await connectHealthy(socketPath);
 		const recoveredAfterRestart = await client.request("main.corpus.close", crashParams, { timeoutMs: 10_000 });
 		expect(recoveredAfterRestart.result).toEqual(originalBoundary.response);
@@ -444,23 +429,19 @@ test("compiled daemon makes corpus closures durable, replayable, and single-flig
 		// closed the same session-owned endpoint.
 		client.close();
 		client = undefined;
-		if (daemon?.exitCode === null) daemon.kill("SIGTERM");
-		if (daemon) await daemon.exited;
+		if (daemon) await managedProcesses.stopDaemon(daemon);
 		fs.rmSync(endpointPath, { force: true });
 		const mismatchMarker = path.join(root, "recovery-mismatch-after-push-marker");
 		const mismatchRelease = path.join(root, "recovery-mismatch-after-push-release");
 		const endpointEnvironment = { ...environment, WAY_E2E_SDK_ENDPOINT_PATH: endpointPath };
-		daemon = Bun.spawn({
-			cmd: [executable, "serve", "--state-dir", state, "--profile", profilePath],
-			cwd: repositoryRoot,
-			env: {
+		daemon = spawnCompiledDaemon(
+			[executable, "serve", "--state-dir", state, "--profile", profilePath],
+			{
 				...endpointEnvironment,
 				WAY_E2E_CLOSURE_AFTER_PUSH_MARKER: mismatchMarker,
 				WAY_E2E_CLOSURE_AFTER_PUSH_RELEASE: mismatchRelease,
 			},
-			stdout: "ignore",
-			stderr: "pipe",
-		});
+		);
 		client = await connectHealthy(socketPath);
 		expect(await endpointReachable(endpointPath)).toBe(true);
 		fs.writeFileSync(path.join(corpus, "recovery-mismatch.txt"), "mismatched remote state\n");
@@ -472,8 +453,7 @@ test("compiled daemon makes corpus closures durable, replayable, and single-flig
 			() => (fs.existsSync(mismatchMarker) ? true : undefined),
 			"recovery-mismatch closure did not reach the post-push crash boundary",
 		);
-		daemon.kill("SIGKILL");
-		await daemon.exited;
+		await managedProcesses.crashDaemon(daemon);
 		await mismatchRequest;
 		client.close();
 		client = undefined;
@@ -491,13 +471,10 @@ test("compiled daemon makes corpus closures durable, replayable, and single-flig
 		await run(["git", "-C", remoteAdvance, "push"]);
 
 		const successfulDisposalFailedClosedStartedAt = performance.now();
-		daemon = Bun.spawn({
-			cmd: [executable, "serve", "--state-dir", state, "--profile", profilePath, "--fail-closed-linger-ms", "3000"],
-			cwd: repositoryRoot,
-			env: endpointEnvironment,
-			stdout: "ignore",
-			stderr: "pipe",
-		});
+		daemon = spawnCompiledDaemon(
+			[executable, "serve", "--state-dir", state, "--profile", profilePath, "--fail-closed-linger-ms", "3000"],
+			endpointEnvironment,
+		);
 		client = await connectAvailable(socketPath);
 		const mismatchHealth = await failedClosedHealth(client);
 		expect(mismatchHealth).toMatchObject({
@@ -516,12 +493,7 @@ test("compiled daemon makes corpus closures durable, replayable, and single-flig
 	} finally {
 		for (const extraClient of extraClients) extraClient.close();
 		client?.close();
-		if (daemon?.exitCode === null) daemon.kill("SIGTERM");
-		if (daemon) {
-			await Promise.race([daemon.exited, Bun.sleep(2_000)]);
-			if (daemon.exitCode === null) daemon.kill("SIGKILL");
-			await daemon.exited;
-		}
+		if (daemon) await managedProcesses.stopDaemon(daemon);
 		fs.rmSync(endpointPath, { force: true });
 		fs.rmSync(root, { force: true, recursive: true });
 	}
@@ -555,18 +527,15 @@ test("compiled daemon exits promptly when pre-host session disposal rejects", as
 
 		const promptExitDeadlineMs = 1_500;
 		const failedClosedStartedAt = performance.now();
-		const rejectedDaemon = Bun.spawn({
-			cmd: [executable, "serve", "--state-dir", state, "--profile", profilePath, "--fail-closed-linger-ms", "5000"],
-			cwd: repositoryRoot,
-			env: {
+		const rejectedDaemon = spawnCompiledDaemon(
+			[executable, "serve", "--state-dir", state, "--profile", profilePath, "--fail-closed-linger-ms", "5000"],
+			{
 				...environment,
 				WAY_E2E_SDK_ENDPOINT_PATH: endpointPath,
 				WAY_E2E_SDK_DISPOSE_REJECT: "1",
 				WAY_E2E_FAIL_BEFORE_MAIN_HOST: "1",
 			},
-			stdout: "ignore",
-			stderr: "pipe",
-		});
+		);
 		daemon = rejectedDaemon;
 		const failedClosedHealth = await failedClosedHealthFile(state);
 		expect(failedClosedHealth).toMatchObject({
@@ -582,12 +551,7 @@ test("compiled daemon exits promptly when pre-host session disposal rejects", as
 			"main session teardown failed before failed-closed shutdown: forced E2E SDK session disposal rejection",
 		);
 	} finally {
-		if (daemon?.exitCode === null) daemon.kill("SIGTERM");
-		if (daemon) {
-			await Promise.race([daemon.exited, Bun.sleep(2_000)]);
-			if (daemon.exitCode === null) daemon.kill("SIGKILL");
-			await daemon.exited;
-		}
+		if (daemon) await managedProcesses.stopDaemon(daemon);
 		fs.rmSync(endpointPath, { force: true });
 		fs.rmSync(root, { force: true, recursive: true });
 	}

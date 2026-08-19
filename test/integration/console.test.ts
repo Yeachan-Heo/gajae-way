@@ -20,11 +20,14 @@ import { loadWayProfile } from "../../src/profile";
 import { createRpcBridge, RpcBridgeException, type RpcBridgeHandler } from "../../src/rpc-bridge";
 import { RpcClient, rpcResult, type JsonRpcClient, type RpcRequestOptions, type JsonRpcResponse } from "../../src/rpc-client";
 import { FileSdkDouble } from "../helpers/main-session";
+import { ManagedProcessRegistry } from "../helpers/managed-process";
 
 const repositoryRoot = path.resolve(import.meta.dir, "../..");
 const temporaryDirectories: string[] = [];
+const managedProcesses = new ManagedProcessRegistry();
 
 afterEach(async () => {
+	await managedProcesses.reapAll();
 	for (const directory of temporaryDirectories.splice(0)) fs.rmSync(directory, { force: true, recursive: true });
 });
 
@@ -413,12 +416,12 @@ test("actual way console CLI exits non-zero after a failed-closed startup refusa
 	core.setRpcHealth("failed_closed", "profile_drift");
 	try {
 		await connectEventually(socketPath).then(client => client.close());
-		const child = Bun.spawn({
+		const child = managedProcesses.trackBun(Bun.spawn({
 			cmd: ["bun", "src/main.ts", "console", "--state-dir", stateDirectory, "--profile", profilePath],
 			cwd: repositoryRoot,
 			stdout: "pipe",
 			stderr: "pipe",
-		});
+		}));
 		const [exitCode, childStdout, childStderr] = await Promise.all([
 			child.exited,
 			new Response(child.stdout).text(),
@@ -441,12 +444,12 @@ test("healthy non-TTY CLI preserves the console checkpoint until a valid termina
 	const checkpointBefore = gateway.core.consumerCursor("way-console");
 	const pending = gateway.core.journalAppend("assistant_message", JSON.stringify({ finalized: true, text: "pending before terminal validation" }));
 	try {
-		const child = Bun.spawn({
+		const child = managedProcesses.trackBun(Bun.spawn({
 			cmd: ["bun", "src/main.ts", "console", "--state-dir", gateway.stateDirectory, "--profile", gateway.profilePath],
 			cwd: repositoryRoot,
 			stdout: "pipe",
 			stderr: "pipe",
-		});
+		}));
 		const [exitCode, childStdout, childStderr] = await Promise.all([
 			child.exited,
 			new Response(child.stdout).text(),

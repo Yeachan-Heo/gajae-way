@@ -1,12 +1,20 @@
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import { spawn, type ChildProcess } from "node:child_process";
-import { expect, test } from "bun:test";
+import type { ChildProcess } from "node:child_process";
+import { afterEach, expect, test } from "bun:test";
 import { createClosureExecutor } from "../../src/main-session/closure";
 import { startWayServer } from "../../src/main";
 import type { WayCoreHandle } from "../../src/native-loader";
 import { RpcClient, type JsonRpcResponse } from "../../src/rpc-client";
+import { ManagedProcessRegistry } from "../helpers/managed-process";
+
+const managedProcesses = new ManagedProcessRegistry();
+
+afterEach(async () => {
+	await managedProcesses.reapAll();
+});
+
 
 const repositoryRoot = path.resolve(import.meta.dir, "..", "..");
 
@@ -56,7 +64,7 @@ function responseResult(response: JsonRpcResponse): Record<string, unknown> {
 }
 
 async function spawnHolder(core: WayCoreHandle): Promise<Holder> {
-	const child = spawn("/bin/sh", ["-c", "exec sleep 60"], { detached: true, stdio: "ignore" });
+	const child = managedProcesses.spawnNodeGroup("/bin/sh", ["-c", "exec sleep 60"], { stdio: "ignore" });
 	if (!child.pid) throw new Error("holder process did not expose a pid");
 	let lastError: unknown;
 	for (let attempt = 0; attempt < 100; attempt += 1) {
@@ -67,22 +75,12 @@ async function spawnHolder(core: WayCoreHandle): Promise<Holder> {
 			await Bun.sleep(10);
 		}
 	}
-	child.kill("SIGKILL");
+	await managedProcesses.crashNodeGroup(child);
 	throw new Error(`holder process did not publish an incarnation: ${lastError instanceof Error ? lastError.message : "unknown error"}`);
 }
 
 async function killHolder(holder: Holder): Promise<void> {
-	try {
-		process.kill(-holder.identity.pgid, "SIGKILL");
-	} catch (error) {
-		const code = (error as NodeJS.ErrnoException).code;
-		if (code !== "ESRCH" && code !== "EPERM") throw error;
-	}
-	await new Promise<void>(resolve => {
-		if (holder.child.exitCode !== null) return resolve();
-		holder.child.once("close", () => resolve());
-		setTimeout(resolve, 1_000);
-	});
+	await managedProcesses.crashNodeGroup(holder.child);
 }
 
 function acquire(core: WayCoreHandle, holder: Holder) {

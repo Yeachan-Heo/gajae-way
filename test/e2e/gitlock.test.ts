@@ -1,7 +1,7 @@
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import { spawn, type ChildProcess } from "node:child_process";
+import type { ChildProcess } from "node:child_process";
 import { afterEach, expect, test } from "bun:test";
 import {
 	ClosureError,
@@ -10,10 +10,10 @@ import {
 	type ClosureRequest,
 } from "../../src/main-session/closure";
 import { loadWayCore, type WayCoreHandle } from "../../src/native-loader";
+import { ManagedProcessRegistry } from "../helpers/managed-process";
 
 const temporaryDirectories: string[] = [];
-const daemonProcesses: ReturnType<typeof Bun.spawn>[] = [];
-const holderProcesses: Array<{ child: ChildProcess; pgid: number }> = [];
+const managedProcesses = new ManagedProcessRegistry();
 
 interface CommandResult {
 	readonly exitCode: number;
@@ -34,21 +34,7 @@ interface Holder {
 }
 
 afterEach(async () => {
-	for (const process of daemonProcesses.splice(0)) {
-		try {
-			process.kill("SIGKILL");
-		} catch {
-			// It is already gone.
-		}
-		await Promise.race([process.exited, Bun.sleep(1_000)]);
-	}
-	for (const holder of holderProcesses.splice(0)) {
-		try {
-			process.kill(-holder.pgid, "SIGKILL");
-		} catch {
-			// It is already gone.
-		}
-	}
+	await managedProcesses.reapAll();
 	for (const directory of temporaryDirectories.splice(0)) fs.rmSync(directory, { force: true, recursive: true });
 });
 
@@ -173,7 +159,7 @@ function expectNativeError(action: () => unknown, code: number): void {
 }
 
 async function spawnHolder(coreHandle: WayCoreHandle): Promise<Holder> {
-	const child = spawn("/bin/sh", ["-c", "exec sleep 60"], { detached: true, stdio: "ignore" });
+	const child = managedProcesses.spawnNodeGroup("/bin/sh", ["-c", "exec sleep 60"], { stdio: "ignore" });
 	if (!child.pid) throw new Error("holder did not start");
 	const identity = await eventually(() => {
 		try {
@@ -182,22 +168,11 @@ async function spawnHolder(coreHandle: WayCoreHandle): Promise<Holder> {
 			return undefined;
 		}
 	}, "holder did not publish an incarnation");
-	holderProcesses.push({ child, pgid: identity.pgid });
 	return { child, identity };
 }
 
 async function killHolder(holder: Holder): Promise<void> {
-	try {
-		process.kill(-holder.identity.pgid, "SIGKILL");
-	} catch (error) {
-		const code = (error as NodeJS.ErrnoException).code;
-		if (code !== "ESRCH" && code !== "EPERM") throw error;
-	}
-	await new Promise<void>((resolve) => {
-		if (holder.child.exitCode !== null) return resolve();
-		holder.child.once("close", () => resolve());
-		setTimeout(resolve, 1_000);
-	});
+	await managedProcesses.crashNodeGroup(holder.child);
 }
 
 function acquire(coreHandle: WayCoreHandle, holder: Holder, sessionId: string, label: string) {
@@ -239,7 +214,7 @@ test("L1a: daemon SIGKILL reaps the residual closure group and the same session 
 	const markerPath = path.join(value.root, "l1a-marker.json");
 	fs.writeFileSync(path.join(value.corpus, "l1a.txt"), "l1a\n");
 	const closure = request(value, "l1a-session", "l1a", "l1a.txt", "l1a committed once");
-	const daemon = Bun.spawn({
+	const daemon = managedProcesses.spawnDaemon({
 		cmd: [process.execPath, path.join(import.meta.dir, "..", "helpers", "gitlock-daemon.ts")],
 		env: {
 			...process.env,
@@ -250,16 +225,13 @@ test("L1a: daemon SIGKILL reaps the residual closure group and the same session 
 				stopAfter: "after_commit",
 			}),
 		},
-		stdout: "ignore",
 		stderr: "pipe",
 	});
-	daemonProcesses.push(daemon);
 	const marker = await eventually(() => {
 		if (!fs.existsSync(markerPath)) return undefined;
 		return JSON.parse(fs.readFileSync(markerPath, "utf8")) as { childPid: number; childPgid: number };
 	}, "daemon did not reach post-commit boundary");
-	daemon.kill("SIGKILL");
-	await daemon.exited;
+	await managedProcesses.crashDaemon(daemon);
 
 	const restarted = core(value);
 	await eventually(

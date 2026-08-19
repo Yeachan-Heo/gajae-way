@@ -1,10 +1,18 @@
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import { expect, test } from "bun:test";
+import { afterEach, expect, test } from "bun:test";
 import { loadWayCore, type RpcBridgeCallback, type WayCoreHandle } from "../../src/native-loader";
 import { createRpcBridge } from "../../src/rpc-bridge";
 import { RpcClient } from "../helpers/rpc-client";
+import { ManagedProcessRegistry } from "../helpers/managed-process";
+
+const managedProcesses = new ManagedProcessRegistry();
+
+afterEach(async () => {
+	await managedProcesses.reapAll();
+});
+
 
 function temporaryStateDirectory(name: string): string {
 	return fs.mkdtempSync(path.join(os.tmpdir(), `gajae-way-rpc-${name}-`));
@@ -36,19 +44,16 @@ function responseError(response: Awaited<ReturnType<RpcClient["request"]>>): {
 test("native RPC server serves health/status and rejects all caller-controlled git-lock holder identities", async () => {
 	const stateDirectory = temporaryStateDirectory("serve");
 	const socketPath = path.join(stateDirectory, "rpc.sock");
-	const child = Bun.spawn(
-		[
+	const child = managedProcesses.spawnDaemon({
+		cmd: [
 			"bun",
 			"-e",
 			`const { startWayServer } = await import("./src/main.ts"); const core = startWayServer(process.env.WAY_STATE_DIR); process.once("SIGTERM", () => { core.shutdownRpcServer(); process.exit(0); }); await new Promise(() => {});`,
 		],
-		{
-			cwd: process.cwd(),
-			env: { ...process.env, WAY_STATE_DIR: stateDirectory },
-			stderr: "pipe",
-			stdout: "ignore",
-		},
-	);
+		cwd: process.cwd(),
+		env: { ...process.env, WAY_STATE_DIR: stateDirectory },
+		stderr: "pipe",
+	});
 	let client: RpcClient | undefined;
 	try {
 		client = await connectEventually(socketPath);
@@ -77,8 +82,7 @@ test("native RPC server serves health/status and rejects all caller-controlled g
 		}
 	} finally {
 		client?.close();
-		child.kill("SIGTERM");
-		await child.exited;
+		await managedProcesses.stopDaemon(child);
 		fs.rmSync(stateDirectory, { force: true, recursive: true });
 	}
 });

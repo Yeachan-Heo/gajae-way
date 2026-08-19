@@ -1,10 +1,18 @@
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import { expect, test } from "bun:test";
+import { afterEach, expect, test } from "bun:test";
 import { GatewayStateStore } from "../../src/main-session/state";
 import { loadWayCore } from "../../src/native-loader";
 import { RpcClient } from "../../src/rpc-client";
+import { ManagedProcessRegistry } from "../helpers/managed-process";
+
+const managedProcesses = new ManagedProcessRegistry();
+
+afterEach(async () => {
+	await managedProcesses.reapAll();
+});
+
 
 function temporaryDirectory(name: string): string {
 	return fs.mkdtempSync(path.join(os.tmpdir(), `gajae-way-qa-${name}-`));
@@ -65,7 +73,7 @@ interface RunningDaemon {
 }
 
 async function startDaemon(stateDirectory: string, profilePath: string, lingerMs?: number): Promise<RunningDaemon> {
-	const child = Bun.spawn({
+	const child = managedProcesses.spawnDaemon({
 		cmd: [
 			"bun",
 			"src/main.ts",
@@ -78,14 +86,12 @@ async function startDaemon(stateDirectory: string, profilePath: string, lingerMs
 		],
 		cwd: process.cwd(),
 		env: daemonEnvironment(),
-		stdout: "ignore",
 		stderr: "pipe",
 	});
 	try {
 		return { child, client: await connectEventually(path.join(stateDirectory, "rpc.sock")) };
 	} catch (error) {
-		if (child.exitCode === null) child.kill("SIGKILL");
-		await child.exited;
+		await managedProcesses.stopDaemon(child);
 		throw error;
 	}
 }
@@ -93,10 +99,7 @@ async function startDaemon(stateDirectory: string, profilePath: string, lingerMs
 async function stopDaemon(daemon: RunningDaemon | undefined): Promise<void> {
 	if (!daemon) return;
 	daemon.client.close();
-	if (daemon.child.exitCode === null) daemon.child.kill("SIGTERM");
-	await Promise.race([daemon.child.exited, Bun.sleep(3_000)]);
-	if (daemon.child.exitCode === null) daemon.child.kill("SIGKILL");
-	await daemon.child.exited;
+	await managedProcesses.stopDaemon(daemon.child);
 }
 
 test("a tampered transcript prefix fails closed over the real UDS, lingers unhealthy, exits 78, and never advertises a resumed main", async () => {

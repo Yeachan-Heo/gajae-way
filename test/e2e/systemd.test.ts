@@ -7,6 +7,9 @@ import { startDiscordAdapter, type RunningDiscordAdapter } from "../../src/adapt
 import { loadWayProfile } from "../../src/profile";
 import { RpcClient } from "../../src/rpc-client";
 import { DiscordFixture } from "../fixtures/discord-fixture";
+import { ManagedProcessRegistry } from "../helpers/managed-process";
+
+const managedProcesses = new ManagedProcessRegistry();
 
 const repositoryRoot = path.resolve(import.meta.dir, "..", "..");
 const temporaryDirectories: string[] = [];
@@ -30,6 +33,7 @@ interface SupervisedServiceOptions {
 }
 
 afterEach(async () => {
+	await managedProcesses.reapAll();
 	for (const directory of temporaryDirectories.splice(0)) fs.rmSync(directory, { force: true, recursive: true });
 });
 
@@ -136,28 +140,20 @@ async function healthyClient(socketPath: string, description: string): Promise<R
 }
 
 async function startDaemon(executable: string, stateDirectory: string, profilePath: string, environment: NodeJS.ProcessEnv): Promise<RunningDaemon> {
-	const child = Bun.spawn({
+	const child = managedProcesses.spawnDaemon({
 		cmd: [executable, "serve", "--state-dir", stateDirectory, "--profile", profilePath],
 		cwd: repositoryRoot,
 		env: environment,
-		stdout: "ignore",
-		stderr: "ignore",
 	});
 	try {
 		const client = await healthyClient(path.join(stateDirectory, "rpc.sock"), "daemon did not become healthy");
 		return { child, client };
 	} catch (error) {
-		if (child.exitCode === null) child.kill("SIGKILL");
-		await child.exited;
+		await managedProcesses.stopDaemon(child);
 		throw error;
 	}
 }
 
-async function awaitChildExit(child: ReturnType<typeof Bun.spawn>, timeoutMs = 3_000): Promise<void> {
-	await Promise.race([child.exited, Bun.sleep(timeoutMs)]);
-	if (child.exitCode === null) child.kill("SIGKILL");
-	await child.exited;
-}
 
 async function stopAdapter(adapter: RunningDiscordAdapter | undefined): Promise<void> {
 	if (adapter) await adapter.stop();
@@ -166,8 +162,7 @@ async function stopAdapter(adapter: RunningDiscordAdapter | undefined): Promise<
 async function stopDaemon(daemon: RunningDaemon | undefined): Promise<void> {
 	if (!daemon) return;
 	daemon.client.close();
-	if (daemon.child.exitCode === null) daemon.child.kill("SIGTERM");
-	await awaitChildExit(daemon.child);
+	await managedProcesses.stopDaemon(daemon.child);
 }
 
 /**
@@ -197,7 +192,7 @@ class SupervisedService {
 
 	async crashDaemon(): Promise<void> {
 		const generation = this.#generation;
-		this.daemon.child.kill("SIGKILL");
+		await managedProcesses.crashDaemon(this.daemon.child);
 		await eventually(
 			() => {
 				if (this.#failure) throw this.#failure;

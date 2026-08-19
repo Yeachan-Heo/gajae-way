@@ -1,13 +1,21 @@
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import { expect, test } from "bun:test";
+import { afterEach, expect, test } from "bun:test";
 import { bootstrapMainSession } from "../../src/main-session/bootstrap";
 import { GatewayStateStore } from "../../src/main-session/state";
 import { loadWayProfile } from "../../src/profile";
 import { loadWayCore } from "../../src/native-loader";
 import { FileSdkDouble } from "../helpers/main-session";
 import { RpcClient } from "../helpers/rpc-client";
+import { ManagedProcessRegistry } from "../helpers/managed-process";
+
+const managedProcesses = new ManagedProcessRegistry();
+
+afterEach(async () => {
+	await managedProcesses.reapAll();
+});
+
 
 async function connectEventually(socketPath: string): Promise<RpcClient> {
 	for (let attempt = 0; attempt < 100; attempt += 1) {
@@ -48,8 +56,8 @@ async function waitForHealth(client: RpcClient, expected: "running" | "failed_cl
 }
 
 async function startDaemon(stateDirectory: string, profilePath: string, failClosedLingerMs?: number): Promise<RunningDaemon> {
-	const child = Bun.spawn(
-		[
+	const child = managedProcesses.spawnDaemon({
+		cmd: [
 			"bun",
 			"src/main.ts",
 			"serve",
@@ -59,13 +67,13 @@ async function startDaemon(stateDirectory: string, profilePath: string, failClos
 			profilePath,
 			...(failClosedLingerMs === undefined ? [] : ["--fail-closed-linger-ms", String(failClosedLingerMs)]),
 		],
-		{ cwd: process.cwd(), env: daemonEnvironment(), stdout: "ignore", stderr: "ignore" },
-	);
+		cwd: process.cwd(),
+		env: daemonEnvironment(),
+	});
 	try {
 		return { child, client: await connectEventually(path.join(stateDirectory, "rpc.sock")) };
 	} catch (error) {
-		if (child.exitCode === null) child.kill("SIGKILL");
-		await child.exited;
+		await managedProcesses.stopDaemon(child);
 		throw error;
 	}
 }
@@ -73,10 +81,7 @@ async function startDaemon(stateDirectory: string, profilePath: string, failClos
 async function stopDaemon(server: RunningDaemon | undefined): Promise<void> {
 	if (!server) return;
 	server.client.close();
-	if (server.child.exitCode === null) server.child.kill("SIGTERM");
-	await Promise.race([server.child.exited, Bun.sleep(3_000)]);
-	if (server.child.exitCode === null) server.child.kill("SIGKILL");
-	await server.child.exited;
+	await managedProcesses.stopDaemon(server.child);
 }
 
 function profileContents(corpus: string, workspace: string): string {

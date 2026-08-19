@@ -1,8 +1,16 @@
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import { expect, test } from "bun:test";
+import { afterEach, expect, test } from "bun:test";
 import { RpcClient } from "../helpers/rpc-client";
+import { ManagedProcessRegistry } from "../helpers/managed-process";
+
+const managedProcesses = new ManagedProcessRegistry();
+
+afterEach(async () => {
+	await managedProcesses.reapAll();
+});
+
 
 async function connectEventually(socketPath: string): Promise<RpcClient> {
 	for (let attempt = 0; attempt < 100; attempt += 1) {
@@ -41,10 +49,11 @@ platform = "test"
 kind = "dm"
 `,
 	);
-	const child = Bun.spawn(
-		["bun", "src/main.ts", "serve", "--state-dir", stateDirectory, "--profile", profile, "--fail-closed-linger-ms", "1000"],
-		{ cwd: process.cwd(), stdout: "ignore", stderr: "pipe" },
-	);
+	const child = managedProcesses.spawnDaemon({
+		cmd: ["bun", "src/main.ts", "serve", "--state-dir", stateDirectory, "--profile", profile, "--fail-closed-linger-ms", "1000"],
+		cwd: process.cwd(),
+		stderr: "pipe",
+	});
 	let client: RpcClient | undefined;
 	try {
 		client = await connectEventually(path.join(stateDirectory, "rpc.sock"));
@@ -65,8 +74,7 @@ kind = "dm"
 		});
 	} finally {
 		client?.close();
-		if (child.exitCode === null) child.kill("SIGTERM");
-		await child.exited;
+		await managedProcesses.stopDaemon(child);
 		fs.rmSync(root, { recursive: true, force: true });
 	}
 }, 10_000);
