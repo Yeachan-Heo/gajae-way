@@ -110,13 +110,31 @@ test.serial("bootstrap refuses a tail timeout without committing an unproven tra
 	const state = new GatewayStateStore(meta);
 	const profile = fixtureProfile(fixture);
 	const adoption = supervisor(fixture);
-	fixture.timeoutNextTails(1);
+	// Verification retries transient timeouts (bounded, 5 attempts); adoption is
+	// refused only when the tail stays incomplete for the whole budget.
+	fixture.timeoutNextTails(50);
 	try {
 		await expect(
 			bootstrapMainSession({ confirm: true, profile, state, supervisor: adoption, sessionId: fixture.sessionId }),
 		).rejects.toMatchObject({ reason: "transcript_proof_unavailable" } satisfies Partial<BootstrapError>);
 		expect(state.read()).toMatchObject({ bootstrapState: "CREATING", mainIdentity: undefined });
 		expect(meta.events).toEqual([]);
+	} finally {
+		await adoption.dispose();
+	}
+});
+
+test.serial("bootstrap survives a transient tail timeout during verification", async () => {
+	const fixture = new FakeBrokerFixture();
+	fixtures.push(fixture);
+	const meta = new MemoryGatewayMeta();
+	const state = new GatewayStateStore(meta);
+	const profile = fixtureProfile(fixture);
+	const adoption = supervisor(fixture);
+	fixture.timeoutNextTails(2);
+	try {
+		await bootstrapMainSession({ confirm: true, profile, state, supervisor: adoption, sessionId: fixture.sessionId });
+		expect(state.read()).toMatchObject({ bootstrapState: "COMMITTED" });
 	} finally {
 		await adoption.dispose();
 	}

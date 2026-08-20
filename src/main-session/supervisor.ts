@@ -203,7 +203,7 @@ export class ExternalHostSupervisor implements HostSupervisor {
 		return await this.#broker.turnStatus(this.requireIdentity().sessionId, opRef, { timeoutMs: this.#commandTimeoutMs });
 	}
 
-	async tailEvents(): Promise<SupervisorTailEvents> {
+	async tailEvents(options: { readonly timeoutMs?: number } = {}): Promise<SupervisorTailEvents> {
 		const identity = this.requireIdentity();
 		let tail: SdkTailEnvelopeV1;
 		try {
@@ -211,7 +211,7 @@ export class ExternalHostSupervisor implements HostSupervisor {
 				repo: identity.locator.repo,
 				untilIdle: true,
 				allEvents: true,
-				timeoutMs: this.#tailTimeoutMs,
+				timeoutMs: options.timeoutMs ?? this.#tailTimeoutMs,
 			});
 
 		} catch (error) {
@@ -289,9 +289,22 @@ export class ExternalHostSupervisor implements HostSupervisor {
 		}
 		const provisional = identityFromRow(row, expected?.transcript);
 		this.#identity = provisional;
-		const tail = await this.tailEvents();
-		if (!tail.complete) {
-			throw new HostSupervisorError("transcript_proof_unavailable", "Broker tail timed out before yielding a complete transcript proof.");
+		// Verification needs a COMPLETE envelope, which the CLI only emits once an
+		// exit condition (idle/terminal) is reached inside the wait window. A real
+		// session may be mid-turn at adoption (a fresh gjc boots for ~30s; an
+		// adopted worker may be busy), so verification waits patiently with a
+		// larger window and bounded retries instead of failing on the first
+		// normal tail timeout. The proof itself stays mandatory.
+		let tail: SupervisorTailEvents | undefined;
+		for (let attempt = 0; attempt < 5; attempt += 1) {
+			const candidate = await this.tailEvents({ timeoutMs: Math.max(this.#tailTimeoutMs, 30_000) });
+			if (candidate.complete) {
+				tail = candidate;
+				break;
+			}
+		}
+		if (!tail) {
+			throw new HostSupervisorError("transcript_proof_unavailable", "Broker tail did not yield a complete transcript proof while the session stayed busy.");
 		}
 		const discoveryCheckpoint = tail.checkpoint ?? tail.resyncCheckpoint;
 		if (!discoveryCheckpoint) {
