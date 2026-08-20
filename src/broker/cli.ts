@@ -344,19 +344,17 @@ function parseCheckpoint(value: unknown, path: string): SdkCheckpointRecordV1 {
  * authoritative; tolerate additive decorative fields around it.
  */
 export function parseSessionCheckpoint(stdout: string): SdkCheckpointRecordV1 {
+	// Real envelope (observed live): {type:"query_response", id, ok, result:{checkpoint:{revision,generation,seq}, revisionId, issuedAt, expiresAt}}.
+	// The signed token fields are redacted for credential-free callers; only the
+	// checkpoint record authority fields are read, decorations are tolerated.
 	const envelope = record(parseJson(stdout, "$"), "$");
 	if (envelope.ok !== true) throw new BrokerDtoParseError("$.ok", "must be true");
-	const page = record(envelope.page, "$.page");
-	if (page.complete !== true) throw new BrokerDtoParseError("$.page.complete", "must be true");
-	if (!Array.isArray(page.items) || page.items.length !== 1) {
-		throw new BrokerDtoParseError("$.page.items", "must contain exactly one checkpoint item");
-	}
-	const item = record(page.items[0], "$.page.items[0]");
-	const checkpoint = record(item.checkpoint, "$.page.items[0].checkpoint");
+	const result = record(envelope.result, "$.result");
+	const checkpoint = record(result.checkpoint, "$.result.checkpoint");
 	return {
-		revision: safeInteger(checkpoint.revision, "$.page.items[0].checkpoint.revision"),
-		generation: safeInteger(checkpoint.generation, "$.page.items[0].checkpoint.generation"),
-		seq: safeInteger(checkpoint.seq, "$.page.items[0].checkpoint.seq"),
+		revision: safeInteger(checkpoint.revision, "$.result.checkpoint.revision"),
+		generation: safeInteger(checkpoint.generation, "$.result.checkpoint.generation"),
+		seq: safeInteger(checkpoint.seq, "$.result.checkpoint.seq"),
 	};
 }
 

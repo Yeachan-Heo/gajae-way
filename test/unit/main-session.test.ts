@@ -232,20 +232,21 @@ test.serial("scripted broker CLI fixture covers inspect, send, status, tail, and
 });
 
 test.serial("session.checkpoint accepts decorative query fields but rejects malformed authority", () => {
+	// Real envelope observed live: {type:"query_response", id, ok, result:{checkpoint, revisionId, issuedAt, expiresAt}}.
 	const envelope = JSON.stringify({
 		type: "query_response",
 		id: "decorative-id",
 		trace: "ignored",
 		ok: true,
-		page: {
-			items: [{ checkpoint: { revision: 7, generation: 3, seq: 11, label: "ignored" }, revisionId: "decorative" }],
-			complete: true,
-			revision: "decorative",
-			nextCursor: "ignored",
+		result: {
+			checkpoint: { revision: 7, generation: 3, seq: 11, label: "ignored" },
+			revisionId: "decorative",
+			issuedAt: 1787246519373,
+			expiresAt: 1787247419373,
 		},
 	});
 	expect(parseSessionCheckpoint(envelope)).toEqual({ revision: 7, generation: 3, seq: 11 });
-	expect(() => parseSessionCheckpoint(JSON.stringify({ ok: true, page: { items: [{ checkpoint: { revision: 7, generation: 3, seq: "11" } }], complete: true } }))).toThrow(
+	expect(() => parseSessionCheckpoint(JSON.stringify({ ok: true, result: { checkpoint: { revision: 7, generation: 3, seq: "11" } } }))).toThrow(
 		BrokerDtoParseError,
 	);
 });
