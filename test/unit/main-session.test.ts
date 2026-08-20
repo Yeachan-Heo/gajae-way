@@ -377,3 +377,50 @@ test("journal append failure degrades the host without losing its growth refresh
 	expect(state.read().growthIntent).toBeUndefined();
 	await host.dispose();
 });
+
+test("host admission degrades visibly when an accepted operation later fails", async () => {
+	const { profilePath, state, sdk } = await committedFixture();
+	const resumed = await strictResumeMainSession({ profile: loadWayProfile(profilePath), state, sdk });
+	let markStarted!: () => void;
+	let release!: () => void;
+	const started = new Promise<void>(resolve => {
+		markStarted = resolve;
+	});
+	const released = new Promise<void>(resolve => {
+		release = resolve;
+	});
+	let reportedReason: string | undefined;
+	const host = createMainSessionHost({
+		session: {
+			...resumed.session,
+			prompt: async () => {
+				markStarted();
+				await released;
+				throw new Error("injected delayed SDK failure");
+			},
+		},
+		identity: resumed.identity,
+		state,
+		journal: {
+			journalAppend: () => undefined,
+			setRpcHealth: (_state, reason) => {
+				reportedReason = reason;
+			},
+		},
+	});
+	try {
+		host.admit("prompt", "accepted before SDK completion");
+		await started;
+		expect(host.degraded).toBe(false);
+		expect(state.read().growthIntent).toBeDefined();
+
+		release();
+		for (let attempt = 0; attempt < 100 && !host.degraded; attempt += 1) await Bun.sleep(10);
+		expect(host.degraded).toBe(true);
+		expect(reportedReason).toBe("turn_execution_failed");
+		expect(state.read().growthIntent).toBeUndefined();
+	} finally {
+		release();
+		await host.dispose();
+	}
+});

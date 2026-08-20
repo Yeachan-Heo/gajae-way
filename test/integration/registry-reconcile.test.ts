@@ -146,6 +146,30 @@ function metadataName(core: WayCoreHandle, sessionId: string): string | undefine
 	}
 }
 
+test("unchanged broker snapshots emit no journal events after discovery", async () => {
+	const fixture = createFixture("unchanged-snapshot", {
+		list: list([row("steady")]),
+		metadata: { steady: metadata("steady") },
+	});
+	const reconciler = new BrokerReconciler({ core: fixture.core, broker: fixture.broker, cycleSlaMs: 2_000 });
+
+	await reconciler.trigger();
+	const afterFirstCycle = fixture.core.journalRead("1:0", 100).nextCursor;
+	const firstRow = fixture.core.registryGet("steady");
+	const firstChanges = fixture.core
+		.journalRead("1:0", 100)
+		.events.filter(event => event.kind === "registry_change")
+		.map(event => JSON.parse(event.payloadJson) as { session_id: string; reason: string });
+	expect(firstChanges.filter(change => change.session_id === "steady" && change.reason === "discovered")).toHaveLength(1);
+
+	await reconciler.trigger();
+	await reconciler.trigger();
+	await reconciler.trigger();
+
+	expect(fixture.core.registryGet("steady").registryRev).toBe(firstRow.registryRev);
+	expect(fixture.core.journalRead(afterFirstCycle, 100).events).toEqual([]);
+});
+
 test("reconciliation reflects rename within the shortened poll SLA and preserves list-only authority changes", async () => {
 	const fixture = createFixture("rename-authority", {
 		list: list([row("rename")]),

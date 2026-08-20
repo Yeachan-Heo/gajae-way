@@ -33,6 +33,9 @@ export interface MainSessionHost {
 	readonly turnState: "idle" | "busy";
 	readonly followUpQueueDepth: number;
 	readonly gates: MainSessionGateRegistry;
+	/** Synchronously takes ownership of an admitted operation; completion is tracked in the host. */
+	admit(deliveredAs: "prompt" | "steer" | "follow_up", text: string): void;
+
 	prompt(text: string): Promise<void>;
 	steer(text: string): Promise<void>;
 	followUp(text: string): Promise<void>;
@@ -195,6 +198,7 @@ class HostedMainSession implements MainSessionHost {
 	#growthWindow: GrowthWindow | undefined;
 	readonly #finalizedAssistantMessageKeys = new Set<string>();
 	readonly #journaledAttemptTransitions = new Map<string, JournaledAttemptTransitions>();
+	readonly #inFlightOperations = new Set<Promise<void>>();
 
 	#disposed = false;
 
@@ -301,6 +305,19 @@ class HostedMainSession implements MainSessionHost {
 			if (!oldest) return;
 			this.#journaledAttemptTransitions.delete(oldest);
 		}
+	}
+
+	private trackAdmittedOperation(operation: Promise<void>): void {
+		this.#inFlightOperations.add(operation);
+		void operation.then(
+			() => {
+				this.#inFlightOperations.delete(operation);
+			},
+			error => {
+				this.#inFlightOperations.delete(operation);
+				this.enterFailure(error instanceof MainSessionHostError ? error.reason : "turn_execution_failed", error);
+			},
+		);
 	}
 
 	/**
@@ -489,6 +506,20 @@ class HostedMainSession implements MainSessionHost {
 		}
 		if (mutationError) throw mutationError;
 		this.assertUsable();
+	}
+
+	admit(deliveredAs: "prompt" | "steer" | "follow_up", text: string): void {
+		const operation =
+			deliveredAs === "prompt" ? this.prompt(text) : deliveredAs === "steer" ? this.steer(text) : this.followUp(text);
+		try {
+			this.refreshFollowUpQueueDepth();
+			this.publishStatus();
+			this.assertUsable();
+		} catch (error) {
+			void operation.catch(() => undefined);
+			throw error;
+		}
+		this.trackAdmittedOperation(operation);
 	}
 
 	async prompt(text: string): Promise<void> {

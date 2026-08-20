@@ -377,17 +377,26 @@ fn validate_snapshot(snapshot: &BrokerSnapshot) -> RegistryResult<()> {
     Ok(())
 }
 
-fn status_from_broker(previous: &str, row: &BrokerSessionRow) -> String {
+fn status_from_broker(previous: &RegistryRow, row: &BrokerSessionRow) -> String {
     if row.deleted {
         return "closed".to_owned();
+    }
+    if previous.status == "lost" {
+        return "discovered".to_owned();
+    }
+    // Discovery deliberately retains `discovered` even when the first broker
+    // row includes activity. Reapplying that exact row must not reinterpret it
+    // as a new status transition on every reconciliation cycle.
+    if previous.status == "discovered"
+        && previous.activity_state == row.activity_state
+        && previous.activity_at == row.activity_at
+    {
+        return previous.status.clone();
     }
     if let Some(activity_state) = &row.activity_state {
         return activity_state.clone();
     }
-    if previous == "lost" {
-        return "discovered".to_owned();
-    }
-    previous.to_owned()
+    previous.status.clone()
 }
 
 fn row_authority_changed(
@@ -562,7 +571,7 @@ pub fn apply_broker_snapshot(
                 result.drift_count += 1;
             }
             Some(previous) => {
-                let status = status_from_broker(&previous.status, broker_row);
+                let status = status_from_broker(&previous, broker_row);
                 let changed = row_authority_changed(&previous, &status, broker_row);
                 let closed_at = if matches!(status.as_str(), "closed" | "lost") {
                     previous.closed_at.or(Some(snapshot.observed_at))
@@ -1189,11 +1198,15 @@ pub fn resolve_surface(store: &Store, surface_id: &str) -> RegistryResult<Surfac
 #[cfg(test)]
 mod tests {
     use super::{
-        BrokerSessionRow, BrokerSnapshot, GatewaySession, RegistryError, RegistryListFilter,
-        SurfaceRecord, apply_broker_snapshot, bind_surface, configure_surfaces, get, list,
-        register_gateway_session,
+        BrokerSessionRow, BrokerSnapshot, GatewaySession, MetadataEnrichment, RegistryError,
+        RegistryListFilter, RegistryRow, SnapshotApplyResult, SurfaceRecord,
+        apply_broker_snapshot, apply_metadata, bind_surface, configure_surfaces, get, list,
+        mark_metadata_unavailable, register_gateway_session,
     };
+
     use crate::{events::EventJournal, store::Store};
+    use serde_json::Value;
+
 
     fn broker_row(session_id: &str) -> BrokerSessionRow {
         BrokerSessionRow {
@@ -1213,6 +1226,73 @@ mod tests {
         }
     }
 
+    fn registry_changes(store: &Store) -> Vec<Value> {
+        EventJournal::new(store.clone())
+            .read(None, 500)
+            .unwrap()
+            .events
+            .into_iter()
+            .filter(|event| event.kind == "registry_change")
+            .map(|event| serde_json::from_str(&event.payload_json).unwrap())
+            .collect()
+    }
+
+    fn assert_change(
+        change: &Value,
+        reason: &str,
+        previous_status: &str,
+        previous_quarantined: bool,
+        previous_rev: u64,
+        current_status: &str,
+        current_quarantined: bool,
+        current_rev: u64,
+    ) {
+        assert_eq!(change["reason"].as_str(), Some(reason));
+        assert_eq!(change["previous"]["status"].as_str(), Some(previous_status));
+        assert_eq!(
+            change["previous"]["quarantined"].as_bool(),
+            Some(previous_quarantined)
+        );
+        assert_eq!(change["previous"]["registry_rev"].as_u64(), Some(previous_rev));
+        assert_eq!(change["current"]["status"].as_str(), Some(current_status));
+        assert_eq!(
+            change["current"]["quarantined"].as_bool(),
+            Some(current_quarantined)
+        );
+        assert_eq!(change["current"]["registry_rev"].as_u64(), Some(current_rev));
+    }
+
+    fn assert_broker_authority(row: &RegistryRow, broker_row: &BrokerSessionRow) {
+        assert_eq!(row.locator.as_deref(), Some(broker_row.locator.as_str()));
+        assert_eq!(row.endpoint_generation, Some(broker_row.endpoint_generation));
+        assert_eq!(row.host_incarnation, broker_row.host_incarnation);
+        assert_eq!(row.identity_provenance, broker_row.identity_provenance);
+        assert_eq!(row.index_seq, Some(broker_row.index_seq));
+        assert_eq!(row.live, broker_row.live);
+        assert_eq!(row.deleted, broker_row.deleted);
+        assert_eq!(row.terminal_uncertain, broker_row.terminal_uncertain);
+        assert_eq!(row.ambiguous, broker_row.ambiguous);
+        assert_eq!(row.activity_state, broker_row.activity_state);
+        assert_eq!(row.activity_at, broker_row.activity_at);
+        assert_eq!(row.last_heartbeat_at, broker_row.last_heartbeat_at);
+    }
+
+    fn apply_snapshot(store: &Store, observed_at: i64, rows: Vec<BrokerSessionRow>) -> SnapshotApplyResult {
+        apply_broker_snapshot(store, BrokerSnapshot { observed_at, rows }).unwrap()
+    }
+
+    fn assert_snapshot_quiet(
+        store: &Store,
+        observed_at: i64,
+        rows: Vec<BrokerSessionRow>,
+        registry_rev: u64,
+        change_count: usize,
+    ) {
+        assert_eq!(apply_snapshot(store, observed_at, rows).drift_count, 0);
+        assert_eq!(get(store, "broker-1").unwrap().registry_rev, registry_rev);
+        assert_eq!(registry_changes(store).len(), change_count);
+    }
+
     #[test]
     fn snapshot_discovers_unknown_rows_and_diffs_authority_in_one_journalled_transaction() {
         let store = Store::default();
@@ -1229,14 +1309,26 @@ mod tests {
         assert_eq!(discovered.kind, "unknown");
         assert_eq!(discovered.status, "discovered");
         assert_eq!(discovered.source, "reconciler");
-        assert_eq!(
-            EventJournal::new(store.clone())
-                .read(None, 10)
-                .unwrap()
-                .events
-                .len(),
-            1
-        );
+        let changes = registry_changes(&store);
+        assert_eq!(changes.len(), 1);
+        assert_eq!(changes[0]["reason"].as_str(), Some("discovered"));
+        assert!(changes[0]["previous"].is_null());
+        assert_eq!(changes[0]["current"]["registry_rev"].as_u64(), Some(1));
+
+        let unchanged = apply_broker_snapshot(
+            &store,
+            BrokerSnapshot {
+                observed_at: 15,
+                rows: vec![broker_row("broker-1")],
+            },
+        )
+        .unwrap();
+        assert!(unchanged.new_session_ids.is_empty());
+        assert!(unchanged.changed_session_ids.is_empty());
+        assert!(unchanged.changed_index_seq_session_ids.is_empty());
+        assert_eq!(unchanged.drift_count, 0);
+        assert_eq!(get(&store, "broker-1").unwrap().registry_rev, 1);
+        assert_eq!(registry_changes(&store).len(), 1);
 
         let mut changed = broker_row("broker-1");
         changed.live = false;
@@ -1265,6 +1357,337 @@ mod tests {
                 .len(),
             2
         );
+    }
+
+    #[test]
+    fn each_authority_field_change_emits_once_with_persisted_previous() {
+        let cases: [(&str, fn(&mut BrokerSessionRow)); 12] = [
+            ("live", |row| row.live = false),
+            ("activity_state", |row| row.activity_state = Some("idle".to_owned())),
+            ("activity_at", |row| row.activity_at = Some(20)),
+            ("index_seq", |row| row.index_seq = 2),
+            ("endpoint_generation", |row| row.endpoint_generation = 2),
+            ("host_incarnation", |row| row.host_incarnation = Some("host:2".to_owned())),
+            ("deleted", |row| row.deleted = true),
+            ("terminal_uncertain", |row| row.terminal_uncertain = true),
+            ("ambiguous", |row| row.ambiguous = true),
+            ("last_heartbeat_at", |row| row.last_heartbeat_at = Some(20)),
+            (
+                "locator",
+                |row| row.locator = r#"{"repo":"/other","stateRoot":"/other/.gjc/state"}"#.to_owned(),
+            ),
+            (
+                "identity_provenance",
+                |row| row.identity_provenance = Some("legacy".to_owned()),
+            ),
+        ];
+
+        for (field, mutate) in cases {
+            let store = Store::default();
+            let original = broker_row("broker-1");
+            apply_broker_snapshot(
+                &store,
+                BrokerSnapshot {
+                    observed_at: 10,
+                    rows: vec![original.clone()],
+                },
+            )
+            .unwrap();
+
+            let mut changed = original;
+            mutate(&mut changed);
+            let applied = apply_broker_snapshot(
+                &store,
+                BrokerSnapshot {
+                    observed_at: 20,
+                    rows: vec![changed.clone()],
+                },
+            )
+            .unwrap();
+            assert!(applied.new_session_ids.is_empty(), "{field}");
+            assert_eq!(applied.changed_session_ids, ["broker-1"], "{field}");
+            if field == "index_seq" {
+                assert_eq!(applied.changed_index_seq_session_ids, ["broker-1"]);
+            } else {
+                assert!(applied.changed_index_seq_session_ids.is_empty(), "{field}");
+            }
+            assert_eq!(applied.drift_count, 1, "{field}");
+
+            let current = get(&store, "broker-1").unwrap();
+            assert_eq!(current.registry_rev, 2, "{field}");
+            assert_broker_authority(&current, &changed);
+            let changes = registry_changes(&store);
+            assert_eq!(changes.len(), 2, "{field}");
+            assert_change(
+                &changes[1],
+                "broker_snapshot",
+                "discovered",
+                false,
+                1,
+                &current.status,
+                current.quarantined,
+                2,
+            );
+
+            let unchanged = apply_broker_snapshot(
+                &store,
+                BrokerSnapshot {
+                    observed_at: 30,
+                    rows: vec![changed],
+                },
+            )
+            .unwrap();
+            assert!(unchanged.new_session_ids.is_empty(), "{field}");
+            assert!(unchanged.changed_session_ids.is_empty(), "{field}");
+            assert!(unchanged.changed_index_seq_session_ids.is_empty(), "{field}");
+            assert_eq!(unchanged.drift_count, 0, "{field}");
+            assert_eq!(get(&store, "broker-1").unwrap().registry_rev, 2, "{field}");
+            assert_eq!(registry_changes(&store).len(), 2, "{field}");
+        }
+    }
+
+    #[test]
+    fn metadata_changes_emit_once_with_persisted_previous() {
+        let store = Store::default();
+        apply_broker_snapshot(
+            &store,
+            BrokerSnapshot {
+                observed_at: 10,
+                rows: vec![broker_row("broker-1")],
+            },
+        )
+        .unwrap();
+
+        let metadata = MetadataEnrichment {
+            session_id: "broker-1".to_owned(),
+            name: "before rename".to_owned(),
+            cwd: "/repo".to_owned(),
+            kind: "main".to_owned(),
+            observed_at: 20,
+        };
+        let enriched = apply_metadata(&store, metadata.clone()).unwrap();
+        assert_eq!(enriched.metadata_state, "enriched");
+        assert_eq!(enriched.registry_rev, 2);
+        let changes = registry_changes(&store);
+        assert_eq!(changes.len(), 2);
+        assert_change(
+            &changes[1],
+            "metadata_enriched",
+            "discovered",
+            false,
+            1,
+            "discovered",
+            false,
+            2,
+        );
+
+        let repeated = apply_metadata(
+            &store,
+            MetadataEnrichment {
+                observed_at: 30,
+                ..metadata.clone()
+            },
+        )
+        .unwrap();
+        assert_eq!(repeated.registry_rev, 2);
+        assert_eq!(registry_changes(&store).len(), 2);
+
+        let renamed = MetadataEnrichment {
+            name: "after rename".to_owned(),
+            observed_at: 40,
+            ..metadata
+        };
+        let renamed_row = apply_metadata(&store, renamed.clone()).unwrap();
+        assert_eq!(renamed_row.registry_rev, 3);
+        let changes = registry_changes(&store);
+        assert_eq!(changes.len(), 3);
+        assert_change(
+            &changes[2],
+            "metadata_enriched",
+            "discovered",
+            false,
+            2,
+            "discovered",
+            false,
+            3,
+        );
+
+        let unavailable = mark_metadata_unavailable(&store, "broker-1", 50).unwrap();
+        assert_eq!(unavailable.metadata_state, "unavailable");
+        assert_eq!(unavailable.registry_rev, 4);
+        let changes = registry_changes(&store);
+        assert_eq!(changes.len(), 4);
+        assert_change(
+            &changes[3],
+            "metadata_unavailable",
+            "discovered",
+            false,
+            3,
+            "discovered",
+            false,
+            4,
+        );
+
+        let repeatedly_unavailable = mark_metadata_unavailable(&store, "broker-1", 60).unwrap();
+        assert_eq!(repeatedly_unavailable.registry_rev, 4);
+        assert_eq!(registry_changes(&store).len(), 4);
+
+        let recovered = apply_metadata(
+            &store,
+            MetadataEnrichment {
+                observed_at: 70,
+                ..renamed.clone()
+            },
+        )
+        .unwrap();
+        assert_eq!(recovered.metadata_state, "enriched");
+        assert_eq!(recovered.registry_rev, 5);
+        let changes = registry_changes(&store);
+        assert_eq!(changes.len(), 5);
+        assert_change(
+            &changes[4],
+            "metadata_enriched",
+            "discovered",
+            false,
+            4,
+            "discovered",
+            false,
+            5,
+        );
+
+        let repeatedly_recovered = apply_metadata(
+            &store,
+            MetadataEnrichment {
+                observed_at: 80,
+                ..renamed
+            },
+        )
+        .unwrap();
+        assert_eq!(repeatedly_recovered.registry_rev, 5);
+        assert_eq!(registry_changes(&store).len(), 5);
+    }
+
+    #[test]
+    fn status_transitions_emit_once_and_advance_the_registry_revision() {
+        let store = Store::default();
+        let mut row = broker_row("broker-1");
+        row.activity_state = None;
+        row.activity_at = None;
+
+        apply_snapshot(&store, 10, vec![row.clone()]);
+        assert_eq!(get(&store, "broker-1").unwrap().status, "discovered");
+        assert_snapshot_quiet(&store, 15, vec![row.clone()], 1, 1);
+
+        row.activity_state = Some("active".to_owned());
+        row.activity_at = Some(20);
+        apply_snapshot(&store, 20, vec![row.clone()]);
+        let active = get(&store, "broker-1").unwrap();
+        assert_eq!((active.status.as_str(), active.registry_rev), ("active", 2));
+        let changes = registry_changes(&store);
+        assert_change(changes.last().unwrap(), "broker_snapshot", "discovered", false, 1, "active", false, 2);
+        assert_snapshot_quiet(&store, 25, vec![row.clone()], 2, 2);
+
+        row.activity_state = Some("idle".to_owned());
+        row.activity_at = Some(30);
+        apply_snapshot(&store, 30, vec![row.clone()]);
+        let idle = get(&store, "broker-1").unwrap();
+        assert_eq!((idle.status.as_str(), idle.registry_rev), ("idle", 3));
+        let changes = registry_changes(&store);
+        assert_change(changes.last().unwrap(), "broker_snapshot", "active", false, 2, "idle", false, 3);
+        assert_snapshot_quiet(&store, 35, vec![row.clone()], 3, 3);
+
+        apply_snapshot(&store, 40, Vec::new());
+        let lost = get(&store, "broker-1").unwrap();
+        assert_eq!((lost.status.as_str(), lost.registry_rev), ("lost", 4));
+        let changes = registry_changes(&store);
+        assert_change(changes.last().unwrap(), "absent_from_broker", "idle", false, 3, "lost", false, 4);
+        assert_snapshot_quiet(&store, 45, Vec::new(), 4, 4);
+
+        apply_snapshot(&store, 50, vec![row.clone()]);
+        let rediscovered = get(&store, "broker-1").unwrap();
+        assert_eq!((rediscovered.status.as_str(), rediscovered.registry_rev), ("discovered", 5));
+        let changes = registry_changes(&store);
+        assert_change(changes.last().unwrap(), "broker_snapshot", "lost", false, 4, "discovered", false, 5);
+        assert_snapshot_quiet(&store, 55, vec![row.clone()], 5, 5);
+
+        register_gateway_session(
+            &store,
+            GatewaySession {
+                session_id: "broker-1".to_owned(),
+                kind: "conversation".to_owned(),
+                purpose: None,
+                brief: None,
+                status: "closing".to_owned(),
+                surface_id: None,
+                observed_at: 60,
+            },
+        )
+        .unwrap();
+        let closing = get(&store, "broker-1").unwrap();
+        assert_eq!((closing.status.as_str(), closing.registry_rev), ("closing", 6));
+        let changes = registry_changes(&store);
+        assert_change(changes.last().unwrap(), "gateway_registered", "discovered", false, 5, "closing", false, 6);
+
+        row.deleted = true;
+        row.index_seq = 2;
+        apply_snapshot(&store, 70, vec![row.clone()]);
+        let closed = get(&store, "broker-1").unwrap();
+        assert_eq!((closed.status.as_str(), closed.registry_rev), ("closed", 7));
+        let changes = registry_changes(&store);
+        assert_change(changes.last().unwrap(), "broker_snapshot", "closing", false, 6, "closed", false, 7);
+        assert_snapshot_quiet(&store, 75, vec![row], 7, 7);
+    }
+
+    #[test]
+    fn quarantine_transitions_emit_once_with_persisted_previous() {
+        let store = Store::default();
+        configure_surfaces(
+            &store,
+            &[SurfaceRecord {
+                surface_id: "surface-1".to_owned(),
+                platform: "test".to_owned(),
+                kind: "dm".to_owned(),
+                is_owner_surface: true,
+            }],
+            1,
+        )
+        .unwrap();
+        let mut row = broker_row("broker-1");
+        apply_snapshot(&store, 10, vec![row.clone()]);
+        bind_surface(&store, "surface-1", "broker-1", 15).unwrap();
+
+        for (observed_at, terminal_uncertain, ambiguous, status, previous_quarantined, quarantined, revision) in [
+            (20, true, false, "discovered", false, true, 3),
+            (30, false, false, "discovered", true, false, 4),
+            (40, false, true, "discovered", false, true, 5),
+            (50, false, false, "discovered", true, false, 6),
+        ] {
+            row.terminal_uncertain = terminal_uncertain;
+            row.ambiguous = ambiguous;
+            apply_snapshot(&store, observed_at, vec![row.clone()]);
+            let current = get(&store, "broker-1").unwrap();
+            assert_eq!((current.status.as_str(), current.quarantined, current.registry_rev), (status, quarantined, revision));
+            let changes = registry_changes(&store);
+            assert_change(
+                changes.last().unwrap(),
+                "broker_snapshot",
+                "discovered",
+                previous_quarantined,
+                revision - 1,
+                status,
+                quarantined,
+                revision,
+            );
+        }
+
+        row.deleted = true;
+        row.index_seq = 2;
+        apply_snapshot(&store, 60, vec![row.clone()]);
+        let deleted = get(&store, "broker-1").unwrap();
+        assert_eq!((deleted.status.as_str(), deleted.quarantined, deleted.registry_rev), ("closed", true, 7));
+        let changes = registry_changes(&store);
+        assert_change(changes.last().unwrap(), "broker_snapshot", "discovered", false, 6, "closed", true, 7);
+        assert_snapshot_quiet(&store, 70, vec![row], 7, 7);
     }
 
     #[test]

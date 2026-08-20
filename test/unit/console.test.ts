@@ -9,6 +9,8 @@ import {
 	renderConsoleStatusSummary,
 	sanitizeConsoleText,
 } from "../../src/console/console";
+import { ConsoleInputEditor } from "../../src/console/tui/editor";
+import { ConsoleTuiRenderer } from "../../src/console/tui/renderer";
 
 class RawInputHarness {
 	readonly isTTY = true;
@@ -68,6 +70,9 @@ class RawInputHarness {
 class RawOutputHarness {
 	readonly isTTY = true;
 	readonly writes: string[] = [];
+	columns = 80;
+	rows = 24;
+	readonly #resizeListeners = new Set<() => void>();
 	onWrite: ((text: string) => void) | undefined;
 
 	write(text: string, callback: (error?: Error | null) => void): boolean {
@@ -78,6 +83,19 @@ class RawOutputHarness {
 	}
 
 	once(_event: "drain", _listener: () => void): void {}
+	on(_event: "resize", listener: () => void): void {
+		this.#resizeListeners.add(listener);
+	}
+
+	off(_event: "resize", listener: () => void): void {
+		this.#resizeListeners.delete(listener);
+	}
+
+	resize(columns: number, rows: number): void {
+		this.columns = columns;
+		this.rows = rows;
+		for (const listener of [...this.#resizeListeners]) listener();
+	}
 }
 
 class BackpressuredRawOutputHarness {
@@ -132,30 +150,15 @@ async function eventually(read: () => boolean, description: string, timeoutMs = 
 	throw new Error(description);
 }
 
-function rawScreen(writes: readonly string[]): string {
-	const lines: string[] = [];
-	let current = "";
-	for (const write of writes) {
-		for (let index = 0; index < write.length; index += 1) {
-			const character = write[index] as string;
-			if (character === "\r") {
-				current = "";
-				continue;
-			}
-			if (character === "\x1b" && write.slice(index, index + 4) === "\x1b[2K") {
-				current = "";
-				index += 3;
-				continue;
-			}
-			if (character === "\n") {
-				lines.push(current);
-				current = "";
-				continue;
-			}
-			current += character;
-		}
-	}
-	return [...lines, current].join("\n");
+function visibleTerminalText(text: string): string {
+	return text
+		.replace(/\x1b\][\s\S]*?(?:\x07|\x1b\\)/gu, "")
+		.replace(/\x1b\[[0-?]*[ -/]*[@-~]/gu, "")
+		.replace(/\x1b[()][A-Za-z0-9]?/gu, "");
+}
+
+function latestTuiFrame(writes: readonly string[]): string {
+	return visibleTerminalText(writes.at(-1) ?? "");
 }
 
 const healthyHealth = {
@@ -281,11 +284,13 @@ test("raw terminal publishes one production frame before an injected concurrent 
 		await terminal.writeTrusted("Assistant:\nassistant frame must remain whole\n");
 		await Bun.sleep(0);
 		const frameWrites = output.writes.filter((write) => write.includes("assistant frame must remain whole"));
-		expect(frameWrites).toEqual(["\r\x1b[2KAssistant:\nassistant frame must remain whole\ngajaeway> "]);
-		expect(output.writes.indexOf("x")).toBeGreaterThan(output.writes.indexOf(frameWrites[0] as string));
-		const screen = rawScreen(output.writes);
+		expect(frameWrites).not.toHaveLength(0);
+		const firstPublishedFrame = visibleTerminalText(frameWrites[0] as string);
+		expect(firstPublishedFrame).toContain("Assistant:\nassistant frame must remain whole");
+		expect(firstPublishedFrame).toContain("gajaeway> ");
+		const screen = latestTuiFrame(output.writes);
 		expect(screen).toContain("Assistant:\nassistant frame must remain whole");
-		expect(screen.endsWith("gajaeway> x")).toBe(true);
+		expect(screen).toContain("gajaeway> x");
 	} finally {
 		terminal.close();
 		await pendingLine;
@@ -403,7 +408,7 @@ test("raw terminal retains one refusal through transient backpressure without ec
 			() => terminal.pendingRefusalPublicationCount === 0 && !terminal.rawPublicationPending,
 			"retained refusal did not publish after output recovery",
 		);
-		expect(output.writes.filter((write) => write.includes("Input queue is full"))).toHaveLength(1);
+		expect(output.writes.some((write) => write.includes("Input queue is full"))).toBe(true);
 		expect(output.writes.join("")).not.toContain(refusedPrefix);
 
 		const delivered: string[] = [];
@@ -432,7 +437,7 @@ test("raw terminal publishes a same-chunk oversized-line refusal and keeps the p
 			() => output.writes.join("").includes(`Input line exceeds ${MAX_RAW_CONSOLE_LINE_BYTES} bytes and was refused.`),
 			"same-chunk oversized input did not render a refusal",
 		);
-		expect(output.writes.filter((write) => write.includes("Input line exceeds"))).toHaveLength(1);
+		expect(output.writes.some((write) => write.includes("Input line exceeds"))).toBe(true);
 		expect(output.writes.join("")).not.toContain(oversized.slice(0, 64));
 		expect(terminal.queuedLineCount).toBe(0);
 		expect(terminal.queuedInputBytes).toBe(0);
@@ -457,13 +462,13 @@ test("raw terminal retains a same-chunk oversized-line refusal through transient
 	const usableLine = "normal line after recovered output";
 	const pendingLine = terminal.readLine("gajaeway> ");
 	try {
-		await eventually(() => output.writes.includes("gajaeway> "), "raw terminal did not render its prompt");
+		await eventually(() => latestTuiFrame(output.writes).includes("gajaeway> "), "raw terminal did not render its prompt");
 		output.stall();
 		input.send(`${oversized}\n`);
 		await eventually(() => output.pendingWriteCount === 1, "oversized refusal did not begin its stalled publication");
 		await Bun.sleep(300);
 		expect(terminal.pendingRefusalPublicationCount).toBe(1);
-		expect(terminal.pendingEchoRedrawCount).toBe(0);
+		expect(terminal.pendingEchoRedrawCount).toBe(1);
 		expect(terminal.rawPublicationPending).toBe(true);
 		expect(terminal.queuedLineCount).toBe(0);
 		expect(terminal.queuedInputBytes).toBe(0);
@@ -474,7 +479,7 @@ test("raw terminal retains a same-chunk oversized-line refusal through transient
 			() => terminal.pendingRefusalPublicationCount === 0 && !terminal.rawPublicationPending,
 			"retained oversized refusal did not publish after output recovery",
 		);
-		expect(output.writes.filter((write) => write.includes("Input line exceeds"))).toHaveLength(1);
+		expect(output.writes.some((write) => write.includes("Input line exceeds"))).toBe(true);
 		expect(output.writes.join("")).not.toContain(oversized.slice(0, 64));
 
 		input.send(`${usableLine}\n`);
@@ -516,8 +521,8 @@ test("raw terminal coalesces mixed refusal causes through transient output backp
 			"combined refusal did not publish after output recovery",
 		);
 		const refusalFrames = output.writes.filter((write) => write.includes("Input refused:"));
-		expect(refusalFrames).toHaveLength(1);
-		const refusal = refusalFrames[0] as string;
+		expect(refusalFrames.length).toBeGreaterThan(0);
+		const refusal = visibleTerminalText(refusalFrames.at(-1) as string);
 		expect(refusal).toContain("oversized-line=1");
 		expect(refusal).toContain("queue-full-lines=1");
 		expect(refusal).not.toContain("queue-full-bytes=");
@@ -553,8 +558,8 @@ test("raw terminal reports byte-capacity refusals with a distinct bounded cause"
 			"byte-capacity refusal did not render",
 		);
 		const refusalFrames = output.writes.filter((write) => write.includes("Input refused:"));
-		expect(refusalFrames).toHaveLength(1);
-		const refusal = refusalFrames[0] as string;
+		expect(refusalFrames.length).toBeGreaterThan(0);
+		const refusal = visibleTerminalText(refusalFrames.at(-1) as string);
 		expect(refusal).toContain("queue-full-bytes=1");
 		expect(refusal).not.toContain("queue-full-lines=");
 		expect(refusal).not.toContain("oversized-line=");
@@ -602,6 +607,128 @@ test("raw terminal retains Ctrl-D as an exit request while no line read is pendi
 		expect(exits).toBe(1);
 		expect(terminal.inputPaused).toBe(true);
 		expect(await terminal.readLine("gajaeway> ")).toBeUndefined();
+	} finally {
+		terminal.close();
+	}
+});
+
+test("renderer appends transcript frames without corrupting its dedicated input line", () => {
+	const renderer = new ConsoleTuiRenderer();
+	const editor = new ConsoleInputEditor();
+	renderer.resize(80, 12);
+	renderer.setStatusSummary(renderConsoleStatusSummary(healthyHealth, healthyStatus, 15_000));
+	renderer.setDeliveryState("ready");
+	editor.insert("draft while streaming");
+	renderer.appendFrame("Assistant:\nfirst streamed frame\n");
+	const firstFrame = visibleTerminalText(renderer.render(editor, "gajaeway> "));
+	expect(firstFrame).toContain("Assistant:\nfirst streamed frame");
+	expect(firstFrame).toContain("gajaeway> draft while streaming");
+	expect(firstFrame).toContain("turn_state=busy");
+	expect(firstFrame).toContain("head_cursor=7:42");
+	expect(firstFrame).toContain("quarantined=true write_mode=false");
+	expect(firstFrame).toContain("freshness=fresh");
+	expect(firstFrame).toContain("delivery=ready consumer=streaming");
+	renderer.appendFrame("Gate opened: gate_id=gate-1 expected_session_id=session-1.\n");
+	const secondFrame = visibleTerminalText(renderer.render(editor, "gajaeway> "));
+	expect(secondFrame).toContain("first streamed frame");
+	expect(secondFrame).toContain("gate_id=gate-1");
+	expect(secondFrame).toContain("gajaeway> draft while streaming");
+});
+
+test("renderer bounds an oversized transcript frame before redrawing it", () => {
+	const renderer = new ConsoleTuiRenderer();
+	const editor = new ConsoleInputEditor();
+	renderer.resize(100, 12);
+	renderer.appendFrame("q".repeat(160 * 1024));
+	const screen = visibleTerminalText(renderer.render(editor, "gajaeway> "));
+	expect(screen).toContain("[Console transcript frame truncated at 131072 bytes.]");
+	expect(renderer.transcriptFrameCount).toBe(1);
+});
+
+test("renderer reflows transcript state after resize without losing the editor", () => {
+	const renderer = new ConsoleTuiRenderer();
+	const editor = new ConsoleInputEditor();
+	const longFrame = "x".repeat(70);
+	editor.insert("resize draft");
+	renderer.appendFrame(`Assistant:\n${longFrame}\n`);
+	renderer.resize(24, 10);
+	const narrow = visibleTerminalText(renderer.render(editor, "gajaeway> "));
+	expect(narrow).not.toContain(longFrame);
+	expect(narrow).toContain("gajaeway> resize draft");
+	renderer.resize(100, 10);
+	const wide = visibleTerminalText(renderer.render(editor, "gajaeway> "));
+	expect(wide).toContain(longFrame);
+	expect(wide).toContain("gajaeway> resize draft");
+});
+
+test("editor supports cursor movement, word operations, and history", () => {
+	const editor = new ConsoleInputEditor();
+	editor.setValue("alpha beta");
+	editor.moveWordLeft();
+	expect(editor.cursor).toBe(6);
+	editor.deleteWordForward();
+	expect(editor.value).toBe("alpha ");
+	editor.insert("gamma");
+	expect(editor.value).toBe("alpha gamma");
+	editor.moveLeft();
+	editor.deleteForward();
+	expect(editor.value).toBe("alpha gamm");
+	editor.takeSubmission();
+	editor.insert("second request");
+	editor.takeSubmission();
+	editor.insert("draft");
+	expect(editor.historyPrevious()).toBe(true);
+	expect(editor.value).toBe("second request");
+	expect(editor.historyPrevious()).toBe(true);
+	expect(editor.value).toBe("alpha gamm");
+	expect(editor.historyNext()).toBe(true);
+	expect(editor.value).toBe("second request");
+	expect(editor.historyNext()).toBe(true);
+	expect(editor.value).toBe("draft");
+	editor.setValue("a👩‍💻b");
+	editor.moveEnd();
+	editor.moveLeft();
+	expect(editor.cursor).toBe("a👩‍💻".length);
+	editor.backspace();
+	expect(editor.value).toBe("ab");
+});
+
+test("raw terminal enters and exits the alternate screen on shutdown and output failure", async () => {
+	const input = new RawInputHarness();
+	const output = new RawOutputHarness();
+	const terminal = new RawConsoleTerminal({ input, output });
+	try {
+		await terminal.writeTrusted("ready\n");
+		expect(output.writes.join("")).toContain("\x1b[?1049h");
+		expect(output.writes.join("")).toContain("\x1b[?2004h");
+		expect(terminal.alternateScreenActive).toBe(true);
+		output.onWrite = () => {
+			throw new Error("simulated terminal failure");
+		};
+		await expect(terminal.writeTrusted("abnormal frame\n")).rejects.toThrow("simulated terminal failure");
+		expect(output.writes.join("")).toContain("\x1b[?1049l");
+		expect(output.writes.join("")).toContain("\x1b[?2026l\x1b[?25h\x1b[?2004l\x1b[?1049l");
+		expect(terminal.alternateScreenActive).toBe(false);
+		expect(input.isRaw).toBe(false);
+	} finally {
+		terminal.close();
+	}
+});
+
+test("raw terminal reflows the full-screen frame after a terminal resize", async () => {
+	const input = new RawInputHarness();
+	const output = new RawOutputHarness();
+	const terminal = new RawConsoleTerminal({ input, output });
+	const longAssistantLine = "z".repeat(70);
+	try {
+		await terminal.writeTrusted(`Assistant:\n${longAssistantLine}\n`);
+		const writesBeforeResize = output.writes.length;
+		output.resize(24, 12);
+		await eventually(() => output.writes.length > writesBeforeResize, "terminal did not redraw after resize");
+		const screen = latestTuiFrame(output.writes);
+		expect(screen).not.toContain(longAssistantLine);
+		expect(screen.replace(/\n/gu, "")).toContain(longAssistantLine);
+		expect(screen).toContain("gajaeway> ");
 	} finally {
 		terminal.close();
 	}

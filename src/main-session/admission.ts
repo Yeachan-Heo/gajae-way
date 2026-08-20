@@ -14,6 +14,8 @@ export interface AdmissionRequest {
 
 export interface MainAdmissionTarget {
 	readonly turnState: "idle" | "busy";
+	/** Synchronously transfers an SDK operation into host-owned tracking. */
+	admit?(deliveredAs: DeliveredAs, text: string): void;
 	prompt(text: string): Promise<void>;
 	steer(text: string): Promise<void>;
 	followUp(text: string): Promise<void>;
@@ -69,6 +71,11 @@ function replayResponse(responseJson: string | undefined): { accepted: boolean; 
 	return response as { accepted: boolean; op_ref: string; delivered_as: DeliveredAs };
 }
 
+function dispatchAdmittedOperation(target: MainAdmissionTarget, deliveredAs: DeliveredAs, text: string): void {
+	if (typeof target.admit !== "function") throw new Error("Main admission target cannot accept operations.");
+	target.admit(deliveredAs, text);
+}
+
 /**
  * Server-authoritative admission. A caller submits only text and a surface;
  * delivery is always derived from the bound profile and current main turn.
@@ -106,10 +113,8 @@ export function createMainAdmissionHandler(
 				? "prompt"
 				: "steer"
 			: "follow_up";
-		if (deliveredAs === "prompt") await target.prompt(request.text);
-		else if (deliveredAs === "steer") await target.steer(request.text);
-		else await target.followUp(request.text);
 		const response = { accepted: true, op_ref: newOpRef(), delivered_as: deliveredAs } as const;
+		dispatchAdmittedOperation(target, deliveredAs, request.text);
 		try {
 			idempotency.idempotencyStore({
 				scope: "main.submit",

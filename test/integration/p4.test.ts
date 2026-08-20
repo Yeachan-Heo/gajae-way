@@ -6,6 +6,7 @@ import { afterEach, expect, test } from "bun:test";
 import { createMainAdmissionHandler } from "../../src/main-session/admission";
 import { createMainGateAnswerHandler } from "../../src/main-session/gates";
 import { createMainSessionHost, type MainSessionHost } from "../../src/main-session/host";
+import type { CreateSdkSessionInput, HostedSdkSession, MainSessionSdk, ResumeSdkSessionInput } from "../../src/main-session/sdk";
 import { strictResumeMainSession } from "../../src/main-session/resume";
 import { GatewayStateStore } from "../../src/main-session/state";
 import { loadWayProfile } from "../../src/profile";
@@ -41,6 +42,16 @@ async function connectEventually(socketPath: string): Promise<RpcClient> {
 	throw new Error(`RPC socket did not become available: ${socketPath}`);
 }
 
+async function eventually<T>(read: () => T | undefined, message: string): Promise<T> {
+	const deadline = Date.now() + 1_000;
+	for (;;) {
+		const result = read();
+		if (result !== undefined) return result;
+		if (Date.now() >= deadline) throw new Error(message);
+		await Bun.sleep(10);
+	}
+}
+
 function error(response: Awaited<ReturnType<RpcClient["request"]>>): { code: number; message: string } {
 	if (!response.error) throw new Error(`Expected an RPC error, got ${JSON.stringify(response)}`);
 	return response.error;
@@ -66,20 +77,91 @@ kind = "channel"
 `;
 }
 
-interface HostedServer {
+interface ControlledPromptSdkOptions {
+	readonly failure?: Error;
+}
+
+class ControlledPromptSdk implements MainSessionSdk {
+	readonly #delegate = new FileSdkDouble();
+	readonly #started: Promise<void>;
+	readonly #released: Promise<void>;
+	readonly #failure: Error | undefined;
+	#markStarted!: () => void;
+	#release!: () => void;
+	#promptCalls = 0;
+
+	constructor(options: ControlledPromptSdkOptions = {}) {
+		this.#failure = options.failure;
+		this.#started = new Promise(resolve => {
+			this.#markStarted = resolve;
+		});
+		this.#released = new Promise(resolve => {
+			this.#release = resolve;
+		});
+	}
+
+	get promptCalls(): number {
+		return this.#promptCalls;
+	}
+
+	async waitForPromptStart(): Promise<void> {
+		await this.#started;
+	}
+
+	release(): void {
+		this.#release();
+	}
+
+	async createNew(input: CreateSdkSessionInput): Promise<HostedSdkSession> {
+		return await this.#delegate.createNew(input);
+	}
+
+	async findBootstrapNonceCandidates(workspace: string, nonce: string): Promise<readonly string[]> {
+		return await this.#delegate.findBootstrapNonceCandidates(workspace, nonce);
+	}
+
+	async openExistingStrict(input: ResumeSdkSessionInput): Promise<HostedSdkSession> {
+		const session = await this.#delegate.openExistingStrict(input);
+		return {
+			sessionFile: session.sessionFile,
+			sessionId: session.sessionId,
+			subscribe: listener => session.subscribe(listener),
+			subscribeGates: listener => session.subscribeGates(listener),
+			prompt: async text => {
+				this.#promptCalls += 1;
+				this.#markStarted();
+				await this.#released;
+				if (this.#failure) throw this.#failure;
+				await session.prompt(text);
+			},
+			steer: text => session.steer(text),
+			followUp: text => session.followUp(text),
+			followUpQueueDepth: () => session.followUpQueueDepth(),
+			answerGate: (gateId, answer, idempotencyKey) => session.answerGate(gateId, answer, idempotencyKey),
+			sendBootstrapMessage: nonce => session.sendBootstrapMessage(nonce),
+			dispose: () => session.dispose(),
+		};
+	}
+}
+
+interface HostedServer<Sdk extends MainSessionSdk = FileSdkDouble> {
 	readonly root: string;
 	readonly stateDirectory: string;
 	readonly core: WayCoreHandle;
 	readonly profile: ReturnType<typeof loadWayProfile>;
 	readonly state: GatewayStateStore;
 	readonly host: MainSessionHost;
-	readonly sdk: FileSdkDouble;
+	readonly sdk: Sdk;
 	readonly sessionFile: string;
 	readonly client: RpcClient;
 	stop(): Promise<void>;
 }
 
-async function hostedServer(): Promise<HostedServer> {
+async function hostedServer(): Promise<HostedServer<FileSdkDouble>> {
+	return await hostedServerWithSdk(new FileSdkDouble());
+}
+
+async function hostedServerWithSdk<Sdk extends MainSessionSdk>(sdk: Sdk): Promise<HostedServer<Sdk>> {
 	const root = temporaryDirectory("host");
 	const stateDirectory = path.join(root, "state");
 	const corpus = path.join(root, "corpus");
@@ -91,7 +173,6 @@ async function hostedServer(): Promise<HostedServer> {
 	const profile = loadWayProfile(profilePath);
 	const core = loadWayCore().WayCore.open(stateDirectory);
 	const state = new GatewayStateStore(core);
-	const sdk = new FileSdkDouble();
 	await bootstrapMainSession({ confirm: true, profile, state, sdk });
 	const resumed = await strictResumeMainSession({ profile, state, sdk });
 	const host = createMainSessionHost({ session: resumed.session, identity: resumed.identity, state, journal: core });
@@ -173,6 +254,104 @@ test("main.submit derives delivery only from profile ownership and turn state", 
 		});
 		expect(replay.result).toEqual(followUp.result);
 	} finally {
+		await server.stop();
+	}
+});
+
+test("main.submit admits a controllably delayed turn without a bridge timeout", async () => {
+	const sdk = new ControlledPromptSdk();
+	const server = await hostedServerWithSdk(sdk);
+	try {
+		const prompt = await server.client.request(
+			"main.submit",
+			{ text: "delayed owner prompt", surface_id: "owner", idempotency_key: "delayed-prompt" },
+			{ timeoutMs: 1_000 },
+		);
+		expect(prompt.error).toBeUndefined();
+		expect(prompt.result).toMatchObject({ accepted: true, delivered_as: "prompt" });
+		await sdk.waitForPromptStart();
+		expect(server.state.read().growthIntent).toBeDefined();
+
+		const followUp = await server.client.request(
+			"main.submit",
+			{ text: "while prompt is delayed", surface_id: "guest", idempotency_key: "delayed-follow-up" },
+			{ timeoutMs: 1_000 },
+		);
+		expect(followUp.result).toMatchObject({ accepted: true, delivered_as: "follow_up" });
+
+		const replay = await server.client.request(
+			"main.submit",
+			{ text: "delayed owner prompt", surface_id: "owner", idempotency_key: "delayed-prompt" },
+			{ timeoutMs: 1_000 },
+		);
+		expect(replay.result).toEqual(prompt.result);
+		expect(sdk.promptCalls).toBe(1);
+		expect(server.core.rpcBridgeStats().timeouts).toBe(0);
+
+		sdk.release();
+		await eventually(
+			() => server.core.journalRead(undefined, 100).events.find(event => event.kind === "assistant_message"),
+			"delayed SDK turn did not publish its finalized assistant message",
+		);
+		await eventually(
+			() => (server.state.read().growthIntent === undefined ? true : undefined),
+			"delayed SDK turn did not settle its growth window",
+		);
+
+	} finally {
+		sdk.release();
+		await server.stop();
+	}
+});
+
+test("main.submit returns delivered_as before the delayed assistant message is journaled", async () => {
+	const sdk = new ControlledPromptSdk();
+	const server = await hostedServerWithSdk(sdk);
+	try {
+		const response = await server.client.request(
+			"main.submit",
+			{ text: "order response before assistant", surface_id: "owner", idempotency_key: "delivery-before-assistant" },
+			{ timeoutMs: 1_000 },
+		);
+		expect(response.result).toMatchObject({ accepted: true, delivered_as: "prompt" });
+		await sdk.waitForPromptStart();
+		expect(server.core.journalRead(undefined, 100).events.filter(event => event.kind === "assistant_message")).toHaveLength(0);
+
+		sdk.release();
+		const assistant = await eventually(
+			() => server.core.journalRead(undefined, 100).events.find(event => event.kind === "assistant_message"),
+			"assistant message was not journaled after delayed turn release",
+		);
+		expect(JSON.parse(assistant.payloadJson)).toMatchObject({ finalized: true, text: "ack" });
+		await eventually(
+			() => (server.state.read().growthIntent === undefined ? true : undefined),
+			"assistant turn did not settle its growth window",
+		);
+	} finally {
+		sdk.release();
+		await server.stop();
+	}
+});
+
+test("main.submit exposes a post-acceptance SDK failure through gateway health", async () => {
+	const sdk = new ControlledPromptSdk({ failure: new Error("injected delayed SDK failure") });
+	const server = await hostedServerWithSdk(sdk);
+	try {
+		const response = await server.client.request(
+			"main.submit",
+			{ text: "accepted then fails", surface_id: "owner", idempotency_key: "post-acceptance-failure" },
+			{ timeoutMs: 1_000 },
+		);
+		expect(response.result).toMatchObject({ accepted: true, delivered_as: "prompt" });
+		await sdk.waitForPromptStart();
+
+		sdk.release();
+		await eventually(() => (server.host.degraded ? true : undefined), "host did not expose the accepted operation failure");
+		const health = await server.client.request("way.health", {});
+		expect(health.result).toMatchObject({ status: "healthy", state: "degraded", reason: "turn_execution_failed" });
+		expect(server.state.read().growthIntent).toBeUndefined();
+	} finally {
+		sdk.release();
 		await server.stop();
 	}
 });

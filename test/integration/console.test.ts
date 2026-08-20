@@ -307,6 +307,17 @@ class RawOutputHarness {
 	once(_event: "drain", _listener: () => void): void {}
 }
 
+function visibleTerminalText(text: string): string {
+	return text
+		.replace(/\x1b\][\s\S]*?(?:\x07|\x1b\\)/gu, "")
+		.replace(/\x1b\[[0-?]*[ -/]*[@-~]/gu, "")
+		.replace(/\x1b[()][A-Za-z0-9]?/gu, "");
+}
+
+function latestTuiFrame(writes: readonly string[]): string {
+	return visibleTerminalText(writes.at(-1) ?? "");
+}
+
 class PermanentlyStalledRawOutputHarness {
 	readonly isTTY = true;
 	readonly writes: string[] = [];
@@ -338,92 +349,6 @@ class PermanentlyStalledRawOutputHarness {
 	}
 }
 
-interface PromptFrameTerminal extends ControlledTerminal {
-	snapshot(): string;
-}
-
-/** Models RawConsoleTerminal's clear-line/repaint behavior for frame assertions. */
-function promptFrameTerminal(): PromptFrameTerminal {
-	const pending: string[] = [];
-	const writes: string[] = [];
-	const lifecycle: string[] = [];
-	const completedLines: string[] = [];
-	let currentLine = "";
-	let prompt = "";
-	let buffer = "";
-	let resolveLine: ((line: string | undefined) => void) | undefined;
-	let closed = false;
-	const append = (text: string): void => {
-		const segments = text.split("\n");
-		for (let index = 0; index < segments.length; index += 1) {
-			currentLine += segments[index] as string;
-			if (index < segments.length - 1) {
-				completedLines.push(currentLine);
-				currentLine = "";
-			}
-		}
-	};
-	const completeInput = (line: string): void => {
-		currentLine += line;
-		completedLines.push(currentLine);
-		currentLine = "";
-		prompt = "";
-		buffer = "";
-		const resolve = resolveLine;
-		resolveLine = undefined;
-		resolve?.(line);
-	};
-	const send = (line: string): void => {
-		if (closed) throw new Error("terminal is closed");
-		if (!resolveLine) {
-			pending.push(line);
-			return;
-		}
-		completeInput(line);
-	};
-	return {
-		writes,
-		lifecycle,
-		send,
-		isReading: () => resolveLine !== undefined,
-		isClosed: () => closed,
-		snapshot: () => [...completedLines, ...(currentLine ? [currentLine] : [])].join("\n"),
-		terminal: {
-			async writeTrusted(text: string): Promise<void> {
-				if (closed) throw new Error("terminal is closed");
-				writes.push(text);
-				lifecycle.push(`write:${text}`);
-				if (resolveLine) currentLine = "";
-				append(text);
-				if (resolveLine) currentLine += `${prompt}${buffer}`;
-			},
-			async readLine(nextPrompt: string): Promise<string | undefined> {
-				if (closed) return undefined;
-				prompt = nextPrompt;
-				buffer = "";
-				currentLine += prompt;
-				const queued = pending.shift();
-				if (queued !== undefined) {
-					completedLines.push(`${currentLine}${queued}`);
-					currentLine = "";
-					prompt = "";
-					return queued;
-				}
-				return await new Promise((resolve) => {
-					resolveLine = resolve;
-				});
-			},
-			close(): void {
-				if (closed) return;
-				closed = true;
-				lifecycle.push("close");
-				const resolve = resolveLine;
-				resolveLine = undefined;
-				resolve?.(undefined);
-			},
-		},
-	};
-}
 
 async function eventually(read: () => boolean, description: string, timeoutMs = 5_000): Promise<void> {
 	const deadline = Date.now() + timeoutMs;
@@ -550,7 +475,7 @@ async function assertRawControlEscapesPermanentlyStalledOutput(control: "\u0003"
 		exitDrainMs: 25,
 	});
 	try {
-		await eventually(() => output.writes.includes("gajaeway> "), "raw console did not begin reading interactive input");
+		await eventually(() => latestTuiFrame(output.writes).includes("gajaeway> "), "raw console did not begin reading interactive input");
 		for (const line of initial) input.send(`${line}\n`);
 		await eventually(() => submissions.length === initial.length, "raw console did not saturate owner operations");
 		await eventually(() => !terminal.rawPublicationPending, "initial raw echo did not flush");
@@ -610,7 +535,7 @@ async function assertRawSaturatedControlStartsBoundedDrain(control: "\u0003" | "
 	});
 	let completed = false;
 	try {
-		await eventually(() => output.writes.includes("gajaeway> "), "raw console did not begin reading interactive input");
+		await eventually(() => latestTuiFrame(output.writes).includes("gajaeway> "), "raw console did not begin reading interactive input");
 		for (const line of initial) input.send(`${line}\n`);
 		await eventually(() => submissions.length === initial.length, "raw console did not saturate owner operations");
 		for (const line of queued) input.send(`${line}\n`);
@@ -997,51 +922,29 @@ test("console drains a submitted operation before closing after an immediate /qu
 	}
 }, 15_000);
 
-test("console reports outstanding operations when exit grace elapses", async () => {
-	const gateId = "gate-exit-grace";
-	const sdk = new FileSdkDouble({ gateOnPrompt: { text: "hold beyond exit grace", gateId } });
-	const gateway = await hostedConsoleGateway({ sdk });
+test("console reports outstanding admission operations when exit grace elapses", async () => {
+	const gateway = await hostedConsoleGateway();
 	const terminal = controlledTerminal();
+	const admission = deferred();
+	const submissions: string[] = [];
 	const running = runWayConsole({ stateDir: gateway.stateDirectory, profilePath: gateway.profilePath }, [], {
 		terminal: terminal.terminal,
+		profile: loadWayProfile(gateway.profilePath),
+		rpcConnect: async () => blockingSubmissionRpc(admission.promise, submissions),
 		exitDrainMs: 25,
 	});
 	try {
 		await eventually(terminal.isReading, "console did not begin reading interactive input");
-		terminal.send("hold beyond exit grace");
-		await eventually(
-			() =>
-				terminal.writes
-					.join("")
-					.includes(`Gate opened: gate_id=${gateId} expected_session_id=${gateway.host.sessionId}`),
-			"prompt did not enter the pending workflow gate",
-		);
+		terminal.send("hold admission beyond exit grace");
+		await eventually(() => submissions.length === 1, "console did not start the owner admission operation");
 		terminal.send("/quit");
 		await running;
 		expect(terminal.writes.join("")).toContain("Exit requested; 1 console operation is still outstanding.");
 		expect(terminal.writes.join("")).toContain(
 			"Results will remain available through the journal at the gajaeway-console consumer checkpoint.",
 		);
-		const release = await gateway.client.request("main.gate.answer", {
-			gate_id: gateId,
-			expected_session_id: gateway.host.sessionId,
-			answer: { selected: ["Yes"] },
-			idempotency_key: "release-exit-grace",
-		});
-		expect(rpcResult(release, "main.gate.answer")).toMatchObject({ accepted: true });
-		await eventually(
-			() => gateway.host.turnState === "idle",
-			"pending prompt did not settle after cleanup gate answer",
-		);
 	} finally {
-		await gateway.client
-			.request("main.gate.answer", {
-				gate_id: gateId,
-				expected_session_id: gateway.host.sessionId,
-				answer: { selected: ["Yes"] },
-				idempotency_key: "release-exit-grace-cleanup",
-			})
-			.catch(() => undefined);
+		admission.resolve();
 		terminal.terminal.close();
 		await gateway.stop();
 		await running.catch(() => undefined);
@@ -1239,13 +1142,13 @@ test("raw same-chunk oversized input renders a refusal and leaves the owner comm
 		rpcConnect: async () => blockingSubmissionRpc(Promise.resolve(), submissions),
 	});
 	try {
-		await eventually(() => output.writes.includes("gajaeway> "), "raw console did not begin reading interactive input");
+		await eventually(() => latestTuiFrame(output.writes).includes("gajaeway> "), "raw console did not begin reading interactive input");
 		input.send(`${oversized}\n`);
 		await eventually(
 			() => output.writes.join("").includes(`Input line exceeds ${MAX_RAW_CONSOLE_LINE_BYTES} bytes and was refused.`),
 			"same-chunk oversized input did not render a refusal",
 		);
-		expect(output.writes.filter((write) => write.includes("Input line exceeds"))).toHaveLength(1);
+		expect(output.writes.some((write) => write.includes("Input line exceeds"))).toBe(true);
 		expect(output.writes.join("")).not.toContain(oversized.slice(0, 64));
 		expect(terminal.queuedLineCount).toBe(0);
 		expect(terminal.queuedInputBytes).toBe(0);
@@ -1281,7 +1184,7 @@ test("raw console coalesces mixed oversized and queue-full refusals while operat
 		rpcConnect: async () => blockingSubmissionRpc(release.promise, submissions),
 	});
 	try {
-		await eventually(() => output.writes.includes("gajaeway> "), "raw console did not begin reading interactive input");
+		await eventually(() => latestTuiFrame(output.writes).includes("gajaeway> "), "raw console did not begin reading interactive input");
 		for (const line of inFlight) input.send(`${line}\n`);
 		await eventually(() => submissions.length === inFlight.length, "console did not saturate the owner-operation cap");
 		await Bun.sleep(0);
@@ -1292,8 +1195,8 @@ test("raw console coalesces mixed oversized and queue-full refusals while operat
 			"mixed-cause input did not render a refusal",
 		);
 		const refusalFrames = output.writes.filter((write) => write.includes("Input refused:"));
-		expect(refusalFrames).toHaveLength(1);
-		const refusal = refusalFrames[0] as string;
+		expect(refusalFrames.length).toBeGreaterThan(0);
+		const refusal = visibleTerminalText(refusalFrames.at(-1) as string);
 		expect(refusal).toContain("oversized-line=1");
 		expect(refusal).toContain("queue-full-lines=1");
 		expect(refusal).not.toContain("queue-full-bytes=");
@@ -1337,7 +1240,7 @@ test("raw console bounds queued input, visibly refuses excess lines, and preserv
 		rpcConnect: async () => blockingSubmissionRpc(release.promise, submissions),
 	});
 	try {
-		await eventually(() => output.writes.includes("gajaeway> "), "raw console did not begin reading interactive input");
+		await eventually(() => latestTuiFrame(output.writes).includes("gajaeway> "), "raw console did not begin reading interactive input");
 		for (const line of initial) input.send(`${line}\n`);
 		await eventually(() => submissions.length === initial.length, "console did not saturate the owner-operation cap");
 		for (const line of queued) input.send(`${line}\n`);
@@ -1457,14 +1360,14 @@ test("real console command loop admits an owner message typed during a busy turn
 	}
 }, 15_000);
 
-test("prompt repaint preserves complete assistant and gate frames while gajaeway> is active", async () => {
+test("full-screen renderer preserves complete assistant and gate frames while the editor is active", async () => {
 	const gateway = await hostedConsoleGateway();
-	const terminal = promptFrameTerminal();
-	const running = runWayConsole({ stateDir: gateway.stateDirectory, profilePath: gateway.profilePath }, [], {
-		terminal: terminal.terminal,
-	});
+	const input = new PausableRawInputHarness();
+	const output = new RawOutputHarness();
+	const terminal = new RawConsoleTerminal({ input, output });
+	const running = runWayConsole({ stateDir: gateway.stateDirectory, profilePath: gateway.profilePath }, [], { terminal });
 	try {
-		await eventually(terminal.isReading, "console did not leave an active prompt for frame rendering");
+		await eventually(() => latestTuiFrame(output.writes).includes("gajaeway> "), "console did not leave an active editor");
 		const assistant = gateway.core.journalAppend(
 			"assistant_message",
 			JSON.stringify({ finalized: true, text: "assistant frame remains visible" }),
@@ -1475,18 +1378,18 @@ test("prompt repaint preserves complete assistant and gate frames while gajaeway
 		);
 		await eventually(
 			() => gateway.core.consumerCursor("gajaeway-console") === gate.cursor,
-			"console did not publish and commit the prompt-active frames",
+			"console did not publish and commit the editor-active frames",
 		);
-		const screen = terminal.snapshot();
+		const screen = latestTuiFrame(output.writes);
 		expect(assistant.cursor).not.toBe(gate.cursor);
 		expect(screen).toContain("Assistant:\nassistant frame remains visible");
 		expect(screen).toContain("gate_id=gate-frame-visible");
-		expect(screen).toContain("expected_session_id=session-frame-visible");
-		expect(screen.endsWith("gajaeway> ")).toBe(true);
-		terminal.send("/quit");
+		expect(screen.replace(/\n/gu, "")).toContain("expected_session_id=session-frame-visible");
+		expect(screen).toContain("gajaeway> ");
+		input.send("/quit\n");
 		await running;
 	} finally {
-		terminal.terminal.close();
+		terminal.close();
 		await gateway.stop();
 		await running.catch(() => undefined);
 	}

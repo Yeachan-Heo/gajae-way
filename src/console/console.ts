@@ -1,10 +1,24 @@
 import { randomUUID } from "node:crypto";
 import * as path from "node:path";
-import { stdin, stdout } from "node:process";
+import { stdout } from "node:process";
 import { RpcJournalConsumer, type RpcJournalEvent } from "../journal-consumer";
 import type { WayConfig } from "../config";
 import { loadWayProfile, type WayProfile } from "../profile";
 import { RpcClient, rpcResult, type JsonRpcClient } from "../rpc-client";
+import {
+	MAX_RAW_CONSOLE_LINE_BYTES,
+	MAX_RAW_CONSOLE_QUEUED_BYTES,
+	MAX_RAW_CONSOLE_QUEUED_LINES,
+	RawConsoleTerminal,
+} from "./tui/terminal";
+import type { RawConsoleOutputStream } from "./tui/terminal";
+export {
+	MAX_RAW_CONSOLE_LINE_BYTES,
+	MAX_RAW_CONSOLE_QUEUED_BYTES,
+	MAX_RAW_CONSOLE_QUEUED_LINES,
+	RawConsoleTerminal,
+} from "./tui/terminal";
+export type { RawConsoleInputStream, RawConsoleOutputStream, RawConsoleTerminalOptions } from "./tui/terminal";
 
 export const GAJAEWAY_CONSOLE_CONSUMER_ID = "gajaeway-console";
 export const GAJAEWAY_CONSOLE_EVENT_KINDS = [
@@ -21,9 +35,6 @@ export const DEFAULT_CONSOLE_READ_WAIT_MS = 1_000;
 export const DEFAULT_CONSOLE_EXIT_DRAIN_MS = 2_000;
 const MAX_CONSOLE_INPUT_OPERATIONS = 16;
 const MAX_CONSOLE_EXIT_DIAGNOSTIC_MS = 250;
-export const MAX_RAW_CONSOLE_QUEUED_LINES = 16;
-export const MAX_RAW_CONSOLE_QUEUED_BYTES = 64 * 1024;
-export const MAX_RAW_CONSOLE_LINE_BYTES = 8 * 1024;
 
 export type WayConsoleEventKind = (typeof GAJAEWAY_CONSOLE_EVENT_KINDS)[number];
 export type ConsoleConsumerRunResult = "rendered" | "idle";
@@ -56,37 +67,10 @@ export interface ConsoleTerminal {
 	close(): void;
 	/** Notifies the input loop that terminal interrupt/EOF was received between reads. */
 	onExitRequested?(listener: () => void): () => void;
-}
-
-const RAW_CONSOLE_REFUSAL_CAUSES = ["oversized-line", "queue-full-lines", "queue-full-bytes"] as const;
-
-type RawConsoleRefusalCause = (typeof RAW_CONSOLE_REFUSAL_CAUSES)[number];
-type RawConsoleRefusalCounts = Record<RawConsoleRefusalCause, number>;
-
-interface RawConsoleRefusal {
-	readonly counts: RawConsoleRefusalCounts;
-	revision: number;
-}
-interface RawConsoleInputStream {
-	readonly isTTY?: boolean;
-	readonly isRaw?: boolean;
-	setEncoding(encoding: BufferEncoding): unknown;
-	setRawMode?(mode: boolean): unknown;
-	resume(): unknown;
-	pause(): unknown;
-	on(event: "data", listener: (chunk: string | Buffer) => void): unknown;
-	off(event: "data", listener: (chunk: string | Buffer) => void): unknown;
-}
-
-interface RawConsoleOutputStream {
-	readonly isTTY?: boolean;
-	write(text: string, callback: (error?: Error | null) => void): boolean;
-	once(event: "drain", listener: () => void): unknown;
-}
-
-export interface RawConsoleTerminalOptions {
-	readonly input?: RawConsoleInputStream;
-	readonly output?: RawConsoleOutputStream;
+	/** Allows the terminal status rail to reflect delivery fencing without owning gateway state. */
+	setDeliveryState?(state: "fenced" | "ready" | "unavailable" | "stopping"): void;
+	/** Lets the terminal update live status before the corresponding journal frame is rendered. */
+	observeEvent?(event: ConsoleEventFrame): void;
 }
 
 /**
@@ -140,6 +124,8 @@ export interface OwnerConsoleOptions {
 	readonly claimTtlMs?: number;
 	readonly readWaitMs?: number;
 	readonly idempotencyKey?: () => string;
+	/** Renderer-only notification emitted immediately before a durable event frame is published. */
+	readonly onEvent?: (event: ConsoleEventFrame) => void | Promise<void>;
 }
 
 export interface RunWayConsoleDependencies {
@@ -408,6 +394,7 @@ export class OwnerConsole {
 	readonly #output: ConsoleOutput;
 	readonly #idempotencyKey: () => string;
 	readonly #consumer: ConsoleEventConsumer;
+	readonly #onEvent: ((event: ConsoleEventFrame) => void | Promise<void>) | undefined;
 	#deliveryReady = false;
 	#deliveryFailure: ConsoleDeliveryUnavailableError | undefined;
 
@@ -417,6 +404,7 @@ export class OwnerConsole {
 		this.#ownerSurfaceId = options.ownerSurfaceId;
 		this.#output = options.output;
 		this.#idempotencyKey = options.idempotencyKey ?? randomUUID;
+		this.#onEvent = options.onEvent;
 		this.#consumer = new ConsoleEventConsumer({
 			rpc: options.rpc,
 			consumerId: options.consumerId,
@@ -609,6 +597,7 @@ export class OwnerConsole {
 	}
 
 	private async renderEvent(event: ConsoleEventFrame): Promise<void> {
+		await this.#onEvent?.(event);
 		await this.#output.writeFrame(renderConsoleEventFrame(event));
 	}
 }
@@ -675,6 +664,7 @@ export async function runWayConsole(
 			ownerSurfaceId,
 			output,
 			idempotencyKey: dependencies.idempotencyKey,
+			onEvent: async (event) => terminal?.observeEvent?.(event),
 		});
 		const inspected = await consoleSurface.inspectStartup();
 		if (!inspected.accepted || !inspected.health || !inspected.status) {
@@ -686,11 +676,14 @@ export async function runWayConsole(
 		terminal = dependencies.terminal ?? new RawConsoleTerminal();
 		const activeTerminal = terminal;
 		output.setWriter(async (text) => await activeTerminal.writeTrusted(text));
+		activeTerminal.setDeliveryState?.("fenced");
 		await output.writeFrame(`${renderConsoleStatusSummary(inspected.health, inspected.status)}\n`);
 		const startup = await consoleSurface.establishDeliveryReadiness(inspected);
 		if (!startup.accepted) {
+			activeTerminal.setDeliveryState?.("unavailable");
 			throw new ConsoleStartupRefusalError(startup.refusal ?? "Interactive console delivery readiness was refused.");
 		}
+		activeTerminal.setDeliveryState?.("ready");
 		await output.writeFrame("Owner console ready. Type /help for commands.\n");
 		const events = new AbortController();
 		const input = new AbortController();
@@ -698,6 +691,7 @@ export async function runWayConsole(
 		const eventLoop = consoleSurface.consume(events.signal).catch((error) => {
 			if (!events.signal.aborted) {
 				deliveryFailure = asError(error);
+				activeTerminal.setDeliveryState?.("unavailable");
 				input.abort();
 				activeTerminal.close();
 			}
@@ -882,351 +876,6 @@ async function waitForInputSlot(
 	});
 }
 
-export class RawConsoleTerminal implements ConsoleTerminal {
-	readonly #input: RawConsoleInputStream;
-	readonly #output: RawConsoleOutputStream;
-	#buffer = "";
-	#bufferBytes = 0;
-	readonly #queuedLines: Array<{ readonly text: string; readonly bytes: number }> = [];
-	#queuedBytes = 0;
-	#pendingRefusal: RawConsoleRefusal | undefined;
-	#discardingOversizeLine = false;
-	#discardingRefusedLine = false;
-	#prompt = "";
-	#resolveLine: ((line: string | undefined) => void) | undefined;
-	readonly #exitListeners = new Set<() => void>();
-	#exitRequested = false;
-	#inputPaused = false;
-	#echoDirty = false;
-	#echoFrame = "";
-	#rawPublicationPending = false;
-	#rawPublicationKind: "echo" | "refusal" | undefined;
-	#writeTail: Promise<void> = Promise.resolve();
-	#closed = false;
-
-	constructor(options: RawConsoleTerminalOptions = {}) {
-		this.#input = options.input ?? stdin;
-		this.#output = options.output ?? stdout;
-		if (!this.#input.isTTY || !this.#output.isTTY || !this.#input.setRawMode) {
-			throw new WayConsoleError("gajaeway console requires an interactive TTY on stdin and stdout.");
-		}
-		this.#input.setEncoding("utf8");
-		this.#input.setRawMode(true);
-		this.#input.resume();
-		this.#input.on("data", this.onData);
-	}
-
-	get queuedLineCount(): number {
-		return this.#queuedLines.length;
-	}
-
-	get queuedInputBytes(): number {
-		return this.#queuedBytes;
-	}
-
-	/** Bytes retained for the unterminated raw input line. */
-	get bufferedInputBytes(): number {
-		return this.#bufferBytes;
-	}
-
-	get inputPaused(): boolean {
-		return this.#inputPaused;
-	}
-
-	/** At most one coalesced echo redraw is retained while stdout is busy. */
-	get pendingEchoRedrawCount(): number {
-		return this.#echoDirty ? 1 : 0;
-	}
-
-	/** The raw terminal has at most one queued or active echo/refusal publisher. */
-	get rawPublicationPending(): boolean {
-		return this.#rawPublicationPending;
-	}
-
-	/** At most one refusal diagnostic is retained until publication or episode end. */
-	get pendingRefusalPublicationCount(): number {
-		return this.#pendingRefusal ? 1 : 0;
-	}
-
-	onExitRequested(listener: () => void): () => void {
-		this.#exitListeners.add(listener);
-		if (this.#exitRequested) listener();
-		return () => this.#exitListeners.delete(listener);
-	}
-
-	async writeTrusted(text: string): Promise<void> {
-		if (this.#closed) throw new WayConsoleError("Console terminal is closed.");
-		await this.write(this.formatTrustedFrame(text));
-	}
-
-	async readLine(prompt: string): Promise<string | undefined> {
-		if (this.#closed || this.#exitRequested) return undefined;
-		if (this.#resolveLine) throw new WayConsoleError("Console already has a pending input line.");
-		const queued = this.#queuedLines.shift();
-		if (queued) {
-			this.#queuedBytes -= queued.bytes;
-			return queued.text;
-		}
-		this.#prompt = prompt;
-		const line = new Promise<string | undefined>((resolve) => {
-			this.#resolveLine = resolve;
-		});
-		if (this.#buffer) return await line;
-		try {
-			await this.write(prompt);
-		} catch (error) {
-			this.finishLine(undefined);
-			throw error;
-		}
-		return await line;
-	}
-
-	close(): void {
-		if (this.#closed) return;
-		this.#closed = true;
-		this.#inputPaused = true;
-		this.#echoDirty = false;
-		this.clearPendingRefusal();
-		this.#input.off("data", this.onData);
-		this.#input.pause();
-		if (this.#input.isRaw) this.#input.setRawMode?.(false);
-		this.finishLine(undefined);
-	}
-
-	private onData = (chunk: string | Buffer): void => {
-		for (const character of String(chunk)) {
-			if (character === "\u0003" || character === "\u0004") {
-				this.requestExit();
-				return;
-			}
-			if (character === "\r" || character === "\n") {
-				if (this.#discardingOversizeLine || this.#discardingRefusedLine) {
-					this.#discardingOversizeLine = false;
-					this.#discardingRefusedLine = false;
-					this.#buffer = "";
-					this.#bufferBytes = 0;
-					continue;
-				}
-				const line = this.#buffer;
-				const prompt = this.#prompt;
-				this.#buffer = "";
-				this.#bufferBytes = 0;
-				if (this.acceptLine(line)) this.requestCompletedLineEcho(prompt, line);
-				continue;
-			}
-			if (character === "\u007f" || character === "\b") {
-				if (!this.#buffer || this.#discardingOversizeLine || this.#discardingRefusedLine) continue;
-				this.#buffer = [...this.#buffer].slice(0, -1).join("");
-				this.#bufferBytes = Buffer.byteLength(this.#buffer);
-				if (this.#resolveLine) this.requestInputEcho("\b \b");
-				continue;
-			}
-			if (character < " " || this.#discardingOversizeLine || this.#discardingRefusedLine) continue;
-			const queueFullCause = this.#resolveLine ? undefined : this.queueFullRefusalCause(0);
-			if (queueFullCause) {
-				this.#discardingRefusedLine = true;
-				this.#buffer = "";
-				this.#bufferBytes = 0;
-				this.reportInputRefusal(queueFullCause);
-				continue;
-			}
-			const bytes = Buffer.byteLength(character);
-			if (this.#bufferBytes + bytes > MAX_RAW_CONSOLE_LINE_BYTES) {
-				this.#discardingOversizeLine = true;
-				this.#buffer = "";
-				this.#bufferBytes = 0;
-				this.#echoDirty = false;
-				this.#echoFrame = "";
-				this.reportInputRefusal("oversized-line");
-				continue;
-			}
-			this.#buffer += character;
-			this.#bufferBytes += bytes;
-			if (this.#resolveLine) this.requestInputEcho(character);
-		}
-	};
-
-	private acceptLine(line: string): boolean {
-		if (this.#resolveLine) {
-			this.finishLine(line);
-			return true;
-		}
-		const bytes = Buffer.byteLength(line);
-		const queueFullCause = this.queueFullRefusalCause(bytes);
-		if (queueFullCause) {
-			this.reportInputRefusal(queueFullCause);
-			return false;
-		}
-		this.#queuedLines.push({ text: line, bytes });
-		this.#queuedBytes += bytes;
-		return true;
-	}
-
-	private queueFullRefusalCause(additionalBytes: number): "queue-full-lines" | "queue-full-bytes" | undefined {
-		if (this.#queuedLines.length >= MAX_RAW_CONSOLE_QUEUED_LINES) return "queue-full-lines";
-		if (this.#queuedBytes + additionalBytes > MAX_RAW_CONSOLE_QUEUED_BYTES) return "queue-full-bytes";
-		return undefined;
-	}
-
-	private requestExit(): void {
-		if (this.#exitRequested) return;
-		this.#exitRequested = true;
-		this.#echoDirty = false;
-		this.clearPendingRefusal();
-		this.refreshInputFlow();
-		this.finishLine(undefined);
-		for (const listener of [...this.#exitListeners]) listener();
-	}
-
-	private refreshInputFlow(): void {
-		const shouldPause = this.#closed || this.#exitRequested;
-		if (shouldPause === this.#inputPaused) return;
-		this.#inputPaused = shouldPause;
-		if (shouldPause) this.#input.pause();
-		else this.#input.resume();
-	}
-
-	private requestInputEcho(text: string): void {
-		const frame = this.#echoDirty || this.#rawPublicationKind === "echo" ? this.inputRedrawFrame() : text;
-		this.requestEchoFrame(frame);
-	}
-
-	private requestCompletedLineEcho(prompt: string, line: string): void {
-		this.requestEchoFrame(`\r\x1b[2K${prompt}${line}\r\n`);
-	}
-
-	private inputRedrawFrame(): string {
-		return `\r\x1b[2K${this.#prompt}${this.#buffer}`;
-	}
-
-	private requestEchoFrame(frame: string): void {
-		if (this.#closed || this.#exitRequested || !frame) return;
-		this.#echoFrame = frame;
-		this.#echoDirty = true;
-		this.scheduleRawPublication();
-	}
-
-	private reportInputRefusal(cause: RawConsoleRefusalCause): void {
-		if (this.#closed || this.#exitRequested) return;
-		const refusal = this.#pendingRefusal ?? {
-			counts: {
-				"oversized-line": 0,
-				"queue-full-lines": 0,
-				"queue-full-bytes": 0,
-			},
-			revision: 0,
-		};
-		refusal.counts[cause] += 1;
-		refusal.revision += 1;
-		this.#pendingRefusal = refusal;
-		this.scheduleRawPublication();
-	}
-
-	private clearPendingRefusal(): void {
-		this.#pendingRefusal = undefined;
-	}
-
-	private snapshotRefusalCounts(counts: RawConsoleRefusalCounts): RawConsoleRefusalCounts {
-		return {
-			"oversized-line": counts["oversized-line"],
-			"queue-full-lines": counts["queue-full-lines"],
-			"queue-full-bytes": counts["queue-full-bytes"],
-		};
-	}
-
-	private renderInputRefusal(counts: RawConsoleRefusalCounts): string {
-		const causes: string[] = [];
-		if (counts["oversized-line"] > 0) {
-			causes.push(
-				`oversized-line=${counts["oversized-line"]} (Input line exceeds ${MAX_RAW_CONSOLE_LINE_BYTES} bytes and was refused.)`,
-			);
-		}
-		if (counts["queue-full-lines"] > 0) {
-			causes.push(
-				`queue-full-lines=${counts["queue-full-lines"]} (Input queue is full (${MAX_RAW_CONSOLE_QUEUED_LINES} lines / ${MAX_RAW_CONSOLE_QUEUED_BYTES} bytes); additional pasted input was refused.)`,
-			);
-		}
-		if (counts["queue-full-bytes"] > 0) {
-			causes.push(
-				`queue-full-bytes=${counts["queue-full-bytes"]} (Input queue byte capacity is full (${MAX_RAW_CONSOLE_QUEUED_BYTES} bytes); additional pasted input was refused.)`,
-			);
-		}
-		return `Input refused: ${causes.join("; ")}\n`;
-	}
-
-	/** Keeps counts merged during a backpressured refusal write for the next bounded frame. */
-	private settlePublishedRefusal(
-		refusal: RawConsoleRefusal,
-		publishedCounts: RawConsoleRefusalCounts,
-		publishedRevision: number,
-	): void {
-		if (this.#pendingRefusal !== refusal) return;
-		if (refusal.revision === publishedRevision) {
-			this.clearPendingRefusal();
-			return;
-		}
-		for (const cause of RAW_CONSOLE_REFUSAL_CAUSES) {
-			refusal.counts[cause] -= publishedCounts[cause];
-		}
-	}
-
-	private scheduleRawPublication(): void {
-		if (this.#closed || this.#rawPublicationPending || (!this.#echoDirty && !this.#pendingRefusal)) return;
-		this.#rawPublicationPending = true;
-		void this.enqueuePublication(async () => await this.publishRawPublication());
-	}
-
-	private async publishRawPublication(): Promise<void> {
-		try {
-			const refusal = this.#pendingRefusal;
-			if (refusal) {
-				const counts = this.snapshotRefusalCounts(refusal.counts);
-				const revision = refusal.revision;
-				this.#rawPublicationKind = "refusal";
-				await writeToStream(this.#output, this.formatTrustedFrame(this.renderInputRefusal(counts)));
-				this.settlePublishedRefusal(refusal, counts, revision);
-				return;
-			}
-			if (!this.#echoDirty || this.#closed || this.#exitRequested) return;
-			const frame = this.#echoFrame;
-			this.#echoDirty = false;
-			this.#rawPublicationKind = "echo";
-			await writeToStream(this.#output, frame);
-		} catch (error) {
-			this.close();
-			throw error;
-		} finally {
-			this.#rawPublicationKind = undefined;
-			this.#rawPublicationPending = false;
-			this.scheduleRawPublication();
-		}
-	}
-
-	private formatTrustedFrame(text: string): string {
-		return this.#resolveLine ? `\r\x1b[2K${text}${this.#prompt}${this.#buffer}` : text;
-	}
-
-	private enqueuePublication(publish: () => Promise<void>): Promise<void> {
-		const publication = this.#writeTail.then(publish);
-		this.#writeTail = publication.catch(() => undefined);
-		return publication;
-	}
-
-	private async write(text: string): Promise<void> {
-		await this.enqueuePublication(async () => await writeToStream(this.#output, text));
-	}
-
-	private finishLine(line: string | undefined): void {
-		const resolve = this.#resolveLine;
-		this.#resolveLine = undefined;
-		this.#buffer = "";
-		this.#bufferBytes = 0;
-		this.#discardingOversizeLine = false;
-		this.#discardingRefusedLine = false;
-		this.#prompt = "";
-		resolve?.(line);
-	}
-}
 
 function parseConsoleArguments(arguments_: readonly string[]): string | undefined {
 	let surfaceId: string | undefined;
