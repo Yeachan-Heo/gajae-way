@@ -195,3 +195,13 @@ owner route, observe its typing acknowledgement within two seconds, then one
 reply. Restart the adapter after the reply and verify no ordinary repost occurs;
 a crash between send and settlement can produce at most the documented,
 nonce-deduplicated retry. Never start a second adapter for the same route.
+## Known limitation: journal latency on continuously busy sessions
+
+The credential-free broker CLI returns tail envelopes only when a terminal turn
+state occurs inside the wait window. While the adopted persona works
+continuously, finalized replies are visible immediately in the attached gjc TUI
+(the primary owner surface), but journal consumers (Discord adapter, cockpit
+transcript) receive them at the next terminal boundary. `way.status` stays live
+throughout via instant context queries. If reply latency to adapters matters
+for your deployment, keep turns bounded or wait for an upstream snapshot-tail
+query.
