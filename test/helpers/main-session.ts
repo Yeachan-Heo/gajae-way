@@ -1,20 +1,11 @@
 import * as fs from "node:fs";
+import * as os from "node:os";
 import * as path from "node:path";
-import {
-	bootstrapNonceMarker,
-	type CreateSdkSessionInput,
-	type HostedSdkGate,
-	type HostedSdkSession,
-	type MainSessionSdk,
-	type ResumeSdkSessionInput,
-} from "../../src/main-session/sdk";
-import {
-	fingerprintSessionFile,
-	sameFingerprint,
-	type GatewayMetaBackend,
-	type GatewayMetaReadOutput,
-	type GatewayMetaTransactionInput,
-	type GatewayMetaTransactionOutput,
+import type {
+	GatewayMetaBackend,
+	GatewayMetaReadOutput,
+	GatewayMetaTransactionInput,
+	GatewayMetaTransactionOutput,
 } from "../../src/main-session/state";
 
 const defaults: Record<string, string> = {
@@ -36,7 +27,7 @@ export class MemoryGatewayMeta implements GatewayMetaBackend {
 	readonly events: Array<{ kind: string; payloadJson: string }> = [];
 
 	gatewayMetaRead(keys: readonly string[]): GatewayMetaReadOutput {
-		return { entries: keys.map((key) => ({ key, value: this.values.get(key) })) };
+		return { entries: keys.map(key => ({ key, value: this.values.get(key) })) };
 	}
 
 	gatewayMetaTransaction(input: GatewayMetaTransactionInput): GatewayMetaTransactionOutput {
@@ -53,229 +44,214 @@ export class MemoryGatewayMeta implements GatewayMetaBackend {
 	}
 }
 
-interface DoubleSessionRecord {
-	readonly id: string;
-	readonly file: string;
-	readonly listeners: Set<(event: unknown) => void>;
-	readonly gateListeners: Set<(gate: HostedSdkGate) => void>;
-	readonly gates: Map<string, { expiresAt?: number; state: "open" | "resolved" | "expired" }>;
-	readonly pendingPromptGates: Map<string, () => void>;
-	followUpQueueDepth: number;
-	nextAssistantResponseId: number;
-	nextAttemptGeneration: number;
+interface FixtureOperation {
+	readonly opRef: string;
+	readonly operation: "turn.prompt" | "turn.steer" | "turn.follow_up";
+	readonly text: string;
+	failure?: boolean;
+	responseText?: string;
+	generation?: number;
+	completed?: boolean;
 }
 
-interface DoubleAttemptScope {
-	readonly attemptId: string;
-	readonly generation: number;
-	readonly lineage: "main";
+interface FixtureSession {
+	row: Record<string, unknown>;
+	metadata: Record<string, unknown>;
+	context: { isStreaming: boolean; followupQueueDepth: number };
+	transcript: unknown[];
+	events: Array<Record<string, unknown>>;
+	operations: Record<string, FixtureOperation>;
+	nextSeq: number;
+	nextGeneration: number;
+	gap?: { readonly code: "retention_gap"; readonly missing?: { readonly from: number; readonly to: number } };
+	holdNext?: boolean;
+	failNext?: boolean;
+	responseText?: string;
+	commandLog: Array<Record<string, unknown>>;
 }
 
-export interface FileSdkDoubleOptions {
-	/** Simulates the SDK's deferred initial JSONL flush for timeout coverage. */
-	readonly persistBootstrapTranscript?: boolean;
-	/** Test seam: a matching prompt opens this gate and remains active until answered. */
-	readonly gateOnPrompt?: { readonly text: string; readonly gateId: string };
+interface FixtureState {
+	indexSeq: number;
+	sessions: Record<string, FixtureSession>;
 }
 
-function isRecord(value: unknown): value is Record<string, unknown> {
-	return typeof value === "object" && value !== null && !Array.isArray(value);
-}
-
-function writeLine(file: string, value: unknown): void {
-	fs.appendFileSync(file, `${JSON.stringify(value)}\n`);
+export interface FakeBrokerFixtureOptions {
+	readonly workspace?: string;
+	readonly sessionId?: string;
+	readonly live?: boolean;
+	readonly kind?: string;
+	readonly responseText?: string;
 }
 
 /**
- * Deterministic file-backed SDK double. Like the published SDK, `createNew`
- * retains the initial session in memory and only creates JSONL after the first
- * nonce-bearing turn has an assistant response.
+ * Deterministic external-session fixture consumed through the real spawn-only
+ * `BrokerCli`. It never mirrors a HostSupervisor in-process: all tests cross
+ * the same command envelopes production uses.
  */
-export class FileSdkDouble implements MainSessionSdk {
-	readonly openedIdentities: ResumeSdkSessionInput["identity"][] = [];
-	readonly createdInputs: CreateSdkSessionInput[] = [];
-	readonly createdSessionFiles: string[] = [];
-	readonly #persistBootstrapTranscript: boolean;
-	readonly #gateOnPrompt: FileSdkDoubleOptions["gateOnPrompt"];
-	#nextId = 1;
-	readonly #sessions = new Map<string, DoubleSessionRecord>();
+export class FakeBrokerFixture {
+	readonly root: string;
+	readonly statePath: string;
+	readonly executable: string;
+	readonly workspace: string;
+	readonly sessionId: string;
 
-	constructor(options: FileSdkDoubleOptions = {}) {
-		this.#persistBootstrapTranscript = options.persistBootstrapTranscript ?? true;
-		this.#gateOnPrompt = options.gateOnPrompt;
-	}
-
-	async createNew(input: CreateSdkSessionInput): Promise<HostedSdkSession> {
-		this.createdInputs.push(input);
-		const directory = path.join(input.workspace, ".way-test-sessions");
-		fs.mkdirSync(directory, { recursive: true });
-		const canonicalDirectory = fs.realpathSync.native(directory);
-		const id = `session-${this.#nextId++}`;
-		const file = path.join(canonicalDirectory, `${id}.jsonl`);
-		const record: DoubleSessionRecord = {
-			id,
-			file,
-			listeners: new Set(),
-			gateListeners: new Set(),
-			gates: new Map(),
-			pendingPromptGates: new Map(),
-			followUpQueueDepth: 0,
-			nextAssistantResponseId: 1,
-			nextAttemptGeneration: 1,
-		};
-		this.#sessions.set(record.file, record);
-		this.createdSessionFiles.push(record.file);
-		return this.hosted(record);
-	}
-
-	async openExistingStrict(input: ResumeSdkSessionInput): Promise<HostedSdkSession> {
-		const observed = fingerprintSessionFile(input.identity.canonicalPath);
-		if (!sameFingerprint(observed, input.identity)) throw new Error("strict identity mismatch");
-		this.openedIdentities.push(input.identity);
-		const record = this.#sessions.get(input.identity.canonicalPath);
-		if (!record) throw new Error("unknown strict session");
-		return this.hosted(record);
-	}
-
-	async findBootstrapNonceCandidates(_workspace: string, nonce: string): Promise<readonly string[]> {
-		const marker = bootstrapNonceMarker(nonce);
-		return [...this.#sessions.values()]
-			.filter((record) => {
-				try {
-					return fs.readFileSync(record.file, "utf8").includes(marker);
-				} catch {
-					return false;
-				}
-			})
-			.map((record) => record.file);
-	}
-
-	async createOrphan(workspace: string, nonce: string): Promise<string> {
-		const session = await this.createNew({ workspace, contextFiles: [] });
-		await session.sendBootstrapMessage(nonce);
-		return session.sessionFile;
-	}
-
-	appendRaw(file: string, value: unknown): void {
-		writeLine(file, value);
-	}
-
-	emitEvent(file: string, event: unknown): void {
-		const record = this.#sessions.get(file);
-		if (!record) throw new Error("unknown strict session");
-		this.emit(record, event);
-	}
-
-	openGate(file: string, gateId: string, options: { expiresAt?: number; payload?: unknown } = {}): void {
-		const record = this.#sessions.get(file);
-		if (!record) throw new Error("unknown strict session");
-		record.gates.set(gateId, { expiresAt: options.expiresAt, state: "open" });
-		const gate: HostedSdkGate = {
-			gateId,
-			sessionId: record.id,
-			expiresAt: options.expiresAt,
-			payload: options.payload ?? { type: "workflow_gate", gate_id: gateId, session_id: record.id },
-		};
-		for (const listener of [...record.gateListeners]) listener(gate);
-	}
-
-	private emit(record: DoubleSessionRecord, event: unknown): void {
-		if (isRecord(event) && event.type === "turn_start" && record.followUpQueueDepth > 0) record.followUpQueueDepth -= 1;
-		for (const listener of [...record.listeners]) listener(event);
-	}
-
-	private finalAssistantMessage(record: DoubleSessionRecord, text: string): Record<string, unknown> {
-		const responseId = `${record.id}:assistant:${record.nextAssistantResponseId++}`;
-		return {
-			role: "assistant",
-			content: [{ type: "text", text }],
-			responseId,
-			timestamp: Date.now(),
-		};
-	}
-
-	private nextAttemptScope(record: DoubleSessionRecord): DoubleAttemptScope {
-		const generation = record.nextAttemptGeneration++;
-		return { attemptId: `${record.id}:attempt:${generation}`, generation, lineage: "main" };
-	}
-
-	private hosted(record: DoubleSessionRecord): HostedSdkSession {
-		return {
-			sessionFile: record.file,
-			sessionId: record.id,
-			subscribe: (listener) => {
-				record.listeners.add(listener);
-				return () => record.listeners.delete(listener);
+	constructor(options: FakeBrokerFixtureOptions = {}) {
+		this.root = fs.mkdtempSync(path.join(os.tmpdir(), "gajaeway-broker-fixture-"));
+		const workspace = path.resolve(options.workspace ?? path.join(this.root, "workspace"));
+		fs.mkdirSync(workspace, { recursive: true });
+		this.workspace = fs.realpathSync.native(workspace);
+		this.sessionId = options.sessionId ?? "external-main-session";
+		this.statePath = path.join(this.root, "broker-state.json");
+		this.executable = path.resolve(import.meta.dir, "../fixtures/fake-broker-cli.mjs");
+		const now = 1_700_000_000_000;
+		const session: FixtureSession = {
+			row: {
+				sessionId: this.sessionId,
+				locator: { repo: this.workspace, stateRoot: path.join(this.workspace, ".gjc", "state") },
+				endpointGeneration: 1,
+				pid: process.pid,
+				live: options.live ?? true,
+				deleted: false,
+				indexSeq: 1,
+				hostIncarnation: "fixture:1",
+				activity: { state: "idle", at: now },
+				lastHeartbeatAt: now,
+				identityProvenance: "composite",
 			},
-			subscribeGates: (listener) => {
-				record.gateListeners.add(listener);
-				return () => record.gateListeners.delete(listener);
-			},
-			prompt: async (text) => {
-				if (!fs.existsSync(record.file))
-					throw new Error("session transcript has not persisted its first assistant message");
-				const scope = this.nextAttemptScope(record);
-				// Match the real SDK's overlapping agent/turn lifecycle sources.
-				this.emit(record, { type: "agent_start", scope });
-				this.emit(record, { type: "turn_start", scope });
-				writeLine(record.file, { type: "message", role: "user", content: text });
-				const gateId = this.#gateOnPrompt?.text === text ? this.#gateOnPrompt.gateId : undefined;
-				if (gateId) {
-					const resolved = new Promise<void>((resolve) => record.pendingPromptGates.set(gateId, resolve));
-					this.openGate(record.file, gateId);
-					await resolved;
-				}
-				const message = this.finalAssistantMessage(record, "ack");
-				writeLine(record.file, { type: "message", role: "assistant", content: "ack" });
-				this.emit(record, {
-					type: "message_update",
-					message,
-					assistantMessageEvent: { type: "text_delta", delta: "ack" },
+			metadata: { sessionId: this.sessionId, name: "fixture-main", cwd: this.workspace, kind: options.kind ?? "main" },
+			context: { isStreaming: false, followupQueueDepth: 0 },
+			transcript: [
+				{ type: "session", id: this.sessionId },
+				{ type: "message", role: "assistant", content: "operator-owned session ready", responseId: "bootstrap:assistant", timestamp: now },
+			],
+			events: [],
+			operations: {},
+			nextSeq: 0,
+			nextGeneration: 1,
+			responseText: options.responseText,
+			commandLog: [],
+		};
+		this.write({ indexSeq: 1, sessions: { [this.sessionId]: session } });
+	}
+
+	environment(base: NodeJS.ProcessEnv = process.env): NodeJS.ProcessEnv {
+		return { ...base, GAJAEWAY_BROKER_FIXTURE_STATE: this.statePath };
+	}
+
+	read(): FixtureState {
+		return JSON.parse(fs.readFileSync(this.statePath, "utf8")) as FixtureState;
+	}
+
+	update(mutator: (session: FixtureSession, state: FixtureState) => void): void {
+		const state = this.read();
+		const session = state.sessions[this.sessionId];
+		if (!session) throw new Error("fixture session disappeared");
+		mutator(session, state);
+		this.write(state);
+	}
+
+	holdNextTurn(): void {
+		this.update(session => {
+			session.holdNext = true;
+		});
+	}
+
+	failNextTurn(): void {
+		this.update(session => {
+			session.failNext = true;
+		});
+	}
+
+	setLive(live: boolean): void {
+		this.update(session => {
+			session.row.live = live;
+		});
+	}
+
+	setRetentionGap(): void {
+		this.update(session => {
+			session.gap = { code: "retention_gap" };
+		});
+	}
+
+	setLocator(locator: { repo?: string; stateRoot?: string }): void {
+		this.update(session => {
+			const current = session.row.locator as { repo: string; stateRoot: string };
+			session.row.locator = { repo: locator.repo ?? current.repo, stateRoot: locator.stateRoot ?? current.stateRoot };
+		});
+	}
+
+	complete(opRef: string, options: { readonly failure?: boolean; readonly text?: string } = {}): void {
+		this.update(session => {
+			const operation = session.operations[opRef];
+			if (!operation || operation.completed) throw new Error(`fixture operation ${opRef} is not held`);
+			operation.completed = true;
+			if (options.failure) operation.failure = true;
+			if (options.text !== undefined) operation.responseText = options.text;
+			const scope = { attemptId: `${this.sessionId}:${opRef}`, generation: operation.generation ?? 1, lineage: "main" };
+			const append = (kind: string, payload: Record<string, unknown>) => {
+				session.nextSeq += 1;
+				session.events.push({ kind, id: `${this.sessionId}:${session.nextSeq}`, generation: 1, seq: session.nextSeq, payload });
+			};
+			if (operation.failure) {
+				append("agent_failed", {
+					type: "agent_failed",
+					sessionId: this.sessionId,
+					error: { code: "fixture_failure", message: "fixture injected turn failure" },
 					scope,
 				});
-				this.emit(record, { type: "message_end", message, scope });
-				this.emit(record, { type: "turn_end", message, toolResults: [], scope });
-				this.emit(record, { type: "agent_end", messages: [message], stopReason: "completed", scope });
-			},
-			steer: async (text) => {
-				if (!fs.existsSync(record.file))
-					throw new Error("session transcript has not persisted its first assistant message");
-				writeLine(record.file, { type: "message", role: "user", content: text, delivery: "steer" });
-				const message = this.finalAssistantMessage(record, "steered");
-				writeLine(record.file, { type: "message", role: "assistant", content: "steered" });
-				this.emit(record, {
-					type: "message_update",
-					message,
-					assistantMessageEvent: { type: "text_delta", delta: "steered" },
-				});
-				this.emit(record, { type: "message_end", message });
-			},
-			followUp: async () => {
-				record.followUpQueueDepth += 1;
-			},
-			followUpQueueDepth: () => record.followUpQueueDepth,
-			answerGate: async (gateId, _answer, _idempotencyKey) => {
-				const gate = record.gates.get(gateId);
-				if (!gate) return "not_found";
-				if (gate.state === "expired" || (gate.expiresAt !== undefined && gate.expiresAt <= Date.now())) {
-					gate.state = "expired";
-					return "expired";
+			} else {
+				const text = operation.responseText ?? session.responseText ?? (operation.operation === "turn.steer" ? "steered" : "ack");
+				const timestamp = 1_700_000_000_000 + session.nextSeq;
+				const responseId = `${this.sessionId}:assistant:${opRef}`;
+				const message = { role: "assistant", content: [{ type: "text", text }], responseId, timestamp };
+				session.transcript.push({ type: "message", role: "assistant", content: text, responseId, timestamp });
+				append("message_end", { type: "message_end", message, scope });
+				append("turn_end", { type: "turn_end", message, toolResults: [], scope });
+				append("agent_end", { type: "agent_end", messages: [message], stopReason: "completed", scope });
+			}
+			if (!operation.failure && operation.operation !== "turn.follow_up") {
+				for (const queued of Object.values(session.operations)) {
+					if (queued.operation !== "turn.follow_up" || queued.completed) continue;
+					queued.completed = true;
+					const queuedScope = {
+						attemptId: `${this.sessionId}:${queued.opRef}`,
+						generation: queued.generation ?? 1,
+						lineage: "main",
+					};
+					append("agent_start", { type: "agent_start", sessionId: this.sessionId, scope: queuedScope });
+					append("turn_start", { type: "turn_start", sessionId: this.sessionId, scope: queuedScope });
+					append("agent_start", { type: "agent_start", sessionId: this.sessionId, scope: queuedScope });
+					const queuedText = queued.responseText ?? session.responseText ?? "ack";
+					const queuedTimestamp = 1_700_000_000_000 + session.nextSeq;
+					const queuedResponseId = `${this.sessionId}:assistant:${queued.opRef}`;
+					const queuedMessage = {
+						role: "assistant",
+						content: [{ type: "text", text: queuedText }],
+						responseId: queuedResponseId,
+						timestamp: queuedTimestamp,
+					};
+					session.transcript.push({ type: "message", role: "user", content: queued.text, delivery: queued.operation });
+					session.transcript.push({ type: "message", role: "assistant", content: queuedText, responseId: queuedResponseId, timestamp: queuedTimestamp });
+					append("message_end", { type: "message_end", message: queuedMessage, scope: queuedScope });
+					append("turn_end", { type: "turn_end", message: queuedMessage, toolResults: [], scope: queuedScope });
+					append("agent_end", { type: "agent_end", messages: [queuedMessage], stopReason: "completed", scope: queuedScope });
 				}
-				if (gate.state === "resolved") return "already_resolved";
-				gate.state = "resolved";
-				this.emit(record, { type: "gate_resolved", gate_id: gateId, session_id: record.id });
-				const resolvePrompt = record.pendingPromptGates.get(gateId);
-				record.pendingPromptGates.delete(gateId);
-				resolvePrompt?.();
-				return "resolved";
-			},
-			sendBootstrapMessage: async (nonce) => {
-				if (!this.#persistBootstrapTranscript) return;
-				fs.writeFileSync(record.file, `${JSON.stringify({ type: "session", id: record.id })}\n`);
-				writeLine(record.file, { type: "message", role: "user", content: bootstrapNonceMarker(nonce) });
-				writeLine(record.file, { type: "message", role: "assistant", content: "bootstrap persisted" });
-			},
-			dispose: async () => undefined,
-		};
+			}
+			session.context.isStreaming = false;
+			session.context.followupQueueDepth = 0;
+		});
+	}
+
+	commands(): readonly Record<string, unknown>[] {
+		return this.read().sessions[this.sessionId]?.commandLog ?? [];
+	}
+
+	dispose(): void {
+		fs.rmSync(this.root, { recursive: true, force: true });
+	}
+
+	private write(state: FixtureState): void {
+		fs.writeFileSync(this.statePath, `${JSON.stringify(state)}\n`);
 	}
 }

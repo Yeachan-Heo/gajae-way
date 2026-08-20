@@ -399,9 +399,7 @@ test("gateway authority survives reconciliation and all routing quarantine predi
 	const submit = createMainAdmissionHandler(
 		{
 			turnState: "idle",
-			async prompt() {},
-			async steer() {},
-			async followUp() {},
+			async admit() {},
 		},
 		profile,
 		fixture.core,

@@ -1,6 +1,4 @@
 import * as crypto from "node:crypto";
-import * as fs from "node:fs";
-import * as path from "node:path";
 import type { CanonicalValue, ProfileIdentityProjection, WayProfile } from "../profile";
 import { profileProjectionCanonical } from "../profile";
 
@@ -58,34 +56,45 @@ export interface GatewayMetaBackend {
 	gatewayMetaTransaction(input: GatewayMetaTransactionInput): GatewayMetaTransactionOutput;
 }
 
-export interface SessionFingerprint {
-	readonly canonicalPath: string;
-	readonly sessionId: string;
-	readonly device: string;
-	readonly inode: string;
-	readonly nlink: string;
-	readonly size: number;
-	/** Millisecond integer representation required by SessionManager.openExistingStrict. */
-	readonly mtimeMs: number;
-	readonly mtimeNs: string;
-	readonly ctimeNs: string;
+/** A broker-projected transcript snapshot, not a local file path or inode claim. */
+export interface TranscriptFingerprint {
+	readonly entryCount: number;
 	readonly sha256: string;
+}
+
+/**
+ * Durable identity of an operator-owned external GJC session. The locator and
+ * transcript fingerprint bind adoption without granting gajaeway filesystem or
+ * process ownership of the interactive session.
+ */
+export interface ExternalSessionIdentity {
+	readonly version: 1;
+	readonly sessionId: string;
+	readonly locator: {
+		readonly repo: string;
+		readonly stateRoot: string;
+	};
+	readonly endpointGeneration: number;
+	readonly hostIncarnation?: string;
+	readonly transcript?: TranscriptFingerprint;
 }
 
 export interface BootstrapIntent {
 	readonly nonce: string;
 	readonly ts: number;
+	/** Exact external session requested before any adoption state is committed. */
+	readonly sessionId: string;
 }
 
 export interface GrowthIntent {
-	readonly base: SessionFingerprint;
+	readonly base: ExternalSessionIdentity;
 	readonly startedAt: number;
 }
 
 export interface DurableGatewayState {
 	readonly bootstrapState: BootstrapState;
 	readonly bootstrapIntent: BootstrapIntent | undefined;
-	readonly mainIdentity: SessionFingerprint | undefined;
+	readonly mainIdentity: ExternalSessionIdentity | undefined;
 	readonly growthIntent: GrowthIntent | undefined;
 	readonly profileDigest: string | undefined;
 	readonly profileDigestVersion: number;
@@ -113,13 +122,6 @@ export class GatewayStateConflictError extends GatewayStateError {
 	}
 }
 
-export class SessionFingerprintError extends GatewayStateError {
-	constructor(reason: string, message = reason) {
-		super(reason, message);
-		this.name = "SessionFingerprintError";
-	}
-}
-
 function parseJson(raw: string, key: string): unknown {
 	try {
 		return JSON.parse(raw) as unknown;
@@ -137,7 +139,6 @@ function requiredString(value: unknown, field: string): string {
 	return value;
 }
 
-
 function requiredNonNegativeInteger(value: unknown, field: string): number {
 	if (typeof value !== "number" || !Number.isSafeInteger(value) || value < 0) {
 		throw new GatewayStateError("metadata_invalid", `${field} must be a non-negative safe integer.`);
@@ -145,26 +146,15 @@ function requiredNonNegativeInteger(value: unknown, field: string): number {
 	return value;
 }
 
-
 function parseNullableJson(raw: string, key: string): unknown | undefined {
 	const value = parseJson(raw, key);
 	return value === null ? undefined : value;
 }
 
-function parseFingerprint(value: unknown, key: string): SessionFingerprint {
+function parseTranscriptFingerprint(value: unknown, key: string): TranscriptFingerprint {
 	if (!isRecord(value)) throw new GatewayStateError("metadata_invalid", `${key} must be an object.`);
-	const fingerprint: SessionFingerprint = {
-		canonicalPath: requiredString(value.canonicalPath, `${key}.canonicalPath`),
-		sessionId: requiredString(value.sessionId, `${key}.sessionId`),
-		device: requiredString(value.device, `${key}.device`),
-		inode: requiredString(value.inode, `${key}.inode`),
-		nlink: requiredString(value.nlink, `${key}.nlink`),
-		size: requiredNonNegativeInteger(value.size, `${key}.size`),
-		mtimeMs: requiredNonNegativeInteger(value.mtimeMs, `${key}.mtimeMs`),
-
-
-		mtimeNs: requiredString(value.mtimeNs, `${key}.mtimeNs`),
-		ctimeNs: requiredString(value.ctimeNs, `${key}.ctimeNs`),
+	const fingerprint = {
+		entryCount: requiredNonNegativeInteger(value.entryCount, `${key}.entryCount`),
 		sha256: requiredString(value.sha256, `${key}.sha256`),
 	};
 	if (!/^[a-f0-9]{64}$/i.test(fingerprint.sha256)) {
@@ -173,15 +163,41 @@ function parseFingerprint(value: unknown, key: string): SessionFingerprint {
 	return fingerprint;
 }
 
+function parseExternalIdentity(value: unknown, key: string): ExternalSessionIdentity {
+	if (!isRecord(value)) throw new GatewayStateError("metadata_invalid", `${key} must be an object.`);
+	const locator = value.locator;
+	if (!isRecord(locator)) throw new GatewayStateError("metadata_invalid", `${key}.locator must be an object.`);
+	const hostIncarnation = value.hostIncarnation;
+	if (hostIncarnation !== undefined && (typeof hostIncarnation !== "string" || !hostIncarnation)) {
+		throw new GatewayStateError("metadata_invalid", `${key}.hostIncarnation must be a non-empty string.`);
+	}
+	if (value.version !== 1) throw new GatewayStateError("metadata_invalid", `${key}.version must be 1.`);
+	return {
+		version: 1,
+		sessionId: requiredString(value.sessionId, `${key}.sessionId`),
+		locator: {
+			repo: requiredString(locator.repo, `${key}.locator.repo`),
+			stateRoot: requiredString(locator.stateRoot, `${key}.locator.stateRoot`),
+		},
+		endpointGeneration: requiredNonNegativeInteger(value.endpointGeneration, `${key}.endpointGeneration`),
+		...(hostIncarnation === undefined ? {} : { hostIncarnation }),
+		...(value.transcript === undefined ? {} : { transcript: parseTranscriptFingerprint(value.transcript, `${key}.transcript`) }),
+	};
+}
+
 function parseBootstrapIntent(value: unknown): BootstrapIntent {
 	if (!isRecord(value)) throw new GatewayStateError("metadata_invalid", "bootstrap_intent must be an object.");
-	return { nonce: requiredString(value.nonce, "bootstrap_intent.nonce"), ts: requiredNonNegativeInteger(value.ts, "bootstrap_intent.ts") };
+	return {
+		nonce: requiredString(value.nonce, "bootstrap_intent.nonce"),
+		ts: requiredNonNegativeInteger(value.ts, "bootstrap_intent.ts"),
+		sessionId: requiredString(value.sessionId, "bootstrap_intent.sessionId"),
+	};
 }
 
 function parseGrowthIntent(value: unknown): GrowthIntent {
 	if (!isRecord(value)) throw new GatewayStateError("metadata_invalid", "growth_intent must be an object.");
 	return {
-		base: parseFingerprint(value.base, "growth_intent.base"),
+		base: parseExternalIdentity(value.base, "growth_intent.base"),
 		startedAt: requiredNonNegativeInteger(value.startedAt, "growth_intent.startedAt"),
 	};
 }
@@ -242,7 +258,7 @@ function parsedState(values: ReadonlyMap<string, string>): DurableGatewayState {
 	return {
 		bootstrapState,
 		bootstrapIntent: bootstrapIntentRaw === undefined ? undefined : parseBootstrapIntent(bootstrapIntentRaw),
-		mainIdentity: mainIdentityRaw === undefined ? undefined : parseFingerprint(mainIdentityRaw, "main_identity"),
+		mainIdentity: mainIdentityRaw === undefined ? undefined : parseExternalIdentity(mainIdentityRaw, "main_identity"),
 		growthIntent: growthIntentRaw === undefined ? undefined : parseGrowthIntent(growthIntentRaw),
 		profileDigest,
 		profileDigestVersion,
@@ -258,141 +274,55 @@ function stableMetadataJson(value: unknown): string {
 	return JSON.stringify(value);
 }
 
-function fingerprintJson(fingerprint: SessionFingerprint): string {
-	return stableMetadataJson(fingerprint);
+function identityJson(identity: ExternalSessionIdentity): string {
+	return stableMetadataJson(identity);
 }
 
-export function sameIdentityFields(left: SessionFingerprint, right: SessionFingerprint): boolean {
+function canonicalJson(value: unknown): string {
+	if (value === null || typeof value === "boolean" || typeof value === "number" || typeof value === "string") return JSON.stringify(value);
+	if (Array.isArray(value)) return `[${value.map(canonicalJson).join(",")}]`;
+	if (isRecord(value)) {
+		return `{${Object.keys(value)
+			.sort()
+			.map(key => `${JSON.stringify(key)}:${canonicalJson(value[key])}`)
+			.join(",")}}`;
+	}
+	throw new GatewayStateError("transcript_fingerprint_invalid", "Transcript entries must be JSON values.");
+}
+
+/** Hashes a broker-projected transcript snapshot using deterministic object ordering. */
+export function fingerprintTranscriptEntries(entries: readonly unknown[]): TranscriptFingerprint {
+	const hash = crypto.createHash("sha256");
+	for (const entry of entries) hash.update(canonicalJson(entry)).update("\n");
+	return { entryCount: entries.length, sha256: hash.digest("hex") };
+}
+
+/** Compares the permanent adopted identity; broker process generations may legitimately advance. */
+export function sameExternalSession(left: ExternalSessionIdentity, right: ExternalSessionIdentity): boolean {
 	return (
-		left.canonicalPath === right.canonicalPath &&
+		left.version === right.version &&
 		left.sessionId === right.sessionId &&
-		left.device === right.device &&
-		left.inode === right.inode &&
-		left.nlink === right.nlink
+		left.locator.repo === right.locator.repo &&
+		left.locator.stateRoot === right.locator.stateRoot
 	);
 }
 
-export function sameFingerprint(left: SessionFingerprint, right: SessionFingerprint): boolean {
-	return (
-		sameIdentityFields(left, right) &&
-		left.size === right.size &&
-		left.mtimeMs === right.mtimeMs &&
-		left.mtimeNs === right.mtimeNs &&
-		left.ctimeNs === right.ctimeNs &&
-		left.sha256 === right.sha256
-	);
+export function sameExternalFingerprint(left: ExternalSessionIdentity, right: ExternalSessionIdentity): boolean {
+	if (!sameExternalSession(left, right)) return false;
+	if (left.transcript === undefined || right.transcript === undefined) return left.transcript === right.transcript;
+	return left.transcript.entryCount === right.transcript.entryCount && left.transcript.sha256 === right.transcript.sha256;
 }
 
-function bigintStatValue(stat: fs.BigIntStats, field: keyof fs.BigIntStats): bigint {
-	const value = stat[field];
-	if (typeof value !== "bigint") throw new SessionFingerprintError("stat_invalid", `${String(field)} is not a bigint.`);
-	return value;
-}
-
-function sessionIdFromTranscript(bytes: Buffer): string {
-	const newline = bytes.indexOf(0x0a);
-	const headerText = bytes.subarray(0, newline === -1 ? bytes.length : newline).toString("utf8");
-	let header: unknown;
-	try {
-		header = JSON.parse(headerText) as unknown;
-	} catch {
-		throw new SessionFingerprintError("transcript_malformed", "Session transcript header is not JSON.");
-	}
-	if (!isRecord(header) || header.type !== "session") {
-		throw new SessionFingerprintError("transcript_malformed", "Session transcript is missing its session header.");
-	}
-	return requiredString(header.id, "session.id");
-}
-
-function sameStat(before: fs.BigIntStats, after: fs.BigIntStats): boolean {
-	return (
-		bigintStatValue(before, "dev") === bigintStatValue(after, "dev") &&
-		bigintStatValue(before, "ino") === bigintStatValue(after, "ino") &&
-		bigintStatValue(before, "nlink") === bigintStatValue(after, "nlink") &&
-		bigintStatValue(before, "size") === bigintStatValue(after, "size") &&
-		bigintStatValue(before, "mtimeNs") === bigintStatValue(after, "mtimeNs") &&
-		bigintStatValue(before, "ctimeNs") === bigintStatValue(after, "ctimeNs")
-	);
-}
-
-/** Captures a stable, full transcript fingerprint without trusting a path alias. */
-export function fingerprintSessionFile(sessionPath: string): SessionFingerprint {
-	let canonicalPath: string;
-	try {
-		canonicalPath = fs.realpathSync.native(sessionPath);
-	} catch (error) {
-		throw new SessionFingerprintError("session_missing", error instanceof Error ? error.message : String(error));
-	}
-	const noFollow = fs.constants.O_NOFOLLOW ?? 0;
-	let fileDescriptor: number;
-	try {
-		fileDescriptor = fs.openSync(canonicalPath, fs.constants.O_RDONLY | noFollow);
-	} catch (error) {
-		throw new SessionFingerprintError("session_open_failed", error instanceof Error ? error.message : String(error));
-	}
-	try {
-		const before = fs.fstatSync(fileDescriptor, { bigint: true });
-		if (!before.isFile()) throw new SessionFingerprintError("session_not_regular", "Session transcript is not a regular file.");
-		const bytes = fs.readFileSync(fileDescriptor);
-		const after = fs.fstatSync(fileDescriptor, { bigint: true });
-		if (!sameStat(before, after)) throw new SessionFingerprintError("session_unstable", "Session transcript changed while it was fingerprinted.");
-		const size = bigintStatValue(before, "size");
-		if (size > BigInt(Number.MAX_SAFE_INTEGER)) throw new SessionFingerprintError("session_too_large", "Session transcript exceeds safe size bounds.");
-		return {
-			canonicalPath,
-			sessionId: sessionIdFromTranscript(bytes),
-			device: bigintStatValue(before, "dev").toString(),
-			inode: bigintStatValue(before, "ino").toString(),
-			nlink: bigintStatValue(before, "nlink").toString(),
-			size: Number(size),
-			mtimeMs: Number(bigintStatValue(before, "mtimeMs")),
-			mtimeNs: bigintStatValue(before, "mtimeNs").toString(),
-			ctimeNs: bigintStatValue(before, "ctimeNs").toString(),
-			sha256: crypto.createHash("sha256").update(bytes).digest("hex"),
-		};
-	} finally {
-		fs.closeSync(fileDescriptor);
-	}
-}
-
-/** Proves that an unrefreshed transcript can only have grown by appending. */
-export function attestAppendOnlyGrowth(base: SessionFingerprint, current: SessionFingerprint): boolean {
-	if (!sameIdentityFields(base, current) || current.size < base.size) return false;
-	const noFollow = fs.constants.O_NOFOLLOW ?? 0;
-	let descriptor: number;
-	try {
-		descriptor = fs.openSync(current.canonicalPath, fs.constants.O_RDONLY | noFollow);
-	} catch {
-		return false;
-	}
-	try {
-		const before = fs.fstatSync(descriptor, { bigint: true });
-		if (
-			bigintStatValue(before, "dev").toString() !== base.device ||
-			bigintStatValue(before, "ino").toString() !== base.inode ||
-			bigintStatValue(before, "nlink").toString() !== base.nlink ||
-			bigintStatValue(before, "size") < BigInt(base.size)
-		) {
-			return false;
-		}
-		const hash = crypto.createHash("sha256");
-		const buffer = Buffer.allocUnsafe(Math.min(64 * 1024, Math.max(base.size, 1)));
-		let offset = 0;
-		while (offset < base.size) {
-			const wanted = Math.min(buffer.length, base.size - offset);
-			const read = fs.readSync(descriptor, buffer, 0, wanted, offset);
-			if (read <= 0) return false;
-			hash.update(buffer.subarray(0, read));
-			offset += read;
-		}
-		const after = fs.fstatSync(descriptor, { bigint: true });
-		if (!sameStat(before, after)) return false;
-		return hash.digest("hex") === base.sha256;
-	} catch {
-		return false;
-	} finally {
-		fs.closeSync(descriptor);
-	}
+/**
+ * Recomputes the stored prefix from a fresh complete broker transcript snapshot.
+ * This proves append-only growth without reading, resuming, or owning the GJC
+ * transcript file directly.
+ */
+export function attestsExternalTranscriptGrowth(base: ExternalSessionIdentity, entries: readonly unknown[]): boolean {
+	if (!base.transcript) return true;
+	if (entries.length < base.transcript.entryCount) return false;
+	const prefix = fingerprintTranscriptEntries(entries.slice(0, base.transcript.entryCount));
+	return prefix.entryCount === base.transcript.entryCount && prefix.sha256 === base.transcript.sha256;
 }
 
 export class GatewayStateStore {
@@ -434,7 +364,7 @@ export class GatewayStateStore {
 		});
 	}
 
-	commitBootstrap(expectedState: "CREATING" | "CREATED", intent: BootstrapIntent, identity: SessionFingerprint, profile: WayProfile): void {
+	commitBootstrap(expectedState: "CREATING" | "CREATED", intent: BootstrapIntent, identity: ExternalSessionIdentity, profile: WayProfile): void {
 		this.transact({
 			expected: [
 				{ key: "bootstrap_state", value: expectedState },
@@ -443,7 +373,7 @@ export class GatewayStateStore {
 			puts: [
 				{ key: "bootstrap_state", value: "COMMITTED" },
 				{ key: "bootstrap_intent", value: "null" },
-				{ key: "main_identity", value: fingerprintJson(identity) },
+				{ key: "main_identity", value: identityJson(identity) },
 				{ key: "growth_intent", value: "null" },
 				{ key: "profile_digest", value: profile.digest.sha256 },
 				{ key: "profile_digest_version", value: String(profile.digest.version) },
@@ -469,12 +399,12 @@ export class GatewayStateStore {
 		});
 	}
 
-	writeGrowthIntent(identity: SessionFingerprint, startedAt: number): void {
+	writeGrowthIntent(identity: ExternalSessionIdentity, startedAt: number): void {
 		const intent: GrowthIntent = { base: identity, startedAt };
 		this.transact({
 			expected: [
 				{ key: "bootstrap_state", value: "COMMITTED" },
-				{ key: "main_identity", value: fingerprintJson(identity) },
+				{ key: "main_identity", value: identityJson(identity) },
 				{ key: "growth_intent", value: "null" },
 			],
 			puts: [{ key: "growth_intent", value: stableMetadataJson(intent) }],
@@ -482,26 +412,28 @@ export class GatewayStateStore {
 		});
 	}
 
-	refreshAfterGrowth(intent: GrowthIntent, identity: SessionFingerprint): void {
+	refreshAfterGrowth(intent: GrowthIntent, identity: ExternalSessionIdentity): void {
 		this.transact({
 			expected: [
 				{ key: "bootstrap_state", value: "COMMITTED" },
 				{ key: "growth_intent", value: stableMetadataJson(intent) },
 			],
 			puts: [
-				{ key: "main_identity", value: fingerprintJson(identity) },
+				{ key: "main_identity", value: identityJson(identity) },
 				{ key: "growth_intent", value: "null" },
 			],
 			deletes: [],
 		});
 	}
 
-	refreshRecoveredGrowth(intent: GrowthIntent, identity: SessionFingerprint): void {
+	refreshRecoveredGrowth(intent: GrowthIntent, identity: ExternalSessionIdentity): void {
 		this.refreshAfterGrowth(intent, identity);
 	}
 
 	setTunablesRevision(revision: number): void {
-		if (!Number.isSafeInteger(revision) || revision < 0) throw new GatewayStateError("revision_invalid", "Profile tunables revision is invalid.");
+		if (!Number.isSafeInteger(revision) || revision < 0) {
+			throw new GatewayStateError("revision_invalid", "Profile tunables revision is invalid.");
+		}
 		const state = this.read();
 		if (state.profileTunablesRevision === revision) return;
 		this.transact({

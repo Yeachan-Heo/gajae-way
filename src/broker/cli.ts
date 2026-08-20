@@ -1,6 +1,6 @@
 import { spawn } from "node:child_process";
 
-/** The published `gjc sdk session` list envelope version. */
+/** The published `gjc sdk session` row DTO version. */
 export const SESSION_ROWS_VERSION = 1;
 const MAX_CAPTURED_OUTPUT_BYTES = 8 * 1024 * 1024;
 const DEFAULT_COMMAND_TIMEOUT_MS = 10_000;
@@ -38,6 +38,54 @@ export interface SessionMetadataV1 {
 	readonly kind: string;
 }
 
+export interface SdkCheckpointRecordV1 {
+	readonly revision: number;
+	readonly generation: number;
+	readonly seq: number;
+}
+
+export interface SdkRetentionGapV1 {
+	readonly code: "retention_gap";
+	readonly missing?: { readonly from: number; readonly to: number };
+	readonly resync?: SdkCheckpointRecordV1;
+}
+
+export interface SdkTailItemV1 {
+	readonly kind: string;
+	readonly id?: string;
+	readonly generation?: number;
+	readonly seq?: number;
+	readonly payload: unknown;
+}
+
+export interface SdkTailEnvelopeV1 {
+	readonly version: typeof SESSION_ROWS_VERSION;
+	readonly source: "session" | "offline";
+	readonly session: SdkSessionRowV1;
+	readonly checkpoint?: SdkCheckpointRecordV1;
+	readonly gap?: SdkRetentionGapV1;
+	readonly items: readonly SdkTailItemV1[];
+	readonly terminal?: boolean;
+}
+
+export type BrokerTurnOperation = "turn.prompt" | "turn.steer" | "turn.follow_up";
+
+/** A broker acknowledgement means the external host accepted this operation, not that its turn completed. */
+export interface BrokerOperationReceipt {
+	readonly sessionId: string;
+	readonly operation: BrokerTurnOperation;
+	readonly operationRef: string;
+	readonly commandId?: string;
+	readonly turnId?: string;
+}
+
+export interface BrokerTurnStatus {
+	readonly operationRef: string;
+	readonly status: string;
+	readonly completed: boolean;
+	readonly detail: unknown;
+}
+
 export class BrokerCliError extends Error {
 	readonly code: string;
 	readonly stderr?: string;
@@ -55,7 +103,7 @@ export class BrokerDtoParseError extends BrokerCliError {
 	readonly path: string;
 
 	constructor(path: string, message: string) {
-		super("broker_dto_drift", `Invalid SdkSessionRowV1 DTO at ${path}: ${message}`);
+		super("broker_dto_drift", `Invalid broker CLI DTO at ${path}: ${message}`);
 		this.name = "BrokerDtoParseError";
 		this.path = path;
 	}
@@ -72,6 +120,8 @@ export interface BrokerCliOptions {
 	/** Path override used by deterministic fixtures; production defaults to `gjc`. */
 	readonly executable?: string;
 	readonly commandTimeoutMs?: number;
+	/** Explicit inherited environment for deterministic broker processes. */
+	readonly environment?: NodeJS.ProcessEnv;
 }
 
 export interface BrokerCommand {
@@ -202,12 +252,16 @@ function parseRow(value: unknown, path: string): SdkSessionRowV1 {
 	};
 }
 
-/** Parses exactly the published `gjc sdk session list` stdout envelope. */
-export function parseSessionRows(stdout: string): SdkSessionRowsV1 {
+function successResult(stdout: string): Record<string, unknown> {
 	const envelope = record(parseJson(stdout, "$"), "$");
 	exactKeys(envelope, ["ok", "result"], "$");
 	if (envelope.ok !== true) throw new BrokerDtoParseError("$.ok", "must be true");
-	const result = record(envelope.result, "$.result");
+	return record(envelope.result, "$.result");
+}
+
+/** Parses exactly the published `gjc sdk session list` stdout envelope. */
+export function parseSessionRows(stdout: string): SdkSessionRowsV1 {
+	const result = successResult(stdout);
 	exactKeys(result, ["version", "source", "indexSeq", "sessions", "warnings"], "$.result");
 	if (result.version !== SESSION_ROWS_VERSION) {
 		throw new BrokerDtoParseError("$.result.version", `expected SESSION_ROWS_VERSION ${SESSION_ROWS_VERSION}`);
@@ -228,6 +282,18 @@ export function parseSessionRows(stdout: string): SdkSessionRowsV1 {
 	};
 }
 
+export function parseSessionInspect(stdout: string, expectedSessionId: string): SdkSessionRowV1 {
+	const result = successResult(stdout);
+	exactKeys(result, ["version", "source", "session"], "$.result");
+	if (result.version !== SESSION_ROWS_VERSION) {
+		throw new BrokerDtoParseError("$.result.version", `expected SESSION_ROWS_VERSION ${SESSION_ROWS_VERSION}`);
+	}
+	if (result.source !== "broker") throw new BrokerDtoParseError("$.result.source", "must be broker");
+	const session = parseRow(result.session, "$.result.session");
+	if (session.sessionId !== expectedSessionId) throw new BrokerDtoParseError("$.result.session.sessionId", `expected ${expectedSessionId}`);
+	return session;
+}
+
 function metadataCandidate(result: Record<string, unknown>): unknown {
 	if (isRecord(result.page)) {
 		const page = result.page;
@@ -242,10 +308,7 @@ function metadataCandidate(result: Record<string, unknown>): unknown {
 
 /** Parses `session.metadata` without trusting host-provided optional fields. */
 export function parseSessionMetadata(stdout: string, expectedSessionId: string): SessionMetadataV1 {
-	const envelope = record(parseJson(stdout, "$"), "$");
-	exactKeys(envelope, ["ok", "result"], "$");
-	if (envelope.ok !== true) throw new BrokerDtoParseError("$.ok", "must be true");
-	const item = record(metadataCandidate(record(envelope.result, "$.result")), "$.result");
+	const item = record(metadataCandidate(successResult(stdout)), "$.result");
 	exactKeys(item, ["sessionId", "name", "cwd", "kind"], "$.result");
 	const metadata = {
 		sessionId: requiredString(item.sessionId, "$.result.sessionId"),
@@ -259,6 +322,145 @@ export function parseSessionMetadata(stdout: string, expectedSessionId: string):
 	return metadata;
 }
 
+function parseCheckpoint(value: unknown, path: string): SdkCheckpointRecordV1 {
+	const checkpoint = record(value, path);
+	exactKeys(checkpoint, ["revision", "generation", "seq"], path);
+	return {
+		revision: safeInteger(checkpoint.revision, `${path}.revision`),
+		generation: safeInteger(checkpoint.generation, `${path}.generation`),
+		seq: safeInteger(checkpoint.seq, `${path}.seq`),
+	};
+}
+
+function parseGap(value: unknown, path: string): SdkRetentionGapV1 {
+	const gap = record(value, path);
+	exactKeys(gap, ["code", "missing", "resync"], path);
+	if (gap.code !== "retention_gap") throw new BrokerDtoParseError(`${path}.code`, "must be retention_gap");
+	let missing: SdkRetentionGapV1["missing"];
+	if (gap.missing !== undefined) {
+		const candidate = record(gap.missing, `${path}.missing`);
+		exactKeys(candidate, ["from", "to"], `${path}.missing`);
+		missing = {
+			from: safeInteger(candidate.from, `${path}.missing.from`),
+			to: safeInteger(candidate.to, `${path}.missing.to`),
+		};
+	}
+	return {
+		code: "retention_gap",
+		...(missing === undefined ? {} : { missing }),
+		...(gap.resync === undefined ? {} : { resync: parseCheckpoint(gap.resync, `${path}.resync`) }),
+	};
+}
+
+function parseTailItem(value: unknown, path: string): SdkTailItemV1 {
+	const item = record(value, path);
+	exactKeys(item, ["kind", "id", "generation", "seq", "payload"], path);
+	return {
+		kind: requiredString(item.kind, `${path}.kind`),
+		...(item.id === undefined ? {} : { id: requiredString(item.id, `${path}.id`) }),
+		...(item.generation === undefined ? {} : { generation: safeInteger(item.generation, `${path}.generation`) }),
+		...(item.seq === undefined ? {} : { seq: safeInteger(item.seq, `${path}.seq`) }),
+		payload: item.payload,
+	};
+}
+
+export function parseTailEnvelope(stdout: string, expectedSessionId: string): SdkTailEnvelopeV1 {
+	const result = successResult(stdout);
+	exactKeys(result, ["version", "source", "session", "checkpoint", "gap", "items", "terminal"], "$.result");
+	if (result.version !== SESSION_ROWS_VERSION) {
+		throw new BrokerDtoParseError("$.result.version", `expected SESSION_ROWS_VERSION ${SESSION_ROWS_VERSION}`);
+	}
+	if (result.source !== "session" && result.source !== "offline") {
+		throw new BrokerDtoParseError("$.result.source", "must be session or offline");
+	}
+	if (!Array.isArray(result.items)) throw new BrokerDtoParseError("$.result.items", "must be an array");
+	const session = parseRow(result.session, "$.result.session");
+	if (session.sessionId !== expectedSessionId) throw new BrokerDtoParseError("$.result.session.sessionId", `expected ${expectedSessionId}`);
+	return {
+		version: SESSION_ROWS_VERSION,
+		source: result.source,
+		session,
+		...(result.checkpoint === undefined ? {} : { checkpoint: parseCheckpoint(result.checkpoint, "$.result.checkpoint") }),
+		...(result.gap === undefined ? {} : { gap: parseGap(result.gap, "$.result.gap") }),
+		items: result.items.map((item, index) => parseTailItem(item, `$.result.items[${index}]`)),
+		...(result.terminal === undefined ? {} : { terminal: requiredBoolean(result.terminal, "$.result.terminal") }),
+	};
+}
+
+function parseOperationReceipt(
+	stdout: string,
+	expectedSessionId: string,
+	expectedOperation: BrokerTurnOperation,
+	expectedOperationRef: string,
+	fromSend: boolean,
+): BrokerOperationReceipt {
+	const result = successResult(stdout);
+	const candidate = fromSend ? record(result.receipt, "$.result.receipt") : result;
+	if (fromSend) {
+		exactKeys(result, ["version", "operationRef", "status", "receipt"], "$.result");
+		if (result.version !== SESSION_ROWS_VERSION) {
+			throw new BrokerDtoParseError("$.result.version", `expected SESSION_ROWS_VERSION ${SESSION_ROWS_VERSION}`);
+		}
+		if (requiredString(result.operationRef, "$.result.operationRef") !== expectedOperationRef) {
+			throw new BrokerDtoParseError("$.result.operationRef", `expected ${expectedOperationRef}`);
+		}
+		if (result.status !== "accepted") throw new BrokerDtoParseError("$.result.status", "must be accepted");
+	}
+	if (candidate.accepted !== true) throw new BrokerDtoParseError(fromSend ? "$.result.receipt.accepted" : "$.result.accepted", "must be true");
+	const sessionId = requiredString(candidate.sessionId, fromSend ? "$.result.receipt.sessionId" : "$.result.sessionId");
+	if (sessionId !== expectedSessionId) throw new BrokerDtoParseError("$.result.sessionId", `expected ${expectedSessionId}`);
+	const operation = requiredString(candidate.operation, fromSend ? "$.result.receipt.operation" : "$.result.operation");
+	if (operation !== expectedOperation) throw new BrokerDtoParseError("$.result.operation", `expected ${expectedOperation}`);
+	const clientRef = typeof candidate.clientRef === "string" ? candidate.clientRef : undefined;
+	if (clientRef !== undefined && clientRef !== expectedOperationRef) {
+		throw new BrokerDtoParseError("$.result.clientRef", `expected ${expectedOperationRef}`);
+	}
+	return {
+		sessionId,
+		operation: expectedOperation,
+		operationRef: expectedOperationRef,
+		...(typeof candidate.commandId === "string" && candidate.commandId ? { commandId: candidate.commandId } : {}),
+		...(typeof candidate.turnId === "string" && candidate.turnId ? { turnId: candidate.turnId } : {}),
+	};
+}
+
+function parseTurnStatus(stdout: string, expectedOperationRef: string): BrokerTurnStatus {
+	const result = successResult(stdout);
+	exactKeys(result, ["version", "operationRef", "status", "summary"], "$.result");
+	if (result.version !== SESSION_ROWS_VERSION) {
+		throw new BrokerDtoParseError("$.result.version", `expected SESSION_ROWS_VERSION ${SESSION_ROWS_VERSION}`);
+	}
+	if (requiredString(result.operationRef, "$.result.operationRef") !== expectedOperationRef) {
+		throw new BrokerDtoParseError("$.result.operationRef", `expected ${expectedOperationRef}`);
+	}
+	const status = record(result.status, "$.result.status");
+	const summary = record(result.summary, "$.result.summary");
+	exactKeys(summary, ["completed"], "$.result.summary");
+	return {
+		operationRef: expectedOperationRef,
+		status: requiredString(status.status, "$.result.status.status"),
+		completed: requiredBoolean(summary.completed, "$.result.summary.completed"),
+		detail: status,
+	};
+}
+
+function extractBrokerError(stdout: string, stderr: string): BrokerCliError | undefined {
+	try {
+		const envelope = JSON.parse(stdout) as unknown;
+		if (!isRecord(envelope) || envelope.ok !== false || !isRecord(envelope.error)) return undefined;
+		const code = typeof envelope.error.code === "string" && envelope.error.code ? envelope.error.code : "broker_command_failed";
+		const message =
+			typeof envelope.error.message === "string" && envelope.error.message ? envelope.error.message : "Broker CLI rejected the request.";
+		return new BrokerCliError(code, message, { stderr });
+	} catch {
+		return undefined;
+	}
+}
+
+function timeoutArgument(timeoutMs: number | undefined): string[] {
+	return timeoutMs === undefined ? [] : ["--timeout-ms", String(timeoutMs)];
+}
+
 /**
  * Spawn-only broker boundary. Commands are passed as argv arrays and never via
  * a shell string so a session id cannot alter process execution.
@@ -266,10 +468,12 @@ export function parseSessionMetadata(stdout: string, expectedSessionId: string):
 export class BrokerCli {
 	readonly executable: string;
 	readonly commandTimeoutMs: number;
+	readonly #environment: NodeJS.ProcessEnv | undefined;
 
 	constructor(options: BrokerCliOptions = {}) {
 		this.executable = options.executable?.trim() || "gjc";
 		this.commandTimeoutMs = options.commandTimeoutMs ?? DEFAULT_COMMAND_TIMEOUT_MS;
+		this.#environment = options.environment;
 		if (!Number.isSafeInteger(this.commandTimeoutMs) || this.commandTimeoutMs <= 0 || this.commandTimeoutMs > 20_000) {
 			throw new BrokerCliError("invalid_broker_timeout", "Broker command timeout must be an integer in 1..=20000 ms.");
 		}
@@ -278,6 +482,12 @@ export class BrokerCli {
 	async listSessions(options: { readonly timeoutMs?: number } = {}): Promise<SdkSessionRowsV1> {
 		const stdout = await this.run(["sdk", "session", "list"], options.timeoutMs);
 		return parseSessionRows(stdout);
+	}
+
+	async inspectSession(sessionId: string, options: { readonly timeoutMs?: number } = {}): Promise<SdkSessionRowV1> {
+		if (!sessionId.trim()) throw new BrokerCliError("invalid_session_id", "Cannot inspect an empty session id.");
+		const stdout = await this.run(["sdk", "session", "inspect", sessionId], options.timeoutMs);
+		return parseSessionInspect(stdout, sessionId);
 	}
 
 	async sessionMetadata(sessionId: string, options: { readonly timeoutMs?: number } = {}): Promise<SessionMetadataV1> {
@@ -298,6 +508,111 @@ export class BrokerCli {
 		return parseSessionMetadata(stdout, sessionId);
 	}
 
+	async sendPrompt(
+		sessionId: string,
+		text: string,
+		operationRef: string,
+		options: { readonly timeoutMs?: number } = {},
+	): Promise<BrokerOperationReceipt> {
+		this.assertOperationInput(sessionId, text, operationRef);
+		const stdout = await this.run(
+			["sdk", "session", "send", sessionId, "--text", text, "--op-ref", operationRef, ...timeoutArgument(options.timeoutMs)],
+			options.timeoutMs,
+		);
+		return parseOperationReceipt(stdout, sessionId, "turn.prompt", operationRef, true);
+	}
+
+	async controlTurn(
+		sessionId: string,
+		operation: Exclude<BrokerTurnOperation, "turn.prompt">,
+		text: string,
+		operationRef: string,
+		options: { readonly timeoutMs?: number } = {},
+	): Promise<BrokerOperationReceipt> {
+		this.assertOperationInput(sessionId, text, operationRef);
+		const input = JSON.stringify({ text, clientRef: operationRef });
+		const stdout = await this.run(
+			[
+				"sdk",
+				"session",
+				"raw",
+				"control",
+				sessionId,
+				"--op",
+				operation,
+				"--json-input",
+				input,
+				...timeoutArgument(options.timeoutMs),
+			],
+			options.timeoutMs,
+		);
+		return parseOperationReceipt(stdout, sessionId, operation, operationRef, false);
+	}
+
+	async turnStatus(
+		sessionId: string,
+		operationRef: string,
+		options: { readonly timeoutMs?: number } = {},
+	): Promise<BrokerTurnStatus> {
+		if (!sessionId.trim() || !operationRef.trim()) throw new BrokerCliError("invalid_operation_ref", "Session id and operation reference are required.");
+		const stdout = await this.run(
+			["sdk", "session", "status", sessionId, operationRef, ...timeoutArgument(options.timeoutMs)],
+			options.timeoutMs,
+		);
+		return parseTurnStatus(stdout, operationRef);
+	}
+
+	async tailSession(
+		sessionId: string,
+		options: {
+			readonly repo: string;
+			readonly cursor?: string;
+			readonly untilIdle?: boolean;
+			readonly strict?: boolean;
+			readonly allEvents?: boolean;
+			readonly timeoutMs?: number;
+		},
+	): Promise<SdkTailEnvelopeV1> {
+		if (!sessionId.trim()) throw new BrokerCliError("invalid_session_id", "Cannot tail an empty session id.");
+		const args = ["sdk", "session", "tail", sessionId, "--repo", options.repo];
+		if (options.cursor) args.push("--cursor", options.cursor);
+		if (options.untilIdle === true) args.push("--until-idle");
+		if (options.strict === true) args.push("--strict");
+		if (options.allEvents === true) args.push("--all-events");
+		args.push(...timeoutArgument(options.timeoutMs));
+		const stdout = await this.run(args, options.timeoutMs);
+		return parseTailEnvelope(stdout, sessionId);
+	}
+
+	async contextState(
+		sessionId: string,
+		options: { readonly timeoutMs?: number } = {},
+	): Promise<{ readonly isStreaming: boolean; readonly followUpQueueDepth: number }> {
+		if (!sessionId.trim()) throw new BrokerCliError("invalid_session_id", "Cannot query an empty session id.");
+		const stdout = await this.run(
+			["sdk", "session", "raw", "query", sessionId, "--query", "context.get", ...timeoutArgument(options.timeoutMs)],
+			options.timeoutMs,
+		);
+		const result = successResult(stdout);
+		const candidate = isRecord(result.page)
+			? Array.isArray(result.page.items) && result.page.items.length === 1
+				? result.page.items[0]
+				: undefined
+			: result;
+		const context = record(candidate, "$.result");
+		const followUpQueueDepth = context.followupQueueDepth ?? context.followUpQueueDepth;
+		return {
+			isStreaming: requiredBoolean(context.isStreaming, "$.result.isStreaming"),
+			followUpQueueDepth: safeInteger(followUpQueueDepth, "$.result.followupQueueDepth"),
+		};
+	}
+
+	private assertOperationInput(sessionId: string, text: string, operationRef: string): void {
+		if (!sessionId.trim()) throw new BrokerCliError("invalid_session_id", "A non-empty session id is required.");
+		if (!text.trim()) throw new BrokerCliError("invalid_prompt", "A non-empty prompt is required.");
+		if (!operationRef.trim()) throw new BrokerCliError("invalid_operation_ref", "A non-empty operation reference is required.");
+	}
+
 	private async run(args: readonly string[], requestedTimeoutMs?: number): Promise<string> {
 		const timeoutMs = requestedTimeoutMs ?? this.commandTimeoutMs;
 		if (!Number.isSafeInteger(timeoutMs) || timeoutMs <= 0) {
@@ -312,6 +627,7 @@ export class BrokerCli {
 				shell: false,
 				stdio: ["ignore", "pipe", "pipe"],
 				windowsHide: true,
+				...(this.#environment === undefined ? {} : { env: this.#environment }),
 			});
 			const finish = (callback: () => void) => {
 				if (settled) return;
@@ -352,11 +668,12 @@ export class BrokerCli {
 				if (exitCode !== 0) {
 					finish(() =>
 						reject(
-							new BrokerCliError(
-								"broker_command_failed",
-								`Broker CLI exited with ${exitCode ?? "signal"}${signal ? ` (${signal})` : ""}.`,
-								{ stderr },
-							),
+							extractBrokerError(stdout, stderr) ??
+								new BrokerCliError(
+									"broker_command_failed",
+									`Broker CLI exited with ${exitCode ?? "signal"}${signal ? ` (${signal})` : ""}.`,
+									{ stderr },
+								),
 						),
 					);
 					return;

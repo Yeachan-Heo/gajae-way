@@ -8,6 +8,7 @@ import { loadWayProfile } from "../../src/profile";
 import { RpcClient } from "../../src/rpc-client";
 import { DiscordFixture } from "../fixtures/discord-fixture";
 import { ManagedProcessRegistry } from "../helpers/managed-process";
+import { FakeBrokerFixture } from "../helpers/main-session";
 
 const managedProcesses = new ManagedProcessRegistry();
 
@@ -80,7 +81,7 @@ function temporaryDirectory(name: string): string {
 	return directory;
 }
 
-function testProfile(corpus: string, workspace: string): string {
+function testProfile(corpus: string, workspace: string, sessionId: string): string {
 	return `[corpus]
 path = "${corpus}"
 workspace = "${workspace}"
@@ -92,15 +93,17 @@ files = []
 id = "discord:owner-dm"
 platform = "discord"
 kind = "dm"
+
+[main_session]
+session_id = "${sessionId}"
 `;
 }
 
-function e2eEnvironment(): NodeJS.ProcessEnv {
+function e2eEnvironment(fixture: FakeBrokerFixture): NodeJS.ProcessEnv {
 	return {
-		...process.env,
+		...fixture.environment(),
 		NODE_ENV: "test",
-		GAJAEWAY_E2E_FILE_SDK: "1",
-		GAJAEWAY_BROKER_CLI: "/usr/bin/false",
+		GAJAEWAY_BROKER_CLI: fixture.executable,
 		GAJAEWAY_RECONCILE_POLL_MS: "600000",
 	};
 }
@@ -375,14 +378,14 @@ test("example profile covers the identity projection, mutable tunables, and Disc
 test("supervised daemon restart restores the PartOf-bound fixture adapter and compiled RPC delivery", async () => {
 	const executable = compiledWay();
 	const root = temporaryDirectory("sd");
+	const fixtureSession = new FakeBrokerFixture();
 	const stateDirectory = path.join(root, "state");
 	const corpus = path.join(root, "corpus");
-	const workspace = path.join(root, "workspace");
+	const workspace = fixtureSession.workspace;
 	const profilePath = path.join(root, "profile.toml");
 	fs.mkdirSync(corpus);
-	fs.mkdirSync(workspace);
-	fs.writeFileSync(profilePath, testProfile(corpus, workspace));
-	const environment = e2eEnvironment();
+	fs.writeFileSync(profilePath, testProfile(corpus, workspace, fixtureSession.sessionId));
+	const environment = e2eEnvironment(fixtureSession);
 	const bootstrap = await runCommand([executable, "bootstrap", "--confirm", "--state-dir", stateDirectory, "--profile", profilePath], environment);
 	expect(bootstrap.exitCode).toBe(0);
 	expect(bootstrap.stdout).toContain('"state":"committed"');
@@ -406,7 +409,7 @@ test("supervised daemon restart restores the PartOf-bound fixture adapter and co
 		});
 		expect(submitted.result).toMatchObject({ accepted: true, delivered_as: "prompt" });
 		const delivery = await eventually(
-			() => fixture.sends.find(send => send.text === "fixture reply: restart fixture delivery"),
+			() => fixture.sends.find(send => send.text === "ack"),
 			"restarted adapter did not deliver the fixture reply",
 			12_000,
 		);
@@ -422,5 +425,6 @@ test("supervised daemon restart restores the PartOf-bound fixture adapter and co
 		expect(restartPrevented(parseUnit("ops/systemd/gajaeway.service"), failClosed.exitCode)).toBe(true);
 	} finally {
 		await service?.stop();
+		fixtureSession.dispose();
 	}
 }, 30_000);

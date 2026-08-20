@@ -19,11 +19,10 @@ import {
 } from "./main-session/closure";
 
 import { bootstrapMainSession, recoverBootstrap } from "./main-session/bootstrap";
-import { createMainSessionHost, type MainSessionHost, type MainSessionJournal } from "./main-session/host";
+import { createMainSessionHost, MainSessionHostError, type MainSessionHost, type MainSessionJournal } from "./main-session/host";
 import { approveProfile, previewProfileApproval } from "./main-session/profile-approval";
 import { ResumeError, strictResumeMainSession } from "./main-session/resume";
-import { createPublishedSdk, type HostedSdkSession, type MainSessionSdk } from "./main-session/sdk";
-import { createE2eFileSdk } from "./main-session/e2e-sdk";
+import { createExternalHostSupervisor } from "./main-session/supervisor";
 
 import { GatewayStateError, GatewayStateStore } from "./main-session/state";
 import { ProfileRevisionTracker } from "./profile";
@@ -33,8 +32,8 @@ import { createRpcBridge, RpcBridgeException, type RpcBridgeHandler } from "./rp
 
 const usage = `Usage:
   gajaeway [serve] [--state-dir PATH] [--profile PATH] [--fail-closed-linger-ms MS] [--broker-cli PATH] [--reconcile-poll-ms MS]
+  gajaeway bootstrap --confirm [--session-id ID] [--state-dir PATH] [--profile PATH] [--broker-cli PATH]
   gajaeway console [--surface-id ID] [--state-dir PATH] [--profile PATH]
-  gajaeway bootstrap --confirm [--state-dir PATH] [--profile PATH]
   gajaeway profile approve --confirm [--state-dir PATH] [--profile PATH]
   gajaeway --health [--state-dir PATH] | --version`;
 
@@ -82,92 +81,22 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 }
 
 function failureReason(error: unknown): string {
-	if (error instanceof ResumeError || error instanceof GatewayStateError) return error.reason;
+	if (error instanceof ResumeError || error instanceof GatewayStateError || error instanceof MainSessionHostError) return error.reason;
 	if (error instanceof Error && error.name === "ProfileValidationError") return "profile_invalid";
 	return "startup_failed";
 }
 
-function createRuntimeSdk(): MainSessionSdk {
-	const sdk =
-		Bun.env.NODE_ENV === "test" && Bun.env.GAJAEWAY_E2E_FILE_SDK === "1" ? createE2eFileSdk() : createPublishedSdk();
-	const endpointPath = Bun.env.GAJAEWAY_E2E_SDK_ENDPOINT_PATH;
-	if (Bun.env.NODE_ENV !== "test" || Bun.env.GAJAEWAY_E2E_FILE_SDK !== "1" || !endpointPath) return sdk;
-	return createE2eEndpointProbeSdk(sdk, endpointPath);
-}
-
-/** Test-only UDS probe that follows E2E session disposal and can retain ingress for the forced fail-stop drill. */
-async function createE2eEndpointProbeSession(
-	session: HostedSdkSession,
-	endpointPath: string,
-): Promise<HostedSdkSession> {
-	if (endpointPath.includes("\0")) throw new Error("E2E SDK endpoint path must not contain a NUL byte.");
-	const resolvedPath = path.resolve(endpointPath);
-	await fsp.mkdir(path.dirname(resolvedPath), { recursive: true, mode: 0o700 });
-	if (fs.existsSync(resolvedPath)) throw new Error(`E2E SDK endpoint already exists: ${resolvedPath}`);
-	const server = net.createServer((socket) => socket.end());
-	await new Promise<void>((resolve, reject) => {
-		const fail = (error: Error) => {
-			server.close();
-			reject(error);
-		};
-		server.once("error", fail);
-		server.listen(resolvedPath, () => {
-			server.off("error", fail);
-			resolve();
-		});
+function createRuntimeSupervisor(config: WayConfig, workspace: string) {
+	return createExternalHostSupervisor({
+		broker: new BrokerCli({ executable: config.brokerCliPath }),
+		workspace,
 	});
-	let disposed = false;
-	const rejectDisposeForE2e = Bun.env.GAJAEWAY_E2E_SDK_DISPOSE_REJECT === "1";
-	return {
-		sessionFile: session.sessionFile,
-		sessionId: session.sessionId,
-		subscribe: (listener) => session.subscribe(listener),
-		subscribeGates: (listener) => session.subscribeGates(listener),
-		prompt: (text) => session.prompt(text),
-		steer: (text) => session.steer(text),
-		followUp: (text) => session.followUp(text),
-		followUpQueueDepth: () => session.followUpQueueDepth(),
-		answerGate: (gateId, answer, idempotencyKey) => session.answerGate(gateId, answer, idempotencyKey),
-		sendBootstrapMessage: (nonce) => session.sendBootstrapMessage(nonce),
-		async dispose() {
-			if (disposed) return;
-			disposed = true;
-			try {
-				if (rejectDisposeForE2e) {
-					throw new Error("forced E2E SDK session disposal rejection");
-				}
-				await session.dispose();
-			} finally {
-				if (!rejectDisposeForE2e) {
-					await new Promise<void>((resolve, reject) => server.close((error) => (error ? reject(error) : resolve())));
-					try {
-						fs.unlinkSync(resolvedPath);
-					} catch (error) {
-						if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
-					}
-				}
-			}
-		},
-	};
 }
 
 function failBeforeMainHostForE2e(): void {
-	if (
-		Bun.env.NODE_ENV === "test" &&
-		Bun.env.GAJAEWAY_E2E_FILE_SDK === "1" &&
-		Bun.env.GAJAEWAY_E2E_FAIL_BEFORE_MAIN_HOST === "1"
-	) {
+	if (Bun.env.NODE_ENV === "test" && Bun.env.GAJAEWAY_E2E_FAIL_BEFORE_MAIN_HOST === "1") {
 		throw new Error("forced E2E pre-host startup failure");
 	}
-}
-
-function createE2eEndpointProbeSdk(delegate: MainSessionSdk, endpointPath: string): MainSessionSdk {
-	return {
-		createNew: (input) => delegate.createNew(input),
-		openExistingStrict: async (input) =>
-			await createE2eEndpointProbeSession(await delegate.openExistingStrict(input), endpointPath),
-		findBootstrapNonceCandidates: (workspace, nonce) => delegate.findBootstrapNonceCandidates(workspace, nonce),
-	};
 }
 
 function healthFilePath(stateDirectory: string): string {
@@ -975,14 +904,6 @@ async function disposeMainSession(core: WayCoreHandle, host: MainSessionHost): P
 	}
 }
 
-async function disposeUnhostedMainSession(core: WayCoreHandle, session: HostedSdkSession): Promise<void> {
-	try {
-		await session.dispose();
-	} finally {
-		core.resetMainSessionStatus();
-	}
-}
-
 type MainSessionStartupDisposalOutcome =
 	| { readonly kind: "not_owned" | "disposed" }
 	| { readonly kind: "failed"; readonly error: unknown };
@@ -996,18 +917,11 @@ function logMainSessionStartupDisposalFailure(error: unknown): void {
 async function disposeMainSessionAfterStartupFailure(
 	core: WayCoreHandle,
 	host: MainSessionHost | undefined,
-	resumedSession: HostedSdkSession | undefined,
 ): Promise<MainSessionStartupDisposalOutcome> {
 	try {
-		if (host) {
-			await disposeMainSession(core, host);
-			return { kind: "disposed" };
-		}
-		if (resumedSession) {
-			await disposeUnhostedMainSession(core, resumedSession);
-			return { kind: "disposed" };
-		}
-		return { kind: "not_owned" };
+		if (!host) return { kind: "not_owned" };
+		await disposeMainSession(core, host);
+		return { kind: "disposed" };
 	} catch (error) {
 		return { kind: "failed", error };
 	}
@@ -1019,11 +933,15 @@ async function waitForShutdown(
 	closures: ClosureExecutor,
 	reconciler: BrokerReconciler,
 ): Promise<void> {
-	await new Promise<void>((resolve) => {
-		const stop = () => resolve();
-		process.once("SIGINT", stop);
-		process.once("SIGTERM", stop);
-	});
+	const outcome = await Promise.race([
+		new Promise<{ readonly kind: "signal" }>((resolve) => {
+			const stop = () => resolve({ kind: "signal" });
+			process.once("SIGINT", stop);
+			process.once("SIGTERM", stop);
+		}),
+		host.waitForFatalFailure().then(error => ({ kind: "fatal" as const, error })),
+	]);
+	if (outcome.kind === "fatal") throw outcome.error;
 	reconciler.stop();
 	await closures.shutdown();
 	await disposeMainSession(core, host);
@@ -1034,7 +952,6 @@ async function serveWay(config: WayConfig): Promise<void> {
 	const core = loadWayCore().WayCore.open(config.stateDir);
 	const closures = createClosureExecutor({ core, hooks: createClosureHooks(core) });
 	const state = new GatewayStateStore(core);
-	const sdk = createRuntimeSdk();
 	const profiles = new ProfileRevisionTracker();
 	const profileHandler = profileBridgeHandler(state, config, profiles);
 	let mainSessionHandler: RpcBridgeHandler | undefined;
@@ -1046,15 +963,18 @@ async function serveWay(config: WayConfig): Promise<void> {
 	core.startRpcServer(path.join(config.stateDir, "rpc.sock"), createRpcBridge(core, bridgeHandler));
 	core.setRpcHealth("verifying");
 	try {
-		core.sdNotifyStatus("gajaeway verifying durable state and main session");
+		core.sdNotifyStatus("gajaeway verifying durable external main session");
 	} catch {
-		// A notification transport failure must not turn a healthy daemon into a failed-closed one.
+		// Status notification is optional.
 	}
 	let host: MainSessionHost | undefined;
 	let reconciler: BrokerReconciler | undefined;
-	let resumedSession: HostedSdkSession | undefined;
+	let supervisor: ReturnType<typeof createRuntimeSupervisor> | undefined;
 	try {
 		const profile = profiles.load(config.profilePath);
+		if (config.sessionId && profile.externalSessionId && config.sessionId !== profile.externalSessionId) {
+			throw new ResumeError("session_id_conflict", "--session-id does not match [main_session].session_id.");
+		}
 		core.registryConfigureSurfaces(
 			profile.knownSurfaces.map((surface) => ({
 				surfaceId: surface.id,
@@ -1063,35 +983,31 @@ async function serveWay(config: WayConfig): Promise<void> {
 				isOwnerSurface: profile.ownerSurfaces.some((owner) => owner.id === surface.id),
 			})),
 		);
-		const recovery = await recoverBootstrap({ profile, state, sdk });
+		supervisor = createRuntimeSupervisor(config, profile.workspace);
+		const recovery = await recoverBootstrap({ profile, state, supervisor });
 		if (recovery.kind === "bootstrap_required") {
-			// The durable state remains ABSENT so an explicit `gajaeway bootstrap --confirm`
-			// can proceed after this unhealthy daemon exits.
 			await enterFailedClosed(core, state, config, "bootstrap_required", false);
 		}
 		if (recovery.kind === "failed_closed") await enterFailedClosed(core, state, config, recovery.reason, false);
-		const resumed = await strictResumeMainSession({
-			profile,
-			state,
-			sdk,
-			onInjectionLog: (entry) => console.warn(`gajaeway injection ${entry.kind}: ${entry.path}`),
-		});
-		resumedSession = resumed.session;
+		const resumed = await strictResumeMainSession({ profile, state, supervisor });
+		if (config.sessionId && config.sessionId !== resumed.identity.sessionId) {
+			throw new ResumeError("session_id_mismatch", "--session-id does not match the durable adopted external identity.");
+		}
 		failBeforeMainHostForE2e();
 		await reconcilePendingClosureOperation(core, closures, profile.corpusPath, resumed.identity.sessionId);
 		host = createMainSessionHost({
-			session: resumed.session,
+			supervisor,
 			identity: resumed.identity,
 			state,
 			journal: createRuntimeMainSessionJournal(core, config.stateDir, state),
+			initialTurnState: resumed.turnState,
+			initialFollowUpQueueDepth: resumed.followUpQueueDepth,
 		});
-		resumedSession = undefined;
 		const admissionHandler = createMainAdmissionHandler(host, profile, core, {
 			isSurfaceQuarantined: (surface) => {
 				try {
 					return core.surfaceResolve(surface.id).quarantined;
 				} catch {
-					// A configured routing surface without a durable resolver is unsafe to submit through.
 					return true;
 				}
 			},
@@ -1115,26 +1031,24 @@ async function serveWay(config: WayConfig): Promise<void> {
 		try {
 			core.sdNotifyReady("gajaeway running");
 		} catch {
-			// Readiness remains observable through RPC and health.json if notification delivery fails.
+			// Readiness remains observable through RPC and health.json.
 		}
 		await waitForShutdown(core, host, closures, reconciler);
 	} catch (error) {
 		if (error instanceof FailedClosedExit) {
-			const disposal = await disposeMainSessionAfterStartupFailure(core, host, resumedSession);
+			const disposal = await disposeMainSessionAfterStartupFailure(core, host);
 			if (disposal.kind === "failed") logMainSessionStartupDisposalFailure(disposal.error);
+			await supervisor?.dispose();
 			await closures.shutdown();
 			reconciler?.stop();
 			throw error;
 		}
-		const disposal = await disposeMainSessionAfterStartupFailure(core, host, resumedSession);
+		const disposal = await disposeMainSessionAfterStartupFailure(core, host);
 		if (disposal.kind === "failed") logMainSessionStartupDisposalFailure(disposal.error);
+		await supervisor?.dispose();
 		reconciler?.stop();
 		await closures.shutdown();
-		if (disposal.kind === "failed") {
-			// A rejected SDK disposal leaves external ingress uncertain. Publish the
-			// failed-closed state, but fail-stop rather than holding the normal linger.
-			await enterFailedClosed(core, state, config, failureReason(error), true, false);
-		}
+		if (disposal.kind === "failed") await enterFailedClosed(core, state, config, failureReason(error), true, false);
 		await enterFailedClosed(core, state, config, failureReason(error));
 	}
 }
@@ -1149,19 +1063,25 @@ async function bootstrapCommand(config: WayConfig, arguments_: readonly string[]
 	requireConfirm(arguments_, "bootstrap");
 	const core = loadWayCore().WayCore.open(config.stateDir);
 	const state = new GatewayStateStore(core);
-	const profiles = new ProfileRevisionTracker();
-	const profile = profiles.load(config.profilePath);
-	const sdk = createRuntimeSdk();
-	const recovery = await recoverBootstrap({ profile, state, sdk });
-	if (recovery.kind === "failed_closed") throw new Error(`Bootstrap recovery is failed closed: ${recovery.reason}`);
-	if (recovery.kind === "committed") {
-		console.log(
-			JSON.stringify({ state: "committed", session_id: recovery.identity.sessionId, recovered: recovery.nonce !== "" }),
-		);
-		return;
+	const profile = new ProfileRevisionTracker().load(config.profilePath);
+	const supervisor = createRuntimeSupervisor(config, profile.workspace);
+	try {
+		const recovery = await recoverBootstrap({ profile, state, supervisor });
+		if (recovery.kind === "failed_closed") throw new Error(`Bootstrap recovery is failed closed: ${recovery.reason}`);
+		if (recovery.kind === "committed") {
+			console.log(JSON.stringify({ state: "committed", session_id: recovery.identity.sessionId, recovered: recovery.nonce !== "" }));
+			return;
+		}
+		const sessionId = config.sessionId ?? profile.externalSessionId;
+		if (!sessionId) throw new Error(`bootstrap requires --session-id or [main_session].session_id.\n${usage}`);
+		if (config.sessionId && profile.externalSessionId && config.sessionId !== profile.externalSessionId) {
+			throw new Error("--session-id must match [main_session].session_id.");
+		}
+		const committed = await bootstrapMainSession({ confirm: true, profile, state, supervisor, sessionId });
+		console.log(JSON.stringify({ state: "committed", session_id: committed.identity.sessionId, nonce: committed.nonce }));
+	} finally {
+		await supervisor.dispose();
 	}
-	const committed = await bootstrapMainSession({ confirm: true, profile, state, sdk });
-	console.log(JSON.stringify({ state: "committed", session_id: committed.identity.sessionId, nonce: committed.nonce }));
 }
 
 interface RpcResponse {

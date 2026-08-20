@@ -6,7 +6,7 @@
   "surfaceNote": "gajaeway console is the gateway operator cockpit; the transcript records its full-screen terminal write-stream.",
   "subject": "gajaeway console (gateway cockpit)",
   "producedBy": "test/qa/console-transcript.ts",
-  "generatedAt": "2026-08-20T04:41:24.849Z",
+  "generatedAt": "2026-08-20T06:19:58.252Z",
   "harness": "RawConsoleTerminal driven through a virtual TTY against a real in-process gateway over a real Unix-domain socket",
   "scriptedInput": [
     "hello from the automation transcript",
@@ -15,7 +15,7 @@
   "actions": [
     {
       "ordinal": 1,
-      "timestamp": "2026-08-20T04:41:24.849Z",
+      "timestamp": "2026-08-20T06:19:58.252Z",
       "selector": "process:gajaeway console",
       "type": "launch",
       "detail": "RawConsoleTerminal TUI driving runWayConsole against the live gateway Unix socket",
@@ -23,7 +23,7 @@
     },
     {
       "ordinal": 2,
-      "timestamp": "2026-08-20T04:41:24.849Z",
+      "timestamp": "2026-08-20T06:19:58.252Z",
       "selector": "stdout:\"Gateway status\"",
       "type": "observe",
       "detail": "gateway status block (daemon/main/journal/lock/reconcile)",
@@ -31,7 +31,7 @@
     },
     {
       "ordinal": 3,
-      "timestamp": "2026-08-20T04:41:24.849Z",
+      "timestamp": "2026-08-20T06:19:58.252Z",
       "selector": "stdout:\"Gateway cockpit ready\"",
       "type": "observe",
       "detail": "cockpit readiness announcement after delivery readiness established",
@@ -39,7 +39,7 @@
     },
     {
       "ordinal": 4,
-      "timestamp": "2026-08-20T04:41:24.849Z",
+      "timestamp": "2026-08-20T06:19:58.252Z",
       "selector": "stdin:gajaeway> prompt",
       "type": "input",
       "detail": "hello from the automation transcript",
@@ -47,7 +47,7 @@
     },
     {
       "ordinal": 5,
-      "timestamp": "2026-08-20T04:41:24.849Z",
+      "timestamp": "2026-08-20T06:19:58.252Z",
       "selector": "stdout:\"Delivered as:\"",
       "type": "observe",
       "detail": "server-derived delivered_as rendered verbatim",
@@ -55,7 +55,7 @@
     },
     {
       "ordinal": 6,
-      "timestamp": "2026-08-20T04:41:24.849Z",
+      "timestamp": "2026-08-20T06:19:58.252Z",
       "selector": "stdout:\"Assistant:\"",
       "type": "observe",
       "detail": "finalized assistant reply rendered asynchronously after delivered_as acceptance",
@@ -63,7 +63,7 @@
     },
     {
       "ordinal": 7,
-      "timestamp": "2026-08-20T04:41:24.849Z",
+      "timestamp": "2026-08-20T06:19:58.252Z",
       "selector": "stdin:gajaeway> prompt",
       "type": "input",
       "detail": "/quit",
@@ -71,7 +71,7 @@
     },
     {
       "ordinal": 8,
-      "timestamp": "2026-08-20T04:41:24.849Z",
+      "timestamp": "2026-08-20T06:19:58.252Z",
       "selector": "rpc:consumerCursor(\"gajaeway-console\")",
       "type": "observe",
       "detail": "gajaeway-console consumer checkpoint after the session",
@@ -81,85 +81,85 @@
   "steps": [
     {
       "sequence": 0,
-      "atMs": 2,
+      "atMs": 1,
       "raw": "\u001b[?1049h\u001b[?2004h\u001b[?25l\u001b[?2026h\u001b[?25l\u001b[H\u001b[2J\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\u001b[48;5;238m\u001b[38;5;255mGATEWAY COCKPIT | daemon: status=unknown state=unknown | main: resumed=unknown session_id=unknown tu\u001b[0m\n\u001b[48;5;238m\u001b[38;5;255mrn_state=unknown follow_up_queue_depth=unknown\u001b[0m\n\u001b[48;5;238m\u001b[38;5;255mjournal: head_cursor=unknown degraded=unknown | lock: held=unknown holder=none queue_len=unknown stu\u001b[0m\n\u001b[48;5;238m\u001b[38;5;255mck=unknown quarantined=unknown write_mode=unknown\u001b[0m\n\u001b[48;5;238m\u001b[38;5;255mreconcile: freshness=unknown last_ok_at=none cycle_ms=unknown drift_count=unknown | consumers: none \u001b[0m\n\u001b[48;5;238m\u001b[38;5;255m| delivery=fenced consumer=idle\u001b[0m\n\u001b[38;5;81mgajaeway> \u001b[0m \u001b[30;11H\u001b[?25h\u001b[?2026l",
       "containsEscape": true
     },
     {
       "sequence": 1,
-      "atMs": 5,
+      "atMs": 3,
       "raw": "\u001b[?2026h\u001b[?25l\u001b[H\u001b[2J\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\u001b[48;5;238m\u001b[38;5;255mGATEWAY COCKPIT | daemon: status=unknown state=unknown | main: resumed=unknown session_id=unknown tu\u001b[0m\n\u001b[48;5;238m\u001b[38;5;255mrn_state=unknown follow_up_queue_depth=unknown\u001b[0m\n\u001b[48;5;238m\u001b[38;5;255mjournal: head_cursor=unknown degraded=unknown | lock: held=unknown holder=none queue_len=unknown stu\u001b[0m\n\u001b[48;5;238m\u001b[38;5;255mck=unknown quarantined=unknown write_mode=unknown\u001b[0m\n\u001b[48;5;238m\u001b[38;5;255mreconcile: freshness=unknown last_ok_at=none cycle_ms=unknown drift_count=unknown | consumers: none \u001b[0m\n\u001b[48;5;238m\u001b[38;5;255m| delivery=fenced consumer=idle\u001b[0m\n\u001b[38;5;81mgajaeway> \u001b[0m \u001b[30;11H\u001b[?25h\u001b[?2026l",
       "containsEscape": true
     },
     {
       "sequence": 2,
-      "atMs": 5,
+      "atMs": 3,
       "raw": "\u001b[?2026h\u001b[?25l\u001b[H\u001b[2J\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\nGateway status\n  daemon: status=healthy state=running\n  main: resumed=false session_id=none turn_state=idle follow_up_queue_depth=0\n  journal: head_cursor=1:0 degraded=false\n  lock: held=false holder=none queue_len=0 stuck=false quarantined=false write_mode=true\n  reconcile: freshness=unknown last_ok_at=none cycle_ms=unknown drift_count=0\n  consumers: none\n\u001b[48;5;238m\u001b[38;5;255mGATEWAY COCKPIT | daemon: status=healthy state=running | main: resumed=false session_id=none turn_st\u001b[0m\n\u001b[48;5;238m\u001b[38;5;255mate=idle follow_up_queue_depth=0\u001b[0m\n\u001b[48;5;238m\u001b[38;5;255mjournal: head_cursor=1:0 degraded=false | lock: held=false holder=none queue_len=0 stuck=false quara\u001b[0m\n\u001b[48;5;238m\u001b[38;5;255mntined=false write_mode=true\u001b[0m\n\u001b[48;5;238m\u001b[38;5;255mreconcile: freshness=unknown last_ok_at=none cycle_ms=unknown drift_count=0 | consumers: none | deli\u001b[0m\n\u001b[48;5;238m\u001b[38;5;255mvery=fenced consumer=idle\u001b[0m\n\u001b[38;5;81mgajaeway> \u001b[0m \u001b[30;11H\u001b[?25h\u001b[?2026l",
       "containsEscape": true
     },
     {
       "sequence": 3,
-      "atMs": 13,
+      "atMs": 12,
       "raw": "\u001b[?2026h\u001b[?25l\u001b[H\u001b[2J\n\n\n\n\n\n\n\n\n\n\n\n\nGateway status\n  daemon: status=healthy state=running\n  main: resumed=false session_id=none turn_state=idle follow_up_queue_depth=0\n  journal: head_cursor=1:0 degraded=false\n  lock: held=false holder=none queue_len=0 stuck=false quarantined=false write_mode=true\n  reconcile: freshness=unknown last_ok_at=none cycle_ms=unknown drift_count=0\n  consumers: none\n\nYou:\nhello from the automation transcript\n\u001b[48;5;238m\u001b[38;5;255mGATEWAY COCKPIT | daemon: status=healthy state=running | main: resumed=false session_id=none turn_st\u001b[0m\n\u001b[48;5;238m\u001b[38;5;255mate=idle follow_up_queue_depth=0\u001b[0m\n\u001b[48;5;238m\u001b[38;5;255mjournal: head_cursor=1:0 degraded=false | lock: held=false holder=none queue_len=0 stuck=false quara\u001b[0m\n\u001b[48;5;238m\u001b[38;5;255mntined=false write_mode=true\u001b[0m\n\u001b[48;5;238m\u001b[38;5;255mreconcile: freshness=unknown last_ok_at=none cycle_ms=unknown drift_count=0 | consumers: none | deli\u001b[0m\n\u001b[48;5;238m\u001b[38;5;255mvery=fenced consumer=idle\u001b[0m\n\u001b[38;5;81mgajaeway> \u001b[0m \u001b[30;11H\u001b[?25h\u001b[?2026l",
       "containsEscape": true
     },
     {
       "sequence": 4,
-      "atMs": 1008,
+      "atMs": 1006,
       "raw": "\u001b[?2026h\u001b[?25l\u001b[H\u001b[2J\n\n\n\n\n\n\n\n\n\n\n\n\nGateway status\n  daemon: status=healthy state=running\n  main: resumed=false session_id=none turn_state=idle follow_up_queue_depth=0\n  journal: head_cursor=1:0 degraded=false\n  lock: held=false holder=none queue_len=0 stuck=false quarantined=false write_mode=true\n  reconcile: freshness=unknown last_ok_at=none cycle_ms=unknown drift_count=0\n  consumers: none\n\nYou:\nhello from the automation transcript\n\u001b[48;5;238m\u001b[38;5;255mGATEWAY COCKPIT | daemon: status=healthy state=running | main: resumed=false session_id=none turn_st\u001b[0m\n\u001b[48;5;238m\u001b[38;5;255mate=idle follow_up_queue_depth=0\u001b[0m\n\u001b[48;5;238m\u001b[38;5;255mjournal: head_cursor=1:0 degraded=false | lock: held=false holder=none queue_len=0 stuck=false quara\u001b[0m\n\u001b[48;5;238m\u001b[38;5;255mntined=false write_mode=true\u001b[0m\n\u001b[48;5;238m\u001b[38;5;255mreconcile: freshness=unknown last_ok_at=none cycle_ms=unknown drift_count=0 | consumers: none | deli\u001b[0m\n\u001b[48;5;238m\u001b[38;5;255mvery=ready consumer=streaming\u001b[0m\n\u001b[38;5;81mgajaeway> \u001b[0m \u001b[30;11H\u001b[?25h\u001b[?2026l",
       "containsEscape": true
     },
     {
       "sequence": 5,
-      "atMs": 1009,
+      "atMs": 1007,
       "raw": "\u001b[?2026h\u001b[?25l\u001b[H\u001b[2J\n\n\n\n\n\n\n\n\n\n\nGateway status\n  daemon: status=healthy state=running\n  main: resumed=false session_id=none turn_state=idle follow_up_queue_depth=0\n  journal: head_cursor=1:0 degraded=false\n  lock: held=false holder=none queue_len=0 stuck=false quarantined=false write_mode=true\n  reconcile: freshness=unknown last_ok_at=none cycle_ms=unknown drift_count=0\n  consumers: none\n\nYou:\nhello from the automation transcript\n\nGateway cockpit ready. Type /help for commands.\n\u001b[48;5;238m\u001b[38;5;255mGATEWAY COCKPIT | daemon: status=healthy state=running | main: resumed=false session_id=none turn_st\u001b[0m\n\u001b[48;5;238m\u001b[38;5;255mate=idle follow_up_queue_depth=0\u001b[0m\n\u001b[48;5;238m\u001b[38;5;255mjournal: head_cursor=1:0 degraded=false | lock: held=false holder=none queue_len=0 stuck=false quara\u001b[0m\n\u001b[48;5;238m\u001b[38;5;255mntined=false write_mode=true\u001b[0m\n\u001b[48;5;238m\u001b[38;5;255mreconcile: freshness=unknown last_ok_at=none cycle_ms=unknown drift_count=0 | consumers: none | deli\u001b[0m\n\u001b[48;5;238m\u001b[38;5;255mvery=ready consumer=streaming\u001b[0m\n\u001b[38;5;81mgajaeway> \u001b[0m \u001b[30;11H\u001b[?25h\u001b[?2026l",
       "containsEscape": true
     },
     {
       "sequence": 6,
-      "atMs": 1009,
+      "atMs": 1007,
       "raw": "\u001b[?2026h\u001b[?25l\u001b[H\u001b[2J\n\n\n\n\n\n\n\n\n\n\nGateway status\n  daemon: status=healthy state=running\n  main: resumed=false session_id=none turn_state=idle follow_up_queue_depth=0\n  journal: head_cursor=1:0 degraded=false\n  lock: held=false holder=none queue_len=0 stuck=false quarantined=false write_mode=true\n  reconcile: freshness=unknown last_ok_at=none cycle_ms=unknown drift_count=0\n  consumers: none\n\nYou:\nhello from the automation transcript\n\nGateway cockpit ready. Type /help for commands.\n\u001b[48;5;238m\u001b[38;5;255mGATEWAY COCKPIT | daemon: status=healthy state=running | main: resumed=false session_id=none turn_st\u001b[0m\n\u001b[48;5;238m\u001b[38;5;255mate=idle follow_up_queue_depth=0\u001b[0m\n\u001b[48;5;238m\u001b[38;5;255mjournal: head_cursor=1:0 degraded=false | lock: held=false holder=none queue_len=0 stuck=false quara\u001b[0m\n\u001b[48;5;238m\u001b[38;5;255mntined=false write_mode=true\u001b[0m\n\u001b[48;5;238m\u001b[38;5;255mreconcile: freshness=unknown last_ok_at=none cycle_ms=unknown drift_count=0 | consumers: none | deli\u001b[0m\n\u001b[48;5;238m\u001b[38;5;255mvery=ready consumer=streaming\u001b[0m\n\u001b[38;5;81mgajaeway> \u001b[0m \u001b[30;11H\u001b[?25h\u001b[?2026l",
       "containsEscape": true
     },
     {
       "sequence": 7,
-      "atMs": 1009,
+      "atMs": 1007,
       "raw": "\u001b[?2026h\u001b[?25l\u001b[H\u001b[2J\n\n\n\n\n\n\n\n\n\n\nGateway status\n  daemon: status=healthy state=running\n  main: resumed=false session_id=none turn_state=idle follow_up_queue_depth=0\n  journal: head_cursor=1:0 degraded=false\n  lock: held=false holder=none queue_len=0 stuck=false quarantined=false write_mode=true\n  reconcile: freshness=unknown last_ok_at=none cycle_ms=unknown drift_count=0\n  consumers: none\n\nYou:\nhello from the automation transcript\n\nGateway cockpit ready. Type /help for commands.\n\u001b[48;5;238m\u001b[38;5;255mGATEWAY COCKPIT | daemon: status=healthy state=running | main: resumed=false session_id=none turn_st\u001b[0m\n\u001b[48;5;238m\u001b[38;5;255mate=idle follow_up_queue_depth=0\u001b[0m\n\u001b[48;5;238m\u001b[38;5;255mjournal: head_cursor=1:0 degraded=false | lock: held=false holder=none queue_len=0 stuck=false quara\u001b[0m\n\u001b[48;5;238m\u001b[38;5;255mntined=false write_mode=true\u001b[0m\n\u001b[48;5;238m\u001b[38;5;255mreconcile: freshness=unknown last_ok_at=none cycle_ms=unknown drift_count=0 | consumers: none | deli\u001b[0m\n\u001b[48;5;238m\u001b[38;5;255mvery=ready consumer=streaming\u001b[0m\n\u001b[38;5;81mgajaeway> \u001b[0m \u001b[30;11H\u001b[?25h\u001b[?2026l",
       "containsEscape": true
     },
     {
       "sequence": 8,
-      "atMs": 1011,
+      "atMs": 1038,
       "raw": "\u001b[?2026h\u001b[?25l\u001b[H\u001b[2J\n\n\n\n\n\n\n\n\nGateway status\n  daemon: status=healthy state=running\n  main: resumed=false session_id=none turn_state=idle follow_up_queue_depth=0\n  journal: head_cursor=1:0 degraded=false\n  lock: held=false holder=none queue_len=0 stuck=false quarantined=false write_mode=true\n  reconcile: freshness=unknown last_ok_at=none cycle_ms=unknown drift_count=0\n  consumers: none\n\nYou:\nhello from the automation transcript\n\nGateway cockpit ready. Type /help for commands.\n\nDelivered as: prompt\n\u001b[48;5;238m\u001b[38;5;255mGATEWAY COCKPIT | daemon: status=healthy state=running | main: resumed=false session_id=none turn_st\u001b[0m\n\u001b[48;5;238m\u001b[38;5;255mate=idle follow_up_queue_depth=0\u001b[0m\n\u001b[48;5;238m\u001b[38;5;255mjournal: head_cursor=1:0 degraded=false | lock: held=false holder=none queue_len=0 stuck=false quara\u001b[0m\n\u001b[48;5;238m\u001b[38;5;255mntined=false write_mode=true\u001b[0m\n\u001b[48;5;238m\u001b[38;5;255mreconcile: freshness=unknown last_ok_at=none cycle_ms=unknown drift_count=0 | consumers: none | deli\u001b[0m\n\u001b[48;5;238m\u001b[38;5;255mvery=ready consumer=streaming\u001b[0m\n\u001b[38;5;81mgajaeway> \u001b[0m \u001b[30;11H\u001b[?25h\u001b[?2026l",
       "containsEscape": true
     },
     {
       "sequence": 9,
-      "atMs": 1012,
+      "atMs": 1087,
       "raw": "\u001b[?2026h\u001b[?25l\u001b[H\u001b[2J\n\n\n\n\n\n\nGateway status\n  daemon: status=healthy state=running\n  main: resumed=false session_id=none turn_state=idle follow_up_queue_depth=0\n  journal: head_cursor=1:0 degraded=false\n  lock: held=false holder=none queue_len=0 stuck=false quarantined=false write_mode=true\n  reconcile: freshness=unknown last_ok_at=none cycle_ms=unknown drift_count=0\n  consumers: none\n\nYou:\nhello from the automation transcript\n\nGateway cockpit ready. Type /help for commands.\n\nDelivered as: prompt\n\nMain turn started — busy.\n\u001b[48;5;238m\u001b[38;5;255mGATEWAY COCKPIT | daemon: status=healthy state=running | main: resumed=false session_id=none turn_st\u001b[0m\n\u001b[48;5;238m\u001b[38;5;255mate=busy follow_up_queue_depth=0\u001b[0m\n\u001b[48;5;238m\u001b[38;5;255mjournal: head_cursor=1 degraded=false | lock: held=false holder=none queue_len=0 stuck=false quarant\u001b[0m\n\u001b[48;5;238m\u001b[38;5;255mined=false write_mode=true\u001b[0m\n\u001b[48;5;238m\u001b[38;5;255mreconcile: freshness=unknown last_ok_at=none cycle_ms=unknown drift_count=0 | consumers: none | deli\u001b[0m\n\u001b[48;5;238m\u001b[38;5;255mvery=ready consumer=streaming\u001b[0m\n\u001b[38;5;81mgajaeway> \u001b[0m \u001b[30;11H\u001b[?25h\u001b[?2026l",
       "containsEscape": true
     },
     {
       "sequence": 10,
-      "atMs": 1012,
+      "atMs": 1087,
       "raw": "\u001b[?2026h\u001b[?25l\u001b[H\u001b[2J\n\n\n\nGateway status\n  daemon: status=healthy state=running\n  main: resumed=false session_id=none turn_state=idle follow_up_queue_depth=0\n  journal: head_cursor=1:0 degraded=false\n  lock: held=false holder=none queue_len=0 stuck=false quarantined=false write_mode=true\n  reconcile: freshness=unknown last_ok_at=none cycle_ms=unknown drift_count=0\n  consumers: none\n\nYou:\nhello from the automation transcript\n\nGateway cockpit ready. Type /help for commands.\n\nDelivered as: prompt\n\nMain turn started — busy.\n\nAssistant:\nack\n\u001b[48;5;238m\u001b[38;5;255mGATEWAY COCKPIT | daemon: status=healthy state=running | main: resumed=false session_id=none turn_st\u001b[0m\n\u001b[48;5;238m\u001b[38;5;255mate=busy follow_up_queue_depth=0\u001b[0m\n\u001b[48;5;238m\u001b[38;5;255mjournal: head_cursor=2 degraded=false | lock: held=false holder=none queue_len=0 stuck=false quarant\u001b[0m\n\u001b[48;5;238m\u001b[38;5;255mined=false write_mode=true\u001b[0m\n\u001b[48;5;238m\u001b[38;5;255mreconcile: freshness=unknown last_ok_at=none cycle_ms=unknown drift_count=0 | consumers: none | deli\u001b[0m\n\u001b[48;5;238m\u001b[38;5;255mvery=ready consumer=streaming\u001b[0m\n\u001b[38;5;81mgajaeway> \u001b[0m \u001b[30;11H\u001b[?25h\u001b[?2026l",
       "containsEscape": true
     },
     {
       "sequence": 11,
-      "atMs": 1012,
+      "atMs": 1087,
       "raw": "\u001b[?2026h\u001b[?25l\u001b[H\u001b[2J\n\nGateway status\n  daemon: status=healthy state=running\n  main: resumed=false session_id=none turn_state=idle follow_up_queue_depth=0\n  journal: head_cursor=1:0 degraded=false\n  lock: held=false holder=none queue_len=0 stuck=false quarantined=false write_mode=true\n  reconcile: freshness=unknown last_ok_at=none cycle_ms=unknown drift_count=0\n  consumers: none\n\nYou:\nhello from the automation transcript\n\nGateway cockpit ready. Type /help for commands.\n\nDelivered as: prompt\n\nMain turn started — busy.\n\nAssistant:\nack\n\nMain turn ended — idle.\n\u001b[48;5;238m\u001b[38;5;255mGATEWAY COCKPIT | daemon: status=healthy state=running | main: resumed=false session_id=none turn_st\u001b[0m\n\u001b[48;5;238m\u001b[38;5;255mate=idle follow_up_queue_depth=0\u001b[0m\n\u001b[48;5;238m\u001b[38;5;255mjournal: head_cursor=3 degraded=false | lock: held=false holder=none queue_len=0 stuck=false quarant\u001b[0m\n\u001b[48;5;238m\u001b[38;5;255mined=false write_mode=true\u001b[0m\n\u001b[48;5;238m\u001b[38;5;255mreconcile: freshness=unknown last_ok_at=none cycle_ms=unknown drift_count=0 | consumers: none | deli\u001b[0m\n\u001b[48;5;238m\u001b[38;5;255mvery=ready consumer=streaming\u001b[0m\n\u001b[38;5;81mgajaeway> \u001b[0m \u001b[30;11H\u001b[?25h\u001b[?2026l",
       "containsEscape": true
     },
     {
       "sequence": 12,
-      "atMs": 1017,
+      "atMs": 1096,
       "raw": "\u001b[?2026h\u001b[?25l\u001b[H\u001b[2J  daemon: status=healthy state=running\n  main: resumed=false session_id=none turn_state=idle follow_up_queue_depth=0\n  journal: head_cursor=1:0 degraded=false\n  lock: held=false holder=none queue_len=0 stuck=false quarantined=false write_mode=true\n  reconcile: freshness=unknown last_ok_at=none cycle_ms=unknown drift_count=0\n  consumers: none\n\nYou:\nhello from the automation transcript\n\nGateway cockpit ready. Type /help for commands.\n\nDelivered as: prompt\n\nMain turn started — busy.\n\nAssistant:\nack\n\nMain turn ended — idle.\n\nYou:\n/quit\n\u001b[48;5;238m\u001b[38;5;255mGATEWAY COCKPIT | daemon: status=healthy state=running | main: resumed=false session_id=none turn_st\u001b[0m\n\u001b[48;5;238m\u001b[38;5;255mate=idle follow_up_queue_depth=0\u001b[0m\n\u001b[48;5;238m\u001b[38;5;255mjournal: head_cursor=3 degraded=false | lock: held=false holder=none queue_len=0 stuck=false quarant\u001b[0m\n\u001b[48;5;238m\u001b[38;5;255mined=false write_mode=true\u001b[0m\n\u001b[48;5;238m\u001b[38;5;255mreconcile: freshness=unknown last_ok_at=none cycle_ms=unknown drift_count=0 | consumers: none | deli\u001b[0m\n\u001b[48;5;238m\u001b[38;5;255mvery=ready consumer=streaming\u001b[0m\n\u001b[38;5;81mgajaeway> \u001b[0m \u001b[30;11H\u001b[?25h\u001b[?2026l",
       "containsEscape": true
     },
     {
       "sequence": 13,
-      "atMs": 1018,
+      "atMs": 1097,
       "raw": "\u001b[?2026l\u001b[?25h\u001b[?2004l\u001b[?1049l",
       "containsEscape": true
     }

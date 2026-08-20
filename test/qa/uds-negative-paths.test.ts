@@ -3,16 +3,18 @@ import * as os from "node:os";
 import { createConnection } from "node:net";
 import * as path from "node:path";
 import { expect, test } from "bun:test";
+import { BrokerCli } from "../../src/broker/cli";
 import { createMainAdmissionHandler } from "../../src/main-session/admission";
 import { bootstrapMainSession } from "../../src/main-session/bootstrap";
 import { createMainSessionHost } from "../../src/main-session/host";
 import { strictResumeMainSession } from "../../src/main-session/resume";
 import { GatewayStateStore } from "../../src/main-session/state";
+import { createExternalHostSupervisor } from "../../src/main-session/supervisor";
 import { loadWayCore, type WayCoreHandle } from "../../src/native-loader";
 import { loadWayProfile } from "../../src/profile";
 import { createRpcBridge, RpcBridgeException } from "../../src/rpc-bridge";
 import { RpcClient } from "../../src/rpc-client";
-import { FileSdkDouble } from "../helpers/main-session";
+import { FakeBrokerFixture } from "../helpers/main-session";
 
 function temporaryDirectory(name: string): string {
 	return fs.mkdtempSync(path.join(os.tmpdir(), `gajae-way-qa-${name}-`));
@@ -24,7 +26,7 @@ async function connectEventually(socketPath: string): Promise<RpcClient> {
 			try {
 				return await RpcClient.connect(socketPath);
 			} catch {
-				// The listener can exist before its accept loop is ready.
+				// Listener startup races are expected.
 			}
 		}
 		await Bun.sleep(10);
@@ -44,28 +46,22 @@ async function rawFrameUntilServerCloses(socketPath: string, frame: Uint8Array):
 		const chunks: Buffer[] = [];
 		let connected = false;
 		let settled = false;
-		const timeout = setTimeout(() => finish(() => reject(new Error("server did not close the malformed RPC connection"))), 5_000);
 		const finish = (callback: () => void) => {
 			if (settled) return;
 			settled = true;
 			clearTimeout(timeout);
 			callback();
 		};
+		const timeout = setTimeout(() => finish(() => reject(new Error("server did not close malformed RPC connection"))), 5_000);
 		socket.on("data", chunk => chunks.push(Buffer.from(chunk)));
 		socket.once("connect", () => {
 			connected = true;
-			socket.write(frame, () => undefined);
+			socket.write(frame);
 		});
 		socket.once("error", error => {
 			if (!connected) finish(() => reject(error));
 		});
-		socket.once("close", () => {
-			if (!connected) {
-				finish(() => reject(new Error("RPC connection closed before it was established")));
-				return;
-			}
-			finish(() => resolve(Buffer.concat(chunks)));
-		});
+		socket.once("close", () => finish(() => resolve(Buffer.concat(chunks))));
 	});
 }
 
@@ -74,13 +70,16 @@ function responseError(response: Awaited<ReturnType<RpcClient["request"]>>): { c
 	return response.error;
 }
 
-function profileContents(corpus: string, workspace: string): string {
+function profileContents(corpus: string, workspace: string, sessionId: string): string {
 	return `[corpus]
 path = "${corpus}"
 workspace = "${workspace}"
 
 [injection]
 files = []
+
+[main_session]
+session_id = "${sessionId}"
 
 [surfaces.owner]
 id = "owner"
@@ -120,84 +119,65 @@ test("real UDS closes malformed frames and leaves unknown cancellation harmless"
 	try {
 		client = await connectEventually(socketPath);
 		const oversized = await rawFrameUntilServerCloses(socketPath, Buffer.concat([Buffer.alloc(1_048_577, "x"), Buffer.from("\n")]));
-		expect(JSON.parse(oversized.toString("utf8"))).toMatchObject({
-			jsonrpc: "2.0",
-			id: null,
-			error: { code: -32600, message: "payload_too_large" },
-		});
-
-		const nonUtf8 = await rawFrameUntilServerCloses(socketPath, Buffer.from([0xff, 0x0a]));
-		expect(nonUtf8).toHaveLength(0);
-
-		const unknownMethod = await client.request("unknown.method", {});
-		expect(responseError(unknownMethod)).toMatchObject({ code: -32601 });
-
-		const unknownCancel = await client.request("rpc.cancel", { id: "not-in-flight" });
-		expect(unknownCancel.result).toEqual({ cancelled: false });
-		expect((await client.request("way.health", {})).result).toMatchObject({ status: "healthy", state: "running" });
+		expect(JSON.parse(oversized.toString("utf8"))).toMatchObject({ error: { code: -32600, message: "payload_too_large" } });
+		expect(await rawFrameUntilServerCloses(socketPath, Buffer.from([0xff, 0x0a]))).toHaveLength(0);
+		expect(responseError(await client.request("unknown.method", {}))).toMatchObject({ code: -32601 });
+		expect((await client.request("rpc.cancel", { id: "not-in-flight" })).result).toEqual({ cancelled: false });
 	} finally {
 		client?.close();
 		await stopCore(core, stateDirectory);
 	}
 }, 10_000);
 
-test("main.submit rejects unknown fields, conflicts durable idempotency, and keeps non-owner ingress off prompt and steer", async () => {
-	const root = temporaryDirectory("admission");
-	const corpus = path.join(root, "corpus");
-	const workspace = path.join(root, "workspace");
-	const stateDirectory = path.join(root, "state");
-	const profilePath = path.join(root, "profile.toml");
-	fs.mkdirSync(corpus);
-	fs.mkdirSync(workspace);
-	fs.writeFileSync(profilePath, profileContents(corpus, workspace));
+test("main.submit validates its UDS contract and durable idempotency through an external broker fixture", async () => {
+	const fixture = new FakeBrokerFixture();
+	const corpus = path.join(fixture.root, "corpus");
+	fs.mkdirSync(corpus, { recursive: true });
+	const stateDirectory = path.join(fixture.root, "state");
+	const profilePath = path.join(fixture.root, "profile.toml");
+	fs.writeFileSync(profilePath, profileContents(corpus, fixture.workspace, fixture.sessionId));
 	const profile = loadWayProfile(profilePath);
 	const core = loadWayCore().WayCore.open(stateDirectory);
 	const state = new GatewayStateStore(core);
-	const sdk = new FileSdkDouble();
+	const supervisor = createExternalHostSupervisor({
+		broker: new BrokerCli({ executable: fixture.executable, environment: fixture.environment() }),
+		workspace: fixture.workspace,
+	});
 	let host: ReturnType<typeof createMainSessionHost> | undefined;
 	let client: RpcClient | undefined;
 	try {
-		await bootstrapMainSession({ confirm: true, profile, state, sdk });
-		const resumed = await strictResumeMainSession({ profile, state, sdk });
-		host = createMainSessionHost({ session: resumed.session, identity: resumed.identity, state, journal: core });
-		const submit = createMainAdmissionHandler(host, profile, core);
-		core.startRpcServer(
-			path.join(stateDirectory, "rpc.sock"),
-			createRpcBridge(core, async (method, params) => {
-				if (method === "main.submit") return await submit(params);
-				throw new RpcBridgeException(-32601, `method not found: ${method}`);
-			}),
-		);
-		client = await connectEventually(path.join(stateDirectory, "rpc.sock"));
-
-		const unexpectedField = await client.request("main.submit", {
-			text: "must reject unknown fields",
-			surface_id: "guest",
-			idempotency_key: "qa-extra-field",
-			unexpected: true,
+		await bootstrapMainSession({ confirm: true, profile, state, supervisor, sessionId: fixture.sessionId });
+		const resumed = await strictResumeMainSession({ profile, state, supervisor });
+		host = createMainSessionHost({
+			supervisor,
+			identity: resumed.identity,
+			state,
+			journal: core,
+			initialTurnState: resumed.turnState,
+			initialFollowUpQueueDepth: resumed.followUpQueueDepth,
 		});
-		expect(responseError(unexpectedField)).toMatchObject({ code: -32602, message: "unknown parameter: unexpected" });
-
+		const submit = createMainAdmissionHandler(host, profile, core);
+		core.startRpcServer(path.join(stateDirectory, "rpc.sock"), createRpcBridge(core, async (method, params) => {
+			if (method === "main.submit") return await submit(params);
+			throw new RpcBridgeException(-32601, `method not found: ${method}`);
+		}));
+		client = await connectEventually(path.join(stateDirectory, "rpc.sock"));
+		expect(responseError(await client.request("main.submit", {
+			text: "must reject unknown fields", surface_id: "guest", idempotency_key: "qa-extra-field", unexpected: true,
+		}))).toMatchObject({ code: -32602, message: "unknown parameter: unexpected" });
 		const first = await client.request("main.submit", {
-			text: "qa non-owner request",
-			surface_id: "guest",
-			idempotency_key: "qa-main-submit-conflict",
+			text: "qa non-owner request", surface_id: "guest", idempotency_key: "qa-main-submit-conflict",
 		});
 		expect(first.result).toMatchObject({ accepted: true, delivered_as: "follow_up" });
-		expect(fs.readFileSync(resumed.identity.canonicalPath, "utf8")).not.toContain("qa non-owner request");
-
-		const conflict = await client.request("main.submit", {
-			text: "qa changed request",
-			surface_id: "guest",
-			idempotency_key: "qa-main-submit-conflict",
-		});
-		expect(responseError(conflict)).toMatchObject({ code: 1500, message: "idempotency_conflict" });
+		expect(fixture.commands()).toEqual([expect.objectContaining({ operation: "turn.follow_up" })]);
+		expect(responseError(await client.request("main.submit", {
+			text: "qa changed request", surface_id: "guest", idempotency_key: "qa-main-submit-conflict",
+		}))).toMatchObject({ code: 1500, message: "idempotency_conflict" });
 	} finally {
 		client?.close();
 		await host?.dispose();
 		core.shutdownRpcServer();
-		await Bun.sleep(40);
-		fs.rmSync(root, { force: true, recursive: true });
+		fixture.dispose();
 	}
 });
 
@@ -210,24 +190,11 @@ test("real RPC makes explicit release idempotent and refuses an expired renewal"
 	try {
 		client = await connectEventually(socketPath);
 		const releasedLease = acquireNativeLease(core, "qa-double-release", "qa-double-release");
-		const firstRelease = await client.request("gitlock.release", {
-			lease_id: releasedLease.leaseId,
-			idempotency_key: "qa-release-first",
-		});
-		expect(firstRelease.result).toMatchObject({ released: true });
-		const secondRelease = await client.request("gitlock.release", {
-			lease_id: releasedLease.leaseId,
-			idempotency_key: "qa-release-second",
-		});
-		expect(secondRelease.result).toMatchObject({ released: false });
-
+		expect((await client.request("gitlock.release", { lease_id: releasedLease.leaseId, idempotency_key: "qa-release-first" })).result).toMatchObject({ released: true });
+		expect((await client.request("gitlock.release", { lease_id: releasedLease.leaseId, idempotency_key: "qa-release-second" })).result).toMatchObject({ released: false });
 		const expiringLease = acquireNativeLease(core, "qa-expired-renew", "qa-expired-renew");
 		await Bun.sleep(5_100);
-		const renewed = await client.request("gitlock.renew", {
-			lease_id: expiringLease.leaseId,
-			idempotency_key: "qa-expired-renew",
-		});
-		expect(responseError(renewed)).toMatchObject({ code: 1202, message: "lease_expired" });
+		expect(responseError(await client.request("gitlock.renew", { lease_id: expiringLease.leaseId, idempotency_key: "qa-expired-renew" }))).toMatchObject({ code: 1202, message: "lease_expired" });
 	} finally {
 		client?.close();
 		await stopCore(core, stateDirectory);

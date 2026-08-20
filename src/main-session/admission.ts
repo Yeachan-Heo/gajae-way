@@ -14,11 +14,8 @@ export interface AdmissionRequest {
 
 export interface MainAdmissionTarget {
 	readonly turnState: "idle" | "busy";
-	/** Synchronously transfers an SDK operation into host-owned tracking. */
-	admit?(deliveredAs: DeliveredAs, text: string): void;
-	prompt(text: string): Promise<void>;
-	steer(text: string): Promise<void>;
-	followUp(text: string): Promise<void>;
+	/** Broker acceptance boundary; this must not await model-turn completion. */
+	admit(deliveredAs: DeliveredAs, text: string, opRef: string): Promise<void>;
 }
 
 export interface CreateMainAdmissionOptions {
@@ -71,9 +68,13 @@ function replayResponse(responseJson: string | undefined): { accepted: boolean; 
 	return response as { accepted: boolean; op_ref: string; delivered_as: DeliveredAs };
 }
 
-function dispatchAdmittedOperation(target: MainAdmissionTarget, deliveredAs: DeliveredAs, text: string): void {
-	if (typeof target.admit !== "function") throw new Error("Main admission target cannot accept operations.");
-	target.admit(deliveredAs, text);
+async function dispatchAdmittedOperation(
+	target: MainAdmissionTarget,
+	deliveredAs: DeliveredAs,
+	text: string,
+	opRef: string,
+): Promise<void> {
+	await target.admit(deliveredAs, text, opRef);
 }
 
 /**
@@ -114,7 +115,7 @@ export function createMainAdmissionHandler(
 				: "steer"
 			: "follow_up";
 		const response = { accepted: true, op_ref: newOpRef(), delivered_as: deliveredAs } as const;
-		dispatchAdmittedOperation(target, deliveredAs, request.text);
+		await dispatchAdmittedOperation(target, deliveredAs, request.text, response.op_ref);
 		try {
 			idempotency.idempotencyStore({
 				scope: "main.submit",

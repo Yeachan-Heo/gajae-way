@@ -10,21 +10,22 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { RawConsoleTerminal, runWayConsole } from "../../src/console/console";
+import { BrokerCli } from "../../src/broker/cli";
 import { createMainAdmissionHandler } from "../../src/main-session/admission";
 import { bootstrapMainSession } from "../../src/main-session/bootstrap";
-import { createMainGateAnswerHandler } from "../../src/main-session/gates";
 import { createMainSessionHost } from "../../src/main-session/host";
 import { strictResumeMainSession } from "../../src/main-session/resume";
 import { GatewayStateStore } from "../../src/main-session/state";
+import { createExternalHostSupervisor } from "../../src/main-session/supervisor";
 import { loadWayCore } from "../../src/native-loader";
 import { loadWayProfile } from "../../src/profile";
 import { createRpcBridge, RpcBridgeException, type RpcBridgeHandler } from "../../src/rpc-bridge";
 import { RpcClient } from "../../src/rpc-client";
-import { FileSdkDouble } from "../helpers/main-session";
+import { FakeBrokerFixture } from "../helpers/main-session";
 
 const repositoryRoot = path.resolve(import.meta.dir, "../..");
 
-function ownerProfile(corpus: string, workspace: string): string {
+function ownerProfile(corpus: string, workspace: string, sessionId: string): string {
 	return `[corpus]
 path = "${corpus}"
 workspace = "${workspace}"
@@ -36,6 +37,9 @@ files = []
 id = "owner"
 platform = "test"
 kind = "dm"
+
+[main_session]
+session_id = "${sessionId}"
 `;
 }
 
@@ -119,32 +123,36 @@ function visibleTerminalText(text: string): string {
 }
 
 async function main(): Promise<void> {
-	const root = fs.mkdtempSync(path.join(os.tmpdir(), "gajaeway-console-transcript-"));
+	const fixture = new FakeBrokerFixture();
+	const root = fixture.root;
 	const corpus = path.join(root, "corpus");
-	const workspace = path.join(root, "workspace");
+	const workspace = fixture.workspace;
 	const stateDirectory = path.join(root, "state");
 	fs.mkdirSync(corpus);
-	fs.mkdirSync(workspace);
 	const profilePath = path.join(root, "profile.toml");
-	fs.writeFileSync(profilePath, ownerProfile(corpus, workspace));
+	fs.writeFileSync(profilePath, ownerProfile(corpus, workspace, fixture.sessionId));
 
 	const profile = loadWayProfile(profilePath);
 	const core = loadWayCore().WayCore.open(stateDirectory);
 	const state = new GatewayStateStore(core);
-	const sdk = new FileSdkDouble();
-	await bootstrapMainSession({ confirm: true, profile, state, sdk });
-	const resumed = await strictResumeMainSession({ profile, state, sdk });
+	const supervisor = createExternalHostSupervisor({
+		broker: new BrokerCli({ executable: fixture.executable, environment: fixture.environment() }),
+		workspace,
+	});
+	await bootstrapMainSession({ confirm: true, profile, state, supervisor, sessionId: fixture.sessionId });
+	const resumed = await strictResumeMainSession({ profile, state, supervisor });
 	const host = createMainSessionHost({
-		session: resumed.session,
+		supervisor,
 		identity: resumed.identity,
 		state,
 		journal: core,
+		initialTurnState: resumed.turnState,
+		initialFollowUpQueueDepth: resumed.followUpQueueDepth,
 	});
 	const submit = createMainAdmissionHandler(host, profile, core);
-	const answer = createMainGateAnswerHandler(host, core);
 	const bridge: RpcBridgeHandler = async (method, params) => {
 		if (method === "main.submit") return await submit(params);
-		if (method === "main.gate.answer") return await answer(params);
+		if (method === "main.gate.answer") throw new RpcBridgeException(1103, "gate_answer_unsupported");
 		throw new RpcBridgeException(-32601, `method not found: ${method}`);
 	};
 	const socketPath = path.join(stateDirectory, "rpc.sock");
@@ -294,7 +302,7 @@ async function main(): Promise<void> {
 
 	core.shutdownRpcServer();
 	await host.dispose();
-	fs.rmSync(root, { force: true, recursive: true });
+	fixture.dispose();
 
 	console.log(JSON.stringify(transcript.observations, null, 2));
 }

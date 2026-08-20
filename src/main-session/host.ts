@@ -1,13 +1,11 @@
-import { MainSessionGateRegistry, type GateHandle } from "./gates";
-import type { HostedSdkGate, HostedSdkGateResolution, HostedSdkSession } from "./sdk";
+import { MainSessionGateRegistry, type GateHandle, type MainGateResolution } from "./gates";
 import {
-	attestAppendOnlyGrowth,
-	fingerprintSessionFile,
 	GatewayStateStore,
-	sameFingerprint,
+	sameExternalFingerprint,
+	type ExternalSessionIdentity,
 	type GrowthIntent,
-	type SessionFingerprint,
 } from "./state";
+import { HostSupervisorError, type HostSupervisor, type SupervisorEvent } from "./supervisor";
 
 export interface MainSessionJournal {
 	journalAppend(kind: string, payloadJson: string): unknown;
@@ -19,8 +17,8 @@ export interface MainSessionJournal {
 export class MainSessionHostError extends Error {
 	readonly reason: string;
 
-	constructor(reason: string, message = reason) {
-		super(message);
+	constructor(reason: string, message = reason, options: { readonly cause?: unknown } = {}) {
+		super(message, options.cause === undefined ? undefined : { cause: options.cause });
 		this.name = "MainSessionHostError";
 		this.reason = reason;
 	}
@@ -28,29 +26,56 @@ export class MainSessionHostError extends Error {
 
 export interface MainSessionHost {
 	readonly sessionId: string;
-	readonly identity: SessionFingerprint;
+	readonly identity: ExternalSessionIdentity;
 	readonly degraded: boolean;
 	readonly turnState: "idle" | "busy";
 	readonly followUpQueueDepth: number;
 	readonly gates: MainSessionGateRegistry;
-	/** Synchronously takes ownership of an admitted operation; completion is tracked in the host. */
-	admit(deliveredAs: "prompt" | "steer" | "follow_up", text: string): void;
-
-	prompt(text: string): Promise<void>;
-	steer(text: string): Promise<void>;
-	followUp(text: string): Promise<void>;
-	resolveGate(gateId: string, answer: unknown, idempotencyKey: string): Promise<HostedSdkGateResolution>;
+	/** Waits for broker admission only; successful turn execution is observed asynchronously. */
+	admit(deliveredAs: "prompt" | "steer" | "follow_up", text: string, opRef: string): Promise<void>;
+	resolveGate(gateId: string, answer: unknown, idempotencyKey: string): Promise<MainGateResolution>;
+	waitForFatalFailure(): Promise<MainSessionHostError>;
 	dispose(): Promise<void>;
 }
 
 export interface CreateMainSessionHostOptions {
-	readonly session: HostedSdkSession;
-	readonly identity: SessionFingerprint;
+	readonly supervisor: HostSupervisor;
+	readonly identity: ExternalSessionIdentity;
 	readonly state: GatewayStateStore;
 	readonly journal: MainSessionJournal;
+	readonly initialTurnState?: "idle" | "busy";
+	readonly initialFollowUpQueueDepth?: number;
 	readonly now?: () => number;
 	readonly gates?: MainSessionGateRegistry;
 }
+
+interface GrowthWindow {
+	readonly intent: GrowthIntent;
+	pendingAdmissions: number;
+}
+
+interface JournaledAttemptTransitions {
+	started: boolean;
+	ended: boolean;
+}
+
+interface FinalAssistantMessage {
+	readonly key: string;
+	readonly payload: {
+		readonly finalized: true;
+		readonly text: string;
+		readonly message_id?: string;
+		readonly timestamp?: number;
+	};
+}
+
+export interface MainSessionTurnJournalPayload {
+	readonly attempt_id: string;
+	readonly generation: number;
+	readonly lineage: string;
+}
+
+const MAX_JOURNALED_ATTEMPTS = 1_000;
 
 function isRecord(value: unknown): value is Record<string, unknown> {
 	return typeof value === "object" && value !== null && !Array.isArray(value);
@@ -65,7 +90,7 @@ function eventString(event: Record<string, unknown>, ...keys: string[]): string 
 }
 
 function eventTimestamp(event: Record<string, unknown>): number | undefined {
-	for (const key of ["expires_at", "expiresAt", "deadline_at", "deadlineAt"]) {
+	for (const key of ["expires_at", "expiresAt", "deadline_at", "deadlineAt", "timestamp"]) {
 		const value = event[key];
 		if (typeof value === "number" && Number.isFinite(value)) return value;
 		if (typeof value === "string") {
@@ -78,87 +103,34 @@ function eventTimestamp(event: Record<string, unknown>): number | undefined {
 
 function gateFromEvent(event: unknown, fallbackSessionId: string): GateHandle | undefined {
 	if (!isRecord(event)) return undefined;
-	const gateId = eventString(event, "gate_id", "gateId", "workflowGateId");
+	const gateId = eventString(event, "gate_id", "gateId", "workflowGateId", "id");
 	if (!gateId) return undefined;
 	return {
 		gateId,
-		expectedSessionId: eventString(event, "session_id", "sessionId") ?? fallbackSessionId,
+		expectedSessionId: eventString(event, "session_id", "sessionId", "expectedSessionId") ?? fallbackSessionId,
 		expiresAt: eventTimestamp(event),
 	};
 }
 
-interface FinalAssistantMessage {
-	readonly key: string;
-	readonly payload: {
-		readonly finalized: true;
-		readonly text: string;
-		readonly message_id?: string;
-		readonly timestamp?: number;
-	};
+function textFromContent(content: unknown): string {
+	if (typeof content === "string") return content;
+	if (!Array.isArray(content)) return "";
+	return content
+		.filter(isRecord)
+		.filter(block => block.type === "text" && typeof block.text === "string")
+		.map(block => block.text as string)
+		.join("");
 }
 
-/**
- * Stable journal payload for one outer SDK attempt.
- *
- * Both `turn_start` and `turn_end` use this exact shape. Provider messages,
- * tool results, and assistant text deliberately remain out of lifecycle rows;
- * finalized assistant text is published only as `assistant_message`.
- */
-export interface MainSessionTurnJournalPayload {
-	readonly attempt_id: string;
-	readonly generation: number;
-	readonly lineage: string;
-}
-
-interface JournaledAttemptTransitions {
-	started: boolean;
-	ended: boolean;
-}
-
-const MAX_JOURNALED_ATTEMPTS = 1_000;
-
-function turnJournalPayload(event: Record<string, unknown>): MainSessionTurnJournalPayload | undefined {
-	const scope = event.scope;
-	if (!isRecord(scope)) return undefined;
-	const attemptId = eventString(scope, "attemptId");
-	const lineage = eventString(scope, "lineage");
-	const generation = scope.generation;
-	if (!attemptId || !lineage || typeof generation !== "number" || !Number.isSafeInteger(generation) || generation < 0)
-		return undefined;
-	return { attempt_id: attemptId, generation, lineage };
-}
-
-function turnJournalKey(payload: MainSessionTurnJournalPayload): string {
-	return `${payload.lineage}\u0000${payload.attempt_id}\u0000${payload.generation}`;
-}
-
-interface GrowthWindow {
-	readonly intent: GrowthIntent;
-	activeMutations: number;
-	activeTurns: number;
-}
-
-function finalizedAssistantMessage(event: Record<string, unknown>): FinalAssistantMessage | undefined {
-	if (event.type !== "message_end" || !isRecord(event.message) || event.message.role !== "assistant") return undefined;
-	const message = event.message;
-	const content = message.content;
-	const text =
-		typeof content === "string"
-			? content
-			: Array.isArray(content)
-				? content
-						.filter(isRecord)
-						.filter((block) => block.type === "text" && typeof block.text === "string")
-						.map((block) => block.text as string)
-						.join("")
-				: "";
+function finalizedAssistantMessage(event: Record<string, unknown>, fallbackKey: string): FinalAssistantMessage | undefined {
+	const candidate = isRecord(event.message) ? event.message : event;
+	if (candidate.role !== "assistant") return undefined;
+	const text = textFromContent(candidate.content);
 	if (!text.trim()) return undefined;
-	const messageId = eventString(message, "responseId", "id");
-	const timestamp =
-		typeof message.timestamp === "number" && Number.isFinite(message.timestamp) ? message.timestamp : undefined;
-	const key = messageId ? `response:${messageId}` : `message:${timestamp ?? "unknown"}:${text}`;
+	const messageId = eventString(candidate, "responseId", "response_id", "id", "message_id");
+	const timestamp = eventTimestamp(candidate);
 	return {
-		key,
+		key: messageId ? `response:${messageId}` : fallbackKey,
 		payload: {
 			finalized: true,
 			text,
@@ -168,55 +140,92 @@ function finalizedAssistantMessage(event: Record<string, unknown>): FinalAssista
 	};
 }
 
-function journalPayload(event: unknown): string {
-	return JSON.stringify(event);
+function payloadJson(payload: unknown): string {
+	return JSON.stringify(payload);
 }
 
 function markFailedClosed(state: GatewayStateStore, reason: string): void {
 	try {
 		state.markFailedClosed(reason);
 	} catch {
-		// A competing process may already have closed the gateway; never overwrite
-		// its more specific durable failure reason from a stale host.
+		// A competing daemon may have already captured the authoritative reason.
 	}
 }
 
-class HostedMainSession implements MainSessionHost {
+function externalEvent(event: SupervisorEvent): Record<string, unknown> {
+	const payload = isRecord(event.payload) ? event.payload : { payload: event.payload };
+	return {
+		...payload,
+		type: typeof payload.type === "string" ? payload.type : event.kind,
+		__tail_kind: event.kind,
+		...(event.id === undefined ? {} : { __tail_id: event.id }),
+		...(event.generation === undefined ? {} : { __tail_generation: event.generation }),
+		...(event.seq === undefined ? {} : { __tail_seq: event.seq }),
+	};
+}
+
+function supervisorEventKey(event: SupervisorEvent): string {
+	if (event.id !== undefined) return `id:${event.id}`;
+	if (event.generation !== undefined && event.seq !== undefined) return `seq:${event.generation}:${event.seq}`;
+	return `payload:${event.kind}:${JSON.stringify(event.payload)}`;
+}
+
+
+const FATAL_EXTERNAL_IDENTITY_REASONS = new Set([
+	"session_deleted",
+	"session_unavailable",
+	"session_ambiguous",
+	"session_terminal_uncertain",
+	"session_locator_mismatch",
+	"growth_intent_mismatch",
+	"main_identity_mismatch",
+	"tail_retention_gap",
+]);
+
+function isFatalExternalIdentityFailure(reason: string): boolean {
+	return FATAL_EXTERNAL_IDENTITY_REASONS.has(reason);
+}
+class ExternalMainSessionHost implements MainSessionHost {
 	readonly sessionId: string;
 	readonly gates: MainSessionGateRegistry;
-	#identity: SessionFingerprint;
-	readonly #session: HostedSdkSession;
+	readonly #supervisor: HostSupervisor;
 	readonly #state: GatewayStateStore;
 	readonly #journal: MainSessionJournal;
 	readonly #now: () => number;
-	readonly #unsubscribe: () => void;
-	readonly #unsubscribeGates: () => void;
-	#turnState: "idle" | "busy" = "idle";
-	#followUpQueueDepth = 0;
+	#identity: ExternalSessionIdentity;
+	#turnState: "idle" | "busy";
+	#followUpQueueDepth: number;
 	#degraded = false;
 	#failure: MainSessionHostError | undefined;
 	#growthWindow: GrowthWindow | undefined;
+	#disposed = false;
+	#activeAttempt: MainSessionTurnJournalPayload | undefined;
+	#nextAttempt = 0;
 	readonly #finalizedAssistantMessageKeys = new Set<string>();
 	readonly #journaledAttemptTransitions = new Map<string, JournaledAttemptTransitions>();
-	readonly #inFlightOperations = new Set<Promise<void>>();
-
-	#disposed = false;
+	readonly #admittedOperations = new Map<string, "prompt" | "steer" | "follow_up">();
+	readonly #seenTailEvents = new Set<string>();
+	readonly #fatalFailure = Promise.withResolvers<MainSessionHostError>();
+	readonly #tailStop = Promise.withResolvers<void>();
+	#tailWake = Promise.withResolvers<void>();
+	readonly #highestTailSequenceByGeneration = new Map<number, number>();
+	readonly #tailTask: Promise<void>;
 
 	constructor(options: CreateMainSessionHostOptions) {
-		this.sessionId = options.session.sessionId;
+		this.sessionId = options.identity.sessionId;
+		this.#supervisor = options.supervisor;
 		this.#identity = options.identity;
-		this.#session = options.session;
 		this.#state = options.state;
 		this.#journal = options.journal;
 		this.#now = options.now ?? Date.now;
 		this.gates = options.gates ?? new MainSessionGateRegistry({ now: this.#now });
-		this.#unsubscribe = this.#session.subscribe((event) => this.observeSessionEvent(event));
-		this.#unsubscribeGates = this.#session.subscribeGates((gate) => this.observeSdkGate(gate));
-		this.refreshFollowUpQueueDepth();
+		this.#turnState = options.initialTurnState ?? "idle";
+		this.#followUpQueueDepth = Math.max(0, options.initialFollowUpQueueDepth ?? 0);
 		this.publishStatus();
+		this.#tailTask = this.observeTail();
 	}
 
-	get identity(): SessionFingerprint {
+	get identity(): ExternalSessionIdentity {
 		return this.#identity;
 	}
 
@@ -232,39 +241,43 @@ class HostedMainSession implements MainSessionHost {
 		return this.#followUpQueueDepth;
 	}
 
+	waitForFatalFailure(): Promise<MainSessionHostError> {
+		return this.#fatalFailure.promise;
+	}
+
+	private wakeTail(): void {
+		this.#tailWake.resolve();
+		this.#tailWake = Promise.withResolvers<void>();
+	}
 	private publishStatus(): void {
 		try {
 			this.#journal.setMainSessionStatus?.(this.#turnState, this.#followUpQueueDepth);
 		} catch {
-			// Status is an in-memory observation. Journal durability remains the
-			// fail-closed boundary and is handled separately below.
+			// Status is best-effort observation; durable journal writes remain authoritative.
 		}
-	}
-
-	private refreshFollowUpQueueDepth(): void {
-		const depth = this.#session.followUpQueueDepth();
-		if (!Number.isSafeInteger(depth) || depth < 0) return;
-		this.#followUpQueueDepth = Math.min(depth, 0xffff_ffff);
 	}
 
 	private enterFailure(reason: string, error: unknown, journalFailure = false): MainSessionHostError {
 		if (this.#failure) return this.#failure;
 		const detail = error instanceof Error ? error.message : String(error);
-		const failure = new MainSessionHostError(reason, `${reason}: ${detail}`);
+		const failure = new MainSessionHostError(reason, `${reason}: ${detail}`, { cause: error });
 		this.#failure = failure;
 		this.#degraded = true;
 		if (journalFailure) {
 			try {
 				this.#journal.setJournalDegraded?.(true);
 			} catch {
-				// The journal failure remains authoritative if status publication is unavailable.
+				// The original journal failure remains authoritative.
 			}
 		}
 		try {
 			this.#journal.setRpcHealth?.("degraded", reason);
 		} catch {
-			// The original durable failure remains authoritative when health reporting
-			// is also unavailable.
+			// The original failure remains authoritative if health publication also fails.
+		}
+		if (isFatalExternalIdentityFailure(reason)) {
+			markFailedClosed(this.#state, reason);
+			this.#fatalFailure.resolve(failure);
 		}
 		return failure;
 	}
@@ -272,7 +285,7 @@ class HostedMainSession implements MainSessionHost {
 	private appendJournalEvent(kind: string, payload: unknown): boolean {
 		if (this.#disposed || this.#failure) return false;
 		try {
-			this.#journal.journalAppend(kind, journalPayload(payload));
+			this.#journal.journalAppend(kind, payloadJson(payload));
 			return true;
 		} catch (error) {
 			this.enterFailure("journal_append_failed", error, true);
@@ -280,21 +293,33 @@ class HostedMainSession implements MainSessionHost {
 		}
 	}
 
-	private appendFinalAssistantMessage(event: Record<string, unknown>): void {
-		const finalized = finalizedAssistantMessage(event);
-		if (!finalized || this.#finalizedAssistantMessageKeys.has(finalized.key)) return;
-		if (!this.appendJournalEvent("assistant_message", finalized.payload)) return;
-		this.#finalizedAssistantMessageKeys.add(finalized.key);
-		if (this.#finalizedAssistantMessageKeys.size > 1_000) {
-			const oldest = this.#finalizedAssistantMessageKeys.values().next().value;
-			if (oldest) this.#finalizedAssistantMessageKeys.delete(oldest);
+	private attemptPayload(event: Record<string, unknown>): MainSessionTurnJournalPayload {
+		const scope = isRecord(event.scope) ? event.scope : undefined;
+		const scopedAttempt = scope && eventString(scope, "attemptId");
+		const scopedLineage = scope && eventString(scope, "lineage");
+		const scopedGeneration = scope?.generation;
+		if (scopedAttempt && scopedLineage && typeof scopedGeneration === "number" && Number.isSafeInteger(scopedGeneration)) {
+			return { attempt_id: scopedAttempt, generation: scopedGeneration, lineage: scopedLineage };
 		}
+		if (!this.#activeAttempt) {
+			const externalId = eventString(event, "clientRef", "commandId", "turnId", "__tail_id");
+			const generation =
+				typeof event.__tail_generation === "number" && Number.isSafeInteger(event.__tail_generation)
+					? event.__tail_generation
+					: ++this.#nextAttempt;
+			this.#activeAttempt = {
+				attempt_id: externalId ?? `${this.sessionId}:external:${++this.#nextAttempt}`,
+				generation,
+				lineage: "external",
+			};
+		}
+		if (!this.#activeAttempt) throw new MainSessionHostError("attempt_identity_missing");
+		return this.#activeAttempt;
 	}
 
 	private appendTurnTransition(kind: "turn_start" | "turn_end", event: Record<string, unknown>): void {
-		const payload = turnJournalPayload(event);
-		if (!payload) return;
-		const key = turnJournalKey(payload);
+		const payload = this.attemptPayload(event);
+		const key = `${payload.lineage}\u0000${payload.attempt_id}\u0000${payload.generation}`;
 		const transitions = this.#journaledAttemptTransitions.get(key) ?? { started: false, ended: false };
 		this.#journaledAttemptTransitions.set(key, transitions);
 		const field = kind === "turn_start" ? "started" : "ended";
@@ -302,109 +327,81 @@ class HostedMainSession implements MainSessionHost {
 		transitions[field] = true;
 		while (this.#journaledAttemptTransitions.size > MAX_JOURNALED_ATTEMPTS) {
 			const oldest = this.#journaledAttemptTransitions.keys().next().value;
-			if (!oldest) return;
+			if (!oldest) break;
 			this.#journaledAttemptTransitions.delete(oldest);
 		}
+		if (kind === "turn_end") this.#activeAttempt = undefined;
 	}
 
-	private trackAdmittedOperation(operation: Promise<void>): void {
-		this.#inFlightOperations.add(operation);
-		void operation.then(
-			() => {
-				this.#inFlightOperations.delete(operation);
-			},
-			error => {
-				this.#inFlightOperations.delete(operation);
-				this.enterFailure(error instanceof MainSessionHostError ? error.reason : "turn_execution_failed", error);
-			},
-		);
-	}
-
-	/**
-	 * A durable growth intent covers one contiguous append-only transcript window.
-	 * Owner interrupts and queued follow-ups may both append inside that same
-	 * window; it is refreshed only after every active turn and queued follow-up
-	 * has settled.
-	 */
-	private beginGrowthWindow(): GrowthWindow {
-		const existing = this.#growthWindow;
-		if (existing) return existing;
-		const growth: GrowthWindow = {
-			intent: this.beforeMutation(),
-			activeMutations: 0,
-			activeTurns: this.#turnState === "busy" ? 1 : 0,
-		};
-		this.#growthWindow = growth;
-		return growth;
-	}
-
-	private beginMutation(): GrowthWindow {
-		const growth = this.beginGrowthWindow();
-		growth.activeMutations += 1;
-		return growth;
-	}
-
-	private finishMutation(growth: GrowthWindow): void {
-		if (this.#growthWindow !== growth) return;
-		growth.activeMutations = Math.max(0, growth.activeMutations - 1);
-		this.refreshFollowUpQueueDepth();
-		this.finishGrowthWindowIfSettled();
-	}
-
-	private finishGrowthWindowIfSettled(): void {
-		const growth = this.#growthWindow;
-		if (!growth || growth.activeMutations > 0 || growth.activeTurns > 0 || this.#followUpQueueDepth > 0) return;
-		this.#growthWindow = undefined;
-		try {
-			this.afterMutation(growth.intent);
-		} catch (error) {
-			this.enterFailure(error instanceof MainSessionHostError ? error.reason : "growth_refresh_failed", error);
+	private appendFinalAssistantMessage(event: Record<string, unknown>, fallbackKey: string): void {
+		const finalized = finalizedAssistantMessage(event, fallbackKey);
+		if (!finalized || this.#finalizedAssistantMessageKeys.has(finalized.key)) return;
+		if (!this.appendJournalEvent("assistant_message", finalized.payload)) return;
+		this.#finalizedAssistantMessageKeys.add(finalized.key);
+		while (this.#finalizedAssistantMessageKeys.size > MAX_JOURNALED_ATTEMPTS) {
+			const oldest = this.#finalizedAssistantMessageKeys.values().next().value;
+			if (!oldest) break;
+			this.#finalizedAssistantMessageKeys.delete(oldest);
 		}
 	}
 
-	private observeSdkGate(gate: HostedSdkGate): void {
-		if (gate.sessionId !== this.sessionId) return;
-		if (!this.gates.observeOpen({ gateId: gate.gateId, expectedSessionId: gate.sessionId, expiresAt: gate.expiresAt }))
-			return;
-		this.appendJournalEvent("gate_open", {
-			gate_id: gate.gateId,
-			session_id: gate.sessionId,
-			...(gate.expiresAt === undefined ? {} : { expires_at: gate.expiresAt }),
-			gate: gate.payload,
-		});
+	private observeGateOpen(event: Record<string, unknown>): void {
+		const gate = gateFromEvent(event, this.sessionId);
+		if (!gate || gate.expectedSessionId !== this.sessionId || !this.gates.observeOpen(gate)) return;
+		this.appendJournalEvent("gate_open", event);
 	}
 
-	private observeGateResolved(gateId: string, payload: unknown): void {
-		if (!this.gates.observeResolved(gateId)) return;
-		this.appendJournalEvent("gate_resolved", { gate_id: gateId, session_id: this.sessionId, event: payload });
+	private observeGateResolved(event: Record<string, unknown>): void {
+		const gate = gateFromEvent(event, this.sessionId);
+		if (!gate || gate.expectedSessionId !== this.sessionId || !this.gates.observeResolved(gate.gateId)) return;
+		this.appendJournalEvent("gate_resolved", event);
 	}
 
-	private observeSessionEvent(event: unknown): void {
-		if (this.#disposed) return;
-		const record = isRecord(event) ? event : undefined;
-		const type = record?.type;
-		if (type === "turn_start" || type === "agent_start") {
+	private observeExternalEvent(source: SupervisorEvent): void {
+		if (source.generation !== undefined && source.seq !== undefined) {
+			const highest = this.#highestTailSequenceByGeneration.get(source.generation);
+			if (highest !== undefined && source.seq <= highest) return;
+			this.#highestTailSequenceByGeneration.set(source.generation, source.seq);
+			while (this.#highestTailSequenceByGeneration.size > 32) {
+				const oldest = this.#highestTailSequenceByGeneration.keys().next().value;
+				if (oldest === undefined) break;
+				this.#highestTailSequenceByGeneration.delete(oldest);
+			}
+		}
+		const eventKey = supervisorEventKey(source);
+		if (this.#seenTailEvents.has(eventKey)) return;
+		this.#seenTailEvents.add(eventKey);
+		while (this.#seenTailEvents.size > MAX_JOURNALED_ATTEMPTS) {
+			const oldest = this.#seenTailEvents.values().next().value;
+			if (!oldest) break;
+			this.#seenTailEvents.delete(oldest);
+		}
+		const event = externalEvent(source);
+		const type = event.type;
+		if (type === "agent_start" || type === "turn_start") {
 			this.#turnState = "busy";
-			this.refreshFollowUpQueueDepth();
-			if (type === "turn_start" && this.#growthWindow) this.#growthWindow.activeTurns += 1;
+			if (type === "agent_start" && this.#followUpQueueDepth > 0) this.#followUpQueueDepth -= 1;
 			this.publishStatus();
-			// `agent_start` and each `turn_start` share the outer attempt scope.
-			// A tool-using attempt can have several SDK turns, so journal only once.
-			if (record) this.appendTurnTransition("turn_start", record);
+			this.appendTurnTransition("turn_start", event);
 			return;
 		}
-		if (type === "turn_end" || type === "agent_end") {
+		if (type === "agent_end" || type === "turn_end") {
 			this.#turnState = "idle";
-			this.refreshFollowUpQueueDepth();
-			if (this.#growthWindow) {
-				if (type === "turn_end" && this.#growthWindow.activeTurns > 0) this.#growthWindow.activeTurns -= 1;
-				if (type === "agent_end") this.#growthWindow.activeTurns = 0;
+			if (type === "agent_end") {
+				this.#admittedOperations.clear();
+				this.appendTurnTransition("turn_end", event);
 			}
 			this.publishStatus();
-			// `turn_end` is per SDK/provider turn. Only terminal `agent_end` closes
-			// the outer attempt represented by a journal `turn_end`.
-			if (type === "agent_end" && record) this.appendTurnTransition("turn_end", record);
 			this.finishGrowthWindowIfSettled();
+			return;
+		}
+		if (type === "agent_failed") {
+			this.#turnState = "idle";
+			this.#admittedOperations.clear();
+			this.publishStatus();
+			this.appendTurnTransition("turn_end", event);
+			this.finishGrowthWindowIfSettled();
+			this.enterFailure("turn_execution_failed", event);
 			return;
 		}
 		if (type === "gate_expired") {
@@ -412,157 +409,146 @@ class HostedMainSession implements MainSessionHost {
 			if (gate) this.gates.observeExpired(gate.gateId);
 			return;
 		}
-		if (type === "gate_open" || type === "workflow_gate" || (type === "action_needed" && record?.kind === "ask")) {
-			const gate = gateFromEvent(event, this.sessionId);
-			if (gate && gate.expectedSessionId === this.sessionId && this.gates.observeOpen(gate)) {
-				this.appendJournalEvent("gate_open", event);
-			}
+		if (type === "gate_open" || type === "workflow_gate" || (type === "action_needed" && event.kind === "ask")) {
+			this.observeGateOpen(event);
 			return;
 		}
 		if (type === "gate_resolved" || type === "action_resolved") {
-			const gate = gateFromEvent(event, this.sessionId);
-			if (gate && gate.expectedSessionId === this.sessionId) this.observeGateResolved(gate.gateId, event);
+			this.observeGateResolved(event);
 			return;
 		}
-		if (type === "message_end" && record) this.appendFinalAssistantMessage(record);
+		if (type === "message_end") this.appendFinalAssistantMessage(event, `event:${eventString(event, "__tail_id") ?? JSON.stringify(event)}`);
+	}
+
+	private observeTranscript(entries: readonly unknown[]): void {
+		for (const [index, entry] of entries.entries()) {
+			if (!isRecord(entry)) continue;
+			const event = isRecord(entry.message) ? entry.message : entry;
+			this.appendFinalAssistantMessage(event, `transcript:${index}:${JSON.stringify(entry)}`);
+		}
+	}
+
+	private observeIdentity(identity: ExternalSessionIdentity): void {
+		if (sameExternalFingerprint(this.#identity, identity)) return;
+		if (!this.#growthWindow) {
+			markFailedClosed(this.#state, "main_identity_mismatch");
+			throw this.enterFailure("main_identity_mismatch", new Error("External transcript changed outside a growth window."));
+		}
+		this.#identity = identity;
+	}
+
+	private async observeTail(): Promise<void> {
+		while (!this.#disposed && !this.#failure) {
+			try {
+				const tail = await this.#supervisor.tailEvents();
+				if (this.#disposed) return;
+				if (tail.retentionGap) {
+					this.enterFailure("tail_retention_gap", new Error("Broker tail reported a retention gap."));
+					return;
+				}
+				const priorTranscriptEntries = this.#identity.transcript?.entryCount ?? 0;
+				this.observeIdentity(tail.identity);
+				for (const event of tail.events) this.observeExternalEvent(event);
+				this.observeTranscript(tail.transcriptEntries.slice(priorTranscriptEntries));
+				if (tail.terminal) {
+					this.#turnState = "idle";
+					this.#admittedOperations.clear();
+					this.publishStatus();
+					this.finishGrowthWindowIfSettled();
+				}
+				const wake = this.#tailWake.promise;
+				await Promise.race([Bun.sleep(tail.terminal && this.#turnState === "idle" ? 500 : 100), wake, this.#tailStop.promise]);
+			} catch (error) {
+				if (this.#disposed) return;
+				const reason = error instanceof HostSupervisorError ? error.reason : "tail_observation_failed";
+				this.enterFailure(reason, error);
+				return;
+			}
+		}
 	}
 
 	private assertUsable(): void {
 		if (this.#disposed) throw new MainSessionHostError("host_disposed");
 		if (this.#failure) throw this.#failure;
-		if (this.#degraded) throw new MainSessionHostError("journal_degraded");
+		if (this.#degraded) throw new MainSessionHostError("host_degraded");
 	}
 
-	private beforeMutation(): GrowthIntent {
+	private beginGrowthWindow(): GrowthWindow {
+		const existing = this.#growthWindow;
+		if (existing) return existing;
 		this.assertUsable();
 		const durable = this.#state.read();
 		if (durable.bootstrapState !== "COMMITTED" || !durable.mainIdentity || durable.growthIntent) {
 			markFailedClosed(this.#state, "growth_protocol_invalid");
 			throw new MainSessionHostError("growth_protocol_invalid");
 		}
-		let observed: SessionFingerprint;
-		try {
-			observed = fingerprintSessionFile(durable.mainIdentity.canonicalPath);
-		} catch (error) {
-			markFailedClosed(this.#state, "main_identity_unreadable");
-			throw new MainSessionHostError(
-				"main_identity_unreadable",
-				error instanceof Error ? error.message : String(error),
-			);
-		}
-		if (!sameFingerprint(durable.mainIdentity, observed)) {
+		if (!sameExternalFingerprint(durable.mainIdentity, this.#identity)) {
 			markFailedClosed(this.#state, "main_identity_mismatch");
 			throw new MainSessionHostError("main_identity_mismatch");
 		}
-		const startedAt = this.#now();
+		const intent: GrowthIntent = { base: this.#identity, startedAt: this.#now() };
 		try {
-			this.#state.writeGrowthIntent(observed, startedAt);
+			this.#state.writeGrowthIntent(this.#identity, intent.startedAt);
 		} catch (error) {
 			markFailedClosed(this.#state, "growth_intent_write_failed");
-			throw new MainSessionHostError(
-				"growth_intent_write_failed",
-				error instanceof Error ? error.message : String(error),
-			);
+			throw new MainSessionHostError("growth_intent_write_failed", error instanceof Error ? error.message : String(error), { cause: error });
 		}
-		return { base: observed, startedAt };
+		const growth = { intent, pendingAdmissions: 0 };
+		this.#growthWindow = growth;
+		return growth;
 	}
 
-	private afterMutation(intent: GrowthIntent): void {
-		let refreshed: SessionFingerprint;
+	private finishGrowthWindowIfSettled(): void {
+		const growth = this.#growthWindow;
+		if (!growth || growth.pendingAdmissions > 0 || this.#turnState !== "idle" || this.#followUpQueueDepth > 0) return;
+		this.#growthWindow = undefined;
 		try {
-			refreshed = fingerprintSessionFile(intent.base.canonicalPath);
-			if (!attestAppendOnlyGrowth(intent.base, refreshed)) {
-				markFailedClosed(this.#state, "growth_intent_mismatch");
-				throw new MainSessionHostError(
-					"growth_intent_mismatch",
-					"The transcript changed outside the active append-only growth window.",
-				);
-			}
-			this.#state.refreshAfterGrowth(intent, refreshed);
-			this.#identity = refreshed;
+			this.#state.refreshAfterGrowth(growth.intent, this.#identity);
 		} catch (error) {
-			if (!(error instanceof MainSessionHostError && error.reason === "growth_intent_mismatch")) {
-				markFailedClosed(this.#state, "growth_refresh_failed");
-			}
-			throw error instanceof MainSessionHostError
-				? error
-				: new MainSessionHostError("growth_refresh_failed", error instanceof Error ? error.message : String(error));
+			this.enterFailure("growth_refresh_failed", error);
 		}
 	}
 
-	private async mutate(action: () => Promise<void>): Promise<void> {
-		const growth = this.beginMutation();
-		let mutationError: unknown;
-		try {
-			await action();
-			this.assertUsable();
-		} catch (error) {
-			mutationError = error;
-		}
-		try {
-			this.finishMutation(growth);
-		} catch (error) {
-			if (!mutationError) mutationError = error;
-		}
-		if (mutationError) throw mutationError;
+	async admit(deliveredAs: "prompt" | "steer" | "follow_up", text: string, opRef: string): Promise<void> {
 		this.assertUsable();
-	}
-
-	admit(deliveredAs: "prompt" | "steer" | "follow_up", text: string): void {
-		const operation =
-			deliveredAs === "prompt" ? this.prompt(text) : deliveredAs === "steer" ? this.steer(text) : this.followUp(text);
+		if (!text.trim()) throw new MainSessionHostError(`${deliveredAs}_empty`, "A main-session message must not be empty.");
+		if (!opRef.trim()) throw new MainSessionHostError("operation_ref_empty", "An admitted operation requires an operation reference.");
+		const growth = this.beginGrowthWindow();
+		growth.pendingAdmissions += 1;
 		try {
-			this.refreshFollowUpQueueDepth();
+			if (deliveredAs === "prompt") await this.#supervisor.sendPrompt(text, opRef);
+			else if (deliveredAs === "steer") await this.#supervisor.sendSteer(text, opRef);
+			else await this.#supervisor.followUp(text, opRef);
+			this.#admittedOperations.set(opRef, deliveredAs);
+			this.wakeTail();
+			if (deliveredAs === "follow_up") this.#followUpQueueDepth += 1;
+			else this.#turnState = "busy";
 			this.publishStatus();
-			this.assertUsable();
 		} catch (error) {
-			void operation.catch(() => undefined);
-			throw error;
+			const reason = error instanceof HostSupervisorError ? error.reason : "turn_admission_failed";
+			throw new MainSessionHostError(reason, error instanceof Error ? error.message : String(error), { cause: error });
+		} finally {
+			growth.pendingAdmissions = Math.max(0, growth.pendingAdmissions - 1);
+			this.finishGrowthWindowIfSettled();
 		}
-		this.trackAdmittedOperation(operation);
 	}
 
-	async prompt(text: string): Promise<void> {
-		if (!text.trim()) throw new MainSessionHostError("prompt_empty", "A main-session prompt must not be empty.");
-		await this.mutate(() => this.#session.prompt(text));
-	}
-
-	async steer(text: string): Promise<void> {
-		if (!text.trim()) throw new MainSessionHostError("steer_empty", "A main-session steer must not be empty.");
-		await this.mutate(() => this.#session.steer(text));
-	}
-
-	async followUp(text: string): Promise<void> {
-		if (!text.trim()) throw new MainSessionHostError("follow_up_empty", "A main-session follow-up must not be empty.");
-		await this.mutate(() => this.#session.followUp(text));
-		this.publishStatus();
-	}
-
-	async resolveGate(gateId: string, answer: unknown, idempotencyKey: string): Promise<HostedSdkGateResolution> {
-		this.assertUsable();
-		const resolution = await this.#session.answerGate(gateId, answer, idempotencyKey);
-		if (resolution === "resolved") this.observeGateResolved(gateId, { answer });
-		if (resolution === "expired") this.gates.observeExpired(gateId);
-		this.assertUsable();
-		return resolution;
+	async resolveGate(_gateId: string, _answer: unknown, _idempotencyKey: string): Promise<MainGateResolution> {
+		// The published spawn-only broker surface does not yet expose a validated
+		// workflow.gate_answer receipt. Do not pretend local registry state answered it.
+		return "unsupported";
 	}
 
 	async dispose(): Promise<void> {
 		if (this.#disposed) return;
 		this.#disposed = true;
-		this.#unsubscribe();
-		this.#unsubscribeGates();
-		await this.#session.dispose();
+		this.#tailStop.resolve();
+		await this.#supervisor.dispose();
+		await this.#tailTask;
 	}
 }
 
-/** Wires the strict-resumed SDK session to synchronous durable journal append. */
+/** Wires a broker-authoritative external session to durable gateway journal projection. */
 export function createMainSessionHost(options: CreateMainSessionHostOptions): MainSessionHost {
-	if (
-		options.session.sessionId !== options.identity.sessionId ||
-		options.session.sessionFile !== options.identity.canonicalPath
-	) {
-		throw new MainSessionHostError("host_identity_mismatch");
-	}
-	return new HostedMainSession(options);
+	return new ExternalMainSessionHost(options);
 }

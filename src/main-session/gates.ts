@@ -1,5 +1,6 @@
 import { RpcBridgeException } from "../rpc-bridge";
-import type { HostedSdkGateResolution } from "./sdk";
+
+export type MainGateResolution = "resolved" | "already_resolved" | "expired" | "not_found" | "rejected" | "unsupported";
 
 export type GateState = "open" | "resolved" | "expired";
 
@@ -68,7 +69,7 @@ export interface GateIdempotencyStore {
 export interface MainGateAnswerTarget {
 	readonly sessionId: string;
 	readonly gates: MainSessionGateRegistry;
-	resolveGate(gateId: string, answer: unknown, idempotencyKey: string): Promise<HostedSdkGateResolution>;
+	resolveGate(gateId: string, answer: unknown, idempotencyKey: string): Promise<MainGateResolution>;
 }
 
 interface GateAnswerRequest {
@@ -117,6 +118,23 @@ export function canonicalJson(value: unknown): string {
 	throw new RpcBridgeException(-32602, "params must contain JSON values.");
 }
 
+function replayGateResponse(responseJson: string | undefined): { accepted: boolean; gate_state: "resolved" | "already_resolved" | "unsupported" } {
+	if (!responseJson) return { accepted: true, gate_state: "already_resolved" };
+	try {
+		const parsed = JSON.parse(responseJson) as unknown;
+		if (
+			isRecord(parsed) &&
+			typeof parsed.accepted === "boolean" &&
+			(parsed.gate_state === "resolved" || parsed.gate_state === "already_resolved" || parsed.gate_state === "unsupported")
+		) {
+			return { accepted: parsed.accepted, gate_state: parsed.gate_state };
+		}
+	} catch {
+		// A legacy replay receipt did not retain a response body.
+	}
+	return { accepted: true, gate_state: "already_resolved" };
+}
+
 function idempotencyFailure(error: unknown): never {
 	if (error instanceof RpcBridgeException) throw error;
 	const message = error instanceof Error ? error.message : String(error);
@@ -128,7 +146,7 @@ function idempotencyFailure(error: unknown): never {
 
 /** Bridges one validated main-session gate response to the durable SDK gate. */
 export function createMainGateAnswerHandler(target: MainGateAnswerTarget, idempotency: GateIdempotencyStore) {
-	return async (params: unknown): Promise<{ accepted: boolean; gate_state: "resolved" | "already_resolved" }> => {
+	return async (params: unknown): Promise<{ accepted: boolean; gate_state: "resolved" | "already_resolved" | "unsupported" }> => {
 		const request = parseRequest(params);
 		const requestJson = canonicalJson({
 			answer: request.answer,
@@ -142,7 +160,7 @@ export function createMainGateAnswerHandler(target: MainGateAnswerTarget, idempo
 		} catch (error) {
 			idempotencyFailure(error);
 		}
-		if (replay?.replayed) return { accepted: true, gate_state: "already_resolved" };
+		if (replay?.replayed) return replayGateResponse(replay.responseJson);
 
 		let gateState: "open" | "resolved" | "already_resolved" = target.gates.answerState(request.gateId, request.expectedSessionId);
 		if (gateState === "open") {
@@ -150,6 +168,20 @@ export function createMainGateAnswerHandler(target: MainGateAnswerTarget, idempo
 			if (resolution === "not_found") throw new RpcBridgeException(1100, "gate_not_found");
 			if (resolution === "expired") throw new RpcBridgeException(1101, "gate_expired");
 			if (resolution === "rejected") throw new RpcBridgeException(-32602, "gate answer was rejected.");
+			if (resolution === "unsupported") {
+				const unsupported = { accepted: false, gate_state: "unsupported" } as const;
+				try {
+					idempotency.idempotencyStore({
+						scope: "main.gate.answer",
+						key: request.idempotencyKey,
+						requestJson,
+						responseJson: canonicalJson(unsupported),
+					});
+				} catch (error) {
+					idempotencyFailure(error);
+				}
+				return unsupported;
+			}
 			if (resolution === "resolved") {
 				target.gates.observeResolved(request.gateId);
 				gateState = "resolved";

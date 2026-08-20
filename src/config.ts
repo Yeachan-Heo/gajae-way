@@ -6,6 +6,8 @@ export const DEFAULT_FAIL_CLOSED_LINGER_MS = 300_000;
 export interface WayConfig {
 	readonly stateDir: string;
 	readonly profilePath: string;
+	/** Exact external GJC session requested by CLI/environment for bootstrap adoption. */
+	readonly sessionId?: string;
 	readonly failClosedLingerMs: number;
 	readonly brokerCliPath: string;
 	readonly reconcilePollMs: number;
@@ -20,9 +22,11 @@ export class ConfigValidationError extends Error {
 
 /** Process-level paths and liveness tuning; profile identity lives in profile.ts. */
 export function defaultConfig(environment: NodeJS.ProcessEnv = process.env): WayConfig {
+	const sessionId = environment.GAJAEWAY_SESSION_ID?.trim();
 	return {
 		stateDir: path.resolve(environment.GAJAEWAY_STATE_DIR || path.join(os.homedir(), ".local", "state", "gajaeway")),
 		profilePath: path.resolve(environment.GAJAEWAY_PROFILE || "ops/profiles/gaebal-gajae.example.toml"),
+		...(sessionId ? { sessionId } : {}),
 		failClosedLingerMs:
 			parseLingerMs(environment.GAJAEWAY_FAIL_CLOSED_LINGER_MS, "GAJAEWAY_FAIL_CLOSED_LINGER_MS") ?? DEFAULT_FAIL_CLOSED_LINGER_MS,
 		brokerCliPath: environment.GAJAEWAY_BROKER_CLI?.trim() || "gjc",
@@ -59,6 +63,7 @@ export interface ParsedWayConfig {
 export function parseWayConfig(arguments_: readonly string[], initial = defaultConfig()): ParsedWayConfig {
 	let stateDir = initial.stateDir;
 	let profilePath = initial.profilePath;
+	let sessionId = initial.sessionId;
 	let failClosedLingerMs = initial.failClosedLingerMs;
 	let brokerCliPath = initial.brokerCliPath;
 	let reconcilePollMs = initial.reconcilePollMs;
@@ -68,6 +73,7 @@ export function parseWayConfig(arguments_: readonly string[], initial = defaultC
 		if (
 			argument === "--state-dir" ||
 			argument === "--profile" ||
+			argument === "--session-id" ||
 			argument === "--fail-closed-linger-ms" ||
 			argument === "--broker-cli" ||
 			argument === "--reconcile-poll-ms"
@@ -76,6 +82,10 @@ export function parseWayConfig(arguments_: readonly string[], initial = defaultC
 			if (!value) throw new ConfigValidationError(`${argument} requires a value.`);
 			if (argument === "--state-dir") stateDir = path.resolve(value);
 			if (argument === "--profile") profilePath = path.resolve(value);
+			if (argument === "--session-id") {
+				sessionId = value.trim();
+				if (!sessionId) throw new ConfigValidationError("--session-id must be non-empty.");
+			}
 			if (argument === "--fail-closed-linger-ms") {
 				failClosedLingerMs = parseLingerMs(value, "--fail-closed-linger-ms") as number;
 			}
@@ -86,5 +96,8 @@ export function parseWayConfig(arguments_: readonly string[], initial = defaultC
 		}
 		remaining.push(argument);
 	}
-	return { config: { stateDir, profilePath, failClosedLingerMs, brokerCliPath, reconcilePollMs }, remaining };
+	return {
+		config: { stateDir, profilePath, ...(sessionId ? { sessionId } : {}), failClosedLingerMs, brokerCliPath, reconcilePollMs },
+		remaining,
+	};
 }

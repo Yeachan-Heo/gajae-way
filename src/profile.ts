@@ -3,7 +3,7 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 
 /**
- * Profile schema and digest classification (v1):
+ * Profile schema and digest classification (v2):
  *
  * Digest-bound identity/security fields:
  * - `[corpus].path` and `[corpus].workspace` identify the corpus authority.
@@ -11,6 +11,8 @@ import * as path from "node:path";
  * - `[restricted_files]` is a per-session-kind deny policy.
  * - `[surfaces.owner]`, `[owner_surface]`, or `[owner_surfaces]` identify owner authority.
  * - `[operator]` (or `[identity]`) contains operator identity fields.
+ * - `[main_session].session_id`, when present, pins the exact operator-run GJC
+ *   session eligible for external adoption.
  *
  * Outside the digest (hot-reloadable tunables): `[tunables]`, `[poll]`, `[ack]`,
  * `[adapter]`, `[adapters]`, `[policy]`, and the top-level scalar aliases
@@ -18,7 +20,7 @@ import * as path from "node:path";
  * deliberately never copied into the identity projection or approval diff.
  */
 
-export const PROFILE_DIGEST_VERSION = 1;
+export const PROFILE_DIGEST_VERSION = 2;
 export const SESSION_KINDS = ["main", "conversation", "lane", "job", "unknown"] as const;
 
 export type SessionKind = (typeof SESSION_KINDS)[number];
@@ -66,6 +68,8 @@ export interface ProfileIdentityProjection {
 	readonly restrictedFilePolicy: Readonly<Record<SessionKind, readonly string[]>>;
 	readonly ownerSurfaceMapping: readonly OwnerSurface[];
 	readonly operatorIdentity: Readonly<Record<string, CanonicalValue>>;
+	/** Exact operator-owned GJC session selected for external main-session adoption. */
+	readonly externalSessionId?: string;
 }
 
 export interface WayProfile {
@@ -78,6 +82,8 @@ export interface WayProfile {
 	/** All profile-known admissible surfaces. Owner surfaces are included. */
 	readonly knownSurfaces: readonly OwnerSurface[];
 	readonly operator: Readonly<Record<string, CanonicalValue>>;
+	/** Optional exact external GJC session selected by this identity-bound profile. */
+	readonly externalSessionId?: string;
 	readonly tunables: Readonly<Record<string, CanonicalValue>>;
 	readonly tunablesCanonical: string;
 	readonly tunablesRevision: number;
@@ -269,6 +275,13 @@ function parseTunables(document: TomlRecord): Readonly<Record<string, CanonicalV
 	return output;
 }
 
+function parseExternalSessionId(document: TomlRecord): string | undefined {
+	const mainSession = optionalRecord(document.main_session, "main_session");
+	if (!mainSession) return undefined;
+	noUnknownKeys(mainSession, ["session_id"], "main_session");
+	return mainSession.session_id === undefined ? undefined : requiredString(mainSession.session_id, "main_session.session_id");
+}
+
 export function profileProjectionCanonical(projection: ProfileIdentityProjection): string {
 	return canonicalSerialize({
 		corpus: { path: projection.corpus.path, workspace: projection.corpus.workspace },
@@ -282,6 +295,7 @@ export function profileProjectionCanonical(projection: ProfileIdentityProjection
 			platform: surface.platform,
 		})),
 		operator_identity: projection.operatorIdentity,
+		external_session_id: projection.externalSessionId ?? null,
 	} as CanonicalValue);
 }
 
@@ -330,6 +344,7 @@ export function loadWayProfile(profilePath: string, options: LoadProfileOptions 
 			"poll_interval_ms",
 			"ack_budget",
 			"adapter_credentials",
+			"main_session",
 		],
 		"root",
 	);
@@ -347,6 +362,7 @@ export function loadWayProfile(profilePath: string, options: LoadProfileOptions 
 	}
 	const rawOperator = document.operator ?? document.identity ?? {};
 	const operator = canonicalValue(requiredRecord(rawOperator, "operator"), "operator") as Readonly<Record<string, CanonicalValue>>;
+	const externalSessionId = parseExternalSessionId(document);
 	const normalizedOwnerSurfaces = ownerSurfaces(document);
 	const normalizedKnownSurfaces = knownSurfaces(document, normalizedOwnerSurfaces);
 	const projection: ProfileIdentityProjection = {
@@ -355,6 +371,7 @@ export function loadWayProfile(profilePath: string, options: LoadProfileOptions 
 		restrictedFilePolicy: restrictedFiles,
 		ownerSurfaceMapping: normalizedOwnerSurfaces,
 		operatorIdentity: operator,
+		...(externalSessionId === undefined ? {} : { externalSessionId }),
 	};
 	const tunables = parseTunables(document);
 	return {
@@ -366,6 +383,7 @@ export function loadWayProfile(profilePath: string, options: LoadProfileOptions 
 		ownerSurfaces: normalizedOwnerSurfaces,
 		knownSurfaces: normalizedKnownSurfaces,
 		operator,
+		...(externalSessionId === undefined ? {} : { externalSessionId }),
 		tunables,
 		tunablesCanonical: canonicalSerialize(tunables),
 		tunablesRevision: options.tunablesRevision ?? 0,
