@@ -11,9 +11,9 @@ pub fn notify_status(status: &str) -> io::Result<()> {
     notify(&format!("STATUS={status}"))
 }
 
-/// Marks the process ready after its UDS RPC endpoint and strict-resumed main
-/// session are both available. A status accompanies readiness for `systemctl`
-/// and journal observability.
+/// Marks the service manager ready after the RPC endpoint and its fenced host
+/// are installed. The accompanying status distinguishes a running session from
+/// a transcript-verification-pending session whose mutations remain fenced.
 pub fn notify_ready(status: &str) -> io::Result<()> {
     notify(&format!("READY=1\nSTATUS={status}"))
 }

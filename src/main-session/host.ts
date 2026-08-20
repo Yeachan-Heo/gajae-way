@@ -1,3 +1,4 @@
+import { BrokerCliError } from "../broker/cli";
 import { MainSessionGateRegistry, type GateHandle, type MainGateResolution } from "./gates";
 import {
 	attestsExternalTranscriptGrowth,
@@ -55,9 +56,11 @@ export interface MainSessionHost {
 	readonly followUpQueueDepth: number;
 	/** Durable adoption proof, not the current boot's complete-tail verification state. */
 	readonly transcriptProof: TranscriptProof;
-	/** Machine fence reason for mutating main-session operations, if this boot is not yet verified. */
-	readonly admissionFenceReason: "transcript_proof_pending" | "transcript_verification_pending" | undefined;
+	/** Machine fence reason for mutating main-session operations while identity or admission state is unresolved. */
+	readonly admissionFenceReason: "transcript_proof_pending" | "transcript_verification_pending" | "admission_recovery_pending" | undefined;
 	readonly gates: MainSessionGateRegistry;
+	/** Resolves once this daemon has a complete, compatible transcript tail. */
+	waitForVerifiedTranscript(): Promise<void>;
 	/** Waits for broker admission only; successful turn execution is observed asynchronously. */
 	admit(deliveredAs: "prompt" | "steer" | "follow_up", text: string, opRef: string): Promise<void>;
 	resolveGate(gateId: string, answer: unknown, idempotencyKey: string): Promise<MainGateResolution>;
@@ -90,6 +93,8 @@ interface GrowthWindow {
 interface AdmittedOperation {
 	/** Durable ring watermark immediately before broker acceptance. */
 	readonly admittedAt: TailCheckpoint | undefined;
+	/** A broker receipt was lost after dispatch, so all mutations stay fenced until a tail settles it. */
+	readonly ambiguous: boolean;
 }
 
 interface JournaledAttemptTransitions {
@@ -208,6 +213,17 @@ function markFailedClosed(state: GatewayStateStore, reason: string): void {
 	}
 }
 
+function isDefinitiveBrokerRejection(error: unknown): boolean {
+	const seen = new Set<unknown>();
+	let current: unknown = error;
+	while (current instanceof Error && !seen.has(current)) {
+		seen.add(current);
+		if (current instanceof BrokerCliError && current.definitive) return true;
+		current = current.cause;
+	}
+	return false;
+}
+
 function externalEvent(event: SupervisorEvent): Record<string, unknown> {
 	const payload = isRecord(event.payload) ? event.payload : { payload: event.payload };
 	return {
@@ -278,6 +294,7 @@ class ExternalMainSessionHost implements MainSessionHost {
 	readonly #admittedOperations = new Map<string, AdmittedOperation>();
 	readonly #seenTailEvents = new Set<string>();
 	readonly #fatalFailure = Promise.withResolvers<MainSessionHostError>();
+	readonly #verificationReady = Promise.withResolvers<void>();
 	readonly #tailStop = Promise.withResolvers<void>();
 	#tailWake = Promise.withResolvers<void>();
 	readonly #highestTailSequenceByGeneration = new Map<number, number>();
@@ -311,6 +328,7 @@ class ExternalMainSessionHost implements MainSessionHost {
 		}
 
 		this.publishStatus();
+		if (this.#verificationState === "verified") this.#verificationReady.resolve();
 		this.#tailTask = this.observeTail();
 	}
 
@@ -334,9 +352,17 @@ class ExternalMainSessionHost implements MainSessionHost {
 		return this.#transcriptProof;
 	}
 
-	get admissionFenceReason(): "transcript_proof_pending" | "transcript_verification_pending" | undefined {
+	get admissionFenceReason(): "transcript_proof_pending" | "transcript_verification_pending" | "admission_recovery_pending" | undefined {
 		if (this.#transcriptProof === "pending") return "transcript_proof_pending";
-		return this.#verificationState === "pending" ? "transcript_verification_pending" : undefined;
+		if (this.#verificationState === "pending") return "transcript_verification_pending";
+		for (const admission of this.#admittedOperations.values()) {
+			if (admission.ambiguous) return "admission_recovery_pending";
+		}
+		return undefined;
+	}
+
+	waitForVerifiedTranscript(): Promise<void> {
+		return this.#verificationReady.promise;
 	}
 
 	waitForFatalFailure(): Promise<MainSessionHostError> {
@@ -764,6 +790,7 @@ class ExternalMainSessionHost implements MainSessionHost {
 		this.#verificationState = "verified";
 		this.publishStatus();
 		this.publishVerifiedReadiness();
+		this.#verificationReady.resolve();
 		return true;
 	}
 
@@ -801,6 +828,7 @@ class ExternalMainSessionHost implements MainSessionHost {
 		this.#verificationState = "verified";
 		this.publishStatus();
 		this.publishVerifiedReadiness();
+		this.#verificationReady.resolve();
 	}
 
 	private observeIdentity(identity: ExternalSessionIdentity, entries: readonly SupervisorTranscriptEntry[]): void {
@@ -1094,7 +1122,7 @@ class ExternalMainSessionHost implements MainSessionHost {
 		if (!opRef.trim()) throw new MainSessionHostError("operation_ref_empty", "An admitted operation requires an operation reference.");
 		const growth = this.beginGrowthWindow();
 		growth.pendingAdmissions += 1;
-		this.#admittedOperations.set(opRef, { admittedAt: this.#tailCheckpoint });
+		this.#admittedOperations.set(opRef, { admittedAt: this.#tailCheckpoint, ambiguous: false });
 		try {
 			if (deliveredAs === "prompt") await this.#supervisor.sendPrompt(text, opRef);
 			else if (deliveredAs === "steer") await this.#supervisor.sendSteer(text, opRef);
@@ -1106,7 +1134,16 @@ class ExternalMainSessionHost implements MainSessionHost {
 				this.publishStatus();
 			}
 		} catch (error) {
-			this.#admittedOperations.delete(opRef);
+			if (isDefinitiveBrokerRejection(error)) {
+				this.#admittedOperations.delete(opRef);
+			} else {
+				const admitted = this.#admittedOperations.get(opRef);
+				if (admitted) this.#admittedOperations.set(opRef, { ...admitted, ambiguous: true });
+				if (deliveredAs === "follow_up") this.#followUpQueueDepth += 1;
+				else this.#turnState = "busy";
+				this.publishStatus();
+				this.wakeTail();
+			}
 			const reason = error instanceof HostSupervisorError ? error.reason : "turn_admission_failed";
 			throw new MainSessionHostError(reason, error instanceof Error ? error.message : String(error), { cause: error });
 		} finally {

@@ -3,9 +3,12 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { afterEach, expect, test } from "bun:test";
 import { loadDiscordAdapterConfig } from "../../src/adapter/discord/config";
+import { BrokerCli } from "../../src/broker/cli";
 import { startDiscordAdapter, type RunningDiscordAdapter } from "../../src/adapter/discord/main";
 import { loadWayProfile } from "../../src/profile";
 import { RpcClient } from "../../src/rpc-client";
+import { GatewayStateStore } from "../../src/main-session/state";
+import { loadWayCore } from "../../src/native-loader";
 import { DiscordFixture } from "../fixtures/discord-fixture";
 import { ManagedProcessRegistry } from "../helpers/managed-process";
 import { FakeBrokerFixture } from "../helpers/main-session";
@@ -136,6 +139,19 @@ async function healthyClient(socketPath: string, description: string): Promise<R
 				client?.close();
 				lastError = error;
 			}
+		}
+		await Bun.sleep(25);
+	}
+	throw new Error(`${description}${lastError instanceof Error ? `: ${lastError.message}` : ""}`);
+}
+
+async function availableClient(socketPath: string, description: string): Promise<RpcClient> {
+	let lastError: unknown;
+	for (let attempt = 0; attempt < 200; attempt += 1) {
+		try {
+			return await RpcClient.connect(socketPath);
+		} catch (error) {
+			lastError = error;
 		}
 		await Bun.sleep(25);
 	}
@@ -354,6 +370,7 @@ test("systemd units declare the required hardened daemon and bound adapter contr
 
 	const mainSource = fs.readFileSync(path.join(repositoryRoot, "src/main.ts"), "utf8");
 	const notifySource = fs.readFileSync(path.join(repositoryRoot, "crates/way-core/src/systemd.rs"), "utf8");
+	expect(mainSource).toContain('core.sdNotifyReady(verificationPending ? "gajaeway transcript verification pending" : "gajaeway running")');
 	expect(mainSource).toContain('core.sdNotifyReady("gajaeway running")');
 	expect(notifySource).toContain("READY=1\\nSTATUS=");
 });
@@ -426,5 +443,81 @@ test("supervised daemon restart restores the PartOf-bound fixture adapter and co
 	} finally {
 		await service?.stop();
 		fixtureSession.dispose();
+	}
+}, 30_000);
+
+test("Type=notify topology keeps a fenced busy restart alive beyond its reduced startup bound and promotes in place", async () => {
+	const executable = compiledWay();
+	const root = temporaryDirectory("sd-verifying");
+	const fixture = new FakeBrokerFixture();
+	const stateDirectory = path.join(root, "state");
+	const corpus = path.join(root, "corpus");
+	const profilePath = path.join(root, "profile.toml");
+	const socketPath = path.join(stateDirectory, "rpc.sock");
+	const environment = e2eEnvironment(fixture);
+	const opRef = "systemd-verification-pending";
+	let daemon: ReturnType<typeof managedProcesses.spawnDaemon> | undefined;
+	let client: RpcClient | undefined;
+	try {
+		fs.mkdirSync(corpus);
+		fs.writeFileSync(profilePath, testProfile(corpus, fixture.workspace, fixture.sessionId));
+		const bootstrap = await runCommand([executable, "bootstrap", "--confirm", "--state-dir", stateDirectory, "--profile", profilePath], environment);
+		expect(bootstrap.exitCode).toBe(0);
+		const startupCore = loadWayCore().WayCore.open(stateDirectory);
+		const startupState = new GatewayStateStore(startupCore);
+		const adoptedIdentity = startupState.read().mainIdentity;
+		if (!adoptedIdentity) throw new Error("bootstrap did not persist the adopted identity");
+		startupState.writeGrowthIntent(adoptedIdentity, Date.now());
+		fixture.setNoEnvelopeWhileBusy();
+		fixture.holdNextTurn();
+		await new BrokerCli({ executable: fixture.executable, environment: fixture.environment() }).sendPrompt(
+			fixture.sessionId,
+			"hold transcript verification past the startup bound",
+			opRef,
+		);
+		daemon = managedProcesses.spawnDaemon({
+			cmd: [executable, "serve", "--state-dir", stateDirectory, "--profile", profilePath],
+			cwd: repositoryRoot,
+			env: environment,
+		});
+		client = await availableClient(socketPath, "fenced daemon did not expose its RPC listener");
+		const pending = await eventually(
+			async () => {
+				const status = (await client!.request("way.status", {}, { timeoutMs: 1_000 })).result as Record<string, unknown> | undefined;
+				return status?.state === "verifying" && status.transcript_proof === "proven" && status.transcript_verification === "pending"
+					? status
+					: undefined;
+			},
+			"fenced busy restart did not enter transcript verification pending",
+		);
+		expect(pending).toMatchObject({ status: "booting", state: "verifying" });
+
+		const reducedSystemdStartupBoundMs = 250;
+		await Bun.sleep(reducedSystemdStartupBoundMs);
+		expect(daemon.exitCode).toBeNull();
+		expect((await client.request("way.status", {}, { timeoutMs: 1_000 })).result).toMatchObject({
+			status: "booting",
+			state: "verifying",
+			transcript_verification: "pending",
+		});
+
+		fixture.complete(opRef, { text: "verification completed after ready was already signaled" });
+		await eventually(
+			async () => {
+				const health = (await client!.request("way.health", {}, { timeoutMs: 1_000 })).result as Record<string, unknown> | undefined;
+				return health?.status === "healthy" && health.state === "running" ? health : undefined;
+			},
+			"fenced daemon did not promote after its terminal verification tail",
+		);
+		expect(daemon.exitCode).toBeNull();
+		expect((await client.request("way.status", {}, { timeoutMs: 1_000 })).result).toMatchObject({
+			status: "healthy",
+			state: "running",
+			transcript_verification: "verified",
+		});
+	} finally {
+		client?.close();
+		if (daemon) await managedProcesses.stopDaemon(daemon);
+		fixture.dispose();
 	}
 }, 30_000);

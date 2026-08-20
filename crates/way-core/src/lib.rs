@@ -784,8 +784,9 @@ impl WayCore {
 		crate::systemd::notify_status(&status).map_err(|error| napi::Error::from_reason(error.to_string()))
 	}
 
-	/// Sends systemd `READY=1` and STATUS after the daemon is fully usable.
-	/// It is a no-op when the process was not started with NOTIFY_SOCKET.
+	/// Sends systemd `READY=1` and STATUS after the RPC endpoint and fenced host
+	/// are installed. Status reports whether transcript verification still fences
+	/// mutations. It is a no-op when the process lacks NOTIFY_SOCKET.
 	#[napi(js_name = "sdNotifyReady")]
 	pub fn sd_notify_ready(&self, status: String) -> napi::Result<()> {
 		crate::systemd::notify_ready(&status).map_err(|error| napi::Error::from_reason(error.to_string()))

@@ -541,6 +541,80 @@ externalTest("main.submit preserves an ambiguous post-acceptance claim for recon
 	}
 });
 
+externalTest("an accepted operation with a lost receipt preserves growth authorization across restart without resend", async () => {
+	const gateway = await hosted({ tailTimeoutMs: 50 });
+	gateway.fixture.setNoEnvelopeWhileBusy();
+	gateway.fixture.holdNextTurn();
+	gateway.fixture.suppressNextAdmissionReceipt();
+	const request = { text: "accepted before receipt loss", surface_id: "owner", idempotency_key: "lost-receipt-growth" };
+	const interrupted = await gateway.client.request("main.submit", request);
+	expect(rpcError(interrupted)).toMatchObject({ code: -32603, message: "bridge_exception", data: { reason: "turn_admission_failed" } });
+	expect(gateway.fixture.commands().filter(command => command.operation === "turn.prompt" && command.text === request.text)).toHaveLength(1);
+	const [pending] = gateway.core.mainAdmissionOperationsPending();
+	const intent = JSON.parse(pending?.intentJson ?? "{}") as { op_ref?: unknown };
+	if (typeof intent.op_ref !== "string") throw new Error("lost receipt admission intent was malformed");
+	expect(gateway.state.read().growthIntent).toBeDefined();
+	expect(gateway.host.admissionFenceReason).toBe("admission_recovery_pending");
+	const fenced = await gateway.client.request("main.submit", {
+		text: "must remain fenced while receipt acceptance is ambiguous",
+		surface_id: "owner",
+		idempotency_key: "lost-receipt-fenced",
+	});
+	expect(rpcError(fenced)).toMatchObject({ code: 1003, message: "admission_recovery_pending" });
+
+	await gateway.host.dispose();
+	gateway.fixture.complete(intent.op_ref, { text: "recovered after accepted receipt loss" });
+	const restartedSupervisor = createExternalHostSupervisor({
+		broker: new BrokerCli({ executable: gateway.fixture.executable, environment: gateway.fixture.environment() }),
+		workspace: gateway.fixture.workspace,
+		tailTimeoutMs: 50,
+		commandTimeoutMs: 1_000,
+	});
+	let restartedHost: ReturnType<typeof createMainSessionHost> | undefined;
+	try {
+		const resumed = await strictResumeMainSession({ profile: gateway.profile, state: gateway.state, supervisor: restartedSupervisor });
+		expect(resumed.recoveredGrowthIntent).toBe(true);
+		await reconcilePendingMainAdmissions(gateway.core, restartedSupervisor);
+		restartedHost = createMainSessionHost({
+			supervisor: restartedSupervisor,
+			identity: resumed.identity,
+			state: gateway.state,
+			journal: {
+				journalAppend: (kind, payloadJson) => gateway.core.journalAppend(kind, payloadJson),
+				journalAppendAtTailCheckpoint: (kind, payloadJson, expected, checkpoint) =>
+					gateway.state.appendTailProjection(expected, checkpoint, kind, payloadJson),
+				journalAppendTranscriptProjection: (kind, payloadJson, expectedTail, checkpoint, expectedDelivery, nextDelivery) =>
+					gateway.state.appendTranscriptProjection(expectedTail, checkpoint, expectedDelivery, nextDelivery, kind, payloadJson),
+				setRpcHealth: (state, reason) => gateway.core.setRpcHealth(state, reason),
+				setMainSessionStatus: (turnState, followUpQueueDepth, verificationState) =>
+					gateway.core.setMainSessionStatus(turnState, followUpQueueDepth, verificationState),
+				setJournalDegraded: degraded => gateway.core.setJournalDegraded(degraded),
+			},
+			initialTurnState: resumed.turnState,
+			initialFollowUpQueueDepth: resumed.followUpQueueDepth,
+			initialVerificationState: resumed.verificationState,
+			...(resumed.verificationTail === undefined ? {} : { verificationTail: resumed.verificationTail }),
+			...(resumed.growthIntent === undefined ? {} : { recoveredGrowthIntent: resumed.growthIntent }),
+		});
+		await eventually(
+			() =>
+				gateway.core
+					.journalRead("1:0", 100)
+					.events.some(event => event.kind === "assistant_message" && event.payloadJson.includes("recovered after accepted receipt loss"))
+					? true
+					: undefined,
+			"lost-receipt recovery did not project the accepted transcript suffix",
+		);
+		await eventually(() => (gateway.state.read().growthIntent === undefined ? true : undefined), "lost-receipt recovery did not settle durable growth authorization");
+		expect(gateway.state.read()).toMatchObject({ bootstrapState: "COMMITTED", failedClosedReason: undefined });
+		expect(gateway.core.mainAdmissionOperationsPending()).toEqual([]);
+		expect(gateway.fixture.commands().filter(command => command.operation === "turn.prompt" && command.text === request.text)).toHaveLength(1);
+	} finally {
+		await restartedHost?.dispose();
+		await restartedSupervisor.dispose();
+	}
+}, 30_000);
+
 externalTest("a definitive broker rejection abandons only its claim while ambiguous accepted claims still reconcile without resend", async () => {
 	const gateway = await hosted();
 	const rejectedRequest = { text: "retry after definite rejection", surface_id: "owner", idempotency_key: "definite-rejection" };
@@ -548,6 +622,7 @@ externalTest("a definitive broker rejection abandons only its claim while ambigu
 	const rejected = await gateway.client.request("main.submit", rejectedRequest);
 	expect(rpcError(rejected)).toMatchObject({ code: -32603, message: "bridge_exception", data: { reason: "turn_admission_failed" } });
 	await eventually(() => (gateway.state.read().growthIntent === undefined ? true : undefined), "definitive rejection did not clear its growth intent");
+	expect(gateway.host.admissionFenceReason).toBeUndefined();
 	expect(gateway.core.mainAdmissionOperationsPending()).toEqual([]);
 
 	gateway.fixture.holdNextTurn();

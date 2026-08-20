@@ -952,7 +952,12 @@ async function waitForShutdown(
 	host: MainSessionHost,
 	closures: ClosureExecutor,
 	reconciler: BrokerReconciler,
+	closureRecovery: Promise<void>,
 ): Promise<void> {
+	const closureRecoveryFailure = closureRecovery.then(
+		() => new Promise<never>(() => {}),
+		error => ({ kind: "closure_recovery_failed" as const, error }),
+	);
 	const outcome = await Promise.race([
 		new Promise<{ readonly kind: "signal" }>((resolve) => {
 			const stop = () => resolve({ kind: "signal" });
@@ -960,8 +965,14 @@ async function waitForShutdown(
 			process.once("SIGTERM", stop);
 		}),
 		host.waitForFatalFailure().then(error => ({ kind: "fatal" as const, error })),
+		closureRecoveryFailure,
 	]);
 	if (outcome.kind === "fatal") throw outcome.error;
+	if (outcome.kind === "closure_recovery_failed") {
+		const detail = outcome.error instanceof Error ? outcome.error.message : String(outcome.error);
+		console.error(`Pending corpus closure recovery failed: ${detail}`);
+		throw new MainSessionHostError("closure_recovery_failed", detail, { cause: outcome.error });
+	}
 	reconciler.stop();
 	await closures.shutdown();
 	await disposeMainSession(core, host);
@@ -1015,7 +1026,6 @@ async function serveWay(config: WayConfig): Promise<void> {
 			throw new ResumeError("session_id_mismatch", "--session-id does not match the durable adopted external identity.");
 		}
 		failBeforeMainHostForE2e();
-		await reconcilePendingClosureOperation(core, closures, profile.corpusPath, resumed.identity.sessionId);
 		const verificationPending = resumed.verificationState === "pending";
 		if (verificationPending) {
 			core.setRpcHealth("verifying", "transcript_verification_pending");
@@ -1054,7 +1064,14 @@ async function serveWay(config: WayConfig): Promise<void> {
 			admissionFenceReason: () => resumedHost.admissionFenceReason,
 		});
 		const gateAnswerHandler = createMainGateAnswerHandler(host, core);
-		const closureHandler = closureBridgeHandler(core, closures, profile.corpusPath, resumed.identity.sessionId);
+		const rawClosureHandler = closureBridgeHandler(core, closures, profile.corpusPath, resumed.identity.sessionId);
+		const closureRecovery = resumedHost
+			.waitForVerifiedTranscript()
+			.then(async () => await reconcilePendingClosureOperation(core, closures, profile.corpusPath, resumed.identity.sessionId));
+		const closureHandler: RpcBridgeHandler = async (method, params) => {
+			await closureRecovery;
+			return await rawClosureHandler(method, params);
+		};
 		mainSessionHandler = async (method, params) => {
 			if (method === "main.submit" || method === "main.corpus.close") assertMainSessionMutationReady(resumedHost);
 			if (method === "main.submit") return await admissionHandler(params);
@@ -1068,14 +1085,12 @@ async function serveWay(config: WayConfig): Promise<void> {
 			pollMs: config.reconcilePollMs,
 		});
 		reconciler.start();
-		if (!verificationPending) {
-			try {
-				core.sdNotifyReady("gajaeway running");
-			} catch {
-				// Readiness remains observable through RPC and health.json.
-			}
+		try {
+			core.sdNotifyReady(verificationPending ? "gajaeway transcript verification pending" : "gajaeway running");
+		} catch {
+			// Readiness remains observable through RPC and health.json.
 		}
-		await waitForShutdown(core, host, closures, reconciler);
+		await waitForShutdown(core, host, closures, reconciler, closureRecovery);
 	} catch (error) {
 		if (error instanceof FailedClosedExit) {
 			const disposal = await disposeMainSessionAfterStartupFailure(core, host);

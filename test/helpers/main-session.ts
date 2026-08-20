@@ -93,6 +93,7 @@ interface FixtureSession {
 	holdNext?: boolean;
 	failNext?: boolean;
 	rejectNext?: { readonly code: string; readonly message: string };
+	suppressNextReceipt?: boolean;
 	responseText?: string;
 	tailTimeoutWhileBusy?: boolean;
 	rotateRingDuringNextCompletion?: boolean;
@@ -253,6 +254,13 @@ export class FakeBrokerFixture {
 	rejectNextTurn(code = "broker_rejected", message = "fixture broker rejected the admission"): void {
 		this.update(session => {
 			session.rejectNext = { code, message };
+		});
+	}
+
+	/** Accepts the next operation durably but exits before returning its receipt. */
+	suppressNextAdmissionReceipt(): void {
+		this.update(session => {
+			session.suppressNextReceipt = true;
 		});
 	}
 

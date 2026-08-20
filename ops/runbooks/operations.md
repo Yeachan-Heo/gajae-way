@@ -47,8 +47,12 @@ non-fast-forward checks are incident backstops, not a concurrency plan.
    sudo systemctl enable --now gajaeway-discord.service
    ```
 
-   The daemon sends `READY=1` only after strict resume and the UDS endpoint are
-   usable. The adapter is `BindsTo=` the daemon and stops when it stops.
+   The daemon sends `READY=1` after its UDS endpoint and fenced main-session
+   host are installed. A busy restart can remain `state: "verifying"` while
+   transcript verification is pending; status and observation RPCs are live,
+   but main-session mutations remain refused until the first compatible complete
+   tail promotes it to `running`. The adapter is `BindsTo=` the daemon and stops
+   when it stops.
 
 ## Monitor the live UDS service
 

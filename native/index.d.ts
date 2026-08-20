@@ -44,8 +44,9 @@ export declare class WayCore {
    */
   sdNotifyStatus(status: string): void
   /**
-   * Sends systemd `READY=1` and STATUS after the daemon is fully usable.
-   * It is a no-op when the process was not started with NOTIFY_SOCKET.
+   * Sends systemd `READY=1` and STATUS after the RPC endpoint and fenced host
+   * are installed. Status reports whether transcript verification still fences
+   * mutations. It is a no-op when the process lacks NOTIFY_SOCKET.
    */
   sdNotifyReady(status: string): void
   gatewayMetaRead(keys: Array<string>): GatewayMetaReadOutput

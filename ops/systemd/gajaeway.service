@@ -17,8 +17,9 @@ StartLimitBurst=3
 [Service]
 Type=notify
 NotifyAccess=main
-# The default failed-closed health linger is five minutes; let exit 78 reach
-# RestartPreventExitStatus instead of timing out while Type=notify is pending.
+# Startup remains bounded only until the fenced RPC bridge is installed. A busy
+# adopted persona receives READY=1 with a verifying STATUS, so per-boot tail
+# verification cannot consume this timeout or kill the recoverable gateway.
 TimeoutStartSec=6min
 User=gajaeway
 Group=gajaeway

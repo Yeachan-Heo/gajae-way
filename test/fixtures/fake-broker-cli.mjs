@@ -252,6 +252,15 @@ if (!statePath) {
 		};
 	}
 
+	function suppressAcceptedReceipt(value) {
+		if (value.suppressNextReceipt !== true) return false;
+		delete value.suppressNextReceipt;
+		writeState();
+		console.error("fixture: accepted operation receipt suppressed");
+		process.exitCode = 1;
+		return true;
+	}
+
 	function handleOperation(sessionId, operation, text, opRef) {
 		const value = session(sessionId);
 		if (!value) return;
@@ -326,7 +335,7 @@ if (!statePath) {
 		const textIndex = args.indexOf("--text");
 		const refIndex = args.indexOf("--op-ref");
 		const value = handleOperation(sessionId, "turn.prompt", args[textIndex + 1], args[refIndex + 1]);
-		if (value) {
+		if (value && !suppressAcceptedReceipt(value)) {
 			const opRef = args[refIndex + 1];
 			success({ version: 1, operationRef: opRef, status: "accepted", receipt: operationReceipt(value, "turn.prompt", opRef) });
 		}
@@ -463,7 +472,7 @@ if (!statePath) {
 			fail("operation_not_supported", `fixture control ${operation} is unsupported`);
 		} else {
 			const value = handleOperation(sessionId, operation, input.text, input.clientRef);
-			if (value) success(operationReceipt(value, operation, input.clientRef));
+			if (value && !suppressAcceptedReceipt(value)) success(operationReceipt(value, operation, input.clientRef));
 		}
 	} else {
 		console.error(`unexpected fake broker argv: ${JSON.stringify(args)}`);
