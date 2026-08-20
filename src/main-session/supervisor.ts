@@ -228,7 +228,9 @@ export class ExternalHostSupervisor implements HostSupervisor {
 			if (isNormalTailTimeout(error)) {
 				return { identity, transcriptEntries: [], events: [], terminal: false, complete: false, retentionGap: false };
 			}
-			if (isRetentionGap(error)) throw new HostSupervisorError("tail_retention_gap", "Broker tail reported a retention gap.", { cause: error });
+			if (isRetentionGap(error)) {
+				throw new HostSupervisorError("tail_unavailable", "Broker tail did not return a resynchronizable ring envelope.", { cause: error });
+			}
 			throw this.wrapBrokerError("tail_unavailable", error);
 		}
 		const reason = unavailableReason(tail.session);

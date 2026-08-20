@@ -80,6 +80,11 @@ interface GrowthWindow {
 	pendingAdmissions: number;
 }
 
+interface AdmittedOperation {
+	/** Durable ring watermark immediately before broker acceptance. */
+	readonly admittedAt: TailCheckpoint | undefined;
+}
+
 interface JournaledAttemptTransitions {
 	started: boolean;
 	ended: boolean;
@@ -201,9 +206,6 @@ function sourceCheckpoint(event: SupervisorEvent, revision: number): TailCheckpo
 	return { revision, generation: event.generation, seq: event.seq };
 }
 
-function checkpointSkipsPast(previous: TailCheckpoint, resync: TailCheckpoint): boolean {
-	return resync.generation !== previous.generation || resync.seq > previous.seq;
-}
 
 
 const FATAL_EXTERNAL_IDENTITY_REASONS = new Set([
@@ -214,7 +216,7 @@ const FATAL_EXTERNAL_IDENTITY_REASONS = new Set([
 	"session_locator_mismatch",
 	"growth_intent_mismatch",
 	"main_identity_mismatch",
-	"tail_retention_gap",
+	"tail_resync_unavailable",
 	"tail_generation_changed",
 	"transcript_proof_invalid",
 	"transcript_proof_mismatch",
@@ -244,7 +246,7 @@ class ExternalMainSessionHost implements MainSessionHost {
 	#transcriptDeliveryProgress: TranscriptDeliveryProgress | undefined;
 	#transcriptProof: TranscriptProof;
 	readonly #journaledAttemptTransitions = new Map<string, JournaledAttemptTransitions>();
-	readonly #admittedOperations = new Map<string, "prompt" | "steer" | "follow_up">();
+	readonly #admittedOperations = new Map<string, AdmittedOperation>();
 	readonly #seenTailEvents = new Set<string>();
 	readonly #fatalFailure = Promise.withResolvers<MainSessionHostError>();
 	readonly #tailStop = Promise.withResolvers<void>();
@@ -711,20 +713,34 @@ class ExternalMainSessionHost implements MainSessionHost {
 	}
 
 	/**
-	 * Bootstrap persists the successful discovery tail's high-water checkpoint.
-	 * A legacy committed identity without one establishes the current high-water
-	 * checkpoint before any projection, never retroactively projecting retained
-	 * pre-adoption lifecycle events.
+	 * The ring is an advisory lifecycle projection channel. A retention gap can
+	 * skip routine busy-turn chatter; the transcript delivery chain remains the
+	 * authoritative loss detector. Persist a visible rotation and resume from
+	 * the broker's resync point instead of failing closed.
 	 */
 	private establishProjectionBoundary(tail: SupervisorTailEvents): boolean {
 		const previous = this.#tailCheckpoint;
 		if (previous) {
+			if (tail.checkpoint && tail.checkpoint.generation !== previous.generation) {
+				throw new HostSupervisorError("tail_generation_changed", "Broker tail checkpoint generation changed after adoption.");
+			}
 			if (!tail.retentionGap) return false;
 			const resync = tail.resyncCheckpoint;
-			if (!resync) throw new HostSupervisorError("tail_retention_gap", "Broker tail reported a retention gap without a resync checkpoint.");
-			if (checkpointSkipsPast(previous, resync)) {
-				throw new HostSupervisorError("tail_retention_gap", "Broker tail retention advanced beyond the durable watermark.");
+			if (!resync) {
+				throw new HostSupervisorError("tail_resync_unavailable", "Broker tail reported a retention gap without a resync checkpoint.");
 			}
+			if (resync.generation !== previous.generation) {
+				throw new HostSupervisorError("tail_generation_changed", "Broker tail resync generation changed after adoption.");
+			}
+			if (resync.seq <= previous.seq) return false;
+			try {
+				this.#state.recordTailRingRotation(previous, resync);
+			} catch (error) {
+				throw new HostSupervisorError("tail_ring_rotation_write_failed", "Could not durably record the broker-tail ring rotation.", {
+					cause: error,
+				});
+			}
+			this.#tailCheckpoint = resync;
 			return false;
 		}
 		const boundary = tail.checkpoint ?? tail.resyncCheckpoint;
@@ -783,13 +799,32 @@ class ExternalMainSessionHost implements MainSessionHost {
 		this.advanceTailCheckpointTo(this.checkpointAfterTail(tail, events));
 	}
 
+	private terminalTailSettlesAdmission(tail: SupervisorTailEvents, admission: AdmittedOperation): boolean {
+		const terminalCheckpoint = tail.checkpoint ?? tail.resyncCheckpoint;
+		if (!terminalCheckpoint) return false;
+		const admittedAt = admission.admittedAt;
+		if (!admittedAt) return true;
+		return terminalCheckpoint.generation === admittedAt.generation && compareTailCheckpoints(terminalCheckpoint, admittedAt) > 0;
+	}
+
+	private settleTerminalTail(tail: SupervisorTailEvents): void {
+		if (!tail.terminal) return;
+		for (const [opRef, admission] of this.#admittedOperations) {
+			if (this.terminalTailSettlesAdmission(tail, admission)) this.#admittedOperations.delete(opRef);
+		}
+		if (this.#admittedOperations.size !== 0) return;
+		this.#turnState = "idle";
+		this.#followUpQueueDepth = 0;
+		this.publishStatus();
+		this.finishGrowthWindowIfSettled();
+	}
+
 	private async observeTail(): Promise<void> {
 		// Transport-level broker failures (CLI spawn pressure, command timeouts,
 		// transient nonzero exits) surface as "tail_unavailable" and are retried
 		// with bounded backoff: under load a single slow spawn must not
-		// permanently fail-stop the host. Authority/semantic failures (identity
-		// or locator mismatch, retention gap, growth mismatch, session
-		// unavailable) still fail closed immediately.
+		// permanently fail-stop the host. Transcript/identity authority failures
+		// (or a malformed/unusable ring resync) still fail closed immediately.
 		let transientFailures = 0;
 		while (!this.#disposed && !this.#failure) {
 			try {
@@ -866,11 +901,7 @@ class ExternalMainSessionHost implements MainSessionHost {
 					// this tail response has committed, so an interrupted poll replays.
 					this.advanceTailCheckpoint(tail, events);
 				}
-				if (tail.terminal && this.#admittedOperations.size === 0) {
-					this.#turnState = "idle";
-					this.publishStatus();
-					this.finishGrowthWindowIfSettled();
-				}
+				this.settleTerminalTail(tail);
 
 				const wake = this.#tailWake.promise;
 				await Promise.race([Bun.sleep(tail.terminal && this.#turnState === "idle" ? 500 : 100), wake, this.#tailStop.promise]);
@@ -957,7 +988,7 @@ class ExternalMainSessionHost implements MainSessionHost {
 		if (!opRef.trim()) throw new MainSessionHostError("operation_ref_empty", "An admitted operation requires an operation reference.");
 		const growth = this.beginGrowthWindow();
 		growth.pendingAdmissions += 1;
-		this.#admittedOperations.set(opRef, deliveredAs);
+		this.#admittedOperations.set(opRef, { admittedAt: this.#tailCheckpoint });
 		try {
 			if (deliveredAs === "prompt") await this.#supervisor.sendPrompt(text, opRef);
 			else if (deliveredAs === "steer") await this.#supervisor.sendSteer(text, opRef);

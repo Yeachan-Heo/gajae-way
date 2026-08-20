@@ -486,6 +486,15 @@ fn durable_transcript_proof(store: &Store) -> Result<Option<String>, RpcError> {
 	}
 }
 
+fn durable_tail_ring_rotation_count(store: &Store) -> Result<u64, RpcError> {
+	match store.get_meta("tail_ring_rotation_count").map_err(store_error)? {
+		Some(raw) => raw
+			.parse::<u64>()
+			.map_err(|_| RpcError::internal("tail_ring_rotation_count metadata is invalid")),
+		None => Ok(0),
+	}
+}
+
 fn main_admission_transcript_proof_pending(store: &Store) -> Result<bool, RpcError> {
 	if store.get_meta("bootstrap_state").map_err(store_error)?.as_deref() != Some("COMMITTED") {
 		return Ok(false);
@@ -666,6 +675,7 @@ impl RpcDispatcher {
 		ensure_empty_params(&params)?;
 		let health = self.health_response(Value::Object(Map::new()))?;
 		let transcript_proof = durable_transcript_proof(&self.store)?;
+		let tail_ring_rotation_count = durable_tail_ring_rotation_count(&self.store)?;
 		let main_session = self
 			.main_session
 			.lock()
@@ -726,6 +736,7 @@ impl RpcDispatcher {
 		response.insert("turn_state".to_owned(), json!(main_session.turn_state));
 		response.insert("follow_up_queue_depth".to_owned(), json!(main_session.follow_up_queue_depth));
 		response.insert("transcript_proof".to_owned(), json!(transcript_proof));
+		response.insert("tail_ring_rotation_count".to_owned(), json!(tail_ring_rotation_count));
 		let mut lock = lock_status_json(lock_status);
 		lock.as_object_mut()
 			.expect("lock status is an object")
@@ -1515,6 +1526,7 @@ mod tests {
 			.await
 			.unwrap();
 		assert_eq!(status["transcript_proof"], "pending");
+		assert_eq!(status["tail_ring_rotation_count"], 0);
 
 		let blocked = dispatcher
 			.dispatch("main.submit".to_owned(), json!({ "text": "must not send" }), super::super::CancellationToken::new())

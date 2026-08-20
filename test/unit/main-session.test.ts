@@ -632,29 +632,44 @@ test.serial("adoption-start retention gap records its resync checkpoint and proj
 	}
 });
 
-test.serial("an established broker-tail checkpoint fails closed when retention advances beyond it", async () => {
+test.serial("an established busy-turn ring rotation journals its resync and continues from transcript delivery", async () => {
 	const fixture = new FakeBrokerFixture();
 	fixtures.push(fixture);
-	const { state, profile } = await bootstrapFixture(fixture);
+	const { meta, state, profile } = await bootstrapFixture(fixture);
 	const resumedSupervisor = supervisor(fixture);
 	const resumed = await strictResumeMainSession({ profile, state, supervisor: resumedSupervisor });
+	const journal: Array<{ kind: string; payloadJson: string }> = [];
 	const host = createMainSessionHost({
 		supervisor: resumedSupervisor,
 		identity: resumed.identity,
 		state,
-		journal: { journalAppend: () => undefined },
+		journal: { journalAppend: (kind, payloadJson) => journal.push({ kind, payloadJson }) },
 		initialTurnState: resumed.turnState,
 		initialFollowUpQueueDepth: resumed.followUpQueueDepth,
 	});
 	try {
 		await eventually(() => state.read().tailCheckpoint?.seq === 0, "host did not establish its initial checkpoint");
-		fixture.appendTailEvent("agent_start", { type: "agent_start", sessionId: fixture.sessionId });
-		await eventually(() => state.read().tailCheckpoint?.seq === 1, "host did not advance its established checkpoint");
-
-		fixture.appendTailEvent("agent_start", { type: "agent_start", sessionId: fixture.sessionId });
-		fixture.rotateTailThrough(2);
-		await expect(host.waitForFatalFailure()).resolves.toMatchObject({ reason: "tail_retention_gap" });
-		expect(state.read()).toMatchObject({ bootstrapState: "FAILED_CLOSED", failedClosedReason: "tail_retention_gap" });
+		fixture.setNoEnvelopeWhileBusy();
+		fixture.holdNextTurn();
+		await host.admit("prompt", "rotate the held ring", "ring-rotation");
+		await eventually(() => state.read().growthIntent !== undefined, "held admission did not open a growth window");
+		fixture.rotateRingDuringNextCompletion();
+		fixture.complete("ring-rotation", { text: "delivered after ring rotation" });
+		await eventually(() => state.read().tailRingRotationCount === 1, "ring rotation was not durably recorded");
+		await eventually(
+			() => journal.some(event => event.kind === "assistant_message" && event.payloadJson.includes("delivered after ring rotation")),
+			"transcript delivery did not project the terminal reply after ring rotation",
+		);
+		expect(meta.events).toContainEqual({
+			kind: "tail_ring_rotation",
+			payloadJson: JSON.stringify({
+				prior_watermark: { revision: 2, generation: 1, seq: 0 },
+				resync_point: { revision: 4, generation: 1, seq: 5 },
+			}),
+		});
+		expect(state.read()).toMatchObject({ bootstrapState: "COMMITTED", failedClosedReason: undefined, tailRingRotationCount: 1 });
+		expect(host.degraded).toBe(false);
+		expect(host.turnState).toBe("idle");
 	} finally {
 		await host.dispose();
 	}

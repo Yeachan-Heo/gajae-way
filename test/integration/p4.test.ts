@@ -178,6 +178,92 @@ externalTest("pending transcript proof fences admission until the first complete
 	}
 }, 30_000);
 
+externalTest("busy ring rotation resyncs without losing transcript delivery or subsequent admission", async () => {
+	const gateway = await hosted({ tailTimeoutMs: 50 });
+	gateway.fixture.setNoEnvelopeWhileBusy();
+	gateway.fixture.holdNextTurn();
+
+	const first = await gateway.client.request("main.submit", {
+		text: "rotate this busy ring",
+		surface_id: "owner",
+		idempotency_key: "busy-ring-rotation",
+	});
+	const firstOpRef = (first.result as { op_ref: string }).op_ref;
+	expect(first.result).toMatchObject({ accepted: true, delivered_as: "prompt" });
+	await waitForBusyStatus(gateway);
+	gateway.fixture.rotateRingDuringNextCompletion();
+	gateway.fixture.complete(firstOpRef, { text: "final reply after busy ring rotation" });
+
+	await eventually(
+		() => (gateway.state.read().tailRingRotationCount === 1 ? true : undefined),
+		"busy-turn ring rotation was not durably recorded",
+	);
+	const rotation = await eventually(
+		() => gateway.core.journalRead("1:0", 100).events.find(event => event.kind === "tail_ring_rotation"),
+		"busy-turn ring rotation was not journaled",
+	);
+	expect(JSON.parse(rotation.payloadJson)).toEqual({
+		prior_watermark: { revision: 2, generation: 1, seq: 0 },
+		resync_point: { revision: 4, generation: 1, seq: 5 },
+	});
+	await eventually(
+		() =>
+			gateway.core
+				.journalRead("1:0", 100)
+				.events.some(event => event.kind === "assistant_message" && event.payloadJson.includes("final reply after busy ring rotation"))
+				? true
+				: undefined,
+		"transcript delivery did not project the terminal reply after ring rotation",
+	);
+	const settled = await gateway.client.request("way.status", {});
+	expect(settled.result).toMatchObject({ turn_state: "idle", tail_ring_rotation_count: 1 });
+	expect(gateway.state.read().bootstrapState).toBe("COMMITTED");
+	expect(gateway.state.read().failedClosedReason).toBeUndefined();
+	expect(gateway.host.degraded).toBe(false);
+
+	gateway.fixture.holdNextTurn();
+	const second = await gateway.client.request("main.submit", {
+		text: "admission still works after rotation",
+		surface_id: "owner",
+		idempotency_key: "post-ring-rotation",
+	});
+	expect(second.result).toMatchObject({ accepted: true, delivered_as: "prompt" });
+	const secondOpRef = (second.result as { op_ref: string }).op_ref;
+	gateway.fixture.complete(secondOpRef, { text: "post-rotation roundtrip" });
+	await eventually(
+		() =>
+			gateway.core
+				.journalRead("1:0", 100)
+				.events.some(event => event.kind === "assistant_message" && event.payloadJson.includes("post-rotation roundtrip"))
+				? true
+				: undefined,
+		"post-rotation admission did not round-trip",
+	);
+}, 30_000);
+
+externalTest("a transcript prefix break remains a fail-closed authority violation", async () => {
+	const gateway = await hosted();
+	gateway.fixture.holdNextTurn();
+	const accepted = await gateway.client.request("main.submit", {
+		text: "force a transcript prefix check",
+		surface_id: "owner",
+		idempotency_key: "transcript-prefix-break",
+	});
+	const opRef = (accepted.result as { op_ref: string }).op_ref;
+	await waitForBusyStatus(gateway);
+	gateway.fixture.replaceTranscriptEntry(`${gateway.fixture.sessionId}:transcript:0`, {
+		type: "session",
+		id: "tampered-external-session",
+	});
+	gateway.fixture.complete(opRef, { text: "must not be accepted as append-only growth" });
+	await eventually(
+		() => (gateway.state.read().bootstrapState === "FAILED_CLOSED" ? true : undefined),
+		"transcript prefix break did not fail closed",
+	);
+	expect(gateway.state.read()).toMatchObject({ bootstrapState: "FAILED_CLOSED", failedClosedReason: "growth_intent_mismatch" });
+	expect((await gateway.client.request("way.status", {})).result).toMatchObject({ state: "failed_closed", reason: "growth_intent_mismatch" });
+}, 30_000);
+
 externalTest("main.submit returns delivered_as before a held external assistant is journaled", async () => {
 	const gateway = await hosted();
 	gateway.fixture.holdNextTurn();

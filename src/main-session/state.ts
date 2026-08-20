@@ -17,6 +17,7 @@ export const GATEWAY_META_KEYS = [
 	"profile_approval_receipt",
 	"failed_closed_reason",
 	"tail_checkpoint",
+	"tail_ring_rotation_count",
 	"transcript_delivery_progress",
 	"transcript_proof",
 
@@ -133,6 +134,7 @@ export interface DurableGatewayState {
 	readonly profileApprovalReceipt: string | undefined;
 	readonly failedClosedReason: string | undefined;
 	readonly tailCheckpoint: TailCheckpoint | undefined;
+	readonly tailRingRotationCount: number;
 	readonly transcriptDeliveryProgress: TranscriptDeliveryProgress | undefined;
 	readonly transcriptProof: TranscriptProof;
 
@@ -273,6 +275,14 @@ function parseOptionalTailCheckpoint(raw: string | undefined): TailCheckpoint | 
 	return parsed === undefined ? undefined : parseTailCheckpoint(parsed, "tail_checkpoint");
 }
 
+function parseTailRingRotationCount(raw: string): number {
+	const count = Number(raw);
+	if (!Number.isSafeInteger(count) || count < 0) {
+		throw new GatewayStateError("metadata_invalid", "tail_ring_rotation_count is invalid.");
+	}
+	return count;
+}
+
 function parseOptionalTranscriptDeliveryProgress(raw: string | undefined): TranscriptDeliveryProgress | undefined {
 	if (raw === undefined || raw === "null") return undefined;
 	const value = parseNullableJson(raw, "transcript_delivery_progress");
@@ -354,6 +364,7 @@ function parsedState(values: ReadonlyMap<string, string>): DurableGatewayState {
 		profileApprovalReceipt: parseOptionalStringJson(requiredMeta(values, "profile_approval_receipt"), "profile_approval_receipt"),
 		failedClosedReason: parseOptionalStringJson(requiredMeta(values, "failed_closed_reason"), "failed_closed_reason"),
 		tailCheckpoint: parseOptionalTailCheckpoint(values.get("tail_checkpoint")),
+		tailRingRotationCount: parseTailRingRotationCount(requiredMeta(values, "tail_ring_rotation_count")),
 		transcriptDeliveryProgress,
 		transcriptProof,
 	};
@@ -498,6 +509,7 @@ export class GatewayStateStore {
 				{ key: "profile_tunables_revision", value: String(profile.tunablesRevision) },
 				{ key: "failed_closed_reason", value: "null" },
 				{ key: "tail_checkpoint", value: tailCheckpointJson(discoveryCheckpoint) },
+				{ key: "tail_ring_rotation_count", value: "0" },
 				{ key: "transcript_delivery_progress", value: transcriptDeliveryProgressJson(transcriptDeliveryProgress) },
 				{ key: "transcript_proof", value: transcriptProof },
 			],
@@ -681,6 +693,31 @@ export class GatewayStateStore {
 		});
 	}
 
+
+	/** Atomically records an established ring rotation and advances its non-authoritative watermark. */
+	recordTailRingRotation(previous: TailCheckpoint, resync: TailCheckpoint): void {
+		if (previous.generation !== resync.generation || resync.seq <= previous.seq) {
+			throw new GatewayStateError("tail_ring_rotation_invalid", "A ring rotation must advance within the established tail generation.");
+		}
+		const state = this.read();
+		if (state.tailRingRotationCount >= Number.MAX_SAFE_INTEGER) {
+			throw new GatewayStateError("tail_ring_rotation_overflow", "The durable tail-ring rotation count overflowed.");
+		}
+		this.transact({
+			expected: [
+				{ key: "bootstrap_state", value: "COMMITTED" },
+				{ key: "tail_checkpoint", value: tailCheckpointJson(previous) },
+				{ key: "tail_ring_rotation_count", value: String(state.tailRingRotationCount) },
+			],
+			puts: [
+				{ key: "tail_checkpoint", value: tailCheckpointJson(resync) },
+				{ key: "tail_ring_rotation_count", value: String(state.tailRingRotationCount + 1) },
+			],
+			deletes: [],
+			eventKind: "tail_ring_rotation",
+			eventPayloadJson: stableMetadataJson({ prior_watermark: previous, resync_point: resync }),
+		});
+	}
 	/** Atomically journals one projected tail event with its consumed watermark. */
 	appendTailProjection(expected: TailCheckpoint | undefined, checkpoint: TailCheckpoint, kind: string, payloadJson: string): void {
 		if (expected && compareTailCheckpoints(checkpoint, expected) < 0) {

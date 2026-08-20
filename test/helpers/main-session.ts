@@ -21,6 +21,7 @@ const defaults: Record<string, string> = {
 	profile_approval_receipt: "null",
 	failed_closed_reason: "null",
 	tail_checkpoint: "null",
+	tail_ring_rotation_count: "0",
 	transcript_delivery_progress: "null",
 	transcript_proof: "pending",
 
@@ -85,6 +86,7 @@ interface FixtureSession {
 	failNext?: boolean;
 	responseText?: string;
 	tailTimeoutWhileBusy?: boolean;
+	rotateRingDuringNextCompletion?: boolean;
 	unavailableQueries?: string[];
 	commandLog: Array<Record<string, unknown>>;
 }
@@ -180,6 +182,13 @@ export class FakeBrokerFixture {
 	holdNextTurn(): void {
 		this.update(session => {
 			session.holdNext = true;
+		});
+	}
+
+	/** Rotates retained lifecycle frames when the next held turn completes. */
+	rotateRingDuringNextCompletion(): void {
+		this.update(session => {
+			session.rotateRingDuringNextCompletion = true;
 		});
 	}
 
@@ -281,6 +290,15 @@ export class FakeBrokerFixture {
 			const id = `${this.sessionId}:transcript:${session.nextTranscriptId}`;
 			session.nextTranscriptId += 1;
 			session.transcript.push({ id, payload: entry });
+		});
+	}
+
+	/** Rewrites retained transcript evidence for prefix-attestation failure drills. */
+	replaceTranscriptEntry(entryId: string, payload: unknown): void {
+		this.update(session => {
+			const index = session.transcript.findIndex(entry => entry.id === entryId);
+			if (index < 0) throw new Error(`fixture transcript entry ${entryId} is not retained`);
+			session.transcript[index] = { id: entryId, payload };
 		});
 	}
 

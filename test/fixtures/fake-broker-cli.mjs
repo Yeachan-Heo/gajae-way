@@ -267,6 +267,15 @@ if (!statePath) {
 				if (requested.failure) operation.failure = true;
 				if (requested.text !== undefined) operation.responseText = requested.text;
 				completeOperation(value, operation);
+				if (value.rotateRingDuringNextCompletion === true) {
+					delete value.rotateRingDuringNextCompletion;
+					const floor = value.nextSeq ?? 0;
+					value.retentionFloorSeq = Math.max(value.retentionFloorSeq ?? 0, floor);
+					value.events = (value.events ?? []).filter(
+						event => typeof event.seq !== "number" || event.seq > (value.retentionFloorSeq ?? 0),
+					);
+					value.gap = undefined;
+				}
 				changed = true;
 			}
 		}

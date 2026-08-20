@@ -14,7 +14,7 @@ use std::{
 use rusqlite::{Connection, OptionalExtension, Transaction};
 
 pub const DATABASE_FILENAME: &str = "way-core.sqlite3";
-pub const SCHEMA_VERSION: u32 = 4;
+pub const SCHEMA_VERSION: u32 = 5;
 pub const IDEMPOTENCY_WINDOW_MS: i64 = 24 * 60 * 60 * 1_000;
 pub const CLOSURE_OPERATION_META_KEY: &str = "gitlock_closure_operation";
 
@@ -749,6 +749,15 @@ fn migrate(connection: &mut Connection) -> StoreResult<()> {
         transaction.commit()?;
     }
 
+    if current_version < 5 {
+        let transaction = connection.transaction()?;
+        if meta_get_tx(&transaction, "tail_ring_rotation_count")?.is_none() {
+            meta_set_tx(&transaction, "tail_ring_rotation_count", "0")?;
+        }
+        meta_set_tx(&transaction, "schema_version", "5")?;
+        transaction.commit()?;
+    }
+
 
     let defaults = [
         ("bootstrap_state", "ABSENT"),
@@ -765,6 +774,7 @@ fn migrate(connection: &mut Connection) -> StoreResult<()> {
         ("tail_checkpoint", "null"),
         ("transcript_delivery_progress", "null"),
         ("transcript_proof", "pending"),
+        ("tail_ring_rotation_count", "0"),
         ("journal_generation", "1"),
         ("boot_epoch", "0"),
         ("journal_floor_seq", "0"),
@@ -831,6 +841,7 @@ mod tests {
             Some(SCHEMA_VERSION.to_string())
         );
         assert_eq!(store.get_meta("transcript_proof").unwrap().as_deref(), Some("pending"));
+        assert_eq!(store.get_meta("tail_ring_rotation_count").unwrap().as_deref(), Some("0"));
 
         let connection = store.connection().unwrap();
         let journal_mode: String = connection
@@ -984,6 +995,25 @@ mod tests {
 
         let migrated = Store::open(&state_dir).unwrap();
         assert_eq!(migrated.get_meta("transcript_proof").unwrap().as_deref(), Some("proven"));
+        assert_eq!(migrated.get_meta("schema_version").unwrap(), Some(SCHEMA_VERSION.to_string()));
+        drop(migrated);
+        fs::remove_dir_all(state_dir).unwrap();
+    }
+
+    #[test]
+    fn v4_state_directory_initializes_the_durable_tail_ring_rotation_count() {
+        let state_dir = temporary_state_dir("v4-tail-ring-rotation");
+        let database_path = state_dir.join(DATABASE_FILENAME);
+        drop(Store::open(&state_dir).unwrap());
+
+        let connection = Connection::open(&database_path).unwrap();
+        connection
+            .execute_batch("DELETE FROM gateway_meta WHERE k = 'tail_ring_rotation_count'; UPDATE gateway_meta SET v = '4' WHERE k = 'schema_version';")
+            .unwrap();
+        drop(connection);
+
+        let migrated = Store::open(&state_dir).unwrap();
+        assert_eq!(migrated.get_meta("tail_ring_rotation_count").unwrap().as_deref(), Some("0"));
         assert_eq!(migrated.get_meta("schema_version").unwrap(), Some(SCHEMA_VERSION.to_string()));
         drop(migrated);
         fs::remove_dir_all(state_dir).unwrap();
