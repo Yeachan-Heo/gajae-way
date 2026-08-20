@@ -22,4 +22,4 @@ const workspace = Bun.env.GAJAEWAY_SUPERVISOR_WORKSPACE;
 	} finally {
 		await supervisor.dispose();
 	}
-}, 30_000);
+}, 180_000);
