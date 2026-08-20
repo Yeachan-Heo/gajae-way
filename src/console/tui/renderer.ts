@@ -134,6 +134,7 @@ export class ConsoleTuiRenderer {
 	#reconcile = "reconcile: freshness=unknown last_ok_at=none cycle_ms=unknown drift_count=unknown";
 	#delivery = "fenced";
 	#consumer = "idle";
+	#consumers = "consumers: none";
 
 	get columns(): number {
 		return this.#columns;
@@ -199,6 +200,7 @@ export class ConsoleTuiRenderer {
 			else if (trimmed.startsWith("journal:")) this.#journal = trimmed;
 			else if (trimmed.startsWith("lock:")) this.#lock = trimmed;
 			else if (trimmed.startsWith("reconcile:")) this.#reconcile = trimmed;
+			else if (trimmed.startsWith("consumers:")) this.#consumers = trimmed;
 		}
 	}
 
@@ -282,9 +284,9 @@ export class ConsoleTuiRenderer {
 	#statusLines(): string[] {
 		const scroll = this.#scrollOffset > 0 ? ` scroll=${this.#scrollOffset}` : "";
 		const source = [
-			`gajaeway console | ${this.#daemon} | ${this.#main}`,
+			`GATEWAY COCKPIT | ${this.#daemon} | ${this.#main}`,
 			`${this.#journal} | ${this.#lock}`,
-			`${this.#reconcile} | delivery=${this.#delivery} consumer=${this.#consumer}${scroll}`,
+			`${this.#reconcile} | ${this.#consumers} | delivery=${this.#delivery} consumer=${this.#consumer}${scroll}`,
 		];
 		const wrapped = source.flatMap((line) => wrapLine(line, this.#columns));
 		const maximumStatusRows = Math.max(1, this.#rows - 2);

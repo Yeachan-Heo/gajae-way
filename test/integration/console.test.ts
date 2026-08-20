@@ -1395,6 +1395,178 @@ test("full-screen renderer preserves complete assistant and gate frames while th
 	}
 }, 15_000);
 
+test("gateway cockpit journal tail excludes registry noise by default and honors explicit kinds", async () => {
+	const gateway = await hostedConsoleGateway();
+	const recorded = recordingClient(gateway.client);
+	const terminal = controlledTerminal();
+	const running = runWayConsole({ stateDir: gateway.stateDirectory, profilePath: gateway.profilePath }, [], {
+		terminal: terminal.terminal,
+		rpcConnect: async () => recorded.rpc,
+	});
+	try {
+		await eventually(terminal.isReading, "cockpit did not begin reading input");
+		terminal.send("/help");
+		await eventually(
+			() => terminal.writes.some((write) => write.includes("/journal [all|kind[,kind...]] [count]")),
+			"cockpit help did not document journal operations",
+		);
+		const help = terminal.writes.find((write) => write.includes("Gateway cockpit commands:")) as string;
+		expect(help).toContain("/registry list | /registry inspect <session_id>");
+		expect(help).toContain("/lock force-release <lease_id> CONFIRM FORCE-RELEASE <lease_id>");
+		gateway.core.journalAppend("registry_change", JSON.stringify({ session_id: "noise-row", reason: "poll" }));
+		gateway.core.journalAppend("turn_start", JSON.stringify({ attempt_id: "cockpit-tail" }));
+		terminal.send("/journal 20");
+		await eventually(
+			() => terminal.writes.some((write) => write.startsWith("Journal tail:") && write.includes("turn_start")),
+			"default journal tail did not render the matching lifecycle event",
+		);
+		const defaultTail = terminal.writes.filter((write) => write.startsWith("Journal tail:")).at(-1) as string;
+		expect(defaultTail).not.toContain("registry_change");
+		const defaultRead = recorded.calls
+			.filter((call) => call.method === "main.events.read" && typeof (call.params as Record<string, unknown> | undefined)?.cursor === "string")
+			.at(-1);
+		expect((defaultRead?.params as { kinds?: readonly string[] }).kinds).not.toContain("registry_change");
+
+		terminal.send("/journal registry_change 20");
+		await eventually(
+			() => terminal.writes.filter((write) => write.startsWith("Journal tail:")).some((write) => write.includes("registry_change")),
+			"explicit registry journal tail did not render registry events",
+		);
+		const explicitRead = recorded.calls
+			.filter((call) => call.method === "main.events.read" && typeof (call.params as Record<string, unknown> | undefined)?.cursor === "string")
+			.at(-1);
+		expect((explicitRead?.params as { kinds?: readonly string[] }).kinds).toEqual(["registry_change"]);
+		terminal.send("/quit");
+		await running;
+	} finally {
+		terminal.terminal.close();
+		await gateway.stop();
+		await running.catch(() => undefined);
+	}
+}, 15_000);
+
+test("gateway cockpit registry list and inspect use real UDS registry rows", async () => {
+	const gateway = await hostedConsoleGateway();
+	gateway.core.registryApplyBrokerSnapshot({
+		observedAt: Date.now(),
+		rows: [
+			{
+				sessionId: "cockpit-lane-1",
+				locator: JSON.stringify({ repo: "/workspace/cockpit-repo", stateRoot: "/workspace/cockpit-repo/.gjc" }),
+				endpointGeneration: 1,
+				identityProvenance: "composite",
+				indexSeq: 1,
+				live: true,
+				deleted: false,
+				terminalUncertain: false,
+				ambiguous: false,
+				activityState: "active",
+				activityAt: Date.now(),
+				lastHeartbeatAt: Date.now(),
+			},
+		],
+	});
+	const terminal = controlledTerminal();
+	const running = runWayConsole({ stateDir: gateway.stateDirectory, profilePath: gateway.profilePath }, [], {
+		terminal: terminal.terminal,
+	});
+	try {
+		await eventually(terminal.isReading, "cockpit did not begin reading input");
+		terminal.send("/registry list");
+		await eventually(
+			() => terminal.writes.some((write) => write.startsWith("Registry list:") && write.includes("cockpit-lane-1")),
+			"registry list did not render the UDS row",
+		);
+		const listed = terminal.writes.filter((write) => write.startsWith("Registry list:")).at(-1) as string;
+		expect(listed).toContain("id=cockpit-lane-1");
+		expect(listed).toContain("status=discovered");
+		expect(listed).toContain("live=true");
+		expect(listed).toContain("quarantined=false");
+		expect(listed).toContain("repo=/workspace/cockpit-repo");
+
+		terminal.send("/registry inspect cockpit-lane-1");
+		await eventually(
+			() => terminal.writes.some((write) => write.startsWith("Registry inspect") && write.includes("cockpit-lane-1")),
+			"registry inspect did not render the UDS row",
+		);
+		const inspected = terminal.writes.filter((write) => write.startsWith("Registry inspect")).at(-1) as string;
+		expect(inspected).toContain("id=cockpit-lane-1");
+		expect(inspected).toContain('"repo":"/workspace/cockpit-repo"');
+		terminal.send("/quit");
+		await running;
+	} finally {
+		terminal.terminal.close();
+		await gateway.stop();
+		await running.catch(() => undefined);
+	}
+}, 15_000);
+
+test("gateway cockpit lock force-release requires an exact typed confirmation and renders the gateway refusal", async () => {
+	const gateway = await hostedConsoleGateway();
+	const identity = gateway.core.processIdentity(process.pid);
+	const lease = gateway.core.lockAcquire({
+		label: "cockpit-confirmation-drill",
+		waitMs: 0,
+		ttlMs: 5_000,
+		holder: {
+			holderKind: "in_daemon",
+			sessionId: "cockpit-main",
+			pid: identity.pid,
+			pidStartTime: identity.pidStartTime,
+			pgid: identity.pgid,
+			...(identity.pgidStartTime ? { pgidStartTime: identity.pgidStartTime } : {}),
+			connId: "way.in_daemon_executor.v1",
+		},
+	});
+	const recorded = recordingClient(gateway.client);
+	const terminal = controlledTerminal();
+	const running = runWayConsole({ stateDir: gateway.stateDirectory, profilePath: gateway.profilePath }, [], {
+		terminal: terminal.terminal,
+		rpcConnect: async () => recorded.rpc,
+		idempotencyKey: () => "cockpit-force-release-1",
+	});
+	try {
+		await eventually(terminal.isReading, "cockpit did not begin reading input");
+		terminal.send("/lock status");
+		await eventually(
+			() => terminal.writes.some((write) => write.startsWith("Git lock status") && write.includes(`lease_id=${lease.leaseId}`)),
+			"lock status did not render the current gateway lease",
+		);
+		terminal.send(`/lock clear-quarantine receipt-unused`);
+		await eventually(
+			() => terminal.writes.some((write) => write.includes("CONFIRM CLEAR-QUARANTINE receipt-unused")),
+			"clear-quarantine did not demand an exact typed confirmation",
+		);
+		expect(recorded.calls.filter((call) => call.method === "gitlock.clear_quarantine")).toHaveLength(0);
+
+		terminal.send(`/lock force-release ${lease.leaseId}`);
+		await eventually(
+			() => terminal.writes.some((write) => write.includes(`CONFIRM FORCE-RELEASE ${lease.leaseId}`)),
+			"force-release did not demand an exact typed confirmation",
+		);
+		expect(recorded.calls.filter((call) => call.method === "gitlock.force_release")).toHaveLength(0);
+
+		terminal.send(`/lock force-release ${lease.leaseId} CONFIRM FORCE-RELEASE ${lease.leaseId}`);
+		await eventually(
+			() => terminal.writes.some((write) => write.includes("Git lock force-release refused: lock_holder_unverified")),
+			"force-release did not render the gateway refusal verbatim",
+		);
+		const forceReleaseCalls = recorded.calls.filter((call) => call.method === "gitlock.force_release");
+		expect(forceReleaseCalls).toHaveLength(1);
+		expect(forceReleaseCalls[0]?.params).toEqual({
+			lease_id: lease.leaseId,
+			confirm: true,
+			idempotency_key: "cockpit-force-release-1",
+		});
+		terminal.send("/quit");
+		await running;
+	} finally {
+		terminal.terminal.close();
+		await gateway.stop();
+		await running.catch(() => undefined);
+	}
+}, 15_000);
+
 test("console gate drill uses durable gate fencing, rejects a mismatched session, and renders resolution", async () => {
 	const gateway = await hostedConsoleGateway();
 	const rendered = recordedOutput();

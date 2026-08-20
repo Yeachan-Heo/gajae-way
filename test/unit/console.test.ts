@@ -5,12 +5,14 @@ import {
 	MAX_RAW_CONSOLE_QUEUED_BYTES,
 	MAX_RAW_CONSOLE_QUEUED_LINES,
 	RawConsoleTerminal,
+	OwnerConsole,
 	consoleStartupDecision,
 	renderConsoleStatusSummary,
 	sanitizeConsoleText,
 } from "../../src/console/console";
 import { ConsoleInputEditor } from "../../src/console/tui/editor";
 import { ConsoleTuiRenderer } from "../../src/console/tui/renderer";
+import type { JsonRpcClient, JsonRpcResponse } from "../../src/rpc-client";
 
 class RawInputHarness {
 	readonly isTTY = true;
@@ -181,6 +183,7 @@ const healthyStatus = {
 	},
 	write_mode: false,
 	reconcile: { last_ok_at: 10_000, cycle_ms: 5_000, drift_count: 3 },
+	consumers: [{ consumer_id: "gajaeway-console", cursor: "7:41", claim_id: "claim-live" }],
 };
 
 test("console maps health and status into the owner-visible summary", () => {
@@ -193,6 +196,38 @@ test("console maps health and status into the owner-visible summary", () => {
 		"lock: held=true holder=session=main-session queue_len=1 stuck=false quarantined=true write_mode=false",
 	);
 	expect(summary).toContain("reconcile: freshness=fresh last_ok_at=10000 age_ms=5000 cycle_ms=5000 drift_count=3");
+	expect(summary).toContain("consumers: gajaeway-console@7:41(claimed)");
+});
+
+test("status polling emits one atomic frame only when gateway state changes", async () => {
+	let status: Record<string, unknown> = {
+		...healthyStatus,
+		consumers: [{ consumer_id: "gajaeway-console", cursor: "7:41", claim_id: "claim-live" }],
+	};
+	const rpc: JsonRpcClient = {
+		async request(method: string): Promise<JsonRpcResponse> {
+			if (method === "way.health") return { jsonrpc: "2.0", id: 1, result: healthyHealth };
+			if (method === "way.status") return { jsonrpc: "2.0", id: 2, result: status };
+			throw new Error(`unexpected RPC method: ${method}`);
+		},
+		close(): void {},
+	};
+	const writes: string[] = [];
+	const consoleSurface = new OwnerConsole({
+		rpc,
+		ownerSurfaceId: "owner",
+		output: new ConsoleOutput((frame) => {
+			writes.push(frame);
+		}),
+	});
+
+	expect(await consoleSurface.refreshStatus({ onlyIfChanged: true })).toBe(true);
+	expect(await consoleSurface.refreshStatus({ onlyIfChanged: true })).toBe(false);
+	status = { ...status, lock: { ...(status.lock as Record<string, unknown>), quarantined: false } };
+	expect(await consoleSurface.refreshStatus({ onlyIfChanged: true })).toBe(true);
+	expect(writes).toHaveLength(2);
+	expect(writes[0]).toContain("quarantined=true");
+	expect(writes[1]).toContain("quarantined=false");
 });
 
 test("console refuses a failed-closed or unhealthy daemon before interactive input", () => {
@@ -627,7 +662,9 @@ test("renderer appends transcript frames without corrupting its dedicated input 
 	expect(firstFrame).toContain("head_cursor=7:42");
 	expect(firstFrame).toContain("quarantined=true write_mode=false");
 	expect(firstFrame).toContain("freshness=fresh");
-	expect(firstFrame).toContain("delivery=ready consumer=streaming");
+	expect(firstFrame.replace(/\n/gu, "")).toContain("delivery=ready consumer=streaming");
+	expect(firstFrame).toContain("GATEWAY COCKPIT");
+	expect(firstFrame).toContain("consumers: gajaeway-console@7:41(claimed)");
 	renderer.appendFrame("Gate opened: gate_id=gate-1 expected_session_id=session-1.\n");
 	const secondFrame = visibleTerminalText(renderer.render(editor, "gajaeway> "));
 	expect(secondFrame).toContain("first streamed frame");

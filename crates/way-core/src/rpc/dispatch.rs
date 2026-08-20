@@ -72,13 +72,21 @@ pub fn app_error_name(code: i64) -> Option<&'static str> {
 	APP_ERROR_CODES.iter().find_map(|(candidate, name)| (*candidate == code).then_some(*name))
 }
 
-/// A wire-safe JSON-RPC error. `internal` is the only constructor for -32603,
-/// ensuring every internal error has a logged correlation identifier.
+/// A wire-safe JSON-RPC error. Every internal error constructor emits a logged
+/// correlation identifier.
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct RpcError {
 	pub code: i64,
 	pub message: String,
 	pub data: Option<Value>,
+}
+
+#[derive(Debug)]
+struct BridgeDiagnostic {
+	error_type: String,
+	message: String,
+	stack: Option<String>,
 }
 
 impl RpcError {
@@ -107,6 +115,30 @@ impl RpcError {
 		let correlation_id = format!("rpc-{}", NEXT_CORRELATION_ID.fetch_add(1, Ordering::Relaxed));
 		eprintln!("way-core rpc internal_error correlation_id={correlation_id} message={message}");
 		Self::with_data(-32603, message, json!({ "correlation_id": correlation_id }))
+	}
+
+	fn bridge_exception(reason: String, diagnostic: Option<BridgeDiagnostic>) -> Self {
+		let correlation_id = format!("rpc-{}", NEXT_CORRELATION_ID.fetch_add(1, Ordering::Relaxed));
+		match diagnostic {
+			Some(diagnostic) => {
+				let error_type = bounded_bridge_log_value(&diagnostic.error_type);
+				let message = bounded_bridge_log_value(&diagnostic.message);
+				if let Some(stack) = diagnostic.stack {
+					let stack = bounded_bridge_log_value(&stack);
+					eprintln!(
+						"way-core rpc bridge_exception correlation_id={correlation_id} reason={reason} error_type={error_type:?} message={message:?} stack={stack:?}"
+					);
+				} else {
+					eprintln!(
+						"way-core rpc bridge_exception correlation_id={correlation_id} reason={reason} error_type={error_type:?} message={message:?}"
+					);
+				}
+			}
+			None => eprintln!(
+				"way-core rpc bridge_exception correlation_id={correlation_id} reason={reason} error_type=\"unknown\" message=\"bridge exception\""
+			),
+		}
+		Self::with_data(-32603, "bridge_exception", json!({ "correlation_id": correlation_id, "reason": reason }))
 	}
 
 	pub fn app(code: i64, data: Option<Value>) -> Self {
@@ -406,10 +438,39 @@ impl GatewayState {
 	fn health_status(self) -> &'static str {
 		match self {
 			Self::Booting | Self::Verifying => "booting",
-			Self::FailedClosed => "unhealthy",
-			Self::Running | Self::Degraded => "healthy",
+			Self::Running => "healthy",
+			Self::FailedClosed | Self::Degraded => "unhealthy",
 		}
 	}
+}
+
+fn is_machine_reason(value: &str) -> bool {
+	!value.is_empty()
+		&& value.len() <= 64
+		&& value.bytes().enumerate().all(|(index, byte)| {
+			if index == 0 {
+				byte.is_ascii_lowercase()
+			} else {
+				byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'_'
+			}
+		})
+}
+
+fn durable_failed_closed_reason(store: &Store) -> Result<Option<String>, RpcError> {
+	let bootstrap_state = store.get_meta("bootstrap_state").map_err(store_error)?;
+	let raw_reason = store.get_meta("failed_closed_reason").map_err(store_error)?;
+	let recorded_failure = bootstrap_state.as_deref() == Some("FAILED_CLOSED")
+		|| raw_reason.as_deref().is_some_and(|value| value != "null");
+	if !recorded_failure {
+		return Ok(None);
+	}
+	let reason = raw_reason
+		.as_deref()
+		.and_then(|value| serde_json::from_str::<Value>(value).ok())
+		.and_then(|value| value.as_str().map(str::to_owned))
+		.filter(|value| is_machine_reason(value))
+		.unwrap_or_else(|| "failed_closed".to_owned());
+	Ok(Some(reason))
 }
 
 #[derive(Debug, Clone)]
@@ -474,6 +535,16 @@ impl RpcDispatcher {
 		}
 	}
 
+	fn reconciled_health(&self) -> Result<GatewayHealth, RpcError> {
+		let failed_closed_reason = durable_failed_closed_reason(&self.store)?;
+		let mut health = self.health.lock().map_err(|_| RpcError::internal("gateway health lock poisoned"))?;
+		if let Some(reason) = failed_closed_reason {
+			health.state = GatewayState::FailedClosed;
+			health.reason = Some(reason);
+		}
+		Ok(health.clone())
+	}
+
 	/// Publishes runtime main-session state only after strict resume has opened
 	/// the durable session for this daemon process.
 	pub fn set_main_session_status(&self, turn_state: String, follow_up_queue_depth: u64) {
@@ -504,7 +575,7 @@ impl RpcDispatcher {
 		if cancellation.is_cancelled() {
 			return Err(RpcError::internal("request cancelled"));
 		}
-		let health = self.health.lock().map_err(|_| RpcError::internal("gateway health lock poisoned"))?.clone();
+		let health = self.reconciled_health()?;
 		if health.state == GatewayState::FailedClosed && method != "way.health" && method != "way.status" && method != "profile.approve" {
 			return Err(RpcError::app(1000, health.reason.map(|reason| json!({ "reason": reason }))));
 		}
@@ -537,7 +608,7 @@ impl RpcDispatcher {
 
 	fn health_response(&self, params: Value) -> Result<Value, RpcError> {
 		ensure_empty_params(&params)?;
-		let health = self.health.lock().map_err(|_| RpcError::internal("gateway health lock poisoned"))?.clone();
+		let health = self.reconciled_health()?;
 		let main_session = self
 			.main_session
 			.lock()
@@ -1189,17 +1260,40 @@ fn journal_error(error: JournalError) -> RpcError {
 	}
 }
 
+fn bounded_bridge_log_value(value: &str) -> String {
+	value.chars().take(16_384).collect()
+}
+
+fn bridge_failure_reason(data: Option<&Value>) -> String {
+	data
+		.and_then(Value::as_object)
+		.and_then(|object| object.get("reason"))
+		.and_then(Value::as_str)
+		.filter(|reason| is_machine_reason(reason))
+		.map(str::to_owned)
+		.unwrap_or_else(|| "bridge_exception".to_owned())
+}
+
+fn bridge_diagnostic(data: Option<&Value>) -> Option<BridgeDiagnostic> {
+	let diagnostic = data?.as_object()?.get("diagnostic")?.as_object()?;
+	let error_type = diagnostic.get("error_type")?.as_str()?.to_owned();
+	let message = diagnostic.get("message")?.as_str()?.to_owned();
+	let stack = diagnostic.get("stack").and_then(Value::as_str).map(str::to_owned);
+	Some(BridgeDiagnostic { error_type, message, stack })
+}
+
 fn remote_bridge_error(error: Value) -> RpcError {
 	let Some(object) = error.as_object() else {
-		return RpcError::internal("bridge_exception");
+		return RpcError::bridge_exception("bridge_protocol_invalid".to_owned(), None);
 	};
 	let Some(code) = object.get("code").and_then(Value::as_i64) else {
-		return RpcError::internal("bridge_exception");
+		return RpcError::bridge_exception("bridge_protocol_invalid".to_owned(), None);
 	};
-	let message = object.get("message").and_then(Value::as_str).unwrap_or("bridge_exception");
 	if code == -32603 {
-		return RpcError::internal(message);
+		let data = object.get("data");
+		return RpcError::bridge_exception(bridge_failure_reason(data), bridge_diagnostic(data));
 	}
+	let message = object.get("message").and_then(Value::as_str).unwrap_or("bridge_exception");
 	let data = object.get("data").cloned();
 	RpcError { code, message: message.to_owned(), data }
 }
@@ -1392,6 +1486,40 @@ mod tests {
 			.await
 			.unwrap_err();
 		assert_ne!(approval.code, 1000);
+	}
+
+	#[tokio::test]
+	async fn durable_failed_closed_marker_overrides_stale_running_health() {
+		let store = Store::default();
+		store.set_meta("bootstrap_state", "FAILED_CLOSED").unwrap();
+		store.set_meta("failed_closed_reason", r#""growth_protocol_invalid""#).unwrap();
+		let locks = LockManager::new(store.clone());
+		let journal = EventJournal::new(store.clone());
+		let dispatcher = RpcDispatcher::new(store, locks, journal, TsfnBridge::for_tests());
+		dispatcher.set_gateway_state(GatewayState::Running, None);
+
+		let health = dispatcher
+			.dispatch("way.health".to_owned(), json!({}), super::super::CancellationToken::new())
+			.await
+			.unwrap();
+		assert_eq!(health["status"], "unhealthy");
+		assert_eq!(health["state"], "failed_closed");
+		assert_eq!(health["reason"], "growth_protocol_invalid");
+
+		let status = dispatcher
+			.dispatch("way.status".to_owned(), json!({}), super::super::CancellationToken::new())
+			.await
+			.unwrap();
+		assert_eq!(status["status"], "unhealthy");
+		assert_eq!(status["state"], "failed_closed");
+		assert_eq!(status["reason"], "growth_protocol_invalid");
+
+		let blocked = dispatcher
+			.dispatch("main.submit".to_owned(), json!({}), super::super::CancellationToken::new())
+			.await
+			.unwrap_err();
+		assert_eq!(blocked.code, 1000);
+		assert_eq!(blocked.data, Some(json!({ "reason": "growth_protocol_invalid" })));
 	}
 
 	#[tokio::test]

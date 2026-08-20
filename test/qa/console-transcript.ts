@@ -1,7 +1,7 @@
 /**
- * QA evidence generator (not a test): drives `gajaeway console` end to end against a real
- * in-process gateway over a real Unix socket and persists the complete terminal
- * write-stream as an app-automation transcript artifact.
+ * QA evidence generator (not a test): drives the `gajaeway console` gateway cockpit
+ * end to end against a real in-process gateway over a real Unix socket and persists
+ * the complete terminal write-stream as an app-automation transcript artifact.
  *
  * Run: bun test/qa/console-transcript.ts
  * Writes: artifacts/console-automation-transcript.json
@@ -210,10 +210,10 @@ async function main(): Promise<void> {
 		{
 			ordinal: 3,
 			timestamp: stamp(),
-			selector: 'stdout:"Owner console ready"',
+			selector: 'stdout:"Gateway cockpit ready"',
 			type: "observe",
-			detail: "readiness announcement after delivery readiness established",
-			result: visible.includes("Owner console ready") ? "rendered" : "absent",
+			detail: "cockpit readiness announcement after delivery readiness established",
+			result: visible.includes("Gateway cockpit ready") ? "rendered" : "absent",
 		},
 		{
 			ordinal: 4,
@@ -263,8 +263,8 @@ async function main(): Promise<void> {
 		tool: "bun (virtual raw-TTY TUI harness: test/qa/console-transcript.ts)",
 		surface: "cli",
 		surfaceNote:
-			"gajaeway console is a subcommand of the gajaeway CLI that renders to a terminal; the transcript records its terminal write-stream.",
-		subject: "gajaeway console (gajaeway local owner surface)",
+			"gajaeway console is the gateway operator cockpit; the transcript records its full-screen terminal write-stream.",
+		subject: "gajaeway console (gateway cockpit)",
 		producedBy: "test/qa/console-transcript.ts",
 		generatedAt: new Date().toISOString(),
 		harness:
@@ -277,7 +277,7 @@ async function main(): Promise<void> {
 			writeCount: writes.length,
 			renderedBytes: rendered.length,
 			statusRendered: visible.includes("Gateway status"),
-			readyLineRendered: visible.includes("Owner console ready"),
+			readyLineRendered: visible.includes("Gateway cockpit ready"),
 			promptRendered: visible.includes("gajaeway>"),
 			deliveredAsRendered,
 			assistantReplyRendered: visible.includes("Assistant:"),

@@ -15,15 +15,24 @@ import { createRpcBridge, RpcBridgeException, type RpcBridgeHandler } from "../.
 import { bootstrapMainSession } from "../../src/main-session/bootstrap";
 import { FileSdkDouble } from "../helpers/main-session";
 import { RpcClient } from "../helpers/rpc-client";
+import { ManagedProcessRegistry } from "../helpers/managed-process";
 
 const temporaryDirectories: string[] = [];
+const managedProcesses = new ManagedProcessRegistry();
 
 afterEach(async () => {
+	await managedProcesses.reapAll();
 	for (const directory of temporaryDirectories.splice(0)) fs.rmSync(directory, { force: true, recursive: true });
 });
 
 function temporaryDirectory(name: string): string {
 	const directory = fs.mkdtempSync(path.join(os.tmpdir(), `gajae-way-p4-${name}-`));
+	temporaryDirectories.push(directory);
+	return directory;
+}
+
+function socketTemporaryDirectory(): string {
+	const directory = fs.mkdtempSync("/tmp/gajaeway-");
 	temporaryDirectories.push(directory);
 	return directory;
 }
@@ -205,6 +214,111 @@ async function hostedServerWithSdk<Sdk extends MainSessionSdk>(sdk: Sdk): Promis
 	};
 }
 
+test("durable failed-closed state is unhealthy through RPC and health.json", async () => {
+	const root = socketTemporaryDirectory();
+	const stateDirectory = path.join(root, "state");
+	const corpus = path.join(root, "corpus");
+	const workspace = path.join(root, "workspace");
+	fs.mkdirSync(corpus);
+	fs.mkdirSync(workspace);
+	const profilePath = path.join(root, "profile.toml");
+	fs.writeFileSync(profilePath, profileContents(corpus, workspace));
+	const core = loadWayCore().WayCore.open(stateDirectory);
+	new GatewayStateStore(core).markFailedClosed("growth_protocol_invalid");
+	const child = managedProcesses.spawnDaemon({
+		cmd: ["bun", "src/main.ts", "serve", "--state-dir", stateDirectory, "--profile", profilePath, "--fail-closed-linger-ms", "2000"],
+		cwd: process.cwd(),
+		env: { ...process.env },
+		stderr: "pipe",
+	});
+	let client: RpcClient | undefined;
+	try {
+		client = await connectEventually(path.join(stateDirectory, "rpc.sock"));
+		let health: unknown;
+		for (let attempt = 0; attempt < 100; attempt += 1) {
+			const response = await client.request("way.health", {});
+			health = response.result;
+			if ((health as { state?: unknown } | undefined)?.state === "failed_closed") break;
+			await Bun.sleep(10);
+		}
+		expect(health).toMatchObject({ status: "unhealthy", state: "failed_closed", reason: "growth_protocol_invalid" });
+		const status = await client.request("way.status", {});
+		expect(status.result).toMatchObject({ status: "unhealthy", state: "failed_closed", reason: "growth_protocol_invalid" });
+		const healthFile = await eventually(() => {
+			try {
+				const payload = JSON.parse(fs.readFileSync(path.join(stateDirectory, "health.json"), "utf8")) as { state?: unknown };
+				return payload.state === "failed_closed" ? payload : undefined;
+			} catch {
+				return undefined;
+			}
+		}, "failed-closed health.json was not written");
+		expect(healthFile).toMatchObject({ status: "unhealthy", state: "failed_closed", reason: "growth_protocol_invalid" });
+	} finally {
+		client?.close();
+		await managedProcesses.stopDaemon(child);
+	}
+}, 10_000);
+
+test("bridge exceptions expose a safe reason and log correlated diagnostics", async () => {
+	const stateDirectory = socketTemporaryDirectory();
+	const child = managedProcesses.spawnDaemon({
+		cmd: [
+			"bun",
+			"-e",
+			`const { loadWayCore } = await import("./src/native-loader.ts");
+const { createRpcBridge } = await import("./src/rpc-bridge.ts");
+const core = loadWayCore().WayCore.open(process.env.GAJAEWAY_STATE_DIR);
+core.startRpcServer(process.env.GAJAEWAY_RPC_SOCKET, createRpcBridge(core, () => {
+  const error = new Error("simulated bridge failure");
+  error.name = "SyntheticBridgeFailure";
+  error.reason = "growth_protocol_invalid";
+  throw error;
+}));
+process.once("SIGTERM", () => { core.shutdownRpcServer(); process.exit(0); });
+await new Promise(() => {});`,
+		],
+		cwd: process.cwd(),
+		env: {
+			...process.env,
+			GAJAEWAY_STATE_DIR: stateDirectory,
+			GAJAEWAY_RPC_SOCKET: path.join(stateDirectory, "rpc.sock"),
+		},
+		stderr: "pipe",
+	});
+	let client: RpcClient | undefined;
+	let correlationId: string | undefined;
+	let stderr = "";
+	try {
+		client = await connectEventually(path.join(stateDirectory, "rpc.sock"));
+		const response = await client.request("main.throw", {});
+		const data = response.error?.data;
+		if (typeof data !== "object" || data === null || Array.isArray(data)) throw new Error("bridge exception did not return object data");
+		const safeData = data as { correlation_id?: unknown; reason?: unknown };
+		if (typeof safeData.correlation_id !== "string" || safeData.reason !== "growth_protocol_invalid") {
+			throw new Error(`bridge exception returned unsafe data: ${JSON.stringify(data)}`);
+		}
+		if (Object.keys(data).sort().join(",") !== "correlation_id,reason") {
+			throw new Error(`bridge exception returned unexpected data fields: ${JSON.stringify(data)}`);
+		}
+		correlationId = safeData.correlation_id;
+		expect(response.error).toMatchObject({
+			code: -32603,
+			message: "bridge_exception",
+			data: { correlation_id: expect.stringMatching(/^rpc-/), reason: "growth_protocol_invalid" },
+		});
+	} finally {
+		client?.close();
+		await managedProcesses.stopDaemon(child);
+		stderr = await new Response(child.stderr).text();
+	}
+	expect(correlationId).toBeDefined();
+	expect(stderr).toContain(`correlation_id=${correlationId}`);
+	expect(stderr).toContain("reason=growth_protocol_invalid");
+	expect(stderr).toContain('error_type="SyntheticBridgeFailure"');
+	expect(stderr).toContain('message="simulated bridge failure"');
+	expect(stderr).toContain("stack=");
+}, 10_000);
+
 test("main.submit derives delivery only from profile ownership and turn state", async () => {
 	const server = await hostedServer();
 	try {
@@ -348,7 +462,7 @@ test("main.submit exposes a post-acceptance SDK failure through gateway health",
 		sdk.release();
 		await eventually(() => (server.host.degraded ? true : undefined), "host did not expose the accepted operation failure");
 		const health = await server.client.request("way.health", {});
-		expect(health.result).toMatchObject({ status: "healthy", state: "degraded", reason: "turn_execution_failed" });
+		expect(health.result).toMatchObject({ status: "unhealthy", state: "degraded", reason: "turn_execution_failed" });
 		expect(server.state.read().growthIntent).toBeUndefined();
 	} finally {
 		sdk.release();

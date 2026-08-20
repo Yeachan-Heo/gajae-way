@@ -44,9 +44,16 @@ pub struct BrokerSnapshot {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SnapshotApplyResult {
+    /// Newly observed rows, each of which has a discovered registry transition.
     pub new_session_ids: Vec<String>,
+    /// Rows with a journalled semantic transition; liveness-only updates are
+    /// excluded.
     pub changed_session_ids: Vec<String>,
+    /// Broker index changes remain visible to metadata scheduling even when they
+    /// are liveness churn.
     pub changed_index_seq_session_ids: Vec<String>,
+    /// Number of semantic transitions in this snapshot, not the number of
+    /// refreshed rows.
     pub drift_count: u64,
 }
 
@@ -385,12 +392,10 @@ fn status_from_broker(previous: &RegistryRow, row: &BrokerSessionRow) -> String 
         return "discovered".to_owned();
     }
     // Discovery deliberately retains `discovered` even when the first broker
-    // row includes activity. Reapplying that exact row must not reinterpret it
-    // as a new status transition on every reconciliation cycle.
-    if previous.status == "discovered"
-        && previous.activity_state == row.activity_state
-        && previous.activity_at == row.activity_at
-    {
+    // row includes activity. Heartbeats advance `activity_at` on every poll,
+    // so only an activity-state change can promote that discovery to a status
+    // transition.
+    if previous.status == "discovered" && previous.activity_state == row.activity_state {
         return previous.status.clone();
     }
     if let Some(activity_state) = &row.activity_state {
@@ -399,9 +404,20 @@ fn status_from_broker(previous: &RegistryRow, row: &BrokerSessionRow) -> String 
     previous.status.clone()
 }
 
-fn row_authority_changed(
+/// Returns whether a broker snapshot is semantically notable enough to journal.
+///
+/// Locator and endpoint identity, status, deletion/tombstoning, terminal
+/// uncertainty, ambiguity, and quarantine changes are authority transitions.
+/// `live`, `index_seq`, `activity_at`,
+/// `last_heartbeat_at`, and an `activity_state` that leaves status unchanged
+/// are routine liveness churn. Every successful snapshot still persists both
+/// groups and refreshes `last_seen_at`; churn deliberately leaves
+/// `registry_rev` unchanged because that revision tracks journalled semantic
+/// transitions rather than each broker poll.
+fn row_has_notable_transition(
     previous: &RegistryRow,
     next_status: &str,
+    next_quarantined: bool,
     row: &BrokerSessionRow,
 ) -> bool {
     previous.status != next_status
@@ -409,14 +425,10 @@ fn row_authority_changed(
         || previous.endpoint_generation != Some(row.endpoint_generation)
         || previous.host_incarnation != row.host_incarnation
         || previous.identity_provenance != row.identity_provenance
-        || previous.index_seq != Some(row.index_seq)
-        || previous.live != row.live
         || previous.deleted != row.deleted
         || previous.terminal_uncertain != row.terminal_uncertain
         || previous.ambiguous != row.ambiguous
-        || previous.activity_state != row.activity_state
-        || previous.activity_at != row.activity_at
-        || previous.last_heartbeat_at != row.last_heartbeat_at
+        || previous.quarantined != next_quarantined
 }
 
 fn transition_payload(
@@ -572,75 +584,79 @@ pub fn apply_broker_snapshot(
             }
             Some(previous) => {
                 let status = status_from_broker(&previous, broker_row);
-                let changed = row_authority_changed(&previous, &status, broker_row);
+                let quarantine_input_changed = previous.deleted != broker_row.deleted
+                    || previous.terminal_uncertain != broker_row.terminal_uncertain
+                    || previous.ambiguous != broker_row.ambiguous;
+                let quarantined = if quarantine_input_changed {
+                    let surface_bound = surface_bound_tx(
+                        &transaction,
+                        &broker_row.session_id,
+                        previous.surface_id.as_deref(),
+                    )?;
+                    quarantine_for(broker_row, surface_bound)
+                } else {
+                    previous.quarantined
+                };
+                let notable = row_has_notable_transition(&previous, &status, quarantined, broker_row);
+                let next_revision = if notable {
+                    previous
+                        .registry_rev
+                        .checked_add(1)
+                        .ok_or(RegistryError::Overflow)?
+                } else {
+                    previous.registry_rev
+                };
                 let closed_at = if matches!(status.as_str(), "closed" | "lost") {
                     previous.closed_at.or(Some(snapshot.observed_at))
                 } else {
                     None
                 };
-                if changed {
-                    let next_revision = previous
-                        .registry_rev
-                        .checked_add(1)
-                        .ok_or(RegistryError::Overflow)?;
-                    transaction.execute(
-                        "UPDATE sessions SET
+                transaction.execute(
+                    "UPDATE sessions SET
 							status = ?2, locator = ?3, endpoint_generation = ?4, host_incarnation = ?5,
 							identity_provenance = ?6, index_seq = ?7, live = ?8, deleted = ?9,
 							terminal_uncertain = ?10, ambiguous = ?11, activity_state = ?12,
 							activity_at = ?13, last_heartbeat_at = ?14, last_seen_at = ?15,
 							closed_at = ?16, registry_rev = ?17
 						WHERE session_id = ?1",
-                        params![
-                            broker_row.session_id,
-                            status,
-                            broker_row.locator,
-                            broker_row.endpoint_generation.to_string(),
-                            broker_row.host_incarnation,
-                            broker_row.identity_provenance,
-                            i64::try_from(broker_row.index_seq)
-                                .map_err(|_| RegistryError::Overflow)?,
-                            i64::from(broker_row.live),
-                            i64::from(broker_row.deleted),
-                            i64::from(broker_row.terminal_uncertain),
-                            i64::from(broker_row.ambiguous),
-                            broker_row.activity_state,
-                            broker_row.activity_at,
-                            broker_row.last_heartbeat_at,
-                            snapshot.observed_at,
-                            closed_at,
-                            i64::try_from(next_revision).map_err(|_| RegistryError::Overflow)?,
-                        ],
-                    )?;
-                    let surface_bound = surface_bound_tx(
-                        &transaction,
-                        &broker_row.session_id,
-                        previous.surface_id.as_deref(),
-                    )?;
+                    params![
+                        broker_row.session_id,
+                        status,
+                        broker_row.locator,
+                        broker_row.endpoint_generation.to_string(),
+                        broker_row.host_incarnation,
+                        broker_row.identity_provenance,
+                        i64::try_from(broker_row.index_seq).map_err(|_| RegistryError::Overflow)?,
+                        i64::from(broker_row.live),
+                        i64::from(broker_row.deleted),
+                        i64::from(broker_row.terminal_uncertain),
+                        i64::from(broker_row.ambiguous),
+                        broker_row.activity_state,
+                        broker_row.activity_at,
+                        broker_row.last_heartbeat_at,
+                        snapshot.observed_at,
+                        closed_at,
+                        i64::try_from(next_revision).map_err(|_| RegistryError::Overflow)?,
+                    ],
+                )?;
+                if previous.index_seq != Some(broker_row.index_seq) {
+                    result
+                        .changed_index_seq_session_ids
+                        .push(broker_row.session_id.clone());
+                }
+                if notable {
                     append_change(
                         &transaction,
                         &broker_row.session_id,
                         "broker_snapshot",
                         Some(&previous),
                         &status,
-                        quarantine_for(broker_row, surface_bound),
+                        quarantined,
                         next_revision,
                         snapshot.observed_at,
                     )?;
-                    if previous.index_seq != Some(broker_row.index_seq) {
-                        result
-                            .changed_index_seq_session_ids
-                            .push(broker_row.session_id.clone());
-                    }
-                    result
-                        .changed_session_ids
-                        .push(broker_row.session_id.clone());
+                    result.changed_session_ids.push(broker_row.session_id.clone());
                     result.drift_count += 1;
-                } else {
-                    transaction.execute(
-                        "UPDATE sessions SET last_seen_at = ?2 WHERE session_id = ?1",
-                        params![broker_row.session_id, snapshot.observed_at],
-                    )?;
                 }
             }
         }
@@ -820,15 +836,23 @@ pub fn apply_metadata(
     let transaction = connection.transaction()?;
     let previous =
         get_tx(&transaction, &enrichment.session_id)?.ok_or(RegistryError::UnknownSession)?;
-    let changed = previous.meta_name.as_deref() != Some(enrichment.name.as_str())
+    let metadata_changed = previous.meta_name.as_deref() != Some(enrichment.name.as_str())
         || previous.meta_cwd.as_deref() != Some(enrichment.cwd.as_str())
-        || previous.meta_kind.as_deref() != Some(enrichment.kind.as_str())
-        || previous.metadata_state != "enriched";
-    if changed {
-        let next_revision = previous
-            .registry_rev
-            .checked_add(1)
-            .ok_or(RegistryError::Overflow)?;
+        || previous.meta_kind.as_deref() != Some(enrichment.kind.as_str());
+    let metadata_state_changed = previous.metadata_state != "enriched";
+    if metadata_changed || metadata_state_changed {
+        // Metadata values must stay current for the rename SLA, but a rename
+        // within an already-enriched row is not a registry transition. The
+        // semantic revision and journal event advance only when metadata_state
+        // flips.
+        let next_revision = if metadata_state_changed {
+            previous
+                .registry_rev
+                .checked_add(1)
+                .ok_or(RegistryError::Overflow)?
+        } else {
+            previous.registry_rev
+        };
         transaction.execute(
             "UPDATE sessions SET meta_name = ?2, meta_cwd = ?3, meta_kind = ?4,
 				metadata_state = 'enriched', metadata_at = ?5, registry_rev = ?6 WHERE session_id = ?1",
@@ -841,16 +865,18 @@ pub fn apply_metadata(
                 i64::try_from(next_revision).map_err(|_| RegistryError::Overflow)?,
             ],
         )?;
-        append_change(
-            &transaction,
-            &enrichment.session_id,
-            "metadata_enriched",
-            Some(&previous),
-            &previous.status,
-            previous.quarantined,
-            next_revision,
-            enrichment.observed_at,
-        )?;
+        if metadata_state_changed {
+            append_change(
+                &transaction,
+                &enrichment.session_id,
+                "metadata_enriched",
+                Some(&previous),
+                &previous.status,
+                previous.quarantined,
+                next_revision,
+                enrichment.observed_at,
+            )?;
+        }
     } else {
         transaction.execute(
             "UPDATE sessions SET metadata_at = ?2 WHERE session_id = ?1",
@@ -1360,18 +1386,17 @@ mod tests {
     }
 
     #[test]
-    fn each_authority_field_change_emits_once_with_persisted_previous() {
-        let cases: [(&str, fn(&mut BrokerSessionRow)); 12] = [
-            ("live", |row| row.live = false),
-            ("activity_state", |row| row.activity_state = Some("idle".to_owned())),
-            ("activity_at", |row| row.activity_at = Some(20)),
-            ("index_seq", |row| row.index_seq = 2),
+    fn each_notable_broker_transition_emits_once_with_persisted_previous() {
+        let cases: [(&str, fn(&mut BrokerSessionRow)); 8] = [
+            ("status", |row| {
+                row.activity_state = Some("idle".to_owned());
+                row.activity_at = Some(20);
+            }),
             ("endpoint_generation", |row| row.endpoint_generation = 2),
             ("host_incarnation", |row| row.host_incarnation = Some("host:2".to_owned())),
             ("deleted", |row| row.deleted = true),
             ("terminal_uncertain", |row| row.terminal_uncertain = true),
             ("ambiguous", |row| row.ambiguous = true),
-            ("last_heartbeat_at", |row| row.last_heartbeat_at = Some(20)),
             (
                 "locator",
                 |row| row.locator = r#"{"repo":"/other","stateRoot":"/other/.gjc/state"}"#.to_owned(),
@@ -1406,11 +1431,7 @@ mod tests {
             .unwrap();
             assert!(applied.new_session_ids.is_empty(), "{field}");
             assert_eq!(applied.changed_session_ids, ["broker-1"], "{field}");
-            if field == "index_seq" {
-                assert_eq!(applied.changed_index_seq_session_ids, ["broker-1"]);
-            } else {
-                assert!(applied.changed_index_seq_session_ids.is_empty(), "{field}");
-            }
+            assert!(applied.changed_index_seq_session_ids.is_empty(), "{field}");
             assert_eq!(applied.drift_count, 1, "{field}");
 
             let current = get(&store, "broker-1").unwrap();
@@ -1447,7 +1468,36 @@ mod tests {
     }
 
     #[test]
-    fn metadata_changes_emit_once_with_persisted_previous() {
+    fn liveness_churn_persists_without_journal_events_or_revision_changes() {
+        let store = Store::default();
+        let mut row = broker_row("broker-1");
+        apply_snapshot(&store, 10, vec![row.clone()]);
+
+        for (observed_at, index_seq, live, activity_at, last_heartbeat_at) in [
+            (20, 2, false, 20, 20),
+            (30, 3, true, 30, 30),
+            (40, 4, false, 40, 40),
+        ] {
+            row.index_seq = index_seq;
+            row.live = live;
+            row.activity_at = Some(activity_at);
+            row.last_heartbeat_at = Some(last_heartbeat_at);
+            let applied = apply_snapshot(&store, observed_at, vec![row.clone()]);
+
+            assert!(applied.new_session_ids.is_empty());
+            assert!(applied.changed_session_ids.is_empty());
+            assert_eq!(applied.changed_index_seq_session_ids, ["broker-1"]);
+            assert_eq!(applied.drift_count, 0);
+            let current = get(&store, "broker-1").unwrap();
+            assert_broker_authority(&current, &row);
+            assert_eq!(current.last_seen_at, Some(observed_at));
+            assert_eq!(current.registry_rev, 1);
+            assert_eq!(registry_changes(&store).len(), 1);
+        }
+    }
+
+    #[test]
+    fn metadata_state_transitions_emit_once_while_renames_stay_quiet() {
         let store = Store::default();
         apply_broker_snapshot(
             &store,
@@ -1498,12 +1548,19 @@ mod tests {
             ..metadata
         };
         let renamed_row = apply_metadata(&store, renamed.clone()).unwrap();
-        assert_eq!(renamed_row.registry_rev, 3);
+        assert_eq!(renamed_row.meta_name.as_deref(), Some("after rename"));
+        assert_eq!(renamed_row.metadata_at, Some(40));
+        assert_eq!(renamed_row.registry_rev, 2);
+        assert_eq!(registry_changes(&store).len(), 2);
+
+        let unavailable = mark_metadata_unavailable(&store, "broker-1", 50).unwrap();
+        assert_eq!(unavailable.metadata_state, "unavailable");
+        assert_eq!(unavailable.registry_rev, 3);
         let changes = registry_changes(&store);
         assert_eq!(changes.len(), 3);
         assert_change(
             &changes[2],
-            "metadata_enriched",
+            "metadata_unavailable",
             "discovered",
             false,
             2,
@@ -1512,25 +1569,9 @@ mod tests {
             3,
         );
 
-        let unavailable = mark_metadata_unavailable(&store, "broker-1", 50).unwrap();
-        assert_eq!(unavailable.metadata_state, "unavailable");
-        assert_eq!(unavailable.registry_rev, 4);
-        let changes = registry_changes(&store);
-        assert_eq!(changes.len(), 4);
-        assert_change(
-            &changes[3],
-            "metadata_unavailable",
-            "discovered",
-            false,
-            3,
-            "discovered",
-            false,
-            4,
-        );
-
         let repeatedly_unavailable = mark_metadata_unavailable(&store, "broker-1", 60).unwrap();
-        assert_eq!(repeatedly_unavailable.registry_rev, 4);
-        assert_eq!(registry_changes(&store).len(), 4);
+        assert_eq!(repeatedly_unavailable.registry_rev, 3);
+        assert_eq!(registry_changes(&store).len(), 3);
 
         let recovered = apply_metadata(
             &store,
@@ -1541,18 +1582,18 @@ mod tests {
         )
         .unwrap();
         assert_eq!(recovered.metadata_state, "enriched");
-        assert_eq!(recovered.registry_rev, 5);
+        assert_eq!(recovered.registry_rev, 4);
         let changes = registry_changes(&store);
-        assert_eq!(changes.len(), 5);
+        assert_eq!(changes.len(), 4);
         assert_change(
-            &changes[4],
+            &changes[3],
             "metadata_enriched",
             "discovered",
             false,
-            4,
+            3,
             "discovered",
             false,
-            5,
+            4,
         );
 
         let repeatedly_recovered = apply_metadata(
@@ -1563,8 +1604,8 @@ mod tests {
             },
         )
         .unwrap();
-        assert_eq!(repeatedly_recovered.registry_rev, 5);
-        assert_eq!(registry_changes(&store).len(), 5);
+        assert_eq!(repeatedly_recovered.registry_rev, 4);
+        assert_eq!(registry_changes(&store).len(), 4);
     }
 
     #[test]

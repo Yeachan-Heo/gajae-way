@@ -19,17 +19,43 @@ export class RpcBridgeException extends Error {
 
 export type RpcBridgeHandler = (method: string, params: unknown) => unknown | Promise<unknown>;
 
-function errorPayload(error: unknown): { error: RpcBridgeError } {
-	if (error instanceof RpcBridgeException) {
-		return { error: { code: error.code, message: error.message, data: error.data } };
-	}
+function isSafeReason(value: unknown): value is string {
+	return typeof value === "string" && /^[a-z][a-z0-9_]{0,63}$/.test(value);
+}
+
+function recordReason(value: unknown): string | undefined {
+	if (typeof value !== "object" || value === null) return undefined;
+	const reason = (value as { reason?: unknown }).reason;
+	return isSafeReason(reason) ? reason : undefined;
+}
+
+function boundedDiagnosticText(value: string): string {
+	return value.slice(0, 16_384);
+}
+
+function bridgeExceptionPayload(error: unknown): RpcBridgeError {
+	const reason = recordReason(error) ?? (error instanceof RpcBridgeException ? recordReason(error.data) : undefined) ?? "bridge_exception";
+	const errorType =
+		error instanceof Error
+			? boundedDiagnosticText(error.name || error.constructor.name || "Error")
+			: boundedDiagnosticText(typeof error);
+	const message = boundedDiagnosticText(error instanceof Error ? error.message : String(error));
+	const stack = error instanceof Error && typeof error.stack === "string" ? boundedDiagnosticText(error.stack) : undefined;
 	return {
-		error: {
-			code: -32603,
-			message: "bridge_exception",
-			data: { detail: error instanceof Error ? error.message : String(error) },
+		code: -32603,
+		message: "bridge_exception",
+		data: {
+			reason,
+			diagnostic: { error_type: errorType, message, ...(stack ? { stack } : {}) },
 		},
 	};
+}
+
+function errorPayload(error: unknown): { error: RpcBridgeError } {
+	if (error instanceof RpcBridgeException && error.code !== -32603) {
+		return { error: { code: error.code, message: error.message, data: error.data } };
+	}
+	return { error: bridgeExceptionPayload(error) };
 }
 
 function unavailableHandler(method: string): { error: RpcBridgeError } {

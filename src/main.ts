@@ -19,7 +19,7 @@ import {
 } from "./main-session/closure";
 
 import { bootstrapMainSession, recoverBootstrap } from "./main-session/bootstrap";
-import { createMainSessionHost, type MainSessionHost } from "./main-session/host";
+import { createMainSessionHost, type MainSessionHost, type MainSessionJournal } from "./main-session/host";
 import { approveProfile, previewProfileApproval } from "./main-session/profile-approval";
 import { ResumeError, strictResumeMainSession } from "./main-session/resume";
 import { createPublishedSdk, type HostedSdkSession, type MainSessionSdk } from "./main-session/sdk";
@@ -180,6 +180,51 @@ async function writeHealthFile(stateDirectory: string, payload: Record<string, u
 	const temporary = `${destination}.tmp.${process.pid}`;
 	await fsp.writeFile(temporary, `${JSON.stringify(payload)}\n`, { encoding: "utf8", mode: 0o600 });
 	await fsp.rename(temporary, destination);
+}
+
+function createRuntimeMainSessionJournal(
+	core: WayCoreHandle,
+	stateDirectory: string,
+	gatewayState: GatewayStateStore,
+): MainSessionJournal {
+	return {
+		journalAppend: (kind, payloadJson) => core.journalAppend(kind, payloadJson),
+		setRpcHealth: (state, reason) => {
+			let healthState: "degraded" | "failed_closed" = state;
+			let healthReason = reason;
+			try {
+				const durable = gatewayState.read();
+				if (durable.bootstrapState === "FAILED_CLOSED" || durable.failedClosedReason) {
+					healthState = "failed_closed";
+					healthReason = durable.failedClosedReason ?? reason;
+				}
+			} catch {
+				// The host's explicit degradation remains safer than reporting healthy.
+			}
+			try {
+				core.setRpcHealth(healthState, healthReason);
+			} finally {
+				void writeHealthFile(stateDirectory, { status: "unhealthy", state: healthState, reason: healthReason }).catch(error => {
+					console.error(`Could not write ${healthState} health file: ${error instanceof Error ? error.message : String(error)}`);
+				});
+			}
+		},
+		setMainSessionStatus: (turnState, followUpQueueDepth) => core.setMainSessionStatus(turnState, followUpQueueDepth),
+		setJournalDegraded: degraded => core.setJournalDegraded(degraded),
+	};
+}
+
+async function publishHostUnavailableHealth(core: WayCoreHandle): Promise<void> {
+	try {
+		core.setRpcHealth("degraded", "host_disposed");
+	} catch {
+		// The state file remains the final observable signal when the RPC listener is already gone.
+	}
+	try {
+		await writeHealthFile(core.stateDir, { status: "unhealthy", state: "degraded", reason: "host_disposed" });
+	} catch (error) {
+		console.error(`Could not write degraded health file: ${error instanceof Error ? error.message : String(error)}`);
+	}
 }
 
 async function enterFailedClosed(
@@ -922,7 +967,11 @@ async function disposeMainSession(core: WayCoreHandle, host: MainSessionHost): P
 	try {
 		await host.dispose();
 	} finally {
-		core.resetMainSessionStatus();
+		try {
+			core.resetMainSessionStatus();
+		} finally {
+			if (!host.degraded) await publishHostUnavailableHealth(core);
+		}
 	}
 }
 
@@ -1034,7 +1083,7 @@ async function serveWay(config: WayConfig): Promise<void> {
 			session: resumed.session,
 			identity: resumed.identity,
 			state,
-			journal: core,
+			journal: createRuntimeMainSessionJournal(core, config.stateDir, state),
 		});
 		resumedSession = undefined;
 		const admissionHandler = createMainAdmissionHandler(host, profile, core, {

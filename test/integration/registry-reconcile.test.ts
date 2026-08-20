@@ -13,6 +13,7 @@ import { RpcClient } from "../helpers/rpc-client";
 
 const temporaryDirectories: string[] = [];
 const fixtureScript = path.join(import.meta.dir, "..", "fixtures", "fake-broker-cli.mjs");
+const runRealBrokerLivenessIntegration = Bun.env.GAJAEWAY_BROKER_RECONCILE_INTEGRATION === "1" && Bun.which("gjc") !== null;
 
 afterEach(() => {
 	for (const directory of temporaryDirectories.splice(0)) fs.rmSync(directory, { recursive: true, force: true });
@@ -96,6 +97,56 @@ function list(sessions: readonly SdkSessionRowV1[], indexSeq = 1): unknown {
 	};
 }
 
+function registrySnapshotRows(sessions: readonly SdkSessionRowV1[]) {
+	return sessions.map(session => ({
+		sessionId: session.sessionId,
+		locator: JSON.stringify(session.locator),
+		endpointGeneration: session.endpointGeneration,
+		...(session.hostIncarnation === undefined ? {} : { hostIncarnation: session.hostIncarnation }),
+		...(session.identityProvenance === undefined ? {} : { identityProvenance: session.identityProvenance }),
+		indexSeq: session.indexSeq,
+		live: session.live,
+		deleted: session.deleted,
+		terminalUncertain: session.terminalUncertain ?? false,
+		ambiguous: session.ambiguous ?? false,
+		...(session.activity === undefined ? {} : { activityState: session.activity.state, activityAt: session.activity.at }),
+		...(session.lastHeartbeatAt === undefined ? {} : { lastHeartbeatAt: session.lastHeartbeatAt }),
+	}));
+}
+
+function sameNotableBrokerFields(left: SdkSessionRowV1, right: SdkSessionRowV1): boolean {
+	return JSON.stringify({
+		sessionId: left.sessionId,
+		locator: left.locator,
+		endpointGeneration: left.endpointGeneration,
+		hostIncarnation: left.hostIncarnation,
+		identityProvenance: left.identityProvenance,
+		deleted: left.deleted,
+		terminalUncertain: left.terminalUncertain ?? false,
+		ambiguous: left.ambiguous ?? false,
+		activityState: left.activity?.state,
+	}) === JSON.stringify({
+		sessionId: right.sessionId,
+		locator: right.locator,
+		endpointGeneration: right.endpointGeneration,
+		hostIncarnation: right.hostIncarnation,
+		identityProvenance: right.identityProvenance,
+		deleted: right.deleted,
+		terminalUncertain: right.terminalUncertain ?? false,
+		ambiguous: right.ambiguous ?? false,
+		activityState: right.activity?.state,
+	});
+}
+
+function livenessFieldsChanged(left: SdkSessionRowV1, right: SdkSessionRowV1): boolean {
+	return (
+		left.live !== right.live ||
+		left.indexSeq !== right.indexSeq ||
+		left.activity?.at !== right.activity?.at ||
+		left.lastHeartbeatAt !== right.lastHeartbeatAt
+	);
+}
+
 function metadata(sessionId: string, name = sessionId): object {
 	return { sessionId, name, cwd: "/fixture/repo", kind: "main" };
 }
@@ -146,29 +197,92 @@ function metadataName(core: WayCoreHandle, sessionId: string): string | undefine
 	}
 }
 
-test("unchanged broker snapshots emit no journal events after discovery", async () => {
-	const fixture = createFixture("unchanged-snapshot", {
+test("liveness-only broker snapshots stay journal-quiet while persisting freshness", async () => {
+	let now = 10_000;
+	const fixture = createFixture("liveness-churn", {
 		list: list([row("steady")]),
 		metadata: { steady: metadata("steady") },
 	});
-	const reconciler = new BrokerReconciler({ core: fixture.core, broker: fixture.broker, cycleSlaMs: 2_000 });
+	const socketPath = path.join(fixture.root, "state", "rpc.sock");
+	fixture.core.startRpcServer(
+		socketPath,
+		createRpcBridge(fixture.core, () => {
+			throw new RpcBridgeException(-32601, "method not found");
+		}),
+	);
+	const client = await connectEventually(socketPath);
+	const reconciler = new BrokerReconciler({ core: fixture.core, broker: fixture.broker, cycleSlaMs: 2_000, now: () => now });
+	try {
+		await reconciler.trigger();
+		const afterFirstCycle = fixture.core.journalRead("1:0", 100).nextCursor;
+		const firstRow = fixture.core.registryGet("steady");
+		const firstChanges = fixture.core
+			.journalRead("1:0", 100)
+			.events.filter(event => event.kind === "registry_change")
+			.map(event => JSON.parse(event.payloadJson) as { session_id: string; reason: string });
+		expect(firstChanges.filter(change => change.session_id === "steady" && change.reason === "discovered")).toHaveLength(1);
 
-	await reconciler.trigger();
-	const afterFirstCycle = fixture.core.journalRead("1:0", 100).nextCursor;
-	const firstRow = fixture.core.registryGet("steady");
-	const firstChanges = fixture.core
-		.journalRead("1:0", 100)
-		.events.filter(event => event.kind === "registry_change")
-		.map(event => JSON.parse(event.payloadJson) as { session_id: string; reason: string });
-	expect(firstChanges.filter(change => change.session_id === "steady" && change.reason === "discovered")).toHaveLength(1);
+		for (const expectedLivenessAt of [101, 102, 103]) {
+			now += 1_000;
+			const cycle = await reconciler.trigger();
+			expect(cycle.driftCount).toBe(0);
+			expect(fixture.core.registryGet("steady")).toMatchObject({
+				activityAt: expectedLivenessAt,
+				lastHeartbeatAt: expectedLivenessAt,
+				indexSeq: 1,
+				lastSeenAt: now,
+				registryRev: firstRow.registryRev,
+			});
+		}
 
-	await reconciler.trigger();
-	await reconciler.trigger();
-	await reconciler.trigger();
-
-	expect(fixture.core.registryGet("steady").registryRev).toBe(firstRow.registryRev);
-	expect(fixture.core.journalRead(afterFirstCycle, 100).events).toEqual([]);
+		expect(fixture.core.journalRead(afterFirstCycle, 100).events).toEqual([]);
+		expect(readState(fixture.statePath).list).toMatchObject({
+			result: { indexSeq: 5, sessions: [expect.objectContaining({ activity: { state: "active", at: 104 }, lastHeartbeatAt: 104 })] },
+		});
+		const status = await client.request("way.status");
+		expect(status.result).toMatchObject({ reconcile: { last_ok_at: now, drift_count: 0 } });
+	} finally {
+		client.close();
+		fixture.core.shutdownRpcServer();
+	}
 });
+
+(runRealBrokerLivenessIntegration ? test : test.skip)(
+	"real broker liveness-only rows produce no registry changes across polls",
+	async () => {
+		const broker = new BrokerCli();
+		const before = await broker.listSessions();
+		await Bun.sleep(16_000);
+		const after = await broker.listSessions();
+		const beforeById = new Map(before.sessions.map(session => [session.sessionId, session]));
+		const livenessOnlyAfter = after.sessions.filter(session => {
+			const previous = beforeById.get(session.sessionId);
+			return previous !== undefined && sameNotableBrokerFields(previous, session) && livenessFieldsChanged(previous, session);
+		});
+		expect(livenessOnlyAfter.length).toBeGreaterThan(0);
+
+		const selectedIds = new Set(livenessOnlyAfter.map(session => session.sessionId));
+		const livenessOnlyBefore = before.sessions.filter(session => selectedIds.has(session.sessionId));
+		expect(livenessOnlyBefore).toHaveLength(livenessOnlyAfter.length);
+		const root = temporaryDirectory("real-broker-liveness");
+		const core = loadWayCore().WayCore.open(path.join(root, "state"));
+		core.registryApplyBrokerSnapshot({ observedAt: 1, rows: registrySnapshotRows(livenessOnlyBefore) });
+		const afterDiscovery = core.journalRead("1:0", 500).nextCursor;
+
+		const applied = core.registryApplyBrokerSnapshot({ observedAt: 2, rows: registrySnapshotRows(livenessOnlyAfter) });
+		expect(applied).toMatchObject({ changedSessionIds: [], driftCount: 0 });
+		expect(core.journalRead(afterDiscovery, 500).events.filter(event => event.kind === "registry_change")).toEqual([]);
+		const expected = livenessOnlyAfter[0];
+		if (!expected) throw new Error("Expected a liveness-only broker row.");
+		expect(core.registryGet(expected.sessionId)).toMatchObject({
+			live: expected.live,
+			indexSeq: expected.indexSeq,
+			...(expected.activity === undefined ? {} : { activityState: expected.activity.state, activityAt: expected.activity.at }),
+			...(expected.lastHeartbeatAt === undefined ? {} : { lastHeartbeatAt: expected.lastHeartbeatAt }),
+		});
+	},
+	60_000,
+);
 
 test("reconciliation reflects rename within the shortened poll SLA and preserves list-only authority changes", async () => {
 	const fixture = createFixture("rename-authority", {

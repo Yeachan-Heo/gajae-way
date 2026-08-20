@@ -4,7 +4,7 @@ import { stdout } from "node:process";
 import { RpcJournalConsumer, type RpcJournalEvent } from "../journal-consumer";
 import type { WayConfig } from "../config";
 import { loadWayProfile, type WayProfile } from "../profile";
-import { RpcClient, rpcResult, type JsonRpcClient } from "../rpc-client";
+import { RpcClient, RpcResponseError, rpcResult, type JsonRpcClient } from "../rpc-client";
 import {
 	MAX_RAW_CONSOLE_LINE_BYTES,
 	MAX_RAW_CONSOLE_QUEUED_BYTES,
@@ -30,13 +30,29 @@ export const GAJAEWAY_CONSOLE_EVENT_KINDS = [
 	"health_change",
 	"lock_event",
 ] as const;
+
+export const GAJAEWAY_JOURNAL_EVENT_KINDS = [
+	...GAJAEWAY_CONSOLE_EVENT_KINDS,
+	"registry_change",
+	"follow_up_attempted",
+	"follow_up_confirmed",
+	"profile_approved",
+] as const;
+export const GAJAEWAY_JOURNAL_DEFAULT_KINDS = GAJAEWAY_JOURNAL_EVENT_KINDS.filter(
+	(kind) => kind !== "registry_change",
+);
 export const DEFAULT_CONSOLE_CLAIM_TTL_MS = 5_000;
 export const DEFAULT_CONSOLE_READ_WAIT_MS = 1_000;
 export const DEFAULT_CONSOLE_EXIT_DRAIN_MS = 2_000;
+export const DEFAULT_CONSOLE_STATUS_POLL_MS = 1_000;
+const DEFAULT_CONSOLE_STATUS_REQUEST_TIMEOUT_MS = 2_000;
+const MAX_CONSOLE_JOURNAL_TAIL_EVENTS = 100;
+const DEFAULT_CONSOLE_JOURNAL_TAIL_EVENTS = 20;
 const MAX_CONSOLE_INPUT_OPERATIONS = 16;
 const MAX_CONSOLE_EXIT_DIAGNOSTIC_MS = 250;
 
 export type WayConsoleEventKind = (typeof GAJAEWAY_CONSOLE_EVENT_KINDS)[number];
+export type WayJournalEventKind = (typeof GAJAEWAY_JOURNAL_EVENT_KINDS)[number];
 export type ConsoleConsumerRunResult = "rendered" | "idle";
 type RecordValue = Record<string, unknown>;
 type ConsoleWrite = (text: string) => void | Promise<void>;
@@ -135,6 +151,8 @@ export interface RunWayConsoleDependencies {
 	readonly idempotencyKey?: () => string;
 	/** Test seam for bounded graceful exit behavior. */
 	readonly exitDrainMs?: number;
+	/** Test seam for bounded live gateway-status polling. */
+	readonly statusPollMs?: number;
 }
 
 interface MainSubmitResult {
@@ -184,7 +202,7 @@ function rawStringValue(value: unknown, fallback = "unknown"): string {
 }
 
 function stringValue(value: unknown, fallback = "unknown"): string {
-	return sanitizeConsoleText(rawStringValue(value, fallback));
+	return boundedConsoleText(rawStringValue(value, fallback));
 }
 
 function booleanValue(value: unknown): string {
@@ -193,6 +211,48 @@ function booleanValue(value: unknown): string {
 
 function integerValue(value: unknown): string {
 	return typeof value === "number" && Number.isFinite(value) ? String(value) : "unknown";
+}
+
+const MAX_CONSOLE_COMPACT_VALUE_CHARS = 512;
+const MAX_CONSOLE_STATUS_CONSUMERS = 8;
+
+function boundedConsoleText(value: string, maximum = MAX_CONSOLE_COMPACT_VALUE_CHARS): string {
+	const sanitized = sanitizeConsoleText(value);
+	return sanitized.length <= maximum ? sanitized : `${sanitized.slice(0, Math.max(0, maximum - 1))}…`;
+}
+
+function compactGatewayValue(value: unknown, maximum = MAX_CONSOLE_COMPACT_VALUE_CHARS): string {
+	try {
+		return boundedConsoleText(JSON.stringify(value) ?? String(value), maximum);
+	} catch {
+		return "[unserializable gateway payload]";
+	}
+}
+
+function renderConsumerCheckpoints(value: unknown): string {
+	if (!Array.isArray(value) || value.length === 0) return "none";
+	const checkpoints = value.slice(0, MAX_CONSOLE_STATUS_CONSUMERS).map((candidate) => {
+		const checkpoint = recordValue(candidate);
+		const consumerId = boundedConsoleText(rawStringValue(checkpoint.consumer_id), 64);
+		const cursor = boundedConsoleText(rawStringValue(checkpoint.cursor), 64);
+		return `${consumerId}@${cursor}${typeof checkpoint.claim_id === "string" ? "(claimed)" : ""}`;
+	});
+	const remainder = value.length - checkpoints.length;
+	return `${checkpoints.join(", ")}${remainder > 0 ? ` (+${remainder} more)` : ""}`;
+}
+
+function stableStatusFingerprint(value: unknown): string {
+	if (Array.isArray(value)) return `[${value.map(stableStatusFingerprint).join(",")}]`;
+	if (!isRecord(value)) return JSON.stringify(value) ?? "undefined";
+	return `{${Object.keys(value)
+		.filter((key) => key !== "uptime_ms")
+		.sort()
+		.map((key) => `${JSON.stringify(key)}:${stableStatusFingerprint(value[key])}`)
+		.join(",")}}`;
+}
+
+function statusFingerprint(health: RecordValue, status: RecordValue): string {
+	return stableStatusFingerprint({ health, status });
 }
 
 function firstString(records: readonly RecordValue[], key: string): string | undefined {
@@ -273,7 +333,7 @@ export function consoleStartupDecision(healthPayload: unknown, statusPayload: un
 	return { interactive: true };
 }
 
-/** Renders the state required before an owner can trust an interactive prompt. */
+/** Renders the live gateway state shown by the cockpit status rail. */
 export function renderConsoleStatusSummary(healthPayload: unknown, statusPayload: unknown, now = Date.now()): string {
 	const health = recordValue(healthPayload);
 	const status = recordValue(statusPayload);
@@ -297,11 +357,12 @@ export function renderConsoleStatusSummary(healthPayload: unknown, statusPayload
 			: "none";
 	return [
 		"Gateway status",
-		`  daemon: status=${stringValue(health.status)} state=${stringValue(health.state)}${reason ? ` reason=${sanitizeConsoleText(reason)}` : ""}`,
+		`  daemon: status=${stringValue(health.status)} state=${stringValue(health.state)}${reason ? ` reason=${boundedConsoleText(reason)}` : ""}`,
 		`  main: resumed=${booleanValue(main.resumed)} session_id=${stringValue(main.session_id, "none")} turn_state=${stringValue(status.turn_state)} follow_up_queue_depth=${integerValue(status.follow_up_queue_depth)}`,
 		`  journal: head_cursor=${stringValue(journal.head_cursor)} degraded=${booleanValue(journal.degraded)}`,
 		`  lock: held=${booleanValue(lock.held)} holder=${holderDescription} queue_len=${integerValue(lock.queue_len)} stuck=${booleanValue(lock.stuck)} quarantined=${booleanValue(lock.quarantined)} write_mode=${booleanValue(status.write_mode)}`,
 		`  reconcile: ${reconcileFreshness} drift_count=${integerValue(reconcile.drift_count)}`,
+		`  consumers: ${renderConsumerCheckpoints(status.consumers)}`,
 	].join("\n");
 }
 
@@ -310,6 +371,163 @@ function renderReconcileFreshness(lastOkAt: number | undefined, cycleMs: number 
 	const ageMs = Math.max(0, now - lastOkAt);
 	const staleAfterMs = Math.max((cycleMs ?? 15_000) * 2, 30_000);
 	return `freshness=${ageMs <= staleAfterMs ? "fresh" : "stale"} last_ok_at=${lastOkAt} age_ms=${ageMs} cycle_ms=${cycleMs ?? "unknown"}`;
+}
+
+interface GatewayStatusSnapshot {
+	readonly health: RecordValue;
+	readonly status: RecordValue;
+}
+
+interface JournalTailRequest {
+	readonly kinds: readonly WayJournalEventKind[] | undefined;
+	readonly count: number;
+}
+
+interface JournalTailEvent {
+	readonly seq: string | number;
+	readonly kind: WayJournalEventKind;
+	readonly payload: unknown;
+}
+
+interface JournalTailResult {
+	readonly events: readonly JournalTailEvent[];
+	readonly nextCursor: string;
+	readonly gap?: { readonly missingFrom: string; readonly missingTo: string; readonly resyncCursor: string };
+}
+
+type LockCommand =
+	| { readonly action: "status" }
+	| { readonly action: "force-release"; readonly leaseId: string; readonly confirmation: string; readonly confirmed: boolean }
+	| { readonly action: "clear-quarantine"; readonly receiptId: string; readonly confirmation: string; readonly confirmed: boolean };
+
+function parseJournalTailCommand(command: string): JournalTailRequest {
+	const argument = command.slice("/journal".length).trim();
+	if (!argument) return { kinds: GAJAEWAY_JOURNAL_DEFAULT_KINDS, count: DEFAULT_CONSOLE_JOURNAL_TAIL_EVENTS };
+	const fields = argument.split(/\s+/u);
+	if (fields.length > 2) throw new WayConsoleError("Usage: /journal [all|kind[,kind...]] [count]");
+	if (/^\d+$/u.test(fields[0] as string)) {
+		if (fields.length !== 1) throw new WayConsoleError("Usage: /journal [all|kind[,kind...]] [count]");
+		return { kinds: GAJAEWAY_JOURNAL_DEFAULT_KINDS, count: parseJournalTailCount(fields[0] as string) };
+	}
+	const kinds = parseJournalKinds(fields[0] as string);
+	return { kinds, count: fields[1] === undefined ? DEFAULT_CONSOLE_JOURNAL_TAIL_EVENTS : parseJournalTailCount(fields[1]) };
+}
+
+function parseJournalTailCount(value: string): number {
+	if (!/^[1-9]\d*$/u.test(value)) throw new WayConsoleError(`Journal count must be an integer in 1..=${MAX_CONSOLE_JOURNAL_TAIL_EVENTS}.`);
+	const count = Number(value);
+	if (!Number.isSafeInteger(count) || count > MAX_CONSOLE_JOURNAL_TAIL_EVENTS) {
+		throw new WayConsoleError(`Journal count must be an integer in 1..=${MAX_CONSOLE_JOURNAL_TAIL_EVENTS}.`);
+	}
+	return count;
+}
+
+function parseJournalKinds(value: string): readonly WayJournalEventKind[] | undefined {
+	if (value === "all") return undefined;
+	const kinds = value.split(",").map((kind) => kind.trim());
+	if (kinds.some((kind) => !GAJAEWAY_JOURNAL_EVENT_KINDS.includes(kind as WayJournalEventKind))) {
+		throw new WayConsoleError(`Unsupported journal kind. Supported kinds: ${GAJAEWAY_JOURNAL_EVENT_KINDS.join(", ")}, or all.`);
+	}
+	if (new Set(kinds).size !== kinds.length) throw new WayConsoleError("Journal kinds must not contain duplicates.");
+	return kinds as WayJournalEventKind[];
+}
+
+function journalTailCursor(headCursor: unknown, count: number): string {
+	const match = /^(\d+):(\d+)$/u.exec(rawStringValue(headCursor, ""));
+	if (!match) throw new WayConsoleError("way.status returned an invalid journal head_cursor.");
+	const generation = match[1] as string;
+	const head = BigInt(match[2] as string);
+	const start = head > BigInt(count) ? head - BigInt(count) : 0n;
+	return `${generation}:${start}`;
+}
+
+function parseJournalTailResult(value: unknown): JournalTailResult {
+	const result = recordValue(value);
+	if (!Array.isArray(result.events) || typeof result.next_cursor !== "string") {
+		throw new WayConsoleError("main.events.read returned an invalid journal-tail response.");
+	}
+	const events = result.events.map((candidate): JournalTailEvent => {
+		const event = recordValue(candidate);
+		const kind = rawStringValue(event.kind, "");
+		if (!GAJAEWAY_JOURNAL_EVENT_KINDS.includes(kind as WayJournalEventKind)) {
+			throw new WayConsoleError(`main.events.read returned an unsupported journal event kind: ${boundedConsoleText(kind)}.`);
+		}
+		if (typeof event.seq !== "string" && typeof event.seq !== "number") {
+			throw new WayConsoleError("main.events.read returned a journal event without a sequence.");
+		}
+		sequenceString(event.seq);
+		return { seq: event.seq, kind: kind as WayJournalEventKind, payload: event.payload };
+	});
+	const gap = result.gap === undefined ? undefined : recordValue(result.gap);
+	if (gap && (typeof gap.missing_from !== "string" || typeof gap.missing_to !== "string" || typeof gap.resync_cursor !== "string")) {
+		throw new WayConsoleError("main.events.read returned an invalid journal retention gap.");
+	}
+	return {
+		events,
+		nextCursor: result.next_cursor,
+		...(gap
+			? { gap: { missingFrom: gap.missing_from as string, missingTo: gap.missing_to as string, resyncCursor: gap.resync_cursor as string } }
+			: {}),
+	};
+}
+
+function parseLockCommand(command: string): LockCommand {
+	const argument = command.slice("/lock".length).trim();
+	if (argument === "status") return { action: "status" };
+	const forceRelease = /^force-release\s+(\S+)(?:\s+(.+))?$/u.exec(argument);
+	if (forceRelease) {
+		const leaseId = forceRelease[1] as string;
+		const typed = (forceRelease[2] ?? "").trim();
+		const confirmation = `CONFIRM FORCE-RELEASE ${leaseId}`;
+		return { action: "force-release", leaseId, confirmation, confirmed: typed === confirmation };
+	}
+	const clearQuarantine = /^clear-quarantine\s+(\S+)(?:\s+(.+))?$/u.exec(argument);
+	if (clearQuarantine) {
+		const receiptId = clearQuarantine[1] as string;
+		const typed = (clearQuarantine[2] ?? "").trim();
+		const confirmation = `CONFIRM CLEAR-QUARANTINE ${receiptId}`;
+		return { action: "clear-quarantine", receiptId, confirmation, confirmed: typed === confirmation };
+	}
+	throw new WayConsoleError(
+		"Usage: /lock status | /lock force-release <lease_id> CONFIRM FORCE-RELEASE <lease_id> | /lock clear-quarantine <verification_receipt_id> CONFIRM CLEAR-QUARANTINE <verification_receipt_id>",
+	);
+}
+
+function parseRegistryRows(value: unknown): { readonly rows: readonly RecordValue[]; readonly total: number } {
+	const result = recordValue(value);
+	if (!Array.isArray(result.rows) || typeof result.total !== "number" || !Number.isFinite(result.total)) {
+		throw new WayConsoleError("registry.list returned an invalid response.");
+	}
+	return { rows: result.rows.map(recordValue), total: result.total };
+}
+
+function parseRegistryRow(value: unknown): RecordValue {
+	const result = recordValue(value);
+	const row = recordValue(result.row);
+	if (typeof row.session_id !== "string" || !row.session_id) throw new WayConsoleError("registry.get returned an invalid response.");
+	return row;
+}
+
+function renderRegistryRow(row: RecordValue): string {
+	const locator = recordValue(row.locator);
+	return `id=${boundedConsoleText(rawStringValue(row.session_id))} status=${boundedConsoleText(rawStringValue(row.status))} live=${booleanValue(row.live)} quarantined=${booleanValue(row.quarantined)} repo=${boundedConsoleText(rawStringValue(locator.repo, "none"), 160)}`;
+}
+
+function renderLockStatus(value: unknown): string {
+	const status = recordValue(value);
+	const holder = recordValue(status.holder);
+	const leaseId = holder.lease_id ? boundedConsoleText(rawStringValue(holder.lease_id), 160) : "none";
+	const sessionId = holder.session_id ? boundedConsoleText(rawStringValue(holder.session_id), 160) : "none";
+	return [
+		"Git lock status",
+		`  held=${booleanValue(status.held)} lease_id=${leaseId} session_id=${sessionId} queue_len=${Array.isArray(status.queue) ? status.queue.length : "unknown"}`,
+		`  stuck=${booleanValue(status.stuck)} quarantined=${booleanValue(status.quarantined)} fencing_token=${boundedConsoleText(rawStringValue(status.fencing_token, "none"), 160)}`,
+	].join("\n");
+}
+
+function serverRefusalMessage(error: unknown): string {
+	if (error instanceof RpcResponseError) return boundedConsoleText(error.message.replace(/^RPC\s+\S+\s+failed:\s+-?\d+\s+/u, ""));
+	return boundedConsoleText(asError(error).message);
 }
 
 /** Resolves only a configured owner surface; an ambiguous profile needs an explicit selection. */
@@ -387,7 +605,7 @@ export class ConsoleEventConsumer {
 	}
 }
 
-/** Owner-facing operations and rendering; all stateful behavior remains on the gateway. */
+/** Gateway-cockpit operations and rendering; all stateful behavior remains on the gateway. */
 export class OwnerConsole {
 	readonly #rpc: JsonRpcClient;
 	readonly #ownerSurfaceId: string;
@@ -397,6 +615,8 @@ export class OwnerConsole {
 	readonly #onEvent: ((event: ConsoleEventFrame) => void | Promise<void>) | undefined;
 	#deliveryReady = false;
 	#deliveryFailure: ConsoleDeliveryUnavailableError | undefined;
+	#lastStatusFingerprint: string | undefined;
+	#lastStatusPollFailure: string | undefined;
 
 	constructor(options: OwnerConsoleOptions) {
 		if (!options.ownerSurfaceId.trim()) throw new WayConsoleError("Console owner surface id must not be empty.");
@@ -425,6 +645,7 @@ export class OwnerConsole {
 			]);
 			health = recordValue(healthPayload);
 			status = recordValue(statusPayload);
+			this.#lastStatusFingerprint = statusFingerprint(health, status);
 		} catch (error) {
 			const refusal = `Refusing interactive console: unable to inspect the gateway over its owner socket: ${asError(error).message}`;
 			await this.writeRefusal(refusal);
@@ -499,12 +720,126 @@ export class OwnerConsole {
 		return result;
 	}
 
-	async refreshStatus(): Promise<void> {
-		const [health, status] = await Promise.all([
-			rpcResult<unknown>(await this.#rpc.request("way.health", {}, { timeoutMs: 5_000 }), "way.health"),
-			rpcResult<unknown>(await this.#rpc.request("way.status", {}, { timeoutMs: 5_000 }), "way.status"),
-		]);
-		await this.#output.writeFrame(`${renderConsoleStatusSummary(health, status)}\n`);
+	async refreshStatus(options: { readonly onlyIfChanged?: boolean; readonly signal?: AbortSignal } = {}): Promise<boolean> {
+		const snapshot = await this.#readStatus(options.signal);
+		const fingerprint = statusFingerprint(snapshot.health, snapshot.status);
+		this.#lastStatusPollFailure = undefined;
+		if (options.onlyIfChanged && fingerprint === this.#lastStatusFingerprint) return false;
+		this.#lastStatusFingerprint = fingerprint;
+		await this.writeStatusSummary(snapshot.health, snapshot.status);
+		return true;
+	}
+
+	/** Polls health/status without changing admission or consumer ownership. */
+	async pollStatus(signal?: AbortSignal): Promise<void> {
+		try {
+			await this.refreshStatus({ onlyIfChanged: true, signal });
+		} catch (error) {
+			if (signal?.aborted) return;
+			const reason = boundedConsoleText(asError(error).message);
+			if (reason === this.#lastStatusPollFailure) return;
+			this.#lastStatusPollFailure = reason;
+			await this.#output.writeFrame(`Gateway status poll unavailable: ${reason}\n`);
+		}
+	}
+
+	async tailJournal(request: JournalTailRequest): Promise<void> {
+		this.assertDeliveryReady();
+		const snapshot = await this.#readStatus();
+		const cursor = journalTailCursor(recordValue(snapshot.status.journal).head_cursor, request.count);
+		const read = parseJournalTailResult(
+			rpcResult<unknown>(
+				await this.#rpc.request("main.events.read", {
+					cursor,
+					limit: request.count,
+					wait_ms: 0,
+					...(request.kinds === undefined ? {} : { kinds: request.kinds }),
+				}),
+				"main.events.read",
+			),
+		);
+		const kinds = request.kinds?.join(",") ?? "all";
+		if (read.gap) {
+			await this.#output.writeFrame(
+				`Journal tail retention gap: missing_from=${boundedConsoleText(read.gap.missingFrom)} missing_to=${boundedConsoleText(read.gap.missingTo)} resync_cursor=${boundedConsoleText(read.gap.resyncCursor)}\n`,
+			);
+			return;
+		}
+		const lines = read.events.map((event) => `  ${sequenceString(event.seq)} ${event.kind} ${compactGatewayValue(event.payload)}`);
+		await this.#output.writeFrame(
+			`Journal tail: kinds=${kinds} requested=${request.count} received=${read.events.length} next_cursor=${boundedConsoleText(read.nextCursor)}\n${lines.length > 0 ? `${lines.join("\n")}\n` : "  (no matching events)\n"}`,
+		);
+	}
+
+	async listRegistry(): Promise<void> {
+		this.assertDeliveryReady();
+		const listed = parseRegistryRows(rpcResult<unknown>(await this.#rpc.request("registry.list", { limit: 100 }), "registry.list"));
+		const rows = listed.rows.map((row) => `  ${renderRegistryRow(row)}`);
+		await this.#output.writeFrame(`Registry list: total=${integerValue(listed.total)} shown=${rows.length}\n${rows.length > 0 ? `${rows.join("\n")}\n` : "  (no registry rows)\n"}`);
+	}
+
+	async inspectRegistry(sessionId: string): Promise<void> {
+		this.assertDeliveryReady();
+		const row = parseRegistryRow(rpcResult<unknown>(await this.#rpc.request("registry.get", { session_id: sessionId }), "registry.get"));
+		const locator = recordValue(row.locator);
+		await this.#output.writeFrame(
+			[
+				"Registry inspect",
+				`  ${renderRegistryRow(row)}`,
+				`  kind=${boundedConsoleText(rawStringValue(row.kind))} surface_id=${boundedConsoleText(rawStringValue(row.surface_id, "none"))} source=${boundedConsoleText(rawStringValue(row.source))}`,
+				`  activity_state=${boundedConsoleText(rawStringValue(row.activity_state, "none"))} metadata_state=${boundedConsoleText(rawStringValue(row.metadata_state))} locator=${compactGatewayValue(locator, 512)}`,
+			].join("\n") + "\n",
+		);
+	}
+
+	async runLockCommand(command: LockCommand): Promise<void> {
+		this.assertDeliveryReady();
+		if (command.action === "status") {
+			const status = rpcResult<unknown>(await this.#rpc.request("gitlock.status", {}), "gitlock.status");
+			await this.#output.writeFrame(`${renderLockStatus(status)}\n`);
+			return;
+		}
+		if (!command.confirmed) {
+			await this.#output.writeFrame(`Confirmation required. Type exactly: ${command.confirmation}\n`);
+			return;
+		}
+		if (command.action === "force-release") {
+			let released: RecordValue;
+			try {
+				released = recordValue(
+					rpcResult<unknown>(
+						await this.#rpc.request("gitlock.force_release", {
+							lease_id: command.leaseId,
+							confirm: true,
+							idempotency_key: this.#idempotencyKey(),
+						}),
+						"gitlock.force_release",
+					),
+				);
+			} catch (error) {
+				await this.#output.writeFrame(`Git lock force-release refused: ${serverRefusalMessage(error)}\n`);
+				return;
+			}
+			await this.#output.writeFrame(
+				`Git lock force-release: released=${booleanValue(released.released)} held_ms=${integerValue(released.held_ms)}\n`,
+			);
+			return;
+		}
+		let status: unknown;
+		try {
+			status = rpcResult<unknown>(
+				await this.#rpc.request("gitlock.clear_quarantine", {
+					verification_receipt_id: command.receiptId,
+					confirm: true,
+					idempotency_key: this.#idempotencyKey(),
+				}),
+				"gitlock.clear_quarantine",
+			);
+		} catch (error) {
+			await this.#output.writeFrame(`Git lock clear-quarantine refused: ${serverRefusalMessage(error)}\n`);
+			return;
+		}
+		await this.#output.writeFrame(`Git lock clear-quarantine completed.\n${renderLockStatus(status)}\n`);
 	}
 
 	async consumeOnce(signal?: AbortSignal): Promise<ConsoleConsumerRunResult> {
@@ -537,13 +872,44 @@ export class OwnerConsole {
 		if (command === "/quit" || command === "/exit") return false;
 		if (command === "/help") {
 			await this.#output.writeFrame(
-				"Commands: /status, /gate <gate_id> <expected_session_id> <JSON answer>, /quit. Any other line is submitted to the main session.\n",
+				[
+					"Gateway cockpit commands:",
+					"  /status",
+					"  /journal [all|kind[,kind...]] [count] (default excludes registry_change)",
+					"  /registry list | /registry inspect <session_id>",
+					"  /lock status",
+					"  /lock force-release <lease_id> CONFIRM FORCE-RELEASE <lease_id>",
+					"  /lock clear-quarantine <verification_receipt_id> CONFIRM CLEAR-QUARANTINE <verification_receipt_id>",
+					"  /gate <gate_id> <expected_session_id> <JSON answer>",
+					"  /quit",
+					"  Any other line is submitted to the main session.",
+				].join("\n") + "\n",
 			);
 			return true;
 		}
 		try {
 			if (command === "/status") {
 				await this.refreshStatus();
+				return true;
+			}
+			if (command === "/journal" || command.startsWith("/journal ")) {
+				await this.tailJournal(parseJournalTailCommand(command));
+				return true;
+			}
+			if (command === "/registry list") {
+				await this.listRegistry();
+				return true;
+			}
+			const registryInspect = /^\/registry\s+inspect\s+(\S+)$/u.exec(command);
+			if (registryInspect) {
+				await this.inspectRegistry(registryInspect[1] as string);
+				return true;
+			}
+			if (command === "/registry" || command.startsWith("/registry ")) {
+				throw new WayConsoleError("Usage: /registry list | /registry inspect <session_id>");
+			}
+			if (command === "/lock" || command.startsWith("/lock ")) {
+				await this.runLockCommand(parseLockCommand(command));
 				return true;
 			}
 			if (command.startsWith("/gate")) {
@@ -555,7 +921,7 @@ export class OwnerConsole {
 			return true;
 		} catch (error) {
 			if (error instanceof ConsoleDeliveryUnavailableError) return false;
-			await this.#output.writeFrame(`Request failed: ${sanitizeConsoleText(asError(error).message)}\n`);
+			await this.#output.writeFrame(`Request failed: ${boundedConsoleText(asError(error).message)}\n`);
 			return true;
 		}
 	}
@@ -578,6 +944,20 @@ export class OwnerConsole {
 		this.#deliveryReady = false;
 		this.#deliveryFailure = failure;
 		return failure;
+	}
+
+	async #readStatus(signal?: AbortSignal): Promise<GatewayStatusSnapshot> {
+		const [health, status] = await Promise.all([
+			rpcResult<unknown>(
+				await this.#rpc.request("way.health", {}, { signal, timeoutMs: DEFAULT_CONSOLE_STATUS_REQUEST_TIMEOUT_MS }),
+				"way.health",
+			),
+			rpcResult<unknown>(
+				await this.#rpc.request("way.status", {}, { signal, timeoutMs: DEFAULT_CONSOLE_STATUS_REQUEST_TIMEOUT_MS }),
+				"way.status",
+			),
+		]);
+		return { health: recordValue(health), status: recordValue(status) };
 	}
 
 	private async writeStatusSummary(health: RecordValue, status: RecordValue): Promise<void> {
@@ -635,7 +1015,7 @@ function renderConsoleEventFrame(event: ConsoleEventFrame): string {
 			return `Gateway health changed: ${state}${reason}.\n`;
 		}
 		case "lock_event":
-			return `Lock state changed: ${sanitizeConsoleText(describeGatewayValue(event.payload))}\n`;
+			return `Lock state changed: ${compactGatewayValue(event.payload)}\n`;
 	}
 }
 
@@ -652,6 +1032,12 @@ export async function runWayConsole(
 		dependencies.exitDrainMs ?? DEFAULT_CONSOLE_EXIT_DRAIN_MS,
 		"exitDrainMs",
 		1,
+		60_000,
+	);
+	const statusPollMs = boundedInteger(
+		dependencies.statusPollMs ?? DEFAULT_CONSOLE_STATUS_POLL_MS,
+		"statusPollMs",
+		25,
 		60_000,
 	);
 	const output = new ConsoleOutput(async (text) => await writeToStream(stdout, text));
@@ -684,9 +1070,10 @@ export async function runWayConsole(
 			throw new ConsoleStartupRefusalError(startup.refusal ?? "Interactive console delivery readiness was refused.");
 		}
 		activeTerminal.setDeliveryState?.("ready");
-		await output.writeFrame("Owner console ready. Type /help for commands.\n");
+		await output.writeFrame("Gateway cockpit ready. Type /help for commands.\n");
 		const events = new AbortController();
 		const input = new AbortController();
+		const status = new AbortController();
 		let deliveryFailure: Error | undefined;
 		const eventLoop = consoleSurface.consume(events.signal).catch((error) => {
 			if (!events.signal.aborted) {
@@ -696,6 +1083,7 @@ export async function runWayConsole(
 				activeTerminal.close();
 			}
 		});
+		const statusLoop = pollConsoleStatus(consoleSurface, status.signal, statusPollMs);
 		let inputFailure: Error | undefined;
 		try {
 			await readConsoleInput(activeTerminal, consoleSurface, {
@@ -710,8 +1098,10 @@ export async function runWayConsole(
 			inputFailure = asError(error);
 		} finally {
 			input.abort();
+			status.abort();
 			events.abort();
 			if (!(await waitForConsoleLoopStop(eventLoop, MAX_CONSOLE_EXIT_DIAGNOSTIC_MS))) activeTerminal.close();
+			if (!(await waitForConsoleLoopStop(statusLoop, MAX_CONSOLE_EXIT_DIAGNOSTIC_MS))) activeTerminal.close();
 		}
 		if (deliveryFailure) throw deliveryFailure;
 		if (inputFailure) throw inputFailure;
@@ -721,6 +1111,19 @@ export async function runWayConsole(
 	}
 }
 
+/** Keeps the cockpit rail current without owning state or retrying mutations. */
+async function pollConsoleStatus(consoleSurface: OwnerConsole, signal: AbortSignal, intervalMs: number): Promise<void> {
+	while (!signal.aborted) {
+		await sleep(intervalMs, signal);
+		if (signal.aborted) return;
+		try {
+			await consoleSurface.pollStatus(signal);
+		} catch {
+			// A terminal publication failure is handled by its owning run loop.
+			return;
+		}
+	}
+}
 interface ConsoleInputLoopOptions {
 	readonly exitDrainMs: number;
 	readonly signal?: AbortSignal;
@@ -951,13 +1354,6 @@ function boundedInteger(value: number, name: string, minimum: number, maximum: n
 	return value;
 }
 
-function describeGatewayValue(value: unknown): string {
-	try {
-		return JSON.stringify(value) ?? String(value);
-	} catch {
-		return "[unserializable gateway payload]";
-	}
-}
 
 function sleep(milliseconds: number, signal: AbortSignal): Promise<void> {
 	if (milliseconds === 0 || signal.aborted) return Promise.resolve();
