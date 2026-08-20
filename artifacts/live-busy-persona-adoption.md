@@ -15,3 +15,13 @@ KNOWN LIMITATION (recorded honestly): the credential-free broker CLI yields tail
 
 tmux capture excerpt:
  gajae: 게이트웨이 어댑션 최종 검증 수신 완료, 형님 — 한 문장 모드로 정상 응답 중입니다.
+
+## Restart-while-busy proof (generation 3), 2026-08-20T21:39:07Z
+
+Sequence on the live persona session (compiled binary at d967e1a):
+1. Fresh adoption: committed, transcript_proof proven at bootstrap.
+2. main.submit accepted (delivered_as prompt); SIGKILL the daemon 3s later, mid-turn, before any envelope.
+3. The persona replied while the daemon was DEAD (visible in his TUI).
+4. Restart: healthy, resumed=true, proof proven, NO exit 78, NO failed_closed.
+5. Journal after restart: tail_adoption_start -> tail_ring_rotation (prior watermark + resync coordinates, visible) -> coherent turn lifecycle -> assistant_message [seq 554] carrying the reply finalized during downtime: '재시작 이후에도 워크스페이스 컨텍스트, 도구 접근, 한 문장 응답 제약이 전부 살아 있어 내구성 검증 통과입니다, 형님.'
+6. transcript_delivery_gap count 0 - the suffix was provable and projected; nothing silently re-baselined.
