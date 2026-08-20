@@ -337,6 +337,29 @@ function parseCheckpoint(value: unknown, path: string): SdkCheckpointRecordV1 {
 	};
 }
 
+/**
+ * Parses the immediate `session.checkpoint` raw-query response. The query
+ * envelope carries broker-generated revision metadata that is useful for
+ * diagnostics but is not authority for adoption. Only the checkpoint tuple is
+ * authoritative; tolerate additive decorative fields around it.
+ */
+export function parseSessionCheckpoint(stdout: string): SdkCheckpointRecordV1 {
+	const envelope = record(parseJson(stdout, "$"), "$");
+	if (envelope.ok !== true) throw new BrokerDtoParseError("$.ok", "must be true");
+	const page = record(envelope.page, "$.page");
+	if (page.complete !== true) throw new BrokerDtoParseError("$.page.complete", "must be true");
+	if (!Array.isArray(page.items) || page.items.length !== 1) {
+		throw new BrokerDtoParseError("$.page.items", "must contain exactly one checkpoint item");
+	}
+	const item = record(page.items[0], "$.page.items[0]");
+	const checkpoint = record(item.checkpoint, "$.page.items[0].checkpoint");
+	return {
+		revision: safeInteger(checkpoint.revision, "$.page.items[0].checkpoint.revision"),
+		generation: safeInteger(checkpoint.generation, "$.page.items[0].checkpoint.generation"),
+		seq: safeInteger(checkpoint.seq, "$.page.items[0].checkpoint.seq"),
+	};
+}
+
 function parseGap(value: unknown, path: string): SdkRetentionGapV1 {
 	const gap = record(value, path);
 	exactKeys(gap, ["code", "missing", "resync"], path);
@@ -521,6 +544,16 @@ export class BrokerCli {
 			throw error;
 		}
 		return parseSessionMetadata(stdout, sessionId);
+	}
+
+	/** Returns the broker's immediate adoption watermark without waiting for a tail exit condition. */
+	async sessionCheckpoint(sessionId: string, options: { readonly timeoutMs?: number } = {}): Promise<SdkCheckpointRecordV1> {
+		if (!sessionId.trim()) throw new BrokerCliError("invalid_session_id", "Cannot query a checkpoint for an empty session id.");
+		const stdout = await this.run(
+			["sdk", "session", "raw", "query", sessionId, "--query", "session.checkpoint", ...timeoutArgument(options.timeoutMs)],
+			options.timeoutMs,
+		);
+		return parseSessionCheckpoint(stdout);
 	}
 
 	async sendPrompt(

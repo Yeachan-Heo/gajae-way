@@ -1,7 +1,7 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { afterEach, expect, test } from "bun:test";
-import { BrokerCli } from "../../src/broker/cli";
+import { BrokerCli, BrokerDtoParseError, parseSessionCheckpoint } from "../../src/broker/cli";
 import { BootstrapError, bootstrapMainSession } from "../../src/main-session/bootstrap";
 import { createMainSessionHost } from "../../src/main-session/host";
 import { ResumeError, strictResumeMainSession } from "../../src/main-session/resume";
@@ -49,6 +49,7 @@ function supervisor(fixture: FakeBrokerFixture) {
 		broker: new BrokerCli({ executable: fixture.executable, environment: fixture.environment() }),
 		workspace: fixture.workspace,
 		tailTimeoutMs: 100,
+		adoptionTailTimeoutMs: 100,
 		commandTimeoutMs: 1_000,
 	});
 }
@@ -99,48 +100,82 @@ test.serial("bootstrap adopts and persists the exact live external identity with
 		mainIdentity: { sessionId: fixture.sessionId },
 		tailCheckpoint: { revision: 2, generation: 1, seq: 0 },
 		transcriptDeliveryProgress: { lastEntryId: `${fixture.sessionId}:transcript:1` },
+		transcriptProof: "proven",
 	});
 	expect(fixture.commands()).toEqual([]);
 });
 
-test.serial("bootstrap refuses a tail timeout without committing an unproven transcript identity", async () => {
+test.serial("bootstrap commits a pending proof when the bounded tail has no envelope", async () => {
 	const fixture = new FakeBrokerFixture();
 	fixtures.push(fixture);
 	const meta = new MemoryGatewayMeta();
 	const state = new GatewayStateStore(meta);
 	const profile = fixtureProfile(fixture);
 	const adoption = supervisor(fixture);
-	// Verification retries transient timeouts (bounded, 5 attempts); adoption is
-	// refused only when the tail stays incomplete for the whole budget.
 	fixture.timeoutNextTails(50);
+	try {
+		await expect(bootstrapMainSession({ confirm: true, profile, state, supervisor: adoption, sessionId: fixture.sessionId })).resolves.toMatchObject({
+			kind: "committed",
+		});
+		const durable = state.read();
+		expect(durable).toMatchObject({
+			bootstrapState: "COMMITTED",
+			mainIdentity: { sessionId: fixture.sessionId },
+			transcriptProof: "pending",
+			tailCheckpoint: { revision: 2, generation: 1, seq: 0 },
+		});
+		expect(durable.mainIdentity?.transcript).toBeUndefined();
+		expect(durable.transcriptDeliveryProgress).toBeUndefined();
+		expect(meta.events).toEqual([{ kind: "tail_adoption_start", payloadJson: JSON.stringify({ checkpoint: { revision: 2, generation: 1, seq: 0 } }) }]);
+	} finally {
+		await adoption.dispose();
+	}
+});
+
+test.serial("bootstrap refuses only when an immediate adoption snapshot query is unavailable", async () => {
+	const fixture = new FakeBrokerFixture();
+	fixtures.push(fixture);
+	const meta = new MemoryGatewayMeta();
+	const state = new GatewayStateStore(meta);
+	const profile = fixtureProfile(fixture);
+	const adoption = supervisor(fixture);
+	fixture.setQueryUnavailable("session.checkpoint");
 	try {
 		await expect(
 			bootstrapMainSession({ confirm: true, profile, state, supervisor: adoption, sessionId: fixture.sessionId }),
-		).rejects.toMatchObject({ reason: "transcript_proof_unavailable" } satisfies Partial<BootstrapError>);
+		).rejects.toMatchObject({ reason: "discovery_checkpoint_unavailable" } satisfies Partial<BootstrapError>);
 		expect(state.read()).toMatchObject({ bootstrapState: "CREATING", mainIdentity: undefined });
-		expect(meta.events).toEqual([]);
 	} finally {
 		await adoption.dispose();
 	}
 });
 
-test.serial("bootstrap survives a transient tail timeout during verification", async () => {
+test.serial("a later complete verification tail promotes a pending proof", async () => {
 	const fixture = new FakeBrokerFixture();
 	fixtures.push(fixture);
 	const meta = new MemoryGatewayMeta();
 	const state = new GatewayStateStore(meta);
 	const profile = fixtureProfile(fixture);
 	const adoption = supervisor(fixture);
-	fixture.timeoutNextTails(2);
+	fixture.timeoutNextTails(1);
 	try {
 		await bootstrapMainSession({ confirm: true, profile, state, supervisor: adoption, sessionId: fixture.sessionId });
-		expect(state.read()).toMatchObject({ bootstrapState: "COMMITTED" });
+		expect(state.read().transcriptProof).toBe("pending");
 	} finally {
 		await adoption.dispose();
 	}
+	const resumedSupervisor = supervisor(fixture);
+	try {
+		const resumed = await strictResumeMainSession({ profile, state, supervisor: resumedSupervisor });
+		expect(resumed.identity.transcript).toBeDefined();
+		expect(state.read()).toMatchObject({ transcriptProof: "proven", transcriptDeliveryProgress: { fingerprint: { entryCount: 2 } } });
+	} finally {
+		await resumedSupervisor.dispose();
+	}
 });
 
-test.serial("strict resume persists a complete legacy transcript proof and delivery baseline before readiness", async () => {
+
+test.serial("strict resume persists a complete pending transcript proof and delivery baseline before readiness", async () => {
 	const fixture = new FakeBrokerFixture();
 	fixtures.push(fixture);
 	const { meta, state, profile, committed } = await bootstrapFixture(fixture);
@@ -148,6 +183,7 @@ test.serial("strict resume persists a complete legacy transcript proof and deliv
 	delete legacyIdentity.transcript;
 	meta.values.set("main_identity", JSON.stringify(legacyIdentity));
 	meta.values.set("transcript_delivery_progress", "null");
+	meta.values.set("transcript_proof", "pending");
 	const resumedSupervisor = supervisor(fixture);
 	try {
 		const resumed = await strictResumeMainSession({ profile, state, supervisor: resumedSupervisor });
@@ -185,6 +221,7 @@ test.serial("scripted broker CLI fixture covers inspect, send, status, tail, and
 	expect(rows.sessions).toHaveLength(1);
 	expect((await broker.inspectSession(fixture.sessionId)).sessionId).toBe(fixture.sessionId);
 	expect((await broker.sessionMetadata(fixture.sessionId)).kind).toBe("main");
+	expect(await broker.sessionCheckpoint(fixture.sessionId)).toEqual({ revision: 2, generation: 1, seq: 0 });
 	const receipt = await broker.sendPrompt(fixture.sessionId, "fixture command", "fixture-op");
 	expect(receipt).toMatchObject({ sessionId: fixture.sessionId, operation: "turn.prompt", operationRef: "fixture-op" });
 	expect(await broker.turnStatus(fixture.sessionId, "fixture-op")).toMatchObject({ status: "terminal_ok", completed: true });
@@ -192,6 +229,25 @@ test.serial("scripted broker CLI fixture covers inspect, send, status, tail, and
 	expect(tail.items.filter(item => item.kind === "agent_start")).toHaveLength(2);
 	expect(tail.items.map(item => item.kind)).not.toContain("message_end");
 	expect(tail.items.filter(item => item.kind === "transcript").every(item => typeof item.id === "string" && item.id.length > 0)).toBe(true);
+});
+
+test.serial("session.checkpoint accepts decorative query fields but rejects malformed authority", () => {
+	const envelope = JSON.stringify({
+		type: "query_response",
+		id: "decorative-id",
+		trace: "ignored",
+		ok: true,
+		page: {
+			items: [{ checkpoint: { revision: 7, generation: 3, seq: 11, label: "ignored" }, revisionId: "decorative" }],
+			complete: true,
+			revision: "decorative",
+			nextCursor: "ignored",
+		},
+	});
+	expect(parseSessionCheckpoint(envelope)).toEqual({ revision: 7, generation: 3, seq: 11 });
+	expect(() => parseSessionCheckpoint(JSON.stringify({ ok: true, page: { items: [{ checkpoint: { revision: 7, generation: 3, seq: "11" } }], complete: true } }))).toThrow(
+		BrokerDtoParseError,
+	);
 });
 
 test.serial("scripted broker tail mirrors cursorless rotation gaps and checkpoint records", async () => {
@@ -248,6 +304,7 @@ test.serial("a terminal tail snapshot that predates admission cannot settle the 
 				identity: committed.identity,
 				transcriptEntries: [],
 				discoveryCheckpoint: state.read().tailCheckpoint!,
+				transcriptProof: "proven",
 				turnState: "idle" as const,
 				followUpQueueDepth: 0,
 			};
@@ -257,6 +314,7 @@ test.serial("a terminal tail snapshot that predates admission cannot settle the 
 				identity: committed.identity,
 				transcriptEntries: [],
 				discoveryCheckpoint: state.read().tailCheckpoint!,
+				transcriptProof: "proven",
 				turnState: "idle" as const,
 				followUpQueueDepth: 0,
 			};
@@ -704,10 +762,10 @@ test.serial("an unprovable transcript suffix journals a durable delivery gap ins
 	const checkpoint = state.read().tailCheckpoint!;
 	const controlled: HostSupervisor = {
 		async discover() {
-			return { identity: committed.identity, transcriptEntries: [], discoveryCheckpoint: checkpoint, turnState: "idle", followUpQueueDepth: 0 };
+			return { identity: committed.identity, transcriptEntries: [], discoveryCheckpoint: checkpoint, transcriptProof: "proven", turnState: "idle", followUpQueueDepth: 0 };
 		},
 		async verify() {
-			return { identity: committed.identity, transcriptEntries: [], discoveryCheckpoint: checkpoint, turnState: "idle", followUpQueueDepth: 0 };
+			return { identity: committed.identity, transcriptEntries: [], discoveryCheckpoint: checkpoint, transcriptProof: "proven", turnState: "idle", followUpQueueDepth: 0 };
 		},
 		async sendPrompt() {
 			throw new Error("not used");

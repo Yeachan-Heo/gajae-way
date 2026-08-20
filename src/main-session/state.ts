@@ -18,6 +18,7 @@ export const GATEWAY_META_KEYS = [
 	"failed_closed_reason",
 	"tail_checkpoint",
 	"transcript_delivery_progress",
+	"transcript_proof",
 
 ] as const;
 
@@ -107,6 +108,9 @@ export interface TranscriptDeliveryProgress {
 	readonly fingerprint: TranscriptFingerprint;
 }
 
+/** Whether the durable adopted identity has a complete transcript fingerprint. */
+export type TranscriptProof = "pending" | "proven";
+
 /** Compares broker-tail watermarks within their event generation. */
 export function compareTailCheckpoints(left: TailCheckpoint, right: TailCheckpoint): number {
 	if (left.generation !== right.generation) return left.generation < right.generation ? -1 : 1;
@@ -130,6 +134,7 @@ export interface DurableGatewayState {
 	readonly failedClosedReason: string | undefined;
 	readonly tailCheckpoint: TailCheckpoint | undefined;
 	readonly transcriptDeliveryProgress: TranscriptDeliveryProgress | undefined;
+	readonly transcriptProof: TranscriptProof;
 
 }
 
@@ -283,6 +288,14 @@ function parseOptionalTranscriptDeliveryProgress(raw: string | undefined): Trans
 	};
 }
 
+function parseTranscriptProof(raw: string | undefined, identity: ExternalSessionIdentity | undefined): TranscriptProof {
+	if (raw === undefined || raw === "null") return identity?.transcript === undefined ? "pending" : "proven";
+	if (raw !== "pending" && raw !== "proven") {
+		throw new GatewayStateError("metadata_invalid", "transcript_proof must be pending or proven.");
+	}
+	return raw;
+}
+
 
 function metadataMap(entries: readonly GatewayMetaEntry[]): Map<string, string> {
 	const values = new Map<string, string>();
@@ -303,6 +316,19 @@ function parsedState(values: ReadonlyMap<string, string>): DurableGatewayState {
 	const bootstrapIntentRaw = parseNullableJson(requiredMeta(values, "bootstrap_intent"), "bootstrap_intent");
 	const mainIdentityRaw = parseNullableJson(requiredMeta(values, "main_identity"), "main_identity");
 	const growthIntentRaw = parseNullableJson(requiredMeta(values, "growth_intent"), "growth_intent");
+	const mainIdentity = mainIdentityRaw === undefined ? undefined : parseExternalIdentity(mainIdentityRaw, "main_identity");
+	const growthIntent = growthIntentRaw === undefined ? undefined : parseGrowthIntent(growthIntentRaw);
+	const transcriptProof = parseTranscriptProof(values.get("transcript_proof"), mainIdentity);
+	const transcriptDeliveryProgress = parseOptionalTranscriptDeliveryProgress(values.get("transcript_delivery_progress"));
+	if (mainIdentity?.transcript === undefined && transcriptProof === "proven") {
+		throw new GatewayStateError("metadata_invalid", "A proven transcript proof requires a fingerprinted main identity.");
+	}
+	if (mainIdentity?.transcript !== undefined && transcriptProof === "pending") {
+		throw new GatewayStateError("metadata_invalid", "A pending transcript proof cannot carry a fingerprinted main identity.");
+	}
+	if (transcriptProof === "pending" && (growthIntent !== undefined || transcriptDeliveryProgress !== undefined)) {
+		throw new GatewayStateError("metadata_invalid", "A pending transcript proof cannot have transcript growth or delivery progress.");
+	}
 	const profileDigestRaw = requiredMeta(values, "profile_digest");
 	const profileDigest = profileDigestRaw === "null" ? undefined : requiredString(profileDigestRaw, "profile_digest");
 	const profileDigestVersionRaw = requiredMeta(values, "profile_digest_version");
@@ -318,8 +344,8 @@ function parsedState(values: ReadonlyMap<string, string>): DurableGatewayState {
 	return {
 		bootstrapState,
 		bootstrapIntent: bootstrapIntentRaw === undefined ? undefined : parseBootstrapIntent(bootstrapIntentRaw),
-		mainIdentity: mainIdentityRaw === undefined ? undefined : parseExternalIdentity(mainIdentityRaw, "main_identity"),
-		growthIntent: growthIntentRaw === undefined ? undefined : parseGrowthIntent(growthIntentRaw),
+		mainIdentity,
+		growthIntent,
 		profileDigest,
 		profileDigestVersion,
 		profileProjection: parseOptionalProjection(requiredMeta(values, "profile_projection")),
@@ -328,8 +354,8 @@ function parsedState(values: ReadonlyMap<string, string>): DurableGatewayState {
 		profileApprovalReceipt: parseOptionalStringJson(requiredMeta(values, "profile_approval_receipt"), "profile_approval_receipt"),
 		failedClosedReason: parseOptionalStringJson(requiredMeta(values, "failed_closed_reason"), "failed_closed_reason"),
 		tailCheckpoint: parseOptionalTailCheckpoint(values.get("tail_checkpoint")),
-		transcriptDeliveryProgress: parseOptionalTranscriptDeliveryProgress(values.get("transcript_delivery_progress")),
-
+		transcriptDeliveryProgress,
+		transcriptProof,
 	};
 }
 
@@ -441,10 +467,20 @@ export class GatewayStateStore {
 		identity: ExternalSessionIdentity,
 		profile: WayProfile,
 		discoveryCheckpoint: TailCheckpoint,
-		transcriptDeliveryProgress: TranscriptDeliveryProgress,
+		transcriptProof: TranscriptProof,
+		transcriptDeliveryProgress?: TranscriptDeliveryProgress,
 	): void {
-		if (!identity.transcript) {
-			throw new GatewayStateError("transcript_proof_missing", "A committed external identity requires a transcript fingerprint.");
+		if (transcriptProof === "proven") {
+			if (
+				!identity.transcript ||
+				!transcriptDeliveryProgress ||
+				transcriptDeliveryProgress.fingerprint.entryCount !== identity.transcript.entryCount ||
+				transcriptDeliveryProgress.fingerprint.sha256 !== identity.transcript.sha256
+			) {
+				throw new GatewayStateError("transcript_proof_invalid", "A proven adoption requires a matching transcript fingerprint and delivery baseline.");
+			}
+		} else if (identity.transcript || transcriptDeliveryProgress) {
+			throw new GatewayStateError("transcript_proof_invalid", "A pending adoption cannot carry a transcript fingerprint or delivery baseline.");
 		}
 		this.transact({
 			expected: [
@@ -463,6 +499,7 @@ export class GatewayStateStore {
 				{ key: "failed_closed_reason", value: "null" },
 				{ key: "tail_checkpoint", value: tailCheckpointJson(discoveryCheckpoint) },
 				{ key: "transcript_delivery_progress", value: transcriptDeliveryProgressJson(transcriptDeliveryProgress) },
+				{ key: "transcript_proof", value: transcriptProof },
 			],
 			deletes: [],
 			eventKind: "tail_adoption_start",
@@ -485,12 +522,16 @@ export class GatewayStateStore {
 	}
 
 	writeGrowthIntent(identity: ExternalSessionIdentity, startedAt: number): void {
+		if (!identity.transcript) {
+			throw new GatewayStateError("transcript_proof_pending", "Cannot open a growth window before the transcript proof is durable.");
+		}
 		const intent: GrowthIntent = { base: identity, startedAt };
 		this.transact({
 			expected: [
 				{ key: "bootstrap_state", value: "COMMITTED" },
 				{ key: "main_identity", value: identityJson(identity) },
 				{ key: "growth_intent", value: "null" },
+				{ key: "transcript_proof", value: "proven" },
 			],
 			puts: [{ key: "growth_intent", value: stableMetadataJson(intent) }],
 			deletes: [],
@@ -498,10 +539,14 @@ export class GatewayStateStore {
 	}
 
 	refreshAfterGrowth(intent: GrowthIntent, identity: ExternalSessionIdentity): void {
+		if (!identity.transcript) {
+			throw new GatewayStateError("transcript_proof_pending", "Cannot refresh transcript growth without a durable transcript proof.");
+		}
 		this.transact({
 			expected: [
 				{ key: "bootstrap_state", value: "COMMITTED" },
 				{ key: "growth_intent", value: stableMetadataJson(intent) },
+				{ key: "transcript_proof", value: "proven" },
 			],
 			puts: [
 				{ key: "main_identity", value: identityJson(identity) },
@@ -511,7 +556,7 @@ export class GatewayStateStore {
 		});
 	}
 
-	/** CAS-upgrades a legacy committed adoption after a fresh complete transcript proof. */
+	/** Atomically binds a pending adoption to its first complete transcript snapshot. */
 	persistTranscriptProof(
 		durable: ExternalSessionIdentity,
 		observed: ExternalSessionIdentity,
@@ -530,10 +575,12 @@ export class GatewayStateStore {
 			expected: [
 				{ key: "bootstrap_state", value: "COMMITTED" },
 				{ key: "main_identity", value: identityJson(durable) },
+				{ key: "transcript_proof", value: "pending" },
 				{ key: "transcript_delivery_progress", value: transcriptDeliveryProgressJson(undefined) },
 			],
 			puts: [
 				{ key: "main_identity", value: identityJson(observed) },
+				{ key: "transcript_proof", value: "proven" },
 				{ key: "transcript_delivery_progress", value: transcriptDeliveryProgressJson(transcriptDeliveryProgress) },
 			],
 			deletes: [],
@@ -544,12 +591,14 @@ export class GatewayStateStore {
 		this.transact({
 			expected: [
 				{ key: "bootstrap_state", value: "COMMITTED" },
+				{ key: "transcript_proof", value: "proven" },
 				{ key: "transcript_delivery_progress", value: transcriptDeliveryProgressJson(expected) },
 			],
 			puts: [{ key: "transcript_delivery_progress", value: transcriptDeliveryProgressJson(next) }],
 			deletes: [],
 		});
 	}
+
 
 	/** Atomically journals a finalized transcript projection and its durable replay point. */
 	appendTranscriptProjection(
@@ -566,6 +615,7 @@ export class GatewayStateStore {
 		this.transact({
 			expected: [
 				{ key: "bootstrap_state", value: "COMMITTED" },
+				{ key: "transcript_proof", value: "proven" },
 				...(expectedTail === undefined ? [] : [{ key: "tail_checkpoint", value: tailCheckpointJson(expectedTail) }]),
 				{ key: "transcript_delivery_progress", value: transcriptDeliveryProgressJson(expectedDelivery) },
 			],

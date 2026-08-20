@@ -46,6 +46,7 @@ static NEXT_CORRELATION_ID: AtomicU64 = AtomicU64::new(1);
 /// The complete application error space reserved by the wire contract.
 pub const APP_ERROR_CODES: &[(i64, &str)] = &[
 	(1000, "unhealthy_failed_closed"),
+	(1003, "transcript_proof_pending"),
 	(1100, "gate_not_found"),
 	(1101, "gate_expired"),
 	(1102, "gate_session_mismatch"),
@@ -473,6 +474,25 @@ fn durable_failed_closed_reason(store: &Store) -> Result<Option<String>, RpcErro
 	Ok(Some(reason))
 }
 
+fn durable_transcript_proof(store: &Store) -> Result<Option<String>, RpcError> {
+	let bootstrap_state = store.get_meta("bootstrap_state").map_err(store_error)?;
+	if !matches!(bootstrap_state.as_deref(), Some("COMMITTED") | Some("FAILED_CLOSED")) {
+		return Ok(None);
+	}
+	match store.get_meta("transcript_proof").map_err(store_error)?.as_deref() {
+		Some("pending") => Ok(Some("pending".to_owned())),
+		Some("proven") => Ok(Some("proven".to_owned())),
+		_ => Ok(None),
+	}
+}
+
+fn main_admission_transcript_proof_pending(store: &Store) -> Result<bool, RpcError> {
+	if store.get_meta("bootstrap_state").map_err(store_error)?.as_deref() != Some("COMMITTED") {
+		return Ok(false);
+	}
+	Ok(store.get_meta("transcript_proof").map_err(store_error)?.as_deref() != Some("proven"))
+}
+
 #[derive(Debug, Clone)]
 struct GatewayHealth {
 	state: GatewayState,
@@ -584,6 +604,9 @@ impl RpcDispatcher {
 		if health.state == GatewayState::FailedClosed && method != "way.health" && method != "way.status" && method != "profile.approve" {
 			return Err(RpcError::app(1000, health.reason.map(|reason| json!({ "reason": reason }))));
 		}
+		if method == "main.submit" && main_admission_transcript_proof_pending(&self.store)? {
+			return Err(RpcError::app(1003, None));
+		}
 
 		match method.as_str() {
 			"way.health" => self.health_response(params),
@@ -642,6 +665,7 @@ impl RpcDispatcher {
 	async fn status_response(&self, params: Value) -> Result<Value, RpcError> {
 		ensure_empty_params(&params)?;
 		let health = self.health_response(Value::Object(Map::new()))?;
+		let transcript_proof = durable_transcript_proof(&self.store)?;
 		let main_session = self
 			.main_session
 			.lock()
@@ -701,6 +725,7 @@ impl RpcDispatcher {
 		let mut response = health.as_object().cloned().expect("health response is an object");
 		response.insert("turn_state".to_owned(), json!(main_session.turn_state));
 		response.insert("follow_up_queue_depth".to_owned(), json!(main_session.follow_up_queue_depth));
+		response.insert("transcript_proof".to_owned(), json!(transcript_proof));
 		let mut lock = lock_status_json(lock_status);
 		lock.as_object_mut()
 			.expect("lock status is an object")
@@ -1473,7 +1498,36 @@ mod tests {
 		for (code, name) in APP_ERROR_CODES {
 			assert_eq!(app_error_name(*code), Some(*name));
 		}
-		assert_eq!(APP_ERROR_CODES.len(), 21);
+		assert_eq!(APP_ERROR_CODES.len(), 22);
+	}
+
+	#[tokio::test]
+	async fn pending_transcript_proof_fences_main_submit_but_keeps_observation_available() {
+		let store = Store::default();
+		store.set_meta("bootstrap_state", "COMMITTED").unwrap();
+		store.set_meta("transcript_proof", "pending").unwrap();
+		let locks = LockManager::new(store.clone());
+		let journal = EventJournal::new(store.clone());
+		let dispatcher = RpcDispatcher::new(store, locks, journal, TsfnBridge::for_tests());
+
+		let status = dispatcher
+			.dispatch("way.status".to_owned(), json!({}), super::super::CancellationToken::new())
+			.await
+			.unwrap();
+		assert_eq!(status["transcript_proof"], "pending");
+
+		let blocked = dispatcher
+			.dispatch("main.submit".to_owned(), json!({ "text": "must not send" }), super::super::CancellationToken::new())
+			.await
+			.unwrap_err();
+		assert_eq!(blocked.code, 1003);
+		assert_eq!(blocked.message, "transcript_proof_pending");
+
+		let observed = dispatcher
+			.dispatch("main.events.read".to_owned(), json!({}), super::super::CancellationToken::new())
+			.await
+			.unwrap();
+		assert!(observed["events"].as_array().unwrap().is_empty());
 	}
 
 	#[tokio::test]

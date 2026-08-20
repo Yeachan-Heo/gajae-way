@@ -14,7 +14,7 @@ use std::{
 use rusqlite::{Connection, OptionalExtension, Transaction};
 
 pub const DATABASE_FILENAME: &str = "way-core.sqlite3";
-pub const SCHEMA_VERSION: u32 = 3;
+pub const SCHEMA_VERSION: u32 = 4;
 pub const IDEMPOTENCY_WINDOW_MS: i64 = 24 * 60 * 60 * 1_000;
 pub const CLOSURE_OPERATION_META_KEY: &str = "gitlock_closure_operation";
 
@@ -736,6 +736,19 @@ fn migrate(connection: &mut Connection) -> StoreResult<()> {
         transaction.commit()?;
     }
 
+    if current_version < 4 {
+        let transaction = connection.transaction()?;
+        if meta_get_tx(&transaction, "transcript_proof")?.is_none() {
+            let transcript_proof = meta_get_tx(&transaction, "main_identity")?
+                .and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok())
+                .and_then(|identity| identity.as_object().is_some_and(|identity| identity.contains_key("transcript")).then_some("proven"))
+                .unwrap_or("pending");
+            meta_set_tx(&transaction, "transcript_proof", transcript_proof)?;
+        }
+        meta_set_tx(&transaction, "schema_version", "4")?;
+        transaction.commit()?;
+    }
+
 
     let defaults = [
         ("bootstrap_state", "ABSENT"),
@@ -751,6 +764,7 @@ fn migrate(connection: &mut Connection) -> StoreResult<()> {
         ("failed_closed_reason", "null"),
         ("tail_checkpoint", "null"),
         ("transcript_delivery_progress", "null"),
+        ("transcript_proof", "pending"),
         ("journal_generation", "1"),
         ("boot_epoch", "0"),
         ("journal_floor_seq", "0"),
@@ -816,6 +830,7 @@ mod tests {
             store.get_meta("schema_version").unwrap(),
             Some(SCHEMA_VERSION.to_string())
         );
+        assert_eq!(store.get_meta("transcript_proof").unwrap().as_deref(), Some("pending"));
 
         let connection = store.connection().unwrap();
         let journal_mode: String = connection
@@ -944,6 +959,32 @@ mod tests {
 			.unwrap();
         assert_eq!(found.as_deref(), Some("verification_receipts"));
         drop(connection);
+        drop(migrated);
+        fs::remove_dir_all(state_dir).unwrap();
+    }
+
+    #[test]
+    fn v3_identity_with_a_fingerprint_migrates_to_a_proven_transcript_proof() {
+        let state_dir = temporary_state_dir("v3-transcript-proof");
+        let database_path = state_dir.join(DATABASE_FILENAME);
+        let store = Store::open(&state_dir).unwrap();
+        store
+            .set_meta(
+                "main_identity",
+                r#"{"version":1,"sessionId":"main","locator":{"repo":"/repo","stateRoot":"/repo/.gjc/state"},"endpointGeneration":1,"transcript":{"entryCount":0,"sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}}"#,
+            )
+            .unwrap();
+        drop(store);
+
+        let connection = Connection::open(&database_path).unwrap();
+        connection
+            .execute_batch("DELETE FROM gateway_meta WHERE k = 'transcript_proof'; UPDATE gateway_meta SET v = '3' WHERE k = 'schema_version';")
+            .unwrap();
+        drop(connection);
+
+        let migrated = Store::open(&state_dir).unwrap();
+        assert_eq!(migrated.get_meta("transcript_proof").unwrap().as_deref(), Some("proven"));
+        assert_eq!(migrated.get_meta("schema_version").unwrap(), Some(SCHEMA_VERSION.to_string()));
         drop(migrated);
         fs::remove_dir_all(state_dir).unwrap();
     }

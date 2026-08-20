@@ -29,6 +29,7 @@ export interface ExternalGatewayOptions {
 	readonly newOpRef?: () => string;
 	readonly afterBrokerAcceptedBeforeFinalize?: () => void | Promise<void>;
 	readonly tailTimeoutMs?: number;
+	readonly adoptionTailTimeoutMs?: number;
 	readonly commandTimeoutMs?: number;
 }
 
@@ -108,6 +109,7 @@ export async function createExternalGateway(options: ExternalGatewayOptions = {}
 		broker: new BrokerCli({ executable: fixture.executable, environment: fixture.environment() }),
 		workspace: fixture.workspace,
 		tailTimeoutMs: options.tailTimeoutMs ?? 500,
+		adoptionTailTimeoutMs: options.adoptionTailTimeoutMs ?? options.tailTimeoutMs ?? 500,
 		commandTimeoutMs: options.commandTimeoutMs ?? 1_000,
 	});
 	await bootstrapMainSession({ confirm: true, profile, state, supervisor, sessionId: fixture.sessionId });
@@ -140,6 +142,7 @@ export async function createExternalGateway(options: ExternalGatewayOptions = {}
 		newOpRef: options.newOpRef,
 		isSurfaceQuarantined: options.isSurfaceQuarantined,
 		afterBrokerAcceptedBeforeFinalize: options.afterBrokerAcceptedBeforeFinalize,
+		isTranscriptProofPending: () => state.read().transcriptProof === "pending",
 	});
 	const answer = createMainGateAnswerHandler(host, core);
 	const handler: RpcBridgeHandler = async (method, params) => {

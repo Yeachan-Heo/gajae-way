@@ -22,6 +22,7 @@ const defaults: Record<string, string> = {
 	failed_closed_reason: "null",
 	tail_checkpoint: "null",
 	transcript_delivery_progress: "null",
+	transcript_proof: "pending",
 
 };
 
@@ -83,6 +84,8 @@ interface FixtureSession {
 	holdNext?: boolean;
 	failNext?: boolean;
 	responseText?: string;
+	tailTimeoutWhileBusy?: boolean;
+	unavailableQueries?: string[];
 	commandLog: Array<Record<string, unknown>>;
 }
 
@@ -97,6 +100,7 @@ export interface FakeBrokerFixtureOptions {
 	readonly live?: boolean;
 	readonly kind?: string;
 	readonly responseText?: string;
+	readonly noEnvelopeWhileBusy?: boolean;
 }
 
 /**
@@ -151,6 +155,7 @@ export class FakeBrokerFixture {
 			retentionFloorSeq: 0,
 
 			responseText: options.responseText,
+			tailTimeoutWhileBusy: options.noEnvelopeWhileBusy,
 			commandLog: [],
 		};
 		this.write({ indexSeq: 1, sessions: { [this.sessionId]: session } });
@@ -175,6 +180,23 @@ export class FakeBrokerFixture {
 	holdNextTurn(): void {
 		this.update(session => {
 			session.holdNext = true;
+		});
+	}
+
+	/** Makes `tail --until-idle` return tail_timeout while the fixture is streaming. */
+	setNoEnvelopeWhileBusy(enabled = true): void {
+		this.update(session => {
+			session.tailTimeoutWhileBusy = enabled;
+		});
+	}
+
+	/** Makes one raw query unavailable so adoption snapshot failures stay testable. */
+	setQueryUnavailable(query: "session.checkpoint" | "context.get", unavailable = true): void {
+		this.update(session => {
+			const unavailableQueries = new Set(session.unavailableQueries ?? []);
+			if (unavailable) unavailableQueries.add(query);
+			else unavailableQueries.delete(query);
+			session.unavailableQueries = [...unavailableQueries];
 		});
 	}
 

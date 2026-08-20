@@ -5,10 +5,12 @@ import {
 	fingerprintTranscriptEntries,
 	GatewayStateStore,
 	sameExternalFingerprint,
+	sameExternalSession,
 	type ExternalSessionIdentity,
 	type GrowthIntent,
 	type TailCheckpoint,
 	type TranscriptDeliveryProgress,
+	type TranscriptProof,
 } from "./state";
 import {
 	HostSupervisorError,
@@ -51,6 +53,7 @@ export interface MainSessionHost {
 	readonly degraded: boolean;
 	readonly turnState: "idle" | "busy";
 	readonly followUpQueueDepth: number;
+	readonly transcriptProof: TranscriptProof;
 	readonly gates: MainSessionGateRegistry;
 	/** Waits for broker admission only; successful turn execution is observed asynchronously. */
 	admit(deliveredAs: "prompt" | "steer" | "follow_up", text: string, opRef: string): Promise<void>;
@@ -213,6 +216,9 @@ const FATAL_EXTERNAL_IDENTITY_REASONS = new Set([
 	"main_identity_mismatch",
 	"tail_retention_gap",
 	"tail_generation_changed",
+	"transcript_proof_invalid",
+	"transcript_proof_mismatch",
+	"transcript_proof_persist_failed",
 ]);
 
 function isFatalExternalIdentityFailure(reason: string): boolean {
@@ -236,6 +242,7 @@ class ExternalMainSessionHost implements MainSessionHost {
 	#nextAttempt = 0;
 	readonly #finalizedAssistantMessageKeys = new Set<string>();
 	#transcriptDeliveryProgress: TranscriptDeliveryProgress | undefined;
+	#transcriptProof: TranscriptProof;
 	readonly #journaledAttemptTransitions = new Map<string, JournaledAttemptTransitions>();
 	readonly #admittedOperations = new Map<string, "prompt" | "steer" | "follow_up">();
 	readonly #seenTailEvents = new Set<string>();
@@ -261,6 +268,7 @@ class ExternalMainSessionHost implements MainSessionHost {
 		const durable = this.#state.read();
 		this.#tailCheckpoint = durable.tailCheckpoint;
 		this.#transcriptDeliveryProgress = durable.transcriptDeliveryProgress;
+		this.#transcriptProof = durable.transcriptProof;
 		if (options.recoveredGrowthIntent) {
 			this.#growthWindow = { intent: options.recoveredGrowthIntent, pendingAdmissions: 0 };
 		}
@@ -283,6 +291,10 @@ class ExternalMainSessionHost implements MainSessionHost {
 
 	get followUpQueueDepth(): number {
 		return this.#followUpQueueDepth;
+	}
+
+	get transcriptProof(): TranscriptProof {
+		return this.#transcriptProof;
 	}
 
 	waitForFatalFailure(): Promise<MainSessionHostError> {
@@ -650,6 +662,41 @@ class ExternalMainSessionHost implements MainSessionHost {
 		}
 	}
 
+	private bindPendingTranscriptProof(tail: SupervisorTailEvents): void {
+		if (this.#transcriptProof === "proven") return;
+		const identity = tail.identity;
+		if (!identity.transcript) {
+			throw new HostSupervisorError("transcript_proof_invalid", "A complete broker tail did not carry a transcript fingerprint.");
+		}
+		if (tail.transcriptEntries.some(entry => !entry.id.trim())) {
+			throw new HostSupervisorError("transcript_proof_invalid", "A complete broker tail contained a transcript entry without a stable id.");
+		}
+		const fingerprint = fingerprintTranscriptEntries(tail.transcriptEntries.map(entry => entry.payload));
+		if (fingerprint.entryCount !== identity.transcript.entryCount || fingerprint.sha256 !== identity.transcript.sha256) {
+			throw new HostSupervisorError("transcript_proof_mismatch", "The complete broker tail did not match its transcript fingerprint.");
+		}
+		const durable = this.#state.read();
+		if (
+			durable.bootstrapState !== "COMMITTED" ||
+			!durable.mainIdentity ||
+			durable.transcriptProof !== "pending" ||
+			!sameExternalSession(durable.mainIdentity, identity) ||
+			!sameExternalSession(this.#identity, identity)
+		) {
+			throw new HostSupervisorError("transcript_proof_invalid", "The pending durable identity did not match the first complete broker tail.");
+		}
+		const transcriptDeliveryProgress = this.deliveryGapProgress(tail.transcriptEntries);
+		try {
+			this.#state.persistTranscriptProof(durable.mainIdentity, identity, transcriptDeliveryProgress);
+		} catch (error) {
+			throw new HostSupervisorError("transcript_proof_persist_failed", "Could not durably bind the pending transcript proof.", { cause: error });
+		}
+		this.#identity = identity;
+		this.#transcriptDeliveryProgress = transcriptDeliveryProgress;
+		this.#transcriptProof = "proven";
+		this.publishStatus();
+	}
+
 	private observeIdentity(identity: ExternalSessionIdentity, entries: readonly SupervisorTranscriptEntry[]): void {
 		if (sameExternalFingerprint(this.#identity, identity)) return;
 		if (!this.#growthWindow) {
@@ -754,6 +801,7 @@ class ExternalMainSessionHost implements MainSessionHost {
 					await Promise.race([Bun.sleep(100), wake, this.#tailStop.promise]);
 					continue;
 				}
+				this.bindPendingTranscriptProof(tail);
 				// A rotating broker transcript window can no longer attest the durable
 				// delivery point. Record the consumer-visible gap before the identity
 				// mismatch closes this unsafe observation path.
@@ -845,6 +893,7 @@ class ExternalMainSessionHost implements MainSessionHost {
 		if (this.#disposed) throw new MainSessionHostError("host_disposed");
 		if (this.#failure) throw this.#failure;
 		if (this.#degraded) throw new MainSessionHostError("host_degraded");
+		if (this.#transcriptProof === "pending") throw new MainSessionHostError("transcript_proof_pending");
 	}
 
 	private beginGrowthWindow(): GrowthWindow {
@@ -852,7 +901,7 @@ class ExternalMainSessionHost implements MainSessionHost {
 		if (existing) return existing;
 		this.assertUsable();
 		const durable = this.#state.read();
-		if (durable.bootstrapState !== "COMMITTED" || !durable.mainIdentity || durable.growthIntent) {
+		if (durable.bootstrapState !== "COMMITTED" || !durable.mainIdentity || durable.growthIntent || durable.transcriptProof !== "proven") {
 			markFailedClosed(this.#state, "growth_protocol_invalid");
 			throw new MainSessionHostError("growth_protocol_invalid");
 		}

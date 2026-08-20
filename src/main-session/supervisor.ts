@@ -13,6 +13,7 @@ import {
 	type ExternalSessionIdentity,
 	type TailCheckpoint,
 	type TranscriptFingerprint,
+	type TranscriptProof,
 } from "./state";
 
 
@@ -47,8 +48,10 @@ export interface SupervisorTailEvents {
 export interface SupervisorVerification {
 	readonly identity: ExternalSessionIdentity;
 	readonly transcriptEntries: readonly SupervisorTranscriptEntry[];
-	/** The verified tail boundary from which adoption begins projecting future events. */
+	/** The immediate broker checkpoint from which adoption begins projection. */
 	readonly discoveryCheckpoint: TailCheckpoint;
+	/** A complete tail fingerprint, or an explicit pending proof after a bounded tail wait. */
+	readonly transcriptProof: TranscriptProof;
 	readonly turnState: SupervisorTurnState;
 	readonly followUpQueueDepth: number;
 }
@@ -84,6 +87,8 @@ export interface ExternalHostSupervisorOptions {
 	/** Canonical workspace selected by the profile; the broker locator must match exactly. */
 	readonly workspace: string;
 	readonly tailTimeoutMs?: number;
+	/** Bounded initial proof wait. Production defaults to 15 seconds; fixtures can shorten it. */
+	readonly adoptionTailTimeoutMs?: number;
 	readonly commandTimeoutMs?: number;
 }
 
@@ -151,6 +156,7 @@ export class ExternalHostSupervisor implements HostSupervisor {
 	readonly #broker: BrokerCli;
 	readonly #workspace: string;
 	readonly #tailTimeoutMs: number;
+	readonly #adoptionTailTimeoutMs: number;
 	readonly #commandTimeoutMs: number;
 	#identity: ExternalSessionIdentity | undefined;
 	#disposed = false;
@@ -159,9 +165,13 @@ export class ExternalHostSupervisor implements HostSupervisor {
 		this.#broker = options.broker;
 		this.#workspace = path.resolve(options.workspace);
 		this.#tailTimeoutMs = options.tailTimeoutMs ?? 3_000;
+		this.#adoptionTailTimeoutMs = options.adoptionTailTimeoutMs ?? 15_000;
 		this.#commandTimeoutMs = options.commandTimeoutMs ?? 30_000;
 		if (!Number.isSafeInteger(this.#tailTimeoutMs) || this.#tailTimeoutMs < 1 || this.#tailTimeoutMs > 120_000) {
 			throw new HostSupervisorError("tail_timeout_invalid", "tailTimeoutMs must be an integer in 1..=120000.");
+		}
+		if (!Number.isSafeInteger(this.#adoptionTailTimeoutMs) || this.#adoptionTailTimeoutMs < 1 || this.#adoptionTailTimeoutMs > 120_000) {
+			throw new HostSupervisorError("adoption_tail_timeout_invalid", "adoptionTailTimeoutMs must be an integer in 1..=120000.");
 		}
 		if (!Number.isSafeInteger(this.#commandTimeoutMs) || this.#commandTimeoutMs < 1 || this.#commandTimeoutMs > 120_000) {
 			throw new HostSupervisorError("command_timeout_invalid", "commandTimeoutMs must be an integer in 1..=120000.");
@@ -287,44 +297,38 @@ export class ExternalHostSupervisor implements HostSupervisor {
 			if (error instanceof HostSupervisorError) throw error;
 			throw this.wrapBrokerError("session_metadata_unavailable", error);
 		}
-		const provisional = identityFromRow(row, expected?.transcript);
-		this.#identity = provisional;
-		// Verification needs a COMPLETE envelope, which the CLI only emits once an
-		// exit condition (idle/terminal) is reached inside the wait window. A real
-		// session may be mid-turn at adoption (a fresh gjc boots for ~30s; an
-		// adopted worker may be busy), so verification waits patiently with a
-		// larger window and bounded retries instead of failing on the first
-		// normal tail timeout. The proof itself stays mandatory.
-		let tail: SupervisorTailEvents | undefined;
-		for (let attempt = 0; attempt < 5; attempt += 1) {
-			const candidate = await this.tailEvents({ timeoutMs: Math.max(this.#tailTimeoutMs, 30_000) });
-			if (candidate.complete) {
-				tail = candidate;
-				break;
-			}
-		}
-		if (!tail) {
-			throw new HostSupervisorError("transcript_proof_unavailable", "Broker tail did not yield a complete transcript proof while the session stayed busy.");
-		}
-		const discoveryCheckpoint = tail.checkpoint ?? tail.resyncCheckpoint;
-		if (!discoveryCheckpoint) {
-			throw new HostSupervisorError("tail_checkpoint_unavailable", "Broker tail did not provide an adoption checkpoint.");
-		}
-		const identity = tail.identity;
-		let turnState: SupervisorTurnState = row.activity?.state === "active" ? "busy" : "idle";
-		let followUpQueueDepth = 0;
+		let discoveryCheckpoint: TailCheckpoint;
 		try {
-			const state = await this.turnState();
-			turnState = state.turnState;
-			followUpQueueDepth = state.followUpQueueDepth;
+			discoveryCheckpoint = await this.#broker.sessionCheckpoint(expectedSessionId, { timeoutMs: this.#commandTimeoutMs });
 		} catch (error) {
-			if (error instanceof HostSupervisorError && error.reason === "turn_state_unavailable") {
-				// Broker index activity is still an honest fallback for initial admission.
-			} else {
-				throw error;
-			}
+			throw this.wrapBrokerError("discovery_checkpoint_unavailable", error);
 		}
-		return { identity, transcriptEntries: tail.transcriptEntries, discoveryCheckpoint, turnState, followUpQueueDepth };
+		const provisional = identityFromRow(row, undefined);
+		this.#identity = provisional;
+		const { turnState, followUpQueueDepth } = await this.turnState();
+		// `tail --until-idle` has no immediate-snapshot mode: it only envelopes
+		// when a terminal boundary occurs inside its wait window. Take one bounded
+		// proof attempt, then explicitly carry a pending proof rather than treating
+		// a long-lived interactive prompt as an unavailable session.
+		const tail = await this.tailEvents({ timeoutMs: this.#adoptionTailTimeoutMs });
+		if (!tail.complete) {
+			return {
+				identity: provisional,
+				transcriptEntries: [],
+				discoveryCheckpoint,
+				transcriptProof: "pending",
+				turnState,
+				followUpQueueDepth,
+			};
+		}
+		return {
+			identity: tail.identity,
+			transcriptEntries: tail.transcriptEntries,
+			discoveryCheckpoint,
+			transcriptProof: "proven",
+			turnState,
+			followUpQueueDepth,
+		};
 	}
 
 	private requireIdentity(): ExternalSessionIdentity {

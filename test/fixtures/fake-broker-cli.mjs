@@ -68,6 +68,17 @@ if (!statePath) {
 		process.stdout.write(`${JSON.stringify({ ok: true, result })}\n`);
 	}
 
+	function queryResponse(item) {
+		process.stdout.write(
+			`${JSON.stringify({
+				type: "query_response",
+				id: "fixture-query",
+				ok: true,
+				page: { items: [item], complete: true, revision: "fixture-revision" },
+			})}\n`,
+		);
+	}
+
 	function session(sessionId) {
 		const value = sessions[sessionId];
 		if (!value) {
@@ -308,7 +319,9 @@ if (!statePath) {
 			console.error("fixture: injected transient tail crash");
 			process.exit(1);
 		}
-		if (value) {
+		if (value && value.tailTimeoutWhileBusy === true && value.context?.isStreaming === true) {
+			fail("tail_timeout", "fixture: busy session has no tail envelope before a terminal boundary");
+		} else if (value) {
 			const cursorIndex = args.indexOf("--cursor");
 			if (cursorIndex !== -1) {
 				// The real credential-free CLI redacts the signed checkpoint token it
@@ -355,13 +368,20 @@ if (!statePath) {
 		const query = args[queryIndex + 1];
 		const value = session(sessionId);
 		if (value) {
-			if (query === "session.metadata") {
+			if (value.unavailableQueries?.includes(query)) {
+				fail("unavailable", `fixture query ${query} is unavailable`);
+			} else if (query === "session.metadata") {
 				fs.appendFileSync(`${statePath}.queries`, `${sessionId}\n`);
 				if (!value.metadata || value.metadata.unavailable === true) fail("session_unavailable", "fixture unavailable");
-				else success(value.metadata);
+				else queryResponse(value.metadata);
+			} else if (query === "session.checkpoint") {
+				queryResponse({
+					checkpoint: { revision: value.transcript?.length ?? 0, generation: 1, seq: value.nextSeq ?? 0 },
+					revisionId: "fixture-revision-id",
+				});
 			} else if (query === "context.get") {
 				const context = value.context ?? { isStreaming: false, followupQueueDepth: 0 };
-				success({ isStreaming: context.isStreaming === true, followupQueueDepth: context.followupQueueDepth ?? 0 });
+				queryResponse({ isStreaming: context.isStreaming === true, followupQueueDepth: context.followupQueueDepth ?? 0 });
 			} else if (query === "workflow.gates.list") {
 				success(value.gates ?? []);
 			} else {

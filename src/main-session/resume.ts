@@ -76,21 +76,35 @@ export async function strictResumeMainSession(options: ResumeOptions): Promise<R
 	}
 	const current = verified.identity;
 	let durableIdentity = durable.mainIdentity;
-	if (!durableIdentity.transcript) {
-		if (!current.transcript || !sameExternalSession(durableIdentity, current)) {
-			return failClosed(options.state, "main_identity_mismatch", "The broker did not provide a transcript proof for the committed external session.");
-		}
-		try {
-			const lastEntry = verified.transcriptEntries.at(-1);
+	if (!sameExternalSession(durableIdentity, current)) {
+		return failClosed(options.state, "main_identity_mismatch", "The broker returned a different external session identity.");
+	}
+	if (durable.transcriptProof === "pending") {
+		if (verified.transcriptProof === "proven") {
+			if (!current.transcript || verified.transcriptEntries.some(entry => !entry.id.trim())) {
+				return failClosed(options.state, "transcript_proof_invalid", "The broker returned an invalid complete transcript proof.");
+			}
 			const transcriptDeliveryProgress: TranscriptDeliveryProgress = {
-				...(lastEntry === undefined ? {} : { lastEntryId: lastEntry.id }),
+				...(verified.transcriptEntries.at(-1) === undefined ? {} : { lastEntryId: verified.transcriptEntries.at(-1)?.id }),
 				fingerprint: fingerprintTranscriptEntries(verified.transcriptEntries.map(entry => entry.payload)),
 			};
-			options.state.persistTranscriptProof(durableIdentity, current, transcriptDeliveryProgress);
-			durableIdentity = current;
-		} catch (error) {
-			return failClosed(options.state, "transcript_proof_persist_failed", error instanceof Error ? error.message : String(error), error);
+			if (
+				transcriptDeliveryProgress.fingerprint.entryCount !== current.transcript.entryCount ||
+				transcriptDeliveryProgress.fingerprint.sha256 !== current.transcript.sha256
+			) {
+				return failClosed(options.state, "transcript_proof_mismatch", "The broker transcript fingerprint did not match its complete snapshot.");
+			}
+			try {
+				options.state.persistTranscriptProof(durableIdentity, current, transcriptDeliveryProgress);
+				durableIdentity = current;
+			} catch (error) {
+				return failClosed(options.state, "transcript_proof_persist_failed", error instanceof Error ? error.message : String(error), error);
+			}
+		} else if (verified.transcriptProof !== "pending" || current.transcript) {
+			return failClosed(options.state, "transcript_proof_invalid", "The broker returned an invalid pending transcript proof.");
 		}
+	} else if (verified.transcriptProof !== "proven" || !current.transcript) {
+		return failClosed(options.state, "transcript_proof_unavailable", "The broker did not provide a complete transcript proof for the durable identity.");
 	}
 	let recoveredGrowthIntent = false;
 	if (durable.growthIntent) {

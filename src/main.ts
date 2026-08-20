@@ -1032,6 +1032,7 @@ async function serveWay(config: WayConfig): Promise<void> {
 				}
 			},
 			afterBrokerAcceptedBeforeFinalize: failAfterMainAdmissionBrokerAcceptedForE2e,
+			isTranscriptProofPending: () => state.read().transcriptProof === "pending",
 		});
 		const gateAnswerHandler = createMainGateAnswerHandler(host, core);
 		const closureHandler = closureBridgeHandler(core, closures, profile.corpusPath, resumed.identity.sessionId);

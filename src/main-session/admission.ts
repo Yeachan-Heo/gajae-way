@@ -48,6 +48,8 @@ export interface CreateMainAdmissionOptions {
 	readonly newOpRef?: () => string;
 	/** Test-only interruption seam after broker acceptance and before durable finalization. */
 	readonly afterBrokerAcceptedBeforeFinalize?: () => void | Promise<void>;
+	/** Durable identity fence; rejection happens before an idempotency claim or broker mutation. */
+	readonly isTranscriptProofPending?: () => boolean;
 }
 
 interface MainAdmissionIntent {
@@ -173,6 +175,7 @@ export function createMainAdmissionHandler(
 	const newOpRef = options.newOpRef ?? crypto.randomUUID;
 	return async (params: unknown): Promise<{ accepted: boolean; op_ref: string; delivered_as: DeliveredAs }> => {
 		const request = parseRequest(params);
+		if (options.isTranscriptProofPending?.()) throw new RpcBridgeException(1003, "transcript_proof_pending");
 		const canonicalSurfaceId = request.surfaceId.trim();
 		const surface = knownSurfaces.get(canonicalSurfaceId);
 		if (!surface) throw new RpcBridgeException(1300, "unknown_surface");

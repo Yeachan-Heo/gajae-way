@@ -124,6 +124,60 @@ externalTest("main.submit admits a held external turn before the bridge timeout"
 
 });
 
+externalTest("pending transcript proof fences admission until the first complete busy-tail boundary", async () => {
+	const fixture = new FakeBrokerFixture();
+	let gatewayOwned = false;
+	try {
+		fixture.holdNextTurn();
+		const operatorBroker = new BrokerCli({ executable: fixture.executable, environment: fixture.environment() });
+		await operatorBroker.sendPrompt(fixture.sessionId, "operator turn already in flight", "operator-busy");
+		fixture.setNoEnvelopeWhileBusy();
+
+		const gateway = await hosted({ fixture, tailTimeoutMs: 50, adoptionTailTimeoutMs: 50 });
+		gatewayOwned = true;
+		expect(gateway.state.read()).toMatchObject({ transcriptProof: "pending", tailCheckpoint: { revision: 2, generation: 1, seq: 3 } });
+
+		const pendingStatus = await gateway.client.request("way.status", {});
+		expect(pendingStatus.result).toMatchObject({ transcript_proof: "pending" });
+		const refused = await gateway.client.request("main.submit", {
+			text: "must remain fenced",
+			surface_id: "owner",
+			idempotency_key: "proof-pending-fence",
+		});
+		expect(rpcError(refused)).toEqual(expect.objectContaining({ code: 1003, message: "transcript_proof_pending" }));
+		expect(gateway.fixture.commands().filter(command => command.text === "must remain fenced")).toEqual([]);
+		expect((await gateway.client.request("main.events.read", { cursor: "1:0" })).error).toBeUndefined();
+
+		gateway.fixture.complete("operator-busy", { text: "operator boundary reached" });
+		await eventually(
+			() => (gateway.state.read().transcriptProof === "proven" ? true : undefined),
+			"the first complete tail did not bind the pending transcript proof",
+		);
+		expect((await gateway.client.request("way.status", {})).result).toMatchObject({ transcript_proof: "proven" });
+
+		gateway.fixture.holdNextTurn();
+		const accepted = await gateway.client.request("main.submit", {
+			text: "admission opens after proof",
+			surface_id: "owner",
+			idempotency_key: "proof-promoted-admission",
+		});
+		expect(accepted.result).toMatchObject({ accepted: true, delivered_as: "prompt" });
+		const opRef = (accepted.result as { op_ref: string }).op_ref;
+		gateway.fixture.complete(opRef, { text: "proof-bound roundtrip" });
+		await eventually(
+			() =>
+				gateway.core
+					.journalRead("1:0", 100)
+					.events.some(event => event.kind === "assistant_message" && event.payloadJson.includes("proof-bound roundtrip"))
+					? true
+					: undefined,
+			"proof-bound admission did not round-trip through the external session",
+		);
+	} finally {
+		if (!gatewayOwned) fixture.dispose();
+	}
+}, 30_000);
+
 externalTest("main.submit returns delivered_as before a held external assistant is journaled", async () => {
 	const gateway = await hosted();
 	gateway.fixture.holdNextTurn();
