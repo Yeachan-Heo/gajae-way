@@ -272,6 +272,14 @@ if (!statePath) {
 		}
 	} else if (args[0] === "sdk" && args[1] === "session" && args[2] === "tail") {
 		const value = session(args[3]);
+		if (value && typeof value.crashNextTailCount === "number" && value.crashNextTailCount > 0) {
+			// Transient transport failure injection: consume one crash budget and
+			// exit nonzero WITHOUT an envelope, like a CLI dying under load.
+			value.crashNextTailCount -= 1;
+			fs.writeFileSync(statePath, JSON.stringify(state, null, 1));
+			console.error("fixture: injected transient tail crash");
+			process.exit(1);
+		}
 		if (value) {
 			const items = [
 				...(value.transcript ?? []).map((payload, index) => ({ kind: "transcript", id: `transcript:${index}`, seq: index, payload })),

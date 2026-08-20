@@ -249,6 +249,24 @@ class ExternalMainSessionHost implements MainSessionHost {
 		this.#tailWake.resolve();
 		this.#tailWake = Promise.withResolvers<void>();
 	}
+
+	private admittedOperationRef(event: Record<string, unknown>): string | undefined {
+		const scope = isRecord(event.scope) ? event.scope : undefined;
+		const candidates = [
+			eventString(event, "operationRef", "operation_ref", "opRef", "op_ref", "clientRef", "client_ref"),
+			scope && eventString(scope, "attemptId", "attempt_id", "operationRef", "operation_ref", "clientRef", "client_ref"),
+		];
+		for (const candidate of candidates) {
+			if (!candidate) continue;
+			if (this.#admittedOperations.has(candidate)) return candidate;
+			const prefix = `${this.sessionId}:`;
+			if (candidate.startsWith(prefix)) {
+				const operationRef = candidate.slice(prefix.length);
+				if (this.#admittedOperations.has(operationRef)) return operationRef;
+			}
+		}
+		return undefined;
+	}
 	private publishStatus(): void {
 		try {
 			this.#journal.setMainSessionStatus?.(this.#turnState, this.#followUpQueueDepth);
@@ -386,18 +404,18 @@ class ExternalMainSessionHost implements MainSessionHost {
 			return;
 		}
 		if (type === "agent_end" || type === "turn_end") {
-			this.#turnState = "idle";
-			if (type === "agent_end") {
-				this.#admittedOperations.clear();
-				this.appendTurnTransition("turn_end", event);
-			}
+			const operationRef = this.admittedOperationRef(event);
+			if (operationRef) this.#admittedOperations.delete(operationRef);
+			this.#turnState = this.#admittedOperations.size === 0 ? "idle" : "busy";
+			if (type === "agent_end") this.appendTurnTransition("turn_end", event);
 			this.publishStatus();
 			this.finishGrowthWindowIfSettled();
 			return;
 		}
 		if (type === "agent_failed") {
-			this.#turnState = "idle";
-			this.#admittedOperations.clear();
+			const operationRef = this.admittedOperationRef(event);
+			if (operationRef) this.#admittedOperations.delete(operationRef);
+			this.#turnState = this.#admittedOperations.size === 0 ? "idle" : "busy";
 			this.publishStatus();
 			this.appendTurnTransition("turn_end", event);
 			this.finishGrowthWindowIfSettled();
@@ -438,10 +456,18 @@ class ExternalMainSessionHost implements MainSessionHost {
 	}
 
 	private async observeTail(): Promise<void> {
+		// Transport-level broker failures (CLI spawn pressure, command timeouts,
+		// transient nonzero exits) surface as "tail_unavailable" and are retried
+		// with bounded backoff: under load a single slow spawn must not
+		// permanently fail-stop the host. Authority/semantic failures (identity
+		// or locator mismatch, retention gap, growth mismatch, session
+		// unavailable) still fail closed immediately.
+		let transientFailures = 0;
 		while (!this.#disposed && !this.#failure) {
 			try {
 				const tail = await this.#supervisor.tailEvents();
 				if (this.#disposed) return;
+				transientFailures = 0;
 				if (tail.retentionGap) {
 					this.enterFailure("tail_retention_gap", new Error("Broker tail reported a retention gap."));
 					return;
@@ -450,17 +476,23 @@ class ExternalMainSessionHost implements MainSessionHost {
 				this.observeIdentity(tail.identity);
 				for (const event of tail.events) this.observeExternalEvent(event);
 				this.observeTranscript(tail.transcriptEntries.slice(priorTranscriptEntries));
-				if (tail.terminal) {
+				if (tail.terminal && this.#admittedOperations.size === 0) {
 					this.#turnState = "idle";
-					this.#admittedOperations.clear();
 					this.publishStatus();
 					this.finishGrowthWindowIfSettled();
 				}
+
 				const wake = this.#tailWake.promise;
 				await Promise.race([Bun.sleep(tail.terminal && this.#turnState === "idle" ? 500 : 100), wake, this.#tailStop.promise]);
 			} catch (error) {
 				if (this.#disposed) return;
 				const reason = error instanceof HostSupervisorError ? error.reason : "tail_observation_failed";
+				if (reason === "tail_unavailable" && transientFailures < 8) {
+					transientFailures += 1;
+					const backoffMs = Math.min(250 * 2 ** (transientFailures - 1), 4_000);
+					await Promise.race([Bun.sleep(backoffMs), this.#tailStop.promise]);
+					continue;
+				}
 				this.enterFailure(reason, error);
 				return;
 			}
@@ -500,7 +532,7 @@ class ExternalMainSessionHost implements MainSessionHost {
 
 	private finishGrowthWindowIfSettled(): void {
 		const growth = this.#growthWindow;
-		if (!growth || growth.pendingAdmissions > 0 || this.#turnState !== "idle" || this.#followUpQueueDepth > 0) return;
+		if (!growth || growth.pendingAdmissions > 0 || this.#admittedOperations.size > 0 || this.#turnState !== "idle" || this.#followUpQueueDepth > 0) return;
 		this.#growthWindow = undefined;
 		try {
 			this.#state.refreshAfterGrowth(growth.intent, this.#identity);
@@ -515,16 +547,19 @@ class ExternalMainSessionHost implements MainSessionHost {
 		if (!opRef.trim()) throw new MainSessionHostError("operation_ref_empty", "An admitted operation requires an operation reference.");
 		const growth = this.beginGrowthWindow();
 		growth.pendingAdmissions += 1;
+		this.#admittedOperations.set(opRef, deliveredAs);
 		try {
 			if (deliveredAs === "prompt") await this.#supervisor.sendPrompt(text, opRef);
 			else if (deliveredAs === "steer") await this.#supervisor.sendSteer(text, opRef);
 			else await this.#supervisor.followUp(text, opRef);
-			this.#admittedOperations.set(opRef, deliveredAs);
 			this.wakeTail();
-			if (deliveredAs === "follow_up") this.#followUpQueueDepth += 1;
-			else this.#turnState = "busy";
-			this.publishStatus();
+			if (this.#admittedOperations.has(opRef)) {
+				if (deliveredAs === "follow_up") this.#followUpQueueDepth += 1;
+				else this.#turnState = "busy";
+				this.publishStatus();
+			}
 		} catch (error) {
+			this.#admittedOperations.delete(opRef);
 			const reason = error instanceof HostSupervisorError ? error.reason : "turn_admission_failed";
 			throw new MainSessionHostError(reason, error instanceof Error ? error.message : String(error), { cause: error });
 		} finally {

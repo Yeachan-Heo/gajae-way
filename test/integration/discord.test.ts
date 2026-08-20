@@ -1,134 +1,61 @@
-import * as fs from "node:fs";
-import * as path from "node:path";
-import { afterEach, expect, test } from "bun:test";
-import { BrokerCli } from "../../src/broker/cli";
+import { AsyncLocalStorage } from "node:async_hooks";
+import { expect, test } from "bun:test";
 import { DiscordOutbox } from "../../src/adapter/discord/outbox";
 import { DiscordRouteHandler } from "../../src/adapter/discord/route";
-import { createMainAdmissionHandler } from "../../src/main-session/admission";
-import { bootstrapMainSession } from "../../src/main-session/bootstrap";
-import { createMainSessionHost, type MainSessionHost } from "../../src/main-session/host";
-import { strictResumeMainSession } from "../../src/main-session/resume";
-import { GatewayStateStore } from "../../src/main-session/state";
-import { createExternalHostSupervisor } from "../../src/main-session/supervisor";
-import { loadWayCore, type WayCoreHandle } from "../../src/native-loader";
-import { loadWayProfile } from "../../src/profile";
-import { createRpcBridge, RpcBridgeException, type RpcBridgeHandler } from "../../src/rpc-bridge";
-import { RpcClient } from "../../src/rpc-client";
 import { DiscordFixture, DiscordFixtureClock } from "../fixtures/discord-fixture";
-import { FakeBrokerFixture } from "../helpers/main-session";
+import { createExternalGateway, eventually, type ExternalGateway } from "../helpers/external-gateway";
 
-interface Gateway {
-	readonly fixture: FakeBrokerFixture;
-	readonly core: WayCoreHandle;
-	readonly host: MainSessionHost;
-	readonly client: RpcClient;
-	stop(): Promise<void>;
-}
+const gatewayScope = new AsyncLocalStorage<ExternalGateway[]>();
 
-const gateways: Gateway[] = [];
+type ExternalTestBody = () => void | Promise<void>;
 
-afterEach(async () => {
-	for (const gateway of gateways.splice(0)) await gateway.stop();
-});
+let externalTestTail: Promise<void> = Promise.resolve();
 
-async function connectEventually(socketPath: string): Promise<RpcClient> {
-	for (let attempt = 0; attempt < 100; attempt += 1) {
-		if (fs.existsSync(socketPath)) {
-			try {
-				return await RpcClient.connect(socketPath);
-			} catch {
-				// Listener startup races are expected.
-			}
+function externalTest(name: string, body: ExternalTestBody, timeoutMs?: number): void {
+	test(name, async () => {
+		let release: (() => void) | undefined;
+		const previous = externalTestTail;
+		externalTestTail = new Promise<void>(resolve => {
+			release = resolve;
+		});
+		await previous;
+		const gateways: ExternalGateway[] = [];
+		try {
+			await gatewayScope.run(gateways, body);
+		} finally {
+			for (const active of gateways.splice(0)) await active.stop();
+			release?.();
 		}
-		await Bun.sleep(10);
-	}
-	throw new Error(`RPC socket did not become available: ${socketPath}`);
+	}, Math.max(timeoutMs ?? 0, 60_000));
 }
 
-async function eventually(predicate: () => boolean, message: string): Promise<void> {
-	for (let attempt = 0; attempt < 100; attempt += 1) {
-		if (predicate()) return;
-		await Bun.sleep(20);
-	}
-	throw new Error(message);
-}
-
-async function gateway(): Promise<Gateway> {
-	const fixture = new FakeBrokerFixture();
-	const corpus = path.join(fixture.root, "corpus");
-	fs.mkdirSync(corpus, { recursive: true });
-	const profilePath = path.join(fixture.root, "profile.toml");
-	fs.writeFileSync(
-		profilePath,
-		`[corpus]
-path = "${corpus}"
-workspace = "${fixture.workspace}"
-
-[injection]
-files = []
-
-[main_session]
-session_id = "${fixture.sessionId}"
-
-[surfaces.owner]
-id = "discord:owner-dm"
-platform = "discord"
-kind = "dm"
-`,
-	);
-	const profile = loadWayProfile(profilePath);
-	const core = loadWayCore().WayCore.open(path.join(fixture.root, "state"));
-	const state = new GatewayStateStore(core);
-	const supervisor = createExternalHostSupervisor({
-		broker: new BrokerCli({ executable: fixture.executable, environment: fixture.environment() }),
-		workspace: fixture.workspace,
-		tailTimeoutMs: 100,
+async function gateway(): Promise<ExternalGateway> {
+	const active = await createExternalGateway({
+		ownerSurface: { id: "discord:owner-dm", platform: "discord", kind: "dm" },
+		knownSurfaces: [{ id: "discord:guest-channel", platform: "discord", kind: "channel" }],
 	});
-	await bootstrapMainSession({ confirm: true, profile, state, supervisor, sessionId: fixture.sessionId });
-	const resumed = await strictResumeMainSession({ profile, state, supervisor });
-	const host = createMainSessionHost({
-		supervisor,
-		identity: resumed.identity,
-		state,
-		journal: core,
-		initialTurnState: resumed.turnState,
-		initialFollowUpQueueDepth: resumed.followUpQueueDepth,
-	});
-	const submit = createMainAdmissionHandler(host, profile, core);
-	const socketPath = path.join(fixture.root, "state", "rpc.sock");
-	const handler: RpcBridgeHandler = async (method, params) => {
-		if (method === "main.submit") return await submit(params);
-		throw new RpcBridgeException(-32601, "method not found");
-	};
-	core.startRpcServer(socketPath, createRpcBridge(core, handler));
-	const client = await connectEventually(socketPath);
-	const output: Gateway = {
-		fixture,
-		core,
-		host,
-		client,
-		async stop() {
-			client.close();
-			await host.dispose();
-			core.shutdownRpcServer();
-			fixture.dispose();
-		},
-	};
-	gateways.push(output);
-	return output;
+	const gateways = gatewayScope.getStore();
+	if (!gateways) throw new Error("gateway() must run inside externalTest().");
+	gateways.push(active);
+	return active;
 }
 
-function outbox(client: RpcClient, fixture: DiscordFixture): DiscordOutbox {
+function outbox(
+	gatewayUnderTest: ExternalGateway,
+	fixture: DiscordFixture,
+	hooks: ConstructorParameters<typeof DiscordOutbox>[0]["hooks"] = undefined,
+): DiscordOutbox {
 	return new DiscordOutbox({
-		rpc: client,
+		rpc: gatewayUnderTest.client,
 		platform: fixture,
 		route: { channelId: "123456789012345678", surfaceId: "discord:owner-dm" },
 		claimTtlMs: 5_000,
 		readWaitMs: 0,
+		hooks,
 	});
 }
 
-test("Discord inbound uses message-id idempotency and egress consumes finalized external supervisor output", async () => {
+externalTest("Discord inbound deduplicates a message id before external broker admission and sends finalized output", async () => {
 	const gatewayUnderTest = await gateway();
 	const clock = new DiscordFixtureClock(1_000);
 	const fixture = new DiscordFixture({ now: clock.now });
@@ -143,32 +70,133 @@ test("Discord inbound uses message-id idempotency and egress consumes finalized 
 		const unsubscribe = fixture.onMessage(async message => {
 			await route.handle(message);
 		});
-		const inbound = { id: "message-1", channelId: "123456789012345678", text: "external broker round trip" };
+		const inbound = { id: "message-id-once", channelId: "123456789012345678", text: "external broker round trip" };
 		await Promise.all([fixture.emitMessage(inbound), fixture.emitMessage(inbound)]);
 		unsubscribe();
+
 		expect(fixture.acknowledgements).toHaveLength(1);
-		expect(gatewayUnderTest.fixture.commands()).toHaveLength(1);
+		expect(fixture.acknowledgements[0]?.at).toBeLessThanOrEqual(clock.now() + 2_000);
+		expect(gatewayUnderTest.fixture.commands()).toEqual([
+			expect.objectContaining({ operation: "turn.prompt", text: "external broker round trip" }),
+		]);
 		await eventually(
-			() => gatewayUnderTest.core.journalRead(undefined, 20).events.some(event => event.kind === "assistant_message"),
+			() => (gatewayUnderTest.core.journalRead("1:0", 20).events.some(event => event.kind === "assistant_message") ? true : undefined),
 			"external assistant output was not journaled",
 		);
-		expect(await outbox(gatewayUnderTest.client, fixture).runOnce()).toBe("sent");
+		expect(await outbox(gatewayUnderTest, fixture).runOnce()).toBe("sent");
 		expect(fixture.sends).toEqual([expect.objectContaining({ channelId: "123456789012345678", text: "ack" })]);
 	} finally {
 		await fixture.disconnect();
 	}
 });
 
-test("Discord outbox settles server-side journal delivery before a restart can repost", async () => {
+externalTest("Discord outbox settles server-side delivery before a restart can repost", async () => {
 	const gatewayUnderTest = await gateway();
 	const fixture = new DiscordFixture();
 	await fixture.connect();
 	try {
 		const appended = gatewayUnderTest.core.journalAppend("assistant_message", JSON.stringify({ finalized: true, text: "settle this" }));
-		expect(await outbox(gatewayUnderTest.client, fixture).runOnce()).toBe("sent");
+		expect(await outbox(gatewayUnderTest, fixture).runOnce()).toBe("sent");
 		expect(gatewayUnderTest.core.consumerCursor("gajaeway-discord")).toBe(appended.cursor);
-		expect(await outbox(gatewayUnderTest.client, fixture).runOnce()).toBe("idle");
+		expect(gatewayUnderTest.core.consumerOutbox("gajaeway-discord")).toEqual([
+			expect.objectContaining({ seq: appended.seq, state: "sent", dedupeKey: "gajaeway-discord:discord:owner-dm:1" }),
+		]);
+
+		const restarted = outbox(gatewayUnderTest, fixture);
+		expect(await restarted.runOnce()).toBe("idle");
 		expect(fixture.sends).toHaveLength(1);
+	} finally {
+		await fixture.disconnect();
+	}
+});
+
+externalTest("Discord crash before send leaves the durable checkpoint for restart delivery", async () => {
+	const gatewayUnderTest = await gateway();
+	const fixture = new DiscordFixture();
+	await fixture.connect();
+	try {
+		const appended = gatewayUnderTest.core.journalAppend("assistant_message", JSON.stringify({ finalized: true, text: "retry before send" }));
+		const abort = new AbortController();
+		const interrupted = outbox(gatewayUnderTest, fixture, { beforeSend: () => abort.abort() });
+		await expect(interrupted.runOnce(abort.signal)).rejects.toMatchObject({ name: "AbortError" });
+		expect(fixture.sends).toEqual([]);
+		expect(gatewayUnderTest.core.consumerCursor("gajaeway-discord")).toBe("1:0");
+
+		await Bun.sleep(5_100);
+		expect(await outbox(gatewayUnderTest, fixture).runOnce()).toBe("sent");
+		expect(fixture.sends).toHaveLength(1);
+		expect(gatewayUnderTest.core.consumerCursor("gajaeway-discord")).toBe(appended.cursor);
+	} finally {
+		await fixture.disconnect();
+	}
+}, 15_000);
+
+externalTest("Discord crash after send before settlement retries with a nonce and does not double-post", async () => {
+	const gatewayUnderTest = await gateway();
+	const fixture = new DiscordFixture();
+	await fixture.connect();
+	try {
+		const appended = gatewayUnderTest.core.journalAppend("assistant_message", JSON.stringify({ finalized: true, text: "retry after send" }));
+		const abort = new AbortController();
+		const interrupted = outbox(gatewayUnderTest, fixture, { afterSendBeforeCommit: () => abort.abort() });
+		await expect(interrupted.runOnce(abort.signal)).rejects.toMatchObject({ name: "AbortError" });
+		expect(fixture.sends).toHaveLength(1);
+		expect(gatewayUnderTest.core.consumerCursor("gajaeway-discord")).toBe("1:0");
+
+		await Bun.sleep(5_100);
+		expect(await outbox(gatewayUnderTest, fixture).runOnce()).toBe("sent");
+		expect(fixture.sends).toHaveLength(1);
+		expect(fixture.sendAttempts).toEqual([
+			expect.objectContaining({ duplicate: false, nonce: "gajaeway-discord:discord:owner-dm:1" }),
+			expect.objectContaining({ duplicate: true, nonce: "gajaeway-discord:discord:owner-dm:1" }),
+		]);
+		expect(gatewayUnderTest.core.consumerCursor("gajaeway-discord")).toBe(appended.cursor);
+	} finally {
+		await fixture.disconnect();
+	}
+}, 15_000);
+
+externalTest("Discord non-owner engagement is admitted as follow_up whether the external turn is idle or busy", async () => {
+	const gatewayUnderTest = await gateway();
+	const fixture = new DiscordFixture();
+	await fixture.connect();
+	try {
+		const guestRoute = new DiscordRouteHandler({
+			rpc: gatewayUnderTest.client,
+			platform: fixture,
+			route: { channelId: "222222222222222222", surfaceId: "discord:guest-channel" },
+		});
+		await guestRoute.handle({ id: "guest-idle", channelId: "222222222222222222", text: "idle guest message", acceptedAt: Date.now() });
+
+		gatewayUnderTest.fixture.holdNextTurn();
+		const ownerRoute = new DiscordRouteHandler({
+			rpc: gatewayUnderTest.client,
+			platform: fixture,
+			route: { channelId: "123456789012345678", surfaceId: "discord:owner-dm" },
+		});
+		await ownerRoute.handle({ id: "owner-held", channelId: "123456789012345678", text: "held owner message", acceptedAt: Date.now() });
+		await eventually(() => (gatewayUnderTest.host.turnState === "busy" ? true : undefined), "owner turn was not admitted as busy");
+		await guestRoute.handle({ id: "guest-busy", channelId: "222222222222222222", text: "busy guest message", acceptedAt: Date.now() });
+
+		expect(gatewayUnderTest.fixture.commands().map(command => ({ operation: command.operation, text: command.text }))).toEqual([
+			{ operation: "turn.follow_up", text: "idle guest message" },
+			{ operation: "turn.prompt", text: "held owner message" },
+			{ operation: "turn.follow_up", text: "busy guest message" },
+		]);
+		expect(fixture.acknowledgements).toHaveLength(3);
+		const heldPrompt = gatewayUnderTest.fixture.commands().find(command => command.operation === "turn.prompt");
+		if (typeof heldPrompt?.opRef !== "string") throw new Error("held Discord owner prompt was not recorded with an operation reference");
+		gatewayUnderTest.fixture.complete(heldPrompt.opRef, { text: "settled after Discord follow-up assertion" });
+		await eventually(
+			() =>
+				gatewayUnderTest.core
+					.journalRead("1:0", 100)
+					.events.some(event => event.kind === "assistant_message" && JSON.parse(event.payloadJson).text === "settled after Discord follow-up assertion")
+					? true
+					: undefined,
+			"held Discord owner prompt did not settle before teardown",
+			15_000,
+		);
 	} finally {
 		await fixture.disconnect();
 	}

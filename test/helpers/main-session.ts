@@ -156,6 +156,12 @@ export class FakeBrokerFixture {
 		});
 	}
 
+	crashNextTails(count: number): void {
+		this.update(session => {
+			(session as { crashNextTailCount?: number }).crashNextTailCount = count;
+		});
+	}
+
 	failNextTurn(): void {
 		this.update(session => {
 			session.failNext = true;
@@ -181,7 +187,29 @@ export class FakeBrokerFixture {
 		});
 	}
 
-	complete(opRef: string, options: { readonly failure?: boolean; readonly text?: string } = {}): void {
+	/** Adds an externally observed transcript entry without routing it through gajaeway. */
+	appendTranscript(entry: unknown): void {
+		this.update(session => {
+			session.transcript.push(entry);
+		});
+	}
+
+	/** Adds one broker-tail event for projection tests, preserving the fixture event sequence. */
+	appendTailEvent(kind: string, payload: Record<string, unknown>): void {
+		this.update(session => {
+			session.nextSeq += 1;
+			session.events.push({
+				kind,
+				id: `${this.sessionId}:${session.nextSeq}`,
+				generation: 1,
+				seq: session.nextSeq,
+				payload,
+			});
+		});
+	}
+
+
+	complete(opRef: string, options: { readonly failure?: boolean; readonly text?: string; readonly appendTranscript?: boolean } = {}): void {
 		this.update(session => {
 			const operation = session.operations[opRef];
 			if (!operation || operation.completed) throw new Error(`fixture operation ${opRef} is not held`);
@@ -205,7 +233,9 @@ export class FakeBrokerFixture {
 				const timestamp = 1_700_000_000_000 + session.nextSeq;
 				const responseId = `${this.sessionId}:assistant:${opRef}`;
 				const message = { role: "assistant", content: [{ type: "text", text }], responseId, timestamp };
-				session.transcript.push({ type: "message", role: "assistant", content: text, responseId, timestamp });
+				if (options.appendTranscript ?? true) {
+					session.transcript.push({ type: "message", role: "assistant", content: text, responseId, timestamp });
+				}
 				append("message_end", { type: "message_end", message, scope });
 				append("turn_end", { type: "turn_end", message, toolResults: [], scope });
 				append("agent_end", { type: "agent_end", messages: [message], stopReason: "completed", scope });

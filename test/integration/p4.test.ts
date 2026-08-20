@@ -1,233 +1,329 @@
-import * as crypto from "node:crypto";
+import { AsyncLocalStorage } from "node:async_hooks";
 import * as fs from "node:fs";
+import * as os from "node:os";
 import * as path from "node:path";
-import { afterEach, expect, test } from "bun:test";
-import { BrokerCli } from "../../src/broker/cli";
-import { createMainAdmissionHandler } from "../../src/main-session/admission";
-import { createMainGateAnswerHandler } from "../../src/main-session/gates";
-import { bootstrapMainSession } from "../../src/main-session/bootstrap";
-import { createMainSessionHost, type MainSessionHost } from "../../src/main-session/host";
-import { strictResumeMainSession } from "../../src/main-session/resume";
-import { GatewayStateStore } from "../../src/main-session/state";
-import { createExternalHostSupervisor } from "../../src/main-session/supervisor";
-import { loadWayCore, type WayCoreHandle } from "../../src/native-loader";
-import { loadWayProfile } from "../../src/profile";
-import { createRpcBridge, RpcBridgeException, type RpcBridgeHandler } from "../../src/rpc-bridge";
-import { RpcClient } from "../helpers/rpc-client";
-import { FakeBrokerFixture } from "../helpers/main-session";
+import { expect, test } from "bun:test";
+import { canonicalJson } from "../../src/main-session/gates";
+import { connectEventually, createExternalGateway, eventually, type ExternalGateway } from "../helpers/external-gateway";
 
-interface HostedServer {
-	readonly fixture: FakeBrokerFixture;
-	readonly core: WayCoreHandle;
-	readonly state: GatewayStateStore;
-	readonly profile: ReturnType<typeof loadWayProfile>;
-	readonly host: MainSessionHost;
-	readonly client: RpcClient;
-	stop(): Promise<void>;
-}
+const gatewayScope = new AsyncLocalStorage<ExternalGateway[]>();
 
-const servers: HostedServer[] = [];
+type ExternalTestBody = () => void | Promise<void>;
+const externalTestLockPath = path.join(os.tmpdir(), `gajaeway-p4-external-test-${process.pid}.lock`);
 
-afterEach(async () => {
-	for (const server of servers.splice(0)) await server.stop();
-});
-
-function profileFor(fixture: FakeBrokerFixture): ReturnType<typeof loadWayProfile> {
-	const corpus = path.join(fixture.root, "corpus");
-	fs.mkdirSync(corpus, { recursive: true });
-	const profilePath = path.join(fixture.root, "profile.toml");
-	fs.writeFileSync(
-		profilePath,
-		`[corpus]
-path = "${corpus}"
-workspace = "${fixture.workspace}"
-
-[injection]
-files = []
-
-[main_session]
-session_id = "${fixture.sessionId}"
-
-[surfaces.owner]
-id = "owner"
-platform = "test"
-kind = "dm"
-
-[[surfaces.known]]
-id = "guest"
-platform = "test"
-kind = "channel"
-`,
-	);
-	return loadWayProfile(profilePath);
-}
-
-async function connectEventually(socketPath: string): Promise<RpcClient> {
-	for (let attempt = 0; attempt < 100; attempt += 1) {
-		if (fs.existsSync(socketPath)) {
-			try {
-				return await RpcClient.connect(socketPath);
-			} catch {
-				// Listener startup races are expected.
-			}
+async function acquireExternalTestLock(): Promise<() => void> {
+	const deadline = Date.now() + 55_000;
+	for (;;) {
+		try {
+			const descriptor = fs.openSync(externalTestLockPath, "wx");
+			return () => {
+				fs.closeSync(descriptor);
+				fs.rmSync(externalTestLockPath, { force: true });
+			};
+		} catch (error) {
+			if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+			if (Date.now() >= deadline) throw new Error("Timed out waiting for the external gateway test lock.");
+			await Bun.sleep(10);
 		}
+	}
+}
+
+
+
+function externalTest(name: string, body: ExternalTestBody, timeoutMs?: number): void {
+	test(name, async () => {
+		let releaseLock: (() => void) | undefined;
+		const gateways: ExternalGateway[] = [];
+		try {
+			releaseLock = await acquireExternalTestLock();
+			await gatewayScope.run(gateways, body);
+		} finally {
+			for (const gateway of gateways.splice(0)) await gateway.stop();
+			releaseLock?.();
+		}
+	}, Math.max(timeoutMs ?? 0, 60_000));
+}
+
+async function hosted(options: Parameters<typeof createExternalGateway>[0] = {}): Promise<ExternalGateway> {
+	const gateway = await createExternalGateway({
+		knownSurfaces: [{ id: "guest", platform: "test", kind: "channel" }],
+		...options,
+	});
+	const gateways = gatewayScope.getStore();
+	if (!gateways) throw new Error("hosted() must run inside externalTest().");
+	gateways.push(gateway);
+	return gateway;
+}
+
+function rpcError(response: Awaited<ReturnType<ExternalGateway["client"]["request"]>>) {
+	if (!response.error) throw new Error(`Expected an RPC error, got ${JSON.stringify(response)}`);
+	return response.error;
+}
+
+async function waitForBusyStatus(gateway: ExternalGateway): Promise<Awaited<ReturnType<ExternalGateway["client"]["request"]>>> {
+	const deadline = Date.now() + 2_000;
+	for (;;) {
+		const response = await gateway.client.request("way.status", {});
+		if ((response.result as { turn_state?: unknown } | undefined)?.turn_state === "busy") return response;
+		if (Date.now() >= deadline) throw new Error("main.submit did not project busy turn state within 2000 ms.");
 		await Bun.sleep(10);
 	}
-	throw new Error(`RPC socket did not become available: ${socketPath}`);
 }
 
-async function eventually<T>(read: () => T | undefined, message: string): Promise<T> {
-	for (let attempt = 0; attempt < 500; attempt += 1) {
-		const value = read();
-		if (value !== undefined) return value;
-		await Bun.sleep(20);
-	}
-	throw new Error(message);
+
+async function settleHeld(gateway: ExternalGateway, opRef: string, text: string): Promise<void> {
+	await eventually(
+		() => (gateway.core.journalRead("1:0", 100).events.some(event => event.kind === "turn_start") ? true : undefined),
+		`held operation ${opRef} did not publish its lifecycle start before teardown`,
+		15_000,
+	);
+	const terminalEventsBefore = gateway.core.journalRead("1:0", 100).events.filter(event => event.kind === "turn_end").length;
+	gateway.fixture.complete(opRef, { text, appendTranscript: false });
+	await eventually(
+		() => (gateway.core.journalRead("1:0", 100).events.filter(event => event.kind === "turn_end").length > terminalEventsBefore ? true : undefined),
+		`held operation ${opRef} did not settle before fixture teardown`,
+		15_000,
+	);
 }
 
-async function hostedServer(): Promise<HostedServer> {
-	const fixture = new FakeBrokerFixture();
-	const profile = profileFor(fixture);
-	const stateDir = path.join(fixture.root, "state");
-	const core = loadWayCore().WayCore.open(stateDir);
-	const state = new GatewayStateStore(core);
-	const supervisor = createExternalHostSupervisor({
-		broker: new BrokerCli({ executable: fixture.executable, environment: fixture.environment() }),
-		workspace: fixture.workspace,
-		tailTimeoutMs: 100,
-		commandTimeoutMs: 1_000,
-	});
-	await bootstrapMainSession({ confirm: true, profile, state, supervisor, sessionId: fixture.sessionId });
-	const resumed = await strictResumeMainSession({ profile, state, supervisor });
-	const host = createMainSessionHost({
-		supervisor,
-		identity: resumed.identity,
-		state,
-		journal: core,
-		initialTurnState: resumed.turnState,
-		initialFollowUpQueueDepth: resumed.followUpQueueDepth,
-	});
-	const submit = createMainAdmissionHandler(host, profile, core, { newOpRef: () => crypto.randomUUID() });
-	const answer = createMainGateAnswerHandler(host, core);
-	const handler: RpcBridgeHandler = async (method, params) => {
-		if (method === "main.submit") return await submit(params);
-		if (method === "main.gate.answer") return await answer(params);
-		throw new RpcBridgeException(-32601, `method not found: ${method}`);
-	};
-	const socketPath = path.join(stateDir, "rpc.sock");
-	core.startRpcServer(socketPath, createRpcBridge(core, handler));
-	const client = await connectEventually(socketPath);
-	const server: HostedServer = {
-		fixture,
-		core,
-		state,
-		profile,
-		host,
-		client,
-		async stop() {
-			client.close();
-			await host.dispose();
-			core.shutdownRpcServer();
-			fixture.dispose();
-		},
-	};
-	servers.push(server);
-	return server;
-}
 
-test("main.submit returns admission before a held external turn and preserves idempotent delivery", async () => {
-	const server = await hostedServer();
-	server.fixture.holdNextTurn();
-	const response = await server.client.request(
+externalTest("main.submit admits a held external turn before the bridge timeout", async () => {
+	const gateway = await hosted();
+	gateway.fixture.holdNextTurn();
+
+	const response = await gateway.client.request(
 		"main.submit",
 		{ text: "held owner prompt", surface_id: "owner", idempotency_key: "held-owner" },
 		{ timeoutMs: 1_000 },
 	);
+
+	const opRef = (response.result as { op_ref: string }).op_ref;
 	expect(response.error).toBeUndefined();
-	const heldOpRef = (response.result as { op_ref: string }).op_ref;
-	expect(response.result).toMatchObject({ accepted: true, delivered_as: "prompt", op_ref: expect.any(String) });
-	expect(server.fixture.commands()).toHaveLength(1);
-	expect(server.core.rpcBridgeStats().timeouts).toBe(0);
-	expect(server.state.read().growthIntent).toBeDefined();
-	expect(server.core.journalRead(undefined, 100).events.filter(event => event.kind === "assistant_message")).toHaveLength(0);
+	expect(response.result).toMatchObject({ accepted: true, delivered_as: "prompt" });
+	expect(opRef).toEqual(expect.any(String));
+	expect(gateway.fixture.commands()).toEqual([expect.objectContaining({ operation: "turn.prompt", text: "held owner prompt" })]);
+	expect(gateway.core.rpcBridgeStats().timeouts).toBe(0);
+	expect(gateway.core.journalRead("1:0", 100).events.filter(event => event.kind === "assistant_message")).toEqual([]);
+	const busyStatus = await waitForBusyStatus(gateway);
+	expect(busyStatus.result).toMatchObject({ turn_state: "busy" });
+	await settleHeld(gateway, opRef, "settled after bridge timing assertion");
 
-	const status = await server.client.request("way.status", {});
-	expect(status.result).toMatchObject({ turn_state: "busy" });
-	const followUp = await server.client.request(
-		"main.submit",
-		{ text: "guest continuation", surface_id: "guest", idempotency_key: "guest-followup" },
-		{ timeoutMs: 1_000 },
+});
+
+externalTest("main.submit returns delivered_as before a held external assistant is journaled", async () => {
+	const gateway = await hosted();
+	gateway.fixture.holdNextTurn();
+
+	const response = await gateway.client.request("main.submit", {
+		text: "response before assistant",
+		surface_id: "owner",
+		idempotency_key: "response-before-assistant",
+	});
+	const opRef = (response.result as { op_ref: string }).op_ref;
+	expect(response.result).toMatchObject({ accepted: true, delivered_as: "prompt" });
+	expect(gateway.core.journalRead("1:0", 100).events.filter(event => event.kind === "assistant_message")).toEqual([]);
+
+	await eventually(
+		() => (gateway.core.journalRead("1:0", 100).events.some(event => event.kind === "turn_start") ? true : undefined),
+		"held external turn did not publish its lifecycle start before completion",
+		15_000,
 	);
-	expect(followUp.result).toMatchObject({ accepted: true, delivered_as: "follow_up" });
-
-	const replay = await server.client.request(
-		"main.submit",
-		{ text: "held owner prompt", surface_id: "owner", idempotency_key: "held-owner" },
-		{ timeoutMs: 1_000 },
-	);
-	expect(replay.result).toEqual(response.result);
-	expect(server.fixture.commands().filter(command => command.operation === "turn.prompt" && command.text === "held owner prompt")).toHaveLength(1);
-
-	server.fixture.complete(heldOpRef, { text: "final delayed answer" });
+	gateway.fixture.complete(opRef, { text: "journaled after admission", appendTranscript: false });
 	const assistant = await eventually(
 		() =>
-			server.core
-				.journalRead(undefined, 100)
-				.events.find(event => event.kind === "assistant_message" && JSON.parse(event.payloadJson).text === "final delayed answer"),
-		"held external turn did not publish an assistant message",
+			gateway.core
+				.journalRead("1:0", 100)
+				.events.find(event => event.kind === "assistant_message" && JSON.parse(event.payloadJson).text === "journaled after admission"),
+		"held assistant output was not journaled",
+		15_000,
 	);
-	expect(JSON.parse(assistant.payloadJson)).toMatchObject({ finalized: true, text: "final delayed answer" });
-	await eventually(() => (server.state.read().growthIntent === undefined ? true : undefined), "growth intent did not settle");
-}, 15_000);
+	expect(JSON.parse(assistant.payloadJson)).toMatchObject({ finalized: true, text: "journaled after admission" });
+}, 20_000);
 
-test("main.events.read receives one stable lifecycle attempt from overlapping external SDK events", async () => {
-	const server = await hostedServer();
-	server.fixture.holdNextTurn();
-	const response = await server.client.request("main.submit", {
-		text: "journal shape",
+externalTest("main.submit replays a pending admission identically without double-sending", async () => {
+	const gateway = await hosted();
+	gateway.fixture.holdNextTurn();
+	const request = { text: "pending once", surface_id: "owner", idempotency_key: "pending-once" };
+
+	const first = await gateway.client.request("main.submit", request, { timeoutMs: 1_000 });
+	const replay = await gateway.client.request("main.submit", request, { timeoutMs: 1_000 });
+
+	expect(first.result).toMatchObject({ accepted: true, delivered_as: "prompt" });
+	expect(replay.result).toEqual(first.result);
+	expect(gateway.fixture.commands().filter(command => command.operation === "turn.prompt" && command.text === "pending once")).toHaveLength(1);
+	await settleHeld(gateway, (first.result as { op_ref: string }).op_ref, "settled after idempotent replay assertion");
+
+});
+
+externalTest("main.submit rejects conflicting reuse of a pending idempotency key with 1500", async () => {
+	const gateway = await hosted();
+	gateway.fixture.holdNextTurn();
+	const accepted = await gateway.client.request("main.submit", {
+		text: "first meaning",
 		surface_id: "owner",
-		idempotency_key: "journal-shape",
+		idempotency_key: "conflicting-key",
+	});
+	expect(accepted.result).toMatchObject({ accepted: true });
+
+	const conflict = await gateway.client.request("main.submit", {
+		text: "different meaning",
+		surface_id: "owner",
+		idempotency_key: "conflicting-key",
+	});
+	expect(rpcError(conflict)).toEqual(expect.objectContaining({ code: 1500, message: "idempotency_conflict" }));
+	expect(gateway.fixture.commands().filter(command => command.opRef === (accepted.result as { op_ref: string }).op_ref)).toHaveLength(1);
+	await settleHeld(gateway, (accepted.result as { op_ref: string }).op_ref, "settled after conflict assertion");
+
+});
+
+externalTest("main.submit rejects an unknown surface with 1300", async () => {
+	const gateway = await hosted();
+	const response = await gateway.client.request("main.submit", {
+		text: "unknown route",
+		surface_id: "not-configured",
+		idempotency_key: "unknown-surface",
+	});
+	expect(rpcError(response)).toEqual(expect.objectContaining({ code: 1300, message: "unknown_surface" }));
+	expect(gateway.fixture.commands()).toEqual([]);
+});
+
+externalTest("main.submit rejects empty text before broker admission", async () => {
+	const gateway = await hosted();
+	const response = await gateway.client.request("main.submit", {
+		text: "   ",
+		surface_id: "owner",
+		idempotency_key: "empty-text",
+	});
+	expect(rpcError(response)).toEqual(expect.objectContaining({ code: -32602, message: "text must be a non-empty string." }));
+	expect(gateway.fixture.commands()).toEqual([]);
+});
+
+externalTest("main.submit rejects a quarantined surface with 1302", async () => {
+	const gateway = await hosted({ isSurfaceQuarantined: surface => surface.id === "owner" });
+	const response = await gateway.client.request("main.submit", {
+		text: "quarantined owner input",
+		surface_id: "owner",
+		idempotency_key: "quarantined-owner",
+	});
+	expect(rpcError(response)).toEqual(expect.objectContaining({ code: 1302, message: "session_quarantined" }));
+	expect(gateway.fixture.commands()).toEqual([]);
+});
+
+externalTest("non-owner admission is follow_up while the external main session is idle or busy", async () => {
+	const gateway = await hosted();
+	const idle = await gateway.client.request("main.submit", {
+		text: "idle guest message",
+		surface_id: "guest",
+		idempotency_key: "guest-idle",
+	});
+	expect(idle.result).toMatchObject({ accepted: true, delivered_as: "follow_up" });
+
+	gateway.fixture.holdNextTurn();
+	const owner = await gateway.client.request("main.submit", {
+		text: "hold owner turn",
+		surface_id: "owner",
+		idempotency_key: "owner-held-for-guest",
+	});
+	expect(owner.result).toMatchObject({ delivered_as: "prompt" });
+	const busy = await gateway.client.request("main.submit", {
+		text: "busy guest message",
+		surface_id: "guest",
+		idempotency_key: "guest-busy",
+	});
+	expect(busy.result).toMatchObject({ accepted: true, delivered_as: "follow_up" });
+	expect(gateway.fixture.commands().filter(command => command.operation === "turn.follow_up").map(command => command.text)).toEqual([
+		"idle guest message",
+		"busy guest message",
+	]);
+	await settleHeld(gateway, (owner.result as { op_ref: string }).op_ref, "settled after guest follow-up assertion");
+});
+
+externalTest("post-admission external failure degrades health and closes the terminal journal attempt", async () => {
+	const gateway = await hosted();
+	gateway.fixture.holdNextTurn();
+	const response = await gateway.client.request("main.submit", {
+		text: "fails after acceptance",
+		surface_id: "owner",
+		idempotency_key: "fails-after-acceptance",
 	});
 	const opRef = (response.result as { op_ref: string }).op_ref;
-	server.fixture.complete(opRef, { text: "finalized only" });
+	expect(response.result).toMatchObject({ accepted: true, delivered_as: "prompt" });
+
+	gateway.fixture.complete(opRef, { failure: true });
+	await eventually(() => (gateway.host.degraded ? true : undefined), "host did not degrade after terminal broker failure");
 	await eventually(
-		() => (server.core.journalRead(undefined, 100).events.filter(event => event.kind === "turn_end").length === 1 ? true : undefined),
-		"external lifecycle did not settle",
+		() => (gateway.core.journalRead("1:0", 100).events.some(event => event.kind === "turn_end") ? true : undefined),
+		"terminal failure did not close the journal attempt",
 	);
-	const events = await server.client.request("main.events.read", { cursor: "1:0", kinds: ["turn_start", "assistant_message", "turn_end"] });
+
+	expect((await gateway.client.request("way.health", {})).result).toMatchObject({
+		status: "unhealthy",
+		state: "degraded",
+		reason: "turn_execution_failed",
+	});
+	const terminalEvents = gateway.core
+		.journalRead("1:0", 100)
+		.events.filter(event => event.kind === "turn_start" || event.kind === "assistant_message" || event.kind === "turn_end");
+	expect(terminalEvents.map(event => event.kind)).toEqual(["turn_start", "turn_end"]);
+	expect(gateway.state.read().growthIntent).toBeUndefined();
+});
+
+externalTest("main.events.read projects overlapping external lifecycle pairs as one attempt", async () => {
+	const gateway = await hosted();
+	gateway.fixture.holdNextTurn();
+	const response = await gateway.client.request("main.submit", {
+		text: "deduplicated lifecycle",
+		surface_id: "owner",
+		idempotency_key: "deduplicated-lifecycle",
+	});
+	const opRef = (response.result as { op_ref: string }).op_ref;
+	await eventually(
+		() => (gateway.core.journalRead("1:0", 100).events.some(event => event.kind === "turn_start") ? true : undefined),
+		"overlapping lifecycle did not publish its start pair before completion",
+		15_000,
+	);
+	gateway.fixture.complete(opRef, { text: "one final answer", appendTranscript: false });
+	await eventually(
+		() => (gateway.core.journalRead("1:0", 100).events.filter(event => event.kind === "turn_end").length === 1 ? true : undefined),
+		"external lifecycle did not settle",
+		15_000,
+	);
+
+	const events = await gateway.client.request("main.events.read", {
+		cursor: "1:0",
+		kinds: ["turn_start", "assistant_message", "turn_end"],
+	});
 	const rows = (events.result as { events: Array<{ kind: string; payload: Record<string, unknown> }> }).events;
 	expect(rows.map(row => row.kind)).toEqual(["turn_start", "assistant_message", "turn_end"]);
-	expect(rows[0]?.payload).toMatchObject({ attempt_id: `${server.fixture.sessionId}:${opRef}`, lineage: "main" });
-	expect(rows[1]?.payload).toMatchObject({ finalized: true, text: "finalized only" });
-	expect(rows[2]?.payload).toMatchObject({ attempt_id: `${server.fixture.sessionId}:${opRef}`, lineage: "main" });
-}, 15_000);
+	expect(rows[0]?.payload).toEqual({ attempt_id: `${gateway.fixture.sessionId}:${opRef}`, generation: 1, lineage: "main" });
+	expect(rows[1]?.payload).toMatchObject({ finalized: true, text: "one final answer" });
+	expect(rows[2]?.payload).toEqual({ attempt_id: `${gateway.fixture.sessionId}:${opRef}`, generation: 1, lineage: "main" });
+}, 20_000);
 
-test("post-admission external failure degrades gateway health and unsupported gate answers stay explicit", async () => {
-	const server = await hostedServer();
-	server.fixture.holdNextTurn();
-	const response = await server.client.request("main.submit", {
-		text: "fails later",
-		surface_id: "owner",
-		idempotency_key: "fails-later",
-	});
-	const opRef = (response.result as { op_ref: string }).op_ref;
-	server.fixture.complete(opRef, { failure: true });
-	await eventually(() => (server.host.degraded ? true : undefined), "host did not degrade after external terminal failure");
-	const health = await server.client.request("way.health", {});
-	expect(health.result).toMatchObject({ status: "unhealthy", state: "degraded", reason: "turn_execution_failed" });
-	server.host.gates.observeOpen({ gateId: "unsupported", expectedSessionId: server.fixture.sessionId });
-	const gate = await server.client.request("main.gate.answer", {
-		gate_id: "unsupported",
-		expected_session_id: server.fixture.sessionId,
-		answer: { value: true },
-		idempotency_key: "unsupported-gate",
-	});
-	expect(gate.result).toEqual({ accepted: false, gate_state: "unsupported" });
-	const replay = await server.client.request("main.gate.answer", {
-		gate_id: "unsupported",
-		expected_session_id: server.fixture.sessionId,
-		answer: { value: true },
-		idempotency_key: "unsupported-gate",
-	});
-	expect(replay.result).toEqual({ accepted: false, gate_state: "unsupported" });
-}, 15_000);
+externalTest("main.gate.answer reports unsupported and durably replays that honest broker limitation", async () => {
+	const gateway = await hosted();
+	gateway.host.gates.observeOpen({ gateId: "broker-cannot-answer", expectedSessionId: gateway.fixture.sessionId });
+	const request = {
+		gate_id: "broker-cannot-answer",
+		expected_session_id: gateway.fixture.sessionId,
+		answer: { approved: true },
+		idempotency_key: "broker-gate-unsupported",
+	};
+
+	const first = await gateway.client.request("main.gate.answer", request);
+	const replayClient = await connectEventually(gateway.socketPath);
+	try {
+		const replay = await replayClient.request("main.gate.answer", request);
+		expect(first.result).toEqual({ accepted: false, gate_state: "unsupported" });
+		expect(replay.result).toEqual(first.result);
+		expect(
+			gateway.core.idempotencyReplay({
+				scope: "main.gate.answer",
+				key: request.idempotency_key,
+				requestJson: canonicalJson(request),
+			}),
+		).toEqual(expect.objectContaining({ replayed: true, responseJson: canonicalJson({ accepted: false, gate_state: "unsupported" }) }));
+	} finally {
+		replayClient.close();
+	}
+});
