@@ -4,6 +4,11 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { afterEach, expect, test } from "bun:test";
 
+import { BrokerCli } from "../../src/broker/cli";
+import { createMainAdmissionHandler, reconcilePendingMainAdmissions } from "../../src/main-session/admission";
+import { strictResumeMainSession } from "../../src/main-session/resume";
+import { createExternalHostSupervisor } from "../../src/main-session/supervisor";
+
 import { canonicalJson } from "../../src/main-session/gates";
 import { connectEventually, createExternalGateway, eventually, type ExternalGateway } from "../helpers/external-gateway";
 import { ManagedProcessRegistry } from "../helpers/managed-process";
@@ -87,7 +92,7 @@ async function settleHeld(gateway: ExternalGateway, opRef: string, text: string)
 		15_000,
 	);
 	const terminalEventsBefore = gateway.core.journalRead("1:0", 100).events.filter(event => event.kind === "turn_end").length;
-	gateway.fixture.complete(opRef, { text, appendTranscript: false });
+	gateway.fixture.complete(opRef, { text });
 	await eventually(
 		() => (gateway.core.journalRead("1:0", 100).events.filter(event => event.kind === "turn_end").length > terminalEventsBefore ? true : undefined),
 		`held operation ${opRef} did not settle before fixture teardown`,
@@ -137,7 +142,7 @@ externalTest("main.submit returns delivered_as before a held external assistant 
 		"held external turn did not publish its lifecycle start before completion",
 		15_000,
 	);
-	gateway.fixture.complete(opRef, { text: "journaled after admission", appendTranscript: false });
+	gateway.fixture.complete(opRef, { text: "journaled after admission" });
 	const assistant = await eventually(
 		() =>
 			gateway.core
@@ -162,6 +167,59 @@ externalTest("main.submit replays a pending admission identically without double
 	expect(gateway.fixture.commands().filter(command => command.operation === "turn.prompt" && command.text === "pending once")).toHaveLength(1);
 	await settleHeld(gateway, (first.result as { op_ref: string }).op_ref, "settled after idempotent replay assertion");
 
+});
+
+externalTest("main.submit pre-effect claim survives interruption after broker acceptance without a second send", async () => {
+	let interrupted = false;
+	const gateway = await hosted({
+		afterBrokerAcceptedBeforeFinalize: () => {
+			interrupted = true;
+			throw new Error("simulated kill after broker acceptance");
+		},
+	});
+	gateway.fixture.holdNextTurn();
+	const request = { text: "claim before send", surface_id: "owner", idempotency_key: "pre-effect-recovery" };
+	const interruptedResponse = await gateway.client.request("main.submit", request);
+	expect(interrupted).toBe(true);
+	expect(interruptedResponse.error).toBeDefined();
+	expect(gateway.fixture.commands().filter(command => command.operation === "turn.prompt" && command.text === request.text)).toHaveLength(1);
+	const [pending] = gateway.core.mainAdmissionOperationsPending();
+	expect(pending).toMatchObject({ scope: "main.submit", key: request.idempotency_key });
+	const intent = JSON.parse(pending?.intentJson ?? "{}") as { op_ref?: unknown; delivered_as?: unknown };
+	if (
+		typeof intent.op_ref !== "string" ||
+		(intent.delivered_as !== "prompt" && intent.delivered_as !== "steer" && intent.delivered_as !== "follow_up")
+	) {
+		throw new Error("pending main admission intent was malformed");
+	}
+
+	await gateway.host.dispose();
+	const restartedSupervisor = createExternalHostSupervisor({
+		broker: new BrokerCli({ executable: gateway.fixture.executable, environment: gateway.fixture.environment() }),
+		workspace: gateway.fixture.workspace,
+		tailTimeoutMs: 500,
+		commandTimeoutMs: 1_000,
+	});
+	try {
+		const resumed = await strictResumeMainSession({ profile: gateway.profile, state: gateway.state, supervisor: restartedSupervisor });
+		expect(resumed.recoveredGrowthIntent).toBe(true);
+		await reconcilePendingMainAdmissions(gateway.core, restartedSupervisor);
+		const replay = await createMainAdmissionHandler(
+			{
+				turnState: "idle",
+				async admit() {
+					throw new Error("replay must not invoke the broker target");
+				},
+			},
+			gateway.profile,
+			gateway.core,
+		)(request);
+		expect(replay).toEqual({ accepted: true, op_ref: intent.op_ref, delivered_as: intent.delivered_as });
+		expect(gateway.core.mainAdmissionOperationsPending()).toEqual([]);
+		expect(gateway.fixture.commands().filter(command => command.operation === "turn.prompt" && command.text === request.text)).toHaveLength(1);
+	} finally {
+		await restartedSupervisor.dispose();
+	}
 });
 
 externalTest("main.submit rejects conflicting reuse of a pending idempotency key with 1500", async () => {
@@ -291,7 +349,7 @@ externalTest("main.events.read projects overlapping external lifecycle pairs as 
 		"overlapping lifecycle did not publish its start pair before completion",
 		15_000,
 	);
-	gateway.fixture.complete(opRef, { text: "one final answer", appendTranscript: false });
+	gateway.fixture.complete(opRef, { text: "one final answer" });
 	await eventually(
 		() => (gateway.core.journalRead("1:0", 100).events.filter(event => event.kind === "turn_end").length === 1 ? true : undefined),
 		"external lifecycle did not settle",

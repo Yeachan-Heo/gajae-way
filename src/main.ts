@@ -8,7 +8,7 @@ import { ConsoleStartupRefusalError, runWayConsole, sanitizeConsoleText } from "
 import { parseWayConfig, type WayConfig } from "./config";
 import { BrokerCli } from "./broker/cli";
 import { BrokerReconciler } from "./broker/reconcile";
-import { createMainAdmissionHandler } from "./main-session/admission";
+import { createMainAdmissionHandler, MainAdmissionRecoveryError, reconcilePendingMainAdmissions } from "./main-session/admission";
 import { canonicalJson, createMainGateAnswerHandler } from "./main-session/gates";
 import {
 	ClosureError,
@@ -81,7 +81,8 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 }
 
 function failureReason(error: unknown): string {
-	if (error instanceof ResumeError || error instanceof GatewayStateError || error instanceof MainSessionHostError) return error.reason;
+	if (error instanceof ResumeError || error instanceof GatewayStateError || error instanceof MainSessionHostError || error instanceof MainAdmissionRecoveryError)
+		return error.reason;
 	if (error instanceof Error && error.name === "ProfileValidationError") return "profile_invalid";
 	return "startup_failed";
 }
@@ -96,6 +97,12 @@ function createRuntimeSupervisor(config: WayConfig, workspace: string) {
 function failBeforeMainHostForE2e(): void {
 	if (Bun.env.NODE_ENV === "test" && Bun.env.GAJAEWAY_E2E_FAIL_BEFORE_MAIN_HOST === "1") {
 		throw new Error("forced E2E pre-host startup failure");
+	}
+}
+
+function failAfterMainAdmissionBrokerAcceptedForE2e(): void {
+	if (Bun.env.NODE_ENV === "test" && Bun.env.GAJAEWAY_E2E_FAIL_AFTER_MAIN_ADMISSION_BROKER_ACCEPTED === "1") {
+		process.exit(137);
 	}
 }
 
@@ -120,6 +127,9 @@ function createRuntimeMainSessionJournal(
 		journalAppend: (kind, payloadJson) => core.journalAppend(kind, payloadJson),
 		journalAppendAtTailCheckpoint: (kind, payloadJson, expected, checkpoint) => {
 			gatewayState.appendTailProjection(expected, checkpoint, kind, payloadJson);
+		},
+		journalAppendTranscriptProjection: (kind, payloadJson, expectedTail, checkpoint, expectedDelivery, nextDelivery) => {
+			gatewayState.appendTranscriptProjection(expectedTail, checkpoint, expectedDelivery, nextDelivery, kind, payloadJson);
 		},
 		setRpcHealth: (state, reason) => {
 			let healthState: "degraded" | "failed_closed" = state;
@@ -993,6 +1003,7 @@ async function serveWay(config: WayConfig): Promise<void> {
 		}
 		if (recovery.kind === "failed_closed") await enterFailedClosed(core, state, config, recovery.reason, false);
 		const resumed = await strictResumeMainSession({ profile, state, supervisor });
+		await reconcilePendingMainAdmissions(core, supervisor);
 		if (config.sessionId && config.sessionId !== resumed.identity.sessionId) {
 			throw new ResumeError("session_id_mismatch", "--session-id does not match the durable adopted external identity.");
 		}
@@ -1009,6 +1020,7 @@ async function serveWay(config: WayConfig): Promise<void> {
 			journal: createRuntimeMainSessionJournal(core, config.stateDir, state),
 			initialTurnState: resumed.turnState,
 			initialFollowUpQueueDepth: resumed.followUpQueueDepth,
+			recoveredGrowthIntent: resumed.growthIntent,
 		});
 		core.setRpcHealth("running");
 		const admissionHandler = createMainAdmissionHandler(host, profile, core, {
@@ -1019,6 +1031,7 @@ async function serveWay(config: WayConfig): Promise<void> {
 					return true;
 				}
 			},
+			afterBrokerAcceptedBeforeFinalize: failAfterMainAdmissionBrokerAcceptedForE2e,
 		});
 		const gateAnswerHandler = createMainGateAnswerHandler(host, core);
 		const closureHandler = closureBridgeHandler(core, closures, profile.corpusPath, resumed.identity.sessionId);

@@ -27,8 +27,5 @@
   "napi": {
     "binaryName": "way_core",
     "triples": {}
-  },
-  "dependencies": {
-    "@gajae-code/coding-agent": "0.14.0"
   }
 }

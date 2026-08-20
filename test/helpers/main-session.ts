@@ -21,6 +21,7 @@ const defaults: Record<string, string> = {
 	profile_approval_receipt: "null",
 	failed_closed_reason: "null",
 	tail_checkpoint: "null",
+	transcript_delivery_progress: "null",
 
 };
 
@@ -54,17 +55,24 @@ interface FixtureOperation {
 	responseText?: string;
 	generation?: number;
 	completed?: boolean;
+	completionRequested?: { readonly failure?: boolean; readonly text?: string };
+}
+
+interface FixtureTranscriptEntry {
+	readonly id: string;
+	readonly payload: unknown;
 }
 
 interface FixtureSession {
 	row: Record<string, unknown>;
 	metadata: Record<string, unknown>;
 	context: { isStreaming: boolean; followupQueueDepth: number };
-	transcript: unknown[];
+	transcript: FixtureTranscriptEntry[];
 	events: Array<Record<string, unknown>>;
 	operations: Record<string, FixtureOperation>;
 	nextSeq: number;
 	nextGeneration: number;
+	nextTranscriptId: number;
 	gap?: {
 		readonly code: "retention_gap";
 		readonly missing?: { readonly from: number; readonly to: number };
@@ -129,13 +137,17 @@ export class FakeBrokerFixture {
 			metadata: { sessionId: this.sessionId, name: "fixture-main", cwd: this.workspace, kind: options.kind ?? "main" },
 			context: { isStreaming: false, followupQueueDepth: 0 },
 			transcript: [
-				{ type: "session", id: this.sessionId },
-				{ type: "message", role: "assistant", content: "operator-owned session ready", responseId: "bootstrap:assistant", timestamp: now },
+				{ id: `${this.sessionId}:transcript:0`, payload: { type: "session", id: this.sessionId } },
+				{
+					id: `${this.sessionId}:transcript:1`,
+					payload: { type: "message", role: "assistant", content: "operator-owned session ready", responseId: "bootstrap:assistant", timestamp: now },
+				},
 			],
 			events: [],
 			operations: {},
 			nextSeq: 0,
 			nextGeneration: 1,
+			nextTranscriptId: 2,
 			retentionFloorSeq: 0,
 
 			responseText: options.responseText,
@@ -169,6 +181,12 @@ export class FakeBrokerFixture {
 	crashNextTails(count: number): void {
 		this.update(session => {
 			(session as { crashNextTailCount?: number }).crashNextTailCount = count;
+		});
+	}
+
+	timeoutNextTails(count: number): void {
+		this.update(session => {
+			(session as { timeoutNextTailCount?: number }).timeoutNextTailCount = count;
 		});
 	}
 
@@ -219,6 +237,15 @@ export class FakeBrokerFixture {
 		});
 	}
 
+	/** Simulates transcript-window rotation while retaining only entries after the supplied stable id. */
+	rotateTranscriptPast(entryId: string): void {
+		this.update(session => {
+			const index = session.transcript.findIndex(entry => entry.id === entryId);
+			if (index < 0) throw new Error(`fixture transcript entry ${entryId} is not retained`);
+			session.transcript = session.transcript.slice(index + 1);
+		});
+	}
+
 	setLocator(locator: { repo?: string; stateRoot?: string }): void {
 		this.update(session => {
 			const current = session.row.locator as { repo: string; stateRoot: string };
@@ -229,7 +256,9 @@ export class FakeBrokerFixture {
 	/** Adds an externally observed transcript entry without routing it through gajaeway. */
 	appendTranscript(entry: unknown): void {
 		this.update(session => {
-			session.transcript.push(entry);
+			const id = `${this.sessionId}:transcript:${session.nextTranscriptId}`;
+			session.nextTranscriptId += 1;
+			session.transcript.push({ id, payload: entry });
 		});
 	}
 
@@ -248,67 +277,12 @@ export class FakeBrokerFixture {
 	}
 
 
-	complete(opRef: string, options: { readonly failure?: boolean; readonly text?: string; readonly appendTranscript?: boolean } = {}): void {
+	/** Requests completion; the fixture CLI performs the actual transition on its next broker command. */
+	complete(opRef: string, options: { readonly failure?: boolean; readonly text?: string } = {}): void {
 		this.update(session => {
 			const operation = session.operations[opRef];
-			if (!operation || operation.completed) throw new Error(`fixture operation ${opRef} is not held`);
-			operation.completed = true;
-			if (options.failure) operation.failure = true;
-			if (options.text !== undefined) operation.responseText = options.text;
-			const scope = { attemptId: `${this.sessionId}:${opRef}`, generation: operation.generation ?? 1, lineage: "main" };
-			const append = (kind: string, payload: Record<string, unknown>) => {
-				session.nextSeq += 1;
-				session.events.push({ kind, id: `${this.sessionId}:${session.nextSeq}`, generation: 1, seq: session.nextSeq, payload });
-			};
-			if (operation.failure) {
-				append("agent_failed", {
-					type: "agent_failed",
-					sessionId: this.sessionId,
-					error: { code: "fixture_failure", message: "fixture injected turn failure" },
-					scope,
-				});
-			} else {
-				const text = operation.responseText ?? session.responseText ?? (operation.operation === "turn.steer" ? "steered" : "ack");
-				const timestamp = 1_700_000_000_000 + session.nextSeq;
-				const responseId = `${this.sessionId}:assistant:${opRef}`;
-				const message = { role: "assistant", content: [{ type: "text", text }], responseId, timestamp };
-				if (options.appendTranscript ?? true) {
-					session.transcript.push({ type: "message", role: "assistant", content: text, responseId, timestamp });
-				}
-				append("message_end", { type: "message_end", message, scope });
-				append("turn_end", { type: "turn_end", message, toolResults: [], scope });
-				append("agent_end", { type: "agent_end", messages: [message], stopReason: "completed", scope });
-			}
-			if (!operation.failure && operation.operation !== "turn.follow_up") {
-				for (const queued of Object.values(session.operations)) {
-					if (queued.operation !== "turn.follow_up" || queued.completed) continue;
-					queued.completed = true;
-					const queuedScope = {
-						attemptId: `${this.sessionId}:${queued.opRef}`,
-						generation: queued.generation ?? 1,
-						lineage: "main",
-					};
-					append("agent_start", { type: "agent_start", sessionId: this.sessionId, scope: queuedScope });
-					append("turn_start", { type: "turn_start", sessionId: this.sessionId, scope: queuedScope });
-					append("agent_start", { type: "agent_start", sessionId: this.sessionId, scope: queuedScope });
-					const queuedText = queued.responseText ?? session.responseText ?? "ack";
-					const queuedTimestamp = 1_700_000_000_000 + session.nextSeq;
-					const queuedResponseId = `${this.sessionId}:assistant:${queued.opRef}`;
-					const queuedMessage = {
-						role: "assistant",
-						content: [{ type: "text", text: queuedText }],
-						responseId: queuedResponseId,
-						timestamp: queuedTimestamp,
-					};
-					session.transcript.push({ type: "message", role: "user", content: queued.text, delivery: queued.operation });
-					session.transcript.push({ type: "message", role: "assistant", content: queuedText, responseId: queuedResponseId, timestamp: queuedTimestamp });
-					append("message_end", { type: "message_end", message: queuedMessage, scope: queuedScope });
-					append("turn_end", { type: "turn_end", message: queuedMessage, toolResults: [], scope: queuedScope });
-					append("agent_end", { type: "agent_end", messages: [queuedMessage], stopReason: "completed", scope: queuedScope });
-				}
-			}
-			session.context.isStreaming = false;
-			session.context.followupQueueDepth = 0;
+			if (!operation || operation.completed || operation.completionRequested) throw new Error(`fixture operation ${opRef} is not held`);
+			operation.completionRequested = options;
 		});
 	}
 

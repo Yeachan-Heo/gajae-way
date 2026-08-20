@@ -99,7 +99,7 @@ externalTest("Discord outbox settles server-side delivery before a restart can r
 		expect(await outbox(gatewayUnderTest, fixture).runOnce()).toBe("sent");
 		expect(gatewayUnderTest.core.consumerCursor("gajaeway-discord")).toBe(appended.cursor);
 		expect(gatewayUnderTest.core.consumerOutbox("gajaeway-discord")).toEqual([
-			expect.objectContaining({ seq: appended.seq, state: "sent", dedupeKey: "gajaeway-discord:discord:owner-dm:1" }),
+			expect.objectContaining({ seq: appended.seq, state: "sent", dedupeKey: `gajaeway-discord:discord:owner-dm:${appended.seq}` }),
 		]);
 
 		const restarted = outbox(gatewayUnderTest, fixture);
@@ -147,8 +147,8 @@ externalTest("Discord crash after send before settlement retries with a nonce an
 		expect(await outbox(gatewayUnderTest, fixture).runOnce()).toBe("sent");
 		expect(fixture.sends).toHaveLength(1);
 		expect(fixture.sendAttempts).toEqual([
-			expect.objectContaining({ duplicate: false, nonce: "gajaeway-discord:discord:owner-dm:1" }),
-			expect.objectContaining({ duplicate: true, nonce: "gajaeway-discord:discord:owner-dm:1" }),
+			expect.objectContaining({ duplicate: false, nonce: `gajaeway-discord:discord:owner-dm:${appended.seq}` }),
+			expect.objectContaining({ duplicate: true, nonce: `gajaeway-discord:discord:owner-dm:${appended.seq}` }),
 		]);
 		expect(gatewayUnderTest.core.consumerCursor("gajaeway-discord")).toBe(appended.cursor);
 	} finally {

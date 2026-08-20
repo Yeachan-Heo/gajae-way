@@ -27,6 +27,7 @@ export interface ExternalGatewayOptions {
 	readonly journal?: MainSessionJournal;
 	readonly isSurfaceQuarantined?: (surface: OwnerSurface) => boolean;
 	readonly newOpRef?: () => string;
+	readonly afterBrokerAcceptedBeforeFinalize?: () => void | Promise<void>;
 	readonly tailTimeoutMs?: number;
 	readonly commandTimeoutMs?: number;
 }
@@ -118,6 +119,9 @@ export async function createExternalGateway(options: ExternalGatewayOptions = {}
 			journalAppendAtTailCheckpoint: (kind, payloadJson, expected, checkpoint) => {
 				state.appendTailProjection(expected, checkpoint, kind, payloadJson);
 			},
+			journalAppendTranscriptProjection: (kind, payloadJson, expectedTail, checkpoint, expectedDelivery, nextDelivery) => {
+				state.appendTranscriptProjection(expectedTail, checkpoint, expectedDelivery, nextDelivery, kind, payloadJson);
+			},
 			setRpcHealth: (healthState, reason) => core.setRpcHealth(healthState, reason),
 			setMainSessionStatus: (turnState, followUpQueueDepth) => core.setMainSessionStatus(turnState, followUpQueueDepth),
 			setJournalDegraded: degraded => core.setJournalDegraded(degraded),
@@ -130,10 +134,12 @@ export async function createExternalGateway(options: ExternalGatewayOptions = {}
 		journal,
 		initialTurnState: resumed.turnState,
 		initialFollowUpQueueDepth: resumed.followUpQueueDepth,
+		recoveredGrowthIntent: resumed.growthIntent,
 	});
 	const submit = createMainAdmissionHandler(host, profile, core, {
 		newOpRef: options.newOpRef,
 		isSurfaceQuarantined: options.isSurfaceQuarantined,
+		afterBrokerAcceptedBeforeFinalize: options.afterBrokerAcceptedBeforeFinalize,
 	});
 	const answer = createMainGateAnswerHandler(host, core);
 	const handler: RpcBridgeHandler = async (method, params) => {

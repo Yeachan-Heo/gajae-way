@@ -228,6 +228,20 @@ export interface WayCoreHandle {
 		operationJson: string;
 		responseJson: string;
 	}): { responseJson: string };
+	mainAdmissionOperationClaim(input: {
+		scope: string;
+		key: string;
+		requestJson: string;
+		intentJson: string;
+	}): { claimed: boolean; responseJson?: string };
+	mainAdmissionOperationFinalize(input: {
+		scope: string;
+		key: string;
+		requestJson: string;
+		intentJson: string;
+		responseJson: string;
+	}): { responseJson: string };
+	mainAdmissionOperationsPending(): Array<{ scope: string; key: string; requestJson: string; intentJson: string }>;
 }
 
 export interface WayCoreConstructor {

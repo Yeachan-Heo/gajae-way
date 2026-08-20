@@ -1,10 +1,13 @@
 import type { WayProfile } from "../profile";
 import {
 	attestsExternalTranscriptGrowth,
+	fingerprintTranscriptEntries,
 	GatewayStateStore,
 	sameExternalFingerprint,
 	sameExternalSession,
 	type ExternalSessionIdentity,
+	type GrowthIntent,
+	type TranscriptDeliveryProgress,
 } from "./state";
 import { HostSupervisorError, type HostSupervisor } from "./supervisor";
 
@@ -27,6 +30,8 @@ export interface ResumeOptions {
 export interface ResumedMainSession {
 	readonly identity: ExternalSessionIdentity;
 	readonly recoveredGrowthIntent: boolean;
+	/** Retained until the terminal event and transcript delivery are durable. */
+	readonly growthIntent?: GrowthIntent;
 	readonly turnState: "idle" | "busy";
 	readonly followUpQueueDepth: number;
 }
@@ -40,14 +45,11 @@ function failClosed(state: GatewayStateStore, reason: string, message?: string, 
 	throw new ResumeError(reason, message, { cause });
 }
 
-function allowsFreshTranscriptFingerprint(durable: ExternalSessionIdentity, observed: ExternalSessionIdentity): boolean {
-	return durable.transcript === undefined && sameExternalSession(durable, observed);
-}
-
 /**
  * Re-verifies the exact broker-adopted identity on every daemon start. This
  * never opens a local SDK session and never offers a recent-session fallback.
  */
+
 export async function strictResumeMainSession(options: ResumeOptions): Promise<ResumedMainSession> {
 	const durable = options.state.read();
 	if (durable.bootstrapState === "FAILED_CLOSED") {
@@ -73,23 +75,33 @@ export async function strictResumeMainSession(options: ResumeOptions): Promise<R
 		return failClosed(options.state, reason, error instanceof Error ? error.message : String(error), error);
 	}
 	const current = verified.identity;
+	let durableIdentity = durable.mainIdentity;
+	if (!durableIdentity.transcript) {
+		if (!current.transcript || !sameExternalSession(durableIdentity, current)) {
+			return failClosed(options.state, "main_identity_mismatch", "The broker did not provide a transcript proof for the committed external session.");
+		}
+		try {
+			const lastEntry = verified.transcriptEntries.at(-1);
+			const transcriptDeliveryProgress: TranscriptDeliveryProgress = {
+				...(lastEntry === undefined ? {} : { lastEntryId: lastEntry.id }),
+				fingerprint: fingerprintTranscriptEntries(verified.transcriptEntries.map(entry => entry.payload)),
+			};
+			options.state.persistTranscriptProof(durableIdentity, current, transcriptDeliveryProgress);
+			durableIdentity = current;
+		} catch (error) {
+			return failClosed(options.state, "transcript_proof_persist_failed", error instanceof Error ? error.message : String(error), error);
+		}
+	}
 	let recoveredGrowthIntent = false;
 	if (durable.growthIntent) {
 		if (!sameExternalSession(durable.growthIntent.base, current)) {
 			return failClosed(options.state, "growth_intent_mismatch", "The adopted session changed while a growth intent was open.");
 		}
-		if (durable.growthIntent.base.transcript) {
-			if (!verified.transcriptEntries || !attestsExternalTranscriptGrowth(durable.growthIntent.base, verified.transcriptEntries)) {
-				return failClosed(options.state, "growth_intent_mismatch", "The broker transcript changed outside append-only growth recovery.");
-			}
+		if (!attestsExternalTranscriptGrowth(durable.growthIntent.base, verified.transcriptEntries.map(entry => entry.payload))) {
+			return failClosed(options.state, "growth_intent_mismatch", "The broker transcript changed outside append-only growth recovery.");
 		}
-		try {
-			options.state.refreshRecoveredGrowth(durable.growthIntent, current);
-			recoveredGrowthIntent = true;
-		} catch (error) {
-			return failClosed(options.state, "growth_intent_refresh_failed", error instanceof Error ? error.message : String(error), error);
-		}
-	} else if (!sameExternalFingerprint(durable.mainIdentity, current) && !allowsFreshTranscriptFingerprint(durable.mainIdentity, current)) {
+		recoveredGrowthIntent = true;
+	} else if (!sameExternalFingerprint(durableIdentity, current)) {
 		return failClosed(options.state, "main_identity_mismatch", "The persisted external session identity no longer matches broker evidence.");
 	}
 	try {
@@ -100,6 +112,7 @@ export async function strictResumeMainSession(options: ResumeOptions): Promise<R
 	return {
 		identity: current,
 		recoveredGrowthIntent,
+		...(durable.growthIntent === undefined ? {} : { growthIntent: durable.growthIntent }),
 		turnState: verified.turnState,
 		followUpQueueDepth: verified.followUpQueueDepth,
 	};

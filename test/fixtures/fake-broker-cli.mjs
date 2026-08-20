@@ -126,7 +126,9 @@ if (!statePath) {
 
 	function appendTranscript(value, payload) {
 		value.transcript ??= [];
-		value.transcript.push(payload);
+		const id = `${value.row.sessionId}:transcript:${value.nextTranscriptId ?? value.transcript.length}`;
+		value.nextTranscriptId = (value.nextTranscriptId ?? value.transcript.length) + 1;
+		value.transcript.push({ id, payload });
 	}
 
 	function settleQueuedFollowUps(value) {
@@ -174,7 +176,6 @@ if (!statePath) {
 			timestamp: operation.timestamp ?? 1_700_000_000_000 + (value.nextSeq ?? 0),
 		};
 		appendTranscript(value, { type: "message", role: "assistant", content: text, responseId, timestamp: message.timestamp });
-		appendEvent(value, "message_end", { type: "message_end", message, scope });
 		appendEvent(value, "turn_end", { type: "turn_end", message, toolResults: [], scope });
 		appendEvent(value, "agent_end", { type: "agent_end", messages: [message], stopReason: "completed", scope });
 		settleQueuedFollowUps(value);
@@ -245,6 +246,24 @@ if (!statePath) {
 		return value;
 	}
 
+	function applyRequestedCompletions() {
+		let changed = false;
+		for (const value of Object.values(sessions)) {
+			for (const operation of Object.values(value.operations ?? {})) {
+				const requested = operation.completionRequested;
+				if (!requested || operation.completed) continue;
+				delete operation.completionRequested;
+				if (requested.failure) operation.failure = true;
+				if (requested.text !== undefined) operation.responseText = requested.text;
+				completeOperation(value, operation);
+				changed = true;
+			}
+		}
+		if (changed) writeState();
+	}
+
+	applyRequestedCompletions();
+
 	if (args.length === 3 && args[0] === "sdk" && args[1] === "session" && args[2] === "list") {
 		const output = `${JSON.stringify(listEnvelope())}\n`;
 		advanceListLiveness();
@@ -272,6 +291,12 @@ if (!statePath) {
 		}
 	} else if (args[0] === "sdk" && args[1] === "session" && args[2] === "tail") {
 		const value = session(args[3]);
+		if (value && typeof value.timeoutNextTailCount === "number" && value.timeoutNextTailCount > 0) {
+			value.timeoutNextTailCount -= 1;
+			fs.writeFileSync(statePath, JSON.stringify(state, null, 1));
+			fail("tail_timeout", "fixture: injected broker tail timeout");
+			process.exit(1);
+		}
 		if (value && typeof value.crashTailAfterCount === "number" && value.crashTailAfterCount > 0) {
 			value.crashTailAfterCount -= 1;
 			fs.writeFileSync(statePath, JSON.stringify(state, null, 1));
@@ -308,7 +333,7 @@ if (!statePath) {
 					fail("retention_gap", "fixture strict tail encountered retained-history loss");
 				} else {
 					const items = [
-						...(value.transcript ?? []).map((payload, index) => ({ kind: "transcript", id: `transcript:${index}`, seq: index, payload })),
+						...(value.transcript ?? []).map(entry => ({ kind: "transcript", id: entry.id, payload: entry.payload })),
 						...(value.events ?? []).filter(event => typeof event.seq !== "number" || event.seq > retentionFloorSeq),
 					];
 					const terminal = value.context?.isStreaming !== true && (value.context?.followupQueueDepth ?? 0) === 0;

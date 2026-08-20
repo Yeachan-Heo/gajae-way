@@ -17,6 +17,7 @@ export const GATEWAY_META_KEYS = [
 	"profile_approval_receipt",
 	"failed_closed_reason",
 	"tail_checkpoint",
+	"transcript_delivery_progress",
 
 ] as const;
 
@@ -100,6 +101,12 @@ export interface TailCheckpoint {
 	readonly seq: number;
 }
 
+/** Durable replay point for finalized transcript entries with broker-stable ids. */
+export interface TranscriptDeliveryProgress {
+	readonly lastEntryId?: string;
+	readonly fingerprint: TranscriptFingerprint;
+}
+
 /** Compares broker-tail watermarks within their event generation. */
 export function compareTailCheckpoints(left: TailCheckpoint, right: TailCheckpoint): number {
 	if (left.generation !== right.generation) return left.generation < right.generation ? -1 : 1;
@@ -122,6 +129,7 @@ export interface DurableGatewayState {
 	readonly profileApprovalReceipt: string | undefined;
 	readonly failedClosedReason: string | undefined;
 	readonly tailCheckpoint: TailCheckpoint | undefined;
+	readonly transcriptDeliveryProgress: TranscriptDeliveryProgress | undefined;
 
 }
 
@@ -260,6 +268,21 @@ function parseOptionalTailCheckpoint(raw: string | undefined): TailCheckpoint | 
 	return parsed === undefined ? undefined : parseTailCheckpoint(parsed, "tail_checkpoint");
 }
 
+function parseOptionalTranscriptDeliveryProgress(raw: string | undefined): TranscriptDeliveryProgress | undefined {
+	if (raw === undefined || raw === "null") return undefined;
+	const value = parseNullableJson(raw, "transcript_delivery_progress");
+	if (value === undefined) return undefined;
+	if (!isRecord(value)) throw new GatewayStateError("metadata_invalid", "transcript_delivery_progress must be an object.");
+	const lastEntryId = value.lastEntryId;
+	if (lastEntryId !== undefined && (typeof lastEntryId !== "string" || !lastEntryId)) {
+		throw new GatewayStateError("metadata_invalid", "transcript_delivery_progress.lastEntryId must be a non-empty string.");
+	}
+	return {
+		...(lastEntryId === undefined ? {} : { lastEntryId }),
+		fingerprint: parseTranscriptFingerprint(value.fingerprint, "transcript_delivery_progress.fingerprint"),
+	};
+}
+
 
 function metadataMap(entries: readonly GatewayMetaEntry[]): Map<string, string> {
 	const values = new Map<string, string>();
@@ -305,6 +328,7 @@ function parsedState(values: ReadonlyMap<string, string>): DurableGatewayState {
 		profileApprovalReceipt: parseOptionalStringJson(requiredMeta(values, "profile_approval_receipt"), "profile_approval_receipt"),
 		failedClosedReason: parseOptionalStringJson(requiredMeta(values, "failed_closed_reason"), "failed_closed_reason"),
 		tailCheckpoint: parseOptionalTailCheckpoint(values.get("tail_checkpoint")),
+		transcriptDeliveryProgress: parseOptionalTranscriptDeliveryProgress(values.get("transcript_delivery_progress")),
 
 	};
 }
@@ -319,6 +343,10 @@ function identityJson(identity: ExternalSessionIdentity): string {
 
 function tailCheckpointJson(checkpoint: TailCheckpoint): string {
 	return stableMetadataJson(checkpoint);
+}
+
+function transcriptDeliveryProgressJson(progress: TranscriptDeliveryProgress | undefined): string {
+	return stableMetadataJson(progress ?? null);
 }
 
 function canonicalJson(value: unknown): string {
@@ -407,7 +435,17 @@ export class GatewayStateStore {
 		});
 	}
 
-	commitBootstrap(expectedState: "CREATING" | "CREATED", intent: BootstrapIntent, identity: ExternalSessionIdentity, profile: WayProfile): void {
+	commitBootstrap(
+		expectedState: "CREATING" | "CREATED",
+		intent: BootstrapIntent,
+		identity: ExternalSessionIdentity,
+		profile: WayProfile,
+		discoveryCheckpoint: TailCheckpoint,
+		transcriptDeliveryProgress: TranscriptDeliveryProgress,
+	): void {
+		if (!identity.transcript) {
+			throw new GatewayStateError("transcript_proof_missing", "A committed external identity requires a transcript fingerprint.");
+		}
 		this.transact({
 			expected: [
 				{ key: "bootstrap_state", value: expectedState },
@@ -423,10 +461,12 @@ export class GatewayStateStore {
 				{ key: "profile_projection", value: profileProjectionCanonical(profile.projection) },
 				{ key: "profile_tunables_revision", value: String(profile.tunablesRevision) },
 				{ key: "failed_closed_reason", value: "null" },
-				{ key: "tail_checkpoint", value: "null" },
-
+				{ key: "tail_checkpoint", value: tailCheckpointJson(discoveryCheckpoint) },
+				{ key: "transcript_delivery_progress", value: transcriptDeliveryProgressJson(transcriptDeliveryProgress) },
 			],
 			deletes: [],
+			eventKind: "tail_adoption_start",
+			eventPayloadJson: stableMetadataJson({ checkpoint: discoveryCheckpoint }),
 		});
 	}
 
@@ -471,8 +511,72 @@ export class GatewayStateStore {
 		});
 	}
 
-	refreshRecoveredGrowth(intent: GrowthIntent, identity: ExternalSessionIdentity): void {
-		this.refreshAfterGrowth(intent, identity);
+	/** CAS-upgrades a legacy committed adoption after a fresh complete transcript proof. */
+	persistTranscriptProof(
+		durable: ExternalSessionIdentity,
+		observed: ExternalSessionIdentity,
+		transcriptDeliveryProgress: TranscriptDeliveryProgress,
+	): void {
+		if (
+			durable.transcript ||
+			!observed.transcript ||
+			!sameExternalSession(durable, observed) ||
+			transcriptDeliveryProgress.fingerprint.entryCount !== observed.transcript.entryCount ||
+			transcriptDeliveryProgress.fingerprint.sha256 !== observed.transcript.sha256
+		) {
+			throw new GatewayStateError("transcript_proof_invalid", "The observed transcript proof does not bind the committed external session.");
+		}
+		this.transact({
+			expected: [
+				{ key: "bootstrap_state", value: "COMMITTED" },
+				{ key: "main_identity", value: identityJson(durable) },
+				{ key: "transcript_delivery_progress", value: transcriptDeliveryProgressJson(undefined) },
+			],
+			puts: [
+				{ key: "main_identity", value: identityJson(observed) },
+				{ key: "transcript_delivery_progress", value: transcriptDeliveryProgressJson(transcriptDeliveryProgress) },
+			],
+			deletes: [],
+		});
+	}
+
+	advanceTranscriptDeliveryProgress(expected: TranscriptDeliveryProgress | undefined, next: TranscriptDeliveryProgress): void {
+		this.transact({
+			expected: [
+				{ key: "bootstrap_state", value: "COMMITTED" },
+				{ key: "transcript_delivery_progress", value: transcriptDeliveryProgressJson(expected) },
+			],
+			puts: [{ key: "transcript_delivery_progress", value: transcriptDeliveryProgressJson(next) }],
+			deletes: [],
+		});
+	}
+
+	/** Atomically journals a finalized transcript projection and its durable replay point. */
+	appendTranscriptProjection(
+		expectedTail: TailCheckpoint | undefined,
+		checkpoint: TailCheckpoint,
+		expectedDelivery: TranscriptDeliveryProgress | undefined,
+		nextDelivery: TranscriptDeliveryProgress,
+		kind: string,
+		payloadJson: string,
+	): void {
+		if (expectedTail && compareTailCheckpoints(checkpoint, expectedTail) < 0) {
+			throw new GatewayStateError("tail_checkpoint_regression", "Broker-tail checkpoint regressed.");
+		}
+		this.transact({
+			expected: [
+				{ key: "bootstrap_state", value: "COMMITTED" },
+				...(expectedTail === undefined ? [] : [{ key: "tail_checkpoint", value: tailCheckpointJson(expectedTail) }]),
+				{ key: "transcript_delivery_progress", value: transcriptDeliveryProgressJson(expectedDelivery) },
+			],
+			puts: [
+				{ key: "tail_checkpoint", value: tailCheckpointJson(checkpoint) },
+				{ key: "transcript_delivery_progress", value: transcriptDeliveryProgressJson(nextDelivery) },
+			],
+			deletes: [],
+			eventKind: kind,
+			eventPayloadJson: payloadJson,
+		});
 	}
 
 	setTunablesRevision(revision: number): void {

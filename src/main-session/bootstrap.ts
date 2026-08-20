@@ -1,7 +1,14 @@
 import * as crypto from "node:crypto";
 import type { WayProfile } from "../profile";
-import type { ExternalSessionIdentity, BootstrapIntent, BootstrapState, GatewayStateStore } from "./state";
-import { HostSupervisorError, type HostSupervisor } from "./supervisor";
+import {
+	fingerprintTranscriptEntries,
+	type BootstrapIntent,
+	type BootstrapState,
+	type ExternalSessionIdentity,
+	type GatewayStateStore,
+	type TranscriptDeliveryProgress,
+} from "./state";
+import { HostSupervisorError, type HostSupervisor, type SupervisorVerification } from "./supervisor";
 
 export type { BootstrapState } from "./state";
 
@@ -66,11 +73,36 @@ function failClosed(state: GatewayStateStore, reason: string): BootstrapRecovery
 	return { kind: "failed_closed", reason };
 }
 
-function checkedIdentity(sessionId: string, identity: ExternalSessionIdentity): ExternalSessionIdentity {
+function checkedVerification(
+	sessionId: string,
+	verified: SupervisorVerification,
+): { readonly identity: ExternalSessionIdentity; readonly checkpoint: NonNullable<SupervisorVerification["discoveryCheckpoint"]>; readonly delivery: TranscriptDeliveryProgress } {
+	const identity = verified.identity;
 	if (identity.sessionId !== sessionId) {
 		throw new BootstrapError("session_identity_mismatch", "The broker did not return the requested external session id.");
 	}
-	return identity;
+	if (!identity.transcript) {
+		throw new BootstrapError("transcript_proof_missing", "The broker did not return a complete transcript fingerprint for adoption.");
+	}
+	if (!verified.discoveryCheckpoint) {
+		throw new BootstrapError("tail_checkpoint_unavailable", "The broker did not return an adoption tail checkpoint.");
+	}
+	const entries = verified.transcriptEntries;
+	if (entries.some(entry => !entry.id.trim())) {
+		throw new BootstrapError("transcript_entry_id_missing", "The broker transcript proof contains an entry without a stable id.");
+	}
+	const observed = fingerprintTranscriptEntries(entries.map(entry => entry.payload));
+	if (observed.entryCount !== identity.transcript.entryCount || observed.sha256 !== identity.transcript.sha256) {
+		throw new BootstrapError("transcript_proof_mismatch", "The broker transcript fingerprint did not match its complete transcript snapshot.");
+	}
+	return {
+		identity,
+		checkpoint: verified.discoveryCheckpoint,
+		delivery: {
+			...(entries.at(-1)?.id === undefined ? {} : { lastEntryId: entries.at(-1)?.id }),
+			fingerprint: observed,
+		},
+	};
 }
 
 /**
@@ -97,16 +129,17 @@ export async function bootstrapMainSession(options: BootstrapOptions): Promise<B
 	await options.hooks?.afterCreatingIntent?.();
 	try {
 		const verified = await options.supervisor.discover(intent.sessionId);
-		const identity = checkedIdentity(intent.sessionId, verified.identity);
+		const proof = checkedVerification(intent.sessionId, verified);
 		await options.hooks?.afterDiscovery?.();
 		options.state.markCreated(intent);
 		await options.hooks?.afterCreated?.();
 		await options.hooks?.beforeCommit?.();
-		options.state.commitBootstrap("CREATED", intent, identity, options.profile);
+		options.state.commitBootstrap("CREATED", intent, proof.identity, options.profile, proof.checkpoint, proof.delivery);
 		await options.hooks?.afterCommit?.();
-		return { kind: "committed", identity, nonce: intent.nonce };
+		return { kind: "committed", identity: proof.identity, nonce: intent.nonce };
 	} catch (error) {
 		if (error instanceof BootstrapError) throw error;
+		if (error instanceof HostSupervisorError) throw new BootstrapError(error.reason, error.message, { cause: error });
 		throw new BootstrapError("external_session_unavailable", error instanceof Error ? error.message : String(error), { cause: error });
 	}
 }
@@ -136,11 +169,11 @@ export async function recoverBootstrap(
 	}
 	try {
 		const verified = await options.supervisor.discover(intent.sessionId);
-		const identity = checkedIdentity(intent.sessionId, verified.identity);
+		const proof = checkedVerification(intent.sessionId, verified);
 		if (current.bootstrapState === "CREATING") options.state.markCreated(intent);
-		options.state.commitBootstrap("CREATED", intent, identity, options.profile);
-		return { kind: "committed", identity, nonce: intent.nonce };
+		options.state.commitBootstrap("CREATED", intent, proof.identity, options.profile, proof.checkpoint, proof.delivery);
+		return { kind: "committed", identity: proof.identity, nonce: intent.nonce };
 	} catch (error) {
-		return failClosed(options.state, error instanceof HostSupervisorError ? error.reason : "bootstrap_adoption_unavailable");
+		return failClosed(options.state, error instanceof BootstrapError || error instanceof HostSupervisorError ? error.reason : "bootstrap_adoption_unavailable");
 	}
 }

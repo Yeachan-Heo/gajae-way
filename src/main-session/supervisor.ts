@@ -4,11 +4,11 @@ import {
 	BrokerCli,
 	BrokerCliError,
 	type BrokerOperationReceipt,
+	type BrokerTurnStatus,
 	type SdkSessionRowV1,
 	type SdkTailEnvelopeV1,
 } from "../broker/cli";
 import {
-	attestsExternalTranscriptGrowth,
 	fingerprintTranscriptEntries,
 	type ExternalSessionIdentity,
 	type TailCheckpoint,
@@ -26,20 +26,29 @@ export interface SupervisorEvent {
 	readonly payload: unknown;
 }
 
+export interface SupervisorTranscriptEntry {
+	/** Stable broker transcript entry id; never derive this from a local array index. */
+	readonly id: string;
+	readonly payload: unknown;
+}
+
 export interface SupervisorTailEvents {
 	readonly identity: ExternalSessionIdentity;
-	readonly transcriptEntries: readonly unknown[];
+	readonly transcriptEntries: readonly SupervisorTranscriptEntry[];
 	readonly events: readonly SupervisorEvent[];
 	readonly terminal: boolean;
+	/** False only when the broker timed out before yielding a transcript snapshot. */
+	readonly complete: boolean;
 	readonly retentionGap: boolean;
 	readonly checkpoint?: TailCheckpoint;
 	readonly resyncCheckpoint?: TailCheckpoint;
-
 }
 
 export interface SupervisorVerification {
 	readonly identity: ExternalSessionIdentity;
-	readonly transcriptEntries?: readonly unknown[];
+	readonly transcriptEntries: readonly SupervisorTranscriptEntry[];
+	/** The verified tail boundary from which adoption begins projecting future events. */
+	readonly discoveryCheckpoint: TailCheckpoint;
 	readonly turnState: SupervisorTurnState;
 	readonly followUpQueueDepth: number;
 }
@@ -54,6 +63,7 @@ export interface HostSupervisor {
 	sendPrompt(text: string, opRef: string): Promise<BrokerOperationReceipt>;
 	sendSteer(text: string, opRef: string): Promise<BrokerOperationReceipt>;
 	followUp(text: string, opRef: string): Promise<BrokerOperationReceipt>;
+	operationStatus(opRef: string): Promise<BrokerTurnStatus>;
 	tailEvents(): Promise<SupervisorTailEvents>;
 	turnState(): Promise<{ readonly turnState: SupervisorTurnState; readonly followUpQueueDepth: number }>;
 	dispose(): Promise<void>;
@@ -77,8 +87,15 @@ export interface ExternalHostSupervisorOptions {
 	readonly commandTimeoutMs?: number;
 }
 
-function transcriptEntries(tail: SdkTailEnvelopeV1): unknown[] {
-	return tail.items.filter(item => item.kind === "transcript").map(item => item.payload);
+function transcriptEntries(tail: SdkTailEnvelopeV1): SupervisorTranscriptEntry[] {
+	return tail.items
+		.filter(item => item.kind === "transcript")
+		.map((item, index) => {
+			if (!item.id) {
+				throw new HostSupervisorError("transcript_entry_id_missing", `Broker transcript entry ${index} has no stable id.`);
+			}
+			return { id: item.id, payload: item.payload };
+		});
 }
 
 function eventItems(tail: SdkTailEnvelopeV1): SupervisorEvent[] {
@@ -182,6 +199,10 @@ export class ExternalHostSupervisor implements HostSupervisor {
 		});
 	}
 
+	async operationStatus(opRef: string): Promise<BrokerTurnStatus> {
+		return await this.#broker.turnStatus(this.requireIdentity().sessionId, opRef, { timeoutMs: this.#commandTimeoutMs });
+	}
+
 	async tailEvents(): Promise<SupervisorTailEvents> {
 		const identity = this.requireIdentity();
 		let tail: SdkTailEnvelopeV1;
@@ -195,7 +216,7 @@ export class ExternalHostSupervisor implements HostSupervisor {
 
 		} catch (error) {
 			if (isNormalTailTimeout(error)) {
-				return { identity, transcriptEntries: [], events: [], terminal: false, retentionGap: false };
+				return { identity, transcriptEntries: [], events: [], terminal: false, complete: false, retentionGap: false };
 			}
 			if (isRetentionGap(error)) throw new HostSupervisorError("tail_retention_gap", "Broker tail reported a retention gap.", { cause: error });
 			throw this.wrapBrokerError("tail_unavailable", error);
@@ -206,16 +227,15 @@ export class ExternalHostSupervisor implements HostSupervisor {
 			throw new HostSupervisorError("session_locator_mismatch", "Broker tail locator did not match the adopted external session.");
 		}
 		const entries = transcriptEntries(tail);
-		const fresh = identityFromRow(tail.session, entries.length > 0 ? fingerprintTranscriptEntries(entries) : identity.transcript);
-		if (!attestsExternalTranscriptGrowth(identity, entries.length > 0 ? entries : [])) {
-			throw new HostSupervisorError("growth_intent_mismatch", "Broker transcript no longer has the adopted transcript as an append-only prefix.");
-		}
+		const transcript = fingerprintTranscriptEntries(entries.map(entry => entry.payload));
+		const fresh = identityFromRow(tail.session, transcript);
 		this.#identity = fresh;
 		return {
 			identity: fresh,
 			transcriptEntries: entries,
 			events: eventItems(tail),
 			terminal: tail.terminal === true,
+			complete: true,
 			retentionGap: tail.gap !== undefined,
 			...(tail.checkpoint === undefined ? {} : { checkpoint: tail.checkpoint }),
 			...(tail.gap?.resync === undefined ? {} : { resyncCheckpoint: tail.gap.resync }),
@@ -267,16 +287,17 @@ export class ExternalHostSupervisor implements HostSupervisor {
 			if (error instanceof HostSupervisorError) throw error;
 			throw this.wrapBrokerError("session_metadata_unavailable", error);
 		}
-		let tail: SupervisorTailEvents | undefined;
-		try {
-			const provisional = identityFromRow(row, expected?.transcript);
-			this.#identity = provisional;
-			tail = await this.tailEvents();
-		} catch (error) {
-			if (!(error instanceof HostSupervisorError && error.reason === "tail_unavailable")) throw error;
-			if (expected?.transcript) throw new HostSupervisorError("main_identity_unreadable", "The adopted transcript fingerprint could not be reverified.", { cause: error });
+		const provisional = identityFromRow(row, expected?.transcript);
+		this.#identity = provisional;
+		const tail = await this.tailEvents();
+		if (!tail.complete) {
+			throw new HostSupervisorError("transcript_proof_unavailable", "Broker tail timed out before yielding a complete transcript proof.");
 		}
-		const identity = tail?.identity ?? identityFromRow(row, expected?.transcript);
+		const discoveryCheckpoint = tail.checkpoint ?? tail.resyncCheckpoint;
+		if (!discoveryCheckpoint) {
+			throw new HostSupervisorError("tail_checkpoint_unavailable", "Broker tail did not provide an adoption checkpoint.");
+		}
+		const identity = tail.identity;
 		let turnState: SupervisorTurnState = row.activity?.state === "active" ? "busy" : "idle";
 		let followUpQueueDepth = 0;
 		try {
@@ -290,7 +311,7 @@ export class ExternalHostSupervisor implements HostSupervisor {
 				throw error;
 			}
 		}
-		return { identity, ...(tail?.transcriptEntries.length ? { transcriptEntries: tail.transcriptEntries } : {}), turnState, followUpQueueDepth };
+		return { identity, transcriptEntries: tail.transcriptEntries, discoveryCheckpoint, turnState, followUpQueueDepth };
 	}
 
 	private requireIdentity(): ExternalSessionIdentity {

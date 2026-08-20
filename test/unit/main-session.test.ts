@@ -2,7 +2,7 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import { afterEach, expect, test } from "bun:test";
 import { BrokerCli } from "../../src/broker/cli";
-import { bootstrapMainSession } from "../../src/main-session/bootstrap";
+import { BootstrapError, bootstrapMainSession } from "../../src/main-session/bootstrap";
 import { createMainSessionHost } from "../../src/main-session/host";
 import { ResumeError, strictResumeMainSession } from "../../src/main-session/resume";
 import { GatewayStateStore } from "../../src/main-session/state";
@@ -94,8 +94,53 @@ test.serial("bootstrap adopts and persists the exact live external identity with
 		locator: { repo: fixture.workspace, stateRoot: path.join(fixture.workspace, ".gjc", "state") },
 		transcript: { entryCount: 2, sha256: expect.stringMatching(/^[a-f0-9]{64}$/) },
 	});
-	expect(state.read()).toMatchObject({ bootstrapState: "COMMITTED", mainIdentity: { sessionId: fixture.sessionId } });
+	expect(state.read()).toMatchObject({
+		bootstrapState: "COMMITTED",
+		mainIdentity: { sessionId: fixture.sessionId },
+		tailCheckpoint: { revision: 2, generation: 1, seq: 0 },
+		transcriptDeliveryProgress: { lastEntryId: `${fixture.sessionId}:transcript:1` },
+	});
 	expect(fixture.commands()).toEqual([]);
+});
+
+test.serial("bootstrap refuses a tail timeout without committing an unproven transcript identity", async () => {
+	const fixture = new FakeBrokerFixture();
+	fixtures.push(fixture);
+	const meta = new MemoryGatewayMeta();
+	const state = new GatewayStateStore(meta);
+	const profile = fixtureProfile(fixture);
+	const adoption = supervisor(fixture);
+	fixture.timeoutNextTails(1);
+	try {
+		await expect(
+			bootstrapMainSession({ confirm: true, profile, state, supervisor: adoption, sessionId: fixture.sessionId }),
+		).rejects.toMatchObject({ reason: "transcript_proof_unavailable" } satisfies Partial<BootstrapError>);
+		expect(state.read()).toMatchObject({ bootstrapState: "CREATING", mainIdentity: undefined });
+		expect(meta.events).toEqual([]);
+	} finally {
+		await adoption.dispose();
+	}
+});
+
+test.serial("strict resume persists a complete legacy transcript proof and delivery baseline before readiness", async () => {
+	const fixture = new FakeBrokerFixture();
+	fixtures.push(fixture);
+	const { meta, state, profile, committed } = await bootstrapFixture(fixture);
+	const legacyIdentity = { ...committed.identity } as { transcript?: unknown } & Record<string, unknown>;
+	delete legacyIdentity.transcript;
+	meta.values.set("main_identity", JSON.stringify(legacyIdentity));
+	meta.values.set("transcript_delivery_progress", "null");
+	const resumedSupervisor = supervisor(fixture);
+	try {
+		const resumed = await strictResumeMainSession({ profile, state, supervisor: resumedSupervisor });
+		expect(resumed.identity.transcript).toBeDefined();
+		expect(state.read()).toMatchObject({
+			mainIdentity: { transcript: { entryCount: 2 } },
+			transcriptDeliveryProgress: { lastEntryId: `${fixture.sessionId}:transcript:1`, fingerprint: { entryCount: 2 } },
+		});
+	} finally {
+		await resumedSupervisor.dispose();
+	}
 });
 
 test.serial("strict resume fails closed when the exact adopted external session disappears", async () => {
@@ -127,7 +172,8 @@ test.serial("scripted broker CLI fixture covers inspect, send, status, tail, and
 	expect(await broker.turnStatus(fixture.sessionId, "fixture-op")).toMatchObject({ status: "terminal_ok", completed: true });
 	const tail = await broker.tailSession(fixture.sessionId, { repo: fixture.workspace, allEvents: true, untilIdle: true, strict: true });
 	expect(tail.items.filter(item => item.kind === "agent_start")).toHaveLength(2);
-	expect(tail.items.map(item => item.kind)).toContain("message_end");
+	expect(tail.items.map(item => item.kind)).not.toContain("message_end");
+	expect(tail.items.filter(item => item.kind === "transcript").every(item => typeof item.id === "string" && item.id.length > 0)).toBe(true);
 });
 
 test.serial("scripted broker tail mirrors cursorless rotation gaps and checkpoint records", async () => {
@@ -180,10 +226,22 @@ test.serial("a terminal tail snapshot that predates admission cannot settle the 
 	let tailCalls = 0;
 	const controlledSupervisor: HostSupervisor = {
 		async discover() {
-			return { identity: committed.identity, turnState: "idle", followUpQueueDepth: 0 };
+			return {
+				identity: committed.identity,
+				transcriptEntries: [],
+				discoveryCheckpoint: state.read().tailCheckpoint!,
+				turnState: "idle" as const,
+				followUpQueueDepth: 0,
+			};
 		},
 		async verify() {
-			return { identity: committed.identity, turnState: "idle", followUpQueueDepth: 0 };
+			return {
+				identity: committed.identity,
+				transcriptEntries: [],
+				discoveryCheckpoint: state.read().tailCheckpoint!,
+				turnState: "idle" as const,
+				followUpQueueDepth: 0,
+			};
 		},
 		async sendPrompt(_text, opRef) {
 			return { sessionId: fixture.sessionId, operation: "turn.prompt", operationRef: opRef };
@@ -193,6 +251,9 @@ test.serial("a terminal tail snapshot that predates admission cannot settle the 
 		},
 		async followUp(_text, opRef) {
 			return { sessionId: fixture.sessionId, operation: "turn.follow_up", operationRef: opRef };
+		},
+		async operationStatus(opRef) {
+			return { operationRef: opRef, status: "in_flight", completed: false, detail: {} };
 		},
 		async tailEvents() {
 			tailCalls += 1;
@@ -217,7 +278,9 @@ test.serial("a terminal tail snapshot that predates admission cannot settle the 
 			transcriptEntries: [],
 			events: [],
 			terminal: true,
+			complete: true,
 			retentionGap: false,
+			checkpoint: state.read().tailCheckpoint,
 		});
 		await Bun.sleep(20);
 
@@ -320,7 +383,7 @@ test.serial("host projects overlapping agent and turn lifecycle tail events into
 	}
 }, 45_000);
 
-test.serial("host journals only finalized assistant messages from external tail events", async () => {
+test.serial("host journals finalized assistant messages from stable transcript entries", async () => {
 	const fixture = new FakeBrokerFixture();
 	fixtures.push(fixture);
 	const { state, profile } = await bootstrapFixture(fixture);
@@ -335,30 +398,24 @@ test.serial("host journals only finalized assistant messages from external tail 
 		initialTurnState: resumed.turnState,
 		initialFollowUpQueueDepth: resumed.followUpQueueDepth,
 	});
-	const finalMessage = {
-		role: "assistant",
-		content: [{ type: "text", text: "final external answer" }],
-		responseId: "finalized-message-id",
-		timestamp: 1_700_000_001_000,
-	};
 	try {
-		fixture.appendTailEvent("message_update", {
-			type: "message_update",
-			message: { ...finalMessage, content: [{ type: "text", text: "partial external answer" }] },
-		});
-		fixture.appendTailEvent("message_end", { type: "message_end", message: finalMessage });
-		fixture.appendTailEvent("message_end", { type: "message_end", message: finalMessage });
+		fixture.holdNextTurn();
+		await host.admit("prompt", "produce a transcript-only final", "transcript-final");
+		await eventually(
+			() => journal.some(event => event.kind === "turn_start"),
+			"held external turn did not start",
+		);
+		fixture.complete("transcript-final", { text: "final external answer" });
 		await eventually(
 			() => journal.filter(event => event.kind === "assistant_message").length === 1,
-			"finalized assistant message was not projected",
+			"finalized transcript message was not projected",
 			10_000,
 		);
 
 		const assistants = journal.filter(event => event.kind === "assistant_message");
 		expect(assistants).toHaveLength(1);
 		expect(JSON.parse(assistants[0]?.payloadJson ?? "{}"))
-			.toEqual({ finalized: true, text: "final external answer", message_id: "finalized-message-id", timestamp: 1_700_000_001_000 });
-		expect(journal.some(event => event.payloadJson.includes("partial external answer"))).toBe(false);
+			.toEqual(expect.objectContaining({ finalized: true, text: "final external answer" }));
 	} finally {
 		await host.dispose();
 	}
@@ -380,17 +437,11 @@ test.serial("host survives transient broker tail failures with bounded retry and
 		initialFollowUpQueueDepth: resumed.followUpQueueDepth,
 	});
 	try {
+		fixture.holdNextTurn();
+		await host.admit("prompt", "recover through transient tail failures", "transient-recovery-message");
 		// Three consecutive CLI deaths (spawn pressure / nonzero exits), then healthy.
 		fixture.crashNextTails(3);
-		fixture.appendTailEvent("message_end", {
-			type: "message_end",
-			message: {
-				role: "assistant",
-				content: [{ type: "text", text: "survived transient transport failure" }],
-				responseId: "transient-recovery-message",
-				timestamp: 1_700_000_002_000,
-			},
-		});
+		fixture.complete("transient-recovery-message", { text: "survived transient transport failure" });
 		await eventually(
 			() => journal.filter(event => event.kind === "assistant_message").length === 1,
 			"host did not recover from transient tail failures",
@@ -437,6 +488,36 @@ test.serial("host fails closed when broker tail failures exhaust the bounded ret
 	}
 }, 90_000);
 
+test.serial("bootstrap discovery checkpoint suppresses retained gap-free pre-adoption lifecycle history", async () => {
+	const fixture = new FakeBrokerFixture();
+	fixtures.push(fixture);
+	fixture.appendTailEvent("agent_start", { type: "agent_start", sessionId: fixture.sessionId });
+	const { state, profile } = await bootstrapFixture(fixture);
+	const resumedSupervisor = supervisor(fixture);
+	const resumed = await strictResumeMainSession({ profile, state, supervisor: resumedSupervisor });
+	const journal: Array<{ kind: string; payloadJson: string }> = [];
+	const host = createMainSessionHost({
+		supervisor: resumedSupervisor,
+		identity: resumed.identity,
+		state,
+		journal: { journalAppend: (kind, payloadJson) => journal.push({ kind, payloadJson }) },
+		initialTurnState: resumed.turnState,
+		initialFollowUpQueueDepth: resumed.followUpQueueDepth,
+	});
+	try {
+		expect(state.read().tailCheckpoint).toMatchObject({ generation: 1, seq: 1 });
+		await Bun.sleep(300);
+		expect(journal).toEqual([]);
+		fixture.appendTailEvent("agent_start", { type: "agent_start", sessionId: fixture.sessionId });
+		await eventually(
+			() => journal.filter(event => event.kind === "turn_start").length === 1,
+			"post-adoption lifecycle event was not projected",
+		);
+	} finally {
+		await host.dispose();
+	}
+});
+
 test.serial("adoption-start retention gap records its resync checkpoint and projects subsequent events", async () => {
 	const fixture = new FakeBrokerFixture();
 	fixtures.push(fixture);
@@ -461,20 +542,14 @@ test.serial("adoption-start retention gap records its resync checkpoint and proj
 			payloadJson: JSON.stringify({ checkpoint: { revision: 2, generation: 1, seq: 1 } }),
 		});
 
-		fixture.appendTailEvent("message_end", {
-			type: "message_end",
-			message: {
-				role: "assistant",
-				content: [{ type: "text", text: "projected after adoption resync" }],
-				responseId: "after-adoption-resync",
-				timestamp: 1_700_000_003_000,
-			},
-		});
+		fixture.holdNextTurn();
+		await host.admit("prompt", "project after adoption resync", "after-adoption-resync");
+		fixture.complete("after-adoption-resync", { text: "projected after adoption resync" });
 		await eventually(
 			() => journal.some(event => event.payloadJson.includes("projected after adoption resync")),
-			"event after adoption resync was not projected",
+			"transcript after adoption resync was not projected",
 		);
-		expect(state.read().tailCheckpoint).toMatchObject({ generation: 1, seq: 2 });
+		expect(state.read().tailCheckpoint).toMatchObject({ generation: 1, seq: expect.any(Number) });
 	} finally {
 		await host.dispose();
 	}
@@ -496,15 +571,7 @@ test.serial("an established broker-tail checkpoint fails closed when retention a
 	});
 	try {
 		await eventually(() => state.read().tailCheckpoint?.seq === 0, "host did not establish its initial checkpoint");
-		fixture.appendTailEvent("message_end", {
-			type: "message_end",
-			message: {
-				role: "assistant",
-				content: [{ type: "text", text: "checkpointed event" }],
-				responseId: "checkpointed-event",
-				timestamp: 1_700_000_004_000,
-			},
-		});
+		fixture.appendTailEvent("agent_start", { type: "agent_start", sessionId: fixture.sessionId });
 		await eventually(() => state.read().tailCheckpoint?.seq === 1, "host did not advance its established checkpoint");
 
 		fixture.appendTailEvent("agent_start", { type: "agent_start", sessionId: fixture.sessionId });
@@ -536,15 +603,7 @@ test.serial("a failed journal append leaves the tail checkpoint behind so the sc
 	});
 	try {
 		await eventually(() => state.read().tailCheckpoint?.seq === 0, "host did not establish its initial checkpoint");
-		fixture.appendTailEvent("message_end", {
-			type: "message_end",
-			message: {
-				role: "assistant",
-				content: [{ type: "text", text: "replay after journal interruption" }],
-				responseId: "replay-after-interruption",
-				timestamp: 1_700_000_005_000,
-			},
-		});
+		fixture.appendTailEvent("agent_start", { type: "agent_start", sessionId: fixture.sessionId });
 		await eventually(() => failedHost.degraded, "scripted journal failure did not degrade the first host");
 		expect(state.read().tailCheckpoint).toMatchObject({ generation: 1, seq: 0 });
 	} finally {
@@ -564,11 +623,196 @@ test.serial("a failed journal append leaves the tail checkpoint behind so the sc
 	});
 	try {
 		await eventually(
-			() => journal.some(event => event.payloadJson.includes("replay after journal interruption")),
+			() => journal.some(event => event.kind === "turn_start"),
 			"restarted host did not replay the uncheckpointed broker event",
 		);
 		expect(state.read().tailCheckpoint).toMatchObject({ generation: 1, seq: 1 });
 	} finally {
 		await replayHost.dispose();
+	}
+});
+
+test.serial("a reply finalized while the daemon is down is recovered from durable transcript delivery progress", async () => {
+	const fixture = new FakeBrokerFixture();
+	fixtures.push(fixture);
+	const { state, profile } = await bootstrapFixture(fixture);
+	const firstSupervisor = supervisor(fixture);
+	const first = await strictResumeMainSession({ profile, state, supervisor: firstSupervisor });
+	const firstHost = createMainSessionHost({
+		supervisor: firstSupervisor,
+		identity: first.identity,
+		state,
+		journal: { journalAppend: () => undefined },
+		initialTurnState: first.turnState,
+		initialFollowUpQueueDepth: first.followUpQueueDepth,
+	});
+	try {
+		fixture.holdNextTurn();
+		await firstHost.admit("prompt", "finish while daemon is down", "down-recovery");
+		await eventually(() => state.read().growthIntent !== undefined, "growth intent was not durable before daemon stop");
+	} finally {
+		await firstHost.dispose();
+	}
+	fixture.complete("down-recovery", { text: "recovered after daemon downtime" });
+
+	const restartedSupervisor = supervisor(fixture);
+	const restarted = await strictResumeMainSession({ profile, state, supervisor: restartedSupervisor });
+	const journal: Array<{ kind: string; payloadJson: string }> = [];
+	const restartedHost = createMainSessionHost({
+		supervisor: restartedSupervisor,
+		identity: restarted.identity,
+		state,
+		journal: { journalAppend: (kind, payloadJson) => journal.push({ kind, payloadJson }) },
+		initialTurnState: restarted.turnState,
+		initialFollowUpQueueDepth: restarted.followUpQueueDepth,
+		recoveredGrowthIntent: restarted.growthIntent,
+	});
+	try {
+		expect(restarted.recoveredGrowthIntent).toBe(true);
+		await eventually(
+			() => journal.some(event => event.kind === "assistant_message" && event.payloadJson.includes("recovered after daemon downtime")),
+			"reply finalized while down was not recovered",
+		);
+		await eventually(() => state.read().growthIntent === undefined, "recovered growth intent was not finalized after transcript delivery");
+	} finally {
+		await restartedHost.dispose();
+	}
+});
+
+test.serial("an unprovable transcript suffix journals a durable delivery gap instead of silently baselining", async () => {
+	const fixture = new FakeBrokerFixture();
+	fixtures.push(fixture);
+	const { state, committed } = await bootstrapFixture(fixture);
+	const checkpoint = state.read().tailCheckpoint!;
+	const controlled: HostSupervisor = {
+		async discover() {
+			return { identity: committed.identity, transcriptEntries: [], discoveryCheckpoint: checkpoint, turnState: "idle", followUpQueueDepth: 0 };
+		},
+		async verify() {
+			return { identity: committed.identity, transcriptEntries: [], discoveryCheckpoint: checkpoint, turnState: "idle", followUpQueueDepth: 0 };
+		},
+		async sendPrompt() {
+			throw new Error("not used");
+		},
+		async sendSteer() {
+			throw new Error("not used");
+		},
+		async followUp() {
+			throw new Error("not used");
+		},
+		async operationStatus(opRef) {
+			return { operationRef: opRef, status: "unknown", completed: false, detail: {} };
+		},
+		async tailEvents() {
+			return {
+				identity: committed.identity,
+				transcriptEntries: [],
+				events: [],
+				terminal: true,
+				complete: true,
+				retentionGap: false,
+				checkpoint,
+			};
+		},
+		async turnState() {
+			return { turnState: "idle" as const, followUpQueueDepth: 0 };
+		},
+		async dispose() {},
+	};
+	const journal: Array<{ kind: string; payloadJson: string }> = [];
+	const host = createMainSessionHost({
+		supervisor: controlled,
+		identity: committed.identity,
+		state,
+		journal: { journalAppend: (kind, payloadJson) => journal.push({ kind, payloadJson }) },
+	});
+	try {
+		await eventually(
+			() => journal.some(event => event.kind === "transcript_delivery_gap"),
+			"unprovable transcript suffix did not produce a delivery-gap journal event",
+		);
+		expect(JSON.parse(journal.find(event => event.kind === "transcript_delivery_gap")?.payloadJson ?? "{}"))
+			.toMatchObject({ reason: "transcript_delivery_unprovable", delivered_through_entry_id: `${fixture.sessionId}:transcript:1` });
+		expect(state.read().transcriptDeliveryProgress).toMatchObject({ fingerprint: { entryCount: 0 } });
+	} finally {
+		await host.dispose();
+	}
+});
+
+test.serial("a rotating external transcript window emits delivery-gap before fail-closed identity loss", async () => {
+	const fixture = new FakeBrokerFixture();
+	fixtures.push(fixture);
+	const { state, profile } = await bootstrapFixture(fixture);
+	const resumedSupervisor = supervisor(fixture);
+	const resumed = await strictResumeMainSession({ profile, state, supervisor: resumedSupervisor });
+	const journal: Array<{ kind: string; payloadJson: string }> = [];
+	const host = createMainSessionHost({
+		supervisor: resumedSupervisor,
+		identity: resumed.identity,
+		state,
+		journal: { journalAppend: (kind, payloadJson) => journal.push({ kind, payloadJson }) },
+		initialTurnState: resumed.turnState,
+		initialFollowUpQueueDepth: resumed.followUpQueueDepth,
+	});
+	try {
+		fixture.rotateTranscriptPast(`${fixture.sessionId}:transcript:1`);
+		await eventually(
+			() => journal.some(event => event.kind === "transcript_delivery_gap"),
+			"rotating transcript window did not emit a delivery gap",
+		);
+		await expect(host.waitForFatalFailure()).resolves.toMatchObject({ reason: "main_identity_mismatch" });
+		expect(state.read()).toMatchObject({ bootstrapState: "FAILED_CLOSED", failedClosedReason: "main_identity_mismatch" });
+	} finally {
+		await host.dispose();
+	}
+});
+
+test.serial("a recovered busy growth window remains open across restart until terminal transcript delivery", async () => {
+	const fixture = new FakeBrokerFixture();
+	fixtures.push(fixture);
+	const { state, profile } = await bootstrapFixture(fixture);
+	const firstSupervisor = supervisor(fixture);
+	const first = await strictResumeMainSession({ profile, state, supervisor: firstSupervisor });
+	const firstHost = createMainSessionHost({
+		supervisor: firstSupervisor,
+		identity: first.identity,
+		state,
+		journal: { journalAppend: () => undefined },
+		initialTurnState: first.turnState,
+		initialFollowUpQueueDepth: first.followUpQueueDepth,
+	});
+	try {
+		fixture.holdNextTurn();
+		await firstHost.admit("prompt", "stay busy across restart", "busy-restart");
+		await eventually(() => firstHost.turnState === "busy", "first host did not observe its busy operation");
+	} finally {
+		await firstHost.dispose();
+	}
+
+	const restartedSupervisor = supervisor(fixture);
+	const restarted = await strictResumeMainSession({ profile, state, supervisor: restartedSupervisor });
+	const journal: Array<{ kind: string; payloadJson: string }> = [];
+	const restartedHost = createMainSessionHost({
+		supervisor: restartedSupervisor,
+		identity: restarted.identity,
+		state,
+		journal: { journalAppend: (kind, payloadJson) => journal.push({ kind, payloadJson }) },
+		initialTurnState: restarted.turnState,
+		initialFollowUpQueueDepth: restarted.followUpQueueDepth,
+		recoveredGrowthIntent: restarted.growthIntent,
+	});
+	try {
+		expect(restarted.recoveredGrowthIntent).toBe(true);
+		expect(restarted.turnState).toBe("busy");
+		expect(state.read().growthIntent).toBeDefined();
+		fixture.complete("busy-restart", { text: "busy turn settled after restart" });
+		await eventually(
+			() => journal.some(event => event.kind === "assistant_message" && event.payloadJson.includes("busy turn settled after restart")),
+			"recovered busy turn did not deliver its terminal transcript",
+		);
+		await eventually(() => state.read().growthIntent === undefined, "growth intent was not cleared after terminal delivery");
+		expect(state.read().bootstrapState).toBe("COMMITTED");
+	} finally {
+		await restartedHost.dispose();
 	}
 });

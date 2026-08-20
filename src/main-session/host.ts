@@ -1,18 +1,35 @@
 import { MainSessionGateRegistry, type GateHandle, type MainGateResolution } from "./gates";
 import {
+	attestsExternalTranscriptGrowth,
 	compareTailCheckpoints,
+	fingerprintTranscriptEntries,
 	GatewayStateStore,
 	sameExternalFingerprint,
 	type ExternalSessionIdentity,
 	type GrowthIntent,
 	type TailCheckpoint,
+	type TranscriptDeliveryProgress,
 } from "./state";
-import { HostSupervisorError, type HostSupervisor, type SupervisorEvent, type SupervisorTailEvents } from "./supervisor";
+import {
+	HostSupervisorError,
+	type HostSupervisor,
+	type SupervisorEvent,
+	type SupervisorTailEvents,
+	type SupervisorTranscriptEntry,
+} from "./supervisor";
 
 
 export interface MainSessionJournal {
 	journalAppend(kind: string, payloadJson: string): unknown;
 	journalAppendAtTailCheckpoint?(kind: string, payloadJson: string, expected: TailCheckpoint | undefined, checkpoint: TailCheckpoint): unknown;
+	journalAppendTranscriptProjection?(
+		kind: string,
+		payloadJson: string,
+		expectedTail: TailCheckpoint | undefined,
+		checkpoint: TailCheckpoint,
+		expectedDelivery: TranscriptDeliveryProgress | undefined,
+		nextDelivery: TranscriptDeliveryProgress,
+	): unknown;
 	setRpcHealth?(state: "degraded", reason: string): void;
 	setMainSessionStatus?(turnState: "idle" | "busy", followUpQueueDepth: number): void;
 	setJournalDegraded?(degraded: boolean): void;
@@ -49,6 +66,8 @@ export interface CreateMainSessionHostOptions {
 	readonly journal: MainSessionJournal;
 	readonly initialTurnState?: "idle" | "busy";
 	readonly initialFollowUpQueueDepth?: number;
+	/** An active durable growth intent recovered by strict resume. */
+	readonly recoveredGrowthIntent?: GrowthIntent;
 	readonly now?: () => number;
 	readonly gates?: MainSessionGateRegistry;
 }
@@ -216,7 +235,7 @@ class ExternalMainSessionHost implements MainSessionHost {
 	#activeAttempt: MainSessionTurnJournalPayload | undefined;
 	#nextAttempt = 0;
 	readonly #finalizedAssistantMessageKeys = new Set<string>();
-	#transcriptBaselineSeeded = false;
+	#transcriptDeliveryProgress: TranscriptDeliveryProgress | undefined;
 	readonly #journaledAttemptTransitions = new Map<string, JournaledAttemptTransitions>();
 	readonly #admittedOperations = new Map<string, "prompt" | "steer" | "follow_up">();
 	readonly #seenTailEvents = new Set<string>();
@@ -239,7 +258,12 @@ class ExternalMainSessionHost implements MainSessionHost {
 		this.gates = options.gates ?? new MainSessionGateRegistry({ now: this.#now });
 		this.#turnState = options.initialTurnState ?? "idle";
 		this.#followUpQueueDepth = Math.max(0, options.initialFollowUpQueueDepth ?? 0);
-		this.#tailCheckpoint = this.#state.read().tailCheckpoint;
+		const durable = this.#state.read();
+		this.#tailCheckpoint = durable.tailCheckpoint;
+		this.#transcriptDeliveryProgress = durable.transcriptDeliveryProgress;
+		if (options.recoveredGrowthIntent) {
+			this.#growthWindow = { intent: options.recoveredGrowthIntent, pendingAdmissions: 0 };
+		}
 
 		this.publishStatus();
 		this.#tailTask = this.observeTail();
@@ -328,7 +352,7 @@ class ExternalMainSessionHost implements MainSessionHost {
 			if (
 				checkpoint &&
 				this.#journal.journalAppendAtTailCheckpoint &&
-				(!this.#tailCheckpoint || compareTailCheckpoints(checkpoint, this.#tailCheckpoint) > 0)
+				(!this.#tailCheckpoint || compareTailCheckpoints(checkpoint, this.#tailCheckpoint) >= 0)
 			) {
 				this.#journal.journalAppendAtTailCheckpoint(kind, encoded, this.#tailCheckpoint, checkpoint);
 				this.#tailCheckpoint = checkpoint;
@@ -382,15 +406,55 @@ class ExternalMainSessionHost implements MainSessionHost {
 		if (kind === "turn_end") this.#activeAttempt = undefined;
 	}
 
-	private appendFinalAssistantMessage(event: Record<string, unknown>, fallbackKey: string): void {
+	private advanceTranscriptDelivery(expected: TranscriptDeliveryProgress | undefined, next: TranscriptDeliveryProgress): boolean {
+		try {
+			this.#state.advanceTranscriptDeliveryProgress(expected, next);
+			this.#transcriptDeliveryProgress = next;
+			return true;
+		} catch (error) {
+			this.enterFailure("transcript_delivery_progress_write_failed", error, true);
+			return false;
+		}
+	}
+
+	private appendFinalAssistantMessage(
+		event: Record<string, unknown>,
+		fallbackKey: string,
+		expectedDelivery: TranscriptDeliveryProgress | undefined,
+		nextDelivery: TranscriptDeliveryProgress,
+	): boolean {
 		const finalized = finalizedAssistantMessage(event, fallbackKey);
-		if (!finalized || this.#finalizedAssistantMessageKeys.has(finalized.key)) return;
-		if (!this.appendJournalEvent("assistant_message", finalized.payload)) return;
-		this.#finalizedAssistantMessageKeys.add(finalized.key);
-		while (this.#finalizedAssistantMessageKeys.size > MAX_JOURNALED_ATTEMPTS) {
-			const oldest = this.#finalizedAssistantMessageKeys.values().next().value;
-			if (!oldest) break;
-			this.#finalizedAssistantMessageKeys.delete(oldest);
+		if (!finalized || this.#finalizedAssistantMessageKeys.has(finalized.key)) {
+			return this.advanceTranscriptDelivery(expectedDelivery, nextDelivery);
+		}
+		try {
+			const encoded = payloadJson(finalized.payload);
+			const checkpoint = this.#journalTailCheckpoint ?? this.#tailCheckpoint;
+			if (checkpoint && this.#journal.journalAppendTranscriptProjection) {
+				this.#journal.journalAppendTranscriptProjection(
+					"assistant_message",
+					encoded,
+					this.#tailCheckpoint,
+					checkpoint,
+					expectedDelivery,
+					nextDelivery,
+				);
+				this.#tailCheckpoint = checkpoint;
+			} else {
+				this.#journal.journalAppend("assistant_message", encoded);
+				this.#state.advanceTranscriptDeliveryProgress(expectedDelivery, nextDelivery);
+			}
+			this.#transcriptDeliveryProgress = nextDelivery;
+			this.#finalizedAssistantMessageKeys.add(finalized.key);
+			while (this.#finalizedAssistantMessageKeys.size > MAX_JOURNALED_ATTEMPTS) {
+				const oldest = this.#finalizedAssistantMessageKeys.values().next().value;
+				if (!oldest) break;
+				this.#finalizedAssistantMessageKeys.delete(oldest);
+			}
+			return true;
+		} catch (error) {
+			this.enterFailure("transcript_delivery_progress_write_failed", error, true);
+			return false;
 		}
 	}
 
@@ -466,55 +530,160 @@ class ExternalMainSessionHost implements MainSessionHost {
 			this.observeGateResolved(event);
 			return;
 		}
-		if (type === "message_end") this.appendFinalAssistantMessage(event, `event:${eventString(event, "__tail_id") ?? JSON.stringify(event)}`);
+		// The broker's finalized reply is a stable transcript entry, not a ring message_end event.
 	}
 
-	private seedTranscriptBaseline(entries: readonly unknown[]): void {
-		this.#transcriptBaselineSeeded = true;
-		for (const [index, entry] of entries.entries()) {
-			if (!isRecord(entry)) continue;
-			const event = isRecord(entry.message) ? entry.message : entry;
-			const finalized = finalizedAssistantMessage(event, `transcript:${index}:${JSON.stringify(entry)}`);
-			if (finalized) this.#finalizedAssistantMessageKeys.add(finalized.key);
+	private appendTranscriptDeliveryGap(
+		expectedDelivery: TranscriptDeliveryProgress | undefined,
+		nextDelivery: TranscriptDeliveryProgress,
+		payload: Record<string, unknown>,
+	): boolean {
+		try {
+			const encoded = payloadJson(payload);
+			const checkpoint = this.#journalTailCheckpoint ?? this.#tailCheckpoint;
+			if (checkpoint && this.#journal.journalAppendTranscriptProjection) {
+				this.#journal.journalAppendTranscriptProjection(
+					"transcript_delivery_gap",
+					encoded,
+					this.#tailCheckpoint,
+					checkpoint,
+					expectedDelivery,
+					nextDelivery,
+				);
+				this.#tailCheckpoint = checkpoint;
+			} else {
+				this.#journal.journalAppend("transcript_delivery_gap", encoded);
+				this.#state.advanceTranscriptDeliveryProgress(expectedDelivery, nextDelivery);
+			}
+			this.#transcriptDeliveryProgress = nextDelivery;
+			return true;
+		} catch (error) {
+			this.enterFailure("transcript_delivery_progress_write_failed", error, true);
+			return false;
 		}
 	}
 
-	private observeTranscript(entries: readonly unknown[]): void {
-		for (const [index, entry] of entries.entries()) {
-			if (!isRecord(entry)) continue;
-			const event = isRecord(entry.message) ? entry.message : entry;
-			this.appendFinalAssistantMessage(event, `transcript:${index}:${JSON.stringify(entry)}`);
+	private transcriptDeliveryAt(entries: readonly SupervisorTranscriptEntry[], index: number): TranscriptDeliveryProgress {
+		return {
+			lastEntryId: entries[index]?.id,
+			fingerprint: fingerprintTranscriptEntries(entries.slice(0, index + 1).map(entry => entry.payload)),
+		};
+	}
+
+	private deliveryGapProgress(entries: readonly SupervisorTranscriptEntry[]): TranscriptDeliveryProgress {
+		return entries.length === 0
+			? { fingerprint: fingerprintTranscriptEntries([]) }
+			: this.transcriptDeliveryAt(entries, entries.length - 1);
+	}
+
+	private transcriptDeliveryIsUnprovable(entries: readonly SupervisorTranscriptEntry[]): boolean {
+		const previous = this.#transcriptDeliveryProgress;
+		if (!previous) return entries.length > 0;
+		if (!previous.lastEntryId) return previous.fingerprint.entryCount !== 0;
+		const index = entries.findIndex(entry => entry.id === previous.lastEntryId);
+		if (index < 0) return true;
+		const observed = fingerprintTranscriptEntries(entries.slice(0, index + 1).map(entry => entry.payload));
+		return (
+			observed.entryCount !== previous.fingerprint.entryCount ||
+			observed.sha256 !== previous.fingerprint.sha256
+		);
+	}
+
+	private observeTranscript(entries: readonly SupervisorTranscriptEntry[]): void {
+		for (const entry of entries) {
+			if (!entry.id.trim()) throw new HostSupervisorError("transcript_entry_id_missing", "Broker transcript delivery entry has no stable id.");
+		}
+		const previous = this.#transcriptDeliveryProgress;
+		if (!previous) {
+			if (entries.length === 0) return;
+			this.appendTranscriptDeliveryGap(undefined, this.deliveryGapProgress(entries), {
+				reason: "transcript_delivery_progress_missing",
+				available_from_entry_id: entries[0]?.id,
+				available_through_entry_id: entries.at(-1)?.id,
+			});
+			return;
+		}
+		let start = 0;
+		if (previous.lastEntryId) {
+			const index = entries.findIndex(entry => entry.id === previous.lastEntryId);
+			if (index < 0) {
+				this.appendTranscriptDeliveryGap(previous, this.deliveryGapProgress(entries), {
+					reason: "transcript_delivery_unprovable",
+					delivered_through_entry_id: previous.lastEntryId,
+					available_from_entry_id: entries[0]?.id,
+					available_through_entry_id: entries.at(-1)?.id,
+				});
+				return;
+			}
+			const observed = fingerprintTranscriptEntries(entries.slice(0, index + 1).map(entry => entry.payload));
+			if (
+				observed.entryCount !== previous.fingerprint.entryCount ||
+				observed.sha256 !== previous.fingerprint.sha256
+			) {
+				this.appendTranscriptDeliveryGap(previous, this.deliveryGapProgress(entries), {
+					reason: "transcript_delivery_unprovable",
+					delivered_through_entry_id: previous.lastEntryId,
+					available_from_entry_id: entries[0]?.id,
+					available_through_entry_id: entries.at(-1)?.id,
+				});
+				return;
+			}
+			start = index + 1;
+		} else if (previous.fingerprint.entryCount !== 0) {
+			this.appendTranscriptDeliveryGap(previous, this.deliveryGapProgress(entries), {
+				reason: "transcript_delivery_unprovable",
+				available_from_entry_id: entries[0]?.id,
+				available_through_entry_id: entries.at(-1)?.id,
+			});
+			return;
+		}
+		for (let index = start; index < entries.length; index += 1) {
+			const entry = entries[index];
+			if (!entry) continue;
+			const expectedDelivery = this.#transcriptDeliveryProgress;
+			const nextDelivery = this.transcriptDeliveryAt(entries, index);
+			const event = isRecord(entry.payload) ? (isRecord(entry.payload.message) ? entry.payload.message : entry.payload) : undefined;
+			const delivered = event
+				? this.appendFinalAssistantMessage(event, `transcript:${entry.id}`, expectedDelivery, nextDelivery)
+				: this.advanceTranscriptDelivery(expectedDelivery, nextDelivery);
+			if (!delivered || this.#failure) return;
 		}
 	}
 
-	private observeIdentity(identity: ExternalSessionIdentity): void {
+	private observeIdentity(identity: ExternalSessionIdentity, entries: readonly SupervisorTranscriptEntry[]): void {
 		if (sameExternalFingerprint(this.#identity, identity)) return;
 		if (!this.#growthWindow) {
 			markFailedClosed(this.#state, "main_identity_mismatch");
 			throw this.enterFailure("main_identity_mismatch", new Error("External transcript changed outside a growth window."));
 		}
+		if (!attestsExternalTranscriptGrowth(this.#identity, entries.map(entry => entry.payload))) {
+			markFailedClosed(this.#state, "growth_intent_mismatch");
+			throw this.enterFailure("growth_intent_mismatch", new Error("External transcript changed outside append-only growth."));
+		}
 		this.#identity = identity;
 	}
 
 	/**
-	 * A cursorless real broker tail reports the same origin retention gap on
-	 * every poll once its ring rotates. The first gap is the adoption boundary;
-	 * later gaps are fatal only when their resync point moves beyond our durable
-	 * event watermark.
+	 * Bootstrap persists the successful discovery tail's high-water checkpoint.
+	 * A legacy committed identity without one establishes the current high-water
+	 * checkpoint before any projection, never retroactively projecting retained
+	 * pre-adoption lifecycle events.
 	 */
-	private observeRetentionGap(tail: SupervisorTailEvents): boolean {
-		if (!tail.retentionGap) return false;
-		const resync = tail.resyncCheckpoint;
-		if (!resync) throw new HostSupervisorError("tail_retention_gap", "Broker tail reported a retention gap without a resync checkpoint.");
+	private establishProjectionBoundary(tail: SupervisorTailEvents): boolean {
 		const previous = this.#tailCheckpoint;
 		if (previous) {
+			if (!tail.retentionGap) return false;
+			const resync = tail.resyncCheckpoint;
+			if (!resync) throw new HostSupervisorError("tail_retention_gap", "Broker tail reported a retention gap without a resync checkpoint.");
 			if (checkpointSkipsPast(previous, resync)) {
 				throw new HostSupervisorError("tail_retention_gap", "Broker tail retention advanced beyond the durable watermark.");
 			}
 			return false;
 		}
+		const boundary = tail.checkpoint ?? tail.resyncCheckpoint;
+		if (!boundary) throw new HostSupervisorError("tail_checkpoint_unavailable", "Broker tail did not provide an adoption checkpoint.");
 		try {
-			this.#state.recordTailAdoptionStart(resync);
+			this.#state.recordTailAdoptionStart(boundary);
 		} catch (error) {
 			throw new HostSupervisorError(
 				"tail_checkpoint_write_failed",
@@ -522,7 +691,7 @@ class ExternalMainSessionHost implements MainSessionHost {
 				{ cause: error },
 			);
 		}
-		this.#tailCheckpoint = resync;
+		this.#tailCheckpoint = boundary;
 		return true;
 	}
 
@@ -580,31 +749,54 @@ class ExternalMainSessionHost implements MainSessionHost {
 				const tail = await this.#supervisor.tailEvents();
 				if (this.#disposed) return;
 				transientFailures = 0;
-				this.observeIdentity(tail.identity);
-				const adoptionGap = this.observeRetentionGap(tail);
-				if (!adoptionGap) {
+				if (!tail.complete) {
+					const wake = this.#tailWake.promise;
+					await Promise.race([Bun.sleep(100), wake, this.#tailStop.promise]);
+					continue;
+				}
+				// A rotating broker transcript window can no longer attest the durable
+				// delivery point. Record the consumer-visible gap before the identity
+				// mismatch closes this unsafe observation path.
+				if (
+					!sameExternalFingerprint(this.#identity, tail.identity) &&
+					this.transcriptDeliveryIsUnprovable(tail.transcriptEntries)
+				) {
+					const candidate = tail.checkpoint;
+					const journalCheckpoint =
+						candidate && (!this.#tailCheckpoint || compareTailCheckpoints(candidate, this.#tailCheckpoint) >= 0)
+							? candidate
+							: this.#tailCheckpoint;
+					this.#journalTailCheckpoint = journalCheckpoint;
+					try {
+						this.observeTranscript(tail.transcriptEntries);
+					} finally {
+						this.#journalTailCheckpoint = undefined;
+					}
+					if (this.#failure) return;
+				}
+				this.observeIdentity(tail.identity, tail.transcriptEntries);
+				const boundaryEstablished = this.establishProjectionBoundary(tail);
+				if (!boundaryEstablished) {
 					const events = tail.events.filter(event => this.shouldProjectTailEvent(event));
 					const revision = Math.max(tail.checkpoint?.revision ?? 0, this.#tailCheckpoint?.revision ?? 0);
-					// A finalized reply travels as a transcript entry while the lifecycle
-					// travels as ring events. Project the batch's transcript BEFORE its
-					// terminal event so consumers observe turn_start -> assistant_message
-					// -> turn_end, never a reply after the turn already closed.
+					// A finalized reply travels as a transcript entry while lifecycle events
+					// travel in the ring. Give a reply the terminal event's checkpoint so
+					// it and that lifecycle transition survive/replay as one durable batch.
 					let transcriptProjected = false;
 					const projectTranscript = (): void => {
 						if (transcriptProjected) return;
 						transcriptProjected = true;
-						if (this.#transcriptBaselineSeeded) this.observeTranscript(tail.transcriptEntries);
-						else this.seedTranscriptBaseline(tail.transcriptEntries);
+						this.observeTranscript(tail.transcriptEntries);
 					};
 					for (const event of events) {
-						const type = externalEvent(event).type;
-						if (type === "agent_end" || type === "turn_end") {
-							projectTranscript();
-							if (this.#failure) return;
-						}
 						const checkpoint = sourceCheckpoint(event, revision);
 						this.#journalTailCheckpoint = checkpoint;
 						try {
+							const type = externalEvent(event).type;
+							if (type === "agent_end" || type === "turn_end" || type === "agent_failed") {
+								projectTranscript();
+								if (this.#failure) return;
+							}
 							this.observeExternalEvent(event);
 						} finally {
 							this.#journalTailCheckpoint = undefined;
@@ -613,9 +805,15 @@ class ExternalMainSessionHost implements MainSessionHost {
 						this.advanceTailCheckpointTo(checkpoint);
 					}
 					if (this.#failure) return;
-					projectTranscript();
+					if (!transcriptProjected) {
+						this.#journalTailCheckpoint = this.checkpointAfterTail(tail, events) ?? tail.checkpoint;
+						try {
+							projectTranscript();
+						} finally {
+							this.#journalTailCheckpoint = undefined;
+						}
+					}
 					if (this.#failure) return;
-
 					// Projection is synchronous. Persist only after every journal append in
 					// this tail response has committed, so an interrupted poll replays.
 					this.advanceTailCheckpoint(tail, events);
@@ -674,9 +872,28 @@ class ExternalMainSessionHost implements MainSessionHost {
 		return growth;
 	}
 
+	private transcriptDeliverySettled(): boolean {
+		const transcript = this.#identity.transcript;
+		const delivery = this.#transcriptDeliveryProgress;
+		return (
+			transcript !== undefined &&
+			delivery !== undefined &&
+			delivery.fingerprint.entryCount === transcript.entryCount &&
+			delivery.fingerprint.sha256 === transcript.sha256
+		);
+	}
+
 	private finishGrowthWindowIfSettled(): void {
 		const growth = this.#growthWindow;
-		if (!growth || growth.pendingAdmissions > 0 || this.#admittedOperations.size > 0 || this.#turnState !== "idle" || this.#followUpQueueDepth > 0) return;
+		if (
+			!growth ||
+			growth.pendingAdmissions > 0 ||
+			this.#admittedOperations.size > 0 ||
+			this.#turnState !== "idle" ||
+			this.#followUpQueueDepth > 0 ||
+			!this.transcriptDeliverySettled()
+		)
+			return;
 		this.#growthWindow = undefined;
 		try {
 			this.#state.refreshAfterGrowth(growth.intent, this.#identity);

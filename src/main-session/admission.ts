@@ -1,9 +1,11 @@
 import * as crypto from "node:crypto";
 import type { OwnerSurface, WayProfile } from "../profile";
 import { RpcBridgeException } from "../rpc-bridge";
-import { canonicalJson, type GateIdempotencyStore } from "./gates";
+import { canonicalJson } from "./gates";
+import type { HostSupervisor } from "./supervisor";
 
 export type DeliveredAs = "prompt" | "steer" | "follow_up";
+const MAIN_ADMISSION_SCOPE = "main.submit";
 
 /** Server-derived request after strict JSON-RPC parameter validation. */
 export interface AdmissionRequest {
@@ -18,10 +20,52 @@ export interface MainAdmissionTarget {
 	admit(deliveredAs: DeliveredAs, text: string, opRef: string): Promise<void>;
 }
 
+export interface MainAdmissionOperationStore {
+	mainAdmissionOperationClaim(input: {
+		readonly scope: string;
+		readonly key: string;
+		readonly requestJson: string;
+		readonly intentJson: string;
+	}): { readonly claimed: boolean; readonly responseJson?: string };
+	mainAdmissionOperationFinalize(input: {
+		readonly scope: string;
+		readonly key: string;
+		readonly requestJson: string;
+		readonly intentJson: string;
+		readonly responseJson: string;
+	}): { readonly responseJson: string };
+	mainAdmissionOperationsPending(): readonly {
+		readonly scope: string;
+		readonly key: string;
+		readonly requestJson: string;
+		readonly intentJson: string;
+	}[];
+}
+
 export interface CreateMainAdmissionOptions {
 	/** P4 has no registry yet; callers can supply its quarantine decision seam. */
 	readonly isSurfaceQuarantined?: (surface: OwnerSurface) => boolean;
 	readonly newOpRef?: () => string;
+	/** Test-only interruption seam after broker acceptance and before durable finalization. */
+	readonly afterBrokerAcceptedBeforeFinalize?: () => void | Promise<void>;
+}
+
+interface MainAdmissionIntent {
+	readonly version: 1;
+	readonly state: "claimed";
+	readonly op_ref: string;
+	readonly delivered_as: DeliveredAs;
+	readonly request_hash: string;
+}
+
+export class MainAdmissionRecoveryError extends Error {
+	readonly reason: string;
+
+	constructor(reason: string, message = reason, options: { readonly cause?: unknown } = {}) {
+		super(message, options.cause === undefined ? undefined : { cause: options.cause });
+		this.name = "MainAdmissionRecoveryError";
+		this.reason = reason;
+	}
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -55,6 +99,10 @@ function idempotencyFailure(error: unknown): never {
 	throw error;
 }
 
+function sha256(value: string): string {
+	return crypto.createHash("sha256").update(value).digest("hex");
+}
+
 function replayResponse(responseJson: string | undefined): { accepted: boolean; op_ref: string; delivered_as: DeliveredAs } {
 	if (!responseJson) throw new Error("Idempotency replay has no stored response.");
 	const response = JSON.parse(responseJson) as Record<string, unknown>;
@@ -66,6 +114,39 @@ function replayResponse(responseJson: string | undefined): { accepted: boolean; 
 		throw new Error("Stored main.submit response is invalid.");
 	}
 	return response as { accepted: boolean; op_ref: string; delivered_as: DeliveredAs };
+}
+
+function parseIntent(intentJson: string): MainAdmissionIntent {
+	let parsed: unknown;
+	try {
+		parsed = JSON.parse(intentJson) as unknown;
+	} catch (error) {
+		throw new MainAdmissionRecoveryError("main_admission_intent_invalid", "The durable main admission intent is not JSON.", { cause: error });
+	}
+	if (
+		!isRecord(parsed) ||
+		parsed.version !== 1 ||
+		parsed.state !== "claimed" ||
+		typeof parsed.op_ref !== "string" ||
+		!parsed.op_ref ||
+		(parsed.delivered_as !== "prompt" && parsed.delivered_as !== "steer" && parsed.delivered_as !== "follow_up") ||
+		typeof parsed.request_hash !== "string" ||
+		!/^[a-f0-9]{64}$/i.test(parsed.request_hash)
+	) {
+		throw new MainAdmissionRecoveryError("main_admission_intent_invalid", "The durable main admission intent is malformed.");
+	}
+	return {
+		version: 1,
+		state: "claimed",
+		op_ref: parsed.op_ref,
+		delivered_as: parsed.delivered_as,
+		request_hash: parsed.request_hash,
+	};
+}
+
+function pendingReplayError(intentJson: string): never {
+	parseIntent(intentJson);
+	throw new RpcBridgeException(1501, "admission_recovery_pending");
 }
 
 async function dispatchAdmittedOperation(
@@ -84,7 +165,7 @@ async function dispatchAdmittedOperation(
 export function createMainAdmissionHandler(
 	target: MainAdmissionTarget,
 	profile: WayProfile,
-	idempotency: GateIdempotencyStore,
+	idempotency: MainAdmissionOperationStore,
 	options: CreateMainAdmissionOptions = {},
 ) {
 	const ownerSurfaceIds = new Set(profile.ownerSurfaces.map(surface => surface.id));
@@ -101,31 +182,95 @@ export function createMainAdmissionHandler(
 			surface_id: surface.id,
 			text: request.text,
 		});
-		let replay;
-		try {
-			replay = idempotency.idempotencyReplay({ scope: "main.submit", key: request.idempotencyKey, requestJson });
-		} catch (error) {
-			idempotencyFailure(error);
-		}
-		if (replay?.replayed) return replayResponse(replay.responseJson);
-
 		const deliveredAs: DeliveredAs = ownerSurfaceIds.has(surface.id)
 			? target.turnState === "idle"
 				? "prompt"
 				: "steer"
 			: "follow_up";
 		const response = { accepted: true, op_ref: newOpRef(), delivered_as: deliveredAs } as const;
-		await dispatchAdmittedOperation(target, deliveredAs, request.text, response.op_ref);
+		const intent: MainAdmissionIntent = {
+			version: 1,
+			state: "claimed",
+			op_ref: response.op_ref,
+			delivered_as: deliveredAs,
+			request_hash: sha256(requestJson),
+		};
+		const intentJson = canonicalJson(intent);
+		let claim;
 		try {
-			idempotency.idempotencyStore({
-				scope: "main.submit",
+			claim = idempotency.mainAdmissionOperationClaim({
+				scope: MAIN_ADMISSION_SCOPE,
 				key: request.idempotencyKey,
 				requestJson,
+				intentJson,
+			});
+		} catch (error) {
+			idempotencyFailure(error);
+		}
+		if (!claim.claimed) {
+			try {
+				return replayResponse(claim.responseJson);
+			} catch {
+				return pendingReplayError(claim.responseJson ?? "");
+			}
+		}
+		await dispatchAdmittedOperation(target, deliveredAs, request.text, response.op_ref);
+		await options.afterBrokerAcceptedBeforeFinalize?.();
+		try {
+			const finalized = idempotency.mainAdmissionOperationFinalize({
+				scope: MAIN_ADMISSION_SCOPE,
+				key: request.idempotencyKey,
+				requestJson,
+				intentJson,
+				responseJson: canonicalJson(response),
+			});
+			return replayResponse(finalized.responseJson);
+		} catch (error) {
+			idempotencyFailure(error);
+		}
+	};
+}
+
+/** Reconciles durable pre-effect claims after restart without ever re-sending their broker operation. */
+export async function reconcilePendingMainAdmissions(
+	idempotency: MainAdmissionOperationStore,
+	supervisor: HostSupervisor,
+): Promise<void> {
+	for (const pending of idempotency.mainAdmissionOperationsPending()) {
+		if (pending.scope !== MAIN_ADMISSION_SCOPE) {
+			throw new MainAdmissionRecoveryError("main_admission_intent_invalid", "A pending admission has an unexpected idempotency scope.");
+		}
+		const intent = parseIntent(pending.intentJson);
+		if (intent.request_hash !== sha256(pending.requestJson)) {
+			throw new MainAdmissionRecoveryError("main_admission_intent_invalid", "A pending admission request hash does not match its durable request.");
+		}
+		let status;
+		try {
+			status = await supervisor.operationStatus(intent.op_ref);
+		} catch (error) {
+			throw new MainAdmissionRecoveryError(
+				"main_admission_recovery_unavailable",
+				"Could not verify the broker operation for a pending main admission.",
+				{ cause: error },
+			);
+		}
+		if (status.status === "unknown") {
+			throw new MainAdmissionRecoveryError(
+				"main_admission_recovery_unprovable",
+				"The broker cannot prove whether a pending main admission was accepted.",
+			);
+		}
+		const response = { accepted: true, op_ref: intent.op_ref, delivered_as: intent.delivered_as } as const;
+		try {
+			idempotency.mainAdmissionOperationFinalize({
+				scope: pending.scope,
+				key: pending.key,
+				requestJson: pending.requestJson,
+				intentJson: pending.intentJson,
 				responseJson: canonicalJson(response),
 			});
 		} catch (error) {
 			idempotencyFailure(error);
 		}
-		return response;
-	};
+	}
 }

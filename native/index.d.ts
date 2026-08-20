@@ -108,6 +108,12 @@ export declare class WayCore {
    * active intent only when the exact original intent still owns the key.
    */
   closureOperationFinalize(input: ClosureOperationFinalizeInput): ClosureOperationFinalizeOutput
+  /** Claims a main admission's durable broker operation intent before the broker send. */
+  mainAdmissionOperationClaim(input: MainAdmissionOperationClaimInput): MainAdmissionOperationClaimOutput
+  /** Finalizes a broker-accepted main admission without changing its operation reference. */
+  mainAdmissionOperationFinalize(input: MainAdmissionOperationFinalizeInput): MainAdmissionOperationFinalizeOutput
+  /** Returns unresolved pre-effect admissions for startup recovery only. */
+  mainAdmissionOperationsPending(): Array<PendingMainAdmissionOperationOutput>
 }
 
 /** Request data delivered from Rust's TSFN into the thin TypeScript shim. */
@@ -335,12 +341,43 @@ export interface LockStatusOutput {
   quarantined: boolean
 }
 
+export interface MainAdmissionOperationClaimInput {
+  scope: string
+  key: string
+  requestJson: string
+  intentJson: string
+}
+
+export interface MainAdmissionOperationClaimOutput {
+  claimed: boolean
+  responseJson?: string
+}
+
+export interface MainAdmissionOperationFinalizeInput {
+  scope: string
+  key: string
+  requestJson: string
+  intentJson: string
+  responseJson: string
+}
+
+export interface MainAdmissionOperationFinalizeOutput {
+  responseJson: string
+}
+
 export interface OutboxRowOutput {
   consumerId: string
   seq: string
   state: string
   platformMsgId?: string
   dedupeKey?: string
+}
+
+export interface PendingMainAdmissionOperationOutput {
+  scope: string
+  key: string
+  requestJson: string
+  intentJson: string
 }
 
 export interface ProcessIdentityOutput {

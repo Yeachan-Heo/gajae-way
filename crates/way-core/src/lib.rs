@@ -25,7 +25,7 @@ use crate::{
 		LockStatus, ProcessObservation, ProcessProbe, QuarantineReceiptEvidence, QueueEntry, ReleaseResult, SystemProcessProbe,
 	},
 	registry::{BrokerSessionRow, BrokerSnapshot, GatewaySession, MetadataEnrichment, RegistryAnnotation, RegistryListFilter, SurfaceRecord},
-	store::{ClosureOperationClaim, Store, StoreError, meta_get_tx, meta_set_tx, unix_epoch_ms},
+	store::{ClosureOperationClaim, MainAdmissionOperationClaim, PendingMainAdmissionOperation, Store, StoreError, meta_get_tx, meta_set_tx, unix_epoch_ms},
 };
 
 pub mod events;
@@ -337,6 +337,51 @@ pub struct ClosureOperationFinalizeInput {
 pub struct ClosureOperationFinalizeOutput {
 	#[napi(js_name = "responseJson")]
 	pub response_json: String,
+}
+
+#[napi(object)]
+pub struct MainAdmissionOperationClaimInput {
+	pub scope: String,
+	pub key: String,
+	#[napi(js_name = "requestJson")]
+	pub request_json: String,
+	#[napi(js_name = "intentJson")]
+	pub intent_json: String,
+}
+
+#[napi(object)]
+pub struct MainAdmissionOperationClaimOutput {
+	pub claimed: bool,
+	#[napi(js_name = "responseJson")]
+	pub response_json: Option<String>,
+}
+
+#[napi(object)]
+pub struct MainAdmissionOperationFinalizeInput {
+	pub scope: String,
+	pub key: String,
+	#[napi(js_name = "requestJson")]
+	pub request_json: String,
+	#[napi(js_name = "intentJson")]
+	pub intent_json: String,
+	#[napi(js_name = "responseJson")]
+	pub response_json: String,
+}
+
+#[napi(object)]
+pub struct MainAdmissionOperationFinalizeOutput {
+	#[napi(js_name = "responseJson")]
+	pub response_json: String,
+}
+
+#[napi(object)]
+pub struct PendingMainAdmissionOperationOutput {
+	pub scope: String,
+	pub key: String,
+	#[napi(js_name = "requestJson")]
+	pub request_json: String,
+	#[napi(js_name = "intentJson")]
+	pub intent_json: String,
 }
 
 /// One metadata value returned from the durable gateway state store. A missing
@@ -1097,6 +1142,59 @@ impl WayCore {
 			.map_err(store_napi_error)?;
 		Ok(ClosureOperationFinalizeOutput { response_json })
 	}
+
+	/// Claims a main admission's durable broker operation intent before the broker send.
+	#[napi(js_name = "mainAdmissionOperationClaim")]
+	pub fn main_admission_operation_claim(
+		&self,
+		input: MainAdmissionOperationClaimInput,
+	) -> napi::Result<MainAdmissionOperationClaimOutput> {
+		match self
+			.store
+			.claim_main_admission_operation(
+				&input.scope,
+				&input.key,
+				&input.request_json,
+				&input.intent_json,
+				unix_epoch_ms(),
+			)
+			.map_err(store_napi_error)?
+		{
+			MainAdmissionOperationClaim::Claimed => Ok(MainAdmissionOperationClaimOutput { claimed: true, response_json: None }),
+			MainAdmissionOperationClaim::Existing { response_json } => {
+				Ok(MainAdmissionOperationClaimOutput { claimed: false, response_json: Some(response_json) })
+			}
+		}
+	}
+
+	/// Finalizes a broker-accepted main admission without changing its operation reference.
+	#[napi(js_name = "mainAdmissionOperationFinalize")]
+	pub fn main_admission_operation_finalize(
+		&self,
+		input: MainAdmissionOperationFinalizeInput,
+	) -> napi::Result<MainAdmissionOperationFinalizeOutput> {
+		let response_json = self
+			.store
+			.finalize_main_admission_operation(
+				&input.scope,
+				&input.key,
+				&input.request_json,
+				&input.intent_json,
+				&input.response_json,
+				unix_epoch_ms(),
+			)
+			.map_err(store_napi_error)?;
+		Ok(MainAdmissionOperationFinalizeOutput { response_json })
+	}
+
+	/// Returns unresolved pre-effect admissions for startup recovery only.
+	#[napi(js_name = "mainAdmissionOperationsPending")]
+	pub fn main_admission_operations_pending(&self) -> napi::Result<Vec<PendingMainAdmissionOperationOutput>> {
+		self.store
+			.pending_main_admission_operations()
+			.map(|operations| operations.into_iter().map(pending_main_admission_operation_output).collect())
+			.map_err(store_napi_error)
+	}
 }
 
 fn open_way_core(state_dir: String, hard_hold_cap_ms: Option<u64>) -> napi::Result<WayCore> {
@@ -1226,6 +1324,15 @@ fn lock_status_output(status: LockStatus) -> LockStatusOutput {
 		queue: status.queue.into_iter().map(queue_entry_output).collect(),
 		stuck: status.stuck,
 		quarantined: status.quarantined,
+	}
+}
+
+fn pending_main_admission_operation_output(operation: PendingMainAdmissionOperation) -> PendingMainAdmissionOperationOutput {
+	PendingMainAdmissionOperationOutput {
+		scope: operation.scope,
+		key: operation.key,
+		request_json: operation.request_json,
+		intent_json: operation.intent_json,
 	}
 }
 

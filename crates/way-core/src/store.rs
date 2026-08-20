@@ -14,7 +14,7 @@ use std::{
 use rusqlite::{Connection, OptionalExtension, Transaction};
 
 pub const DATABASE_FILENAME: &str = "way-core.sqlite3";
-pub const SCHEMA_VERSION: u32 = 2;
+pub const SCHEMA_VERSION: u32 = 3;
 pub const IDEMPOTENCY_WINDOW_MS: i64 = 24 * 60 * 60 * 1_000;
 pub const CLOSURE_OPERATION_META_KEY: &str = "gitlock_closure_operation";
 
@@ -54,6 +54,8 @@ pub enum StoreError {
     ClosureOperationInProgress,
     ClosureOperationMissing,
     ClosureOperationChanged,
+    MainAdmissionOperationMissing,
+    MainAdmissionOperationChanged,
 }
 
 impl fmt::Display for StoreError {
@@ -78,6 +80,8 @@ impl fmt::Display for StoreError {
             Self::ClosureOperationInProgress => formatter.write_str("another corpus closure operation is pending recovery"),
             Self::ClosureOperationMissing => formatter.write_str("closure operation intent is missing"),
             Self::ClosureOperationChanged => formatter.write_str("closure operation intent changed before finalization"),
+            Self::MainAdmissionOperationMissing => formatter.write_str("main admission operation intent is missing"),
+            Self::MainAdmissionOperationChanged => formatter.write_str("main admission operation intent changed before finalization"),
         }
     }
 }
@@ -110,6 +114,20 @@ pub type StoreResult<T> = Result<T, StoreError>;
 pub enum ClosureOperationClaim {
     Claimed,
     Existing { response_json: String },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MainAdmissionOperationClaim {
+    Claimed,
+    Existing { response_json: String },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PendingMainAdmissionOperation {
+    pub scope: String,
+    pub key: String,
+    pub request_json: String,
+    pub intent_json: String,
 }
 
 struct StoreInner {
@@ -211,7 +229,7 @@ impl Store {
     ) -> StoreResult<Option<String>> {
         let mut connection = self.connection()?;
         let transaction = connection.transaction()?;
-        transaction.execute("DELETE FROM idempotency WHERE expires_at <= ?1", [now_ms])?;
+        expire_idempotency_tx(&transaction, now_ms)?;
         let existing = transaction
 			.query_row(
 				"SELECT request_json, response_json FROM idempotency WHERE scope = ?1 AND idempotency_key = ?2",
@@ -243,7 +261,7 @@ impl Store {
         })?;
         let mut connection = self.connection()?;
         let transaction = connection.transaction()?;
-        transaction.execute("DELETE FROM idempotency WHERE expires_at <= ?1", [now_ms])?;
+        expire_idempotency_tx(&transaction, now_ms)?;
         let existing = transaction
             .query_row(
                 "SELECT request_json FROM idempotency WHERE scope = ?1 AND idempotency_key = ?2",
@@ -283,7 +301,7 @@ impl Store {
         })?;
         let mut connection = self.connection()?;
         let transaction = connection.transaction()?;
-        transaction.execute("DELETE FROM idempotency WHERE expires_at <= ?1", [now_ms])?;
+        expire_idempotency_tx(&transaction, now_ms)?;
         let existing = transaction
             .query_row(
                 "SELECT request_json, response_json FROM idempotency WHERE scope = ?1 AND idempotency_key = ?2",
@@ -357,6 +375,141 @@ impl Store {
         transaction.commit()?;
         Ok(response_json.to_owned())
     }
+
+    /// Atomically reserves a main-admission idempotency key and its broker operation
+    /// reference before any external broker command is allowed to run.
+    pub fn claim_main_admission_operation(
+        &self,
+        scope: &str,
+        key: &str,
+        request_json: &str,
+        intent_json: &str,
+        now_ms: i64,
+    ) -> StoreResult<MainAdmissionOperationClaim> {
+        let expires_at = now_ms.checked_add(IDEMPOTENCY_WINDOW_MS).ok_or_else(|| {
+            StoreError::InvalidMetadata("idempotency expiration overflowed i64".to_owned())
+        })?;
+        let mut connection = self.connection()?;
+        let transaction = connection.transaction()?;
+        expire_idempotency_tx(&transaction, now_ms)?;
+        let existing = transaction
+            .query_row(
+                "SELECT request_json, response_json FROM idempotency WHERE scope = ?1 AND idempotency_key = ?2",
+                rusqlite::params![scope, key],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            )
+            .optional()?;
+        match existing {
+            Some((stored_request, _)) if stored_request != request_json => return Err(StoreError::IdempotencyConflict),
+            Some((_, response_json)) => {
+                transaction.commit()?;
+                return Ok(MainAdmissionOperationClaim::Existing { response_json });
+            }
+            None => {}
+        }
+        transaction.execute(
+            "INSERT INTO idempotency(scope, idempotency_key, request_json, response_json, created_at, expires_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            rusqlite::params![scope, key, request_json, intent_json, now_ms, expires_at],
+        )?;
+        transaction.execute(
+            "INSERT INTO main_admission_operations(scope, idempotency_key, request_json, intent_json)
+             VALUES (?1, ?2, ?3, ?4)",
+            rusqlite::params![scope, key, request_json, intent_json],
+        )?;
+        transaction.commit()?;
+        Ok(MainAdmissionOperationClaim::Claimed)
+    }
+
+    /// Atomically replaces a claimed pre-effect intent with its accepted response.
+    pub fn finalize_main_admission_operation(
+        &self,
+        scope: &str,
+        key: &str,
+        request_json: &str,
+        intent_json: &str,
+        response_json: &str,
+        now_ms: i64,
+    ) -> StoreResult<String> {
+        let expires_at = now_ms.checked_add(IDEMPOTENCY_WINDOW_MS).ok_or_else(|| {
+            StoreError::InvalidMetadata("idempotency expiration overflowed i64".to_owned())
+        })?;
+        let mut connection = self.connection()?;
+        let transaction = connection.transaction()?;
+        let existing = transaction
+            .query_row(
+                "SELECT request_json, response_json FROM idempotency WHERE scope = ?1 AND idempotency_key = ?2",
+                rusqlite::params![scope, key],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            )
+            .optional()?;
+        let Some((stored_request, stored_response)) = existing else {
+            return Err(StoreError::MainAdmissionOperationMissing);
+        };
+        if stored_request != request_json {
+            return Err(StoreError::IdempotencyConflict);
+        }
+        if stored_response != intent_json {
+            transaction.commit()?;
+            return Ok(stored_response);
+        }
+        let operation_intent = transaction
+            .query_row(
+                "SELECT intent_json FROM main_admission_operations WHERE scope = ?1 AND idempotency_key = ?2",
+                rusqlite::params![scope, key],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?;
+        if operation_intent.as_deref() != Some(intent_json) {
+            return Err(if operation_intent.is_some() {
+                StoreError::MainAdmissionOperationChanged
+            } else {
+                StoreError::MainAdmissionOperationMissing
+            });
+        }
+        transaction.execute(
+            "UPDATE idempotency SET response_json = ?1, expires_at = ?2 WHERE scope = ?3 AND idempotency_key = ?4",
+            rusqlite::params![response_json, expires_at, scope, key],
+        )?;
+        transaction.execute(
+            "DELETE FROM main_admission_operations WHERE scope = ?1 AND idempotency_key = ?2",
+            rusqlite::params![scope, key],
+        )?;
+        transaction.commit()?;
+        Ok(response_json.to_owned())
+    }
+
+    /// Lists only unresolved pre-effect claims so startup can prove broker acceptance without resending.
+    pub fn pending_main_admission_operations(&self) -> StoreResult<Vec<PendingMainAdmissionOperation>> {
+        let connection = self.connection()?;
+        let mut statement = connection.prepare(
+            "SELECT scope, idempotency_key, request_json, intent_json
+             FROM main_admission_operations ORDER BY scope, idempotency_key",
+        )?;
+        let rows = statement.query_map([], |row| {
+            Ok(PendingMainAdmissionOperation {
+                scope: row.get(0)?,
+                key: row.get(1)?,
+                request_json: row.get(2)?,
+                intent_json: row.get(3)?,
+            })
+        })?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(StoreError::from)
+    }
+}
+
+fn expire_idempotency_tx(transaction: &Transaction<'_>, now_ms: i64) -> StoreResult<()> {
+    transaction.execute(
+        "DELETE FROM idempotency
+         WHERE expires_at <= ?1
+           AND NOT EXISTS (
+               SELECT 1 FROM main_admission_operations AS pending
+               WHERE pending.scope = idempotency.scope
+                 AND pending.idempotency_key = idempotency.idempotency_key
+           )",
+        [now_ms],
+    )?;
+    Ok(())
 }
 
 pub(crate) fn meta_get(connection: &Connection, key: &str) -> StoreResult<Option<String>> {
@@ -567,6 +720,23 @@ fn migrate(connection: &mut Connection) -> StoreResult<()> {
         transaction.commit()?;
     }
 
+    if current_version < 3 {
+        let transaction = connection.transaction()?;
+        transaction.execute_batch(
+            "CREATE TABLE IF NOT EXISTS main_admission_operations (
+                scope TEXT NOT NULL,
+                idempotency_key TEXT NOT NULL,
+                request_json TEXT NOT NULL,
+                intent_json TEXT NOT NULL,
+                PRIMARY KEY (scope, idempotency_key),
+                FOREIGN KEY (scope, idempotency_key) REFERENCES idempotency(scope, idempotency_key)
+            );",
+        )?;
+        meta_set_tx(&transaction, "schema_version", "3")?;
+        transaction.commit()?;
+    }
+
+
     let defaults = [
         ("bootstrap_state", "ABSENT"),
         ("bootstrap_intent", "null"),
@@ -579,6 +749,8 @@ fn migrate(connection: &mut Connection) -> StoreResult<()> {
         ("profile_approved_at", "null"),
         ("profile_approval_receipt", "null"),
         ("failed_closed_reason", "null"),
+        ("tail_checkpoint", "null"),
+        ("transcript_delivery_progress", "null"),
         ("journal_generation", "1"),
         ("boot_epoch", "0"),
         ("journal_floor_seq", "0"),
@@ -619,7 +791,7 @@ mod tests {
 
     use super::{
         CLOSURE_OPERATION_META_KEY, DATABASE_FILENAME, IDEMPOTENCY_WINDOW_MS, SCHEMA_VERSION,
-        ClosureOperationClaim, Store, StoreError,
+        ClosureOperationClaim, MainAdmissionOperationClaim, Store, StoreError,
     };
     use rusqlite::{Connection, OptionalExtension};
 
@@ -667,6 +839,7 @@ mod tests {
             "consumer_checkpoints",
             "outbox",
             "idempotency",
+            "main_admission_operations",
         ] {
             let found: Option<String> = connection
                 .query_row(
@@ -856,6 +1029,44 @@ mod tests {
             response
         );
         assert_eq!(store.get_meta(CLOSURE_OPERATION_META_KEY).unwrap(), None);
+        assert_eq!(store.replay_idempotency(scope, "key", request, 103).unwrap().as_deref(), Some(response));
+    }
+
+    #[test]
+    fn main_admission_claim_is_pre_effect_and_finalizes_without_replay_resend() {
+        let store = Store::default();
+        let scope = "main.submit";
+        let request = r#"{"idempotency_key":"key","surface_id":"owner","text":"send once"}"#;
+        let intent = r#"{"delivered_as":"prompt","op_ref":"operation","request_hash":"hash","state":"claimed","version":1}"#;
+        let response = r#"{"accepted":true,"delivered_as":"prompt","op_ref":"operation"}"#;
+
+        assert_eq!(
+            store.claim_main_admission_operation(scope, "key", request, intent, 100).unwrap(),
+            MainAdmissionOperationClaim::Claimed
+        );
+        assert_eq!(
+            store.claim_main_admission_operation(scope, "key", request, intent, 101).unwrap(),
+            MainAdmissionOperationClaim::Existing { response_json: intent.to_owned() }
+        );
+        assert_eq!(
+            store.pending_main_admission_operations().unwrap(),
+            vec![super::PendingMainAdmissionOperation {
+                scope: scope.to_owned(),
+                key: "key".to_owned(),
+                request_json: request.to_owned(),
+                intent_json: intent.to_owned(),
+            }]
+        );
+        assert!(matches!(
+            store.claim_main_admission_operation(scope, "key", r#"{"different":true}"#, intent, 101),
+            Err(StoreError::IdempotencyConflict)
+        ));
+
+        assert_eq!(
+            store.finalize_main_admission_operation(scope, "key", request, intent, response, 102).unwrap(),
+            response
+        );
+        assert!(store.pending_main_admission_operations().unwrap().is_empty());
         assert_eq!(store.replay_idempotency(scope, "key", request, 103).unwrap().as_deref(), Some(response));
     }
 }
