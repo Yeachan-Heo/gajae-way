@@ -4,6 +4,7 @@
 export interface EmbeddedAddon {
 	platformTag: string;
 	version: string;
+	contentHash: string;
 	executable: "gajaeway" | "gajaeway-discord";
 	filename: string;
 	filePath: string;

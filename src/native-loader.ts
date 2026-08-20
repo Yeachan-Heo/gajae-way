@@ -256,18 +256,31 @@ function materializeEmbeddedAddon(): string {
 		throw new Error(`Embedded ${embeddedAddon.filename} cannot run on ${platformTag()}.`);
 	}
 
-	const cacheDir = path.join(os.tmpdir(), "gajaeway", "native", embeddedAddon.version, embeddedAddon.platformTag);
+	// The cache key MUST be the addon's content hash. Version+platform+size is
+	// not enough: rebuilds of the same crate version routinely produce same-size
+	// addons, and a stale extraction then silently serves OLD native code to
+	// every new binary (observed in production: a compiled daemon reporting
+	// status healthy for a degraded gateway that source had already fixed).
+	const cacheDir = path.join(os.tmpdir(), "gajaeway", "native", embeddedAddon.contentHash, embeddedAddon.platformTag);
 	const targetPath = path.join(cacheDir, embeddedAddon.filename);
-	const sourceSize = fs.statSync(embeddedAddon.filePath).size;
+	const sourceBytes = fs.readFileSync(embeddedAddon.filePath);
+	const hash = (bytes: Uint8Array): string => {
+		const hasher = new Bun.CryptoHasher("sha256");
+		hasher.update(bytes);
+		return hasher.digest("hex");
+	};
+	if (hash(sourceBytes) !== embeddedAddon.contentHash) {
+		throw new Error(`Embedded addon ${embeddedAddon.filename} does not match its recorded content hash.`);
+	}
 	try {
-		if (fs.statSync(targetPath).size === sourceSize) return targetPath;
+		if (hash(fs.readFileSync(targetPath)) === embeddedAddon.contentHash) return targetPath;
 	} catch (error) {
 		if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
 	}
 
 	fs.mkdirSync(cacheDir, { recursive: true });
 	const temporaryPath = `${targetPath}.tmp.${process.pid}`;
-	fs.writeFileSync(temporaryPath, fs.readFileSync(embeddedAddon.filePath));
+	fs.writeFileSync(temporaryPath, sourceBytes);
 	try {
 		fs.renameSync(temporaryPath, targetPath);
 	} catch (renameError) {
