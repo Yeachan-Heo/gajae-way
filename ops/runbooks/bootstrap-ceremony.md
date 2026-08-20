@@ -1,15 +1,43 @@
 # Bootstrap ceremony
 
-## Preconditions
+## Preconditions and the operator-owned GJC session
 
-`gajaeway bootstrap --confirm` is the only creation path for a main identity. The
-daemon never auto-bootstraps. Complete profile configuration first, including
+`gajaeway bootstrap --confirm` is an explicit adoption ceremony, not a session
+creation path. It never creates, resumes, or takes ownership of a GJC session,
+and the daemon never auto-bootstraps. Complete the profile first, including the
 corpus/workspace, ordered injection files, restricted-file policy, owner
-surfaces, and operator identity. Ensure the service account can access the
-configured SDK/broker credentials without placing them in the profile.
+surfaces, operator identity, and the exact external main-session selection.
 
-The corpus must have no other writer. Stop the daemon and adapter before
-opening its state directory:
+The operator starts an interactive `gjc` in the configured corpus workspace
+before bootstrap. A durable tmux owner is recommended so the real owner TUI can
+be reattached after a disconnect:
+
+```sh
+tmux new-session -s gajae-main -c /srv/gajaeway/workspace gjc
+```
+
+In another operator shell, discover the live session and select the exact live
+`main` session for that workspace:
+
+```sh
+gjc sdk session list
+```
+
+Record that session in the deployment profile before the first bootstrap:
+
+```toml
+[main_session]
+session_id = "SESSION_ID_FROM_GJC"
+```
+
+The normal bootstrap command then reads the profile selection. An operator may
+instead pass `--session-id SESSION_ID_FROM_GJC`; when both are supplied, they
+must match exactly. Do not select a recent, similarly named, or different
+workspace session.
+
+The corpus must have no other writer. Stop the gateway and adapter before
+adopting the operator-owned session; this does not stop the operator's `gjc`
+process:
 
 ```sh
 sudo systemctl stop gajaeway-discord.service gajaeway.service
@@ -17,35 +45,57 @@ sudo -u gajaeway -H /usr/local/bin/gajaeway bootstrap --confirm \
   --state-dir /var/lib/gajaeway --profile /etc/gajaeway/profile.toml
 ```
 
-The exact `--confirm` flag is mandatory. A successful command prints a JSON
-object with `state: "committed"`, `session_id`, and the bootstrap `nonce`.
-Record the session ID and profile digest from the profile in the deployment
-record; do not hand-edit `way-core.sqlite3` to repair bootstrap state.
-
 ## What is committed atomically
 
-The ceremony writes `CREATING { nonce, ts }` before SDK creation. Its first
-nonce-bearing message is persisted in the transcript. After two stable
-fingerprints, one durable transaction publishes the full transcript identity
-(canonical path, session ID, device/inode, link count, size, timestamps, and
-SHA-256) and the resolved profile digest. The next `gajaeway serve` can only resume
-that exact identity.
+The exact `--confirm` command asks the credential-free broker CLI to verify the
+selected external GJC session. It verifies that the session is live, is a
+`main` session, and has the configured workspace/locator before committing the
+external identity and resolved profile digest in one durable state transition.
+It does not create a session, inject a bootstrap prompt, scan nonce-bearing
+transcripts, or adopt a fallback session.
+
+A successful command prints JSON with `state: "committed"`, `session_id`, and
+the adoption nonce. Record the session ID, broker-verified identity/locator,
+and profile digest in the deployment record. Do not hand-edit
+`way-core.sqlite3` to repair bootstrap state.
+
+## Strict resume and external-owner boundaries
+
+Every `gajaeway serve` performs strict resume against the exact committed
+external session. It re-verifies the broker identity, workspace locator, and
+profile digest, and fails closed on an unavailable, ambiguous, mismatched, or
+otherwise unverifiable identity. It never creates a local SDK session or falls
+back to a recent session.
+
+The operator remains the owner of the real GJC TUI. Attach with `tmux attach -t <session>` (for example, `tmux attach -t gajae-main`) when tmux hosts it, or use the terminal that runs `gjc`.
+The gateway sends prompts, steers, and follow-ups only through the broker CLI;
+The gateway is only the session's broker-CLI controller.
+
+Gates are answered in that attached GJC TUI, not through the gateway. The
+console `/gate` command remains a capability probe for a future backend with
+validated gate receipts; the external-host backend honestly reports it as
+unsupported.
+
+Replies finalized while the daemon is down are recovered from durable delivery
+progress or surfaced as an explicit delivery-gap event. A missing delivery is
+never silently represented as a delivered assistant reply.
 
 ## Interrupted ceremony recovery
 
-Do not delete a partial transcript or reset state by hand. Start the daemon
-once with the same profile and state directory; it scans the durable nonce:
+Do not delete adoption state or reset it by hand. If bootstrap was interrupted
+while recording `CREATING` or `CREATED`, rerun the same explicit bootstrap
+command with the same state directory and profile. Recovery re-verifies only
+the exact session ID in the durable adoption intent:
 
-- exactly one matching valid transcript is committed and strict resume proceeds;
-- zero matching transcripts returns the state to `ABSENT`, so repeat the same
-  explicit bootstrap command; and
-- multiple matches or an invalid candidate fails closed for manual
-  investigation.
+- a verified identity is committed and strict resume proceeds; and
+- an unavailable or mismatched identity fails closed for manual investigation.
 
-A failed-closed daemon serves its reason through `way.health` during its
-configured linger window, writes `health.json`, then exits 78. Correct the
-cause or use the profile-approval ceremony when the reported reason is
-`profile_drift`; do not use systemd restart loops as a repair mechanism.
+There is no nonce transcript scan, local transcript-file identity, or
+recent-session discovery recovery path. A failed-closed daemon serves its
+reason through `way.health` during its configured linger window, writes
+`health.json`, then exits 78. Correct the cause or use the profile-approval
+ceremony when the reported reason is `profile_drift`; do not use systemd restart
+loops as a repair mechanism.
 
 ## Start after commit
 

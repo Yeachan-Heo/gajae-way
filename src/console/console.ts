@@ -50,6 +50,8 @@ const MAX_CONSOLE_JOURNAL_TAIL_EVENTS = 100;
 const DEFAULT_CONSOLE_JOURNAL_TAIL_EVENTS = 20;
 const MAX_CONSOLE_INPUT_OPERATIONS = 16;
 const MAX_CONSOLE_EXIT_DIAGNOSTIC_MS = 250;
+const EXTERNAL_HOST_GATE_ANSWER_GUIDANCE =
+	"The gateway cannot answer gates in the external-host architecture. The owner must answer each gate in the attached gjc TUI: tmux attach -t <session> when the tmux backend hosts it, or whatever terminal runs gjc.";
 
 export type WayConsoleEventKind = (typeof GAJAEWAY_CONSOLE_EVENT_KINDS)[number];
 export type WayJournalEventKind = (typeof GAJAEWAY_JOURNAL_EVENT_KINDS)[number];
@@ -161,10 +163,17 @@ interface MainSubmitResult {
 	readonly deliveredAs: string;
 }
 
-interface GateAnswerResult {
+interface GateAnswerAcceptedResult {
 	readonly accepted: true;
 	readonly gateState: string;
 }
+
+interface GateAnswerUnsupportedResult {
+	readonly accepted: false;
+	readonly gateState: "unsupported";
+}
+
+type GateAnswerResult = GateAnswerAcceptedResult | GateAnswerUnsupportedResult;
 
 export class WayConsoleError extends Error {
 	constructor(message: string) {
@@ -716,6 +725,10 @@ export class OwnerConsole {
 				"main.gate.answer",
 			),
 		);
+		if (!result.accepted) {
+			await this.#output.writeFrame(`Gate ${sanitizeConsoleText(gateId)}: ${EXTERNAL_HOST_GATE_ANSWER_GUIDANCE}\n`);
+			return result;
+		}
 		await this.#output.writeFrame(`Gate ${sanitizeConsoleText(gateId)}: ${sanitizeConsoleText(result.gateState)}\n`);
 		return result;
 	}
@@ -880,7 +893,8 @@ export class OwnerConsole {
 					"  /lock status",
 					"  /lock force-release <lease_id> CONFIRM FORCE-RELEASE <lease_id>",
 					"  /lock clear-quarantine <verification_receipt_id> CONFIRM CLEAR-QUARANTINE <verification_receipt_id>",
-					"  /gate <gate_id> <expected_session_id> <JSON answer>",
+					"  /gate <gate_id> <expected_session_id> <JSON answer> (capability probe; a future backend may support validated gate receipts)",
+					`  ${EXTERNAL_HOST_GATE_ANSWER_GUIDANCE}`,
 					"  /quit",
 					"  Any other line is submitted to the main session.",
 				].join("\n") + "\n",
@@ -1001,7 +1015,7 @@ function renderConsoleEventFrame(event: ConsoleEventFrame): string {
 			const payload = recordValue(event.payload);
 			const gateId = sanitizeConsoleText(rawStringValue(firstValue(payload, ["gate_id", "gateId"])));
 			const sessionId = sanitizeConsoleText(rawStringValue(firstValue(payload, ["session_id", "sessionId"])));
-			return `Gate opened: gate_id=${gateId} expected_session_id=${sessionId}. Answer with /gate ${gateId} ${sessionId} <JSON answer>.\n`;
+			return `Gate opened: gate_id=${gateId} expected_session_id=${sessionId}. ${EXTERNAL_HOST_GATE_ANSWER_GUIDANCE} /gate ${gateId} ${sessionId} <JSON answer> remains a capability probe for a future backend that supports validated gate receipts.\n`;
 		}
 		case "gate_resolved": {
 			const payload = recordValue(event.payload);
@@ -1307,10 +1321,12 @@ function parseMainSubmitResult(value: unknown): MainSubmitResult {
 }
 
 function parseGateAnswerResult(value: unknown): GateAnswerResult {
-	if (!isRecord(value) || value.accepted !== true || typeof value.gate_state !== "string") {
+	if (!isRecord(value) || typeof value.gate_state !== "string") {
 		throw new WayConsoleError("main.gate.answer returned an invalid response.");
 	}
-	return { accepted: true, gateState: value.gate_state };
+	if (value.accepted === true) return { accepted: true, gateState: value.gate_state };
+	if (value.accepted === false && value.gate_state === "unsupported") return { accepted: false, gateState: "unsupported" };
+	throw new WayConsoleError("main.gate.answer returned an invalid response.");
 }
 
 function parseGateCommand(command: string): { gateId: string; expectedSessionId: string; answer: unknown } {

@@ -14,17 +14,22 @@ non-fast-forward checks are incident backstops, not a concurrency plan.
    Keep the service account home under `/var/lib/gajaeway`, not under `/home`.
 2. Copy `ops/profiles/gaebal-gajae.example.toml` to
    `/etc/gajaeway/profile.toml`. Replace the corpus/workspace, injection
-   files, owner mapping, operator identity, Discord route, and all examples.
-   Install it `root:gajaeway`, mode `0640`.
+   files, `[main_session].session_id`, owner mapping, operator identity,
+   Discord route, and all examples. Install it `root:gajaeway`, mode `0640`.
 3. Edit `ReadWritePaths=` in `gajaeway.service` so it names the exact
    configured corpus and workspace. Reinstall the unit and run
-   `sudo systemctl daemon-reload`. The state path is
-   `/var/lib/gajaeway`; leave it in the list.
+   `sudo systemctl daemon-reload`. The state path is `/var/lib/gajaeway`; leave
+   it in the list.
 4. Put the Discord token in
    `/etc/gajaeway/credentials/discord-token`, owned by `root:root`, mode
    `0600`. `LoadCredential=` exposes it only to the adapter as a private file;
    never put a token in the profile, a shell history, or a unit environment.
-5. With both services stopped, perform the one-time bootstrap ceremony:
+5. The operator must first run the interactive `gjc` owner in the configured
+   corpus workspace (tmux is the recommended durable owner) and use `gjc sdk session
+   list` to identify its live `main` session. Record that exact ID in
+   `[main_session].session_id`; see the [bootstrap ceremony](bootstrap-ceremony.md)
+   for the selection and attachment procedure.
+6. With both services stopped, adopt that live session:
 
    ```sh
    sudo systemctl stop gajaeway-discord.service gajaeway.service
@@ -32,7 +37,10 @@ non-fast-forward checks are incident backstops, not a concurrency plan.
      --state-dir /var/lib/gajaeway --profile /etc/gajaeway/profile.toml
    ```
 
-6. Start the daemon first, then its bound adapter:
+   This command reads `[main_session].session_id`, broker-verifies the external
+   session, and commits its identity. When an operator intentionally uses
+   `--session-id` instead, it must identify the same session as any profile pin.
+7. Start the daemon first, then its bound adapter:
 
    ```sh
    sudo systemctl enable --now gajaeway.service
@@ -96,10 +104,15 @@ shows daemon state, strict-resume status, journal head cursor, lock state
 refuses interactive input when the daemon is failed closed or unhealthy; repair
 that condition first. Owner text is admitted only through `main.submit` with
 the configured owner surface, and the displayed `delivered_as` result is the
-gateway's authoritative admission decision. Replies, turn state, health
-changes, and gates use the named `gajaeway-console` journal consumer; rendering
-precedes `consumer.commit`, so a normal console restart resumes the
-server-owned checkpoint without replaying settled output.
+gateway's authoritative admission decision. The gateway controls the adopted
+GJC session through the broker CLI; the console does not open an SDK session.
+
+Replies, turn state, health changes, and gate notifications use the named
+`gajaeway-console` journal consumer; rendering precedes `consumer.commit`, so
+a normal console restart resumes the server-owned checkpoint without replaying
+settled output. If assistant replies finalized while the daemon was down, the
+runtime either recovers them from durable delivery progress or emits an explicit
+delivery-gap event. It never silently claims a missing reply was delivered.
 
 For a profile with multiple configured owner surfaces, name the intended one:
 
@@ -108,13 +121,11 @@ sudo -u gajaeway -H /usr/local/bin/gajaeway console --surface-id OWNER_SURFACE_I
   --state-dir /var/lib/gajaeway --profile /etc/gajaeway/profile.toml
 ```
 
-Answer a displayed gate using its durable values, never a guessed session ID:
-
-```text
-/gate GATE_ID EXPECTED_SESSION_ID {"selected":["Yes"]}
-```
-
-`main.gate.answer` rejects a mismatched expected session with code `1102`.
+The external-host gateway cannot answer gates. `/gate GATE_ID EXPECTED_SESSION_ID JSON_ANSWER` remains a capability probe for a future
+backend with validated gate receipts; the current backend returns
+`{accepted:false, gate_state:"unsupported"}`. Answer the displayed gate in the
+attached GJC TUI instead: `tmux attach -t <session>` when the tmux backend hosts
+it, or the terminal that runs `gjc`.
 
 ## Audit journal and receipt evidence
 
@@ -152,11 +163,14 @@ sudo install -m 0640 -o root -g gajaeway /etc/gajaeway/profile.toml \
   /var/backups/gajaeway/profile-${stamp}.toml
 ```
 
-`PRAGMA integrity_check` must print `ok`. Back up the strict-resume transcript
-location configured by the SDK and the corpus according to their own retention
-policy as well; the SQLite database alone is not a replacement for the
-transcript or corpus. Stop automation and follow the quarantine runbook before
-any recovery that could change Git history or reopen write authority.
+`PRAGMA integrity_check` must print `ok`. Back up the corpus according to its
+own retention policy. The adopted GJC session and transcript are broker-managed;
+there is no gateway-local SDK transcript file for `gajaeway` to copy. Retain the
+session ID and broker-verified identity in the deployment record and use the broker's
+retention procedure for its evidence. The SQLite database alone is not a
+replacement for the corpus or broker-managed session evidence. Stop automation
+and follow the quarantine runbook before any recovery that could change Git
+history or reopen write authority.
 
 ## Chat adapter final-gate verification
 

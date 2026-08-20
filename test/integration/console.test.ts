@@ -53,6 +53,9 @@ async function gateway(): Promise<ExternalGateway> {
 	return active;
 }
 
+const EXTERNAL_HOST_GATE_ANSWER_GUIDANCE =
+	"The gateway cannot answer gates in the external-host architecture. The owner must answer each gate in the attached gjc TUI: tmux attach -t <session> when the tmux backend hosts it, or whatever terminal runs gjc.";
+
 interface ControlledTerminal {
 	readonly terminal: ConsoleTerminal;
 	readonly writes: string[];
@@ -767,6 +770,11 @@ externalTest("full-screen prompt repaint preserves assistant and gate frames whi
 		expect(screen).toContain("Assistant:\nassistant frame remains visible");
 		expect(screen).toContain("gate_id=gate-frame-visible");
 		expect(screen.replace(/\n/gu, "")).toContain("expected_session_id=session-frame-visible");
+		expect(screen.replace(/\n/gu, "")).toContain(EXTERNAL_HOST_GATE_ANSWER_GUIDANCE);
+		expect(screen.replace(/\n/gu, "")).toContain(
+			"/gate gate-frame-visible session-frame-visible <JSON answer> remains a capability probe for a future backend that supports validated gate receipts.",
+		);
+
 		expect(screen).toContain("gajaeway> draft while events arrive");
 		input.send("\u0003");
 		await running;
@@ -991,6 +999,44 @@ externalTest("console retention-gap startup refusal preserves its checkpoint and
 	await expect(consoleSurface.submit("must not submit without a recoverable checkpoint")).rejects.toBeInstanceOf(ConsoleDeliveryUnavailableError);
 	expect(active.fixture.commands()).toEqual([]);
 });
+
+externalTest("console command loop renders the external-host gate limitation and help", async () => {
+	const active = await gateway();
+	const terminal = controlledTerminal();
+	const gateId = "console-command-loop-unsupported-gate";
+	const unsupportedFrame = `Gate ${gateId}: ${EXTERNAL_HOST_GATE_ANSWER_GUIDANCE}\n`;
+	active.host.gates.observeOpen({ gateId, expectedSessionId: active.fixture.sessionId });
+	const running = runWayConsole(
+		{ stateDir: active.stateDirectory, profilePath: active.profilePath },
+		[],
+		{ terminal: terminal.terminal, statusPollMs: 25 },
+	);
+	try {
+		await eventually(() => (terminal.isReading() ? true : undefined), "console did not begin reading owner input");
+		terminal.send("/help");
+		await eventually(
+			() => (terminal.writes.some(write => write.includes(EXTERNAL_HOST_GATE_ANSWER_GUIDANCE)) ? true : undefined),
+			"console help did not explain the external-host gate limitation",
+		);
+		const help = terminal.writes.find(write => write.startsWith("Gateway cockpit commands:\n"));
+		if (!help) throw new Error("console did not render its help frame");
+		expect(help).toContain("/gate <gate_id> <expected_session_id> <JSON answer> (capability probe; a future backend may support validated gate receipts)");
+		expect(help).toContain(EXTERNAL_HOST_GATE_ANSWER_GUIDANCE);
+
+		terminal.send(`/gate ${gateId} ${active.fixture.sessionId} {"selected":["Yes"]}`);
+		await eventually(
+			() => (terminal.writes.includes(unsupportedFrame) ? true : undefined),
+			"console did not render the external-host unsupported-gate frame",
+		);
+		expect(terminal.writes).toContain(unsupportedFrame);
+		expect(terminal.writes.join("")).not.toContain("Request failed: main.gate.answer returned an invalid response.");
+		terminal.send("/quit");
+		await running;
+	} finally {
+		terminal.terminal.close();
+		await running.catch(() => undefined);
+	}
+}, 15_000);
 
 externalTest("console gateway gate answers report unsupported and durably replay that broker limitation", async () => {
 	const active = await gateway();

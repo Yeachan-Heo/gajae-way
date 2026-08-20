@@ -8,6 +8,12 @@ workspace = "/srv/gajaeway/workspace"
 # Ordered and digest-bound: SOUL -> USER -> daily(today + prior days) -> MEMORY.
 files = ["SOUL.md", "USER.md", "daily/{date}.md", "MEMORY.md"]
 
+
+[main_session]
+# Select the live operator-owned GJC main session with `gjc sdk session list`.
+# `gajaeway bootstrap --confirm` adopts this session; `gajaeway serve` re-verifies it.
+session_id = "replace-with-gjc-session-id"
+
 [security.restricted_files]
 # These paths are relative to corpus.path. Keep private memory out of all
 # non-owner construction paths.

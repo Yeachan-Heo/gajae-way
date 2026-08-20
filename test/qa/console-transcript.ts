@@ -1,6 +1,6 @@
 /**
  * QA evidence generator (not a test): drives the `gajaeway console` gateway cockpit
- * end to end against a real in-process gateway over a real Unix socket and persists
+ * end to end against a real external-host gateway over a real Unix socket and persists
  * the complete terminal write-stream as an app-automation transcript artifact.
  *
  * Run: bun test/qa/console-transcript.ts
@@ -276,7 +276,7 @@ async function main(): Promise<void> {
 		producedBy: "test/qa/console-transcript.ts",
 		generatedAt: new Date().toISOString(),
 		harness:
-			"RawConsoleTerminal driven through a virtual TTY against a real in-process gateway over a real Unix-domain socket",
+			"RawConsoleTerminal driven through a virtual TTY against a real external-host gateway over a real Unix-domain socket",
 		scriptedInput: scripted,
 		actions,
 		steps: writes,

@@ -9,8 +9,9 @@ operator approves it:
 - `[corpus] path` or `workspace`;
 - ordered `[injection] files`;
 - `[security.restricted_files]` (or the supported top-level equivalent);
-- `[surfaces.owner]`, `[owner_surfaces]`, or `[owner_surface]`; and
-- `[operator]` or `[identity]` values.
+- `[surfaces.owner]`, `[owner_surfaces]`, or `[owner_surface]`;
+- `[operator]` or `[identity]` values; and
+- `[main_session].session_id`.
 
 Do not approve an unexpected change. Treat it as possible profile or corpus
 configuration tampering, restore the intended file, and investigate before

@@ -42,7 +42,8 @@ not run a gateway and a legacy bot together "just for validation".
    any residual push before proceeding. Preserve the inventory and verification
    evidence so a reversal can be planned without recovering copied secrets.
 4. Configure the gajaeway profile and systemd `ReadWritePaths=` for that one
-   corpus, then perform `gajaeway bootstrap --confirm` and start the two units using
+   corpus, then adopt the operator-owned live GJC `main` session through the
+   [bootstrap ceremony](bootstrap-ceremony.md) and start the two units using
    the [operations runbook](operations.md). From that point, gajaeway is the
    sole permitted writer.
 
