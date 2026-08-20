@@ -159,7 +159,17 @@ test("a daemon killed after main broker acceptance recovers the pre-effect claim
 		killed.client.close();
 		expect(await killed.child.exited).toBe(137);
 		killed = undefined;
-		expect(fixture.commands().filter(command => command.operation === "turn.prompt" && command.text === request.text)).toHaveLength(1);
+		// Under full-suite load the fixture's command-log write can lag the kill
+		// hook by a beat; wait for the observed send instead of racing it.
+		{
+			const deadline = Date.now() + 10_000;
+			let sends = fixture.commands().filter(command => command.operation === "turn.prompt" && command.text === request.text);
+			while (sends.length === 0 && Date.now() < deadline) {
+				await Bun.sleep(50);
+				sends = fixture.commands().filter(command => command.operation === "turn.prompt" && command.text === request.text);
+			}
+			expect(sends).toHaveLength(1);
+		}
 
 		recovered = await startDaemon(stateDirectory, profilePath, {
 			...environment,
