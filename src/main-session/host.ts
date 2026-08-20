@@ -94,6 +94,41 @@ interface FinalAssistantMessage {
 	};
 }
 
+/**
+ * Stable journal payload for one outer SDK attempt.
+ *
+ * Both `turn_start` and `turn_end` use this exact shape. Provider messages,
+ * tool results, and assistant text deliberately remain out of lifecycle rows;
+ * finalized assistant text is published only as `assistant_message`.
+ */
+export interface MainSessionTurnJournalPayload {
+	readonly attempt_id: string;
+	readonly generation: number;
+	readonly lineage: string;
+}
+
+interface JournaledAttemptTransitions {
+	started: boolean;
+	ended: boolean;
+}
+
+const MAX_JOURNALED_ATTEMPTS = 1_000;
+
+function turnJournalPayload(event: Record<string, unknown>): MainSessionTurnJournalPayload | undefined {
+	const scope = event.scope;
+	if (!isRecord(scope)) return undefined;
+	const attemptId = eventString(scope, "attemptId");
+	const lineage = eventString(scope, "lineage");
+	const generation = scope.generation;
+	if (!attemptId || !lineage || typeof generation !== "number" || !Number.isSafeInteger(generation) || generation < 0)
+		return undefined;
+	return { attempt_id: attemptId, generation, lineage };
+}
+
+function turnJournalKey(payload: MainSessionTurnJournalPayload): string {
+	return `${payload.lineage}\u0000${payload.attempt_id}\u0000${payload.generation}`;
+}
+
 interface GrowthWindow {
 	readonly intent: GrowthIntent;
 	activeMutations: number;
@@ -110,13 +145,14 @@ function finalizedAssistantMessage(event: Record<string, unknown>): FinalAssista
 			: Array.isArray(content)
 				? content
 						.filter(isRecord)
-						.filter(block => block.type === "text" && typeof block.text === "string")
-						.map(block => block.text as string)
+						.filter((block) => block.type === "text" && typeof block.text === "string")
+						.map((block) => block.text as string)
 						.join("")
-					: "";
+				: "";
 	if (!text.trim()) return undefined;
 	const messageId = eventString(message, "responseId", "id");
-	const timestamp = typeof message.timestamp === "number" && Number.isFinite(message.timestamp) ? message.timestamp : undefined;
+	const timestamp =
+		typeof message.timestamp === "number" && Number.isFinite(message.timestamp) ? message.timestamp : undefined;
 	const key = messageId ? `response:${messageId}` : `message:${timestamp ?? "unknown"}:${text}`;
 	return {
 		key,
@@ -158,6 +194,8 @@ class HostedMainSession implements MainSessionHost {
 	#failure: MainSessionHostError | undefined;
 	#growthWindow: GrowthWindow | undefined;
 	readonly #finalizedAssistantMessageKeys = new Set<string>();
+	readonly #journaledAttemptTransitions = new Map<string, JournaledAttemptTransitions>();
+
 	#disposed = false;
 
 	constructor(options: CreateMainSessionHostOptions) {
@@ -168,8 +206,8 @@ class HostedMainSession implements MainSessionHost {
 		this.#journal = options.journal;
 		this.#now = options.now ?? Date.now;
 		this.gates = options.gates ?? new MainSessionGateRegistry({ now: this.#now });
-		this.#unsubscribe = this.#session.subscribe(event => this.observeSessionEvent(event));
-		this.#unsubscribeGates = this.#session.subscribeGates(gate => this.observeSdkGate(gate));
+		this.#unsubscribe = this.#session.subscribe((event) => this.observeSessionEvent(event));
+		this.#unsubscribeGates = this.#session.subscribeGates((gate) => this.observeSdkGate(gate));
 		this.refreshFollowUpQueueDepth();
 		this.publishStatus();
 	}
@@ -249,6 +287,22 @@ class HostedMainSession implements MainSessionHost {
 		}
 	}
 
+	private appendTurnTransition(kind: "turn_start" | "turn_end", event: Record<string, unknown>): void {
+		const payload = turnJournalPayload(event);
+		if (!payload) return;
+		const key = turnJournalKey(payload);
+		const transitions = this.#journaledAttemptTransitions.get(key) ?? { started: false, ended: false };
+		this.#journaledAttemptTransitions.set(key, transitions);
+		const field = kind === "turn_start" ? "started" : "ended";
+		if (transitions[field] || !this.appendJournalEvent(kind, payload)) return;
+		transitions[field] = true;
+		while (this.#journaledAttemptTransitions.size > MAX_JOURNALED_ATTEMPTS) {
+			const oldest = this.#journaledAttemptTransitions.keys().next().value;
+			if (!oldest) return;
+			this.#journaledAttemptTransitions.delete(oldest);
+		}
+	}
+
 	/**
 	 * A durable growth intent covers one contiguous append-only transcript window.
 	 * Owner interrupts and queued follow-ups may both append inside that same
@@ -293,7 +347,8 @@ class HostedMainSession implements MainSessionHost {
 
 	private observeSdkGate(gate: HostedSdkGate): void {
 		if (gate.sessionId !== this.sessionId) return;
-		if (!this.gates.observeOpen({ gateId: gate.gateId, expectedSessionId: gate.sessionId, expiresAt: gate.expiresAt })) return;
+		if (!this.gates.observeOpen({ gateId: gate.gateId, expectedSessionId: gate.sessionId, expiresAt: gate.expiresAt }))
+			return;
 		this.appendJournalEvent("gate_open", {
 			gate_id: gate.gateId,
 			session_id: gate.sessionId,
@@ -316,7 +371,9 @@ class HostedMainSession implements MainSessionHost {
 			this.refreshFollowUpQueueDepth();
 			if (type === "turn_start" && this.#growthWindow) this.#growthWindow.activeTurns += 1;
 			this.publishStatus();
-			this.appendJournalEvent("turn_start", event);
+			// `agent_start` and each `turn_start` share the outer attempt scope.
+			// A tool-using attempt can have several SDK turns, so journal only once.
+			if (record) this.appendTurnTransition("turn_start", record);
 			return;
 		}
 		if (type === "turn_end" || type === "agent_end") {
@@ -327,7 +384,9 @@ class HostedMainSession implements MainSessionHost {
 				if (type === "agent_end") this.#growthWindow.activeTurns = 0;
 			}
 			this.publishStatus();
-			this.appendJournalEvent("turn_end", event);
+			// `turn_end` is per SDK/provider turn. Only terminal `agent_end` closes
+			// the outer attempt represented by a journal `turn_end`.
+			if (type === "agent_end" && record) this.appendTurnTransition("turn_end", record);
 			this.finishGrowthWindowIfSettled();
 			return;
 		}
@@ -369,7 +428,10 @@ class HostedMainSession implements MainSessionHost {
 			observed = fingerprintSessionFile(durable.mainIdentity.canonicalPath);
 		} catch (error) {
 			markFailedClosed(this.#state, "main_identity_unreadable");
-			throw new MainSessionHostError("main_identity_unreadable", error instanceof Error ? error.message : String(error));
+			throw new MainSessionHostError(
+				"main_identity_unreadable",
+				error instanceof Error ? error.message : String(error),
+			);
 		}
 		if (!sameFingerprint(durable.mainIdentity, observed)) {
 			markFailedClosed(this.#state, "main_identity_mismatch");
@@ -380,7 +442,10 @@ class HostedMainSession implements MainSessionHost {
 			this.#state.writeGrowthIntent(observed, startedAt);
 		} catch (error) {
 			markFailedClosed(this.#state, "growth_intent_write_failed");
-			throw new MainSessionHostError("growth_intent_write_failed", error instanceof Error ? error.message : String(error));
+			throw new MainSessionHostError(
+				"growth_intent_write_failed",
+				error instanceof Error ? error.message : String(error),
+			);
 		}
 		return { base: observed, startedAt };
 	}
@@ -391,7 +456,10 @@ class HostedMainSession implements MainSessionHost {
 			refreshed = fingerprintSessionFile(intent.base.canonicalPath);
 			if (!attestAppendOnlyGrowth(intent.base, refreshed)) {
 				markFailedClosed(this.#state, "growth_intent_mismatch");
-				throw new MainSessionHostError("growth_intent_mismatch", "The transcript changed outside the active append-only growth window.");
+				throw new MainSessionHostError(
+					"growth_intent_mismatch",
+					"The transcript changed outside the active append-only growth window.",
+				);
 			}
 			this.#state.refreshAfterGrowth(intent, refreshed);
 			this.#identity = refreshed;
@@ -459,7 +527,10 @@ class HostedMainSession implements MainSessionHost {
 
 /** Wires the strict-resumed SDK session to synchronous durable journal append. */
 export function createMainSessionHost(options: CreateMainSessionHostOptions): MainSessionHost {
-	if (options.session.sessionId !== options.identity.sessionId || options.session.sessionFile !== options.identity.canonicalPath) {
+	if (
+		options.session.sessionId !== options.identity.sessionId ||
+		options.session.sessionFile !== options.identity.canonicalPath
+	) {
 		throw new MainSessionHostError("host_identity_mismatch");
 	}
 	return new HostedMainSession(options);

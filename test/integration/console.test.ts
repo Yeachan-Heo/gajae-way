@@ -661,6 +661,13 @@ test("console submits through real UDS, renders finalized replies before settlem
 		expect(recorded.calls.filter((call) => call.method === "way.status")).toHaveLength(1);
 		await consoleSurface.submit("owner request");
 		expect(await consoleSurface.consumeOnce()).toBe("rendered");
+		const lifecycleEvents = gateway.core
+			.journalRead(undefined, 10)
+			.events.filter((event) => event.kind === "turn_start" || event.kind === "turn_end");
+		const expectedTurnPayload = { attempt_id: "session-1:attempt:1", generation: 1, lineage: "main" };
+		expect(lifecycleEvents.map((event) => event.kind)).toEqual(["turn_start", "turn_end"]);
+		expect(JSON.parse(lifecycleEvents[0]?.payloadJson ?? "{}")).toEqual(expectedTurnPayload);
+		expect(JSON.parse(lifecycleEvents[1]?.payloadJson ?? "{}")).toEqual(expectedTurnPayload);
 
 		const submit = recorded.calls.find((call) => call.method === "main.submit");
 		expect(submit?.params).toEqual({ text: "owner request", surface_id: "owner", idempotency_key: "console-submit-1" });
@@ -685,6 +692,8 @@ test("console submits through real UDS, renders finalized replies before settlem
 		expect(rendered.writes.join("")).toContain("Main turn started — busy.");
 		expect(rendered.writes.join("")).toContain("Assistant:\nack\n");
 		expect(rendered.writes.join("")).toContain("Main turn ended — idle.");
+		expect(rendered.writes.filter((text) => text.includes("Main turn started — busy."))).toHaveLength(1);
+		expect(rendered.writes.filter((text) => text.includes("Main turn ended — idle."))).toHaveLength(1);
 		expect(cursorAtAssistantRender).toBe("1:0");
 		expect(gateway.core.consumerCursor("gajaeway-console")).toBe("1:3");
 		expect(gateway.core.consumerOutbox("gajaeway-console")).toHaveLength(3);

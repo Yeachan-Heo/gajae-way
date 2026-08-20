@@ -1,7 +1,13 @@
 import * as crypto from "node:crypto";
 import * as fs from "node:fs";
 import * as path from "node:path";
-import { bootstrapNonceMarker, type HostedSdkGate, type HostedSdkGateResolution, type HostedSdkSession, type MainSessionSdk } from "./sdk";
+import {
+	bootstrapNonceMarker,
+	type HostedSdkGate,
+	type HostedSdkGateResolution,
+	type HostedSdkSession,
+	type MainSessionSdk,
+} from "./sdk";
 import { fingerprintSessionFile, sameFingerprint, type SessionFingerprint } from "./state";
 
 const E2E_SESSION_DIRECTORY = ".gajaeway-e2e-sessions";
@@ -28,9 +34,9 @@ export function createE2eFileSdk(): MainSessionSdk {
 			try {
 				return fs
 					.readdirSync(directory, { withFileTypes: true })
-					.filter(entry => entry.isFile() && entry.name.endsWith(".jsonl"))
-					.map(entry => path.join(directory, entry.name))
-					.filter(candidate => fs.readFileSync(candidate, "utf8").includes(bootstrapNonceMarker(nonce)));
+					.filter((entry) => entry.isFile() && entry.name.endsWith(".jsonl"))
+					.map((entry) => path.join(directory, entry.name))
+					.filter((candidate) => fs.readFileSync(candidate, "utf8").includes(bootstrapNonceMarker(nonce)));
 			} catch (error) {
 				if ((error as NodeJS.ErrnoException).code === "ENOENT") return [];
 				throw error;
@@ -50,6 +56,7 @@ class E2eFileSession implements HostedSdkSession {
 	readonly #gateListeners = new Set<(gate: HostedSdkGate) => void>();
 	#followUpQueueDepth = 0;
 	#disposed = false;
+	#nextAttemptGeneration = 1;
 
 	constructor(sessionFile: string, sessionId: string | undefined) {
 		this.sessionFile = sessionFile;
@@ -107,7 +114,9 @@ class E2eFileSession implements HostedSdkSession {
 
 	private async respond(text: string, delivery: "prompt" | "steer"): Promise<void> {
 		this.assertLive();
-		this.emit({ type: "turn_start" });
+		const scope = this.nextAttemptScope();
+		this.emit({ type: "agent_start", scope });
+		this.emit({ type: "turn_start", scope });
 		this.append({ type: "message", role: "user", content: text, delivery });
 		const reply = `fixture reply: ${text}`;
 		const message = {
@@ -117,11 +126,16 @@ class E2eFileSession implements HostedSdkSession {
 			timestamp: Date.now(),
 		};
 		this.append({ type: "message", role: "assistant", content: reply });
-		this.emit({ type: "message_update", message, assistantMessageEvent: { type: "text_delta", delta: reply } });
-		this.emit({ type: "message_end", message });
-		this.emit({ type: "turn_end", message });
+		this.emit({ type: "message_update", message, assistantMessageEvent: { type: "text_delta", delta: reply }, scope });
+		this.emit({ type: "message_end", message, scope });
+		this.emit({ type: "turn_end", message, toolResults: [], scope });
+		this.emit({ type: "agent_end", messages: [message], stopReason: "completed", scope });
 	}
 
+	private nextAttemptScope(): { readonly attemptId: string; readonly generation: number; readonly lineage: "main" } {
+		const generation = this.#nextAttemptGeneration++;
+		return { attemptId: `${this.sessionId}:attempt:${generation}`, generation, lineage: "main" };
+	}
 	private append(value: unknown): void {
 		fs.appendFileSync(this.sessionFile, `${JSON.stringify(value)}\n`, { encoding: "utf8", mode: 0o600 });
 	}

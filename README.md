@@ -131,6 +131,20 @@ adapter validation. The configured live Discord route remains the final chat
 adapter gate, and a future Telegram adapter is subject to the same final-gate
 route drill after local-console acceptance succeeds.
 
+### Main-session journal lifecycle payloads
+
+`turn_start` and `turn_end` each represent one outer GJC SDK attempt, not an
+individual provider/tool turn. Both rows use the same stable payload and contain
+no provider message or assistant text:
+
+```json
+{"attempt_id":"<SDK scope attemptId>","generation":1,"lineage":"main"}
+```
+
+Final assistant text is published only in the finalized `assistant_message`
+journal event. Consumers can therefore treat lifecycle rows as transition
+identities and render reply text solely from `assistant_message`.
+
 Use the runbooks below for the complete operational procedure and incident
 handling. Do not bootstrap a second state directory or start a second adapter
 for the same configured route.

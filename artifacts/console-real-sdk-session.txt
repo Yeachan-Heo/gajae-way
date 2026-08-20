@@ -1,0 +1,14 @@
+Gateway status
+  daemon: status=healthy state=running
+  main: resumed=true session_id=01a01cc1-be28-7000-9024-7038473b8540 turn_state=idle follow_up_queue_depth=0
+  journal: head_cursor=1:0 degraded=false
+  lock: held=false holder=none queue_len=0 stuck=false quarantined=false write_mode=true
+  reconcile: freshness=unknown last_ok_at=none cycle_ms=unknown drift_count=0
+Owner console ready. Type /help for commands.
+gajaeway> [2Kgajaeway> say exactly: duplicates are gone
+gajaeway> [2KMain turn started — busy.
+gajaeway> [2KAssistant:
+duplicates are gone
+gajaeway> [2KDelivered as: prompt
+gajaeway> [2KMain turn ended — idle.
+gajaeway> 

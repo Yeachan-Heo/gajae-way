@@ -144,7 +144,10 @@ test("bootstrap orphan scan fails closed when a nonce maps to multiple transcrip
 	await sdk.createOrphan(profile.workspace, intent.nonce);
 	const result = await recoverBootstrap({ profile, state, sdk });
 	expect(result).toEqual({ kind: "failed_closed", reason: "bootstrap_orphan_ambiguous" });
-	expect(state.read()).toMatchObject({ bootstrapState: "FAILED_CLOSED", failedClosedReason: "bootstrap_orphan_ambiguous" });
+	expect(state.read()).toMatchObject({
+		bootstrapState: "FAILED_CLOSED",
+		failedClosedReason: "bootstrap_orphan_ambiguous",
+	});
 });
 
 test("open growth intent recovers append-only transcript growth by prefix attestation", async () => {
@@ -174,14 +177,22 @@ test("queued follow-up interrupted mid-turn recovers through append-only prefix 
 	expect(state.read().growthIntent).toBeDefined();
 
 	sdk.emitEvent(resumed.identity.canonicalPath, { type: "turn_start" });
-	sdk.appendRaw(resumed.identity.canonicalPath, { type: "message", role: "user", content: "queued before interruption" });
+	sdk.appendRaw(resumed.identity.canonicalPath, {
+		type: "message",
+		role: "user",
+		content: "queued before interruption",
+	});
 	// Simulate a process kill after transcript growth but before the terminal event.
 	await host.dispose();
 
 	const restarted = await strictResumeMainSession({ profile, state, sdk });
 	expect(restarted.recoveredGrowthIntent).toBe(true);
 	expect(state.read().mainIdentity?.size).toBeGreaterThan(resumed.identity.size);
-	expect(state.read()).toMatchObject({ bootstrapState: "COMMITTED", growthIntent: undefined, failedClosedReason: undefined });
+	expect(state.read()).toMatchObject({
+		bootstrapState: "COMMITTED",
+		growthIntent: undefined,
+		failedClosedReason: undefined,
+	});
 	await restarted.session.dispose();
 });
 
@@ -204,7 +215,9 @@ test("tampering a queued follow-up growth prefix fails closed instead of accepti
 	expect(state.read()).toMatchObject({ bootstrapState: "FAILED_CLOSED", failedClosedReason: "growth_intent_mismatch" });
 	await host.dispose();
 
-	await expect(strictResumeMainSession({ profile, state, sdk })).rejects.toMatchObject({ reason: "growth_intent_mismatch" } satisfies Partial<ResumeError>);
+	await expect(strictResumeMainSession({ profile, state, sdk })).rejects.toMatchObject({
+		reason: "growth_intent_mismatch",
+	} satisfies Partial<ResumeError>);
 	expect(state.read()).toMatchObject({ bootstrapState: "FAILED_CLOSED", failedClosedReason: "growth_intent_mismatch" });
 });
 
@@ -238,7 +251,9 @@ test("profile drift blocks resume until explicit approval, while tunables remain
 	const original = fs.readFileSync(profilePath, "utf8");
 	fs.writeFileSync(profilePath, original.replace('"SOUL.md", "USER.md"', '"USER.md", "SOUL.md"'));
 	const changedProfile = loadWayProfile(profilePath);
-	await expect(strictResumeMainSession({ profile: changedProfile, state, sdk })).rejects.toMatchObject({ reason: "profile_drift" } satisfies Partial<ResumeError>);
+	await expect(strictResumeMainSession({ profile: changedProfile, state, sdk })).rejects.toMatchObject({
+		reason: "profile_drift",
+	} satisfies Partial<ResumeError>);
 	expect(state.read().failedClosedReason).toBe("profile_drift");
 	const preview = previewProfileApproval(state, changedProfile);
 	expect(preview.changes.length).toBeGreaterThan(0);
@@ -253,7 +268,7 @@ test("profile drift blocks resume until explicit approval, while tunables remain
 	await afterTuning.session.dispose();
 });
 
-test("host writes growth intent before prompt, refreshes it after append, and journals SDK events synchronously", async () => {
+test("host normalizes overlapping SDK lifecycle events into one stable journal transition per attempt", async () => {
 	const { profilePath, state, backend, sdk } = await committedFixture();
 	const profile = loadWayProfile(profilePath);
 	const resumed = await strictResumeMainSession({ profile, state, sdk });
@@ -265,12 +280,71 @@ test("host writes growth intent before prompt, refreshes it after append, and jo
 		journal: { journalAppend: (kind, payload) => journal.push({ kind, payload }) },
 		now: () => 1234,
 	});
+	const sourceEvents: unknown[] = [];
+	const unsubscribe = resumed.session.subscribe((event) => sourceEvents.push(event));
+
 	await host.prompt("hello");
+	unsubscribe();
+	const expectedSourceScope = { attemptId: "session-1:attempt:1", generation: 1, lineage: "main" };
+	const lifecycleEvents = sourceEvents.filter((event) => {
+		const type = (event as { type?: unknown }).type;
+		return type === "agent_start" || type === "turn_start" || type === "turn_end" || type === "agent_end";
+	});
+
+	const starts = journal.filter((event) => event.kind === "turn_start");
+	const ends = journal.filter((event) => event.kind === "turn_end");
+	const startPayload = JSON.parse(starts[0]?.payload ?? "{}") as Record<string, unknown>;
+	const endPayload = JSON.parse(ends[0]?.payload ?? "{}") as Record<string, unknown>;
+	const expectedPayload = { attempt_id: "session-1:attempt:1", generation: 1, lineage: "main" };
+	expect(lifecycleEvents).toEqual([
+		expect.objectContaining({ type: "agent_start", scope: expectedSourceScope }),
+		expect.objectContaining({ type: "turn_start", scope: expectedSourceScope }),
+		expect.objectContaining({ type: "turn_end", scope: expectedSourceScope, toolResults: [] }),
+		expect.objectContaining({ type: "agent_end", scope: expectedSourceScope, stopReason: "completed" }),
+	]);
+
 	expect(state.read().growthIntent).toBeUndefined();
 	expect(state.read().mainIdentity?.size).toBeGreaterThan(resumed.identity.size);
-	expect(journal.map(event => event.kind)).toEqual(["turn_start", "assistant_message", "turn_end"]);
+	expect(journal.map((event) => event.kind)).toEqual(["turn_start", "assistant_message", "turn_end"]);
+	expect(starts).toHaveLength(1);
+	expect(ends).toHaveLength(1);
+	expect(startPayload).toEqual(expectedPayload);
+	expect(endPayload).toEqual(expectedPayload);
+	expect(endPayload).not.toHaveProperty("message");
+	expect(endPayload).not.toHaveProperty("messages");
+	expect(JSON.parse(journal[1]?.payload ?? "{}")).toMatchObject({ finalized: true, text: "ack" });
 	expect(backend.events).toHaveLength(0);
 	await host.dispose();
+});
+
+test("host gate registry prevents duplicate journal rows across SDK gate sources", async () => {
+	const { profilePath, state, sdk } = await committedFixture();
+	const resumed = await strictResumeMainSession({ profile: loadWayProfile(profilePath), state, sdk });
+	const journal: Array<{ kind: string; payload: string }> = [];
+	const host = createMainSessionHost({
+		session: resumed.session,
+		identity: resumed.identity,
+		state,
+		journal: { journalAppend: (kind, payload) => journal.push({ kind, payload }) },
+	});
+	const gateId = "duplicate-source-gate";
+	try {
+		sdk.openGate(resumed.identity.canonicalPath, gateId);
+		sdk.emitEvent(resumed.identity.canonicalPath, {
+			type: "workflow_gate",
+			gate_id: gateId,
+			session_id: host.sessionId,
+		});
+		await host.resolveGate(gateId, { approved: true }, "duplicate-source-gate-answer");
+		sdk.emitEvent(resumed.identity.canonicalPath, {
+			type: "action_resolved",
+			gate_id: gateId,
+			session_id: host.sessionId,
+		});
+		expect(journal.map((event) => event.kind)).toEqual(["gate_open", "gate_resolved"]);
+	} finally {
+		await host.dispose();
+	}
 });
 
 test("journal append failure degrades the host without losing its growth refresh", async () => {
@@ -289,12 +363,14 @@ test("journal append failure degrades the host without losing its growth refresh
 			setRpcHealth: (_state, reason) => {
 				reportedReason = reason;
 			},
-			setJournalDegraded: degraded => {
+			setJournalDegraded: (degraded) => {
 				journalDegraded = degraded;
 			},
 		},
 	});
-	await expect(host.prompt("event triggers durable journal failure")).rejects.toMatchObject({ reason: "journal_append_failed" });
+	await expect(host.prompt("event triggers durable journal failure")).rejects.toMatchObject({
+		reason: "journal_append_failed",
+	});
 	expect(host.degraded).toBe(true);
 	expect(reportedReason).toBe("journal_append_failed");
 	expect(journalDegraded).toBe(true);

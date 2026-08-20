@@ -62,6 +62,13 @@ interface DoubleSessionRecord {
 	readonly pendingPromptGates: Map<string, () => void>;
 	followUpQueueDepth: number;
 	nextAssistantResponseId: number;
+	nextAttemptGeneration: number;
+}
+
+interface DoubleAttemptScope {
+	readonly attemptId: string;
+	readonly generation: number;
+	readonly lineage: "main";
 }
 
 export interface FileSdkDoubleOptions {
@@ -114,6 +121,7 @@ export class FileSdkDouble implements MainSessionSdk {
 			pendingPromptGates: new Map(),
 			followUpQueueDepth: 0,
 			nextAssistantResponseId: 1,
+			nextAttemptGeneration: 1,
 		};
 		this.#sessions.set(record.file, record);
 		this.createdSessionFiles.push(record.file);
@@ -186,6 +194,11 @@ export class FileSdkDouble implements MainSessionSdk {
 		};
 	}
 
+	private nextAttemptScope(record: DoubleSessionRecord): DoubleAttemptScope {
+		const generation = record.nextAttemptGeneration++;
+		return { attemptId: `${record.id}:attempt:${generation}`, generation, lineage: "main" };
+	}
+
 	private hosted(record: DoubleSessionRecord): HostedSdkSession {
 		return {
 			sessionFile: record.file,
@@ -201,7 +214,10 @@ export class FileSdkDouble implements MainSessionSdk {
 			prompt: async (text) => {
 				if (!fs.existsSync(record.file))
 					throw new Error("session transcript has not persisted its first assistant message");
-				this.emit(record, { type: "turn_start" });
+				const scope = this.nextAttemptScope(record);
+				// Match the real SDK's overlapping agent/turn lifecycle sources.
+				this.emit(record, { type: "agent_start", scope });
+				this.emit(record, { type: "turn_start", scope });
 				writeLine(record.file, { type: "message", role: "user", content: text });
 				const gateId = this.#gateOnPrompt?.text === text ? this.#gateOnPrompt.gateId : undefined;
 				if (gateId) {
@@ -215,9 +231,11 @@ export class FileSdkDouble implements MainSessionSdk {
 					type: "message_update",
 					message,
 					assistantMessageEvent: { type: "text_delta", delta: "ack" },
+					scope,
 				});
-				this.emit(record, { type: "message_end", message });
-				this.emit(record, { type: "turn_end", message });
+				this.emit(record, { type: "message_end", message, scope });
+				this.emit(record, { type: "turn_end", message, toolResults: [], scope });
+				this.emit(record, { type: "agent_end", messages: [message], stopReason: "completed", scope });
 			},
 			steer: async (text) => {
 				if (!fs.existsSync(record.file))
