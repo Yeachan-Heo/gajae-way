@@ -137,6 +137,7 @@ export async function createExternalGateway(options: ExternalGatewayOptions = {}
 		initialTurnState: resumed.turnState,
 		initialFollowUpQueueDepth: resumed.followUpQueueDepth,
 		initialVerificationState: resumed.verificationState,
+		...(resumed.verificationTail === undefined ? {} : { verificationTail: resumed.verificationTail }),
 		...(resumed.growthIntent === undefined ? {} : { recoveredGrowthIntent: resumed.growthIntent }),
 	});
 	const submit = createMainAdmissionHandler(host, profile, core, {

@@ -96,6 +96,7 @@ interface FixtureSession {
 	responseText?: string;
 	tailTimeoutWhileBusy?: boolean;
 	rotateRingDuringNextCompletion?: boolean;
+	clearRetentionGapAfterTail?: boolean;
 	unavailableQueries?: string[];
 	commandLog: Array<Record<string, unknown>>;
 }
@@ -195,7 +196,7 @@ export class FakeBrokerFixture {
 		});
 	}
 
-	/** Rotates retained lifecycle frames when the next held turn completes. */
+	/** Rotates retained lifecycle frames when the next held turn completes; the following tail consumes the one-shot gap. */
 	rotateRingDuringNextCompletion(): void {
 		this.update(session => {
 			session.rotateRingDuringNextCompletion = true;

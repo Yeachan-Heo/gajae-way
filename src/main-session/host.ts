@@ -74,6 +74,8 @@ export interface CreateMainSessionHostOptions {
 	readonly initialFollowUpQueueDepth?: number;
 	/** Per-boot complete-tail verification state returned by strict resume. */
 	readonly initialVerificationState?: "pending" | "verified";
+	/** Complete restart verification tail, consumed before the first fresh broker tail request. */
+	readonly verificationTail?: SupervisorTailEvents;
 	/** An active durable growth intent recovered by strict resume. */
 	readonly recoveredGrowthIntent?: GrowthIntent;
 	readonly now?: () => number;
@@ -150,16 +152,34 @@ function gateFromEvent(event: unknown, fallbackSessionId: string): GateHandle | 
 
 function textFromContent(content: unknown): string {
 	if (typeof content === "string") return content;
+	if (isRecord(content) && typeof content.text === "string") return content.text;
 	if (!Array.isArray(content)) return "";
 	return content
 		.filter(isRecord)
-		.filter(block => block.type === "text" && typeof block.text === "string")
+		.filter(block => (block.type === "text" || block.type === "output_text") && typeof block.text === "string")
 		.map(block => block.text as string)
 		.join("");
 }
 
+function transcriptMessageCandidate(event: Record<string, unknown>): Record<string, unknown> {
+	if (isRecord(event.message)) return event.message;
+	if (isRecord(event.data)) return event.data;
+	return event;
+}
+
+function isSafelyNonDeliverableTranscriptEntry(event: Record<string, unknown>): boolean {
+	const candidate = transcriptMessageCandidate(event);
+	if (candidate.role === "user" || candidate.role === "system" || candidate.role === "developer" || candidate.role === "tool") return true;
+	if (candidate.role !== "assistant" || !Array.isArray(candidate.content)) return false;
+	return candidate.content.every(
+		block =>
+			isRecord(block) &&
+			(block.type === "tool_use" || block.type === "tool_call" || block.type === "thinking" || block.type === "reasoning"),
+	);
+}
+
 function finalizedAssistantMessage(event: Record<string, unknown>, fallbackKey: string): FinalAssistantMessage | undefined {
-	const candidate = isRecord(event.message) ? event.message : event;
+	const candidate = transcriptMessageCandidate(event);
 	if (candidate.role !== "assistant") return undefined;
 	const text = textFromContent(candidate.content);
 	if (!text.trim()) return undefined;
@@ -262,6 +282,7 @@ class ExternalMainSessionHost implements MainSessionHost {
 	#tailWake = Promise.withResolvers<void>();
 	readonly #highestTailSequenceByGeneration = new Map<number, number>();
 	#tailCheckpoint: TailCheckpoint | undefined;
+	#verificationTail: SupervisorTailEvents | undefined;
 	#journalTailCheckpoint: TailCheckpoint | undefined;
 
 	readonly #tailTask: Promise<void>;
@@ -281,6 +302,7 @@ class ExternalMainSessionHost implements MainSessionHost {
 		this.#transcriptDeliveryProgress = durable.transcriptDeliveryProgress;
 		this.#transcriptProof = durable.transcriptProof;
 		this.#verificationState = options.initialVerificationState ?? (durable.transcriptProof === "proven" ? "verified" : "pending");
+		this.#verificationTail = options.verificationTail;
 		if (durable.transcriptProof === "pending" && this.#verificationState !== "pending") {
 			throw new MainSessionHostError("transcript_proof_invalid", "A pending durable transcript proof cannot start as boot-verified.");
 		}
@@ -682,11 +704,21 @@ class ExternalMainSessionHost implements MainSessionHost {
 			if (!entry) continue;
 			const expectedDelivery = this.#transcriptDeliveryProgress;
 			const nextDelivery = this.transcriptDeliveryAt(entries, index);
-			const event = isRecord(entry.payload) ? (isRecord(entry.payload.message) ? entry.payload.message : entry.payload) : undefined;
-			const delivered = event
+			const event = isRecord(entry.payload) ? entry.payload : undefined;
+			const finalized = event ? finalizedAssistantMessage(event, `transcript:${entry.id}`) : undefined;
+			const safelyNonDeliverable = event ? isSafelyNonDeliverableTranscriptEntry(event) : false;
+			const delivered = finalized && event
 				? this.appendFinalAssistantMessage(event, `transcript:${entry.id}`, expectedDelivery, nextDelivery)
-				: this.advanceTranscriptDelivery(expectedDelivery, nextDelivery);
-			if (!delivered || this.#failure) return;
+				: safelyNonDeliverable
+					? this.advanceTranscriptDelivery(expectedDelivery, nextDelivery)
+					: this.appendTranscriptDeliveryGap(expectedDelivery, this.deliveryGapProgress(entries), {
+							reason: "transcript_delivery_unprovable",
+							delivered_through_entry_id: expectedDelivery?.lastEntryId,
+							unprojectable_entry_id: entry.id,
+							available_from_entry_id: entries[0]?.id,
+							available_through_entry_id: entries.at(-1)?.id,
+						});
+			if (!delivered || this.#failure || (!finalized && !safelyNonDeliverable)) return;
 		}
 	}
 
@@ -892,7 +924,9 @@ class ExternalMainSessionHost implements MainSessionHost {
 		let transientFailures = 0;
 		while (!this.#disposed && !this.#failure) {
 			try {
-				const tail = await this.#supervisor.tailEvents();
+				const verificationTail = this.#verificationTail;
+				this.#verificationTail = undefined;
+				const tail = verificationTail ?? (await this.#supervisor.tailEvents());
 				if (this.#disposed) return;
 				transientFailures = 0;
 				if (!tail.complete) {

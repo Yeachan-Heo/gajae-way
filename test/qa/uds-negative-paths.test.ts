@@ -155,6 +155,8 @@ test("main.submit validates its UDS contract and durable idempotency through an 
 			journal: core,
 			initialTurnState: resumed.turnState,
 			initialFollowUpQueueDepth: resumed.followUpQueueDepth,
+			initialVerificationState: resumed.verificationState,
+			...(resumed.verificationTail === undefined ? {} : { verificationTail: resumed.verificationTail }),
 		});
 		const submit = createMainAdmissionHandler(host, profile, core);
 		core.startRpcServer(path.join(stateDirectory, "rpc.sock"), createRpcBridge(core, async (method, params) => {

@@ -50,6 +50,8 @@ export interface SupervisorVerification {
 	readonly transcriptEntries: readonly SupervisorTranscriptEntry[];
 	/** Complete-tail ring watermark used only for a proven adoption boundary. */
 	readonly initialRingCheckpoint?: TailCheckpoint;
+	/** Exact complete tail used to verify an existing durable adoption; it must be replayed into delivery projection. */
+	readonly verificationTail?: SupervisorTailEvents;
 	/** A complete tail fingerprint, or an explicit pending proof after a bounded tail wait. */
 	readonly transcriptProof: TranscriptProof;
 	readonly turnState: SupervisorTurnState;
@@ -334,6 +336,7 @@ export class ExternalHostSupervisor implements HostSupervisor {
 			identity: tail.identity,
 			transcriptEntries: tail.transcriptEntries,
 			initialRingCheckpoint,
+			verificationTail: tail,
 			transcriptProof: "proven",
 			turnState,
 			followUpQueueDepth,

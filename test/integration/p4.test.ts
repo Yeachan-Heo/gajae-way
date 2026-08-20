@@ -6,6 +6,7 @@ import { afterEach, expect, test } from "bun:test";
 
 import { BrokerCli } from "../../src/broker/cli";
 import { createMainAdmissionHandler, reconcilePendingMainAdmissions } from "../../src/main-session/admission";
+import { createMainSessionHost } from "../../src/main-session/host";
 import { strictResumeMainSession } from "../../src/main-session/resume";
 import { createExternalHostSupervisor } from "../../src/main-session/supervisor";
 
@@ -324,6 +325,86 @@ externalTest("busy ring rotation across an attempt-generation boundary resyncs w
 				: undefined,
 		"post-rotation admission did not round-trip",
 	);
+}, 30_000);
+
+externalTest("restart replays the exact verification tail after a down-time ring rotation without rebaselining transcript delivery", async () => {
+	const gateway = await hosted({ tailTimeoutMs: 50 });
+	gateway.fixture.setNoEnvelopeWhileBusy();
+	gateway.fixture.holdNextTurn();
+	const submitted = await gateway.client.request("main.submit", {
+		text: "complete while daemon is absent and rotate the ring",
+		surface_id: "owner",
+		idempotency_key: "restart-rotation-delivery",
+	});
+	const opRef = (submitted.result as { op_ref: string }).op_ref;
+	expect(submitted.result).toMatchObject({ accepted: true, delivered_as: "prompt" });
+	await waitForBusyStatus(gateway);
+	await gateway.host.dispose();
+	gateway.fixture.rotateRingDuringNextCompletion();
+	gateway.fixture.complete(opRef, { text: "reply recovered from verification-tail delivery" });
+
+	const restartedSupervisor = createExternalHostSupervisor({
+		broker: new BrokerCli({ executable: gateway.fixture.executable, environment: gateway.fixture.environment() }),
+		workspace: gateway.fixture.workspace,
+		tailTimeoutMs: 50,
+		commandTimeoutMs: 1_000,
+	});
+	let restartedHost: ReturnType<typeof createMainSessionHost> | undefined;
+	try {
+		const resumed = await strictResumeMainSession({ profile: gateway.profile, state: gateway.state, supervisor: restartedSupervisor });
+		expect(resumed.verificationTail).toMatchObject({ retentionGap: true, resyncCheckpoint: { generation: 1, seq: 5 } });
+		restartedHost = createMainSessionHost({
+			supervisor: restartedSupervisor,
+			identity: resumed.identity,
+			state: gateway.state,
+			journal: {
+				journalAppend: (kind, payloadJson) => gateway.core.journalAppend(kind, payloadJson),
+				journalAppendAtTailCheckpoint: (kind, payloadJson, expected, checkpoint) =>
+					gateway.state.appendTailProjection(expected, checkpoint, kind, payloadJson),
+				journalAppendTranscriptProjection: (kind, payloadJson, expectedTail, checkpoint, expectedDelivery, nextDelivery) =>
+					gateway.state.appendTranscriptProjection(expectedTail, checkpoint, expectedDelivery, nextDelivery, kind, payloadJson),
+				setRpcHealth: (state, reason) => gateway.core.setRpcHealth(state, reason),
+				setMainSessionStatus: (turnState, followUpQueueDepth, verificationState) =>
+					gateway.core.setMainSessionStatus(turnState, followUpQueueDepth, verificationState),
+				setJournalDegraded: degraded => gateway.core.setJournalDegraded(degraded),
+			},
+			initialTurnState: resumed.turnState,
+			initialFollowUpQueueDepth: resumed.followUpQueueDepth,
+			initialVerificationState: resumed.verificationState,
+			...(resumed.verificationTail === undefined ? {} : { verificationTail: resumed.verificationTail }),
+			...(resumed.growthIntent === undefined ? {} : { recoveredGrowthIntent: resumed.growthIntent }),
+		});
+		await eventually(
+			() =>
+				gateway.core
+					.journalRead("1:0", 100)
+					.events.find(event => event.kind === "assistant_message" && event.payloadJson.includes("reply recovered from verification-tail delivery")),
+			"restart did not project the transcript suffix from its verification tail",
+		);
+		await eventually(
+			() => (gateway.state.read().tailRingRotationCount === 1 ? true : undefined),
+			"verification-tail retention rotation was not counted",
+		);
+		const journal = gateway.core.journalRead("1:0", 100).events;
+		const rotations = journal.filter(event => event.kind === "tail_ring_rotation");
+		expect(rotations).toHaveLength(1);
+		expect(JSON.parse(rotations[0]?.payloadJson ?? "{}")).toEqual({
+			prior_watermark: { revision: 2, generation: 1, seq: 0 },
+			resync_point: { revision: 4, generation: 1, seq: 5 },
+		});
+		expect(journal.some(event => event.kind === "transcript_delivery_gap")).toBe(false);
+		const filtered = await gateway.client.request("main.events.read", {
+			cursor: "1:0",
+			kinds: ["tail_ring_rotation", "assistant_message", "transcript_delivery_gap"],
+		});
+		expect((filtered.result as { events: Array<{ kind: string }> }).events.map(event => event.kind)).toEqual([
+			"tail_ring_rotation",
+			"assistant_message",
+		]);
+	} finally {
+		await restartedHost?.dispose();
+		await restartedSupervisor.dispose();
+	}
 }, 30_000);
 
 externalTest("a transcript prefix break remains a fail-closed authority violation", async () => {

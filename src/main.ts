@@ -1037,6 +1037,7 @@ async function serveWay(config: WayConfig): Promise<void> {
 			initialTurnState: resumed.turnState,
 			initialFollowUpQueueDepth: resumed.followUpQueueDepth,
 			initialVerificationState: resumed.verificationState,
+			...(resumed.verificationTail === undefined ? {} : { verificationTail: resumed.verificationTail }),
 			...(resumed.growthIntent === undefined ? {} : { recoveredGrowthIntent: resumed.growthIntent }),
 		});
 		host = resumedHost;

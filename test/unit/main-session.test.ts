@@ -738,7 +738,7 @@ test.serial("a failed journal append leaves the tail checkpoint behind so the sc
 test.serial("a reply finalized while the daemon is down is recovered from durable transcript delivery progress", async () => {
 	const fixture = new FakeBrokerFixture();
 	fixtures.push(fixture);
-	const { state, profile } = await bootstrapFixture(fixture);
+	const { meta, state, profile } = await bootstrapFixture(fixture);
 	const firstSupervisor = supervisor(fixture);
 	const first = await strictResumeMainSession({ profile, state, supervisor: firstSupervisor });
 	const firstHost = createMainSessionHost({
@@ -758,6 +758,7 @@ test.serial("a reply finalized while the daemon is down is recovered from durabl
 	} finally {
 		await firstHost.dispose();
 	}
+	fixture.rotateRingDuringNextCompletion();
 	fixture.complete("down-recovery", { text: "recovered after daemon downtime" });
 
 	const restartedSupervisor = supervisor(fixture);
@@ -771,18 +772,75 @@ test.serial("a reply finalized while the daemon is down is recovered from durabl
 		initialTurnState: restarted.turnState,
 		initialFollowUpQueueDepth: restarted.followUpQueueDepth,
 		initialVerificationState: restarted.verificationState,
+		...(restarted.verificationTail === undefined ? {} : { verificationTail: restarted.verificationTail }),
 		...(restarted.growthIntent === undefined ? {} : { recoveredGrowthIntent: restarted.growthIntent }),
 	});
 	try {
 		expect(restarted.verificationState).toBe("verified");
+		expect(restarted.verificationTail).toMatchObject({ retentionGap: true, resyncCheckpoint: { generation: 1, seq: 5 } });
 		expect(restarted.recoveredGrowthIntent).toBe(true);
 		await eventually(
 			() => journal.some(event => event.kind === "assistant_message" && event.payloadJson.includes("recovered after daemon downtime")),
 			"reply finalized while down was not recovered",
 		);
+		await eventually(() => state.read().tailRingRotationCount === 1, "verification-tail ring rotation was not durably recorded");
+		expect(meta.events).toContainEqual({
+			kind: "tail_ring_rotation",
+			payloadJson: JSON.stringify({
+				prior_watermark: { revision: 2, generation: 1, seq: 0 },
+				resync_point: { revision: 4, generation: 1, seq: 5 },
+			}),
+		});
+		expect(journal.some(event => event.kind === "transcript_delivery_gap")).toBe(false);
 		await eventually(() => state.read().growthIntent === undefined, "recovered growth intent was not finalized after transcript delivery");
 	} finally {
 		await restartedHost.dispose();
+	}
+});
+
+test.serial("an unprojectable assistant transcript suffix journals a gap instead of silently advancing delivery", async () => {
+	const fixture = new FakeBrokerFixture();
+	fixtures.push(fixture);
+	const { meta, state, profile } = await bootstrapFixture(fixture);
+	const resumedSupervisor = supervisor(fixture);
+	const resumed = await strictResumeMainSession({ profile, state, supervisor: resumedSupervisor });
+	const host = createMainSessionHost({
+		supervisor: resumedSupervisor,
+		identity: resumed.identity,
+		state,
+		journal: {
+			journalAppend: () => undefined,
+			journalAppendAtTailCheckpoint: (kind, payloadJson, expected, checkpoint) => state.appendTailProjection(expected, checkpoint, kind, payloadJson),
+			journalAppendTranscriptProjection: (kind, payloadJson, expectedTail, checkpoint, expectedDelivery, nextDelivery) =>
+				state.appendTranscriptProjection(expectedTail, checkpoint, expectedDelivery, nextDelivery, kind, payloadJson),
+		},
+		initialTurnState: resumed.turnState,
+		initialFollowUpQueueDepth: resumed.followUpQueueDepth,
+		initialVerificationState: resumed.verificationState,
+		...(resumed.verificationTail === undefined ? {} : { verificationTail: resumed.verificationTail }),
+	});
+	try {
+		fixture.holdNextTurn();
+		await host.admit("prompt", "hold while an opaque assistant suffix appears", "opaque-suffix");
+		await eventually(() => state.read().growthIntent !== undefined, "held operation did not open growth intent");
+		fixture.appendTranscript({
+			type: "message",
+			role: "assistant",
+			content: [{ type: "opaque_output", value: "must not silently rebaseline" }],
+		});
+		await eventually(
+			() => meta.events.some(event => event.kind === "transcript_delivery_gap"),
+			"opaque assistant transcript suffix did not journal a delivery gap",
+		);
+		const gap = meta.events.find(event => event.kind === "transcript_delivery_gap");
+		expect(JSON.parse(gap?.payloadJson ?? "{}")).toMatchObject({
+			reason: "transcript_delivery_unprovable",
+			unprojectable_entry_id: `${fixture.sessionId}:transcript:2`,
+		});
+		expect(state.read()).toMatchObject({ transcriptDeliveryGapCount: 1, transcriptDeliveryProgress: { lastEntryId: `${fixture.sessionId}:transcript:2` } });
+		expect(meta.events.some(event => event.kind === "assistant_message")).toBe(false);
+	} finally {
+		await host.dispose();
 	}
 });
 

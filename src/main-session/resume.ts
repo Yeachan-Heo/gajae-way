@@ -9,7 +9,7 @@ import {
 	type GrowthIntent,
 	type TranscriptDeliveryProgress,
 } from "./state";
-import { HostSupervisorError, type HostSupervisor } from "./supervisor";
+import { HostSupervisorError, type HostSupervisor, type SupervisorTailEvents } from "./supervisor";
 
 export class ResumeError extends Error {
 	readonly reason: string;
@@ -31,6 +31,8 @@ export interface ResumedMainSession {
 	readonly identity: ExternalSessionIdentity;
 	/** Per-daemon proof state; durable proof may remain proven while a busy boot waits for a complete tail. */
 	readonly verificationState: "pending" | "verified";
+	/** The complete verification envelope for an existing durable proof, replayed before any fresh tail request. */
+	readonly verificationTail?: SupervisorTailEvents;
 	readonly recoveredGrowthIntent: boolean;
 	/** Retained until the terminal event and transcript delivery are durable. */
 	readonly growthIntent?: GrowthIntent;
@@ -151,6 +153,9 @@ export async function strictResumeMainSession(options: ResumeOptions): Promise<R
 	return {
 		identity,
 		verificationState,
+		...(durable.transcriptProof === "proven" && verified.transcriptProof === "proven" && verified.verificationTail
+			? { verificationTail: verified.verificationTail }
+			: {}),
 		recoveredGrowthIntent,
 		...(durable.growthIntent === undefined ? {} : { growthIntent: durable.growthIntent }),
 		turnState: verified.turnState,

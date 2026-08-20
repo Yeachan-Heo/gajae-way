@@ -148,6 +148,8 @@ async function main(): Promise<void> {
 		journal: core,
 		initialTurnState: resumed.turnState,
 		initialFollowUpQueueDepth: resumed.followUpQueueDepth,
+		initialVerificationState: resumed.verificationState,
+		...(resumed.verificationTail === undefined ? {} : { verificationTail: resumed.verificationTail }),
 	});
 	const submit = createMainAdmissionHandler(host, profile, core);
 	const bridge: RpcBridgeHandler = async (method, params) => {

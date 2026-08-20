@@ -301,6 +301,7 @@ if (!statePath) {
 					const checkpoint = value.tailCheckpoint;
 					const floor = !priorFloor || compareTailCoordinates(checkpoint, priorFloor) > 0 ? checkpoint : priorFloor;
 					value.retentionFloor = floor;
+					value.clearRetentionGapAfterTail = true;
 					value.events = (value.events ?? []).filter(event => eventIsAfter(event, floor));
 					value.gap = undefined;
 				}
@@ -400,6 +401,11 @@ if (!statePath) {
 						items,
 						terminal,
 					});
+					if (gap && value.clearRetentionGapAfterTail === true) {
+						delete value.clearRetentionGapAfterTail;
+						delete value.retentionFloor;
+						writeState();
+					}
 				}
 			}
 		}
