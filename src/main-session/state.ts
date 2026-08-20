@@ -336,8 +336,8 @@ function parsedState(values: ReadonlyMap<string, string>): DurableGatewayState {
 	if (mainIdentity?.transcript !== undefined && transcriptProof === "pending") {
 		throw new GatewayStateError("metadata_invalid", "A pending transcript proof cannot carry a fingerprinted main identity.");
 	}
-	if (transcriptProof === "pending" && (growthIntent !== undefined || transcriptDeliveryProgress !== undefined)) {
-		throw new GatewayStateError("metadata_invalid", "A pending transcript proof cannot have transcript growth or delivery progress.");
+	if (transcriptProof === "pending" && (growthIntent !== undefined || transcriptDeliveryProgress !== undefined || values.get("tail_checkpoint") !== "null")) {
+		throw new GatewayStateError("metadata_invalid", "A pending transcript proof cannot have transcript growth, delivery progress, or a ring watermark.");
 	}
 	const profileDigestRaw = requiredMeta(values, "profile_digest");
 	const profileDigest = profileDigestRaw === "null" ? undefined : requiredString(profileDigestRaw, "profile_digest");
@@ -477,21 +477,22 @@ export class GatewayStateStore {
 		intent: BootstrapIntent,
 		identity: ExternalSessionIdentity,
 		profile: WayProfile,
-		discoveryCheckpoint: TailCheckpoint,
+		ringCheckpoint: TailCheckpoint | undefined,
 		transcriptProof: TranscriptProof,
 		transcriptDeliveryProgress?: TranscriptDeliveryProgress,
 	): void {
 		if (transcriptProof === "proven") {
 			if (
 				!identity.transcript ||
+				!ringCheckpoint ||
 				!transcriptDeliveryProgress ||
 				transcriptDeliveryProgress.fingerprint.entryCount !== identity.transcript.entryCount ||
 				transcriptDeliveryProgress.fingerprint.sha256 !== identity.transcript.sha256
 			) {
-				throw new GatewayStateError("transcript_proof_invalid", "A proven adoption requires a matching transcript fingerprint and delivery baseline.");
+				throw new GatewayStateError("transcript_proof_invalid", "A proven adoption requires a ring watermark, matching transcript fingerprint, and delivery baseline.");
 			}
-		} else if (identity.transcript || transcriptDeliveryProgress) {
-			throw new GatewayStateError("transcript_proof_invalid", "A pending adoption cannot carry a transcript fingerprint or delivery baseline.");
+		} else if (identity.transcript || ringCheckpoint || transcriptDeliveryProgress) {
+			throw new GatewayStateError("transcript_proof_invalid", "A pending adoption cannot carry a ring watermark, transcript fingerprint, or delivery baseline.");
 		}
 		this.transact({
 			expected: [
@@ -508,14 +509,18 @@ export class GatewayStateStore {
 				{ key: "profile_projection", value: profileProjectionCanonical(profile.projection) },
 				{ key: "profile_tunables_revision", value: String(profile.tunablesRevision) },
 				{ key: "failed_closed_reason", value: "null" },
-				{ key: "tail_checkpoint", value: tailCheckpointJson(discoveryCheckpoint) },
+				{ key: "tail_checkpoint", value: ringCheckpoint === undefined ? "null" : tailCheckpointJson(ringCheckpoint) },
 				{ key: "tail_ring_rotation_count", value: "0" },
 				{ key: "transcript_delivery_progress", value: transcriptDeliveryProgressJson(transcriptDeliveryProgress) },
 				{ key: "transcript_proof", value: transcriptProof },
 			],
 			deletes: [],
-			eventKind: "tail_adoption_start",
-			eventPayloadJson: stableMetadataJson({ checkpoint: discoveryCheckpoint }),
+			...(ringCheckpoint === undefined
+				? {}
+				: {
+					eventKind: "tail_adoption_start",
+					eventPayloadJson: stableMetadataJson({ checkpoint: ringCheckpoint }),
+				}),
 		});
 	}
 
@@ -568,11 +573,12 @@ export class GatewayStateStore {
 		});
 	}
 
-	/** Atomically binds a pending adoption to its first complete transcript snapshot. */
+	/** Atomically binds a pending adoption to its first complete transcript and ring snapshot. */
 	persistTranscriptProof(
 		durable: ExternalSessionIdentity,
 		observed: ExternalSessionIdentity,
 		transcriptDeliveryProgress: TranscriptDeliveryProgress,
+		ringCheckpoint: TailCheckpoint,
 	): void {
 		if (
 			durable.transcript ||
@@ -588,14 +594,18 @@ export class GatewayStateStore {
 				{ key: "bootstrap_state", value: "COMMITTED" },
 				{ key: "main_identity", value: identityJson(durable) },
 				{ key: "transcript_proof", value: "pending" },
+				{ key: "tail_checkpoint", value: "null" },
 				{ key: "transcript_delivery_progress", value: transcriptDeliveryProgressJson(undefined) },
 			],
 			puts: [
 				{ key: "main_identity", value: identityJson(observed) },
 				{ key: "transcript_proof", value: "proven" },
+				{ key: "tail_checkpoint", value: tailCheckpointJson(ringCheckpoint) },
 				{ key: "transcript_delivery_progress", value: transcriptDeliveryProgressJson(transcriptDeliveryProgress) },
 			],
 			deletes: [],
+			eventKind: "tail_adoption_start",
+			eventPayloadJson: stableMetadataJson({ checkpoint: ringCheckpoint }),
 		});
 	}
 
@@ -654,7 +664,7 @@ export class GatewayStateStore {
 		});
 	}
 
-	/** Records the point from which an adopted daemon begins projection after an initial retention gap. */
+	/** Records the first actual event-ring envelope as an adoption boundary without projecting it. */
 	recordTailAdoptionStart(checkpoint: TailCheckpoint): void {
 		const state = this.read();
 		if (state.tailCheckpoint) {

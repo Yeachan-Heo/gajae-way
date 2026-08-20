@@ -206,7 +206,11 @@ function sourceCheckpoint(event: SupervisorEvent, revision: number): TailCheckpo
 	return { revision, generation: event.generation, seq: event.seq };
 }
 
-
+function initialRingCheckpoint(tail: SupervisorTailEvents): TailCheckpoint | undefined {
+	// An envelope checkpoint is its high-water mark. A resync point is only a
+	// fallback when the broker omitted that high-water mark entirely.
+	return tail.checkpoint ?? tail.resyncCheckpoint;
+}
 
 const FATAL_EXTERNAL_IDENTITY_REASONS = new Set([
 	"session_deleted",
@@ -664,9 +668,14 @@ class ExternalMainSessionHost implements MainSessionHost {
 		}
 	}
 
-	private bindPendingTranscriptProof(tail: SupervisorTailEvents): void {
-		if (this.#transcriptProof === "proven") return;
+	/** Binds the first successful pending-proof tail as both transcript and ring baselines. */
+	private bindPendingTranscriptProof(tail: SupervisorTailEvents): boolean {
+		if (this.#transcriptProof === "proven") return false;
 		const identity = tail.identity;
+		const ringCheckpoint = initialRingCheckpoint(tail);
+		if (!ringCheckpoint) {
+			throw new HostSupervisorError("tail_checkpoint_unavailable", "The first complete broker tail did not carry a ring checkpoint.");
+		}
 		if (!identity.transcript) {
 			throw new HostSupervisorError("transcript_proof_invalid", "A complete broker tail did not carry a transcript fingerprint.");
 		}
@@ -682,6 +691,7 @@ class ExternalMainSessionHost implements MainSessionHost {
 			durable.bootstrapState !== "COMMITTED" ||
 			!durable.mainIdentity ||
 			durable.transcriptProof !== "pending" ||
+			durable.tailCheckpoint !== undefined ||
 			!sameExternalSession(durable.mainIdentity, identity) ||
 			!sameExternalSession(this.#identity, identity)
 		) {
@@ -689,14 +699,16 @@ class ExternalMainSessionHost implements MainSessionHost {
 		}
 		const transcriptDeliveryProgress = this.deliveryGapProgress(tail.transcriptEntries);
 		try {
-			this.#state.persistTranscriptProof(durable.mainIdentity, identity, transcriptDeliveryProgress);
+			this.#state.persistTranscriptProof(durable.mainIdentity, identity, transcriptDeliveryProgress, ringCheckpoint);
 		} catch (error) {
 			throw new HostSupervisorError("transcript_proof_persist_failed", "Could not durably bind the pending transcript proof.", { cause: error });
 		}
 		this.#identity = identity;
+		this.#tailCheckpoint = ringCheckpoint;
 		this.#transcriptDeliveryProgress = transcriptDeliveryProgress;
 		this.#transcriptProof = "proven";
 		this.publishStatus();
+		return true;
 	}
 
 	private observeIdentity(identity: ExternalSessionIdentity, entries: readonly SupervisorTranscriptEntry[]): void {
@@ -836,7 +848,13 @@ class ExternalMainSessionHost implements MainSessionHost {
 					await Promise.race([Bun.sleep(100), wake, this.#tailStop.promise]);
 					continue;
 				}
-				this.bindPendingTranscriptProof(tail);
+				const pendingProofBound = this.bindPendingTranscriptProof(tail);
+				if (pendingProofBound) {
+					this.settleTerminalTail(tail);
+					const wake = this.#tailWake.promise;
+					await Promise.race([Bun.sleep(tail.terminal && this.#turnState === "idle" ? 500 : 100), wake, this.#tailStop.promise]);
+					continue;
+				}
 				// A rotating broker transcript window can no longer attest the durable
 				// delivery point. Record the consumer-visible gap before the identity
 				// mismatch closes this unsafe observation path.

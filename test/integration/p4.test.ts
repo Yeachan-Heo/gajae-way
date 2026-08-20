@@ -124,7 +124,7 @@ externalTest("main.submit admits a held external turn before the bridge timeout"
 
 });
 
-externalTest("pending transcript proof fences admission until the first complete busy-tail boundary", async () => {
+externalTest("pending busy adoption binds its first complete tail as an unprojected ring boundary before admission", async () => {
 	const fixture = new FakeBrokerFixture();
 	let gatewayOwned = false;
 	try {
@@ -135,7 +135,7 @@ externalTest("pending transcript proof fences admission until the first complete
 
 		const gateway = await hosted({ fixture, tailTimeoutMs: 50, adoptionTailTimeoutMs: 50 });
 		gatewayOwned = true;
-		expect(gateway.state.read()).toMatchObject({ transcriptProof: "pending", tailCheckpoint: { revision: 2, generation: 1, seq: 3 } });
+		expect(gateway.state.read()).toMatchObject({ transcriptProof: "pending", tailCheckpoint: undefined });
 
 		const pendingStatus = await gateway.client.request("way.status", {});
 		expect(pendingStatus.result).toMatchObject({ transcript_proof: "pending" });
@@ -153,7 +153,14 @@ externalTest("pending transcript proof fences admission until the first complete
 			() => (gateway.state.read().transcriptProof === "proven" ? true : undefined),
 			"the first complete tail did not bind the pending transcript proof",
 		);
-		expect((await gateway.client.request("way.status", {})).result).toMatchObject({ transcript_proof: "proven" });
+		expect(gateway.state.read().tailCheckpoint).toEqual({ revision: 4, generation: 1, seq: 5 });
+		const boundaryEvents = gateway.core.journalRead("1:0", 100).events;
+		expect(boundaryEvents.filter(event => event.kind === "tail_adoption_start")).toHaveLength(1);
+		expect(JSON.parse(boundaryEvents.find(event => event.kind === "tail_adoption_start")?.payloadJson ?? "{}")).toEqual({
+			checkpoint: { revision: 4, generation: 1, seq: 5 },
+		});
+		expect(boundaryEvents.filter(event => event.kind === "turn_start" || event.kind === "turn_end" || event.kind === "assistant_message")).toEqual([]);
+		expect((await gateway.client.request("way.status", {})).result).toMatchObject({ transcript_proof: "proven", turn_state: "idle" });
 
 		gateway.fixture.holdNextTurn();
 		const accepted = await gateway.client.request("main.submit", {
@@ -163,6 +170,10 @@ externalTest("pending transcript proof fences admission until the first complete
 		});
 		expect(accepted.result).toMatchObject({ accepted: true, delivered_as: "prompt" });
 		const opRef = (accepted.result as { op_ref: string }).op_ref;
+		await eventually(
+			() => gateway.core.journalRead("1:0", 100).events.some(event => event.kind === "turn_start"),
+			"the envelope after the adoption boundary did not project lifecycle evidence",
+		);
 		gateway.fixture.complete(opRef, { text: "proof-bound roundtrip" });
 		await eventually(
 			() =>

@@ -384,15 +384,15 @@ if (!statePath) {
 				if (!value.metadata || value.metadata.unavailable === true) fail("session_unavailable", "fixture unavailable");
 				else queryResponse(value.metadata);
 			} else if (query === "session.checkpoint") {
-				// Real broker returns the RESULT-form envelope for this query (observed
-				// live), unlike metadata/context which use the page form.
+				// Real broker returns the RESULT-form envelope for this query, but these
+				// coordinates are foreign to the event ring and must never seed its watermark.
 				process.stdout.write(
 					`${JSON.stringify({
 						type: "query_response",
 						id: "fixture-query",
 						ok: true,
 						result: {
-							checkpoint: { revision: value.transcript?.length ?? 0, generation: 1, seq: value.nextSeq ?? 0 },
+							checkpoint: { revision: value.transcript?.length ?? 0, generation: 0, seq: 0 },
 							revisionId: "fixture-revision-id",
 							issuedAt: 1700000000000,
 							expiresAt: 1700000900000,

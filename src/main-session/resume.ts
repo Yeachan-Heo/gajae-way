@@ -81,8 +81,8 @@ export async function strictResumeMainSession(options: ResumeOptions): Promise<R
 	}
 	if (durable.transcriptProof === "pending") {
 		if (verified.transcriptProof === "proven") {
-			if (!current.transcript || verified.transcriptEntries.some(entry => !entry.id.trim())) {
-				return failClosed(options.state, "transcript_proof_invalid", "The broker returned an invalid complete transcript proof.");
+			if (!current.transcript || !verified.initialRingCheckpoint || verified.transcriptEntries.some(entry => !entry.id.trim())) {
+				return failClosed(options.state, "transcript_proof_invalid", "The broker returned an invalid complete transcript proof or ring boundary.");
 			}
 			const transcriptDeliveryProgress: TranscriptDeliveryProgress = {
 				...(verified.transcriptEntries.at(-1) === undefined ? {} : { lastEntryId: verified.transcriptEntries.at(-1)?.id }),
@@ -95,12 +95,12 @@ export async function strictResumeMainSession(options: ResumeOptions): Promise<R
 				return failClosed(options.state, "transcript_proof_mismatch", "The broker transcript fingerprint did not match its complete snapshot.");
 			}
 			try {
-				options.state.persistTranscriptProof(durableIdentity, current, transcriptDeliveryProgress);
+				options.state.persistTranscriptProof(durableIdentity, current, transcriptDeliveryProgress, verified.initialRingCheckpoint);
 				durableIdentity = current;
 			} catch (error) {
 				return failClosed(options.state, "transcript_proof_persist_failed", error instanceof Error ? error.message : String(error), error);
 			}
-		} else if (verified.transcriptProof !== "pending" || current.transcript) {
+		} else if (verified.transcriptProof !== "pending" || current.transcript || verified.initialRingCheckpoint) {
 			return failClosed(options.state, "transcript_proof_invalid", "The broker returned an invalid pending transcript proof.");
 		}
 	} else if (verified.transcriptProof !== "proven" || !current.transcript) {

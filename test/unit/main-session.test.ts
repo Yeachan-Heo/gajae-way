@@ -87,7 +87,7 @@ async function bootstrapFixture(fixture: FakeBrokerFixture) {
 test.serial("bootstrap adopts and persists the exact live external identity without creating a GJC session", async () => {
 	const fixture = new FakeBrokerFixture();
 	fixtures.push(fixture);
-	const { state, committed } = await bootstrapFixture(fixture);
+	const { meta, state, committed } = await bootstrapFixture(fixture);
 
 	expect(committed.identity).toMatchObject({
 		version: 1,
@@ -102,6 +102,9 @@ test.serial("bootstrap adopts and persists the exact live external identity with
 		transcriptDeliveryProgress: { lastEntryId: `${fixture.sessionId}:transcript:1` },
 		transcriptProof: "proven",
 	});
+	expect(meta.events).toEqual([
+		{ kind: "tail_adoption_start", payloadJson: JSON.stringify({ checkpoint: { revision: 2, generation: 1, seq: 0 } }) },
+	]);
 	expect(fixture.commands()).toEqual([]);
 });
 
@@ -122,17 +125,16 @@ test.serial("bootstrap commits a pending proof when the bounded tail has no enve
 			bootstrapState: "COMMITTED",
 			mainIdentity: { sessionId: fixture.sessionId },
 			transcriptProof: "pending",
-			tailCheckpoint: { revision: 2, generation: 1, seq: 0 },
+			tailCheckpoint: undefined,
 		});
 		expect(durable.mainIdentity?.transcript).toBeUndefined();
 		expect(durable.transcriptDeliveryProgress).toBeUndefined();
-		expect(meta.events).toEqual([{ kind: "tail_adoption_start", payloadJson: JSON.stringify({ checkpoint: { revision: 2, generation: 1, seq: 0 } }) }]);
+		expect(meta.events).toEqual([]);
 	} finally {
 		await adoption.dispose();
 	}
 });
-
-test.serial("bootstrap refuses only when an immediate adoption snapshot query is unavailable", async () => {
+test.serial("bootstrap refuses only when its immediate session-checkpoint liveness query is unavailable", async () => {
 	const fixture = new FakeBrokerFixture();
 	fixtures.push(fixture);
 	const meta = new MemoryGatewayMeta();
@@ -143,7 +145,7 @@ test.serial("bootstrap refuses only when an immediate adoption snapshot query is
 	try {
 		await expect(
 			bootstrapMainSession({ confirm: true, profile, state, supervisor: adoption, sessionId: fixture.sessionId }),
-		).rejects.toMatchObject({ reason: "discovery_checkpoint_unavailable" } satisfies Partial<BootstrapError>);
+		).rejects.toMatchObject({ reason: "session_checkpoint_unavailable" } satisfies Partial<BootstrapError>);
 		expect(state.read()).toMatchObject({ bootstrapState: "CREATING", mainIdentity: undefined });
 	} finally {
 		await adoption.dispose();
@@ -184,6 +186,7 @@ test.serial("strict resume persists a complete pending transcript proof and deli
 	meta.values.set("main_identity", JSON.stringify(legacyIdentity));
 	meta.values.set("transcript_delivery_progress", "null");
 	meta.values.set("transcript_proof", "pending");
+	meta.values.set("tail_checkpoint", "null");
 	const resumedSupervisor = supervisor(fixture);
 	try {
 		const resumed = await strictResumeMainSession({ profile, state, supervisor: resumedSupervisor });
@@ -191,6 +194,7 @@ test.serial("strict resume persists a complete pending transcript proof and deli
 		expect(state.read()).toMatchObject({
 			mainIdentity: { transcript: { entryCount: 2 } },
 			transcriptDeliveryProgress: { lastEntryId: `${fixture.sessionId}:transcript:1`, fingerprint: { entryCount: 2 } },
+			tailCheckpoint: { revision: 2, generation: 1, seq: 0 },
 		});
 	} finally {
 		await resumedSupervisor.dispose();
@@ -221,7 +225,7 @@ test.serial("scripted broker CLI fixture covers inspect, send, status, tail, and
 	expect(rows.sessions).toHaveLength(1);
 	expect((await broker.inspectSession(fixture.sessionId)).sessionId).toBe(fixture.sessionId);
 	expect((await broker.sessionMetadata(fixture.sessionId)).kind).toBe("main");
-	expect(await broker.sessionCheckpoint(fixture.sessionId)).toEqual({ revision: 2, generation: 1, seq: 0 });
+	expect(await broker.sessionCheckpoint(fixture.sessionId)).toEqual({ revision: 2, generation: 0, seq: 0 });
 	const receipt = await broker.sendPrompt(fixture.sessionId, "fixture command", "fixture-op");
 	expect(receipt).toMatchObject({ sessionId: fixture.sessionId, operation: "turn.prompt", operationRef: "fixture-op" });
 	expect(await broker.turnStatus(fixture.sessionId, "fixture-op")).toMatchObject({ status: "terminal_ok", completed: true });
@@ -304,7 +308,7 @@ test.serial("a terminal tail snapshot that predates admission cannot settle the 
 			return {
 				identity: committed.identity,
 				transcriptEntries: [],
-				discoveryCheckpoint: state.read().tailCheckpoint!,
+				initialRingCheckpoint: state.read().tailCheckpoint,
 				transcriptProof: "proven",
 				turnState: "idle" as const,
 				followUpQueueDepth: 0,
@@ -314,7 +318,7 @@ test.serial("a terminal tail snapshot that predates admission cannot settle the 
 			return {
 				identity: committed.identity,
 				transcriptEntries: [],
-				discoveryCheckpoint: state.read().tailCheckpoint!,
+				initialRingCheckpoint: state.read().tailCheckpoint,
 				transcriptProof: "proven",
 				turnState: "idle" as const,
 				followUpQueueDepth: 0,
@@ -565,7 +569,8 @@ test.serial("host fails closed when broker tail failures exhaust the bounded ret
 	}
 }, 90_000);
 
-test.serial("bootstrap discovery checkpoint suppresses retained gap-free pre-adoption lifecycle history", async () => {
+
+test.serial("bootstrap ring checkpoint suppresses retained gap-free pre-adoption lifecycle history", async () => {
 	const fixture = new FakeBrokerFixture();
 	fixtures.push(fixture);
 	fixture.appendTailEvent("agent_start", { type: "agent_start", sessionId: fixture.sessionId });
@@ -778,10 +783,10 @@ test.serial("an unprovable transcript suffix journals a durable delivery gap ins
 	const checkpoint = state.read().tailCheckpoint!;
 	const controlled: HostSupervisor = {
 		async discover() {
-			return { identity: committed.identity, transcriptEntries: [], discoveryCheckpoint: checkpoint, transcriptProof: "proven", turnState: "idle", followUpQueueDepth: 0 };
+			return { identity: committed.identity, transcriptEntries: [], initialRingCheckpoint: checkpoint, transcriptProof: "proven", turnState: "idle", followUpQueueDepth: 0 };
 		},
 		async verify() {
-			return { identity: committed.identity, transcriptEntries: [], discoveryCheckpoint: checkpoint, transcriptProof: "proven", turnState: "idle", followUpQueueDepth: 0 };
+			return { identity: committed.identity, transcriptEntries: [], initialRingCheckpoint: checkpoint, transcriptProof: "proven", turnState: "idle", followUpQueueDepth: 0 };
 		},
 		async sendPrompt() {
 			throw new Error("not used");

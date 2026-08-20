@@ -48,8 +48,8 @@ export interface SupervisorTailEvents {
 export interface SupervisorVerification {
 	readonly identity: ExternalSessionIdentity;
 	readonly transcriptEntries: readonly SupervisorTranscriptEntry[];
-	/** The immediate broker checkpoint from which adoption begins projection. */
-	readonly discoveryCheckpoint: TailCheckpoint;
+	/** Complete-tail ring watermark used only for a proven adoption boundary. */
+	readonly initialRingCheckpoint?: TailCheckpoint;
 	/** A complete tail fingerprint, or an explicit pending proof after a bounded tail wait. */
 	readonly transcriptProof: TranscriptProof;
 	readonly turnState: SupervisorTurnState;
@@ -299,11 +299,12 @@ export class ExternalHostSupervisor implements HostSupervisor {
 			if (error instanceof HostSupervisorError) throw error;
 			throw this.wrapBrokerError("session_metadata_unavailable", error);
 		}
-		let discoveryCheckpoint: TailCheckpoint;
 		try {
-			discoveryCheckpoint = await this.#broker.sessionCheckpoint(expectedSessionId, { timeoutMs: this.#commandTimeoutMs });
+			// This is a liveness/existence query only. Its checkpoint coordinates are
+			// not part of the broker event-ring coordinate system.
+			await this.#broker.sessionCheckpoint(expectedSessionId, { timeoutMs: this.#commandTimeoutMs });
 		} catch (error) {
-			throw this.wrapBrokerError("discovery_checkpoint_unavailable", error);
+			throw this.wrapBrokerError("session_checkpoint_unavailable", error);
 		}
 		const provisional = identityFromRow(row, undefined);
 		this.#identity = provisional;
@@ -317,16 +318,22 @@ export class ExternalHostSupervisor implements HostSupervisor {
 			return {
 				identity: provisional,
 				transcriptEntries: [],
-				discoveryCheckpoint,
 				transcriptProof: "pending",
 				turnState,
 				followUpQueueDepth,
 			};
 		}
+		// The envelope checkpoint is the ring's high-water boundary. On a gap it
+		// deliberately wins over `resync`: we must not replay retained pre-adoption
+		// events from the first envelope.
+		const initialRingCheckpoint = tail.checkpoint ?? tail.resyncCheckpoint;
+		if (!initialRingCheckpoint) {
+			throw new HostSupervisorError("tail_checkpoint_unavailable", "A complete broker tail did not provide an adoption ring checkpoint.");
+		}
 		return {
 			identity: tail.identity,
 			transcriptEntries: tail.transcriptEntries,
-			discoveryCheckpoint,
+			initialRingCheckpoint,
 			transcriptProof: "proven",
 			turnState,
 			followUpQueueDepth,

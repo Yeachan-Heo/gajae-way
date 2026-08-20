@@ -79,7 +79,7 @@ function checkedVerification(
 	verified: SupervisorVerification,
 ): {
 	readonly identity: ExternalSessionIdentity;
-	readonly checkpoint: NonNullable<SupervisorVerification["discoveryCheckpoint"]>;
+	readonly ringCheckpoint?: NonNullable<SupervisorVerification["initialRingCheckpoint"]>;
 	readonly transcriptProof: TranscriptProof;
 	readonly delivery?: TranscriptDeliveryProgress;
 } {
@@ -87,17 +87,14 @@ function checkedVerification(
 	if (identity.sessionId !== sessionId) {
 		throw new BootstrapError("session_identity_mismatch", "The broker did not return the requested external session id.");
 	}
-	if (!verified.discoveryCheckpoint) {
-		throw new BootstrapError("discovery_checkpoint_unavailable", "The broker did not return an immediate adoption checkpoint.");
-	}
 	if (verified.transcriptProof === "pending") {
-		if (identity.transcript || verified.transcriptEntries.length !== 0) {
-			throw new BootstrapError("transcript_proof_invalid", "A pending transcript proof carried fingerprint evidence.");
+		if (identity.transcript || verified.transcriptEntries.length !== 0 || verified.initialRingCheckpoint) {
+			throw new BootstrapError("transcript_proof_invalid", "A pending transcript proof carried fingerprint or ring-boundary evidence.");
 		}
-		return { identity, checkpoint: verified.discoveryCheckpoint, transcriptProof: "pending" };
+		return { identity, transcriptProof: "pending" };
 	}
-	if (verified.transcriptProof !== "proven" || !identity.transcript) {
-		throw new BootstrapError("transcript_proof_invalid", "The broker returned an invalid transcript proof state.");
+	if (verified.transcriptProof !== "proven" || !identity.transcript || !verified.initialRingCheckpoint) {
+		throw new BootstrapError("transcript_proof_invalid", "A proven transcript proof requires a complete transcript and its ring boundary.");
 	}
 	const entries = verified.transcriptEntries;
 	if (entries.some(entry => !entry.id.trim())) {
@@ -109,7 +106,7 @@ function checkedVerification(
 	}
 	return {
 		identity,
-		checkpoint: verified.discoveryCheckpoint,
+		ringCheckpoint: verified.initialRingCheckpoint,
 		transcriptProof: "proven",
 		delivery: {
 			...(entries.at(-1)?.id === undefined ? {} : { lastEntryId: entries.at(-1)?.id }),
@@ -147,7 +144,7 @@ export async function bootstrapMainSession(options: BootstrapOptions): Promise<B
 		options.state.markCreated(intent);
 		await options.hooks?.afterCreated?.();
 		await options.hooks?.beforeCommit?.();
-		options.state.commitBootstrap("CREATED", intent, proof.identity, options.profile, proof.checkpoint, proof.transcriptProof, proof.delivery);
+		options.state.commitBootstrap("CREATED", intent, proof.identity, options.profile, proof.ringCheckpoint, proof.transcriptProof, proof.delivery);
 		await options.hooks?.afterCommit?.();
 		return { kind: "committed", identity: proof.identity, nonce: intent.nonce };
 	} catch (error) {
@@ -184,7 +181,7 @@ export async function recoverBootstrap(
 		const verified = await options.supervisor.discover(intent.sessionId);
 		const proof = checkedVerification(intent.sessionId, verified);
 		if (current.bootstrapState === "CREATING") options.state.markCreated(intent);
-		options.state.commitBootstrap("CREATED", intent, proof.identity, options.profile, proof.checkpoint, proof.transcriptProof, proof.delivery);
+		options.state.commitBootstrap("CREATED", intent, proof.identity, options.profile, proof.ringCheckpoint, proof.transcriptProof, proof.delivery);
 		return { kind: "committed", identity: proof.identity, nonce: intent.nonce };
 	} catch (error) {
 		return failClosed(options.state, error instanceof BootstrapError || error instanceof HostSupervisorError ? error.reason : "bootstrap_adoption_unavailable");

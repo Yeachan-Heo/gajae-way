@@ -14,7 +14,7 @@ use std::{
 use rusqlite::{Connection, OptionalExtension, Transaction};
 
 pub const DATABASE_FILENAME: &str = "way-core.sqlite3";
-pub const SCHEMA_VERSION: u32 = 5;
+pub const SCHEMA_VERSION: u32 = 6;
 pub const IDEMPOTENCY_WINDOW_MS: i64 = 24 * 60 * 60 * 1_000;
 pub const CLOSURE_OPERATION_META_KEY: &str = "gitlock_closure_operation";
 
@@ -758,6 +758,17 @@ fn migrate(connection: &mut Connection) -> StoreResult<()> {
         transaction.commit()?;
     }
 
+    // v5 used session.checkpoint coordinates as an event-ring watermark. Those
+    // coordinate systems are unrelated, so discard every v5 ring watermark and
+    // let the first actual tail envelope establish a new one.
+    if current_version < 6 {
+        let transaction = connection.transaction()?;
+        meta_set_tx(&transaction, "tail_checkpoint", "null")?;
+        meta_set_tx(&transaction, "tail_ring_rotation_count", "0")?;
+        meta_set_tx(&transaction, "schema_version", "6")?;
+        transaction.commit()?;
+    }
+
 
     let defaults = [
         ("bootstrap_state", "ABSENT"),
@@ -1013,6 +1024,27 @@ mod tests {
         drop(connection);
 
         let migrated = Store::open(&state_dir).unwrap();
+        assert_eq!(migrated.get_meta("tail_ring_rotation_count").unwrap().as_deref(), Some("0"));
+        assert_eq!(migrated.get_meta("schema_version").unwrap(), Some(SCHEMA_VERSION.to_string()));
+        drop(migrated);
+        fs::remove_dir_all(state_dir).unwrap();
+    }
+
+    #[test]
+    fn v5_state_directory_discards_foreign_session_checkpoint_coordinates() {
+        let state_dir = temporary_state_dir("v5-foreign-checkpoint");
+        let database_path = state_dir.join(DATABASE_FILENAME);
+        let store = Store::open(&state_dir).unwrap();
+        store.set_meta("tail_checkpoint", r#"{"revision":1696,"generation":0,"seq":0}"#).unwrap();
+        store.set_meta("tail_ring_rotation_count", "7").unwrap();
+        drop(store);
+
+        let connection = Connection::open(&database_path).unwrap();
+        connection.execute_batch("UPDATE gateway_meta SET v = '5' WHERE k = 'schema_version';").unwrap();
+        drop(connection);
+
+        let migrated = Store::open(&state_dir).unwrap();
+        assert_eq!(migrated.get_meta("tail_checkpoint").unwrap().as_deref(), Some("null"));
         assert_eq!(migrated.get_meta("tail_ring_rotation_count").unwrap().as_deref(), Some("0"));
         assert_eq!(migrated.get_meta("schema_version").unwrap(), Some(SCHEMA_VERSION.to_string()));
         drop(migrated);
