@@ -530,6 +530,11 @@ impl RpcDispatcher {
 
 	pub fn set_gateway_state(&self, state: GatewayState, reason: Option<String>) {
 		if let Ok(mut health) = self.health.lock() {
+			// A failed tail can race daemon startup. A later startup publication must
+			// never turn an already-degraded serving process healthy again.
+			if health.state == GatewayState::Degraded && state == GatewayState::Running {
+				return;
+			}
 			health.state = state;
 			health.reason = reason;
 		}
@@ -1486,6 +1491,29 @@ mod tests {
 			.await
 			.unwrap_err();
 		assert_ne!(approval.code, 1000);
+	}
+
+	#[tokio::test]
+	async fn degraded_health_remains_unhealthy_when_startup_attempts_to_publish_running() {
+		let dispatcher = dispatcher();
+		dispatcher.set_gateway_state(GatewayState::Degraded, Some("tail_unavailable".to_owned()));
+		dispatcher.set_gateway_state(GatewayState::Running, None);
+
+		let health = dispatcher
+			.dispatch("way.health".to_owned(), json!({}), super::super::CancellationToken::new())
+			.await
+			.unwrap();
+		assert_eq!(health["status"], "unhealthy");
+		assert_eq!(health["state"], "degraded");
+		assert_eq!(health["reason"], "tail_unavailable");
+
+		let status = dispatcher
+			.dispatch("way.status".to_owned(), json!({}), super::super::CancellationToken::new())
+			.await
+			.unwrap();
+		assert_eq!(status["status"], "unhealthy");
+		assert_eq!(status["state"], "degraded");
+		assert_eq!(status["reason"], "tail_unavailable");
 	}
 
 	#[tokio::test]

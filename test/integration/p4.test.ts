@@ -2,11 +2,20 @@ import { AsyncLocalStorage } from "node:async_hooks";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import { expect, test } from "bun:test";
+import { afterEach, expect, test } from "bun:test";
+
 import { canonicalJson } from "../../src/main-session/gates";
 import { connectEventually, createExternalGateway, eventually, type ExternalGateway } from "../helpers/external-gateway";
+import { ManagedProcessRegistry } from "../helpers/managed-process";
+import { FakeBrokerFixture } from "../helpers/main-session";
+
 
 const gatewayScope = new AsyncLocalStorage<ExternalGateway[]>();
+const managedProcesses = new ManagedProcessRegistry();
+
+afterEach(async () => {
+	await managedProcesses.reapAll();
+});
 
 type ExternalTestBody = () => void | Promise<void>;
 const externalTestLockPath = path.join(os.tmpdir(), `gajaeway-p4-external-test-${process.pid}.lock`);
@@ -327,3 +336,103 @@ externalTest("main.gate.answer reports unsupported and durably replays that hone
 		replayClient.close();
 	}
 });
+
+externalTest("process tail exhaustion keeps the RPC socket serving while every health surface reports degraded", async () => {
+	const fixture = new FakeBrokerFixture();
+	const corpus = path.join(fixture.root, "corpus");
+	const profilePath = path.join(fixture.root, "process-health-profile.toml");
+	const processStateRoot = fs.mkdtempSync(path.join(os.tmpdir(), "gajaeway-tail-health-"));
+	const stateDirectory = path.join(processStateRoot, "state");
+	const socketPath = path.join(stateDirectory, "rpc.sock");
+	const environment = {
+		...fixture.environment(),
+		NODE_ENV: "test",
+		GAJAEWAY_BROKER_CLI: fixture.executable,
+		GAJAEWAY_RECONCILE_POLL_MS: "600000",
+	};
+	fs.mkdirSync(corpus, { recursive: true });
+	fs.writeFileSync(
+		profilePath,
+		`[corpus]
+path = "${corpus}"
+workspace = "${fixture.workspace}"
+
+[injection]
+files = []
+
+[main_session]
+session_id = "${fixture.sessionId}"
+
+[surfaces.owner]
+id = "owner"
+platform = "test"
+kind = "dm"
+`,
+	);
+	let daemon: ReturnType<typeof managedProcesses.spawnDaemon> | undefined;
+	let client: Awaited<ReturnType<typeof connectEventually>> | undefined;
+	try {
+		const bootstrap = Bun.spawn({
+			cmd: ["bun", "src/main.ts", "bootstrap", "--confirm", "--state-dir", stateDirectory, "--profile", profilePath],
+			cwd: process.cwd(),
+			env: environment,
+			stdout: "pipe",
+			stderr: "pipe",
+		});
+		const [exitCode, stdout, stderr] = await Promise.all([
+			bootstrap.exited,
+			new Response(bootstrap.stdout).text(),
+			new Response(bootstrap.stderr).text(),
+		]);
+		if (exitCode !== 0) throw new Error(`process health bootstrap failed (${exitCode}): ${stderr || stdout}`);
+
+		// strictResumeMainSession consumes the one successful tail; the host then
+		// starts with an exhausted tail path while startup is still publishing.
+		fixture.crashTailsAfter(1, 50);
+		daemon = managedProcesses.spawnDaemon({
+			cmd: ["bun", "src/main.ts", "serve", "--state-dir", stateDirectory, "--profile", profilePath],
+			cwd: process.cwd(),
+			env: environment,
+			stderr: "pipe",
+		});
+		try {
+			client = await connectEventually(socketPath);
+		} catch (error) {
+			if (daemon.exitCode !== null) {
+				const stderr = await new Response(daemon.stderr).text();
+				throw new Error(`process health daemon exited before exposing RPC (${daemon.exitCode}): ${stderr}`);
+			}
+			throw error;
+		}
+		let degraded: Record<string, unknown> | undefined;
+		for (let attempt = 0; attempt < 1_400; attempt += 1) {
+			const health = await client.request("way.health", {});
+			if ((health.result as { state?: unknown } | undefined)?.state === "degraded") {
+				degraded = health.result as Record<string, unknown>;
+				break;
+			}
+			await Bun.sleep(25);
+		}
+		expect(degraded).toMatchObject({ status: "unhealthy", state: "degraded", reason: "tail_unavailable" });
+
+		const status = await client.request("way.status", {});
+		expect(status.result).toMatchObject({ status: "unhealthy", state: "degraded", reason: "tail_unavailable" });
+
+		let fileHealth: unknown;
+		for (let attempt = 0; attempt < 100; attempt += 1) {
+			try {
+				fileHealth = JSON.parse(fs.readFileSync(path.join(stateDirectory, "health.json"), "utf8"));
+				if ((fileHealth as { state?: unknown } | undefined)?.state === "degraded") break;
+			} catch {
+				// The asynchronous health-file writer may not have replaced the baseline yet.
+			}
+			await Bun.sleep(25);
+		}
+		expect(fileHealth).toMatchObject({ status: "unhealthy", state: "degraded", reason: "tail_unavailable" });
+	} finally {
+		client?.close();
+		if (daemon) await managedProcesses.stopDaemon(daemon);
+		fixture.dispose();
+		fs.rmSync(processStateRoot, { recursive: true, force: true });
+	}
+}, 45_000);

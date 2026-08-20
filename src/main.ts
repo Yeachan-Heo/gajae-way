@@ -118,6 +118,9 @@ function createRuntimeMainSessionJournal(
 ): MainSessionJournal {
 	return {
 		journalAppend: (kind, payloadJson) => core.journalAppend(kind, payloadJson),
+		journalAppendAtTailCheckpoint: (kind, payloadJson, expected, checkpoint) => {
+			gatewayState.appendTailProjection(expected, checkpoint, kind, payloadJson);
+		},
 		setRpcHealth: (state, reason) => {
 			let healthState: "degraded" | "failed_closed" = state;
 			let healthReason = reason;
@@ -995,6 +998,10 @@ async function serveWay(config: WayConfig): Promise<void> {
 		}
 		failBeforeMainHostForE2e();
 		await reconcilePendingClosureOperation(core, closures, profile.corpusPath, resumed.identity.sessionId);
+		// Write the baseline before tail observation begins. A host may degrade
+		// immediately; the later running state publication is monotonic in core.
+		await writeHealthFile(config.stateDir, { status: "healthy", state: "running" });
+
 		host = createMainSessionHost({
 			supervisor,
 			identity: resumed.identity,
@@ -1003,6 +1010,7 @@ async function serveWay(config: WayConfig): Promise<void> {
 			initialTurnState: resumed.turnState,
 			initialFollowUpQueueDepth: resumed.followUpQueueDepth,
 		});
+		core.setRpcHealth("running");
 		const admissionHandler = createMainAdmissionHandler(host, profile, core, {
 			isSurfaceQuarantined: (surface) => {
 				try {
@@ -1020,8 +1028,6 @@ async function serveWay(config: WayConfig): Promise<void> {
 			if (method === "main.corpus.close") return await closureHandler(method, params);
 			throw new RpcBridgeException(-32601, `method not found: ${method}`);
 		};
-		core.setRpcHealth("running");
-		await writeHealthFile(config.stateDir, { status: "healthy", state: "running" });
 		reconciler = new BrokerReconciler({
 			core,
 			broker: new BrokerCli({ executable: config.brokerCliPath }),

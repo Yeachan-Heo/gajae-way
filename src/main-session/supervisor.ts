@@ -11,8 +11,10 @@ import {
 	attestsExternalTranscriptGrowth,
 	fingerprintTranscriptEntries,
 	type ExternalSessionIdentity,
+	type TailCheckpoint,
 	type TranscriptFingerprint,
 } from "./state";
+
 
 export type SupervisorTurnState = "idle" | "busy";
 
@@ -30,6 +32,9 @@ export interface SupervisorTailEvents {
 	readonly events: readonly SupervisorEvent[];
 	readonly terminal: boolean;
 	readonly retentionGap: boolean;
+	readonly checkpoint?: TailCheckpoint;
+	readonly resyncCheckpoint?: TailCheckpoint;
+
 }
 
 export interface SupervisorVerification {
@@ -184,10 +189,10 @@ export class ExternalHostSupervisor implements HostSupervisor {
 			tail = await this.#broker.tailSession(identity.sessionId, {
 				repo: identity.locator.repo,
 				untilIdle: true,
-				strict: true,
 				allEvents: true,
 				timeoutMs: this.#tailTimeoutMs,
 			});
+
 		} catch (error) {
 			if (isNormalTailTimeout(error)) {
 				return { identity, transcriptEntries: [], events: [], terminal: false, retentionGap: false };
@@ -212,6 +217,8 @@ export class ExternalHostSupervisor implements HostSupervisor {
 			events: eventItems(tail),
 			terminal: tail.terminal === true,
 			retentionGap: tail.gap !== undefined,
+			...(tail.checkpoint === undefined ? {} : { checkpoint: tail.checkpoint }),
+			...(tail.gap?.resync === undefined ? {} : { resyncCheckpoint: tail.gap.resync }),
 		};
 	}
 

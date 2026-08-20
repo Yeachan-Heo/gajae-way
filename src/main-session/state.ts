@@ -16,6 +16,8 @@ export const GATEWAY_META_KEYS = [
 	"profile_approved_at",
 	"profile_approval_receipt",
 	"failed_closed_reason",
+	"tail_checkpoint",
+
 ] as const;
 
 export interface GatewayMetaEntry {
@@ -91,6 +93,22 @@ export interface GrowthIntent {
 	readonly startedAt: number;
 }
 
+/** Durable broker-tail watermark. It is a record, not a broker cursor token. */
+export interface TailCheckpoint {
+	readonly revision: number;
+	readonly generation: number;
+	readonly seq: number;
+}
+
+/** Compares broker-tail watermarks within their event generation. */
+export function compareTailCheckpoints(left: TailCheckpoint, right: TailCheckpoint): number {
+	if (left.generation !== right.generation) return left.generation < right.generation ? -1 : 1;
+	if (left.seq !== right.seq) return left.seq < right.seq ? -1 : 1;
+	if (left.revision !== right.revision) return left.revision < right.revision ? -1 : 1;
+	return 0;
+}
+
+
 export interface DurableGatewayState {
 	readonly bootstrapState: BootstrapState;
 	readonly bootstrapIntent: BootstrapIntent | undefined;
@@ -103,6 +121,8 @@ export interface DurableGatewayState {
 	readonly profileApprovedAt: number | undefined;
 	readonly profileApprovalReceipt: string | undefined;
 	readonly failedClosedReason: string | undefined;
+	readonly tailCheckpoint: TailCheckpoint | undefined;
+
 }
 
 export class GatewayStateError extends Error {
@@ -162,6 +182,16 @@ function parseTranscriptFingerprint(value: unknown, key: string): TranscriptFing
 	}
 	return fingerprint;
 }
+
+function parseTailCheckpoint(value: unknown, key: string): TailCheckpoint {
+	if (!isRecord(value)) throw new GatewayStateError("metadata_invalid", `${key} must be an object.`);
+	return {
+		revision: requiredNonNegativeInteger(value.revision, `${key}.revision`),
+		generation: requiredNonNegativeInteger(value.generation, `${key}.generation`),
+		seq: requiredNonNegativeInteger(value.seq, `${key}.seq`),
+	};
+}
+
 
 function parseExternalIdentity(value: unknown, key: string): ExternalSessionIdentity {
 	if (!isRecord(value)) throw new GatewayStateError("metadata_invalid", `${key} must be an object.`);
@@ -224,6 +254,13 @@ function parseOptionalNonNegativeIntegerJson(raw: string, key: string): number |
 	return requiredNonNegativeInteger(parsed, key);
 }
 
+function parseOptionalTailCheckpoint(raw: string | undefined): TailCheckpoint | undefined {
+	if (raw === undefined || raw === "null") return undefined;
+	const parsed = parseNullableJson(raw, "tail_checkpoint");
+	return parsed === undefined ? undefined : parseTailCheckpoint(parsed, "tail_checkpoint");
+}
+
+
 function metadataMap(entries: readonly GatewayMetaEntry[]): Map<string, string> {
 	const values = new Map<string, string>();
 	for (const entry of entries) {
@@ -267,6 +304,8 @@ function parsedState(values: ReadonlyMap<string, string>): DurableGatewayState {
 		profileApprovedAt: parseOptionalNonNegativeIntegerJson(requiredMeta(values, "profile_approved_at"), "profile_approved_at"),
 		profileApprovalReceipt: parseOptionalStringJson(requiredMeta(values, "profile_approval_receipt"), "profile_approval_receipt"),
 		failedClosedReason: parseOptionalStringJson(requiredMeta(values, "failed_closed_reason"), "failed_closed_reason"),
+		tailCheckpoint: parseOptionalTailCheckpoint(values.get("tail_checkpoint")),
+
 	};
 }
 
@@ -276,6 +315,10 @@ function stableMetadataJson(value: unknown): string {
 
 function identityJson(identity: ExternalSessionIdentity): string {
 	return stableMetadataJson(identity);
+}
+
+function tailCheckpointJson(checkpoint: TailCheckpoint): string {
+	return stableMetadataJson(checkpoint);
 }
 
 function canonicalJson(value: unknown): string {
@@ -380,6 +423,8 @@ export class GatewayStateStore {
 				{ key: "profile_projection", value: profileProjectionCanonical(profile.projection) },
 				{ key: "profile_tunables_revision", value: String(profile.tunablesRevision) },
 				{ key: "failed_closed_reason", value: "null" },
+				{ key: "tail_checkpoint", value: "null" },
+
 			],
 			deletes: [],
 		});
@@ -440,6 +485,62 @@ export class GatewayStateStore {
 			expected: [{ key: "profile_tunables_revision", value: String(state.profileTunablesRevision) }],
 			puts: [{ key: "profile_tunables_revision", value: String(revision) }],
 			deletes: [],
+		});
+	}
+
+	/** Records the point from which an adopted daemon begins projection after an initial retention gap. */
+	recordTailAdoptionStart(checkpoint: TailCheckpoint): void {
+		const state = this.read();
+		if (state.tailCheckpoint) {
+			if (compareTailCheckpoints(state.tailCheckpoint, checkpoint) === 0) return;
+			throw new GatewayStateError("tail_checkpoint_exists", "A broker-tail checkpoint is already durable.");
+		}
+		const raw = this.#backend.gatewayMetaRead(["tail_checkpoint"]).entries[0]?.value;
+		this.transact({
+			expected: [
+				{ key: "bootstrap_state", value: "COMMITTED" },
+				...(raw === undefined ? [] : [{ key: "tail_checkpoint", value: raw }]),
+			],
+			puts: [{ key: "tail_checkpoint", value: tailCheckpointJson(checkpoint) }],
+			deletes: [],
+			eventKind: "tail_adoption_start",
+			eventPayloadJson: stableMetadataJson({ checkpoint }),
+		});
+	}
+
+	/**
+	 * Advances the durable broker-tail watermark only after the caller has
+	 * committed every projection derived from that tail batch.
+	 */
+	advanceTailCheckpoint(expected: TailCheckpoint | undefined, checkpoint: TailCheckpoint): void {
+		if (expected && compareTailCheckpoints(checkpoint, expected) < 0) {
+			throw new GatewayStateError("tail_checkpoint_regression", "Broker-tail checkpoint regressed.");
+		}
+		if (expected && compareTailCheckpoints(checkpoint, expected) === 0) return;
+		this.transact({
+			expected: [
+				{ key: "bootstrap_state", value: "COMMITTED" },
+				...(expected === undefined ? [] : [{ key: "tail_checkpoint", value: tailCheckpointJson(expected) }]),
+			],
+			puts: [{ key: "tail_checkpoint", value: tailCheckpointJson(checkpoint) }],
+			deletes: [],
+		});
+	}
+
+	/** Atomically journals one projected tail event with its consumed watermark. */
+	appendTailProjection(expected: TailCheckpoint | undefined, checkpoint: TailCheckpoint, kind: string, payloadJson: string): void {
+		if (expected && compareTailCheckpoints(checkpoint, expected) < 0) {
+			throw new GatewayStateError("tail_checkpoint_regression", "Broker-tail checkpoint regressed.");
+		}
+		this.transact({
+			expected: [
+				{ key: "bootstrap_state", value: "COMMITTED" },
+				...(expected === undefined ? [] : [{ key: "tail_checkpoint", value: tailCheckpointJson(expected) }]),
+			],
+			puts: [{ key: "tail_checkpoint", value: tailCheckpointJson(checkpoint) }],
+			deletes: [],
+			eventKind: kind,
+			eventPayloadJson: payloadJson,
 		});
 	}
 

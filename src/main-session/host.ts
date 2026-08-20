@@ -1,14 +1,18 @@
 import { MainSessionGateRegistry, type GateHandle, type MainGateResolution } from "./gates";
 import {
+	compareTailCheckpoints,
 	GatewayStateStore,
 	sameExternalFingerprint,
 	type ExternalSessionIdentity,
 	type GrowthIntent,
+	type TailCheckpoint,
 } from "./state";
-import { HostSupervisorError, type HostSupervisor, type SupervisorEvent } from "./supervisor";
+import { HostSupervisorError, type HostSupervisor, type SupervisorEvent, type SupervisorTailEvents } from "./supervisor";
+
 
 export interface MainSessionJournal {
 	journalAppend(kind: string, payloadJson: string): unknown;
+	journalAppendAtTailCheckpoint?(kind: string, payloadJson: string, expected: TailCheckpoint | undefined, checkpoint: TailCheckpoint): unknown;
 	setRpcHealth?(state: "degraded", reason: string): void;
 	setMainSessionStatus?(turnState: "idle" | "busy", followUpQueueDepth: number): void;
 	setJournalDegraded?(degraded: boolean): void;
@@ -170,6 +174,15 @@ function supervisorEventKey(event: SupervisorEvent): string {
 	return `payload:${event.kind}:${JSON.stringify(event.payload)}`;
 }
 
+function sourceCheckpoint(event: SupervisorEvent, revision: number): TailCheckpoint | undefined {
+	if (event.generation === undefined || event.seq === undefined) return undefined;
+	return { revision, generation: event.generation, seq: event.seq };
+}
+
+function checkpointSkipsPast(previous: TailCheckpoint, resync: TailCheckpoint): boolean {
+	return resync.generation !== previous.generation || resync.seq > previous.seq;
+}
+
 
 const FATAL_EXTERNAL_IDENTITY_REASONS = new Set([
 	"session_deleted",
@@ -180,6 +193,7 @@ const FATAL_EXTERNAL_IDENTITY_REASONS = new Set([
 	"growth_intent_mismatch",
 	"main_identity_mismatch",
 	"tail_retention_gap",
+	"tail_generation_changed",
 ]);
 
 function isFatalExternalIdentityFailure(reason: string): boolean {
@@ -209,6 +223,9 @@ class ExternalMainSessionHost implements MainSessionHost {
 	readonly #tailStop = Promise.withResolvers<void>();
 	#tailWake = Promise.withResolvers<void>();
 	readonly #highestTailSequenceByGeneration = new Map<number, number>();
+	#tailCheckpoint: TailCheckpoint | undefined;
+	#journalTailCheckpoint: TailCheckpoint | undefined;
+
 	readonly #tailTask: Promise<void>;
 
 	constructor(options: CreateMainSessionHostOptions) {
@@ -221,6 +238,8 @@ class ExternalMainSessionHost implements MainSessionHost {
 		this.gates = options.gates ?? new MainSessionGateRegistry({ now: this.#now });
 		this.#turnState = options.initialTurnState ?? "idle";
 		this.#followUpQueueDepth = Math.max(0, options.initialFollowUpQueueDepth ?? 0);
+		this.#tailCheckpoint = this.#state.read().tailCheckpoint;
+
 		this.publishStatus();
 		this.#tailTask = this.observeTail();
 	}
@@ -303,7 +322,18 @@ class ExternalMainSessionHost implements MainSessionHost {
 	private appendJournalEvent(kind: string, payload: unknown): boolean {
 		if (this.#disposed || this.#failure) return false;
 		try {
-			this.#journal.journalAppend(kind, payloadJson(payload));
+			const encoded = payloadJson(payload);
+			const checkpoint = this.#journalTailCheckpoint;
+			if (
+				checkpoint &&
+				this.#journal.journalAppendAtTailCheckpoint &&
+				(!this.#tailCheckpoint || compareTailCheckpoints(checkpoint, this.#tailCheckpoint) > 0)
+			) {
+				this.#journal.journalAppendAtTailCheckpoint(kind, encoded, this.#tailCheckpoint, checkpoint);
+				this.#tailCheckpoint = checkpoint;
+			} else {
+				this.#journal.journalAppend(kind, encoded);
+			}
 			return true;
 		} catch (error) {
 			this.enterFailure("journal_append_failed", error, true);
@@ -455,6 +485,77 @@ class ExternalMainSessionHost implements MainSessionHost {
 		this.#identity = identity;
 	}
 
+	/**
+	 * A cursorless real broker tail reports the same origin retention gap on
+	 * every poll once its ring rotates. The first gap is the adoption boundary;
+	 * later gaps are fatal only when their resync point moves beyond our durable
+	 * event watermark.
+	 */
+	private observeRetentionGap(tail: SupervisorTailEvents): boolean {
+		if (!tail.retentionGap) return false;
+		const resync = tail.resyncCheckpoint;
+		if (!resync) throw new HostSupervisorError("tail_retention_gap", "Broker tail reported a retention gap without a resync checkpoint.");
+		const previous = this.#tailCheckpoint;
+		if (previous) {
+			if (checkpointSkipsPast(previous, resync)) {
+				throw new HostSupervisorError("tail_retention_gap", "Broker tail retention advanced beyond the durable watermark.");
+			}
+			return false;
+		}
+		try {
+			this.#state.recordTailAdoptionStart(resync);
+		} catch (error) {
+			throw new HostSupervisorError(
+				"tail_checkpoint_write_failed",
+				"Could not durably record the broker-tail adoption checkpoint.",
+				{ cause: error },
+			);
+		}
+		this.#tailCheckpoint = resync;
+		return true;
+	}
+
+	private shouldProjectTailEvent(event: SupervisorEvent): boolean {
+		const checkpoint = this.#tailCheckpoint;
+		if (!checkpoint || event.generation === undefined || event.seq === undefined) return true;
+		if (event.generation < checkpoint.generation) return false;
+		if (event.generation > checkpoint.generation) {
+			throw new HostSupervisorError("tail_generation_changed", "Broker tail event generation changed after adoption.");
+		}
+		return event.seq > checkpoint.seq;
+	}
+
+	private checkpointAfterTail(tail: SupervisorTailEvents, events: readonly SupervisorEvent[]): TailCheckpoint | undefined {
+		const previous = this.#tailCheckpoint;
+		const revision = Math.max(tail.checkpoint?.revision ?? 0, previous?.revision ?? 0);
+		let checkpoint = previous;
+		for (const event of events) {
+			const candidate = sourceCheckpoint(event, revision);
+			if (!candidate) continue;
+			if (!checkpoint || compareTailCheckpoints(candidate, checkpoint) > 0) checkpoint = candidate;
+		}
+		if (!checkpoint) return tail.checkpoint;
+		if (checkpoint.revision === revision) return checkpoint;
+		return { ...checkpoint, revision };
+	}
+
+	private advanceTailCheckpointTo(checkpoint: TailCheckpoint | undefined): void {
+		const previous = this.#tailCheckpoint;
+		if (!checkpoint || (previous && compareTailCheckpoints(checkpoint, previous) <= 0)) return;
+		try {
+			this.#state.advanceTailCheckpoint(previous, checkpoint);
+		} catch (error) {
+			throw new HostSupervisorError("tail_checkpoint_write_failed", "Could not durably advance the broker-tail checkpoint.", {
+				cause: error,
+			});
+		}
+		this.#tailCheckpoint = checkpoint;
+	}
+
+	private advanceTailCheckpoint(tail: SupervisorTailEvents, events: readonly SupervisorEvent[]): void {
+		this.advanceTailCheckpointTo(this.checkpointAfterTail(tail, events));
+	}
+
 	private async observeTail(): Promise<void> {
 		// Transport-level broker failures (CLI spawn pressure, command timeouts,
 		// transient nonzero exits) surface as "tail_unavailable" and are retried
@@ -468,14 +569,30 @@ class ExternalMainSessionHost implements MainSessionHost {
 				const tail = await this.#supervisor.tailEvents();
 				if (this.#disposed) return;
 				transientFailures = 0;
-				if (tail.retentionGap) {
-					this.enterFailure("tail_retention_gap", new Error("Broker tail reported a retention gap."));
-					return;
-				}
 				const priorTranscriptEntries = this.#identity.transcript?.entryCount ?? 0;
 				this.observeIdentity(tail.identity);
-				for (const event of tail.events) this.observeExternalEvent(event);
-				this.observeTranscript(tail.transcriptEntries.slice(priorTranscriptEntries));
+				const adoptionGap = this.observeRetentionGap(tail);
+				if (!adoptionGap) {
+					const events = tail.events.filter(event => this.shouldProjectTailEvent(event));
+					const revision = Math.max(tail.checkpoint?.revision ?? 0, this.#tailCheckpoint?.revision ?? 0);
+					for (const event of events) {
+						const checkpoint = sourceCheckpoint(event, revision);
+						this.#journalTailCheckpoint = checkpoint;
+						try {
+							this.observeExternalEvent(event);
+						} finally {
+							this.#journalTailCheckpoint = undefined;
+						}
+						if (this.#failure) return;
+						this.advanceTailCheckpointTo(checkpoint);
+					}
+					if (this.#failure) return;
+					this.observeTranscript(tail.transcriptEntries.slice(priorTranscriptEntries));
+					if (this.#failure) return;
+					// Projection is synchronous. Persist only after every journal append in
+					// this tail response has committed, so an interrupted poll replays.
+					this.advanceTailCheckpoint(tail, events);
+				}
 				if (tail.terminal && this.#admittedOperations.size === 0) {
 					this.#turnState = "idle";
 					this.publishStatus();

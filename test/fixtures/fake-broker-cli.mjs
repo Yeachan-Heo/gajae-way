@@ -272,7 +272,10 @@ if (!statePath) {
 		}
 	} else if (args[0] === "sdk" && args[1] === "session" && args[2] === "tail") {
 		const value = session(args[3]);
-		if (value && typeof value.crashNextTailCount === "number" && value.crashNextTailCount > 0) {
+		if (value && typeof value.crashTailAfterCount === "number" && value.crashTailAfterCount > 0) {
+			value.crashTailAfterCount -= 1;
+			fs.writeFileSync(statePath, JSON.stringify(state, null, 1));
+		} else if (value && typeof value.crashNextTailCount === "number" && value.crashNextTailCount > 0) {
 			// Transient transport failure injection: consume one crash budget and
 			// exit nonzero WITHOUT an envelope, like a CLI dying under load.
 			value.crashNextTailCount -= 1;
@@ -281,20 +284,45 @@ if (!statePath) {
 			process.exit(1);
 		}
 		if (value) {
-			const items = [
-				...(value.transcript ?? []).map((payload, index) => ({ kind: "transcript", id: `transcript:${index}`, seq: index, payload })),
-				...(value.events ?? []),
-			];
-			const terminal = value.context?.isStreaming !== true && (value.context?.followupQueueDepth ?? 0) === 0;
-			success({
-				version: 1,
-				source: "session",
-				session: value.row,
-				checkpoint: { revision: value.transcript?.length ?? 0, generation: 1, seq: value.nextSeq ?? 0 },
-				...(value.gap === undefined ? {} : { gap: value.gap }),
-				items,
-				terminal,
-			});
+			const cursorIndex = args.indexOf("--cursor");
+			if (cursorIndex !== -1) {
+				// The real credential-free CLI redacts the signed checkpoint token it
+				// would need here. Do not accept an invented record-shaped cursor.
+				fail("invalid_cursor", "fixture tail cannot validate an unavailable checkpoint token");
+			} else {
+				const retentionFloorSeq = Number.isSafeInteger(value.retentionFloorSeq) ? value.retentionFloorSeq : 0;
+				const gap =
+					value.gap ??
+					(retentionFloorSeq > 0
+						? {
+								code: "retention_gap",
+								missing: { from: 0, to: retentionFloorSeq },
+								resync: {
+									revision: value.transcript?.length ?? 0,
+									generation: 1,
+									seq: retentionFloorSeq,
+								},
+							}
+						: undefined);
+				if (gap && args.includes("--strict")) {
+					fail("retention_gap", "fixture strict tail encountered retained-history loss");
+				} else {
+					const items = [
+						...(value.transcript ?? []).map((payload, index) => ({ kind: "transcript", id: `transcript:${index}`, seq: index, payload })),
+						...(value.events ?? []).filter(event => typeof event.seq !== "number" || event.seq > retentionFloorSeq),
+					];
+					const terminal = value.context?.isStreaming !== true && (value.context?.followupQueueDepth ?? 0) === 0;
+					success({
+						version: 1,
+						source: "session",
+						session: value.row,
+						checkpoint: { revision: value.transcript?.length ?? 0, generation: 1, seq: value.nextSeq ?? 0 },
+						...(gap === undefined ? {} : { gap }),
+						items,
+						terminal,
+					});
+				}
+			}
 		}
 	} else if (args[0] === "sdk" && args[1] === "session" && args[2] === "raw" && args[3] === "query") {
 		const sessionId = args[4];

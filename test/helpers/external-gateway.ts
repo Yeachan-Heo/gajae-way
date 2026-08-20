@@ -106,16 +106,28 @@ export async function createExternalGateway(options: ExternalGatewayOptions = {}
 	const supervisor = createExternalHostSupervisor({
 		broker: new BrokerCli({ executable: fixture.executable, environment: fixture.environment() }),
 		workspace: fixture.workspace,
-		tailTimeoutMs: options.tailTimeoutMs ?? 100,
+		tailTimeoutMs: options.tailTimeoutMs ?? 500,
 		commandTimeoutMs: options.commandTimeoutMs ?? 1_000,
 	});
 	await bootstrapMainSession({ confirm: true, profile, state, supervisor, sessionId: fixture.sessionId });
 	const resumed = await strictResumeMainSession({ profile, state, supervisor });
+	const journal: MainSessionJournal =
+		options.journal ??
+		{
+			journalAppend: (kind, payloadJson) => core.journalAppend(kind, payloadJson),
+			journalAppendAtTailCheckpoint: (kind, payloadJson, expected, checkpoint) => {
+				state.appendTailProjection(expected, checkpoint, kind, payloadJson);
+			},
+			setRpcHealth: (healthState, reason) => core.setRpcHealth(healthState, reason),
+			setMainSessionStatus: (turnState, followUpQueueDepth) => core.setMainSessionStatus(turnState, followUpQueueDepth),
+			setJournalDegraded: degraded => core.setJournalDegraded(degraded),
+		};
+
 	const host = createMainSessionHost({
 		supervisor,
 		identity: resumed.identity,
 		state,
-		journal: options.journal ?? core,
+		journal,
 		initialTurnState: resumed.turnState,
 		initialFollowUpQueueDepth: resumed.followUpQueueDepth,
 	});

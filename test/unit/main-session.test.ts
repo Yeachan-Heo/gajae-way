@@ -64,7 +64,8 @@ async function eventually(predicate: () => boolean, message: string, timeoutMs =
 
 
 async function bootstrapFixture(fixture: FakeBrokerFixture) {
-	const state = new GatewayStateStore(new MemoryGatewayMeta());
+	const meta = new MemoryGatewayMeta();
+	const state = new GatewayStateStore(meta);
 	const profile = fixtureProfile(fixture);
 	const adoption = supervisor(fixture);
 	try {
@@ -75,7 +76,7 @@ async function bootstrapFixture(fixture: FakeBrokerFixture) {
 			supervisor: adoption,
 			sessionId: fixture.sessionId,
 		});
-		return { state, profile, committed };
+		return { meta, state, profile, committed };
 	} finally {
 		await adoption.dispose();
 	}
@@ -127,6 +128,24 @@ test.serial("scripted broker CLI fixture covers inspect, send, status, tail, and
 	const tail = await broker.tailSession(fixture.sessionId, { repo: fixture.workspace, allEvents: true, untilIdle: true, strict: true });
 	expect(tail.items.filter(item => item.kind === "agent_start")).toHaveLength(2);
 	expect(tail.items.map(item => item.kind)).toContain("message_end");
+});
+
+test.serial("scripted broker tail mirrors cursorless rotation gaps and checkpoint records", async () => {
+	const fixture = new FakeBrokerFixture();
+	fixtures.push(fixture);
+	fixture.appendTailEvent("agent_start", { type: "agent_start", sessionId: fixture.sessionId });
+	fixture.rotateTailThrough(1);
+	const broker = new BrokerCli({ executable: fixture.executable, environment: fixture.environment() });
+	const tail = await broker.tailSession(fixture.sessionId, { repo: fixture.workspace, allEvents: true, untilIdle: true });
+	expect(tail.checkpoint).toEqual({ revision: 2, generation: 1, seq: 1 });
+	expect(tail.gap).toEqual({
+		code: "retention_gap",
+		missing: { from: 0, to: 1 },
+		resync: { revision: 2, generation: 1, seq: 1 },
+	});
+	await expect(
+		broker.tailSession(fixture.sessionId, { repo: fixture.workspace, cursor: "not-a-signed-broker-checkpoint" }),
+	).rejects.toMatchObject({ code: "invalid_cursor" });
 });
 
 
@@ -417,3 +436,139 @@ test.serial("host fails closed when broker tail failures exhaust the bounded ret
 		await host.dispose();
 	}
 }, 90_000);
+
+test.serial("adoption-start retention gap records its resync checkpoint and projects subsequent events", async () => {
+	const fixture = new FakeBrokerFixture();
+	fixtures.push(fixture);
+	fixture.appendTailEvent("agent_start", { type: "agent_start", sessionId: fixture.sessionId });
+	fixture.rotateTailThrough(1);
+	const { meta, state, profile } = await bootstrapFixture(fixture);
+	const resumedSupervisor = supervisor(fixture);
+	const resumed = await strictResumeMainSession({ profile, state, supervisor: resumedSupervisor });
+	const journal: Array<{ kind: string; payloadJson: string }> = [];
+	const host = createMainSessionHost({
+		supervisor: resumedSupervisor,
+		identity: resumed.identity,
+		state,
+		journal: { journalAppend: (kind, payloadJson) => journal.push({ kind, payloadJson }) },
+		initialTurnState: resumed.turnState,
+		initialFollowUpQueueDepth: resumed.followUpQueueDepth,
+	});
+	try {
+		await eventually(() => state.read().tailCheckpoint?.seq === 1, "host did not record the adoption-start resync checkpoint");
+		expect(meta.events).toContainEqual({
+			kind: "tail_adoption_start",
+			payloadJson: JSON.stringify({ checkpoint: { revision: 2, generation: 1, seq: 1 } }),
+		});
+
+		fixture.appendTailEvent("message_end", {
+			type: "message_end",
+			message: {
+				role: "assistant",
+				content: [{ type: "text", text: "projected after adoption resync" }],
+				responseId: "after-adoption-resync",
+				timestamp: 1_700_000_003_000,
+			},
+		});
+		await eventually(
+			() => journal.some(event => event.payloadJson.includes("projected after adoption resync")),
+			"event after adoption resync was not projected",
+		);
+		expect(state.read().tailCheckpoint).toMatchObject({ generation: 1, seq: 2 });
+	} finally {
+		await host.dispose();
+	}
+});
+
+test.serial("an established broker-tail checkpoint fails closed when retention advances beyond it", async () => {
+	const fixture = new FakeBrokerFixture();
+	fixtures.push(fixture);
+	const { state, profile } = await bootstrapFixture(fixture);
+	const resumedSupervisor = supervisor(fixture);
+	const resumed = await strictResumeMainSession({ profile, state, supervisor: resumedSupervisor });
+	const host = createMainSessionHost({
+		supervisor: resumedSupervisor,
+		identity: resumed.identity,
+		state,
+		journal: { journalAppend: () => undefined },
+		initialTurnState: resumed.turnState,
+		initialFollowUpQueueDepth: resumed.followUpQueueDepth,
+	});
+	try {
+		await eventually(() => state.read().tailCheckpoint?.seq === 0, "host did not establish its initial checkpoint");
+		fixture.appendTailEvent("message_end", {
+			type: "message_end",
+			message: {
+				role: "assistant",
+				content: [{ type: "text", text: "checkpointed event" }],
+				responseId: "checkpointed-event",
+				timestamp: 1_700_000_004_000,
+			},
+		});
+		await eventually(() => state.read().tailCheckpoint?.seq === 1, "host did not advance its established checkpoint");
+
+		fixture.appendTailEvent("agent_start", { type: "agent_start", sessionId: fixture.sessionId });
+		fixture.rotateTailThrough(2);
+		await expect(host.waitForFatalFailure()).resolves.toMatchObject({ reason: "tail_retention_gap" });
+		expect(state.read()).toMatchObject({ bootstrapState: "FAILED_CLOSED", failedClosedReason: "tail_retention_gap" });
+	} finally {
+		await host.dispose();
+	}
+});
+
+test.serial("a failed journal append leaves the tail checkpoint behind so the scripted broker event replays", async () => {
+	const fixture = new FakeBrokerFixture();
+	fixtures.push(fixture);
+	const { state, profile } = await bootstrapFixture(fixture);
+	const firstSupervisor = supervisor(fixture);
+	const first = await strictResumeMainSession({ profile, state, supervisor: firstSupervisor });
+	const failedHost = createMainSessionHost({
+		supervisor: firstSupervisor,
+		identity: first.identity,
+		state,
+		journal: {
+			journalAppend: () => {
+				throw new Error("scripted journal interruption");
+			},
+		},
+		initialTurnState: first.turnState,
+		initialFollowUpQueueDepth: first.followUpQueueDepth,
+	});
+	try {
+		await eventually(() => state.read().tailCheckpoint?.seq === 0, "host did not establish its initial checkpoint");
+		fixture.appendTailEvent("message_end", {
+			type: "message_end",
+			message: {
+				role: "assistant",
+				content: [{ type: "text", text: "replay after journal interruption" }],
+				responseId: "replay-after-interruption",
+				timestamp: 1_700_000_005_000,
+			},
+		});
+		await eventually(() => failedHost.degraded, "scripted journal failure did not degrade the first host");
+		expect(state.read().tailCheckpoint).toMatchObject({ generation: 1, seq: 0 });
+	} finally {
+		await failedHost.dispose();
+	}
+
+	const replaySupervisor = supervisor(fixture);
+	const replayed = await strictResumeMainSession({ profile, state, supervisor: replaySupervisor });
+	const journal: Array<{ kind: string; payloadJson: string }> = [];
+	const replayHost = createMainSessionHost({
+		supervisor: replaySupervisor,
+		identity: replayed.identity,
+		state,
+		journal: { journalAppend: (kind, payloadJson) => journal.push({ kind, payloadJson }) },
+		initialTurnState: replayed.turnState,
+		initialFollowUpQueueDepth: replayed.followUpQueueDepth,
+	});
+	try {
+		await eventually(
+			() => journal.some(event => event.payloadJson.includes("replay after journal interruption")),
+			"restarted host did not replay the uncheckpointed broker event",
+		);
+		expect(state.read().tailCheckpoint).toMatchObject({ generation: 1, seq: 1 });
+	} finally {
+		await replayHost.dispose();
+	}
+});

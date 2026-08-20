@@ -20,6 +20,8 @@ const defaults: Record<string, string> = {
 	profile_approved_at: "null",
 	profile_approval_receipt: "null",
 	failed_closed_reason: "null",
+	tail_checkpoint: "null",
+
 };
 
 export class MemoryGatewayMeta implements GatewayMetaBackend {
@@ -63,7 +65,13 @@ interface FixtureSession {
 	operations: Record<string, FixtureOperation>;
 	nextSeq: number;
 	nextGeneration: number;
-	gap?: { readonly code: "retention_gap"; readonly missing?: { readonly from: number; readonly to: number } };
+	gap?: {
+		readonly code: "retention_gap";
+		readonly missing?: { readonly from: number; readonly to: number };
+		readonly resync?: { readonly revision: number; readonly generation: number; readonly seq: number };
+	};
+	retentionFloorSeq?: number;
+
 	holdNext?: boolean;
 	failNext?: boolean;
 	responseText?: string;
@@ -128,6 +136,8 @@ export class FakeBrokerFixture {
 			operations: {},
 			nextSeq: 0,
 			nextGeneration: 1,
+			retentionFloorSeq: 0,
+
 			responseText: options.responseText,
 			commandLog: [],
 		};
@@ -162,6 +172,17 @@ export class FakeBrokerFixture {
 		});
 	}
 
+	/** Allows a strict-resume tail before exhausting the host's retry budget. */
+	crashTailsAfter(successfulTails: number, count: number): void {
+		if (!Number.isSafeInteger(successfulTails) || successfulTails < 0 || !Number.isSafeInteger(count) || count < 0) {
+			throw new Error("tail crash counts must be non-negative safe integers");
+		}
+		this.update(session => {
+			(session as { crashTailAfterCount?: number }).crashTailAfterCount = successfulTails;
+			(session as { crashNextTailCount?: number }).crashNextTailCount = count;
+		});
+	}
+
 	failNextTurn(): void {
 		this.update(session => {
 			session.failNext = true;
@@ -174,9 +195,27 @@ export class FakeBrokerFixture {
 		});
 	}
 
+	/** Forces a resynchronizable gap without inventing a broker cursor token. */
 	setRetentionGap(): void {
 		this.update(session => {
-			session.gap = { code: "retention_gap" };
+			session.gap = {
+				code: "retention_gap",
+				resync: { revision: session.transcript.length, generation: 1, seq: session.retentionFloorSeq ?? 0 },
+			};
+		});
+	}
+
+	/** Simulates event-ring rotation through the supplied inclusive sequence. */
+	rotateTailThrough(sequence: number): void {
+		if (!Number.isSafeInteger(sequence) || sequence < 0) throw new Error("rotation sequence must be a non-negative safe integer");
+		this.update(session => {
+			const floor = Math.min(sequence, session.nextSeq);
+			session.retentionFloorSeq = Math.max(session.retentionFloorSeq ?? 0, floor);
+			session.events = session.events.filter(event => {
+				const eventSequence = event.seq;
+				return typeof eventSequence !== "number" || eventSequence > (session.retentionFloorSeq ?? 0);
+			});
+			session.gap = undefined;
 		});
 	}
 
