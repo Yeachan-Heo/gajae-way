@@ -208,10 +208,10 @@ if (!statePath) {
 	}
 
 	function operationReceipt(value, operation, opRef) {
+		// Mirrors the REAL broker receipt: {commandId, turnId, accepted, clientRef}.
+		// The real broker does NOT echo sessionId or operation (observed 2026-08-20).
 		return {
 			accepted: true,
-			sessionId: value.row.sessionId,
-			operation,
 			clientRef: opRef,
 			commandId: `command:${opRef}`,
 			turnId: `turn:${opRef}`,

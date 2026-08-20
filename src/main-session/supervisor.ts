@@ -136,13 +136,13 @@ export class ExternalHostSupervisor implements HostSupervisor {
 	constructor(options: ExternalHostSupervisorOptions) {
 		this.#broker = options.broker;
 		this.#workspace = path.resolve(options.workspace);
-		this.#tailTimeoutMs = options.tailTimeoutMs ?? 1_000;
-		this.#commandTimeoutMs = options.commandTimeoutMs ?? 5_000;
-		if (!Number.isSafeInteger(this.#tailTimeoutMs) || this.#tailTimeoutMs < 1 || this.#tailTimeoutMs > 20_000) {
-			throw new HostSupervisorError("tail_timeout_invalid", "tailTimeoutMs must be an integer in 1..=20000.");
+		this.#tailTimeoutMs = options.tailTimeoutMs ?? 3_000;
+		this.#commandTimeoutMs = options.commandTimeoutMs ?? 30_000;
+		if (!Number.isSafeInteger(this.#tailTimeoutMs) || this.#tailTimeoutMs < 1 || this.#tailTimeoutMs > 120_000) {
+			throw new HostSupervisorError("tail_timeout_invalid", "tailTimeoutMs must be an integer in 1..=120000.");
 		}
-		if (!Number.isSafeInteger(this.#commandTimeoutMs) || this.#commandTimeoutMs < 1 || this.#commandTimeoutMs > 20_000) {
-			throw new HostSupervisorError("command_timeout_invalid", "commandTimeoutMs must be an integer in 1..=20000.");
+		if (!Number.isSafeInteger(this.#commandTimeoutMs) || this.#commandTimeoutMs < 1 || this.#commandTimeoutMs > 120_000) {
+			throw new HostSupervisorError("command_timeout_invalid", "commandTimeoutMs must be an integer in 1..=120000.");
 		}
 	}
 

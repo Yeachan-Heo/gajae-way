@@ -26,7 +26,10 @@ function isSafeReason(value: unknown): value is string {
 function recordReason(value: unknown): string | undefined {
 	if (typeof value !== "object" || value === null) return undefined;
 	const reason = (value as { reason?: unknown }).reason;
-	return isSafeReason(reason) ? reason : undefined;
+	if (isSafeReason(reason)) return reason;
+	// Broker-layer errors carry machine codes (e.g. broker_dto_drift) in .code.
+	const code = (value as { code?: unknown }).code;
+	return isSafeReason(code) ? code : undefined;
 }
 
 function boundedDiagnosticText(value: string): string {

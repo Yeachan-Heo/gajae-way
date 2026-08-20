@@ -262,7 +262,8 @@ export class BrokerReconciler {
 	private applyMetadata(metadata: SessionMetadataV1): void {
 		this.core.registryApplyMetadata({
 			sessionId: metadata.sessionId,
-			name: metadata.name,
+			// The real broker omits name for unnamed sessions; the registry column stays non-null.
+			name: metadata.name ?? "",
 			cwd: metadata.cwd,
 			kind: metadata.kind,
 			observedAt: this.#now(),

@@ -33,7 +33,7 @@ export interface SdkSessionRowsV1 {
 
 export interface SessionMetadataV1 {
 	readonly sessionId: string;
-	readonly name: string;
+	readonly name?: string;
 	readonly cwd: string;
 	readonly kind: string;
 }
@@ -254,9 +254,14 @@ function parseRow(value: unknown, path: string): SdkSessionRowV1 {
 
 function successResult(stdout: string): Record<string, unknown> {
 	const envelope = record(parseJson(stdout, "$"), "$");
-	exactKeys(envelope, ["ok", "result"], "$");
+	// The broker emits two success envelopes: {ok,result} for typed commands and
+	// {type:"query_response",id,ok,page} for raw queries. Decorative envelope
+	// fields (type/id) are tolerated; authority fields below stay strict.
+	exactKeys(envelope, ["ok", "result", "type", "id", "page"], "$");
 	if (envelope.ok !== true) throw new BrokerDtoParseError("$.ok", "must be true");
-	return record(envelope.result, "$.result");
+	if (envelope.result !== undefined) return record(envelope.result, "$.result");
+	if (envelope.page !== undefined) return { page: envelope.page };
+	throw new BrokerDtoParseError("$", "success envelope carried neither result nor page");
 }
 
 /** Parses exactly the published `gjc sdk session list` stdout envelope. */
@@ -297,7 +302,7 @@ export function parseSessionInspect(stdout: string, expectedSessionId: string): 
 function metadataCandidate(result: Record<string, unknown>): unknown {
 	if (isRecord(result.page)) {
 		const page = result.page;
-		exactKeys(page, ["items", "complete", "nextCursor"], "$.result.page");
+		exactKeys(page, ["items", "complete", "nextCursor", "revision"], "$.result.page");
 		if (!Array.isArray(page.items) || page.items.length !== 1) {
 			throw new BrokerDtoParseError("$.result.page.items", "must contain exactly one metadata item");
 		}
@@ -312,7 +317,7 @@ export function parseSessionMetadata(stdout: string, expectedSessionId: string):
 	exactKeys(item, ["sessionId", "name", "cwd", "kind"], "$.result");
 	const metadata = {
 		sessionId: requiredString(item.sessionId, "$.result.sessionId"),
-		name: requiredString(item.name, "$.result.name"),
+		...(item.name === undefined ? {} : { name: requiredString(item.name, "$.result.name") }),
 		cwd: requiredString(item.cwd, "$.result.cwd"),
 		kind: requiredString(item.kind, "$.result.kind"),
 	};
@@ -407,16 +412,26 @@ function parseOperationReceipt(
 		if (result.status !== "accepted") throw new BrokerDtoParseError("$.result.status", "must be accepted");
 	}
 	if (candidate.accepted !== true) throw new BrokerDtoParseError(fromSend ? "$.result.receipt.accepted" : "$.result.accepted", "must be true");
-	const sessionId = requiredString(candidate.sessionId, fromSend ? "$.result.receipt.sessionId" : "$.result.sessionId");
-	if (sessionId !== expectedSessionId) throw new BrokerDtoParseError("$.result.sessionId", `expected ${expectedSessionId}`);
-	const operation = requiredString(candidate.operation, fromSend ? "$.result.receipt.operation" : "$.result.operation");
-	if (operation !== expectedOperation) throw new BrokerDtoParseError("$.result.operation", `expected ${expectedOperation}`);
+	// The real broker's receipt is {commandId, turnId, accepted, clientRef} - it
+	// does NOT echo sessionId or operation. Bind identity through clientRef
+	// (which must equal our operationRef); tolerate but verify echoes if present.
+	const sessionId = typeof candidate.sessionId === "string" ? candidate.sessionId : undefined;
+	if (sessionId !== undefined && sessionId !== expectedSessionId) {
+		throw new BrokerDtoParseError("$.result.sessionId", `expected ${expectedSessionId}`);
+	}
+	const operation = typeof candidate.operation === "string" ? candidate.operation : undefined;
+	if (operation !== undefined && operation !== expectedOperation) {
+		throw new BrokerDtoParseError("$.result.operation", `expected ${expectedOperation}`);
+	}
 	const clientRef = typeof candidate.clientRef === "string" ? candidate.clientRef : undefined;
-	if (clientRef !== undefined && clientRef !== expectedOperationRef) {
+	if (fromSend) {
+		if (clientRef === undefined) throw new BrokerDtoParseError("$.result.receipt.clientRef", "must be present");
+		if (clientRef !== expectedOperationRef) throw new BrokerDtoParseError("$.result.receipt.clientRef", `expected ${expectedOperationRef}`);
+	} else if (clientRef !== undefined && clientRef !== expectedOperationRef) {
 		throw new BrokerDtoParseError("$.result.clientRef", `expected ${expectedOperationRef}`);
 	}
 	return {
-		sessionId,
+		sessionId: expectedSessionId,
 		operation: expectedOperation,
 		operationRef: expectedOperationRef,
 		...(typeof candidate.commandId === "string" && candidate.commandId ? { commandId: candidate.commandId } : {}),
