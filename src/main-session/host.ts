@@ -216,6 +216,7 @@ class ExternalMainSessionHost implements MainSessionHost {
 	#activeAttempt: MainSessionTurnJournalPayload | undefined;
 	#nextAttempt = 0;
 	readonly #finalizedAssistantMessageKeys = new Set<string>();
+	#transcriptBaselineSeeded = false;
 	readonly #journaledAttemptTransitions = new Map<string, JournaledAttemptTransitions>();
 	readonly #admittedOperations = new Map<string, "prompt" | "steer" | "follow_up">();
 	readonly #seenTailEvents = new Set<string>();
@@ -468,6 +469,16 @@ class ExternalMainSessionHost implements MainSessionHost {
 		if (type === "message_end") this.appendFinalAssistantMessage(event, `event:${eventString(event, "__tail_id") ?? JSON.stringify(event)}`);
 	}
 
+	private seedTranscriptBaseline(entries: readonly unknown[]): void {
+		this.#transcriptBaselineSeeded = true;
+		for (const [index, entry] of entries.entries()) {
+			if (!isRecord(entry)) continue;
+			const event = isRecord(entry.message) ? entry.message : entry;
+			const finalized = finalizedAssistantMessage(event, `transcript:${index}:${JSON.stringify(entry)}`);
+			if (finalized) this.#finalizedAssistantMessageKeys.add(finalized.key);
+		}
+	}
+
 	private observeTranscript(entries: readonly unknown[]): void {
 		for (const [index, entry] of entries.entries()) {
 			if (!isRecord(entry)) continue;
@@ -569,13 +580,28 @@ class ExternalMainSessionHost implements MainSessionHost {
 				const tail = await this.#supervisor.tailEvents();
 				if (this.#disposed) return;
 				transientFailures = 0;
-				const priorTranscriptEntries = this.#identity.transcript?.entryCount ?? 0;
 				this.observeIdentity(tail.identity);
 				const adoptionGap = this.observeRetentionGap(tail);
 				if (!adoptionGap) {
 					const events = tail.events.filter(event => this.shouldProjectTailEvent(event));
 					const revision = Math.max(tail.checkpoint?.revision ?? 0, this.#tailCheckpoint?.revision ?? 0);
+					// A finalized reply travels as a transcript entry while the lifecycle
+					// travels as ring events. Project the batch's transcript BEFORE its
+					// terminal event so consumers observe turn_start -> assistant_message
+					// -> turn_end, never a reply after the turn already closed.
+					let transcriptProjected = false;
+					const projectTranscript = (): void => {
+						if (transcriptProjected) return;
+						transcriptProjected = true;
+						if (this.#transcriptBaselineSeeded) this.observeTranscript(tail.transcriptEntries);
+						else this.seedTranscriptBaseline(tail.transcriptEntries);
+					};
 					for (const event of events) {
+						const type = externalEvent(event).type;
+						if (type === "agent_end" || type === "turn_end") {
+							projectTranscript();
+							if (this.#failure) return;
+						}
 						const checkpoint = sourceCheckpoint(event, revision);
 						this.#journalTailCheckpoint = checkpoint;
 						try {
@@ -587,8 +613,9 @@ class ExternalMainSessionHost implements MainSessionHost {
 						this.advanceTailCheckpointTo(checkpoint);
 					}
 					if (this.#failure) return;
-					this.observeTranscript(tail.transcriptEntries.slice(priorTranscriptEntries));
+					projectTranscript();
 					if (this.#failure) return;
+
 					// Projection is synchronous. Persist only after every journal append in
 					// this tail response has committed, so an interrupted poll replays.
 					this.advanceTailCheckpoint(tail, events);

@@ -595,7 +595,13 @@ export class BrokerCli {
 		if (options.strict === true) args.push("--strict");
 		if (options.allEvents === true) args.push("--all-events");
 		args.push(...timeoutArgument(options.timeoutMs));
-		const stdout = await this.run(args, options.timeoutMs);
+		// --timeout-ms bounds the broker-side tail WAIT WINDOW. The process
+		// deadline must additionally cover real CLI startup (~5s cold on this
+		// hardware), or every tail dies as broker_command_timeout before the CLI
+		// can even reach the broker (observed live: a 3s window with a 3s process
+		// deadline degraded the daemon permanently while manual tails succeeded).
+		const processDeadlineMs = options.timeoutMs === undefined ? undefined : options.timeoutMs + 30_000;
+		const stdout = await this.run(args, processDeadlineMs);
 		return parseTailEnvelope(stdout, sessionId);
 	}
 
