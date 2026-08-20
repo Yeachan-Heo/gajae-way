@@ -96,7 +96,7 @@ export interface GrowthIntent {
 	readonly startedAt: number;
 }
 
-/** Durable broker-tail watermark. It is a record, not a broker cursor token. */
+/** Durable broker-tail envelope record; only its `(generation, seq)` pair is a watermark coordinate. */
 export interface TailCheckpoint {
 	readonly revision: number;
 	readonly generation: number;
@@ -112,11 +112,10 @@ export interface TranscriptDeliveryProgress {
 /** Whether the durable adopted identity has a complete transcript fingerprint. */
 export type TranscriptProof = "pending" | "proven";
 
-/** Compares broker-tail watermarks within their event generation. */
+/** Lexicographically compares the broker-tail `(generation, seq)` watermark pair. */
 export function compareTailCheckpoints(left: TailCheckpoint, right: TailCheckpoint): number {
 	if (left.generation !== right.generation) return left.generation < right.generation ? -1 : 1;
 	if (left.seq !== right.seq) return left.seq < right.seq ? -1 : 1;
-	if (left.revision !== right.revision) return left.revision < right.revision ? -1 : 1;
 	return 0;
 }
 
@@ -704,10 +703,10 @@ export class GatewayStateStore {
 	}
 
 
-	/** Atomically records an established ring rotation and advances its non-authoritative watermark. */
+	/** Atomically records a retention floor that advanced beyond the established tail coordinate. */
 	recordTailRingRotation(previous: TailCheckpoint, resync: TailCheckpoint): void {
-		if (previous.generation !== resync.generation || resync.seq <= previous.seq) {
-			throw new GatewayStateError("tail_ring_rotation_invalid", "A ring rotation must advance within the established tail generation.");
+		if (compareTailCheckpoints(resync, previous) <= 0) {
+			throw new GatewayStateError("tail_ring_rotation_invalid", "A ring rotation resync must advance the established tail coordinate.");
 		}
 		const state = this.read();
 		if (state.tailRingRotationCount >= Number.MAX_SAFE_INTEGER) {

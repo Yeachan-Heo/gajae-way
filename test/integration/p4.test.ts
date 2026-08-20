@@ -189,13 +189,80 @@ externalTest("pending busy adoption binds its first complete tail as an unprojec
 	}
 }, 30_000);
 
-externalTest("busy ring rotation resyncs without losing transcript delivery or subsequent admission", async () => {
+externalTest("successive attempt generations project once and settle as ordered tail coordinates", async () => {
+	const gateway = await hosted({ tailTimeoutMs: 50 });
+	const rounds = [
+		{ text: "first generation", idempotencyKey: "generation-one", reply: "first generation reply", generation: 1 },
+		{ text: "second generation", idempotencyKey: "generation-two", reply: "second generation reply", generation: 2 },
+	] as const;
+
+	for (const round of rounds) {
+		gateway.fixture.holdNextTurn();
+		const accepted = await gateway.client.request("main.submit", {
+			text: round.text,
+			surface_id: "owner",
+			idempotency_key: round.idempotencyKey,
+		});
+		expect(accepted.result).toMatchObject({ accepted: true, delivered_as: "prompt" });
+		const opRef = (accepted.result as { op_ref: string }).op_ref;
+		await waitForBusyStatus(gateway);
+		gateway.fixture.complete(opRef, { text: round.reply });
+		await eventually(
+			() =>
+				gateway.core.journalRead("1:0", 100).events.some(event => event.kind === "assistant_message" && event.payloadJson.includes(round.reply))
+					? true
+					: undefined,
+			`generation ${round.generation} transcript reply did not project`,
+		);
+		await eventually(() => (gateway.host.turnState === "idle" ? true : undefined), `generation ${round.generation} did not settle`);
+		expect(gateway.state.read().tailCheckpoint).toMatchObject({ generation: round.generation, seq: 5 });
+	}
+
+	const lifecycle = gateway.core.journalRead("1:0", 100).events.filter(event => event.kind === "turn_start" || event.kind === "turn_end");
+	const starts = lifecycle.filter(event => event.kind === "turn_start").map(event => JSON.parse(event.payloadJson));
+	const ends = lifecycle.filter(event => event.kind === "turn_end").map(event => JSON.parse(event.payloadJson));
+	expect(starts.map(payload => payload.generation)).toEqual([1, 2]);
+	expect(ends.map(payload => payload.generation)).toEqual([1, 2]);
+	for (const round of rounds) {
+		expect(
+			gateway.core.journalRead("1:0", 100).events.filter(event => event.kind === "assistant_message" && event.payloadJson.includes(round.reply)),
+		).toHaveLength(1);
+	}
+	expect(gateway.state.read()).toMatchObject({
+		bootstrapState: "COMMITTED",
+		failedClosedReason: undefined,
+		tailCheckpoint: { generation: 2, seq: 5 },
+		tailRingRotationCount: 0,
+	});
+	expect(gateway.core.journalRead("1:0", 100).events.filter(event => event.kind === "tail_ring_rotation")).toHaveLength(0);
+	expect(gateway.host.degraded).toBe(false);
+}, 30_000);
+
+externalTest("busy ring rotation across an attempt-generation boundary resyncs without losing transcript delivery", async () => {
 	const gateway = await hosted({ tailTimeoutMs: 50 });
 	gateway.fixture.setNoEnvelopeWhileBusy();
 	gateway.fixture.holdNextTurn();
+	const primer = await gateway.client.request("main.submit", {
+		text: "advance the first attempt generation",
+		surface_id: "owner",
+		idempotency_key: "rotation-generation-primer",
+	});
+	const primerOpRef = (primer.result as { op_ref: string }).op_ref;
+	expect(primer.result).toMatchObject({ accepted: true, delivered_as: "prompt" });
+	await waitForBusyStatus(gateway);
+	gateway.fixture.complete(primerOpRef, { text: "first-generation terminal reply" });
+	await eventually(
+		() =>
+			gateway.state.read().tailCheckpoint?.generation === 1 && gateway.state.read().tailCheckpoint?.seq === 5
+				? true
+				: undefined,
+		"first attempt did not establish its generation-one tail watermark",
+	);
+	await eventually(() => (gateway.host.turnState === "idle" ? true : undefined), "first attempt did not settle before the generation-boundary rotation");
 
+	gateway.fixture.holdNextTurn();
 	const first = await gateway.client.request("main.submit", {
-		text: "rotate this busy ring",
+		text: "rotate this busy ring across generation boundary",
 		surface_id: "owner",
 		idempotency_key: "busy-ring-rotation",
 	});
@@ -214,8 +281,8 @@ externalTest("busy ring rotation resyncs without losing transcript delivery or s
 		"busy-turn ring rotation was not journaled",
 	);
 	expect(JSON.parse(rotation.payloadJson)).toEqual({
-		prior_watermark: { revision: 2, generation: 1, seq: 0 },
-		resync_point: { revision: 4, generation: 1, seq: 5 },
+		prior_watermark: { revision: 4, generation: 1, seq: 5 },
+		resync_point: { revision: 6, generation: 2, seq: 5 },
 	});
 	await eventually(
 		() =>
@@ -234,7 +301,7 @@ externalTest("busy ring rotation resyncs without losing transcript delivery or s
 
 	gateway.fixture.holdNextTurn();
 	const second = await gateway.client.request("main.submit", {
-		text: "admission still works after rotation",
+		text: "admission still works after cross-generation rotation",
 		surface_id: "owner",
 		idempotency_key: "post-ring-rotation",
 	});

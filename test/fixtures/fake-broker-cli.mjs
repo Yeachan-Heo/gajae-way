@@ -124,15 +124,37 @@ if (!statePath) {
 		state.indexSeq = (state.indexSeq ?? 1) + heartbeatRows;
 	}
 
-	function nextSequence(value) {
-		value.nextSeq = (value.nextSeq ?? 0) + 1;
-		return value.nextSeq;
+	function compareTailCoordinates(left, right) {
+		if (left.generation !== right.generation) return left.generation < right.generation ? -1 : 1;
+		if (left.seq !== right.seq) return left.seq < right.seq ? -1 : 1;
+		return 0;
+	}
+
+	function eventIsAfter(event, checkpoint) {
+		return (
+			typeof event.generation !== "number" ||
+			typeof event.seq !== "number" ||
+			event.generation > checkpoint.generation ||
+			(event.generation === checkpoint.generation && event.seq > checkpoint.seq)
+		);
+	}
+
+	function nextSequence(value, generation) {
+		value.nextSequenceByGeneration ??= {};
+		const key = String(generation);
+		const sequence = (value.nextSequenceByGeneration[key] ?? 0) + 1;
+		value.nextSequenceByGeneration[key] = sequence;
+		return sequence;
 	}
 
 	function appendEvent(value, kind, payload) {
-		const seq = nextSequence(value);
+		const scopedGeneration = payload?.scope?.generation;
+		const generation = Number.isSafeInteger(scopedGeneration) ? scopedGeneration : value.tailCheckpoint.generation;
+		const seq = nextSequence(value, generation);
+		value.nextEventId = (value.nextEventId ?? 0) + 1;
+		value.tailCheckpoint = { generation, seq };
 		value.events ??= [];
-		value.events.push({ kind, id: `${value.row.sessionId}:${seq}`, generation: 1, seq, payload });
+		value.events.push({ kind, id: `${value.row.sessionId}:${generation}:${seq}:${value.nextEventId}`, generation, seq, payload });
 	}
 
 	function appendTranscript(value, payload) {
@@ -184,7 +206,7 @@ if (!statePath) {
 			role: "assistant",
 			content: [{ type: "text", text }],
 			responseId,
-			timestamp: operation.timestamp ?? 1_700_000_000_000 + (value.nextSeq ?? 0),
+			timestamp: operation.timestamp ?? 1_700_000_000_000 + (value.nextEventId ?? 0),
 		};
 		appendTranscript(value, { type: "message", role: "assistant", content: text, responseId, timestamp: message.timestamp });
 		appendEvent(value, "turn_end", { type: "turn_end", message, toolResults: [], scope });
@@ -269,11 +291,11 @@ if (!statePath) {
 				completeOperation(value, operation);
 				if (value.rotateRingDuringNextCompletion === true) {
 					delete value.rotateRingDuringNextCompletion;
-					const floor = value.nextSeq ?? 0;
-					value.retentionFloorSeq = Math.max(value.retentionFloorSeq ?? 0, floor);
-					value.events = (value.events ?? []).filter(
-						event => typeof event.seq !== "number" || event.seq > (value.retentionFloorSeq ?? 0),
-					);
+					const priorFloor = value.retentionFloor;
+					const checkpoint = value.tailCheckpoint;
+					const floor = !priorFloor || compareTailCoordinates(checkpoint, priorFloor) > 0 ? checkpoint : priorFloor;
+					value.retentionFloor = floor;
+					value.events = (value.events ?? []).filter(event => eventIsAfter(event, floor));
 					value.gap = undefined;
 				}
 				changed = true;
@@ -337,17 +359,17 @@ if (!statePath) {
 				// would need here. Do not accept an invented record-shaped cursor.
 				fail("invalid_cursor", "fixture tail cannot validate an unavailable checkpoint token");
 			} else {
-				const retentionFloorSeq = Number.isSafeInteger(value.retentionFloorSeq) ? value.retentionFloorSeq : 0;
+				const retentionFloor = value.retentionFloor;
 				const gap =
 					value.gap ??
-					(retentionFloorSeq > 0
+					(retentionFloor
 						? {
 								code: "retention_gap",
-								missing: { from: 0, to: retentionFloorSeq },
+								missing: { from: 0, to: retentionFloor.seq },
 								resync: {
 									revision: value.transcript?.length ?? 0,
-									generation: 1,
-									seq: retentionFloorSeq,
+									generation: retentionFloor.generation,
+									seq: retentionFloor.seq,
 								},
 							}
 						: undefined);
@@ -356,14 +378,18 @@ if (!statePath) {
 				} else {
 					const items = [
 						...(value.transcript ?? []).map(entry => ({ kind: "transcript", id: entry.id, payload: entry.payload })),
-						...(value.events ?? []).filter(event => typeof event.seq !== "number" || event.seq > retentionFloorSeq),
+						...(value.events ?? []).filter(event => retentionFloor === undefined || eventIsAfter(event, retentionFloor)),
 					];
 					const terminal = value.context?.isStreaming !== true && (value.context?.followupQueueDepth ?? 0) === 0;
 					success({
 						version: 1,
 						source: "session",
 						session: value.row,
-						checkpoint: { revision: value.transcript?.length ?? 0, generation: 1, seq: value.nextSeq ?? 0 },
+						checkpoint: {
+							revision: value.transcript?.length ?? 0,
+							generation: value.tailCheckpoint.generation,
+							seq: value.tailCheckpoint.seq,
+						},
 						...(gap === undefined ? {} : { gap }),
 						items,
 						terminal,

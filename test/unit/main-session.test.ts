@@ -5,7 +5,7 @@ import { BrokerCli, BrokerDtoParseError, parseSessionCheckpoint } from "../../sr
 import { BootstrapError, bootstrapMainSession } from "../../src/main-session/bootstrap";
 import { createMainSessionHost } from "../../src/main-session/host";
 import { ResumeError, strictResumeMainSession } from "../../src/main-session/resume";
-import { GatewayStateStore } from "../../src/main-session/state";
+import { compareTailCheckpoints, GatewayStateStore } from "../../src/main-session/state";
 import { createExternalHostSupervisor, type HostSupervisor, type SupervisorTailEvents } from "../../src/main-session/supervisor";
 import { loadWayProfile } from "../../src/profile";
 import { FakeBrokerFixture, MemoryGatewayMeta } from "../helpers/main-session";
@@ -106,6 +106,12 @@ test.serial("bootstrap adopts and persists the exact live external identity with
 		{ kind: "tail_adoption_start", payloadJson: JSON.stringify({ checkpoint: { revision: 2, generation: 1, seq: 0 } }) },
 	]);
 	expect(fixture.commands()).toEqual([]);
+});
+
+test("tail checkpoint ordering is lexicographic by generation then sequence, independent of revision", () => {
+	expect(compareTailCheckpoints({ revision: 999, generation: 2, seq: 0 }, { revision: 0, generation: 1, seq: 999 })).toBeGreaterThan(0);
+	expect(compareTailCheckpoints({ revision: 1, generation: 2, seq: 4 }, { revision: 999, generation: 2, seq: 5 })).toBeLessThan(0);
+	expect(compareTailCheckpoints({ revision: 1, generation: 2, seq: 5 }, { revision: 999, generation: 2, seq: 5 })).toBe(0);
 });
 
 test.serial("bootstrap commits a pending proof when the bounded tail has no envelope", async () => {

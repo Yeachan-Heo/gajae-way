@@ -221,7 +221,6 @@ const FATAL_EXTERNAL_IDENTITY_REASONS = new Set([
 	"growth_intent_mismatch",
 	"main_identity_mismatch",
 	"tail_resync_unavailable",
-	"tail_generation_changed",
 	"transcript_proof_invalid",
 	"transcript_proof_mismatch",
 	"transcript_proof_persist_failed",
@@ -725,26 +724,21 @@ class ExternalMainSessionHost implements MainSessionHost {
 	}
 
 	/**
-	 * The ring is an advisory lifecycle projection channel. A retention gap can
-	 * skip routine busy-turn chatter; the transcript delivery chain remains the
-	 * authoritative loss detector. Persist a visible rotation and resume from
-	 * the broker's resync point instead of failing closed.
+	 * The ring is an advisory lifecycle projection channel. Its coordinate is
+	 * the lexicographic `(generation, seq)` pair: a new attempt generation is
+	 * normal progression, while only a retention floor beyond that pair signals
+	 * lifecycle loss. The transcript delivery chain remains the authority for
+	 * content loss.
 	 */
 	private establishProjectionBoundary(tail: SupervisorTailEvents): boolean {
 		const previous = this.#tailCheckpoint;
 		if (previous) {
-			if (tail.checkpoint && tail.checkpoint.generation !== previous.generation) {
-				throw new HostSupervisorError("tail_generation_changed", "Broker tail checkpoint generation changed after adoption.");
-			}
 			if (!tail.retentionGap) return false;
 			const resync = tail.resyncCheckpoint;
 			if (!resync) {
 				throw new HostSupervisorError("tail_resync_unavailable", "Broker tail reported a retention gap without a resync checkpoint.");
 			}
-			if (resync.generation !== previous.generation) {
-				throw new HostSupervisorError("tail_generation_changed", "Broker tail resync generation changed after adoption.");
-			}
-			if (resync.seq <= previous.seq) return false;
+			if (compareTailCheckpoints(resync, previous) <= 0) return false;
 			try {
 				this.#state.recordTailRingRotation(previous, resync);
 			} catch (error) {
@@ -773,23 +767,20 @@ class ExternalMainSessionHost implements MainSessionHost {
 	private shouldProjectTailEvent(event: SupervisorEvent): boolean {
 		const checkpoint = this.#tailCheckpoint;
 		if (!checkpoint || event.generation === undefined || event.seq === undefined) return true;
-		if (event.generation < checkpoint.generation) return false;
-		if (event.generation > checkpoint.generation) {
-			throw new HostSupervisorError("tail_generation_changed", "Broker tail event generation changed after adoption.");
-		}
-		return event.seq > checkpoint.seq;
+		return event.generation > checkpoint.generation || (event.generation === checkpoint.generation && event.seq > checkpoint.seq);
 	}
 
 	private checkpointAfterTail(tail: SupervisorTailEvents, events: readonly SupervisorEvent[]): TailCheckpoint | undefined {
 		const previous = this.#tailCheckpoint;
 		const revision = Math.max(tail.checkpoint?.revision ?? 0, previous?.revision ?? 0);
 		let checkpoint = previous;
+		if (tail.checkpoint && (!checkpoint || compareTailCheckpoints(tail.checkpoint, checkpoint) > 0)) checkpoint = tail.checkpoint;
 		for (const event of events) {
 			const candidate = sourceCheckpoint(event, revision);
 			if (!candidate) continue;
 			if (!checkpoint || compareTailCheckpoints(candidate, checkpoint) > 0) checkpoint = candidate;
 		}
-		if (!checkpoint) return tail.checkpoint;
+		if (!checkpoint) return undefined;
 		if (checkpoint.revision === revision) return checkpoint;
 		return { ...checkpoint, revision };
 	}
@@ -816,7 +807,7 @@ class ExternalMainSessionHost implements MainSessionHost {
 		if (!terminalCheckpoint) return false;
 		const admittedAt = admission.admittedAt;
 		if (!admittedAt) return true;
-		return terminalCheckpoint.generation === admittedAt.generation && compareTailCheckpoints(terminalCheckpoint, admittedAt) > 0;
+		return compareTailCheckpoints(terminalCheckpoint, admittedAt) > 0;
 	}
 
 	private settleTerminalTail(tail: SupervisorTailEvents): void {

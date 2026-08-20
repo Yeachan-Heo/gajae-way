@@ -65,6 +65,11 @@ interface FixtureTranscriptEntry {
 	readonly payload: unknown;
 }
 
+interface FixtureTailCoordinate {
+	readonly generation: number;
+	readonly seq: number;
+}
+
 interface FixtureSession {
 	row: Record<string, unknown>;
 	metadata: Record<string, unknown>;
@@ -72,15 +77,17 @@ interface FixtureSession {
 	transcript: FixtureTranscriptEntry[];
 	events: Array<Record<string, unknown>>;
 	operations: Record<string, FixtureOperation>;
-	nextSeq: number;
+	tailCheckpoint: FixtureTailCoordinate;
 	nextGeneration: number;
+	nextSequenceByGeneration: Record<string, number>;
+	nextEventId: number;
 	nextTranscriptId: number;
 	gap?: {
 		readonly code: "retention_gap";
 		readonly missing?: { readonly from: number; readonly to: number };
 		readonly resync?: { readonly revision: number; readonly generation: number; readonly seq: number };
 	};
-	retentionFloorSeq?: number;
+	retentionFloor?: FixtureTailCoordinate;
 
 	holdNext?: boolean;
 	failNext?: boolean;
@@ -151,10 +158,11 @@ export class FakeBrokerFixture {
 			],
 			events: [],
 			operations: {},
-			nextSeq: 0,
+			tailCheckpoint: { generation: 1, seq: 0 },
 			nextGeneration: 1,
+			nextSequenceByGeneration: {},
+			nextEventId: 0,
 			nextTranscriptId: 2,
-			retentionFloorSeq: 0,
 
 			responseText: options.responseText,
 			tailTimeoutWhileBusy: options.noEnvelopeWhileBusy,
@@ -247,22 +255,37 @@ export class FakeBrokerFixture {
 	/** Forces a resynchronizable gap without inventing a broker cursor token. */
 	setRetentionGap(): void {
 		this.update(session => {
+			const resync = session.retentionFloor ?? session.tailCheckpoint;
 			session.gap = {
 				code: "retention_gap",
-				resync: { revision: session.transcript.length, generation: 1, seq: session.retentionFloorSeq ?? 0 },
+				resync: { revision: session.transcript.length, generation: resync.generation, seq: resync.seq },
 			};
 		});
 	}
 
-	/** Simulates event-ring rotation through the supplied inclusive sequence. */
+	/** Simulates event-ring rotation through the supplied sequence in the current generation. */
 	rotateTailThrough(sequence: number): void {
 		if (!Number.isSafeInteger(sequence) || sequence < 0) throw new Error("rotation sequence must be a non-negative safe integer");
 		this.update(session => {
-			const floor = Math.min(sequence, session.nextSeq);
-			session.retentionFloorSeq = Math.max(session.retentionFloorSeq ?? 0, floor);
+			const candidate: FixtureTailCoordinate = {
+				generation: session.tailCheckpoint.generation,
+				seq: Math.min(sequence, session.tailCheckpoint.seq),
+			};
+			const existing = session.retentionFloor;
+			const floor =
+				existing && (existing.generation > candidate.generation || (existing.generation === candidate.generation && existing.seq >= candidate.seq))
+					? existing
+					: candidate;
+			session.retentionFloor = floor;
 			session.events = session.events.filter(event => {
+				const generation = event.generation;
 				const eventSequence = event.seq;
-				return typeof eventSequence !== "number" || eventSequence > (session.retentionFloorSeq ?? 0);
+				return (
+					typeof generation !== "number" ||
+					typeof eventSequence !== "number" ||
+					generation > floor.generation ||
+					(generation === floor.generation && eventSequence > floor.seq)
+				);
 			});
 			session.gap = undefined;
 		});
@@ -302,15 +325,20 @@ export class FakeBrokerFixture {
 		});
 	}
 
-	/** Adds one broker-tail event for projection tests, preserving the fixture event sequence. */
+	/** Adds one broker-tail event for projection tests in the current ring generation. */
 	appendTailEvent(kind: string, payload: Record<string, unknown>): void {
 		this.update(session => {
-			session.nextSeq += 1;
+			const generation = session.tailCheckpoint.generation;
+			const key = String(generation);
+			const seq = (session.nextSequenceByGeneration[key] ?? 0) + 1;
+			session.nextSequenceByGeneration[key] = seq;
+			session.nextEventId += 1;
+			session.tailCheckpoint = { generation, seq };
 			session.events.push({
 				kind,
-				id: `${this.sessionId}:${session.nextSeq}`,
-				generation: 1,
-				seq: session.nextSeq,
+				id: `${this.sessionId}:${generation}:${seq}:${session.nextEventId}`,
+				generation,
+				seq,
 				payload,
 			});
 		});
