@@ -22,6 +22,7 @@ const defaults: Record<string, string> = {
 	failed_closed_reason: "null",
 	tail_checkpoint: "null",
 	tail_ring_rotation_count: "0",
+	transcript_delivery_gap_count: "0",
 	transcript_delivery_progress: "null",
 	transcript_proof: "pending",
 
@@ -91,6 +92,7 @@ interface FixtureSession {
 
 	holdNext?: boolean;
 	failNext?: boolean;
+	rejectNext?: { readonly code: string; readonly message: string };
 	responseText?: string;
 	tailTimeoutWhileBusy?: boolean;
 	rotateRingDuringNextCompletion?: boolean;
@@ -243,6 +245,13 @@ export class FakeBrokerFixture {
 	failNextTurn(): void {
 		this.update(session => {
 			session.failNext = true;
+		});
+	}
+
+	/** Makes the next admission receive an explicit broker `ok:false` rejection envelope. */
+	rejectNextTurn(code = "broker_rejected", message = "fixture broker rejected the admission"): void {
+		this.update(session => {
+			session.rejectNext = { code, message };
 		});
 	}
 

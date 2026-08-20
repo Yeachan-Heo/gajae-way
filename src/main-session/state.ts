@@ -18,6 +18,7 @@ export const GATEWAY_META_KEYS = [
 	"failed_closed_reason",
 	"tail_checkpoint",
 	"tail_ring_rotation_count",
+	"transcript_delivery_gap_count",
 	"transcript_delivery_progress",
 	"transcript_proof",
 
@@ -134,6 +135,7 @@ export interface DurableGatewayState {
 	readonly failedClosedReason: string | undefined;
 	readonly tailCheckpoint: TailCheckpoint | undefined;
 	readonly tailRingRotationCount: number;
+	readonly transcriptDeliveryGapCount: number;
 	readonly transcriptDeliveryProgress: TranscriptDeliveryProgress | undefined;
 	readonly transcriptProof: TranscriptProof;
 
@@ -282,6 +284,14 @@ function parseTailRingRotationCount(raw: string): number {
 	return count;
 }
 
+function parseTranscriptDeliveryGapCount(raw: string): number {
+	const count = Number(raw);
+	if (!Number.isSafeInteger(count) || count < 0) {
+		throw new GatewayStateError("metadata_invalid", "transcript_delivery_gap_count is invalid.");
+	}
+	return count;
+}
+
 function parseOptionalTranscriptDeliveryProgress(raw: string | undefined): TranscriptDeliveryProgress | undefined {
 	if (raw === undefined || raw === "null") return undefined;
 	const value = parseNullableJson(raw, "transcript_delivery_progress");
@@ -364,6 +374,7 @@ function parsedState(values: ReadonlyMap<string, string>): DurableGatewayState {
 		failedClosedReason: parseOptionalStringJson(requiredMeta(values, "failed_closed_reason"), "failed_closed_reason"),
 		tailCheckpoint: parseOptionalTailCheckpoint(values.get("tail_checkpoint")),
 		tailRingRotationCount: parseTailRingRotationCount(requiredMeta(values, "tail_ring_rotation_count")),
+		transcriptDeliveryGapCount: parseTranscriptDeliveryGapCount(requiredMeta(values, "transcript_delivery_gap_count")),
 		transcriptDeliveryProgress,
 		transcriptProof,
 	};
@@ -510,6 +521,7 @@ export class GatewayStateStore {
 				{ key: "failed_closed_reason", value: "null" },
 				{ key: "tail_checkpoint", value: ringCheckpoint === undefined ? "null" : tailCheckpointJson(ringCheckpoint) },
 				{ key: "tail_ring_rotation_count", value: "0" },
+				{ key: "transcript_delivery_gap_count", value: "0" },
 				{ key: "transcript_delivery_progress", value: transcriptDeliveryProgressJson(transcriptDeliveryProgress) },
 				{ key: "transcript_proof", value: transcriptProof },
 			],
@@ -621,7 +633,7 @@ export class GatewayStateStore {
 	}
 
 
-	/** Atomically journals a finalized transcript projection and its durable replay point. */
+	/** Atomically journals a transcript projection, its delivery replay point, and any detected delivery gap. */
 	appendTranscriptProjection(
 		expectedTail: TailCheckpoint | undefined,
 		checkpoint: TailCheckpoint,
@@ -633,16 +645,22 @@ export class GatewayStateStore {
 		if (expectedTail && compareTailCheckpoints(checkpoint, expectedTail) < 0) {
 			throw new GatewayStateError("tail_checkpoint_regression", "Broker-tail checkpoint regressed.");
 		}
+		const state = kind === "transcript_delivery_gap" ? this.read() : undefined;
+		if (state && state.transcriptDeliveryGapCount >= Number.MAX_SAFE_INTEGER) {
+			throw new GatewayStateError("transcript_delivery_gap_overflow", "The durable transcript delivery-gap count overflowed.");
+		}
 		this.transact({
 			expected: [
 				{ key: "bootstrap_state", value: "COMMITTED" },
 				{ key: "transcript_proof", value: "proven" },
 				...(expectedTail === undefined ? [] : [{ key: "tail_checkpoint", value: tailCheckpointJson(expectedTail) }]),
 				{ key: "transcript_delivery_progress", value: transcriptDeliveryProgressJson(expectedDelivery) },
+				...(state === undefined ? [] : [{ key: "transcript_delivery_gap_count", value: String(state.transcriptDeliveryGapCount) }]),
 			],
 			puts: [
 				{ key: "tail_checkpoint", value: tailCheckpointJson(checkpoint) },
 				{ key: "transcript_delivery_progress", value: transcriptDeliveryProgressJson(nextDelivery) },
+				...(state === undefined ? [] : [{ key: "transcript_delivery_gap_count", value: String(state.transcriptDeliveryGapCount + 1) }]),
 			],
 			deletes: [],
 			eventKind: kind,

@@ -33,7 +33,7 @@ export declare class WayCore {
    */
   setRpcHealth(state: string, reason?: string | undefined | null): void
   /** Publishes live main-session state after strict resume for `way.status`. */
-  setMainSessionStatus(turnState: string, followUpQueueDepth: number): void
+  setMainSessionStatus(turnState: string, followUpQueueDepth: number, verificationState: string): void
   /** Clears process-local resume facts once the hosted main session is gone. */
   resetMainSessionStatus(): void
   /** Marks journal-derived delivery as halted after a synchronous append failure. */
@@ -112,6 +112,8 @@ export declare class WayCore {
   mainAdmissionOperationClaim(input: MainAdmissionOperationClaimInput): MainAdmissionOperationClaimOutput
   /** Finalizes a broker-accepted main admission without changing its operation reference. */
   mainAdmissionOperationFinalize(input: MainAdmissionOperationFinalizeInput): MainAdmissionOperationFinalizeOutput
+  /** Atomically abandons a definitively broker-rejected pre-effect admission claim. */
+  mainAdmissionOperationAbandon(input: MainAdmissionOperationAbandonInput): void
   /** Returns unresolved pre-effect admissions for startup recovery only. */
   mainAdmissionOperationsPending(): Array<PendingMainAdmissionOperationOutput>
 }
@@ -339,6 +341,13 @@ export interface LockStatusOutput {
   queue: Array<QueueEntryOutput>
   stuck: boolean
   quarantined: boolean
+}
+
+export interface MainAdmissionOperationAbandonInput {
+  scope: string
+  key: string
+  requestJson: string
+  intentJson: string
 }
 
 export interface MainAdmissionOperationClaimInput {

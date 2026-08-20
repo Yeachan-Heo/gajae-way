@@ -815,6 +815,50 @@ externalTest("cockpit status pane renders lock quarantine and reconcile state fr
 	}
 }, 15_000);
 
+externalTest("cockpit renders durable-tail loss notices as warnings and exposes them in journal filters", async () => {
+	const active = await gateway();
+	const recorded = recordingClient(active.client);
+	const terminal = controlledTerminal();
+	const running = runWayConsole(
+		{ stateDir: active.stateDirectory, profilePath: active.profilePath },
+		[],
+		{ terminal: terminal.terminal, rpcConnect: async () => recorded.rpc, statusPollMs: 25 },
+	);
+	try {
+		await eventually(() => (terminal.isReading() ? true : undefined), "cockpit did not begin reading input");
+		active.core.journalAppend(
+			"tail_ring_rotation",
+			JSON.stringify({ prior_watermark: { generation: 1, seq: 4 }, resync_point: { generation: 2, seq: 1 } }),
+		);
+		active.core.journalAppend(
+			"transcript_delivery_gap",
+			JSON.stringify({ reason: "transcript_delivery_unprovable", delivered_through_entry_id: "entry-4" }),
+		);
+		await eventually(
+			() => (terminal.writes.some(write => write.includes("WARNING: Lifecycle event-ring retention advanced")) ? true : undefined),
+			"cockpit did not render the lifecycle-ring warning",
+		);
+		await eventually(
+			() => (terminal.writes.some(write => write.includes("WARNING: Transcript delivery gap detected")) ? true : undefined),
+			"cockpit did not render the transcript-gap warning",
+		);
+		terminal.send("/journal transcript_delivery_gap 20");
+		await eventually(
+			() => (terminal.writes.some(write => write.startsWith("Journal tail:") && write.includes("transcript_delivery_gap")) ? true : undefined),
+			"cockpit journal view did not render the transcript-gap event",
+		);
+		const filteredRead = recorded.calls
+			.filter(call => call.method === "main.events.read" && Array.isArray((call.params as Record<string, unknown> | undefined)?.kinds))
+			.at(-1);
+		expect((filteredRead?.params as { kinds?: readonly string[] }).kinds).toEqual(["transcript_delivery_gap"]);
+		terminal.send("/quit");
+		await running;
+	} finally {
+		terminal.terminal.close();
+		await running.catch(() => undefined);
+	}
+}, 15_000);
+
 externalTest("cockpit /journal filters registry noise by default and honors an explicit kind", async () => {
 	const active = await gateway();
 	const recorded = recordingClient(active.client);

@@ -128,8 +128,8 @@ impl RpcServerHandle {
 		self.dispatcher.set_gateway_state(state, reason);
 	}
 
-	pub fn set_main_session_status(&self, turn_state: String, follow_up_queue_depth: u64) {
-		self.dispatcher.set_main_session_status(turn_state, follow_up_queue_depth);
+	pub fn set_main_session_status(&self, turn_state: String, follow_up_queue_depth: u64, transcript_verification: String) {
+		self.dispatcher.set_main_session_status(turn_state, follow_up_queue_depth, transcript_verification);
 	}
 
 	pub fn reset_main_session_status(&self) {

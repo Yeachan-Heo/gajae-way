@@ -25,6 +25,8 @@ export const GAJAEWAY_CONSOLE_EVENT_KINDS = [
 	"assistant_message",
 	"turn_start",
 	"turn_end",
+	"tail_ring_rotation",
+	"transcript_delivery_gap",
 	"gate_open",
 	"gate_resolved",
 	"health_change",
@@ -369,6 +371,7 @@ export function renderConsoleStatusSummary(healthPayload: unknown, statusPayload
 		`  daemon: status=${stringValue(health.status)} state=${stringValue(health.state)}${reason ? ` reason=${boundedConsoleText(reason)}` : ""}`,
 		`  main: resumed=${booleanValue(main.resumed)} session_id=${stringValue(main.session_id, "none")} turn_state=${stringValue(status.turn_state)} follow_up_queue_depth=${integerValue(status.follow_up_queue_depth)}`,
 		`  journal: head_cursor=${stringValue(journal.head_cursor)} degraded=${booleanValue(journal.degraded)}`,
+		`  transcript delivery: verification=${stringValue(status.transcript_verification)} gap_detected=${booleanValue(status.transcript_delivery_gap_detected)} gap_count=${integerValue(status.transcript_delivery_gap_count)}`,
 		`  lock: held=${booleanValue(lock.held)} holder=${holderDescription} queue_len=${integerValue(lock.queue_len)} stuck=${booleanValue(lock.stuck)} quarantined=${booleanValue(lock.quarantined)} write_mode=${booleanValue(status.write_mode)}`,
 		`  reconcile: ${reconcileFreshness} drift_count=${integerValue(reconcile.drift_count)}`,
 		`  consumers: ${renderConsumerCheckpoints(status.consumers)}`,
@@ -1011,6 +1014,12 @@ function renderConsoleEventFrame(event: ConsoleEventFrame): string {
 			return "Main turn started — busy.\n";
 		case "turn_end":
 			return "Main turn ended — idle.\n";
+		case "tail_ring_rotation": {
+			const payload = recordValue(event.payload);
+			return `WARNING: Lifecycle event-ring retention advanced; resynced from ${compactGatewayValue(payload.prior_watermark)} to ${compactGatewayValue(payload.resync_point)}. Transcript delivery remains authoritative.\n`;
+		}
+		case "transcript_delivery_gap":
+			return `WARNING: Transcript delivery gap detected. Owner-visible transcript continuity may be incomplete: ${compactGatewayValue(event.payload)}\n`;
 		case "gate_open": {
 			const payload = recordValue(event.payload);
 			const gateId = sanitizeConsoleText(rawStringValue(firstValue(payload, ["gate_id", "gateId"])));

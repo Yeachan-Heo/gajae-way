@@ -39,7 +39,7 @@ export interface WayCoreHandle {
 	rpcBridgeStats(): RpcBridgeStats;
 	rpcDroppedNotificationCount(): number;
 	setRpcHealth(state: "booting" | "verifying" | "running" | "failed_closed" | "degraded", reason?: string): void;
-	setMainSessionStatus(turnState: "idle" | "busy", followUpQueueDepth: number): void;
+	setMainSessionStatus(turnState: "idle" | "busy", followUpQueueDepth: number, verificationState: "pending" | "verified"): void;
 	resetMainSessionStatus(): void;
 	setJournalDegraded(degraded: boolean): void;
 	sdNotifyStatus(status: string): void;
@@ -241,6 +241,7 @@ export interface WayCoreHandle {
 		intentJson: string;
 		responseJson: string;
 	}): { responseJson: string };
+	mainAdmissionOperationAbandon(input: { scope: string; key: string; requestJson: string; intentJson: string }): void;
 	mainAdmissionOperationsPending(): Array<{ scope: string; key: string; requestJson: string; intentJson: string }>;
 }
 

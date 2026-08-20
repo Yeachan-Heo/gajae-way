@@ -31,6 +31,8 @@ pub const MAIN_EVENT_KINDS: &[&str] = &[
 	"assistant_message",
 	"turn_start",
 	"turn_end",
+	"tail_ring_rotation",
+	"transcript_delivery_gap",
 	"gate_open",
 	"gate_resolved",
 	"health_change",
@@ -495,11 +497,24 @@ fn durable_tail_ring_rotation_count(store: &Store) -> Result<u64, RpcError> {
 	}
 }
 
+fn durable_transcript_delivery_gap_count(store: &Store) -> Result<u64, RpcError> {
+	match store.get_meta("transcript_delivery_gap_count").map_err(store_error)? {
+		Some(raw) => raw
+			.parse::<u64>()
+			.map_err(|_| RpcError::internal("transcript_delivery_gap_count metadata is invalid")),
+		None => Ok(0),
+	}
+}
+
 fn main_admission_transcript_proof_pending(store: &Store) -> Result<bool, RpcError> {
 	if store.get_meta("bootstrap_state").map_err(store_error)?.as_deref() != Some("COMMITTED") {
 		return Ok(false);
 	}
 	Ok(store.get_meta("transcript_proof").map_err(store_error)?.as_deref() != Some("proven"))
+}
+
+fn main_session_mutation_requires_transcript_proof(method: &str) -> bool {
+	matches!(method, "main.submit" | "main.corpus.close")
 }
 
 #[derive(Debug, Clone)]
@@ -513,12 +528,19 @@ struct MainSessionStatus {
 	resumed: bool,
 	turn_state: String,
 	follow_up_queue_depth: u64,
+	transcript_verification: String,
 	journal_degraded: bool,
 }
 
 impl Default for MainSessionStatus {
 	fn default() -> Self {
-		Self { resumed: false, turn_state: "idle".to_owned(), follow_up_queue_depth: 0, journal_degraded: false }
+		Self {
+			resumed: false,
+			turn_state: "idle".to_owned(),
+			follow_up_queue_depth: 0,
+			transcript_verification: "unavailable".to_owned(),
+			journal_degraded: false,
+		}
 	}
 }
 
@@ -581,11 +603,12 @@ impl RpcDispatcher {
 
 	/// Publishes runtime main-session state only after strict resume has opened
 	/// the durable session for this daemon process.
-	pub fn set_main_session_status(&self, turn_state: String, follow_up_queue_depth: u64) {
+	pub fn set_main_session_status(&self, turn_state: String, follow_up_queue_depth: u64, transcript_verification: String) {
 		if let Ok(mut status) = self.main_session.lock() {
 			status.resumed = true;
 			status.turn_state = turn_state;
 			status.follow_up_queue_depth = follow_up_queue_depth;
+			status.transcript_verification = transcript_verification;
 		}
 	}
 
@@ -596,6 +619,7 @@ impl RpcDispatcher {
 			status.resumed = false;
 			status.turn_state = "idle".to_owned();
 			status.follow_up_queue_depth = 0;
+			status.transcript_verification = "unavailable".to_owned();
 		}
 	}
 
@@ -610,10 +634,10 @@ impl RpcDispatcher {
 			return Err(RpcError::internal("request cancelled"));
 		}
 		let health = self.reconciled_health()?;
-		if health.state == GatewayState::FailedClosed && method != "way.health" && method != "way.status" && method != "profile.approve" {
+		if health.state == GatewayState::FailedClosed && !matches!(method.as_str(), "way.health" | "way.status" | "profile.approve" | "main.events.read" | "main.gate.answer") {
 			return Err(RpcError::app(1000, health.reason.map(|reason| json!({ "reason": reason }))));
 		}
-		if method == "main.submit" && main_admission_transcript_proof_pending(&self.store)? {
+		if main_session_mutation_requires_transcript_proof(&method) && main_admission_transcript_proof_pending(&self.store)? {
 			return Err(RpcError::app(1003, None));
 		}
 
@@ -676,6 +700,7 @@ impl RpcDispatcher {
 		let health = self.health_response(Value::Object(Map::new()))?;
 		let transcript_proof = durable_transcript_proof(&self.store)?;
 		let tail_ring_rotation_count = durable_tail_ring_rotation_count(&self.store)?;
+		let transcript_delivery_gap_count = durable_transcript_delivery_gap_count(&self.store)?;
 		let main_session = self
 			.main_session
 			.lock()
@@ -736,7 +761,10 @@ impl RpcDispatcher {
 		response.insert("turn_state".to_owned(), json!(main_session.turn_state));
 		response.insert("follow_up_queue_depth".to_owned(), json!(main_session.follow_up_queue_depth));
 		response.insert("transcript_proof".to_owned(), json!(transcript_proof));
+		response.insert("transcript_verification".to_owned(), json!(main_session.transcript_verification));
 		response.insert("tail_ring_rotation_count".to_owned(), json!(tail_ring_rotation_count));
+		response.insert("transcript_delivery_gap_count".to_owned(), json!(transcript_delivery_gap_count));
+		response.insert("transcript_delivery_gap_detected".to_owned(), json!(transcript_delivery_gap_count > 0));
 		let mut lock = lock_status_json(lock_status);
 		lock.as_object_mut()
 			.expect("lock status is an object")
@@ -1513,7 +1541,7 @@ mod tests {
 	}
 
 	#[tokio::test]
-	async fn pending_transcript_proof_fences_main_submit_but_keeps_observation_available() {
+	async fn pending_transcript_proof_fences_main_mutations_but_keeps_observation_available() {
 		let store = Store::default();
 		store.set_meta("bootstrap_state", "COMMITTED").unwrap();
 		store.set_meta("transcript_proof", "pending").unwrap();
@@ -1527,6 +1555,8 @@ mod tests {
 			.unwrap();
 		assert_eq!(status["transcript_proof"], "pending");
 		assert_eq!(status["tail_ring_rotation_count"], 0);
+		assert_eq!(status["transcript_delivery_gap_count"], 0);
+		assert_eq!(status["transcript_delivery_gap_detected"], false);
 
 		let blocked = dispatcher
 			.dispatch("main.submit".to_owned(), json!({ "text": "must not send" }), super::super::CancellationToken::new())
@@ -1534,6 +1564,12 @@ mod tests {
 			.unwrap_err();
 		assert_eq!(blocked.code, 1003);
 		assert_eq!(blocked.message, "transcript_proof_pending");
+		let blocked_closure = dispatcher
+			.dispatch("main.corpus.close".to_owned(), json!({}), super::super::CancellationToken::new())
+			.await
+			.unwrap_err();
+		assert_eq!(blocked_closure.code, 1003);
+		assert_eq!(blocked_closure.message, "transcript_proof_pending");
 
 		let observed = dispatcher
 			.dispatch("main.events.read".to_owned(), json!({}), super::super::CancellationToken::new())
@@ -1543,17 +1579,27 @@ mod tests {
 	}
 
 	#[tokio::test]
-	async fn failed_closed_serves_health_status_and_owner_profile_approval_only() {
+	async fn failed_closed_fences_mutations_but_keeps_observation_and_gate_answers_available() {
 		let dispatcher = dispatcher();
 		dispatcher.set_gateway_state(GatewayState::FailedClosed, Some("profile_drift".to_owned()));
 		let cancellation = super::super::CancellationToken::new();
 		let health = dispatcher.dispatch("way.health".to_owned(), json!({}), cancellation.clone()).await.unwrap();
 		assert_eq!(health["status"], "unhealthy");
 		assert_eq!(health["reason"], "profile_drift");
-		let error = dispatcher.dispatch("gitlock.status".to_owned(), json!({}), cancellation).await.unwrap_err();
+		let error = dispatcher.dispatch("gitlock.status".to_owned(), json!({}), cancellation.clone()).await.unwrap_err();
 		assert_eq!(error.code, 1000);
+		let events = dispatcher
+			.dispatch("main.events.read".to_owned(), json!({}), cancellation.clone())
+			.await
+			.unwrap();
+		assert!(events["events"].as_array().unwrap().is_empty());
+		let gate = dispatcher
+			.dispatch("main.gate.answer".to_owned(), json!({}), cancellation.clone())
+			.await
+			.unwrap_err();
+		assert_ne!(gate.code, 1000);
 		let approval = dispatcher
-			.dispatch("profile.approve".to_owned(), json!({}), super::super::CancellationToken::new())
+			.dispatch("profile.approve".to_owned(), json!({}), cancellation)
 			.await
 			.unwrap_err();
 		assert_ne!(approval.code, 1000);
@@ -1661,7 +1707,7 @@ mod tests {
 		// This live publication occurs only after main.ts completes
 		// strictResumeMainSession and constructs its host.
 		dispatcher.set_gateway_state(GatewayState::Running, None);
-		dispatcher.set_main_session_status("idle".to_owned(), 0);
+		dispatcher.set_main_session_status("idle".to_owned(), 0, "verified".to_owned());
 		let health = dispatcher
 			.dispatch("way.health".to_owned(), json!({}), super::super::CancellationToken::new())
 			.await

@@ -257,6 +257,12 @@ if (!statePath) {
 		if (!value) return;
 		if (value.row.live !== true || value.row.deleted === true) return fail("session_unavailable", "fixture session is not live");
 		if (!text || !text.trim() || !opRef || !opRef.trim()) return fail("invalid_input", "text and operation ref are required");
+		const rejection = value.rejectNext;
+		if (rejection) {
+			delete value.rejectNext;
+			writeState();
+			return fail(rejection.code, rejection.message);
+		}
 		const existing = value.operations?.[opRef];
 		if (!existing) {
 			const hold = value.holdOperations?.includes(opRef) === true || value.holdNext === true;

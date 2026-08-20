@@ -284,6 +284,13 @@ externalTest("busy ring rotation across an attempt-generation boundary resyncs w
 		prior_watermark: { revision: 4, generation: 1, seq: 5 },
 		resync_point: { revision: 6, generation: 2, seq: 5 },
 	});
+	const filteredRotation = await gateway.client.request("main.events.read", {
+		cursor: "1:0",
+		kinds: ["tail_ring_rotation"],
+	});
+	expect((filteredRotation.result as { events: Array<{ kind: string; payload: unknown }> }).events).toEqual([
+		expect.objectContaining({ kind: "tail_ring_rotation", payload: JSON.parse(rotation.payloadJson) }),
+	]);
 	await eventually(
 		() =>
 			gateway.core
@@ -338,8 +345,21 @@ externalTest("a transcript prefix break remains a fail-closed authority violatio
 		() => (gateway.state.read().bootstrapState === "FAILED_CLOSED" ? true : undefined),
 		"transcript prefix break did not fail closed",
 	);
-	expect(gateway.state.read()).toMatchObject({ bootstrapState: "FAILED_CLOSED", failedClosedReason: "growth_intent_mismatch" });
-	expect((await gateway.client.request("way.status", {})).result).toMatchObject({ state: "failed_closed", reason: "growth_intent_mismatch" });
+	expect(gateway.state.read()).toMatchObject({ bootstrapState: "FAILED_CLOSED", failedClosedReason: "growth_intent_mismatch", transcriptDeliveryGapCount: 1 });
+	const status = await gateway.client.request("way.status", {});
+	expect(status.result).toMatchObject({
+		state: "failed_closed",
+		reason: "growth_intent_mismatch",
+		transcript_delivery_gap_detected: true,
+		transcript_delivery_gap_count: 1,
+	});
+	const gaps = await gateway.client.request("main.events.read", {
+		cursor: "1:0",
+		kinds: ["transcript_delivery_gap"],
+	});
+	expect((gaps.result as { events: Array<{ kind: string; payload: unknown }> }).events).toEqual([
+		expect.objectContaining({ kind: "transcript_delivery_gap", payload: expect.objectContaining({ reason: "transcript_delivery_unprovable" }) }),
+	]);
 }, 30_000);
 
 externalTest("main.submit returns delivered_as before a held external assistant is journaled", async () => {
@@ -387,7 +407,7 @@ externalTest("main.submit replays a pending admission identically without double
 
 });
 
-externalTest("main.submit pre-effect claim survives interruption after broker acceptance without a second send", async () => {
+externalTest("main.submit preserves an ambiguous post-acceptance claim for reconciliation without a second send", async () => {
 	let interrupted = false;
 	const gateway = await hosted({
 		afterBrokerAcceptedBeforeFinalize: () => {
@@ -435,6 +455,46 @@ externalTest("main.submit pre-effect claim survives interruption after broker ac
 		expect(replay).toEqual({ accepted: true, op_ref: intent.op_ref, delivered_as: intent.delivered_as });
 		expect(gateway.core.mainAdmissionOperationsPending()).toEqual([]);
 		expect(gateway.fixture.commands().filter(command => command.operation === "turn.prompt" && command.text === request.text)).toHaveLength(1);
+	} finally {
+		await restartedSupervisor.dispose();
+	}
+});
+
+externalTest("a definitive broker rejection abandons only its claim while ambiguous accepted claims still reconcile without resend", async () => {
+	const gateway = await hosted();
+	const rejectedRequest = { text: "retry after definite rejection", surface_id: "owner", idempotency_key: "definite-rejection" };
+	gateway.fixture.rejectNextTurn("broker_rejected", "fixture rejected this admission");
+	const rejected = await gateway.client.request("main.submit", rejectedRequest);
+	expect(rpcError(rejected)).toMatchObject({ code: -32603, message: "bridge_exception", data: { reason: "turn_admission_failed" } });
+	await eventually(() => (gateway.state.read().growthIntent === undefined ? true : undefined), "definitive rejection did not clear its growth intent");
+	expect(gateway.core.mainAdmissionOperationsPending()).toEqual([]);
+
+	gateway.fixture.holdNextTurn();
+	const retry = await gateway.client.request("main.submit", rejectedRequest);
+	expect(retry.result).toMatchObject({ accepted: true, delivered_as: "prompt" });
+	await settleHeld(gateway, (retry.result as { op_ref: string }).op_ref, "same key retried after broker rejection");
+
+	gateway.fixture.holdNextTurn();
+	const unrelated = await gateway.client.request("main.submit", {
+		text: "unrelated key remains usable",
+		surface_id: "owner",
+		idempotency_key: "unrelated-after-rejection",
+	});
+	expect(unrelated.result).toMatchObject({ accepted: true, delivered_as: "prompt" });
+	await settleHeld(gateway, (unrelated.result as { op_ref: string }).op_ref, "unrelated key after broker rejection");
+	expect(gateway.core.mainAdmissionOperationsPending()).toEqual([]);
+
+	await gateway.host.dispose();
+	const restartedSupervisor = createExternalHostSupervisor({
+		broker: new BrokerCli({ executable: gateway.fixture.executable, environment: gateway.fixture.environment() }),
+		workspace: gateway.fixture.workspace,
+		tailTimeoutMs: 500,
+		commandTimeoutMs: 1_000,
+	});
+	try {
+		const resumed = await strictResumeMainSession({ profile: gateway.profile, state: gateway.state, supervisor: restartedSupervisor });
+		expect(resumed.verificationState).toBe("verified");
+		expect(gateway.state.read()).toMatchObject({ bootstrapState: "COMMITTED", failedClosedReason: undefined });
 	} finally {
 		await restartedSupervisor.dispose();
 	}

@@ -32,8 +32,8 @@ export interface MainSessionJournal {
 		expectedDelivery: TranscriptDeliveryProgress | undefined,
 		nextDelivery: TranscriptDeliveryProgress,
 	): unknown;
-	setRpcHealth?(state: "degraded", reason: string): void;
-	setMainSessionStatus?(turnState: "idle" | "busy", followUpQueueDepth: number): void;
+	setRpcHealth?(state: "degraded" | "running", reason: string): void;
+	setMainSessionStatus?(turnState: "idle" | "busy", followUpQueueDepth: number, verificationState: "pending" | "verified"): void;
 	setJournalDegraded?(degraded: boolean): void;
 }
 
@@ -53,7 +53,10 @@ export interface MainSessionHost {
 	readonly degraded: boolean;
 	readonly turnState: "idle" | "busy";
 	readonly followUpQueueDepth: number;
+	/** Durable adoption proof, not the current boot's complete-tail verification state. */
 	readonly transcriptProof: TranscriptProof;
+	/** Machine fence reason for mutating main-session operations, if this boot is not yet verified. */
+	readonly admissionFenceReason: "transcript_proof_pending" | "transcript_verification_pending" | undefined;
 	readonly gates: MainSessionGateRegistry;
 	/** Waits for broker admission only; successful turn execution is observed asynchronously. */
 	admit(deliveredAs: "prompt" | "steer" | "follow_up", text: string, opRef: string): Promise<void>;
@@ -69,6 +72,8 @@ export interface CreateMainSessionHostOptions {
 	readonly journal: MainSessionJournal;
 	readonly initialTurnState?: "idle" | "busy";
 	readonly initialFollowUpQueueDepth?: number;
+	/** Per-boot complete-tail verification state returned by strict resume. */
+	readonly initialVerificationState?: "pending" | "verified";
 	/** An active durable growth intent recovered by strict resume. */
 	readonly recoveredGrowthIntent?: GrowthIntent;
 	readonly now?: () => number;
@@ -248,6 +253,7 @@ class ExternalMainSessionHost implements MainSessionHost {
 	readonly #finalizedAssistantMessageKeys = new Set<string>();
 	#transcriptDeliveryProgress: TranscriptDeliveryProgress | undefined;
 	#transcriptProof: TranscriptProof;
+	#verificationState: "pending" | "verified";
 	readonly #journaledAttemptTransitions = new Map<string, JournaledAttemptTransitions>();
 	readonly #admittedOperations = new Map<string, AdmittedOperation>();
 	readonly #seenTailEvents = new Set<string>();
@@ -274,6 +280,10 @@ class ExternalMainSessionHost implements MainSessionHost {
 		this.#tailCheckpoint = durable.tailCheckpoint;
 		this.#transcriptDeliveryProgress = durable.transcriptDeliveryProgress;
 		this.#transcriptProof = durable.transcriptProof;
+		this.#verificationState = options.initialVerificationState ?? (durable.transcriptProof === "proven" ? "verified" : "pending");
+		if (durable.transcriptProof === "pending" && this.#verificationState !== "pending") {
+			throw new MainSessionHostError("transcript_proof_invalid", "A pending durable transcript proof cannot start as boot-verified.");
+		}
 		if (options.recoveredGrowthIntent) {
 			this.#growthWindow = { intent: options.recoveredGrowthIntent, pendingAdmissions: 0 };
 		}
@@ -300,6 +310,11 @@ class ExternalMainSessionHost implements MainSessionHost {
 
 	get transcriptProof(): TranscriptProof {
 		return this.#transcriptProof;
+	}
+
+	get admissionFenceReason(): "transcript_proof_pending" | "transcript_verification_pending" | undefined {
+		if (this.#transcriptProof === "pending") return "transcript_proof_pending";
+		return this.#verificationState === "pending" ? "transcript_verification_pending" : undefined;
 	}
 
 	waitForFatalFailure(): Promise<MainSessionHostError> {
@@ -330,9 +345,17 @@ class ExternalMainSessionHost implements MainSessionHost {
 	}
 	private publishStatus(): void {
 		try {
-			this.#journal.setMainSessionStatus?.(this.#turnState, this.#followUpQueueDepth);
+			this.#journal.setMainSessionStatus?.(this.#turnState, this.#followUpQueueDepth, this.#verificationState);
 		} catch {
 			// Status is best-effort observation; durable journal writes remain authoritative.
+		}
+	}
+
+	private publishVerifiedReadiness(): void {
+		try {
+			this.#journal.setRpcHealth?.("running", "transcript_verified");
+		} catch {
+			// The proof state and status publication remain authoritative if readiness publication fails.
 		}
 	}
 
@@ -706,8 +729,46 @@ class ExternalMainSessionHost implements MainSessionHost {
 		this.#tailCheckpoint = ringCheckpoint;
 		this.#transcriptDeliveryProgress = transcriptDeliveryProgress;
 		this.#transcriptProof = "proven";
+		this.#verificationState = "verified";
 		this.publishStatus();
+		this.publishVerifiedReadiness();
 		return true;
+	}
+
+	/** Re-attests a durable proven identity after a busy boot deferred its complete tail. */
+	private verifyBootTranscriptProof(tail: SupervisorTailEvents): void {
+		if (this.#verificationState === "verified") return;
+		const durable = this.#state.read();
+		const identity = tail.identity;
+		if (
+			durable.bootstrapState !== "COMMITTED" ||
+			durable.transcriptProof !== "proven" ||
+			!durable.mainIdentity?.transcript ||
+			!identity.transcript ||
+			!sameExternalSession(durable.mainIdentity, identity) ||
+			!sameExternalSession(this.#identity, identity)
+		) {
+			throw new HostSupervisorError("transcript_proof_invalid", "The complete tail could not re-attest the durable transcript proof.");
+		}
+		if (tail.transcriptEntries.some(entry => !entry.id.trim())) {
+			throw new HostSupervisorError("transcript_proof_invalid", "A complete broker tail contained a transcript entry without a stable id.");
+		}
+		const fingerprint = fingerprintTranscriptEntries(tail.transcriptEntries.map(entry => entry.payload));
+		if (fingerprint.entryCount !== identity.transcript.entryCount || fingerprint.sha256 !== identity.transcript.sha256) {
+			throw new HostSupervisorError("transcript_proof_mismatch", "The complete broker tail did not match its transcript fingerprint.");
+		}
+		const growth = this.#growthWindow;
+		if (growth) {
+			if (!sameExternalSession(growth.intent.base, identity) || !attestsExternalTranscriptGrowth(growth.intent.base, tail.transcriptEntries.map(entry => entry.payload))) {
+				throw new HostSupervisorError("growth_intent_mismatch", "The complete broker tail did not attest append-only growth from the recovered intent.");
+			}
+		} else if (!sameExternalFingerprint(durable.mainIdentity, identity)) {
+			throw new HostSupervisorError("main_identity_mismatch", "The complete broker tail did not match the durable transcript proof.");
+		}
+		this.#identity = identity;
+		this.#verificationState = "verified";
+		this.publishStatus();
+		this.publishVerifiedReadiness();
 	}
 
 	private observeIdentity(identity: ExternalSessionIdentity, entries: readonly SupervisorTranscriptEntry[]): void {
@@ -846,6 +907,7 @@ class ExternalMainSessionHost implements MainSessionHost {
 					await Promise.race([Bun.sleep(tail.terminal && this.#turnState === "idle" ? 500 : 100), wake, this.#tailStop.promise]);
 					continue;
 				}
+				this.verifyBootTranscriptProof(tail);
 				// A rotating broker transcript window can no longer attest the durable
 				// delivery point. Record the consumer-visible gap before the identity
 				// mismatch closes this unsafe observation path.
@@ -933,7 +995,8 @@ class ExternalMainSessionHost implements MainSessionHost {
 		if (this.#disposed) throw new MainSessionHostError("host_disposed");
 		if (this.#failure) throw this.#failure;
 		if (this.#degraded) throw new MainSessionHostError("host_degraded");
-		if (this.#transcriptProof === "pending") throw new MainSessionHostError("transcript_proof_pending");
+		const fenceReason = this.admissionFenceReason;
+		if (fenceReason) throw new MainSessionHostError(fenceReason);
 	}
 
 	private beginGrowthWindow(): GrowthWindow {

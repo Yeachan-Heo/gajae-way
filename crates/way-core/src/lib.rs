@@ -357,6 +357,16 @@ pub struct MainAdmissionOperationClaimOutput {
 }
 
 #[napi(object)]
+pub struct MainAdmissionOperationAbandonInput {
+	pub scope: String,
+	pub key: String,
+	#[napi(js_name = "requestJson")]
+	pub request_json: String,
+	#[napi(js_name = "intentJson")]
+	pub intent_json: String,
+}
+
+#[napi(object)]
 pub struct MainAdmissionOperationFinalizeInput {
 	pub scope: String,
 	pub key: String,
@@ -731,13 +741,21 @@ impl WayCore {
 
 	/// Publishes live main-session state after strict resume for `way.status`.
 	#[napi(js_name = "setMainSessionStatus")]
-	pub fn set_main_session_status(&self, turn_state: String, follow_up_queue_depth: u32) -> napi::Result<()> {
+	pub fn set_main_session_status(
+		&self,
+		turn_state: String,
+		follow_up_queue_depth: u32,
+		verification_state: String,
+	) -> napi::Result<()> {
 		if !matches!(turn_state.as_str(), "idle" | "busy") {
 			return Err(napi::Error::from_reason("turnState must be idle or busy"));
 		}
+		if !matches!(verification_state.as_str(), "pending" | "verified") {
+			return Err(napi::Error::from_reason("verificationState must be pending or verified"));
+		}
 		let server = self.rpc_server.lock().map_err(|_| napi::Error::from_reason("RPC server lock was poisoned"))?;
 		let server = server.as_ref().ok_or_else(|| napi::Error::from_reason("RPC server is not running"))?;
-		server.set_main_session_status(turn_state, u64::from(follow_up_queue_depth));
+		server.set_main_session_status(turn_state, u64::from(follow_up_queue_depth), verification_state);
 		Ok(())
 	}
 
@@ -1185,6 +1203,14 @@ impl WayCore {
 			)
 			.map_err(store_napi_error)?;
 		Ok(MainAdmissionOperationFinalizeOutput { response_json })
+	}
+
+	/// Atomically abandons a definitively broker-rejected pre-effect admission claim.
+	#[napi(js_name = "mainAdmissionOperationAbandon")]
+	pub fn main_admission_operation_abandon(&self, input: MainAdmissionOperationAbandonInput) -> napi::Result<()> {
+		self.store
+			.abandon_main_admission_operation(&input.scope, &input.key, &input.request_json, &input.intent_json)
+			.map_err(store_napi_error)
 	}
 
 	/// Returns unresolved pre-effect admissions for startup recovery only.

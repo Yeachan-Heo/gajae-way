@@ -14,7 +14,7 @@ use std::{
 use rusqlite::{Connection, OptionalExtension, Transaction};
 
 pub const DATABASE_FILENAME: &str = "way-core.sqlite3";
-pub const SCHEMA_VERSION: u32 = 6;
+pub const SCHEMA_VERSION: u32 = 7;
 pub const IDEMPOTENCY_WINDOW_MS: i64 = 24 * 60 * 60 * 1_000;
 pub const CLOSURE_OPERATION_META_KEY: &str = "gitlock_closure_operation";
 
@@ -479,6 +479,59 @@ impl Store {
         Ok(response_json.to_owned())
     }
 
+    /// Atomically abandons a pre-effect admission after the broker returned a
+    /// definitive rejection envelope, leaving the idempotency key retryable.
+    pub fn abandon_main_admission_operation(
+        &self,
+        scope: &str,
+        key: &str,
+        request_json: &str,
+        intent_json: &str,
+    ) -> StoreResult<()> {
+        let mut connection = self.connection()?;
+        let transaction = connection.transaction()?;
+        let existing = transaction
+            .query_row(
+                "SELECT request_json, response_json FROM idempotency WHERE scope = ?1 AND idempotency_key = ?2",
+                rusqlite::params![scope, key],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            )
+            .optional()?;
+        let Some((stored_request, stored_response)) = existing else {
+            return Err(StoreError::MainAdmissionOperationMissing);
+        };
+        if stored_request != request_json {
+            return Err(StoreError::IdempotencyConflict);
+        }
+        if stored_response != intent_json {
+            return Err(StoreError::MainAdmissionOperationChanged);
+        }
+        let operation_intent = transaction
+            .query_row(
+                "SELECT intent_json FROM main_admission_operations WHERE scope = ?1 AND idempotency_key = ?2",
+                rusqlite::params![scope, key],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?;
+        if operation_intent.as_deref() != Some(intent_json) {
+            return Err(if operation_intent.is_some() {
+                StoreError::MainAdmissionOperationChanged
+            } else {
+                StoreError::MainAdmissionOperationMissing
+            });
+        }
+        transaction.execute(
+            "DELETE FROM main_admission_operations WHERE scope = ?1 AND idempotency_key = ?2",
+            rusqlite::params![scope, key],
+        )?;
+        transaction.execute(
+            "DELETE FROM idempotency WHERE scope = ?1 AND idempotency_key = ?2",
+            rusqlite::params![scope, key],
+        )?;
+        transaction.commit()?;
+        Ok(())
+    }
+
     /// Lists only unresolved pre-effect claims so startup can prove broker acceptance without resending.
     pub fn pending_main_admission_operations(&self) -> StoreResult<Vec<PendingMainAdmissionOperation>> {
         let connection = self.connection()?;
@@ -769,6 +822,15 @@ fn migrate(connection: &mut Connection) -> StoreResult<()> {
         transaction.commit()?;
     }
 
+    if current_version < 7 {
+        let transaction = connection.transaction()?;
+        if meta_get_tx(&transaction, "transcript_delivery_gap_count")?.is_none() {
+            meta_set_tx(&transaction, "transcript_delivery_gap_count", "0")?;
+        }
+        meta_set_tx(&transaction, "schema_version", "7")?;
+        transaction.commit()?;
+    }
+
 
     let defaults = [
         ("bootstrap_state", "ABSENT"),
@@ -786,6 +848,7 @@ fn migrate(connection: &mut Connection) -> StoreResult<()> {
         ("transcript_delivery_progress", "null"),
         ("transcript_proof", "pending"),
         ("tail_ring_rotation_count", "0"),
+        ("transcript_delivery_gap_count", "0"),
         ("journal_generation", "1"),
         ("boot_epoch", "0"),
         ("journal_floor_seq", "0"),
@@ -853,6 +916,7 @@ mod tests {
         );
         assert_eq!(store.get_meta("transcript_proof").unwrap().as_deref(), Some("pending"));
         assert_eq!(store.get_meta("tail_ring_rotation_count").unwrap().as_deref(), Some("0"));
+        assert_eq!(store.get_meta("transcript_delivery_gap_count").unwrap().as_deref(), Some("0"));
 
         let connection = store.connection().unwrap();
         let journal_mode: String = connection
@@ -1025,6 +1089,7 @@ mod tests {
 
         let migrated = Store::open(&state_dir).unwrap();
         assert_eq!(migrated.get_meta("tail_ring_rotation_count").unwrap().as_deref(), Some("0"));
+        assert_eq!(migrated.get_meta("transcript_delivery_gap_count").unwrap().as_deref(), Some("0"));
         assert_eq!(migrated.get_meta("schema_version").unwrap(), Some(SCHEMA_VERSION.to_string()));
         drop(migrated);
         fs::remove_dir_all(state_dir).unwrap();
@@ -1046,6 +1111,7 @@ mod tests {
         let migrated = Store::open(&state_dir).unwrap();
         assert_eq!(migrated.get_meta("tail_checkpoint").unwrap().as_deref(), Some("null"));
         assert_eq!(migrated.get_meta("tail_ring_rotation_count").unwrap().as_deref(), Some("0"));
+        assert_eq!(migrated.get_meta("transcript_delivery_gap_count").unwrap().as_deref(), Some("0"));
         assert_eq!(migrated.get_meta("schema_version").unwrap(), Some(SCHEMA_VERSION.to_string()));
         drop(migrated);
         fs::remove_dir_all(state_dir).unwrap();
@@ -1171,5 +1237,38 @@ mod tests {
         );
         assert!(store.pending_main_admission_operations().unwrap().is_empty());
         assert_eq!(store.replay_idempotency(scope, "key", request, 103).unwrap().as_deref(), Some(response));
+    }
+
+    #[test]
+    fn definitive_main_admission_rejection_abandons_only_the_matching_claim() {
+        let store = Store::default();
+        let scope = "main.submit";
+        let rejected_request = r#"{"idempotency_key":"rejected","surface_id":"owner","text":"retry"}"#;
+        let rejected_intent = r#"{"delivered_as":"prompt","op_ref":"rejected-op","request_hash":"hash","state":"claimed","version":1}"#;
+        let unrelated_request = r#"{"idempotency_key":"other","surface_id":"owner","text":"other"}"#;
+        let unrelated_intent = r#"{"delivered_as":"prompt","op_ref":"other-op","request_hash":"hash","state":"claimed","version":1}"#;
+        assert_eq!(
+            store.claim_main_admission_operation(scope, "rejected", rejected_request, rejected_intent, 100).unwrap(),
+            MainAdmissionOperationClaim::Claimed
+        );
+        assert_eq!(
+            store.claim_main_admission_operation(scope, "other", unrelated_request, unrelated_intent, 100).unwrap(),
+            MainAdmissionOperationClaim::Claimed
+        );
+        store.abandon_main_admission_operation(scope, "rejected", rejected_request, rejected_intent).unwrap();
+        assert_eq!(
+            store.pending_main_admission_operations().unwrap(),
+            vec![super::PendingMainAdmissionOperation {
+                scope: scope.to_owned(),
+                key: "other".to_owned(),
+                request_json: unrelated_request.to_owned(),
+                intent_json: unrelated_intent.to_owned(),
+            }]
+        );
+        assert_eq!(store.replay_idempotency(scope, "rejected", rejected_request, 101).unwrap(), None);
+        assert_eq!(
+            store.claim_main_admission_operation(scope, "rejected", rejected_request, rejected_intent, 101).unwrap(),
+            MainAdmissionOperationClaim::Claimed
+        );
     }
 }

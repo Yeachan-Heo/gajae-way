@@ -89,12 +89,15 @@ export interface BrokerTurnStatus {
 export class BrokerCliError extends Error {
 	readonly code: string;
 	readonly stderr?: string;
+	/** True only when the broker returned an explicit `ok:false` command envelope. */
+	readonly definitive: boolean;
 
-	constructor(code: string, message: string, options: { readonly stderr?: string; readonly cause?: unknown } = {}) {
+	constructor(code: string, message: string, options: { readonly stderr?: string; readonly cause?: unknown; readonly definitive?: boolean } = {}) {
 		super(message, options.cause === undefined ? undefined : { cause: options.cause });
 		this.name = "BrokerCliError";
 		this.code = code;
 		this.stderr = options.stderr;
+		this.definitive = options.definitive === true;
 	}
 }
 
@@ -487,7 +490,7 @@ function extractBrokerError(stdout: string, stderr: string): BrokerCliError | un
 		const code = typeof envelope.error.code === "string" && envelope.error.code ? envelope.error.code : "broker_command_failed";
 		const message =
 			typeof envelope.error.message === "string" && envelope.error.message ? envelope.error.message : "Broker CLI rejected the request.";
-		return new BrokerCliError(code, message, { stderr });
+		return new BrokerCliError(code, message, { stderr, definitive: true });
 	} catch {
 		return undefined;
 	}

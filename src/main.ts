@@ -132,7 +132,7 @@ function createRuntimeMainSessionJournal(
 			gatewayState.appendTranscriptProjection(expectedTail, checkpoint, expectedDelivery, nextDelivery, kind, payloadJson);
 		},
 		setRpcHealth: (state, reason) => {
-			let healthState: "degraded" | "failed_closed" = state;
+			let healthState: "degraded" | "running" | "failed_closed" = state;
 			let healthReason = reason;
 			try {
 				const durable = gatewayState.read();
@@ -144,14 +144,16 @@ function createRuntimeMainSessionJournal(
 				// The host's explicit degradation remains safer than reporting healthy.
 			}
 			try {
-				core.setRpcHealth(healthState, healthReason);
+				core.setRpcHealth(healthState, healthState === "running" ? undefined : healthReason);
+				if (healthState === "running") core.sdNotifyReady("gajaeway running");
 			} finally {
-				void writeHealthFile(stateDirectory, { status: "unhealthy", state: healthState, reason: healthReason }).catch(error => {
+				const status = healthState === "running" ? "healthy" : "unhealthy";
+				void writeHealthFile(stateDirectory, { status, state: healthState, ...(healthState === "running" ? {} : { reason: healthReason }) }).catch(error => {
 					console.error(`Could not write ${healthState} health file: ${error instanceof Error ? error.message : String(error)}`);
 				});
 			}
 		},
-		setMainSessionStatus: (turnState, followUpQueueDepth) => core.setMainSessionStatus(turnState, followUpQueueDepth),
+		setMainSessionStatus: (turnState, followUpQueueDepth, verificationState) => core.setMainSessionStatus(turnState, followUpQueueDepth, verificationState),
 		setJournalDegraded: degraded => core.setJournalDegraded(degraded),
 	};
 }
@@ -840,6 +842,11 @@ function closureExecutionFailure(error: unknown): never {
 	throw new RpcBridgeException(-32603, error instanceof Error ? error.message : String(error));
 }
 
+function assertMainSessionMutationReady(host: MainSessionHost): void {
+	const reason = host.admissionFenceReason;
+	if (reason) throw new RpcBridgeException(1003, reason);
+}
+
 function closureBridgeHandler(
 	core: WayCoreHandle,
 	closures: ClosureExecutor,
@@ -1009,20 +1016,31 @@ async function serveWay(config: WayConfig): Promise<void> {
 		}
 		failBeforeMainHostForE2e();
 		await reconcilePendingClosureOperation(core, closures, profile.corpusPath, resumed.identity.sessionId);
-		// Write the baseline before tail observation begins. A host may degrade
-		// immediately; the later running state publication is monotonic in core.
-		await writeHealthFile(config.stateDir, { status: "healthy", state: "running" });
-
-		host = createMainSessionHost({
+		const verificationPending = resumed.verificationState === "pending";
+		if (verificationPending) {
+			core.setRpcHealth("verifying", "transcript_verification_pending");
+			await writeHealthFile(config.stateDir, {
+				status: "booting",
+				state: "verifying",
+				reason: "transcript_verification_pending",
+			});
+		} else {
+			// Write the baseline before tail observation begins. A host may degrade
+			// immediately; the later running state publication is monotonic in core.
+			await writeHealthFile(config.stateDir, { status: "healthy", state: "running" });
+		}
+		const resumedHost = createMainSessionHost({
 			supervisor,
 			identity: resumed.identity,
 			state,
 			journal: createRuntimeMainSessionJournal(core, config.stateDir, state),
 			initialTurnState: resumed.turnState,
 			initialFollowUpQueueDepth: resumed.followUpQueueDepth,
-			recoveredGrowthIntent: resumed.growthIntent,
+			initialVerificationState: resumed.verificationState,
+			...(resumed.growthIntent === undefined ? {} : { recoveredGrowthIntent: resumed.growthIntent }),
 		});
-		core.setRpcHealth("running");
+		host = resumedHost;
+		if (!verificationPending) core.setRpcHealth("running");
 		const admissionHandler = createMainAdmissionHandler(host, profile, core, {
 			isSurfaceQuarantined: (surface) => {
 				try {
@@ -1032,11 +1050,12 @@ async function serveWay(config: WayConfig): Promise<void> {
 				}
 			},
 			afterBrokerAcceptedBeforeFinalize: failAfterMainAdmissionBrokerAcceptedForE2e,
-			isTranscriptProofPending: () => state.read().transcriptProof === "pending",
+			admissionFenceReason: () => resumedHost.admissionFenceReason,
 		});
 		const gateAnswerHandler = createMainGateAnswerHandler(host, core);
 		const closureHandler = closureBridgeHandler(core, closures, profile.corpusPath, resumed.identity.sessionId);
 		mainSessionHandler = async (method, params) => {
+			if (method === "main.submit" || method === "main.corpus.close") assertMainSessionMutationReady(resumedHost);
 			if (method === "main.submit") return await admissionHandler(params);
 			if (method === "main.gate.answer") return await gateAnswerHandler(params);
 			if (method === "main.corpus.close") return await closureHandler(method, params);
@@ -1048,10 +1067,12 @@ async function serveWay(config: WayConfig): Promise<void> {
 			pollMs: config.reconcilePollMs,
 		});
 		reconciler.start();
-		try {
-			core.sdNotifyReady("gajaeway running");
-		} catch {
-			// Readiness remains observable through RPC and health.json.
+		if (!verificationPending) {
+			try {
+				core.sdNotifyReady("gajaeway running");
+			} catch {
+				// Readiness remains observable through RPC and health.json.
+			}
 		}
 		await waitForShutdown(core, host, closures, reconciler);
 	} catch (error) {

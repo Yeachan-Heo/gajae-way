@@ -29,6 +29,8 @@ export interface ResumeOptions {
 
 export interface ResumedMainSession {
 	readonly identity: ExternalSessionIdentity;
+	/** Per-daemon proof state; durable proof may remain proven while a busy boot waits for a complete tail. */
+	readonly verificationState: "pending" | "verified";
 	readonly recoveredGrowthIntent: boolean;
 	/** Retained until the terminal event and transcript delivery are durable. */
 	readonly growthIntent?: GrowthIntent;
@@ -79,6 +81,8 @@ export async function strictResumeMainSession(options: ResumeOptions): Promise<R
 	if (!sameExternalSession(durableIdentity, current)) {
 		return failClosed(options.state, "main_identity_mismatch", "The broker returned a different external session identity.");
 	}
+	let identity = current;
+	let verificationState: "pending" | "verified";
 	if (durable.transcriptProof === "pending") {
 		if (verified.transcriptProof === "proven") {
 			if (!current.transcript || !verified.initialRingCheckpoint || verified.transcriptEntries.some(entry => !entry.id.trim())) {
@@ -100,22 +104,43 @@ export async function strictResumeMainSession(options: ResumeOptions): Promise<R
 			} catch (error) {
 				return failClosed(options.state, "transcript_proof_persist_failed", error instanceof Error ? error.message : String(error), error);
 			}
-		} else if (verified.transcriptProof !== "pending" || current.transcript || verified.initialRingCheckpoint) {
+			verificationState = "verified";
+		} else if (
+			verified.transcriptProof !== "pending" ||
+			current.transcript ||
+			verified.initialRingCheckpoint ||
+			verified.transcriptEntries.length !== 0
+		) {
 			return failClosed(options.state, "transcript_proof_invalid", "The broker returned an invalid pending transcript proof.");
+		} else {
+			verificationState = "pending";
 		}
-	} else if (verified.transcriptProof !== "proven" || !current.transcript) {
-		return failClosed(options.state, "transcript_proof_unavailable", "The broker did not provide a complete transcript proof for the durable identity.");
+	} else if (verified.transcriptProof === "proven" && current.transcript) {
+		verificationState = "verified";
+	} else if (
+		verified.transcriptProof === "pending" &&
+		!current.transcript &&
+		!verified.initialRingCheckpoint &&
+		verified.transcriptEntries.length === 0
+	) {
+		// A busy `tail --until-idle` cannot provide a complete transcript snapshot.
+		// Keep the durable proof identity as this boot's authority until the host
+		// observes a complete tail and re-attests its prefix.
+		identity = durableIdentity;
+		verificationState = "pending";
+	} else {
+		return failClosed(options.state, "transcript_proof_invalid", "The broker returned an invalid proof state for the durable transcript identity.");
 	}
 	let recoveredGrowthIntent = false;
 	if (durable.growthIntent) {
 		if (!sameExternalSession(durable.growthIntent.base, current)) {
 			return failClosed(options.state, "growth_intent_mismatch", "The adopted session changed while a growth intent was open.");
 		}
-		if (!attestsExternalTranscriptGrowth(durable.growthIntent.base, verified.transcriptEntries.map(entry => entry.payload))) {
+		if (verificationState === "verified" && !attestsExternalTranscriptGrowth(durable.growthIntent.base, verified.transcriptEntries.map(entry => entry.payload))) {
 			return failClosed(options.state, "growth_intent_mismatch", "The broker transcript changed outside append-only growth recovery.");
 		}
 		recoveredGrowthIntent = true;
-	} else if (!sameExternalFingerprint(durableIdentity, current)) {
+	} else if (verificationState === "verified" && !sameExternalFingerprint(durableIdentity, current)) {
 		return failClosed(options.state, "main_identity_mismatch", "The persisted external session identity no longer matches broker evidence.");
 	}
 	try {
@@ -124,7 +149,8 @@ export async function strictResumeMainSession(options: ResumeOptions): Promise<R
 		return failClosed(options.state, "profile_tunables_revision_failed", error instanceof Error ? error.message : String(error), error);
 	}
 	return {
-		identity: current,
+		identity,
+		verificationState,
 		recoveredGrowthIntent,
 		...(durable.growthIntent === undefined ? {} : { growthIntent: durable.growthIntent }),
 		turnState: verified.turnState,

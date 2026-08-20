@@ -173,6 +173,9 @@ const healthyStatus = {
 	...healthyHealth,
 	turn_state: "busy",
 	follow_up_queue_depth: 2,
+	transcript_verification: "verified",
+	transcript_delivery_gap_detected: true,
+	transcript_delivery_gap_count: 3,
 	journal: { head_cursor: "7:42", degraded: false },
 	lock: {
 		held: true,
@@ -197,6 +200,7 @@ test("console maps health and status into the owner-visible summary", () => {
 	);
 	expect(summary).toContain("reconcile: freshness=fresh last_ok_at=10000 age_ms=5000 cycle_ms=5000 drift_count=3");
 	expect(summary).toContain("consumers: gajaeway-console@7:41(claimed)");
+	expect(summary).toContain("transcript delivery: verification=verified gap_detected=true gap_count=3");
 });
 
 test("status polling emits one atomic frame only when gateway state changes", async () => {

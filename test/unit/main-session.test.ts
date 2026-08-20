@@ -748,8 +748,10 @@ test.serial("a reply finalized while the daemon is down is recovered from durabl
 		journal: { journalAppend: () => undefined },
 		initialTurnState: first.turnState,
 		initialFollowUpQueueDepth: first.followUpQueueDepth,
+		initialVerificationState: first.verificationState,
 	});
 	try {
+		fixture.setNoEnvelopeWhileBusy();
 		fixture.holdNextTurn();
 		await firstHost.admit("prompt", "finish while daemon is down", "down-recovery");
 		await eventually(() => state.read().growthIntent !== undefined, "growth intent was not durable before daemon stop");
@@ -768,9 +770,11 @@ test.serial("a reply finalized while the daemon is down is recovered from durabl
 		journal: { journalAppend: (kind, payloadJson) => journal.push({ kind, payloadJson }) },
 		initialTurnState: restarted.turnState,
 		initialFollowUpQueueDepth: restarted.followUpQueueDepth,
-		recoveredGrowthIntent: restarted.growthIntent,
+		initialVerificationState: restarted.verificationState,
+		...(restarted.growthIntent === undefined ? {} : { recoveredGrowthIntent: restarted.growthIntent }),
 	});
 	try {
+		expect(restarted.verificationState).toBe("verified");
 		expect(restarted.recoveredGrowthIntent).toBe(true);
 		await eventually(
 			() => journal.some(event => event.kind === "assistant_message" && event.payloadJson.includes("recovered after daemon downtime")),
@@ -883,8 +887,10 @@ test.serial("a recovered busy growth window remains open across restart until te
 		journal: { journalAppend: () => undefined },
 		initialTurnState: first.turnState,
 		initialFollowUpQueueDepth: first.followUpQueueDepth,
+		initialVerificationState: first.verificationState,
 	});
 	try {
+		fixture.setNoEnvelopeWhileBusy();
 		fixture.holdNextTurn();
 		await firstHost.admit("prompt", "stay busy across restart", "busy-restart");
 		await eventually(() => firstHost.turnState === "busy", "first host did not observe its busy operation");
@@ -895,17 +901,25 @@ test.serial("a recovered busy growth window remains open across restart until te
 	const restartedSupervisor = supervisor(fixture);
 	const restarted = await strictResumeMainSession({ profile, state, supervisor: restartedSupervisor });
 	const journal: Array<{ kind: string; payloadJson: string }> = [];
+	const readinessReports: Array<{ state: string; reason: string }> = [];
 	const restartedHost = createMainSessionHost({
 		supervisor: restartedSupervisor,
 		identity: restarted.identity,
 		state,
-		journal: { journalAppend: (kind, payloadJson) => journal.push({ kind, payloadJson }) },
+		journal: {
+			journalAppend: (kind, payloadJson) => journal.push({ kind, payloadJson }),
+			setRpcHealth: (state, reason) => readinessReports.push({ state, reason }),
+		},
 		initialTurnState: restarted.turnState,
 		initialFollowUpQueueDepth: restarted.followUpQueueDepth,
-		recoveredGrowthIntent: restarted.growthIntent,
+		initialVerificationState: restarted.verificationState,
+		...(restarted.growthIntent === undefined ? {} : { recoveredGrowthIntent: restarted.growthIntent }),
 	});
 	try {
 		expect(restarted.recoveredGrowthIntent).toBe(true);
+		expect(restarted.verificationState).toBe("pending");
+		expect(restartedHost.admissionFenceReason).toBe("transcript_verification_pending");
+		await expect(restartedHost.admit("steer", "must stay fenced", "busy-restart-fenced")).rejects.toMatchObject({ reason: "transcript_verification_pending" });
 		expect(restarted.turnState).toBe("busy");
 		expect(state.read().growthIntent).toBeDefined();
 		fixture.complete("busy-restart", { text: "busy turn settled after restart" });
@@ -913,6 +927,8 @@ test.serial("a recovered busy growth window remains open across restart until te
 			() => journal.some(event => event.kind === "assistant_message" && event.payloadJson.includes("busy turn settled after restart")),
 			"recovered busy turn did not deliver its terminal transcript",
 		);
+		await eventually(() => restartedHost.admissionFenceReason === undefined, "restarted host did not promote its complete-tail verification");
+		expect(readinessReports).toContainEqual({ state: "running", reason: "transcript_verified" });
 		await eventually(() => state.read().growthIntent === undefined, "growth intent was not cleared after terminal delivery");
 		expect(state.read().bootstrapState).toBe("COMMITTED");
 	} finally {

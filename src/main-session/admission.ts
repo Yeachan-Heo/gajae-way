@@ -1,4 +1,5 @@
 import * as crypto from "node:crypto";
+import { BrokerCliError } from "../broker/cli";
 import type { OwnerSurface, WayProfile } from "../profile";
 import { RpcBridgeException } from "../rpc-bridge";
 import { canonicalJson } from "./gates";
@@ -34,6 +35,12 @@ export interface MainAdmissionOperationStore {
 		readonly intentJson: string;
 		readonly responseJson: string;
 	}): { readonly responseJson: string };
+	mainAdmissionOperationAbandon(input: {
+		readonly scope: string;
+		readonly key: string;
+		readonly requestJson: string;
+		readonly intentJson: string;
+	}): void;
 	mainAdmissionOperationsPending(): readonly {
 		readonly scope: string;
 		readonly key: string;
@@ -48,8 +55,8 @@ export interface CreateMainAdmissionOptions {
 	readonly newOpRef?: () => string;
 	/** Test-only interruption seam after broker acceptance and before durable finalization. */
 	readonly afterBrokerAcceptedBeforeFinalize?: () => void | Promise<void>;
-	/** Durable identity fence; rejection happens before an idempotency claim or broker mutation. */
-	readonly isTranscriptProofPending?: () => boolean;
+	/** Central main-session mutation fence, checked before a claim or broker effect. */
+	readonly admissionFenceReason?: () => string | undefined;
 }
 
 interface MainAdmissionIntent {
@@ -160,6 +167,41 @@ async function dispatchAdmittedOperation(
 	await target.admit(deliveredAs, text, opRef);
 }
 
+function isDefinitiveBrokerRejection(error: unknown): boolean {
+	const seen = new Set<unknown>();
+	let current: unknown = error;
+	while (current instanceof Error && !seen.has(current)) {
+		seen.add(current);
+		if (current instanceof BrokerCliError && current.definitive) return true;
+		current = current.cause;
+	}
+	return false;
+}
+
+function abandonDefinitivelyRejectedClaim(
+	idempotency: MainAdmissionOperationStore,
+	request: AdmissionRequest,
+	requestJson: string,
+	intentJson: string,
+	error: unknown,
+): void {
+	if (!isDefinitiveBrokerRejection(error)) return;
+	try {
+		idempotency.mainAdmissionOperationAbandon({
+			scope: MAIN_ADMISSION_SCOPE,
+			key: request.idempotencyKey,
+			requestJson,
+			intentJson,
+		});
+	} catch (abandonError) {
+		throw new MainAdmissionRecoveryError(
+			"main_admission_claim_abandon_failed",
+			"The broker definitively rejected a main admission, but its durable pre-effect claim could not be abandoned.",
+			{ cause: abandonError },
+		);
+	}
+}
+
 /**
  * Server-authoritative admission. A caller submits only text and a surface;
  * delivery is always derived from the bound profile and current main turn.
@@ -175,7 +217,8 @@ export function createMainAdmissionHandler(
 	const newOpRef = options.newOpRef ?? crypto.randomUUID;
 	return async (params: unknown): Promise<{ accepted: boolean; op_ref: string; delivered_as: DeliveredAs }> => {
 		const request = parseRequest(params);
-		if (options.isTranscriptProofPending?.()) throw new RpcBridgeException(1003, "transcript_proof_pending");
+		const fenceReason = options.admissionFenceReason?.();
+		if (fenceReason) throw new RpcBridgeException(1003, fenceReason);
 		const canonicalSurfaceId = request.surfaceId.trim();
 		const surface = knownSurfaces.get(canonicalSurfaceId);
 		if (!surface) throw new RpcBridgeException(1300, "unknown_surface");
@@ -217,7 +260,12 @@ export function createMainAdmissionHandler(
 				return pendingReplayError(claim.responseJson ?? "");
 			}
 		}
-		await dispatchAdmittedOperation(target, deliveredAs, request.text, response.op_ref);
+		try {
+			await dispatchAdmittedOperation(target, deliveredAs, request.text, response.op_ref);
+		} catch (error) {
+			abandonDefinitivelyRejectedClaim(idempotency, request, requestJson, intentJson, error);
+			throw error;
+		}
 		await options.afterBrokerAcceptedBeforeFinalize?.();
 		try {
 			const finalized = idempotency.mainAdmissionOperationFinalize({

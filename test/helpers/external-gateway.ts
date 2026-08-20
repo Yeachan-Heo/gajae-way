@@ -125,7 +125,7 @@ export async function createExternalGateway(options: ExternalGatewayOptions = {}
 				state.appendTranscriptProjection(expectedTail, checkpoint, expectedDelivery, nextDelivery, kind, payloadJson);
 			},
 			setRpcHealth: (healthState, reason) => core.setRpcHealth(healthState, reason),
-			setMainSessionStatus: (turnState, followUpQueueDepth) => core.setMainSessionStatus(turnState, followUpQueueDepth),
+			setMainSessionStatus: (turnState, followUpQueueDepth, verificationState) => core.setMainSessionStatus(turnState, followUpQueueDepth, verificationState),
 			setJournalDegraded: degraded => core.setJournalDegraded(degraded),
 		};
 
@@ -136,13 +136,14 @@ export async function createExternalGateway(options: ExternalGatewayOptions = {}
 		journal,
 		initialTurnState: resumed.turnState,
 		initialFollowUpQueueDepth: resumed.followUpQueueDepth,
-		recoveredGrowthIntent: resumed.growthIntent,
+		initialVerificationState: resumed.verificationState,
+		...(resumed.growthIntent === undefined ? {} : { recoveredGrowthIntent: resumed.growthIntent }),
 	});
 	const submit = createMainAdmissionHandler(host, profile, core, {
 		newOpRef: options.newOpRef,
 		isSurfaceQuarantined: options.isSurfaceQuarantined,
 		afterBrokerAcceptedBeforeFinalize: options.afterBrokerAcceptedBeforeFinalize,
-		isTranscriptProofPending: () => state.read().transcriptProof === "pending",
+		admissionFenceReason: () => host.admissionFenceReason,
 	});
 	const answer = createMainGateAnswerHandler(host, core);
 	const handler: RpcBridgeHandler = async (method, params) => {
