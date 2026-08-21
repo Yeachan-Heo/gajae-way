@@ -2,7 +2,6 @@ import { createHash } from "node:crypto";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { afterEach, expect, test } from "bun:test";
-import { BrokerCli } from "../../src/broker/cli";
 import { canonicalJson } from "../../src/main-session/gates";
 import { GatewayStateStore } from "../../src/main-session/state";
 import { loadWayCore, type WayCoreHandle } from "../../src/native-loader";
@@ -48,13 +47,21 @@ async function connectEventually(socketPath: string): Promise<RpcClient> {
 	throw new Error(`RPC socket did not become available: ${socketPath}`);
 }
 
-async function waitForHealth(client: RpcClient, expected: "running" | "verifying" | "degraded" | "failed_closed"): Promise<Record<string, unknown>> {
+async function waitForHealth(client: RpcClient, expected: "running" | "degraded" | "failed_closed"): Promise<Record<string, unknown>> {
 	for (let attempt = 0; attempt < 500; attempt += 1) {
 		const response = await client.request("way.health", {});
 		if ((response.result as { state?: unknown } | undefined)?.state === expected) return response.result as Record<string, unknown>;
 		await Bun.sleep(10);
 	}
 	throw new Error(`Daemon did not reach ${expected}.`);
+}
+
+async function waitForFile(filePath: string, description: string): Promise<void> {
+	for (let attempt = 0; attempt < 500; attempt += 1) {
+		if (fs.existsSync(filePath)) return;
+		await Bun.sleep(10);
+	}
+	throw new Error(`${description}: ${filePath}`);
 }
 
 interface RunningDaemon {
@@ -81,6 +88,12 @@ async function stopDaemon(daemon: RunningDaemon | undefined): Promise<void> {
 	if (!daemon) return;
 	daemon.client.close();
 	await managedProcesses.stopDaemon(daemon.child);
+}
+
+async function readDaemonStderr(daemon: RunningDaemon): Promise<string> {
+	const stderr = daemon.child.stderr;
+	if (typeof stderr === "number") return "";
+	return await new Response(stderr).text();
 }
 
 async function run(command: readonly string[], cwd = process.cwd()): Promise<string> {
@@ -130,7 +143,7 @@ function stagePendingClosureOperation(
 	corpusPath: string,
 	sessionId: string,
 	params: { readonly paths: readonly string[]; readonly commit_message: string; readonly idempotency_key: string },
-): { readonly operationJson: string } {
+): { readonly intentJson: string; readonly operationJson: string } {
 	const requestJson = canonicalJson({
 		commit_message: params.commit_message,
 		idempotency_key: params.idempotency_key,
@@ -157,7 +170,7 @@ function stagePendingClosureOperation(
 			operationJson,
 		}),
 	).toMatchObject({ claimed: true });
-	return { operationJson };
+	return { intentJson, operationJson };
 }
 test("missing exact adopted broker identity fails closed over UDS, lingers unhealthy, exits 78, and never rebirths", async () => {
 	const fixture = new FakeBrokerFixture();
@@ -341,24 +354,34 @@ test("a transcript projection failure degrades the host and fences corpus closur
 	}
 }, 30_000);
 
-test("startup closure recovery refuses a staged Git effect after host degradation and a healthy boot finalizes it exactly once", async () => {
+test("startup closure recovery fences after lease acquisition before Git dispatch and later finalizes exactly once", async () => {
 	const fixture = new FakeBrokerFixture();
 	const corpus = path.join(fixture.root, "corpus");
 	const remote = path.join(fixture.root, "remote.git");
 	const stateDirectory = path.join(fixture.root, "state");
 	const profilePath = path.join(fixture.root, "profile.toml");
+	const acquireMarker = path.join(fixture.root, "closure-after-acquire.marker");
+	const acquireRelease = path.join(fixture.root, "closure-after-acquire.release");
 	const closeParams = {
 		paths: ["recovered-close.txt"],
 		commit_message: "recover only after a healthy boot",
 		idempotency_key: "startup-recovery-fence",
 	};
-	const busyOpRef = "startup-recovery-verification-busy";
 	const environment = {
 		...fixture.environment(),
 		NODE_ENV: "test",
 		GAJAEWAY_BROKER_CLI: fixture.executable,
 		GAJAEWAY_RECONCILE_POLL_MS: "600000",
 		GAJAEWAY_E2E_FAIL_TRANSCRIPT_PROJECTION: "1",
+		GAJAEWAY_E2E_CLOSURE_AFTER_ACQUIRE_MARKER: acquireMarker,
+		GAJAEWAY_E2E_CLOSURE_AFTER_ACQUIRE_RELEASE: acquireRelease,
+	};
+	const healthyEnvironment = {
+		...fixture.environment(),
+		NODE_ENV: "test",
+		GAJAEWAY_BROKER_CLI: fixture.executable,
+		GAJAEWAY_RECONCILE_POLL_MS: "600000",
+		GAJAEWAY_E2E_FAIL_TRANSCRIPT_PROJECTION: "0",
 	};
 	let degradedDaemon: RunningDaemon | undefined;
 	let healthyDaemon: RunningDaemon | undefined;
@@ -379,45 +402,45 @@ test("startup closure recovery refuses a staged Git effect after host degradatio
 		bootstrap(stateDirectory, profilePath, environment);
 
 		const observer = loadWayCore().WayCore.open(stateDirectory);
-		const state = new GatewayStateStore(observer);
-		const identity = state.read().mainIdentity;
-		if (!identity) throw new Error("bootstrap did not persist the adopted identity");
-		state.writeGrowthIntent(identity, Date.now());
-		const { operationJson } = stagePendingClosureOperation(observer, corpus, fixture.sessionId, closeParams);
-		fixture.setNoEnvelopeWhileBusy();
-		fixture.holdNextTurn();
-		await new BrokerCli({ executable: fixture.executable, environment: fixture.environment() }).sendPrompt(
-			fixture.sessionId,
-			"hold transcript verification until the staged closure recovery is fenced",
-			busyOpRef,
-		);
+		const { intentJson } = stagePendingClosureOperation(observer, corpus, fixture.sessionId, closeParams);
 		const localHead = await run(["git", "-C", corpus, "rev-parse", "HEAD"]);
 		const remoteHead = await run(["git", `--git-dir=${remote}`, "rev-parse", "main"]);
-
 		degradedDaemon = await startDaemon(stateDirectory, profilePath, environment);
-		expect(await waitForHealth(degradedDaemon.client, "verifying")).toMatchObject({ state: "verifying" });
-		expect(observer.gatewayMetaRead(["gitlock_closure_operation"]).entries[0]?.value).toBe(operationJson);
-		fixture.complete(busyOpRef, { text: "this transcript projection fails before recovery Git effects" });
+		expect(await waitForHealth(degradedDaemon.client, "running")).toMatchObject({ state: "running" });
+		await waitForFile(acquireMarker, "startup recovery did not acquire its closure lease");
+		expect(JSON.parse(fs.readFileSync(acquireMarker, "utf8"))).toEqual({ operation_id: "startup-recovery-fence", step: "after_acquire" });
+		const acquiredRaw = observer.gatewayMetaRead(["gitlock_closure_operation"]).entries[0]?.value;
+		expect(JSON.parse(acquiredRaw ?? "{}")).toMatchObject({ intentJson, state: "acquired" });
+
+		fixture.holdNextTurn();
+		const admission = await degradedDaemon.client.request("main.submit", {
+			text: "degrade the host while startup recovery holds its acquired closure",
+			surface_id: "owner",
+			idempotency_key: "startup-recovery-acquire-fence",
+		});
+		expect(admission.result).toMatchObject({ accepted: true, delivered_as: "prompt" });
+		fixture.complete((admission.result as { op_ref: string }).op_ref, { text: "projection failure fences the acquired closure" });
 		expect(await waitForHealth(degradedDaemon.client, "degraded")).toMatchObject({
 			status: "unhealthy",
 			state: "degraded",
 			reason: "transcript_delivery_progress_write_failed",
 		});
-		await Bun.sleep(500);
+		fs.writeFileSync(acquireRelease, "release\n", { encoding: "utf8", mode: 0o600 });
+		await Bun.sleep(250);
 		const refused = await degradedDaemon.client.request("main.corpus.close", closeParams);
 		expect(refused.error).toMatchObject({ code: 1003, message: "transcript_delivery_progress_write_failed" });
-		expect(state.read()).toMatchObject({ bootstrapState: "COMMITTED", failedClosedReason: undefined });
-		expect(observer.gatewayMetaRead(["gitlock_closure_operation"]).entries[0]?.value).toBe(operationJson);
+		const retainedRaw = observer.gatewayMetaRead(["gitlock_closure_operation"]).entries[0]?.value;
+		expect(JSON.parse(retainedRaw ?? "{}")).toMatchObject({ intentJson, state: "acquired" });
 		expect(await run(["git", "-C", corpus, "rev-parse", "HEAD"])).toBe(localHead);
 		expect(await run(["git", `--git-dir=${remote}`, "rev-parse", "main"])).toBe(remoteHead);
 		expect(await run(["git", `--git-dir=${remote}`, "rev-list", "--count", "main"])).toBe("1\n");
 
-		await stopDaemon(degradedDaemon);
+		const stoppedDaemon = degradedDaemon;
+		await stopDaemon(stoppedDaemon);
+		const stderr = await readDaemonStderr(stoppedDaemon);
+		expect(stderr).toContain("Pending corpus closure recovery refused: transcript_delivery_progress_write_failed");
 		degradedDaemon = undefined;
-		healthyDaemon = await startDaemon(stateDirectory, profilePath, {
-			...environment,
-			GAJAEWAY_E2E_FAIL_TRANSCRIPT_PROJECTION: "0",
-		});
+		healthyDaemon = await startDaemon(stateDirectory, profilePath, healthyEnvironment);
 		expect(await waitForHealth(healthyDaemon.client, "running")).toMatchObject({ state: "running" });
 		const finalized = await healthyDaemon.client.request("main.corpus.close", closeParams, { timeoutMs: 10_000 });
 		expect(finalized.result).toMatchObject({ committed: true });
@@ -430,6 +453,122 @@ test("startup closure recovery refuses a staged Git effect after host degradatio
 		expect(await run(["git", "-C", corpus, "rev-list", "--count", "HEAD"])).toBe("2\n");
 		expect(observer.gatewayMetaRead(["gitlock_closure_operation"]).entries[0]?.value).toBeUndefined();
 	} finally {
+		if (!fs.existsSync(acquireRelease)) fs.writeFileSync(acquireRelease, "release\n", { encoding: "utf8", mode: 0o600 });
+		await stopDaemon(healthyDaemon);
+		await stopDaemon(degradedDaemon);
+		fixture.dispose();
+	}
+}, 45_000);
+
+test("startup recovery retains a committed-not-pushed closure for exactly-once healthy push finalization", async () => {
+	const fixture = new FakeBrokerFixture();
+	const corpus = path.join(fixture.root, "corpus");
+	const remote = path.join(fixture.root, "remote.git");
+	const stateDirectory = path.join(fixture.root, "state");
+	const profilePath = path.join(fixture.root, "profile.toml");
+	const commitMarker = path.join(fixture.root, "closure-after-commit.marker");
+	const commitRelease = path.join(fixture.root, "closure-after-commit.release");
+	const closeParams = {
+		paths: ["committed-close.txt"],
+		commit_message: "push only after a healthy boot",
+		idempotency_key: "startup-recovery-commit-fence",
+	};
+	const environment = {
+		...fixture.environment(),
+		NODE_ENV: "test",
+		GAJAEWAY_BROKER_CLI: fixture.executable,
+		GAJAEWAY_RECONCILE_POLL_MS: "600000",
+		GAJAEWAY_E2E_FAIL_TRANSCRIPT_PROJECTION: "1",
+		GAJAEWAY_E2E_CLOSURE_AFTER_COMMIT_MARKER: commitMarker,
+		GAJAEWAY_E2E_CLOSURE_AFTER_COMMIT_RELEASE: commitRelease,
+	};
+	const healthyEnvironment = {
+		...fixture.environment(),
+		NODE_ENV: "test",
+		GAJAEWAY_BROKER_CLI: fixture.executable,
+		GAJAEWAY_RECONCILE_POLL_MS: "600000",
+		GAJAEWAY_E2E_FAIL_TRANSCRIPT_PROJECTION: "0",
+	};
+	let degradedDaemon: RunningDaemon | undefined;
+	let healthyDaemon: RunningDaemon | undefined;
+	try {
+		await run(["git", "init", "--bare", remote]);
+		await run(["git", "init", corpus]);
+		await run(["git", "-C", corpus, "config", "user.name", "Committed Recovery Fence Drill"]);
+		await run(["git", "-C", corpus, "config", "user.email", "committed-recovery-fence@example.test"]);
+		fs.writeFileSync(path.join(corpus, "base.txt"), "base\n");
+		fs.writeFileSync(path.join(corpus, "committed-close.txt"), "commit before the host degrades\n");
+		await run(["git", "-C", corpus, "add", "--", "base.txt"]);
+		await run(["git", "-C", corpus, "commit", "-m", "base"]);
+		await run(["git", "-C", corpus, "branch", "-M", "main"]);
+		await run(["git", "-C", corpus, "remote", "add", "origin", remote]);
+		await run(["git", "-C", corpus, "push", "-u", "origin", "main"]);
+		await run(["git", `--git-dir=${remote}`, "symbolic-ref", "HEAD", "refs/heads/main"]);
+		fs.writeFileSync(profilePath, profileContents(corpus, fixture.workspace, fixture.sessionId));
+		bootstrap(stateDirectory, profilePath, environment);
+
+		const observer = loadWayCore().WayCore.open(stateDirectory);
+		const { intentJson } = stagePendingClosureOperation(observer, corpus, fixture.sessionId, closeParams);
+		const localHead = (await run(["git", "-C", corpus, "rev-parse", "HEAD"])).trim();
+		const remoteHead = (await run(["git", `--git-dir=${remote}`, "rev-parse", "main"])).trim();
+		degradedDaemon = await startDaemon(stateDirectory, profilePath, environment);
+		expect(await waitForHealth(degradedDaemon.client, "running")).toMatchObject({ state: "running" });
+		await waitForFile(commitMarker, "startup recovery did not persist its committed closure evidence");
+		expect(JSON.parse(fs.readFileSync(commitMarker, "utf8"))).toEqual({ operation_id: "startup-recovery-fence", step: "after_commit" });
+		const committedHead = (await run(["git", "-C", corpus, "rev-parse", "HEAD"])).trim();
+		expect(committedHead).not.toBe(localHead);
+		const committedRaw = observer.gatewayMetaRead(["gitlock_closure_operation"]).entries[0]?.value;
+		expect(JSON.parse(committedRaw ?? "{}")).toMatchObject({
+			intentJson,
+			state: "committed",
+			evidence: { commitHead: committedHead, committed: true },
+		});
+
+		fixture.holdNextTurn();
+		const admission = await degradedDaemon.client.request("main.submit", {
+			text: "degrade the host after startup recovery commits but before it pushes",
+			surface_id: "owner",
+			idempotency_key: "startup-recovery-commit-fence",
+		});
+		expect(admission.result).toMatchObject({ accepted: true, delivered_as: "prompt" });
+		fixture.complete((admission.result as { op_ref: string }).op_ref, { text: "projection failure fences the pending push" });
+		expect(await waitForHealth(degradedDaemon.client, "degraded")).toMatchObject({
+			status: "unhealthy",
+			state: "degraded",
+			reason: "transcript_delivery_progress_write_failed",
+		});
+		fs.writeFileSync(commitRelease, "release\n", { encoding: "utf8", mode: 0o600 });
+		await Bun.sleep(250);
+		const refused = await degradedDaemon.client.request("main.corpus.close", closeParams);
+		expect(refused.error).toMatchObject({ code: 1003, message: "transcript_delivery_progress_write_failed" });
+		const retainedRaw = observer.gatewayMetaRead(["gitlock_closure_operation"]).entries[0]?.value;
+		expect(JSON.parse(retainedRaw ?? "{}")).toMatchObject({
+			intentJson,
+			state: "committed",
+			evidence: { commitHead: committedHead, committed: true },
+		});
+		expect((await run(["git", "-C", corpus, "rev-parse", "HEAD"])).trim()).toBe(committedHead);
+		expect((await run(["git", `--git-dir=${remote}`, "rev-parse", "main"])).trim()).toBe(remoteHead);
+		expect(await run(["git", "-C", corpus, "rev-list", "--count", "HEAD"])).toBe("2\n");
+		expect(await run(["git", `--git-dir=${remote}`, "rev-list", "--count", "main"])).toBe("1\n");
+
+		const stoppedDaemon = degradedDaemon;
+		await stopDaemon(stoppedDaemon);
+		const stderr = await readDaemonStderr(stoppedDaemon);
+		expect(stderr).toContain("Pending corpus closure recovery refused: transcript_delivery_progress_write_failed");
+		degradedDaemon = undefined;
+		healthyDaemon = await startDaemon(stateDirectory, profilePath, healthyEnvironment);
+		expect(await waitForHealth(healthyDaemon.client, "running")).toMatchObject({ state: "running" });
+		const finalized = await healthyDaemon.client.request("main.corpus.close", closeParams, { timeoutMs: 10_000 });
+		expect(finalized.result).toMatchObject({ committed: true });
+		const replay = await healthyDaemon.client.request("main.corpus.close", closeParams, { timeoutMs: 10_000 });
+		expect(replay.result).toEqual(finalized.result);
+		expect(await run(["git", `--git-dir=${remote}`, "show", "main:committed-close.txt"])).toBe("commit before the host degrades\n");
+		expect(await run(["git", `--git-dir=${remote}`, "rev-list", "--count", "main"])).toBe("2\n");
+		expect(await run(["git", "-C", corpus, "rev-list", "--count", "HEAD"])).toBe("2\n");
+		expect(observer.gatewayMetaRead(["gitlock_closure_operation"]).entries[0]?.value).toBeUndefined();
+	} finally {
+		if (!fs.existsSync(commitRelease)) fs.writeFileSync(commitRelease, "release\n", { encoding: "utf8", mode: 0o600 });
 		await stopDaemon(healthyDaemon);
 		await stopDaemon(degradedDaemon);
 		fixture.dispose();

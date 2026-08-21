@@ -12,10 +12,12 @@ import { createMainAdmissionHandler, MainAdmissionRecoveryError, reconcilePendin
 import { canonicalJson, createMainGateAnswerHandler } from "./main-session/gates";
 import {
 	ClosureError,
+	ClosureMutationReadinessError,
 	createClosureExecutor,
 	runClosureWorker,
 	type ClosureExecutor,
 	type ClosureHookContext,
+	type ClosureMutationReadinessReason,
 } from "./main-session/closure";
 
 import { bootstrapMainSession, recoverBootstrap } from "./main-session/bootstrap";
@@ -284,7 +286,7 @@ interface InFlightCorpusClosure {
 	readonly response: Promise<CorpusClosureResponse>;
 }
 
-type MutationReadinessReason = () => string | undefined;
+type MutationReadinessReason = ClosureMutationReadinessReason;
 
 class ClosureRecoveryReadinessRefusal extends Error {
 	readonly reason: string;
@@ -651,6 +653,17 @@ async function gitOutput(corpusPath: string, args: readonly string[]): Promise<s
 	return stdout.trim();
 }
 
+async function pauseClosureHookForE2e(
+	operationId: string,
+	step: "after_acquire" | "after_commit",
+	markerPath: string | undefined,
+	releasePath: string | undefined,
+): Promise<void> {
+	if (Bun.env.NODE_ENV !== "test" || !markerPath || !releasePath) return;
+	fs.writeFileSync(markerPath, `${JSON.stringify({ operation_id: operationId, step })}\n`, { encoding: "utf8", mode: 0o600 });
+	while (!fs.existsSync(releasePath)) await Bun.sleep(10);
+}
+
 async function pauseAfterPushedClosure(operationId: string, evidence: ClosureOperationEvidence): Promise<void> {
 	if (Bun.env.NODE_ENV !== "test") return;
 	const markerPath = Bun.env.GAJAEWAY_E2E_CLOSURE_AFTER_PUSH_MARKER;
@@ -683,6 +696,12 @@ function createClosureHooks(core: WayCoreHandle): NonNullable<Parameters<typeof 
 				leaseId: context.leaseId,
 				fencingToken: context.fencingToken,
 			});
+			await pauseClosureHookForE2e(
+				operationId,
+				"after_acquire",
+				Bun.env.GAJAEWAY_E2E_CLOSURE_AFTER_ACQUIRE_MARKER,
+				Bun.env.GAJAEWAY_E2E_CLOSURE_AFTER_ACQUIRE_RELEASE,
+			);
 		},
 		after_pull: async (context) => {
 			const operationId = operationIdFromContext(context);
@@ -719,6 +738,12 @@ function createClosureHooks(core: WayCoreHandle): NonNullable<Parameters<typeof 
 				(await gitOutput(context.request.corpusPath, ["rev-parse", "HEAD^"])) === evidence.baseHead &&
 				(await gitOutput(context.request.corpusPath, ["rev-parse", "HEAD^{tree}"])) === evidence.stagedTree;
 			advanceClosureOperation(core, operationId, "committed", { commitHead: head, committed });
+			await pauseClosureHookForE2e(
+				operationId,
+				"after_commit",
+				Bun.env.GAJAEWAY_E2E_CLOSURE_AFTER_COMMIT_MARKER,
+				Bun.env.GAJAEWAY_E2E_CLOSURE_AFTER_COMMIT_RELEASE,
+			);
 		},
 		after_push: async (context) => {
 			const operationId = operationIdFromContext(context);
@@ -798,9 +823,6 @@ async function executeAndFinalizeClosureOperation(
 ): Promise<CorpusClosureResponse> {
 	let closure: Awaited<ReturnType<ClosureExecutor["execute"]>>;
 	try {
-		// Re-check the host-owned fence at the closure effect boundary; verified
-		// transcript evidence alone is not sufficient.
-		assertMutationReadiness(mutationReadinessReason);
 		closure = await closures.execute({
 			sessionId: intent.sessionId,
 			corpusPath: intent.corpusPath,
@@ -808,6 +830,7 @@ async function executeAndFinalizeClosureOperation(
 			class: "batch",
 			paths: intent.paths,
 			commitMessage: intent.commitMessage,
+			mutationReadinessReason,
 		});
 	} catch (error) {
 		closureExecutionFailure(error);
@@ -858,19 +881,24 @@ async function reconcilePendingClosureOperation(
 	try {
 		await executeAndFinalizeClosureOperation(core, closures, intent, operation.record.intentJson, mutationReadinessReason);
 	} catch (error) {
-		if (error instanceof RpcBridgeException && error.code === 1003) {
-			throw new ClosureRecoveryReadinessRefusal(error.message);
+		if (error instanceof ClosureMutationReadinessError) {
+			throw new ClosureRecoveryReadinessRefusal(error.reason);
 		}
 		throw error;
 	}
 }
 
 function closureExecutionFailure(error: unknown): never {
-	if (error instanceof RpcBridgeException) throw error;
+	if (error instanceof ClosureMutationReadinessError || error instanceof RpcBridgeException) throw error;
 	if (error instanceof ClosureError && error.code !== undefined) {
 		throw new RpcBridgeException(error.code, error.message);
 	}
 	throw new RpcBridgeException(-32603, error instanceof Error ? error.message : String(error));
+}
+
+function closureRpcExecutionFailure(error: unknown): never {
+	if (error instanceof ClosureMutationReadinessError) throw new RpcBridgeException(1003, error.reason);
+	throw error;
 }
 
 function assertMutationReadiness(mutationReadinessReason: MutationReadinessReason): void {
@@ -887,7 +915,7 @@ function closureBridgeHandler(
 	closures: ClosureExecutor,
 	corpusPath: string,
 	sessionId: string,
-	mutationReadinessReason: () => string | undefined,
+	mutationReadinessReason: MutationReadinessReason,
 ): RpcBridgeHandler {
 	const inFlightByKey = new Map<string, InFlightCorpusClosure>();
 	return async (method, params) => {
@@ -897,7 +925,11 @@ function closureBridgeHandler(
 		const inFlight = inFlightByKey.get(request.idempotencyKey);
 		if (inFlight) {
 			if (inFlight.requestJson !== request.requestJson) throw new RpcBridgeException(1500, "idempotency_conflict");
-			return await inFlight.response;
+			try {
+				return await inFlight.response;
+			} catch (error) {
+				closureRpcExecutionFailure(error);
+			}
 		}
 
 		const created = createClosureOperationIntent(request, corpusPath, sessionId);
@@ -932,6 +964,8 @@ function closureBridgeHandler(
 			inFlightByKey.set(request.idempotencyKey, { requestJson: request.requestJson, response });
 			try {
 				return await response;
+			} catch (error) {
+				closureRpcExecutionFailure(error);
 			} finally {
 				if (inFlightByKey.get(request.idempotencyKey)?.response === response)
 					inFlightByKey.delete(request.idempotencyKey);
@@ -942,6 +976,8 @@ function closureBridgeHandler(
 		inFlightByKey.set(request.idempotencyKey, { requestJson: request.requestJson, response });
 		try {
 			return await response;
+		} catch (error) {
+			closureRpcExecutionFailure(error);
 		} finally {
 			if (inFlightByKey.get(request.idempotencyKey)?.response === response)
 				inFlightByKey.delete(request.idempotencyKey);

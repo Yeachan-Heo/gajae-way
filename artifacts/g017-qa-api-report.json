@@ -1,68 +1,25 @@
 {
   "schemaVersion": 1,
   "kind": "api-package-test-report",
-  "sourceHash": "sha256:5377dc936885a58b4e708cbde30f698b8818578cd7f41d62f901e7451508988d",
-  "snapshotCommit": "8cdac2ad5642c2cb0372c2554d50d0f95ddab071",
-  "priorSnapshotCommit": "3c3ac8d49119193a7e9e05ec90134f57c6d03773",
+  "sourceHash": "sha256:5aa3f3d7b47403f410a72d931f3d3c18b9e0b6a2b9c4aaa21f0c0a4d81227e14",
+  "snapshotCommit": "d9cc76df33bab2da22d0a763d6986d0cc70293c8",
+  "priorSnapshotCommit": "8cdac2ad5642c2cb0372c2554d50d0f95ddab071",
   "status": "passed",
   "e2eStatus": "passed",
   "redTeamStatus": "passed",
   "planCodeMismatch": false,
   "commands": [
     {
-      "command": "bun test test/unit/main-session.test.ts",
-      "classification": "focused state, proof, atomic projection, and injected-failure suite",
-      "passed": 33,
-      "failed": 0,
-      "expectCalls": 111,
-      "verdict": "passed"
-    },
-    {
-      "command": "bun test test/integration/p4.test.ts",
-      "classification": "owner-UDS external-broker integration suite",
-      "passed": 21,
-      "failed": 0,
-      "expectCalls": 115,
-      "observed": "Intentional bridge-error logs covered post-acceptance interruption, receipt loss, and definitive broker rejection paths.",
-      "verdict": "passed"
-    },
-    {
       "command": "bun test test/qa/recovery-fail-closed.test.ts",
-      "classification": "real daemon/UDS recovery and mutation-fence suite",
-      "passed": 6,
+      "classification": "affected real-daemon/UDS closure-recovery and mutation-fence suite",
+      "passed": 7,
       "failed": 0,
-      "expectCalls": 43,
-      "verdict": "passed"
-    },
-    {
-      "command": "bun test test/integration/discord.test.ts",
-      "classification": "Discord durable-admission and acknowledgement integration suite",
-      "passed": 8,
-      "failed": 0,
-      "expectCalls": 41,
-      "observed": "Expected fixture broker-rejection bridge-error log occurred in its negative path.",
-      "verdict": "passed"
-    },
-    {
-      "command": "bun test test/qa/uds-negative-paths.test.ts",
-      "classification": "owner-UDS malformed and negative-path suite",
-      "passed": 3,
-      "failed": 0,
-      "expectCalls": 11,
-      "verdict": "passed"
-    },
-    {
-      "command": "bun test test/integration/console.test.ts",
-      "classification": "cockpit terminal integration suite",
-      "passed": 24,
-      "failed": 0,
-      "expectCalls": 111,
-      "observed": "Expected shutdown/request-cancel internal-error logs occurred during teardown.",
+      "expectCalls": 60,
       "verdict": "passed"
     },
     {
       "command": "bun scripts/compile.ts",
-      "classification": "build frozen snapshot into current darwin-arm64 executables",
+      "classification": "required rebuild of the frozen d9cc76d snapshot before compiled e2e",
       "passed": 1,
       "failed": 0,
       "observed": "Compiled and codesigned dist/gajaeway and dist/gajaeway-discord for darwin-arm64.",
@@ -70,7 +27,7 @@
     },
     {
       "command": "bun test test/e2e/compiled-closure.test.ts",
-      "classification": "post-build compiled corpus-closure and deferred-proof suite",
+      "classification": "post-rebuild compiled closure and verification-fence e2e",
       "passed": 4,
       "failed": 0,
       "expectCalls": 25,
@@ -78,23 +35,65 @@
     },
     {
       "command": "bun test test/e2e/systemd.test.ts",
-      "classification": "post-build compiled executable systemd-topology suite",
+      "classification": "post-rebuild compiled executable topology e2e",
       "passed": 4,
       "failed": 0,
       "expectCalls": 100,
       "verdict": "passed"
     },
     {
-      "command": "bun /tmp/g018-red-team-probes.ts",
-      "classification": "throwaway adversarial owner-UDS, SQLite-tamper, host-construction, broker, and Discord probe suite",
-      "passed": 7,
+      "command": "bun /tmp/g019-closure-recovery-red-team.ts",
+      "classification": "new throwaway real-daemon closure-recovery red-team probe",
+      "passed": 1,
       "failed": 0,
-      "observed": "The probe report is /tmp/g018-adversarial-probe-results.json; expected bridge-error logs represented deliberately rejected/ambiguous admissions.",
+      "observed": "Staged a durable closure intent, forced transcript projection degradation before recovery effect, captured the typed refusal on stderr, then verified healthy automatic recovery and five concurrent same-key replays did not create a second commit.",
       "verdict": "passed"
     },
     {
-      "command": "bun /tmp/g018-console-transcript.ts",
-      "classification": "throwaway redirected copy of the raw-TTY console transcript harness",
+      "command": "bun /tmp/g019-gen3-regression-probes.ts",
+      "classification": "throwaway Generation-3 regression probes rebound to the Generation-4 source hash",
+      "passed": 7,
+      "failed": 0,
+      "observed": "Re-ran pending-proof gap, unified mutation fence, null/missing proof, mandatory projection journal, disposition, and Discord acknowledgement drills through real fixture/UDS boundaries.",
+      "verdict": "passed"
+    },
+    {
+      "command": "bun test test/unit/main-session.test.ts",
+      "classification": "focused proof, transcript-delivery, atomic projection, and injected-failure regression suite",
+      "passed": 33,
+      "failed": 0,
+      "expectCalls": 111,
+      "verdict": "passed"
+    },
+    {
+      "command": "bun test test/integration/p4.test.ts",
+      "classification": "owner-UDS/external-broker integration regression suite",
+      "passed": 21,
+      "failed": 0,
+      "expectCalls": 115,
+      "observed": "Expected bridge-error logs represented deliberate interruption, receipt-loss, and broker-rejection drills.",
+      "verdict": "passed"
+    },
+    {
+      "command": "bun test test/integration/discord.test.ts",
+      "classification": "Discord durable-admission and acknowledgement regression suite",
+      "passed": 8,
+      "failed": 0,
+      "expectCalls": 41,
+      "observed": "Expected broker-rejection bridge-error log occurred only in its negative-path drill.",
+      "verdict": "passed"
+    },
+    {
+      "command": "bun test test/qa/uds-negative-paths.test.ts",
+      "classification": "owner-UDS protocol negative-path suite",
+      "passed": 3,
+      "failed": 0,
+      "expectCalls": 11,
+      "verdict": "passed"
+    },
+    {
+      "command": "bun /tmp/g019-console-transcript.ts",
+      "classification": "new throwaway redirected raw-TTY cockpit transcript harness",
       "passed": 1,
       "failed": 0,
       "observed": {
@@ -118,30 +117,30 @@
     },
     {
       "command": "./dist/gajaeway --help",
-      "classification": "real compiled CLI invocation",
+      "classification": "real rebuilt compiled CLI invocation",
       "passed": 1,
       "failed": 0,
       "observed": "Printed the same supported command surface as the source CLI.",
       "verdict": "passed"
     },
     {
-      "command": "LC_ALL=C bun -e 'console.log(\"g018-cli-ok\")'",
+      "command": "LC_ALL=C bun -e 'console.log(\"g019-cli-ok\")'",
       "classification": "safe deterministic CLI replay",
       "passed": 1,
       "failed": 0,
-      "recordedStdout": "g018-cli-ok\n",
+      "recordedStdout": "g019-cli-ok\n",
       "recordedStderr": "",
       "verdict": "passed"
     },
     {
-      "command": "git diff --check 3c3ac8d..8cdac2ad && git diff --check",
-      "classification": "frozen delta and generated-artifact whitespace validation",
+      "command": "git diff --check 8cdac2a..d9cc76d && git diff --check",
+      "classification": "frozen-delta and refreshed-artifact whitespace validation",
       "passed": 1,
       "failed": 0,
       "verdict": "passed"
     },
     {
-      "command": "git grep -n '@gajae-code/coding-agent' 8cdac2ad -- package.json bun.lock src test scripts README.md || true",
+      "command": "git grep -n '@gajae-code/coding-agent' d9cc76d -- package.json bun.lock src test scripts README.md || true",
       "classification": "retained removed-dependency guard",
       "passed": 1,
       "failed": 0,
@@ -151,75 +150,80 @@
   ],
   "contractCoverage": [
     {
-      "contractRef": "B1",
-      "obligation": "A pending-proof promotion must atomically durably bind its proof and journal a visible transcript_delivery_gap for any unprojected post-commit transcript suffix; finalized replies may be projected only when delivery is provable, never silently baselined.",
+      "contractRef": "R1",
+      "obligation": "Startup closure recovery must consult the host mutation-readiness fence immediately before any recovered Git effect. A readiness refusal is non-fatal, visibly logged, and retains the exact durable intent; a later healthy restart completes it once without duplicate finalization.",
       "status": "covered",
       "evidence": [
-        "bun /tmp/g018-red-team-probes.ts :: pending-proof-promotion-visible-gap-over-owner-uds observed transcriptProof=proven, gapCount=1, and one owner-UDS transcript_delivery_gap with adoption=pending_proof_promotion.",
-        "test/integration/p4.test.ts :: pending busy adoption records a visible delivery gap when its first complete tail includes a post-commit reply.",
-        "test/unit/main-session.test.ts :: strict resume records a visible delivery gap when pending-proof promotion covers a post-commit reply."
+        "test/qa/recovery-fail-closed.test.ts :: startup closure recovery refuses a staged Git effect after host degradation and a healthy boot finalizes it exactly once (7-suite result: 60 assertions total).",
+        "bun /tmp/g019-closure-recovery-red-team.ts :: staged raw closure intent remained byte-for-byte present through forced transcript_delivery_progress_write_failed; stderr contained Pending corpus closure recovery refused: transcript_delivery_progress_write_failed; three degraded closure calls returned 1003 without commit/push; healthy restart autonomously produced exactly one additional remote commit and cleared the intent; five concurrent same-key calls returned one identical replay response with remote history still at two commits."
+      ]
+    },
+    {
+      "contractRef": "B1",
+      "obligation": "Pending-proof promotion atomically binds the transcript proof and journals a visible transcript_delivery_gap for an unprojected post-commit suffix; it never silently baselines a finalized reply.",
+      "status": "covered",
+      "evidence": [
+        "bun /tmp/g019-gen3-regression-probes.ts :: pending-proof promotion observed transcriptProof=proven, gapCount=1, journalKinds=[transcript_delivery_gap], and adoption=pending_proof_promotion over owner UDS.",
+        "bun test test/integration/p4.test.ts :: pending busy adoption records a visible delivery gap when its first complete tail includes a post-commit reply.",
+        "bun test test/unit/main-session.test.ts :: strict resume records a visible delivery gap when pending-proof promotion covers a post-commit reply."
       ]
     },
     {
       "contractRef": "B2",
-      "obligation": "mutationReadinessReason is the one host fence for main.submit and main.corpus.close: a projection/journal failure must prevent a second broker admission and prevent closure claim, commit, and push.",
+      "obligation": "mutationReadinessReason remains the sole host fence for both main.submit and main.corpus.close after a transcript/journal projection failure, before broker or Git effects.",
       "status": "covered",
       "evidence": [
-        "bun /tmp/g018-red-team-probes.ts :: forced transcript projection failure produced way.health degraded/transcript_delivery_progress_write_failed; both main.submit and main.corpus.close returned 1003 with that reason, the second broker attempt was absent, gitlock_closure_operation was absent, and local/remote Git heads were unchanged.",
-        "test/qa/recovery-fail-closed.test.ts :: a transcript projection failure degrades the host and fences corpus closure before any claim, commit, or push.",
-        "test/e2e/compiled-closure.test.ts :: pending and verifying transcript states fence compiled closure before effects."
+        "bun /tmp/g019-gen3-regression-probes.ts :: forced projection failure produced transcript_delivery_progress_write_failed; main.submit and main.corpus.close both returned 1003, the second broker attempt was absent, gitlock_closure_operation was absent, and local/remote Git heads were unchanged.",
+        "bun /tmp/g019-closure-recovery-red-team.ts :: three direct corpus-close attempts remained fenced while a startup recovery intent was retained in degraded state.",
+        "bun test test/qa/recovery-fail-closed.test.ts :: source-suite fence assertions passed."
       ]
     },
     {
       "contractRef": "C1",
-      "obligation": "Current-schema missing or null durable transcript_proof is corrupt state at read time. It must not be silently derived from main_identity; only the designated schema migration may handle historic state.",
+      "obligation": "Current-schema null or missing durable transcript_proof is corrupt state at read time and must fail closed rather than be re-derived from main_identity.",
       "status": "covered",
       "evidence": [
-        "bun /tmp/g018-red-team-probes.ts :: raw SQLite UPDATE transcript_proof='null' yielded owner-UDS way.health unhealthy/failed_closed/metadata_invalid and exit 78.",
-        "bun /tmp/g018-red-team-probes.ts :: raw SQLite DELETE left zero transcript_proof rows and yielded owner-UDS way.health unhealthy/failed_closed/metadata_invalid and exit 78.",
-        "test/unit/main-session.test.ts :: missing transcript_proof metadata is corrupt durable state, not an inferred legacy proof."
+        "bun /tmp/g019-gen3-regression-probes.ts :: raw SQLite transcript_proof=null yielded owner-UDS health unhealthy/failed_closed/metadata_invalid and exit 78.",
+        "bun /tmp/g019-gen3-regression-probes.ts :: raw SQLite deletion left zero transcript_proof rows and yielded owner-UDS health unhealthy/failed_closed/metadata_invalid and exit 78.",
+        "bun test test/unit/main-session.test.ts :: state parser rejects missing and null transcript_proof metadata."
       ]
     },
     {
       "contractRef": "C2",
-      "obligation": "journalAppendTranscriptProjection is mandatory for transcript delivery; no journal-plus-progress split-write fallback may be constructed or used.",
+      "obligation": "journalAppendTranscriptProjection remains mandatory and no split journal/delivery write fallback is constructible or used.",
       "status": "covered",
       "evidence": [
-        "bun /tmp/g018-red-team-probes.ts :: host construction with only journalAppend failed transcript_projection_journal_unavailable before any broker command or admission attempt.",
-        "bun /tmp/g018-red-team-probes.ts :: injected atomic projection failure left delivery at transcript:2 rather than silently advancing the assistant at transcript:3.",
-        "test/unit/main-session.test.ts and test/qa/recovery-fail-closed.test.ts exercise state.appendTranscriptProjection and projection-write failure fencing."
+        "bun /tmp/g019-gen3-regression-probes.ts :: host construction without journalAppendTranscriptProjection failed transcript_projection_journal_unavailable before commands=0/admissionAttempts=0.",
+        "The same probe's injected projection failure retained durable delivery at transcript:2 rather than silently advancing the assistant at transcript:3.",
+        "bun test test/unit/main-session.test.ts and bun test test/qa/recovery-fail-closed.test.ts passed atomic projection/write-failure drills."
       ]
     },
     {
       "contractRef": "C3",
-      "obligation": "classifyAdmissionDisposition is the central distinction for both settlement and durable claim handling: definitive rejection abandons its claim; non-definitive failure retains it and never resends until reconciliation/terminal evidence.",
+      "obligation": "The centralized broker admission disposition abandons a definitive-rejection claim but retains and fences a non-definitive claim without resend until terminal evidence settles it.",
       "status": "covered",
       "evidence": [
-        "bun /tmp/g018-red-team-probes.ts :: definitive fixture rejection left zero pending claims and permitted one later retry; ambiguous receipt loss retained one claim, exact replay returned 1003 admission_recovery_pending, broker attempts/commands stayed one, and terminal evidence settled the claim.",
-        "test/integration/p4.test.ts :: definitive broker rejection abandons only its claim while ambiguous accepted claims reconcile without resend.",
-        "test/unit/main-session.test.ts :: failed definitive-rejection claim abandonment degrades and fences the host without a resend."
+        "bun /tmp/g019-gen3-regression-probes.ts :: definitive rejection left zero pending claims and permitted one later retry; ambiguous receipt loss replayed as 1003 admission_recovery_pending with attempts=1 and commands=1 until terminal evidence settled it.",
+        "bun test test/integration/p4.test.ts and bun test test/unit/main-session.test.ts passed disposition and claim-abandon regression drills."
       ]
     },
     {
       "contractRef": "C4",
-      "obligation": "Discord acknowledgement timing begins only once the adapter observes a successful durable main.submit acceptance. A delayed successful admission gets typing; a failed admission gets no typing.",
+      "obligation": "Discord acknowledgement timing starts at observed durable main.submit acceptance: a delayed successful admission types; a failed admission does not.",
       "status": "covered",
       "evidence": [
-        "bun /tmp/g018-red-team-probes.ts :: virtual inbound time 1000 and observed accepted response 3501 still yielded one typing acknowledgement at 3501; the following rejected admission added none and left no host fence or pending claim.",
-        "test/integration/discord.test.ts :: Discord typing starts after delayed durable main.submit acceptance and does not follow a stale healthy-to-fenced connection."
+        "bun /tmp/g019-gen3-regression-probes.ts :: inbound timestamp 1000 and observed acceptance 3501 yielded typing at 3501; a following rejected admission did not increase acknowledgement count.",
+        "bun test test/integration/discord.test.ts :: 8 cases / 41 assertions passed."
       ]
     },
     {
       "contractRef": "C5",
-      "obligation": "Injected recovery failures must retain the expected safety signal: no resend or silent delivery/ring progress, plus the documented mutation fence, degraded state, or FAILED_CLOSED state.",
+      "obligation": "Injected recovery failures keep their required no-resend/no-silent-progress invariant and publish the expected fence, degraded state, or FAILED_CLOSED state.",
       "status": "covered",
       "evidence": [
-        "test/unit/main-session.test.ts :: transcript_proof_persist_failed fails closed with no delivery advance, broker command, or admission attempt.",
-        "test/unit/main-session.test.ts :: tail_resync_unavailable fails closed with delivery unchanged and sends=0.",
-        "test/unit/main-session.test.ts :: tail_ring_rotation_write_failed fences with ring and delivery metadata unadvanced and sends=0.",
-        "test/qa/recovery-fail-closed.test.ts and the custom real-daemon probe :: transcript_delivery_progress_write_failed exposes degraded health, retains the pre-assistant delivery point, and fences submit/closure before broker or Git effects.",
-        "test/qa/recovery-fail-closed.test.ts :: main_admission_recovery_unavailable, main_admission_recovery_unprovable, and main_admission_intent_invalid each fail closed without a broker resend.",
-        "test/unit/main-session.test.ts :: main_admission_claim_abandon_failed degrades/fences the host while retaining the unresolved durable claim and without a resend."
+        "bun test test/unit/main-session.test.ts :: transcript_proof_persist_failed, tail_resync_unavailable, tail_ring_rotation_write_failed, transcript_delivery_progress_write_failed, and main_admission_claim_abandon_failed drills passed.",
+        "bun test test/qa/recovery-fail-closed.test.ts :: main_admission_recovery_unavailable, main_admission_recovery_unprovable, main_admission_intent_invalid, projection failure, and the new deferred closure-recovery drill passed.",
+        "bun /tmp/g019-gen3-regression-probes.ts :: direct UDS projection-failure probe retained delivery before assistant projection and blocked mutation effects."
       ]
     }
   ],
@@ -227,192 +231,157 @@
     {
       "surface": "api",
       "invocations": [
-        "bun /tmp/g018-red-team-probes.ts",
-        "bun test test/integration/p4.test.ts",
+        "bun /tmp/g019-closure-recovery-red-team.ts",
+        "bun /tmp/g019-gen3-regression-probes.ts",
         "bun test test/qa/recovery-fail-closed.test.ts",
+        "bun test test/integration/p4.test.ts",
         "bun test test/qa/uds-negative-paths.test.ts"
       ],
-      "observed": "Real owner UDS calls covered way.health, way.status, main.events.read, main.submit, and main.corpus.close. The process drill observed degraded transcript-delivery failure fencing both mutation methods, no closure claim/commit/push, and both raw-SQLite null and deleted transcript_proof corruptions as failed_closed with exit 78.",
+      "observed": "Real owner UDS calls exercised way.health, main.events.read, main.submit, and main.corpus.close. The new process drill captured the startup-recovery readiness refusal, retained intent, no local/remote Git effect while degraded, automatic healthy recovery, and five same-key replay attempts without a duplicate commit. SQLite null/delete proof tampering reached failed_closed with exit 78.",
       "verdict": "passed"
     },
     {
       "surface": "cli",
       "invocations": [
-        "bun src/main.ts --help",
-        "./dist/gajaeway --help",
-        "LC_ALL=C bun -e 'console.log(\"g018-cli-ok\")'",
         "bun scripts/compile.ts",
+        "./dist/gajaeway --help",
+        "bun src/main.ts --help",
+        "LC_ALL=C bun -e 'console.log(\"g019-cli-ok\")'",
         "bun test test/e2e/compiled-closure.test.ts",
         "bun test test/e2e/systemd.test.ts"
       ],
-      "observed": "Source and compiled commands printed the same supported CLI surface; the safe replay produced exactly g018-cli-ok newline with empty stderr; compiled closure and systemd suites passed after the build.",
+      "observed": "The rebuilt compiled daemon and source CLI exposed the same supported command surface. The deterministic replay wrote exactly g019-cli-ok newline with empty stderr; compiled closure and systemd e2e passed after the required rebuild.",
       "verdict": "passed"
     },
     {
       "surface": "tui",
       "invocations": [
-        "bun /tmp/g018-console-transcript.ts",
-        "bun test test/integration/console.test.ts"
+        "bun /tmp/g019-console-transcript.ts"
       ],
-      "observed": "A redirected raw-TTY harness drove the live external-host Unix-socket gateway. The stored capture has 14,216 UTF-8 bytes and 358 ESC bytes, including alternate-screen enter/exit, Delivered as: prompt, and an Assistant frame.",
+      "observed": "The newly rerun redirected raw-TTY harness drove a real external-host UDS gateway. The refreshed capture contains 14,216 UTF-8 bytes and 358 ESC bytes, alternate-screen enter/exit, Delivered as: prompt, and an Assistant frame.",
       "verdict": "passed"
     }
   ],
   "adversarialCases": [
     {
-      "scenario": "Finalize an operator-owned busy turn after bootstrap commits a pending proof.",
-      "expectedBehavior": "The first complete tail atomically proves the transcript and records a visible pending_proof_promotion transcript_delivery_gap instead of silently consuming the reply.",
-      "invocation": "bun /tmp/g018-red-team-probes.ts",
-      "observed": "proof=proven, gapCount=1, one owner-UDS gap with the proof-binding checkpoint, no assistant_message baseline event.",
+      "scenario": "Stage an exact durable startup closure intent, force transcript projection failure before recovery executes, and call corpus.close three times while degraded.",
+      "expectedBehavior": "Recovery refusal is visible and non-fatal; the original intent remains; no claim replacement, local commit, or remote push occurs.",
+      "invocation": "bun /tmp/g019-closure-recovery-red-team.ts",
+      "observed": "stderr contained the typed refusal; all three calls returned 1003 transcript_delivery_progress_write_failed; original intent remained; local/remote heads and remote count stayed at one.",
       "verdict": "passed"
     },
     {
-      "scenario": "Force journalAppendTranscriptProjection to fail after an accepted owner turn and then invoke both guarded mutations.",
-      "expectedBehavior": "The host degrades; assistant delivery is not advanced; main.submit cannot reach the broker and main.corpus.close cannot claim, commit, or push.",
-      "invocation": "bun /tmp/g018-red-team-probes.ts; bun test test/qa/recovery-fail-closed.test.ts",
-      "observed": "Both calls returned 1003 transcript_delivery_progress_write_failed; no second broker attempt; no closure operation; Git heads unchanged.",
+      "scenario": "Restart healthily with the deferred closure intent and attack finalization with five concurrent same-key calls.",
+      "expectedBehavior": "Healthy startup autonomously finalizes and clears the intent once; all later same-key calls replay one response without a second Git commit.",
+      "invocation": "bun /tmp/g019-closure-recovery-red-team.ts",
+      "observed": "Automatic recovery reached remote/local count two and cleared the intent before RPC calls; five responses were identical; final remote count remained two.",
       "verdict": "passed"
     },
     {
-      "scenario": "Raw-SQLite tamper transcript_proof to null after a normal bootstrap.",
-      "expectedBehavior": "No transcript proof is re-derived; UDS health is failed_closed and the daemon exits 78.",
-      "invocation": "bun /tmp/g018-red-team-probes.ts",
-      "observed": "storedProof=null; health=unhealthy/failed_closed/metadata_invalid; exitCode=78.",
+      "scenario": "Finalize an operator-owned busy turn after pending adoption commit.",
+      "expectedBehavior": "A visible pending-proof promotion delivery gap is atomically recorded, never a silent baseline.",
+      "invocation": "bun /tmp/g019-gen3-regression-probes.ts; bun test test/integration/p4.test.ts",
+      "observed": "proof=proven, gapCount=1, one transcript_delivery_gap with adoption=pending_proof_promotion.",
       "verdict": "passed"
     },
     {
-      "scenario": "Raw-SQLite delete transcript_proof after a normal bootstrap.",
-      "expectedBehavior": "No transcript proof is re-derived; UDS health is failed_closed and the daemon exits 78.",
-      "invocation": "bun /tmp/g018-red-team-probes.ts",
-      "observed": "remainingRows=0 before startup; health=unhealthy/failed_closed/metadata_invalid; exitCode=78.",
+      "scenario": "Force atomic transcript projection failure, then submit and close mutations.",
+      "expectedBehavior": "Both mutation methods are fenced before broker or Git effect; assistant delivery does not silently advance.",
+      "invocation": "bun /tmp/g019-gen3-regression-probes.ts; bun test test/qa/recovery-fail-closed.test.ts",
+      "observed": "Both calls returned 1003 transcript_delivery_progress_write_failed; no broker resend, closure operation, commit, or push.",
       "verdict": "passed"
     },
     {
-      "scenario": "Construct a host with a journal lacking journalAppendTranscriptProjection.",
-      "expectedBehavior": "Construction refuses the split-write-capable journal before any broker effect.",
-      "invocation": "bun /tmp/g018-red-team-probes.ts",
-      "observed": "failureReason=transcript_projection_journal_unavailable; commands=0; admissionAttempts=0.",
+      "scenario": "Tamper current SQLite transcript_proof to null and then delete it.",
+      "expectedBehavior": "Neither state is re-derived from main_identity; each fails closed over UDS and exits 78.",
+      "invocation": "bun /tmp/g019-gen3-regression-probes.ts; bun test test/unit/main-session.test.ts",
+      "observed": "null and missing cases both returned failed_closed/metadata_invalid and exit 78.",
       "verdict": "passed"
     },
     {
-      "scenario": "Make the broker definitively reject an admission, then retry its same idempotency key.",
-      "expectedBehavior": "The rejected claim is abandoned and a later retry is a fresh, single broker operation.",
-      "invocation": "bun /tmp/g018-red-team-probes.ts; bun test test/integration/p4.test.ts",
-      "observed": "First rejection left no pending claim; retry produced two total attempts but exactly one accepted prompt command.",
+      "scenario": "Construct a host without journalAppendTranscriptProjection.",
+      "expectedBehavior": "No split-write fallback starts or reaches the broker.",
+      "invocation": "bun /tmp/g019-gen3-regression-probes.ts",
+      "observed": "Constructor returned transcript_projection_journal_unavailable before any command or admission attempt.",
       "verdict": "passed"
     },
     {
-      "scenario": "Lose an accepted broker receipt and replay the exact idempotency key before terminal evidence.",
-      "expectedBehavior": "The pre-effect claim remains, ingress is fenced, and the broker command is never resent.",
-      "invocation": "bun /tmp/g018-red-team-probes.ts; bun test test/integration/p4.test.ts",
-      "observed": "Replay returned 1003 admission_recovery_pending; attempts=1; commands=1; terminal tail evidence later settled the claim.",
+      "scenario": "Definitive broker rejection then retry; ambiguous accepted receipt loss then replay.",
+      "expectedBehavior": "Only the definitive claim is abandoned; ambiguity is retained/fenced without resend until terminal evidence.",
+      "invocation": "bun /tmp/g019-gen3-regression-probes.ts; bun test test/integration/p4.test.ts",
+      "observed": "Definitive pending claims=0 before retry; ambiguous replay=1003 admission_recovery_pending with attempts=1 and commands=1.",
       "verdict": "passed"
     },
     {
-      "scenario": "Delay observed Discord durable acceptance beyond the original inbound acknowledgement budget, then reject a second inbound message.",
-      "expectedBehavior": "The accepted message receives typing measured from the observed acceptance response; rejected ingress receives none.",
-      "invocation": "bun /tmp/g018-red-team-probes.ts; bun test test/integration/discord.test.ts",
-      "observed": "inbound=1000, observedAccepted=3501, typing=3501; failed admission left acknowledgement count at one and no pending claim/fence.",
+      "scenario": "Delay observed Discord acceptance past the inbound budget and reject the next admission.",
+      "expectedBehavior": "Typing begins from observed successful acceptance; rejected admission produces none.",
+      "invocation": "bun /tmp/g019-gen3-regression-probes.ts; bun test test/integration/discord.test.ts",
+      "observed": "Typing occurred at observed time 3501 for inbound time 1000; acknowledgement count stayed one after rejected ingress.",
       "verdict": "passed"
     },
     {
-      "scenario": "Inject proof persistence, tail resync, ring rotation, delivery projection, admission recovery, malformed intent, and claim-abandon failures.",
-      "expectedBehavior": "Each variant preserves the documented no-resend/no-silent-progress invariant and reports its expected fence/degraded/FAILED_CLOSED state.",
+      "scenario": "Inject proof, tail, delivery, and admission-recovery failures.",
+      "expectedBehavior": "Each retains the documented no-resend/no-silent-progress safety outcome.",
       "invocation": "bun test test/unit/main-session.test.ts; bun test test/qa/recovery-fail-closed.test.ts",
-      "observed": "33 unit and 6 recovery cases passed, including all C5 reason groups.",
+      "observed": "40 focused cases passed; 0 failed.",
       "verdict": "passed"
     },
     {
-      "scenario": "Attempt compiled corpus closure while pending/verification proof states remain fenced, then recover only after verification.",
-      "expectedBehavior": "Compiled process never closes early and later closes/replays only after proof readiness.",
-      "invocation": "bun test test/e2e/compiled-closure.test.ts",
-      "observed": "4 cases passed with 25 assertions.",
+      "scenario": "Exercise rebuilt compiled corpus closure while proof/verification fences are active.",
+      "expectedBehavior": "Compiled process blocks early effects and handles durable replay correctly after verification.",
+      "invocation": "bun test test/e2e/compiled-closure.test.ts; bun test test/e2e/systemd.test.ts",
+      "observed": "8 compiled e2e cases passed; 0 failed.",
       "verdict": "passed"
     },
     {
-      "scenario": "Send malformed and unknown owner-UDS frames and methods.",
-      "expectedBehavior": "The UDS server rejects invalid paths without opening an unsafe fallback.",
+      "scenario": "Send malformed and unknown owner UDS frames and methods.",
+      "expectedBehavior": "Protocol errors do not open an unsafe alternate route.",
       "invocation": "bun test test/qa/uds-negative-paths.test.ts",
-      "observed": "3 cases passed with 11 assertions.",
+      "observed": "3 cases passed; 11 assertions.",
       "verdict": "passed"
     }
   ],
   "probes": [
     {
-      "contract": "B1 pending proof promotion",
-      "invocation": "bun /tmp/g018-red-team-probes.ts :: pending-proof-promotion-visible-gap-over-owner-uds",
-      "expected": "Visible transcript_delivery_gap atomically binds the promoted proof.",
-      "observed": "transcriptProof=proven, gapCount=1, journalKinds=[transcript_delivery_gap], adoption=pending_proof_promotion.",
+      "contract": "R1 startup recovery readiness fence",
+      "invocation": "bun /tmp/g019-closure-recovery-red-team.ts",
+      "expected": "Retain/refuse while degraded, then automatic healthy finalization once with replay-only later calls.",
+      "observed": "refusalLogVisible=true; 3 fenced 1003 calls; intent retained before restart; automatic remote count=2; 5 same-key responses with uniqueReplayResponses=1; final remote count=2; final intent absent.",
       "verdict": "passed"
     },
     {
-      "contract": "B2/C2/C5 failure fence",
-      "invocation": "bun /tmp/g018-red-team-probes.ts :: atomic-projection-failure-unifies-submit-and-corpus-close-fences",
-      "expected": "No assistant delivery advancement, no new broker effect, no closure claim/commit/push after projection failure.",
-      "observed": "delivery stopped at transcript:2; both guarded calls returned 1003; closure claim absent; local and remote heads matched their pre-call values.",
-      "verdict": "passed"
-    },
-    {
-      "contract": "C1 null SQLite metadata",
-      "invocation": "bun /tmp/g018-red-team-probes.ts :: null-current-schema-transcript-proof-fails-closed-over-owner-uds",
-      "expected": "null is corrupt, not an inferred proof.",
-      "observed": "storedProof=null; way.health=unhealthy/failed_closed/metadata_invalid; exitCode=78.",
-      "verdict": "passed"
-    },
-    {
-      "contract": "C1 missing SQLite metadata",
-      "invocation": "bun /tmp/g018-red-team-probes.ts :: missing-current-schema-transcript-proof-fails-closed-over-owner-uds",
-      "expected": "A deleted current-schema key is corrupt, not an inferred proof.",
-      "observed": "remainingRows=0 before startup; way.health=unhealthy/failed_closed/metadata_invalid; exitCode=78.",
-      "verdict": "passed"
-    },
-    {
-      "contract": "C2 mandatory atomic journal",
-      "invocation": "bun /tmp/g018-red-team-probes.ts :: host-refuses-missing-atomic-transcript-projection-journal",
-      "expected": "No fallback split-write path is constructible.",
-      "observed": "transcript_projection_journal_unavailable before commands=0 and admissionAttempts=0.",
-      "verdict": "passed"
-    },
-    {
-      "contract": "C3 centralized disposition",
-      "invocation": "bun /tmp/g018-red-team-probes.ts :: centralized-broker-disposition-abandons-only-definitive-claims",
-      "expected": "Definitive rejection abandons; ambiguity retains/fences without resend.",
-      "observed": "definitive pending=0/retry command=1; ambiguous replay=1003 admission_recovery_pending/attempts=1/commands=1/settledPending=0.",
-      "verdict": "passed"
-    },
-    {
-      "contract": "C4 Discord acknowledgement boundary",
-      "invocation": "bun /tmp/g018-red-team-probes.ts :: discord-typing-budget-begins-at-observed-durable-acceptance",
-      "expected": "Late observed success gets typing; failed admission gets none.",
-      "observed": "inboundAcceptedAt=1000, observedAcceptanceAt=3501, one typing at 3501, acknowledgement count remained one after rejected admission.",
+      "contract": "B1 through C4 regression matrix",
+      "invocation": "bun /tmp/g019-gen3-regression-probes.ts",
+      "expected": "All prior Generation-3 behavioral probes remain true on d9cc76d.",
+      "observed": "7 probes passed; 0 failed.",
       "verdict": "passed"
     },
     {
       "contract": "C5 injected-failure matrix",
       "invocation": "bun test test/unit/main-session.test.ts; bun test test/qa/recovery-fail-closed.test.ts",
-      "expected": "Each injected failure has its expected durable safety fence or fail-closed outcome.",
-      "observed": "39 focused cases passed; 0 failed.",
+      "expected": "Every injected failure publishes its safety fence/failed-closed result without resend or silent progress.",
+      "observed": "40 test cases passed; 0 failed.",
       "verdict": "passed"
     },
     {
-      "contract": "Compiled topology",
-      "invocation": "bun test test/e2e/compiled-closure.test.ts; bun test test/e2e/systemd.test.ts",
-      "expected": "Compiled daemon preserves proof and mutation fences.",
-      "observed": "8 cases passed; 0 failed.",
+      "contract": "Rebuilt compiled topology",
+      "invocation": "bun scripts/compile.ts; bun test test/e2e/compiled-closure.test.ts; bun test test/e2e/systemd.test.ts",
+      "expected": "New source is present in dist and compiled daemon preserves closure/proof behavior.",
+      "observed": "Build passed; 8 compiled e2e cases passed.",
       "verdict": "passed"
     },
     {
-      "contract": "Raw terminal capture",
-      "invocation": "bun /tmp/g018-console-transcript.ts",
-      "expected": "Terminal transcript records console lifecycle and accepted/finalized owner interaction.",
-      "observed": "14 writes, 358 ESC bytes, alternate screen enter/exit, delivered-as prompt, assistant reply.",
+      "contract": "Console terminal capture",
+      "invocation": "bun /tmp/g019-console-transcript.ts",
+      "expected": "Raw terminal capture includes lifecycle plus accepted/finalized owner interaction.",
+      "observed": "14 writes, 358 ESC bytes, alternate screen enter/exit, delivery frame, assistant frame.",
       "verdict": "passed"
     },
     {
       "contract": "Safe CLI replay",
-      "invocation": "LC_ALL=C bun -e 'console.log(\"g018-cli-ok\")'",
+      "invocation": "LC_ALL=C bun -e 'console.log(\"g019-cli-ok\")'",
       "expected": "Exit 0 with deterministic safe output.",
-      "observed": "stdout=g018-cli-ok newline; stderr empty.",
+      "observed": "stdout=g019-cli-ok newline; stderr empty.",
       "verdict": "passed"
     }
   ],
@@ -420,19 +389,19 @@
     {
       "path": "artifacts/g017-qa-api-report.json",
       "kind": "api-package-test-report",
-      "sourceHash": "sha256:5377dc936885a58b4e708cbde30f698b8818578cd7f41d62f901e7451508988d",
+      "sourceHash": "sha256:5aa3f3d7b47403f410a72d931f3d3c18b9e0b6a2b9c4aaa21f0c0a4d81227e14",
       "verified": true
     },
     {
       "path": "artifacts/g017-cli-replay.json",
       "kind": "cli-replay",
-      "sourceHash": "sha256:5377dc936885a58b4e708cbde30f698b8818578cd7f41d62f901e7451508988d",
+      "sourceHash": "sha256:5aa3f3d7b47403f410a72d931f3d3c18b9e0b6a2b9c4aaa21f0c0a4d81227e14",
       "verified": true
     },
     {
       "path": "artifacts/g017-console-pty-capture.txt",
       "kind": "raw-console-pty-capture",
-      "sourceHash": "sha256:5377dc936885a58b4e708cbde30f698b8818578cd7f41d62f901e7451508988d",
+      "sourceHash": "sha256:5aa3f3d7b47403f410a72d931f3d3c18b9e0b6a2b9c4aaa21f0c0a4d81227e14",
       "verified": true,
       "bytes": 14216,
       "escapeBytes": 358

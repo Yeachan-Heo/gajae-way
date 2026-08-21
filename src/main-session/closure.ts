@@ -9,6 +9,8 @@ import type { WayCoreHandle } from "../native-loader";
 
 export type ClosureClass = "interactive" | "batch";
 
+export type ClosureMutationReadinessReason = () => string | undefined;
+
 /** One in-daemon corpus closure. Paths are literal, corpus-relative paths. */
 export interface ClosureRequest {
 	readonly sessionId: string;
@@ -18,6 +20,8 @@ export interface ClosureRequest {
 	readonly paths: readonly string[];
 	readonly commitMessage: string;
 	readonly remote?: string;
+	/** Main-session callers supply their host-owned fence for every Git dispatch. */
+	readonly mutationReadinessReason?: ClosureMutationReadinessReason;
 }
 
 export interface ClosureResult {
@@ -59,6 +63,17 @@ export class ClosureError extends Error {
 		super(message);
 		this.name = "ClosureError";
 		this.code = code;
+	}
+}
+
+/** Refusal at a host-owned mutation fence; callers must preserve the staged intent. */
+export class ClosureMutationReadinessError extends ClosureError {
+	readonly reason: string;
+
+	constructor(reason: string) {
+		super(`closure mutation is fenced: ${reason}`);
+		this.name = "ClosureMutationReadinessError";
+		this.reason = reason;
 	}
 }
 
@@ -429,6 +444,7 @@ class ClosureExecutorImpl implements ClosureExecutor {
 
 	private async executeInner(request: ClosureRequest): Promise<ClosureResult> {
 		const normalized = validateRequest(request);
+		this.assertMutationReady(normalized);
 		const worker = await ClosureWorker.start();
 		let active: ActiveClosure | undefined;
 		let result: ClosureResult | undefined;
@@ -446,7 +462,8 @@ class ClosureExecutorImpl implements ClosureExecutor {
 			};
 			this.#active.set(active.leaseId, active);
 			this.startHeartbeat(active);
-			await this.assertFence(active);
+			this.assertFence(active);
+			this.assertMutationReady(active.request);
 			await this.hook("after_acquire", active);
 
 			await this.recoverCommittedIndex(active);
@@ -477,10 +494,12 @@ class ClosureExecutorImpl implements ClosureExecutor {
 			}
 			await this.hook("after_commit", active);
 
+			// `after_commit` durably records the local commit before this dispatch, so
+			// a readiness refusal here retains a recoverable committed-not-pushed intent.
 			const push = normalized.remote ? ["push", normalized.remote] : ["push"];
 			this.assertGit(await this.git(active, push), push);
 			await this.hook("after_push", active);
-			await this.assertFence(active);
+			this.assertFence(active);
 			this.clearRecoveryMarker(active);
 			if (active.cancelled) throw active.cancelled;
 			result = { leaseId: active.leaseId, fencingToken: active.fencingToken, committed };
@@ -545,7 +564,12 @@ class ClosureExecutorImpl implements ClosureExecutor {
 		}
 	}
 
-	private async assertFence(active: ActiveClosure): Promise<void> {
+	private assertMutationReady(request: ClosureRequest): void {
+		const reason = request.mutationReadinessReason?.();
+		if (reason) throw new ClosureMutationReadinessError(reason);
+	}
+
+	private assertFence(active: ActiveClosure): void {
 		dispatchCoreRevocations(this.#core);
 		if (active.cancelled || !this.#core.lockFencingValid(active.leaseId, active.fencingToken)) {
 			this.cancel(active, new ClosureError("closure fencing token is no longer valid", 1202));
@@ -554,10 +578,11 @@ class ClosureExecutorImpl implements ClosureExecutor {
 	}
 
 	private async git(active: ActiveClosure, args: readonly string[], env?: Record<string, string>): Promise<WorkerResult> {
-		await this.assertFence(active);
+		this.assertFence(active);
+		this.assertMutationReady(active.request);
 		const result = await active.worker.run(args, active.request.corpusPath, env);
 		if (active.cancelled) throw active.cancelled;
-		await this.assertFence(active);
+		this.assertFence(active);
 		return result;
 	}
 
@@ -694,7 +719,7 @@ class ClosureExecutorImpl implements ClosureExecutor {
 			},
 		});
 		if (active.cancelled) throw active.cancelled;
-		await this.assertFence(active);
+		this.assertFence(active);
 	}
 
 	private cancel(active: ActiveClosure, error: ClosureError): void {
@@ -756,6 +781,9 @@ function validateRequest(request: ClosureRequest): ClosureRequest {
 	}
 	if (!request.commitMessage.trim()) throw new ClosureError("commitMessage must not be empty");
 	if (request.remote !== undefined && !request.remote.trim()) throw new ClosureError("remote must not be empty when provided");
+	if (request.mutationReadinessReason !== undefined && typeof request.mutationReadinessReason !== "function") {
+		throw new ClosureError("mutationReadinessReason must be a function when provided");
+	}
 	if (!request.corpusPath.trim()) throw new ClosureError("corpusPath must not be empty");
 	if (request.paths.length === 0) throw new ClosureError("paths must list at least one explicit path");
 	const corpusPath = path.resolve(request.corpusPath);
