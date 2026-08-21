@@ -311,6 +311,7 @@ interface ClosureOperationIntent {
 }
 
 interface ClosureOperationEvidence {
+	/** The latest execution attempt's Git-lock receipt; atomically replaced after reacquisition. */
 	leaseId?: string;
 	fencingToken?: string;
 	baseHead?: string;
@@ -609,19 +610,28 @@ function stateRank(state: ClosureOperationState): number {
 	return ["intent", "acquired", "pulled", "staged", "committed", "pushed"].indexOf(state);
 }
 
+interface AdvanceClosureOperationOptions {
+	/** A recovered execution attempt replaces only its active Git-lock receipt. */
+	readonly replaceExecutionLease?: boolean;
+}
+
 function advanceClosureOperation(
 	core: WayCoreHandle,
 	operationId: string,
 	state: ClosureOperationState,
 	evidence: Partial<ClosureOperationEvidence> = {},
+	options: AdvanceClosureOperationOptions = {},
 ): ClosureOperationRecord | undefined {
 	const current = readClosureOperation(core);
 	if (!current || current.intent.operationId !== operationId) return undefined;
+	// Lease evidence is attempt-scoped and replaces atomically on every acquisition.
+	// State and commit graph evidence remain monotonic and write-once.
 	const nextEvidence: ClosureOperationEvidence = { ...current.record.evidence };
 	for (const [key, value] of Object.entries(evidence) as Array<
 		[keyof ClosureOperationEvidence, ClosureOperationEvidence[keyof ClosureOperationEvidence]]
 	>) {
-		if (value !== undefined && nextEvidence[key] === undefined) Object.assign(nextEvidence, { [key]: value });
+		const replaceExecutionLease = options.replaceExecutionLease && (key === "leaseId" || key === "fencingToken");
+		if (value !== undefined && (replaceExecutionLease || nextEvidence[key] === undefined)) Object.assign(nextEvidence, { [key]: value });
 	}
 	const next: ClosureOperationRecord = {
 		version: 1,
@@ -692,10 +702,13 @@ function createClosureHooks(core: WayCoreHandle): NonNullable<Parameters<typeof 
 		after_acquire: async (context) => {
 			const operationId = operationIdFromContext(context);
 			if (!operationId) return;
-			advanceClosureOperation(core, operationId, "acquired", {
-				leaseId: context.leaseId,
-				fencingToken: context.fencingToken,
-			});
+			advanceClosureOperation(
+				core,
+				operationId,
+				"acquired",
+				{ leaseId: context.leaseId, fencingToken: context.fencingToken },
+				{ replaceExecutionLease: true },
+			);
 			await pauseClosureHookForE2e(
 				operationId,
 				"after_acquire",
@@ -910,6 +923,12 @@ function assertMainSessionMutationReady(host: MainSessionHost): void {
 	assertMutationReadiness(() => host.mutationReadinessReason);
 }
 
+function markClosureInFlightWaiterForE2e(idempotencyKey: string): void {
+	if (Bun.env.NODE_ENV !== "test") return;
+	const markerPath = Bun.env.GAJAEWAY_E2E_CLOSURE_INFLIGHT_WAITER_MARKER;
+	if (!markerPath) return;
+	fs.writeFileSync(markerPath, `${JSON.stringify({ idempotency_key: idempotencyKey })}\n`, { encoding: "utf8", mode: 0o600 });
+}
 function closureBridgeHandler(
 	core: WayCoreHandle,
 	closures: ClosureExecutor,
@@ -925,6 +944,7 @@ function closureBridgeHandler(
 		const inFlight = inFlightByKey.get(request.idempotencyKey);
 		if (inFlight) {
 			if (inFlight.requestJson !== request.requestJson) throw new RpcBridgeException(1500, "idempotency_conflict");
+			markClosureInFlightWaiterForE2e(request.idempotencyKey);
 			try {
 				return await inFlight.response;
 			} catch (error) {

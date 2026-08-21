@@ -172,6 +172,14 @@ function stagePendingClosureOperation(
 	).toMatchObject({ claimed: true });
 	return { intentJson, operationJson };
 }
+
+function executionLeaseFromOperation(raw: string | undefined): { readonly leaseId: string; readonly fencingToken: string } {
+	const parsed = JSON.parse(raw ?? "{}") as { evidence?: { leaseId?: unknown; fencingToken?: unknown } };
+	if (typeof parsed.evidence?.leaseId !== "string" || typeof parsed.evidence.fencingToken !== "string") {
+		throw new Error("closure operation does not retain an execution lease");
+	}
+	return { leaseId: parsed.evidence.leaseId, fencingToken: parsed.evidence.fencingToken };
+}
 test("missing exact adopted broker identity fails closed over UDS, lingers unhealthy, exits 78, and never rebirths", async () => {
 	const fixture = new FakeBrokerFixture();
 	const corpus = path.join(fixture.root, "corpus");
@@ -411,6 +419,7 @@ test("startup closure recovery fences after lease acquisition before Git dispatc
 		expect(JSON.parse(fs.readFileSync(acquireMarker, "utf8"))).toEqual({ operation_id: "startup-recovery-fence", step: "after_acquire" });
 		const acquiredRaw = observer.gatewayMetaRead(["gitlock_closure_operation"]).entries[0]?.value;
 		expect(JSON.parse(acquiredRaw ?? "{}")).toMatchObject({ intentJson, state: "acquired" });
+		const refusedAttempt = executionLeaseFromOperation(acquiredRaw);
 
 		fixture.holdNextTurn();
 		const admission = await degradedDaemon.client.request("main.submit", {
@@ -444,6 +453,12 @@ test("startup closure recovery fences after lease acquisition before Git dispatc
 		expect(await waitForHealth(healthyDaemon.client, "running")).toMatchObject({ state: "running" });
 		const finalized = await healthyDaemon.client.request("main.corpus.close", closeParams, { timeoutMs: 10_000 });
 		expect(finalized.result).toMatchObject({ committed: true });
+		const finalLeaseId = (finalized.result as { lease_id?: unknown }).lease_id;
+		const finalFencingToken = (finalized.result as { fencing_token?: unknown }).fencing_token;
+		expect(finalLeaseId).toEqual(expect.any(String));
+		expect(finalFencingToken).toEqual(expect.any(String));
+		expect(finalLeaseId).not.toBe(refusedAttempt.leaseId);
+		expect(finalFencingToken).not.toBe(refusedAttempt.fencingToken);
 		const replay = await healthyDaemon.client.request("main.corpus.close", closeParams, { timeoutMs: 10_000 });
 		expect(replay.result).toEqual(finalized.result);
 		expect(await run(["git", `--git-dir=${remote}`, "show", "main:recovered-close.txt"])).toBe(
@@ -523,6 +538,7 @@ test("startup recovery retains a committed-not-pushed closure for exactly-once h
 			state: "committed",
 			evidence: { commitHead: committedHead, committed: true },
 		});
+		const refusedAttempt = executionLeaseFromOperation(committedRaw);
 
 		fixture.holdNextTurn();
 		const admission = await degradedDaemon.client.request("main.submit", {
@@ -561,6 +577,12 @@ test("startup recovery retains a committed-not-pushed closure for exactly-once h
 		expect(await waitForHealth(healthyDaemon.client, "running")).toMatchObject({ state: "running" });
 		const finalized = await healthyDaemon.client.request("main.corpus.close", closeParams, { timeoutMs: 10_000 });
 		expect(finalized.result).toMatchObject({ committed: true });
+		const finalLeaseId = (finalized.result as { lease_id?: unknown }).lease_id;
+		const finalFencingToken = (finalized.result as { fencing_token?: unknown }).fencing_token;
+		expect(finalLeaseId).toEqual(expect.any(String));
+		expect(finalFencingToken).toEqual(expect.any(String));
+		expect(finalLeaseId).not.toBe(refusedAttempt.leaseId);
+		expect(finalFencingToken).not.toBe(refusedAttempt.fencingToken);
 		const replay = await healthyDaemon.client.request("main.corpus.close", closeParams, { timeoutMs: 10_000 });
 		expect(replay.result).toEqual(finalized.result);
 		expect(await run(["git", `--git-dir=${remote}`, "show", "main:committed-close.txt"])).toBe("commit before the host degrades\n");
@@ -569,6 +591,137 @@ test("startup recovery retains a committed-not-pushed closure for exactly-once h
 		expect(observer.gatewayMetaRead(["gitlock_closure_operation"]).entries[0]?.value).toBeUndefined();
 	} finally {
 		if (!fs.existsSync(commitRelease)) fs.writeFileSync(commitRelease, "release\n", { encoding: "utf8", mode: 0o600 });
+		await stopDaemon(healthyDaemon);
+		await stopDaemon(degradedDaemon);
+		fixture.dispose();
+	}
+}, 45_000);
+
+test("RPC closure fences the original and in-flight duplicate, then preserves unrelated closure errors and recovers", async () => {
+	const fixture = new FakeBrokerFixture();
+	const corpus = path.join(fixture.root, "corpus");
+	const remote = path.join(fixture.root, "remote.git");
+	const stateDirectory = path.join(fixture.root, "state");
+	const profilePath = path.join(fixture.root, "profile.toml");
+	const acquireMarker = path.join(fixture.root, "rpc-closure-after-acquire.marker");
+	const acquireRelease = path.join(fixture.root, "rpc-closure-after-acquire.release");
+	const waiterMarker = path.join(fixture.root, "rpc-closure-inflight-waiter.marker");
+	const closeParams = {
+		paths: ["rpc-recovered-close.txt"],
+		commit_message: "recover RPC closure after a healthy boot",
+		idempotency_key: "rpc-closure-readiness-fence",
+	};
+	const environment = {
+		...fixture.environment(),
+		NODE_ENV: "test",
+		GAJAEWAY_BROKER_CLI: fixture.executable,
+		GAJAEWAY_RECONCILE_POLL_MS: "600000",
+		GAJAEWAY_E2E_FAIL_TRANSCRIPT_PROJECTION: "1",
+		GAJAEWAY_E2E_CLOSURE_AFTER_ACQUIRE_MARKER: acquireMarker,
+		GAJAEWAY_E2E_CLOSURE_AFTER_ACQUIRE_RELEASE: acquireRelease,
+		GAJAEWAY_E2E_CLOSURE_INFLIGHT_WAITER_MARKER: waiterMarker,
+	};
+	const healthyEnvironment = {
+		...fixture.environment(),
+		NODE_ENV: "test",
+		GAJAEWAY_BROKER_CLI: fixture.executable,
+		GAJAEWAY_RECONCILE_POLL_MS: "600000",
+		GAJAEWAY_E2E_FAIL_TRANSCRIPT_PROJECTION: "0",
+	};
+	let degradedDaemon: RunningDaemon | undefined;
+	let healthyDaemon: RunningDaemon | undefined;
+	let waiterClient: RpcClient | undefined;
+	try {
+		await run(["git", "init", "--bare", remote]);
+		await run(["git", "init", corpus]);
+		await run(["git", "-C", corpus, "config", "user.name", "RPC Closure Fence Drill"]);
+		await run(["git", "-C", corpus, "config", "user.email", "rpc-closure-fence@example.test"]);
+		fs.writeFileSync(path.join(corpus, "base.txt"), "base\n");
+		fs.writeFileSync(path.join(corpus, "rpc-recovered-close.txt"), "must not commit while the RPC close is fenced\n");
+		await run(["git", "-C", corpus, "add", "--", "base.txt"]);
+		await run(["git", "-C", corpus, "commit", "-m", "base"]);
+		await run(["git", "-C", corpus, "branch", "-M", "main"]);
+		await run(["git", "-C", corpus, "remote", "add", "origin", remote]);
+		await run(["git", "-C", corpus, "push", "-u", "origin", "main"]);
+		await run(["git", `--git-dir=${remote}`, "symbolic-ref", "HEAD", "refs/heads/main"]);
+		fs.writeFileSync(profilePath, profileContents(corpus, fixture.workspace, fixture.sessionId));
+		bootstrap(stateDirectory, profilePath, environment);
+
+		const observer = loadWayCore().WayCore.open(stateDirectory);
+		const localHead = await run(["git", "-C", corpus, "rev-parse", "HEAD"]);
+		const remoteHead = await run(["git", `--git-dir=${remote}`, "rev-parse", "main"]);
+		degradedDaemon = await startDaemon(stateDirectory, profilePath, environment);
+		expect(await waitForHealth(degradedDaemon.client, "running")).toMatchObject({ state: "running" });
+		const original = degradedDaemon.client.request("main.corpus.close", closeParams, { timeoutMs: 10_000 });
+		await waitForFile(acquireMarker, "RPC closure did not acquire its lease");
+		const acquiredRaw = observer.gatewayMetaRead(["gitlock_closure_operation"]).entries[0]?.value;
+		const refusedAttempt = executionLeaseFromOperation(acquiredRaw);
+		waiterClient = await connectEventually(path.join(stateDirectory, "rpc.sock"));
+		const waiter = waiterClient.request("main.corpus.close", closeParams, { timeoutMs: 10_000 });
+		await waitForFile(waiterMarker, "same-key RPC waiter did not enter the in-flight path");
+		expect(JSON.parse(fs.readFileSync(waiterMarker, "utf8"))).toEqual({ idempotency_key: closeParams.idempotency_key });
+
+		fixture.holdNextTurn();
+		const admission = await degradedDaemon.client.request("main.submit", {
+			text: "degrade the host while RPC closure callers wait on its acquired lease",
+			surface_id: "owner",
+			idempotency_key: "rpc-closure-readiness-fence-admission",
+		});
+		expect(admission.result).toMatchObject({ accepted: true, delivered_as: "prompt" });
+		fixture.complete((admission.result as { op_ref: string }).op_ref, { text: "projection failure fences both RPC closure callers" });
+		expect(await waitForHealth(degradedDaemon.client, "degraded")).toMatchObject({
+			status: "unhealthy",
+			state: "degraded",
+			reason: "transcript_delivery_progress_write_failed",
+		});
+		fs.writeFileSync(acquireRelease, "release\n", { encoding: "utf8", mode: 0o600 });
+		const [originalResponse, waiterResponse] = await Promise.all([original, waiter]);
+		expect(originalResponse.error).toMatchObject({ code: 1003, message: "transcript_delivery_progress_write_failed" });
+		expect(waiterResponse.error).toMatchObject({ code: 1003, message: "transcript_delivery_progress_write_failed" });
+		expect(JSON.parse(observer.gatewayMetaRead(["gitlock_closure_operation"]).entries[0]?.value ?? "{}")).toMatchObject({
+			state: "acquired",
+			evidence: { leaseId: refusedAttempt.leaseId, fencingToken: refusedAttempt.fencingToken },
+		});
+		expect(await run(["git", "-C", corpus, "rev-parse", "HEAD"])).toBe(localHead);
+		expect(await run(["git", `--git-dir=${remote}`, "rev-parse", "main"])).toBe(remoteHead);
+
+		waiterClient.close();
+		waiterClient = undefined;
+		await stopDaemon(degradedDaemon);
+		degradedDaemon = undefined;
+		healthyDaemon = await startDaemon(stateDirectory, profilePath, healthyEnvironment);
+		expect(await waitForHealth(healthyDaemon.client, "running")).toMatchObject({ state: "running" });
+		const finalized = await healthyDaemon.client.request("main.corpus.close", closeParams, { timeoutMs: 10_000 });
+		expect(finalized.result).toMatchObject({ committed: true });
+		const finalLeaseId = (finalized.result as { lease_id?: unknown }).lease_id;
+		const finalFencingToken = (finalized.result as { fencing_token?: unknown }).fencing_token;
+		expect(finalLeaseId).toEqual(expect.any(String));
+		expect(finalFencingToken).toEqual(expect.any(String));
+		expect(finalLeaseId).not.toBe(refusedAttempt.leaseId);
+		expect(finalFencingToken).not.toBe(refusedAttempt.fencingToken);
+		const replay = await healthyDaemon.client.request("main.corpus.close", closeParams, { timeoutMs: 10_000 });
+		expect(replay.result).toEqual(finalized.result);
+		expect(await run(["git", `--git-dir=${remote}`, "show", "main:rpc-recovered-close.txt"])).toBe(
+			"must not commit while the RPC close is fenced\n",
+		);
+		expect(await run(["git", `--git-dir=${remote}`, "rev-list", "--count", "main"])).toBe("2\n");
+
+		fs.writeFileSync(path.join(corpus, "dirty-index.txt"), "unrelated closure error\n");
+		await run(["git", "-C", corpus, "add", "--", "dirty-index.txt"]);
+		const dirtyParams = {
+			paths: ["never-close.txt"],
+			commit_message: "must report dirty index",
+			idempotency_key: "rpc-closure-non-readiness-error",
+		};
+		const firstClosureError = await healthyDaemon.client.request("main.corpus.close", dirtyParams, { timeoutMs: 10_000 });
+		expect(firstClosureError.error).toMatchObject({ code: 1206, message: "corpus git index is dirty" });
+		const retryClosureError = await healthyDaemon.client.request("main.corpus.close", dirtyParams, { timeoutMs: 10_000 });
+		expect(retryClosureError.error).toMatchObject({ code: 1206, message: "corpus git index is dirty" });
+		expect(retryClosureError.error?.code).not.toBe(1003);
+		expect(JSON.parse(observer.gatewayMetaRead(["gitlock_closure_operation"]).entries[0]?.value ?? "{}")).toMatchObject({ state: "acquired" });
+	} finally {
+		if (!fs.existsSync(acquireRelease)) fs.writeFileSync(acquireRelease, "release\n", { encoding: "utf8", mode: 0o600 });
+		waiterClient?.close();
 		await stopDaemon(healthyDaemon);
 		await stopDaemon(degradedDaemon);
 		fixture.dispose();

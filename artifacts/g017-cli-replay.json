@@ -1,13 +1,13 @@
 {
   "schemaVersion": 1,
   "kind": "cli-replay",
-  "sourceHash": "sha256:5aa3f3d7b47403f410a72d931f3d3c18b9e0b6a2b9c4aaa21f0c0a4d81227e14",
-  "snapshotCommit": "d9cc76df33bab2da22d0a763d6986d0cc70293c8",
+  "sourceHash": "sha256:180906de84bdd4798c338a332bf608bd2f40712597dd07ce09a5ac1229949d50",
+  "snapshotCommit": "49791f295d2d9a8697714ae1a42ded084f69613f",
   "replaySafe": true,
   "command": [
     "bun",
     "-e",
-    "console.log(\"g019-cli-ok\")"
+    "console.log(\"g020-cli-ok\")"
   ],
   "cwd": ".",
   "env": {
@@ -15,12 +15,12 @@
   },
   "timeoutMs": 30000,
   "expectedExitCode": 0,
-  "recordedStdout": "g019-cli-ok\n",
+  "recordedStdout": "g020-cli-ok\n",
   "recordedStderr": "",
   "invariants": [
     {
       "type": "substring",
-      "value": "g019-cli-ok"
+      "value": "g020-cli-ok"
     },
     {
       "type": "not_substring",
