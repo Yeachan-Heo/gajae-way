@@ -53,8 +53,10 @@ non-fast-forward checks are incident backstops, not a concurrency plan.
    but main-session mutations remain refused until the first compatible complete
    tail promotes it to `running`. The adapter is `BindsTo=` the daemon and stops
    when it stops. It polls `way.health` first and does not connect to Discord or
-   register inbound handlers until health is `status: "healthy", state: "running"`,
-   so no typing acknowledgement is emitted while the gateway fences submissions.
+   register inbound handlers until health is `status: "healthy", state: "running"`.
+   Every inbound typing acknowledgement is then sent only after `main.submit`
+   returns durable acceptance; a later fence or failed-closed transition leaves
+   the message unacknowledged rather than consuming it without delivery.
 
 ## Monitor the live UDS service
 

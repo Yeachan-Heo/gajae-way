@@ -1,7 +1,9 @@
 import { AsyncLocalStorage } from "node:async_hooks";
 import { expect, test } from "bun:test";
 import { DiscordOutbox } from "../../src/adapter/discord/outbox";
+import { startDiscordAdapter } from "../../src/adapter/discord/main";
 import { DiscordRouteHandler } from "../../src/adapter/discord/route";
+import type { JsonRpcClient } from "../../src/rpc-client";
 import { DiscordFixture, DiscordFixtureClock } from "../fixtures/discord-fixture";
 import { createExternalGateway, eventually, type ExternalGateway } from "../helpers/external-gateway";
 
@@ -88,6 +90,103 @@ externalTest("Discord inbound deduplicates a message id before external broker a
 	} finally {
 		await fixture.disconnect();
 	}
+});
+
+externalTest("Discord typing follows accepted admission, not a stale healthy-to-fenced connection", async () => {
+	const gatewayUnderTest = await gateway();
+	const fixture = new DiscordFixture();
+	await fixture.connect();
+	try {
+		const route = new DiscordRouteHandler({
+			rpc: gatewayUnderTest.client,
+			platform: fixture,
+			route: { channelId: "123456789012345678", surfaceId: "discord:owner-dm" },
+		});
+		gatewayUnderTest.fixture.holdNextTurn();
+		gatewayUnderTest.fixture.suppressNextAdmissionReceipt();
+		const ambiguous = await gatewayUnderTest.client.request("main.submit", {
+			text: "establish an admission recovery fence",
+			surface_id: "discord:owner-dm",
+			idempotency_key: "discord-health-flap-fence",
+		});
+		expect(ambiguous.error).toMatchObject({ code: -32603 });
+		const [pending] = gatewayUnderTest.core.mainAdmissionOperationsPending();
+		const intent = JSON.parse(pending?.intentJson ?? "{}") as { op_ref?: unknown };
+		if (typeof intent.op_ref !== "string") throw new Error("fenced Discord setup did not retain its operation reference");
+		await eventually(
+			() => (gatewayUnderTest.host.admissionFenceReason === "admission_recovery_pending" ? true : undefined),
+			"gateway did not enter the admission recovery fence",
+		);
+
+		const blocked = { id: "discord-fenced-message", channelId: "123456789012345678", text: "must remain unacknowledged" };
+		await expect(route.handle({ ...blocked, acceptedAt: Date.now() })).rejects.toMatchObject({ name: "RpcResponseError", code: 1003 });
+		expect(fixture.connected).toBe(true);
+		expect(fixture.acknowledgements).toEqual([]);
+		expect(gatewayUnderTest.fixture.commands().filter(command => command.text === blocked.text)).toEqual([]);
+
+		gatewayUnderTest.fixture.complete(intent.op_ref, { text: "recovery fence terminal reply" });
+		await eventually(
+			() => (gatewayUnderTest.host.admissionFenceReason === undefined ? true : undefined),
+			"gateway did not promote after the fenced admission's terminal evidence",
+		);
+		const fresh = { id: "discord-after-promotion", channelId: "123456789012345678", text: "fresh ingress after promotion", acceptedAt: Date.now() };
+		expect(await route.handle(fresh)).toBe(true);
+		expect(fixture.acknowledgements).toHaveLength(1);
+		expect(gatewayUnderTest.fixture.commands()).toEqual(
+			expect.arrayContaining([expect.objectContaining({ operation: "turn.prompt", text: fresh.text })]),
+		);
+	} finally {
+		await fixture.disconnect();
+	}
+});
+
+externalTest("Discord startup reports rate-limited verifying and transport readiness diagnostics without opening ingress", async () => {
+	const config = {
+		rpcSocketPath: "/tmp/discord-gateway-readiness.sock",
+		token: "fixture-token",
+		route: { channelId: "123456789012345678", surfaceId: "discord:owner-dm" },
+		ackBudgetMs: 2_000,
+		claimTtlMs: 5_000,
+		readWaitMs: 0,
+	};
+	const verifyingPlatform = new DiscordFixture();
+	const verifyingAbort = new AbortController();
+	const verifyingDiagnostics: string[] = [];
+	let healthRequests = 0;
+	const verifyingRpc: JsonRpcClient = {
+		async request() {
+			healthRequests += 1;
+			return { jsonrpc: "2.0", id: healthRequests, result: { status: "booting", state: "verifying" } };
+		},
+		close() {},
+	};
+	const verifyingStart = startDiscordAdapter(config, {
+		rpcConnect: async () => verifyingRpc,
+		platformFactory: () => verifyingPlatform,
+		startupSignal: verifyingAbort.signal,
+		onDiagnostic: message => verifyingDiagnostics.push(message),
+	});
+	await eventually(() => (healthRequests >= 3 ? true : undefined), "adapter did not poll the verifying gateway");
+	verifyingAbort.abort();
+	await expect(verifyingStart).rejects.toMatchObject({ name: "AbortError" });
+	expect(verifyingPlatform.connectCount).toBe(0);
+	expect(verifyingDiagnostics).toEqual(["gateway verifying (expected wait); delaying Discord connection until healthy/running."]);
+
+	const transportAbort = new AbortController();
+	const transportDiagnostics: string[] = [];
+	let connectionAttempts = 0;
+	const transportStart = startDiscordAdapter(config, {
+		rpcConnect: async () => {
+			connectionAttempts += 1;
+			throw new Error("fixture UDS unavailable");
+		},
+		startupSignal: transportAbort.signal,
+		onDiagnostic: message => transportDiagnostics.push(message),
+	});
+	await eventually(() => (connectionAttempts >= 3 ? true : undefined), "adapter did not retry the unavailable gateway transport");
+	transportAbort.abort();
+	await expect(transportStart).rejects.toMatchObject({ name: "AbortError" });
+	expect(transportDiagnostics).toEqual(["gateway transport/protocol error while waiting: could not connect to the local gateway: fixture UDS unavailable"]);
 });
 
 externalTest("Discord outbox settles server-side delivery before a restart can repost", async () => {

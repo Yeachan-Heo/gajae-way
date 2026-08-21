@@ -79,6 +79,10 @@ if (!statePath) {
 		);
 	}
 
+	function pause(milliseconds) {
+		return new Promise(resolve => setTimeout(resolve, milliseconds));
+	}
+
 	function session(sessionId) {
 		const value = sessions[sessionId];
 		if (!value) {
@@ -261,6 +265,28 @@ if (!statePath) {
 		return true;
 	}
 
+	async function suppressReceiptAfterTerminalTail(value, opRef) {
+		delete value.suppressNextReceiptAfterTerminalTail;
+		value.receiptSuppressionWaitingForTerminalTail = opRef;
+		delete value.receiptSuppressionTerminalTailObserved;
+		writeState();
+		const deadline = Date.now() + 1_500;
+		while (Date.now() < deadline) {
+			await pause(10);
+			const latest = JSON.parse(fs.readFileSync(statePath, "utf8")).sessions?.[value.row.sessionId];
+			if (latest?.receiptSuppressionTerminalTailObserved !== opRef) continue;
+			// Let the host process the already-emitted terminal envelope before the
+			// waiting send command fails without its receipt.
+			await pause(50);
+			console.error("fixture: accepted operation receipt suppressed after terminal tail");
+			process.exitCode = 1;
+			return true;
+		}
+		console.error("fixture: terminal tail was not observed before receipt suppression timed out");
+		process.exitCode = 1;
+		return true;
+	}
+
 	function handleOperation(sessionId, operation, text, opRef) {
 		const value = session(sessionId);
 		if (!value) return;
@@ -335,9 +361,10 @@ if (!statePath) {
 		const textIndex = args.indexOf("--text");
 		const refIndex = args.indexOf("--op-ref");
 		const value = handleOperation(sessionId, "turn.prompt", args[textIndex + 1], args[refIndex + 1]);
-		if (value && !suppressAcceptedReceipt(value)) {
+		if (value) {
 			const opRef = args[refIndex + 1];
-			success({ version: 1, operationRef: opRef, status: "accepted", receipt: operationReceipt(value, "turn.prompt", opRef) });
+			const suppress = value.suppressNextReceiptAfterTerminalTail === true ? await suppressReceiptAfterTerminalTail(value, opRef) : suppressAcceptedReceipt(value);
+			if (!suppress) success({ version: 1, operationRef: opRef, status: "accepted", receipt: operationReceipt(value, "turn.prompt", opRef) });
 		}
 	} else if (args[0] === "sdk" && args[1] === "session" && args[2] === "status") {
 		const value = session(args[3]);
@@ -410,6 +437,10 @@ if (!statePath) {
 						items,
 						terminal,
 					});
+					if (value.receiptSuppressionWaitingForTerminalTail && terminal) {
+						value.receiptSuppressionTerminalTailObserved = value.receiptSuppressionWaitingForTerminalTail;
+						writeState();
+					}
 					if (gap && value.clearRetentionGapAfterTail === true) {
 						delete value.clearRetentionGapAfterTail;
 						delete value.retentionFloor;
@@ -472,7 +503,12 @@ if (!statePath) {
 			fail("operation_not_supported", `fixture control ${operation} is unsupported`);
 		} else {
 			const value = handleOperation(sessionId, operation, input.text, input.clientRef);
-			if (value && !suppressAcceptedReceipt(value)) success(operationReceipt(value, operation, input.clientRef));
+			if (value) {
+				const suppress = value.suppressNextReceiptAfterTerminalTail === true
+					? await suppressReceiptAfterTerminalTail(value, input.clientRef)
+					: suppressAcceptedReceipt(value);
+				if (!suppress) success(operationReceipt(value, operation, input.clientRef));
+			}
 		}
 	} else {
 		console.error(`unexpected fake broker argv: ${JSON.stringify(args)}`);

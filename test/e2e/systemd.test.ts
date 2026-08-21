@@ -460,6 +460,7 @@ test("Type=notify topology keeps Discord ingress disconnected until a fenced bus
 	const discord = new DiscordFixture();
 	const adapterStartup = new AbortController();
 	const adapterErrors: Error[] = [];
+	const adapterDiagnostics: string[] = [];
 	let daemon: ReturnType<typeof managedProcesses.spawnDaemon> | undefined;
 	let client: RpcClient | undefined;
 	let adapter: RunningDiscordAdapter | undefined;
@@ -509,6 +510,7 @@ test("Type=notify topology keeps Discord ingress disconnected until a fenced bus
 			{
 				platformFactory: () => discord,
 				onError: error => adapterErrors.push(error),
+				onDiagnostic: message => adapterDiagnostics.push(message),
 				startupSignal: adapterStartup.signal,
 			},
 		);
@@ -528,6 +530,7 @@ test("Type=notify topology keeps Discord ingress disconnected until a fenced bus
 		expect(discord.queuedMessageCount).toBe(1);
 		expect(discord.acknowledgements).toEqual([]);
 		expect(fixture.commands().filter(command => command.text === inbound.text)).toEqual([]);
+		expect(adapterDiagnostics).toEqual(["gateway verifying (expected wait); delaying Discord connection until healthy/running."]);
 		fixture.complete(opRef, { text: "verification completed after ready was already signaled" });
 		await eventually(
 			async () => {

@@ -60,20 +60,20 @@ export class DiscordRouteHandler {
 	}
 
 	private async submitAndAcknowledge(message: DiscordMessage): Promise<boolean> {
-		// Start typing before dispatching the submit RPC. The acknowledgement is
-		// bounded from gateway acceptance and never waits for the persona turn.
-		const acknowledgement = acknowledgeDiscordMessage(this.#platform, message, this.#acknowledgement);
-		const submission = this.#rpc.request("main.submit", {
+		// Admission is the sole acknowledgement authority. A fenced or failed
+		// gateway submission leaves the Discord event unacknowledged, preventing a
+		// consumed inbound message from receiving typing without a durable turn.
+		const response = await this.#rpc.request("main.submit", {
 			text: message.text,
 			surface_id: this.#route.surfaceId,
 			idempotency_key: message.id,
 		});
-		const [response, acknowledged] = await Promise.all([submission, acknowledgement]);
-		this.#onAcknowledged?.(acknowledged);
 		const result = rpcResult<unknown>(response, "main.submit");
 		if (!isRecord(result) || result.accepted !== true) {
 			throw new DiscordRouteError("Gateway main.submit returned an invalid acceptance response.");
 		}
+		const acknowledgement = await acknowledgeDiscordMessage(this.#platform, message, this.#acknowledgement);
+		this.#onAcknowledged?.(acknowledgement);
 		return true;
 	}
 }

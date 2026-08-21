@@ -14,6 +14,7 @@ const usage = `Usage:
 
 const GATEWAY_READY_POLL_MS = 100;
 const GATEWAY_HEALTH_TIMEOUT_MS = 1_000;
+const GATEWAY_READINESS_DIAGNOSTIC_INTERVAL_MS = 30_000;
 
 export interface DiscordAdapterDependencies {
 	readonly environment?: NodeJS.ProcessEnv;
@@ -21,6 +22,8 @@ export interface DiscordAdapterDependencies {
 	rpcConnect?(socketPath: string): Promise<JsonRpcClient>;
 	platformFactory?(config: DiscordAdapterConfig): DiscordPlatform;
 	onError?(error: Error): void;
+	/** Receives rate-limited gateway-readiness diagnostics; stderr is the default sink. */
+	onDiagnostic?(message: string): void;
 	/** Cancels startup while the adapter is intentionally waiting for a fenced gateway. */
 	startupSignal?: AbortSignal;
 	waitForShutdown?(): Promise<void>;
@@ -40,7 +43,14 @@ export async function startDiscordAdapter(
 	config: DiscordAdapterConfig,
 	dependencies: DiscordAdapterDependencies = {},
 ): Promise<RunningDiscordAdapter> {
-	const rpc = await waitForGatewayRunning(config.rpcSocketPath, dependencies.rpcConnect ?? RpcClient.connect, dependencies.startupSignal);
+	const onError = dependencies.onError ?? (error => console.error(`gajaeway-discord failed: ${error.message}`));
+	const onDiagnostic = dependencies.onDiagnostic ?? (message => console.error(`gajaeway-discord: ${message}`));
+	const rpc = await waitForGatewayRunning(
+		config.rpcSocketPath,
+		dependencies.rpcConnect ?? RpcClient.connect,
+		dependencies.startupSignal,
+		onDiagnostic,
+	);
 	let platform: DiscordPlatform | undefined;
 	let unsubscribe: (() => void) | undefined;
 	try {
@@ -53,7 +63,6 @@ export async function startDiscordAdapter(
 				...(config.gatewayUrl ? { gatewayUrl: config.gatewayUrl } : {}),
 			});
 		const activePlatform = platform;
-		const onError = dependencies.onError ?? (error => console.error(`gajaeway-discord failed: ${error.message}`));
 		const router = new DiscordRouteHandler({
 			route: config.route,
 			rpc,
@@ -105,7 +114,9 @@ async function waitForGatewayRunning(
 	socketPath: string,
 	rpcConnect: (socketPath: string) => Promise<JsonRpcClient>,
 	signal: AbortSignal | undefined,
+	onDiagnostic: (message: string) => void,
 ): Promise<JsonRpcClient> {
+	const diagnostics = createGatewayReadinessDiagnostics(onDiagnostic);
 	let rpc: JsonRpcClient | undefined;
 	try {
 		for (;;) {
@@ -113,7 +124,8 @@ async function waitForGatewayRunning(
 			if (!rpc) {
 				try {
 					rpc = await rpcConnect(socketPath);
-				} catch {
+				} catch (error) {
+					diagnostics.transportOrProtocol(`could not connect to the local gateway: ${asError(error).message}`);
 					await sleepForGatewayReadiness(signal);
 					continue;
 				}
@@ -122,11 +134,17 @@ async function waitForGatewayRunning(
 			try {
 				const response = await rpc.request("way.health", {}, { timeoutMs: GATEWAY_HEALTH_TIMEOUT_MS });
 				if (gatewayIsRunning(response.result)) return rpc;
-				if (response.error) {
+				if (gatewayIsVerifying(response.result)) {
+					diagnostics.verifying();
+				} else if (response.error) {
+					diagnostics.transportOrProtocol(`way.health returned ${response.error.code} ${response.error.message}`);
 					rpc.close();
 					rpc = undefined;
+				} else {
+					diagnostics.notRunning(response.result);
 				}
-			} catch {
+			} catch (error) {
+				diagnostics.transportOrProtocol(`way.health request failed: ${asError(error).message}`);
 				rpc?.close();
 				rpc = undefined;
 			}
@@ -136,6 +154,26 @@ async function waitForGatewayRunning(
 		rpc?.close();
 		throw error;
 	}
+}
+
+function createGatewayReadinessDiagnostics(onDiagnostic: (message: string) => void): {
+	verifying(): void;
+	transportOrProtocol(detail: string): void;
+	notRunning(health: unknown): void;
+} {
+	const lastAt = new Map<string, number>();
+	const emit = (kind: string, message: string): void => {
+		const now = Date.now();
+		const previous = lastAt.get(kind);
+		if (previous !== undefined && now - previous < GATEWAY_READINESS_DIAGNOSTIC_INTERVAL_MS) return;
+		lastAt.set(kind, now);
+		onDiagnostic(message);
+	};
+	return {
+		verifying: () => emit("verifying", "gateway verifying (expected wait); delaying Discord connection until healthy/running."),
+		transportOrProtocol: detail => emit("transport_or_protocol", `gateway transport/protocol error while waiting: ${detail}`),
+		notRunning: health => emit("not_running", `gateway is not healthy/running while waiting: ${gatewayHealthSummary(health)}`),
+	};
 }
 
 async function sleepForGatewayReadiness(signal: AbortSignal | undefined): Promise<void> {
@@ -151,6 +189,17 @@ function adapterStartupAborted(): Error {
 
 function gatewayIsRunning(value: unknown): value is Record<string, unknown> {
 	return isRecord(value) && value.status === "healthy" && value.state === "running";
+}
+
+function gatewayIsVerifying(value: unknown): value is Record<string, unknown> {
+	return isRecord(value) && value.state === "verifying";
+}
+
+function gatewayHealthSummary(value: unknown): string {
+	if (!isRecord(value)) return "invalid way.health result";
+	const status = typeof value.status === "string" ? value.status : "unknown";
+	const state = typeof value.state === "string" ? value.state : "unknown";
+	return `status=${status}, state=${state}`;
 }
 
 /** `--check`: verify the credential with Discord and confirm the UDS gateway is healthy and running. */

@@ -934,13 +934,16 @@ class ExternalMainSessionHost implements MainSessionHost {
 		return compareTailCheckpoints(terminalCheckpoint, admittedAt) > 0;
 	}
 
-	private finalizeAmbiguousAdmission(opRef: string, admission: AdmittedOperation): boolean {
-		if (!admission.ambiguous) return true;
+	private finalizeTerminalAdmission(opRef: string, admission: AdmittedOperation): boolean {
 		if (!admission.finalizePendingClaim) {
+			if (!admission.ambiguous) return true;
 			this.enterFailure("main_admission_finalize_missing", new Error(`No durable finalizer was registered for ambiguous admission ${opRef}.`));
 			return false;
 		}
 		try {
+			// Terminal broker evidence proves acceptance even when the send command's
+			// receipt has not yet arrived (or never will). The native finalizer is
+			// idempotent, so it is safe if the normal receipt path races this tail.
 			admission.finalizePendingClaim();
 			return true;
 		} catch (error) {
@@ -952,7 +955,7 @@ class ExternalMainSessionHost implements MainSessionHost {
 	private settleAdmittedOperation(opRef: string): boolean {
 		const admission = this.#admittedOperations.get(opRef);
 		if (!admission) return true;
-		if (!this.finalizeAmbiguousAdmission(opRef, admission)) return false;
+		if (!this.finalizeTerminalAdmission(opRef, admission)) return false;
 		this.#admittedOperations.delete(opRef);
 		return true;
 	}
@@ -1170,11 +1173,16 @@ class ExternalMainSessionHost implements MainSessionHost {
 				this.#admittedOperations.delete(opRef);
 			} else {
 				const admitted = this.#admittedOperations.get(opRef);
-				if (admitted) this.#admittedOperations.set(opRef, { ...admitted, ambiguous: true });
-				if (deliveredAs === "follow_up") this.#followUpQueueDepth += 1;
-				else this.#turnState = "busy";
-				this.publishStatus();
-				this.wakeTail();
+				// The tail may have already terminally finalized this operation while
+				// the broker process was still withholding its receipt. Do not restore
+				// busy state or a mutation fence after that authoritative settlement.
+				if (admitted) {
+					this.#admittedOperations.set(opRef, { ...admitted, ambiguous: true });
+					if (deliveredAs === "follow_up") this.#followUpQueueDepth += 1;
+					else this.#turnState = "busy";
+					this.publishStatus();
+					this.wakeTail();
+				}
 			}
 			const reason = error instanceof HostSupervisorError ? error.reason : "turn_admission_failed";
 			throw new MainSessionHostError(reason, error instanceof Error ? error.message : String(error), { cause: error });

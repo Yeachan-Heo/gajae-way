@@ -94,6 +94,9 @@ interface FixtureSession {
 	failNext?: boolean;
 	rejectNext?: { readonly code: string; readonly message: string };
 	suppressNextReceipt?: boolean;
+	suppressNextReceiptAfterTerminalTail?: boolean;
+	receiptSuppressionWaitingForTerminalTail?: string;
+	receiptSuppressionTerminalTailObserved?: string;
 	responseText?: string;
 	tailTimeoutWhileBusy?: boolean;
 	rotateRingDuringNextCompletion?: boolean;
@@ -261,6 +264,13 @@ export class FakeBrokerFixture {
 	suppressNextAdmissionReceipt(): void {
 		this.update(session => {
 			session.suppressNextReceipt = true;
+		});
+	}
+
+	/** Completes the next admission before withholding its receipt until a terminal tail is exposed. */
+	suppressNextAdmissionReceiptAfterTerminalTail(): void {
+		this.update(session => {
+			session.suppressNextReceiptAfterTerminalTail = true;
 		});
 	}
 

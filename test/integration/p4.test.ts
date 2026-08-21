@@ -615,35 +615,30 @@ externalTest("an accepted operation with a lost receipt preserves growth authori
 	}
 }, 30_000);
 
-externalTest("terminal tail evidence finalizes same-process lost-receipt claims without accumulating pending admissions", async () => {
-	const gateway = await hosted({ tailTimeoutMs: 50 });
+externalTest("terminal tail evidence finalizes fast same-process lost-receipt claims before their send failures and never accumulates rows", async () => {
+	const gateway = await hosted({ tailTimeoutMs: 50, commandTimeoutMs: 3_000 });
 	const settleLostReceipt = async (ordinal: number): Promise<void> => {
 		const request = {
-			text: `accepted without receipt ${ordinal}`,
+			text: `fast accepted without receipt ${ordinal}`,
 			surface_id: "owner",
-			idempotency_key: `same-process-lost-receipt-${ordinal}`,
+			idempotency_key: `fast-same-process-lost-receipt-${ordinal}`,
 		};
-		gateway.fixture.holdNextTurn();
-		gateway.fixture.suppressNextAdmissionReceipt();
-		const interrupted = await gateway.client.request("main.submit", request);
+		gateway.fixture.suppressNextAdmissionReceiptAfterTerminalTail();
+		const interrupted = await gateway.client.request("main.submit", request, { timeoutMs: 5_000 });
 		expect(rpcError(interrupted)).toMatchObject({ code: -32603, message: "bridge_exception", data: { reason: "turn_admission_failed" } });
-		const [pending] = gateway.core.mainAdmissionOperationsPending();
-		const intent = JSON.parse(pending?.intentJson ?? "{}") as { op_ref?: unknown; delivered_as?: unknown };
-		if (typeof intent.op_ref !== "string" || (intent.delivered_as !== "prompt" && intent.delivered_as !== "steer" && intent.delivered_as !== "follow_up")) {
-			throw new Error("same-process lost-receipt admission intent was malformed");
-		}
-		expect(gateway.host.admissionFenceReason).toBe("admission_recovery_pending");
-		gateway.fixture.complete(intent.op_ref, { text: `same-process receipt-loss reply ${ordinal}` });
 		await eventually(
 			() => (gateway.core.mainAdmissionOperationsPending().length === 0 ? true : undefined),
-			"terminal evidence did not finalize the same-process admission claim",
+			"terminal evidence did not finalize the fast same-process admission claim",
 		);
 		await eventually(
 			() => (gateway.host.admissionFenceReason === undefined && gateway.state.read().growthIntent === undefined ? true : undefined),
-			"terminal evidence did not release the ambiguous admission fence and growth intent",
+			"terminal evidence did not settle the fast receipt-loss admission",
 		);
+		const commands = gateway.fixture.commands().filter(command => command.operation === "turn.prompt" && command.text === request.text);
+		expect(commands).toHaveLength(1);
+		if (typeof commands[0]?.opRef !== "string") throw new Error("fast same-process lost-receipt admission did not retain its operation reference");
 		const replay = await gateway.client.request("main.submit", request);
-		expect(replay.result).toEqual({ accepted: true, op_ref: intent.op_ref, delivered_as: intent.delivered_as });
+		expect(replay.result).toEqual({ accepted: true, op_ref: commands[0].opRef, delivered_as: "prompt" });
 		expect(gateway.fixture.commands().filter(command => command.operation === "turn.prompt" && command.text === request.text)).toHaveLength(1);
 	};
 

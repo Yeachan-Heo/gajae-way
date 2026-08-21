@@ -22,8 +22,9 @@ export class DiscordAcknowledgementError extends Error {
 }
 
 /**
- * Starts at gateway acceptance, not after a persona turn. Typing is a cheap
- * Discord-visible acknowledgement and does not need a durable local receipt.
+ * Runs only after durable `main.submit` acceptance. Typing remains bounded from
+ * the inbound gateway timestamp and never serves as acknowledgement for a
+ * message the fenced gateway refused to admit.
  */
 export async function acknowledgeDiscordMessage(
 	platform: DiscordPlatform,
