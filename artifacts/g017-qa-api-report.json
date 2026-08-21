@@ -1,9 +1,9 @@
 {
   "schemaVersion": 1,
   "kind": "api-package-test-report",
-  "sourceHash": "sha256:180906de84bdd4798c338a332bf608bd2f40712597dd07ce09a5ac1229949d50",
-  "snapshotCommit": "49791f295d2d9a8697714ae1a42ded084f69613f",
-  "priorSnapshotCommit": "d9cc76df33bab2da22d0a763d6986d0cc70293c8",
+  "sourceHash": "sha256:6325d7db5299c33141afc6686664a4faf5896a1cd022d4041713bf25ede71a83",
+  "snapshotCommit": "b7d432f098fbc1dc8f643854cd615ce2974e31af",
+  "priorSnapshotCommit": "49791f295d2d9a8697714ae1a42ded084f69613f",
   "status": "passed",
   "e2eStatus": "passed",
   "redTeamStatus": "passed",
@@ -11,34 +11,34 @@
   "commands": [
     {
       "command": "bun test test/qa/recovery-fail-closed.test.ts",
-      "classification": "affected real-daemon/UDS recovery and mid-closure readiness-boundary suite",
-      "passed": 8,
+      "classification": "affected real-daemon/UDS closure recovery, receipt, and mid-flight readiness suite",
+      "passed": 9,
       "failed": 0,
-      "expectCalls": 83,
+      "expectCalls": 113,
       "verdict": "passed"
     },
     {
       "command": "bun scripts/compile.ts",
-      "classification": "required rebuild of frozen 49791f2 source before compiled e2e",
+      "classification": "required rebuild of frozen b7d432f source before compiled e2e and compiled production-hook probe",
       "passed": 1,
       "failed": 0,
       "observed": "Compiled and codesigned dist/gajaeway and dist/gajaeway-discord for darwin-arm64.",
       "verdict": "passed"
     },
     {
-      "command": "bun /tmp/g020-r2-red-team.ts",
-      "classification": "new throwaway real-daemon closure-dispatch, pause-scope, and error-propagation red-team suite",
-      "passed": 4,
+      "command": "bun /tmp/g021-r3-red-team.ts",
+      "classification": "throwaway real-daemon receipt-integrity, mid-flight RPC, and production-hook red-team suite run after the rebuild",
+      "passed": 3,
       "failed": 0,
-      "observed": "Covered after-acquire and after-commit readiness races, source/compiled production pause-hook inertness, and a genuine Git error distinct from readiness refusal.",
+      "observed": "Covered stale-versus-fresh worker receipts, immutable graph evidence during receipt replacement, original plus same-key waiter 1003 mapping, dirty-index 1206 preservation, and source/compiled production test-hook inertness under a real in-flight Git pre-push gate.",
       "verdict": "passed"
     },
     {
-      "command": "bun /tmp/g020-gen3-gen4-regression-probes.ts",
-      "classification": "throwaway Generation-3/4 behavioral spot-check suite rebound to Generation-5 source",
+      "command": "bun /tmp/g021-gen3-gen5-regression-probes.ts",
+      "classification": "throwaway Generation-3/4/5 spot-check suite rebound to Generation-6 source",
       "passed": 7,
       "failed": 0,
-      "observed": "Covered pending-proof delivery gap, unified mutation fence, null/missing proof, mandatory atomic journal, admission disposition, and Discord acknowledgement boundary through fixture/UDS paths.",
+      "observed": "Covered pending-proof delivery gap, unified mutation fence, null/missing proof, mandatory atomic projection journal, admission disposition, and Discord acknowledgement boundary through real fixture/UDS paths.",
       "verdict": "passed"
     },
     {
@@ -58,17 +58,34 @@
       "verdict": "passed"
     },
     {
+      "command": "bun test test/unit/main-session.test.ts",
+      "classification": "focused durable proof, transcript delivery, atomic projection, and injected-failure regression suite",
+      "passed": 33,
+      "failed": 0,
+      "expectCalls": 111,
+      "verdict": "passed"
+    },
+    {
+      "command": "bun test test/integration/discord.test.ts",
+      "classification": "Discord durable admission and acknowledgement regression suite",
+      "passed": 8,
+      "failed": 0,
+      "expectCalls": 41,
+      "observed": "Expected fixture broker-rejection bridge-error logging occurred only for a negative-path drill.",
+      "verdict": "passed"
+    },
+    {
       "command": "bun test test/integration/console.test.ts",
       "classification": "focused cockpit/TUI integration regression suite",
       "passed": 24,
       "failed": 0,
       "expectCalls": 111,
-      "observed": "Expected shutdown/request-cancel internal-error logs occurred only during teardown.",
+      "observed": "Expected shutdown/request-cancel internal-error logs occurred during teardown only.",
       "verdict": "passed"
     },
     {
-      "command": "bun /tmp/g020-console-transcript.ts",
-      "classification": "throwaway redirected raw-TTY cockpit transcript harness",
+      "command": "bun /tmp/g021-console-transcript.ts",
+      "classification": "fresh redirected raw-TTY cockpit transcript harness",
       "passed": 1,
       "failed": 0,
       "observed": {
@@ -99,23 +116,23 @@
       "verdict": "passed"
     },
     {
-      "command": "LC_ALL=C bun -e 'console.log(\"g020-cli-ok\")'",
+      "command": "LC_ALL=C bun -e 'console.log(\"g021-cli-ok\")'",
       "classification": "safe deterministic CLI replay",
       "passed": 1,
       "failed": 0,
-      "recordedStdout": "g020-cli-ok\n",
+      "recordedStdout": "g021-cli-ok\n",
       "recordedStderr": "",
       "verdict": "passed"
     },
     {
-      "command": "git diff --check d9cc76d..49791f2 && git diff --check",
+      "command": "git diff --check 49791f2..b7d432f && git diff --check",
       "classification": "frozen-delta and refreshed-artifact whitespace validation",
       "passed": 1,
       "failed": 0,
       "verdict": "passed"
     },
     {
-      "command": "git grep -n '@gajae-code/coding-agent' 49791f2 -- package.json bun.lock src test scripts README.md || true",
+      "command": "git grep -n '@gajae-code/coding-agent' b7d432f -- package.json bun.lock src test scripts README.md || true",
       "classification": "retained removed-dependency guard",
       "passed": 1,
       "failed": 0,
@@ -126,30 +143,39 @@
   "contractCoverage": [
     {
       "contractRef": "R1",
-      "obligation": "Startup closure recovery uses the same host mutation-readiness authority: a readiness refusal remains non-fatal and visible, preserves its exact durable intent, and a later healthy boot finalizes the intent exactly once.",
+      "obligation": "Startup closure recovery must share host mutation readiness: a refusal is non-fatal and visible, retains the durable intent, and a healthy restart finalizes the same operation exactly once.",
       "status": "covered",
       "evidence": [
-        "bun test test/qa/recovery-fail-closed.test.ts :: 8 cases / 83 assertions, including retained closure recovery through acquired and committed-not-pushed states.",
-        "bun /tmp/g020-r2-red-team.ts :: both paused recovery variants visibly logged Pending corpus closure recovery refused: transcript_delivery_progress_write_failed, retained their staged operation, and healthy restart finalized once with seven identical same-key replays and no extra commit."
+        "bun test test/qa/recovery-fail-closed.test.ts :: 9 cases / 113 assertions, including acquired and committed-not-pushed recovery deferrals.",
+        "bun /tmp/g021-r3-red-team.ts :: a refused committed closure emitted Pending corpus closure recovery refused: transcript_delivery_progress_write_failed, kept its intent/graph evidence, then healthy recovery completed one remote commit and a same-key follow-up replayed one result."
       ]
     },
     {
       "contractRef": "R2",
-      "obligation": "Every worker Git dispatch synchronously validates lock fencing and host mutation readiness. A degradation after lease acquisition blocks the first Git command; a degradation after commit blocks push while retaining a committed-not-pushed, exactly-once recoverable closure. Typed readiness refusal must not mask unrelated closure failures.",
+      "obligation": "Every worker Git dispatch validates lock fencing and host mutation readiness; after-acquire degradation blocks Git, after-commit degradation blocks push while preserving recovery, and original plus same-key in-flight RPC callers are each mapped to typed 1003 refusal. Genuine ClosureErrors remain their own errors.",
       "status": "covered",
       "evidence": [
-        "bun /tmp/g020-r2-red-team.ts :: after_acquire marker held the lease; after degradation/release the durable state remained acquired, local and remote heads stayed identical to baseline, and direct close returned 1003 transcript_delivery_progress_write_failed.",
-        "bun /tmp/g020-r2-red-team.ts :: after_commit marker held a durable local commit; after degradation/release the durable state remained committed, local head stayed committed, remote head stayed at base, and healthy restart pushed/finalized once. Seven same-key attempts afterward yielded one response and remote count remained two.",
-        "bun /tmp/g020-r2-red-team.ts :: a missing-path Git add fault returned JSON-RPC -32603 bridge_exception with reason bridge_exception, logged git add failed, kept host health running, retained a pulled operation, and did not become a 1003 readiness refusal.",
-        "test/qa/recovery-fail-closed.test.ts :: source regression drills at the after-acquire and after-commit boundaries passed."
+        "bun test test/qa/recovery-fail-closed.test.ts :: source drill covers after-acquire, after-commit, and new RPC original/waiter behavior.",
+        "bun /tmp/g021-r3-red-team.ts :: original and same-key waiter both received 1003 transcript_delivery_progress_write_failed after release from an acquired pause; intent stayed acquired and later recovered with a fresh receipt.",
+        "bun /tmp/g021-r3-red-team.ts :: dirty index returned code 1206 corpus git index is dirty on original and retry, never 1003; the operation remained acquired/recoverable."
+      ]
+    },
+    {
+      "contractRef": "R3",
+      "obligation": "Closure receipts are attempt-scoped. Reacquisition atomically replaces only lease/fencing evidence; immutable commit-graph evidence cannot be regressed or replaced. Final output must name the fresh receipt that actually performs Git, not a released/expired refused receipt.",
+      "status": "covered",
+      "evidence": [
+        "bun /tmp/g021-r3-red-team.ts :: the refused committed-not-pushed receipt became lockFencingValid=false after daemon shutdown and was never returned by recovery; per-run old and fresh IDs are retained in /tmp/g021-r3-red-team-results.json.",
+        "The healthy attempt replaced it with fresh lease/token 2 while lockFencingValid=true at after-push marker; marker response and final stored replay response used exactly that fresh receipt. After finalization the fresh lease was correctly released, showing the final response identifies the completed worker attempt rather than claiming ongoing validity.",
+        "The committed state and baseHead/baseTree/stagedTree/commitHead/committed/recoveryMarker evidence were byte-for-byte preserved across replaceExecutionLease; only attempt receipt fields changed."
       ]
     },
     {
       "contractRef": "B1",
-      "obligation": "Pending-proof promotion atomically binds proof and records a visible transcript_delivery_gap for a post-commit suffix rather than silently baselining a finalized reply.",
+      "obligation": "Pending-proof promotion atomically binds proof and leaves a visible transcript_delivery_gap for a post-commit suffix rather than silently baselining a finalized reply.",
       "status": "covered",
       "evidence": [
-        "bun /tmp/g020-gen3-gen4-regression-probes.ts :: owner-UDS probe observed transcriptProof=proven, gapCount=1, journalKinds=[transcript_delivery_gap], and adoption=pending_proof_promotion."
+        "bun /tmp/g021-gen3-gen5-regression-probes.ts :: owner-UDS probe observed transcriptProof=proven, gapCount=1, journalKinds=[transcript_delivery_gap], and adoption=pending_proof_promotion."
       ]
     },
     {
@@ -157,8 +183,8 @@
       "obligation": "mutationReadinessReason fences main.submit and main.corpus.close before broker or Git effects once transcript delivery projection has failed.",
       "status": "covered",
       "evidence": [
-        "bun /tmp/g020-gen3-gen4-regression-probes.ts :: forced projection failure returned 1003 transcript_delivery_progress_write_failed for both calls; no second broker attempt, closure operation, commit, or push occurred.",
-        "bun /tmp/g020-r2-red-team.ts :: direct closure calls remained typed-fenced while both mid-closure recovery variants were degraded."
+        "bun /tmp/g021-gen3-gen5-regression-probes.ts :: forced projection failure returned 1003 transcript_delivery_progress_write_failed for both submit and close; there was no second broker attempt, closure claim, commit, or push.",
+        "bun /tmp/g021-r3-red-team.ts :: direct close calls remained typed-fenced during refused worker recovery."
       ]
     },
     {
@@ -166,40 +192,42 @@
       "obligation": "Current-schema null or missing durable transcript_proof fails closed at read time instead of being inferred from main_identity.",
       "status": "covered",
       "evidence": [
-        "bun /tmp/g020-gen3-gen4-regression-probes.ts :: raw SQLite null and deleted-key cases each became owner-UDS unhealthy/failed_closed/metadata_invalid and exited 78."
+        "bun /tmp/g021-gen3-gen5-regression-probes.ts :: raw SQLite null and deleted-key cases each reached unhealthy/failed_closed/metadata_invalid over UDS and exit 78."
       ]
     },
     {
       "contractRef": "C2",
-      "obligation": "journalAppendTranscriptProjection remains mandatory; no split journal/delivery write fallback is constructible or used.",
+      "obligation": "journalAppendTranscriptProjection remains mandatory and no split journal/delivery fallback is constructible or used.",
       "status": "covered",
       "evidence": [
-        "bun /tmp/g020-gen3-gen4-regression-probes.ts :: host construction without journalAppendTranscriptProjection failed transcript_projection_journal_unavailable before commands=0/admissionAttempts=0, and an injected projection fault retained delivery at transcript:2 rather than silently advancing assistant transcript:3."
+        "bun /tmp/g021-gen3-gen5-regression-probes.ts :: a host lacking journalAppendTranscriptProjection failed transcript_projection_journal_unavailable before commands=0/admissionAttempts=0; injected projection failure retained delivery at transcript:2 rather than silently advancing assistant transcript:3."
       ]
     },
     {
       "contractRef": "C3",
-      "obligation": "Centralized admission disposition abandons only a definitive broker-rejection claim and retains/fences a non-definitive claim without resend until terminal evidence settles it.",
+      "obligation": "Centralized admission disposition abandons only a definitive broker rejection claim and retains/fences a non-definitive claim without resend until terminal evidence settles it.",
       "status": "covered",
       "evidence": [
-        "bun /tmp/g020-gen3-gen4-regression-probes.ts :: definitive rejection left pendingClaims=0 before retry; ambiguous receipt loss replayed as 1003 admission_recovery_pending with attempts=1/commands=1 until terminal settlement."
+        "bun /tmp/g021-gen3-gen5-regression-probes.ts :: definitive rejection left pendingClaims=0 before retry; ambiguous receipt loss replayed as 1003 admission_recovery_pending with attempts=1/commands=1 until terminal settlement."
       ]
     },
     {
       "contractRef": "C4",
-      "obligation": "Discord acknowledgement budget begins at observed durable main.submit acceptance: delayed success receives typing and failed admission receives none.",
+      "obligation": "Discord acknowledgement budget starts at observed durable main.submit acceptance: delayed success gets typing and failed admission gets none.",
       "status": "covered",
       "evidence": [
-        "bun /tmp/g020-gen3-gen4-regression-probes.ts :: inbound time 1000, observed acceptance 3501, one typing acknowledgement at 3501, and no additional acknowledgement after the rejected admission."
+        "bun /tmp/g021-gen3-gen5-regression-probes.ts :: inbound timestamp 1000 and observed durable acceptance 3501 yielded one typing acknowledgement at 3501; a rejected admission did not increase acknowledgement count.",
+        "bun test test/integration/discord.test.ts :: 8 cases / 41 assertions passed."
       ]
     },
     {
       "contractRef": "C5",
-      "obligation": "Injected recovery faults retain their no-resend/no-silent-progress safety signal and publish the expected fence, degraded, or FAILED_CLOSED state.",
+      "obligation": "Injected recovery faults retain no-resend/no-silent-progress safety and publish the required fence, degraded state, or FAILED_CLOSED outcome.",
       "status": "covered",
       "evidence": [
-        "bun test test/qa/recovery-fail-closed.test.ts :: projection, recovery, admission, and both mid-closure failure paths passed 8 cases / 83 assertions.",
-        "bun /tmp/g020-gen3-gen4-regression-probes.ts :: projection-write fault left transcript delivery before assistant output and fenced both mutation effects."
+        "bun test test/unit/main-session.test.ts :: 33 proof, tail, delivery, and admission-recovery cases passed.",
+        "bun test test/qa/recovery-fail-closed.test.ts :: 9 failure/recovery cases passed, including projection, admission recovery, closure recovery, receipt distinction, and mid-flight waiter behavior.",
+        "bun /tmp/g021-gen3-gen5-regression-probes.ts :: live projection-failure probe retained delivery before assistant output and fenced both mutation effects."
       ]
     }
   ],
@@ -207,171 +235,171 @@
     {
       "surface": "api",
       "invocations": [
-        "bun /tmp/g020-r2-red-team.ts",
-        "bun /tmp/g020-gen3-gen4-regression-probes.ts",
+        "bun /tmp/g021-r3-red-team.ts",
+        "bun /tmp/g021-gen3-gen5-regression-probes.ts",
         "bun test test/qa/recovery-fail-closed.test.ts"
       ],
-      "observed": "Real owner UDS calls exercised way.health, main.events.read, main.submit, and main.corpus.close. Mid-closure probes demonstrated no pre-Git dispatch after lease degradation, no push after commit degradation, retained operation evidence, visible readiness refusal, exactly-once healthy recovery, and a genuine -32603 Git failure that stayed distinct from a typed 1003 fence.",
+      "observed": "Real owner UDS calls exercised way.health, main.events.read, main.submit, and main.corpus.close. The custom suite proved current receipt binding at after-push, old refused receipt invalidity after daemon exit, immutable graph evidence across receipt replacement, dual original/waiter 1003 mapping, and dirty-index 1206 preservation.",
       "verdict": "passed"
     },
     {
       "surface": "cli",
       "invocations": [
         "bun scripts/compile.ts",
-        "./dist/gajaeway --help",
         "bun src/main.ts --help",
-        "LC_ALL=C bun -e 'console.log(\"g020-cli-ok\")'",
-        "bun /tmp/g020-r2-red-team.ts :: source-production and compiled-production pause-hook probes",
+        "./dist/gajaeway --help",
+        "LC_ALL=C bun -e 'console.log(\"g021-cli-ok\")'",
+        "bun /tmp/g021-r3-red-team.ts :: production source/compiled real-pre-push waiter probes",
         "bun test test/e2e/compiled-closure.test.ts",
         "bun test test/e2e/systemd.test.ts"
       ],
-      "observed": "Rebuilt compiled and source CLIs exposed the same supported surface. Test-only after-acquire/after-commit marker variables were supplied without releases under NODE_ENV=production to both source and compiled daemon flows: neither marker appeared, both closures completed, and each remote history stayed at two commits. Safe replay emitted exactly g020-cli-ok newline with empty stderr.",
+      "observed": "Source and freshly rebuilt compiled CLIs exposed the same supported command surface. In source and compiled NODE_ENV=production daemons, after-acquire, after-commit, and in-flight waiter marker variables were supplied without releases while a real pre-push hook held the original request: no test-only marker appeared, same-key responses were identical, and each remote history remained at two commits. Safe replay wrote exactly g021-cli-ok newline with empty stderr.",
       "verdict": "passed"
     },
     {
       "surface": "tui",
       "invocations": [
-        "bun /tmp/g020-console-transcript.ts",
+        "bun /tmp/g021-console-transcript.ts",
         "bun test test/integration/console.test.ts"
       ],
-      "observed": "A fresh redirected raw-TTY harness drove a real external-host UDS gateway. The refreshed capture has 14,216 UTF-8 bytes and 358 ESC bytes, alternate-screen enter/exit, Delivered as: prompt, and an Assistant frame.",
+      "observed": "Fresh raw-TTY harness against a real external-host UDS gateway produced 14 writes. The refreshed capture contains 14,216 UTF-8 bytes and 358 ESC bytes, alternate-screen enter/exit, Delivered as: prompt, and an Assistant frame.",
       "verdict": "passed"
     }
   ],
   "adversarialCases": [
     {
-      "scenario": "Pause startup closure recovery after lease acquisition, degrade host, then release it before any Git command.",
-      "expectedBehavior": "No Git local or remote effect; acquired intent remains; typed refusal is visible; healthy restart finalizes once.",
-      "invocation": "bun /tmp/g020-r2-red-team.ts; bun test test/qa/recovery-fail-closed.test.ts",
-      "observed": "Local and remote heads stayed at baseline while degraded; retained state=acquired; refusal logged; healthy remote count=2; seven same-key replay responses were identical.",
+      "scenario": "Refuse a committed-not-pushed closure, terminate its worker lease, then healthy-recover behind after-acquire and after-push pauses.",
+      "expectedBehavior": "Old receipt is invalid/stale; state and graph evidence remain immutable; fresh attempt receipt is active during Git push and is exactly what the final response reports.",
+      "invocation": "bun /tmp/g021-r3-red-team.ts",
+      "observed": "Old lease token 1 became invalid after daemon exit; fresh lease token 2 was valid at push marker; marker and final replay matched fresh receipt; final lease was released only after finalization; graph evidence stayed preserved; remote count=2.",
       "verdict": "passed"
     },
     {
-      "scenario": "Pause startup closure recovery after durable local commit but before push, degrade host, and then release it.",
-      "expectedBehavior": "No push; committed evidence remains; healthy restart pushes/finalizes once without double commit or double finalization.",
-      "invocation": "bun /tmp/g020-r2-red-team.ts; bun test test/qa/recovery-fail-closed.test.ts",
-      "observed": "Local committed head stayed stable, remote remained at base/count=1, retained state=committed, refusal logged; healthy remote count=2 and seven later same-key calls were one replay response.",
+      "scenario": "Pause original RPC closure after acquire, join a same-key waiter, degrade host, and release both.",
+      "expectedBehavior": "Original and waiter each receive typed 1003; acquired intent remains recoverable; healthy restart uses a fresh receipt.",
+      "invocation": "bun /tmp/g021-r3-red-team.ts; bun test test/qa/recovery-fail-closed.test.ts",
+      "observed": "Both errors were 1003 transcript_delivery_progress_write_failed; intent state=acquired; old receipt invalid after exit; recovery response used a different lease/token and remote count=2.",
       "verdict": "passed"
     },
     {
-      "scenario": "Supply after-acquire and after-commit test-only pause variables with no release under NODE_ENV=production.",
-      "expectedBehavior": "Neither source nor compiled daemon may create a marker or pause; each closure must finish normally.",
-      "invocation": "bun /tmp/g020-r2-red-team.ts",
-      "observed": "source-production and compiled-production both had acquireMarkerPresent=false, commitMarkerPresent=false, closureIntentPresent=false, and remoteCommitCount=2.",
+      "scenario": "Invoke dirty-index closure error and retry it after healthy recovery.",
+      "expectedBehavior": "A genuine ClosureError remains code 1206 on each call, never a 1003 readiness refusal, and durable operation stays recoverable.",
+      "invocation": "bun /tmp/g021-r3-red-team.ts",
+      "observed": "Original and retry both returned 1206 corpus git index is dirty; durable state=acquired.",
       "verdict": "passed"
     },
     {
-      "scenario": "Request a real closure for a nonexistent Git path on a healthy host.",
-      "expectedBehavior": "A genuine Git error remains an explicit closure failure, not a readiness-refusal disguise.",
-      "invocation": "bun /tmp/g020-r2-red-team.ts",
-      "observed": "UDS returned -32603 bridge_exception with reason=bridge_exception; daemon stderr included git add failed; health remained running; operation state=pulled; remote count=1.",
+      "scenario": "Supply all pause and in-flight waiter test-hook environment variables under NODE_ENV=production while holding a real pre-push Git hook open.",
+      "expectedBehavior": "Source and compiled daemons must not emit any test-only markers even while a same-key waiter is truly in-flight.",
+      "invocation": "bun /tmp/g021-r3-red-team.ts",
+      "observed": "Source and compiled production scenarios observed real pre-push gates, no acquire/commit/waiter markers, identical first/waiter replies, and two remote commits only.",
       "verdict": "passed"
     },
     {
-      "scenario": "Promote a pending proof after an operator-owned post-commit reply.",
-      "expectedBehavior": "Atomically record transcript_delivery_gap rather than silently baseline the reply.",
-      "invocation": "bun /tmp/g020-gen3-gen4-regression-probes.ts",
+      "scenario": "Finalize an operator-owned busy turn after pending-proof bootstrap.",
+      "expectedBehavior": "Visible atomic pending-proof delivery gap, never silent baseline.",
+      "invocation": "bun /tmp/g021-gen3-gen5-regression-probes.ts",
       "observed": "proof=proven; gapCount=1; adoption=pending_proof_promotion.",
       "verdict": "passed"
     },
     {
-      "scenario": "Force transcript projection failure, then call main.submit and main.corpus.close.",
-      "expectedBehavior": "Both mutations are fenced before broker/Git effect and transcript delivery does not silently advance.",
-      "invocation": "bun /tmp/g020-gen3-gen4-regression-probes.ts",
-      "observed": "Both returned 1003 transcript_delivery_progress_write_failed; no second broker effect, closure claim, commit, or push.",
+      "scenario": "Force transcript projection failure, then submit and close mutations.",
+      "expectedBehavior": "Both paths fence before broker/Git effects and delivery does not silently advance.",
+      "invocation": "bun /tmp/g021-gen3-gen5-regression-probes.ts",
+      "observed": "Both returned 1003; no resend, closure claim, commit, or push.",
       "verdict": "passed"
     },
     {
-      "scenario": "Tamper transcript_proof to null and remove it from current-schema SQLite state.",
-      "expectedBehavior": "Both corruptions fail closed without re-deriving the proof.",
-      "invocation": "bun /tmp/g020-gen3-gen4-regression-probes.ts",
-      "observed": "Both cases were unhealthy/failed_closed/metadata_invalid over UDS with exit 78.",
+      "scenario": "Tamper current-schema SQLite transcript_proof to null and remove it.",
+      "expectedBehavior": "Neither corruption is re-derived from main_identity.",
+      "invocation": "bun /tmp/g021-gen3-gen5-regression-probes.ts",
+      "observed": "Both returned failed_closed/metadata_invalid over UDS and exit 78.",
       "verdict": "passed"
     },
     {
       "scenario": "Construct a host without journalAppendTranscriptProjection.",
-      "expectedBehavior": "No split-write fallback starts or reaches the broker.",
-      "invocation": "bun /tmp/g020-gen3-gen4-regression-probes.ts",
+      "expectedBehavior": "No split-write fallback begins or reaches broker.",
+      "invocation": "bun /tmp/g021-gen3-gen5-regression-probes.ts",
       "observed": "transcript_projection_journal_unavailable before commands=0/admissionAttempts=0.",
       "verdict": "passed"
     },
     {
       "scenario": "Definitive broker rejection versus ambiguous accepted receipt loss.",
-      "expectedBehavior": "Abandon only the definitive claim; retain/fence ambiguity without resend.",
-      "invocation": "bun /tmp/g020-gen3-gen4-regression-probes.ts",
+      "expectedBehavior": "Only definitive claim is abandoned; ambiguity remains fenced without resend.",
+      "invocation": "bun /tmp/g021-gen3-gen5-regression-probes.ts",
       "observed": "Definitive pending claims=0; ambiguous replay=1003 admission_recovery_pending with one broker command until terminal settlement.",
       "verdict": "passed"
     },
     {
-      "scenario": "Delay observed Discord durable acceptance then reject the following ingress.",
-      "expectedBehavior": "Typing begins from observed acceptance and not from inbound time; rejected ingress gets no typing.",
-      "invocation": "bun /tmp/g020-gen3-gen4-regression-probes.ts",
-      "observed": "Typing occurred at 3501 for inbound 1000; acknowledgement count stayed one after failure.",
+      "scenario": "Delay observed Discord durable acceptance and reject following ingress.",
+      "expectedBehavior": "Typing starts from observed durable acceptance and not inbound time; rejected ingress gets none.",
+      "invocation": "bun /tmp/g021-gen3-gen5-regression-probes.ts; bun test test/integration/discord.test.ts",
+      "observed": "Typing occurred at 3501 for inbound 1000; acknowledgement count stayed one after failure; integration suite passed 8 cases.",
       "verdict": "passed"
     },
     {
-      "scenario": "Run current source recovery faults and rebuilt compiled closure/systemd paths.",
-      "expectedBehavior": "No loss of fail-closed or exactly-once closure behavior after the R2 change.",
-      "invocation": "bun test test/qa/recovery-fail-closed.test.ts; bun test test/e2e/compiled-closure.test.ts; bun test test/e2e/systemd.test.ts",
-      "observed": "16 focused/e2e cases passed; 0 failed.",
+      "scenario": "Rebuild and exercise compiled closure/systemd and console surfaces.",
+      "expectedBehavior": "Current source reaches dist and preserves compiled/TUI behavior.",
+      "invocation": "bun scripts/compile.ts; bun test test/e2e/compiled-closure.test.ts; bun test test/e2e/systemd.test.ts; bun test test/integration/console.test.ts",
+      "observed": "Build passed; 8 compiled e2e cases and 24 console cases passed.",
       "verdict": "passed"
     }
   ],
   "probes": [
     {
-      "contract": "R2 after-acquire dispatch boundary",
-      "invocation": "bun /tmp/g020-r2-red-team.ts :: mid-closure-readiness-after_acquire",
-      "expected": "Host degradation after lease acquisition blocks the first Git dispatch and retains the acquired intent.",
-      "observed": "retainedState=acquired, local/remote heads unchanged, refusal visible, healthy count=2, sameKeyReplayCount=7, uniqueReplayResponses=1.",
+      "contract": "R3 attempt-scoped receipt integrity",
+      "invocation": "bun /tmp/g021-r3-red-team.ts :: attempt-scoped-receipt-replaces-stale-refusal-with-actual-git-worker-receipt",
+      "expected": "Fresh execution receipt replaces stale refusal receipt only; graph evidence remains immutable; final response names fresh Git worker receipt.",
+      "observed": "old fencing valid=false after exit; fresh fencing valid=true at push marker; graph preserved=true; marker response equals final replay; fresh receipt released after finalization.",
       "verdict": "passed"
     },
     {
-      "contract": "R2 after-commit dispatch boundary",
-      "invocation": "bun /tmp/g020-r2-red-team.ts :: mid-closure-readiness-after_commit",
-      "expected": "Host degradation between commit and push blocks only push and preserves committed-not-pushed recovery evidence.",
-      "observed": "retainedState=committed, local changed exactly once, remote stayed base until healthy boot, healthy count=2, sameKeyReplayCount=7, uniqueReplayResponses=1.",
+      "contract": "R2 mid-flight RPC owner and waiter",
+      "invocation": "bun /tmp/g021-r3-red-team.ts :: rpc-mid-flight-original-and-waiter-are-fenced-while-dirty-index-error-remains-1206",
+      "expected": "Both callers receive 1003 with retained intent and fresh recovery receipt; dirty index remains 1206 on retry.",
+      "observed": "original=1003; waiter=1003; retained=acquired; recovered receipt token=2; dirty original/retry=1206; dirty operation=acquired.",
       "verdict": "passed"
     },
     {
-      "contract": "Pause-hook production scope",
-      "invocation": "bun /tmp/g020-r2-red-team.ts :: test-only-closure-pause-hooks-unreachable-outside-test",
-      "expected": "Test pause variables are inert outside NODE_ENV=test for source and compiled processes.",
-      "observed": "Both production scenarios completed with no acquire or commit marker and no release file.",
+      "contract": "Test-hook production scope",
+      "invocation": "bun /tmp/g021-r3-red-team.ts :: pause-and-inflight-waiter-markers-are-inert-outside-test-for-source-and-compiled",
+      "expected": "Pause and waiter markers are inert outside NODE_ENV=test even during real in-flight duplicate closure.",
+      "observed": "source and compiled production: realPrePush=true, acquireMarker=false, commitMarker=false, waiterMarker=false, identicalResponses=true, remoteCount=2.",
       "verdict": "passed"
     },
     {
-      "contract": "Genuine closure error propagation",
-      "invocation": "bun /tmp/g020-r2-red-team.ts :: genuine-closure-error-is-not-masked-by-readiness-refusal",
-      "expected": "Git failure remains loud and distinguishable from typed readiness refusal.",
-      "observed": "-32603 bridge_exception/reason=bridge_exception, stderr included git add failed, host stayed running, no remote effect.",
-      "verdict": "passed"
-    },
-    {
-      "contract": "B1 through C4 current-hash spot check",
-      "invocation": "bun /tmp/g020-gen3-gen4-regression-probes.ts",
-      "expected": "Generation-3/4 behavioral probes remain true on 49791f2.",
+      "contract": "B1 through C4 current-hash regression spot check",
+      "invocation": "bun /tmp/g021-gen3-gen5-regression-probes.ts",
+      "expected": "Generation-3 through Generation-5 behavioral probes remain true on b7d432f.",
       "observed": "7 probes passed; 0 failed.",
+      "verdict": "passed"
+    },
+    {
+      "contract": "C5 durable failure matrix",
+      "invocation": "bun test test/unit/main-session.test.ts; bun test test/qa/recovery-fail-closed.test.ts",
+      "expected": "Injection paths preserve expected fence/degraded/FAILED_CLOSED state without resend or silent progress.",
+      "observed": "42 focused test cases passed; 0 failed.",
       "verdict": "passed"
     },
     {
       "contract": "Rebuilt compiled topology",
       "invocation": "bun scripts/compile.ts; bun test test/e2e/compiled-closure.test.ts; bun test test/e2e/systemd.test.ts",
-      "expected": "The current source is present in dist and preserves compiled closure/topology behavior.",
+      "expected": "Current source is present in dist and preserves compiled closure/topology behavior.",
       "observed": "Build passed; 8 compiled e2e cases passed.",
       "verdict": "passed"
     },
     {
-      "contract": "Console terminal capture",
-      "invocation": "bun /tmp/g020-console-transcript.ts",
-      "expected": "Raw terminal capture records terminal lifecycle plus accepted/finalized owner interaction.",
+      "contract": "Raw terminal capture",
+      "invocation": "bun /tmp/g021-console-transcript.ts",
+      "expected": "Terminal capture records lifecycle plus accepted/finalized owner interaction.",
       "observed": "14 writes, 358 ESC bytes, alternate-screen enter/exit, delivered-as prompt, assistant reply.",
       "verdict": "passed"
     },
     {
       "contract": "Safe CLI replay",
-      "invocation": "LC_ALL=C bun -e 'console.log(\"g020-cli-ok\")'",
+      "invocation": "LC_ALL=C bun -e 'console.log(\"g021-cli-ok\")'",
       "expected": "Exit 0 with deterministic safe output.",
-      "observed": "stdout=g020-cli-ok newline; stderr empty.",
+      "observed": "stdout=g021-cli-ok newline; stderr empty.",
       "verdict": "passed"
     }
   ],
@@ -379,19 +407,19 @@
     {
       "path": "artifacts/g017-qa-api-report.json",
       "kind": "api-package-test-report",
-      "sourceHash": "sha256:180906de84bdd4798c338a332bf608bd2f40712597dd07ce09a5ac1229949d50",
+      "sourceHash": "sha256:6325d7db5299c33141afc6686664a4faf5896a1cd022d4041713bf25ede71a83",
       "verified": true
     },
     {
       "path": "artifacts/g017-cli-replay.json",
       "kind": "cli-replay",
-      "sourceHash": "sha256:180906de84bdd4798c338a332bf608bd2f40712597dd07ce09a5ac1229949d50",
+      "sourceHash": "sha256:6325d7db5299c33141afc6686664a4faf5896a1cd022d4041713bf25ede71a83",
       "verified": true
     },
     {
       "path": "artifacts/g017-console-pty-capture.txt",
       "kind": "raw-console-pty-capture",
-      "sourceHash": "sha256:180906de84bdd4798c338a332bf608bd2f40712597dd07ce09a5ac1229949d50",
+      "sourceHash": "sha256:6325d7db5299c33141afc6686664a4faf5896a1cd022d4041713bf25ede71a83",
       "verified": true,
       "bytes": 14216,
       "escapeBytes": 358
