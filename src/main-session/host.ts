@@ -62,7 +62,8 @@ export interface MainSessionHost {
 	/** Resolves once this daemon has a complete, compatible transcript tail. */
 	waitForVerifiedTranscript(): Promise<void>;
 	/** Waits for broker admission only; successful turn execution is observed asynchronously. */
-	admit(deliveredAs: "prompt" | "steer" | "follow_up", text: string, opRef: string): Promise<void>;
+	/** The optional finalizer resolves this exact durable claim after terminal evidence. */
+	admit(deliveredAs: "prompt" | "steer" | "follow_up", text: string, opRef: string, finalizePendingClaim?: () => void): Promise<void>;
 	resolveGate(gateId: string, answer: unknown, idempotencyKey: string): Promise<MainGateResolution>;
 	waitForFatalFailure(): Promise<MainSessionHostError>;
 	dispose(): Promise<void>;
@@ -95,6 +96,8 @@ interface AdmittedOperation {
 	readonly admittedAt: TailCheckpoint | undefined;
 	/** A broker receipt was lost after dispatch, so all mutations stay fenced until a tail settles it. */
 	readonly ambiguous: boolean;
+	/** Exact idempotency finalizer armed before broker dispatch. */
+	readonly finalizePendingClaim?: () => void;
 }
 
 interface JournaledAttemptTransitions {
@@ -588,7 +591,7 @@ class ExternalMainSessionHost implements MainSessionHost {
 		}
 		if (type === "agent_end" || type === "turn_end") {
 			const operationRef = this.admittedOperationRef(event);
-			if (operationRef) this.#admittedOperations.delete(operationRef);
+			if (operationRef && !this.settleAdmittedOperation(operationRef)) return;
 			this.#turnState = this.#admittedOperations.size === 0 ? "idle" : "busy";
 			if (type === "agent_end") this.appendTurnTransition("turn_end", event);
 			this.publishStatus();
@@ -597,7 +600,7 @@ class ExternalMainSessionHost implements MainSessionHost {
 		}
 		if (type === "agent_failed") {
 			const operationRef = this.admittedOperationRef(event);
-			if (operationRef) this.#admittedOperations.delete(operationRef);
+			if (operationRef && !this.settleAdmittedOperation(operationRef)) return;
 			this.#turnState = this.#admittedOperations.size === 0 ? "idle" : "busy";
 			this.publishStatus();
 			this.appendTurnTransition("turn_end", event);
@@ -931,10 +934,34 @@ class ExternalMainSessionHost implements MainSessionHost {
 		return compareTailCheckpoints(terminalCheckpoint, admittedAt) > 0;
 	}
 
+	private finalizeAmbiguousAdmission(opRef: string, admission: AdmittedOperation): boolean {
+		if (!admission.ambiguous) return true;
+		if (!admission.finalizePendingClaim) {
+			this.enterFailure("main_admission_finalize_missing", new Error(`No durable finalizer was registered for ambiguous admission ${opRef}.`));
+			return false;
+		}
+		try {
+			admission.finalizePendingClaim();
+			return true;
+		} catch (error) {
+			this.enterFailure("main_admission_finalize_failed", error);
+			return false;
+		}
+	}
+
+	private settleAdmittedOperation(opRef: string): boolean {
+		const admission = this.#admittedOperations.get(opRef);
+		if (!admission) return true;
+		if (!this.finalizeAmbiguousAdmission(opRef, admission)) return false;
+		this.#admittedOperations.delete(opRef);
+		return true;
+	}
+
 	private settleTerminalTail(tail: SupervisorTailEvents): void {
 		if (!tail.terminal) return;
 		for (const [opRef, admission] of this.#admittedOperations) {
-			if (this.terminalTailSettlesAdmission(tail, admission)) this.#admittedOperations.delete(opRef);
+			if (!this.terminalTailSettlesAdmission(tail, admission)) continue;
+			if (!this.settleAdmittedOperation(opRef)) return;
 		}
 		if (this.#admittedOperations.size !== 0) return;
 		this.#turnState = "idle";
@@ -1116,13 +1143,18 @@ class ExternalMainSessionHost implements MainSessionHost {
 		}
 	}
 
-	async admit(deliveredAs: "prompt" | "steer" | "follow_up", text: string, opRef: string): Promise<void> {
+	async admit(
+		deliveredAs: "prompt" | "steer" | "follow_up",
+		text: string,
+		opRef: string,
+		finalizePendingClaim?: () => void,
+	): Promise<void> {
 		this.assertUsable();
 		if (!text.trim()) throw new MainSessionHostError(`${deliveredAs}_empty`, "A main-session message must not be empty.");
 		if (!opRef.trim()) throw new MainSessionHostError("operation_ref_empty", "An admitted operation requires an operation reference.");
 		const growth = this.beginGrowthWindow();
 		growth.pendingAdmissions += 1;
-		this.#admittedOperations.set(opRef, { admittedAt: this.#tailCheckpoint, ambiguous: false });
+		this.#admittedOperations.set(opRef, { admittedAt: this.#tailCheckpoint, ambiguous: false, ...(finalizePendingClaim === undefined ? {} : { finalizePendingClaim }) });
 		try {
 			if (deliveredAs === "prompt") await this.#supervisor.sendPrompt(text, opRef);
 			else if (deliveredAs === "steer") await this.#supervisor.sendSteer(text, opRef);

@@ -1,5 +1,8 @@
 # The adapter has no durable local state: the gajaeway daemon owns checkpoints
-# and the journal. The credential source must be root-owned and mode 0600.
+# and the journal. It waits for UDS way.health healthy/running before opening
+# Discord ingress, so a READY=1 daemon still verifying a busy transcript cannot
+# acknowledge a message it is fenced from admitting. The credential source must
+# be root-owned and mode 0600.
 [Unit]
 Description=Gajaeway Discord adapter
 

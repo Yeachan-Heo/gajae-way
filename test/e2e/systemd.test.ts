@@ -446,7 +446,7 @@ test("supervised daemon restart restores the PartOf-bound fixture adapter and co
 	}
 }, 30_000);
 
-test("Type=notify topology keeps a fenced busy restart alive beyond its reduced startup bound and promotes in place", async () => {
+test("Type=notify topology keeps Discord ingress disconnected until a fenced busy restart verifies, then promotes in place", async () => {
 	const executable = compiledWay();
 	const root = temporaryDirectory("sd-verifying");
 	const fixture = new FakeBrokerFixture();
@@ -456,8 +456,14 @@ test("Type=notify topology keeps a fenced busy restart alive beyond its reduced 
 	const socketPath = path.join(stateDirectory, "rpc.sock");
 	const environment = e2eEnvironment(fixture);
 	const opRef = "systemd-verification-pending";
+	const inbound = { id: "fenced-discord-message", channelId: "123456789012345678", text: "deliver only after verification" };
+	const discord = new DiscordFixture();
+	const adapterStartup = new AbortController();
+	const adapterErrors: Error[] = [];
 	let daemon: ReturnType<typeof managedProcesses.spawnDaemon> | undefined;
 	let client: RpcClient | undefined;
+	let adapter: RunningDiscordAdapter | undefined;
+	let adapterStart: Promise<RunningDiscordAdapter> | undefined;
 	try {
 		fs.mkdirSync(corpus);
 		fs.writeFileSync(profilePath, testProfile(corpus, fixture.workspace, fixture.sessionId));
@@ -491,6 +497,22 @@ test("Type=notify topology keeps a fenced busy restart alive beyond its reduced 
 			"fenced busy restart did not enter transcript verification pending",
 		);
 		expect(pending).toMatchObject({ status: "booting", state: "verifying" });
+		adapterStart = startDiscordAdapter(
+			{
+				rpcSocketPath: socketPath,
+				token: "fixture-token",
+				route: { channelId: inbound.channelId, surfaceId: "discord:owner-dm" },
+				ackBudgetMs: 2_000,
+				claimTtlMs: 5_000,
+				readWaitMs: 0,
+			},
+			{
+				platformFactory: () => discord,
+				onError: error => adapterErrors.push(error),
+				startupSignal: adapterStartup.signal,
+			},
+		);
+		discord.queueMessage(inbound);
 
 		const reducedSystemdStartupBoundMs = 250;
 		await Bun.sleep(reducedSystemdStartupBoundMs);
@@ -500,7 +522,12 @@ test("Type=notify topology keeps a fenced busy restart alive beyond its reduced 
 			state: "verifying",
 			transcript_verification: "pending",
 		});
-
+		expect(discord.connected).toBe(false);
+		expect(discord.connectCount).toBe(0);
+		expect(discord.messageHandlerCount).toBe(0);
+		expect(discord.queuedMessageCount).toBe(1);
+		expect(discord.acknowledgements).toEqual([]);
+		expect(fixture.commands().filter(command => command.text === inbound.text)).toEqual([]);
 		fixture.complete(opRef, { text: "verification completed after ready was already signaled" });
 		await eventually(
 			async () => {
@@ -515,7 +542,24 @@ test("Type=notify topology keeps a fenced busy restart alive beyond its reduced 
 			state: "running",
 			transcript_verification: "verified",
 		});
+		adapter = await adapterStart;
+		expect(discord.queuedMessageCount).toBe(0);
+		await eventually(
+			() => fixture.commands().find(command => command.operation === "turn.prompt" && command.text === inbound.text),
+			"adapter did not admit the queued Discord message after verification promotion",
+		);
+		expect(discord.acknowledgements).toHaveLength(1);
+		const inboundCommand = fixture.commands().find(command => command.operation === "turn.prompt" && command.text === inbound.text);
+		if (typeof inboundCommand?.opRef !== "string") throw new Error("gated Discord ingress did not retain its operation reference");
+		await eventually(
+			() => discord.sends.find(send => send.text === "ack"),
+			"adapter did not deliver the accepted Discord ingress reply",
+		);
+		expect(adapterErrors).toEqual([]);
 	} finally {
+		adapterStartup.abort();
+		if (adapter) await adapter.stop();
+		else await adapterStart?.catch(() => undefined);
 		client?.close();
 		if (daemon) await managedProcesses.stopDaemon(daemon);
 		fixture.dispose();

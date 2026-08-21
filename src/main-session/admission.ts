@@ -18,7 +18,8 @@ export interface AdmissionRequest {
 export interface MainAdmissionTarget {
 	readonly turnState: "idle" | "busy";
 	/** Broker acceptance boundary; this must not await model-turn completion. */
-	admit(deliveredAs: DeliveredAs, text: string, opRef: string): Promise<void>;
+	/** The supplied finalizer atomically replaces this request's durable intent after terminal evidence. */
+	admit(deliveredAs: DeliveredAs, text: string, opRef: string, finalizePendingClaim?: () => void): Promise<void>;
 }
 
 export interface MainAdmissionOperationStore {
@@ -163,8 +164,9 @@ async function dispatchAdmittedOperation(
 	deliveredAs: DeliveredAs,
 	text: string,
 	opRef: string,
+	finalizePendingClaim: () => void,
 ): Promise<void> {
-	await target.admit(deliveredAs, text, opRef);
+	await target.admit(deliveredAs, text, opRef, finalizePendingClaim);
 }
 
 function isDefinitiveBrokerRejection(error: unknown): boolean {
@@ -242,6 +244,19 @@ export function createMainAdmissionHandler(
 			request_hash: sha256(requestJson),
 		};
 		const intentJson = canonicalJson(intent);
+		const responseJson = canonicalJson(response);
+		// The host retains this exact native finalization transaction if broker
+		// acceptance loses its receipt, then invokes it only after terminal tail evidence.
+		const finalizePendingClaim = (): void => {
+			const finalized = idempotency.mainAdmissionOperationFinalize({
+				scope: MAIN_ADMISSION_SCOPE,
+				key: request.idempotencyKey,
+				requestJson,
+				intentJson,
+				responseJson,
+			});
+			replayResponse(finalized.responseJson);
+		};
 		let claim;
 		try {
 			claim = idempotency.mainAdmissionOperationClaim({
@@ -261,21 +276,15 @@ export function createMainAdmissionHandler(
 			}
 		}
 		try {
-			await dispatchAdmittedOperation(target, deliveredAs, request.text, response.op_ref);
+			await dispatchAdmittedOperation(target, deliveredAs, request.text, response.op_ref, finalizePendingClaim);
 		} catch (error) {
 			abandonDefinitivelyRejectedClaim(idempotency, request, requestJson, intentJson, error);
 			throw error;
 		}
 		await options.afterBrokerAcceptedBeforeFinalize?.();
 		try {
-			const finalized = idempotency.mainAdmissionOperationFinalize({
-				scope: MAIN_ADMISSION_SCOPE,
-				key: request.idempotencyKey,
-				requestJson,
-				intentJson,
-				responseJson: canonicalJson(response),
-			});
-			return replayResponse(finalized.responseJson);
+			finalizePendingClaim();
+			return response;
 		} catch (error) {
 			idempotencyFailure(error);
 		}

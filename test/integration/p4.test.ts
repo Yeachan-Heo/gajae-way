@@ -615,6 +615,44 @@ externalTest("an accepted operation with a lost receipt preserves growth authori
 	}
 }, 30_000);
 
+externalTest("terminal tail evidence finalizes same-process lost-receipt claims without accumulating pending admissions", async () => {
+	const gateway = await hosted({ tailTimeoutMs: 50 });
+	const settleLostReceipt = async (ordinal: number): Promise<void> => {
+		const request = {
+			text: `accepted without receipt ${ordinal}`,
+			surface_id: "owner",
+			idempotency_key: `same-process-lost-receipt-${ordinal}`,
+		};
+		gateway.fixture.holdNextTurn();
+		gateway.fixture.suppressNextAdmissionReceipt();
+		const interrupted = await gateway.client.request("main.submit", request);
+		expect(rpcError(interrupted)).toMatchObject({ code: -32603, message: "bridge_exception", data: { reason: "turn_admission_failed" } });
+		const [pending] = gateway.core.mainAdmissionOperationsPending();
+		const intent = JSON.parse(pending?.intentJson ?? "{}") as { op_ref?: unknown; delivered_as?: unknown };
+		if (typeof intent.op_ref !== "string" || (intent.delivered_as !== "prompt" && intent.delivered_as !== "steer" && intent.delivered_as !== "follow_up")) {
+			throw new Error("same-process lost-receipt admission intent was malformed");
+		}
+		expect(gateway.host.admissionFenceReason).toBe("admission_recovery_pending");
+		gateway.fixture.complete(intent.op_ref, { text: `same-process receipt-loss reply ${ordinal}` });
+		await eventually(
+			() => (gateway.core.mainAdmissionOperationsPending().length === 0 ? true : undefined),
+			"terminal evidence did not finalize the same-process admission claim",
+		);
+		await eventually(
+			() => (gateway.host.admissionFenceReason === undefined && gateway.state.read().growthIntent === undefined ? true : undefined),
+			"terminal evidence did not release the ambiguous admission fence and growth intent",
+		);
+		const replay = await gateway.client.request("main.submit", request);
+		expect(replay.result).toEqual({ accepted: true, op_ref: intent.op_ref, delivered_as: intent.delivered_as });
+		expect(gateway.fixture.commands().filter(command => command.operation === "turn.prompt" && command.text === request.text)).toHaveLength(1);
+	};
+
+	await settleLostReceipt(1);
+	await settleLostReceipt(2);
+	expect(gateway.core.mainAdmissionOperationsPending()).toEqual([]);
+	expect(gateway.state.read()).toMatchObject({ bootstrapState: "COMMITTED", failedClosedReason: undefined });
+}, 30_000);
+
 externalTest("a definitive broker rejection abandons only its claim while ambiguous accepted claims still reconcile without resend", async () => {
 	const gateway = await hosted();
 	const rejectedRequest = { text: "retry after definite rejection", surface_id: "owner", idempotency_key: "definite-rejection" };

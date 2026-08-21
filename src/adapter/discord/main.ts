@@ -12,12 +12,17 @@ const usage = `Usage:
   gajaeway-discord --check [--state-dir PATH] [--profile PATH] [--rpc-socket PATH]
   gajaeway-discord --help | --version`;
 
+const GATEWAY_READY_POLL_MS = 100;
+const GATEWAY_HEALTH_TIMEOUT_MS = 1_000;
+
 export interface DiscordAdapterDependencies {
 	readonly environment?: NodeJS.ProcessEnv;
 	readonly fetch?: DiscordFetch;
 	rpcConnect?(socketPath: string): Promise<JsonRpcClient>;
 	platformFactory?(config: DiscordAdapterConfig): DiscordPlatform;
 	onError?(error: Error): void;
+	/** Cancels startup while the adapter is intentionally waiting for a fenced gateway. */
+	startupSignal?: AbortSignal;
 	waitForShutdown?(): Promise<void>;
 }
 
@@ -30,67 +35,125 @@ export interface RunningDiscordAdapter {
 	stop(): Promise<void>;
 }
 
-/** Starts the adapter as a pure UDS RPC client with no durable local state. */
+/** Starts the adapter only after a running gateway can durably accept ingress. */
 export async function startDiscordAdapter(
 	config: DiscordAdapterConfig,
 	dependencies: DiscordAdapterDependencies = {},
 ): Promise<RunningDiscordAdapter> {
-	const rpc = await (dependencies.rpcConnect ?? RpcClient.connect)(config.rpcSocketPath);
-	const platform =
-		dependencies.platformFactory?.(config) ??
-		new DiscordGatewayPlatform({
-			token: config.token,
-			...(dependencies.fetch ? { fetch: dependencies.fetch } : {}),
-			...(config.apiBaseUrl ? { apiBaseUrl: config.apiBaseUrl } : {}),
-			...(config.gatewayUrl ? { gatewayUrl: config.gatewayUrl } : {}),
-		});
-	const onError = dependencies.onError ?? (error => console.error(`gajaeway-discord failed: ${error.message}`));
-	const router = new DiscordRouteHandler({
-		route: config.route,
-		rpc,
-		platform,
-		acknowledgement: { budgetMs: config.ackBudgetMs },
-	});
-	const outbox = new DiscordOutbox({
-		rpc,
-		platform,
-		route: config.route,
-		claimTtlMs: config.claimTtlMs,
-		readWaitMs: config.readWaitMs,
-		onError,
-	});
-	const controller = new AbortController();
-	const unsubscribe = platform.onMessage(async message => {
-		try {
-			await router.handle(message);
-		} catch (error) {
-			onError(asError(error));
-		}
-	});
+	const rpc = await waitForGatewayRunning(config.rpcSocketPath, dependencies.rpcConnect ?? RpcClient.connect, dependencies.startupSignal);
+	let platform: DiscordPlatform | undefined;
+	let unsubscribe: (() => void) | undefined;
 	try {
-		await platform.connect();
+		platform =
+			dependencies.platformFactory?.(config) ??
+			new DiscordGatewayPlatform({
+				token: config.token,
+				...(dependencies.fetch ? { fetch: dependencies.fetch } : {}),
+				...(config.apiBaseUrl ? { apiBaseUrl: config.apiBaseUrl } : {}),
+				...(config.gatewayUrl ? { gatewayUrl: config.gatewayUrl } : {}),
+			});
+		const activePlatform = platform;
+		const onError = dependencies.onError ?? (error => console.error(`gajaeway-discord failed: ${error.message}`));
+		const router = new DiscordRouteHandler({
+			route: config.route,
+			rpc,
+			platform: activePlatform,
+			acknowledgement: { budgetMs: config.ackBudgetMs },
+		});
+		const outbox = new DiscordOutbox({
+			rpc,
+			platform: activePlatform,
+			route: config.route,
+			claimTtlMs: config.claimTtlMs,
+			readWaitMs: config.readWaitMs,
+			onError,
+		});
+		const controller = new AbortController();
+		unsubscribe = activePlatform.onMessage(async message => {
+			try {
+				await router.handle(message);
+			} catch (error) {
+				onError(asError(error));
+			}
+		});
+		await activePlatform.connect();
+		const outboxRun = outbox.run(controller.signal);
+		let stopped = false;
+		return {
+			async stop(): Promise<void> {
+				if (stopped) return;
+				stopped = true;
+				controller.abort();
+				unsubscribe?.();
+				await activePlatform.disconnect();
+				rpc.close();
+				await outboxRun;
+			},
+		};
 	} catch (error) {
-		unsubscribe();
-		await platform.disconnect();
-		rpc.close();
+		unsubscribe?.();
+		try {
+			await platform?.disconnect();
+		} finally {
+			rpc.close();
+		}
 		throw error;
 	}
-	const outboxRun = outbox.run(controller.signal);
-	let stopped = false;
-	return {
-		async stop(): Promise<void> {
-			if (stopped) return;
-			stopped = true;
-			controller.abort();
-			unsubscribe();
-			await platform.disconnect();
-			rpc.close();
-			await outboxRun;
-		},
-	};
 }
 
-/** `--check`: verify the credential with Discord and confirm the UDS gateway is healthy. */
+async function waitForGatewayRunning(
+	socketPath: string,
+	rpcConnect: (socketPath: string) => Promise<JsonRpcClient>,
+	signal: AbortSignal | undefined,
+): Promise<JsonRpcClient> {
+	let rpc: JsonRpcClient | undefined;
+	try {
+		for (;;) {
+			if (signal?.aborted) throw adapterStartupAborted();
+			if (!rpc) {
+				try {
+					rpc = await rpcConnect(socketPath);
+				} catch {
+					await sleepForGatewayReadiness(signal);
+					continue;
+				}
+			}
+			if (signal?.aborted) throw adapterStartupAborted();
+			try {
+				const response = await rpc.request("way.health", {}, { timeoutMs: GATEWAY_HEALTH_TIMEOUT_MS });
+				if (gatewayIsRunning(response.result)) return rpc;
+				if (response.error) {
+					rpc.close();
+					rpc = undefined;
+				}
+			} catch {
+				rpc?.close();
+				rpc = undefined;
+			}
+			await sleepForGatewayReadiness(signal);
+		}
+	} catch (error) {
+		rpc?.close();
+		throw error;
+	}
+}
+
+async function sleepForGatewayReadiness(signal: AbortSignal | undefined): Promise<void> {
+	await Bun.sleep(GATEWAY_READY_POLL_MS);
+	if (signal?.aborted) throw adapterStartupAborted();
+}
+
+function adapterStartupAborted(): Error {
+	const error = new Error("Discord adapter startup was aborted while waiting for gateway readiness.");
+	error.name = "AbortError";
+	return error;
+}
+
+function gatewayIsRunning(value: unknown): value is Record<string, unknown> {
+	return isRecord(value) && value.status === "healthy" && value.state === "running";
+}
+
+/** `--check`: verify the credential with Discord and confirm the UDS gateway is healthy and running. */
 export async function checkDiscordAdapter(
 	config: DiscordAdapterConfig,
 	dependencies: Pick<DiscordAdapterDependencies, "fetch" | "rpcConnect"> = {},
@@ -102,8 +165,8 @@ export async function checkDiscordAdapter(
 			rpc.request("way.health", {}, { timeoutMs: 5_000 }),
 		]);
 		const health = rpcResult<unknown>(healthResponse, "way.health");
-		if (!isRecord(health) || health.status !== "healthy") {
-			throw new Error("Gateway way.health did not report healthy status.");
+		if (!gatewayIsRunning(health)) {
+			throw new Error("Gateway way.health did not report healthy running status.");
 		}
 		return { discordUserId: user.id, gatewayHealth: health };
 	} finally {

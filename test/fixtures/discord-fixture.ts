@@ -69,6 +69,7 @@ export class DiscordFixture implements DiscordPlatform {
 	#sendId: (input: { channelId: string; text: string; nonce: string; ordinal: number }) => string;
 	readonly #nonceIds = new Map<string, string>();
 	readonly #queuedSendIds: string[] = [];
+	readonly #queuedMessages: DiscordMessage[] = [];
 	#connected = false;
 
 	constructor(options: DiscordFixtureOptions = {}) {
@@ -80,9 +81,18 @@ export class DiscordFixture implements DiscordPlatform {
 		return this.#connected;
 	}
 
+	get queuedMessageCount(): number {
+		return this.#queuedMessages.length;
+	}
+
+	get messageHandlerCount(): number {
+		return this.#handlers.size;
+	}
+
 	async connect(): Promise<void> {
 		this.#connected = true;
 		this.connectCount += 1;
+		for (const message of this.#queuedMessages.splice(0)) await this.dispatch(message);
 	}
 
 	async disconnect(): Promise<void> {
@@ -114,8 +124,17 @@ export class DiscordFixture implements DiscordPlatform {
 		this.#sendId = allocator;
 	}
 
+	/** Queues an inbound event until the next gateway connection without acknowledging it. */
+	queueMessage(input: DiscordFixtureMessage): void {
+		this.#queuedMessages.push(this.recordMessage(input));
+	}
+
 	async emitMessage(input: DiscordFixtureMessage): Promise<void> {
 		if (!this.#connected) throw new Error("Discord fixture gateway is disconnected.");
+		await this.dispatch(this.recordMessage(input));
+	}
+
+	private recordMessage(input: DiscordFixtureMessage): DiscordMessage {
 		const message: DiscordMessage = {
 			id: input.id,
 			channelId: input.channelId,
@@ -125,6 +144,10 @@ export class DiscordFixture implements DiscordPlatform {
 			acceptedAt: input.acceptedAt ?? this.#now(),
 		};
 		this.messages.push(input);
+		return message;
+	}
+
+	private async dispatch(message: DiscordMessage): Promise<void> {
 		for (const handler of [...this.#handlers]) await handler(message);
 	}
 
