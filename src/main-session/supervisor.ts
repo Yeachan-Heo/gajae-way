@@ -84,6 +84,24 @@ export class HostSupervisorError extends Error {
 	}
 }
 
+/**
+ * Whether a broker admission failure proves that no external effect was accepted.
+ * All callers must use this boundary classification rather than inspecting broker
+ * error causes independently.
+ */
+export type AdmissionDisposition = "definitive_rejection" | "ambiguous";
+
+export function classifyAdmissionDisposition(error: unknown): AdmissionDisposition {
+	const seen = new Set<unknown>();
+	let current: unknown = error;
+	while (current instanceof Error && !seen.has(current)) {
+		seen.add(current);
+		if (current instanceof BrokerCliError && current.definitive) return "definitive_rejection";
+		current = current.cause;
+	}
+	return "ambiguous";
+}
+
 export interface ExternalHostSupervisorOptions {
 	readonly broker: BrokerCli;
 	/** Canonical workspace selected by the profile; the broker locator must match exactly. */

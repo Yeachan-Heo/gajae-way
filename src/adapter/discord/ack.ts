@@ -22,9 +22,11 @@ export class DiscordAcknowledgementError extends Error {
 }
 
 /**
- * Runs only after durable `main.submit` acceptance. Typing remains bounded from
- * the inbound gateway timestamp and never serves as acknowledgement for a
- * message the fenced gateway refused to admit.
+ * Runs only after the caller observes durable `main.submit` acceptance. The
+ * gateway exposes no earlier accepted-claim response, so the typing budget
+ * begins at that observable acceptance boundary rather than the inbound Discord
+ * dispatch. This permits slow successful admissions to receive late typing
+ * without acknowledging a fenced or rejected message.
  */
 export async function acknowledgeDiscordMessage(
 	platform: DiscordPlatform,
@@ -36,12 +38,8 @@ export async function acknowledgeDiscordMessage(
 	if (!Number.isSafeInteger(budgetMs) || budgetMs < 1) {
 		throw new DiscordAcknowledgementError("Discord acknowledgement budget must be a positive safe integer.");
 	}
-	const startedAt = message.acceptedAt;
-	const remainingMs = startedAt + budgetMs - now();
-	if (remainingMs <= 0) {
-		throw new DiscordAcknowledgementError(`Discord acknowledgement budget already elapsed for message ${message.id}.`);
-	}
-	await withinBudget(platform.ackTyping(message.channelId), remainingMs, message.id);
+	const startedAt = now();
+	await withinBudget(platform.ackTyping(message.channelId), budgetMs, message.id);
 	const acknowledgedAt = now();
 	if (acknowledgedAt > startedAt + budgetMs) {
 		throw new DiscordAcknowledgementError(`Discord acknowledgement exceeded the ${budgetMs}ms budget for message ${message.id}.`);

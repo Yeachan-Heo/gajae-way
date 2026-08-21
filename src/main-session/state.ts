@@ -307,8 +307,7 @@ function parseOptionalTranscriptDeliveryProgress(raw: string | undefined): Trans
 	};
 }
 
-function parseTranscriptProof(raw: string | undefined, identity: ExternalSessionIdentity | undefined): TranscriptProof {
-	if (raw === undefined || raw === "null") return identity?.transcript === undefined ? "pending" : "proven";
+function parseTranscriptProof(raw: string): TranscriptProof {
 	if (raw !== "pending" && raw !== "proven") {
 		throw new GatewayStateError("metadata_invalid", "transcript_proof must be pending or proven.");
 	}
@@ -337,7 +336,7 @@ function parsedState(values: ReadonlyMap<string, string>): DurableGatewayState {
 	const growthIntentRaw = parseNullableJson(requiredMeta(values, "growth_intent"), "growth_intent");
 	const mainIdentity = mainIdentityRaw === undefined ? undefined : parseExternalIdentity(mainIdentityRaw, "main_identity");
 	const growthIntent = growthIntentRaw === undefined ? undefined : parseGrowthIntent(growthIntentRaw);
-	const transcriptProof = parseTranscriptProof(values.get("transcript_proof"), mainIdentity);
+	const transcriptProof = parseTranscriptProof(requiredMeta(values, "transcript_proof"));
 	const transcriptDeliveryProgress = parseOptionalTranscriptDeliveryProgress(values.get("transcript_delivery_progress"));
 	if (mainIdentity?.transcript === undefined && transcriptProof === "proven") {
 		throw new GatewayStateError("metadata_invalid", "A proven transcript proof requires a fingerprinted main identity.");
@@ -584,7 +583,12 @@ export class GatewayStateStore {
 		});
 	}
 
-	/** Atomically binds a pending adoption to its first complete transcript and ring snapshot. */
+	/**
+	 * Atomically binds a pending adoption to its first complete transcript and ring
+	 * snapshot. A pending adoption has no durable delivery baseline, so consuming
+	 * this first complete tail must leave an explicit loss record rather than
+	 * silently treating its tip as delivered.
+	 */
 	persistTranscriptProof(
 		durable: ExternalSessionIdentity,
 		observed: ExternalSessionIdentity,
@@ -600,6 +604,10 @@ export class GatewayStateStore {
 		) {
 			throw new GatewayStateError("transcript_proof_invalid", "The observed transcript proof does not bind the committed external session.");
 		}
+		const current = this.read();
+		if (current.transcriptDeliveryGapCount >= Number.MAX_SAFE_INTEGER) {
+			throw new GatewayStateError("transcript_delivery_gap_overflow", "The durable transcript delivery-gap count overflowed.");
+		}
 		this.transact({
 			expected: [
 				{ key: "bootstrap_state", value: "COMMITTED" },
@@ -607,16 +615,23 @@ export class GatewayStateStore {
 				{ key: "transcript_proof", value: "pending" },
 				{ key: "tail_checkpoint", value: "null" },
 				{ key: "transcript_delivery_progress", value: transcriptDeliveryProgressJson(undefined) },
+				{ key: "transcript_delivery_gap_count", value: String(current.transcriptDeliveryGapCount) },
 			],
 			puts: [
 				{ key: "main_identity", value: identityJson(observed) },
 				{ key: "transcript_proof", value: "proven" },
 				{ key: "tail_checkpoint", value: tailCheckpointJson(ringCheckpoint) },
 				{ key: "transcript_delivery_progress", value: transcriptDeliveryProgressJson(transcriptDeliveryProgress) },
+				{ key: "transcript_delivery_gap_count", value: String(current.transcriptDeliveryGapCount + 1) },
 			],
 			deletes: [],
-			eventKind: "tail_adoption_start",
-			eventPayloadJson: stableMetadataJson({ checkpoint: ringCheckpoint }),
+			eventKind: "transcript_delivery_gap",
+			eventPayloadJson: stableMetadataJson({
+				reason: "transcript_delivery_progress_missing",
+				adoption: "pending_proof_promotion",
+				available_through_entry_id: transcriptDeliveryProgress.lastEntryId,
+				checkpoint: ringCheckpoint,
+			}),
 		});
 	}
 

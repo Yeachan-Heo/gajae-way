@@ -106,6 +106,12 @@ function failAfterMainAdmissionBrokerAcceptedForE2e(): void {
 	}
 }
 
+function failTranscriptProjectionForE2e(): void {
+	if (Bun.env.NODE_ENV === "test" && Bun.env.GAJAEWAY_E2E_FAIL_TRANSCRIPT_PROJECTION === "1") {
+		throw new Error("forced transcript projection failure");
+	}
+}
+
 function healthFilePath(stateDirectory: string): string {
 	return path.join(stateDirectory, "health.json");
 }
@@ -129,6 +135,7 @@ function createRuntimeMainSessionJournal(
 			gatewayState.appendTailProjection(expected, checkpoint, kind, payloadJson);
 		},
 		journalAppendTranscriptProjection: (kind, payloadJson, expectedTail, checkpoint, expectedDelivery, nextDelivery) => {
+			failTranscriptProjectionForE2e();
 			gatewayState.appendTranscriptProjection(expectedTail, checkpoint, expectedDelivery, nextDelivery, kind, payloadJson);
 		},
 		setRpcHealth: (state, reason) => {
@@ -843,7 +850,7 @@ function closureExecutionFailure(error: unknown): never {
 }
 
 function assertMainSessionMutationReady(host: MainSessionHost): void {
-	const reason = host.admissionFenceReason;
+	const reason = host.mutationReadinessReason;
 	if (reason) throw new RpcBridgeException(1003, reason);
 }
 
@@ -852,10 +859,13 @@ function closureBridgeHandler(
 	closures: ClosureExecutor,
 	corpusPath: string,
 	sessionId: string,
+	mutationReadinessReason: () => string | undefined,
 ): RpcBridgeHandler {
 	const inFlightByKey = new Map<string, InFlightCorpusClosure>();
 	return async (method, params) => {
 		if (method !== "main.corpus.close") throw new RpcBridgeException(-32601, `method not found: ${method}`);
+		const readinessReason = mutationReadinessReason();
+		if (readinessReason) throw new RpcBridgeException(1003, readinessReason);
 		const request = parseCorpusClosureRequest(params, corpusPath);
 		const inFlight = inFlightByKey.get(request.idempotencyKey);
 		if (inFlight) {
@@ -1061,10 +1071,10 @@ async function serveWay(config: WayConfig): Promise<void> {
 				}
 			},
 			afterBrokerAcceptedBeforeFinalize: failAfterMainAdmissionBrokerAcceptedForE2e,
-			admissionFenceReason: () => resumedHost.admissionFenceReason,
+			mutationReadinessReason: () => resumedHost.mutationReadinessReason,
 		});
 		const gateAnswerHandler = createMainGateAnswerHandler(host, core);
-		const rawClosureHandler = closureBridgeHandler(core, closures, profile.corpusPath, resumed.identity.sessionId);
+		const rawClosureHandler = closureBridgeHandler(core, closures, profile.corpusPath, resumed.identity.sessionId, () => resumedHost.mutationReadinessReason);
 		const closureRecovery = resumedHost
 			.waitForVerifiedTranscript()
 			.then(async () => await reconcilePendingClosureOperation(core, closures, profile.corpusPath, resumed.identity.sessionId));

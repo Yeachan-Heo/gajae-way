@@ -846,7 +846,6 @@ fn migrate(connection: &mut Connection) -> StoreResult<()> {
         ("failed_closed_reason", "null"),
         ("tail_checkpoint", "null"),
         ("transcript_delivery_progress", "null"),
-        ("transcript_proof", "pending"),
         ("tail_ring_rotation_count", "0"),
         ("transcript_delivery_gap_count", "0"),
         ("journal_generation", "1"),
@@ -1072,6 +1071,24 @@ mod tests {
         assert_eq!(migrated.get_meta("transcript_proof").unwrap().as_deref(), Some("proven"));
         assert_eq!(migrated.get_meta("schema_version").unwrap(), Some(SCHEMA_VERSION.to_string()));
         drop(migrated);
+        fs::remove_dir_all(state_dir).unwrap();
+    }
+
+    #[test]
+    fn current_schema_missing_transcript_proof_remains_corrupt_for_the_gateway_reader() {
+        let state_dir = temporary_state_dir("missing-current-transcript-proof");
+        let database_path = state_dir.join(DATABASE_FILENAME);
+        drop(Store::open(&state_dir).unwrap());
+
+        let connection = Connection::open(&database_path).unwrap();
+        connection
+            .execute("DELETE FROM gateway_meta WHERE k = 'transcript_proof'", [])
+            .unwrap();
+        drop(connection);
+
+        let reopened = Store::open(&state_dir).unwrap();
+        assert_eq!(reopened.get_meta("transcript_proof").unwrap(), None);
+        drop(reopened);
         fs::remove_dir_all(state_dir).unwrap();
     }
 

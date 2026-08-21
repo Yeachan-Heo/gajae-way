@@ -144,7 +144,7 @@ export async function createExternalGateway(options: ExternalGatewayOptions = {}
 		newOpRef: options.newOpRef,
 		isSurfaceQuarantined: options.isSurfaceQuarantined,
 		afterBrokerAcceptedBeforeFinalize: options.afterBrokerAcceptedBeforeFinalize,
-		admissionFenceReason: () => host.admissionFenceReason,
+		mutationReadinessReason: () => host.mutationReadinessReason,
 	});
 	const answer = createMainGateAnswerHandler(host, core);
 	const handler: RpcBridgeHandler = async (method, params) => {

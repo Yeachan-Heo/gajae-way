@@ -60,9 +60,11 @@ export class DiscordRouteHandler {
 	}
 
 	private async submitAndAcknowledge(message: DiscordMessage): Promise<boolean> {
-		// Admission is the sole acknowledgement authority. A fenced or failed
-		// gateway submission leaves the Discord event unacknowledged, preventing a
-		// consumed inbound message from receiving typing without a durable turn.
+		// `main.submit` exposes no response at its earlier durable-claim boundary.
+		// Its accepted response is the adapter's first observable durable ingress
+		// boundary, so the acknowledgement budget starts only after that response.
+		// A fenced or failed gateway submission remains unacknowledged, preventing
+		// a consumed inbound message from receiving typing without a durable turn.
 		const response = await this.#rpc.request("main.submit", {
 			text: message.text,
 			surface_id: this.#route.surfaceId,

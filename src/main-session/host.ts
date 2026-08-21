@@ -1,4 +1,3 @@
-import { BrokerCliError } from "../broker/cli";
 import { MainSessionGateRegistry, type GateHandle, type MainGateResolution } from "./gates";
 import {
 	attestsExternalTranscriptGrowth,
@@ -14,7 +13,9 @@ import {
 	type TranscriptProof,
 } from "./state";
 import {
+	classifyAdmissionDisposition,
 	HostSupervisorError,
+	type AdmissionDisposition,
 	type HostSupervisor,
 	type SupervisorEvent,
 	type SupervisorTailEvents,
@@ -25,7 +26,8 @@ import {
 export interface MainSessionJournal {
 	journalAppend(kind: string, payloadJson: string): unknown;
 	journalAppendAtTailCheckpoint?(kind: string, payloadJson: string, expected: TailCheckpoint | undefined, checkpoint: TailCheckpoint): unknown;
-	journalAppendTranscriptProjection?(
+	/** Atomically persists the journal projection, tail watermark, and delivery replay point. */
+	journalAppendTranscriptProjection(
 		kind: string,
 		payloadJson: string,
 		expectedTail: TailCheckpoint | undefined,
@@ -40,11 +42,18 @@ export interface MainSessionJournal {
 
 export class MainSessionHostError extends Error {
 	readonly reason: string;
+	/** Present only for a broker admission failure classified at the host boundary. */
+	readonly admissionDisposition?: AdmissionDisposition;
 
-	constructor(reason: string, message = reason, options: { readonly cause?: unknown } = {}) {
+	constructor(
+		reason: string,
+		message = reason,
+		options: { readonly cause?: unknown; readonly admissionDisposition?: AdmissionDisposition } = {},
+	) {
 		super(message, options.cause === undefined ? undefined : { cause: options.cause });
 		this.name = "MainSessionHostError";
 		this.reason = reason;
+		this.admissionDisposition = options.admissionDisposition;
 	}
 }
 
@@ -54,16 +63,16 @@ export interface MainSessionHost {
 	readonly degraded: boolean;
 	readonly turnState: "idle" | "busy";
 	readonly followUpQueueDepth: number;
-	/** Durable adoption proof, not the current boot's complete-tail verification state. */
-	readonly transcriptProof: TranscriptProof;
-	/** Machine fence reason for mutating main-session operations while identity or admission state is unresolved. */
-	readonly admissionFenceReason: "transcript_proof_pending" | "transcript_verification_pending" | "admission_recovery_pending" | undefined;
+	/** The sole mutation fence consulted before any main-session claim or effect. */
+	readonly mutationReadinessReason: string | undefined;
 	readonly gates: MainSessionGateRegistry;
 	/** Resolves once this daemon has a complete, compatible transcript tail. */
 	waitForVerifiedTranscript(): Promise<void>;
 	/** Waits for broker admission only; successful turn execution is observed asynchronously. */
 	/** The optional finalizer resolves this exact durable claim after terminal evidence. */
 	admit(deliveredAs: "prompt" | "steer" | "follow_up", text: string, opRef: string, finalizePendingClaim?: () => void): Promise<void>;
+	/** Degrades and fences the host when durable abandonment of a definitive rejection fails. */
+	reportAdmissionClaimAbandonFailure(error: unknown): void;
 	resolveGate(gateId: string, answer: unknown, idempotencyKey: string): Promise<MainGateResolution>;
 	waitForFatalFailure(): Promise<MainSessionHostError>;
 	dispose(): Promise<void>;
@@ -216,16 +225,6 @@ function markFailedClosed(state: GatewayStateStore, reason: string): void {
 	}
 }
 
-function isDefinitiveBrokerRejection(error: unknown): boolean {
-	const seen = new Set<unknown>();
-	let current: unknown = error;
-	while (current instanceof Error && !seen.has(current)) {
-		seen.add(current);
-		if (current instanceof BrokerCliError && current.definitive) return true;
-		current = current.cause;
-	}
-	return false;
-}
 
 function externalEvent(event: SupervisorEvent): Record<string, unknown> {
 	const payload = isRecord(event.payload) ? event.payload : { payload: event.payload };
@@ -313,6 +312,12 @@ class ExternalMainSessionHost implements MainSessionHost {
 		this.#identity = options.identity;
 		this.#state = options.state;
 		this.#journal = options.journal;
+		if (typeof this.#journal.journalAppendTranscriptProjection !== "function") {
+			throw new MainSessionHostError(
+				"transcript_projection_journal_unavailable",
+				"A durable main-session host requires an atomic transcript projection journal.",
+			);
+		}
 		this.#now = options.now ?? Date.now;
 		this.gates = options.gates ?? new MainSessionGateRegistry({ now: this.#now });
 		this.#turnState = options.initialTurnState ?? "idle";
@@ -351,17 +356,20 @@ class ExternalMainSessionHost implements MainSessionHost {
 		return this.#followUpQueueDepth;
 	}
 
-	get transcriptProof(): TranscriptProof {
-		return this.#transcriptProof;
-	}
-
-	get admissionFenceReason(): "transcript_proof_pending" | "transcript_verification_pending" | "admission_recovery_pending" | undefined {
+	get mutationReadinessReason(): string | undefined {
+		if (this.#disposed) return "host_disposed";
+		if (this.#failure) return this.#failure.reason;
+		if (this.#degraded) return "host_degraded";
 		if (this.#transcriptProof === "pending") return "transcript_proof_pending";
 		if (this.#verificationState === "pending") return "transcript_verification_pending";
 		for (const admission of this.#admittedOperations.values()) {
 			if (admission.ambiguous) return "admission_recovery_pending";
 		}
 		return undefined;
+	}
+
+	reportAdmissionClaimAbandonFailure(error: unknown): void {
+		this.enterFailure("main_admission_claim_abandon_failed", error);
 	}
 
 	waitForVerifiedTranscript(): Promise<void> {
@@ -521,20 +529,16 @@ class ExternalMainSessionHost implements MainSessionHost {
 		try {
 			const encoded = payloadJson(finalized.payload);
 			const checkpoint = this.#journalTailCheckpoint ?? this.#tailCheckpoint;
-			if (checkpoint && this.#journal.journalAppendTranscriptProjection) {
-				this.#journal.journalAppendTranscriptProjection(
-					"assistant_message",
-					encoded,
-					this.#tailCheckpoint,
-					checkpoint,
-					expectedDelivery,
-					nextDelivery,
-				);
-				this.#tailCheckpoint = checkpoint;
-			} else {
-				this.#journal.journalAppend("assistant_message", encoded);
-				this.#state.advanceTranscriptDeliveryProgress(expectedDelivery, nextDelivery);
-			}
+			if (!checkpoint) throw new MainSessionHostError("tail_checkpoint_unavailable", "A transcript projection requires a durable broker-tail checkpoint.");
+			this.#journal.journalAppendTranscriptProjection(
+				"assistant_message",
+				encoded,
+				this.#tailCheckpoint,
+				checkpoint,
+				expectedDelivery,
+				nextDelivery,
+			);
+			this.#tailCheckpoint = checkpoint;
 			this.#transcriptDeliveryProgress = nextDelivery;
 			this.#finalizedAssistantMessageKeys.add(finalized.key);
 			while (this.#finalizedAssistantMessageKeys.size > MAX_JOURNALED_ATTEMPTS) {
@@ -632,20 +636,16 @@ class ExternalMainSessionHost implements MainSessionHost {
 		try {
 			const encoded = payloadJson(payload);
 			const checkpoint = this.#journalTailCheckpoint ?? this.#tailCheckpoint;
-			if (checkpoint && this.#journal.journalAppendTranscriptProjection) {
-				this.#journal.journalAppendTranscriptProjection(
-					"transcript_delivery_gap",
-					encoded,
-					this.#tailCheckpoint,
-					checkpoint,
-					expectedDelivery,
-					nextDelivery,
-				);
-				this.#tailCheckpoint = checkpoint;
-			} else {
-				this.#journal.journalAppend("transcript_delivery_gap", encoded);
-				this.#state.advanceTranscriptDeliveryProgress(expectedDelivery, nextDelivery);
-			}
+			if (!checkpoint) throw new MainSessionHostError("tail_checkpoint_unavailable", "A transcript delivery gap requires a durable broker-tail checkpoint.");
+			this.#journal.journalAppendTranscriptProjection(
+				"transcript_delivery_gap",
+				encoded,
+				this.#tailCheckpoint,
+				checkpoint,
+				expectedDelivery,
+				nextDelivery,
+			);
+			this.#tailCheckpoint = checkpoint;
 			this.#transcriptDeliveryProgress = nextDelivery;
 			return true;
 		} catch (error) {
@@ -1084,11 +1084,10 @@ class ExternalMainSessionHost implements MainSessionHost {
 	}
 
 	private assertUsable(): void {
-		if (this.#disposed) throw new MainSessionHostError("host_disposed");
-		if (this.#failure) throw this.#failure;
-		if (this.#degraded) throw new MainSessionHostError("host_degraded");
-		const fenceReason = this.admissionFenceReason;
-		if (fenceReason) throw new MainSessionHostError(fenceReason);
+		const reason = this.mutationReadinessReason;
+		if (!reason) return;
+		if (this.#failure && this.#failure.reason === reason) throw this.#failure;
+		throw new MainSessionHostError(reason);
 	}
 
 	private beginGrowthWindow(): GrowthWindow {
@@ -1169,7 +1168,8 @@ class ExternalMainSessionHost implements MainSessionHost {
 				this.publishStatus();
 			}
 		} catch (error) {
-			if (isDefinitiveBrokerRejection(error)) {
+			const admissionDisposition = classifyAdmissionDisposition(error);
+			if (admissionDisposition === "definitive_rejection") {
 				this.#admittedOperations.delete(opRef);
 			} else {
 				const admitted = this.#admittedOperations.get(opRef);
@@ -1185,7 +1185,10 @@ class ExternalMainSessionHost implements MainSessionHost {
 				}
 			}
 			const reason = error instanceof HostSupervisorError ? error.reason : "turn_admission_failed";
-			throw new MainSessionHostError(reason, error instanceof Error ? error.message : String(error), { cause: error });
+			throw new MainSessionHostError(reason, error instanceof Error ? error.message : String(error), {
+				cause: error,
+				admissionDisposition,
+			});
 		} finally {
 			growth.pendingAdmissions = Math.max(0, growth.pendingAdmissions - 1);
 			this.finishGrowthWindowIfSettled();

@@ -1,5 +1,5 @@
 import * as crypto from "node:crypto";
-import { BrokerCliError } from "../broker/cli";
+import { MainSessionHostError } from "./host";
 import type { OwnerSurface, WayProfile } from "../profile";
 import { RpcBridgeException } from "../rpc-bridge";
 import { canonicalJson } from "./gates";
@@ -17,9 +17,13 @@ export interface AdmissionRequest {
 
 export interface MainAdmissionTarget {
 	readonly turnState: "idle" | "busy";
+	/** Host-provided readiness is consulted even when a caller did not install an explicit wrapper. */
+	readonly mutationReadinessReason?: string;
 	/** Broker acceptance boundary; this must not await model-turn completion. */
 	/** The supplied finalizer atomically replaces this request's durable intent after terminal evidence. */
 	admit(deliveredAs: DeliveredAs, text: string, opRef: string, finalizePendingClaim?: () => void): Promise<void>;
+	/** Production hosts publish a terminal fence if a definitive rejection's claim cannot be abandoned. */
+	reportAdmissionClaimAbandonFailure?(error: unknown): void;
 }
 
 export interface MainAdmissionOperationStore {
@@ -56,8 +60,8 @@ export interface CreateMainAdmissionOptions {
 	readonly newOpRef?: () => string;
 	/** Test-only interruption seam after broker acceptance and before durable finalization. */
 	readonly afterBrokerAcceptedBeforeFinalize?: () => void | Promise<void>;
-	/** Central main-session mutation fence, checked before a claim or broker effect. */
-	readonly admissionFenceReason?: () => string | undefined;
+	/** The sole main-session mutation fence, checked immediately before a claim or broker effect. */
+	readonly mutationReadinessReason?: () => string | undefined;
 }
 
 interface MainAdmissionIntent {
@@ -169,25 +173,15 @@ async function dispatchAdmittedOperation(
 	await target.admit(deliveredAs, text, opRef, finalizePendingClaim);
 }
 
-function isDefinitiveBrokerRejection(error: unknown): boolean {
-	const seen = new Set<unknown>();
-	let current: unknown = error;
-	while (current instanceof Error && !seen.has(current)) {
-		seen.add(current);
-		if (current instanceof BrokerCliError && current.definitive) return true;
-		current = current.cause;
-	}
-	return false;
-}
-
 function abandonDefinitivelyRejectedClaim(
+	target: MainAdmissionTarget,
 	idempotency: MainAdmissionOperationStore,
 	request: AdmissionRequest,
 	requestJson: string,
 	intentJson: string,
 	error: unknown,
 ): void {
-	if (!isDefinitiveBrokerRejection(error)) return;
+	if (!(error instanceof MainSessionHostError) || error.admissionDisposition !== "definitive_rejection") return;
 	try {
 		idempotency.mainAdmissionOperationAbandon({
 			scope: MAIN_ADMISSION_SCOPE,
@@ -196,11 +190,13 @@ function abandonDefinitivelyRejectedClaim(
 			intentJson,
 		});
 	} catch (abandonError) {
-		throw new MainAdmissionRecoveryError(
+		const recoveryError = new MainAdmissionRecoveryError(
 			"main_admission_claim_abandon_failed",
 			"The broker definitively rejected a main admission, but its durable pre-effect claim could not be abandoned.",
 			{ cause: abandonError },
 		);
+		target.reportAdmissionClaimAbandonFailure?.(recoveryError);
+		throw recoveryError;
 	}
 }
 
@@ -219,7 +215,7 @@ export function createMainAdmissionHandler(
 	const newOpRef = options.newOpRef ?? crypto.randomUUID;
 	return async (params: unknown): Promise<{ accepted: boolean; op_ref: string; delivered_as: DeliveredAs }> => {
 		const request = parseRequest(params);
-		const fenceReason = options.admissionFenceReason?.();
+		const fenceReason = options.mutationReadinessReason?.() ?? target.mutationReadinessReason;
 		if (fenceReason) throw new RpcBridgeException(1003, fenceReason);
 		const canonicalSurfaceId = request.surfaceId.trim();
 		const surface = knownSurfaces.get(canonicalSurfaceId);
@@ -278,7 +274,7 @@ export function createMainAdmissionHandler(
 		try {
 			await dispatchAdmittedOperation(target, deliveredAs, request.text, response.op_ref, finalizePendingClaim);
 		} catch (error) {
-			abandonDefinitivelyRejectedClaim(idempotency, request, requestJson, intentJson, error);
+			abandonDefinitivelyRejectedClaim(target, idempotency, request, requestJson, intentJson, error);
 			throw error;
 		}
 		await options.afterBrokerAcceptedBeforeFinalize?.();

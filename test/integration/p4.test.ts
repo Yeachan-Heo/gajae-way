@@ -125,7 +125,7 @@ externalTest("main.submit admits a held external turn before the bridge timeout"
 
 });
 
-externalTest("pending busy adoption binds its first complete tail as an unprojected ring boundary before admission", async () => {
+externalTest("pending busy adoption records a visible delivery gap when its first complete tail includes a post-commit reply", async () => {
 	const fixture = new FakeBrokerFixture();
 	let gatewayOwned = false;
 	try {
@@ -154,14 +154,26 @@ externalTest("pending busy adoption binds its first complete tail as an unprojec
 			() => (gateway.state.read().transcriptProof === "proven" ? true : undefined),
 			"the first complete tail did not bind the pending transcript proof",
 		);
-		expect(gateway.state.read().tailCheckpoint).toEqual({ revision: 4, generation: 1, seq: 5 });
+		expect(gateway.state.read()).toMatchObject({
+			tailCheckpoint: { revision: 4, generation: 1, seq: 5 },
+			transcriptDeliveryGapCount: 1,
+			transcriptDeliveryProgress: { lastEntryId: `${fixture.sessionId}:transcript:3`, fingerprint: { entryCount: 4 } },
+		});
 		const boundaryEvents = gateway.core.journalRead("1:0", 100).events;
-		expect(boundaryEvents.filter(event => event.kind === "tail_adoption_start")).toHaveLength(1);
-		expect(JSON.parse(boundaryEvents.find(event => event.kind === "tail_adoption_start")?.payloadJson ?? "{}")).toEqual({
+		expect(boundaryEvents.filter(event => event.kind === "tail_adoption_start")).toEqual([]);
+		const gap = boundaryEvents.find(event => event.kind === "transcript_delivery_gap");
+		expect(JSON.parse(gap?.payloadJson ?? "{}")).toEqual({
+			reason: "transcript_delivery_progress_missing",
+			adoption: "pending_proof_promotion",
+			available_through_entry_id: `${fixture.sessionId}:transcript:3`,
 			checkpoint: { revision: 4, generation: 1, seq: 5 },
 		});
 		expect(boundaryEvents.filter(event => event.kind === "turn_start" || event.kind === "turn_end" || event.kind === "assistant_message")).toEqual([]);
-		expect((await gateway.client.request("way.status", {})).result).toMatchObject({ transcript_proof: "proven", turn_state: "idle" });
+		expect((await gateway.client.request("way.status", {})).result).toMatchObject({
+			transcript_proof: "proven",
+			turn_state: "idle",
+			transcript_delivery_gap_count: 1,
+		});
 
 		gateway.fixture.holdNextTurn();
 		const accepted = await gateway.client.request("main.submit", {
@@ -554,7 +566,7 @@ externalTest("an accepted operation with a lost receipt preserves growth authori
 	const intent = JSON.parse(pending?.intentJson ?? "{}") as { op_ref?: unknown };
 	if (typeof intent.op_ref !== "string") throw new Error("lost receipt admission intent was malformed");
 	expect(gateway.state.read().growthIntent).toBeDefined();
-	expect(gateway.host.admissionFenceReason).toBe("admission_recovery_pending");
+	expect(gateway.host.mutationReadinessReason).toBe("admission_recovery_pending");
 	const fenced = await gateway.client.request("main.submit", {
 		text: "must remain fenced while receipt acceptance is ambiguous",
 		surface_id: "owner",
@@ -631,7 +643,7 @@ externalTest("terminal tail evidence finalizes fast same-process lost-receipt cl
 			"terminal evidence did not finalize the fast same-process admission claim",
 		);
 		await eventually(
-			() => (gateway.host.admissionFenceReason === undefined && gateway.state.read().growthIntent === undefined ? true : undefined),
+			() => (gateway.host.mutationReadinessReason === undefined && gateway.state.read().growthIntent === undefined ? true : undefined),
 			"terminal evidence did not settle the fast receipt-loss admission",
 		);
 		const commands = gateway.fixture.commands().filter(command => command.operation === "turn.prompt" && command.text === request.text);
@@ -655,7 +667,7 @@ externalTest("a definitive broker rejection abandons only its claim while ambigu
 	const rejected = await gateway.client.request("main.submit", rejectedRequest);
 	expect(rpcError(rejected)).toMatchObject({ code: -32603, message: "bridge_exception", data: { reason: "turn_admission_failed" } });
 	await eventually(() => (gateway.state.read().growthIntent === undefined ? true : undefined), "definitive rejection did not clear its growth intent");
-	expect(gateway.host.admissionFenceReason).toBeUndefined();
+	expect(gateway.host.mutationReadinessReason).toBeUndefined();
 	expect(gateway.core.mainAdmissionOperationsPending()).toEqual([]);
 
 	gateway.fixture.holdNextTurn();

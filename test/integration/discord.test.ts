@@ -59,15 +59,13 @@ function outbox(
 
 externalTest("Discord inbound deduplicates a message id before external broker admission and sends finalized output", async () => {
 	const gatewayUnderTest = await gateway();
-	const clock = new DiscordFixtureClock(1_000);
-	const fixture = new DiscordFixture({ now: clock.now });
+	const fixture = new DiscordFixture();
 	await fixture.connect();
 	try {
 		const route = new DiscordRouteHandler({
 			rpc: gatewayUnderTest.client,
 			platform: fixture,
 			route: { channelId: "123456789012345678", surfaceId: "discord:owner-dm" },
-			acknowledgement: { now: clock.now, budgetMs: 2_000 },
 		});
 		const unsubscribe = fixture.onMessage(async message => {
 			await route.handle(message);
@@ -77,7 +75,6 @@ externalTest("Discord inbound deduplicates a message id before external broker a
 		unsubscribe();
 
 		expect(fixture.acknowledgements).toHaveLength(1);
-		expect(fixture.acknowledgements[0]?.at).toBeLessThanOrEqual(clock.now() + 2_000);
 		expect(gatewayUnderTest.fixture.commands()).toEqual([
 			expect.objectContaining({ operation: "turn.prompt", text: "external broker round trip" }),
 		]);
@@ -87,6 +84,55 @@ externalTest("Discord inbound deduplicates a message id before external broker a
 		);
 		expect(await outbox(gatewayUnderTest, fixture).runOnce()).toBe("sent");
 		expect(fixture.sends).toEqual([expect.objectContaining({ channelId: "123456789012345678", text: "ack" })]);
+	} finally {
+		await fixture.disconnect();
+	}
+});
+
+externalTest("Discord typing starts after delayed durable main.submit acceptance", async () => {
+	const gatewayUnderTest = await gateway();
+	const clock = new DiscordFixtureClock(1_000);
+	const fixture = new DiscordFixture({ now: clock.now });
+	const ordering: string[] = [];
+	let durableAcceptedAt: number | undefined;
+	const delayedRpc: JsonRpcClient = {
+		async request(method, params, options) {
+			const request = gatewayUnderTest.client.request(method, params, options);
+			if (method === "main.submit") clock.advance(2_001);
+			const response = await request;
+			if (method === "main.submit") {
+				if (response.error || (response.result as { accepted?: unknown } | undefined)?.accepted !== true) {
+					throw new Error("delayed main.submit did not return durable acceptance");
+				}
+				durableAcceptedAt = clock.now();
+				ordering.push("durably accepted");
+			}
+			return response;
+		},
+		close() {},
+	};
+	await fixture.connect();
+	try {
+		const route = new DiscordRouteHandler({
+			rpc: delayedRpc,
+			platform: fixture,
+			route: { channelId: "123456789012345678", surfaceId: "discord:owner-dm" },
+			acknowledgement: { now: clock.now, budgetMs: 2_000 },
+			onAcknowledged: () => ordering.push("typing acknowledged"),
+		});
+		const inbound = {
+			id: "delayed-admission",
+			channelId: "123456789012345678",
+			text: "acknowledge after delayed admission",
+			acceptedAt: clock.now(),
+		};
+
+		expect(await route.handle(inbound)).toBe(true);
+		const acceptedAt = durableAcceptedAt;
+		if (acceptedAt === undefined) throw new Error("delayed main.submit acceptance was not observed");
+		expect(acceptedAt - inbound.acceptedAt).toBeGreaterThan(2_000);
+		expect(fixture.acknowledgements).toEqual([{ channelId: inbound.channelId, at: acceptedAt }]);
+		expect(ordering).toEqual(["durably accepted", "typing acknowledged"]);
 	} finally {
 		await fixture.disconnect();
 	}
@@ -114,7 +160,7 @@ externalTest("Discord typing follows accepted admission, not a stale healthy-to-
 		const intent = JSON.parse(pending?.intentJson ?? "{}") as { op_ref?: unknown };
 		if (typeof intent.op_ref !== "string") throw new Error("fenced Discord setup did not retain its operation reference");
 		await eventually(
-			() => (gatewayUnderTest.host.admissionFenceReason === "admission_recovery_pending" ? true : undefined),
+			() => (gatewayUnderTest.host.mutationReadinessReason === "admission_recovery_pending" ? true : undefined),
 			"gateway did not enter the admission recovery fence",
 		);
 
@@ -126,7 +172,7 @@ externalTest("Discord typing follows accepted admission, not a stale healthy-to-
 
 		gatewayUnderTest.fixture.complete(intent.op_ref, { text: "recovery fence terminal reply" });
 		await eventually(
-			() => (gatewayUnderTest.host.admissionFenceReason === undefined ? true : undefined),
+			() => (gatewayUnderTest.host.mutationReadinessReason === undefined ? true : undefined),
 			"gateway did not promote after the fenced admission's terminal evidence",
 		);
 		const fresh = { id: "discord-after-promotion", channelId: "123456789012345678", text: "fresh ingress after promotion", acceptedAt: Date.now() };

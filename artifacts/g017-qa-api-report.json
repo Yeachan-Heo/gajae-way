@@ -1,0 +1,406 @@
+{
+  "schemaVersion": 1,
+  "kind": "api-package-test-report",
+  "sourceHash": "sha256:cf147336747fbf32e1e7f48d04fd61c195ffe0840c51d356257cd0022249de72",
+  "snapshotCommit": "3c3ac8d49119193a7e9e05ec90134f57c6d03773",
+  "status": "passed",
+  "e2eStatus": "passed",
+  "redTeamStatus": "passed",
+  "planCodeMismatch": false,
+  "commands": [
+    {
+      "command": "bun test test/unit/main-session.test.ts",
+      "classification": "focused base suite",
+      "passed": 28,
+      "failed": 0,
+      "expectCalls": 83,
+      "verdict": "passed"
+    },
+    {
+      "command": "bun test test/integration/p4.test.ts",
+      "classification": "focused base suite",
+      "passed": 21,
+      "failed": 0,
+      "expectCalls": 115,
+      "verdict": "passed"
+    },
+    {
+      "command": "bun test test/qa/recovery-fail-closed.test.ts",
+      "classification": "focused base suite",
+      "passed": 2,
+      "failed": 0,
+      "expectCalls": 12,
+      "verdict": "passed"
+    },
+    {
+      "command": "bun test test/integration/console.test.ts",
+      "classification": "focused base suite",
+      "passed": 24,
+      "failed": 0,
+      "expectCalls": 111,
+      "verdict": "passed"
+    },
+    {
+      "command": "bun test test/e2e/systemd.test.ts",
+      "classification": "focused base suite",
+      "passed": 4,
+      "failed": 0,
+      "expectCalls": 100,
+      "verdict": "passed"
+    },
+    {
+      "command": "bun scripts/compile.ts",
+      "classification": "build frozen snapshot into current dist executables",
+      "passed": 1,
+      "failed": 0,
+      "observed": "Compiled and codesigned gajaeway and gajaeway-discord for darwin-arm64.",
+      "verdict": "passed"
+    },
+    {
+      "command": "bun test test/e2e/systemd.test.ts",
+      "classification": "post-build compiled executable e2e rerun",
+      "passed": 4,
+      "failed": 0,
+      "expectCalls": 100,
+      "verdict": "passed"
+    },
+    {
+      "command": "bun test test/qa/uds-negative-paths.test.ts",
+      "classification": "additional owner-UDS negative-path suite",
+      "passed": 3,
+      "failed": 0,
+      "expectCalls": 11,
+      "verdict": "passed"
+    },
+    {
+      "command": "bun /tmp/g017-red-team-probes.ts",
+      "classification": "new throwaway adversarial probe suite",
+      "passed": 5,
+      "failed": 0,
+      "verdict": "passed"
+    },
+    {
+      "command": "bun /tmp/g017-console-transcript.ts",
+      "classification": "throwaway copy of test/qa/console-transcript.ts with its artifact destination redirected to /tmp",
+      "passed": 1,
+      "failed": 0,
+      "observed": {
+        "writeCount": 14,
+        "renderedBytes": 14204,
+        "alternateScreenEntered": true,
+        "alternateScreenExited": true,
+        "deliveredAsRendered": true,
+        "assistantReplyRendered": true
+      },
+      "verdict": "passed"
+    },
+    {
+      "command": "LC_ALL=C bun -e 'console.log(\"ultragoal-cli-ok\")'",
+      "classification": "safe CLI replay",
+      "passed": 1,
+      "failed": 0,
+      "recordedStdout": "ultragoal-cli-ok\n",
+      "recordedStderr": "",
+      "verdict": "passed"
+    },
+    {
+      "command": "bun src/main.ts --help",
+      "classification": "real source CLI invocation",
+      "passed": 1,
+      "failed": 0,
+      "observed": "Printed gajaeway serve, bootstrap, console, profile approve, and health usage.",
+      "verdict": "passed"
+    },
+    {
+      "command": "git diff --check fed7d18..3c3ac8d",
+      "classification": "frozen delta whitespace validation",
+      "passed": 1,
+      "failed": 0,
+      "verdict": "passed"
+    }
+  ],
+  "contractCoverage": [
+    {
+      "contractRef": "F1",
+      "obligation": "Adoption proof is durably re-verified; a busy boot keeps an existing proof pending rather than inventing a fresh proof, and tampered evidence fails closed.",
+      "status": "covered",
+      "evidence": [
+        "test/unit/main-session.test.ts",
+        "test/e2e/systemd.test.ts",
+        "tampered-transcript-fingerprint-fails-closed-over-uds",
+        "busy-boot-preserves-proof-and-growth-window"
+      ]
+    },
+    {
+      "contractRef": "F2",
+      "obligation": "A persisted adoption discovery checkpoint prevents retained pre-adoption ring events from being projected later, including retention-gap handling.",
+      "status": "covered",
+      "evidence": [
+        "test/unit/main-session.test.ts: bootstrap ring checkpoint suppresses retained gap-free pre-adoption lifecycle history",
+        "test/unit/main-session.test.ts: adoption-start retention gap records its resync checkpoint"
+      ]
+    },
+    {
+      "contractRef": "F3",
+      "obligation": "Replies finalized while the daemon is down are recovered from durable transcript delivery progress or recorded as a visible durable delivery gap; they are never silently baselined.",
+      "status": "covered",
+      "evidence": [
+        "test/unit/main-session.test.ts: a reply finalized while the daemon is down is recovered from durable transcript delivery progress",
+        "test/unit/main-session.test.ts: unprojectable/unprovable transcript suffix delivery-gap drills",
+        "test/integration/console.test.ts: cockpit renders durable-tail loss notices"
+      ]
+    },
+    {
+      "contractRef": "F4",
+      "obligation": "main.submit durably claims before broker effect; restart reconciliation never resends an accepted owner command, duplicate keys replay, and unknown broker status is rejected without resend.",
+      "status": "covered",
+      "evidence": [
+        "test/qa/recovery-fail-closed.test.ts: daemon killed after broker acceptance recovers claim without re-sending",
+        "test/unit/main-session.test.ts: ambiguous post-acceptance claim and restart recovery",
+        "api-idempotency-replay-and-conflict",
+        "foreign-unknown-broker-status-rejects-without-resend"
+      ]
+    },
+    {
+      "contractRef": "F5",
+      "obligation": "Strict resume preserves an active busy growth window until terminal transcript delivery rather than failing closed because the adopted external turn grew.",
+      "status": "covered",
+      "evidence": [
+        "test/unit/main-session.test.ts: recovered busy growth window remains open across restart",
+        "test/e2e/systemd.test.ts: fenced busy restart promotes only after terminal verification",
+        "busy-boot-preserves-proof-and-growth-window"
+      ]
+    },
+    {
+      "contractRef": "F6",
+      "obligation": "The cockpit renders gate_state unsupported with actionable external-owner GJC TUI guidance.",
+      "status": "covered",
+      "evidence": [
+        "test/integration/console.test.ts: console command loop renders external-host gate limitation and help",
+        "test/integration/console.test.ts: console gateway gate answers report unsupported and durably replay it",
+        "test/integration/p4.test.ts: main.gate.answer reports unsupported"
+      ]
+    },
+    {
+      "contractRef": "F7",
+      "obligation": "Runbooks describe the operator-owned external adoption, strict-resume, delivery-gap, console, and gate-answer world.",
+      "status": "covered",
+      "evidence": [
+        "ops/runbooks/bootstrap-ceremony.md",
+        "ops/runbooks/operations.md",
+        "ops/runbooks/legacy-decommission.md",
+        "ops/runbooks/profile-approve.md"
+      ]
+    },
+    {
+      "contractRef": "F8",
+      "obligation": "The @gajae-code/coding-agent dependency is removed from package metadata, lockfile, runtime source, and tests.",
+      "status": "covered",
+      "evidence": [
+        "Repository search for @gajae-code/coding-agent across package.json, bun.lock, src, test, README.md, scripts, and native returned no matches.",
+        "package.json devDependencies contains no coding-agent package."
+      ]
+    },
+    {
+      "contractRef": "F9",
+      "obligation": "Held-operation source lifecycle overlap is represented once in the owner journal; the fixture emits the overlap that the drill validates.",
+      "status": "covered",
+      "evidence": [
+        "fixture-held-operation-lifecycle-deduplication",
+        "test/unit/main-session.test.ts: host projects overlapping lifecycle tail events into one journal attempt",
+        "test/integration/p4.test.ts: main.events.read projects overlapping external lifecycle pairs as one attempt"
+      ]
+    }
+  ],
+  "surfaceEvidence": [
+    {
+      "surface": "api",
+      "invocations": [
+        "bun /tmp/g017-red-team-probes.ts",
+        "bun test test/integration/p4.test.ts",
+        "bun test test/qa/recovery-fail-closed.test.ts",
+        "bun test test/qa/uds-negative-paths.test.ts"
+      ],
+      "observed": "Real owner UDS calls exercised main.submit, main.events.read, main.gate.answer, way.health, and way.status. The custom process drill observed a tampered transcript as way.health {status: unhealthy, state: failed_closed, reason: main_identity_mismatch} followed by exit 78; duplicate/restart counters stayed at one broker prompt.",
+      "verdict": "passed"
+    },
+    {
+      "surface": "cli",
+      "invocations": [
+        "bun src/main.ts --help",
+        "LC_ALL=C bun -e 'console.log(\"ultragoal-cli-ok\")'",
+        "bun test test/e2e/systemd.test.ts"
+      ],
+      "observed": "Source CLI printed the supported command surface; safe replay exited 0 with exactly ultragoal-cli-ok newline; the systemd suite passed against the compiled executable path.",
+      "verdict": "passed"
+    },
+    {
+      "surface": "tui",
+      "invocations": [
+        "bun /tmp/g017-console-transcript.ts",
+        "bun test test/integration/console.test.ts"
+      ],
+      "observed": "The real console flow used a raw-TTY harness against a real external-host UDS gateway. Capture contains 14,216 UTF-8 bytes, 358 ESC control bytes, alternate-screen enter/exit, Delivered as: prompt, and a finalized Assistant frame.",
+      "verdict": "passed"
+    }
+  ],
+  "adversarialCases": [
+    {
+      "scenario": "Kill daemon after broker acceptance, before durable finalization; restart and replay same key.",
+      "expectedBehavior": "Broker sees exactly one turn.prompt and restarted main.submit returns the durable replay rather than resending.",
+      "invocation": "bun test test/qa/recovery-fail-closed.test.ts",
+      "verdict": "passed"
+    },
+    {
+      "scenario": "Finalize reply during daemon downtime, including tail retention rotation.",
+      "expectedBehavior": "Recovery projects the finalized assistant reply from durable transcript delivery progress, or journals a visible transcript_delivery_gap rather than silently advancing.",
+      "invocation": "bun test test/unit/main-session.test.ts",
+      "verdict": "passed"
+    },
+    {
+      "scenario": "Start/restart against a busy adopted turn with a durable proof and open growth intent.",
+      "expectedBehavior": "way.status remains verifying/proven/pending without inventing a proof; it promotes only after terminal evidence and clears growth intent without fail-closed state.",
+      "invocation": "bun /tmp/g017-red-team-probes.ts; bun test test/e2e/systemd.test.ts",
+      "verdict": "passed"
+    },
+    {
+      "scenario": "Inject a pre-adoption ring event and adoption-start retention gap.",
+      "expectedBehavior": "The checkpoint is journaled as an adoption boundary and old retained lifecycle history is not retroactively projected.",
+      "invocation": "bun test test/unit/main-session.test.ts",
+      "verdict": "passed"
+    },
+    {
+      "scenario": "Tamper a retained adopted transcript fingerprint while the daemon is running.",
+      "expectedBehavior": "Owner UDS health becomes failed_closed/main_identity_mismatch and the process exits 78; no replacement proof is accepted.",
+      "invocation": "bun /tmp/g017-red-team-probes.ts",
+      "verdict": "passed"
+    },
+    {
+      "scenario": "Reuse an idempotency key with the exact request, then with conflicting request content.",
+      "expectedBehavior": "Exact reuse replays its original op_ref with one broker prompt; conflicting reuse returns 1500 idempotency_conflict with no broker send.",
+      "invocation": "bun /tmp/g017-red-team-probes.ts",
+      "verdict": "passed"
+    },
+    {
+      "scenario": "Delete the accepted operation from the fixture before restart reconciliation so broker status is unknown.",
+      "expectedBehavior": "Recovery rejects main_admission_recovery_unprovable, leaves the claim pending, and does not resend the owner command.",
+      "invocation": "bun /tmp/g017-red-team-probes.ts",
+      "verdict": "passed"
+    },
+    {
+      "scenario": "Have the held-operation fixture emit its documented duplicate agent_start plus turn_start lifecycle source frames.",
+      "expectedBehavior": "main.events.read contains exactly one turn_start and one turn_end, proving the drill exercises real fixture overlap rather than an un-emitted state.",
+      "invocation": "bun /tmp/g017-red-team-probes.ts",
+      "verdict": "passed"
+    },
+    {
+      "scenario": "Answer an external-host gate through both RPC and cockpit pathways.",
+      "expectedBehavior": "The API returns accepted:false/gate_state:unsupported, replay is durable, and the cockpit gives actionable attached-GJC-TUI guidance.",
+      "invocation": "bun test test/integration/p4.test.ts; bun test test/integration/console.test.ts",
+      "verdict": "passed"
+    },
+    {
+      "scenario": "Send malformed and negative owner-UDS protocol requests.",
+      "expectedBehavior": "Invalid/unknown request paths are rejected without opening an unsafe alternate behavior path.",
+      "invocation": "bun test test/qa/uds-negative-paths.test.ts",
+      "verdict": "passed"
+    }
+  ],
+  "probes": [
+    {
+      "contract": "F1/F5 busy proof and growth window",
+      "invocation": "bun /tmp/g017-red-team-probes.ts :: busy-boot-preserves-proof-and-growth-window",
+      "expected": "proven/pending while busy, proof unchanged, then healthy/verified after terminal evidence",
+      "observed": "pendingState=verifying, pendingProof=proven, pendingVerification=pending, proofUnchanged=true, finalVerification=verified",
+      "verdict": "passed"
+    },
+    {
+      "contract": "F1 tampered adoption proof",
+      "invocation": "bun /tmp/g017-red-team-probes.ts :: tampered-transcript-fingerprint-fails-closed-over-uds",
+      "expected": "owner UDS fails closed rather than accepting a forged or replacement fingerprint",
+      "observed": "way.health reported unhealthy/failed_closed/main_identity_mismatch; daemon exitCode=78",
+      "verdict": "passed"
+    },
+    {
+      "contract": "F4 idempotency replay/conflict",
+      "invocation": "bun /tmp/g017-red-team-probes.ts :: api-idempotency-replay-and-conflict",
+      "expected": "same key replays; conflicting payload returns 1500; neither resends",
+      "observed": "identical op_ref replayed, conflict=1500 idempotency_conflict, brokerPromptCount=1",
+      "verdict": "passed"
+    },
+    {
+      "contract": "F4 unknown broker operation state",
+      "invocation": "bun /tmp/g017-red-team-probes.ts :: foreign-unknown-broker-status-rejects-without-resend",
+      "expected": "unprovable status rejects and leaves one pending claim without resend",
+      "observed": "recoveryReason=main_admission_recovery_unprovable, pendingClaims=1, brokerPromptCount=1",
+      "verdict": "passed"
+    },
+    {
+      "contract": "F9 fixture/lifecycle dedupe",
+      "invocation": "bun /tmp/g017-red-team-probes.ts :: fixture-held-operation-lifecycle-deduplication",
+      "expected": "fixture overlap results in one owner turn_start/turn_end pair",
+      "observed": "fixtureAgentStartCount=2, fixtureTurnStartCount=1, projectedKinds=[turn_start,assistant_message,turn_end]",
+      "verdict": "passed"
+    },
+    {
+      "contract": "F2/F3/F4/F5 existing restart and delivery drills",
+      "invocation": "bun test test/unit/main-session.test.ts; bun test test/integration/p4.test.ts; bun test test/qa/recovery-fail-closed.test.ts",
+      "expected": "checkpoint, recovery, durable delivery, no-resend, and busy-window suites pass",
+      "observed": "51 test cases passed; 0 failed",
+      "verdict": "passed"
+    },
+    {
+      "contract": "F6 cockpit unsupported gate and loss rendering",
+      "invocation": "bun test test/integration/console.test.ts",
+      "expected": "cockpit remains actionable under unsupported gate and delivery-gap paths",
+      "observed": "24 test cases passed; 0 failed",
+      "verdict": "passed"
+    },
+    {
+      "contract": "Compiled systemd topology and busy startup fence",
+      "invocation": "bun test test/e2e/systemd.test.ts",
+      "expected": "compiled daemon topology preserves a fenced busy verification path",
+      "observed": "4 test cases passed; 0 failed",
+      "verdict": "passed"
+    },
+    {
+      "contract": "Owner-UDS malformed request rejection",
+      "invocation": "bun test test/qa/uds-negative-paths.test.ts",
+      "expected": "negative RPC paths remain fail-closed",
+      "observed": "3 test cases passed; 0 failed",
+      "verdict": "passed"
+    },
+    {
+      "contract": "Console terminal control capture",
+      "invocation": "bun /tmp/g017-console-transcript.ts",
+      "expected": "raw terminal capture contains ANSI lifecycle and accepted/finalized owner interaction",
+      "observed": "14 raw writes, 358 ESC bytes, alternate screen enter/exit, delivery and assistant frames",
+      "verdict": "passed"
+    },
+    {
+      "contract": "Safe CLI replay",
+      "invocation": "LC_ALL=C bun -e 'console.log(\"ultragoal-cli-ok\")'",
+      "expected": "exit 0 with safe deterministic output",
+      "observed": "stdout=ultragoal-cli-ok newline; stderr empty",
+      "verdict": "passed"
+    }
+  ],
+  "artifactRefs": [
+    {
+      "path": "artifacts/g017-qa-api-report.json",
+      "kind": "api-package-test-report",
+      "verified": true
+    },
+    {
+      "path": "artifacts/g017-cli-replay.json",
+      "kind": "cli-replay",
+      "verified": true
+    },
+    {
+      "path": "artifacts/g017-console-pty-capture.txt",
+      "kind": "raw-console-pty-capture",
+      "verified": true
+    }
+  ],
+  "blockers": []
+}

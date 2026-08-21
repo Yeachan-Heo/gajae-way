@@ -14,7 +14,7 @@ import { loadWayCore, type WayCoreHandle } from "../../src/native-loader";
 import { loadWayProfile } from "../../src/profile";
 import { createRpcBridge, RpcBridgeException } from "../../src/rpc-bridge";
 import { RpcClient } from "../../src/rpc-client";
-import { FakeBrokerFixture } from "../helpers/main-session";
+import { durableTestJournal, FakeBrokerFixture } from "../helpers/main-session";
 
 function temporaryDirectory(name: string): string {
 	return fs.mkdtempSync(path.join(os.tmpdir(), `gajae-way-qa-${name}-`));
@@ -152,7 +152,7 @@ test("main.submit validates its UDS contract and durable idempotency through an 
 			supervisor,
 			identity: resumed.identity,
 			state,
-			journal: core,
+			journal: durableTestJournal(state, { journalAppend: core.journalAppend.bind(core) }),
 			initialTurnState: resumed.turnState,
 			initialFollowUpQueueDepth: resumed.followUpQueueDepth,
 			initialVerificationState: resumed.verificationState,

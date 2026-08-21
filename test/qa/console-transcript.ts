@@ -21,7 +21,7 @@ import { loadWayCore } from "../../src/native-loader";
 import { loadWayProfile } from "../../src/profile";
 import { createRpcBridge, RpcBridgeException, type RpcBridgeHandler } from "../../src/rpc-bridge";
 import { RpcClient } from "../../src/rpc-client";
-import { FakeBrokerFixture } from "../helpers/main-session";
+import { durableTestJournal, FakeBrokerFixture } from "../helpers/main-session";
 
 const repositoryRoot = path.resolve(import.meta.dir, "../..");
 
@@ -145,7 +145,7 @@ async function main(): Promise<void> {
 		supervisor,
 		identity: resumed.identity,
 		state,
-		journal: core,
+		journal: durableTestJournal(state, { journalAppend: core.journalAppend.bind(core) }),
 		initialTurnState: resumed.turnState,
 		initialFollowUpQueueDepth: resumed.followUpQueueDepth,
 		initialVerificationState: resumed.verificationState,

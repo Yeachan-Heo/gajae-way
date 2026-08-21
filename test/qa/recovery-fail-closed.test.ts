@@ -1,6 +1,9 @@
+import { createHash } from "node:crypto";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { afterEach, expect, test } from "bun:test";
+import { GatewayStateStore } from "../../src/main-session/state";
+import { loadWayCore, type WayCoreHandle } from "../../src/native-loader";
 import { RpcClient } from "../../src/rpc-client";
 import { ManagedProcessRegistry } from "../helpers/managed-process";
 import { FakeBrokerFixture } from "../helpers/main-session";
@@ -43,8 +46,8 @@ async function connectEventually(socketPath: string): Promise<RpcClient> {
 	throw new Error(`RPC socket did not become available: ${socketPath}`);
 }
 
-async function waitForHealth(client: RpcClient, expected: "running" | "failed_closed"): Promise<Record<string, unknown>> {
-	for (let attempt = 0; attempt < 100; attempt += 1) {
+async function waitForHealth(client: RpcClient, expected: "running" | "degraded" | "failed_closed"): Promise<Record<string, unknown>> {
+	for (let attempt = 0; attempt < 500; attempt += 1) {
 		const response = await client.request("way.health", {});
 		if ((response.result as { state?: unknown } | undefined)?.state === expected) return response.result as Record<string, unknown>;
 		await Bun.sleep(10);
@@ -76,6 +79,48 @@ async function stopDaemon(daemon: RunningDaemon | undefined): Promise<void> {
 	if (!daemon) return;
 	daemon.client.close();
 	await managedProcesses.stopDaemon(daemon.child);
+}
+
+async function run(command: readonly string[], cwd = process.cwd()): Promise<string> {
+	const child = Bun.spawn({ cmd: [...command], cwd, stdout: "pipe", stderr: "pipe" });
+	const [exitCode, stdout, stderr] = await Promise.all([child.exited, new Response(child.stdout).text(), new Response(child.stderr).text()]);
+	if (exitCode !== 0) throw new Error(`${command.join(" ")} failed (${exitCode}): ${stderr || stdout}`);
+	return stdout;
+}
+
+function bootstrap(stateDirectory: string, profilePath: string, environment: NodeJS.ProcessEnv): void {
+	const result = Bun.spawnSync({
+		cmd: ["bun", "src/main.ts", "bootstrap", "--confirm", "--state-dir", stateDirectory, "--profile", profilePath],
+		cwd: process.cwd(),
+		env: environment,
+		stdout: "pipe",
+		stderr: "pipe",
+	});
+	if (result.exitCode !== 0) throw new Error(`bootstrap failed (${result.exitCode}): ${new TextDecoder().decode(result.stderr)}`);
+}
+
+function stagePendingMainAdmission(core: WayCoreHandle, key: string, mode: "valid" | "invalid" = "valid"): { readonly opRef: string } {
+	const requestJson = JSON.stringify({ idempotency_key: key, surface_id: "owner", text: `recover ${key}` });
+	const opRef = `recovery-${key}`;
+	const intentJson =
+		mode === "invalid"
+			? "not-json"
+			: JSON.stringify({
+					version: 1,
+					state: "claimed",
+					op_ref: opRef,
+					delivered_as: "prompt",
+					request_hash: createHash("sha256").update(requestJson).digest("hex"),
+				});
+	expect(
+		core.mainAdmissionOperationClaim({
+			scope: "main.submit",
+			key,
+			requestJson,
+			intentJson,
+		}),
+	).toMatchObject({ claimed: true });
+	return { opRef };
 }
 
 test("missing exact adopted broker identity fails closed over UDS, lingers unhealthy, exits 78, and never rebirths", async () => {
@@ -185,3 +230,130 @@ test("a daemon killed after main broker acceptance recovers the pre-effect claim
 		fixture.dispose();
 	}
 }, 20_000);
+
+test("a transcript projection failure degrades the host and fences corpus closure before any claim, commit, or push", async () => {
+	const fixture = new FakeBrokerFixture();
+	const corpus = path.join(fixture.root, "corpus");
+	const remote = path.join(fixture.root, "remote.git");
+	const stateDirectory = path.join(fixture.root, "state");
+	const profilePath = path.join(fixture.root, "profile.toml");
+	const environment = {
+		...fixture.environment(),
+		NODE_ENV: "test",
+		GAJAEWAY_BROKER_CLI: fixture.executable,
+		GAJAEWAY_RECONCILE_POLL_MS: "600000",
+		GAJAEWAY_E2E_FAIL_TRANSCRIPT_PROJECTION: "1",
+	};
+	let daemon: RunningDaemon | undefined;
+	try {
+		await run(["git", "init", "--bare", remote]);
+		await run(["git", "init", corpus]);
+		await run(["git", "-C", corpus, "config", "user.name", "Recovery Fence Drill"]);
+		await run(["git", "-C", corpus, "config", "user.email", "recovery-fence@example.test"]);
+		fs.writeFileSync(path.join(corpus, "base.txt"), "base\n");
+		await run(["git", "-C", corpus, "add", "--", "base.txt"]);
+		await run(["git", "-C", corpus, "commit", "-m", "base"]);
+		await run(["git", "-C", corpus, "branch", "-M", "main"]);
+		await run(["git", "-C", corpus, "remote", "add", "origin", remote]);
+		await run(["git", "-C", corpus, "push", "-u", "origin", "main"]);
+		await run(["git", `--git-dir=${remote}`, "symbolic-ref", "HEAD", "refs/heads/main"]);
+		fs.writeFileSync(profilePath, profileContents(corpus, fixture.workspace, fixture.sessionId));
+		bootstrap(stateDirectory, profilePath, environment);
+		const observer = loadWayCore().WayCore.open(stateDirectory);
+		const state = new GatewayStateStore(observer);
+		const deliveryBefore = state.read().transcriptDeliveryProgress;
+		daemon = await startDaemon(stateDirectory, profilePath, environment);
+		expect(await waitForHealth(daemon.client, "running")).toMatchObject({ state: "running" });
+
+		fixture.holdNextTurn();
+		const admission = await daemon.client.request("main.submit", {
+			text: "force an atomic transcript projection failure",
+			surface_id: "owner",
+			idempotency_key: "projection-failure-fence",
+		});
+		expect(admission.result).toMatchObject({ accepted: true, delivered_as: "prompt" });
+		const opRef = (admission.result as { op_ref: string }).op_ref;
+		fixture.complete(opRef, { text: "this reply must not advance delivery" });
+		expect(await waitForHealth(daemon.client, "degraded")).toMatchObject({
+			status: "unhealthy",
+			state: "degraded",
+			reason: "transcript_delivery_progress_write_failed",
+		});
+		const deliveryAfterFailure = state.read().transcriptDeliveryProgress;
+		expect(deliveryAfterFailure?.fingerprint.entryCount).toBe((deliveryBefore?.fingerprint.entryCount ?? 0) + 1);
+		expect(deliveryAfterFailure?.lastEntryId).toBe(`${fixture.sessionId}:transcript:2`);
+		expect(deliveryAfterFailure?.lastEntryId).not.toBe(`${fixture.sessionId}:transcript:3`);
+		expect(fixture.commands().filter(command => command.operation === "turn.prompt" && command.text === "force an atomic transcript projection failure")).toHaveLength(1);
+		expect(fixture.admissionAttempts().filter(attempt => attempt.text === "force an atomic transcript projection failure")).toHaveLength(1);
+
+		fs.writeFileSync(path.join(corpus, "must-not-close.txt"), "must remain uncommitted\n");
+		const localHead = await run(["git", "-C", corpus, "rev-parse", "HEAD"]);
+		const remoteHead = await run(["git", `--git-dir=${remote}`, "rev-parse", "main"]);
+		const refused = await daemon.client.request("main.corpus.close", {
+			paths: ["must-not-close.txt"],
+			commit_message: "must never execute after host degradation",
+			idempotency_key: "degraded-host-close",
+		});
+		expect(refused.error).toMatchObject({ code: 1003, message: "transcript_delivery_progress_write_failed" });
+		expect(observer.gatewayMetaRead(["gitlock_closure_operation"]).entries[0]?.value).toBeUndefined();
+		expect(await run(["git", "-C", corpus, "rev-parse", "HEAD"])).toBe(localHead);
+		expect(await run(["git", `--git-dir=${remote}`, "rev-parse", "main"])).toBe(remoteHead);
+		expect(await run(["git", "-C", corpus, "status", "--porcelain"])).toBe("?? must-not-close.txt\n");
+	} finally {
+		await stopDaemon(daemon);
+		fixture.dispose();
+	}
+}, 30_000);
+
+async function assertPendingAdmissionRecoveryFailsClosed(
+	reason: "main_admission_recovery_unavailable" | "main_admission_recovery_unprovable" | "main_admission_intent_invalid",
+	mode: "valid" | "invalid",
+	configureFixture: (fixture: FakeBrokerFixture, opRef: string) => void = () => undefined,
+): Promise<void> {
+	const fixture = new FakeBrokerFixture();
+	const corpus = path.join(fixture.root, "corpus");
+	const stateDirectory = path.join(fixture.root, "state");
+	const profilePath = path.join(fixture.root, "profile.toml");
+	const environment = {
+		...fixture.environment(),
+		NODE_ENV: "test",
+		GAJAEWAY_BROKER_CLI: fixture.executable,
+		GAJAEWAY_RECONCILE_POLL_MS: "600000",
+	};
+	let daemon: RunningDaemon | undefined;
+	try {
+		fs.mkdirSync(corpus, { recursive: true });
+		fs.writeFileSync(profilePath, profileContents(corpus, fixture.workspace, fixture.sessionId));
+		bootstrap(stateDirectory, profilePath, environment);
+		const core = loadWayCore().WayCore.open(stateDirectory);
+		const state = new GatewayStateStore(core);
+		const deliveryBefore = state.read().transcriptDeliveryProgress;
+		const { opRef } = stagePendingMainAdmission(core, `pending-${reason}`, mode);
+		configureFixture(fixture, opRef);
+		daemon = await startDaemon(stateDirectory, profilePath, environment, 2_000);
+		expect(await waitForHealth(daemon.client, "failed_closed")).toMatchObject({
+			status: "unhealthy",
+			state: "failed_closed",
+			reason,
+		});
+		expect(state.read()).toMatchObject({ bootstrapState: "FAILED_CLOSED", failedClosedReason: reason });
+		expect(state.read().transcriptDeliveryProgress).toEqual(deliveryBefore);
+		expect(fixture.commands()).toEqual([]);
+		expect(fixture.admissionAttempts()).toEqual([]);
+	} finally {
+		await stopDaemon(daemon);
+		fixture.dispose();
+	}
+}
+
+test("pending main admission status transport failure fails closed without a broker resend", async () => {
+	await assertPendingAdmissionRecoveryFailsClosed("main_admission_recovery_unavailable", "valid", fixture => fixture.setOperationStatusUnavailable());
+}, 15_000);
+
+test("pending main admission with an unprovable broker status fails closed without a broker resend", async () => {
+	await assertPendingAdmissionRecoveryFailsClosed("main_admission_recovery_unprovable", "valid");
+}, 15_000);
+
+test("invalid pending main admission intent fails closed before any broker resend", async () => {
+	await assertPendingAdmissionRecoveryFailsClosed("main_admission_intent_invalid", "invalid");
+}, 15_000);

@@ -1,12 +1,8 @@
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import type {
-	GatewayMetaBackend,
-	GatewayMetaReadOutput,
-	GatewayMetaTransactionInput,
-	GatewayMetaTransactionOutput,
-} from "../../src/main-session/state";
+import { GatewayStateStore, type GatewayMetaBackend, type GatewayMetaReadOutput, type GatewayMetaTransactionInput, type GatewayMetaTransactionOutput } from "../../src/main-session/state";
+import type { MainSessionJournal } from "../../src/main-session/host";
 
 const defaults: Record<string, string> = {
 	bootstrap_state: "ABSENT",
@@ -32,11 +28,20 @@ export class MemoryGatewayMeta implements GatewayMetaBackend {
 	readonly values = new Map(Object.entries(defaults));
 	readonly events: Array<{ kind: string; payloadJson: string }> = [];
 
+	#nextTransactionFailure: Error | undefined;
+
+	failNextGatewayMetaTransaction(error = new Error("scripted gateway metadata transaction failure")): void {
+		this.#nextTransactionFailure = error;
+	}
+
 	gatewayMetaRead(keys: readonly string[]): GatewayMetaReadOutput {
 		return { entries: keys.map(key => ({ key, value: this.values.get(key) })) };
 	}
 
 	gatewayMetaTransaction(input: GatewayMetaTransactionInput): GatewayMetaTransactionOutput {
+		const failure = this.#nextTransactionFailure;
+		this.#nextTransactionFailure = undefined;
+		if (failure) throw failure;
 		for (const expected of input.expected) {
 			if (this.values.get(expected.key) !== expected.value) return { applied: false };
 		}
@@ -48,6 +53,31 @@ export class MemoryGatewayMeta implements GatewayMetaBackend {
 		}
 		return { applied: true };
 	}
+}
+
+export interface DurableTestJournalOptions {
+	readonly journalAppend?: (kind: string, payloadJson: string) => unknown;
+	readonly onTranscriptProjection?: (kind: string, payloadJson: string) => void;
+	readonly setRpcHealth?: (state: "degraded" | "running", reason: string) => void;
+	readonly setMainSessionStatus?: (turnState: "idle" | "busy", followUpQueueDepth: number, verificationState: "pending" | "verified") => void;
+	readonly setJournalDegraded?: (degraded: boolean) => void;
+}
+
+/**
+ * Test-only durable journal adapter. The transcript projection is committed through
+ * the same metadata transaction used by production before an observer sees it.
+ */
+export function durableTestJournal(state: GatewayStateStore, options: DurableTestJournalOptions = {}): MainSessionJournal {
+	return {
+		journalAppend: options.journalAppend ?? (() => undefined),
+		journalAppendTranscriptProjection: (kind, payloadJson, expectedTail, checkpoint, expectedDelivery, nextDelivery) => {
+			state.appendTranscriptProjection(expectedTail, checkpoint, expectedDelivery, nextDelivery, kind, payloadJson);
+			options.onTranscriptProjection?.(kind, payloadJson);
+		},
+		...(options.setRpcHealth === undefined ? {} : { setRpcHealth: options.setRpcHealth }),
+		...(options.setMainSessionStatus === undefined ? {} : { setMainSessionStatus: options.setMainSessionStatus }),
+		...(options.setJournalDegraded === undefined ? {} : { setJournalDegraded: options.setJournalDegraded }),
+	};
 }
 
 interface FixtureOperation {
@@ -102,7 +132,9 @@ interface FixtureSession {
 	rotateRingDuringNextCompletion?: boolean;
 	clearRetentionGapAfterTail?: boolean;
 	unavailableQueries?: string[];
+	operationStatusUnavailable?: boolean;
 	commandLog: Array<Record<string, unknown>>;
+	admissionAttemptLog: Array<Record<string, unknown>>;
 }
 
 interface FixtureState {
@@ -174,6 +206,7 @@ export class FakeBrokerFixture {
 			responseText: options.responseText,
 			tailTimeoutWhileBusy: options.noEnvelopeWhileBusy,
 			commandLog: [],
+			admissionAttemptLog: [],
 		};
 		this.write({ indexSeq: 1, sessions: { [this.sessionId]: session } });
 	}
@@ -271,6 +304,18 @@ export class FakeBrokerFixture {
 	suppressNextAdmissionReceiptAfterTerminalTail(): void {
 		this.update(session => {
 			session.suppressNextReceiptAfterTerminalTail = true;
+		});
+	}
+
+	setOperationStatusUnavailable(unavailable = true): void {
+		this.update(session => {
+			session.operationStatusUnavailable = unavailable;
+		});
+	}
+
+	forgetOperation(opRef: string): void {
+		this.update(session => {
+			delete session.operations[opRef];
 		});
 	}
 
@@ -384,6 +429,10 @@ export class FakeBrokerFixture {
 
 	commands(): readonly Record<string, unknown>[] {
 		return this.read().sessions[this.sessionId]?.commandLog ?? [];
+	}
+
+	admissionAttempts(): readonly Record<string, unknown>[] {
+		return this.read().sessions[this.sessionId]?.admissionAttemptLog ?? [];
 	}
 
 	dispose(): void {

@@ -54,9 +54,13 @@ non-fast-forward checks are incident backstops, not a concurrency plan.
    tail promotes it to `running`. The adapter is `BindsTo=` the daemon and stops
    when it stops. It polls `way.health` first and does not connect to Discord or
    register inbound handlers until health is `status: "healthy", state: "running"`.
-   Every inbound typing acknowledgement is then sent only after `main.submit`
-   returns durable acceptance; a later fence or failed-closed transition leaves
-   the message unacknowledged rather than consuming it without delivery.
+   Every inbound typing acknowledgement is sent only after the adapter observes
+   `main.submit` return durable acceptance. `ack_budget_ms` bounds the typing
+   request from that observed response, not from the inbound Discord dispatch:
+   `main.submit` exposes no earlier accepted-claim response. A slow successful
+   broker admission can therefore produce typing more than two seconds after
+   Discord delivery; a fence, failed-closed transition, or rejected submit
+   leaves the message unacknowledged rather than consuming it without delivery.
 
 ## Monitor the live UDS service
 
@@ -199,10 +203,12 @@ sudo -u gajaeway -H env \
 
 `gajaeway-discord --check` succeeds only after Discord `GET /users/@me` and the
 running daemon's `way.health` succeed. Send one unique test DM to the configured
-owner route, observe its typing acknowledgement within two seconds, then one
-reply. Restart the adapter after the reply and verify no ordinary repost occurs;
-a crash between send and settlement can produce at most the documented,
-nonce-deduplicated retry. Never start a second adapter for the same route.
+owner route. After the gateway accepts it, observe typing within `ack_budget_ms`
+(two seconds by default); a slow broker admission can make typing arrive later
+than two seconds after Discord delivery. Then observe one reply. Restart the
+adapter after the reply and verify no ordinary repost occurs; a crash between
+send and settlement can produce at most the documented, nonce-deduplicated retry.
+Never start a second adapter for the same route.
 ## Known limitation: journal latency on continuously busy sessions
 
 The credential-free broker CLI returns tail envelopes only when a terminal turn

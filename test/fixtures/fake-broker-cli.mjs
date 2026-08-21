@@ -292,6 +292,8 @@ if (!statePath) {
 		if (!value) return;
 		if (value.row.live !== true || value.row.deleted === true) return fail("session_unavailable", "fixture session is not live");
 		if (!text || !text.trim() || !opRef || !opRef.trim()) return fail("invalid_input", "text and operation ref are required");
+		value.admissionAttemptLog ??= [];
+		value.admissionAttemptLog.push({ operation, text, opRef });
 		const rejection = value.rejectNext;
 		if (rejection) {
 			delete value.rejectNext;
@@ -370,9 +372,13 @@ if (!statePath) {
 		const value = session(args[3]);
 		const opRef = args[4];
 		if (value) {
-			const operation = value.operations?.[opRef];
-			const status = operation?.failure && operation.completed ? "failed" : operation?.completed ? "terminal_ok" : operation ? "in_flight" : "unknown";
-			success({ version: 1, operationRef: opRef, status: { status }, summary: { completed: status === "failed" || status === "terminal_ok" } });
+			if (value.operationStatusUnavailable === true) {
+				fail("unavailable", "fixture operation status is unavailable");
+			} else {
+				const operation = value.operations?.[opRef];
+				const status = operation?.failure && operation.completed ? "failed" : operation?.completed ? "terminal_ok" : operation ? "in_flight" : "unknown";
+				success({ version: 1, operationRef: opRef, status: { status }, summary: { completed: status === "failed" || status === "terminal_ok" } });
+			}
 		}
 	} else if (args[0] === "sdk" && args[1] === "session" && args[2] === "tail") {
 		const value = session(args[3]);

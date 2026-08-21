@@ -2,13 +2,14 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import { afterEach, expect, test } from "bun:test";
 import { BrokerCli, BrokerDtoParseError, parseSessionCheckpoint } from "../../src/broker/cli";
+import { createMainAdmissionHandler, MainAdmissionRecoveryError } from "../../src/main-session/admission";
 import { BootstrapError, bootstrapMainSession } from "../../src/main-session/bootstrap";
 import { createMainSessionHost } from "../../src/main-session/host";
 import { ResumeError, strictResumeMainSession } from "../../src/main-session/resume";
-import { compareTailCheckpoints, GatewayStateStore } from "../../src/main-session/state";
+import { compareTailCheckpoints, GatewayStateError, GatewayStateStore } from "../../src/main-session/state";
 import { createExternalHostSupervisor, type HostSupervisor, type SupervisorTailEvents } from "../../src/main-session/supervisor";
 import { loadWayProfile } from "../../src/profile";
-import { FakeBrokerFixture, MemoryGatewayMeta } from "../helpers/main-session";
+import { durableTestJournal, FakeBrokerFixture, MemoryGatewayMeta } from "../helpers/main-session";
 
 const fixtures: FakeBrokerFixture[] = [];
 
@@ -63,6 +64,13 @@ async function eventually(predicate: () => boolean, message: string, timeoutMs =
 	throw new Error(message);
 }
 
+function recordingDurableJournal(state: GatewayStateStore, events: Array<{ kind: string; payloadJson: string }>) {
+	return durableTestJournal(state, {
+		journalAppend: (kind, payloadJson) => events.push({ kind, payloadJson }),
+		onTranscriptProjection: (kind, payloadJson) => events.push({ kind, payloadJson }),
+	});
+}
+
 
 async function bootstrapFixture(fixture: FakeBrokerFixture) {
 	const meta = new MemoryGatewayMeta();
@@ -112,6 +120,27 @@ test("tail checkpoint ordering is lexicographic by generation then sequence, ind
 	expect(compareTailCheckpoints({ revision: 999, generation: 2, seq: 0 }, { revision: 0, generation: 1, seq: 999 })).toBeGreaterThan(0);
 	expect(compareTailCheckpoints({ revision: 1, generation: 2, seq: 4 }, { revision: 999, generation: 2, seq: 5 })).toBeLessThan(0);
 	expect(compareTailCheckpoints({ revision: 1, generation: 2, seq: 5 }, { revision: 999, generation: 2, seq: 5 })).toBe(0);
+});
+
+test("missing transcript_proof metadata is corrupt durable state, not an inferred legacy proof", () => {
+	const meta = new MemoryGatewayMeta();
+	const state = new GatewayStateStore(meta);
+	meta.values.delete("transcript_proof");
+	expect(() => state.read()).toThrow(GatewayStateError);
+	try {
+		state.read();
+		throw new Error("missing transcript_proof unexpectedly read as a legacy proof");
+	} catch (error) {
+		expect(error).toMatchObject({ reason: "metadata_missing" } satisfies Partial<GatewayStateError>);
+	}
+	meta.values.set("transcript_proof", "null");
+	expect(() => state.read()).toThrow(GatewayStateError);
+	try {
+		state.read();
+		throw new Error("null transcript_proof unexpectedly read as a legacy proof");
+	} catch (error) {
+		expect(error).toMatchObject({ reason: "metadata_invalid" } satisfies Partial<GatewayStateError>);
+	}
 });
 
 test.serial("bootstrap commits a pending proof when the bounded tail has no envelope", async () => {
@@ -176,14 +205,21 @@ test.serial("a later complete verification tail promotes a pending proof", async
 	try {
 		const resumed = await strictResumeMainSession({ profile, state, supervisor: resumedSupervisor });
 		expect(resumed.identity.transcript).toBeDefined();
-		expect(state.read()).toMatchObject({ transcriptProof: "proven", transcriptDeliveryProgress: { fingerprint: { entryCount: 2 } } });
+		expect(state.read()).toMatchObject({ transcriptProof: "proven", transcriptDeliveryGapCount: 1, transcriptDeliveryProgress: { fingerprint: { entryCount: 2 } } });
+		expect(meta.events).toContainEqual(
+			expect.objectContaining({
+				kind: "transcript_delivery_gap",
+				payloadJson: expect.stringContaining('"adoption":"pending_proof_promotion"'),
+			}),
+		);
 	} finally {
 		await resumedSupervisor.dispose();
 	}
 });
 
 
-test.serial("strict resume persists a complete pending transcript proof and delivery baseline before readiness", async () => {
+
+test.serial("strict resume records a visible delivery gap when pending-proof promotion covers a post-commit reply", async () => {
 	const fixture = new FakeBrokerFixture();
 	fixtures.push(fixture);
 	const { meta, state, profile, committed } = await bootstrapFixture(fixture);
@@ -193,15 +229,24 @@ test.serial("strict resume persists a complete pending transcript proof and deli
 	meta.values.set("transcript_delivery_progress", "null");
 	meta.values.set("transcript_proof", "pending");
 	meta.values.set("tail_checkpoint", "null");
+	fixture.appendTranscript({ type: "message", role: "assistant", content: "reply finalized after pending adoption" });
 	const resumedSupervisor = supervisor(fixture);
 	try {
 		const resumed = await strictResumeMainSession({ profile, state, supervisor: resumedSupervisor });
 		expect(resumed.identity.transcript).toBeDefined();
 		expect(state.read()).toMatchObject({
-			mainIdentity: { transcript: { entryCount: 2 } },
-			transcriptDeliveryProgress: { lastEntryId: `${fixture.sessionId}:transcript:1`, fingerprint: { entryCount: 2 } },
-			tailCheckpoint: { revision: 2, generation: 1, seq: 0 },
+			mainIdentity: { transcript: { entryCount: 3 } },
+			transcriptDeliveryGapCount: 1,
+			transcriptDeliveryProgress: { lastEntryId: `${fixture.sessionId}:transcript:2`, fingerprint: { entryCount: 3 } },
+			tailCheckpoint: { revision: 3, generation: 1, seq: 0 },
 		});
+		const gap = meta.events.find(event => event.kind === "transcript_delivery_gap");
+		expect(JSON.parse(gap?.payloadJson ?? "{}")).toMatchObject({
+			reason: "transcript_delivery_progress_missing",
+			adoption: "pending_proof_promotion",
+			available_through_entry_id: `${fixture.sessionId}:transcript:2`,
+		});
+		expect(meta.events.some(event => event.kind === "assistant_message")).toBe(false);
 	} finally {
 		await resumedSupervisor.dispose();
 	}
@@ -290,7 +335,7 @@ test.serial("external identity disappearance is durable failed-closed host state
 		supervisor: resumedSupervisor,
 		identity: resumed.identity,
 		state,
-		journal: { journalAppend: () => undefined },
+		journal: durableTestJournal(state),
 		initialTurnState: resumed.turnState,
 		initialFollowUpQueueDepth: resumed.followUpQueueDepth,
 	});
@@ -355,7 +400,7 @@ test.serial("a terminal tail snapshot that predates admission cannot settle the 
 		supervisor: controlledSupervisor,
 		identity: committed.identity,
 		state,
-		journal: { journalAppend: () => undefined },
+		journal: durableTestJournal(state),
 	});
 	try {
 		await eventually(() => tailCalls === 1, "host did not start its first tail poll");
@@ -439,7 +484,7 @@ test.serial("host projects overlapping agent and turn lifecycle tail events into
 		supervisor: resumedSupervisor,
 		identity: resumed.identity,
 		state,
-		journal: { journalAppend: (kind, payloadJson) => journal.push({ kind, payloadJson }) },
+		journal: recordingDurableJournal(state, journal),
 		initialTurnState: resumed.turnState,
 		initialFollowUpQueueDepth: resumed.followUpQueueDepth,
 	});
@@ -481,7 +526,7 @@ test.serial("host journals finalized assistant messages from stable transcript e
 		supervisor: resumedSupervisor,
 		identity: resumed.identity,
 		state,
-		journal: { journalAppend: (kind, payloadJson) => journal.push({ kind, payloadJson }) },
+		journal: recordingDurableJournal(state, journal),
 		initialTurnState: resumed.turnState,
 		initialFollowUpQueueDepth: resumed.followUpQueueDepth,
 	});
@@ -519,7 +564,7 @@ test.serial("host survives transient broker tail failures with bounded retry and
 		supervisor: resumedSupervisor,
 		identity: resumed.identity,
 		state,
-		journal: { journalAppend: (kind, payloadJson) => journal.push({ kind, payloadJson }) },
+		journal: recordingDurableJournal(state, journal),
 		initialTurnState: resumed.turnState,
 		initialFollowUpQueueDepth: resumed.followUpQueueDepth,
 	});
@@ -555,10 +600,11 @@ test.serial("host fails closed when broker tail failures exhaust the bounded ret
 		supervisor: resumedSupervisor,
 		identity: resumed.identity,
 		state,
-		journal: {
+		journal: durableTestJournal(state, {
 			journalAppend: (kind, payloadJson) => journal.push({ kind, payloadJson }),
+			onTranscriptProjection: (kind, payloadJson) => journal.push({ kind, payloadJson }),
 			setRpcHealth: (healthState, reason) => healthReports.push({ state: healthState, reason }),
-		},
+		}),
 		initialTurnState: resumed.turnState,
 		initialFollowUpQueueDepth: resumed.followUpQueueDepth,
 	});
@@ -588,7 +634,7 @@ test.serial("bootstrap ring checkpoint suppresses retained gap-free pre-adoption
 		supervisor: resumedSupervisor,
 		identity: resumed.identity,
 		state,
-		journal: { journalAppend: (kind, payloadJson) => journal.push({ kind, payloadJson }) },
+		journal: recordingDurableJournal(state, journal),
 		initialTurnState: resumed.turnState,
 		initialFollowUpQueueDepth: resumed.followUpQueueDepth,
 	});
@@ -619,7 +665,7 @@ test.serial("adoption-start retention gap records its resync checkpoint and proj
 		supervisor: resumedSupervisor,
 		identity: resumed.identity,
 		state,
-		journal: { journalAppend: (kind, payloadJson) => journal.push({ kind, payloadJson }) },
+		journal: recordingDurableJournal(state, journal),
 		initialTurnState: resumed.turnState,
 		initialFollowUpQueueDepth: resumed.followUpQueueDepth,
 	});
@@ -654,7 +700,7 @@ test.serial("an established busy-turn ring rotation journals its resync and cont
 		supervisor: resumedSupervisor,
 		identity: resumed.identity,
 		state,
-		journal: { journalAppend: (kind, payloadJson) => journal.push({ kind, payloadJson }) },
+		journal: recordingDurableJournal(state, journal),
 		initialTurnState: resumed.turnState,
 		initialFollowUpQueueDepth: resumed.followUpQueueDepth,
 	});
@@ -696,11 +742,11 @@ test.serial("a failed journal append leaves the tail checkpoint behind so the sc
 		supervisor: firstSupervisor,
 		identity: first.identity,
 		state,
-		journal: {
+		journal: durableTestJournal(state, {
 			journalAppend: () => {
 				throw new Error("scripted journal interruption");
 			},
-		},
+		}),
 		initialTurnState: first.turnState,
 		initialFollowUpQueueDepth: first.followUpQueueDepth,
 	});
@@ -720,7 +766,7 @@ test.serial("a failed journal append leaves the tail checkpoint behind so the sc
 		supervisor: replaySupervisor,
 		identity: replayed.identity,
 		state,
-		journal: { journalAppend: (kind, payloadJson) => journal.push({ kind, payloadJson }) },
+		journal: recordingDurableJournal(state, journal),
 		initialTurnState: replayed.turnState,
 		initialFollowUpQueueDepth: replayed.followUpQueueDepth,
 	});
@@ -745,7 +791,7 @@ test.serial("a reply finalized while the daemon is down is recovered from durabl
 		supervisor: firstSupervisor,
 		identity: first.identity,
 		state,
-		journal: { journalAppend: () => undefined },
+		journal: durableTestJournal(state),
 		initialTurnState: first.turnState,
 		initialFollowUpQueueDepth: first.followUpQueueDepth,
 		initialVerificationState: first.verificationState,
@@ -768,7 +814,7 @@ test.serial("a reply finalized while the daemon is down is recovered from durabl
 		supervisor: restartedSupervisor,
 		identity: restarted.identity,
 		state,
-		journal: { journalAppend: (kind, payloadJson) => journal.push({ kind, payloadJson }) },
+		journal: recordingDurableJournal(state, journal),
 		initialTurnState: restarted.turnState,
 		initialFollowUpQueueDepth: restarted.followUpQueueDepth,
 		initialVerificationState: restarted.verificationState,
@@ -889,7 +935,7 @@ test.serial("an unprovable transcript suffix journals a durable delivery gap ins
 		supervisor: controlled,
 		identity: committed.identity,
 		state,
-		journal: { journalAppend: (kind, payloadJson) => journal.push({ kind, payloadJson }) },
+		journal: recordingDurableJournal(state, journal),
 	});
 	try {
 		await eventually(
@@ -915,7 +961,7 @@ test.serial("a rotating external transcript window emits delivery-gap before fai
 		supervisor: resumedSupervisor,
 		identity: resumed.identity,
 		state,
-		journal: { journalAppend: (kind, payloadJson) => journal.push({ kind, payloadJson }) },
+		journal: recordingDurableJournal(state, journal),
 		initialTurnState: resumed.turnState,
 		initialFollowUpQueueDepth: resumed.followUpQueueDepth,
 	});
@@ -942,7 +988,7 @@ test.serial("a recovered busy growth window remains open across restart until te
 		supervisor: firstSupervisor,
 		identity: first.identity,
 		state,
-		journal: { journalAppend: () => undefined },
+		journal: durableTestJournal(state),
 		initialTurnState: first.turnState,
 		initialFollowUpQueueDepth: first.followUpQueueDepth,
 		initialVerificationState: first.verificationState,
@@ -964,10 +1010,11 @@ test.serial("a recovered busy growth window remains open across restart until te
 		supervisor: restartedSupervisor,
 		identity: restarted.identity,
 		state,
-		journal: {
+		journal: durableTestJournal(state, {
 			journalAppend: (kind, payloadJson) => journal.push({ kind, payloadJson }),
-			setRpcHealth: (state, reason) => readinessReports.push({ state, reason }),
-		},
+			onTranscriptProjection: (kind, payloadJson) => journal.push({ kind, payloadJson }),
+			setRpcHealth: (healthState, reason) => readinessReports.push({ state: healthState, reason }),
+		}),
 		initialTurnState: restarted.turnState,
 		initialFollowUpQueueDepth: restarted.followUpQueueDepth,
 		initialVerificationState: restarted.verificationState,
@@ -976,7 +1023,7 @@ test.serial("a recovered busy growth window remains open across restart until te
 	try {
 		expect(restarted.recoveredGrowthIntent).toBe(true);
 		expect(restarted.verificationState).toBe("pending");
-		expect(restartedHost.admissionFenceReason).toBe("transcript_verification_pending");
+		expect(restartedHost.mutationReadinessReason).toBe("transcript_verification_pending");
 		await expect(restartedHost.admit("steer", "must stay fenced", "busy-restart-fenced")).rejects.toMatchObject({ reason: "transcript_verification_pending" });
 		expect(restarted.turnState).toBe("busy");
 		expect(state.read().growthIntent).toBeDefined();
@@ -985,11 +1032,234 @@ test.serial("a recovered busy growth window remains open across restart until te
 			() => journal.some(event => event.kind === "assistant_message" && event.payloadJson.includes("busy turn settled after restart")),
 			"recovered busy turn did not deliver its terminal transcript",
 		);
-		await eventually(() => restartedHost.admissionFenceReason === undefined, "restarted host did not promote its complete-tail verification");
+		await eventually(() => restartedHost.mutationReadinessReason === undefined, "restarted host did not promote its complete-tail verification");
 		expect(readinessReports).toContainEqual({ state: "running", reason: "transcript_verified" });
 		await eventually(() => state.read().growthIntent === undefined, "growth intent was not cleared after terminal delivery");
 		expect(state.read().bootstrapState).toBe("COMMITTED");
 	} finally {
 		await restartedHost.dispose();
+	}
+});
+
+test.serial("pending-proof persistence failure leaves delivery unadvanced, emits degraded health, and fails closed", async () => {
+	const fixture = new FakeBrokerFixture();
+	fixtures.push(fixture);
+	const meta = new MemoryGatewayMeta();
+	const state = new GatewayStateStore(meta);
+	const profile = fixtureProfile(fixture);
+	fixture.timeoutNextTails(2);
+	const adoption = supervisor(fixture);
+	try {
+		await bootstrapMainSession({ confirm: true, profile, state, supervisor: adoption, sessionId: fixture.sessionId });
+	} finally {
+		await adoption.dispose();
+	}
+	const resumedSupervisor = supervisor(fixture);
+	const resumed = await strictResumeMainSession({ profile, state, supervisor: resumedSupervisor });
+	const healthReports: Array<{ state: string; reason: string }> = [];
+	meta.failNextGatewayMetaTransaction();
+	const host = createMainSessionHost({
+		supervisor: resumedSupervisor,
+		identity: resumed.identity,
+		state,
+		journal: durableTestJournal(state, { setRpcHealth: (healthState, reason) => healthReports.push({ state: healthState, reason }) }),
+		initialTurnState: resumed.turnState,
+		initialFollowUpQueueDepth: resumed.followUpQueueDepth,
+		initialVerificationState: resumed.verificationState,
+	});
+	try {
+		await eventually(() => host.mutationReadinessReason === "transcript_proof_persist_failed", "pending-proof persistence failure did not fence mutations");
+		expect(state.read()).toMatchObject({
+			bootstrapState: "FAILED_CLOSED",
+			failedClosedReason: "transcript_proof_persist_failed",
+			transcriptProof: "pending",
+			transcriptDeliveryProgress: undefined,
+		});
+		expect(meta.events.some(event => event.kind === "transcript_delivery_gap")).toBe(false);
+		expect(healthReports).toContainEqual({ state: "degraded", reason: "transcript_proof_persist_failed" });
+		expect(fixture.commands()).toEqual([]);
+		expect(fixture.admissionAttempts()).toEqual([]);
+	} finally {
+		await host.dispose();
+	}
+});
+
+test.serial("a retention gap without a resync checkpoint fails closed without advancing delivery", async () => {
+	const fixture = new FakeBrokerFixture();
+	fixtures.push(fixture);
+	const { state, committed } = await bootstrapFixture(fixture);
+	const checkpoint = state.read().tailCheckpoint!;
+	const deliveryBefore = state.read().transcriptDeliveryProgress;
+	let sends = 0;
+	const controlled: HostSupervisor = {
+		async discover() {
+			return { identity: committed.identity, transcriptEntries: [], initialRingCheckpoint: checkpoint, transcriptProof: "proven", turnState: "idle" as const, followUpQueueDepth: 0 };
+		},
+		async verify() {
+			return { identity: committed.identity, transcriptEntries: [], initialRingCheckpoint: checkpoint, transcriptProof: "proven", turnState: "idle" as const, followUpQueueDepth: 0 };
+		},
+		async sendPrompt() {
+			sends += 1;
+			throw new Error("not used");
+		},
+		async sendSteer() {
+			sends += 1;
+			throw new Error("not used");
+		},
+		async followUp() {
+			sends += 1;
+			throw new Error("not used");
+		},
+		async operationStatus(opRef) {
+			return { operationRef: opRef, status: "unknown", completed: false, detail: {} };
+		},
+		async tailEvents() {
+			return {
+				identity: committed.identity,
+				transcriptEntries: [],
+				events: [],
+				terminal: true,
+				complete: true,
+				retentionGap: true,
+				checkpoint,
+			};
+		},
+		async turnState() {
+			return { turnState: "idle" as const, followUpQueueDepth: 0 };
+		},
+		async dispose() {},
+	};
+	const healthReports: Array<{ state: string; reason: string }> = [];
+	const host = createMainSessionHost({
+		supervisor: controlled,
+		identity: committed.identity,
+		state,
+		journal: durableTestJournal(state, { setRpcHealth: (healthState, reason) => healthReports.push({ state: healthState, reason }) }),
+	});
+	try {
+		await eventually(() => host.mutationReadinessReason === "tail_resync_unavailable", "missing ring resync did not fence mutations");
+		expect(state.read()).toMatchObject({ bootstrapState: "FAILED_CLOSED", failedClosedReason: "tail_resync_unavailable" });
+		expect(state.read().transcriptDeliveryProgress).toEqual(deliveryBefore);
+		expect(healthReports).toContainEqual({ state: "degraded", reason: "tail_resync_unavailable" });
+		expect(sends).toBe(0);
+	} finally {
+		await host.dispose();
+	}
+});
+
+test.serial("a ring-rotation metadata write failure fences mutations without advancing the ring or delivery", async () => {
+	const fixture = new FakeBrokerFixture();
+	fixtures.push(fixture);
+	const { meta, state, committed } = await bootstrapFixture(fixture);
+	const checkpoint = state.read().tailCheckpoint!;
+	const resyncCheckpoint = { revision: checkpoint.revision + 1, generation: checkpoint.generation, seq: checkpoint.seq + 1 };
+	const deliveryBefore = state.read().transcriptDeliveryProgress;
+	let sends = 0;
+	const controlled: HostSupervisor = {
+		async discover() {
+			return { identity: committed.identity, transcriptEntries: [], initialRingCheckpoint: checkpoint, transcriptProof: "proven", turnState: "idle" as const, followUpQueueDepth: 0 };
+		},
+		async verify() {
+			return { identity: committed.identity, transcriptEntries: [], initialRingCheckpoint: checkpoint, transcriptProof: "proven", turnState: "idle" as const, followUpQueueDepth: 0 };
+		},
+		async sendPrompt() {
+			sends += 1;
+			throw new Error("not used");
+		},
+		async sendSteer() {
+			sends += 1;
+			throw new Error("not used");
+		},
+		async followUp() {
+			sends += 1;
+			throw new Error("not used");
+		},
+		async operationStatus(opRef) {
+			return { operationRef: opRef, status: "unknown", completed: false, detail: {} };
+		},
+		async tailEvents() {
+			return {
+				identity: committed.identity,
+				transcriptEntries: [],
+				events: [],
+				terminal: true,
+				complete: true,
+				retentionGap: true,
+				checkpoint: resyncCheckpoint,
+				resyncCheckpoint,
+			};
+		},
+		async turnState() {
+			return { turnState: "idle" as const, followUpQueueDepth: 0 };
+		},
+		async dispose() {},
+	};
+	const healthReports: Array<{ state: string; reason: string }> = [];
+	meta.failNextGatewayMetaTransaction();
+	const host = createMainSessionHost({
+		supervisor: controlled,
+		identity: committed.identity,
+		state,
+		journal: durableTestJournal(state, { setRpcHealth: (healthState, reason) => healthReports.push({ state: healthState, reason }) }),
+	});
+	try {
+		await eventually(() => host.mutationReadinessReason === "tail_ring_rotation_write_failed", "ring-rotation write failure did not fence mutations");
+		expect(state.read()).toMatchObject({ bootstrapState: "COMMITTED", tailCheckpoint: checkpoint, tailRingRotationCount: 0 });
+		expect(state.read().transcriptDeliveryProgress).toEqual(deliveryBefore);
+		expect(meta.events.some(event => event.kind === "tail_ring_rotation")).toBe(false);
+		expect(healthReports).toContainEqual({ state: "degraded", reason: "tail_ring_rotation_write_failed" });
+		expect(sends).toBe(0);
+	} finally {
+		await host.dispose();
+	}
+});
+
+test.serial("a failed definitive-rejection claim abandonment degrades and fences the host without a resend", async () => {
+	const fixture = new FakeBrokerFixture();
+	fixtures.push(fixture);
+	const { state, profile } = await bootstrapFixture(fixture);
+	const resumedSupervisor = supervisor(fixture);
+	const resumed = await strictResumeMainSession({ profile, state, supervisor: resumedSupervisor });
+	const deliveryBefore = state.read().transcriptDeliveryProgress;
+	const healthReports: Array<{ state: string; reason: string }> = [];
+	const host = createMainSessionHost({
+		supervisor: resumedSupervisor,
+		identity: resumed.identity,
+		state,
+		journal: durableTestJournal(state, { setRpcHealth: (healthState, reason) => healthReports.push({ state: healthState, reason }) }),
+		initialTurnState: resumed.turnState,
+		initialFollowUpQueueDepth: resumed.followUpQueueDepth,
+		initialVerificationState: resumed.verificationState,
+	});
+	let pending = false;
+	const idempotency = {
+		mainAdmissionOperationClaim() {
+			pending = true;
+			return { claimed: true };
+		},
+		mainAdmissionOperationFinalize(input: { readonly responseJson: string }) {
+			return { responseJson: input.responseJson };
+		},
+		mainAdmissionOperationAbandon() {
+			throw new Error("scripted durable claim abandonment failure");
+		},
+		mainAdmissionOperationsPending() {
+			return pending ? [{ scope: "main.submit", key: "claim-abandon-failure", requestJson: "{}", intentJson: "{}" }] : [];
+		},
+	};
+	const submit = createMainAdmissionHandler(host, profile, idempotency);
+	try {
+		fixture.rejectNextTurn();
+		await expect(
+			submit({ text: "definitively reject then fail durable abandonment", surface_id: "owner", idempotency_key: "claim-abandon-failure" }),
+		).rejects.toMatchObject({ reason: "main_admission_claim_abandon_failed" } satisfies Partial<MainAdmissionRecoveryError>);
+		expect(host.mutationReadinessReason).toBe("main_admission_claim_abandon_failed");
+		expect(healthReports).toContainEqual({ state: "degraded", reason: "main_admission_claim_abandon_failed" });
+		expect(state.read().transcriptDeliveryProgress).toEqual(deliveryBefore);
+		expect(idempotency.mainAdmissionOperationsPending()).toHaveLength(1);
+		expect(fixture.admissionAttempts().filter(attempt => attempt.text === "definitively reject then fail durable abandonment")).toHaveLength(1);
+		expect(fixture.commands()).toEqual([]);
+	} finally {
+		await host.dispose();
 	}
 });
