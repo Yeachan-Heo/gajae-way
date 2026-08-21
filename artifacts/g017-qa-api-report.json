@@ -1,8 +1,9 @@
 {
   "schemaVersion": 1,
   "kind": "api-package-test-report",
-  "sourceHash": "sha256:cf147336747fbf32e1e7f48d04fd61c195ffe0840c51d356257cd0022249de72",
-  "snapshotCommit": "3c3ac8d49119193a7e9e05ec90134f57c6d03773",
+  "sourceHash": "sha256:5377dc936885a58b4e708cbde30f698b8818578cd7f41d62f901e7451508988d",
+  "snapshotCommit": "8cdac2ad5642c2cb0372c2554d50d0f95ddab071",
+  "priorSnapshotCommit": "3c3ac8d49119193a7e9e05ec90134f57c6d03773",
   "status": "passed",
   "e2eStatus": "passed",
   "redTeamStatus": "passed",
@@ -10,78 +11,90 @@
   "commands": [
     {
       "command": "bun test test/unit/main-session.test.ts",
-      "classification": "focused base suite",
-      "passed": 28,
-      "failed": 0,
-      "expectCalls": 83,
-      "verdict": "passed"
-    },
-    {
-      "command": "bun test test/integration/p4.test.ts",
-      "classification": "focused base suite",
-      "passed": 21,
-      "failed": 0,
-      "expectCalls": 115,
-      "verdict": "passed"
-    },
-    {
-      "command": "bun test test/qa/recovery-fail-closed.test.ts",
-      "classification": "focused base suite",
-      "passed": 2,
-      "failed": 0,
-      "expectCalls": 12,
-      "verdict": "passed"
-    },
-    {
-      "command": "bun test test/integration/console.test.ts",
-      "classification": "focused base suite",
-      "passed": 24,
+      "classification": "focused state, proof, atomic projection, and injected-failure suite",
+      "passed": 33,
       "failed": 0,
       "expectCalls": 111,
       "verdict": "passed"
     },
     {
-      "command": "bun test test/e2e/systemd.test.ts",
-      "classification": "focused base suite",
-      "passed": 4,
+      "command": "bun test test/integration/p4.test.ts",
+      "classification": "owner-UDS external-broker integration suite",
+      "passed": 21,
       "failed": 0,
-      "expectCalls": 100,
+      "expectCalls": 115,
+      "observed": "Intentional bridge-error logs covered post-acceptance interruption, receipt loss, and definitive broker rejection paths.",
       "verdict": "passed"
     },
     {
-      "command": "bun scripts/compile.ts",
-      "classification": "build frozen snapshot into current dist executables",
-      "passed": 1,
+      "command": "bun test test/qa/recovery-fail-closed.test.ts",
+      "classification": "real daemon/UDS recovery and mutation-fence suite",
+      "passed": 6,
       "failed": 0,
-      "observed": "Compiled and codesigned gajaeway and gajaeway-discord for darwin-arm64.",
+      "expectCalls": 43,
       "verdict": "passed"
     },
     {
-      "command": "bun test test/e2e/systemd.test.ts",
-      "classification": "post-build compiled executable e2e rerun",
-      "passed": 4,
+      "command": "bun test test/integration/discord.test.ts",
+      "classification": "Discord durable-admission and acknowledgement integration suite",
+      "passed": 8,
       "failed": 0,
-      "expectCalls": 100,
+      "expectCalls": 41,
+      "observed": "Expected fixture broker-rejection bridge-error log occurred in its negative path.",
       "verdict": "passed"
     },
     {
       "command": "bun test test/qa/uds-negative-paths.test.ts",
-      "classification": "additional owner-UDS negative-path suite",
+      "classification": "owner-UDS malformed and negative-path suite",
       "passed": 3,
       "failed": 0,
       "expectCalls": 11,
       "verdict": "passed"
     },
     {
-      "command": "bun /tmp/g017-red-team-probes.ts",
-      "classification": "new throwaway adversarial probe suite",
-      "passed": 5,
+      "command": "bun test test/integration/console.test.ts",
+      "classification": "cockpit terminal integration suite",
+      "passed": 24,
       "failed": 0,
+      "expectCalls": 111,
+      "observed": "Expected shutdown/request-cancel internal-error logs occurred during teardown.",
       "verdict": "passed"
     },
     {
-      "command": "bun /tmp/g017-console-transcript.ts",
-      "classification": "throwaway copy of test/qa/console-transcript.ts with its artifact destination redirected to /tmp",
+      "command": "bun scripts/compile.ts",
+      "classification": "build frozen snapshot into current darwin-arm64 executables",
+      "passed": 1,
+      "failed": 0,
+      "observed": "Compiled and codesigned dist/gajaeway and dist/gajaeway-discord for darwin-arm64.",
+      "verdict": "passed"
+    },
+    {
+      "command": "bun test test/e2e/compiled-closure.test.ts",
+      "classification": "post-build compiled corpus-closure and deferred-proof suite",
+      "passed": 4,
+      "failed": 0,
+      "expectCalls": 25,
+      "verdict": "passed"
+    },
+    {
+      "command": "bun test test/e2e/systemd.test.ts",
+      "classification": "post-build compiled executable systemd-topology suite",
+      "passed": 4,
+      "failed": 0,
+      "expectCalls": 100,
+      "verdict": "passed"
+    },
+    {
+      "command": "bun /tmp/g018-red-team-probes.ts",
+      "classification": "throwaway adversarial owner-UDS, SQLite-tamper, host-construction, broker, and Discord probe suite",
+      "passed": 7,
+      "failed": 0,
+      "observed": "The probe report is /tmp/g018-adversarial-probe-results.json; expected bridge-error logs represented deliberately rejected/ambiguous admissions.",
+      "verdict": "passed"
+    },
+    {
+      "command": "bun /tmp/g018-console-transcript.ts",
+      "classification": "throwaway redirected copy of the raw-TTY console transcript harness",
       "passed": 1,
       "failed": 0,
       "observed": {
@@ -90,17 +103,9 @@
         "alternateScreenEntered": true,
         "alternateScreenExited": true,
         "deliveredAsRendered": true,
-        "assistantReplyRendered": true
+        "assistantReplyRendered": true,
+        "consumerCursorAfter": "1:4"
       },
-      "verdict": "passed"
-    },
-    {
-      "command": "LC_ALL=C bun -e 'console.log(\"ultragoal-cli-ok\")'",
-      "classification": "safe CLI replay",
-      "passed": 1,
-      "failed": 0,
-      "recordedStdout": "ultragoal-cli-ok\n",
-      "recordedStderr": "",
       "verdict": "passed"
     },
     {
@@ -108,107 +113,113 @@
       "classification": "real source CLI invocation",
       "passed": 1,
       "failed": 0,
-      "observed": "Printed gajaeway serve, bootstrap, console, profile approve, and health usage.",
+      "observed": "Printed serve, bootstrap, console, profile approve, health, and version usage.",
       "verdict": "passed"
     },
     {
-      "command": "git diff --check fed7d18..3c3ac8d",
-      "classification": "frozen delta whitespace validation",
+      "command": "./dist/gajaeway --help",
+      "classification": "real compiled CLI invocation",
       "passed": 1,
       "failed": 0,
+      "observed": "Printed the same supported command surface as the source CLI.",
+      "verdict": "passed"
+    },
+    {
+      "command": "LC_ALL=C bun -e 'console.log(\"g018-cli-ok\")'",
+      "classification": "safe deterministic CLI replay",
+      "passed": 1,
+      "failed": 0,
+      "recordedStdout": "g018-cli-ok\n",
+      "recordedStderr": "",
+      "verdict": "passed"
+    },
+    {
+      "command": "git diff --check 3c3ac8d..8cdac2ad && git diff --check",
+      "classification": "frozen delta and generated-artifact whitespace validation",
+      "passed": 1,
+      "failed": 0,
+      "verdict": "passed"
+    },
+    {
+      "command": "git grep -n '@gajae-code/coding-agent' 8cdac2ad -- package.json bun.lock src test scripts README.md || true",
+      "classification": "retained removed-dependency guard",
+      "passed": 1,
+      "failed": 0,
+      "observed": "No matches.",
       "verdict": "passed"
     }
   ],
   "contractCoverage": [
     {
-      "contractRef": "F1",
-      "obligation": "Adoption proof is durably re-verified; a busy boot keeps an existing proof pending rather than inventing a fresh proof, and tampered evidence fails closed.",
+      "contractRef": "B1",
+      "obligation": "A pending-proof promotion must atomically durably bind its proof and journal a visible transcript_delivery_gap for any unprojected post-commit transcript suffix; finalized replies may be projected only when delivery is provable, never silently baselined.",
       "status": "covered",
       "evidence": [
-        "test/unit/main-session.test.ts",
-        "test/e2e/systemd.test.ts",
-        "tampered-transcript-fingerprint-fails-closed-over-uds",
-        "busy-boot-preserves-proof-and-growth-window"
+        "bun /tmp/g018-red-team-probes.ts :: pending-proof-promotion-visible-gap-over-owner-uds observed transcriptProof=proven, gapCount=1, and one owner-UDS transcript_delivery_gap with adoption=pending_proof_promotion.",
+        "test/integration/p4.test.ts :: pending busy adoption records a visible delivery gap when its first complete tail includes a post-commit reply.",
+        "test/unit/main-session.test.ts :: strict resume records a visible delivery gap when pending-proof promotion covers a post-commit reply."
       ]
     },
     {
-      "contractRef": "F2",
-      "obligation": "A persisted adoption discovery checkpoint prevents retained pre-adoption ring events from being projected later, including retention-gap handling.",
+      "contractRef": "B2",
+      "obligation": "mutationReadinessReason is the one host fence for main.submit and main.corpus.close: a projection/journal failure must prevent a second broker admission and prevent closure claim, commit, and push.",
       "status": "covered",
       "evidence": [
-        "test/unit/main-session.test.ts: bootstrap ring checkpoint suppresses retained gap-free pre-adoption lifecycle history",
-        "test/unit/main-session.test.ts: adoption-start retention gap records its resync checkpoint"
+        "bun /tmp/g018-red-team-probes.ts :: forced transcript projection failure produced way.health degraded/transcript_delivery_progress_write_failed; both main.submit and main.corpus.close returned 1003 with that reason, the second broker attempt was absent, gitlock_closure_operation was absent, and local/remote Git heads were unchanged.",
+        "test/qa/recovery-fail-closed.test.ts :: a transcript projection failure degrades the host and fences corpus closure before any claim, commit, or push.",
+        "test/e2e/compiled-closure.test.ts :: pending and verifying transcript states fence compiled closure before effects."
       ]
     },
     {
-      "contractRef": "F3",
-      "obligation": "Replies finalized while the daemon is down are recovered from durable transcript delivery progress or recorded as a visible durable delivery gap; they are never silently baselined.",
+      "contractRef": "C1",
+      "obligation": "Current-schema missing or null durable transcript_proof is corrupt state at read time. It must not be silently derived from main_identity; only the designated schema migration may handle historic state.",
       "status": "covered",
       "evidence": [
-        "test/unit/main-session.test.ts: a reply finalized while the daemon is down is recovered from durable transcript delivery progress",
-        "test/unit/main-session.test.ts: unprojectable/unprovable transcript suffix delivery-gap drills",
-        "test/integration/console.test.ts: cockpit renders durable-tail loss notices"
+        "bun /tmp/g018-red-team-probes.ts :: raw SQLite UPDATE transcript_proof='null' yielded owner-UDS way.health unhealthy/failed_closed/metadata_invalid and exit 78.",
+        "bun /tmp/g018-red-team-probes.ts :: raw SQLite DELETE left zero transcript_proof rows and yielded owner-UDS way.health unhealthy/failed_closed/metadata_invalid and exit 78.",
+        "test/unit/main-session.test.ts :: missing transcript_proof metadata is corrupt durable state, not an inferred legacy proof."
       ]
     },
     {
-      "contractRef": "F4",
-      "obligation": "main.submit durably claims before broker effect; restart reconciliation never resends an accepted owner command, duplicate keys replay, and unknown broker status is rejected without resend.",
+      "contractRef": "C2",
+      "obligation": "journalAppendTranscriptProjection is mandatory for transcript delivery; no journal-plus-progress split-write fallback may be constructed or used.",
       "status": "covered",
       "evidence": [
-        "test/qa/recovery-fail-closed.test.ts: daemon killed after broker acceptance recovers claim without re-sending",
-        "test/unit/main-session.test.ts: ambiguous post-acceptance claim and restart recovery",
-        "api-idempotency-replay-and-conflict",
-        "foreign-unknown-broker-status-rejects-without-resend"
+        "bun /tmp/g018-red-team-probes.ts :: host construction with only journalAppend failed transcript_projection_journal_unavailable before any broker command or admission attempt.",
+        "bun /tmp/g018-red-team-probes.ts :: injected atomic projection failure left delivery at transcript:2 rather than silently advancing the assistant at transcript:3.",
+        "test/unit/main-session.test.ts and test/qa/recovery-fail-closed.test.ts exercise state.appendTranscriptProjection and projection-write failure fencing."
       ]
     },
     {
-      "contractRef": "F5",
-      "obligation": "Strict resume preserves an active busy growth window until terminal transcript delivery rather than failing closed because the adopted external turn grew.",
+      "contractRef": "C3",
+      "obligation": "classifyAdmissionDisposition is the central distinction for both settlement and durable claim handling: definitive rejection abandons its claim; non-definitive failure retains it and never resends until reconciliation/terminal evidence.",
       "status": "covered",
       "evidence": [
-        "test/unit/main-session.test.ts: recovered busy growth window remains open across restart",
-        "test/e2e/systemd.test.ts: fenced busy restart promotes only after terminal verification",
-        "busy-boot-preserves-proof-and-growth-window"
+        "bun /tmp/g018-red-team-probes.ts :: definitive fixture rejection left zero pending claims and permitted one later retry; ambiguous receipt loss retained one claim, exact replay returned 1003 admission_recovery_pending, broker attempts/commands stayed one, and terminal evidence settled the claim.",
+        "test/integration/p4.test.ts :: definitive broker rejection abandons only its claim while ambiguous accepted claims reconcile without resend.",
+        "test/unit/main-session.test.ts :: failed definitive-rejection claim abandonment degrades and fences the host without a resend."
       ]
     },
     {
-      "contractRef": "F6",
-      "obligation": "The cockpit renders gate_state unsupported with actionable external-owner GJC TUI guidance.",
+      "contractRef": "C4",
+      "obligation": "Discord acknowledgement timing begins only once the adapter observes a successful durable main.submit acceptance. A delayed successful admission gets typing; a failed admission gets no typing.",
       "status": "covered",
       "evidence": [
-        "test/integration/console.test.ts: console command loop renders external-host gate limitation and help",
-        "test/integration/console.test.ts: console gateway gate answers report unsupported and durably replay it",
-        "test/integration/p4.test.ts: main.gate.answer reports unsupported"
+        "bun /tmp/g018-red-team-probes.ts :: virtual inbound time 1000 and observed accepted response 3501 still yielded one typing acknowledgement at 3501; the following rejected admission added none and left no host fence or pending claim.",
+        "test/integration/discord.test.ts :: Discord typing starts after delayed durable main.submit acceptance and does not follow a stale healthy-to-fenced connection."
       ]
     },
     {
-      "contractRef": "F7",
-      "obligation": "Runbooks describe the operator-owned external adoption, strict-resume, delivery-gap, console, and gate-answer world.",
+      "contractRef": "C5",
+      "obligation": "Injected recovery failures must retain the expected safety signal: no resend or silent delivery/ring progress, plus the documented mutation fence, degraded state, or FAILED_CLOSED state.",
       "status": "covered",
       "evidence": [
-        "ops/runbooks/bootstrap-ceremony.md",
-        "ops/runbooks/operations.md",
-        "ops/runbooks/legacy-decommission.md",
-        "ops/runbooks/profile-approve.md"
-      ]
-    },
-    {
-      "contractRef": "F8",
-      "obligation": "The @gajae-code/coding-agent dependency is removed from package metadata, lockfile, runtime source, and tests.",
-      "status": "covered",
-      "evidence": [
-        "Repository search for @gajae-code/coding-agent across package.json, bun.lock, src, test, README.md, scripts, and native returned no matches.",
-        "package.json devDependencies contains no coding-agent package."
-      ]
-    },
-    {
-      "contractRef": "F9",
-      "obligation": "Held-operation source lifecycle overlap is represented once in the owner journal; the fixture emits the overlap that the drill validates.",
-      "status": "covered",
-      "evidence": [
-        "fixture-held-operation-lifecycle-deduplication",
-        "test/unit/main-session.test.ts: host projects overlapping lifecycle tail events into one journal attempt",
-        "test/integration/p4.test.ts: main.events.read projects overlapping external lifecycle pairs as one attempt"
+        "test/unit/main-session.test.ts :: transcript_proof_persist_failed fails closed with no delivery advance, broker command, or admission attempt.",
+        "test/unit/main-session.test.ts :: tail_resync_unavailable fails closed with delivery unchanged and sends=0.",
+        "test/unit/main-session.test.ts :: tail_ring_rotation_write_failed fences with ring and delivery metadata unadvanced and sends=0.",
+        "test/qa/recovery-fail-closed.test.ts and the custom real-daemon probe :: transcript_delivery_progress_write_failed exposes degraded health, retains the pre-assistant delivery point, and fences submit/closure before broker or Git effects.",
+        "test/qa/recovery-fail-closed.test.ts :: main_admission_recovery_unavailable, main_admission_recovery_unprovable, and main_admission_intent_invalid each fail closed without a broker resend.",
+        "test/unit/main-session.test.ts :: main_admission_claim_abandon_failed degrades/fences the host while retaining the unresolved durable claim and without a resend."
       ]
     }
   ],
@@ -216,172 +227,192 @@
     {
       "surface": "api",
       "invocations": [
-        "bun /tmp/g017-red-team-probes.ts",
+        "bun /tmp/g018-red-team-probes.ts",
         "bun test test/integration/p4.test.ts",
         "bun test test/qa/recovery-fail-closed.test.ts",
         "bun test test/qa/uds-negative-paths.test.ts"
       ],
-      "observed": "Real owner UDS calls exercised main.submit, main.events.read, main.gate.answer, way.health, and way.status. The custom process drill observed a tampered transcript as way.health {status: unhealthy, state: failed_closed, reason: main_identity_mismatch} followed by exit 78; duplicate/restart counters stayed at one broker prompt.",
+      "observed": "Real owner UDS calls covered way.health, way.status, main.events.read, main.submit, and main.corpus.close. The process drill observed degraded transcript-delivery failure fencing both mutation methods, no closure claim/commit/push, and both raw-SQLite null and deleted transcript_proof corruptions as failed_closed with exit 78.",
       "verdict": "passed"
     },
     {
       "surface": "cli",
       "invocations": [
         "bun src/main.ts --help",
-        "LC_ALL=C bun -e 'console.log(\"ultragoal-cli-ok\")'",
+        "./dist/gajaeway --help",
+        "LC_ALL=C bun -e 'console.log(\"g018-cli-ok\")'",
+        "bun scripts/compile.ts",
+        "bun test test/e2e/compiled-closure.test.ts",
         "bun test test/e2e/systemd.test.ts"
       ],
-      "observed": "Source CLI printed the supported command surface; safe replay exited 0 with exactly ultragoal-cli-ok newline; the systemd suite passed against the compiled executable path.",
+      "observed": "Source and compiled commands printed the same supported CLI surface; the safe replay produced exactly g018-cli-ok newline with empty stderr; compiled closure and systemd suites passed after the build.",
       "verdict": "passed"
     },
     {
       "surface": "tui",
       "invocations": [
-        "bun /tmp/g017-console-transcript.ts",
+        "bun /tmp/g018-console-transcript.ts",
         "bun test test/integration/console.test.ts"
       ],
-      "observed": "The real console flow used a raw-TTY harness against a real external-host UDS gateway. Capture contains 14,216 UTF-8 bytes, 358 ESC control bytes, alternate-screen enter/exit, Delivered as: prompt, and a finalized Assistant frame.",
+      "observed": "A redirected raw-TTY harness drove the live external-host Unix-socket gateway. The stored capture has 14,216 UTF-8 bytes and 358 ESC bytes, including alternate-screen enter/exit, Delivered as: prompt, and an Assistant frame.",
       "verdict": "passed"
     }
   ],
   "adversarialCases": [
     {
-      "scenario": "Kill daemon after broker acceptance, before durable finalization; restart and replay same key.",
-      "expectedBehavior": "Broker sees exactly one turn.prompt and restarted main.submit returns the durable replay rather than resending.",
-      "invocation": "bun test test/qa/recovery-fail-closed.test.ts",
+      "scenario": "Finalize an operator-owned busy turn after bootstrap commits a pending proof.",
+      "expectedBehavior": "The first complete tail atomically proves the transcript and records a visible pending_proof_promotion transcript_delivery_gap instead of silently consuming the reply.",
+      "invocation": "bun /tmp/g018-red-team-probes.ts",
+      "observed": "proof=proven, gapCount=1, one owner-UDS gap with the proof-binding checkpoint, no assistant_message baseline event.",
       "verdict": "passed"
     },
     {
-      "scenario": "Finalize reply during daemon downtime, including tail retention rotation.",
-      "expectedBehavior": "Recovery projects the finalized assistant reply from durable transcript delivery progress, or journals a visible transcript_delivery_gap rather than silently advancing.",
-      "invocation": "bun test test/unit/main-session.test.ts",
+      "scenario": "Force journalAppendTranscriptProjection to fail after an accepted owner turn and then invoke both guarded mutations.",
+      "expectedBehavior": "The host degrades; assistant delivery is not advanced; main.submit cannot reach the broker and main.corpus.close cannot claim, commit, or push.",
+      "invocation": "bun /tmp/g018-red-team-probes.ts; bun test test/qa/recovery-fail-closed.test.ts",
+      "observed": "Both calls returned 1003 transcript_delivery_progress_write_failed; no second broker attempt; no closure operation; Git heads unchanged.",
       "verdict": "passed"
     },
     {
-      "scenario": "Start/restart against a busy adopted turn with a durable proof and open growth intent.",
-      "expectedBehavior": "way.status remains verifying/proven/pending without inventing a proof; it promotes only after terminal evidence and clears growth intent without fail-closed state.",
-      "invocation": "bun /tmp/g017-red-team-probes.ts; bun test test/e2e/systemd.test.ts",
+      "scenario": "Raw-SQLite tamper transcript_proof to null after a normal bootstrap.",
+      "expectedBehavior": "No transcript proof is re-derived; UDS health is failed_closed and the daemon exits 78.",
+      "invocation": "bun /tmp/g018-red-team-probes.ts",
+      "observed": "storedProof=null; health=unhealthy/failed_closed/metadata_invalid; exitCode=78.",
       "verdict": "passed"
     },
     {
-      "scenario": "Inject a pre-adoption ring event and adoption-start retention gap.",
-      "expectedBehavior": "The checkpoint is journaled as an adoption boundary and old retained lifecycle history is not retroactively projected.",
-      "invocation": "bun test test/unit/main-session.test.ts",
+      "scenario": "Raw-SQLite delete transcript_proof after a normal bootstrap.",
+      "expectedBehavior": "No transcript proof is re-derived; UDS health is failed_closed and the daemon exits 78.",
+      "invocation": "bun /tmp/g018-red-team-probes.ts",
+      "observed": "remainingRows=0 before startup; health=unhealthy/failed_closed/metadata_invalid; exitCode=78.",
       "verdict": "passed"
     },
     {
-      "scenario": "Tamper a retained adopted transcript fingerprint while the daemon is running.",
-      "expectedBehavior": "Owner UDS health becomes failed_closed/main_identity_mismatch and the process exits 78; no replacement proof is accepted.",
-      "invocation": "bun /tmp/g017-red-team-probes.ts",
+      "scenario": "Construct a host with a journal lacking journalAppendTranscriptProjection.",
+      "expectedBehavior": "Construction refuses the split-write-capable journal before any broker effect.",
+      "invocation": "bun /tmp/g018-red-team-probes.ts",
+      "observed": "failureReason=transcript_projection_journal_unavailable; commands=0; admissionAttempts=0.",
       "verdict": "passed"
     },
     {
-      "scenario": "Reuse an idempotency key with the exact request, then with conflicting request content.",
-      "expectedBehavior": "Exact reuse replays its original op_ref with one broker prompt; conflicting reuse returns 1500 idempotency_conflict with no broker send.",
-      "invocation": "bun /tmp/g017-red-team-probes.ts",
+      "scenario": "Make the broker definitively reject an admission, then retry its same idempotency key.",
+      "expectedBehavior": "The rejected claim is abandoned and a later retry is a fresh, single broker operation.",
+      "invocation": "bun /tmp/g018-red-team-probes.ts; bun test test/integration/p4.test.ts",
+      "observed": "First rejection left no pending claim; retry produced two total attempts but exactly one accepted prompt command.",
       "verdict": "passed"
     },
     {
-      "scenario": "Delete the accepted operation from the fixture before restart reconciliation so broker status is unknown.",
-      "expectedBehavior": "Recovery rejects main_admission_recovery_unprovable, leaves the claim pending, and does not resend the owner command.",
-      "invocation": "bun /tmp/g017-red-team-probes.ts",
+      "scenario": "Lose an accepted broker receipt and replay the exact idempotency key before terminal evidence.",
+      "expectedBehavior": "The pre-effect claim remains, ingress is fenced, and the broker command is never resent.",
+      "invocation": "bun /tmp/g018-red-team-probes.ts; bun test test/integration/p4.test.ts",
+      "observed": "Replay returned 1003 admission_recovery_pending; attempts=1; commands=1; terminal tail evidence later settled the claim.",
       "verdict": "passed"
     },
     {
-      "scenario": "Have the held-operation fixture emit its documented duplicate agent_start plus turn_start lifecycle source frames.",
-      "expectedBehavior": "main.events.read contains exactly one turn_start and one turn_end, proving the drill exercises real fixture overlap rather than an un-emitted state.",
-      "invocation": "bun /tmp/g017-red-team-probes.ts",
+      "scenario": "Delay observed Discord durable acceptance beyond the original inbound acknowledgement budget, then reject a second inbound message.",
+      "expectedBehavior": "The accepted message receives typing measured from the observed acceptance response; rejected ingress receives none.",
+      "invocation": "bun /tmp/g018-red-team-probes.ts; bun test test/integration/discord.test.ts",
+      "observed": "inbound=1000, observedAccepted=3501, typing=3501; failed admission left acknowledgement count at one and no pending claim/fence.",
       "verdict": "passed"
     },
     {
-      "scenario": "Answer an external-host gate through both RPC and cockpit pathways.",
-      "expectedBehavior": "The API returns accepted:false/gate_state:unsupported, replay is durable, and the cockpit gives actionable attached-GJC-TUI guidance.",
-      "invocation": "bun test test/integration/p4.test.ts; bun test test/integration/console.test.ts",
+      "scenario": "Inject proof persistence, tail resync, ring rotation, delivery projection, admission recovery, malformed intent, and claim-abandon failures.",
+      "expectedBehavior": "Each variant preserves the documented no-resend/no-silent-progress invariant and reports its expected fence/degraded/FAILED_CLOSED state.",
+      "invocation": "bun test test/unit/main-session.test.ts; bun test test/qa/recovery-fail-closed.test.ts",
+      "observed": "33 unit and 6 recovery cases passed, including all C5 reason groups.",
       "verdict": "passed"
     },
     {
-      "scenario": "Send malformed and negative owner-UDS protocol requests.",
-      "expectedBehavior": "Invalid/unknown request paths are rejected without opening an unsafe alternate behavior path.",
+      "scenario": "Attempt compiled corpus closure while pending/verification proof states remain fenced, then recover only after verification.",
+      "expectedBehavior": "Compiled process never closes early and later closes/replays only after proof readiness.",
+      "invocation": "bun test test/e2e/compiled-closure.test.ts",
+      "observed": "4 cases passed with 25 assertions.",
+      "verdict": "passed"
+    },
+    {
+      "scenario": "Send malformed and unknown owner-UDS frames and methods.",
+      "expectedBehavior": "The UDS server rejects invalid paths without opening an unsafe fallback.",
       "invocation": "bun test test/qa/uds-negative-paths.test.ts",
+      "observed": "3 cases passed with 11 assertions.",
       "verdict": "passed"
     }
   ],
   "probes": [
     {
-      "contract": "F1/F5 busy proof and growth window",
-      "invocation": "bun /tmp/g017-red-team-probes.ts :: busy-boot-preserves-proof-and-growth-window",
-      "expected": "proven/pending while busy, proof unchanged, then healthy/verified after terminal evidence",
-      "observed": "pendingState=verifying, pendingProof=proven, pendingVerification=pending, proofUnchanged=true, finalVerification=verified",
+      "contract": "B1 pending proof promotion",
+      "invocation": "bun /tmp/g018-red-team-probes.ts :: pending-proof-promotion-visible-gap-over-owner-uds",
+      "expected": "Visible transcript_delivery_gap atomically binds the promoted proof.",
+      "observed": "transcriptProof=proven, gapCount=1, journalKinds=[transcript_delivery_gap], adoption=pending_proof_promotion.",
       "verdict": "passed"
     },
     {
-      "contract": "F1 tampered adoption proof",
-      "invocation": "bun /tmp/g017-red-team-probes.ts :: tampered-transcript-fingerprint-fails-closed-over-uds",
-      "expected": "owner UDS fails closed rather than accepting a forged or replacement fingerprint",
-      "observed": "way.health reported unhealthy/failed_closed/main_identity_mismatch; daemon exitCode=78",
+      "contract": "B2/C2/C5 failure fence",
+      "invocation": "bun /tmp/g018-red-team-probes.ts :: atomic-projection-failure-unifies-submit-and-corpus-close-fences",
+      "expected": "No assistant delivery advancement, no new broker effect, no closure claim/commit/push after projection failure.",
+      "observed": "delivery stopped at transcript:2; both guarded calls returned 1003; closure claim absent; local and remote heads matched their pre-call values.",
       "verdict": "passed"
     },
     {
-      "contract": "F4 idempotency replay/conflict",
-      "invocation": "bun /tmp/g017-red-team-probes.ts :: api-idempotency-replay-and-conflict",
-      "expected": "same key replays; conflicting payload returns 1500; neither resends",
-      "observed": "identical op_ref replayed, conflict=1500 idempotency_conflict, brokerPromptCount=1",
+      "contract": "C1 null SQLite metadata",
+      "invocation": "bun /tmp/g018-red-team-probes.ts :: null-current-schema-transcript-proof-fails-closed-over-owner-uds",
+      "expected": "null is corrupt, not an inferred proof.",
+      "observed": "storedProof=null; way.health=unhealthy/failed_closed/metadata_invalid; exitCode=78.",
       "verdict": "passed"
     },
     {
-      "contract": "F4 unknown broker operation state",
-      "invocation": "bun /tmp/g017-red-team-probes.ts :: foreign-unknown-broker-status-rejects-without-resend",
-      "expected": "unprovable status rejects and leaves one pending claim without resend",
-      "observed": "recoveryReason=main_admission_recovery_unprovable, pendingClaims=1, brokerPromptCount=1",
+      "contract": "C1 missing SQLite metadata",
+      "invocation": "bun /tmp/g018-red-team-probes.ts :: missing-current-schema-transcript-proof-fails-closed-over-owner-uds",
+      "expected": "A deleted current-schema key is corrupt, not an inferred proof.",
+      "observed": "remainingRows=0 before startup; way.health=unhealthy/failed_closed/metadata_invalid; exitCode=78.",
       "verdict": "passed"
     },
     {
-      "contract": "F9 fixture/lifecycle dedupe",
-      "invocation": "bun /tmp/g017-red-team-probes.ts :: fixture-held-operation-lifecycle-deduplication",
-      "expected": "fixture overlap results in one owner turn_start/turn_end pair",
-      "observed": "fixtureAgentStartCount=2, fixtureTurnStartCount=1, projectedKinds=[turn_start,assistant_message,turn_end]",
+      "contract": "C2 mandatory atomic journal",
+      "invocation": "bun /tmp/g018-red-team-probes.ts :: host-refuses-missing-atomic-transcript-projection-journal",
+      "expected": "No fallback split-write path is constructible.",
+      "observed": "transcript_projection_journal_unavailable before commands=0 and admissionAttempts=0.",
       "verdict": "passed"
     },
     {
-      "contract": "F2/F3/F4/F5 existing restart and delivery drills",
-      "invocation": "bun test test/unit/main-session.test.ts; bun test test/integration/p4.test.ts; bun test test/qa/recovery-fail-closed.test.ts",
-      "expected": "checkpoint, recovery, durable delivery, no-resend, and busy-window suites pass",
-      "observed": "51 test cases passed; 0 failed",
+      "contract": "C3 centralized disposition",
+      "invocation": "bun /tmp/g018-red-team-probes.ts :: centralized-broker-disposition-abandons-only-definitive-claims",
+      "expected": "Definitive rejection abandons; ambiguity retains/fences without resend.",
+      "observed": "definitive pending=0/retry command=1; ambiguous replay=1003 admission_recovery_pending/attempts=1/commands=1/settledPending=0.",
       "verdict": "passed"
     },
     {
-      "contract": "F6 cockpit unsupported gate and loss rendering",
-      "invocation": "bun test test/integration/console.test.ts",
-      "expected": "cockpit remains actionable under unsupported gate and delivery-gap paths",
-      "observed": "24 test cases passed; 0 failed",
+      "contract": "C4 Discord acknowledgement boundary",
+      "invocation": "bun /tmp/g018-red-team-probes.ts :: discord-typing-budget-begins-at-observed-durable-acceptance",
+      "expected": "Late observed success gets typing; failed admission gets none.",
+      "observed": "inboundAcceptedAt=1000, observedAcceptanceAt=3501, one typing at 3501, acknowledgement count remained one after rejected admission.",
       "verdict": "passed"
     },
     {
-      "contract": "Compiled systemd topology and busy startup fence",
-      "invocation": "bun test test/e2e/systemd.test.ts",
-      "expected": "compiled daemon topology preserves a fenced busy verification path",
-      "observed": "4 test cases passed; 0 failed",
+      "contract": "C5 injected-failure matrix",
+      "invocation": "bun test test/unit/main-session.test.ts; bun test test/qa/recovery-fail-closed.test.ts",
+      "expected": "Each injected failure has its expected durable safety fence or fail-closed outcome.",
+      "observed": "39 focused cases passed; 0 failed.",
       "verdict": "passed"
     },
     {
-      "contract": "Owner-UDS malformed request rejection",
-      "invocation": "bun test test/qa/uds-negative-paths.test.ts",
-      "expected": "negative RPC paths remain fail-closed",
-      "observed": "3 test cases passed; 0 failed",
+      "contract": "Compiled topology",
+      "invocation": "bun test test/e2e/compiled-closure.test.ts; bun test test/e2e/systemd.test.ts",
+      "expected": "Compiled daemon preserves proof and mutation fences.",
+      "observed": "8 cases passed; 0 failed.",
       "verdict": "passed"
     },
     {
-      "contract": "Console terminal control capture",
-      "invocation": "bun /tmp/g017-console-transcript.ts",
-      "expected": "raw terminal capture contains ANSI lifecycle and accepted/finalized owner interaction",
-      "observed": "14 raw writes, 358 ESC bytes, alternate screen enter/exit, delivery and assistant frames",
+      "contract": "Raw terminal capture",
+      "invocation": "bun /tmp/g018-console-transcript.ts",
+      "expected": "Terminal transcript records console lifecycle and accepted/finalized owner interaction.",
+      "observed": "14 writes, 358 ESC bytes, alternate screen enter/exit, delivered-as prompt, assistant reply.",
       "verdict": "passed"
     },
     {
       "contract": "Safe CLI replay",
-      "invocation": "LC_ALL=C bun -e 'console.log(\"ultragoal-cli-ok\")'",
-      "expected": "exit 0 with safe deterministic output",
-      "observed": "stdout=ultragoal-cli-ok newline; stderr empty",
+      "invocation": "LC_ALL=C bun -e 'console.log(\"g018-cli-ok\")'",
+      "expected": "Exit 0 with deterministic safe output.",
+      "observed": "stdout=g018-cli-ok newline; stderr empty.",
       "verdict": "passed"
     }
   ],
@@ -389,17 +420,22 @@
     {
       "path": "artifacts/g017-qa-api-report.json",
       "kind": "api-package-test-report",
+      "sourceHash": "sha256:5377dc936885a58b4e708cbde30f698b8818578cd7f41d62f901e7451508988d",
       "verified": true
     },
     {
       "path": "artifacts/g017-cli-replay.json",
       "kind": "cli-replay",
+      "sourceHash": "sha256:5377dc936885a58b4e708cbde30f698b8818578cd7f41d62f901e7451508988d",
       "verified": true
     },
     {
       "path": "artifacts/g017-console-pty-capture.txt",
       "kind": "raw-console-pty-capture",
-      "verified": true
+      "sourceHash": "sha256:5377dc936885a58b4e708cbde30f698b8818578cd7f41d62f901e7451508988d",
+      "verified": true,
+      "bytes": 14216,
+      "escapeBytes": 358
     }
   ],
   "blockers": []

@@ -1,11 +1,13 @@
 {
   "schemaVersion": 1,
   "kind": "cli-replay",
+  "sourceHash": "sha256:5377dc936885a58b4e708cbde30f698b8818578cd7f41d62f901e7451508988d",
+  "snapshotCommit": "8cdac2ad5642c2cb0372c2554d50d0f95ddab071",
   "replaySafe": true,
   "command": [
     "bun",
     "-e",
-    "console.log(\"ultragoal-cli-ok\")"
+    "console.log(\"g018-cli-ok\")"
   ],
   "cwd": ".",
   "env": {
@@ -13,12 +15,12 @@
   },
   "timeoutMs": 30000,
   "expectedExitCode": 0,
-  "recordedStdout": "ultragoal-cli-ok\n",
+  "recordedStdout": "g018-cli-ok\n",
   "recordedStderr": "",
   "invariants": [
     {
       "type": "substring",
-      "value": "ultragoal-cli-ok"
+      "value": "g018-cli-ok"
     },
     {
       "type": "not_substring",

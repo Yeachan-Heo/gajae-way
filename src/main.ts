@@ -284,6 +284,18 @@ interface InFlightCorpusClosure {
 	readonly response: Promise<CorpusClosureResponse>;
 }
 
+type MutationReadinessReason = () => string | undefined;
+
+class ClosureRecoveryReadinessRefusal extends Error {
+	readonly reason: string;
+
+	constructor(reason: string) {
+		super(`Pending corpus closure recovery is fenced: ${reason}`);
+		this.name = "ClosureRecoveryReadinessRefusal";
+		this.reason = reason;
+	}
+}
+
 interface ClosureOperationIntent {
 	readonly version: 1;
 	readonly operationId: string;
@@ -782,9 +794,13 @@ async function executeAndFinalizeClosureOperation(
 	closures: ClosureExecutor,
 	intent: ClosureOperationIntent,
 	intentJson: string,
+	mutationReadinessReason: MutationReadinessReason,
 ): Promise<CorpusClosureResponse> {
 	let closure: Awaited<ReturnType<ClosureExecutor["execute"]>>;
 	try {
+		// Re-check the host-owned fence at the closure effect boundary; verified
+		// transcript evidence alone is not sufficient.
+		assertMutationReadiness(mutationReadinessReason);
 		closure = await closures.execute({
 			sessionId: intent.sessionId,
 			corpusPath: intent.corpusPath,
@@ -823,6 +839,7 @@ async function reconcilePendingClosureOperation(
 	closures: ClosureExecutor,
 	corpusPath: string,
 	sessionId: string,
+	mutationReadinessReason: MutationReadinessReason,
 ): Promise<void> {
 	const operation = readClosureOperation(core);
 	if (!operation) return;
@@ -838,7 +855,14 @@ async function reconcilePendingClosureOperation(
 	if (!replay.replayed || replay.responseJson !== operation.record.intentJson) {
 		throw new Error("pending closure operation is not bound to its idempotency intent");
 	}
-	await executeAndFinalizeClosureOperation(core, closures, intent, operation.record.intentJson);
+	try {
+		await executeAndFinalizeClosureOperation(core, closures, intent, operation.record.intentJson, mutationReadinessReason);
+	} catch (error) {
+		if (error instanceof RpcBridgeException && error.code === 1003) {
+			throw new ClosureRecoveryReadinessRefusal(error.message);
+		}
+		throw error;
+	}
 }
 
 function closureExecutionFailure(error: unknown): never {
@@ -849,9 +873,13 @@ function closureExecutionFailure(error: unknown): never {
 	throw new RpcBridgeException(-32603, error instanceof Error ? error.message : String(error));
 }
 
-function assertMainSessionMutationReady(host: MainSessionHost): void {
-	const reason = host.mutationReadinessReason;
+function assertMutationReadiness(mutationReadinessReason: MutationReadinessReason): void {
+	const reason = mutationReadinessReason();
 	if (reason) throw new RpcBridgeException(1003, reason);
+}
+
+function assertMainSessionMutationReady(host: MainSessionHost): void {
+	assertMutationReadiness(() => host.mutationReadinessReason);
 }
 
 function closureBridgeHandler(
@@ -864,8 +892,7 @@ function closureBridgeHandler(
 	const inFlightByKey = new Map<string, InFlightCorpusClosure>();
 	return async (method, params) => {
 		if (method !== "main.corpus.close") throw new RpcBridgeException(-32601, `method not found: ${method}`);
-		const readinessReason = mutationReadinessReason();
-		if (readinessReason) throw new RpcBridgeException(1003, readinessReason);
+		assertMutationReadiness(mutationReadinessReason);
 		const request = parseCorpusClosureRequest(params, corpusPath);
 		const inFlight = inFlightByKey.get(request.idempotencyKey);
 		if (inFlight) {
@@ -901,7 +928,7 @@ function closureBridgeHandler(
 			) {
 				throw new RpcBridgeException(1500, "idempotency_conflict");
 			}
-			const response = executeAndFinalizeClosureOperation(core, closures, pendingIntent, storedResponse as string);
+			const response = executeAndFinalizeClosureOperation(core, closures, pendingIntent, storedResponse as string, mutationReadinessReason);
 			inFlightByKey.set(request.idempotencyKey, { requestJson: request.requestJson, response });
 			try {
 				return await response;
@@ -911,7 +938,7 @@ function closureBridgeHandler(
 			}
 		}
 
-		const response = executeAndFinalizeClosureOperation(core, closures, created.intent, created.intentJson);
+		const response = executeAndFinalizeClosureOperation(core, closures, created.intent, created.intentJson, mutationReadinessReason);
 		inFlightByKey.set(request.idempotencyKey, { requestJson: request.requestJson, response });
 		try {
 			return await response;
@@ -1062,6 +1089,7 @@ async function serveWay(config: WayConfig): Promise<void> {
 		});
 		host = resumedHost;
 		if (!verificationPending) core.setRpcHealth("running");
+		const mutationReadinessReason: MutationReadinessReason = () => resumedHost.mutationReadinessReason;
 		const admissionHandler = createMainAdmissionHandler(host, profile, core, {
 			isSurfaceQuarantined: (surface) => {
 				try {
@@ -1071,13 +1099,20 @@ async function serveWay(config: WayConfig): Promise<void> {
 				}
 			},
 			afterBrokerAcceptedBeforeFinalize: failAfterMainAdmissionBrokerAcceptedForE2e,
-			mutationReadinessReason: () => resumedHost.mutationReadinessReason,
+			mutationReadinessReason,
 		});
 		const gateAnswerHandler = createMainGateAnswerHandler(host, core);
-		const rawClosureHandler = closureBridgeHandler(core, closures, profile.corpusPath, resumed.identity.sessionId, () => resumedHost.mutationReadinessReason);
+		const rawClosureHandler = closureBridgeHandler(core, closures, profile.corpusPath, resumed.identity.sessionId, mutationReadinessReason);
 		const closureRecovery = resumedHost
 			.waitForVerifiedTranscript()
-			.then(async () => await reconcilePendingClosureOperation(core, closures, profile.corpusPath, resumed.identity.sessionId));
+			.then(async () => await reconcilePendingClosureOperation(core, closures, profile.corpusPath, resumed.identity.sessionId, mutationReadinessReason))
+			.catch((error) => {
+				if (error instanceof ClosureRecoveryReadinessRefusal) {
+					console.error(`Pending corpus closure recovery refused: ${error.reason}`);
+					return;
+				}
+				throw error;
+			});
 		const closureHandler: RpcBridgeHandler = async (method, params) => {
 			await closureRecovery;
 			return await rawClosureHandler(method, params);

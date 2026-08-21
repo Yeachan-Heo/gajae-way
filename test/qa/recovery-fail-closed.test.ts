@@ -2,6 +2,8 @@ import { createHash } from "node:crypto";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { afterEach, expect, test } from "bun:test";
+import { BrokerCli } from "../../src/broker/cli";
+import { canonicalJson } from "../../src/main-session/gates";
 import { GatewayStateStore } from "../../src/main-session/state";
 import { loadWayCore, type WayCoreHandle } from "../../src/native-loader";
 import { RpcClient } from "../../src/rpc-client";
@@ -46,7 +48,7 @@ async function connectEventually(socketPath: string): Promise<RpcClient> {
 	throw new Error(`RPC socket did not become available: ${socketPath}`);
 }
 
-async function waitForHealth(client: RpcClient, expected: "running" | "degraded" | "failed_closed"): Promise<Record<string, unknown>> {
+async function waitForHealth(client: RpcClient, expected: "running" | "verifying" | "degraded" | "failed_closed"): Promise<Record<string, unknown>> {
 	for (let attempt = 0; attempt < 500; attempt += 1) {
 		const response = await client.request("way.health", {});
 		if ((response.result as { state?: unknown } | undefined)?.state === expected) return response.result as Record<string, unknown>;
@@ -123,6 +125,40 @@ function stagePendingMainAdmission(core: WayCoreHandle, key: string, mode: "vali
 	return { opRef };
 }
 
+function stagePendingClosureOperation(
+	core: WayCoreHandle,
+	corpusPath: string,
+	sessionId: string,
+	params: { readonly paths: readonly string[]; readonly commit_message: string; readonly idempotency_key: string },
+): { readonly operationJson: string } {
+	const requestJson = canonicalJson({
+		commit_message: params.commit_message,
+		idempotency_key: params.idempotency_key,
+		paths: params.paths,
+	});
+	const intentJson = canonicalJson({
+		version: 1,
+		operationId: "startup-recovery-fence",
+		idempotencyKey: params.idempotency_key,
+		requestHash: createHash("sha256").update(requestJson).digest("hex"),
+		requestJson,
+		corpusPath: fs.realpathSync.native(corpusPath),
+		sessionId,
+		paths: params.paths,
+		commitMessage: params.commit_message,
+	});
+	const operationJson = canonicalJson({ version: 1, intentJson, state: "intent", evidence: {} });
+	expect(
+		core.closureOperationClaim({
+			scope: "main.corpus.close",
+			key: params.idempotency_key,
+			requestJson,
+			intentJson,
+			operationJson,
+		}),
+	).toMatchObject({ claimed: true });
+	return { operationJson };
+}
 test("missing exact adopted broker identity fails closed over UDS, lingers unhealthy, exits 78, and never rebirths", async () => {
 	const fixture = new FakeBrokerFixture();
 	const corpus = path.join(fixture.root, "corpus");
@@ -304,6 +340,101 @@ test("a transcript projection failure degrades the host and fences corpus closur
 		fixture.dispose();
 	}
 }, 30_000);
+
+test("startup closure recovery refuses a staged Git effect after host degradation and a healthy boot finalizes it exactly once", async () => {
+	const fixture = new FakeBrokerFixture();
+	const corpus = path.join(fixture.root, "corpus");
+	const remote = path.join(fixture.root, "remote.git");
+	const stateDirectory = path.join(fixture.root, "state");
+	const profilePath = path.join(fixture.root, "profile.toml");
+	const closeParams = {
+		paths: ["recovered-close.txt"],
+		commit_message: "recover only after a healthy boot",
+		idempotency_key: "startup-recovery-fence",
+	};
+	const busyOpRef = "startup-recovery-verification-busy";
+	const environment = {
+		...fixture.environment(),
+		NODE_ENV: "test",
+		GAJAEWAY_BROKER_CLI: fixture.executable,
+		GAJAEWAY_RECONCILE_POLL_MS: "600000",
+		GAJAEWAY_E2E_FAIL_TRANSCRIPT_PROJECTION: "1",
+	};
+	let degradedDaemon: RunningDaemon | undefined;
+	let healthyDaemon: RunningDaemon | undefined;
+	try {
+		await run(["git", "init", "--bare", remote]);
+		await run(["git", "init", corpus]);
+		await run(["git", "-C", corpus, "config", "user.name", "Startup Recovery Fence Drill"]);
+		await run(["git", "-C", corpus, "config", "user.email", "startup-recovery-fence@example.test"]);
+		fs.writeFileSync(path.join(corpus, "base.txt"), "base\n");
+		fs.writeFileSync(path.join(corpus, "recovered-close.txt"), "must remain pending until a healthy boot\n");
+		await run(["git", "-C", corpus, "add", "--", "base.txt"]);
+		await run(["git", "-C", corpus, "commit", "-m", "base"]);
+		await run(["git", "-C", corpus, "branch", "-M", "main"]);
+		await run(["git", "-C", corpus, "remote", "add", "origin", remote]);
+		await run(["git", "-C", corpus, "push", "-u", "origin", "main"]);
+		await run(["git", `--git-dir=${remote}`, "symbolic-ref", "HEAD", "refs/heads/main"]);
+		fs.writeFileSync(profilePath, profileContents(corpus, fixture.workspace, fixture.sessionId));
+		bootstrap(stateDirectory, profilePath, environment);
+
+		const observer = loadWayCore().WayCore.open(stateDirectory);
+		const state = new GatewayStateStore(observer);
+		const identity = state.read().mainIdentity;
+		if (!identity) throw new Error("bootstrap did not persist the adopted identity");
+		state.writeGrowthIntent(identity, Date.now());
+		const { operationJson } = stagePendingClosureOperation(observer, corpus, fixture.sessionId, closeParams);
+		fixture.setNoEnvelopeWhileBusy();
+		fixture.holdNextTurn();
+		await new BrokerCli({ executable: fixture.executable, environment: fixture.environment() }).sendPrompt(
+			fixture.sessionId,
+			"hold transcript verification until the staged closure recovery is fenced",
+			busyOpRef,
+		);
+		const localHead = await run(["git", "-C", corpus, "rev-parse", "HEAD"]);
+		const remoteHead = await run(["git", `--git-dir=${remote}`, "rev-parse", "main"]);
+
+		degradedDaemon = await startDaemon(stateDirectory, profilePath, environment);
+		expect(await waitForHealth(degradedDaemon.client, "verifying")).toMatchObject({ state: "verifying" });
+		expect(observer.gatewayMetaRead(["gitlock_closure_operation"]).entries[0]?.value).toBe(operationJson);
+		fixture.complete(busyOpRef, { text: "this transcript projection fails before recovery Git effects" });
+		expect(await waitForHealth(degradedDaemon.client, "degraded")).toMatchObject({
+			status: "unhealthy",
+			state: "degraded",
+			reason: "transcript_delivery_progress_write_failed",
+		});
+		await Bun.sleep(500);
+		const refused = await degradedDaemon.client.request("main.corpus.close", closeParams);
+		expect(refused.error).toMatchObject({ code: 1003, message: "transcript_delivery_progress_write_failed" });
+		expect(state.read()).toMatchObject({ bootstrapState: "COMMITTED", failedClosedReason: undefined });
+		expect(observer.gatewayMetaRead(["gitlock_closure_operation"]).entries[0]?.value).toBe(operationJson);
+		expect(await run(["git", "-C", corpus, "rev-parse", "HEAD"])).toBe(localHead);
+		expect(await run(["git", `--git-dir=${remote}`, "rev-parse", "main"])).toBe(remoteHead);
+		expect(await run(["git", `--git-dir=${remote}`, "rev-list", "--count", "main"])).toBe("1\n");
+
+		await stopDaemon(degradedDaemon);
+		degradedDaemon = undefined;
+		healthyDaemon = await startDaemon(stateDirectory, profilePath, {
+			...environment,
+			GAJAEWAY_E2E_FAIL_TRANSCRIPT_PROJECTION: "0",
+		});
+		expect(await waitForHealth(healthyDaemon.client, "running")).toMatchObject({ state: "running" });
+		const finalized = await healthyDaemon.client.request("main.corpus.close", closeParams, { timeoutMs: 10_000 });
+		expect(finalized.result).toMatchObject({ committed: true });
+		const replay = await healthyDaemon.client.request("main.corpus.close", closeParams, { timeoutMs: 10_000 });
+		expect(replay.result).toEqual(finalized.result);
+		expect(await run(["git", `--git-dir=${remote}`, "show", "main:recovered-close.txt"])).toBe(
+			"must remain pending until a healthy boot\n",
+		);
+		expect(await run(["git", `--git-dir=${remote}`, "rev-list", "--count", "main"])).toBe("2\n");
+		expect(await run(["git", "-C", corpus, "rev-list", "--count", "HEAD"])).toBe("2\n");
+		expect(observer.gatewayMetaRead(["gitlock_closure_operation"]).entries[0]?.value).toBeUndefined();
+	} finally {
+		await stopDaemon(healthyDaemon);
+		await stopDaemon(degradedDaemon);
+		fixture.dispose();
+	}
+}, 45_000);
 
 async function assertPendingAdmissionRecoveryFailsClosed(
 	reason: "main_admission_recovery_unavailable" | "main_admission_recovery_unprovable" | "main_admission_intent_invalid",
