@@ -15,6 +15,14 @@ const usage = `Usage:
 const GATEWAY_READY_POLL_MS = 100;
 const GATEWAY_HEALTH_TIMEOUT_MS = 1_000;
 const GATEWAY_READINESS_DIAGNOSTIC_INTERVAL_MS = 30_000;
+const DISCORD_TYPING_KEEPALIVE_MS = 8_000;
+const DISCORD_TYPING_KEEPALIVE_CAP_MS = 10 * 60_000;
+
+export interface DiscordTypingKeepaliveClock {
+	now(): number;
+	setTimeout(callback: () => void | Promise<void>, milliseconds: number): unknown;
+	clearTimeout(timer: unknown): void;
+}
 
 export interface DiscordAdapterDependencies {
 	readonly environment?: NodeJS.ProcessEnv;
@@ -26,7 +34,10 @@ export interface DiscordAdapterDependencies {
 	onDiagnostic?(message: string): void;
 	/** Cancels startup while the adapter is intentionally waiting for a fenced gateway. */
 	startupSignal?: AbortSignal;
+	/** Test-only clock injection for deterministic typing keepalive scheduling. */
+	typingKeepaliveClock?: DiscordTypingKeepaliveClock;
 	waitForShutdown?(): Promise<void>;
+
 }
 
 export interface DiscordAdapterCheck {
@@ -53,6 +64,8 @@ export async function startDiscordAdapter(
 	);
 	let platform: DiscordPlatform | undefined;
 	let unsubscribe: (() => void) | undefined;
+	let controller: AbortController | undefined;
+	let typingKeepalive: DiscordTypingKeepalive | undefined;
 	try {
 		platform =
 			dependencies.platformFactory?.(config) ??
@@ -63,11 +76,23 @@ export async function startDiscordAdapter(
 				...(config.gatewayUrl ? { gatewayUrl: config.gatewayUrl } : {}),
 			});
 		const activePlatform = platform;
+		const activeController = new AbortController();
+		controller = activeController;
+		const activeTypingKeepalive = new DiscordTypingKeepalive({
+			platform: activePlatform,
+			signal: activeController.signal,
+			onError,
+			clock: dependencies.typingKeepaliveClock,
+		});
+		typingKeepalive = activeTypingKeepalive;
 		const router = new DiscordRouteHandler({
 			route: config.route,
 			rpc,
 			platform: activePlatform,
 			acknowledgement: { budgetMs: config.ackBudgetMs },
+			onAccepted: message => activeTypingKeepalive.begin(message.channelId, message.id),
+			onAcknowledged: acknowledgement => activeTypingKeepalive.start(config.route.channelId, acknowledgement.messageId),
+			onAcknowledgementFailed: message => activeTypingKeepalive.cancel(message.channelId, message.id),
 		});
 		const outbox = new DiscordOutbox({
 			rpc,
@@ -75,9 +100,9 @@ export async function startDiscordAdapter(
 			route: config.route,
 			claimTtlMs: config.claimTtlMs,
 			readWaitMs: config.readWaitMs,
+			hooks: { afterSendBeforeCommit: () => activeTypingKeepalive.stop(config.route.channelId) },
 			onError,
 		});
-		const controller = new AbortController();
 		unsubscribe = activePlatform.onMessage(async message => {
 			try {
 				await router.handle(message);
@@ -86,20 +111,26 @@ export async function startDiscordAdapter(
 			}
 		});
 		await activePlatform.connect();
-		const outboxRun = outbox.run(controller.signal);
+		const outboxRun = outbox.run(activeController.signal);
 		let stopped = false;
 		return {
 			async stop(): Promise<void> {
 				if (stopped) return;
 				stopped = true;
-				controller.abort();
+				activeController.abort();
+				activeTypingKeepalive.dispose();
 				unsubscribe?.();
-				await activePlatform.disconnect();
-				rpc.close();
-				await outboxRun;
+				try {
+					await activePlatform.disconnect();
+				} finally {
+					rpc.close();
+					await outboxRun;
+				}
 			},
 		};
 	} catch (error) {
+		typingKeepalive?.dispose();
+		controller?.abort();
 		unsubscribe?.();
 		try {
 			await platform?.disconnect();
@@ -109,6 +140,122 @@ export async function startDiscordAdapter(
 		throw error;
 	}
 }
+
+class DiscordTypingKeepalive {
+	readonly #platform: DiscordPlatform;
+	readonly #signal: AbortSignal;
+	readonly #onError: (error: Error) => void;
+	readonly #clock: DiscordTypingKeepaliveClock;
+	readonly #channels = new Map<string, TypingKeepaliveChannel>();
+	#stopped = false;
+
+	constructor(options: {
+		readonly platform: DiscordPlatform;
+		readonly signal: AbortSignal;
+		readonly onError: (error: Error) => void;
+		readonly clock?: DiscordTypingKeepaliveClock;
+	}) {
+		this.#platform = options.platform;
+		this.#signal = options.signal;
+		this.#onError = options.onError;
+		this.#clock = options.clock ?? systemTypingKeepaliveClock;
+		if (this.#signal.aborted) {
+			this.#stopped = true;
+		} else {
+			this.#signal.addEventListener("abort", this.dispose, { once: true });
+		}
+	}
+
+	begin(channelId: string, messageId: string): void {
+		if (this.#stopped || this.#signal.aborted) return;
+		const channel = this.#channels.get(channelId) ?? { admissions: new Set<string>() };
+		channel.admissions.add(messageId);
+		this.#channels.set(channelId, channel);
+	}
+
+	start(channelId: string, messageId: string): void {
+		if (this.#stopped || this.#signal.aborted) return;
+		const channel = this.#channels.get(channelId);
+		if (!channel || !channel.admissions.delete(messageId)) return;
+		channel.deadlineAt = this.#clock.now() + DISCORD_TYPING_KEEPALIVE_CAP_MS;
+		if (channel.timer === undefined) this.schedule(channelId, channel);
+	}
+
+	cancel(channelId: string, messageId: string): void {
+		const channel = this.#channels.get(channelId);
+		if (!channel || !channel.admissions.delete(messageId)) return;
+		if (channel.deadlineAt === undefined && channel.admissions.size === 0) this.#channels.delete(channelId);
+	}
+
+	stop(channelId: string): void {
+		const channel = this.#channels.get(channelId);
+		if (!channel) return;
+		if (channel.timer !== undefined) this.#clock.clearTimeout(channel.timer);
+		this.#channels.delete(channelId);
+	}
+
+	dispose = (): void => {
+		if (this.#stopped) return;
+		this.#stopped = true;
+		this.#signal.removeEventListener("abort", this.dispose);
+		for (const channelId of [...this.#channels.keys()]) this.stop(channelId);
+	};
+
+	private schedule(channelId: string, channel: TypingKeepaliveChannel): void {
+		if (!this.isCurrent(channelId, channel) || channel.deadlineAt === undefined) return;
+		const remainingMs = channel.deadlineAt - this.#clock.now();
+		if (remainingMs <= 0) {
+			this.stop(channelId);
+			return;
+		}
+		channel.timer = this.#clock.setTimeout(async () => {
+			await this.tick(channelId, channel);
+		}, Math.min(DISCORD_TYPING_KEEPALIVE_MS, remainingMs));
+	}
+
+	private async tick(channelId: string, channel: TypingKeepaliveChannel): Promise<void> {
+		if (!this.isCurrent(channelId, channel) || channel.deadlineAt === undefined) return;
+		channel.timer = undefined;
+		if (this.#clock.now() >= channel.deadlineAt) {
+			this.stop(channelId);
+			return;
+		}
+		this.schedule(channelId, channel);
+		try {
+			await this.#platform.ackTyping(channelId);
+		} catch (error) {
+			this.reportFailure(channelId, error);
+		}
+	}
+
+	private isCurrent(channelId: string, channel: TypingKeepaliveChannel): boolean {
+		return !this.#stopped && !this.#signal.aborted && this.#channels.get(channelId) === channel;
+	}
+
+	private reportFailure(channelId: string, error: unknown): void {
+		const cause = asError(error);
+		try {
+			this.#onError(new Error(`Discord typing keepalive failed for channel ${channelId}: ${cause.message}`, { cause }));
+		} catch {
+			// Reporting must not terminate the adapter's ingress or egress loops.
+		}
+	}
+}
+
+interface TypingKeepaliveChannel {
+	readonly admissions: Set<string>;
+	deadlineAt?: number;
+	timer?: unknown;
+}
+
+const systemTypingKeepaliveClock: DiscordTypingKeepaliveClock = {
+	now: Date.now,
+	setTimeout: (callback, milliseconds) =>
+		setTimeout(() => {
+			void callback();
+		}, milliseconds),
+	clearTimeout: timer => clearTimeout(timer as ReturnType<typeof setTimeout>),
+};
 
 async function waitForGatewayRunning(
 	socketPath: string,

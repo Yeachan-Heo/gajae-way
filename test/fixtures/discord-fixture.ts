@@ -1,7 +1,14 @@
 import type { DiscordMessage, DiscordMessageHandler, DiscordPlatform } from "../../src/adapter/discord/platform";
 
+interface DiscordFixtureTimer {
+	readonly at: number;
+	readonly callback: () => void | Promise<void>;
+}
+
 export class DiscordFixtureClock {
 	#now: number;
+	#nextTimerId = 1;
+	readonly #timers = new Map<number, DiscordFixtureTimer>();
 
 	constructor(initialNow = 0) {
 		this.#now = initialNow;
@@ -9,10 +16,55 @@ export class DiscordFixtureClock {
 
 	now = (): number => this.#now;
 
+	get scheduledTimerCount(): number {
+		return this.#timers.size;
+	}
+
 	advance(milliseconds: number): void {
-		if (!Number.isSafeInteger(milliseconds) || milliseconds < 0) throw new Error("Fixture clock advance must be a non-negative safe integer.");
+		assertDuration(milliseconds);
 		this.#now += milliseconds;
 	}
+
+	setTimeout(callback: () => void | Promise<void>, milliseconds: number): number {
+		assertDuration(milliseconds);
+		const timerId = this.#nextTimerId;
+		this.#nextTimerId += 1;
+		this.#timers.set(timerId, { at: this.#now + milliseconds, callback });
+		return timerId;
+	}
+
+	clearTimeout(timer: unknown): void {
+		if (typeof timer === "number") this.#timers.delete(timer);
+	}
+
+	async advanceTimersBy(milliseconds: number): Promise<void> {
+		assertDuration(milliseconds);
+		const deadline = this.#now + milliseconds;
+		for (;;) {
+			const next = this.nextTimerBefore(deadline);
+			if (!next) {
+				this.#now = deadline;
+				return;
+			}
+			const [timerId, timer] = next;
+			this.#timers.delete(timerId);
+			this.#now = timer.at;
+			await timer.callback();
+		}
+	}
+
+	private nextTimerBefore(deadline: number): [number, DiscordFixtureTimer] | undefined {
+		let next: [number, DiscordFixtureTimer] | undefined;
+		for (const timer of this.#timers) {
+			if (timer[1].at > deadline) continue;
+			if (!next || timer[1].at < next[1].at || (timer[1].at === next[1].at && timer[0] < next[0])) next = timer;
+		}
+		return next;
+	}
+}
+
+function assertDuration(milliseconds: number): void {
+	if (!Number.isSafeInteger(milliseconds) || milliseconds < 0) throw new Error("Fixture clock advance must be a non-negative safe integer.");
 }
 
 export interface DiscordFixtureMessage {
@@ -60,6 +112,7 @@ export class DiscordFixture implements DiscordPlatform {
 	readonly sends: DiscordFixtureSend[] = [];
 	readonly sendAttempts: DiscordFixtureSend[] = [];
 	readonly acknowledgements: DiscordFixtureAcknowledgement[] = [];
+	readonly acknowledgementAttempts: DiscordFixtureAcknowledgement[] = [];
 	readonly reactions: DiscordFixtureReaction[] = [];
 	connectCount = 0;
 	disconnectCount = 0;
@@ -70,6 +123,8 @@ export class DiscordFixture implements DiscordPlatform {
 	readonly #nonceIds = new Map<string, string>();
 	readonly #queuedSendIds: string[] = [];
 	readonly #queuedMessages: DiscordMessage[] = [];
+	readonly #queuedTypingErrors: Error[] = [];
+
 	#connected = false;
 
 	constructor(options: DiscordFixtureOptions = {}) {
@@ -124,6 +179,10 @@ export class DiscordFixture implements DiscordPlatform {
 		this.#sendId = allocator;
 	}
 
+	failNextTyping(error = new Error("fixture typing acknowledgement failed")): void {
+		this.#queuedTypingErrors.push(error);
+	}
+
 	/** Queues an inbound event until the next gateway connection without acknowledging it. */
 	queueMessage(input: DiscordFixtureMessage): void {
 		this.#queuedMessages.push(this.recordMessage(input));
@@ -165,7 +224,11 @@ export class DiscordFixture implements DiscordPlatform {
 
 	async ackTyping(channelId: string): Promise<void> {
 		if (!this.#connected) throw new Error("Discord fixture gateway is disconnected.");
-		this.acknowledgements.push({ channelId, at: this.#now() });
+		const acknowledgement = { channelId, at: this.#now() };
+		this.acknowledgementAttempts.push(acknowledgement);
+		const error = this.#queuedTypingErrors.shift();
+		if (error) throw error;
+		this.acknowledgements.push(acknowledgement);
 	}
 
 	async react(channelId: string, messageId: string, emoji: string): Promise<void> {

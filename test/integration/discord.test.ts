@@ -3,7 +3,7 @@ import { expect, test } from "bun:test";
 import { DiscordOutbox, discordDedupeKey, discordWireNonce } from "../../src/adapter/discord/outbox";
 import { startDiscordAdapter } from "../../src/adapter/discord/main";
 import { DiscordRouteHandler } from "../../src/adapter/discord/route";
-import type { JsonRpcClient } from "../../src/rpc-client";
+import type { JsonRpcClient, JsonRpcResponse } from "../../src/rpc-client";
 import { DiscordFixture, DiscordFixtureClock } from "../fixtures/discord-fixture";
 import { createExternalGateway, eventually, type ExternalGateway } from "../helpers/external-gateway";
 
@@ -55,6 +55,61 @@ function outbox(
 		readWaitMs: 0,
 		hooks,
 	});
+}
+
+const TYPING_CHANNEL_ID = "123456789012345678";
+const TYPING_ROUTE = { channelId: TYPING_CHANNEL_ID, surfaceId: "discord:owner-dm" };
+
+function typingAdapterRpc(accepted: boolean): JsonRpcClient {
+	let claimCount = 0;
+	return {
+		async request(method): Promise<JsonRpcResponse> {
+			switch (method) {
+				case "way.health":
+					return typingRpcResult({ status: "healthy", state: "running" });
+				case "main.submit":
+					return typingRpcResult({ accepted });
+				case "consumer.claim":
+					claimCount += 1;
+					return typingRpcResult({ claim_id: `typing-claim-${claimCount}`, cursor: "1:0", expires_at: Date.now() + 5_000 });
+				case "main.events.read":
+					return typingRpcResult({ events: [], next_cursor: "1:0" });
+				case "consumer.commit":
+					return typingRpcResult({});
+				default:
+					throw new Error(`Unexpected typing fixture RPC method: ${method}`);
+			}
+		},
+		close() {},
+	};
+}
+
+function typingRpcResult(result: unknown): JsonRpcResponse {
+	return { jsonrpc: "2.0", id: 1, result };
+}
+
+async function startTypingFixtureAdapter(
+	fixture: DiscordFixture,
+	clock: DiscordFixtureClock,
+	rpc: JsonRpcClient,
+	onError: (error: Error) => void = () => undefined,
+) {
+	return await startDiscordAdapter(
+		{
+			rpcSocketPath: "/tmp/gajaeway-discord-typing-fixture.sock",
+			token: "fixture-token",
+			route: TYPING_ROUTE,
+			ackBudgetMs: 2_000,
+			claimTtlMs: 5_000,
+			readWaitMs: 0,
+		},
+		{
+			rpcConnect: async () => rpc,
+			platformFactory: () => fixture,
+			typingKeepaliveClock: clock,
+			onError,
+		},
+	);
 }
 
 externalTest("Discord inbound deduplicates a message id before external broker admission and sends finalized output", async () => {
@@ -135,6 +190,124 @@ externalTest("Discord typing starts after delayed durable main.submit acceptance
 		expect(ordering).toEqual(["durably accepted", "typing acknowledged"]);
 	} finally {
 		await fixture.disconnect();
+	}
+});
+
+externalTest("Discord typing keepalive refreshes a slow accepted turn and stops after reply delivery", async () => {
+	const gatewayUnderTest = await gateway();
+	const clock = new DiscordFixtureClock(1_000);
+	const fixture = new DiscordFixture({ now: clock.now });
+	const adapter = await startTypingFixtureAdapter(fixture, clock, gatewayUnderTest.client);
+	try {
+		gatewayUnderTest.fixture.holdNextTurn();
+		const inbound = { id: "typing-slow-turn", channelId: TYPING_CHANNEL_ID, text: "keep typing until the reply arrives" };
+		await fixture.emitMessage(inbound);
+		const opRef = await eventually(
+			() => {
+				const command = gatewayUnderTest.fixture.commands().find(command => command.operation === "turn.prompt" && command.text === inbound.text);
+				return typeof command?.opRef === "string" ? command.opRef : undefined;
+			},
+			"slow Discord turn was not admitted",
+		);
+
+		await clock.advanceTimersBy(30_000);
+		expect(fixture.acknowledgements).toEqual([
+			{ channelId: TYPING_CHANNEL_ID, at: 1_000 },
+			{ channelId: TYPING_CHANNEL_ID, at: 9_000 },
+			{ channelId: TYPING_CHANNEL_ID, at: 17_000 },
+			{ channelId: TYPING_CHANNEL_ID, at: 25_000 },
+		]);
+
+		gatewayUnderTest.fixture.complete(opRef, { text: "typing keepalive delivered reply" });
+		await eventually(
+			() => (fixture.sends.some(send => send.text === "typing keepalive delivered reply") ? true : undefined),
+			"Discord outbox did not deliver the slow turn reply",
+		);
+		const acknowledgementsAtDelivery = fixture.acknowledgements.length;
+		await clock.advanceTimersBy(30_000);
+		expect(fixture.acknowledgements).toHaveLength(acknowledgementsAtDelivery);
+	} finally {
+		await adapter.stop();
+	}
+});
+
+externalTest("Discord typing keepalive shares one channel interval and extends its cap for a later admission", async () => {
+	const clock = new DiscordFixtureClock(1_000);
+	const fixture = new DiscordFixture({ now: clock.now });
+	const adapter = await startTypingFixtureAdapter(fixture, clock, typingAdapterRpc(true));
+	try {
+		await fixture.emitMessage({ id: "typing-first", channelId: TYPING_CHANNEL_ID, text: "first accepted admission" });
+		clock.advance(4_000);
+		await fixture.emitMessage({ id: "typing-second", channelId: TYPING_CHANNEL_ID, text: "second accepted admission" });
+
+		await clock.advanceTimersBy(600_000);
+		const refreshes = fixture.acknowledgements.slice(2);
+		expect(fixture.acknowledgements.slice(0, 2)).toEqual([
+			{ channelId: TYPING_CHANNEL_ID, at: 1_000 },
+			{ channelId: TYPING_CHANNEL_ID, at: 5_000 },
+		]);
+		expect(refreshes).toHaveLength(75);
+		for (const [index, acknowledgement] of refreshes.entries()) {
+			expect(acknowledgement).toEqual({ channelId: TYPING_CHANNEL_ID, at: 9_000 + index * 8_000 });
+		}
+		expect(clock.scheduledTimerCount).toBe(0);
+	} finally {
+		await adapter.stop();
+	}
+});
+
+externalTest("Discord typing keepalive never starts for a rejected admission", async () => {
+	const clock = new DiscordFixtureClock(1_000);
+	const fixture = new DiscordFixture({ now: clock.now });
+	const adapter = await startTypingFixtureAdapter(fixture, clock, typingAdapterRpc(false));
+	try {
+		await fixture.emitMessage({ id: "typing-rejected", channelId: TYPING_CHANNEL_ID, text: "must not type" });
+		await clock.advanceTimersBy(30_000);
+		expect(fixture.acknowledgements).toEqual([]);
+		expect(fixture.acknowledgementAttempts).toEqual([]);
+		expect(clock.scheduledTimerCount).toBe(0);
+		expect(fixture.connected).toBe(true);
+	} finally {
+		await adapter.stop();
+	}
+});
+
+externalTest("Discord typing keepalive cancels its timer when the adapter stops", async () => {
+	const clock = new DiscordFixtureClock(1_000);
+	const fixture = new DiscordFixture({ now: clock.now });
+	const adapter = await startTypingFixtureAdapter(fixture, clock, typingAdapterRpc(true));
+	await fixture.emitMessage({ id: "typing-teardown", channelId: TYPING_CHANNEL_ID, text: "stop before refresh" });
+	expect(clock.scheduledTimerCount).toBe(1);
+	await adapter.stop();
+	expect(clock.scheduledTimerCount).toBe(0);
+	await clock.advanceTimersBy(30_000);
+	expect(fixture.acknowledgements).toEqual([{ channelId: TYPING_CHANNEL_ID, at: 1_000 }]);
+});
+
+externalTest("Discord typing keepalive retries after a non-fatal typing failure", async () => {
+	const clock = new DiscordFixtureClock(1_000);
+	const fixture = new DiscordFixture({ now: clock.now });
+	const errors: Error[] = [];
+	const adapter = await startTypingFixtureAdapter(fixture, clock, typingAdapterRpc(true), error => errors.push(error));
+	try {
+		await fixture.emitMessage({ id: "typing-retry", channelId: TYPING_CHANNEL_ID, text: "retry typing after failure" });
+		fixture.failNextTyping();
+		await clock.advanceTimersBy(8_000);
+		expect(fixture.acknowledgementAttempts).toEqual([
+			{ channelId: TYPING_CHANNEL_ID, at: 1_000 },
+			{ channelId: TYPING_CHANNEL_ID, at: 9_000 },
+		]);
+		expect(fixture.acknowledgements).toEqual([{ channelId: TYPING_CHANNEL_ID, at: 1_000 }]);
+		expect(errors).toEqual([expect.objectContaining({ message: `Discord typing keepalive failed for channel ${TYPING_CHANNEL_ID}: fixture typing acknowledgement failed` })]);
+
+		await clock.advanceTimersBy(8_000);
+		expect(fixture.acknowledgements).toEqual([
+			{ channelId: TYPING_CHANNEL_ID, at: 1_000 },
+			{ channelId: TYPING_CHANNEL_ID, at: 17_000 },
+		]);
+		expect(fixture.connected).toBe(true);
+	} finally {
+		await adapter.stop();
 	}
 });
 
