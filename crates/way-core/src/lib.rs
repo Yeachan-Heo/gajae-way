@@ -946,6 +946,12 @@ impl WayCore {
 		self.journal.read(cursor, limit.unwrap_or(100)).map(journal_read_output).map_err(journal_napi_error)
 	}
 
+	/** Returns the current inclusive journal head for admission causal boundaries. */
+	#[napi(js_name = "journalHeadCursor")]
+	pub fn journal_head_cursor(&self) -> napi::Result<String> {
+		self.journal.head_cursor().map(|cursor| cursor.to_string()).map_err(journal_napi_error)
+	}
+
 	#[napi(js_name = "consumerClaim")]
 	pub fn consumer_claim(&self, consumer_id: String, claim_ttl_ms: Option<u32>) -> napi::Result<ConsumerClaimOutput> {
 		self.journal

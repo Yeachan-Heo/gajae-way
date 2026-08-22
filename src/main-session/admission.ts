@@ -52,6 +52,9 @@ export interface MainAdmissionOperationStore {
 		readonly requestJson: string;
 		readonly intentJson: string;
 	}[];
+	/** Returns the inclusive durable journal head before any broker effect. */
+	journalHeadCursor?(): string;
+
 }
 
 export interface CreateMainAdmissionOptions {
@@ -62,6 +65,16 @@ export interface CreateMainAdmissionOptions {
 	readonly afterBrokerAcceptedBeforeFinalize?: () => void | Promise<void>;
 	/** The sole main-session mutation fence, checked immediately before a claim or broker effect. */
 	readonly mutationReadinessReason?: () => string | undefined;
+	/** Captures the inclusive durable journal head before any broker effect. */
+	readonly journalHeadCursor?: () => string;
+
+}
+
+interface MainAdmissionResponse {
+	readonly accepted: true;
+	readonly op_ref: string;
+	readonly delivered_as: DeliveredAs;
+	readonly journal_head_cursor?: string;
 }
 
 interface MainAdmissionIntent {
@@ -70,6 +83,7 @@ interface MainAdmissionIntent {
 	readonly op_ref: string;
 	readonly delivered_as: DeliveredAs;
 	readonly request_hash: string;
+	readonly journal_head_cursor?: string;
 }
 
 export class MainAdmissionRecoveryError extends Error {
@@ -117,7 +131,7 @@ function sha256(value: string): string {
 	return crypto.createHash("sha256").update(value).digest("hex");
 }
 
-function replayResponse(responseJson: string | undefined): { accepted: boolean; op_ref: string; delivered_as: DeliveredAs } {
+function replayResponse(responseJson: string | undefined): MainAdmissionResponse {
 	if (!responseJson) throw new Error("Idempotency replay has no stored response.");
 	const response = JSON.parse(responseJson) as Record<string, unknown>;
 	if (
@@ -127,7 +141,19 @@ function replayResponse(responseJson: string | undefined): { accepted: boolean; 
 	) {
 		throw new Error("Stored main.submit response is invalid.");
 	}
-	return response as { accepted: boolean; op_ref: string; delivered_as: DeliveredAs };
+	const journalHeadCursor = optionalJournalHeadCursor(response.journal_head_cursor);
+	return {
+		accepted: true,
+		op_ref: response.op_ref,
+		delivered_as: response.delivered_as,
+		...(journalHeadCursor === undefined ? {} : { journal_head_cursor: journalHeadCursor }),
+	};
+}
+
+function optionalJournalHeadCursor(value: unknown): string | undefined {
+	if (value === undefined) return undefined;
+	if (typeof value !== "string" || !/^\d+:\d+$/.test(value)) throw new Error("journal_head_cursor must be a journal cursor.");
+	return value;
 }
 
 function parseIntent(intentJson: string): MainAdmissionIntent {
@@ -137,15 +163,19 @@ function parseIntent(intentJson: string): MainAdmissionIntent {
 	} catch (error) {
 		throw new MainAdmissionRecoveryError("main_admission_intent_invalid", "The durable main admission intent is not JSON.", { cause: error });
 	}
+	if (!isRecord(parsed)) {
+		throw new MainAdmissionRecoveryError("main_admission_intent_invalid", "The durable main admission intent is malformed.");
+	}
+	const journalHeadCursor = parsed.journal_head_cursor;
 	if (
-		!isRecord(parsed) ||
 		parsed.version !== 1 ||
 		parsed.state !== "claimed" ||
 		typeof parsed.op_ref !== "string" ||
 		!parsed.op_ref ||
 		(parsed.delivered_as !== "prompt" && parsed.delivered_as !== "steer" && parsed.delivered_as !== "follow_up") ||
 		typeof parsed.request_hash !== "string" ||
-		!/^[a-f0-9]{64}$/i.test(parsed.request_hash)
+		!/^[a-f0-9]{64}$/i.test(parsed.request_hash) ||
+		(journalHeadCursor !== undefined && (typeof journalHeadCursor !== "string" || !/^\d+:\d+$/.test(journalHeadCursor)))
 	) {
 		throw new MainAdmissionRecoveryError("main_admission_intent_invalid", "The durable main admission intent is malformed.");
 	}
@@ -155,8 +185,10 @@ function parseIntent(intentJson: string): MainAdmissionIntent {
 		op_ref: parsed.op_ref,
 		delivered_as: parsed.delivered_as,
 		request_hash: parsed.request_hash,
+		...(journalHeadCursor === undefined ? {} : { journal_head_cursor: journalHeadCursor }),
 	};
 }
+
 
 function pendingReplayError(intentJson: string): never {
 	parseIntent(intentJson);
@@ -213,7 +245,8 @@ export function createMainAdmissionHandler(
 	const ownerSurfaceIds = new Set(profile.ownerSurfaces.map(surface => surface.id));
 	const knownSurfaces = new Map(profile.knownSurfaces.map(surface => [surface.id, surface]));
 	const newOpRef = options.newOpRef ?? crypto.randomUUID;
-	return async (params: unknown): Promise<{ accepted: boolean; op_ref: string; delivered_as: DeliveredAs }> => {
+	return async (params: unknown): Promise<MainAdmissionResponse> => {
+
 		const request = parseRequest(params);
 		const fenceReason = options.mutationReadinessReason?.() ?? target.mutationReadinessReason;
 		if (fenceReason) throw new RpcBridgeException(1003, fenceReason);
@@ -231,14 +264,28 @@ export function createMainAdmissionHandler(
 				? "prompt"
 				: "steer"
 			: "follow_up";
-		const response = { accepted: true, op_ref: newOpRef(), delivered_as: deliveredAs } as const;
+		// This direct durable read happens synchronously before the broker effect,
+		// so any assistant event for this admission must be strictly later.
+		const journalHeadCursor = options.journalHeadCursor
+			? optionalJournalHeadCursor(options.journalHeadCursor())
+			: idempotency.journalHeadCursor
+				? optionalJournalHeadCursor(idempotency.journalHeadCursor())
+				: undefined;
+		const response: MainAdmissionResponse = {
+			accepted: true,
+			op_ref: newOpRef(),
+			delivered_as: deliveredAs,
+			...(journalHeadCursor === undefined ? {} : { journal_head_cursor: journalHeadCursor }),
+		};
 		const intent: MainAdmissionIntent = {
 			version: 1,
 			state: "claimed",
 			op_ref: response.op_ref,
 			delivered_as: deliveredAs,
 			request_hash: sha256(requestJson),
+			...(journalHeadCursor === undefined ? {} : { journal_head_cursor: journalHeadCursor }),
 		};
+
 		const intentJson = canonicalJson(intent);
 		const responseJson = canonicalJson(response);
 		// The host retains this exact native finalization transaction if broker
@@ -316,7 +363,12 @@ export async function reconcilePendingMainAdmissions(
 				"The broker cannot prove whether a pending main admission was accepted.",
 			);
 		}
-		const response = { accepted: true, op_ref: intent.op_ref, delivered_as: intent.delivered_as } as const;
+		const response: MainAdmissionResponse = {
+			accepted: true,
+			op_ref: intent.op_ref,
+			delivered_as: intent.delivered_as,
+			...(intent.journal_head_cursor === undefined ? {} : { journal_head_cursor: intent.journal_head_cursor }),
+		};
 		try {
 			idempotency.mainAdmissionOperationFinalize({
 				scope: pending.scope,

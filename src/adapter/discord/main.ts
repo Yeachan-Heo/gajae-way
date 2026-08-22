@@ -18,9 +18,6 @@ const GATEWAY_HEALTH_TIMEOUT_MS = 1_000;
 const GATEWAY_READINESS_DIAGNOSTIC_INTERVAL_MS = 30_000;
 const DISCORD_TYPING_KEEPALIVE_MS = 8_000;
 const DISCORD_TYPING_KEEPALIVE_CAP_MS = 10 * 60_000;
-const DISCORD_TYPING_KEEPALIVE_JOURNAL_PAGE_SIZE = 500;
-const DISCORD_TYPING_KEEPALIVE_JOURNAL_PAGE_LIMIT = 100;
-
 
 export interface DiscordTypingKeepaliveClock {
 	now(): number;
@@ -84,7 +81,6 @@ export async function startDiscordAdapter(
 		controller = activeController;
 		const activeTypingKeepalive = new DiscordTypingKeepalive({
 			platform: activePlatform,
-			rpc,
 			signal: activeController.signal,
 			onError,
 			clock: dependencies.typingKeepaliveClock,
@@ -95,7 +91,7 @@ export async function startDiscordAdapter(
 			rpc,
 			platform: activePlatform,
 			acknowledgement: { budgetMs: config.ackBudgetMs },
-			onAccepted: message => activeTypingKeepalive.begin(message.channelId, message.id),
+			onAccepted: (message, journalHeadCursor) => activeTypingKeepalive.begin(message.channelId, message.id, journalHeadCursor),
 			onAcknowledged: acknowledgement => activeTypingKeepalive.start(config.route.channelId, acknowledgement.messageId),
 			onAcknowledgementFailed: message => activeTypingKeepalive.cancel(message.channelId, message.id),
 		});
@@ -148,7 +144,6 @@ export async function startDiscordAdapter(
 
 class DiscordTypingKeepalive {
 	readonly #platform: DiscordPlatform;
-	readonly #rpc: JsonRpcClient;
 	readonly #signal: AbortSignal;
 	readonly #onError: (error: Error) => void;
 	readonly #clock: DiscordTypingKeepaliveClock;
@@ -157,13 +152,11 @@ class DiscordTypingKeepalive {
 
 	constructor(options: {
 		readonly platform: DiscordPlatform;
-		readonly rpc: JsonRpcClient;
 		readonly signal: AbortSignal;
 		readonly onError: (error: Error) => void;
 		readonly clock?: DiscordTypingKeepaliveClock;
 	}) {
 		this.#platform = options.platform;
-		this.#rpc = options.rpc;
 		this.#signal = options.signal;
 		this.#onError = options.onError;
 		this.#clock = options.clock ?? systemTypingKeepaliveClock;
@@ -174,18 +167,15 @@ class DiscordTypingKeepalive {
 		}
 	}
 
-	begin(channelId: string, messageId: string): void {
+	begin(channelId: string, messageId: string, journalHeadCursor: unknown): void {
 		if (this.#stopped || this.#signal.aborted) return;
 		const channel = this.#channels.get(channelId) ?? createTypingKeepaliveChannel();
-		const admission: TypingAdmission = {};
-
+		const boundary = parseJournalCursor(journalHeadCursor);
+		if (!boundary) this.reportBoundaryUnavailable(channelId, journalHeadCursor);
+		const admission: TypingAdmission = { boundary };
 		channel.admissions.set(messageId, admission);
-		// A later accepted command makes an older assistant event ambiguous. Until
-		// this admission's journal head is observed, retain typing rather than let
-		// a backlogged delivery clear a newer owner turn.
 		channel.latestAdmission = admission;
 		this.#channels.set(channelId, channel);
-		void this.captureDeliveryBoundary(channelId, channel, admission);
 	}
 
 	start(channelId: string, messageId: string): void {
@@ -213,8 +203,25 @@ class DiscordTypingKeepalive {
 	delivered(channelId: string, item: DiscordOutboxItem): void {
 		const channel = this.#channels.get(channelId);
 		const boundary = channel?.latestAdmission?.boundary;
-		if (!channel || !boundary || !deliveryFollowsBoundary(item, boundary)) return;
-		this.stop(channelId);
+		if (!channel || !boundary) return;
+		const deliveryCursor = parseJournalCursor(item.cursor);
+		if (!deliveryCursor) {
+			this.reportBoundaryComparisonUnavailable(channelId, "the delivered assistant cursor is invalid");
+			return;
+		}
+		if (deliveryCursor.generation !== boundary.generation) {
+			this.reportBoundaryComparisonUnavailable(
+				channelId,
+				`the delivered assistant generation ${deliveryCursor.generation} does not match accepted generation ${boundary.generation}`,
+			);
+			return;
+		}
+		const deliveryAfterBoundary = decimalGreaterThan(item.seq, boundary.seq);
+		if (deliveryAfterBoundary === undefined) {
+			this.reportBoundaryComparisonUnavailable(channelId, "the delivered assistant sequence is invalid");
+			return;
+		}
+		if (deliveryAfterBoundary) this.stop(channelId);
 	}
 
 	stop(channelId: string): void {
@@ -231,17 +238,6 @@ class DiscordTypingKeepalive {
 		this.#signal.removeEventListener("abort", this.dispose);
 		for (const channelId of [...this.#channels.keys()]) this.stop(channelId);
 	};
-
-	private async captureDeliveryBoundary(channelId: string, channel: TypingKeepaliveChannel, admission: TypingAdmission): Promise<void> {
-		try {
-			const boundary = await readJournalHead(this.#rpc, this.#signal);
-			if (!boundary || !this.isCurrent(channelId, channel) || channel.latestAdmission !== admission) return;
-			admission.boundary = boundary;
-		} catch {
-			// An unreadable head cannot prove delivery causality. The cap provides the
-			// bounded safe outcome: retain typing rather than stop a newer turn.
-		}
-	}
 
 	private scheduleExpiry(channelId: string, channel: TypingKeepaliveChannel): void {
 		if (!this.isCurrent(channelId, channel) || channel.deadlineAt === undefined) return;
@@ -308,6 +304,31 @@ class DiscordTypingKeepalive {
 		return !this.#stopped && !this.#signal.aborted && this.#channels.get(channelId) === channel;
 	}
 
+	private reportBoundaryUnavailable(channelId: string, journalHeadCursor: unknown): void {
+		const detail =
+			journalHeadCursor === undefined
+				? "main.submit accepted response omitted journal_head_cursor"
+				: `main.submit accepted response returned invalid journal_head_cursor (${boundaryValueDescription(journalHeadCursor)})`;
+		this.reportDiagnostic(channelId, detail);
+	}
+
+	private reportBoundaryComparisonUnavailable(channelId: string, detail: string): void {
+		this.reportDiagnostic(channelId, detail);
+	}
+
+	private reportDiagnostic(channelId: string, detail: string): void {
+		if (this.#stopped || this.#signal.aborted) return;
+		try {
+			this.#onError(
+				new Error(
+					`Discord typing keepalive cannot establish a causal delivery boundary for channel ${channelId}: ${detail}; retaining typing until the hard cap.`,
+				),
+			);
+		} catch {
+			// Reporting must not terminate the adapter's ingress or egress loops.
+		}
+	}
+
 	private reportFailure(channelId: string, error: unknown): void {
 		const cause = asError(error);
 		try {
@@ -319,7 +340,7 @@ class DiscordTypingKeepalive {
 }
 
 interface TypingAdmission {
-	boundary?: JournalCursor;
+	readonly boundary?: JournalCursor;
 }
 
 interface TypingKeepaliveChannel {
@@ -340,52 +361,30 @@ function createTypingKeepaliveChannel(): TypingKeepaliveChannel {
 	return { admissions: new Map(), refreshInFlight: false };
 }
 
-/** Reads the inclusive journal head; only a strictly later event can be a reply to a later admission. */
-async function readJournalHead(rpc: JsonRpcClient, signal: AbortSignal): Promise<JournalCursor | undefined> {
-	let cursor: string | undefined;
-	for (let page = 0; page < DISCORD_TYPING_KEEPALIVE_JOURNAL_PAGE_LIMIT; page += 1) {
-		const result = rpcResult<unknown>(
-			await rpc.request(
-				"main.events.read",
-				{
-					...(cursor === undefined ? {} : { cursor }),
-					limit: DISCORD_TYPING_KEEPALIVE_JOURNAL_PAGE_SIZE,
-					wait_ms: 0,
-				},
-				{ signal },
-			),
-			"main.events.read",
-		);
-		if (!isRecord(result) || !Array.isArray(result.events) || typeof result.next_cursor !== "string") return undefined;
-		const nextCursor = parseJournalCursor(result.next_cursor);
-		if (!nextCursor) return undefined;
-		cursor = result.next_cursor;
-		if (result.gap !== undefined) continue;
-		if (result.events.length < DISCORD_TYPING_KEEPALIVE_JOURNAL_PAGE_SIZE) return nextCursor;
-	}
-	return undefined;
-}
-
-function deliveryFollowsBoundary(item: DiscordOutboxItem, boundary: JournalCursor): boolean {
-	const deliveryCursor = parseJournalCursor(item.cursor);
-	return deliveryCursor?.generation === boundary.generation && decimalGreaterThan(item.seq, boundary.seq);
-}
-
 function parseJournalCursor(value: unknown): JournalCursor | undefined {
 	if (typeof value !== "string") return undefined;
 	const match = /^(\d+):(\d+)$/.exec(value);
 	if (!match) return undefined;
-	return { generation: normalizeDecimal(match[1] as string), seq: normalizeDecimal(match[2] as string) };
+	const generation = normalizeDecimal(match[1] as string);
+	const seq = normalizeDecimal(match[2] as string);
+	if (generation === undefined || seq === undefined) return undefined;
+	return { generation, seq };
 }
 
-function decimalGreaterThan(left: string, right: string): boolean {
+function decimalGreaterThan(left: string, right: string): boolean | undefined {
 	const normalizedLeft = normalizeDecimal(left);
 	const normalizedRight = normalizeDecimal(right);
+	if (normalizedLeft === undefined || normalizedRight === undefined) return undefined;
 	return normalizedLeft.length > normalizedRight.length || (normalizedLeft.length === normalizedRight.length && normalizedLeft > normalizedRight);
 }
 
-function normalizeDecimal(value: string): string {
+function normalizeDecimal(value: string): string | undefined {
+	if (!/^\d+$/.test(value)) return undefined;
 	return value.replace(/^0+(?=\d)/, "");
+}
+
+function boundaryValueDescription(value: unknown): string {
+	return typeof value === "string" ? JSON.stringify(value.slice(0, 128)) : typeof value;
 }
 
 const systemTypingKeepaliveClock: DiscordTypingKeepaliveClock = {

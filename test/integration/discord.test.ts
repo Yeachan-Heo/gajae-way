@@ -60,7 +60,11 @@ function outbox(
 const TYPING_CHANNEL_ID = "123456789012345678";
 const TYPING_ROUTE = { channelId: TYPING_CHANNEL_ID, surfaceId: "discord:owner-dm" };
 
-function typingAdapterRpc(accepted: boolean): JsonRpcClient {
+function typingAdapterRpc(
+	accepted: boolean,
+	acceptedResponse: Record<string, unknown> = accepted ? { accepted: true, journal_head_cursor: "1:0" } : { accepted: false },
+): JsonRpcClient {
+
 	let claimCount = 0;
 	return {
 		async request(method): Promise<JsonRpcResponse> {
@@ -68,7 +72,7 @@ function typingAdapterRpc(accepted: boolean): JsonRpcClient {
 				case "way.health":
 					return typingRpcResult({ status: "healthy", state: "running" });
 				case "main.submit":
-					return typingRpcResult({ accepted });
+					return typingRpcResult(acceptedResponse);
 				case "consumer.claim":
 					claimCount += 1;
 					return typingRpcResult({ claim_id: `typing-claim-${claimCount}`, cursor: "1:0", expires_at: Date.now() + 5_000 });
@@ -256,20 +260,8 @@ externalTest("Discord typing keepalive ignores an older delayed delivery but sto
 	const gatewayUnderTest = await gateway();
 	const clock = new DiscordFixtureClock(1_000);
 	const fixture = new DiscordFixture({ now: clock.now });
-	let completedJournalHeadReads = 0;
-	const adapterRpc: JsonRpcClient = {
-		async request(method, params, options) {
-			const response = await gatewayUnderTest.client.request(method, params, options);
-			if (method === "main.events.read" && (params as { limit?: unknown } | undefined)?.limit === 500) {
-				completedJournalHeadReads += 1;
-			}
-			return response;
-		},
-		close() {
-			gatewayUnderTest.client.close();
-		},
-	};
-	const adapter = await startTypingFixtureAdapter(fixture, clock, adapterRpc);
+	const adapter = await startTypingFixtureAdapter(fixture, clock, gatewayUnderTest.client);
+
 	let releasedOlderSend = false;
 	try {
 		const olderText = "older assistant delivery must not clear newer typing";
@@ -287,8 +279,6 @@ externalTest("Discord typing keepalive ignores an older delayed delivery but sto
 			},
 			"new Discord turn was not admitted",
 		);
-		await eventually(() => (completedJournalHeadReads > 0 ? true : undefined), "accepted admission did not capture its journal boundary");
-		await clock.flushAsync();
 
 		fixture.releaseNextSend();
 		releasedOlderSend = true;
@@ -312,6 +302,61 @@ externalTest("Discord typing keepalive ignores an older delayed delivery but sto
 		expect(fixture.acknowledgementAttempts).toHaveLength(acknowledgementsAfterReply);
 	} finally {
 		if (!releasedOlderSend && fixture.pendingSendCount > 0) {
+			fixture.releaseNextSend();
+			await clock.flushAsync();
+		}
+		await adapter.stop();
+	}
+});
+
+externalTest("Discord typing keepalive stops for a reply journaled before the accepted response reaches the adapter", async () => {
+	const gatewayUnderTest = await gateway();
+	const clock = new DiscordFixtureClock(1_000);
+	const fixture = new DiscordFixture({ now: clock.now });
+	const replyText = "fast reply predates client receipt of acceptance";
+	let completed = false;
+	let serverBoundary: unknown;
+	const adapterRpc: JsonRpcClient = {
+		async request(method, params, options) {
+			const response = await gatewayUnderTest.client.request(method, params, options);
+			if (method !== "main.submit" || completed) return response;
+			const result = response.result as { accepted?: unknown; op_ref?: unknown; journal_head_cursor?: unknown } | undefined;
+			if (result?.accepted !== true || typeof result.op_ref !== "string") return response;
+			completed = true;
+			serverBoundary = result.journal_head_cursor;
+			gatewayUnderTest.fixture.complete(result.op_ref, { text: replyText });
+			await eventually(
+				() =>
+					gatewayUnderTest.core
+						.journalRead("1:0", 100)
+						.events.some(event => event.kind === "assistant_message" && event.payloadJson.includes(replyText))
+						? true
+						: undefined,
+				"fast assistant reply was not journaled before main.submit returned to the adapter",
+			);
+			return response;
+		},
+		close() {
+			gatewayUnderTest.client.close();
+		},
+	};
+	const adapter = await startTypingFixtureAdapter(fixture, clock, adapterRpc);
+	try {
+		gatewayUnderTest.fixture.holdNextTurn();
+		fixture.deferNextSend();
+		await fixture.emitMessage({ id: "typing-fast-reply", channelId: TYPING_CHANNEL_ID, text: "respond before adapter observes acceptance" });
+		expect(serverBoundary).toMatch(/^\d+:\d+$/);
+		await eventually(() => (fixture.pendingSendCount === 1 ? true : undefined), "fast journaled reply was not held before Discord delivery");
+		expect(fixture.acknowledgements).toEqual([{ channelId: TYPING_CHANNEL_ID, at: 1_000 }]);
+		expect(clock.scheduledTimerCount).toBe(2);
+
+		fixture.releaseNextSend();
+		await eventually(() => (fixture.sends.some(send => send.text === replyText) ? true : undefined), "fast reply was not delivered to Discord");
+		await eventually(() => (clock.scheduledTimerCount === 0 ? true : undefined), "fast reply did not stop the typing keepalive");
+		await advanceTypingClock(clock, 30_000);
+		expect(fixture.acknowledgements).toEqual([{ channelId: TYPING_CHANNEL_ID, at: 1_000 }]);
+	} finally {
+		if (fixture.pendingSendCount > 0) {
 			fixture.releaseNextSend();
 			await clock.flushAsync();
 		}
@@ -358,6 +403,82 @@ externalTest("Discord typing keepalive never starts for a rejected admission", a
 		expect(fixture.acknowledgementAttempts).toEqual([]);
 		expect(clock.scheduledTimerCount).toBe(0);
 		expect(fixture.connected).toBe(true);
+	} finally {
+		await adapter.stop();
+	}
+});
+
+externalTest("Discord typing keepalive diagnoses missing and malformed admission boundaries while retaining typing", async () => {
+	for (const scenario of [
+		{ name: "missing", response: { accepted: true }, detail: "omitted journal_head_cursor" },
+		{ name: "malformed", response: { accepted: true, journal_head_cursor: "not-a-cursor" }, detail: "invalid journal_head_cursor" },
+	] as const) {
+		const clock = new DiscordFixtureClock(1_000);
+		const fixture = new DiscordFixture({ now: clock.now });
+		const errors: Error[] = [];
+		const adapter = await startTypingFixtureAdapter(fixture, clock, typingAdapterRpc(true, scenario.response), error => errors.push(error));
+		try {
+			await fixture.emitMessage({
+				id: `typing-boundary-${scenario.name}`,
+				channelId: TYPING_CHANNEL_ID,
+				text: `${scenario.name} accepted boundary retains typing`,
+			});
+			expect(errors).toEqual([expect.objectContaining({ message: expect.stringContaining(scenario.detail) })]);
+			expect(clock.scheduledTimerCount).toBe(2);
+			await advanceTypingClock(clock, 8_000);
+			expect(fixture.acknowledgementAttempts).toEqual([
+				{ channelId: TYPING_CHANNEL_ID, at: 1_000 },
+				{ channelId: TYPING_CHANNEL_ID, at: 9_000 },
+			]);
+			expect(clock.scheduledTimerCount).toBe(2);
+		} finally {
+			await adapter.stop();
+		}
+	}
+});
+
+externalTest("Discord typing keepalive diagnoses a stale-generation admission boundary while retaining typing", async () => {
+	const gatewayUnderTest = await gateway();
+	const clock = new DiscordFixtureClock(1_000);
+	const fixture = new DiscordFixture({ now: clock.now });
+	const errors: Error[] = [];
+	const staleBoundaryRpc: JsonRpcClient = {
+		async request(method, params, options) {
+			const response = await gatewayUnderTest.client.request(method, params, options);
+			if (method !== "main.submit" || !response.result || typeof response.result !== "object") return response;
+			return {
+				...response,
+				result: { ...(response.result as Record<string, unknown>), journal_head_cursor: "0:0" },
+			};
+		},
+		close() {
+			gatewayUnderTest.client.close();
+		},
+	};
+	const adapter = await startTypingFixtureAdapter(fixture, clock, staleBoundaryRpc, error => errors.push(error));
+	try {
+		gatewayUnderTest.fixture.holdNextTurn();
+		const inbound = { id: "typing-stale-generation", channelId: TYPING_CHANNEL_ID, text: "stale generation must retain typing" };
+		await fixture.emitMessage(inbound);
+		const opRef = await eventually(
+			() => {
+				const command = gatewayUnderTest.fixture.commands().find(command => command.operation === "turn.prompt" && command.text === inbound.text);
+				return typeof command?.opRef === "string" ? command.opRef : undefined;
+			},
+			"stale-boundary Discord turn was not admitted",
+		);
+		gatewayUnderTest.fixture.complete(opRef, { text: "stale generation reply" });
+		await eventually(() => (fixture.sends.some(send => send.text === "stale generation reply") ? true : undefined), "stale-boundary reply was not delivered");
+		await eventually(
+			() => (errors.some(error => error.message.includes("does not match accepted generation")) ? true : undefined),
+			"stale-generation boundary diagnostic was not reported",
+		);
+		expect(clock.scheduledTimerCount).toBe(2);
+		await advanceTypingClock(clock, 8_000);
+		expect(fixture.acknowledgementAttempts).toEqual([
+			{ channelId: TYPING_CHANNEL_ID, at: 1_000 },
+			{ channelId: TYPING_CHANNEL_ID, at: 9_000 },
+		]);
 	} finally {
 		await adapter.stop();
 	}

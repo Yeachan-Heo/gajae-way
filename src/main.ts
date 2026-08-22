@@ -1155,6 +1155,7 @@ async function serveWay(config: WayConfig): Promise<void> {
 				}
 			},
 			afterBrokerAcceptedBeforeFinalize: failAfterMainAdmissionBrokerAcceptedForE2e,
+			journalHeadCursor: () => core.journalHeadCursor(),
 			mutationReadinessReason,
 		});
 		const gateAnswerHandler = createMainGateAnswerHandler(host, core);

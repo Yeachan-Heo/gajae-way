@@ -2,17 +2,17 @@
   "schemaVersion": 1,
   "kind": "cli-replay",
   "replaySafe": false,
-  "sourceHash": "sha256:6662f76506c49aa1aa778e6bd567bc83ac06ea767e722923cd7c10a09d42fb66",
-  "snapshotCommit": "9c0f600fa6beed4910ea9fc4fc68d6e12ef96fbd",
+  "sourceHash": "sha256:3aae219ca87b14ee16f005209a6cb377dc2fe76aedae7c2008c1dc6ed1efde8d",
+  "snapshotCommit": "8ed8866421eabff96d96f5644405e8e2c749ae1e",
   "replayExempt": {
     "reasonCode": "platform_unavailable",
     "detail": "Executable argv replay is refused in the compiled GJC runtime because process.execPath launches the GJC application rather than a Bun CLI executable. The audited structural fallback is a raw pseudo-terminal capture of the product console CLI recorded on this generation's frozen snapshot.",
     "fallback": {
       "kind": "pty-capture",
       "path": "artifacts/g017-console-pty-capture.txt",
-      "description": "Raw-TTY pseudo-terminal capture (14,216 bytes, 358 ESC terminal-control bytes, alternate-screen enter/exit) of way console driven against a real external-host UDS gateway on generation-7 snapshot 9c0f600, rendering Delivered as: prompt and the finalized Assistant frame."
+      "description": "Raw-TTY pseudo-terminal capture (14,216 bytes, 358 ESC terminal-control bytes, alternate-screen enter/exit) of way console driven against a real external-host UDS gateway on generation-8 snapshot 8ed8866, rendering Delivered as: prompt and the finalized Assistant frame."
     },
-    "reason": "Executable argv replay is unavailable in the compiled GJC runtime: process.execPath resolves to the GJC application rather than a Bun CLI executable, so the validator refuses executable replay by design. Audited structural fallback supplied: the generation-7 raw-TTY PTY capture of the product console attached to a live gateway.",
+    "reason": "Executable argv replay is unavailable in the compiled GJC runtime: process.execPath resolves to the GJC application rather than a Bun CLI executable, so the validator refuses executable replay by design. Audited structural fallback supplied: the generation-8 raw-TTY PTY capture of the product console attached to a live gateway.",
     "approvedBy": "ultragoal leader (GJC main session, agent-invoked) - NOT an owner approval; the exemption is forced by the compiled-runtime limitation the gate validator itself reports, and the structural PTY fallback is supplied in its place",
     "fallbackArtifactRefs": [
       "console-pty"
@@ -21,7 +21,7 @@
   "command": [
     "bun",
     "-e",
-    "console.log(\"g022-cli-ok\")"
+    "console.log(\"g023-cli-ok\")"
   ],
   "cwd": ".",
   "env": {
@@ -29,12 +29,12 @@
   },
   "timeoutMs": 30000,
   "expectedExitCode": 0,
-  "recordedStdout": "g022-cli-ok\n",
+  "recordedStdout": "g023-cli-ok\n",
   "recordedStderr": "",
   "invariants": [
     {
       "type": "substring",
-      "value": "g022-cli-ok"
+      "value": "g023-cli-ok"
     },
     {
       "type": "not_substring",

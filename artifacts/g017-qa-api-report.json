@@ -1,51 +1,34 @@
 {
   "schemaVersion": 1,
   "kind": "api-package-test-report",
-  "sourceHash": "sha256:6662f76506c49aa1aa778e6bd567bc83ac06ea767e722923cd7c10a09d42fb66",
-  "snapshotCommit": "9c0f600fa6beed4910ea9fc4fc68d6e12ef96fbd",
-  "priorSnapshotCommit": "b7d432f098fbc1dc8f643854cd615ce2974e31af",
+  "sourceHash": "sha256:3aae219ca87b14ee16f005209a6cb377dc2fe76aedae7c2008c1dc6ed1efde8d",
+  "snapshotCommit": "8ed8866421eabff96d96f5644405e8e2c749ae1e",
+  "priorSnapshotCommit": "9c0f600fa6beed4910ea9fc4fc68d6e12ef96fbd",
   "status": "passed",
   "e2eStatus": "passed",
   "redTeamStatus": "passed",
   "planCodeMismatch": false,
   "commands": [
     {
-      "command": "bun /tmp/g022-live-uds-read.ts",
-      "classification": "strictly read-only live owner-UDS evidence collection",
-      "methods": ["way.status", "main.events.read"],
-      "passed": 1,
+      "command": "bun /tmp/g023-r6-red-team.ts",
+      "classification": "throwaway real adapter/fixture causal-stop, boundary-failure, refresh-serialization, cap, and nonce-purity red-team suite",
+      "passed": 4,
       "failed": 0,
-      "observed": "Live socket returned healthy/running, four requested finalized assistant events, five delivery-gap events, journal head 1:896, and gajaeway-discord cursor 1:853. No mutation RPC was invoked.",
-      "verdict": "passed"
-    },
-    {
-      "command": "curl GET /api/v10/channels/1468535438498336923/messages?limit=100 with Authorization header from ~/gajaeway-play/discord/discord-token",
-      "classification": "strictly read-only live Discord REST history evidence collection",
-      "passed": 1,
-      "failed": 0,
-      "observed": "Returned 17 history rows, including 7 bot-authored messages; no POST/PUT/PATCH/DELETE, typing, reaction, or send was made and the token was not printed or stored.",
-      "verdict": "passed"
-    },
-    {
-      "command": "bun /tmp/g022-discord-red-team.ts",
-      "classification": "throwaway real adapter/fixture Discord red-team suite",
-      "passed": 3,
-      "failed": 0,
-      "observed": "Covered R4 typing cadence/delivery stop/fenced-rejected/teardown/failure/overlap, deterministic 24-hex nonce retry-after-restart dedupe, distinct nonce separation, and heartbeat latency plus RESUME identity.",
+      "observed": "Covered older-versus-later delivery causality, malformed/stale-generation boundary retention, one in-flight refresh, stop during a pending POST, independent cap under never-settling POST, and pure 24-hex nonce properties.",
       "verdict": "passed"
     },
     {
       "command": "bun test test/integration/discord.test.ts test/integration/discord-platform.test.ts",
-      "classification": "affected Discord adapter, outbox, keepalive, nonce, heartbeat, and resume suites",
-      "passed": 15,
+      "classification": "affected Discord adapter, fixture, causal typing keepalive, nonce, heartbeat, and resume suites",
+      "passed": 19,
       "failed": 0,
-      "expectCalls": 144,
+      "expectCalls": 164,
       "observed": "Expected fixture broker-rejection bridge-error logging occurred only for a negative-path test.",
       "verdict": "passed"
     },
     {
       "command": "bun scripts/compile.ts",
-      "classification": "required rebuild of frozen 9c0f600 source before compiled e2e",
+      "classification": "required rebuild of frozen 8ed8866 source before compiled e2e",
       "passed": 1,
       "failed": 0,
       "observed": "Compiled and codesigned dist/gajaeway and dist/gajaeway-discord for darwin-arm64.",
@@ -68,53 +51,35 @@
       "verdict": "passed"
     },
     {
-      "command": "bun /tmp/g022-gen3-gen4-regression-probes.ts",
+      "command": "bun /tmp/g023-gen3-gen4-regression-probes.ts",
       "classification": "standing Generation-3/4 owner-UDS proof, projection, admission, and acknowledgement regression spot check",
       "passed": 7,
       "failed": 0,
       "verdict": "passed"
     },
     {
-      "command": "bun /tmp/g022-gen5-r2-regression.ts",
+      "command": "bun /tmp/g023-gen5-r2-regression.ts",
       "classification": "standing Generation-5 per-Git-dispatch readiness and production-hook regression spot check",
       "passed": 4,
       "failed": 0,
       "verdict": "passed"
     },
     {
-      "command": "bun /tmp/g022-gen6-r3-regression.ts",
+      "command": "bun /tmp/g023-gen6-r3-regression.ts",
       "classification": "standing Generation-6 receipt-integrity, mid-flight waiter, and production-hook regression spot check",
       "passed": 3,
       "failed": 0,
       "verdict": "passed"
     },
     {
-      "command": "bun test test/qa/recovery-fail-closed.test.ts",
-      "classification": "Generation-6 recovery/receipt/mid-flight source suite retained as focused regression evidence",
-      "passed": 9,
+      "command": "bun /tmp/g023-gen7-r4-regression.ts",
+      "classification": "standing Generation-7 keepalive, nonce/restart, and heartbeat/resume regression spot check adapted to Generation-8 non-awaiting fixture timers",
+      "passed": 3,
       "failed": 0,
-      "expectCalls": 113,
       "verdict": "passed"
     },
     {
-      "command": "bun test test/unit/main-session.test.ts",
-      "classification": "durable proof, transcript delivery, atomic projection, and admission-recovery source regression suite",
-      "passed": 33,
-      "failed": 0,
-      "expectCalls": 111,
-      "verdict": "passed"
-    },
-    {
-      "command": "bun test test/integration/console.test.ts",
-      "classification": "cockpit/TUI integration regression suite",
-      "passed": 24,
-      "failed": 0,
-      "expectCalls": 111,
-      "observed": "Expected shutdown/request-cancel internal-error logs occurred during teardown only.",
-      "verdict": "passed"
-    },
-    {
-      "command": "bun /tmp/g022-console-transcript.ts",
+      "command": "bun /tmp/g023-console-transcript.ts",
       "classification": "fresh redirected raw-TTY console evidence harness",
       "passed": 1,
       "failed": 0,
@@ -146,23 +111,31 @@
       "verdict": "passed"
     },
     {
-      "command": "LC_ALL=C bun -e 'console.log(\"g022-cli-ok\")'",
+      "command": "LC_ALL=C bun -e 'console.log(\"g023-cli-ok\")'",
       "classification": "safe deterministic replay evidence retained inside replayExempt artifact shape",
       "passed": 1,
       "failed": 0,
-      "recordedStdout": "g022-cli-ok\n",
+      "recordedStdout": "g023-cli-ok\n",
       "recordedStderr": "",
       "verdict": "passed"
     },
     {
-      "command": "git diff --check b7d432f..9c0f600 && git diff --check",
+      "command": "Structural rebind validation of artifacts/g013-live-drill-receipt.md",
+      "classification": "Generation-8 source-hash rebind only; live gateway intentionally not re-contacted",
+      "passed": 1,
+      "failed": 0,
+      "observed": "The existing read-only G013 facts, assistant/gap rows, cursor, timing rows, bot-count statement, and token-redaction guard remain present; only frozen snapshot/hash provenance changed.",
+      "verdict": "passed"
+    },
+    {
+      "command": "git diff --check 9c0f600..8ed8866 && git diff --check",
       "classification": "frozen-delta and refreshed-artifact whitespace validation",
       "passed": 1,
       "failed": 0,
       "verdict": "passed"
     },
     {
-      "command": "git grep -n '@gajae-code/coding-agent' 9c0f600 -- package.json bun.lock src test scripts README.md || true",
+      "command": "git grep -n '@gajae-code/coding-agent' 8ed8866 -- package.json bun.lock src test scripts README.md || true",
       "classification": "retained removed-dependency guard",
       "passed": 1,
       "failed": 0,
@@ -173,105 +146,112 @@
   "contractCoverage": [
     {
       "contractRef": "R1",
-      "obligation": "Startup closure recovery shares host mutation readiness: refusal remains non-fatal and visible, retains its durable intent, and a healthy restart finalizes exactly once.",
+      "obligation": "Startup closure recovery shares host mutation readiness: a refusal is visible and non-fatal, preserves durable intent, and a later healthy execution finalizes exactly once.",
       "status": "covered",
       "evidence": [
-        "bun test test/qa/recovery-fail-closed.test.ts: 9 passed / 113 assertions.",
-        "bun /tmp/g022-gen5-r2-regression.ts and bun /tmp/g022-gen6-r3-regression.ts: acquired and committed-not-pushed refusal/recovery probes passed with exact-once remote histories."
+        "bun /tmp/g023-gen5-r2-regression.ts: after-acquire and committed-not-pushed recoveries each retained their operation through degraded refusal and finalized to one remote commit.",
+        "bun /tmp/g023-gen6-r3-regression.ts: refusal/recovery receipt scenarios passed with exact final replay behavior."
       ]
     },
     {
       "contractRef": "R2",
-      "obligation": "Every Git dispatch validates readiness and lock fencing; after-acquire and after-commit degradation preserve a recoverable intent, and original plus same-key mid-flight RPC callers receive typed 1003 while unrelated ClosureErrors retain their native error code.",
+      "obligation": "Every Git dispatch validates readiness/fencing. Mid-flight original and same-key waiter map to typed 1003 while unrelated ClosureErrors retain their own codes.",
       "status": "covered",
       "evidence": [
-        "bun /tmp/g022-gen5-r2-regression.ts: after-acquire left local/remote heads unchanged and after-commit retained committed-not-pushed evidence; both healthy recoveries completed exactly once.",
-        "bun /tmp/g022-gen6-r3-regression.ts: original/waiter each returned 1003 transcript_delivery_progress_write_failed; dirty index returned 1206 on original and retry, never 1003."
+        "Generation-5 probe: degraded after acquire made no Git effect; degraded after commit preserved committed-not-pushed state; production pause hooks stayed inert.",
+        "Generation-6 probe: original and waiter both returned 1003 transcript_delivery_progress_write_failed; dirty-index original and retry both returned 1206 corpus git index is dirty."
       ]
     },
     {
       "contractRef": "R3",
-      "obligation": "Closure lease/token receipts are attempt-scoped. Recovery may atomically replace only active lease evidence; immutable commit-graph evidence cannot regress; final output identifies the attempt that performed Git rather than a stale/released refusal receipt.",
+      "obligation": "Closure receipts are attempt-scoped: recovery atomically replaces only current lease/token evidence, immutable commit-graph evidence cannot regress, and final response identifies the Git-performing attempt rather than stale/refused receipt.",
       "status": "covered",
       "evidence": [
-        "bun /tmp/g022-gen6-r3-regression.ts: stale refusal receipt became invalid after shutdown, fresh receipt differed and was valid at after-push marker, marker response equaled final replay, and graph evidence remained immutable."
+        "bun /tmp/g023-gen6-r3-regression.ts: stale receipt invalid after exit, fresh receipt valid at after-push marker, marker response matched final replay, and graph evidence remained immutable."
       ]
     },
     {
       "contractRef": "R4",
-      "obligation": "A durable accepted owner-DM starts one per-channel typing keepalive: initial acknowledgement plus 8-second refreshes until confirmed Discord delivery, a ten-minute cap, non-fatal refresh failures, clean teardown, and no typing for rejected/fenced ingress. Concurrent admissions on one channel share cadence and extend cap.",
+      "obligation": "A durable accepted owner-DM starts a single per-channel typing keepalive at 8-second cadence until confirmed delivery, bounded by a ten-minute cap, with non-fatal tick failures, clean teardown, and zero typing for rejected/fenced ingress. Overlap shares cadence and extends the cap.",
       "status": "covered",
       "evidence": [
-        "bun /tmp/g022-discord-red-team.ts: slow real external turn typed at 1000/9000/17000/25000/33000 then stopped at confirmed outbox delivery; an extra 32 seconds produced no new typing.",
-        "The same probe observed zero acknowledgement attempts and zero timers for rejected and 1003-fenced admission, timer count 0 after adapter stop, transient typing failure followed by resumed tick at 17000, and overlapping accepted admissions with exactly one timer / 75 refreshes through 601000 before extended cap teardown.",
-        "bun test test/integration/discord.test.ts test/integration/discord-platform.test.ts: 15 passed / 144 assertions."
+        "bun /tmp/g023-gen7-r4-regression.ts: real slow accepted turn typed at 1000/9000/17000/25000/33000 and stopped on confirmed delivery; rejected/fenced ingress had zero acknowledgement attempts; temporary failure resumed; channel overlap used one refresh plus one cap timer and capped cleanly.",
+        "bun test test/integration/discord.test.ts test/integration/discord-platform.test.ts: 19 passed / 164 assertions."
       ]
     },
     {
       "contractRef": "R5",
-      "obligation": "The G013 live Discord drill is captured with strict read-only evidence: owner UDS assistant/delivery-gap/cursor rows, Discord DM REST history timing, and no-duplicate restart checkpoint evidence without mutating the deployment.",
+      "obligation": "G013 live-drill receipt remains strict read-only evidence for owner UDS assistant/delivery-gap/cursor facts plus Discord DM timing and checkpoint/no-duplicate observation.",
       "status": "covered",
       "evidence": [
-        "artifacts/g013-live-drill-receipt.md: live UDS way.status plus main.events.read returned assistant_message seq 845/848/850/853, delivery gaps 843/844/846/851/852, journal head 1:896, and gajaeway-discord cursor 1:853.",
-        "The receipt records one read-only Discord GET with 17 rows / 7 bot messages and the requested 03:51:31Z and 03:52:33Z owner timing plus 03:52:11Z / 03:52:18Z / 03:53:21Z bot rows; content is digested rather than stored.",
-        "The receipt expressly scopes the restart evidence: current 7-post history and cursor corroborate the stated checkpoint-resume outcome; QA did not restart the live adapter because that would violate the read-only constraint."
+        "artifacts/g013-live-drill-receipt.md remains the durable Generation-7 capture: assistant_message seq 845/848/850/853, delivery gaps 843/844/846/851/852, journal head 1:896, and gajaeway-discord cursor 1:853.",
+        "It records the one read-only Discord history GET's 17 rows / 7 bot rows plus requested owner and bot timing rows. Generation 8 re-bound provenance only; no live socket, state directory, adapter, Discord send, typing, reaction, or token was touched."
+      ]
+    },
+    {
+      "contractRef": "R6",
+      "obligation": "Typing stop is causal to the latest accepted admission boundary; stale/malformed boundaries retain safely until cap. At most one refresh is in flight per channel; stop and cap prevent post-dispose scheduling or reporting even when a typing POST never settles.",
+      "status": "covered",
+      "evidence": [
+        "bun /tmp/g023-r6-red-team.ts: a held older assistant delivery at cursor 1:2 did not stop a later accepted owner turn; a strictly later same-generation reply did stop it. Typing attempts continued 1000 then 9000 after the old delivery, then timer count became zero only on the later delivery.",
+        "The same probe supplied malformed and stale-generation head cursors; manual delivery did not stop typing, one refresh still occurred, and the dedicated cap cleared all timers at the ten-minute boundary.",
+        "It held one ackTyping request through five additional deadline crossings without fan-out; resolving restored exactly one refresh plus one cap. Adapter stop during pending request and cap during never-settling request both left zero timers and zero late error reports."
       ]
     },
     {
       "contractRef": "B1",
-      "obligation": "Pending-proof promotion atomically binds proof and emits a visible transcript_delivery_gap rather than silently baselining a post-commit suffix.",
+      "obligation": "Pending-proof promotion atomically records visible transcript_delivery_gap rather than silently baselining a post-commit suffix.",
       "status": "covered",
       "evidence": [
-        "bun /tmp/g022-gen3-gen4-regression-probes.ts: proof=proven, gapCount=1, journal kind transcript_delivery_gap, adoption=pending_proof_promotion."
+        "bun /tmp/g023-gen3-gen4-regression-probes.ts: proof=proven, gapCount=1, journal kind transcript_delivery_gap, adoption=pending_proof_promotion."
       ]
     },
     {
       "contractRef": "B2",
-      "obligation": "Transcript projection failure fences main.submit and main.corpus.close before broker or Git effect.",
+      "obligation": "Transcript-projection failure fences main.submit and main.corpus.close before broker or Git effect.",
       "status": "covered",
       "evidence": [
-        "bun /tmp/g022-gen3-gen4-regression-probes.ts: both returned 1003 transcript_delivery_progress_write_failed with no extra broker command, closure claim, commit, or push."
+        "Current-hash Generation-3/4 probe: both mutations returned 1003 transcript_delivery_progress_write_failed with no resend, closure claim, commit, or push."
       ]
     },
     {
       "contractRef": "C1",
-      "obligation": "Null or missing current-schema transcript_proof fails closed at read time rather than being inferred from main identity.",
+      "obligation": "Null or missing current-schema transcript proof fails closed at read time instead of being inferred from main identity.",
       "status": "covered",
       "evidence": [
-        "bun /tmp/g022-gen3-gen4-regression-probes.ts: raw SQLite null and removed-key cases reached failed_closed/metadata_invalid over UDS and exited 78."
+        "Current-hash Generation-3/4 raw SQLite probes: null and deleted key both exposed failed_closed/metadata_invalid over UDS and exited 78."
       ]
     },
     {
       "contractRef": "C2",
-      "obligation": "journalAppendTranscriptProjection is mandatory; no split journal/delivery fallback exists.",
+      "obligation": "journalAppendTranscriptProjection is mandatory; there is no split journal/delivery fallback.",
       "status": "covered",
       "evidence": [
-        "bun /tmp/g022-gen3-gen4-regression-probes.ts: a host lacking the method failed transcript_projection_journal_unavailable before broker commands/admission attempts; injected failure retained delivery at transcript:2."
+        "Current-hash probe: missing projection journal failed transcript_projection_journal_unavailable before broker commands/admission attempts; fault retained delivery at transcript:2."
       ]
     },
     {
       "contractRef": "C3",
-      "obligation": "Admission disposition abandons only definitive broker rejection and retains/fences ambiguous acceptance without resend until terminal evidence settles it.",
+      "obligation": "Only definitive broker rejection abandons an admission claim; ambiguous acceptance stays fenced without resend until terminal evidence settles it.",
       "status": "covered",
       "evidence": [
-        "bun /tmp/g022-gen3-gen4-regression-probes.ts: definitive pendingClaims=0 before retry; ambiguous replay=1003 admission_recovery_pending with one command until terminal settlement."
+        "Current-hash probe: definitive pendingClaims=0 before retry; ambiguous replay=1003 admission_recovery_pending with attempts=1/commands=1 until settlement."
       ]
     },
     {
       "contractRef": "C4",
-      "obligation": "Discord acknowledgement budget starts at observed durable main.submit acceptance; delayed success types and failed admission does not.",
+      "obligation": "Discord acknowledgement budget starts at observed durable acceptance; failed admission produces no acknowledgement.",
       "status": "covered",
       "evidence": [
-        "bun /tmp/g022-gen3-gen4-regression-probes.ts: inbound=1000, observed acceptance=3501, typing acknowledgement=3501, and no added acknowledgement after failed admission."
+        "Current-hash probe: inbound=1000, observed acceptance=3501, typing acknowledgement=3501, and acknowledgement count unchanged after failed admission."
       ]
     },
     {
       "contractRef": "C5",
-      "obligation": "Injected recovery faults retain no-resend/no-silent-progress safety and publish expected fence, degraded, or FAILED_CLOSED states.",
+      "obligation": "Injected recovery faults retain no-resend/no-silent-progress safety and publish expected fence, degraded, or FAILED_CLOSED state.",
       "status": "covered",
       "evidence": [
-        "bun test test/unit/main-session.test.ts: 33 passed / 111 assertions; bun test test/qa/recovery-fail-closed.test.ts: 9 passed / 113 assertions.",
-        "bun /tmp/g022-gen3-gen4-regression-probes.ts: projection fault left delivery before assistant output and fenced both mutations."
+        "Current-hash Generation-3/4 probe: projection failure retained delivery before assistant output and fenced both mutation effects; proof and recovery ambiguity cases passed 7/0."
       ]
     }
   ],
@@ -279,14 +259,13 @@
     {
       "surface": "api",
       "invocations": [
-        "bun /tmp/g022-discord-red-team.ts",
-        "bun /tmp/g022-gen3-gen4-regression-probes.ts",
-        "bun /tmp/g022-gen5-r2-regression.ts",
-        "bun /tmp/g022-gen6-r3-regression.ts",
-        "bun /tmp/g022-live-uds-read.ts",
-        "read-only Discord REST GET"
+        "bun /tmp/g023-r6-red-team.ts",
+        "bun /tmp/g023-gen3-gen4-regression-probes.ts",
+        "bun /tmp/g023-gen5-r2-regression.ts",
+        "bun /tmp/g023-gen6-r3-regression.ts",
+        "bun /tmp/g023-gen7-r4-regression.ts"
       ],
-      "observed": "Local real owner-UDS/fixture exercises covered typing keepalive lifecycle, deterministic nonce retry/restart dedupe, heartbeat/resume, proof and closure safety. The separate strictly read-only live audit captured healthy/running status, assistant event seq 845/848/850/853, delivery gaps, Discord consumer cursor 1:853, 7 bot history posts, and requested timing rows without invoking a mutable UDS or REST method.",
+      "observed": "Real local owner-UDS/fixture paths exercised causal typing ownership, malformed/stale boundary retention, deferred-refresh serialization, cap behavior, deterministic Discord egress nonce, heartbeat/resume, durable transcript proof, and Git closure safety. The G013 receipt is carried forward as explicitly unchanged read-only historical evidence; no live deployment call occurred in Generation 8.",
       "verdict": "passed"
     },
     {
@@ -297,177 +276,176 @@
         "./dist/gajaeway --help",
         "bun src/adapter/discord/main.ts --help",
         "./dist/gajaeway-discord --help",
-        "LC_ALL=C bun -e 'console.log(\"g022-cli-ok\")'",
+        "LC_ALL=C bun -e 'console.log(\"g023-cli-ok\")'",
         "bun test test/e2e/compiled-closure.test.ts",
         "bun test test/e2e/systemd.test.ts"
       ],
-      "observed": "Both fresh compiled binaries and their source entry points exposed matching help surfaces. Compile succeeded, 8 compiled e2e cases passed, and the replayExempt artifact preserves an audited PTY fallback for the compiled-GJC-runtime argv limitation while retaining deterministic safe replay evidence.",
+      "observed": "Fresh source and compiled main/Discord entry points matched their help surfaces. Compile succeeded and 8 compiled e2e cases passed. The cli-replay artifact preserves replayExempt with a current raw-PTY fallback for compiled-GJC argv limitations while retaining deterministic safe replay output.",
       "verdict": "passed"
     },
     {
       "surface": "tui",
       "invocations": [
-        "bun /tmp/g022-console-transcript.ts",
-        "bun test test/integration/console.test.ts"
+        "bun /tmp/g023-console-transcript.ts"
       ],
-      "observed": "Fresh raw-TTY harness against a real external-host UDS gateway produced 14 writes. Regenerated capture has 14,216 bytes, 358 ESC bytes, alternate-screen enter/exit, Delivered as: prompt, and Assistant:; console integration passed 24 cases.",
+      "observed": "Fresh raw-TTY harness against a real external-host UDS gateway generated 14 writes. The regenerated capture has 14,216 bytes and 358 ESC bytes, alternate-screen enter/exit, Delivered as: prompt, and Assistant:.",
       "verdict": "passed"
     }
   ],
   "adversarialCases": [
     {
-      "scenario": "Hold a real accepted external owner turn while advancing the keepalive clock through four 8-second refresh intervals, then confirm Discord outbox delivery.",
-      "expectedBehavior": "Immediate typing plus 8-second cadence until confirmed delivery; no ticks afterward.",
-      "observed": "ack times=[1000,9000,17000,25000,33000]; confirmed delivery cleared timer; +32 seconds left acknowledgement count at 5.",
+      "scenario": "Hold an older assistant Discord send, then accept a newer owner admission before releasing the old send.",
+      "expectedBehavior": "Older/equal delivery cannot stop current typing; strictly later same-generation delivery can.",
+      "observed": "Old cursor=1:2, typing attempts continued at 1000 and 9000, and two timers remained; later assistant reply cleared both timers and no extra typing appeared after +32 seconds.",
       "verdict": "passed"
     },
     {
-      "scenario": "Submit rejected and 1003-fenced Discord ingress.",
-      "expectedBehavior": "Neither result may cause typing or a keepalive timer.",
-      "observed": "Both had acknowledgementAttempts=0, acknowledgements=0, and scheduledTimers=0.",
+      "scenario": "Return malformed journal boundary after durable acceptance and deliver an assistant message.",
+      "expectedBehavior": "No causal proof means conservative typing retention until cap.",
+      "observed": "Manual delivery did not stop typing; one 8-second refresh occurred; cap cleared timers and no later tick occurred.",
       "verdict": "passed"
     },
     {
-      "scenario": "Stop adapter while typing timer is scheduled.",
-      "expectedBehavior": "Stop clears timer and no later clock advance sends typing.",
-      "observed": "pending timer=1 before stop, 0 after stop, acknowledgement count remained 1 after +32 seconds.",
+      "scenario": "Return a stale-generation journal boundary after durable acceptance and deliver a current-generation assistant message.",
+      "expectedBehavior": "Generation mismatch cannot stop typing; cap remains final safety bound.",
+      "observed": "Manual current-generation delivery retained typing; cap cleared timers at ten minutes with no later tick.",
       "verdict": "passed"
     },
     {
-      "scenario": "Fail one mid-keepalive typing REST call.",
-      "expectedBehavior": "Failure is reported non-fatally and a later scheduled tick resumes.",
-      "observed": "attempts=[1000,9000,17000], successful acknowledgements=[1000,17000], one error report, timer remained scheduled.",
+      "scenario": "Hold ackTyping through five additional refresh deadlines.",
+      "expectedBehavior": "At most one in-flight request, no fan-out, then exactly one normal refresh schedule after settlement.",
+      "observed": "attempts=2, pending=1, timers=1 across deadline crossings; resolving produced refresh+cap timers and exactly one subsequent request.",
       "verdict": "passed"
     },
     {
-      "scenario": "Overlap two accepted admissions on one channel.",
-      "expectedBehavior": "One shared cadence/timer; second admission extends cap rather than multiplies ticks.",
-      "observed": "initial=[1000,5000], one timer, 75 refreshes 9000 through 601000, timer count 0 at extended cap.",
+      "scenario": "Stop adapter while a deferred typing POST is pending, then reject it afterward.",
+      "expectedBehavior": "No post-dispose schedule and no error report.",
+      "observed": "timersAfterStop=0, attempts remained 2, late rejection generated zero error reports.",
       "verdict": "passed"
     },
     {
-      "scenario": "Abort after Discord send but before consumer commit, then create a new outbox consumer instance after claim expiry.",
-      "expectedBehavior": "Same event uses identical <=25-character wire nonce and fixture dedupes to one post; durable checkpoint resumes.",
-      "observed": "nonce=598a493c86550c69863037ac (24 hex); attempt 1 duplicate=false and retry duplicate=true returned same post id; one published post for first event; cursor settled after restart.",
+      "scenario": "Let a typing POST never settle until the cap deadline.",
+      "expectedBehavior": "Dedicated cap fires independently, clears timers, and late completion cannot reschedule/report.",
+      "observed": "attemptsAtCap=2, pendingAtCap=1, timersAfterCap=0, late rejection emitted zero reports and no timer.",
       "verdict": "passed"
     },
     {
-      "scenario": "Publish a distinct assistant journal event after nonce replay.",
-      "expectedBehavior": "Distinct event derives a distinct deterministic nonce and gets its own post.",
-      "observed": "second nonce=82f92b6d61a00424854d8fc3, distinct from retry nonce; total published posts=2.",
+      "scenario": "Test nonce purity for long durable key and distinct successor key.",
+      "expectedBehavior": "Exactly 24 lowercase hex characters, deterministic for same key, distinct observed value for another key, and no raw durable key embedding.",
+      "observed": "first=be16f39680da582beb521939, second=8cea47d612343af52de03a31, each 24 hex, deterministic=true, distinct=true.",
       "verdict": "passed"
     },
     {
-      "scenario": "Delay first Discord heartbeat ACK about 40ms before READY then force reconnect.",
-      "expectedBehavior": "No premature pre-READY close; reconnect sends RESUME with saved session and sequence.",
-      "observed": "preReadyCloseCount=0, immediateHeartbeatCount=1, RESUME session_id=g022-session seq=42, resumedCloseCountBeforeAdapterStop=0.",
+      "scenario": "Slow accepted turn, rejected/fenced ingress, stop, transient failure, and overlapping owner admissions.",
+      "expectedBehavior": "Generation-7 typing contract remains intact after R6 changes.",
+      "observed": "Generation-7 regression 3/0: slow cadence stopped on delivery; rejected/fenced had zero typing; stop cleared timer; failure recovered; overlap used shared cadence/cap.",
       "verdict": "passed"
     },
     {
-      "scenario": "Read the live UDS only with way.status and main.events.read.",
-      "expectedBehavior": "Capture requested assistant/gap/checkpoint facts without changing live session state.",
-      "observed": "healthy/running, assistant seq 845/848/850/853, gaps 843/844/846/851/852, head=1:896, discord cursor=1:853.",
+      "scenario": "Outbox crash after send before checkpoint then restart, plus distinct subsequent event.",
+      "expectedBehavior": "Same event uses one deterministic nonce and dedupes; distinct event has distinct nonce.",
+      "observed": "Generation-7 regression retained one first-event post across retry and separate second nonce/post.",
       "verdict": "passed"
     },
     {
-      "scenario": "Read Discord DM history using one authorized GET only.",
-      "expectedBehavior": "Capture timing and no-duplicate evidence without message mutation or credential disclosure.",
-      "observed": "17 returned rows / 7 bot rows; requested owner UTC rows and bot answer UTC rows were present; content retained as hashes/lengths only.",
+      "scenario": "Latent first heartbeat ACK then reconnect/resume.",
+      "expectedBehavior": "No pre-READY close; RESUME retains session and sequence.",
+      "observed": "Generation-7 regression observed preReadyCloseCount=0, one immediate heartbeat, and RESUME sequence=42.",
       "verdict": "passed"
     },
     {
-      "scenario": "Pending-proof promotion and projection fault mutation fence.",
-      "expectedBehavior": "Visible gap on promotion; no silent progress/resend after projection failure.",
+      "scenario": "Pending-proof promotion and transcript projection failure mutation fence.",
+      "expectedBehavior": "Visible promotion gap; no silent progress/resend after projection failure.",
       "observed": "Current-hash Generation-3/4 probe passed B1/B2/C2/C5 cases.",
       "verdict": "passed"
     },
     {
-      "scenario": "Current-schema proof null/missing, missing atomic journal, and broker disposition ambiguity.",
+      "scenario": "Null/missing proof, missing atomic projection journal, and broker disposition ambiguity.",
       "expectedBehavior": "Fail closed / no fallback / no resend.",
-      "observed": "Current-hash Generation-3/4 probe passed C1/C2/C3 cases.",
+      "observed": "Current-hash Generation-3/4 probe passed C1/C2/C3/C4 cases.",
       "verdict": "passed"
     },
     {
-      "scenario": "Gen5/6 readiness, receipt, and mid-flight waiter regression.",
-      "expectedBehavior": "No Git effect when fenced, exact-once recovery, current receipt only, and genuine errors preserved.",
-      "observed": "g022 Gen5 4/0 and Gen6 3/0 probes passed.",
+      "scenario": "Generation-5/6 closure readiness, receipt, and mid-flight waiter regression.",
+      "expectedBehavior": "No forbidden Git effect when fenced, exactly-once recovery, current receipt only, and genuine errors preserved.",
+      "observed": "Generation-5=4 passed; Generation-6=3 passed.",
       "verdict": "passed"
     },
     {
-      "scenario": "Rebuild compiled binaries and execute closure/systemd plus console paths.",
-      "expectedBehavior": "Current source reaches dist and preserves compiled/TUI behavior.",
-      "observed": "Build passed; compiled closure/systemd=8 cases; console integration=24 cases; raw PTY capture regenerated.",
+      "scenario": "Rebuild compiled binaries, run compiled closure/systemd, and regenerate console PTY evidence.",
+      "expectedBehavior": "Current source reaches dist and compiled/TUI behavior remains intact.",
+      "observed": "Build passed; compiled e2e=8 cases; raw PTY capture regenerated and structurally validated.",
       "verdict": "passed"
     }
   ],
   "probes": [
     {
-      "contract": "R4 typing lifecycle",
-      "invocation": "bun /tmp/g022-discord-red-team.ts :: typing-keepalive-adversaries-across-delivery-fence-stop-failure-and-overlap",
-      "expected": "Durable acceptance gets one 8-second per-channel keepalive that ends on delivery and stays robust under adverse conditions.",
-      "observed": "All slow-reply, rejected/fenced, stop, failure, and overlap assertions passed.",
+      "contract": "R6 causal delivery boundary",
+      "invocation": "bun /tmp/g023-r6-red-team.ts :: causal-old-delivery-cannot-stop-newer-admission-but-strictly-later-reply-can",
+      "expected": "Only strictly later same-generation delivery stops current typing.",
+      "observed": "Older cursor 1:2 retained typing through 9000; later reply cleared timers=0.",
       "verdict": "passed"
     },
     {
-      "contract": "Discord wire nonce",
-      "invocation": "bun /tmp/g022-discord-red-team.ts :: deterministic-24hex-wire-nonce-survives-retry-and-outbox-restart-with-distinct-event-separation",
-      "expected": "Replay retains one 24-hex nonce; a distinct event differs.",
-      "observed": "Same nonce repeated and fixture deduped; distinct second nonce/post occurred.",
+      "contract": "R6 conservative malformed/stale boundary",
+      "invocation": "bun /tmp/g023-r6-red-team.ts :: malformed-and-stale-generation-boundaries-retain-typing-until-independent-cap",
+      "expected": "Unprovable causality retains typing until cap.",
+      "observed": "Both malformed and stale-generation cases refreshed once, then cap cleared timer count to zero.",
       "verdict": "passed"
     },
     {
-      "contract": "Discord heartbeat ordering",
-      "invocation": "bun /tmp/g022-discord-red-team.ts :: latent-heartbeat-ack-preserves-pre-ready-socket-and-reconnect-resumes-identity",
-      "expected": "40ms ACK latency cannot kill pre-READY connection; reconnect preserves session/sequence.",
-      "observed": "No pre-READY or pre-stop RESUMED close; RESUME session_id=g022-session seq=42.",
+      "contract": "R6 one in-flight refresh and independent cap",
+      "invocation": "bun /tmp/g023-r6-red-team.ts :: single-inflight-refresh-stop-during-request-and-independent-cap-under-never-settling-post",
+      "expected": "No fan-out, no post-stop side effect, cap stops unresolved POST ownership.",
+      "observed": "Deferred fan-out stayed attempts=2/pending=1; stop and cap cases each had timers=0 and zero late reports.",
       "verdict": "passed"
     },
     {
-      "contract": "R5 live UDS receipt",
-      "invocation": "bun /tmp/g022-live-uds-read.ts",
-      "expected": "Read-only live assistant/gap/cursor evidence.",
-      "observed": "4 requested assistant events, 5 gaps, cursor 1:853, no mutable method.",
+      "contract": "Generation-7 typing, nonce, heartbeat regression",
+      "invocation": "bun /tmp/g023-gen7-r4-regression.ts",
+      "expected": "Prior keepalive, deterministic retry nonce, and heartbeat/resume contracts survive R6.",
+      "observed": "3 probes passed; 0 failed.",
       "verdict": "passed"
     },
     {
-      "contract": "R5 Discord REST receipt",
-      "invocation": "read-only GET /channels/1468535438498336923/messages?limit=100",
-      "expected": "Requested DM timing and no-duplicate history evidence with no secret persistence.",
-      "observed": "17 messages / 7 bot messages; requested timestamps present; no token in artifacts.",
-      "verdict": "passed"
-    },
-    {
-      "contract": "Generation-3/4 spot check",
-      "invocation": "bun /tmp/g022-gen3-gen4-regression-probes.ts",
+      "contract": "Generation-3/4 durable projection and admission spot check",
+      "invocation": "bun /tmp/g023-gen3-gen4-regression-probes.ts",
       "expected": "B1/B2/C1/C2/C3/C4 durable behaviors remain true.",
       "observed": "7 probes passed; 0 failed.",
       "verdict": "passed"
     },
     {
-      "contract": "Generation-5 spot check",
-      "invocation": "bun /tmp/g022-gen5-r2-regression.ts",
-      "expected": "Git dispatch readiness and non-test hooks remain correct.",
+      "contract": "Generation-5 Git readiness spot check",
+      "invocation": "bun /tmp/g023-gen5-r2-regression.ts",
+      "expected": "Per-dispatch readiness and production hook scope remain correct.",
       "observed": "4 probes passed; 0 failed.",
       "verdict": "passed"
     },
     {
-      "contract": "Generation-6 spot check",
-      "invocation": "bun /tmp/g022-gen6-r3-regression.ts",
+      "contract": "Generation-6 receipt/mid-flight spot check",
+      "invocation": "bun /tmp/g023-gen6-r3-regression.ts",
       "expected": "Attempt receipt integrity and original/waiter readiness behavior remain correct.",
       "observed": "3 probes passed; 0 failed.",
       "verdict": "passed"
     },
     {
+      "contract": "Affected Discord suite",
+      "invocation": "bun test test/integration/discord.test.ts test/integration/discord-platform.test.ts",
+      "expected": "Committed R6 and platform behavior pass their focused test contracts.",
+      "observed": "19 cases / 164 expectations passed.",
+      "verdict": "passed"
+    },
+    {
       "contract": "Rebuilt compiled topology",
       "invocation": "bun scripts/compile.ts; bun test test/e2e/compiled-closure.test.ts; bun test test/e2e/systemd.test.ts",
-      "expected": "Current source is present in dist and retains compiled behavior.",
+      "expected": "Current source is present in dist and preserves compiled behavior.",
       "observed": "Build passed; 8 compiled e2e cases passed.",
       "verdict": "passed"
     },
     {
-      "contract": "Console PTY fallback",
-      "invocation": "bun /tmp/g022-console-transcript.ts",
-      "expected": "Raw terminal capture shows lifecycle plus accepted/finalized owner interaction.",
+      "contract": "Console PTY replay fallback",
+      "invocation": "bun /tmp/g023-console-transcript.ts",
+      "expected": "Raw terminal evidence includes lifecycle plus accepted/finalized owner interaction.",
       "observed": "14 writes, 358 ESC bytes, alternate-screen enter/exit, Delivered as: prompt, Assistant:.",
       "verdict": "passed"
     }
@@ -476,13 +454,13 @@
     {
       "path": "artifacts/g017-qa-api-report.json",
       "kind": "api-package-test-report",
-      "sourceHash": "sha256:6662f76506c49aa1aa778e6bd567bc83ac06ea767e722923cd7c10a09d42fb66",
+      "sourceHash": "sha256:3aae219ca87b14ee16f005209a6cb377dc2fe76aedae7c2008c1dc6ed1efde8d",
       "verified": true
     },
     {
       "path": "artifacts/g017-cli-replay.json",
       "kind": "cli-replay",
-      "sourceHash": "sha256:6662f76506c49aa1aa778e6bd567bc83ac06ea767e722923cd7c10a09d42fb66",
+      "sourceHash": "sha256:3aae219ca87b14ee16f005209a6cb377dc2fe76aedae7c2008c1dc6ed1efde8d",
       "verified": true,
       "replayExempt": true,
       "fallbackPath": "artifacts/g017-console-pty-capture.txt"
@@ -490,7 +468,7 @@
     {
       "path": "artifacts/g017-console-pty-capture.txt",
       "kind": "raw-console-pty-capture",
-      "sourceHash": "sha256:6662f76506c49aa1aa778e6bd567bc83ac06ea767e722923cd7c10a09d42fb66",
+      "sourceHash": "sha256:3aae219ca87b14ee16f005209a6cb377dc2fe76aedae7c2008c1dc6ed1efde8d",
       "verified": true,
       "bytes": 14216,
       "escapeBytes": 358
@@ -498,8 +476,9 @@
     {
       "path": "artifacts/g013-live-drill-receipt.md",
       "kind": "live-readonly-drill-receipt",
-      "sourceHash": "sha256:6662f76506c49aa1aa778e6bd567bc83ac06ea767e722923cd7c10a09d42fb66",
+      "sourceHash": "sha256:3aae219ca87b14ee16f005209a6cb377dc2fe76aedae7c2008c1dc6ed1efde8d",
       "verified": true,
+      "reboundOnly": true,
       "liveSocketMutated": false,
       "discordMutationRequests": 0,
       "tokenPersisted": false
@@ -507,12 +486,13 @@
   ],
   "liveDrillReceipt": {
     "path": "artifacts/g013-live-drill-receipt.md",
-    "readOnlyMethods": ["way.status", "main.events.read", "GET /channels/1468535438498336923/messages?limit=100"],
+    "generation8EvidenceMode": "provenance rebind and structural validation only; live gateway was not re-contacted because recorded facts are unchanged and scope remains strictly read-only",
+    "originalReadOnlyMethods": ["way.status", "main.events.read", "GET /channels/1468535438498336923/messages?limit=100"],
     "assistantEventSeqs": [845, 848, 850, 853],
     "deliveryGapSeqs": [843, 844, 846, 851, 852],
     "discordConsumerCursor": "1:853",
     "discordBotHistoryCount": 7,
-    "restartEvidenceScope": "Read-only post-drill count/checkpoint corroboration; QA did not restart the live adapter because restart would violate scope."
+    "restartEvidenceScope": "Read-only post-drill count/checkpoint corroboration. QA did not restart the live adapter because restart would violate the strict read-only constraint."
   },
   "blockers": []
 }

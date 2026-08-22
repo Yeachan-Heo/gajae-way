@@ -112,15 +112,26 @@ externalTest("main.submit admits a held external turn before the bridge timeout"
 		{ timeoutMs: 1_000 },
 	);
 
-	const opRef = (response.result as { op_ref: string }).op_ref;
+	const admission = response.result as { op_ref: string; journal_head_cursor?: unknown };
+	const opRef = admission.op_ref;
+	const boundary = admission.journal_head_cursor;
+	if (typeof boundary !== "string") throw new Error("main.submit acceptance omitted its journal head cursor");
+	const boundaryMatch = /^(\d+):(\d+)$/.exec(boundary);
+	if (!boundaryMatch) throw new Error("main.submit acceptance returned an invalid journal head cursor");
+
 	expect(response.error).toBeUndefined();
-	expect(response.result).toMatchObject({ accepted: true, delivered_as: "prompt" });
+	expect(response.result).toMatchObject({ accepted: true, delivered_as: "prompt", journal_head_cursor: expect.stringMatching(/^\d+:\d+$/) });
 	expect(opRef).toEqual(expect.any(String));
 	expect(gateway.fixture.commands()).toEqual([expect.objectContaining({ operation: "turn.prompt", text: "held owner prompt" })]);
 	expect(gateway.core.rpcBridgeStats().timeouts).toBe(0);
 	expect(gateway.core.journalRead("1:0", 100).events.filter(event => event.kind === "assistant_message")).toEqual([]);
 	const busyStatus = await waitForBusyStatus(gateway);
 	expect(busyStatus.result).toMatchObject({ turn_state: "busy" });
+	const turnStart = await eventually(
+		() => gateway.core.journalRead("1:0", 100).events.find(event => event.kind === "turn_start"),
+		"held main.submit did not journal a turn_start event",
+	);
+	expect(BigInt(turnStart.seq)).toBeGreaterThan(BigInt(boundaryMatch[2] as string));
 	await settleHeld(gateway, opRef, "settled after bridge timing assertion");
 
 });
@@ -545,7 +556,13 @@ externalTest("main.submit preserves an ambiguous post-acceptance claim for recon
 			gateway.profile,
 			gateway.core,
 		)(request);
-		expect(replay).toEqual({ accepted: true, op_ref: intent.op_ref, delivered_as: intent.delivered_as });
+		expect(replay).toMatchObject({
+			accepted: true,
+			op_ref: intent.op_ref,
+			delivered_as: intent.delivered_as,
+			journal_head_cursor: expect.stringMatching(/^\d+:\d+$/),
+		});
+
 		expect(gateway.core.mainAdmissionOperationsPending()).toEqual([]);
 		expect(gateway.fixture.commands().filter(command => command.operation === "turn.prompt" && command.text === request.text)).toHaveLength(1);
 	} finally {
@@ -650,7 +667,12 @@ externalTest("terminal tail evidence finalizes fast same-process lost-receipt cl
 		expect(commands).toHaveLength(1);
 		if (typeof commands[0]?.opRef !== "string") throw new Error("fast same-process lost-receipt admission did not retain its operation reference");
 		const replay = await gateway.client.request("main.submit", request);
-		expect(replay.result).toEqual({ accepted: true, op_ref: commands[0].opRef, delivered_as: "prompt" });
+		expect(replay.result).toMatchObject({
+			accepted: true,
+			op_ref: commands[0].opRef,
+			delivered_as: "prompt",
+			journal_head_cursor: expect.stringMatching(/^\d+:\d+$/),
+		});
 		expect(gateway.fixture.commands().filter(command => command.operation === "turn.prompt" && command.text === request.text)).toHaveLength(1);
 	};
 

@@ -193,6 +193,7 @@ export interface WayCoreHandle {
 		nextCursor: string;
 		gap?: { missingFrom: string; missingTo: string; resyncCursor: string };
 	};
+	journalHeadCursor(): string;
 	consumerClaim(consumerId: string, claimTtlMs?: number): { claimId: string; cursor: string; expiresAt: number };
 	consumerCommit(input: {
 		consumerId: string;

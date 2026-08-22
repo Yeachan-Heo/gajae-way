@@ -13,7 +13,8 @@ export interface DiscordRouteHandlerOptions {
 	readonly rpc: JsonRpcClient;
 	readonly platform: DiscordPlatform;
 	readonly acknowledgement?: DiscordAcknowledgementOptions;
-	onAccepted?(message: DiscordMessage): void;
+	onAccepted?(message: DiscordMessage, journalHeadCursor: unknown): void;
+
 	onAcknowledged?(acknowledgement: DiscordAcknowledgement): void;
 	onAcknowledgementFailed?(message: DiscordMessage): void;
 }
@@ -36,7 +37,7 @@ export class DiscordRouteHandler {
 	readonly #rpc: JsonRpcClient;
 	readonly #platform: DiscordPlatform;
 	readonly #acknowledgement: DiscordAcknowledgementOptions;
-	readonly #onAccepted: ((message: DiscordMessage) => void) | undefined;
+	readonly #onAccepted: ((message: DiscordMessage, journalHeadCursor: unknown) => void) | undefined;
 	readonly #onAcknowledged: ((acknowledgement: DiscordAcknowledgement) => void) | undefined;
 	readonly #onAcknowledgementFailed: ((message: DiscordMessage) => void) | undefined;
 	readonly #inFlight = new Map<string, Promise<boolean>>();
@@ -80,7 +81,7 @@ export class DiscordRouteHandler {
 		if (!isRecord(result) || result.accepted !== true) {
 			throw new DiscordRouteError("Gateway main.submit returned an invalid acceptance response.");
 		}
-		this.#onAccepted?.(message);
+		this.#onAccepted?.(message, result.journal_head_cursor);
 		let acknowledgement: DiscordAcknowledgement;
 		try {
 			acknowledgement = await acknowledgeDiscordMessage(this.#platform, message, this.#acknowledgement);

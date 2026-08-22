@@ -85,6 +85,8 @@ export declare class WayCore {
   lockClearQuarantine(verificationReceiptId: string, confirm: boolean): LockStatusOutput
   journalAppend(kind: string, payloadJson: string): JournalAppendOutput
   journalRead(cursor?: string | undefined | null, limit?: number | undefined | null): JournalReadOutput
+  /** Returns the current inclusive journal head for admission causal boundaries.  */
+  journalHeadCursor(): string
   consumerClaim(consumerId: string, claimTtlMs?: number | undefined | null): ConsumerClaimOutput
   consumerCommit(input: ConsumerCommitInput): ConsumerCommitOutput
   consumerCursor(consumerId: string): string | null
