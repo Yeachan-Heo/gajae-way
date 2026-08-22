@@ -235,6 +235,13 @@ export interface WayCoreHandle {
 		requestJson: string;
 		intentJson: string;
 	}): { claimed: boolean; responseJson?: string };
+	mainAdmissionOperationRecordAttemptIds(input: {
+		scope: string;
+		key: string;
+		requestJson: string;
+		intentJson: string;
+		attemptIdsJson: string;
+	}): void;
 	mainAdmissionOperationFinalize(input: {
 		scope: string;
 		key: string;
@@ -243,7 +250,7 @@ export interface WayCoreHandle {
 		responseJson: string;
 	}): { responseJson: string };
 	mainAdmissionOperationAbandon(input: { scope: string; key: string; requestJson: string; intentJson: string }): void;
-	mainAdmissionOperationsPending(): Array<{ scope: string; key: string; requestJson: string; intentJson: string }>;
+	mainAdmissionOperationsPending(): Array<{ scope: string; key: string; requestJson: string; intentJson: string; attemptIdsJson?: string }>;
 }
 
 export interface WayCoreConstructor {

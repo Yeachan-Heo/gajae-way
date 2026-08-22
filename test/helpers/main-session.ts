@@ -133,6 +133,8 @@ interface FixtureSession {
 	clearRetentionGapAfterTail?: boolean;
 	unavailableQueries?: string[];
 	operationStatusUnavailable?: boolean;
+	tailUsesBrokerTurnId?: boolean;
+	tailTerminalOverride?: boolean;
 	commandLog: Array<Record<string, unknown>>;
 	admissionAttemptLog: Array<Record<string, unknown>>;
 }
@@ -316,6 +318,19 @@ export class FakeBrokerFixture {
 	forgetOperation(opRef: string): void {
 		this.update(session => {
 			delete session.operations[opRef];
+		});
+	}
+
+	useBrokerTurnIdForTail(enabled = true): void {
+		this.update(session => {
+			session.tailUsesBrokerTurnId = enabled;
+		});
+	}
+
+	setTailTerminalOverride(terminal: boolean | undefined): void {
+		this.update(session => {
+			if (terminal === undefined) delete session.tailTerminalOverride;
+			else session.tailTerminalOverride = terminal;
 		});
 	}
 

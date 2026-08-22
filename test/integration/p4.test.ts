@@ -570,6 +570,41 @@ externalTest("main.submit preserves an ambiguous post-acceptance claim for recon
 	}
 });
 
+externalTest("a post-acceptance bridge error retains broker receipt linkage until nonterminal tail evidence finalizes its claim", async () => {
+	const gateway = await hosted({
+		afterBrokerAcceptedBeforeFinalize: () => {
+			throw new Error("forced bridge response failure after broker acceptance");
+		},
+	});
+	gateway.fixture.useBrokerTurnIdForTail();
+	gateway.fixture.setTailTerminalOverride(false);
+	gateway.fixture.holdNextTurn();
+	const request = { text: "receipt-linked terminal recovery", surface_id: "owner", idempotency_key: "receipt-linked-terminal" };
+	const interrupted = await gateway.client.request("main.submit", request);
+	expect(rpcError(interrupted)).toMatchObject({ code: -32603, message: "bridge_exception" });
+	const [pending] = gateway.core.mainAdmissionOperationsPending();
+	const intent = JSON.parse(pending?.intentJson ?? "{}") as { op_ref?: unknown };
+	if (typeof intent.op_ref !== "string") throw new Error("post-acceptance failure did not retain a durable operation reference");
+	const opRef = intent.op_ref;
+	const attemptIds = JSON.parse(pending?.attemptIdsJson ?? "null") as unknown;
+	expect(attemptIds).toEqual(expect.arrayContaining([`broker-turn-${opRef}`]));
+	gateway.fixture.complete(opRef, { text: "terminal evidence after response error" });
+	await eventually(
+		() => (gateway.core.mainAdmissionOperationsPending().length === 0 ? true : undefined),
+		"receipt-linked terminal evidence did not finalize the post-response-error claim",
+	);
+	const terminal = gateway.core.journalRead("1:0", 100).events.find(event => event.kind === "turn_end" && JSON.parse(event.payloadJson).attempt_id === `broker-turn-${opRef}`);
+	expect(terminal).toBeDefined();
+	const replay = await gateway.client.request("main.submit", request);
+	expect(replay.result).toMatchObject({ accepted: true, op_ref: opRef, delivered_as: "prompt", journal_head_cursor: expect.stringMatching(/^\d+:\d+$/) });
+	const conflict = await gateway.client.request("main.submit", {
+		...request,
+		text: "different same-key meaning must remain a conflict",
+	});
+	expect(rpcError(conflict)).toEqual(expect.objectContaining({ code: 1500, message: "idempotency_conflict" }));
+	expect(gateway.fixture.admissionAttempts().filter(attempt => attempt.opRef === opRef)).toHaveLength(1);
+});
+
 externalTest("an accepted operation with a lost receipt preserves growth authorization across restart without resend", async () => {
 	const gateway = await hosted({ tailTimeoutMs: 50 });
 	gateway.fixture.setNoEnvelopeWhileBusy();

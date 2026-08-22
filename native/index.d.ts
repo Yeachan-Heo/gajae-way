@@ -113,6 +113,8 @@ export declare class WayCore {
   closureOperationFinalize(input: ClosureOperationFinalizeInput): ClosureOperationFinalizeOutput
   /** Claims a main admission's durable broker operation intent before the broker send. */
   mainAdmissionOperationClaim(input: MainAdmissionOperationClaimInput): MainAdmissionOperationClaimOutput
+  /** Persists receipt-derived broker identifiers while this exact pre-effect claim remains pending. */
+  mainAdmissionOperationRecordAttemptIds(input: MainAdmissionOperationRecordAttemptIdsInput): void
   /** Finalizes a broker-accepted main admission without changing its operation reference. */
   mainAdmissionOperationFinalize(input: MainAdmissionOperationFinalizeInput): MainAdmissionOperationFinalizeOutput
   /** Atomically abandons a definitively broker-rejected pre-effect admission claim. */
@@ -377,6 +379,14 @@ export interface MainAdmissionOperationFinalizeOutput {
   responseJson: string
 }
 
+export interface MainAdmissionOperationRecordAttemptIdsInput {
+  scope: string
+  key: string
+  requestJson: string
+  intentJson: string
+  attemptIdsJson: string
+}
+
 export interface OutboxRowOutput {
   consumerId: string
   seq: string
@@ -390,6 +400,7 @@ export interface PendingMainAdmissionOperationOutput {
   key: string
   requestJson: string
   intentJson: string
+  attemptIdsJson?: string
 }
 
 export interface ProcessIdentityOutput {

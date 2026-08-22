@@ -103,7 +103,15 @@ function failBeforeMainHostForE2e(): void {
 }
 
 function failAfterMainAdmissionBrokerAcceptedForE2e(): void {
-	if (Bun.env.NODE_ENV === "test" && Bun.env.GAJAEWAY_E2E_FAIL_AFTER_MAIN_ADMISSION_BROKER_ACCEPTED === "1") {
+	if (Bun.env.NODE_ENV !== "test") return;
+	if (Bun.env.GAJAEWAY_E2E_FAIL_AFTER_MAIN_ADMISSION_BROKER_ACCEPTED === "1") process.exit(137);
+	if (Bun.env.GAJAEWAY_E2E_THROW_AFTER_MAIN_ADMISSION_BROKER_ACCEPTED === "1") {
+		throw new Error("forced main admission bridge response failure after broker acceptance");
+	}
+}
+
+function failAfterMainAdmissionTerminalEvidenceForE2e(): void {
+	if (Bun.env.NODE_ENV === "test" && Bun.env.GAJAEWAY_E2E_FAIL_AFTER_MAIN_ADMISSION_TERMINAL_EVIDENCE === "1") {
 		process.exit(137);
 	}
 }
@@ -1142,6 +1150,7 @@ async function serveWay(config: WayConfig): Promise<void> {
 			initialVerificationState: resumed.verificationState,
 			...(resumed.verificationTail === undefined ? {} : { verificationTail: resumed.verificationTail }),
 			...(resumed.growthIntent === undefined ? {} : { recoveredGrowthIntent: resumed.growthIntent }),
+			afterTerminalEvidenceBeforeAdmissionFinalize: failAfterMainAdmissionTerminalEvidenceForE2e,
 		});
 		host = resumedHost;
 		if (!verificationPending) core.setRpcHealth("running");

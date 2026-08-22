@@ -14,7 +14,7 @@ use std::{
 use rusqlite::{Connection, OptionalExtension, Transaction};
 
 pub const DATABASE_FILENAME: &str = "way-core.sqlite3";
-pub const SCHEMA_VERSION: u32 = 7;
+pub const SCHEMA_VERSION: u32 = 8;
 pub const IDEMPOTENCY_WINDOW_MS: i64 = 24 * 60 * 60 * 1_000;
 pub const CLOSURE_OPERATION_META_KEY: &str = "gitlock_closure_operation";
 
@@ -128,6 +128,7 @@ pub struct PendingMainAdmissionOperation {
     pub key: String,
     pub request_json: String,
     pub intent_json: String,
+    pub attempt_ids_json: Option<String>,
 }
 
 struct StoreInner {
@@ -421,6 +422,64 @@ impl Store {
         Ok(MainAdmissionOperationClaim::Claimed)
     }
 
+    /// Durably binds a pending claim to every receipt identifier that can label
+    /// its terminal broker-tail attempt. A later call must carry identical evidence.
+    pub fn record_main_admission_operation_attempt_ids(
+        &self,
+        scope: &str,
+        key: &str,
+        request_json: &str,
+        intent_json: &str,
+        attempt_ids_json: &str,
+    ) -> StoreResult<()> {
+        let mut connection = self.connection()?;
+        let transaction = connection.transaction()?;
+        let existing = transaction
+            .query_row(
+                "SELECT request_json, response_json FROM idempotency WHERE scope = ?1 AND idempotency_key = ?2",
+                rusqlite::params![scope, key],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            )
+            .optional()?;
+        let Some((stored_request, stored_response)) = existing else {
+            return Err(StoreError::MainAdmissionOperationMissing);
+        };
+        if stored_request != request_json {
+            return Err(StoreError::IdempotencyConflict);
+        }
+        if stored_response != intent_json {
+            transaction.commit()?;
+            return Ok(());
+        }
+        let operation = transaction
+            .query_row(
+                "SELECT intent_json, attempt_ids_json FROM main_admission_operations WHERE scope = ?1 AND idempotency_key = ?2",
+                rusqlite::params![scope, key],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?)),
+            )
+            .optional()?;
+        let Some((stored_intent, stored_attempt_ids)) = operation else {
+            return Err(StoreError::MainAdmissionOperationMissing);
+        };
+        if stored_intent != intent_json {
+            return Err(StoreError::MainAdmissionOperationChanged);
+        }
+        match stored_attempt_ids {
+            Some(existing_attempt_ids) if existing_attempt_ids != attempt_ids_json => {
+                return Err(StoreError::MainAdmissionOperationChanged);
+            }
+            Some(_) => {}
+            None => {
+                transaction.execute(
+                    "UPDATE main_admission_operations SET attempt_ids_json = ?1 WHERE scope = ?2 AND idempotency_key = ?3",
+                    rusqlite::params![attempt_ids_json, scope, key],
+                )?;
+            }
+        }
+        transaction.commit()?;
+        Ok(())
+    }
+
     /// Atomically replaces a claimed pre-effect intent with its accepted response.
     pub fn finalize_main_admission_operation(
         &self,
@@ -536,7 +595,7 @@ impl Store {
     pub fn pending_main_admission_operations(&self) -> StoreResult<Vec<PendingMainAdmissionOperation>> {
         let connection = self.connection()?;
         let mut statement = connection.prepare(
-            "SELECT scope, idempotency_key, request_json, intent_json
+            "SELECT scope, idempotency_key, request_json, intent_json, attempt_ids_json
              FROM main_admission_operations ORDER BY scope, idempotency_key",
         )?;
         let rows = statement.query_map([], |row| {
@@ -545,6 +604,7 @@ impl Store {
                 key: row.get(1)?,
                 request_json: row.get(2)?,
                 intent_json: row.get(3)?,
+                attempt_ids_json: row.get(4)?,
             })
         })?;
         rows.collect::<Result<Vec<_>, _>>().map_err(StoreError::from)
@@ -828,6 +888,27 @@ fn migrate(connection: &mut Connection) -> StoreResult<()> {
             meta_set_tx(&transaction, "transcript_delivery_gap_count", "0")?;
         }
         meta_set_tx(&transaction, "schema_version", "7")?;
+        transaction.commit()?;
+    }
+
+    if current_version < 8 {
+        let transaction = connection.transaction()?;
+        let has_attempt_ids_column = {
+            let mut statement = transaction.prepare("PRAGMA table_info(main_admission_operations)")?;
+            let mut rows = statement.query([])?;
+            let mut found = false;
+            while let Some(row) = rows.next()? {
+                if row.get::<_, String>(1)? == "attempt_ids_json" {
+                    found = true;
+                    break;
+                }
+            }
+            found
+        };
+        if !has_attempt_ids_column {
+            transaction.execute("ALTER TABLE main_admission_operations ADD COLUMN attempt_ids_json TEXT", [])?;
+        }
+        meta_set_tx(&transaction, "schema_version", "8")?;
         transaction.commit()?;
     }
 
@@ -1241,6 +1322,7 @@ mod tests {
                 key: "key".to_owned(),
                 request_json: request.to_owned(),
                 intent_json: intent.to_owned(),
+                attempt_ids_json: None,
             }]
         );
         assert!(matches!(
@@ -1254,6 +1336,30 @@ mod tests {
         );
         assert!(store.pending_main_admission_operations().unwrap().is_empty());
         assert_eq!(store.replay_idempotency(scope, "key", request, 103).unwrap().as_deref(), Some(response));
+    }
+
+    #[test]
+    fn main_admission_attempt_ids_are_bound_once_to_the_pending_claim() {
+        let store = Store::default();
+        let scope = "main.submit";
+        let request = r#"{"idempotency_key":"key","surface_id":"owner","text":"send once"}"#;
+        let intent = r#"{"delivered_as":"prompt","op_ref":"operation","request_hash":"hash","state":"claimed","version":1}"#;
+        let attempt_ids = r#"["operation","turn-opaque"]"#;
+        store.claim_main_admission_operation(scope, "key", request, intent, 100).unwrap();
+        store
+            .record_main_admission_operation_attempt_ids(scope, "key", request, intent, attempt_ids)
+            .unwrap();
+        store
+            .record_main_admission_operation_attempt_ids(scope, "key", request, intent, attempt_ids)
+            .unwrap();
+        assert_eq!(
+            store.pending_main_admission_operations().unwrap()[0].attempt_ids_json.as_deref(),
+            Some(attempt_ids)
+        );
+        assert!(matches!(
+            store.record_main_admission_operation_attempt_ids(scope, "key", request, intent, r#"["different"]"#),
+            Err(StoreError::MainAdmissionOperationChanged)
+        ));
     }
 
     #[test]
@@ -1280,6 +1386,7 @@ mod tests {
                 key: "other".to_owned(),
                 request_json: unrelated_request.to_owned(),
                 intent_json: unrelated_intent.to_owned(),
+                attempt_ids_json: None,
             }]
         );
         assert_eq!(store.replay_idempotency(scope, "rejected", rejected_request, 101).unwrap(), None);

@@ -20,8 +20,14 @@ export interface MainAdmissionTarget {
 	/** Host-provided readiness is consulted even when a caller did not install an explicit wrapper. */
 	readonly mutationReadinessReason?: string;
 	/** Broker acceptance boundary; this must not await model-turn completion. */
-	/** The supplied finalizer atomically replaces this request's durable intent after terminal evidence. */
-	admit(deliveredAs: DeliveredAs, text: string, opRef: string, finalizePendingClaim?: () => void): Promise<void>;
+	/** The callbacks finalize the claim and persist receipt-to-tail identifiers after acceptance. */
+	admit(
+		deliveredAs: DeliveredAs,
+		text: string,
+		opRef: string,
+		finalizePendingClaim?: () => void,
+		recordAttemptIds?: (attemptIds: readonly string[]) => void,
+	): Promise<void>;
 	/** Production hosts publish a terminal fence if a definitive rejection's claim cannot be abandoned. */
 	reportAdmissionClaimAbandonFailure?(error: unknown): void;
 }
@@ -40,6 +46,13 @@ export interface MainAdmissionOperationStore {
 		readonly intentJson: string;
 		readonly responseJson: string;
 	}): { readonly responseJson: string };
+	mainAdmissionOperationRecordAttemptIds(input: {
+		readonly scope: string;
+		readonly key: string;
+		readonly requestJson: string;
+		readonly intentJson: string;
+		readonly attemptIdsJson: string;
+	}): void;
 	mainAdmissionOperationAbandon(input: {
 		readonly scope: string;
 		readonly key: string;
@@ -51,9 +64,16 @@ export interface MainAdmissionOperationStore {
 		readonly key: string;
 		readonly requestJson: string;
 		readonly intentJson: string;
+		readonly attemptIdsJson?: string;
 	}[];
 	/** Returns the inclusive durable journal head before any broker effect. */
 	journalHeadCursor?(): string;
+	/** Reads durable journal evidence after an admission's pre-effect boundary. */
+	journalRead?(cursor: string | undefined, limit: number): {
+		readonly events: readonly { readonly seq: string; readonly kind: string; readonly payloadJson: string }[];
+		readonly nextCursor: string;
+		readonly gap?: unknown;
+	};
 
 }
 
@@ -85,6 +105,8 @@ interface MainAdmissionIntent {
 	readonly request_hash: string;
 	readonly journal_head_cursor?: string;
 }
+
+const JOURNAL_RECOVERY_PAGE_SIZE = 500;
 
 export class MainAdmissionRecoveryError extends Error {
 	readonly reason: string;
@@ -189,6 +211,105 @@ function parseIntent(intentJson: string): MainAdmissionIntent {
 	};
 }
 
+function recoveryResponse(intent: MainAdmissionIntent): MainAdmissionResponse {
+	return {
+		accepted: true,
+		op_ref: intent.op_ref,
+		delivered_as: intent.delivered_as,
+		...(intent.journal_head_cursor === undefined ? {} : { journal_head_cursor: intent.journal_head_cursor }),
+	};
+}
+
+function parseJournalPayload(payloadJson: string): Record<string, unknown> | undefined {
+	try {
+		const parsed = JSON.parse(payloadJson) as unknown;
+		return isRecord(parsed) ? parsed : undefined;
+	} catch {
+		return undefined;
+	}
+}
+
+function persistedAttemptIds(value: unknown): readonly string[] {
+	if (value === undefined) return [];
+	if (typeof value !== "string") {
+		throw new MainAdmissionRecoveryError("main_admission_intent_invalid", "The durable main admission attempt identifiers are malformed.");
+	}
+	let parsed: unknown;
+	try {
+		parsed = JSON.parse(value) as unknown;
+	} catch (error) {
+		throw new MainAdmissionRecoveryError("main_admission_intent_invalid", "The durable main admission attempt identifiers are not JSON.", { cause: error });
+	}
+	if (!Array.isArray(parsed) || parsed.length === 0 || parsed.some(attemptId => typeof attemptId !== "string" || !attemptId)) {
+		throw new MainAdmissionRecoveryError("main_admission_intent_invalid", "The durable main admission attempt identifiers are malformed.");
+	}
+	return [...new Set(parsed)];
+}
+
+function terminalAttemptId(payloadJson: string): string | undefined {
+	const payload = parseJournalPayload(payloadJson);
+	if (
+		!payload ||
+		payload.lineage !== "main" ||
+		typeof payload.attempt_id !== "string" ||
+		!payload.attempt_id ||
+		typeof payload.generation !== "number" ||
+		!Number.isSafeInteger(payload.generation)
+	)
+		return undefined;
+	return payload.attempt_id;
+}
+
+function legacyAttemptIds(opRef: string): readonly string[] {
+	return [opRef, `turn:${opRef}`, `command:${opRef}`];
+}
+
+function matchesAttemptId(attemptId: string, aliases: ReadonlySet<string>): boolean {
+	if (aliases.has(attemptId)) return true;
+	for (const alias of aliases) {
+		if (attemptId.endsWith(`:${alias}`)) return true;
+	}
+	return false;
+}
+
+async function hasDurableTerminalEvidence(
+	idempotency: MainAdmissionOperationStore,
+	intent: MainAdmissionIntent,
+	attemptIds: readonly string[],
+): Promise<boolean> {
+	if (!idempotency.journalRead) return false;
+	const aliases = new Set([...legacyAttemptIds(intent.op_ref), ...attemptIds]);
+	const terminalAttempts: string[] = [];
+	let cursor = intent.journal_head_cursor;
+	for (;;) {
+		let page;
+		try {
+			page = idempotency.journalRead(cursor, JOURNAL_RECOVERY_PAGE_SIZE);
+		} catch (error) {
+			throw new MainAdmissionRecoveryError(
+				"main_admission_recovery_unavailable",
+				"Could not read durable journal evidence for a pending main admission.",
+				{ cause: error },
+			);
+		}
+		if (page.gap !== undefined) return false;
+		if (!optionalJournalHeadCursor(page.nextCursor)) {
+			throw new MainAdmissionRecoveryError("main_admission_recovery_unavailable", "The durable journal returned an invalid recovery cursor.");
+		}
+		for (const event of page.events) {
+			if (event.kind !== "turn_end") continue;
+			const attemptId = terminalAttemptId(event.payloadJson);
+			if (attemptId) terminalAttempts.push(attemptId);
+		}
+		if (terminalAttempts.some(attemptId => matchesAttemptId(attemptId, aliases))) return true;
+		if (page.events.length === 0) return false;
+		if (page.nextCursor === cursor) {
+			throw new MainAdmissionRecoveryError("main_admission_recovery_unavailable", "The durable journal recovery cursor did not advance.");
+		}
+		cursor = page.nextCursor;
+	}
+}
+
 
 function pendingReplayError(intentJson: string): never {
 	parseIntent(intentJson);
@@ -201,8 +322,9 @@ async function dispatchAdmittedOperation(
 	text: string,
 	opRef: string,
 	finalizePendingClaim: () => void,
+	recordAttemptIds: (attemptIds: readonly string[]) => void,
 ): Promise<void> {
-	await target.admit(deliveredAs, text, opRef, finalizePendingClaim);
+	await target.admit(deliveredAs, text, opRef, finalizePendingClaim, recordAttemptIds);
 }
 
 function abandonDefinitivelyRejectedClaim(
@@ -300,6 +422,15 @@ export function createMainAdmissionHandler(
 			});
 			replayResponse(finalized.responseJson);
 		};
+		const recordAttemptIds = (attemptIds: readonly string[]): void => {
+			idempotency.mainAdmissionOperationRecordAttemptIds({
+				scope: MAIN_ADMISSION_SCOPE,
+				key: request.idempotencyKey,
+				requestJson,
+				intentJson,
+				attemptIdsJson: canonicalJson([...attemptIds]),
+			});
+		};
 		let claim;
 		try {
 			claim = idempotency.mainAdmissionOperationClaim({
@@ -319,7 +450,7 @@ export function createMainAdmissionHandler(
 			}
 		}
 		try {
-			await dispatchAdmittedOperation(target, deliveredAs, request.text, response.op_ref, finalizePendingClaim);
+			await dispatchAdmittedOperation(target, deliveredAs, request.text, response.op_ref, finalizePendingClaim, recordAttemptIds);
 		} catch (error) {
 			abandonDefinitivelyRejectedClaim(target, idempotency, request, requestJson, intentJson, error);
 			throw error;
@@ -347,28 +478,28 @@ export async function reconcilePendingMainAdmissions(
 		if (intent.request_hash !== sha256(pending.requestJson)) {
 			throw new MainAdmissionRecoveryError("main_admission_intent_invalid", "A pending admission request hash does not match its durable request.");
 		}
-		let status;
+		const attemptIds = persistedAttemptIds(pending.attemptIdsJson);
+		let brokerProven = false;
+		let brokerStatusError: unknown;
 		try {
-			status = await supervisor.operationStatus(intent.op_ref);
+			brokerProven = (await supervisor.operationStatus(intent.op_ref)).status !== "unknown";
 		} catch (error) {
-			throw new MainAdmissionRecoveryError(
-				"main_admission_recovery_unavailable",
-				"Could not verify the broker operation for a pending main admission.",
-				{ cause: error },
-			);
+			brokerStatusError = error;
 		}
-		if (status.status === "unknown") {
+		if (!brokerProven && !(await hasDurableTerminalEvidence(idempotency, intent, attemptIds))) {
+			if (brokerStatusError !== undefined) {
+				throw new MainAdmissionRecoveryError(
+					"main_admission_recovery_unavailable",
+					"Could not verify the broker operation for a pending main admission.",
+					{ cause: brokerStatusError },
+				);
+			}
 			throw new MainAdmissionRecoveryError(
 				"main_admission_recovery_unprovable",
-				"The broker cannot prove whether a pending main admission was accepted.",
+				"Neither the broker nor the durable journal can prove whether a pending main admission was accepted.",
 			);
 		}
-		const response: MainAdmissionResponse = {
-			accepted: true,
-			op_ref: intent.op_ref,
-			delivered_as: intent.delivered_as,
-			...(intent.journal_head_cursor === undefined ? {} : { journal_head_cursor: intent.journal_head_cursor }),
-		};
+		const response = recoveryResponse(intent);
 		try {
 			idempotency.mainAdmissionOperationFinalize({
 				scope: pending.scope,

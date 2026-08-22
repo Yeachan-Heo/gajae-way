@@ -168,14 +168,22 @@ if (!statePath) {
 		value.transcript.push({ id, payload });
 	}
 
+	function brokerTurnId(value, opRef) {
+		return value.tailUsesBrokerTurnId === true ? `broker-turn-${opRef}` : `turn:${opRef}`;
+	}
+
+	function operationScope(value, operation) {
+		return {
+			attemptId: value.tailUsesBrokerTurnId === true ? brokerTurnId(value, operation.opRef) : `${value.row.sessionId}:${operation.opRef}`,
+			generation: operation.generation ?? 1,
+			lineage: "main",
+		};
+	}
+
 	function settleQueuedFollowUps(value) {
 		for (const candidate of Object.values(value.operations ?? {})) {
 			if (candidate.operation !== "turn.follow_up" || candidate.completed) continue;
-			const scope = {
-				attemptId: `${value.row.sessionId}:${candidate.opRef}`,
-				generation: candidate.generation ?? 1,
-				lineage: "main",
-			};
+			const scope = operationScope(value, candidate);
 			value.context.isStreaming = true;
 			appendEvent(value, "agent_start", { type: "agent_start", sessionId: value.row.sessionId, scope });
 			appendEvent(value, "turn_start", { type: "turn_start", sessionId: value.row.sessionId, scope });
@@ -188,7 +196,7 @@ if (!statePath) {
 		if (!operation || operation.completed) return;
 		operation.completed = true;
 		value.context ??= { isStreaming: false, followupQueueDepth: 0 };
-		const scope = { attemptId: `${value.row.sessionId}:${operation.opRef}`, generation: operation.generation ?? 1, lineage: "main" };
+		const scope = operationScope(value, operation);
 		const responseId = `${value.row.sessionId}:assistant:${operation.opRef}`;
 		const text = operation.failure ? "" : (operation.responseText ?? (operation.operation === "turn.steer" ? "steered" : "ack"));
 		if (operation.operation !== "turn.follow_up") {
@@ -224,7 +232,7 @@ if (!statePath) {
 		value.operations ??= {};
 		value.operations[operation.opRef] = operation;
 		value.context ??= { isStreaming: false, followupQueueDepth: 0 };
-		const scope = { attemptId: `${value.row.sessionId}:${operation.opRef}`, generation: operation.generation ?? 1, lineage: "main" };
+		const scope = operationScope(value, operation);
 		if (operation.operation === "turn.follow_up") {
 			value.context.followupQueueDepth = (value.context.followupQueueDepth ?? 0) + 1;
 			if (!hold && value.context.isStreaming !== true) {
@@ -252,7 +260,7 @@ if (!statePath) {
 			accepted: true,
 			clientRef: opRef,
 			commandId: `command:${opRef}`,
-			turnId: `turn:${opRef}`,
+			turnId: brokerTurnId(value, opRef),
 		};
 	}
 
@@ -429,7 +437,7 @@ if (!statePath) {
 						...(value.transcript ?? []).map(entry => ({ kind: "transcript", id: entry.id, payload: entry.payload })),
 						...(value.events ?? []).filter(event => retentionFloor === undefined || eventIsAfter(event, retentionFloor)),
 					];
-					const terminal = value.context?.isStreaming !== true && (value.context?.followupQueueDepth ?? 0) === 0;
+					const terminal = typeof value.tailTerminalOverride === "boolean" ? value.tailTerminalOverride : value.context?.isStreaming !== true && (value.context?.followupQueueDepth ?? 0) === 0;
 					success({
 						version: 1,
 						source: "session",

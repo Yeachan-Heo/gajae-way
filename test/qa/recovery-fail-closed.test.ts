@@ -288,6 +288,92 @@ test("a daemon killed after main broker acceptance recovers the pre-effect claim
 	}
 }, 20_000);
 
+test("a post-acceptance bridge failure with durable terminal evidence reconciles an unknown broker outcome without resend", async () => {
+	const fixture = new FakeBrokerFixture();
+	const corpus = path.join(fixture.root, "corpus");
+	const stateDirectory = path.join(fixture.root, "state");
+	const profilePath = path.join(fixture.root, "profile.toml");
+	const environment = {
+		...fixture.environment(),
+		NODE_ENV: "test",
+		GAJAEWAY_BROKER_CLI: fixture.executable,
+		GAJAEWAY_RECONCILE_POLL_MS: "600000",
+		GAJAEWAY_E2E_THROW_AFTER_MAIN_ADMISSION_BROKER_ACCEPTED: "1",
+		GAJAEWAY_E2E_FAIL_AFTER_MAIN_ADMISSION_TERMINAL_EVIDENCE: "1",
+	};
+	let crashed: RunningDaemon | undefined;
+	let recovered: RunningDaemon | undefined;
+	try {
+		fs.mkdirSync(corpus, { recursive: true });
+		fs.writeFileSync(profilePath, profileContents(corpus, fixture.workspace, fixture.sessionId));
+		bootstrap(stateDirectory, profilePath, environment);
+		const core = loadWayCore().WayCore.open(stateDirectory);
+		crashed = await startDaemon(stateDirectory, profilePath, environment);
+		expect(await waitForHealth(crashed.client, "running")).toMatchObject({ state: "running" });
+		fixture.useBrokerTurnIdForTail();
+		fixture.holdNextTurn();
+		const request = {
+			text: "recover a reply whose bridge response failed",
+			surface_id: "owner",
+			idempotency_key: "post-acceptance-terminal-recovery",
+		};
+		const failedResponse = await crashed.client.request("main.submit", request);
+		expect(failedResponse.error).toMatchObject({ code: -32603, message: "bridge_exception" });
+		const [pending] = core.mainAdmissionOperationsPending();
+		const intent = JSON.parse(pending?.intentJson ?? "{}") as { op_ref?: unknown; journal_head_cursor?: unknown };
+		if (typeof intent.op_ref !== "string" || typeof intent.journal_head_cursor !== "string") {
+			throw new Error("post-acceptance bridge failure did not retain a recoverable durable intent");
+		}
+		const opRef = intent.op_ref;
+		fixture.complete(opRef, { text: "reply persisted before terminal-finalizer interruption" });
+		crashed.client.close();
+		expect(await crashed.child.exited).toBe(137);
+		crashed = undefined;
+
+		const evidence = core.journalRead(intent.journal_head_cursor, 100).events;
+		expect(evidence).toEqual(
+			expect.arrayContaining([
+				expect.objectContaining({
+					kind: "assistant_message",
+					payloadJson: expect.stringContaining("reply persisted before terminal-finalizer interruption"),
+				}),
+				expect.objectContaining({
+					kind: "turn_end",
+					payloadJson: expect.stringContaining(`broker-turn-${opRef}`),
+				}),
+			]),
+		);
+		const [surviving] = core.mainAdmissionOperationsPending();
+		expect(JSON.parse(surviving?.attemptIdsJson ?? "null")).toEqual(expect.arrayContaining([`broker-turn-${opRef}`]));
+		fixture.forgetOperation(opRef);
+
+		recovered = await startDaemon(stateDirectory, profilePath, {
+			...environment,
+			GAJAEWAY_E2E_THROW_AFTER_MAIN_ADMISSION_BROKER_ACCEPTED: "0",
+			GAJAEWAY_E2E_FAIL_AFTER_MAIN_ADMISSION_TERMINAL_EVIDENCE: "0",
+		});
+		expect(await waitForHealth(recovered.client, "running")).toMatchObject({ state: "running", main: { resumed: true } });
+		expect(core.mainAdmissionOperationsPending()).toEqual([]);
+		const replay = await recovered.client.request("main.submit", request);
+		expect(replay.result).toMatchObject({
+			accepted: true,
+			op_ref: opRef,
+			delivered_as: "prompt",
+			journal_head_cursor: intent.journal_head_cursor,
+		});
+		const conflict = await recovered.client.request("main.submit", {
+			...request,
+			text: "different content with the recovered idempotency key",
+		});
+		expect(conflict.error).toMatchObject({ code: 1500, message: "idempotency_conflict" });
+		expect(fixture.admissionAttempts().filter(attempt => attempt.opRef === opRef)).toHaveLength(1);
+	} finally {
+		await stopDaemon(recovered);
+		await stopDaemon(crashed);
+		fixture.dispose();
+	}
+}, 30_000);
+
 test("a transcript projection failure degrades the host and fences corpus closure before any claim, commit, or push", async () => {
 	const fixture = new FakeBrokerFixture();
 	const corpus = path.join(fixture.root, "corpus");

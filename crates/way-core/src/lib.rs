@@ -357,6 +357,18 @@ pub struct MainAdmissionOperationClaimOutput {
 }
 
 #[napi(object)]
+pub struct MainAdmissionOperationRecordAttemptIdsInput {
+	pub scope: String,
+	pub key: String,
+	#[napi(js_name = "requestJson")]
+	pub request_json: String,
+	#[napi(js_name = "intentJson")]
+	pub intent_json: String,
+	#[napi(js_name = "attemptIdsJson")]
+	pub attempt_ids_json: String,
+}
+
+#[napi(object)]
 pub struct MainAdmissionOperationAbandonInput {
 	pub scope: String,
 	pub key: String,
@@ -392,6 +404,8 @@ pub struct PendingMainAdmissionOperationOutput {
 	pub request_json: String,
 	#[napi(js_name = "intentJson")]
 	pub intent_json: String,
+	#[napi(js_name = "attemptIdsJson")]
+	pub attempt_ids_json: Option<String>,
 }
 
 /// One metadata value returned from the durable gateway state store. A missing
@@ -1192,6 +1206,23 @@ impl WayCore {
 		}
 	}
 
+	/// Persists receipt-derived broker identifiers while this exact pre-effect claim remains pending.
+	#[napi(js_name = "mainAdmissionOperationRecordAttemptIds")]
+	pub fn main_admission_operation_record_attempt_ids(
+		&self,
+		input: MainAdmissionOperationRecordAttemptIdsInput,
+	) -> napi::Result<()> {
+		self.store
+			.record_main_admission_operation_attempt_ids(
+				&input.scope,
+				&input.key,
+				&input.request_json,
+				&input.intent_json,
+				&input.attempt_ids_json,
+			)
+			.map_err(store_napi_error)
+	}
+
 	/// Finalizes a broker-accepted main admission without changing its operation reference.
 	#[napi(js_name = "mainAdmissionOperationFinalize")]
 	pub fn main_admission_operation_finalize(
@@ -1366,6 +1397,7 @@ fn pending_main_admission_operation_output(operation: PendingMainAdmissionOperat
 		key: operation.key,
 		request_json: operation.request_json,
 		intent_json: operation.intent_json,
+		attempt_ids_json: operation.attempt_ids_json,
 	}
 }
 

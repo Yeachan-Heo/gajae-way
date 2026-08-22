@@ -1,3 +1,4 @@
+import type { BrokerOperationReceipt } from "../broker/cli";
 import { MainSessionGateRegistry, type GateHandle, type MainGateResolution } from "./gates";
 import {
 	attestsExternalTranscriptGrowth,
@@ -69,8 +70,14 @@ export interface MainSessionHost {
 	/** Resolves once this daemon has a complete, compatible transcript tail. */
 	waitForVerifiedTranscript(): Promise<void>;
 	/** Waits for broker admission only; successful turn execution is observed asynchronously. */
-	/** The optional finalizer resolves this exact durable claim after terminal evidence. */
-	admit(deliveredAs: "prompt" | "steer" | "follow_up", text: string, opRef: string, finalizePendingClaim?: () => void): Promise<void>;
+	/** The finalizer is armed before dispatch; the receipt callback persists identifiers after acceptance. */
+	admit(
+		deliveredAs: "prompt" | "steer" | "follow_up",
+		text: string,
+		opRef: string,
+		finalizePendingClaim?: () => void,
+		recordAttemptIds?: (attemptIds: readonly string[]) => void,
+	): Promise<void>;
 	/** Degrades and fences the host when durable abandonment of a definitive rejection fails. */
 	reportAdmissionClaimAbandonFailure(error: unknown): void;
 	resolveGate(gateId: string, answer: unknown, idempotencyKey: string): Promise<MainGateResolution>;
@@ -91,6 +98,8 @@ export interface CreateMainSessionHostOptions {
 	readonly verificationTail?: SupervisorTailEvents;
 	/** An active durable growth intent recovered by strict resume. */
 	readonly recoveredGrowthIntent?: GrowthIntent;
+	/** Test-only seam after durable terminal evidence but before pending-claim finalization. */
+	readonly afterTerminalEvidenceBeforeAdmissionFinalize?: () => void;
 	readonly now?: () => number;
 	readonly gates?: MainSessionGateRegistry;
 }
@@ -103,6 +112,10 @@ interface GrowthWindow {
 interface AdmittedOperation {
 	/** Durable ring watermark immediately before broker acceptance. */
 	readonly admittedAt: TailCheckpoint | undefined;
+	/** Every broker identifier that can appear in this operation's tail attempt. */
+	readonly attemptIds: readonly string[];
+	/** Persists receipt-derived attempt identifiers while this exact claim remains pending. */
+	readonly recordAttemptIds?: (attemptIds: readonly string[]) => void;
 	/** A broker receipt was lost after dispatch, so all mutations stay fenced until a tail settles it. */
 	readonly ambiguous: boolean;
 	/** Exact idempotency finalizer armed before broker dispatch. */
@@ -130,6 +143,7 @@ export interface MainSessionTurnJournalPayload {
 	readonly lineage: string;
 }
 
+
 const MAX_JOURNALED_ATTEMPTS = 1_000;
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -142,6 +156,24 @@ function eventString(event: Record<string, unknown>, ...keys: string[]): string 
 		if (typeof value === "string" && value) return value;
 	}
 	return undefined;
+}
+
+function distinctAttemptIds(values: readonly (string | undefined)[]): string[] {
+	const ids = new Set<string>();
+	for (const value of values) {
+		if (typeof value === "string" && value) ids.add(value);
+	}
+	return [...ids];
+}
+
+function admissionAttemptIds(sessionId: string, opRef: string, receipt?: BrokerOperationReceipt): string[] {
+	return distinctAttemptIds([
+		opRef,
+		`${sessionId}:${opRef}`,
+		receipt?.operationRef,
+		receipt?.commandId,
+		receipt?.turnId,
+	]);
 }
 
 function eventTimestamp(event: Record<string, unknown>): number | undefined {
@@ -279,6 +311,7 @@ class ExternalMainSessionHost implements MainSessionHost {
 	readonly #state: GatewayStateStore;
 	readonly #journal: MainSessionJournal;
 	readonly #now: () => number;
+	readonly #afterTerminalEvidenceBeforeAdmissionFinalize: (() => void) | undefined;
 	#identity: ExternalSessionIdentity;
 	#turnState: "idle" | "busy";
 	#followUpQueueDepth: number;
@@ -294,6 +327,7 @@ class ExternalMainSessionHost implements MainSessionHost {
 	#verificationState: "pending" | "verified";
 	readonly #journaledAttemptTransitions = new Map<string, JournaledAttemptTransitions>();
 	readonly #admittedOperations = new Map<string, AdmittedOperation>();
+	readonly #unmatchedTerminalAttemptIds = new Set<string>();
 	readonly #seenTailEvents = new Set<string>();
 	readonly #fatalFailure = Promise.withResolvers<MainSessionHostError>();
 	readonly #verificationReady = Promise.withResolvers<void>();
@@ -319,6 +353,7 @@ class ExternalMainSessionHost implements MainSessionHost {
 			);
 		}
 		this.#now = options.now ?? Date.now;
+		this.#afterTerminalEvidenceBeforeAdmissionFinalize = options.afterTerminalEvidenceBeforeAdmissionFinalize;
 		this.gates = options.gates ?? new MainSessionGateRegistry({ now: this.#now });
 		this.#turnState = options.initialTurnState ?? "idle";
 		this.#followUpQueueDepth = Math.max(0, options.initialFollowUpQueueDepth ?? 0);
@@ -385,22 +420,50 @@ class ExternalMainSessionHost implements MainSessionHost {
 		this.#tailWake = Promise.withResolvers<void>();
 	}
 
-	private admittedOperationRef(event: Record<string, unknown>): string | undefined {
+	private eventAttemptIds(event: Record<string, unknown>): readonly string[] {
 		const scope = isRecord(event.scope) ? event.scope : undefined;
-		const candidates = [
-			eventString(event, "operationRef", "operation_ref", "opRef", "op_ref", "clientRef", "client_ref"),
-			scope && eventString(scope, "attemptId", "attempt_id", "operationRef", "operation_ref", "clientRef", "client_ref"),
-		];
-		for (const candidate of candidates) {
-			if (!candidate) continue;
-			if (this.#admittedOperations.has(candidate)) return candidate;
-			const prefix = `${this.sessionId}:`;
-			if (candidate.startsWith(prefix)) {
-				const operationRef = candidate.slice(prefix.length);
-				if (this.#admittedOperations.has(operationRef)) return operationRef;
+		return distinctAttemptIds([
+			eventString(event, "operationRef", "operation_ref", "opRef", "op_ref"),
+			eventString(event, "clientRef", "client_ref"),
+			eventString(event, "commandId", "command_id"),
+			eventString(event, "turnId", "turn_id"),
+			scope && eventString(scope, "attemptId", "attempt_id", "operationRef", "operation_ref", "opRef", "op_ref"),
+			scope && eventString(scope, "clientRef", "client_ref"),
+			scope && eventString(scope, "commandId", "command_id"),
+			scope && eventString(scope, "turnId", "turn_id"),
+		]);
+	}
+
+	private admittedOperationRef(event: Record<string, unknown>): string | undefined {
+		for (const candidate of this.eventAttemptIds(event)) {
+			for (const [opRef, admission] of this.#admittedOperations) {
+				if (admission.attemptIds.includes(candidate)) return opRef;
 			}
 		}
 		return undefined;
+	}
+
+	private rememberUnmatchedTerminalAttempts(event: Record<string, unknown>): void {
+		for (const attemptId of this.eventAttemptIds(event)) this.#unmatchedTerminalAttemptIds.add(attemptId);
+		while (this.#unmatchedTerminalAttemptIds.size > MAX_JOURNALED_ATTEMPTS) {
+			const oldest = this.#unmatchedTerminalAttemptIds.values().next().value;
+			if (!oldest) break;
+			this.#unmatchedTerminalAttemptIds.delete(oldest);
+		}
+	}
+
+	private recordAdmissionAttemptIds(opRef: string, receipt: BrokerOperationReceipt): void {
+		const admission = this.#admittedOperations.get(opRef);
+		if (!admission) return;
+		const attemptIds = admissionAttemptIds(this.sessionId, opRef, receipt);
+		this.#admittedOperations.set(opRef, { ...admission, attemptIds });
+		try {
+			admission.recordAttemptIds?.(attemptIds);
+		} catch (error) {
+			throw this.enterFailure("main_admission_attempt_ids_persist_failed", error);
+		}
+		if (!attemptIds.some(attemptId => this.#unmatchedTerminalAttemptIds.has(attemptId))) return;
+		if (!this.settleAdmittedOperation(opRef)) throw this.#failure ?? new MainSessionHostError("main_admission_finalize_failed");
 	}
 	private publishStatus(): void {
 		try {
@@ -595,19 +658,25 @@ class ExternalMainSessionHost implements MainSessionHost {
 		}
 		if (type === "agent_end" || type === "turn_end") {
 			const operationRef = this.admittedOperationRef(event);
+			// Persist the terminal boundary before its claim finalizer. If the process
+			// dies after this write, restart reconciliation can prove the acceptance.
+			this.appendTurnTransition("turn_end", event);
+			if (this.#failure) return;
+			if (!operationRef) this.rememberUnmatchedTerminalAttempts(event);
 			if (operationRef && !this.settleAdmittedOperation(operationRef)) return;
 			this.#turnState = this.#admittedOperations.size === 0 ? "idle" : "busy";
-			if (type === "agent_end") this.appendTurnTransition("turn_end", event);
 			this.publishStatus();
 			this.finishGrowthWindowIfSettled();
 			return;
 		}
 		if (type === "agent_failed") {
 			const operationRef = this.admittedOperationRef(event);
+			this.appendTurnTransition("turn_end", event);
+			if (this.#failure) return;
+			if (!operationRef) this.rememberUnmatchedTerminalAttempts(event);
 			if (operationRef && !this.settleAdmittedOperation(operationRef)) return;
 			this.#turnState = this.#admittedOperations.size === 0 ? "idle" : "busy";
 			this.publishStatus();
-			this.appendTurnTransition("turn_end", event);
 			this.finishGrowthWindowIfSettled();
 			this.enterFailure("turn_execution_failed", event);
 			return;
@@ -944,6 +1013,7 @@ class ExternalMainSessionHost implements MainSessionHost {
 			// Terminal broker evidence proves acceptance even when the send command's
 			// receipt has not yet arrived (or never will). The native finalizer is
 			// idempotent, so it is safe if the normal receipt path races this tail.
+			this.#afterTerminalEvidenceBeforeAdmissionFinalize?.();
 			admission.finalizePendingClaim();
 			return true;
 		} catch (error) {
@@ -1150,17 +1220,28 @@ class ExternalMainSessionHost implements MainSessionHost {
 		text: string,
 		opRef: string,
 		finalizePendingClaim?: () => void,
+		recordAttemptIds?: (attemptIds: readonly string[]) => void,
 	): Promise<void> {
 		this.assertUsable();
 		if (!text.trim()) throw new MainSessionHostError(`${deliveredAs}_empty`, "A main-session message must not be empty.");
 		if (!opRef.trim()) throw new MainSessionHostError("operation_ref_empty", "An admitted operation requires an operation reference.");
 		const growth = this.beginGrowthWindow();
 		growth.pendingAdmissions += 1;
-		this.#admittedOperations.set(opRef, { admittedAt: this.#tailCheckpoint, ambiguous: false, ...(finalizePendingClaim === undefined ? {} : { finalizePendingClaim }) });
+		this.#admittedOperations.set(opRef, {
+			admittedAt: this.#tailCheckpoint,
+			attemptIds: admissionAttemptIds(this.sessionId, opRef),
+			ambiguous: false,
+			...(finalizePendingClaim === undefined ? {} : { finalizePendingClaim }),
+			...(recordAttemptIds === undefined ? {} : { recordAttemptIds }),
+		});
 		try {
-			if (deliveredAs === "prompt") await this.#supervisor.sendPrompt(text, opRef);
-			else if (deliveredAs === "steer") await this.#supervisor.sendSteer(text, opRef);
-			else await this.#supervisor.followUp(text, opRef);
+			const receipt =
+				deliveredAs === "prompt"
+					? await this.#supervisor.sendPrompt(text, opRef)
+					: deliveredAs === "steer"
+						? await this.#supervisor.sendSteer(text, opRef)
+						: await this.#supervisor.followUp(text, opRef);
+			this.recordAdmissionAttemptIds(opRef, receipt);
 			this.wakeTail();
 			if (this.#admittedOperations.has(opRef)) {
 				if (deliveredAs === "follow_up") this.#followUpQueueDepth += 1;
@@ -1184,7 +1265,7 @@ class ExternalMainSessionHost implements MainSessionHost {
 					this.wakeTail();
 				}
 			}
-			const reason = error instanceof HostSupervisorError ? error.reason : "turn_admission_failed";
+			const reason = error instanceof MainSessionHostError || error instanceof HostSupervisorError ? error.reason : "turn_admission_failed";
 			throw new MainSessionHostError(reason, error instanceof Error ? error.message : String(error), {
 				cause: error,
 				admissionDisposition,

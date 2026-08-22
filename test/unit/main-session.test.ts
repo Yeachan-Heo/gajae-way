@@ -1240,6 +1240,7 @@ test.serial("a failed definitive-rejection claim abandonment degrades and fences
 		mainAdmissionOperationFinalize(input: { readonly responseJson: string }) {
 			return { responseJson: input.responseJson };
 		},
+		mainAdmissionOperationRecordAttemptIds() {},
 		mainAdmissionOperationAbandon() {
 			throw new Error("scripted durable claim abandonment failure");
 		},
