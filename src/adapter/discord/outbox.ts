@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import {
 	RpcJournalConsumer,
 	type JournalDeliveryProof,
@@ -139,13 +140,23 @@ export function discordDedupeKey(surfaceId: string, seq: string): string {
 	return `gajaeway-discord:${surfaceId}:${seq}`;
 }
 
+/**
+ * Discord rejects nonces longer than 25 characters (50035 NONCE_TYPE_TOO_LONG),
+ * so the wire nonce is a deterministic 24-hex-character digest of the full
+ * dedupe key. Retries and post-restart replays of the same journal event keep
+ * producing the identical nonce, preserving `enforce_nonce` deduplication.
+ */
+export function discordWireNonce(dedupeKey: string): string {
+	return createHash("sha256").update(dedupeKey).digest("hex").slice(0, 24);
+}
+
 function eventToOutboxItem(event: RpcJournalEvent, route: DiscordRoute, cursor: string): DiscordOutboxItem {
 	if (event.kind !== "assistant_message") throw new DiscordOutboxError(`Unexpected event kind in Discord outbox: ${event.kind}.`);
 	const seq = sequenceString(event.seq);
 	const text = assistantMessageText(event.payload);
 	if (!text.trim()) throw new DiscordOutboxError(`assistant_message event ${seq} has no deliverable text.`);
 	const dedupeKey = discordDedupeKey(route.surfaceId, seq);
-	return { cursor, seq, text, dedupeKey, nonce: dedupeKey };
+	return { cursor, seq, text, dedupeKey, nonce: discordWireNonce(dedupeKey) };
 }
 
 /** Rejects streaming/legacy shapes: egress must consume a terminal persisted message only. */

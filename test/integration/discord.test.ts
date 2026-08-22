@@ -1,6 +1,6 @@
 import { AsyncLocalStorage } from "node:async_hooks";
 import { expect, test } from "bun:test";
-import { DiscordOutbox } from "../../src/adapter/discord/outbox";
+import { DiscordOutbox, discordDedupeKey, discordWireNonce } from "../../src/adapter/discord/outbox";
 import { startDiscordAdapter } from "../../src/adapter/discord/main";
 import { DiscordRouteHandler } from "../../src/adapter/discord/route";
 import type { JsonRpcClient } from "../../src/rpc-client";
@@ -291,10 +291,16 @@ externalTest("Discord crash after send before settlement retries with a nonce an
 		await Bun.sleep(5_100);
 		expect(await outbox(gatewayUnderTest, fixture).runOnce()).toBe("sent");
 		expect(fixture.sends).toHaveLength(1);
+		const wireNonce = discordWireNonce(discordDedupeKey("discord:owner-dm", String(appended.seq)));
+		expect(wireNonce.length).toBeLessThanOrEqual(25);
 		expect(fixture.sendAttempts).toEqual([
-			expect.objectContaining({ duplicate: false, nonce: `gajaeway-discord:discord:owner-dm:${appended.seq}` }),
-			expect.objectContaining({ duplicate: true, nonce: `gajaeway-discord:discord:owner-dm:${appended.seq}` }),
+			expect.objectContaining({ duplicate: false, nonce: wireNonce }),
+			expect.objectContaining({ duplicate: true, nonce: wireNonce }),
 		]);
+		for (const attempt of fixture.sendAttempts) {
+			// Live Discord rejects nonces longer than 25 characters (50035 NONCE_TYPE_TOO_LONG).
+			expect(attempt.nonce.length).toBeLessThanOrEqual(25);
+		}
 		expect(gatewayUnderTest.core.consumerCursor("gajaeway-discord")).toBe(appended.cursor);
 	} finally {
 		await fixture.disconnect();
