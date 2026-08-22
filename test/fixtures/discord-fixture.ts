@@ -5,10 +5,22 @@ interface DiscordFixtureTimer {
 	readonly callback: () => void | Promise<void>;
 }
 
+interface DeferredTypingAcknowledgement {
+	resolve(): void;
+	reject(error: Error): void;
+}
+
+interface DeferredSend {
+	resolve(): void;
+}
+
+
 export class DiscordFixtureClock {
 	#now: number;
 	#nextTimerId = 1;
 	readonly #timers = new Map<number, DiscordFixtureTimer>();
+	readonly #timerErrors: Error[] = [];
+
 
 	constructor(initialNow = 0) {
 		this.#now = initialNow;
@@ -19,6 +31,9 @@ export class DiscordFixtureClock {
 	get scheduledTimerCount(): number {
 		return this.#timers.size;
 	}
+
+
+
 
 	advance(milliseconds: number): void {
 		assertDuration(milliseconds);
@@ -37,7 +52,8 @@ export class DiscordFixtureClock {
 		if (typeof timer === "number") this.#timers.delete(timer);
 	}
 
-	async advanceTimersBy(milliseconds: number): Promise<void> {
+	/** Fires due callbacks without awaiting asynchronous work; use flushAsync() to drain settled continuations. */
+	advanceTimersBy(milliseconds: number): void {
 		assertDuration(milliseconds);
 		const deadline = this.#now + milliseconds;
 		for (;;) {
@@ -49,9 +65,16 @@ export class DiscordFixtureClock {
 			const [timerId, timer] = next;
 			this.#timers.delete(timerId);
 			this.#now = timer.at;
-			await timer.callback();
+			this.runTimer(timer.callback);
 		}
 	}
+
+	async flushAsync(): Promise<void> {
+		for (let turn = 0; turn < 4; turn += 1) await Promise.resolve();
+		const error = this.#timerErrors.shift();
+		if (error) throw error;
+	}
+
 
 	private nextTimerBefore(deadline: number): [number, DiscordFixtureTimer] | undefined {
 		let next: [number, DiscordFixtureTimer] | undefined;
@@ -61,6 +84,15 @@ export class DiscordFixtureClock {
 		}
 		return next;
 	}
+
+	private runTimer(callback: () => void | Promise<void>): void {
+		try {
+			void Promise.resolve(callback()).catch(error => this.#timerErrors.push(asError(error)));
+		} catch (error) {
+			this.#timerErrors.push(asError(error));
+		}
+	}
+
 }
 
 function assertDuration(milliseconds: number): void {
@@ -124,12 +156,26 @@ export class DiscordFixture implements DiscordPlatform {
 	readonly #queuedSendIds: string[] = [];
 	readonly #queuedMessages: DiscordMessage[] = [];
 	readonly #queuedTypingErrors: Error[] = [];
+	#deferredTypingCount = 0;
+	#deferredSendCount = 0;
+	readonly #pendingTyping: DeferredTypingAcknowledgement[] = [];
+	readonly #pendingSends: DeferredSend[] = [];
+
+
 
 	#connected = false;
 
 	constructor(options: DiscordFixtureOptions = {}) {
 		this.#now = options.now ?? Date.now;
 		this.#sendId = options.sendId ?? (input => `discord-send-${input.ordinal}`);
+	}
+
+	get pendingTypingCount(): number {
+		return this.#pendingTyping.length;
+	}
+
+	get pendingSendCount(): number {
+		return this.#pendingSends.length;
 	}
 
 	get connected(): boolean {
@@ -183,6 +229,33 @@ export class DiscordFixture implements DiscordPlatform {
 		this.#queuedTypingErrors.push(error);
 	}
 
+	deferNextTyping(): void {
+		this.#deferredTypingCount += 1;
+	}
+
+	resolveNextTyping(): void {
+		const pending = this.#pendingTyping.shift();
+		if (!pending) throw new Error("No deferred fixture typing acknowledgement is pending.");
+		pending.resolve();
+	}
+
+	rejectNextTyping(error = new Error("fixture deferred typing acknowledgement failed")): void {
+		const pending = this.#pendingTyping.shift();
+		if (!pending) throw new Error("No deferred fixture typing acknowledgement is pending.");
+		pending.reject(error);
+	}
+
+	deferNextSend(): void {
+		this.#deferredSendCount += 1;
+	}
+
+	releaseNextSend(): void {
+		const pending = this.#pendingSends.shift();
+		if (!pending) throw new Error("No deferred fixture send is pending.");
+		pending.resolve();
+	}
+
+
 	/** Queues an inbound event until the next gateway connection without acknowledging it. */
 	queueMessage(input: DiscordFixtureMessage): void {
 		this.#queuedMessages.push(this.recordMessage(input));
@@ -218,9 +291,21 @@ export class DiscordFixture implements DiscordPlatform {
 		this.sendAttempts.push(attempt);
 		if (priorId) return priorId;
 		this.#nonceIds.set(nonce, id);
+		if (this.#deferredSendCount > 0) {
+			this.#deferredSendCount -= 1;
+			return await new Promise<string>(resolve => {
+				this.#pendingSends.push({
+					resolve: () => {
+						this.sends.push(attempt);
+						resolve(id);
+					},
+				});
+			});
+		}
 		this.sends.push(attempt);
 		return id;
 	}
+
 
 	async ackTyping(channelId: string): Promise<void> {
 		if (!this.#connected) throw new Error("Discord fixture gateway is disconnected.");
@@ -228,11 +313,28 @@ export class DiscordFixture implements DiscordPlatform {
 		this.acknowledgementAttempts.push(acknowledgement);
 		const error = this.#queuedTypingErrors.shift();
 		if (error) throw error;
+		if (this.#deferredTypingCount > 0) {
+			this.#deferredTypingCount -= 1;
+			return await new Promise<void>((resolve, reject) => {
+				this.#pendingTyping.push({
+					resolve: () => {
+						this.acknowledgements.push(acknowledgement);
+						resolve();
+					},
+					reject,
+				});
+			});
+		}
 		this.acknowledgements.push(acknowledgement);
 	}
+
 
 	async react(channelId: string, messageId: string, emoji: string): Promise<void> {
 		if (!this.#connected) throw new Error("Discord fixture gateway is disconnected.");
 		this.reactions.push({ channelId, messageId, emoji, at: this.#now() });
 	}
+}
+
+function asError(error: unknown): Error {
+	return error instanceof Error ? error : new Error(String(error));
 }

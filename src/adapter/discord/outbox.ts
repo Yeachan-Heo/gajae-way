@@ -142,9 +142,11 @@ export function discordDedupeKey(surfaceId: string, seq: string): string {
 
 /**
  * Discord rejects nonces longer than 25 characters (50035 NONCE_TYPE_TOO_LONG),
- * so the wire nonce is a deterministic 24-hex-character digest of the full
- * dedupe key. Retries and post-restart replays of the same journal event keep
- * producing the identical nonce, preserving `enforce_nonce` deduplication.
+ * so the wire nonce is a deterministic 24-hex-character (96-bit) digest of the
+ * full dedupe key. At one billion events, the birthday-bound collision chance is
+ * about 6.3e-12; the full dedupe key remains the durable consumer.commit proof.
+ * Retries and post-restart replays of the same journal event keep producing the
+ * identical nonce, preserving `enforce_nonce` deduplication.
  */
 export function discordWireNonce(dedupeKey: string): string {
 	return createHash("sha256").update(dedupeKey).digest("hex").slice(0, 24);

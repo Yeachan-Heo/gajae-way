@@ -3,7 +3,8 @@ import { defaultConfig, parseWayConfig } from "../../config";
 import { RpcClient, rpcResult, type JsonRpcClient } from "../../rpc-client";
 import { loadWayCore } from "../../native-loader";
 import { loadDiscordAdapterConfig, type DiscordAdapterConfig } from "./config";
-import { DiscordOutbox } from "./outbox";
+import { DiscordOutbox, type DiscordOutboxItem } from "./outbox";
+
 import { DiscordGatewayPlatform, validateDiscordToken, type DiscordFetch, type DiscordPlatform } from "./platform";
 import { DiscordRouteHandler } from "./route";
 
@@ -17,6 +18,9 @@ const GATEWAY_HEALTH_TIMEOUT_MS = 1_000;
 const GATEWAY_READINESS_DIAGNOSTIC_INTERVAL_MS = 30_000;
 const DISCORD_TYPING_KEEPALIVE_MS = 8_000;
 const DISCORD_TYPING_KEEPALIVE_CAP_MS = 10 * 60_000;
+const DISCORD_TYPING_KEEPALIVE_JOURNAL_PAGE_SIZE = 500;
+const DISCORD_TYPING_KEEPALIVE_JOURNAL_PAGE_LIMIT = 100;
+
 
 export interface DiscordTypingKeepaliveClock {
 	now(): number;
@@ -80,6 +84,7 @@ export async function startDiscordAdapter(
 		controller = activeController;
 		const activeTypingKeepalive = new DiscordTypingKeepalive({
 			platform: activePlatform,
+			rpc,
 			signal: activeController.signal,
 			onError,
 			clock: dependencies.typingKeepaliveClock,
@@ -100,7 +105,7 @@ export async function startDiscordAdapter(
 			route: config.route,
 			claimTtlMs: config.claimTtlMs,
 			readWaitMs: config.readWaitMs,
-			hooks: { afterSendBeforeCommit: () => activeTypingKeepalive.stop(config.route.channelId) },
+			hooks: { afterSendBeforeCommit: item => activeTypingKeepalive.delivered(config.route.channelId, item) },
 			onError,
 		});
 		unsubscribe = activePlatform.onMessage(async message => {
@@ -143,6 +148,7 @@ export async function startDiscordAdapter(
 
 class DiscordTypingKeepalive {
 	readonly #platform: DiscordPlatform;
+	readonly #rpc: JsonRpcClient;
 	readonly #signal: AbortSignal;
 	readonly #onError: (error: Error) => void;
 	readonly #clock: DiscordTypingKeepaliveClock;
@@ -151,11 +157,13 @@ class DiscordTypingKeepalive {
 
 	constructor(options: {
 		readonly platform: DiscordPlatform;
+		readonly rpc: JsonRpcClient;
 		readonly signal: AbortSignal;
 		readonly onError: (error: Error) => void;
 		readonly clock?: DiscordTypingKeepaliveClock;
 	}) {
 		this.#platform = options.platform;
+		this.#rpc = options.rpc;
 		this.#signal = options.signal;
 		this.#onError = options.onError;
 		this.#clock = options.clock ?? systemTypingKeepaliveClock;
@@ -168,9 +176,16 @@ class DiscordTypingKeepalive {
 
 	begin(channelId: string, messageId: string): void {
 		if (this.#stopped || this.#signal.aborted) return;
-		const channel = this.#channels.get(channelId) ?? { admissions: new Set<string>() };
-		channel.admissions.add(messageId);
+		const channel = this.#channels.get(channelId) ?? createTypingKeepaliveChannel();
+		const admission: TypingAdmission = {};
+
+		channel.admissions.set(messageId, admission);
+		// A later accepted command makes an older assistant event ambiguous. Until
+		// this admission's journal head is observed, retain typing rather than let
+		// a backlogged delivery clear a newer owner turn.
+		channel.latestAdmission = admission;
 		this.#channels.set(channelId, channel);
+		void this.captureDeliveryBoundary(channelId, channel, admission);
 	}
 
 	start(channelId: string, messageId: string): void {
@@ -178,19 +193,35 @@ class DiscordTypingKeepalive {
 		const channel = this.#channels.get(channelId);
 		if (!channel || !channel.admissions.delete(messageId)) return;
 		channel.deadlineAt = this.#clock.now() + DISCORD_TYPING_KEEPALIVE_CAP_MS;
-		if (channel.timer === undefined) this.schedule(channelId, channel);
+		this.scheduleExpiry(channelId, channel);
+		if (channel.timer !== undefined) {
+			this.#clock.clearTimeout(channel.timer);
+			channel.timer = undefined;
+		}
+		this.schedule(channelId, channel);
 	}
 
 	cancel(channelId: string, messageId: string): void {
 		const channel = this.#channels.get(channelId);
-		if (!channel || !channel.admissions.delete(messageId)) return;
-		if (channel.deadlineAt === undefined && channel.admissions.size === 0) this.#channels.delete(channelId);
+		const admission = channel?.admissions.get(messageId);
+		if (!channel || !admission) return;
+		channel.admissions.delete(messageId);
+		if (channel.latestAdmission === admission) channel.latestAdmission = undefined;
+		if (channel.deadlineAt === undefined && channel.admissions.size === 0 && !channel.refreshInFlight) this.stop(channelId);
+	}
+
+	delivered(channelId: string, item: DiscordOutboxItem): void {
+		const channel = this.#channels.get(channelId);
+		const boundary = channel?.latestAdmission?.boundary;
+		if (!channel || !boundary || !deliveryFollowsBoundary(item, boundary)) return;
+		this.stop(channelId);
 	}
 
 	stop(channelId: string): void {
 		const channel = this.#channels.get(channelId);
 		if (!channel) return;
 		if (channel.timer !== undefined) this.#clock.clearTimeout(channel.timer);
+		if (channel.capTimer !== undefined) this.#clock.clearTimeout(channel.capTimer);
 		this.#channels.delete(channelId);
 	}
 
@@ -201,8 +232,47 @@ class DiscordTypingKeepalive {
 		for (const channelId of [...this.#channels.keys()]) this.stop(channelId);
 	};
 
-	private schedule(channelId: string, channel: TypingKeepaliveChannel): void {
+	private async captureDeliveryBoundary(channelId: string, channel: TypingKeepaliveChannel, admission: TypingAdmission): Promise<void> {
+		try {
+			const boundary = await readJournalHead(this.#rpc, this.#signal);
+			if (!boundary || !this.isCurrent(channelId, channel) || channel.latestAdmission !== admission) return;
+			admission.boundary = boundary;
+		} catch {
+			// An unreadable head cannot prove delivery causality. The cap provides the
+			// bounded safe outcome: retain typing rather than stop a newer turn.
+		}
+	}
+
+	private scheduleExpiry(channelId: string, channel: TypingKeepaliveChannel): void {
 		if (!this.isCurrent(channelId, channel) || channel.deadlineAt === undefined) return;
+		if (channel.capTimer !== undefined) this.#clock.clearTimeout(channel.capTimer);
+		const remainingMs = channel.deadlineAt - this.#clock.now();
+		if (remainingMs <= 0) {
+			this.stop(channelId);
+			return;
+		}
+		channel.capTimer = this.#clock.setTimeout(() => this.expire(channelId, channel), remainingMs);
+	}
+
+	private expire(channelId: string, channel: TypingKeepaliveChannel): void {
+		if (!this.isCurrent(channelId, channel) || channel.deadlineAt === undefined) return;
+		channel.capTimer = undefined;
+		if (this.#clock.now() < channel.deadlineAt) {
+			this.scheduleExpiry(channelId, channel);
+			return;
+		}
+		this.stop(channelId);
+	}
+
+	private schedule(channelId: string, channel: TypingKeepaliveChannel): void {
+		if (
+			!this.isCurrent(channelId, channel) ||
+			channel.deadlineAt === undefined ||
+			channel.timer !== undefined ||
+			channel.refreshInFlight
+		) {
+			return;
+		}
 		const remainingMs = channel.deadlineAt - this.#clock.now();
 		if (remainingMs <= 0) {
 			this.stop(channelId);
@@ -220,11 +290,17 @@ class DiscordTypingKeepalive {
 			this.stop(channelId);
 			return;
 		}
-		this.schedule(channelId, channel);
+		if (channel.refreshInFlight) return;
+		channel.refreshInFlight = true;
 		try {
 			await this.#platform.ackTyping(channelId);
 		} catch (error) {
-			this.reportFailure(channelId, error);
+			if (this.isCurrent(channelId, channel)) this.reportFailure(channelId, error);
+		} finally {
+			channel.refreshInFlight = false;
+			if (this.isCurrent(channelId, channel) && channel.deadlineAt !== undefined && this.#clock.now() < channel.deadlineAt) {
+				this.schedule(channelId, channel);
+			}
 		}
 	}
 
@@ -242,10 +318,74 @@ class DiscordTypingKeepalive {
 	}
 }
 
+interface TypingAdmission {
+	boundary?: JournalCursor;
+}
+
 interface TypingKeepaliveChannel {
-	readonly admissions: Set<string>;
+	readonly admissions: Map<string, TypingAdmission>;
+	latestAdmission?: TypingAdmission;
 	deadlineAt?: number;
 	timer?: unknown;
+	capTimer?: unknown;
+	refreshInFlight: boolean;
+}
+
+interface JournalCursor {
+	readonly generation: string;
+	readonly seq: string;
+}
+
+function createTypingKeepaliveChannel(): TypingKeepaliveChannel {
+	return { admissions: new Map(), refreshInFlight: false };
+}
+
+/** Reads the inclusive journal head; only a strictly later event can be a reply to a later admission. */
+async function readJournalHead(rpc: JsonRpcClient, signal: AbortSignal): Promise<JournalCursor | undefined> {
+	let cursor: string | undefined;
+	for (let page = 0; page < DISCORD_TYPING_KEEPALIVE_JOURNAL_PAGE_LIMIT; page += 1) {
+		const result = rpcResult<unknown>(
+			await rpc.request(
+				"main.events.read",
+				{
+					...(cursor === undefined ? {} : { cursor }),
+					limit: DISCORD_TYPING_KEEPALIVE_JOURNAL_PAGE_SIZE,
+					wait_ms: 0,
+				},
+				{ signal },
+			),
+			"main.events.read",
+		);
+		if (!isRecord(result) || !Array.isArray(result.events) || typeof result.next_cursor !== "string") return undefined;
+		const nextCursor = parseJournalCursor(result.next_cursor);
+		if (!nextCursor) return undefined;
+		cursor = result.next_cursor;
+		if (result.gap !== undefined) continue;
+		if (result.events.length < DISCORD_TYPING_KEEPALIVE_JOURNAL_PAGE_SIZE) return nextCursor;
+	}
+	return undefined;
+}
+
+function deliveryFollowsBoundary(item: DiscordOutboxItem, boundary: JournalCursor): boolean {
+	const deliveryCursor = parseJournalCursor(item.cursor);
+	return deliveryCursor?.generation === boundary.generation && decimalGreaterThan(item.seq, boundary.seq);
+}
+
+function parseJournalCursor(value: unknown): JournalCursor | undefined {
+	if (typeof value !== "string") return undefined;
+	const match = /^(\d+):(\d+)$/.exec(value);
+	if (!match) return undefined;
+	return { generation: normalizeDecimal(match[1] as string), seq: normalizeDecimal(match[2] as string) };
+}
+
+function decimalGreaterThan(left: string, right: string): boolean {
+	const normalizedLeft = normalizeDecimal(left);
+	const normalizedRight = normalizeDecimal(right);
+	return normalizedLeft.length > normalizedRight.length || (normalizedLeft.length === normalizedRight.length && normalizedLeft > normalizedRight);
+}
+
+function normalizeDecimal(value: string): string {
+	return value.replace(/^0+(?=\d)/, "");
 }
 
 const systemTypingKeepaliveClock: DiscordTypingKeepaliveClock = {
