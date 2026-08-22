@@ -1,77 +1,68 @@
 {
   "schemaVersion": 1,
   "kind": "api-package-test-report",
-  "sourceHash": "sha256:6b8a85008fff58935c41c8225fe1c270e589104b660fd3d7d7b637b75fed8eb0",
-  "snapshotCommit": "bb280f622e3a1895a335450514a288e4b59bdabc",
-  "priorSnapshotCommit": "6f65a8f268b383f5a08609b2d559fb9560f8f40e",
-  "status": "blocked",
+  "sourceHash": "sha256:0ef52eeddf5d7de7ed3d452b9edf1aa691ca583cf9ad69f7e4a8a28ff22fdd33",
+  "snapshotCommit": "eda0a5730dbc24f689de2f12e28631d15ad1bc9f",
+  "priorSnapshotCommit": "bb280f622e3a1895a335450514a288e4b59bdabc",
+  "baselineSnapshotCommit": "6f65a8f268b383f5a08609b2d559fb9560f8f40e",
+  "status": "passed",
   "e2eStatus": "passed",
-  "redTeamStatus": "failed",
-  "planCodeMismatch": true,
+  "redTeamStatus": "passed",
+  "planCodeMismatch": false,
   "commands": [
     {
-      "command": "bun run build:native",
-      "classification": "required native N-API rebuild before Generation-10 compile/e2e",
+      "command": "bun scripts/build-native.ts",
+      "classification": "required native N-API rebuild before compiled verification",
       "passed": 1,
       "failed": 0,
       "observed": "Built and installed native/way_core.darwin-arm64.node (release, target-cpu=apple-m1).",
       "verdict": "passed"
     },
     {
-      "command": "bun /tmp/g026-r8-red-team.ts",
-      "classification": "throwaway direct N-API journal/reconciliation red-team for exact evidence, unknown no-evidence, corrupt aliases, wrong aliases, and v7 migration",
-      "passed": 5,
-      "failed": 1,
-      "observed": "Exact receipt alias, no-evidence retention, corrupt JSON fail-closed, distinct exact wrong ID rejection, and v7→v8 legacy exact alias passed. A v8 explicit binding was incorrectly finalized by a different turn attempt id merely ending in :op_ref.",
-      "verdict": "failed",
-      "blocker": "R8-v8-suffix-alias-acceptance"
+      "command": "bun /tmp/g028-r8-red-team.ts",
+      "classification": "direct native journal/restart-reconciliation red-team for R8 exact binding, false evidence, malformed binding, and v7 migration",
+      "passed": 7,
+      "failed": 0,
+      "observed": "Exact receipt evidence finalized canonical replay; suffix-only, absent, object, non-JSON, empty-array, and v7-NULL false-evidence cases each retained their claim with the expected fail-closed reason.",
+      "verdict": "passed"
     },
     {
-      "command": "bun /tmp/g025-alias-suffix-check.ts",
-      "classification": "minimal restart-reconciliation poison-alias reproducer",
-      "passed": 0,
-      "failed": 1,
-      "observed": "attempt_ids_json=[broker-turn-g025-original] plus journaled turn_end attempt_id=different-turn:g025-original and unknown broker status left pending=[]: claim finalized incorrectly.",
-      "verdict": "failed",
-      "blocker": "R8-v8-suffix-alias-acceptance"
-    },
-    {
-      "command": "bun /tmp/g025-inprocess-alias-check.ts",
-      "classification": "live-host blast-radius comparison for the poison alias",
+      "command": "bun /tmp/g028-real-sigkill-trap.ts",
+      "classification": "real SIGKILL poison-claim trap over a test fixture and real source daemon",
       "passed": 1,
       "failed": 0,
-      "observed": "The wrong terminal event was journaled but in-process exact admission.attemptIds.includes matching retained pendingCount=1. The defect is confined to restart reconciliation suffix matching.",
+      "observed": "A preload paused main-admission finalization after durable assistant_message plus exact receipt-bound turn_end. ManagedProcessRegistry sent actual SIGKILL; restart with the fixture broker operation forgotten/unknown reached healthy/running, finalized the original response, replayed identically, returned conflict 1500, and retained one broker admission/command.",
       "verdict": "passed"
     },
     {
-      "command": "bun /tmp/g026-production-seams.ts",
-      "classification": "source and freshly compiled production-mode e2e test-seam inertness",
-      "passed": 2,
+      "command": "cargo test v7_pending_main_admission_migrates_without_synthesizing_attempt_ids",
+      "classification": "focused Rust store migration test",
+      "passed": 1,
       "failed": 0,
-      "observed": "With all three admission failure/throw environment variables set and NODE_ENV=production, source and compiled daemons accepted and terminally processed one turn, remained healthy/running, and dispatched exactly one broker operation.",
-      "verdict": "passed"
-    },
-    {
-      "command": "bun test test/integration/p4.test.ts",
-      "classification": "affected owner-UDS admission, durable attempt binding, journal-head response, replay/reconciliation, and idempotency suite",
-      "passed": 22,
-      "failed": 0,
-      "expectCalls": 122,
-      "observed": "Expected test-only bridge logs covered post-acceptance interruption, broker receipt loss/rejection, and other asserted negative paths.",
+      "observed": "One selected test passed; 70 filtered. v7 migration reaches schema 8 with pending attempt_ids_json=NULL.",
       "verdict": "passed"
     },
     {
       "command": "bun test test/qa/recovery-fail-closed.test.ts",
-      "classification": "affected real-daemon poison-claim, recovery, and fail-closed suite; final isolated rerun",
-      "passed": 10,
+      "classification": "affected real-daemon poison-claim restart, terminal evidence, and fail-closed suite",
+      "passed": 15,
       "failed": 0,
-      "expectCalls": 123,
-      "observed": "Includes the test-gated post-acceptance bridge throw plus terminal-boundary exit-137 recovery drill: terminal evidence, unknown broker status after fixture forgetOperation, canonical replay, conflict 1500, and no resend. An earlier concurrent invocation timed out during a process-heavy parallel run and observed runner teardown signal 143 instead of the expected 137; this isolated rerun passed.",
+      "expectCalls": 161,
+      "observed": "Includes post-acceptance bridge throw, journaled assistant reply and turn_end before deterministic abrupt exit 137, restart after fixture broker status becomes unknown, canonical replay, conflict 1500, no resend, suffix false evidence, unbound false evidence, and malformed binding cases.",
+      "verdict": "passed"
+    },
+    {
+      "command": "bun test test/integration/p4.test.ts",
+      "classification": "affected owner-UDS admission, durable attempt binding, terminal recovery, journal-head response, and idempotency suite",
+      "passed": 22,
+      "failed": 0,
+      "expectCalls": 122,
+      "observed": "Expected test-only bridge exceptions covered asserted post-acceptance interruption, receipt loss/rejection, and exact-once paths.",
       "verdict": "passed"
     },
     {
       "command": "bun test test/unit/main-session.test.ts",
-      "classification": "affected strict-resume, durable transcript, host, and admission unit spot check",
+      "classification": "affected strict-resume, durable transcript, host, and admission unit suite",
       "passed": 33,
       "failed": 0,
       "expectCalls": 111,
@@ -79,16 +70,16 @@
     },
     {
       "command": "bun test test/integration/discord.test.ts test/integration/discord-platform.test.ts",
-      "classification": "Discord adapter/platform regression spot check",
+      "classification": "affected Discord adapter/platform suite",
       "passed": 22,
       "failed": 0,
       "expectCalls": 178,
-      "observed": "Expected fixture broker-rejection bridge-error logging occurred only alongside passing negative assertions.",
+      "observed": "Expected fixture broker-rejection bridge log occurred only with passing negative assertions.",
       "verdict": "passed"
     },
     {
       "command": "bun scripts/compile.ts",
-      "classification": "required compilation after native rebuild before compiled e2e",
+      "classification": "required TS compilation after native rebuild and before compiled e2e",
       "passed": 1,
       "failed": 0,
       "observed": "Compiled and codesigned dist/gajaeway and dist/gajaeway-discord for darwin-arm64.",
@@ -96,7 +87,7 @@
     },
     {
       "command": "bun test test/e2e/compiled-closure.test.ts",
-      "classification": "post-rebuild compiled closure/transcript verification e2e",
+      "classification": "post-build compiled closure/transcript e2e",
       "passed": 4,
       "failed": 0,
       "expectCalls": 25,
@@ -104,66 +95,65 @@
     },
     {
       "command": "bun test test/e2e/systemd.test.ts",
-      "classification": "post-rebuild compiled topology/systemd e2e",
+      "classification": "post-build compiled topology/systemd e2e",
       "passed": 4,
       "failed": 0,
       "expectCalls": 100,
       "verdict": "passed"
     },
     {
-      "command": "bun test test/integration/console.test.ts",
-      "classification": "console integration regression behind refreshed PTY evidence",
-      "passed": 24,
+      "command": "bun /tmp/g028-production-seams.ts",
+      "classification": "source and freshly compiled production-mode test-seam inertness",
+      "passed": 2,
       "failed": 0,
-      "expectCalls": 111,
-      "observed": "Expected teardown-only shutting_down/request cancelled logs occurred with passing assertions.",
+      "observed": "With both admission test variables and terminal-evidence exit variable set under NODE_ENV=production, source and compiled daemons each accepted and terminally processed one turn, stayed healthy/running, and issued exactly one broker admission.",
       "verdict": "passed"
     },
     {
-      "command": "bun /tmp/g027-gen3-gen4-regression-probes.ts",
+      "command": "bun /tmp/g028-gen3-gen4-regression-probes.ts",
       "classification": "standing Generation-3/4 proof, projection, admission disposition, and acknowledgement regression",
       "passed": 7,
       "failed": 0,
       "verdict": "passed"
     },
     {
-      "command": "bun /tmp/g027-gen5-r2-regression.ts",
-      "classification": "standing Generation-5 readiness and production-hook regression",
+      "command": "bun /tmp/g028-gen5-r2-regression.ts",
+      "classification": "standing Generation-5 closure readiness and production-hook regression",
       "passed": 4,
       "failed": 0,
       "verdict": "passed"
     },
     {
-      "command": "bun /tmp/g027-gen6-r3-regression.ts",
+      "command": "bun /tmp/g028-gen6-r3-regression.ts",
       "classification": "standing Generation-6 receipt-integrity, waiter, and production-hook regression",
       "passed": 3,
       "failed": 0,
       "verdict": "passed"
     },
     {
-      "command": "bun /tmp/g027-gen7-r4-regression.ts",
+      "command": "bun /tmp/g028-gen7-r4-regression.ts",
       "classification": "standing Generation-7 typing, nonce/restart, and heartbeat/resume regression",
       "passed": 3,
       "failed": 0,
       "verdict": "passed"
     },
     {
-      "command": "bun /tmp/g027-gen8-r6-regression.ts",
+      "command": "bun /tmp/g028-gen8-r6-regression.ts",
       "classification": "standing Generation-8 causal delivery, serialization, stop/cap, and nonce-purity regression",
       "passed": 4,
       "failed": 0,
-      "observed": "All cases retained adapterHeadScans=0 under direct server journal boundaries.",
+      "observed": "All cases retained adapterHeadScans=0 using direct server-owned journal boundaries.",
       "verdict": "passed"
     },
     {
-      "command": "bun /tmp/g027-gen9-r7-regression.ts",
+      "command": "bun /tmp/g028-gen9-r7-regression.ts",
       "classification": "standing Generation-9 native head, fast-reply, boundary diagnostics, and atomic server-boundary regression",
       "passed": 4,
       "failed": 0,
       "verdict": "passed"
     },
     {
-      "command": "bun /tmp/g027-console-transcript.ts",
+      "command": "bun /tmp/g028-console-transcript.ts",
       "classification": "fresh redirected raw-TTY console evidence harness",
       "passed": 1,
       "failed": 0,
@@ -179,7 +169,16 @@
       "verdict": "passed"
     },
     {
-      "command": "bun src/main.ts --help && ./dist/gajaeway --help",
+      "command": "bun test test/integration/console.test.ts",
+      "classification": "console integration regression behind refreshed PTY evidence",
+      "passed": 24,
+      "failed": 0,
+      "expectCalls": 111,
+      "observed": "Expected teardown-only shutting_down/request cancelled logs occurred with passing assertions.",
+      "verdict": "passed"
+    },
+    {
+      "command": "bun src/main.ts --help; ./dist/gajaeway --help",
       "classification": "source and freshly compiled main CLI surface",
       "passed": 2,
       "failed": 0,
@@ -187,7 +186,7 @@
       "verdict": "passed"
     },
     {
-      "command": "bun src/adapter/discord/main.ts --help && ./dist/gajaeway-discord --help",
+      "command": "bun src/adapter/discord/main.ts --help; ./dist/gajaeway-discord --help",
       "classification": "source and freshly compiled Discord adapter CLI surface",
       "passed": 2,
       "failed": 0,
@@ -195,31 +194,16 @@
       "verdict": "passed"
     },
     {
-      "command": "LC_ALL=C bun -e 'console.log(\"g027-cli-ok\")'",
-      "classification": "safe deterministic replay evidence retained inside replayExempt artifact shape",
+      "command": "LC_ALL=C bun -e 'console.log(\"g028-cli-ok\")'",
+      "classification": "safe deterministic replay evidence retained in replayExempt shape",
       "passed": 1,
       "failed": 0,
-      "recordedStdout": "g027-cli-ok\n",
+      "recordedStdout": "g028-cli-ok\n",
       "recordedStderr": "",
       "verdict": "passed"
     },
     {
-      "command": "Structural rebind validation of artifacts/g013-live-drill-receipt.md",
-      "classification": "Generation-10 provenance rebind only; fresh live adoption intentionally not contacted",
-      "passed": 1,
-      "failed": 0,
-      "observed": "Existing strict read-only UDS/REST facts, assistant/gap rows, cursor, timing rows, bot-count statement, no-mutation caveat, and token-redaction guard remain present. Only snapshot/hash provenance changed.",
-      "verdict": "passed"
-    },
-    {
-      "command": "git diff --check 6f65a8f..bb280f6 && git diff --check",
-      "classification": "frozen source delta and refreshed artifact whitespace validation",
-      "passed": 1,
-      "failed": 0,
-      "verdict": "passed"
-    },
-    {
-      "command": "git grep -n '@gajae-code/coding-agent' bb280f6 -- package.json bun.lock src test scripts README.md || true",
+      "command": "git grep -n '@gajae-code/coding-agent' eda0a5730dbc24f689de2f12e28631d15ad1bc9f -- package.json bun.lock src test scripts README.md || true",
       "classification": "retained removed-dependency guard",
       "passed": 1,
       "failed": 0,
@@ -230,16 +214,16 @@
   "contractCoverage": [
     {
       "contractRef": "R1",
-      "obligation": "Startup closure recovery shares host mutation readiness: visible non-fatal refusal retains durable intent and healthy recovery finalizes exactly once.",
+      "obligation": "Startup closure recovery shares host mutation readiness; a visible non-fatal refusal retains durable intent and healthy recovery finalizes exactly once.",
       "status": "covered",
       "evidence": [
         "Generation-5 acquired/committed-not-pushed recovery probes passed.",
-        "Generation-6 receipt/recovery probe passed fresh final replay behavior."
+        "Generation-6 fresh worker receipt/final replay recovery probe passed."
       ]
     },
     {
       "contractRef": "R2",
-      "obligation": "Every Git dispatch validates readiness/fencing; original and same-key waiter map to typed 1003 while unrelated ClosureErrors preserve their own codes.",
+      "obligation": "Every Git dispatch validates readiness/fencing; original and same-key waiter receive typed 1003 while unrelated ClosureErrors preserve their own codes.",
       "status": "covered",
       "evidence": [
         "Generation-5 after-acquire and after-commit fences passed.",
@@ -268,8 +252,8 @@
       "obligation": "G013 live-drill receipt remains strict read-only UDS/Discord evidence.",
       "status": "covered",
       "evidence": [
-        "Receipt retains assistant seq 845/848/850/853, gap seq 843/844/846/851/852, journal head 1:896, consumer cursor 1:853, and 7 bot history posts.",
-        "Generation 10 only re-bound provenance; it did not contact the fresh live adoption or perform a mutable UDS/Discord operation."
+        "Receipt retains assistant seq 845/848/850/853, gap seq 843/844/846/851/852, journal head 1:896, consumer cursor 1:853, and seven bot-authored history posts.",
+        "Generation 11 only re-bound provenance; it did not contact the fresh Generation-10 live adoption or perform any mutable UDS/Discord operation."
       ]
     },
     {
@@ -282,7 +266,7 @@
     },
     {
       "contractRef": "R7",
-      "obligation": "main.submit synchronous server journal boundary is returned/persisted/replayed and directly consumed with safe diagnostics.",
+      "obligation": "main.submit synchronous server journal boundary is returned, persisted, replayed, and directly consumed with safe diagnostics.",
       "status": "covered",
       "evidence": [
         "Generation-9 native/fast-race/diagnostic/replay regression passed 4/0: boundary=1:1, reply=1:3, client scans=0, and direct/restart replay retained 1:1 after head 1:2."
@@ -290,12 +274,13 @@
     },
     {
       "contractRef": "R8",
-      "obligation": "Unknown broker status may finalize a pending poison claim only from exact durable terminal evidence bound by attempt_ids_json; wrong/corrupt/missing evidence must retain the claim and fail closed. Legacy null binding uses only narrow exact aliases.",
-      "status": "blocked",
+      "obligation": "A broker-accepted pre-effect claim survives an abrupt post-acceptance failure; unknown-broker restart recovery finalizes only from exact persisted receipt IDs. Unbound/malformed/wrong terminal evidence fails closed and remains retained; v7 migration preserves NULL.",
+      "status": "covered",
       "evidence": [
-        "Positive: exact v8 receipt alias finalizes unknown broker claim with canonical response preserved; recovery-fail-closed 10/0 passed actual terminal-boundary interruption/restart/no-resend replay drill.",
-        "Positive: no terminal evidence yielded main_admission_recovery_unprovable with claim retained; corrupt attempt_ids_json yielded main_admission_intent_invalid with claim retained; a distinct exact attempt ID stayed unprovable; v7 database migrated to v8 and legacy exact turn:op_ref path replayed.",
-        "Blocking negative: explicit v8 attempt_ids_json=[broker-turn-g026-original-op] plus terminal attempt_id=different-turn:g026-original-op finalizes and deletes the claim under unknown broker status. This violates the required wrong-op_ref rejection."
+        "Recovery-fail-closed suite passed 15/0. Its real-daemon terminal-boundary interruption journals assistant_message and turn_end, then restarts after fixture broker status becomes unknown; it asserts healthy recovery, same op_ref/journal_head_cursor replay, conflict 1500, and exactly one admission attempt.",
+        "Direct actual-SIGKILL probe passed: finalization was paused only after assistant_message and exact receipt-bound turn_end were durable; pendingAtPause=1, managed process group received SIGKILL, broker status was unknown after fixture forgetOperation, restart was healthy, pendingAfterRestart=0, canonical replay was identical, conflict=1500, and brokerCommands=1.",
+        "Direct red-team passed 7/0: exact evidence yields canonical replay; suffix-only different turn, absent binding, object/non-JSON/empty binding all retain and fail closed; v7→v8 preserves NULL and does not infer aliases.",
+        "The shared host predicate is exact equality only; restart reconciliation invokes it over persisted canonical IDs."
       ]
     },
     {
@@ -351,7 +336,7 @@
       "obligation": "Injected recovery faults retain no-resend/no-silent-progress safety and visible fence/degraded/FAILED_CLOSED behavior.",
       "status": "covered",
       "evidence": [
-        "Generation-3/4 passed 7/0; isolated recovery-fail-closed suite passed 10/0."
+        "Generation-3/4 passed 7/0; recovery-fail-closed suite passed 15/0."
       ]
     }
   ],
@@ -359,42 +344,41 @@
     {
       "surface": "api",
       "invocations": [
-        "bun /tmp/g026-r8-red-team.ts",
-        "bun /tmp/g025-alias-suffix-check.ts",
-        "bun /tmp/g025-inprocess-alias-check.ts",
-        "bun /tmp/g026-production-seams.ts",
-        "bun test test/integration/p4.test.ts",
+        "bun /tmp/g028-r8-red-team.ts",
+        "bun /tmp/g028-real-sigkill-trap.ts",
         "bun test test/qa/recovery-fail-closed.test.ts",
-        "bun /tmp/g027-gen3-gen4-regression-probes.ts",
-        "bun /tmp/g027-gen5-r2-regression.ts",
-        "bun /tmp/g027-gen6-r3-regression.ts",
-        "bun /tmp/g027-gen7-r4-regression.ts",
-        "bun /tmp/g027-gen8-r6-regression.ts",
-        "bun /tmp/g027-gen9-r7-regression.ts"
+        "bun test test/integration/p4.test.ts",
+        "bun /tmp/g028-production-seams.ts",
+        "bun /tmp/g028-gen3-gen4-regression-probes.ts",
+        "bun /tmp/g028-gen5-r2-regression.ts",
+        "bun /tmp/g028-gen6-r3-regression.ts",
+        "bun /tmp/g028-gen7-r4-regression.ts",
+        "bun /tmp/g028-gen8-r6-regression.ts",
+        "bun /tmp/g028-gen9-r7-regression.ts"
       ],
-      "observed": "All standing safety domains passed, and the intended poison-claim happy-path recovery is observed. However, restart reconciliation alone accepts a different terminal attempt id solely because it ends in :op_ref, even when a current v8 row carries explicit receipt aliases. The in-process host exact-includes matching did not exhibit this flaw.",
-      "verdict": "blocked"
+      "observed": "Exact persisted receipt-ID matching is exercised both in host and restart reconciliation. The prior suffix false-positive now stays main_admission_recovery_unprovable with its pending claim retained; no legacy alias union or arbitrary suffix path was observed.",
+      "verdict": "passed"
     },
     {
       "surface": "cli",
       "invocations": [
-        "bun run build:native",
+        "bun scripts/build-native.ts",
         "bun scripts/compile.ts",
         "bun src/main.ts --help",
         "./dist/gajaeway --help",
         "bun src/adapter/discord/main.ts --help",
         "./dist/gajaeway-discord --help",
-        "LC_ALL=C bun -e 'console.log(\"g027-cli-ok\")'",
+        "LC_ALL=C bun -e 'console.log(\"g028-cli-ok\")'",
         "bun test test/e2e/compiled-closure.test.ts",
         "bun test test/e2e/systemd.test.ts"
       ],
-      "observed": "Native rebuild preceded compilation. Source/compiled CLI help matched and 8 compiled e2e cases passed. replayExempt remains structurally valid for compiled-GJC argv limitations.",
+      "observed": "Native rebuild preceded compilation. Source/compiled main and Discord CLI usage matched; 8 compiled e2e cases passed. replayExempt remains structurally valid for compiled-GJC argv limits.",
       "verdict": "passed"
     },
     {
       "surface": "tui",
       "invocations": [
-        "bun /tmp/g027-console-transcript.ts",
+        "bun /tmp/g028-console-transcript.ts",
         "bun test test/integration/console.test.ts"
       ],
       "observed": "Fresh raw-TTY fixture capture has 14 writes, 14,216 bytes, 358 ESC bytes, alternate-screen enter/exit, Delivered as: prompt, and Assistant:. Console integration passed 24 cases / 111 expectations.",
@@ -403,81 +387,80 @@
   ],
   "adversarialCases": [
     {
-      "scenario": "Exact v8 broker receipt alias with unknown broker status and terminal boundary",
-      "expectedBehavior": "Finalize canonical original response only with exact durable evidence.",
-      "observed": "terminalCursor=1:1, replayed=true, canonical response preserved, pendingCount=0.",
+      "scenario": "Post-acceptance bridge throw, durable assistant reply and receipt-bound terminal boundary, actual SIGKILL before finalization, broker status forgotten/unknown, and daemon restart",
+      "expectedBehavior": "Restart healthy; finalize original canonical response without resend; same-key replay identical; conflicting reuse is 1500.",
+      "observed": "Direct real-SIGKILL harness paused at the native finalizer only after assistantDurable=true, terminalDurable=true, pendingAtPause=1; it sent SIGKILL, restarted with unknown broker status, observed pendingAfterRestart=0 and healthy/running, replayIdentical=true, conflict=1500, admissionAttempts=1, and brokerCommands=1. The recovery-fail-closed suite independently passed 15/0 for its abrupt-exit seam.",
       "verdict": "passed"
     },
     {
-      "scenario": "Post-acceptance bridge throw, terminal journal evidence, forced terminal-boundary exit 137, unknown broker status after fixture forgetOperation, then daemon restart",
-      "expectedBehavior": "Healthy restart, original canonical replay, no broker resend, same-key identical response, conflicting reuse 1500.",
-      "observed": "Committed recovery-fail-closed drill passed 10/0 and asserts terminal evidence, replay cursor/op_ref, conflict 1500, and one fixture admission attempt.",
+      "scenario": "Unknown broker plus exact persisted v8 receipt ID on a durable terminal turn_end",
+      "expectedBehavior": "Finalize only the original canonical response.",
+      "observed": "Direct probe terminalCursor=1:1, pendingCount=0, replayed=true, canonicalResponsePreserved=true.",
       "verdict": "passed"
     },
     {
-      "scenario": "Unknown broker status with no durable terminal evidence",
-      "expectedBehavior": "main_admission_recovery_unprovable and retained claim.",
-      "observed": "MainAdmissionRecoveryError reason=main_admission_recovery_unprovable; pendingCount=1.",
+      "scenario": "Unknown broker plus unrelated post-boundary main turn_end sharing only a persisted alias suffix",
+      "expectedBehavior": "Must remain main_admission_recovery_unprovable with claim retained; no suffix matching.",
+      "observed": "canonical=opaque-turn-g028-suffix-op; unrelated=other:opaque-turn-g028-suffix-op; error=main_admission_recovery_unprovable; pendingCount=1.",
       "verdict": "passed"
     },
     {
-      "scenario": "Corrupt attempt_ids_json with otherwise matching-looking terminal event",
-      "expectedBehavior": "Fail closed, retain, and never silently re-derive aliases.",
-      "observed": "MainAdmissionRecoveryError reason=main_admission_intent_invalid; stored value not-json; pendingCount=1.",
+      "scenario": "Unknown broker plus absent attempt_ids_json and an op_ref-shaped terminal event",
+      "expectedBehavior": "No legacy inference; retain claim as unprovable.",
+      "observed": "error=main_admission_recovery_unprovable; pendingCount=1; attemptIdsJson absent.",
       "verdict": "passed"
     },
     {
-      "scenario": "Different exact terminal attempt id",
-      "expectedBehavior": "Cannot finalize a v8 receipt-bound claim.",
-      "observed": "broker-turn-a-different-operation caused main_admission_recovery_unprovable and pendingCount=1.",
+      "scenario": "Unknown broker plus object attempt_ids_json",
+      "expectedBehavior": "Fail closed without re-derivation or resend.",
+      "observed": "error=main_admission_intent_invalid; stored={} and pendingCount=1.",
       "verdict": "passed"
     },
     {
-      "scenario": "Different terminal attempt id that ends with current op_ref",
-      "expectedBehavior": "Cannot finalize a v8 receipt-bound claim; explicit aliases require exact membership.",
-      "observed": "attempt_ids_json=[broker-turn-g026-original-op], wrong attempt=different-turn:g026-original-op, unknown broker result; reconciliation returned normally and pendingCount=0.",
-      "verdict": "failed",
-      "blocker": "R8-v8-suffix-alias-acceptance"
-    },
-    {
-      "scenario": "Same wrong suffix event delivered to a running host",
-      "expectedBehavior": "Live settlement must reject mismatched evidence as well.",
-      "observed": "Wrong event was journaled, but live host retained pendingCount=1 because it uses exact admission.attemptIds.includes; restart reconciliation remains the vulnerable site.",
+      "scenario": "Unknown broker plus non-JSON attempt_ids_json",
+      "expectedBehavior": "Fail closed without re-derivation or resend.",
+      "observed": "error=main_admission_intent_invalid; stored=not-json and pendingCount=1.",
       "verdict": "passed"
     },
     {
-      "scenario": "v7 database with legacy pending row and no attempt_ids_json",
-      "expectedBehavior": "Migrates to v8; narrow exact turn:op_ref legacy path remains usable.",
-      "observed": "schemaVersionAfterOpen=8; attemptIdsJson absent; exact turn:op_ref terminal event replayed; pendingAfter=0.",
+      "scenario": "Unknown broker plus empty-array attempt_ids_json",
+      "expectedBehavior": "Fail closed without re-derivation or resend.",
+      "observed": "error=main_admission_intent_invalid; stored=[] and pendingCount=1.",
       "verdict": "passed"
     },
     {
-      "scenario": "Production source and compiled processes with all test seam variables enabled",
+      "scenario": "Schema-v7 pending admission migration",
+      "expectedBehavior": "Upgrade to v8 while preserving NULL, with no alias synthesis.",
+      "observed": "schemaVersion=8; attemptIdsJson absent; op_ref-shaped terminal evidence remained main_admission_recovery_unprovable with pendingCount=1.",
+      "verdict": "passed"
+    },
+    {
+      "scenario": "Production source and compiled daemons with all new admission crash/throw seam variables supplied",
       "expectedBehavior": "Test seams are inert outside NODE_ENV=test.",
-      "observed": "Both accepted and terminally processed one turn, stayed healthy/running, and had one broker attempt.",
+      "observed": "Each stayed healthy/running after accepted and terminally processed admission; one broker attempt each.",
       "verdict": "passed"
     },
     {
-      "scenario": "Older held delivery followed by newer accepted admission, then later reply",
-      "expectedBehavior": "Old/equal delivery retains typing; strictly later delivery stops it.",
-      "observed": "Generation-8 causal probe retained typing through 1000/9000 then stopped on later reply; adapter head scans=0.",
+      "scenario": "Earlier held delivery followed by a newer accepted admission, then a later assistant reply",
+      "expectedBehavior": "Old/equal delivery retains typing; strictly later delivery stops it without adapter head scans.",
+      "observed": "Generation-8 causal probe retained typing through 1000/9000 then stopped on later reply; adapterHeadScans=0.",
       "verdict": "passed"
     },
     {
       "scenario": "Deferred ackTyping, stop during request, and cap during never-settling request",
-      "expectedBehavior": "No fan-out, no post-stop effects, independent cap ends ownership.",
+      "expectedBehavior": "No fan-out, no post-stop effects, and independent cap clears ownership.",
       "observed": "Generation-8 probe held attempts=2/pending=1; stopTimers=0, capTimers=0, late reports=0.",
       "verdict": "passed"
     },
     {
       "scenario": "Generation-7 typing/nonce/heartbeat regression",
-      "expectedBehavior": "Earlier Discord contract survives generation-10 changes.",
+      "expectedBehavior": "Earlier Discord contract survives Generation-11 changes.",
       "observed": "3 probes passed; nonce retry deduped; pre-READY close count=0; resume sequence=42.",
       "verdict": "passed"
     },
     {
       "scenario": "Generation-9 native head, fast reply, boundary diagnostics, and atomic replay regression",
-      "expectedBehavior": "Server journal boundary behavior survives generation-10 changes.",
+      "expectedBehavior": "Server journal boundary behavior survives Generation-11 changes.",
       "observed": "4 probes passed; native head 1:0→1:1; fast reply 1:3 after boundary 1:1; scans=0.",
       "verdict": "passed"
     },
@@ -489,94 +472,86 @@
     },
     {
       "scenario": "Native rebuild, compile, compiled closure/systemd, and console PTY regeneration",
-      "expectedBehavior": "Latest native/TS source reaches compiled/TUI surfaces.",
+      "expectedBehavior": "Latest native/TS source reaches compiled and TUI surfaces.",
       "observed": "Build/compile passed; compiled e2e=8; console capture structural invariants passed.",
       "verdict": "passed"
     },
     {
       "scenario": "G013 receipt source-hash rebind only",
       "expectedBehavior": "No unauthorized fresh live mutation or token persistence.",
-      "observed": "Only provenance changed; receipt structural/token-redaction validation passed; fresh live Gen10 adoption was not contacted.",
+      "observed": "Only provenance changed; receipt structural/token-redaction validation passed; fresh Generation-10 live adoption was not contacted.",
       "verdict": "passed"
     }
   ],
   "probes": [
     {
-      "contract": "R8 exact v8 terminal evidence",
-      "invocation": "bun /tmp/g026-r8-red-team.ts :: exact-v8-receipt-bound-terminal-evidence-finalizes-unknown-broker-claim",
-      "expected": "Exact persisted receipt alias finalizes and preserves original response.",
-      "observed": "Passed: replayed=true, canonicalResponsePreserved=true.",
+      "contract": "R8 exact persisted terminal evidence",
+      "invocation": "bun /tmp/g028-r8-red-team.ts :: exact-persisted-receipt-id-terminal-evidence-finalizes-an-unknown-broker-claim",
+      "expected": "Exact persisted receipt membership finalizes canonical original response.",
+      "observed": "Passed: terminalCursor=1:1, replayed=true, canonicalResponsePreserved=true.",
       "verdict": "passed"
     },
     {
-      "contract": "R8 no evidence/corrupt evidence",
-      "invocation": "bun /tmp/g026-r8-red-team.ts :: no-evidence-and-corrupt-bindings",
-      "expected": "No evidence and corrupt aliases fail closed/retain.",
-      "observed": "Passed: reasons main_admission_recovery_unprovable and main_admission_intent_invalid; each pendingCount=1.",
+      "contract": "R8 suffix and unbound false evidence",
+      "invocation": "bun /tmp/g028-r8-red-team.ts :: suffixAndUnboundFalseEvidence",
+      "expected": "Suffix-only and absent binding must retain claims as unprovable.",
+      "observed": "Passed: each returned main_admission_recovery_unprovable with pendingCount=1.",
       "verdict": "passed"
     },
     {
-      "contract": "R8 different exact evidence",
-      "invocation": "bun /tmp/g026-r8-red-team.ts :: different-exact-terminal-attempt-id-cannot-finalize-v8-claim",
-      "expected": "A separate exact identifier cannot settle the claim.",
-      "observed": "Passed: main_admission_recovery_unprovable, pendingCount=1.",
+      "contract": "R8 malformed binding fail-closed",
+      "invocation": "bun /tmp/g028-r8-red-team.ts :: malformedBindings",
+      "expected": "Object, non-JSON, and empty-array aliases never derive fallback evidence.",
+      "observed": "Passed: all three returned main_admission_intent_invalid with pendingCount=1.",
       "verdict": "passed"
     },
     {
-      "contract": "R8 suffix-shaped different evidence",
-      "invocation": "bun /tmp/g025-alias-suffix-check.ts; bun /tmp/g026-r8-red-team.ts :: v8-different-turn-suffix-of-op-ref",
-      "expected": "Different attempt merely ending in :op_ref cannot settle v8 binding.",
-      "observed": "Failed: different-turn:g026-original-op silently finalized and deleted pending claim.",
-      "verdict": "failed",
-      "blocker": "R8-v8-suffix-alias-acceptance"
-    },
-    {
-      "contract": "R8 in-process blast radius",
-      "invocation": "bun /tmp/g025-inprocess-alias-check.ts",
-      "expected": "Live host rejects wrong suffix too.",
-      "observed": "Passed live-host exact match: wrong event journaled, pendingCount remained 1; only restart reconciliation is vulnerable.",
+      "contract": "Schema v8 migration preservation",
+      "invocation": "bun /tmp/g028-r8-red-team.ts :: v7MigrationPreservesNull; cargo test v7_pending_main_admission_migrates_without_synthesizing_attempt_ids",
+      "expected": "v7 row remains NULL after migration; it is not given an inferred terminal alias.",
+      "observed": "Passed direct and Rust focused migration tests.",
       "verdict": "passed"
     },
     {
-      "contract": "Schema v8 migration / legacy narrow path",
-      "invocation": "bun /tmp/g026-r8-red-team.ts :: v7-database-migrates-to-v8-and-legacy-null-attempt-ids-row-uses-narrow-exact-op-ref-alias",
-      "expected": "v7 upgrade keeps legacy row usable through exact historical alias.",
-      "observed": "Passed: schema=8, no binding on legacy row, exact turn:op_ref replayed.",
+      "contract": "R8 real daemon crash/restart trap",
+      "invocation": "bun /tmp/g028-real-sigkill-trap.ts; bun test test/qa/recovery-fail-closed.test.ts",
+      "expected": "Journal-before-finalize supports no-resend healthy recovery from abrupt post-acceptance interruption.",
+      "observed": "Passed actual SIGKILL harness: durable assistant/terminal evidence before pause, pending=1 at kill, unknown broker restart healthy, exact original replay, conflict 1500, one broker command. The focused suite separately passed 15 cases / 161 expectations.",
       "verdict": "passed"
     },
     {
-      "contract": "New test-seam production gating",
-      "invocation": "bun /tmp/g026-production-seams.ts",
-      "expected": "Source/compiled production ignore bridge-throw and terminal exit test variables.",
+      "contract": "R8 production-only seam guard",
+      "invocation": "bun /tmp/g028-production-seams.ts",
+      "expected": "Both new admission failure seams are inert in source and compiled NODE_ENV=production processes.",
       "observed": "Passed for source and compiled modes.",
       "verdict": "passed"
     },
     {
       "contract": "Generation-3/4 durable proof/projection regression",
-      "invocation": "bun /tmp/g027-gen3-gen4-regression-probes.ts",
+      "invocation": "bun /tmp/g028-gen3-gen4-regression-probes.ts",
       "expected": "B1/B2/C1/C2/C3/C4 durable behavior remains true.",
       "observed": "7 passed; 0 failed.",
       "verdict": "passed"
     },
     {
       "contract": "Generation-5/6 closure regression",
-      "invocation": "bun /tmp/g027-gen5-r2-regression.ts; bun /tmp/g027-gen6-r3-regression.ts",
-      "expected": "Readiness/receipt/waiter contracts remain true.",
+      "invocation": "bun /tmp/g028-gen5-r2-regression.ts; bun /tmp/g028-gen6-r3-regression.ts",
+      "expected": "Readiness, receipt, and waiter contracts remain true.",
       "observed": "4 plus 3 probes passed; 0 failed.",
       "verdict": "passed"
     },
     {
-      "contract": "Generation-7/8/9 Discord and atomic boundary regression",
-      "invocation": "bun /tmp/g027-gen7-r4-regression.ts; bun /tmp/g027-gen8-r6-regression.ts; bun /tmp/g027-gen9-r7-regression.ts",
-      "expected": "Typing, nonce, heartbeat, causal boundary, and direct server head contracts remain true.",
+      "contract": "Generation-7/8/9 Discord and atomic-boundary regression",
+      "invocation": "bun /tmp/g028-gen7-r4-regression.ts; bun /tmp/g028-gen8-r6-regression.ts; bun /tmp/g028-gen9-r7-regression.ts",
+      "expected": "Typing, nonce, heartbeat, causal boundary, and direct server-head contracts remain true.",
       "observed": "3 plus 4 plus 4 probes passed; 0 failed.",
       "verdict": "passed"
     },
     {
       "contract": "Affected suites and compiled/TUI surfaces",
-      "invocation": "p4, recovery-fail-closed, main-session, Discord/platform, console, native build, compile, compiled closure/systemd, console transcript",
-      "expected": "Frozen source runs end-to-end after native rebuild.",
-      "observed": "All final isolated suite/e2e/CLI/TUI checks passed; only the R8 suffix adversary remains blocking.",
+      "invocation": "p4, unit main-session, Discord/platform, console, native build, compile, compiled closure/systemd, console transcript",
+      "expected": "Frozen source runs end to end after native rebuild.",
+      "observed": "All affected suite, e2e, CLI, and TUI checks passed.",
       "verdict": "passed"
     }
   ],
@@ -584,14 +559,14 @@
     {
       "path": "artifacts/g017-qa-api-report.json",
       "kind": "api-package-test-report",
-      "sourceHash": "sha256:6b8a85008fff58935c41c8225fe1c270e589104b660fd3d7d7b637b75fed8eb0",
+      "sourceHash": "sha256:0ef52eeddf5d7de7ed3d452b9edf1aa691ca583cf9ad69f7e4a8a28ff22fdd33",
       "verified": true,
-      "status": "blocked"
+      "status": "passed"
     },
     {
       "path": "artifacts/g017-cli-replay.json",
       "kind": "cli-replay",
-      "sourceHash": "sha256:6b8a85008fff58935c41c8225fe1c270e589104b660fd3d7d7b637b75fed8eb0",
+      "sourceHash": "sha256:0ef52eeddf5d7de7ed3d452b9edf1aa691ca583cf9ad69f7e4a8a28ff22fdd33",
       "verified": true,
       "replayExempt": true,
       "fallbackPath": "artifacts/g017-console-pty-capture.txt"
@@ -599,7 +574,7 @@
     {
       "path": "artifacts/g017-console-pty-capture.txt",
       "kind": "raw-console-pty-capture",
-      "sourceHash": "sha256:6b8a85008fff58935c41c8225fe1c270e589104b660fd3d7d7b637b75fed8eb0",
+      "sourceHash": "sha256:0ef52eeddf5d7de7ed3d452b9edf1aa691ca583cf9ad69f7e4a8a28ff22fdd33",
       "verified": true,
       "bytes": 14216,
       "escapeBytes": 358
@@ -607,7 +582,7 @@
     {
       "path": "artifacts/g013-live-drill-receipt.md",
       "kind": "live-readonly-drill-receipt",
-      "sourceHash": "sha256:6b8a85008fff58935c41c8225fe1c270e589104b660fd3d7d7b637b75fed8eb0",
+      "sourceHash": "sha256:0ef52eeddf5d7de7ed3d452b9edf1aa691ca583cf9ad69f7e4a8a28ff22fdd33",
       "verified": true,
       "reboundOnly": true,
       "liveSocketMutated": false,
@@ -617,7 +592,7 @@
   ],
   "liveDrillReceipt": {
     "path": "artifacts/g013-live-drill-receipt.md",
-    "generation10EvidenceMode": "Provenance rebind and structural validation only; the fresh Generation-10 live adoption was not contacted because historic facts are unchanged and the task permits only strictly read-only live operations.",
+    "generation11EvidenceMode": "Provenance rebind and structural validation only; the fresh Generation-10 live adoption was not contacted because its historic facts are unchanged and only strictly read-only live operations are authorized.",
     "originalReadOnlyMethods": [
       "way.status",
       "main.events.read",
@@ -629,24 +604,5 @@
     "discordBotHistoryCount": 7,
     "restartEvidenceScope": "Read-only post-drill count/checkpoint corroboration. QA did not restart the live adapter because restart would violate the strict read-only constraint."
   },
-  "blockers": [
-    {
-      "id": "R8-v8-suffix-alias-acceptance",
-      "severity": "blocking",
-      "contractRef": "R8",
-      "summary": "Restart reconciliation treats a different terminal attempt merely ending in :op_ref as proof for a v8 claim with explicit attempt_ids_json bindings.",
-      "reproduction": "bun /tmp/g025-alias-suffix-check.ts",
-      "observed": {
-        "explicitAttemptIdsJson": "[\"broker-turn-g025-original\"]",
-        "differentTerminalAttemptId": "different-turn:g025-original",
-        "brokerStatus": "unknown",
-        "pendingAfterReconciliation": [],
-        "result": "Claim finalized even though terminal evidence belongs to a different turn."
-      },
-      "sourceLocation": "src/main-session/admission.ts: hasDurableTerminalEvidence() passes both legacyAttemptIds(intent.op_ref) and persisted v8 IDs to matchesAttemptId(); matchesAttemptId() accepts arbitrary event attempt IDs ending in ':' + a legacy alias.",
-      "impact": "A colliding or attacker-shaped different turn identifier can cause restart reconciliation to replace a pending pre-effect intent with an accepted replay response without exact proof that the claimed broker operation terminally completed.",
-      "blastRadius": "Restart reconciliation only. /tmp/g025-inprocess-alias-check.ts shows the live host's exact admission.attemptIds.includes check retained the same claim after the wrong event was journaled.",
-      "requiredCorrection": "For rows with non-null attempt_ids_json, use exact membership only in the persisted aliases. Keep any legacy NULL-row compatibility aliases narrow and anchored as exact values; never suffix-match arbitrary event identifiers. Corrupt/non-array/empty binding must continue to fail closed."
-    }
-  ]
+  "blockers": []
 }

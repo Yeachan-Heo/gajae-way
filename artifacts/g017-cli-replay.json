@@ -2,18 +2,18 @@
   "schemaVersion": 1,
   "kind": "cli-replay",
   "replaySafe": false,
-  "sourceHash": "sha256:6b8a85008fff58935c41c8225fe1c270e589104b660fd3d7d7b637b75fed8eb0",
-  "snapshotCommit": "bb280f622e3a1895a335450514a288e4b59bdabc",
+  "sourceHash": "sha256:0ef52eeddf5d7de7ed3d452b9edf1aa691ca583cf9ad69f7e4a8a28ff22fdd33",
+  "snapshotCommit": "eda0a5730dbc24f689de2f12e28631d15ad1bc9f",
   "replayExempt": {
     "reasonCode": "platform_unavailable",
-    "detail": "Executable argv replay is refused in the compiled GJC runtime because process.execPath launches the GJC application rather than a Bun CLI executable. The audited structural fallback is a raw pseudo-terminal capture of the product console CLI recorded on this generation's frozen snapshot.",
+    "detail": "Executable argv replay is refused in the compiled GJC runtime because process.execPath launches the GJC application rather than a Bun CLI executable. The audited structural fallback is a raw pseudo-terminal capture of the product console CLI on this frozen snapshot.",
     "fallback": {
       "kind": "pty-capture",
       "path": "artifacts/g017-console-pty-capture.txt",
-      "description": "Raw-TTY pseudo-terminal capture (14,216 bytes, 358 ESC terminal-control bytes, alternate-screen enter/exit) of way console driven against a real external-host UDS gateway on generation-10 snapshot bb280f6, rendering Delivered as: prompt and the finalized Assistant frame."
+      "description": "Raw-TTY pseudo-terminal capture (14,216 bytes, 358 ESC terminal-control bytes, alternate-screen enter/exit) of the product console against a real external-host UDS fixture on Generation 11, rendering Delivered as: prompt and a finalized Assistant frame."
     },
-    "reason": "Executable argv replay is unavailable in the compiled GJC runtime: process.execPath resolves to the GJC application rather than a Bun CLI executable, so the validator refuses executable replay by design. Audited structural fallback supplied: the generation-10 raw-TTY PTY capture of the product console attached to a local fixture gateway.",
-    "approvedBy": "ultragoal leader (GJC main session, agent-invoked) - NOT an owner approval; the exemption is forced by the compiled-runtime limitation the gate validator itself reports, and the structural PTY fallback is supplied in its place",
+    "reason": "Executable argv replay is unavailable in the compiled GJC runtime: process.execPath resolves to the GJC application rather than a Bun CLI executable. The Generation-11 structural PTY fallback is supplied instead.",
+    "approvedBy": "ultragoal leader (GJC main session, agent-invoked) - NOT an owner approval; the exemption is forced by the compiled-runtime limitation the validator reports, and the structural PTY fallback is supplied in its place.",
     "fallbackArtifactRefs": [
       "console-pty"
     ]
@@ -21,7 +21,7 @@
   "command": [
     "bun",
     "-e",
-    "console.log(\"g027-cli-ok\")"
+    "console.log(\"g028-cli-ok\")"
   ],
   "cwd": ".",
   "env": {
@@ -29,12 +29,12 @@
   },
   "timeoutMs": 30000,
   "expectedExitCode": 0,
-  "recordedStdout": "g027-cli-ok\n",
+  "recordedStdout": "g028-cli-ok\n",
   "recordedStderr": "",
   "invariants": [
     {
       "type": "substring",
-      "value": "g027-cli-ok"
+      "value": "g028-cli-ok"
     },
     {
       "type": "not_substring",
