@@ -1,6 +1,6 @@
 # G013 live Discord drill receipt (read-only)
 
-- **Frozen QA snapshot:** 8ed8866 (sha256:3aae219ca87b14ee16f005209a6cb377dc2fe76aedae7c2008c1dc6ed1efde8d)
+- **Frozen QA snapshot:** 6f65a8f (sha256:dbf145b34dc9822d1b20ca6d4fed20d8d8902edf7fb33c9b8ee13dbae044a528)
 - **Scope:** evidence-only audit. No live gateway state, process, broker session, Discord message, typing indicator, reaction, or consumer checkpoint was modified.
 - **Credential handling:** the Discord token was read by the local GET process only to form its Authorization header. It was neither printed nor written to this artifact or any QA result.
 
