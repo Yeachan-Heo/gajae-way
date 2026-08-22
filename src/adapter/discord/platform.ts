@@ -303,10 +303,11 @@ export class DiscordGatewayPlatform implements DiscordPlatform {
 			this.#socket?.close(4_000, "invalid gateway hello");
 			return;
 		}
-		this.#heartbeatIntervalMs = Math.floor(data.heartbeat_interval);
-		this.#heartbeatAcknowledged = true;
+		const heartbeatIntervalMs = Math.floor(data.heartbeat_interval);
 		this.clearHeartbeat();
-		this.#heartbeatTimer = setInterval(() => this.heartbeat(), this.#heartbeatIntervalMs);
+		this.#heartbeatIntervalMs = heartbeatIntervalMs;
+		this.#heartbeatAcknowledged = true;
+		this.#heartbeatTimer = setInterval(() => this.heartbeat(), heartbeatIntervalMs);
 		this.heartbeat();
 		if (this.#sessionId && this.#sequence !== null) {
 			this.sendGateway({ op: 6, d: { token: this.#token, session_id: this.#sessionId, seq: this.#sequence } });

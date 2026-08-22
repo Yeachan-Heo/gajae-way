@@ -111,3 +111,46 @@ test("hand-rolled Discord platform identifies, heartbeats, resumes, routes MESSA
 		await platform.disconnect();
 	}
 });
+
+test("hello schedules the real heartbeat interval so a latent ACK cannot kill the pre-READY connection", async () => {
+	const sockets: GatewaySocketFixture[] = [];
+	const closes: Array<{ code: number; reason: string }> = [];
+	const platform = new DiscordGatewayPlatform({
+		token: "test-token",
+		fetch: async input => {
+			if (String(input).endsWith("/gateway/bot")) return new Response(JSON.stringify({ url: "wss://gateway.test" }), { status: 200 });
+			return new Response(null, { status: 204 });
+		},
+		webSocketFactory: () => {
+			const socket = new GatewaySocketFixture();
+			const close = socket.close.bind(socket);
+			socket.close = (code = 1_000, reason = "") => {
+				closes.push({ code, reason });
+				close(code, reason);
+			};
+			sockets.push(socket);
+			return socket;
+		},
+		reconnectBaseMs: 1,
+		reconnectMaxMs: 2,
+	});
+	try {
+		const connecting = platform.connect();
+		await waitFor(() => sockets.length === 1);
+		const socket = sockets[0] as GatewaySocketFixture;
+		socket.emit("message", { data: JSON.stringify({ op: 10, d: { heartbeat_interval: 60_000 } }) });
+		// Real Discord acknowledges the first heartbeat over network latency. The
+		// regression (interval scheduled as 0ms) closed the socket with
+		// "Discord heartbeat ACK missing" within this window.
+		await Bun.sleep(40);
+		expect(closes).toEqual([]);
+		const beats = socket.sent.map(entry => JSON.parse(entry)).filter(payload => payload.op === 1);
+		expect(beats).toHaveLength(1);
+		socket.emit("message", { data: JSON.stringify({ op: 11, d: null }) });
+		socket.emit("message", { data: JSON.stringify({ op: 0, s: 1, t: "READY", d: { session_id: "session-latency" } }) });
+		await connecting;
+		expect(closes).toEqual([]);
+	} finally {
+		await platform.disconnect();
+	}
+});
