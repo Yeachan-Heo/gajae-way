@@ -166,6 +166,14 @@ function distinctAttemptIds(values: readonly (string | undefined)[]): string[] {
 	return [...ids];
 }
 
+/** Matches only a receipt-derived canonical attempt ID; never infer ownership from an ID suffix. */
+export function matchesCanonicalAdmissionAttemptId(attemptId: string, canonicalAttemptIds: Iterable<string>): boolean {
+	for (const canonicalAttemptId of canonicalAttemptIds) {
+		if (attemptId === canonicalAttemptId) return true;
+	}
+	return false;
+}
+
 function admissionAttemptIds(sessionId: string, opRef: string, receipt?: BrokerOperationReceipt): string[] {
 	return distinctAttemptIds([
 		opRef,
@@ -437,7 +445,7 @@ class ExternalMainSessionHost implements MainSessionHost {
 	private admittedOperationRef(event: Record<string, unknown>): string | undefined {
 		for (const candidate of this.eventAttemptIds(event)) {
 			for (const [opRef, admission] of this.#admittedOperations) {
-				if (admission.attemptIds.includes(candidate)) return opRef;
+				if (matchesCanonicalAdmissionAttemptId(candidate, admission.attemptIds)) return opRef;
 			}
 		}
 		return undefined;
@@ -462,7 +470,7 @@ class ExternalMainSessionHost implements MainSessionHost {
 		} catch (error) {
 			throw this.enterFailure("main_admission_attempt_ids_persist_failed", error);
 		}
-		if (!attemptIds.some(attemptId => this.#unmatchedTerminalAttemptIds.has(attemptId))) return;
+		if (!attemptIds.some(attemptId => matchesCanonicalAdmissionAttemptId(attemptId, this.#unmatchedTerminalAttemptIds))) return;
 		if (!this.settleAdmittedOperation(opRef)) throw this.#failure ?? new MainSessionHostError("main_admission_finalize_failed");
 	}
 	private publishStatus(): void {

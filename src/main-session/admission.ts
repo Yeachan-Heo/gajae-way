@@ -1,5 +1,5 @@
 import * as crypto from "node:crypto";
-import { MainSessionHostError } from "./host";
+import { matchesCanonicalAdmissionAttemptId, MainSessionHostError } from "./host";
 import type { OwnerSurface, WayProfile } from "../profile";
 import { RpcBridgeException } from "../rpc-bridge";
 import { canonicalJson } from "./gates";
@@ -229,8 +229,14 @@ function parseJournalPayload(payloadJson: string): Record<string, unknown> | und
 	}
 }
 
-function persistedAttemptIds(value: unknown): readonly string[] {
-	if (value === undefined) return [];
+/**
+ * `attempt_ids_json` is absent both for rows migrated from schema v7 and for
+ * a current-schema claim that crashed before its broker receipt was persisted.
+ * Those states have indistinguishable provenance, so absence is never treated
+ * as legacy alias evidence: broker status is the only settlement authority.
+ */
+function persistedAttemptIds(value: unknown): readonly string[] | undefined {
+	if (value === undefined) return undefined;
 	if (typeof value !== "string") {
 		throw new MainAdmissionRecoveryError("main_admission_intent_invalid", "The durable main admission attempt identifiers are malformed.");
 	}
@@ -240,10 +246,15 @@ function persistedAttemptIds(value: unknown): readonly string[] {
 	} catch (error) {
 		throw new MainAdmissionRecoveryError("main_admission_intent_invalid", "The durable main admission attempt identifiers are not JSON.", { cause: error });
 	}
-	if (!Array.isArray(parsed) || parsed.length === 0 || parsed.some(attemptId => typeof attemptId !== "string" || !attemptId)) {
+	if (
+		!Array.isArray(parsed) ||
+		parsed.length === 0 ||
+		parsed.some(attemptId => typeof attemptId !== "string" || !attemptId) ||
+		new Set(parsed).size !== parsed.length
+	) {
 		throw new MainAdmissionRecoveryError("main_admission_intent_invalid", "The durable main admission attempt identifiers are malformed.");
 	}
-	return [...new Set(parsed)];
+	return parsed;
 }
 
 function terminalAttemptId(payloadJson: string): string | undefined {
@@ -260,25 +271,13 @@ function terminalAttemptId(payloadJson: string): string | undefined {
 	return payload.attempt_id;
 }
 
-function legacyAttemptIds(opRef: string): readonly string[] {
-	return [opRef, `turn:${opRef}`, `command:${opRef}`];
-}
-
-function matchesAttemptId(attemptId: string, aliases: ReadonlySet<string>): boolean {
-	if (aliases.has(attemptId)) return true;
-	for (const alias of aliases) {
-		if (attemptId.endsWith(`:${alias}`)) return true;
-	}
-	return false;
-}
 
 async function hasDurableTerminalEvidence(
 	idempotency: MainAdmissionOperationStore,
 	intent: MainAdmissionIntent,
-	attemptIds: readonly string[],
+	canonicalAttemptIds: readonly string[],
 ): Promise<boolean> {
 	if (!idempotency.journalRead) return false;
-	const aliases = new Set([...legacyAttemptIds(intent.op_ref), ...attemptIds]);
 	const terminalAttempts: string[] = [];
 	let cursor = intent.journal_head_cursor;
 	for (;;) {
@@ -301,7 +300,7 @@ async function hasDurableTerminalEvidence(
 			const attemptId = terminalAttemptId(event.payloadJson);
 			if (attemptId) terminalAttempts.push(attemptId);
 		}
-		if (terminalAttempts.some(attemptId => matchesAttemptId(attemptId, aliases))) return true;
+		if (terminalAttempts.some(attemptId => matchesCanonicalAdmissionAttemptId(attemptId, canonicalAttemptIds))) return true;
 		if (page.events.length === 0) return false;
 		if (page.nextCursor === cursor) {
 			throw new MainAdmissionRecoveryError("main_admission_recovery_unavailable", "The durable journal recovery cursor did not advance.");
@@ -486,7 +485,7 @@ export async function reconcilePendingMainAdmissions(
 		} catch (error) {
 			brokerStatusError = error;
 		}
-		if (!brokerProven && !(await hasDurableTerminalEvidence(idempotency, intent, attemptIds))) {
+		if (!brokerProven && !(attemptIds !== undefined && (await hasDurableTerminalEvidence(idempotency, intent, attemptIds)))) {
 			if (brokerStatusError !== undefined) {
 				throw new MainAdmissionRecoveryError(
 					"main_admission_recovery_unavailable",

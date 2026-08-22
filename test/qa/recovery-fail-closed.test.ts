@@ -114,7 +114,14 @@ function bootstrap(stateDirectory: string, profilePath: string, environment: Nod
 	if (result.exitCode !== 0) throw new Error(`bootstrap failed (${result.exitCode}): ${new TextDecoder().decode(result.stderr)}`);
 }
 
-function stagePendingMainAdmission(core: WayCoreHandle, key: string, mode: "valid" | "invalid" = "valid"): { readonly opRef: string } {
+interface StagedMainAdmission {
+	readonly key: string;
+	readonly opRef: string;
+	readonly requestJson: string;
+	readonly intentJson: string;
+}
+
+function stagePendingMainAdmission(core: WayCoreHandle, key: string, mode: "valid" | "invalid" = "valid"): StagedMainAdmission {
 	const requestJson = JSON.stringify({ idempotency_key: key, surface_id: "owner", text: `recover ${key}` });
 	const opRef = `recovery-${key}`;
 	const intentJson =
@@ -135,7 +142,7 @@ function stagePendingMainAdmission(core: WayCoreHandle, key: string, mode: "vali
 			intentJson,
 		}),
 	).toMatchObject({ claimed: true });
-	return { opRef };
+	return { key, opRef, requestJson, intentJson };
 }
 
 function stagePendingClosureOperation(
@@ -817,7 +824,7 @@ test("RPC closure fences the original and in-flight duplicate, then preserves un
 async function assertPendingAdmissionRecoveryFailsClosed(
 	reason: "main_admission_recovery_unavailable" | "main_admission_recovery_unprovable" | "main_admission_intent_invalid",
 	mode: "valid" | "invalid",
-	configureFixture: (fixture: FakeBrokerFixture, opRef: string) => void = () => undefined,
+	configurePending: (fixture: FakeBrokerFixture, pending: StagedMainAdmission, core: WayCoreHandle) => void = () => undefined,
 ): Promise<void> {
 	const fixture = new FakeBrokerFixture();
 	const corpus = path.join(fixture.root, "corpus");
@@ -837,8 +844,8 @@ async function assertPendingAdmissionRecoveryFailsClosed(
 		const core = loadWayCore().WayCore.open(stateDirectory);
 		const state = new GatewayStateStore(core);
 		const deliveryBefore = state.read().transcriptDeliveryProgress;
-		const { opRef } = stagePendingMainAdmission(core, `pending-${reason}`, mode);
-		configureFixture(fixture, opRef);
+		const pending = stagePendingMainAdmission(core, `pending-${reason}`, mode);
+		configurePending(fixture, pending, core);
 		daemon = await startDaemon(stateDirectory, profilePath, environment, 2_000);
 		expect(await waitForHealth(daemon.client, "failed_closed")).toMatchObject({
 			status: "unhealthy",
@@ -849,6 +856,7 @@ async function assertPendingAdmissionRecoveryFailsClosed(
 		expect(state.read().transcriptDeliveryProgress).toEqual(deliveryBefore);
 		expect(fixture.commands()).toEqual([]);
 		expect(fixture.admissionAttempts()).toEqual([]);
+		expect(core.mainAdmissionOperationsPending()).toHaveLength(1);
 	} finally {
 		await stopDaemon(daemon);
 		fixture.dispose();
@@ -861,6 +869,68 @@ test("pending main admission status transport failure fails closed without a bro
 
 test("pending main admission with an unprovable broker status fails closed without a broker resend", async () => {
 	await assertPendingAdmissionRecoveryFailsClosed("main_admission_recovery_unprovable", "valid");
+}, 15_000);
+
+test("a suffix-sharing unrelated terminal attempt cannot settle a pending admission", async () => {
+	await assertPendingAdmissionRecoveryFailsClosed("main_admission_recovery_unprovable", "valid", (_fixture, pending, core) => {
+		const opaqueAttemptId = `opaque-turn-${pending.opRef}`;
+		core.mainAdmissionOperationRecordAttemptIds({
+			scope: "main.submit",
+			key: pending.key,
+			requestJson: pending.requestJson,
+			intentJson: pending.intentJson,
+			attemptIdsJson: canonicalJson([opaqueAttemptId]),
+		});
+		core.journalAppend(
+			"turn_end",
+			canonicalJson({ attempt_id: `other:${opaqueAttemptId}`, generation: 1, lineage: "main" }),
+		);
+	});
+}, 15_000);
+
+test("an unbound pending admission does not infer a legacy terminal alias", async () => {
+	await assertPendingAdmissionRecoveryFailsClosed("main_admission_recovery_unprovable", "valid", (_fixture, pending, core) => {
+		core.journalAppend(
+			"turn_end",
+			canonicalJson({ attempt_id: pending.opRef, generation: 1, lineage: "main" }),
+		);
+	});
+}, 15_000);
+
+test("a pending admission with object attempt_ids_json fails closed without a broker resend", async () => {
+	await assertPendingAdmissionRecoveryFailsClosed("main_admission_intent_invalid", "valid", (_fixture, pending, core) => {
+		core.mainAdmissionOperationRecordAttemptIds({
+			scope: "main.submit",
+			key: pending.key,
+			requestJson: pending.requestJson,
+			intentJson: pending.intentJson,
+			attemptIdsJson: "{}",
+		});
+	});
+}, 15_000);
+
+test("a pending admission with non-JSON attempt_ids_json fails closed without a broker resend", async () => {
+	await assertPendingAdmissionRecoveryFailsClosed("main_admission_intent_invalid", "valid", (_fixture, pending, core) => {
+		core.mainAdmissionOperationRecordAttemptIds({
+			scope: "main.submit",
+			key: pending.key,
+			requestJson: pending.requestJson,
+			intentJson: pending.intentJson,
+			attemptIdsJson: "not-json",
+		});
+	});
+}, 15_000);
+
+test("a pending admission with empty attempt_ids_json fails closed without a broker resend", async () => {
+	await assertPendingAdmissionRecoveryFailsClosed("main_admission_intent_invalid", "valid", (_fixture, pending, core) => {
+		core.mainAdmissionOperationRecordAttemptIds({
+			scope: "main.submit",
+			key: pending.key,
+			requestJson: pending.requestJson,
+			intentJson: pending.intentJson,
+			attemptIdsJson: "[]",
+		});
+	});
 }, 15_000);
 
 test("invalid pending main admission intent fails closed before any broker resend", async () => {

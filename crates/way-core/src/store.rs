@@ -1174,6 +1174,56 @@ mod tests {
     }
 
     #[test]
+    fn v7_pending_main_admission_migrates_without_synthesizing_attempt_ids() {
+        let state_dir = temporary_state_dir("v7-pending-main-admission");
+        let database_path = state_dir.join(DATABASE_FILENAME);
+        let store = Store::open(&state_dir).unwrap();
+        let request = r#"{"idempotency_key":"legacy-key","surface_id":"owner","text":"legacy pending"}"#;
+        let intent = r#"{"delivered_as":"prompt","op_ref":"legacy-op","request_hash":"hash","state":"claimed","version":1}"#;
+        store
+            .claim_main_admission_operation("main.submit", "legacy-key", request, intent, 100)
+            .unwrap();
+        drop(store);
+
+        let connection = Connection::open(&database_path).unwrap();
+        connection
+            .execute_batch(
+                "BEGIN;
+                 ALTER TABLE main_admission_operations RENAME TO main_admission_operations_v8;
+                 CREATE TABLE main_admission_operations (
+                    scope TEXT NOT NULL,
+                    idempotency_key TEXT NOT NULL,
+                    request_json TEXT NOT NULL,
+                    intent_json TEXT NOT NULL,
+                    PRIMARY KEY (scope, idempotency_key),
+                    FOREIGN KEY (scope, idempotency_key) REFERENCES idempotency(scope, idempotency_key)
+                 );
+                 INSERT INTO main_admission_operations(scope, idempotency_key, request_json, intent_json)
+                    SELECT scope, idempotency_key, request_json, intent_json FROM main_admission_operations_v8;
+                 DROP TABLE main_admission_operations_v8;
+                 UPDATE gateway_meta SET v = '7' WHERE k = 'schema_version';
+                 COMMIT;",
+            )
+            .unwrap();
+        drop(connection);
+
+        let migrated = Store::open(&state_dir).unwrap();
+        assert_eq!(migrated.get_meta("schema_version").unwrap(), Some(SCHEMA_VERSION.to_string()));
+        assert_eq!(
+            migrated.pending_main_admission_operations().unwrap(),
+            vec![super::PendingMainAdmissionOperation {
+                scope: "main.submit".to_owned(),
+                key: "legacy-key".to_owned(),
+                request_json: request.to_owned(),
+                intent_json: intent.to_owned(),
+                attempt_ids_json: None,
+            }]
+        );
+        drop(migrated);
+        fs::remove_dir_all(state_dir).unwrap();
+    }
+
+    #[test]
     fn v4_state_directory_initializes_the_durable_tail_ring_rotation_count() {
         let state_dir = temporary_state_dir("v4-tail-ring-rotation");
         let database_path = state_dir.join(DATABASE_FILENAME);
