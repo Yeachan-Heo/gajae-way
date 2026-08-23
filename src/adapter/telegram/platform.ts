@@ -52,6 +52,7 @@ export class TelegramPlatform implements DiscordPlatform {
 	readonly #diagnostic: (message: string) => void;
 	readonly #handlers = new Set<DiscordMessageHandler>();
 	#state: TelegramUpdateState;
+	readonly #topicParents = new Map<string, string>();
 	#running = false;
 	#pollTask: Promise<void> | undefined;
 	#currentUser: Promise<DiscordCurrentUser> | undefined;
@@ -112,8 +113,12 @@ export class TelegramPlatform implements DiscordPlatform {
 				first ??= existing;
 				continue;
 			}
+			// A reply to a topic-originated turn must land back in that topic, not the
+			// supergroup root, so a known topic id resolves to chat + thread.
+			const parentChatId = this.#topicParents.get(channelId);
 			const result = record(await this.call("sendMessage", {
-				chat_id: channelId,
+				chat_id: parentChatId ?? channelId,
+				...(parentChatId ? { message_thread_id: Number(channelId) } : {}),
 				text: chunk,
 				...(index === 0 && options?.replyTo ? { reply_to_message_id: options.replyTo.messageId } : {}),
 			}));
@@ -129,13 +134,25 @@ export class TelegramPlatform implements DiscordPlatform {
 	}
 
 	async ackTyping(channelId: string): Promise<void> {
-		await this.call("sendChatAction", { chat_id: channelId, action: "typing" });
+		const parentChatId = this.#topicParents.get(channelId);
+		await this.call("sendChatAction", {
+			chat_id: parentChatId ?? channelId,
+			...(parentChatId ? { message_thread_id: Number(channelId) } : {}),
+			action: "typing",
+		});
 	}
 
-	async resolveThreadParent(_channelId: string): Promise<string | undefined> {
-		return undefined;
+	/** Maps an observed forum-topic id back to its supergroup chat id. */
+	async resolveThreadParent(channelId: string): Promise<string | undefined> {
+		return this.#topicParents.get(channelId);
 	}
 
+	/**
+	 * Telegram embeds the replied-to author in reply_to_message, so ingress already
+	 * carries `referencedMessageAuthorId` and the route handler never reaches here.
+	 * Returning undefined keeps the shared policy failing closed to not-engaged if
+	 * a future payload ever omits it, rather than guessing an author.
+	 */
 	async resolveMessageAuthor(_channelId: string, _messageId: string): Promise<string | undefined> {
 		return undefined;
 	}
@@ -152,7 +169,7 @@ export class TelegramPlatform implements DiscordPlatform {
 					const update = record(updateValue);
 					const updateId = Number(update.update_id);
 					if (!Number.isSafeInteger(updateId)) continue;
-					const message = telegramMessage(update.message, this.#now());
+					const message = telegramMessage(update.message, this.#now(), this.#topicParents);
 					if (message) for (const handler of [...this.#handlers]) await handler(message);
 					this.#state.offset = updateId + 1;
 					writeState(this.#statePath, this.#state);
@@ -214,19 +231,34 @@ function requiredToken(token: string): string {
 	return value;
 }
 
-function telegramMessage(value: unknown, acceptedAt: number): DiscordMessage | undefined {
+function telegramMessage(value: unknown, acceptedAt: number, topics?: Map<string, string>): DiscordMessage | undefined {
 	const message = record(value);
 	const chat = record(message.chat);
 	const from = record(message.from);
 	if (!message.message_id || (typeof chat.id !== "number" && typeof chat.id !== "string")) return undefined;
 	const text = typeof message.text === "string" ? message.text : "";
+	// A forum-topic message shares its supergroup chat id, so the topic id becomes
+	// the routed channel id (numeric, as derived thread surfaces require) and the
+	// platform remembers which chat it belongs to for parent resolution and sends.
+	const topicId = typeof message.message_thread_id === "number" ? String(message.message_thread_id) : undefined;
+	const routedChannelId = topicId ?? String(chat.id);
+	if (topicId) topics?.set(topicId, String(chat.id));
 	return {
 		id: String(message.message_id),
-		channelId: String(chat.id),
+		channelId: routedChannelId,
 		text,
 		...(from.id === undefined ? {} : { authorId: String(from.id) }),
 		...(from.is_bot === undefined ? {} : { authorBot: from.is_bot === true }),
-		...(record(message.reply_to_message).message_id === undefined ? {} : { messageReference: { channelId: String(chat.id), messageId: String(record(message.reply_to_message).message_id) } }),
+		...(record(message.reply_to_message).message_id === undefined
+			? {}
+			: {
+				messageReference: { channelId: routedChannelId, messageId: String(record(message.reply_to_message).message_id) },
+				// Telegram embeds the replied-to author, so reply-to-bot engagement
+				// resolves without any extra API lookup (unlike Discord).
+				...(record(record(message.reply_to_message).from).id === undefined
+					? {}
+					: { referencedMessageAuthorId: String(record(record(message.reply_to_message).from).id) }),
+			}),
 		acceptedAt,
 	};
 }

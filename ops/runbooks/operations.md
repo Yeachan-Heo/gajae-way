@@ -345,6 +345,21 @@ clears a reason the runtime cannot presently prove resolved. When recovery
 refuses, the remaining remedy is the explicit re-adoption ceremony in
 `bootstrap-ceremony.md`, which does reset journal history.
 
+### Telegram surface notes
+
+Forum topics are the Telegram thread analogue. A topic message's
+`message_thread_id` becomes its routed channel id, so derived thread surfaces stay
+numeric (`<parent-surface>/thread:<topic-id>`) and the parent supergroup is
+resolved from the topic the adapter observed on ingress; replies and typing for a
+topic-originated turn are sent back into that topic. A topic whose parent
+supergroup is not an explicitly routed channel stays refused.
+
+Reply-to-bot engagement needs no extra API call on Telegram: `reply_to_message`
+carries the replied-to author, so the shared engagement policy resolves it from
+ingress. Message reactions are NOT implemented for Telegram; the adapter's
+`react` is intentionally a no-op there and reactions must not be relied on for
+Telegram surfaces.
+
 ## Known limitation: journal latency on continuously busy sessions
 
 The credential-free broker CLI returns tail envelopes only when a terminal turn
