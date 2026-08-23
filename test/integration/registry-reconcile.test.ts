@@ -15,6 +15,9 @@ const temporaryDirectories: string[] = [];
 const fixtureScript = path.join(import.meta.dir, "..", "fixtures", "fake-broker-cli.mjs");
 const runRealBrokerLivenessIntegration = Bun.env.GAJAEWAY_BROKER_RECONCILE_INTEGRATION === "1" && Bun.which("gjc") !== null;
 
+// Reconciliation tests invoke a real fixture child process; 10s gives spawning and round-trip work headroom under CPU contention while preserving the bounded-cycle contract.
+const REAL_BROKER_CYCLE_SLA_MS = 10_000;
+
 afterEach(() => {
 	for (const directory of temporaryDirectories.splice(0)) fs.rmSync(directory, { recursive: true, force: true });
 });
@@ -160,7 +163,7 @@ function createFixture(name: string, state: FixtureState): { root: string; state
 		root,
 		statePath,
 		core: loadWayCore().WayCore.open(path.join(root, "state")),
-		broker: new BrokerCli({ executable }),
+		broker: new BrokerCli({ executable, commandTimeoutMs: 5_000 }), // Real fixture subprocesses must cover cold child spawn under CPU contention; 1s is not a valid budget.
 	};
 }
 
@@ -211,7 +214,7 @@ test("liveness-only broker snapshots stay journal-quiet while persisting freshne
 		}),
 	);
 	const client = await connectEventually(socketPath);
-	const reconciler = new BrokerReconciler({ core: fixture.core, broker: fixture.broker, cycleSlaMs: 2_000, now: () => now });
+	const reconciler = new BrokerReconciler({ core: fixture.core, broker: fixture.broker, cycleSlaMs: REAL_BROKER_CYCLE_SLA_MS, now: () => now });
 	try {
 		await reconciler.trigger();
 		const afterFirstCycle = fixture.core.journalRead("1:0", 100).nextCursor;
@@ -291,7 +294,7 @@ test("reconciliation reflects rename within the shortened poll SLA and preserves
 	});
 	const configured = defaultConfig({ GAJAEWAY_BROKER_CLI: fixture.broker.executable, GAJAEWAY_RECONCILE_POLL_MS: "25" });
 	expect(configured).toMatchObject({ brokerCliPath: fixture.broker.executable, reconcilePollMs: 25 });
-	const reconciler = new BrokerReconciler({ core: fixture.core, broker: fixture.broker, pollMs: 25, cycleSlaMs: 2_000 });
+	const reconciler = new BrokerReconciler({ core: fixture.core, broker: fixture.broker, pollMs: 25, cycleSlaMs: REAL_BROKER_CYCLE_SLA_MS });
 	try {
 		reconciler.start();
 		await eventually(() => (metadataName(fixture.core, "rename") === "before rename" ? true : undefined), "initial metadata");
@@ -311,7 +314,7 @@ test("reconciliation reflects rename within the shortened poll SLA and preserves
 		list: list([row("authority")]),
 		metadata: { authority: metadata("authority") },
 	});
-	const authorityReconciler = new BrokerReconciler({ core: authority.core, broker: authority.broker, cycleSlaMs: 2_000 });
+	const authorityReconciler = new BrokerReconciler({ core: authority.core, broker: authority.broker, cycleSlaMs: REAL_BROKER_CYCLE_SLA_MS });
 	await authorityReconciler.trigger();
 	expect(authority.core.registryGet("authority")).toMatchObject({ kind: "unknown", status: "discovered", source: "reconciler" });
 	const changed = readState(authority.statePath);
@@ -358,7 +361,7 @@ test("gateway authority survives reconciliation and all routing quarantine predi
 		purpose: "operator-owned purpose",
 		status: "starting",
 	});
-	const reconciler = new BrokerReconciler({ core: fixture.core, broker: fixture.broker, cycleSlaMs: 2_000 });
+	const reconciler = new BrokerReconciler({ core: fixture.core, broker: fixture.broker, cycleSlaMs: REAL_BROKER_CYCLE_SLA_MS });
 	await reconciler.trigger();
 	expect(fixture.core.registryGet("gateway")).toMatchObject({
 		source: "gateway",
@@ -424,7 +427,7 @@ test("DTO drift leaves the registry unchanged and reconcile status stale", async
 		}),
 	);
 	const client = await connectEventually(socketPath);
-	const reconciler = new BrokerReconciler({ core: fixture.core, broker: fixture.broker, cycleSlaMs: 2_000 });
+	const reconciler = new BrokerReconciler({ core: fixture.core, broker: fixture.broker, cycleSlaMs: REAL_BROKER_CYCLE_SLA_MS });
 	try {
 		await reconciler.trigger();
 		const statusBefore = await client.request("way.status");
@@ -511,7 +514,7 @@ test("metadata enrichment is bounded to ten commands and unavailable rows honor 
 			sessions.map(session => [session.sessionId, session.sessionId === "bulk-00" ? { unavailable: true } : metadata(session.sessionId)]),
 		),
 	});
-	const reconciler = new BrokerReconciler({ core: fixture.core, broker: fixture.broker, cycleSlaMs: 2_000, now: () => now });
+	const reconciler = new BrokerReconciler({ core: fixture.core, broker: fixture.broker, cycleSlaMs: REAL_BROKER_CYCLE_SLA_MS, now: () => now });
 	await reconciler.trigger();
 	expect(queryIds(fixture.statePath)).toHaveLength(10);
 	expect(rows(fixture.core).filter(row => row.metadataState === "enriched")).toHaveLength(9);

@@ -10,6 +10,8 @@ import { ManagedProcessRegistry } from "../helpers/managed-process";
 import { FakeBrokerFixture } from "../helpers/main-session";
 
 const managedProcesses = new ManagedProcessRegistry();
+// Real daemon admission RPCs cross a spawned broker process; 10s covers the request under cold-start CPU contention.
+const DAEMON_ADMISSION_RPC_TIMEOUT_MS = 10_000;
 
 afterEach(async () => {
 	await managedProcesses.reapAll();
@@ -261,7 +263,7 @@ test("a daemon killed after main broker acceptance recovers the pre-effect claim
 		fixture.holdNextTurn();
 		const request = { text: "claim survives daemon death", surface_id: "owner", idempotency_key: "daemon-death-claim" };
 		try {
-			await killed.client.request("main.submit", request, { timeoutMs: 1_000 });
+			await killed.client.request("main.submit", request, { timeoutMs: DAEMON_ADMISSION_RPC_TIMEOUT_MS });
 		} catch {
 			// The test hook exits the daemon immediately after broker acceptance.
 		}

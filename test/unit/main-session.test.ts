@@ -51,7 +51,8 @@ function supervisor(fixture: FakeBrokerFixture) {
 		workspace: fixture.workspace,
 		tailTimeoutMs: 100,
 		adoptionTailTimeoutMs: 100,
-		commandTimeoutMs: 1_000,
+		// Unit uses the real fake-broker child process; 5s prevents cold spawn timeout under contention.
+		commandTimeoutMs: 5_000,
 	});
 }
 

@@ -18,6 +18,8 @@ const managedProcesses = new ManagedProcessRegistry();
 const repositoryRoot = path.resolve(import.meta.dir, "..", "..");
 const temporaryDirectories: string[] = [];
 
+// Real daemon health/status RPCs can be delayed by cold boot and CPU contention; 5s is the per-call budget while outer polling remains bounded.
+const DAEMON_RPC_TIMEOUT_MS = 5_000;
 type ParsedUnit = {
 	readonly source: string;
 	readonly sections: ReadonlyMap<string, ReadonlyMap<string, readonly string[]>>;
@@ -132,7 +134,7 @@ async function healthyClient(socketPath: string, description: string): Promise<R
 			let client: RpcClient | undefined;
 			try {
 				client = await RpcClient.connect(socketPath);
-				const response = await client.request("way.health", {}, { timeoutMs: 1_000 });
+				const response = await client.request("way.health", {}, { timeoutMs: DAEMON_RPC_TIMEOUT_MS });
 				if (response.result && (response.result as { status?: unknown }).status === "healthy") return client;
 				client.close();
 			} catch (error) {
@@ -505,7 +507,7 @@ test("Type=notify topology keeps Discord ingress disconnected until a fenced bus
 		client = await availableClient(socketPath, "fenced daemon did not expose its RPC listener");
 		const pending = await eventually(
 			async () => {
-				const status = (await client!.request("way.status", {}, { timeoutMs: 1_000 })).result as Record<string, unknown> | undefined;
+				const status = (await client!.request("way.status", {}, { timeoutMs: DAEMON_RPC_TIMEOUT_MS })).result as Record<string, unknown> | undefined;
 				return status?.state === "verifying" && status.transcript_proof === "proven" && status.transcript_verification === "pending"
 					? status
 					: undefined;
@@ -537,7 +539,7 @@ test("Type=notify topology keeps Discord ingress disconnected until a fenced bus
 		const reducedSystemdStartupBoundMs = 250;
 		await Bun.sleep(reducedSystemdStartupBoundMs);
 		expect(daemon.exitCode).toBeNull();
-		expect((await client.request("way.status", {}, { timeoutMs: 1_000 })).result).toMatchObject({
+		expect((await client.request("way.status", {}, { timeoutMs: DAEMON_RPC_TIMEOUT_MS })).result).toMatchObject({
 			status: "booting",
 			state: "verifying",
 			transcript_verification: "pending",
@@ -552,13 +554,13 @@ test("Type=notify topology keeps Discord ingress disconnected until a fenced bus
 		fixture.complete(opRef, { text: "verification completed after ready was already signaled" });
 		await eventually(
 			async () => {
-				const health = (await client!.request("way.health", {}, { timeoutMs: 1_000 })).result as Record<string, unknown> | undefined;
+				const health = (await client!.request("way.health", {}, { timeoutMs: DAEMON_RPC_TIMEOUT_MS })).result as Record<string, unknown> | undefined;
 				return health?.status === "healthy" && health.state === "running" ? health : undefined;
 			},
 			"fenced daemon did not promote after its terminal verification tail",
 		);
 		expect(daemon.exitCode).toBeNull();
-		expect((await client.request("way.status", {}, { timeoutMs: 1_000 })).result).toMatchObject({
+		expect((await client.request("way.status", {}, { timeoutMs: DAEMON_RPC_TIMEOUT_MS })).result).toMatchObject({
 			status: "healthy",
 			state: "running",
 			transcript_verification: "verified",

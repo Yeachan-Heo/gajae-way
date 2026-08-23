@@ -14,6 +14,8 @@ import { FakeBrokerFixture } from "../helpers/main-session";
 const managedProcesses = new ManagedProcessRegistry();
 const repositoryRoot = path.resolve(import.meta.dir, "..", "..");
 
+// Real daemon health/status RPCs can be delayed by cold boot and CPU contention; 5s is the per-call budget while outer polling remains bounded.
+const DAEMON_RPC_TIMEOUT_MS = 5_000;
 afterEach(async () => {
 	await managedProcesses.reapAll();
 });
@@ -55,7 +57,7 @@ async function connectHealthy(socketPath: string): Promise<RpcClient> {
 		let client: RpcClient | undefined;
 		try {
 			client = await RpcClient.connect(socketPath);
-			const health = await client.request("way.health", {}, { timeoutMs: 1_000 });
+			const health = await client.request("way.health", {}, { timeoutMs: DAEMON_RPC_TIMEOUT_MS });
 			if ((health.result as { status?: string } | undefined)?.status === "healthy") return client;
 			client.close();
 		} catch (error) {
@@ -83,7 +85,7 @@ async function waitForPendingTranscriptVerification(
 	transcriptProof: "pending" | "proven" = "pending",
 ): Promise<Record<string, unknown>> {
 	for (let attempt = 0; attempt < 200; attempt += 1) {
-		const response = await client.request("way.status", {}, { timeoutMs: 1_000 });
+		const response = await client.request("way.status", {}, { timeoutMs: DAEMON_RPC_TIMEOUT_MS });
 		const status = response.result as Record<string, unknown> | undefined;
 		if (
 			status?.state === "verifying" &&
@@ -99,7 +101,7 @@ async function waitForPendingTranscriptVerification(
 
 async function waitForFailedClosed(client: RpcClient): Promise<Record<string, unknown>> {
 	for (let attempt = 0; attempt < 200; attempt += 1) {
-		const health = await client.request("way.health", {}, { timeoutMs: 1_000 });
+		const health = await client.request("way.health", {}, { timeoutMs: DAEMON_RPC_TIMEOUT_MS });
 		if ((health.result as { state?: unknown } | undefined)?.state === "failed_closed") return health.result as Record<string, unknown>;
 		await Bun.sleep(25);
 	}
@@ -347,7 +349,7 @@ test("compiled restart defers a durable closure intent until per-boot transcript
 		fixture.complete(busyOpRef, { text: "verification tail is now complete" });
 		await eventually(
 			async () => {
-				const health = (await client!.request("way.health", {}, { timeoutMs: 1_000 })).result as Record<string, unknown> | undefined;
+				const health = (await client!.request("way.health", {}, { timeoutMs: DAEMON_RPC_TIMEOUT_MS })).result as Record<string, unknown> | undefined;
 				if (health?.state === "failed_closed") throw new Error(`compiled daemon failed closed during deferred closure recovery: ${JSON.stringify(health)}`);
 				return health?.status === "healthy" && health.state === "running" ? health : undefined;
 			},

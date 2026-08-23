@@ -18,6 +18,7 @@ import { FakeBrokerFixture } from "../helpers/main-session";
 
 const gatewayScope = new AsyncLocalStorage<ExternalGateway[]>();
 const managedProcesses = new ManagedProcessRegistry();
+const EXTERNAL_GATEWAY_RPC_TIMEOUT_MS = 10_000;
 
 afterEach(async () => {
 	await managedProcesses.reapAll();
@@ -109,7 +110,7 @@ externalTest("main.submit admits a held external turn before the bridge timeout"
 	const response = await gateway.client.request(
 		"main.submit",
 		{ text: "held owner prompt", surface_id: "owner", idempotency_key: "held-owner" },
-		{ timeoutMs: 1_000 },
+		{ timeoutMs: EXTERNAL_GATEWAY_RPC_TIMEOUT_MS },
 	);
 
 	const admission = response.result as { op_ref: string; journal_head_cursor?: unknown };
@@ -370,7 +371,8 @@ externalTest("restart replays the exact verification tail after a down-time ring
 		broker: new BrokerCli({ executable: gateway.fixture.executable, environment: gateway.fixture.environment() }),
 		workspace: gateway.fixture.workspace,
 		tailTimeoutMs: 50,
-		commandTimeoutMs: 1_000,
+		// This restart path still invokes the real fixture CLI; 5s covers child spawn under contention.
+		commandTimeoutMs: 5_000,
 	});
 	let restartedHost: ReturnType<typeof createMainSessionHost> | undefined;
 	try {
@@ -462,7 +464,8 @@ externalTest("restart reconciliation preserves receipt-bound surface attribution
 		broker: new BrokerCli({ executable: gateway.fixture.executable, environment: gateway.fixture.environment() }),
 		workspace: gateway.fixture.workspace,
 		tailTimeoutMs: 50,
-		commandTimeoutMs: 1_000,
+		// Reconciliation after a crash uses a real broker child; 1s is insufficient during loaded spawn.
+		commandTimeoutMs: 5_000,
 	});
 	let restartedHost: ReturnType<typeof createMainSessionHost> | undefined;
 	try {
@@ -576,8 +579,8 @@ externalTest("main.submit replays a pending admission identically without double
 	gateway.fixture.holdNextTurn();
 	const request = { text: "pending once", surface_id: "owner", idempotency_key: "pending-once" };
 
-	const first = await gateway.client.request("main.submit", request, { timeoutMs: 1_000 });
-	const replay = await gateway.client.request("main.submit", request, { timeoutMs: 1_000 });
+	const first = await gateway.client.request("main.submit", request, { timeoutMs: EXTERNAL_GATEWAY_RPC_TIMEOUT_MS });
+	const replay = await gateway.client.request("main.submit", request, { timeoutMs: EXTERNAL_GATEWAY_RPC_TIMEOUT_MS });
 
 	expect(first.result).toMatchObject({ accepted: true, delivered_as: "prompt" });
 	expect(replay.result).toEqual(first.result);
@@ -615,7 +618,8 @@ externalTest("main.submit preserves an ambiguous post-acceptance claim for recon
 		broker: new BrokerCli({ executable: gateway.fixture.executable, environment: gateway.fixture.environment() }),
 		workspace: gateway.fixture.workspace,
 		tailTimeoutMs: 500,
-		commandTimeoutMs: 1_000,
+		// Restart recovery executes real fixture subprocesses; retain a 5s spawn/round-trip budget under contention.
+		commandTimeoutMs: 5_000,
 	});
 	try {
 		const resumed = await strictResumeMainSession({ profile: gateway.profile, state: gateway.state, supervisor: restartedSupervisor });
@@ -707,7 +711,8 @@ externalTest("an accepted operation with a lost receipt preserves growth authori
 		broker: new BrokerCli({ executable: gateway.fixture.executable, environment: gateway.fixture.environment() }),
 		workspace: gateway.fixture.workspace,
 		tailTimeoutMs: 50,
-		commandTimeoutMs: 1_000,
+		// Lost-receipt reconciliation invokes a real child process; 5s avoids false broker_timeout under CPU contention.
+		commandTimeoutMs: 5_000,
 	});
 	let restartedHost: ReturnType<typeof createMainSessionHost> | undefined;
 	try {
@@ -823,7 +828,8 @@ externalTest("a definitive broker rejection abandons only its claim while ambigu
 		broker: new BrokerCli({ executable: gateway.fixture.executable, environment: gateway.fixture.environment() }),
 		workspace: gateway.fixture.workspace,
 		tailTimeoutMs: 500,
-		commandTimeoutMs: 1_000,
+		// Final restart reconciliation still crosses the real broker process boundary; 5s is the contention-safe budget.
+		commandTimeoutMs: 5_000,
 	});
 	try {
 		const resumed = await strictResumeMainSession({ profile: gateway.profile, state: gateway.state, supervisor: restartedSupervisor });

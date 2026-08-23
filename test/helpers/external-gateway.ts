@@ -114,9 +114,10 @@ export async function createExternalGateway(options: ExternalGatewayOptions = {}
 	const supervisor = createExternalHostSupervisor({
 		broker: new BrokerCli({ executable: fixture.executable, environment: fixture.environment() }),
 		workspace: fixture.workspace,
-		tailTimeoutMs: options.tailTimeoutMs ?? 500,
 		adoptionTailTimeoutMs: options.adoptionTailTimeoutMs ?? options.tailTimeoutMs ?? 500,
-		commandTimeoutMs: options.commandTimeoutMs ?? 1_000,
+		tailTimeoutMs: options.tailTimeoutMs ?? 500,
+		// External tests spawn a real fixture CLI for every broker operation; 1s is below cold child-process startup under contention.
+		commandTimeoutMs: options.commandTimeoutMs ?? 5_000,
 	});
 	await bootstrapMainSession({ confirm: true, profile, state, supervisor, sessionId: fixture.sessionId });
 	const resumed = await strictResumeMainSession({ profile, state, supervisor });

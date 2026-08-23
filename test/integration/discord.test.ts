@@ -3,7 +3,7 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 
-import { expect, test } from "bun:test";
+import { afterAll, expect, test } from "bun:test";
 import { DiscordOutbox, discordChunkWireNonce, discordDedupeKey, discordWireNonce } from "../../src/adapter/discord/outbox";
 import { loadDiscordAdapterConfig, type DiscordAdapterConfig } from "../../src/adapter/discord/config";
 import { loadWayProfile } from "../../src/profile";
@@ -17,6 +17,8 @@ import { createExternalGateway, eventually, type ExternalGateway, type ExternalG
 
 
 const gatewayScope = new AsyncLocalStorage<ExternalGateway[]>();
+const discordFixtureSocketRoot = fs.mkdtempSync(path.join(os.tmpdir(), "gajaeway-discord-fixtures-"));
+afterAll(() => fs.rmSync(discordFixtureSocketRoot, { force: true, recursive: true }));
 
 type ExternalTestBody = () => void | Promise<void>;
 
@@ -81,7 +83,7 @@ async function startRoutedFixtureAdapter(
 ) {
 	const unattributedDelivery = options.unattributedDelivery ?? "owner-dm";
 	const config: DiscordAdapterConfig = {
-		rpcSocketPath: "/tmp/gajaeway-discord-routes-fixture.sock",
+		rpcSocketPath: path.join(discordFixtureSocketRoot, `routes-${crypto.randomUUID()}.sock`),
 		token: "fixture-token",
 		routes,
 		blockedAuthorIds: options.blockedAuthorIds ?? [],
@@ -169,7 +171,7 @@ async function startTypingFixtureAdapter(
 ) {
 	return await startDiscordAdapter(
 		{
-			rpcSocketPath: "/tmp/gajaeway-discord-typing-fixture.sock",
+			rpcSocketPath: path.join(discordFixtureSocketRoot, `typing-${crypto.randomUUID()}.sock`),
 			token: "fixture-token",
 			routes: [TYPING_ROUTE],
 			unattributedDelivery: "owner-dm",
@@ -1453,7 +1455,7 @@ externalTest("Discord typing follows accepted admission, not a stale healthy-to-
 
 externalTest("Discord startup reports rate-limited verifying and transport readiness diagnostics without opening ingress", async () => {
 	const config = {
-		rpcSocketPath: "/tmp/discord-gateway-readiness.sock",
+		rpcSocketPath: path.join(discordFixtureSocketRoot, `readiness-${crypto.randomUUID()}.sock`),
 		token: "fixture-token",
 		routes: [OWNER_ROUTE],
 		unattributedDelivery: "owner-dm" as const,
