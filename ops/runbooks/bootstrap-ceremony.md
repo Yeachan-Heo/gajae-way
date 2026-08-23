@@ -70,7 +70,37 @@ back to a recent session.
 The operator remains the owner of the real GJC TUI. Attach with `tmux attach -t <session>` (for example, `tmux attach -t gajae-main`) when tmux hosts it, or use the terminal that runs `gjc`.
 The gateway sends prompts, steers, and follow-ups only through the broker CLI;
 The gateway is only the session's broker-CLI controller.
+## Optional persona MCP discovery
 
+After the gateway is healthy and before asking the persona to use tools, configure
+its corpus/session MCP entry to launch the existing binary as the same OS user:
+
+```sh
+/usr/local/bin/gajaeway mcp \
+  --state-dir /var/lib/gajaeway \
+  --profile /etc/gajaeway/profile.toml
+```
+
+This is a stdio server, so the operator-run `gjc` owns the child process and the
+server connects only to `/var/lib/gajaeway/rpc.sock`. The service account must be
+the same user that owns the owner-only socket; no credentials are passed to the
+persona. Verify `tools/list` contains exactly `way_status`, `way_surfaces`,
+`way_turn_origin`, and `way_say`. If the socket is unavailable or owned by a
+different user, tool calls fail rather than falling back to broker or platform
+access.
+
+The corpus MCP configuration may use this entry:
+
+```json
+{
+  "mcpServers": {
+    "gajaeway": {
+      "command": "/usr/local/bin/gajaeway",
+      "args": ["mcp", "--state-dir", "/var/lib/gajaeway", "--profile", "/etc/gajaeway/profile.toml"]
+    }
+  }
+}
+```
 Gates are answered in that attached GJC TUI, not through the gateway. The
 console `/gate` command remains a capability probe for a future backend with
 validated gate receipts; the external-host backend honestly reports it as

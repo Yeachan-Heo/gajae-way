@@ -32,6 +32,8 @@ import { approveProfile, previewProfileApproval } from "./main-session/profile-a
 import { ResumeError, strictResumeMainSession } from "./main-session/resume";
 import { createExternalHostSupervisor } from "./main-session/supervisor";
 
+import { GatewayToolController, GatewayToolError } from "./main-session/tools";
+import { runWayMcp } from "./mcp";
 import { GatewayStateError, GatewayStateStore } from "./main-session/state";
 import { ProfileRevisionTracker } from "./profile";
 
@@ -43,6 +45,7 @@ const usage = `Usage:
   gajaeway bootstrap --confirm [--session-id ID] [--state-dir PATH] [--profile PATH] [--broker-cli PATH]
   gajaeway console [--surface-id ID] [--state-dir PATH] [--profile PATH]
   gajaeway profile approve --confirm [--state-dir PATH] [--profile PATH]
+  gajaeway mcp [--state-dir PATH] [--profile PATH]
   gajaeway --health [--state-dir PATH] | --version`;
 
 class FailedClosedExit extends Error {
@@ -93,6 +96,27 @@ function failureReason(error: unknown): string {
 		return error.reason;
 	if (error instanceof Error && error.name === "ProfileValidationError") return "profile_invalid";
 	return "startup_failed";
+}
+
+function gatewayToolCallError(error: unknown): never {
+	if (error instanceof GatewayToolError) throw new RpcBridgeException(error.code, error.message, error.data);
+	throw error;
+}
+
+function gatewayToolDiagnostic(tool: string, outcome: "ok" | "error", detail?: string): void {
+	const suffix = detail === undefined ? "" : ` detail=${JSON.stringify(detail.slice(0, 256))}`;
+	console.error(`gateway_tool_call tool=${tool} outcome=${outcome}${suffix}`);
+}
+
+async function invokeGatewayTool<T>(tool: string, call: () => T | Promise<T>): Promise<T> {
+	try {
+		const result = await call();
+		gatewayToolDiagnostic(tool, "ok");
+		return result;
+	} catch (error) {
+		gatewayToolDiagnostic(tool, "error", error instanceof Error ? error.message : String(error));
+		return gatewayToolCallError(error);
+	}
 }
 
 function createRuntimeSupervisor(config: WayConfig, workspace: string) {
@@ -1161,6 +1185,7 @@ async function serveWay(config: WayConfig): Promise<void> {
 			afterTerminalEvidenceBeforeAdmissionFinalize: failAfterMainAdmissionTerminalEvidenceForE2e,
 		});
 		host = resumedHost;
+		const gatewayTools = new GatewayToolController({ core, profile, host: resumedHost });
 		if (!verificationPending) core.setRpcHealth("running");
 		const mutationReadinessReason: MutationReadinessReason = () => resumedHost.mutationReadinessReason;
 		const admissionHandler = createMainAdmissionHandler(host, profile, core, {
@@ -1192,6 +1217,12 @@ async function serveWay(config: WayConfig): Promise<void> {
 			return await rawClosureHandler(method, params);
 		};
 		mainSessionHandler = async (method, params) => {
+			if (method === "main.surfaces") return await invokeGatewayTool("way_surfaces", () => gatewayTools.listSurfaces());
+			if (method === "main.turn.origin") return await invokeGatewayTool("way_turn_origin", () => gatewayTools.turnOrigin());
+			if (method === "main.say") {
+				assertMainSessionMutationReady(resumedHost);
+				return await invokeGatewayTool("way_say", () => gatewayTools.say(params));
+			}
 			if (method === "main.submit" || method === "main.corpus.close") assertMainSessionMutationReady(resumedHost);
 			if (method === "main.submit") return await admissionHandler(params);
 			if (method === "main.gate.answer") return await gateAnswerHandler(params);
@@ -1353,6 +1384,10 @@ export async function runWay(arguments_ = process.argv.slice(2)): Promise<void> 
 	}
 	if (parsed.remaining[0] === "console") {
 		await runWayConsole(parsed.config, parsed.remaining.slice(1));
+		return;
+	}
+	if (parsed.remaining[0] === "mcp") {
+		await runWayMcp(parsed.config);
 		return;
 	}
 	if (parsed.remaining[0] === "bootstrap") {

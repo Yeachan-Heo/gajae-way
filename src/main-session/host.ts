@@ -114,6 +114,8 @@ export interface MainSessionHost {
 	/** The sole mutation fence consulted before any main-session claim or effect. */
 	readonly mutationReadinessReason: string | undefined;
 	readonly gates: MainSessionGateRegistry;
+	/** Surface origin for the currently busy turn; absent when autonomous or ambiguous. */
+	readonly turnOriginSurfaceId: string | undefined;
 	/** Resolves once this daemon has a complete, compatible transcript tail. */
 	waitForVerifiedTranscript(): Promise<void>;
 	/** Waits for broker admission only; successful turn execution is observed asynchronously. */
@@ -470,6 +472,13 @@ class ExternalMainSessionHost implements MainSessionHost {
 
 	get degraded(): boolean {
 		return this.#degraded;
+	}
+
+	get turnOriginSurfaceId(): string | undefined {
+		if (this.#turnState !== "busy") return undefined;
+		const candidates = new Set<string>();
+		for (const admission of this.#admittedOperations.values()) if (admission.surfaceId) candidates.add(admission.surfaceId);
+		return candidates.size === 1 ? candidates.values().next().value : undefined;
 	}
 
 	get turnState(): "idle" | "busy" {

@@ -12,6 +12,7 @@ import {
 } from "../../src/main-session/host";
 import { strictResumeMainSession } from "../../src/main-session/resume";
 import { GatewayStateStore } from "../../src/main-session/state";
+import { GatewayToolController, GatewayToolError } from "../../src/main-session/tools";
 import { createExternalHostSupervisor, type ExternalHostSupervisor } from "../../src/main-session/supervisor";
 import { loadWayCore, type WayCoreHandle } from "../../src/native-loader";
 import { loadWayProfile, type OwnerSurface, type WayProfile } from "../../src/profile";
@@ -146,6 +147,7 @@ export async function createExternalGateway(options: ExternalGatewayOptions = {}
 		...(resumed.growthIntent === undefined ? {} : { recoveredGrowthIntent: resumed.growthIntent }),
 		initialAdmissionAttributions: parseMainSessionAdmissionAttributions(core.mainAdmissionAttributions()),
 	});
+	const gatewayTools = new GatewayToolController({ core, profile, host });
 	const submit = createMainAdmissionHandler(host, profile, core, {
 		newOpRef: options.newOpRef,
 		isSurfaceQuarantined: options.isSurfaceQuarantined,
@@ -153,8 +155,19 @@ export async function createExternalGateway(options: ExternalGatewayOptions = {}
 		mutationReadinessReason: () => host.mutationReadinessReason,
 	});
 	const answer = createMainGateAnswerHandler(host, core);
+	const callGatewayTool = async <T>(call: () => T | Promise<T>): Promise<T> => {
+		try {
+			return await call();
+		} catch (error) {
+			if (error instanceof GatewayToolError) throw new RpcBridgeException(error.code, error.message, error.data);
+			throw error;
+		}
+	};
 	const handler: RpcBridgeHandler = async (method, params) => {
 		if (method === "main.submit") return await submit(params);
+		if (method === "main.say") return await callGatewayTool(() => gatewayTools.say(params));
+		if (method === "main.turn.origin") return await callGatewayTool(() => gatewayTools.turnOrigin());
+		if (method === "main.surfaces") return await callGatewayTool(() => gatewayTools.listSurfaces());
 		if (method === "main.gate.answer") return await answer(params);
 		throw new RpcBridgeException(-32601, `method not found: ${method}`);
 	};

@@ -139,6 +139,69 @@ backend with validated gate receipts; the current backend returns
 attached GJC TUI instead: `tmux attach -t <session>` when the tmux backend hosts
 it, or the terminal that runs `gjc`.
 
+## Persona gateway tools (MCP stdio)
+
+The operator-run persona may discover only four gateway-mediated tools through the
+existing `gajaeway` binary: `way_status`, `way_surfaces`, `way_turn_origin`, and
+`way_say`. These tools do not expose Discord credentials, a generic RPC proxy,
+Git/lock controls, or gate/quarantine operations. `way_say` appends a durable,
+surface-attributed `assistant_message` with `origin: "persona"` and never calls
+`main.submit`, so it cannot create a self-feeding turn.
+
+Configure the operator-run GJC session's corpus MCP entry with this server command,
+for example in the corpus workspace's MCP configuration:
+
+```json
+{
+  "mcpServers": {
+    "gajaeway": {
+      "command": "/usr/local/bin/gajaeway",
+      "args": ["mcp", "--state-dir", "/var/lib/gajaeway", "--profile", "/etc/gajaeway/profile.toml"]
+    }
+  }
+}
+```
+
+The command is equivalent to:
+
+```sh
+/usr/local/bin/gajaeway mcp \
+  --state-dir /var/lib/gajaeway \
+  --profile /etc/gajaeway/profile.toml
+```
+
+The MCP server is stdio JSON-RPC. The GJC process starts it as its child and reads
+its tool list from `tools/list`; do not put a Discord token, REST endpoint, or a
+second adapter in that configuration. The command must run as `gajaeway` (or the
+same OS user that owns `/var/lib/gajaeway/rpc.sock`); connecting from another user
+is intentionally refused by the filesystem-protected owner-only UDS.
+
+`way_turn_origin` returns a surface only for one currently busy, unambiguous
+admitted turn whose origin is proven by gateway admission. It fails with
+`turn_origin_unavailable` for autonomous, idle, or ambiguous concurrent context.
+`way_say` requires an exact configured surface and an idempotency key. It is capped
+to 20 persona messages per 60 seconds and is replay-safe across retries; the
+journal event is delivered by the existing outbox using its explicit `surface_id`.
+
+The `way_say` journal frame is an `assistant_message` with this explicit marker
+(and is therefore distinguishable from a broker turn reply):
+
+```json
+{
+  "finalized": true,
+  "origin": "persona",
+  "persona_initiated": true,
+  "text": "...",
+  "surface_id": "configured-surface-id",
+  "idempotency_key": "caller-key",
+  "request_hash": "sha256-of-canonical-request"
+}
+```
+
+The existing outbox consumes the frame only after `consumer.commit` can settle its
+confirmed send. Its deterministic event/nonce dedupe and the gateway idempotency
+record prevent a retried `way_say` from creating a second journal frame or post.
+
 ## Audit journal and receipt evidence
 
 The durable journal is exposed through `main.events.read`; begin at `1:0` only
@@ -190,15 +253,17 @@ The configured live Discord route table is the final chat-adapter gate after loc
 console acceptance. A future Telegram adapter is subject to the same final-gate
 route drill; neither chat adapter is accepted solely from local RPC fixtures.
 
-Enable Discord **Direct Messages**, **Guild Messages**, and **Message Content**
-intents. A thread under a configured guild-channel route is resolved through a
+Enable Discord **Direct Messages**, **Guild Messages**, and **Message Content** intents. A thread under a configured guild-channel route is resolved through a
 cached read-only `GET /channels/{thread_id}` parent lookup; any unresolved or
 unrouted channel remains unsubmitted. Guild-channel routes default to
-`engagement = "mention"`: only a direct bot user mention or a reply to the bot
-is admitted. Use `engagement = "always"` only for intentionally open channels;
-DMs and routed threads are always engaged. `blocked_author_ids` drops listed
-users on every route, including DMs, before admission. Drops are silent on Discord
-and rate-limited in adapter diagnostics. With the adapter unit running (so its
+`groupPolicy = "mention"`: only a direct bot user mention or a reply to the bot
+is admitted. Use `groupPolicy = "open"` only for intentionally open channels;
+the legacy `engagement = "mention"`/`"always"` key remains accepted, but
+conflicting duplicate policy keys are rejected. DMs and routed threads are always
+engaged. Bot-authored messages are allowed by default (`allowBots = true`), while
+the adapter's own bot id is always ignored; set `allowBots = false` to block other
+bots. `blocked_author_ids` drops listed users on every route, including DMs, before
+admission. Drops are silent on Discord and rate-limited in adapter diagnostics.
 systemd credential directory exists), verify the configured credential and live
 gateway without sending a bot message:
 
