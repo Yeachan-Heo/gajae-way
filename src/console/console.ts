@@ -40,6 +40,7 @@ export const GAJAEWAY_JOURNAL_EVENT_KINDS = [
 	"follow_up_confirmed",
 	"profile_approved",
 	"main_identity_growth_absorbed",
+	"failed_closed_recovered",
 ] as const;
 export const GAJAEWAY_JOURNAL_DEFAULT_KINDS = GAJAEWAY_JOURNAL_EVENT_KINDS.filter(
 	(kind) => kind !== "registry_change",

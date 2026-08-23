@@ -302,6 +302,49 @@ Telegram outbound sends use durable `dedupe_key:chunk:index` records in that sam
 state file before commit, preventing duplicate posts despite Telegram lacking
 Discord's enforce_nonce. Typing uses `sendChatAction` and follows the existing
 acceptance-before-acknowledgement keepalive ordering.
+## Recover a failed-closed gateway without discarding the journal
+
+A gateway that cannot prove its own safety refuses to serve and records a durable
+`FAILED_CLOSED` marker with a reason. That marker short-circuits strict resume, so
+fixing the underlying cause is not by itself enough to bring the daemon back.
+
+`gajaeway recover --confirm` is the explicit ceremony that clears exactly one
+recorded reason, and only after re-proving from live evidence that its cause is
+gone. It preserves the durable journal, tail checkpoint, transcript delivery
+progress, consumer checkpoints, and admission records; it appends a
+`failed_closed_recovered` receipt carrying the cleared reason, a receipt id, and
+the re-verification evidence that authorized it.
+
+```sh
+sudo -u gajaeway -H /usr/local/bin/gajaeway recover --confirm \
+  --state-dir /var/lib/gajaeway --profile /etc/gajaeway/profile.toml
+```
+
+Recoverable reasons, each gated on its own live re-verification:
+
+| Reason | Re-verification required |
+|---|---|
+| `main_identity_mismatch` | The broker transcript must be an attested append-only extension of the persisted prefix. The identity re-bind lands in the same transaction that clears the marker. |
+| `session_unavailable`, `turn_state_unavailable`, `tail_resync_unavailable` | A fresh broker verification must now succeed for the same session and locator. |
+| `transcript_proof_persist_failed`, `tail_ring_rotation_write_failed`, `transcript_delivery_progress_write_failed` | Durable metadata must read back coherent and accept a probe write. |
+
+Terminal reasons that recovery deliberately refuses:
+
+- `main_admission_recovery_unprovable`, `main_admission_intent_invalid` — an
+  unprovable admission outcome is never cleared by fiat, because doing so could
+  resend or silently lose an owner command. Investigate, then re-adopt.
+- `growth_intent_mismatch`, and any `main_identity_mismatch` whose transcript is
+  not an append-only extension — rewritten, reordered, or truncated history.
+- `metadata_invalid` / `metadata_missing` and any corrupt-durable-state reason.
+- `profile_drift` — cleared by the profile-approval ceremony instead; recovery
+  refuses and says so.
+
+Anything not listed as recoverable fails closed on the classification itself.
+Recovery never runs automatically on boot, never retries in a loop, and never
+clears a reason the runtime cannot presently prove resolved. When recovery
+refuses, the remaining remedy is the explicit re-adoption ceremony in
+`bootstrap-ceremony.md`, which does reset journal history.
+
 ## Known limitation: journal latency on continuously busy sessions
 
 The credential-free broker CLI returns tail envelopes only when a terminal turn

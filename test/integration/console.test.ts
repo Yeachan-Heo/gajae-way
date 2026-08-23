@@ -847,10 +847,13 @@ externalTest("cockpit renders durable-tail loss notices as warnings and exposes 
 			() => (terminal.writes.some(write => write.startsWith("Journal tail:") && write.includes("transcript_delivery_gap")) ? true : undefined),
 			"cockpit journal view did not render the transcript-gap event",
 		);
-		const filteredRead = recorded.calls
+		// The console's background consumer also issues kind-filtered reads, so the
+		// explicit /journal read is not necessarily the LAST one under load. Assert
+		// that the command issued its filtered read, not that it raced to be last.
+		const filteredKindReads = recorded.calls
 			.filter(call => call.method === "main.events.read" && Array.isArray((call.params as Record<string, unknown> | undefined)?.kinds))
-			.at(-1);
-		expect((filteredRead?.params as { kinds?: readonly string[] }).kinds).toEqual(["transcript_delivery_gap"]);
+			.map(call => (call.params as { kinds?: readonly string[] }).kinds);
+		expect(filteredKindReads).toContainEqual(["transcript_delivery_gap"]);
 		terminal.send("/quit");
 		await running;
 	} finally {
@@ -879,20 +882,22 @@ externalTest("cockpit /journal filters registry noise by default and honors an e
 		);
 		const defaultTail = terminal.writes.filter(write => write.startsWith("Journal tail:")).at(-1) as string;
 		expect(defaultTail).not.toContain("registry_change");
-		const defaultRead = recorded.calls
+		const cursorReads = recorded.calls
 			.filter(call => call.method === "main.events.read" && typeof (call.params as Record<string, unknown> | undefined)?.cursor === "string")
-			.at(-1);
-		expect((defaultRead?.params as { kinds?: readonly string[] }).kinds).not.toContain("registry_change");
+			.map(call => (call.params as { kinds?: readonly string[] }).kinds ?? []);
+		// Every cursor-bearing read the console issues must exclude registry noise.
+		expect(cursorReads.length).toBeGreaterThan(0);
+		for (const kinds of cursorReads) expect(kinds).not.toContain("registry_change");
 
 		terminal.send("/journal registry_change 20");
 		await eventually(
 			() => (terminal.writes.filter(write => write.startsWith("Journal tail:")).some(write => write.includes("registry_change")) ? true : undefined),
 			"explicit registry filter did not render registry events",
 		);
-		const explicitRead = recorded.calls
+		const explicitKindReads = recorded.calls
 			.filter(call => call.method === "main.events.read" && typeof (call.params as Record<string, unknown> | undefined)?.cursor === "string")
-			.at(-1);
-		expect((explicitRead?.params as { kinds?: readonly string[] }).kinds).toEqual(["registry_change"]);
+			.map(call => (call.params as { kinds?: readonly string[] }).kinds);
+		expect(explicitKindReads).toContainEqual(["registry_change"]);
 		terminal.send("/quit");
 		await running;
 	} finally {

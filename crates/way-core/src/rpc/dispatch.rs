@@ -42,6 +42,7 @@ pub const MAIN_EVENT_KINDS: &[&str] = &[
 	"follow_up_confirmed",
 	"profile_approved",
 	"main_identity_growth_absorbed",
+	"failed_closed_recovered",
 ];
 
 static NEXT_CORRELATION_ID: AtomicU64 = AtomicU64::new(1);

@@ -30,6 +30,7 @@ import {
 } from "./main-session/host";
 import { approveProfile, previewProfileApproval } from "./main-session/profile-approval";
 import { ResumeError, strictResumeMainSession } from "./main-session/resume";
+import { recoverFailedClosedGateway } from "./main-session/recover";
 import { createExternalHostSupervisor } from "./main-session/supervisor";
 
 import { GatewayToolController, GatewayToolError } from "./main-session/tools";
@@ -46,6 +47,7 @@ const usage = `Usage:
   gajaeway console [--surface-id ID] [--state-dir PATH] [--profile PATH]
   gajaeway profile approve --confirm [--state-dir PATH] [--profile PATH]
   gajaeway mcp [--state-dir PATH] [--profile PATH]
+  gajaeway recover --confirm [--state-dir PATH] [--profile PATH] [--broker-cli PATH]
   gajaeway --health [--state-dir PATH] | --version`;
 
 class FailedClosedExit extends Error {
@@ -1291,6 +1293,30 @@ async function bootstrapCommand(config: WayConfig, arguments_: readonly string[]
 	}
 }
 
+/**
+ * Explicit operator ceremony clearing one re-verified fail-closed reason while
+ * preserving the durable journal. Reasons that cannot be re-proven stay terminal
+ * and still require the re-adoption ceremony.
+ */
+async function recoverCommand(config: WayConfig, arguments_: readonly string[]): Promise<void> {
+	requireConfirm(arguments_, "recover");
+	const core = loadWayCore().WayCore.open(config.stateDir);
+	const state = new GatewayStateStore(core);
+	const profile = new ProfileRevisionTracker().load(config.profilePath);
+	const supervisor = createRuntimeSupervisor(config, profile.workspace);
+	try {
+		const recovered = await recoverFailedClosedGateway({ profile, state, supervisor, confirm: true });
+		console.log(JSON.stringify({
+			state: "recovered",
+			cleared_reason: recovered.clearedReason,
+			receipt_id: recovered.receiptId,
+			evidence: recovered.evidence,
+		}));
+	} finally {
+		await supervisor.dispose();
+	}
+}
+
 interface RpcResponse {
 	readonly result?: unknown;
 	readonly error?: { readonly code: number; readonly message: string; readonly data?: unknown };
@@ -1396,6 +1422,10 @@ export async function runWay(arguments_ = process.argv.slice(2)): Promise<void> 
 	}
 	if (parsed.remaining[0] === "profile") {
 		await profileApproveCommand(parsed.config, parsed.remaining);
+		return;
+	}
+	if (parsed.remaining[0] === "recover") {
+		await recoverCommand(parsed.config, parsed.remaining);
 		return;
 	}
 	throw new Error(`Unknown command: ${parsed.remaining.join(" ")}\n${usage}`);

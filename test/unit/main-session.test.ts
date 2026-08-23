@@ -5,6 +5,7 @@ import { BrokerCli, BrokerDtoParseError, parseSessionCheckpoint } from "../../sr
 import { createMainAdmissionHandler, MainAdmissionRecoveryError } from "../../src/main-session/admission";
 import { BootstrapError, bootstrapMainSession } from "../../src/main-session/bootstrap";
 import { createMainSessionHost } from "../../src/main-session/host";
+import { recoverFailedClosedGateway } from "../../src/main-session/recover";
 import { ResumeError, strictResumeMainSession } from "../../src/main-session/resume";
 import { compareTailCheckpoints, GatewayStateError, GatewayStateStore } from "../../src/main-session/state";
 import { createExternalHostSupervisor, type HostSupervisor, type SupervisorTailEvents } from "../../src/main-session/supervisor";
@@ -1303,5 +1304,137 @@ test.serial("a failed definitive-rejection claim abandonment degrades and fences
 		expect(fixture.commands()).toEqual([]);
 	} finally {
 		await host.dispose();
+	}
+});
+
+test.serial("recovery clears an attested-growth identity mismatch while preserving the journal", async () => {
+	const fixture = new FakeBrokerFixture();
+	fixtures.push(fixture);
+	const { meta, state, profile } = await bootstrapFixture(fixture);
+	const before = state.read();
+	// Autonomous growth, then a marker recorded the way the pre-G010 runtime did.
+	fixture.appendTranscript({ type: "message", role: "user", content: "growth before the marker" });
+	state.markFailedClosed("main_identity_mismatch");
+	const journalRowsBefore = meta.events.length;
+	const recovering = supervisor(fixture);
+	try {
+		const result = await recoverFailedClosedGateway({ profile, state, supervisor: recovering, confirm: true });
+		expect(result.clearedReason).toBe("main_identity_mismatch");
+		const after = state.read();
+		expect(after.bootstrapState).toBe("COMMITTED");
+		expect(after.failedClosedReason).toBeUndefined();
+		// Durable history preserved: nothing was reset, only appended to.
+		expect(meta.events.length).toBeGreaterThan(journalRowsBefore);
+		expect(after.tailCheckpoint).toEqual(before.tailCheckpoint);
+		expect(after.transcriptDeliveryProgress).toEqual(before.transcriptDeliveryProgress);
+		const receipt = meta.events.filter(event => event.kind === "failed_closed_recovered");
+		expect(receipt).toHaveLength(1);
+		expect(JSON.parse(receipt[0]?.payloadJson ?? "{}")).toMatchObject({
+			cleared_reason: "main_identity_mismatch",
+			receipt_id: expect.any(String),
+			verification_evidence: expect.stringContaining("append-only growth"),
+		});
+	} finally {
+		await recovering.dispose();
+	}
+});
+
+test.serial("recovery refuses a rewritten transcript prefix and leaves the gateway terminal", async () => {
+	const fixture = new FakeBrokerFixture();
+	fixtures.push(fixture);
+	const { state, profile } = await bootstrapFixture(fixture);
+	fixture.rotateTranscriptPast(`${fixture.sessionId}:transcript:1`);
+	state.markFailedClosed("main_identity_mismatch");
+	const recovering = supervisor(fixture);
+	try {
+		await expect(recoverFailedClosedGateway({ profile, state, supervisor: recovering, confirm: true })).rejects.toMatchObject({
+			reason: "reason_not_recoverable",
+		});
+		expect(state.read()).toMatchObject({ bootstrapState: "FAILED_CLOSED", failedClosedReason: "main_identity_mismatch" });
+	} finally {
+		await recovering.dispose();
+	}
+});
+
+test.serial("recovery refuses an unprovable admission outcome as terminal by classification", async () => {
+	const fixture = new FakeBrokerFixture();
+	fixtures.push(fixture);
+	const { state, profile } = await bootstrapFixture(fixture);
+	state.markFailedClosed("main_admission_recovery_unprovable");
+	const recovering = supervisor(fixture);
+	try {
+		await expect(recoverFailedClosedGateway({ profile, state, supervisor: recovering, confirm: true })).rejects.toMatchObject({
+			reason: "reason_not_recoverable",
+		});
+		expect(state.read()).toMatchObject({ bootstrapState: "FAILED_CLOSED", failedClosedReason: "main_admission_recovery_unprovable" });
+	} finally {
+		await recovering.dispose();
+	}
+});
+
+test.serial("recovery redirects profile drift to the profile-approval ceremony", async () => {
+	const fixture = new FakeBrokerFixture();
+	fixtures.push(fixture);
+	const { state, profile } = await bootstrapFixture(fixture);
+	state.markFailedClosed("profile_drift");
+	const recovering = supervisor(fixture);
+	try {
+		await expect(recoverFailedClosedGateway({ profile, state, supervisor: recovering, confirm: true })).rejects.toMatchObject({
+			reason: "use_profile_approval",
+		});
+		expect(state.read()).toMatchObject({ bootstrapState: "FAILED_CLOSED", failedClosedReason: "profile_drift" });
+	} finally {
+		await recovering.dispose();
+	}
+});
+
+test.serial("recovery refuses while the original transient condition still holds", async () => {
+	const fixture = new FakeBrokerFixture();
+	fixtures.push(fixture);
+	const { state, profile } = await bootstrapFixture(fixture);
+	state.markFailedClosed("session_unavailable");
+	// verify() inspects the session rather than tailing, so unavailability must be
+	// expressed as the session no longer being live.
+	fixture.setLive(false);
+	const recovering = supervisor(fixture);
+	try {
+		await expect(recoverFailedClosedGateway({ profile, state, supervisor: recovering, confirm: true })).rejects.toMatchObject({
+			reason: "recovery_verification_unavailable",
+		});
+		expect(state.read()).toMatchObject({ bootstrapState: "FAILED_CLOSED", failedClosedReason: "session_unavailable" });
+	} finally {
+		await recovering.dispose();
+	}
+});
+
+test.serial("recovery clears a transient broker reason once live verification succeeds", async () => {
+	const fixture = new FakeBrokerFixture();
+	fixtures.push(fixture);
+	const { state, profile } = await bootstrapFixture(fixture);
+	state.markFailedClosed("session_unavailable");
+	const recovering = supervisor(fixture);
+	try {
+		const result = await recoverFailedClosedGateway({ profile, state, supervisor: recovering, confirm: true });
+		expect(result.clearedReason).toBe("session_unavailable");
+		expect(result.evidence).toContain("live broker verification");
+		expect(state.read()).toMatchObject({ bootstrapState: "COMMITTED", failedClosedReason: undefined });
+	} finally {
+		await recovering.dispose();
+	}
+});
+
+test.serial("recovery requires explicit confirmation", async () => {
+	const fixture = new FakeBrokerFixture();
+	fixtures.push(fixture);
+	const { state, profile } = await bootstrapFixture(fixture);
+	state.markFailedClosed("session_unavailable");
+	const recovering = supervisor(fixture);
+	try {
+		await expect(recoverFailedClosedGateway({ profile, state, supervisor: recovering, confirm: false })).rejects.toMatchObject({
+			reason: "recovery_not_confirmed",
+		});
+		expect(state.read().bootstrapState).toBe("FAILED_CLOSED");
+	} finally {
+		await recovering.dispose();
 	}
 });

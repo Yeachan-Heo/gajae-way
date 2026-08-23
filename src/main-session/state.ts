@@ -842,6 +842,91 @@ export class GatewayStateStore {
 		});
 	}
 
+	/**
+	 * Clears exactly one recorded fail-closed reason after the caller has
+	 * re-proven, from live evidence, that the condition no longer holds. The
+	 * expected reason is part of the CAS, so a state that failed closed again for
+	 * a different reason between re-verification and this write cannot be cleared.
+	 *
+	 * Journal rows, tail checkpoint, transcript delivery progress, consumer
+	 * checkpoints, and admission records are deliberately untouched: recovery
+	 * restores serviceability without discarding durable history.
+	 */
+	recoverFailedClosed(
+		expectedReason: string,
+		receiptId: string,
+		recoveredAt: number,
+		evidence: string,
+		rebind?: { readonly observed: ExternalSessionIdentity; readonly entries: readonly unknown[] },
+	): string | undefined {
+		if (!expectedReason) throw new GatewayStateError("failure_reason_invalid", "A recovered fail-closed reason is required.");
+		if (!receiptId) throw new GatewayStateError("recovery_receipt_invalid", "A recovery receipt id is required.");
+		if (!evidence) throw new GatewayStateError("recovery_evidence_invalid", "Recovery requires recorded re-verification evidence.");
+		const state = this.read();
+		if (state.bootstrapState !== "FAILED_CLOSED") {
+			throw new GatewayStateError("not_failed_closed", "Only a failed-closed gateway can be recovered.");
+		}
+		if (state.failedClosedReason !== expectedReason) {
+			throw new GatewayStateError("failed_closed_reason_changed", "The recorded fail-closed reason does not match the re-verified reason.");
+		}
+		const durable = state.mainIdentity;
+		if (!durable) {
+			throw new GatewayStateError("bootstrap_not_committed", "A gateway without a durable adopted identity cannot be recovered.");
+		}
+		// A transcript re-bind must land in the SAME transaction that clears the
+		// marker: clearing first would briefly publish a COMMITTED state whose
+		// identity still disagreed with the broker, and re-binding first cannot
+		// work at all because the identity write requires a COMMITTED state.
+		let identityPut: { readonly key: string; readonly value: string } | undefined;
+		if (rebind) {
+			if (!durable.transcript || !rebind.observed.transcript) {
+				throw new GatewayStateError("transcript_proof_invalid", "A recovery re-bind requires a durable and observed transcript fingerprint.");
+			}
+			if (!sameExternalSession(durable, rebind.observed)) {
+				throw new GatewayStateError("main_identity_mismatch", "A recovery re-bind cannot change the adopted external session.");
+			}
+			if (!attestsExternalTranscriptGrowth(durable, rebind.entries)) {
+				throw new GatewayStateError("main_identity_mismatch", "The observed transcript is not an append-only extension of the persisted prefix.");
+			}
+			const observedFingerprint = fingerprintTranscriptEntries(rebind.entries);
+			if (
+				observedFingerprint.entryCount !== rebind.observed.transcript.entryCount ||
+				observedFingerprint.sha256 !== rebind.observed.transcript.sha256
+			) {
+				throw new GatewayStateError("transcript_proof_mismatch", "The observed transcript entries do not match the observed fingerprint.");
+			}
+			if (state.transcriptProof !== "proven") {
+				throw new GatewayStateError("transcript_proof_pending", "A recovery re-bind requires a proven durable transcript proof.");
+			}
+			identityPut = { key: "main_identity", value: identityJson(rebind.observed) };
+		}
+		return this.transact({
+			expected: [
+				{ key: "bootstrap_state", value: "FAILED_CLOSED" },
+				{ key: "failed_closed_reason", value: stableMetadataJson(expectedReason) },
+				...(identityPut === undefined ? [] : [{ key: "main_identity", value: identityJson(durable) }]),
+			],
+			puts: [
+				{ key: "bootstrap_state", value: "COMMITTED" },
+				{ key: "failed_closed_reason", value: "null" },
+				...(identityPut === undefined ? [] : [identityPut]),
+			],
+			deletes: [],
+			eventKind: "failed_closed_recovered",
+			eventPayloadJson: stableMetadataJson({
+				receipt_id: receiptId,
+				recovered_at: recoveredAt,
+				cleared_reason: expectedReason,
+				verification_evidence: evidence,
+				...(rebind === undefined
+					? {}
+					: {
+						rebound_prior_entry_count: durable.transcript?.entryCount ?? 0,
+						rebound_observed_entry_count: rebind.observed.transcript?.entryCount ?? 0,
+					}),
+			}),
+		});
+	}
 	approveProfile(profile: WayProfile, receiptId: string, approvedAt: number): { readonly cursor?: string; readonly previousProjection: CanonicalValue | undefined } {
 		const state = this.read();
 		if (state.bootstrapState === "ABSENT" || state.bootstrapState === "CREATING" || state.bootstrapState === "CREATED") {

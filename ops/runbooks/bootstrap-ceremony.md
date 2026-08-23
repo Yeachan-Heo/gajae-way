@@ -127,6 +127,12 @@ reason through `way.health` during its configured linger window, writes
 ceremony when the reported reason is `profile_drift`; do not use systemd restart
 loops as a repair mechanism.
 
+Before deleting state and re-adopting, check whether the recorded reason is
+recoverable: `gajaeway recover --confirm` clears a re-verifiable fail-closed
+reason while PRESERVING the journal, and refuses the reasons that must stay
+terminal. See "Recover a failed-closed gateway without discarding the journal" in
+`operations.md`. Re-adoption below is the remedy only when recovery refuses.
+
 ## Start after commit
 
 After a committed result, start only the configured units:
