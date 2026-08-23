@@ -33,6 +33,7 @@ export const requiredGeneratedBindingSymbols = [
 	"registryRegisterGatewaySession",
 	"surfaceResolve",
 	"setReconcileStatus",
+	"mainAdmissionAttributions",
 ] as const;
 
 export function validateGeneratedBindingSource(bindings: string): void {

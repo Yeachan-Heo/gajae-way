@@ -6,7 +6,7 @@ import { afterEach, expect, test } from "bun:test";
 
 import { BrokerCli } from "../../src/broker/cli";
 import { createMainAdmissionHandler, reconcilePendingMainAdmissions } from "../../src/main-session/admission";
-import { createMainSessionHost } from "../../src/main-session/host";
+import { createMainSessionHost, parseMainSessionAdmissionAttributions } from "../../src/main-session/host";
 import { strictResumeMainSession } from "../../src/main-session/resume";
 import { createExternalHostSupervisor } from "../../src/main-session/supervisor";
 
@@ -396,14 +396,16 @@ externalTest("restart replays the exact verification tail after a down-time ring
 			initialVerificationState: resumed.verificationState,
 			...(resumed.verificationTail === undefined ? {} : { verificationTail: resumed.verificationTail }),
 			...(resumed.growthIntent === undefined ? {} : { recoveredGrowthIntent: resumed.growthIntent }),
+			initialAdmissionAttributions: parseMainSessionAdmissionAttributions(gateway.core.mainAdmissionAttributions()),
 		});
-		await eventually(
+		const recoveredReply = await eventually(
 			() =>
 				gateway.core
 					.journalRead("1:0", 100)
 					.events.find(event => event.kind === "assistant_message" && event.payloadJson.includes("reply recovered from verification-tail delivery")),
 			"restart did not project the transcript suffix from its verification tail",
 		);
+		expect(JSON.parse(recoveredReply.payloadJson)).toMatchObject({ surface_id: "owner" });
 		await eventually(
 			() => (gateway.state.read().tailRingRotationCount === 1 ? true : undefined),
 			"verification-tail retention rotation was not counted",
@@ -424,6 +426,79 @@ externalTest("restart replays the exact verification tail after a down-time ring
 			"tail_ring_rotation",
 			"assistant_message",
 		]);
+	} finally {
+		await restartedHost?.dispose();
+		await restartedSupervisor.dispose();
+	}
+}, 30_000);
+
+externalTest("restart reconciliation preserves receipt-bound surface attribution for a downtime-finalized reply", async () => {
+	const gateway = await hosted({
+		tailTimeoutMs: 50,
+		afterBrokerAcceptedBeforeFinalize: () => {
+			throw new Error("hold accepted admission claim for restart reconciliation");
+		},
+	});
+	gateway.fixture.holdNextTurn();
+	const request = {
+		text: "settle after bridge response failure while the daemon is down",
+		surface_id: "owner",
+		idempotency_key: "restart-reconciled-surface-attribution",
+	};
+	const interrupted = await gateway.client.request("main.submit", request);
+	expect(rpcError(interrupted)).toMatchObject({ code: -32603, message: "bridge_exception" });
+	const [pending] = gateway.core.mainAdmissionOperationsPending();
+	const intent = JSON.parse(pending?.intentJson ?? "{}") as { op_ref?: unknown };
+	if (typeof intent.op_ref !== "string") throw new Error("accepted claim did not retain its operation reference");
+	const opRef = intent.op_ref;
+	expect(gateway.core.mainAdmissionAttributions()).toEqual(
+		expect.arrayContaining([expect.objectContaining({ surfaceId: "owner", attemptIdsJson: expect.stringContaining(opRef) })]),
+	);
+	await gateway.host.dispose();
+	gateway.fixture.rotateRingDuringNextCompletion();
+	gateway.fixture.complete(opRef, { text: "reconciled downtime reply" });
+
+	const restartedSupervisor = createExternalHostSupervisor({
+		broker: new BrokerCli({ executable: gateway.fixture.executable, environment: gateway.fixture.environment() }),
+		workspace: gateway.fixture.workspace,
+		tailTimeoutMs: 50,
+		commandTimeoutMs: 1_000,
+	});
+	let restartedHost: ReturnType<typeof createMainSessionHost> | undefined;
+	try {
+		const resumed = await strictResumeMainSession({ profile: gateway.profile, state: gateway.state, supervisor: restartedSupervisor });
+		await reconcilePendingMainAdmissions(gateway.core, restartedSupervisor);
+		expect(gateway.core.mainAdmissionOperationsPending()).toEqual([]);
+		restartedHost = createMainSessionHost({
+			supervisor: restartedSupervisor,
+			identity: resumed.identity,
+			state: gateway.state,
+			journal: {
+				journalAppend: (kind, payloadJson) => gateway.core.journalAppend(kind, payloadJson),
+				journalAppendAtTailCheckpoint: (kind, payloadJson, expected, checkpoint) =>
+					gateway.state.appendTailProjection(expected, checkpoint, kind, payloadJson),
+				journalAppendTranscriptProjection: (kind, payloadJson, expectedTail, checkpoint, expectedDelivery, nextDelivery) =>
+					gateway.state.appendTranscriptProjection(expectedTail, checkpoint, expectedDelivery, nextDelivery, kind, payloadJson),
+				setRpcHealth: (state, reason) => gateway.core.setRpcHealth(state, reason),
+				setMainSessionStatus: (turnState, followUpQueueDepth, verificationState) =>
+					gateway.core.setMainSessionStatus(turnState, followUpQueueDepth, verificationState),
+				setJournalDegraded: degraded => gateway.core.setJournalDegraded(degraded),
+			},
+			initialTurnState: resumed.turnState,
+			initialFollowUpQueueDepth: resumed.followUpQueueDepth,
+			initialVerificationState: resumed.verificationState,
+			...(resumed.verificationTail === undefined ? {} : { verificationTail: resumed.verificationTail }),
+			...(resumed.growthIntent === undefined ? {} : { recoveredGrowthIntent: resumed.growthIntent }),
+			initialAdmissionAttributions: parseMainSessionAdmissionAttributions(gateway.core.mainAdmissionAttributions()),
+		});
+		const reply = await eventually(
+			() =>
+				gateway.core
+					.journalRead("1:0", 100)
+					.events.find(event => event.kind === "assistant_message" && event.payloadJson.includes("reconciled downtime reply")),
+			"restart reconciliation did not project the downtime-finalized reply",
+		);
+		expect(JSON.parse(reply.payloadJson)).toMatchObject({ surface_id: "owner" });
 	} finally {
 		await restartedHost?.dispose();
 		await restartedSupervisor.dispose();
@@ -659,6 +734,7 @@ externalTest("an accepted operation with a lost receipt preserves growth authori
 			initialVerificationState: resumed.verificationState,
 			...(resumed.verificationTail === undefined ? {} : { verificationTail: resumed.verificationTail }),
 			...(resumed.growthIntent === undefined ? {} : { recoveredGrowthIntent: resumed.growthIntent }),
+			initialAdmissionAttributions: parseMainSessionAdmissionAttributions(gateway.core.mainAdmissionAttributions()),
 		});
 		await eventually(
 			() =>
@@ -871,12 +947,12 @@ externalTest("post-admission external failure degrades health and closes the ter
 	expect(gateway.state.read().growthIntent).toBeUndefined();
 });
 
-externalTest("main.events.read projects overlapping external lifecycle pairs as one attempt", async () => {
+externalTest("main.events.read surface-attributes an owner admission lifecycle and transcript reply", async () => {
 	const gateway = await hosted();
 	gateway.fixture.holdNextTurn();
 	const response = await gateway.client.request("main.submit", {
 		text: "deduplicated lifecycle",
-		surface_id: "owner",
+		surface_id: " owner ",
 		idempotency_key: "deduplicated-lifecycle",
 	});
 	const opRef = (response.result as { op_ref: string }).op_ref;
@@ -898,10 +974,124 @@ externalTest("main.events.read projects overlapping external lifecycle pairs as 
 	});
 	const rows = (events.result as { events: Array<{ kind: string; payload: Record<string, unknown> }> }).events;
 	expect(rows.map(row => row.kind)).toEqual(["turn_start", "assistant_message", "turn_end"]);
-	expect(rows[0]?.payload).toEqual({ attempt_id: `${gateway.fixture.sessionId}:${opRef}`, generation: 1, lineage: "main" });
-	expect(rows[1]?.payload).toMatchObject({ finalized: true, text: "one final answer" });
-	expect(rows[2]?.payload).toEqual({ attempt_id: `${gateway.fixture.sessionId}:${opRef}`, generation: 1, lineage: "main" });
+	expect(rows[0]?.payload).toEqual({ attempt_id: `${gateway.fixture.sessionId}:${opRef}`, generation: 1, lineage: "main", surface_id: "owner" });
+	expect(rows[1]?.payload).toMatchObject({ finalized: true, text: "one final answer", surface_id: "owner" });
+	expect(rows[2]?.payload).toEqual({ attempt_id: `${gateway.fixture.sessionId}:${opRef}`, generation: 1, lineage: "main", surface_id: "owner" });
 }, 20_000);
+
+externalTest("two configured admission surfaces retain distinct attribution across separate turns", async () => {
+	const gateway = await hosted();
+	const ownerRequest = { text: "owner-origin turn", surface_id: "owner", idempotency_key: "owner-origin-attribution" };
+	gateway.fixture.holdNextTurn();
+	const ownerAccepted = await gateway.client.request("main.submit", ownerRequest);
+	const ownerOpRef = (ownerAccepted.result as { op_ref: string }).op_ref;
+	gateway.fixture.complete(ownerOpRef, { text: "owner-origin reply" });
+	await eventually(
+		() =>
+			gateway.core
+				.journalRead("1:0", 100)
+				.events.some(event => event.kind === "assistant_message" && event.payloadJson.includes("owner-origin reply"))
+				? true
+				: undefined,
+		"owner-origin reply did not project",
+	);
+	await eventually(() => (gateway.host.turnState === "idle" ? true : undefined), "owner-origin turn did not settle");
+
+	const guestRequest = { text: "guest-origin turn", surface_id: "guest", idempotency_key: "guest-origin-attribution" };
+	gateway.fixture.holdNextTurn();
+	const guestAccepted = await gateway.client.request("main.submit", guestRequest);
+	expect(guestAccepted.result).toMatchObject({ delivered_as: "follow_up" });
+	const guestOpRef = (guestAccepted.result as { op_ref: string }).op_ref;
+	gateway.fixture.complete(guestOpRef, { text: "guest-origin reply" });
+	await eventually(
+		() =>
+			gateway.core
+				.journalRead("1:0", 100)
+				.events.some(event => event.kind === "assistant_message" && event.payloadJson.includes("guest-origin reply"))
+				? true
+				: undefined,
+		"guest-origin reply did not project",
+	);
+
+	const events = await gateway.client.request("main.events.read", {
+		cursor: "1:0",
+		kinds: ["turn_start", "assistant_message", "turn_end"],
+	});
+	const rows = (events.result as { events: Array<{ kind: string; payload: Record<string, unknown> }> }).events;
+	const byAttempt = (opRef: string) =>
+		rows.filter(
+			row =>
+				(row.kind === "turn_start" || row.kind === "turn_end") &&
+				row.payload.attempt_id === `${gateway.fixture.sessionId}:${opRef}`,
+		);
+	expect(byAttempt(ownerOpRef)).toEqual([
+		expect.objectContaining({ kind: "turn_start", payload: expect.objectContaining({ surface_id: "owner" }) }),
+		expect.objectContaining({ kind: "turn_end", payload: expect.objectContaining({ surface_id: "owner" }) }),
+	]);
+	expect(byAttempt(guestOpRef)).toEqual([
+		expect.objectContaining({ kind: "turn_end", payload: expect.objectContaining({ surface_id: "guest" }) }),
+	]);
+	expect(rows.find(row => row.kind === "assistant_message" && row.payload.text === "owner-origin reply")?.payload).toMatchObject({ surface_id: "owner" });
+	expect(rows.find(row => row.kind === "assistant_message" && row.payload.text === "guest-origin reply")?.payload).toMatchObject({ surface_id: "guest" });
+});
+
+externalTest("unmatched autonomous main lifecycle events remain unattributed", async () => {
+	const gateway = await hosted();
+	const attemptId = "autonomous-main-turn";
+	const responseId = "autonomous-main-response";
+	gateway.fixture.appendTailEvent("agent_start", {
+		type: "agent_start",
+		scope: { attemptId, generation: 1, lineage: "main" },
+	});
+	gateway.fixture.appendTailEvent("turn_end", {
+		type: "turn_end",
+		message: { role: "assistant", content: [{ type: "text", text: "autonomous completion" }], responseId, turnId: attemptId },
+		scope: { attemptId, generation: 1, lineage: "main" },
+	});
+	const rows = await eventually(
+		() => {
+			const events = gateway.core.journalRead("1:0", 100).events;
+			return events.some(event => event.kind === "turn_end" && event.payloadJson.includes(attemptId)) ? events : undefined;
+		},
+		"autonomous lifecycle did not project",
+	);
+	for (const event of rows.filter(event => event.kind === "turn_start" || event.kind === "turn_end")) {
+		const payload = JSON.parse(event.payloadJson) as Record<string, unknown>;
+		if (payload.attempt_id === attemptId) expect(payload).not.toHaveProperty("surface_id");
+	}
+});
+
+externalTest("a suffix-sharing autonomous lifecycle cannot inherit a durable admission surface", async () => {
+	const gateway = await hosted();
+	gateway.fixture.holdNextTurn();
+	const accepted = await gateway.client.request("main.submit", {
+		text: "establish exact owner attribution",
+		surface_id: "owner",
+		idempotency_key: "exact-attribution-only",
+	});
+	const opRef = (accepted.result as { op_ref: string }).op_ref;
+	await eventually(
+		() => (gateway.core.mainAdmissionAttributions().some(row => row.attemptIdsJson.includes(opRef)) ? true : undefined),
+		"accepted owner turn did not retain a durable attribution",
+	);
+	const suffixAttemptId = `${gateway.fixture.sessionId}:${opRef}:unrelated`;
+	gateway.fixture.appendTailEvent("agent_start", {
+		type: "agent_start",
+		scope: { attemptId: suffixAttemptId, generation: 1, lineage: "main" },
+	});
+	gateway.fixture.appendTailEvent("turn_end", {
+		type: "turn_end",
+		scope: { attemptId: suffixAttemptId, generation: 1, lineage: "main" },
+	});
+	const terminal = await eventually(
+		() =>
+			gateway.core
+				.journalRead("1:0", 100)
+				.events.find(event => event.kind === "turn_end" && JSON.parse(event.payloadJson).attempt_id === suffixAttemptId),
+		"suffix-sharing autonomous lifecycle did not project",
+	);
+	expect(JSON.parse(terminal.payloadJson)).not.toHaveProperty("surface_id");
+});
 
 externalTest("main.gate.answer reports unsupported and durably replays that honest broker limitation", async () => {
 	const gateway = await hosted();

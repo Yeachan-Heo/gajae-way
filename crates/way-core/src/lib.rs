@@ -25,7 +25,7 @@ use crate::{
 		LockStatus, ProcessObservation, ProcessProbe, QuarantineReceiptEvidence, QueueEntry, ReleaseResult, SystemProcessProbe,
 	},
 	registry::{BrokerSessionRow, BrokerSnapshot, GatewaySession, MetadataEnrichment, RegistryAnnotation, RegistryListFilter, SurfaceRecord},
-	store::{ClosureOperationClaim, MainAdmissionOperationClaim, PendingMainAdmissionOperation, Store, StoreError, meta_get_tx, meta_set_tx, unix_epoch_ms},
+	store::{ClosureOperationClaim, MainAdmissionAttribution, MainAdmissionOperationClaim, PendingMainAdmissionOperation, Store, StoreError, meta_get_tx, meta_set_tx, unix_epoch_ms},
 };
 
 pub mod events;
@@ -406,6 +406,14 @@ pub struct PendingMainAdmissionOperationOutput {
 	pub intent_json: String,
 	#[napi(js_name = "attemptIdsJson")]
 	pub attempt_ids_json: Option<String>,
+}
+
+#[napi(object)]
+pub struct MainAdmissionAttributionOutput {
+	#[napi(js_name = "attemptIdsJson")]
+	pub attempt_ids_json: String,
+	#[napi(js_name = "surfaceId")]
+	pub surface_id: String,
 }
 
 /// One metadata value returned from the durable gateway state store. A missing
@@ -1259,6 +1267,15 @@ impl WayCore {
 			.map(|operations| operations.into_iter().map(pending_main_admission_operation_output).collect())
 			.map_err(store_napi_error)
 	}
+
+	/// Returns receipt-bound surface attribution for live and recently finalized main admissions.
+	#[napi(js_name = "mainAdmissionAttributions")]
+	pub fn main_admission_attributions(&self) -> napi::Result<Vec<MainAdmissionAttributionOutput>> {
+		self.store
+			.main_admission_attributions(unix_epoch_ms())
+			.map(|attributions| attributions.into_iter().map(main_admission_attribution_output).collect())
+			.map_err(store_napi_error)
+	}
 }
 
 fn open_way_core(state_dir: String, hard_hold_cap_ms: Option<u64>) -> napi::Result<WayCore> {
@@ -1398,6 +1415,13 @@ fn pending_main_admission_operation_output(operation: PendingMainAdmissionOperat
 		request_json: operation.request_json,
 		intent_json: operation.intent_json,
 		attempt_ids_json: operation.attempt_ids_json,
+	}
+}
+
+fn main_admission_attribution_output(attribution: MainAdmissionAttribution) -> MainAdmissionAttributionOutput {
+	MainAdmissionAttributionOutput {
+		attempt_ids_json: attribution.attempt_ids_json,
+		surface_id: attribution.surface_id,
 	}
 }
 

@@ -27,6 +27,8 @@ export interface MainAdmissionTarget {
 		opRef: string,
 		finalizePendingClaim?: () => void,
 		recordAttemptIds?: (attemptIds: readonly string[]) => void,
+		/** Canonical admitted surface persisted with receipt aliases for journal egress. */
+		surfaceId?: string,
 	): Promise<void>;
 	/** Production hosts publish a terminal fence if a definitive rejection's claim cannot be abandoned. */
 	reportAdmissionClaimAbandonFailure?(error: unknown): void;
@@ -322,8 +324,9 @@ async function dispatchAdmittedOperation(
 	opRef: string,
 	finalizePendingClaim: () => void,
 	recordAttemptIds: (attemptIds: readonly string[]) => void,
+	surfaceId: string,
 ): Promise<void> {
-	await target.admit(deliveredAs, text, opRef, finalizePendingClaim, recordAttemptIds);
+	await target.admit(deliveredAs, text, opRef, finalizePendingClaim, recordAttemptIds, surfaceId);
 }
 
 function abandonDefinitivelyRejectedClaim(
@@ -449,7 +452,7 @@ export function createMainAdmissionHandler(
 			}
 		}
 		try {
-			await dispatchAdmittedOperation(target, deliveredAs, request.text, response.op_ref, finalizePendingClaim, recordAttemptIds);
+			await dispatchAdmittedOperation(target, deliveredAs, request.text, response.op_ref, finalizePendingClaim, recordAttemptIds, surface.id);
 		} catch (error) {
 			abandonDefinitivelyRejectedClaim(target, idempotency, request, requestJson, intentJson, error);
 			throw error;

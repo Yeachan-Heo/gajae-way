@@ -218,9 +218,17 @@ if (!statePath) {
 			role: "assistant",
 			content: [{ type: "text", text }],
 			responseId,
+			turnId: brokerTurnId(value, operation.opRef),
 			timestamp: operation.timestamp ?? 1_700_000_000_000 + (value.nextEventId ?? 0),
 		};
-		appendTranscript(value, { type: "message", role: "assistant", content: text, responseId, timestamp: message.timestamp });
+		appendTranscript(value, {
+			type: "message",
+			role: "assistant",
+			content: text,
+			responseId,
+			turnId: brokerTurnId(value, operation.opRef),
+			timestamp: message.timestamp,
+		});
 		appendEvent(value, "turn_end", { type: "turn_end", message, toolResults: [], scope });
 		appendEvent(value, "agent_end", { type: "agent_end", messages: [message], stopReason: "completed", scope });
 		settleQueuedFollowUps(value);

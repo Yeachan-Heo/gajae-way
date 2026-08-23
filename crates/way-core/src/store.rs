@@ -14,7 +14,7 @@ use std::{
 use rusqlite::{Connection, OptionalExtension, Transaction};
 
 pub const DATABASE_FILENAME: &str = "way-core.sqlite3";
-pub const SCHEMA_VERSION: u32 = 8;
+pub const SCHEMA_VERSION: u32 = 9;
 pub const IDEMPOTENCY_WINDOW_MS: i64 = 24 * 60 * 60 * 1_000;
 pub const CLOSURE_OPERATION_META_KEY: &str = "gitlock_closure_operation";
 
@@ -129,6 +129,12 @@ pub struct PendingMainAdmissionOperation {
     pub request_json: String,
     pub intent_json: String,
     pub attempt_ids_json: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MainAdmissionAttribution {
+    pub attempt_ids_json: String,
+    pub surface_id: String,
 }
 
 struct StoreInner {
@@ -476,6 +482,26 @@ impl Store {
                 )?;
             }
         }
+        let surface_id = main_admission_surface_id(request_json)?;
+        let existing_attribution = transaction
+            .query_row(
+                "SELECT attempt_ids_json, surface_id FROM main_admission_attributions WHERE scope = ?1 AND idempotency_key = ?2",
+                rusqlite::params![scope, key],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            )
+            .optional()?;
+        match existing_attribution {
+            Some((existing_attempt_ids, existing_surface_id))
+                if existing_attempt_ids == attempt_ids_json && existing_surface_id == surface_id => {}
+            Some(_) => return Err(StoreError::MainAdmissionOperationChanged),
+            None => {
+                transaction.execute(
+                    "INSERT INTO main_admission_attributions(scope, idempotency_key, attempt_ids_json, surface_id)
+                     VALUES (?1, ?2, ?3, ?4)",
+                    rusqlite::params![scope, key, attempt_ids_json, surface_id],
+                )?;
+            }
+        }
         transaction.commit()?;
         Ok(())
     }
@@ -584,6 +610,10 @@ impl Store {
             rusqlite::params![scope, key],
         )?;
         transaction.execute(
+            "DELETE FROM main_admission_attributions WHERE scope = ?1 AND idempotency_key = ?2",
+            rusqlite::params![scope, key],
+        )?;
+        transaction.execute(
             "DELETE FROM idempotency WHERE scope = ?1 AND idempotency_key = ?2",
             rusqlite::params![scope, key],
         )?;
@@ -609,9 +639,57 @@ impl Store {
         })?;
         rows.collect::<Result<Vec<_>, _>>().map_err(StoreError::from)
     }
+
+    /// Lists receipt-bound surface mappings retained after main-admission finalization.
+    pub fn main_admission_attributions(&self, now_ms: i64) -> StoreResult<Vec<MainAdmissionAttribution>> {
+        let connection = self.connection()?;
+        let mut statement = connection.prepare(
+            "SELECT attribution.attempt_ids_json, attribution.surface_id
+             FROM main_admission_attributions AS attribution
+             INNER JOIN idempotency
+               ON idempotency.scope = attribution.scope
+              AND idempotency.idempotency_key = attribution.idempotency_key
+             WHERE attribution.scope = 'main.submit' AND idempotency.expires_at > ?1
+             ORDER BY attribution.scope, attribution.idempotency_key",
+        )?;
+        let rows = statement.query_map([now_ms], |row| {
+            Ok(MainAdmissionAttribution {
+                attempt_ids_json: row.get(0)?,
+                surface_id: row.get(1)?,
+            })
+        })?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(StoreError::from)
+    }
+}
+
+fn main_admission_surface_id(request_json: &str) -> StoreResult<String> {
+    let request: serde_json::Value = serde_json::from_str(request_json)
+        .map_err(|_| StoreError::InvalidMetadata("main admission request_json is not JSON".to_owned()))?;
+    let surface_id = request
+        .as_object()
+        .and_then(|object| object.get("surface_id"))
+        .and_then(serde_json::Value::as_str)
+        .filter(|surface_id| !surface_id.trim().is_empty())
+        .ok_or_else(|| StoreError::InvalidMetadata("main admission request_json has no surface_id".to_owned()))?;
+    Ok(surface_id.to_owned())
 }
 
 fn expire_idempotency_tx(transaction: &Transaction<'_>, now_ms: i64) -> StoreResult<()> {
+    transaction.execute(
+        "DELETE FROM main_admission_attributions
+         WHERE EXISTS (
+             SELECT 1 FROM idempotency
+             WHERE idempotency.scope = main_admission_attributions.scope
+               AND idempotency.idempotency_key = main_admission_attributions.idempotency_key
+               AND idempotency.expires_at <= ?1
+         )
+         AND NOT EXISTS (
+             SELECT 1 FROM main_admission_operations AS pending
+             WHERE pending.scope = main_admission_attributions.scope
+               AND pending.idempotency_key = main_admission_attributions.idempotency_key
+         )",
+        [now_ms],
+    )?;
     transaction.execute(
         "DELETE FROM idempotency
          WHERE expires_at <= ?1
@@ -912,6 +990,22 @@ fn migrate(connection: &mut Connection) -> StoreResult<()> {
         transaction.commit()?;
     }
 
+    if current_version < 9 {
+        let transaction = connection.transaction()?;
+        transaction.execute_batch(
+            "CREATE TABLE IF NOT EXISTS main_admission_attributions (
+                scope TEXT NOT NULL,
+                idempotency_key TEXT NOT NULL,
+                attempt_ids_json TEXT NOT NULL,
+                surface_id TEXT NOT NULL,
+                PRIMARY KEY (scope, idempotency_key),
+                FOREIGN KEY (scope, idempotency_key) REFERENCES idempotency(scope, idempotency_key)
+            );",
+        )?;
+        meta_set_tx(&transaction, "schema_version", "9")?;
+        transaction.commit()?;
+    }
+
 
     let defaults = [
         ("bootstrap_state", "ABSENT"),
@@ -1021,6 +1115,7 @@ mod tests {
             "outbox",
             "idempotency",
             "main_admission_operations",
+            "main_admission_attributions",
         ] {
             let found: Option<String> = connection
                 .query_row(
@@ -1224,6 +1319,53 @@ mod tests {
     }
 
     #[test]
+    fn v8_pending_main_admission_and_existing_journal_rows_migrate_without_surface_synthesis() {
+        let state_dir = temporary_state_dir("v8-pending-main-admission");
+        let database_path = state_dir.join(DATABASE_FILENAME);
+        let store = Store::open(&state_dir).unwrap();
+        let request = r#"{"idempotency_key":"legacy-key","surface_id":"owner","text":"legacy pending"}"#;
+        let intent = r#"{"delivered_as":"prompt","op_ref":"legacy-op","request_hash":"hash","state":"claimed","version":1}"#;
+        let attempt_ids = r#"["legacy-op","turn:legacy-op"]"#;
+        store
+            .claim_main_admission_operation("main.submit", "legacy-key", request, intent, 100)
+            .unwrap();
+        store
+            .record_main_admission_operation_attempt_ids("main.submit", "legacy-key", request, intent, attempt_ids)
+            .unwrap();
+        drop(store);
+
+        let connection = Connection::open(&database_path).unwrap();
+        connection
+            .execute(
+                "INSERT INTO events(ts, kind, payload_json) VALUES (1, 'turn_end', '{\"attempt_id\":\"legacy-op\",\"generation\":1,\"lineage\":\"main\"}')",
+                [],
+            )
+            .unwrap();
+        connection
+            .execute_batch("DROP TABLE main_admission_attributions; UPDATE gateway_meta SET v = '8' WHERE k = 'schema_version';")
+            .unwrap();
+        drop(connection);
+
+        let migrated = Store::open(&state_dir).unwrap();
+        assert_eq!(migrated.get_meta("schema_version").unwrap(), Some(SCHEMA_VERSION.to_string()));
+        assert_eq!(
+            migrated.pending_main_admission_operations().unwrap()[0].attempt_ids_json.as_deref(),
+            Some(attempt_ids)
+        );
+        assert!(migrated.main_admission_attributions(101).unwrap().is_empty());
+        let connection = migrated.connection().unwrap();
+        assert_eq!(
+            connection
+                .query_row("SELECT payload_json FROM events WHERE kind = 'turn_end'", [], |row| row.get::<_, String>(0))
+                .unwrap(),
+            r#"{"attempt_id":"legacy-op","generation":1,"lineage":"main"}"#
+        );
+        drop(connection);
+        drop(migrated);
+        fs::remove_dir_all(state_dir).unwrap();
+    }
+
+    #[test]
     fn v4_state_directory_initializes_the_durable_tail_ring_rotation_count() {
         let state_dir = temporary_state_dir("v4-tail-ring-rotation");
         let database_path = state_dir.join(DATABASE_FILENAME);
@@ -1410,6 +1552,17 @@ mod tests {
             store.record_main_admission_operation_attempt_ids(scope, "key", request, intent, r#"["different"]"#),
             Err(StoreError::MainAdmissionOperationChanged)
         ));
+        let response = r#"{"accepted":true,"delivered_as":"prompt","op_ref":"operation"}"#;
+        store
+            .finalize_main_admission_operation(scope, "key", request, intent, response, 102)
+            .unwrap();
+        assert_eq!(
+            store.main_admission_attributions(103).unwrap(),
+            vec![super::MainAdmissionAttribution {
+                attempt_ids_json: attempt_ids.to_owned(),
+                surface_id: "owner".to_owned(),
+            }]
+        );
     }
 
     #[test]

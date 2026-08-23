@@ -21,7 +21,13 @@ import {
 } from "./main-session/closure";
 
 import { bootstrapMainSession, recoverBootstrap } from "./main-session/bootstrap";
-import { createMainSessionHost, MainSessionHostError, type MainSessionHost, type MainSessionJournal } from "./main-session/host";
+import {
+	createMainSessionHost,
+	MainSessionHostError,
+	parseMainSessionAdmissionAttributions,
+	type MainSessionHost,
+	type MainSessionJournal,
+} from "./main-session/host";
 import { approveProfile, previewProfileApproval } from "./main-session/profile-approval";
 import { ResumeError, strictResumeMainSession } from "./main-session/resume";
 import { createExternalHostSupervisor } from "./main-session/supervisor";
@@ -1123,6 +1129,7 @@ async function serveWay(config: WayConfig): Promise<void> {
 		if (recovery.kind === "failed_closed") await enterFailedClosed(core, state, config, recovery.reason, false);
 		const resumed = await strictResumeMainSession({ profile, state, supervisor });
 		await reconcilePendingMainAdmissions(core, supervisor);
+		const initialAdmissionAttributions = parseMainSessionAdmissionAttributions(core.mainAdmissionAttributions());
 		if (config.sessionId && config.sessionId !== resumed.identity.sessionId) {
 			throw new ResumeError("session_id_mismatch", "--session-id does not match the durable adopted external identity.");
 		}
@@ -1150,6 +1157,7 @@ async function serveWay(config: WayConfig): Promise<void> {
 			initialVerificationState: resumed.verificationState,
 			...(resumed.verificationTail === undefined ? {} : { verificationTail: resumed.verificationTail }),
 			...(resumed.growthIntent === undefined ? {} : { recoveredGrowthIntent: resumed.growthIntent }),
+			initialAdmissionAttributions,
 			afterTerminalEvidenceBeforeAdmissionFinalize: failAfterMainAdmissionTerminalEvidenceForE2e,
 		});
 		host = resumedHost;

@@ -58,6 +58,53 @@ export class MainSessionHostError extends Error {
 	}
 }
 
+/** A durable broker-attempt-to-origin-surface binding retained for delayed projection. */
+export interface MainSessionAdmissionAttribution {
+	readonly attemptIds: readonly string[];
+	readonly surfaceId: string;
+}
+
+export interface PersistedMainSessionAdmissionAttribution {
+	readonly attemptIdsJson: string;
+	readonly surfaceId: string;
+}
+
+/** Rejects corrupt durable attribution rather than guessing from operation-ref shapes. */
+export function parseMainSessionAdmissionAttributions(
+	rows: readonly PersistedMainSessionAdmissionAttribution[],
+): readonly MainSessionAdmissionAttribution[] {
+	const surfaceByAttemptId = new Map<string, string>();
+	return rows.map((row) => {
+		if (typeof row.surfaceId !== "string" || !row.surfaceId.trim()) {
+			throw new MainSessionHostError("main_admission_attribution_invalid", "A durable main-admission surface attribution is invalid.");
+		}
+		let parsed: unknown;
+		try {
+			parsed = JSON.parse(row.attemptIdsJson) as unknown;
+		} catch (error) {
+			throw new MainSessionHostError("main_admission_attribution_invalid", "A durable main-admission attempt attribution is not JSON.", {
+				cause: error,
+			});
+		}
+		if (
+			!Array.isArray(parsed) ||
+			parsed.length === 0 ||
+			parsed.some((attemptId) => typeof attemptId !== "string" || !attemptId) ||
+			new Set(parsed).size !== parsed.length
+		) {
+			throw new MainSessionHostError("main_admission_attribution_invalid", "A durable main-admission attempt attribution is malformed.");
+		}
+		for (const attemptId of parsed) {
+			const existing = surfaceByAttemptId.get(attemptId);
+			if (existing !== undefined && existing !== row.surfaceId) {
+				throw new MainSessionHostError("main_admission_attribution_invalid", "A broker attempt has conflicting durable surface attributions.");
+			}
+			surfaceByAttemptId.set(attemptId, row.surfaceId);
+		}
+		return { attemptIds: parsed, surfaceId: row.surfaceId };
+	});
+}
+
 export interface MainSessionHost {
 	readonly sessionId: string;
 	readonly identity: ExternalSessionIdentity;
@@ -77,6 +124,8 @@ export interface MainSessionHost {
 		opRef: string,
 		finalizePendingClaim?: () => void,
 		recordAttemptIds?: (attemptIds: readonly string[]) => void,
+		/** Canonical admitted surface persisted with receipt aliases for journal egress. */
+		surfaceId?: string,
 	): Promise<void>;
 	/** Degrades and fences the host when durable abandonment of a definitive rejection fails. */
 	reportAdmissionClaimAbandonFailure(error: unknown): void;
@@ -98,6 +147,8 @@ export interface CreateMainSessionHostOptions {
 	readonly verificationTail?: SupervisorTailEvents;
 	/** An active durable growth intent recovered by strict resume. */
 	readonly recoveredGrowthIntent?: GrowthIntent;
+	/** Receipt-bound origin mappings loaded from durable admission records before tail projection. */
+	readonly initialAdmissionAttributions?: readonly MainSessionAdmissionAttribution[];
 	/** Test-only seam after durable terminal evidence but before pending-claim finalization. */
 	readonly afterTerminalEvidenceBeforeAdmissionFinalize?: () => void;
 	readonly now?: () => number;
@@ -116,6 +167,8 @@ interface AdmittedOperation {
 	readonly attemptIds: readonly string[];
 	/** Persists receipt-derived attempt identifiers while this exact claim remains pending. */
 	readonly recordAttemptIds?: (attemptIds: readonly string[]) => void;
+	/** Originating surface when this live admission was accepted through main.submit. */
+	readonly surfaceId?: string;
 	/** A broker receipt was lost after dispatch, so all mutations stay fenced until a tail settles it. */
 	readonly ambiguous: boolean;
 	/** Exact idempotency finalizer armed before broker dispatch. */
@@ -134,6 +187,7 @@ interface FinalAssistantMessage {
 		readonly text: string;
 		readonly message_id?: string;
 		readonly timestamp?: number;
+		readonly surface_id?: string;
 	};
 }
 
@@ -141,8 +195,8 @@ export interface MainSessionTurnJournalPayload {
 	readonly attempt_id: string;
 	readonly generation: number;
 	readonly lineage: string;
+	readonly surface_id?: string;
 }
-
 
 const MAX_JOURNALED_ATTEMPTS = 1_000;
 
@@ -222,6 +276,14 @@ function transcriptMessageCandidate(event: Record<string, unknown>): Record<stri
 	if (isRecord(event.message)) return event.message;
 	if (isRecord(event.data)) return event.data;
 	return event;
+}
+
+function messageIds(event: Record<string, unknown>): readonly string[] {
+	const candidates: unknown[] = [transcriptMessageCandidate(event)];
+	if (Array.isArray(event.messages)) candidates.push(...event.messages);
+	return distinctAttemptIds(
+		candidates.filter(isRecord).map((candidate) => eventString(candidate, "responseId", "response_id", "id", "message_id")),
+	);
 }
 
 function isSafelyNonDeliverableTranscriptEntry(event: Record<string, unknown>): boolean {
@@ -335,6 +397,8 @@ class ExternalMainSessionHost implements MainSessionHost {
 	#verificationState: "pending" | "verified";
 	readonly #journaledAttemptTransitions = new Map<string, JournaledAttemptTransitions>();
 	readonly #admittedOperations = new Map<string, AdmittedOperation>();
+	readonly #surfaceIdByAttemptId = new Map<string, string>();
+	readonly #surfaceIdByResponseId = new Map<string, string>();
 	readonly #unmatchedTerminalAttemptIds = new Set<string>();
 	readonly #seenTailEvents = new Set<string>();
 	readonly #fatalFailure = Promise.withResolvers<MainSessionHostError>();
@@ -377,6 +441,7 @@ class ExternalMainSessionHost implements MainSessionHost {
 		if (options.recoveredGrowthIntent) {
 			this.#growthWindow = { intent: options.recoveredGrowthIntent, pendingAdmissions: 0 };
 		}
+		for (const attribution of options.initialAdmissionAttributions ?? []) this.registerAdmissionAttribution(attribution);
 
 		this.publishStatus();
 		if (this.#verificationState === "verified") this.#verificationReady.resolve();
@@ -442,6 +507,77 @@ class ExternalMainSessionHost implements MainSessionHost {
 		]);
 	}
 
+	private registerAdmissionAttribution(attribution: MainSessionAdmissionAttribution): void {
+		if (!attribution.surfaceId.trim() || attribution.attemptIds.length === 0) {
+			throw new MainSessionHostError("main_admission_attribution_invalid", "A main-admission attribution is malformed.");
+		}
+		for (const attemptId of attribution.attemptIds) {
+			if (!attemptId) throw new MainSessionHostError("main_admission_attribution_invalid", "A main-admission attempt id is empty.");
+			const existing = this.#surfaceIdByAttemptId.get(attemptId);
+			if (existing !== undefined && existing !== attribution.surfaceId) {
+				throw new MainSessionHostError("main_admission_attribution_invalid", "A broker attempt has conflicting surface attributions.");
+			}
+			this.#surfaceIdByAttemptId.set(attemptId, attribution.surfaceId);
+		}
+	}
+
+	private mergeSurfaceId(current: string | undefined, candidate: string | undefined): string | undefined {
+		if (candidate === undefined) return current;
+		if (current !== undefined && current !== candidate) {
+			throw new MainSessionHostError("main_admission_attribution_invalid", "One broker observation has conflicting surface attributions.");
+		}
+		return candidate;
+	}
+
+	private surfaceIdForAttemptId(attemptId: string): string | undefined {
+		let surfaceId = this.#surfaceIdByAttemptId.get(attemptId);
+		for (const admission of this.#admittedOperations.values()) {
+			if (!matchesCanonicalAdmissionAttemptId(attemptId, admission.attemptIds)) continue;
+			surfaceId = this.mergeSurfaceId(surfaceId, admission.surfaceId);
+		}
+		return surfaceId;
+	}
+
+	private surfaceIdForEvent(event: Record<string, unknown>): string | undefined {
+		let surfaceId: string | undefined;
+		for (const attemptId of this.eventAttemptIds(event)) {
+			surfaceId = this.mergeSurfaceId(surfaceId, this.surfaceIdForAttemptId(attemptId));
+		}
+		return surfaceId;
+	}
+
+	private recordResponseAttribution(event: Record<string, unknown>): void {
+		const surfaceId = this.surfaceIdForEvent(event);
+		if (surfaceId === undefined) return;
+		for (const messageId of messageIds(event)) {
+			const existing = this.#surfaceIdByResponseId.get(messageId);
+			if (existing !== undefined && existing !== surfaceId) {
+				throw new MainSessionHostError("main_admission_attribution_invalid", "A response message has conflicting surface attributions.");
+			}
+			this.#surfaceIdByResponseId.set(messageId, surfaceId);
+		}
+		while (this.#surfaceIdByResponseId.size > MAX_JOURNALED_ATTEMPTS) {
+			const oldest = this.#surfaceIdByResponseId.keys().next().value;
+			if (oldest === undefined) break;
+			this.#surfaceIdByResponseId.delete(oldest);
+		}
+	}
+
+	private prepareTailResponseAttributions(events: readonly SupervisorEvent[]): void {
+		for (const source of events) {
+			const event = externalEvent(source);
+			if (event.type === "agent_end" || event.type === "turn_end" || event.type === "agent_failed") this.recordResponseAttribution(event);
+		}
+	}
+
+	private surfaceIdForTranscriptEntry(event: Record<string, unknown>): string | undefined {
+		let surfaceId = this.surfaceIdForEvent(event);
+		for (const messageId of messageIds(event)) {
+			surfaceId = this.mergeSurfaceId(surfaceId, this.#surfaceIdByResponseId.get(messageId));
+		}
+		return surfaceId;
+	}
+
 	private admittedOperationRef(event: Record<string, unknown>): string | undefined {
 		for (const candidate of this.eventAttemptIds(event)) {
 			for (const [opRef, admission] of this.#admittedOperations) {
@@ -467,6 +603,9 @@ class ExternalMainSessionHost implements MainSessionHost {
 		this.#admittedOperations.set(opRef, { ...admission, attemptIds });
 		try {
 			admission.recordAttemptIds?.(attemptIds);
+			if (admission.surfaceId !== undefined) {
+				this.registerAdmissionAttribution({ attemptIds, surfaceId: admission.surfaceId });
+			}
 		} catch (error) {
 			throw this.enterFailure("main_admission_attempt_ids_persist_failed", error);
 		}
@@ -561,8 +700,13 @@ class ExternalMainSessionHost implements MainSessionHost {
 	}
 
 	private appendTurnTransition(kind: "turn_start" | "turn_end", event: Record<string, unknown>): void {
-		const payload = this.attemptPayload(event);
-		const key = `${payload.lineage}\u0000${payload.attempt_id}\u0000${payload.generation}`;
+		const attempt = this.attemptPayload(event);
+		const surfaceId = this.surfaceIdForEvent(event);
+		const payload: MainSessionTurnJournalPayload = {
+			...attempt,
+			...(surfaceId === undefined ? {} : { surface_id: surfaceId }),
+		};
+		const key = `${attempt.lineage}\u0000${attempt.attempt_id}\u0000${attempt.generation}`;
 		const transitions = this.#journaledAttemptTransitions.get(key) ?? { started: false, ended: false };
 		this.#journaledAttemptTransitions.set(key, transitions);
 		const field = kind === "turn_start" ? "started" : "ended";
@@ -598,7 +742,11 @@ class ExternalMainSessionHost implements MainSessionHost {
 			return this.advanceTranscriptDelivery(expectedDelivery, nextDelivery);
 		}
 		try {
-			const encoded = payloadJson(finalized.payload);
+			const surfaceId = this.surfaceIdForTranscriptEntry(event);
+			const encoded = payloadJson({
+				...finalized.payload,
+				...(surfaceId === undefined ? {} : { surface_id: surfaceId }),
+			});
 			const checkpoint = this.#journalTailCheckpoint ?? this.#tailCheckpoint;
 			if (!checkpoint) throw new MainSessionHostError("tail_checkpoint_unavailable", "A transcript projection requires a durable broker-tail checkpoint.");
 			this.#journal.journalAppendTranscriptProjection(
@@ -709,9 +857,10 @@ class ExternalMainSessionHost implements MainSessionHost {
 		expectedDelivery: TranscriptDeliveryProgress | undefined,
 		nextDelivery: TranscriptDeliveryProgress,
 		payload: Record<string, unknown>,
+		surfaceId?: string,
 	): boolean {
 		try {
-			const encoded = payloadJson(payload);
+			const encoded = payloadJson({ ...payload, ...(surfaceId === undefined ? {} : { surface_id: surfaceId }) });
 			const checkpoint = this.#journalTailCheckpoint ?? this.#tailCheckpoint;
 			if (!checkpoint) throw new MainSessionHostError("tail_checkpoint_unavailable", "A transcript delivery gap requires a durable broker-tail checkpoint.");
 			this.#journal.journalAppendTranscriptProjection(
@@ -817,13 +966,18 @@ class ExternalMainSessionHost implements MainSessionHost {
 				? this.appendFinalAssistantMessage(event, `transcript:${entry.id}`, expectedDelivery, nextDelivery)
 				: safelyNonDeliverable
 					? this.advanceTranscriptDelivery(expectedDelivery, nextDelivery)
-					: this.appendTranscriptDeliveryGap(expectedDelivery, this.deliveryGapProgress(entries), {
-							reason: "transcript_delivery_unprovable",
-							delivered_through_entry_id: expectedDelivery?.lastEntryId,
-							unprojectable_entry_id: entry.id,
-							available_from_entry_id: entries[0]?.id,
-							available_through_entry_id: entries.at(-1)?.id,
-						});
+					: this.appendTranscriptDeliveryGap(
+							expectedDelivery,
+							this.deliveryGapProgress(entries),
+							{
+								reason: "transcript_delivery_unprovable",
+								delivered_through_entry_id: expectedDelivery?.lastEntryId,
+								unprojectable_entry_id: entry.id,
+								available_from_entry_id: entries[0]?.id,
+								available_through_entry_id: entries.at(-1)?.id,
+							},
+							event === undefined ? undefined : this.surfaceIdForTranscriptEntry(event),
+						);
 			if (!delivered || this.#failure || (!finalized && !safelyNonDeliverable)) return;
 		}
 	}
@@ -1103,6 +1257,7 @@ class ExternalMainSessionHost implements MainSessionHost {
 				if (!boundaryEstablished) {
 					const events = tail.events.filter(event => this.shouldProjectTailEvent(event));
 					const revision = Math.max(tail.checkpoint?.revision ?? 0, this.#tailCheckpoint?.revision ?? 0);
+					this.prepareTailResponseAttributions(events);
 					// A finalized reply travels as a transcript entry while lifecycle events
 					// travel in the ring. Give a reply the terminal event's checkpoint so
 					// it and that lifecycle transition survive/replay as one durable batch.
@@ -1229,6 +1384,7 @@ class ExternalMainSessionHost implements MainSessionHost {
 		opRef: string,
 		finalizePendingClaim?: () => void,
 		recordAttemptIds?: (attemptIds: readonly string[]) => void,
+		surfaceId?: string,
 	): Promise<void> {
 		this.assertUsable();
 		if (!text.trim()) throw new MainSessionHostError(`${deliveredAs}_empty`, "A main-session message must not be empty.");
@@ -1241,6 +1397,7 @@ class ExternalMainSessionHost implements MainSessionHost {
 			ambiguous: false,
 			...(finalizePendingClaim === undefined ? {} : { finalizePendingClaim }),
 			...(recordAttemptIds === undefined ? {} : { recordAttemptIds }),
+			...(surfaceId === undefined ? {} : { surfaceId }),
 		});
 		try {
 			const receipt =

@@ -4,7 +4,12 @@ import { BrokerCli } from "../../src/broker/cli";
 import { createMainAdmissionHandler } from "../../src/main-session/admission";
 import { bootstrapMainSession } from "../../src/main-session/bootstrap";
 import { createMainGateAnswerHandler } from "../../src/main-session/gates";
-import { createMainSessionHost, type MainSessionHost, type MainSessionJournal } from "../../src/main-session/host";
+import {
+	createMainSessionHost,
+	parseMainSessionAdmissionAttributions,
+	type MainSessionHost,
+	type MainSessionJournal,
+} from "../../src/main-session/host";
 import { strictResumeMainSession } from "../../src/main-session/resume";
 import { GatewayStateStore } from "../../src/main-session/state";
 import { createExternalHostSupervisor, type ExternalHostSupervisor } from "../../src/main-session/supervisor";
@@ -139,6 +144,7 @@ export async function createExternalGateway(options: ExternalGatewayOptions = {}
 		initialVerificationState: resumed.verificationState,
 		...(resumed.verificationTail === undefined ? {} : { verificationTail: resumed.verificationTail }),
 		...(resumed.growthIntent === undefined ? {} : { recoveredGrowthIntent: resumed.growthIntent }),
+		initialAdmissionAttributions: parseMainSessionAdmissionAttributions(core.mainAdmissionAttributions()),
 	});
 	const submit = createMainAdmissionHandler(host, profile, core, {
 		newOpRef: options.newOpRef,

@@ -473,7 +473,7 @@ test.serial("strict resume fails closed when an external transcript grew without
 	}
 });
 
-test.serial("host projects overlapping agent and turn lifecycle tail events into one journal attempt", async () => {
+test.serial("host surface-attributes overlapping agent and turn lifecycle tail events", async () => {
 	const fixture = new FakeBrokerFixture();
 	fixtures.push(fixture);
 	const { state, profile } = await bootstrapFixture(fixture);
@@ -490,7 +490,7 @@ test.serial("host projects overlapping agent and turn lifecycle tail events into
 	});
 	try {
 		fixture.holdNextTurn();
-		await host.admit("prompt", "deduplicate this attempt", "overlap-attempt");
+		await host.admit("prompt", "deduplicate this attempt", "overlap-attempt", undefined, undefined, "owner");
 		await eventually(
 			() => journal.filter(event => event.kind === "turn_start").length === 1,
 			"tail lifecycle did not observe the overlapping start pair",
@@ -505,11 +505,11 @@ test.serial("host projects overlapping agent and turn lifecycle tail events into
 
 		expect(journal.map(event => event.kind)).toEqual(["turn_start", "assistant_message", "turn_end"]);
 		expect(JSON.parse(journal[0]?.payloadJson ?? "{}"))
-			.toEqual({ attempt_id: `${fixture.sessionId}:overlap-attempt`, generation: 1, lineage: "main" });
+			.toEqual({ attempt_id: `${fixture.sessionId}:overlap-attempt`, generation: 1, lineage: "main", surface_id: "owner" });
 		expect(JSON.parse(journal[1]?.payloadJson ?? "{}"))
-			.toEqual(expect.objectContaining({ finalized: true, text: "one terminal response" }));
+			.toEqual(expect.objectContaining({ finalized: true, text: "one terminal response", surface_id: "owner" }));
 		expect(JSON.parse(journal[2]?.payloadJson ?? "{}"))
-			.toEqual({ attempt_id: `${fixture.sessionId}:overlap-attempt`, generation: 1, lineage: "main" });
+			.toEqual({ attempt_id: `${fixture.sessionId}:overlap-attempt`, generation: 1, lineage: "main", surface_id: "owner" });
 	} finally {
 		await host.dispose();
 	}
@@ -844,7 +844,7 @@ test.serial("a reply finalized while the daemon is down is recovered from durabl
 	}
 });
 
-test.serial("an unprojectable assistant transcript suffix journals a gap instead of silently advancing delivery", async () => {
+test.serial("an admitted opaque assistant suffix surface-attributes its delivery gap instead of silently advancing", async () => {
 	const fixture = new FakeBrokerFixture();
 	fixtures.push(fixture);
 	const { meta, state, profile } = await bootstrapFixture(fixture);
@@ -867,12 +867,13 @@ test.serial("an unprojectable assistant transcript suffix journals a gap instead
 	});
 	try {
 		fixture.holdNextTurn();
-		await host.admit("prompt", "hold while an opaque assistant suffix appears", "opaque-suffix");
+		await host.admit("prompt", "hold while an opaque assistant suffix appears", "opaque-suffix", undefined, undefined, "owner");
 		await eventually(() => state.read().growthIntent !== undefined, "held operation did not open growth intent");
 		fixture.appendTranscript({
 			type: "message",
 			role: "assistant",
 			content: [{ type: "opaque_output", value: "must not silently rebaseline" }],
+			turnId: "turn:opaque-suffix",
 		});
 		await eventually(
 			() => meta.events.some(event => event.kind === "transcript_delivery_gap"),
@@ -882,6 +883,7 @@ test.serial("an unprojectable assistant transcript suffix journals a gap instead
 		expect(JSON.parse(gap?.payloadJson ?? "{}")).toMatchObject({
 			reason: "transcript_delivery_unprovable",
 			unprojectable_entry_id: `${fixture.sessionId}:transcript:2`,
+			surface_id: "owner",
 		});
 		expect(state.read()).toMatchObject({ transcriptDeliveryGapCount: 1, transcriptDeliveryProgress: { lastEntryId: `${fixture.sessionId}:transcript:2` } });
 		expect(meta.events.some(event => event.kind === "assistant_message")).toBe(false);

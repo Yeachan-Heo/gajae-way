@@ -251,6 +251,7 @@ export interface WayCoreHandle {
 	}): { responseJson: string };
 	mainAdmissionOperationAbandon(input: { scope: string; key: string; requestJson: string; intentJson: string }): void;
 	mainAdmissionOperationsPending(): Array<{ scope: string; key: string; requestJson: string; intentJson: string; attemptIdsJson?: string }>;
+	mainAdmissionAttributions(): Array<{ attemptIdsJson: string; surfaceId: string }>;
 }
 
 export interface WayCoreConstructor {

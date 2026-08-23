@@ -121,6 +121,8 @@ export declare class WayCore {
   mainAdmissionOperationAbandon(input: MainAdmissionOperationAbandonInput): void
   /** Returns unresolved pre-effect admissions for startup recovery only. */
   mainAdmissionOperationsPending(): Array<PendingMainAdmissionOperationOutput>
+  /** Returns receipt-bound surface attribution for live and recently finalized main admissions. */
+  mainAdmissionAttributions(): Array<MainAdmissionAttributionOutput>
 }
 
 /** Request data delivered from Rust's TSFN into the thin TypeScript shim. */
@@ -346,6 +348,11 @@ export interface LockStatusOutput {
   queue: Array<QueueEntryOutput>
   stuck: boolean
   quarantined: boolean
+}
+
+export interface MainAdmissionAttributionOutput {
+  attemptIdsJson: string
+  surfaceId: string
 }
 
 export interface MainAdmissionOperationAbandonInput {
