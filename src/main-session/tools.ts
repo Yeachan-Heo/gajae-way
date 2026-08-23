@@ -3,7 +3,9 @@ import { canonicalJson } from "./gates";
 import type { MainSessionHost } from "./host";
 import type { OwnerSurface, WayProfile } from "../profile";
 
-export const MAIN_SAY_SCOPE = "main.say";
+export const MAIN_SAY_REPLAY_SCAN_EVENTS = 5_000;
+const PERSONA_SAY_RATE_SCAN_EVENTS = 2_000;
+const MAIN_SAY_SCOPE = "main.say";
 export const PERSONA_SAY_MAX_TEXT_LENGTH = 4_000;
 export const PERSONA_SAY_WINDOW_MS = 60_000;
 export const PERSONA_SAY_MAX_PER_WINDOW = 20;
@@ -139,14 +141,37 @@ function idempotencyConflict(error: unknown): never {
 	throw error;
 }
 
-/** Reads the durable journal without trusting a local cursor or memory cache. */
-function readJournal(core: ToolCore): JournalFrame[] {
+/**
+ * Reads a BOUNDED recent window of the durable journal without trusting a local
+ * cursor or memory cache.
+ *
+ * Starting at sequence 0 would make every call cost O(journal size) and, worse,
+ * would always cross the retention floor once the journal has rotated past
+ * MAX_RETAINED_EVENTS - permanently breaking persona output. The window is
+ * therefore anchored to the head cursor. A gap encountered while seeking into
+ * that window is expected after rotation and simply moves the window start; the
+ * caller's authority for exactly-once remains the durable idempotency store.
+ */
+function readRecentJournal(core: ToolCore, maxEvents: number): JournalFrame[] {
+	const head = parseCursor(core.journalHeadCursor());
+	const window = BigInt(maxEvents);
+	const start = head.seq > window ? head.seq - window : 0n;
 	const events: JournalFrame[] = [];
-	const generation = parseCursor(core.journalHeadCursor()).generation;
-	let cursor = `${generation}:0`;
+	let cursor = `${head.generation}:${start}`;
 	for (;;) {
-		const page = core.journalRead(cursor, 500);
-		if (page.gap !== undefined) throw new GatewayToolError(1503, "main_say_journal_retention_gap");
+		let page: { events: JournalFrame[]; nextCursor: string; gap?: unknown };
+		try {
+			page = core.journalRead(cursor, 500);
+		} catch (error) {
+			throw new GatewayToolError(1503, "main_say_journal_unavailable", { detail: error instanceof Error ? error.message : String(error) });
+		}
+		if (page.gap !== undefined) {
+			// The requested start fell below the retention floor. Resync forward to
+			// whatever the journal still retains instead of failing the call.
+			if (page.nextCursor === cursor) return events;
+			cursor = page.nextCursor;
+			continue;
+		}
 		events.push(...page.events);
 		if (page.events.length === 0 || page.nextCursor === cursor) return events;
 		cursor = page.nextCursor;
@@ -154,7 +179,9 @@ function readJournal(core: ToolCore): JournalFrame[] {
 }
 
 function findCommittedSay(core: ToolCore, key: string, requestHash: string): StoredSayResponse | undefined {
-	for (const frame of readJournal(core)) {
+	// The durable idempotency store is the authority for replay; this bounded scan
+	// only recovers the committed frame's cursor for the response.
+	for (const frame of readRecentJournal(core, MAIN_SAY_REPLAY_SCAN_EVENTS)) {
 		const payload = payloadForFrame(frame);
 		if (frame.kind !== "assistant_message" || payload?.origin !== "persona" || payload.idempotency_key !== key) continue;
 		if (payload.request_hash !== requestHash || payload.finalized !== true || typeof payload.surface_id !== "string") {
@@ -175,7 +202,9 @@ function findCommittedSay(core: ToolCore, key: string, requestHash: string): Sto
 
 function countRecentPersonaSays(core: ToolCore, now: number): number {
 	const cutoff = now - PERSONA_SAY_WINDOW_MS;
-	return readJournal(core).filter(frame => {
+	// Only the rate-limit window matters, so the scan stays bounded regardless of
+	// how large the journal has grown.
+	return readRecentJournal(core, PERSONA_SAY_RATE_SCAN_EVENTS).filter(frame => {
 		if (frame.ts < cutoff || frame.kind !== "assistant_message") return false;
 		return payloadForFrame(frame)?.origin === "persona";
 	}).length;

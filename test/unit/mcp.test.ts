@@ -28,8 +28,16 @@ class MemoryCore {
 		return { cursor: `1:${seq}`, seq };
 	}
 
+	/** Simulates the durable journal's retention floor (MAX_RETAINED_EVENTS). */
+	retentionFloor = 0n;
+
 	journalRead(cursor = "1:0", limit = 500) {
 		const after = BigInt(cursor.split(":")[1] ?? "0");
+		if (after < this.retentionFloor) {
+			// Mirrors the real core: reads below the floor report a gap and a resync
+			// cursor rather than returning truncated history silently.
+			return { events: [], nextCursor: `1:${this.retentionFloor}`, gap: { resyncCursor: `1:${this.retentionFloor}` } };
+		}
 		const events = this.events.filter(event => BigInt(event.seq) > after).slice(0, limit);
 		const nextCursor = events.length === 0 ? cursor : `1:${events.at(-1)?.seq}`;
 		return { events, nextCursor };
@@ -161,4 +169,27 @@ test("way mcp runs the stdio JSON-RPC server over the owner UDS client", async (
 	);
 	expect(output).toHaveLength(2);
 	expect(JSON.parse(output[1] ?? "{}")).toMatchObject({ result: { tools: expect.any(Array) } });
+});
+
+test("way_say survives a journal that has rotated past the retention floor", async () => {
+	const core = new MemoryCore();
+	const tools = controller(core);
+	const first = await tools.say({ text: "before rotation", surface_id: "guest", idempotency_key: "rotate-1" });
+
+	// Rotate: the journal advances far past the retained window and the floor moves
+	// above sequence 0, which previously made every scan throw
+	// main_say_journal_retention_gap forever.
+	for (let index = 0; index < 40; index += 1) core.journalAppend("registry_change", JSON.stringify({ n: index }));
+	core.retentionFloor = 30n;
+
+	// New persona output must still work after rotation.
+	const after = await tools.say({ text: "after rotation", surface_id: "guest", idempotency_key: "rotate-2" });
+	expect(after).toMatchObject({ accepted: true, origin: "persona", surface_id: "guest", idempotency_key: "rotate-2" });
+
+	// And replay of a key whose frame has rotated away must still return the
+	// original response from the durable idempotency store rather than duplicating.
+	const eventsBefore = core.events.length;
+	const replayed = await tools.say({ text: "before rotation", surface_id: "guest", idempotency_key: "rotate-1" });
+	expect(replayed).toEqual(first);
+	expect(core.events).toHaveLength(eventsBefore);
 });
