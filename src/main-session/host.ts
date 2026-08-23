@@ -175,6 +175,18 @@ interface AdmittedOperation {
 	readonly finalizePendingClaim?: () => void;
 }
 
+/**
+ * A bounded bridge for brokers that publish terminal ring evidence before the
+ * corresponding transcript row. It carries exact receipt aliases from the
+ * settled admission; it is never synthesized from transcript text or suffixes.
+ */
+interface PendingTranscriptAttribution {
+	readonly attemptIds: readonly string[];
+	readonly surfaceId: string;
+	readonly settlementSequence: number;
+	readonly tailEpoch: number;
+}
+
 interface JournaledAttemptTransitions {
 	started: boolean;
 	ended: boolean;
@@ -399,6 +411,10 @@ class ExternalMainSessionHost implements MainSessionHost {
 	readonly #admittedOperations = new Map<string, AdmittedOperation>();
 	readonly #surfaceIdByAttemptId = new Map<string, string>();
 	readonly #surfaceIdByResponseId = new Map<string, string>();
+	readonly #pendingTranscriptAttributions: PendingTranscriptAttribution[] = [];
+	readonly #settledTerminalAttemptIds = new Set<string>();
+	#terminalSettlementSequence = 0;
+	#tailObservationEpoch = 0;
 	readonly #unmatchedTerminalAttemptIds = new Set<string>();
 	readonly #seenTailEvents = new Set<string>();
 	readonly #fatalFailure = Promise.withResolvers<MainSessionHostError>();
@@ -566,7 +582,11 @@ class ExternalMainSessionHost implements MainSessionHost {
 	private prepareTailResponseAttributions(events: readonly SupervisorEvent[]): void {
 		for (const source of events) {
 			const event = externalEvent(source);
-			if (event.type === "agent_end" || event.type === "turn_end" || event.type === "agent_failed") this.recordResponseAttribution(event);
+			if (event.type !== "agent_end" && event.type !== "turn_end" && event.type !== "agent_failed") continue;
+			const operationRef = this.admittedOperationRef(event);
+			const admission = operationRef === undefined ? undefined : this.#admittedOperations.get(operationRef);
+			this.rememberTerminalBoundary(event, admission, this.surfaceIdForEvent(event));
+			this.recordResponseAttribution(event);
 		}
 	}
 
@@ -575,7 +595,59 @@ class ExternalMainSessionHost implements MainSessionHost {
 		for (const messageId of messageIds(event)) {
 			surfaceId = this.mergeSurfaceId(surfaceId, this.#surfaceIdByResponseId.get(messageId));
 		}
-		return surfaceId;
+		const pending = this.pendingTranscriptAttributionFor(event);
+		return this.mergeSurfaceId(surfaceId, pending?.surfaceId);
+	}
+
+	/** Resolves one unambiguous trailing transcript against retained exact durable-attribution aliases. */
+	private pendingTranscriptAttributionFor(event: Record<string, unknown>): PendingTranscriptAttribution | undefined {
+		if (messageIds(event).length === 0 || this.#admittedOperations.size !== 0) return undefined;
+		// Keep the bridge to one subsequent complete tail. A later autonomous or
+		// unrelated transcript must not inherit a stale surface merely because a
+		// durable idempotency mapping has not yet expired.
+		this.#pendingTranscriptAttributions.splice(
+			0,
+			this.#pendingTranscriptAttributions.length,
+			...this.#pendingTranscriptAttributions.filter(attribution => this.#tailObservationEpoch - attribution.tailEpoch <= 1),
+		);
+		if (this.#pendingTranscriptAttributions.length !== 1) return undefined;
+		const attribution = this.#pendingTranscriptAttributions[0];
+		if (!attribution || attribution.settlementSequence !== this.#terminalSettlementSequence) return undefined;
+		let resolvedSurfaceId: string | undefined;
+		for (const attemptId of attribution.attemptIds) {
+			resolvedSurfaceId = this.mergeSurfaceId(resolvedSurfaceId, this.#surfaceIdByAttemptId.get(attemptId));
+		}
+		return resolvedSurfaceId === attribution.surfaceId ? attribution : undefined;
+	}
+
+	private consumePendingTranscriptAttribution(attribution: PendingTranscriptAttribution): void {
+		const index = this.#pendingTranscriptAttributions.indexOf(attribution);
+		if (index >= 0) this.#pendingTranscriptAttributions.splice(index, 1);
+	}
+
+	private rememberTerminalBoundary(
+		event: Record<string, unknown>,
+		admission: AdmittedOperation | undefined,
+		surfaceId: string | undefined,
+	): void {
+		const attemptIds = admission?.attemptIds ?? this.eventAttemptIds(event);
+		const duplicate = attemptIds.some(attemptId => this.#settledTerminalAttemptIds.has(attemptId));
+		if (duplicate) return;
+		this.#terminalSettlementSequence += 1;
+		for (const attemptId of attemptIds) this.#settledTerminalAttemptIds.add(attemptId);
+		while (this.#settledTerminalAttemptIds.size > MAX_JOURNALED_ATTEMPTS) {
+			const oldest = this.#settledTerminalAttemptIds.values().next().value;
+			if (oldest === undefined) break;
+			this.#settledTerminalAttemptIds.delete(oldest);
+		}
+		if (attemptIds.length === 0 || surfaceId === undefined) return;
+		this.#pendingTranscriptAttributions.push({
+			attemptIds: [...attemptIds],
+			surfaceId,
+			settlementSequence: this.#terminalSettlementSequence,
+			tailEpoch: this.#tailObservationEpoch,
+		});
+		while (this.#pendingTranscriptAttributions.length > MAX_JOURNALED_ATTEMPTS) this.#pendingTranscriptAttributions.shift();
 	}
 
 	private shouldDeferTranscriptAttribution(event: Record<string, unknown>, surfaceId: string | undefined): boolean {
@@ -822,6 +894,8 @@ class ExternalMainSessionHost implements MainSessionHost {
 		}
 		if (type === "agent_end" || type === "turn_end") {
 			const operationRef = this.admittedOperationRef(event);
+			const admission = operationRef === undefined ? undefined : this.#admittedOperations.get(operationRef);
+			this.rememberTerminalBoundary(event, admission, operationRef === undefined ? undefined : this.surfaceIdForEvent(event));
 			// Persist the terminal boundary before its claim finalizer. If the process
 			// dies after this write, restart reconciliation can prove the acceptance.
 			this.appendTurnTransition("turn_end", event);
@@ -835,6 +909,8 @@ class ExternalMainSessionHost implements MainSessionHost {
 		}
 		if (type === "agent_failed") {
 			const operationRef = this.admittedOperationRef(event);
+			const admission = operationRef === undefined ? undefined : this.#admittedOperations.get(operationRef);
+			this.rememberTerminalBoundary(event, admission, operationRef === undefined ? undefined : this.surfaceIdForEvent(event));
 			this.appendTurnTransition("turn_end", event);
 			if (this.#failure) return;
 			if (!operationRef) this.rememberUnmatchedTerminalAttempts(event);
@@ -970,6 +1046,7 @@ class ExternalMainSessionHost implements MainSessionHost {
 			const event = isRecord(entry.payload) ? entry.payload : undefined;
 			const finalized = event ? finalizedAssistantMessage(event, `transcript:${entry.id}`) : undefined;
 			const safelyNonDeliverable = event ? isSafelyNonDeliverableTranscriptEntry(event) : false;
+			const pendingAttribution = event ? this.pendingTranscriptAttributionFor(event) : undefined;
 			const surfaceId = event ? this.surfaceIdForTranscriptEntry(event) : undefined;
 			if (event && this.shouldDeferTranscriptAttribution(event, surfaceId)) return;
 			const delivered = finalized && event
@@ -988,6 +1065,7 @@ class ExternalMainSessionHost implements MainSessionHost {
 							},
 							surfaceId,
 						);
+			if (pendingAttribution && delivered && (finalized !== undefined || !safelyNonDeliverable)) this.consumePendingTranscriptAttribution(pendingAttribution);
 			if (!delivered || this.#failure || (!finalized && !safelyNonDeliverable)) return;
 		}
 	}
@@ -1234,6 +1312,7 @@ class ExternalMainSessionHost implements MainSessionHost {
 					await Promise.race([Bun.sleep(100), wake, this.#tailStop.promise]);
 					continue;
 				}
+				this.#tailObservationEpoch += 1;
 				const pendingProofBound = this.bindPendingTranscriptProof(tail);
 				if (pendingProofBound) {
 					this.settleTerminalTail(tail);

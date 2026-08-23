@@ -1090,6 +1090,97 @@ externalTest("main.events.read defers an attributable transcript delivery gap em
 	expect(JSON.parse(gap.payloadJson)).toMatchObject({ reason: "transcript_delivery_unprovable", surface_id: "owner" });
 });
 
+externalTest("terminal-before-transcript trailing assistant reply receives exact durable surface attribution", async () => {
+	const gateway = await hosted();
+	gateway.fixture.holdNextTurn();
+	const accepted = await gateway.client.request("main.submit", {
+		text: "terminal boundary arrives before trailing transcript",
+		surface_id: "owner",
+		idempotency_key: "terminal-before-transcript-trailing-reply",
+	});
+	const opRef = (accepted.result as { op_ref: string }).op_ref;
+	const attemptId = `${gateway.fixture.sessionId}:${opRef}`;
+	const responseId = "trailing-terminal-first-response-id";
+	gateway.fixture.appendTailEvent("turn_end", {
+		type: "turn_end",
+		scope: { attemptId, generation: 1, lineage: "main" },
+	});
+	await eventually(
+		() => gateway.core.journalRead("1:0", 100).events.some(event => event.kind === "turn_end" && JSON.parse(event.payloadJson).attempt_id === attemptId),
+		"terminal event did not project before trailing transcript",
+	);
+	gateway.fixture.appendTranscript({ type: "message", role: "assistant", content: "trailing terminal-first reply", responseId });
+	const assistant = await eventually(
+		() => gateway.core.journalRead("1:0", 100).events.find(event => event.kind === "assistant_message" && event.payloadJson.includes("trailing terminal-first reply")),
+		"trailing transcript reply did not project",
+	);
+	expect(JSON.parse(assistant.payloadJson)).toMatchObject({ finalized: true, text: "trailing terminal-first reply", surface_id: "owner" });
+});
+
+externalTest("two terminal-before-transcript admissions remain unattributed when exact trailing correlation is ambiguous", async () => {
+	const gateway = await hosted();
+	gateway.fixture.holdNextTurn();
+	const first = await gateway.client.request("main.submit", {
+		text: "first concurrent terminal boundary",
+		surface_id: "owner",
+		idempotency_key: "terminal-before-transcript-ambiguous-first",
+	});
+	const firstOpRef = (first.result as { op_ref: string }).op_ref;
+	gateway.fixture.holdNextTurn();
+	const second = await gateway.client.request("main.submit", {
+		text: "second concurrent terminal boundary",
+		surface_id: "guest",
+		idempotency_key: "terminal-before-transcript-ambiguous-second",
+	});
+	const secondOpRef = (second.result as { op_ref: string }).op_ref;
+	const firstAttemptId = `${gateway.fixture.sessionId}:${firstOpRef}`;
+	const secondAttemptId = `${gateway.fixture.sessionId}:${secondOpRef}`;
+	gateway.fixture.appendTailEvent("turn_end", { type: "turn_end", scope: { attemptId: firstAttemptId, generation: 1, lineage: "main" } });
+	gateway.fixture.appendTailEvent("turn_end", { type: "turn_end", scope: { attemptId: secondAttemptId, generation: 1, lineage: "main" } });
+	await eventually(
+		() => gateway.core.journalRead("1:0", 100).events.filter(event => event.kind === "turn_end").length >= 2,
+		"both concurrent terminal boundaries did not project",
+	);
+	gateway.fixture.appendTranscript({ type: "message", role: "assistant", content: "ambiguous first trailing reply", responseId: "ambiguous-first-response" });
+	gateway.fixture.appendTranscript({ type: "message", role: "assistant", content: "ambiguous second trailing reply", responseId: "ambiguous-second-response" });
+	const assistantRows = await eventually(
+		() => {
+			const rows = gateway.core.journalRead("1:0", 100).events.filter(event => event.kind === "assistant_message");
+			return rows.length >= 2 ? rows : undefined;
+		},
+		"ambiguous trailing replies did not project",
+	);
+	for (const row of assistantRows) expect(JSON.parse(row.payloadJson)).not.toHaveProperty("surface_id");
+});
+
+externalTest("terminal-before-transcript opaque trailing entry receives exact durable surface attribution on its gap", async () => {
+	const gateway = await hosted();
+	gateway.fixture.holdNextTurn();
+	const accepted = await gateway.client.request("main.submit", {
+		text: "terminal boundary precedes opaque trailing transcript",
+		surface_id: "owner",
+		idempotency_key: "terminal-before-transcript-trailing-gap",
+	});
+	const opRef = (accepted.result as { op_ref: string }).op_ref;
+	const attemptId = `${gateway.fixture.sessionId}:${opRef}`;
+	gateway.fixture.appendTailEvent("turn_end", { type: "turn_end", scope: { attemptId, generation: 1, lineage: "main" } });
+	await eventually(
+		() => gateway.core.journalRead("1:0", 100).events.some(event => event.kind === "turn_end" && JSON.parse(event.payloadJson).attempt_id === attemptId),
+		"terminal event did not project before opaque trailing transcript",
+	);
+	gateway.fixture.appendTranscript({
+		type: "message",
+		role: "assistant",
+		content: [{ type: "opaque_output", value: "opaque trailing terminal-first output" }],
+		responseId: "trailing-terminal-first-gap-response",
+	});
+	const gap = await eventually(
+		() => gateway.core.journalRead("1:0", 100).events.find(event => event.kind === "transcript_delivery_gap" && event.payloadJson.includes("transcript:2")),
+		"opaque trailing transcript gap did not project",
+	);
+	expect(JSON.parse(gap.payloadJson)).toMatchObject({ reason: "transcript_delivery_unprovable", surface_id: "owner" });
+});
+
 externalTest("two configured admission surfaces retain distinct attribution across separate turns", async () => {
 	const gateway = await hosted();
 	const ownerRequest = { text: "owner-origin turn", surface_id: "owner", idempotency_key: "owner-origin-attribution" };
