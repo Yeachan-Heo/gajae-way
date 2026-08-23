@@ -4,6 +4,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 
 import { afterAll, expect, test } from "bun:test";
+import { MemoryChunkLedger } from "../../src/adapter/chunk-ledger";
 import { DiscordOutbox, discordChunkWireNonce, discordDedupeKey, discordWireNonce } from "../../src/adapter/discord/outbox";
 import { loadDiscordAdapterConfig, type DiscordAdapterConfig } from "../../src/adapter/discord/config";
 import { loadWayProfile } from "../../src/profile";
@@ -114,6 +115,7 @@ function outbox(
 	fixture: DiscordFixture,
 	hooks: ConstructorParameters<typeof DiscordOutbox>[0]["hooks"] = undefined,
 	onDiagnostic?: (message: string) => void,
+	chunkLedger?: ConstructorParameters<typeof DiscordOutbox>[0]["chunkLedger"],
 ): DiscordOutbox {
 	return new DiscordOutbox({
 		rpc: gatewayUnderTest.client,
@@ -121,6 +123,7 @@ function outbox(
 		routes: [OWNER_ROUTE],
 		unattributedDelivery: "owner-dm",
 		unattributedRoute: OWNER_ROUTE,
+		...(chunkLedger ? { chunkLedger } : {}),
 
 		claimTtlMs: 5_000,
 		readWaitMs: 0,
@@ -1689,3 +1692,41 @@ externalTest("Discord non-owner engagement is admitted as follow_up whether the 
 		await fixture.disconnect();
 	}
 });
+
+
+externalTest("a durable chunk ledger makes a delayed mid-set replay skip chunks that already landed", async () => {
+	const gatewayUnderTest = await gateway();
+	const fixture = new DiscordFixture();
+	await fixture.connect();
+	// One ledger shared across the interruption models a durable record surviving
+	// a restart. Unlike the enforce_nonce path, this must hold no matter how long
+	// the outage lasted, so the confirmed chunk is never re-attempted at all.
+	const ledger = new MemoryChunkLedger();
+	try {
+		const text = ["```ts", ...Array.from({ length: 260 }, (_, index) => `const value${index} = ${index};`), "```"].join("\n");
+		const appended = gatewayUnderTest.core.journalAppend("assistant_message", JSON.stringify({ finalized: true, text }));
+		const abort = new AbortController();
+		fixture.deferNextSend();
+		const interrupted = outbox(gatewayUnderTest, fixture, undefined, undefined, ledger).runOnce(abort.signal);
+		await eventually(() => (fixture.pendingSendCount === 1 ? true : undefined), "outbox did not reach the first deferred chunk");
+		abort.abort();
+		fixture.releaseNextSend();
+		await expect(interrupted).rejects.toMatchObject({ name: "AbortError" });
+		expect(fixture.sends).toHaveLength(1);
+		const attemptsAfterInterrupt = fixture.sendAttempts.length;
+		expect(gatewayUnderTest.core.consumerCursor("gajaeway-discord")).toBe("1:0");
+
+		await Bun.sleep(5_100);
+		expect(await outbox(gatewayUnderTest, fixture, undefined, undefined, ledger).runOnce()).toBe("sent");
+
+		const dedupeKey = discordDedupeKey("discord:owner-dm", String(appended.seq));
+		// Chunk 0 was already confirmed, so the replay must not attempt it again.
+		const firstChunkNonce = discordChunkWireNonce(dedupeKey, 0);
+		const replayAttempts = fixture.sendAttempts.slice(attemptsAfterInterrupt);
+		expect(replayAttempts.some(attempt => attempt.nonce === firstChunkNonce)).toBe(false);
+		expect(replayAttempts.every(attempt => !attempt.duplicate)).toBe(true);
+		expect(gatewayUnderTest.core.consumerCursor("gajaeway-discord")).toBe(appended.cursor);
+	} finally {
+		await fixture.disconnect();
+	}
+}, 15_000);

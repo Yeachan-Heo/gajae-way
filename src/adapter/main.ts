@@ -1,6 +1,7 @@
 import * as path from "node:path";
 import { defaultConfig, parseWayConfig } from "../config";
 import { RpcClient, type JsonRpcClient } from "../rpc-client";
+import { FileChunkLedger } from "./chunk-ledger";
 import { loadDiscordAdapterConfig } from "./discord/config";
 import { DiscordOutbox } from "./discord/outbox";
 import { DiscordGatewayPlatform, type DiscordPlatform } from "./discord/platform";
@@ -35,7 +36,10 @@ async function startDiscordPeer(config: ReturnType<typeof loadDiscordAdapterConf
 	const platform = new DiscordGatewayPlatform({ token: config.token, fetch: dependencies.fetch });
 	const bot = await platform.getCurrentUser();
 	const route = new DiscordRouteHandler({ routes: config.routes, rpc, platform, botUserId: bot.id, allowBots: config.allowBots, blockedAuthorIds: config.blockedAuthorIds });
-	const outbox = new DiscordOutbox({ rpc, platform, routes: config.routes, unattributedDelivery: config.unattributedDelivery, unattributedRoute: config.unattributedRoute, claimTtlMs: config.claimTtlMs, readWaitMs: config.readWaitMs });
+	// Durable so a replayed multi-chunk set cannot re-post chunks that already
+	// landed, independent of Discord's time-bounded enforce_nonce window.
+	const chunkLedger = new FileChunkLedger(path.dirname(config.rpcSocketPath), "discord-chunk-ledger.json");
+	const outbox = new DiscordOutbox({ rpc, platform, routes: config.routes, unattributedDelivery: config.unattributedDelivery, unattributedRoute: config.unattributedRoute, claimTtlMs: config.claimTtlMs, readWaitMs: config.readWaitMs, chunkLedger });
 	const unsubscribe = platform.onMessage(message => { void route.handle(message).catch(error => dependencies.onError?.(error instanceof Error ? error : new Error(String(error)))); });
 	await platform.connect();
 	const controller = new AbortController();

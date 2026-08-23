@@ -360,6 +360,17 @@ ingress. Message reactions are NOT implemented for Telegram; the adapter's
 `react` is intentionally a no-op there and reactions must not be relied on for
 Telegram surfaces.
 
+### Multi-chunk delivery durability
+
+A reply longer than a platform's message limit is delivered as ordered chunks and
+its journal event commits only after every chunk is confirmed, so an interruption
+mid-set replays the set. Deterministic per-chunk nonces let Discord suppress a
+prompt duplicate, but that deduplication is time-bounded, so both adapters keep a
+DURABLE per-chunk record (`discord-chunk-ledger.json` beside the adapter's socket
+state, and the Telegram send ledger) and skip chunks already confirmed regardless
+of how long the outage lasted. A present-but-corrupt ledger fails closed rather
+than starting empty, because starting empty is exactly what would double-post.
+
 ## Known limitation: journal latency on continuously busy sessions
 
 The credential-free broker CLI returns tail envelopes only when a terminal turn

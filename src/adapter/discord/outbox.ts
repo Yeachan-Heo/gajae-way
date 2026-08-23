@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+import { MemoryChunkLedger, type ChunkLedger } from "../chunk-ledger";
 import {
 	RpcJournalConsumer,
 	type JournalDeliveryProof,
@@ -43,6 +44,8 @@ export interface DiscordOutboxOptions {
 	readonly retryDelayMs?: number;
 	readonly now?: () => number;
 	readonly hooks?: DiscordOutboxHooks;
+	/** Durable record of confirmed chunks so a replayed multi-chunk set cannot double-post. */
+	readonly chunkLedger?: ChunkLedger;
 	/** Resolves the most recent inbound trigger for reply threading on a surface. */
 	replyReferenceForSurface?(surfaceId: string): DiscordMessageReference | undefined;
 	onError?(error: Error): void;
@@ -99,6 +102,7 @@ export class DiscordOutbox {
 	readonly #unattributedRoute: DiscordRoute | undefined;
 	readonly #replyReferenceForSurface: ((surfaceId: string) => DiscordMessageReference | undefined) | undefined;
 	readonly #hooks: DiscordOutboxHooks;
+	readonly #chunkLedger: ChunkLedger;
 	readonly #consumer: RpcJournalConsumer;
 	readonly #idleDelayMs: number;
 	readonly #retryDelayMs: number;
@@ -137,6 +141,7 @@ export class DiscordOutbox {
 		this.#unattributedRoute = options.unattributedRoute;
 		this.#replyReferenceForSurface = options.replyReferenceForSurface;
 		this.#hooks = options.hooks ?? {};
+		this.#chunkLedger = options.chunkLedger ?? new MemoryChunkLedger();
 		this.#idleDelayMs = boundedInteger(options.idleDelayMs ?? 50, "idleDelayMs", 0, 60_000);
 		this.#retryDelayMs = boundedInteger(options.retryDelayMs ?? 250, "retryDelayMs", 0, 60_000);
 		this.#onError = options.onError ?? (error => console.error(`gajaeway-discord outbox failed: ${error.message}`));
@@ -192,8 +197,20 @@ export class DiscordOutbox {
 		for (const [index, chunk] of chunks.chunks.entries()) {
 			throwIfAborted(signal);
 			const nonce = discordChunkWireNonce(item.dedupeKey, index);
+			// A replayed chunk set must not re-post chunks that already landed.
+			// Deterministic nonces alone cannot guarantee that: Discord's
+			// enforce_nonce deduplication is time-bounded, so an outage longer than
+			// its window would duplicate. The durable ledger makes the skip decision
+			// independent of elapsed time.
+			const ledgerKey = `${item.dedupeKey}:chunk:${index}`;
+			const alreadySent = this.#chunkLedger.recorded(ledgerKey);
+			if (alreadySent) {
+				firstMessageId ??= alreadySent;
+				continue;
+			}
 			const platformMessageId = await this.#platform.send(item.channelId, chunk, nonce, { formatted: true, dedupeKey: item.dedupeKey, ...(index === 0 && item.replyTo ? { replyTo: item.replyTo } : {}) });
 			if (!platformMessageId) throw new DiscordOutboxError(`Discord returned no message id for journal event ${item.seq} chunk ${index}.`);
+			this.#chunkLedger.record(ledgerKey, platformMessageId);
 			firstMessageId ??= platformMessageId;
 		}
 		if (!firstMessageId) throw new DiscordOutboxError(`Discord returned no message id for journal event ${item.seq}.`);
@@ -238,7 +255,9 @@ export function discordDedupeKey(surfaceId: string, seq: string): string {
  * full dedupe key. At one billion events, the birthday-bound collision chance is
  * about 6.3e-12; the full dedupe key remains the durable consumer.commit proof.
  * Retries and post-restart replays of the same journal event keep producing the
- * identical nonce, preserving `enforce_nonce` deduplication.
+ * identical nonce, which lets `enforce_nonce` suppress a prompt duplicate. That
+ * deduplication is TIME-BOUNDED on Discord's side, so the durable chunk ledger -
+ * not the nonce - is what makes a delayed replay safe.
  */
 export function discordWireNonce(dedupeKey: string): string {
 	return createHash("sha256").update(dedupeKey).digest("hex").slice(0, 24);
