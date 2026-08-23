@@ -264,6 +264,15 @@ engaged. Bot-authored messages are allowed by default (`allowBots = true`), whil
 the adapter's own bot id is always ignored; set `allowBots = false` to block other
 bots. `blocked_author_ids` drops listed users on every route, including DMs, before
 admission. Drops are silent on Discord and rate-limited in adapter diagnostics.
+
+Outbound Discord presentation is not journal state: markdown tables are rendered
+as bullet lists, and when a reply contains multiple bare links each link is
+wrapped in angle brackets to suppress embeds. Replies over 2,000 characters are
+sent as ordered chunks with deterministic per-event/per-chunk nonces. The
+consumer commits only after every chunk is confirmed; a restart may retry an
+already-posted chunk with the same nonce, while Discord suppresses the duplicate.
+Replies to accepted messages use `message_reference` when the trigger remains
+available and degrade to a normal post when it has been deleted.
 systemd credential directory exists), verify the configured credential and live
 gateway without sending a bot message:
 

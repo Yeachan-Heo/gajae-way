@@ -3,6 +3,8 @@ import type { DiscordMessage, DiscordPlatform } from "./platform";
 import { rpcResult, type JsonRpcClient } from "../../rpc-client";
 
 export type DiscordRouteKind = "channel" | "dm";
+export type DiscordGroupPolicy = "open" | "mention";
+/** Legacy engagement vocabulary accepted at the configuration boundary. */
 export type DiscordEngagementMode = "mention" | "always";
 
 /** A configured Discord ingress and attributed egress route. */
@@ -11,7 +13,9 @@ export interface DiscordRoute {
 	readonly channelId: string;
 	/** `channel` permits derived Discord thread routes; `dm` does not. */
 	readonly kind?: DiscordRouteKind;
-	/** Channels default to mention; DMs and derived threads are always engaged. */
+	/** OpenClaw policy: channels default to mention, open responds to all traffic. */
+	readonly groupPolicy?: DiscordGroupPolicy;
+	/** Legacy alias: `mention` maps to mention and `always` maps to open. */
 	readonly engagement?: DiscordEngagementMode;
 }
 
@@ -21,8 +25,10 @@ export interface DiscordRouteHandlerOptions {
 	readonly platform: DiscordPlatform;
 	readonly botUserId: string;
 	readonly blockedAuthorIds?: readonly string[];
+	/** OpenClaw's permissive default; self-authored messages remain refused. */
+	readonly allowBots?: boolean;
 	readonly acknowledgement?: DiscordAcknowledgementOptions;
-	onAccepted?(message: DiscordMessage, journalHeadCursor: unknown): void;
+	onAccepted?(message: DiscordMessage, journalHeadCursor: unknown, surfaceId?: string): void;
 	onAcknowledged?(acknowledgement: DiscordAcknowledgement): void;
 	onAcknowledgementFailed?(message: DiscordMessage): void;
 	onDiagnostic?(message: string): void;
@@ -50,8 +56,9 @@ export class DiscordRouteHandler {
 	readonly #platform: DiscordPlatform;
 	readonly #botUserId: string;
 	readonly #blockedAuthorIds: ReadonlySet<string>;
+	readonly #allowBots: boolean;
 	readonly #acknowledgement: DiscordAcknowledgementOptions;
-	readonly #onAccepted: ((message: DiscordMessage, journalHeadCursor: unknown) => void) | undefined;
+	readonly #onAccepted: ((message: DiscordMessage, journalHeadCursor: unknown, surfaceId?: string) => void) | undefined;
 	readonly #onAcknowledged: ((acknowledgement: DiscordAcknowledgement) => void) | undefined;
 	readonly #onAcknowledgementFailed: ((message: DiscordMessage) => void) | undefined;
 	readonly #diagnostics: DiscordIngressDiagnostics;
@@ -69,6 +76,7 @@ export class DiscordRouteHandler {
 		this.#platform = options.platform;
 		this.#botUserId = options.botUserId;
 		this.#blockedAuthorIds = new Set(options.blockedAuthorIds ?? []);
+		this.#allowBots = options.allowBots ?? true;
 		this.#acknowledgement = options.acknowledgement ?? {};
 		this.#onAccepted = options.onAccepted;
 		this.#onAcknowledged = options.onAcknowledged;
@@ -77,7 +85,7 @@ export class DiscordRouteHandler {
 	}
 
 	async handle(message: DiscordMessage): Promise<boolean> {
-		if (message.authorBot || !message.text.trim()) return false;
+		if (message.authorId === this.#botUserId || (message.authorBot && !this.#allowBots) || !message.text.trim()) return false;
 		const existing = this.#inFlight.get(message.id);
 		if (existing) return await existing;
 		const handling = this.resolveAndSubmit(message);
@@ -170,7 +178,7 @@ export class DiscordRouteHandler {
 		if (!isRecord(result) || result.accepted !== true) {
 			throw new DiscordRouteError("Gateway main.submit returned an invalid acceptance response.");
 		}
-		this.#onAccepted?.(message, result.journal_head_cursor);
+		this.#onAccepted?.(message, result.journal_head_cursor, surfaceId);
 		let acknowledgement: DiscordAcknowledgement;
 		try {
 			acknowledgement = await acknowledgeDiscordMessage(this.#platform, message, this.#acknowledgement);
@@ -223,11 +231,17 @@ function validateDiscordRoute(route: DiscordRoute): void {
 	if (route.kind !== undefined && route.kind !== "channel" && route.kind !== "dm") {
 		throw new DiscordRouteError("Discord route kind must be channel or dm.");
 	}
+	if (route.groupPolicy !== undefined && route.groupPolicy !== "mention" && route.groupPolicy !== "open") {
+		throw new DiscordRouteError("Discord route groupPolicy must be mention or open.");
+	}
 	if (route.engagement !== undefined && route.engagement !== "mention" && route.engagement !== "always") {
 		throw new DiscordRouteError("Discord route engagement must be mention or always.");
 	}
-	if (route.kind === "dm" && route.engagement !== undefined) {
-		throw new DiscordRouteError("Discord dm routes are always engaged and must not configure engagement.");
+	if (route.groupPolicy !== undefined && route.engagement !== undefined && route.groupPolicy !== engagementToGroupPolicy(route.engagement)) {
+		throw new DiscordRouteError("Discord route groupPolicy conflicts with legacy engagement.");
+	}
+	if (route.kind === "dm" && (route.groupPolicy !== undefined || route.engagement !== undefined)) {
+		throw new DiscordRouteError("Discord dm routes are always engaged and must not configure groupPolicy or engagement.");
 	}
 }
 
@@ -283,7 +297,12 @@ function ingressDropDescription(kind: DiscordIngressDrop): string {
 
 function engagementMode(route: DiscordRoute): DiscordEngagementMode {
 	if (route.kind === "dm") return "always";
-	return route.engagement ?? "mention";
+	const policy = route.groupPolicy ?? (route.engagement === undefined ? "mention" : engagementToGroupPolicy(route.engagement));
+	return policy === "open" ? "always" : "mention";
+}
+
+function engagementToGroupPolicy(engagement: DiscordEngagementMode): DiscordGroupPolicy {
+	return engagement === "always" ? "open" : "mention";
 }
 
 function hasDirectBotMention(message: DiscordMessage, botUserId: string): boolean {

@@ -1,4 +1,4 @@
-import type { DiscordCurrentUser, DiscordMessage, DiscordMessageHandler, DiscordMessageReference, DiscordPlatform } from "../../src/adapter/discord/platform";
+import type { DiscordCurrentUser, DiscordMessage, DiscordMessageHandler, DiscordMessageReference, DiscordPlatform, DiscordSendOptions } from "../../src/adapter/discord/platform";
 
 
 interface DiscordFixtureTimer {
@@ -117,6 +117,7 @@ export interface DiscordFixtureSend {
 	readonly channelId: string;
 	readonly text: string;
 	readonly nonce: string;
+	readonly replyTo?: DiscordMessageReference;
 	readonly id: string;
 	readonly at: number;
 	readonly duplicate: boolean;
@@ -171,6 +172,7 @@ export class DiscordFixture implements DiscordPlatform {
 	readonly #queuedTypingErrors: Error[] = [];
 	readonly #threadParents = new Map<string, string>();
 	readonly #messageAuthors = new Map<string, string>();
+	readonly #missingReplyMessageIds = new Set<string>();
 
 
 	#deferredTypingCount = 0;
@@ -261,6 +263,11 @@ export class DiscordFixture implements DiscordPlatform {
 		this.#messageAuthors.set(`${channelId}:${messageId}`, authorId);
 	}
 
+	/** Makes a reply reference unavailable so the platform can exercise plain-post fallback. */
+	setMissingReplyReference(channelId: string, messageId: string): void {
+		this.#missingReplyMessageIds.add(`${channelId}:${messageId}`);
+	}
+
 
 	failNextTyping(error = new Error("fixture typing acknowledgement failed")): void {
 		this.#queuedTypingErrors.push(error);
@@ -324,11 +331,12 @@ export class DiscordFixture implements DiscordPlatform {
 		for (const handler of [...this.#handlers]) await handler(message);
 	}
 
-	async send(channelId: string, text: string, nonce: string): Promise<string> {
+	async send(channelId: string, text: string, nonce: string, options?: DiscordSendOptions): Promise<string> {
 		if (!this.#connected) throw new Error("Discord fixture gateway is disconnected.");
+		const replyTo = options?.replyTo && !this.#missingReplyMessageIds.has(`${options.replyTo.channelId}:${options.replyTo.messageId}`) ? options.replyTo : undefined;
 		const priorId = this.#nonceIds.get(nonce);
 		const id = priorId ?? this.#queuedSendIds.shift() ?? this.#sendId({ channelId, text, nonce, ordinal: this.sendAttempts.length + 1 });
-		const attempt: DiscordFixtureSend = { channelId, text, nonce, id, at: this.#now(), duplicate: priorId !== undefined };
+		const attempt: DiscordFixtureSend = { channelId, text, nonce, ...(replyTo === undefined ? {} : { replyTo }), id, at: this.#now(), duplicate: priorId !== undefined };
 		this.sendAttempts.push(attempt);
 		if (priorId) return priorId;
 		this.#nonceIds.set(nonce, id);

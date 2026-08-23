@@ -5,7 +5,7 @@ import { loadWayCore } from "../../native-loader";
 import { loadDiscordAdapterConfig, type DiscordAdapterConfig } from "./config";
 import { DiscordOutbox, type DiscordOutboxItem } from "./outbox";
 
-import { DiscordGatewayPlatform, validateDiscordToken, type DiscordFetch, type DiscordPlatform } from "./platform";
+import { DiscordGatewayPlatform, validateDiscordToken, type DiscordFetch, type DiscordMessage, type DiscordMessageReference, type DiscordPlatform } from "./platform";
 import { DiscordRouteHandler } from "./route";
 
 const usage = `Usage:
@@ -75,6 +75,7 @@ export async function startDiscordAdapter(
 				...(dependencies.fetch ? { fetch: dependencies.fetch } : {}),
 				...(config.apiBaseUrl ? { apiBaseUrl: config.apiBaseUrl } : {}),
 				...(config.gatewayUrl ? { gatewayUrl: config.gatewayUrl } : {}),
+				onDiagnostic,
 			});
 		const activePlatform = platform;
 		const botUser = await activePlatform.getCurrentUser();
@@ -88,16 +89,29 @@ export async function startDiscordAdapter(
 			clock: dependencies.typingKeepaliveClock,
 		});
 		typingKeepalive = activeTypingKeepalive;
+		const replyReferences = new Map<string, DiscordMessageReference>();
+		const rememberReplyReference = (surfaceId: string | undefined, message: DiscordMessage): void => {
+			if (!surfaceId) return;
+			replyReferences.set(surfaceId, { channelId: message.channelId, messageId: message.id });
+			if (replyReferences.size > 1_024) {
+				const oldest = replyReferences.keys().next().value as string | undefined;
+				if (oldest) replyReferences.delete(oldest);
+			}
+		};
 		const router = new DiscordRouteHandler({
 			routes: config.routes,
 			botUserId: botUser.id,
 			blockedAuthorIds: config.blockedAuthorIds,
+			allowBots: config.allowBots,
 			onDiagnostic,
 
 			rpc,
 			platform: activePlatform,
 			acknowledgement: { budgetMs: config.ackBudgetMs },
-			onAccepted: (message, journalHeadCursor) => activeTypingKeepalive.begin(message.channelId, message.id, journalHeadCursor),
+			onAccepted: (message, journalHeadCursor, surfaceId) => {
+				rememberReplyReference(surfaceId, message);
+				activeTypingKeepalive.begin(message.channelId, message.id, journalHeadCursor);
+			},
 			onAcknowledged: acknowledgement => activeTypingKeepalive.start(acknowledgement.channelId, acknowledgement.messageId),
 
 			onAcknowledgementFailed: message => activeTypingKeepalive.cancel(message.channelId, message.id),
@@ -108,6 +122,7 @@ export async function startDiscordAdapter(
 			routes: config.routes,
 			unattributedDelivery: config.unattributedDelivery,
 			...(config.unattributedRoute === undefined ? {} : { unattributedRoute: config.unattributedRoute }),
+			replyReferenceForSurface: surfaceId => replyReferences.get(surfaceId),
 			claimTtlMs: config.claimTtlMs,
 			readWaitMs: config.readWaitMs,
 			hooks: { afterSendBeforeCommit: item => activeTypingKeepalive.delivered(item.channelId, item) },

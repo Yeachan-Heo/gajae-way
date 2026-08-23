@@ -1,5 +1,5 @@
 import { expect, test } from "bun:test";
-import { DiscordGatewayPlatform, type DiscordMessage } from "../../src/adapter/discord/platform";
+import { DiscordGatewayPlatform, formatDiscordOutboundText, type DiscordMessage } from "../../src/adapter/discord/platform";
 
 
 class GatewaySocketFixture {
@@ -199,4 +199,63 @@ test("hello schedules the real heartbeat interval so a latent ACK cannot kill th
 	} finally {
 		await platform.disconnect();
 	}
+});
+
+test("Discord platform chunks long replies with deterministic per-chunk nonces and fence reopening", async () => {
+	const requests: Array<{ body: Record<string, unknown> }> = [];
+	let ordinal = 0;
+	const platform = new DiscordGatewayPlatform({
+		token: "test-token",
+		fetch: async (input, init) => {
+			const url = String(input);
+			if (url.endsWith("/channels/123456789012345678/messages") && init?.method === "POST") {
+			requests.push({ body: JSON.parse(String(init.body)) as Record<string, unknown> });
+			ordinal += 1;
+			return new Response(JSON.stringify({ id: `chunk-${ordinal}` }), { status: 200 });
+			}
+			return new Response(null, { status: 204 });
+		},
+	});
+	const source = ["```ts", ...Array.from({ length: 180 }, () => "const value = 1;"), "```", "final paragraph"].join("\n");
+	const firstId = await platform.send("123456789012345678", source, "base-nonce");
+	expect(firstId).toBe("chunk-1");
+	expect(requests.length).toBeGreaterThan(1);
+	expect(requests.every(request => String(request.body.content).length <= 2_000)).toBe(true);
+	expect(requests[0]?.body.nonce).toBe("base-nonce");
+	expect(requests.slice(1).map(request => request.body.nonce)).toEqual(expect.arrayContaining([expect.any(String)]));
+	expect(String(requests[0]?.body.content)).toContain("```ts");
+	expect(String(requests[0]?.body.content)).toContain("```");
+});
+
+test("Discord outbound formatting renders tables as bullets and wraps multiple bare links", () => {
+	const source = ["| Name | Value |", "| --- | --- |", "| alpha | one |", "| beta | two |", "", "See https://one.example/a and https://two.example/b."].join("\n");
+	const formatted = formatDiscordOutboundText(source);
+	expect(formatted).not.toContain("| --- | --- |");
+	expect(formatted).toContain("- Name: alpha; Value: one");
+	expect(formatted).toContain("<https://one.example/a>");
+	expect(formatted).toContain("<https://two.example/b>.");
+});
+
+test("Discord platform falls back to a plain post when a reply target is gone", async () => {
+	const bodies: Array<Record<string, unknown>> = [];
+	const platform = new DiscordGatewayPlatform({
+		token: "test-token",
+		fetch: async (input, init) => {
+			if (String(input).endsWith("/channels/123456789012345678/messages") && init?.method === "POST") {
+				const body = JSON.parse(String(init.body)) as Record<string, unknown>;
+				bodies.push(body);
+				if (body.message_reference) return new Response(JSON.stringify({ code: 10008, message: "Unknown Message" }), { status: 404 });
+				return new Response(JSON.stringify({ id: "plain-fallback" }), { status: 200 });
+			}
+			return new Response(null, { status: 204 });
+		},
+	});
+	expect(
+		await platform.send("123456789012345678", "fallback", "fallback-nonce", {
+			replyTo: { channelId: "123456789012345678", messageId: "888888888888888888" },
+		}),
+	).toBe("plain-fallback");
+	expect(bodies).toHaveLength(2);
+	expect(bodies[0]?.message_reference).toBeDefined();
+	expect(bodies[1]?.message_reference).toBeUndefined();
 });

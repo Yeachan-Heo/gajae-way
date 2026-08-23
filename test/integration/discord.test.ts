@@ -4,7 +4,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 
 import { expect, test } from "bun:test";
-import { DiscordOutbox, discordDedupeKey, discordWireNonce } from "../../src/adapter/discord/outbox";
+import { DiscordOutbox, discordChunkWireNonce, discordDedupeKey, discordWireNonce } from "../../src/adapter/discord/outbox";
 import { loadDiscordAdapterConfig, type DiscordAdapterConfig } from "../../src/adapter/discord/config";
 import { loadWayProfile } from "../../src/profile";
 
@@ -70,6 +70,7 @@ async function startRoutedFixtureAdapter(
 	options: {
 		readonly unattributedDelivery?: "owner-dm" | "suppress";
 		readonly blockedAuthorIds?: readonly string[];
+		readonly allowBots?: boolean;
 
 		readonly unattributedRoute?: DiscordRoute;
 		readonly onError?: (error: Error) => void;
@@ -84,6 +85,7 @@ async function startRoutedFixtureAdapter(
 		token: "fixture-token",
 		routes,
 		blockedAuthorIds: options.blockedAuthorIds ?? [],
+		allowBots: options.allowBots,
 		unattributedDelivery,
 
 		...(options.unattributedRoute === undefined ? {} : { unattributedRoute: options.unattributedRoute }),
@@ -109,6 +111,7 @@ function outbox(
 	gatewayUnderTest: ExternalGateway,
 	fixture: DiscordFixture,
 	hooks: ConstructorParameters<typeof DiscordOutbox>[0]["hooks"] = undefined,
+	onDiagnostic?: (message: string) => void,
 ): DiscordOutbox {
 	return new DiscordOutbox({
 		rpc: gatewayUnderTest.client,
@@ -120,6 +123,7 @@ function outbox(
 		claimTtlMs: 5_000,
 		readWaitMs: 0,
 		hooks,
+		onDiagnostic,
 	});
 }
 
@@ -317,8 +321,102 @@ surface_id = "discord:owner-dm"
 			unattributedDelivery: "owner-dm",
 			unattributedRoute: OWNER_ROUTE,
 		});
+		fs.writeFileSync(
+			profilePath,
+			profile(`[adapter.discord]
+
+token_env = "GAJAEWAY_DISCORD_BOT_TOKEN"
+allowBots = false
+
+[[adapter.discord.routes]]
+channel_id = "123456789012345678"
+surface_id = "discord:owner-dm"
+kind = "dm"
+
+[[adapter.discord.routes]]
+channel_id = "222222222222222222"
+surface_id = "discord:guild-a"
+groupPolicy = "open"
+`),
+		);
+		const openConfig = loadDiscordAdapterConfig({
+			profile: loadWayProfile(profilePath),
+			environment: { GAJAEWAY_DISCORD_BOT_TOKEN: "fixture-token" },
+		});
+		expect(openConfig.allowBots).toBe(false);
+		expect(openConfig.routes).toContainEqual(expect.objectContaining({ surfaceId: GUILD_A_ROUTE.surfaceId, groupPolicy: "open" }));
+
+		fs.writeFileSync(
+			profilePath,
+			profile(`[adapter.discord]
+token_env = "GAJAEWAY_DISCORD_BOT_TOKEN"
+
+[[adapter.discord.routes]]
+channel_id = "123456789012345678"
+surface_id = "discord:owner-dm"
+kind = "dm"
+
+[[adapter.discord.routes]]
+channel_id = "222222222222222222"
+surface_id = "discord:guild-a"
+groupPolicy = "mention"
+engagement = "always"
+`),
+		);
+		expect(() =>
+			loadDiscordAdapterConfig({
+				profile: loadWayProfile(profilePath),
+				environment: { GAJAEWAY_DISCORD_BOT_TOKEN: "fixture-token" },
+			}),
+		).toThrow("conflicts with legacy engagement");
 	} finally {
 		fs.rmSync(root, { recursive: true, force: true });
+	}
+});
+
+externalTest("Discord groupPolicy open admits other bots while self-authored and allowBots=false traffic stay refused", async () => {
+	const gatewayUnderTest = await gateway([{ id: GUILD_A_ROUTE.surfaceId, platform: "discord", kind: "channel" }]);
+	const fixture = new DiscordFixture({ botUserId: BOT_USER_ID });
+	await fixture.connect();
+	try {
+		const openRoute = new DiscordRouteHandler({
+			rpc: gatewayUnderTest.client,
+			platform: fixture,
+			routes: [{ ...GUILD_A_ROUTE, groupPolicy: "open" }],
+			botUserId: BOT_USER_ID,
+			allowBots: true,
+		});
+		expect(
+			await openRoute.handle({ id: "open-user", channelId: GUILD_A_ROUTE.channelId, text: "open user prompt", authorId: "333333333333333333", acceptedAt: Date.now() }),
+		).toBe(true);
+		const mentionRoute = new DiscordRouteHandler({
+			rpc: gatewayUnderTest.client,
+			platform: fixture,
+			routes: [{ channelId: GUILD_A_ROUTE.channelId, surfaceId: GUILD_A_ROUTE.surfaceId, kind: "channel", groupPolicy: "mention" }],
+			botUserId: BOT_USER_ID,
+		});
+		expect(
+			await mentionRoute.handle({ id: "mention-user", channelId: GUILD_A_ROUTE.channelId, text: "mention only prompt", authorId: "444444444444444444", acceptedAt: Date.now() }),
+		).toBe(false);
+		expect(
+			await openRoute.handle({ id: "bot-allowed", channelId: GUILD_A_ROUTE.channelId, text: "bot prompt", authorId: "111111111111111111", authorBot: true, acceptedAt: Date.now() }),
+		).toBe(true);
+		expect(
+			await openRoute.handle({ id: "bot-self", channelId: GUILD_A_ROUTE.channelId, text: "self prompt", authorId: BOT_USER_ID, authorBot: true, acceptedAt: Date.now() }),
+		).toBe(false);
+		const closedRoute = new DiscordRouteHandler({
+			rpc: gatewayUnderTest.client,
+			platform: fixture,
+			routes: [{ ...GUILD_A_ROUTE, groupPolicy: "open" }],
+			botUserId: BOT_USER_ID,
+			allowBots: false,
+		});
+		expect(
+			await closedRoute.handle({ id: "bot-blocked", channelId: GUILD_A_ROUTE.channelId, text: "blocked bot", authorId: "222222222222222222", authorBot: true, acceptedAt: Date.now() }),
+		).toBe(false);
+		expect(gatewayUnderTest.fixture.commands()).toEqual([expect.objectContaining({ text: "open user prompt" }), expect.objectContaining({ text: "bot prompt" })]);
+	} finally {
+		await fixture.disconnect();
 	}
 });
 
@@ -610,6 +708,46 @@ externalTest("Discord route table admits a guild-channel message and returns its
 		);
 		expect(fixture.sends).toEqual([expect.objectContaining({ channelId: GUILD_A_ROUTE.channelId, text: "guild route reply" })]);
 		expect(fixture.acknowledgements).toEqual([expect.objectContaining({ channelId: GUILD_A_ROUTE.channelId })]);
+	} finally {
+		await adapter.stop();
+	}
+});
+
+externalTest("Discord replies thread to the accepted trigger and fall back to a plain post when it is gone", async () => {
+	const gatewayUnderTest = await gateway([{ id: GUILD_A_ROUTE.surfaceId, platform: "discord", kind: "channel" }]);
+	const fixture = new DiscordFixture();
+	const adapter = await startRoutedFixtureAdapter(fixture, gatewayUnderTest.client, [OWNER_ROUTE, GUILD_A_ROUTE], {
+		unattributedRoute: OWNER_ROUTE,
+	});
+	try {
+		gatewayUnderTest.fixture.holdNextTurn();
+		const first = { id: "reply-trigger-one", channelId: GUILD_A_ROUTE.channelId, text: "first trigger" };
+		await fixture.emitMessage(first);
+		const firstOpRef = await eventually(
+			() => {
+				const command = gatewayUnderTest.fixture.commands().find(command => command.text === first.text);
+				return typeof command?.opRef === "string" ? command.opRef : undefined;
+			},
+			"first reply trigger was not admitted",
+		);
+		gatewayUnderTest.fixture.complete(firstOpRef, { text: "first threaded reply" });
+		await eventually(() => fixture.sends.find(send => send.text === "first threaded reply"), "first threaded reply was not sent");
+		expect(fixture.sends.at(-1)?.replyTo).toEqual({ channelId: first.channelId, messageId: first.id });
+
+		fixture.setMissingReplyReference(GUILD_A_ROUTE.channelId, "reply-trigger-two");
+		gatewayUnderTest.fixture.holdNextTurn();
+		const second = { id: "reply-trigger-two", channelId: GUILD_A_ROUTE.channelId, text: "second trigger" };
+		await fixture.emitMessage(second);
+		const secondOpRef = await eventually(
+			() => {
+				const command = gatewayUnderTest.fixture.commands().find(command => command.text === second.text);
+				return typeof command?.opRef === "string" ? command.opRef : undefined;
+			},
+			"second reply trigger was not admitted",
+		);
+		gatewayUnderTest.fixture.complete(secondOpRef, { text: "fallback threaded reply" });
+		await eventually(() => fixture.sends.find(send => send.text === "fallback threaded reply"), "fallback reply was not sent");
+		expect(fixture.sends.at(-1)?.replyTo).toBeUndefined();
 	} finally {
 		await adapter.stop();
 	}
@@ -1437,6 +1575,67 @@ externalTest("Discord crash after send before settlement retries with a nonce an
 		await fixture.disconnect();
 	}
 }, 15_000);
+
+externalTest("Discord outbox delivers bounded chunks and replays identical chunk nonces after a mid-set restart", async () => {
+	const gatewayUnderTest = await gateway();
+	const fixture = new DiscordFixture();
+	await fixture.connect();
+	const diagnostics: string[] = [];
+	try {
+		const text = ["```ts", ...Array.from({ length: 260 }, (_, index) => `const value${index} = ${index};`), "```"].join("\n");
+		const appended = gatewayUnderTest.core.journalAppend("assistant_message", JSON.stringify({ finalized: true, text }));
+		const abort = new AbortController();
+		fixture.deferNextSend();
+		const interrupted = outbox(gatewayUnderTest, fixture, undefined, message => diagnostics.push(message)).runOnce(abort.signal);
+		await eventually(() => (fixture.pendingSendCount === 1 ? true : undefined), "outbox did not reach the first deferred chunk");
+		abort.abort();
+		fixture.releaseNextSend();
+		await expect(interrupted).rejects.toMatchObject({ name: "AbortError" });
+		expect(fixture.sends).toHaveLength(1);
+		expect(gatewayUnderTest.core.consumerCursor("gajaeway-discord")).toBe("1:0");
+
+		await Bun.sleep(5_100);
+		expect(await outbox(gatewayUnderTest, fixture, undefined, message => diagnostics.push(message)).runOnce()).toBe("sent");
+		const dedupeKey = discordDedupeKey("discord:owner-dm", String(appended.seq));
+		const chunkCount = fixture.sends.length;
+		const expectedNonces = Array.from({ length: chunkCount }, (_, index) => discordChunkWireNonce(dedupeKey, index));
+		expect(chunkCount).toBeGreaterThan(1);
+		expect(fixture.sendAttempts.map(attempt => attempt.nonce)).toEqual([expectedNonces[0], expectedNonces[0], ...expectedNonces.slice(1)]);
+		expect(fixture.sendAttempts[0]?.duplicate).toBe(false);
+		expect(fixture.sendAttempts[1]?.duplicate).toBe(true);
+		expect(fixture.sendAttempts.slice(2).every(attempt => !attempt.duplicate)).toBe(true);
+		expect(gatewayUnderTest.core.consumerCursor("gajaeway-discord")).toBe(appended.cursor);
+		expect(diagnostics).toEqual([]);
+
+		const huge = "x".repeat(2_000 * 40);
+		gatewayUnderTest.core.journalAppend("assistant_message", JSON.stringify({ finalized: true, text: huge }));
+		expect(await outbox(gatewayUnderTest, fixture, undefined, message => diagnostics.push(message)).runOnce()).toBe("sent");
+		expect(diagnostics).toEqual([expect.stringContaining("chunk bound")]);
+		expect(fixture.sends.at(-1)?.text).toContain("chunk limit reached");
+	} finally {
+		await fixture.disconnect();
+	}
+}, 15_000);
+
+externalTest("Discord outbound formatting changes only the wire copy and preserves journal text and nonce", async () => {
+	const gatewayUnderTest = await gateway();
+	const fixture = new DiscordFixture();
+	await fixture.connect();
+	try {
+		const original = ["| Name | Value |", "| --- | --- |", "| alpha | one |", "", "See https://one.example/a and https://two.example/b."].join("\n");
+		const appended = gatewayUnderTest.core.journalAppend("assistant_message", JSON.stringify({ finalized: true, text: original }));
+		expect(await outbox(gatewayUnderTest, fixture).runOnce()).toBe("sent");
+		expect(fixture.sends).toHaveLength(1);
+		expect(fixture.sends[0]?.text).toContain("- Name: alpha; Value: one");
+		expect(fixture.sends[0]?.text).toContain("<https://one.example/a>");
+		expect(fixture.sends[0]?.text).not.toContain("| --- | --- |");
+		const journalEvent = gatewayUnderTest.core.journalRead("1:0", 20).events.find(event => event.seq === appended.seq);
+		expect(JSON.parse(journalEvent?.payloadJson ?? "{}").text).toBe(original);
+		expect(fixture.sends[0]?.nonce).toBe(discordWireNonce(discordDedupeKey("discord:owner-dm", String(appended.seq))));
+	} finally {
+		await fixture.disconnect();
+	}
+});
 
 externalTest("Discord non-owner engagement is admitted as follow_up whether the external turn is idle or busy", async () => {
 	const gatewayUnderTest = await gateway();

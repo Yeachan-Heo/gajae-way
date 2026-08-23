@@ -6,7 +6,7 @@ import {
 } from "../../journal-consumer";
 import type { JsonRpcClient } from "../../rpc-client";
 import type { DiscordUnattributedDelivery } from "./config";
-import type { DiscordPlatform } from "./platform";
+import { formatDiscordOutboundText, splitDiscordMessage, type DiscordMessageReference, type DiscordPlatform } from "./platform";
 import { resolveDiscordEgressRoute, validateDiscordRoutes, type DiscordRoute } from "./route";
 
 export const DISCORD_CONSUMER_ID = "gajaeway-discord";
@@ -22,6 +22,7 @@ export interface DiscordOutboxItem {
 	readonly text: string;
 	readonly dedupeKey: string;
 	readonly nonce: string;
+	readonly replyTo?: DiscordMessageReference;
 }
 
 export interface DiscordOutboxHooks {
@@ -42,6 +43,8 @@ export interface DiscordOutboxOptions {
 	readonly retryDelayMs?: number;
 	readonly now?: () => number;
 	readonly hooks?: DiscordOutboxHooks;
+	/** Resolves the most recent inbound trigger for reply threading on a surface. */
+	replyReferenceForSurface?(surfaceId: string): DiscordMessageReference | undefined;
 	onError?(error: Error): void;
 	onDiagnostic?(message: string): void;
 }
@@ -94,6 +97,7 @@ export class DiscordOutbox {
 	readonly #routes: readonly DiscordRoute[];
 	readonly #unattributedDelivery: DiscordUnattributedDelivery;
 	readonly #unattributedRoute: DiscordRoute | undefined;
+	readonly #replyReferenceForSurface: ((surfaceId: string) => DiscordMessageReference | undefined) | undefined;
 	readonly #hooks: DiscordOutboxHooks;
 	readonly #consumer: RpcJournalConsumer;
 	readonly #idleDelayMs: number;
@@ -131,6 +135,7 @@ export class DiscordOutbox {
 		this.#routes = [...options.routes];
 		this.#unattributedDelivery = options.unattributedDelivery;
 		this.#unattributedRoute = options.unattributedRoute;
+		this.#replyReferenceForSurface = options.replyReferenceForSurface;
 		this.#hooks = options.hooks ?? {};
 		this.#idleDelayMs = boundedInteger(options.idleDelayMs ?? 50, "idleDelayMs", 0, 60_000);
 		this.#retryDelayMs = boundedInteger(options.retryDelayMs ?? 250, "retryDelayMs", 0, 60_000);
@@ -173,17 +178,28 @@ export class DiscordOutbox {
 	private async publish(event: RpcJournalEvent, cursor: string, signal?: AbortSignal): Promise<JournalDeliveryProof> {
 		const delivery = this.resolveDelivery(event, cursor);
 		if (delivery.kind === "suppressed") {
-			this.#onDiagnostic(`suppressed assistant_message ${delivery.seq}: ${delivery.reason}`);
+			safeDiscordDiagnostic(this.#onDiagnostic, `suppressed assistant_message ${delivery.seq}: ${delivery.reason}`);
 			return { seq: delivery.seq, dedupe_key: delivery.dedupeKey };
 		}
 		const item = delivery.item;
 		await this.#hooks.beforeSend?.(item);
+		const chunks = splitDiscordMessage(item.text);
+		if (chunks.chunks.length === 0) throw new DiscordOutboxError(`assistant_message event ${item.seq} has no deliverable text.`);
+		if (chunks.truncated) {
+			safeDiscordDiagnostic(this.#onDiagnostic, `assistant_message ${item.seq} exceeded the Discord chunk bound; sent a truncated presentation.`);
+		}
+		let firstMessageId: string | undefined;
+		for (const [index, chunk] of chunks.chunks.entries()) {
+			throwIfAborted(signal);
+			const nonce = discordChunkWireNonce(item.dedupeKey, index);
+			const platformMessageId = await this.#platform.send(item.channelId, chunk, nonce, { formatted: true, dedupeKey: item.dedupeKey, ...(index === 0 && item.replyTo ? { replyTo: item.replyTo } : {}) });
+			if (!platformMessageId) throw new DiscordOutboxError(`Discord returned no message id for journal event ${item.seq} chunk ${index}.`);
+			firstMessageId ??= platformMessageId;
+		}
+		if (!firstMessageId) throw new DiscordOutboxError(`Discord returned no message id for journal event ${item.seq}.`);
+		await this.#hooks.afterSendBeforeCommit?.(item, firstMessageId);
 		throwIfAborted(signal);
-		const platformMessageId = await this.#platform.send(item.channelId, item.text, item.nonce);
-		if (!platformMessageId) throw new DiscordOutboxError(`Discord returned no message id for journal event ${item.seq}.`);
-		await this.#hooks.afterSendBeforeCommit?.(item, platformMessageId);
-		throwIfAborted(signal);
-		return { seq: item.seq, platform_msg_id: platformMessageId, dedupe_key: item.dedupeKey };
+		return { seq: item.seq, platform_msg_id: firstMessageId, dedupe_key: item.dedupeKey };
 	}
 
 	private resolveDelivery(event: RpcJournalEvent, cursor: string): ResolvedDelivery {
@@ -194,7 +210,7 @@ export class DiscordOutbox {
 
 		if (payload.surfaceId) {
 			const route = resolveDiscordEgressRoute(this.#routes, payload.surfaceId);
-			if (route) return { kind: "send", item: eventToOutboxItem(seq, payload.text, cursor, route, payload.surfaceId) };
+			if (route) return { kind: "send", item: eventToOutboxItem(seq, payload.text, cursor, route, payload.surfaceId, this.#replyReferenceForSurface?.(payload.surfaceId)) };
 		}
 
 		const reason = payload.surfaceIdMalformed
@@ -205,7 +221,7 @@ export class DiscordOutbox {
 		if (this.#unattributedDelivery === "owner-dm") {
 			const route = this.#unattributedRoute;
 			if (!route) throw new DiscordOutboxError("Discord owner-dm unattributed route is unavailable.");
-			return { kind: "send", item: eventToOutboxItem(seq, payload.text, cursor, route, route.surfaceId) };
+			return { kind: "send", item: eventToOutboxItem(seq, payload.text, cursor, route, route.surfaceId, this.#replyReferenceForSurface?.(route.surfaceId)) };
 		}
 		const dedupeSurfaceId = payload.surfaceId ?? "unattributed";
 		return { kind: "suppressed", seq, dedupeKey: discordDedupeKey(dedupeSurfaceId, seq), reason };
@@ -228,16 +244,30 @@ export function discordWireNonce(dedupeKey: string): string {
 	return createHash("sha256").update(dedupeKey).digest("hex").slice(0, 24);
 }
 
-function eventToOutboxItem(seq: string, text: string, cursor: string, route: DiscordRoute, surfaceId: string): DiscordOutboxItem {
+/** Stable per-chunk nonce derived from the durable event key and chunk index. */
+export function discordChunkWireNonce(dedupeKey: string, index: number): string {
+	if (!Number.isSafeInteger(index) || index < 0) throw new DiscordOutboxError("Discord chunk index must be a non-negative safe integer.");
+	return index === 0 ? discordWireNonce(dedupeKey) : discordWireNonce(`${dedupeKey}:chunk:${index}`);
+}
+
+function eventToOutboxItem(
+	seq: string,
+	text: string,
+	cursor: string,
+	route: DiscordRoute,
+	surfaceId: string,
+	replyTo?: DiscordMessageReference,
+): DiscordOutboxItem {
 	const dedupeKey = discordDedupeKey(surfaceId, seq);
 	return {
 		cursor,
 		seq,
 		channelId: route.channelId,
 		surfaceId,
-		text,
+		text: formatDiscordOutboundText(text),
 		dedupeKey,
 		nonce: discordWireNonce(dedupeKey),
+		...(replyTo === undefined ? {} : { replyTo }),
 	};
 }
 
@@ -271,6 +301,14 @@ function throwIfAborted(signal: AbortSignal | undefined): void {
 	const error = new Error("Discord outbox stopped.");
 	error.name = "AbortError";
 	throw error;
+}
+
+function safeDiscordDiagnostic(onDiagnostic: (message: string) => void, message: string): void {
+	try {
+		onDiagnostic(message);
+	} catch {
+		// Diagnostics are best-effort and must not poison ordered delivery.
+	}
 }
 
 function sleep(milliseconds: number, signal: AbortSignal): Promise<void> {

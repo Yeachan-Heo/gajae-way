@@ -2,7 +2,7 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import { defaultConfig } from "../../config";
 import { loadWayProfile, type CanonicalValue, type WayProfile } from "../../profile";
-import { DiscordRouteError, validateDiscordRoutes, type DiscordEngagementMode, type DiscordRoute, type DiscordRouteKind } from "./route";
+import { DiscordRouteError, validateDiscordRoutes, type DiscordEngagementMode, type DiscordGroupPolicy, type DiscordRoute, type DiscordRouteKind } from "./route";
 
 
 export const DEFAULT_DISCORD_TOKEN_ENV = "GAJAEWAY_DISCORD_BOT_TOKEN";
@@ -13,6 +13,7 @@ export interface DiscordAdapterConfig {
 	readonly token: string;
 	readonly routes: readonly DiscordRoute[];
 	readonly blockedAuthorIds: readonly string[];
+	readonly allowBots?: boolean;
 
 	readonly unattributedDelivery: DiscordUnattributedDelivery;
 	/** The unique configured owner DM used when unattributed delivery is enabled. */
@@ -52,6 +53,7 @@ export function loadDiscordAdapterConfig(options: LoadDiscordAdapterConfigOption
 	const adapter = adapterTable(profile);
 	const routes = configuredRoutes(adapter, environment, profile);
 	const blockedAuthorIds = parseBlockedAuthorIds(adapter.blocked_author_ids);
+	const allowBots = parseAllowBots(adapter);
 
 	const unattributedDelivery = parseUnattributedDelivery(adapter.unattributed_delivery);
 	const unattributedRoute = unattributedDelivery === "owner-dm" ? configuredOwnerDmRoute(routes, profile) : undefined;
@@ -72,6 +74,7 @@ export function loadDiscordAdapterConfig(options: LoadDiscordAdapterConfigOption
 		routes,
 		unattributedDelivery,
 		blockedAuthorIds,
+		allowBots,
 
 		...(unattributedRoute === undefined ? {} : { unattributedRoute }),
 		ackBudgetMs,
@@ -98,7 +101,7 @@ function configuredRoutes(
 	}
 
 	const routeTable = optionalRecord(adapter.route, "adapter.discord.route") ?? {};
-	validateKnownFields(routeTable, ["channel_id", "owner_dm_channel_id", "surface_id", "owner_surface_id", "kind", "engagement"], "adapter.discord.route");
+	validateKnownFields(routeTable, ["channel_id", "owner_dm_channel_id", "surface_id", "owner_surface_id", "kind", "groupPolicy", "engagement"], "adapter.discord.route");
 
 	const channelId = envOrString(
 		environment.GAJAEWAY_DISCORD_CHANNEL_ID,
@@ -112,12 +115,14 @@ function configuredRoutes(
 			firstString(adapter, ["surface_id", "owner_surface_id"], "adapter.discord"),
 		"Discord surface id",
 	);
+	const groupPolicy = routeTable.groupPolicy ?? adapter.groupPolicy;
 	const engagement = routeTable.engagement ?? adapter.engagement;
 	const route = configuredRoute(
 		{
 			channel_id: channelId,
 			surface_id: surfaceId,
 			...(routeTable.kind === undefined ? {} : { kind: routeTable.kind }),
+			...(groupPolicy === undefined ? {} : { groupPolicy }),
 			...(engagement === undefined ? {} : { engagement }),
 		},
 		"adapter.discord.route",
@@ -136,6 +141,7 @@ function hasLegacyRouteConfiguration(adapter: Record<string, CanonicalValue>, en
 		adapter.surface_id !== undefined ||
 		adapter.owner_surface_id !== undefined ||
 		adapter.engagement !== undefined ||
+		adapter.groupPolicy !== undefined ||
 
 		Boolean(environment.GAJAEWAY_DISCORD_CHANNEL_ID?.trim()) ||
 		Boolean(environment.GAJAEWAY_DISCORD_SURFACE_ID?.trim())
@@ -143,7 +149,7 @@ function hasLegacyRouteConfiguration(adapter: Record<string, CanonicalValue>, en
 }
 
 function configuredRoute(record: Record<string, CanonicalValue>, field: string, profile: WayProfile): DiscordRoute {
-	validateKnownFields(record, ["channel_id", "surface_id", "kind", "engagement"], field);
+	validateKnownFields(record, ["channel_id", "surface_id", "kind", "groupPolicy", "engagement"], field);
 	const channelId = requiredString(record.channel_id, `${field}.channel_id`);
 	if (!/^\d+$/.test(channelId)) throw new DiscordAdapterConfigError(`${field}.channel_id must be a numeric Discord snowflake.`);
 	const surfaceId = requiredString(record.surface_id, `${field}.surface_id`);
@@ -158,12 +164,27 @@ function configuredRoute(record: Record<string, CanonicalValue>, field: string, 
 	if (surface.kind !== "channel" && surface.kind !== "dm") {
 		throw new DiscordAdapterConfigError(`${field}.surface_id must name a Discord dm or channel surface.`);
 	}
+	const groupPolicy = optionalGroupPolicy(record.groupPolicy, `${field}.groupPolicy`);
 	const engagement = optionalEngagementMode(record.engagement, `${field}.engagement`);
+	if (groupPolicy !== undefined && engagement !== undefined && groupPolicy !== (engagement === "always" ? "open" : "mention")) {
+		throw new DiscordAdapterConfigError(`${field}.groupPolicy conflicts with legacy engagement.`);
+	}
 	if (surface.kind === "dm") {
-		if (engagement !== undefined) throw new DiscordAdapterConfigError(`${field}.engagement is not configurable for Discord dm routes.`);
+		if (groupPolicy !== undefined || engagement !== undefined) {
+			throw new DiscordAdapterConfigError(`${field}.groupPolicy/engagement is not configurable for Discord dm routes.`);
+		}
 		return { channelId, surfaceId, kind: "dm" };
 	}
-	return { channelId, surfaceId, kind: "channel", engagement: engagement ?? "mention" };
+	return {
+		channelId,
+		surfaceId,
+		kind: "channel",
+		...(groupPolicy === undefined
+			? engagement === undefined
+				? { groupPolicy: "mention" as const, engagement: "mention" as const }
+				: { engagement }
+			: { groupPolicy, ...(engagement === undefined ? {} : { engagement }) }),
+	};
 }
 
 function configuredOwnerDmRoute(routes: readonly DiscordRoute[], profile: WayProfile): DiscordRoute {
@@ -213,6 +234,9 @@ function adapterTable(profile: WayProfile): Record<string, CanonicalValue> {
 		"unattributed_delivery",
 		"blocked_author_ids",
 		"engagement",
+		"groupPolicy",
+		"allowBots",
+		"allow_bots",
 
 		"rpc_socket",
 		"rpc_socket_path",
@@ -295,6 +319,13 @@ function optionalRouteKind(value: CanonicalValue | undefined, field: string): Di
 	return kind;
 }
 
+function optionalGroupPolicy(value: CanonicalValue | undefined, field: string): DiscordGroupPolicy | undefined {
+	const policy = optionalString(value, field);
+	if (policy === undefined) return undefined;
+	if (policy !== "mention" && policy !== "open") throw new DiscordAdapterConfigError(`${field} must be mention or open.`);
+	return policy;
+}
+
 function optionalEngagementMode(value: CanonicalValue | undefined, field: string): DiscordEngagementMode | undefined {
 	const engagement = optionalString(value, field);
 	if (engagement === undefined) return undefined;
@@ -302,6 +333,21 @@ function optionalEngagementMode(value: CanonicalValue | undefined, field: string
 		throw new DiscordAdapterConfigError(`${field} must be mention or always.`);
 	}
 	return engagement;
+}
+
+function parseAllowBots(adapter: Record<string, CanonicalValue>): boolean {
+	const camel = optionalBoolean(adapter.allowBots, "adapter.discord.allowBots");
+	const snake = optionalBoolean(adapter.allow_bots, "adapter.discord.allow_bots");
+	if (camel !== undefined && snake !== undefined && camel !== snake) {
+		throw new DiscordAdapterConfigError("adapter.discord.allowBots conflicts with legacy allow_bots.");
+	}
+	return camel ?? snake ?? true;
+}
+
+function optionalBoolean(value: CanonicalValue | undefined, field: string): boolean | undefined {
+	if (value === undefined) return undefined;
+	if (typeof value !== "boolean") throw new DiscordAdapterConfigError(`${field} must be a boolean.`);
+	return value;
 }
 
 function parseBlockedAuthorIds(value: CanonicalValue | undefined): readonly string[] {

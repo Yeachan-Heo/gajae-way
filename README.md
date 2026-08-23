@@ -182,6 +182,24 @@ Final assistant text is published only in the finalized `assistant_message`
 journal event. Consumers can therefore treat lifecycle rows as transition
 identities and render reply text solely from `assistant_message`.
 
+### Discord adapter behavior
+
+`gajaeway-discord` uses the route table in `[adapter.discord]`. Guild channels
+use OpenClaw's `groupPolicy = "mention"` by default; set `groupPolicy = "open"`
+for an intentionally open channel. The legacy `engagement = "mention"` /
+`"always"` alias remains accepted, but a conflicting pair is refused. DMs and
+routed threads are always engaged. `allowBots = true` is the permissive default;
+the adapter still ignores its own bot id and honors `blocked_author_ids` before
+admission. Set `allowBots = false` to refuse other bot authors.
+
+Outbound replies are presentation-only transformed for Discord: markdown tables
+become bullet lists and multiple bare links are wrapped in angle brackets to
+suppress embeds. Replies over Discord's 2,000-character limit are sent as
+ordered, nonce-deduplicated chunks; the journal event is committed only after
+all chunks settle. A reply to an accepted inbound message uses Discord
+`message_reference` when possible and falls back to a plain post if the trigger
+has been deleted.
+
 Use the runbooks below for the complete operational procedure and incident
 handling. Do not bootstrap a second state directory or start a second adapter
 for the same configured route.

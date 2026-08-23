@@ -1,3 +1,5 @@
+import { createHash } from "node:crypto";
+
 export interface DiscordMessageReference {
 	readonly channelId: string;
 	readonly messageId: string;
@@ -22,6 +24,15 @@ export interface DiscordMessage {
 
 
 export type DiscordMessageHandler = (message: DiscordMessage) => void | Promise<void>;
+export interface DiscordSendOptions {
+	/** Reply target for the first outbound chunk; Discord may fall back to a plain post when it is gone. */
+	readonly replyTo?: DiscordMessageReference;
+	/** Durable event key used to derive retries for chunks after the first. */
+	readonly dedupeKey?: string;
+	/** Internal adapter hint: the caller already applied presentation formatting. */
+	readonly formatted?: boolean;
+}
+
 
 /**
  * The only Discord boundary used by routing and egress. It intentionally has
@@ -33,7 +44,7 @@ export interface DiscordPlatform {
 	disconnect(): Promise<void>;
 	onMessage(callback: DiscordMessageHandler): () => void;
 	getCurrentUser(): Promise<DiscordCurrentUser>;
-	send(channelId: string, text: string, nonce: string): Promise<string>;
+	send(channelId: string, text: string, nonce: string, options?: DiscordSendOptions): Promise<string>;
 	ackTyping(channelId: string): Promise<void>;
 	resolveThreadParent(channelId: string): Promise<string | undefined>;
 	resolveMessageAuthor(channelId: string, messageId: string): Promise<string | undefined>;
@@ -62,6 +73,7 @@ export interface DiscordGatewayPlatformOptions {
 	readonly fetch?: DiscordFetch;
 	readonly webSocketFactory?: (url: string) => GatewaySocket;
 	readonly now?: () => number;
+	readonly onDiagnostic?: (message: string) => void;
 	readonly reconnectBaseMs?: number;
 	readonly reconnectMaxMs?: number;
 }
@@ -96,6 +108,186 @@ const GUILD_MESSAGES_INTENT = 1 << 9;
 const DIRECT_MESSAGES_INTENT = 1 << 12;
 const MESSAGE_CONTENT_INTENT = 1 << 15;
 
+export const DISCORD_MAX_MESSAGE_LENGTH = 2_000;
+export const DISCORD_MAX_CHUNKS_PER_MESSAGE = 32;
+export const DISCORD_TRUNCATION_MARKER = "\n… [Discord message truncated: chunk limit reached]";
+
+export interface DiscordMessageChunks {
+	readonly chunks: readonly string[];
+	readonly truncated: boolean;
+}
+
+/**
+ * Splits outbound text at paragraph, line, sentence, and finally hard boundaries.
+ * Fenced blocks are closed and re-opened across chunks so each Discord post is
+ * independently renderable. The original text is never mutated in the journal.
+ */
+export function splitDiscordMessage(text: string, maxChunks = DISCORD_MAX_CHUNKS_PER_MESSAGE): DiscordMessageChunks {
+	if (!Number.isSafeInteger(maxChunks) || maxChunks < 1) throw new DiscordPlatformError("Discord message chunk bound must be a positive safe integer.");
+	if (!text) return { chunks: [], truncated: false };
+	const hasFence = /(^|\n)\s*(`{3,}|~{3,})/.test(text);
+	const rawLimit = hasFence ? DISCORD_MAX_MESSAGE_LENGTH - 32 : DISCORD_MAX_MESSAGE_LENGTH;
+	const rawChunks: string[] = [];
+	let remaining = text;
+	while (remaining && rawChunks.length < maxChunks) {
+		const { prefix, remainder } = takeDiscordChunk(remaining, rawLimit);
+		rawChunks.push(prefix);
+		remaining = remainder;
+	}
+	const truncated = remaining.length > 0;
+	if (truncated) {
+		const marker = DISCORD_TRUNCATION_MARKER;
+		const last = rawChunks.at(-1) ?? "";
+		const available = Math.max(0, DISCORD_MAX_MESSAGE_LENGTH - marker.length);
+		rawChunks[rawChunks.length - 1] = `${discordSlice(last, available)}${marker}`;
+	}
+	const chunks: string[] = [];
+	let fence: DiscordFenceState | undefined;
+	for (const raw of rawChunks) {
+		let chunk = raw;
+		if (fence) chunk = `${fence.openingLine}\n${chunk}`;
+		const nextFence = discordFenceTransition(raw, fence);
+		if (nextFence) chunk = `${chunk}\n${nextFence.closingMarker}`;
+		if (chunk.length > DISCORD_MAX_MESSAGE_LENGTH) {
+			// The reserved fence budget keeps this path rare; preserve the marker and
+			// hard-trim only the presentation chunk, never the durable source text.
+			const markerIndex = chunk.lastIndexOf(DISCORD_TRUNCATION_MARKER);
+			chunk = markerIndex >= 0 && truncated
+				? `${discordSlice(chunk.slice(0, markerIndex), Math.max(0, DISCORD_MAX_MESSAGE_LENGTH - DISCORD_TRUNCATION_MARKER.length))}${DISCORD_TRUNCATION_MARKER}`
+				: discordSlice(chunk, DISCORD_MAX_MESSAGE_LENGTH);
+		}
+		chunks.push(chunk);
+		fence = nextFence;
+	}
+	if (fence && chunks.length > 0) {
+		const closing = `\n${fence.closingMarker}`;
+		const last = chunks[chunks.length - 1] ?? "";
+		const budget = Math.max(0, DISCORD_MAX_MESSAGE_LENGTH - closing.length);
+		const markerIndex = last.lastIndexOf(DISCORD_TRUNCATION_MARKER);
+		const content = markerIndex >= 0 && truncated
+			? `${discordSlice(last.slice(0, markerIndex), Math.max(0, budget - DISCORD_TRUNCATION_MARKER.length))}${DISCORD_TRUNCATION_MARKER}`
+			: discordSlice(last, budget);
+		chunks[chunks.length - 1] = `${content}${closing}`;
+	}
+	return { chunks, truncated };
+}
+
+/** Applies Discord's presentation-only markdown rules without touching journal text. */
+export function formatDiscordOutboundText(text: string): string {
+	return wrapMultipleBareLinks(renderDiscordTables(text));
+}
+
+function renderDiscordTables(text: string): string {
+	const lines = text.split("\n");
+	const output: string[] = [];
+	let fence: string | undefined;
+	for (let index = 0; index < lines.length; index += 1) {
+		const line = lines[index] ?? "";
+		const fenceMatch = /^\s*(`{3,}|~{3,})/.exec(line);
+		if (fenceMatch) {
+			const marker = fenceMatch[1] as string;
+			if (fence === undefined) fence = marker[0];
+			else if (marker[0] === fence[0]) fence = undefined;
+			output.push(line);
+			continue;
+		}
+		const separator = lines[index + 1];
+		if (fence === undefined && separator !== undefined && line.includes("|") && isDiscordTableSeparator(separator)) {
+			const headers = discordTableCells(line);
+			const rows: string[] = [];
+			index += 2;
+			while (index < lines.length && (lines[index]?.includes("|") ?? false)) {
+				const cells = discordTableCells(lines[index] ?? "");
+				if (cells.length > 0) rows.push(`- ${headers.map((header, cellIndex) => `${header}: ${cells[cellIndex] ?? ""}`).join("; ")}`);
+				index += 1;
+			}
+			index -= 1;
+			if (rows.length === 0) output.push(...headers.map(header => `- ${header}`));
+			else output.push(...rows);
+			continue;
+		}
+		output.push(line);
+	}
+	return output.join("\n");
+}
+
+function isDiscordTableSeparator(line: string): boolean {
+	const cells = discordTableCells(line);
+	return cells.length >= 2 && cells.every(cell => /^:?-{3,}:?$/.test(cell));
+}
+
+function discordTableCells(line: string): string[] {
+	const trimmed = line.trim();
+	const withoutEdges = trimmed.startsWith("|") ? trimmed.slice(1) : trimmed;
+	const normalized = withoutEdges.endsWith("|") ? withoutEdges.slice(0, -1) : withoutEdges;
+	return normalized.split("|").map(cell => cell.trim()).filter((cell, index, cells) => cell.length > 0 || index < cells.length - 1);
+}
+
+function wrapMultipleBareLinks(text: string): string {
+	const pattern = /https?:\/\/[^\s<>]+/g;
+	const matches = [...text.matchAll(pattern)];
+	if (matches.length < 2) return text;
+	return text.replace(pattern, (raw, offset: number) => {
+		const before = text[offset - 1];
+		const trailing = raw.match(/[.,!?;:)]+$/)?.[0] ?? "";
+		const url = trailing ? raw.slice(0, -trailing.length) : raw;
+		const markdownLink = before === "(" && text.slice(0, offset).endsWith("](");
+		if (before === "<" || markdownLink || !url) return raw;
+		return `<${url}>${trailing}`;
+	});
+}
+
+interface DiscordFenceState {
+	readonly openingLine: string;
+	readonly closingMarker: string;
+}
+
+function discordSlice(text: string, limit: number): string {
+	if (limit <= 0) return "";
+	const sliced = text.slice(0, limit);
+	const last = sliced.charCodeAt(sliced.length - 1);
+	return last >= 0xd800 && last <= 0xdbff ? sliced.slice(0, -1) : sliced;
+}
+
+function takeDiscordChunk(text: string, limit: number): { prefix: string; remainder: string } {
+	const candidate = discordSlice(text, limit);
+	if (candidate.length >= text.length) return { prefix: text, remainder: "" };
+	const paragraph = candidate.lastIndexOf("\n\n");
+	if (paragraph >= 0) return splitAt(text, candidate, paragraph + 2);
+	const line = candidate.lastIndexOf("\n");
+	if (line >= 0) return splitAt(text, candidate, line + 1);
+	const sentence = /[.!?](?:[\"')\]]*)\s+/g;
+	let sentenceEnd = -1;
+	for (const match of candidate.matchAll(sentence)) sentenceEnd = (match.index ?? 0) + match[0].length;
+	if (sentenceEnd > 0) return splitAt(text, candidate, sentenceEnd);
+	const whitespace = candidate.search(/\s+[^\s]*$/);
+	if (whitespace > 0) {
+		const whitespaceEnd = whitespace + (candidate.slice(whitespace).match(/\s+/)?.[0].length ?? 1);
+		return splitAt(text, candidate, whitespaceEnd);
+	}
+	return splitAt(text, candidate, candidate.length);
+}
+
+function splitAt(source: string, candidate: string, codeUnitIndex: number): { prefix: string; remainder: string } {
+	const prefix = candidate.slice(0, codeUnitIndex);
+	return { prefix, remainder: source.slice(prefix.length) };
+}
+
+function discordFenceTransition(raw: string, incoming: DiscordFenceState | undefined): DiscordFenceState | undefined {
+	let state = incoming;
+	for (const line of raw.split("\n")) {
+		const match = /^\s*(`{3,}|~{3,})(.*)$/.exec(line);
+		if (!match) continue;
+		const marker = match[1] as string;
+		if (state) {
+			if (marker[0] === state.closingMarker[0] && marker.length >= state.closingMarker.length) state = undefined;
+		} else {
+			state = { openingLine: line, closingMarker: marker[0]!.repeat(marker.length) };
+		}
+	}
+	return state;
+}
+
 
 /** Validates a bot token without opening a gateway connection. */
 export async function validateDiscordToken(
@@ -126,6 +318,7 @@ export class DiscordGatewayPlatform implements DiscordPlatform {
 	readonly #fetch: DiscordFetch;
 	readonly #webSocketFactory: (url: string) => GatewaySocket;
 	readonly #now: () => number;
+	readonly #onDiagnostic: ((message: string) => void) | undefined;
 	readonly #reconnectBaseMs: number;
 	readonly #reconnectMaxMs: number;
 	readonly #handlers = new Set<DiscordMessageHandler>();
@@ -154,6 +347,7 @@ export class DiscordGatewayPlatform implements DiscordPlatform {
 		this.#fetch = options.fetch ?? globalThis.fetch;
 		this.#webSocketFactory = options.webSocketFactory ?? defaultWebSocketFactory;
 		this.#now = options.now ?? Date.now;
+		this.#onDiagnostic = options.onDiagnostic;
 		this.#reconnectBaseMs = positiveInteger(options.reconnectBaseMs ?? DEFAULT_RECONNECT_BASE_MS, "reconnectBaseMs");
 		this.#reconnectMaxMs = positiveInteger(options.reconnectMaxMs ?? DEFAULT_RECONNECT_MAX_MS, "reconnectMaxMs");
 		if (this.#reconnectMaxMs < this.#reconnectBaseMs) {
@@ -206,16 +400,57 @@ export class DiscordGatewayPlatform implements DiscordPlatform {
 	}
 
 
-	async send(channelId: string, text: string, nonce: string): Promise<string> {
+	async send(channelId: string, text: string, nonce: string, options?: DiscordSendOptions): Promise<string> {
 		validateChannelId(channelId);
 		if (!text.trim()) throw new DiscordPlatformError("Discord message text must not be empty.");
-		if (text.length > 2_000) throw new DiscordPlatformError("Discord message text exceeds the 2000-character platform limit.");
 		if (!nonce) throw new DiscordPlatformError("Discord message nonce must not be empty.");
-		const response = await this.rest("POST", `/channels/${encodeURIComponent(channelId)}/messages`, {
+		const outboundText = options?.formatted ? text : formatDiscordOutboundText(text);
+		const chunkSet = splitDiscordMessage(outboundText);
+		if (chunkSet.truncated) {
+			try {
+				this.#onDiagnostic?.("Discord outbound message exceeded the chunk bound; sent a truncated presentation.");
+			} catch {
+				// Diagnostics must not interfere with durable delivery.
+			}
+		}
+		const chunks = chunkSet.chunks;
+		let firstMessageId: string | undefined;
+		for (const [index, chunk] of chunks.entries()) {
+			const chunkNonce = index === 0 ? nonce : discordChunkNonceFromBase(options?.dedupeKey ?? nonce, index);
+			const messageId = await this.sendChunk(channelId, chunk, chunkNonce, index === 0 ? options?.replyTo : undefined);
+			firstMessageId ??= messageId;
+		}
+		if (!firstMessageId) throw new DiscordPlatformError("Discord message text must not be empty.");
+		return firstMessageId;
+	}
+
+	private async sendChunk(channelId: string, text: string, nonce: string, replyTo: DiscordMessageReference | undefined): Promise<string> {
+		if (replyTo !== undefined) {
+			validateChannelId(replyTo.channelId);
+			validateMessageId(replyTo.messageId);
+		}
+		const body = {
 			content: text,
 			nonce,
 			enforce_nonce: true,
-		});
+			...(replyTo === undefined
+				? {}
+				: { message_reference: { channel_id: replyTo.channelId, message_id: replyTo.messageId, fail_if_not_exists: false } }),
+		};
+		let response: unknown;
+		try {
+			response = await this.rest("POST", `/channels/${encodeURIComponent(channelId)}/messages`, body);
+		} catch (error) {
+			if (replyTo !== undefined && isMissingReplyReference(error)) {
+				response = await this.rest("POST", `/channels/${encodeURIComponent(channelId)}/messages`, {
+					content: text,
+					nonce,
+					enforce_nonce: true,
+				});
+			} else {
+				throw error;
+			}
+		}
 		if (!isRecord(response) || typeof response.id !== "string" || !response.id) {
 			throw new DiscordPlatformError("Discord message send response did not include an id.");
 		}
@@ -565,6 +800,14 @@ function positiveInteger(value: number, name: string): number {
 
 function isNonRetryableGatewayClose(code: number | undefined): boolean {
 	return code === 4_004 || code === 4_010 || code === 4_011 || code === 4_012 || code === 4_013 || code === 4_014;
+}
+
+function discordChunkNonceFromBase(baseNonce: string, index: number): string {
+	return createHash("sha256").update(`${baseNonce}:chunk:${index}`).digest("hex").slice(0, 24);
+}
+
+function isMissingReplyReference(error: unknown): boolean {
+	return error instanceof DiscordPlatformError && /HTTP 404|10008|unknown message/i.test(error.message);
 }
 
 async function restError(method: string, resource: string, response: Response): Promise<DiscordPlatformError> {
