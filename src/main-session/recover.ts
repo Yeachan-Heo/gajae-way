@@ -125,17 +125,17 @@ export async function recoverFailedClosedGateway(options: RecoverOptions): Promi
 	} else if (strategy === "live_verify") {
 		evidence = `live broker verification succeeded for session ${identity.sessionId} with turn state ${verified.turnState}`;
 	} else {
-		// coherent_durable_state: the durable read above already parsed and
-		// validated every metadata key, and a corrupt value would have raised
-		// metadata_invalid instead of reaching here. Probe one durable write so a
-		// still-broken store refuses recovery rather than reporting success.
-		try {
-			options.state.setTunablesRevision(options.profile.tunablesRevision);
-		} catch (error) {
-			const detail = error instanceof GatewayStateError ? error.reason : error instanceof Error ? error.message : String(error);
-			throw new RecoverError("recovery_verification_unavailable", `The durable store still refuses writes: ${detail}`, { cause: error });
-		}
-		evidence = `durable metadata read back coherent and accepted a probe write after ${reason}`;
+		// coherent_durable_state: the durable read above already parsed and validated
+		// every metadata key, so corrupt values would have raised metadata_invalid
+		// rather than reaching here.
+		//
+		// Deliberately NO separate probe write. setTunablesRevision early-returns
+		// when the revision already matches (state.ts:743), which is the normal case
+		// when recovery runs with the same profile, so it would have proven nothing
+		// while the receipt claimed a write had been accepted. The clearing CAS
+		// transaction below IS the write proof: if the store still refuses writes it
+		// fails and recovery reports recovery_write_failed without clearing anything.
+		evidence = `durable metadata read back coherent after ${reason}; the clearing transaction is the write proof`;
 	}
 
 	const receiptId = randomUUID();

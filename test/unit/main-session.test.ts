@@ -1438,3 +1438,34 @@ test.serial("recovery requires explicit confirmation", async () => {
 		await recovering.dispose();
 	}
 });
+
+test("recovery of a write-failure reason is refused when the durable store still rejects writes", async () => {
+	const fixture = new FakeBrokerFixture();
+	fixtures.push(fixture);
+	const meta = new MemoryGatewayMeta();
+	const state = new GatewayStateStore(meta);
+	const profile = fixtureProfile(fixture);
+	const adoption = supervisor(fixture);
+	try {
+		await bootstrapMainSession({ confirm: true, profile, state, supervisor: adoption, sessionId: fixture.sessionId });
+	} finally {
+		await adoption.dispose();
+	}
+	state.markFailedClosed("transcript_delivery_progress_write_failed");
+	// The clearing CAS transaction is the write proof: a store that still refuses
+	// writes must fail recovery rather than reporting a cleared marker.
+	meta.failNextGatewayMetaTransaction();
+	const recovering = supervisor(fixture);
+	try {
+		await expect(recoverFailedClosedGateway({ profile, state, supervisor: recovering, confirm: true })).rejects.toMatchObject({
+			reason: "recovery_write_failed",
+		});
+		expect(state.read()).toMatchObject({
+			bootstrapState: "FAILED_CLOSED",
+			failedClosedReason: "transcript_delivery_progress_write_failed",
+		});
+		expect(meta.events.some(event => event.kind === "failed_closed_recovered")).toBe(false);
+	} finally {
+		await recovering.dispose();
+	}
+});
