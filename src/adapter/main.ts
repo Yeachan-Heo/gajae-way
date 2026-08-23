@@ -1,3 +1,5 @@
+import * as path from "node:path";
+import { defaultConfig, parseWayConfig } from "../config";
 import { RpcClient, type JsonRpcClient } from "../rpc-client";
 import { loadDiscordAdapterConfig } from "./discord/config";
 import { DiscordOutbox } from "./discord/outbox";
@@ -7,6 +9,7 @@ import { loadTelegramAdapterConfig, type TelegramAdapterConfig } from "./telegra
 import { TelegramPlatform, validateTelegramToken } from "./telegram/platform";
 
 export interface UnifiedAdapterDependencies {
+	readonly environment?: NodeJS.ProcessEnv;
 	rpcConnect?(socketPath: string): Promise<JsonRpcClient>;
 	platformFactory?(config: unknown): DiscordPlatform;
 	fetch?: typeof fetch;
@@ -54,10 +57,33 @@ async function startTelegramPeer(config: TelegramAdapterConfig, dependencies: Un
 }
 
 export async function runUnifiedAdapter(arguments_: readonly string[] = process.argv.slice(2), dependencies: UnifiedAdapterDependencies = {}): Promise<void> {
-	const environment = process.env;
-	const discord = loadDiscordAdapterConfig({ environment });
-	const telegram = loadTelegramAdapterConfig({ environment });
-	if (arguments_.includes("--check")) {
+	const environment = dependencies.environment ?? process.env;
+	// The documented invocation (and the shipped systemd units) pass --state-dir,
+	// --profile, and optionally --rpc-socket. Parse them and thread them into both
+	// channel config loaders: resolving config from the environment alone silently
+	// ignores the operator's flags and loads the wrong profile.
+	const parsed = parseWayConfig(arguments_, defaultConfig(environment));
+	let rpcSocketOverride: string | undefined;
+	for (let index = 0; index < parsed.remaining.length; index += 1) {
+		const argument = parsed.remaining[index];
+		if (argument === "--check") continue;
+		if (argument === "--rpc-socket") {
+			const value = parsed.remaining[index + 1];
+			if (!value) throw new Error("--rpc-socket requires a value.");
+			rpcSocketOverride = path.resolve(value);
+			index += 1;
+			continue;
+		}
+		throw new Error(`Unknown argument: ${argument}`);
+	}
+	const loaderOptions = { environment, stateDir: parsed.config.stateDir, profilePath: parsed.config.profilePath };
+	let discord = loadDiscordAdapterConfig(loaderOptions);
+	let telegram = loadTelegramAdapterConfig(loaderOptions);
+	if (rpcSocketOverride) {
+		discord = { ...discord, rpcSocketPath: rpcSocketOverride };
+		telegram = { ...telegram, rpcSocketPath: rpcSocketOverride };
+	}
+	if (parsed.remaining.includes("--check")) {
 		const checks: Record<string, unknown> = { status: "ok" };
 		if (discord.token) checks.discord = await (await import("./discord/main")).checkDiscordAdapter(discord, dependencies as any);
 		if (telegram.enabled) checks.telegram = await validateTelegramToken(telegram.token, dependencies.fetch);
