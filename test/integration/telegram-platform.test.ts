@@ -105,3 +105,26 @@ test("Telegram restart mid-chunk-set does not duplicate earlier chunks", async (
 	await second.send("-100", "x".repeat(8_200), "nonce", { dedupeKey: "event:restart" });
 	expect(sent.length).toBe(3);
 });
+
+test("Telegram durable state fails closed on corruption instead of silently replaying updates", async () => {
+	const dir = (await Bun.$`mktemp -d`.text()).trim();
+	const statePath = `${dir}/telegram-offset.json`;
+	// A present-but-corrupt file must never be treated as a fresh start: that would
+	// re-deliver handled updates and discard the chunk dedupe ledger.
+	await Bun.write(statePath, "{not json");
+	expect(() => new TelegramPlatform({ token: "t", stateDir: dir, fetch: (async () => new Response("{}")) as never }))
+		.toThrow(/not valid JSON/);
+
+	await Bun.write(statePath, JSON.stringify({ offset: -5, sends: {} }));
+	expect(() => new TelegramPlatform({ token: "t", stateDir: dir, fetch: (async () => new Response("{}")) as never }))
+		.toThrow(/invalid update offset/);
+
+	await Bun.write(statePath, JSON.stringify({ offset: 3, sends: { "a:chunk:0": 42 } }));
+	expect(() => new TelegramPlatform({ token: "t", stateDir: dir, fetch: (async () => new Response("{}")) as never }))
+		.toThrow(/malformed send-ledger entry/);
+
+	// An ABSENT file remains a legitimate fresh start.
+	await Bun.$`rm -f ${statePath}`.quiet();
+	expect(() => new TelegramPlatform({ token: "t", stateDir: dir, fetch: (async () => new Response("{}")) as never }))
+		.not.toThrow();
+});

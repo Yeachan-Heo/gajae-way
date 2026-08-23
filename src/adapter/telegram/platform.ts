@@ -27,6 +27,7 @@ interface TelegramUpdateState {
 const TELEGRAM_API = "https://api.telegram.org";
 const MAX_MESSAGE_LENGTH = 4_096;
 const MAX_CHUNKS = 32;
+const MAX_TRACKED_SENDS = 5_000;
 const TRUNCATION = "\n… [Telegram message truncated: chunk limit reached]";
 export function telegramFormatOutboundText(text: string): string {
 	return text.replace(/^#{1,6}\s+(.+)$/gm, "**$1**");
@@ -234,17 +235,67 @@ function record(value: unknown): Record<string, any> {
 	return typeof value === "object" && value !== null && !Array.isArray(value) ? value as Record<string, any> : {};
 }
 
+/**
+ * An ABSENT state file is a legitimate fresh start. A present-but-unreadable or
+ * malformed one is NOT: silently resetting to offset 0 with an empty send ledger
+ * would make Telegram re-deliver already-handled updates AND discard the chunk
+ * dedupe records that stand in for Discord's `enforce_nonce`, producing duplicate
+ * persona turns and duplicate posts. Corruption therefore fails closed.
+ */
 function readState(filePath: string): TelegramUpdateState {
+	let raw: string;
 	try {
-		const value = JSON.parse(fs.readFileSync(filePath, "utf8"));
-		const state = record(value);
-		return { offset: Number.isSafeInteger(state.offset) && state.offset >= 0 ? state.offset : 0, sends: record(state.sends) as Record<string, string> };
-	} catch {
-		return { offset: 0, sends: {} };
+		raw = fs.readFileSync(filePath, "utf8");
+	} catch (error) {
+		if ((error as NodeJS.ErrnoException)?.code === "ENOENT") return { offset: 0, sends: {} };
+		throw new TelegramPlatformError(
+			`Telegram durable state at ${filePath} could not be read: ${error instanceof Error ? error.message : String(error)}`,
+		);
 	}
+	let value: unknown;
+	try {
+		value = JSON.parse(raw);
+	} catch (error) {
+		throw new TelegramPlatformError(
+			`Telegram durable state at ${filePath} is not valid JSON: ${error instanceof Error ? error.message : String(error)}`,
+		);
+	}
+	if (typeof value !== "object" || value === null || Array.isArray(value)) {
+		throw new TelegramPlatformError(`Telegram durable state at ${filePath} is not an object.`);
+	}
+	const state = value as Record<string, unknown>;
+	if (!Number.isSafeInteger(state.offset) || (state.offset as number) < 0) {
+		throw new TelegramPlatformError(`Telegram durable state at ${filePath} has an invalid update offset.`);
+	}
+	const sendsValue = state.sends;
+	if (typeof sendsValue !== "object" || sendsValue === null || Array.isArray(sendsValue)) {
+		throw new TelegramPlatformError(`Telegram durable state at ${filePath} has an invalid send ledger.`);
+	}
+	const sends: Record<string, string> = {};
+	for (const [key, entry] of Object.entries(sendsValue as Record<string, unknown>)) {
+		if (typeof entry !== "string" || !entry) {
+			throw new TelegramPlatformError(`Telegram durable state at ${filePath} has a malformed send-ledger entry for ${key}.`);
+		}
+		sends[key] = entry;
+	}
+	return { offset: state.offset as number, sends };
+}
+
+/**
+ * Bounds the send ledger. Discord delegates duplicate suppression to
+ * `enforce_nonce` server-side; Telegram has no equivalent, so these records are
+ * the only dedupe authority and would otherwise grow without limit while being
+ * fully rewritten on every chunk. Oldest insertions are dropped first, well past
+ * any realistic redelivery window.
+ */
+function pruneSends(state: TelegramUpdateState): void {
+	const keys = Object.keys(state.sends);
+	if (keys.length <= MAX_TRACKED_SENDS) return;
+	for (const key of keys.slice(0, keys.length - MAX_TRACKED_SENDS)) delete state.sends[key];
 }
 
 function writeState(filePath: string, state: TelegramUpdateState): void {
+	pruneSends(state);
 	fs.mkdirSync(path.dirname(filePath), { recursive: true });
 	const temporary = `${filePath}.${process.pid}.tmp`;
 	fs.writeFileSync(temporary, JSON.stringify(state));
