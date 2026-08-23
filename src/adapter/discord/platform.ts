@@ -22,6 +22,8 @@ export interface DiscordPlatform {
 	onMessage(callback: DiscordMessageHandler): () => void;
 	send(channelId: string, text: string, nonce: string): Promise<string>;
 	ackTyping(channelId: string): Promise<void>;
+	resolveThreadParent(channelId: string): Promise<string | undefined>;
+
 	react(channelId: string, messageId: string, emoji: string): Promise<void>;
 }
 
@@ -76,8 +78,10 @@ const DISCORD_API_BASE_URL = "https://discord.com/api/v10";
 const DEFAULT_RECONNECT_BASE_MS = 1_000;
 const DEFAULT_RECONNECT_MAX_MS = 30_000;
 const GATEWAY_CONNECT_TIMEOUT_MS = 15_000;
+const GUILD_MESSAGES_INTENT = 1 << 9;
 const DIRECT_MESSAGES_INTENT = 1 << 12;
 const MESSAGE_CONTENT_INTENT = 1 << 15;
+
 
 /** Validates a bot token without opening a gateway connection. */
 export async function validateDiscordToken(
@@ -111,6 +115,8 @@ export class DiscordGatewayPlatform implements DiscordPlatform {
 	readonly #reconnectBaseMs: number;
 	readonly #reconnectMaxMs: number;
 	readonly #handlers = new Set<DiscordMessageHandler>();
+	readonly #threadParentCache = new Map<string, Promise<string | undefined>>();
+
 	#socket: GatewaySocket | undefined;
 	#sessionId: string | undefined;
 	#resumeGatewayUrl: string | undefined;
@@ -189,6 +195,25 @@ export class DiscordGatewayPlatform implements DiscordPlatform {
 		await this.rest("POST", `/channels/${encodeURIComponent(channelId)}/typing`);
 	}
 
+	/**
+	 * Resolves parentage only for a possible thread through a read-only REST
+	 * lookup. Successful thread and non-thread results are cached per channel.
+	 */
+	async resolveThreadParent(channelId: string): Promise<string | undefined> {
+		validateChannelId(channelId);
+		const existing = this.#threadParentCache.get(channelId);
+		if (existing) return await existing;
+		const lookup = this.readThreadParent(channelId);
+		this.#threadParentCache.set(channelId, lookup);
+		try {
+			return await lookup;
+		} catch (error) {
+			if (this.#threadParentCache.get(channelId) === lookup) this.#threadParentCache.delete(channelId);
+			throw error;
+		}
+	}
+
+
 	async react(channelId: string, messageId: string, emoji: string): Promise<void> {
 		validateChannelId(channelId);
 		if (!messageId) throw new DiscordPlatformError("Discord message id must not be empty.");
@@ -197,6 +222,14 @@ export class DiscordGatewayPlatform implements DiscordPlatform {
 			"PUT",
 			`/channels/${encodeURIComponent(channelId)}/messages/${encodeURIComponent(messageId)}/reactions/${encodeURIComponent(emoji)}/@me`,
 		);
+	}
+
+	private async readThreadParent(channelId: string): Promise<string | undefined> {
+		const channel = await this.rest("GET", `/channels/${encodeURIComponent(channelId)}`);
+		if (!isRecord(channel) || !isDiscordThreadType(channel.type) || typeof channel.parent_id !== "string" || !/^\d+$/.test(channel.parent_id)) {
+			return undefined;
+		}
+		return channel.parent_id;
 	}
 
 	private async rest(method: string, resource: string, body?: Record<string, unknown>): Promise<unknown> {
@@ -317,7 +350,7 @@ export class DiscordGatewayPlatform implements DiscordPlatform {
 			op: 2,
 			d: {
 				token: this.#token,
-				intents: DIRECT_MESSAGES_INTENT | MESSAGE_CONTENT_INTENT,
+				intents: GUILD_MESSAGES_INTENT | DIRECT_MESSAGES_INTENT | MESSAGE_CONTENT_INTENT,
 				properties: { os: process.platform, browser: "gajaeway", device: "gajaeway" },
 			},
 		});
@@ -390,6 +423,10 @@ export class DiscordGatewayPlatform implements DiscordPlatform {
 		this.#heartbeatIntervalMs = 0;
 		this.#heartbeatAcknowledged = true;
 	}
+}
+
+function isDiscordThreadType(value: unknown): boolean {
+	return value === 10 || value === 11 || value === 12;
 }
 
 function defaultWebSocketFactory(url: string): GatewaySocket {

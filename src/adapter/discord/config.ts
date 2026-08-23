@@ -2,14 +2,18 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import { defaultConfig } from "../../config";
 import { loadWayProfile, type CanonicalValue, type WayProfile } from "../../profile";
-import type { DiscordRoute } from "./route";
+import { DiscordRouteError, validateDiscordRoutes, type DiscordRoute, type DiscordRouteKind } from "./route";
 
 export const DEFAULT_DISCORD_TOKEN_ENV = "GAJAEWAY_DISCORD_BOT_TOKEN";
+export type DiscordUnattributedDelivery = "owner-dm" | "suppress";
 
 export interface DiscordAdapterConfig {
 	readonly rpcSocketPath: string;
 	readonly token: string;
-	readonly route: DiscordRoute;
+	readonly routes: readonly DiscordRoute[];
+	readonly unattributedDelivery: DiscordUnattributedDelivery;
+	/** The unique configured owner DM used when unattributed delivery is enabled. */
+	readonly unattributedRoute?: DiscordRoute;
 	readonly ackBudgetMs: number;
 	readonly claimTtlMs: number;
 	readonly readWaitMs: number;
@@ -43,25 +47,9 @@ export function loadDiscordAdapterConfig(options: LoadDiscordAdapterConfigOption
 	const profilePath = options.profilePath ?? processConfig.profilePath;
 	const profile = options.profile ?? loadWayProfile(profilePath);
 	const adapter = adapterTable(profile);
-	const routeTable = optionalRecord(adapter.route, "adapter.discord.route") ?? {};
-	validateKnownFields(routeTable, ["channel_id", "owner_dm_channel_id", "surface_id", "owner_surface_id"], "adapter.discord.route");
-	const channelId = envOrString(
-		environment.GAJAEWAY_DISCORD_CHANNEL_ID,
-		firstString(routeTable, ["channel_id", "owner_dm_channel_id"], "adapter.discord.route") ??
-			firstString(adapter, ["channel_id", "owner_dm_channel_id"], "adapter.discord"),
-		"Discord channel id",
-	);
-	const surfaceId = envOrString(
-		environment.GAJAEWAY_DISCORD_SURFACE_ID,
-		firstString(routeTable, ["surface_id", "owner_surface_id"], "adapter.discord.route") ??
-			firstString(adapter, ["surface_id", "owner_surface_id"], "adapter.discord"),
-		"Discord surface id",
-	);
-	if (!/^\d+$/.test(channelId)) throw new DiscordAdapterConfigError("Discord channel id must be a numeric Discord snowflake.");
-	const ownerSurface = profile.ownerSurfaces.find(surface => surface.id === surfaceId);
-	if (!ownerSurface || ownerSurface.platform !== "discord" || ownerSurface.kind !== "dm") {
-		throw new DiscordAdapterConfigError("Discord route surface_id must name a configured owner Discord DM surface.");
-	}
+	const routes = configuredRoutes(adapter, environment, profile);
+	const unattributedDelivery = parseUnattributedDelivery(adapter.unattributed_delivery);
+	const unattributedRoute = unattributedDelivery === "owner-dm" ? configuredOwnerDmRoute(routes, profile) : undefined;
 
 	const token = resolveToken(adapter, environment, path.dirname(profile.sourcePath));
 	const configuredSocket = firstString(adapter, ["rpc_socket", "rpc_socket_path"], "adapter.discord");
@@ -76,13 +64,114 @@ export function loadDiscordAdapterConfig(options: LoadDiscordAdapterConfigOption
 	return {
 		rpcSocketPath,
 		token,
-		route: { channelId, surfaceId },
+		routes,
+		unattributedDelivery,
+		...(unattributedRoute === undefined ? {} : { unattributedRoute }),
 		ackBudgetMs,
 		claimTtlMs,
 		readWaitMs,
 		...(apiBaseUrl ? { apiBaseUrl } : {}),
 		...(gatewayUrl ? { gatewayUrl } : {}),
 	};
+}
+
+function configuredRoutes(
+	adapter: Record<string, CanonicalValue>,
+	environment: NodeJS.ProcessEnv,
+	profile: WayProfile,
+): readonly DiscordRoute[] {
+	if (adapter.routes !== undefined) {
+		if (!Array.isArray(adapter.routes)) throw new DiscordAdapterConfigError("adapter.discord.routes must be an array of route tables.");
+		if (hasLegacyRouteConfiguration(adapter, environment)) {
+			throw new DiscordAdapterConfigError("Define Discord routes through either adapter.discord.routes or the legacy single-route fields, not both.");
+		}
+		const routes = adapter.routes.map((value, index) => configuredRoute(requiredRecord(value, `adapter.discord.routes[${index}]`), `adapter.discord.routes[${index}]`, profile));
+		validateConfiguredRoutes(routes);
+		return routes;
+	}
+
+	const routeTable = optionalRecord(adapter.route, "adapter.discord.route") ?? {};
+	validateKnownFields(routeTable, ["channel_id", "owner_dm_channel_id", "surface_id", "owner_surface_id", "kind"], "adapter.discord.route");
+	const channelId = envOrString(
+		environment.GAJAEWAY_DISCORD_CHANNEL_ID,
+		firstString(routeTable, ["channel_id", "owner_dm_channel_id"], "adapter.discord.route") ??
+			firstString(adapter, ["channel_id", "owner_dm_channel_id"], "adapter.discord"),
+		"Discord channel id",
+	);
+	const surfaceId = envOrString(
+		environment.GAJAEWAY_DISCORD_SURFACE_ID,
+		firstString(routeTable, ["surface_id", "owner_surface_id"], "adapter.discord.route") ??
+			firstString(adapter, ["surface_id", "owner_surface_id"], "adapter.discord"),
+		"Discord surface id",
+	);
+	const route = configuredRoute(
+		{
+			channel_id: channelId,
+			surface_id: surfaceId,
+			...(routeTable.kind === undefined ? {} : { kind: routeTable.kind }),
+		},
+		"adapter.discord.route",
+		profile,
+	);
+	validateConfiguredRoutes([route]);
+	return [route];
+}
+
+function hasLegacyRouteConfiguration(adapter: Record<string, CanonicalValue>, environment: NodeJS.ProcessEnv): boolean {
+	return (
+		adapter.route !== undefined ||
+		adapter.channel_id !== undefined ||
+		adapter.owner_dm_channel_id !== undefined ||
+		adapter.surface_id !== undefined ||
+		adapter.owner_surface_id !== undefined ||
+		Boolean(environment.GAJAEWAY_DISCORD_CHANNEL_ID?.trim()) ||
+		Boolean(environment.GAJAEWAY_DISCORD_SURFACE_ID?.trim())
+	);
+}
+
+function configuredRoute(record: Record<string, CanonicalValue>, field: string, profile: WayProfile): DiscordRoute {
+	validateKnownFields(record, ["channel_id", "surface_id", "kind"], field);
+	const channelId = requiredString(record.channel_id, `${field}.channel_id`);
+	if (!/^\d+$/.test(channelId)) throw new DiscordAdapterConfigError(`${field}.channel_id must be a numeric Discord snowflake.`);
+	const surfaceId = requiredString(record.surface_id, `${field}.surface_id`);
+	const surface = profile.knownSurfaces.find(candidate => candidate.id === surfaceId);
+	if (!surface || surface.platform !== "discord") {
+		throw new DiscordAdapterConfigError(`${field}.surface_id must name a profile-known Discord surface.`);
+	}
+	const configuredKind = optionalRouteKind(record.kind, `${field}.kind`);
+	if (configuredKind !== undefined && configuredKind !== surface.kind) {
+		throw new DiscordAdapterConfigError(`${field}.kind must match the profile-known surface kind.`);
+	}
+	if (surface.kind !== "channel" && surface.kind !== "dm") {
+		throw new DiscordAdapterConfigError(`${field}.surface_id must name a Discord dm or channel surface.`);
+	}
+	return { channelId, surfaceId, kind: surface.kind };
+}
+
+function configuredOwnerDmRoute(routes: readonly DiscordRoute[], profile: WayProfile): DiscordRoute {
+	const ownerDmSurfaceIds = new Set(profile.ownerSurfaces.filter(surface => surface.platform === "discord" && surface.kind === "dm").map(surface => surface.id));
+	const candidates = routes.filter(route => route.kind === "dm" && ownerDmSurfaceIds.has(route.surfaceId));
+	if (candidates.length !== 1) {
+		throw new DiscordAdapterConfigError("adapter.discord.unattributed_delivery=owner-dm requires exactly one configured owner Discord DM route.");
+	}
+	return candidates[0] as DiscordRoute;
+}
+
+function parseUnattributedDelivery(value: CanonicalValue | undefined): DiscordUnattributedDelivery {
+	const policy = optionalString(value, "adapter.discord.unattributed_delivery") ?? "owner-dm";
+	if (policy !== "owner-dm" && policy !== "suppress") {
+		throw new DiscordAdapterConfigError("adapter.discord.unattributed_delivery must be owner-dm or suppress.");
+	}
+	return policy;
+}
+
+function validateConfiguredRoutes(routes: readonly DiscordRoute[]): void {
+	try {
+		validateDiscordRoutes(routes);
+	} catch (error) {
+		const message = error instanceof DiscordRouteError ? error.message : String(error);
+		throw new DiscordAdapterConfigError(message);
+	}
 }
 
 function adapterTable(profile: WayProfile): Record<string, CanonicalValue> {
@@ -102,6 +191,8 @@ function adapterTable(profile: WayProfile): Record<string, CanonicalValue> {
 		"surface_id",
 		"owner_surface_id",
 		"route",
+		"routes",
+		"unattributed_delivery",
 		"rpc_socket",
 		"rpc_socket_path",
 		"ack_budget_ms",
@@ -164,10 +255,23 @@ function firstString(record: Record<string, CanonicalValue>, keys: readonly stri
 	return undefined;
 }
 
+function requiredString(value: CanonicalValue | undefined, field: string): string {
+	const string = optionalString(value, field);
+	if (string === undefined) throw new DiscordAdapterConfigError(`${field} is required.`);
+	return string;
+}
+
 function optionalString(value: CanonicalValue | undefined, field: string): string | undefined {
 	if (value === undefined) return undefined;
 	if (typeof value !== "string" || !value.trim()) throw new DiscordAdapterConfigError(`${field} must be a non-empty string.`);
 	return value.trim();
+}
+
+function optionalRouteKind(value: CanonicalValue | undefined, field: string): DiscordRouteKind | undefined {
+	const kind = optionalString(value, field);
+	if (kind === undefined) return undefined;
+	if (kind !== "channel" && kind !== "dm") throw new DiscordAdapterConfigError(`${field} must be channel or dm.`);
+	return kind;
 }
 
 function optionalInteger(value: CanonicalValue | undefined, field: string, minimum: number, maximum: number): number | undefined {
@@ -175,6 +279,11 @@ function optionalInteger(value: CanonicalValue | undefined, field: string, minim
 	if (typeof value !== "number" || !Number.isSafeInteger(value) || value < minimum || value > maximum) {
 		throw new DiscordAdapterConfigError(`${field} must be an integer in ${minimum}..=${maximum}.`);
 	}
+	return value;
+}
+
+function requiredRecord(value: CanonicalValue, field: string): Record<string, CanonicalValue> {
+	if (!isRecord(value)) throw new DiscordAdapterConfigError(`${field} must be a table.`);
 	return value;
 }
 

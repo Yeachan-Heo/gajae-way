@@ -51,6 +51,9 @@ engagement_enabled = false
 # In systemd, LoadCredential supplies GAJAEWAY_DISCORD_TOKEN_FILE and takes
 # precedence. This env-name fallback is convenient for local development only.
 token_env = "GAJAEWAY_DISCORD_BOT_TOKEN"
+# Legacy one-entry route fields remain supported. Guild routes use repeated
+# [[adapter.discord.routes]] entries; thread MESSAGE_CREATE events are resolved
+# through cached read-only GET /channels/{thread_id} parent lookups.
 channel_id = "123456789012345678"
 surface_id = "discord:owner-dm"
 ack_budget_ms = 2000

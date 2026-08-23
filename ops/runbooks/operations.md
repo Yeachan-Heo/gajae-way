@@ -186,13 +186,16 @@ history or reopen write authority.
 
 ## Chat adapter final-gate verification
 
-The configured live Discord route is the final chat-adapter gate after local
+The configured live Discord route table is the final chat-adapter gate after local
 console acceptance. A future Telegram adapter is subject to the same final-gate
 route drill; neither chat adapter is accepted solely from local RPC fixtures.
 
-Enable Discord **Direct Messages** and **Message Content** intents. With the
-adapter unit running (so its systemd credential directory exists), verify the
-configured credential and live gateway without sending a bot message:
+Enable Discord **Direct Messages**, **Guild Messages**, and **Message Content**
+intents. A thread under a configured guild-channel route is resolved through a
+cached read-only `GET /channels/{thread_id}` parent lookup; any unresolved or
+unrouted channel remains unsubmitted. With the adapter unit running (so its
+systemd credential directory exists), verify the configured credential and live
+gateway without sending a bot message:
 
 ```sh
 sudo -u gajaeway -H env \

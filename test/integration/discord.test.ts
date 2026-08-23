@@ -1,11 +1,20 @@
 import { AsyncLocalStorage } from "node:async_hooks";
+import * as fs from "node:fs";
+import * as os from "node:os";
+import * as path from "node:path";
+
 import { expect, test } from "bun:test";
 import { DiscordOutbox, discordDedupeKey, discordWireNonce } from "../../src/adapter/discord/outbox";
+import { loadDiscordAdapterConfig, type DiscordAdapterConfig } from "../../src/adapter/discord/config";
+import { loadWayProfile } from "../../src/profile";
+
 import { startDiscordAdapter } from "../../src/adapter/discord/main";
-import { DiscordRouteHandler } from "../../src/adapter/discord/route";
+import { DiscordRouteHandler, type DiscordRoute } from "../../src/adapter/discord/route";
+
 import type { JsonRpcClient, JsonRpcResponse } from "../../src/rpc-client";
 import { DiscordFixture, DiscordFixtureClock } from "../fixtures/discord-fixture";
-import { createExternalGateway, eventually, type ExternalGateway } from "../helpers/external-gateway";
+import { createExternalGateway, eventually, type ExternalGateway, type ExternalGatewaySurface } from "../helpers/external-gateway";
+
 
 const gatewayScope = new AsyncLocalStorage<ExternalGateway[]>();
 
@@ -31,16 +40,63 @@ function externalTest(name: string, body: ExternalTestBody, timeoutMs?: number):
 	}, Math.max(timeoutMs ?? 0, 60_000));
 }
 
-async function gateway(): Promise<ExternalGateway> {
+async function gateway(
+	knownSurfaces: readonly ExternalGatewaySurface[] = [{ id: "discord:guest-channel", platform: "discord", kind: "channel" }],
+): Promise<ExternalGateway> {
 	const active = await createExternalGateway({
 		ownerSurface: { id: "discord:owner-dm", platform: "discord", kind: "dm" },
-		knownSurfaces: [{ id: "discord:guest-channel", platform: "discord", kind: "channel" }],
+		knownSurfaces,
 	});
 	const gateways = gatewayScope.getStore();
 	if (!gateways) throw new Error("gateway() must run inside externalTest().");
 	gateways.push(active);
 	return active;
 }
+
+
+const OWNER_ROUTE = { channelId: "123456789012345678", surfaceId: "discord:owner-dm", kind: "dm" } as const;
+const TYPING_CHANNEL_ID = OWNER_ROUTE.channelId;
+const TYPING_ROUTE = OWNER_ROUTE;
+const GUILD_A_ROUTE = { channelId: "222222222222222222", surfaceId: "discord:guild-a", kind: "channel" } as const;
+const GUILD_B_ROUTE = { channelId: "333333333333333333", surfaceId: "discord:guild-b", kind: "channel" } as const;
+
+async function startRoutedFixtureAdapter(
+	fixture: DiscordFixture,
+	rpc: JsonRpcClient,
+	routes: readonly DiscordRoute[],
+	options: {
+		readonly unattributedDelivery?: "owner-dm" | "suppress";
+		readonly unattributedRoute?: DiscordRoute;
+		readonly onError?: (error: Error) => void;
+		readonly onDiagnostic?: (message: string) => void;
+		readonly typingKeepaliveClock?: DiscordFixtureClock;
+
+	} = {},
+) {
+	const unattributedDelivery = options.unattributedDelivery ?? "owner-dm";
+	const config: DiscordAdapterConfig = {
+		rpcSocketPath: "/tmp/gajaeway-discord-routes-fixture.sock",
+		token: "fixture-token",
+		routes,
+		unattributedDelivery,
+		...(options.unattributedRoute === undefined ? {} : { unattributedRoute: options.unattributedRoute }),
+		ackBudgetMs: 2_000,
+		claimTtlMs: 5_000,
+		readWaitMs: 0,
+	};
+	return await startDiscordAdapter(config, {
+		rpcConnect: async () => rpc,
+		platformFactory: () => fixture,
+		...(options.onError === undefined ? {} : { onError: options.onError }),
+		...(options.onDiagnostic === undefined ? {} : { onDiagnostic: options.onDiagnostic }),
+		...(options.typingKeepaliveClock === undefined ? {} : { typingKeepaliveClock: options.typingKeepaliveClock }),
+	});
+}
+
+function nonClosingRpc(rpc: JsonRpcClient): JsonRpcClient {
+	return { request: async (method, params, options) => await rpc.request(method, params, options), close() {} };
+}
+
 
 function outbox(
 	gatewayUnderTest: ExternalGateway,
@@ -50,15 +106,17 @@ function outbox(
 	return new DiscordOutbox({
 		rpc: gatewayUnderTest.client,
 		platform: fixture,
-		route: { channelId: "123456789012345678", surfaceId: "discord:owner-dm" },
+		routes: [OWNER_ROUTE],
+		unattributedDelivery: "owner-dm",
+		unattributedRoute: OWNER_ROUTE,
+
 		claimTtlMs: 5_000,
 		readWaitMs: 0,
 		hooks,
 	});
 }
 
-const TYPING_CHANNEL_ID = "123456789012345678";
-const TYPING_ROUTE = { channelId: TYPING_CHANNEL_ID, surfaceId: "discord:owner-dm" };
+
 
 function typingAdapterRpc(
 	accepted: boolean,
@@ -102,7 +160,9 @@ async function startTypingFixtureAdapter(
 		{
 			rpcSocketPath: "/tmp/gajaeway-discord-typing-fixture.sock",
 			token: "fixture-token",
-			route: TYPING_ROUTE,
+			routes: [TYPING_ROUTE],
+			unattributedDelivery: "owner-dm",
+			unattributedRoute: TYPING_ROUTE,
 			ackBudgetMs: 2_000,
 			claimTtlMs: 5_000,
 			readWaitMs: 0,
@@ -135,7 +195,82 @@ test("Discord wire nonce is deterministic, distinct, and exactly 96 bits", () =>
 	expect(discordWireNonce(secondKey)).not.toBe(firstNonce);
 });
 
-externalTest("Discord inbound deduplicates a message id before external broker admission and sends finalized output", async () => {
+test("Discord config normalizes route tables and legacy single-route fields", () => {
+	const root = fs.mkdtempSync(path.join(os.tmpdir(), "gajaeway-discord-routes-"));
+	const corpus = path.join(root, "corpus");
+	const workspace = path.join(root, "workspace");
+	const profilePath = path.join(root, "profile.toml");
+	fs.mkdirSync(corpus);
+	fs.mkdirSync(workspace);
+	const profile = (adapter: string): string => `[corpus]
+path = "${corpus}"
+workspace = "${workspace}"
+
+[injection]
+files = []
+
+[surfaces.owner]
+id = "discord:owner-dm"
+platform = "discord"
+kind = "dm"
+
+[[surfaces.known]]
+id = "discord:guild-a"
+platform = "discord"
+kind = "channel"
+
+${adapter}`;
+	try {
+		fs.writeFileSync(
+			profilePath,
+			profile(`[adapter.discord]
+token_env = "GAJAEWAY_DISCORD_BOT_TOKEN"
+unattributed_delivery = "suppress"
+
+[[adapter.discord.routes]]
+channel_id = "123456789012345678"
+surface_id = "discord:owner-dm"
+kind = "dm"
+
+[[adapter.discord.routes]]
+channel_id = "222222222222222222"
+surface_id = "discord:guild-a"
+`),
+		);
+		const tableConfig = loadDiscordAdapterConfig({
+			profile: loadWayProfile(profilePath),
+			environment: { GAJAEWAY_DISCORD_BOT_TOKEN: "fixture-token" },
+		});
+		expect(tableConfig).toMatchObject({
+			routes: [OWNER_ROUTE, GUILD_A_ROUTE],
+			unattributedDelivery: "suppress",
+		});
+		expect(tableConfig.unattributedRoute).toBeUndefined();
+
+		fs.writeFileSync(
+			profilePath,
+			profile(`[adapter.discord]
+token_env = "GAJAEWAY_DISCORD_BOT_TOKEN"
+channel_id = "123456789012345678"
+surface_id = "discord:owner-dm"
+`),
+		);
+		const legacyConfig = loadDiscordAdapterConfig({
+			profile: loadWayProfile(profilePath),
+			environment: { GAJAEWAY_DISCORD_BOT_TOKEN: "fixture-token" },
+		});
+		expect(legacyConfig).toMatchObject({
+			routes: [OWNER_ROUTE],
+			unattributedDelivery: "owner-dm",
+			unattributedRoute: OWNER_ROUTE,
+		});
+	} finally {
+		fs.rmSync(root, { recursive: true, force: true });
+	}
+});
+
+externalTest("Discord one-entry route table deduplicates a message id before external broker admission and sends finalized output", async () => {
+
 	const gatewayUnderTest = await gateway();
 	const fixture = new DiscordFixture();
 	await fixture.connect();
@@ -143,7 +278,8 @@ externalTest("Discord inbound deduplicates a message id before external broker a
 		const route = new DiscordRouteHandler({
 			rpc: gatewayUnderTest.client,
 			platform: fixture,
-			route: { channelId: "123456789012345678", surfaceId: "discord:owner-dm" },
+			routes: [OWNER_ROUTE],
+
 		});
 		const unsubscribe = fixture.onMessage(async message => {
 			await route.handle(message);
@@ -164,6 +300,255 @@ externalTest("Discord inbound deduplicates a message id before external broker a
 		expect(fixture.sends).toEqual([expect.objectContaining({ channelId: "123456789012345678", text: "ack" })]);
 	} finally {
 		await fixture.disconnect();
+	}
+});
+
+externalTest("Discord route table admits a guild-channel message and returns its reply to that channel", async () => {
+	const gatewayUnderTest = await gateway([{ id: GUILD_A_ROUTE.surfaceId, platform: "discord", kind: "channel" }]);
+	const fixture = new DiscordFixture();
+	const adapter = await startRoutedFixtureAdapter(fixture, gatewayUnderTest.client, [OWNER_ROUTE, GUILD_A_ROUTE], {
+		unattributedRoute: OWNER_ROUTE,
+	});
+	try {
+		gatewayUnderTest.fixture.holdNextTurn();
+		const inbound = { id: "guild-route-round-trip", channelId: GUILD_A_ROUTE.channelId, text: "guild route round trip" };
+		await fixture.emitMessage(inbound);
+		const opRef = await eventually(
+			() => {
+				const command = gatewayUnderTest.fixture.commands().find(command => command.text === inbound.text);
+				return typeof command?.opRef === "string" ? command.opRef : undefined;
+			},
+			"guild-channel message was not admitted",
+		);
+		expect(gatewayUnderTest.fixture.commands()).toEqual([expect.objectContaining({ operation: "turn.follow_up", text: inbound.text, opRef })]);
+		gatewayUnderTest.fixture.complete(opRef, { text: "guild route reply" });
+		await eventually(
+			() => (fixture.sends.some(send => send.channelId === GUILD_A_ROUTE.channelId && send.text === "guild route reply") ? true : undefined),
+			"guild route reply was not posted to its guild channel",
+		);
+		expect(fixture.sends).toEqual([expect.objectContaining({ channelId: GUILD_A_ROUTE.channelId, text: "guild route reply" })]);
+		expect(fixture.acknowledgements).toEqual([expect.objectContaining({ channelId: GUILD_A_ROUTE.channelId })]);
+	} finally {
+		await adapter.stop();
+	}
+});
+
+externalTest("Discord route table resolves a thread first seen mid-session and returns to that thread", async () => {
+	const gatewayUnderTest = await gateway([{ id: GUILD_A_ROUTE.surfaceId, platform: "discord", kind: "channel" }]);
+	const fixture = new DiscordFixture();
+	const adapter = await startRoutedFixtureAdapter(fixture, gatewayUnderTest.client, [OWNER_ROUTE, GUILD_A_ROUTE], {
+		unattributedRoute: OWNER_ROUTE,
+	});
+	const threadChannelId = "444444444444444444";
+	try {
+		// The adapter has already connected; this is a thread discovered only when
+		// its first MESSAGE_CREATE arrives, not pre-registered fixture state.
+		fixture.setThreadParent(threadChannelId, GUILD_A_ROUTE.channelId);
+		gatewayUnderTest.fixture.holdNextTurn();
+		const inbound = { id: "thread-route-round-trip", channelId: threadChannelId, text: "thread route round trip" };
+		await fixture.emitMessage(inbound);
+		const opRef = await eventually(
+			() => {
+				const command = gatewayUnderTest.fixture.commands().find(command => command.text === inbound.text);
+				return typeof command?.opRef === "string" ? command.opRef : undefined;
+			},
+			"thread message was not admitted",
+		);
+		expect(fixture.threadParentLookups).toEqual([threadChannelId]);
+		gatewayUnderTest.fixture.complete(opRef, { text: "thread route reply" });
+		await eventually(
+			() => (fixture.sends.some(send => send.channelId === threadChannelId && send.text === "thread route reply") ? true : undefined),
+			"thread route reply was not posted to its thread channel",
+		);
+		expect(fixture.acknowledgements).toEqual([expect.objectContaining({ channelId: threadChannelId })]);
+	} finally {
+		await adapter.stop();
+	}
+});
+
+externalTest("Discord route table never submits an unrouted channel", async () => {
+	const gatewayUnderTest = await gateway([{ id: GUILD_A_ROUTE.surfaceId, platform: "discord", kind: "channel" }]);
+	const fixture = new DiscordFixture();
+	const adapter = await startRoutedFixtureAdapter(fixture, gatewayUnderTest.client, [OWNER_ROUTE, GUILD_A_ROUTE], {
+		unattributedRoute: OWNER_ROUTE,
+	});
+	try {
+		await fixture.emitMessage({ id: "unrouted-channel", channelId: "555555555555555555", text: "must remain outside the route table" });
+		expect(gatewayUnderTest.fixture.commands()).toEqual([]);
+		expect(fixture.acknowledgements).toEqual([]);
+		expect(fixture.threadParentLookups).toEqual(["555555555555555555"]);
+	} finally {
+		await adapter.stop();
+	}
+});
+
+externalTest("Discord route table keeps concurrent surface replies isolated across an adapter restart", async () => {
+	const gatewayUnderTest = await gateway([
+		{ id: GUILD_A_ROUTE.surfaceId, platform: "discord", kind: "channel" },
+		{ id: GUILD_B_ROUTE.surfaceId, platform: "discord", kind: "channel" },
+	]);
+	const fixture = new DiscordFixture();
+	const rpc = nonClosingRpc(gatewayUnderTest.client);
+	const routes = [OWNER_ROUTE, GUILD_A_ROUTE, GUILD_B_ROUTE];
+	let adapter = await startRoutedFixtureAdapter(fixture, rpc, routes, { unattributedRoute: OWNER_ROUTE });
+	try {
+		gatewayUnderTest.fixture.holdNextTurn();
+		const first = { id: "restart-route-a", channelId: GUILD_A_ROUTE.channelId, text: "surface A before restart" };
+		await fixture.emitMessage(first);
+		const firstOpRef = await eventually(
+			() => {
+				const command = gatewayUnderTest.fixture.commands().find(command => command.text === first.text);
+				return typeof command?.opRef === "string" ? command.opRef : undefined;
+			},
+			"first concurrent surface was not admitted",
+		);
+		gatewayUnderTest.fixture.holdNextTurn();
+		const second = { id: "restart-route-b", channelId: GUILD_B_ROUTE.channelId, text: "surface B across restart" };
+		await fixture.emitMessage(second);
+		const secondOpRef = await eventually(
+			() => {
+				const command = gatewayUnderTest.fixture.commands().find(command => command.text === second.text);
+				return typeof command?.opRef === "string" ? command.opRef : undefined;
+			},
+			"second concurrent surface was not admitted",
+		);
+
+		gatewayUnderTest.fixture.complete(firstOpRef, { text: "reply A before restart" });
+		await eventually(
+			() => (fixture.sends.some(send => send.channelId === GUILD_A_ROUTE.channelId && send.text === "reply A before restart") ? true : undefined),
+			"first routed reply was not delivered before restart",
+		);
+		await eventually(
+			() => (fixture.sends.some(send => send.channelId === GUILD_B_ROUTE.channelId && send.text === "ack") ? true : undefined),
+			"second concurrent routed reply was not delivered before restart",
+		);
+		expect(secondOpRef).toEqual(expect.any(String));
+		await adapter.stop();
+		const sendsBeforeRestart = fixture.sends.length;
+		adapter = await startRoutedFixtureAdapter(fixture, rpc, routes, { unattributedRoute: OWNER_ROUTE });
+		await Bun.sleep(100);
+		expect(fixture.sends).toEqual([
+			expect.objectContaining({ channelId: GUILD_A_ROUTE.channelId, text: "reply A before restart" }),
+			expect.objectContaining({ channelId: GUILD_B_ROUTE.channelId, text: "ack" }),
+		]);
+		expect(fixture.sends).toHaveLength(sendsBeforeRestart);
+		expect(fixture.sendAttempts).toHaveLength(2);
+	} finally {
+		await adapter.stop();
+	}
+});
+
+externalTest("Discord typing keepalive stops only the delivered route's channel", async () => {
+	const gatewayUnderTest = await gateway([
+		{ id: GUILD_A_ROUTE.surfaceId, platform: "discord", kind: "channel" },
+		{ id: GUILD_B_ROUTE.surfaceId, platform: "discord", kind: "channel" },
+	]);
+	const clock = new DiscordFixtureClock(1_000);
+	const fixture = new DiscordFixture({ now: clock.now });
+	const adapter = await startRoutedFixtureAdapter(fixture, gatewayUnderTest.client, [OWNER_ROUTE, GUILD_A_ROUTE, GUILD_B_ROUTE], {
+		unattributedRoute: OWNER_ROUTE,
+		typingKeepaliveClock: clock,
+	});
+	try {
+		gatewayUnderTest.fixture.holdNextTurn();
+		const first = { id: "typing-route-a", channelId: GUILD_A_ROUTE.channelId, text: "keep channel A typing" };
+		await fixture.emitMessage(first);
+		const firstOpRef = await eventually(
+			() => {
+				const command = gatewayUnderTest.fixture.commands().find(command => command.text === first.text);
+				return typeof command?.opRef === "string" ? command.opRef : undefined;
+			},
+			"first route typing admission was not recorded",
+		);
+		gatewayUnderTest.fixture.holdNextTurn();
+		const second = { id: "typing-route-b", channelId: GUILD_B_ROUTE.channelId, text: "keep channel B typing" };
+		await fixture.emitMessage(second);
+		const secondOpRef = await eventually(
+			() => {
+				const command = gatewayUnderTest.fixture.commands().find(command => command.text === second.text);
+				return typeof command?.opRef === "string" ? command.opRef : undefined;
+			},
+			"second route typing admission was not recorded",
+		);
+		const delivered = gatewayUnderTest.core.journalAppend(
+			"assistant_message",
+			JSON.stringify({ finalized: true, text: "channel A delivery stops only A", surface_id: GUILD_A_ROUTE.surfaceId }),
+		);
+		await eventually(
+			() => (fixture.sends.some(send => send.channelId === GUILD_A_ROUTE.channelId && send.text === "channel A delivery stops only A") ? true : undefined),
+			"channel A attributed delivery was not posted",
+		);
+		expect(delivered.seq).toEqual(expect.any(String));
+		expect(firstOpRef).toEqual(expect.any(String));
+		expect(secondOpRef).toEqual(expect.any(String));
+		await advanceTypingClock(clock, 8_000);
+		expect(fixture.acknowledgementAttempts).toEqual([
+			{ channelId: GUILD_A_ROUTE.channelId, at: 1_000 },
+			{ channelId: GUILD_B_ROUTE.channelId, at: 1_000 },
+			{ channelId: GUILD_B_ROUTE.channelId, at: 9_000 },
+		]);
+	} finally {
+		await adapter.stop();
+	}
+});
+
+externalTest("Discord outbox applies owner-dm and suppress policies to unattributed replies", async () => {
+	const gatewayUnderTest = await gateway([
+		{ id: GUILD_A_ROUTE.surfaceId, platform: "discord", kind: "channel" },
+	]);
+	const routes = [OWNER_ROUTE, GUILD_A_ROUTE];
+	const ownerFixture = new DiscordFixture();
+	const suppressFixture = new DiscordFixture();
+	await ownerFixture.connect();
+	await suppressFixture.connect();
+	try {
+		const ownerEvent = gatewayUnderTest.core.journalAppend("assistant_message", JSON.stringify({ finalized: true, text: "unattributed to owner dm" }));
+		const ownerOutbox = new DiscordOutbox({
+			rpc: gatewayUnderTest.client,
+			platform: ownerFixture,
+			routes,
+			unattributedDelivery: "owner-dm",
+			unattributedRoute: OWNER_ROUTE,
+			consumerId: "discord-owner-default-policy",
+			claimTtlMs: 5_000,
+			readWaitMs: 0,
+		});
+		expect(await ownerOutbox.runOnce()).toBe("sent");
+		expect(ownerFixture.sends).toEqual([expect.objectContaining({ channelId: OWNER_ROUTE.channelId, text: "unattributed to owner dm" })]);
+		expect(gatewayUnderTest.core.consumerCursor("discord-owner-default-policy")).toBe(ownerEvent.cursor);
+
+		const unmappedEvent = gatewayUnderTest.core.journalAppend(
+			"assistant_message",
+			JSON.stringify({ finalized: true, text: "unmapped attribution defaults to owner dm", surface_id: "discord:unrouted" }),
+		);
+		expect(await ownerOutbox.runOnce()).toBe("sent");
+		expect(ownerFixture.sends).toEqual([
+			expect.objectContaining({ channelId: OWNER_ROUTE.channelId, text: "unattributed to owner dm" }),
+			expect.objectContaining({ channelId: OWNER_ROUTE.channelId, text: "unmapped attribution defaults to owner dm" }),
+		]);
+		expect(gatewayUnderTest.core.consumerCursor("discord-owner-default-policy")).toBe(unmappedEvent.cursor);
+
+		const suppressedEvent = gatewayUnderTest.core.journalAppend("assistant_message", JSON.stringify({ finalized: true, text: "unattributed suppression" }));
+		const diagnostics: string[] = [];
+		const suppressOutbox = new DiscordOutbox({
+			rpc: gatewayUnderTest.client,
+			platform: suppressFixture,
+			routes,
+			unattributedDelivery: "suppress",
+			consumerId: "discord-suppress-policy",
+			claimTtlMs: 5_000,
+			readWaitMs: 0,
+			onDiagnostic: message => diagnostics.push(message),
+		});
+		expect(await suppressOutbox.runOnce()).toBe("sent");
+		expect(suppressFixture.sends).toEqual([]);
+		expect(gatewayUnderTest.core.consumerCursor("discord-suppress-policy")).toBe(suppressedEvent.cursor);
+		expect(diagnostics).toEqual(
+		expect.arrayContaining([expect.stringContaining("suppressed assistant_message"), expect.stringContaining("payload has no surface_id")]),
+	);
+	} finally {
+		await ownerFixture.disconnect();
+		await suppressFixture.disconnect();
 	}
 });
 
@@ -194,7 +579,8 @@ externalTest("Discord typing starts after delayed durable main.submit acceptance
 		const route = new DiscordRouteHandler({
 			rpc: delayedRpc,
 			platform: fixture,
-			route: { channelId: "123456789012345678", surfaceId: "discord:owner-dm" },
+			routes: [OWNER_ROUTE],
+
 			acknowledgement: { now: clock.now, budgetMs: 2_000 },
 			onAcknowledged: () => ordering.push("typing acknowledged"),
 		});
@@ -595,7 +981,8 @@ externalTest("Discord typing follows accepted admission, not a stale healthy-to-
 		const route = new DiscordRouteHandler({
 			rpc: gatewayUnderTest.client,
 			platform: fixture,
-			route: { channelId: "123456789012345678", surfaceId: "discord:owner-dm" },
+			routes: [OWNER_ROUTE],
+
 		});
 		gatewayUnderTest.fixture.holdNextTurn();
 		gatewayUnderTest.fixture.suppressNextAdmissionReceipt();
@@ -639,7 +1026,10 @@ externalTest("Discord startup reports rate-limited verifying and transport readi
 	const config = {
 		rpcSocketPath: "/tmp/discord-gateway-readiness.sock",
 		token: "fixture-token",
-		route: { channelId: "123456789012345678", surfaceId: "discord:owner-dm" },
+		routes: [OWNER_ROUTE],
+		unattributedDelivery: "owner-dm" as const,
+		unattributedRoute: OWNER_ROUTE,
+
 		ackBudgetMs: 2_000,
 		claimTtlMs: 5_000,
 		readWaitMs: 0,
@@ -764,7 +1154,8 @@ externalTest("Discord non-owner engagement is admitted as follow_up whether the 
 		const guestRoute = new DiscordRouteHandler({
 			rpc: gatewayUnderTest.client,
 			platform: fixture,
-			route: { channelId: "222222222222222222", surfaceId: "discord:guest-channel" },
+			routes: [{ channelId: "222222222222222222", surfaceId: "discord:guest-channel", kind: "channel" }],
+
 		});
 		await guestRoute.handle({ id: "guest-idle", channelId: "222222222222222222", text: "idle guest message", acceptedAt: Date.now() });
 
@@ -772,7 +1163,7 @@ externalTest("Discord non-owner engagement is admitted as follow_up whether the 
 		const ownerRoute = new DiscordRouteHandler({
 			rpc: gatewayUnderTest.client,
 			platform: fixture,
-			route: { channelId: "123456789012345678", surfaceId: "discord:owner-dm" },
+			routes: [OWNER_ROUTE],
 		});
 		await ownerRoute.handle({ id: "owner-held", channelId: "123456789012345678", text: "held owner message", acceptedAt: Date.now() });
 		await eventually(() => (gatewayUnderTest.host.turnState === "busy" ? true : undefined), "owner turn was not admitted as busy");

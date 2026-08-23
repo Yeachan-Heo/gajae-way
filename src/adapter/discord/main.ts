@@ -87,21 +87,26 @@ export async function startDiscordAdapter(
 		});
 		typingKeepalive = activeTypingKeepalive;
 		const router = new DiscordRouteHandler({
-			route: config.route,
+			routes: config.routes,
+
 			rpc,
 			platform: activePlatform,
 			acknowledgement: { budgetMs: config.ackBudgetMs },
 			onAccepted: (message, journalHeadCursor) => activeTypingKeepalive.begin(message.channelId, message.id, journalHeadCursor),
-			onAcknowledged: acknowledgement => activeTypingKeepalive.start(config.route.channelId, acknowledgement.messageId),
+			onAcknowledged: acknowledgement => activeTypingKeepalive.start(acknowledgement.channelId, acknowledgement.messageId),
+
 			onAcknowledgementFailed: message => activeTypingKeepalive.cancel(message.channelId, message.id),
 		});
 		const outbox = new DiscordOutbox({
 			rpc,
 			platform: activePlatform,
-			route: config.route,
+			routes: config.routes,
+			unattributedDelivery: config.unattributedDelivery,
+			...(config.unattributedRoute === undefined ? {} : { unattributedRoute: config.unattributedRoute }),
 			claimTtlMs: config.claimTtlMs,
 			readWaitMs: config.readWaitMs,
-			hooks: { afterSendBeforeCommit: item => activeTypingKeepalive.delivered(config.route.channelId, item) },
+			hooks: { afterSendBeforeCommit: item => activeTypingKeepalive.delivered(item.channelId, item) },
+			onDiagnostic,
 			onError,
 		});
 		unsubscribe = activePlatform.onMessage(async message => {

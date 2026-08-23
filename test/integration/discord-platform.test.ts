@@ -48,6 +48,10 @@ test("hand-rolled Discord platform identifies, heartbeats, resumes, routes MESSA
 			requests.push({ url, method, ...(typeof init?.body === "string" ? { body: init.body } : {}) });
 			if (url.endsWith("/gateway/bot")) return new Response(JSON.stringify({ url: "wss://gateway.test" }), { status: 200 });
 			if (url.includes("/messages") && method === "POST") return new Response(JSON.stringify({ id: "platform-message-1" }), { status: 200 });
+			if (url.endsWith("/channels/222222222222222222") && method === "GET") {
+				return new Response(JSON.stringify({ id: "222222222222222222", type: 11, parent_id: "123456789012345678" }), { status: 200 });
+			}
+
 			return new Response(null, { status: 204 });
 		},
 		webSocketFactory: () => {
@@ -68,7 +72,8 @@ test("hand-rolled Discord platform identifies, heartbeats, resumes, routes MESSA
 		const first = sockets[0] as GatewaySocketFixture;
 		first.emit("message", { data: JSON.stringify({ op: 10, d: { heartbeat_interval: 60_000 } }) });
 		expect(first.sent.map(entry => JSON.parse(entry))).toEqual(
-			expect.arrayContaining([expect.objectContaining({ op: 1 }), expect.objectContaining({ op: 2, d: expect.objectContaining({ intents: 36_864 }) })]),
+			expect.arrayContaining([expect.objectContaining({ op: 1 }), expect.objectContaining({ op: 2, d: expect.objectContaining({ intents: 37_376 }) })]),
+
 		);
 		first.emit(
 			"message",
@@ -91,13 +96,19 @@ test("hand-rolled Discord platform identifies, heartbeats, resumes, routes MESSA
 		expect(await platform.send("123456789012345678", "reply", "nonce-1")).toBe("platform-message-1");
 		await platform.ackTyping("123456789012345678");
 		await platform.react("123456789012345678", "incoming-1", "👀");
+		expect(await platform.resolveThreadParent("222222222222222222")).toBe("123456789012345678");
+		expect(await platform.resolveThreadParent("222222222222222222")).toBe("123456789012345678");
+
 		expect(requests).toEqual(
 			expect.arrayContaining([
 				expect.objectContaining({ url: "https://discord.com/api/v10/gateway/bot", method: "GET" }),
 				expect.objectContaining({ method: "POST", body: JSON.stringify({ content: "reply", nonce: "nonce-1", enforce_nonce: true }) }),
 				expect.objectContaining({ url: "https://discord.com/api/v10/channels/123456789012345678/typing", method: "POST" }),
+				expect.objectContaining({ url: "https://discord.com/api/v10/channels/222222222222222222", method: "GET" }),
+
 			]),
 		);
+		expect(requests.filter(request => request.url.endsWith("/channels/222222222222222222") && request.method === "GET")).toHaveLength(1);
 
 		first.close(1_006, "network");
 		await waitFor(() => sockets.length === 2);

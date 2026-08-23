@@ -866,6 +866,50 @@ externalTest("main.submit rejects an unknown surface with 1300", async () => {
 	expect(gateway.fixture.commands()).toEqual([]);
 });
 
+externalTest("main.submit admits only numeric Discord thread children of configured channel surfaces", async () => {
+	const gateway = await hosted({ knownSurfaces: [{ id: "discord:guild", platform: "discord", kind: "channel" }] });
+	const threadSurfaceId = "discord:guild/thread:222222222222222222";
+	gateway.fixture.holdNextTurn();
+	const accepted = await gateway.client.request("main.submit", {
+		text: "routed thread message",
+		surface_id: threadSurfaceId,
+		idempotency_key: "derived-discord-thread",
+	});
+	expect(accepted.result).toMatchObject({ accepted: true, delivered_as: "follow_up" });
+	const opRef = (accepted.result as { op_ref: string }).op_ref;
+	expect(gateway.fixture.commands()).toEqual([expect.objectContaining({ operation: "turn.follow_up", text: "routed thread message", opRef })]);
+	gateway.fixture.complete(opRef, { text: "derived thread attribution" });
+	await eventually(
+		() =>
+			gateway.core
+				.journalRead("1:0", 100)
+				.events.some(event => event.kind === "assistant_message" && event.payloadJson.includes(`\"surface_id\":\"${threadSurfaceId}\"`))
+				? true
+				: undefined,
+		"derived Discord thread surface was not attributed in the durable reply",
+	);
+
+	for (const surfaceId of ["discord:guild/thread:not-a-snowflake", "discord:unrouted/thread:222222222222222222", "owner/thread:222222222222222222"]) {
+		const refused = await gateway.client.request("main.submit", {
+			text: "must remain unknown",
+			surface_id: surfaceId,
+			idempotency_key: `derived-discord-thread-refusal-${surfaceId}`,
+		});
+		expect(rpcError(refused)).toMatchObject({ code: 1300, message: "unknown_surface" });
+	}
+
+	const quarantinedGateway = await hosted({
+		knownSurfaces: [{ id: "discord:guild", platform: "discord", kind: "channel" }],
+		isSurfaceQuarantined: surface => surface.id === "discord:guild",
+	});
+	const quarantined = await quarantinedGateway.client.request("main.submit", {
+		text: "thread inherits parent quarantine",
+		surface_id: threadSurfaceId,
+		idempotency_key: "derived-discord-thread-quarantine",
+	});
+	expect(rpcError(quarantined)).toMatchObject({ code: 1302, message: "session_quarantined" });
+});
+
 externalTest("main.submit rejects empty text before broker admission", async () => {
 	const gateway = await hosted();
 	const response = await gateway.client.request("main.submit", {

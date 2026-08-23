@@ -4,6 +4,7 @@ export const DISCORD_ACK_BUDGET_MS = 2_000;
 
 export interface DiscordAcknowledgement {
 	readonly messageId: string;
+	readonly channelId: string;
 	readonly accepted: boolean;
 	readonly acknowledgedAt: number;
 	readonly elapsedMs: number;
@@ -46,6 +47,7 @@ export async function acknowledgeDiscordMessage(
 	}
 	return {
 		messageId: message.id,
+		channelId: message.channelId,
 		accepted: true,
 		acknowledgedAt,
 		elapsedMs: acknowledgedAt - startedAt,

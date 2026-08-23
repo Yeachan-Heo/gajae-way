@@ -142,6 +142,35 @@ function parseRequest(params: unknown): AdmissionRequest {
 	};
 }
 
+interface ResolvedAdmissionSurface {
+	readonly surface: OwnerSurface;
+	/** Registry quarantine applies to the configured parent, never an invented thread row. */
+	readonly quarantineSurface: OwnerSurface;
+}
+
+/**
+ * Admits only a numeric Discord thread suffix below one configured Discord
+ * channel surface. This preserves 1300 for every other unknown surface while
+ * avoiding dynamic registry mutation for ephemeral Discord thread ids.
+ */
+function resolveAdmissionSurface(surfaceId: string, knownSurfaces: ReadonlyMap<string, OwnerSurface>): ResolvedAdmissionSurface | undefined {
+	const exact = knownSurfaces.get(surfaceId);
+	if (exact) return { surface: exact, quarantineSurface: exact };
+	const parents = [...knownSurfaces.values()].filter(parent => {
+		if (parent.platform !== "discord" || parent.kind !== "channel") return false;
+		const prefix = `${parent.id}/thread:`;
+		const threadId = surfaceId.slice(prefix.length);
+		return surfaceId.startsWith(prefix) && /^\d+$/.test(threadId);
+	});
+	if (parents.length !== 1) return undefined;
+	const parent = parents[0] as OwnerSurface;
+	return {
+		surface: { id: surfaceId, platform: parent.platform, kind: "thread" },
+		quarantineSurface: parent,
+	};
+}
+
+
 function idempotencyFailure(error: unknown): never {
 	if (error instanceof RpcBridgeException) throw error;
 	const message = error instanceof Error ? error.message : String(error);
@@ -375,9 +404,10 @@ export function createMainAdmissionHandler(
 		const fenceReason = options.mutationReadinessReason?.() ?? target.mutationReadinessReason;
 		if (fenceReason) throw new RpcBridgeException(1003, fenceReason);
 		const canonicalSurfaceId = request.surfaceId.trim();
-		const surface = knownSurfaces.get(canonicalSurfaceId);
-		if (!surface) throw new RpcBridgeException(1300, "unknown_surface");
-		if (options.isSurfaceQuarantined?.(surface)) throw new RpcBridgeException(1302, "session_quarantined");
+		const resolvedSurface = resolveAdmissionSurface(canonicalSurfaceId, knownSurfaces);
+		if (!resolvedSurface) throw new RpcBridgeException(1300, "unknown_surface");
+		const surface = resolvedSurface.surface;
+		if (options.isSurfaceQuarantined?.(resolvedSurface.quarantineSurface)) throw new RpcBridgeException(1302, "session_quarantined");
 		const requestJson = canonicalJson({
 			idempotency_key: request.idempotencyKey,
 			surface_id: surface.id,

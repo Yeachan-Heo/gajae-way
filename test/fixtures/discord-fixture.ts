@@ -146,6 +146,8 @@ export class DiscordFixture implements DiscordPlatform {
 	readonly acknowledgements: DiscordFixtureAcknowledgement[] = [];
 	readonly acknowledgementAttempts: DiscordFixtureAcknowledgement[] = [];
 	readonly reactions: DiscordFixtureReaction[] = [];
+	readonly threadParentLookups: string[] = [];
+
 	connectCount = 0;
 	disconnectCount = 0;
 
@@ -156,6 +158,8 @@ export class DiscordFixture implements DiscordPlatform {
 	readonly #queuedSendIds: string[] = [];
 	readonly #queuedMessages: DiscordMessage[] = [];
 	readonly #queuedTypingErrors: Error[] = [];
+	readonly #threadParents = new Map<string, string>();
+
 	#deferredTypingCount = 0;
 	#deferredSendCount = 0;
 	readonly #pendingTyping: DeferredTypingAcknowledgement[] = [];
@@ -223,6 +227,15 @@ export class DiscordFixture implements DiscordPlatform {
 	setSendIdAllocator(allocator: DiscordFixtureOptions["sendId"]): void {
 		if (!allocator) throw new Error("Fixture send id allocator is required.");
 		this.#sendId = allocator;
+	}
+
+
+	/** Configures the read-only thread parent lookup used by multi-route ingress drills. */
+	setThreadParent(threadChannelId: string, parentChannelId: string): void {
+		if (!/^\d+$/.test(threadChannelId) || !/^\d+$/.test(parentChannelId)) {
+			throw new Error("Fixture thread and parent channel ids must be Discord snowflakes.");
+		}
+		this.#threadParents.set(threadChannelId, parentChannelId);
 	}
 
 	failNextTyping(error = new Error("fixture typing acknowledgement failed")): void {
@@ -326,6 +339,12 @@ export class DiscordFixture implements DiscordPlatform {
 			});
 		}
 		this.acknowledgements.push(acknowledgement);
+	}
+
+	async resolveThreadParent(channelId: string): Promise<string | undefined> {
+		if (!this.#connected) throw new Error("Discord fixture gateway is disconnected.");
+		this.threadParentLookups.push(channelId);
+		return this.#threadParents.get(channelId);
 	}
 
 
