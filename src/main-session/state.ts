@@ -647,6 +647,58 @@ export class GatewayStateStore {
 		});
 	}
 
+	/**
+	 * Re-binds the durable identity to an observed transcript that is an attested
+	 * append-only extension of the persisted prefix, for autonomous persona growth
+	 * that happened with no growth intent open (for example while the daemon was
+	 * down). The prefix attestation is re-checked here so the durable write itself
+	 * is guarded, never only the caller.
+	 *
+	 * `transcript_delivery_progress` is deliberately left untouched: the observed
+	 * suffix stays undelivered, so the existing projection path must still either
+	 * deliver it or journal an explicit `transcript_delivery_gap`. Absorbing growth
+	 * must never imply the new entries were delivered.
+	 */
+	absorbAutonomousTranscriptGrowth(
+		durable: ExternalSessionIdentity,
+		observed: ExternalSessionIdentity,
+		entries: readonly unknown[],
+	): void {
+		if (!durable.transcript || !observed.transcript) {
+			throw new GatewayStateError("transcript_proof_invalid", "Autonomous growth absorption requires a durable and observed transcript fingerprint.");
+		}
+		if (!sameExternalSession(durable, observed)) {
+			throw new GatewayStateError("main_identity_mismatch", "Autonomous growth absorption cannot change the adopted external session.");
+		}
+		if (!attestsExternalTranscriptGrowth(durable, entries)) {
+			throw new GatewayStateError("main_identity_mismatch", "The observed transcript is not an append-only extension of the persisted prefix.");
+		}
+		const observedFingerprint = fingerprintTranscriptEntries(entries);
+		if (
+			observedFingerprint.entryCount !== observed.transcript.entryCount ||
+			observedFingerprint.sha256 !== observed.transcript.sha256
+		) {
+			throw new GatewayStateError("transcript_proof_mismatch", "The observed transcript entries do not match the observed fingerprint.");
+		}
+		if (observed.transcript.entryCount === durable.transcript.entryCount) return;
+		this.transact({
+			expected: [
+				{ key: "bootstrap_state", value: "COMMITTED" },
+				{ key: "main_identity", value: identityJson(durable) },
+				{ key: "growth_intent", value: "null" },
+				{ key: "transcript_proof", value: "proven" },
+			],
+			puts: [{ key: "main_identity", value: identityJson(observed) }],
+			deletes: [],
+			eventKind: "main_identity_growth_absorbed",
+			eventPayloadJson: stableMetadataJson({
+				reason: "autonomous_append_only_growth",
+				prior_entry_count: durable.transcript.entryCount,
+				observed_entry_count: observed.transcript.entryCount,
+				absorbed_entries: observed.transcript.entryCount - durable.transcript.entryCount,
+			}),
+		});
+	}
 
 	/** Atomically journals a transcript projection, its delivery replay point, and any detected delivery gap. */
 	appendTranscriptProjection(

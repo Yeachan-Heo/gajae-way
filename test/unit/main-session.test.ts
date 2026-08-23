@@ -458,11 +458,49 @@ test.serial("strict resume fails closed when the profile selects a different ext
 	}
 });
 
-test.serial("strict resume fails closed when an external transcript grew without a durable growth intent", async () => {
+test.serial("strict resume absorbs attested autonomous append-only transcript growth without a growth intent", async () => {
+	const fixture = new FakeBrokerFixture();
+	fixtures.push(fixture);
+	const { meta, state, profile } = await bootstrapFixture(fixture);
+	const before = state.read();
+	const priorEntryCount = before.mainIdentity?.transcript?.entryCount ?? 0;
+	// The adopted persona is a live agent: it keeps working while the daemon is
+	// down, so its transcript legitimately grows with no growth intent open.
+	fixture.appendTranscript({ type: "message", role: "user", content: "autonomous growth while the daemon was down" });
+	fixture.appendTranscript({ type: "message", role: "assistant", content: "autonomous reply while the daemon was down" });
+	const resumed = supervisor(fixture);
+	try {
+		const result = await strictResumeMainSession({ profile, state, supervisor: resumed });
+		expect(result.verificationState).toBe("verified");
+		const after = state.read();
+		expect(after.bootstrapState).toBe("COMMITTED");
+		expect(after.failedClosedReason).toBeUndefined();
+		// The durable identity re-bound to the observed transcript...
+		expect(after.mainIdentity?.transcript?.entryCount).toBe(priorEntryCount + 2);
+		// ...and the absorption is visible in the journal with its entry accounting.
+		const absorbed = meta.events.filter(event => event.kind === "main_identity_growth_absorbed");
+		expect(absorbed).toHaveLength(1);
+		expect(JSON.parse(absorbed[0]?.payloadJson ?? "{}")).toEqual({
+			reason: "autonomous_append_only_growth",
+			prior_entry_count: priorEntryCount,
+			observed_entry_count: priorEntryCount + 2,
+			absorbed_entries: 2,
+		});
+		// Absorbing growth must NOT imply the new entries were delivered: delivery
+		// progress stays where it was so the suffix is still projected or gapped.
+		expect(after.transcriptDeliveryProgress).toEqual(before.transcriptDeliveryProgress);
+	} finally {
+		await resumed.dispose();
+	}
+});
+
+test.serial("strict resume still fails closed when the external transcript prefix is rewritten rather than extended", async () => {
 	const fixture = new FakeBrokerFixture();
 	fixtures.push(fixture);
 	const { state, profile } = await bootstrapFixture(fixture);
-	fixture.appendTranscript({ type: "message", role: "user", content: "out-of-band transcript growth" });
+	// Not append-only: the persisted prefix no longer reproduces, so this is a
+	// rewritten/truncated history and absence of attestation is never permission.
+	fixture.rotateTranscriptPast(`${fixture.sessionId}:transcript:1`);
 	const resumed = supervisor(fixture);
 	try {
 		await expect(strictResumeMainSession({ profile, state, supervisor: resumed })).rejects.toMatchObject({

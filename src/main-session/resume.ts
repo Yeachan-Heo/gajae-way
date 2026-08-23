@@ -2,6 +2,7 @@ import type { WayProfile } from "../profile";
 import {
 	attestsExternalTranscriptGrowth,
 	fingerprintTranscriptEntries,
+	GatewayStateError,
 	GatewayStateStore,
 	sameExternalFingerprint,
 	sameExternalSession,
@@ -143,7 +144,25 @@ export async function strictResumeMainSession(options: ResumeOptions): Promise<R
 		}
 		recoveredGrowthIntent = true;
 	} else if (verificationState === "verified" && !sameExternalFingerprint(durableIdentity, current)) {
-		return failClosed(options.state, "main_identity_mismatch", "The persisted external session identity no longer matches broker evidence.");
+		// The adopted persona is a live agent: it can legitimately keep working
+		// while the daemon is down, so its transcript grows with no growth intent
+		// open. Absorb that growth only when it is an attested append-only
+		// extension of the persisted prefix on the same session and locator; a
+		// rewritten, reordered, truncated, or replaced history still fails closed.
+		// Absence of attestation is never permission.
+		if (!sameExternalSession(durableIdentity, current)) {
+			return failClosed(options.state, "main_identity_mismatch", "The persisted external session identity no longer matches broker evidence.");
+		}
+		if (!attestsExternalTranscriptGrowth(durableIdentity, verified.transcriptEntries.map(entry => entry.payload))) {
+			return failClosed(options.state, "main_identity_mismatch", "The broker transcript diverged from the persisted prefix outside append-only growth.");
+		}
+		try {
+			options.state.absorbAutonomousTranscriptGrowth(durableIdentity, current, verified.transcriptEntries.map(entry => entry.payload));
+		} catch (error) {
+			const reason = error instanceof GatewayStateError ? error.reason : "main_identity_growth_absorb_failed";
+			return failClosed(options.state, reason, error instanceof Error ? error.message : String(error), error);
+		}
+		durableIdentity = current;
 	}
 	try {
 		options.state.setTunablesRevision(options.profile.tunablesRevision);
