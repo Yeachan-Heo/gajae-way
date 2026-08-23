@@ -163,9 +163,10 @@ durable delivery progress or represented by an explicit delivery-gap event,
 never silently as a delivered assistant reply.
 
 The local console is the first acceptance surface, not a replacement for chat
-adapter validation. The configured live Discord route remains the final chat
-adapter gate, and a future Telegram adapter is subject to the same final-gate
-route drill after local-console acceptance succeeds.
+adapter validation. The configured live Discord route table, including its
+per-channel engagement policy, remains the final chat adapter gate, and a future
+Telegram adapter is subject to the same final-gate route drill after local-console
+acceptance succeeds.
 
 ### Main-session journal lifecycle payloads
 

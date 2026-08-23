@@ -1,4 +1,5 @@
-import type { DiscordMessage, DiscordMessageHandler, DiscordPlatform } from "../../src/adapter/discord/platform";
+import type { DiscordCurrentUser, DiscordMessage, DiscordMessageHandler, DiscordMessageReference, DiscordPlatform } from "../../src/adapter/discord/platform";
+
 
 interface DiscordFixtureTimer {
 	readonly at: number;
@@ -105,8 +106,12 @@ export interface DiscordFixtureMessage {
 	readonly text: string;
 	readonly authorId?: string;
 	readonly authorBot?: boolean;
+	readonly mentionedUserIds?: readonly string[];
+	readonly messageReference?: DiscordMessageReference;
+	readonly referencedMessageAuthorId?: string;
 	readonly acceptedAt?: number;
 }
+
 
 export interface DiscordFixtureSend {
 	readonly channelId: string;
@@ -131,8 +136,10 @@ export interface DiscordFixtureReaction {
 
 export interface DiscordFixtureOptions {
 	readonly now?: () => number;
+	readonly botUserId?: string;
 	readonly sendId?: (input: { channelId: string; text: string; nonce: string; ordinal: number }) => string;
 }
+
 
 /**
  * In-process DiscordPlatform for deterministic adapter protocol drills. A
@@ -147,18 +154,24 @@ export class DiscordFixture implements DiscordPlatform {
 	readonly acknowledgementAttempts: DiscordFixtureAcknowledgement[] = [];
 	readonly reactions: DiscordFixtureReaction[] = [];
 	readonly threadParentLookups: string[] = [];
+	readonly messageAuthorLookups: Array<{ readonly channelId: string; readonly messageId: string }> = [];
+
 
 	connectCount = 0;
 	disconnectCount = 0;
 
 	readonly #handlers = new Set<DiscordMessageHandler>();
 	readonly #now: () => number;
+	readonly #botUserId: string;
+
 	#sendId: (input: { channelId: string; text: string; nonce: string; ordinal: number }) => string;
 	readonly #nonceIds = new Map<string, string>();
 	readonly #queuedSendIds: string[] = [];
 	readonly #queuedMessages: DiscordMessage[] = [];
 	readonly #queuedTypingErrors: Error[] = [];
 	readonly #threadParents = new Map<string, string>();
+	readonly #messageAuthors = new Map<string, string>();
+
 
 	#deferredTypingCount = 0;
 	#deferredSendCount = 0;
@@ -171,8 +184,10 @@ export class DiscordFixture implements DiscordPlatform {
 
 	constructor(options: DiscordFixtureOptions = {}) {
 		this.#now = options.now ?? Date.now;
+		this.#botUserId = options.botUserId ?? "999999999999999999";
 		this.#sendId = options.sendId ?? (input => `discord-send-${input.ordinal}`);
 	}
+
 
 	get pendingTypingCount(): number {
 		return this.#pendingTyping.length;
@@ -238,6 +253,15 @@ export class DiscordFixture implements DiscordPlatform {
 		this.#threadParents.set(threadChannelId, parentChannelId);
 	}
 
+	/** Configures the author returned by a cached reply-target lookup. */
+	setReferencedMessageAuthor(channelId: string, messageId: string, authorId: string): void {
+		if (!/^\d+$/.test(channelId) || !/^\d+$/.test(messageId) || !/^\d+$/.test(authorId)) {
+			throw new Error("Fixture reply channel, message, and author ids must be Discord snowflakes.");
+		}
+		this.#messageAuthors.set(`${channelId}:${messageId}`, authorId);
+	}
+
+
 	failNextTyping(error = new Error("fixture typing acknowledgement failed")): void {
 		this.#queuedTypingErrors.push(error);
 	}
@@ -286,11 +310,15 @@ export class DiscordFixture implements DiscordPlatform {
 			text: input.text,
 			...(input.authorId ? { authorId: input.authorId } : {}),
 			...(input.authorBot !== undefined ? { authorBot: input.authorBot } : {}),
+			...(input.mentionedUserIds === undefined ? {} : { mentionedUserIds: input.mentionedUserIds }),
+			...(input.messageReference === undefined ? {} : { messageReference: input.messageReference }),
+			...(input.referencedMessageAuthorId === undefined ? {} : { referencedMessageAuthorId: input.referencedMessageAuthorId }),
 			acceptedAt: input.acceptedAt ?? this.#now(),
 		};
 		this.messages.push(input);
 		return message;
 	}
+
 
 	private async dispatch(message: DiscordMessage): Promise<void> {
 		for (const handler of [...this.#handlers]) await handler(message);
@@ -319,6 +347,11 @@ export class DiscordFixture implements DiscordPlatform {
 		return id;
 	}
 
+	async getCurrentUser(): Promise<DiscordCurrentUser> {
+		return { id: this.#botUserId };
+	}
+
+
 
 	async ackTyping(channelId: string): Promise<void> {
 		if (!this.#connected) throw new Error("Discord fixture gateway is disconnected.");
@@ -345,6 +378,14 @@ export class DiscordFixture implements DiscordPlatform {
 		if (!this.#connected) throw new Error("Discord fixture gateway is disconnected.");
 		this.threadParentLookups.push(channelId);
 		return this.#threadParents.get(channelId);
+	}
+
+	async resolveMessageAuthor(channelId: string, messageId: string): Promise<string | undefined> {
+		if (!this.#connected) throw new Error("Discord fixture gateway is disconnected.");
+		this.messageAuthorLookups.push({ channelId, messageId });
+		const key = `${channelId}:${messageId}`;
+		if (!this.#messageAuthors.has(key)) throw new Error(`Fixture referenced message ${key} is unavailable.`);
+		return this.#messageAuthors.get(key);
 	}
 
 

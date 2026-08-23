@@ -193,7 +193,12 @@ route drill; neither chat adapter is accepted solely from local RPC fixtures.
 Enable Discord **Direct Messages**, **Guild Messages**, and **Message Content**
 intents. A thread under a configured guild-channel route is resolved through a
 cached read-only `GET /channels/{thread_id}` parent lookup; any unresolved or
-unrouted channel remains unsubmitted. With the adapter unit running (so its
+unrouted channel remains unsubmitted. Guild-channel routes default to
+`engagement = "mention"`: only a direct bot user mention or a reply to the bot
+is admitted. Use `engagement = "always"` only for intentionally open channels;
+DMs and routed threads are always engaged. `blocked_author_ids` drops listed
+users on every route, including DMs, before admission. Drops are silent on Discord
+and rate-limited in adapter diagnostics. With the adapter unit running (so its
 systemd credential directory exists), verify the configured credential and live
 gateway without sending a bot message:
 

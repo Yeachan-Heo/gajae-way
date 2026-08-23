@@ -1,5 +1,6 @@
 import { expect, test } from "bun:test";
-import { DiscordGatewayPlatform } from "../../src/adapter/discord/platform";
+import { DiscordGatewayPlatform, type DiscordMessage } from "../../src/adapter/discord/platform";
+
 
 class GatewaySocketFixture {
 	readonly readyState = 1;
@@ -47,6 +48,11 @@ test("hand-rolled Discord platform identifies, heartbeats, resumes, routes MESSA
 			const method = init?.method ?? "GET";
 			requests.push({ url, method, ...(typeof init?.body === "string" ? { body: init.body } : {}) });
 			if (url.endsWith("/gateway/bot")) return new Response(JSON.stringify({ url: "wss://gateway.test" }), { status: 200 });
+			if (url.endsWith("/users/@me")) return new Response(JSON.stringify({ id: "999999999999999999", username: "fixture-bot" }), { status: 200 });
+			if (url.endsWith("/channels/123456789012345678/messages/888888888888888888") && method === "GET") {
+				return new Response(JSON.stringify({ id: "888888888888888888", author: { id: "999999999999999999" } }), { status: 200 });
+			}
+
 			if (url.includes("/messages") && method === "POST") return new Response(JSON.stringify({ id: "platform-message-1" }), { status: 200 });
 			if (url.endsWith("/channels/222222222222222222") && method === "GET") {
 				return new Response(JSON.stringify({ id: "222222222222222222", type: 11, parent_id: "123456789012345678" }), { status: 200 });
@@ -62,10 +68,11 @@ test("hand-rolled Discord platform identifies, heartbeats, resumes, routes MESSA
 		reconnectBaseMs: 1,
 		reconnectMaxMs: 2,
 	});
-	const messages: Array<{ id: string; text: string }> = [];
+	const messages: DiscordMessage[] = [];
 	platform.onMessage(message => {
-		messages.push({ id: message.id, text: message.text });
+		messages.push(message);
 	});
+
 	try {
 		const connecting = platform.connect();
 		await waitFor(() => sockets.length === 1);
@@ -87,17 +94,40 @@ test("hand-rolled Discord platform identifies, heartbeats, resumes, routes MESSA
 					op: 0,
 					s: 8,
 					t: "MESSAGE_CREATE",
-					d: { id: "incoming-1", channel_id: "123456789012345678", content: "owner message", author: { id: "owner", bot: false } },
+					d: {
+						id: "incoming-1",
+						channel_id: "123456789012345678",
+						content: "<@999999999999999999> owner message",
+						author: { id: "111111111111111111", bot: false },
+						mentions: [{ id: "999999999999999999" }],
+						message_reference: { message_id: "888888888888888888" },
+						referenced_message: { author: { id: "999999999999999999" } },
+					},
+
 				}),
 			},
 		);
 		await waitFor(() => messages.length === 1);
-		expect(messages).toEqual([{ id: "incoming-1", text: "owner message" }]);
+		expect(messages).toEqual([
+			expect.objectContaining({
+				id: "incoming-1",
+				text: "<@999999999999999999> owner message",
+				mentionedUserIds: ["999999999999999999"],
+				messageReference: { channelId: "123456789012345678", messageId: "888888888888888888" },
+				referencedMessageAuthorId: "999999999999999999",
+			}),
+		]);
+
 		expect(await platform.send("123456789012345678", "reply", "nonce-1")).toBe("platform-message-1");
 		await platform.ackTyping("123456789012345678");
 		await platform.react("123456789012345678", "incoming-1", "👀");
 		expect(await platform.resolveThreadParent("222222222222222222")).toBe("123456789012345678");
 		expect(await platform.resolveThreadParent("222222222222222222")).toBe("123456789012345678");
+		expect(await platform.getCurrentUser()).toEqual({ id: "999999999999999999", username: "fixture-bot" });
+		expect(await platform.getCurrentUser()).toEqual({ id: "999999999999999999", username: "fixture-bot" });
+		expect(await platform.resolveMessageAuthor("123456789012345678", "888888888888888888")).toBe("999999999999999999");
+		expect(await platform.resolveMessageAuthor("123456789012345678", "888888888888888888")).toBe("999999999999999999");
+
 
 		expect(requests).toEqual(
 			expect.arrayContaining([
@@ -105,10 +135,15 @@ test("hand-rolled Discord platform identifies, heartbeats, resumes, routes MESSA
 				expect.objectContaining({ method: "POST", body: JSON.stringify({ content: "reply", nonce: "nonce-1", enforce_nonce: true }) }),
 				expect.objectContaining({ url: "https://discord.com/api/v10/channels/123456789012345678/typing", method: "POST" }),
 				expect.objectContaining({ url: "https://discord.com/api/v10/channels/222222222222222222", method: "GET" }),
+				expect.objectContaining({ url: "https://discord.com/api/v10/users/@me", method: "GET" }),
+				expect.objectContaining({ url: "https://discord.com/api/v10/channels/123456789012345678/messages/888888888888888888", method: "GET" }),
+
 
 			]),
 		);
 		expect(requests.filter(request => request.url.endsWith("/channels/222222222222222222") && request.method === "GET")).toHaveLength(1);
+		expect(requests.filter(request => request.url.endsWith("/users/@me") && request.method === "GET")).toHaveLength(1);
+		expect(requests.filter(request => request.url.endsWith("/channels/123456789012345678/messages/888888888888888888") && request.method === "GET")).toHaveLength(1);
 
 		first.close(1_006, "network");
 		await waitFor(() => sockets.length === 2);

@@ -77,6 +77,8 @@ export async function startDiscordAdapter(
 				...(config.gatewayUrl ? { gatewayUrl: config.gatewayUrl } : {}),
 			});
 		const activePlatform = platform;
+		const botUser = await activePlatform.getCurrentUser();
+
 		const activeController = new AbortController();
 		controller = activeController;
 		const activeTypingKeepalive = new DiscordTypingKeepalive({
@@ -88,6 +90,9 @@ export async function startDiscordAdapter(
 		typingKeepalive = activeTypingKeepalive;
 		const router = new DiscordRouteHandler({
 			routes: config.routes,
+			botUserId: botUser.id,
+			blockedAuthorIds: config.blockedAuthorIds,
+			onDiagnostic,
 
 			rpc,
 			platform: activePlatform,

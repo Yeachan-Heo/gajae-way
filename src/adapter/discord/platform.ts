@@ -1,3 +1,8 @@
+export interface DiscordMessageReference {
+	readonly channelId: string;
+	readonly messageId: string;
+}
+
 export interface DiscordMessage {
 	/** Discord's immutable MESSAGE_CREATE snowflake. */
 	readonly id: string;
@@ -5,9 +10,16 @@ export interface DiscordMessage {
 	readonly text: string;
 	readonly authorId?: string;
 	readonly authorBot?: boolean;
+	/** User ids from Discord's `mentions` array; roles/everyone are excluded. */
+	readonly mentionedUserIds?: readonly string[];
+	/** The MESSAGE_CREATE reference, when the inbound message is a reply. */
+	readonly messageReference?: DiscordMessageReference;
+	/** Available only when Discord included `referenced_message` in the dispatch. */
+	readonly referencedMessageAuthorId?: string;
 	/** Milliseconds when this adapter accepted the gateway dispatch. */
 	readonly acceptedAt: number;
 }
+
 
 export type DiscordMessageHandler = (message: DiscordMessage) => void | Promise<void>;
 
@@ -20,12 +32,14 @@ export interface DiscordPlatform {
 	connect(): Promise<void>;
 	disconnect(): Promise<void>;
 	onMessage(callback: DiscordMessageHandler): () => void;
+	getCurrentUser(): Promise<DiscordCurrentUser>;
 	send(channelId: string, text: string, nonce: string): Promise<string>;
 	ackTyping(channelId: string): Promise<void>;
 	resolveThreadParent(channelId: string): Promise<string | undefined>;
-
+	resolveMessageAuthor(channelId: string, messageId: string): Promise<string | undefined>;
 	react(channelId: string, messageId: string, emoji: string): Promise<void>;
 }
+
 
 export class DiscordPlatformError extends Error {
 	constructor(message: string) {
@@ -116,6 +130,9 @@ export class DiscordGatewayPlatform implements DiscordPlatform {
 	readonly #reconnectMaxMs: number;
 	readonly #handlers = new Set<DiscordMessageHandler>();
 	readonly #threadParentCache = new Map<string, Promise<string | undefined>>();
+	#currentUser: Promise<DiscordCurrentUser> | undefined;
+	readonly #messageAuthorCache = new Map<string, Promise<string | undefined>>();
+
 
 	#socket: GatewaySocket | undefined;
 	#sessionId: string | undefined;
@@ -174,6 +191,21 @@ export class DiscordGatewayPlatform implements DiscordPlatform {
 		return () => this.#handlers.delete(callback);
 	}
 
+	/** Returns the bot identity through the same verified GET /users/@me path as --check. */
+	async getCurrentUser(): Promise<DiscordCurrentUser> {
+		const existing = this.#currentUser;
+		if (existing) return await existing;
+		const lookup = validateDiscordToken(this.#token, this.#fetch, this.#apiBaseUrl);
+		this.#currentUser = lookup;
+		try {
+			return await lookup;
+		} catch (error) {
+			if (this.#currentUser === lookup) this.#currentUser = undefined;
+			throw error;
+		}
+	}
+
+
 	async send(channelId: string, text: string, nonce: string): Promise<string> {
 		validateChannelId(channelId);
 		if (!text.trim()) throw new DiscordPlatformError("Discord message text must not be empty.");
@@ -213,6 +245,24 @@ export class DiscordGatewayPlatform implements DiscordPlatform {
 		}
 	}
 
+	/** Resolves a reply target's author through cached read-only Discord REST. */
+	async resolveMessageAuthor(channelId: string, messageId: string): Promise<string | undefined> {
+		validateChannelId(channelId);
+		validateMessageId(messageId);
+		const key = `${channelId}:${messageId}`;
+		const existing = this.#messageAuthorCache.get(key);
+		if (existing) return await existing;
+		const lookup = this.readMessageAuthor(channelId, messageId);
+		this.#messageAuthorCache.set(key, lookup);
+		try {
+			return await lookup;
+		} catch (error) {
+			if (this.#messageAuthorCache.get(key) === lookup) this.#messageAuthorCache.delete(key);
+			throw error;
+		}
+	}
+
+
 
 	async react(channelId: string, messageId: string, emoji: string): Promise<void> {
 		validateChannelId(channelId);
@@ -231,6 +281,13 @@ export class DiscordGatewayPlatform implements DiscordPlatform {
 		}
 		return channel.parent_id;
 	}
+
+	private async readMessageAuthor(channelId: string, messageId: string): Promise<string | undefined> {
+		const message = await this.rest("GET", `/channels/${encodeURIComponent(channelId)}/messages/${encodeURIComponent(messageId)}`);
+		const author = isRecord(message) && isRecord(message.author) ? message.author : undefined;
+		return typeof author?.id === "string" && author.id ? author.id : undefined;
+	}
+
 
 	private async rest(method: string, resource: string, body?: Record<string, unknown>): Promise<unknown> {
 		const response = await this.#fetch(`${this.#apiBaseUrl}${resource}`, {
@@ -438,15 +495,34 @@ function discordMessageFromDispatch(data: Record<string, unknown>, acceptedAt: n
 	if (typeof data.id !== "string" || !data.id || typeof data.channel_id !== "string" || !data.channel_id) return undefined;
 	if (typeof data.content !== "string") return undefined;
 	const author = isRecord(data.author) ? data.author : undefined;
+	const mentions = Array.isArray(data.mentions)
+		? data.mentions
+			.map(mention => (isRecord(mention) && typeof mention.id === "string" && mention.id ? mention.id : undefined))
+			.filter((id): id is string => id !== undefined)
+		: [];
+	const messageReference = discordMessageReference(data.message_reference, data.channel_id);
+	const referencedMessage = isRecord(data.referenced_message) ? data.referenced_message : undefined;
+	const referencedAuthor = referencedMessage && isRecord(referencedMessage.author) ? referencedMessage.author : undefined;
 	return {
 		id: data.id,
 		channelId: data.channel_id,
 		text: data.content,
 		...(typeof author?.id === "string" ? { authorId: author.id } : {}),
 		...(typeof author?.bot === "boolean" ? { authorBot: author.bot } : {}),
+		...(mentions.length > 0 ? { mentionedUserIds: mentions } : {}),
+		...(messageReference === undefined ? {} : { messageReference }),
+		...(typeof referencedAuthor?.id === "string" && referencedAuthor.id ? { referencedMessageAuthorId: referencedAuthor.id } : {}),
 		acceptedAt,
 	};
 }
+
+function discordMessageReference(value: unknown, fallbackChannelId: string): DiscordMessageReference | undefined {
+	if (!isRecord(value) || !isDiscordSnowflake(value.message_id)) return undefined;
+	const channelId = isDiscordSnowflake(value.channel_id) ? value.channel_id : fallbackChannelId;
+	if (!isDiscordSnowflake(channelId)) return undefined;
+	return { channelId, messageId: value.message_id };
+}
+
 
 function requiredToken(token: string): string {
 	const normalized = token.trim();
@@ -459,6 +535,14 @@ function validateChannelId(channelId: string): void {
 	if (!channelId || !/^\d+$/.test(channelId)) {
 		throw new DiscordPlatformError("Discord channel id must be a non-empty snowflake.");
 	}
+}
+
+function validateMessageId(messageId: string): void {
+	if (!isDiscordSnowflake(messageId)) throw new DiscordPlatformError("Discord message id must be a non-empty snowflake.");
+}
+
+function isDiscordSnowflake(value: unknown): value is string {
+	return typeof value === "string" && /^\d+$/.test(value);
 }
 
 function normalizeBaseUrl(baseUrl: string): string {

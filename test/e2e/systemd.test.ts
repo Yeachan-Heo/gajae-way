@@ -244,6 +244,8 @@ class SupervisedService {
 					rpcSocketPath: path.join(this.#options.stateDirectory, "rpc.sock"),
 					token: "fixture-token",
 					routes: [{ channelId: "123456789012345678", surfaceId: "discord:owner-dm", kind: "dm" }],
+					blockedAuthorIds: [],
+
 					unattributedDelivery: "owner-dm",
 					unattributedRoute: { channelId: "123456789012345678", surfaceId: "discord:owner-dm", kind: "dm" },
 
@@ -394,6 +396,8 @@ test("example profile covers the identity projection, mutable tunables, and Disc
 	});
 	expect(adapter).toMatchObject({
 		routes: [{ channelId: "123456789012345678", surfaceId: "discord:owner-dm", kind: "dm" }],
+		blockedAuthorIds: [],
+
 		unattributedDelivery: "owner-dm",
 		unattributedRoute: { channelId: "123456789012345678", surfaceId: "discord:owner-dm", kind: "dm" },
 		ackBudgetMs: 2000,
@@ -514,6 +518,7 @@ test("Type=notify topology keeps Discord ingress disconnected until a fenced bus
 				rpcSocketPath: socketPath,
 				token: "fixture-token",
 				routes: [{ channelId: inbound.channelId, surfaceId: "discord:owner-dm", kind: "dm" }],
+				blockedAuthorIds: [],
 				unattributedDelivery: "owner-dm",
 				unattributedRoute: { channelId: inbound.channelId, surfaceId: "discord:owner-dm", kind: "dm" },
 				ackBudgetMs: 2_000,

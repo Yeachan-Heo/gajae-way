@@ -52,10 +52,15 @@ engagement_enabled = false
 # precedence. This env-name fallback is convenient for local development only.
 token_env = "GAJAEWAY_DISCORD_BOT_TOKEN"
 # Legacy one-entry route fields remain supported. Guild routes use repeated
-# [[adapter.discord.routes]] entries; thread MESSAGE_CREATE events are resolved
-# through cached read-only GET /channels/{thread_id} parent lookups.
+# [[adapter.discord.routes]] entries; channel routes default to
+# engagement = "mention" and may explicitly use engagement = "always". DMs
+# and routed threads are always engaged. Thread MESSAGE_CREATE events are
+# resolved through cached read-only GET /channels/{thread_id} parent lookups.
+
 channel_id = "123456789012345678"
 surface_id = "discord:owner-dm"
+# Empty by default. Listed Discord author ids are silently dropped before admission.
+blocked_author_ids = []
 ack_budget_ms = 2000
 claim_ttl_ms = 5000
 read_wait_ms = 1000

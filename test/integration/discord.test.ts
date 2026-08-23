@@ -54,11 +54,14 @@ async function gateway(
 }
 
 
+const BOT_USER_ID = "999999999999999999";
 const OWNER_ROUTE = { channelId: "123456789012345678", surfaceId: "discord:owner-dm", kind: "dm" } as const;
 const TYPING_CHANNEL_ID = OWNER_ROUTE.channelId;
 const TYPING_ROUTE = OWNER_ROUTE;
-const GUILD_A_ROUTE = { channelId: "222222222222222222", surfaceId: "discord:guild-a", kind: "channel" } as const;
-const GUILD_B_ROUTE = { channelId: "333333333333333333", surfaceId: "discord:guild-b", kind: "channel" } as const;
+const GUILD_A_ROUTE = { channelId: "222222222222222222", surfaceId: "discord:guild-a", kind: "channel", engagement: "always" } as const;
+const GUILD_B_ROUTE = { channelId: "333333333333333333", surfaceId: "discord:guild-b", kind: "channel", engagement: "always" } as const;
+const MENTION_ROUTE = { channelId: "444444444444444444", surfaceId: "discord:guild-mention", kind: "channel" } as const;
+
 
 async function startRoutedFixtureAdapter(
 	fixture: DiscordFixture,
@@ -66,6 +69,8 @@ async function startRoutedFixtureAdapter(
 	routes: readonly DiscordRoute[],
 	options: {
 		readonly unattributedDelivery?: "owner-dm" | "suppress";
+		readonly blockedAuthorIds?: readonly string[];
+
 		readonly unattributedRoute?: DiscordRoute;
 		readonly onError?: (error: Error) => void;
 		readonly onDiagnostic?: (message: string) => void;
@@ -78,7 +83,9 @@ async function startRoutedFixtureAdapter(
 		rpcSocketPath: "/tmp/gajaeway-discord-routes-fixture.sock",
 		token: "fixture-token",
 		routes,
+		blockedAuthorIds: options.blockedAuthorIds ?? [],
 		unattributedDelivery,
+
 		...(options.unattributedRoute === undefined ? {} : { unattributedRoute: options.unattributedRoute }),
 		ackBudgetMs: 2_000,
 		claimTtlMs: 5_000,
@@ -162,6 +169,8 @@ async function startTypingFixtureAdapter(
 			token: "fixture-token",
 			routes: [TYPING_ROUTE],
 			unattributedDelivery: "owner-dm",
+			blockedAuthorIds: [],
+
 			unattributedRoute: TYPING_ROUTE,
 			ackBudgetMs: 2_000,
 			claimTtlMs: 5_000,
@@ -226,6 +235,8 @@ ${adapter}`;
 			profile(`[adapter.discord]
 token_env = "GAJAEWAY_DISCORD_BOT_TOKEN"
 unattributed_delivery = "suppress"
+blocked_author_ids = ["777777777777777777"]
+
 
 [[adapter.discord.routes]]
 channel_id = "123456789012345678"
@@ -242,10 +253,51 @@ surface_id = "discord:guild-a"
 			environment: { GAJAEWAY_DISCORD_BOT_TOKEN: "fixture-token" },
 		});
 		expect(tableConfig).toMatchObject({
-			routes: [OWNER_ROUTE, GUILD_A_ROUTE],
+			routes: [OWNER_ROUTE, { channelId: GUILD_A_ROUTE.channelId, surfaceId: GUILD_A_ROUTE.surfaceId, kind: "channel", engagement: "mention" }],
+			blockedAuthorIds: ["777777777777777777"],
 			unattributedDelivery: "suppress",
 		});
 		expect(tableConfig.unattributedRoute).toBeUndefined();
+
+
+		fs.writeFileSync(
+			profilePath,
+			profile(`[adapter.discord]
+token_env = "GAJAEWAY_DISCORD_BOT_TOKEN"
+
+[[adapter.discord.routes]]
+channel_id = "123456789012345678"
+surface_id = "discord:owner-dm"
+kind = "dm"
+
+[[adapter.discord.routes]]
+channel_id = "222222222222222222"
+surface_id = "discord:guild-a"
+engagement = "always"
+`),
+		);
+		const alwaysConfig = loadDiscordAdapterConfig({
+			profile: loadWayProfile(profilePath),
+			environment: { GAJAEWAY_DISCORD_BOT_TOKEN: "fixture-token" },
+		});
+		expect(alwaysConfig.routes).toEqual([OWNER_ROUTE, GUILD_A_ROUTE]);
+
+		fs.writeFileSync(
+			profilePath,
+			profile(`[adapter.discord]
+token_env = "GAJAEWAY_DISCORD_BOT_TOKEN"
+channel_id = "123456789012345678"
+surface_id = "discord:owner-dm"
+engagement = "mention"
+`),
+		);
+		expect(() =>
+			loadDiscordAdapterConfig({
+				profile: loadWayProfile(profilePath),
+				environment: { GAJAEWAY_DISCORD_BOT_TOKEN: "fixture-token" },
+			}),
+		).toThrow("not configurable for Discord dm routes");
+
 
 		fs.writeFileSync(
 			profilePath,
@@ -261,11 +313,239 @@ surface_id = "discord:owner-dm"
 		});
 		expect(legacyConfig).toMatchObject({
 			routes: [OWNER_ROUTE],
+			blockedAuthorIds: [],
 			unattributedDelivery: "owner-dm",
 			unattributedRoute: OWNER_ROUTE,
 		});
 	} finally {
 		fs.rmSync(root, { recursive: true, force: true });
+	}
+});
+
+externalTest("Discord mention-mode channels engage direct bot mentions and strip only a leading mention", async () => {
+	const gatewayUnderTest = await gateway([{ id: MENTION_ROUTE.surfaceId, platform: "discord", kind: "channel" }]);
+	const fixture = new DiscordFixture({ botUserId: BOT_USER_ID });
+	const adapter = await startRoutedFixtureAdapter(fixture, gatewayUnderTest.client, [OWNER_ROUTE, MENTION_ROUTE], {
+		unattributedRoute: OWNER_ROUTE,
+	});
+	try {
+		await fixture.emitMessage({
+			id: "mention-content",
+			channelId: MENTION_ROUTE.channelId,
+			text: `<@${BOT_USER_ID}> clean mention prompt`,
+			authorId: "111111111111111111",
+		});
+		await fixture.emitMessage({
+			id: "mention-array",
+			channelId: MENTION_ROUTE.channelId,
+			text: "metadata direct mention prompt",
+			authorId: "111111111111111111",
+			mentionedUserIds: [BOT_USER_ID],
+		});
+		await eventually(
+			() => (gatewayUnderTest.fixture.commands().length === 2 ? true : undefined),
+			"direct bot mentions were not admitted",
+		);
+		expect(gatewayUnderTest.fixture.commands().map(command => command.text)).toEqual(["clean mention prompt", "metadata direct mention prompt"]);
+		expect(fixture.acknowledgements.map(acknowledgement => acknowledgement.channelId)).toEqual([
+			MENTION_ROUTE.channelId,
+			MENTION_ROUTE.channelId,
+		]);
+	} finally {
+		await adapter.stop();
+	}
+});
+
+externalTest("Discord mention-mode channels ignore role and everyone mentions", async () => {
+	const gatewayUnderTest = await gateway([{ id: MENTION_ROUTE.surfaceId, platform: "discord", kind: "channel" }]);
+	const fixture = new DiscordFixture({ botUserId: BOT_USER_ID });
+	const diagnostics: string[] = [];
+	const adapter = await startRoutedFixtureAdapter(fixture, gatewayUnderTest.client, [OWNER_ROUTE, MENTION_ROUTE], {
+		unattributedRoute: OWNER_ROUTE,
+		onDiagnostic: message => diagnostics.push(message),
+	});
+	try {
+		await fixture.emitMessage({
+			id: "role-mention",
+			channelId: MENTION_ROUTE.channelId,
+			text: `<@&${BOT_USER_ID}> role mention must not engage`,
+			authorId: "111111111111111111",
+		});
+		await fixture.emitMessage({
+			id: "here-mention",
+			channelId: MENTION_ROUTE.channelId,
+			text: "@here here mention must not engage",
+			authorId: "111111111111111111",
+		});
+		await fixture.emitMessage({
+			id: "everyone-mention",
+			channelId: MENTION_ROUTE.channelId,
+			text: "@everyone everyone mention must not engage",
+			authorId: "111111111111111111",
+		});
+		expect(gatewayUnderTest.fixture.commands()).toEqual([]);
+		expect(fixture.acknowledgements).toEqual([]);
+		expect(diagnostics).toEqual([expect.stringContaining("unengaged mention-mode")]);
+	} finally {
+		await adapter.stop();
+	}
+});
+
+externalTest("Discord mention-mode channels engage replies to the bot but not other users", async () => {
+	const gatewayUnderTest = await gateway([{ id: MENTION_ROUTE.surfaceId, platform: "discord", kind: "channel" }]);
+	const fixture = new DiscordFixture({ botUserId: BOT_USER_ID });
+	const diagnostics: string[] = [];
+
+	const adapter = await startRoutedFixtureAdapter(fixture, gatewayUnderTest.client, [OWNER_ROUTE, MENTION_ROUTE], {
+		unattributedRoute: OWNER_ROUTE,
+		onDiagnostic: message => diagnostics.push(message),
+
+	});
+	try {
+		fixture.setReferencedMessageAuthor(MENTION_ROUTE.channelId, "555555555555555555", BOT_USER_ID);
+
+		await fixture.emitMessage({
+			id: "reply-to-bot",
+			channelId: MENTION_ROUTE.channelId,
+			text: "reply to bot prompt",
+			authorId: "111111111111111111",
+			messageReference: { channelId: MENTION_ROUTE.channelId, messageId: "555555555555555555" },
+
+		});
+		await fixture.emitMessage({
+			id: "reply-to-other",
+			channelId: MENTION_ROUTE.channelId,
+			text: "reply to other must not engage",
+			authorId: "111111111111111111",
+			messageReference: { channelId: MENTION_ROUTE.channelId, messageId: "666666666666666666" },
+			referencedMessageAuthorId: "222222222222222222",
+		});
+		await eventually(
+			() => (gatewayUnderTest.fixture.commands().length === 1 ? true : undefined),
+			"reply to the bot was not admitted",
+		);
+		expect(gatewayUnderTest.fixture.commands().map(command => command.text)).toEqual(["reply to bot prompt"]);
+		expect(fixture.messageAuthorLookups).toEqual([{ channelId: MENTION_ROUTE.channelId, messageId: "555555555555555555" }]);
+		expect(fixture.acknowledgements.map(acknowledgement => acknowledgement.channelId)).toEqual([MENTION_ROUTE.channelId]);
+		expect(diagnostics).toEqual([expect.stringContaining("unengaged mention-mode")]);
+	} finally {
+		await adapter.stop();
+	}
+});
+
+externalTest("Discord mention-mode channels fail closed when a reply reference cannot resolve", async () => {
+	const gatewayUnderTest = await gateway([{ id: MENTION_ROUTE.surfaceId, platform: "discord", kind: "channel" }]);
+	const fixture = new DiscordFixture({ botUserId: BOT_USER_ID });
+	const diagnostics: string[] = [];
+	const adapter = await startRoutedFixtureAdapter(fixture, gatewayUnderTest.client, [OWNER_ROUTE, MENTION_ROUTE], {
+		unattributedRoute: OWNER_ROUTE,
+		onDiagnostic: message => diagnostics.push(message),
+	});
+	try {
+		await fixture.emitMessage({
+			id: "reply-reference-missing",
+			channelId: MENTION_ROUTE.channelId,
+			text: "unresolvable reply must not engage",
+			authorId: "111111111111111111",
+			messageReference: { channelId: MENTION_ROUTE.channelId, messageId: "777777777777777778" },
+		});
+		expect(gatewayUnderTest.fixture.commands()).toEqual([]);
+		expect(fixture.acknowledgements).toEqual([]);
+		expect(fixture.messageAuthorLookups).toEqual([{ channelId: MENTION_ROUTE.channelId, messageId: "777777777777777778" }]);
+		expect(diagnostics).toEqual([expect.stringContaining("unresolved reply reference")]);
+	} finally {
+		await adapter.stop();
+	}
+});
+
+externalTest("Discord always-on channel overrides, routed threads, and DMs bypass mention gating", async () => {
+	const gatewayUnderTest = await gateway([
+		{ id: GUILD_A_ROUTE.surfaceId, platform: "discord", kind: "channel" },
+		{ id: MENTION_ROUTE.surfaceId, platform: "discord", kind: "channel" },
+	]);
+	const fixture = new DiscordFixture({ botUserId: BOT_USER_ID });
+	const adapter = await startRoutedFixtureAdapter(fixture, gatewayUnderTest.client, [OWNER_ROUTE, GUILD_A_ROUTE, MENTION_ROUTE], {
+		unattributedRoute: OWNER_ROUTE,
+	});
+	const threadChannelId = "888888888888888888";
+	try {
+		fixture.setThreadParent(threadChannelId, MENTION_ROUTE.channelId);
+		await fixture.emitMessage({ id: "always-channel", channelId: GUILD_A_ROUTE.channelId, text: "always-on channel prompt", authorId: "111111111111111111" });
+		await fixture.emitMessage({ id: "always-thread", channelId: threadChannelId, text: "thread prompt without a mention", authorId: "111111111111111111" });
+		await fixture.emitMessage({ id: "always-dm", channelId: OWNER_ROUTE.channelId, text: "dm prompt without a mention", authorId: "111111111111111111" });
+		await eventually(
+			() => (gatewayUnderTest.fixture.commands().length === 3 ? true : undefined),
+			"always-on channel, thread, or DM ingress was not admitted",
+		);
+		expect(gatewayUnderTest.fixture.commands().map(command => command.text)).toEqual([
+			"always-on channel prompt",
+			"thread prompt without a mention",
+			"dm prompt without a mention",
+		]);
+		expect(fixture.acknowledgements.map(acknowledgement => acknowledgement.channelId)).toEqual([
+			GUILD_A_ROUTE.channelId,
+			threadChannelId,
+			OWNER_ROUTE.channelId,
+		]);
+	} finally {
+		await adapter.stop();
+	}
+});
+
+externalTest("Discord blocks configured authors on DM and channel routes before admission", async () => {
+	const gatewayUnderTest = await gateway([{ id: GUILD_A_ROUTE.surfaceId, platform: "discord", kind: "channel" }]);
+	const fixture = new DiscordFixture({ botUserId: BOT_USER_ID });
+	const diagnostics: string[] = [];
+	const blockedAuthorId = "777777777777777777";
+	const adapter = await startRoutedFixtureAdapter(fixture, gatewayUnderTest.client, [OWNER_ROUTE, GUILD_A_ROUTE], {
+		unattributedRoute: OWNER_ROUTE,
+		blockedAuthorIds: [blockedAuthorId],
+		onDiagnostic: message => diagnostics.push(message),
+	});
+	try {
+		await fixture.emitMessage({ id: "blocked-dm", channelId: OWNER_ROUTE.channelId, text: "blocked dm", authorId: blockedAuthorId });
+		await fixture.emitMessage({ id: "blocked-channel", channelId: GUILD_A_ROUTE.channelId, text: "blocked channel", authorId: blockedAuthorId });
+		expect(gatewayUnderTest.fixture.commands()).toEqual([]);
+		expect(fixture.acknowledgements).toEqual([]);
+		expect(diagnostics).toEqual([expect.stringContaining("blacklisted-author")]);
+	} finally {
+		await adapter.stop();
+	}
+});
+
+externalTest("Discord ingress drop diagnostics are bounded and rate-limited", async () => {
+	const gatewayUnderTest = await gateway([{ id: MENTION_ROUTE.surfaceId, platform: "discord", kind: "channel" }]);
+	const fixture = new DiscordFixture({ botUserId: BOT_USER_ID });
+	const diagnostics: string[] = [];
+	let now = 1_000;
+	await fixture.connect();
+	const route = new DiscordRouteHandler({
+		rpc: gatewayUnderTest.client,
+		platform: fixture,
+		routes: [MENTION_ROUTE],
+		botUserId: BOT_USER_ID,
+		onDiagnostic: message => diagnostics.push(message),
+		diagnosticNow: () => now,
+	});
+	const unsubscribe = fixture.onMessage(async message => {
+		await route.handle(message);
+	});
+	try {
+		for (const id of ["drop-rate-1", "drop-rate-2", "drop-rate-3"]) {
+			await fixture.emitMessage({ id, channelId: MENTION_ROUTE.channelId, text: "ordinary mention-mode chatter", authorId: "111111111111111111" });
+		}
+		expect(gatewayUnderTest.fixture.commands()).toEqual([]);
+		expect(fixture.acknowledgements).toEqual([]);
+		expect(diagnostics).toEqual([expect.stringContaining("unengaged mention-mode")]);
+		now += 30_000;
+		await fixture.emitMessage({ id: "drop-rate-after-window", channelId: MENTION_ROUTE.channelId, text: "ordinary chatter after window", authorId: "111111111111111111" });
+		expect(diagnostics).toEqual([
+			expect.stringContaining("unengaged mention-mode"),
+			expect.stringContaining("unengaged mention-mode"),
+		]);
+	} finally {
+		unsubscribe();
+		await fixture.disconnect();
 	}
 });
 
@@ -279,6 +559,8 @@ externalTest("Discord one-entry route table deduplicates a message id before ext
 			rpc: gatewayUnderTest.client,
 			platform: fixture,
 			routes: [OWNER_ROUTE],
+			botUserId: BOT_USER_ID,
+
 
 		});
 		const unsubscribe = fixture.onMessage(async message => {
@@ -369,14 +651,19 @@ externalTest("Discord route table resolves a thread first seen mid-session and r
 externalTest("Discord route table never submits an unrouted channel", async () => {
 	const gatewayUnderTest = await gateway([{ id: GUILD_A_ROUTE.surfaceId, platform: "discord", kind: "channel" }]);
 	const fixture = new DiscordFixture();
+	const diagnostics: string[] = [];
+
 	const adapter = await startRoutedFixtureAdapter(fixture, gatewayUnderTest.client, [OWNER_ROUTE, GUILD_A_ROUTE], {
 		unattributedRoute: OWNER_ROUTE,
+		onDiagnostic: message => diagnostics.push(message),
+
 	});
 	try {
 		await fixture.emitMessage({ id: "unrouted-channel", channelId: "555555555555555555", text: "must remain outside the route table" });
 		expect(gatewayUnderTest.fixture.commands()).toEqual([]);
 		expect(fixture.acknowledgements).toEqual([]);
 		expect(fixture.threadParentLookups).toEqual(["555555555555555555"]);
+		expect(diagnostics).toEqual([expect.stringContaining("unrouted message")]);
 	} finally {
 		await adapter.stop();
 	}
@@ -580,6 +867,8 @@ externalTest("Discord typing starts after delayed durable main.submit acceptance
 			rpc: delayedRpc,
 			platform: fixture,
 			routes: [OWNER_ROUTE],
+			botUserId: BOT_USER_ID,
+
 
 			acknowledgement: { now: clock.now, budgetMs: 2_000 },
 			onAcknowledged: () => ordering.push("typing acknowledged"),
@@ -982,6 +1271,8 @@ externalTest("Discord typing follows accepted admission, not a stale healthy-to-
 			rpc: gatewayUnderTest.client,
 			platform: fixture,
 			routes: [OWNER_ROUTE],
+			botUserId: BOT_USER_ID,
+
 
 		});
 		gatewayUnderTest.fixture.holdNextTurn();
@@ -1028,6 +1319,7 @@ externalTest("Discord startup reports rate-limited verifying and transport readi
 		token: "fixture-token",
 		routes: [OWNER_ROUTE],
 		unattributedDelivery: "owner-dm" as const,
+		blockedAuthorIds: [],
 		unattributedRoute: OWNER_ROUTE,
 
 		ackBudgetMs: 2_000,
@@ -1154,7 +1446,10 @@ externalTest("Discord non-owner engagement is admitted as follow_up whether the 
 		const guestRoute = new DiscordRouteHandler({
 			rpc: gatewayUnderTest.client,
 			platform: fixture,
-			routes: [{ channelId: "222222222222222222", surfaceId: "discord:guest-channel", kind: "channel" }],
+			routes: [{ channelId: "222222222222222222", surfaceId: "discord:guest-channel", kind: "channel", engagement: "always" }],
+
+			botUserId: BOT_USER_ID,
+
 
 		});
 		await guestRoute.handle({ id: "guest-idle", channelId: "222222222222222222", text: "idle guest message", acceptedAt: Date.now() });
@@ -1164,6 +1459,7 @@ externalTest("Discord non-owner engagement is admitted as follow_up whether the 
 			rpc: gatewayUnderTest.client,
 			platform: fixture,
 			routes: [OWNER_ROUTE],
+			botUserId: BOT_USER_ID,
 		});
 		await ownerRoute.handle({ id: "owner-held", channelId: "123456789012345678", text: "held owner message", acceptedAt: Date.now() });
 		await eventually(() => (gatewayUnderTest.host.turnState === "busy" ? true : undefined), "owner turn was not admitted as busy");
