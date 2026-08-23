@@ -578,6 +578,14 @@ class ExternalMainSessionHost implements MainSessionHost {
 		return surfaceId;
 	}
 
+	private shouldDeferTranscriptAttribution(event: Record<string, unknown>, surfaceId: string | undefined): boolean {
+		// A transcript entry can arrive in a tail before the ring's terminal event.
+		// While an admitted operation is still unresolved, withholding a response-ID
+		// bearing entry preserves ordering and avoids permanently routing it as
+		// unattributed. Exact terminal correlation is still required before release.
+		return surfaceId === undefined && this.#admittedOperations.size > 0 && messageIds(event).length > 0;
+	}
+
 	private admittedOperationRef(event: Record<string, unknown>): string | undefined {
 		for (const candidate of this.eventAttemptIds(event)) {
 			for (const [opRef, admission] of this.#admittedOperations) {
@@ -962,6 +970,8 @@ class ExternalMainSessionHost implements MainSessionHost {
 			const event = isRecord(entry.payload) ? entry.payload : undefined;
 			const finalized = event ? finalizedAssistantMessage(event, `transcript:${entry.id}`) : undefined;
 			const safelyNonDeliverable = event ? isSafelyNonDeliverableTranscriptEntry(event) : false;
+			const surfaceId = event ? this.surfaceIdForTranscriptEntry(event) : undefined;
+			if (event && this.shouldDeferTranscriptAttribution(event, surfaceId)) return;
 			const delivered = finalized && event
 				? this.appendFinalAssistantMessage(event, `transcript:${entry.id}`, expectedDelivery, nextDelivery)
 				: safelyNonDeliverable
@@ -976,7 +986,7 @@ class ExternalMainSessionHost implements MainSessionHost {
 								available_from_entry_id: entries[0]?.id,
 								available_through_entry_id: entries.at(-1)?.id,
 							},
-							event === undefined ? undefined : this.surfaceIdForTranscriptEntry(event),
+							surfaceId,
 						);
 			if (!delivered || this.#failure || (!finalized && !safelyNonDeliverable)) return;
 		}

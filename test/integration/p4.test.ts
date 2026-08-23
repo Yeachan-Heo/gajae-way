@@ -1023,6 +1023,73 @@ externalTest("main.events.read surface-attributes an owner admission lifecycle a
 	expect(rows[2]?.payload).toEqual({ attempt_id: `${gateway.fixture.sessionId}:${opRef}`, generation: 1, lineage: "main", surface_id: "owner" });
 }, 20_000);
 
+externalTest("main.events.read defers a finalized transcript emitted before its terminal event until exact surface correlation is proven", async () => {
+	const gateway = await hosted();
+	gateway.fixture.holdNextTurn();
+	const accepted = await gateway.client.request("main.submit", {
+		text: "real-order transcript arrives before terminal event",
+		surface_id: "owner",
+		idempotency_key: "real-order-transcript-before-terminal",
+	});
+	const opRef = (accepted.result as { op_ref: string }).op_ref;
+	const responseId = "real-order-response-id";
+	gateway.fixture.appendTranscript({
+		type: "message",
+		role: "assistant",
+		content: "real-order reply",
+		responseId,
+	});
+	await Bun.sleep(250);
+	expect(
+		gateway.core
+			.journalRead("1:0", 100)
+			.events.filter(event => event.kind === "assistant_message" && event.payloadJson.includes("real-order reply")),
+	).toEqual([]);
+	gateway.fixture.appendTailEvent("turn_end", {
+		type: "turn_end",
+		message: { role: "assistant", content: [{ type: "text", text: "real-order reply" }], responseId },
+		scope: { attemptId: `${gateway.fixture.sessionId}:${opRef}`, generation: 1, lineage: "main" },
+	});
+	const assistant = await eventually(
+		() =>
+			gateway.core
+				.journalRead("1:0", 100)
+				.events.find(event => event.kind === "assistant_message" && event.payloadJson.includes("real-order reply")),
+		"deferred real-order assistant reply did not project after exact terminal correlation",
+	);
+	expect(JSON.parse(assistant.payloadJson)).toMatchObject({ finalized: true, text: "real-order reply", surface_id: "owner" });
+});
+
+externalTest("main.events.read defers an attributable transcript delivery gap emitted before its terminal event", async () => {
+	const gateway = await hosted();
+	gateway.fixture.holdNextTurn();
+	const accepted = await gateway.client.request("main.submit", {
+		text: "real-order opaque transcript arrives before terminal event",
+		surface_id: "owner",
+		idempotency_key: "real-order-gap-before-terminal",
+	});
+	const opRef = (accepted.result as { op_ref: string }).op_ref;
+	const responseId = "real-order-gap-response-id";
+	gateway.fixture.appendTranscript({
+		type: "message",
+		role: "assistant",
+		content: [{ type: "opaque_output", value: "real-order opaque output" }],
+		responseId,
+	});
+	await Bun.sleep(250);
+	expect(gateway.core.journalRead("1:0", 100).events.filter(event => event.kind === "transcript_delivery_gap")).toEqual([]);
+	gateway.fixture.appendTailEvent("turn_end", {
+		type: "turn_end",
+		message: { role: "assistant", content: [{ type: "opaque_output", value: "real-order opaque output" }], responseId },
+		scope: { attemptId: `${gateway.fixture.sessionId}:${opRef}`, generation: 1, lineage: "main" },
+	});
+	const gap = await eventually(
+		() => gateway.core.journalRead("1:0", 100).events.find(event => event.kind === "transcript_delivery_gap"),
+		"deferred real-order transcript gap did not project after exact terminal correlation",
+	);
+	expect(JSON.parse(gap.payloadJson)).toMatchObject({ reason: "transcript_delivery_unprovable", surface_id: "owner" });
+});
+
 externalTest("two configured admission surfaces retain distinct attribution across separate turns", async () => {
 	const gateway = await hosted();
 	const ownerRequest = { text: "owner-origin turn", surface_id: "owner", idempotency_key: "owner-origin-attribution" };
