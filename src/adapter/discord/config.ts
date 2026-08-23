@@ -85,6 +85,15 @@ export function loadDiscordAdapterConfig(options: LoadDiscordAdapterConfigOption
 	};
 }
 
+/** Loads a shared keyed channel map; callers may enable Telegram alongside Discord. */
+export function loadEnabledTelegramConfig(options: LoadDiscordAdapterConfigOptions = {}): Record<string, CanonicalValue> | undefined {
+	const profile = options.profile ?? loadWayProfile(options.profilePath ?? defaultConfig(options.environment ?? process.env).profilePath);
+	const adapter = optionalRecord(profile.tunables.adapter, "adapter");
+	const adapters = optionalRecord(profile.tunables.adapters, "adapters");
+	const selected = adapter?.telegram ?? adapters?.telegram;
+	return optionalRecord(selected, "adapter.telegram");
+}
+
 function configuredRoutes(
 	adapter: Record<string, CanonicalValue>,
 	environment: NodeJS.ProcessEnv,

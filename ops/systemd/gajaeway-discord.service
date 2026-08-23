@@ -1,9 +1,7 @@
-# The adapter has no durable local state: the gajaeway daemon owns checkpoints
-# and the journal. It waits for UDS way.health healthy/running before opening
-# Discord ingress, and sends typing only after main.submit accepts, so any
-# verification, recovery, or failed-closed fence leaves inbound messages
-# unacknowledged rather than consuming them without delivery. The credential
-# source must be root-owned and mode 0600.
+# The multi-platform adapter has no durable journal checkpoint locally, but Telegram
+# persists its update offset and per-chunk send ledger under the adapter state dir.
+# Discord remains the compatibility service/entrypoint; enabled Telegram channels
+# run concurrently from the keyed adapter configuration.
 [Unit]
 Description=Gajaeway Discord adapter
 
@@ -32,6 +30,8 @@ Environment=GAJAEWAY_PROFILE=/etc/gajaeway/profile.toml
 LoadCredential=discord-token:/etc/gajaeway/credentials/discord-token
 Environment=GAJAEWAY_DISCORD_TOKEN_FILE=%d/discord-token
 ExecStart=/usr/local/bin/gajaeway-discord --state-dir /var/lib/gajaeway --profile /etc/gajaeway/profile.toml
+LoadCredential=telegram-token:/etc/gajaeway/credentials/telegram-token
+Environment=GAJAEWAY_TELEGRAM_TOKEN_FILE=%d/telegram-token
 Restart=on-failure
 RestartSec=5s
 TimeoutStopSec=30s

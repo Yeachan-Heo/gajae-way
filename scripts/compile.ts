@@ -2,7 +2,7 @@ import * as fs from "node:fs/promises";
 import * as path from "node:path";
 
 type Executable = {
-	name: "gajaeway" | "gajaeway-discord";
+	name: "gajaeway" | "gajaeway-discord" | "gajaeway-telegram";
 	entrypoint: string;
 };
 
@@ -19,7 +19,7 @@ const bunTargets: Record<string, string> = {
 };
 const executables: readonly Executable[] = [
 	{ name: "gajaeway", entrypoint: "src/main.ts" },
-	{ name: "gajaeway-discord", entrypoint: "src/adapter/discord/main.ts" },
+	{ name: "gajaeway-discord", entrypoint: "src/adapter/main.ts" },
 ];
 
 if (!bunTargets[platformTag]) {

@@ -200,6 +200,20 @@ all chunks settle. A reply to an accepted inbound message uses Discord
 `message_reference` when possible and falls back to a plain post if the trigger
 has been deleted.
 
+### Multi-platform chat adapter
+
+The release unit remains two executables: `gajaeway` and the single
+`gajaeway-discord` adapter binary. The latter is now a multi-platform runtime:
+Discord remains the compatibility entrypoint, while enabled Telegram channels
+run concurrently from the keyed adapter channel map. `gajaeway-telegram` is a
+package alias to the same adapter artifact, not a third executable.
+
+Telegram uses durable long-poll update state under the adapter state directory:
+`telegram-offset.json` stores the next update offset and a per-chunk send ledger.
+The offset advances only after ingress handlers finish; send records keyed by
+`dedupe_key:chunk:index` prevent duplicate Telegram posts across retries and
+restarts because Telegram has no `enforce_nonce` equivalent.
+
 Use the runbooks below for the complete operational procedure and incident
 handling. Do not bootstrap a second state directory or start a second adapter
 for the same configured route.

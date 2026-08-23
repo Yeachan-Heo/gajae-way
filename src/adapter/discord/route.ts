@@ -1,5 +1,6 @@
 import { acknowledgeDiscordMessage, type DiscordAcknowledgement, type DiscordAcknowledgementOptions } from "./ack";
 import type { DiscordMessage, DiscordPlatform } from "./platform";
+import type { AdapterPlatformName } from "./platform";
 import { rpcResult, type JsonRpcClient } from "../../rpc-client";
 
 export type DiscordRouteKind = "channel" | "dm";

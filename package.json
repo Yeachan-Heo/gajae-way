@@ -13,7 +13,8 @@
   },
   "bin": {
     "gajaeway": "./dist/gajaeway",
-    "gajaeway-discord": "./dist/gajaeway-discord"
+    "gajaeway-discord": "./dist/gajaeway-discord",
+    "gajaeway-telegram": "./dist/gajaeway-discord"
   },
   "devDependencies": {
     "@biomejs/biome": "2.5.2",

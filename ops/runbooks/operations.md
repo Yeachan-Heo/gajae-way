@@ -291,6 +291,17 @@ than two seconds after Discord delivery. Then observe one reply. Restart the
 adapter after the reply and verify no ordinary repost occurs; a crash between
 send and settlement can produce at most the documented, nonce-deduplicated retry.
 Never start a second adapter for the same route.
+
+Telegram channels run in the same `gajaeway-discord` adapter release unit when
+`[adapter.telegram].enabled = true`; `gajaeway-telegram` is only an alias to that
+binary. Telegram `getMe` is checked with `--check`, and credentials come from a
+root-owned token file or process-start credential environment. Long-polling
+updates are persisted in `telegram-offset.json`; the offset advances only after
+successful handler completion, so restart neither skips nor reprocesses updates.
+Telegram outbound sends use durable `dedupe_key:chunk:index` records in that same
+state file before commit, preventing duplicate posts despite Telegram lacking
+Discord's enforce_nonce. Typing uses `sendChatAction` and follows the existing
+acceptance-before-acknowledgement keepalive ordering.
 ## Known limitation: journal latency on continuously busy sessions
 
 The credential-free broker CLI returns tail envelopes only when a terminal turn

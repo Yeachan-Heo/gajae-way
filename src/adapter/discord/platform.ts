@@ -109,13 +109,25 @@ const DIRECT_MESSAGES_INTENT = 1 << 12;
 const MESSAGE_CONTENT_INTENT = 1 << 15;
 
 export const DISCORD_MAX_MESSAGE_LENGTH = 2_000;
+export const TELEGRAM_MAX_MESSAGE_LENGTH = 4_096;
 export const DISCORD_MAX_CHUNKS_PER_MESSAGE = 32;
 export const DISCORD_TRUNCATION_MARKER = "\n… [Discord message truncated: chunk limit reached]";
 
-export interface DiscordMessageChunks {
+export type AdapterPlatformName = "discord" | "telegram";
+export type PlatformFormattingKind = "discord" | "telegram";
+
+export interface PlatformCurrentUser {
+	readonly id: string;
+	readonly username?: string;
+}
+
+export interface PlatformMessageChunks {
 	readonly chunks: readonly string[];
 	readonly truncated: boolean;
 }
+
+
+export type DiscordMessageChunks = PlatformMessageChunks;
 
 /**
  * Splits outbound text at paragraph, line, sentence, and finally hard boundaries.

@@ -68,3 +68,14 @@ blocked_author_ids = []
 ack_budget_ms = 2000
 claim_ttl_ms = 5000
 read_wait_ms = 1000
+
+[adapter.telegram]
+enabled = false
+token_env = "GAJAEWAY_TELEGRAM_BOT_TOKEN"
+allowBots = true
+# The adapter persists telegram-offset.json under the Telegram state directory.
+# Each route uses a Telegram chat_id and a profile-known telegram surface.
+# [[adapter.telegram.routes]]
+# chat_id = "-1001234567890"
+# surface_id = "telegram:owner-dm"
+# groupPolicy = "mention"
