@@ -1324,6 +1324,13 @@ class ExternalMainSessionHost implements MainSessionHost {
 	private observeIdentity(identity: ExternalSessionIdentity, entries: readonly SupervisorTranscriptEntry[]): void {
 		if (sameExternalFingerprint(this.#identity, identity)) return;
 		const payloads = entries.map((entry) => entry.payload);
+		// NOTE: a snapshot shorter than the identity we hold is NOT safely skippable.
+		// Skipping it was tried and reverted: a genuinely truncated or rewritten
+		// history also presents as a shorter snapshot, so ignoring short snapshots
+		// silently disabled truncation detection. Entry counts alone cannot separate
+		// "narrow view" from "history lost", so both still fail closed and the
+		// diagnostics below record the counts for whoever investigates.
+		const knownEntryCount = this.#identity.transcript?.entryCount;
 		if (!this.#growthWindow) {
 			// The adopted session is a live agent: the owner drives it directly and it
 			// works autonomously, so its transcript routinely changes with no
@@ -1339,7 +1346,9 @@ class ExternalMainSessionHost implements MainSessionHost {
 				markFailedClosed(this.#state, "main_identity_mismatch");
 				throw this.enterFailure(
 					"main_identity_mismatch",
-					new Error("External transcript changed outside append-only growth."),
+					new Error(
+						`External transcript changed outside append-only growth (known ${knownEntryCount ?? 0} entries, observed ${payloads.length}).`,
+					),
 				);
 			}
 			try {
@@ -1354,7 +1363,9 @@ class ExternalMainSessionHost implements MainSessionHost {
 			markFailedClosed(this.#state, "growth_intent_mismatch");
 			throw this.enterFailure(
 				"growth_intent_mismatch",
-				new Error("External transcript changed outside append-only growth."),
+				new Error(
+					`External transcript changed outside append-only growth during a growth window (known ${knownEntryCount ?? 0} entries, observed ${payloads.length}).`,
+				),
 			);
 		}
 		this.#identity = identity;
