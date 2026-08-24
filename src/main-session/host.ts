@@ -1164,11 +1164,28 @@ class ExternalMainSessionHost implements MainSessionHost {
 
 	private observeIdentity(identity: ExternalSessionIdentity, entries: readonly SupervisorTranscriptEntry[]): void {
 		if (sameExternalFingerprint(this.#identity, identity)) return;
+		const payloads = entries.map(entry => entry.payload);
 		if (!this.#growthWindow) {
-			markFailedClosed(this.#state, "main_identity_mismatch");
-			throw this.enterFailure("main_identity_mismatch", new Error("External transcript changed outside a growth window."));
+			// The adopted session is a live agent: the owner drives it directly and it
+			// works autonomously, so its transcript routinely changes with no
+			// gateway-initiated turn and therefore no growth window. Apply the same
+			// rule strict resume applies - absorb attested append-only growth on the
+			// same session, fail closed on anything else. Delivery progress is left
+			// untouched, so a reply that arrived in this divergence is still projected
+			// or journaled as a gap rather than silently baselined.
+			if (!sameExternalSession(this.#identity, identity) || !attestsExternalTranscriptGrowth(this.#identity, payloads)) {
+				markFailedClosed(this.#state, "main_identity_mismatch");
+				throw this.enterFailure("main_identity_mismatch", new Error("External transcript changed outside append-only growth."));
+			}
+			try {
+				this.#state.absorbAutonomousTranscriptGrowth(this.#identity, identity, payloads);
+			} catch (error) {
+				throw this.enterFailure("main_identity_growth_absorb_failed", error);
+			}
+			this.#identity = identity;
+			return;
 		}
-		if (!attestsExternalTranscriptGrowth(this.#identity, entries.map(entry => entry.payload))) {
+		if (!attestsExternalTranscriptGrowth(this.#identity, payloads)) {
 			markFailedClosed(this.#state, "growth_intent_mismatch");
 			throw this.enterFailure("growth_intent_mismatch", new Error("External transcript changed outside append-only growth."));
 		}

@@ -1469,3 +1469,67 @@ test("recovery of a write-failure reason is refused when the durable store still
 		await recovering.dispose();
 	}
 });
+
+test.serial("the running host absorbs attested transcript growth that happens outside a growth window", async () => {
+	const fixture = new FakeBrokerFixture();
+	fixtures.push(fixture);
+	const { meta, state, profile } = await bootstrapFixture(fixture);
+	const resumedSupervisor = supervisor(fixture);
+	const resumed = await strictResumeMainSession({ profile, state, supervisor: resumedSupervisor });
+	const journal: Array<{ kind: string; payloadJson: string }> = [];
+	const host = createMainSessionHost({
+		supervisor: resumedSupervisor,
+		identity: resumed.identity,
+		state,
+		journal: recordingDurableJournal(state, journal),
+		initialTurnState: resumed.turnState,
+		initialFollowUpQueueDepth: resumed.followUpQueueDepth,
+		initialVerificationState: resumed.verificationState,
+	});
+	try {
+		await eventually(() => state.read().tailCheckpoint !== undefined, "host did not establish its initial checkpoint");
+		const deliveryBefore = state.read().transcriptDeliveryProgress;
+		// The owner drives the adopted session directly, so its transcript grows with
+		// NO gateway admission and therefore no growth window. This previously
+		// fail-closed the whole gateway on the next tail poll.
+		fixture.appendTranscript({ type: "message", role: "user", content: "owner typed straight into the session" });
+		await eventually(
+			() => meta.events.some(event => event.kind === "main_identity_growth_absorbed"),
+			"unwindowed growth was not absorbed",
+			15_000,
+		);
+		expect(state.read()).toMatchObject({ bootstrapState: "COMMITTED", failedClosedReason: undefined });
+		expect(host.degraded).toBe(false);
+		// Absorption must not imply delivery of the new entry.
+		expect(state.read().transcriptDeliveryProgress).not.toEqual(undefined);
+		expect(deliveryBefore).not.toEqual(undefined);
+	} finally {
+		await host.dispose();
+	}
+}, 30_000);
+
+test.serial("the running host still fails closed when an unwindowed transcript change is not append-only", async () => {
+	const fixture = new FakeBrokerFixture();
+	fixtures.push(fixture);
+	const { state, profile } = await bootstrapFixture(fixture);
+	const resumedSupervisor = supervisor(fixture);
+	const resumed = await strictResumeMainSession({ profile, state, supervisor: resumedSupervisor });
+	const host = createMainSessionHost({
+		supervisor: resumedSupervisor,
+		identity: resumed.identity,
+		state,
+		journal: durableTestJournal(state),
+		initialTurnState: resumed.turnState,
+		initialFollowUpQueueDepth: resumed.followUpQueueDepth,
+		initialVerificationState: resumed.verificationState,
+	});
+	try {
+		await eventually(() => state.read().tailCheckpoint !== undefined, "host did not establish its initial checkpoint");
+		// Rewritten history, not growth: absence of attestation is never permission.
+		fixture.rotateTranscriptPast(`${fixture.sessionId}:transcript:1`);
+		await expect(host.waitForFatalFailure()).resolves.toMatchObject({ reason: "main_identity_mismatch" });
+		expect(state.read()).toMatchObject({ bootstrapState: "FAILED_CLOSED", failedClosedReason: "main_identity_mismatch" });
+	} finally {
+		await host.dispose();
+	}
+}, 30_000);
