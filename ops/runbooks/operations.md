@@ -364,7 +364,7 @@ Recoverable reasons, each gated on its own live re-verification:
 | Reason | Re-verification required |
 |---|---|
 | `main_identity_mismatch` | The broker transcript must be an attested append-only extension of the persisted prefix. The identity re-bind lands in the same transaction that clears the marker. |
-| `session_unavailable`, `turn_state_unavailable`, `tail_resync_unavailable` | A fresh broker verification must now succeed for the same session and locator. |
+| `session_unavailable`, `turn_state_unavailable`, `tail_resync_unavailable`, `broker_unavailable`, `tail_unavailable` | A fresh broker verification must now succeed for the same session and locator. |
 | `transcript_proof_persist_failed`, `tail_ring_rotation_write_failed`, `transcript_delivery_progress_write_failed` | Durable metadata must read back coherent, and the clearing transaction itself must succeed — a store still refusing writes fails recovery without clearing anything. |
 
 Terminal reasons that recovery deliberately refuses:

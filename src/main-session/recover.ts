@@ -32,6 +32,9 @@ const RECOVERABLE_REASONS = {
 	/** Transient broker/transport unavailability; recoverable by a fresh verify. */
 	session_unavailable: "live_verify",
 	broker_unavailable: "live_verify",
+	// Transport-classed like the others: the tail being unreadable says nothing
+	// about identity integrity, so a live verification is sufficient proof.
+	tail_unavailable: "live_verify",
 	turn_state_unavailable: "live_verify",
 	tail_resync_unavailable: "live_verify",
 	/** Durable metadata write failures; recoverable when state reads back coherent. */
