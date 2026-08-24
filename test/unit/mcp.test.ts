@@ -193,3 +193,30 @@ test("way_say survives a journal that has rotated past the retention floor", asy
 	expect(replayed).toEqual(first);
 	expect(core.events).toHaveLength(eventsBefore);
 });
+
+test("way_say can target a derived thread surface that admission also accepts", async () => {
+	const core = new MemoryCore();
+	// The persona could be spoken TO in a thread but not answer proactively in one,
+	// because way_say used an exact-match lookup while main.submit resolved derived
+	// thread surfaces. Both now go through the shared routing SSOT.
+	const tools = new GatewayToolController({
+		core,
+		profile: {
+			ownerSurfaces: [{ id: "owner", platform: "test", kind: "dm", sessionKind: "main" }],
+			knownSurfaces: [
+				{ id: "owner", platform: "test", kind: "dm", sessionKind: "main" },
+				{ id: "guest", platform: "discord", kind: "channel", sessionKind: "conversation" },
+			],
+		},
+		host: { get turnOriginSurfaceId() { return "guest"; } },
+		now: () => core.now,
+	});
+	const threadSurface = "guest/thread:1493635653441945762";
+	const said = await tools.say({ text: "answering inside the thread", surface_id: threadSurface, idempotency_key: "thread-say" });
+	expect(said).toMatchObject({ accepted: true, origin: "persona", surface_id: threadSurface });
+	expect(JSON.parse(core.events[0]?.payloadJson ?? "{}")).toMatchObject({ finalized: true, surface_id: threadSurface });
+
+	// An unconfigured parent is still refused.
+	await expect(tools.say({ text: "no parent", surface_id: "nope/thread:1", idempotency_key: "bad-thread" }))
+		.rejects.toMatchObject({ code: 1300, message: "unknown_surface" });
+});

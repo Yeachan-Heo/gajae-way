@@ -410,6 +410,21 @@ state, and the Telegram send ledger) and skip chunks already confirmed regardles
 of how long the outage lasted. A present-but-corrupt ledger fails closed rather
 than starting empty, because starting empty is exactly what would double-post.
 
+### One source of truth for surface routing
+
+`src/surface-routing.ts` owns surface identity and derived-child (thread/topic)
+derivation: the `/thread:` format, the rule that only a configured channel surface
+may parent a child, class inheritance from the parent, and the resolver. Gateway
+admission, persona `way_say`, and the Discord ingress and egress paths all go
+through it, so they cannot disagree about what a surface is. Adapter route tables
+bind BY REFERENCE to catalog surfaces: `surface_id` must name a profile-known
+surface of the right platform and any declared `kind` must match the catalog, or
+the adapter refuses to start. Route validation additionally proves every surface
+resolves in both directions, so a surface can never be ingressable yet
+undeliverable. Telegram forum-topic parentage is persisted in the adapter's
+durable state so a reply to a topic-originated turn still lands in that topic
+after a restart.
+
 ## Known limitation: journal latency on continuously busy sessions
 
 The credential-free broker CLI returns tail envelopes only when a terminal turn

@@ -206,6 +206,36 @@ export class DiscordRouteHandler {
 	}
 }
 
+/**
+ * Proves every configured route resolves in BOTH directions.
+ *
+ * Ingress (channel id -> surface) and egress (surface -> channel id) are separate
+ * lookups over the same table, so without this invariant a surface could be
+ * ingressable but undeliverable - the adapter would accept a message and then
+ * have nowhere to send the reply. Derived thread children are covered too, since
+ * they are what ingress synthesises at runtime.
+ */
+export function assertDiscordRoutesResolveBothWays(routes: readonly DiscordRoute[]): void {
+	const byChannel = new Map(routes.map(route => [route.channelId, route]));
+	for (const route of routes) {
+		const ingress = byChannel.get(route.channelId);
+		if (!ingress || ingress.surfaceId !== route.surfaceId) {
+			throw new DiscordRouteError(`Discord route ${route.surfaceId} does not resolve on ingress from channel ${route.channelId}.`);
+		}
+		const egress = resolveDiscordEgressRoute(routes, route.surfaceId);
+		if (!egress || egress.channelId !== route.channelId) {
+			throw new DiscordRouteError(`Discord surface ${route.surfaceId} resolves on ingress but not to channel ${route.channelId} on egress.`);
+		}
+		if (route.kind !== "channel") continue;
+		// A derived thread child must also be deliverable back to its own thread.
+		const child = discordThreadSurfaceId(route.surfaceId, "1");
+		const childEgress = resolveDiscordEgressRoute(routes, child);
+		if (!childEgress || childEgress.channelId !== "1") {
+			throw new DiscordRouteError(`Discord thread surfaces under ${route.surfaceId} are not deliverable on egress.`);
+		}
+	}
+}
+
 export function validateDiscordRoutes(routes: readonly DiscordRoute[]): void {
 	if (!Array.isArray(routes) || routes.length === 0) throw new DiscordRouteError("Discord routing requires at least one route.");
 	const channelIds = new Set<string>();
@@ -217,6 +247,7 @@ export function validateDiscordRoutes(routes: readonly DiscordRoute[]): void {
 		channelIds.add(route.channelId);
 		surfaceIds.add(route.surfaceId);
 	}
+	assertDiscordRoutesResolveBothWays(routes);
 }
 
 export function discordThreadSurfaceId(parentSurfaceId: string, threadChannelId: string): string {

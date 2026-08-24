@@ -22,6 +22,8 @@ export interface TelegramPlatformOptions {
 interface TelegramUpdateState {
 	offset: number;
 	sends: Record<string, string>;
+	/** Forum-topic id -> supergroup chat id, so parentage survives restart. */
+	topics: Record<string, string>;
 }
 
 const TELEGRAM_API = "https://api.telegram.org";
@@ -52,7 +54,7 @@ export class TelegramPlatform implements DiscordPlatform {
 	readonly #diagnostic: (message: string) => void;
 	readonly #handlers = new Set<DiscordMessageHandler>();
 	#state: TelegramUpdateState;
-	readonly #topicParents = new Map<string, string>();
+
 	#running = false;
 	#pollTask: Promise<void> | undefined;
 	#currentUser: Promise<DiscordCurrentUser> | undefined;
@@ -115,7 +117,7 @@ export class TelegramPlatform implements DiscordPlatform {
 			}
 			// A reply to a topic-originated turn must land back in that topic, not the
 			// supergroup root, so a known topic id resolves to chat + thread.
-			const parentChatId = this.#topicParents.get(channelId);
+			const parentChatId = this.#state.topics[channelId];
 			const result = record(await this.call("sendMessage", {
 				chat_id: parentChatId ?? channelId,
 				...(parentChatId ? { message_thread_id: Number(channelId) } : {}),
@@ -134,7 +136,7 @@ export class TelegramPlatform implements DiscordPlatform {
 	}
 
 	async ackTyping(channelId: string): Promise<void> {
-		const parentChatId = this.#topicParents.get(channelId);
+		const parentChatId = this.#state.topics[channelId];
 		await this.call("sendChatAction", {
 			chat_id: parentChatId ?? channelId,
 			...(parentChatId ? { message_thread_id: Number(channelId) } : {}),
@@ -142,9 +144,15 @@ export class TelegramPlatform implements DiscordPlatform {
 		});
 	}
 
-	/** Maps an observed forum-topic id back to its supergroup chat id. */
+	/**
+	 * Maps an observed forum-topic id back to its supergroup chat id.
+	 *
+	 * Durable: Discord resolves parentage from the platform API on demand, so an
+	 * in-memory-only map made Telegram forget every topic on restart and silently
+	 * lose the ability to reply into it.
+	 */
 	async resolveThreadParent(channelId: string): Promise<string | undefined> {
-		return this.#topicParents.get(channelId);
+		return this.#state.topics[channelId];
 	}
 
 	/**
@@ -169,7 +177,7 @@ export class TelegramPlatform implements DiscordPlatform {
 					const update = record(updateValue);
 					const updateId = Number(update.update_id);
 					if (!Number.isSafeInteger(updateId)) continue;
-					const message = telegramMessage(update.message, this.#now(), this.#topicParents);
+					const message = telegramMessage(update.message, this.#now(), this.#state.topics);
 					if (message) for (const handler of [...this.#handlers]) await handler(message);
 					this.#state.offset = updateId + 1;
 					writeState(this.#statePath, this.#state);
@@ -231,7 +239,7 @@ function requiredToken(token: string): string {
 	return value;
 }
 
-function telegramMessage(value: unknown, acceptedAt: number, topics?: Map<string, string>): DiscordMessage | undefined {
+function telegramMessage(value: unknown, acceptedAt: number, topics?: Record<string, string>): DiscordMessage | undefined {
 	const message = record(value);
 	const chat = record(message.chat);
 	const from = record(message.from);
@@ -242,7 +250,7 @@ function telegramMessage(value: unknown, acceptedAt: number, topics?: Map<string
 	// platform remembers which chat it belongs to for parent resolution and sends.
 	const topicId = typeof message.message_thread_id === "number" ? String(message.message_thread_id) : undefined;
 	const routedChannelId = topicId ?? String(chat.id);
-	if (topicId) topics?.set(topicId, String(chat.id));
+	if (topicId && topics) topics[topicId] = String(chat.id);
 	return {
 		id: String(message.message_id),
 		channelId: routedChannelId,
@@ -279,7 +287,7 @@ function readState(filePath: string): TelegramUpdateState {
 	try {
 		raw = fs.readFileSync(filePath, "utf8");
 	} catch (error) {
-		if ((error as NodeJS.ErrnoException)?.code === "ENOENT") return { offset: 0, sends: {} };
+		if ((error as NodeJS.ErrnoException)?.code === "ENOENT") return { offset: 0, sends: {}, topics: {} };
 		throw new TelegramPlatformError(
 			`Telegram durable state at ${filePath} could not be read: ${error instanceof Error ? error.message : String(error)}`,
 		);
@@ -310,7 +318,18 @@ function readState(filePath: string): TelegramUpdateState {
 		}
 		sends[key] = entry;
 	}
-	return { offset: state.offset as number, sends };
+	const topicsValue = state.topics;
+	if (topicsValue !== undefined && (typeof topicsValue !== "object" || topicsValue === null || Array.isArray(topicsValue))) {
+		throw new TelegramPlatformError(`Telegram durable state at ${filePath} has an invalid topic map.`);
+	}
+	const topics: Record<string, string> = {};
+	for (const [key, entry] of Object.entries((topicsValue ?? {}) as Record<string, unknown>)) {
+		if (typeof entry !== "string" || !entry) {
+			throw new TelegramPlatformError(`Telegram durable state at ${filePath} has a malformed topic entry for ${key}.`);
+		}
+		topics[key] = entry;
+	}
+	return { offset: state.offset as number, sends, topics };
 }
 
 /**

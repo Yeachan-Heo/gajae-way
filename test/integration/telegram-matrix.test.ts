@@ -191,3 +191,43 @@ test("a Telegram reply carries its referenced author so reply-to-bot engagement 
 		await Bun.$`rm -rf ${dir}`.quiet();
 	}
 });
+
+
+test("Telegram forum-topic parentage survives a restart", async () => {
+	const dir = (await Bun.$`mktemp -d`.text()).trim();
+	let polled = false;
+	const fetchImpl = (async (input: string | URL | Request) => {
+		if (String(input).endsWith("/getUpdates")) {
+			if (polled) return new Response(JSON.stringify({ ok: true, result: [] }), { status: 200 });
+			polled = true;
+			return new Response(JSON.stringify({
+				ok: true,
+				result: [{
+					update_id: 9,
+					message: { message_id: 1, message_thread_id: 4242, chat: { id: -100999 }, from: { id: 7, is_bot: false }, text: "in topic" },
+				}],
+			}), { status: 200 });
+		}
+		return new Response(JSON.stringify({ ok: true, result: {} }), { status: 200 });
+	}) as never;
+	const first = new TelegramPlatform({ token: "t", stateDir: dir, fetch: fetchImpl });
+	const seen: string[] = [];
+	first.onMessage(async message => { seen.push(message.channelId); });
+	try {
+		await first.connect();
+		for (let attempt = 0; attempt < 100 && seen.length === 0; attempt += 1) await Bun.sleep(10);
+		expect(seen).toEqual(["4242"]);
+		expect(await first.resolveThreadParent("4242")).toBe("-100999");
+	} finally {
+		await first.disconnect();
+	}
+	// A fresh instance models the adapter restarting. Parentage must persist, or a
+	// reply to a topic-originated turn would land in the group root instead.
+	const restarted = new TelegramPlatform({ token: "t", stateDir: dir, fetch: fetchImpl });
+	try {
+		expect(await restarted.resolveThreadParent("4242")).toBe("-100999");
+	} finally {
+		await restarted.disconnect();
+		await Bun.$`rm -rf ${dir}`.quiet();
+	}
+});

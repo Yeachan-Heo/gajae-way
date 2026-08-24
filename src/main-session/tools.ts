@@ -2,6 +2,7 @@ import { createHash } from "node:crypto";
 import { canonicalJson } from "./gates";
 import type { MainSessionHost } from "./host";
 import type { OwnerSurface, WayProfile } from "../profile";
+import { resolveSurface } from "../surface-routing";
 
 export const MAIN_SAY_REPLAY_SCAN_EVENTS = 5_000;
 const PERSONA_SAY_RATE_SCAN_EVENTS = 2_000;
@@ -210,10 +211,17 @@ function countRecentPersonaSays(core: ToolCore, now: number): number {
 	}).length;
 }
 
+/**
+ * Resolved through the shared routing SSOT so persona output and gateway
+ * admission cannot disagree about what a surface is. An exact-match-only lookup
+ * meant `way_say` refused derived thread/topic surfaces that `main.submit`
+ * accepts, so the persona could be spoken TO in a thread but could not answer
+ * proactively in one.
+ */
 function validateSurface(profile: Pick<WayProfile, "knownSurfaces">, surfaceId: string): OwnerSurface {
-	const surface = profile.knownSurfaces.find(candidate => candidate.id === surfaceId);
-	if (!surface) throw new GatewayToolError(1300, "unknown_surface");
-	return surface;
+	const resolved = resolveSurface(surfaceId, new Map(profile.knownSurfaces.map(surface => [surface.id, surface])));
+	if (!resolved) throw new GatewayToolError(1300, "unknown_surface");
+	return resolved.surface;
 }
 
 /** Gateway-mediated tools. This class is deliberately not a generic RPC proxy. */

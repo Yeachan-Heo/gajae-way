@@ -1,6 +1,7 @@
 import { expect, test } from "bun:test";
 import type { OwnerSurface } from "../../src/profile";
 import { parseThreadSurfaceId, resolveSurface, threadSurfaceId } from "../../src/surface-routing";
+import { resolveDiscordEgressRoute, validateDiscordRoutes } from "../../src/adapter/discord/route";
 
 function catalog(...surfaces: OwnerSurface[]): ReadonlyMap<string, OwnerSurface> {
 	return new Map(surfaces.map(surface => [surface.id, surface]));
@@ -49,4 +50,22 @@ test("only a configured channel surface can parent a derived child", () => {
 	expect(resolveSurface("discord:not-configured/thread:12", surfaces)).toBeUndefined();
 	// An exact configured surface always wins and is never marked derived.
 	expect(resolveSurface(discordChannel.id, surfaces)).toMatchObject({ surface: discordChannel, derived: false });
+});
+
+test("route validation refuses a table where a surface is ingressable but not deliverable", () => {
+	// Ingress and egress are separate lookups over the same table, so an ambiguous
+	// or broken egress mapping must be caught at startup rather than at reply time.
+	const duplicateSurface = [
+		{ channelId: "111111111111111111", surfaceId: "discord:a", kind: "channel" as const, groupPolicy: "mention" as const },
+		{ channelId: "222222222222222222", surfaceId: "discord:a", kind: "channel" as const, groupPolicy: "mention" as const },
+	];
+	expect(() => validateDiscordRoutes(duplicateSurface)).toThrow();
+
+	const healthy = [
+		{ channelId: "111111111111111111", surfaceId: "discord:a", kind: "channel" as const, groupPolicy: "mention" as const },
+		{ channelId: "333333333333333333", surfaceId: "discord:owner", kind: "dm" as const },
+	];
+	expect(() => validateDiscordRoutes(healthy)).not.toThrow();
+	// And the derived thread child of a channel route is deliverable.
+	expect(resolveDiscordEgressRoute(healthy, "discord:a/thread:987654321")).toMatchObject({ channelId: "987654321" });
 });
