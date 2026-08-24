@@ -72,8 +72,8 @@ test("way.surfaces exposes owner and known non-owner metadata without widening t
 	try {
 		expect(await gateway.client.request("main.surfaces", {})).toMatchObject({
 			result: expect.arrayContaining([
-				{ id: OWNER_ROUTE.surfaceId, platform: "discord", kind: "dm", is_owner: true },
-				{ id: CONSULTANT_ROUTE.surfaceId, platform: "discord", kind: "channel", is_owner: false },
+				{ id: OWNER_ROUTE.surfaceId, platform: "discord", kind: "dm", sessionKind: "main", is_owner: true },
+				{ id: CONSULTANT_ROUTE.surfaceId, platform: "discord", kind: "channel", sessionKind: "conversation", is_owner: false },
 			]),
 		});
 	} finally {

@@ -40,6 +40,7 @@ conversation = ["MEMORY.md"]
 id = "owner"
 platform = "test"
 kind = "dm"
+session_kind = "main"
 `,
 	);
 	const profile = loadWayProfile(profilePath);

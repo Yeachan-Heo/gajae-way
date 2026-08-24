@@ -26,11 +26,18 @@ jobs:
       TARGET_ARCH: ${{ matrix.arch }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          # The migration check diffs against the merge base, so it needs history.
+          fetch-depth: 0
       - uses: oven-sh/setup-bun@v2
         with:
           bun-version: 1.3.14
       - uses: dtolnay/rust-toolchain@stable
       - run: bun install --frozen-lockfile
+      # A skipped SCHEMA_VERSION never executes its guarded migration block, so
+      # two branches each claiming "the next version" silently lose a table.
+      # This runs before the build so the failure is unambiguous.
+      - run: bun scripts/check-schema-migration.ts
       - run: bun scripts/build-native.ts
       - run: bun scripts/compile.ts
       - run: cargo test -p way-core

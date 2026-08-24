@@ -20,7 +20,12 @@ import * as path from "node:path";
  * deliberately never copied into the identity projection or approval diff.
  */
 
-export const PROFILE_DIGEST_VERSION = 2;
+// v3 adds every declared surface's session_kind to the identity projection and
+// makes [[surfaces.known]] MEMBERSHIP digest-bound.
+export const PROFILE_DIGEST_VERSION = 3;
+
+/** Width of the recall RestrictionMask bitset. */
+export const MAX_INJECTION_FILES = 64;
 export const SESSION_KINDS = ["main", "conversation", "lane", "job", "unknown"] as const;
 
 export type SessionKind = (typeof SESSION_KINDS)[number];
@@ -50,7 +55,10 @@ export interface ProfileInjection {
 export interface OwnerSurface {
 	readonly id: string;
 	readonly platform: string;
+	/** Free-form platform kind. NEVER read for redaction; see `sessionKind`. */
 	readonly kind: string;
+	/** Declared, digest-bound redaction class. */
+	readonly sessionKind: SessionKind;
 }
 
 export interface ProfileDigest {
@@ -67,6 +75,8 @@ export interface ProfileIdentityProjection {
 	readonly injectionFiles: readonly string[];
 	readonly restrictedFilePolicy: Readonly<Record<SessionKind, readonly string[]>>;
 	readonly ownerSurfaceMapping: readonly OwnerSurface[];
+	/** Id-sorted declared class for EVERY surface, owner and known. */
+	readonly surfaceClassMapping: readonly { readonly id: string; readonly sessionKind: SessionKind }[];
 	readonly operatorIdentity: Readonly<Record<string, CanonicalValue>>;
 	/** Exact operator-owned GJC session selected for external main-session adoption. */
 	readonly externalSessionId?: string;
@@ -115,14 +125,16 @@ function optionalRecord(value: unknown, field: string): TomlRecord | undefined {
 }
 
 function requiredString(value: unknown, field: string): string {
-	if (typeof value !== "string") fail(value === undefined ? "missing_field" : "invalid_type", field, "must be a non-empty string.");
+	if (typeof value !== "string")
+		fail(value === undefined ? "missing_field" : "invalid_type", field, "must be a non-empty string.");
 	const trimmed = value.trim();
 	if (!trimmed) fail("invalid_value", field, "must be a non-empty string.");
 	return trimmed;
 }
 
 function stringArray(value: unknown, field: string): string[] {
-	if (!Array.isArray(value)) fail(value === undefined ? "missing_field" : "invalid_type", field, "must be an array of strings.");
+	if (!Array.isArray(value))
+		fail(value === undefined ? "missing_field" : "invalid_type", field, "must be an array of strings.");
 	const values = value.map((entry, index) => requiredString(entry, `${field}[${index}]`));
 	if (new Set(values).size !== values.length) fail("invalid_value", field, "must not contain duplicate entries.");
 	return values;
@@ -170,7 +182,7 @@ export function canonicalSerialize(value: CanonicalValue): string {
 	const record = value as CanonicalObject;
 	return `{${Object.keys(record)
 		.sort()
-		.map(key => `${JSON.stringify(key)}:${canonicalSerialize(record[key] as CanonicalValue)}`)
+		.map((key) => `${JSON.stringify(key)}:${canonicalSerialize(record[key] as CanonicalValue)}`)
 		.join(",")}}`;
 }
 
@@ -180,13 +192,29 @@ function noUnknownKeys(record: TomlRecord, allowed: readonly string[], field: st
 	}
 }
 
+/**
+ * Parses a declared redaction class.
+ *
+ * There is no inferred default: a profile omitting `session_kind` fails to load
+ * rather than silently defaulting, because a wrong default would grant a
+ * surface the wrong deny list.
+ */
+function requiredSessionKind(value: unknown, field: string): SessionKind {
+	const raw = requiredString(value, field);
+	if (!(SESSION_KINDS as readonly string[]).includes(raw)) {
+		fail("invalid_value", field, `must be one of ${SESSION_KINDS.join(", ")}.`);
+	}
+	return raw as SessionKind;
+}
+
 function normalizeOwnerSurface(value: unknown, field: string): OwnerSurface {
 	const record = requiredRecord(value, field);
-	noUnknownKeys(record, ["id", "platform", "kind"], field);
+	noUnknownKeys(record, ["id", "platform", "kind", "session_kind"], field);
 	return {
 		id: requiredString(record.id, `${field}.id`),
 		platform: requiredString(record.platform, `${field}.platform`),
 		kind: requiredString(record.kind, `${field}.kind`),
+		sessionKind: requiredSessionKind(record.session_kind, `${field}.session_kind`),
 	};
 }
 
@@ -205,7 +233,14 @@ function ownerSurfaces(document: TomlRecord): OwnerSurface[] {
 			for (const key of Object.keys(document.owner_surfaces).sort()) {
 				const candidate = requiredRecord(document.owner_surfaces[key], `owner_surfaces.${key}`);
 				sources.push({
-					value: { id: candidate.id ?? key, platform: candidate.platform, kind: candidate.kind },
+					// session_kind MUST be forwarded here: this form rebuilds the record
+					// field by field, so an omission silently drops a declared class.
+					value: {
+						id: candidate.id ?? key,
+						platform: candidate.platform,
+						kind: candidate.kind,
+						session_kind: candidate.session_kind,
+					},
 					field: `owner_surfaces.${key}`,
 				});
 			}
@@ -214,11 +249,21 @@ function ownerSurfaces(document: TomlRecord): OwnerSurface[] {
 		}
 	}
 	if (sources.length === 0) fail("missing_field", "surfaces.owner", "must define at least one owner surface.");
-	const normalized = sources.map(source => normalizeOwnerSurface(source.value, source.field));
+	const normalized = sources.map((source) => normalizeOwnerSurface(source.value, source.field));
 	const ids = new Set<string>();
-	for (const surface of normalized) {
-		if (ids.has(surface.id)) fail("invalid_value", "owner_surfaces", `contains duplicate owner surface id ${surface.id}.`);
+	for (const [index, surface] of normalized.entries()) {
+		if (ids.has(surface.id))
+			fail("invalid_value", "owner_surfaces", `contains duplicate owner surface id ${surface.id}.`);
 		ids.add(surface.id);
+		// An owner surface IS the main session. Letting one declare another class
+		// would hand the main transcript a non-main deny list.
+		if (surface.sessionKind !== "main") {
+			fail(
+				"invalid_value",
+				`${sources[index]?.field ?? "owner_surfaces"}.session_kind`,
+				'owner surfaces must declare session_kind = "main".',
+			);
+		}
 	}
 	return normalized.sort((left, right) => left.id.localeCompare(right.id));
 }
@@ -233,12 +278,16 @@ function knownSurfaces(document: TomlRecord, owners: readonly OwnerSurface[]): O
 	if (known === undefined) return [...owners];
 	if (!Array.isArray(known)) fail("invalid_type", "surfaces.known", "must be an array of surface tables.");
 	const result = [...owners];
-	const byId = new Map(result.map(surface => [surface.id, surface]));
+	const byId = new Map(result.map((surface) => [surface.id, surface]));
 	for (const [index, value] of known.entries()) {
 		const surface = normalizeOwnerSurface(value, `surfaces.known[${index}]`);
 		const existing = byId.get(surface.id);
 		if (existing) {
-			if (existing.platform !== surface.platform || existing.kind !== surface.kind) {
+			if (
+				existing.platform !== surface.platform ||
+				existing.kind !== surface.kind ||
+				existing.sessionKind !== surface.sessionKind
+			) {
 				fail("invalid_value", `surfaces.known[${index}]`, `conflicts with configured owner surface ${surface.id}.`);
 			}
 			continue;
@@ -267,7 +316,17 @@ function parseRestrictedFiles(document: TomlRecord): Readonly<Record<SessionKind
 }
 
 function parseTunables(document: TomlRecord): Readonly<Record<string, CanonicalValue>> {
-	const tunableKeys = ["tunables", "poll", "ack", "adapter", "adapters", "policy", "poll_interval_ms", "ack_budget", "adapter_credentials"] as const;
+	const tunableKeys = [
+		"tunables",
+		"poll",
+		"ack",
+		"adapter",
+		"adapters",
+		"policy",
+		"poll_interval_ms",
+		"ack_budget",
+		"adapter_credentials",
+	] as const;
 	const output: Record<string, CanonicalValue> = {};
 	for (const key of tunableKeys) {
 		if (document[key] !== undefined) output[key] = canonicalValue(document[key], key);
@@ -279,7 +338,9 @@ function parseExternalSessionId(document: TomlRecord): string | undefined {
 	const mainSession = optionalRecord(document.main_session, "main_session");
 	if (!mainSession) return undefined;
 	noUnknownKeys(mainSession, ["session_id"], "main_session");
-	return mainSession.session_id === undefined ? undefined : requiredString(mainSession.session_id, "main_session.session_id");
+	return mainSession.session_id === undefined
+		? undefined
+		: requiredString(mainSession.session_id, "main_session.session_id");
 }
 
 export function profileProjectionCanonical(projection: ProfileIdentityProjection): string {
@@ -287,12 +348,21 @@ export function profileProjectionCanonical(projection: ProfileIdentityProjection
 		corpus: { path: projection.corpus.path, workspace: projection.corpus.workspace },
 		injection_files: [...projection.injectionFiles],
 		restricted_file_policy: Object.fromEntries(
-			SESSION_KINDS.map(kind => [kind, [...projection.restrictedFilePolicy[kind]]]),
+			SESSION_KINDS.map((kind) => [kind, [...projection.restrictedFilePolicy[kind]]]),
 		) as Record<string, CanonicalValue>,
-		owner_surface_mapping: projection.ownerSurfaceMapping.map(surface => ({
+		owner_surface_mapping: projection.ownerSurfaceMapping.map((surface) => ({
 			id: surface.id,
 			kind: surface.kind,
 			platform: surface.platform,
+			session_kind: surface.sessionKind,
+		})),
+		// Every declared surface, owner and known. This is what makes
+		// [[surfaces.known]] membership digest-bound: adding one now changes the
+		// digest and requires `profile approve`, closing the hole where a new
+		// known surface silently gained follow-up admission authority.
+		surface_class_mapping: projection.surfaceClassMapping.map((surface) => ({
+			id: surface.id,
+			session_kind: surface.sessionKind,
 		})),
 		operator_identity: projection.operatorIdentity,
 		external_session_id: projection.externalSessionId ?? null,
@@ -352,16 +422,34 @@ export function loadWayProfile(profilePath: string, options: LoadProfileOptions 
 	noUnknownKeys(corpus, ["path", "workspace"], "corpus");
 	const baseDirectory = path.dirname(sourcePath);
 	const corpusPath = canonicalPath(requiredString(corpus.path, "corpus.path"), baseDirectory, "corpus.path");
-	const workspace = canonicalPath(requiredString(corpus.workspace, "corpus.workspace"), baseDirectory, "corpus.workspace");
+	const workspace = canonicalPath(
+		requiredString(corpus.workspace, "corpus.workspace"),
+		baseDirectory,
+		"corpus.workspace",
+	);
 	const injection = requiredRecord(document.injection, "injection");
 	noUnknownKeys(injection, ["files"], "injection");
-	const files = stringArray(injection.files, "injection.files").map((file, index) => relativePolicyPath(file, `injection.files[${index}]`));
+	const files = stringArray(injection.files, "injection.files").map((file, index) =>
+		relativePolicyPath(file, `injection.files[${index}]`),
+	);
+	// The recall lane's RestrictionMask is a u64 bitset over this ordered list.
+	// Rejecting at load beats silently truncating: a truncated mask would leave
+	// files past bit 63 permanently UNrestricted, which is a redaction failure.
+	if (files.length > MAX_INJECTION_FILES) {
+		fail(
+			"invalid_value",
+			"injection.files",
+			`must not exceed ${MAX_INJECTION_FILES} entries; the recall restriction mask is a ${MAX_INJECTION_FILES}-bit set.`,
+		);
+	}
 	const restrictedFiles = parseRestrictedFiles(document);
 	if (document.operator !== undefined && document.identity !== undefined) {
 		fail("invalid_value", "operator", "must not be defined together with identity.");
 	}
 	const rawOperator = document.operator ?? document.identity ?? {};
-	const operator = canonicalValue(requiredRecord(rawOperator, "operator"), "operator") as Readonly<Record<string, CanonicalValue>>;
+	const operator = canonicalValue(requiredRecord(rawOperator, "operator"), "operator") as Readonly<
+		Record<string, CanonicalValue>
+	>;
 	const externalSessionId = parseExternalSessionId(document);
 	const normalizedOwnerSurfaces = ownerSurfaces(document);
 	const normalizedKnownSurfaces = knownSurfaces(document, normalizedOwnerSurfaces);
@@ -370,6 +458,9 @@ export function loadWayProfile(profilePath: string, options: LoadProfileOptions 
 		injectionFiles: files,
 		restrictedFilePolicy: restrictedFiles,
 		ownerSurfaceMapping: normalizedOwnerSurfaces,
+		surfaceClassMapping: normalizedKnownSurfaces
+			.map((surface) => ({ id: surface.id, sessionKind: surface.sessionKind }))
+			.sort((left, right) => left.id.localeCompare(right.id)),
 		operatorIdentity: operator,
 		...(externalSessionId === undefined ? {} : { externalSessionId }),
 	};
@@ -427,7 +518,13 @@ export function diffProfileProjections(
 	if (isRecord(before) && isRecord(after)) {
 		const changes: ProjectionDiff[] = [];
 		for (const key of [...new Set([...Object.keys(before), ...Object.keys(after)])].sort()) {
-			changes.push(...diffProfileProjections(before[key] as CanonicalValue | undefined, after[key] as CanonicalValue | undefined, `${pathPrefix}.${key}`));
+			changes.push(
+				...diffProfileProjections(
+					before[key] as CanonicalValue | undefined,
+					after[key] as CanonicalValue | undefined,
+					`${pathPrefix}.${key}`,
+				),
+			);
 		}
 		return changes;
 	}

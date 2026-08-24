@@ -1,8 +1,8 @@
 import * as crypto from "node:crypto";
-import { matchesCanonicalAdmissionAttemptId, MainSessionHostError } from "./host";
 import type { OwnerSurface, WayProfile } from "../profile";
 import { RpcBridgeException } from "../rpc-bridge";
 import { canonicalJson } from "./gates";
+import { MainSessionHostError, matchesCanonicalAdmissionAttemptId } from "./host";
 import type { HostSupervisor } from "./supervisor";
 
 export type DeliveredAs = "prompt" | "steer" | "follow_up";
@@ -71,12 +71,14 @@ export interface MainAdmissionOperationStore {
 	/** Returns the inclusive durable journal head before any broker effect. */
 	journalHeadCursor?(): string;
 	/** Reads durable journal evidence after an admission's pre-effect boundary. */
-	journalRead?(cursor: string | undefined, limit: number): {
+	journalRead?(
+		cursor: string | undefined,
+		limit: number,
+	): {
 		readonly events: readonly { readonly seq: string; readonly kind: string; readonly payloadJson: string }[];
 		readonly nextCursor: string;
 		readonly gap?: unknown;
 	};
-
 }
 
 export interface CreateMainAdmissionOptions {
@@ -89,7 +91,6 @@ export interface CreateMainAdmissionOptions {
 	readonly mutationReadinessReason?: () => string | undefined;
 	/** Captures the inclusive durable journal head before any broker effect. */
 	readonly journalHeadCursor?: () => string;
-
 }
 
 interface MainAdmissionResponse {
@@ -125,7 +126,8 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 }
 
 function requiredString(value: unknown, field: string): string {
-	if (typeof value !== "string" || !value.trim()) throw new RpcBridgeException(-32602, `${field} must be a non-empty string.`);
+	if (typeof value !== "string" || !value.trim())
+		throw new RpcBridgeException(-32602, `${field} must be a non-empty string.`);
 	return value;
 }
 
@@ -153,10 +155,13 @@ interface ResolvedAdmissionSurface {
  * channel surface. This preserves 1300 for every other unknown surface while
  * avoiding dynamic registry mutation for ephemeral Discord thread ids.
  */
-function resolveAdmissionSurface(surfaceId: string, knownSurfaces: ReadonlyMap<string, OwnerSurface>): ResolvedAdmissionSurface | undefined {
+function resolveAdmissionSurface(
+	surfaceId: string,
+	knownSurfaces: ReadonlyMap<string, OwnerSurface>,
+): ResolvedAdmissionSurface | undefined {
 	const exact = knownSurfaces.get(surfaceId);
 	if (exact) return { surface: exact, quarantineSurface: exact };
-	const parents = [...knownSurfaces.values()].filter(parent => {
+	const parents = [...knownSurfaces.values()].filter((parent) => {
 		if (parent.platform !== "discord" || parent.kind !== "channel") return false;
 		const prefix = `${parent.id}/thread:`;
 		const threadId = surfaceId.slice(prefix.length);
@@ -165,11 +170,13 @@ function resolveAdmissionSurface(surfaceId: string, knownSurfaces: ReadonlyMap<s
 	if (parents.length !== 1) return undefined;
 	const parent = parents[0] as OwnerSurface;
 	return {
-		surface: { id: surfaceId, platform: parent.platform, kind: "thread" },
+		// A derived thread inherits its parent's declared redaction class: a thread
+		// under a conversation channel IS a conversation, and inventing a
+		// different class here would apply the wrong deny list.
+		surface: { id: surfaceId, platform: parent.platform, kind: "thread", sessionKind: parent.sessionKind },
 		quarantineSurface: parent,
 	};
 }
-
 
 function idempotencyFailure(error: unknown): never {
 	if (error instanceof RpcBridgeException) throw error;
@@ -205,7 +212,8 @@ function replayResponse(responseJson: string | undefined): MainAdmissionResponse
 
 function optionalJournalHeadCursor(value: unknown): string | undefined {
 	if (value === undefined) return undefined;
-	if (typeof value !== "string" || !/^\d+:\d+$/.test(value)) throw new Error("journal_head_cursor must be a journal cursor.");
+	if (typeof value !== "string" || !/^\d+:\d+$/.test(value))
+		throw new Error("journal_head_cursor must be a journal cursor.");
 	return value;
 }
 
@@ -214,10 +222,17 @@ function parseIntent(intentJson: string): MainAdmissionIntent {
 	try {
 		parsed = JSON.parse(intentJson) as unknown;
 	} catch (error) {
-		throw new MainAdmissionRecoveryError("main_admission_intent_invalid", "The durable main admission intent is not JSON.", { cause: error });
+		throw new MainAdmissionRecoveryError(
+			"main_admission_intent_invalid",
+			"The durable main admission intent is not JSON.",
+			{ cause: error },
+		);
 	}
 	if (!isRecord(parsed)) {
-		throw new MainAdmissionRecoveryError("main_admission_intent_invalid", "The durable main admission intent is malformed.");
+		throw new MainAdmissionRecoveryError(
+			"main_admission_intent_invalid",
+			"The durable main admission intent is malformed.",
+		);
 	}
 	const journalHeadCursor = parsed.journal_head_cursor;
 	if (
@@ -230,7 +245,10 @@ function parseIntent(intentJson: string): MainAdmissionIntent {
 		!/^[a-f0-9]{64}$/i.test(parsed.request_hash) ||
 		(journalHeadCursor !== undefined && (typeof journalHeadCursor !== "string" || !/^\d+:\d+$/.test(journalHeadCursor)))
 	) {
-		throw new MainAdmissionRecoveryError("main_admission_intent_invalid", "The durable main admission intent is malformed.");
+		throw new MainAdmissionRecoveryError(
+			"main_admission_intent_invalid",
+			"The durable main admission intent is malformed.",
+		);
 	}
 	return {
 		version: 1,
@@ -269,21 +287,31 @@ function parseJournalPayload(payloadJson: string): Record<string, unknown> | und
 function persistedAttemptIds(value: unknown): readonly string[] | undefined {
 	if (value === undefined) return undefined;
 	if (typeof value !== "string") {
-		throw new MainAdmissionRecoveryError("main_admission_intent_invalid", "The durable main admission attempt identifiers are malformed.");
+		throw new MainAdmissionRecoveryError(
+			"main_admission_intent_invalid",
+			"The durable main admission attempt identifiers are malformed.",
+		);
 	}
 	let parsed: unknown;
 	try {
 		parsed = JSON.parse(value) as unknown;
 	} catch (error) {
-		throw new MainAdmissionRecoveryError("main_admission_intent_invalid", "The durable main admission attempt identifiers are not JSON.", { cause: error });
+		throw new MainAdmissionRecoveryError(
+			"main_admission_intent_invalid",
+			"The durable main admission attempt identifiers are not JSON.",
+			{ cause: error },
+		);
 	}
 	if (
 		!Array.isArray(parsed) ||
 		parsed.length === 0 ||
-		parsed.some(attemptId => typeof attemptId !== "string" || !attemptId) ||
+		parsed.some((attemptId) => typeof attemptId !== "string" || !attemptId) ||
 		new Set(parsed).size !== parsed.length
 	) {
-		throw new MainAdmissionRecoveryError("main_admission_intent_invalid", "The durable main admission attempt identifiers are malformed.");
+		throw new MainAdmissionRecoveryError(
+			"main_admission_intent_invalid",
+			"The durable main admission attempt identifiers are malformed.",
+		);
 	}
 	return parsed;
 }
@@ -301,7 +329,6 @@ function terminalAttemptId(payloadJson: string): string | undefined {
 		return undefined;
 	return payload.attempt_id;
 }
-
 
 async function hasDurableTerminalEvidence(
 	idempotency: MainAdmissionOperationStore,
@@ -324,22 +351,28 @@ async function hasDurableTerminalEvidence(
 		}
 		if (page.gap !== undefined) return false;
 		if (!optionalJournalHeadCursor(page.nextCursor)) {
-			throw new MainAdmissionRecoveryError("main_admission_recovery_unavailable", "The durable journal returned an invalid recovery cursor.");
+			throw new MainAdmissionRecoveryError(
+				"main_admission_recovery_unavailable",
+				"The durable journal returned an invalid recovery cursor.",
+			);
 		}
 		for (const event of page.events) {
 			if (event.kind !== "turn_end") continue;
 			const attemptId = terminalAttemptId(event.payloadJson);
 			if (attemptId) terminalAttempts.push(attemptId);
 		}
-		if (terminalAttempts.some(attemptId => matchesCanonicalAdmissionAttemptId(attemptId, canonicalAttemptIds))) return true;
+		if (terminalAttempts.some((attemptId) => matchesCanonicalAdmissionAttemptId(attemptId, canonicalAttemptIds)))
+			return true;
 		if (page.events.length === 0) return false;
 		if (page.nextCursor === cursor) {
-			throw new MainAdmissionRecoveryError("main_admission_recovery_unavailable", "The durable journal recovery cursor did not advance.");
+			throw new MainAdmissionRecoveryError(
+				"main_admission_recovery_unavailable",
+				"The durable journal recovery cursor did not advance.",
+			);
 		}
 		cursor = page.nextCursor;
 	}
 }
-
 
 function pendingReplayError(intentJson: string): never {
 	parseIntent(intentJson);
@@ -353,8 +386,11 @@ async function dispatchAdmittedOperation(
 	opRef: string,
 	finalizePendingClaim: () => void,
 	recordAttemptIds: (attemptIds: readonly string[]) => void,
-	surfaceId: string,
+	attribution: AdmissionAttribution,
 ): Promise<void> {
+	// Scheduler work passes no surface: the host records it by origin instead, so
+	// it cannot borrow a configured surface's routing authority.
+	const surfaceId = attribution.kind === "surface" ? attribution.surfaceId : undefined;
 	await target.admit(deliveredAs, text, opRef, finalizePendingClaim, recordAttemptIds, surfaceId);
 }
 
@@ -389,35 +425,42 @@ function abandonDefinitivelyRejectedClaim(
  * Server-authoritative admission. A caller submits only text and a surface;
  * delivery is always derived from the bound profile and current main turn.
  */
+/**
+ * How an admission is attributed durably. Exactly one of these: operator traffic
+ * is attributed to the surface it arrived on, and in-process scheduler traffic
+ * is attributed to its origin because it has no surface to borrow authority
+ * from. There is no `delivery` discriminator; the entry point IS the mode.
+ */
+export type AdmissionAttribution =
+	| { readonly kind: "surface"; readonly surfaceId: string }
+	| { readonly kind: "origin"; readonly origin: typeof SCHEDULER_ORIGIN };
+
+/** Canonical `origin` value for scheduler-originated admissions. */
+export const SCHEDULER_ORIGIN = "scheduler";
+
+/** In-process scheduler admission. Never reachable from an RPC method. */
+export interface SystemEventAdmission {
+	readonly text: string;
+	readonly idempotencyKey: string;
+}
+
 export function createMainAdmissionHandler(
 	target: MainAdmissionTarget,
 	profile: WayProfile,
 	idempotency: MainAdmissionOperationStore,
 	options: CreateMainAdmissionOptions = {},
 ) {
-	const ownerSurfaceIds = new Set(profile.ownerSurfaces.map(surface => surface.id));
-	const knownSurfaces = new Map(profile.knownSurfaces.map(surface => [surface.id, surface]));
+	const ownerSurfaceIds = new Set(profile.ownerSurfaces.map((surface) => surface.id));
+	const knownSurfaces = new Map(profile.knownSurfaces.map((surface) => [surface.id, surface]));
 	const newOpRef = options.newOpRef ?? crypto.randomUUID;
-	return async (params: unknown): Promise<MainAdmissionResponse> => {
-
-		const request = parseRequest(params);
-		const fenceReason = options.mutationReadinessReason?.() ?? target.mutationReadinessReason;
-		if (fenceReason) throw new RpcBridgeException(1003, fenceReason);
-		const canonicalSurfaceId = request.surfaceId.trim();
-		const resolvedSurface = resolveAdmissionSurface(canonicalSurfaceId, knownSurfaces);
-		if (!resolvedSurface) throw new RpcBridgeException(1300, "unknown_surface");
-		const surface = resolvedSurface.surface;
-		if (options.isSurfaceQuarantined?.(resolvedSurface.quarantineSurface)) throw new RpcBridgeException(1302, "session_quarantined");
-		const requestJson = canonicalJson({
-			idempotency_key: request.idempotencyKey,
-			surface_id: surface.id,
-			text: request.text,
-		});
-		const deliveredAs: DeliveredAs = ownerSurfaceIds.has(surface.id)
-			? target.turnState === "idle"
-				? "prompt"
-				: "steer"
-			: "follow_up";
+	// One shared durable pipeline for every admission, whatever its origin. The
+	// single-writer invariant depends on there being exactly one of these.
+	const admit = async (
+		request: AdmissionRequest,
+		requestJson: string,
+		deliveredAs: DeliveredAs,
+		attribution: AdmissionAttribution,
+	): Promise<MainAdmissionResponse> => {
 		// This direct durable read happens synchronously before the broker effect,
 		// so any assistant event for this admission must be strictly later.
 		const journalHeadCursor = options.journalHeadCursor
@@ -482,7 +525,15 @@ export function createMainAdmissionHandler(
 			}
 		}
 		try {
-			await dispatchAdmittedOperation(target, deliveredAs, request.text, response.op_ref, finalizePendingClaim, recordAttemptIds, surface.id);
+			await dispatchAdmittedOperation(
+				target,
+				deliveredAs,
+				request.text,
+				response.op_ref,
+				finalizePendingClaim,
+				recordAttemptIds,
+				attribution,
+			);
 		} catch (error) {
 			abandonDefinitivelyRejectedClaim(target, idempotency, request, requestJson, intentJson, error);
 			throw error;
@@ -495,6 +546,56 @@ export function createMainAdmissionHandler(
 			idempotencyFailure(error);
 		}
 	};
+
+	/** Bound to `main.submit`. Requires a declared, non-quarantined surface. */
+	const submitFromRpc = async (params: unknown): Promise<MainAdmissionResponse> => {
+		const request = parseRequest(params);
+		const fenceReason = options.mutationReadinessReason?.() ?? target.mutationReadinessReason;
+		if (fenceReason) throw new RpcBridgeException(1003, fenceReason);
+		const canonicalSurfaceId = request.surfaceId.trim();
+		const resolvedSurface = resolveAdmissionSurface(canonicalSurfaceId, knownSurfaces);
+		if (!resolvedSurface) throw new RpcBridgeException(1300, "unknown_surface");
+		const surface = resolvedSurface.surface;
+		if (options.isSurfaceQuarantined?.(resolvedSurface.quarantineSurface))
+			throw new RpcBridgeException(1302, "session_quarantined");
+		const requestJson = canonicalJson({
+			idempotency_key: request.idempotencyKey,
+			surface_id: surface.id,
+			text: request.text,
+		});
+		const deliveredAs: DeliveredAs = ownerSurfaceIds.has(surface.id)
+			? target.turnState === "idle"
+				? "prompt"
+				: "steer"
+			: "follow_up";
+		return await admit(request, requestJson, deliveredAs, { kind: "surface", surfaceId: surface.id });
+	};
+
+	/**
+	 * In-process scheduler entry point. Deliberately NOT bound to any RPC method
+	 * and deliberately typed rather than taking `unknown` params, so it cannot be
+	 * reached from the wire. Scheduler work is always `follow_up`: it must never
+	 * pre-empt or steer a live operator turn.
+	 */
+	const admitSystemEvent = async (input: SystemEventAdmission): Promise<MainAdmissionResponse> => {
+		const fenceReason = options.mutationReadinessReason?.() ?? target.mutationReadinessReason;
+		if (fenceReason) throw new RpcBridgeException(1003, fenceReason);
+		const text = input.text.trim();
+		if (!text) throw new RpcBridgeException(-32602, "a system event requires non-empty text");
+		if (!input.idempotencyKey.trim())
+			throw new RpcBridgeException(-32602, "a system event requires an idempotency key");
+		const request: AdmissionRequest = { idempotencyKey: input.idempotencyKey, surfaceId: "", text };
+		// No surface_id in the canonical request: the scheduler is attributed by
+		// origin, so it cannot inherit a surface's authority.
+		const requestJson = canonicalJson({
+			idempotency_key: input.idempotencyKey,
+			origin: SCHEDULER_ORIGIN,
+			text,
+		});
+		return await admit(request, requestJson, "follow_up", { kind: "origin", origin: SCHEDULER_ORIGIN });
+	};
+
+	return { submitFromRpc, admitSystemEvent };
 }
 
 /** Reconciles durable pre-effect claims after restart without ever re-sending their broker operation. */
@@ -504,11 +605,17 @@ export async function reconcilePendingMainAdmissions(
 ): Promise<void> {
 	for (const pending of idempotency.mainAdmissionOperationsPending()) {
 		if (pending.scope !== MAIN_ADMISSION_SCOPE) {
-			throw new MainAdmissionRecoveryError("main_admission_intent_invalid", "A pending admission has an unexpected idempotency scope.");
+			throw new MainAdmissionRecoveryError(
+				"main_admission_intent_invalid",
+				"A pending admission has an unexpected idempotency scope.",
+			);
 		}
 		const intent = parseIntent(pending.intentJson);
 		if (intent.request_hash !== sha256(pending.requestJson)) {
-			throw new MainAdmissionRecoveryError("main_admission_intent_invalid", "A pending admission request hash does not match its durable request.");
+			throw new MainAdmissionRecoveryError(
+				"main_admission_intent_invalid",
+				"A pending admission request hash does not match its durable request.",
+			);
 		}
 		const attemptIds = persistedAttemptIds(pending.attemptIdsJson);
 		let brokerProven = false;
@@ -518,7 +625,10 @@ export async function reconcilePendingMainAdmissions(
 		} catch (error) {
 			brokerStatusError = error;
 		}
-		if (!brokerProven && !(attemptIds !== undefined && (await hasDurableTerminalEvidence(idempotency, intent, attemptIds)))) {
+		if (
+			!brokerProven &&
+			!(attemptIds !== undefined && (await hasDurableTerminalEvidence(idempotency, intent, attemptIds)))
+		) {
 			if (brokerStatusError !== undefined) {
 				throw new MainAdmissionRecoveryError(
 					"main_admission_recovery_unavailable",

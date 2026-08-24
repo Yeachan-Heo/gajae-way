@@ -4,41 +4,44 @@ import * as fsp from "node:fs/promises";
 import * as net from "node:net";
 import * as os from "node:os";
 import * as path from "node:path";
-import { ConsoleStartupRefusalError, runWayConsole, sanitizeConsoleText } from "./console/console";
-import { parseWayConfig, type WayConfig } from "./config";
 import { BrokerCli } from "./broker/cli";
 import { BrokerReconciler } from "./broker/reconcile";
-import { createMainAdmissionHandler, MainAdmissionRecoveryError, reconcilePendingMainAdmissions } from "./main-session/admission";
-import { canonicalJson, createMainGateAnswerHandler } from "./main-session/gates";
+import { parseWayConfig, type WayConfig } from "./config";
+import { ConsoleStartupRefusalError, runWayConsole, sanitizeConsoleText } from "./console/console";
 import {
-	ClosureError,
-	ClosureMutationReadinessError,
-	createClosureExecutor,
-	runClosureWorker,
-	type ClosureExecutor,
-	type ClosureHookContext,
-	type ClosureMutationReadinessReason,
-} from "./main-session/closure";
-
+	createMainAdmissionHandler,
+	MainAdmissionRecoveryError,
+	reconcilePendingMainAdmissions,
+} from "./main-session/admission";
 import { bootstrapMainSession, recoverBootstrap } from "./main-session/bootstrap";
 import {
+	ClosureError,
+	type ClosureExecutor,
+	type ClosureHookContext,
+	ClosureMutationReadinessError,
+	type ClosureMutationReadinessReason,
+	createClosureExecutor,
+	runClosureWorker,
+} from "./main-session/closure";
+import { canonicalJson, createMainGateAnswerHandler } from "./main-session/gates";
+import {
 	createMainSessionHost,
-	MainSessionHostError,
-	parseMainSessionAdmissionAttributions,
 	type MainSessionHost,
+	MainSessionHostError,
 	type MainSessionJournal,
+	parseMainSessionAdmissionAttributions,
 } from "./main-session/host";
+import { recallCandidates, restrictionMask } from "./main-session/inject";
 import { approveProfile, previewProfileApproval } from "./main-session/profile-approval";
-import { ResumeError, strictResumeMainSession } from "./main-session/resume";
 import { recoverFailedClosedGateway } from "./main-session/recover";
+import { ResumeError, strictResumeMainSession } from "./main-session/resume";
+import { createScheduler } from "./main-session/scheduler";
+import { GatewayStateError, GatewayStateStore } from "./main-session/state";
 import { createExternalHostSupervisor } from "./main-session/supervisor";
-
 import { GatewayToolController, GatewayToolError } from "./main-session/tools";
 import { runWayMcp } from "./mcp";
-import { GatewayStateError, GatewayStateStore } from "./main-session/state";
-import { ProfileRevisionTracker } from "./profile";
-
 import { loadWayCore, type WayCoreHandle } from "./native-loader";
+import { MAX_INJECTION_FILES, ProfileRevisionTracker, SESSION_KINDS } from "./profile";
 import { createRpcBridge, RpcBridgeException, type RpcBridgeHandler } from "./rpc-bridge";
 
 const usage = `Usage:
@@ -94,7 +97,12 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 }
 
 function failureReason(error: unknown): string {
-	if (error instanceof ResumeError || error instanceof GatewayStateError || error instanceof MainSessionHostError || error instanceof MainAdmissionRecoveryError)
+	if (
+		error instanceof ResumeError ||
+		error instanceof GatewayStateError ||
+		error instanceof MainSessionHostError ||
+		error instanceof MainAdmissionRecoveryError
+	)
 		return error.reason;
 	if (error instanceof Error && error.name === "ProfileValidationError") return "profile_invalid";
 	return "startup_failed";
@@ -176,9 +184,23 @@ function createRuntimeMainSessionJournal(
 		journalAppendAtTailCheckpoint: (kind, payloadJson, expected, checkpoint) => {
 			gatewayState.appendTailProjection(expected, checkpoint, kind, payloadJson);
 		},
-		journalAppendTranscriptProjection: (kind, payloadJson, expectedTail, checkpoint, expectedDelivery, nextDelivery) => {
+		journalAppendTranscriptProjection: (
+			kind,
+			payloadJson,
+			expectedTail,
+			checkpoint,
+			expectedDelivery,
+			nextDelivery,
+		) => {
 			failTranscriptProjectionForE2e();
-			gatewayState.appendTranscriptProjection(expectedTail, checkpoint, expectedDelivery, nextDelivery, kind, payloadJson);
+			gatewayState.appendTranscriptProjection(
+				expectedTail,
+				checkpoint,
+				expectedDelivery,
+				nextDelivery,
+				kind,
+				payloadJson,
+			);
 		},
 		setRpcHealth: (state, reason) => {
 			let healthState: "degraded" | "running" | "failed_closed" = state;
@@ -197,13 +219,20 @@ function createRuntimeMainSessionJournal(
 				if (healthState === "running") core.sdNotifyReady("gajaeway running");
 			} finally {
 				const status = healthState === "running" ? "healthy" : "unhealthy";
-				void writeHealthFile(stateDirectory, { status, state: healthState, ...(healthState === "running" ? {} : { reason: healthReason }) }).catch(error => {
-					console.error(`Could not write ${healthState} health file: ${error instanceof Error ? error.message : String(error)}`);
+				void writeHealthFile(stateDirectory, {
+					status,
+					state: healthState,
+					...(healthState === "running" ? {} : { reason: healthReason }),
+				}).catch((error) => {
+					console.error(
+						`Could not write ${healthState} health file: ${error instanceof Error ? error.message : String(error)}`,
+					);
 				});
 			}
 		},
-		setMainSessionStatus: (turnState, followUpQueueDepth, verificationState) => core.setMainSessionStatus(turnState, followUpQueueDepth, verificationState),
-		setJournalDegraded: degraded => core.setJournalDegraded(degraded),
+		setMainSessionStatus: (turnState, followUpQueueDepth, verificationState) =>
+			core.setMainSessionStatus(turnState, followUpQueueDepth, verificationState),
+		setJournalDegraded: (degraded) => core.setJournalDegraded(degraded),
 	};
 }
 
@@ -671,7 +700,8 @@ function advanceClosureOperation(
 		[keyof ClosureOperationEvidence, ClosureOperationEvidence[keyof ClosureOperationEvidence]]
 	>) {
 		const replaceExecutionLease = options.replaceExecutionLease && (key === "leaseId" || key === "fencingToken");
-		if (value !== undefined && (replaceExecutionLease || nextEvidence[key] === undefined)) Object.assign(nextEvidence, { [key]: value });
+		if (value !== undefined && (replaceExecutionLease || nextEvidence[key] === undefined))
+			Object.assign(nextEvidence, { [key]: value });
 	}
 	const next: ClosureOperationRecord = {
 		version: 1,
@@ -710,7 +740,10 @@ async function pauseClosureHookForE2e(
 	releasePath: string | undefined,
 ): Promise<void> {
 	if (Bun.env.NODE_ENV !== "test" || !markerPath || !releasePath) return;
-	fs.writeFileSync(markerPath, `${JSON.stringify({ operation_id: operationId, step })}\n`, { encoding: "utf8", mode: 0o600 });
+	fs.writeFileSync(markerPath, `${JSON.stringify({ operation_id: operationId, step })}\n`, {
+		encoding: "utf8",
+		mode: 0o600,
+	});
 	while (!fs.existsSync(releasePath)) await Bun.sleep(10);
 }
 
@@ -932,7 +965,13 @@ async function reconcilePendingClosureOperation(
 		throw new Error("pending closure operation is not bound to its idempotency intent");
 	}
 	try {
-		await executeAndFinalizeClosureOperation(core, closures, intent, operation.record.intentJson, mutationReadinessReason);
+		await executeAndFinalizeClosureOperation(
+			core,
+			closures,
+			intent,
+			operation.record.intentJson,
+			mutationReadinessReason,
+		);
 	} catch (error) {
 		if (error instanceof ClosureMutationReadinessError) {
 			throw new ClosureRecoveryReadinessRefusal(error.reason);
@@ -967,7 +1006,10 @@ function markClosureInFlightWaiterForE2e(idempotencyKey: string): void {
 	if (Bun.env.NODE_ENV !== "test") return;
 	const markerPath = Bun.env.GAJAEWAY_E2E_CLOSURE_INFLIGHT_WAITER_MARKER;
 	if (!markerPath) return;
-	fs.writeFileSync(markerPath, `${JSON.stringify({ idempotency_key: idempotencyKey })}\n`, { encoding: "utf8", mode: 0o600 });
+	fs.writeFileSync(markerPath, `${JSON.stringify({ idempotency_key: idempotencyKey })}\n`, {
+		encoding: "utf8",
+		mode: 0o600,
+	});
 }
 function closureBridgeHandler(
 	core: WayCoreHandle,
@@ -1020,7 +1062,13 @@ function closureBridgeHandler(
 			) {
 				throw new RpcBridgeException(1500, "idempotency_conflict");
 			}
-			const response = executeAndFinalizeClosureOperation(core, closures, pendingIntent, storedResponse as string, mutationReadinessReason);
+			const response = executeAndFinalizeClosureOperation(
+				core,
+				closures,
+				pendingIntent,
+				storedResponse as string,
+				mutationReadinessReason,
+			);
 			inFlightByKey.set(request.idempotencyKey, { requestJson: request.requestJson, response });
 			try {
 				return await response;
@@ -1032,7 +1080,13 @@ function closureBridgeHandler(
 			}
 		}
 
-		const response = executeAndFinalizeClosureOperation(core, closures, created.intent, created.intentJson, mutationReadinessReason);
+		const response = executeAndFinalizeClosureOperation(
+			core,
+			closures,
+			created.intent,
+			created.intentJson,
+			mutationReadinessReason,
+		);
 		inFlightByKey.set(request.idempotencyKey, { requestJson: request.requestJson, response });
 		try {
 			return await response;
@@ -1089,7 +1143,7 @@ async function waitForShutdown(
 ): Promise<void> {
 	const closureRecoveryFailure = closureRecovery.then(
 		() => new Promise<never>(() => {}),
-		error => ({ kind: "closure_recovery_failed" as const, error }),
+		(error) => ({ kind: "closure_recovery_failed" as const, error }),
 	);
 	const outcome = await Promise.race([
 		new Promise<{ readonly kind: "signal" }>((resolve) => {
@@ -1097,7 +1151,7 @@ async function waitForShutdown(
 			process.once("SIGINT", stop);
 			process.once("SIGTERM", stop);
 		}),
-		host.waitForFatalFailure().then(error => ({ kind: "fatal" as const, error })),
+		host.waitForFatalFailure().then((error) => ({ kind: "fatal" as const, error })),
 		closureRecoveryFailure,
 	]);
 	if (outcome.kind === "fatal") throw outcome.error;
@@ -1157,7 +1211,10 @@ async function serveWay(config: WayConfig): Promise<void> {
 		await reconcilePendingMainAdmissions(core, supervisor);
 		const initialAdmissionAttributions = parseMainSessionAdmissionAttributions(core.mainAdmissionAttributions());
 		if (config.sessionId && config.sessionId !== resumed.identity.sessionId) {
-			throw new ResumeError("session_id_mismatch", "--session-id does not match the durable adopted external identity.");
+			throw new ResumeError(
+				"session_id_mismatch",
+				"--session-id does not match the durable adopted external identity.",
+			);
 		}
 		failBeforeMainHostForE2e();
 		const verificationPending = resumed.verificationState === "pending";
@@ -1190,7 +1247,7 @@ async function serveWay(config: WayConfig): Promise<void> {
 		const gatewayTools = new GatewayToolController({ core, profile, host: resumedHost });
 		if (!verificationPending) core.setRpcHealth("running");
 		const mutationReadinessReason: MutationReadinessReason = () => resumedHost.mutationReadinessReason;
-		const admissionHandler = createMainAdmissionHandler(host, profile, core, {
+		const { submitFromRpc: admissionHandler, admitSystemEvent } = createMainAdmissionHandler(host, profile, core, {
 			isSurfaceQuarantined: (surface) => {
 				try {
 					return core.surfaceResolve(surface.id).quarantined;
@@ -1203,10 +1260,25 @@ async function serveWay(config: WayConfig): Promise<void> {
 			mutationReadinessReason,
 		});
 		const gateAnswerHandler = createMainGateAnswerHandler(host, core);
-		const rawClosureHandler = closureBridgeHandler(core, closures, profile.corpusPath, resumed.identity.sessionId, mutationReadinessReason);
+		const rawClosureHandler = closureBridgeHandler(
+			core,
+			closures,
+			profile.corpusPath,
+			resumed.identity.sessionId,
+			mutationReadinessReason,
+		);
 		const closureRecovery = resumedHost
 			.waitForVerifiedTranscript()
-			.then(async () => await reconcilePendingClosureOperation(core, closures, profile.corpusPath, resumed.identity.sessionId, mutationReadinessReason))
+			.then(
+				async () =>
+					await reconcilePendingClosureOperation(
+						core,
+						closures,
+						profile.corpusPath,
+						resumed.identity.sessionId,
+						mutationReadinessReason,
+					),
+			)
 			.catch((error) => {
 				if (error instanceof ClosureRecoveryReadinessRefusal) {
 					console.error(`Pending corpus closure recovery refused: ${error.reason}`);
@@ -1218,14 +1290,26 @@ async function serveWay(config: WayConfig): Promise<void> {
 			await closureRecovery;
 			return await rawClosureHandler(method, params);
 		};
+		const scheduler = createScheduler({
+			core,
+			profile,
+			admitSystemEvent,
+			submitFromRpc: admissionHandler,
+			turnState: () => resumedHost.turnState,
+			mutationReadinessReason: () => resumedHost.mutationReadinessReason,
+			onError: (error) => process.stderr.write(`gajaeway scheduler error: ${error.message}\n`),
+		});
+
 		mainSessionHandler = async (method, params) => {
 			if (method === "main.surfaces") return await invokeGatewayTool("way_surfaces", () => gatewayTools.listSurfaces());
-			if (method === "main.turn.origin") return await invokeGatewayTool("way_turn_origin", () => gatewayTools.turnOrigin());
+			if (method === "main.turn.origin")
+				return await invokeGatewayTool("way_turn_origin", () => gatewayTools.turnOrigin());
 			if (method === "main.say") {
 				assertMainSessionMutationReady(resumedHost);
 				return await invokeGatewayTool("way_say", () => gatewayTools.say(params));
 			}
 			if (method === "main.submit" || method === "main.corpus.close") assertMainSessionMutationReady(resumedHost);
+			if (method.startsWith("schedule.")) return await scheduler.handleRpc(method, params);
 			if (method === "main.submit") return await admissionHandler(params);
 			if (method === "main.gate.answer") return await gateAnswerHandler(params);
 			if (method === "main.corpus.close") return await closureHandler(method, params);
@@ -1236,13 +1320,82 @@ async function serveWay(config: WayConfig): Promise<void> {
 			broker: new BrokerCli({ executable: config.brokerCliPath }),
 			pollMs: config.reconcilePollMs,
 		});
+		// Build the recall index against the ACTIVE profile digest, with ONE shared
+		// expansion feeding both the documents and the masks so a bit index, an
+		// indexed document, and an injected file all denote the same position.
+		try {
+			if (!core.memoryFts5Available()) {
+				// Without FTS5 the redaction predicate cannot run inside the query, so
+				// a degraded fallback would be a disclosure, not a missing feature.
+				await enterFailedClosed(core, state, config, "memory_fts5_unavailable");
+			}
+			const indexedAt = new Date();
+			const candidates = recallCandidates(profile, indexedAt);
+			if (candidates.length > MAX_INJECTION_FILES) {
+				throw new Error(
+					`expanded injection list has ${candidates.length} entries, exceeding the ${MAX_INJECTION_FILES}-bit restriction mask`,
+				);
+			}
+			const documents = candidates.flatMap((file, fileIndex) => {
+				try {
+					return [{ fileIndex, path: file, body: fs.readFileSync(path.resolve(profile.corpusPath, file), "utf8") }];
+				} catch (error) {
+					if ((error as NodeJS.ErrnoException).code === "ENOENT") return [];
+					// Any OTHER I/O failure must not silently yield a partial index.
+					throw error;
+				}
+			});
+			core.memoryIndexRebuild(
+				profile.digest.sha256,
+				documents,
+				SESSION_KINDS.map((sessionKind) => ({ sessionKind, mask: restrictionMask(profile, sessionKind, indexedAt) })),
+			);
+		} catch (error) {
+			process.stderr.write(
+				`gajaeway memory recall index unavailable: ${error instanceof Error ? error.message : String(error)}\n`,
+			);
+			try {
+				core.gatewayMetaTransaction({
+					expected: [],
+					puts: [{ key: "memory_index_digest", value: "unavailable" }],
+					deletes: [],
+				});
+			} catch {
+				// A pin that cannot be invalidated would keep answering under a policy
+				// we can no longer vouch for.
+				await enterFailedClosed(core, state, config, "memory_index_unverifiable");
+			}
+		}
+
+		// In-flight runs resolve before any overdue collapse, and after
+		// reconcilePendingMainAdmissions so a pending admission is not raced.
+		await scheduler.reconcile();
+		scheduler.start();
+
+		// Alert evaluation is deliberately independent of the metrics listener: an
+		// operator who leaves the endpoint disabled must still be told when an
+		// adapter goes silent.
+		const alertTimer = setInterval(() => {
+			try {
+				core.alertsEvaluateAdapterDisconnects(60_000);
+			} catch {
+				// Best-effort per tick; the durable flag means nothing is lost.
+			}
+		}, 15_000);
+		alertTimer.unref?.();
+
 		reconciler.start();
 		try {
 			core.sdNotifyReady(verificationPending ? "gajaeway transcript verification pending" : "gajaeway running");
 		} catch {
 			// Readiness remains observable through RPC and health.json.
 		}
-		await waitForShutdown(core, host, closures, reconciler, closureRecovery);
+		try {
+			await waitForShutdown(core, host, closures, reconciler, closureRecovery);
+		} finally {
+			clearInterval(alertTimer);
+			scheduler.stop();
+		}
 	} catch (error) {
 		if (error instanceof FailedClosedExit) {
 			const disposal = await disposeMainSessionAfterStartupFailure(core, host);
@@ -1278,7 +1431,13 @@ async function bootstrapCommand(config: WayConfig, arguments_: readonly string[]
 		const recovery = await recoverBootstrap({ profile, state, supervisor });
 		if (recovery.kind === "failed_closed") throw new Error(`Bootstrap recovery is failed closed: ${recovery.reason}`);
 		if (recovery.kind === "committed") {
-			console.log(JSON.stringify({ state: "committed", session_id: recovery.identity.sessionId, recovered: recovery.nonce !== "" }));
+			console.log(
+				JSON.stringify({
+					state: "committed",
+					session_id: recovery.identity.sessionId,
+					recovered: recovery.nonce !== "",
+				}),
+			);
 			return;
 		}
 		const sessionId = config.sessionId ?? profile.externalSessionId;
@@ -1287,7 +1446,9 @@ async function bootstrapCommand(config: WayConfig, arguments_: readonly string[]
 			throw new Error("--session-id must match [main_session].session_id.");
 		}
 		const committed = await bootstrapMainSession({ confirm: true, profile, state, supervisor, sessionId });
-		console.log(JSON.stringify({ state: "committed", session_id: committed.identity.sessionId, nonce: committed.nonce }));
+		console.log(
+			JSON.stringify({ state: "committed", session_id: committed.identity.sessionId, nonce: committed.nonce }),
+		);
 	} finally {
 		await supervisor.dispose();
 	}
@@ -1306,12 +1467,14 @@ async function recoverCommand(config: WayConfig, arguments_: readonly string[]):
 	const supervisor = createRuntimeSupervisor(config, profile.workspace);
 	try {
 		const recovered = await recoverFailedClosedGateway({ profile, state, supervisor, confirm: true });
-		console.log(JSON.stringify({
-			state: "recovered",
-			cleared_reason: recovered.clearedReason,
-			receipt_id: recovered.receiptId,
-			evidence: recovered.evidence,
-		}));
+		console.log(
+			JSON.stringify({
+				state: "recovered",
+				cleared_reason: recovered.clearedReason,
+				receipt_id: recovered.receiptId,
+				evidence: recovered.evidence,
+			}),
+		);
 	} finally {
 		await supervisor.dispose();
 	}

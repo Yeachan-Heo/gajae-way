@@ -288,7 +288,7 @@ function bareConsoleGateway(name: string, health: "running" | "failed_closed"): 
 	const profilePath = path.join(root, "profile.toml");
 	fs.writeFileSync(
 		profilePath,
-		`[corpus]\npath = "${corpus}"\nworkspace = "${workspace}"\n\n[injection]\nfiles = []\n\n[surfaces.owner]\nid = "owner"\nplatform = "test"\nkind = "dm"\n`,
+		`[corpus]\npath = "${corpus}"\nworkspace = "${workspace}"\n\n[injection]\nfiles = []\n\n[surfaces.owner]\nid = "owner"\nplatform = "test"\nkind = "dm"\nsession_kind = "main"\n`,
 	);
 	const core = loadWayCore().WayCore.open(stateDirectory);
 	core.startRpcServer(

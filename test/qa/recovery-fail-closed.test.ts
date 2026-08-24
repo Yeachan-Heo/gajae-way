@@ -32,6 +32,7 @@ session_id = "${sessionId}"
 id = "owner"
 platform = "test"
 kind = "dm"
+session_kind = "main"
 `;
 }
 

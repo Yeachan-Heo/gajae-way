@@ -37,6 +37,7 @@ conversation = ["MEMORY.md"]
 id = "discord:owner"
 platform = "discord"
 kind = "dm"
+session_kind = "main"
 
 [operator]
 id = "operator-1"
@@ -57,6 +58,7 @@ id = "operator-1"
 kind = "dm"
 platform = "discord"
 id = "discord:owner"
+session_kind = "main"
 
 [injection]
 files = ["SOUL.md", "USER.md", "daily/{date}.md", "MEMORY.md"]

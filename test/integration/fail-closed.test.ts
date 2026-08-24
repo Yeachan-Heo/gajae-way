@@ -47,6 +47,7 @@ files = []
 id = "owner"
 platform = "test"
 kind = "dm"
+session_kind = "main"
 `,
 	);
 	const child = managedProcesses.spawnDaemon({

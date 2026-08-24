@@ -85,11 +85,13 @@ session_id = "${sessionId}"
 id = "owner"
 platform = "test"
 kind = "dm"
+session_kind = "main"
 
 [[surfaces.known]]
 id = "guest"
 platform = "test"
 kind = "channel"
+session_kind = "conversation"
 `;
 }
 
@@ -158,7 +160,7 @@ test("main.submit validates its UDS contract and durable idempotency through an 
 			initialVerificationState: resumed.verificationState,
 			...(resumed.verificationTail === undefined ? {} : { verificationTail: resumed.verificationTail }),
 		});
-		const submit = createMainAdmissionHandler(host, profile, core);
+		const { submitFromRpc: submit } = createMainAdmissionHandler(host, profile, core);
 		core.startRpcServer(path.join(stateDirectory, "rpc.sock"), createRpcBridge(core, async (method, params) => {
 			if (method === "main.submit") return await submit(params);
 			throw new RpcBridgeException(-32601, `method not found: ${method}`);

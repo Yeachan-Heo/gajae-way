@@ -24,6 +24,8 @@ export interface ExternalGatewaySurface {
 	readonly id: string;
 	readonly platform: string;
 	readonly kind: string;
+	/** Declared redaction class; defaults to `conversation` for known surfaces. */
+	readonly sessionKind?: string;
 }
 
 export interface ExternalGatewayOptions {
@@ -60,10 +62,10 @@ function profileToml(
 ): string {
 	const known = knownSurfaces
 		.map(
-			surface => `\n[[surfaces.known]]\nid = "${surface.id}"\nplatform = "${surface.platform}"\nkind = "${surface.kind}"\n`,
+			surface => `\n[[surfaces.known]]\nid = "${surface.id}"\nplatform = "${surface.platform}"\nkind = "${surface.kind}"\nsession_kind = "${surface.sessionKind ?? "conversation"}"\n`,
 		)
 		.join("");
-	return `[corpus]\npath = "${path.join(fixture.root, "corpus")}"\nworkspace = "${fixture.workspace}"\n\n[injection]\nfiles = []\n\n[main_session]\nsession_id = "${fixture.sessionId}"\n\n[surfaces.owner]\nid = "${ownerSurface.id}"\nplatform = "${ownerSurface.platform}"\nkind = "${ownerSurface.kind}"\n${known}`;
+	return `[corpus]\npath = "${path.join(fixture.root, "corpus")}"\nworkspace = "${fixture.workspace}"\n\n[injection]\nfiles = []\n\n[main_session]\nsession_id = "${fixture.sessionId}"\n\n[surfaces.owner]\nid = "${ownerSurface.id}"\nplatform = "${ownerSurface.platform}"\nkind = "${ownerSurface.kind}"\nsession_kind = "main"\n${known}`;
 }
 
 export async function connectEventually(socketPath: string): Promise<RpcClient> {
@@ -93,7 +95,7 @@ export async function eventually<T>(read: () => T | undefined, message: string, 
 /** Starts a full external-session gateway through the production broker CLI boundary. */
 export async function createExternalGateway(options: ExternalGatewayOptions = {}): Promise<ExternalGateway> {
 	const fixture = options.fixture ?? new FakeBrokerFixture();
-	const ownerSurface = options.ownerSurface ?? { id: "owner", platform: "test", kind: "dm" };
+	const ownerSurface = options.ownerSurface ?? { id: "owner", platform: "test", kind: "dm", sessionKind: "main" };
 	const knownSurfaces = options.knownSurfaces ?? [];
 	const corpus = path.join(fixture.root, "corpus");
 	fs.mkdirSync(corpus, { recursive: true });
@@ -149,7 +151,7 @@ export async function createExternalGateway(options: ExternalGatewayOptions = {}
 		initialAdmissionAttributions: parseMainSessionAdmissionAttributions(core.mainAdmissionAttributions()),
 	});
 	const gatewayTools = new GatewayToolController({ core, profile, host });
-	const submit = createMainAdmissionHandler(host, profile, core, {
+	const { submitFromRpc: submit } = createMainAdmissionHandler(host, profile, core, {
 		newOpRef: options.newOpRef,
 		isSurfaceQuarantined: options.isSurfaceQuarantined,
 		afterBrokerAcceptedBeforeFinalize: options.afterBrokerAcceptedBeforeFinalize,

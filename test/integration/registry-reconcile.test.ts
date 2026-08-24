@@ -396,10 +396,10 @@ test("gateway authority survives reconciliation and all routing quarantine predi
 	const profilePath = path.join(fixture.root, "profile.toml");
 	fs.writeFileSync(
 		profilePath,
-		`[corpus]\npath = "${corpus}"\nworkspace = "${workspace}"\n\n[injection]\nfiles = []\n\n[surfaces.owner]\nid = "surface-a"\nplatform = "test"\nkind = "dm"\n`,
+		`[corpus]\npath = "${corpus}"\nworkspace = "${workspace}"\n\n[injection]\nfiles = []\n\n[surfaces.owner]\nid = "surface-a"\nplatform = "test"\nkind = "dm"\nsession_kind = "main"\n`,
 	);
 	const profile = loadWayProfile(profilePath);
-	const submit = createMainAdmissionHandler(
+	const { submitFromRpc: submit } = createMainAdmissionHandler(
 		{
 			turnState: "idle",
 			async admit() {},

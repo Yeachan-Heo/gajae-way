@@ -62,7 +62,7 @@ function rpcStub(methods: Record<string, unknown>): JsonRpcClient {
 function controller(core: MemoryCore, origin: string | undefined = "owner") {
 	return new GatewayToolController({
 		core,
-		profile: { ownerSurfaces: [{ id: "owner", platform: "test", kind: "dm" }], knownSurfaces: [{ id: "owner", platform: "test", kind: "dm" }, { id: "guest", platform: "test", kind: "channel" }] },
+		profile: { ownerSurfaces: [{ id: "owner", platform: "test", kind: "dm", sessionKind: "main" }], knownSurfaces: [{ id: "owner", platform: "test", kind: "dm", sessionKind: "main" }, { id: "guest", platform: "test", kind: "channel", sessionKind: "conversation" }] },
 		host: { get turnOriginSurfaceId() { return origin; } },
 		now: () => core.now,
 	});
@@ -97,13 +97,13 @@ test("way_status, way_surfaces, and way_turn_origin use only their narrow gatewa
 	const rpc = rpcStub({
 		"way.health": () => { calls.push("way.health"); return { status: "healthy", state: "running" }; },
 		"way.status": () => { calls.push("way.status"); return { journal: { head_cursor: "1:4" }, write_mode: true }; },
-		"main.surfaces": () => { calls.push("main.surfaces"); return [{ id: "guest", platform: "test", kind: "channel" }]; },
+		"main.surfaces": () => { calls.push("main.surfaces"); return [{ id: "guest", platform: "test", kind: "channel", sessionKind: "conversation" }]; },
 		"main.turn.origin": () => { calls.push("main.turn.origin"); return { surface_id: "guest" }; },
 	});
 	const status = await handleMcpRequest({ jsonrpc: "2.0", id: 1, method: "tools/call", params: { name: "way_status", arguments: {} } }, rpc);
 	expect(status).toMatchObject({ result: { content: [{ type: "text" }] } });
 	const surfaces = await handleMcpRequest({ jsonrpc: "2.0", id: 2, method: "tools/call", params: { name: "way_surfaces", arguments: {} } }, rpc);
-	expect(surfaces).toMatchObject({ result: { content: [{ text: '[{"id":"guest","platform":"test","kind":"channel"}]' }] } });
+	expect(surfaces).toMatchObject({ result: { content: [{ text: '[{"id":"guest","platform":"test","kind":"channel","sessionKind":"conversation"}]' }] } });
 	const origin = await handleMcpRequest({ jsonrpc: "2.0", id: 3, method: "tools/call", params: { name: "way_turn_origin", arguments: {} } }, rpc);
 	expect(origin).toMatchObject({ result: { content: [{ text: '{"surface_id":"guest"}' }] } });
 	expect(calls).toEqual(["way.health", "way.status", "main.surfaces", "main.turn.origin"]);

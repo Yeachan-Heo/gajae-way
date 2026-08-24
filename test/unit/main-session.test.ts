@@ -38,6 +38,7 @@ session_id = "${options.sessionId ?? fixture.sessionId}"
 id = "owner"
 platform = "test"
 kind = "dm"
+session_kind = "main"
 
 [operator]
 id = "operator-1"
@@ -1296,7 +1297,7 @@ test.serial("a failed definitive-rejection claim abandonment degrades and fences
 			return pending ? [{ scope: "main.submit", key: "claim-abandon-failure", requestJson: "{}", intentJson: "{}" }] : [];
 		},
 	};
-	const submit = createMainAdmissionHandler(host, profile, idempotency);
+	const { submitFromRpc: submit } = createMainAdmissionHandler(host, profile, idempotency);
 	try {
 		fixture.rejectNextTurn();
 		await expect(

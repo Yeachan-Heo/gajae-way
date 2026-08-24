@@ -232,11 +232,13 @@ files = []
 id = "discord:owner-dm"
 platform = "discord"
 kind = "dm"
+session_kind = "main"
 
 [[surfaces.known]]
 id = "discord:guild-a"
 platform = "discord"
 kind = "channel"
+session_kind = "conversation"
 
 ${adapter}`;
 	try {

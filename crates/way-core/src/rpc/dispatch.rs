@@ -43,7 +43,49 @@ pub const MAIN_EVENT_KINDS: &[&str] = &[
 	"profile_approved",
 	"main_identity_growth_absorbed",
 	"failed_closed_recovered",
+	"schedule_run",
+	"alert_raised",
+	"alert_cleared",
+	"memory_index_rebuilt",
 ];
+
+/// Aggregate scheduler counters for `way.status`.
+///
+/// Deliberately counters and states only: no payload text, no surface ids, and
+/// no operator-authored content, so this projection stays safe to expose beside
+/// the rest of the status document.
+fn schedule_status_json(store: &crate::store::Store) -> Result<serde_json::Value, RpcError> {
+	let connection = store.connection().map_err(store_error)?;
+	let counts = |state: &str| -> Result<i64, RpcError> {
+		connection
+			.query_row(
+				"SELECT COUNT(*) FROM schedule_jobs WHERE state = ?1",
+				rusqlite::params![state],
+				|row| row.get::<_, i64>(0),
+			)
+			.map_err(|error| store_error(crate::store::StoreError::Sql(error)))
+	};
+	let active = counts("active")?;
+	let backoff = counts("backoff")?;
+	let suspended = counts("suspended")?;
+	let next_fire_at_ms = connection
+		.query_row(
+			"SELECT MIN(next_fire_at_ms) FROM schedule_jobs WHERE state IN ('active','backoff') AND next_fire_at_ms IS NOT NULL",
+			[],
+			|row| row.get::<_, Option<i64>>(0),
+		)
+		.map_err(|error| store_error(crate::store::StoreError::Sql(error)))?;
+	let in_flight = connection
+		.query_row("SELECT COUNT(*) FROM schedule_runs WHERE outcome IS NULL", [], |row| row.get::<_, i64>(0))
+		.map_err(|error| store_error(crate::store::StoreError::Sql(error)))?;
+	Ok(json!({
+		"active_jobs": active,
+		"backoff_jobs": backoff,
+		"suspended_jobs": suspended,
+		"in_flight_runs": in_flight,
+		"next_fire_at_ms": next_fire_at_ms,
+	}))
+}
 
 static NEXT_CORRELATION_ID: AtomicU64 = AtomicU64::new(1);
 
@@ -70,6 +112,10 @@ pub const APP_ERROR_CODES: &[(i64, &str)] = &[
 	(1502, "payload_too_large"),
 	(1600, "cursor_before_retention"),
 	(1601, "consumer_claim_held"),
+	(1700, "schedule_not_found"),
+	(1701, "schedule_invalid_spec"),
+	(1702, "schedule_refused"),
+	(1801, "memory_index_stale"),
 	(1900, "unauthorized"),
 ];
 
@@ -636,7 +682,7 @@ impl RpcDispatcher {
 			return Err(RpcError::internal("request cancelled"));
 		}
 		let health = self.reconciled_health()?;
-		if health.state == GatewayState::FailedClosed && !matches!(method.as_str(), "way.health" | "way.status" | "profile.approve" | "main.events.read" | "main.gate.answer") {
+		if health.state == GatewayState::FailedClosed && !matches!(method.as_str(), "way.health" | "way.status" | "way.metrics" | "profile.approve" | "main.events.read" | "main.gate.answer") {
 			return Err(RpcError::app(1000, health.reason.map(|reason| json!({ "reason": reason }))));
 		}
 		if main_session_mutation_requires_transcript_proof(&method) && main_admission_transcript_proof_pending(&self.store)? {
@@ -646,6 +692,8 @@ impl RpcDispatcher {
 		match method.as_str() {
 			"way.health" => self.health_response(params),
 			"way.status" => self.status_response(params).await,
+			"way.metrics" => self.metrics_response(params).await,
+			"memory.search" => self.memory_search_response(params).await,
 			"gitlock.acquire" => Err(RpcError::invalid_params(
 				"gitlock.acquire is reserved for the daemon's supervised in-daemon closure executor in v1",
 			)),
@@ -663,7 +711,7 @@ impl RpcDispatcher {
 			"main.events.read" => self.main_events_read(params, cancellation).await,
 			"consumer.claim" => self.consumer_claim(params).await,
 			"consumer.commit" => self.consumer_commit(params).await,
-			method if method.starts_with("main.") || method == "profile.approve" => self.bridge_method(method, params, cancellation).await,
+			method if method.starts_with("main.") || method.starts_with("schedule.") || method == "profile.approve" => self.bridge_method(method, params, cancellation).await,
 
 			_ => Err(RpcError::method_not_found(&method)),
 		}
@@ -695,6 +743,92 @@ impl RpcDispatcher {
 				.insert("reason".to_owned(), Value::String(reason));
 		}
 		Ok(response)
+	}
+
+	/// Scrapeable counters projected from state the daemon already tracks.
+	///
+	/// Deliberately counters, ages, and booleans only. Holder identity, session
+	/// ids, lease ids, and free-text reasons are excluded so this projection is
+	/// safe to expose over the unauthenticated loopback HTTP endpoint; the
+	/// authenticated UDS path may still read the richer `way.status`.
+	/// Corpus recall, deliberately NOT in the fail-closed allowlist.
+	///
+	/// `profile_drift` is precisely the state in which the digest-bound policy
+	/// authorizing this read is unverified, so answering would apply an
+	/// unverified redaction mask.
+	async fn memory_search_response(&self, params: Value) -> Result<Value, RpcError> {
+		let object = params.as_object().ok_or_else(|| RpcError::invalid_params("memory.search params must be an object"))?;
+		for key in object.keys() {
+			if !matches!(key.as_str(), "query" | "session_kind" | "limit") {
+				return Err(RpcError::invalid_params(&format!("unsupported memory.search field: {key}")));
+			}
+		}
+		let query = object
+			.get("query")
+			.and_then(Value::as_str)
+			.filter(|value| !value.trim().is_empty())
+			.ok_or_else(|| RpcError::invalid_params("memory.search requires a non-empty query"))?;
+		let session_kind = object.get("session_kind").and_then(Value::as_str).unwrap_or("unknown");
+		let limit = object.get("limit").and_then(Value::as_i64).unwrap_or(10).clamp(1, 50);
+
+		let digest = self.store.get_meta("profile_digest").map_err(store_error)?.unwrap_or_default();
+		// The mask is derived from the digest-bound projection by the SAME
+		// predicate the injector uses, stored per session kind at index build.
+		let mask_key = format!("memory_mask_{session_kind}");
+		let mask = match self.store.get_meta(&mask_key).map_err(store_error)? {
+			Some(raw) => raw.trim().parse::<u64>().unwrap_or(u64::MAX),
+			// An unbound, unresolvable, or absent class falls back to the most
+			// restrictive posture rather than the most permissive.
+			None => self
+				.store
+				.get_meta("memory_mask_unknown")
+				.map_err(store_error)?
+				.and_then(|raw| raw.trim().parse::<u64>().ok())
+				.unwrap_or(u64::MAX),
+		};
+
+		match crate::memory::search(&self.store, &digest, query, mask, limit) {
+			Ok(hits) => Ok(json!({
+				// `hits.length` is the ONLY observable cardinality: no total,
+				// matched, or score_sum, because any of those would disclose the
+				// existence of redacted documents.
+				"hits": hits
+					.into_iter()
+					.map(|hit| json!({ "path": hit.path, "snippet": hit.snippet, "rank": hit.rank }))
+					.collect::<Vec<_>>(),
+			})),
+			Err(crate::memory::MemoryError::IndexStale { .. }) => Err(RpcError::app(1801, None)),
+			Err(error) => Err(RpcError::internal(&error.to_string())),
+		}
+	}
+
+	async fn metrics_response(&self, _params: Value) -> Result<Value, RpcError> {
+		let health = self.reconciled_health()?;
+		let main_session = self
+			.main_session
+			.lock()
+			.map_err(|_| RpcError::internal("main session status lock poisoned"))?
+			.clone();
+		// Reuses the same durable projection the HTTP endpoint serves rather than
+		// duplicating its queries, then adds the in-memory session fields that
+		// only this authenticated path exposes.
+		let mut projection = crate::metrics::durable_projection(&self.store, &self.locks, crate::store::unix_epoch_ms())
+			.map_err(store_error)?;
+		let object = projection
+			.as_object_mut()
+			.ok_or_else(|| RpcError::internal("durable metrics projection is not an object"))?;
+		object.insert("gajaeway_state".to_owned(), json!(health.state.as_str()));
+		object.insert("gajaeway_journal_degraded".to_owned(), json!(main_session.journal_degraded));
+		object.insert("gajaeway_turn_busy".to_owned(), json!(main_session.turn_state == "busy"));
+		object.insert(
+			"gajaeway_follow_up_queue_depth".to_owned(),
+			json!(main_session.follow_up_queue_depth),
+		);
+		object.insert(
+			"gajaeway_transcript_verified".to_owned(),
+			json!(main_session.transcript_verification == "verified"),
+		);
+		Ok(projection)
 	}
 
 	async fn status_response(&self, params: Value) -> Result<Value, RpcError> {
@@ -767,6 +901,17 @@ impl RpcDispatcher {
 		response.insert("tail_ring_rotation_count".to_owned(), json!(tail_ring_rotation_count));
 		response.insert("transcript_delivery_gap_count".to_owned(), json!(transcript_delivery_gap_count));
 		response.insert("transcript_delivery_gap_detected".to_owned(), json!(transcript_delivery_gap_count > 0));
+		// Scheduler state is surfaced here so the owner console and way.metrics
+		// can see the subsystem; without it a new durable writer would be
+		// invisible to the operator surfaces this project treats as the
+		// observability contract.
+		response.insert("schedule".to_owned(), schedule_status_json(&self.store)?);
+		// Raised alert conditions, so an operator surface can see an active
+		// condition without tailing the journal.
+		response.insert(
+			"alerts".to_owned(),
+			json!(crate::alerts::raised_conditions(&self.store).map_err(store_error)?),
+		);
 		let mut lock = lock_status_json(lock_status);
 		lock.as_object_mut()
 			.expect("lock status is an object")
@@ -1539,7 +1684,7 @@ mod tests {
 		for (code, name) in APP_ERROR_CODES {
 			assert_eq!(app_error_name(*code), Some(*name));
 		}
-		assert_eq!(APP_ERROR_CODES.len(), 22);
+		assert_eq!(APP_ERROR_CODES.len(), 26);
 	}
 
 	#[tokio::test]
@@ -1605,6 +1750,173 @@ mod tests {
 			.await
 			.unwrap_err();
 		assert_ne!(approval.code, 1000);
+	}
+
+	/// Every `schedule.*` method must be refused while failed closed.
+	///
+	/// This holds because the family routes through the bridge arm and is absent
+	/// from the fail-closed allowlist, so it needs no second list to maintain.
+	/// The test pins that consequence rather than the mechanism, so moving the
+	/// routing without re-checking the gate fails here.
+	#[tokio::test]
+	async fn failed_closed_blocks_every_schedule_method() {
+		let dispatcher = dispatcher();
+		dispatcher.set_gateway_state(GatewayState::FailedClosed, Some("profile_drift".to_owned()));
+		let cancellation = super::super::CancellationToken::new();
+		for method in [
+			"schedule.create",
+			"schedule.update",
+			"schedule.delete",
+			"schedule.run_now",
+			"schedule.get",
+			"schedule.list",
+			"schedule.runs",
+		] {
+			let error = dispatcher
+				.dispatch(method.to_owned(), json!({}), cancellation.clone())
+				.await
+				.unwrap_err();
+			assert_eq!(error.code, 1000, "{method} must be fenced while failed closed");
+		}
+	}
+
+	/// `memory.search` must be REFUSED while failed closed. Unlike way.metrics,
+	/// this read is authorized by the digest-bound redaction policy, and
+	/// `profile_drift` is exactly the state in which that policy is unverified.
+	#[tokio::test]
+	async fn failed_closed_blocks_memory_search() {
+		let dispatcher = dispatcher();
+		dispatcher.set_gateway_state(GatewayState::FailedClosed, Some("profile_drift".to_owned()));
+		let error = dispatcher
+			.dispatch("memory.search".to_owned(), json!({ "query": "anything" }), super::super::CancellationToken::new())
+			.await
+			.unwrap_err();
+		assert_eq!(error.code, 1000);
+	}
+
+	#[tokio::test]
+	async fn memory_search_rejects_unknown_fields_and_an_empty_query() {
+		let dispatcher = dispatcher();
+		let cancellation = super::super::CancellationToken::new();
+		for params in [json!({ "query": "x", "mask": 0 }), json!({ "query": "   " }), json!({})] {
+			let error = dispatcher
+				.dispatch("memory.search".to_owned(), params, cancellation.clone())
+				.await
+				.unwrap_err();
+			assert_eq!(error.code, -32602);
+		}
+	}
+
+	/// The response must expose no cardinality beyond `hits.length`; a total or
+	/// match count would disclose the existence of redacted documents.
+	#[tokio::test]
+	async fn memory_search_exposes_no_cardinality_beyond_hits() {
+		let dispatcher = dispatcher();
+		let digest = dispatcher.store.get_meta("profile_digest").unwrap().unwrap_or_default();
+		crate::memory::rebuild(&dispatcher.store, &digest, &[(0, "SOUL.md".to_owned(), "quokka".to_owned())]).unwrap();
+
+		let result = dispatcher
+			.dispatch("memory.search".to_owned(), json!({ "query": "quokka" }), super::super::CancellationToken::new())
+			.await
+			.unwrap();
+
+		let object = result.as_object().unwrap();
+		assert_eq!(object.len(), 1, "hits is the only field");
+		assert!(object.contains_key("hits"));
+		for forbidden in ["total", "matched", "score_sum", "count"] {
+			assert!(!object.contains_key(forbidden), "must not expose {forbidden}");
+		}
+	}
+
+	/// The spec maps an unbound, unresolvable, or absent class to `unknown`.
+	/// This asserts that mapping explicitly rather than relying on an empty
+	/// store, which is what the previous version of this test actually proved.
+	#[tokio::test]
+	async fn an_unresolvable_session_kind_uses_the_unknown_mask() {
+		let dispatcher = dispatcher();
+		let digest = dispatcher.store.get_meta("profile_digest").unwrap().unwrap_or_default();
+		crate::memory::rebuild(
+			&dispatcher.store,
+			&digest,
+			&[(0, "SOUL.md".to_owned(), "quokka".to_owned()), (1, "MEMORY.md".to_owned(), "quokka".to_owned())],
+		)
+		.unwrap();
+		// `unknown` denies bit 1 only.
+		dispatcher.store.set_meta("memory_mask_unknown", "2").unwrap();
+
+		let result = dispatcher
+			.dispatch(
+				"memory.search".to_owned(),
+				json!({ "query": "quokka", "session_kind": "nonexistent" }),
+				super::super::CancellationToken::new(),
+			)
+			.await
+			.unwrap();
+		let hits = result["hits"].as_array().unwrap();
+		assert_eq!(hits.len(), 1, "an unresolvable class inherits unknown's deny list");
+		assert_eq!(hits[0]["path"], "SOUL.md");
+	}
+
+	/// With no mask recorded at all, the fallback must be deny-all rather than
+	/// permit-all: an unconfigured class is where guessing permissively is worst.
+	#[tokio::test]
+	async fn an_absent_mask_denies_everything() {
+		let dispatcher = dispatcher();
+		let digest = dispatcher.store.get_meta("profile_digest").unwrap().unwrap_or_default();
+		crate::memory::rebuild(&dispatcher.store, &digest, &[(0, "SOUL.md".to_owned(), "quokka".to_owned())]).unwrap();
+
+		let result = dispatcher
+			.dispatch(
+				"memory.search".to_owned(),
+				json!({ "query": "quokka", "session_kind": "nonexistent" }),
+				super::super::CancellationToken::new(),
+			)
+			.await
+			.unwrap();
+		assert!(result["hits"].as_array().unwrap().is_empty(), "no mask means deny all");
+	}
+
+	/// `way.metrics` must answer while failed closed: that is the one state an
+	/// operator most needs telemetry, so refusing it would be a self-inflicted
+	/// blind spot.
+	#[tokio::test]
+	async fn metrics_answers_while_failed_closed_and_excludes_identifiers() {
+		let dispatcher = dispatcher();
+		dispatcher.set_gateway_state(GatewayState::FailedClosed, Some("profile_drift".to_owned()));
+		let metrics = dispatcher
+			.dispatch("way.metrics".to_owned(), json!({}), super::super::CancellationToken::new())
+			.await
+			.unwrap();
+
+		assert_eq!(metrics["gajaeway_state"], "failed_closed");
+		assert!(metrics["gajaeway_journal_head_seq"].is_number());
+		assert!(metrics["gajaeway_lock_quarantined"].is_boolean());
+		assert!(metrics["gajaeway_schedule"]["active_jobs"].is_number());
+
+		// No holder identity, session id, lease id, or free-text reason may
+		// appear: this projection is exposed over unauthenticated loopback HTTP.
+		let rendered = serde_json::to_string(&metrics).unwrap();
+		for forbidden in ["holder", "session_id", "lease_id", "reason"] {
+			assert!(!rendered.contains(forbidden), "metrics must not expose {forbidden}");
+		}
+	}
+
+	/// `way.status` must expose the scheduler subsystem, or a new durable writer
+	/// is invisible to the operator surfaces this project treats as the
+	/// observability contract.
+	#[tokio::test]
+	async fn status_exposes_scheduler_counters() {
+		let dispatcher = dispatcher();
+		let status = dispatcher
+			.dispatch("way.status".to_owned(), json!({}), super::super::CancellationToken::new())
+			.await
+			.unwrap();
+		let schedule = &status["schedule"];
+		assert_eq!(schedule["active_jobs"], 0);
+		assert_eq!(schedule["backoff_jobs"], 0);
+		assert_eq!(schedule["suspended_jobs"], 0);
+		assert_eq!(schedule["in_flight_runs"], 0);
+		assert!(schedule["next_fire_at_ms"].is_null());
 	}
 
 	#[tokio::test]

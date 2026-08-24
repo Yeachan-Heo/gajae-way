@@ -1,32 +1,36 @@
 import type { BrokerOperationReceipt } from "../broker/cli";
-import { MainSessionGateRegistry, type GateHandle, type MainGateResolution } from "./gates";
+import { type GateHandle, type MainGateResolution, MainSessionGateRegistry } from "./gates";
 import {
 	attestsExternalTranscriptGrowth,
 	compareTailCheckpoints,
+	type ExternalSessionIdentity,
 	fingerprintTranscriptEntries,
-	GatewayStateStore,
+	type GatewayStateStore,
+	type GrowthIntent,
 	sameExternalFingerprint,
 	sameExternalSession,
-	type ExternalSessionIdentity,
-	type GrowthIntent,
 	type TailCheckpoint,
 	type TranscriptDeliveryProgress,
 	type TranscriptProof,
 } from "./state";
 import {
-	classifyAdmissionDisposition,
-	HostSupervisorError,
 	type AdmissionDisposition,
+	classifyAdmissionDisposition,
 	type HostSupervisor,
+	HostSupervisorError,
 	type SupervisorEvent,
 	type SupervisorTailEvents,
 	type SupervisorTranscriptEntry,
 } from "./supervisor";
 
-
 export interface MainSessionJournal {
 	journalAppend(kind: string, payloadJson: string): unknown;
-	journalAppendAtTailCheckpoint?(kind: string, payloadJson: string, expected: TailCheckpoint | undefined, checkpoint: TailCheckpoint): unknown;
+	journalAppendAtTailCheckpoint?(
+		kind: string,
+		payloadJson: string,
+		expected: TailCheckpoint | undefined,
+		checkpoint: TailCheckpoint,
+	): unknown;
 	/** Atomically persists the journal projection, tail watermark, and delivery replay point. */
 	journalAppendTranscriptProjection(
 		kind: string,
@@ -37,7 +41,11 @@ export interface MainSessionJournal {
 		nextDelivery: TranscriptDeliveryProgress,
 	): unknown;
 	setRpcHealth?(state: "degraded" | "running", reason: string): void;
-	setMainSessionStatus?(turnState: "idle" | "busy", followUpQueueDepth: number, verificationState: "pending" | "verified"): void;
+	setMainSessionStatus?(
+		turnState: "idle" | "busy",
+		followUpQueueDepth: number,
+		verificationState: "pending" | "verified",
+	): void;
 	setJournalDegraded?(degraded: boolean): void;
 }
 
@@ -61,12 +69,15 @@ export class MainSessionHostError extends Error {
 /** A durable broker-attempt-to-origin-surface binding retained for delayed projection. */
 export interface MainSessionAdmissionAttribution {
 	readonly attemptIds: readonly string[];
-	readonly surfaceId: string;
+	/** Absent for scheduler-originated work, which has no surface. */
+	readonly surfaceId?: string;
+	readonly origin?: "scheduler";
 }
 
 export interface PersistedMainSessionAdmissionAttribution {
 	readonly attemptIdsJson: string;
-	readonly surfaceId: string;
+	readonly surfaceId?: string;
+	readonly origin?: string;
 }
 
 /** Rejects corrupt durable attribution rather than guessing from operation-ref shapes. */
@@ -75,16 +86,36 @@ export function parseMainSessionAdmissionAttributions(
 ): readonly MainSessionAdmissionAttribution[] {
 	const surfaceByAttemptId = new Map<string, string>();
 	return rows.map((row) => {
-		if (typeof row.surfaceId !== "string" || !row.surfaceId.trim()) {
-			throw new MainSessionHostError("main_admission_attribution_invalid", "A durable main-admission surface attribution is invalid.");
+		// Exactly one of a surface or a scheduler origin. Operator traffic is
+		// attributed to the surface it arrived on; in-process scheduler traffic is
+		// attributed to its origin because it has no surface to borrow authority
+		// from. Both, neither, or an unrecognized origin are corruption rather
+		// than something to default.
+		const hasSurface = typeof row.surfaceId === "string" && row.surfaceId.trim().length > 0;
+		const isScheduler = row.origin === "scheduler";
+		if (hasSurface === isScheduler) {
+			throw new MainSessionHostError(
+				"main_admission_attribution_invalid",
+				"A durable main-admission attribution must declare exactly one of a surface or an origin.",
+			);
+		}
+		if (!hasSurface && !isScheduler) {
+			throw new MainSessionHostError(
+				"main_admission_attribution_invalid",
+				"A durable main-admission attribution has an unknown origin.",
+			);
 		}
 		let parsed: unknown;
 		try {
 			parsed = JSON.parse(row.attemptIdsJson) as unknown;
 		} catch (error) {
-			throw new MainSessionHostError("main_admission_attribution_invalid", "A durable main-admission attempt attribution is not JSON.", {
-				cause: error,
-			});
+			throw new MainSessionHostError(
+				"main_admission_attribution_invalid",
+				"A durable main-admission attempt attribution is not JSON.",
+				{
+					cause: error,
+				},
+			);
 		}
 		if (
 			!Array.isArray(parsed) ||
@@ -92,16 +123,27 @@ export function parseMainSessionAdmissionAttributions(
 			parsed.some((attemptId) => typeof attemptId !== "string" || !attemptId) ||
 			new Set(parsed).size !== parsed.length
 		) {
-			throw new MainSessionHostError("main_admission_attribution_invalid", "A durable main-admission attempt attribution is malformed.");
+			throw new MainSessionHostError(
+				"main_admission_attribution_invalid",
+				"A durable main-admission attempt attribution is malformed.",
+			);
 		}
-		for (const attemptId of parsed) {
-			const existing = surfaceByAttemptId.get(attemptId);
-			if (existing !== undefined && existing !== row.surfaceId) {
-				throw new MainSessionHostError("main_admission_attribution_invalid", "A broker attempt has conflicting durable surface attributions.");
+		// Only surface-attributed rows contribute an attempt-to-surface mapping.
+		if (hasSurface) {
+			const surfaceId = row.surfaceId as string;
+			for (const attemptId of parsed) {
+				const existing = surfaceByAttemptId.get(attemptId);
+				if (existing !== undefined && existing !== surfaceId) {
+					throw new MainSessionHostError(
+						"main_admission_attribution_invalid",
+						"A broker attempt has conflicting durable surface attributions.",
+					);
+				}
+				surfaceByAttemptId.set(attemptId, surfaceId);
 			}
-			surfaceByAttemptId.set(attemptId, row.surfaceId);
+			return { attemptIds: parsed, surfaceId };
 		}
-		return { attemptIds: parsed, surfaceId: row.surfaceId };
+		return { attemptIds: parsed, origin: "scheduler" as const };
 	});
 }
 
@@ -281,8 +323,8 @@ function textFromContent(content: unknown): string {
 	if (!Array.isArray(content)) return "";
 	return content
 		.filter(isRecord)
-		.filter(block => (block.type === "text" || block.type === "output_text") && typeof block.text === "string")
-		.map(block => block.text as string)
+		.filter((block) => (block.type === "text" || block.type === "output_text") && typeof block.text === "string")
+		.map((block) => block.text as string)
 		.join("");
 }
 
@@ -296,22 +338,36 @@ function messageIds(event: Record<string, unknown>): readonly string[] {
 	const candidates: unknown[] = [transcriptMessageCandidate(event)];
 	if (Array.isArray(event.messages)) candidates.push(...event.messages);
 	return distinctAttemptIds(
-		candidates.filter(isRecord).map((candidate) => eventString(candidate, "responseId", "response_id", "id", "message_id")),
+		candidates
+			.filter(isRecord)
+			.map((candidate) => eventString(candidate, "responseId", "response_id", "id", "message_id")),
 	);
 }
 
 function isSafelyNonDeliverableTranscriptEntry(event: Record<string, unknown>): boolean {
 	const candidate = transcriptMessageCandidate(event);
-	if (candidate.role === "user" || candidate.role === "system" || candidate.role === "developer" || candidate.role === "tool") return true;
+	if (
+		candidate.role === "user" ||
+		candidate.role === "system" ||
+		candidate.role === "developer" ||
+		candidate.role === "tool"
+	)
+		return true;
 	if (candidate.role !== "assistant" || !Array.isArray(candidate.content)) return false;
 	return candidate.content.every(
-		block =>
+		(block) =>
 			isRecord(block) &&
-			(block.type === "tool_use" || block.type === "tool_call" || block.type === "thinking" || block.type === "reasoning"),
+			(block.type === "tool_use" ||
+				block.type === "tool_call" ||
+				block.type === "thinking" ||
+				block.type === "reasoning"),
 	);
 }
 
-function finalizedAssistantMessage(event: Record<string, unknown>, fallbackKey: string): FinalAssistantMessage | undefined {
+function finalizedAssistantMessage(
+	event: Record<string, unknown>,
+	fallbackKey: string,
+): FinalAssistantMessage | undefined {
 	const candidate = transcriptMessageCandidate(event);
 	if (candidate.role !== "assistant") return undefined;
 	const text = textFromContent(candidate.content);
@@ -340,7 +396,6 @@ function markFailedClosed(state: GatewayStateStore, reason: string): void {
 		// A competing daemon may have already captured the authoritative reason.
 	}
 }
-
 
 function externalEvent(event: SupervisorEvent): Record<string, unknown> {
 	const payload = isRecord(event.payload) ? event.payload : { payload: event.payload };
@@ -453,15 +508,20 @@ class ExternalMainSessionHost implements MainSessionHost {
 		this.#tailCheckpoint = durable.tailCheckpoint;
 		this.#transcriptDeliveryProgress = durable.transcriptDeliveryProgress;
 		this.#transcriptProof = durable.transcriptProof;
-		this.#verificationState = options.initialVerificationState ?? (durable.transcriptProof === "proven" ? "verified" : "pending");
+		this.#verificationState =
+			options.initialVerificationState ?? (durable.transcriptProof === "proven" ? "verified" : "pending");
 		this.#verificationTail = options.verificationTail;
 		if (durable.transcriptProof === "pending" && this.#verificationState !== "pending") {
-			throw new MainSessionHostError("transcript_proof_invalid", "A pending durable transcript proof cannot start as boot-verified.");
+			throw new MainSessionHostError(
+				"transcript_proof_invalid",
+				"A pending durable transcript proof cannot start as boot-verified.",
+			);
 		}
 		if (options.recoveredGrowthIntent) {
 			this.#growthWindow = { intent: options.recoveredGrowthIntent, pendingAdmissions: 0 };
 		}
-		for (const attribution of options.initialAdmissionAttributions ?? []) this.registerAdmissionAttribution(attribution);
+		for (const attribution of options.initialAdmissionAttributions ?? [])
+			this.registerAdmissionAttribution(attribution);
 
 		this.publishStatus();
 		if (this.#verificationState === "verified") this.#verificationReady.resolve();
@@ -479,7 +539,8 @@ class ExternalMainSessionHost implements MainSessionHost {
 	get turnOriginSurfaceId(): string | undefined {
 		if (this.#turnState !== "busy") return undefined;
 		const candidates = new Set<string>();
-		for (const admission of this.#admittedOperations.values()) if (admission.surfaceId) candidates.add(admission.surfaceId);
+		for (const admission of this.#admittedOperations.values())
+			if (admission.surfaceId) candidates.add(admission.surfaceId);
 		return candidates.size === 1 ? candidates.values().next().value : undefined;
 	}
 
@@ -535,14 +596,24 @@ class ExternalMainSessionHost implements MainSessionHost {
 	}
 
 	private registerAdmissionAttribution(attribution: MainSessionAdmissionAttribution): void {
+		// Scheduler-originated work registers NO attempt-to-surface mapping: it has
+		// no surface, and inventing one would let it borrow routing authority.
+		if (attribution.surfaceId === undefined) return;
 		if (!attribution.surfaceId.trim() || attribution.attemptIds.length === 0) {
-			throw new MainSessionHostError("main_admission_attribution_invalid", "A main-admission attribution is malformed.");
+			throw new MainSessionHostError(
+				"main_admission_attribution_invalid",
+				"A main-admission attribution is malformed.",
+			);
 		}
 		for (const attemptId of attribution.attemptIds) {
-			if (!attemptId) throw new MainSessionHostError("main_admission_attribution_invalid", "A main-admission attempt id is empty.");
+			if (!attemptId)
+				throw new MainSessionHostError("main_admission_attribution_invalid", "A main-admission attempt id is empty.");
 			const existing = this.#surfaceIdByAttemptId.get(attemptId);
 			if (existing !== undefined && existing !== attribution.surfaceId) {
-				throw new MainSessionHostError("main_admission_attribution_invalid", "A broker attempt has conflicting surface attributions.");
+				throw new MainSessionHostError(
+					"main_admission_attribution_invalid",
+					"A broker attempt has conflicting surface attributions.",
+				);
 			}
 			this.#surfaceIdByAttemptId.set(attemptId, attribution.surfaceId);
 		}
@@ -551,7 +622,10 @@ class ExternalMainSessionHost implements MainSessionHost {
 	private mergeSurfaceId(current: string | undefined, candidate: string | undefined): string | undefined {
 		if (candidate === undefined) return current;
 		if (current !== undefined && current !== candidate) {
-			throw new MainSessionHostError("main_admission_attribution_invalid", "One broker observation has conflicting surface attributions.");
+			throw new MainSessionHostError(
+				"main_admission_attribution_invalid",
+				"One broker observation has conflicting surface attributions.",
+			);
 		}
 		return candidate;
 	}
@@ -579,7 +653,10 @@ class ExternalMainSessionHost implements MainSessionHost {
 		for (const messageId of messageIds(event)) {
 			const existing = this.#surfaceIdByResponseId.get(messageId);
 			if (existing !== undefined && existing !== surfaceId) {
-				throw new MainSessionHostError("main_admission_attribution_invalid", "A response message has conflicting surface attributions.");
+				throw new MainSessionHostError(
+					"main_admission_attribution_invalid",
+					"A response message has conflicting surface attributions.",
+				);
 			}
 			this.#surfaceIdByResponseId.set(messageId, surfaceId);
 		}
@@ -619,7 +696,9 @@ class ExternalMainSessionHost implements MainSessionHost {
 		this.#pendingTranscriptAttributions.splice(
 			0,
 			this.#pendingTranscriptAttributions.length,
-			...this.#pendingTranscriptAttributions.filter(attribution => this.#tailObservationEpoch - attribution.tailEpoch <= 1),
+			...this.#pendingTranscriptAttributions.filter(
+				(attribution) => this.#tailObservationEpoch - attribution.tailEpoch <= 1,
+			),
 		);
 		if (this.#pendingTranscriptAttributions.length !== 1) return undefined;
 		const attribution = this.#pendingTranscriptAttributions[0];
@@ -642,7 +721,7 @@ class ExternalMainSessionHost implements MainSessionHost {
 		surfaceId: string | undefined,
 	): void {
 		const attemptIds = admission?.attemptIds ?? this.eventAttemptIds(event);
-		const duplicate = attemptIds.some(attemptId => this.#settledTerminalAttemptIds.has(attemptId));
+		const duplicate = attemptIds.some((attemptId) => this.#settledTerminalAttemptIds.has(attemptId));
 		if (duplicate) return;
 		this.#terminalSettlementSequence += 1;
 		for (const attemptId of attemptIds) this.#settledTerminalAttemptIds.add(attemptId);
@@ -658,7 +737,8 @@ class ExternalMainSessionHost implements MainSessionHost {
 			settlementSequence: this.#terminalSettlementSequence,
 			tailEpoch: this.#tailObservationEpoch,
 		});
-		while (this.#pendingTranscriptAttributions.length > MAX_JOURNALED_ATTEMPTS) this.#pendingTranscriptAttributions.shift();
+		while (this.#pendingTranscriptAttributions.length > MAX_JOURNALED_ATTEMPTS)
+			this.#pendingTranscriptAttributions.shift();
 	}
 
 	private shouldDeferTranscriptAttribution(event: Record<string, unknown>, surfaceId: string | undefined): boolean {
@@ -700,8 +780,12 @@ class ExternalMainSessionHost implements MainSessionHost {
 		} catch (error) {
 			throw this.enterFailure("main_admission_attempt_ids_persist_failed", error);
 		}
-		if (!attemptIds.some(attemptId => matchesCanonicalAdmissionAttemptId(attemptId, this.#unmatchedTerminalAttemptIds))) return;
-		if (!this.settleAdmittedOperation(opRef)) throw this.#failure ?? new MainSessionHostError("main_admission_finalize_failed");
+		if (
+			!attemptIds.some((attemptId) => matchesCanonicalAdmissionAttemptId(attemptId, this.#unmatchedTerminalAttemptIds))
+		)
+			return;
+		if (!this.settleAdmittedOperation(opRef))
+			throw this.#failure ?? new MainSessionHostError("main_admission_finalize_failed");
 	}
 	private publishStatus(): void {
 		try {
@@ -771,7 +855,12 @@ class ExternalMainSessionHost implements MainSessionHost {
 		const scopedAttempt = scope && eventString(scope, "attemptId");
 		const scopedLineage = scope && eventString(scope, "lineage");
 		const scopedGeneration = scope?.generation;
-		if (scopedAttempt && scopedLineage && typeof scopedGeneration === "number" && Number.isSafeInteger(scopedGeneration)) {
+		if (
+			scopedAttempt &&
+			scopedLineage &&
+			typeof scopedGeneration === "number" &&
+			Number.isSafeInteger(scopedGeneration)
+		) {
 			return { attempt_id: scopedAttempt, generation: scopedGeneration, lineage: scopedLineage };
 		}
 		if (!this.#activeAttempt) {
@@ -811,7 +900,10 @@ class ExternalMainSessionHost implements MainSessionHost {
 		if (kind === "turn_end") this.#activeAttempt = undefined;
 	}
 
-	private advanceTranscriptDelivery(expected: TranscriptDeliveryProgress | undefined, next: TranscriptDeliveryProgress): boolean {
+	private advanceTranscriptDelivery(
+		expected: TranscriptDeliveryProgress | undefined,
+		next: TranscriptDeliveryProgress,
+	): boolean {
 		try {
 			this.#state.advanceTranscriptDeliveryProgress(expected, next);
 			this.#transcriptDeliveryProgress = next;
@@ -839,7 +931,11 @@ class ExternalMainSessionHost implements MainSessionHost {
 				...(surfaceId === undefined ? {} : { surface_id: surfaceId }),
 			});
 			const checkpoint = this.#journalTailCheckpoint ?? this.#tailCheckpoint;
-			if (!checkpoint) throw new MainSessionHostError("tail_checkpoint_unavailable", "A transcript projection requires a durable broker-tail checkpoint.");
+			if (!checkpoint)
+				throw new MainSessionHostError(
+					"tail_checkpoint_unavailable",
+					"A transcript projection requires a durable broker-tail checkpoint.",
+				);
 			this.#journal.journalAppendTranscriptProjection(
 				"assistant_message",
 				encoded,
@@ -906,7 +1002,11 @@ class ExternalMainSessionHost implements MainSessionHost {
 		if (type === "agent_end" || type === "turn_end") {
 			const operationRef = this.admittedOperationRef(event);
 			const admission = operationRef === undefined ? undefined : this.#admittedOperations.get(operationRef);
-			this.rememberTerminalBoundary(event, admission, operationRef === undefined ? undefined : this.surfaceIdForEvent(event));
+			this.rememberTerminalBoundary(
+				event,
+				admission,
+				operationRef === undefined ? undefined : this.surfaceIdForEvent(event),
+			);
 			// Persist the terminal boundary before its claim finalizer. If the process
 			// dies after this write, restart reconciliation can prove the acceptance.
 			this.appendTurnTransition("turn_end", event);
@@ -921,7 +1021,11 @@ class ExternalMainSessionHost implements MainSessionHost {
 		if (type === "agent_failed") {
 			const operationRef = this.admittedOperationRef(event);
 			const admission = operationRef === undefined ? undefined : this.#admittedOperations.get(operationRef);
-			this.rememberTerminalBoundary(event, admission, operationRef === undefined ? undefined : this.surfaceIdForEvent(event));
+			this.rememberTerminalBoundary(
+				event,
+				admission,
+				operationRef === undefined ? undefined : this.surfaceIdForEvent(event),
+			);
 			this.appendTurnTransition("turn_end", event);
 			if (this.#failure) return;
 			if (!operationRef) this.rememberUnmatchedTerminalAttempts(event);
@@ -957,7 +1061,11 @@ class ExternalMainSessionHost implements MainSessionHost {
 		try {
 			const encoded = payloadJson({ ...payload, ...(surfaceId === undefined ? {} : { surface_id: surfaceId }) });
 			const checkpoint = this.#journalTailCheckpoint ?? this.#tailCheckpoint;
-			if (!checkpoint) throw new MainSessionHostError("tail_checkpoint_unavailable", "A transcript delivery gap requires a durable broker-tail checkpoint.");
+			if (!checkpoint)
+				throw new MainSessionHostError(
+					"tail_checkpoint_unavailable",
+					"A transcript delivery gap requires a durable broker-tail checkpoint.",
+				);
 			this.#journal.journalAppendTranscriptProjection(
 				"transcript_delivery_gap",
 				encoded,
@@ -975,10 +1083,13 @@ class ExternalMainSessionHost implements MainSessionHost {
 		}
 	}
 
-	private transcriptDeliveryAt(entries: readonly SupervisorTranscriptEntry[], index: number): TranscriptDeliveryProgress {
+	private transcriptDeliveryAt(
+		entries: readonly SupervisorTranscriptEntry[],
+		index: number,
+	): TranscriptDeliveryProgress {
 		return {
 			lastEntryId: entries[index]?.id,
-			fingerprint: fingerprintTranscriptEntries(entries.slice(0, index + 1).map(entry => entry.payload)),
+			fingerprint: fingerprintTranscriptEntries(entries.slice(0, index + 1).map((entry) => entry.payload)),
 		};
 	}
 
@@ -992,18 +1103,19 @@ class ExternalMainSessionHost implements MainSessionHost {
 		const previous = this.#transcriptDeliveryProgress;
 		if (!previous) return entries.length > 0;
 		if (!previous.lastEntryId) return previous.fingerprint.entryCount !== 0;
-		const index = entries.findIndex(entry => entry.id === previous.lastEntryId);
+		const index = entries.findIndex((entry) => entry.id === previous.lastEntryId);
 		if (index < 0) return true;
-		const observed = fingerprintTranscriptEntries(entries.slice(0, index + 1).map(entry => entry.payload));
-		return (
-			observed.entryCount !== previous.fingerprint.entryCount ||
-			observed.sha256 !== previous.fingerprint.sha256
-		);
+		const observed = fingerprintTranscriptEntries(entries.slice(0, index + 1).map((entry) => entry.payload));
+		return observed.entryCount !== previous.fingerprint.entryCount || observed.sha256 !== previous.fingerprint.sha256;
 	}
 
 	private observeTranscript(entries: readonly SupervisorTranscriptEntry[]): void {
 		for (const entry of entries) {
-			if (!entry.id.trim()) throw new HostSupervisorError("transcript_entry_id_missing", "Broker transcript delivery entry has no stable id.");
+			if (!entry.id.trim())
+				throw new HostSupervisorError(
+					"transcript_entry_id_missing",
+					"Broker transcript delivery entry has no stable id.",
+				);
 		}
 		const previous = this.#transcriptDeliveryProgress;
 		if (!previous) {
@@ -1017,7 +1129,7 @@ class ExternalMainSessionHost implements MainSessionHost {
 		}
 		let start = 0;
 		if (previous.lastEntryId) {
-			const index = entries.findIndex(entry => entry.id === previous.lastEntryId);
+			const index = entries.findIndex((entry) => entry.id === previous.lastEntryId);
 			if (index < 0) {
 				this.appendTranscriptDeliveryGap(previous, this.deliveryGapProgress(entries), {
 					reason: "transcript_delivery_unprovable",
@@ -1027,11 +1139,8 @@ class ExternalMainSessionHost implements MainSessionHost {
 				});
 				return;
 			}
-			const observed = fingerprintTranscriptEntries(entries.slice(0, index + 1).map(entry => entry.payload));
-			if (
-				observed.entryCount !== previous.fingerprint.entryCount ||
-				observed.sha256 !== previous.fingerprint.sha256
-			) {
+			const observed = fingerprintTranscriptEntries(entries.slice(0, index + 1).map((entry) => entry.payload));
+			if (observed.entryCount !== previous.fingerprint.entryCount || observed.sha256 !== previous.fingerprint.sha256) {
 				this.appendTranscriptDeliveryGap(previous, this.deliveryGapProgress(entries), {
 					reason: "transcript_delivery_unprovable",
 					delivered_through_entry_id: previous.lastEntryId,
@@ -1060,23 +1169,25 @@ class ExternalMainSessionHost implements MainSessionHost {
 			const pendingAttribution = event ? this.pendingTranscriptAttributionFor(event) : undefined;
 			const surfaceId = event ? this.surfaceIdForTranscriptEntry(event) : undefined;
 			if (event && this.shouldDeferTranscriptAttribution(event, surfaceId)) return;
-			const delivered = finalized && event
-				? this.appendFinalAssistantMessage(event, `transcript:${entry.id}`, expectedDelivery, nextDelivery)
-				: safelyNonDeliverable
-					? this.advanceTranscriptDelivery(expectedDelivery, nextDelivery)
-					: this.appendTranscriptDeliveryGap(
-							expectedDelivery,
-							this.deliveryGapProgress(entries),
-							{
-								reason: "transcript_delivery_unprovable",
-								delivered_through_entry_id: expectedDelivery?.lastEntryId,
-								unprojectable_entry_id: entry.id,
-								available_from_entry_id: entries[0]?.id,
-								available_through_entry_id: entries.at(-1)?.id,
-							},
-							surfaceId,
-						);
-			if (pendingAttribution && delivered && (finalized !== undefined || !safelyNonDeliverable)) this.consumePendingTranscriptAttribution(pendingAttribution);
+			const delivered =
+				finalized && event
+					? this.appendFinalAssistantMessage(event, `transcript:${entry.id}`, expectedDelivery, nextDelivery)
+					: safelyNonDeliverable
+						? this.advanceTranscriptDelivery(expectedDelivery, nextDelivery)
+						: this.appendTranscriptDeliveryGap(
+								expectedDelivery,
+								this.deliveryGapProgress(entries),
+								{
+									reason: "transcript_delivery_unprovable",
+									delivered_through_entry_id: expectedDelivery?.lastEntryId,
+									unprojectable_entry_id: entry.id,
+									available_from_entry_id: entries[0]?.id,
+									available_through_entry_id: entries.at(-1)?.id,
+								},
+								surfaceId,
+							);
+			if (pendingAttribution && delivered && (finalized !== undefined || !safelyNonDeliverable))
+				this.consumePendingTranscriptAttribution(pendingAttribution);
 			if (!delivered || this.#failure || (!finalized && !safelyNonDeliverable)) return;
 		}
 	}
@@ -1087,17 +1198,32 @@ class ExternalMainSessionHost implements MainSessionHost {
 		const identity = tail.identity;
 		const ringCheckpoint = initialRingCheckpoint(tail);
 		if (!ringCheckpoint) {
-			throw new HostSupervisorError("tail_checkpoint_unavailable", "The first complete broker tail did not carry a ring checkpoint.");
+			throw new HostSupervisorError(
+				"tail_checkpoint_unavailable",
+				"The first complete broker tail did not carry a ring checkpoint.",
+			);
 		}
 		if (!identity.transcript) {
-			throw new HostSupervisorError("transcript_proof_invalid", "A complete broker tail did not carry a transcript fingerprint.");
+			throw new HostSupervisorError(
+				"transcript_proof_invalid",
+				"A complete broker tail did not carry a transcript fingerprint.",
+			);
 		}
-		if (tail.transcriptEntries.some(entry => !entry.id.trim())) {
-			throw new HostSupervisorError("transcript_proof_invalid", "A complete broker tail contained a transcript entry without a stable id.");
+		if (tail.transcriptEntries.some((entry) => !entry.id.trim())) {
+			throw new HostSupervisorError(
+				"transcript_proof_invalid",
+				"A complete broker tail contained a transcript entry without a stable id.",
+			);
 		}
-		const fingerprint = fingerprintTranscriptEntries(tail.transcriptEntries.map(entry => entry.payload));
-		if (fingerprint.entryCount !== identity.transcript.entryCount || fingerprint.sha256 !== identity.transcript.sha256) {
-			throw new HostSupervisorError("transcript_proof_mismatch", "The complete broker tail did not match its transcript fingerprint.");
+		const fingerprint = fingerprintTranscriptEntries(tail.transcriptEntries.map((entry) => entry.payload));
+		if (
+			fingerprint.entryCount !== identity.transcript.entryCount ||
+			fingerprint.sha256 !== identity.transcript.sha256
+		) {
+			throw new HostSupervisorError(
+				"transcript_proof_mismatch",
+				"The complete broker tail did not match its transcript fingerprint.",
+			);
 		}
 		const durable = this.#state.read();
 		if (
@@ -1108,13 +1234,20 @@ class ExternalMainSessionHost implements MainSessionHost {
 			!sameExternalSession(durable.mainIdentity, identity) ||
 			!sameExternalSession(this.#identity, identity)
 		) {
-			throw new HostSupervisorError("transcript_proof_invalid", "The pending durable identity did not match the first complete broker tail.");
+			throw new HostSupervisorError(
+				"transcript_proof_invalid",
+				"The pending durable identity did not match the first complete broker tail.",
+			);
 		}
 		const transcriptDeliveryProgress = this.deliveryGapProgress(tail.transcriptEntries);
 		try {
 			this.#state.persistTranscriptProof(durable.mainIdentity, identity, transcriptDeliveryProgress, ringCheckpoint);
 		} catch (error) {
-			throw new HostSupervisorError("transcript_proof_persist_failed", "Could not durably bind the pending transcript proof.", { cause: error });
+			throw new HostSupervisorError(
+				"transcript_proof_persist_failed",
+				"Could not durably bind the pending transcript proof.",
+				{ cause: error },
+			);
 		}
 		this.#identity = identity;
 		this.#tailCheckpoint = ringCheckpoint;
@@ -1140,22 +1273,46 @@ class ExternalMainSessionHost implements MainSessionHost {
 			!sameExternalSession(durable.mainIdentity, identity) ||
 			!sameExternalSession(this.#identity, identity)
 		) {
-			throw new HostSupervisorError("transcript_proof_invalid", "The complete tail could not re-attest the durable transcript proof.");
+			throw new HostSupervisorError(
+				"transcript_proof_invalid",
+				"The complete tail could not re-attest the durable transcript proof.",
+			);
 		}
-		if (tail.transcriptEntries.some(entry => !entry.id.trim())) {
-			throw new HostSupervisorError("transcript_proof_invalid", "A complete broker tail contained a transcript entry without a stable id.");
+		if (tail.transcriptEntries.some((entry) => !entry.id.trim())) {
+			throw new HostSupervisorError(
+				"transcript_proof_invalid",
+				"A complete broker tail contained a transcript entry without a stable id.",
+			);
 		}
-		const fingerprint = fingerprintTranscriptEntries(tail.transcriptEntries.map(entry => entry.payload));
-		if (fingerprint.entryCount !== identity.transcript.entryCount || fingerprint.sha256 !== identity.transcript.sha256) {
-			throw new HostSupervisorError("transcript_proof_mismatch", "The complete broker tail did not match its transcript fingerprint.");
+		const fingerprint = fingerprintTranscriptEntries(tail.transcriptEntries.map((entry) => entry.payload));
+		if (
+			fingerprint.entryCount !== identity.transcript.entryCount ||
+			fingerprint.sha256 !== identity.transcript.sha256
+		) {
+			throw new HostSupervisorError(
+				"transcript_proof_mismatch",
+				"The complete broker tail did not match its transcript fingerprint.",
+			);
 		}
 		const growth = this.#growthWindow;
 		if (growth) {
-			if (!sameExternalSession(growth.intent.base, identity) || !attestsExternalTranscriptGrowth(growth.intent.base, tail.transcriptEntries.map(entry => entry.payload))) {
-				throw new HostSupervisorError("growth_intent_mismatch", "The complete broker tail did not attest append-only growth from the recovered intent.");
+			if (
+				!sameExternalSession(growth.intent.base, identity) ||
+				!attestsExternalTranscriptGrowth(
+					growth.intent.base,
+					tail.transcriptEntries.map((entry) => entry.payload),
+				)
+			) {
+				throw new HostSupervisorError(
+					"growth_intent_mismatch",
+					"The complete broker tail did not attest append-only growth from the recovered intent.",
+				);
 			}
 		} else if (!sameExternalFingerprint(durable.mainIdentity, identity)) {
-			throw new HostSupervisorError("main_identity_mismatch", "The complete broker tail did not match the durable transcript proof.");
+			throw new HostSupervisorError(
+				"main_identity_mismatch",
+				"The complete broker tail did not match the durable transcript proof.",
+			);
 		}
 		this.#identity = identity;
 		this.#verificationState = "verified";
@@ -1166,7 +1323,7 @@ class ExternalMainSessionHost implements MainSessionHost {
 
 	private observeIdentity(identity: ExternalSessionIdentity, entries: readonly SupervisorTranscriptEntry[]): void {
 		if (sameExternalFingerprint(this.#identity, identity)) return;
-		const payloads = entries.map(entry => entry.payload);
+		const payloads = entries.map((entry) => entry.payload);
 		if (!this.#growthWindow) {
 			// The adopted session is a live agent: the owner drives it directly and it
 			// works autonomously, so its transcript routinely changes with no
@@ -1175,9 +1332,15 @@ class ExternalMainSessionHost implements MainSessionHost {
 			// same session, fail closed on anything else. Delivery progress is left
 			// untouched, so a reply that arrived in this divergence is still projected
 			// or journaled as a gap rather than silently baselined.
-			if (!sameExternalSession(this.#identity, identity) || !attestsExternalTranscriptGrowth(this.#identity, payloads)) {
+			if (
+				!sameExternalSession(this.#identity, identity) ||
+				!attestsExternalTranscriptGrowth(this.#identity, payloads)
+			) {
 				markFailedClosed(this.#state, "main_identity_mismatch");
-				throw this.enterFailure("main_identity_mismatch", new Error("External transcript changed outside append-only growth."));
+				throw this.enterFailure(
+					"main_identity_mismatch",
+					new Error("External transcript changed outside append-only growth."),
+				);
 			}
 			try {
 				this.#state.absorbAutonomousTranscriptGrowth(this.#identity, identity, payloads);
@@ -1189,7 +1352,10 @@ class ExternalMainSessionHost implements MainSessionHost {
 		}
 		if (!attestsExternalTranscriptGrowth(this.#identity, payloads)) {
 			markFailedClosed(this.#state, "growth_intent_mismatch");
-			throw this.enterFailure("growth_intent_mismatch", new Error("External transcript changed outside append-only growth."));
+			throw this.enterFailure(
+				"growth_intent_mismatch",
+				new Error("External transcript changed outside append-only growth."),
+			);
 		}
 		this.#identity = identity;
 	}
@@ -1207,21 +1373,32 @@ class ExternalMainSessionHost implements MainSessionHost {
 			if (!tail.retentionGap) return false;
 			const resync = tail.resyncCheckpoint;
 			if (!resync) {
-				throw new HostSupervisorError("tail_resync_unavailable", "Broker tail reported a retention gap without a resync checkpoint.");
+				throw new HostSupervisorError(
+					"tail_resync_unavailable",
+					"Broker tail reported a retention gap without a resync checkpoint.",
+				);
 			}
 			if (compareTailCheckpoints(resync, previous) <= 0) return false;
 			try {
 				this.#state.recordTailRingRotation(previous, resync);
 			} catch (error) {
-				throw new HostSupervisorError("tail_ring_rotation_write_failed", "Could not durably record the broker-tail ring rotation.", {
-					cause: error,
-				});
+				throw new HostSupervisorError(
+					"tail_ring_rotation_write_failed",
+					"Could not durably record the broker-tail ring rotation.",
+					{
+						cause: error,
+					},
+				);
 			}
 			this.#tailCheckpoint = resync;
 			return false;
 		}
 		const boundary = tail.checkpoint ?? tail.resyncCheckpoint;
-		if (!boundary) throw new HostSupervisorError("tail_checkpoint_unavailable", "Broker tail did not provide an adoption checkpoint.");
+		if (!boundary)
+			throw new HostSupervisorError(
+				"tail_checkpoint_unavailable",
+				"Broker tail did not provide an adoption checkpoint.",
+			);
 		try {
 			this.#state.recordTailAdoptionStart(boundary);
 		} catch (error) {
@@ -1238,14 +1415,21 @@ class ExternalMainSessionHost implements MainSessionHost {
 	private shouldProjectTailEvent(event: SupervisorEvent): boolean {
 		const checkpoint = this.#tailCheckpoint;
 		if (!checkpoint || event.generation === undefined || event.seq === undefined) return true;
-		return event.generation > checkpoint.generation || (event.generation === checkpoint.generation && event.seq > checkpoint.seq);
+		return (
+			event.generation > checkpoint.generation ||
+			(event.generation === checkpoint.generation && event.seq > checkpoint.seq)
+		);
 	}
 
-	private checkpointAfterTail(tail: SupervisorTailEvents, events: readonly SupervisorEvent[]): TailCheckpoint | undefined {
+	private checkpointAfterTail(
+		tail: SupervisorTailEvents,
+		events: readonly SupervisorEvent[],
+	): TailCheckpoint | undefined {
 		const previous = this.#tailCheckpoint;
 		const revision = Math.max(tail.checkpoint?.revision ?? 0, previous?.revision ?? 0);
 		let checkpoint = previous;
-		if (tail.checkpoint && (!checkpoint || compareTailCheckpoints(tail.checkpoint, checkpoint) > 0)) checkpoint = tail.checkpoint;
+		if (tail.checkpoint && (!checkpoint || compareTailCheckpoints(tail.checkpoint, checkpoint) > 0))
+			checkpoint = tail.checkpoint;
 		for (const event of events) {
 			const candidate = sourceCheckpoint(event, revision);
 			if (!candidate) continue;
@@ -1262,9 +1446,13 @@ class ExternalMainSessionHost implements MainSessionHost {
 		try {
 			this.#state.advanceTailCheckpoint(previous, checkpoint);
 		} catch (error) {
-			throw new HostSupervisorError("tail_checkpoint_write_failed", "Could not durably advance the broker-tail checkpoint.", {
-				cause: error,
-			});
+			throw new HostSupervisorError(
+				"tail_checkpoint_write_failed",
+				"Could not durably advance the broker-tail checkpoint.",
+				{
+					cause: error,
+				},
+			);
 		}
 		this.#tailCheckpoint = checkpoint;
 	}
@@ -1284,7 +1472,10 @@ class ExternalMainSessionHost implements MainSessionHost {
 	private finalizeTerminalAdmission(opRef: string, admission: AdmittedOperation): boolean {
 		if (!admission.finalizePendingClaim) {
 			if (!admission.ambiguous) return true;
-			this.enterFailure("main_admission_finalize_missing", new Error(`No durable finalizer was registered for ambiguous admission ${opRef}.`));
+			this.enterFailure(
+				"main_admission_finalize_missing",
+				new Error(`No durable finalizer was registered for ambiguous admission ${opRef}.`),
+			);
 			return false;
 		}
 		try {
@@ -1353,7 +1544,11 @@ class ExternalMainSessionHost implements MainSessionHost {
 				if (pendingProofBound) {
 					this.settleTerminalTail(tail);
 					const wake = this.#tailWake.promise;
-					await Promise.race([Bun.sleep(tail.terminal && this.#turnState === "idle" ? 500 : 100), wake, this.#tailStop.promise]);
+					await Promise.race([
+						Bun.sleep(tail.terminal && this.#turnState === "idle" ? 500 : 100),
+						wake,
+						this.#tailStop.promise,
+					]);
 					continue;
 				}
 				this.verifyBootTranscriptProof(tail);
@@ -1380,7 +1575,7 @@ class ExternalMainSessionHost implements MainSessionHost {
 				this.observeIdentity(tail.identity, tail.transcriptEntries);
 				const boundaryEstablished = this.establishProjectionBoundary(tail);
 				if (!boundaryEstablished) {
-					const events = tail.events.filter(event => this.shouldProjectTailEvent(event));
+					const events = tail.events.filter((event) => this.shouldProjectTailEvent(event));
 					const revision = Math.max(tail.checkpoint?.revision ?? 0, this.#tailCheckpoint?.revision ?? 0);
 					this.prepareTailResponseAttributions(events);
 					// A finalized reply travels as a transcript entry while lifecycle events
@@ -1425,7 +1620,11 @@ class ExternalMainSessionHost implements MainSessionHost {
 				this.settleTerminalTail(tail);
 
 				const wake = this.#tailWake.promise;
-				await Promise.race([Bun.sleep(tail.terminal && this.#turnState === "idle" ? 500 : 100), wake, this.#tailStop.promise]);
+				await Promise.race([
+					Bun.sleep(tail.terminal && this.#turnState === "idle" ? 500 : 100),
+					wake,
+					this.#tailStop.promise,
+				]);
 			} catch (error) {
 				if (this.#disposed) return;
 				const reason = error instanceof HostSupervisorError ? error.reason : "tail_observation_failed";
@@ -1470,7 +1669,12 @@ class ExternalMainSessionHost implements MainSessionHost {
 		if (existing) return existing;
 		this.assertUsable();
 		const durable = this.#state.read();
-		if (durable.bootstrapState !== "COMMITTED" || !durable.mainIdentity || durable.growthIntent || durable.transcriptProof !== "proven") {
+		if (
+			durable.bootstrapState !== "COMMITTED" ||
+			!durable.mainIdentity ||
+			durable.growthIntent ||
+			durable.transcriptProof !== "proven"
+		) {
 			markFailedClosed(this.#state, "growth_protocol_invalid");
 			throw new MainSessionHostError("growth_protocol_invalid");
 		}
@@ -1483,7 +1687,11 @@ class ExternalMainSessionHost implements MainSessionHost {
 			this.#state.writeGrowthIntent(this.#identity, intent.startedAt);
 		} catch (error) {
 			markFailedClosed(this.#state, "growth_intent_write_failed");
-			throw new MainSessionHostError("growth_intent_write_failed", error instanceof Error ? error.message : String(error), { cause: error });
+			throw new MainSessionHostError(
+				"growth_intent_write_failed",
+				error instanceof Error ? error.message : String(error),
+				{ cause: error },
+			);
 		}
 		const growth = { intent, pendingAdmissions: 0 };
 		this.#growthWindow = growth;
@@ -1529,8 +1737,10 @@ class ExternalMainSessionHost implements MainSessionHost {
 		surfaceId?: string,
 	): Promise<void> {
 		this.assertUsable();
-		if (!text.trim()) throw new MainSessionHostError(`${deliveredAs}_empty`, "A main-session message must not be empty.");
-		if (!opRef.trim()) throw new MainSessionHostError("operation_ref_empty", "An admitted operation requires an operation reference.");
+		if (!text.trim())
+			throw new MainSessionHostError(`${deliveredAs}_empty`, "A main-session message must not be empty.");
+		if (!opRef.trim())
+			throw new MainSessionHostError("operation_ref_empty", "An admitted operation requires an operation reference.");
 		const growth = this.beginGrowthWindow();
 		growth.pendingAdmissions += 1;
 		this.#admittedOperations.set(opRef, {
@@ -1572,7 +1782,10 @@ class ExternalMainSessionHost implements MainSessionHost {
 					this.wakeTail();
 				}
 			}
-			const reason = error instanceof MainSessionHostError || error instanceof HostSupervisorError ? error.reason : "turn_admission_failed";
+			const reason =
+				error instanceof MainSessionHostError || error instanceof HostSupervisorError
+					? error.reason
+					: "turn_admission_failed";
 			throw new MainSessionHostError(reason, error instanceof Error ? error.message : String(error), {
 				cause: error,
 				admissionDisposition,

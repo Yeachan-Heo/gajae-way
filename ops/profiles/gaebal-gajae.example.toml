@@ -27,6 +27,7 @@ unknown = ["MEMORY.md"]
 id = "discord:owner-dm"
 platform = "discord"
 kind = "dm"
+session_kind = "main"
 
 [operator]
 # Any fields here are canonicalized into the digest-bound operator identity.

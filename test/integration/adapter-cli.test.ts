@@ -18,7 +18,7 @@ function writeDeployment(): { readonly dir: string; readonly profilePath: string
 	const profilePath = path.join(dir, "profile.toml");
 	fs.writeFileSync(
 		profilePath,
-		`[corpus]\npath = "${dir}"\nworkspace = "${dir}"\n\n[injection]\nfiles = []\n\n[main_session]\nsession_id = "cli-regression-session"\n\n[surfaces.owner]\nid = "discord:owner-dm"\nplatform = "discord"\nkind = "dm"\n\n[adapter.discord]\ntoken_file = "discord-token"\nchannel_id = "1468535438498336923"\nsurface_id = "discord:owner-dm"\n`,
+		`[corpus]\npath = "${dir}"\nworkspace = "${dir}"\n\n[injection]\nfiles = []\n\n[main_session]\nsession_id = "cli-regression-session"\n\n[surfaces.owner]\nid = "discord:owner-dm"\nplatform = "discord"\nkind = "dm"\nsession_kind = "main"\n\n[adapter.discord]\ntoken_file = "discord-token"\nchannel_id = "1468535438498336923"\nsurface_id = "discord:owner-dm"\n`,
 	);
 	return { dir, profilePath };
 }

@@ -62,7 +62,7 @@ function externalTest(name: string, body: ExternalTestBody, timeoutMs?: number):
 
 async function hosted(options: Parameters<typeof createExternalGateway>[0] = {}): Promise<ExternalGateway> {
 	const gateway = await createExternalGateway({
-		knownSurfaces: [{ id: "guest", platform: "test", kind: "channel" }],
+		knownSurfaces: [{ id: "guest", platform: "test", kind: "channel", sessionKind: "conversation" }],
 		...options,
 	});
 	const gateways = gatewayScope.getStore();
@@ -634,7 +634,7 @@ externalTest("main.submit preserves an ambiguous post-acceptance claim for recon
 			},
 			gateway.profile,
 			gateway.core,
-		)(request);
+		).submitFromRpc(request);
 		expect(replay).toMatchObject({
 			accepted: true,
 			op_ref: intent.op_ref,
@@ -873,7 +873,7 @@ externalTest("main.submit rejects an unknown surface with 1300", async () => {
 });
 
 externalTest("main.submit admits only numeric Discord thread children of configured channel surfaces", async () => {
-	const gateway = await hosted({ knownSurfaces: [{ id: "discord:guild", platform: "discord", kind: "channel" }] });
+	const gateway = await hosted({ knownSurfaces: [{ id: "discord:guild", platform: "discord", kind: "channel", sessionKind: "conversation" }] });
 	const threadSurfaceId = "discord:guild/thread:222222222222222222";
 	gateway.fixture.holdNextTurn();
 	const accepted = await gateway.client.request("main.submit", {
@@ -905,7 +905,7 @@ externalTest("main.submit admits only numeric Discord thread children of configu
 	}
 
 	const quarantinedGateway = await hosted({
-		knownSurfaces: [{ id: "discord:guild", platform: "discord", kind: "channel" }],
+		knownSurfaces: [{ id: "discord:guild", platform: "discord", kind: "channel", sessionKind: "conversation" }],
 		isSurfaceQuarantined: surface => surface.id === "discord:guild",
 	});
 	const quarantined = await quarantinedGateway.client.request("main.submit", {
@@ -1359,6 +1359,7 @@ session_id = "${fixture.sessionId}"
 id = "owner"
 platform = "test"
 kind = "dm"
+session_kind = "main"
 `,
 	);
 	let daemon: ReturnType<typeof managedProcesses.spawnDaemon> | undefined;

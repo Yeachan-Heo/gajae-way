@@ -98,6 +98,7 @@ files = []
 id = "discord:owner-dm"
 platform = "discord"
 kind = "dm"
+session_kind = "main"
 
 [main_session]
 session_id = "${sessionId}"
@@ -387,7 +388,7 @@ test("example profile covers the identity projection, mutable tunables, and Disc
 	const profile = loadWayProfile(profilePath);
 	expect(profile.injection.files).toEqual(["SOUL.md", "USER.md", "daily/{date}.md", "MEMORY.md"]);
 	expect(profile.restrictedFiles.conversation).toEqual(["MEMORY.md"]);
-	expect(profile.ownerSurfaces).toEqual([{ id: "discord:owner-dm", platform: "discord", kind: "dm" }]);
+	expect(profile.ownerSurfaces).toEqual([{ id: "discord:owner-dm", platform: "discord", kind: "dm", sessionKind: "main" }]);
 	expect(profile.operator).toMatchObject({ id: "gaebal-gajae-operator" });
 	expect(profile.tunables).toMatchObject({ poll: { interval_ms: 15000 }, ack: { budget_ms: 2000 } });
 	const adapter = loadDiscordAdapterConfig({

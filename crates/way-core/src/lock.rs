@@ -983,6 +983,19 @@ impl LockManager {
         );
         append_in_transaction(&transaction, "lock_event", &payload, now)
             .map_err(|error| LockError::Journal(error.to_string()))?;
+        // The quarantine alert shares this commit with the lease row itself, so
+        // there is no window in which the corpus is quarantined and silent. The
+        // lease state and its announcement are one durable fact, not two.
+        if meta_get_tx(&transaction, "alert_lock_quarantined")?.as_deref() != Some("raised") {
+            meta_set_tx(&transaction, "alert_lock_quarantined", "raised")?;
+            append_in_transaction(
+                &transaction,
+                "alert_raised",
+                "{\"condition\":\"lock_quarantined\",\"reason\":\"quarantine_override\"}",
+                now,
+            )
+            .map_err(|error| LockError::Journal(error.to_string()))?;
+        }
         transaction.commit()?;
         drop(connection);
         self.notify_revocation(&lease.lease_id);
@@ -1177,6 +1190,20 @@ impl LockManager {
         );
         append_in_transaction(&transaction, "lock_event", &payload, now)
             .map_err(|error| LockError::Journal(error.to_string()))?;
+        // Clearing shares this commit with the lease release, exactly as raising
+        // shares its commit with the quarantine. Without this the alert stays
+        // raised after a documented recovery and `way.status.alerts` reports a
+        // condition that no longer exists.
+        if meta_get_tx(&transaction, "alert_lock_quarantined")?.as_deref() == Some("raised") {
+            meta_set_tx(&transaction, "alert_lock_quarantined", "clear")?;
+            append_in_transaction(
+                &transaction,
+                "alert_cleared",
+                "{\"condition\":\"lock_quarantined\",\"reason\":\"quarantine_cleared\"}",
+                now,
+            )
+            .map_err(|error| LockError::Journal(error.to_string()))?;
+        }
         transaction.commit()?;
         drop(connection);
         self.notify_waiters();
@@ -1911,7 +1938,82 @@ mod tests {
         (manager, clock, probe, revoker)
     }
 
-    #[cfg(target_os = "macos")]
+    /// Clearing must share a commit with the release, exactly as raising shares
+    /// one with the quarantine. A sticky alert after a documented recovery
+    /// trains an operator to ignore alerts.
+    ///
+    /// Deliberately not platform-gated: it uses FakeProbe and an in-memory
+    /// Store, and gating it would mean the Linux CI majority never executes the
+    /// contract it protects.
+    #[test]
+    fn clearing_quarantine_also_clears_its_alert_in_the_same_commit() {
+        let store = Store::default();
+        let (manager, _, probe, _) = manager(store.clone());
+        probe.set_alive(43, 43, 100);
+        let acquired = manager.acquire(request("quarantine-clear", 43)).unwrap();
+        let lease_id = acquired.lease_id;
+        manager.quarantine_override(&lease_id, true, true).unwrap();
+        assert!(crate::alerts::is_raised(&store, "lock_quarantined").unwrap());
+
+        // A receipt is only accepted once the holder is provably gone.
+        probe.set_dead(43, 43);
+        let receipt_id = manager
+            .record_quarantine_receipt(
+                &lease_id,
+                "corpus",
+                QuarantineReceiptEvidence {
+                    process_inspected: true,
+                    git_status_checked: true,
+                    git_log_checked: true,
+                    git_fsck_checked: true,
+                    remote_verified: true,
+                },
+            )
+            .expect("receipt recorded");
+        manager.clear_quarantine(&receipt_id, true).unwrap();
+
+        assert!(!crate::alerts::is_raised(&store, "lock_quarantined").unwrap());
+        let connection = store.connection().unwrap();
+        let cleared: i64 = connection
+            .query_row("SELECT COUNT(*) FROM events WHERE kind = 'alert_cleared'", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(cleared, 1, "recovery must announce exactly once");
+    }
+
+    /// The quarantine alert must be one durable fact with the lease row.
+    ///
+    /// If they were separate commits, a crash between them would leave the
+    /// corpus quarantined and silent - the exact condition an operator must be
+    /// told about.
+    #[test]
+    fn quarantine_override_raises_its_alert_in_the_same_commit() {
+        let store = Store::default();
+        let (manager, _, probe, _) = manager(store.clone());
+        probe.set_alive(41, 41, 100);
+        let acquired = manager.acquire(request("quarantine-alert", 41)).unwrap();
+        let lease_id = acquired.lease_id;
+
+        manager.quarantine_override(&lease_id, true, true).unwrap();
+
+        let connection = store.connection().unwrap();
+        let alert: String = connection
+            .query_row("SELECT v FROM gateway_meta WHERE k = 'alert_lock_quarantined'", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(alert, "raised");
+        let raised: i64 = connection
+            .query_row("SELECT COUNT(*) FROM events WHERE kind = 'alert_raised'", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(raised, 1, "quarantine must announce itself exactly once");
+        let quarantined: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM leases WHERE lease_id = ?1 AND state = 'quarantined'",
+                [&lease_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(quarantined, 1, "the lease row and its alert are one durable fact");
+    }
+
     #[test]
     fn system_probe_uses_libproc_for_current_process_and_group() {
         let probe = super::SystemProcessProbe;
