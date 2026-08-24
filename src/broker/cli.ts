@@ -504,7 +504,32 @@ function timeoutArgument(timeoutMs: number | undefined): string[] {
  * Spawn-only broker boundary. Commands are passed as argv arrays and never via
  * a shell string so a session id cannot alter process execution.
  */
-export class BrokerCli {
+
+/**
+ * The complete broker surface the gateway depends on.
+ *
+ * Extracted so the transport is replaceable: the CLI implementation spawns the
+ * gjc binary once PER OPERATION, which is the root cause of the spawn-pressure
+ * failures this gateway kept absorbing (bounded tail retries fail-stopping the
+ * host, widened subprocess budgets, package-generation pinning). A persistent
+ * SDK transport implements this same interface, so the proven adoption path can
+ * stay on the CLI while the SDK path is drilled behind the identical contract.
+ */
+export interface BrokerTransport {
+	/** Per-command budget the reconciler divides its cycle SLA against. */
+	readonly commandTimeoutMs: number;
+	listSessions(options?: { readonly timeoutMs?: number }): Promise<SdkSessionRowsV1>;
+	inspectSession(sessionId: string, options?: { readonly timeoutMs?: number }): Promise<SdkSessionRowV1>;
+	sessionMetadata(sessionId: string, options?: { readonly timeoutMs?: number }): Promise<SessionMetadataV1>;
+	sessionCheckpoint(sessionId: string, options?: { readonly timeoutMs?: number }): Promise<SdkCheckpointRecordV1>;
+	sendPrompt(...args: Parameters<BrokerCli["sendPrompt"]>): ReturnType<BrokerCli["sendPrompt"]>;
+	controlTurn(...args: Parameters<BrokerCli["controlTurn"]>): ReturnType<BrokerCli["controlTurn"]>;
+	turnStatus(...args: Parameters<BrokerCli["turnStatus"]>): ReturnType<BrokerCli["turnStatus"]>;
+	tailSession(...args: Parameters<BrokerCli["tailSession"]>): ReturnType<BrokerCli["tailSession"]>;
+	contextState(...args: Parameters<BrokerCli["contextState"]>): ReturnType<BrokerCli["contextState"]>;
+}
+
+export class BrokerCli implements BrokerTransport {
 	readonly executable: string;
 	readonly commandTimeoutMs: number;
 	readonly #environment: NodeJS.ProcessEnv | undefined;

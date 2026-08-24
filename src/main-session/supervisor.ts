@@ -7,6 +7,7 @@ import {
 	type BrokerTurnStatus,
 	type SdkSessionRowV1,
 	type SdkTailEnvelopeV1,
+	type BrokerTransport,
 } from "../broker/cli";
 import {
 	fingerprintTranscriptEntries,
@@ -103,7 +104,7 @@ export function classifyAdmissionDisposition(error: unknown): AdmissionDispositi
 }
 
 export interface ExternalHostSupervisorOptions {
-	readonly broker: BrokerCli;
+	readonly broker: BrokerTransport;
 	/** Canonical workspace selected by the profile; the broker locator must match exactly. */
 	readonly workspace: string;
 	readonly tailTimeoutMs?: number;
@@ -173,7 +174,7 @@ function samePathIdentity(left: string, right: string): boolean {
 
 /** External-only supervisor backed by `gjc sdk session`; it never creates, resumes, or terminates a GJC session. */
 export class ExternalHostSupervisor implements HostSupervisor {
-	readonly #broker: BrokerCli;
+	readonly #broker: BrokerTransport;
 	readonly #workspace: string;
 	readonly #tailTimeoutMs: number;
 	readonly #adoptionTailTimeoutMs: number;

@@ -3,6 +3,7 @@ import {
 	BrokerCliError,
 	type SessionMetadataV1,
 	type SdkSessionRowV1,
+	type BrokerTransport,
 } from "./cli";
 
 export const DEFAULT_RECONCILE_POLL_MS = 15_000;
@@ -75,7 +76,7 @@ export interface RegistryCore {
 
 export interface BrokerReconcilerOptions {
 	readonly core: RegistryCore;
-	readonly broker?: BrokerCli;
+	readonly broker?: BrokerTransport;
 	readonly pollMs?: number;
 	readonly cycleSlaMs?: number;
 	readonly now?: () => number;
@@ -117,7 +118,7 @@ function asNativeRow(row: SdkSessionRowV1) {
  */
 export class BrokerReconciler {
 	readonly core: RegistryCore;
-	readonly broker: BrokerCli;
+	readonly broker: BrokerTransport;
 	readonly pollMs: number;
 	readonly cycleSlaMs: number;
 	readonly #now: () => number;
