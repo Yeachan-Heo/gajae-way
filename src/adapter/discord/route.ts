@@ -138,6 +138,12 @@ export class DiscordRouteHandler {
 		if (hasDirectBotMention(message, this.#botUserId)) {
 			const text = stripLeadingBotMention(message.text, this.#botUserId);
 			if (text.trim()) return text;
+			// A bare mention is a deliberate ping and must engage: dropping it made the
+			// bot look dead to an owner who simply mentioned it with no words. The
+			// original text is forwarded verbatim rather than substituting invented
+			// wording, so the persona sees exactly what was sent and nothing is
+			// fabricated on the owner's behalf.
+			if (message.text.trim()) return message.text;
 			this.#diagnostics.drop("empty_after_mention", message.channelId);
 			return undefined;
 		}

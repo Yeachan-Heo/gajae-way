@@ -1730,3 +1730,35 @@ externalTest("a durable chunk ledger makes a delayed mid-set replay skip chunks 
 		await fixture.disconnect();
 	}
 }, 15_000);
+
+externalTest("a bare bot mention engages instead of being dropped as empty", async () => {
+	const gatewayUnderTest = await gateway();
+	const fixture = new DiscordFixture();
+	await fixture.connect();
+	const diagnostics: string[] = [];
+	try {
+		const route = new DiscordRouteHandler({
+			rpc: gatewayUnderTest.client,
+			platform: fixture,
+			routes: [{ channelId: "222222222222222222", surfaceId: "discord:guest-channel", kind: "channel", groupPolicy: "mention" }],
+			botUserId: BOT_USER_ID,
+			onDiagnostic: message => diagnostics.push(message),
+		});
+		// Exactly what an owner sends when they ping with no words. This previously
+		// stripped to empty text and was dropped, making the bot look dead.
+		await route.handle({
+			id: "bare-mention",
+			channelId: "222222222222222222",
+			text: `<@${BOT_USER_ID}>`,
+			authorId: "660473980301344768",
+			mentionedUserIds: [BOT_USER_ID],
+			acceptedAt: Date.now(),
+		});
+		const admitted = gatewayUnderTest.fixture.commands().map(command => ({ operation: command.operation, text: command.text }));
+		expect(admitted).toEqual([{ operation: "turn.follow_up", text: `<@${BOT_USER_ID}>` }]);
+		expect(diagnostics.filter(message => message.includes("empty message after leading bot mention"))).toEqual([]);
+		expect(fixture.acknowledgements).toHaveLength(1);
+	} finally {
+		await fixture.disconnect();
+	}
+});
