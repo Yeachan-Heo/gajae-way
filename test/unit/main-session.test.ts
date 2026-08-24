@@ -628,7 +628,7 @@ test.serial("host survives transient broker tail failures with bounded retry and
 	}
 }, 30_000);
 
-test.serial("host fails closed when broker tail failures exhaust the bounded retry budget", async () => {
+test.serial("host reports degraded health for an unavailable tail without fencing owner ingress", async () => {
 	const fixture = new FakeBrokerFixture();
 	fixtures.push(fixture);
 	const { state, profile } = await bootstrapFixture(fixture);
@@ -653,9 +653,13 @@ test.serial("host fails closed when broker tail failures exhaust the bounded ret
 		fixture.crashNextTails(50);
 		await eventually(
 			() => healthReports.some(report => report.state === "degraded" && report.reason === "tail_unavailable"),
-			"host did not report degraded health after exhausting the retry budget",
+			"host did not report degraded health while the tail was unavailable",
 			60_000,
 		);
+		// Transport unavailability must NOT fence mutations: the adopted identity is
+		// already verified and the broker is the authority for admitting a turn, so
+		// refusing here would silently discard the owner's message.
+		expect(host.mutationReadinessReason).toBeUndefined();
 	} finally {
 		await host.dispose();
 	}
@@ -1533,3 +1537,60 @@ test.serial("the running host still fails closed when an unwindowed transcript c
 		await host.dispose();
 	}
 }, 30_000);
+
+
+test.serial("an unavailable broker tail recovers automatically instead of fail-stopping the host", async () => {
+	const fixture = new FakeBrokerFixture();
+	fixtures.push(fixture);
+	const { state, profile } = await bootstrapFixture(fixture);
+	const resumedSupervisor = supervisor(fixture);
+	const resumed = await strictResumeMainSession({ profile, state, supervisor: resumedSupervisor });
+	const healthReports: Array<{ state: string; reason: string }> = [];
+	const journal: Array<{ kind: string; payloadJson: string }> = [];
+	const host = createMainSessionHost({
+		supervisor: resumedSupervisor,
+		identity: resumed.identity,
+		state,
+		journal: durableTestJournal(state, {
+			journalAppend: (kind, payloadJson) => journal.push({ kind, payloadJson }),
+			onTranscriptProjection: (kind, payloadJson) => journal.push({ kind, payloadJson }),
+			setRpcHealth: (healthState, reason) => healthReports.push({ state: healthState, reason }),
+		}),
+		initialTurnState: resumed.turnState,
+		initialFollowUpQueueDepth: resumed.followUpQueueDepth,
+		initialVerificationState: resumed.verificationState,
+	});
+	try {
+		// More consecutive failures than the old bounded budget (8) tolerated: this
+		// is what a persona sitting in a long turn looks like to the tail. Kept to 10
+		// so the capped 5s backoff still recovers inside the assertion window.
+		fixture.crashNextTails(10);
+		await eventually(
+			() => healthReports.some(report => report.state === "degraded" && report.reason === "tail_unavailable"),
+			"host did not report degraded health while the tail was unavailable",
+			60_000,
+		);
+		// The host must still be alive and unfenced, and must recover on its own once
+		// the tail returns - previously it fail-stopped permanently and only a process
+		// restart brought owner ingress back.
+		await eventually(
+			() => healthReports.some(report => report.state === "running" && report.reason === "tail_recovered"),
+			"host did not recover after the tail became available again",
+			60_000,
+		);
+		expect(host.mutationReadinessReason).toBeUndefined();
+		expect(state.read().failedClosedReason).toBeUndefined();
+
+		// And it must still deliver a real turn after recovering.
+		fixture.holdNextTurn();
+		await host.admit("prompt", "after tail recovery", "post-recovery");
+		fixture.complete("post-recovery", { text: "answered after tail recovery" });
+		await eventually(
+			() => journal.some(event => event.kind === "assistant_message" && event.payloadJson.includes("answered after tail recovery")),
+			"host did not deliver a turn after tail recovery",
+			30_000,
+		);
+	} finally {
+		await host.dispose();
+	}
+}, 120_000);

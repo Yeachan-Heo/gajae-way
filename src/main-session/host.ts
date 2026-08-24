@@ -400,6 +400,8 @@ class ExternalMainSessionHost implements MainSessionHost {
 	#turnState: "idle" | "busy";
 	#followUpQueueDepth: number;
 	#degraded = false;
+	/** Tail transport is transiently unreadable: health-visible, but NOT a mutation fence. */
+	#tailUnavailable = false;
 	#failure: MainSessionHostError | undefined;
 	#growthWindow: GrowthWindow | undefined;
 	#disposed = false;
@@ -1333,6 +1335,14 @@ class ExternalMainSessionHost implements MainSessionHost {
 				const tail = verificationTail ?? (await this.#supervisor.tailEvents());
 				if (this.#disposed) return;
 				transientFailures = 0;
+				if (this.#tailUnavailable) {
+					this.#tailUnavailable = false;
+					try {
+						this.#journal.setRpcHealth?.("running", "tail_recovered");
+					} catch {
+						// Recovery reporting is best-effort.
+					}
+				}
 				if (!tail.complete) {
 					const wake = this.#tailWake.promise;
 					await Promise.race([Bun.sleep(100), wake, this.#tailStop.promise]);
@@ -1419,9 +1429,26 @@ class ExternalMainSessionHost implements MainSessionHost {
 			} catch (error) {
 				if (this.#disposed) return;
 				const reason = error instanceof HostSupervisorError ? error.reason : "tail_observation_failed";
-				if (reason === "tail_unavailable" && transientFailures < 8) {
+				if (reason === "tail_unavailable") {
+					// Transport unavailability is NEVER terminal. A bounded retry budget
+					// permanently fail-stopped the host whenever the adopted session sat
+					// in a turn longer than the budget (the broker CLI only emits tail
+					// envelopes at terminal turn boundaries), which fenced owner ingress
+					// forever and silently discarded the owner's messages. Keep retrying
+					// with capped backoff and surface it as degraded HEALTH only: the
+					// adopted identity is already verified and the broker - not the tail -
+					// is the authority for admitting a turn, so accepting ingress here is
+					// safe and strictly better than losing it.
 					transientFailures += 1;
-					const backoffMs = Math.min(250 * 2 ** (transientFailures - 1), 4_000);
+					if (!this.#tailUnavailable) {
+						this.#tailUnavailable = true;
+						try {
+							this.#journal.setRpcHealth?.("degraded", "tail_unavailable");
+						} catch {
+							// Health reporting is best-effort and must not stop retrying.
+						}
+					}
+					const backoffMs = Math.min(250 * 2 ** Math.min(transientFailures - 1, 6), 5_000);
 					await Promise.race([Bun.sleep(backoffMs), this.#tailStop.promise]);
 					continue;
 				}
