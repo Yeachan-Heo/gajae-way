@@ -8,7 +8,7 @@ import { createMainSessionHost } from "../../src/main-session/host";
 import { recoverFailedClosedGateway } from "../../src/main-session/recover";
 import { ResumeError, strictResumeMainSession } from "../../src/main-session/resume";
 import { compareTailCheckpoints, GatewayStateError, GatewayStateStore } from "../../src/main-session/state";
-import { createExternalHostSupervisor, type HostSupervisor, type SupervisorTailEvents } from "../../src/main-session/supervisor";
+import { createExternalHostSupervisor, HostSupervisorError, type HostSupervisor, type SupervisorTailEvents } from "../../src/main-session/supervisor";
 import { loadWayProfile } from "../../src/profile";
 import { durableTestJournal, FakeBrokerFixture, MemoryGatewayMeta } from "../helpers/main-session";
 
@@ -1646,3 +1646,58 @@ test.serial("an authority failure at boot still persists a durable fail-closed m
 }, 30_000);
 
 
+
+test.serial("recovery refuses when the daemon's own resume predicate would still fail, and restores the marker", async () => {
+	const fixture = new FakeBrokerFixture();
+	fixtures.push(fixture);
+	const { state, profile } = await bootstrapFixture(fixture);
+	state.markFailedClosed("session_unavailable");
+	// The ceremony's own snapshot can pass while the daemon still refuses. Recovery
+	// must not report success for a condition the next boot re-raises, and must not
+	// leave a cleared-but-unserviceable gateway behind.
+	const base = supervisor(fixture);
+	let verifyCalls = 0;
+	const flaky: HostSupervisor = {
+		discover: identity => base.discover(identity),
+		verify: async identity => {
+			verifyCalls += 1;
+			// The ceremony's re-verification succeeds; the daemon's resume predicate,
+			// called immediately after, refuses.
+			if (verifyCalls === 1) return await base.verify(identity);
+			throw new HostSupervisorError("session_unavailable", "the session is not safely live");
+		},
+		sendPrompt: (text, opRef) => base.sendPrompt(text, opRef),
+		sendSteer: (text, opRef) => base.sendSteer(text, opRef),
+		followUp: (text, opRef) => base.followUp(text, opRef),
+		operationStatus: opRef => base.operationStatus(opRef),
+		tailEvents: () => base.tailEvents(),
+		turnState: () => base.turnState(),
+		dispose: () => base.dispose(),
+	};
+	try {
+		await expect(recoverFailedClosedGateway({ profile, state, supervisor: flaky, confirm: true })).rejects.toMatchObject({
+			reason: "recovery_not_serviceable",
+		});
+		expect(state.read()).toMatchObject({ bootstrapState: "FAILED_CLOSED" });
+	} finally {
+		await base.dispose();
+	}
+}, 60_000);
+
+test.serial("recovery evidence never claims a re-bind that did not move the transcript", async () => {
+	const fixture = new FakeBrokerFixture();
+	fixtures.push(fixture);
+	const { state, profile } = await bootstrapFixture(fixture);
+	state.markFailedClosed("main_identity_mismatch");
+	const recovering = supervisor(fixture);
+	try {
+		const result = await recoverFailedClosedGateway({ profile, state, supervisor: recovering, confirm: true });
+		// The live receipt used to read "re-bound from 69 to 69 transcript entries",
+		// which asserts growth that never happened.
+		expect(result.evidence).not.toMatch(/re-bound from (\d+) to \1 transcript entries/);
+		expect(result.evidence).toContain("resume predicate");
+		expect(state.read()).toMatchObject({ bootstrapState: "COMMITTED", failedClosedReason: undefined });
+	} finally {
+		await recovering.dispose();
+	}
+}, 60_000);

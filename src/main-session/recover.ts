@@ -6,6 +6,7 @@ import {
 	GatewayStateStore,
 	sameExternalSession,
 } from "./state";
+import { ResumeError, strictResumeMainSession } from "./resume";
 import { HostSupervisorError, type HostSupervisor } from "./supervisor";
 
 export class RecoverError extends Error {
@@ -125,7 +126,12 @@ export async function recoverFailedClosedGateway(options: RecoverOptions): Promi
 		// The re-bind is handed to the clearing transaction so identity and marker
 		// move together; a separate write here could not observe a COMMITTED state.
 		rebind = { observed: verified.identity, entries };
-		evidence = `attested append-only growth re-bound from ${identity.transcript?.entryCount ?? 0} to ${verified.identity.transcript?.entryCount ?? 0} transcript entries`;
+		const priorCount = identity.transcript?.entryCount ?? 0;
+		const observedCount = verified.identity.transcript?.entryCount ?? 0;
+		evidence =
+			observedCount === priorCount
+				? `transcript already matches the persisted prefix at ${priorCount} entries; no re-bind was needed`
+				: `attested append-only growth re-bound from ${priorCount} to ${observedCount} transcript entries`;
 	} else if (strategy === "live_verify") {
 		evidence = `live broker verification succeeded for session ${identity.sessionId} with turn state ${verified.turnState}`;
 	} else {
@@ -144,11 +150,43 @@ export async function recoverFailedClosedGateway(options: RecoverOptions): Promi
 
 	const receiptId = randomUUID();
 	const recoveredAt = (options.now ?? Date.now)();
+	let cursor: string | undefined;
 	try {
-		const cursor = options.state.recoverFailedClosed(reason, receiptId, recoveredAt, evidence, rebind);
-		return { clearedReason: reason, receiptId, evidence, ...(cursor === undefined ? {} : { cursor }) };
+		cursor = options.state.recoverFailedClosed(reason, receiptId, recoveredAt, evidence, rebind);
 	} catch (error) {
 		const detail = error instanceof GatewayStateError ? error.reason : error instanceof Error ? error.message : String(error);
 		throw new RecoverError("recovery_write_failed", `Clearing the fail-closed marker failed: ${detail}`, { cause: error });
+	}
+
+	// SELF-CHECK against the daemon's OWN predicate. Recovery previously used a
+	// narrower private re-verification and could report success for a condition the
+	// daemon re-raised seconds later - observed live, where a ceremony cleared
+	// main_identity_mismatch and the very next start failed closed again with the
+	// same reason. Running the real resume path here means "recovered" is defined by
+	// the same check that admits a boot, not by a momentary snapshot.
+	try {
+		const resumed = await strictResumeMainSession({ profile: options.profile, state: options.state, supervisor: options.supervisor });
+		return {
+			clearedReason: reason,
+			receiptId,
+			evidence: `${evidence}; the daemon's own resume predicate then verified the session (state ${resumed.verificationState})`,
+			...(cursor === undefined ? {} : { cursor }),
+		};
+	} catch (error) {
+		// Resume refused. It may already have re-armed a durable marker itself; if it
+		// did not, re-arm so a cleared-but-unserviceable gateway is never left behind.
+		const detail = error instanceof ResumeError ? error.reason : error instanceof Error ? error.message : String(error);
+		if (options.state.read().bootstrapState !== "FAILED_CLOSED") {
+			try {
+				options.state.markFailedClosed(reason);
+			} catch {
+				// The resume failure remains authoritative for the operator.
+			}
+		}
+		throw new RecoverError(
+			"recovery_not_serviceable",
+			`The marker was cleared but the daemon's resume predicate still refuses (${detail}); the fail-closed state was restored.`,
+			{ cause: error },
+		);
 	}
 }
