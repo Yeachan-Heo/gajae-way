@@ -1,5 +1,6 @@
 import * as crypto from "node:crypto";
 import type { OwnerSurface, WayProfile } from "../profile";
+import { resolveSurface } from "../surface-routing";
 import { RpcBridgeException } from "../rpc-bridge";
 import { canonicalJson } from "./gates";
 import { MainSessionHostError, matchesCanonicalAdmissionAttemptId } from "./host";
@@ -144,39 +145,9 @@ function parseRequest(params: unknown): AdmissionRequest {
 	};
 }
 
-interface ResolvedAdmissionSurface {
-	readonly surface: OwnerSurface;
-	/** Registry quarantine applies to the configured parent, never an invented thread row. */
-	readonly quarantineSurface: OwnerSurface;
-}
 
-/**
- * Admits only a numeric Discord thread suffix below one configured Discord
- * channel surface. This preserves 1300 for every other unknown surface while
- * avoiding dynamic registry mutation for ephemeral Discord thread ids.
- */
-function resolveAdmissionSurface(
-	surfaceId: string,
-	knownSurfaces: ReadonlyMap<string, OwnerSurface>,
-): ResolvedAdmissionSurface | undefined {
-	const exact = knownSurfaces.get(surfaceId);
-	if (exact) return { surface: exact, quarantineSurface: exact };
-	const parents = [...knownSurfaces.values()].filter((parent) => {
-		if (parent.platform !== "discord" || parent.kind !== "channel") return false;
-		const prefix = `${parent.id}/thread:`;
-		const threadId = surfaceId.slice(prefix.length);
-		return surfaceId.startsWith(prefix) && /^\d+$/.test(threadId);
-	});
-	if (parents.length !== 1) return undefined;
-	const parent = parents[0] as OwnerSurface;
-	return {
-		// A derived thread inherits its parent's declared redaction class: a thread
-		// under a conversation channel IS a conversation, and inventing a
-		// different class here would apply the wrong deny list.
-		surface: { id: surfaceId, platform: parent.platform, kind: "thread", sessionKind: parent.sessionKind },
-		quarantineSurface: parent,
-	};
-}
+
+
 
 function idempotencyFailure(error: unknown): never {
 	if (error instanceof RpcBridgeException) throw error;
@@ -553,7 +524,7 @@ export function createMainAdmissionHandler(
 		const fenceReason = options.mutationReadinessReason?.() ?? target.mutationReadinessReason;
 		if (fenceReason) throw new RpcBridgeException(1003, fenceReason);
 		const canonicalSurfaceId = request.surfaceId.trim();
-		const resolvedSurface = resolveAdmissionSurface(canonicalSurfaceId, knownSurfaces);
+		const resolvedSurface = resolveSurface(canonicalSurfaceId, knownSurfaces);
 		if (!resolvedSurface) throw new RpcBridgeException(1300, "unknown_surface");
 		const surface = resolvedSurface.surface;
 		if (options.isSurfaceQuarantined?.(resolvedSurface.quarantineSurface))

@@ -1,3 +1,4 @@
+import { parseThreadSurfaceId, threadSurfaceId } from "../../surface-routing";
 import { acknowledgeDiscordMessage, type DiscordAcknowledgement, type DiscordAcknowledgementOptions } from "./ack";
 import type { DiscordMessage, DiscordPlatform } from "./platform";
 import type { AdapterPlatformName } from "./platform";
@@ -219,24 +220,26 @@ export function validateDiscordRoutes(routes: readonly DiscordRoute[]): void {
 }
 
 export function discordThreadSurfaceId(parentSurfaceId: string, threadChannelId: string): string {
-	if (!parentSurfaceId.trim()) throw new DiscordRouteError("Discord thread parent surface id must not be empty.");
-	if (!isDiscordSnowflake(threadChannelId)) throw new DiscordRouteError("Discord thread channel id must be a snowflake.");
-	return `${parentSurfaceId}/thread:${threadChannelId}`;
+	// Delegates to the shared routing SSOT so the derived-surface format cannot
+	// drift from what the gateway admits.
+	try {
+		return threadSurfaceId(parentSurfaceId, threadChannelId);
+	} catch (error) {
+		throw new DiscordRouteError(error instanceof Error ? error.message : String(error));
+	}
 }
 
 /** Resolves an attributed surface to a configured channel, including a derived thread channel. */
 export function resolveDiscordEgressRoute(routes: readonly DiscordRoute[], surfaceId: string): DiscordRoute | undefined {
 	const direct = routes.find(route => route.surfaceId === surfaceId);
 	if (direct) return direct;
-	const threadRoutes: DiscordRoute[] = [];
-	for (const route of routes) {
-		if (route.kind !== "channel") continue;
-		const prefix = `${route.surfaceId}/thread:`;
-		if (!surfaceId.startsWith(prefix)) continue;
-		const threadChannelId = surfaceId.slice(prefix.length);
-		if (isDiscordSnowflake(threadChannelId)) threadRoutes.push({ surfaceId, channelId: threadChannelId, kind: "channel" });
-	}
-	return threadRoutes.length === 1 ? threadRoutes[0] : undefined;
+	// Parsed through the shared SSOT rather than re-deriving the prefix here, so
+	// ingress, egress, and gateway admission agree by construction.
+	const parsed = parseThreadSurfaceId(surfaceId);
+	if (!parsed) return undefined;
+	const parent = routes.find(route => route.surfaceId === parsed.parentSurfaceId && route.kind === "channel");
+	if (!parent) return undefined;
+	return { surfaceId, channelId: parsed.threadId, kind: "channel" };
 }
 
 function validateDiscordRoute(route: DiscordRoute): void {
