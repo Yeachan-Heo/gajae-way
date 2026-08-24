@@ -31,6 +31,7 @@ const RECOVERABLE_REASONS = {
 	main_identity_mismatch: "attested_append_only_growth",
 	/** Transient broker/transport unavailability; recoverable by a fresh verify. */
 	session_unavailable: "live_verify",
+	broker_unavailable: "live_verify",
 	turn_state_unavailable: "live_verify",
 	tail_resync_unavailable: "live_verify",
 	/** Durable metadata write failures; recoverable when state reads back coherent. */

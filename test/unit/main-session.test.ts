@@ -254,13 +254,15 @@ test.serial("strict resume records a visible delivery gap when pending-proof pro
 	}
 });
 
-test.serial("strict resume fails closed when the exact adopted external session disappears", async () => {
+test.serial("strict resume fails closed when the broker authoritatively reports the adopted session not live", async () => {
 	const fixture = new FakeBrokerFixture();
 	fixtures.push(fixture);
 	const { state, profile } = await bootstrapFixture(fixture);
 	fixture.setLive(false);
 	const resumed = supervisor(fixture);
 	try {
+		// An authoritative "not live" answer is an identity-authority failure and
+		// must stay durable so the daemon never rebirths a replacement session.
 		await expect(strictResumeMainSession({ profile, state, supervisor: resumed })).rejects.toMatchObject({
 			reason: "session_unavailable",
 		} satisfies Partial<ResumeError>);
@@ -268,7 +270,7 @@ test.serial("strict resume fails closed when the exact adopted external session 
 	} finally {
 		await resumed.dispose();
 	}
-});
+}, 60_000);
 
 test.serial("scripted broker CLI fixture covers inspect, send, status, tail, and overlapping SDK lifecycle frames", async () => {
 	const fixture = new FakeBrokerFixture();
@@ -1594,3 +1596,50 @@ test.serial("an unavailable broker tail recovers automatically instead of fail-s
 		await host.dispose();
 	}
 }, 120_000);
+
+test.serial("a failed broker call at boot does not persist a durable fail-closed marker", async () => {
+	const fixture = new FakeBrokerFixture();
+	fixtures.push(fixture);
+	const { state, profile } = await bootstrapFixture(fixture);
+	// The broker CLI itself fails (spawn pressure, a version/generation mismatch,
+	// or the persona sitting in a long turn). This says nothing about the adopted
+	// identity, so it must never brick the deployment: persisting it forced a
+	// manual recovery ceremony before the daemon would start again.
+	// A broker executable that cannot run at all is the cleanest stand-in for the
+	// real cause seen live: a gjc build whose package generation the running broker
+	// refuses, so every broker call fails.
+	const resuming = createExternalHostSupervisor({
+		broker: new BrokerCli({ executable: `${fixture.executable}.does-not-exist`, environment: fixture.environment() }),
+		workspace: fixture.workspace,
+		tailTimeoutMs: 100,
+		adoptionTailTimeoutMs: 100,
+		commandTimeoutMs: 2_000,
+	});
+	try {
+		await expect(strictResumeMainSession({ profile, state, supervisor: resuming })).rejects.toMatchObject({
+			reason: expect.stringMatching(/broker_unavailable|tail_unavailable|broker_timeout/),
+		});
+		const after = state.read();
+		expect(after.bootstrapState).toBe("COMMITTED");
+		expect(after.failedClosedReason).toBeUndefined();
+	} finally {
+		await resuming.dispose();
+	}
+}, 90_000);
+
+test.serial("an authority failure at boot still persists a durable fail-closed marker", async () => {
+	const fixture = new FakeBrokerFixture();
+	fixtures.push(fixture);
+	const { state, profile } = await bootstrapFixture(fixture);
+	// Not transport: the transcript prefix was rewritten, which must stay terminal.
+	fixture.rotateTranscriptPast(`${fixture.sessionId}:transcript:1`);
+	const resuming = supervisor(fixture);
+	try {
+		await expect(strictResumeMainSession({ profile, state, supervisor: resuming })).rejects.toMatchObject({
+			reason: "main_identity_mismatch",
+		} satisfies Partial<ResumeError>);
+		expect(state.read()).toMatchObject({ bootstrapState: "FAILED_CLOSED", failedClosedReason: "main_identity_mismatch" });
+	} finally {
+		await resuming.dispose();
+	}
+}, 30_000);

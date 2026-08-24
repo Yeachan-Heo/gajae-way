@@ -297,7 +297,10 @@ export class ExternalHostSupervisor implements HostSupervisor {
 		try {
 			row = await this.#broker.inspectSession(expectedSessionId, { timeoutMs: this.#commandTimeoutMs });
 		} catch (error) {
-			throw this.wrapBrokerError("session_unavailable", error);
+			// The broker CALL failed, which says nothing about the session itself.
+			// Keep it distinct from an authoritative "not live" answer so boot can
+			// retry transport problems without persisting a fail-closed marker.
+			throw this.wrapBrokerError("broker_unavailable", error);
 		}
 		const reason = unavailableReason(row);
 		if (reason) throw new HostSupervisorError(reason, `The requested external session ${expectedSessionId} is not safely live.`);

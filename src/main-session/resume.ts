@@ -55,6 +55,19 @@ function failClosed(state: GatewayStateStore, reason: string, message?: string, 
  * never opens a local SDK session and never offers a recent-session fallback.
  */
 
+/**
+ * Broker/transport reasons that say nothing about the adopted identity's
+ * integrity. They are retried at boot and NEVER persisted as a durable
+ * fail-closed marker: doing so turned a transient hiccup (most often the adopted
+ * persona simply sitting in a long turn, since the broker CLI only emits tail
+ * envelopes at terminal turn boundaries) into a permanent outage that required a
+ * manual recovery ceremony before the daemon would start again.
+ */
+const TRANSPORT_RESUME_REASONS = new Set(["tail_unavailable", "broker_unavailable", "turn_state_unavailable", "broker_timeout"]);
+
+const RESUME_VERIFY_ATTEMPTS = 8;
+const RESUME_VERIFY_MAX_DELAY_MS = 5_000;
+
 export async function strictResumeMainSession(options: ResumeOptions): Promise<ResumedMainSession> {
 	const durable = options.state.read();
 	if (durable.bootstrapState === "FAILED_CLOSED") {
@@ -73,11 +86,32 @@ export async function strictResumeMainSession(options: ResumeOptions): Promise<R
 		return failClosed(options.state, "profile_session_mismatch", "The profile selected a different external session than the durable adopted identity.");
 	}
 	let verified;
-	try {
-		verified = await options.supervisor.verify(durable.mainIdentity);
-	} catch (error) {
-		const reason = error instanceof HostSupervisorError ? error.reason : "strict_resume_failed";
-		return failClosed(options.state, reason, error instanceof Error ? error.message : String(error), error);
+	{
+		let lastError: unknown;
+		for (let attempt = 1; attempt <= RESUME_VERIFY_ATTEMPTS; attempt += 1) {
+			try {
+				verified = await options.supervisor.verify(durable.mainIdentity);
+				lastError = undefined;
+				break;
+			} catch (error) {
+				lastError = error;
+				const reason = error instanceof HostSupervisorError ? error.reason : "strict_resume_failed";
+				if (!TRANSPORT_RESUME_REASONS.has(reason)) {
+					// An authority failure is durable: identity, proof, and profile
+					// problems must fail closed and stay closed.
+					return failClosed(options.state, reason, error instanceof Error ? error.message : String(error), error);
+				}
+				if (attempt === RESUME_VERIFY_ATTEMPTS) break;
+				const delayMs = Math.min(250 * 2 ** (attempt - 1), RESUME_VERIFY_MAX_DELAY_MS);
+				await new Promise(resolve => setTimeout(resolve, delayMs));
+			}
+		}
+		if (lastError !== undefined || verified === undefined) {
+			// Still a transport failure after retrying: report it WITHOUT writing a
+			// durable marker so a later start recovers on its own.
+			const reason = lastError instanceof HostSupervisorError ? lastError.reason : "strict_resume_failed";
+			throw new ResumeError(reason, lastError instanceof Error ? lastError.message : String(lastError), { cause: lastError });
+		}
 	}
 	const current = verified.identity;
 	let durableIdentity = durable.mainIdentity;
