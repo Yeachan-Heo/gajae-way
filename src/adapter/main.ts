@@ -1,6 +1,7 @@
 import * as path from "node:path";
 import { defaultConfig, parseWayConfig } from "../config";
 import { RpcClient, type JsonRpcClient } from "../rpc-client";
+import { ReconnectingRpcClient } from "./reconnecting-rpc";
 import { FileChunkLedger } from "./chunk-ledger";
 import { loadDiscordAdapterConfig } from "./discord/config";
 import { DiscordOutbox } from "./discord/outbox";
@@ -32,7 +33,13 @@ export async function startUnifiedAdapter(options: { discord?: ReturnType<typeof
 }
 
 async function startDiscordPeer(config: ReturnType<typeof loadDiscordAdapterConfig>, dependencies: UnifiedAdapterDependencies): Promise<RunningUnifiedAdapter> {
-	const rpc = await (dependencies.rpcConnect ?? RpcClient.connect)(config.rpcSocketPath);
+	// Reconnecting by default: a gateway restart must not permanently silence the
+	// chat surface. Delivery stays exactly-once because the consumer commits only
+	// after a confirmed send and replays reuse deterministic nonces plus the
+	// durable chunk ledger.
+	const rpc = dependencies.rpcConnect
+		? await dependencies.rpcConnect(config.rpcSocketPath)
+		: await ReconnectingRpcClient.connect(config.rpcSocketPath, { onDiagnostic: message => dependencies.onError?.(new Error(message)) });
 	const platform = new DiscordGatewayPlatform({ token: config.token, fetch: dependencies.fetch });
 	const bot = await platform.getCurrentUser();
 	const route = new DiscordRouteHandler({ routes: config.routes, rpc, platform, botUserId: bot.id, allowBots: config.allowBots, blockedAuthorIds: config.blockedAuthorIds });
@@ -48,7 +55,9 @@ async function startDiscordPeer(config: ReturnType<typeof loadDiscordAdapterConf
 }
 
 async function startTelegramPeer(config: TelegramAdapterConfig, dependencies: UnifiedAdapterDependencies): Promise<RunningUnifiedAdapter> {
-	const rpc = await (dependencies.rpcConnect ?? RpcClient.connect)(config.rpcSocketPath);
+	const rpc = dependencies.rpcConnect
+		? await dependencies.rpcConnect(config.rpcSocketPath)
+		: await ReconnectingRpcClient.connect(config.rpcSocketPath, { onDiagnostic: message => dependencies.onError?.(new Error(message)) });
 	const platform = new TelegramPlatform({ token: config.token, fetch: dependencies.fetch, stateDir: config.stateDir });
 	const bot = await platform.getCurrentUser();
 	const route = new DiscordRouteHandler({ routes: config.routes, rpc, platform, botUserId: bot.id, allowBots: config.allowBots, blockedAuthorIds: config.blockedAuthorIds });
