@@ -1,9 +1,4 @@
-import {
-	BrokerCli,
-	BrokerCliError,
-	type SessionMetadataV1,
-	type SdkSessionRowV1,
-} from "./cli";
+import { BrokerCli, BrokerCliError, type SdkSessionRowV1, type SessionMetadataV1 } from "./cli";
 
 export const DEFAULT_RECONCILE_POLL_MS = 15_000;
 export const MAX_RECONCILE_CYCLE_MS = 20_000;
@@ -68,7 +63,13 @@ export interface RegistryCore {
 		driftCount: number;
 	};
 	registryList(input?: { limit?: number; offset?: number }): { rows: RegistryRow[]; total: number };
-	registryApplyMetadata(input: { sessionId: string; name: string; cwd: string; kind: string; observedAt: number }): RegistryRow;
+	registryApplyMetadata(input: {
+		sessionId: string;
+		name: string;
+		cwd: string;
+		kind: string;
+		observedAt: number;
+	}): RegistryRow;
 	registryMarkMetadataUnavailable(input: { sessionId: string; observedAt: number }): RegistryRow;
 	setReconcileStatus(input: { lastOkAt: number; cycleMs: number; driftCount: number }): void;
 }
@@ -131,7 +132,8 @@ export class BrokerReconciler {
 		this.pollMs = options.pollMs ?? DEFAULT_RECONCILE_POLL_MS;
 		this.cycleSlaMs = options.cycleSlaMs ?? MAX_RECONCILE_CYCLE_MS;
 		this.#now = options.now ?? Date.now;
-		if (!Number.isSafeInteger(this.pollMs) || this.pollMs <= 0) throw new Error("pollMs must be a positive safe integer.");
+		if (!Number.isSafeInteger(this.pollMs) || this.pollMs <= 0)
+			throw new Error("pollMs must be a positive safe integer.");
 		if (!Number.isSafeInteger(this.cycleSlaMs) || this.cycleSlaMs <= 0 || this.cycleSlaMs > MAX_RECONCILE_CYCLE_MS) {
 			throw new Error(`cycleSlaMs must be in 1..=${MAX_RECONCILE_CYCLE_MS}.`);
 		}
@@ -171,7 +173,10 @@ export class BrokerReconciler {
 	}
 
 	private commandBudget(deadline: number): number {
-		return Math.max(1, Math.min(this.remaining(deadline), this.broker.commandTimeoutMs, Math.floor(this.cycleSlaMs / 2)));
+		return Math.max(
+			1,
+			Math.min(this.remaining(deadline), this.broker.commandTimeoutMs, Math.floor(this.cycleSlaMs / 2)),
+		);
 	}
 
 	private async runCycle(): Promise<ReconcileCycleResult> {
@@ -185,7 +190,13 @@ export class BrokerReconciler {
 			rows: listed.sessions.map(asNativeRow),
 		});
 		const rows = this.allRows();
-		const metadataQueries = await this.enrich(rows, applied.newSessionIds, applied.changedIndexSeqSessionIds, new Set(listed.sessions.map(row => row.sessionId)), deadline);
+		const metadataQueries = await this.enrich(
+			rows,
+			applied.newSessionIds,
+			applied.changedIndexSeqSessionIds,
+			new Set(listed.sessions.map((row) => row.sessionId)),
+			deadline,
+		);
 		const cycleMs = this.#now() - startedAt;
 		this.core.setReconcileStatus({ lastOkAt: this.#now(), cycleMs, driftCount: applied.driftCount });
 		return { observedAt, cycleMs, driftCount: applied.driftCount, metadataQueries };
@@ -220,7 +231,7 @@ export class BrokerReconciler {
 		const newSessions = new Set(newSessionIds);
 		const changedIndexSeq = new Set(changedIndexSeqSessionIds);
 		const candidates = rows
-			.filter(row => listedSessionIds.has(row.sessionId) && !row.deleted && this.eligibleForMetadata(row, now))
+			.filter((row) => listedSessionIds.has(row.sessionId) && !row.deleted && this.eligibleForMetadata(row, now))
 			.sort((left, right) => {
 				const priority = (row: RegistryRow): readonly [number, number, number, string] => [
 					newSessions.has(row.sessionId) ? 0 : 1,
@@ -237,7 +248,7 @@ export class BrokerReconciler {
 				return 0;
 			})
 			.slice(0, MAX_METADATA_QUERIES_PER_CYCLE);
-		await Promise.all(candidates.map(row => this.enrichOne(row, deadline)));
+		await Promise.all(candidates.map((row) => this.enrichOne(row, deadline)));
 		return candidates.length;
 	}
 
@@ -253,7 +264,8 @@ export class BrokerReconciler {
 			const now = this.#now();
 			const current = this.#metadataBackoff.get(row.sessionId);
 			const priorDelay = current?.delayMs ?? (row.metadataState === "unavailable" ? INITIAL_METADATA_BACKOFF_MS : 0);
-			const delayMs = priorDelay === 0 ? INITIAL_METADATA_BACKOFF_MS : Math.min(MAX_METADATA_BACKOFF_MS, priorDelay * 2);
+			const delayMs =
+				priorDelay === 0 ? INITIAL_METADATA_BACKOFF_MS : Math.min(MAX_METADATA_BACKOFF_MS, priorDelay * 2);
 			this.#metadataBackoff.set(row.sessionId, { delayMs, nextAttemptAt: now + delayMs });
 			this.core.registryMarkMetadataUnavailable({ sessionId: row.sessionId, observedAt: now });
 		}

@@ -1,0 +1,56 @@
+{
+  "schemaVersion": 1,
+  "kind": "adversarial-test-report",
+  "batch": "VB002",
+  "generation": 2,
+  "deltaOnly": true,
+  "surface": "memory.search + mcp serve",
+  "redactionBoundary": true,
+  "cases": [
+    {
+      "id": "AR-1-midnight",
+      "verdict": "passed",
+      "proof": "Stored conversation mask from indexedAt before local midnight still denies daily/2026-01-03.md after midnight; live search uses the stored mask, not a recomputed expansion."
+    },
+    {
+      "id": "AR-1-template-agreement",
+      "verdict": "passed",
+      "proof": "Raw daily/{date}.md rule is restricted against the template and unrestricted against the expanded path. Conversation search returns today-secret from daily/2026-01-03.md and never returns memory-secret."
+    },
+    {
+      "id": "AR-1-overflow-pin",
+      "verdict": "passed",
+      "proof": "src/main.ts threads one indexedAt into recallCandidates and every restrictionMask and refuses candidates.length > MAX_INJECTION_FILES. Pinning memory_index_digest=unavailable yields RPC 1801 with no zebra/secret in the JSON."
+    },
+    {
+      "id": "AR-2-unknown-vs-absent",
+      "verdict": "passed",
+      "proof": "Unresolvable, empty, SQL-looking, path-traversal, and numeric session_kind inherit the stored unknown mask. Deleting all memory_mask_* keys then searching as main returns no hits."
+    },
+    {
+      "id": "AR-3-oob-index",
+      "verdict": "passed",
+      "proof": "Indexed file_index 64, 65, u32-max and a NAPI-rejected -1 never appear under any class. Bit 63 remains maskable. Rust SQL BETWEEN 0 AND 63 excludes 64 and -1."
+    },
+    {
+      "id": "AR-4-1801",
+      "verdict": "passed",
+      "proof": "Failed rebuild leaves the old index searchable until the digest pin is set to unavailable; then memory.search returns 1801 and the body does not contain the query token."
+    },
+    {
+      "id": "AR-5-known-membership",
+      "verdict": "passed",
+      "proof": "Adding [[surfaces.known]] changes digest with other bound inputs held constant. Changing that known surface's session_kind changes digest; changing only free-form kind does not."
+    },
+    {
+      "id": "AR-6-mcp-table",
+      "verdict": "passed",
+      "proof": "Crafted tool names including memory.search, prototype keys, and write-tool aliases are -32602 with write disabled. consumer_id is unsupported. write_enabled truthy non-booleans stay false. package.json has no dependencies; compile.ts has no gajaeway-mcp target."
+    },
+    {
+      "id": "G005-no-recall-bypass",
+      "verdict": "passed",
+      "proof": "tools/list never advertises memory.search with write on or off. tools/call memory.search is -32602. JSON-RPC method memory.search on the MCP dispatcher is -32601. Fake gateway recorded zero backing RPC calls."
+    }
+  ]
+}

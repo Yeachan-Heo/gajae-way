@@ -1,7 +1,7 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
 import {
-	BrokerCli,
+	type BrokerCli,
 	BrokerCliError,
 	type BrokerOperationReceipt,
 	type BrokerTurnStatus,
@@ -9,13 +9,12 @@ import {
 	type SdkTailEnvelopeV1,
 } from "../broker/cli";
 import {
-	fingerprintTranscriptEntries,
 	type ExternalSessionIdentity,
+	fingerprintTranscriptEntries,
 	type TailCheckpoint,
 	type TranscriptFingerprint,
 	type TranscriptProof,
 } from "./state";
-
 
 export type SupervisorTurnState = "idle" | "busy";
 
@@ -114,10 +113,13 @@ export interface ExternalHostSupervisorOptions {
 
 function transcriptEntries(tail: SdkTailEnvelopeV1): SupervisorTranscriptEntry[] {
 	return tail.items
-		.filter(item => item.kind === "transcript")
+		.filter((item) => item.kind === "transcript")
 		.map((item, index) => {
 			if (!item.id) {
-				throw new HostSupervisorError("transcript_entry_id_missing", `Broker transcript entry ${index} has no stable id.`);
+				throw new HostSupervisorError(
+					"transcript_entry_id_missing",
+					`Broker transcript entry ${index} has no stable id.`,
+				);
 			}
 			return { id: item.id, payload: item.payload };
 		});
@@ -125,8 +127,8 @@ function transcriptEntries(tail: SdkTailEnvelopeV1): SupervisorTranscriptEntry[]
 
 function eventItems(tail: SdkTailEnvelopeV1): SupervisorEvent[] {
 	return tail.items
-		.filter(item => item.kind !== "transcript")
-		.map(item => ({
+		.filter((item) => item.kind !== "transcript")
+		.map((item) => ({
 			kind: item.kind,
 			...(item.id === undefined ? {} : { id: item.id }),
 			...(item.generation === undefined ? {} : { generation: item.generation }),
@@ -190,17 +192,29 @@ export class ExternalHostSupervisor implements HostSupervisor {
 		if (!Number.isSafeInteger(this.#tailTimeoutMs) || this.#tailTimeoutMs < 1 || this.#tailTimeoutMs > 120_000) {
 			throw new HostSupervisorError("tail_timeout_invalid", "tailTimeoutMs must be an integer in 1..=120000.");
 		}
-		if (!Number.isSafeInteger(this.#adoptionTailTimeoutMs) || this.#adoptionTailTimeoutMs < 1 || this.#adoptionTailTimeoutMs > 120_000) {
-			throw new HostSupervisorError("adoption_tail_timeout_invalid", "adoptionTailTimeoutMs must be an integer in 1..=120000.");
+		if (
+			!Number.isSafeInteger(this.#adoptionTailTimeoutMs) ||
+			this.#adoptionTailTimeoutMs < 1 ||
+			this.#adoptionTailTimeoutMs > 120_000
+		) {
+			throw new HostSupervisorError(
+				"adoption_tail_timeout_invalid",
+				"adoptionTailTimeoutMs must be an integer in 1..=120000.",
+			);
 		}
-		if (!Number.isSafeInteger(this.#commandTimeoutMs) || this.#commandTimeoutMs < 1 || this.#commandTimeoutMs > 120_000) {
+		if (
+			!Number.isSafeInteger(this.#commandTimeoutMs) ||
+			this.#commandTimeoutMs < 1 ||
+			this.#commandTimeoutMs > 120_000
+		) {
 			throw new HostSupervisorError("command_timeout_invalid", "commandTimeoutMs must be an integer in 1..=120000.");
 		}
 	}
 
 	async discover(sessionId: string): Promise<SupervisorVerification> {
 		this.assertUsable();
-		if (!sessionId.trim()) throw new HostSupervisorError("session_id_required", "External adoption requires an exact session id.");
+		if (!sessionId.trim())
+			throw new HostSupervisorError("session_id_required", "External adoption requires an exact session id.");
 		const verified = await this.verifyRow(sessionId, undefined);
 		this.#identity = verified.identity;
 		return verified;
@@ -214,7 +228,9 @@ export class ExternalHostSupervisor implements HostSupervisor {
 	}
 
 	async sendPrompt(text: string, opRef: string): Promise<BrokerOperationReceipt> {
-		return await this.#broker.sendPrompt(this.requireIdentity().sessionId, text, opRef, { timeoutMs: this.#commandTimeoutMs });
+		return await this.#broker.sendPrompt(this.requireIdentity().sessionId, text, opRef, {
+			timeoutMs: this.#commandTimeoutMs,
+		});
 	}
 
 	async sendSteer(text: string, opRef: string): Promise<BrokerOperationReceipt> {
@@ -230,7 +246,9 @@ export class ExternalHostSupervisor implements HostSupervisor {
 	}
 
 	async operationStatus(opRef: string): Promise<BrokerTurnStatus> {
-		return await this.#broker.turnStatus(this.requireIdentity().sessionId, opRef, { timeoutMs: this.#commandTimeoutMs });
+		return await this.#broker.turnStatus(this.requireIdentity().sessionId, opRef, {
+			timeoutMs: this.#commandTimeoutMs,
+		});
 	}
 
 	async tailEvents(options: { readonly timeoutMs?: number } = {}): Promise<SupervisorTailEvents> {
@@ -243,23 +261,33 @@ export class ExternalHostSupervisor implements HostSupervisor {
 				allEvents: true,
 				timeoutMs: options.timeoutMs ?? this.#tailTimeoutMs,
 			});
-
 		} catch (error) {
 			if (isNormalTailTimeout(error)) {
 				return { identity, transcriptEntries: [], events: [], terminal: false, complete: false, retentionGap: false };
 			}
 			if (isRetentionGap(error)) {
-				throw new HostSupervisorError("tail_unavailable", "Broker tail did not return a resynchronizable ring envelope.", { cause: error });
+				throw new HostSupervisorError(
+					"tail_unavailable",
+					"Broker tail did not return a resynchronizable ring envelope.",
+					{ cause: error },
+				);
 			}
 			throw this.wrapBrokerError("tail_unavailable", error);
 		}
 		const reason = unavailableReason(tail.session);
-		if (reason) throw new HostSupervisorError(reason, `The adopted session ${identity.sessionId} is no longer safely available.`);
-		if (!samePathIdentity(tail.session.locator.repo, identity.locator.repo) || !samePathIdentity(tail.session.locator.stateRoot, identity.locator.stateRoot)) {
-			throw new HostSupervisorError("session_locator_mismatch", "Broker tail locator did not match the adopted external session.");
+		if (reason)
+			throw new HostSupervisorError(reason, `The adopted session ${identity.sessionId} is no longer safely available.`);
+		if (
+			!samePathIdentity(tail.session.locator.repo, identity.locator.repo) ||
+			!samePathIdentity(tail.session.locator.stateRoot, identity.locator.stateRoot)
+		) {
+			throw new HostSupervisorError(
+				"session_locator_mismatch",
+				"Broker tail locator did not match the adopted external session.",
+			);
 		}
 		const entries = transcriptEntries(tail);
-		const transcript = fingerprintTranscriptEntries(entries.map(entry => entry.payload));
+		const transcript = fingerprintTranscriptEntries(entries.map((entry) => entry.payload));
 		const fresh = identityFromRow(tail.session, transcript);
 		this.#identity = fresh;
 		return {
@@ -292,7 +320,10 @@ export class ExternalHostSupervisor implements HostSupervisor {
 		this.#identity = undefined;
 	}
 
-	private async verifyRow(expectedSessionId: string, expected: ExternalSessionIdentity | undefined): Promise<SupervisorVerification> {
+	private async verifyRow(
+		expectedSessionId: string,
+		expected: ExternalSessionIdentity | undefined,
+	): Promise<SupervisorVerification> {
 		let row: SdkSessionRowV1;
 		try {
 			row = await this.#broker.inspectSession(expectedSessionId, { timeoutMs: this.#commandTimeoutMs });
@@ -300,17 +331,31 @@ export class ExternalHostSupervisor implements HostSupervisor {
 			throw this.wrapBrokerError("session_unavailable", error);
 		}
 		const reason = unavailableReason(row);
-		if (reason) throw new HostSupervisorError(reason, `The requested external session ${expectedSessionId} is not safely live.`);
+		if (reason)
+			throw new HostSupervisorError(reason, `The requested external session ${expectedSessionId} is not safely live.`);
 		if (!samePathIdentity(row.locator.repo, this.#workspace)) {
-			throw new HostSupervisorError("session_workspace_mismatch", "Broker session locator does not match the profile workspace.");
+			throw new HostSupervisorError(
+				"session_workspace_mismatch",
+				"Broker session locator does not match the profile workspace.",
+			);
 		}
-		if (expected && (!samePathIdentity(row.locator.repo, expected.locator.repo) || !samePathIdentity(row.locator.stateRoot, expected.locator.stateRoot))) {
-			throw new HostSupervisorError("session_locator_mismatch", "Broker session locator does not match the durable adopted identity.");
+		if (
+			expected &&
+			(!samePathIdentity(row.locator.repo, expected.locator.repo) ||
+				!samePathIdentity(row.locator.stateRoot, expected.locator.stateRoot))
+		) {
+			throw new HostSupervisorError(
+				"session_locator_mismatch",
+				"Broker session locator does not match the durable adopted identity.",
+			);
 		}
 		try {
 			const metadata = await this.#broker.sessionMetadata(expectedSessionId, { timeoutMs: this.#commandTimeoutMs });
 			if (!samePathIdentity(metadata.cwd, this.#workspace)) {
-				throw new HostSupervisorError("session_workspace_mismatch", "Session metadata cwd does not match the profile workspace.");
+				throw new HostSupervisorError(
+					"session_workspace_mismatch",
+					"Session metadata cwd does not match the profile workspace.",
+				);
 			}
 			if (metadata.kind !== "main") {
 				throw new HostSupervisorError("session_kind_mismatch", "Only an operator-run main GJC session can be adopted.");
@@ -348,7 +393,10 @@ export class ExternalHostSupervisor implements HostSupervisor {
 		// events from the first envelope.
 		const initialRingCheckpoint = tail.checkpoint ?? tail.resyncCheckpoint;
 		if (!initialRingCheckpoint) {
-			throw new HostSupervisorError("tail_checkpoint_unavailable", "A complete broker tail did not provide an adoption ring checkpoint.");
+			throw new HostSupervisorError(
+				"tail_checkpoint_unavailable",
+				"A complete broker tail did not provide an adoption ring checkpoint.",
+			);
 		}
 		return {
 			identity: tail.identity,
@@ -363,7 +411,8 @@ export class ExternalHostSupervisor implements HostSupervisor {
 
 	private requireIdentity(): ExternalSessionIdentity {
 		this.assertUsable();
-		if (!this.#identity) throw new HostSupervisorError("session_not_adopted", "No external GJC session has been adopted.");
+		if (!this.#identity)
+			throw new HostSupervisorError("session_not_adopted", "No external GJC session has been adopted.");
 		return this.#identity;
 	}
 

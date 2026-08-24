@@ -46,6 +46,8 @@ export interface DiscordGatewayPlatformOptions {
 	readonly fetch?: DiscordFetch;
 	readonly webSocketFactory?: (url: string) => GatewaySocket;
 	readonly now?: () => number;
+	/** Test seam so rate-limit backoff never waits in real time. */
+	readonly sleep?: (milliseconds: number) => Promise<void>;
 	readonly reconnectBaseMs?: number;
 	readonly reconnectMaxMs?: number;
 }
@@ -98,6 +100,34 @@ export async function validateDiscordToken(
 }
 
 /**
+ * Bounded retry budget for Discord 429 responses.
+ *
+ * Bounded on purpose: an unbounded retry would let a rate limit block adapter
+ * shutdown, and the caller already tolerates a failed request.
+ */
+export const DISCORD_RATE_LIMIT_MAX_RETRIES = 3;
+/** Upper bound on a single honoured `retry_after`, so one hostile value cannot stall the adapter. */
+export const DISCORD_RATE_LIMIT_MAX_WAIT_MS = 5_000;
+
+async function retryAfterMs(response: Response): Promise<number | undefined> {
+	const header = response.headers.get("retry-after");
+	const fromHeader = header === null ? Number.NaN : Number(header);
+	// Discord sends seconds in the header and, for some routes, a JSON body.
+	let seconds = Number.isFinite(fromHeader) ? fromHeader : Number.NaN;
+	if (!Number.isFinite(seconds)) {
+		try {
+			const parsed = JSON.parse(await response.clone().text()) as unknown;
+			const candidate = isRecord(parsed) ? parsed.retry_after : undefined;
+			if (typeof candidate === "number" && Number.isFinite(candidate)) seconds = candidate;
+		} catch {
+			return undefined;
+		}
+	}
+	if (!Number.isFinite(seconds) || seconds < 0) return undefined;
+	return Math.min(Math.ceil(seconds * 1_000), DISCORD_RATE_LIMIT_MAX_WAIT_MS);
+}
+
+/**
  * Minimal dependency-free Discord implementation: gateway IDENTIFY,
  * HEARTBEAT, RESUME and MESSAGE_CREATE, plus REST send/typing/reaction calls.
  */
@@ -108,6 +138,7 @@ export class DiscordGatewayPlatform implements DiscordPlatform {
 	readonly #fetch: DiscordFetch;
 	readonly #webSocketFactory: (url: string) => GatewaySocket;
 	readonly #now: () => number;
+	readonly #sleep: (milliseconds: number) => Promise<void>;
 	readonly #reconnectBaseMs: number;
 	readonly #reconnectMaxMs: number;
 	readonly #handlers = new Set<DiscordMessageHandler>();
@@ -131,6 +162,7 @@ export class DiscordGatewayPlatform implements DiscordPlatform {
 		this.#fetch = options.fetch ?? globalThis.fetch;
 		this.#webSocketFactory = options.webSocketFactory ?? defaultWebSocketFactory;
 		this.#now = options.now ?? Date.now;
+		this.#sleep = options.sleep ?? ((milliseconds) => new Promise((resolve) => setTimeout(resolve, milliseconds)));
 		this.#reconnectBaseMs = positiveInteger(options.reconnectBaseMs ?? DEFAULT_RECONNECT_BASE_MS, "reconnectBaseMs");
 		this.#reconnectMaxMs = positiveInteger(options.reconnectMaxMs ?? DEFAULT_RECONNECT_MAX_MS, "reconnectMaxMs");
 		if (this.#reconnectMaxMs < this.#reconnectBaseMs) {
@@ -171,7 +203,8 @@ export class DiscordGatewayPlatform implements DiscordPlatform {
 	async send(channelId: string, text: string, nonce: string): Promise<string> {
 		validateChannelId(channelId);
 		if (!text.trim()) throw new DiscordPlatformError("Discord message text must not be empty.");
-		if (text.length > 2_000) throw new DiscordPlatformError("Discord message text exceeds the 2000-character platform limit.");
+		if (text.length > 2_000)
+			throw new DiscordPlatformError("Discord message text exceeds the 2000-character platform limit.");
 		if (!nonce) throw new DiscordPlatformError("Discord message nonce must not be empty.");
 		const response = await this.rest("POST", `/channels/${encodeURIComponent(channelId)}/messages`, {
 			content: text,
@@ -200,14 +233,16 @@ export class DiscordGatewayPlatform implements DiscordPlatform {
 	}
 
 	private async rest(method: string, resource: string, body?: Record<string, unknown>): Promise<unknown> {
-		const response = await this.#fetch(`${this.#apiBaseUrl}${resource}`, {
-			method,
-			headers: {
-				Authorization: `Bot ${this.#token}`,
-				...(body ? { "Content-Type": "application/json" } : {}),
-			},
-			...(body ? { body: JSON.stringify(body) } : {}),
-		});
+		let response = await this.restOnce(method, resource, body);
+		// Discord rate-limits aggressively, and POST /typing is among the worst
+		// offenders because the keepalive polls it per channel. Without this the
+		// first 429 propagated as a hard failure.
+		for (let attempt = 0; response.status === 429 && attempt < DISCORD_RATE_LIMIT_MAX_RETRIES; attempt += 1) {
+			const waitMs = await retryAfterMs(response);
+			if (waitMs === undefined) break;
+			await this.#sleep(waitMs);
+			response = await this.restOnce(method, resource, body);
+		}
 		if (!response.ok) throw await restError(method, resource, response);
 		if (response.status === 204) return undefined;
 		const text = await response.text();
@@ -217,6 +252,17 @@ export class DiscordGatewayPlatform implements DiscordPlatform {
 		} catch {
 			throw new DiscordPlatformError(`Discord ${method} ${resource} returned invalid JSON.`);
 		}
+	}
+
+	private async restOnce(method: string, resource: string, body?: Record<string, unknown>): Promise<Response> {
+		return await this.#fetch(`${this.#apiBaseUrl}${resource}`, {
+			method,
+			headers: {
+				Authorization: `Bot ${this.#token}`,
+				...(body ? { "Content-Type": "application/json" } : {}),
+			},
+			...(body ? { body: JSON.stringify(body) } : {}),
+		});
 	}
 
 	private async gatewayUrl(): Promise<string> {
@@ -235,13 +281,16 @@ export class DiscordGatewayPlatform implements DiscordPlatform {
 		this.#ready = ready;
 		let timer: ReturnType<typeof setTimeout> | undefined;
 		const timeout = new Promise<never>((_, reject) => {
-			timer = setTimeout(() => reject(new DiscordPlatformError("Timed out waiting for Discord gateway READY.")), GATEWAY_CONNECT_TIMEOUT_MS);
+			timer = setTimeout(
+				() => reject(new DiscordPlatformError("Timed out waiting for Discord gateway READY.")),
+				GATEWAY_CONNECT_TIMEOUT_MS,
+			);
 		});
 		try {
 			const socket = this.#webSocketFactory(gatewayUrlWithEncoding(gatewayUrl));
 			this.#socket = socket;
-			socket.addEventListener("message", event => this.onGatewayMessage(socket, event));
-			socket.addEventListener("close", event => this.onGatewayClose(socket, event));
+			socket.addEventListener("message", (event) => this.onGatewayMessage(socket, event));
+			socket.addEventListener("close", (event) => this.onGatewayClose(socket, event));
 			socket.addEventListener("error", () => {
 				// Discord closes the socket with the actionable status. Keep this
 				// handler intentionally quiet to avoid treating transient errors as a
@@ -338,8 +387,10 @@ export class DiscordGatewayPlatform implements DiscordPlatform {
 		const message = discordMessageFromDispatch(envelope.d, this.#now());
 		if (!message) return;
 		for (const callback of this.#handlers) {
-			Promise.resolve(callback(message)).catch(error => {
-				console.error(`gajaeway-discord message handler failed: ${error instanceof Error ? error.message : String(error)}`);
+			Promise.resolve(callback(message)).catch((error) => {
+				console.error(
+					`gajaeway-discord message handler failed: ${error instanceof Error ? error.message : String(error)}`,
+				);
 			});
 		}
 	}
@@ -369,7 +420,8 @@ export class DiscordGatewayPlatform implements DiscordPlatform {
 		const code = isRecord(event) && typeof event.code === "number" ? event.code : undefined;
 		const ready = this.#ready;
 		this.#ready = undefined;
-		if (ready && !ready.settled()) ready.reject(new DiscordPlatformError(`Discord gateway closed${code ? ` (${code})` : ""}.`));
+		if (ready && !ready.settled())
+			ready.reject(new DiscordPlatformError(`Discord gateway closed${code ? ` (${code})` : ""}.`));
 		if (!this.#wanted || isNonRetryableGatewayClose(code)) return;
 		this.scheduleReconnect();
 	}
@@ -393,12 +445,14 @@ export class DiscordGatewayPlatform implements DiscordPlatform {
 }
 
 function defaultWebSocketFactory(url: string): GatewaySocket {
-	if (typeof WebSocket === "undefined") throw new DiscordPlatformError("This runtime does not provide WebSocket support.");
+	if (typeof WebSocket === "undefined")
+		throw new DiscordPlatformError("This runtime does not provide WebSocket support.");
 	return new WebSocket(url) as unknown as GatewaySocket;
 }
 
 function discordMessageFromDispatch(data: Record<string, unknown>, acceptedAt: number): DiscordMessage | undefined {
-	if (typeof data.id !== "string" || !data.id || typeof data.channel_id !== "string" || !data.channel_id) return undefined;
+	if (typeof data.id !== "string" || !data.id || typeof data.channel_id !== "string" || !data.channel_id)
+		return undefined;
 	if (typeof data.content !== "string") return undefined;
 	const author = isRecord(data.author) ? data.author : undefined;
 	return {
@@ -438,7 +492,8 @@ function gatewayUrlWithEncoding(url: string): string {
 }
 
 function positiveInteger(value: number, name: string): number {
-	if (!Number.isSafeInteger(value) || value < 1) throw new DiscordPlatformError(`${name} must be a positive safe integer.`);
+	if (!Number.isSafeInteger(value) || value < 1)
+		throw new DiscordPlatformError(`${name} must be a positive safe integer.`);
 	return value;
 }
 
@@ -462,12 +517,12 @@ function deferred<T>(): Deferred<T> {
 	let resolvePromise!: (value: T) => void;
 	let rejectPromise!: (error: Error) => void;
 	const promise = new Promise<T>((resolve, reject) => {
-		resolvePromise = value => {
+		resolvePromise = (value) => {
 			if (resolved) return;
 			resolved = true;
 			resolve(value);
 		};
-		rejectPromise = error => {
+		rejectPromise = (error) => {
 			if (resolved) return;
 			resolved = true;
 			reject(error);

@@ -1,16 +1,15 @@
+import { afterEach, expect, test } from "bun:test";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import { afterEach, expect, test } from "bun:test";
-import { RpcClient } from "../helpers/rpc-client";
 import { ManagedProcessRegistry } from "../helpers/managed-process";
+import { RpcClient } from "../helpers/rpc-client";
 
 const managedProcesses = new ManagedProcessRegistry();
 
 afterEach(async () => {
 	await managedProcesses.reapAll();
 });
-
 
 async function connectEventually(socketPath: string): Promise<RpcClient> {
 	for (let attempt = 0; attempt < 100; attempt += 1) {
@@ -47,10 +46,21 @@ files = []
 id = "owner"
 platform = "test"
 kind = "dm"
+session_kind = "main"
 `,
 	);
 	const child = managedProcesses.spawnDaemon({
-		cmd: ["bun", "src/main.ts", "serve", "--state-dir", stateDirectory, "--profile", profile, "--fail-closed-linger-ms", "1000"],
+		cmd: [
+			"bun",
+			"src/main.ts",
+			"serve",
+			"--state-dir",
+			stateDirectory,
+			"--profile",
+			profile,
+			"--fail-closed-linger-ms",
+			"1000",
+		],
 		cwd: process.cwd(),
 		stderr: "pipe",
 	});

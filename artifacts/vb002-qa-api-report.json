@@ -1,0 +1,104 @@
+{
+  "schemaVersion": 1,
+  "kind": "api-package-test-report",
+  "batch": "VB002",
+  "generation": 2,
+  "deltaOnly": true,
+  "recordedAt": "2026-08-24T05:20:00+09:00",
+  "mergeBase": "354c8ea1011dfeadf4883856a07d1e45c0747e45",
+  "assignedSourceHash": "sha256:05a0feeb4d43231d7c4ed87da738c07c0463541a844b2aaa4ee0b6b670b6a492",
+  "sourceHashNote": "Live worktree HEAD is merge-base 354c8ea1011d with uncommitted VB002/parity work. Path count vs that base is 115 (71 git-diff names + 44 untracked excluding node_modules). Assigned snapshot digest was not reproduced by path-list or content concatenation hashes; merge-base and 115-path count match the freeze description.",
+  "goals": [
+    "G004",
+    "G005"
+  ],
+  "architectFixesCovered": [
+    "AR-1",
+    "AR-2",
+    "AR-3",
+    "AR-4",
+    "AR-5",
+    "AR-6"
+  ],
+  "commands": [
+    {
+      "cmd": "bun test test/unit/vb002-gen2-redteam.test.ts",
+      "result": "11 passed, 0 failed, 82ms"
+    },
+    {
+      "cmd": "bun test test/unit/vb002-gen2-redteam.test.ts test/unit/vb002-redteam.test.ts test/unit/memory-recall.test.ts test/unit/mcp-serve.test.ts test/unit/profile-surface-classes.test.ts",
+      "result": "63 passed, 0 failed, 5 files, 237ms"
+    },
+    {
+      "cmd": "bun test test/e2e/mcp-serve.test.ts",
+      "result": "3 passed, 0 failed, 2.54s; compiled dist/gajaeway mcp serve over stdio"
+    },
+    {
+      "cmd": "cargo test --release --manifest-path crates/way-core/Cargo.toml --lib memory::",
+      "result": "10 passed, 0 failed, including an_out_of_range_file_index_is_excluded_rather_than_admitted"
+    },
+    {
+      "cmd": "cargo test --release --manifest-path crates/way-core/Cargo.toml --lib an_unresolvable_session_kind",
+      "result": "an_unresolvable_session_kind_uses_the_unknown_mask passed"
+    },
+    {
+      "cmd": "cargo test --release --manifest-path crates/way-core/Cargo.toml --lib an_absent_mask",
+      "result": "an_absent_mask_denies_everything passed"
+    },
+    {
+      "cmd": "cargo test --release --manifest-path crates/way-core/Cargo.toml --lib memory_search",
+      "result": "3 passed: failed_closed_blocks_memory_search, memory_search_exposes_no_cardinality_beyond_hits, memory_search_rejects_unknown_fields_and_an_empty_query"
+    },
+    {
+      "cmd": "cargo test --release --manifest-path crates/way-core/Cargo.toml --lib",
+      "result": "104 passed, 0 failed, 0 warnings"
+    },
+    {
+      "cmd": "bunx tsc --noEmit",
+      "result": "exit 0, empty output"
+    },
+    {
+      "cmd": "./dist/gajaeway --help",
+      "result": "exit 0; usage includes gajaeway mcp serve"
+    },
+    {
+      "cmd": "bun --version",
+      "result": "1.4.0"
+    }
+  ],
+  "binaries": {
+    "dist/gajaeway": true,
+    "dist/gajaeway-discord": true,
+    "dist/gajaeway-telegram": true
+  },
+  "liveSurfaces": {
+    "memory.search": "in-process WayCore RPC via createRpcBridge + RpcClient over a real UDS",
+    "mcp.serve": "compiled dist/gajaeway mcp serve e2e plus dispatchMcp unit/red-team",
+    "profile.digest": "loadWayProfile identity projection"
+  },
+  "findings": {
+    "disclosures": [],
+    "defects": [],
+    "acceptedResiduals": [
+      {
+        "id": "R-DATE-TEMPLATE",
+        "severity": "accepted",
+        "summary": "A restriction written as the raw template daily/{date}.md does not match expanded candidate daily/YYYY-MM-DD.md. Live memory.search for conversation returned the daily file and withheld MEMORY.md, matching assembleInjection. Pre-existing injector exact/basename semantics; recall mask agrees position-by-position."
+      },
+      {
+        "id": "R-README-DIGEST",
+        "severity": "docs",
+        "summary": "README profile-model digest list still omits [[surfaces.known]] membership; ops/runbooks/profile-approve.md and PROFILE_DIGEST_VERSION 3 tests cover the bound fields."
+      },
+      {
+        "id": "R-KNOWN-KIND",
+        "severity": "by-design",
+        "summary": "Changing a known surface's free-form platform kind does not change the digest; session_kind and membership do. Admission looks up by surface id. Matches profile.ts: kind is never the redaction class."
+      }
+    ]
+  },
+  "computerUse": {
+    "applicable": false,
+    "reason": "Change set is gajae-way gateway profile/recall/MCP. No crates/pi-natives/src/computer, packages/coding-agent computer tool, or shared computer behavior registry exists in this tree."
+  }
+}

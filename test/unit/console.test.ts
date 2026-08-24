@@ -1,12 +1,12 @@
 import { expect, test } from "bun:test";
 import {
 	ConsoleOutput,
+	consoleStartupDecision,
 	MAX_RAW_CONSOLE_LINE_BYTES,
 	MAX_RAW_CONSOLE_QUEUED_BYTES,
 	MAX_RAW_CONSOLE_QUEUED_LINES,
-	RawConsoleTerminal,
 	OwnerConsole,
-	consoleStartupDecision,
+	RawConsoleTerminal,
 	renderConsoleStatusSummary,
 	sanitizeConsoleText,
 } from "../../src/console/console";
@@ -501,7 +501,10 @@ test("raw terminal retains a same-chunk oversized-line refusal through transient
 	const usableLine = "normal line after recovered output";
 	const pendingLine = terminal.readLine("gajaeway> ");
 	try {
-		await eventually(() => latestTuiFrame(output.writes).includes("gajaeway> "), "raw terminal did not render its prompt");
+		await eventually(
+			() => latestTuiFrame(output.writes).includes("gajaeway> "),
+			"raw terminal did not render its prompt",
+		);
 		output.stall();
 		input.send(`${oversized}\n`);
 		await eventually(() => output.pendingWriteCount === 1, "oversized refusal did not begin its stalled publication");

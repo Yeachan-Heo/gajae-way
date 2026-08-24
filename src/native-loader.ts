@@ -1,13 +1,13 @@
 import * as fs from "node:fs";
+import { createRequire } from "node:module";
 import * as os from "node:os";
 import * as path from "node:path";
-import { createRequire } from "node:module";
+import { embeddedAddon } from "../native/embedded-addon";
 import type {
 	GatewayMetaReadOutput,
 	GatewayMetaTransactionInput,
 	GatewayMetaTransactionOutput,
 } from "./main-session/state";
-import { embeddedAddon } from "../native/embedded-addon";
 
 export interface HealthInfo {
 	version: string;
@@ -31,15 +31,109 @@ export interface RpcBridgeStats {
 
 export type RpcBridgeCallback = (error: Error | null, request: RpcBridgeRequest) => void;
 
+export interface ScheduleJobRow {
+	readonly jobId: string;
+	readonly name: string;
+	readonly kind: string;
+	readonly spec: string;
+	readonly timezone: string;
+	readonly payloadKind: string;
+	readonly payloadJson: string;
+	readonly surfaceId?: string;
+	readonly state: string;
+	readonly nextFireAtMs?: number;
+	readonly backoffUntilMs?: number;
+	readonly failureCount: number;
+	readonly maxConsecutiveFailures: number;
+	/** Create-time epoch; `every` schedules anchor to this so advances do not drift. */
+	readonly createdAtMs: number;
+}
+
+export interface ScheduleRunRow {
+	readonly runId: string;
+	readonly jobId: string;
+	readonly trigger: string;
+	readonly scheduledForMs: number;
+	readonly claimedAt: number;
+	readonly finishedAt?: number;
+	readonly attempt: number;
+	readonly outcome?: string;
+	readonly missedCount: number;
+	readonly opRef?: string;
+	readonly detailJson?: string;
+}
+
+export interface ScheduleJobUpsertInput {
+	readonly jobId: string;
+	readonly name: string;
+	readonly kind: string;
+	readonly spec: string;
+	readonly timezone: string;
+	readonly payloadKind: string;
+	readonly payloadJson: string;
+	readonly surfaceId?: string;
+	readonly nextFireAtMs?: number;
+	readonly maxConsecutiveFailures: number;
+}
+
+export interface ScheduleDueClaim {
+	readonly claimed: boolean;
+	readonly refusedFailedClosed: boolean;
+	readonly reason?: string;
+	readonly job?: ScheduleJobRow;
+	readonly run?: ScheduleRunRow;
+}
+
+export interface ScheduleRunFinalizeInput {
+	readonly runId: string;
+	readonly outcome: string;
+	readonly finishedAt: number;
+	readonly opRef?: string;
+	readonly detailJson?: string;
+	readonly jobState?: string;
+	readonly failureCount?: number;
+	readonly backoffUntilMs?: number;
+	readonly journalPayloadJson?: string;
+}
+
+export interface ScheduleOverdueCollapseInput {
+	readonly jobId: string;
+	readonly runId: string;
+	readonly missedCount: number;
+	readonly nextFireAtMs?: number;
+	readonly nowMs: number;
+	readonly journalPayloadJson?: string;
+}
+
 export interface WayCoreHandle {
 	readonly stateDir: string;
+	/** Every journal kind the daemon can emit; used to assert console render coverage. */
+	mainEventKinds(): string[];
+	/** Daemon-owned alert evaluation, independent of the metrics listener. */
+	alertsEvaluateAdapterDisconnects(thresholdMs: number): string[];
+	alertsRaised(): string[];
+	/** False when SQLite FTS5 is unavailable; recall redaction cannot be enforced. */
+	memoryFts5Available(): boolean;
+	/** Rebuilds the recall index and pins it to the active profile digest. */
+	memoryIndexRebuild(
+		profileDigest: string,
+		documents: Array<{ fileIndex: number; path: string; body: string }>,
+		masks: Array<{ sessionKind: string; mask: string }>,
+	): number;
+	/** Starts the optional loopback Prometheus endpoint; returns the bound port. */
+	metricsHttpStart(port: number): number;
+	metricsHttpStop(): void;
 	startRpcServer(socketPath: string, bridgeCallback: RpcBridgeCallback): void;
 	bridgeComplete(reqId: number, resultJson: string): boolean;
 	shutdownRpcServer(): void;
 	rpcBridgeStats(): RpcBridgeStats;
 	rpcDroppedNotificationCount(): number;
 	setRpcHealth(state: "booting" | "verifying" | "running" | "failed_closed" | "degraded", reason?: string): void;
-	setMainSessionStatus(turnState: "idle" | "busy", followUpQueueDepth: number, verificationState: "pending" | "verified"): void;
+	setMainSessionStatus(
+		turnState: "idle" | "busy",
+		followUpQueueDepth: number,
+		verificationState: "pending" | "verified",
+	): void;
 	resetMainSessionStatus(): void;
 	setJournalDegraded(degraded: boolean): void;
 	sdNotifyStatus(status: string): void;
@@ -229,12 +323,10 @@ export interface WayCoreHandle {
 		operationJson: string;
 		responseJson: string;
 	}): { responseJson: string };
-	mainAdmissionOperationClaim(input: {
-		scope: string;
-		key: string;
-		requestJson: string;
-		intentJson: string;
-	}): { claimed: boolean; responseJson?: string };
+	mainAdmissionOperationClaim(input: { scope: string; key: string; requestJson: string; intentJson: string }): {
+		claimed: boolean;
+		responseJson?: string;
+	};
 	mainAdmissionOperationRecordAttemptIds(input: {
 		scope: string;
 		key: string;
@@ -250,8 +342,27 @@ export interface WayCoreHandle {
 		responseJson: string;
 	}): { responseJson: string };
 	mainAdmissionOperationAbandon(input: { scope: string; key: string; requestJson: string; intentJson: string }): void;
-	mainAdmissionOperationsPending(): Array<{ scope: string; key: string; requestJson: string; intentJson: string; attemptIdsJson?: string }>;
-	mainAdmissionAttributions(): Array<{ attemptIdsJson: string; surfaceId: string }>;
+	mainAdmissionOperationsPending(): Array<{
+		scope: string;
+		key: string;
+		requestJson: string;
+		intentJson: string;
+		attemptIdsJson?: string;
+	}>;
+	mainAdmissionAttributions(): Array<{ attemptIdsJson: string; surfaceId?: string; origin?: string }>;
+	scheduleJobUpsert(input: ScheduleJobUpsertInput): ScheduleJobRow;
+	scheduleJobGet(jobId: string): ScheduleJobRow;
+	scheduleJobList(input?: { state?: string; cursor?: string; limit?: number }): {
+		jobs: ScheduleJobRow[];
+		nextCursor?: string;
+	};
+	scheduleJobDelete(jobId: string): boolean;
+	scheduleDueClaim(nowMs: number, runId: string): ScheduleDueClaim;
+	scheduleRunFinalize(input: ScheduleRunFinalizeInput): ScheduleRunRow;
+	scheduleRunList(jobId: string, cursor?: string, limit?: number): { runs: ScheduleRunRow[]; nextCursor?: string };
+	scheduleInFlightRuns(): ScheduleRunRow[];
+	scheduleOverdueCollapse(input: ScheduleOverdueCollapseInput): ScheduleRunRow | null;
+	scheduleSetNextFire(jobId: string, nextFireAtMs: number | undefined, nowMs: number): void;
 }
 
 export interface WayCoreConstructor {

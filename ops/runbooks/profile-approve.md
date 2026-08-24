@@ -10,8 +10,36 @@ operator approves it:
 - ordered `[injection] files`;
 - `[security.restricted_files]` (or the supported top-level equivalent);
 - `[surfaces.owner]`, `[owner_surfaces]`, or `[owner_surface]`;
+- `[[surfaces.known]]` **membership and each entry's `session_kind`**;
+- any surface's `session_kind`;
 - `[operator]` or `[identity]` values; and
 - `[main_session].session_id`.
+
+### Digest version 3: required `session_kind`
+
+`PROFILE_DIGEST_VERSION` is now **3**. Two changes come with it.
+
+**Every declared surface must declare `session_kind`.** It is constrained to
+`main`, `conversation`, `lane`, `job`, or `unknown`, and it selects the
+`[restricted_files]` deny list applied to that surface. There is no inferred
+default and no migration shim: a profile omitting the field **fails to load**.
+That is deliberate, because defaulting a missing class would silently hand a
+surface the wrong deny list. An owner surface must declare `session_kind =
+"main"`; anything else is a load failure.
+
+Note that `kind` remains the free-form platform kind (`dm`, `channel`, and so
+on) and is **never** consulted for redaction. A surface may legitimately have
+`kind = "conversation"` and `session_kind = "lane"`.
+
+**`[[surfaces.known]]` membership is now digest-bound.** Previously, adding a
+known surface granted it follow-up admission authority with no approval
+ceremony, because known-surface membership was absent from the digest-bound
+projection. Adding, removing, or reclassifying a known surface now produces
+`profile_drift` and fails closed until `gajaeway profile approve`.
+
+Upgrading an existing deployment therefore requires editing the profile to add
+`session_kind` to every declared surface and then approving the resulting
+drift once.
 
 Do not approve an unexpected change. Treat it as possible profile or corpus
 configuration tampering, restore the intended file, and investigate before

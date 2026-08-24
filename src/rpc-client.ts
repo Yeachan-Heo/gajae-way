@@ -44,8 +44,8 @@ export class RpcClient implements JsonRpcClient {
 	private constructor(socket: Socket) {
 		this.socket = socket;
 		socket.setEncoding("utf8");
-		socket.on("data", chunk => this.onData(String(chunk)));
-		socket.on("error", error => this.rejectAll(error));
+		socket.on("data", (chunk) => this.onData(String(chunk)));
+		socket.on("error", (error) => this.rejectAll(error));
 		socket.on("close", () => this.rejectAll(new Error("RPC socket closed")));
 	}
 
@@ -96,11 +96,14 @@ export class RpcClient implements JsonRpcClient {
 					reject(new Error("RPC timeoutMs must be a positive safe integer"));
 					return;
 				}
-				timeout = setTimeout(() => finish(() => reject(new Error(`RPC request timed out: ${method}`))), options.timeoutMs);
+				timeout = setTimeout(
+					() => finish(() => reject(new Error(`RPC request timed out: ${method}`))),
+					options.timeoutMs,
+				);
 			}
 			options.signal?.addEventListener("abort", onAbort, { once: true });
 			this.#pending.set(key, { resolve, reject, cleanup });
-			this.socket.write(request, error => {
+			this.socket.write(request, (error) => {
 				if (!error) return;
 				finish(() => reject(error));
 			});

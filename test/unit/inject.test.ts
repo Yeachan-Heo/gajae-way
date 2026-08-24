@@ -1,7 +1,7 @@
+import { afterEach, expect, test } from "bun:test";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import { afterEach, expect, test } from "bun:test";
 import { assembleInjection } from "../../src/main-session/inject";
 import { loadWayProfile } from "../../src/profile";
 
@@ -40,15 +40,16 @@ conversation = ["MEMORY.md"]
 id = "owner"
 platform = "test"
 kind = "dm"
+session_kind = "main"
 `,
 	);
 	const profile = loadWayProfile(profilePath);
 	const logs: string[] = [];
 	const main = assembleInjection(profile, {
 		now: new Date(2026, 0, 3, 12),
-		onLog: entry => logs.push(`${entry.kind}:${entry.path}`),
+		onLog: (entry) => logs.push(`${entry.kind}:${entry.path}`),
 	});
-	expect(main.map(file => file.path)).toEqual([
+	expect(main.map((file) => file.path)).toEqual([
 		"SOUL.md",
 		"USER.md",
 		"daily/2026-01-03.md",
@@ -57,5 +58,5 @@ kind = "dm"
 	]);
 	expect(logs).toEqual(["missing:daily/2026-01-02.md"]);
 	const conversation = assembleInjection(profile, { sessionKind: "conversation", now: new Date(2026, 0, 3, 12) });
-	expect(conversation.map(file => file.path)).not.toContain("MEMORY.md");
+	expect(conversation.map((file) => file.path)).not.toContain("MEMORY.md");
 });

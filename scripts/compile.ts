@@ -2,7 +2,7 @@ import * as fs from "node:fs/promises";
 import * as path from "node:path";
 
 type Executable = {
-	name: "gajaeway" | "gajaeway-discord";
+	name: "gajaeway" | "gajaeway-discord" | "gajaeway-telegram";
 	entrypoint: string;
 };
 
@@ -20,10 +20,13 @@ const bunTargets: Record<string, string> = {
 const executables: readonly Executable[] = [
 	{ name: "gajaeway", entrypoint: "src/main.ts" },
 	{ name: "gajaeway-discord", entrypoint: "src/adapter/discord/main.ts" },
+	{ name: "gajaeway-telegram", entrypoint: "src/adapter/telegram/main.ts" },
 ];
 
 if (!bunTargets[platformTag]) {
-	throw new Error(`Unsupported compile target ${platformTag}. Supported targets: ${Object.keys(bunTargets).join(", ")}.`);
+	throw new Error(
+		`Unsupported compile target ${platformTag}. Supported targets: ${Object.keys(bunTargets).join(", ")}.`,
+	);
 }
 
 async function runCommand(command: string[], env: NodeJS.ProcessEnv = Bun.env): Promise<void> {
@@ -94,7 +97,9 @@ async function compileExecutable(executable: Executable): Promise<void> {
 await ensureNativeAddon();
 await fs.mkdir(distDir, { recursive: true });
 await Promise.all(
-	(await fs.readdir(distDir)).filter((entry) => entry.startsWith("way")).map((entry) => fs.rm(path.join(distDir, entry), { force: true, recursive: true })),
+	(await fs.readdir(distDir))
+		.filter((entry) => entry.startsWith("way"))
+		.map((entry) => fs.rm(path.join(distDir, entry), { force: true, recursive: true })),
 );
 for (const executable of executables) {
 	console.log(`Compiling ${executable.name} for ${platformTag}…`);

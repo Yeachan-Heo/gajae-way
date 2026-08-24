@@ -62,6 +62,46 @@ non-fast-forward checks are incident backstops, not a concurrency plan.
    Discord delivery; a fence, failed-closed transition, or rejected submit
    leaves the message unacknowledged rather than consuming it without delivery.
 
+## Scrapeable metrics and their accepted exposure
+
+`way.metrics` is answerable over the peer-credential-authenticated UDS and is
+deliberately allowed even while the daemon is failed closed, because that is the
+state in which telemetry matters most. Prefer this path: it is the only
+authenticated one.
+
+```sh
+gajaeway_rpc way.metrics '{}'
+```
+
+An optional Prometheus text endpoint can be enabled with
+`[tunables.metrics].http_enabled = true`. **It is disabled by default and it is
+unauthenticated.** Read the following before enabling it.
+
+- **What is exposed.** While the listener is enabled, *any local process running
+  as any user* can scrape it. The exposition carries gateway state as counters,
+  fail-closed duration, journal head and per-consumer lag, turn activity,
+  follow-up queue depth, lock held/queue/stuck/quarantined flags, and scheduler
+  counters.
+- **What is not exposed.** Lock holder identity, session ids, lease ids, and
+  free-text failure reasons are excluded from the HTTP exposition and this is
+  asserted by test. Only the authenticated UDS path returns the richer
+  `way.status` document.
+- **Bind address.** The listener binds loopback only, and a non-loopback address
+  is refused rather than honoured. There is no `bind_addr` profile key, so the
+  address is not operator-configurable. An occupied port is refused rather than
+  silently rebound.
+- **Surface.** Only `GET /metrics` is served. Every other path and method
+  returns a bare 404 with no request echo.
+- **Recommendation.** Keep the endpoint disabled on multi-tenant or shared-login
+  hosts, where "loopback" does not imply "private". On a single-tenant host,
+  enabling it is reasonable.
+- **Audit trail.** `[tunables.metrics]` is in the non-digest tunable class, so
+  enabling the endpoint changes no profile digest and produces **no
+  `profile approve` receipt**. The audit trail for "an operator chose to expose
+  telemetry" is this runbook plus the profile file's modification time, not an
+  approval record. That is a deliberate trade: loopback-only plus default-off is
+  the actual control, and treating enablement as a ceremony would overstate it.
+
 ## Monitor the live UDS service
 
 `gajaeway --health --state-dir /var/lib/gajaeway` queries the running daemon over

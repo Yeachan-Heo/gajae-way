@@ -8,9 +8,9 @@ Description=Gajaeway operator-agent runtime
 # Quarantine recovery creates the root-owned no-ingress marker documented in the
 # quarantine runbook. The adapter's ConditionPathExists= rejects every start,
 # including Wants= and automatic restarts, until clearance removes that marker.
-Wants=network-online.target gajaeway-discord.service
+Wants=network-online.target gajaeway-discord.service gajaeway-telegram.service
 After=network-online.target
-Before=gajaeway-discord.service
+Before=gajaeway-discord.service gajaeway-telegram.service
 StartLimitIntervalSec=60s
 StartLimitBurst=3
 

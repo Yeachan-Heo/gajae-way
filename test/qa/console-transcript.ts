@@ -9,8 +9,8 @@
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import { RawConsoleTerminal, runWayConsole } from "../../src/console/console";
 import { BrokerCli } from "../../src/broker/cli";
+import { RawConsoleTerminal, runWayConsole } from "../../src/console/console";
 import { createMainAdmissionHandler } from "../../src/main-session/admission";
 import { bootstrapMainSession } from "../../src/main-session/bootstrap";
 import { createMainSessionHost } from "../../src/main-session/host";
@@ -37,6 +37,7 @@ files = []
 id = "owner"
 platform = "test"
 kind = "dm"
+session_kind = "main"
 
 [main_session]
 session_id = "${sessionId}"
@@ -151,7 +152,7 @@ async function main(): Promise<void> {
 		initialVerificationState: resumed.verificationState,
 		...(resumed.verificationTail === undefined ? {} : { verificationTail: resumed.verificationTail }),
 	});
-	const submit = createMainAdmissionHandler(host, profile, core);
+	const { submitFromRpc: submit } = createMainAdmissionHandler(host, profile, core);
 	const bridge: RpcBridgeHandler = async (method, params) => {
 		if (method === "main.submit") return await submit(params);
 		if (method === "main.gate.answer") throw new RpcBridgeException(1103, "gate_answer_unsupported");

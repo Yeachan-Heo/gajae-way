@@ -1,8 +1,14 @@
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import { GatewayStateStore, type GatewayMetaBackend, type GatewayMetaReadOutput, type GatewayMetaTransactionInput, type GatewayMetaTransactionOutput } from "../../src/main-session/state";
 import type { MainSessionJournal } from "../../src/main-session/host";
+import type {
+	GatewayMetaBackend,
+	GatewayMetaReadOutput,
+	GatewayMetaTransactionInput,
+	GatewayMetaTransactionOutput,
+	GatewayStateStore,
+} from "../../src/main-session/state";
 
 const defaults: Record<string, string> = {
 	bootstrap_state: "ABSENT",
@@ -21,7 +27,6 @@ const defaults: Record<string, string> = {
 	transcript_delivery_gap_count: "0",
 	transcript_delivery_progress: "null",
 	transcript_proof: "pending",
-
 };
 
 export class MemoryGatewayMeta implements GatewayMetaBackend {
@@ -35,7 +40,7 @@ export class MemoryGatewayMeta implements GatewayMetaBackend {
 	}
 
 	gatewayMetaRead(keys: readonly string[]): GatewayMetaReadOutput {
-		return { entries: keys.map(key => ({ key, value: this.values.get(key) })) };
+		return { entries: keys.map((key) => ({ key, value: this.values.get(key) })) };
 	}
 
 	gatewayMetaTransaction(input: GatewayMetaTransactionInput): GatewayMetaTransactionOutput {
@@ -59,7 +64,11 @@ export interface DurableTestJournalOptions {
 	readonly journalAppend?: (kind: string, payloadJson: string) => unknown;
 	readonly onTranscriptProjection?: (kind: string, payloadJson: string) => void;
 	readonly setRpcHealth?: (state: "degraded" | "running", reason: string) => void;
-	readonly setMainSessionStatus?: (turnState: "idle" | "busy", followUpQueueDepth: number, verificationState: "pending" | "verified") => void;
+	readonly setMainSessionStatus?: (
+		turnState: "idle" | "busy",
+		followUpQueueDepth: number,
+		verificationState: "pending" | "verified",
+	) => void;
 	readonly setJournalDegraded?: (degraded: boolean) => void;
 }
 
@@ -67,10 +76,20 @@ export interface DurableTestJournalOptions {
  * Test-only durable journal adapter. The transcript projection is committed through
  * the same metadata transaction used by production before an observer sees it.
  */
-export function durableTestJournal(state: GatewayStateStore, options: DurableTestJournalOptions = {}): MainSessionJournal {
+export function durableTestJournal(
+	state: GatewayStateStore,
+	options: DurableTestJournalOptions = {},
+): MainSessionJournal {
 	return {
 		journalAppend: options.journalAppend ?? (() => undefined),
-		journalAppendTranscriptProjection: (kind, payloadJson, expectedTail, checkpoint, expectedDelivery, nextDelivery) => {
+		journalAppendTranscriptProjection: (
+			kind,
+			payloadJson,
+			expectedTail,
+			checkpoint,
+			expectedDelivery,
+			nextDelivery,
+		) => {
 			state.appendTranscriptProjection(expectedTail, checkpoint, expectedDelivery, nextDelivery, kind, payloadJson);
 			options.onTranscriptProjection?.(kind, payloadJson);
 		},
@@ -194,7 +213,13 @@ export class FakeBrokerFixture {
 				{ id: `${this.sessionId}:transcript:0`, payload: { type: "session", id: this.sessionId } },
 				{
 					id: `${this.sessionId}:transcript:1`,
-					payload: { type: "message", role: "assistant", content: "operator-owned session ready", responseId: "bootstrap:assistant", timestamp: now },
+					payload: {
+						type: "message",
+						role: "assistant",
+						content: "operator-owned session ready",
+						responseId: "bootstrap:assistant",
+						timestamp: now,
+					},
 				},
 			],
 			events: [],
@@ -230,28 +255,28 @@ export class FakeBrokerFixture {
 	}
 
 	holdNextTurn(): void {
-		this.update(session => {
+		this.update((session) => {
 			session.holdNext = true;
 		});
 	}
 
 	/** Rotates retained lifecycle frames when the next held turn completes; the following tail consumes the one-shot gap. */
 	rotateRingDuringNextCompletion(): void {
-		this.update(session => {
+		this.update((session) => {
 			session.rotateRingDuringNextCompletion = true;
 		});
 	}
 
 	/** Makes `tail --until-idle` return tail_timeout while the fixture is streaming. */
 	setNoEnvelopeWhileBusy(enabled = true): void {
-		this.update(session => {
+		this.update((session) => {
 			session.tailTimeoutWhileBusy = enabled;
 		});
 	}
 
 	/** Makes one raw query unavailable so adoption snapshot failures stay testable. */
 	setQueryUnavailable(query: "session.checkpoint" | "context.get", unavailable = true): void {
-		this.update(session => {
+		this.update((session) => {
 			const unavailableQueries = new Set(session.unavailableQueries ?? []);
 			if (unavailable) unavailableQueries.add(query);
 			else unavailableQueries.delete(query);
@@ -260,13 +285,13 @@ export class FakeBrokerFixture {
 	}
 
 	crashNextTails(count: number): void {
-		this.update(session => {
+		this.update((session) => {
 			(session as { crashNextTailCount?: number }).crashNextTailCount = count;
 		});
 	}
 
 	timeoutNextTails(count: number): void {
-		this.update(session => {
+		this.update((session) => {
 			(session as { timeoutNextTailCount?: number }).timeoutNextTailCount = count;
 		});
 	}
@@ -276,73 +301,73 @@ export class FakeBrokerFixture {
 		if (!Number.isSafeInteger(successfulTails) || successfulTails < 0 || !Number.isSafeInteger(count) || count < 0) {
 			throw new Error("tail crash counts must be non-negative safe integers");
 		}
-		this.update(session => {
+		this.update((session) => {
 			(session as { crashTailAfterCount?: number }).crashTailAfterCount = successfulTails;
 			(session as { crashNextTailCount?: number }).crashNextTailCount = count;
 		});
 	}
 
 	failNextTurn(): void {
-		this.update(session => {
+		this.update((session) => {
 			session.failNext = true;
 		});
 	}
 
 	/** Makes the next admission receive an explicit broker `ok:false` rejection envelope. */
 	rejectNextTurn(code = "broker_rejected", message = "fixture broker rejected the admission"): void {
-		this.update(session => {
+		this.update((session) => {
 			session.rejectNext = { code, message };
 		});
 	}
 
 	/** Accepts the next operation durably but exits before returning its receipt. */
 	suppressNextAdmissionReceipt(): void {
-		this.update(session => {
+		this.update((session) => {
 			session.suppressNextReceipt = true;
 		});
 	}
 
 	/** Completes the next admission before withholding its receipt until a terminal tail is exposed. */
 	suppressNextAdmissionReceiptAfterTerminalTail(): void {
-		this.update(session => {
+		this.update((session) => {
 			session.suppressNextReceiptAfterTerminalTail = true;
 		});
 	}
 
 	setOperationStatusUnavailable(unavailable = true): void {
-		this.update(session => {
+		this.update((session) => {
 			session.operationStatusUnavailable = unavailable;
 		});
 	}
 
 	forgetOperation(opRef: string): void {
-		this.update(session => {
+		this.update((session) => {
 			delete session.operations[opRef];
 		});
 	}
 
 	useBrokerTurnIdForTail(enabled = true): void {
-		this.update(session => {
+		this.update((session) => {
 			session.tailUsesBrokerTurnId = enabled;
 		});
 	}
 
 	setTailTerminalOverride(terminal: boolean | undefined): void {
-		this.update(session => {
+		this.update((session) => {
 			if (terminal === undefined) delete session.tailTerminalOverride;
 			else session.tailTerminalOverride = terminal;
 		});
 	}
 
 	setLive(live: boolean): void {
-		this.update(session => {
+		this.update((session) => {
 			session.row.live = live;
 		});
 	}
 
 	/** Forces a resynchronizable gap without inventing a broker cursor token. */
 	setRetentionGap(): void {
-		this.update(session => {
+		this.update((session) => {
 			const resync = session.retentionFloor ?? session.tailCheckpoint;
 			session.gap = {
 				code: "retention_gap",
@@ -353,19 +378,22 @@ export class FakeBrokerFixture {
 
 	/** Simulates event-ring rotation through the supplied sequence in the current generation. */
 	rotateTailThrough(sequence: number): void {
-		if (!Number.isSafeInteger(sequence) || sequence < 0) throw new Error("rotation sequence must be a non-negative safe integer");
-		this.update(session => {
+		if (!Number.isSafeInteger(sequence) || sequence < 0)
+			throw new Error("rotation sequence must be a non-negative safe integer");
+		this.update((session) => {
 			const candidate: FixtureTailCoordinate = {
 				generation: session.tailCheckpoint.generation,
 				seq: Math.min(sequence, session.tailCheckpoint.seq),
 			};
 			const existing = session.retentionFloor;
 			const floor =
-				existing && (existing.generation > candidate.generation || (existing.generation === candidate.generation && existing.seq >= candidate.seq))
+				existing &&
+				(existing.generation > candidate.generation ||
+					(existing.generation === candidate.generation && existing.seq >= candidate.seq))
 					? existing
 					: candidate;
 			session.retentionFloor = floor;
-			session.events = session.events.filter(event => {
+			session.events = session.events.filter((event) => {
 				const generation = event.generation;
 				const eventSequence = event.seq;
 				return (
@@ -381,15 +409,15 @@ export class FakeBrokerFixture {
 
 	/** Simulates transcript-window rotation while retaining only entries after the supplied stable id. */
 	rotateTranscriptPast(entryId: string): void {
-		this.update(session => {
-			const index = session.transcript.findIndex(entry => entry.id === entryId);
+		this.update((session) => {
+			const index = session.transcript.findIndex((entry) => entry.id === entryId);
 			if (index < 0) throw new Error(`fixture transcript entry ${entryId} is not retained`);
 			session.transcript = session.transcript.slice(index + 1);
 		});
 	}
 
 	setLocator(locator: { repo?: string; stateRoot?: string }): void {
-		this.update(session => {
+		this.update((session) => {
 			const current = session.row.locator as { repo: string; stateRoot: string };
 			session.row.locator = { repo: locator.repo ?? current.repo, stateRoot: locator.stateRoot ?? current.stateRoot };
 		});
@@ -397,7 +425,7 @@ export class FakeBrokerFixture {
 
 	/** Adds an externally observed transcript entry without routing it through gajaeway. */
 	appendTranscript(entry: unknown): void {
-		this.update(session => {
+		this.update((session) => {
 			const id = `${this.sessionId}:transcript:${session.nextTranscriptId}`;
 			session.nextTranscriptId += 1;
 			session.transcript.push({ id, payload: entry });
@@ -406,8 +434,8 @@ export class FakeBrokerFixture {
 
 	/** Rewrites retained transcript evidence for prefix-attestation failure drills. */
 	replaceTranscriptEntry(entryId: string, payload: unknown): void {
-		this.update(session => {
-			const index = session.transcript.findIndex(entry => entry.id === entryId);
+		this.update((session) => {
+			const index = session.transcript.findIndex((entry) => entry.id === entryId);
 			if (index < 0) throw new Error(`fixture transcript entry ${entryId} is not retained`);
 			session.transcript[index] = { id: entryId, payload };
 		});
@@ -415,7 +443,7 @@ export class FakeBrokerFixture {
 
 	/** Adds one broker-tail event for projection tests in the current ring generation. */
 	appendTailEvent(kind: string, payload: Record<string, unknown>): void {
-		this.update(session => {
+		this.update((session) => {
 			const generation = session.tailCheckpoint.generation;
 			const key = String(generation);
 			const seq = (session.nextSequenceByGeneration[key] ?? 0) + 1;
@@ -432,12 +460,12 @@ export class FakeBrokerFixture {
 		});
 	}
 
-
 	/** Requests completion; the fixture CLI performs the actual transition on its next broker command. */
 	complete(opRef: string, options: { readonly failure?: boolean; readonly text?: string } = {}): void {
-		this.update(session => {
+		this.update((session) => {
 			const operation = session.operations[opRef];
-			if (!operation || operation.completed || operation.completionRequested) throw new Error(`fixture operation ${opRef} is not held`);
+			if (!operation || operation.completed || operation.completionRequested)
+				throw new Error(`fixture operation ${opRef} is not held`);
 			operation.completionRequested = options;
 		});
 	}

@@ -1,18 +1,17 @@
+import { afterEach, expect, test } from "bun:test";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import { afterEach, expect, test } from "bun:test";
 import { loadWayCore, type RpcBridgeCallback, type WayCoreHandle } from "../../src/native-loader";
 import { createRpcBridge } from "../../src/rpc-bridge";
-import { RpcClient } from "../helpers/rpc-client";
 import { ManagedProcessRegistry } from "../helpers/managed-process";
+import { RpcClient } from "../helpers/rpc-client";
 
 const managedProcesses = new ManagedProcessRegistry();
 
 afterEach(async () => {
 	await managedProcesses.reapAll();
 });
-
 
 function temporaryStateDirectory(name: string): string {
 	return fs.mkdtempSync(path.join(os.tmpdir(), `gajae-way-rpc-${name}-`));

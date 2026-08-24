@@ -1,12 +1,12 @@
 import * as path from "node:path";
 import { defaultConfig, parseWayConfig } from "../../config";
-import { RpcClient, rpcResult, type JsonRpcClient } from "../../rpc-client";
 import { loadWayCore } from "../../native-loader";
-import { loadDiscordAdapterConfig, type DiscordAdapterConfig } from "./config";
-import { DiscordOutbox, type DiscordOutboxItem } from "./outbox";
-
-import { DiscordGatewayPlatform, validateDiscordToken, type DiscordFetch, type DiscordPlatform } from "./platform";
-import { DiscordRouteHandler } from "./route";
+import { type JsonRpcClient, RpcClient, rpcResult } from "../../rpc-client";
+import { AdapterEgress } from "../runtime/egress";
+import { AdapterIngress } from "../runtime/ingress";
+import { DISCORD_CONSUMER_ID, type DiscordAdapterConfig, loadDiscordAdapterConfig } from "./config";
+import { type DiscordFetch, DiscordGatewayPlatform, type DiscordPlatform, validateDiscordToken } from "./platform";
+import { discordAdapterPlatform } from "./port";
 
 const usage = `Usage:
   gajaeway-discord [--state-dir PATH] [--profile PATH] [--rpc-socket PATH]
@@ -38,7 +38,6 @@ export interface DiscordAdapterDependencies {
 	/** Test-only clock injection for deterministic typing keepalive scheduling. */
 	typingKeepaliveClock?: DiscordTypingKeepaliveClock;
 	waitForShutdown?(): Promise<void>;
-
 }
 
 export interface DiscordAdapterCheck {
@@ -55,8 +54,8 @@ export async function startDiscordAdapter(
 	config: DiscordAdapterConfig,
 	dependencies: DiscordAdapterDependencies = {},
 ): Promise<RunningDiscordAdapter> {
-	const onError = dependencies.onError ?? (error => console.error(`gajaeway-discord failed: ${error.message}`));
-	const onDiagnostic = dependencies.onDiagnostic ?? (message => console.error(`gajaeway-discord: ${message}`));
+	const onError = dependencies.onError ?? ((error) => console.error(`gajaeway-discord failed: ${error.message}`));
+	const onDiagnostic = dependencies.onDiagnostic ?? ((message) => console.error(`gajaeway-discord: ${message}`));
 	const rpc = await waitForGatewayRunning(
 		config.rpcSocketPath,
 		dependencies.rpcConnect ?? RpcClient.connect,
@@ -86,32 +85,45 @@ export async function startDiscordAdapter(
 			clock: dependencies.typingKeepaliveClock,
 		});
 		typingKeepalive = activeTypingKeepalive;
-		const router = new DiscordRouteHandler({
-			route: config.route,
+		const port = discordAdapterPlatform(activePlatform, config.route.channelId);
+		const ingress = new AdapterIngress({
 			rpc,
-			platform: activePlatform,
-			acknowledgement: { budgetMs: config.ackBudgetMs },
-			onAccepted: (message, journalHeadCursor) => activeTypingKeepalive.begin(message.channelId, message.id, journalHeadCursor),
-			onAcknowledged: acknowledgement => activeTypingKeepalive.start(config.route.channelId, acknowledgement.messageId),
-			onAcknowledgementFailed: message => activeTypingKeepalive.cancel(message.channelId, message.id),
+			platform: port,
+			surfaceId: config.route.surfaceId,
+			chatId: config.route.channelId,
+			ackBudgetMs: config.ackBudgetMs,
+			// One resolved channel key for begin/start/cancel/delivered. The inbound
+			// channel is filtered to the configured route, so these agree today;
+			// keying them differently would silently early-return in `start` the
+			// moment a second route exists.
+			onAccepted: (message, journalHeadCursor) =>
+				activeTypingKeepalive.begin(config.route.channelId, message.platformMsgId, journalHeadCursor),
+			onAcknowledged: (acknowledgement) =>
+				activeTypingKeepalive.start(config.route.channelId, acknowledgement.platformMsgId),
+			// A typing failure after durable acceptance is reported, not fatal: the
+			// keepalive still runs so the operator sees activity for the turn that
+			// is genuinely in flight.
+			onAcknowledgementDiagnostic: (message, reason) =>
+				onError(new Error(`Discord typing unavailable for message ${message.platformMsgId}: ${reason}`)),
 		});
-		const outbox = new DiscordOutbox({
+		const outbox = new AdapterEgress({
 			rpc,
-			platform: activePlatform,
-			route: config.route,
+			platform: port,
+			consumerId: DISCORD_CONSUMER_ID,
+			surfaceId: config.route.surfaceId,
+			chatId: config.route.channelId,
 			claimTtlMs: config.claimTtlMs,
 			readWaitMs: config.readWaitMs,
-			hooks: { afterSendBeforeCommit: item => activeTypingKeepalive.delivered(config.route.channelId, item) },
+			hooks: { afterSendBeforeCommit: (item) => activeTypingKeepalive.delivered(config.route.channelId, item) },
 			onError,
 		});
-		unsubscribe = activePlatform.onMessage(async message => {
+		await port.start(async (message) => {
 			try {
-				await router.handle(message);
+				await ingress.handle(message);
 			} catch (error) {
 				onError(asError(error));
 			}
 		});
-		await activePlatform.connect();
 		const outboxRun = outbox.run(activeController.signal);
 		let stopped = false;
 		return {
@@ -120,9 +132,8 @@ export async function startDiscordAdapter(
 				stopped = true;
 				activeController.abort();
 				activeTypingKeepalive.dispose();
-				unsubscribe?.();
 				try {
-					await activePlatform.disconnect();
+					await port.stop();
 				} finally {
 					rpc.close();
 					await outboxRun;
@@ -197,10 +208,11 @@ class DiscordTypingKeepalive {
 		if (!channel || !admission) return;
 		channel.admissions.delete(messageId);
 		if (channel.latestAdmission === admission) channel.latestAdmission = undefined;
-		if (channel.deadlineAt === undefined && channel.admissions.size === 0 && !channel.refreshInFlight) this.stop(channelId);
+		if (channel.deadlineAt === undefined && channel.admissions.size === 0 && !channel.refreshInFlight)
+			this.stop(channelId);
 	}
 
-	delivered(channelId: string, item: DiscordOutboxItem): void {
+	delivered(channelId: string, item: { readonly cursor: string; readonly seq: string }): void {
 		const channel = this.#channels.get(channelId);
 		const boundary = channel?.latestAdmission?.boundary;
 		if (!channel || !boundary) return;
@@ -274,9 +286,12 @@ class DiscordTypingKeepalive {
 			this.stop(channelId);
 			return;
 		}
-		channel.timer = this.#clock.setTimeout(async () => {
-			await this.tick(channelId, channel);
-		}, Math.min(DISCORD_TYPING_KEEPALIVE_MS, remainingMs));
+		channel.timer = this.#clock.setTimeout(
+			async () => {
+				await this.tick(channelId, channel);
+			},
+			Math.min(DISCORD_TYPING_KEEPALIVE_MS, remainingMs),
+		);
 	}
 
 	private async tick(channelId: string, channel: TypingKeepaliveChannel): Promise<void> {
@@ -294,7 +309,11 @@ class DiscordTypingKeepalive {
 			if (this.isCurrent(channelId, channel)) this.reportFailure(channelId, error);
 		} finally {
 			channel.refreshInFlight = false;
-			if (this.isCurrent(channelId, channel) && channel.deadlineAt !== undefined && this.#clock.now() < channel.deadlineAt) {
+			if (
+				this.isCurrent(channelId, channel) &&
+				channel.deadlineAt !== undefined &&
+				this.#clock.now() < channel.deadlineAt
+			) {
 				this.schedule(channelId, channel);
 			}
 		}
@@ -375,7 +394,10 @@ function decimalGreaterThan(left: string, right: string): boolean | undefined {
 	const normalizedLeft = normalizeDecimal(left);
 	const normalizedRight = normalizeDecimal(right);
 	if (normalizedLeft === undefined || normalizedRight === undefined) return undefined;
-	return normalizedLeft.length > normalizedRight.length || (normalizedLeft.length === normalizedRight.length && normalizedLeft > normalizedRight);
+	return (
+		normalizedLeft.length > normalizedRight.length ||
+		(normalizedLeft.length === normalizedRight.length && normalizedLeft > normalizedRight)
+	);
 }
 
 function normalizeDecimal(value: string): string | undefined {
@@ -393,7 +415,7 @@ const systemTypingKeepaliveClock: DiscordTypingKeepaliveClock = {
 		setTimeout(() => {
 			void callback();
 		}, milliseconds),
-	clearTimeout: timer => clearTimeout(timer as ReturnType<typeof setTimeout>),
+	clearTimeout: (timer) => clearTimeout(timer as ReturnType<typeof setTimeout>),
 };
 
 async function waitForGatewayRunning(
@@ -456,9 +478,12 @@ function createGatewayReadinessDiagnostics(onDiagnostic: (message: string) => vo
 		onDiagnostic(message);
 	};
 	return {
-		verifying: () => emit("verifying", "gateway verifying (expected wait); delaying Discord connection until healthy/running."),
-		transportOrProtocol: detail => emit("transport_or_protocol", `gateway transport/protocol error while waiting: ${detail}`),
-		notRunning: health => emit("not_running", `gateway is not healthy/running while waiting: ${gatewayHealthSummary(health)}`),
+		verifying: () =>
+			emit("verifying", "gateway verifying (expected wait); delaying Discord connection until healthy/running."),
+		transportOrProtocol: (detail) =>
+			emit("transport_or_protocol", `gateway transport/protocol error while waiting: ${detail}`),
+		notRunning: (health) =>
+			emit("not_running", `gateway is not healthy/running while waiting: ${gatewayHealthSummary(health)}`),
 	};
 }
 
@@ -532,7 +557,9 @@ export async function runDiscordAdapter(
 	if (command.rpcSocketPath) config = { ...config, rpcSocketPath: path.resolve(command.rpcSocketPath) };
 	if (command.check) {
 		const checked = await checkDiscordAdapter(config, dependencies);
-		console.log(JSON.stringify({ status: "ok", discord_user_id: checked.discordUserId, gateway: checked.gatewayHealth }));
+		console.log(
+			JSON.stringify({ status: "ok", discord_user_id: checked.discordUserId, gateway: checked.gatewayHealth }),
+		);
 		return;
 	}
 	const adapter = await startDiscordAdapter(config, dependencies);
@@ -566,7 +593,7 @@ function parseAdapterArguments(arguments_: readonly string[]): { check: boolean;
 }
 
 async function waitForShutdown(): Promise<void> {
-	await new Promise<void>(resolve => {
+	await new Promise<void>((resolve) => {
 		const stop = () => resolve();
 		process.once("SIGINT", stop);
 		process.once("SIGTERM", stop);

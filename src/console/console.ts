@@ -1,24 +1,25 @@
 import { randomUUID } from "node:crypto";
 import * as path from "node:path";
 import { stdout } from "node:process";
-import { RpcJournalConsumer, type RpcJournalEvent } from "../journal-consumer";
 import type { WayConfig } from "../config";
+import { RpcJournalConsumer, type RpcJournalEvent } from "../journal-consumer";
 import { loadWayProfile, type WayProfile } from "../profile";
-import { RpcClient, RpcResponseError, rpcResult, type JsonRpcClient } from "../rpc-client";
+import { type JsonRpcClient, RpcClient, RpcResponseError, rpcResult } from "../rpc-client";
+import type { RawConsoleOutputStream } from "./tui/terminal";
 import {
 	MAX_RAW_CONSOLE_LINE_BYTES,
 	MAX_RAW_CONSOLE_QUEUED_BYTES,
 	MAX_RAW_CONSOLE_QUEUED_LINES,
 	RawConsoleTerminal,
 } from "./tui/terminal";
-import type { RawConsoleOutputStream } from "./tui/terminal";
+
+export type { RawConsoleInputStream, RawConsoleOutputStream, RawConsoleTerminalOptions } from "./tui/terminal";
 export {
 	MAX_RAW_CONSOLE_LINE_BYTES,
 	MAX_RAW_CONSOLE_QUEUED_BYTES,
 	MAX_RAW_CONSOLE_QUEUED_LINES,
 	RawConsoleTerminal,
 } from "./tui/terminal";
-export type { RawConsoleInputStream, RawConsoleOutputStream, RawConsoleTerminalOptions } from "./tui/terminal";
 
 export const GAJAEWAY_CONSOLE_CONSUMER_ID = "gajaeway-console";
 export const GAJAEWAY_CONSOLE_EVENT_KINDS = [
@@ -31,6 +32,8 @@ export const GAJAEWAY_CONSOLE_EVENT_KINDS = [
 	"gate_resolved",
 	"health_change",
 	"lock_event",
+	"alert_raised",
+	"alert_cleared",
 ] as const;
 
 export const GAJAEWAY_JOURNAL_EVENT_KINDS = [
@@ -39,10 +42,10 @@ export const GAJAEWAY_JOURNAL_EVENT_KINDS = [
 	"follow_up_attempted",
 	"follow_up_confirmed",
 	"profile_approved",
+	"schedule_run",
+	"memory_index_rebuilt",
 ] as const;
-export const GAJAEWAY_JOURNAL_DEFAULT_KINDS = GAJAEWAY_JOURNAL_EVENT_KINDS.filter(
-	(kind) => kind !== "registry_change",
-);
+export const GAJAEWAY_JOURNAL_DEFAULT_KINDS = GAJAEWAY_JOURNAL_EVENT_KINDS.filter((kind) => kind !== "registry_change");
 export const DEFAULT_CONSOLE_CLAIM_TTL_MS = 5_000;
 export const DEFAULT_CONSOLE_READ_WAIT_MS = 1_000;
 export const DEFAULT_CONSOLE_EXIT_DRAIN_MS = 2_000;
@@ -409,8 +412,18 @@ interface JournalTailResult {
 
 type LockCommand =
 	| { readonly action: "status" }
-	| { readonly action: "force-release"; readonly leaseId: string; readonly confirmation: string; readonly confirmed: boolean }
-	| { readonly action: "clear-quarantine"; readonly receiptId: string; readonly confirmation: string; readonly confirmed: boolean };
+	| {
+			readonly action: "force-release";
+			readonly leaseId: string;
+			readonly confirmation: string;
+			readonly confirmed: boolean;
+	  }
+	| {
+			readonly action: "clear-quarantine";
+			readonly receiptId: string;
+			readonly confirmation: string;
+			readonly confirmed: boolean;
+	  };
 
 function parseJournalTailCommand(command: string): JournalTailRequest {
 	const argument = command.slice("/journal".length).trim();
@@ -422,11 +435,15 @@ function parseJournalTailCommand(command: string): JournalTailRequest {
 		return { kinds: GAJAEWAY_JOURNAL_DEFAULT_KINDS, count: parseJournalTailCount(fields[0] as string) };
 	}
 	const kinds = parseJournalKinds(fields[0] as string);
-	return { kinds, count: fields[1] === undefined ? DEFAULT_CONSOLE_JOURNAL_TAIL_EVENTS : parseJournalTailCount(fields[1]) };
+	return {
+		kinds,
+		count: fields[1] === undefined ? DEFAULT_CONSOLE_JOURNAL_TAIL_EVENTS : parseJournalTailCount(fields[1]),
+	};
 }
 
 function parseJournalTailCount(value: string): number {
-	if (!/^[1-9]\d*$/u.test(value)) throw new WayConsoleError(`Journal count must be an integer in 1..=${MAX_CONSOLE_JOURNAL_TAIL_EVENTS}.`);
+	if (!/^[1-9]\d*$/u.test(value))
+		throw new WayConsoleError(`Journal count must be an integer in 1..=${MAX_CONSOLE_JOURNAL_TAIL_EVENTS}.`);
 	const count = Number(value);
 	if (!Number.isSafeInteger(count) || count > MAX_CONSOLE_JOURNAL_TAIL_EVENTS) {
 		throw new WayConsoleError(`Journal count must be an integer in 1..=${MAX_CONSOLE_JOURNAL_TAIL_EVENTS}.`);
@@ -438,7 +455,9 @@ function parseJournalKinds(value: string): readonly WayJournalEventKind[] | unde
 	if (value === "all") return undefined;
 	const kinds = value.split(",").map((kind) => kind.trim());
 	if (kinds.some((kind) => !GAJAEWAY_JOURNAL_EVENT_KINDS.includes(kind as WayJournalEventKind))) {
-		throw new WayConsoleError(`Unsupported journal kind. Supported kinds: ${GAJAEWAY_JOURNAL_EVENT_KINDS.join(", ")}, or all.`);
+		throw new WayConsoleError(
+			`Unsupported journal kind. Supported kinds: ${GAJAEWAY_JOURNAL_EVENT_KINDS.join(", ")}, or all.`,
+		);
 	}
 	if (new Set(kinds).size !== kinds.length) throw new WayConsoleError("Journal kinds must not contain duplicates.");
 	return kinds as WayJournalEventKind[];
@@ -462,7 +481,9 @@ function parseJournalTailResult(value: unknown): JournalTailResult {
 		const event = recordValue(candidate);
 		const kind = rawStringValue(event.kind, "");
 		if (!GAJAEWAY_JOURNAL_EVENT_KINDS.includes(kind as WayJournalEventKind)) {
-			throw new WayConsoleError(`main.events.read returned an unsupported journal event kind: ${boundedConsoleText(kind)}.`);
+			throw new WayConsoleError(
+				`main.events.read returned an unsupported journal event kind: ${boundedConsoleText(kind)}.`,
+			);
 		}
 		if (typeof event.seq !== "string" && typeof event.seq !== "number") {
 			throw new WayConsoleError("main.events.read returned a journal event without a sequence.");
@@ -471,14 +492,25 @@ function parseJournalTailResult(value: unknown): JournalTailResult {
 		return { seq: event.seq, kind: kind as WayJournalEventKind, payload: event.payload };
 	});
 	const gap = result.gap === undefined ? undefined : recordValue(result.gap);
-	if (gap && (typeof gap.missing_from !== "string" || typeof gap.missing_to !== "string" || typeof gap.resync_cursor !== "string")) {
+	if (
+		gap &&
+		(typeof gap.missing_from !== "string" ||
+			typeof gap.missing_to !== "string" ||
+			typeof gap.resync_cursor !== "string")
+	) {
 		throw new WayConsoleError("main.events.read returned an invalid journal retention gap.");
 	}
 	return {
 		events,
 		nextCursor: result.next_cursor,
 		...(gap
-			? { gap: { missingFrom: gap.missing_from as string, missingTo: gap.missing_to as string, resyncCursor: gap.resync_cursor as string } }
+			? {
+					gap: {
+						missingFrom: gap.missing_from as string,
+						missingTo: gap.missing_to as string,
+						resyncCursor: gap.resync_cursor as string,
+					},
+				}
 			: {}),
 	};
 }
@@ -516,7 +548,8 @@ function parseRegistryRows(value: unknown): { readonly rows: readonly RecordValu
 function parseRegistryRow(value: unknown): RecordValue {
 	const result = recordValue(value);
 	const row = recordValue(result.row);
-	if (typeof row.session_id !== "string" || !row.session_id) throw new WayConsoleError("registry.get returned an invalid response.");
+	if (typeof row.session_id !== "string" || !row.session_id)
+		throw new WayConsoleError("registry.get returned an invalid response.");
 	return row;
 }
 
@@ -538,7 +571,8 @@ function renderLockStatus(value: unknown): string {
 }
 
 function serverRefusalMessage(error: unknown): string {
-	if (error instanceof RpcResponseError) return boundedConsoleText(error.message.replace(/^RPC\s+\S+\s+failed:\s+-?\d+\s+/u, ""));
+	if (error instanceof RpcResponseError)
+		return boundedConsoleText(error.message.replace(/^RPC\s+\S+\s+failed:\s+-?\d+\s+/u, ""));
 	return boundedConsoleText(asError(error).message);
 }
 
@@ -736,7 +770,9 @@ export class OwnerConsole {
 		return result;
 	}
 
-	async refreshStatus(options: { readonly onlyIfChanged?: boolean; readonly signal?: AbortSignal } = {}): Promise<boolean> {
+	async refreshStatus(
+		options: { readonly onlyIfChanged?: boolean; readonly signal?: AbortSignal } = {},
+	): Promise<boolean> {
 		const snapshot = await this.#readStatus(options.signal);
 		const fingerprint = statusFingerprint(snapshot.health, snapshot.status);
 		this.#lastStatusPollFailure = undefined;
@@ -781,7 +817,9 @@ export class OwnerConsole {
 			);
 			return;
 		}
-		const lines = read.events.map((event) => `  ${sequenceString(event.seq)} ${event.kind} ${compactGatewayValue(event.payload)}`);
+		const lines = read.events.map(
+			(event) => `  ${sequenceString(event.seq)} ${event.kind} ${compactGatewayValue(event.payload)}`,
+		);
 		await this.#output.writeFrame(
 			`Journal tail: kinds=${kinds} requested=${request.count} received=${read.events.length} next_cursor=${boundedConsoleText(read.nextCursor)}\n${lines.length > 0 ? `${lines.join("\n")}\n` : "  (no matching events)\n"}`,
 		);
@@ -789,14 +827,20 @@ export class OwnerConsole {
 
 	async listRegistry(): Promise<void> {
 		this.assertDeliveryReady();
-		const listed = parseRegistryRows(rpcResult<unknown>(await this.#rpc.request("registry.list", { limit: 100 }), "registry.list"));
+		const listed = parseRegistryRows(
+			rpcResult<unknown>(await this.#rpc.request("registry.list", { limit: 100 }), "registry.list"),
+		);
 		const rows = listed.rows.map((row) => `  ${renderRegistryRow(row)}`);
-		await this.#output.writeFrame(`Registry list: total=${integerValue(listed.total)} shown=${rows.length}\n${rows.length > 0 ? `${rows.join("\n")}\n` : "  (no registry rows)\n"}`);
+		await this.#output.writeFrame(
+			`Registry list: total=${integerValue(listed.total)} shown=${rows.length}\n${rows.length > 0 ? `${rows.join("\n")}\n` : "  (no registry rows)\n"}`,
+		);
 	}
 
 	async inspectRegistry(sessionId: string): Promise<void> {
 		this.assertDeliveryReady();
-		const row = parseRegistryRow(rpcResult<unknown>(await this.#rpc.request("registry.get", { session_id: sessionId }), "registry.get"));
+		const row = parseRegistryRow(
+			rpcResult<unknown>(await this.#rpc.request("registry.get", { session_id: sessionId }), "registry.get"),
+		);
 		const locator = recordValue(row.locator);
 		await this.#output.writeFrame(
 			[
@@ -805,6 +849,41 @@ export class OwnerConsole {
 				`  kind=${boundedConsoleText(rawStringValue(row.kind))} surface_id=${boundedConsoleText(rawStringValue(row.surface_id, "none"))} source=${boundedConsoleText(rawStringValue(row.source))}`,
 				`  activity_state=${boundedConsoleText(rawStringValue(row.activity_state, "none"))} metadata_state=${boundedConsoleText(rawStringValue(row.metadata_state))} locator=${compactGatewayValue(locator, 512)}`,
 			].join("\n") + "\n",
+		);
+	}
+
+	/**
+	 * Read-only scheduler view. The console is an acceptance surface, so it
+	 * observes jobs and run history but never creates, edits, or fires them;
+	 * mutation stays on the authenticated RPC surface.
+	 */
+	async listSchedule(): Promise<void> {
+		this.assertDeliveryReady();
+		const listed = recordValue(
+			rpcResult<unknown>(await this.#rpc.request("schedule.list", { limit: 100 }), "schedule.list"),
+		);
+		const jobs = Array.isArray(listed.jobs) ? listed.jobs : [];
+		const rows = jobs.map((candidate) => {
+			const job = recordValue(candidate);
+			return `  ${boundedConsoleText(rawStringValue(job.jobId))} state=${boundedConsoleText(rawStringValue(job.state))} kind=${boundedConsoleText(rawStringValue(job.kind))} payload=${boundedConsoleText(rawStringValue(job.payloadKind))} next_fire_at_ms=${rawStringValue(job.nextFireAtMs === undefined ? "none" : String(job.nextFireAtMs))} failures=${rawStringValue(String(job.failureCount ?? 0))} name=${boundedConsoleText(rawStringValue(job.name))}`;
+		});
+		await this.#output.writeFrame(
+			`Schedule list: shown=${rows.length}\n${rows.length > 0 ? `${rows.join("\n")}\n` : "  (no schedule jobs)\n"}`,
+		);
+	}
+
+	async listScheduleRuns(jobId: string): Promise<void> {
+		this.assertDeliveryReady();
+		const listed = recordValue(
+			rpcResult<unknown>(await this.#rpc.request("schedule.runs", { job_id: jobId, limit: 50 }), "schedule.runs"),
+		);
+		const runs = Array.isArray(listed.runs) ? listed.runs : [];
+		const rows = runs.map((candidate) => {
+			const run = recordValue(candidate);
+			return `  ${boundedConsoleText(rawStringValue(run.runId))} outcome=${boundedConsoleText(rawStringValue(run.outcome, "in_flight"))} trigger=${boundedConsoleText(rawStringValue(run.trigger))} attempt=${rawStringValue(String(run.attempt ?? 0))} missed=${rawStringValue(String(run.missedCount ?? 0))} claimed_at=${rawStringValue(String(run.claimedAt ?? 0))}`;
+		});
+		await this.#output.writeFrame(
+			`Schedule runs for ${boundedConsoleText(jobId)}: shown=${rows.length}\n${rows.length > 0 ? `${rows.join("\n")}\n` : "  (no runs)\n"}`,
 		);
 	}
 
@@ -893,6 +972,7 @@ export class OwnerConsole {
 					"  /status",
 					"  /journal [all|kind[,kind...]] [count] (default excludes registry_change)",
 					"  /registry list | /registry inspect <session_id>",
+					"  /schedule list | /schedule runs <job_id>",
 					"  /lock status",
 					"  /lock force-release <lease_id> CONFIRM FORCE-RELEASE <lease_id>",
 					"  /lock clear-quarantine <verification_receipt_id> CONFIRM CLEAR-QUARANTINE <verification_receipt_id>",
@@ -924,6 +1004,18 @@ export class OwnerConsole {
 			}
 			if (command === "/registry" || command.startsWith("/registry ")) {
 				throw new WayConsoleError("Usage: /registry list | /registry inspect <session_id>");
+			}
+			if (command === "/schedule list" || command === "/schedule") {
+				await this.listSchedule();
+				return true;
+			}
+			const scheduleRuns = /^\/schedule\s+runs\s+(\S+)$/u.exec(command);
+			if (scheduleRuns) {
+				await this.listScheduleRuns(scheduleRuns[1] as string);
+				return true;
+			}
+			if (command.startsWith("/schedule ")) {
+				throw new WayConsoleError("Usage: /schedule list | /schedule runs <job_id>");
 			}
 			if (command === "/lock" || command.startsWith("/lock ")) {
 				await this.runLockCommand(parseLockCommand(command));
@@ -1039,6 +1131,14 @@ function renderConsoleEventFrame(event: ConsoleEventFrame): string {
 		}
 		case "lock_event":
 			return `Lock state changed: ${compactGatewayValue(event.payload)}\n`;
+		case "alert_raised":
+		case "alert_cleared": {
+			const payload = recordValue(event.payload);
+			const condition = sanitizeConsoleText(rawStringValue(payload.condition, "unknown"));
+			const reason = sanitizeConsoleText(rawStringValue(payload.reason, "unspecified"));
+			const verb = event.kind === "alert_raised" ? "RAISED" : "cleared";
+			return `Alert ${verb}: ${condition} (${reason}).\n`;
+		}
 	}
 }
 
@@ -1302,7 +1402,6 @@ async function waitForInputSlot(
 	});
 }
 
-
 function parseConsoleArguments(arguments_: readonly string[]): string | undefined {
 	let surfaceId: string | undefined;
 	for (let index = 0; index < arguments_.length; index += 1) {
@@ -1334,7 +1433,8 @@ function parseGateAnswerResult(value: unknown): GateAnswerResult {
 		throw new WayConsoleError("main.gate.answer returned an invalid response.");
 	}
 	if (value.accepted === true) return { accepted: true, gateState: value.gate_state };
-	if (value.accepted === false && value.gate_state === "unsupported") return { accepted: false, gateState: "unsupported" };
+	if (value.accepted === false && value.gate_state === "unsupported")
+		return { accepted: false, gateState: "unsupported" };
 	throw new WayConsoleError("main.gate.answer returned an invalid response.");
 }
 
@@ -1378,7 +1478,6 @@ function boundedInteger(value: number, name: string, minimum: number, maximum: n
 	}
 	return value;
 }
-
 
 function sleep(milliseconds: number, signal: AbortSignal): Promise<void> {
 	if (milliseconds === 0 || signal.aborted) return Promise.resolve();

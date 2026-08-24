@@ -1,8 +1,8 @@
+import { type ChildProcess, spawn } from "node:child_process";
+import { randomUUID } from "node:crypto";
 import * as fs from "node:fs";
 import * as fsp from "node:fs/promises";
 import * as path from "node:path";
-import { randomUUID } from "node:crypto";
-import { spawn, type ChildProcess } from "node:child_process";
 import * as readline from "node:readline";
 import { fileURLToPath } from "node:url";
 import type { WayCoreHandle } from "../native-loader";
@@ -170,13 +170,13 @@ class ClosureWorker {
 			this.#resolveReady = resolve;
 			this.#rejectReady = reject;
 		});
-		this.#closed = new Promise<void>(resolve => {
+		this.#closed = new Promise<void>((resolve) => {
 			this.#resolveClosed = resolve;
 		});
 		child.stdout?.setEncoding("utf8");
-		child.stdout?.on("data", chunk => this.receive(String(chunk)));
+		child.stdout?.on("data", (chunk) => this.receive(String(chunk)));
 		child.stderr?.resume();
-		child.once("error", error => this.close(new ClosureError(`closure worker failed: ${error.message}`)));
+		child.once("error", (error) => this.close(new ClosureError(`closure worker failed: ${error.message}`)));
 		child.once("close", () => this.close(new ClosureError("closure worker exited before completing the Git command")));
 	}
 
@@ -283,7 +283,12 @@ class ClosureWorker {
 				this.#resolveReady();
 				continue;
 			}
-			if (message.type !== "result" || typeof message.id !== "number" || !this.#pending || message.id !== this.#pending.id) {
+			if (
+				message.type !== "result" ||
+				typeof message.id !== "number" ||
+				!this.#pending ||
+				message.id !== this.#pending.id
+			) {
 				continue;
 			}
 			const pending = this.#pending;
@@ -319,7 +324,7 @@ function boundedAppend(current: string, chunk: string): string {
 }
 
 async function runWorkerGit(instruction: WorkerRunInstruction): Promise<WorkerResult> {
-	return await new Promise<WorkerResult>(resolve => {
+	return await new Promise<WorkerResult>((resolve) => {
 		let stdout = "";
 		let stderr = "";
 		let settled = false;
@@ -335,13 +340,15 @@ async function runWorkerGit(instruction: WorkerRunInstruction): Promise<WorkerRe
 		});
 		child.stdout?.setEncoding("utf8");
 		child.stderr?.setEncoding("utf8");
-		child.stdout?.on("data", chunk => {
+		child.stdout?.on("data", (chunk) => {
 			stdout = boundedAppend(stdout, String(chunk));
 		});
-		child.stderr?.on("data", chunk => {
+		child.stderr?.on("data", (chunk) => {
 			stderr = boundedAppend(stderr, String(chunk));
 		});
-		child.once("error", error => finish({ exitCode: null, signal: null, stdout, stderr: boundedAppend(stderr, error.message) }));
+		child.once("error", (error) =>
+			finish({ exitCode: null, signal: null, stdout, stderr: boundedAppend(stderr, error.message) }),
+		);
 		child.once("close", (exitCode, signal) => finish({ exitCode, signal, stdout, stderr }));
 	});
 }
@@ -364,12 +371,14 @@ export async function runClosureWorker(): Promise<void> {
 			typeof instruction.id !== "number" ||
 			typeof instruction.cwd !== "string" ||
 			!Array.isArray(instruction.args) ||
-			instruction.args.some(argument => typeof argument !== "string")
+			instruction.args.some((argument) => typeof argument !== "string")
 		) {
 			continue;
 		}
 		const env = isRecord(instruction.env)
-			? Object.fromEntries(Object.entries(instruction.env).filter((entry): entry is [string, string] => typeof entry[1] === "string"))
+			? Object.fromEntries(
+					Object.entries(instruction.env).filter((entry): entry is [string, string] => typeof entry[1] === "string"),
+				)
 			: undefined;
 		const result = await runWorkerGit({
 			type: "run",
@@ -429,7 +438,7 @@ class ClosureExecutorImpl implements ClosureExecutor {
 		this.#disposed = true;
 		const active = [...this.#active.values()];
 		for (const closure of active) this.cancel(closure, new ClosureError("daemon shutdown cancelled closure"));
-		await Promise.all(active.map(async closure => await closure.worker.terminate()));
+		await Promise.all(active.map(async (closure) => await closure.worker.terminate()));
 		await Promise.allSettled([...this.#running]);
 		const key = this.#core as object;
 		const executors = executorsByCore.get(key);
@@ -476,14 +485,20 @@ class ClosureExecutorImpl implements ClosureExecutor {
 
 			active.temporaryIndex = await this.prepareTemporaryIndex(active);
 			const indexEnvironment = { GIT_INDEX_FILE: active.temporaryIndex };
-			this.assertGit(await this.git(active, ["add", "--", ...normalized.paths], indexEnvironment), ["add", "--", ...normalized.paths]);
+			this.assertGit(await this.git(active, ["add", "--", ...normalized.paths], indexEnvironment), [
+				"add",
+				"--",
+				...normalized.paths,
+			]);
 			await this.writeRecoveryMarker(active, indexEnvironment);
 			await this.hook("after_stage", active);
 
 			const staged = await this.git(active, ["diff", "--cached", "--quiet"], indexEnvironment);
 			let committed = false;
 			if (staged.exitCode === 1) {
-				this.assertGit(await this.git(active, ["commit", "-m", normalized.commitMessage], indexEnvironment), ["commit"]);
+				this.assertGit(await this.git(active, ["commit", "-m", normalized.commitMessage], indexEnvironment), [
+					"commit",
+				]);
 				// The temporary index keeps a pre-commit kill from dirtying the
 				// real index. Once the commit is durable, synchronize the real index
 				// before exposing the post-commit crash boundary.
@@ -577,7 +592,11 @@ class ClosureExecutorImpl implements ClosureExecutor {
 		}
 	}
 
-	private async git(active: ActiveClosure, args: readonly string[], env?: Record<string, string>): Promise<WorkerResult> {
+	private async git(
+		active: ActiveClosure,
+		args: readonly string[],
+		env?: Record<string, string>,
+	): Promise<WorkerResult> {
 		this.assertFence(active);
 		this.assertMutationReady(active.request);
 		const result = await active.worker.run(args, active.request.corpusPath, env);
@@ -597,9 +616,16 @@ class ClosureExecutorImpl implements ClosureExecutor {
 		this.assertGit(gitDirectory, ["rev-parse", "--git-dir"]);
 		const directory = gitDirectory.stdout.trim();
 		if (!directory) throw new ClosureError("git did not report its index directory");
-		const temporaryIndex = path.resolve(active.request.corpusPath, directory, `way-closure-index-${process.pid}-${randomUUID()}`);
+		const temporaryIndex = path.resolve(
+			active.request.corpusPath,
+			directory,
+			`way-closure-index-${process.pid}-${randomUUID()}`,
+		);
 		await fsp.rm(temporaryIndex, { force: true });
-		this.assertGit(await this.git(active, ["read-tree", "HEAD"], { GIT_INDEX_FILE: temporaryIndex }), ["read-tree", "HEAD"]);
+		this.assertGit(await this.git(active, ["read-tree", "HEAD"], { GIT_INDEX_FILE: temporaryIndex }), [
+			"read-tree",
+			"HEAD",
+		]);
 		return temporaryIndex;
 	}
 
@@ -780,14 +806,15 @@ function validateRequest(request: ClosureRequest): ClosureRequest {
 		throw new ClosureError("class must be interactive or batch");
 	}
 	if (!request.commitMessage.trim()) throw new ClosureError("commitMessage must not be empty");
-	if (request.remote !== undefined && !request.remote.trim()) throw new ClosureError("remote must not be empty when provided");
+	if (request.remote !== undefined && !request.remote.trim())
+		throw new ClosureError("remote must not be empty when provided");
 	if (request.mutationReadinessReason !== undefined && typeof request.mutationReadinessReason !== "function") {
 		throw new ClosureError("mutationReadinessReason must be a function when provided");
 	}
 	if (!request.corpusPath.trim()) throw new ClosureError("corpusPath must not be empty");
 	if (request.paths.length === 0) throw new ClosureError("paths must list at least one explicit path");
 	const corpusPath = path.resolve(request.corpusPath);
-	const paths = request.paths.map(candidate => {
+	const paths = request.paths.map((candidate) => {
 		if (!candidate || path.isAbsolute(candidate) || candidate.startsWith(":")) {
 			throw new ClosureError("paths must be literal corpus-relative paths");
 		}

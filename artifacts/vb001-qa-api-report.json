@@ -1,0 +1,55 @@
+{
+  "schemaVersion": 1,
+  "kind": "api-package-test-report",
+  "batch": "VB001",
+  "generation": 2,
+  "deltaOnly": true,
+  "recordedAt": "2026-08-24T02:40:00+09:00",
+  "mergeBase": "354c8ea1011dfeadf4883856a07d1e45c0747e45",
+  "assignedSourceHash": "sha256:b841c564df3fa03e2ed11f560feee836eb39be52583f00433bcb251050ca5aad",
+  "sourceHashNote": "Verified live worktree against merge-base 354c8ea1011d. Gen-1 B-SCHEMA-CI is now present as scripts/check-schema-migration.ts, wired in .github/workflows/build.yml before bun scripts/build-native.ts with fetch-depth: 0.",
+  "commands": [
+    {
+      "cmd": "GAJAEWAY_MERGE_BASE=354c8ea1011dfeadf4883856a07d1e45c0747e45 bun scripts/check-schema-migration.ts",
+      "result": "exit 0; SCHEMA_VERSION 9 -> 10, guarded versions 1-10"
+    },
+    {
+      "cmd": "bun test test/unit/schema-migration-check.test.ts",
+      "result": "8 passed, 0 failed"
+    },
+    {
+      "cmd": "bun test test/unit/alerts.test.ts test/unit/admission-entrypoints.test.ts test/unit/metrics-disclosure.test.ts test/unit/scheduler.test.ts",
+      "result": "30 passed, 0 failed, 4 files"
+    },
+    {
+      "cmd": "bun test test/unit/vb001-gen2-redteam.test.ts",
+      "result": "9 passed, 0 failed"
+    },
+    {
+      "cmd": "bun test test/unit/vb001-redteam.test.ts",
+      "result": "9 passed, 0 failed"
+    },
+    {
+      "cmd": "cargo test -p way-core --release --lib lock::tests::clearing_quarantine_also_clears_its_alert_in_the_same_commit",
+      "result": "exit 0"
+    },
+    {
+      "cmd": "bun --version",
+      "result": "1.4.0"
+    }
+  ],
+  "schemaChecker": {
+    "liveAgainstMergeBase": "pass 9->10",
+    "syntheticSkipByTwo": "rejected",
+    "syntheticMissingBlock": "rejected",
+    "syntheticTwoNewBlocks": "rejected",
+    "syntheticSingleStepWithBlock": "accepted",
+    "liveStoreMutatedTo12": "rejected",
+    "commentSpoofResidual": "a // if current_version < 11 comment currently satisfies the presence regex; skip-by-2 is still rejected. Residual control quality, not a reopen of B-SCHEMA-CI."
+  },
+  "gen1Blocker": {
+    "id": "B-SCHEMA-CI",
+    "status": "closed",
+    "evidence": "Control exists, is ordered before native build in CI, fetch-depth 0, live checker passes 9->10, SCHEMA_VERSION=12 mutation is rejected."
+  }
+}

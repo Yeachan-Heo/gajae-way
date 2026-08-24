@@ -1,13 +1,17 @@
+import { afterEach, expect, test } from "bun:test";
 import * as fs from "node:fs";
 import * as path from "node:path";
-import { afterEach, expect, test } from "bun:test";
 import { BrokerCli, BrokerDtoParseError, parseSessionCheckpoint } from "../../src/broker/cli";
-import { createMainAdmissionHandler, MainAdmissionRecoveryError } from "../../src/main-session/admission";
-import { BootstrapError, bootstrapMainSession } from "../../src/main-session/bootstrap";
+import { createMainAdmissionHandler, type MainAdmissionRecoveryError } from "../../src/main-session/admission";
+import { type BootstrapError, bootstrapMainSession } from "../../src/main-session/bootstrap";
 import { createMainSessionHost } from "../../src/main-session/host";
-import { ResumeError, strictResumeMainSession } from "../../src/main-session/resume";
+import { type ResumeError, strictResumeMainSession } from "../../src/main-session/resume";
 import { compareTailCheckpoints, GatewayStateError, GatewayStateStore } from "../../src/main-session/state";
-import { createExternalHostSupervisor, type HostSupervisor, type SupervisorTailEvents } from "../../src/main-session/supervisor";
+import {
+	createExternalHostSupervisor,
+	type HostSupervisor,
+	type SupervisorTailEvents,
+} from "../../src/main-session/supervisor";
 import { loadWayProfile } from "../../src/profile";
 import { durableTestJournal, FakeBrokerFixture, MemoryGatewayMeta } from "../helpers/main-session";
 
@@ -37,6 +41,7 @@ session_id = "${options.sessionId ?? fixture.sessionId}"
 id = "owner"
 platform = "test"
 kind = "dm"
+session_kind = "main"
 
 [operator]
 id = "operator-1"
@@ -71,7 +76,6 @@ function recordingDurableJournal(state: GatewayStateStore, events: Array<{ kind:
 	});
 }
 
-
 async function bootstrapFixture(fixture: FakeBrokerFixture) {
 	const meta = new MemoryGatewayMeta();
 	const state = new GatewayStateStore(meta);
@@ -91,35 +95,46 @@ async function bootstrapFixture(fixture: FakeBrokerFixture) {
 	}
 }
 
+test.serial(
+	"bootstrap adopts and persists the exact live external identity without creating a GJC session",
+	async () => {
+		const fixture = new FakeBrokerFixture();
+		fixtures.push(fixture);
+		const { meta, state, committed } = await bootstrapFixture(fixture);
 
-test.serial("bootstrap adopts and persists the exact live external identity without creating a GJC session", async () => {
-	const fixture = new FakeBrokerFixture();
-	fixtures.push(fixture);
-	const { meta, state, committed } = await bootstrapFixture(fixture);
-
-	expect(committed.identity).toMatchObject({
-		version: 1,
-		sessionId: fixture.sessionId,
-		locator: { repo: fixture.workspace, stateRoot: path.join(fixture.workspace, ".gjc", "state") },
-		transcript: { entryCount: 2, sha256: expect.stringMatching(/^[a-f0-9]{64}$/) },
-	});
-	expect(state.read()).toMatchObject({
-		bootstrapState: "COMMITTED",
-		mainIdentity: { sessionId: fixture.sessionId },
-		tailCheckpoint: { revision: 2, generation: 1, seq: 0 },
-		transcriptDeliveryProgress: { lastEntryId: `${fixture.sessionId}:transcript:1` },
-		transcriptProof: "proven",
-	});
-	expect(meta.events).toEqual([
-		{ kind: "tail_adoption_start", payloadJson: JSON.stringify({ checkpoint: { revision: 2, generation: 1, seq: 0 } }) },
-	]);
-	expect(fixture.commands()).toEqual([]);
-});
+		expect(committed.identity).toMatchObject({
+			version: 1,
+			sessionId: fixture.sessionId,
+			locator: { repo: fixture.workspace, stateRoot: path.join(fixture.workspace, ".gjc", "state") },
+			transcript: { entryCount: 2, sha256: expect.stringMatching(/^[a-f0-9]{64}$/) },
+		});
+		expect(state.read()).toMatchObject({
+			bootstrapState: "COMMITTED",
+			mainIdentity: { sessionId: fixture.sessionId },
+			tailCheckpoint: { revision: 2, generation: 1, seq: 0 },
+			transcriptDeliveryProgress: { lastEntryId: `${fixture.sessionId}:transcript:1` },
+			transcriptProof: "proven",
+		});
+		expect(meta.events).toEqual([
+			{
+				kind: "tail_adoption_start",
+				payloadJson: JSON.stringify({ checkpoint: { revision: 2, generation: 1, seq: 0 } }),
+			},
+		]);
+		expect(fixture.commands()).toEqual([]);
+	},
+);
 
 test("tail checkpoint ordering is lexicographic by generation then sequence, independent of revision", () => {
-	expect(compareTailCheckpoints({ revision: 999, generation: 2, seq: 0 }, { revision: 0, generation: 1, seq: 999 })).toBeGreaterThan(0);
-	expect(compareTailCheckpoints({ revision: 1, generation: 2, seq: 4 }, { revision: 999, generation: 2, seq: 5 })).toBeLessThan(0);
-	expect(compareTailCheckpoints({ revision: 1, generation: 2, seq: 5 }, { revision: 999, generation: 2, seq: 5 })).toBe(0);
+	expect(
+		compareTailCheckpoints({ revision: 999, generation: 2, seq: 0 }, { revision: 0, generation: 1, seq: 999 }),
+	).toBeGreaterThan(0);
+	expect(
+		compareTailCheckpoints({ revision: 1, generation: 2, seq: 4 }, { revision: 999, generation: 2, seq: 5 }),
+	).toBeLessThan(0);
+	expect(compareTailCheckpoints({ revision: 1, generation: 2, seq: 5 }, { revision: 999, generation: 2, seq: 5 })).toBe(
+		0,
+	);
 });
 
 test("missing transcript_proof metadata is corrupt durable state, not an inferred legacy proof", () => {
@@ -152,7 +167,9 @@ test.serial("bootstrap commits a pending proof when the bounded tail has no enve
 	const adoption = supervisor(fixture);
 	fixture.timeoutNextTails(50);
 	try {
-		await expect(bootstrapMainSession({ confirm: true, profile, state, supervisor: adoption, sessionId: fixture.sessionId })).resolves.toMatchObject({
+		await expect(
+			bootstrapMainSession({ confirm: true, profile, state, supervisor: adoption, sessionId: fixture.sessionId }),
+		).resolves.toMatchObject({
 			kind: "committed",
 		});
 		const durable = state.read();
@@ -205,7 +222,11 @@ test.serial("a later complete verification tail promotes a pending proof", async
 	try {
 		const resumed = await strictResumeMainSession({ profile, state, supervisor: resumedSupervisor });
 		expect(resumed.identity.transcript).toBeDefined();
-		expect(state.read()).toMatchObject({ transcriptProof: "proven", transcriptDeliveryGapCount: 1, transcriptDeliveryProgress: { fingerprint: { entryCount: 2 } } });
+		expect(state.read()).toMatchObject({
+			transcriptProof: "proven",
+			transcriptDeliveryGapCount: 1,
+			transcriptDeliveryProgress: { fingerprint: { entryCount: 2 } },
+		});
 		expect(meta.events).toContainEqual(
 			expect.objectContaining({
 				kind: "transcript_delivery_gap",
@@ -217,40 +238,44 @@ test.serial("a later complete verification tail promotes a pending proof", async
 	}
 });
 
-
-
-test.serial("strict resume records a visible delivery gap when pending-proof promotion covers a post-commit reply", async () => {
-	const fixture = new FakeBrokerFixture();
-	fixtures.push(fixture);
-	const { meta, state, profile, committed } = await bootstrapFixture(fixture);
-	const legacyIdentity = { ...committed.identity } as { transcript?: unknown } & Record<string, unknown>;
-	delete legacyIdentity.transcript;
-	meta.values.set("main_identity", JSON.stringify(legacyIdentity));
-	meta.values.set("transcript_delivery_progress", "null");
-	meta.values.set("transcript_proof", "pending");
-	meta.values.set("tail_checkpoint", "null");
-	fixture.appendTranscript({ type: "message", role: "assistant", content: "reply finalized after pending adoption" });
-	const resumedSupervisor = supervisor(fixture);
-	try {
-		const resumed = await strictResumeMainSession({ profile, state, supervisor: resumedSupervisor });
-		expect(resumed.identity.transcript).toBeDefined();
-		expect(state.read()).toMatchObject({
-			mainIdentity: { transcript: { entryCount: 3 } },
-			transcriptDeliveryGapCount: 1,
-			transcriptDeliveryProgress: { lastEntryId: `${fixture.sessionId}:transcript:2`, fingerprint: { entryCount: 3 } },
-			tailCheckpoint: { revision: 3, generation: 1, seq: 0 },
-		});
-		const gap = meta.events.find(event => event.kind === "transcript_delivery_gap");
-		expect(JSON.parse(gap?.payloadJson ?? "{}")).toMatchObject({
-			reason: "transcript_delivery_progress_missing",
-			adoption: "pending_proof_promotion",
-			available_through_entry_id: `${fixture.sessionId}:transcript:2`,
-		});
-		expect(meta.events.some(event => event.kind === "assistant_message")).toBe(false);
-	} finally {
-		await resumedSupervisor.dispose();
-	}
-});
+test.serial(
+	"strict resume records a visible delivery gap when pending-proof promotion covers a post-commit reply",
+	async () => {
+		const fixture = new FakeBrokerFixture();
+		fixtures.push(fixture);
+		const { meta, state, profile, committed } = await bootstrapFixture(fixture);
+		const legacyIdentity = { ...committed.identity } as { transcript?: unknown } & Record<string, unknown>;
+		delete legacyIdentity.transcript;
+		meta.values.set("main_identity", JSON.stringify(legacyIdentity));
+		meta.values.set("transcript_delivery_progress", "null");
+		meta.values.set("transcript_proof", "pending");
+		meta.values.set("tail_checkpoint", "null");
+		fixture.appendTranscript({ type: "message", role: "assistant", content: "reply finalized after pending adoption" });
+		const resumedSupervisor = supervisor(fixture);
+		try {
+			const resumed = await strictResumeMainSession({ profile, state, supervisor: resumedSupervisor });
+			expect(resumed.identity.transcript).toBeDefined();
+			expect(state.read()).toMatchObject({
+				mainIdentity: { transcript: { entryCount: 3 } },
+				transcriptDeliveryGapCount: 1,
+				transcriptDeliveryProgress: {
+					lastEntryId: `${fixture.sessionId}:transcript:2`,
+					fingerprint: { entryCount: 3 },
+				},
+				tailCheckpoint: { revision: 3, generation: 1, seq: 0 },
+			});
+			const gap = meta.events.find((event) => event.kind === "transcript_delivery_gap");
+			expect(JSON.parse(gap?.payloadJson ?? "{}")).toMatchObject({
+				reason: "transcript_delivery_progress_missing",
+				adoption: "pending_proof_promotion",
+				available_through_entry_id: `${fixture.sessionId}:transcript:2`,
+			});
+			expect(meta.events.some((event) => event.kind === "assistant_message")).toBe(false);
+		} finally {
+			await resumedSupervisor.dispose();
+		}
+	},
+);
 
 test.serial("strict resume fails closed when the exact adopted external session disappears", async () => {
 	const fixture = new FakeBrokerFixture();
@@ -268,23 +293,42 @@ test.serial("strict resume fails closed when the exact adopted external session 
 	}
 });
 
-test.serial("scripted broker CLI fixture covers inspect, send, status, tail, and overlapping SDK lifecycle frames", async () => {
-	const fixture = new FakeBrokerFixture();
-	fixtures.push(fixture);
-	const broker = new BrokerCli({ executable: fixture.executable, environment: fixture.environment() });
-	const rows = await broker.listSessions();
-	expect(rows.sessions).toHaveLength(1);
-	expect((await broker.inspectSession(fixture.sessionId)).sessionId).toBe(fixture.sessionId);
-	expect((await broker.sessionMetadata(fixture.sessionId)).kind).toBe("main");
-	expect(await broker.sessionCheckpoint(fixture.sessionId)).toEqual({ revision: 2, generation: 0, seq: 0 });
-	const receipt = await broker.sendPrompt(fixture.sessionId, "fixture command", "fixture-op");
-	expect(receipt).toMatchObject({ sessionId: fixture.sessionId, operation: "turn.prompt", operationRef: "fixture-op" });
-	expect(await broker.turnStatus(fixture.sessionId, "fixture-op")).toMatchObject({ status: "terminal_ok", completed: true });
-	const tail = await broker.tailSession(fixture.sessionId, { repo: fixture.workspace, allEvents: true, untilIdle: true, strict: true });
-	expect(tail.items.filter(item => item.kind === "agent_start")).toHaveLength(2);
-	expect(tail.items.map(item => item.kind)).not.toContain("message_end");
-	expect(tail.items.filter(item => item.kind === "transcript").every(item => typeof item.id === "string" && item.id.length > 0)).toBe(true);
-});
+test.serial(
+	"scripted broker CLI fixture covers inspect, send, status, tail, and overlapping SDK lifecycle frames",
+	async () => {
+		const fixture = new FakeBrokerFixture();
+		fixtures.push(fixture);
+		const broker = new BrokerCli({ executable: fixture.executable, environment: fixture.environment() });
+		const rows = await broker.listSessions();
+		expect(rows.sessions).toHaveLength(1);
+		expect((await broker.inspectSession(fixture.sessionId)).sessionId).toBe(fixture.sessionId);
+		expect((await broker.sessionMetadata(fixture.sessionId)).kind).toBe("main");
+		expect(await broker.sessionCheckpoint(fixture.sessionId)).toEqual({ revision: 2, generation: 0, seq: 0 });
+		const receipt = await broker.sendPrompt(fixture.sessionId, "fixture command", "fixture-op");
+		expect(receipt).toMatchObject({
+			sessionId: fixture.sessionId,
+			operation: "turn.prompt",
+			operationRef: "fixture-op",
+		});
+		expect(await broker.turnStatus(fixture.sessionId, "fixture-op")).toMatchObject({
+			status: "terminal_ok",
+			completed: true,
+		});
+		const tail = await broker.tailSession(fixture.sessionId, {
+			repo: fixture.workspace,
+			allEvents: true,
+			untilIdle: true,
+			strict: true,
+		});
+		expect(tail.items.filter((item) => item.kind === "agent_start")).toHaveLength(2);
+		expect(tail.items.map((item) => item.kind)).not.toContain("message_end");
+		expect(
+			tail.items
+				.filter((item) => item.kind === "transcript")
+				.every((item) => typeof item.id === "string" && item.id.length > 0),
+		).toBe(true);
+	},
+);
 
 test.serial("session.checkpoint accepts decorative query fields but rejects malformed authority", () => {
 	// Real envelope observed live: {type:"query_response", id, ok, result:{checkpoint, revisionId, issuedAt, expiresAt}}.
@@ -301,9 +345,11 @@ test.serial("session.checkpoint accepts decorative query fields but rejects malf
 		},
 	});
 	expect(parseSessionCheckpoint(envelope)).toEqual({ revision: 7, generation: 3, seq: 11 });
-	expect(() => parseSessionCheckpoint(JSON.stringify({ ok: true, result: { checkpoint: { revision: 7, generation: 3, seq: "11" } } }))).toThrow(
-		BrokerDtoParseError,
-	);
+	expect(() =>
+		parseSessionCheckpoint(
+			JSON.stringify({ ok: true, result: { checkpoint: { revision: 7, generation: 3, seq: "11" } } }),
+		),
+	).toThrow(BrokerDtoParseError);
 });
 
 test.serial("scripted broker tail mirrors cursorless rotation gaps and checkpoint records", async () => {
@@ -312,7 +358,11 @@ test.serial("scripted broker tail mirrors cursorless rotation gaps and checkpoin
 	fixture.appendTailEvent("agent_start", { type: "agent_start", sessionId: fixture.sessionId });
 	fixture.rotateTailThrough(1);
 	const broker = new BrokerCli({ executable: fixture.executable, environment: fixture.environment() });
-	const tail = await broker.tailSession(fixture.sessionId, { repo: fixture.workspace, allEvents: true, untilIdle: true });
+	const tail = await broker.tailSession(fixture.sessionId, {
+		repo: fixture.workspace,
+		allEvents: true,
+		untilIdle: true,
+	});
 	expect(tail.checkpoint).toEqual({ revision: 2, generation: 1, seq: 1 });
 	expect(tail.gap).toEqual({
 		code: "retention_gap",
@@ -324,29 +374,34 @@ test.serial("scripted broker tail mirrors cursorless rotation gaps and checkpoin
 	).rejects.toMatchObject({ code: "invalid_cursor" });
 });
 
-
-test.serial("external identity disappearance is durable failed-closed host state, not a silent degraded continuation", async () => {
-	const fixture = new FakeBrokerFixture();
-	fixtures.push(fixture);
-	const { state, profile } = await bootstrapFixture(fixture);
-	const resumedSupervisor = supervisor(fixture);
-	const resumed = await strictResumeMainSession({ profile, state, supervisor: resumedSupervisor });
-	const host = createMainSessionHost({
-		supervisor: resumedSupervisor,
-		identity: resumed.identity,
-		state,
-		journal: durableTestJournal(state),
-		initialTurnState: resumed.turnState,
-		initialFollowUpQueueDepth: resumed.followUpQueueDepth,
-	});
-	try {
-		fixture.setLive(false);
-		await expect(host.waitForFatalFailure()).resolves.toMatchObject({ reason: "session_unavailable" });
-		expect(state.read()).toMatchObject({ bootstrapState: "FAILED_CLOSED", failedClosedReason: "session_unavailable" });
-	} finally {
-		await host.dispose();
-	}
-});
+test.serial(
+	"external identity disappearance is durable failed-closed host state, not a silent degraded continuation",
+	async () => {
+		const fixture = new FakeBrokerFixture();
+		fixtures.push(fixture);
+		const { state, profile } = await bootstrapFixture(fixture);
+		const resumedSupervisor = supervisor(fixture);
+		const resumed = await strictResumeMainSession({ profile, state, supervisor: resumedSupervisor });
+		const host = createMainSessionHost({
+			supervisor: resumedSupervisor,
+			identity: resumed.identity,
+			state,
+			journal: durableTestJournal(state),
+			initialTurnState: resumed.turnState,
+			initialFollowUpQueueDepth: resumed.followUpQueueDepth,
+		});
+		try {
+			fixture.setLive(false);
+			await expect(host.waitForFatalFailure()).resolves.toMatchObject({ reason: "session_unavailable" });
+			expect(state.read()).toMatchObject({
+				bootstrapState: "FAILED_CLOSED",
+				failedClosedReason: "session_unavailable",
+			});
+		} finally {
+			await host.dispose();
+		}
+	},
+);
 
 test.serial("a terminal tail snapshot that predates admission cannot settle the growth window", async () => {
 	const fixture = new FakeBrokerFixture();
@@ -431,7 +486,9 @@ test.serial("strict resume fails closed on unapproved profile drift before adopt
 	fs.writeFileSync(profilePath, fs.readFileSync(profilePath, "utf8").replace("files = []", 'files = ["DRIFT.md"]'));
 	const resumed = supervisor(fixture);
 	try {
-		await expect(strictResumeMainSession({ profile: loadWayProfile(profilePath), state, supervisor: resumed })).rejects.toMatchObject({
+		await expect(
+			strictResumeMainSession({ profile: loadWayProfile(profilePath), state, supervisor: resumed }),
+		).rejects.toMatchObject({
 			reason: "profile_drift",
 		} satisfies Partial<ResumeError>);
 		expect(state.read()).toMatchObject({ bootstrapState: "FAILED_CLOSED", failedClosedReason: "profile_drift" });
@@ -448,10 +505,15 @@ test.serial("strict resume fails closed when the profile selects a different ext
 	state.approveProfile(mismatchedProfile, "profile-session-mismatch-receipt", 1);
 	const resumed = supervisor(fixture);
 	try {
-		await expect(strictResumeMainSession({ profile: mismatchedProfile, state, supervisor: resumed })).rejects.toMatchObject({
+		await expect(
+			strictResumeMainSession({ profile: mismatchedProfile, state, supervisor: resumed }),
+		).rejects.toMatchObject({
 			reason: "profile_session_mismatch",
 		} satisfies Partial<ResumeError>);
-		expect(state.read()).toMatchObject({ bootstrapState: "FAILED_CLOSED", failedClosedReason: "profile_session_mismatch" });
+		expect(state.read()).toMatchObject({
+			bootstrapState: "FAILED_CLOSED",
+			failedClosedReason: "profile_session_mismatch",
+		});
 	} finally {
 		await resumed.dispose();
 	}
@@ -467,160 +529,186 @@ test.serial("strict resume fails closed when an external transcript grew without
 		await expect(strictResumeMainSession({ profile, state, supervisor: resumed })).rejects.toMatchObject({
 			reason: "main_identity_mismatch",
 		} satisfies Partial<ResumeError>);
-		expect(state.read()).toMatchObject({ bootstrapState: "FAILED_CLOSED", failedClosedReason: "main_identity_mismatch" });
+		expect(state.read()).toMatchObject({
+			bootstrapState: "FAILED_CLOSED",
+			failedClosedReason: "main_identity_mismatch",
+		});
 	} finally {
 		await resumed.dispose();
 	}
 });
 
-test.serial("host surface-attributes overlapping agent and turn lifecycle tail events", async () => {
-	const fixture = new FakeBrokerFixture();
-	fixtures.push(fixture);
-	const { state, profile } = await bootstrapFixture(fixture);
-	const resumedSupervisor = supervisor(fixture);
-	const resumed = await strictResumeMainSession({ profile, state, supervisor: resumedSupervisor });
-	const journal: Array<{ kind: string; payloadJson: string }> = [];
-	const host = createMainSessionHost({
-		supervisor: resumedSupervisor,
-		identity: resumed.identity,
-		state,
-		journal: recordingDurableJournal(state, journal),
-		initialTurnState: resumed.turnState,
-		initialFollowUpQueueDepth: resumed.followUpQueueDepth,
-	});
-	try {
-		fixture.holdNextTurn();
-		await host.admit("prompt", "deduplicate this attempt", "overlap-attempt", undefined, undefined, "owner");
-		await eventually(
-			() => journal.filter(event => event.kind === "turn_start").length === 1,
-			"tail lifecycle did not observe the overlapping start pair",
-			15_000,
-		);
-		fixture.complete("overlap-attempt", { text: "one terminal response" });
-		await eventually(
-			() => journal.filter(event => event.kind === "turn_end").length === 1,
-			"tail lifecycle did not reach turn_end",
-			20_000,
-		);
+test.serial(
+	"host surface-attributes overlapping agent and turn lifecycle tail events",
+	async () => {
+		const fixture = new FakeBrokerFixture();
+		fixtures.push(fixture);
+		const { state, profile } = await bootstrapFixture(fixture);
+		const resumedSupervisor = supervisor(fixture);
+		const resumed = await strictResumeMainSession({ profile, state, supervisor: resumedSupervisor });
+		const journal: Array<{ kind: string; payloadJson: string }> = [];
+		const host = createMainSessionHost({
+			supervisor: resumedSupervisor,
+			identity: resumed.identity,
+			state,
+			journal: recordingDurableJournal(state, journal),
+			initialTurnState: resumed.turnState,
+			initialFollowUpQueueDepth: resumed.followUpQueueDepth,
+		});
+		try {
+			fixture.holdNextTurn();
+			await host.admit("prompt", "deduplicate this attempt", "overlap-attempt", undefined, undefined, "owner");
+			await eventually(
+				() => journal.filter((event) => event.kind === "turn_start").length === 1,
+				"tail lifecycle did not observe the overlapping start pair",
+				15_000,
+			);
+			fixture.complete("overlap-attempt", { text: "one terminal response" });
+			await eventually(
+				() => journal.filter((event) => event.kind === "turn_end").length === 1,
+				"tail lifecycle did not reach turn_end",
+				20_000,
+			);
 
-		expect(journal.map(event => event.kind)).toEqual(["turn_start", "assistant_message", "turn_end"]);
-		expect(JSON.parse(journal[0]?.payloadJson ?? "{}"))
-			.toEqual({ attempt_id: `${fixture.sessionId}:overlap-attempt`, generation: 1, lineage: "main", surface_id: "owner" });
-		expect(JSON.parse(journal[1]?.payloadJson ?? "{}"))
-			.toEqual(expect.objectContaining({ finalized: true, text: "one terminal response", surface_id: "owner" }));
-		expect(JSON.parse(journal[2]?.payloadJson ?? "{}"))
-			.toEqual({ attempt_id: `${fixture.sessionId}:overlap-attempt`, generation: 1, lineage: "main", surface_id: "owner" });
-	} finally {
-		await host.dispose();
-	}
-}, 45_000);
+			expect(journal.map((event) => event.kind)).toEqual(["turn_start", "assistant_message", "turn_end"]);
+			expect(JSON.parse(journal[0]?.payloadJson ?? "{}")).toEqual({
+				attempt_id: `${fixture.sessionId}:overlap-attempt`,
+				generation: 1,
+				lineage: "main",
+				surface_id: "owner",
+			});
+			expect(JSON.parse(journal[1]?.payloadJson ?? "{}")).toEqual(
+				expect.objectContaining({ finalized: true, text: "one terminal response", surface_id: "owner" }),
+			);
+			expect(JSON.parse(journal[2]?.payloadJson ?? "{}")).toEqual({
+				attempt_id: `${fixture.sessionId}:overlap-attempt`,
+				generation: 1,
+				lineage: "main",
+				surface_id: "owner",
+			});
+		} finally {
+			await host.dispose();
+		}
+	},
+	45_000,
+);
 
-test.serial("host journals finalized assistant messages from stable transcript entries", async () => {
-	const fixture = new FakeBrokerFixture();
-	fixtures.push(fixture);
-	const { state, profile } = await bootstrapFixture(fixture);
-	const resumedSupervisor = supervisor(fixture);
-	const resumed = await strictResumeMainSession({ profile, state, supervisor: resumedSupervisor });
-	const journal: Array<{ kind: string; payloadJson: string }> = [];
-	const host = createMainSessionHost({
-		supervisor: resumedSupervisor,
-		identity: resumed.identity,
-		state,
-		journal: recordingDurableJournal(state, journal),
-		initialTurnState: resumed.turnState,
-		initialFollowUpQueueDepth: resumed.followUpQueueDepth,
-	});
-	try {
-		fixture.holdNextTurn();
-		await host.admit("prompt", "produce a transcript-only final", "transcript-final");
-		await eventually(
-			() => journal.some(event => event.kind === "turn_start"),
-			"held external turn did not start",
-		);
-		fixture.complete("transcript-final", { text: "final external answer" });
-		await eventually(
-			() => journal.filter(event => event.kind === "assistant_message").length === 1,
-			"finalized transcript message was not projected",
-			10_000,
-		);
+test.serial(
+	"host journals finalized assistant messages from stable transcript entries",
+	async () => {
+		const fixture = new FakeBrokerFixture();
+		fixtures.push(fixture);
+		const { state, profile } = await bootstrapFixture(fixture);
+		const resumedSupervisor = supervisor(fixture);
+		const resumed = await strictResumeMainSession({ profile, state, supervisor: resumedSupervisor });
+		const journal: Array<{ kind: string; payloadJson: string }> = [];
+		const host = createMainSessionHost({
+			supervisor: resumedSupervisor,
+			identity: resumed.identity,
+			state,
+			journal: recordingDurableJournal(state, journal),
+			initialTurnState: resumed.turnState,
+			initialFollowUpQueueDepth: resumed.followUpQueueDepth,
+		});
+		try {
+			fixture.holdNextTurn();
+			await host.admit("prompt", "produce a transcript-only final", "transcript-final");
+			await eventually(() => journal.some((event) => event.kind === "turn_start"), "held external turn did not start");
+			fixture.complete("transcript-final", { text: "final external answer" });
+			await eventually(
+				() => journal.filter((event) => event.kind === "assistant_message").length === 1,
+				"finalized transcript message was not projected",
+				10_000,
+			);
 
-		const assistants = journal.filter(event => event.kind === "assistant_message");
-		expect(assistants).toHaveLength(1);
-		expect(JSON.parse(assistants[0]?.payloadJson ?? "{}"))
-			.toEqual(expect.objectContaining({ finalized: true, text: "final external answer" }));
-	} finally {
-		await host.dispose();
-	}
-}, 15_000);
+			const assistants = journal.filter((event) => event.kind === "assistant_message");
+			expect(assistants).toHaveLength(1);
+			expect(JSON.parse(assistants[0]?.payloadJson ?? "{}")).toEqual(
+				expect.objectContaining({ finalized: true, text: "final external answer" }),
+			);
+		} finally {
+			await host.dispose();
+		}
+	},
+	15_000,
+);
 
-test.serial("host survives transient broker tail failures with bounded retry and recovers", async () => {
-	const fixture = new FakeBrokerFixture();
-	fixtures.push(fixture);
-	const { state, profile } = await bootstrapFixture(fixture);
-	const resumedSupervisor = supervisor(fixture);
-	const resumed = await strictResumeMainSession({ profile, state, supervisor: resumedSupervisor });
-	const journal: Array<{ kind: string; payloadJson: string }> = [];
-	const host = createMainSessionHost({
-		supervisor: resumedSupervisor,
-		identity: resumed.identity,
-		state,
-		journal: recordingDurableJournal(state, journal),
-		initialTurnState: resumed.turnState,
-		initialFollowUpQueueDepth: resumed.followUpQueueDepth,
-	});
-	try {
-		fixture.holdNextTurn();
-		await host.admit("prompt", "recover through transient tail failures", "transient-recovery-message");
-		// Three consecutive CLI deaths (spawn pressure / nonzero exits), then healthy.
-		fixture.crashNextTails(3);
-		fixture.complete("transient-recovery-message", { text: "survived transient transport failure" });
-		await eventually(
-			() => journal.filter(event => event.kind === "assistant_message").length === 1,
-			"host did not recover from transient tail failures",
-			20_000,
-		);
-		expect(JSON.parse(journal.find(event => event.kind === "assistant_message")?.payloadJson ?? "{}"))
-			.toEqual(expect.objectContaining({ finalized: true, text: "survived transient transport failure" }));
-		// The host must still be usable: no failed-closed marker was recorded.
-		expect(state.read().failedClosedReason).toBeUndefined();
-	} finally {
-		await host.dispose();
-	}
-}, 30_000);
+test.serial(
+	"host survives transient broker tail failures with bounded retry and recovers",
+	async () => {
+		const fixture = new FakeBrokerFixture();
+		fixtures.push(fixture);
+		const { state, profile } = await bootstrapFixture(fixture);
+		const resumedSupervisor = supervisor(fixture);
+		const resumed = await strictResumeMainSession({ profile, state, supervisor: resumedSupervisor });
+		const journal: Array<{ kind: string; payloadJson: string }> = [];
+		const host = createMainSessionHost({
+			supervisor: resumedSupervisor,
+			identity: resumed.identity,
+			state,
+			journal: recordingDurableJournal(state, journal),
+			initialTurnState: resumed.turnState,
+			initialFollowUpQueueDepth: resumed.followUpQueueDepth,
+		});
+		try {
+			fixture.holdNextTurn();
+			await host.admit("prompt", "recover through transient tail failures", "transient-recovery-message");
+			// Three consecutive CLI deaths (spawn pressure / nonzero exits), then healthy.
+			fixture.crashNextTails(3);
+			fixture.complete("transient-recovery-message", { text: "survived transient transport failure" });
+			await eventually(
+				() => journal.filter((event) => event.kind === "assistant_message").length === 1,
+				"host did not recover from transient tail failures",
+				20_000,
+			);
+			expect(JSON.parse(journal.find((event) => event.kind === "assistant_message")?.payloadJson ?? "{}")).toEqual(
+				expect.objectContaining({ finalized: true, text: "survived transient transport failure" }),
+			);
+			// The host must still be usable: no failed-closed marker was recorded.
+			expect(state.read().failedClosedReason).toBeUndefined();
+		} finally {
+			await host.dispose();
+		}
+	},
+	30_000,
+);
 
-test.serial("host fails closed when broker tail failures exhaust the bounded retry budget", async () => {
-	const fixture = new FakeBrokerFixture();
-	fixtures.push(fixture);
-	const { state, profile } = await bootstrapFixture(fixture);
-	const resumedSupervisor = supervisor(fixture);
-	const resumed = await strictResumeMainSession({ profile, state, supervisor: resumedSupervisor });
-	const journal: Array<{ kind: string; payloadJson: string }> = [];
-	const healthReports: Array<{ state: string; reason: string }> = [];
-	const host = createMainSessionHost({
-		supervisor: resumedSupervisor,
-		identity: resumed.identity,
-		state,
-		journal: durableTestJournal(state, {
-			journalAppend: (kind, payloadJson) => journal.push({ kind, payloadJson }),
-			onTranscriptProjection: (kind, payloadJson) => journal.push({ kind, payloadJson }),
-			setRpcHealth: (healthState, reason) => healthReports.push({ state: healthState, reason }),
-		}),
-		initialTurnState: resumed.turnState,
-		initialFollowUpQueueDepth: resumed.followUpQueueDepth,
-	});
-	try {
-		// More consecutive failures than the retry budget (8) tolerates.
-		fixture.crashNextTails(50);
-		await eventually(
-			() => healthReports.some(report => report.state === "degraded" && report.reason === "tail_unavailable"),
-			"host did not report degraded health after exhausting the retry budget",
-			60_000,
-		);
-	} finally {
-		await host.dispose();
-	}
-}, 90_000);
-
+test.serial(
+	"host fails closed when broker tail failures exhaust the bounded retry budget",
+	async () => {
+		const fixture = new FakeBrokerFixture();
+		fixtures.push(fixture);
+		const { state, profile } = await bootstrapFixture(fixture);
+		const resumedSupervisor = supervisor(fixture);
+		const resumed = await strictResumeMainSession({ profile, state, supervisor: resumedSupervisor });
+		const journal: Array<{ kind: string; payloadJson: string }> = [];
+		const healthReports: Array<{ state: string; reason: string }> = [];
+		const host = createMainSessionHost({
+			supervisor: resumedSupervisor,
+			identity: resumed.identity,
+			state,
+			journal: durableTestJournal(state, {
+				journalAppend: (kind, payloadJson) => journal.push({ kind, payloadJson }),
+				onTranscriptProjection: (kind, payloadJson) => journal.push({ kind, payloadJson }),
+				setRpcHealth: (healthState, reason) => healthReports.push({ state: healthState, reason }),
+			}),
+			initialTurnState: resumed.turnState,
+			initialFollowUpQueueDepth: resumed.followUpQueueDepth,
+		});
+		try {
+			// More consecutive failures than the retry budget (8) tolerates.
+			fixture.crashNextTails(50);
+			await eventually(
+				() => healthReports.some((report) => report.state === "degraded" && report.reason === "tail_unavailable"),
+				"host did not report degraded health after exhausting the retry budget",
+				60_000,
+			);
+		} finally {
+			await host.dispose();
+		}
+	},
+	90_000,
+);
 
 test.serial("bootstrap ring checkpoint suppresses retained gap-free pre-adoption lifecycle history", async () => {
 	const fixture = new FakeBrokerFixture();
@@ -644,7 +732,7 @@ test.serial("bootstrap ring checkpoint suppresses retained gap-free pre-adoption
 		expect(journal).toEqual([]);
 		fixture.appendTailEvent("agent_start", { type: "agent_start", sessionId: fixture.sessionId });
 		await eventually(
-			() => journal.filter(event => event.kind === "turn_start").length === 1,
+			() => journal.filter((event) => event.kind === "turn_start").length === 1,
 			"post-adoption lifecycle event was not projected",
 		);
 	} finally {
@@ -670,7 +758,10 @@ test.serial("adoption-start retention gap records its resync checkpoint and proj
 		initialFollowUpQueueDepth: resumed.followUpQueueDepth,
 	});
 	try {
-		await eventually(() => state.read().tailCheckpoint?.seq === 1, "host did not record the adoption-start resync checkpoint");
+		await eventually(
+			() => state.read().tailCheckpoint?.seq === 1,
+			"host did not record the adoption-start resync checkpoint",
+		);
 		expect(meta.events).toContainEqual({
 			kind: "tail_adoption_start",
 			payloadJson: JSON.stringify({ checkpoint: { revision: 2, generation: 1, seq: 1 } }),
@@ -680,7 +771,7 @@ test.serial("adoption-start retention gap records its resync checkpoint and proj
 		await host.admit("prompt", "project after adoption resync", "after-adoption-resync");
 		fixture.complete("after-adoption-resync", { text: "projected after adoption resync" });
 		await eventually(
-			() => journal.some(event => event.payloadJson.includes("projected after adoption resync")),
+			() => journal.some((event) => event.payloadJson.includes("projected after adoption resync")),
 			"transcript after adoption resync was not projected",
 		);
 		expect(state.read().tailCheckpoint).toMatchObject({ generation: 1, seq: expect.any(Number) });
@@ -689,268 +780,343 @@ test.serial("adoption-start retention gap records its resync checkpoint and proj
 	}
 });
 
-test.serial("an established busy-turn ring rotation journals its resync and continues from transcript delivery", async () => {
-	const fixture = new FakeBrokerFixture();
-	fixtures.push(fixture);
-	const { meta, state, profile } = await bootstrapFixture(fixture);
-	const resumedSupervisor = supervisor(fixture);
-	const resumed = await strictResumeMainSession({ profile, state, supervisor: resumedSupervisor });
-	const journal: Array<{ kind: string; payloadJson: string }> = [];
-	const host = createMainSessionHost({
-		supervisor: resumedSupervisor,
-		identity: resumed.identity,
-		state,
-		journal: recordingDurableJournal(state, journal),
-		initialTurnState: resumed.turnState,
-		initialFollowUpQueueDepth: resumed.followUpQueueDepth,
-	});
-	try {
-		await eventually(() => state.read().tailCheckpoint?.seq === 0, "host did not establish its initial checkpoint");
-		fixture.setNoEnvelopeWhileBusy();
-		fixture.holdNextTurn();
-		await host.admit("prompt", "rotate the held ring", "ring-rotation");
-		await eventually(() => state.read().growthIntent !== undefined, "held admission did not open a growth window");
+test.serial(
+	"an established busy-turn ring rotation journals its resync and continues from transcript delivery",
+	async () => {
+		const fixture = new FakeBrokerFixture();
+		fixtures.push(fixture);
+		const { meta, state, profile } = await bootstrapFixture(fixture);
+		const resumedSupervisor = supervisor(fixture);
+		const resumed = await strictResumeMainSession({ profile, state, supervisor: resumedSupervisor });
+		const journal: Array<{ kind: string; payloadJson: string }> = [];
+		const host = createMainSessionHost({
+			supervisor: resumedSupervisor,
+			identity: resumed.identity,
+			state,
+			journal: recordingDurableJournal(state, journal),
+			initialTurnState: resumed.turnState,
+			initialFollowUpQueueDepth: resumed.followUpQueueDepth,
+		});
+		try {
+			await eventually(() => state.read().tailCheckpoint?.seq === 0, "host did not establish its initial checkpoint");
+			fixture.setNoEnvelopeWhileBusy();
+			fixture.holdNextTurn();
+			await host.admit("prompt", "rotate the held ring", "ring-rotation");
+			await eventually(() => state.read().growthIntent !== undefined, "held admission did not open a growth window");
+			fixture.rotateRingDuringNextCompletion();
+			fixture.complete("ring-rotation", { text: "delivered after ring rotation" });
+			await eventually(() => state.read().tailRingRotationCount === 1, "ring rotation was not durably recorded");
+			await eventually(
+				() =>
+					journal.some(
+						(event) =>
+							event.kind === "assistant_message" && event.payloadJson.includes("delivered after ring rotation"),
+					),
+				"transcript delivery did not project the terminal reply after ring rotation",
+			);
+			expect(meta.events).toContainEqual({
+				kind: "tail_ring_rotation",
+				payloadJson: JSON.stringify({
+					prior_watermark: { revision: 2, generation: 1, seq: 0 },
+					resync_point: { revision: 4, generation: 1, seq: 5 },
+				}),
+			});
+			expect(state.read()).toMatchObject({
+				bootstrapState: "COMMITTED",
+				failedClosedReason: undefined,
+				tailRingRotationCount: 1,
+			});
+			expect(host.degraded).toBe(false);
+			expect(host.turnState).toBe("idle");
+		} finally {
+			await host.dispose();
+		}
+	},
+);
+
+test.serial(
+	"a failed journal append leaves the tail checkpoint behind so the scripted broker event replays",
+	async () => {
+		const fixture = new FakeBrokerFixture();
+		fixtures.push(fixture);
+		const { state, profile } = await bootstrapFixture(fixture);
+		const firstSupervisor = supervisor(fixture);
+		const first = await strictResumeMainSession({ profile, state, supervisor: firstSupervisor });
+		const failedHost = createMainSessionHost({
+			supervisor: firstSupervisor,
+			identity: first.identity,
+			state,
+			journal: durableTestJournal(state, {
+				journalAppend: () => {
+					throw new Error("scripted journal interruption");
+				},
+			}),
+			initialTurnState: first.turnState,
+			initialFollowUpQueueDepth: first.followUpQueueDepth,
+		});
+		try {
+			await eventually(() => state.read().tailCheckpoint?.seq === 0, "host did not establish its initial checkpoint");
+			fixture.appendTailEvent("agent_start", { type: "agent_start", sessionId: fixture.sessionId });
+			await eventually(() => failedHost.degraded, "scripted journal failure did not degrade the first host");
+			expect(state.read().tailCheckpoint).toMatchObject({ generation: 1, seq: 0 });
+		} finally {
+			await failedHost.dispose();
+		}
+
+		const replaySupervisor = supervisor(fixture);
+		const replayed = await strictResumeMainSession({ profile, state, supervisor: replaySupervisor });
+		const journal: Array<{ kind: string; payloadJson: string }> = [];
+		const replayHost = createMainSessionHost({
+			supervisor: replaySupervisor,
+			identity: replayed.identity,
+			state,
+			journal: recordingDurableJournal(state, journal),
+			initialTurnState: replayed.turnState,
+			initialFollowUpQueueDepth: replayed.followUpQueueDepth,
+		});
+		try {
+			await eventually(
+				() => journal.some((event) => event.kind === "turn_start"),
+				"restarted host did not replay the uncheckpointed broker event",
+			);
+			expect(state.read().tailCheckpoint).toMatchObject({ generation: 1, seq: 1 });
+		} finally {
+			await replayHost.dispose();
+		}
+	},
+);
+
+test.serial(
+	"a reply finalized while the daemon is down is recovered from durable transcript delivery progress",
+	async () => {
+		const fixture = new FakeBrokerFixture();
+		fixtures.push(fixture);
+		const { meta, state, profile } = await bootstrapFixture(fixture);
+		const firstSupervisor = supervisor(fixture);
+		const first = await strictResumeMainSession({ profile, state, supervisor: firstSupervisor });
+		const firstHost = createMainSessionHost({
+			supervisor: firstSupervisor,
+			identity: first.identity,
+			state,
+			journal: durableTestJournal(state),
+			initialTurnState: first.turnState,
+			initialFollowUpQueueDepth: first.followUpQueueDepth,
+			initialVerificationState: first.verificationState,
+		});
+		try {
+			fixture.setNoEnvelopeWhileBusy();
+			fixture.holdNextTurn();
+			await firstHost.admit("prompt", "finish while daemon is down", "down-recovery");
+			await eventually(
+				() => state.read().growthIntent !== undefined,
+				"growth intent was not durable before daemon stop",
+			);
+		} finally {
+			await firstHost.dispose();
+		}
 		fixture.rotateRingDuringNextCompletion();
-		fixture.complete("ring-rotation", { text: "delivered after ring rotation" });
-		await eventually(() => state.read().tailRingRotationCount === 1, "ring rotation was not durably recorded");
-		await eventually(
-			() => journal.some(event => event.kind === "assistant_message" && event.payloadJson.includes("delivered after ring rotation")),
-			"transcript delivery did not project the terminal reply after ring rotation",
-		);
-		expect(meta.events).toContainEqual({
-			kind: "tail_ring_rotation",
-			payloadJson: JSON.stringify({
-				prior_watermark: { revision: 2, generation: 1, seq: 0 },
-				resync_point: { revision: 4, generation: 1, seq: 5 },
-			}),
-		});
-		expect(state.read()).toMatchObject({ bootstrapState: "COMMITTED", failedClosedReason: undefined, tailRingRotationCount: 1 });
-		expect(host.degraded).toBe(false);
-		expect(host.turnState).toBe("idle");
-	} finally {
-		await host.dispose();
-	}
-});
+		fixture.complete("down-recovery", { text: "recovered after daemon downtime" });
 
-test.serial("a failed journal append leaves the tail checkpoint behind so the scripted broker event replays", async () => {
-	const fixture = new FakeBrokerFixture();
-	fixtures.push(fixture);
-	const { state, profile } = await bootstrapFixture(fixture);
-	const firstSupervisor = supervisor(fixture);
-	const first = await strictResumeMainSession({ profile, state, supervisor: firstSupervisor });
-	const failedHost = createMainSessionHost({
-		supervisor: firstSupervisor,
-		identity: first.identity,
-		state,
-		journal: durableTestJournal(state, {
-			journalAppend: () => {
-				throw new Error("scripted journal interruption");
+		const restartedSupervisor = supervisor(fixture);
+		const restarted = await strictResumeMainSession({ profile, state, supervisor: restartedSupervisor });
+		const journal: Array<{ kind: string; payloadJson: string }> = [];
+		const restartedHost = createMainSessionHost({
+			supervisor: restartedSupervisor,
+			identity: restarted.identity,
+			state,
+			journal: recordingDurableJournal(state, journal),
+			initialTurnState: restarted.turnState,
+			initialFollowUpQueueDepth: restarted.followUpQueueDepth,
+			initialVerificationState: restarted.verificationState,
+			...(restarted.verificationTail === undefined ? {} : { verificationTail: restarted.verificationTail }),
+			...(restarted.growthIntent === undefined ? {} : { recoveredGrowthIntent: restarted.growthIntent }),
+		});
+		try {
+			expect(restarted.verificationState).toBe("verified");
+			expect(restarted.verificationTail).toMatchObject({
+				retentionGap: true,
+				resyncCheckpoint: { generation: 1, seq: 5 },
+			});
+			expect(restarted.recoveredGrowthIntent).toBe(true);
+			await eventually(
+				() =>
+					journal.some(
+						(event) =>
+							event.kind === "assistant_message" && event.payloadJson.includes("recovered after daemon downtime"),
+					),
+				"reply finalized while down was not recovered",
+			);
+			await eventually(
+				() => state.read().tailRingRotationCount === 1,
+				"verification-tail ring rotation was not durably recorded",
+			);
+			expect(meta.events).toContainEqual({
+				kind: "tail_ring_rotation",
+				payloadJson: JSON.stringify({
+					prior_watermark: { revision: 2, generation: 1, seq: 0 },
+					resync_point: { revision: 4, generation: 1, seq: 5 },
+				}),
+			});
+			expect(journal.some((event) => event.kind === "transcript_delivery_gap")).toBe(false);
+			await eventually(
+				() => state.read().growthIntent === undefined,
+				"recovered growth intent was not finalized after transcript delivery",
+			);
+		} finally {
+			await restartedHost.dispose();
+		}
+	},
+);
+
+test.serial(
+	"an admitted opaque assistant suffix surface-attributes its delivery gap instead of silently advancing",
+	async () => {
+		const fixture = new FakeBrokerFixture();
+		fixtures.push(fixture);
+		const { meta, state, profile } = await bootstrapFixture(fixture);
+		const resumedSupervisor = supervisor(fixture);
+		const resumed = await strictResumeMainSession({ profile, state, supervisor: resumedSupervisor });
+		const host = createMainSessionHost({
+			supervisor: resumedSupervisor,
+			identity: resumed.identity,
+			state,
+			journal: {
+				journalAppend: () => undefined,
+				journalAppendAtTailCheckpoint: (kind, payloadJson, expected, checkpoint) =>
+					state.appendTailProjection(expected, checkpoint, kind, payloadJson),
+				journalAppendTranscriptProjection: (
+					kind,
+					payloadJson,
+					expectedTail,
+					checkpoint,
+					expectedDelivery,
+					nextDelivery,
+				) =>
+					state.appendTranscriptProjection(expectedTail, checkpoint, expectedDelivery, nextDelivery, kind, payloadJson),
 			},
-		}),
-		initialTurnState: first.turnState,
-		initialFollowUpQueueDepth: first.followUpQueueDepth,
-	});
-	try {
-		await eventually(() => state.read().tailCheckpoint?.seq === 0, "host did not establish its initial checkpoint");
-		fixture.appendTailEvent("agent_start", { type: "agent_start", sessionId: fixture.sessionId });
-		await eventually(() => failedHost.degraded, "scripted journal failure did not degrade the first host");
-		expect(state.read().tailCheckpoint).toMatchObject({ generation: 1, seq: 0 });
-	} finally {
-		await failedHost.dispose();
-	}
-
-	const replaySupervisor = supervisor(fixture);
-	const replayed = await strictResumeMainSession({ profile, state, supervisor: replaySupervisor });
-	const journal: Array<{ kind: string; payloadJson: string }> = [];
-	const replayHost = createMainSessionHost({
-		supervisor: replaySupervisor,
-		identity: replayed.identity,
-		state,
-		journal: recordingDurableJournal(state, journal),
-		initialTurnState: replayed.turnState,
-		initialFollowUpQueueDepth: replayed.followUpQueueDepth,
-	});
-	try {
-		await eventually(
-			() => journal.some(event => event.kind === "turn_start"),
-			"restarted host did not replay the uncheckpointed broker event",
-		);
-		expect(state.read().tailCheckpoint).toMatchObject({ generation: 1, seq: 1 });
-	} finally {
-		await replayHost.dispose();
-	}
-});
-
-test.serial("a reply finalized while the daemon is down is recovered from durable transcript delivery progress", async () => {
-	const fixture = new FakeBrokerFixture();
-	fixtures.push(fixture);
-	const { meta, state, profile } = await bootstrapFixture(fixture);
-	const firstSupervisor = supervisor(fixture);
-	const first = await strictResumeMainSession({ profile, state, supervisor: firstSupervisor });
-	const firstHost = createMainSessionHost({
-		supervisor: firstSupervisor,
-		identity: first.identity,
-		state,
-		journal: durableTestJournal(state),
-		initialTurnState: first.turnState,
-		initialFollowUpQueueDepth: first.followUpQueueDepth,
-		initialVerificationState: first.verificationState,
-	});
-	try {
-		fixture.setNoEnvelopeWhileBusy();
-		fixture.holdNextTurn();
-		await firstHost.admit("prompt", "finish while daemon is down", "down-recovery");
-		await eventually(() => state.read().growthIntent !== undefined, "growth intent was not durable before daemon stop");
-	} finally {
-		await firstHost.dispose();
-	}
-	fixture.rotateRingDuringNextCompletion();
-	fixture.complete("down-recovery", { text: "recovered after daemon downtime" });
-
-	const restartedSupervisor = supervisor(fixture);
-	const restarted = await strictResumeMainSession({ profile, state, supervisor: restartedSupervisor });
-	const journal: Array<{ kind: string; payloadJson: string }> = [];
-	const restartedHost = createMainSessionHost({
-		supervisor: restartedSupervisor,
-		identity: restarted.identity,
-		state,
-		journal: recordingDurableJournal(state, journal),
-		initialTurnState: restarted.turnState,
-		initialFollowUpQueueDepth: restarted.followUpQueueDepth,
-		initialVerificationState: restarted.verificationState,
-		...(restarted.verificationTail === undefined ? {} : { verificationTail: restarted.verificationTail }),
-		...(restarted.growthIntent === undefined ? {} : { recoveredGrowthIntent: restarted.growthIntent }),
-	});
-	try {
-		expect(restarted.verificationState).toBe("verified");
-		expect(restarted.verificationTail).toMatchObject({ retentionGap: true, resyncCheckpoint: { generation: 1, seq: 5 } });
-		expect(restarted.recoveredGrowthIntent).toBe(true);
-		await eventually(
-			() => journal.some(event => event.kind === "assistant_message" && event.payloadJson.includes("recovered after daemon downtime")),
-			"reply finalized while down was not recovered",
-		);
-		await eventually(() => state.read().tailRingRotationCount === 1, "verification-tail ring rotation was not durably recorded");
-		expect(meta.events).toContainEqual({
-			kind: "tail_ring_rotation",
-			payloadJson: JSON.stringify({
-				prior_watermark: { revision: 2, generation: 1, seq: 0 },
-				resync_point: { revision: 4, generation: 1, seq: 5 },
-			}),
+			initialTurnState: resumed.turnState,
+			initialFollowUpQueueDepth: resumed.followUpQueueDepth,
+			initialVerificationState: resumed.verificationState,
+			...(resumed.verificationTail === undefined ? {} : { verificationTail: resumed.verificationTail }),
 		});
-		expect(journal.some(event => event.kind === "transcript_delivery_gap")).toBe(false);
-		await eventually(() => state.read().growthIntent === undefined, "recovered growth intent was not finalized after transcript delivery");
-	} finally {
-		await restartedHost.dispose();
-	}
-});
+		try {
+			fixture.holdNextTurn();
+			await host.admit(
+				"prompt",
+				"hold while an opaque assistant suffix appears",
+				"opaque-suffix",
+				undefined,
+				undefined,
+				"owner",
+			);
+			await eventually(() => state.read().growthIntent !== undefined, "held operation did not open growth intent");
+			fixture.appendTranscript({
+				type: "message",
+				role: "assistant",
+				content: [{ type: "opaque_output", value: "must not silently rebaseline" }],
+				turnId: "turn:opaque-suffix",
+			});
+			await eventually(
+				() => meta.events.some((event) => event.kind === "transcript_delivery_gap"),
+				"opaque assistant transcript suffix did not journal a delivery gap",
+			);
+			const gap = meta.events.find((event) => event.kind === "transcript_delivery_gap");
+			expect(JSON.parse(gap?.payloadJson ?? "{}")).toMatchObject({
+				reason: "transcript_delivery_unprovable",
+				unprojectable_entry_id: `${fixture.sessionId}:transcript:2`,
+				surface_id: "owner",
+			});
+			expect(state.read()).toMatchObject({
+				transcriptDeliveryGapCount: 1,
+				transcriptDeliveryProgress: { lastEntryId: `${fixture.sessionId}:transcript:2` },
+			});
+			expect(meta.events.some((event) => event.kind === "assistant_message")).toBe(false);
+		} finally {
+			await host.dispose();
+		}
+	},
+);
 
-test.serial("an admitted opaque assistant suffix surface-attributes its delivery gap instead of silently advancing", async () => {
-	const fixture = new FakeBrokerFixture();
-	fixtures.push(fixture);
-	const { meta, state, profile } = await bootstrapFixture(fixture);
-	const resumedSupervisor = supervisor(fixture);
-	const resumed = await strictResumeMainSession({ profile, state, supervisor: resumedSupervisor });
-	const host = createMainSessionHost({
-		supervisor: resumedSupervisor,
-		identity: resumed.identity,
-		state,
-		journal: {
-			journalAppend: () => undefined,
-			journalAppendAtTailCheckpoint: (kind, payloadJson, expected, checkpoint) => state.appendTailProjection(expected, checkpoint, kind, payloadJson),
-			journalAppendTranscriptProjection: (kind, payloadJson, expectedTail, checkpoint, expectedDelivery, nextDelivery) =>
-				state.appendTranscriptProjection(expectedTail, checkpoint, expectedDelivery, nextDelivery, kind, payloadJson),
-		},
-		initialTurnState: resumed.turnState,
-		initialFollowUpQueueDepth: resumed.followUpQueueDepth,
-		initialVerificationState: resumed.verificationState,
-		...(resumed.verificationTail === undefined ? {} : { verificationTail: resumed.verificationTail }),
-	});
-	try {
-		fixture.holdNextTurn();
-		await host.admit("prompt", "hold while an opaque assistant suffix appears", "opaque-suffix", undefined, undefined, "owner");
-		await eventually(() => state.read().growthIntent !== undefined, "held operation did not open growth intent");
-		fixture.appendTranscript({
-			type: "message",
-			role: "assistant",
-			content: [{ type: "opaque_output", value: "must not silently rebaseline" }],
-			turnId: "turn:opaque-suffix",
+test.serial(
+	"an unprovable transcript suffix journals a durable delivery gap instead of silently baselining",
+	async () => {
+		const fixture = new FakeBrokerFixture();
+		fixtures.push(fixture);
+		const { state, committed } = await bootstrapFixture(fixture);
+		const checkpoint = state.read().tailCheckpoint!;
+		const controlled: HostSupervisor = {
+			async discover() {
+				return {
+					identity: committed.identity,
+					transcriptEntries: [],
+					initialRingCheckpoint: checkpoint,
+					transcriptProof: "proven",
+					turnState: "idle",
+					followUpQueueDepth: 0,
+				};
+			},
+			async verify() {
+				return {
+					identity: committed.identity,
+					transcriptEntries: [],
+					initialRingCheckpoint: checkpoint,
+					transcriptProof: "proven",
+					turnState: "idle",
+					followUpQueueDepth: 0,
+				};
+			},
+			async sendPrompt() {
+				throw new Error("not used");
+			},
+			async sendSteer() {
+				throw new Error("not used");
+			},
+			async followUp() {
+				throw new Error("not used");
+			},
+			async operationStatus(opRef) {
+				return { operationRef: opRef, status: "unknown", completed: false, detail: {} };
+			},
+			async tailEvents() {
+				return {
+					identity: committed.identity,
+					transcriptEntries: [],
+					events: [],
+					terminal: true,
+					complete: true,
+					retentionGap: false,
+					checkpoint,
+				};
+			},
+			async turnState() {
+				return { turnState: "idle" as const, followUpQueueDepth: 0 };
+			},
+			async dispose() {},
+		};
+		const journal: Array<{ kind: string; payloadJson: string }> = [];
+		const host = createMainSessionHost({
+			supervisor: controlled,
+			identity: committed.identity,
+			state,
+			journal: recordingDurableJournal(state, journal),
 		});
-		await eventually(
-			() => meta.events.some(event => event.kind === "transcript_delivery_gap"),
-			"opaque assistant transcript suffix did not journal a delivery gap",
-		);
-		const gap = meta.events.find(event => event.kind === "transcript_delivery_gap");
-		expect(JSON.parse(gap?.payloadJson ?? "{}")).toMatchObject({
-			reason: "transcript_delivery_unprovable",
-			unprojectable_entry_id: `${fixture.sessionId}:transcript:2`,
-			surface_id: "owner",
-		});
-		expect(state.read()).toMatchObject({ transcriptDeliveryGapCount: 1, transcriptDeliveryProgress: { lastEntryId: `${fixture.sessionId}:transcript:2` } });
-		expect(meta.events.some(event => event.kind === "assistant_message")).toBe(false);
-	} finally {
-		await host.dispose();
-	}
-});
-
-test.serial("an unprovable transcript suffix journals a durable delivery gap instead of silently baselining", async () => {
-	const fixture = new FakeBrokerFixture();
-	fixtures.push(fixture);
-	const { state, committed } = await bootstrapFixture(fixture);
-	const checkpoint = state.read().tailCheckpoint!;
-	const controlled: HostSupervisor = {
-		async discover() {
-			return { identity: committed.identity, transcriptEntries: [], initialRingCheckpoint: checkpoint, transcriptProof: "proven", turnState: "idle", followUpQueueDepth: 0 };
-		},
-		async verify() {
-			return { identity: committed.identity, transcriptEntries: [], initialRingCheckpoint: checkpoint, transcriptProof: "proven", turnState: "idle", followUpQueueDepth: 0 };
-		},
-		async sendPrompt() {
-			throw new Error("not used");
-		},
-		async sendSteer() {
-			throw new Error("not used");
-		},
-		async followUp() {
-			throw new Error("not used");
-		},
-		async operationStatus(opRef) {
-			return { operationRef: opRef, status: "unknown", completed: false, detail: {} };
-		},
-		async tailEvents() {
-			return {
-				identity: committed.identity,
-				transcriptEntries: [],
-				events: [],
-				terminal: true,
-				complete: true,
-				retentionGap: false,
-				checkpoint,
-			};
-		},
-		async turnState() {
-			return { turnState: "idle" as const, followUpQueueDepth: 0 };
-		},
-		async dispose() {},
-	};
-	const journal: Array<{ kind: string; payloadJson: string }> = [];
-	const host = createMainSessionHost({
-		supervisor: controlled,
-		identity: committed.identity,
-		state,
-		journal: recordingDurableJournal(state, journal),
-	});
-	try {
-		await eventually(
-			() => journal.some(event => event.kind === "transcript_delivery_gap"),
-			"unprovable transcript suffix did not produce a delivery-gap journal event",
-		);
-		expect(JSON.parse(journal.find(event => event.kind === "transcript_delivery_gap")?.payloadJson ?? "{}"))
-			.toMatchObject({ reason: "transcript_delivery_unprovable", delivered_through_entry_id: `${fixture.sessionId}:transcript:1` });
-		expect(state.read().transcriptDeliveryProgress).toMatchObject({ fingerprint: { entryCount: 0 } });
-	} finally {
-		await host.dispose();
-	}
-});
+		try {
+			await eventually(
+				() => journal.some((event) => event.kind === "transcript_delivery_gap"),
+				"unprovable transcript suffix did not produce a delivery-gap journal event",
+			);
+			expect(
+				JSON.parse(journal.find((event) => event.kind === "transcript_delivery_gap")?.payloadJson ?? "{}"),
+			).toMatchObject({
+				reason: "transcript_delivery_unprovable",
+				delivered_through_entry_id: `${fixture.sessionId}:transcript:1`,
+			});
+			expect(state.read().transcriptDeliveryProgress).toMatchObject({ fingerprint: { entryCount: 0 } });
+		} finally {
+			await host.dispose();
+		}
+	},
+);
 
 test.serial("a rotating external transcript window emits delivery-gap before fail-closed identity loss", async () => {
 	const fixture = new FakeBrokerFixture();
@@ -970,121 +1136,147 @@ test.serial("a rotating external transcript window emits delivery-gap before fai
 	try {
 		fixture.rotateTranscriptPast(`${fixture.sessionId}:transcript:1`);
 		await eventually(
-			() => journal.some(event => event.kind === "transcript_delivery_gap"),
+			() => journal.some((event) => event.kind === "transcript_delivery_gap"),
 			"rotating transcript window did not emit a delivery gap",
 		);
 		await expect(host.waitForFatalFailure()).resolves.toMatchObject({ reason: "main_identity_mismatch" });
-		expect(state.read()).toMatchObject({ bootstrapState: "FAILED_CLOSED", failedClosedReason: "main_identity_mismatch" });
-	} finally {
-		await host.dispose();
-	}
-});
-
-test.serial("a recovered busy growth window remains open across restart until terminal transcript delivery", async () => {
-	const fixture = new FakeBrokerFixture();
-	fixtures.push(fixture);
-	const { state, profile } = await bootstrapFixture(fixture);
-	const firstSupervisor = supervisor(fixture);
-	const first = await strictResumeMainSession({ profile, state, supervisor: firstSupervisor });
-	const firstHost = createMainSessionHost({
-		supervisor: firstSupervisor,
-		identity: first.identity,
-		state,
-		journal: durableTestJournal(state),
-		initialTurnState: first.turnState,
-		initialFollowUpQueueDepth: first.followUpQueueDepth,
-		initialVerificationState: first.verificationState,
-	});
-	try {
-		fixture.setNoEnvelopeWhileBusy();
-		fixture.holdNextTurn();
-		await firstHost.admit("prompt", "stay busy across restart", "busy-restart");
-		await eventually(() => firstHost.turnState === "busy", "first host did not observe its busy operation");
-	} finally {
-		await firstHost.dispose();
-	}
-
-	const restartedSupervisor = supervisor(fixture);
-	const restarted = await strictResumeMainSession({ profile, state, supervisor: restartedSupervisor });
-	const journal: Array<{ kind: string; payloadJson: string }> = [];
-	const readinessReports: Array<{ state: string; reason: string }> = [];
-	const restartedHost = createMainSessionHost({
-		supervisor: restartedSupervisor,
-		identity: restarted.identity,
-		state,
-		journal: durableTestJournal(state, {
-			journalAppend: (kind, payloadJson) => journal.push({ kind, payloadJson }),
-			onTranscriptProjection: (kind, payloadJson) => journal.push({ kind, payloadJson }),
-			setRpcHealth: (healthState, reason) => readinessReports.push({ state: healthState, reason }),
-		}),
-		initialTurnState: restarted.turnState,
-		initialFollowUpQueueDepth: restarted.followUpQueueDepth,
-		initialVerificationState: restarted.verificationState,
-		...(restarted.growthIntent === undefined ? {} : { recoveredGrowthIntent: restarted.growthIntent }),
-	});
-	try {
-		expect(restarted.recoveredGrowthIntent).toBe(true);
-		expect(restarted.verificationState).toBe("pending");
-		expect(restartedHost.mutationReadinessReason).toBe("transcript_verification_pending");
-		await expect(restartedHost.admit("steer", "must stay fenced", "busy-restart-fenced")).rejects.toMatchObject({ reason: "transcript_verification_pending" });
-		expect(restarted.turnState).toBe("busy");
-		expect(state.read().growthIntent).toBeDefined();
-		fixture.complete("busy-restart", { text: "busy turn settled after restart" });
-		await eventually(
-			() => journal.some(event => event.kind === "assistant_message" && event.payloadJson.includes("busy turn settled after restart")),
-			"recovered busy turn did not deliver its terminal transcript",
-		);
-		await eventually(() => restartedHost.mutationReadinessReason === undefined, "restarted host did not promote its complete-tail verification");
-		expect(readinessReports).toContainEqual({ state: "running", reason: "transcript_verified" });
-		await eventually(() => state.read().growthIntent === undefined, "growth intent was not cleared after terminal delivery");
-		expect(state.read().bootstrapState).toBe("COMMITTED");
-	} finally {
-		await restartedHost.dispose();
-	}
-});
-
-test.serial("pending-proof persistence failure leaves delivery unadvanced, emits degraded health, and fails closed", async () => {
-	const fixture = new FakeBrokerFixture();
-	fixtures.push(fixture);
-	const meta = new MemoryGatewayMeta();
-	const state = new GatewayStateStore(meta);
-	const profile = fixtureProfile(fixture);
-	fixture.timeoutNextTails(2);
-	const adoption = supervisor(fixture);
-	try {
-		await bootstrapMainSession({ confirm: true, profile, state, supervisor: adoption, sessionId: fixture.sessionId });
-	} finally {
-		await adoption.dispose();
-	}
-	const resumedSupervisor = supervisor(fixture);
-	const resumed = await strictResumeMainSession({ profile, state, supervisor: resumedSupervisor });
-	const healthReports: Array<{ state: string; reason: string }> = [];
-	meta.failNextGatewayMetaTransaction();
-	const host = createMainSessionHost({
-		supervisor: resumedSupervisor,
-		identity: resumed.identity,
-		state,
-		journal: durableTestJournal(state, { setRpcHealth: (healthState, reason) => healthReports.push({ state: healthState, reason }) }),
-		initialTurnState: resumed.turnState,
-		initialFollowUpQueueDepth: resumed.followUpQueueDepth,
-		initialVerificationState: resumed.verificationState,
-	});
-	try {
-		await eventually(() => host.mutationReadinessReason === "transcript_proof_persist_failed", "pending-proof persistence failure did not fence mutations");
 		expect(state.read()).toMatchObject({
 			bootstrapState: "FAILED_CLOSED",
-			failedClosedReason: "transcript_proof_persist_failed",
-			transcriptProof: "pending",
-			transcriptDeliveryProgress: undefined,
+			failedClosedReason: "main_identity_mismatch",
 		});
-		expect(meta.events.some(event => event.kind === "transcript_delivery_gap")).toBe(false);
-		expect(healthReports).toContainEqual({ state: "degraded", reason: "transcript_proof_persist_failed" });
-		expect(fixture.commands()).toEqual([]);
-		expect(fixture.admissionAttempts()).toEqual([]);
 	} finally {
 		await host.dispose();
 	}
 });
+
+test.serial(
+	"a recovered busy growth window remains open across restart until terminal transcript delivery",
+	async () => {
+		const fixture = new FakeBrokerFixture();
+		fixtures.push(fixture);
+		const { state, profile } = await bootstrapFixture(fixture);
+		const firstSupervisor = supervisor(fixture);
+		const first = await strictResumeMainSession({ profile, state, supervisor: firstSupervisor });
+		const firstHost = createMainSessionHost({
+			supervisor: firstSupervisor,
+			identity: first.identity,
+			state,
+			journal: durableTestJournal(state),
+			initialTurnState: first.turnState,
+			initialFollowUpQueueDepth: first.followUpQueueDepth,
+			initialVerificationState: first.verificationState,
+		});
+		try {
+			fixture.setNoEnvelopeWhileBusy();
+			fixture.holdNextTurn();
+			await firstHost.admit("prompt", "stay busy across restart", "busy-restart");
+			await eventually(() => firstHost.turnState === "busy", "first host did not observe its busy operation");
+		} finally {
+			await firstHost.dispose();
+		}
+
+		const restartedSupervisor = supervisor(fixture);
+		const restarted = await strictResumeMainSession({ profile, state, supervisor: restartedSupervisor });
+		const journal: Array<{ kind: string; payloadJson: string }> = [];
+		const readinessReports: Array<{ state: string; reason: string }> = [];
+		const restartedHost = createMainSessionHost({
+			supervisor: restartedSupervisor,
+			identity: restarted.identity,
+			state,
+			journal: durableTestJournal(state, {
+				journalAppend: (kind, payloadJson) => journal.push({ kind, payloadJson }),
+				onTranscriptProjection: (kind, payloadJson) => journal.push({ kind, payloadJson }),
+				setRpcHealth: (healthState, reason) => readinessReports.push({ state: healthState, reason }),
+			}),
+			initialTurnState: restarted.turnState,
+			initialFollowUpQueueDepth: restarted.followUpQueueDepth,
+			initialVerificationState: restarted.verificationState,
+			...(restarted.growthIntent === undefined ? {} : { recoveredGrowthIntent: restarted.growthIntent }),
+		});
+		try {
+			expect(restarted.recoveredGrowthIntent).toBe(true);
+			expect(restarted.verificationState).toBe("pending");
+			expect(restartedHost.mutationReadinessReason).toBe("transcript_verification_pending");
+			await expect(restartedHost.admit("steer", "must stay fenced", "busy-restart-fenced")).rejects.toMatchObject({
+				reason: "transcript_verification_pending",
+			});
+			expect(restarted.turnState).toBe("busy");
+			expect(state.read().growthIntent).toBeDefined();
+			fixture.complete("busy-restart", { text: "busy turn settled after restart" });
+			await eventually(
+				() =>
+					journal.some(
+						(event) =>
+							event.kind === "assistant_message" && event.payloadJson.includes("busy turn settled after restart"),
+					),
+				"recovered busy turn did not deliver its terminal transcript",
+			);
+			await eventually(
+				() => restartedHost.mutationReadinessReason === undefined,
+				"restarted host did not promote its complete-tail verification",
+			);
+			expect(readinessReports).toContainEqual({ state: "running", reason: "transcript_verified" });
+			await eventually(
+				() => state.read().growthIntent === undefined,
+				"growth intent was not cleared after terminal delivery",
+			);
+			expect(state.read().bootstrapState).toBe("COMMITTED");
+		} finally {
+			await restartedHost.dispose();
+		}
+	},
+);
+
+test.serial(
+	"pending-proof persistence failure leaves delivery unadvanced, emits degraded health, and fails closed",
+	async () => {
+		const fixture = new FakeBrokerFixture();
+		fixtures.push(fixture);
+		const meta = new MemoryGatewayMeta();
+		const state = new GatewayStateStore(meta);
+		const profile = fixtureProfile(fixture);
+		fixture.timeoutNextTails(2);
+		const adoption = supervisor(fixture);
+		try {
+			await bootstrapMainSession({ confirm: true, profile, state, supervisor: adoption, sessionId: fixture.sessionId });
+		} finally {
+			await adoption.dispose();
+		}
+		const resumedSupervisor = supervisor(fixture);
+		const resumed = await strictResumeMainSession({ profile, state, supervisor: resumedSupervisor });
+		const healthReports: Array<{ state: string; reason: string }> = [];
+		meta.failNextGatewayMetaTransaction();
+		const host = createMainSessionHost({
+			supervisor: resumedSupervisor,
+			identity: resumed.identity,
+			state,
+			journal: durableTestJournal(state, {
+				setRpcHealth: (healthState, reason) => healthReports.push({ state: healthState, reason }),
+			}),
+			initialTurnState: resumed.turnState,
+			initialFollowUpQueueDepth: resumed.followUpQueueDepth,
+			initialVerificationState: resumed.verificationState,
+		});
+		try {
+			await eventually(
+				() => host.mutationReadinessReason === "transcript_proof_persist_failed",
+				"pending-proof persistence failure did not fence mutations",
+			);
+			expect(state.read()).toMatchObject({
+				bootstrapState: "FAILED_CLOSED",
+				failedClosedReason: "transcript_proof_persist_failed",
+				transcriptProof: "pending",
+				transcriptDeliveryProgress: undefined,
+			});
+			expect(meta.events.some((event) => event.kind === "transcript_delivery_gap")).toBe(false);
+			expect(healthReports).toContainEqual({ state: "degraded", reason: "transcript_proof_persist_failed" });
+			expect(fixture.commands()).toEqual([]);
+			expect(fixture.admissionAttempts()).toEqual([]);
+		} finally {
+			await host.dispose();
+		}
+	},
+);
 
 test.serial("a retention gap without a resync checkpoint fails closed without advancing delivery", async () => {
 	const fixture = new FakeBrokerFixture();
@@ -1095,10 +1287,24 @@ test.serial("a retention gap without a resync checkpoint fails closed without ad
 	let sends = 0;
 	const controlled: HostSupervisor = {
 		async discover() {
-			return { identity: committed.identity, transcriptEntries: [], initialRingCheckpoint: checkpoint, transcriptProof: "proven", turnState: "idle" as const, followUpQueueDepth: 0 };
+			return {
+				identity: committed.identity,
+				transcriptEntries: [],
+				initialRingCheckpoint: checkpoint,
+				transcriptProof: "proven",
+				turnState: "idle" as const,
+				followUpQueueDepth: 0,
+			};
 		},
 		async verify() {
-			return { identity: committed.identity, transcriptEntries: [], initialRingCheckpoint: checkpoint, transcriptProof: "proven", turnState: "idle" as const, followUpQueueDepth: 0 };
+			return {
+				identity: committed.identity,
+				transcriptEntries: [],
+				initialRingCheckpoint: checkpoint,
+				transcriptProof: "proven",
+				turnState: "idle" as const,
+				followUpQueueDepth: 0,
+			};
 		},
 		async sendPrompt() {
 			sends += 1;
@@ -1136,11 +1342,19 @@ test.serial("a retention gap without a resync checkpoint fails closed without ad
 		supervisor: controlled,
 		identity: committed.identity,
 		state,
-		journal: durableTestJournal(state, { setRpcHealth: (healthState, reason) => healthReports.push({ state: healthState, reason }) }),
+		journal: durableTestJournal(state, {
+			setRpcHealth: (healthState, reason) => healthReports.push({ state: healthState, reason }),
+		}),
 	});
 	try {
-		await eventually(() => host.mutationReadinessReason === "tail_resync_unavailable", "missing ring resync did not fence mutations");
-		expect(state.read()).toMatchObject({ bootstrapState: "FAILED_CLOSED", failedClosedReason: "tail_resync_unavailable" });
+		await eventually(
+			() => host.mutationReadinessReason === "tail_resync_unavailable",
+			"missing ring resync did not fence mutations",
+		);
+		expect(state.read()).toMatchObject({
+			bootstrapState: "FAILED_CLOSED",
+			failedClosedReason: "tail_resync_unavailable",
+		});
 		expect(state.read().transcriptDeliveryProgress).toEqual(deliveryBefore);
 		expect(healthReports).toContainEqual({ state: "degraded", reason: "tail_resync_unavailable" });
 		expect(sends).toBe(0);
@@ -1149,120 +1363,167 @@ test.serial("a retention gap without a resync checkpoint fails closed without ad
 	}
 });
 
-test.serial("a ring-rotation metadata write failure fences mutations without advancing the ring or delivery", async () => {
-	const fixture = new FakeBrokerFixture();
-	fixtures.push(fixture);
-	const { meta, state, committed } = await bootstrapFixture(fixture);
-	const checkpoint = state.read().tailCheckpoint!;
-	const resyncCheckpoint = { revision: checkpoint.revision + 1, generation: checkpoint.generation, seq: checkpoint.seq + 1 };
-	const deliveryBefore = state.read().transcriptDeliveryProgress;
-	let sends = 0;
-	const controlled: HostSupervisor = {
-		async discover() {
-			return { identity: committed.identity, transcriptEntries: [], initialRingCheckpoint: checkpoint, transcriptProof: "proven", turnState: "idle" as const, followUpQueueDepth: 0 };
-		},
-		async verify() {
-			return { identity: committed.identity, transcriptEntries: [], initialRingCheckpoint: checkpoint, transcriptProof: "proven", turnState: "idle" as const, followUpQueueDepth: 0 };
-		},
-		async sendPrompt() {
-			sends += 1;
-			throw new Error("not used");
-		},
-		async sendSteer() {
-			sends += 1;
-			throw new Error("not used");
-		},
-		async followUp() {
-			sends += 1;
-			throw new Error("not used");
-		},
-		async operationStatus(opRef) {
-			return { operationRef: opRef, status: "unknown", completed: false, detail: {} };
-		},
-		async tailEvents() {
-			return {
-				identity: committed.identity,
-				transcriptEntries: [],
-				events: [],
-				terminal: true,
-				complete: true,
-				retentionGap: true,
-				checkpoint: resyncCheckpoint,
-				resyncCheckpoint,
-			};
-		},
-		async turnState() {
-			return { turnState: "idle" as const, followUpQueueDepth: 0 };
-		},
-		async dispose() {},
-	};
-	const healthReports: Array<{ state: string; reason: string }> = [];
-	meta.failNextGatewayMetaTransaction();
-	const host = createMainSessionHost({
-		supervisor: controlled,
-		identity: committed.identity,
-		state,
-		journal: durableTestJournal(state, { setRpcHealth: (healthState, reason) => healthReports.push({ state: healthState, reason }) }),
-	});
-	try {
-		await eventually(() => host.mutationReadinessReason === "tail_ring_rotation_write_failed", "ring-rotation write failure did not fence mutations");
-		expect(state.read()).toMatchObject({ bootstrapState: "COMMITTED", tailCheckpoint: checkpoint, tailRingRotationCount: 0 });
-		expect(state.read().transcriptDeliveryProgress).toEqual(deliveryBefore);
-		expect(meta.events.some(event => event.kind === "tail_ring_rotation")).toBe(false);
-		expect(healthReports).toContainEqual({ state: "degraded", reason: "tail_ring_rotation_write_failed" });
-		expect(sends).toBe(0);
-	} finally {
-		await host.dispose();
-	}
-});
+test.serial(
+	"a ring-rotation metadata write failure fences mutations without advancing the ring or delivery",
+	async () => {
+		const fixture = new FakeBrokerFixture();
+		fixtures.push(fixture);
+		const { meta, state, committed } = await bootstrapFixture(fixture);
+		const checkpoint = state.read().tailCheckpoint!;
+		const resyncCheckpoint = {
+			revision: checkpoint.revision + 1,
+			generation: checkpoint.generation,
+			seq: checkpoint.seq + 1,
+		};
+		const deliveryBefore = state.read().transcriptDeliveryProgress;
+		let sends = 0;
+		const controlled: HostSupervisor = {
+			async discover() {
+				return {
+					identity: committed.identity,
+					transcriptEntries: [],
+					initialRingCheckpoint: checkpoint,
+					transcriptProof: "proven",
+					turnState: "idle" as const,
+					followUpQueueDepth: 0,
+				};
+			},
+			async verify() {
+				return {
+					identity: committed.identity,
+					transcriptEntries: [],
+					initialRingCheckpoint: checkpoint,
+					transcriptProof: "proven",
+					turnState: "idle" as const,
+					followUpQueueDepth: 0,
+				};
+			},
+			async sendPrompt() {
+				sends += 1;
+				throw new Error("not used");
+			},
+			async sendSteer() {
+				sends += 1;
+				throw new Error("not used");
+			},
+			async followUp() {
+				sends += 1;
+				throw new Error("not used");
+			},
+			async operationStatus(opRef) {
+				return { operationRef: opRef, status: "unknown", completed: false, detail: {} };
+			},
+			async tailEvents() {
+				return {
+					identity: committed.identity,
+					transcriptEntries: [],
+					events: [],
+					terminal: true,
+					complete: true,
+					retentionGap: true,
+					checkpoint: resyncCheckpoint,
+					resyncCheckpoint,
+				};
+			},
+			async turnState() {
+				return { turnState: "idle" as const, followUpQueueDepth: 0 };
+			},
+			async dispose() {},
+		};
+		const healthReports: Array<{ state: string; reason: string }> = [];
+		meta.failNextGatewayMetaTransaction();
+		const host = createMainSessionHost({
+			supervisor: controlled,
+			identity: committed.identity,
+			state,
+			journal: durableTestJournal(state, {
+				setRpcHealth: (healthState, reason) => healthReports.push({ state: healthState, reason }),
+			}),
+		});
+		try {
+			await eventually(
+				() => host.mutationReadinessReason === "tail_ring_rotation_write_failed",
+				"ring-rotation write failure did not fence mutations",
+			);
+			expect(state.read()).toMatchObject({
+				bootstrapState: "COMMITTED",
+				tailCheckpoint: checkpoint,
+				tailRingRotationCount: 0,
+			});
+			expect(state.read().transcriptDeliveryProgress).toEqual(deliveryBefore);
+			expect(meta.events.some((event) => event.kind === "tail_ring_rotation")).toBe(false);
+			expect(healthReports).toContainEqual({ state: "degraded", reason: "tail_ring_rotation_write_failed" });
+			expect(sends).toBe(0);
+		} finally {
+			await host.dispose();
+		}
+	},
+);
 
-test.serial("a failed definitive-rejection claim abandonment degrades and fences the host without a resend", async () => {
-	const fixture = new FakeBrokerFixture();
-	fixtures.push(fixture);
-	const { state, profile } = await bootstrapFixture(fixture);
-	const resumedSupervisor = supervisor(fixture);
-	const resumed = await strictResumeMainSession({ profile, state, supervisor: resumedSupervisor });
-	const deliveryBefore = state.read().transcriptDeliveryProgress;
-	const healthReports: Array<{ state: string; reason: string }> = [];
-	const host = createMainSessionHost({
-		supervisor: resumedSupervisor,
-		identity: resumed.identity,
-		state,
-		journal: durableTestJournal(state, { setRpcHealth: (healthState, reason) => healthReports.push({ state: healthState, reason }) }),
-		initialTurnState: resumed.turnState,
-		initialFollowUpQueueDepth: resumed.followUpQueueDepth,
-		initialVerificationState: resumed.verificationState,
-	});
-	let pending = false;
-	const idempotency = {
-		mainAdmissionOperationClaim() {
-			pending = true;
-			return { claimed: true };
-		},
-		mainAdmissionOperationFinalize(input: { readonly responseJson: string }) {
-			return { responseJson: input.responseJson };
-		},
-		mainAdmissionOperationRecordAttemptIds() {},
-		mainAdmissionOperationAbandon() {
-			throw new Error("scripted durable claim abandonment failure");
-		},
-		mainAdmissionOperationsPending() {
-			return pending ? [{ scope: "main.submit", key: "claim-abandon-failure", requestJson: "{}", intentJson: "{}" }] : [];
-		},
-	};
-	const submit = createMainAdmissionHandler(host, profile, idempotency);
-	try {
-		fixture.rejectNextTurn();
-		await expect(
-			submit({ text: "definitively reject then fail durable abandonment", surface_id: "owner", idempotency_key: "claim-abandon-failure" }),
-		).rejects.toMatchObject({ reason: "main_admission_claim_abandon_failed" } satisfies Partial<MainAdmissionRecoveryError>);
-		expect(host.mutationReadinessReason).toBe("main_admission_claim_abandon_failed");
-		expect(healthReports).toContainEqual({ state: "degraded", reason: "main_admission_claim_abandon_failed" });
-		expect(state.read().transcriptDeliveryProgress).toEqual(deliveryBefore);
-		expect(idempotency.mainAdmissionOperationsPending()).toHaveLength(1);
-		expect(fixture.admissionAttempts().filter(attempt => attempt.text === "definitively reject then fail durable abandonment")).toHaveLength(1);
-		expect(fixture.commands()).toEqual([]);
-	} finally {
-		await host.dispose();
-	}
-});
+test.serial(
+	"a failed definitive-rejection claim abandonment degrades and fences the host without a resend",
+	async () => {
+		const fixture = new FakeBrokerFixture();
+		fixtures.push(fixture);
+		const { state, profile } = await bootstrapFixture(fixture);
+		const resumedSupervisor = supervisor(fixture);
+		const resumed = await strictResumeMainSession({ profile, state, supervisor: resumedSupervisor });
+		const deliveryBefore = state.read().transcriptDeliveryProgress;
+		const healthReports: Array<{ state: string; reason: string }> = [];
+		const host = createMainSessionHost({
+			supervisor: resumedSupervisor,
+			identity: resumed.identity,
+			state,
+			journal: durableTestJournal(state, {
+				setRpcHealth: (healthState, reason) => healthReports.push({ state: healthState, reason }),
+			}),
+			initialTurnState: resumed.turnState,
+			initialFollowUpQueueDepth: resumed.followUpQueueDepth,
+			initialVerificationState: resumed.verificationState,
+		});
+		let pending = false;
+		const idempotency = {
+			mainAdmissionOperationClaim() {
+				pending = true;
+				return { claimed: true };
+			},
+			mainAdmissionOperationFinalize(input: { readonly responseJson: string }) {
+				return { responseJson: input.responseJson };
+			},
+			mainAdmissionOperationRecordAttemptIds() {},
+			mainAdmissionOperationAbandon() {
+				throw new Error("scripted durable claim abandonment failure");
+			},
+			mainAdmissionOperationsPending() {
+				return pending
+					? [{ scope: "main.submit", key: "claim-abandon-failure", requestJson: "{}", intentJson: "{}" }]
+					: [];
+			},
+		};
+		const { submitFromRpc: submit } = createMainAdmissionHandler(host, profile, idempotency);
+		try {
+			fixture.rejectNextTurn();
+			await expect(
+				submit({
+					text: "definitively reject then fail durable abandonment",
+					surface_id: "owner",
+					idempotency_key: "claim-abandon-failure",
+				}),
+			).rejects.toMatchObject({
+				reason: "main_admission_claim_abandon_failed",
+			} satisfies Partial<MainAdmissionRecoveryError>);
+			expect(host.mutationReadinessReason).toBe("main_admission_claim_abandon_failed");
+			expect(healthReports).toContainEqual({ state: "degraded", reason: "main_admission_claim_abandon_failed" });
+			expect(state.read().transcriptDeliveryProgress).toEqual(deliveryBefore);
+			expect(idempotency.mainAdmissionOperationsPending()).toHaveLength(1);
+			expect(
+				fixture
+					.admissionAttempts()
+					.filter((attempt) => attempt.text === "definitively reject then fail durable abandonment"),
+			).toHaveLength(1);
+			expect(fixture.commands()).toEqual([]);
+		} finally {
+			await host.dispose();
+		}
+	},
+);

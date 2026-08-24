@@ -1,0 +1,59 @@
+# The adapter has no durable local state: the gajaeway daemon owns checkpoints
+# and the journal. It waits for UDS way.health healthy/running before opening
+# Telegram ingress, and sends typing only after main.submit accepts, so any
+# verification, recovery, or failed-closed fence leaves inbound messages
+# unacknowledged rather than consuming them without delivery. The credential
+# source must be root-owned and mode 0600.
+[Unit]
+Description=Gajaeway Telegram adapter
+
+# The root-owned recovery marker below rejects every adapter activation while a
+# quarantine is being cleared, including the daemon's Wants= and restart paths.
+# The quarantine runbook removes it only after a bound receipt clears the fence.
+ConditionPathExists=!/etc/gajaeway/recovery/no-telegram-ingress
+Requires=gajaeway.service
+BindsTo=gajaeway.service
+PartOf=gajaeway.service
+After=network-online.target gajaeway.service
+Wants=network-online.target
+StartLimitIntervalSec=60s
+StartLimitBurst=3
+
+[Service]
+Type=simple
+User=gajaeway
+Group=gajaeway
+UMask=0077
+Environment=HOME=/var/lib/gajaeway
+Environment=GAJAEWAY_STATE_DIR=/var/lib/gajaeway
+Environment=GAJAEWAY_PROFILE=/etc/gajaeway/profile.toml
+# Install /etc/gajaeway/credentials/telegram-token as root:root, mode 0600.
+# %d is this unit's private credentials directory, not a secret value.
+LoadCredential=telegram-token:/etc/gajaeway/credentials/telegram-token
+Environment=GAJAEWAY_TELEGRAM_TOKEN_FILE=%d/telegram-token
+ExecStart=/usr/local/bin/gajaeway-telegram --state-dir /var/lib/gajaeway --profile /etc/gajaeway/profile.toml
+Restart=on-failure
+RestartSec=5s
+TimeoutStopSec=30s
+KillMode=mixed
+MemoryMax=512M
+TasksMax=128
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+PrivateDevices=yes
+LockPersonality=yes
+RestrictSUIDSGID=yes
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+# The adapter may connect to this UDS but owns no persistent data there.
+ReadOnlyPaths=/var/lib/gajaeway
+
+[Install]
+WantedBy=multi-user.target

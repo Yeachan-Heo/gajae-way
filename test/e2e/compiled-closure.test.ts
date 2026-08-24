@@ -1,15 +1,15 @@
+import { afterEach, expect, test } from "bun:test";
 import { createHash } from "node:crypto";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import { afterEach, expect, test } from "bun:test";
 import { BrokerCli } from "../../src/broker/cli";
-import { RpcClient } from "../../src/rpc-client";
 import { canonicalJson } from "../../src/main-session/gates";
 import { GatewayStateStore } from "../../src/main-session/state";
 import { loadWayCore } from "../../src/native-loader";
-import { ManagedProcessRegistry, type ManagedBunProcess } from "../helpers/managed-process";
+import { RpcClient } from "../../src/rpc-client";
 import { FakeBrokerFixture } from "../helpers/main-session";
+import { type ManagedBunProcess, ManagedProcessRegistry } from "../helpers/managed-process";
 
 const managedProcesses = new ManagedProcessRegistry();
 const repositoryRoot = path.resolve(import.meta.dir, "..", "..");
@@ -20,13 +20,18 @@ afterEach(async () => {
 
 function compiledWay(): string {
 	const executable = path.join(repositoryRoot, "dist", "gajaeway");
-	if (!fs.existsSync(executable)) throw new Error("The compiled closure drill requires dist/gajaeway. Run bun scripts/compile.ts before bun test.");
+	if (!fs.existsSync(executable))
+		throw new Error("The compiled closure drill requires dist/gajaeway. Run bun scripts/compile.ts before bun test.");
 	return executable;
 }
 
 async function run(command: readonly string[], cwd = repositoryRoot, env?: NodeJS.ProcessEnv): Promise<string> {
 	const child = Bun.spawn({ cmd: [...command], cwd, env, stdout: "pipe", stderr: "pipe" });
-	const [exitCode, stdout, stderr] = await Promise.all([child.exited, new Response(child.stdout).text(), new Response(child.stderr).text()]);
+	const [exitCode, stdout, stderr] = await Promise.all([
+		child.exited,
+		new Response(child.stdout).text(),
+		new Response(child.stderr).text(),
+	]);
 	if (exitCode !== 0) throw new Error(`${command.join(" ")} failed (${exitCode}): ${stderr || stdout}`);
 	return stdout;
 }
@@ -46,6 +51,7 @@ session_id = "${sessionId}"
 id = "closure-owner"
 platform = "test"
 kind = "dm"
+session_kind = "main"
 `;
 }
 
@@ -64,7 +70,9 @@ async function connectHealthy(socketPath: string): Promise<RpcClient> {
 		}
 		await Bun.sleep(25);
 	}
-	throw new Error(`compiled daemon did not become healthy${lastError instanceof Error ? `: ${lastError.message}` : ""}`);
+	throw new Error(
+		`compiled daemon did not become healthy${lastError instanceof Error ? `: ${lastError.message}` : ""}`,
+	);
 }
 
 async function connectAvailable(socketPath: string): Promise<RpcClient> {
@@ -100,7 +108,8 @@ async function waitForPendingTranscriptVerification(
 async function waitForFailedClosed(client: RpcClient): Promise<Record<string, unknown>> {
 	for (let attempt = 0; attempt < 200; attempt += 1) {
 		const health = await client.request("way.health", {}, { timeoutMs: 1_000 });
-		if ((health.result as { state?: unknown } | undefined)?.state === "failed_closed") return health.result as Record<string, unknown>;
+		if ((health.result as { state?: unknown } | undefined)?.state === "failed_closed")
+			return health.result as Record<string, unknown>;
 		await Bun.sleep(25);
 	}
 	throw new Error("compiled daemon did not become failed_closed");
@@ -156,19 +165,32 @@ test("compiled daemon adopts an external broker session and makes corpus closure
 		await run(["git", `--git-dir=${remote}`, "symbolic-ref", "HEAD", "refs/heads/main"]);
 		fs.writeFileSync(profilePath, profile(corpus, fixture.workspace, fixture.sessionId));
 
-		await run([executable, "bootstrap", "--confirm", "--state-dir", state, "--profile", profilePath], repositoryRoot, environment);
+		await run(
+			[executable, "bootstrap", "--confirm", "--state-dir", state, "--profile", profilePath],
+			repositoryRoot,
+			environment,
+		);
 		expect(fixture.commands()).toEqual([]);
 		daemon = spawnCompiledDaemon([executable, "serve", "--state-dir", state, "--profile", profilePath], environment);
 		client = await connectHealthy(socketPath);
-		expect((await client.request("way.status", {})).result).toMatchObject({ status: "healthy", main: { session_id: fixture.sessionId } });
+		expect((await client.request("way.status", {})).result).toMatchObject({
+			status: "healthy",
+			main: { session_id: fixture.sessionId },
+		});
 
 		fs.writeFileSync(path.join(corpus, "compiled-close.txt"), "closed by compiled daemon\n");
-		const params = { paths: ["compiled-close.txt"], commit_message: "compiled external closure", idempotency_key: "compiled-closure" };
+		const params = {
+			paths: ["compiled-close.txt"],
+			commit_message: "compiled external closure",
+			idempotency_key: "compiled-closure",
+		};
 		const first = await client.request("main.corpus.close", params, { timeoutMs: 10_000 });
 		expect(first.result).toMatchObject({ committed: true });
 		const replay = await client.request("main.corpus.close", params);
 		expect(replay.result).toEqual(first.result);
-		expect(await run(["git", `--git-dir=${remote}`, "show", "main:compiled-close.txt"])).toBe("closed by compiled daemon\n");
+		expect(await run(["git", `--git-dir=${remote}`, "show", "main:compiled-close.txt"])).toBe(
+			"closed by compiled daemon\n",
+		);
 		expect(fixture.commands()).toEqual([]);
 	} finally {
 		client?.close();
@@ -216,7 +238,11 @@ test("compiled daemon fences corpus closure before durable claims or Git effects
 			"external busy adoption",
 			"pending-closure-busy",
 		);
-		await run([executable, "bootstrap", "--confirm", "--state-dir", state, "--profile", profilePath], repositoryRoot, environment);
+		await run(
+			[executable, "bootstrap", "--confirm", "--state-dir", state, "--profile", profilePath],
+			repositoryRoot,
+			environment,
+		);
 		daemon = spawnCompiledDaemon([executable, "serve", "--state-dir", state, "--profile", profilePath], environment);
 		client = await connectAvailable(socketPath);
 		expect(await waitForPendingTranscriptVerification(client)).toMatchObject({
@@ -285,7 +311,11 @@ test("compiled restart defers a durable closure intent until per-boot transcript
 		await run(["git", "-C", corpus, "push", "-u", "origin", "main"]);
 		await run(["git", `--git-dir=${remote}`, "symbolic-ref", "HEAD", "refs/heads/main"]);
 		fs.writeFileSync(profilePath, profile(corpus, fixture.workspace, fixture.sessionId));
-		await run([executable, "bootstrap", "--confirm", "--state-dir", state, "--profile", profilePath], repositoryRoot, environment);
+		await run(
+			[executable, "bootstrap", "--confirm", "--state-dir", state, "--profile", profilePath],
+			repositoryRoot,
+			environment,
+		);
 
 		const core = loadWayCore().WayCore.open(state);
 		const gatewayState = new GatewayStateStore(core);
@@ -345,21 +375,18 @@ test("compiled restart defers a durable closure intent until per-boot transcript
 		expect(core.gatewayMetaRead(["gitlock_closure_operation"]).entries[0]?.value).toBe(operationJson);
 
 		fixture.complete(busyOpRef, { text: "verification tail is now complete" });
-		await eventually(
-			async () => {
-				const health = (await client!.request("way.health", {}, { timeoutMs: 1_000 })).result as Record<string, unknown> | undefined;
-				if (health?.state === "failed_closed") throw new Error(`compiled daemon failed closed during deferred closure recovery: ${JSON.stringify(health)}`);
-				return health?.status === "healthy" && health.state === "running" ? health : undefined;
-			},
-			"compiled daemon did not promote after verification",
-		);
-		await eventually(
-			async () => {
-				const content = await run(["git", `--git-dir=${remote}`, "show", "main:deferred-close.txt"]);
-				return content === "must not commit before verification\n" ? content : undefined;
-			},
-			"deferred closure did not execute after transcript verification promotion",
-		);
+		await eventually(async () => {
+			const health = (await client!.request("way.health", {}, { timeoutMs: 1_000 })).result as
+				| Record<string, unknown>
+				| undefined;
+			if (health?.state === "failed_closed")
+				throw new Error(`compiled daemon failed closed during deferred closure recovery: ${JSON.stringify(health)}`);
+			return health?.status === "healthy" && health.state === "running" ? health : undefined;
+		}, "compiled daemon did not promote after verification");
+		await eventually(async () => {
+			const content = await run(["git", `--git-dir=${remote}`, "show", "main:deferred-close.txt"]);
+			return content === "must not commit before verification\n" ? content : undefined;
+		}, "deferred closure did not execute after transcript verification promotion");
 		const replay = await client.request("main.corpus.close", closeParams, { timeoutMs: 10_000 });
 		expect(replay.result).toMatchObject({ committed: true });
 		expect(await run(["git", `--git-dir=${remote}`, "rev-list", "--count", "main"])).toBe("2\n");
@@ -390,13 +417,21 @@ test("compiled daemon failed-closed startup never disposes or rebirths the adopt
 	try {
 		fs.mkdirSync(corpus, { recursive: true });
 		fs.writeFileSync(profilePath, profile(corpus, fixture.workspace, fixture.sessionId));
-		await run([executable, "bootstrap", "--confirm", "--state-dir", state, "--profile", profilePath], repositoryRoot, environment);
+		await run(
+			[executable, "bootstrap", "--confirm", "--state-dir", state, "--profile", profilePath],
+			repositoryRoot,
+			environment,
+		);
 		daemon = spawnCompiledDaemon(
 			[executable, "serve", "--state-dir", state, "--profile", profilePath, "--fail-closed-linger-ms", "300"],
 			{ ...environment, GAJAEWAY_E2E_FAIL_BEFORE_MAIN_HOST: "1" },
 		);
 		client = await connectAvailable(path.join(state, "rpc.sock"));
-		expect(await waitForFailedClosed(client)).toMatchObject({ status: "unhealthy", state: "failed_closed", reason: "startup_failed" });
+		expect(await waitForFailedClosed(client)).toMatchObject({
+			status: "unhealthy",
+			state: "failed_closed",
+			reason: "startup_failed",
+		});
 		client.close();
 		client = undefined;
 		expect(await daemon.exited).toBe(78);

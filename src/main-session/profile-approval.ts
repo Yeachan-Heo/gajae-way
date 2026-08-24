@@ -1,7 +1,7 @@
 import * as crypto from "node:crypto";
 import type { CanonicalValue, ProjectionDiff, WayProfile } from "../profile";
 import { diffProfileProjections, profileProjectionCanonical } from "../profile";
-import { GatewayStateStore } from "./state";
+import type { GatewayStateStore } from "./state";
 
 export class ProfileApprovalError extends Error {
 	readonly reason: string;

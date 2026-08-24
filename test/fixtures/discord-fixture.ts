@@ -14,13 +14,11 @@ interface DeferredSend {
 	resolve(): void;
 }
 
-
 export class DiscordFixtureClock {
 	#now: number;
 	#nextTimerId = 1;
 	readonly #timers = new Map<number, DiscordFixtureTimer>();
 	readonly #timerErrors: Error[] = [];
-
 
 	constructor(initialNow = 0) {
 		this.#now = initialNow;
@@ -31,9 +29,6 @@ export class DiscordFixtureClock {
 	get scheduledTimerCount(): number {
 		return this.#timers.size;
 	}
-
-
-
 
 	advance(milliseconds: number): void {
 		assertDuration(milliseconds);
@@ -75,7 +70,6 @@ export class DiscordFixtureClock {
 		if (error) throw error;
 	}
 
-
 	private nextTimerBefore(deadline: number): [number, DiscordFixtureTimer] | undefined {
 		let next: [number, DiscordFixtureTimer] | undefined;
 		for (const timer of this.#timers) {
@@ -87,16 +81,16 @@ export class DiscordFixtureClock {
 
 	private runTimer(callback: () => void | Promise<void>): void {
 		try {
-			void Promise.resolve(callback()).catch(error => this.#timerErrors.push(asError(error)));
+			void Promise.resolve(callback()).catch((error) => this.#timerErrors.push(asError(error)));
 		} catch (error) {
 			this.#timerErrors.push(asError(error));
 		}
 	}
-
 }
 
 function assertDuration(milliseconds: number): void {
-	if (!Number.isSafeInteger(milliseconds) || milliseconds < 0) throw new Error("Fixture clock advance must be a non-negative safe integer.");
+	if (!Number.isSafeInteger(milliseconds) || milliseconds < 0)
+		throw new Error("Fixture clock advance must be a non-negative safe integer.");
 }
 
 export interface DiscordFixtureMessage {
@@ -161,13 +155,11 @@ export class DiscordFixture implements DiscordPlatform {
 	readonly #pendingTyping: DeferredTypingAcknowledgement[] = [];
 	readonly #pendingSends: DeferredSend[] = [];
 
-
-
 	#connected = false;
 
 	constructor(options: DiscordFixtureOptions = {}) {
 		this.#now = options.now ?? Date.now;
-		this.#sendId = options.sendId ?? (input => `discord-send-${input.ordinal}`);
+		this.#sendId = options.sendId ?? ((input) => `discord-send-${input.ordinal}`);
 	}
 
 	get pendingTypingCount(): number {
@@ -255,7 +247,6 @@ export class DiscordFixture implements DiscordPlatform {
 		pending.resolve();
 	}
 
-
 	/** Queues an inbound event until the next gateway connection without acknowledging it. */
 	queueMessage(input: DiscordFixtureMessage): void {
 		this.#queuedMessages.push(this.recordMessage(input));
@@ -286,14 +277,24 @@ export class DiscordFixture implements DiscordPlatform {
 	async send(channelId: string, text: string, nonce: string): Promise<string> {
 		if (!this.#connected) throw new Error("Discord fixture gateway is disconnected.");
 		const priorId = this.#nonceIds.get(nonce);
-		const id = priorId ?? this.#queuedSendIds.shift() ?? this.#sendId({ channelId, text, nonce, ordinal: this.sendAttempts.length + 1 });
-		const attempt: DiscordFixtureSend = { channelId, text, nonce, id, at: this.#now(), duplicate: priorId !== undefined };
+		const id =
+			priorId ??
+			this.#queuedSendIds.shift() ??
+			this.#sendId({ channelId, text, nonce, ordinal: this.sendAttempts.length + 1 });
+		const attempt: DiscordFixtureSend = {
+			channelId,
+			text,
+			nonce,
+			id,
+			at: this.#now(),
+			duplicate: priorId !== undefined,
+		};
 		this.sendAttempts.push(attempt);
 		if (priorId) return priorId;
 		this.#nonceIds.set(nonce, id);
 		if (this.#deferredSendCount > 0) {
 			this.#deferredSendCount -= 1;
-			return await new Promise<string>(resolve => {
+			return await new Promise<string>((resolve) => {
 				this.#pendingSends.push({
 					resolve: () => {
 						this.sends.push(attempt);
@@ -305,7 +306,6 @@ export class DiscordFixture implements DiscordPlatform {
 		this.sends.push(attempt);
 		return id;
 	}
-
 
 	async ackTyping(channelId: string): Promise<void> {
 		if (!this.#connected) throw new Error("Discord fixture gateway is disconnected.");
@@ -327,7 +327,6 @@ export class DiscordFixture implements DiscordPlatform {
 		}
 		this.acknowledgements.push(acknowledgement);
 	}
-
 
 	async react(channelId: string, messageId: string, emoji: string): Promise<void> {
 		if (!this.#connected) throw new Error("Discord fixture gateway is disconnected.");

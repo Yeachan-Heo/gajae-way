@@ -6,18 +6,19 @@ import { bootstrapMainSession } from "../../src/main-session/bootstrap";
 import { createMainGateAnswerHandler } from "../../src/main-session/gates";
 import {
 	createMainSessionHost,
-	parseMainSessionAdmissionAttributions,
 	type MainSessionHost,
 	type MainSessionJournal,
+	parseMainSessionAdmissionAttributions,
 } from "../../src/main-session/host";
 import { strictResumeMainSession } from "../../src/main-session/resume";
+import { createScheduler } from "../../src/main-session/scheduler";
 import { GatewayStateStore } from "../../src/main-session/state";
 import { createExternalHostSupervisor, type ExternalHostSupervisor } from "../../src/main-session/supervisor";
 import { loadWayCore, type WayCoreHandle } from "../../src/native-loader";
 import { loadWayProfile, type OwnerSurface, type WayProfile } from "../../src/profile";
 import { createRpcBridge, RpcBridgeException, type RpcBridgeHandler } from "../../src/rpc-bridge";
-import { RpcClient } from "./rpc-client";
 import { FakeBrokerFixture } from "./main-session";
+import { RpcClient } from "./rpc-client";
 
 export interface ExternalGatewaySurface {
 	readonly id: string;
@@ -59,10 +60,11 @@ function profileToml(
 ): string {
 	const known = knownSurfaces
 		.map(
-			surface => `\n[[surfaces.known]]\nid = "${surface.id}"\nplatform = "${surface.platform}"\nkind = "${surface.kind}"\n`,
+			(surface) =>
+				`\n[[surfaces.known]]\nid = "${surface.id}"\nplatform = "${surface.platform}"\nkind = "${surface.kind}"\nsession_kind = "conversation"\n`,
 		)
 		.join("");
-	return `[corpus]\npath = "${path.join(fixture.root, "corpus")}"\nworkspace = "${fixture.workspace}"\n\n[injection]\nfiles = []\n\n[main_session]\nsession_id = "${fixture.sessionId}"\n\n[surfaces.owner]\nid = "${ownerSurface.id}"\nplatform = "${ownerSurface.platform}"\nkind = "${ownerSurface.kind}"\n${known}`;
+	return `[corpus]\npath = "${path.join(fixture.root, "corpus")}"\nworkspace = "${fixture.workspace}"\n\n[injection]\nfiles = []\n\n[main_session]\nsession_id = "${fixture.sessionId}"\n\n[surfaces.owner]\nid = "${ownerSurface.id}"\nplatform = "${ownerSurface.platform}"\nkind = "${ownerSurface.kind}"\nsession_kind = "main"\n${known}`;
 }
 
 export async function connectEventually(socketPath: string): Promise<RpcClient> {
@@ -102,11 +104,11 @@ export async function createExternalGateway(options: ExternalGatewayOptions = {}
 	const stateDirectory = path.join(fixture.root, "state");
 	const core = loadWayCore().WayCore.open(stateDirectory);
 	core.registryConfigureSurfaces(
-		profile.knownSurfaces.map(surface => ({
+		profile.knownSurfaces.map((surface) => ({
 			surfaceId: surface.id,
 			platform: surface.platform,
 			kind: surface.kind,
-			isOwnerSurface: profile.ownerSurfaces.some(owner => owner.id === surface.id),
+			isOwnerSurface: profile.ownerSurfaces.some((owner) => owner.id === surface.id),
 		})),
 	);
 	const state = new GatewayStateStore(core);
@@ -119,20 +121,26 @@ export async function createExternalGateway(options: ExternalGatewayOptions = {}
 	});
 	await bootstrapMainSession({ confirm: true, profile, state, supervisor, sessionId: fixture.sessionId });
 	const resumed = await strictResumeMainSession({ profile, state, supervisor });
-	const journal: MainSessionJournal =
-		options.journal ??
-		{
-			journalAppend: (kind, payloadJson) => core.journalAppend(kind, payloadJson),
-			journalAppendAtTailCheckpoint: (kind, payloadJson, expected, checkpoint) => {
-				state.appendTailProjection(expected, checkpoint, kind, payloadJson);
-			},
-			journalAppendTranscriptProjection: (kind, payloadJson, expectedTail, checkpoint, expectedDelivery, nextDelivery) => {
-				state.appendTranscriptProjection(expectedTail, checkpoint, expectedDelivery, nextDelivery, kind, payloadJson);
-			},
-			setRpcHealth: (healthState, reason) => core.setRpcHealth(healthState, reason),
-			setMainSessionStatus: (turnState, followUpQueueDepth, verificationState) => core.setMainSessionStatus(turnState, followUpQueueDepth, verificationState),
-			setJournalDegraded: degraded => core.setJournalDegraded(degraded),
-		};
+	const journal: MainSessionJournal = options.journal ?? {
+		journalAppend: (kind, payloadJson) => core.journalAppend(kind, payloadJson),
+		journalAppendAtTailCheckpoint: (kind, payloadJson, expected, checkpoint) => {
+			state.appendTailProjection(expected, checkpoint, kind, payloadJson);
+		},
+		journalAppendTranscriptProjection: (
+			kind,
+			payloadJson,
+			expectedTail,
+			checkpoint,
+			expectedDelivery,
+			nextDelivery,
+		) => {
+			state.appendTranscriptProjection(expectedTail, checkpoint, expectedDelivery, nextDelivery, kind, payloadJson);
+		},
+		setRpcHealth: (healthState, reason) => core.setRpcHealth(healthState, reason),
+		setMainSessionStatus: (turnState, followUpQueueDepth, verificationState) =>
+			core.setMainSessionStatus(turnState, followUpQueueDepth, verificationState),
+		setJournalDegraded: (degraded) => core.setJournalDegraded(degraded),
+	};
 
 	const host = createMainSessionHost({
 		supervisor,
@@ -146,14 +154,25 @@ export async function createExternalGateway(options: ExternalGatewayOptions = {}
 		...(resumed.growthIntent === undefined ? {} : { recoveredGrowthIntent: resumed.growthIntent }),
 		initialAdmissionAttributions: parseMainSessionAdmissionAttributions(core.mainAdmissionAttributions()),
 	});
-	const submit = createMainAdmissionHandler(host, profile, core, {
+	const { submitFromRpc: submit, admitSystemEvent } = createMainAdmissionHandler(host, profile, core, {
 		newOpRef: options.newOpRef,
 		isSurfaceQuarantined: options.isSurfaceQuarantined,
 		afterBrokerAcceptedBeforeFinalize: options.afterBrokerAcceptedBeforeFinalize,
 		mutationReadinessReason: () => host.mutationReadinessReason,
 	});
 	const answer = createMainGateAnswerHandler(host, core);
+	// Mirrors the daemon's routing so harness-backed tests exercise the same
+	// bridge surface, including the schedule family.
+	const scheduler = createScheduler({
+		core,
+		profile,
+		admitSystemEvent,
+		submitFromRpc: submit,
+		turnState: () => host.turnState,
+		mutationReadinessReason: () => host.mutationReadinessReason,
+	});
 	const handler: RpcBridgeHandler = async (method, params) => {
+		if (method.startsWith("schedule.")) return await scheduler.handleRpc(method, params);
 		if (method === "main.submit") return await submit(params);
 		if (method === "main.gate.answer") return await answer(params);
 		throw new RpcBridgeException(-32601, `method not found: ${method}`);

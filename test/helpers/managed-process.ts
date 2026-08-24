@@ -1,4 +1,4 @@
-import { spawn, type ChildProcess, type SpawnOptions } from "node:child_process";
+import { type ChildProcess, type SpawnOptions, spawn } from "node:child_process";
 
 export type ManagedBunProcess = Bun.Subprocess<"ignore", "ignore", "pipe">;
 type TrackedBunProcess = ReturnType<typeof Bun.spawn>;

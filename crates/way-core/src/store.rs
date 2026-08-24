@@ -14,7 +14,7 @@ use std::{
 use rusqlite::{Connection, OptionalExtension, Transaction};
 
 pub const DATABASE_FILENAME: &str = "way-core.sqlite3";
-pub const SCHEMA_VERSION: u32 = 9;
+pub const SCHEMA_VERSION: u32 = 10;
 pub const IDEMPOTENCY_WINDOW_MS: i64 = 24 * 60 * 60 * 1_000;
 pub const CLOSURE_OPERATION_META_KEY: &str = "gitlock_closure_operation";
 
@@ -134,7 +134,29 @@ pub struct PendingMainAdmissionOperation {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MainAdmissionAttribution {
     pub attempt_ids_json: String,
-    pub surface_id: String,
+    pub surface_id: Option<String>,
+    pub origin: Option<String>,
+}
+
+/// Durable attribution target for one main admission. Exactly one variant is
+/// recorded per admission: an operator-facing surface, or the in-process
+/// scheduler origin. There is no sentinel surface id for scheduler work.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MainAdmissionAttributionTarget {
+    Surface(String),
+    SchedulerOrigin,
+}
+
+/// Canonical `origin` column value for scheduler-originated admissions.
+pub const SCHEDULER_ORIGIN: &str = "scheduler";
+
+impl MainAdmissionAttributionTarget {
+    fn columns(&self) -> (Option<&str>, Option<&str>) {
+        match self {
+            Self::Surface(surface_id) => (Some(surface_id.as_str()), None),
+            Self::SchedulerOrigin => (None, Some(SCHEDULER_ORIGIN)),
+        }
+    }
 }
 
 struct StoreInner {
@@ -482,23 +504,32 @@ impl Store {
                 )?;
             }
         }
-        let surface_id = main_admission_surface_id(request_json)?;
+        let target = main_admission_attribution_target(request_json)?;
+        let (target_surface_id, target_origin) = target.columns();
         let existing_attribution = transaction
             .query_row(
-                "SELECT attempt_ids_json, surface_id FROM main_admission_attributions WHERE scope = ?1 AND idempotency_key = ?2",
+                "SELECT attempt_ids_json, surface_id, origin FROM main_admission_attributions WHERE scope = ?1 AND idempotency_key = ?2",
                 rusqlite::params![scope, key],
-                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, Option<String>>(1)?,
+                        row.get::<_, Option<String>>(2)?,
+                    ))
+                },
             )
             .optional()?;
         match existing_attribution {
-            Some((existing_attempt_ids, existing_surface_id))
-                if existing_attempt_ids == attempt_ids_json && existing_surface_id == surface_id => {}
+            Some((existing_attempt_ids, existing_surface_id, existing_origin))
+                if existing_attempt_ids == attempt_ids_json
+                    && existing_surface_id.as_deref() == target_surface_id
+                    && existing_origin.as_deref() == target_origin => {}
             Some(_) => return Err(StoreError::MainAdmissionOperationChanged),
             None => {
                 transaction.execute(
-                    "INSERT INTO main_admission_attributions(scope, idempotency_key, attempt_ids_json, surface_id)
-                     VALUES (?1, ?2, ?3, ?4)",
-                    rusqlite::params![scope, key, attempt_ids_json, surface_id],
+                    "INSERT INTO main_admission_attributions(scope, idempotency_key, attempt_ids_json, surface_id, origin)
+                     VALUES (?1, ?2, ?3, ?4, ?5)",
+                    rusqlite::params![scope, key, attempt_ids_json, target_surface_id, target_origin],
                 )?;
             }
         }
@@ -644,7 +675,7 @@ impl Store {
     pub fn main_admission_attributions(&self, now_ms: i64) -> StoreResult<Vec<MainAdmissionAttribution>> {
         let connection = self.connection()?;
         let mut statement = connection.prepare(
-            "SELECT attribution.attempt_ids_json, attribution.surface_id
+            "SELECT attribution.attempt_ids_json, attribution.surface_id, attribution.origin
              FROM main_admission_attributions AS attribution
              INNER JOIN idempotency
                ON idempotency.scope = attribution.scope
@@ -656,22 +687,42 @@ impl Store {
             Ok(MainAdmissionAttribution {
                 attempt_ids_json: row.get(0)?,
                 surface_id: row.get(1)?,
+                origin: row.get(2)?,
             })
         })?;
         rows.collect::<Result<Vec<_>, _>>().map_err(StoreError::from)
     }
 }
 
-fn main_admission_surface_id(request_json: &str) -> StoreResult<String> {
+/// Derives the durable attribution target from a canonical admission request.
+///
+/// Exactly one of `surface_id` or `origin` must be present. Both present or
+/// neither present is invalid metadata rather than a silent default, so a
+/// hand-edited or truncated row can never be attributed to the wrong actor.
+fn main_admission_attribution_target(request_json: &str) -> StoreResult<MainAdmissionAttributionTarget> {
     let request: serde_json::Value = serde_json::from_str(request_json)
         .map_err(|_| StoreError::InvalidMetadata("main admission request_json is not JSON".to_owned()))?;
-    let surface_id = request
+    let object = request
         .as_object()
-        .and_then(|object| object.get("surface_id"))
+        .ok_or_else(|| StoreError::InvalidMetadata("main admission request_json is not an object".to_owned()))?;
+    let surface_id = object
+        .get("surface_id")
         .and_then(serde_json::Value::as_str)
-        .filter(|surface_id| !surface_id.trim().is_empty())
-        .ok_or_else(|| StoreError::InvalidMetadata("main admission request_json has no surface_id".to_owned()))?;
-    Ok(surface_id.to_owned())
+        .filter(|surface_id| !surface_id.trim().is_empty());
+    let origin = object.get("origin").and_then(serde_json::Value::as_str);
+    match (surface_id, origin) {
+        (Some(_), Some(_)) => Err(StoreError::InvalidMetadata(
+            "main admission request_json declares both surface_id and origin".to_owned(),
+        )),
+        (Some(surface_id), None) => Ok(MainAdmissionAttributionTarget::Surface(surface_id.to_owned())),
+        (None, Some(SCHEDULER_ORIGIN)) => Ok(MainAdmissionAttributionTarget::SchedulerOrigin),
+        (None, Some(_)) => Err(StoreError::InvalidMetadata(
+            "main admission request_json has an unsupported origin".to_owned(),
+        )),
+        (None, None) => Err(StoreError::InvalidMetadata(
+            "main admission request_json has neither surface_id nor origin".to_owned(),
+        )),
+    }
 }
 
 fn expire_idempotency_tx(transaction: &Transaction<'_>, now_ms: i64) -> StoreResult<()> {
@@ -1006,6 +1057,74 @@ fn migrate(connection: &mut Connection) -> StoreResult<()> {
         transaction.commit()?;
     }
 
+    if current_version < 10 {
+        let transaction = connection.transaction()?;
+        // Idempotent like every earlier block: `migrate` may run against a
+        // database whose tables already exist but whose recorded version is
+        // stale, so DDL here must never assume a clean slate.
+        transaction.execute_batch("DROP TABLE IF EXISTS main_admission_attributions_v10;")?;
+        let attributions_have_origin = transaction
+            .prepare("SELECT 1 FROM pragma_table_info('main_admission_attributions') WHERE name = 'origin'")?
+            .exists([])?;
+        if !attributions_have_origin {
+            // SQLite cannot drop a NOT NULL constraint in place, so the
+            // scheduler-origin attribution shape requires a table rebuild.
+            transaction.execute_batch(
+                "CREATE TABLE main_admission_attributions_v10 (
+                    scope TEXT NOT NULL,
+                    idempotency_key TEXT NOT NULL,
+                    attempt_ids_json TEXT NOT NULL,
+                    surface_id TEXT,
+                    origin TEXT,
+                    PRIMARY KEY (scope, idempotency_key),
+                    FOREIGN KEY (scope, idempotency_key) REFERENCES idempotency(scope, idempotency_key),
+                    CHECK ((surface_id IS NOT NULL AND origin IS NULL) OR (surface_id IS NULL AND origin = 'scheduler'))
+                );
+                 INSERT INTO main_admission_attributions_v10(scope, idempotency_key, attempt_ids_json, surface_id, origin)
+                     SELECT scope, idempotency_key, attempt_ids_json, surface_id, NULL FROM main_admission_attributions;
+                 DROP TABLE main_admission_attributions;
+                 ALTER TABLE main_admission_attributions_v10 RENAME TO main_admission_attributions;",
+            )?;
+        }
+        transaction.execute_batch(
+            "CREATE TABLE IF NOT EXISTS schedule_jobs (
+                job_id TEXT PRIMARY KEY NOT NULL,
+                name TEXT NOT NULL UNIQUE,
+                kind TEXT NOT NULL CHECK (kind IN ('at','every','cron')),
+                spec TEXT NOT NULL,
+                timezone TEXT NOT NULL,
+                payload_kind TEXT NOT NULL CHECK (payload_kind IN ('system_event','submit')),
+                payload_json TEXT NOT NULL,
+                surface_id TEXT,
+                state TEXT NOT NULL CHECK (state IN ('active','backoff','suspended','completed')),
+                next_fire_at_ms INTEGER,
+                backoff_until_ms INTEGER,
+                failure_count INTEGER NOT NULL DEFAULT 0,
+                max_consecutive_failures INTEGER NOT NULL,
+                created_at INTEGER NOT NULL,
+                updated_at INTEGER NOT NULL,
+                CHECK ((payload_kind = 'submit' AND surface_id IS NOT NULL) OR (payload_kind = 'system_event' AND surface_id IS NULL))
+            );
+             CREATE INDEX IF NOT EXISTS schedule_jobs_due_idx ON schedule_jobs(state, next_fire_at_ms);
+             CREATE TABLE IF NOT EXISTS schedule_runs (
+                run_id TEXT PRIMARY KEY NOT NULL,
+                job_id TEXT NOT NULL REFERENCES schedule_jobs(job_id) ON DELETE CASCADE,
+                trigger TEXT NOT NULL CHECK (trigger IN ('timer','manual','overdue')),
+                scheduled_for_ms INTEGER NOT NULL,
+                claimed_at INTEGER NOT NULL,
+                finished_at INTEGER,
+                attempt INTEGER NOT NULL,
+                outcome TEXT,
+                missed_count INTEGER NOT NULL DEFAULT 0,
+                op_ref TEXT,
+                detail_json TEXT
+            );
+             CREATE INDEX IF NOT EXISTS schedule_runs_job_idx ON schedule_runs(job_id, claimed_at DESC);",
+        )?;
+        meta_set_tx(&transaction, "schema_version", "10")?;
+        transaction.commit()?;
+    }
+
 
     let defaults = [
         ("bootstrap_state", "ABSENT"),
@@ -1019,6 +1138,9 @@ fn migrate(connection: &mut Connection) -> StoreResult<()> {
         ("profile_approved_at", "null"),
         ("profile_approval_receipt", "null"),
         ("failed_closed_reason", "null"),
+        ("failed_closed_since_ms", "null"),
+        ("alert_failed_closed", "clear"),
+        ("alert_lock_quarantined", "clear"),
         ("tail_checkpoint", "null"),
         ("transcript_delivery_progress", "null"),
         ("tail_ring_rotation_count", "0"),
@@ -1560,7 +1682,8 @@ mod tests {
             store.main_admission_attributions(103).unwrap(),
             vec![super::MainAdmissionAttribution {
                 attempt_ids_json: attempt_ids.to_owned(),
-                surface_id: "owner".to_owned(),
+                surface_id: Some("owner".to_owned()),
+                origin: None,
             }]
         );
     }

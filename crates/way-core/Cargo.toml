@@ -12,6 +12,14 @@ crate-type = ["cdylib"]
 napi = { version = "3", features = ["napi10", "tokio_rt"] }
 napi-derive = "3"
 libc = "0.2"
+# fts5 backs the memory recall index; redaction is a SQL predicate inside the
+# FTS join, so the extension is load-bearing rather than optional.
+# FTS5 backs the memory recall index, where redaction is a SQL predicate inside
+# the FTS join. rusqlite 0.37 exposes no 'fts5' Cargo feature (that name is for
+# custom tokenizers in other versions); FTS5 ships compiled into the 'bundled'
+# SQLite build. memory::tests::fts5_is_available_in_this_build asserts that, so a
+# dependency change that drops it fails loudly instead of silently disabling
+# in-query redaction.
 rusqlite = { version = "0.37", features = ["bundled"] }
 serde_json = "1"
 tokio = { version = "1", features = ["io-util", "macros", "net", "rt-multi-thread", "sync", "time"] }

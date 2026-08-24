@@ -23,10 +23,25 @@ lane = ["MEMORY.md"]
 job = ["MEMORY.md"]
 unknown = ["MEMORY.md"]
 
+# `kind` is the free-form platform kind and is NEVER consulted for redaction.
+# `session_kind` is the declared, digest-bound redaction class and selects the
+# [restricted_files] deny list applied to this surface. It is required on every
+# declared surface; there is no inferred default, because a wrong default would
+# hand a surface the wrong deny list. An owner surface must declare "main".
 [surfaces.owner]
 id = "discord:owner-dm"
 platform = "discord"
 kind = "dm"
+session_kind = "main"
+
+# Non-owner routes are declared here. Membership is digest-bound: adding an
+# entry changes the profile digest and requires `gajaeway profile approve`
+# before the gateway will accept traffic from it.
+# [[surfaces.known]]
+# id = "discord:team-channel"
+# platform = "discord"
+# kind = "channel"
+# session_kind = "conversation"
 
 [operator]
 # Any fields here are canonicalized into the digest-bound operator identity.
@@ -36,6 +51,23 @@ display_name = "Gaebal Gajae operator"
 # Everything below is mutable tuning, excluded from the resume identity digest.
 [tunables]
 log_level = "info"
+
+# `gajaeway mcp serve` exposes read-mostly gateway state as MCP tools over
+# stdio. The single write tool `main_submit` is absent from tools/list unless
+# write_enabled is true; it grants no authority the operator UID lacks, since it
+# traverses the same main.submit admission path behind the same UDS
+# peer-credential gate.
+[tunables.mcp]
+write_enabled = false
+
+[tunables.metrics]
+# Unauthenticated loopback Prometheus endpoint. Disabled by default: while it is
+# enabled, any local process of any user can scrape gateway telemetry. Read the
+# exposure section in ops/runbooks/operations.md before turning it on, and keep
+# it off on multi-tenant or shared-login hosts. Enabling it changes no profile
+# digest, so there is no `profile approve` receipt for this decision.
+http_enabled = false
+port = 9465
 
 [poll]
 interval_ms = 15000

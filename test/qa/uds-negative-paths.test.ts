@@ -1,8 +1,8 @@
-import * as fs from "node:fs";
-import * as os from "node:os";
-import { createConnection } from "node:net";
-import * as path from "node:path";
 import { expect, test } from "bun:test";
+import * as fs from "node:fs";
+import { createConnection } from "node:net";
+import * as os from "node:os";
+import * as path from "node:path";
 import { BrokerCli } from "../../src/broker/cli";
 import { createMainAdmissionHandler } from "../../src/main-session/admission";
 import { bootstrapMainSession } from "../../src/main-session/bootstrap";
@@ -52,13 +52,16 @@ async function rawFrameUntilServerCloses(socketPath: string, frame: Uint8Array):
 			clearTimeout(timeout);
 			callback();
 		};
-		const timeout = setTimeout(() => finish(() => reject(new Error("server did not close malformed RPC connection"))), 5_000);
-		socket.on("data", chunk => chunks.push(Buffer.from(chunk)));
+		const timeout = setTimeout(
+			() => finish(() => reject(new Error("server did not close malformed RPC connection"))),
+			5_000,
+		);
+		socket.on("data", (chunk) => chunks.push(Buffer.from(chunk)));
 		socket.once("connect", () => {
 			connected = true;
 			socket.write(frame);
 		});
-		socket.once("error", error => {
+		socket.once("error", (error) => {
 			if (!connected) finish(() => reject(error));
 		});
 		socket.once("close", () => finish(() => resolve(Buffer.concat(chunks))));
@@ -85,11 +88,13 @@ session_id = "${sessionId}"
 id = "owner"
 platform = "test"
 kind = "dm"
+session_kind = "main"
 
 [[surfaces.known]]
 id = "guest"
 platform = "test"
 kind = "channel"
+session_kind = "conversation"
 `;
 }
 
@@ -118,8 +123,13 @@ test("real UDS closes malformed frames and leaves unknown cancellation harmless"
 	let client: RpcClient | undefined;
 	try {
 		client = await connectEventually(socketPath);
-		const oversized = await rawFrameUntilServerCloses(socketPath, Buffer.concat([Buffer.alloc(1_048_577, "x"), Buffer.from("\n")]));
-		expect(JSON.parse(oversized.toString("utf8"))).toMatchObject({ error: { code: -32600, message: "payload_too_large" } });
+		const oversized = await rawFrameUntilServerCloses(
+			socketPath,
+			Buffer.concat([Buffer.alloc(1_048_577, "x"), Buffer.from("\n")]),
+		);
+		expect(JSON.parse(oversized.toString("utf8"))).toMatchObject({
+			error: { code: -32600, message: "payload_too_large" },
+		});
 		expect(await rawFrameUntilServerCloses(socketPath, Buffer.from([0xff, 0x0a]))).toHaveLength(0);
 		expect(responseError(await client.request("unknown.method", {}))).toMatchObject({ code: -32601 });
 		expect((await client.request("rpc.cancel", { id: "not-in-flight" })).result).toEqual({ cancelled: false });
@@ -158,23 +168,41 @@ test("main.submit validates its UDS contract and durable idempotency through an 
 			initialVerificationState: resumed.verificationState,
 			...(resumed.verificationTail === undefined ? {} : { verificationTail: resumed.verificationTail }),
 		});
-		const submit = createMainAdmissionHandler(host, profile, core);
-		core.startRpcServer(path.join(stateDirectory, "rpc.sock"), createRpcBridge(core, async (method, params) => {
-			if (method === "main.submit") return await submit(params);
-			throw new RpcBridgeException(-32601, `method not found: ${method}`);
-		}));
+		const { submitFromRpc: submit } = createMainAdmissionHandler(host, profile, core);
+		core.startRpcServer(
+			path.join(stateDirectory, "rpc.sock"),
+			createRpcBridge(core, async (method, params) => {
+				if (method === "main.submit") return await submit(params);
+				throw new RpcBridgeException(-32601, `method not found: ${method}`);
+			}),
+		);
 		client = await connectEventually(path.join(stateDirectory, "rpc.sock"));
-		expect(responseError(await client.request("main.submit", {
-			text: "must reject unknown fields", surface_id: "guest", idempotency_key: "qa-extra-field", unexpected: true,
-		}))).toMatchObject({ code: -32602, message: "unknown parameter: unexpected" });
+		expect(
+			responseError(
+				await client.request("main.submit", {
+					text: "must reject unknown fields",
+					surface_id: "guest",
+					idempotency_key: "qa-extra-field",
+					unexpected: true,
+				}),
+			),
+		).toMatchObject({ code: -32602, message: "unknown parameter: unexpected" });
 		const first = await client.request("main.submit", {
-			text: "qa non-owner request", surface_id: "guest", idempotency_key: "qa-main-submit-conflict",
+			text: "qa non-owner request",
+			surface_id: "guest",
+			idempotency_key: "qa-main-submit-conflict",
 		});
 		expect(first.result).toMatchObject({ accepted: true, delivered_as: "follow_up" });
 		expect(fixture.commands()).toEqual([expect.objectContaining({ operation: "turn.follow_up" })]);
-		expect(responseError(await client.request("main.submit", {
-			text: "qa changed request", surface_id: "guest", idempotency_key: "qa-main-submit-conflict",
-		}))).toMatchObject({ code: 1500, message: "idempotency_conflict" });
+		expect(
+			responseError(
+				await client.request("main.submit", {
+					text: "qa changed request",
+					surface_id: "guest",
+					idempotency_key: "qa-main-submit-conflict",
+				}),
+			),
+		).toMatchObject({ code: 1500, message: "idempotency_conflict" });
 	} finally {
 		client?.close();
 		await host?.dispose();
@@ -192,11 +220,29 @@ test("real RPC makes explicit release idempotent and refuses an expired renewal"
 	try {
 		client = await connectEventually(socketPath);
 		const releasedLease = acquireNativeLease(core, "qa-double-release", "qa-double-release");
-		expect((await client.request("gitlock.release", { lease_id: releasedLease.leaseId, idempotency_key: "qa-release-first" })).result).toMatchObject({ released: true });
-		expect((await client.request("gitlock.release", { lease_id: releasedLease.leaseId, idempotency_key: "qa-release-second" })).result).toMatchObject({ released: false });
+		expect(
+			(
+				await client.request("gitlock.release", {
+					lease_id: releasedLease.leaseId,
+					idempotency_key: "qa-release-first",
+				})
+			).result,
+		).toMatchObject({ released: true });
+		expect(
+			(
+				await client.request("gitlock.release", {
+					lease_id: releasedLease.leaseId,
+					idempotency_key: "qa-release-second",
+				})
+			).result,
+		).toMatchObject({ released: false });
 		const expiringLease = acquireNativeLease(core, "qa-expired-renew", "qa-expired-renew");
 		await Bun.sleep(5_100);
-		expect(responseError(await client.request("gitlock.renew", { lease_id: expiringLease.leaseId, idempotency_key: "qa-expired-renew" }))).toMatchObject({ code: 1202, message: "lease_expired" });
+		expect(
+			responseError(
+				await client.request("gitlock.renew", { lease_id: expiringLease.leaseId, idempotency_key: "qa-expired-renew" }),
+			),
+		).toMatchObject({ code: 1202, message: "lease_expired" });
 	} finally {
 		client?.close();
 		await stopCore(core, stateDirectory);

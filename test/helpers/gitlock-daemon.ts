@@ -1,5 +1,10 @@
 import * as fs from "node:fs";
-import { createClosureExecutor, type ClosureHookContext, type ClosureRequest, type ClosureStep } from "../../src/main-session/closure";
+import {
+	type ClosureHookContext,
+	type ClosureRequest,
+	type ClosureStep,
+	createClosureExecutor,
+} from "../../src/main-session/closure";
 import { loadWayCore } from "../../src/native-loader";
 
 interface DaemonFixture {

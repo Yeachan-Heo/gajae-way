@@ -92,7 +92,11 @@ export class BrokerCliError extends Error {
 	/** True only when the broker returned an explicit `ok:false` command envelope. */
 	readonly definitive: boolean;
 
-	constructor(code: string, message: string, options: { readonly stderr?: string; readonly cause?: unknown; readonly definitive?: boolean } = {}) {
+	constructor(
+		code: string,
+		message: string,
+		options: { readonly stderr?: string; readonly cause?: unknown; readonly definitive?: boolean } = {},
+	) {
 		super(message, options.cause === undefined ? undefined : { cause: options.cause });
 		this.name = "BrokerCliError";
 		this.code = code;
@@ -139,7 +143,10 @@ function parseJson(stdout: string, path: string): unknown {
 	try {
 		return JSON.parse(stdout) as unknown;
 	} catch (error) {
-		throw new BrokerDtoParseError(path, `stdout was not JSON (${error instanceof Error ? error.message : String(error)})`);
+		throw new BrokerDtoParseError(
+			path,
+			`stdout was not JSON (${error instanceof Error ? error.message : String(error)})`,
+		);
 	}
 }
 
@@ -172,7 +179,8 @@ function safeInteger(value: unknown, path: string, nonNegative = true): number {
 }
 
 function finiteNumber(value: unknown, path: string): number {
-	if (typeof value !== "number" || !Number.isFinite(value)) throw new BrokerDtoParseError(path, "must be a finite number");
+	if (typeof value !== "number" || !Number.isFinite(value))
+		throw new BrokerDtoParseError(path, "must be a finite number");
 	return value;
 }
 
@@ -235,21 +243,27 @@ function parseRow(value: unknown, path: string): SdkSessionRowV1 {
 		live: requiredBoolean(row.live, `${path}.live`),
 		deleted: requiredBoolean(row.deleted, `${path}.deleted`),
 		indexSeq: safeInteger(row.indexSeq, `${path}.indexSeq`),
-		...(row.hostIncarnation === undefined ? {} : { hostIncarnation: optionalString(row.hostIncarnation, `${path}.hostIncarnation`) }),
+		...(row.hostIncarnation === undefined
+			? {}
+			: { hostIncarnation: optionalString(row.hostIncarnation, `${path}.hostIncarnation`) }),
 		...(terminalUncertain === undefined ? {} : { terminalUncertain }),
 		...(row.lifecycleRequestId === undefined
 			? {}
 			: { lifecycleRequestId: optionalString(row.lifecycleRequestId, `${path}.lifecycleRequestId`) }),
-		...(row.endpointMtimeMs === undefined ? {} : { endpointMtimeMs: finiteNumber(row.endpointMtimeMs, `${path}.endpointMtimeMs`) }),
+		...(row.endpointMtimeMs === undefined
+			? {}
+			: { endpointMtimeMs: finiteNumber(row.endpointMtimeMs, `${path}.endpointMtimeMs`) }),
 		...(activity === undefined
 			? {}
 			: {
-				activity: {
-					state: activity.state as SdkSessionActivityState,
-					at: finiteNumber(activity.at, `${path}.activity.at`),
-				},
-			}),
-		...(row.lastHeartbeatAt === undefined ? {} : { lastHeartbeatAt: finiteNumber(row.lastHeartbeatAt, `${path}.lastHeartbeatAt`) }),
+					activity: {
+						state: activity.state as SdkSessionActivityState,
+						at: finiteNumber(activity.at, `${path}.activity.at`),
+					},
+				}),
+		...(row.lastHeartbeatAt === undefined
+			? {}
+			: { lastHeartbeatAt: finiteNumber(row.lastHeartbeatAt, `${path}.lastHeartbeatAt`) }),
 		...(identityProvenance === undefined ? {} : { identityProvenance }),
 		...(ambiguous === undefined ? {} : { ambiguous }),
 	};
@@ -280,7 +294,8 @@ export function parseSessionRows(stdout: string): SdkSessionRowsV1 {
 	const sessions = result.sessions.map((row, index) => parseRow(row, `$.result.sessions[${index}]`));
 	const ids = new Set<string>();
 	for (const session of sessions) {
-		if (ids.has(session.sessionId)) throw new BrokerDtoParseError("$.result.sessions", `contains duplicate sessionId ${session.sessionId}`);
+		if (ids.has(session.sessionId))
+			throw new BrokerDtoParseError("$.result.sessions", `contains duplicate sessionId ${session.sessionId}`);
 		ids.add(session.sessionId);
 	}
 	return {
@@ -298,7 +313,8 @@ export function parseSessionInspect(stdout: string, expectedSessionId: string): 
 	}
 	if (result.source !== "broker") throw new BrokerDtoParseError("$.result.source", "must be broker");
 	const session = parseRow(result.session, "$.result.session");
-	if (session.sessionId !== expectedSessionId) throw new BrokerDtoParseError("$.result.session.sessionId", `expected ${expectedSessionId}`);
+	if (session.sessionId !== expectedSessionId)
+		throw new BrokerDtoParseError("$.result.session.sessionId", `expected ${expectedSessionId}`);
 	return session;
 }
 
@@ -404,12 +420,15 @@ export function parseTailEnvelope(stdout: string, expectedSessionId: string): Sd
 	}
 	if (!Array.isArray(result.items)) throw new BrokerDtoParseError("$.result.items", "must be an array");
 	const session = parseRow(result.session, "$.result.session");
-	if (session.sessionId !== expectedSessionId) throw new BrokerDtoParseError("$.result.session.sessionId", `expected ${expectedSessionId}`);
+	if (session.sessionId !== expectedSessionId)
+		throw new BrokerDtoParseError("$.result.session.sessionId", `expected ${expectedSessionId}`);
 	return {
 		version: SESSION_ROWS_VERSION,
 		source: result.source,
 		session,
-		...(result.checkpoint === undefined ? {} : { checkpoint: parseCheckpoint(result.checkpoint, "$.result.checkpoint") }),
+		...(result.checkpoint === undefined
+			? {}
+			: { checkpoint: parseCheckpoint(result.checkpoint, "$.result.checkpoint") }),
 		...(result.gap === undefined ? {} : { gap: parseGap(result.gap, "$.result.gap") }),
 		items: result.items.map((item, index) => parseTailItem(item, `$.result.items[${index}]`)),
 		...(result.terminal === undefined ? {} : { terminal: requiredBoolean(result.terminal, "$.result.terminal") }),
@@ -435,7 +454,8 @@ function parseOperationReceipt(
 		}
 		if (result.status !== "accepted") throw new BrokerDtoParseError("$.result.status", "must be accepted");
 	}
-	if (candidate.accepted !== true) throw new BrokerDtoParseError(fromSend ? "$.result.receipt.accepted" : "$.result.accepted", "must be true");
+	if (candidate.accepted !== true)
+		throw new BrokerDtoParseError(fromSend ? "$.result.receipt.accepted" : "$.result.accepted", "must be true");
 	// The real broker's receipt is {commandId, turnId, accepted, clientRef} - it
 	// does NOT echo sessionId or operation. Bind identity through clientRef
 	// (which must equal our operationRef); tolerate but verify echoes if present.
@@ -450,7 +470,8 @@ function parseOperationReceipt(
 	const clientRef = typeof candidate.clientRef === "string" ? candidate.clientRef : undefined;
 	if (fromSend) {
 		if (clientRef === undefined) throw new BrokerDtoParseError("$.result.receipt.clientRef", "must be present");
-		if (clientRef !== expectedOperationRef) throw new BrokerDtoParseError("$.result.receipt.clientRef", `expected ${expectedOperationRef}`);
+		if (clientRef !== expectedOperationRef)
+			throw new BrokerDtoParseError("$.result.receipt.clientRef", `expected ${expectedOperationRef}`);
 	} else if (clientRef !== undefined && clientRef !== expectedOperationRef) {
 		throw new BrokerDtoParseError("$.result.clientRef", `expected ${expectedOperationRef}`);
 	}
@@ -487,9 +508,12 @@ function extractBrokerError(stdout: string, stderr: string): BrokerCliError | un
 	try {
 		const envelope = JSON.parse(stdout) as unknown;
 		if (!isRecord(envelope) || envelope.ok !== false || !isRecord(envelope.error)) return undefined;
-		const code = typeof envelope.error.code === "string" && envelope.error.code ? envelope.error.code : "broker_command_failed";
+		const code =
+			typeof envelope.error.code === "string" && envelope.error.code ? envelope.error.code : "broker_command_failed";
 		const message =
-			typeof envelope.error.message === "string" && envelope.error.message ? envelope.error.message : "Broker CLI rejected the request.";
+			typeof envelope.error.message === "string" && envelope.error.message
+				? envelope.error.message
+				: "Broker CLI rejected the request.";
 		return new BrokerCliError(code, message, { stderr, definitive: true });
 	} catch {
 		return undefined;
@@ -533,7 +557,10 @@ export class BrokerCli {
 		if (!sessionId.trim()) throw new BrokerMetadataUnavailableError("Cannot query metadata for an empty session id.");
 		let stdout: string;
 		try {
-			stdout = await this.run(["sdk", "session", "raw", "query", sessionId, "--query", "session.metadata"], options.timeoutMs);
+			stdout = await this.run(
+				["sdk", "session", "raw", "query", sessionId, "--query", "session.metadata"],
+				options.timeoutMs,
+			);
 		} catch (error) {
 			if (error instanceof BrokerDtoParseError) throw error;
 			if (error instanceof BrokerCliError) {
@@ -548,10 +575,23 @@ export class BrokerCli {
 	}
 
 	/** Returns the broker's immediate adoption watermark without waiting for a tail exit condition. */
-	async sessionCheckpoint(sessionId: string, options: { readonly timeoutMs?: number } = {}): Promise<SdkCheckpointRecordV1> {
-		if (!sessionId.trim()) throw new BrokerCliError("invalid_session_id", "Cannot query a checkpoint for an empty session id.");
+	async sessionCheckpoint(
+		sessionId: string,
+		options: { readonly timeoutMs?: number } = {},
+	): Promise<SdkCheckpointRecordV1> {
+		if (!sessionId.trim())
+			throw new BrokerCliError("invalid_session_id", "Cannot query a checkpoint for an empty session id.");
 		const stdout = await this.run(
-			["sdk", "session", "raw", "query", sessionId, "--query", "session.checkpoint", ...timeoutArgument(options.timeoutMs)],
+			[
+				"sdk",
+				"session",
+				"raw",
+				"query",
+				sessionId,
+				"--query",
+				"session.checkpoint",
+				...timeoutArgument(options.timeoutMs),
+			],
 			options.timeoutMs,
 		);
 		return parseSessionCheckpoint(stdout);
@@ -565,7 +605,17 @@ export class BrokerCli {
 	): Promise<BrokerOperationReceipt> {
 		this.assertOperationInput(sessionId, text, operationRef);
 		const stdout = await this.run(
-			["sdk", "session", "send", sessionId, "--text", text, "--op-ref", operationRef, ...timeoutArgument(options.timeoutMs)],
+			[
+				"sdk",
+				"session",
+				"send",
+				sessionId,
+				"--text",
+				text,
+				"--op-ref",
+				operationRef,
+				...timeoutArgument(options.timeoutMs),
+			],
 			options.timeoutMs,
 		);
 		return parseOperationReceipt(stdout, sessionId, "turn.prompt", operationRef, true);
@@ -603,7 +653,8 @@ export class BrokerCli {
 		operationRef: string,
 		options: { readonly timeoutMs?: number } = {},
 	): Promise<BrokerTurnStatus> {
-		if (!sessionId.trim() || !operationRef.trim()) throw new BrokerCliError("invalid_operation_ref", "Session id and operation reference are required.");
+		if (!sessionId.trim() || !operationRef.trim())
+			throw new BrokerCliError("invalid_operation_ref", "Session id and operation reference are required.");
 		const stdout = await this.run(
 			["sdk", "session", "status", sessionId, operationRef, ...timeoutArgument(options.timeoutMs)],
 			options.timeoutMs,
@@ -665,7 +716,8 @@ export class BrokerCli {
 	private assertOperationInput(sessionId: string, text: string, operationRef: string): void {
 		if (!sessionId.trim()) throw new BrokerCliError("invalid_session_id", "A non-empty session id is required.");
 		if (!text.trim()) throw new BrokerCliError("invalid_prompt", "A non-empty prompt is required.");
-		if (!operationRef.trim()) throw new BrokerCliError("invalid_operation_ref", "A non-empty operation reference is required.");
+		if (!operationRef.trim())
+			throw new BrokerCliError("invalid_operation_ref", "A non-empty operation reference is required.");
 	}
 
 	private async run(args: readonly string[], requestedTimeoutMs?: number): Promise<string> {
@@ -696,7 +748,11 @@ export class BrokerCli {
 				} catch {
 					// The process can already have exited.
 				}
-				finish(() => reject(new BrokerCliError("broker_output_too_large", "Broker CLI output exceeded the 8 MiB limit.", { stderr })));
+				finish(() =>
+					reject(
+						new BrokerCliError("broker_output_too_large", "Broker CLI output exceeded the 8 MiB limit.", { stderr }),
+					),
+				);
 			};
 			const timer = setTimeout(() => {
 				timedOut = true;
@@ -706,18 +762,24 @@ export class BrokerCli {
 					// The close/error listener supplies the final result.
 				}
 			}, timeoutMs);
-			child.once("error", error => finish(() => reject(new BrokerCliError("broker_spawn_failed", `Could not start ${this.executable}.`, { cause: error }))));
-			child.stdout?.on("data", chunk => {
+			child.once("error", (error) =>
+				finish(() =>
+					reject(new BrokerCliError("broker_spawn_failed", `Could not start ${this.executable}.`, { cause: error })),
+				),
+			);
+			child.stdout?.on("data", (chunk) => {
 				stdout += String(chunk);
 				if (Buffer.byteLength(stdout) > MAX_CAPTURED_OUTPUT_BYTES) overflow();
 			});
-			child.stderr?.on("data", chunk => {
+			child.stderr?.on("data", (chunk) => {
 				stderr += String(chunk);
 				if (Buffer.byteLength(stderr) > MAX_CAPTURED_OUTPUT_BYTES) overflow();
 			});
 			child.once("close", (exitCode, signal) => {
 				if (timedOut) {
-					finish(() => reject(new BrokerCliError("broker_timeout", `Broker CLI exceeded ${timeoutMs} ms.`, { stderr })));
+					finish(() =>
+						reject(new BrokerCliError("broker_timeout", `Broker CLI exceeded ${timeoutMs} ms.`, { stderr })),
+					);
 					return;
 				}
 				if (exitCode !== 0) {

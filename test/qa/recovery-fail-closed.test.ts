@@ -1,13 +1,13 @@
+import { afterEach, expect, test } from "bun:test";
 import { createHash } from "node:crypto";
 import * as fs from "node:fs";
 import * as path from "node:path";
-import { afterEach, expect, test } from "bun:test";
 import { canonicalJson } from "../../src/main-session/gates";
 import { GatewayStateStore } from "../../src/main-session/state";
 import { loadWayCore, type WayCoreHandle } from "../../src/native-loader";
 import { RpcClient } from "../../src/rpc-client";
-import { ManagedProcessRegistry } from "../helpers/managed-process";
 import { FakeBrokerFixture } from "../helpers/main-session";
+import { ManagedProcessRegistry } from "../helpers/managed-process";
 
 const managedProcesses = new ManagedProcessRegistry();
 
@@ -30,6 +30,7 @@ session_id = "${sessionId}"
 id = "owner"
 platform = "test"
 kind = "dm"
+session_kind = "main"
 `;
 }
 
@@ -47,10 +48,14 @@ async function connectEventually(socketPath: string): Promise<RpcClient> {
 	throw new Error(`RPC socket did not become available: ${socketPath}`);
 }
 
-async function waitForHealth(client: RpcClient, expected: "running" | "degraded" | "failed_closed"): Promise<Record<string, unknown>> {
+async function waitForHealth(
+	client: RpcClient,
+	expected: "running" | "degraded" | "failed_closed",
+): Promise<Record<string, unknown>> {
 	for (let attempt = 0; attempt < 500; attempt += 1) {
 		const response = await client.request("way.health", {});
-		if ((response.result as { state?: unknown } | undefined)?.state === expected) return response.result as Record<string, unknown>;
+		if ((response.result as { state?: unknown } | undefined)?.state === expected)
+			return response.result as Record<string, unknown>;
 		await Bun.sleep(10);
 	}
 	throw new Error(`Daemon did not reach ${expected}.`);
@@ -69,9 +74,23 @@ interface RunningDaemon {
 	readonly client: RpcClient;
 }
 
-async function startDaemon(stateDirectory: string, profilePath: string, environment: NodeJS.ProcessEnv, lingerMs?: number): Promise<RunningDaemon> {
+async function startDaemon(
+	stateDirectory: string,
+	profilePath: string,
+	environment: NodeJS.ProcessEnv,
+	lingerMs?: number,
+): Promise<RunningDaemon> {
 	const child = managedProcesses.spawnDaemon({
-		cmd: ["bun", "src/main.ts", "serve", "--state-dir", stateDirectory, "--profile", profilePath, ...(lingerMs ? ["--fail-closed-linger-ms", String(lingerMs)] : [])],
+		cmd: [
+			"bun",
+			"src/main.ts",
+			"serve",
+			"--state-dir",
+			stateDirectory,
+			"--profile",
+			profilePath,
+			...(lingerMs ? ["--fail-closed-linger-ms", String(lingerMs)] : []),
+		],
 		cwd: process.cwd(),
 		env: environment,
 		stderr: "pipe",
@@ -98,7 +117,11 @@ async function readDaemonStderr(daemon: RunningDaemon): Promise<string> {
 
 async function run(command: readonly string[], cwd = process.cwd()): Promise<string> {
 	const child = Bun.spawn({ cmd: [...command], cwd, stdout: "pipe", stderr: "pipe" });
-	const [exitCode, stdout, stderr] = await Promise.all([child.exited, new Response(child.stdout).text(), new Response(child.stderr).text()]);
+	const [exitCode, stdout, stderr] = await Promise.all([
+		child.exited,
+		new Response(child.stdout).text(),
+		new Response(child.stderr).text(),
+	]);
 	if (exitCode !== 0) throw new Error(`${command.join(" ")} failed (${exitCode}): ${stderr || stdout}`);
 	return stdout;
 }
@@ -111,7 +134,8 @@ function bootstrap(stateDirectory: string, profilePath: string, environment: Nod
 		stdout: "pipe",
 		stderr: "pipe",
 	});
-	if (result.exitCode !== 0) throw new Error(`bootstrap failed (${result.exitCode}): ${new TextDecoder().decode(result.stderr)}`);
+	if (result.exitCode !== 0)
+		throw new Error(`bootstrap failed (${result.exitCode}): ${new TextDecoder().decode(result.stderr)}`);
 }
 
 interface StagedMainAdmission {
@@ -121,7 +145,11 @@ interface StagedMainAdmission {
 	readonly intentJson: string;
 }
 
-function stagePendingMainAdmission(core: WayCoreHandle, key: string, mode: "valid" | "invalid" = "valid"): StagedMainAdmission {
+function stagePendingMainAdmission(
+	core: WayCoreHandle,
+	key: string,
+	mode: "valid" | "invalid" = "valid",
+): StagedMainAdmission {
 	const requestJson = JSON.stringify({ idempotency_key: key, surface_id: "owner", text: `recover ${key}` });
 	const opRef = `recovery-${key}`;
 	const intentJson =
@@ -180,7 +208,10 @@ function stagePendingClosureOperation(
 	return { intentJson, operationJson };
 }
 
-function executionLeaseFromOperation(raw: string | undefined): { readonly leaseId: string; readonly fencingToken: string } {
+function executionLeaseFromOperation(raw: string | undefined): {
+	readonly leaseId: string;
+	readonly fencingToken: string;
+} {
 	const parsed = JSON.parse(raw ?? "{}") as { evidence?: { leaseId?: unknown; fencingToken?: unknown } };
 	if (typeof parsed.evidence?.leaseId !== "string" || typeof parsed.evidence.fencingToken !== "string") {
 		throw new Error("closure operation does not retain an execution lease");
@@ -213,14 +244,21 @@ test("missing exact adopted broker identity fails closed over UDS, lingers unhea
 		expect(bootstrap.exitCode, new TextDecoder().decode(bootstrap.stderr)).toBe(0);
 		expect(fixture.commands()).toEqual([]);
 		healthy = await startDaemon(stateDirectory, profilePath, environment);
-		expect(await waitForHealth(healthy.client, "running")).toMatchObject({ status: "healthy", state: "running", main: { resumed: true } });
+		expect(await waitForHealth(healthy.client, "running")).toMatchObject({
+			status: "healthy",
+			state: "running",
+			main: { resumed: true },
+		});
 		await stopDaemon(healthy);
 		healthy = undefined;
 
 		fixture.setLive(false);
 		failed = await startDaemon(stateDirectory, profilePath, environment, 750);
 		expect(await waitForHealth(failed.client, "failed_closed")).toMatchObject({
-			status: "unhealthy", state: "failed_closed", reason: "session_unavailable", main: { resumed: false, session_id: null },
+			status: "unhealthy",
+			state: "failed_closed",
+			reason: "session_unavailable",
+			main: { resumed: false, session_id: null },
 		});
 		failed.client.close();
 		expect(await failed.child.exited).toBe(78);
@@ -272,10 +310,14 @@ test("a daemon killed after main broker acceptance recovers the pre-effect claim
 		// hook by a beat; wait for the observed send instead of racing it.
 		{
 			const deadline = Date.now() + 10_000;
-			let sends = fixture.commands().filter(command => command.operation === "turn.prompt" && command.text === request.text);
+			let sends = fixture
+				.commands()
+				.filter((command) => command.operation === "turn.prompt" && command.text === request.text);
 			while (sends.length === 0 && Date.now() < deadline) {
 				await Bun.sleep(50);
-				sends = fixture.commands().filter(command => command.operation === "turn.prompt" && command.text === request.text);
+				sends = fixture
+					.commands()
+					.filter((command) => command.operation === "turn.prompt" && command.text === request.text);
 			}
 			expect(sends).toHaveLength(1);
 		}
@@ -284,10 +326,15 @@ test("a daemon killed after main broker acceptance recovers the pre-effect claim
 			...environment,
 			GAJAEWAY_E2E_FAIL_AFTER_MAIN_ADMISSION_BROKER_ACCEPTED: "0",
 		});
-		expect(await waitForHealth(recovered.client, "running")).toMatchObject({ state: "running", main: { resumed: true } });
+		expect(await waitForHealth(recovered.client, "running")).toMatchObject({
+			state: "running",
+			main: { resumed: true },
+		});
 		const replay = await recovered.client.request("main.submit", request);
 		expect(replay.result).toMatchObject({ accepted: true, delivered_as: "prompt" });
-		expect(fixture.commands().filter(command => command.operation === "turn.prompt" && command.text === request.text)).toHaveLength(1);
+		expect(
+			fixture.commands().filter((command) => command.operation === "turn.prompt" && command.text === request.text),
+		).toHaveLength(1);
 	} finally {
 		await stopDaemon(recovered);
 		await stopDaemon(killed);
@@ -359,7 +406,10 @@ test("a post-acceptance bridge failure with durable terminal evidence reconciles
 			GAJAEWAY_E2E_THROW_AFTER_MAIN_ADMISSION_BROKER_ACCEPTED: "0",
 			GAJAEWAY_E2E_FAIL_AFTER_MAIN_ADMISSION_TERMINAL_EVIDENCE: "0",
 		});
-		expect(await waitForHealth(recovered.client, "running")).toMatchObject({ state: "running", main: { resumed: true } });
+		expect(await waitForHealth(recovered.client, "running")).toMatchObject({
+			state: "running",
+			main: { resumed: true },
+		});
 		expect(core.mainAdmissionOperationsPending()).toEqual([]);
 		const replay = await recovered.client.request("main.submit", request);
 		expect(replay.result).toMatchObject({
@@ -373,7 +423,7 @@ test("a post-acceptance bridge failure with durable terminal evidence reconciles
 			text: "different content with the recovered idempotency key",
 		});
 		expect(conflict.error).toMatchObject({ code: 1500, message: "idempotency_conflict" });
-		expect(fixture.admissionAttempts().filter(attempt => attempt.opRef === opRef)).toHaveLength(1);
+		expect(fixture.admissionAttempts().filter((attempt) => attempt.opRef === opRef)).toHaveLength(1);
 	} finally {
 		await stopDaemon(recovered);
 		await stopDaemon(crashed);
@@ -433,8 +483,17 @@ test("a transcript projection failure degrades the host and fences corpus closur
 		expect(deliveryAfterFailure?.fingerprint.entryCount).toBe((deliveryBefore?.fingerprint.entryCount ?? 0) + 1);
 		expect(deliveryAfterFailure?.lastEntryId).toBe(`${fixture.sessionId}:transcript:2`);
 		expect(deliveryAfterFailure?.lastEntryId).not.toBe(`${fixture.sessionId}:transcript:3`);
-		expect(fixture.commands().filter(command => command.operation === "turn.prompt" && command.text === "force an atomic transcript projection failure")).toHaveLength(1);
-		expect(fixture.admissionAttempts().filter(attempt => attempt.text === "force an atomic transcript projection failure")).toHaveLength(1);
+		expect(
+			fixture
+				.commands()
+				.filter(
+					(command) =>
+						command.operation === "turn.prompt" && command.text === "force an atomic transcript projection failure",
+				),
+		).toHaveLength(1);
+		expect(
+			fixture.admissionAttempts().filter((attempt) => attempt.text === "force an atomic transcript projection failure"),
+		).toHaveLength(1);
 
 		fs.writeFileSync(path.join(corpus, "must-not-close.txt"), "must remain uncommitted\n");
 		const localHead = await run(["git", "-C", corpus, "rev-parse", "HEAD"]);
@@ -509,7 +568,10 @@ test("startup closure recovery fences after lease acquisition before Git dispatc
 		degradedDaemon = await startDaemon(stateDirectory, profilePath, environment);
 		expect(await waitForHealth(degradedDaemon.client, "running")).toMatchObject({ state: "running" });
 		await waitForFile(acquireMarker, "startup recovery did not acquire its closure lease");
-		expect(JSON.parse(fs.readFileSync(acquireMarker, "utf8"))).toEqual({ operation_id: "startup-recovery-fence", step: "after_acquire" });
+		expect(JSON.parse(fs.readFileSync(acquireMarker, "utf8"))).toEqual({
+			operation_id: "startup-recovery-fence",
+			step: "after_acquire",
+		});
 		const acquiredRaw = observer.gatewayMetaRead(["gitlock_closure_operation"]).entries[0]?.value;
 		expect(JSON.parse(acquiredRaw ?? "{}")).toMatchObject({ intentJson, state: "acquired" });
 		const refusedAttempt = executionLeaseFromOperation(acquiredRaw);
@@ -521,7 +583,9 @@ test("startup closure recovery fences after lease acquisition before Git dispatc
 			idempotency_key: "startup-recovery-acquire-fence",
 		});
 		expect(admission.result).toMatchObject({ accepted: true, delivered_as: "prompt" });
-		fixture.complete((admission.result as { op_ref: string }).op_ref, { text: "projection failure fences the acquired closure" });
+		fixture.complete((admission.result as { op_ref: string }).op_ref, {
+			text: "projection failure fences the acquired closure",
+		});
 		expect(await waitForHealth(degradedDaemon.client, "degraded")).toMatchObject({
 			status: "unhealthy",
 			state: "degraded",
@@ -561,7 +625,8 @@ test("startup closure recovery fences after lease acquisition before Git dispatc
 		expect(await run(["git", "-C", corpus, "rev-list", "--count", "HEAD"])).toBe("2\n");
 		expect(observer.gatewayMetaRead(["gitlock_closure_operation"]).entries[0]?.value).toBeUndefined();
 	} finally {
-		if (!fs.existsSync(acquireRelease)) fs.writeFileSync(acquireRelease, "release\n", { encoding: "utf8", mode: 0o600 });
+		if (!fs.existsSync(acquireRelease))
+			fs.writeFileSync(acquireRelease, "release\n", { encoding: "utf8", mode: 0o600 });
 		await stopDaemon(healthyDaemon);
 		await stopDaemon(degradedDaemon);
 		fixture.dispose();
@@ -622,7 +687,10 @@ test("startup recovery retains a committed-not-pushed closure for exactly-once h
 		degradedDaemon = await startDaemon(stateDirectory, profilePath, environment);
 		expect(await waitForHealth(degradedDaemon.client, "running")).toMatchObject({ state: "running" });
 		await waitForFile(commitMarker, "startup recovery did not persist its committed closure evidence");
-		expect(JSON.parse(fs.readFileSync(commitMarker, "utf8"))).toEqual({ operation_id: "startup-recovery-fence", step: "after_commit" });
+		expect(JSON.parse(fs.readFileSync(commitMarker, "utf8"))).toEqual({
+			operation_id: "startup-recovery-fence",
+			step: "after_commit",
+		});
 		const committedHead = (await run(["git", "-C", corpus, "rev-parse", "HEAD"])).trim();
 		expect(committedHead).not.toBe(localHead);
 		const committedRaw = observer.gatewayMetaRead(["gitlock_closure_operation"]).entries[0]?.value;
@@ -640,7 +708,9 @@ test("startup recovery retains a committed-not-pushed closure for exactly-once h
 			idempotency_key: "startup-recovery-commit-fence",
 		});
 		expect(admission.result).toMatchObject({ accepted: true, delivered_as: "prompt" });
-		fixture.complete((admission.result as { op_ref: string }).op_ref, { text: "projection failure fences the pending push" });
+		fixture.complete((admission.result as { op_ref: string }).op_ref, {
+			text: "projection failure fences the pending push",
+		});
 		expect(await waitForHealth(degradedDaemon.client, "degraded")).toMatchObject({
 			status: "unhealthy",
 			state: "degraded",
@@ -678,7 +748,9 @@ test("startup recovery retains a committed-not-pushed closure for exactly-once h
 		expect(finalFencingToken).not.toBe(refusedAttempt.fencingToken);
 		const replay = await healthyDaemon.client.request("main.corpus.close", closeParams, { timeoutMs: 10_000 });
 		expect(replay.result).toEqual(finalized.result);
-		expect(await run(["git", `--git-dir=${remote}`, "show", "main:committed-close.txt"])).toBe("commit before the host degrades\n");
+		expect(await run(["git", `--git-dir=${remote}`, "show", "main:committed-close.txt"])).toBe(
+			"commit before the host degrades\n",
+		);
 		expect(await run(["git", `--git-dir=${remote}`, "rev-list", "--count", "main"])).toBe("2\n");
 		expect(await run(["git", "-C", corpus, "rev-list", "--count", "HEAD"])).toBe("2\n");
 		expect(observer.gatewayMetaRead(["gitlock_closure_operation"]).entries[0]?.value).toBeUndefined();
@@ -761,7 +833,9 @@ test("RPC closure fences the original and in-flight duplicate, then preserves un
 			idempotency_key: "rpc-closure-readiness-fence-admission",
 		});
 		expect(admission.result).toMatchObject({ accepted: true, delivered_as: "prompt" });
-		fixture.complete((admission.result as { op_ref: string }).op_ref, { text: "projection failure fences both RPC closure callers" });
+		fixture.complete((admission.result as { op_ref: string }).op_ref, {
+			text: "projection failure fences both RPC closure callers",
+		});
 		expect(await waitForHealth(degradedDaemon.client, "degraded")).toMatchObject({
 			status: "unhealthy",
 			state: "degraded",
@@ -771,10 +845,12 @@ test("RPC closure fences the original and in-flight duplicate, then preserves un
 		const [originalResponse, waiterResponse] = await Promise.all([original, waiter]);
 		expect(originalResponse.error).toMatchObject({ code: 1003, message: "transcript_delivery_progress_write_failed" });
 		expect(waiterResponse.error).toMatchObject({ code: 1003, message: "transcript_delivery_progress_write_failed" });
-		expect(JSON.parse(observer.gatewayMetaRead(["gitlock_closure_operation"]).entries[0]?.value ?? "{}")).toMatchObject({
-			state: "acquired",
-			evidence: { leaseId: refusedAttempt.leaseId, fencingToken: refusedAttempt.fencingToken },
-		});
+		expect(JSON.parse(observer.gatewayMetaRead(["gitlock_closure_operation"]).entries[0]?.value ?? "{}")).toMatchObject(
+			{
+				state: "acquired",
+				evidence: { leaseId: refusedAttempt.leaseId, fencingToken: refusedAttempt.fencingToken },
+			},
+		);
 		expect(await run(["git", "-C", corpus, "rev-parse", "HEAD"])).toBe(localHead);
 		expect(await run(["git", `--git-dir=${remote}`, "rev-parse", "main"])).toBe(remoteHead);
 
@@ -806,14 +882,21 @@ test("RPC closure fences the original and in-flight duplicate, then preserves un
 			commit_message: "must report dirty index",
 			idempotency_key: "rpc-closure-non-readiness-error",
 		};
-		const firstClosureError = await healthyDaemon.client.request("main.corpus.close", dirtyParams, { timeoutMs: 10_000 });
+		const firstClosureError = await healthyDaemon.client.request("main.corpus.close", dirtyParams, {
+			timeoutMs: 10_000,
+		});
 		expect(firstClosureError.error).toMatchObject({ code: 1206, message: "corpus git index is dirty" });
-		const retryClosureError = await healthyDaemon.client.request("main.corpus.close", dirtyParams, { timeoutMs: 10_000 });
+		const retryClosureError = await healthyDaemon.client.request("main.corpus.close", dirtyParams, {
+			timeoutMs: 10_000,
+		});
 		expect(retryClosureError.error).toMatchObject({ code: 1206, message: "corpus git index is dirty" });
 		expect(retryClosureError.error?.code).not.toBe(1003);
-		expect(JSON.parse(observer.gatewayMetaRead(["gitlock_closure_operation"]).entries[0]?.value ?? "{}")).toMatchObject({ state: "acquired" });
+		expect(JSON.parse(observer.gatewayMetaRead(["gitlock_closure_operation"]).entries[0]?.value ?? "{}")).toMatchObject(
+			{ state: "acquired" },
+		);
 	} finally {
-		if (!fs.existsSync(acquireRelease)) fs.writeFileSync(acquireRelease, "release\n", { encoding: "utf8", mode: 0o600 });
+		if (!fs.existsSync(acquireRelease))
+			fs.writeFileSync(acquireRelease, "release\n", { encoding: "utf8", mode: 0o600 });
 		waiterClient?.close();
 		await stopDaemon(healthyDaemon);
 		await stopDaemon(degradedDaemon);
@@ -822,9 +905,13 @@ test("RPC closure fences the original and in-flight duplicate, then preserves un
 }, 45_000);
 
 async function assertPendingAdmissionRecoveryFailsClosed(
-	reason: "main_admission_recovery_unavailable" | "main_admission_recovery_unprovable" | "main_admission_intent_invalid",
+	reason:
+		| "main_admission_recovery_unavailable"
+		| "main_admission_recovery_unprovable"
+		| "main_admission_intent_invalid",
 	mode: "valid" | "invalid",
-	configurePending: (fixture: FakeBrokerFixture, pending: StagedMainAdmission, core: WayCoreHandle) => void = () => undefined,
+	configurePending: (fixture: FakeBrokerFixture, pending: StagedMainAdmission, core: WayCoreHandle) => void = () =>
+		undefined,
 ): Promise<void> {
 	const fixture = new FakeBrokerFixture();
 	const corpus = path.join(fixture.root, "corpus");
@@ -864,7 +951,9 @@ async function assertPendingAdmissionRecoveryFailsClosed(
 }
 
 test("pending main admission status transport failure fails closed without a broker resend", async () => {
-	await assertPendingAdmissionRecoveryFailsClosed("main_admission_recovery_unavailable", "valid", fixture => fixture.setOperationStatusUnavailable());
+	await assertPendingAdmissionRecoveryFailsClosed("main_admission_recovery_unavailable", "valid", (fixture) =>
+		fixture.setOperationStatusUnavailable(),
+	);
 }, 15_000);
 
 test("pending main admission with an unprovable broker status fails closed without a broker resend", async () => {
@@ -872,65 +961,82 @@ test("pending main admission with an unprovable broker status fails closed witho
 }, 15_000);
 
 test("a suffix-sharing unrelated terminal attempt cannot settle a pending admission", async () => {
-	await assertPendingAdmissionRecoveryFailsClosed("main_admission_recovery_unprovable", "valid", (_fixture, pending, core) => {
-		const opaqueAttemptId = `opaque-turn-${pending.opRef}`;
-		core.mainAdmissionOperationRecordAttemptIds({
-			scope: "main.submit",
-			key: pending.key,
-			requestJson: pending.requestJson,
-			intentJson: pending.intentJson,
-			attemptIdsJson: canonicalJson([opaqueAttemptId]),
-		});
-		core.journalAppend(
-			"turn_end",
-			canonicalJson({ attempt_id: `other:${opaqueAttemptId}`, generation: 1, lineage: "main" }),
-		);
-	});
+	await assertPendingAdmissionRecoveryFailsClosed(
+		"main_admission_recovery_unprovable",
+		"valid",
+		(_fixture, pending, core) => {
+			const opaqueAttemptId = `opaque-turn-${pending.opRef}`;
+			core.mainAdmissionOperationRecordAttemptIds({
+				scope: "main.submit",
+				key: pending.key,
+				requestJson: pending.requestJson,
+				intentJson: pending.intentJson,
+				attemptIdsJson: canonicalJson([opaqueAttemptId]),
+			});
+			core.journalAppend(
+				"turn_end",
+				canonicalJson({ attempt_id: `other:${opaqueAttemptId}`, generation: 1, lineage: "main" }),
+			);
+		},
+	);
 }, 15_000);
 
 test("an unbound pending admission does not infer a legacy terminal alias", async () => {
-	await assertPendingAdmissionRecoveryFailsClosed("main_admission_recovery_unprovable", "valid", (_fixture, pending, core) => {
-		core.journalAppend(
-			"turn_end",
-			canonicalJson({ attempt_id: pending.opRef, generation: 1, lineage: "main" }),
-		);
-	});
+	await assertPendingAdmissionRecoveryFailsClosed(
+		"main_admission_recovery_unprovable",
+		"valid",
+		(_fixture, pending, core) => {
+			core.journalAppend("turn_end", canonicalJson({ attempt_id: pending.opRef, generation: 1, lineage: "main" }));
+		},
+	);
 }, 15_000);
 
 test("a pending admission with object attempt_ids_json fails closed without a broker resend", async () => {
-	await assertPendingAdmissionRecoveryFailsClosed("main_admission_intent_invalid", "valid", (_fixture, pending, core) => {
-		core.mainAdmissionOperationRecordAttemptIds({
-			scope: "main.submit",
-			key: pending.key,
-			requestJson: pending.requestJson,
-			intentJson: pending.intentJson,
-			attemptIdsJson: "{}",
-		});
-	});
+	await assertPendingAdmissionRecoveryFailsClosed(
+		"main_admission_intent_invalid",
+		"valid",
+		(_fixture, pending, core) => {
+			core.mainAdmissionOperationRecordAttemptIds({
+				scope: "main.submit",
+				key: pending.key,
+				requestJson: pending.requestJson,
+				intentJson: pending.intentJson,
+				attemptIdsJson: "{}",
+			});
+		},
+	);
 }, 15_000);
 
 test("a pending admission with non-JSON attempt_ids_json fails closed without a broker resend", async () => {
-	await assertPendingAdmissionRecoveryFailsClosed("main_admission_intent_invalid", "valid", (_fixture, pending, core) => {
-		core.mainAdmissionOperationRecordAttemptIds({
-			scope: "main.submit",
-			key: pending.key,
-			requestJson: pending.requestJson,
-			intentJson: pending.intentJson,
-			attemptIdsJson: "not-json",
-		});
-	});
+	await assertPendingAdmissionRecoveryFailsClosed(
+		"main_admission_intent_invalid",
+		"valid",
+		(_fixture, pending, core) => {
+			core.mainAdmissionOperationRecordAttemptIds({
+				scope: "main.submit",
+				key: pending.key,
+				requestJson: pending.requestJson,
+				intentJson: pending.intentJson,
+				attemptIdsJson: "not-json",
+			});
+		},
+	);
 }, 15_000);
 
 test("a pending admission with empty attempt_ids_json fails closed without a broker resend", async () => {
-	await assertPendingAdmissionRecoveryFailsClosed("main_admission_intent_invalid", "valid", (_fixture, pending, core) => {
-		core.mainAdmissionOperationRecordAttemptIds({
-			scope: "main.submit",
-			key: pending.key,
-			requestJson: pending.requestJson,
-			intentJson: pending.intentJson,
-			attemptIdsJson: "[]",
-		});
-	});
+	await assertPendingAdmissionRecoveryFailsClosed(
+		"main_admission_intent_invalid",
+		"valid",
+		(_fixture, pending, core) => {
+			core.mainAdmissionOperationRecordAttemptIds({
+				scope: "main.submit",
+				key: pending.key,
+				requestJson: pending.requestJson,
+				intentJson: pending.intentJson,
+				attemptIdsJson: "[]",
+			});
+		},
+	);
 }, 15_000);
 
 test("invalid pending main admission intent fails closed before any broker resend", async () => {

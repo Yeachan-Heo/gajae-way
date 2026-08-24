@@ -16,13 +16,27 @@ export const GATEWAY_META_KEYS = [
 	"profile_approved_at",
 	"profile_approval_receipt",
 	"failed_closed_reason",
+	"failed_closed_since_ms",
+	"alert_failed_closed",
+	"alert_lock_quarantined",
 	"tail_checkpoint",
 	"tail_ring_rotation_count",
 	"transcript_delivery_gap_count",
 	"transcript_delivery_progress",
 	"transcript_proof",
-
 ] as const;
+
+/**
+ * Alert payloads carry a condition and a bounded reason token only.
+ *
+ * A free-text reason is rejected rather than embedded, because these events are
+ * rendered to chat surfaces and read by adapters that must not become a vector
+ * for arbitrary text.
+ */
+function canonicalAlertPayload(condition: string, reason: string): string {
+	const safe = /^[a-z][a-z0-9_]{0,63}$/.test(reason) ? reason : "unspecified";
+	return stableMetadataJson({ condition, reason: safe });
+}
 
 export interface GatewayMetaEntry {
 	readonly key: string;
@@ -120,7 +134,6 @@ export function compareTailCheckpoints(left: TailCheckpoint, right: TailCheckpoi
 	return 0;
 }
 
-
 export interface DurableGatewayState {
 	readonly bootstrapState: BootstrapState;
 	readonly bootstrapIntent: BootstrapIntent | undefined;
@@ -138,7 +151,6 @@ export interface DurableGatewayState {
 	readonly transcriptDeliveryGapCount: number;
 	readonly transcriptDeliveryProgress: TranscriptDeliveryProgress | undefined;
 	readonly transcriptProof: TranscriptProof;
-
 }
 
 export class GatewayStateError extends Error {
@@ -171,7 +183,8 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 }
 
 function requiredString(value: unknown, field: string): string {
-	if (typeof value !== "string" || !value) throw new GatewayStateError("metadata_invalid", `${field} must be a non-empty string.`);
+	if (typeof value !== "string" || !value)
+		throw new GatewayStateError("metadata_invalid", `${field} must be a non-empty string.`);
 	return value;
 }
 
@@ -208,7 +221,6 @@ function parseTailCheckpoint(value: unknown, key: string): TailCheckpoint {
 	};
 }
 
-
 function parseExternalIdentity(value: unknown, key: string): ExternalSessionIdentity {
 	if (!isRecord(value)) throw new GatewayStateError("metadata_invalid", `${key} must be an object.`);
 	const locator = value.locator;
@@ -227,7 +239,9 @@ function parseExternalIdentity(value: unknown, key: string): ExternalSessionIden
 		},
 		endpointGeneration: requiredNonNegativeInteger(value.endpointGeneration, `${key}.endpointGeneration`),
 		...(hostIncarnation === undefined ? {} : { hostIncarnation }),
-		...(value.transcript === undefined ? {} : { transcript: parseTranscriptFingerprint(value.transcript, `${key}.transcript`) }),
+		...(value.transcript === undefined
+			? {}
+			: { transcript: parseTranscriptFingerprint(value.transcript, `${key}.transcript`) }),
 	};
 }
 
@@ -249,7 +263,8 @@ function parseGrowthIntent(value: unknown): GrowthIntent {
 }
 
 function parseBootstrapState(raw: string): BootstrapState {
-	if (raw === "ABSENT" || raw === "CREATING" || raw === "CREATED" || raw === "COMMITTED" || raw === "FAILED_CLOSED") return raw;
+	if (raw === "ABSENT" || raw === "CREATING" || raw === "CREATED" || raw === "COMMITTED" || raw === "FAILED_CLOSED")
+		return raw;
 	throw new GatewayStateError("metadata_invalid", "bootstrap_state is invalid.");
 }
 
@@ -296,10 +311,14 @@ function parseOptionalTranscriptDeliveryProgress(raw: string | undefined): Trans
 	if (raw === undefined || raw === "null") return undefined;
 	const value = parseNullableJson(raw, "transcript_delivery_progress");
 	if (value === undefined) return undefined;
-	if (!isRecord(value)) throw new GatewayStateError("metadata_invalid", "transcript_delivery_progress must be an object.");
+	if (!isRecord(value))
+		throw new GatewayStateError("metadata_invalid", "transcript_delivery_progress must be an object.");
 	const lastEntryId = value.lastEntryId;
 	if (lastEntryId !== undefined && (typeof lastEntryId !== "string" || !lastEntryId)) {
-		throw new GatewayStateError("metadata_invalid", "transcript_delivery_progress.lastEntryId must be a non-empty string.");
+		throw new GatewayStateError(
+			"metadata_invalid",
+			"transcript_delivery_progress.lastEntryId must be a non-empty string.",
+		);
 	}
 	return {
 		...(lastEntryId === undefined ? {} : { lastEntryId }),
@@ -314,7 +333,6 @@ function parseTranscriptProof(raw: string): TranscriptProof {
 	return raw;
 }
 
-
 function metadataMap(entries: readonly GatewayMetaEntry[]): Map<string, string> {
 	const values = new Map<string, string>();
 	for (const entry of entries) {
@@ -325,7 +343,8 @@ function metadataMap(entries: readonly GatewayMetaEntry[]): Map<string, string> 
 
 function requiredMeta(values: ReadonlyMap<string, string>, key: string): string {
 	const value = values.get(key);
-	if (value === undefined) throw new GatewayStateError("metadata_missing", `Required gateway metadata ${key} is missing.`);
+	if (value === undefined)
+		throw new GatewayStateError("metadata_missing", `Required gateway metadata ${key} is missing.`);
 	return value;
 }
 
@@ -334,18 +353,33 @@ function parsedState(values: ReadonlyMap<string, string>): DurableGatewayState {
 	const bootstrapIntentRaw = parseNullableJson(requiredMeta(values, "bootstrap_intent"), "bootstrap_intent");
 	const mainIdentityRaw = parseNullableJson(requiredMeta(values, "main_identity"), "main_identity");
 	const growthIntentRaw = parseNullableJson(requiredMeta(values, "growth_intent"), "growth_intent");
-	const mainIdentity = mainIdentityRaw === undefined ? undefined : parseExternalIdentity(mainIdentityRaw, "main_identity");
+	const mainIdentity =
+		mainIdentityRaw === undefined ? undefined : parseExternalIdentity(mainIdentityRaw, "main_identity");
 	const growthIntent = growthIntentRaw === undefined ? undefined : parseGrowthIntent(growthIntentRaw);
 	const transcriptProof = parseTranscriptProof(requiredMeta(values, "transcript_proof"));
-	const transcriptDeliveryProgress = parseOptionalTranscriptDeliveryProgress(values.get("transcript_delivery_progress"));
+	const transcriptDeliveryProgress = parseOptionalTranscriptDeliveryProgress(
+		values.get("transcript_delivery_progress"),
+	);
 	if (mainIdentity?.transcript === undefined && transcriptProof === "proven") {
-		throw new GatewayStateError("metadata_invalid", "A proven transcript proof requires a fingerprinted main identity.");
+		throw new GatewayStateError(
+			"metadata_invalid",
+			"A proven transcript proof requires a fingerprinted main identity.",
+		);
 	}
 	if (mainIdentity?.transcript !== undefined && transcriptProof === "pending") {
-		throw new GatewayStateError("metadata_invalid", "A pending transcript proof cannot carry a fingerprinted main identity.");
+		throw new GatewayStateError(
+			"metadata_invalid",
+			"A pending transcript proof cannot carry a fingerprinted main identity.",
+		);
 	}
-	if (transcriptProof === "pending" && (growthIntent !== undefined || transcriptDeliveryProgress !== undefined || values.get("tail_checkpoint") !== "null")) {
-		throw new GatewayStateError("metadata_invalid", "A pending transcript proof cannot have transcript growth, delivery progress, or a ring watermark.");
+	if (
+		transcriptProof === "pending" &&
+		(growthIntent !== undefined || transcriptDeliveryProgress !== undefined || values.get("tail_checkpoint") !== "null")
+	) {
+		throw new GatewayStateError(
+			"metadata_invalid",
+			"A pending transcript proof cannot have transcript growth, delivery progress, or a ring watermark.",
+		);
 	}
 	const profileDigestRaw = requiredMeta(values, "profile_digest");
 	const profileDigest = profileDigestRaw === "null" ? undefined : requiredString(profileDigestRaw, "profile_digest");
@@ -368,8 +402,14 @@ function parsedState(values: ReadonlyMap<string, string>): DurableGatewayState {
 		profileDigestVersion,
 		profileProjection: parseOptionalProjection(requiredMeta(values, "profile_projection")),
 		profileTunablesRevision,
-		profileApprovedAt: parseOptionalNonNegativeIntegerJson(requiredMeta(values, "profile_approved_at"), "profile_approved_at"),
-		profileApprovalReceipt: parseOptionalStringJson(requiredMeta(values, "profile_approval_receipt"), "profile_approval_receipt"),
+		profileApprovedAt: parseOptionalNonNegativeIntegerJson(
+			requiredMeta(values, "profile_approved_at"),
+			"profile_approved_at",
+		),
+		profileApprovalReceipt: parseOptionalStringJson(
+			requiredMeta(values, "profile_approval_receipt"),
+			"profile_approval_receipt",
+		),
 		failedClosedReason: parseOptionalStringJson(requiredMeta(values, "failed_closed_reason"), "failed_closed_reason"),
 		tailCheckpoint: parseOptionalTailCheckpoint(values.get("tail_checkpoint")),
 		tailRingRotationCount: parseTailRingRotationCount(requiredMeta(values, "tail_ring_rotation_count")),
@@ -396,12 +436,13 @@ function transcriptDeliveryProgressJson(progress: TranscriptDeliveryProgress | u
 }
 
 function canonicalJson(value: unknown): string {
-	if (value === null || typeof value === "boolean" || typeof value === "number" || typeof value === "string") return JSON.stringify(value);
+	if (value === null || typeof value === "boolean" || typeof value === "number" || typeof value === "string")
+		return JSON.stringify(value);
 	if (Array.isArray(value)) return `[${value.map(canonicalJson).join(",")}]`;
 	if (isRecord(value)) {
 		return `{${Object.keys(value)
 			.sort()
-			.map(key => `${JSON.stringify(key)}:${canonicalJson(value[key])}`)
+			.map((key) => `${JSON.stringify(key)}:${canonicalJson(value[key])}`)
 			.join(",")}}`;
 	}
 	throw new GatewayStateError("transcript_fingerprint_invalid", "Transcript entries must be JSON values.");
@@ -427,7 +468,9 @@ export function sameExternalSession(left: ExternalSessionIdentity, right: Extern
 export function sameExternalFingerprint(left: ExternalSessionIdentity, right: ExternalSessionIdentity): boolean {
 	if (!sameExternalSession(left, right)) return false;
 	if (left.transcript === undefined || right.transcript === undefined) return left.transcript === right.transcript;
-	return left.transcript.entryCount === right.transcript.entryCount && left.transcript.sha256 === right.transcript.sha256;
+	return (
+		left.transcript.entryCount === right.transcript.entryCount && left.transcript.sha256 === right.transcript.sha256
+	);
 }
 
 /**
@@ -498,10 +541,16 @@ export class GatewayStateStore {
 				transcriptDeliveryProgress.fingerprint.entryCount !== identity.transcript.entryCount ||
 				transcriptDeliveryProgress.fingerprint.sha256 !== identity.transcript.sha256
 			) {
-				throw new GatewayStateError("transcript_proof_invalid", "A proven adoption requires a ring watermark, matching transcript fingerprint, and delivery baseline.");
+				throw new GatewayStateError(
+					"transcript_proof_invalid",
+					"A proven adoption requires a ring watermark, matching transcript fingerprint, and delivery baseline.",
+				);
 			}
 		} else if (identity.transcript || ringCheckpoint || transcriptDeliveryProgress) {
-			throw new GatewayStateError("transcript_proof_invalid", "A pending adoption cannot carry a ring watermark, transcript fingerprint, or delivery baseline.");
+			throw new GatewayStateError(
+				"transcript_proof_invalid",
+				"A pending adoption cannot carry a ring watermark, transcript fingerprint, or delivery baseline.",
+			);
 		}
 		this.transact({
 			expected: [
@@ -528,9 +577,9 @@ export class GatewayStateStore {
 			...(ringCheckpoint === undefined
 				? {}
 				: {
-					eventKind: "tail_adoption_start",
-					eventPayloadJson: stableMetadataJson({ checkpoint: ringCheckpoint }),
-				}),
+						eventKind: "tail_adoption_start",
+						eventPayloadJson: stableMetadataJson({ checkpoint: ringCheckpoint }),
+					}),
 		});
 	}
 
@@ -550,7 +599,10 @@ export class GatewayStateStore {
 
 	writeGrowthIntent(identity: ExternalSessionIdentity, startedAt: number): void {
 		if (!identity.transcript) {
-			throw new GatewayStateError("transcript_proof_pending", "Cannot open a growth window before the transcript proof is durable.");
+			throw new GatewayStateError(
+				"transcript_proof_pending",
+				"Cannot open a growth window before the transcript proof is durable.",
+			);
 		}
 		const intent: GrowthIntent = { base: identity, startedAt };
 		this.transact({
@@ -567,7 +619,10 @@ export class GatewayStateStore {
 
 	refreshAfterGrowth(intent: GrowthIntent, identity: ExternalSessionIdentity): void {
 		if (!identity.transcript) {
-			throw new GatewayStateError("transcript_proof_pending", "Cannot refresh transcript growth without a durable transcript proof.");
+			throw new GatewayStateError(
+				"transcript_proof_pending",
+				"Cannot refresh transcript growth without a durable transcript proof.",
+			);
 		}
 		this.transact({
 			expected: [
@@ -602,11 +657,17 @@ export class GatewayStateStore {
 			transcriptDeliveryProgress.fingerprint.entryCount !== observed.transcript.entryCount ||
 			transcriptDeliveryProgress.fingerprint.sha256 !== observed.transcript.sha256
 		) {
-			throw new GatewayStateError("transcript_proof_invalid", "The observed transcript proof does not bind the committed external session.");
+			throw new GatewayStateError(
+				"transcript_proof_invalid",
+				"The observed transcript proof does not bind the committed external session.",
+			);
 		}
 		const current = this.read();
 		if (current.transcriptDeliveryGapCount >= Number.MAX_SAFE_INTEGER) {
-			throw new GatewayStateError("transcript_delivery_gap_overflow", "The durable transcript delivery-gap count overflowed.");
+			throw new GatewayStateError(
+				"transcript_delivery_gap_overflow",
+				"The durable transcript delivery-gap count overflowed.",
+			);
 		}
 		this.transact({
 			expected: [
@@ -635,7 +696,10 @@ export class GatewayStateStore {
 		});
 	}
 
-	advanceTranscriptDeliveryProgress(expected: TranscriptDeliveryProgress | undefined, next: TranscriptDeliveryProgress): void {
+	advanceTranscriptDeliveryProgress(
+		expected: TranscriptDeliveryProgress | undefined,
+		next: TranscriptDeliveryProgress,
+	): void {
 		this.transact({
 			expected: [
 				{ key: "bootstrap_state", value: "COMMITTED" },
@@ -646,7 +710,6 @@ export class GatewayStateStore {
 			deletes: [],
 		});
 	}
-
 
 	/** Atomically journals a transcript projection, its delivery replay point, and any detected delivery gap. */
 	appendTranscriptProjection(
@@ -662,7 +725,10 @@ export class GatewayStateStore {
 		}
 		const state = kind === "transcript_delivery_gap" ? this.read() : undefined;
 		if (state && state.transcriptDeliveryGapCount >= Number.MAX_SAFE_INTEGER) {
-			throw new GatewayStateError("transcript_delivery_gap_overflow", "The durable transcript delivery-gap count overflowed.");
+			throw new GatewayStateError(
+				"transcript_delivery_gap_overflow",
+				"The durable transcript delivery-gap count overflowed.",
+			);
 		}
 		this.transact({
 			expected: [
@@ -670,12 +736,16 @@ export class GatewayStateStore {
 				{ key: "transcript_proof", value: "proven" },
 				...(expectedTail === undefined ? [] : [{ key: "tail_checkpoint", value: tailCheckpointJson(expectedTail) }]),
 				{ key: "transcript_delivery_progress", value: transcriptDeliveryProgressJson(expectedDelivery) },
-				...(state === undefined ? [] : [{ key: "transcript_delivery_gap_count", value: String(state.transcriptDeliveryGapCount) }]),
+				...(state === undefined
+					? []
+					: [{ key: "transcript_delivery_gap_count", value: String(state.transcriptDeliveryGapCount) }]),
 			],
 			puts: [
 				{ key: "tail_checkpoint", value: tailCheckpointJson(checkpoint) },
 				{ key: "transcript_delivery_progress", value: transcriptDeliveryProgressJson(nextDelivery) },
-				...(state === undefined ? [] : [{ key: "transcript_delivery_gap_count", value: String(state.transcriptDeliveryGapCount + 1) }]),
+				...(state === undefined
+					? []
+					: [{ key: "transcript_delivery_gap_count", value: String(state.transcriptDeliveryGapCount + 1) }]),
 			],
 			deletes: [],
 			eventKind: kind,
@@ -735,11 +805,13 @@ export class GatewayStateStore {
 		});
 	}
 
-
 	/** Atomically records a retention floor that advanced beyond the established tail coordinate. */
 	recordTailRingRotation(previous: TailCheckpoint, resync: TailCheckpoint): void {
 		if (compareTailCheckpoints(resync, previous) <= 0) {
-			throw new GatewayStateError("tail_ring_rotation_invalid", "A ring rotation resync must advance the established tail coordinate.");
+			throw new GatewayStateError(
+				"tail_ring_rotation_invalid",
+				"A ring rotation resync must advance the established tail coordinate.",
+			);
 		}
 		const state = this.read();
 		if (state.tailRingRotationCount >= Number.MAX_SAFE_INTEGER) {
@@ -761,7 +833,12 @@ export class GatewayStateStore {
 		});
 	}
 	/** Atomically journals one projected tail event with its consumed watermark. */
-	appendTailProjection(expected: TailCheckpoint | undefined, checkpoint: TailCheckpoint, kind: string, payloadJson: string): void {
+	appendTailProjection(
+		expected: TailCheckpoint | undefined,
+		checkpoint: TailCheckpoint,
+		kind: string,
+		payloadJson: string,
+	): void {
 		if (expected && compareTailCheckpoints(checkpoint, expected) < 0) {
 			throw new GatewayStateError("tail_checkpoint_regression", "Broker-tail checkpoint regressed.");
 		}
@@ -777,26 +854,108 @@ export class GatewayStateStore {
 		});
 	}
 
-	markFailedClosed(reason: string): void {
+	/**
+	 * Enters the durable failed-closed state and raises its alert in ONE commit.
+	 *
+	 * The alert is folded into this transaction rather than appended afterwards:
+	 * two transactions would leave a window where the gateway is failed closed
+	 * with no alert, which is precisely the state an operator needs to be told
+	 * about. Writing only on a clear-to-raised transition keeps a restart from
+	 * re-announcing an ongoing condition.
+	 */
+	markFailedClosed(reason: string, now: number = Date.now()): void {
 		if (!reason) throw new GatewayStateError("failure_reason_invalid", "A fail-closed reason is required.");
 		const state = this.read();
+		const alertRaised = this.rawMeta("alert_failed_closed") === "raised";
 		this.transact({
 			expected: [{ key: "bootstrap_state", value: state.bootstrapState }],
 			puts: [
 				{ key: "bootstrap_state", value: "FAILED_CLOSED" },
 				{ key: "failed_closed_reason", value: stableMetadataJson(reason) },
+				{ key: "failed_closed_since_ms", value: String(now) },
+				{ key: "alert_failed_closed", value: "raised" },
 			],
 			deletes: [],
+			...(alertRaised
+				? {}
+				: {
+						eventKind: "alert_raised",
+						eventPayloadJson: canonicalAlertPayload("failed_closed", reason),
+					}),
 		});
 	}
 
-	approveProfile(profile: WayProfile, receiptId: string, approvedAt: number): { readonly cursor?: string; readonly previousProjection: CanonicalValue | undefined } {
+	/**
+	 * Startup catch-up for a durable failed-closed state that carries no raised
+	 * alert.
+	 *
+	 * This covers two cases: a database upgraded from a schema that had no alert
+	 * flag (v10 defaults it to `clear`), and any future path that marks
+	 * failed-closed without folding an alert. It is load-bearing rather than a
+	 * belt, because without it a restart can leave a failed-closed gateway that
+	 * never announced itself. It must therefore run on EVERY startup that
+	 * observes failed-closed, including the non-persisting recovery path.
+	 */
+	catchUpFailedClosedAlert(now: number = Date.now()): boolean {
 		const state = this.read();
-		if (state.bootstrapState === "ABSENT" || state.bootstrapState === "CREATING" || state.bootstrapState === "CREATED") {
-			throw new GatewayStateError("bootstrap_not_committed", "A profile cannot be approved before bootstrap is committed.");
+		if (state.bootstrapState !== "FAILED_CLOSED") return false;
+		if (this.rawMeta("alert_failed_closed") === "raised") return false;
+		this.transact({
+			expected: [{ key: "alert_failed_closed", value: this.rawMeta("alert_failed_closed") ?? "clear" }],
+			puts: [
+				{ key: "alert_failed_closed", value: "raised" },
+				...(this.rawMeta("failed_closed_since_ms") === "null"
+					? [{ key: "failed_closed_since_ms", value: String(now) }]
+					: []),
+			],
+			deletes: [],
+			eventKind: "alert_raised",
+			eventPayloadJson: canonicalAlertPayload("failed_closed", state.failedClosedReason ?? "unknown"),
+		});
+		return true;
+	}
+
+	/** Clears the fail-closed alert exactly once, when the condition ends. */
+	clearFailedClosedAlert(): boolean {
+		if (this.rawMeta("alert_failed_closed") !== "raised") return false;
+		this.transact({
+			expected: [{ key: "alert_failed_closed", value: "raised" }],
+			puts: [
+				{ key: "alert_failed_closed", value: "clear" },
+				{ key: "failed_closed_since_ms", value: "null" },
+			],
+			deletes: [],
+			eventKind: "alert_cleared",
+			eventPayloadJson: canonicalAlertPayload("failed_closed", "resolved"),
+		});
+		return true;
+	}
+
+	private rawMeta(key: string): string | undefined {
+		return this.#backend.gatewayMetaRead([key]).entries[0]?.value;
+	}
+
+	approveProfile(
+		profile: WayProfile,
+		receiptId: string,
+		approvedAt: number,
+	): { readonly cursor?: string; readonly previousProjection: CanonicalValue | undefined } {
+		const state = this.read();
+		if (
+			state.bootstrapState === "ABSENT" ||
+			state.bootstrapState === "CREATING" ||
+			state.bootstrapState === "CREATED"
+		) {
+			throw new GatewayStateError(
+				"bootstrap_not_committed",
+				"A profile cannot be approved before bootstrap is committed.",
+			);
 		}
 		if (state.bootstrapState === "FAILED_CLOSED" && state.failedClosedReason !== "profile_drift") {
-			throw new GatewayStateError("failed_closed_not_profile_drift", "Only profile drift can be cleared by profile approval.");
+			throw new GatewayStateError(
+				"failed_closed_not_profile_drift",
+				"Only profile drift can be cleared by profile approval.",
+			);
 		}
 		const cursor = this.transact({
 			expected: [{ key: "bootstrap_state", value: state.bootstrapState }],
@@ -809,6 +968,11 @@ export class GatewayStateStore {
 				{ key: "profile_approved_at", value: stableMetadataJson(approvedAt) },
 				{ key: "profile_approval_receipt", value: stableMetadataJson(receiptId) },
 				{ key: "failed_closed_reason", value: "null" },
+				// Recovery must clear the alert in the same commit that ends the
+				// condition. Otherwise way.status.alerts and the metrics
+				// exposition keep reporting a condition that no longer exists.
+				{ key: "alert_failed_closed", value: "clear" },
+				{ key: "failed_closed_since_ms", value: "null" },
 			],
 			deletes: [],
 			eventKind: "profile_approved",

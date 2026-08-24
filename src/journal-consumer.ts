@@ -1,4 +1,4 @@
-import { RpcResponseError, rpcResult, type JsonRpcClient } from "./rpc-client";
+import { type JsonRpcClient, RpcResponseError, rpcResult } from "./rpc-client";
 
 export interface RpcJournalEvent {
 	readonly seq: string | number;
@@ -31,11 +31,15 @@ export interface RpcJournalConsumerOptions {
 	readonly readWaitMs: number;
 	readonly kinds: readonly string[];
 	readonly publish: (event: RpcJournalEvent, context: JournalPublicationContext) => Promise<JournalDeliveryProof>;
+	/** Invoked only after `consumer.commit` durably settles the listed sequences. */
+	readonly afterCommit?: (seqs: readonly string[]) => void;
 	readonly now?: () => number;
 	/** Release an unadvanced claim when a caller intentionally aborts. */
 	readonly releaseOnAbort?: boolean;
 	readonly errorFactory?: (message: string) => Error;
-	readonly gapError?: (input: JournalRetentionGap & { readonly consumerId: string; readonly checkpoint: string }) => Error;
+	readonly gapError?: (
+		input: JournalRetentionGap & { readonly consumerId: string; readonly checkpoint: string },
+	) => Error;
 }
 
 export type RpcJournalConsumerRunResult = "published" | "idle" | "claim_held";
@@ -65,7 +69,9 @@ export class RpcJournalRetentionGapError extends RpcJournalConsumerError {
 	readonly gap: JournalRetentionGap;
 
 	constructor(consumerId: string, checkpoint: string, gap: JournalRetentionGap) {
-		super(`Consumer ${consumerId} checkpoint ${checkpoint} is behind journal retention; operator resync is required at ${gap.resyncCursor}.`);
+		super(
+			`Consumer ${consumerId} checkpoint ${checkpoint} is behind journal retention; operator resync is required at ${gap.resyncCursor}.`,
+		);
 		this.name = "RpcJournalRetentionGapError";
 		this.consumerId = consumerId;
 		this.checkpoint = checkpoint;
@@ -85,6 +91,7 @@ export class RpcJournalConsumer {
 	readonly #readWaitMs: number;
 	readonly #kinds: readonly string[];
 	readonly #publish: RpcJournalConsumerOptions["publish"];
+	readonly #afterCommit: RpcJournalConsumerOptions["afterCommit"];
 	readonly #now: () => number;
 	readonly #releaseOnAbort: boolean;
 	readonly #errorFactory: (message: string) => Error;
@@ -92,7 +99,7 @@ export class RpcJournalConsumer {
 
 	constructor(options: RpcJournalConsumerOptions) {
 		if (!options.consumerId.trim()) throw new RpcJournalConsumerError("Journal consumer_id must not be empty.");
-		if (!Array.isArray(options.kinds) || options.kinds.length === 0 || options.kinds.some(kind => !kind.trim())) {
+		if (!Array.isArray(options.kinds) || options.kinds.length === 0 || options.kinds.some((kind) => !kind.trim())) {
 			throw new RpcJournalConsumerError("Journal consumer kinds must contain at least one non-empty kind.");
 		}
 		if (new Set(options.kinds).size !== options.kinds.length) {
@@ -102,15 +109,16 @@ export class RpcJournalConsumer {
 		this.#consumerId = options.consumerId;
 		this.#claimTtlMs = boundedInteger(options.claimTtlMs, "claimTtlMs", 5_000, 600_000);
 		this.#readWaitMs = boundedInteger(options.readWaitMs, "readWaitMs", 0, 60_000);
-		if (this.#readWaitMs >= this.#claimTtlMs) throw new RpcJournalConsumerError("readWaitMs must be shorter than claimTtlMs.");
+		if (this.#readWaitMs >= this.#claimTtlMs)
+			throw new RpcJournalConsumerError("readWaitMs must be shorter than claimTtlMs.");
 		this.#kinds = [...options.kinds];
 		this.#publish = options.publish;
+		this.#afterCommit = options.afterCommit;
 		this.#now = options.now ?? Date.now;
 		this.#releaseOnAbort = options.releaseOnAbort ?? false;
-		this.#errorFactory = options.errorFactory ?? (message => new RpcJournalConsumerError(message));
+		this.#errorFactory = options.errorFactory ?? ((message) => new RpcJournalConsumerError(message));
 		this.#gapError =
-			options.gapError ??
-			(input => new RpcJournalRetentionGapError(input.consumerId, input.checkpoint, input));
+			options.gapError ?? ((input) => new RpcJournalRetentionGapError(input.consumerId, input.checkpoint, input));
 	}
 
 	async runOnce(signal?: AbortSignal): Promise<RpcJournalConsumerRunResult> {
@@ -205,6 +213,9 @@ export class RpcJournalConsumer {
 			),
 			"consumer.commit",
 		);
+		// Durably settled: only now may a caller drop any in-process guard it
+		// keeps for these sequences.
+		if (proofs.length > 0) this.#afterCommit?.(proofs.map((proof) => proof.seq));
 	}
 
 	private async releaseUnadvancedClaim(claim: ConsumerClaim): Promise<void> {
@@ -216,7 +227,12 @@ export class RpcJournalConsumer {
 	}
 
 	private parseClaim(value: unknown): ConsumerClaim {
-		if (!isRecord(value) || typeof value.claim_id !== "string" || typeof value.cursor !== "string" || typeof value.expires_at !== "number") {
+		if (
+			!isRecord(value) ||
+			typeof value.claim_id !== "string" ||
+			typeof value.cursor !== "string" ||
+			typeof value.expires_at !== "number"
+		) {
 			throw this.#errorFactory("consumer.claim returned an invalid response.");
 		}
 		return { claimId: value.claim_id, cursor: value.cursor, expiresAt: value.expires_at };
@@ -228,7 +244,11 @@ export class RpcJournalConsumer {
 		}
 		const events: RpcJournalEvent[] = [];
 		for (const event of value.events) {
-			if (!isRecord(event) || (typeof event.seq !== "number" && typeof event.seq !== "string") || typeof event.kind !== "string") {
+			if (
+				!isRecord(event) ||
+				(typeof event.seq !== "number" && typeof event.seq !== "string") ||
+				typeof event.kind !== "string"
+			) {
 				throw this.#errorFactory("main.events.read returned an invalid event.");
 			}
 			sequenceString(event.seq, this.#errorFactory);
@@ -243,7 +263,12 @@ export class RpcJournalConsumer {
 			});
 		}
 		if (value.gap === undefined) return { events, nextCursor: value.next_cursor };
-		if (!isRecord(value.gap) || typeof value.gap.missing_from !== "string" || typeof value.gap.missing_to !== "string" || typeof value.gap.resync_cursor !== "string") {
+		if (
+			!isRecord(value.gap) ||
+			typeof value.gap.missing_from !== "string" ||
+			typeof value.gap.missing_to !== "string" ||
+			typeof value.gap.resync_cursor !== "string"
+		) {
 			throw this.#errorFactory("main.events.read returned an invalid retention gap.");
 		}
 		return {
@@ -258,7 +283,12 @@ export class RpcJournalConsumer {
 	}
 
 	private validateProof(proof: JournalDeliveryProof, event: RpcJournalEvent): void {
-		if (!isRecord(proof) || typeof proof.seq !== "string" || typeof proof.dedupe_key !== "string" || !proof.dedupe_key) {
+		if (
+			!isRecord(proof) ||
+			typeof proof.seq !== "string" ||
+			typeof proof.dedupe_key !== "string" ||
+			!proof.dedupe_key
+		) {
 			throw this.#errorFactory("Journal publication returned an invalid delivery proof.");
 		}
 		if (proof.platform_msg_id !== undefined && (typeof proof.platform_msg_id !== "string" || !proof.platform_msg_id)) {

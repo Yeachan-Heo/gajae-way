@@ -1,17 +1,17 @@
+import { afterEach, expect, test } from "bun:test";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import { afterEach, expect, test } from "bun:test";
 import { loadDiscordAdapterConfig } from "../../src/adapter/discord/config";
+import { type RunningDiscordAdapter, startDiscordAdapter } from "../../src/adapter/discord/main";
 import { BrokerCli } from "../../src/broker/cli";
-import { startDiscordAdapter, type RunningDiscordAdapter } from "../../src/adapter/discord/main";
-import { loadWayProfile } from "../../src/profile";
-import { RpcClient } from "../../src/rpc-client";
 import { GatewayStateStore } from "../../src/main-session/state";
 import { loadWayCore } from "../../src/native-loader";
+import { loadWayProfile } from "../../src/profile";
+import { RpcClient } from "../../src/rpc-client";
 import { DiscordFixture } from "../fixtures/discord-fixture";
-import { ManagedProcessRegistry } from "../helpers/managed-process";
 import { FakeBrokerFixture } from "../helpers/main-session";
+import { ManagedProcessRegistry } from "../helpers/managed-process";
 
 const managedProcesses = new ManagedProcessRegistry();
 
@@ -74,7 +74,7 @@ function expectValue(unit: ParsedUnit, section: string, directive: string, expec
 }
 
 function expectWords(unit: ParsedUnit, section: string, directive: string, expected: readonly string[]): void {
-	const actual = new Set(values(unit, section, directive).flatMap(value => value.split(/\s+/).filter(Boolean)));
+	const actual = new Set(values(unit, section, directive).flatMap((value) => value.split(/\s+/).filter(Boolean)));
 	expect([...actual].sort()).toEqual([...expected].sort());
 }
 
@@ -96,6 +96,7 @@ files = []
 id = "discord:owner-dm"
 platform = "discord"
 kind = "dm"
+session_kind = "main"
 
 [main_session]
 session_id = "${sessionId}"
@@ -119,9 +120,16 @@ function compiledWay(): string {
 	return executable;
 }
 
-async function runCommand(command: readonly string[], environment: NodeJS.ProcessEnv): Promise<{ readonly exitCode: number; readonly stdout: string; readonly stderr: string }> {
+async function runCommand(
+	command: readonly string[],
+	environment: NodeJS.ProcessEnv,
+): Promise<{ readonly exitCode: number; readonly stdout: string; readonly stderr: string }> {
 	const child = Bun.spawn({ cmd: [...command], cwd: repositoryRoot, env: environment, stdout: "pipe", stderr: "pipe" });
-	const [exitCode, stdout, stderr] = await Promise.all([child.exited, new Response(child.stdout).text(), new Response(child.stderr).text()]);
+	const [exitCode, stdout, stderr] = await Promise.all([
+		child.exited,
+		new Response(child.stdout).text(),
+		new Response(child.stderr).text(),
+	]);
 	return { exitCode, stdout, stderr };
 }
 
@@ -158,7 +166,12 @@ async function availableClient(socketPath: string, description: string): Promise
 	throw new Error(`${description}${lastError instanceof Error ? `: ${lastError.message}` : ""}`);
 }
 
-async function startDaemon(executable: string, stateDirectory: string, profilePath: string, environment: NodeJS.ProcessEnv): Promise<RunningDaemon> {
+async function startDaemon(
+	executable: string,
+	stateDirectory: string,
+	profilePath: string,
+	environment: NodeJS.ProcessEnv,
+): Promise<RunningDaemon> {
 	const child = managedProcesses.spawnDaemon({
 		cmd: [executable, "serve", "--state-dir", stateDirectory, "--profile", profilePath],
 		cwd: repositoryRoot,
@@ -172,7 +185,6 @@ async function startDaemon(executable: string, stateDirectory: string, profilePa
 		throw error;
 	}
 }
-
 
 async function stopAdapter(adapter: RunningDiscordAdapter | undefined): Promise<void> {
 	if (adapter) await adapter.stop();
@@ -251,7 +263,7 @@ class SupervisedService {
 				{ platformFactory: () => this.#options.fixture, onError: () => undefined },
 			);
 			this.#generation += 1;
-			void this.watchDaemon(daemon).catch(error => {
+			void this.watchDaemon(daemon).catch((error) => {
 				this.#failure = error;
 			});
 		} catch (error) {
@@ -267,7 +279,8 @@ class SupervisedService {
 		if (this.#daemon !== daemon) return;
 		await stopAdapter(this.#adapter);
 		this.#adapter = undefined;
-		if (this.#stopping || exitCode === 0 || restartPrevented(parseUnit("ops/systemd/gajaeway.service"), exitCode)) return;
+		if (this.#stopping || exitCode === 0 || restartPrevented(parseUnit("ops/systemd/gajaeway.service"), exitCode))
+			return;
 		try {
 			await this.startGeneration();
 		} catch (error) {
@@ -276,7 +289,11 @@ class SupervisedService {
 	}
 }
 
-async function eventually<T>(read: () => T | undefined | Promise<T | undefined>, description: string, timeoutMs = 10_000): Promise<T> {
+async function eventually<T>(
+	read: () => T | undefined | Promise<T | undefined>,
+	description: string,
+	timeoutMs = 10_000,
+): Promise<T> {
 	const deadline = Date.now() + timeoutMs;
 	let lastError: unknown;
 	while (Date.now() < deadline) {
@@ -292,7 +309,9 @@ async function eventually<T>(read: () => T | undefined | Promise<T | undefined>,
 }
 
 function restartPrevented(unit: ParsedUnit, exitCode: number): boolean {
-	return values(unit, "Service", "RestartPreventExitStatus").flatMap(value => value.split(/\s+/)).includes(String(exitCode));
+	return values(unit, "Service", "RestartPreventExitStatus")
+		.flatMap((value) => value.split(/\s+/))
+		.includes(String(exitCode));
 }
 
 test("systemd units declare the required hardened daemon and bound adapter contract", () => {
@@ -329,12 +348,25 @@ test("systemd units declare the required hardened daemon and bound adapter contr
 	expectValue(daemon, "Service", "KillMode", "mixed");
 	expectValue(daemon, "Service", "Restart", "on-failure");
 	expectValue(daemon, "Service", "RestartSec", "5s");
-	expectWords(daemon, "Unit", "Wants", ["network-online.target", "gajaeway-discord.service"]);
-	expectValue(daemon, "Unit", "Before", "gajaeway-discord.service");
+	expectWords(daemon, "Unit", "Wants", [
+		"network-online.target",
+		"gajaeway-discord.service",
+		"gajaeway-telegram.service",
+	]);
+	expectWords(daemon, "Unit", "Before", ["gajaeway-discord.service", "gajaeway-telegram.service"]);
 
 	expectValue(daemon, "Service", "RestartPreventExitStatus", "78");
-	expectValue(daemon, "Service", "ExecStart", "/usr/local/bin/gajaeway serve --state-dir /var/lib/gajaeway --profile /etc/gajaeway/profile.toml");
-	expectWords(daemon, "Service", "ReadWritePaths", ["/var/lib/gajaeway", "/srv/gajaeway/corpus", "/srv/gajaeway/workspace"]);
+	expectValue(
+		daemon,
+		"Service",
+		"ExecStart",
+		"/usr/local/bin/gajaeway serve --state-dir /var/lib/gajaeway --profile /etc/gajaeway/profile.toml",
+	);
+	expectWords(daemon, "Service", "ReadWritePaths", [
+		"/var/lib/gajaeway",
+		"/srv/gajaeway/corpus",
+		"/srv/gajaeway/workspace",
+	]);
 
 	expectValue(adapter, "Unit", "Requires", "gajaeway.service");
 	expectValue(adapter, "Unit", "BindsTo", "gajaeway.service");
@@ -364,13 +396,20 @@ test("systemd units declare the required hardened daemon and bound adapter contr
 	expectValue(adapter, "Service", "LoadCredential", "discord-token:/etc/gajaeway/credentials/discord-token");
 	expectValue(adapter, "Service", "Environment", "GAJAEWAY_DISCORD_TOKEN_FILE=%d/discord-token");
 	expect(adapter.source).toContain("mode 0600");
-	expectValue(adapter, "Service", "ExecStart", "/usr/local/bin/gajaeway-discord --state-dir /var/lib/gajaeway --profile /etc/gajaeway/profile.toml");
+	expectValue(
+		adapter,
+		"Service",
+		"ExecStart",
+		"/usr/local/bin/gajaeway-discord --state-dir /var/lib/gajaeway --profile /etc/gajaeway/profile.toml",
+	);
 	expectWords(adapter, "Service", "RestrictAddressFamilies", ["AF_UNIX", "AF_INET", "AF_INET6"]);
 	expectValue(adapter, "Service", "ReadOnlyPaths", "/var/lib/gajaeway");
 
 	const mainSource = fs.readFileSync(path.join(repositoryRoot, "src/main.ts"), "utf8");
 	const notifySource = fs.readFileSync(path.join(repositoryRoot, "crates/way-core/src/systemd.rs"), "utf8");
-	expect(mainSource).toContain('core.sdNotifyReady(verificationPending ? "gajaeway transcript verification pending" : "gajaeway running")');
+	expect(mainSource).toContain(
+		'core.sdNotifyReady(verificationPending ? "gajaeway transcript verification pending" : "gajaeway running")',
+	);
 	expect(mainSource).toContain('core.sdNotifyReady("gajaeway running")');
 	expect(notifySource).toContain("READY=1\\nSTATUS=");
 });
@@ -380,7 +419,9 @@ test("example profile covers the identity projection, mutable tunables, and Disc
 	const profile = loadWayProfile(profilePath);
 	expect(profile.injection.files).toEqual(["SOUL.md", "USER.md", "daily/{date}.md", "MEMORY.md"]);
 	expect(profile.restrictedFiles.conversation).toEqual(["MEMORY.md"]);
-	expect(profile.ownerSurfaces).toEqual([{ id: "discord:owner-dm", platform: "discord", kind: "dm" }]);
+	expect(profile.ownerSurfaces).toEqual([
+		{ id: "discord:owner-dm", platform: "discord", kind: "dm", sessionKind: "main" },
+	]);
 	expect(profile.operator).toMatchObject({ id: "gaebal-gajae-operator" });
 	expect(profile.tunables).toMatchObject({ poll: { interval_ms: 15000 }, ack: { budget_ms: 2000 } });
 	const adapter = loadDiscordAdapterConfig({
@@ -389,7 +430,12 @@ test("example profile covers the identity projection, mutable tunables, and Disc
 		stateDir: "/var/lib/gajaeway",
 		environment: { GAJAEWAY_DISCORD_BOT_TOKEN: "fixture-token" },
 	});
-	expect(adapter).toMatchObject({ route: { channelId: "123456789012345678", surfaceId: "discord:owner-dm" }, ackBudgetMs: 2000, claimTtlMs: 5000, readWaitMs: 1000 });
+	expect(adapter).toMatchObject({
+		route: { channelId: "123456789012345678", surfaceId: "discord:owner-dm" },
+		ackBudgetMs: 2000,
+		claimTtlMs: 5000,
+		readWaitMs: 1000,
+	});
 });
 
 test("supervised daemon restart restores the PartOf-bound fixture adapter and compiled RPC delivery", async () => {
@@ -403,7 +449,10 @@ test("supervised daemon restart restores the PartOf-bound fixture adapter and co
 	fs.mkdirSync(corpus);
 	fs.writeFileSync(profilePath, testProfile(corpus, workspace, fixtureSession.sessionId));
 	const environment = e2eEnvironment(fixtureSession);
-	const bootstrap = await runCommand([executable, "bootstrap", "--confirm", "--state-dir", stateDirectory, "--profile", profilePath], environment);
+	const bootstrap = await runCommand(
+		[executable, "bootstrap", "--confirm", "--state-dir", stateDirectory, "--profile", profilePath],
+		environment,
+	);
 	expect(bootstrap.exitCode).toBe(0);
 	expect(bootstrap.stdout).toContain('"state":"committed"');
 
@@ -412,12 +461,18 @@ test("supervised daemon restart restores the PartOf-bound fixture adapter and co
 	try {
 		service = new SupervisedService({ executable, stateDirectory, profilePath, environment, fixture });
 		await service.start();
-		expect((await service.daemon.client.request("way.health")).result).toMatchObject({ status: "healthy", state: "running" });
+		expect((await service.daemon.client.request("way.health")).result).toMatchObject({
+			status: "healthy",
+			state: "running",
+		});
 
 		// The test only crashes the daemon. The unit topology causes BindsTo to stop
 		// the adapter and PartOf to bring it back with the daemon's restart.
 		await service.crashDaemon();
-		expect((await service.daemon.client.request("way.health")).result).toMatchObject({ status: "healthy", state: "running" });
+		expect((await service.daemon.client.request("way.health")).result).toMatchObject({
+			status: "healthy",
+			state: "running",
+		});
 
 		const submitted = await service.daemon.client.request("main.submit", {
 			text: "restart fixture delivery",
@@ -426,7 +481,7 @@ test("supervised daemon restart restores the PartOf-bound fixture adapter and co
 		});
 		expect(submitted.result).toMatchObject({ accepted: true, delivered_as: "prompt" });
 		const delivery = await eventually(
-			() => fixture.sends.find(send => send.text === "ack"),
+			() => fixture.sends.find((send) => send.text === "ack"),
 			"restarted adapter did not deliver the fixture reply",
 			12_000,
 		);
@@ -435,7 +490,16 @@ test("supervised daemon restart restores the PartOf-bound fixture adapter and co
 		expect(fixture.disconnectCount).toBeGreaterThanOrEqual(1);
 
 		const failClosed = await runCommand(
-			[executable, "serve", "--state-dir", path.join(root, "x"), "--profile", profilePath, "--fail-closed-linger-ms", "25"],
+			[
+				executable,
+				"serve",
+				"--state-dir",
+				path.join(root, "x"),
+				"--profile",
+				profilePath,
+				"--fail-closed-linger-ms",
+				"25",
+			],
 			environment,
 		);
 		expect(failClosed.exitCode, failClosed.stderr).toBe(78);
@@ -456,7 +520,11 @@ test("Type=notify topology keeps Discord ingress disconnected until a fenced bus
 	const socketPath = path.join(stateDirectory, "rpc.sock");
 	const environment = e2eEnvironment(fixture);
 	const opRef = "systemd-verification-pending";
-	const inbound = { id: "fenced-discord-message", channelId: "123456789012345678", text: "deliver only after verification" };
+	const inbound = {
+		id: "fenced-discord-message",
+		channelId: "123456789012345678",
+		text: "deliver only after verification",
+	};
 	const discord = new DiscordFixture();
 	const adapterStartup = new AbortController();
 	const adapterErrors: Error[] = [];
@@ -468,7 +536,10 @@ test("Type=notify topology keeps Discord ingress disconnected until a fenced bus
 	try {
 		fs.mkdirSync(corpus);
 		fs.writeFileSync(profilePath, testProfile(corpus, fixture.workspace, fixture.sessionId));
-		const bootstrap = await runCommand([executable, "bootstrap", "--confirm", "--state-dir", stateDirectory, "--profile", profilePath], environment);
+		const bootstrap = await runCommand(
+			[executable, "bootstrap", "--confirm", "--state-dir", stateDirectory, "--profile", profilePath],
+			environment,
+		);
 		expect(bootstrap.exitCode).toBe(0);
 		const startupCore = loadWayCore().WayCore.open(stateDirectory);
 		const startupState = new GatewayStateStore(startupCore);
@@ -488,15 +559,16 @@ test("Type=notify topology keeps Discord ingress disconnected until a fenced bus
 			env: environment,
 		});
 		client = await availableClient(socketPath, "fenced daemon did not expose its RPC listener");
-		const pending = await eventually(
-			async () => {
-				const status = (await client!.request("way.status", {}, { timeoutMs: 1_000 })).result as Record<string, unknown> | undefined;
-				return status?.state === "verifying" && status.transcript_proof === "proven" && status.transcript_verification === "pending"
-					? status
-					: undefined;
-			},
-			"fenced busy restart did not enter transcript verification pending",
-		);
+		const pending = await eventually(async () => {
+			const status = (await client!.request("way.status", {}, { timeoutMs: 1_000 })).result as
+				| Record<string, unknown>
+				| undefined;
+			return status?.state === "verifying" &&
+				status.transcript_proof === "proven" &&
+				status.transcript_verification === "pending"
+				? status
+				: undefined;
+		}, "fenced busy restart did not enter transcript verification pending");
 		expect(pending).toMatchObject({ status: "booting", state: "verifying" });
 		adapterStart = startDiscordAdapter(
 			{
@@ -509,8 +581,8 @@ test("Type=notify topology keeps Discord ingress disconnected until a fenced bus
 			},
 			{
 				platformFactory: () => discord,
-				onError: error => adapterErrors.push(error),
-				onDiagnostic: message => adapterDiagnostics.push(message),
+				onError: (error) => adapterErrors.push(error),
+				onDiagnostic: (message) => adapterDiagnostics.push(message),
 				startupSignal: adapterStartup.signal,
 			},
 		);
@@ -529,16 +601,17 @@ test("Type=notify topology keeps Discord ingress disconnected until a fenced bus
 		expect(discord.messageHandlerCount).toBe(0);
 		expect(discord.queuedMessageCount).toBe(1);
 		expect(discord.acknowledgements).toEqual([]);
-		expect(fixture.commands().filter(command => command.text === inbound.text)).toEqual([]);
-		expect(adapterDiagnostics).toEqual(["gateway verifying (expected wait); delaying Discord connection until healthy/running."]);
+		expect(fixture.commands().filter((command) => command.text === inbound.text)).toEqual([]);
+		expect(adapterDiagnostics).toEqual([
+			"gateway verifying (expected wait); delaying Discord connection until healthy/running.",
+		]);
 		fixture.complete(opRef, { text: "verification completed after ready was already signaled" });
-		await eventually(
-			async () => {
-				const health = (await client!.request("way.health", {}, { timeoutMs: 1_000 })).result as Record<string, unknown> | undefined;
-				return health?.status === "healthy" && health.state === "running" ? health : undefined;
-			},
-			"fenced daemon did not promote after its terminal verification tail",
-		);
+		await eventually(async () => {
+			const health = (await client!.request("way.health", {}, { timeoutMs: 1_000 })).result as
+				| Record<string, unknown>
+				| undefined;
+			return health?.status === "healthy" && health.state === "running" ? health : undefined;
+		}, "fenced daemon did not promote after its terminal verification tail");
 		expect(daemon.exitCode).toBeNull();
 		expect((await client.request("way.status", {}, { timeoutMs: 1_000 })).result).toMatchObject({
 			status: "healthy",
@@ -548,14 +621,17 @@ test("Type=notify topology keeps Discord ingress disconnected until a fenced bus
 		adapter = await adapterStart;
 		expect(discord.queuedMessageCount).toBe(0);
 		await eventually(
-			() => fixture.commands().find(command => command.operation === "turn.prompt" && command.text === inbound.text),
+			() => fixture.commands().find((command) => command.operation === "turn.prompt" && command.text === inbound.text),
 			"adapter did not admit the queued Discord message after verification promotion",
 		);
 		expect(discord.acknowledgements).toHaveLength(1);
-		const inboundCommand = fixture.commands().find(command => command.operation === "turn.prompt" && command.text === inbound.text);
-		if (typeof inboundCommand?.opRef !== "string") throw new Error("gated Discord ingress did not retain its operation reference");
+		const inboundCommand = fixture
+			.commands()
+			.find((command) => command.operation === "turn.prompt" && command.text === inbound.text);
+		if (typeof inboundCommand?.opRef !== "string")
+			throw new Error("gated Discord ingress did not retain its operation reference");
 		await eventually(
-			() => discord.sends.find(send => send.text === "ack"),
+			() => discord.sends.find((send) => send.text === "ack"),
 			"adapter did not deliver the accepted Discord ingress reply",
 		);
 		expect(adapterErrors).toEqual([]);

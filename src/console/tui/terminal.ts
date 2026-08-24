@@ -137,7 +137,10 @@ export class RawConsoleTerminal implements ConsoleTerminal {
 		}
 		this.#wasRaw = this.#input.isRaw === true;
 		this.#isProcessTerminal = this.#input === stdin && this.#output === stdout;
-		this.#renderer.resize(firstTerminalDimension(this.#output.columns, 80), firstTerminalDimension(this.#output.rows, 24));
+		this.#renderer.resize(
+			firstTerminalDimension(this.#output.columns, 80),
+			firstTerminalDimension(this.#output.rows, 24),
+		);
 		this.#input.setEncoding("utf8");
 		this.#input.setRawMode(true);
 		this.#input.resume();
@@ -258,7 +261,10 @@ export class RawConsoleTerminal implements ConsoleTerminal {
 
 	private onResize = (): void => {
 		if (this.#closed) return;
-		this.#renderer.resize(firstTerminalDimension(this.#output.columns, this.#renderer.columns), firstTerminalDimension(this.#output.rows, this.#renderer.rows));
+		this.#renderer.resize(
+			firstTerminalDimension(this.#output.columns, this.#renderer.columns),
+			firstTerminalDimension(this.#output.rows, this.#renderer.rows),
+		);
 		this.#requestEditorRender();
 	};
 

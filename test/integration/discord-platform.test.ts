@@ -46,8 +46,10 @@ test("hand-rolled Discord platform identifies, heartbeats, resumes, routes MESSA
 			const url = String(input);
 			const method = init?.method ?? "GET";
 			requests.push({ url, method, ...(typeof init?.body === "string" ? { body: init.body } : {}) });
-			if (url.endsWith("/gateway/bot")) return new Response(JSON.stringify({ url: "wss://gateway.test" }), { status: 200 });
-			if (url.includes("/messages") && method === "POST") return new Response(JSON.stringify({ id: "platform-message-1" }), { status: 200 });
+			if (url.endsWith("/gateway/bot"))
+				return new Response(JSON.stringify({ url: "wss://gateway.test" }), { status: 200 });
+			if (url.includes("/messages") && method === "POST")
+				return new Response(JSON.stringify({ id: "platform-message-1" }), { status: 200 });
 			return new Response(null, { status: 204 });
 		},
 		webSocketFactory: () => {
@@ -59,7 +61,7 @@ test("hand-rolled Discord platform identifies, heartbeats, resumes, routes MESSA
 		reconnectMaxMs: 2,
 	});
 	const messages: Array<{ id: string; text: string }> = [];
-	platform.onMessage(message => {
+	platform.onMessage((message) => {
 		messages.push({ id: message.id, text: message.text });
 	});
 	try {
@@ -67,25 +69,34 @@ test("hand-rolled Discord platform identifies, heartbeats, resumes, routes MESSA
 		await waitFor(() => sockets.length === 1);
 		const first = sockets[0] as GatewaySocketFixture;
 		first.emit("message", { data: JSON.stringify({ op: 10, d: { heartbeat_interval: 60_000 } }) });
-		expect(first.sent.map(entry => JSON.parse(entry))).toEqual(
-			expect.arrayContaining([expect.objectContaining({ op: 1 }), expect.objectContaining({ op: 2, d: expect.objectContaining({ intents: 36_864 }) })]),
+		expect(first.sent.map((entry) => JSON.parse(entry))).toEqual(
+			expect.arrayContaining([
+				expect.objectContaining({ op: 1 }),
+				expect.objectContaining({ op: 2, d: expect.objectContaining({ intents: 36_864 }) }),
+			]),
 		);
-		first.emit(
-			"message",
-			{ data: JSON.stringify({ op: 0, s: 7, t: "READY", d: { session_id: "session-1", resume_gateway_url: "wss://resume.test" } }) },
-		);
+		first.emit("message", {
+			data: JSON.stringify({
+				op: 0,
+				s: 7,
+				t: "READY",
+				d: { session_id: "session-1", resume_gateway_url: "wss://resume.test" },
+			}),
+		});
 		await connecting;
-		first.emit(
-			"message",
-			{
-				data: JSON.stringify({
-					op: 0,
-					s: 8,
-					t: "MESSAGE_CREATE",
-					d: { id: "incoming-1", channel_id: "123456789012345678", content: "owner message", author: { id: "owner", bot: false } },
-				}),
-			},
-		);
+		first.emit("message", {
+			data: JSON.stringify({
+				op: 0,
+				s: 8,
+				t: "MESSAGE_CREATE",
+				d: {
+					id: "incoming-1",
+					channel_id: "123456789012345678",
+					content: "owner message",
+					author: { id: "owner", bot: false },
+				},
+			}),
+		});
 		await waitFor(() => messages.length === 1);
 		expect(messages).toEqual([{ id: "incoming-1", text: "owner message" }]);
 		expect(await platform.send("123456789012345678", "reply", "nonce-1")).toBe("platform-message-1");
@@ -94,8 +105,14 @@ test("hand-rolled Discord platform identifies, heartbeats, resumes, routes MESSA
 		expect(requests).toEqual(
 			expect.arrayContaining([
 				expect.objectContaining({ url: "https://discord.com/api/v10/gateway/bot", method: "GET" }),
-				expect.objectContaining({ method: "POST", body: JSON.stringify({ content: "reply", nonce: "nonce-1", enforce_nonce: true }) }),
-				expect.objectContaining({ url: "https://discord.com/api/v10/channels/123456789012345678/typing", method: "POST" }),
+				expect.objectContaining({
+					method: "POST",
+					body: JSON.stringify({ content: "reply", nonce: "nonce-1", enforce_nonce: true }),
+				}),
+				expect.objectContaining({
+					url: "https://discord.com/api/v10/channels/123456789012345678/typing",
+					method: "POST",
+				}),
 			]),
 		);
 
@@ -103,8 +120,10 @@ test("hand-rolled Discord platform identifies, heartbeats, resumes, routes MESSA
 		await waitFor(() => sockets.length === 2);
 		const second = sockets[1] as GatewaySocketFixture;
 		second.emit("message", { data: JSON.stringify({ op: 10, d: { heartbeat_interval: 60_000 } }) });
-		expect(second.sent.map(entry => JSON.parse(entry))).toEqual(
-			expect.arrayContaining([expect.objectContaining({ op: 6, d: expect.objectContaining({ session_id: "session-1", seq: 8 }) })]),
+		expect(second.sent.map((entry) => JSON.parse(entry))).toEqual(
+			expect.arrayContaining([
+				expect.objectContaining({ op: 6, d: expect.objectContaining({ session_id: "session-1", seq: 8 }) }),
+			]),
 		);
 		second.emit("message", { data: JSON.stringify({ op: 0, s: 8, t: "RESUMED", d: {} }) });
 	} finally {
@@ -117,8 +136,9 @@ test("hello schedules the real heartbeat interval so a latent ACK cannot kill th
 	const closes: Array<{ code: number; reason: string }> = [];
 	const platform = new DiscordGatewayPlatform({
 		token: "test-token",
-		fetch: async input => {
-			if (String(input).endsWith("/gateway/bot")) return new Response(JSON.stringify({ url: "wss://gateway.test" }), { status: 200 });
+		fetch: async (input) => {
+			if (String(input).endsWith("/gateway/bot"))
+				return new Response(JSON.stringify({ url: "wss://gateway.test" }), { status: 200 });
 			return new Response(null, { status: 204 });
 		},
 		webSocketFactory: () => {
@@ -144,7 +164,7 @@ test("hello schedules the real heartbeat interval so a latent ACK cannot kill th
 		// "Discord heartbeat ACK missing" within this window.
 		await Bun.sleep(40);
 		expect(closes).toEqual([]);
-		const beats = socket.sent.map(entry => JSON.parse(entry)).filter(payload => payload.op === 1);
+		const beats = socket.sent.map((entry) => JSON.parse(entry)).filter((payload) => payload.op === 1);
 		expect(beats).toHaveLength(1);
 		socket.emit("message", { data: JSON.stringify({ op: 11, d: null }) });
 		socket.emit("message", { data: JSON.stringify({ op: 0, s: 1, t: "READY", d: { session_id: "session-latency" } }) });
@@ -153,4 +173,80 @@ test("hello schedules the real heartbeat interval so a latent ACK cannot kill th
 	} finally {
 		await platform.disconnect();
 	}
+});
+
+/**
+ * `POST /channels/{id}/typing` is among Discord's most aggressively rate-limited
+ * routes and the keepalive polls it per channel, so a 429 is expected traffic
+ * rather than an exceptional case. Before this the REST layer threw on any
+ * non-ok response, which is what made the operator-visible typing failure fatal.
+ */
+test("a rate-limited typing request honours retry_after and then succeeds", async () => {
+	const waits: number[] = [];
+	let calls = 0;
+	const platform = new DiscordGatewayPlatform({
+		token: "test-token",
+		sleep: async (milliseconds) => {
+			waits.push(milliseconds);
+		},
+		fetch: (async () => {
+			calls += 1;
+			if (calls === 1) {
+				return new Response(JSON.stringify({ retry_after: 0.25 }), {
+					status: 429,
+					headers: { "retry-after": "0.25", "content-type": "application/json" },
+				});
+			}
+			return new Response(null, { status: 204 });
+		}) as unknown as ConstructorParameters<typeof DiscordGatewayPlatform>[0]["fetch"],
+	});
+
+	await platform.ackTyping("123456789012345678");
+
+	expect(calls).toBe(2);
+	expect(waits).toEqual([250]);
+});
+
+test("a persistently rate-limited request gives up instead of retrying forever", async () => {
+	let calls = 0;
+	const platform = new DiscordGatewayPlatform({
+		token: "test-token",
+		sleep: async () => {},
+		fetch: (async () => {
+			calls += 1;
+			return new Response(JSON.stringify({ retry_after: 0.01 }), {
+				status: 429,
+				headers: { "retry-after": "0.01", "content-type": "application/json" },
+			});
+		}) as unknown as ConstructorParameters<typeof DiscordGatewayPlatform>[0]["fetch"],
+	});
+
+	await expect(platform.ackTyping("123456789012345678")).rejects.toThrow();
+	// Bounded: an unbounded retry would let a rate limit block adapter shutdown.
+	expect(calls).toBe(4);
+});
+
+test("a hostile retry_after is clamped so one response cannot stall the adapter", async () => {
+	const waits: number[] = [];
+	let calls = 0;
+	const platform = new DiscordGatewayPlatform({
+		token: "test-token",
+		sleep: async (milliseconds) => {
+			waits.push(milliseconds);
+		},
+		fetch: (async () => {
+			calls += 1;
+			if (calls === 1) {
+				return new Response(JSON.stringify({ retry_after: 86_400 }), {
+					status: 429,
+					headers: { "retry-after": "86400", "content-type": "application/json" },
+				});
+			}
+			return new Response(null, { status: 204 });
+		}) as unknown as ConstructorParameters<typeof DiscordGatewayPlatform>[0]["fetch"],
+	});
+
+	await platform.ackTyping("123456789012345678");
+
+	expect(waits).toEqual([5_000]);
 });

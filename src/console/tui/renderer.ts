@@ -165,12 +165,7 @@ export class ConsoleTuiRenderer {
 
 	appendFrame(text: string): void {
 		const normalized = text.replace(/\r\n?/gu, "\n");
-		const sanitized = boundedFrameText(
-			normalized
-				.split("\n")
-				.map(safeTerminalText)
-				.join("\n"),
-		);
+		const sanitized = boundedFrameText(normalized.split("\n").map(safeTerminalText).join("\n"));
 		const lines = sanitized.split("\n");
 		if (lines.at(-1) === "") lines.pop();
 		const frame = { lines, bytes: Buffer.byteLength(sanitized) } satisfies TranscriptFrame;
@@ -189,7 +184,10 @@ export class ConsoleTuiRenderer {
 		}
 		this.#invalidateLayout();
 		const liveCapacity = this.#transcriptCapacity();
-		this.#scrollOffset = Math.min(this.#scrollOffset, Math.max(0, this.#logicalTranscriptLines().length - liveCapacity));
+		this.#scrollOffset = Math.min(
+			this.#scrollOffset,
+			Math.max(0, this.#logicalTranscriptLines().length - liveCapacity),
+		);
 	}
 
 	setStatusSummary(summary: string): void {
@@ -223,7 +221,12 @@ export class ConsoleTuiRenderer {
 				break;
 			case "health_change": {
 				const payload = recordValue(event.payload);
-				const state = typeof payload.state === "string" ? payload.state : typeof payload.status === "string" ? payload.status : "unknown";
+				const state =
+					typeof payload.state === "string"
+						? payload.state
+						: typeof payload.status === "string"
+							? payload.status
+							: "unknown";
 				this.#daemon = replaceField(this.#daemon, "state", safeTerminalText(state));
 				break;
 			}

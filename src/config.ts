@@ -28,7 +28,8 @@ export function defaultConfig(environment: NodeJS.ProcessEnv = process.env): Way
 		profilePath: path.resolve(environment.GAJAEWAY_PROFILE || "ops/profiles/gaebal-gajae.example.toml"),
 		...(sessionId ? { sessionId } : {}),
 		failClosedLingerMs:
-			parseLingerMs(environment.GAJAEWAY_FAIL_CLOSED_LINGER_MS, "GAJAEWAY_FAIL_CLOSED_LINGER_MS") ?? DEFAULT_FAIL_CLOSED_LINGER_MS,
+			parseLingerMs(environment.GAJAEWAY_FAIL_CLOSED_LINGER_MS, "GAJAEWAY_FAIL_CLOSED_LINGER_MS") ??
+			DEFAULT_FAIL_CLOSED_LINGER_MS,
 		brokerCliPath: environment.GAJAEWAY_BROKER_CLI?.trim() || "gjc",
 		reconcilePollMs: parsePositiveMs(environment.GAJAEWAY_RECONCILE_POLL_MS, "GAJAEWAY_RECONCILE_POLL_MS") ?? 15_000,
 	};
@@ -36,7 +37,8 @@ export function defaultConfig(environment: NodeJS.ProcessEnv = process.env): Way
 
 function parseLingerMs(value: string | undefined, name: string): number | undefined {
 	if (value === undefined) return undefined;
-	if (!/^\d+$/.test(value)) throw new ConfigValidationError(`${name} must be a non-negative integer number of milliseconds.`);
+	if (!/^\d+$/.test(value))
+		throw new ConfigValidationError(`${name} must be a non-negative integer number of milliseconds.`);
 	const parsed = Number(value);
 	if (!Number.isSafeInteger(parsed) || parsed > 86_400_000) {
 		throw new ConfigValidationError(`${name} must be between 0 and 86400000 milliseconds.`);
@@ -46,7 +48,8 @@ function parseLingerMs(value: string | undefined, name: string): number | undefi
 
 function parsePositiveMs(value: string | undefined, name: string): number | undefined {
 	if (value === undefined) return undefined;
-	if (!/^\d+$/.test(value)) throw new ConfigValidationError(`${name} must be a positive integer number of milliseconds.`);
+	if (!/^\d+$/.test(value))
+		throw new ConfigValidationError(`${name} must be a positive integer number of milliseconds.`);
 	const parsed = Number(value);
 	if (!Number.isSafeInteger(parsed) || parsed < 1 || parsed > 600_000) {
 		throw new ConfigValidationError(`${name} must be between 1 and 600000 milliseconds.`);
@@ -97,7 +100,14 @@ export function parseWayConfig(arguments_: readonly string[], initial = defaultC
 		remaining.push(argument);
 	}
 	return {
-		config: { stateDir, profilePath, ...(sessionId ? { sessionId } : {}), failClosedLingerMs, brokerCliPath, reconcilePollMs },
+		config: {
+			stateDir,
+			profilePath,
+			...(sessionId ? { sessionId } : {}),
+			failClosedLingerMs,
+			brokerCliPath,
+			reconcilePollMs,
+		},
 		remaining,
 	};
 }

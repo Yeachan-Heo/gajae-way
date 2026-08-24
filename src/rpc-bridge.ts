@@ -37,13 +37,17 @@ function boundedDiagnosticText(value: string): string {
 }
 
 function bridgeExceptionPayload(error: unknown): RpcBridgeError {
-	const reason = recordReason(error) ?? (error instanceof RpcBridgeException ? recordReason(error.data) : undefined) ?? "bridge_exception";
+	const reason =
+		recordReason(error) ??
+		(error instanceof RpcBridgeException ? recordReason(error.data) : undefined) ??
+		"bridge_exception";
 	const errorType =
 		error instanceof Error
 			? boundedDiagnosticText(error.name || error.constructor.name || "Error")
 			: boundedDiagnosticText(typeof error);
 	const message = boundedDiagnosticText(error instanceof Error ? error.message : String(error));
-	const stack = error instanceof Error && typeof error.stack === "string" ? boundedDiagnosticText(error.stack) : undefined;
+	const stack =
+		error instanceof Error && typeof error.stack === "string" ? boundedDiagnosticText(error.stack) : undefined;
 	return {
 		code: -32603,
 		message: "bridge_exception",
@@ -70,7 +74,10 @@ function unavailableHandler(method: string): { error: RpcBridgeError } {
  * reports exactly one JSON completion; the native side treats late or repeated
  * completions as counted no-ops.
  */
-export function createRpcBridge(core: WayCoreHandle, handler: RpcBridgeHandler = unavailableHandler): RpcBridgeCallback {
+export function createRpcBridge(
+	core: WayCoreHandle,
+	handler: RpcBridgeHandler = unavailableHandler,
+): RpcBridgeCallback {
 	return ((error: Error | null | RpcBridgeRequest, request?: RpcBridgeRequest) => {
 		const bridgeRequest = request ?? (error as RpcBridgeRequest);
 		const callbackError = request ? error : null;
@@ -80,9 +87,9 @@ export function createRpcBridge(core: WayCoreHandle, handler: RpcBridgeHandler =
 				if (callbackError) throw callbackError;
 				return JSON.parse(bridgeRequest.paramsJson) as unknown;
 			})
-			.then(params => handler(bridgeRequest.method, params))
-			.then(result => core.bridgeComplete(bridgeRequest.reqId, JSON.stringify(result)))
-			.catch(error => {
+			.then((params) => handler(bridgeRequest.method, params))
+			.then((result) => core.bridgeComplete(bridgeRequest.reqId, JSON.stringify(result)))
+			.catch((error) => {
 				try {
 					core.bridgeComplete(bridgeRequest.reqId, JSON.stringify(errorPayload(error)));
 				} catch {

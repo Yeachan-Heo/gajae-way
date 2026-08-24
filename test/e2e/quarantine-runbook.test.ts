@@ -1,12 +1,12 @@
+import { afterEach, expect, test } from "bun:test";
+import type { ChildProcess } from "node:child_process";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import type { ChildProcess } from "node:child_process";
-import { afterEach, expect, test } from "bun:test";
-import { createClosureExecutor } from "../../src/main-session/closure";
 import { startWayServer } from "../../src/main";
+import { createClosureExecutor } from "../../src/main-session/closure";
 import type { WayCoreHandle } from "../../src/native-loader";
-import { RpcClient, type JsonRpcResponse } from "../../src/rpc-client";
+import { type JsonRpcResponse, RpcClient } from "../../src/rpc-client";
 import { ManagedProcessRegistry } from "../helpers/managed-process";
 
 const managedProcesses = new ManagedProcessRegistry();
@@ -15,12 +15,16 @@ afterEach(async () => {
 	await managedProcesses.reapAll();
 });
 
-
 const repositoryRoot = path.resolve(import.meta.dir, "..", "..");
 
 interface Holder {
 	readonly child: ChildProcess;
-	readonly identity: { readonly pid: number; readonly pidStartTime: string; readonly pgid: number; readonly pgidStartTime?: string };
+	readonly identity: {
+		readonly pid: number;
+		readonly pidStartTime: string;
+		readonly pgid: number;
+		readonly pgidStartTime?: string;
+	};
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -29,7 +33,11 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 
 async function run(command: readonly string[], cwd = repositoryRoot): Promise<string> {
 	const child = Bun.spawn({ cmd: [...command], cwd, stdout: "pipe", stderr: "pipe" });
-	const [exitCode, stdout, stderr] = await Promise.all([child.exited, new Response(child.stdout).text(), new Response(child.stderr).text()]);
+	const [exitCode, stdout, stderr] = await Promise.all([
+		child.exited,
+		new Response(child.stdout).text(),
+		new Response(child.stderr).text(),
+	]);
 	if (exitCode !== 0) throw new Error(`${command.join(" ")} failed (${exitCode}): ${stderr || stdout}`);
 	return stdout;
 }
@@ -44,7 +52,9 @@ async function connectEventually(socketPath: string): Promise<RpcClient> {
 			await Bun.sleep(10);
 		}
 	}
-	throw new Error(`RPC socket did not become available: ${lastError instanceof Error ? lastError.message : "unknown error"}`);
+	throw new Error(
+		`RPC socket did not become available: ${lastError instanceof Error ? lastError.message : "unknown error"}`,
+	);
 }
 
 /** Mirrors the operations runbook's NDJSON `way_rpc METHOD JSON` helper. */
@@ -76,7 +86,9 @@ async function spawnHolder(core: WayCoreHandle): Promise<Holder> {
 		}
 	}
 	await managedProcesses.crashNodeGroup(child);
-	throw new Error(`holder process did not publish an incarnation: ${lastError instanceof Error ? lastError.message : "unknown error"}`);
+	throw new Error(
+		`holder process did not publish an incarnation: ${lastError instanceof Error ? lastError.message : "unknown error"}`,
+	);
 }
 
 async function killHolder(holder: Holder): Promise<void> {
@@ -131,7 +143,10 @@ test("quarantine runbook fences a live holder, records only a complete bound rec
 		// The documented detection and fencing requests use the real public RPC
 		// names and exact snake_case fields from quarantine.md.
 		const initialStatus = responseResult(await wayRpc(client, "way.status", "{}"));
-		expect(initialStatus).toMatchObject({ lock: { holder: { lease_id: lease.leaseId }, quarantined: false }, write_mode: true });
+		expect(initialStatus).toMatchObject({
+			lock: { holder: { lease_id: lease.leaseId }, quarantined: false },
+			write_mode: true,
+		});
 
 		const forced = await wayRpc(
 			client,
@@ -153,7 +168,10 @@ test("quarantine runbook fences a live holder, records only a complete bound rec
 			),
 		);
 		expect(quarantined).toMatchObject({ quarantined: true });
-		expect(responseResult(await wayRpc(client, "way.status", "{}"))).toMatchObject({ lock: { quarantined: true }, write_mode: false });
+		expect(responseResult(await wayRpc(client, "way.status", "{}"))).toMatchObject({
+			lock: { quarantined: true },
+			write_mode: false,
+		});
 
 		// The runbook's process inspection precedes its Git status/fsck/fetch/log
 		// checks. A killed holder gives record_quarantine_receipt a fresh death proof.
@@ -234,11 +252,18 @@ test("quarantine runbook fences a live holder, records only a complete bound rec
 			await wayRpc(
 				client,
 				"gitlock.clear_quarantine",
-				JSON.stringify({ verification_receipt_id: receiptId, confirm: true, idempotency_key: "clear-quarantine-runbook" }),
+				JSON.stringify({
+					verification_receipt_id: receiptId,
+					confirm: true,
+					idempotency_key: "clear-quarantine-runbook",
+				}),
 			),
 		);
 		expect(cleared).toMatchObject({ quarantined: false });
-		expect(responseResult(await wayRpc(client, "way.status", "{}"))).toMatchObject({ lock: { quarantined: false }, write_mode: true });
+		expect(responseResult(await wayRpc(client, "way.status", "{}"))).toMatchObject({
+			lock: { quarantined: false },
+			write_mode: true,
+		});
 
 		// Verify that the documented status transition reopens actual supervised
 		// writes, not merely an in-memory flag, against the authoritative bare remote.
@@ -257,7 +282,9 @@ test("quarantine runbook fences a live holder, records only a complete bound rec
 		const runbook = fs.readFileSync(path.join(repositoryRoot, "ops/runbooks/quarantine.md"), "utf8");
 		const adapterUnit = fs.readFileSync(path.join(repositoryRoot, "ops/systemd/gajaeway-discord.service"), "utf8");
 		expect(adapterUnit).toMatch(/^ConditionPathExists=!\/etc\/gajaeway\/recovery\/no-discord-ingress$/m);
-		expect(runbook).toContain("sudo install -o root -g root -m 0600 /dev/null /etc/gajaeway/recovery/no-discord-ingress");
+		expect(runbook).toContain(
+			"sudo install -o root -g root -m 0600 /dev/null /etc/gajaeway/recovery/no-discord-ingress",
+		);
 		expect(runbook).toContain("ConditionResult gajaeway-discord.service");
 		expect(runbook).toContain("gitlock.record_quarantine_receipt");
 		expect(runbook).toContain('"lease_id":"LEASE_ID","corpus":"corpus","checks"');

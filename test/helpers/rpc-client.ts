@@ -1,1 +1,1 @@
-export { RpcClient, type JsonRpcResponse } from "../../src/rpc-client";
+export { type JsonRpcResponse, RpcClient } from "../../src/rpc-client";

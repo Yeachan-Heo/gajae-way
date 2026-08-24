@@ -1,7 +1,7 @@
+import { afterEach, expect, test } from "bun:test";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import { afterEach, expect, test } from "bun:test";
 import { loadWayCore } from "../../src/native-loader";
 
 const temporaryDirectories: string[] = [];

@@ -25,12 +25,20 @@ use crate::{
 		LockStatus, ProcessObservation, ProcessProbe, QuarantineReceiptEvidence, QueueEntry, ReleaseResult, SystemProcessProbe,
 	},
 	registry::{BrokerSessionRow, BrokerSnapshot, GatewaySession, MetadataEnrichment, RegistryAnnotation, RegistryListFilter, SurfaceRecord},
+	schedule::{
+		DueClaim, RunFinalize, ScheduleError, ScheduleJob, ScheduleJobState, ScheduleJobUpsert, ScheduleKind, SchedulePayloadKind,
+		ScheduleRun, ScheduleRunOutcome,
+	},
 	store::{ClosureOperationClaim, MainAdmissionAttribution, MainAdmissionOperationClaim, PendingMainAdmissionOperation, Store, StoreError, meta_get_tx, meta_set_tx, unix_epoch_ms},
 };
 
+pub mod alerts;
 pub mod events;
 pub mod lock;
+pub mod memory;
+pub mod metrics;
 pub mod registry;
+pub mod schedule;
 pub mod rpc;
 pub mod store;
 pub mod systemd;
@@ -413,7 +421,9 @@ pub struct MainAdmissionAttributionOutput {
 	#[napi(js_name = "attemptIdsJson")]
 	pub attempt_ids_json: String,
 	#[napi(js_name = "surfaceId")]
-	pub surface_id: String,
+	pub surface_id: Option<String>,
+	#[napi(js_name = "origin")]
+	pub origin: Option<String>,
 }
 
 /// One metadata value returned from the durable gateway state store. A missing
@@ -648,6 +658,27 @@ pub struct GatewayMetaReadOutput {
 }
 
 /// N-API handle over a real, migrated SQLite state directory.
+#[napi(object)]
+pub struct MemoryDocumentInput {
+	/// Position in the profile's ordered injection list; the mask indexes this.
+	pub file_index: u32,
+	pub path: String,
+	pub body: String,
+}
+
+#[napi(object)]
+pub struct MemoryMaskInput {
+	pub session_kind: String,
+	/// Decimal u64 string: a 64-bit mask does not fit a JS number.
+	pub mask: String,
+}
+
+struct MetricsHttpHandle {
+	stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+	handle: Option<std::thread::JoinHandle<()>>,
+	port: u16,
+}
+
 #[napi]
 pub struct WayCore {
 	state_dir: String,
@@ -655,6 +686,7 @@ pub struct WayCore {
 	locks: LockManager,
 	journal: EventJournal,
 	rpc_server: Mutex<Option<RpcServerHandle>>,
+	metrics_http: Mutex<Option<MetricsHttpHandle>>,
 }
 
 #[napi]
@@ -1276,6 +1308,486 @@ impl WayCore {
 			.map(|attributions| attributions.into_iter().map(main_admission_attribution_output).collect())
 			.map_err(store_napi_error)
 	}
+
+	/// Every journal kind this daemon can emit.
+	///
+	/// Exposed so the owner console can assert at build time that its render
+	/// allowlist covers the daemon. `/journal all` sends no `kinds` filter, so a
+	/// kind added here but missing from the console throws at runtime.
+	/// Starts the optional loopback Prometheus endpoint.
+	///
+	/// Disabled by default and never reachable off-host: the bind address is a
+	/// loopback constant and `bind_metrics_listener` refuses anything else. Only
+	/// `GET /metrics` is served; every other request gets a 404 that echoes
+	/// neither the target nor the body.
+	#[napi(js_name = "metricsHttpStart")]
+	pub fn metrics_http_start(&self, port: u16) -> napi::Result<u16> {
+		let mut guard = self
+			.metrics_http
+			.lock()
+			.map_err(|_| napi::Error::from_reason("metrics listener lock was poisoned"))?;
+		if guard.is_some() {
+			return Err(napi::Error::from_reason("metrics listener is already running"));
+		}
+		let addr: std::net::SocketAddr = (std::net::Ipv4Addr::LOCALHOST, port).into();
+		let listener = crate::metrics::bind_metrics_listener(addr).map_err(|error| napi::Error::from_reason(error.to_string()))?;
+		let bound = listener.local_addr().map_err(|error| napi::Error::from_reason(error.to_string()))?.port();
+		listener.set_nonblocking(false).ok();
+		let store = self.store.clone();
+		let locks = self.locks.clone();
+		let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+		let thread_stop = stop.clone();
+		let handle = std::thread::spawn(move || {
+			for stream in listener.incoming() {
+				if thread_stop.load(std::sync::atomic::Ordering::Relaxed) {
+					break;
+				}
+				let Ok(mut stream) = stream else { continue };
+				let _ = serve_metrics_request(&mut stream, &store, &locks);
+			}
+		});
+		*guard = Some(MetricsHttpHandle { stop, handle: Some(handle), port: bound });
+		Ok(bound)
+	}
+
+	/// Stops the endpoint. Safe to call when it was never started.
+	#[napi(js_name = "metricsHttpStop")]
+	pub fn metrics_http_stop(&self) -> napi::Result<()> {
+		let mut guard = self
+			.metrics_http
+			.lock()
+			.map_err(|_| napi::Error::from_reason("metrics listener lock was poisoned"))?;
+		if let Some(mut running) = guard.take() {
+			running.stop.store(true, std::sync::atomic::Ordering::Relaxed);
+			// Unblock `incoming()` with a self-connection so the thread observes
+			// the stop flag instead of parking until the next scrape.
+			let _ = std::net::TcpStream::connect((std::net::Ipv4Addr::LOCALHOST, running.port));
+			if let Some(handle) = running.handle.take() {
+				let _ = handle.join();
+			}
+		}
+		Ok(())
+	}
+
+	/// Reports whether SQLite FTS5 is available.
+	///
+	/// Separate from the rebuild so startup can fail closed on a NAMED reason:
+	/// without FTS5 the redaction predicate cannot run inside the query, and a
+	/// degraded fallback would be a disclosure rather than a lesser feature.
+	#[napi(js_name = "memoryFts5Available")]
+	pub fn memory_fts5_available(&self) -> napi::Result<bool> {
+		let connection = self.store.connection().map_err(store_napi_error)?;
+		Ok(crate::memory::assert_fts5_available(&connection).is_ok())
+	}
+
+	/// Rebuilds the recall index and pins it to the active profile digest.
+	///
+	/// Masks are supplied per session kind by the caller, derived from the SAME
+	/// exported `isRestricted` predicate the injector uses, so the redaction rule
+	/// has exactly one implementation.
+	#[napi(js_name = "memoryIndexRebuild")]
+	pub fn memory_index_rebuild(
+		&self,
+		profile_digest: String,
+		documents: Vec<MemoryDocumentInput>,
+		masks: Vec<MemoryMaskInput>,
+	) -> napi::Result<u32> {
+		let rows: Vec<(i64, String, String)> = documents
+			.into_iter()
+			.map(|document| (document.file_index as i64, document.path, document.body))
+			.collect();
+		let indexed = crate::memory::rebuild(&self.store, &profile_digest, &rows)
+			.map_err(|error| napi::Error::from_reason(error.to_string()))?;
+		for mask in masks {
+			self.store
+				.set_meta(&format!("memory_mask_{}", mask.session_kind), &mask.mask)
+				.map_err(store_napi_error)?;
+		}
+		self.journal
+			.append(
+				"memory_index_rebuilt",
+				&format!("{{\"documents\":{indexed}}}"),
+			)
+			.map_err(|error| napi::Error::from_reason(error.to_string()))?;
+		Ok(indexed as u32)
+	}
+
+	/// Evaluates adapter liveness from durable consumer checkpoints.
+	///
+	/// Driven by a daemon-owned interval, deliberately independent of the metrics
+	/// HTTP listener: an operator who leaves the endpoint disabled must still
+	/// receive alerts, so tying this cadence to the listener would silently
+	/// disable it.
+	#[napi(js_name = "alertsEvaluateAdapterDisconnects")]
+	pub fn alerts_evaluate_adapter_disconnects(&self, threshold_ms: f64) -> napi::Result<Vec<String>> {
+		let threshold = napi_i64(threshold_ms)?;
+		crate::alerts::evaluate_adapter_disconnects(&self.store, threshold, unix_epoch_ms())
+			.map(|transitions| {
+				transitions
+					.into_iter()
+					.map(|transition| format!("{}={}", transition.condition, if transition.raised { "raised" } else { "clear" }))
+					.collect()
+			})
+			.map_err(store_napi_error)
+	}
+
+	/// Currently raised alert conditions, for `way.status` and operator tooling.
+	#[napi(js_name = "alertsRaised")]
+	pub fn alerts_raised(&self) -> napi::Result<Vec<String>> {
+		crate::alerts::raised_conditions(&self.store).map_err(store_napi_error)
+	}
+
+	#[napi(js_name = "mainEventKinds")]
+	pub fn main_event_kinds(&self) -> Vec<String> {
+		crate::rpc::dispatch::MAIN_EVENT_KINDS.iter().map(|kind| (*kind).to_owned()).collect()
+	}
+
+	#[napi(js_name = "scheduleJobUpsert")]
+	pub fn schedule_job_upsert(&self, input: ScheduleJobUpsertInput) -> napi::Result<ScheduleJobOutput> {
+		let upsert = ScheduleJobUpsert {
+			job_id: input.job_id,
+			name: input.name,
+			kind: ScheduleKind::parse(&input.kind).map_err(schedule_napi_error)?,
+			spec: input.spec,
+			timezone: input.timezone,
+			payload_kind: SchedulePayloadKind::parse(&input.payload_kind).map_err(schedule_napi_error)?,
+			payload_json: input.payload_json,
+			surface_id: input.surface_id,
+			next_fire_at_ms: input.next_fire_at_ms.map(napi_i64).transpose()?,
+			max_consecutive_failures: napi_i64(input.max_consecutive_failures)?,
+			now_ms: unix_epoch_ms(),
+		};
+		schedule::job_upsert(&self.store, upsert).map(schedule_job_output).map_err(schedule_napi_error)
+	}
+
+	#[napi(js_name = "scheduleJobGet")]
+	pub fn schedule_job_get(&self, job_id: String) -> napi::Result<ScheduleJobOutput> {
+		schedule::job_get(&self.store, &job_id).map(schedule_job_output).map_err(schedule_napi_error)
+	}
+
+	#[napi(js_name = "scheduleJobList")]
+	pub fn schedule_job_list(&self, input: Option<ScheduleJobListInput>) -> napi::Result<ScheduleJobListOutput> {
+		let input = input.unwrap_or(ScheduleJobListInput { state: None, cursor: None, limit: None });
+		let state = match input.state {
+			Some(state) => Some(ScheduleJobState::parse(&state).map_err(schedule_napi_error)?),
+			None => None,
+		};
+		let (jobs, next_cursor) =
+			schedule::job_list(&self.store, state, input.cursor, input.limit).map_err(schedule_napi_error)?;
+		Ok(ScheduleJobListOutput { jobs: jobs.into_iter().map(schedule_job_output).collect(), next_cursor })
+	}
+
+	#[napi(js_name = "scheduleJobDelete")]
+	pub fn schedule_job_delete(&self, job_id: String) -> napi::Result<bool> {
+		schedule::job_delete(&self.store, &job_id).map_err(schedule_napi_error)
+	}
+
+	#[napi(js_name = "scheduleDueClaim")]
+	pub fn schedule_due_claim(&self, now_ms: f64, run_id: String) -> napi::Result<ScheduleDueClaimOutput> {
+		let now_ms = napi_i64(now_ms)?;
+		match schedule::due_claim(&self.store, now_ms, &run_id).map_err(schedule_napi_error)? {
+			DueClaim::Claimed { job, run } => Ok(ScheduleDueClaimOutput {
+				claimed: true,
+				refused_failed_closed: false,
+				reason: None,
+				job: Some(schedule_job_output(job)),
+				run: Some(schedule_run_output(run)),
+			}),
+			DueClaim::NothingDue => Ok(ScheduleDueClaimOutput {
+				claimed: false,
+				refused_failed_closed: false,
+				reason: None,
+				job: None,
+				run: None,
+			}),
+			DueClaim::RefusedFailedClosed { reason } => Ok(ScheduleDueClaimOutput {
+				claimed: false,
+				refused_failed_closed: true,
+				reason: Some(reason),
+				job: None,
+				run: None,
+			}),
+		}
+	}
+
+	#[napi(js_name = "scheduleRunFinalize")]
+	pub fn schedule_run_finalize(&self, input: ScheduleRunFinalizeInput) -> napi::Result<ScheduleRunOutput> {
+		let finalize = RunFinalize {
+			run_id: input.run_id,
+			outcome: ScheduleRunOutcome::parse(&input.outcome).map_err(schedule_napi_error)?,
+			finished_at: napi_i64(input.finished_at)?,
+			op_ref: input.op_ref,
+			detail_json: input.detail_json,
+			job_state: match input.job_state {
+				Some(state) => Some(ScheduleJobState::parse(&state).map_err(schedule_napi_error)?),
+				None => None,
+			},
+			failure_count: input.failure_count.map(napi_i64).transpose()?,
+			backoff_until_ms: input.backoff_until_ms.map(napi_i64).transpose()?,
+			journal_payload_json: input.journal_payload_json,
+		};
+		schedule::run_finalize(&self.store, finalize).map(schedule_run_output).map_err(schedule_napi_error)
+	}
+
+	#[napi(js_name = "scheduleRunList")]
+	pub fn schedule_run_list(
+		&self,
+		job_id: String,
+		cursor: Option<String>,
+		limit: Option<u32>,
+	) -> napi::Result<ScheduleRunListOutput> {
+		let (runs, next_cursor) =
+			schedule::run_list(&self.store, &job_id, cursor, limit).map_err(schedule_napi_error)?;
+		Ok(ScheduleRunListOutput { runs: runs.into_iter().map(schedule_run_output).collect(), next_cursor })
+	}
+
+	#[napi(js_name = "scheduleInFlightRuns")]
+	pub fn schedule_in_flight_runs(&self) -> napi::Result<Vec<ScheduleRunOutput>> {
+		schedule::in_flight_runs(&self.store)
+			.map(|runs| runs.into_iter().map(schedule_run_output).collect())
+			.map_err(schedule_napi_error)
+	}
+
+	#[napi(js_name = "scheduleOverdueCollapse")]
+	pub fn schedule_overdue_collapse(
+		&self,
+		input: ScheduleOverdueCollapseInput,
+	) -> napi::Result<Option<ScheduleRunOutput>> {
+		schedule::overdue_collapse(
+			&self.store,
+			&input.job_id,
+			&input.run_id,
+			napi_i64(input.missed_count)?,
+			input.next_fire_at_ms.map(napi_i64).transpose()?,
+			napi_i64(input.now_ms)?,
+			input.journal_payload_json,
+		)
+		.map(|run| run.map(schedule_run_output))
+		.map_err(schedule_napi_error)
+	}
+
+	#[napi(js_name = "scheduleSetNextFire")]
+	pub fn schedule_set_next_fire(&self, job_id: String, next_fire_at_ms: Option<f64>, now_ms: f64) -> napi::Result<()> {
+		schedule::set_next_fire(
+			&self.store,
+			&job_id,
+			next_fire_at_ms.map(napi_i64).transpose()?,
+			napi_i64(now_ms)?,
+		)
+		.map_err(schedule_napi_error)
+	}
+}
+
+#[napi(object)]
+pub struct ScheduleJobOutput {
+	#[napi(js_name = "jobId")]
+	pub job_id: String,
+	pub name: String,
+	pub kind: String,
+	pub spec: String,
+	pub timezone: String,
+	#[napi(js_name = "payloadKind")]
+	pub payload_kind: String,
+	#[napi(js_name = "payloadJson")]
+	pub payload_json: String,
+	#[napi(js_name = "surfaceId")]
+	pub surface_id: Option<String>,
+	pub state: String,
+	#[napi(js_name = "nextFireAtMs")]
+	pub next_fire_at_ms: Option<f64>,
+	#[napi(js_name = "backoffUntilMs")]
+	pub backoff_until_ms: Option<f64>,
+	#[napi(js_name = "failureCount")]
+	pub failure_count: f64,
+	#[napi(js_name = "maxConsecutiveFailures")]
+	pub max_consecutive_failures: f64,
+	#[napi(js_name = "createdAtMs")]
+	pub created_at_ms: f64,
+}
+
+#[napi(object)]
+pub struct ScheduleRunOutput {
+	#[napi(js_name = "runId")]
+	pub run_id: String,
+	#[napi(js_name = "jobId")]
+	pub job_id: String,
+	pub trigger: String,
+	#[napi(js_name = "scheduledForMs")]
+	pub scheduled_for_ms: f64,
+	#[napi(js_name = "claimedAt")]
+	pub claimed_at: f64,
+	#[napi(js_name = "finishedAt")]
+	pub finished_at: Option<f64>,
+	pub attempt: f64,
+	pub outcome: Option<String>,
+	#[napi(js_name = "missedCount")]
+	pub missed_count: f64,
+	#[napi(js_name = "opRef")]
+	pub op_ref: Option<String>,
+	#[napi(js_name = "detailJson")]
+	pub detail_json: Option<String>,
+}
+
+#[napi(object)]
+pub struct ScheduleJobUpsertInput {
+	#[napi(js_name = "jobId")]
+	pub job_id: String,
+	pub name: String,
+	pub kind: String,
+	pub spec: String,
+	pub timezone: String,
+	#[napi(js_name = "payloadKind")]
+	pub payload_kind: String,
+	#[napi(js_name = "payloadJson")]
+	pub payload_json: String,
+	#[napi(js_name = "surfaceId")]
+	pub surface_id: Option<String>,
+	#[napi(js_name = "nextFireAtMs")]
+	pub next_fire_at_ms: Option<f64>,
+	#[napi(js_name = "maxConsecutiveFailures")]
+	pub max_consecutive_failures: f64,
+}
+
+#[napi(object)]
+pub struct ScheduleJobListInput {
+	pub state: Option<String>,
+	pub cursor: Option<String>,
+	pub limit: Option<u32>,
+}
+
+#[napi(object)]
+pub struct ScheduleJobListOutput {
+	pub jobs: Vec<ScheduleJobOutput>,
+	#[napi(js_name = "nextCursor")]
+	pub next_cursor: Option<String>,
+}
+
+#[napi(object)]
+pub struct ScheduleRunListOutput {
+	pub runs: Vec<ScheduleRunOutput>,
+	#[napi(js_name = "nextCursor")]
+	pub next_cursor: Option<String>,
+}
+
+/// Result of one due-claim attempt. `refusedFailedClosed` is reported distinctly
+/// from `nothingDue` so the caller records a durable refusal instead of idling.
+#[napi(object)]
+pub struct ScheduleDueClaimOutput {
+	pub claimed: bool,
+	#[napi(js_name = "refusedFailedClosed")]
+	pub refused_failed_closed: bool,
+	pub reason: Option<String>,
+	pub job: Option<ScheduleJobOutput>,
+	pub run: Option<ScheduleRunOutput>,
+}
+
+#[napi(object)]
+pub struct ScheduleRunFinalizeInput {
+	#[napi(js_name = "runId")]
+	pub run_id: String,
+	pub outcome: String,
+	#[napi(js_name = "finishedAt")]
+	pub finished_at: f64,
+	#[napi(js_name = "opRef")]
+	pub op_ref: Option<String>,
+	#[napi(js_name = "detailJson")]
+	pub detail_json: Option<String>,
+	#[napi(js_name = "jobState")]
+	pub job_state: Option<String>,
+	#[napi(js_name = "failureCount")]
+	pub failure_count: Option<f64>,
+	#[napi(js_name = "backoffUntilMs")]
+	pub backoff_until_ms: Option<f64>,
+	#[napi(js_name = "journalPayloadJson")]
+	pub journal_payload_json: Option<String>,
+}
+
+#[napi(object)]
+pub struct ScheduleOverdueCollapseInput {
+	#[napi(js_name = "jobId")]
+	pub job_id: String,
+	#[napi(js_name = "runId")]
+	pub run_id: String,
+	#[napi(js_name = "missedCount")]
+	pub missed_count: f64,
+	#[napi(js_name = "nextFireAtMs")]
+	pub next_fire_at_ms: Option<f64>,
+	#[napi(js_name = "nowMs")]
+	pub now_ms: f64,
+	#[napi(js_name = "journalPayloadJson")]
+	pub journal_payload_json: Option<String>,
+}
+
+fn schedule_napi_error(error: ScheduleError) -> napi::Error {
+	let code = match &error {
+		ScheduleError::NotFound => "1700 ",
+		ScheduleError::InvalidInput(_) => "1701 ",
+		ScheduleError::Store(_) | ScheduleError::Overflow => "",
+	};
+	napi::Error::from_reason(format!("{code}{error}"))
+}
+
+fn schedule_job_output(job: ScheduleJob) -> ScheduleJobOutput {
+	ScheduleJobOutput {
+		job_id: job.job_id,
+		name: job.name,
+		kind: job.kind.as_str().to_owned(),
+		spec: job.spec,
+		timezone: job.timezone,
+		payload_kind: job.payload_kind.as_str().to_owned(),
+		payload_json: job.payload_json,
+		surface_id: job.surface_id,
+		state: job.state.as_str().to_owned(),
+		next_fire_at_ms: job.next_fire_at_ms.map(|value| value as f64),
+		backoff_until_ms: job.backoff_until_ms.map(|value| value as f64),
+		failure_count: job.failure_count as f64,
+		max_consecutive_failures: job.max_consecutive_failures as f64,
+		// The create-time epoch. `every` schedules anchor to this so repeated
+		// advances land on a stable lattice instead of drifting.
+		created_at_ms: job.created_at as f64,
+	}
+}
+
+fn schedule_run_output(run: ScheduleRun) -> ScheduleRunOutput {
+	ScheduleRunOutput {
+		run_id: run.run_id,
+		job_id: run.job_id,
+		trigger: run.trigger.as_str().to_owned(),
+		scheduled_for_ms: run.scheduled_for_ms as f64,
+		claimed_at: run.claimed_at as f64,
+		finished_at: run.finished_at.map(|value| value as f64),
+		attempt: run.attempt as f64,
+		outcome: run.outcome.map(|outcome| outcome.as_str().to_owned()),
+		missed_count: run.missed_count as f64,
+		op_ref: run.op_ref,
+		detail_json: run.detail_json,
+	}
+}
+
+/// Serves exactly one metrics request. Any parse failure yields a 404 rather
+/// than an error page, so the endpoint cannot be probed for detail.
+fn serve_metrics_request(
+	stream: &mut std::net::TcpStream,
+	store: &Store,
+	locks: &crate::lock::LockManager,
+) -> std::io::Result<()> {
+	use std::io::{BufRead, BufReader, Write};
+	let mut reader = BufReader::new(stream.try_clone()?);
+	let mut line = String::new();
+	reader.read_line(&mut line)?;
+	let parsed = crate::metrics::parse_request_line(line.trim_end());
+	let body = match &parsed {
+		Some((method, path)) if method == "GET" && path == "/metrics" => {
+			crate::metrics::durable_projection(store, locks, unix_epoch_ms())
+				.map(|projection| crate::metrics::render_prometheus(&projection))
+				.unwrap_or_default()
+		}
+		_ => String::new(),
+	};
+	let (method, path) = parsed.unwrap_or_else(|| ("BAD".to_owned(), "/".to_owned()));
+	let response = crate::metrics::http_response(&method, &path, &body);
+	stream.write_all(response.as_bytes())?;
+	stream.flush()
 }
 
 fn open_way_core(state_dir: String, hard_hold_cap_ms: Option<u64>) -> napi::Result<WayCore> {
@@ -1289,7 +1801,7 @@ fn open_way_core(state_dir: String, hard_hold_cap_ms: Option<u64>) -> napi::Resu
 	};
 	locks.reconcile().map_err(lock_napi_error)?;
 	let journal = EventJournal::new(store.clone());
-	Ok(WayCore { state_dir, store, locks, journal, rpc_server: Mutex::new(None) })
+	Ok(WayCore { state_dir, store, locks, journal, rpc_server: Mutex::new(None), metrics_http: Mutex::new(None) })
 }
 
 fn process_identity_output(pid: i32) -> napi::Result<ProcessIdentityOutput> {
@@ -1422,6 +1934,7 @@ fn main_admission_attribution_output(attribution: MainAdmissionAttribution) -> M
 	MainAdmissionAttributionOutput {
 		attempt_ids_json: attribution.attempt_ids_json,
 		surface_id: attribution.surface_id,
+		origin: attribution.origin,
 	}
 }
 

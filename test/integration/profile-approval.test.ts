@@ -1,6 +1,6 @@
+import { afterEach, expect, test } from "bun:test";
 import * as fs from "node:fs";
 import * as path from "node:path";
-import { afterEach, expect, test } from "bun:test";
 import { BrokerCli } from "../../src/broker/cli";
 import { bootstrapMainSession } from "../../src/main-session/bootstrap";
 import { approveProfile, previewProfileApproval } from "../../src/main-session/profile-approval";
@@ -35,6 +35,7 @@ session_id = "${fixture.sessionId}"
 id = "owner"
 platform = "test"
 kind = "dm"
+session_kind = "main"
 `,
 	);
 	return output;

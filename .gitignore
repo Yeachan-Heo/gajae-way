@@ -1,4 +1,4 @@
-node_modules/
+node_modules
 native/*.node
 native/*.node.build.json
 native/.build/

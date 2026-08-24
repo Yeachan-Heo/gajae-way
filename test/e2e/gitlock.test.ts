@@ -1,13 +1,13 @@
+import { afterEach, expect, test } from "bun:test";
+import type { ChildProcess } from "node:child_process";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import type { ChildProcess } from "node:child_process";
-import { afterEach, expect, test } from "bun:test";
 import {
 	ClosureError,
-	createClosureExecutor,
 	type ClosureExecutor,
 	type ClosureRequest,
+	createClosureExecutor,
 } from "../../src/main-session/closure";
 import { loadWayCore, type WayCoreHandle } from "../../src/native-loader";
 import { ManagedProcessRegistry } from "../helpers/managed-process";

@@ -1,7 +1,7 @@
+import { afterEach, expect, test } from "bun:test";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import { afterEach, expect, test } from "bun:test";
 import { loadWayProfile, ProfileRevisionTracker, ProfileValidationError } from "../../src/profile";
 
 const temporaryDirectories: string[] = [];
@@ -37,6 +37,7 @@ conversation = ["MEMORY.md"]
 id = "discord:owner"
 platform = "discord"
 kind = "dm"
+session_kind = "main"
 
 [operator]
 id = "operator-1"
@@ -57,6 +58,7 @@ id = "operator-1"
 kind = "dm"
 platform = "discord"
 id = "discord:owner"
+session_kind = "main"
 
 [injection]
 files = ["SOUL.md", "USER.md", "daily/{date}.md", "MEMORY.md"]
@@ -73,7 +75,10 @@ interval_ms = 30000
 `);
 	fs.writeFileSync(
 		second.profile,
-		fs.readFileSync(second.profile, "utf8").replaceAll(second.corpus, first.corpus).replaceAll(second.workspace, first.workspace),
+		fs
+			.readFileSync(second.profile, "utf8")
+			.replaceAll(second.corpus, first.corpus)
+			.replaceAll(second.workspace, first.workspace),
 	);
 	const left = loadWayProfile(first.profile);
 	const right = loadWayProfile(second.profile);
@@ -84,7 +89,13 @@ interval_ms = 30000
 test("profile digest changes for an identity/security injection-order change", () => {
 	const fixture = temporaryProfile(profileToml());
 	const before = loadWayProfile(fixture.profile);
-	fs.writeFileSync(fixture.profile, profileToml().replace('"SOUL.md", "USER.md"', '"USER.md", "SOUL.md"').replaceAll("$CORPUS", fixture.corpus).replaceAll("$WORKSPACE", fixture.workspace));
+	fs.writeFileSync(
+		fixture.profile,
+		profileToml()
+			.replace('"SOUL.md", "USER.md"', '"USER.md", "SOUL.md"')
+			.replaceAll("$CORPUS", fixture.corpus)
+			.replaceAll("$WORKSPACE", fixture.workspace),
+	);
 	const after = loadWayProfile(fixture.profile);
 	expect(after.digest.sha256).not.toBe(before.digest.sha256);
 });
@@ -93,7 +104,12 @@ test("tunables have a separate hot-reload revision without changing the digest",
 	const fixture = temporaryProfile(profileToml());
 	const tracker = new ProfileRevisionTracker();
 	const before = tracker.load(fixture.profile);
-	fs.writeFileSync(fixture.profile, profileToml("\n[ack]\nbudget = 12\n").replaceAll("$CORPUS", fixture.corpus).replaceAll("$WORKSPACE", fixture.workspace));
+	fs.writeFileSync(
+		fixture.profile,
+		profileToml("\n[ack]\nbudget = 12\n")
+			.replaceAll("$CORPUS", fixture.corpus)
+			.replaceAll("$WORKSPACE", fixture.workspace),
+	);
 	const after = tracker.load(fixture.profile);
 	expect(before.digest.sha256).toBe(after.digest.sha256);
 	expect(before.tunablesRevision).toBe(1);
@@ -101,7 +117,9 @@ test("tunables have a separate hot-reload revision without changing the digest",
 });
 
 test("profile loader returns typed validation errors", () => {
-	const fixture = temporaryProfile(profileToml().replace('files = ["SOUL.md", "USER.md", "daily/{date}.md", "MEMORY.md"]', "files = 42"));
+	const fixture = temporaryProfile(
+		profileToml().replace('files = ["SOUL.md", "USER.md", "daily/{date}.md", "MEMORY.md"]', "files = 42"),
+	);
 	try {
 		loadWayProfile(fixture.profile);
 		throw new Error("expected profile loader to reject");
