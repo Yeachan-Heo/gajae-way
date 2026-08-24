@@ -2,17 +2,28 @@ import type { DiscordMessage, DiscordPlatform } from "./platform";
 
 export const DISCORD_ACK_BUDGET_MS = 2_000;
 
+/**
+ * openclaw's reaction doctrine: a reaction is the lightweight "I saw this, I
+ * acknowledge you" signal, with 👀 reserved for acknowledgement and at most one
+ * reaction per message. This is the default request-detected acknowledgement.
+ */
+export const DISCORD_ACK_REACTION = "\u{1F440}";
+
 export interface DiscordAcknowledgement {
 	readonly messageId: string;
 	readonly channelId: string;
 	readonly accepted: boolean;
 	readonly acknowledgedAt: number;
 	readonly elapsedMs: number;
+	/** Whether the request-detected reaction was placed. */
+	readonly reacted: boolean;
 }
 
 export interface DiscordAcknowledgementOptions {
 	readonly budgetMs?: number;
 	readonly now?: () => number;
+	/** Reaction placed on the detected request; `false` disables it. Defaults to 👀. */
+	readonly reaction?: string | false;
 }
 
 export class DiscordAcknowledgementError extends Error {
@@ -40,6 +51,19 @@ export async function acknowledgeDiscordMessage(
 		throw new DiscordAcknowledgementError("Discord acknowledgement budget must be a positive safe integer.");
 	}
 	const startedAt = now();
+	// React FIRST so the requester sees the request was picked up, then start
+	// typing. A failed reaction must not fail the acknowledgement: reactions are a
+	// social signal, while typing is the contract the budget exists for.
+	const reaction = options.reaction === undefined ? DISCORD_ACK_REACTION : options.reaction;
+	let reacted = false;
+	if (reaction) {
+		try {
+			await withinBudget(platform.react(message.channelId, message.id, reaction), budgetMs, message.id);
+			reacted = true;
+		} catch {
+			reacted = false;
+		}
+	}
 	await withinBudget(platform.ackTyping(message.channelId), budgetMs, message.id);
 	const acknowledgedAt = now();
 	if (acknowledgedAt > startedAt + budgetMs) {
@@ -51,6 +75,7 @@ export async function acknowledgeDiscordMessage(
 		accepted: true,
 		acknowledgedAt,
 		elapsedMs: acknowledgedAt - startedAt,
+		reacted,
 	};
 }
 

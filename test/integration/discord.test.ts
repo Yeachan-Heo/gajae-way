@@ -4,6 +4,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 
 import { afterAll, expect, test } from "bun:test";
+import { DISCORD_ACK_REACTION } from "../../src/adapter/discord/ack";
 import { MemoryChunkLedger } from "../../src/adapter/chunk-ledger";
 import { DiscordOutbox, discordChunkWireNonce, discordDedupeKey, discordWireNonce } from "../../src/adapter/discord/outbox";
 import { loadDiscordAdapterConfig, type DiscordAdapterConfig } from "../../src/adapter/discord/config";
@@ -1758,6 +1759,65 @@ externalTest("a bare bot mention engages instead of being dropped as empty", asy
 		expect(admitted).toEqual([{ operation: "turn.follow_up", text: `<@${BOT_USER_ID}>` }]);
 		expect(diagnostics.filter(message => message.includes("empty message after leading bot mention"))).toEqual([]);
 		expect(fixture.acknowledgements).toHaveLength(1);
+	} finally {
+		await fixture.disconnect();
+	}
+});
+
+externalTest("a detected request is acknowledged with a reaction by default before typing", async () => {
+	const gatewayUnderTest = await gateway();
+	const fixture = new DiscordFixture();
+	await fixture.connect();
+	try {
+		const route = new DiscordRouteHandler({
+			rpc: gatewayUnderTest.client,
+			platform: fixture,
+			routes: [{ channelId: "222222222222222222", surfaceId: "discord:guest-channel", kind: "channel", groupPolicy: "open" }],
+			botUserId: BOT_USER_ID,
+		});
+		await route.handle({
+			id: "reaction-ack",
+			channelId: "222222222222222222",
+			text: "please look at this",
+			authorId: "660473980301344768",
+			acceptedAt: Date.now(),
+		});
+		// openclaw doctrine: one reaction per message, eyes for acknowledgement.
+		expect(fixture.reactions).toEqual([
+			expect.objectContaining({ channelId: "222222222222222222", messageId: "reaction-ack", emoji: DISCORD_ACK_REACTION }),
+		]);
+		// The reaction lands before typing, so both signals are present.
+		expect(fixture.acknowledgements).toHaveLength(1);
+	} finally {
+		await fixture.disconnect();
+	}
+});
+
+externalTest("a message with no readable text is diagnosed instead of dropped silently", async () => {
+	const gatewayUnderTest = await gateway();
+	const fixture = new DiscordFixture();
+	await fixture.connect();
+	const diagnostics: string[] = [];
+	try {
+		const route = new DiscordRouteHandler({
+			rpc: gatewayUnderTest.client,
+			platform: fixture,
+			routes: [{ channelId: "222222222222222222", surfaceId: "discord:guest-channel", kind: "channel", groupPolicy: "mention" }],
+			botUserId: BOT_USER_ID,
+			onDiagnostic: message => diagnostics.push(message),
+		});
+		// A guild message arriving with empty content is the signature of a missing
+		// MESSAGE_CONTENT privileged intent; it must never look like silence.
+		await route.handle({
+			id: "content-less",
+			channelId: "222222222222222222",
+			text: "",
+			authorId: "660473980301344768",
+			mentionedUserIds: [BOT_USER_ID],
+			acceptedAt: Date.now(),
+		});
+		expect(diagnostics.filter(message => message.includes("MESSAGE_CONTENT"))).toHaveLength(1);
+		expect(gatewayUnderTest.fixture.commands()).toEqual([]);
 	} finally {
 		await fixture.disconnect();
 	}

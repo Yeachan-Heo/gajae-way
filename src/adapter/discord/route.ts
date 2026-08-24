@@ -86,7 +86,14 @@ export class DiscordRouteHandler {
 	}
 
 	async handle(message: DiscordMessage): Promise<boolean> {
-		if (message.authorId === this.#botUserId || (message.authorBot && !this.#allowBots) || !message.text.trim()) return false;
+		if (message.authorId === this.#botUserId || (message.authorBot && !this.#allowBots)) return false;
+		if (!message.text.trim()) {
+			// Never silent: an empty body on a guild message is the signature of a
+			// missing MESSAGE_CONTENT privileged intent, which otherwise looks
+			// identical to the bot ignoring its owner.
+			this.#diagnostics.drop("empty_text", message.channelId);
+			return false;
+		}
 		const existing = this.#inFlight.get(message.id);
 		if (existing) return await existing;
 		const handling = this.resolveAndSubmit(message);
@@ -258,7 +265,7 @@ interface DiscordIngressRoute {
 	readonly thread: boolean;
 }
 
-type DiscordIngressDrop = "unrouted" | "blacklisted" | "unengaged" | "unresolved_reference" | "empty_after_mention";
+type DiscordIngressDrop = "unrouted" | "blacklisted" | "unengaged" | "unresolved_reference" | "empty_after_mention" | "empty_text";
 
 class DiscordIngressDiagnostics {
 	readonly #onDiagnostic: ((message: string) => void) | undefined;
@@ -299,6 +306,8 @@ function ingressDropDescription(kind: DiscordIngressDrop): string {
 			return "an unengaged message with an unresolved reply reference";
 		case "empty_after_mention":
 			return "an empty message after leading bot mention stripping";
+		case "empty_text":
+			return "a message with no readable text (check the MESSAGE_CONTENT privileged intent for guild channels)";
 	}
 }
 
