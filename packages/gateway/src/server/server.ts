@@ -278,6 +278,12 @@ async function sendChat(
 			text: "Started a fresh session.",
 			final: true,
 		};
+		connection.write({
+			v: PROFILE_VERSION,
+			type: "response",
+			id: request.id,
+			result: { turnId: payload.turnId, engaged: true },
+		});
 		if (origin.platform === "loopback")
 			connection.write({ v: PROFILE_VERSION, type: "event", event: "chat.message", id: request.id, payload });
 		else {
@@ -289,12 +295,6 @@ async function sendChat(
 				runtime.delivery.markInflight(delivery.deliveryId as string);
 			}
 		}
-		connection.write({
-			v: PROFILE_VERSION,
-			type: "response",
-			id: request.id,
-			result: { turnId: payload.turnId, engaged: true },
-		});
 		return;
 	}
 	if (origin.platform !== "loopback" && origin.platform !== "discord" && origin.platform !== "telegram")

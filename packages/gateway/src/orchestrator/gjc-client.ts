@@ -40,13 +40,18 @@ export class GjcClient implements GjcPort {
 		const cacheKey = `${originKey}#${epoch}`;
 		if (process.env.GAJAEWAY_TEST_STUB_GJC === "1") return { sessionId: `stub-${cacheKey}` };
 		const record = this.#database.getSessionRecord(originKey);
-		const cached = this.#sessions.get(cacheKey) ?? (record && record.epoch === epoch ? record.sessionId : undefined);
+		const cached =
+			this.#sessions.get(cacheKey) ??
+			(record && record.epoch === epoch && record.sessionId ? record.sessionId : undefined);
 		if (cached) {
 			this.#sessions.set(cacheKey, cached);
 			return { sessionId: cached };
 		}
-		const suffix = epoch === 0 ? "" : `-e${epoch}`;
-		const idempotencyKey = `gajaeway-${originKey.replace(/[^A-Za-z0-9._-]/g, "-")}${suffix}`;
+		// Instance-scoped key: two gateway installs (or two homes on one machine)
+		// must never collide on the same gjc session (cross-instance replay bug
+		// found in P2 integration). Epoch is always included so /new provably
+		// binds a fresh transcript.
+		const idempotencyKey = `gajaeway-${this.#database.instanceId}-${originKey.replace(/[^A-Za-z0-9._-]/g, "-")}-e${epoch}`;
 		const child = Bun.spawn({
 			cmd: [
 				"gjc",

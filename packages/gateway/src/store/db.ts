@@ -2,7 +2,7 @@ import { Database } from "bun:sqlite";
 import { mkdir } from "node:fs/promises";
 import { dirname } from "node:path";
 
-const LATEST_SCHEMA_VERSION = 3;
+const LATEST_SCHEMA_VERSION = 4;
 
 export class DatabaseStartupError extends Error {
 	readonly code: "newer_schema" | "integrity_check_failed";
@@ -41,13 +41,18 @@ export class GatewayDatabase {
 	get activeSessionCount(): number {
 		return this.#database.query<{ count: number }, []>("SELECT COUNT(*) AS count FROM sessions").get()?.count ?? 0;
 	}
+	/**
+	 * Returns the session row even when no gjc session is bound yet (empty
+	 * sessionId): the epoch must stay visible after /new bumps it, or dispatch
+	 * silently falls back to epoch 0 and the old transcript.
+	 */
 	getSessionRecord(originKey: string): { sessionId: string; epoch: number } | undefined {
 		const row = this.#database
 			.query<{ gjc_session_id: string; epoch: number }, [string]>(
 				"SELECT gjc_session_id, epoch FROM sessions WHERE origin_key = ?",
 			)
 			.get(originKey);
-		return row && row.gjc_session_id ? { sessionId: row.gjc_session_id, epoch: row.epoch } : undefined;
+		return row ? { sessionId: row.gjc_session_id, epoch: row.epoch } : undefined;
 	}
 
 	bumpEpoch(originKey: string, originRefJson: string): number {
@@ -227,6 +232,24 @@ export class GatewayDatabase {
 					.run(3, new Date().toISOString());
 			});
 		}
+
+		if (current < 4) {
+			this.withTransaction(() => {
+				this.#database.exec("CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)");
+				this.#database.query("INSERT INTO meta (key, value) VALUES ('instance_id', ?)").run(crypto.randomUUID());
+				this.#database
+					.query("INSERT INTO schema_migrations (version, applied_at) VALUES (?, ?)")
+					.run(4, new Date().toISOString());
+			});
+		}
+	}
+
+	get instanceId(): string {
+		const row = this.#database
+			.query<{ value: string }, [string]>("SELECT value FROM meta WHERE key = ?")
+			.get("instance_id");
+		if (!row) throw new DatabaseStartupError("integrity_check_failed", "meta.instance_id missing after migration");
+		return row.value;
 	}
 
 	private integrityCheck(): void {
