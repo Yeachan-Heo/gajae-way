@@ -12,6 +12,7 @@ import {
 	LruSet,
 	settleDiscordDelivery,
 	subscribeDiscordDeliveries,
+	TypingIndicator,
 } from "../src/main";
 import { discordMessageOrigin } from "../src/origin";
 
@@ -134,6 +135,49 @@ test("delivery subscription filters non-Discord and missing delivery ids", async
 	await Bun.sleep(0);
 	expect(requests).toEqual([]);
 	off();
+});
+
+test("typing indicator pulses while a turn runs and stops when the delivery settles", async () => {
+	let typingCount = 0;
+	const discord: DiscordClientLike = {
+		channels: {
+			fetch: async () => ({
+				send: async () => {},
+				sendTyping: async () => void typingCount++,
+			}),
+		},
+	};
+	const typing = new TypingIndicator(discord, 5, 10_000, { error: () => {} });
+	typing.begin("channel-1");
+	await Bun.sleep(20);
+	expect(typingCount).toBeGreaterThanOrEqual(2);
+	const requests: Array<{ verb: string; params: unknown }> = [];
+	await settleDiscordDelivery(mockGateway(requests), discord, delivery("reply"), typing);
+	const settled = typingCount;
+	await Bun.sleep(25);
+	expect(typingCount).toBe(settled);
+});
+
+test("typing indicator stops at its deadline and on channels without sendTyping", async () => {
+	let typingCount = 0;
+	const typingCapable: DiscordClientLike = {
+		channels: { fetch: async () => ({ send: async () => {}, sendTyping: async () => void typingCount++ }) },
+	};
+	const deadlined = new TypingIndicator(typingCapable, 5, 12, { error: () => {} });
+	deadlined.begin("channel-1");
+	await Bun.sleep(40);
+	const atDeadline = typingCount;
+	await Bun.sleep(20);
+	expect(typingCount).toBe(atDeadline);
+
+	let sent = 0;
+	const sendOnly: DiscordClientLike = {
+		channels: { fetch: async () => ({ send: async () => void sent++ }) },
+	};
+	const incapable = new TypingIndicator(sendOnly, 5, 10_000, { error: () => {} });
+	incapable.begin("channel-2");
+	await Bun.sleep(20);
+	expect(sent).toBe(0);
 });
 
 function delivery(text: string): ChatMessagePayload {

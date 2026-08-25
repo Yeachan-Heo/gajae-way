@@ -5,6 +5,10 @@ import { type LoadedDiscordAdapterConfig, loadDiscordAdapterConfig } from "./con
 import { type DiscordMessageOriginShape, discordMessageOrigin } from "./origin";
 
 const DISCORD_MESSAGE_LIMIT = 2_000;
+// Discord clears the typing hint after ~10s, so refresh inside that window while a turn is running.
+const TYPING_REFRESH_MS = 7_000;
+// Hard ceiling above the gateway's 120s gjc turn timeout: a lost turn must not type forever.
+const TYPING_MAX_MS = 150_000;
 const REQUIRED_INTENTS = [
 	GatewayIntentBits.Guilds,
 	GatewayIntentBits.GuildMessages,
@@ -20,6 +24,15 @@ export interface GatewayClientLike {
 
 export interface DiscordTextChannelLike {
 	send(text: string): Promise<unknown>;
+}
+
+export interface DiscordTypingChannelLike {
+	sendTyping(): Promise<unknown>;
+}
+
+export interface TypingPort {
+	begin(conversationId: string): void;
+	end(conversationId: string): void;
 }
 
 export interface DiscordClientLike {
@@ -78,10 +91,72 @@ export function deliveryFailureIsAmbiguous(error: unknown): boolean {
 	return !new Set(["10003", "10008", "50001", "50013"]).has(code);
 }
 
+/**
+ * Keeps Discord's "is typing…" hint alive from the moment an engaged turn is accepted until its
+ * reply is delivered. One run per conversation; a failed pulse stops that run rather than retrying,
+ * because the typing hint is cosmetic and must never compete with delivery.
+ */
+export class TypingIndicator implements TypingPort {
+	readonly #runs = new Map<string, { deadline: number; timer: ReturnType<typeof setTimeout> | undefined }>();
+
+	constructor(
+		readonly discord: DiscordClientLike,
+		readonly refreshMs = TYPING_REFRESH_MS,
+		readonly maxMs = TYPING_MAX_MS,
+		readonly log: Pick<Console, "error"> = console,
+	) {}
+
+	begin(conversationId: string): void {
+		const existing = this.#runs.get(conversationId);
+		if (existing) {
+			existing.deadline = Date.now() + this.maxMs;
+			return;
+		}
+		const run = { deadline: Date.now() + this.maxMs, timer: undefined };
+		this.#runs.set(conversationId, run);
+		void this.#pulse(conversationId, run);
+	}
+
+	end(conversationId: string): void {
+		const run = this.#runs.get(conversationId);
+		if (!run) return;
+		if (run.timer) clearTimeout(run.timer);
+		this.#runs.delete(conversationId);
+	}
+
+	async #pulse(
+		conversationId: string,
+		run: { deadline: number; timer: ReturnType<typeof setTimeout> | undefined },
+	): Promise<void> {
+		if (this.#runs.get(conversationId) !== run) return;
+		try {
+			const channel = await this.discord.channels.fetch(conversationId);
+			if (!isDiscordTypingChannel(channel)) {
+				this.#runs.delete(conversationId);
+				return;
+			}
+			await channel.sendTyping();
+		} catch (error) {
+			this.log.error(
+				`Discord typing indicator stopped for ${conversationId}: ${error instanceof Error ? error.message : String(error)}`,
+			);
+			this.#runs.delete(conversationId);
+			return;
+		}
+		if (this.#runs.get(conversationId) !== run) return;
+		if (Date.now() >= run.deadline) {
+			this.#runs.delete(conversationId);
+			return;
+		}
+		run.timer = setTimeout(() => void this.#pulse(conversationId, run), this.refreshMs);
+	}
+}
+
 export async function settleDiscordDelivery(
 	gateway: Pick<GatewayClientLike, "request">,
 	discord: DiscordClientLike,
 	message: ChatMessagePayload,
+	typing?: TypingPort,
 ): Promise<void> {
 	if (message.origin.platform !== "discord" || !message.deliveryId) return;
 	const deliveryId = message.deliveryId;
@@ -101,16 +176,19 @@ export async function settleDiscordDelivery(
 			reason: error instanceof Error ? error.message : String(error),
 			ambiguous: deliveryFailureIsAmbiguous(error),
 		});
+	} finally {
+		typing?.end(message.origin.conversationId);
 	}
 }
 
 export function subscribeDiscordDeliveries(
 	gateway: GatewayClientLike,
 	discord: DiscordClientLike,
+	typing?: TypingPort,
 	log: Pick<Console, "error"> = console,
 ): () => void {
 	return gateway.onChatMessage((message) => {
-		void settleDiscordDelivery(gateway, discord, message).catch((error) =>
+		void settleDiscordDelivery(gateway, discord, message, typing).catch((error) =>
 			log.error(
 				`Discord delivery settlement request failed: ${error instanceof Error ? error.message : String(error)}`,
 			),
@@ -120,7 +198,8 @@ export function subscribeDiscordDeliveries(
 
 export async function startDiscordAdapter(config: LoadedDiscordAdapterConfig): Promise<void> {
 	const discord = new Client({ intents: [...new Set([...REQUIRED_INTENTS, ...(config.intents ?? [])])] });
-	const gateway = new ReconnectingGateway(config.gatewaySocket ?? defaultGatewaySocket(), discord, config);
+	const typing = new TypingIndicator(discord);
+	const gateway = new ReconnectingGateway(config.gatewaySocket ?? defaultGatewaySocket(), discord, config, typing);
 	discord.on("messageCreate", (message) => {
 		if (message.author.bot || message.id === undefined) return;
 		const origin = discordMessageOrigin(message);
@@ -148,6 +227,7 @@ class ReconnectingGateway {
 		readonly socketPath: string,
 		readonly discord: DiscordClientLike,
 		readonly config: LoadedDiscordAdapterConfig,
+		readonly typing?: TypingPort,
 	) {}
 
 	async connect(): Promise<void> {
@@ -156,7 +236,7 @@ class ReconnectingGateway {
 			this.#client = client;
 			this.#attempt = 0;
 			this.#deliveryOff?.();
-			this.#deliveryOff = subscribeDiscordDeliveries(client, this.discord);
+			this.#deliveryOff = subscribeDiscordDeliveries(client, this.discord, this.typing);
 			console.log("Discord adapter connected to gateway.");
 			this.monitor(client);
 		} catch {
@@ -168,7 +248,14 @@ class ReconnectingGateway {
 		if (!this.#inbound.addIfAbsent(messageId)) return;
 		const client = this.#client;
 		if (!client) return;
-		void client.request("chat.send", { origin, text, engagement }).catch(() => this.scheduleReconnect());
+		// The gateway acknowledges engagement before running the turn, so typing starts only for
+		// turns that will actually produce a reply and never outlives the delivery that clears it.
+		void client.request<{ engaged?: boolean }>("chat.send", { origin, text, engagement }).then(
+			(result) => {
+				if (result?.engaged) this.typing?.begin(origin.conversationId);
+			},
+			() => this.scheduleReconnect(),
+		);
 	}
 
 	private monitor(client: GajaewayClient): void {
@@ -206,6 +293,10 @@ function escapeRegExp(value: string): string {
 
 function isDiscordTextChannel(value: unknown): value is DiscordTextChannelLike {
 	return typeof value === "object" && value !== null && "send" in value && typeof value.send === "function";
+}
+
+function isDiscordTypingChannel(value: unknown): value is DiscordTypingChannelLike {
+	return typeof value === "object" && value !== null && "sendTyping" in value && typeof value.sendTyping === "function";
 }
 
 if (import.meta.main) {

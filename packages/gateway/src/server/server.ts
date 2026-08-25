@@ -29,6 +29,7 @@ import type { GjcPort } from "../orchestrator/gjc-client";
 import { PersonaLoader } from "../persona/persona";
 import type { GatewayDatabase } from "../store/db";
 import { DeliveryLedger } from "../store/ledger";
+import { KeyedQueue } from "./keyed-queue";
 
 interface Connection {
 	readonly decoder: FrameDecoder;
@@ -56,6 +57,7 @@ interface Runtime {
 	readonly monitors: MonitorPropagator;
 	readonly monitorRuntime: MonitorRuntime;
 	readonly reconcileTimer: ReturnType<typeof setInterval>;
+	readonly turns: KeyedQueue;
 }
 
 export async function startUnixServer(options: GatewayServerOptions): Promise<GatewayServer> {
@@ -178,6 +180,7 @@ function createRuntime(options: GatewayServerOptions): Runtime {
 		monitors,
 		monitorRuntime,
 		reconcileTimer,
+		turns: new KeyedQueue(),
 	};
 }
 async function handleFrame(
@@ -477,11 +480,15 @@ async function sendChat(
 		return;
 	}
 	const turnId = crypto.randomUUID();
-	const epoch = options.database.getSessionRecord(key)?.epoch ?? 0;
-	const { sessionId } = await options.gjc.ensureSession(key, epoch);
 	connection.write({ v: PROFILE_VERSION, type: "response", id: request.id, result: { turnId, engaged: true } });
-	const preamble = `${await runtime.persona.systemPreamble()}\n\n${ACTION_GUARD_SYSTEM_NOTICE}`;
-	const text = await options.gjc.sendTurn(sessionId, userText, preamble);
+	// One origin == one gjc session: serialize turns per origin key so a burst of
+	// inbound messages can never race two `gjc --resume` processes on one session.
+	const text = await runtime.turns.run(key, async () => {
+		const epoch = options.database.getSessionRecord(key)?.epoch ?? 0;
+		const { sessionId } = await options.gjc.ensureSession(key, epoch);
+		const preamble = `${await runtime.persona.systemPreamble()}\n\n${ACTION_GUARD_SYSTEM_NOTICE}`;
+		return options.gjc.sendTurn(sessionId, userText, preamble);
+	});
 	options.database.withTransaction(() => {
 		options.database.updateActivity(key, JSON.stringify(origin));
 		options.database.addRecall(
