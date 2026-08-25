@@ -73,8 +73,10 @@ test("watcher and script honor allowlists and ActionGuard", async () => {
 	try {
 		const paths: string[] = [];
 		const stop = await startWatcher(root, [root], (path) => paths.push(path), 5);
-		await writeFile(join(root, "file"), "x");
-		for (let i = 0; i < 100 && paths.length === 0; i++) await Bun.sleep(20);
+		for (let i = 0; i < 100 && paths.length === 0; i++) {
+			if (i % 10 === 0) await writeFile(join(root, `file-${i}`), "x");
+			await Bun.sleep(20);
+		}
 		stop();
 		expect(paths.length).toBeGreaterThanOrEqual(1);
 		await expect(startWatcher(outside, [root], () => {})).rejects.toThrow();

@@ -1,4 +1,6 @@
-import { LOOPBACK_ORIGIN } from "@gajaeway/protocol";
+import { copyFile, stat } from "node:fs/promises";
+import { isAbsolute, join } from "node:path";
+import { LOOPBACK_ORIGIN, originKey } from "@gajaeway/protocol";
 import { GajaewayClient } from "@gajaeway/sdk";
 
 export function socketPath(home = process.env.GAJAEWAY_HOME): string {
@@ -13,6 +15,52 @@ export function parseArgs(args: string[]): { command?: string; rest: string[]; s
 		else rest.push(args[i]);
 	}
 	return { command: rest[0], rest: rest.slice(1), socket };
+}
+
+function gatewayHome(): string {
+	return process.env.GAJAEWAY_HOME ?? `${process.env.HOME ?? "~"}/.gajaeway`;
+}
+
+function printSessions(
+	sessions: Array<{
+		origin: Parameters<typeof originKey>[0];
+		epoch: number;
+		createdAt: string;
+		lastActivityAt: string | null;
+	}>,
+): void {
+	console.log("INDEX  ORIGIN                                      EPOCH  CREATED AT                 LAST ACTIVITY AT");
+	for (const [index, session] of sessions.entries())
+		console.log(
+			`${String(index).padEnd(6)} ${originKey(session.origin).padEnd(43)} ${String(session.epoch).padEnd(6)} ${session.createdAt.padEnd(26)} ${session.lastActivityAt ?? "-"}`,
+		);
+}
+
+export async function restoreDatabase(socket: string, backupPath: string): Promise<void> {
+	if (!isAbsolute(backupPath)) throw new Error("ops restore requires an absolute backup path");
+	try {
+		await stat(socket);
+		throw new Error(`Refusing restore: gateway socket ${socket} exists. Stop the daemon before restoring.`);
+	} catch (error) {
+		if (error instanceof Error && error.message.startsWith("Refusing restore:")) throw error;
+		if ((error as NodeJS.ErrnoException).code !== "ENOENT")
+			throw new Error(`Cannot verify gateway socket ${socket}; refusing restore.`);
+	}
+	let header: Uint8Array;
+	try {
+		header = new Uint8Array(await Bun.file(backupPath).slice(0, 16).arrayBuffer());
+	} catch {
+		throw new Error(`Backup is not readable: ${backupPath}`);
+	}
+	if (new TextDecoder().decode(header) !== "SQLite format 3\u0000")
+		throw new Error(`Backup is not a SQLite database: ${backupPath}`);
+	const databasePath = join(gatewayHome(), "gateway.db");
+	const preservedPath = `${databasePath}.pre-restore-${new Date().toISOString().replace(/[:.]/g, "-")}`;
+	await copyFile(databasePath, preservedPath);
+	await copyFile(backupPath, databasePath);
+	console.log(`Validated SQLite backup: ${backupPath}`);
+	console.log(`Copied current database to: ${preservedPath}`);
+	console.log(`Restored backup to: ${databasePath}`);
 }
 
 async function chat(socket: string): Promise<void> {
@@ -100,6 +148,54 @@ export async function main(args = process.argv.slice(2)): Promise<void> {
 					console.log("Launch the gateway out-of-band with: bun packages/gateway/src/main.ts daemon");
 				else throw new Error("usage: gajaeway daemon run");
 				break;
+			case "sessions": {
+				const client = await GajaewayClient.connectSocket(parsed.socket);
+				try {
+					const result = await client.request<{
+						sessions: Array<{
+							origin: Parameters<typeof originKey>[0];
+							epoch: number;
+							createdAt: string;
+							lastActivityAt: string | null;
+						}>;
+					}>("session.list");
+					const [command, selector] = parsed.rest;
+					if (command === "list") {
+						if (selector === "--json") console.log(JSON.stringify(result));
+						else if (!selector) printSessions(result.sessions);
+						else throw new Error("usage: gajaeway sessions list [--json]");
+					} else if (command === "inspect" && selector) {
+						const index = Number(selector);
+						const session = Number.isInteger(index)
+							? result.sessions[index]
+							: result.sessions.find((candidate) => originKey(candidate.origin) === selector);
+						if (!session) throw new Error(`Unknown session: ${selector}`);
+						console.log(`origin: ${originKey(session.origin)}`);
+						console.log(`epoch: ${session.epoch}`);
+						console.log(`createdAt: ${session.createdAt}`);
+						console.log(`lastActivityAt: ${session.lastActivityAt ?? "-"}`);
+					} else throw new Error("usage: gajaeway sessions list [--json]|inspect <originKey-or-index>");
+				} finally {
+					await client.close();
+				}
+				break;
+			}
+			case "ops": {
+				const [command, path] = parsed.rest;
+				if (command === "restore" && path) {
+					await restoreDatabase(parsed.socket, path);
+					break;
+				}
+				const client = await GajaewayClient.connectSocket(parsed.socket);
+				try {
+					if (command === "backup" && path) console.log(JSON.stringify(await client.request("ops.backup", { path })));
+					else if (command === "integrity") console.log(JSON.stringify(await client.request("ops.integrity")));
+					else throw new Error("usage: gajaeway ops backup <path>|integrity|restore <backupPath>");
+				} finally {
+					await client.close();
+				}
+				break;
+			}
 			case "memory": {
 				const client = await GajaewayClient.connectSocket(parsed.socket);
 				try {
@@ -153,7 +249,7 @@ export async function main(args = process.argv.slice(2)): Promise<void> {
 			}
 			default:
 				throw new Error(
-					"usage: gajaeway [--socket PATH] status|shutdown|chat|daemon run|memory audit|memory search <query>",
+					"usage: gajaeway [--socket PATH] status|shutdown|chat|daemon run|sessions list [--json]|sessions inspect <originKey-or-index>|memory audit|memory search <query>|monitors ...|ops backup <path>|ops integrity|ops restore <backupPath>",
 				);
 		}
 	} catch (error) {

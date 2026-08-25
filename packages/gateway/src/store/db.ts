@@ -327,6 +327,17 @@ export class GatewayDatabase {
 		}
 	}
 
+	backupInto(path: string): void {
+		this.#database.query("VACUUM INTO ?").run(path);
+	}
+
+	integrityCheckDetail(): string {
+		return (
+			this.#database.query<{ integrity_check: string }, []>("PRAGMA integrity_check").get()?.integrity_check ??
+			"unknown"
+		);
+	}
+
 	close(): void {
 		this.#database.close();
 	}
@@ -414,10 +425,8 @@ export class GatewayDatabase {
 	}
 
 	private integrityCheck(): void {
-		const result = this.#database
-			.query<{ integrity_check: string }, []>("PRAGMA integrity_check")
-			.get()?.integrity_check;
+		const result = this.integrityCheckDetail();
 		if (result !== "ok")
-			throw new DatabaseStartupError("integrity_check_failed", `SQLite integrity_check failed: ${result ?? "unknown"}`);
+			throw new DatabaseStartupError("integrity_check_failed", `SQLite integrity_check failed: ${result}`);
 	}
 }

@@ -1,0 +1,8 @@
+{
+	"v": "0.1",
+	"type": "hello",
+	"payload": {
+		"supportedVersions": ["0.1"],
+		"clientInfo": { "name": "@gajaeway/sdk", "version": "0.1.0" }
+	}
+}

@@ -1,5 +1,7 @@
 {
-  "workspaces": ["packages/*"],
+  "workspaces": [
+    "packages/*"
+  ],
   "name": "gajae-way",
   "version": "0.1.0",
   "private": true,
@@ -7,27 +9,14 @@
   "packageManager": "bun@1.3.14",
   "description": "Gajae Way operator-agent runtime",
   "scripts": {
-    "build:native": "bun scripts/build-native.ts",
-    "compile": "bun scripts/compile.ts",
-    "embed:native": "bun scripts/embed-native.ts",
-    "test": "bun test"
-  },
-  "bin": {
-    "gajaeway": "./dist/gajaeway",
-    "gajaeway-discord": "./dist/gajaeway-discord",
-    "gajaeway-telegram": "./dist/gajaeway-discord"
+    "test": "bun test packages"
   },
   "devDependencies": {
     "@biomejs/biome": "2.5.2",
-    "@napi-rs/cli": "3.6.2",
     "@types/bun": "^1.3.14",
     "typescript": "^5.9.3"
   },
   "engines": {
     "bun": ">=1.3.14"
-  },
-  "napi": {
-    "binaryName": "way_core",
-    "triples": {}
   }
 }

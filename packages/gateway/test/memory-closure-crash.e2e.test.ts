@@ -2,7 +2,6 @@ import { afterEach, expect, test } from "bun:test";
 import { access, mkdtemp, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { MemoryClosureQueue } from "../src/memory/closure";
 import { memoryRoot } from "../src/memory/doctrine";
 import { GatewayDatabase } from "../src/store/db";
 

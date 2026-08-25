@@ -209,6 +209,11 @@ export interface VerbCatalogV01 {
 	};
 	"monitor.test": { params: MonitorTestParams; result: { readonly eventId: string } };
 	"monitor.remove": { params: { readonly monitorId: string }; result: { readonly removed: true } };
+	"ops.backup": {
+		params: { readonly path: string };
+		result: { readonly path: string; readonly bytes: number };
+	};
+	"ops.integrity": { params: undefined; result: { readonly ok: boolean; readonly detail: string } };
 }
 
 /** Event catalog: event name -> payload. */
@@ -233,6 +238,8 @@ export const VERBS_V01 = [
 	"monitor.inspect",
 	"monitor.test",
 	"monitor.remove",
+	"ops.backup",
+	"ops.integrity",
 ] as const;
 export const EVENTS_V01 = ["chat.message", "gateway.stopping", "monitor.event"] as const;
 

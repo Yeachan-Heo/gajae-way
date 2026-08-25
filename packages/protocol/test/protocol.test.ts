@@ -14,7 +14,7 @@ import {
 
 describe("negotiation", () => {
 	test("picks highest mutual version", () => {
-		const result = negotiate({ supportedVersions: ["0.1"] });
+		const result = negotiate({ supportedVersions: [PROFILE_VERSION] });
 		expect(result.ok).toBe(true);
 		if (result.ok) expect(result.negotiated.profileVersion).toBe(PROFILE_VERSION);
 	});

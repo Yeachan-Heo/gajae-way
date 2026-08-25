@@ -24,6 +24,7 @@ import { validateMemory } from "../memory/validator";
 import { MonitorPropagator } from "../monitors/propagate";
 import { MonitorRegistry } from "../monitors/registry";
 import { MonitorRuntime } from "../monitors/runtime";
+import { backupDatabase, integrityDatabase } from "../ops/backup";
 import type { GjcPort } from "../orchestrator/gjc-client";
 import { PersonaLoader } from "../persona/persona";
 import type { GatewayDatabase } from "../store/db";
@@ -264,6 +265,27 @@ async function handleRequest(
 			connection.write({ v: PROFILE_VERSION, type: "response", id: request.id, result: { recorded: true } });
 			return;
 		}
+		case "ops.backup": {
+			try {
+				const result = await backupDatabase(
+					options.database,
+					options.config.dbPath,
+					(request.params as { path?: unknown } | undefined)?.path,
+				);
+				connection.write({ v: PROFILE_VERSION, type: "response", id: request.id, result });
+			} catch (error) {
+				throw new ProtocolError("invalid_params", error instanceof Error ? error.message : "invalid backup path");
+			}
+			return;
+		}
+		case "ops.integrity":
+			connection.write({
+				v: PROFILE_VERSION,
+				type: "response",
+				id: request.id,
+				result: integrityDatabase(options.database),
+			});
+			return;
 		case "session.list": {
 			const sessions = options.database.sessionRows().map((row) => ({
 				origin: row.origin_ref_json ? JSON.parse(row.origin_ref_json) : LOOPBACK_ORIGIN,

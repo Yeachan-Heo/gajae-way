@@ -7,15 +7,13 @@
  */
 
 /** Current wire profile version served by this gateway build. */
-export const PROFILE_VERSION = "0.1" as const;
+export const PROFILE_VERSION = "1.0" as const;
 
 /** Inclusive range of profile versions this build can serve. */
-export const SUPPORTED_PROFILE_VERSIONS: readonly string[] = ["0.1"];
+export const SUPPORTED_PROFILE_VERSIONS: readonly string[] = ["0.1", "1.0"];
 
 /** Capability identifiers advertised at negotiation. Grows additively per phase. */
 export const CAPABILITIES = [
-	/** Profile is pre-1.0; consumers must expect additive evolution. */
-	"unstable",
 	/** Core gateway lifecycle verbs: gateway.status, gateway.shutdown. */
 	"gateway.core",
 	/** Loopback chat verbs: chat.send + chat.* events (P0). */
