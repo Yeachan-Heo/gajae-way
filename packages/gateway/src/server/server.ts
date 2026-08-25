@@ -489,12 +489,32 @@ async function sendChat(
 	connection.write({ v: PROFILE_VERSION, type: "response", id: request.id, result: { turnId, engaged: true } });
 	// One origin == one gjc session: serialize turns per origin key so a burst of
 	// inbound messages can never race two `gjc --resume` processes on one session.
-	const text = await runtime.turns.run(key, async () => {
-		const epoch = options.database.getSessionRecord(key)?.epoch ?? 0;
-		const { sessionId } = await options.gjc.ensureSession(key, epoch);
-		const preamble = `${await runtime.persona.systemPreamble()}\n\n${ACTION_GUARD_SYSTEM_NOTICE}`;
-		return options.gjc.sendTurn(sessionId, userText, preamble);
-	});
+	let text: string;
+	try {
+		text = await runtime.turns.run(key, async () => {
+			const epoch = options.database.getSessionRecord(key)?.epoch ?? 0;
+			const { sessionId } = await options.gjc.ensureSession(key, epoch);
+			const preamble = `${await runtime.persona.systemPreamble()}\n\n${ACTION_GUARD_SYSTEM_NOTICE}`;
+			return options.gjc.sendTurn(sessionId, userText, preamble);
+		});
+	} catch (error) {
+		// Never ghost a platform conversation: a failed turn still produces a visible,
+		// ledgered notice (live P1 drill finding: timeouts looked like silent ignores).
+		if (nonLoopback) {
+			const notice = runtime.delivery.prepare(
+				turnId,
+				origin,
+				"[turn failed] The reply could not be produced (timeout or runtime error). Try again, or send /new to rebind this conversation.",
+			);
+			if (notice) {
+				runtime.delivery.markInflight(notice.deliveryId as string);
+				for (const recipient of runtime.connections)
+					if (recipient.negotiated)
+						recipient.write({ v: PROFILE_VERSION, type: "event", event: "chat.message", payload: notice });
+			}
+		}
+		throw error;
+	}
 	options.database.withTransaction(() => {
 		options.database.updateActivity(key, JSON.stringify(origin));
 		options.database.addRecall(

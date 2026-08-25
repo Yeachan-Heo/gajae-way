@@ -96,3 +96,45 @@ test("requires negotiation then serves status, shutdown, and validates chat para
 	expect(client.frames[7]).toMatchObject({ type: "event", event: "gateway.stopping" });
 	client.close();
 });
+
+test("a failed platform turn still delivers a visible ledgered failure notice", async () => {
+	directory = await mkdtemp(join(tmpdir(), "gajaeway-server-"));
+	const config: GatewayConfig = {
+		schemaVersion: 1,
+		home: directory,
+		configPath: join(directory, "config.json"),
+		socketPath: join(directory, "gateway.sock"),
+		dbPath: join(directory, "gateway.db"),
+		logVerbosity: "info",
+	};
+	const database = await GatewayDatabase.open(config.dbPath);
+	const gjc: GjcPort = {
+		ensureSession: async () => ({ sessionId: "mock-session" }),
+		sendTurn: async () => {
+			throw new Error("gjc turn timed out after 300000ms");
+		},
+	};
+	server = await startUnixServer({ config, database, gjc, onStop: () => database.close() });
+	const client = await connect(config.socketPath);
+	client.send({ v: "0.1", type: "hello", payload: { supportedVersions: ["0.1"] } });
+	await waitFor(client.frames, 1);
+	client.send({
+		v: "0.1",
+		type: "request",
+		id: "dm",
+		verb: "chat.send",
+		params: {
+			origin: { platform: "discord", kind: "dm", conversationId: "c1", peerId: "p1" },
+			text: "hello",
+			engagement: { mentioned: false, group: false, authorId: "p1" },
+		},
+	});
+	await waitFor(client.frames, 4);
+	expect(client.frames[1].result.engaged).toBe(true);
+	const notice = client.frames.find((frame) => frame.type === "event" && frame.event === "chat.message");
+	expect(notice.payload.text).toStartWith("[turn failed]");
+	expect(notice.payload.deliveryId).toBeString();
+	const errorFrame = client.frames.find((frame) => frame.type === "error" && frame.id === "dm");
+	expect(errorFrame.error.code).toBe("verb_failed");
+	client.close();
+});
