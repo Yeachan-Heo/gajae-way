@@ -90,3 +90,4 @@ On startup, the delivery ledger redelivers unsettled output. Ambiguous prior del
 - **Newer-schema refusal:** do not downgrade against that database. Restore a compatible backup or run a gateway that supports its schema.
 - **Quarantined mutation:** inspect the intent payload, memory repository state, and Git error; repair the source condition, then use the documented recovery workflow rather than deleting the evidence.
 - **Backup failure:** supply an absolute target path whose parent directory already exists; never target the live `gateway.db`.
+- **Every turn on one origin fails with the same gjc `api_error` (for example "cannot restore Claude OAuth MCP tool alias"):** the bound gjc session transcript is poisoned and every resume replays the failure. Send `/new` to that conversation to rebind a fresh session; prior in-session context is lost by design. The daemon log carries the exact error; the conversation receives the `[turn failed]` notice.
