@@ -217,6 +217,12 @@ async function handleFrame(
 			await handleRequest(connection, frame, options, runtime, stop);
 		}
 	} catch (error) {
+		// Non-protocol failures are sanitized on the wire; keep the real cause in the
+		// daemon log or turn failures are undiagnosable (live P1 drill finding).
+		if (!(error instanceof ProtocolError))
+			console.error(
+				`gateway request failed${frame.type === "request" ? ` (${frame.verb})` : ""}: ${error instanceof Error ? (error.stack ?? error.message) : String(error)}`,
+			);
 		writeError(connection, error, frame.type === "request" ? frame.id : undefined);
 	}
 }
