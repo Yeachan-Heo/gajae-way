@@ -8,5 +8,8 @@ export function decideEngagement(
 ): { readonly engaged: boolean } {
 	if (origin.platform === "loopback" || origin.kind === "dm") return { engaged: true };
 	if (!engagement?.group) return { engaged: false };
-	return { engaged: engagement.mentioned || config.channels?.[origin.conversationId]?.engagement === "open" };
+	const configured =
+		config.channels?.[`${origin.platform}:${origin.conversationId}`] ??
+		(origin.platform === "discord" ? config.channels?.[origin.conversationId] : undefined);
+	return { engaged: engagement.mentioned || configured?.engagement === "open" };
 }

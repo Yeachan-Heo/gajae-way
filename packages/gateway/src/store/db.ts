@@ -2,7 +2,7 @@ import { Database } from "bun:sqlite";
 import { mkdir } from "node:fs/promises";
 import { dirname } from "node:path";
 
-const LATEST_SCHEMA_VERSION = 2;
+const LATEST_SCHEMA_VERSION = 3;
 
 export class DatabaseStartupError extends Error {
 	readonly code: "newer_schema" | "integrity_check_failed";
@@ -40,6 +40,65 @@ export class GatewayDatabase {
 
 	get activeSessionCount(): number {
 		return this.#database.query<{ count: number }, []>("SELECT COUNT(*) AS count FROM sessions").get()?.count ?? 0;
+	}
+	getSessionRecord(originKey: string): { sessionId: string; epoch: number } | undefined {
+		const row = this.#database
+			.query<{ gjc_session_id: string; epoch: number }, [string]>(
+				"SELECT gjc_session_id, epoch FROM sessions WHERE origin_key = ?",
+			)
+			.get(originKey);
+		return row && row.gjc_session_id ? { sessionId: row.gjc_session_id, epoch: row.epoch } : undefined;
+	}
+
+	bumpEpoch(originKey: string, originRefJson: string): number {
+		const now = new Date().toISOString();
+		this.#database
+			.query(
+				"INSERT INTO sessions (origin_key, origin_ref_json, gjc_session_id, epoch, created_at, last_activity_at) VALUES (?, ?, '', 1, ?, ?) ON CONFLICT(origin_key) DO UPDATE SET epoch = epoch + 1, gjc_session_id = '', origin_ref_json = excluded.origin_ref_json, last_activity_at = excluded.last_activity_at",
+			)
+			.run(originKey, originRefJson, now, now);
+		return this.#database
+			.query<{ epoch: number }, [string]>("SELECT epoch FROM sessions WHERE origin_key = ?")
+			.get(originKey)!.epoch;
+	}
+
+	updateActivity(originKey: string, originRefJson: string): void {
+		this.#database
+			.query("UPDATE sessions SET last_activity_at = ?, origin_ref_json = ? WHERE origin_key = ?")
+			.run(new Date().toISOString(), originRefJson, originKey);
+	}
+
+	sessionRows(): Array<{
+		origin_ref_json: string | null;
+		created_at: string;
+		last_activity_at: string | null;
+		epoch: number;
+	}> {
+		return this.#database
+			.query("SELECT origin_ref_json, created_at, last_activity_at, epoch FROM sessions ORDER BY created_at")
+			.all() as Array<{
+			origin_ref_json: string | null;
+			created_at: string;
+			last_activity_at: string | null;
+			epoch: number;
+		}>;
+	}
+
+	addRecall(originKey: string, originRefJson: string, text: string): void {
+		this.#database
+			.query("INSERT INTO recall_snippets (origin_key, origin_ref_json, text, at) VALUES (?, ?, ?, ?)")
+			.run(originKey, originRefJson, text.slice(0, 1000), new Date().toISOString());
+		this.#database
+			.query(
+				"DELETE FROM recall_snippets WHERE origin_key = ? AND id NOT IN (SELECT id FROM recall_snippets WHERE origin_key = ? ORDER BY id DESC LIMIT 20)",
+			)
+			.run(originKey, originKey);
+	}
+
+	recallRows(): Array<{ origin_key: string; origin_ref_json: string; text: string; at: string }> {
+		return this.#database
+			.query("SELECT origin_key, origin_ref_json, text, at FROM recall_snippets ORDER BY id DESC")
+			.all() as Array<{ origin_key: string; origin_ref_json: string; text: string; at: string }>;
 	}
 
 	getSession(originKey: string): string | undefined {
@@ -155,6 +214,17 @@ export class GatewayDatabase {
 				this.#database
 					.query("INSERT INTO schema_migrations (version, applied_at) VALUES (?, ?)")
 					.run(2, new Date().toISOString());
+			});
+		}
+
+		if (current < 3) {
+			this.withTransaction(() => {
+				this.#database.exec(
+					"ALTER TABLE sessions ADD COLUMN epoch INTEGER NOT NULL DEFAULT 0; ALTER TABLE sessions ADD COLUMN last_activity_at TEXT; ALTER TABLE sessions ADD COLUMN origin_ref_json TEXT; CREATE TABLE recall_snippets (id INTEGER PRIMARY KEY AUTOINCREMENT, origin_key TEXT NOT NULL, origin_ref_json TEXT NOT NULL, text TEXT NOT NULL, at TEXT NOT NULL)",
+				);
+				this.#database
+					.query("INSERT INTO schema_migrations (version, applied_at) VALUES (?, ?)")
+					.run(3, new Date().toISOString());
 			});
 		}
 	}

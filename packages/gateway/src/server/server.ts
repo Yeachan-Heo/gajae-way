@@ -5,7 +5,7 @@ import {
 	type Frame,
 	FrameDecoder,
 	type HelloPayload,
-	type LOOPBACK_ORIGIN,
+	LOOPBACK_ORIGIN,
 	negotiate,
 	originKey,
 	PROFILE_VERSION,
@@ -215,6 +215,34 @@ async function handleRequest(
 			connection.write({ v: PROFILE_VERSION, type: "response", id: request.id, result: { recorded: true } });
 			return;
 		}
+		case "session.list": {
+			const sessions = options.database.sessionRows().map((row) => ({
+				origin: row.origin_ref_json ? JSON.parse(row.origin_ref_json) : LOOPBACK_ORIGIN,
+				createdAt: row.created_at,
+				lastActivityAt: row.last_activity_at,
+				epoch: row.epoch,
+			}));
+			connection.write({ v: PROFILE_VERSION, type: "response", id: request.id, result: { sessions } });
+			return;
+		}
+		case "session.recall": {
+			const params = (request.params ?? {}) as { query?: unknown; limit?: unknown; requestingOrigin?: unknown };
+			const requesting = params.requestingOrigin
+				? originKey(validateOriginRef(params.requestingOrigin as never))
+				: undefined;
+			const query = typeof params.query === "string" ? params.query.toLowerCase().split(/\s+/).filter(Boolean) : [];
+			const limit = Math.min(10, Math.max(0, typeof params.limit === "number" ? Math.floor(params.limit) : 10));
+			const rows = options.database
+				.recallRows()
+				.filter((r) => r.origin_key !== requesting)
+				.map((r) => ({ ...r, score: query.length ? query.filter((t) => r.text.toLowerCase().includes(t)).length : 0 }));
+			rows.sort((a, b) => b.score - a.score || b.at.localeCompare(a.at));
+			const snippets = rows
+				.slice(0, limit)
+				.map((r) => ({ origin: JSON.parse(r.origin_ref_json), text: r.text.slice(0, 500), at: r.at }));
+			connection.write({ v: PROFILE_VERSION, type: "response", id: request.id, result: { snippets } });
+			return;
+		}
 		case "chat.send":
 			await sendChat(connection, request, options, runtime);
 			return;
@@ -233,14 +261,44 @@ async function sendChat(
 		| undefined;
 	if (!params || typeof params.text !== "string" || !params.text)
 		throw new ProtocolError("invalid_params", "chat.send requires non-empty text");
+	const userText: string = params.text;
 	let origin: ReturnType<typeof validateOriginRef>;
 	try {
 		origin = validateOriginRef(params.origin as typeof LOOPBACK_ORIGIN);
 	} catch {
 		throw new ProtocolError("invalid_params", "chat.send requires a valid origin");
 	}
-	if (origin.platform !== "loopback" && origin.platform !== "discord")
-		throw new ProtocolError("invalid_params", "only loopback and discord origins are available in P1");
+	const key = originKey(origin);
+	if (params.text === "/new" || params.text === "/reset") {
+		options.database.withTransaction(() => options.database.bumpEpoch(key, JSON.stringify(origin)));
+		const payload = {
+			turnId: crypto.randomUUID(),
+			origin,
+			role: "assistant" as const,
+			text: "Started a fresh session.",
+			final: true,
+		};
+		if (origin.platform === "loopback")
+			connection.write({ v: PROFILE_VERSION, type: "event", event: "chat.message", id: request.id, payload });
+		else {
+			const delivery = runtime.delivery.prepare(payload.turnId, origin, payload.text);
+			if (delivery) {
+				for (const recipient of runtime.connections)
+					if (recipient.negotiated)
+						recipient.write({ v: PROFILE_VERSION, type: "event", event: "chat.message", payload: delivery });
+				runtime.delivery.markInflight(delivery.deliveryId as string);
+			}
+		}
+		connection.write({
+			v: PROFILE_VERSION,
+			type: "response",
+			id: request.id,
+			result: { turnId: payload.turnId, engaged: true },
+		});
+		return;
+	}
+	if (origin.platform !== "loopback" && origin.platform !== "discord" && origin.platform !== "telegram")
+		throw new ProtocolError("invalid_params", "unsupported origin platform");
 	const nonLoopback = origin.platform !== "loopback";
 	if (
 		nonLoopback &&
@@ -261,10 +319,19 @@ async function sendChat(
 		return;
 	}
 	const turnId = crypto.randomUUID();
-	const { sessionId } = await options.gjc.ensureSession(originKey(origin));
+	const epoch = options.database.getSessionRecord(key)?.epoch ?? 0;
+	const { sessionId } = await options.gjc.ensureSession(key, epoch);
 	connection.write({ v: PROFILE_VERSION, type: "response", id: request.id, result: { turnId, engaged: true } });
 	const preamble = `${await runtime.persona.systemPreamble()}\n\n${ACTION_GUARD_SYSTEM_NOTICE}`;
-	const text = await options.gjc.sendTurn(sessionId, params.text, preamble);
+	const text = await options.gjc.sendTurn(sessionId, userText, preamble);
+	options.database.withTransaction(() => {
+		options.database.updateActivity(key, JSON.stringify(origin));
+		options.database.addRecall(
+			key,
+			JSON.stringify(origin),
+			`user: ${userText.slice(0, 500)}\nassistant: ${text.slice(0, 500)}`,
+		);
+	});
 	if (!nonLoopback) {
 		connection.write({
 			v: PROFILE_VERSION,

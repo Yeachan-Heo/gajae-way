@@ -1,7 +1,7 @@
 import type { GatewayDatabase } from "../store/db";
 
 export interface GjcPort {
-	ensureSession(originKey: string): Promise<{ sessionId: string }>;
+	ensureSession(originKey: string, epoch?: number): Promise<{ sessionId: string }>;
 	sendTurn(sessionId: string, text: string, systemPreamble?: string): Promise<string>;
 }
 
@@ -36,14 +36,17 @@ export class GjcClient implements GjcPort {
 		this.#cwd = cwd;
 	}
 
-	async ensureSession(originKey: string): Promise<{ sessionId: string }> {
-		if (process.env.GAJAEWAY_TEST_STUB_GJC === "1") return { sessionId: `stub-${originKey}` };
-		const cached = this.#sessions.get(originKey) ?? this.#database.getSession(originKey);
+	async ensureSession(originKey: string, epoch = 0): Promise<{ sessionId: string }> {
+		const cacheKey = `${originKey}#${epoch}`;
+		if (process.env.GAJAEWAY_TEST_STUB_GJC === "1") return { sessionId: `stub-${cacheKey}` };
+		const record = this.#database.getSessionRecord(originKey);
+		const cached = this.#sessions.get(cacheKey) ?? (record && record.epoch === epoch ? record.sessionId : undefined);
 		if (cached) {
-			this.#sessions.set(originKey, cached);
+			this.#sessions.set(cacheKey, cached);
 			return { sessionId: cached };
 		}
-		const idempotencyKey = `gajaeway-${originKey.replace(/[^A-Za-z0-9._-]/g, "-")}`;
+		const suffix = epoch === 0 ? "" : `-e${epoch}`;
+		const idempotencyKey = `gajaeway-${originKey.replace(/[^A-Za-z0-9._-]/g, "-")}${suffix}`;
 		const child = Bun.spawn({
 			cmd: [
 				"gjc",
@@ -66,7 +69,7 @@ export class GjcClient implements GjcPort {
 		const [stdout, stderr, exitCode] = await this.#bounded(child, "session.create");
 		if (exitCode !== 0) throw new Error(`gjc session.create exited ${exitCode}: ${stderr.trim()}`);
 		const sessionId = parseCreateResult(stdout);
-		this.#sessions.set(originKey, sessionId);
+		this.#sessions.set(cacheKey, sessionId);
 		this.#database.withTransaction(() => this.#database.putSession(originKey, sessionId));
 		return { sessionId };
 	}

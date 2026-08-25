@@ -82,6 +82,41 @@ export interface DeliveryFailParams {
 	readonly ambiguous?: boolean;
 }
 
+/**
+ * Cross-session recall (P2, spec fact 10): on-demand, bounded, source-cited.
+ * Never returns raw transcripts; snippets are working-memory digests and every
+ * snippet names its source origin.
+ */
+export interface SessionRecallParams {
+	/** Free-text relevance query; empty returns most-recent snippets. */
+	readonly query?: string;
+	/** Max snippets returned; server clamps to its own ceiling. */
+	readonly limit?: number;
+	/** Origin the request is made on behalf of; excluded from results. */
+	readonly requestingOrigin?: OriginRef;
+}
+
+export interface RecallSnippet {
+	/** Source origin citation — always present (spec fact 10). */
+	readonly origin: OriginRef;
+	/** Bounded digest text, never raw transcript. */
+	readonly text: string;
+	readonly at: string;
+}
+
+export interface SessionRecallResult {
+	readonly snippets: readonly RecallSnippet[];
+}
+
+export interface SessionListResult {
+	readonly sessions: readonly {
+		readonly origin: OriginRef;
+		readonly createdAt: string;
+		readonly lastActivityAt: string | null;
+		readonly epoch: number;
+	}[];
+}
+
 /** Verb catalog: verb name -> { params, result } (documentation-level typing). */
 export interface VerbCatalogV01 {
 	"gateway.status": { params: undefined; result: GatewayStatusResult };
@@ -89,6 +124,8 @@ export interface VerbCatalogV01 {
 	"chat.send": { params: ChatSendParams; result: ChatSendResult };
 	"delivery.confirm": { params: DeliveryConfirmParams; result: { readonly settled: true } };
 	"delivery.fail": { params: DeliveryFailParams; result: { readonly recorded: true } };
+	"session.recall": { params: SessionRecallParams; result: SessionRecallResult };
+	"session.list": { params: undefined; result: SessionListResult };
 }
 
 /** Event catalog: event name -> payload. */
@@ -103,6 +140,8 @@ export const VERBS_V01 = [
 	"chat.send",
 	"delivery.confirm",
 	"delivery.fail",
+	"session.recall",
+	"session.list",
 ] as const;
 export const EVENTS_V01 = ["chat.message", "gateway.stopping"] as const;
 
