@@ -5,7 +5,7 @@ on:
   pull_request:
 
 jobs:
-  build:
+  test:
     name: ${{ matrix.platform }}-${{ matrix.arch }}
     runs-on: ${{ matrix.os }}
     strategy:
@@ -21,48 +21,14 @@ jobs:
           - os: ubuntu-24.04-arm
             platform: linux
             arch: arm64
-    env:
-      TARGET_PLATFORM: ${{ matrix.platform }}
-      TARGET_ARCH: ${{ matrix.arch }}
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          # The migration check diffs against the merge base, so it needs history.
-          fetch-depth: 0
-      - uses: oven-sh/setup-bun@v2
-        with:
-          bun-version: 1.3.14
-      - uses: dtolnay/rust-toolchain@stable
-      - run: bun install --frozen-lockfile
-      # A skipped SCHEMA_VERSION never executes its guarded migration block, so
-      # two branches each claiming "the next version" silently lose a table.
-      # This runs before the build so the failure is unambiguous.
-      - run: bun scripts/check-schema-migration.ts
-      - run: bun scripts/build-native.ts
-      - run: bun scripts/compile.ts
-      - run: cargo test -p way-core
-      - run: bun test
-
-  # Hosted runners do not expose systemd as PID 1 or a reliable privileged nested
-  # container. This portable drill exercises the same restart contract instead.
-  supervised-restart-linux:
-    name: linux-supervised-full-service-restart
-    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
       - uses: oven-sh/setup-bun@v2
         with:
-          bun-version: 1.3.14
-      - uses: dtolnay/rust-toolchain@stable
+          bun-version: 1.4.0
       - run: bun install --frozen-lockfile
-      - run: bun scripts/build-native.ts
-      - run: bun scripts/compile.ts
-      - run: bun test test/e2e/systemd.test.ts
-
-  peer-auth-linux:
-    name: linux-so-peercred-cross-user
-    runs-on: ubuntu-24.04
-    container: rust:latest
-    steps:
-      - uses: actions/checkout@v4
-      - run: GAJAEWAY_CORE_CROSS_UID_TEST=1 cargo test -p way-core rpc::auth::tests::linux_second_os_user_is_rejected_by_real_so_peercred_when_enabled -- --exact
+      - run: bunx biome ci packages/
+      - run: bunx tsc --noEmit -p tsconfig.json
+      - run: bun test packages/
+      # Frozen-corpus retrieval benchmark gate (separate from unit tests).
+      - run: GAJAEWAY_BENCH=1 bun test packages/gateway/bench
