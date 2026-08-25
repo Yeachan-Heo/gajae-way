@@ -13,6 +13,7 @@ export interface GatewayConfigFile {
 	readonly socketPath?: string;
 	readonly dbPath?: string;
 	readonly credentials?: Readonly<Record<string, CredentialFileReference>>;
+	readonly channels?: Readonly<Record<string, { readonly engagement?: "open" }>>;
 }
 
 export interface GatewayConfig extends GatewayConfigFile {
@@ -88,6 +89,21 @@ function parseCredentials(value: unknown): Readonly<Record<string, CredentialFil
 	return credentials;
 }
 
+function parseChannels(value: unknown): Readonly<Record<string, { readonly engagement?: "open" }>> | undefined {
+	if (value === undefined) return undefined;
+	const input = requireObject(value, "channels");
+	const channels: Record<string, { readonly engagement?: "open" }> = {};
+	for (const [conversationId, channel] of Object.entries(input)) {
+		const item = requireObject(channel, `channels.${conversationId}`);
+		if (item.engagement !== undefined && item.engagement !== "open")
+			throw new ConfigError("config_invalid", `channels.${conversationId}.engagement must be open`);
+		if (Object.keys(item).some((key) => key !== "engagement"))
+			throw new ConfigError("config_invalid", `channels.${conversationId} contains an unknown field`);
+		channels[conversationId] = item.engagement === "open" ? { engagement: "open" } : {};
+	}
+	return channels;
+}
+
 export function parseConfigFile(value: unknown): GatewayConfigFile {
 	const input = requireObject(value, "config");
 	if (input.schemaVersion !== CONFIG_SCHEMA_VERSION) {
@@ -105,6 +121,7 @@ export function parseConfigFile(value: unknown): GatewayConfigFile {
 			: {}),
 		...(optionalString(input.dbPath, "dbPath") ? { dbPath: optionalString(input.dbPath, "dbPath") } : {}),
 		...(parseCredentials(input.credentials) ? { credentials: parseCredentials(input.credentials) } : {}),
+		...(parseChannels(input.channels) ? { channels: parseChannels(input.channels) } : {}),
 	};
 }
 

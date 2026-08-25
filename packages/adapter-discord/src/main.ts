@@ -1,0 +1,218 @@
+import type { ChatMessagePayload, EngagementContext, OriginRef } from "@gajaeway/protocol";
+import { GajaewayClient } from "@gajaeway/sdk";
+import { Client, GatewayIntentBits } from "discord.js";
+import { type LoadedDiscordAdapterConfig, loadDiscordAdapterConfig } from "./config";
+import { type DiscordMessageOriginShape, discordMessageOrigin } from "./origin";
+
+const DISCORD_MESSAGE_LIMIT = 2_000;
+const REQUIRED_INTENTS = [
+	GatewayIntentBits.Guilds,
+	GatewayIntentBits.GuildMessages,
+	GatewayIntentBits.MessageContent,
+	GatewayIntentBits.DirectMessages,
+];
+
+export interface GatewayClientLike {
+	request<T = unknown>(verb: string, params?: unknown): Promise<T>;
+	onChatMessage(handler: (message: ChatMessagePayload) => void): () => void;
+	close?(): Promise<void>;
+}
+
+export interface DiscordTextChannelLike {
+	send(text: string): Promise<unknown>;
+}
+
+export interface DiscordClientLike {
+	channels: { fetch(id: string): Promise<unknown> };
+}
+
+export interface DiscordInboundMessage extends DiscordMessageOriginShape {
+	readonly id: string;
+	readonly content: string;
+	readonly author: { readonly id: string; readonly bot?: boolean };
+	readonly mentions?: { has(user: unknown): boolean };
+}
+
+/** Bounded inbound message-id memory prevents gateway replay/reconnect duplicate turns. */
+export class LruSet {
+	readonly #values = new Map<string, undefined>();
+	constructor(readonly limit = 10_000) {
+		if (!Number.isSafeInteger(limit) || limit < 1) throw new Error("LRU limit must be a positive integer");
+	}
+
+	addIfAbsent(value: string): boolean {
+		if (this.#values.has(value)) {
+			this.#values.delete(value);
+			this.#values.set(value, undefined);
+			return false;
+		}
+		this.#values.set(value, undefined);
+		if (this.#values.size > this.limit) this.#values.delete(this.#values.keys().next().value as string);
+		return true;
+	}
+}
+
+export function engagementForMessage(message: DiscordInboundMessage, botUser: unknown): EngagementContext {
+	const origin = discordMessageOrigin(message);
+	const botId = typeof botUser === "object" && botUser !== null && "id" in botUser ? String(botUser.id) : "";
+	const contentMention = botId !== "" && new RegExp(`<@!?${escapeRegExp(botId)}>`).test(message.content);
+	return {
+		mentioned: Boolean(message.mentions?.has(botUser) || contentMention),
+		group: origin.kind !== "dm",
+		authorId: message.author.id,
+	};
+}
+
+export function chunkDiscordMessage(text: string): string[] {
+	if (text.length === 0) return [""];
+	const chunks: string[] = [];
+	for (let offset = 0; offset < text.length; offset += DISCORD_MESSAGE_LIMIT) {
+		chunks.push(text.slice(offset, offset + DISCORD_MESSAGE_LIMIT));
+	}
+	return chunks;
+}
+
+export function deliveryFailureIsAmbiguous(error: unknown): boolean {
+	const code = typeof error === "object" && error !== null && "code" in error ? String(error.code) : "";
+	// Discord's known permanent target/permission errors have not dispatched a message.
+	return !new Set(["10003", "10008", "50001", "50013"]).has(code);
+}
+
+export async function settleDiscordDelivery(
+	gateway: Pick<GatewayClientLike, "request">,
+	discord: DiscordClientLike,
+	message: ChatMessagePayload,
+): Promise<void> {
+	if (message.origin.platform !== "discord" || !message.deliveryId) return;
+	const deliveryId = message.deliveryId;
+	try {
+		const channel = await discord.channels.fetch(message.origin.conversationId);
+		if (!isDiscordTextChannel(channel)) {
+			throw Object.assign(new Error(`Discord channel ${message.origin.conversationId} cannot receive messages`), {
+				code: 10003,
+			});
+		}
+		const text = message.duplicateWarning ? `[recovered - may be a duplicate] ${message.text}` : message.text;
+		for (const chunk of chunkDiscordMessage(text)) await channel.send(chunk);
+		await gateway.request("delivery.confirm", { deliveryId });
+	} catch (error) {
+		await gateway.request("delivery.fail", {
+			deliveryId,
+			reason: error instanceof Error ? error.message : String(error),
+			ambiguous: deliveryFailureIsAmbiguous(error),
+		});
+	}
+}
+
+export function subscribeDiscordDeliveries(
+	gateway: GatewayClientLike,
+	discord: DiscordClientLike,
+	log: Pick<Console, "error"> = console,
+): () => void {
+	return gateway.onChatMessage((message) => {
+		void settleDiscordDelivery(gateway, discord, message).catch((error) =>
+			log.error(
+				`Discord delivery settlement request failed: ${error instanceof Error ? error.message : String(error)}`,
+			),
+		);
+	});
+}
+
+export async function startDiscordAdapter(config: LoadedDiscordAdapterConfig): Promise<void> {
+	const discord = new Client({ intents: [...new Set([...REQUIRED_INTENTS, ...(config.intents ?? [])])] });
+	const gateway = new ReconnectingGateway(config.gatewaySocket ?? defaultGatewaySocket(), discord, config);
+	discord.on("messageCreate", (message) => {
+		if (message.author.bot || message.id === undefined) return;
+		const origin = discordMessageOrigin(message);
+		const baseEngagement = engagementForMessage(message, discord.user);
+		const engagement: EngagementContext =
+			origin.kind !== "dm" && config.channels?.[origin.conversationId]?.engagement === "open"
+				? { ...baseEngagement, mentioned: true }
+				: baseEngagement;
+		gateway.sendInbound(message.id, origin, message.content, engagement);
+	});
+	discord.once("ready", () => console.log("Discord adapter connected."));
+	console.log("Discord adapter starting.");
+	await gateway.connect();
+	await discord.login(config.token);
+}
+
+class ReconnectingGateway {
+	#client: GajaewayClient | undefined;
+	#reconnecting = false;
+	#attempt = 0;
+	#deliveryOff: (() => void) | undefined;
+	readonly #inbound = new LruSet();
+
+	constructor(
+		readonly socketPath: string,
+		readonly discord: DiscordClientLike,
+		readonly config: LoadedDiscordAdapterConfig,
+	) {}
+
+	async connect(): Promise<void> {
+		try {
+			const client = await GajaewayClient.connectSocket(this.socketPath);
+			this.#client = client;
+			this.#attempt = 0;
+			this.#deliveryOff?.();
+			this.#deliveryOff = subscribeDiscordDeliveries(client, this.discord);
+			console.log("Discord adapter connected to gateway.");
+			this.monitor(client);
+		} catch {
+			this.scheduleReconnect();
+		}
+	}
+
+	sendInbound(messageId: string, origin: OriginRef, text: string, engagement: EngagementContext): void {
+		if (!this.#inbound.addIfAbsent(messageId)) return;
+		const client = this.#client;
+		if (!client) return;
+		void client.request("chat.send", { origin, text, engagement }).catch(() => this.scheduleReconnect());
+	}
+
+	private monitor(client: GajaewayClient): void {
+		setTimeout(() => {
+			if (this.#client !== client) return;
+			void client.request("gateway.status").then(
+				() => this.monitor(client),
+				() => this.scheduleReconnect(),
+			);
+		}, 30_000);
+	}
+
+	private scheduleReconnect(): void {
+		if (this.#reconnecting) return;
+		this.#reconnecting = true;
+		this.#client = undefined;
+		this.#deliveryOff?.();
+		const delay = Math.min(30_000, 500 * 2 ** Math.min(this.#attempt++, 6));
+		const jitter = Math.floor(Math.random() * Math.max(1, delay / 4));
+		console.log(`Discord adapter gateway reconnecting in ${delay + jitter}ms.`);
+		setTimeout(() => {
+			this.#reconnecting = false;
+			void this.connect();
+		}, delay + jitter);
+	}
+}
+
+function defaultGatewaySocket(): string {
+	return `${process.env.GAJAEWAY_HOME ?? `${process.env.HOME ?? "~"}/.gajaeway`}/gateway.sock`;
+}
+
+function escapeRegExp(value: string): string {
+	return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+function isDiscordTextChannel(value: unknown): value is DiscordTextChannelLike {
+	return typeof value === "object" && value !== null && "send" in value && typeof value.send === "function";
+}
+
+if (import.meta.main) {
+	loadDiscordAdapterConfig()
+		.then(startDiscordAdapter)
+		.catch((error) => {
+			console.error(error instanceof Error ? error.message : String(error));
+			process.exitCode = 1;
+		});
+}

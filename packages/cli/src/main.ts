@@ -31,6 +31,10 @@ async function chat(socket: string): Promise<void> {
 	});
 	const sendAndWait = async (text: string): Promise<void> => {
 		const { turnId } = await client.chatSend(LOOPBACK_ORIGIN, text);
+		if (turnId === null) {
+			console.error("(message was not engaged)");
+			return;
+		}
 		await new Promise<void>((resolve) => {
 			const timer = setTimeout(() => {
 				turnWaiters.delete(turnId);

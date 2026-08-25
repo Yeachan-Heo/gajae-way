@@ -2,7 +2,7 @@ import type { GatewayDatabase } from "../store/db";
 
 export interface GjcPort {
 	ensureSession(originKey: string): Promise<{ sessionId: string }>;
-	sendTurn(sessionId: string, text: string): Promise<string>;
+	sendTurn(sessionId: string, text: string, systemPreamble?: string): Promise<string>;
 }
 
 /**
@@ -15,15 +15,16 @@ export interface GjcPort {
  *   The same origin key always resolves to the same gjc session (proven under
  *   5-way concurrency), so a crash between create and binding commit is
  *   harmless: re-running create returns the same session (§4 row 3, branch A).
- * - Turns: spawn-per-turn `gjc --resume <id> -p --no-tools <text>` with plain
- *   text output. Persistent `gjc sdk serve` is deferred until its recovery
- *   contract is separately proven.
+ * - Turns: spawn-per-turn `gjc --resume <id> -p --append-system-prompt <text>`.
+ *   The gateway intentionally does not pass `--no-tools`; gjc owns its tool
+ *   policy, informed by the unoverridable ActionGuard floor notice.
  *
  * The child inherits the owner's environment: the gateway is the owner's own
  * process and gjc needs the owner's provider credentials. Secrets are never
  * logged or persisted by this module.
  */
 export class GjcClient implements GjcPort {
+	/** GAJAEWAY_TEST_STUB_GJC is a test-only deterministic process seam; never set it in production. */
 	readonly #sessions = new Map<string, string>();
 	readonly #database: GatewayDatabase;
 	readonly #timeoutMs: number;
@@ -36,6 +37,7 @@ export class GjcClient implements GjcPort {
 	}
 
 	async ensureSession(originKey: string): Promise<{ sessionId: string }> {
+		if (process.env.GAJAEWAY_TEST_STUB_GJC === "1") return { sessionId: `stub-${originKey}` };
 		const cached = this.#sessions.get(originKey) ?? this.#database.getSession(originKey);
 		if (cached) {
 			this.#sessions.set(originKey, cached);
@@ -69,12 +71,25 @@ export class GjcClient implements GjcPort {
 		return { sessionId };
 	}
 
-	async sendTurn(sessionId: string, text: string): Promise<string> {
+	async sendTurn(sessionId: string, text: string, systemPreamble?: string): Promise<string> {
 		if (typeof text !== "string" || text.length === 0) {
 			throw new Error("turn text must be non-empty");
 		}
+		if (process.env.GAJAEWAY_TEST_STUB_GJC === "1") {
+			await Bun.sleep(50);
+			if (process.env.GAJAEWAY_TEST_STUB_CAPTURE)
+				await Bun.write(process.env.GAJAEWAY_TEST_STUB_CAPTURE, systemPreamble ?? "");
+			return process.env.GAJAEWAY_TEST_STUB_REPLY ?? "stub reply";
+		}
 		const child = Bun.spawn({
-			cmd: ["gjc", "--resume", sessionId, "-p", "--no-tools", text],
+			cmd: [
+				"gjc",
+				"--resume",
+				sessionId,
+				"-p",
+				...(systemPreamble ? ["--append-system-prompt", systemPreamble] : []),
+				text,
+			],
 			cwd: this.#cwd,
 			stdin: "ignore",
 			stdout: "pipe",

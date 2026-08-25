@@ -2,7 +2,7 @@ import { Database } from "bun:sqlite";
 import { mkdir } from "node:fs/promises";
 import { dirname } from "node:path";
 
-const LATEST_SCHEMA_VERSION = 1;
+const LATEST_SCHEMA_VERSION = 2;
 
 export class DatabaseStartupError extends Error {
 	readonly code: "newer_schema" | "integrity_check_failed";
@@ -56,6 +56,52 @@ export class GatewayDatabase {
 			.run(originKey, sessionId, new Date().toISOString());
 	}
 
+	deliveryCreate(row: { id: string; turnId: string; originKey: string; payloadJson: string }): void {
+		const now = new Date().toISOString();
+		this.#database
+			.query(
+				"INSERT INTO deliveries (delivery_id, turn_id, origin_key, payload_json, state, attempts, created_at, updated_at) VALUES (?, ?, ?, ?, 'pending', 0, ?, ?)",
+			)
+			.run(row.id, row.turnId, row.originKey, row.payloadJson, now, now);
+	}
+
+	deliveryUpdate(id: string, state: string, attempts?: number): void {
+		this.#database
+			.query("UPDATE deliveries SET state = ?, attempts = COALESCE(?, attempts), updated_at = ? WHERE delivery_id = ?")
+			.run(state, attempts ?? null, new Date().toISOString(), id);
+	}
+
+	deliveryRows(): Array<{
+		delivery_id: string;
+		turn_id: string;
+		origin_key: string;
+		payload_json: string;
+		state: string;
+		attempts: number;
+		created_at: string;
+		updated_at: string;
+	}> {
+		return this.#database
+			.query(
+				"SELECT delivery_id, turn_id, origin_key, payload_json, state, attempts, created_at, updated_at FROM deliveries ORDER BY created_at",
+			)
+			.all() as Array<{
+			delivery_id: string;
+			turn_id: string;
+			origin_key: string;
+			payload_json: string;
+			state: string;
+			attempts: number;
+			created_at: string;
+			updated_at: string;
+		}>;
+	}
+
+	deliveryPrune(before: string): number {
+		return this.#database.query("DELETE FROM deliveries WHERE state = 'confirmed' AND updated_at < ?").run(before)
+			.changes;
+	}
+
 	/**
 	 * All writes pass through this single-writer boundary. Callbacks must be
 	 * synchronous and must never perform external I/O; nested transactions fail.
@@ -99,6 +145,16 @@ export class GatewayDatabase {
 				this.#database
 					.query("INSERT INTO schema_migrations (version, applied_at) VALUES (?, ?)")
 					.run(1, new Date().toISOString());
+			});
+		}
+		if (current < 2) {
+			this.withTransaction(() => {
+				this.#database.exec(
+					"CREATE TABLE deliveries (delivery_id TEXT PRIMARY KEY, turn_id TEXT NOT NULL, origin_key TEXT NOT NULL, payload_json TEXT NOT NULL, state TEXT NOT NULL CHECK(state IN ('pending','inflight','confirmed','failed_ambiguous','expired')), attempts INTEGER NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL)",
+				);
+				this.#database
+					.query("INSERT INTO schema_migrations (version, applied_at) VALUES (?, ?)")
+					.run(2, new Date().toISOString());
 			});
 		}
 	}

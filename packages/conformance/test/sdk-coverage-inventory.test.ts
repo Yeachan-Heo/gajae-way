@@ -49,7 +49,7 @@ function harvest(pattern: RegExp): Set<string> {
 
 // Namespaced dotted literals in quotes: "gateway.status", "chat.message", ...
 // File-ish literals (gateway.sock, gateway.db, *.json, ...) are not verbs.
-const VERB_LITERAL_RE = /["'`]((?:gateway|chat|session|memory|monitor|ops)\.[a-zA-Z0-9_.]+)["'`]/g;
+const VERB_LITERAL_RE = /["'`]((?:gateway|chat|session|memory|monitor|delivery|engagement|ops)\.[a-zA-Z0-9_.]+)["'`]/g;
 const NON_VERB_SUFFIX_RE = /\.(sock|db|json|jsonl|sqlite|md|ts|js|log|lock|pid)$/;
 
 describe("sdk-coverage-inventory", () => {

@@ -9,7 +9,7 @@ test("migrates the sessions foundation", async () => {
 	const directory = await mkdtemp(join(tmpdir(), "gajaeway-db-"));
 	try {
 		const database = await GatewayDatabase.open(join(directory, "gateway.db"));
-		expect(database.schemaVersion).toBe(1);
+		expect(database.schemaVersion).toBe(2);
 		database.withTransaction(() => database.putSession("loopback/loopback/loopback", "session-1"));
 		expect(database.getSession("loopback/loopback/loopback")).toBe("session-1");
 		database.close();
@@ -24,7 +24,7 @@ test("refuses a database from a newer schema", async () => {
 	try {
 		const raw = new Database(path);
 		raw.exec(
-			"CREATE TABLE schema_migrations (version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL); INSERT INTO schema_migrations VALUES (2, 'now')",
+			"CREATE TABLE schema_migrations (version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL); INSERT INTO schema_migrations VALUES (3, 'now')",
 		);
 		raw.close();
 		await expect(GatewayDatabase.open(path)).rejects.toMatchObject({
