@@ -1,0 +1,55 @@
+export {
+	type ChatMessagePayload,
+	type ChatSendParams,
+	type ChatSendResult,
+	EVENTS_V01,
+	type EventCatalogV01,
+	type EventName,
+	type GatewayStatusResult,
+	VERBS_V01,
+	type VerbCatalogV01,
+	type VerbName,
+} from "./catalog";
+export {
+	ERROR_CODES,
+	type ErrorCode,
+	isErrorCode,
+	ProtocolError,
+	type ProtocolErrorPayload,
+} from "./errors";
+export {
+	decodeFrame,
+	type ErrorFrame,
+	type EventFrame,
+	encodeFrame,
+	type Frame,
+	FrameDecoder,
+	type FrameType,
+	type HelloFrame,
+	MAX_FRAME_BYTES,
+	type NegotiatedFrame,
+	type RequestFrame,
+	type ResponseFrame,
+} from "./frames";
+export {
+	LOOPBACK_ORIGIN,
+	ORIGIN_KINDS,
+	ORIGIN_PLATFORMS,
+	type OriginKind,
+	type OriginPlatform,
+	type OriginRef,
+	OriginRefError,
+	originKey,
+	validateOriginRef,
+} from "./origin";
+export {
+	CAPABILITIES,
+	type Capability,
+	compareProfileVersions,
+	type HelloPayload,
+	type NegotiatedPayload,
+	type NegotiationResult,
+	negotiate,
+	PROFILE_VERSION,
+	SUPPORTED_PROFILE_VERSIONS,
+} from "./version";

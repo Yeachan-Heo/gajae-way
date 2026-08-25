@@ -1,0 +1,12 @@
+{
+	"name": "@gajaeway/gateway",
+	"version": "0.1.0",
+	"private": true,
+	"type": "module",
+	"bin": {
+		"gajaeway-gateway": "./src/main.ts"
+	},
+	"dependencies": {
+		"@gajaeway/protocol": "workspace:*"
+	}
+}

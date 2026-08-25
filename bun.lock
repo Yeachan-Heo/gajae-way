@@ -11,6 +11,45 @@
         "typescript": "^5.9.3",
       },
     },
+    "packages/cli": {
+      "name": "@gajaeway/cli",
+      "version": "0.1.0",
+      "bin": {
+        "gajaeway": "./src/main.ts",
+      },
+      "dependencies": {
+        "@gajaeway/protocol": "workspace:*",
+        "@gajaeway/sdk": "workspace:*",
+      },
+    },
+    "packages/conformance": {
+      "name": "@gajaeway/conformance",
+      "version": "0.1.0",
+      "dependencies": {
+        "@gajaeway/protocol": "workspace:*",
+      },
+    },
+    "packages/gateway": {
+      "name": "@gajaeway/gateway",
+      "version": "0.1.0",
+      "bin": {
+        "gajaeway-gateway": "./src/main.ts",
+      },
+      "dependencies": {
+        "@gajaeway/protocol": "workspace:*",
+      },
+    },
+    "packages/protocol": {
+      "name": "@gajaeway/protocol",
+      "version": "0.1.0",
+    },
+    "packages/sdk": {
+      "name": "@gajaeway/sdk",
+      "version": "0.1.0",
+      "dependencies": {
+        "@gajaeway/protocol": "workspace:*",
+      },
+    },
   },
   "packages": {
     "@biomejs/biome": ["@biomejs/biome@2.5.2", "", { "optionalDependencies": { "@biomejs/cli-darwin-arm64": "2.5.2", "@biomejs/cli-darwin-x64": "2.5.2", "@biomejs/cli-linux-arm64": "2.5.2", "@biomejs/cli-linux-arm64-musl": "2.5.2", "@biomejs/cli-linux-x64": "2.5.2", "@biomejs/cli-linux-x64-musl": "2.5.2", "@biomejs/cli-win32-arm64": "2.5.2", "@biomejs/cli-win32-x64": "2.5.2" }, "bin": { "biome": "bin/biome" } }, "sha512-VQ3RCqr7JmDIX+w6stWYl+g/3bYofN3q2wDBHUKKc/c7i5QWrFKFBZYCYPWTE6agsUPMIZZe6/CMmVUfUAhkKA=="],
@@ -36,6 +75,16 @@
     "@emnapi/runtime": ["@emnapi/runtime@1.9.2", "", { "dependencies": { "tslib": "^2.4.0" } }, "sha512-3U4+MIWHImeyu1wnmVygh5WlgfYDtyf0k8AbLhMFxOipihf6nrWC4syIm/SwEeec0mNSafiiNnMJwbza/Is6Lw=="],
 
     "@emnapi/wasi-threads": ["@emnapi/wasi-threads@1.2.1", "", { "dependencies": { "tslib": "^2.4.0" } }, "sha512-uTII7OYF+/Mes/MrcIOYp5yOtSMLBWSIoLPpcgwipoiKbli6k322tcoFsxoIIxPDqW01SQGAgko4EzZi2BNv2w=="],
+
+    "@gajaeway/cli": ["@gajaeway/cli@workspace:packages/cli"],
+
+    "@gajaeway/conformance": ["@gajaeway/conformance@workspace:packages/conformance"],
+
+    "@gajaeway/gateway": ["@gajaeway/gateway@workspace:packages/gateway"],
+
+    "@gajaeway/protocol": ["@gajaeway/protocol@workspace:packages/protocol"],
+
+    "@gajaeway/sdk": ["@gajaeway/sdk@workspace:packages/sdk"],
 
     "@inquirer/ansi": ["@inquirer/ansi@2.0.7", "", {}, "sha512-3eTuUO1vH2cZm2ZKHeQxnOqlTi9EfZDGgIe3BL3I4u+rJHocr9Fz86M4fjYABPvFnQG/gGK551HqDiIcETwU6Q=="],
 

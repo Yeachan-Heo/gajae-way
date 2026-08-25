@@ -1,0 +1,10 @@
+{
+	"name": "@gajaeway/protocol",
+	"version": "0.1.0",
+	"private": true,
+	"type": "module",
+	"description": "gajaeway protocol profile v0.x: frames, negotiation, verbs, events, error codes, origin normalization. Zero runtime dependencies.",
+	"exports": {
+		".": "./src/index.ts"
+	}
+}

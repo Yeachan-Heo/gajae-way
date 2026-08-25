@@ -1,0 +1,12 @@
+{
+	"name": "@gajaeway/cli",
+	"version": "0.1.0",
+	"type": "module",
+	"bin": {
+		"gajaeway": "./src/main.ts"
+	},
+	"dependencies": {
+		"@gajaeway/sdk": "workspace:*",
+		"@gajaeway/protocol": "workspace:*"
+	}
+}
