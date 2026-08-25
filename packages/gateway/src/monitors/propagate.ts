@@ -74,7 +74,8 @@ export class MonitorPropagator {
 		return eventId;
 	}
 	async reconcile(): Promise<void> {
-		for (const row of this.#database.monitorEventRows()) {
+		// Replay oldest-first: recovery must re-author events in the order they fired.
+		for (const row of this.#database.monitorEventRows(undefined, "oldest")) {
 			const output = this.#database.authoredOutput(row.event_id);
 			const hasMemory = this.#database
 				.memoryIntentRows()

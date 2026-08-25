@@ -79,3 +79,51 @@ test("reconciliation uses retained authored output and otherwise re-dispatches",
 		await rm(directory, { recursive: true, force: true });
 	}
 });
+
+test("reconcile replays same-millisecond events oldest-first", async () => {
+	const directory = await mkdtemp(join(tmpdir(), "gajaeway-reconcile-order-"));
+	try {
+		const database = await GatewayDatabase.open(join(directory, "gateway.db"));
+		const registry = new MonitorRegistry(database);
+		const monitor = registry.add({
+			name: "order",
+			trigger: { kind: "cron", schedule: "* * * * *" },
+			eventTypes: ["changed"],
+		});
+		const queued: string[] = [];
+		const pipeline = new MonitorPropagator({
+			database,
+			registry,
+			gjc: { ensureSession: async () => ({ sessionId: "s" }), sendTurn: async () => "[]" },
+			memory: {
+				enqueue: (mutation: { replyText: string }) => {
+					queued.push(mutation.replyText);
+					return "intent";
+				},
+			} as never,
+			delivery: new DeliveryService(new DeliveryLedger(database)),
+			emit: () => {},
+		});
+		// One fired_at for both rows: ordering must come from insertion order, not row layout.
+		const firedAt = new Date().toISOString();
+		const ids = [crypto.randomUUID(), crypto.randomUUID()];
+		database.withTransaction(() => {
+			for (const [index, eventId] of ids.entries()) {
+				database.monitorEventCreate({
+					eventId,
+					monitorId: monitor.monitorId,
+					eventType: "changed",
+					payloadJson: "{}",
+					firedAt,
+				});
+				database.authoredOutputCreate(eventId, `authored-${index}`);
+				database.monitorEventUpdate(eventId, "authored");
+			}
+		});
+		await pipeline.reconcile();
+		expect(queued).toEqual(["authored-0", "authored-1"]);
+		database.close();
+	} finally {
+		await rm(directory, { recursive: true, force: true });
+	}
+});

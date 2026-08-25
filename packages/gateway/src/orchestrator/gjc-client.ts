@@ -30,7 +30,9 @@ export class GjcClient implements GjcPort {
 	readonly #timeoutMs: number;
 	readonly #cwd: string;
 
-	constructor(database: GatewayDatabase, timeoutMs = 120_000, cwd = process.cwd()) {
+	// 300s ceiling: the persona is an action-capable agent that runs real tools per
+	// turn; 120s killed live owner turns mid-investigation (P1 drill finding).
+	constructor(database: GatewayDatabase, timeoutMs = 300_000, cwd = process.cwd()) {
 		this.#database = database;
 		this.#timeoutMs = timeoutMs;
 		this.#cwd = cwd;

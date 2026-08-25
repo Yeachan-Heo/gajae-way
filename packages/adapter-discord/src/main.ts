@@ -7,8 +7,8 @@ import { type DiscordMessageOriginShape, discordMessageOrigin } from "./origin";
 const DISCORD_MESSAGE_LIMIT = 2_000;
 // Discord clears the typing hint after ~10s, so refresh inside that window while a turn is running.
 const TYPING_REFRESH_MS = 7_000;
-// Hard ceiling above the gateway's 120s gjc turn timeout: a lost turn must not type forever.
-const TYPING_MAX_MS = 150_000;
+// Hard ceiling above the gateway's 300s gjc turn timeout: a lost turn must not type forever.
+const TYPING_MAX_MS = 330_000;
 const REQUIRED_INTENTS = [
 	GatewayIntentBits.Guilds,
 	GatewayIntentBits.GuildMessages,

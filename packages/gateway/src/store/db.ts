@@ -262,7 +262,14 @@ export class GatewayDatabase {
 			.query("UPDATE monitor_events SET stage = ?, batch_id = COALESCE(?, batch_id), updated_at = ? WHERE event_id = ?")
 			.run(stage, batchId, new Date().toISOString(), eventId);
 	}
-	monitorEventRows(monitorId?: string): Array<{
+	/**
+	 * `order` is explicit because listings want newest-first while recovery must replay in the
+	 * order events fired; `rowid` breaks same-millisecond ties so both orders are deterministic.
+	 */
+	monitorEventRows(
+		monitorId?: string,
+		order: "newest" | "oldest" = "newest",
+	): Array<{
 		event_id: string;
 		monitor_id: string;
 		event_type: string;
@@ -272,11 +279,12 @@ export class GatewayDatabase {
 		batch_id: string | null;
 		updated_at: string;
 	}> {
+		const direction = order === "oldest" ? "ASC" : "DESC";
 		return this.#database
 			.query(
 				monitorId
-					? "SELECT * FROM monitor_events WHERE monitor_id = ? ORDER BY fired_at DESC"
-					: "SELECT * FROM monitor_events ORDER BY fired_at DESC",
+					? `SELECT * FROM monitor_events WHERE monitor_id = ? ORDER BY fired_at ${direction}, rowid ${direction}`
+					: `SELECT * FROM monitor_events ORDER BY fired_at ${direction}, rowid ${direction}`,
 			)
 			.all(...(monitorId ? [monitorId] : [])) as Array<{
 			event_id: string;
