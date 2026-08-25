@@ -144,6 +144,52 @@ export interface MemorySearchResult {
 	}[];
 }
 
+/**
+ * Monitor surface (P4, spec facts 7/11/12/19): unified Monitor abstraction.
+ * A cron is a Monitor with a periodic static trigger. Event types are declared
+ * at creation, never inferred; unknown types route to the catch-all session.
+ */
+export type TriggerSpec =
+	| { readonly kind: "cron"; readonly schedule: string }
+	| { readonly kind: "webhook"; readonly route: string }
+	| { readonly kind: "watcher"; readonly root: string; readonly debounceMs?: number }
+	| { readonly kind: "script"; readonly command: readonly string[]; readonly intervalMs: number };
+
+export type BurstPolicyKind = "coalesce" | "dedupe" | "serialize" | "drop";
+
+export interface MonitorSpec {
+	readonly name: string;
+	readonly trigger: TriggerSpec;
+	/** Declared event types this monitor may emit (spec fact 19). */
+	readonly eventTypes: readonly string[];
+	/** Burst policy; coalesce when unspecified (spec fact 12). */
+	readonly burstPolicy?: BurstPolicyKind;
+	/** Channel target for authored output: at most one (spec fact 7). */
+	readonly channelTarget?: { readonly origin: OriginRef } | null;
+	readonly enabled?: boolean;
+}
+
+export interface MonitorRecord extends MonitorSpec {
+	readonly monitorId: string;
+	readonly createdAt: string;
+	readonly burstPolicy: BurstPolicyKind;
+	readonly enabled: boolean;
+}
+
+export interface MonitorTestParams {
+	readonly monitorId: string;
+	readonly eventType?: string;
+	readonly payload?: unknown;
+}
+
+export interface MonitorEventRecord {
+	readonly eventId: string;
+	readonly monitorId: string;
+	readonly eventType: string;
+	readonly firedAt: string;
+	readonly stage: string;
+}
+
 /** Verb catalog: verb name -> { params, result } (documentation-level typing). */
 export interface VerbCatalogV01 {
 	"gateway.status": { params: undefined; result: GatewayStatusResult };
@@ -155,12 +201,21 @@ export interface VerbCatalogV01 {
 	"session.list": { params: undefined; result: SessionListResult };
 	"memory.audit": { params: undefined; result: MemoryAuditResult };
 	"memory.search": { params: MemorySearchParams; result: MemorySearchResult };
+	"monitor.add": { params: MonitorSpec; result: { readonly monitorId: string } };
+	"monitor.list": { params: undefined; result: { readonly monitors: readonly MonitorRecord[] } };
+	"monitor.inspect": {
+		params: { readonly monitorId: string };
+		result: { readonly monitor: MonitorRecord; readonly recentEvents: readonly MonitorEventRecord[] };
+	};
+	"monitor.test": { params: MonitorTestParams; result: { readonly eventId: string } };
+	"monitor.remove": { params: { readonly monitorId: string }; result: { readonly removed: true } };
 }
 
 /** Event catalog: event name -> payload. */
 export interface EventCatalogV01 {
 	"chat.message": ChatMessagePayload;
 	"gateway.stopping": { readonly reason: string };
+	"monitor.event": MonitorEventRecord;
 }
 
 export const VERBS_V01 = [
@@ -173,8 +228,13 @@ export const VERBS_V01 = [
 	"session.list",
 	"memory.audit",
 	"memory.search",
+	"monitor.add",
+	"monitor.list",
+	"monitor.inspect",
+	"monitor.test",
+	"monitor.remove",
 ] as const;
-export const EVENTS_V01 = ["chat.message", "gateway.stopping"] as const;
+export const EVENTS_V01 = ["chat.message", "gateway.stopping", "monitor.event"] as const;
 
 export type VerbName = keyof VerbCatalogV01;
 export type EventName = keyof EventCatalogV01;

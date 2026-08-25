@@ -4,7 +4,7 @@ import type { GatewayDatabase } from "../store/db";
 import { appendDaily, initializeMemory, memoryGit } from "./doctrine";
 
 export interface DailyCaptureMutation {
-	readonly kind: "daily_capture";
+	readonly kind: "daily_capture" | "monitor-event";
 	readonly originRefJson: string;
 	readonly userText: string;
 	readonly replyText: string;
@@ -125,7 +125,8 @@ export class MemoryClosureQueue {
 	}
 
 	#parse(intent: Intent): DailyCaptureMutation {
-		if (intent.kind !== "daily_capture") throw new Error(`unsupported memory intent ${intent.kind}`);
+		if (intent.kind !== "daily_capture" && intent.kind !== "monitor-event")
+			throw new Error(`unsupported memory intent ${intent.kind}`);
 		const value = JSON.parse(intent.payload_json) as DailyCaptureMutation;
 		if (
 			!value ||

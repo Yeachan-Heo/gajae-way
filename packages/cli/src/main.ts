@@ -117,6 +117,40 @@ export async function main(args = process.argv.slice(2)): Promise<void> {
 				}
 				break;
 			}
+			case "monitors": {
+				const client = await GajaewayClient.connectSocket(parsed.socket);
+				try {
+					const [command, ...args] = parsed.rest;
+					if (command === "add" && args[0] === "--json" && args[1])
+						console.log(JSON.stringify(await client.request("monitor.add", JSON.parse(args[1]))));
+					else if (command === "list") console.log(JSON.stringify(await client.request("monitor.list")));
+					else if (command === "inspect" && args[0])
+						console.log(JSON.stringify(await client.request("monitor.inspect", { monitorId: args[0] })));
+					else if (command === "test" && args[0]) {
+						let eventType: string | undefined;
+						let payload: unknown = {};
+						for (let i = 1; i < args.length; i++) {
+							if (args[i] === "--type") eventType = args[++i];
+							else if (args[i] === "--payload") payload = JSON.parse(args[++i] ?? "");
+						}
+						console.log(
+							JSON.stringify(
+								await client.request("monitor.test", {
+									monitorId: args[0],
+									...(eventType ? { eventType } : {}),
+									payload,
+								}),
+							),
+						);
+					} else
+						throw new Error(
+							"usage: gajaeway monitors add --json '<MonitorSpec json>'|list|inspect <id>|test <id> [--type T] [--payload J]",
+						);
+				} finally {
+					await client.close();
+				}
+				break;
+			}
 			default:
 				throw new Error(
 					"usage: gajaeway [--socket PATH] status|shutdown|chat|daemon run|memory audit|memory search <query>",

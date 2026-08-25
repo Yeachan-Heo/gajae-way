@@ -7,10 +7,10 @@
  * One conversational origin == one strictly isolated session (spec fact 9).
  */
 
-export const ORIGIN_PLATFORMS = ["loopback", "discord", "telegram"] as const;
+export const ORIGIN_PLATFORMS = ["loopback", "discord", "telegram", "monitor"] as const;
 export type OriginPlatform = (typeof ORIGIN_PLATFORMS)[number];
 
-export const ORIGIN_KINDS = ["dm", "channel", "thread", "topic", "loopback"] as const;
+export const ORIGIN_KINDS = ["dm", "channel", "thread", "topic", "loopback", "eventtype"] as const;
 export type OriginKind = (typeof ORIGIN_KINDS)[number];
 
 export interface OriginRef {
@@ -67,6 +67,12 @@ export function validateOriginRef(ref: OriginRef): OriginRef {
 	if (ref.kind === "loopback" && ref.platform !== "loopback") {
 		throw new OriginRefError("loopback kind only valid on loopback platform");
 	}
+	if (ref.platform === "monitor" && ref.kind !== "eventtype") {
+		throw new OriginRefError("monitor platform only supports eventtype kind");
+	}
+	if (ref.kind === "eventtype" && ref.platform !== "monitor") {
+		throw new OriginRefError("eventtype kind only valid on monitor platform");
+	}
 	return ref;
 }
 
@@ -88,4 +94,16 @@ export const LOOPBACK_ORIGIN: OriginRef = {
 	platform: "loopback",
 	kind: "loopback",
 	conversationId: "loopback",
+};
+
+/** Origin of the event-type session executing events of one declared type (P4). */
+export function eventTypeOrigin(eventType: string): OriginRef {
+	return { platform: "monitor", kind: "eventtype", conversationId: eventType };
+}
+
+/** The catch-all session origin for undeclared event types (spec fact 19). */
+export const CATCH_ALL_EVENT_ORIGIN: OriginRef = {
+	platform: "monitor",
+	kind: "eventtype",
+	conversationId: "catch-all",
 };

@@ -1,4 +1,5 @@
 export {
+	type BurstPolicyKind,
 	type ChatMessagePayload,
 	type ChatSendParams,
 	type ChatSendResult,
@@ -13,11 +14,16 @@ export {
 	type MemoryAuditResult,
 	type MemorySearchParams,
 	type MemorySearchResult,
+	type MonitorEventRecord,
+	type MonitorRecord,
+	type MonitorSpec,
+	type MonitorTestParams,
 	type RecallSnippet,
 	type SessionListResult,
 	type SessionRecallParams,
 	type SessionRecallResult,
 	SILENCE_TOKENS,
+	type TriggerSpec,
 	VERBS_V01,
 	type VerbCatalogV01,
 	type VerbName,
@@ -44,6 +50,8 @@ export {
 	type ResponseFrame,
 } from "./frames";
 export {
+	CATCH_ALL_EVENT_ORIGIN,
+	eventTypeOrigin,
 	LOOPBACK_ORIGIN,
 	ORIGIN_KINDS,
 	ORIGIN_PLATFORMS,

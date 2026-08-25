@@ -1,0 +1,86 @@
+import { type MonitorRecord, type MonitorSpec, type TriggerSpec, validateOriginRef } from "@gajaeway/protocol";
+import type { GatewayDatabase } from "../store/db";
+
+const BURST_POLICIES = new Set(["coalesce", "dedupe", "serialize", "drop"]);
+
+export class MonitorRegistry {
+	readonly #database: GatewayDatabase;
+	constructor(database: GatewayDatabase) {
+		this.#database = database;
+	}
+	add(spec: MonitorSpec): MonitorRecord {
+		validateSpec(spec);
+		const trigger = spec.trigger.kind === "webhook" ? { ...spec.trigger, route: crypto.randomUUID() } : spec.trigger;
+		const record: MonitorRecord = {
+			...spec,
+			trigger,
+			monitorId: crypto.randomUUID(),
+			burstPolicy: spec.burstPolicy ?? "coalesce",
+			enabled: spec.enabled ?? true,
+			createdAt: new Date().toISOString(),
+		};
+		this.#database.withTransaction(() =>
+			this.#database.monitorCreate({
+				id: record.monitorId,
+				name: record.name,
+				triggerJson: JSON.stringify(record.trigger),
+				eventTypesJson: JSON.stringify(record.eventTypes),
+				burstPolicy: record.burstPolicy,
+				channelTargetJson: record.channelTarget ? JSON.stringify(record.channelTarget) : null,
+				enabled: record.enabled,
+			}),
+		);
+		return record;
+	}
+	list(): MonitorRecord[] {
+		return this.#database.monitorRows().map(rowToRecord);
+	}
+	get(monitorId: string): MonitorRecord | undefined {
+		return this.list().find((monitor) => monitor.monitorId === monitorId);
+	}
+	remove(monitorId: string): boolean {
+		return this.#database.withTransaction(() => this.#database.monitorDelete(monitorId));
+	}
+}
+
+function rowToRecord(row: ReturnType<GatewayDatabase["monitorRows"]>[number]): MonitorRecord {
+	return {
+		monitorId: row.monitor_id,
+		name: row.name,
+		trigger: JSON.parse(row.trigger_json),
+		eventTypes: JSON.parse(row.event_types_json),
+		burstPolicy: row.burst_policy as MonitorRecord["burstPolicy"],
+		channelTarget: row.channel_target_json ? JSON.parse(row.channel_target_json) : null,
+		enabled: Boolean(row.enabled),
+		createdAt: row.created_at,
+	};
+}
+
+export function validateSpec(spec: MonitorSpec): void {
+	if (!spec || typeof spec.name !== "string" || !spec.name.trim()) throw new Error("monitor name is required");
+	if (
+		!Array.isArray(spec.eventTypes) ||
+		!spec.eventTypes.length ||
+		spec.eventTypes.some((type) => typeof type !== "string" || !type)
+	)
+		throw new Error("monitor eventTypes must be a non-empty string list");
+	if (spec.burstPolicy && !BURST_POLICIES.has(spec.burstPolicy)) throw new Error("invalid monitor burstPolicy");
+	validateTrigger(spec.trigger);
+	if (spec.channelTarget) validateOriginRef(spec.channelTarget.origin);
+}
+function validateTrigger(trigger: TriggerSpec): void {
+	if (!trigger || typeof trigger !== "object") throw new Error("monitor trigger is required");
+	if (trigger.kind === "cron" && typeof trigger.schedule === "string") return;
+	if (trigger.kind === "webhook" && typeof trigger.route === "string") return;
+	if (trigger.kind === "watcher" && typeof trigger.root === "string") return;
+	if (
+		trigger.kind === "script" &&
+		Array.isArray(trigger.command) &&
+		trigger.command.length &&
+		trigger.command.every((arg) => typeof arg === "string") &&
+		Number.isFinite(trigger.intervalMs) &&
+		trigger.intervalMs > 0
+	)
+		return;
+	throw new Error("invalid monitor trigger");
+}

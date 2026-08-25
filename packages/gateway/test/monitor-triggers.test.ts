@@ -1,0 +1,99 @@
+import { expect, test } from "bun:test";
+import { createHmac } from "node:crypto";
+import { chmod, mkdtemp, rm, symlink, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { CATCH_ALL_EVENT_ORIGIN, originKey } from "@gajaeway/protocol";
+import { cronMatches, startCron } from "../src/monitors/triggers/cron";
+import { startScript } from "../src/monitors/triggers/script";
+import { startWatcher } from "../src/monitors/triggers/watcher";
+import { startWebhook } from "../src/monitors/triggers/webhook";
+
+test("cron supports steps, lists, ranges, dow and injected clock", () => {
+	const monday = new Date(2026, 0, 5, 10, 15);
+	expect(cronMatches("*/5 10 1-10 1 1", monday)).toBe(true);
+	expect(cronMatches("0,15,30 10 * * 1", monday)).toBe(true);
+	let fired = 0;
+	const stop = startCron(
+		"15 10 * * 1",
+		() => fired++,
+		() => monday,
+	);
+	stop();
+	expect(fired).toBe(1);
+});
+
+test("webhook admits before 202, rejects unknown routes, replay and oversized bodies", async () => {
+	const events: string[] = [];
+	const server = startWebhook({
+		port: 0,
+		monitors: () => [
+			{ monitorId: "m", route: "secret", eventType: "changed", auth: { kind: "hmac" as const, secret: "key" } },
+		],
+		submit: () => {
+			events.push("admitted");
+			return "event";
+		},
+	});
+	try {
+		const base = `http://127.0.0.1:${server.port}`;
+		expect((await fetch(`${base}/hook/missing`, { method: "POST" })).status).toBe(404);
+		const bytes = new TextEncoder().encode(JSON.stringify({ x: 1 }));
+		const timestamp = Math.floor(Date.now() / 1000);
+		const nonce = "nonce";
+		const signature = createHmac("sha256", "key").update(`${timestamp}.${nonce}.`).update(bytes).digest("hex");
+		const request = () =>
+			fetch(`${base}/hook/secret`, {
+				method: "POST",
+				body: bytes,
+				headers: {
+					"x-gajaeway-timestamp": String(timestamp),
+					"x-gajaeway-nonce": nonce,
+					"x-gajaeway-signature": signature,
+				},
+			});
+		expect((await request()).status).toBe(202);
+		expect(events).toEqual(["admitted"]);
+		expect((await request()).status).toBe(401);
+		expect((await fetch(`${base}/hook/secret`, { method: "POST", body: new Uint8Array(256 * 1024 + 1) })).status).toBe(
+			413,
+		);
+	} finally {
+		server.stop(true);
+	}
+});
+
+test("webhook refuses non-loopback exposure without explicit opt-in", () => {
+	expect(() => startWebhook({ bind: "0.0.0.0", port: 0, monitors: () => [], submit: () => "event" })).toThrow();
+});
+
+test("watcher and script honor allowlists and ActionGuard", async () => {
+	const root = await mkdtemp(join(tmpdir(), "gajaeway-trigger-"));
+	const outside = await mkdtemp(join(tmpdir(), "gajaeway-outside-"));
+	try {
+		const paths: string[] = [];
+		const stop = await startWatcher(root, [root], (path) => paths.push(path), 5);
+		await writeFile(join(root, "file"), "x");
+		for (let i = 0; i < 100 && paths.length === 0; i++) await Bun.sleep(20);
+		stop();
+		expect(paths.length).toBeGreaterThanOrEqual(1);
+		await expect(startWatcher(outside, [root], () => {})).rejects.toThrow();
+		await symlink(join(outside, "target"), join(root, "link"));
+		const script = join(root, "echo.sh");
+		await writeFile(script, "#!/bin/sh\necho payload\n");
+		await chmod(script, 0o755);
+		const output: string[] = [];
+		const stopScript = await startScript([script], 100_000, root, (text) => output.push(text));
+		for (let i = 0; i < 100 && output.length === 0; i++) await Bun.sleep(20);
+		stopScript();
+		expect(output[0]).toContain("payload");
+		await expect(startScript([script, "rm -rf /"], 1, root, () => {})).rejects.toThrow();
+	} finally {
+		await rm(root, { recursive: true, force: true });
+		await rm(outside, { recursive: true, force: true });
+	}
+});
+
+test("catch-all origin retains undeclared event identity", () => {
+	expect(originKey(CATCH_ALL_EVENT_ORIGIN)).toBe("monitor/eventtype/catch-all");
+});

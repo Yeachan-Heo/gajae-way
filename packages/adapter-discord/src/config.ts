@@ -32,7 +32,7 @@ export async function loadDiscordAdapterConfig(
 	let raw: unknown;
 	try {
 		raw = JSON.parse(await readFile(configPath, "utf8"));
-	} catch (error) {
+	} catch (_error) {
 		throw new DiscordAdapterStartupError(
 			`Unable to read Discord adapter config at ${configPath}. Create it with a tokenFile credential-file path.`,
 		);

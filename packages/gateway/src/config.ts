@@ -14,6 +14,9 @@ export interface GatewayConfigFile {
 	readonly dbPath?: string;
 	readonly credentials?: Readonly<Record<string, CredentialFileReference>>;
 	readonly channels?: Readonly<Record<string, { readonly engagement?: "open" }>>;
+	readonly webhook?: { readonly bind?: string; readonly port: number; readonly exposeNonLoopback?: boolean };
+	readonly watcherRoots?: readonly string[];
+	readonly scriptRoot?: string;
 }
 
 export interface GatewayConfig extends GatewayConfigFile {
@@ -104,6 +107,31 @@ function parseChannels(value: unknown): Readonly<Record<string, { readonly engag
 	return channels;
 }
 
+function parseStringArray(value: unknown, field: string): readonly string[] {
+	if (!Array.isArray(value) || value.some((item) => typeof item !== "string" || !item))
+		throw new ConfigError("config_invalid", `${field} must be a non-empty string array`);
+	return value;
+}
+function parseWebhook(value: unknown): {
+	readonly bind?: string;
+	readonly port: number;
+	readonly exposeNonLoopback?: boolean;
+} {
+	const input = requireObject(value, "webhook");
+	const bind = optionalString(input.bind, "webhook.bind");
+	if (!Number.isInteger(input.port) || (input.port as number) < 1 || (input.port as number) > 65535)
+		throw new ConfigError("config_invalid", "webhook.port must be a valid port");
+	if (input.exposeNonLoopback !== undefined && typeof input.exposeNonLoopback !== "boolean")
+		throw new ConfigError("config_invalid", "webhook.exposeNonLoopback must be boolean");
+	if (Object.keys(input).some((key) => !["bind", "port", "exposeNonLoopback"].includes(key)))
+		throw new ConfigError("config_invalid", "webhook contains an unknown field");
+	return {
+		...(bind ? { bind } : {}),
+		port: input.port as number,
+		...(input.exposeNonLoopback ? { exposeNonLoopback: true } : {}),
+	};
+}
+
 export function parseConfigFile(value: unknown): GatewayConfigFile {
 	const input = requireObject(value, "config");
 	if (input.schemaVersion !== CONFIG_SCHEMA_VERSION) {
@@ -122,6 +150,9 @@ export function parseConfigFile(value: unknown): GatewayConfigFile {
 		...(optionalString(input.dbPath, "dbPath") ? { dbPath: optionalString(input.dbPath, "dbPath") } : {}),
 		...(parseCredentials(input.credentials) ? { credentials: parseCredentials(input.credentials) } : {}),
 		...(parseChannels(input.channels) ? { channels: parseChannels(input.channels) } : {}),
+		...(input.webhook === undefined ? {} : { webhook: parseWebhook(input.webhook) }),
+		...(input.watcherRoots === undefined ? {} : { watcherRoots: parseStringArray(input.watcherRoots, "watcherRoots") }),
+		...(input.scriptRoot === undefined ? {} : { scriptRoot: optionalString(input.scriptRoot, "scriptRoot") }),
 	};
 }
 

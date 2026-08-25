@@ -2,7 +2,7 @@ import { Database } from "bun:sqlite";
 import { mkdir } from "node:fs/promises";
 import { dirname } from "node:path";
 
-const LATEST_SCHEMA_VERSION = 5;
+const LATEST_SCHEMA_VERSION = 6;
 
 export class DatabaseStartupError extends Error {
 	readonly code: "newer_schema" | "integrity_check_failed";
@@ -192,6 +192,116 @@ export class GatewayDatabase {
 		}>;
 	}
 
+	monitorCreate(row: {
+		id: string;
+		name: string;
+		triggerJson: string;
+		eventTypesJson: string;
+		burstPolicy: string;
+		channelTargetJson: string | null;
+		enabled: boolean;
+	}): void {
+		this.#database
+			.query(
+				"INSERT INTO monitors (monitor_id, name, trigger_json, event_types_json, burst_policy, channel_target_json, enabled, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+			)
+			.run(
+				row.id,
+				row.name,
+				row.triggerJson,
+				row.eventTypesJson,
+				row.burstPolicy,
+				row.channelTargetJson,
+				row.enabled ? 1 : 0,
+				new Date().toISOString(),
+			);
+	}
+	monitorRows(): Array<{
+		monitor_id: string;
+		name: string;
+		trigger_json: string;
+		event_types_json: string;
+		burst_policy: string;
+		channel_target_json: string | null;
+		enabled: number;
+		created_at: string;
+	}> {
+		return this.#database
+			.query(
+				"SELECT monitor_id, name, trigger_json, event_types_json, burst_policy, channel_target_json, enabled, created_at FROM monitors ORDER BY created_at",
+			)
+			.all() as Array<{
+			monitor_id: string;
+			name: string;
+			trigger_json: string;
+			event_types_json: string;
+			burst_policy: string;
+			channel_target_json: string | null;
+			enabled: number;
+			created_at: string;
+		}>;
+	}
+	monitorDelete(id: string): boolean {
+		return this.#database.query("DELETE FROM monitors WHERE monitor_id = ?").run(id).changes > 0;
+	}
+	monitorEventCreate(row: {
+		eventId: string;
+		monitorId: string;
+		eventType: string;
+		payloadJson: string;
+		firedAt: string;
+	}): void {
+		this.#database
+			.query(
+				"INSERT INTO monitor_events (event_id, monitor_id, event_type, payload_json, fired_at, stage, batch_id, updated_at) VALUES (?, ?, ?, ?, ?, 'admitted', NULL, ?)",
+			)
+			.run(row.eventId, row.monitorId, row.eventType, row.payloadJson, row.firedAt, new Date().toISOString());
+	}
+	monitorEventUpdate(eventId: string, stage: string, batchId: string | null = null): void {
+		this.#database
+			.query("UPDATE monitor_events SET stage = ?, batch_id = COALESCE(?, batch_id), updated_at = ? WHERE event_id = ?")
+			.run(stage, batchId, new Date().toISOString(), eventId);
+	}
+	monitorEventRows(monitorId?: string): Array<{
+		event_id: string;
+		monitor_id: string;
+		event_type: string;
+		payload_json: string;
+		fired_at: string;
+		stage: string;
+		batch_id: string | null;
+		updated_at: string;
+	}> {
+		return this.#database
+			.query(
+				monitorId
+					? "SELECT * FROM monitor_events WHERE monitor_id = ? ORDER BY fired_at DESC"
+					: "SELECT * FROM monitor_events ORDER BY fired_at DESC",
+			)
+			.all(...(monitorId ? [monitorId] : [])) as Array<{
+			event_id: string;
+			monitor_id: string;
+			event_type: string;
+			payload_json: string;
+			fired_at: string;
+			stage: string;
+			batch_id: string | null;
+			updated_at: string;
+		}>;
+	}
+	authoredOutputCreate(eventId: string, outputText: string): void {
+		this.#database
+			.query(
+				"INSERT INTO authored_outputs (event_id, output_text, authored_at) VALUES (?, ?, ?) ON CONFLICT(event_id) DO UPDATE SET output_text = excluded.output_text, authored_at = excluded.authored_at",
+			)
+			.run(eventId, outputText, new Date().toISOString());
+	}
+	authoredOutput(eventId: string): string | undefined {
+		return this.#database
+			.query<{ output_text: string }, [string]>("SELECT output_text FROM authored_outputs WHERE event_id = ?")
+			.get(eventId)?.output_text;
+	}
+
 	deliveryPrune(before: string): number {
 		return this.#database.query("DELETE FROM deliveries WHERE state = 'confirmed' AND updated_at < ?").run(before)
 			.changes;
@@ -281,6 +391,16 @@ export class GatewayDatabase {
 				this.#database
 					.query("INSERT INTO schema_migrations (version, applied_at) VALUES (?, ?)")
 					.run(5, new Date().toISOString());
+			});
+		}
+		if (current < 6) {
+			this.withTransaction(() => {
+				this.#database.exec(
+					"CREATE TABLE monitors (monitor_id TEXT PRIMARY KEY, name TEXT NOT NULL, trigger_json TEXT NOT NULL, event_types_json TEXT NOT NULL, burst_policy TEXT NOT NULL, channel_target_json TEXT, enabled INTEGER NOT NULL, created_at TEXT NOT NULL); CREATE TABLE monitor_events (event_id TEXT PRIMARY KEY, monitor_id TEXT NOT NULL, event_type TEXT NOT NULL, payload_json TEXT NOT NULL, fired_at TEXT NOT NULL, stage TEXT NOT NULL CHECK(stage IN ('admitted','batched','dispatched','authored','delivered','failed')), batch_id TEXT, updated_at TEXT NOT NULL); CREATE TABLE authored_outputs (event_id TEXT PRIMARY KEY, output_text TEXT NOT NULL, authored_at TEXT NOT NULL)",
+				);
+				this.#database
+					.query("INSERT INTO schema_migrations (version, applied_at) VALUES (?, ?)")
+					.run(6, new Date().toISOString());
 			});
 		}
 	}

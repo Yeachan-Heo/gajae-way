@@ -39,7 +39,7 @@ export const ACTION_GUARD_SYSTEM_NOTICE =
 
 function isUnrecoverable(command: string): boolean {
 	return (
-		/(?:^|[;&|]\s*)rm\s+(?:-[A-Za-z]*[rRfF][A-Za-z]*\s+|--recursive\s+)(?:--no-preserve-root\s+)?\/(?:\s|$)/.test(
+		/(?:^|[;&|]\s*|\s)rm\s+(?:-[A-Za-z]*[rRfF][A-Za-z]*\s+|--recursive\s+)(?:--no-preserve-root\s+)?\/(?:\s|$)/.test(
 			command,
 		) ||
 		/\brm\s+--no-preserve-root\b/.test(command) ||

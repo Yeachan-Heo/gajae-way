@@ -21,6 +21,9 @@ import { MemoryClosureQueue } from "../memory/closure";
 import { initializeMemory } from "../memory/doctrine";
 import { searchMemory } from "../memory/retrieve";
 import { validateMemory } from "../memory/validator";
+import { MonitorPropagator } from "../monitors/propagate";
+import { MonitorRegistry } from "../monitors/registry";
+import { MonitorRuntime } from "../monitors/runtime";
 import type { GjcPort } from "../orchestrator/gjc-client";
 import { PersonaLoader } from "../persona/persona";
 import type { GatewayDatabase } from "../store/db";
@@ -48,6 +51,10 @@ interface Runtime {
 	readonly persona: PersonaLoader;
 	readonly connections: Set<Connection>;
 	readonly memory: MemoryClosureQueue;
+	readonly registry: MonitorRegistry;
+	readonly monitors: MonitorPropagator;
+	readonly monitorRuntime: MonitorRuntime;
+	readonly reconcileTimer: ReturnType<typeof setInterval>;
 }
 
 export async function startUnixServer(options: GatewayServerOptions): Promise<GatewayServer> {
@@ -58,6 +65,8 @@ export async function startUnixServer(options: GatewayServerOptions): Promise<Ga
 	}
 	const runtime = createRuntime(options);
 	void runtime.memory.initialize();
+	void runtime.monitors.reconcile();
+	await runtime.monitorRuntime.start();
 	let stopping = false;
 	let listener: ReturnType<typeof Bun.listen>;
 	const stop = async (reason = "shutdown requested") => {
@@ -66,6 +75,8 @@ export async function startUnixServer(options: GatewayServerOptions): Promise<Ga
 		for (const connection of runtime.connections)
 			connection.write({ v: PROFILE_VERSION, type: "event", event: "gateway.stopping", payload: { reason } });
 		listener.stop(true);
+		clearInterval(runtime.reconcileTimer);
+		await runtime.monitorRuntime.stop();
 		await runtime.memory.initialize();
 		await runtime.memory.drain();
 		await options.onStop?.();
@@ -106,6 +117,8 @@ export async function startUnixServer(options: GatewayServerOptions): Promise<Ga
 export function startStdioServer(options: GatewayServerOptions): GatewayServer {
 	const runtime = createRuntime(options);
 	void runtime.memory.initialize();
+	void runtime.monitors.reconcile();
+	void runtime.monitorRuntime.start();
 	const connection: Connection = {
 		decoder: new FrameDecoder(),
 		negotiated: false,
@@ -118,6 +131,8 @@ export function startStdioServer(options: GatewayServerOptions): GatewayServer {
 		if (stopping) return;
 		stopping = true;
 		connection.write({ v: PROFILE_VERSION, type: "event", event: "gateway.stopping", payload: { reason } });
+		clearInterval(runtime.reconcileTimer);
+		await runtime.monitorRuntime.stop();
 		connection.close();
 		await runtime.memory.initialize();
 		await runtime.memory.drain();
@@ -135,11 +150,33 @@ export function startStdioServer(options: GatewayServerOptions): GatewayServer {
 }
 
 function createRuntime(options: GatewayServerOptions): Runtime {
+	const connections = new Set<Connection>();
+	const delivery = new DeliveryService(new DeliveryLedger(options.database));
+	const registry = new MonitorRegistry(options.database);
+	const memory = new MemoryClosureQueue(options.database, options.config.home);
+	const monitors = new MonitorPropagator({
+		database: options.database,
+		registry,
+		gjc: options.gjc,
+		memory,
+		delivery,
+		emit: (payload) => {
+			for (const connection of connections)
+				if (connection.negotiated)
+					connection.write({ v: PROFILE_VERSION, type: "event", event: "monitor.event", payload });
+		},
+	});
+	const monitorRuntime = new MonitorRuntime(options.config, registry, monitors);
+	const reconcileTimer = setInterval(() => void monitors.reconcile(), 60_000);
 	return {
-		delivery: new DeliveryService(new DeliveryLedger(options.database)),
+		delivery,
 		persona: options.persona ?? new PersonaLoader(options.config.home),
-		connections: new Set(),
-		memory: new MemoryClosureQueue(options.database, options.config.home),
+		connections,
+		memory,
+		registry,
+		monitors,
+		monitorRuntime,
+		reconcileTimer,
 	};
 }
 async function handleFrame(
@@ -279,6 +316,69 @@ async function handleRequest(
 			});
 			return;
 		}
+		case "monitor.add": {
+			try {
+				const monitor = runtime.registry.add(request.params as never);
+				connection.write({
+					v: PROFILE_VERSION,
+					type: "response",
+					id: request.id,
+					result: { monitorId: monitor.monitorId },
+				});
+				void runtime.monitorRuntime.refresh();
+			} catch (error) {
+				throw new ProtocolError("invalid_params", error instanceof Error ? error.message : "invalid monitor");
+			}
+			return;
+		}
+		case "monitor.list":
+			connection.write({
+				v: PROFILE_VERSION,
+				type: "response",
+				id: request.id,
+				result: { monitors: runtime.registry.list() },
+			});
+			return;
+		case "monitor.inspect": {
+			const monitorId = (request.params as { monitorId?: unknown } | undefined)?.monitorId;
+			if (typeof monitorId !== "string") throw new ProtocolError("invalid_params", "unknown monitorId");
+			const monitor = runtime.registry.get(monitorId);
+			if (!monitor) throw new ProtocolError("invalid_params", "unknown monitorId");
+			const recentEvents = options.database
+				.monitorEventRows(monitorId)
+				.slice(0, 100)
+				.map((row) => ({
+					eventId: row.event_id,
+					monitorId: row.monitor_id,
+					eventType: row.event_type,
+					firedAt: row.fired_at,
+					stage: row.stage,
+				}));
+			connection.write({ v: PROFILE_VERSION, type: "response", id: request.id, result: { monitor, recentEvents } });
+			return;
+		}
+		case "monitor.test": {
+			const params = request.params as { monitorId?: unknown; eventType?: unknown; payload?: unknown } | undefined;
+			if (!params || typeof params.monitorId !== "string")
+				throw new ProtocolError("invalid_params", "monitor.test requires monitorId");
+			const monitor = runtime.registry.get(params.monitorId);
+			if (!monitor) throw new ProtocolError("invalid_params", "unknown monitorId");
+			const eventId = runtime.monitors.submit(
+				params.monitorId,
+				typeof params.eventType === "string" ? params.eventType : monitor.eventTypes[0]!,
+				params.payload ?? {},
+			);
+			connection.write({ v: PROFILE_VERSION, type: "response", id: request.id, result: { eventId } });
+			return;
+		}
+		case "monitor.remove": {
+			const monitorId = (request.params as { monitorId?: unknown } | undefined)?.monitorId;
+			if (typeof monitorId !== "string" || !runtime.registry.remove(monitorId))
+				throw new ProtocolError("invalid_params", "unknown monitorId");
+			connection.write({ v: PROFILE_VERSION, type: "response", id: request.id, result: { removed: true } });
+			void runtime.monitorRuntime.refresh();
+			return;
+		}
 		case "chat.send":
 			await sendChat(connection, request, options, runtime);
 			return;
@@ -325,10 +425,10 @@ async function sendChat(
 		else {
 			const delivery = runtime.delivery.prepare(payload.turnId, origin, payload.text);
 			if (delivery) {
+				runtime.delivery.markInflight(delivery.deliveryId as string);
 				for (const recipient of runtime.connections)
 					if (recipient.negotiated)
 						recipient.write({ v: PROFILE_VERSION, type: "event", event: "chat.message", payload: delivery });
-				runtime.delivery.markInflight(delivery.deliveryId as string);
 			}
 		}
 		return;
@@ -382,9 +482,9 @@ async function sendChat(
 	}
 	const payload = runtime.delivery.prepare(turnId, origin, text);
 	if (!payload) return;
+	runtime.delivery.markInflight(payload.deliveryId as string);
 	for (const recipient of runtime.connections)
 		if (recipient.negotiated) recipient.write({ v: PROFILE_VERSION, type: "event", event: "chat.message", payload });
-	runtime.delivery.markInflight(payload.deliveryId as string);
 	// Durable intent is persisted synchronously; closure work deliberately does not delay delivery.
 	runtime.memory.enqueue({ kind: "daily_capture", originRefJson: JSON.stringify(origin), userText, replyText: text });
 }

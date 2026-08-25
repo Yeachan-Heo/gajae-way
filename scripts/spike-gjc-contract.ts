@@ -10,10 +10,11 @@ type CommandResult = {
 	elapsedMs: number;
 };
 
-const gjc = Bun.which("gjc");
-if (!gjc) {
+const gjcPath = Bun.which("gjc");
+if (!gjcPath) {
 	throw new Error("gjc was not found on PATH");
 }
+const gjc: string = gjcPath;
 
 const root = await mkdtemp(join(tmpdir(), "gajaeway-gjc-spike-"));
 const sessions = join(root, "sessions");
