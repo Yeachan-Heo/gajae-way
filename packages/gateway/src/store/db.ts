@@ -2,7 +2,7 @@ import { Database } from "bun:sqlite";
 import { mkdir } from "node:fs/promises";
 import { dirname } from "node:path";
 
-const LATEST_SCHEMA_VERSION = 4;
+const LATEST_SCHEMA_VERSION = 5;
 
 export class DatabaseStartupError extends Error {
 	readonly code: "newer_schema" | "integrity_check_failed";
@@ -104,6 +104,37 @@ export class GatewayDatabase {
 		return this.#database
 			.query("SELECT origin_key, origin_ref_json, text, at FROM recall_snippets ORDER BY id DESC")
 			.all() as Array<{ origin_key: string; origin_ref_json: string; text: string; at: string }>;
+	}
+
+	memoryIntentCreate(row: { id: string; kind: string; payloadJson: string }): void {
+		const now = new Date().toISOString();
+		this.#database
+			.query(
+				"INSERT INTO memory_intents (id, kind, payload_json, state, created_at, updated_at) VALUES (?, ?, ?, 'queued', ?, ?)",
+			)
+			.run(row.id, row.kind, row.payloadJson, now, now);
+	}
+
+	memoryIntentUpdate(id: string, state: "queued" | "written" | "committed" | "receipted" | "quarantined"): void {
+		this.#database
+			.query("UPDATE memory_intents SET state = ?, updated_at = ? WHERE id = ?")
+			.run(state, new Date().toISOString(), id);
+	}
+
+	memoryIntentRows(): Array<{
+		id: string;
+		kind: string;
+		payload_json: string;
+		state: "queued" | "written" | "committed" | "receipted" | "quarantined";
+	}> {
+		return this.#database
+			.query("SELECT id, kind, payload_json, state FROM memory_intents ORDER BY created_at, id")
+			.all() as Array<{
+			id: string;
+			kind: string;
+			payload_json: string;
+			state: "queued" | "written" | "committed" | "receipted" | "quarantined";
+		}>;
 	}
 
 	getSession(originKey: string): string | undefined {
@@ -240,6 +271,16 @@ export class GatewayDatabase {
 				this.#database
 					.query("INSERT INTO schema_migrations (version, applied_at) VALUES (?, ?)")
 					.run(4, new Date().toISOString());
+			});
+		}
+		if (current < 5) {
+			this.withTransaction(() => {
+				this.#database.exec(
+					"CREATE TABLE memory_intents (id TEXT PRIMARY KEY, kind TEXT NOT NULL, payload_json TEXT NOT NULL, state TEXT NOT NULL CHECK(state IN ('queued','written','committed','receipted','quarantined')), created_at TEXT NOT NULL, updated_at TEXT NOT NULL)",
+				);
+				this.#database
+					.query("INSERT INTO schema_migrations (version, applied_at) VALUES (?, ?)")
+					.run(5, new Date().toISOString());
 			});
 		}
 	}

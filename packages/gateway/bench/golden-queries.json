@@ -1,0 +1,9 @@
+[
+	{ "query": "cobalt signing rollout", "expectedTopPath": "projects/aurora.md" },
+	{ "query": "tomato compost watering", "expectedTopPath": "projects/garden.md" },
+	{ "query": "leaked API credentials", "expectedTopPath": "projects/incident.md" },
+	{ "query": "telescope dark frame calibration", "expectedTopPath": "projects/orbit.md" },
+	{ "query": "idempotent legacy event migration", "expectedTopPath": "projects/project-river.md" },
+	{ "query": "privilege escalation tenant", "expectedTopPath": "projects/security.md" },
+	{ "query": "train harbor hotel", "expectedTopPath": "projects/travel.md" }
+]

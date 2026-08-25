@@ -100,8 +100,27 @@ export async function main(args = process.argv.slice(2)): Promise<void> {
 					console.log("Launch the gateway out-of-band with: bun packages/gateway/src/main.ts daemon");
 				else throw new Error("usage: gajaeway daemon run");
 				break;
+			case "memory": {
+				const client = await GajaewayClient.connectSocket(parsed.socket);
+				try {
+					if (parsed.rest[0] === "audit") {
+						const result = await client.request<{ ok: boolean; issues: unknown[] }>("memory.audit");
+						console.log(JSON.stringify(result.issues));
+						if (!result.ok) process.exitCode = 1;
+					} else if (parsed.rest[0] === "search" && parsed.rest.slice(1).join(" ")) {
+						console.log(
+							JSON.stringify(await client.request("memory.search", { query: parsed.rest.slice(1).join(" ") })),
+						);
+					} else throw new Error("usage: gajaeway memory audit|search <query>");
+				} finally {
+					await client.close();
+				}
+				break;
+			}
 			default:
-				throw new Error("usage: gajaeway [--socket PATH] status|shutdown|chat|daemon run");
+				throw new Error(
+					"usage: gajaeway [--socket PATH] status|shutdown|chat|daemon run|memory audit|memory search <query>",
+				);
 		}
 	} catch (error) {
 		console.error(error instanceof Error ? error.message : String(error));

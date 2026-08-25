@@ -117,6 +117,33 @@ export interface SessionListResult {
 	}[];
 }
 
+/**
+ * Memory system surface (P3, spec fact 8): filesystem-first Markdown memory.
+ * memory.audit runs the structural validator; memory.search is map-then-BM25
+ * retrieval over the canonical tree. Both are read-only verbs.
+ */
+export interface MemoryAuditResult {
+	readonly ok: boolean;
+	readonly issues: readonly {
+		readonly code: string;
+		readonly path: string;
+		readonly message: string;
+	}[];
+}
+
+export interface MemorySearchParams {
+	readonly query: string;
+	readonly limit?: number;
+}
+
+export interface MemorySearchResult {
+	readonly hits: readonly {
+		readonly path: string;
+		readonly score: number;
+		readonly excerpt: string;
+	}[];
+}
+
 /** Verb catalog: verb name -> { params, result } (documentation-level typing). */
 export interface VerbCatalogV01 {
 	"gateway.status": { params: undefined; result: GatewayStatusResult };
@@ -126,6 +153,8 @@ export interface VerbCatalogV01 {
 	"delivery.fail": { params: DeliveryFailParams; result: { readonly recorded: true } };
 	"session.recall": { params: SessionRecallParams; result: SessionRecallResult };
 	"session.list": { params: undefined; result: SessionListResult };
+	"memory.audit": { params: undefined; result: MemoryAuditResult };
+	"memory.search": { params: MemorySearchParams; result: MemorySearchResult };
 }
 
 /** Event catalog: event name -> payload. */
@@ -142,6 +171,8 @@ export const VERBS_V01 = [
 	"delivery.fail",
 	"session.recall",
 	"session.list",
+	"memory.audit",
+	"memory.search",
 ] as const;
 export const EVENTS_V01 = ["chat.message", "gateway.stopping"] as const;
 

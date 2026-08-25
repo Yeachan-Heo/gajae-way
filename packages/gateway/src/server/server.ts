@@ -17,6 +17,10 @@ import type { GatewayConfig } from "../config";
 import { DeliveryService } from "../delivery/delivery";
 import { decideEngagement } from "../engagement/policy";
 import { ACTION_GUARD_SYSTEM_NOTICE } from "../guard/action-guard";
+import { MemoryClosureQueue } from "../memory/closure";
+import { initializeMemory } from "../memory/doctrine";
+import { searchMemory } from "../memory/retrieve";
+import { validateMemory } from "../memory/validator";
 import type { GjcPort } from "../orchestrator/gjc-client";
 import { PersonaLoader } from "../persona/persona";
 import type { GatewayDatabase } from "../store/db";
@@ -43,6 +47,7 @@ interface Runtime {
 	readonly delivery: DeliveryService;
 	readonly persona: PersonaLoader;
 	readonly connections: Set<Connection>;
+	readonly memory: MemoryClosureQueue;
 }
 
 export async function startUnixServer(options: GatewayServerOptions): Promise<GatewayServer> {
@@ -52,6 +57,7 @@ export async function startUnixServer(options: GatewayServerOptions): Promise<Ga
 		if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
 	}
 	const runtime = createRuntime(options);
+	void runtime.memory.initialize();
 	let stopping = false;
 	let listener: ReturnType<typeof Bun.listen>;
 	const stop = async (reason = "shutdown requested") => {
@@ -60,6 +66,8 @@ export async function startUnixServer(options: GatewayServerOptions): Promise<Ga
 		for (const connection of runtime.connections)
 			connection.write({ v: PROFILE_VERSION, type: "event", event: "gateway.stopping", payload: { reason } });
 		listener.stop(true);
+		await runtime.memory.initialize();
+		await runtime.memory.drain();
 		await options.onStop?.();
 	};
 	listener = Bun.listen<{ connection: Connection }>({
@@ -97,6 +105,7 @@ export async function startUnixServer(options: GatewayServerOptions): Promise<Ga
 
 export function startStdioServer(options: GatewayServerOptions): GatewayServer {
 	const runtime = createRuntime(options);
+	void runtime.memory.initialize();
 	const connection: Connection = {
 		decoder: new FrameDecoder(),
 		negotiated: false,
@@ -110,6 +119,8 @@ export function startStdioServer(options: GatewayServerOptions): GatewayServer {
 		stopping = true;
 		connection.write({ v: PROFILE_VERSION, type: "event", event: "gateway.stopping", payload: { reason } });
 		connection.close();
+		await runtime.memory.initialize();
+		await runtime.memory.drain();
 		await options.onStop?.();
 	};
 	process.stdin.on("data", (data: Buffer) => {
@@ -128,6 +139,7 @@ function createRuntime(options: GatewayServerOptions): Runtime {
 		delivery: new DeliveryService(new DeliveryLedger(options.database)),
 		persona: options.persona ?? new PersonaLoader(options.config.home),
 		connections: new Set(),
+		memory: new MemoryClosureQueue(options.database, options.config.home),
 	};
 }
 async function handleFrame(
@@ -243,6 +255,30 @@ async function handleRequest(
 			connection.write({ v: PROFILE_VERSION, type: "response", id: request.id, result: { snippets } });
 			return;
 		}
+		case "memory.audit": {
+			const root = await initializeMemory(options.config.home);
+			const issues = await validateMemory(root);
+			connection.write({
+				v: PROFILE_VERSION,
+				type: "response",
+				id: request.id,
+				result: { ok: issues.length === 0, issues },
+			});
+			return;
+		}
+		case "memory.search": {
+			const params = (request.params ?? {}) as { query?: unknown; limit?: unknown };
+			if (typeof params.query !== "string") throw new ProtocolError("invalid_params", "memory.search requires query");
+			const root = await initializeMemory(options.config.home);
+			const limit = typeof params.limit === "number" ? params.limit : 10;
+			connection.write({
+				v: PROFILE_VERSION,
+				type: "response",
+				id: request.id,
+				result: { hits: await searchMemory(root, params.query, limit) },
+			});
+			return;
+		}
 		case "chat.send":
 			await sendChat(connection, request, options, runtime);
 			return;
@@ -340,6 +376,8 @@ async function sendChat(
 			id: request.id,
 			payload: { turnId, origin, role: "assistant", text, final: true },
 		});
+		// Durable intent is persisted synchronously; closure work deliberately does not delay delivery.
+		runtime.memory.enqueue({ kind: "daily_capture", originRefJson: JSON.stringify(origin), userText, replyText: text });
 		return;
 	}
 	const payload = runtime.delivery.prepare(turnId, origin, text);
@@ -347,6 +385,8 @@ async function sendChat(
 	for (const recipient of runtime.connections)
 		if (recipient.negotiated) recipient.write({ v: PROFILE_VERSION, type: "event", event: "chat.message", payload });
 	runtime.delivery.markInflight(payload.deliveryId as string);
+	// Durable intent is persisted synchronously; closure work deliberately does not delay delivery.
+	runtime.memory.enqueue({ kind: "daily_capture", originRefJson: JSON.stringify(origin), userText, replyText: text });
 }
 function writeError(connection: Connection, error: unknown, id?: string): void {
 	const protocol = error instanceof ProtocolError ? error : new ProtocolError("verb_failed", "gateway request failed");
