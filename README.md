@@ -145,9 +145,12 @@ sudo -u gajaeway -H /usr/local/bin/gajaeway console \
 ```
 
 It reads `way.health` and `way.status` before accepting input, displays the
-main-session resume state, journal cursor, lock/quarantine and write-mode
-state, and reconciliation freshness, and refuses a failed-closed or unhealthy
-daemon. Owner messages use the configured owner surface mapping; when a
+runtime cycle (phase, UI mode, identity verdict), journal/outbox settlement,
+lock/quarantine and write-mode state, reconciliation freshness, and
+actionable gates, and refuses a failed-closed, unhealthy, unavailable, or
+stale-identity daemon. The cycle contract is documented in
+[artifacts/owner-console-runtime-cycle.md](artifacts/owner-console-runtime-cycle.md).
+Owner messages use the configured owner surface mapping; when a
 profile has more than one owner surface, select one explicitly with
 `--surface-id`. The gateway controls the adopted GJC session through the broker
 CLI; replies, turn transitions, health changes, and gate notifications are read

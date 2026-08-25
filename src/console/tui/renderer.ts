@@ -135,6 +135,7 @@ export class ConsoleTuiRenderer {
 	#delivery = "fenced";
 	#consumer = "idle";
 	#consumers = "consumers: none";
+	#cyclePhase = "unknown";
 
 	get columns(): number {
 		return this.#columns;
@@ -201,6 +202,10 @@ export class ConsoleTuiRenderer {
 			else if (trimmed.startsWith("lock:")) this.#lock = trimmed;
 			else if (trimmed.startsWith("reconcile:")) this.#reconcile = trimmed;
 			else if (trimmed.startsWith("consumers:")) this.#consumers = trimmed;
+			else if (trimmed.startsWith("cycle:")) {
+				const match = /\bphase=(\S+)/u.exec(trimmed);
+				if (match?.[1]) this.#cyclePhase = match[1];
+			}
 		}
 	}
 
@@ -284,7 +289,7 @@ export class ConsoleTuiRenderer {
 	#statusLines(): string[] {
 		const scroll = this.#scrollOffset > 0 ? ` scroll=${this.#scrollOffset}` : "";
 		const source = [
-			`GATEWAY COCKPIT | ${this.#daemon} | ${this.#main}`,
+			`GATEWAY COCKPIT | cycle=${this.#cyclePhase} | ${this.#daemon} | ${this.#main}`,
 			`${this.#journal} | ${this.#lock}`,
 			`${this.#reconcile} | ${this.#consumers} | delivery=${this.#delivery} consumer=${this.#consumer}${scroll}`,
 		];

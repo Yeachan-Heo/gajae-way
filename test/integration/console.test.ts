@@ -227,7 +227,7 @@ function blockingSubmissionRpc(release: Promise<void>, submissions: string[]): J
 	return {
 		async request(method: string, params?: unknown, options?: RpcRequestOptions): Promise<JsonRpcResponse> {
 			if (method === "way.health") {
-				return { jsonrpc: "2.0", id: 1, result: { status: "healthy", state: "running", main: { resumed: true, session_id: "fake" } } };
+				return { jsonrpc: "2.0", id: 1, result: { status: "healthy", state: "running", main: { resumed: true, session_id: "external-main-session" } } };
 			}
 			if (method === "way.status") {
 				return {
@@ -236,7 +236,7 @@ function blockingSubmissionRpc(release: Promise<void>, submissions: string[]): J
 					result: {
 						status: "healthy",
 						state: "running",
-						main: { resumed: true, session_id: "fake" },
+						main: { resumed: true, session_id: "external-main-session" },
 						turn_state: "idle",
 						follow_up_queue_depth: 0,
 						journal: { head_cursor: "1:0", degraded: false },

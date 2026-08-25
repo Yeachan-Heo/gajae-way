@@ -5,6 +5,12 @@ import type { WayConfig } from "../config";
 import { RpcJournalConsumer, type RpcJournalEvent } from "../journal-consumer";
 import { loadWayProfile, type WayProfile } from "../profile";
 import { type JsonRpcClient, RpcClient, RpcResponseError, rpcResult } from "../rpc-client";
+import {
+	projectRuntimeCycle,
+	renderRuntimeCycleLines,
+	type RuntimeCycleObservation,
+	type RuntimeCycleProjection,
+} from "../runtime-cycle";
 import type { RawConsoleOutputStream } from "./tui/terminal";
 import {
 	MAX_RAW_CONSOLE_LINE_BYTES,
@@ -151,6 +157,8 @@ export interface OwnerConsoleOptions {
 	readonly idempotencyKey?: () => string;
 	/** Renderer-only notification emitted immediately before a durable event frame is published. */
 	readonly onEvent?: (event: ConsoleEventFrame) => void | Promise<void>;
+	/** Profile pin used to detect stale adopted identity before owner input. */
+	readonly expectedSessionId?: string;
 }
 
 export interface RunWayConsoleDependencies {
@@ -320,37 +328,51 @@ export function sanitizeConsoleText(value: string): string {
 }
 
 /** Decides whether a local owner can safely send input to this daemon. */
-export function consoleStartupDecision(healthPayload: unknown, statusPayload: unknown): ConsoleStartupDecision {
+export function consoleStartupDecision(
+	healthPayload: unknown,
+	statusPayload: unknown,
+	observation: Omit<RuntimeCycleObservation, "health" | "status"> = {},
+): ConsoleStartupDecision {
 	if (!isRecord(healthPayload) || !isRecord(statusPayload)) {
 		return {
 			interactive: false,
 			refusal: "Refusing interactive console: the gateway returned an invalid health or status payload.",
 		};
 	}
-	const records = [healthPayload, statusPayload] as const;
+	const projection = projectRuntimeCycle({ health: healthPayload, status: statusPayload, ...observation });
+	if (projection.inputAllowed) return { interactive: true };
+	return { interactive: false, refusal: consoleStartupRefusal(healthPayload, statusPayload, projection) };
+}
+
+function consoleStartupRefusal(health: RecordValue, status: RecordValue, projection: RuntimeCycleProjection): string {
+	const records = [health, status] as const;
 	const states = records.map((record) => rawStringValue(record.state));
 	const statuses = records.map((record) => rawStringValue(record.status));
 	const renderedStates = states.map(sanitizeConsoleText);
 	const renderedStatuses = statuses.map(sanitizeConsoleText);
 	const reason = firstString(records, "reason");
 	const renderedReason = reason ? sanitizeConsoleText(reason) : undefined;
-	if (states.includes("failed_closed")) {
-		return {
-			interactive: false,
-			refusal: `Refusing interactive console: the gateway is failed closed${renderedReason ? ` (${renderedReason})` : ""}. The main persona is fenced; repair or explicitly approve it before sending owner input.`,
-		};
+	if (projection.phase === "unavailable") {
+		return `Refusing interactive console: the gateway daemon is unavailable${renderedReason ? ` (${renderedReason})` : ""}. No owner input was sent.`;
 	}
-	if (statuses.some((status) => status !== "healthy")) {
-		return {
-			interactive: false,
-			refusal: `Refusing interactive console: the gateway is not healthy (health=${renderedStatuses.join(", ")}, state=${renderedStates.join(", ")})${renderedReason ? `: ${renderedReason}` : ""}. No owner input was sent.`,
-		};
+	if (projection.phase === "failed_closed" || states.includes("failed_closed")) {
+		return `Refusing interactive console: the gateway is failed closed${renderedReason ? ` (${renderedReason})` : ""}. The main persona is fenced; repair or explicitly approve it before sending owner input.`;
 	}
-	return { interactive: true };
+	if (projection.phase === "identity_stale") {
+		const adopted = sanitizeConsoleText(projection.identity.adopted ?? "none");
+		const expected = sanitizeConsoleText(projection.identity.expected ?? "none");
+		return `Refusing interactive console: adopted session_id=${adopted} does not match the profile pin ${expected}. Exact-session adoption is required; re-run bootstrap or correct the pin.`;
+	}
+	return `Refusing interactive console: the gateway is not healthy (health=${renderedStatuses.join(", ")}, state=${renderedStates.join(", ")})${renderedReason ? `: ${renderedReason}` : ""}. No owner input was sent.`;
 }
 
 /** Renders the live gateway state shown by the cockpit status rail. */
-export function renderConsoleStatusSummary(healthPayload: unknown, statusPayload: unknown, now = Date.now()): string {
+export function renderConsoleStatusSummary(
+	healthPayload: unknown,
+	statusPayload: unknown,
+	now = Date.now(),
+	observation: Omit<RuntimeCycleObservation, "health" | "status" | "now"> = {},
+): string {
 	const health = recordValue(healthPayload);
 	const status = recordValue(statusPayload);
 	const main = recordValue(status.main ?? health.main);
@@ -371,6 +393,7 @@ export function renderConsoleStatusSummary(healthPayload: unknown, statusPayload
 		: holder.lease_id
 			? `lease=${stringValue(holder.lease_id)}`
 			: "none";
+	const projection = projectRuntimeCycle({ health: healthPayload, status: statusPayload, now, ...observation });
 	return [
 		"Gateway status",
 		`  daemon: status=${stringValue(health.status)} state=${stringValue(health.state)}${reason ? ` reason=${boundedConsoleText(reason)}` : ""}`,
@@ -380,6 +403,7 @@ export function renderConsoleStatusSummary(healthPayload: unknown, statusPayload
 		`  lock: held=${booleanValue(lock.held)} holder=${holderDescription} queue_len=${integerValue(lock.queue_len)} stuck=${booleanValue(lock.stuck)} quarantined=${booleanValue(lock.quarantined)} write_mode=${booleanValue(status.write_mode)}`,
 		`  reconcile: ${reconcileFreshness} drift_count=${integerValue(reconcile.drift_count)}`,
 		`  consumers: ${renderConsumerCheckpoints(status.consumers)}`,
+		...renderRuntimeCycleLines(projection).map((line) => `  ${line}`),
 	].join("\n");
 }
 
@@ -661,6 +685,7 @@ export class OwnerConsole {
 	readonly #idempotencyKey: () => string;
 	readonly #consumer: ConsoleEventConsumer;
 	readonly #onEvent: ((event: ConsoleEventFrame) => void | Promise<void>) | undefined;
+	readonly #expectedSessionId: string | undefined;
 	#deliveryReady = false;
 	#deliveryFailure: ConsoleDeliveryUnavailableError | undefined;
 	#lastStatusFingerprint: string | undefined;
@@ -673,6 +698,7 @@ export class OwnerConsole {
 		this.#output = options.output;
 		this.#idempotencyKey = options.idempotencyKey ?? randomUUID;
 		this.#onEvent = options.onEvent;
+		this.#expectedSessionId = options.expectedSessionId;
 		this.#consumer = new ConsoleEventConsumer({
 			rpc: options.rpc,
 			consumerId: options.consumerId,
@@ -699,7 +725,7 @@ export class OwnerConsole {
 			await this.writeRefusal(refusal);
 			return { accepted: false, refusal };
 		}
-		const decision = consoleStartupDecision(health, status);
+		const decision = consoleStartupDecision(health, status, { expectedSessionId: this.#expectedSessionId });
 		if (!decision.interactive) {
 			await this.writeStatusSummary(health, status);
 			await this.writeRefusal(decision.refusal ?? "The gateway refused interactive console startup.");
@@ -971,7 +997,7 @@ export class OwnerConsole {
 			await this.#output.writeFrame(
 				[
 					"Gateway cockpit commands:",
-					"  /status",
+					"  /status  (cycle, identity, journal/outbox, lock/quarantine, reconcile, gates)",
 					"  /journal [all|kind[,kind...]] [count] (default excludes registry_change)",
 					"  /registry list | /registry inspect <session_id>",
 					"  /schedule list | /schedule runs <job_id>",
@@ -1072,7 +1098,9 @@ export class OwnerConsole {
 	}
 
 	private async writeStatusSummary(health: RecordValue, status: RecordValue): Promise<void> {
-		await this.#output.writeFrame(`${renderConsoleStatusSummary(health, status)}\n`);
+		await this.#output.writeFrame(
+			`${renderConsoleStatusSummary(health, status, Date.now(), { expectedSessionId: this.#expectedSessionId })}\n`,
+		);
 	}
 
 	private async writeRefusal(message: string): Promise<void> {
@@ -1174,6 +1202,7 @@ export async function runWayConsole(
 			rpc,
 			ownerSurfaceId,
 			output,
+			expectedSessionId: profile.externalSessionId,
 			idempotencyKey: dependencies.idempotencyKey,
 			onEvent: async (event) => terminal?.observeEvent?.(event),
 		});
@@ -1188,7 +1217,9 @@ export async function runWayConsole(
 		const activeTerminal = terminal;
 		output.setWriter(async (text) => await activeTerminal.writeTrusted(text));
 		activeTerminal.setDeliveryState?.("fenced");
-		await output.writeFrame(`${renderConsoleStatusSummary(inspected.health, inspected.status)}\n`);
+		await output.writeFrame(
+			`${renderConsoleStatusSummary(inspected.health, inspected.status, Date.now(), { expectedSessionId: profile.externalSessionId })}\n`,
+		);
 		const startup = await consoleSurface.establishDeliveryReadiness(inspected);
 		if (!startup.accepted) {
 			activeTerminal.setDeliveryState?.("unavailable");
