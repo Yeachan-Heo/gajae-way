@@ -2,11 +2,14 @@
 
 ## Install and run
 
-Install the workspace package with Bun 1.4, then launch the gateway out of band:
+For production, compile standalone binaries — no source checkout, node_modules, or Bun install is needed on the host:
 
 ```sh
-bun packages/gateway/src/main.ts daemon
+bun run build   # emits dist/gajaeway-gateway, dist/gajaeway-discord, dist/gajaeway-telegram, dist/gajaeway
+dist/gajaeway-gateway daemon
 ```
+
+The external `gjc` binary remains a runtime dependency on PATH (the gateway spawns it per turn). For development, run straight from source: `bun packages/gateway/src/main.ts daemon`.
 
 The CLI does not start the daemon: `gajaeway daemon run` prints the launcher command, and `gajaeway status` requires the daemon socket. Run the launcher under your service manager (systemd/launchd/container supervisor), keep its state directory private, and stop the service before an offline restore.
 
