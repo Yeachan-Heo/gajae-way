@@ -19,16 +19,18 @@ memory/
 
 These seven directories are the canonical homes: **daily**, **events**, **tasks**, **people**, **projects**, **channels**, and **decisions**. `MEMORY.md` is strictly a navigation map: it contains generated pointers to canonical files, not long-form facts. It lists up to 20 recent files per axis. Keep durable knowledge in axis files, then regenerate the map rather than turning `MEMORY.md` into a second store.
 
-Each completed chat turn and each authored monitor event is captured in the current UTC daily file. A capture records timestamp, origin, user/event text, and reply text; each text field is bounded to 500 characters. This gives the canonicalization routine raw daily material to sort into the seven axes.
+Each completed chat turn and each authored monitor event is captured in the current UTC daily file. A capture records timestamp, origin, speaker (`author @ #channel | server`), user/event text, and reply text; each text field is bounded to 500 characters. This gives the canonicalization routine raw daily material to sort into the seven axes.
+
+The daily axis has two layers: flat `daily/YYYY-MM-DD.md` files are the gateway-written raw capture layer and must never be edited or moved, while persona-curated digests live in `daily/YYYY-MM/` subdirectories. Axis subdirectories are fully supported: the generated map scans axes recursively.
 
 ## Default maintenance monitors
 
-The live defaults are:
+These are seeded automatically on a database's first boot (removals are never resurrected); a monitor without its own channel target reports to the configured `ownerTarget`:
 
 | Monitor | Local schedule | Event type | Burst policy | Target |
 |---|---:|---|---|---|
-| `memory-canonicalize` | 05:30 daily | `memory.canonicalize` | `dedupe` | none |
-| `memory-audit` | 06:00 daily | `memory.audit` | `dedupe` | owner DM |
+| `memory-canonicalize` | every 6 hours (00:30/06:30/12:30/18:30) | `memory.canonicalize` | `dedupe` | `ownerTarget` fallback |
+| `memory-audit` | 06:00 daily | `memory.audit` | `dedupe` | `ownerTarget` fallback |
 
 Canonicalization reads daily captures, consolidates durable facts into the relevant canonical axes, and keeps `MEMORY.md` as a generated map. The audit then reports the structural state to the owner channel. Review changes as ordinary Markdown and Git changes; daily capture remains the source material rather than an invisible side channel.
 
