@@ -1,83 +1,66 @@
 # gajae-way
 
-`gajae-way` (**gajaeway**) is a personal-agent gateway in the spirit of Hermes
-and OpenClaw: one Gajae persona living across many strictly isolated
-[gajae-code (gjc)](https://github.com) sessions, reachable chat-first from
-Discord and Telegram, with a filesystem-first Markdown memory, unified
-event-driven monitors, and a versioned SDK protocol that exposes every gateway
-action and event to third parties.
+**gajae-way** gives you a persistent AI persona that lives where you already talk: Discord and Telegram DMs, channels, and threads. It can keep notes in plain Markdown files, react to scheduled work and outside events, and keep each conversation in its own private context.
 
-Pure Bun/TypeScript. No Rust core, no TUI, no fail-closed ceremony — durability
-comes from `bun:sqlite` transaction discipline plus explicit, tested recovery
-paths.
-
-## Architecture
+It is meant to feel like talking to one helpful presence—not operating a dashboard.
 
 ```text
-Discord adapter  ─┐                        ┌─ gjc session per origin
-Telegram adapter ─┼─ @gajaeway/sdk ─ UDS ──┤   (idempotent-key create,
-owner CLI        ─┘   (protocol v1.0)      │    resume per turn)
-third-party apps ─┘                        ├─ filesystem memory (git closure)
-                     gateway daemon ───────┼─ monitors (cron/webhook/watcher/script)
-                                           └─ SQLite: sessions, delivery ledger,
-                                              systematic event log
+Discord / Telegram ──> gajaeway gateway ──> your persona (gjc)
+                              │
+                    Markdown memory + scheduled/event monitors
 ```
 
-- **One Gajae, many sessions.** Every conversational origin (Discord
-  channel/thread/DM, Telegram chat/topic/DM, loopback REPL) maps to its own
-  isolated gjc session. Transcripts never merge; cross-session context flows
-  only through on-demand, bounded, source-cited recall and canonical memory.
-- **SDK-first.** Adapters and the owner CLI are ordinary consumers of the
-  public `@gajaeway/sdk` — anything they can do, a third party can do.
-  Enforced by the `sdk-boundary-dogfood` and `sdk-coverage-inventory` CI gates.
-- **Memory by doctrine.** Canonical memory is a Markdown tree under
-  `$GAJAEWAY_HOME/memory` with a map-only `MEMORY.md`, BM25 retrieval, and a
-  crash-proven intent → write → git commit → receipt closure ladder.
-- **Monitors.** A cron is just a monitor with a periodic trigger. Cron,
-  webhook, watcher, and script triggers feed a seven-stage propagation
-  pipeline: log-before-propagate, declared event types (unknown → catch-all
-  session), per-monitor burst policies, one Gajae-authored memory record per
-  event, channel output through the delivery ledger.
-- **Honest at-least-once delivery.** A durable ledger redelivers unconfirmed
-  replies on boot; mid-send ambiguity is redelivered with a visible duplicate
-  label, never silently resent.
+## What it feels like
 
-## Packages
+- Send a DM and talk normally. Your bot responds in that conversation’s own ongoing context.
+- In a group, it stays out of the way until you mention it. You can explicitly open a configured channel for normal conversation.
+- Send `/new` when you want a fresh start in that conversation. It confirms that a fresh session has started.
+- On Discord, it shows a typing indicator while it is working.
+- Replies are protected by a durable delivery record. After a crash, an unsettled reply may be sent again; when the earlier send was uncertain, it is visibly labeled as a duplicate rather than silently pretending it was not.
+- Conversations and useful monitor output are captured under your own `$GAJAEWAY_HOME/memory` directory as readable Markdown, not hidden in a proprietary store.
 
-| Package | Role |
-|---|---|
-| `@gajaeway/protocol` | Wire profile v1.0: frames, negotiation, verbs, events, origin normalization |
-| `@gajaeway/sdk` | Public client (Unix socket + stdio) |
-| `@gajaeway/gateway` | The daemon: sessions, memory, monitors, delivery, guard |
-| `@gajaeway/adapter-discord` | Discord surface (SDK-only consumer) |
-| `@gajaeway/adapter-telegram` | Telegram surface (SDK-only, zero platform deps) |
-| `@gajaeway/cli` | Owner CLI: chat REPL, sessions, monitors, memory, ops |
-| `@gajaeway/conformance` | SDK boundary + coverage CI gates |
+For how memory, monitors, and the gateway work, see [the documentation](docs/).
 
-## Quick start
+## Start in five steps
 
-```sh
-bun install
-bun packages/gateway/src/main.ts daemon     # out-of-band launcher (foreground)
-bun packages/cli/src/main.ts chat           # loopback REPL
-bun packages/cli/src/main.ts status
-```
+1. Build the standalone programs on a machine with Bun:
 
-Configuration lives in `$GAJAEWAY_HOME/config.json` (default `~/.gajaeway`);
-secrets are credential-file references only. See
-[`docs/runbooks/gajaeway-v1.md`](docs/runbooks/gajaeway-v1.md) for adapters,
-monitors, memory operations, backup/restore, and crash-recovery behavior.
+   ```sh
+   bun run build
+   ```
+
+   This creates `dist/gajaeway-gateway`, `dist/gajaeway-discord`, `dist/gajaeway-telegram`, and `dist/gajaeway`.
+
+2. Choose a private home directory and create `$GAJAEWAY_HOME/config.json` plus separate credential files. The gateway configuration references credential **files**, rather than storing secret values inline. See [deployment](docs/deployment.md) for the complete layout and examples.
+
+3. Create `$GAJAEWAY_HOME/adapter-discord.json` with its own `tokenFile` reference for Discord. Create the analogous Telegram adapter configuration when using Telegram.
+
+4. Run the gateway as a long-lived daemon under your service manager:
+
+   ```sh
+   dist/gajaeway-gateway daemon
+   ```
+
+   The host also needs the external `gjc` program on `PATH`; it supplies the AI runtime for every turn.
+
+5. Start the Discord adapter, then send your bot a DM:
+
+   ```sh
+   dist/gajaeway-discord
+   ```
+
+   Start `dist/gajaeway-telegram` separately when using Telegram.
+
+## Make it yours
+
+Put `SOUL.md`, `AGENTS.md`, and `USER.md` in `$GAJAEWAY_HOME/workspace`. They are read for each turn and that workspace is also your persona’s working directory. Keep the home directory private: it contains configuration, the gateway database, your workspace, and memory.
+
+- [Deployment guide](docs/deployment.md) — configuration, credentials, and service-manager setup
+- [Memory guide](docs/memory.md) — readable memory and search
+- [Monitor guide](docs/monitors.md) — scheduled and event-driven work
+- [Architecture](docs/architecture.md) — protocol and reliability details
+- [Operator runbook](docs/runbooks/gajaeway-v1.md) — recovery and troubleshooting
 
 ## Development
 
-```sh
-bun test packages/                          # full suite
-GAJAEWAY_BENCH=1 bun test packages/gateway/bench    # retrieval benchmark gate
-GAJAEWAY_STRESS=1 bun test packages/gateway/test/stress  # 60s burst stress
-bunx biome check packages/
-bunx tsc --noEmit -p tsconfig.json
-```
-
-Safety floors are unoverridable in every configuration: the unrecoverable
-command blocklist and the path-scope guard (no recursive deletion of `$HOME`
-itself or anything outside `$HOME` / `$GAJAEWAY_HOME`).
+This repository is a Bun/TypeScript workspace. Build with `bun run build`; run tests with `bun test packages`. Production hosts run the compiled binaries, not this source checkout.
