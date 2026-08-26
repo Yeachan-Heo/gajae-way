@@ -12,6 +12,8 @@ export interface GatewayConfigFile {
 	readonly logVerbosity?: "debug" | "info" | "warn" | "error";
 	readonly socketPath?: string;
 	readonly dbPath?: string;
+	/** Per-turn gjc ceiling in milliseconds; default 300000. Long agentic turns need more. */
+	readonly turnTimeoutMs?: number;
 	readonly credentials?: Readonly<Record<string, CredentialFileReference>>;
 	readonly channels?: Readonly<Record<string, { readonly engagement?: "open" }>>;
 	readonly webhook?: { readonly bind?: string; readonly port: number; readonly exposeNonLoopback?: boolean };
@@ -132,6 +134,13 @@ function parseWebhook(value: unknown): {
 	};
 }
 
+function parseTurnTimeout(value: unknown): number {
+	// Bounded 30s..3600s: below breaks trivial turns, above is an operator mistake.
+	if (!Number.isInteger(value) || (value as number) < 30_000 || (value as number) > 3_600_000)
+		throw new ConfigError("config_invalid", "turnTimeoutMs must be an integer between 30000 and 3600000");
+	return value as number;
+}
+
 export function parseConfigFile(value: unknown): GatewayConfigFile {
 	const input = requireObject(value, "config");
 	if (input.schemaVersion !== CONFIG_SCHEMA_VERSION) {
@@ -153,6 +162,7 @@ export function parseConfigFile(value: unknown): GatewayConfigFile {
 		...(input.webhook === undefined ? {} : { webhook: parseWebhook(input.webhook) }),
 		...(input.watcherRoots === undefined ? {} : { watcherRoots: parseStringArray(input.watcherRoots, "watcherRoots") }),
 		...(input.scriptRoot === undefined ? {} : { scriptRoot: optionalString(input.scriptRoot, "scriptRoot") }),
+		...(input.turnTimeoutMs === undefined ? {} : { turnTimeoutMs: parseTurnTimeout(input.turnTimeoutMs) }),
 	};
 }
 
