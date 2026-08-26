@@ -250,7 +250,10 @@ class ReconnectingGateway {
 		if (!client) return;
 		// The gateway acknowledges engagement before running the turn, so typing starts only for
 		// turns that will actually produce a reply and never outlives the delivery that clears it.
-		void client.request<{ engaged?: boolean }>("chat.send", { origin, text, engagement }).then(
+		// The platform message id travels with the turn: the gateway keys its durable inbound
+		// queue on it, so a replayed or backfilled message is deduped there and not just in the
+		// adapter's in-memory set, which does not survive a restart.
+		void client.request<{ engaged?: boolean }>("chat.send", { origin, text, engagement, messageId }).then(
 			(result) => {
 				if (result?.engaged) this.typing?.begin(origin.conversationId);
 			},

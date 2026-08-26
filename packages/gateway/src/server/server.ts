@@ -27,7 +27,7 @@ import { MonitorRuntime } from "../monitors/runtime";
 import { backupDatabase, integrityDatabase } from "../ops/backup";
 import type { GjcPort } from "../orchestrator/gjc-client";
 import { PersonaLoader } from "../persona/persona";
-import type { GatewayDatabase } from "../store/db";
+import type { GatewayDatabase, InboundMessageRow } from "../store/db";
 import { DeliveryLedger } from "../store/ledger";
 import { KeyedQueue } from "./keyed-queue";
 
@@ -48,6 +48,11 @@ export interface GatewayServerOptions {
 	readonly onStop?: () => void | Promise<void>;
 	readonly persona?: PersonaLoader;
 }
+interface InboundContext {
+	readonly turnId: string;
+	readonly requestId: string;
+	readonly connection: Connection;
+}
 interface Runtime {
 	readonly delivery: DeliveryService;
 	readonly persona: PersonaLoader;
@@ -58,6 +63,8 @@ interface Runtime {
 	readonly monitorRuntime: MonitorRuntime;
 	readonly reconcileTimer: ReturnType<typeof setInterval>;
 	readonly turns: KeyedQueue;
+	/** Accepted-but-not-yet-dispatched inbound messages, keyed by message id. */
+	readonly inbound: Map<string, InboundContext>;
 }
 
 export async function startUnixServer(options: GatewayServerOptions): Promise<GatewayServer> {
@@ -80,8 +87,7 @@ export async function startUnixServer(options: GatewayServerOptions): Promise<Ga
 		listener.stop(true);
 		clearInterval(runtime.reconcileTimer);
 		await runtime.monitorRuntime.stop();
-		await runtime.memory.initialize();
-		await runtime.memory.drain();
+		await settleMemory(runtime);
 		await options.onStop?.();
 	};
 	listener = Bun.listen<{ connection: Connection }>({
@@ -137,8 +143,7 @@ export function startStdioServer(options: GatewayServerOptions): GatewayServer {
 		clearInterval(runtime.reconcileTimer);
 		await runtime.monitorRuntime.stop();
 		connection.close();
-		await runtime.memory.initialize();
-		await runtime.memory.drain();
+		await settleMemory(runtime);
 		await options.onStop?.();
 	};
 	process.stdin.on("data", (data: Buffer) => {
@@ -152,8 +157,28 @@ export function startStdioServer(options: GatewayServerOptions): GatewayServer {
 	return { stop };
 }
 
+/**
+ * Shutdown must never be blocked by the memory subsystem. Startup fires initialize() without
+ * awaiting it, so a failure there stays latent until shutdown awaits the memoized promise and
+ * throws mid-teardown. Intents are durable SQLite rows recovered on the next boot, so a failed
+ * settle is logged and teardown continues.
+ */
+async function settleMemory(runtime: Runtime): Promise<void> {
+	try {
+		await runtime.memory.initialize();
+		await runtime.memory.drain();
+	} catch (error) {
+		console.error(
+			`gateway memory settle failed during shutdown; intents remain durable for next boot: ${error instanceof Error ? error.message : String(error)}`,
+		);
+	}
+}
+
 function createRuntime(options: GatewayServerOptions): Runtime {
 	const connections = new Set<Connection>();
+	// A turn killed mid-flight leaves its claimed message stranded; recover before serving.
+	const recovered = options.database.inboundRecoverProcessing();
+	console.error(`gateway recovered ${recovered} inbound message(s) stranded in processing.`);
 	const delivery = new DeliveryService(new DeliveryLedger(options.database));
 	const registry = new MonitorRegistry(options.database);
 	const memory = new MemoryClosureQueue(options.database, options.config.home);
@@ -181,6 +206,7 @@ function createRuntime(options: GatewayServerOptions): Runtime {
 		monitorRuntime,
 		reconcileTimer,
 		turns: new KeyedQueue(),
+		inbound: new Map(),
 	};
 }
 async function handleFrame(
@@ -424,7 +450,12 @@ async function sendChat(
 	runtime: Runtime,
 ): Promise<void> {
 	const params = request.params as
-		| { origin?: unknown; text?: unknown; engagement?: { mentioned?: unknown; group?: unknown; authorId?: unknown } }
+		| {
+				origin?: unknown;
+				text?: unknown;
+				messageId?: unknown;
+				engagement?: { mentioned?: unknown; group?: unknown; authorId?: unknown };
+		  }
 		| undefined;
 	if (!params || typeof params.text !== "string" || !params.text)
 		throw new ProtocolError("invalid_params", "chat.send requires non-empty text");
@@ -485,18 +516,84 @@ async function sendChat(
 		});
 		return;
 	}
+	const messageId = typeof params.messageId === "string" && params.messageId ? params.messageId : crypto.randomUUID();
 	const turnId = crypto.randomUUID();
+	// Persist before dispatch: the insert is the acceptance boundary. A message that arrives
+	// while a turn for the same origin is in flight stays durable and is drained afterwards
+	// instead of being dropped outright (five real owner messages were lost that way).
+	const accepted = options.database.inboundEnqueue({
+		messageId,
+		originKey: key,
+		originRefJson: JSON.stringify(origin),
+		body: userText,
+		engagementJson: params.engagement ? JSON.stringify(params.engagement) : undefined,
+	});
+	if (!accepted) {
+		// Duplicate message id: already accepted once, so acknowledge without dispatching.
+		connection.write({
+			v: PROFILE_VERSION,
+			type: "response",
+			id: request.id,
+			result: { turnId: null, engaged: true },
+		});
+		return;
+	}
+	runtime.inbound.set(messageId, { turnId, requestId: request.id, connection });
 	connection.write({ v: PROFILE_VERSION, type: "response", id: request.id, result: { turnId, engaged: true } });
-	// One origin == one gjc session: serialize turns per origin key so a burst of
-	// inbound messages can never race two `gjc --resume` processes on one session.
+	await drainOrigin(key, messageId, connection, options, runtime);
+}
+// One origin == one gjc session: serialize turns per origin key so a burst of inbound
+// messages can never race two `gjc --resume` processes on one session. The drain runs
+// inside that serialization, and inboundClaimNext is the atomic hand-off, so a message
+// enqueued mid-turn is dispatched exactly once — either by the in-flight drain or by its
+// own queued slot.
+async function drainOrigin(
+	key: string,
+	ownMessageId: string,
+	fallback: Connection,
+	options: GatewayServerOptions,
+	runtime: Runtime,
+): Promise<void> {
+	let ownFailure: unknown;
+	await runtime.turns.run(key, async () => {
+		for (let row = options.database.inboundClaimNext(key); row; row = options.database.inboundClaimNext(key)) {
+			try {
+				await runInboundTurn(row, fallback, options, runtime);
+			} catch (error) {
+				// The originating request reports its own failure; a drained message has no
+				// live requester left, so its failure only belongs in the daemon log.
+				if (row.message_id === ownMessageId) ownFailure = error;
+				else
+					console.error(
+						`gateway inbound turn failed (${row.message_id}): ${error instanceof Error ? (error.stack ?? error.message) : String(error)}`,
+					);
+			} finally {
+				options.database.inboundComplete(row.message_id);
+			}
+		}
+	});
+	if (ownFailure) throw ownFailure;
+}
+async function runInboundTurn(
+	row: InboundMessageRow,
+	fallback: Connection,
+	options: GatewayServerOptions,
+	runtime: Runtime,
+): Promise<void> {
+	const context = runtime.inbound.get(row.message_id);
+	runtime.inbound.delete(row.message_id);
+	const connection = context?.connection ?? fallback;
+	const turnId = context?.turnId ?? crypto.randomUUID();
+	const key = row.origin_key;
+	const origin = validateOriginRef(JSON.parse(row.origin_ref_json) as typeof LOOPBACK_ORIGIN);
+	const userText = row.body;
+	const nonLoopback = origin.platform !== "loopback";
 	let text: string;
 	try {
-		text = await runtime.turns.run(key, async () => {
-			const epoch = options.database.getSessionRecord(key)?.epoch ?? 0;
-			const { sessionId } = await options.gjc.ensureSession(key, epoch);
-			const preamble = `${await runtime.persona.systemPreamble()}\n\n${ACTION_GUARD_SYSTEM_NOTICE}`;
-			return options.gjc.sendTurn(sessionId, userText, preamble);
-		});
+		const epoch = options.database.getSessionRecord(key)?.epoch ?? 0;
+		const { sessionId } = await options.gjc.ensureSession(key, epoch);
+		const preamble = `${await runtime.persona.systemPreamble()}\n\n${ACTION_GUARD_SYSTEM_NOTICE}`;
+		text = await options.gjc.sendTurn(sessionId, userText, preamble);
 	} catch (error) {
 		// Never ghost a platform conversation: a failed turn still produces a visible,
 		// ledgered notice (live P1 drill finding: timeouts looked like silent ignores).
@@ -528,7 +625,7 @@ async function sendChat(
 			v: PROFILE_VERSION,
 			type: "event",
 			event: "chat.message",
-			id: request.id,
+			...(context ? { id: context.requestId } : {}),
 			payload: { turnId, origin, role: "assistant", text, final: true },
 		});
 		// Durable intent is persisted synchronously; closure work deliberately does not delay delivery.
