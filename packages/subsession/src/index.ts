@@ -36,6 +36,8 @@ export {
 } from "./lane";
 export {
 	assertValidOpRef,
+	CLIENT_REF_CONFLICT_CODE,
+	envelopeErrorCode,
 	isOpRefRejection,
 	MAX_OP_REF_LENGTH,
 	newOpRef,

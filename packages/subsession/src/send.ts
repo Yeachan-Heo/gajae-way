@@ -159,7 +159,11 @@ export async function sendPrompt(options: ControllerOptions, input: SendPromptIn
 		payload = parseEnvelope(raw, "session send");
 	} catch (error) {
 		if (isOpRefRejection(error)) {
-			throw new OpRefRejectedError(opRef, error instanceof GjcCliError ? error.details : undefined);
+			throw new OpRefRejectedError(
+				opRef,
+				CLIENT_REF_CONFLICT_CODE,
+				error instanceof GjcCliError ? error.details : undefined,
+			);
 		}
 		throw error;
 	}
@@ -182,28 +186,50 @@ export async function sendPrompt(options: ControllerOptions, input: SendPromptIn
  * duplicate `clientRef` instead of returning the earlier result. The correct
  * recovery is to reconcile the existing record via `status` - never to mint a
  * fresh ref for the same logical prompt, which would run the work twice.
+ *
+ * Classification is by the structured envelope code ONLY. Human messages get
+ * reworded, translated and wrapped between releases, so a text heuristic
+ * misclassifies both ways: it would call an unrelated failure a ref conflict, or
+ * miss a real one behind a wrapping error.
  */
+export const CLIENT_REF_CONFLICT_CODE = "client_ref_conflict";
+
 export class OpRefRejectedError extends Error {
 	readonly opRef: string;
+	/** Exact envelope code that produced this classification. */
+	readonly code: string;
+	/** Original error payload, kept verbatim for the operator. */
 	readonly details: unknown;
 
-	constructor(opRef: string, details: unknown) {
-		super(`op-ref ${opRef} was rejected as already used; reconcile it with status instead of resending or reminting`);
+	constructor(opRef: string, code: string, details: unknown) {
+		super(`op-ref ${opRef} was rejected with ${code}; reconcile it with status instead of resending or reminting`);
 		this.name = "OpRefRejectedError";
 		this.opRef = opRef;
+		this.code = code;
 		this.details = details;
 	}
 }
 
-const REJECTION_SUBJECT = /(client_?ref|op[-_]?ref)/i;
-const REJECTION_VERB = /(duplicate|already|exists|reused|conflict|in[-_ ]?use)/i;
+/** Reads `error.code` from a parsed envelope payload, if it has one. */
+export function envelopeErrorCode(details: unknown): string | undefined {
+	if (typeof details !== "object" || details === null) {
+		return undefined;
+	}
+	const code = (details as { code?: unknown }).code;
+	return typeof code === "string" ? code : undefined;
+}
 
+/**
+ * True only for an exact `client_ref_conflict` envelope code.
+ *
+ * Anything else - including an envelope with no code at all - stays a generic
+ * operational failure and fails closed.
+ */
 export function isOpRefRejection(error: unknown): boolean {
 	if (!(error instanceof GjcCliError)) {
 		return false;
 	}
-	const text = `${error.message} ${JSON.stringify(error.details ?? "")}`;
-	return REJECTION_SUBJECT.test(text) && REJECTION_VERB.test(text);
+	return envelopeErrorCode(error.details) === CLIENT_REF_CONFLICT_CODE;
 }
 
 export type PromptOutcome = {

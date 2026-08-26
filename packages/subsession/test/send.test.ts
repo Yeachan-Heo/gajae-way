@@ -3,6 +3,7 @@ import type { CliResult, ControllerOptions } from "../src/cli";
 import { GjcCliError } from "../src/cli";
 import {
 	assertValidOpRef,
+	envelopeErrorCode,
 	isOpRefRejection,
 	MAX_OP_REF_LENGTH,
 	newOpRef,
@@ -226,7 +227,7 @@ describe("op-ref rejection", () => {
 				exitCode: 0,
 				stdout: JSON.stringify({
 					ok: false,
-					error: { code: "client_ref_duplicate", message: "clientRef already used" },
+					error: { code: "client_ref_conflict", message: "clientRef already used" },
 				}),
 				stderr: "",
 			}),
@@ -236,8 +237,10 @@ describe("op-ref rejection", () => {
 		).rejects.toBeInstanceOf(OpRefRejectedError);
 	});
 
-	test("the rejection tells the caller to reconcile rather than remint", async () => {
-		const error = new OpRefRejectedError("gw-pr-a-1", null);
+	test("the rejection carries the exact code and tells the caller to reconcile", async () => {
+		const error = new OpRefRejectedError("gw-pr-a-1", "client_ref_conflict", { code: "client_ref_conflict" });
+		expect(error.code).toBe("client_ref_conflict");
+		expect(error.details).toEqual({ code: "client_ref_conflict" });
 		expect(error.message).toMatch(/reconcile it with status/);
 	});
 
@@ -255,10 +258,35 @@ describe("op-ref rejection", () => {
 		);
 	});
 
-	test("isOpRefRejection needs both an op-ref subject and a duplication verb", () => {
-		expect(isOpRefRejection(new GjcCliError("clientRef already used", 0, ""))).toBe(true);
-		expect(isOpRefRejection(new GjcCliError("session already deleted", 0, ""))).toBe(false);
+	test("classification is by exact envelope code, never by message text", () => {
+		expect(isOpRefRejection(new GjcCliError("x", 0, "", { code: "client_ref_conflict" }))).toBe(true);
+		// A reworded or translated message must not be promoted to a ref conflict.
+		expect(isOpRefRejection(new GjcCliError("clientRef already used", 0, ""))).toBe(false);
+		expect(isOpRefRejection(new GjcCliError("dup", 0, "", { code: "client_ref_duplicate" }))).toBe(false);
+	});
+
+	test("an envelope wrapping the conflict message under another code stays generic", () => {
+		expect(
+			isOpRefRejection(
+				new GjcCliError("wrapped", 0, "", {
+					code: "internal_error",
+					message: "clientRef already used, duplicate op-ref",
+				}),
+			),
+		).toBe(false);
+	});
+
+	test("an envelope with no code at all fails closed as a generic failure", () => {
+		expect(isOpRefRejection(new GjcCliError("no code", 0, "", { message: "conflict" }))).toBe(false);
+		expect(isOpRefRejection(new GjcCliError("no details", 0, ""))).toBe(false);
 		expect(isOpRefRejection(new Error("clientRef already used"))).toBe(false);
+	});
+
+	test("envelopeErrorCode reads only a string code", () => {
+		expect(envelopeErrorCode({ code: "client_ref_conflict" })).toBe("client_ref_conflict");
+		expect(envelopeErrorCode({ code: 7 })).toBeUndefined();
+		expect(envelopeErrorCode(null)).toBeUndefined();
+		expect(envelopeErrorCode("client_ref_conflict")).toBeUndefined();
 	});
 });
 
