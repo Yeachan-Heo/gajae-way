@@ -46,6 +46,8 @@ export interface ChatProgressPayload {
 	readonly elapsedMs: number;
 	/** Tool executions the turn has started so far. */
 	readonly toolCalls: number;
+	/** Output tokens produced so far (exact per completed message, estimated between). */
+	readonly outputTokens: number;
 }
 
 export interface ChatSendResult {

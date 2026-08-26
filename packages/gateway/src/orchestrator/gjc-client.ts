@@ -3,6 +3,8 @@ import type { GatewayDatabase } from "../store/db";
 export interface TurnProgress {
 	/** Tool executions the turn has started so far. */
 	readonly toolCalls: number;
+	/** Output tokens so far: exact per completed message, estimated between. */
+	readonly outputTokens: number;
 }
 
 export interface GjcPort {
@@ -21,8 +23,15 @@ export interface GjcPort {
  */
 export class GjcTurnStream {
 	#buffer = "";
+	#exactOutputTokens = 0;
+	#deltaChars = 0;
 	toolCalls = 0;
 	finalText: string | undefined;
+
+	/** Exact usage from completed messages plus a ~4-chars/token estimate of the in-flight one. */
+	get outputTokens(): number {
+		return this.#exactOutputTokens + Math.ceil(this.#deltaChars / 4);
+	}
 
 	feed(chunk: string): void {
 		this.#buffer += chunk;
@@ -36,14 +45,24 @@ export class GjcTurnStream {
 	}
 
 	#line(line: string): void {
-		let event: { type?: string; message?: { role?: string; content?: Array<{ type?: string; text?: string }> } };
+		let event: {
+			type?: string;
+			assistantMessageEvent?: { delta?: string };
+			message?: { role?: string; content?: Array<{ type?: string; text?: string }>; usage?: { output?: number } };
+		};
 		try {
 			event = JSON.parse(line) as typeof event;
 		} catch {
 			return; // non-JSON noise line
 		}
+		if (event.type === "message_update" && typeof event.assistantMessageEvent?.delta === "string")
+			this.#deltaChars += event.assistantMessageEvent.delta.length;
 		if (event.type === "tool_execution_start") this.toolCalls++;
-		if ((event.type === "message_end" || event.type === "turn_end") && event.message?.role === "assistant") {
+		if (event.type === "message_end" && event.message?.role === "assistant") {
+			if (typeof event.message.usage?.output === "number") {
+				this.#exactOutputTokens += event.message.usage.output;
+				this.#deltaChars = 0;
+			}
 			const text = (event.message.content ?? [])
 				.filter((part) => part.type === "text" && typeof part.text === "string")
 				.map((part) => part.text)
@@ -143,7 +162,7 @@ export class GjcClient implements GjcPort {
 			await Bun.sleep(50);
 			if (process.env.GAJAEWAY_TEST_STUB_CAPTURE)
 				await Bun.write(process.env.GAJAEWAY_TEST_STUB_CAPTURE, systemPreamble ?? "");
-			onProgress?.({ toolCalls: 0 });
+			onProgress?.({ toolCalls: 0, outputTokens: 0 });
 			return process.env.GAJAEWAY_TEST_STUB_REPLY ?? "stub reply";
 		}
 		const child = Bun.spawn({
@@ -177,15 +196,19 @@ export class GjcClient implements GjcPort {
 			}
 		}, 1_000);
 		try {
-			const reader = (child.stdout as ReadableStream<Uint8Array>).getReader();
 			const decoder = new TextDecoder();
 			const stderrPromise = new Response(child.stderr as ReadableStream).text();
-			for (;;) {
-				const { done, value } = await reader.read();
-				if (done) break;
-				lastActivity = Date.now();
-				stream.feed(decoder.decode(value, { stream: true }));
-				if (onProgress) onProgress({ toolCalls: stream.toolCalls });
+			// Async iteration instead of an explicit reader: killing the child while a
+			// getReader() read was pending crashed the compiled Bun binary in production
+			// (panic at sendTurn); iteration ends or throws cleanly on teardown instead.
+			try {
+				for await (const value of child.stdout as unknown as AsyncIterable<Uint8Array>) {
+					lastActivity = Date.now();
+					stream.feed(decoder.decode(value, { stream: true }));
+					if (onProgress) onProgress({ toolCalls: stream.toolCalls, outputTokens: stream.outputTokens });
+				}
+			} catch {
+				// Stream teardown after kill or child death; the exit code decides the outcome.
 			}
 			const [stderr, exitCode] = await Promise.all([stderrPromise, child.exited]);
 			if (killedForInactivity) throw new Error(`gjc turn made no progress for ${this.#timeoutMs}ms and was reaped`);

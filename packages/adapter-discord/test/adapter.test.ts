@@ -222,10 +222,10 @@ test("working status posts one amended message per conversation and clears on de
 	};
 	const status = new WorkingStatus(discord, { error: () => {} });
 	const origin = { platform: "discord", kind: "channel", conversationId: "channel-1" } as const;
-	await status.update({ turnId: "t", origin, elapsedMs: 16_000, toolCalls: 1 });
-	await status.update({ turnId: "t", origin, elapsedMs: 125_000, toolCalls: 3 });
-	expect(sent).toEqual(["⏳ working… (16s, 1 tool)"]);
-	expect(edits).toEqual(["⏳ working… (2m 05s, 3 tools)"]);
+	await status.update({ turnId: "t", origin, elapsedMs: 16_000, toolCalls: 1, outputTokens: 210 });
+	await status.update({ turnId: "t", origin, elapsedMs: 125_000, toolCalls: 3, outputTokens: 1250 });
+	expect(sent).toEqual(["⏳ working… (16s, 1 tool, 210 tok)"]);
+	expect(edits).toEqual(["⏳ working… (2m 05s, 3 tools, 1.3k tok)"]);
 	const requests: Array<{ verb: string; params: unknown }> = [];
 	await settleDiscordDelivery(mockGateway(requests), discord, delivery("real reply"), undefined, status);
 	expect(deleted).toBe(1);
@@ -248,12 +248,14 @@ test("working status ignores non-discord progress and survives channel failures"
 		origin: { platform: "telegram", kind: "channel", conversationId: "tg" },
 		elapsedMs: 20_000,
 		toolCalls: 1,
+		outputTokens: 0,
 	});
 	await status.update({
 		turnId: "t",
 		origin: { platform: "discord", kind: "channel", conversationId: "c" },
 		elapsedMs: 20_000,
 		toolCalls: 1,
+		outputTokens: 0,
 	});
 	await status.clear("c"); // nothing posted; must not throw
 });

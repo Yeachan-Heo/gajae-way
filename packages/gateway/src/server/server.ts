@@ -593,24 +593,35 @@ async function runInboundTurn(
 	const nonLoopback = origin.platform !== "loopback";
 	let text: string;
 	// Long turns announce liveness instead of dying: throttled chat.progress events
-	// let adapters render a "working…" status while the persona runs tools.
+	// let adapters render a "working…" status while the persona runs. A heartbeat
+	// timer keeps the status ticking every interval even when the gjc stream is
+	// silent (e.g. a long tool run producing no events).
 	const startedAt = Date.now();
-	const firstAfterMs = options.progress?.firstAfterMs ?? 15_000;
-	const intervalMs = options.progress?.intervalMs ?? 15_000;
+	const firstAfterMs = options.progress?.firstAfterMs ?? 10_000;
+	const intervalMs = options.progress?.intervalMs ?? 10_000;
 	let lastProgressAt = 0;
-	const emitProgress = (toolCalls: number) => {
+	let lastKnown = { toolCalls: 0, outputTokens: 0 };
+	const emitProgress = (progress: { toolCalls: number; outputTokens: number }) => {
+		lastKnown = progress;
 		const now = Date.now();
 		if (now - startedAt < firstAfterMs || now - lastProgressAt < intervalMs) return;
 		lastProgressAt = now;
-		const payload = { turnId, origin, elapsedMs: now - startedAt, toolCalls };
+		const payload = {
+			turnId,
+			origin,
+			elapsedMs: now - startedAt,
+			toolCalls: progress.toolCalls,
+			outputTokens: progress.outputTokens,
+		};
 		for (const recipient of runtime.connections)
 			if (recipient.negotiated) recipient.write({ v: PROFILE_VERSION, type: "event", event: "chat.progress", payload });
 	};
+	const heartbeat = setInterval(() => emitProgress(lastKnown), intervalMs);
 	try {
 		const epoch = options.database.getSessionRecord(key)?.epoch ?? 0;
 		const { sessionId } = await options.gjc.ensureSession(key, epoch);
 		const preamble = `${await runtime.persona.systemPreamble()}\n\n${ACTION_GUARD_SYSTEM_NOTICE}`;
-		text = await options.gjc.sendTurn(sessionId, userText, preamble, (progress) => emitProgress(progress.toolCalls));
+		text = await options.gjc.sendTurn(sessionId, userText, preamble, emitProgress);
 	} catch (error) {
 		// Never ghost a platform conversation: a failed turn still produces a visible,
 		// ledgered notice (live P1 drill finding: timeouts looked like silent ignores).
@@ -628,6 +639,8 @@ async function runInboundTurn(
 			}
 		}
 		throw error;
+	} finally {
+		clearInterval(heartbeat);
 	}
 	options.database.withTransaction(() => {
 		options.database.updateActivity(key, JSON.stringify(origin));

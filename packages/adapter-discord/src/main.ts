@@ -200,6 +200,10 @@ function formatElapsed(elapsedMs: number): string {
 	return minutes > 0 ? `${minutes}m ${String(seconds).padStart(2, "0")}s` : `${seconds}s`;
 }
 
+function formatTokens(outputTokens: number): string {
+	return outputTokens >= 1000 ? `${(outputTokens / 1000).toFixed(1)}k tok` : `${outputTokens} tok`;
+}
+
 /**
  * Renders a long-running turn as one temporary, amended status message per
  * conversation ("working… (2m 05s, 3 tools)") driven by gateway chat.progress
@@ -219,7 +223,7 @@ export class WorkingStatus {
 	async update(progress: ChatProgressPayload): Promise<void> {
 		if (progress.origin.platform !== "discord") return;
 		const conversationId = progress.origin.conversationId;
-		const text = `⏳ working… (${formatElapsed(progress.elapsedMs)}, ${progress.toolCalls} tool${progress.toolCalls === 1 ? "" : "s"})`;
+		const text = `⏳ working… (${formatElapsed(progress.elapsedMs)}, ${progress.toolCalls} tool${progress.toolCalls === 1 ? "" : "s"}, ${formatTokens(progress.outputTokens)})`;
 		const existing = this.#messages.get(conversationId);
 		if (existing === "pending") return; // a send is already in flight; next tick edits
 		try {
@@ -234,9 +238,14 @@ export class WorkingStatus {
 				return;
 			}
 			const posted = await channel.send(text);
-			if (isEditableMessage(posted) && this.#messages.get(conversationId) === "pending")
+			if (isEditableMessage(posted) && this.#messages.get(conversationId) === "pending") {
 				this.#messages.set(conversationId, posted);
-			else this.#messages.delete(conversationId);
+				return;
+			}
+			this.#messages.delete(conversationId);
+			// The reply was delivered (clear ran) while this send was in flight: the
+			// freshly posted status is already stale — remove it or it lingers forever.
+			if (isEditableMessage(posted)) await posted.delete().catch(() => {});
 		} catch (error) {
 			this.#messages.delete(conversationId);
 			this.#log.error(

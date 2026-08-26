@@ -155,7 +155,7 @@ test("long turns broadcast throttled chat.progress liveness events", async () =>
 		sendTurn: async (_session, _text, _preamble, onProgress) => {
 			for (let call = 1; call <= 3; call++) {
 				await Bun.sleep(5);
-				onProgress?.({ toolCalls: call });
+				onProgress?.({ toolCalls: call, outputTokens: call * 100 });
 			}
 			return "done";
 		},
@@ -181,11 +181,19 @@ test("long turns broadcast throttled chat.progress liveness events", async () =>
 			engagement: { mentioned: false, group: false, authorId: "p1" },
 		},
 	});
-	await waitFor(client.frames, 5);
+	// Wait for the final reply so every progress frame the turn produced has arrived.
+	for (let attempt = 0; attempt < 200; attempt++) {
+		if (client.frames.some((frame) => frame.type === "event" && frame.event === "chat.message")) break;
+		await Bun.sleep(5);
+	}
 	const progress = client.frames.filter((frame) => frame.type === "event" && frame.event === "chat.progress");
 	expect(progress.length).toBeGreaterThanOrEqual(2);
 	expect(progress[0].payload.origin.conversationId).toBe("c1");
-	expect(progress[0].payload.toolCalls).toBeGreaterThanOrEqual(1);
+	// The first frame may be a zero-state heartbeat; later frames carry stream data.
+	const maxTools = Math.max(...progress.map((frame: any) => frame.payload.toolCalls));
+	const maxTokens = Math.max(...progress.map((frame: any) => frame.payload.outputTokens));
+	expect(maxTools).toBeGreaterThanOrEqual(1);
+	expect(maxTokens).toBeGreaterThanOrEqual(100);
 	expect(progress[0].payload.elapsedMs).toBeGreaterThanOrEqual(0);
 	const reply = client.frames.find((frame) => frame.type === "event" && frame.event === "chat.message");
 	expect(reply.payload.text).toBe("done");
