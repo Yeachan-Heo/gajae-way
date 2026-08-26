@@ -249,9 +249,36 @@ export async function main(args = process.argv.slice(2)): Promise<void> {
 				}
 				break;
 			}
+			case "work": {
+				const [command, ...args] = parsed.rest;
+				if (command !== "run") throw new Error('usage: gajaeway work run <name> [--cwd DIR] "<task text>"');
+				const name = args[0];
+				let cwd: string | undefined;
+				const textParts: string[] = [];
+				for (let i = 1; i < args.length; i++) {
+					if (args[i] === "--cwd") cwd = args[++i];
+					else textParts.push(args[i] as string);
+				}
+				const text = textParts.join(" ").trim();
+				if (!name || !text) throw new Error('usage: gajaeway work run <name> [--cwd DIR] "<task text>"');
+				// Worker turns are long agentic runs: the request waits as long as the
+				// gateway's own inactivity ceiling allows, not the default 30s.
+				const client = await GajaewayClient.connectSocket(parsed.socket, { requestTimeoutMs: 3_600_000 });
+				try {
+					const result = await client.request<{ text: string; sessionKey: string }>("work.run", {
+						name,
+						text,
+						...(cwd ? { cwd } : {}),
+					});
+					console.log(result.text);
+				} finally {
+					await client.close();
+				}
+				break;
+			}
 			default:
 				throw new Error(
-					"usage: gajaeway [--socket PATH] status|shutdown|chat|daemon run|sessions list [--json]|sessions inspect <originKey-or-index>|memory audit|memory search <query>|monitors ...|ops backup <path>|ops integrity|ops restore <backupPath>",
+					"usage: gajaeway [--socket PATH] status|shutdown|chat|daemon run|sessions list [--json]|sessions inspect <originKey-or-index>|memory audit|memory search <query>|monitors ...|work run <name> [--cwd DIR] <text>|ops backup <path>|ops integrity|ops restore <backupPath>",
 				);
 		}
 	} catch (error) {
