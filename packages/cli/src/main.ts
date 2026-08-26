@@ -222,6 +222,8 @@ export async function main(args = process.argv.slice(2)): Promise<void> {
 					else if (command === "list") console.log(JSON.stringify(await client.request("monitor.list")));
 					else if (command === "inspect" && args[0])
 						console.log(JSON.stringify(await client.request("monitor.inspect", { monitorId: args[0] })));
+					else if (command === "remove" && args[0])
+						console.log(JSON.stringify(await client.request("monitor.remove", { monitorId: args[0] })));
 					else if (command === "test" && args[0]) {
 						let eventType: string | undefined;
 						let payload: unknown = {};
@@ -240,7 +242,7 @@ export async function main(args = process.argv.slice(2)): Promise<void> {
 						);
 					} else
 						throw new Error(
-							"usage: gajaeway monitors add --json '<MonitorSpec json>'|list|inspect <id>|test <id> [--type T] [--payload J]",
+							"usage: gajaeway monitors add --json '<MonitorSpec json>'|list|inspect <id>|remove <id>|test <id> [--type T] [--payload J]",
 						);
 				} finally {
 					await client.close();
