@@ -209,6 +209,11 @@ function createRuntime(options: GatewayServerOptions): Runtime {
 				if (connection.negotiated)
 					connection.write({ v: PROFILE_VERSION, type: "event", event: "monitor.event", payload });
 		},
+		deliver: (payload) => {
+			for (const connection of connections)
+				if (connection.negotiated)
+					connection.write({ v: PROFILE_VERSION, type: "event", event: "chat.message", payload });
+		},
 	});
 	const monitorRuntime = new MonitorRuntime(options.config, registry, monitors);
 	const reconcileTimer = setInterval(() => void monitors.reconcile(), 60_000);

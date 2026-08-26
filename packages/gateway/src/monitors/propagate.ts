@@ -1,5 +1,6 @@
 import {
 	CATCH_ALL_EVENT_ORIGIN,
+	type ChatMessagePayload,
 	eventTypeOrigin,
 	type MonitorEventRecord,
 	type OriginRef,
@@ -27,6 +28,7 @@ export class MonitorPropagator {
 	readonly #delivery: DeliveryService;
 	readonly #emit: (event: MonitorEventRecord) => void;
 	readonly #ownerTarget: { readonly origin: OriginRef } | undefined;
+	readonly #deliver: ((payload: ChatMessagePayload) => void) | undefined;
 	#batches = new Map<string, { eventIds: string[]; timer: ReturnType<typeof setTimeout> }>();
 	constructor(options: {
 		database: GatewayDatabase;
@@ -37,6 +39,8 @@ export class MonitorPropagator {
 		emit: (event: MonitorEventRecord) => void;
 		/** Default recipient for monitors without their own channel target. */
 		ownerTarget?: { readonly origin: OriginRef };
+		/** Broadcasts a prepared chat.message to live adapter connections. */
+		deliver?: (payload: ChatMessagePayload) => void;
 	}) {
 		this.#database = options.database;
 		this.#registry = options.registry;
@@ -45,6 +49,7 @@ export class MonitorPropagator {
 		this.#delivery = options.delivery;
 		this.#emit = options.emit;
 		this.#ownerTarget = options.ownerTarget;
+		this.#deliver = options.deliver;
 	}
 	submit(monitorId: string, eventType: string, payload: unknown): string {
 		const monitor = this.#registry.get(monitorId);
@@ -151,7 +156,13 @@ export class MonitorPropagator {
 						.map((entry) => entry.note)
 						.join("\n"),
 				);
-				if (delivery) this.#delivery.markInflight(delivery.deliveryId as string);
+				if (delivery) {
+					this.#delivery.markInflight(delivery.deliveryId as string);
+					// Push to live adapters NOW: without this the note sat in the ledger
+					// until the next adapter reconnect flushed redeliveries (live finding:
+					// owner-DM canonicalize note stuck inflight for minutes).
+					this.#deliver?.(delivery);
+				}
 			}
 		} catch {
 			this.#database.withTransaction(() => {

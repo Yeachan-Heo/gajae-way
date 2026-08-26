@@ -147,6 +147,7 @@ test("a monitor without its own channel target reports authored notes to the own
 		eventTypes: ["memory.canonicalize"],
 	});
 	const delivery = new DeliveryService(new DeliveryLedger(database));
+	const pushed: unknown[] = [];
 	const pipeline = new MonitorPropagator({
 		database,
 		registry,
@@ -163,6 +164,7 @@ test("a monitor without its own channel target reports authored notes to the own
 		memory: { enqueue: () => {} } as never,
 		delivery,
 		emit: () => {},
+		deliver: (payload: unknown) => void pushed.push(payload),
 		ownerTarget: {
 			origin: { platform: "discord", kind: "dm", conversationId: "owner-dm", peerId: "owner" },
 		},
@@ -177,5 +179,8 @@ test("a monitor without its own channel target reports authored notes to the own
 	expect(undelivered).toHaveLength(1);
 	expect(undelivered[0]?.origin).toMatchObject({ platform: "discord", kind: "dm", conversationId: "owner-dm" });
 	expect(undelivered[0]?.text).toBe("owner-target note");
+	// The note is pushed to live adapters immediately, not just parked in the ledger.
+	expect(pushed).toHaveLength(1);
+	expect((pushed[0] as { text: string }).text).toBe("owner-target note");
 	database.close();
 });
