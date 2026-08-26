@@ -1,4 +1,10 @@
-import { CATCH_ALL_EVENT_ORIGIN, eventTypeOrigin, type MonitorEventRecord, originKey } from "@gajaeway/protocol";
+import {
+	CATCH_ALL_EVENT_ORIGIN,
+	eventTypeOrigin,
+	type MonitorEventRecord,
+	type OriginRef,
+	originKey,
+} from "@gajaeway/protocol";
 import type { DeliveryService } from "../delivery/delivery";
 import type { MemoryClosureQueue } from "../memory/closure";
 import type { GjcPort } from "../orchestrator/gjc-client";
@@ -20,6 +26,7 @@ export class MonitorPropagator {
 	readonly #memory: MemoryClosureQueue;
 	readonly #delivery: DeliveryService;
 	readonly #emit: (event: MonitorEventRecord) => void;
+	readonly #ownerTarget: { readonly origin: OriginRef } | undefined;
 	#batches = new Map<string, { eventIds: string[]; timer: ReturnType<typeof setTimeout> }>();
 	constructor(options: {
 		database: GatewayDatabase;
@@ -28,6 +35,8 @@ export class MonitorPropagator {
 		memory: MemoryClosureQueue;
 		delivery: DeliveryService;
 		emit: (event: MonitorEventRecord) => void;
+		/** Default recipient for monitors without their own channel target. */
+		ownerTarget?: { readonly origin: OriginRef };
 	}) {
 		this.#database = options.database;
 		this.#registry = options.registry;
@@ -35,6 +44,7 @@ export class MonitorPropagator {
 		this.#memory = options.memory;
 		this.#delivery = options.delivery;
 		this.#emit = options.emit;
+		this.#ownerTarget = options.ownerTarget;
 	}
 	submit(monitorId: string, eventType: string, payload: unknown): string {
 		const monitor = this.#registry.get(monitorId);
@@ -125,10 +135,14 @@ export class MonitorPropagator {
 			for (const entry of authored)
 				if (typeof entry.eventId === "string" && eventIds.includes(entry.eventId) && typeof entry.note === "string")
 					this.#author(entry.eventId, entry.note);
-			if (monitor.channelTarget) {
+			// A monitor without its own channel target reports to the configured owner
+			// target when one exists: a personal agent's maintenance and event notes go
+			// to the owner by default rather than vanishing into the logs.
+			const target = monitor.channelTarget ?? this.#ownerTarget;
+			if (target) {
 				const delivery = this.#delivery.prepare(
 					batchId,
-					monitor.channelTarget.origin,
+					target.origin,
 					authored
 						.filter(
 							(entry): entry is { eventId: string; note: string } =>

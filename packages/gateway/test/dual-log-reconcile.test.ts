@@ -127,3 +127,55 @@ test("reconcile replays same-millisecond events oldest-first", async () => {
 		await rm(directory, { recursive: true, force: true });
 	}
 });
+
+test("a monitor without its own channel target reports authored notes to the ownerTarget", async () => {
+	const { mkdtemp } = await import("node:fs/promises");
+	const { tmpdir } = await import("node:os");
+	const { join } = await import("node:path");
+	const { GatewayDatabase } = await import("../src/store/db");
+	const { MonitorRegistry } = await import("../src/monitors/registry");
+	const { MonitorPropagator } = await import("../src/monitors/propagate");
+	const { MemoryClosureQueue } = await import("../src/memory/closure");
+	const { DeliveryService } = await import("../src/delivery/delivery");
+	const { DeliveryLedger } = await import("../src/store/ledger");
+	const directory = await mkdtemp(join(tmpdir(), "gajaeway-ownertarget-"));
+	const database = await GatewayDatabase.open(join(directory, "gateway.db"));
+	const registry = new MonitorRegistry(database);
+	const monitor = registry.add({
+		name: "targetless",
+		trigger: { kind: "cron", schedule: "* * * * *" },
+		eventTypes: ["memory.canonicalize"],
+	});
+	const delivery = new DeliveryService(new DeliveryLedger(database));
+	const pipeline = new MonitorPropagator({
+		database,
+		registry,
+		gjc: {
+			ensureSession: async () => ({ sessionId: "s" }),
+			sendTurn: async (_id: string, prompt: string) =>
+				JSON.stringify(
+					(JSON.parse(prompt.match(/\[.*\]$/s)?.[0] ?? "[]") as Array<{ eventId: string }>).map(({ eventId }) => ({
+						eventId,
+						note: "owner-target note",
+					})),
+				),
+		},
+		memory: { enqueue: () => {} } as never,
+		delivery,
+		emit: () => {},
+		ownerTarget: {
+			origin: { platform: "discord", kind: "dm", conversationId: "owner-dm", peerId: "owner" },
+		},
+	});
+	pipeline.submit(monitor.monitorId, "memory.canonicalize", { source: "test" });
+	let undelivered: ReturnType<typeof delivery.redeliveries> = [];
+	for (let attempt = 0; attempt < 400; attempt++) {
+		undelivered = delivery.redeliveries();
+		if (undelivered.length > 0) break;
+		await Bun.sleep(5);
+	}
+	expect(undelivered).toHaveLength(1);
+	expect(undelivered[0]?.origin).toMatchObject({ platform: "discord", kind: "dm", conversationId: "owner-dm" });
+	expect(undelivered[0]?.text).toBe("owner-target note");
+	database.close();
+});
