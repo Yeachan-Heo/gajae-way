@@ -1,13 +1,17 @@
 import { describe, expect, test } from "bun:test";
 import type { CliResult, ControllerOptions } from "../src/cli";
+import { GjcCliError } from "../src/cli";
 import {
 	assertValidOpRef,
 	classifyState,
+	isOpRefRejection,
 	MAX_OP_REF_LENGTH,
 	newOpRef,
 	OpRefError,
 	OpRefLedger,
+	OpRefRejectedError,
 	pollStatus,
+	reconcileOrSend,
 	type SendReceipt,
 	sendPrompt,
 } from "../src/send";
@@ -204,5 +208,93 @@ describe("pollStatus", () => {
 	test("an absent state is not treated as done", async () => {
 		const outcome = await pollStatus(controller({}), receipt);
 		expect(outcome).toMatchObject({ state: "unknown", terminal: false });
+	});
+});
+
+describe("op-ref rejection", () => {
+	test("a duplicate clientRef surfaces as OpRefRejectedError, not a generic CLI failure", async () => {
+		const options: ControllerOptions = {
+			repo: WORKTREE,
+			run: async () => ({
+				exitCode: 0,
+				stdout: JSON.stringify({
+					ok: false,
+					error: { code: "client_ref_duplicate", message: "clientRef already used" },
+				}),
+				stderr: "",
+			}),
+		};
+		await expect(
+			sendPrompt(options, { sessionId: SESSION, text: "x", taskKey: "pr-a", opRef: "gw-pr-a-1" }),
+		).rejects.toBeInstanceOf(OpRefRejectedError);
+	});
+
+	test("the rejection tells the caller to reconcile rather than remint", async () => {
+		const error = new OpRefRejectedError("gw-pr-a-1", null);
+		expect(error.message).toMatch(/reconcile it with status/);
+	});
+
+	test("an unrelated CLI failure is not misread as an op-ref rejection", async () => {
+		const options: ControllerOptions = {
+			repo: WORKTREE,
+			run: async () => ({
+				exitCode: 0,
+				stdout: JSON.stringify({ ok: false, error: { code: "broker_down" } }),
+				stderr: "",
+			}),
+		};
+		await expect(sendPrompt(options, { sessionId: SESSION, text: "x", taskKey: "pr-a" })).rejects.not.toBeInstanceOf(
+			OpRefRejectedError,
+		);
+	});
+
+	test("isOpRefRejection needs both an op-ref subject and a duplication verb", () => {
+		expect(isOpRefRejection(new GjcCliError("clientRef already used", 0, ""))).toBe(true);
+		expect(isOpRefRejection(new GjcCliError("session already deleted", 0, ""))).toBe(false);
+		expect(isOpRefRejection(new Error("clientRef already used"))).toBe(false);
+	});
+});
+
+describe("reconcileOrSend", () => {
+	const stored: SendReceipt = {
+		sessionId: SESSION,
+		operationRef: "gw-pr-a-01hq",
+		acceptedAt: new Date(0).toISOString(),
+		taskKey: "pr-a",
+	};
+
+	test("resumes a stored receipt instead of resending after a restart", async () => {
+		const calls: string[][] = [];
+		const options = controller({ state: "running" }, calls);
+		const result = await reconcileOrSend(options, {
+			sessionId: SESSION,
+			text: "x",
+			taskKey: "pr-a",
+			existing: stored,
+		});
+		expect(result.kind).toBe("resumed");
+		expect(calls[0]?.[2]).toBe("status");
+		expect(calls.flat()).not.toContain("send");
+	});
+
+	test("does not resend even when the stored op already finished", async () => {
+		const calls: string[][] = [];
+		const options = controller({ state: "completed" }, calls);
+		const result = await reconcileOrSend(options, {
+			sessionId: SESSION,
+			text: "x",
+			taskKey: "pr-a",
+			existing: stored,
+		});
+		expect(result).toMatchObject({ kind: "resumed", outcome: { terminal: true } });
+		expect(calls).toHaveLength(1);
+	});
+
+	test("sends only when there is no prior record", async () => {
+		const calls: string[][] = [];
+		const options = controller({ commandId: "c" }, calls);
+		const result = await reconcileOrSend(options, { sessionId: SESSION, text: "x", taskKey: "pr-a" });
+		expect(result.kind).toBe("sent");
+		expect(calls[0]?.[2]).toBe("send");
 	});
 });

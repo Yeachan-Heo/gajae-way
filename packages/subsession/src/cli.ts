@@ -36,11 +36,15 @@ export class GjcCliError extends Error {
 	readonly exitCode: number;
 	readonly stderr: string;
 
-	constructor(message: string, exitCode: number, stderr: string) {
+	/** The `error` payload from an `ok: false` envelope, when there was one. */
+	readonly details: unknown;
+
+	constructor(message: string, exitCode: number, stderr: string, details: unknown = undefined) {
 		super(message);
 		this.name = "GjcCliError";
 		this.exitCode = exitCode;
 		this.stderr = stderr;
+		this.details = details;
 	}
 }
 
@@ -65,7 +69,12 @@ export function parseEnvelope<T>(result: CliResult, command: string): T {
 	}
 	const envelope = body as { ok?: unknown; result?: unknown; error?: unknown };
 	if (envelope.ok !== true) {
-		throw new GjcCliError(`gjc sdk ${command} reported failure: ${JSON.stringify(envelope.error ?? null)}`, 0, "");
+		throw new GjcCliError(
+			`gjc sdk ${command} reported failure: ${JSON.stringify(envelope.error ?? null)}`,
+			0,
+			"",
+			envelope.error,
+		);
 	}
 	return envelope.result as T;
 }

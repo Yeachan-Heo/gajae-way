@@ -14,7 +14,7 @@
  */
 
 import type { ControllerOptions } from "./cli";
-import { parseEnvelope } from "./cli";
+import { GjcCliError, parseEnvelope } from "./cli";
 
 export const MAX_OP_REF_LENGTH = 128;
 
@@ -146,7 +146,15 @@ export async function sendPrompt(options: ControllerOptions, input: SendPromptIn
 	const raw = await options.run(args, {
 		...(input.waitTimeoutMs === undefined ? {} : { timeoutMs: input.waitTimeoutMs + 5_000 }),
 	});
-	const payload = parseEnvelope<{ commandId?: unknown; turnId?: unknown; sessionId?: unknown }>(raw, "session send");
+	let payload: { commandId?: unknown; turnId?: unknown; sessionId?: unknown };
+	try {
+		payload = parseEnvelope(raw, "session send");
+	} catch (error) {
+		if (isOpRefRejection(error)) {
+			throw new OpRefRejectedError(opRef, error instanceof GjcCliError ? error.details : undefined);
+		}
+		throw error;
+	}
 
 	const now = input.now ?? (() => new Date());
 	return {
@@ -157,6 +165,37 @@ export async function sendPrompt(options: ControllerOptions, input: SendPromptIn
 		acceptedAt: now().toISOString(),
 		taskKey: input.taskKey,
 	};
+}
+
+/**
+ * A resend of an already-used op-ref is REJECTED, not replayed.
+ *
+ * `turn.prompt` is ordered and non-idempotent, so the runtime refuses a
+ * duplicate `clientRef` instead of returning the earlier result. The correct
+ * recovery is to reconcile the existing record via `status` - never to mint a
+ * fresh ref for the same logical prompt, which would run the work twice.
+ */
+export class OpRefRejectedError extends Error {
+	readonly opRef: string;
+	readonly details: unknown;
+
+	constructor(opRef: string, details: unknown) {
+		super(`op-ref ${opRef} was rejected as already used; reconcile it with status instead of resending or reminting`);
+		this.name = "OpRefRejectedError";
+		this.opRef = opRef;
+		this.details = details;
+	}
+}
+
+const REJECTION_SUBJECT = /(client_?ref|op[-_]?ref)/i;
+const REJECTION_VERB = /(duplicate|already|exists|reused|conflict|in[-_ ]?use)/i;
+
+export function isOpRefRejection(error: unknown): boolean {
+	if (!(error instanceof GjcCliError)) {
+		return false;
+	}
+	const text = `${error.message} ${JSON.stringify(error.details ?? "")}`;
+	return REJECTION_SUBJECT.test(text) && REJECTION_VERB.test(text);
 }
 
 export type PromptOutcome = {
@@ -206,4 +245,26 @@ export async function pollStatus(
 		(typeof payload.status === "string" && payload.status) ||
 		"unknown";
 	return { ...classifyState(state), state, receipt, raw: payload };
+}
+
+export type ReconcileResult =
+	| { readonly kind: "resumed"; readonly outcome: PromptOutcome }
+	| { readonly kind: "sent"; readonly receipt: SendReceipt };
+
+/**
+ * Restart-safe entry point for one logical prompt.
+ *
+ * With a stored receipt the runtime is asked first: a live turn is resumed, a
+ * terminal turn is reported, and neither path resends. Sending only happens when
+ * there is no prior record, which is what keeps an ordered non-idempotent
+ * `turn.prompt` from being executed twice after a controller restart.
+ */
+export async function reconcileOrSend(
+	options: ControllerOptions,
+	input: SendPromptInput & { readonly existing?: SendReceipt },
+): Promise<ReconcileResult> {
+	if (input.existing) {
+		return { kind: "resumed", outcome: await pollStatus(options, input.existing) };
+	}
+	return { kind: "sent", receipt: await sendPrompt(options, input) };
 }
