@@ -138,3 +138,56 @@ test("a failed platform turn still delivers a visible ledgered failure notice", 
 	expect(errorFrame.error.code).toBe("verb_failed");
 	client.close();
 });
+
+test("long turns broadcast throttled chat.progress liveness events", async () => {
+	directory = await mkdtemp(join(tmpdir(), "gajaeway-server-"));
+	const config: GatewayConfig = {
+		schemaVersion: 1,
+		home: directory,
+		configPath: join(directory, "config.json"),
+		socketPath: join(directory, "gateway.sock"),
+		dbPath: join(directory, "gateway.db"),
+		logVerbosity: "info",
+	};
+	const database = await GatewayDatabase.open(config.dbPath);
+	const gjc: GjcPort = {
+		ensureSession: async () => ({ sessionId: "mock-session" }),
+		sendTurn: async (_session, _text, _preamble, onProgress) => {
+			for (let call = 1; call <= 3; call++) {
+				await Bun.sleep(5);
+				onProgress?.({ toolCalls: call });
+			}
+			return "done";
+		},
+	};
+	server = await startUnixServer({
+		config,
+		database,
+		gjc,
+		progress: { firstAfterMs: 0, intervalMs: 0 },
+		onStop: () => database.close(),
+	});
+	const client = await connect(config.socketPath);
+	client.send({ v: "0.1", type: "hello", payload: { supportedVersions: ["0.1"] } });
+	await waitFor(client.frames, 1);
+	client.send({
+		v: "0.1",
+		type: "request",
+		id: "dm",
+		verb: "chat.send",
+		params: {
+			origin: { platform: "discord", kind: "dm", conversationId: "c1", peerId: "p1" },
+			text: "hello",
+			engagement: { mentioned: false, group: false, authorId: "p1" },
+		},
+	});
+	await waitFor(client.frames, 5);
+	const progress = client.frames.filter((frame) => frame.type === "event" && frame.event === "chat.progress");
+	expect(progress.length).toBeGreaterThanOrEqual(2);
+	expect(progress[0].payload.origin.conversationId).toBe("c1");
+	expect(progress[0].payload.toolCalls).toBeGreaterThanOrEqual(1);
+	expect(progress[0].payload.elapsedMs).toBeGreaterThanOrEqual(0);
+	const reply = client.frames.find((frame) => frame.type === "event" && frame.event === "chat.message");
+	expect(reply.payload.text).toBe("done");
+	client.close();
+});

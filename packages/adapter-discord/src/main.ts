@@ -1,4 +1,4 @@
-import type { ChatMessagePayload, EngagementContext, OriginRef } from "@gajaeway/protocol";
+import type { ChatMessagePayload, ChatProgressPayload, EngagementContext, OriginRef } from "@gajaeway/protocol";
 import { GajaewayClient } from "@gajaeway/sdk";
 import { Client, GatewayIntentBits } from "discord.js";
 import { type LoadedDiscordAdapterConfig, loadDiscordAdapterConfig } from "./config";
@@ -19,6 +19,7 @@ const REQUIRED_INTENTS = [
 export interface GatewayClientLike {
 	request<T = unknown>(verb: string, params?: unknown): Promise<T>;
 	onChatMessage(handler: (message: ChatMessagePayload) => void): () => void;
+	onChatProgress?(handler: (progress: ChatProgressPayload) => void): () => void;
 	close?(): Promise<void>;
 }
 
@@ -175,11 +176,93 @@ export class TypingIndicator implements TypingPort {
 	}
 }
 
+/** A Discord message the adapter posted and can amend or remove; duck-typed from channel.send(). */
+interface EditableDiscordMessage {
+	edit(text: string): Promise<unknown>;
+	delete(): Promise<unknown>;
+}
+
+function isEditableMessage(value: unknown): value is EditableDiscordMessage {
+	return (
+		typeof value === "object" &&
+		value !== null &&
+		"edit" in value &&
+		typeof (value as EditableDiscordMessage).edit === "function" &&
+		"delete" in value &&
+		typeof (value as EditableDiscordMessage).delete === "function"
+	);
+}
+
+function formatElapsed(elapsedMs: number): string {
+	const total = Math.floor(elapsedMs / 1000);
+	const minutes = Math.floor(total / 60);
+	const seconds = total % 60;
+	return minutes > 0 ? `${minutes}m ${String(seconds).padStart(2, "0")}s` : `${seconds}s`;
+}
+
+/**
+ * Renders a long-running turn as one temporary, amended status message per
+ * conversation ("working… (2m 05s, 3 tools)") driven by gateway chat.progress
+ * events, and removes it when the real reply is delivered. Best-effort only:
+ * status failures never compete with delivery.
+ */
+export class WorkingStatus {
+	readonly #discord: DiscordClientLike;
+	readonly #log: Pick<Console, "error">;
+	readonly #messages = new Map<string, EditableDiscordMessage | "pending">();
+
+	constructor(discord: DiscordClientLike, log: Pick<Console, "error"> = console) {
+		this.#discord = discord;
+		this.#log = log;
+	}
+
+	async update(progress: ChatProgressPayload): Promise<void> {
+		if (progress.origin.platform !== "discord") return;
+		const conversationId = progress.origin.conversationId;
+		const text = `⏳ working… (${formatElapsed(progress.elapsedMs)}, ${progress.toolCalls} tool${progress.toolCalls === 1 ? "" : "s"})`;
+		const existing = this.#messages.get(conversationId);
+		if (existing === "pending") return; // a send is already in flight; next tick edits
+		try {
+			if (existing) {
+				await existing.edit(text);
+				return;
+			}
+			this.#messages.set(conversationId, "pending");
+			const channel = await this.#discord.channels.fetch(conversationId);
+			if (!isDiscordTextChannel(channel)) {
+				this.#messages.delete(conversationId);
+				return;
+			}
+			const posted = await channel.send(text);
+			if (isEditableMessage(posted) && this.#messages.get(conversationId) === "pending")
+				this.#messages.set(conversationId, posted);
+			else this.#messages.delete(conversationId);
+		} catch (error) {
+			this.#messages.delete(conversationId);
+			this.#log.error(
+				`Discord working status failed for ${conversationId}: ${error instanceof Error ? error.message : String(error)}`,
+			);
+		}
+	}
+
+	async clear(conversationId: string): Promise<void> {
+		const existing = this.#messages.get(conversationId);
+		this.#messages.delete(conversationId);
+		if (!existing || existing === "pending") return;
+		try {
+			await existing.delete();
+		} catch {
+			// the status message may already be gone; cosmetic either way
+		}
+	}
+}
+
 export async function settleDiscordDelivery(
 	gateway: Pick<GatewayClientLike, "request">,
 	discord: DiscordClientLike,
 	message: ChatMessagePayload,
 	typing?: TypingPort,
+	status?: WorkingStatus,
 ): Promise<void> {
 	if (message.origin.platform !== "discord" || !message.deliveryId) return;
 	const deliveryId = message.deliveryId;
@@ -200,6 +283,7 @@ export async function settleDiscordDelivery(
 			ambiguous: deliveryFailureIsAmbiguous(error),
 		});
 	} finally {
+		await status?.clear(message.origin.conversationId);
 		typing?.end(message.origin.conversationId);
 	}
 }
@@ -208,10 +292,11 @@ export function subscribeDiscordDeliveries(
 	gateway: GatewayClientLike,
 	discord: DiscordClientLike,
 	typing?: TypingPort,
+	status?: WorkingStatus,
 	log: Pick<Console, "error"> = console,
 ): () => void {
 	return gateway.onChatMessage((message) => {
-		void settleDiscordDelivery(gateway, discord, message, typing).catch((error) =>
+		void settleDiscordDelivery(gateway, discord, message, typing, status).catch((error) =>
 			log.error(
 				`Discord delivery settlement request failed: ${error instanceof Error ? error.message : String(error)}`,
 			),
@@ -219,10 +304,32 @@ export function subscribeDiscordDeliveries(
 	});
 }
 
+export function subscribeDiscordProgress(
+	gateway: GatewayClientLike,
+	status: WorkingStatus,
+	log: Pick<Console, "error"> = console,
+): () => void {
+	if (!gateway.onChatProgress) return () => {};
+	return gateway.onChatProgress((progress) => {
+		void status
+			.update(progress)
+			.catch((error) =>
+				log.error(`Discord working status update failed: ${error instanceof Error ? error.message : String(error)}`),
+			);
+	});
+}
+
 export async function startDiscordAdapter(config: LoadedDiscordAdapterConfig): Promise<void> {
 	const discord = new Client({ intents: [...new Set([...REQUIRED_INTENTS, ...(config.intents ?? [])])] });
 	const typing = new TypingIndicator(discord);
-	const gateway = new ReconnectingGateway(config.gatewaySocket ?? defaultGatewaySocket(), discord, config, typing);
+	const status = new WorkingStatus(discord);
+	const gateway = new ReconnectingGateway(
+		config.gatewaySocket ?? defaultGatewaySocket(),
+		discord,
+		config,
+		typing,
+		status,
+	);
 	discord.on("messageCreate", (message) => {
 		const engagement = decideInbound(message, discord.user, config.channels);
 		if (!engagement) return;
@@ -239,6 +346,7 @@ class ReconnectingGateway {
 	#reconnecting = false;
 	#attempt = 0;
 	#deliveryOff: (() => void) | undefined;
+	#progressOff: (() => void) | undefined;
 	readonly #inbound = new LruSet();
 
 	constructor(
@@ -246,6 +354,7 @@ class ReconnectingGateway {
 		readonly discord: DiscordClientLike,
 		readonly config: LoadedDiscordAdapterConfig,
 		readonly typing?: TypingPort,
+		readonly status?: WorkingStatus,
 	) {}
 
 	async connect(): Promise<void> {
@@ -254,7 +363,9 @@ class ReconnectingGateway {
 			this.#client = client;
 			this.#attempt = 0;
 			this.#deliveryOff?.();
-			this.#deliveryOff = subscribeDiscordDeliveries(client, this.discord, this.typing);
+			this.#deliveryOff = subscribeDiscordDeliveries(client, this.discord, this.typing, this.status);
+			this.#progressOff?.();
+			this.#progressOff = this.status ? subscribeDiscordProgress(client, this.status) : undefined;
 			console.log("Discord adapter connected to gateway.");
 			this.monitor(client);
 		} catch {

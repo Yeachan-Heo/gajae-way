@@ -1,6 +1,7 @@
 import type { ChatSendResult, GatewayStatusResult } from "@gajaeway/protocol";
 import {
 	type ChatMessagePayload,
+	type ChatProgressPayload,
 	encodeFrame,
 	type Frame,
 	FrameDecoder,
@@ -107,6 +108,10 @@ export class GajaewayClient {
 
 	onChatMessage(handler: (message: ChatMessagePayload) => void): () => void {
 		return this.on("chat.message", (payload) => handler(payload as ChatMessagePayload));
+	}
+
+	onChatProgress(handler: (progress: ChatProgressPayload) => void): () => void {
+		return this.on("chat.progress", (payload) => handler(payload as ChatProgressPayload));
 	}
 
 	async request<T = unknown>(verb: string, params?: unknown): Promise<T> {

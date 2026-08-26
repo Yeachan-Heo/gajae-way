@@ -1,8 +1,57 @@
 import type { GatewayDatabase } from "../store/db";
 
+export interface TurnProgress {
+	/** Tool executions the turn has started so far. */
+	readonly toolCalls: number;
+}
+
 export interface GjcPort {
 	ensureSession(originKey: string, epoch?: number): Promise<{ sessionId: string }>;
-	sendTurn(sessionId: string, text: string, systemPreamble?: string): Promise<string>;
+	sendTurn(
+		sessionId: string,
+		text: string,
+		systemPreamble?: string,
+		onProgress?: (progress: TurnProgress) => void,
+	): Promise<string>;
+}
+
+/**
+ * Incremental parser for the `gjc -p --mode json` ndjson event stream.
+ * Tracks tool executions and captures the final assistant text.
+ */
+export class GjcTurnStream {
+	#buffer = "";
+	toolCalls = 0;
+	finalText: string | undefined;
+
+	feed(chunk: string): void {
+		this.#buffer += chunk;
+		let index = this.#buffer.indexOf("\n");
+		while (index !== -1) {
+			const line = this.#buffer.slice(0, index).trim();
+			this.#buffer = this.#buffer.slice(index + 1);
+			if (line) this.#line(line);
+			index = this.#buffer.indexOf("\n");
+		}
+	}
+
+	#line(line: string): void {
+		let event: { type?: string; message?: { role?: string; content?: Array<{ type?: string; text?: string }> } };
+		try {
+			event = JSON.parse(line) as typeof event;
+		} catch {
+			return; // non-JSON noise line
+		}
+		if (event.type === "tool_execution_start") this.toolCalls++;
+		if ((event.type === "message_end" || event.type === "turn_end") && event.message?.role === "assistant") {
+			const text = (event.message.content ?? [])
+				.filter((part) => part.type === "text" && typeof part.text === "string")
+				.map((part) => part.text)
+				.join("\n")
+				.trim();
+			if (text) this.finalText = text;
+		}
+	}
 }
 
 /**
@@ -81,7 +130,12 @@ export class GjcClient implements GjcPort {
 		return { sessionId };
 	}
 
-	async sendTurn(sessionId: string, text: string, systemPreamble?: string): Promise<string> {
+	async sendTurn(
+		sessionId: string,
+		text: string,
+		systemPreamble?: string,
+		onProgress?: (progress: TurnProgress) => void,
+	): Promise<string> {
 		if (typeof text !== "string" || text.length === 0) {
 			throw new Error("turn text must be non-empty");
 		}
@@ -89,6 +143,7 @@ export class GjcClient implements GjcPort {
 			await Bun.sleep(50);
 			if (process.env.GAJAEWAY_TEST_STUB_CAPTURE)
 				await Bun.write(process.env.GAJAEWAY_TEST_STUB_CAPTURE, systemPreamble ?? "");
+			onProgress?.({ toolCalls: 0 });
 			return process.env.GAJAEWAY_TEST_STUB_REPLY ?? "stub reply";
 		}
 		const child = Bun.spawn({
@@ -97,6 +152,8 @@ export class GjcClient implements GjcPort {
 				"--resume",
 				sessionId,
 				"-p",
+				"--mode",
+				"json",
 				...(systemPreamble ? ["--append-system-prompt", systemPreamble] : []),
 				text,
 			],
@@ -106,9 +163,38 @@ export class GjcClient implements GjcPort {
 			stderr: "pipe",
 			env: process.env as Record<string, string>,
 		});
-		const [stdout, stderr, exitCode] = await this.#bounded(child, "turn");
-		if (exitCode !== 0) throw new Error(`gjc turn exited ${exitCode}: ${stderr.trim()}`);
-		return stdout.trim();
+		// The ceiling is an INACTIVITY ceiling, not a wall-clock one: a turn that is
+		// visibly working (streaming events, running tools) is never killed, while a
+		// hung child that goes silent for turnTimeoutMs is reaped (owner directive:
+		// long agentic work must not die mid-flight; liveness is reported instead).
+		const stream = new GjcTurnStream();
+		let lastActivity = Date.now();
+		let killedForInactivity = false;
+		const watchdog = setInterval(() => {
+			if (Date.now() - lastActivity > this.#timeoutMs) {
+				killedForInactivity = true;
+				child.kill();
+			}
+		}, 1_000);
+		try {
+			const reader = (child.stdout as ReadableStream<Uint8Array>).getReader();
+			const decoder = new TextDecoder();
+			const stderrPromise = new Response(child.stderr as ReadableStream).text();
+			for (;;) {
+				const { done, value } = await reader.read();
+				if (done) break;
+				lastActivity = Date.now();
+				stream.feed(decoder.decode(value, { stream: true }));
+				if (onProgress) onProgress({ toolCalls: stream.toolCalls });
+			}
+			const [stderr, exitCode] = await Promise.all([stderrPromise, child.exited]);
+			if (killedForInactivity) throw new Error(`gjc turn made no progress for ${this.#timeoutMs}ms and was reaped`);
+			if (exitCode !== 0) throw new Error(`gjc turn exited ${exitCode}: ${stderr.trim()}`);
+			if (stream.finalText === undefined) throw new Error("gjc turn stream produced no assistant text");
+			return stream.finalText;
+		} finally {
+			clearInterval(watchdog);
+		}
 	}
 
 	async #bounded(child: ReturnType<typeof Bun.spawn>, label: string): Promise<[string, string, number]> {

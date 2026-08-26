@@ -38,6 +38,16 @@ export interface ChatSendParams {
 	readonly engagement?: EngagementContext;
 }
 
+/** Periodic liveness for a long-running turn: the persona is working, not gone. */
+export interface ChatProgressPayload {
+	readonly turnId: string;
+	readonly origin: OriginRef;
+	/** Wall-clock milliseconds since the turn was accepted. */
+	readonly elapsedMs: number;
+	/** Tool executions the turn has started so far. */
+	readonly toolCalls: number;
+}
+
 export interface ChatSendResult {
 	/**
 	 * Gateway-assigned turn id, or null when engagement policy declined the
@@ -219,6 +229,7 @@ export interface VerbCatalogV01 {
 /** Event catalog: event name -> payload. */
 export interface EventCatalogV01 {
 	"chat.message": ChatMessagePayload;
+	"chat.progress": ChatProgressPayload;
 	"gateway.stopping": { readonly reason: string };
 	"monitor.event": MonitorEventRecord;
 }
@@ -241,7 +252,7 @@ export const VERBS_V01 = [
 	"ops.backup",
 	"ops.integrity",
 ] as const;
-export const EVENTS_V01 = ["chat.message", "gateway.stopping", "monitor.event"] as const;
+export const EVENTS_V01 = ["chat.message", "chat.progress", "gateway.stopping", "monitor.event"] as const;
 
 export type VerbName = keyof VerbCatalogV01;
 export type EventName = keyof EventCatalogV01;

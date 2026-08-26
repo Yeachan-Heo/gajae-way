@@ -13,6 +13,7 @@ import {
 	settleDiscordDelivery,
 	subscribeDiscordDeliveries,
 	TypingIndicator,
+	WorkingStatus,
 } from "../src/main";
 import { discordMessageOrigin } from "../src/origin";
 
@@ -200,3 +201,50 @@ function mockGateway(requests: Array<{ verb: string; params: unknown }>): Gatewa
 		onChatMessage: () => () => {},
 	};
 }
+
+test("working status posts one amended message per conversation and clears on delivery", async () => {
+	const sent: string[] = [];
+	const edits: string[] = [];
+	let deleted = 0;
+	const statusMessage = {
+		edit: async (text: string) => void edits.push(text),
+		delete: async () => void deleted++,
+	};
+	const discord: DiscordClientLike = {
+		channels: {
+			fetch: async () => ({ send: async (text: string) => (sent.push(text), statusMessage) }),
+		},
+	};
+	const status = new WorkingStatus(discord, { error: () => {} });
+	const origin = { platform: "discord", kind: "channel", conversationId: "channel-1" } as const;
+	await status.update({ turnId: "t", origin, elapsedMs: 16_000, toolCalls: 1 });
+	await status.update({ turnId: "t", origin, elapsedMs: 125_000, toolCalls: 3 });
+	expect(sent).toEqual(["⏳ working… (16s, 1 tool)"]);
+	expect(edits).toEqual(["⏳ working… (2m 05s, 3 tools)"]);
+	const requests: Array<{ verb: string; params: unknown }> = [];
+	await settleDiscordDelivery(mockGateway(requests), discord, delivery("real reply"), undefined, status);
+	expect(deleted).toBe(1);
+	// A later delivery without a live status message is a no-op.
+	await settleDiscordDelivery(mockGateway(requests), discord, delivery("again"), undefined, status);
+	expect(deleted).toBe(1);
+});
+
+test("working status ignores non-discord progress and survives channel failures", async () => {
+	const failing: DiscordClientLike = {
+		channels: { fetch: async () => { throw new Error("network down"); } },
+	};
+	const status = new WorkingStatus(failing, { error: () => {} });
+	await status.update({
+		turnId: "t",
+		origin: { platform: "telegram", kind: "channel", conversationId: "tg" },
+		elapsedMs: 20_000,
+		toolCalls: 1,
+	});
+	await status.update({
+		turnId: "t",
+		origin: { platform: "discord", kind: "channel", conversationId: "c" },
+		elapsedMs: 20_000,
+		toolCalls: 1,
+	});
+	await status.clear("c"); // nothing posted; must not throw
+});

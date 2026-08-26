@@ -5,8 +5,8 @@ import {
 	type Frame,
 	FrameDecoder,
 	type HelloPayload,
-	LOOPBACK_ORIGIN,
 	isSilenceToken,
+	LOOPBACK_ORIGIN,
 	negotiate,
 	originKey,
 	PROFILE_VERSION,
@@ -48,6 +48,8 @@ export interface GatewayServerOptions {
 	readonly startedAt?: string;
 	readonly onStop?: () => void | Promise<void>;
 	readonly persona?: PersonaLoader;
+	/** Test seam for chat.progress throttling; production uses the 15s defaults. */
+	readonly progress?: { readonly firstAfterMs?: number; readonly intervalMs?: number };
 }
 interface InboundContext {
 	readonly turnId: string;
@@ -590,11 +592,25 @@ async function runInboundTurn(
 	const userText = row.body;
 	const nonLoopback = origin.platform !== "loopback";
 	let text: string;
+	// Long turns announce liveness instead of dying: throttled chat.progress events
+	// let adapters render a "working…" status while the persona runs tools.
+	const startedAt = Date.now();
+	const firstAfterMs = options.progress?.firstAfterMs ?? 15_000;
+	const intervalMs = options.progress?.intervalMs ?? 15_000;
+	let lastProgressAt = 0;
+	const emitProgress = (toolCalls: number) => {
+		const now = Date.now();
+		if (now - startedAt < firstAfterMs || now - lastProgressAt < intervalMs) return;
+		lastProgressAt = now;
+		const payload = { turnId, origin, elapsedMs: now - startedAt, toolCalls };
+		for (const recipient of runtime.connections)
+			if (recipient.negotiated) recipient.write({ v: PROFILE_VERSION, type: "event", event: "chat.progress", payload });
+	};
 	try {
 		const epoch = options.database.getSessionRecord(key)?.epoch ?? 0;
 		const { sessionId } = await options.gjc.ensureSession(key, epoch);
 		const preamble = `${await runtime.persona.systemPreamble()}\n\n${ACTION_GUARD_SYSTEM_NOTICE}`;
-		text = await options.gjc.sendTurn(sessionId, userText, preamble);
+		text = await options.gjc.sendTurn(sessionId, userText, preamble, (progress) => emitProgress(progress.toolCalls));
 	} catch (error) {
 		// Never ghost a platform conversation: a failed turn still produces a visible,
 		// ledgered notice (live P1 drill finding: timeouts looked like silent ignores).

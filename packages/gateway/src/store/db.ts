@@ -178,9 +178,7 @@ export class GatewayDatabase {
 				)
 				.get(originKey);
 			if (!row) return undefined;
-			this.#database
-				.query("UPDATE inbound_messages SET state = 'processing' WHERE message_id = ?")
-				.run(row.message_id);
+			this.#database.query("UPDATE inbound_messages SET state = 'processing' WHERE message_id = ?").run(row.message_id);
 			return row;
 		});
 	}

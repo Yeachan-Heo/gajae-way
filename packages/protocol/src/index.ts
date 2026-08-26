@@ -1,6 +1,7 @@
 export {
 	type BurstPolicyKind,
 	type ChatMessagePayload,
+	type ChatProgressPayload,
 	type ChatSendParams,
 	type ChatSendResult,
 	type DeliveryConfirmParams,
