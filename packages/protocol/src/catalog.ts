@@ -31,6 +31,8 @@ export interface EngagementContext {
 	readonly authorId: string;
 	/** Human-readable author name when the platform provides one. */
 	readonly authorName?: string;
+	/** Human-readable conversation label (channel/group name) when available. */
+	readonly channelLabel?: string;
 }
 
 export interface ChatSendParams {

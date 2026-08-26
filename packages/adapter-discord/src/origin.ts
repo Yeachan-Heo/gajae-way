@@ -9,6 +9,7 @@ export interface DiscordMessageOriginShape {
 		isDMBased?: () => boolean;
 		isThread?: () => boolean;
 		readonly type?: number | string;
+		readonly name?: string | null;
 	};
 }
 

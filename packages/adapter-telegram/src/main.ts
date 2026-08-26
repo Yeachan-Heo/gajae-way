@@ -165,6 +165,7 @@ export function engagementForMessage(
 		group: origin.kind !== "dm",
 		authorId: String(message.from?.id ?? ""),
 		...(authorName ? { authorName } : {}),
+		...(message.chat.title ? { channelLabel: message.chat.title } : {}),
 	};
 }
 

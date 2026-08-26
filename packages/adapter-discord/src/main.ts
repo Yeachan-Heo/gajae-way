@@ -75,6 +75,7 @@ export function engagementForMessage(message: DiscordInboundMessage, botUser: un
 		group: origin.kind !== "dm",
 		authorId: message.author.id,
 		...(message.author.username ? { authorName: message.author.username } : {}),
+		...(message.channel.name ? { channelLabel: `#${message.channel.name}` } : {}),
 	};
 }
 

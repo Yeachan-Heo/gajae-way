@@ -652,8 +652,11 @@ async function runInboundTurn(
 				group?: boolean;
 				authorId?: string;
 				authorName?: string;
+				channelLabel?: string;
 			})
 		: undefined;
+	const speaker = engagement?.authorName ?? engagement?.authorId;
+	const place = engagement?.channelLabel ?? `${origin.platform} ${origin.kind} ${origin.conversationId}`;
 	// Compose the turn: everything said in this conversation since the persona's
 	// last reply (the read-cursor diff), then the triggering message with speaker
 	// attribution — so the persona always reads "the messages above".
@@ -667,8 +670,7 @@ async function runInboundTurn(
 		const header = lines.length
 			? `[Unread messages in this conversation since your last reply]\n${lines.join("\n")}\n\n`
 			: "";
-		const speaker = engagement?.authorName ?? engagement?.authorId;
-		turnText = `${header}${speaker ? `[Current message from ${speaker}]\n` : ""}${userText}`;
+		turnText = `${header}${speaker ? `[${speaker} in ${place}]\n` : ""}${userText}`;
 		options.database.contextConsume([...unread.map((entry) => entry.message_id), row.message_id]);
 	}
 	let text: string;
@@ -747,13 +749,29 @@ async function runInboundTurn(
 		runtime.memory.enqueue({ kind: "daily_capture", originRefJson: JSON.stringify(origin), userText, replyText: text });
 		return;
 	}
-	const payload = runtime.delivery.prepare(turnId, origin, text);
-	if (!payload) return;
-	runtime.delivery.markInflight(payload.deliveryId as string);
-	for (const recipient of runtime.connections)
-		if (recipient.negotiated) recipient.write({ v: PROFILE_VERSION, type: "event", event: "chat.message", payload });
+	// Memory carries who spoke and where, so canonicalization keeps provenance.
+	const capturedUser = speaker ? `${speaker} @ ${place}: ${userText}` : userText;
+	// Human-sized chat: the persona may split one turn into several short messages
+	// with a line containing exactly [BREAK]; each part ships as its own delivery.
+	const parts = text
+		.split(/\n\s*\[BREAK\]\s*\n?/)
+		.map((part) => part.trim())
+		.filter((part) => part.length > 0 && !isSilenceToken(part))
+		.slice(0, 5);
+	for (const part of parts) {
+		const payload = runtime.delivery.prepare(crypto.randomUUID(), origin, part);
+		if (!payload) continue;
+		runtime.delivery.markInflight(payload.deliveryId as string);
+		for (const recipient of runtime.connections)
+			if (recipient.negotiated) recipient.write({ v: PROFILE_VERSION, type: "event", event: "chat.message", payload });
+	}
 	// Durable intent is persisted synchronously; closure work deliberately does not delay delivery.
-	runtime.memory.enqueue({ kind: "daily_capture", originRefJson: JSON.stringify(origin), userText, replyText: text });
+	runtime.memory.enqueue({
+		kind: "daily_capture",
+		originRefJson: JSON.stringify(origin),
+		userText: capturedUser,
+		replyText: text,
+	});
 }
 
 /**
