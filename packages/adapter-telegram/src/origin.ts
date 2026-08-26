@@ -2,7 +2,7 @@ import type { OriginRef } from "@gajaeway/protocol";
 
 export interface TelegramMessageOriginShape {
 	readonly chat: { readonly id: number | string; readonly type: string };
-	readonly from?: { readonly id: number | string };
+	readonly from?: { readonly id: number | string; readonly username?: string; readonly first_name?: string };
 	readonly message_thread_id?: number;
 	readonly is_topic_message?: boolean;
 }

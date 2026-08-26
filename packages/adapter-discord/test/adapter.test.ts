@@ -9,6 +9,7 @@ import {
 	type DiscordClientLike,
 	engagementForMessage,
 	type GatewayClientLike,
+	handleSlashCommand,
 	LruSet,
 	settleDiscordDelivery,
 	subscribeDiscordDeliveries,
@@ -258,4 +259,37 @@ test("working status ignores non-discord progress and survives channel failures"
 		outputTokens: 0,
 	});
 	await status.clear("c"); // nothing posted; must not throw
+});
+
+test("slash commands /new and /reset map to gateway session resets with the invoker attributed", async () => {
+	const sent: Array<{ messageId: string; text: string; engagement: unknown }> = [];
+	const gateway = {
+		sendInbound: (messageId: string, _origin: unknown, text: string, engagement: unknown) =>
+			void sent.push({ messageId, text, engagement }),
+	};
+	let replied = "";
+	const interaction = {
+		isChatInputCommand: () => true,
+		commandName: "new",
+		id: "itx-1",
+		user: { id: "owner-1", username: "bellman" },
+		channel: { id: "channel-9", type: 0 },
+		reply: async (options: { content: string }) => {
+			replied = options.content;
+		},
+	};
+	await handleSlashCommand(interaction as never, gateway as never, { error: () => {} });
+	expect(sent).toHaveLength(1);
+	expect(sent[0]).toMatchObject({
+		messageId: "slash-itx-1",
+		text: "/new",
+		engagement: { mentioned: true, group: true, authorId: "owner-1", authorName: "bellman" },
+	});
+	expect(replied).toContain("session reset");
+	// Non-command interactions and unknown commands are ignored outright.
+	await handleSlashCommand({ ...interaction, commandName: "dance" } as never, gateway as never, { error: () => {} });
+	await handleSlashCommand({ ...interaction, isChatInputCommand: () => false } as never, gateway as never, {
+		error: () => {},
+	});
+	expect(sent).toHaveLength(1);
 });

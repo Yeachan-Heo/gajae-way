@@ -9,7 +9,7 @@ test("migrates the sessions foundation", async () => {
 	const directory = await mkdtemp(join(tmpdir(), "gajaeway-db-"));
 	try {
 		const database = await GatewayDatabase.open(join(directory, "gateway.db"));
-		expect(database.schemaVersion).toBe(7);
+		expect(database.schemaVersion).toBe(8);
 		database.withTransaction(() => database.putSession("loopback/loopback/loopback", "session-1"));
 		expect(database.getSession("loopback/loopback/loopback")).toBe("session-1");
 		database.close();

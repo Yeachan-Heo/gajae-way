@@ -159,7 +159,13 @@ export function engagementForMessage(
 	const mentioned =
 		message.text?.toLocaleLowerCase().includes(`@${botUsername.toLocaleLowerCase()}`) === true ||
 		String(message.reply_to_message?.from?.id ?? "") === botUserId;
-	return { mentioned, group: origin.kind !== "dm", authorId: String(message.from?.id ?? "") };
+	const authorName = message.from?.username ?? message.from?.first_name;
+	return {
+		mentioned,
+		group: origin.kind !== "dm",
+		authorId: String(message.from?.id ?? ""),
+		...(authorName ? { authorName } : {}),
+	};
 }
 
 export async function startTelegramAdapter(config: LoadedTelegramAdapterConfig): Promise<void> {

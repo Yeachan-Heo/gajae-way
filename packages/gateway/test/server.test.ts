@@ -34,7 +34,7 @@ async function connect(socketPath: string): Promise<{ send(value: unknown): void
 }
 
 async function waitFor(frames: any[], count: number): Promise<void> {
-	for (let attempt = 0; attempt < 100 && frames.length < count; attempt++) await Bun.sleep(5);
+	for (let attempt = 0; attempt < 400 && frames.length < count; attempt++) await Bun.sleep(5);
 	expect(frames.length).toBeGreaterThanOrEqual(count);
 }
 
@@ -69,7 +69,7 @@ test("requires negotiation then serves status, shutdown, and validates chat para
 	expect(client.frames[1].type).toBe("negotiated");
 	client.send({ v: "0.1", type: "request", id: "status", verb: "gateway.status" });
 	await waitFor(client.frames, 3);
-	expect(client.frames[2].result.schemaVersion).toBe(7);
+	expect(client.frames[2].result.schemaVersion).toBe(8);
 	expect(client.frames[2].result.startedAt).toBe("2026-01-01T00:00:00.000Z");
 	client.send({
 		v: "0.1",
@@ -182,7 +182,7 @@ test("long turns broadcast throttled chat.progress liveness events", async () =>
 		},
 	});
 	// Wait for the final reply so every progress frame the turn produced has arrived.
-	for (let attempt = 0; attempt < 200; attempt++) {
+	for (let attempt = 0; attempt < 400; attempt++) {
 		if (client.frames.some((frame) => frame.type === "event" && frame.event === "chat.message")) break;
 		await Bun.sleep(5);
 	}
@@ -197,5 +197,107 @@ test("long turns broadcast throttled chat.progress liveness events", async () =>
 	expect(progress[0].payload.elapsedMs).toBeGreaterThanOrEqual(0);
 	const reply = client.frames.find((frame) => frame.type === "event" && frame.event === "chat.message");
 	expect(reply.payload.text).toBe("done");
+	client.close();
+});
+
+test("debounced burst becomes one turn carrying the unread diff with speaker attribution", async () => {
+	directory = await mkdtemp(join(tmpdir(), "gajaeway-server-"));
+	const config: GatewayConfig = {
+		schemaVersion: 1,
+		home: directory,
+		configPath: join(directory, "config.json"),
+		socketPath: join(directory, "gateway.sock"),
+		dbPath: join(directory, "gateway.db"),
+		logVerbosity: "info",
+		debounceMs: 80,
+		channels: { c1: { engagement: "open" } },
+	};
+	const database = await GatewayDatabase.open(config.dbPath);
+	const turns: Array<{ text: string; preamble: string }> = [];
+	const gjc: GjcPort = {
+		ensureSession: async () => ({ sessionId: "mock-session" }),
+		sendTurn: async (_session, text, preamble) => {
+			turns.push({ text, preamble: preamble ?? "" });
+			return "batched reply";
+		},
+	};
+	server = await startUnixServer({ config, database, gjc, onStop: () => database.close() });
+	const client = await connect(config.socketPath);
+	client.send({ v: "0.1", type: "hello", payload: { supportedVersions: ["0.1"] } });
+	await waitFor(client.frames, 1);
+	const origin = { platform: "discord", kind: "channel", conversationId: "c1" };
+	const say = (id: string, text: string, authorId: string, authorName: string, mentioned: boolean) =>
+		client.send({
+			v: "0.1",
+			type: "request",
+			id,
+			verb: "chat.send",
+			params: { origin, text, messageId: id, engagement: { mentioned, group: true, authorId, authorName } },
+		});
+	say("m1", "first message", "u1", "alice", false);
+	await Bun.sleep(10);
+	say("m2", "second message", "u2", "bob", false);
+	await Bun.sleep(10);
+	say("m3", "@bot do the thing", "owner", "bellman", true);
+	for (let attempt = 0; attempt < 400 && turns.length === 0; attempt++) await Bun.sleep(10);
+	expect(turns).toHaveLength(1);
+	const turn = turns[0]!;
+	// The two earlier burst messages arrive as the unread diff, the newest as the trigger.
+	expect(turn.text).toContain("Unread messages in this conversation");
+	expect(turn.text).toContain("alice: first message");
+	expect(turn.text).toContain("bob: second message");
+	expect(turn.text).toContain("[Current message from bellman]");
+	expect(turn.text).toContain("@bot do the thing");
+	// Consumed context is not replayed on the next turn.
+	say("m4", "follow-up", "owner", "bellman", true);
+	for (let attempt = 0; attempt < 400 && turns.length < 2; attempt++) await Bun.sleep(10);
+	expect(turns).toHaveLength(2);
+	expect(turns[1]!.text).not.toContain("first message");
+	expect(turns[1]!.text).toContain("follow-up");
+	client.close();
+});
+
+test("group turns carry silence guidance: listeners are told to default to [SILENT]", async () => {
+	directory = await mkdtemp(join(tmpdir(), "gajaeway-server-"));
+	const config: GatewayConfig = {
+		schemaVersion: 1,
+		home: directory,
+		configPath: join(directory, "config.json"),
+		socketPath: join(directory, "gateway.sock"),
+		dbPath: join(directory, "gateway.db"),
+		logVerbosity: "info",
+		channels: { c1: { engagement: "open", debounceMs: 0 } },
+	};
+	const database = await GatewayDatabase.open(config.dbPath);
+	const preambles: string[] = [];
+	const gjc: GjcPort = {
+		ensureSession: async () => ({ sessionId: "mock-session" }),
+		sendTurn: async (_session, _text, preamble) => {
+			preambles.push(preamble ?? "");
+			return "[SILENT]";
+		},
+	};
+	server = await startUnixServer({ config, database, gjc, onStop: () => database.close() });
+	const client = await connect(config.socketPath);
+	client.send({ v: "0.1", type: "hello", payload: { supportedVersions: ["0.1"] } });
+	await waitFor(client.frames, 1);
+	client.send({
+		v: "0.1",
+		type: "request",
+		id: "listen",
+		verb: "chat.send",
+		params: {
+			origin: { platform: "discord", kind: "channel", conversationId: "c1" },
+			text: "people chatting among themselves",
+			messageId: "listen-1",
+			engagement: { mentioned: false, group: true, authorId: "u1", authorName: "alice" },
+		},
+	});
+	for (let attempt = 0; attempt < 400 && preambles.length === 0; attempt++) await Bun.sleep(5);
+	expect(preambles[0]).toContain("You were NOT addressed");
+	expect(preambles[0]).toContain("[SILENT]");
+	// The silence-token reply suppresses delivery: no chat.message event arrives.
+	await Bun.sleep(50);
+	expect(client.frames.filter((frame) => frame.type === "event" && frame.event === "chat.message")).toHaveLength(0);
 	client.close();
 });

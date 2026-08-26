@@ -2,7 +2,7 @@ import { Database } from "bun:sqlite";
 import { mkdir } from "node:fs/promises";
 import { dirname } from "node:path";
 
-const LATEST_SCHEMA_VERSION = 7;
+const LATEST_SCHEMA_VERSION = 8;
 
 export interface InboundMessageRow {
 	readonly message_id: string;
@@ -185,6 +185,65 @@ export class GatewayDatabase {
 
 	inboundComplete(messageId: string): void {
 		this.#database.query("UPDATE inbound_messages SET state = 'done' WHERE message_id = ?").run(messageId);
+	}
+
+	/**
+	 * Conversation context ledger: every inbound platform message (engaged or not)
+	 * is recorded here; a turn consumes the unread diff since the last reply.
+	 */
+	contextRecord(row: {
+		messageId: string;
+		originKey: string;
+		authorId?: string;
+		authorName?: string;
+		body: string;
+	}): void {
+		this.#database
+			.query(
+				"INSERT INTO conversation_context (message_id, origin_key, author_id, author_name, body, received_at) VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT(message_id) DO NOTHING",
+			)
+			.run(
+				row.messageId,
+				row.originKey,
+				row.authorId ?? null,
+				row.authorName ?? null,
+				row.body,
+				new Date().toISOString(),
+			);
+	}
+
+	contextUnread(
+		originKey: string,
+		limit = 100,
+	): Array<{
+		message_id: string;
+		author_id: string | null;
+		author_name: string | null;
+		body: string;
+		received_at: string;
+	}> {
+		return this.#database
+			.query<
+				{ message_id: string; author_id: string | null; author_name: string | null; body: string; received_at: string },
+				[string, number]
+			>(
+				"SELECT message_id, author_id, author_name, body, received_at FROM conversation_context WHERE origin_key = ? AND consumed_at IS NULL ORDER BY received_at, message_id LIMIT ?",
+			)
+			.all(originKey, limit);
+	}
+
+	contextConsume(messageIds: readonly string[]): void {
+		if (messageIds.length === 0) return;
+		const now = new Date().toISOString();
+		this.withTransaction(() => {
+			for (const id of messageIds)
+				this.#database.query("UPDATE conversation_context SET consumed_at = ? WHERE message_id = ?").run(now, id);
+		});
+	}
+
+	contextPrune(maxAgeMs: number): number {
+		const cutoff = new Date(Date.now() - maxAgeMs).toISOString();
+		return this.#database.query("DELETE FROM conversation_context WHERE received_at < ?").run(cutoff).changes;
 	}
 
 	/** Startup recovery: a turn killed mid-flight must not strand its claimed message. */
@@ -498,6 +557,19 @@ export class GatewayDatabase {
 				this.#database
 					.query("INSERT INTO schema_migrations (version, applied_at) VALUES (?, ?)")
 					.run(7, new Date().toISOString());
+			});
+		}
+		if (current < 8) {
+			this.withTransaction(() => {
+				// Declined messages are still context, never commands: every inbound platform
+				// message lands here so an engaged turn can read the unread diff since the
+				// persona's last reply in that conversation.
+				this.#database.exec(
+					"CREATE TABLE conversation_context (message_id TEXT PRIMARY KEY, origin_key TEXT NOT NULL, author_id TEXT, author_name TEXT, body TEXT NOT NULL, received_at TEXT NOT NULL, consumed_at TEXT); CREATE INDEX conversation_context_unread ON conversation_context (origin_key, consumed_at, received_at)",
+				);
+				this.#database
+					.query("INSERT INTO schema_migrations (version, applied_at) VALUES (?, ?)")
+					.run(8, new Date().toISOString());
 			});
 		}
 	}

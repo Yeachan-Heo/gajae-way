@@ -29,6 +29,8 @@ export interface EngagementContext {
 	readonly group: boolean;
 	/** Platform-scoped author id of the inbound message. */
 	readonly authorId: string;
+	/** Human-readable author name when the platform provides one. */
+	readonly authorName?: string;
 }
 
 export interface ChatSendParams {

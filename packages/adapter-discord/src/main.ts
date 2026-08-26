@@ -43,7 +43,7 @@ export interface DiscordClientLike {
 export interface DiscordInboundMessage extends DiscordMessageOriginShape {
 	readonly id: string;
 	readonly content: string;
-	readonly author: { readonly id: string; readonly bot?: boolean };
+	readonly author: { readonly id: string; readonly bot?: boolean; readonly username?: string };
 	readonly mentions?: { has(user: unknown): boolean };
 }
 
@@ -74,6 +74,7 @@ export function engagementForMessage(message: DiscordInboundMessage, botUser: un
 		mentioned: Boolean(message.mentions?.has(botUser) || contentMention),
 		group: origin.kind !== "dm",
 		authorId: message.author.id,
+		...(message.author.username ? { authorName: message.author.username } : {}),
 	};
 }
 
@@ -344,10 +345,60 @@ export async function startDiscordAdapter(config: LoadedDiscordAdapterConfig): P
 		if (!engagement) return;
 		gateway.sendInbound(message.id as string, discordMessageOrigin(message), message.content, engagement);
 	});
-	discord.once("ready", () => console.log("Discord adapter connected."));
+	discord.on("interactionCreate", (interaction) => {
+		if (interaction.isChatInputCommand()) void handleSlashCommand(interaction, gateway);
+	});
+	discord.once("ready", () => {
+		console.log("Discord adapter connected.");
+		// Slash-command mapping: /new and /reset are first-class Discord commands
+		// that route into the gateway's session-reset verbs for the invoking
+		// conversation (typing "/new" as chat text never reaches messageCreate).
+		void discord.application?.commands
+			.set([
+				{ name: "new", description: "Start a fresh persona session in this conversation" },
+				{ name: "reset", description: "Reset this conversation's persona session" },
+			])
+			.catch((error: unknown) =>
+				console.error(
+					`Discord slash-command registration failed: ${error instanceof Error ? error.message : String(error)}`,
+				),
+			);
+	});
 	console.log("Discord adapter starting.");
 	await gateway.connect();
 	await discord.login(config.token);
+}
+
+/** Duck-typed slice of a Discord chat-input command interaction. */
+export interface SlashInteractionLike {
+	isChatInputCommand?(): boolean;
+	readonly commandName?: string;
+	readonly id: string;
+	readonly user?: { readonly id: string; readonly username?: string };
+	readonly channel?: DiscordMessageOriginShape["channel"] | null;
+	reply(options: { content: string; ephemeral?: boolean }): Promise<unknown>;
+}
+
+export async function handleSlashCommand(
+	interaction: SlashInteractionLike,
+	gateway: Pick<ReconnectingGateway, "sendInbound">,
+	log: Pick<Console, "error"> = console,
+): Promise<void> {
+	if (!interaction.isChatInputCommand?.()) return;
+	if (interaction.commandName !== "new" && interaction.commandName !== "reset") return;
+	if (!interaction.channel || !interaction.user) return;
+	try {
+		const origin = discordMessageOrigin({ author: { id: interaction.user.id }, channel: interaction.channel });
+		gateway.sendInbound(`slash-${interaction.id}`, origin, `/${interaction.commandName}`, {
+			mentioned: true,
+			group: origin.kind !== "dm",
+			authorId: interaction.user.id,
+			...(interaction.user.username ? { authorName: interaction.user.username } : {}),
+		});
+		await interaction.reply({ content: "🦞 session reset requested", ephemeral: true });
+	} catch (error) {
+		log.error(`Discord slash command failed: ${error instanceof Error ? error.message : String(error)}`);
+	}
 }
 
 class ReconnectingGateway {

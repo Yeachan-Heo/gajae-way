@@ -7,6 +7,20 @@ export interface TurnProgress {
 	readonly outputTokens: number;
 }
 
+/**
+ * Replaces gjc's default coding-assistant identity (owner directive: gajaeway is
+ * a GENERIC personal agent, and the default made every reply read like a coding
+ * CLI report). Persona identity itself arrives via the appended workspace files
+ * (SOUL.md / AGENTS.md / USER.md); this base only sets the register and keeps
+ * full tool capability.
+ */
+export const GENERIC_AGENT_SYSTEM_PROMPT = [
+	"You are a general-purpose personal agent living in chat surfaces (Discord, Telegram, a local console).",
+	"You are NOT a coding CLI assistant. Do not produce engineering status reports, verification ceremony, commit/file-path narration, or headed markdown documents unless the conversation genuinely calls for them. Answer like a person in a chat: direct, natural, sized to the message.",
+	"You still have full tool access and may do real work (files, shell, code, web) whenever the conversation needs it — capability stays, the coding-assistant register goes.",
+	"Your actual identity, voice, and standing instructions are defined by the appended persona documents (SOUL.md, AGENTS.md, USER.md) and always take precedence over this base note.",
+].join("\n");
+
 export interface GjcPort {
 	ensureSession(originKey: string, epoch?: number): Promise<{ sessionId: string }>;
 	sendTurn(
@@ -97,13 +111,15 @@ export class GjcClient implements GjcPort {
 	readonly #database: GatewayDatabase;
 	readonly #timeoutMs: number;
 	readonly #cwd: string;
+	readonly #model: string | undefined;
 
 	// 300s ceiling: the persona is an action-capable agent that runs real tools per
 	// turn; 120s killed live owner turns mid-investigation (P1 drill finding).
-	constructor(database: GatewayDatabase, timeoutMs = 300_000, cwd = process.cwd()) {
+	constructor(database: GatewayDatabase, timeoutMs = 300_000, cwd = process.cwd(), model?: string) {
 		this.#database = database;
 		this.#timeoutMs = timeoutMs;
 		this.#cwd = cwd;
+		this.#model = model;
 	}
 
 	async ensureSession(originKey: string, epoch = 0): Promise<{ sessionId: string }> {
@@ -173,6 +189,9 @@ export class GjcClient implements GjcPort {
 				"-p",
 				"--mode",
 				"json",
+				"--system-prompt",
+				GENERIC_AGENT_SYSTEM_PROMPT,
+				...(this.#model ? ["--model", this.#model] : []),
 				...(systemPreamble ? ["--append-system-prompt", systemPreamble] : []),
 				text,
 			],

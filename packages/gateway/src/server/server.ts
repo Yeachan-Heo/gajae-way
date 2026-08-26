@@ -472,6 +472,25 @@ async function sendChat(
 	}
 	const key = originKey(origin);
 	if (params.text === "/new" || params.text === "/reset") {
+		// Session resets are commands: in group surfaces they obey the mention
+		// allowlist, or any room member could wipe the persona's conversation state.
+		const allowlist = options.config.mentionAllowlist;
+		const authorId = (params.engagement as { authorId?: unknown } | undefined)?.authorId;
+		if (
+			origin.platform !== "loopback" &&
+			origin.kind !== "dm" &&
+			allowlist &&
+			allowlist.length > 0 &&
+			(typeof authorId !== "string" || !allowlist.includes(authorId))
+		) {
+			connection.write({
+				v: PROFILE_VERSION,
+				type: "response",
+				id: request.id,
+				result: { turnId: null, engaged: false },
+			});
+			return;
+		}
 		options.database.withTransaction(() => options.database.bumpEpoch(key, JSON.stringify(origin)));
 		const payload = {
 			turnId: crypto.randomUUID(),
@@ -511,6 +530,20 @@ async function sendChat(
 	)
 		throw new ProtocolError("invalid_params", "non-loopback chat.send requires engagement");
 	const engaged = decideEngagement(origin, params.engagement as never, options.config).engaged;
+	const inboundMessageId = typeof params.messageId === "string" && params.messageId ? params.messageId : undefined;
+	// Declined messages are still context, never commands (protocol contract): every
+	// platform message lands in the conversation-context ledger so the next engaged
+	// turn reads the full unread diff since the persona's last reply.
+	if (nonLoopback && inboundMessageId) {
+		const engagement = params.engagement as { authorId?: string; authorName?: unknown } | undefined;
+		options.database.contextRecord({
+			messageId: inboundMessageId,
+			originKey: key,
+			authorId: typeof engagement?.authorId === "string" ? engagement.authorId : undefined,
+			authorName: typeof engagement?.authorName === "string" ? engagement.authorName : undefined,
+			body: userText,
+		});
+	}
 	if (!engaged) {
 		connection.write({
 			v: PROFILE_VERSION,
@@ -520,7 +553,7 @@ async function sendChat(
 		});
 		return;
 	}
-	const messageId = typeof params.messageId === "string" && params.messageId ? params.messageId : crypto.randomUUID();
+	const messageId = inboundMessageId ?? crypto.randomUUID();
 	const turnId = crypto.randomUUID();
 	// Persist before dispatch: the insert is the acceptance boundary. A message that arrives
 	// while a turn for the same origin is in flight stays durable and is drained afterwards
@@ -561,29 +594,50 @@ async function drainOrigin(
 	let ownFailure: unknown;
 	await runtime.turns.run(key, async () => {
 		for (let row = options.database.inboundClaimNext(key); row; row = options.database.inboundClaimNext(key)) {
+			// Debounce: a burst of messages becomes ONE turn carrying the whole diff.
+			// The window is per-channel configurable; newer arrivals during the wait
+			// are folded into this batch, with the newest message as the trigger.
+			const debounceMs = debounceFor(row, options.config);
+			if (debounceMs > 0) await Bun.sleep(debounceMs);
+			const batch = [row];
+			for (let more = options.database.inboundClaimNext(key); more; more = options.database.inboundClaimNext(key))
+				batch.push(more);
 			try {
-				await runInboundTurn(row, fallback, options, runtime);
+				await runInboundTurn(batch, fallback, options, runtime);
 			} catch (error) {
 				// The originating request reports its own failure; a drained message has no
 				// live requester left, so its failure only belongs in the daemon log.
-				if (row.message_id === ownMessageId) ownFailure = error;
+				if (batch.some((member) => member.message_id === ownMessageId)) ownFailure = error;
 				else
 					console.error(
-						`gateway inbound turn failed (${row.message_id}): ${error instanceof Error ? (error.stack ?? error.message) : String(error)}`,
+						`gateway inbound turn failed (${batch[batch.length - 1]?.message_id}): ${error instanceof Error ? (error.stack ?? error.message) : String(error)}`,
 					);
 			} finally {
-				options.database.inboundComplete(row.message_id);
+				for (const member of batch) options.database.inboundComplete(member.message_id);
 			}
 		}
 	});
 	if (ownFailure) throw ownFailure;
 }
+
+function debounceFor(row: InboundMessageRow, config: GatewayServerOptions["config"]): number {
+	const origin = JSON.parse(row.origin_ref_json) as { platform?: string; conversationId?: string };
+	if (origin.platform === "loopback") return 0;
+	const channel =
+		config.channels?.[`${origin.platform}:${origin.conversationId}`] ??
+		(origin.platform === "discord" ? config.channels?.[origin.conversationId ?? ""] : undefined);
+	return channel?.debounceMs ?? config.debounceMs ?? 0;
+}
 async function runInboundTurn(
-	row: InboundMessageRow,
+	batch: readonly InboundMessageRow[],
 	fallback: Connection,
 	options: GatewayServerOptions,
 	runtime: Runtime,
 ): Promise<void> {
+	// The newest message triggers the turn; older batch members are part of the
+	// unread diff. Their live requesters (if any) already got their responses.
+	const row = batch[batch.length - 1] as InboundMessageRow;
+	for (const member of batch) if (member !== row) runtime.inbound.delete(member.message_id);
 	const context = runtime.inbound.get(row.message_id);
 	runtime.inbound.delete(row.message_id);
 	const connection = context?.connection ?? fallback;
@@ -592,6 +646,31 @@ async function runInboundTurn(
 	const origin = validateOriginRef(JSON.parse(row.origin_ref_json) as typeof LOOPBACK_ORIGIN);
 	const userText = row.body;
 	const nonLoopback = origin.platform !== "loopback";
+	const engagement = row.engagement_json
+		? (JSON.parse(row.engagement_json) as {
+				mentioned?: boolean;
+				group?: boolean;
+				authorId?: string;
+				authorName?: string;
+			})
+		: undefined;
+	// Compose the turn: everything said in this conversation since the persona's
+	// last reply (the read-cursor diff), then the triggering message with speaker
+	// attribution — so the persona always reads "the messages above".
+	let turnText = userText;
+	if (nonLoopback) {
+		const unread = options.database.contextUnread(key, 100).filter((entry) => entry.message_id !== row.message_id);
+		const lines = unread.map(
+			(entry) =>
+				`- [${entry.received_at}] ${entry.author_name ?? entry.author_id ?? "unknown"}: ${entry.body.slice(0, 1000)}`,
+		);
+		const header = lines.length
+			? `[Unread messages in this conversation since your last reply]\n${lines.join("\n")}\n\n`
+			: "";
+		const speaker = engagement?.authorName ?? engagement?.authorId;
+		turnText = `${header}${speaker ? `[Current message from ${speaker}]\n` : ""}${userText}`;
+		options.database.contextConsume([...unread.map((entry) => entry.message_id), row.message_id]);
+	}
 	let text: string;
 	// Long turns announce liveness instead of dying: throttled chat.progress events
 	// let adapters render a "working…" status while the persona runs. A heartbeat
@@ -621,8 +700,8 @@ async function runInboundTurn(
 	try {
 		const epoch = options.database.getSessionRecord(key)?.epoch ?? 0;
 		const { sessionId } = await options.gjc.ensureSession(key, epoch);
-		const preamble = `${await runtime.persona.systemPreamble()}\n\n${currentConversationNotice(origin)}\n\n${ACTION_GUARD_SYSTEM_NOTICE}`;
-		text = await options.gjc.sendTurn(sessionId, userText, preamble, emitProgress);
+		const preamble = `${await runtime.persona.systemPreamble()}\n\n${currentConversationNotice(origin, engagement)}\n\n${ACTION_GUARD_SYSTEM_NOTICE}`;
+		text = await options.gjc.sendTurn(sessionId, turnText, preamble, emitProgress);
 	} catch (error) {
 		// Never ghost a platform conversation: a failed turn still produces a visible,
 		// ledgered notice (live P1 drill finding: timeouts looked like silent ignores).
@@ -682,7 +761,7 @@ async function runInboundTurn(
  * tell which conversation it was in and imported other origins' memory as if
  * it had been said here).
  */
-function currentConversationNotice(origin: OriginRef): string {
+function currentConversationNotice(origin: OriginRef, engagement?: { mentioned?: boolean }): string {
 	const where =
 		origin.kind === "dm"
 			? `a PRIVATE direct-message conversation (${origin.platform} DM ${origin.conversationId}, peer ${origin.peerId})`
@@ -693,6 +772,13 @@ function currentConversationNotice(origin: OriginRef): string {
 		"## Current conversation",
 		`You are replying inside ${where}. This session is bound to exactly this one conversation.`,
 		`Shared memory (memory/daily and canonical axes) records EVERY conversation, each entry tagged with its origin. Entries whose origin differs from ${origin.platform}/${origin.kind}/${origin.conversationId} happened elsewhere: treat them as background knowledge only, never as something said here, and do not import their topics or in-flight work into this conversation unprompted.`,
+		...(origin.kind !== "dm" && origin.kind !== "loopback"
+			? [
+					engagement?.mentioned
+						? "You were explicitly addressed here: reply."
+						: "You were NOT addressed: you are listening in on a room. Unless this message clearly needs you or adds real value for you to answer, reply with exactly [SILENT] and nothing else — that suppresses delivery while the message stays recorded. Do not respond to every message.",
+				]
+			: []),
 	].join("\n");
 }
 function writeError(connection: Connection, error: unknown, id?: string): void {

@@ -30,7 +30,11 @@ The CLI does not start the daemon: `gajaeway daemon run` prints the launcher com
   "socketPath": "/absolute/path/gateway.sock",
   "dbPath": "/absolute/path/gateway.db",
   "credentials": { "discord": { "credentialFile": "/absolute/path/discord-token" } },
-  "channels": { "channel-id": { "engagement": "open" } },
+  "channels": { "channel-id": { "engagement": "open", "debounceMs": 500 } },
+  "turnTimeoutMs": 900000,
+  "model": "opus",
+  "debounceMs": 1000,
+  "mentionAllowlist": ["owner-author-id"],
   "webhook": { "bind": "127.0.0.1", "port": 8080, "exposeNonLoopback": false },
   "watcherRoots": ["/absolute/path"],
   "scriptRoot": "/absolute/path"

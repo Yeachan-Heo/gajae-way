@@ -14,8 +14,14 @@ export interface GatewayConfigFile {
 	readonly dbPath?: string;
 	/** Per-turn gjc ceiling in milliseconds; default 300000. Long agentic turns need more. */
 	readonly turnTimeoutMs?: number;
+	/** gjc model override for persona turns (fuzzy, e.g. "opus" or "openai/gpt-5.2"); unset = gjc's own default. */
+	readonly model?: string;
 	readonly credentials?: Readonly<Record<string, CredentialFileReference>>;
-	readonly channels?: Readonly<Record<string, { readonly engagement?: "open" }>>;
+	readonly channels?: Readonly<Record<string, ChannelPolicy>>;
+	/** Default inbound debounce window in milliseconds; per-channel `debounceMs` overrides it. */
+	readonly debounceMs?: number;
+	/** Author ids allowed to trigger mention-gated group turns; absent/empty = anyone. */
+	readonly mentionAllowlist?: readonly string[];
 	readonly webhook?: { readonly bind?: string; readonly port: number; readonly exposeNonLoopback?: boolean };
 	readonly watcherRoots?: readonly string[];
 	readonly scriptRoot?: string;
@@ -26,6 +32,11 @@ export interface GatewayConfig extends GatewayConfigFile {
 	readonly configPath: string;
 	readonly socketPath: string;
 	readonly dbPath: string;
+}
+export interface ChannelPolicy {
+	readonly engagement?: "open";
+	/** Per-channel inbound debounce override in milliseconds. */
+	readonly debounceMs?: number;
 }
 
 export interface ConfigOverrides {
@@ -94,19 +105,30 @@ function parseCredentials(value: unknown): Readonly<Record<string, CredentialFil
 	return credentials;
 }
 
-function parseChannels(value: unknown): Readonly<Record<string, { readonly engagement?: "open" }>> | undefined {
+function parseChannels(value: unknown): Readonly<Record<string, ChannelPolicy>> | undefined {
 	if (value === undefined) return undefined;
 	const input = requireObject(value, "channels");
-	const channels: Record<string, { readonly engagement?: "open" }> = {};
+	const channels: Record<string, ChannelPolicy> = {};
 	for (const [conversationId, channel] of Object.entries(input)) {
 		const item = requireObject(channel, `channels.${conversationId}`);
 		if (item.engagement !== undefined && item.engagement !== "open")
 			throw new ConfigError("config_invalid", `channels.${conversationId}.engagement must be open`);
-		if (Object.keys(item).some((key) => key !== "engagement"))
+		if (item.debounceMs !== undefined) parseDebounce(item.debounceMs, `channels.${conversationId}.debounceMs`);
+		if (Object.keys(item).some((key) => !["engagement", "debounceMs"].includes(key)))
 			throw new ConfigError("config_invalid", `channels.${conversationId} contains an unknown field`);
-		channels[conversationId] = item.engagement === "open" ? { engagement: "open" } : {};
+		channels[conversationId] = {
+			...(item.engagement === "open" ? { engagement: "open" as const } : {}),
+			...(item.debounceMs === undefined ? {} : { debounceMs: item.debounceMs as number }),
+		};
 	}
 	return channels;
+}
+
+function parseDebounce(value: unknown, field: string): number {
+	// 0 disables; above 60s is an operator mistake, not a debounce.
+	if (!Number.isInteger(value) || (value as number) < 0 || (value as number) > 60_000)
+		throw new ConfigError("config_invalid", `${field} must be an integer between 0 and 60000`);
+	return value as number;
 }
 
 function parseStringArray(value: unknown, field: string): readonly string[] {
@@ -163,6 +185,11 @@ export function parseConfigFile(value: unknown): GatewayConfigFile {
 		...(input.watcherRoots === undefined ? {} : { watcherRoots: parseStringArray(input.watcherRoots, "watcherRoots") }),
 		...(input.scriptRoot === undefined ? {} : { scriptRoot: optionalString(input.scriptRoot, "scriptRoot") }),
 		...(input.turnTimeoutMs === undefined ? {} : { turnTimeoutMs: parseTurnTimeout(input.turnTimeoutMs) }),
+		...(input.mentionAllowlist === undefined
+			? {}
+			: { mentionAllowlist: parseStringArray(input.mentionAllowlist, "mentionAllowlist") }),
+		...(input.debounceMs === undefined ? {} : { debounceMs: parseDebounce(input.debounceMs, "debounceMs") }),
+		...(optionalString(input.model, "model") ? { model: optionalString(input.model, "model") } : {}),
 	};
 }
 
@@ -188,6 +215,7 @@ export async function loadConfig(
 		socketPath: overrides.socketPath ?? fileConfig.socketPath ?? join(home, "gateway.sock"),
 		dbPath: overrides.dbPath ?? fileConfig.dbPath ?? join(home, "gateway.db"),
 		logVerbosity: overrides.logVerbosity ?? fileConfig.logVerbosity ?? "info",
+		debounceMs: fileConfig.debounceMs ?? 1_000,
 	};
 }
 
