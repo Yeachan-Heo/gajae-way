@@ -76,6 +76,29 @@ export function engagementForMessage(message: DiscordInboundMessage, botUser: un
 	};
 }
 
+/**
+ * Decides whether an incoming Discord message becomes a turn, and with what engagement.
+ * Returns undefined when the message must be ignored outright.
+ *
+ * Collaboration means hearing other bots, so only our own messages are dropped. An `open`
+ * channel promotes a human message to a mention so the persona joins the room without being
+ * called; bot authors never get that promotion, because two open-channel bots would answer each
+ * other forever. A bot has to address us explicitly to get a turn.
+ */
+export function decideInbound(
+	message: DiscordInboundMessage,
+	botUser: unknown,
+	channels: Readonly<Record<string, { readonly engagement?: "open" }>> | undefined,
+): EngagementContext | undefined {
+	if (message.id === undefined) return undefined;
+	const botId = typeof botUser === "object" && botUser !== null && "id" in botUser ? String(botUser.id) : "";
+	if (botId !== "" && message.author.id === botId) return undefined;
+	const origin = discordMessageOrigin(message);
+	const base = engagementForMessage(message, botUser);
+	const open = origin.kind !== "dm" && channels?.[origin.conversationId]?.engagement === "open";
+	return open && !message.author.bot ? { ...base, mentioned: true } : base;
+}
+
 export function chunkDiscordMessage(text: string): string[] {
 	if (text.length === 0) return [""];
 	const chunks: string[] = [];
@@ -201,14 +224,9 @@ export async function startDiscordAdapter(config: LoadedDiscordAdapterConfig): P
 	const typing = new TypingIndicator(discord);
 	const gateway = new ReconnectingGateway(config.gatewaySocket ?? defaultGatewaySocket(), discord, config, typing);
 	discord.on("messageCreate", (message) => {
-		if (message.author.bot || message.id === undefined) return;
-		const origin = discordMessageOrigin(message);
-		const baseEngagement = engagementForMessage(message, discord.user);
-		const engagement: EngagementContext =
-			origin.kind !== "dm" && config.channels?.[origin.conversationId]?.engagement === "open"
-				? { ...baseEngagement, mentioned: true }
-				: baseEngagement;
-		gateway.sendInbound(message.id, origin, message.content, engagement);
+		const engagement = decideInbound(message, discord.user, config.channels);
+		if (!engagement) return;
+		gateway.sendInbound(message.id as string, discordMessageOrigin(message), message.content, engagement);
 	});
 	discord.once("ready", () => console.log("Discord adapter connected."));
 	console.log("Discord adapter starting.");
