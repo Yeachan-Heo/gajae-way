@@ -1,5 +1,6 @@
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
+import { type OriginRef, validateOriginRef } from "@gajaeway/protocol";
 
 export const CONFIG_SCHEMA_VERSION = 1;
 
@@ -22,6 +23,8 @@ export interface GatewayConfigFile {
 	readonly debounceMs?: number;
 	/** Author ids allowed to trigger mention-gated group turns; absent/empty = anyone. */
 	readonly mentionAllowlist?: readonly string[];
+	/** Default recipient origin for monitor/maintenance notes without their own channel target. */
+	readonly ownerTarget?: { readonly origin: OriginRef };
 	readonly webhook?: { readonly bind?: string; readonly port: number; readonly exposeNonLoopback?: boolean };
 	readonly watcherRoots?: readonly string[];
 	readonly scriptRoot?: string;
@@ -131,6 +134,20 @@ function parseDebounce(value: unknown, field: string): number {
 	return value as number;
 }
 
+function parseOwnerTarget(value: unknown): { readonly origin: OriginRef } {
+	const input = requireObject(value, "ownerTarget");
+	if (Object.keys(input).some((key) => key !== "origin"))
+		throw new ConfigError("config_invalid", "ownerTarget may only contain origin");
+	try {
+		return { origin: validateOriginRef(input.origin as OriginRef) };
+	} catch (error) {
+		throw new ConfigError(
+			"config_invalid",
+			`ownerTarget.origin is invalid: ${error instanceof Error ? error.message : String(error)}`,
+		);
+	}
+}
+
 function parseStringArray(value: unknown, field: string): readonly string[] {
 	if (!Array.isArray(value) || value.some((item) => typeof item !== "string" || !item))
 		throw new ConfigError("config_invalid", `${field} must be a non-empty string array`);
@@ -190,6 +207,7 @@ export function parseConfigFile(value: unknown): GatewayConfigFile {
 			: { mentionAllowlist: parseStringArray(input.mentionAllowlist, "mentionAllowlist") }),
 		...(input.debounceMs === undefined ? {} : { debounceMs: parseDebounce(input.debounceMs, "debounceMs") }),
 		...(optionalString(input.model, "model") ? { model: optionalString(input.model, "model") } : {}),
+		...(input.ownerTarget === undefined ? {} : { ownerTarget: parseOwnerTarget(input.ownerTarget) }),
 	};
 }
 

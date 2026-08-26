@@ -203,6 +203,7 @@ function createRuntime(options: GatewayServerOptions): Runtime {
 		gjc: options.gjc,
 		memory,
 		delivery,
+		ownerTarget: options.config.ownerTarget,
 		emit: (payload) => {
 			for (const connection of connections)
 				if (connection.negotiated)
