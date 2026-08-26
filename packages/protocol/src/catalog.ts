@@ -33,6 +33,8 @@ export interface EngagementContext {
 	readonly authorName?: string;
 	/** Human-readable conversation label (channel/group name) when available. */
 	readonly channelLabel?: string;
+	/** Human-readable server/guild/workspace label when the platform has one above the channel. */
+	readonly serverLabel?: string;
 }
 
 export interface ChatSendParams {

@@ -20,14 +20,28 @@ function gitEnv(): Record<string, string> {
 }
 
 export async function memoryGit(root: string, args: readonly string[]): Promise<string> {
-	const child = Bun.spawn(["git", ...args], { cwd: root, env: gitEnv(), stdout: "pipe", stderr: "pipe" });
-	const [stdout, stderr, code] = await Promise.all([
-		new Response(child.stdout).text(),
-		new Response(child.stderr).text(),
-		child.exited,
-	]);
-	if (code !== 0) throw new Error(`memory git ${args[0]} failed: ${stderr.trim()}`);
-	return stdout.trim();
+	// posix_spawn can transiently fail with ENOENT/EAGAIN on a busy host even
+	// though git exists (observed under parallel test load); one bounded retry
+	// keeps a durable closure from failing on a scheduler hiccup.
+	for (let attempt = 0; ; attempt++) {
+		let child: ReturnType<typeof Bun.spawn>;
+		try {
+			child = Bun.spawn(["git", ...args], { cwd: root, env: gitEnv(), stdout: "pipe", stderr: "pipe" });
+		} catch (error) {
+			if (attempt === 0) {
+				await Bun.sleep(50);
+				continue;
+			}
+			throw error;
+		}
+		const [stdout, stderr, code] = await Promise.all([
+			new Response(child.stdout as ReadableStream).text(),
+			new Response(child.stderr as ReadableStream).text(),
+			child.exited,
+		]);
+		if (code !== 0) throw new Error(`memory git ${args[0]} failed: ${stderr.trim()}`);
+		return stdout.trim();
+	}
 }
 
 export async function initializeMemory(home: string): Promise<string> {

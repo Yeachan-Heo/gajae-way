@@ -246,7 +246,7 @@ test("debounced burst becomes one turn carrying the unread diff with speaker att
 	expect(turn.text).toContain("Unread messages in this conversation");
 	expect(turn.text).toContain("alice (author:u1, msg:m1): first message");
 	expect(turn.text).toContain("bob (author:u2, msg:m2): second message");
-	expect(turn.text).toContain("[bellman (author:owner, msg:m3) in discord channel c1]");
+	expect(turn.text).toContain("[bellman | discord channel c1 (author:owner, msg:m3)]");
 	expect(turn.text).toContain("@bot do the thing");
 	// Consumed context is not replayed on the next turn.
 	say("m4", "follow-up", "owner", "bellman", true);

@@ -82,17 +82,24 @@ export async function startUnixServer(options: GatewayServerOptions): Promise<Ga
 	void runtime.monitors.reconcile();
 	await runtime.monitorRuntime.start();
 	let stopping = false;
+	let stopPromise: Promise<void> | undefined;
 	let listener: ReturnType<typeof Bun.listen>;
-	const stop = async (reason = "shutdown requested") => {
-		if (stopping) return;
+	// Concurrent stop() calls (shutdown verb + owner teardown) must all await the
+	// SAME settling run: an early-returning duplicate let callers proceed while
+	// memory closure was still writing, racing filesystem teardown (live flake).
+	const stop = (reason = "shutdown requested") => {
+		if (stopPromise) return stopPromise;
 		stopping = true;
-		for (const connection of runtime.connections)
-			connection.write({ v: PROFILE_VERSION, type: "event", event: "gateway.stopping", payload: { reason } });
-		listener.stop(true);
-		clearInterval(runtime.reconcileTimer);
-		await runtime.monitorRuntime.stop();
-		await settleMemory(runtime);
-		await options.onStop?.();
+		stopPromise = (async () => {
+			for (const connection of runtime.connections)
+				connection.write({ v: PROFILE_VERSION, type: "event", event: "gateway.stopping", payload: { reason } });
+			listener.stop(true);
+			clearInterval(runtime.reconcileTimer);
+			await runtime.monitorRuntime.stop();
+			await settleMemory(runtime);
+			await options.onStop?.();
+		})();
+		return stopPromise;
 	};
 	listener = Bun.listen<{ connection: Connection }>({
 		unix: options.config.socketPath,
@@ -140,15 +147,19 @@ export function startStdioServer(options: GatewayServerOptions): GatewayServer {
 	};
 	runtime.connections.add(connection);
 	let stopping = false;
-	const stop = async (reason = "shutdown requested") => {
-		if (stopping) return;
+	let stopPromise: Promise<void> | undefined;
+	const stop = (reason = "shutdown requested") => {
+		if (stopPromise) return stopPromise;
 		stopping = true;
-		connection.write({ v: PROFILE_VERSION, type: "event", event: "gateway.stopping", payload: { reason } });
-		clearInterval(runtime.reconcileTimer);
-		await runtime.monitorRuntime.stop();
-		connection.close();
-		await settleMemory(runtime);
-		await options.onStop?.();
+		stopPromise = (async () => {
+			connection.write({ v: PROFILE_VERSION, type: "event", event: "gateway.stopping", payload: { reason } });
+			clearInterval(runtime.reconcileTimer);
+			await runtime.monitorRuntime.stop();
+			connection.close();
+			await settleMemory(runtime);
+			await options.onStop?.();
+		})();
+		return stopPromise;
 	};
 	process.stdin.on("data", (data: Buffer) => {
 		try {
@@ -653,10 +664,14 @@ async function runInboundTurn(
 				authorId?: string;
 				authorName?: string;
 				channelLabel?: string;
+				serverLabel?: string;
 			})
 		: undefined;
 	const speaker = engagement?.authorName ?? engagement?.authorId;
-	const place = engagement?.channelLabel ?? `${origin.platform} ${origin.kind} ${origin.conversationId}`;
+	// "channel | server" when the platform labels both (e.g. "#playground-ko | GAJAE").
+	const place =
+		[engagement?.channelLabel, engagement?.serverLabel].filter(Boolean).join(" | ") ||
+		`${origin.platform} ${origin.kind} ${origin.conversationId}`;
 	// Compose the turn: everything said in this conversation since the persona's
 	// last reply (the read-cursor diff), then the triggering message with speaker
 	// attribution — so the persona always reads "the messages above".
@@ -670,7 +685,7 @@ async function runInboundTurn(
 		const header = lines.length
 			? `[Unread messages in this conversation since your last reply]\n${lines.join("\n")}\n\n`
 			: "";
-		turnText = `${header}${speaker ? `[${speaker} (author:${engagement?.authorId ?? "?"}, msg:${row.message_id}) in ${place}]\n` : ""}${userText}`;
+		turnText = `${header}${speaker ? `[${speaker} | ${place} (author:${engagement?.authorId ?? "?"}, msg:${row.message_id})]\n` : ""}${userText}`;
 		options.database.contextConsume([...unread.map((entry) => entry.message_id), row.message_id]);
 	}
 	let text: string;

@@ -47,6 +47,7 @@ export interface DiscordInboundMessage extends DiscordMessageOriginShape {
 	readonly content: string;
 	readonly author: { readonly id: string; readonly bot?: boolean; readonly username?: string };
 	readonly mentions?: { has(user: unknown): boolean };
+	readonly guild?: { readonly name?: string } | null;
 }
 
 /** Bounded inbound message-id memory prevents gateway replay/reconnect duplicate turns. */
@@ -78,6 +79,7 @@ export function engagementForMessage(message: DiscordInboundMessage, botUser: un
 		authorId: message.author.id,
 		...(message.author.username ? { authorName: message.author.username } : {}),
 		...(message.channel.name ? { channelLabel: `#${message.channel.name}` } : {}),
+		...(message.guild?.name ? { serverLabel: message.guild.name } : {}),
 	};
 }
 
