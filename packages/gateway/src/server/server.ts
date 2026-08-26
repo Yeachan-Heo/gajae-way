@@ -6,6 +6,7 @@ import {
 	FrameDecoder,
 	type HelloPayload,
 	LOOPBACK_ORIGIN,
+	isSilenceToken,
 	negotiate,
 	originKey,
 	PROFILE_VERSION,
@@ -620,6 +621,11 @@ async function runInboundTurn(
 			`user: ${userText.slice(0, 500)}\nassistant: ${text.slice(0, 500)}`,
 		);
 	});
+	// Spec fact 22: a reply that is exactly a silence token means the persona chose not to
+	// speak. The observation is already recorded above, so nothing is delivered and no daily
+	// capture is written. This is what makes an `open` channel usable: the persona can read
+	// every message in the room without answering all of them.
+	if (isSilenceToken(text)) return;
 	if (!nonLoopback) {
 		connection.write({
 			v: PROFILE_VERSION,
