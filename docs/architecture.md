@@ -1,0 +1,54 @@
+# Architecture
+
+## Runtime layout
+
+The Bun workspace is divided into small packages:
+
+| Package | Responsibility |
+|---|---|
+| `@gajaeway/protocol` | Versioned NDJSON frames, negotiation, verb/event catalogues, and canonical origins. |
+| `@gajaeway/sdk` | Client for the gateway’s Unix-domain socket or stdio transport. |
+| `@gajaeway/gateway` | Daemon: configuration, SQLite state, sessions, delivery, memory, monitors, and the `gjc` boundary. |
+| `@gajaeway/adapter-discord` | Discord ingress and outbound delivery, including typing hints. |
+| `@gajaeway/adapter-telegram` | Telegram ingress and outbound delivery. |
+| `@gajaeway/cli` | Owner commands over the gateway socket. |
+
+`bun run build` compiles the gateway, Discord adapter, Telegram adapter, and CLI into standalone executables. The gateway still invokes the external `gjc` executable for session creation and each turn.
+
+## Wire protocol and negotiation
+
+Gateway clients exchange newline-delimited JSON frames over a Unix socket (or stdio). A frame has a profile version and a type: `hello`, `negotiated`, `request`, `response`, `event`, or `error`; an encoded frame is capped at 1 MiB.
+
+A client must start with `hello`, listing `supportedVersions` and optionally `requiredCapabilities`. The server chooses the highest mutually supported profile version, currently from `0.1` and `1.0`, and returns its capability list. No common version produces `incompatible_profile_version`; a missing required capability produces `missing_required_capability`. Unknown optional fields are ignored, while required capabilities are explicit compatibility checks. Requests then invoke catalogued verbs and asynchronous events include `chat.message`, `monitor.event`, and `gateway.stopping`.
+
+## Conversation identity and sessions
+
+An origin is a validated, platform-neutral record: platform, kind, conversation ID, and (only where appropriate) parent or peer IDs. Platforms are `loopback`, `discord`, `telegram`, and `monitor`; kinds include DM, channel, thread, topic, loopback, and monitor event type. The only canonical identity string is `originKey`:
+
+```text
+platform/kind/conversationId[/parent=…][/peer=…]
+```
+
+It is opaque after creation—callers must not parse it back into fields. Each origin key has one `gjc` session and an epoch. `/new` (and `/reset`) increments that origin’s epoch and binds the next turn to a new session, leaving other origins untouched. Session creation is idempotent and includes the gateway instance, normalized origin key, and epoch, so a crash around creation can safely retry.
+
+Turns are serialized by origin key with `KeyedQueue`. Different conversations can work concurrently, but two messages for the same origin cannot race two `gjc --resume` processes. Each `gjc` child—creation or a turn—has a 300-second ceiling. A failing platform turn generates the visible, ledgered notice:
+
+```text
+[turn failed] The reply could not be produced (timeout or runtime error). Try again, or send /new to rebind this conversation.
+```
+
+The persona preamble comes from `SOUL.md`, `AGENTS.md`, and `USER.md` in `$GAJAEWAY_HOME/workspace`; the same directory is passed to `gjc` as the session working directory.
+
+## Delivery and crash semantics
+
+Before an outbound reply is emitted, the gateway creates a durable ledger item. States are `pending`, `inflight`, `confirmed`, `failed_ambiguous`, and `expired`. Adapters mark an item inflight before attempting platform delivery and confirm it after success. A non-ambiguous failure returns to `pending` with exponential backoff; after three attempts it expires. An ambiguous failure stays `failed_ambiguous`.
+
+At negotiated connection time, adapters receive unsettled deliveries created within the last 24 hours. This is deliberately at-least-once delivery: an `inflight` or `failed_ambiguous` item is reissued with `redelivered: true` and `duplicateWarning: true`. Platform adapters must display the duplicate warning. Confirmed or expired records are not replayed; old settled records are pruned after seven days.
+
+## Engagement and safety floors
+
+Loopback and DMs engage automatically. Group traffic engages only when the adapter reports a mention, or the configured channel is explicitly `engagement: "open"`. Unconfigured group traffic therefore remains mention-gated.
+
+The gateway gives `gjc` unoverridable ActionGuard guidance. It forbids unrecoverable commands such as recursive removal of `/`, filesystem formatting, raw device writes, and fork bombs. It also refuses recursive deletion of `$HOME` itself or absolute paths outside `$HOME` and `$GAJAEWAY_HOME`. These are floors, not a configurable permission bypass.
+
+See [deployment](deployment.md), [memory](memory.md), and [monitors](monitors.md) for operational details.
