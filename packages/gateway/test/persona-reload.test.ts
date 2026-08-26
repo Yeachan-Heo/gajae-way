@@ -69,6 +69,9 @@ test("persona USER.md edits are included on the next turn", async () => {
 		expect(seen).toHaveLength(2);
 		expect(seen[0]).toContain("first");
 		expect(seen[1]).toContain("second");
+		// Session-context grounding: every preamble names the bound conversation.
+		expect(seen[0]).toContain("## Current conversation");
+		expect(seen[0]).toContain("loopback");
 		socket.end();
 	} finally {
 		await server.stop();

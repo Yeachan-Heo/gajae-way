@@ -8,6 +8,7 @@ import {
 	isSilenceToken,
 	LOOPBACK_ORIGIN,
 	negotiate,
+	type OriginRef,
 	originKey,
 	PROFILE_VERSION,
 	ProtocolError,
@@ -620,7 +621,7 @@ async function runInboundTurn(
 	try {
 		const epoch = options.database.getSessionRecord(key)?.epoch ?? 0;
 		const { sessionId } = await options.gjc.ensureSession(key, epoch);
-		const preamble = `${await runtime.persona.systemPreamble()}\n\n${ACTION_GUARD_SYSTEM_NOTICE}`;
+		const preamble = `${await runtime.persona.systemPreamble()}\n\n${currentConversationNotice(origin)}\n\n${ACTION_GUARD_SYSTEM_NOTICE}`;
 		text = await options.gjc.sendTurn(sessionId, userText, preamble, emitProgress);
 	} catch (error) {
 		// Never ghost a platform conversation: a failed turn still produces a visible,
@@ -674,6 +675,25 @@ async function runInboundTurn(
 		if (recipient.negotiated) recipient.write({ v: PROFILE_VERSION, type: "event", event: "chat.message", payload });
 	// Durable intent is persisted synchronously; closure work deliberately does not delay delivery.
 	runtime.memory.enqueue({ kind: "daily_capture", originRefJson: JSON.stringify(origin), userText, replyText: text });
+}
+
+/**
+ * Session-context grounding (live finding: without it the persona could not
+ * tell which conversation it was in and imported other origins' memory as if
+ * it had been said here).
+ */
+function currentConversationNotice(origin: OriginRef): string {
+	const where =
+		origin.kind === "dm"
+			? `a PRIVATE direct-message conversation (${origin.platform} DM ${origin.conversationId}, peer ${origin.peerId})`
+			: origin.kind === "loopback"
+				? "the local loopback console"
+				: `a ${origin.kind === "channel" ? "PUBLIC/group channel" : origin.kind} (${origin.platform} ${origin.kind} ${origin.conversationId})`;
+	return [
+		"## Current conversation",
+		`You are replying inside ${where}. This session is bound to exactly this one conversation.`,
+		`Shared memory (memory/daily and canonical axes) records EVERY conversation, each entry tagged with its origin. Entries whose origin differs from ${origin.platform}/${origin.kind}/${origin.conversationId} happened elsewhere: treat them as background knowledge only, never as something said here, and do not import their topics or in-flight work into this conversation unprompted.`,
+	].join("\n");
 }
 function writeError(connection: Connection, error: unknown, id?: string): void {
 	const protocol = error instanceof ProtocolError ? error : new ProtocolError("verb_failed", "gateway request failed");
