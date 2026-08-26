@@ -1,6 +1,8 @@
 import { chmod, mkdir } from "node:fs/promises";
 import { join } from "node:path";
 import { type ConfigOverrides, loadConfig } from "./config";
+import { seedDefaultMonitors } from "./monitors/defaults";
+import { MonitorRegistry } from "./monitors/registry";
 import { GjcClient } from "./orchestrator/gjc-client";
 import { PersonaLoader } from "./persona/persona";
 import { type GatewayServer, startStdioServer, startUnixServer } from "./server/server";
@@ -16,6 +18,9 @@ export async function bootGateway(
 	const database = await GatewayDatabase.open(config.dbPath);
 	const persona = new PersonaLoader(config.home);
 	await persona.ensureWorkspace();
+	// Generic product default: memory maintenance crons exist on every fresh
+	// deployment (seeded once; operator removals are never resurrected).
+	seedDefaultMonitors(new MonitorRegistry(database), database);
 	const ledger = new DeliveryLedger(database);
 	const pruned = ledger.prune(7 * 24 * 60 * 60 * 1000);
 	const pending = ledger.listUndelivered(24 * 60 * 60 * 1000).length;

@@ -99,3 +99,27 @@ test("watcher and script honor allowlists and ActionGuard", async () => {
 test("catch-all origin retains undeclared event identity", () => {
 	expect(originKey(CATCH_ALL_EVENT_ORIGIN)).toBe("monitor/eventtype/catch-all");
 });
+
+test("default memory monitors seed once and respect operator removals", async () => {
+	const { mkdtemp: mkTemp } = await import("node:fs/promises");
+	const { tmpdir: tmp } = await import("node:os");
+	const { join: joinPath } = await import("node:path");
+	const { GatewayDatabase: Db } = await import("../src/store/db");
+	const { MonitorRegistry: Registry } = await import("../src/monitors/registry");
+	const { seedDefaultMonitors } = await import("../src/monitors/defaults");
+	const dir = await mkTemp(joinPath(tmp(), "gajaeway-seed-"));
+	const database = await Db.open(joinPath(dir, "gateway.db"));
+	const registry = new Registry(database);
+	expect(seedDefaultMonitors(registry, database)).toBe(2);
+	const names = registry.list().map((monitor) => monitor.name);
+	expect(names).toContain("memory-canonicalize");
+	expect(names).toContain("memory-audit");
+	// Second boot: flag prevents reseeding.
+	expect(seedDefaultMonitors(registry, database)).toBe(0);
+	// Operator removal survives later boots.
+	const canonical = registry.list().find((monitor) => monitor.name === "memory-canonicalize");
+	registry.remove(canonical?.monitorId ?? "");
+	expect(seedDefaultMonitors(registry, database)).toBe(0);
+	expect(registry.list().map((monitor) => monitor.name)).not.toContain("memory-canonicalize");
+	database.close();
+});

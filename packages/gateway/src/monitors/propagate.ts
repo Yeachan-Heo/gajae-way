@@ -5,6 +5,14 @@ import type { GjcPort } from "../orchestrator/gjc-client";
 import type { GatewayDatabase } from "../store/db";
 import type { MonitorRegistry } from "./registry";
 
+/** Product-level semantics for the seeded maintenance events (generic, persona-independent). */
+const MAINTENANCE_GUIDANCE: Record<string, string | undefined> = {
+	"memory.canonicalize":
+		"For memory.canonicalize events: read the memory tree's daily/ captures, append the durable facts into their canonical axis files (people/ projects/ decisions/ events/ tasks/ channels/), keep every original byte (never delete or summarize-replace, move stray root files into an axis directory with their raw content preserved), and make new files reachable from MEMORY.md. The gateway commits; you only write files.",
+	"memory.audit":
+		"For memory.audit events: run the memory validator (gajaeway memory audit) and put a one-line pass report or the failure diagnostics plus your repair attempt into the note.",
+};
+
 export class MonitorPropagator {
 	readonly #database: GatewayDatabase;
 	readonly #registry: MonitorRegistry;
@@ -103,7 +111,11 @@ export class MonitorPropagator {
 				originKey(sessionOrigin),
 				this.#database.getSessionRecord(originKey(sessionOrigin))?.epoch ?? 0,
 			);
-			const prompt = `Author monitor events. Respond ONLY with a JSON array containing exactly one {"eventId","note"} entry per event: ${JSON.stringify(rows.map((row) => ({ eventId: row.event_id, eventType: row.event_type, payload: JSON.parse(row.payload_json) })))}`;
+			const guidance = rows
+				.map((row) => MAINTENANCE_GUIDANCE[row.event_type])
+				.filter((entry, index, all) => entry && all.indexOf(entry) === index)
+				.join(" ");
+			const prompt = `Author monitor events.${guidance ? ` ${guidance}` : ""} Respond ONLY with a JSON array containing exactly one {"eventId","note"} entry per event: ${JSON.stringify(rows.map((row) => ({ eventId: row.event_id, eventType: row.event_type, payload: JSON.parse(row.payload_json) })))}`;
 			const response = await this.#gjc.sendTurn(sessionId, prompt);
 			this.#database.withTransaction(() => {
 				for (const row of rows) this.#database.monitorEventUpdate(row.event_id, "dispatched", batchId);

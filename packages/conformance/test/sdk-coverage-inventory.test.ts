@@ -38,6 +38,10 @@ function harvest(pattern: RegExp): Set<string> {
 		// The gjc vendor adapter speaks gjc's own SDK protocol (session.create
 		// ops etc.), not the gajaeway profile; it is outside the inventory.
 		if (file.endsWith("gjc-client.ts")) continue;
+		// Monitor EVENT TYPE names (memory.canonicalize etc.) are data flowing through
+		// the monitor pipeline, not protocol verbs/events; the seeded defaults and the
+		// per-type authoring guidance reference them as plain strings.
+		if (file.endsWith("monitors/defaults.ts") || file.endsWith("monitors/propagate.ts")) continue;
 		const text = readFileSync(file, "utf8");
 		for (const match of text.matchAll(pattern)) {
 			const name = match[1];

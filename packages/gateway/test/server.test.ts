@@ -244,9 +244,9 @@ test("debounced burst becomes one turn carrying the unread diff with speaker att
 	const turn = turns[0]!;
 	// The two earlier burst messages arrive as the unread diff, the newest as the trigger.
 	expect(turn.text).toContain("Unread messages in this conversation");
-	expect(turn.text).toContain("alice: first message");
-	expect(turn.text).toContain("bob: second message");
-	expect(turn.text).toContain("[bellman in discord channel c1]");
+	expect(turn.text).toContain("alice (author:u1, msg:m1): first message");
+	expect(turn.text).toContain("bob (author:u2, msg:m2): second message");
+	expect(turn.text).toContain("[bellman (author:owner, msg:m3) in discord channel c1]");
 	expect(turn.text).toContain("@bot do the thing");
 	// Consumed context is not replayed on the next turn.
 	say("m4", "follow-up", "owner", "bellman", true);
@@ -299,5 +299,48 @@ test("group turns carry silence guidance: listeners are told to default to [SILE
 	// The silence-token reply suppresses delivery: no chat.message event arrives.
 	await Bun.sleep(50);
 	expect(client.frames.filter((frame) => frame.type === "event" && frame.event === "chat.message")).toHaveLength(0);
+	client.close();
+});
+
+test("[REPLY:id] parts thread to the referenced message and strip the directive", async () => {
+	directory = await mkdtemp(join(tmpdir(), "gajaeway-server-"));
+	const config: GatewayConfig = {
+		schemaVersion: 1,
+		home: directory,
+		configPath: join(directory, "config.json"),
+		socketPath: join(directory, "gateway.sock"),
+		dbPath: join(directory, "gateway.db"),
+		logVerbosity: "info",
+	};
+	const database = await GatewayDatabase.open(config.dbPath);
+	const gjc: GjcPort = {
+		ensureSession: async () => ({ sessionId: "mock-session" }),
+		sendTurn: async () => "[REPLY:msg-42] threaded answer\n[BREAK]\nplain follow-up",
+	};
+	server = await startUnixServer({ config, database, gjc, onStop: () => database.close() });
+	const client = await connect(config.socketPath);
+	client.send({ v: "0.1", type: "hello", payload: { supportedVersions: ["0.1"] } });
+	await waitFor(client.frames, 1);
+	client.send({
+		v: "0.1",
+		type: "request",
+		id: "dm",
+		verb: "chat.send",
+		params: {
+			origin: { platform: "discord", kind: "dm", conversationId: "c1", peerId: "p1" },
+			text: "hello",
+			messageId: "m-1",
+			engagement: { mentioned: false, group: false, authorId: "p1" },
+		},
+	});
+	for (let attempt = 0; attempt < 400; attempt++) {
+		if (client.frames.filter((frame) => frame.type === "event" && frame.event === "chat.message").length >= 2) break;
+		await Bun.sleep(5);
+	}
+	const messages = client.frames.filter((frame) => frame.type === "event" && frame.event === "chat.message");
+	expect(messages).toHaveLength(2);
+	expect(messages[0].payload).toMatchObject({ text: "threaded answer", replyToMessageId: "msg-42" });
+	expect(messages[1].payload.text).toBe("plain follow-up");
+	expect(messages[1].payload.replyToMessageId).toBeUndefined();
 	client.close();
 });

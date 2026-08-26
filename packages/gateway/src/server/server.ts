@@ -665,12 +665,12 @@ async function runInboundTurn(
 		const unread = options.database.contextUnread(key, 100).filter((entry) => entry.message_id !== row.message_id);
 		const lines = unread.map(
 			(entry) =>
-				`- [${entry.received_at}] ${entry.author_name ?? entry.author_id ?? "unknown"}: ${entry.body.slice(0, 1000)}`,
+				`- [${entry.received_at}] ${entry.author_name ?? "unknown"} (author:${entry.author_id ?? "?"}, msg:${entry.message_id}): ${entry.body.slice(0, 1000)}`,
 		);
 		const header = lines.length
 			? `[Unread messages in this conversation since your last reply]\n${lines.join("\n")}\n\n`
 			: "";
-		turnText = `${header}${speaker ? `[${speaker} in ${place}]\n` : ""}${userText}`;
+		turnText = `${header}${speaker ? `[${speaker} (author:${engagement?.authorId ?? "?"}, msg:${row.message_id}) in ${place}]\n` : ""}${userText}`;
 		options.database.contextConsume([...unread.map((entry) => entry.message_id), row.message_id]);
 	}
 	let text: string;
@@ -759,7 +759,12 @@ async function runInboundTurn(
 		.filter((part) => part.length > 0 && !isSilenceToken(part))
 		.slice(0, 5);
 	for (const part of parts) {
-		const payload = runtime.delivery.prepare(crypto.randomUUID(), origin, part);
+		// Reply-threading: a part may open with [REPLY:<platform message id>] to
+		// answer a specific message; mentions are plain <@author id> in the text.
+		const replyMatch = part.match(/^\[REPLY:([^\]\s]+)\]\s*/);
+		const body = replyMatch ? part.slice(replyMatch[0].length).trim() : part;
+		if (!body) continue;
+		const payload = runtime.delivery.prepare(crypto.randomUUID(), origin, body, replyMatch?.[1]);
 		if (!payload) continue;
 		runtime.delivery.markInflight(payload.deliveryId as string);
 		for (const recipient of runtime.connections)

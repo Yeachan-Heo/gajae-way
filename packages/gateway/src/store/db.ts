@@ -582,6 +582,16 @@ export class GatewayDatabase {
 		return row.value;
 	}
 
+	metaGet(key: string): string | undefined {
+		return this.#database.query<{ value: string }, [string]>("SELECT value FROM meta WHERE key = ?").get(key)?.value;
+	}
+
+	metaSet(key: string, value: string): void {
+		this.#database
+			.query("INSERT INTO meta (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value")
+			.run(key, value);
+	}
+
 	private integrityCheck(): void {
 		const result = this.integrityCheckDetail();
 		if (result !== "ok")

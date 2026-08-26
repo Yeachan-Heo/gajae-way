@@ -77,6 +77,8 @@ export interface ChatMessagePayload {
 	 * delivery.confirm / delivery.fail.
 	 */
 	readonly deliveryId?: string;
+	/** Platform message id this message replies to (reply-threading), when the persona chose one. */
+	readonly replyToMessageId?: string;
 	/** True when re-emitted from the ledger after a restart. */
 	readonly redelivered?: boolean;
 	/**

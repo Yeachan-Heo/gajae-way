@@ -24,7 +24,9 @@ export interface GatewayClientLike {
 }
 
 export interface DiscordTextChannelLike {
-	send(text: string): Promise<unknown>;
+	send(
+		payload: string | { content: string; reply?: { messageReference: string; failIfNotExists?: boolean } },
+	): Promise<unknown>;
 }
 
 export interface DiscordTypingChannelLike {
@@ -285,7 +287,18 @@ export async function settleDiscordDelivery(
 			});
 		}
 		const text = message.duplicateWarning ? `[recovered - may be a duplicate] ${message.text}` : message.text;
-		for (const chunk of chunkDiscordMessage(text)) await channel.send(chunk);
+		const chunks = chunkDiscordMessage(text);
+		for (let index = 0; index < chunks.length; index++) {
+			// Reply-threading applies to the first chunk only; failIfNotExists keeps a
+			// deleted target from failing the whole delivery.
+			const chunk = chunks[index] as string;
+			if (index === 0 && message.replyToMessageId)
+				await channel.send({
+					content: chunk,
+					reply: { messageReference: message.replyToMessageId, failIfNotExists: false },
+				});
+			else await channel.send(chunk);
+		}
 		await gateway.request("delivery.confirm", { deliveryId });
 	} catch (error) {
 		await gateway.request("delivery.fail", {
