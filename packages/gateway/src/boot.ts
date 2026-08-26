@@ -22,7 +22,7 @@ export async function bootGateway(
 	// The persona lives in its own dedicated workspace, never in the gateway's
 	// process cwd (which is typically the product source checkout): a session
 	// bound to the app repo reports that repo's git state as its own.
-	const gjc = new GjcClient(database, undefined, join(config.home, "workspace"));
+	const gjc = new GjcClient(database, config.turnTimeoutMs, join(config.home, "workspace"));
 	const startedAt = new Date().toISOString();
 	const close = async () => database.close();
 	const server = options.stdio

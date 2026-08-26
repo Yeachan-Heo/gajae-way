@@ -2,7 +2,7 @@ import { afterEach, expect, test } from "bun:test";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { type ConfigError, loadConfig, reloadConfig } from "../src/config";
+import { type ConfigError, loadConfig, parseConfigFile, reloadConfig } from "../src/config";
 
 const homes: string[] = [];
 afterEach(async () => {
@@ -55,4 +55,11 @@ test("atomic reload keeps the last valid config on validation failure", async ()
 		expect(result.config).toBe(current);
 		expect(result.diagnostics[0]?.code).toBe("config_invalid");
 	}
+});
+
+test("turnTimeoutMs parses when bounded and rejects out-of-range values", () => {
+	expect(parseConfigFile({ schemaVersion: 1, turnTimeoutMs: 900_000 }).turnTimeoutMs).toBe(900_000);
+	expect(parseConfigFile({ schemaVersion: 1 }).turnTimeoutMs).toBeUndefined();
+	expect(() => parseConfigFile({ schemaVersion: 1, turnTimeoutMs: 5_000 })).toThrow("turnTimeoutMs");
+	expect(() => parseConfigFile({ schemaVersion: 1, turnTimeoutMs: "long" })).toThrow("turnTimeoutMs");
 });
