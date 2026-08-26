@@ -212,7 +212,12 @@ test("working status posts one amended message per conversation and clears on de
 	};
 	const discord: DiscordClientLike = {
 		channels: {
-			fetch: async () => ({ send: async (text: string) => (sent.push(text), statusMessage) }),
+			fetch: async () => ({
+				send: async (text: string) => {
+					sent.push(text);
+					return statusMessage;
+				},
+			}),
 		},
 	};
 	const status = new WorkingStatus(discord, { error: () => {} });
@@ -231,7 +236,11 @@ test("working status posts one amended message per conversation and clears on de
 
 test("working status ignores non-discord progress and survives channel failures", async () => {
 	const failing: DiscordClientLike = {
-		channels: { fetch: async () => { throw new Error("network down"); } },
+		channels: {
+			fetch: async () => {
+				throw new Error("network down");
+			},
+		},
 	};
 	const status = new WorkingStatus(failing, { error: () => {} });
 	await status.update({
