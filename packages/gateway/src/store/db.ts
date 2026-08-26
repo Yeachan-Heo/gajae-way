@@ -2,7 +2,16 @@ import { Database } from "bun:sqlite";
 import { mkdir } from "node:fs/promises";
 import { dirname } from "node:path";
 
-const LATEST_SCHEMA_VERSION = 6;
+const LATEST_SCHEMA_VERSION = 7;
+
+export interface InboundMessageRow {
+	readonly message_id: string;
+	readonly origin_key: string;
+	readonly origin_ref_json: string;
+	readonly body: string;
+	readonly engagement_json: string | null;
+	readonly received_at: string;
+}
 
 export class DatabaseStartupError extends Error {
 	readonly code: "newer_schema" | "integrity_check_failed";
@@ -135,6 +144,65 @@ export class GatewayDatabase {
 			payload_json: string;
 			state: "queued" | "written" | "committed" | "receipted" | "quarantined";
 		}>;
+	}
+
+	/** The insert is the acceptance boundary: dispatch may only start once the row is durable. */
+	inboundEnqueue(row: {
+		messageId: string;
+		originKey: string;
+		originRefJson: string;
+		body: string;
+		engagementJson?: string;
+	}): boolean {
+		const changes = this.#database
+			.query(
+				"INSERT INTO inbound_messages (message_id, origin_key, origin_ref_json, body, engagement_json, state, received_at) VALUES (?, ?, ?, ?, ?, 'pending', ?) ON CONFLICT(message_id) DO NOTHING",
+			)
+			.run(
+				row.messageId,
+				row.originKey,
+				row.originRefJson,
+				row.body,
+				row.engagementJson ?? null,
+				new Date().toISOString(),
+			);
+		return changes.changes > 0;
+	}
+
+	/** Claims the oldest pending message for an origin, so replay and live dispatch cannot double-run it. */
+	inboundClaimNext(originKey: string): InboundMessageRow | undefined {
+		return this.withTransaction(() => {
+			const row = this.#database
+				.query<InboundMessageRow, [string]>(
+					"SELECT message_id, origin_key, origin_ref_json, body, engagement_json, received_at FROM inbound_messages WHERE origin_key = ? AND state = 'pending' ORDER BY received_at, message_id LIMIT 1",
+				)
+				.get(originKey);
+			if (!row) return undefined;
+			this.#database
+				.query("UPDATE inbound_messages SET state = 'processing' WHERE message_id = ?")
+				.run(row.message_id);
+			return row;
+		});
+	}
+
+	inboundComplete(messageId: string): void {
+		this.#database.query("UPDATE inbound_messages SET state = 'done' WHERE message_id = ?").run(messageId);
+	}
+
+	/** Startup recovery: a turn killed mid-flight must not strand its claimed message. */
+	inboundRecoverProcessing(): number {
+		return this.#database.query("UPDATE inbound_messages SET state = 'pending' WHERE state = 'processing'").run()
+			.changes;
+	}
+
+	inboundPendingCount(originKey: string): number {
+		return (
+			this.#database
+				.query<{ n: number }, [string]>(
+					"SELECT COUNT(*) AS n FROM inbound_messages WHERE origin_key = ? AND state = 'pending'",
+				)
+				.get(originKey)?.n ?? 0
+		);
 	}
 
 	getSession(originKey: string): string | undefined {
@@ -420,6 +488,18 @@ export class GatewayDatabase {
 				this.#database
 					.query("INSERT INTO schema_migrations (version, applied_at) VALUES (?, ?)")
 					.run(6, new Date().toISOString());
+			});
+		}
+		if (current < 7) {
+			this.withTransaction(() => {
+				// Inbound messages must be durable before dispatch: a message arriving while a turn is
+				// in flight was previously processed transiently and lost outright.
+				this.#database.exec(
+					"CREATE TABLE inbound_messages (message_id TEXT PRIMARY KEY, origin_key TEXT NOT NULL, origin_ref_json TEXT NOT NULL, body TEXT NOT NULL, engagement_json TEXT, state TEXT NOT NULL CHECK(state IN ('pending','processing','done')), received_at TEXT NOT NULL); CREATE INDEX inbound_messages_claim ON inbound_messages (origin_key, state, received_at)",
+				);
+				this.#database
+					.query("INSERT INTO schema_migrations (version, applied_at) VALUES (?, ?)")
+					.run(7, new Date().toISOString());
 			});
 		}
 	}

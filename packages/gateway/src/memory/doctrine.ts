@@ -76,7 +76,13 @@ export async function appendDaily(
 ): Promise<string> {
 	const date = new Date().toISOString().slice(0, 10);
 	const path = join(root, "daily", `${date}.md`);
-	const bounded = (text: string) => text.slice(0, 500).replaceAll("\u0000", "");
+	// Each field must stay on one physical line: a captured newline would let reply text
+	// containing "## " forge an entry delimiter and escape its own list item.
+	const bounded = (text: string) =>
+		text
+			.slice(0, 500)
+			.replaceAll("\u0000", "")
+			.replaceAll(/\r\n|\r|\n/g, "\\n");
 	const entry = `\n## ${new Date().toISOString()}\n\n- origin: ${bounded(originRefJson)}\n- user: ${bounded(userText)}\n- reply: ${bounded(replyText)}\n`;
 	await appendFile(path, entry, { encoding: "utf8" });
 	await regenerateMap(root);
