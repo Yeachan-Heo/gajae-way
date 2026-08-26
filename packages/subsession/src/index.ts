@@ -36,7 +36,6 @@ export {
 } from "./lane";
 export {
 	assertValidOpRef,
-	classifyState,
 	isOpRefRejection,
 	MAX_OP_REF_LENGTH,
 	newOpRef,
@@ -51,3 +50,30 @@ export {
 	type SendReceipt,
 	sendPrompt,
 } from "./send";
+export {
+	fetchOpState,
+	isPromptStatus,
+	isTerminalStatus,
+	judgeOperation,
+	type OperationJudgement,
+	type PromptOutcomeBody,
+	type PromptStatus,
+	type PromptStatusBody,
+	parseStatusReport,
+	projectOpState,
+	type ReceiptState,
+	requiresOperatorHold,
+	type SessionAuthority,
+	type StatusReport,
+	type StopReason,
+	type SupervisorOpState,
+} from "./status";
+export {
+	assertNoRetentionGap,
+	fetchLastAssistant,
+	type LastAssistantResult,
+	RetentionGapError,
+	type TailEvent,
+	TranscriptIncompleteError,
+	type TranscriptPage,
+} from "./transcript";

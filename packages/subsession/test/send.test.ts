@@ -3,7 +3,6 @@ import type { CliResult, ControllerOptions } from "../src/cli";
 import { GjcCliError } from "../src/cli";
 import {
 	assertValidOpRef,
-	classifyState,
 	isOpRefRejection,
 	MAX_OP_REF_LENGTH,
 	newOpRef,
@@ -166,24 +165,6 @@ describe("sendPrompt", () => {
 	});
 });
 
-describe("classifyState", () => {
-	test.each(["completed", "failed", "cancelled", "error"])("%s is terminal", (state) => {
-		expect(classifyState(state).terminal).toBe(true);
-	});
-
-	test("wait_timeout is NOT terminal: the turn is still running", () => {
-		expect(classifyState("wait_timeout").terminal).toBe(false);
-	});
-
-	test.each(["running", "active", "pending", "accepted"])("%s is not terminal", (state) => {
-		expect(classifyState(state).terminal).toBe(false);
-	});
-
-	test("an unknown state is treated as still running", () => {
-		expect(classifyState("something-new").terminal).toBe(false);
-	});
-});
-
 describe("pollStatus", () => {
 	const receipt: SendReceipt = {
 		sessionId: SESSION,
@@ -194,20 +175,46 @@ describe("pollStatus", () => {
 
 	test("reconciles a stored receipt by sessionId and op-ref", async () => {
 		const calls: string[][] = [];
-		const options = controller({ state: "running" }, calls);
+		const options = controller(
+			{ operationRef: "gw-pr-a-01hq", status: { status: "in_flight", receiptState: "absent" } },
+			calls,
+		);
 		const outcome = await pollStatus(options, receipt);
 		expect(calls[0]).toEqual(["sdk", "session", "status", SESSION, "gw-pr-a-01hq", "--repo", WORKTREE]);
-		expect(outcome).toMatchObject({ state: "running", terminal: false });
+		expect(outcome).toMatchObject({ state: "running", terminal: false, hold: false });
 	});
 
-	test("marks a completed op terminal", async () => {
-		const outcome = await pollStatus(controller({ status: "completed" }), receipt);
-		expect(outcome).toMatchObject({ state: "completed", terminal: true });
+	test("projects a terminal_ok end_turn as a completed deliverable", async () => {
+		const outcome = await pollStatus(
+			controller({
+				status: {
+					status: "terminal_ok",
+					receiptState: "present",
+					outcome: { kind: "stopped", reason: "end_turn" },
+				},
+			}),
+			receipt,
+		);
+		expect(outcome).toMatchObject({ state: "completed", terminal: true, hold: false });
 	});
 
-	test("an absent state is not treated as done", async () => {
-		const outcome = await pollStatus(controller({}), receipt);
-		expect(outcome).toMatchObject({ state: "unknown", terminal: false });
+	test("a client cancel is terminal but not completed", async () => {
+		const outcome = await pollStatus(
+			controller({
+				status: {
+					status: "terminal_ok",
+					receiptState: "present",
+					outcome: { kind: "stopped", reason: "cancelled", provenance: "client_cancel" },
+				},
+			}),
+			receipt,
+		);
+		expect(outcome).toMatchObject({ state: "cancelled", terminal: true });
+	});
+
+	test("unknown is neither terminal nor auto-resumed: it holds", async () => {
+		const outcome = await pollStatus(controller({ status: { status: "unknown", receiptState: "unknown" } }), receipt);
+		expect(outcome).toMatchObject({ state: "terminal_uncertain", terminal: false, hold: true });
 	});
 });
 
@@ -265,7 +272,7 @@ describe("reconcileOrSend", () => {
 
 	test("resumes a stored receipt instead of resending after a restart", async () => {
 		const calls: string[][] = [];
-		const options = controller({ state: "running" }, calls);
+		const options = controller({ status: { status: "in_flight" } }, calls);
 		const result = await reconcileOrSend(options, {
 			sessionId: SESSION,
 			text: "x",
@@ -279,7 +286,10 @@ describe("reconcileOrSend", () => {
 
 	test("does not resend even when the stored op already finished", async () => {
 		const calls: string[][] = [];
-		const options = controller({ state: "completed" }, calls);
+		const options = controller(
+			{ status: { status: "terminal_ok", receiptState: "present", outcome: { reason: "end_turn" } } },
+			calls,
+		);
 		const result = await reconcileOrSend(options, {
 			sessionId: SESSION,
 			text: "x",

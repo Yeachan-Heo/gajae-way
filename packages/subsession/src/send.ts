@@ -15,6 +15,14 @@
 
 import type { ControllerOptions } from "./cli";
 import { GjcCliError, parseEnvelope } from "./cli";
+import {
+	fetchOpState,
+	isTerminalStatus,
+	projectOpState,
+	requiresOperatorHold,
+	type StatusReport,
+	type SupervisorOpState,
+} from "./status";
 
 export const MAX_OP_REF_LENGTH = 128;
 
@@ -199,52 +207,36 @@ export function isOpRefRejection(error: unknown): boolean {
 }
 
 export type PromptOutcome = {
-	/** Terminal states end reconciliation; `wait_timeout`/`running` do not. */
+	/** Only `terminal_ok | failed` are terminal; `unknown` is neither. */
 	readonly terminal: boolean;
-	readonly state: string;
+	/** True when automation must stop and wait for operator judgement. */
+	readonly hold: boolean;
+	readonly state: SupervisorOpState;
+	readonly report: StatusReport;
 	readonly receipt: SendReceipt;
-	readonly raw: unknown;
 };
 
-const TERMINAL_STATES = new Set(["completed", "failed", "cancelled", "canceled", "error"]);
-const NON_TERMINAL_STATES = new Set(["wait_timeout", "running", "active", "pending", "accepted"]);
-
-export function classifyState(state: string): { terminal: boolean } {
-	if (TERMINAL_STATES.has(state)) {
-		return { terminal: true };
-	}
-	if (NON_TERMINAL_STATES.has(state)) {
-		return { terminal: false };
-	}
-	// Unknown states are treated as non-terminal: closing a live turn early is
-	// the more expensive mistake.
-	return { terminal: false };
-}
-
-/** Reconciles a stored receipt against the runtime, e.g. after a restart. */
+/**
+ * Reconciles a stored receipt against the runtime, e.g. after a restart.
+ *
+ * The canonical five statuses are projected onto the supervisor state, so a
+ * cancel (`terminal_ok` + `outcome.reason = "cancelled"`) is never reported as a
+ * completed deliverable and an `unknown` record is held rather than guessed.
+ */
 export async function pollStatus(
 	options: ControllerOptions,
 	receipt: SendReceipt,
 	timeoutMs?: number,
 ): Promise<PromptOutcome> {
-	const args = [
-		"sdk",
-		"session",
-		...(options.agentDir ? ["--agent-dir", options.agentDir] : []),
-		"status",
-		receipt.sessionId,
-		receipt.operationRef,
-		"--repo",
-		options.repo,
-		...(timeoutMs === undefined ? [] : ["--timeout-ms", String(timeoutMs)]),
-	];
-	const raw = await options.run(args);
-	const payload = parseEnvelope<{ state?: unknown; status?: unknown }>(raw, "session status");
-	const state =
-		(typeof payload.state === "string" && payload.state) ||
-		(typeof payload.status === "string" && payload.status) ||
-		"unknown";
-	return { ...classifyState(state), state, receipt, raw: payload };
+	const report = await fetchOpState(options, receipt.sessionId, receipt.operationRef, timeoutMs);
+	const state = projectOpState(report.status);
+	return {
+		terminal: isTerminalStatus(report.status.status),
+		hold: requiresOperatorHold(state),
+		state,
+		report,
+		receipt,
+	};
 }
 
 export type ReconcileResult =
