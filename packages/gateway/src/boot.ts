@@ -1,4 +1,5 @@
 import { chmod, mkdir } from "node:fs/promises";
+import { join } from "node:path";
 import { type ConfigOverrides, loadConfig } from "./config";
 import { GjcClient } from "./orchestrator/gjc-client";
 import { PersonaLoader } from "./persona/persona";
@@ -18,7 +19,10 @@ export async function bootGateway(
 	const ledger = new DeliveryLedger(database);
 	const pruned = ledger.prune(7 * 24 * 60 * 60 * 1000);
 	const pending = ledger.listUndelivered(24 * 60 * 60 * 1000).length;
-	const gjc = new GjcClient(database);
+	// The persona lives in its own dedicated workspace, never in the gateway's
+	// process cwd (which is typically the product source checkout): a session
+	// bound to the app repo reports that repo's git state as its own.
+	const gjc = new GjcClient(database, undefined, join(config.home, "workspace"));
 	const startedAt = new Date().toISOString();
 	const close = async () => database.close();
 	const server = options.stdio
