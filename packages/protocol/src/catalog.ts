@@ -263,10 +263,20 @@ export type EventName = keyof EventCatalogV01;
  * Silence tokens (spec fact 22, Hermes pattern): when a turn's final reply is
  * exactly one of these (after trim), the gateway suppresses outbound delivery
  * while keeping the turn in the session transcript.
+ *
+ * Matching is bracket-insensitive. `[SILENT]` was the only bracketed spelling
+ * in the original list, so an owner or persona writing the equally natural
+ * `[NO_REPLY]` produced a literal message in the room instead of silence.
+ * Brackets are decoration, not meaning: strip one optional surrounding pair
+ * before comparing.
  */
 export const SILENCE_TOKENS = ["[SILENT]", "SILENT", "NO_REPLY", "NO REPLY"] as const;
 
 export function isSilenceToken(text: string): boolean {
-	const normalized = text.trim().toUpperCase();
-	return (SILENCE_TOKENS as readonly string[]).some((t) => t.toUpperCase() === normalized);
+	const normalized = unbracket(text.trim()).toUpperCase();
+	return (SILENCE_TOKENS as readonly string[]).some((t) => unbracket(t).toUpperCase() === normalized);
+}
+
+function unbracket(text: string): string {
+	return text.startsWith("[") && text.endsWith("]") && text.length > 2 ? text.slice(1, -1).trim() : text;
 }

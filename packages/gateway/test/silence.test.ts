@@ -82,6 +82,16 @@ test("silence tokens are matched exactly, after trimming and case folding", () =
 		expect(isSilenceToken(text)).toBe(false);
 });
 
+test("bracketing a silence token never turns it into a delivered message", () => {
+	// `[SILENT]` was the only bracketed spelling in the catalog, so `[NO_REPLY]`
+	// used to be delivered verbatim into the room.
+	for (const token of ["[NO_REPLY]", "[NO REPLY]", "  [no_reply]  ", "[SILENT]", "SILENT"])
+		expect(isSilenceToken(token)).toBe(true);
+	// Stripping brackets must not turn prose into silence.
+	for (const text of ["[reply please]", "[]", "[SILENT] but actually", "[NO_REPLY] just kidding"])
+		expect(isSilenceToken(text)).toBe(false);
+});
+
 test("a silent turn in an open channel delivers nothing", async () => {
 	const { frames } = await openChannelGateway("[SILENT]");
 	expect(frames.some((frame) => frame.type === "response" && frame.id === "c1")).toBe(true);
