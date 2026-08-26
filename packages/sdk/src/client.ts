@@ -1,4 +1,4 @@
-import type { ChatSendResult, GatewayStatusResult } from "@gajaeway/protocol";
+import type { ChatSendResult, GatewayStatusResult, WorkRunParams, WorkRunResult } from "@gajaeway/protocol";
 import {
 	type ChatMessagePayload,
 	type ChatProgressPayload,
@@ -136,6 +136,9 @@ export class GajaewayClient {
 	}
 	chatSend(origin: OriginRef, text: string): Promise<ChatSendResult> {
 		return this.request("chat.send", { origin, text });
+	}
+	workRun(params: WorkRunParams): Promise<WorkRunResult> {
+		return this.request("work.run", params);
 	}
 
 	async close(): Promise<void> {

@@ -28,6 +28,8 @@ export {
 	VERBS_V01,
 	type VerbCatalogV01,
 	type VerbName,
+	type WorkRunParams,
+	type WorkRunResult,
 } from "./catalog";
 export {
 	ERROR_CODES,

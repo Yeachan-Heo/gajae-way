@@ -329,6 +329,35 @@ async function handleRequest(
 			}
 			return;
 		}
+		case "work.run": {
+			// First-class delegated work: a named worker gjc session in the coding
+			// register, bound to a caller-chosen cwd, serialized per worker name and
+			// resumable across calls (the persona's hand-rolled subsession spawning
+			// kept losing the reply body — this returns it directly).
+			const params = request.params as { name?: unknown; text?: unknown; cwd?: unknown } | undefined;
+			if (typeof params?.name !== "string" || !/^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/.test(params.name))
+				throw new ProtocolError("invalid_params", "work.run requires name matching [A-Za-z0-9][A-Za-z0-9._-]{0,63}");
+			if (typeof params.text !== "string" || !params.text)
+				throw new ProtocolError("invalid_params", "work.run requires non-empty text");
+			if (params.cwd !== undefined && (typeof params.cwd !== "string" || !params.cwd.startsWith("/")))
+				throw new ProtocolError("invalid_params", "work.run cwd must be an absolute path");
+			const workName = params.name;
+			const workText = params.text;
+			const workCwd = params.cwd as string | undefined;
+			const sessionKey = `work/task/${workName}`;
+			const text = await runtime.turns.run(sessionKey, async () => {
+				const turnOptions = { ...(workCwd ? { cwd: workCwd } : {}), codingRegister: true };
+				const epoch = options.database.getSessionRecord(sessionKey)?.epoch ?? 0;
+				const { sessionId } = await options.gjc.ensureSession(sessionKey, epoch, turnOptions);
+				options.database.updateActivity(
+					sessionKey,
+					JSON.stringify({ platform: "work", kind: "task", conversationId: workName }),
+				);
+				return options.gjc.sendTurn(sessionId, workText, undefined, undefined, turnOptions);
+			});
+			connection.write({ v: PROFILE_VERSION, type: "response", id: request.id, result: { text, sessionKey } });
+			return;
+		}
 		case "ops.integrity":
 			connection.write({
 				v: PROFILE_VERSION,

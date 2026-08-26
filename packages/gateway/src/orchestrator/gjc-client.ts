@@ -23,13 +23,22 @@ export const GENERIC_AGENT_SYSTEM_PROMPT = [
 	"Your actual identity, voice, and standing instructions are defined by the appended persona documents (SOUL.md, AGENTS.md, USER.md) and always take precedence over this base note.",
 ].join("\n");
 
+/** Per-call session/turn options for worker sessions (delegated coding work). */
+export interface TurnOptions {
+	/** Working directory override (worker sessions run in repo checkouts, not the persona workspace). */
+	readonly cwd?: string;
+	/** Keep gjc's own coding-assistant system prompt instead of the generic-agent override. */
+	readonly codingRegister?: boolean;
+}
+
 export interface GjcPort {
-	ensureSession(originKey: string, epoch?: number): Promise<{ sessionId: string }>;
+	ensureSession(originKey: string, epoch?: number, options?: TurnOptions): Promise<{ sessionId: string }>;
 	sendTurn(
 		sessionId: string,
 		text: string,
 		systemPreamble?: string,
 		onProgress?: (progress: TurnProgress) => void,
+		options?: TurnOptions,
 	): Promise<string>;
 }
 
@@ -124,7 +133,7 @@ export class GjcClient implements GjcPort {
 		this.#model = model;
 	}
 
-	async ensureSession(originKey: string, epoch = 0): Promise<{ sessionId: string }> {
+	async ensureSession(originKey: string, epoch = 0, options?: TurnOptions): Promise<{ sessionId: string }> {
 		const cacheKey = `${originKey}#${epoch}`;
 		if (process.env.GAJAEWAY_TEST_STUB_GJC === "1") return { sessionId: `stub-${cacheKey}` };
 		const record = this.#database.getSessionRecord(originKey);
@@ -153,8 +162,8 @@ export class GjcClient implements GjcPort {
 				idempotencyKey,
 				"--json-input-stdin",
 			],
-			cwd: this.#cwd,
-			stdin: new Response(JSON.stringify({ cwd: this.#cwd })).body ?? "ignore",
+			cwd: options?.cwd ?? this.#cwd,
+			stdin: new Response(JSON.stringify({ cwd: options?.cwd ?? this.#cwd })).body ?? "ignore",
 			stdout: "pipe",
 			stderr: "pipe",
 			env: process.env as Record<string, string>,
@@ -172,6 +181,7 @@ export class GjcClient implements GjcPort {
 		text: string,
 		systemPreamble?: string,
 		onProgress?: (progress: TurnProgress) => void,
+		options?: TurnOptions,
 	): Promise<string> {
 		if (typeof text !== "string" || text.length === 0) {
 			throw new Error("turn text must be non-empty");
@@ -191,13 +201,12 @@ export class GjcClient implements GjcPort {
 				"-p",
 				"--mode",
 				"json",
-				"--system-prompt",
-				GENERIC_AGENT_SYSTEM_PROMPT,
+				...(options?.codingRegister ? [] : ["--system-prompt", GENERIC_AGENT_SYSTEM_PROMPT]),
 				...(this.#model ? ["--model", this.#model] : []),
 				...(systemPreamble ? ["--append-system-prompt", systemPreamble] : []),
 				text,
 			],
-			cwd: this.#cwd,
+			cwd: options?.cwd ?? this.#cwd,
 			stdin: "ignore",
 			stdout: "pipe",
 			stderr: "pipe",

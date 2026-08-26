@@ -210,6 +210,19 @@ export interface MonitorEventRecord {
 	readonly stage: string;
 }
 
+/** A worker gjc session run: an isolated coding-register session doing delegated work. */
+export interface WorkRunParams {
+	/** Stable worker name; the same name resumes the same gjc session. */
+	readonly name: string;
+	readonly text: string;
+	/** Working directory for the worker session (e.g. a repo checkout). */
+	readonly cwd?: string;
+}
+export interface WorkRunResult {
+	readonly text: string;
+	readonly sessionKey: string;
+}
+
 /** Verb catalog: verb name -> { params, result } (documentation-level typing). */
 export interface VerbCatalogV01 {
 	"gateway.status": { params: undefined; result: GatewayStatusResult };
@@ -234,6 +247,7 @@ export interface VerbCatalogV01 {
 		result: { readonly path: string; readonly bytes: number };
 	};
 	"ops.integrity": { params: undefined; result: { readonly ok: boolean; readonly detail: string } };
+	"work.run": { params: WorkRunParams; result: WorkRunResult };
 }
 
 /** Event catalog: event name -> payload. */
@@ -261,6 +275,7 @@ export const VERBS_V01 = [
 	"monitor.remove",
 	"ops.backup",
 	"ops.integrity",
+	"work.run",
 ] as const;
 export const EVENTS_V01 = ["chat.message", "chat.progress", "gateway.stopping", "monitor.event"] as const;
 

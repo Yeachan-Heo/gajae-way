@@ -344,3 +344,51 @@ test("[REPLY:id] parts thread to the referenced message and strip the directive"
 	expect(messages[1].payload.replyToMessageId).toBeUndefined();
 	client.close();
 });
+
+test("work.run runs a named worker session in the requested cwd and returns the text", async () => {
+	directory = await mkdtemp(join(tmpdir(), "gajaeway-server-"));
+	const config: GatewayConfig = {
+		schemaVersion: 1,
+		home: directory,
+		configPath: join(directory, "config.json"),
+		socketPath: join(directory, "gateway.sock"),
+		dbPath: join(directory, "gateway.db"),
+		logVerbosity: "info",
+	};
+	const database = await GatewayDatabase.open(config.dbPath);
+	const seen: Array<{ key?: string; text?: string; options?: unknown }> = [];
+	const gjc: GjcPort = {
+		ensureSession: async (key, _epoch, options) => {
+			seen.push({ key, options });
+			return { sessionId: "worker-session" };
+		},
+		sendTurn: async (_session, text, _preamble, _progress, options) => {
+			seen.push({ text, options });
+			return "worker result";
+		},
+	};
+	server = await startUnixServer({ config, database, gjc, onStop: () => database.close() });
+	const client = await connect(config.socketPath);
+	client.send({ v: "0.1", type: "hello", payload: { supportedVersions: ["0.1"] } });
+	await waitFor(client.frames, 1);
+	client.send({
+		v: "0.1",
+		type: "request",
+		id: "w",
+		verb: "work.run",
+		params: { name: "repo-fix", text: "fix the bug", cwd: "/tmp/some-repo" },
+	});
+	await waitFor(client.frames, 2);
+	const response = client.frames.find((frame) => frame.type === "response" && frame.id === "w");
+	expect(response.result).toEqual({ text: "worker result", sessionKey: "work/task/repo-fix" });
+	expect(seen[0]).toMatchObject({
+		key: "work/task/repo-fix",
+		options: { cwd: "/tmp/some-repo", codingRegister: true },
+	});
+	expect(seen[1]).toMatchObject({ text: "fix the bug", options: { cwd: "/tmp/some-repo", codingRegister: true } });
+	// Invalid names are rejected before touching gjc.
+	client.send({ v: "0.1", type: "request", id: "bad", verb: "work.run", params: { name: "../evil", text: "x" } });
+	await waitFor(client.frames, 3);
+	expect(client.frames.find((frame) => frame.type === "error" && frame.id === "bad")).toBeDefined();
+	client.close();
+});
