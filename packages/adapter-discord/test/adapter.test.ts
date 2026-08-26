@@ -264,8 +264,10 @@ test("working status ignores non-discord progress and survives channel failures"
 test("slash commands /new and /reset map to gateway session resets with the invoker attributed", async () => {
 	const sent: Array<{ messageId: string; text: string; engagement: unknown }> = [];
 	const gateway = {
-		sendInbound: (messageId: string, _origin: unknown, text: string, engagement: unknown) =>
-			void sent.push({ messageId, text, engagement }),
+		requestInbound: async (messageId: string, _origin: unknown, text: string, engagement: unknown) => {
+			sent.push({ messageId, text, engagement });
+			return { engaged: true };
+		},
 	};
 	let replied = "";
 	const interaction = {
@@ -292,4 +294,24 @@ test("slash commands /new and /reset map to gateway session resets with the invo
 		error: () => {},
 	});
 	expect(sent).toHaveLength(1);
+});
+
+test("a declined slash command answers not-authorized instead of claiming a reset", async () => {
+	const gateway = { requestInbound: async () => ({ engaged: false }) };
+	let replied = "";
+	await handleSlashCommand(
+		{
+			isChatInputCommand: () => true,
+			commandName: "reset",
+			id: "itx-2",
+			user: { id: "intruder", username: "mallory" },
+			channel: { id: "channel-9", type: 0 },
+			reply: async (options: { content: string }) => {
+				replied = options.content;
+			},
+		} as never,
+		gateway as never,
+		{ error: () => {} },
+	);
+	expect(replied).toContain("not authorized");
 });

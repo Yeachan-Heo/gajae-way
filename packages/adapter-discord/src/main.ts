@@ -381,7 +381,7 @@ export interface SlashInteractionLike {
 
 export async function handleSlashCommand(
 	interaction: SlashInteractionLike,
-	gateway: Pick<ReconnectingGateway, "sendInbound">,
+	gateway: Pick<ReconnectingGateway, "requestInbound">,
 	log: Pick<Console, "error"> = console,
 ): Promise<void> {
 	if (!interaction.isChatInputCommand?.()) return;
@@ -389,13 +389,19 @@ export async function handleSlashCommand(
 	if (!interaction.channel || !interaction.user) return;
 	try {
 		const origin = discordMessageOrigin({ author: { id: interaction.user.id }, channel: interaction.channel });
-		gateway.sendInbound(`slash-${interaction.id}`, origin, `/${interaction.commandName}`, {
+		const result = await gateway.requestInbound(`slash-${interaction.id}`, origin, `/${interaction.commandName}`, {
 			mentioned: true,
 			group: origin.kind !== "dm",
 			authorId: interaction.user.id,
 			...(interaction.user.username ? { authorName: interaction.user.username } : {}),
 		});
-		await interaction.reply({ content: "🦞 session reset requested", ephemeral: true });
+		// Honest ack: the gateway allowlist may decline the command (non-owner in a
+		// group surface) — never claim a reset that did not happen.
+		await interaction.reply(
+			result?.engaged
+				? { content: "🦞 session reset", ephemeral: true }
+				: { content: "not authorized for session commands here", ephemeral: true },
+		);
 	} catch (error) {
 		log.error(`Discord slash command failed: ${error instanceof Error ? error.message : String(error)}`);
 	}
@@ -434,6 +440,16 @@ class ReconnectingGateway {
 	}
 
 	sendInbound(messageId: string, origin: OriginRef, text: string, engagement: EngagementContext): void {
+		void this.requestInbound(messageId, origin, text, engagement);
+	}
+
+	/** Like sendInbound but reports the gateway's engagement decision to the caller. */
+	async requestInbound(
+		messageId: string,
+		origin: OriginRef,
+		text: string,
+		engagement: EngagementContext,
+	): Promise<{ engaged?: boolean } | undefined> {
 		if (!this.#inbound.addIfAbsent(messageId)) return;
 		const client = this.#client;
 		if (!client) return;
@@ -442,12 +458,14 @@ class ReconnectingGateway {
 		// The platform message id travels with the turn: the gateway keys its durable inbound
 		// queue on it, so a replayed or backfilled message is deduped there and not just in the
 		// adapter's in-memory set, which does not survive a restart.
-		void client.request<{ engaged?: boolean }>("chat.send", { origin, text, engagement, messageId }).then(
-			(result) => {
-				if (result?.engaged) this.typing?.begin(origin.conversationId);
-			},
-			() => this.scheduleReconnect(),
-		);
+		try {
+			const result = await client.request<{ engaged?: boolean }>("chat.send", { origin, text, engagement, messageId });
+			if (result?.engaged) this.typing?.begin(origin.conversationId);
+			return result;
+		} catch {
+			this.scheduleReconnect();
+			return undefined;
+		}
 	}
 
 	private monitor(client: GajaewayClient): void {
