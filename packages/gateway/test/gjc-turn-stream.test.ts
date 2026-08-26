@@ -10,7 +10,9 @@ test("counts tool executions and captures the final assistant text across chunk 
 	stream.feed(line({ type: "tool_execution_end" }));
 	stream.feed(line({ type: "tool_execution_start", toolName: "read" }));
 	// Interim assistant message: superseded by the later one.
-	stream.feed(line({ type: "message_end", message: { role: "assistant", content: [{ type: "text", text: "thinking aloud" }] } }));
+	stream.feed(
+		line({ type: "message_end", message: { role: "assistant", content: [{ type: "text", text: "thinking aloud" }] } }),
+	);
 	// A chunk boundary in the middle of a JSON line must not corrupt parsing.
 	const final = line({
 		type: "message_end",
@@ -25,8 +27,12 @@ test("counts tool executions and captures the final assistant text across chunk 
 test("ignores non-JSON noise and non-assistant messages", () => {
 	const stream = new GjcTurnStream();
 	stream.feed("plain stderr-ish noise\n");
-	stream.feed(line({ type: "message_end", message: { role: "toolResult", content: [{ type: "text", text: "tool output" }] } }));
-	stream.feed(line({ type: "message_end", message: { role: "user", content: [{ type: "text", text: "prompt echo" }] } }));
+	stream.feed(
+		line({ type: "message_end", message: { role: "toolResult", content: [{ type: "text", text: "tool output" }] } }),
+	);
+	stream.feed(
+		line({ type: "message_end", message: { role: "user", content: [{ type: "text", text: "prompt echo" }] } }),
+	);
 	expect(stream.toolCalls).toBe(0);
 	expect(stream.finalText).toBeUndefined();
 });
