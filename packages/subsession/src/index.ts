@@ -9,21 +9,20 @@ export {
 	resolveBaseRef,
 } from "./base-ref";
 export {
-	awaitReadyEndpoint,
-	checkReady,
-	controlUrl,
-	type DiscoveryResult,
-	defaultConnect,
-	defaultIsPidAlive,
-	discoverEndpoints,
-	type EndpointParseFailure,
-	endpointDirectory,
+	awaitReady,
+	type BrokerSession,
+	type CliResult,
+	type CliRunner,
+	type ControllerOptions,
+	GjcCliError,
+	inspectSession,
+	listSessions,
 	type NotReadyReason,
-	parseEndpoint,
-	type ReadinessProbes,
+	parseEnvelope,
 	type ReadinessResult,
-	type SubsessionEndpoint,
-} from "./endpoint";
+	selectSessionForWorktree,
+	verifyReady,
+} from "./cli";
 export {
 	isRuntimeSessionId,
 	type LaneClaim,
@@ -32,5 +31,19 @@ export {
 	LaneRegistry,
 	LaneScopeError,
 	type LaneSpec,
+	laneSessionKey,
 	laneSessionName,
 } from "./lane";
+export {
+	assertValidOpRef,
+	classifyState,
+	MAX_OP_REF_LENGTH,
+	newOpRef,
+	OpRefError,
+	OpRefLedger,
+	type PromptOutcome,
+	pollStatus,
+	type SendPromptInput,
+	type SendReceipt,
+	sendPrompt,
+} from "./send";

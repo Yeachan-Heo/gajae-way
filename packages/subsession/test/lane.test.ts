@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { isRuntimeSessionId, LaneRegistry, LaneScopeError, laneSessionName } from "../src/lane";
+import { isRuntimeSessionId, LaneRegistry, LaneScopeError, laneSessionKey, laneSessionName } from "../src/lane";
 
 describe("laneSessionName", () => {
 	test("builds the issue and pr forms", () => {
@@ -79,5 +79,35 @@ describe("LaneRegistry", () => {
 			worktreePath: "/wt/a",
 		});
 		expect(next.sessionName).toBe("project-issue-1-a-retry");
+	});
+});
+
+describe("laneSessionKey", () => {
+	test("is tmux-safe and decoupled from the branch name", () => {
+		const key = laneSessionKey({ kind: "feature", label: "subsessions runtime" });
+		expect(key).toBe("project-feature-subsessions-runtime");
+		expect(key).not.toContain("/");
+	});
+
+	test("sanitises a branch-shaped label instead of emitting slashes", () => {
+		expect(laneSessionKey({ kind: "feature", label: "feat/subsession-runtime" })).toBe(
+			"project-feature-feat-subsession-runtime",
+		);
+	});
+
+	test("binds a number once the issue or PR exists", () => {
+		expect(laneSessionKey({ kind: "pr", number: 12, label: "admin ui" })).toBe("project-pr-12-admin-ui");
+	});
+
+	test("rejects a feature key carrying a number", () => {
+		expect(() => laneSessionKey({ kind: "feature", label: "x", number: 3 })).toThrow(LaneScopeError);
+	});
+
+	test("rejects a numbered kind without a number", () => {
+		expect(() => laneSessionKey({ kind: "issue", label: "x" })).toThrow(LaneScopeError);
+	});
+
+	test("rejects a label with no usable characters", () => {
+		expect(() => laneSessionKey({ kind: "feature", label: "///" })).toThrow(LaneScopeError);
 	});
 });
