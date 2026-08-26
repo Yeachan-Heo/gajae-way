@@ -55,3 +55,20 @@ test("entry count grows by exactly one per capture", async () => {
 
 	expect(body.split("\n").filter((line) => line.startsWith("## "))).toHaveLength(2);
 });
+
+test("the regenerated map reaches nested axis subdirectories", async () => {
+	const { mkdtemp } = await import("node:fs/promises");
+	const { tmpdir } = await import("node:os");
+	const { join } = await import("node:path");
+	const { mkdir, writeFile, readFile } = await import("node:fs/promises");
+	const { initializeMemory, regenerateMap } = await import("../src/memory/doctrine");
+	const home = await mkdtemp(join(tmpdir(), "gajaeway-map-"));
+	const root = await initializeMemory(home);
+	await mkdir(join(root, "daily/2026-08"), { recursive: true });
+	await writeFile(join(root, "daily/2026-08/2026-08-26.md"), "# nested\n");
+	await writeFile(join(root, "daily/2026-08-26.md"), "# flat\n");
+	await regenerateMap(root);
+	const map = await readFile(join(root, "MEMORY.md"), "utf8");
+	expect(map).toContain("daily/2026-08/2026-08-26.md");
+	expect(map).toContain("daily/2026-08-26.md");
+});
