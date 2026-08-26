@@ -63,10 +63,14 @@ export async function initializeMemory(home: string): Promise<string> {
 
 async function markdownFiles(root: string, axis: Axis): Promise<string[]> {
 	const directory = join(root, axis);
-	const entries = await readdir(directory, { withFileTypes: true });
+	// Recursive: the persona may organize an axis into subdirectories (e.g.
+	// daily/2026-08/); a non-recursive map made nested files permanently
+	// invisible, and every capture regenerated the drift back (live audit
+	// finding: map_content_drift that self-repair could not stick).
+	const entries = await readdir(directory, { withFileTypes: true, recursive: true });
 	return entries
 		.filter((entry) => entry.isFile() && entry.name.endsWith(".md"))
-		.map((entry) => relative(root, join(directory, entry.name)).replaceAll("\\", "/"))
+		.map((entry) => relative(root, join(entry.parentPath ?? directory, entry.name)).replaceAll("\\", "/"))
 		.sort();
 }
 
