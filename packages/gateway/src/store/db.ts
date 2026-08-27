@@ -111,6 +111,82 @@ export class GatewayDatabase {
 			epoch: number;
 		}>;
 	}
+	/**
+	 * Cycle projection source (ops.cycle): full session identity including the bound
+	 * gjc session id. An empty gjc_session_id with a positive epoch is the mid-rebind
+	 * state after /new; the projection must report it as stale identity, never healthy.
+	 */
+	sessionIdentityRows(): Array<{
+		origin_key: string;
+		origin_ref_json: string | null;
+		gjc_session_id: string;
+		epoch: number;
+		created_at: string;
+		last_activity_at: string | null;
+	}> {
+		return this.#database
+			.query(
+				"SELECT origin_key, origin_ref_json, gjc_session_id, epoch, created_at, last_activity_at FROM sessions ORDER BY created_at",
+			)
+			.all() as Array<{
+			origin_key: string;
+			origin_ref_json: string | null;
+			gjc_session_id: string;
+			epoch: number;
+			created_at: string;
+			last_activity_at: string | null;
+		}>;
+	}
+
+	/** Cycle projection source: durable inbound queue state census across all origins. */
+	inboundStateCounts(): Array<{ state: string; n: number }> {
+		return this.#database.query("SELECT state, COUNT(*) AS n FROM inbound_messages GROUP BY state").all() as Array<{
+			state: string;
+			n: number;
+		}>;
+	}
+
+	/** Cycle projection source: pending inbound count per origin key. */
+	inboundPendingByOrigin(): Array<{ origin_key: string; n: number }> {
+		return this.#database
+			.query("SELECT origin_key, COUNT(*) AS n FROM inbound_messages WHERE state = 'pending' GROUP BY origin_key")
+			.all() as Array<{ origin_key: string; n: number }>;
+	}
+
+	/** Cycle projection source: delivery state census across all origins. */
+	deliveryStateCounts(): Array<{ state: string; n: number }> {
+		return this.#database.query("SELECT state, COUNT(*) AS n FROM deliveries GROUP BY state").all() as Array<{
+			state: string;
+			n: number;
+		}>;
+	}
+
+	/** Cycle projection source: unsettled delivery age census per origin key. */
+	deliveryUnsettledByOrigin(now = Date.now()): Array<{ origin_key: string; n: number; oldest_ms: number }> {
+		return this.#database
+			.query(
+				// Age in ms from a seconds binding: parenthesize so the seconds delta is
+				// multiplied, not the timestamp alone (SQL precedence binds * before -).
+				"SELECT origin_key, COUNT(*) AS n, MAX((? - CAST(strftime('%s', created_at) AS INTEGER)) * 1000) AS oldest_ms FROM deliveries WHERE state IN ('pending','inflight','failed_ambiguous') GROUP BY origin_key",
+			)
+			.all(Math.floor(now / 1000)) as Array<{ origin_key: string; n: number; oldest_ms: number }>;
+	}
+
+	/** Cycle projection source: memory-intent settlement census. */
+	memoryIntentCounts(): Array<{ state: string; n: number }> {
+		return this.#database.query("SELECT state, COUNT(*) AS n FROM memory_intents GROUP BY state").all() as Array<{
+			state: string;
+			n: number;
+		}>;
+	}
+
+	/** Cycle projection source: monitor-event stage census. */
+	monitorEventStageCounts(): Array<{ stage: string; n: number }> {
+		return this.#database.query("SELECT stage, COUNT(*) AS n FROM monitor_events GROUP BY stage").all() as Array<{
+			stage: string;
+			n: number;
+		}>;
+	}
 
 	addRecall(originKey: string, originRefJson: string, text: string): void {
 		this.#database
