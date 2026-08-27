@@ -63,7 +63,18 @@ export interface ReloadDiagnostic {
 }
 
 export type ReloadResult =
-	| { readonly ok: true; readonly config: GatewayConfig; readonly changed: readonly string[] }
+	| {
+			readonly ok: true;
+			readonly config: GatewayConfig;
+			/** Reloadable fields whose value actually changed and was applied. */
+			readonly changed: readonly string[];
+			/**
+			 * Fields the operator edited that CANNOT be applied live. They are
+			 * reported explicitly and left at their old values: a reload that
+			 * pretends to apply a restart-only field is worse than refusing.
+			 */
+			readonly restartRequired: readonly string[];
+	  }
 	| { readonly ok: false; readonly config: GatewayConfig; readonly diagnostics: readonly ReloadDiagnostic[] };
 
 export function gatewayHome(env: NodeJS.ProcessEnv = process.env): string {
@@ -237,14 +248,16 @@ export async function loadConfig(
 	};
 }
 
-/** Validates a complete replacement before publishing it; failed reloads retain current. */
+/**
+ * Re-reads config.json and publishes ONLY the reloadable fields, so the daemon
+ * can never end up half-applied: a parse or validation error retains the current
+ * config untouched, and an edited restart-only field is reported rather than
+ * silently ignored or half-honoured.
+ */
 export async function reloadConfig(current: GatewayConfig, overrides: ConfigOverrides = {}): Promise<ReloadResult> {
+	let candidate: GatewayConfig;
 	try {
-		const candidate = await loadConfig({ home: current.home, overrides });
-		const changed = (["logVerbosity", "socketPath", "dbPath"] as const).filter(
-			(field) => candidate[field] !== current[field],
-		);
-		return { ok: true, config: candidate, changed };
+		candidate = await loadConfig({ home: current.home, overrides });
 	} catch (error) {
 		const diagnostic =
 			error instanceof ConfigError
@@ -252,10 +265,40 @@ export async function reloadConfig(current: GatewayConfig, overrides: ConfigOver
 				: { code: "config_invalid" as const, message: "configuration reload failed" };
 		return { ok: false, config: current, diagnostics: [diagnostic] };
 	}
+	const changed = RELOADABLE_FIELDS.filter((field) => !Bun.deepEquals(candidate[field], current[field]));
+	const restartRequired = RESTART_REQUIRED_FIELDS.filter((field) => !Bun.deepEquals(candidate[field], current[field]));
+	const next: Record<string, unknown> = { ...current };
+	for (const field of RELOADABLE_FIELDS) {
+		if (candidate[field] === undefined) delete next[field];
+		else next[field] = candidate[field];
+	}
+	return { ok: true, config: next as unknown as GatewayConfig, changed, restartRequired };
 }
 
-export const RELOADABLE_FIELDS = ["logVerbosity"] as const;
-export const RESTART_REQUIRED_FIELDS = ["socketPath", "dbPath"] as const;
+/**
+ * Fields that are genuinely re-read at runtime, verified against their consumers:
+ * `mentionAllowlist` and `channels` are read per request by the chat dispatch
+ * path (engagement policy and inbound debounce), `debounceMs` likewise, and
+ * `logVerbosity` is plain config state with no bound resource.
+ */
+export const RELOADABLE_FIELDS = ["logVerbosity", "mentionAllowlist", "channels", "debounceMs"] as const;
+
+/**
+ * Fields bound to a live resource at startup — a listening socket, an open
+ * database, the constructed gjc client, a running webhook/watcher, the monitor
+ * propagator's owner target — and therefore only changeable by a restart.
+ */
+export const RESTART_REQUIRED_FIELDS = [
+	"socketPath",
+	"dbPath",
+	"turnTimeoutMs",
+	"model",
+	"credentials",
+	"webhook",
+	"watcherRoots",
+	"scriptRoot",
+	"ownerTarget",
+] as const;
 
 export function configDirectory(config: GatewayConfig): string {
 	return dirname(config.configPath);

@@ -15,7 +15,7 @@ import {
 	type RequestFrame,
 	validateOriginRef,
 } from "@gajaeway/protocol";
-import type { GatewayConfig } from "../config";
+import { type ConfigOverrides, type GatewayConfig, type ReloadResult, reloadConfig } from "../config";
 import { DeliveryService } from "../delivery/delivery";
 import { decideEngagement } from "../engagement/policy";
 import { ACTION_GUARD_SYSTEM_NOTICE } from "../guard/action-guard";
@@ -51,6 +51,8 @@ export interface GatewayServerOptions {
 	readonly startedAt?: string;
 	readonly onStop?: () => void | Promise<void>;
 	readonly persona?: PersonaLoader;
+	/** Per-process CLI overrides, reapplied on every live reload so they survive it. */
+	readonly overrides?: ConfigOverrides;
 	/** Test seam for chat.progress throttling; production uses the 15s defaults. */
 	readonly progress?: { readonly firstAfterMs?: number; readonly intervalMs?: number };
 }
@@ -59,7 +61,45 @@ interface InboundContext {
 	readonly requestId: string;
 	readonly connection: Connection;
 }
+/**
+ * The ONE reload implementation, shared by the SIGHUP handler and the
+ * `gateway.reloadConfig` verb: changing a single mention-allowlist entry used to
+ * require a full gateway restart, and restarting is exactly what poisons session
+ * keys and produced the outage this branch also fixes.
+ *
+ * Fail-safe by construction: `reloadConfig` validates the whole file before
+ * publishing and returns the previous config on any error, so a failed reload
+ * cannot leave the daemon half-applied. Every outcome is logged with the fields
+ * applied and the fields refused as restart-only.
+ */
+async function applyConfigReload(
+	runtime: Runtime,
+	options: GatewayServerOptions,
+	trigger: string,
+): Promise<ReloadResult> {
+	const result = await reloadConfig(runtime.config, options.overrides);
+	if (!result.ok) {
+		console.error(
+			`gateway config reload (${trigger}) FAILED; keeping the previous config: ${result.diagnostics
+				.map((diagnostic) => `${diagnostic.code}: ${diagnostic.message}`)
+				.join("; ")}`,
+		);
+		return result;
+	}
+	runtime.config = result.config;
+	console.error(
+		`gateway config reload (${trigger}) ok; applied=[${result.changed.join(",")}] restart-required=[${result.restartRequired.join(",")}]`,
+	);
+	return result;
+}
+
 interface Runtime {
+	/**
+	 * The live config. Mutable on purpose: SIGHUP and the reload verb republish it
+	 * here, and every per-request read goes through it, so a reloadable field
+	 * takes effect on the next turn without a restart.
+	 */
+	config: GatewayConfig;
 	readonly delivery: DeliveryService;
 	readonly persona: PersonaLoader;
 	readonly connections: Set<Connection>;
@@ -86,6 +126,11 @@ export async function startUnixServer(options: GatewayServerOptions): Promise<Ga
 	let stopping = false;
 	let stopPromise: Promise<void> | undefined;
 	let listener: ReturnType<typeof Bun.listen>;
+	// SIGHUP is what an operator reaches for; the reload verb is the same code path
+	// for the console. Registered here and removed on stop so the handler never
+	// outlives the daemon it belongs to.
+	const onHup = () => void applyConfigReload(runtime, options, "SIGHUP");
+	process.on("SIGHUP", onHup);
 	// Concurrent stop() calls (shutdown verb + owner teardown) must all await the
 	// SAME settling run: an early-returning duplicate let callers proceed while
 	// memory closure was still writing, racing filesystem teardown (live flake).
@@ -93,6 +138,7 @@ export async function startUnixServer(options: GatewayServerOptions): Promise<Ga
 		if (stopPromise) return stopPromise;
 		stopping = true;
 		stopPromise = (async () => {
+			process.off("SIGHUP", onHup);
 			for (const connection of runtime.connections)
 				connection.write({ v: PROFILE_VERSION, type: "event", event: "gateway.stopping", payload: { reason } });
 			listener.stop(true);
@@ -220,6 +266,7 @@ function createRuntime(options: GatewayServerOptions): Runtime {
 	const monitorRuntime = new MonitorRuntime(options.config, registry, monitors);
 	const reconcileTimer = setInterval(() => void monitors.reconcile(), 60_000);
 	return {
+		config: options.config,
 		delivery,
 		persona: options.persona ?? new PersonaLoader(options.config.home),
 		connections,
@@ -303,6 +350,19 @@ async function handleRequest(
 			connection.write({ v: PROFILE_VERSION, type: "response", id: request.id, result: { stopping: true } });
 			await stop();
 			return;
+		case "gateway.reloadConfig": {
+			// Same implementation as SIGHUP; the console gets it without signals.
+			const result = await applyConfigReload(runtime, options, `verb ${request.id}`);
+			connection.write({
+				v: PROFILE_VERSION,
+				type: "response",
+				id: request.id,
+				result: result.ok
+					? { ok: true, changed: result.changed, restartRequired: result.restartRequired }
+					: { ok: false, diagnostics: result.diagnostics },
+			});
+			return;
+		}
 		case "delivery.confirm": {
 			const id = (request.params as { deliveryId?: unknown } | undefined)?.deliveryId;
 			if (typeof id !== "string" || !runtime.delivery.confirm(id))
@@ -522,7 +582,7 @@ async function sendChat(
 	if (params.text === "/new" || params.text === "/reset") {
 		// Session resets are commands: in group surfaces they obey the mention
 		// allowlist, or any room member could wipe the persona's conversation state.
-		const allowlist = options.config.mentionAllowlist;
+		const allowlist = runtime.config.mentionAllowlist;
 		const authorId = (params.engagement as { authorId?: unknown } | undefined)?.authorId;
 		if (
 			origin.platform !== "loopback" &&
@@ -577,7 +637,7 @@ async function sendChat(
 			typeof params.engagement.authorId !== "string")
 	)
 		throw new ProtocolError("invalid_params", "non-loopback chat.send requires engagement");
-	const engaged = decideEngagement(origin, params.engagement as never, options.config).engaged;
+	const engaged = decideEngagement(origin, params.engagement as never, runtime.config).engaged;
 	const inboundMessageId = typeof params.messageId === "string" && params.messageId ? params.messageId : undefined;
 	// Declined messages are still context, never commands (protocol contract): every
 	// platform message lands in the conversation-context ledger so the next engaged
@@ -645,7 +705,7 @@ async function drainOrigin(
 			// Debounce: a burst of messages becomes ONE turn carrying the whole diff.
 			// The window is per-channel configurable; newer arrivals during the wait
 			// are folded into this batch, with the newest message as the trigger.
-			const debounceMs = debounceFor(row, options.config);
+			const debounceMs = debounceFor(row, runtime.config);
 			if (debounceMs > 0) await Bun.sleep(debounceMs);
 			const batch = [row];
 			for (let more = options.database.inboundClaimNext(key); more; more = options.database.inboundClaimNext(key))

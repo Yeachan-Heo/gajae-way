@@ -227,6 +227,18 @@ export interface WorkRunParams {
 	/** Working directory for the worker session (e.g. a repo checkout). */
 	readonly cwd?: string;
 }
+/**
+ * Live config reload: `changed` are the reloadable fields actually applied and
+ * `restartRequired` names edited fields that only a restart can apply, so the
+ * caller is never told a restart-only field took effect.
+ */
+export type ConfigReloadResult =
+	| { readonly ok: true; readonly changed: readonly string[]; readonly restartRequired: readonly string[] }
+	| {
+			readonly ok: false;
+			readonly diagnostics: readonly { readonly code: string; readonly message: string }[];
+	  };
+
 export interface WorkRunResult {
 	readonly text: string;
 	readonly sessionKey: string;
@@ -236,6 +248,7 @@ export interface WorkRunResult {
 export interface VerbCatalogV01 {
 	"gateway.status": { params: undefined; result: GatewayStatusResult };
 	"gateway.shutdown": { params: undefined; result: { readonly stopping: true } };
+	"gateway.reloadConfig": { params: undefined; result: ConfigReloadResult };
 	"chat.send": { params: ChatSendParams; result: ChatSendResult };
 	"delivery.confirm": { params: DeliveryConfirmParams; result: { readonly settled: true } };
 	"delivery.fail": { params: DeliveryFailParams; result: { readonly recorded: true } };
@@ -285,6 +298,7 @@ export const VERBS_V01 = [
 	"ops.backup",
 	"ops.integrity",
 	"work.run",
+	"gateway.reloadConfig",
 ] as const;
 export const EVENTS_V01 = ["chat.message", "chat.progress", "gateway.stopping", "monitor.event"] as const;
 
