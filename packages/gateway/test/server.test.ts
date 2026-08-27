@@ -563,3 +563,83 @@ test("a stalled durable job holds the next work.run until resume (production pat
 	expect(turns).toBe(2);
 	client.close();
 });
+test("resuming a stalled job clears the hold durably: the next ordinary call is not held", async () => {
+	directory = await mkdtemp(join(tmpdir(), "gajaeway-server-"));
+	const config: GatewayConfig = {
+		schemaVersion: 1,
+		home: directory,
+		configPath: join(directory, "config.json"),
+		socketPath: join(directory, "gateway.sock"),
+		dbPath: join(directory, "gateway.db"),
+		logVerbosity: "info",
+	};
+	const database = await GatewayDatabase.open(config.dbPath);
+	let turns = 0;
+	const gjc: GjcPort = {
+		ensureSession: async () => ({ sessionId: "0f1e2d3c-4b5a-4678-8796-a5b4c3d2e1f0" }),
+		sendTurn: async () => {
+			turns += 1;
+			return "worker result";
+		},
+	};
+	server = await startUnixServer({ config, database, gjc, onStop: () => database.close() });
+	const client = await connect(config.socketPath);
+	client.send({ v: "0.1", type: "hello", payload: { supportedVersions: ["0.1"] } });
+	await waitFor(client.frames, 1);
+	const jobId = `lanejob-${Buffer.from("stall-clear", "utf8").toString("hex")}`;
+
+	// First run succeeds (creates the job).
+	client.send({ v: "0.1", type: "request", id: "w1", verb: "work.run", params: { name: "stall-clear", text: "x" } });
+	async function waitId3(id: string): Promise<void> {
+		for (let attempt = 0; attempt < 400 && !client.frames.some((f) => f.id === id && f.type !== undefined); attempt++)
+			await Bun.sleep(5);
+	}
+	await waitId3("w1");
+
+	// Force the stalled hold, as reconciliation would after repeat stalls.
+	const first = parseLaneJobRecord(database.laneJobJson(jobId) as string);
+	database.putLaneJob({
+		jobId: first.jobId,
+		laneKey: "work-stall-clear",
+		state: "stalled",
+		createdAt: first.createdAt,
+		updatedAt: new Date().toISOString(),
+		lane: first.lane,
+		json: JSON.stringify({ ...first, state: "stalled", stalledContinuations: MAX_STALLED_CONTINUATIONS }),
+	});
+
+	// Ordinary call: held.
+	client.send({ v: "0.1", type: "request", id: "w2", verb: "work.run", params: { name: "stall-clear", text: "x" } });
+	await waitId3("w2");
+	expect(client.frames.find((frame) => frame.id === "w2" && frame.type === "response")?.result).toMatchObject({
+		held: true,
+		state: "stalled",
+	});
+	expect(turns).toBe(1);
+
+	// resume:true: runs AND durably clears the hold with an audit entry.
+	client.send({
+		v: "0.1",
+		type: "request",
+		id: "w3",
+		verb: "work.run",
+		params: { name: "stall-clear", text: "x", resume: true },
+	});
+	await waitId3("w3");
+	expect(client.frames.find((frame) => frame.id === "w3" && frame.type === "response")?.result).toMatchObject({
+		held: false,
+		text: "worker result",
+	});
+	const afterResume = parseLaneJobRecord(database.laneJobJson(jobId) as string);
+	expect(afterResume.stalledContinuations).toBe(0);
+	expect(afterResume.escalations.some((entry) => entry.includes("operator resume acknowledged"))).toBe(true);
+
+	// The NEXT ordinary call is not held by the old stalled state.
+	client.send({ v: "0.1", type: "request", id: "w4", verb: "work.run", params: { name: "stall-clear", text: "x" } });
+	await waitId3("w4");
+	expect(client.frames.find((frame) => frame.id === "w4" && frame.type === "response")?.result).toMatchObject({
+		held: false,
+	});
+	expect(turns).toBe(3);
+	client.close();
+});

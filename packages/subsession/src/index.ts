@@ -24,6 +24,7 @@ export {
 	verifyReady,
 } from "./cli";
 export {
+	acknowledgeHold,
 	appendAttempt,
 	applyReconciliation,
 	type ContinuationPlan,

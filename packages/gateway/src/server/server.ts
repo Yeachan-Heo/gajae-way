@@ -25,6 +25,7 @@ import {
 	validateOriginRef,
 } from "@gajaeway/protocol";
 import {
+	acknowledgeHold,
 	appendAttempt,
 	applyReconciliation,
 	closeAttempt,
@@ -545,8 +546,22 @@ async function handleRequest(
 						};
 					}
 				}
+				// resume:true is an explicit operator acknowledgement: the sticky
+				// hold (stalled budget or uncertain predecessor) is CLEARED and
+				// the acknowledgement is audited in the escalation trail BEFORE
+				// the new attempt starts. Without this, a successfully resumed
+				// job would stay sticky-stalled and be held forever.
+				let acknowledged = uncertain ?? prior;
+				if (acknowledged.state === "stalled" || acknowledged.state === "awaiting_operator") {
+					acknowledged = acknowledgeHold({
+						record: acknowledged,
+						note: "operator resumed the lane via work.run resume:true",
+						at: new Date().toISOString(),
+					});
+					persistLaneJob(options.database, acknowledged, laneKey);
+				}
 				const opRef = newOpRef(`work-${workName.toLowerCase().replace(/[^a-z0-9]+/g, "-")}`);
-				let job = appendAttempt(uncertain ?? prior, {
+				let job = appendAttempt(acknowledged, {
 					opRef,
 					sessionId,
 					startedAt: new Date().toISOString(),

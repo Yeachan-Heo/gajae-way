@@ -580,6 +580,37 @@ export function appendAttempt(record: LaneJobRecord, attempt: JobAttempt): LaneJ
 	});
 }
 
+export type AcknowledgeHoldInput = {
+	readonly record: LaneJobRecord;
+	/** Why the hold is being released; lands in the escalation trail. */
+	readonly note: string;
+	readonly at: string;
+};
+
+/**
+ * Explicitly releases a sticky hold (`stalled` / `awaiting_operator`).
+ *
+ * Release is an AUDITED operator decision, never a side effect: the hold
+ * reason lands in the escalation trail, the stalled budget resets, and the
+ * job returns to the continuable `attempt_ended` state. `done`/`aborted`
+ * jobs and records without a hold are returned unchanged.
+ */
+export function acknowledgeHold(input: AcknowledgeHoldInput): LaneJobRecord {
+	if (input.record.state !== "stalled" && input.record.state !== "awaiting_operator") {
+		return input.record;
+	}
+	return Object.freeze({
+		...input.record,
+		state: "attempt_ended",
+		stalledContinuations: input.record.state === "stalled" ? 0 : input.record.stalledContinuations,
+		escalations: Object.freeze([
+			...input.record.escalations,
+			`${input.at} operator resume acknowledged: hold cleared (${input.note})`,
+		]),
+		updatedAt: input.at,
+	});
+}
+
 export type CloseAttemptInput = {
 	readonly record: LaneJobRecord;
 	readonly opRef: string;
