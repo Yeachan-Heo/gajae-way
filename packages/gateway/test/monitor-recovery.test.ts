@@ -74,6 +74,11 @@ function seedEvent(db: GatewayDatabase, monitorId: string, stage: string, batchI
 	return eventId;
 }
 
+
+function backdateMonitor(db: GatewayDatabase, monitorId: string, createdAt: Date): void {
+	db.monitorSetCreatedAt(monitorId, createdAt.toISOString());
+}
+
 describe("monitor crash-boundary state machine", () => {
 	test("admitted→batched→dispatched→authored via a live dispatch", async () => {
 		const {
@@ -238,6 +243,8 @@ describe("monitor crash-boundary state machine", () => {
 });
 
 describe("cron slot catch-up", () => {
+	// Catch-up tests use synthetic 2026-08-27 clocks; backdate the monitor so its
+	// creation instant precedes the scheduled slots under test.
 	test("catch-up fires every due slot across a restart window with exact timestamps, deduped", () => {
 		const fired: string[] = [];
 		// Window crossing the 06:30 slot.
@@ -268,6 +275,7 @@ describe("cron slot catch-up", () => {
 		const { propagator, monitor, database: db } = await harness(async (_id, text) =>
 			JSON.stringify(eventsFromPrompt(text).map(({ eventId }) => ({ eventId, note: "note" }))),
 		);
+		backdateMonitor(db, monitor.monitorId, new Date(2026, 7, 26, 0, 0));
 		const fired: string[] = [];
 		const clock = { value: new Date(2026, 7, 27, 6, 0) };
 		const stop = startCron("*/30 * * * *", (slot) => {
@@ -303,6 +311,32 @@ describe("cron slot catch-up", () => {
 		stop();
 	});
 
+	test("fresh monitor does not backfill pre-creation slots; restarted old monitor does", async () => {
+		const { propagator, monitor, database: db } = await harness(async (_id, text) =>
+			JSON.stringify(eventsFromPrompt(text).map(({ eventId }) => ({ eventId, note: "note" }))),
+		);
+		// The monitor was just created (createdAt ≈ now). A slot scheduled 30
+		// minutes BEFORE creation must not be synthesized by catch-up...
+		const beforeCreation = new Date(Date.now() - 30 * 60_000);
+		const id = propagator.submitSlot(
+			monitor.monitorId,
+			"memory.canonicalize",
+			{ at: beforeCreation.toISOString() },
+			beforeCreation,
+		);
+		expect(id).toBeNull();
+		expect(db.monitorSlotExists(monitor.monitorId, beforeCreation.toISOString())).toBe(false);
+		// ...while a slot after creation on a RESTARTED (old) monitor still fires:
+		const afterCreation = new Date(Date.now() + 30 * 60_000);
+		const ok = propagator.submitSlot(
+			monitor.monitorId,
+			"memory.canonicalize",
+			{ at: afterCreation.toISOString() },
+			afterCreation,
+		);
+		expect(ok).not.toBeNull();
+	});
+
 	test("budget counts only NEW admissions: 12 claimed duplicates do not starve a missed later slot", () => {
 		const claimed = new Set<string>();
 		// 12 already-claimed slots (fire returns false = duplicate admission)...
@@ -326,6 +360,7 @@ describe("cron slot catch-up", () => {
 		const { propagator, monitor, database: db } = await harness(async (_id, text) =>
 			JSON.stringify(eventsFromPrompt(text).map(({ eventId }) => ({ eventId, note: "note" }))),
 		);
+		backdateMonitor(db, monitor.monitorId, new Date(2026, 7, 26, 0, 0));
 		const fired: string[] = [];
 		// Process "starts" at 06:31 after being down across the 06:30 slot.
 		const stop = startCron("30 6 * * *", (slot) => {
@@ -361,6 +396,7 @@ describe("cron slot catch-up", () => {
 		const { propagator, monitor, database: db } = await harness(async (_id, text) =>
 			JSON.stringify(eventsFromPrompt(text).map(({ eventId }) => ({ eventId, note: "note" }))),
 		);
+		backdateMonitor(db, monitor.monitorId, new Date(2026, 7, 26, 0, 0));
 		const fired: string[] = [];
 		// Process starts at 20:00; the 06:30 slot from the same day is far outside the
 		// bounded window and must NOT fire.
@@ -381,6 +417,7 @@ describe("cron slot catch-up", () => {
 		const { propagator, monitor, database: db } = await harness(async (_id, text) =>
 			JSON.stringify(eventsFromPrompt(text).map(({ eventId }) => ({ eventId, note: "note" }))),
 		);
+		backdateMonitor(db, monitor.monitorId, new Date(2026, 7, 26, 0, 0));
 		const clock = { value: new Date(2026, 7, 27, 5, 30) };
 		const fired: string[] = [];
 		const stop = startCron("30 6 * * *", (slot) => {
@@ -416,6 +453,7 @@ describe("cron slot catch-up", () => {
 		const { propagator, monitor, database: db } = await harness(async (_id, text) =>
 			JSON.stringify(eventsFromPrompt(text).map(({ eventId }) => ({ eventId, note: "note" }))),
 		);
+		backdateMonitor(db, monitor.monitorId, new Date(2026, 7, 26, 0, 0));
 		const slotAt = new Date(2026, 7, 27, 6, 30);
 		// The ONLY production admission path is the atomic claim+event transaction:
 		// there is no intermediate "claimed but unadmitted" state a crash can leave.
@@ -433,6 +471,7 @@ describe("cron slot catch-up", () => {
 		const { propagator, monitor, database: db } = await harness(async (_id, text) =>
 			JSON.stringify(eventsFromPrompt(text).map(({ eventId }) => ({ eventId, note: "note" }))),
 		);
+		backdateMonitor(db, monitor.monitorId, new Date(2026, 7, 26, 0, 0));
 		const slotAt = new Date(2026, 7, 27, 6, 30);
 		const id = propagator.submitSlot(monitor.monitorId, "memory.canonicalize", { at: slotAt.toISOString() }, slotAt);
 		expect(id).not.toBeNull();
@@ -531,11 +570,14 @@ describe("durable dispatch leases — concurrent attempts (true overlap)", () =>
 				enabled: true,
 			});
 
-			// Attempt A parks inside its real propagator dispatch (sendTurn hangs).
+			// Attempt A parks inside its real propagator dispatch (sendTurn hangs,
+			// then RETURNS an A note only after B has completed — the stale
+			// completion path the fencing must neutralize).
 			let releaseA!: () => void;
 			const aParked = new Promise<void>((resolve) => {
 				releaseA = resolve;
 			});
+			let aUnblocked = false;
 			let deliveriesA = 0;
 			const propagatorA = new MonitorPropagator({
 				database: db,
@@ -544,7 +586,15 @@ describe("durable dispatch leases — concurrent attempts (true overlap)", () =>
 					ensureSession: async () => ({ sessionId: "s" }),
 					sendTurn: async () => {
 						releaseA();
-						return await new Promise<string>(() => {});
+						await new Promise<void>((resolve) => {
+							const check = setInterval(() => {
+								if (aUnblocked) {
+									clearInterval(check);
+									resolve();
+								}
+							}, 5);
+						});
+						return JSON.stringify([{ eventId, note: "A note" }]);
 					},
 				},
 				memory: { enqueue: () => crypto.randomUUID() } as never,
@@ -554,11 +604,14 @@ describe("durable dispatch leases — concurrent attempts (true overlap)", () =>
 				},
 				emit: () => {},
 			});
-			const eventId = propagatorA.submit(monitor.monitorId, "memory.canonicalize", { at: "a" });
+			let eventId = "";
+			const submitA = propagatorA.submit(monitor.monitorId, "memory.canonicalize", { at: "a" });
+			eventId = submitA;
 			await aParked;
 			await Bun.sleep(10);
 			const leaseA = db.monitorEventLiveLeaseOwner(eventId);
 			expect(leaseA).toBeString();
+			
 
 			// A's process "dies": its lease expires with no heartbeat. Attempt B (a
 			// new process's propagator, clock shifted past A's TTL) finds no live
@@ -587,13 +640,25 @@ describe("durable dispatch leases — concurrent attempts (true overlap)", () =>
 			expect(row?.stage).toBe("authored");
 			expect(db.authoredOutput(eventId)).toBe("B note");
 			expect(deliveriesB).toBe(1);
-			// Exactly one memory intent (B's), one delivery (B's).
 
-			// A's parked turn never completes (its process died) — no writes from A
-			// can exist even if it later unblocks, because its fenced writes require
-			// the lease it no longer holds.
-			expect(deliveriesA).toBe(0);
+			// Now unblock A: its stale attempt completes with an A note. Every write
+			// is lease-fenced, so nothing may change.
+			aUnblocked = true;
+			await Bun.sleep(50);
+			expect(row?.stage).toBe("authored");
 			expect(db.authoredOutput(eventId)).toBe("B note");
+			// Exactly one memory intent for the event (B's; A fenced out):
+			const intents = db.memoryIntentRows().filter((intent) => intent.payload_json.includes(eventId));
+			expect(intents).toHaveLength(1);
+			const intent0 = intents[0];
+			expect(intent0?.payload_json).toContain("B note");
+			// Exactly one ledger delivery (B's); A emitted none:
+			expect(deliveriesA).toBe(0);
+			expect(deliveriesB).toBe(1);
+			// No A failure evidence:
+			expect(db.monitorFailure(eventId)).toBeUndefined();
+			// No failure rows at all for this event.
+			expect(db.monitorEventRows().find((candidate) => candidate.event_id === eventId)?.stage).not.toBe("failed");
 			expect(db.monitorEventLiveLeaseOwner(eventId, Date.now() + bClockShift)).not.toBe(leaseA);
 			db.close();
 		} finally {

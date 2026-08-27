@@ -138,6 +138,9 @@ export class MonitorPropagator {
 	submitSlot(monitorId: string, eventType: string, payload: unknown, slotAt: Date): string | null {
 		const monitor = this.#registry.get(monitorId);
 		if (!monitor?.enabled) throw new Error("unknown or disabled monitor");
+		// Round-4 blocker 4: a monitor must never backfill slots scheduled before
+		// it existed — catch-up admission is clamped to monitor.createdAt.
+		if (slotAt.getTime() < Date.parse(monitor.createdAt)) return null;
 		const eventId = crypto.randomUUID();
 		const admitted = this.#database.monitorSlotClaimWithEvent({
 			monitorId,
@@ -192,7 +195,8 @@ export class MonitorPropagator {
 				const hasMemory = this.#database
 					.memoryIntentRows()
 					.some((intent) => intent.kind === "monitor-event" && intent.payload_json.includes(row.event_id));
-				if (output && !hasMemory) this.#author(row.event_id, output, row.stage === "authored_no_delivery");
+				if (output && !hasMemory)
+					this.#author(row.event_id, output, row.stage === "authored_no_delivery", row);
 				else if (!output && this.#recoverable(row)) {
 					// Red-team blocker 1: a live dispatch lease owned by ANOTHER attempt
 					// means the authoring turn may still complete elsewhere; a new
@@ -304,23 +308,26 @@ export class MonitorPropagator {
 					fenced.some((row) => row.event_id === entry.eventId) &&
 					typeof entry.note === "string"
 				) {
-					const authoredOk = this.#database.monitorEventFencedAuthor(entry.eventId, leaseId, entry.note);
-					if (!authoredOk) continue;
-					// Memory closure mirrors #author for the fenced path.
 					const row = this.#database.monitorEventRows().find((candidate) => candidate.event_id === entry.eventId);
-					if (row) {
-						this.#memory.enqueue({
-							kind: "monitor-event",
-							originRefJson: JSON.stringify(eventTypeOrigin(row.event_type)),
-							userText: `Monitor event ${entry.eventId}: ${row.event_type}`,
-							replyText: entry.note,
-						});
-					}
+					if (!row) continue;
+					const intentId = `monitor-event-intent:${entry.eventId}`;
+					const authoredOk = this.#database.monitorEventFencedAuthorWithIntent(
+						entry.eventId,
+						leaseId,
+						entry.note,
+						false,
+						monitor.monitorId,
+						row.event_type,
+						row.fired_at,
+						intentId,
+						JSON.stringify(eventTypeOrigin(row.event_type)),
+					);
+					if (!authoredOk) continue;
 					this.#emit({
 						eventId: entry.eventId,
-						monitorId: row?.monitor_id ?? "",
-						eventType: row?.event_type ?? "",
-						firedAt: row?.fired_at ?? new Date().toISOString(),
+						monitorId: monitor.monitorId,
+						eventType: row.event_type,
+						firedAt: row.fired_at,
 						stage: "authored",
 					});
 				}
@@ -412,25 +419,29 @@ export class MonitorPropagator {
 		timer.unref?.();
 		return () => clearInterval(timer);
 	}
-	#author(eventId: string, note: string, noDelivery = false): void {
-		const row = this.#database.monitorEventRows().find((candidate) => candidate.event_id === eventId);
-		if (!row) return;
-		this.#database.withTransaction(() => {
-			this.#database.authoredOutputCreate(eventId, note);
-			this.#database.monitorEventUpdate(eventId, noDelivery ? "authored_no_delivery" : "authored");
-		});
-		this.#memory.enqueue({
-			kind: "monitor-event",
-			originRefJson: JSON.stringify(eventTypeOrigin(row.event_type)),
-			userText: `Monitor event ${eventId}: ${row.event_type}`,
-			replyText: note,
-		});
+	#author(eventId: string, note: string, noDelivery = false, row?: { monitor_id: string; event_type: string; fired_at: string }): void {
+		const eventRow = row ?? this.#database.monitorEventRows().find((candidate) => candidate.event_id === eventId);
+		if (!eventRow) return;
+		// Atomic output+intent with a DETERMINISTIC intent id: reconcile and a
+		// concurrent dispatch can never create two intents for one event.
+		const intentId = `monitor-event-intent:${eventId}`;
+		this.#database.monitorEventFencedAuthorWithIntent(
+			eventId,
+			"",
+			note,
+			noDelivery,
+			eventRow.monitor_id,
+			eventRow.event_type,
+			eventRow.fired_at,
+			intentId,
+			JSON.stringify(eventTypeOrigin(eventRow.event_type)),
+		);
 		this.#emit({
 			eventId,
-			monitorId: row.monitor_id,
-			eventType: row.event_type,
-			firedAt: row.fired_at,
-			stage: "authored",
+			monitorId: eventRow.monitor_id,
+			eventType: eventRow.event_type,
+			firedAt: eventRow.fired_at,
+			stage: noDelivery ? "authored_no_delivery" : "authored",
 		});
 	}
 }

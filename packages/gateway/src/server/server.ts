@@ -362,8 +362,14 @@ async function handleRequest(
 			if (confirmOutcome === "unknown") throw new ProtocolError("invalid_params", "unknown deliveryId");
 			// Monitor batch settlement: a confirmed delivery for a monitor batch
 			// (turn_id === the events' batch_id) advances its authored events to
-			// `delivered` — only AFTER the adapter confirmed (issue #29 defect 2).
-			settleMonitorBatch(options.database, id, "delivered");
+			// `delivered` — only AFTER the adapter confirmed (issue #29 defect 2),
+			// and NEVER when the ledger row is expired: a late confirm on an expired
+			// delivery must not mark monitor events delivered (round-4 blocker 3).
+			// delivery must not mark monitor events delivered (round-4 blocker 3).
+			{
+				const ledgerRow = options.database.deliveryRows().find((row) => row.delivery_id === id);
+				if (ledgerRow?.state === "confirmed") settleMonitorBatch(options.database, id, "delivered");
+			}
 			connection.write({ v: PROFILE_VERSION, type: "response", id: request.id, result: { settled: true } });
 			return;
 		}
@@ -383,9 +389,11 @@ async function handleRequest(
 			// A failed monitor-batch delivery stays distinguishable: its events keep
 			// stage `authored` (or `batched` before authoring) so reconcile and the
 			// operator projection show them as unsettled; the ledger row carries the
-			// failed/ambiguous state. Never silently `delivered`.
-			if (params && typeof params.deliveryId === "string")
+			// failed/ambiguous state. Never silently `delivered`. Monotonic: only a
+			// transitioned fail touches still-unsettled events.
+			if (failOutcome === "transitioned" && typeof params.deliveryId === "string") {
 				settleMonitorBatch(options.database, params.deliveryId, "authored");
+			}
 			connection.write({ v: PROFILE_VERSION, type: "response", id: request.id, result: { recorded: true } });
 			return;
 		}

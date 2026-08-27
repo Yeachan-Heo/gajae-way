@@ -4,8 +4,8 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { GatewayConfig } from "../src/config";
 import type { GjcPort } from "../src/orchestrator/gjc-client";
-import { GatewayDatabase } from "../src/store/db";
 import { type GatewayServer, startUnixServer } from "../src/server/server";
+import { GatewayDatabase } from "../src/store/db";
 
 let directory = "";
 let server: GatewayServer | undefined;
@@ -116,7 +116,13 @@ test("delivery.confirm on a monitor batch advances authored events to delivered 
 	const ctx = await startWithMonitor();
 	ctx.send({ v: "0.1", type: "hello", payload: { supportedVersions: ["0.1"] } });
 	await response(ctx.frames, "__negotiated__").catch(() => undefined);
-	ctx.send({ v: "0.1", type: "request", id: "confirm", verb: "delivery.confirm", params: { deliveryId: ctx.deliveryId } });
+	ctx.send({
+		v: "0.1",
+		type: "request",
+		id: "confirm",
+		verb: "delivery.confirm",
+		params: { deliveryId: ctx.deliveryId },
+	});
 	const res = await response(ctx.frames, "confirm");
 	expect(res.result).toEqual({ settled: true });
 	const stages = ctx.db.monitorEventRows().filter((row) => ctx.eventIds.includes(row.event_id));
@@ -127,7 +133,13 @@ test("delivery.confirm on a monitor batch advances authored events to delivered 
 test("late delivery.fail cannot regress a delivered monitor event (server protocol)", async () => {
 	const ctx = await startWithMonitor();
 	ctx.send({ v: "0.1", type: "hello", payload: { supportedVersions: ["0.1"] } });
-	ctx.send({ v: "0.1", type: "request", id: "confirm", verb: "delivery.confirm", params: { deliveryId: ctx.deliveryId } });
+	ctx.send({
+		v: "0.1",
+		type: "request",
+		id: "confirm",
+		verb: "delivery.confirm",
+		params: { deliveryId: ctx.deliveryId },
+	});
 	await response(ctx.frames, "confirm");
 	// A late, out-of-order fail for the same delivery id (e.g. a duplicate
 	// adapter retry after confirmation):
@@ -142,6 +154,25 @@ test("late delivery.fail cannot regress a delivered monitor event (server protoc
 	const stages = ctx.db.monitorEventRows().filter((row) => ctx.eventIds.includes(row.event_id));
 	// Monotonic: delivered stays delivered.
 	expect(stages.map((row) => row.stage)).toEqual(["delivered", "delivered"]);
+});
+
+test("RT-29 duplicate confirm on confirmed keeps monitor events delivered", async () => {
+	const ctx = await startWithMonitor();
+	ctx.send({ v: "0.1", type: "hello", payload: { supportedVersions: ["0.1"] } });
+	ctx.send({ v: "0.1", type: "request", id: "c1", verb: "delivery.confirm", params: { deliveryId: ctx.deliveryId } });
+	await response(ctx.frames, "c1");
+	expect(ctx.db.monitorEventRows().filter((row) => ctx.eventIds.includes(row.event_id)).map((row) => row.stage)).toEqual([
+		"delivered",
+		"delivered",
+	]);
+	// Duplicate confirm (idempotent ack):
+	ctx.send({ v: "0.1", type: "request", id: "c2", verb: "delivery.confirm", params: { deliveryId: ctx.deliveryId } });
+	const dup = await response(ctx.frames, "c2");
+	expect(dup.result).toEqual({ settled: true });
+	expect(ctx.db.monitorEventRows().filter((row) => ctx.eventIds.includes(row.event_id)).map((row) => row.stage)).toEqual([
+		"delivered",
+		"delivered",
+	]);
 });
 
 test("delivery.fail before confirmation keeps authored events authored (server protocol)", async () => {
@@ -164,7 +195,13 @@ test("delivery.fail before confirmation keeps authored events authored (server p
 test("RT-29 ledger monotonicity: late fail after confirmed is a no-op on the ledger row", async () => {
 	const ctx = await startWithMonitor();
 	ctx.send({ v: "0.1", type: "hello", payload: { supportedVersions: ["0.1"] } });
-	ctx.send({ v: "0.1", type: "request", id: "confirm", verb: "delivery.confirm", params: { deliveryId: ctx.deliveryId } });
+	ctx.send({
+		v: "0.1",
+		type: "request",
+		id: "confirm",
+		verb: "delivery.confirm",
+		params: { deliveryId: ctx.deliveryId },
+	});
 	await response(ctx.frames, "confirm");
 	expect(ctx.db.deliveryRows().find((row) => row.delivery_id === ctx.deliveryId)?.state).toBe("confirmed");
 	// Adapter retries a stale failure AFTER the confirm landed:
@@ -200,11 +237,21 @@ test("RT-29 ledger monotonicity: expired row cannot be resurrected by a late con
 	}
 	expect(ctx.db.deliveryRows().find((row) => row.delivery_id === ctx.deliveryId)?.state).toBe("expired");
 	// A late confirm cannot resurrect an expired delivery:
-	ctx.send({ v: "0.1", type: "request", id: "late-confirm", verb: "delivery.confirm", params: { deliveryId: ctx.deliveryId } });
+	ctx.send({
+		v: "0.1",
+		type: "request",
+		id: "late-confirm",
+		verb: "delivery.confirm",
+		params: { deliveryId: ctx.deliveryId },
+	});
 	const lateConfirm = await response(ctx.frames, "late-confirm");
 	// Expired is terminal: idempotent success ack, state unchanged.
 	expect(lateConfirm.result).toEqual({ settled: true });
 	expect(ctx.db.deliveryRows().find((row) => row.delivery_id === ctx.deliveryId)?.state).toBe("expired");
+	// Round-4 blocker 3: the late confirm on an EXPIRED delivery must NOT settle
+	// the batch's monitor events to delivered — they stay authored.
+	const stagesAfter = ctx.db.monitorEventRows().filter((row) => ctx.eventIds.includes(row.event_id));
+	expect(stagesAfter.map((row) => row.stage)).toEqual(["authored", "authored"]);
 	// An UNKNOWN delivery id is still invalid_params (an error frame):
 	ctx.send({ v: "0.1", type: "request", id: "unknown-id", verb: "delivery.confirm", params: { deliveryId: "nope" } });
 	for (let attempt = 0; attempt < 400; attempt++) {

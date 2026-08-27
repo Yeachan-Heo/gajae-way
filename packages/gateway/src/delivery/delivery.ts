@@ -5,7 +5,7 @@ import {
 	originKey,
 	type ReactionRef,
 } from "@gajaeway/protocol";
-import { type LedgerOutcome, DeliveryLedger } from "../store/ledger";
+import type { DeliveryLedger, LedgerOutcome } from "../store/ledger";
 
 export class DeliveryService {
 	readonly #ledger: DeliveryLedger;

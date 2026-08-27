@@ -265,6 +265,15 @@ export class GatewayDatabase {
 			.run(row.id, row.kind, row.payloadJson, now, now);
 	}
 
+	/** Insertion-order view (rowid) — preserves admission order within the same millisecond. */
+	memoryIntentRowsByRowid(): Array<{ id: string; kind: string; payload_json: string; state: string }> {
+		return this.#database
+			.query(
+				"SELECT id, kind, payload_json, state FROM memory_intents ORDER BY rowid",
+			)
+			.all() as Array<{ id: string; kind: string; payload_json: string; state: string }>;
+	}
+
 	memoryIntentUpdate(id: string, state: "queued" | "written" | "committed" | "receipted" | "quarantined"): void {
 		this.#database
 			.query("UPDATE memory_intents SET state = ?, updated_at = ? WHERE id = ?")
@@ -663,6 +672,67 @@ SELECT 1 FROM dispatch_leases l WHERE l.event_id = monitor_events.event_id AND l
 		});
 	}
 	/**
+	 * Atomic LEASE-FENCED authored output + memory-intent admission (round-3/4
+	 * blockers): the authored_outputs upsert and the queued monitor-event intent
+	 * commit in ONE transaction, and the stage UPDATE carries the live-lease
+	 * predicate — a crash or interleaving between writes can never produce zero
+	 * or duplicate intents for the same event, and a stale attempt cannot write.
+	 */
+	monitorEventFencedAuthorWithIntent(
+		eventId: string,
+		leaseId: string,
+		note: string,
+		noDelivery: boolean,
+		monitorId: string,
+		eventType: string,
+		firedAt: string,
+		intentId: string,
+		originRefJson: string,
+		now = Date.now(),
+	): boolean {
+		return this.withTransaction(() => {
+			// leaseId === "" means UNFENCED (reconcile re-author path: single-flight,
+			// event already proven non-terminal). Dispatch attempts always pass a
+			// real lease id and get the EXISTS predicate.
+			const leasePredicate =
+				leaseId === ""
+					? "1=1"
+					: `EXISTS (
+SELECT 1 FROM dispatch_leases l WHERE l.event_id = monitor_events.event_id AND l.lease_id = ? AND l.expires_at > ?
+)`;
+			const leaseArgs = leaseId === "" ? [] : [leaseId, new Date(now).toISOString()];
+			const changes = this.#database
+				.query(
+					`UPDATE monitor_events SET stage = ?, updated_at = ?
+WHERE event_id = ? AND ${leasePredicate}`,
+				)
+				.run(noDelivery ? "authored_no_delivery" : "authored", new Date(now).toISOString(), eventId, ...leaseArgs)
+				.changes;
+			if (changes === 0) return false;
+			this.authoredOutputCreate(eventId, note);
+			// Idempotent intent: the INSERT is keyed on the deterministic intent id;
+			// a second admission for the same event is a no-op.
+			const existing = this.#database
+				.query<{ id: string }, [string]>("SELECT id FROM memory_intents WHERE id = ?")
+				.get(intentId);
+			if (existing) return true;
+			this.memoryIntentCreate({
+				id: intentId,
+				kind: "monitor-event",
+				payloadJson: JSON.stringify({
+					kind: "monitor-event",
+					identity: `monitor-event:${eventId}`,
+					originRefJson,
+					userText: `Monitor event ${eventId}: ${eventType}`,
+					replyText: note,
+				}),
+			});
+			void monitorId;
+			void firedAt;
+			return true;
+		});
+	}
+	/**
 	 * Fenced failure write: failed stage + public-safe evidence row in one
 	 * transaction, both gated on the live lease (round-3 blocker 1).
 	 */
@@ -866,6 +936,12 @@ SELECT 1 FROM dispatch_leases l WHERE l.event_id = monitor_events.event_id AND l
 				return true;
 			}) as boolean
 		);
+	}
+	/** Test/recovery seam: move a monitor's creation instant (clamps catch-up). */
+	monitorSetCreatedAt(monitorId: string, createdAt: string): void {
+		this.#database
+			.query("UPDATE monitors SET created_at = ? WHERE monitor_id = ?")
+			.run(createdAt, monitorId);
 	}
 	monitorSlotExists(monitorId: string, slotAt: string): boolean {
 		const row = this.#database

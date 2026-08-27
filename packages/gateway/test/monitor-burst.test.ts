@@ -38,6 +38,7 @@ test("coalesce preserves every event identity while using one authoring turn", a
 				return crypto.randomUUID();
 			},
 		};
+		void memory;
 		const pipeline = new MonitorPropagator({
 			database,
 			registry,
@@ -49,7 +50,8 @@ test("coalesce preserves every event identity while using one authoring turn", a
 		for (let i = 0; i < 200; i++) pipeline.submit(monitor.monitorId, "changed", { i });
 		await Bun.sleep(350);
 		expect(database.monitorEventRows().length).toBe(200);
-		expect(mutations).toBe(200);
+		// Intents are now admitted atomically at the DB level: count durable rows.
+		expect(database.memoryIntentRows().length).toBe(200);
 		expect(turns).toBe(1);
 		database.close();
 	} finally {
