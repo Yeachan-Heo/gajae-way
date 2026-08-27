@@ -298,16 +298,26 @@ export interface RebindStore {
  * create made the cap unreachable for a recurring turn-level failure and let the
  * epoch grow one bump per message — the silent growth the cap exists to stop.
  *
- * The counter is process-local while the epoch is durable, so a gateway restart
- * starts a fresh budget. That is a deliberate limit, not an oversight: a restart
- * is an operator action and is visible, whereas the outage this guards against
- * was continuous muteness inside one long-lived process.
+ * The cap bounds CONSECUTIVE rebinds: a turn that completes unaided is genuine
+ * evidence of health and clears it, because a lifetime quota recoverable only by
+ * `/new` would be worse. That leaves one shape the cap cannot bound — a failure
+ * that alternates with clean turns grows the epoch at half rate while every
+ * consecutive count reads `1/3`. The lifetime total is therefore logged on every
+ * rebind, so that pattern is visible instead of silent; "nobody notices" is the
+ * actual harm the guard exists to prevent.
+ *
+ * The counters are process-local while the epoch is durable, so a gateway restart
+ * starts fresh. That is a deliberate limit, not an oversight: a restart is an
+ * operator action and is visible, whereas the outage this guards against was
+ * continuous muteness inside one long-lived process.
  */
 export class SessionRebinder {
 	readonly #store: RebindStore;
 	readonly #cap: number;
 	readonly #log: (line: string) => void;
 	readonly #used = new Map<string, number>();
+	/** Never cleared by health: the total this process has ever spent per origin. */
+	readonly #lifetime = new Map<string, number>();
 
 	constructor(store: RebindStore, cap = DEFAULT_REBIND_CAP, log: (line: string) => void = console.warn) {
 		this.#store = store;
@@ -330,8 +340,10 @@ export class SessionRebinder {
 		if (used >= this.#cap) throw new RebindCapExceededError(originKey, this.#cap, causeCode, fromEpoch);
 		const toEpoch = this.#store.withTransaction(() => this.#store.rebindEpoch(originKey));
 		this.#used.set(originKey, used + 1);
+		const lifetime = (this.#lifetime.get(originKey) ?? 0) + 1;
+		this.#lifetime.set(originKey, lifetime);
 		this.#log(
-			`gateway session rebind ${used + 1}/${this.#cap} origin=${originKey} cause=${causeCode} epoch ${fromEpoch} -> ${toEpoch}`,
+			`gateway session rebind ${used + 1}/${this.#cap} origin=${originKey} cause=${causeCode} epoch ${fromEpoch} -> ${toEpoch} (lifetime ${lifetime})`,
 		);
 		return toEpoch;
 	}

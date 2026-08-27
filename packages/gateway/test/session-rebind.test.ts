@@ -335,7 +335,46 @@ test("the rebind log line names the causing code and both epochs", async () => {
 	]);
 	try {
 		await client.ensureSession("discord:dm:c1");
-		expect(logs[0]).toBe("gateway session rebind 1/3 origin=discord:dm:c1 cause=terminal_uncertain epoch 0 -> 1");
+		expect(logs[0]).toBe(
+			"gateway session rebind 1/3 origin=discord:dm:c1 cause=terminal_uncertain epoch 0 -> 1 (lifetime 1)",
+		);
+	} finally {
+		database.close();
+	}
+});
+
+test("the lifetime total is logged, so growth that alternates with clean turns is visible", async () => {
+	// The cap bounds CONSECUTIVE rebinds, and an unaided clean turn legitimately
+	// clears it. That leaves a failure alternating with clean turns growing the
+	// epoch while every consecutive count reads 1/3 — invisible unless the
+	// lifetime total is reported, which is the harm the guard exists to prevent.
+	directory = await mkdtemp(join(tmpdir(), "gajaeway-rebind-"));
+	const database = await GatewayDatabase.open(join(directory, "gateway.db"));
+	const logs: string[] = [];
+	let failNextTurn = false;
+	let created = 0;
+	const spawn = ((options: { cmd: string[] }) => {
+		if (options.cmd.includes("session.create")) return fakeChild(createSuccess(`session-${created++}`), "", 0);
+		if (failNextTurn) {
+			failNextTurn = false;
+			return fakeChild(turnFailure("managed_append_identity_mismatch", "identity moved"), "", 1);
+		}
+		return fakeChild(turnReply("ok"), "", 0);
+	}) as unknown as typeof Bun.spawn;
+	const client = new GjcClient(database, 5_000, directory, undefined, { spawn, log: (line) => logs.push(line) });
+	const current = async () =>
+		(await client.ensureSession("discord:dm:c1", database.getSessionRecord("discord:dm:c1")?.epoch ?? 0)).sessionId;
+	try {
+		for (let round = 0; round < 3; round++) {
+			// A failing message, then a clean one that resets the consecutive count.
+			failNextTurn = true;
+			await client.sendTurn(await current(), "hello").catch(() => undefined);
+			await client.sendTurn(await current(), "hello");
+		}
+		// The consecutive count keeps reading 1/3 — the shape the cap cannot bound.
+		expect(logs.every((line) => line.includes("rebind 1/3"))).toBe(true);
+		// The lifetime total escalates, so an operator can actually see it.
+		expect(logs.map((line) => line.match(/\(lifetime (\d+)\)/)?.[1])).toEqual(["1", "2", "3"]);
 	} finally {
 		database.close();
 	}
@@ -380,7 +419,7 @@ test("a turn-level managed_append_identity_mismatch rebinds and replays the turn
 		expect(sessionId).toBe("session-e0");
 		expect(await client.sendTurn(sessionId, "hello")).toBe("reply after rebind");
 		expect(logs[0]).toBe(
-			"gateway session rebind 1/3 origin=discord:dm:c1 cause=managed_append_identity_mismatch epoch 0 -> 1",
+			"gateway session rebind 1/3 origin=discord:dm:c1 cause=managed_append_identity_mismatch epoch 0 -> 1 (lifetime 1)",
 		);
 		expect(database.getSessionRecord("discord:dm:c1")).toEqual({ sessionId: "session-e1", epoch: 1 });
 		// The replayed turn resumes the NEW session, never the condemned one.
