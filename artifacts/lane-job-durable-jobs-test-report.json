@@ -88,7 +88,7 @@
   "collision-free identity lanejob-work-<slug>-<fnv1a32(exact name)>; lane block records the real worktree and actual git branch",
   "parse rejects endedAt/endState mismatches and non-last open attempts; work.jobs re-validates record JSON and flags corrupt rows"
  ],
- "reportIdentity": "Report-bearing commits after 23b70c5 (bfc219d, 86c6abd, and the commit adding this text) touch only this JSON file; the validated executable tree is 23b70c5 exactly.",
+ "reportIdentity": "Report-bearing commits after 23b70c5 (bfc219d, 86c6abd, 60e0179, and this commit) touch only this JSON file and docs-adjacent text; the validated executable tree is 23b70c5 plus the round-3 code fixes committed alongside this report (see git history: the round-3 code commit re-ran the full validation suite).",
  "criticRound3Fixes": [
   "awaiting_operator hold is sticky: every work.run on a held job refuses to run until resume:true; held/resume contract typed in WorkRunParams/WorkRunResult and surfaced in the CLI (--resume, HELD output)",
   "repository-first reconciliation now runs on EVERY attempt end including reaped/failed ones; creation seeds the baseline HEAD checkpoint so the pre-existing commit is never reported as worker progress; classification uses hasNewCommit (progressed vs held)",
