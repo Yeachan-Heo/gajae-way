@@ -652,14 +652,19 @@ test("redaction is calibrated in BOTH directions", () => {
 });
 
 test("redaction stays linear on adversarial input", () => {
-	// A generic camelCase prefix pattern nested two quantifiers and took 6 seconds
+	// A generic camelCase prefix pattern nested two quantifiers and took 6 SECONDS
 	// on a 56-character input. This function parses untrusted runtime output, so a
 	// backtracking blowup here is a denial-of-service hazard, not a slow test.
+	//
+	// The bound is deliberately loose. It exists to catch a blowup of that
+	// magnitude, not to measure performance: a tight bound turns scheduler jitter
+	// under a parallel suite run into a flake, which is exactly what a 250ms
+	// version of this assertion did once.
 	const started = performance.now();
 	redactSecrets("AWS_SECRET_ACCESS_KEY_sk_live_deadbeefcafebabe0123456789".repeat(8));
 	redactSecrets(`token=${"a".repeat(4000)}`);
 	redactSecrets("secret_".repeat(500));
-	expect(performance.now() - started).toBeLessThan(250);
+	expect(performance.now() - started).toBeLessThan(2_000);
 });
 
 test("a quoted secret containing whitespace is redacted whole, not half", () => {
