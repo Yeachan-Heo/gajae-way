@@ -1,5 +1,6 @@
 import { copyFile, stat } from "node:fs/promises";
 import { isAbsolute, join } from "node:path";
+import type { OpsCycleResult } from "@gajaeway/protocol";
 import { LOOPBACK_ORIGIN, originKey } from "@gajaeway/protocol";
 import { GajaewayClient } from "@gajaeway/sdk";
 
@@ -34,6 +35,57 @@ function printSessions(
 		console.log(
 			`${String(index).padEnd(6)} ${originKey(session.origin).padEnd(43)} ${String(session.epoch).padEnd(6)} ${session.createdAt.padEnd(26)} ${session.lastActivityAt ?? "-"}`,
 		);
+}
+
+/**
+ * Operator runtime-cycle view (`gajaeway ops cycle`).
+ *
+ * Rendering contract:
+ * - The aggregate phase line always prints.
+ * - Any gate prints under `gates:` and forces exit code 1 — a gated cycle is
+ *   never reported as healthy, so scripting cannot mistake it for idle.
+ * - `--json` emits the typed OpsCycleResult verbatim; the exit-code contract
+ *   is identical.
+ */
+export function renderCycle(cycle: OpsCycleResult): string[] {
+	const lines: string[] = [];
+	lines.push(`phase: ${cycle.phase}`);
+	if (cycle.gates.length > 0) lines.push(`gates: ${cycle.gates.join(", ")}`);
+	else lines.push("gates: none");
+	lines.push(`generatedAt: ${cycle.generatedAt}`);
+	lines.push(`instance: ${cycle.instanceId}`);
+	lines.push(`inbound: pending=${cycle.pendingInbound} inflight=${cycle.inFlightInbound}`);
+	lines.push(
+		`deliveries: pending=${cycle.deliveries.pending} inflight=${cycle.deliveries.inflight} confirmed=${cycle.deliveries.confirmed} failed_ambiguous=${cycle.deliveries.failedAmbiguous} expired=${cycle.deliveries.expired}`,
+	);
+	lines.push(
+		`memory: queued=${cycle.memoryIntents.queued} written=${cycle.memoryIntents.written} committed=${cycle.memoryIntents.committed} receipted=${cycle.memoryIntents.receipted} quarantined=${cycle.memoryIntents.quarantined}${cycle.memoryClosing ? " (closing)" : ""}`,
+	);
+	// Always rendered: an empty subsystem must be distinguishable from an absent one.
+	lines.push(
+		`monitors: ${cycle.monitorEvents.length ? cycle.monitorEvents.map((m) => `${m.stage}=${m.count}`).join(" ") : "none"}`,
+	);
+	if (cycle.sessions.length > 0) {
+		lines.push("sessions:");
+		lines.push("INDEX  ORIGIN                                      EPOCH  SESSION      PENDING  UNSETTLED  OLDEST");
+		for (const [index, session] of cycle.sessions.entries()) {
+			const sessionId = session.sessionId === "" ? "(rebinding)" : session.sessionId.slice(0, 11);
+			const oldest =
+				session.oldestUnsettledAgeMs === null ? "-" : `${Math.round(session.oldestUnsettledAgeMs / 1000)}s`;
+			lines.push(
+				`${String(index).padEnd(6)} ${session.originKey.padEnd(43)} ${String(session.epoch).padEnd(6)} ${sessionId.padEnd(12)} ${String(session.pendingInbound).padEnd(8)} ${String(session.unsettledDeliveries).padEnd(10)} ${oldest}`,
+			);
+		}
+	}
+	return lines;
+}
+
+/**
+ * Exit-code contract for `gajaeway ops cycle`: 0 only when the projection is
+ * healthy. Extracted so the automation-facing contract is pinned by tests.
+ */
+export function cycleExitCode(cycle: OpsCycleResult): number {
+	return cycle.gates.length > 0 ? 1 : 0;
 }
 
 export async function restoreDatabase(socket: string, backupPath: string): Promise<void> {
@@ -190,7 +242,15 @@ export async function main(args = process.argv.slice(2)): Promise<void> {
 				try {
 					if (command === "backup" && path) console.log(JSON.stringify(await client.request("ops.backup", { path })));
 					else if (command === "integrity") console.log(JSON.stringify(await client.request("ops.integrity")));
-					else throw new Error("usage: gajaeway ops backup <path>|integrity|restore <backupPath>");
+					else if (command === "cycle") {
+						const cycle = await client.opsCycle();
+						if (parsed.rest[1] === "--json") console.log(JSON.stringify(cycle));
+						else if (parsed.rest[1]) throw new Error("usage: gajaeway ops cycle [--json]");
+						else for (const line of renderCycle(cycle)) console.log(line);
+						// Fail-closed: a gated/degraded cycle exits non-zero even though the
+						// request itself succeeded, so scripts can never read it as healthy.
+						process.exitCode = cycleExitCode(cycle);
+					} else throw new Error("usage: gajaeway ops backup <path>|cycle [--json]|integrity|restore <backupPath>");
 				} finally {
 					await client.close();
 				}
@@ -288,7 +348,7 @@ export async function main(args = process.argv.slice(2)): Promise<void> {
 			}
 			default:
 				throw new Error(
-					"usage: gajaeway [--socket PATH] status|shutdown|chat|daemon run|sessions list [--json]|sessions inspect <originKey-or-index>|memory audit|memory search <query>|monitors ...|work run <name> [--cwd DIR] <text>|ops backup <path>|ops integrity|ops restore <backupPath>",
+					"usage: gajaeway [--socket PATH] status|shutdown|chat|daemon run|sessions list [--json]|sessions inspect <originKey-or-index>|memory audit|memory search <query>|monitors ...|work run <name> [--cwd DIR] <text>|ops backup <path>|ops cycle [--json]|ops integrity|ops restore <backupPath>",
 				);
 		}
 	} catch (error) {
