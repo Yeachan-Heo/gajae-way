@@ -52,11 +52,6 @@ import { composeSpeakerLabel, composeTurnHeader } from "./speaker";
  */
 const SESSION_TURN_LIMIT = 50;
 
-/** A `gjc --resume` against a session gjc no longer has (deleted or lost binding). */
-function isStaleSessionError(error: unknown): boolean {
-	return error instanceof Error && /session\s+"?[\w-]+"?\s+not found/i.test(error.message);
-}
-
 interface Connection {
 	readonly decoder: FrameDecoder;
 	negotiated: boolean;
@@ -1106,19 +1101,13 @@ async function runInboundTurn(
 		});
 	};
 	try {
-		try {
-			text = await runTurn();
-		} catch (error) {
-			// A bound gjc session can vanish underneath its binding (live crash loop:
-			// `gjc turn exited 1: Session "…" not found` on every subsequent message).
-			// Rebind a fresh transcript via an epoch bump and retry once.
-			if (deliveredParts.length === 0 && isStaleSessionError(error)) {
-				console.error(`gateway rebinding stale gjc session for ${key}: ${(error as Error).message}`);
-				options.database.withTransaction(() => options.database.bumpEpoch(key, JSON.stringify(origin)));
-				text = await runTurn();
-			} else throw error;
-		}
+		text = await runTurn();
 	} catch (error) {
+		// A prose-only "session not found" failure (gjc emits no structured code
+		// for it) is deliberately NOT auto-rebound: #13 mandates exact-code-only
+		// classification, and every retry against the same dead key is guaranteed
+		// silence. The failure surfaces through #14's structured notice instead,
+		// where the operator's remedy — /new — is one message away.
 		// Never ghost a platform conversation: a failed turn still produces a visible,
 		// ledgered notice (live P1 drill finding: timeouts looked like silent ignores).
 		// The notice carries the runtime's OWN code and message (#14): one opaque line

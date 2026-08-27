@@ -280,8 +280,12 @@ function camelCaseKey(key: string): string {
  * carries one, and `?api_key=…` was not matching at all.
  */
 const CREDENTIAL_KEY = `(?:^|[\\s,{(\\["'?&#/;])(?:[A-Za-z0-9]+[_-])*?(?:${[...CREDENTIAL_KEYS, ...CREDENTIAL_KEYS.map(camelCaseKey)].join("|")})(?:[_-](?:value|key|token|secret|string|data|b64|base64))*["']?`;
-/** `key: [ … ]` — a list of credentials must not be delivered entry by entry. */
-const CREDENTIAL_BRACKETED = new RegExp(`(${CREDENTIAL_KEY}\\s*[:=]\\s*)\\[[^\\]\\n]*\\]`, "gi");
+/**
+ * `key: [ … ]` — a list of credentials must not be delivered entry by entry.
+ * The body is newline-tolerant (pretty-printed arrays) but bounded to 600
+ * characters so a hostile stream cannot balloon the match.
+ */
+const CREDENTIAL_BRACKETED = new RegExp(`(${CREDENTIAL_KEY}\\s*[:=]\\s*)\\[[^\\]]{0,600}?\\]`, "gis");
 /** `key: "value with spaces"`; the closing quote is optional so it fails closed. */
 const CREDENTIAL_QUOTED = new RegExp(`(${CREDENTIAL_KEY}\\s*[:=]\\s*)(["'])([^"'\\n]*)(["'])?`, "gi");
 /**
@@ -410,10 +414,17 @@ export function formatFailureNotice(error: unknown): string {
 	return `[turn failed] ${described.text}${hint}`;
 }
 
-/** The subset of the gateway store a rebind needs. */
+/**
+ * The subset of the gateway store a rebind needs. `metaGet`/`metaSet` are
+ * optional durable counters: when the store provides them the budget survives
+ * a gateway restart; when absent the rebinder degrades to process-local
+ * counting (correct, just less conservative).
+ */
 export interface RebindStore {
 	withTransaction<T>(run: () => T): T;
 	rebindEpoch(originKey: string): number;
+	metaGet?(key: string): string | undefined;
+	metaSet?(key: string, value: string): void;
 }
 
 /**
@@ -434,10 +445,11 @@ export interface RebindStore {
  * rebind, so that pattern is visible instead of silent; "nobody notices" is the
  * actual harm the guard exists to prevent.
  *
- * The counters are process-local while the epoch is durable, so a gateway restart
- * starts fresh. That is a deliberate limit, not an oversight: a restart is an
- * operator action and is visible, whereas the outage this guards against was
- * continuous muteness inside one long-lived process.
+ * The consecutive budget is DURABLE when the store exposes meta counters: it
+ * survives a gateway restart, so a restart cannot act as an unauthorized cap
+ * reset; only a proven-good turn or `/new` restores it. Lifetime totals are
+ * durable for the same reason. Without meta support the counters degrade to
+ * process-local (documented degradation, never silently claimed as durable).
  */
 export class SessionRebinder {
 	readonly #store: RebindStore;
@@ -445,6 +457,8 @@ export class SessionRebinder {
 	readonly #log: (line: string) => void;
 	readonly #used = new Map<string, number>();
 	/** Never cleared by health: the total this process has ever spent per origin. */
+	/** Origins hydrated from durable counters so far (unused when the store has no meta). */
+	readonly #hydrated = new Set<string>();
 	readonly #lifetime = new Map<string, number>();
 
 	constructor(store: RebindStore, cap = DEFAULT_REBIND_CAP, log: (line: string) => void = console.warn) {
@@ -452,10 +466,37 @@ export class SessionRebinder {
 		this.#cap = cap;
 		this.#log = log;
 	}
+	#durable(originKey: string, used: number, lifetime: number): void {
+		if (!this.#store.metaSet) return;
+		this.#store.metaSet(`rebind_budget:${originKey}`, JSON.stringify({ used, lifetime }));
+	}
 
-	/** Rebinds allocated to this origin so far. */
-	#usedFor(originKey: string): number {
-		return this.#used.get(originKey) ?? 0;
+	#countersFor(originKey: string): { used: number; lifetime: number } {
+		if (this.#store.metaGet && !this.#hydrated.has(originKey)) {
+			this.#hydrated.add(originKey);
+			try {
+				const raw = this.#store.metaGet(`rebind_budget:${originKey}`);
+				const parsed = raw ? (JSON.parse(raw) as { used?: unknown; lifetime?: unknown }) : undefined;
+				if (
+					parsed &&
+					Number.isInteger(parsed.used) &&
+					(parsed.used as number) >= 0 &&
+					Number.isInteger(parsed.lifetime) &&
+					(parsed.lifetime as number) >= 0
+				)
+					return {
+						used: parsed.used as number,
+						lifetime: Math.max(parsed.used as number, parsed.lifetime as number),
+					};
+			} catch {
+				// A corrupted counter reads as absent; the budget then restarts at zero
+				// rather than bricking the origin on unreadable metadata.
+			}
+		}
+		return {
+			used: this.#used.get(originKey) ?? 0,
+			lifetime: this.#lifetime.get(originKey) ?? 0,
+		};
 	}
 
 	/**
@@ -464,14 +505,18 @@ export class SessionRebinder {
 	 * this e7?" later. Throws once the budget is spent.
 	 */
 	rebind(originKey: string, causeCode: string, fromEpoch: number): number {
-		const used = this.#usedFor(originKey);
-		if (used >= this.#cap) throw new RebindCapExceededError(originKey, this.#cap, causeCode, fromEpoch);
+		const counters = this.#countersFor(originKey);
+		if (counters.used >= this.#cap) throw new RebindCapExceededError(originKey, this.#cap, causeCode, fromEpoch);
 		const toEpoch = this.#store.withTransaction(() => this.#store.rebindEpoch(originKey));
-		this.#used.set(originKey, used + 1);
-		const lifetime = (this.#lifetime.get(originKey) ?? 0) + 1;
+		const used = counters.used + 1;
+		// Lifetime is its own monotonic counter and must NOT be tied to the
+		// consecutive count: a proven-good turn clears `used` but never history.
+		const lifetime = counters.lifetime + 1;
+		this.#used.set(originKey, used);
 		this.#lifetime.set(originKey, lifetime);
+		this.#durable(originKey, used, lifetime);
 		this.#log(
-			`gateway session rebind ${used + 1}/${this.#cap} origin=${originKey} cause=${causeCode} epoch ${fromEpoch} -> ${toEpoch} lifetime=${lifetime}`,
+			`gateway session rebind ${used}/${this.#cap} origin=${originKey} cause=${causeCode} epoch ${fromEpoch} -> ${toEpoch} lifetime=${lifetime}`,
 		);
 		return toEpoch;
 	}
@@ -479,5 +524,6 @@ export class SessionRebinder {
 	/** Clears the budget after a proven-good turn, or an explicit operator reset. */
 	clear(originKey: string): void {
 		this.#used.delete(originKey);
+		this.#durable(originKey, 0, this.#countersFor(originKey).lifetime);
 	}
 }

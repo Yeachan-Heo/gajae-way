@@ -248,10 +248,26 @@ export class GjcClient implements GjcPort {
 	 * identical binding instead of racing a second epoch bump.
 	 */
 	#bindAt(originKey: string, epoch: number, options?: TurnOptions): Promise<{ sessionId: string }> {
+		return this.#coordinatedBind(originKey, epoch, options, true);
+	}
+
+	/**
+	 * The coordinator entry: join an in-flight bind for this origin+epoch or
+	 * start one. `mayRebind` is true only for the TOP-LEVEL bind a caller asked
+	 * for; the post-rebind create starts with false, so one caller's
+	 * ensureSession spends at most ONE rebind instead of chaining bumps while
+	 * every consecutive epoch fails — the cap only resets on good turns.
+	 */
+	#coordinatedBind(
+		originKey: string,
+		epoch: number,
+		options: TurnOptions | undefined,
+		mayRebind: boolean,
+	): Promise<{ sessionId: string }> {
 		const cacheKey = `${originKey}#${epoch}`;
 		const existing = this.#inflight.get(cacheKey);
 		if (existing) return existing;
-		const bind = this.#ensureSessionUncached(originKey, epoch, options).finally(() => {
+		const bind = this.#ensureSessionUncached(originKey, epoch, options, mayRebind).finally(() => {
 			this.#inflight.delete(cacheKey);
 		});
 		this.#inflight.set(cacheKey, bind);
@@ -261,15 +277,19 @@ export class GjcClient implements GjcPort {
 	async #ensureSessionUncached(
 		originKey: string,
 		epoch: number,
-		options?: TurnOptions,
+		options: TurnOptions | undefined,
+		mayRebind: boolean,
 	): Promise<{ sessionId: string }> {
 		try {
 			return await this.#createSession(originKey, epoch, options);
 		} catch (error) {
 			const code = rebindableCodeOf(error);
-			if (!code) throw error;
+			if (!code || !mayRebind) throw error;
 			const nextEpoch = this.#rebinder.rebind(originKey, code, epoch);
-			return await this.#createSession(originKey, nextEpoch, options);
+			// The post-rebind bind ALSO enters the coordinator (as a non-rebinding
+			// step): a concurrent caller reading the newly durable e1 joins this
+			// exact create instead of starting a second one that could race to e2.
+			return await this.#coordinatedBind(originKey, nextEpoch, options, false);
 		}
 	}
 
@@ -324,20 +344,22 @@ export class GjcClient implements GjcPort {
 			throw runtimeFailure(`gjc session.create exited ${exitCode}`, detail, stderr.trim());
 		}
 		const sessionId = parseCreateResult(stdout);
+		// Publication validation BEFORE any cache mutation: if another path
+		// rebound this origin PAST our epoch while our create was in flight, this
+		// binding is obsolete. It must not be cached, must not evict the live
+		// mapping, and must never be handed to the caller as if it were current —
+		// the caller chases the live epoch's coordinated bind instead.
+		const persistedEpoch = this.#database.getSessionRecord(originKey)?.epoch ?? -1;
+		if (persistedEpoch > epoch) {
+			console.warn(`gateway discarding superseded bind ${originKey}#e${epoch}; persisted epoch is e${persistedEpoch}`);
+			return await this.#bindAt(originKey, persistedEpoch);
+		}
 		// One live binding per origin: older epochs are unreachable once a new one
 		// is bound, so dropping them keeps both maps bounded and prevents a stale
 		// epoch from being reported as a rebind's from-epoch.
 		this.#forgetOrigin(originKey);
 		this.#sessions.set(cacheKey, sessionId);
 		this.#origins.set(sessionId, { originKey, epoch });
-		// Epoch-conditional publication: if another path rebound this origin PAST
-		// our epoch while our create was in flight, our stale binding must not
-		// overwrite theirs — the newer key is the live one.
-		const persistedEpoch = this.#database.getSessionRecord(originKey)?.epoch ?? -1;
-		if (persistedEpoch > epoch) {
-			console.warn(`gateway discarding superseded bind ${originKey}#e${epoch}; persisted epoch is e${persistedEpoch}`);
-			return { sessionId };
-		}
 		this.#database.withTransaction(() => this.#database.putSession(originKey, sessionId));
 		// The budget is deliberately NOT cleared here: a fresh key always creates,
 		// so clearing on create would make the cap unreachable for a recurring
