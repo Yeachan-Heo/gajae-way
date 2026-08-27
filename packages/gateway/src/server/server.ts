@@ -32,6 +32,7 @@ import { PersonaLoader } from "../persona/persona";
 import type { GatewayDatabase, InboundMessageRow } from "../store/db";
 import { DeliveryLedger } from "../store/ledger";
 import { KeyedQueue } from "./keyed-queue";
+import { composeSpeakerLabel } from "./speaker";
 
 interface Connection {
 	readonly decoder: FrameDecoder;
@@ -698,11 +699,12 @@ async function runInboundTurn(
 				group?: boolean;
 				authorId?: string;
 				authorName?: string;
+				authorHandle?: string;
 				channelLabel?: string;
 				serverLabel?: string;
 			})
 		: undefined;
-	const speaker = engagement?.authorName ?? engagement?.authorId;
+	const speaker = composeSpeakerLabel(engagement);
 	// "channel | server" when the platform labels both (e.g. "#playground-ko | GAJAE").
 	const place =
 		[engagement?.channelLabel, engagement?.serverLabel].filter(Boolean).join(" | ") ||

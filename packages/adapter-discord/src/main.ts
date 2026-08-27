@@ -1,6 +1,7 @@
 import type { ChatMessagePayload, ChatProgressPayload, EngagementContext, OriginRef } from "@gajaeway/protocol";
 import { GajaewayClient } from "@gajaeway/sdk";
 import { Client, GatewayIntentBits } from "discord.js";
+import { resolveDisplayName } from "./author";
 import { type LoadedDiscordAdapterConfig, loadDiscordAdapterConfig } from "./config";
 import { type DiscordMessageOriginShape, discordMessageOrigin } from "./origin";
 
@@ -45,9 +46,35 @@ export interface DiscordClientLike {
 export interface DiscordInboundMessage extends DiscordMessageOriginShape {
 	readonly id: string;
 	readonly content: string;
-	readonly author: { readonly id: string; readonly bot?: boolean; readonly username?: string };
+	readonly author: {
+		readonly id: string;
+		readonly bot?: boolean;
+		readonly username?: string;
+		/** Account-wide display name, shown when a guild has no nickname. */
+		readonly globalName?: string | null;
+	};
 	readonly mentions?: { has(user: unknown): boolean };
 	readonly guild?: { readonly name?: string } | null;
+	/**
+	 * Guild membership for this message, present only for guild messages.
+	 * `displayName` is what the server actually shows in the member list.
+	 */
+	readonly member?: {
+		readonly displayName?: string | null;
+		readonly nickname?: string | null;
+	} | null;
+}
+
+/**
+ * Resolves the name a reader would see next to the message in this server.
+ *
+ * Discord shows a per-guild nickname when one is set, then the account's global
+ * display name, and only falls back to the raw handle when neither exists.
+ * Reporting the handle instead makes the persona address people by a string
+ * nobody in the room sees, and it differs per server for the same account.
+ */
+export function resolveAuthorDisplayName(message: DiscordInboundMessage): string | undefined {
+	return resolveDisplayName(message.author, message.member);
 }
 
 /** Bounded inbound message-id memory prevents gateway replay/reconnect duplicate turns. */
@@ -73,11 +100,13 @@ export function engagementForMessage(message: DiscordInboundMessage, botUser: un
 	const origin = discordMessageOrigin(message);
 	const botId = typeof botUser === "object" && botUser !== null && "id" in botUser ? String(botUser.id) : "";
 	const contentMention = botId !== "" && new RegExp(`<@!?${escapeRegExp(botId)}>`).test(message.content);
+	const displayName = resolveAuthorDisplayName(message);
 	return {
 		mentioned: Boolean(message.mentions?.has(botUser) || contentMention),
 		group: origin.kind !== "dm",
 		authorId: message.author.id,
-		...(message.author.username ? { authorName: message.author.username } : {}),
+		...(displayName ? { authorName: displayName } : {}),
+		...(message.author.username ? { authorHandle: message.author.username } : {}),
 		...(message.channel.name ? { channelLabel: `#${message.channel.name}` } : {}),
 		...(message.guild?.name ? { serverLabel: message.guild.name } : {}),
 	};
@@ -390,9 +419,22 @@ export interface SlashInteractionLike {
 	isChatInputCommand?(): boolean;
 	readonly commandName?: string;
 	readonly id: string;
-	readonly user?: { readonly id: string; readonly username?: string };
+	readonly user?: {
+		readonly id: string;
+		readonly username?: string;
+		readonly globalName?: string | null;
+	};
+	/** Guild member for the invoking user, when the command ran in a guild. */
+	readonly member?: { readonly displayName?: string | null; readonly nickname?: string | null } | null;
 	readonly channel?: DiscordMessageOriginShape["channel"] | null;
 	reply(options: { content: string; ephemeral?: boolean }): Promise<unknown>;
+}
+
+/** Same precedence as messages, for a slash command's invoking user. */
+export function resolveInteractionDisplayName(
+	interaction: Pick<SlashInteractionLike, "user" | "member">,
+): string | undefined {
+	return resolveDisplayName(interaction.user, interaction.member);
 }
 
 export async function handleSlashCommand(
@@ -409,7 +451,10 @@ export async function handleSlashCommand(
 			mentioned: true,
 			group: origin.kind !== "dm",
 			authorId: interaction.user.id,
-			...(interaction.user.username ? { authorName: interaction.user.username } : {}),
+			...(resolveInteractionDisplayName(interaction)
+				? { authorName: resolveInteractionDisplayName(interaction) as string }
+				: {}),
+			...(interaction.user.username ? { authorHandle: interaction.user.username } : {}),
 		});
 		// Honest ack: the gateway allowlist may decline the command (non-owner in a
 		// group surface) — never claim a reset that did not happen.
