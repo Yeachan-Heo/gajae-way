@@ -35,6 +35,19 @@ export {
 	laneSessionName,
 } from "./lane";
 export {
+	ALLOWED_OPERATIONS,
+	assertControlAllowed,
+	type ClassifyResult,
+	type ControlContext,
+	classifyOperation,
+	DENIED_OPERATIONS,
+	OPERATOR_GATED_OPERATIONS,
+	type OperationClass,
+	PolicyError,
+	PROMPT_POLICY,
+	TERMINAL_DELIVERABLE,
+} from "./policy";
+export {
 	assertDeleteNotSupported,
 	buildHandoff,
 	CENSUS_KEYS,
@@ -72,6 +85,17 @@ export {
 	type SendReceipt,
 	sendPrompt,
 } from "./send";
+export {
+	DEFAULT_SUBSESSION_SKILLS,
+	type MissionKind,
+	RESEARCH_ONLY_SKILLS,
+	type ResolvedSkills,
+	type ResolveSkillsInput,
+	resolveSkills,
+	SKILL_UNAVAILABLE,
+	type SkillSurface,
+	SkillUnavailableError,
+} from "./skills";
 export {
 	fetchOpState,
 	isPromptStatus,
