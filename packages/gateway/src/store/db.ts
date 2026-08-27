@@ -2,8 +2,6 @@ import { Database } from "bun:sqlite";
 import { mkdir } from "node:fs/promises";
 import { dirname } from "node:path";
 
-const LATEST_SCHEMA_VERSION = 9;
-
 export interface InboundMessageRow {
 	readonly message_id: string;
 	readonly origin_key: string;
@@ -11,6 +9,22 @@ export interface InboundMessageRow {
 	readonly body: string;
 	readonly engagement_json: string | null;
 	readonly received_at: string;
+}
+
+const LATEST_SCHEMA_VERSION = 10;
+/** A scheduled cron slot the gateway claimed or fired for one monitor. */
+export interface MonitorSlotRow {
+	readonly monitor_id: string;
+	readonly slot_at: string;
+	readonly created_at: string;
+}
+
+/** Public-safe dispatch failure evidence (never a raw error body). */
+export interface MonitorFailureRow {
+	readonly event_id: string;
+	readonly code: string;
+	readonly detail: string;
+	readonly failed_at: string;
 }
 
 export class DatabaseStartupError extends Error {
@@ -21,6 +35,43 @@ export class DatabaseStartupError extends Error {
 		this.code = code;
 	}
 }
+
+/**
+ * Durable monitor-event stage contract (fail-closed). `monitorEventUpdate`
+ * rejects any stage outside this set, so a typo or a corrupt write cannot
+ * invent a state the recovery logic does not know how to reclaim.
+ *
+ * - admitted: durable row exists, not yet claimed by a dispatch.
+ * - batched: claimed by a dispatch awaiting its authoring turn (a live stage,
+ *   minutes at most) or stranded there by a crash mid-dispatch.
+ * - dispatched: authoring turn sent, output not yet parsed.
+ * - authored: note authored; delivery to the target is pending or settled.
+ * - delivered: the batch's ledger delivery was confirmed by the adapter.
+ * - authored_no_delivery: terminal — the monitor has no channel target and no
+ *   owner target is configured, so nothing will ever be delivered. Explicit
+ *   instead of `authored`-forever so the operator sees a finished state.
+ * - failed: the last dispatch attempt failed; reconcile redispatches.
+ * - failed_no_retry: dispatch failed and reconcile will not retry it again
+ *   (reclaim budget exhausted); operator-visible terminal state.
+ */
+export const MONITOR_EVENT_STAGES = [
+	"admitted",
+	"batched",
+	"dispatched",
+	"authored",
+	"delivered",
+	"authored_no_delivery",
+	"failed",
+	"failed_no_retry",
+] as const;
+export type MonitorEventStage = (typeof MONITOR_EVENT_STAGES)[number];
+/** Stages whose rows reconcile() may claim and redispatch. */
+export const RECONCILABLE_STAGES: readonly MonitorEventStage[] = ["admitted", "batched", "dispatched", "failed"];
+/** Terminal stages: no further transition will ever happen without operator action. */
+export const TERMINAL_STAGES: readonly MonitorEventStage[] = ["delivered", "authored_no_delivery", "failed_no_retry"];
+
+/** Upper bound on how often a single event may be reclaimed by reconcile. */
+export const MONITOR_EVENT_MAX_DISPATCH_ATTEMPTS = 5;
 
 export class GatewayDatabase {
 	readonly #database: Database;
@@ -472,10 +523,38 @@ export class GatewayDatabase {
 			)
 			.run(row.eventId, row.monitorId, row.eventType, row.payloadJson, row.firedAt, new Date().toISOString());
 	}
-	monitorEventUpdate(eventId: string, stage: string, batchId: string | null = null): void {
+	/**
+	 * Fail-closed stage transition: an unknown stage name throws instead of
+	 * writing a state no recovery path understands.
+	 */
+	monitorEventUpdate(eventId: string, stage: MonitorEventStage, batchId: string | null = null): void {
+		if (!MONITOR_EVENT_STAGES.includes(stage)) throw new Error(`unknown monitor event stage: ${stage}`);
 		this.#database
 			.query("UPDATE monitor_events SET stage = ?, batch_id = COALESCE(?, batch_id), updated_at = ? WHERE event_id = ?")
 			.run(stage, batchId, new Date().toISOString(), eventId);
+	}
+	/**
+	 * Bumps the reclaim counter; returns the new count. Reconcile stops
+	 * reclaiming an event once it exceeds MONITOR_EVENT_MAX_DISPATCH_ATTEMPTS.
+	 */
+	monitorEventIncrementAttempts(eventId: string): number {
+		this.#database
+			.query("UPDATE monitor_events SET dispatch_attempts = dispatch_attempts + 1, updated_at = ? WHERE event_id = ?")
+			.run(new Date().toISOString(), eventId);
+		return (
+			this.#database
+				.query<{ n: number }, [string]>("SELECT dispatch_attempts AS n FROM monitor_events WHERE event_id = ?")
+				.get(eventId)?.n ?? 0
+		);
+	}
+	monitorEventDispatchAttempts(eventId: string): number {
+		return (
+			this.#database
+				.query<{ dispatch_attempts: number }, [string]>(
+					"SELECT dispatch_attempts FROM monitor_events WHERE event_id = ?",
+				)
+				.get(eventId)?.dispatch_attempts ?? 0
+		);
 	}
 	/**
 	 * `order` is explicit because listings want newest-first while recovery must replay in the
@@ -492,6 +571,7 @@ export class GatewayDatabase {
 		fired_at: string;
 		stage: string;
 		batch_id: string | null;
+		dispatch_attempts: number;
 		updated_at: string;
 	}> {
 		const direction = order === "oldest" ? "ASC" : "DESC";
@@ -509,6 +589,7 @@ export class GatewayDatabase {
 			fired_at: string;
 			stage: string;
 			batch_id: string | null;
+			dispatch_attempts: number;
 			updated_at: string;
 		}>;
 	}
@@ -523,6 +604,65 @@ export class GatewayDatabase {
 		return this.#database
 			.query<{ output_text: string }, [string]>("SELECT output_text FROM authored_outputs WHERE event_id = ?")
 			.get(eventId)?.output_text;
+	}
+	/** Latest public-safe failure evidence for one event, if any. */
+	monitorFailure(eventId: string): MonitorFailureRow | undefined {
+		return (
+			this.#database
+				.query<MonitorFailureRow, [string]>(
+					"SELECT event_id, code, detail, failed_at FROM monitor_failures WHERE event_id = ? ORDER BY rowid DESC LIMIT 1",
+				)
+				.get(eventId) ?? undefined
+		);
+	}
+	/**
+	 * Persists bounded, public-safe dispatch evidence: a stable machine code plus
+	 * a one-line detail that must never contain secrets or raw error bodies.
+	 * Keeps the newest 20 rows per event and deletes stale rows so the table
+	 * cannot grow without bound across retries.
+	 */
+	monitorFailureRecord(eventId: string, code: string, detail: string): void {
+		// Runs inside the caller's transaction when one is open (dispatch failure
+		// bookkeeping must be atomic with the stage transition); standalone otherwise.
+		this.#database
+			.query("INSERT INTO monitor_failures (event_id, code, detail, failed_at) VALUES (?, ?, ?, ?)")
+			.run(eventId, code, detail.slice(0, 500), new Date().toISOString());
+		this.#database
+			.query(
+				"DELETE FROM monitor_failures WHERE event_id = ? AND rowid NOT IN (SELECT rowid FROM monitor_failures WHERE event_id = ? ORDER BY rowid DESC LIMIT 20)",
+			)
+			.run(eventId, eventId);
+	}
+	monitorFailures(eventIds: readonly string[]): Map<string, MonitorFailureRow> {
+		const rows = new Map<string, MonitorFailureRow>();
+		for (const eventId of eventIds) {
+			const row = this.monitorFailure(eventId);
+			if (row) rows.set(eventId, row);
+		}
+		return rows;
+	}
+	/** Claims one scheduled slot for a monitor; false means it was already fired/claimed. */
+	monitorSlotClaim(monitorId: string, slotAt: string): boolean {
+		const now = new Date().toISOString();
+		const changes = this.#database
+			.query(
+				"INSERT INTO monitor_slots (monitor_id, slot_at, created_at) VALUES (?, ?, ?) ON CONFLICT(monitor_id, slot_at) DO NOTHING",
+			)
+			.run(monitorId, slotAt, now).changes;
+		return changes > 0;
+	}
+	monitorSlotExists(monitorId: string, slotAt: string): boolean {
+		const row = this.#database
+			.query<{ n: number }, [string, string]>(
+				"SELECT COUNT(*) AS n FROM monitor_slots WHERE monitor_id = ? AND slot_at = ?",
+			)
+			.get(monitorId, slotAt);
+		return (row?.n ?? 0) > 0;
+	}
+	/** Drops slot ledger entries older than the retention window (bounded table). */
+	monitorSlotPrune(olderThanMs: number, now = Date.now()): number {
+		const cutoff = new Date(now - olderThanMs).toISOString();
+		return this.#database.query("DELETE FROM monitor_slots WHERE slot_at < ?").run(cutoff).changes;
 	}
 
 	deliveryPrune(before: string): number {
@@ -671,6 +811,32 @@ export class GatewayDatabase {
 				this.#database
 					.query("INSERT INTO schema_migrations (version, applied_at) VALUES (?, ?)")
 					.run(9, new Date().toISOString());
+			});
+		}
+		if (current < 10) {
+			this.withTransaction(() => {
+				// Monitor recovery (issue #29): SQLite cannot ALTER a CHECK constraint, so
+				// monitor_events is rebuilt with the extended stage contract (authored_
+				// no_delivery, failed_no_retry) plus a per-event reclaim counter, and the
+				// new bounded evidence tables are created. Recovery semantics:
+				// - every legacy row keeps its stage (reconcile now reclaims `batched`),
+				// - the two live stranded `batched` rows stay `batched` and are reclaimed
+				//   automatically by the next reconcile — no manual DB mutation.
+				// Fail-closed: any legacy stage outside the contract is surfaced by the
+				// runtime cycle projection as `monitor_settlement_stuck`, never silently
+				// accepted.
+				this.#database.exec(
+					`CREATE TABLE monitor_events_new (event_id TEXT PRIMARY KEY, monitor_id TEXT NOT NULL, event_type TEXT NOT NULL, payload_json TEXT NOT NULL, fired_at TEXT NOT NULL, stage TEXT NOT NULL CHECK(stage IN ('admitted','batched','dispatched','authored','delivered','authored_no_delivery','failed','failed_no_retry')), batch_id TEXT, dispatch_attempts INTEGER NOT NULL DEFAULT 0, updated_at TEXT NOT NULL);
+INSERT INTO monitor_events_new (event_id, monitor_id, event_type, payload_json, fired_at, stage, batch_id, dispatch_attempts, updated_at) SELECT event_id, monitor_id, event_type, payload_json, fired_at, stage, batch_id, 0, updated_at FROM monitor_events;
+DROP TABLE monitor_events;
+ALTER TABLE monitor_events_new RENAME TO monitor_events;
+CREATE TABLE monitor_failures (id INTEGER PRIMARY KEY AUTOINCREMENT, event_id TEXT NOT NULL, code TEXT NOT NULL, detail TEXT NOT NULL, failed_at TEXT NOT NULL);
+CREATE INDEX monitor_failures_event ON monitor_failures (event_id, failed_at);
+CREATE TABLE monitor_slots (monitor_id TEXT NOT NULL, slot_at TEXT NOT NULL, created_at TEXT NOT NULL, PRIMARY KEY (monitor_id, slot_at));`,
+				);
+				this.#database
+					.query("INSERT INTO schema_migrations (version, applied_at) VALUES (?, ?)")
+					.run(10, new Date().toISOString());
 			});
 		}
 	}

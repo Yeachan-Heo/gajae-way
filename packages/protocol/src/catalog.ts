@@ -349,7 +349,8 @@ export type CycleGateReason =
 	| "stale_session_identity"
 	| "delivery_settlement_unknown"
 	| "memory_closure_blocked"
-	| "monitor_settlement_failed";
+	| "monitor_settlement_failed"
+	| "monitor_settlement_stuck";
 
 export interface CycleSessionView {
 	/** Canonical, opaque origin key (protocol originKey; never reparsed). */

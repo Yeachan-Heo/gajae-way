@@ -1,5 +1,6 @@
 import { readFile } from "node:fs/promises";
 import type { GatewayConfig } from "../config";
+import type { GatewayDatabase } from "../store/db";
 import type { MonitorPropagator } from "./propagate";
 import type { MonitorRegistry } from "./registry";
 import { startCron } from "./triggers/cron";
@@ -17,11 +18,18 @@ export class MonitorRuntime {
 	readonly #config: GatewayConfig;
 	readonly #registry: MonitorRegistry;
 	readonly #propagator: MonitorPropagator;
+	readonly #database: GatewayDatabase;
 	#stops: Stop[] = [];
-	constructor(config: GatewayConfig, registry: MonitorRegistry, propagator: MonitorPropagator) {
+	constructor(
+		config: GatewayConfig,
+		registry: MonitorRegistry,
+		propagator: MonitorPropagator,
+		database: GatewayDatabase,
+	) {
 		this.#config = config;
 		this.#registry = registry;
 		this.#propagator = propagator;
+		this.#database = database;
 	}
 	async start(): Promise<void> {
 		await this.stop();
@@ -31,8 +39,14 @@ export class MonitorRuntime {
 		for (const monitor of monitors) {
 			if (monitor.trigger.kind === "cron")
 				this.#stops.push(
-					startCron(monitor.trigger.schedule, () =>
-						this.#propagator.submit(monitor.monitorId, monitor.eventTypes[0]!, { at: new Date().toISOString() }),
+					startCron(
+						monitor.trigger.schedule,
+						(slotAt) =>
+							this.#propagator.submit(monitor.monitorId, monitor.eventTypes[0]!, { at: slotAt.toISOString() }),
+						{
+							database: this.#database,
+							monitorId: monitor.monitorId,
+						},
 					),
 				);
 			if (monitor.trigger.kind === "watcher") {

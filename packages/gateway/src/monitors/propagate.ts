@@ -10,6 +10,7 @@ import type { DeliveryService } from "../delivery/delivery";
 import type { MemoryClosureQueue } from "../memory/closure";
 import type { GjcPort } from "../orchestrator/gjc-client";
 import type { GatewayDatabase } from "../store/db";
+import { MONITOR_EVENT_MAX_DISPATCH_ATTEMPTS, RECONCILABLE_STAGES, TERMINAL_STAGES } from "../store/db";
 import type { MonitorRegistry } from "./registry";
 
 /** Product-level semantics for the seeded maintenance events (generic, persona-independent). */
@@ -19,6 +20,23 @@ const MAINTENANCE_GUIDANCE: Record<string, string | undefined> = {
 	"memory.audit":
 		"For memory.audit events: run the memory validator (gajaeway memory audit) and put a one-line pass report or the failure diagnostics plus your repair attempt into the note.",
 };
+
+/**
+ * Stable, public-safe dispatch failure codes. The raw error message is NEVER
+ * persisted or logged — it can carry secrets (tokens, URLs, file paths); the
+ * structured code plus the dispatch phase is what the operator gets.
+ */
+type DispatchFailureCode =
+	| "session_bind_failed"
+	| "authoring_turn_failed"
+	| "authoring_response_invalid"
+	| "delivery_prepare_failed"
+	| "internal_error";
+
+export interface MonitorDispatchFailure {
+	readonly eventId: string;
+	readonly code: DispatchFailureCode;
+}
 
 export class MonitorPropagator {
 	readonly #database: GatewayDatabase;
@@ -32,6 +50,8 @@ export class MonitorPropagator {
 	#batches = new Map<string, { eventIds: string[]; timer: ReturnType<typeof setTimeout> }>();
 	/** Event ids this process is dispatching right now, so reconcile never double-runs them. */
 	#inFlight = new Set<string>();
+	/** Re-entrancy guard: only one reconcile sweep may run at a time in this process. */
+	#reconciling = false;
 	constructor(options: {
 		database: GatewayDatabase;
 		registry: MonitorRegistry;
@@ -52,6 +72,11 @@ export class MonitorPropagator {
 		this.#emit = options.emit;
 		this.#ownerTarget = options.ownerTarget;
 		this.#deliver = options.deliver;
+	}
+	/** Cancels pending burst timers so a closed database is never touched after shutdown. */
+	dispose(): void {
+		for (const batch of this.#batches.values()) clearTimeout(batch.timer);
+		this.#batches.clear();
 	}
 	submit(monitorId: string, eventType: string, payload: unknown): string {
 		const monitor = this.#registry.get(monitorId);
@@ -98,15 +123,43 @@ export class MonitorPropagator {
 		this.#batches.set(key, batch);
 		return eventId;
 	}
+	/**
+	 * Recovery sweep. Oldest-first, at-most-one concurrent sweep per process:
+	 * - `batched` rows not in this process's in-flight set are orphans of a dead
+	 *   dispatch and are reclaimed exactly like `admitted`/`dispatched`/`failed`
+	 *   (the fix for issue #29's stranded canonicalize events).
+	 * - events with an authored output but no memory intent get their memory
+	 *   closure re-enqueued (a crash between authoring and enqueue).
+	 * - terminal rows are skipped.
+	 * The reclaim budget (MONITOR_EVENT_MAX_DISPATCH_ATTEMPTS) bounds retries:
+	 * an event that keeps failing lands on `failed_no_retry` — operator-visible,
+	 * never an infinite dispatch loop.
+	 */
 	async reconcile(): Promise<void> {
-		// Replay oldest-first: recovery must re-author events in the order they fired.
-		for (const row of this.#database.monitorEventRows(undefined, "oldest")) {
-			const output = this.#database.authoredOutput(row.event_id);
-			const hasMemory = this.#database
-				.memoryIntentRows()
-				.some((intent) => intent.kind === "monitor-event" && intent.payload_json.includes(row.event_id));
-			if (output && !hasMemory) this.#author(row.event_id, output);
-			else if (!output && this.#recoverable(row.stage, row.event_id)) await this.#dispatch([row.event_id]);
+		if (this.#reconciling) return;
+		this.#reconciling = true;
+		try {
+			// Replay oldest-first: recovery must re-author events in the order they fired.
+			for (const row of this.#database.monitorEventRows(undefined, "oldest")) {
+				if ((TERMINAL_STAGES as readonly string[]).includes(row.stage)) continue;
+				const output = this.#database.authoredOutput(row.event_id);
+				const hasMemory = this.#database
+					.memoryIntentRows()
+					.some((intent) => intent.kind === "monitor-event" && intent.payload_json.includes(row.event_id));
+				if (output && !hasMemory) this.#author(row.event_id, output, row.stage === "authored_no_delivery");
+				else if (!output && this.#recoverable(row)) {
+					if (row.dispatch_attempts >= MONITOR_EVENT_MAX_DISPATCH_ATTEMPTS) {
+						this.#database.withTransaction(() =>
+							this.#database.monitorEventUpdate(row.event_id, "failed_no_retry", null),
+						);
+						continue;
+					}
+					this.#database.monitorEventIncrementAttempts(row.event_id);
+					await this.#dispatch([row.event_id]);
+				}
+			}
+		} finally {
+			this.#reconciling = false;
 		}
 	}
 
@@ -118,9 +171,12 @@ export class MonitorPropagator {
 	 * The in-flight set tells the two apart exactly — anything batched that this process is not
 	 * currently dispatching is an orphan, including every batched row after a restart.
 	 */
-	#recoverable(stage: string, eventId: string): boolean {
-		if (stage === "admitted" || stage === "dispatched" || stage === "failed") return true;
-		return stage === "batched" && !this.#inFlight.has(eventId);
+	#recoverable(row: { stage: string; event_id: string }): boolean {
+		if ((TERMINAL_STAGES as readonly string[]).includes(row.stage)) return false;
+		if (!RECONCILABLE_STAGES.includes(row.stage as never) && row.stage !== "authored_no_delivery") return false;
+		if (row.stage === "authored_no_delivery") return false;
+		if (row.stage === "batched") return !this.#inFlight.has(row.event_id);
+		return ["admitted", "dispatched", "failed"].includes(row.stage);
 	}
 	async #dispatch(eventIds: string[]): Promise<void> {
 		for (const id of eventIds) this.#inFlight.add(id);
@@ -164,40 +220,55 @@ export class MonitorPropagator {
 					this.#author(entry.eventId, entry.note);
 			// A monitor without its own channel target reports to the configured owner
 			// target when one exists: a personal agent's maintenance and event notes go
-			// to the owner by default rather than vanishing into the logs.
+			// to the owner by default rather than vanishing into the logs. With no
+			// target at all the event settles terminally as `authored_no_delivery`
+			// instead of pretending a delivery is still pending (issue #29 defect 3).
 			const target = monitor.channelTarget ?? this.#ownerTarget;
-			if (target) {
-				const delivery = this.#delivery.prepare(
-					batchId,
-					target.origin,
-					authored
-						.filter(
-							(entry): entry is { eventId: string; note: string } =>
-								typeof entry.eventId === "string" && typeof entry.note === "string",
-						)
-						.map((entry) => entry.note)
-						.join("\n"),
-				);
-				if (delivery) {
-					this.#delivery.markInflight(delivery.deliveryId as string);
-					// Push to live adapters NOW: without this the note sat in the ledger
-					// until the next adapter reconnect flushed redeliveries (live finding:
-					// owner-DM canonicalize note stuck inflight for minutes).
-					this.#deliver?.(delivery);
-				}
+			if (!target) {
+				this.#database.withTransaction(() => {
+					for (const row of rows)
+						if (this.#database.authoredOutput(row.event_id) !== undefined)
+							this.#database.monitorEventUpdate(row.event_id, "authored_no_delivery", batchId);
+				});
+				return;
 			}
-		} catch {
+			const delivery = this.#delivery.prepare(
+				batchId,
+				target.origin,
+				authored
+					.filter(
+						(entry): entry is { eventId: string; note: string } =>
+							typeof entry.eventId === "string" && typeof entry.note === "string",
+					)
+					.map((entry) => entry.note)
+					.join("\n"),
+			);
+			if (delivery) {
+				this.#delivery.markInflight(delivery.deliveryId as string);
+				// Push to live adapters NOW: without this the note sat in the ledger
+				// until the next adapter reconnect flushed redeliveries (live finding:
+				// owner-DM canonicalize note stuck inflight for minutes).
+				this.#deliver?.(delivery);
+			}
+		} catch (error) {
+			// Public-safe structured evidence only: a stable phase code and event ids.
+			// The raw error body can carry secrets and is never persisted or logged.
+			const code: DispatchFailureCode = failureCode(error);
 			this.#database.withTransaction(() => {
-				for (const row of rows) this.#database.monitorEventUpdate(row.event_id, "failed", batchId);
+				for (const row of rows) {
+					this.#database.monitorEventUpdate(row.event_id, "failed", batchId);
+					this.#database.monitorFailureRecord(row.event_id, code, `dispatch phase failed (${code})`);
+				}
 			});
+			console.error(`monitor dispatch failed (${code}): events ${rows.map((row) => row.event_id).join(",")}`);
 		}
 	}
-	#author(eventId: string, note: string): void {
+	#author(eventId: string, note: string, noDelivery = false): void {
 		const row = this.#database.monitorEventRows().find((candidate) => candidate.event_id === eventId);
 		if (!row) return;
 		this.#database.withTransaction(() => {
 			this.#database.authoredOutputCreate(eventId, note);
-			this.#database.monitorEventUpdate(eventId, "authored");
+			this.#database.monitorEventUpdate(eventId, noDelivery ? "authored_no_delivery" : "authored");
 		});
 		this.#memory.enqueue({
 			kind: "monitor-event",
@@ -213,4 +284,12 @@ export class MonitorPropagator {
 			stage: "authored",
 		});
 	}
+}
+
+function failureCode(error: unknown): DispatchFailureCode {
+	const message = error instanceof Error ? error.message : String(error);
+	if (message.includes("authoring response is not an array")) return "authoring_response_invalid";
+	if (message.includes("sendTurn")) return "authoring_turn_failed";
+	if (message.includes("ensureSession")) return "session_bind_failed";
+	return "internal_error";
 }

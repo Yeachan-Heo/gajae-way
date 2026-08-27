@@ -40,7 +40,7 @@ import { backupDatabase, integrityDatabase } from "../ops/backup";
 import { RuntimeCycleProjector } from "../ops/cycle";
 import type { GjcPort } from "../orchestrator/gjc-client";
 import { PersonaLoader } from "../persona/persona";
-import type { GatewayDatabase, InboundMessageRow } from "../store/db";
+import type { GatewayDatabase, InboundMessageRow, MonitorEventStage } from "../store/db";
 import { DeliveryLedger } from "../store/ledger";
 import { KeyedQueue } from "./keyed-queue";
 import { composeSpeakerLabel, composeTurnHeader } from "./speaker";
@@ -247,7 +247,7 @@ function createRuntime(options: GatewayServerOptions): Runtime {
 					connection.write({ v: PROFILE_VERSION, type: "event", event: "chat.message", payload });
 		},
 	});
-	const monitorRuntime = new MonitorRuntime(options.config, registry, monitors);
+	const monitorRuntime = new MonitorRuntime(options.config, registry, monitors, options.database);
 	const reconcileTimer = setInterval(() => void monitors.reconcile(), 60_000);
 	return {
 		delivery,
@@ -264,6 +264,26 @@ function createRuntime(options: GatewayServerOptions): Runtime {
 		inbound: new Map(),
 	};
 }
+/**
+ * Monitor-batch settlement (issue #29 defect 2): the delivery ledger row for a
+ * monitor batch carries turn_id === batch_id. When the adapter confirms that
+ * delivery, every event of the batch that has already reached `authored`
+ * advances to `delivered`. Failure paths never mark `delivered`: on
+ * delivery.fail the events stay `authored` (distinguishable, operator-visible)
+ * while the ledger row itself records failed/ambiguous.
+ */
+function settleMonitorBatch(database: GatewayDatabase, deliveryId: string, stage: MonitorEventStage): void {
+	const delivery = database.deliveryRows().find((row) => row.delivery_id === deliveryId);
+	if (!delivery) return;
+	const batchId = delivery.turn_id;
+	const events = database.monitorEventRows().filter((row) => row.batch_id === batchId);
+	if (!events.length) return;
+	database.withTransaction(() => {
+		for (const event of events)
+			if (stage === "delivered" ? event.stage === "authored" : true) database.monitorEventUpdate(event.event_id, stage);
+	});
+}
+
 async function handleFrame(
 	connection: Connection,
 	frame: Frame,
@@ -339,6 +359,10 @@ async function handleRequest(
 			const id = (request.params as { deliveryId?: unknown } | undefined)?.deliveryId;
 			if (typeof id !== "string" || !runtime.delivery.confirm(id))
 				throw new ProtocolError("invalid_params", "unknown deliveryId");
+			// Monitor batch settlement: a confirmed delivery for a monitor batch
+			// (turn_id === the events' batch_id) advances its authored events to
+			// `delivered` — only AFTER the adapter confirmed (issue #29 defect 2).
+			settleMonitorBatch(options.database, id, "delivered");
 			connection.write({ v: PROFILE_VERSION, type: "response", id: request.id, result: { settled: true } });
 			return;
 		}
@@ -352,6 +376,12 @@ async function handleRequest(
 				!runtime.delivery.fail(params.deliveryId, params.ambiguous)
 			)
 				throw new ProtocolError("invalid_params", "invalid delivery failure");
+			// A failed monitor-batch delivery stays distinguishable: its events keep
+			// stage `authored` (or `batched` before authoring) so reconcile and the
+			// operator projection show them as unsettled; the ledger row carries the
+			// failed/ambiguous state. Never silently `delivered`.
+			if (params && typeof params.deliveryId === "string")
+				settleMonitorBatch(options.database, params.deliveryId, "authored");
 			connection.write({ v: PROFILE_VERSION, type: "response", id: request.id, result: { recorded: true } });
 			return;
 		}

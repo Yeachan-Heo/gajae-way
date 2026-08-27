@@ -68,7 +68,7 @@ describe("buildAttention", () => {
 	});
 
 	test("terminal stages are never attention items", () => {
-		for (const stage of ["delivered", "authored", "batched"]) {
+		for (const stage of ["delivered", "authored", "authored_no_delivery", "failed_no_retry"]) {
 			const event = monitorEvent({ stage, firedAt: new Date(FIXED_NOW.getTime() - 30 * 86_400_000).toISOString() });
 			expect(buildAttention(STATUS, [{ monitor: MONITOR, recentEvents: [event] }], FIXED_NOW)).toEqual([]);
 		}

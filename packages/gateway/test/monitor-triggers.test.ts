@@ -17,7 +17,7 @@ test("cron supports steps, lists, ranges, dow and injected clock", () => {
 	const stop = startCron(
 		"15 10 * * 1",
 		() => fired++,
-		() => monday,
+		{ now: () => monday },
 	);
 	stop();
 	expect(fired).toBe(1);
