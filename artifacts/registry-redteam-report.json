@@ -1,0 +1,238 @@
+{
+	"schemaVersion": 1,
+	"kind": "api-package-test-report",
+	"sourceHash": "sha256:808f9483ba5a95a9e228b64f9b3d2f7d441b4adb36caaa89a511fc8e127accc9",
+	"commands": [
+		"bun test packages/gateway/test/registry-redteam.qa.test.ts",
+		"bun /tmp/diag.ts  (out-of-band characterisation probe for B2a race rate and B4 audit blind spot; temp dir only)",
+		"shasum -a 256 packages/gateway/src/memory/{registry,doctrine,validator,retrieve}.ts"
+	],
+	"runner": {
+		"bun": "1.4.0",
+		"finalRun": "21 pass / 3 fail / 278 expect() calls / 24 tests / 472ms / exit 1",
+		"suiteFile": "packages/gateway/test/registry-redteam.qa.test.ts",
+		"filesUnderTest": {
+			"packages/gateway/src/memory/registry.ts": "sha256:540159d8f6ee1d30c2a650357179c1236690c064567e89c33106bbf23edd8b2f",
+			"packages/gateway/src/memory/doctrine.ts": "sha256:a5645d29c8c2c4324b59a07a2d6a7c7d15bc508c498b29d18b3cff376ade7306",
+			"packages/gateway/src/memory/validator.ts": "sha256:f58b99be67eab85f15a0fba8c02dd33f6d2ea94135aa1815e008e7a16c8f50d7",
+			"packages/gateway/src/memory/retrieve.ts": "sha256:4f08b22dd7297ab8a17cc4842a39ebf042d3b0cfc924a6cfaa7d07700ac4afc9"
+		},
+		"note": "registry.ts was patched by 0-Main after this lane spawned (lowercase-only root segments + RESERVED_ROOTS); confirmed frozen at the hash above before the run that produced the case verdicts below."
+	},
+	"postPatchRerun": {
+		"why": "0-Main patched the three reported defects while this lane was writing up. The same suite was re-run unchanged against the patched tree.",
+		"command": "bun test packages/gateway/test/registry-redteam.qa.test.ts",
+		"result": "24 pass / 0 fail / 279 expect() calls / 24 tests / 480ms / exit 0",
+		"patchedHashes": {
+			"packages/gateway/src/memory/registry.ts": "sha256:540159d8f6ee1d30c2a650357179c1236690c064567e89c33106bbf23edd8b2f",
+			"packages/gateway/src/memory/doctrine.ts": "sha256:ae83cf0a44fa0a001692d929ac8b3e4fc2b4e1d97208534f334d32989d3848cd",
+			"packages/gateway/src/memory/validator.ts": "sha256:943fb854ef978b19b1fecad39bc39ec6d9dbc3fdf07a74a0a487281135cc84f7",
+			"packages/gateway/src/memory/retrieve.ts": "sha256:f9ac88e16da695077450442e306137931a3342378ccd48f1504cf97d5b644471"
+		},
+		"perDefect": {
+			"B2a": "PASS after patch - initializeMemory now re-stats .git and swallows the git init loser's error (doctrine.ts initializeCorpus).",
+			"B4": "PASS after patch - the symlinked axis root is now audited; ops/loose.md raises an issue.",
+			"D4": "PASS after patch - recall now drops unreadable map pointers instead of rejecting the query (retrieve.ts documents filter)."
+		},
+		"caveat": "The `cases` verdicts and the file:line citations in them describe the FROZEN generation named by sourceHash, not this patched tree. The patched tree has not been red-teamed beyond re-running this same suite."
+	},
+	"cases": [
+		{
+			"id": "A1",
+			"class": "A. registry parsing / fail-closed",
+			"scenario": "axes.json carrying __proto__ as a descriptor key, __proto__ as an axis id, a constructor.prototype payload, and a top-level __proto__ override",
+			"expected": "every hostile shape throws AxisRegistryError; Object.prototype, {} and [] stay unpolluted",
+			"observed": "all three descriptor shapes threw AxisRegistryError(malformed_descriptor) via the unknown-field gate (JSON.parse materialises __proto__ as an OWN key, so Object.keys sees it); the legal '{\"axes\":[]}' body yielded exactly the 9 built-ins; no pollution on Object.prototype/{}/[]",
+			"verdict": "passed"
+		},
+		{
+			"id": "A2",
+			"class": "A. registry parsing / fail-closed",
+			"scenario": "18 hostile axis ids: __proto__, empty, Ops/OPS case-shadows, Cyrillic confusables (орs, 'ор s'), leading digit, leading dash, leading/trailing space, ops.md, ops/rules, null, 42, true, {}, []",
+			"expected": "all rejected with AxisRegistryError code malformed_descriptor; ids that ARE legal must not corrupt lookup",
+			"observed": "all 18 rejected with code malformed_descriptor. 'constructor'/'prototype' are syntactically legal ids (/^[a-z][a-z0-9-]*$/) and are accepted; proven inert because byId is a Map - byId('hasOwnProperty')/byId('__proto__') are undefined. Recorded as accepted-and-inert, not a defect.",
+			"verdict": "passed"
+		},
+		{
+			"id": "A3",
+			"class": "A. registry parsing / fail-closed",
+			"scenario": "23 hostile roots: a/../b, ./a, ../a, a//b, a/, /etc, /, a\\\\b, .git, .git/hooks, MEMORY.md, memory.md, axes.json, Daily, DAILY, OPS/rules, 'ops ', ' ops', ~/escape, NUL byte, a/./b, empty; plus overlapping roots daily, ops, ops/rules, reflections/2026-08",
+			"expected": "traversal/absolute/windows/reserved/uppercase roots -> malformed_descriptor; roots inside or equal to a built-in root -> overlapping_axis_root",
+			"observed": "all 23 rejected with malformed_descriptor (RESERVED_ROOTS covers memory.md/axes.json/.git, lowercase-only SEGMENT covers Daily/DAILY/OPS); all 4 overlap cases rejected with overlapping_axis_root",
+			"verdict": "passed"
+		},
+		{
+			"id": "A4",
+			"class": "A. registry parsing / fail-closed",
+			"scenario": "custom-vs-custom collisions: same id different root, same root different id, inner-under-outer, outer-after-inner; plus a legal prefix sibling (opsx vs ops)",
+			"expected": "duplicate_axis_id / overlapping_axis_root as appropriate; a mere name prefix is NOT rejected",
+			"observed": "duplicate_axis_id for the id clash, overlapping_axis_root for all three root clashes in both declaration orders, and opsx registered cleanly alongside ops",
+			"verdict": "passed"
+		},
+		{
+			"id": "A5",
+			"class": "A. registry parsing / fail-closed",
+			"scenario": "promotion graph: 3-cycle, 4-node cycle whose entry node is outside the loop (a1->a2->a3->a4->a2), self-cycle, forward reference to an axis declared later, unknown target, and a legal diamond into built-ins",
+			"expected": "circular_promotion for all cycles, unknown_promotion_target for the ghost, acceptance for the forward reference and the diamond",
+			"observed": "exactly that. Note: a cycle cannot close through a built-in because no built-in promotes into a custom axis, so 'hook -> daily' is correctly accepted rather than flagged (my first draft asserted otherwise; that was a test bug, corrected)",
+			"verdict": "passed"
+		},
+		{
+			"id": "A6",
+			"class": "A. registry parsing / fail-closed",
+			"scenario": "axes.json valid JSON but wrong shape: {\"axes\":{}}, {\"axes\":[null]}, {\"axes\":[[]]}, {\"axes\":[\"ops\"]}, {\"axes\":[42]}, [], \"string\", null, 42, true, empty file, whitespace-only, UTF-8 BOM, mixed valid+null array, duplicate axes keys; plus a 500-axis array",
+			"expected": "every malformed shape throws AxisRegistryError(malformed_descriptor); a large legal array is accepted",
+			"observed": "14/14 malformed shapes threw malformed_descriptor (BOM fails at JSON.parse, which is still fail-closed). Duplicate JSON keys resolve last-wins to one legal axis and are accepted deterministically. 500 custom axes -> 509 registered, no quadratic collapse.",
+			"verdict": "passed"
+		},
+		{
+			"id": "A7",
+			"class": "A. registry parsing / fail-closed",
+			"scenario": "initializeMemory against an axes.json whose SECOND axis is invalid (root ../escape), first axis valid",
+			"expected": "throws AxisRegistryError and creates nothing on disk - no good/, no daily/, no MEMORY.md",
+			"observed": "threw AxisRegistryError; directory fingerprint before/after identical; good/, daily/ and MEMORY.md all absent. Whole-registry validation happens before any mkdir.",
+			"verdict": "passed"
+		},
+		{
+			"id": "A8",
+			"class": "A. registry parsing / fail-closed",
+			"scenario": "4096-character axis id and root pushed through initializeMemory (ENAMETOOLONG bait)",
+			"expected": "fails closed with AxisRegistryError rather than a raw filesystem error mid-migration",
+			"observed": "AxisRegistryError raised during descriptor parsing (id regex bounds are irrelevant, but the root's reserved/segment checks reject before mkdir is ever reached); no partial corpus",
+			"verdict": "passed"
+		},
+		{
+			"id": "B1",
+			"class": "B. migration / losslessness",
+			"scenario": "legacy 7-axis corpus + hand-written ops/rules/index.md, Korean and emoji filenames, a name with spaces, a file with no trailing newline, CRLF content, a 1.0MB file, and a relative symlink; sha256 per entry and full entry list compared across initializeMemory",
+			"expected": "every pre-existing byte survives; only directories and the generated MEMORY.md are added",
+			"observed": "all 13 pre-existing entries byte-identical after migration (symlink preserved as a symlink with its original target); the only new entries were axis directories and the regenerated MEMORY.md, which now lists ## ops, ## reflections and ops/rules/index.md",
+			"verdict": "passed"
+		},
+		{
+			"id": "B2a",
+			"class": "B. migration / losslessness",
+			"scenario": "Promise.all of 5 initializeMemory calls on the same fresh home (the exact pattern server.ts uses: initializeMemory runs on EVERY memory.audit and memory.search RPC, and closure.ts runs it per queued intent)",
+			"expected": "all five resolve; concurrent boot is the normal case for this API",
+			"observed": "DEFECT. 4 of 5 calls rejected with \"memory git init failed: fatal: cannot copy '.../templates/info/exclude' to '<root>/.git/info/exclude': File exists\". Out-of-band probe: 8 of 8 rounds had at least one rejection, so this is deterministic, not flaky. Root cause is a TOCTOU between the stat() probe at packages/gateway/src/memory/doctrine.ts:63 and the unguarded `git init` at packages/gateway/src/memory/doctrine.ts:65 - every concurrent caller sees no .git and all of them run git init. Production impact: two concurrent memory.search/memory.audit RPCs against a corpus that has not been git-initialised yet (packages/gateway/src/server/server.ts:404 and :417) return an error to the client.",
+			"verdict": "failed"
+		},
+		{
+			"id": "B2b",
+			"class": "B. migration / losslessness",
+			"scenario": "5 concurrent initializeMemory calls on a WARM corpus (.git and all axis dirs present) with MEMORY.md deleted, forcing 5 concurrent regenerateMap writes",
+			"expected": "no rejections and no torn MEMORY.md",
+			"observed": "all five resolved; MEMORY.md contains exactly one '# Memory map' and one '## daily' heading, ends with a newline, and validateMemory returns zero issues",
+			"verdict": "passed"
+		},
+		{
+			"id": "B3",
+			"class": "B. migration / losslessness",
+			"scenario": "a corpus where `ops` already exists as a FILE, not a directory",
+			"expected": "fails loudly and does not touch the human's bytes",
+			"observed": "initializeMemory rejected with errno code EEXIST; the file's contents were unchanged afterwards",
+			"verdict": "passed"
+		},
+		{
+			"id": "B4",
+			"class": "B. migration / losslessness + C. audit semantics",
+			"scenario": "the `ops` axis root is a symlink to a directory OUTSIDE the memory root containing rules/smuggled.md and loose.md (loose.md is in no declared partition)",
+			"expected": "index and audit agree - anything the map serves and recall returns is also inspected by validateMemory, so ops/loose.md must raise axis_layout_violation",
+			"observed": "DEFECT. MEMORY.md lists both ops/rules/smuggled.md and ops/loose.md, searchMemory returns both, but validateMemory returns [] - zero issues. Cause: the audit walker at packages/gateway/src/memory/validator.ts:25 descends only on entry.isDirectory(), which is false for a symlink dirent, so the whole symlinked axis is skipped; meanwhile axisEntries (packages/gateway/src/memory/doctrine.ts:88-99) resolves the symlink through readdir and indexes it. Net effect: content living outside the memory root is mapped and recalled while being exempt from orphan_file, axis_layout_violation, duplicate_file_hash and out_of_root_link checks. Repro: symlink <root>/ops -> <home>/elsewhere, write elsewhere/loose.md, initializeMemory + regenerateMap, validateMemory -> [].",
+			"verdict": "failed"
+		},
+		{
+			"id": "B5",
+			"class": "B. migration / losslessness",
+			"scenario": "read-only memory root (chmod 0500) with no axis directories",
+			"expected": "fails closed with a permission error, no half-migrated corpus",
+			"observed": "rejected with EACCES; the root directory was still empty afterwards",
+			"verdict": "passed"
+		},
+		{
+			"id": "B6",
+			"class": "B. migration / losslessness",
+			"scenario": "axes.json registers a custom axis whose root directory already contains hand-written human files, including a 4-level-deep one",
+			"expected": "the files are adopted as-is, not rewritten, and become mapped and audit-clean",
+			"observed": "every pre-existing file byte-identical after initializeMemory; MEMORY.md gained '## runbooks' and the deep pointer runbooks/staging/deep/deeper/failover.md; validateMemory returned zero issues",
+			"verdict": "passed"
+		},
+		{
+			"id": "C1",
+			"class": "C. audit semantics",
+			"scenario": "an orphan at the root (stray.md) and a 3-level-deep orphan (scratch/notes/deep/idea.md), then three rounds of initializeMemory + regenerateMap",
+			"expected": "both keep failing with orphan_file naming axes.json, and are never auto-promoted into the map",
+			"observed": "both reported in all three rounds with the axes.json remediation hint; MEMORY.md never grew a '## scratch' section",
+			"verdict": "passed"
+		},
+		{
+			"id": "C2",
+			"class": "C. audit semantics",
+			"scenario": "five layout policies in five separate corpora: per-subject reflections file, reflections nested one level too deep, unpartitioned ops file, undeclared ops partition (ops/secrets/), and a subdirectory under a custom `flat` axis",
+			"expected": "each produces EXACTLY one issue, code axis_layout_violation, on the offending path and nothing else",
+			"observed": "all five produced exactly one issue each with the right code and path: reflections/tone.md, reflections/2026-08/extra/2026-08-27.md, ops/scratch.md, ops/secrets/keys.md, flatx/sub/nope.md",
+			"verdict": "passed"
+		},
+		{
+			"id": "C3",
+			"class": "C. audit semantics",
+			"scenario": "smuggling attempts in one corpus: ops/../scratch/x.md, a directory literally named 'ops ' (trailing space), a prefix-sibling directory opsx/, ./ops/x.md, and daily/ops/rules/impostor.md",
+			"expected": "scratch/x.md, 'ops /trailing.md' and opsx/prefix.md are orphan_file; ops/x.md is an axis_layout_violation; the impostor is attributed to daily (any-depth) and is clean",
+			"observed": "exactly that set, no more and no less. Attribution uses a '<root>/' prefix test with longest-root-first resolution, so a trailing space or a shared prefix does not leak into the axis, and a nested axis-named directory stays with its owning axis",
+			"verdict": "passed"
+		},
+		{
+			"id": "C4",
+			"class": "C. audit semantics",
+			"scenario": "map_content_drift across all four append-only axes (daily, reflections + two custom dated axes journal/quiet): empty-axis baseline, then a newest file per axis, then regenerateMap",
+			"expected": "no drift on empty axes; exactly one drift issue naming the right axis when its newest file is unmapped; cleared by regenerateMap; no cross-axis bleed",
+			"observed": "empty append-only axes produced no drift; each axis in turn produced exactly one 'map does not include newest <id> file' issue and cleared after regenerateMap; the still-empty axis never fired",
+			"verdict": "passed"
+		},
+		{
+			"id": "D1",
+			"class": "D. retrieval",
+			"scenario": "a file 6 levels deep in a custom axis (runbooks/staging/a/b/c/d/failover.md) with the map deliberately NOT regenerated",
+			"expected": "recall finds it from the registry walk alone, with no MEMORY.md pointer",
+			"observed": "MEMORY.md confirmed not to mention failover.md; searchMemory returned the path",
+			"verdict": "passed"
+		},
+		{
+			"id": "D2",
+			"class": "D. retrieval",
+			"scenario": "byte-identical documents in two custom axes (alpha priority 5, zulu priority 95) giving genuinely equal BM25 scores, then the same query against a registry with the priorities flipped",
+			"expected": "the tie is broken by retrievalPriority, and the order flips when the priorities flip - path sort order must not decide",
+			"observed": "scores compared exactly equal; zulu/doc.md ranked first at priority 95 despite sorting after alpha; with priorities flipped via a createRegistry override passed to searchMemory, alpha/doc.md ranked first",
+			"verdict": "passed"
+		},
+		{
+			"id": "D3",
+			"class": "D. retrieval",
+			"scenario": "pathological queries: empty, spaces, \\n\\t\\r, regex metacharacters .*+?[](){}|^$\\\\, '((((', NUL, emoji-only, 10k characters, a 2000-token query, a mixed Korean/ASCII query, and limits 0, -5, 10000",
+			"expected": "no crash, no junk; tokenless queries return [], limits are clamped to 0..50",
+			"observed": "all seven tokenless/no-match queries returned []; the 10k-character query returned 0 hits; the 2000-token query returned hits; the Korean+ASCII query returned ops/rules/drain.md; limits 0 and -5 returned [] and limit 10000 was clamped to <= 50",
+			"verdict": "passed"
+		},
+		{
+			"id": "D4",
+			"class": "D. retrieval",
+			"scenario": "MEMORY.md holds a dangling pointer to ops/rules/gone.md - a state the audit merely REPORTS as map_dangling - then searchMemory is called",
+			"expected": "recall degrades gracefully and still returns the real hit; a stale map is not a corrupt corpus",
+			"observed": "DEFECT. searchMemory rejects with ENOENT open '<root>/ops/rules/gone.md' at packages/gateway/src/memory/retrieve.ts:43 (the Promise.all over `files` readFiles every map pointer unconditionally). map_dangling was confirmed present, i.e. the audit treats this as a reportable-but-tolerated state while recall hard-fails. Production impact: one stale pointer in MEMORY.md takes down every memory.search RPC (packages/gateway/src/server/server.ts:417) until the map is regenerated. Repro: initializeMemory, append '- [ops/rules/gone.md](ops/rules/gone.md)' to MEMORY.md, call searchMemory.",
+			"verdict": "failed"
+		},
+		{
+			"id": "D5",
+			"class": "D. retrieval",
+			"scenario": "map pointers attempting to escape the root: percent-encoded %2e%2e/secret.md, daily/../../secret.md, and absolute /etc/hosts.md, with a real secret.md sitting one level above the memory root",
+			"expected": "recall never reads or surfaces content from outside the memory root",
+			"observed": "containment holds - the '..' and leading-'/' filters in retrieve.ts:17 drop the literal traversals, and the percent-encoded form is never decoded so it resolves to a non-existent path INSIDE the root. No hit path or excerpt contained the secret. (The resulting failure mode is the same unguarded readFile as D4.)",
+			"verdict": "passed"
+		}
+	],
+	"summary": {
+		"total": 24,
+		"passed": 21,
+		"failed": 3
+	}
+}

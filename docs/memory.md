@@ -7,6 +7,7 @@ Gajaeway’s canonical long-term memory is a private Git-backed Markdown tree at
 ```text
 memory/
   MEMORY.md
+  axes.json          # optional: deployment-registered custom axes
   daily/
   events/
   tasks/
@@ -14,14 +15,90 @@ memory/
   projects/
   channels/
   decisions/
+  ops/
+    rules/
+    distillations/
+    handoffs/
+  reflections/
   .git/
 ```
 
-These seven directories are the canonical homes: **daily**, **events**, **tasks**, **people**, **projects**, **channels**, and **decisions**. `MEMORY.md` is strictly a navigation map: it contains generated pointers to canonical files, not long-form facts. It lists up to 20 recent files per axis. Keep durable knowledge in axis files, then regenerate the map rather than turning `MEMORY.md` into a second store.
+`MEMORY.md` is strictly a navigation map: it contains generated pointers to canonical files, not long-form facts. Keep durable knowledge in axis files, then regenerate the map rather than turning `MEMORY.md` into a second store.
 
-Each completed chat turn and each authored monitor event is captured in the current UTC daily file. A capture records timestamp, origin, speaker (`author @ #channel | server`), user/event text, and reply text; each text field is bounded to 500 characters. This gives the canonicalization routine raw daily material to sort into the seven axes.
+## The axis registry
 
-The daily axis has two layers: flat `daily/YYYY-MM-DD.md` files are the gateway-written raw capture layer and must never be edited or moved, while persona-curated digests live in `daily/YYYY-MM/` subdirectories. Axis subdirectories are fully supported: the generated map scans axes recursively.
+An axis is not a name in a list. It is a **descriptor** that tells every other part of the memory system how to treat its files, so map generation, audit, canonicalization and retrieval never test an axis by id:
+
+| Field | Meaning |
+|---|---|
+| `id` | stable machine id; the map heading, audit messages and promotion targets key off it |
+| `displayName` | human label rendered under the map heading |
+| `root` | canonical root relative to the memory root; roots may not overlap |
+| `nesting` | `flat` (entries directly under the root) or `nested` (subdirectories at any depth) |
+| `partitions` | named subdirectories that partition a nested axis |
+| `index` | `recent` (map the newest entries) or `tree` (map the whole hierarchy, grouped) |
+| `layout` | `dated` (`[YYYY-MM/]YYYY-MM-DD.md` only) or `free` (any `.md` name) |
+| `retrievalPriority` | higher wins when two documents score equally during recall |
+| `orphanPolicy` | `partitioned` (a file must sit in a declared partition) or `any-depth` |
+| `appendOnly` | entries are only ever appended to, never rewritten in place |
+| `promotesTo` | axis ids this axis promotes durable material into; must be acyclic |
+
+The built-in axes live in exactly one place, `packages/gateway/src/memory/registry.ts`. A deployment adds its own without editing that module by writing `memory/axes.json`:
+
+```json
+{
+  "version": 1,
+  "axes": [
+    {
+      "id": "runbooks",
+      "displayName": "Deployment runbooks",
+      "root": "runbooks",
+      "nesting": "nested",
+      "partitions": ["staging", "production"],
+      "index": "tree",
+      "layout": "free",
+      "retrievalPriority": 90,
+      "orphanPolicy": "partitioned",
+      "appendOnly": false,
+      "promotesTo": ["ops"]
+    }
+  ]
+}
+```
+
+Only `id` is required; every other field takes the documented default (`root` defaults to the id, `nesting` to `nested`, `index` to `recent`, `layout` to `free`, `orphanPolicy` to `any-depth`, `retrievalPriority` to `0`, `appendOnly` to whether the layout is dated). A registered axis is created, indexed, audited and searched by the same code as a built-in.
+
+The registry **fails closed**. Startup refuses to run, rather than quietly dropping an axis and orphaning everything under it, when a declaration has an id that collides with another axis, a root that contains or sits inside another axis's root, a promotion target that is not registered, a promotion cycle, an unknown field, or any malformed value. Registration is also the *only* way a directory becomes canonical: writing into an unregistered directory never promotes it, and the audit keeps reporting it as an orphan.
+
+### What each built-in takes and refuses
+
+| Axis | Takes | Refuses |
+|---|---|---|
+| `daily` | append-only capture of what was said | curated fact |
+| `events` | something that happened at a point in time | plans, rules |
+| `tasks` | work still owed, with its state | a record of finished work |
+| `people` | durable facts about a person | what they said once |
+| `projects` | durable facts about an ongoing effort | its individual work items |
+| `channels` | durable facts about a place we talk in | the messages sent there |
+| `decisions` | what was chosen at a point in time and why: context, options, chosen, rationale, scope, timestamp, supersedes | rules for what to do next |
+| `ops` | repeatable operating rules, runtime/session/tool procedure, principles distilled from failure, state the next executor picks up | raw transcript, secrets, dated small talk, one-off dumps |
+| `reflections` | observed failure or drift, the invariant learned, why it matters, the concrete next action, its promotion target | facts about the world |
+
+`ops` and `decisions` are the pair most easily confused: **`ops` constrains current behaviour before acting; `decisions` records what was chosen at a point in time and why.**
+
+**`ops` is routable, not one growing file.** It is partitioned into `ops/rules/`, `ops/distillations/` and `ops/handoffs/`, indexed as a tree so a rule pack never scrolls off the newest-entries window, and ranked above raw capture during recall. A file directly under `ops/` is an `axis_layout_violation`: it belongs in a partition.
+
+**`reflections` is dated and append-only.** Entries are `reflections/YYYY-MM-DD.md`, optionally sharded into `reflections/YYYY-MM/`, with several entries per day allowed inside a file. Per-subject files (`reflections/tone.md`) are rejected with `axis_layout_violation`; a subject view may exist only as a generated projection, never as a second authority. One layout, not both: a writer holding a subject file edits it in place, and the correction history that makes a reflection useful is exactly what gets overwritten. A reflection promotes onward — an operating invariant to `ops/rules`, a cross-incident learning to `ops/distillations`, a project-scoped or person/channel correction to that axis.
+
+Adding an axis to an existing corpus is additive only. Startup creates the missing directories and regenerates the generated map; it never reads, moves, rewrites or deletes a file a human wrote, so a seven-axis corpus and an `ops/` tree written by hand before the axis existed both survive byte-identically.
+
+Each completed chat turn and each authored monitor event is captured in the current UTC daily file. A capture records timestamp, origin, speaker (`author @ #channel | server`), user/event text, and reply text; each text field is bounded to 500 characters. This gives the canonicalization routine raw daily material to sort into the canonical axes.
+
+The daily axis has two layers: flat `daily/YYYY-MM-DD.md` files are the gateway-written raw capture layer and must never be edited or moved, while persona-curated digests live in `daily/YYYY-MM/` subdirectories. Axis subdirectories are fully supported at any depth: map generation, audit and retrieval all walk an axis recursively.
+
+There is exactly **one** traversal behind those three, and that is deliberate: a file the map serves must be a file the audit inspects, or an unpartitioned rule can be indexed and recalled while never being reported. It follows directory symlinks — an axis rooted at a symlink still gets audited — bounded by `realpath` bookkeeping so a symlink cycle terminates. Symlinked *files* are skipped, since they are a second name for content already indexed under its real path.
+
+Startup is safe to call concurrently. Adapters, monitors and the closure queue all initialize, so `initializeMemory` serializes per memory root; otherwise concurrent cold starts race on `git init` and on the generated map. A malformed registry, an unwritable root, or a plain file where an axis directory belongs still fails closed, leaving the corpus untouched.
 
 ## Default maintenance monitors
 
@@ -40,7 +117,7 @@ Memory writes use a durable closure ladder so a reply does not have to wait for 
 
 1. Store an intent in the gateway database (the acceptance boundary).
 2. Write the daily Markdown capture and regenerate `MEMORY.md`.
-3. Commit `MEMORY.md` and `daily/` in the memory repository with `Gajaeway-Mutation-Id: <id>` in the commit message.
+3. Commit the whole corpus in the memory repository with `Gajaeway-Mutation-Id: <id>` in the commit message. Staging is not limited to the capture axis: every registered axis is committed, so a reflection or an `ops` rule written by hand between two captures enters the same reviewable history instead of sitting untracked.
 4. Append a receipt containing the mutation ID, commit hash, and timestamp to `$GAJAEWAY_HOME/memory-receipts.jsonl`.
 5. On startup, resume queued, written, or committed intents. If the evidence cannot be recovered, mark the intent **quarantined**; do not erase the intent, receipt, or Git history to hide it.
 
@@ -60,9 +137,10 @@ It returns JSON issues and exits non-zero when memory is not structurally sound.
 - `unmapped_axis_dir` — an axis has no heading in the map.
 - `long_form_map` — a map line exceeds 200 characters.
 - `duplicate_file_hash` — two Markdown files have identical content.
-- `orphan_file` — Markdown exists outside the seven axis directories (except `MEMORY.md`).
-- `out_of_root_link` — a Markdown link escapes the memory root.
-- `map_content_drift` — the map does not point to the newest daily file.
+- `orphan_file` — Markdown exists outside every registered axis root (except `MEMORY.md`); register the axis in `axes.json` to make it canonical.
+- `out_of_root_link` — a Markdown link or map pointer escapes the memory root. Percent-escapes are decoded first, so `%2e%2e/secret.md` is reported as an escape rather than a missing file.
+- `axis_layout_violation` — a file breaks its own axis's layout policy: a dated axis given a per-subject name, a partitioned axis written to directly, or a flat axis given a subdirectory.
+- `map_content_drift` — the map does not point to the newest entry of an append-only axis (`daily`, `reflections`).
 
 Audit before manual repair. Repair the source Markdown or map generation problem, not the diagnostic evidence.
 
@@ -72,7 +150,7 @@ Audit before manual repair. Repair the source Markdown or map generation problem
 gajaeway memory search 'project decision'
 ```
 
-Search reads safe `.md` pointers from `MEMORY.md`, then includes canonical axis files not already mapped. It ranks results with BM25-style term frequency, inverse document frequency, and document-length normalization; mapped files break score ties ahead of unmapped files. Results are bounded excerpts with path and score (default 10, maximum 50).
+Search reads `.md` pointers from `MEMORY.md`, then includes canonical axis files not already mapped. A pointer is followed only if it stays inside the memory root once decoded; a pointer that escapes is ignored, and one that no longer resolves is skipped, so recall degrades on a stale map instead of failing the query (the audit is what reports the staleness, as `map_dangling`). It ranks results with BM25-style term frequency, inverse document frequency, and document-length normalization; ties break on the axis's declared `retrievalPriority`, then on mapped ahead of unmapped. Results are bounded excerpts with path and score (default 10, maximum 50).
 
 Maintain a small golden-query benchmark beside operational practice: representative queries should name the expected canonical file(s) and be checked after a reorganization. This is a human quality benchmark for retrieval relevance, not a replacement for `memory audit`’s structural gate.
 

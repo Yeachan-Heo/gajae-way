@@ -2,7 +2,7 @@ import { afterEach, expect, test } from "bun:test";
 import { appendFile, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { initializeMemory, regenerateMap } from "../src/memory/doctrine";
+import { initializeMemory, memoryRoot, regenerateMap } from "../src/memory/doctrine";
 import { validateMemory } from "../src/memory/validator";
 
 let home = "";
@@ -14,8 +14,12 @@ async function root() {
 	home = await mkdtemp(join(tmpdir(), "gajaeway-validator-"));
 	return initializeMemory(home);
 }
+// The corpus is audited exactly as it sits on disk. Re-entering initializeMemory
+// here would repair the generated map first and hide the very issue under test:
+// startup guarantees the map covers every registered axis, while the audit is
+// what reports a map that does not.
 async function issue(code: string): Promise<void> {
-	expect((await validateMemory(await initializeMemory(home))).some((item) => item.code === code)).toBe(true);
+	expect((await validateMemory(memoryRoot(home))).some((item) => item.code === code)).toBe(true);
 }
 
 test("validator reports map_dangling", async () => {
