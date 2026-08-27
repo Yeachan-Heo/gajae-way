@@ -21,6 +21,33 @@ export interface GatewayStatusResult {
 	readonly delivery?: { readonly pending: number; readonly oldestPendingAgeMs: number | null };
 }
 
+/**
+ * The message an inbound message replies to, when the platform reports one.
+ *
+ * A reply is the only signal that says *which* of the many messages in a busy
+ * room is being answered, so it is carried as metadata rather than folded into
+ * engagement decisions. Every field except `messageId` is optional on purpose:
+ * platforms hand out the reference id eagerly but the referenced author and
+ * text only when they are already resolved, and an adapter must never delay
+ * inbound handling on an extra API fetch to fill this in. Absent beats guessed.
+ */
+export interface ReplyContext {
+	/** Platform-scoped id of the referenced message. Always known when a reply exists. */
+	readonly messageId: string;
+	/** Platform-scoped author id of the referenced message, when it is already resolved. */
+	readonly authorId?: string;
+	/** Display name of the referenced author, resolved with the same precedence as `authorName`. */
+	readonly authorName?: string;
+	/**
+	 * True when the referenced message was authored by our own agent account,
+	 * false when it was authored by somebody else. Absent means the referenced
+	 * author is unknown, so ownership could not be decided — never assume false.
+	 */
+	readonly fromSelf?: boolean;
+	/** Short single-line excerpt of the referenced text, when the platform included it. */
+	readonly excerpt?: string;
+}
+
 /** Inbound engagement metadata supplied by adapters for group-capable origins. */
 export interface EngagementContext {
 	/** True when the agent account was explicitly mentioned/addressed. */
@@ -44,6 +71,12 @@ export interface EngagementContext {
 	readonly channelLabel?: string;
 	/** Human-readable server/guild/workspace label when the platform has one above the channel. */
 	readonly serverLabel?: string;
+	/**
+	 * The message this one replies to, when the platform reports a reply. Absent
+	 * for every message that is not a reply, so existing payloads are unchanged.
+	 * Metadata only: a reply never decides engagement by itself.
+	 */
+	readonly replyTo?: ReplyContext;
 }
 
 export interface ChatSendParams {

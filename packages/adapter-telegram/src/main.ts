@@ -2,6 +2,7 @@ import type { ChatMessagePayload, EngagementContext, OriginRef } from "@gajaeway
 import { GajaewayClient } from "@gajaeway/sdk";
 import { type LoadedTelegramAdapterConfig, loadTelegramAdapterConfig } from "./config";
 import { type TelegramMessageOriginShape, telegramMessageOrigin } from "./origin";
+import { resolveTelegramReplyContext, type TelegramReplyMessageShape } from "./reply";
 import { TelegramAdapterState } from "./state";
 
 const TELEGRAM_MESSAGE_LIMIT = 4_096;
@@ -15,7 +16,7 @@ export interface GatewayClientLike {
 export interface TelegramMessage extends TelegramMessageOriginShape {
 	readonly message_id: number;
 	readonly text?: string;
-	readonly reply_to_message?: { readonly from?: { readonly id: number | string } };
+	readonly reply_to_message?: TelegramReplyMessageShape;
 }
 
 export interface TelegramUpdate {
@@ -156,9 +157,12 @@ export function engagementForMessage(
 	botUsername: string,
 	botUserId: string,
 ): EngagementContext {
+	const replyTo = resolveTelegramReplyContext(message.reply_to_message, botUserId);
+	// A reply to our own message is the same "addressed to us" signal as an @mention,
+	// so it keeps reading as one — derived from replyTo instead of a second identity check.
 	const mentioned =
 		message.text?.toLocaleLowerCase().includes(`@${botUsername.toLocaleLowerCase()}`) === true ||
-		String(message.reply_to_message?.from?.id ?? "") === botUserId;
+		replyTo?.fromSelf === true;
 	const authorName = message.from?.username ?? message.from?.first_name;
 	return {
 		mentioned,
@@ -166,6 +170,7 @@ export function engagementForMessage(
 		authorId: String(message.from?.id ?? ""),
 		...(authorName ? { authorName } : {}),
 		...(message.chat.title ? { channelLabel: message.chat.title } : {}),
+		...(replyTo ? { replyTo } : {}),
 	};
 }
 

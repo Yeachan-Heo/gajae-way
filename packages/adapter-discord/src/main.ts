@@ -1,9 +1,10 @@
 import type { ChatMessagePayload, ChatProgressPayload, EngagementContext, OriginRef } from "@gajaeway/protocol";
 import { GajaewayClient } from "@gajaeway/sdk";
 import { Client, GatewayIntentBits } from "discord.js";
-import { resolveDisplayName } from "./author";
+import { type AuthorLike, resolveDisplayName } from "./author";
 import { type LoadedDiscordAdapterConfig, loadDiscordAdapterConfig } from "./config";
 import { type DiscordMessageOriginShape, discordMessageOrigin } from "./origin";
+import { type ReplyMessageLike, resolveReplyContext } from "./reply";
 
 const DISCORD_MESSAGE_LIMIT = 2_000;
 // Discord clears the typing hint after ~10s, so refresh inside that window while a turn is running.
@@ -43,7 +44,7 @@ export interface DiscordClientLike {
 	channels: { fetch(id: string): Promise<unknown> };
 }
 
-export interface DiscordInboundMessage extends DiscordMessageOriginShape {
+export interface DiscordInboundMessage extends DiscordMessageOriginShape, ReplyMessageLike {
 	readonly id: string;
 	readonly content: string;
 	readonly author: {
@@ -53,7 +54,7 @@ export interface DiscordInboundMessage extends DiscordMessageOriginShape {
 		/** Account-wide display name, shown when a guild has no nickname. */
 		readonly globalName?: string | null;
 	};
-	readonly mentions?: { has(user: unknown): boolean };
+	readonly mentions?: { has(user: unknown): boolean; readonly repliedUser?: AuthorLike | null };
 	readonly guild?: { readonly name?: string } | null;
 	/**
 	 * Guild membership for this message, present only for guild messages.
@@ -102,6 +103,7 @@ export function engagementForMessage(message: DiscordInboundMessage, botUser: un
 	const botId = typeof botUser === "object" && botUser !== null && "id" in botUser ? String(botUser.id) : "";
 	const contentMention = botId !== "" && new RegExp(`<@!?${escapeRegExp(botId)}>`).test(message.content);
 	const displayName = resolveAuthorDisplayName(message);
+	const replyTo = resolveReplyContext(message, botId);
 	return {
 		mentioned: Boolean(message.mentions?.has(botUser) || contentMention),
 		group: origin.kind !== "dm",
@@ -110,6 +112,8 @@ export function engagementForMessage(message: DiscordInboundMessage, botUser: un
 		...(message.author.username ? { authorHandle: message.author.username } : {}),
 		...(message.channel.name ? { channelLabel: `#${message.channel.name}` } : {}),
 		...(message.guild?.name ? { serverLabel: message.guild.name } : {}),
+		// Metadata only: a reply — even a reply to us — never promotes engagement.
+		...(replyTo ? { replyTo } : {}),
 	};
 }
 
