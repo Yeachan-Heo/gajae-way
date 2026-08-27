@@ -247,6 +247,46 @@ test("a completed turn restores the budget, and an explicit /new does too", asyn
 	}
 });
 
+test("a rebind whose REPLAY succeeds still spends the budget: no unbounded epoch growth", async () => {
+	// The dangerous shape, and the one the live incident had: a turn-level code
+	// that recurs on every message while the replay against the fresh session
+	// succeeds. If a replayed turn cleared the budget, each message would cost one
+	// epoch and reset the counter, so the cap would never fire.
+	directory = await mkdtemp(join(tmpdir(), "gajaeway-rebind-"));
+	const database = await GatewayDatabase.open(join(directory, "gateway.db"));
+	const logs: string[] = [];
+	let failNextTurn = false;
+	let created = 0;
+	const spawn = ((options: { cmd: string[] }) => {
+		if (options.cmd.includes("session.create")) return fakeChild(createSuccess(`session-${created++}`), "", 0);
+		if (failNextTurn) {
+			failNextTurn = false;
+			return fakeChild(turnFailure("managed_append_identity_mismatch", "identity moved"), "", 1);
+		}
+		return fakeChild(turnReply("ok"), "", 0);
+	}) as unknown as typeof Bun.spawn;
+	const client = new GjcClient(database, 5_000, directory, undefined, { spawn, log: (line) => logs.push(line) });
+	try {
+		const failures: string[] = [];
+		for (let message = 0; message < 10; message++) {
+			failNextTurn = true;
+			const epoch = database.getSessionRecord("discord:dm:c1")?.epoch ?? 0;
+			const { sessionId } = await client.ensureSession("discord:dm:c1", epoch);
+			await client.sendTurn(sessionId, "hello").catch((error: unknown) => {
+				failures.push(error instanceof Error ? error.name : String(error));
+			});
+		}
+		// Bounded at the cap, not one bump per message.
+		expect(database.getSessionRecord("discord:dm:c1")?.epoch).toBe(DEFAULT_REBIND_CAP);
+		expect(logs).toHaveLength(DEFAULT_REBIND_CAP);
+		expect(logs[DEFAULT_REBIND_CAP - 1]).toContain(`${DEFAULT_REBIND_CAP}/${DEFAULT_REBIND_CAP}`);
+		// Past the cap every further message fails loudly instead of growing the epoch.
+		expect(failures.filter((name) => name === "RebindCapExceededError")).toHaveLength(7);
+	} finally {
+		database.close();
+	}
+});
+
 test("a turn that already ran a tool is NOT replayed after the rebind", async () => {
 	// The persona has full tool access; replaying a half-executed turn re-runs
 	// real side effects, so the gateway rebinds but surfaces the failure.

@@ -311,8 +311,11 @@ export class GjcClient implements GjcPort {
 		const observed = { toolCalls: 0, outputTokens: 0, hadText: false };
 		try {
 			const reply = await this.#runTurn(sessionId, text, systemPreamble, onProgress, options, observed);
-			// A completed turn is the only proof this origin is healthy, so it is the
-			// only thing that restores the rebind budget.
+			// A turn that completed WITHOUT needing a rebind is the only proof this
+			// origin is healthy, so it is the only thing that restores the budget.
+			// Clearing after a REPLAYED turn would reopen unbounded epoch growth: for
+			// a code that recurs every message and clears on the replay, each message
+			// would cost one bump and reset the counter, so the cap would never fire.
 			const bound = this.#origins.get(sessionId);
 			if (bound) this.#rebinder.clear(bound.originKey);
 			return reply;
@@ -332,9 +335,7 @@ export class GjcClient implements GjcPort {
 					`${error instanceof Error ? error.message : String(error)} (rebound to e${nextEpoch}; the turn was not replayed because it had already run ${observed.toolCalls} tool call(s))`,
 					{ ...(code ? { code } : {}), message: `${code}: the turn had already started work, so it was not replayed` },
 				);
-			const replayed = await this.#runTurn(rebound.sessionId, text, systemPreamble, onProgress, options);
-			this.#rebinder.clear(binding.originKey);
-			return replayed;
+			return await this.#runTurn(rebound.sessionId, text, systemPreamble, onProgress, options);
 		}
 	}
 
