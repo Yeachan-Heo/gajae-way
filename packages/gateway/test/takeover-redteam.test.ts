@@ -549,3 +549,41 @@ test("rebindEpoch resets turn_count so a recovery near rotation keeps its fresh 
 		database.close();
 	}
 });
+
+test("a pretty-printed multiline credential array is redacted whole", () => {
+	// The bracketed-list rule used to stop at the first newline, so a
+	// pretty-printed array shipped its entries line by line.
+	const notice = formatFailureNotice(
+		new GjcRuntimeError("wrapped", {
+			code: "spawn_failed",
+			message: `{"secrets":[\n"wJalrXUtnFEMIK7MDENGbPxRfiCYEXAMPLEKEY"\n]}`,
+		}),
+	);
+	expect(notice).not.toContain("wJalrXUtnFEMIK7MDENGbPxRfiCYEXAMPLEKEY");
+	expect(notice).toContain("[redacted]");
+});
+
+test("the rebind budget survives a gateway restart via durable counters", async () => {
+	const database = await makeDatabase("gajaeway-takeover-durable-");
+	const logs: string[] = [];
+	const spawn = (() => fakeChild(createFailure("resource_gone", "session endpoint record is gone"), "", 1)) as unknown as typeof Bun.spawn;
+	try {
+		const first = new GjcClient(database, 5_000, directory, undefined, { spawn, log: (line) => logs.push(line) });
+		for (let attempt = 0; attempt < DEFAULT_REBIND_CAP; attempt++)
+			await expect(first.ensureSession("discord:dm:durable")).rejects.toMatchObject({ code: "resource_gone" });
+		database.close();
+		// "Restart": a fresh client over the same durable store must inherit the
+		// spent budget — a restart is not an unauthorized cap reset.
+		const reopened = await GatewayDatabase.open(join(directory!, "gateway.db"));
+		try {
+			const second = new GjcClient(reopened, 5_000, directory, undefined, { spawn, log: (line) => logs.push(line) });
+			await expect(second.ensureSession("discord:dm:durable")).rejects.toMatchObject({
+				name: "RebindCapExceededError",
+			});
+		} finally {
+			reopened.close();
+		}
+	} finally {
+		database.close();
+	}
+});
