@@ -291,10 +291,11 @@ const CREDENTIAL_KEY = `(?:^|[\\s,{(\\["'?&#/;])(?:[A-Za-z0-9]+[_-])*?(?:${[...C
 const CREDENTIAL_BRACKET_OPEN = new RegExp(`(${CREDENTIAL_KEY}\\s*[:=]\\s*)\\[`, "gi");
 
 /**
- * Redacts a credential-keyed bracketed array: everything up to the closing
- * `]` — or, if none appears within the 600-character work bound, the whole
- * bounded window — is replaced with `[redacted]`. The bound limits WORK only;
- * content beyond it cannot survive unredacted inside the window.
+ * Redacts a credential-keyed bracketed array with a QUOTE/ESCAPE-AWARE linear
+ * scan to the TRUE closing bracket — a `]` inside a quoted value does not end
+ * the array, and an unterminated array redacts to the end of the diagnostic
+ * (fail closed). The scan is linear with no backtracking, so the DoS concern
+ * of the old bounded regex never applies.
  */
 function redactBracketedCredentials(text: string): string {
 	const open = new RegExp(CREDENTIAL_BRACKET_OPEN.source, "gi");
@@ -302,9 +303,18 @@ function redactBracketedCredentials(text: string): string {
 	let copied = 0;
 	for (let match = open.exec(text); match !== null; match = open.exec(text)) {
 		const start = match.index + match[0].length;
-		const window = text.slice(start, start + 600);
-		const close = window.indexOf("]");
-		const consumed = close === -1 ? window.length : close + 1;
+		let index = start;
+		let quote: string | null = null;
+		while (index < text.length) {
+			const character = text[index];
+			if (quote !== null) {
+				if (character === "\\") index++;
+				else if (character === quote) quote = null;
+			} else if (character === '"' || character === "'") quote = character;
+			else if (character === "]") break;
+			index++;
+		}
+		const consumed = (index >= text.length ? text.length : index + 1) - start;
 		result += text.slice(copied, match.index) + `${match[1]}[redacted]`;
 		copied = start + consumed;
 		open.lastIndex = copied;

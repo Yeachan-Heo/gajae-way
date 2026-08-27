@@ -688,3 +688,31 @@ test("a restart followed by clear preserves the durable lifetime audit total", a
 		database.close();
 	}
 });
+
+test("a quoted ] inside a credential array does not end the redaction early", () => {
+	// G5-B1: the scanner must track quotes/escapes — a `]` inside a quoted value
+	// cannot close the array and let the later generic credential through.
+	const message = `{"secrets":["safe]text","wJalrXUtnFEMIK7MDENGbPxRfiCYEXAMPLEKEY"]}`;
+	const notice = formatFailureNotice(new GjcRuntimeError("wrapped", { code: "spawn_failed", message }));
+	expect(notice).not.toContain("wJalrXUtnFEMIK7MDENGbPxRfiCYEXAMPLEKEY");
+	expect(notice).toContain("[redacted]");
+});
+
+test("a generic credential AFTER the old work bound is still redacted", () => {
+	// The scanner is linear (no work cap), so a later entry beyond any fixed
+	// window is redacted because the array's true close is found.
+	const padded = `{"secrets":["${"x".repeat(800)}","wJalrXUtnFEMIK7MDENGbPxRfiCYEXAMPLEKEY"]}`;
+	const notice = formatFailureNotice(new GjcRuntimeError("wrapped", { code: "spawn_failed", message: padded }));
+	expect(notice).not.toContain("wJalrXUtnFEMIK7MDENGbPxRfiCYEXAMPLEKEY");
+});
+
+test("an unterminated credential array redacts to the end of the diagnostic", () => {
+	const notice = formatFailureNotice(
+		new GjcRuntimeError("wrapped", {
+			code: "spawn_failed",
+			message: `{"secrets":["wJalrXUtnFEMIK7MDENGbPxRfiCYEXAMPLEKEY"`,
+		}),
+	);
+	expect(notice).not.toContain("wJalrXUtnFEMIK7MDENGbPxRfiCYEXAMPLEKEY");
+	expect(notice).toContain("[redacted]");
+});
