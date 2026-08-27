@@ -49,6 +49,11 @@ export interface GjcPort {
 		onProgress?: (progress: TurnProgress) => void,
 		options?: TurnOptions,
 	): Promise<string>;
+	/**
+	 * Forgets an origin's rebind budget after an explicit operator reset (`/new`),
+	 * which is the manual form of the same remedy.
+	 */
+	forgetRebinds?(originKey: string): void;
 }
 
 /**
@@ -96,7 +101,9 @@ export class GjcTurnStream {
 		// Structured turn failures (e.g. managed_append_identity_mismatch) arrive as
 		// their own frame; the code is kept so the caller can classify without ever
 		// matching on human message text.
-		this.runtimeError = runtimeErrorOfEnvelope(event) ?? this.runtimeError;
+		// First-wins: the FIRST declared error frame is the failure. A later
+		// incidental error frame must not overwrite the genuine cause.
+		this.runtimeError ??= runtimeErrorOfEnvelope(event);
 		if (event.type === "message_update" && typeof event.assistantMessageEvent?.delta === "string")
 			this.#deltaChars += event.assistantMessageEvent.delta.length;
 		if (event.type === "tool_execution_start") this.toolCalls++;
@@ -133,6 +140,13 @@ export class GjcTurnStream {
  * process and gjc needs the owner's provider credentials. Secrets are never
  * logged or persisted by this module.
  */
+/**
+ * Process seam. Bound at construction rather than stored as a bare
+ * `Bun.spawn` reference, so the production path never depends on the method
+ * being callable detached from its receiver.
+ */
+type SpawnFn = typeof Bun.spawn;
+
 export class GjcClient implements GjcPort {
 	/** GAJAEWAY_TEST_STUB_GJC is a test-only deterministic process seam; never set it in production. */
 	readonly #sessions = new Map<string, string>();
@@ -143,7 +157,7 @@ export class GjcClient implements GjcPort {
 	readonly #cwd: string;
 	readonly #model: string | undefined;
 	readonly #rebinder: SessionRebinder;
-	readonly #spawn: typeof Bun.spawn;
+	readonly #spawn: SpawnFn;
 
 	// 300s ceiling: the persona is an action-capable agent that runs real tools per
 	// turn; 120s killed live owner turns mid-investigation (P1 drill finding).
@@ -156,7 +170,7 @@ export class GjcClient implements GjcPort {
 			/** Rebinds allowed per session/origin before the gateway fails loudly. */
 			readonly rebindCap?: number;
 			/** Process seam; production always uses Bun.spawn. */
-			readonly spawn?: typeof Bun.spawn;
+			readonly spawn?: SpawnFn;
 			readonly log?: (line: string) => void;
 		} = {},
 	) {
@@ -164,7 +178,7 @@ export class GjcClient implements GjcPort {
 		this.#timeoutMs = timeoutMs;
 		this.#cwd = cwd;
 		this.#model = model;
-		this.#spawn = deps.spawn ?? Bun.spawn;
+		this.#spawn = deps.spawn ?? Bun.spawn.bind(Bun);
 		this.#rebinder = new SessionRebinder(
 			database,
 			deps.rebindCap ?? DEFAULT_REBIND_CAP,
@@ -191,6 +205,11 @@ export class GjcClient implements GjcPort {
 			const nextEpoch = this.#rebinder.rebind(originKey, code, epoch);
 			return await this.#createSession(originKey, nextEpoch, options);
 		}
+	}
+
+	/** An explicit `/new` is the manual rebind, so it restores the budget too. */
+	forgetRebinds(originKey: string): void {
+		this.#rebinder.clear(originKey);
 	}
 
 	#cachedSession(originKey: string, epoch: number): string | undefined {
@@ -236,19 +255,28 @@ export class GjcClient implements GjcPort {
 			// The runtime's structured envelope can land on either stream; the code is
 			// what decides rebindability, so both are inspected before giving up.
 			const detail = extractRuntimeError(stdout) ?? extractRuntimeError(stderr);
-			throw new GjcRuntimeError(
-				`gjc session.create exited ${exitCode}: ${detail?.code ? `${detail.code}: ` : ""}${detail?.message ?? stderr.trim()}`,
-				detail ?? { message: stderr.trim() },
-			);
+			throw runtimeFailure(`gjc session.create exited ${exitCode}`, detail, stderr.trim());
 		}
 		const sessionId = parseCreateResult(stdout);
+		// One live binding per origin: older epochs are unreachable once a new one
+		// is bound, so dropping them keeps both maps bounded and prevents a stale
+		// epoch from being reported as a rebind's from-epoch.
+		this.#forgetOrigin(originKey);
 		this.#sessions.set(cacheKey, sessionId);
 		this.#origins.set(sessionId, { originKey, epoch });
 		this.#database.withTransaction(() => this.#database.putSession(originKey, sessionId));
-		// A proven-good bind means this origin is healthy again, so the rebind
-		// budget starts over rather than counting failures from a past incident.
-		this.#rebinder.clear(originKey);
+		// The budget is deliberately NOT cleared here: a fresh key always creates,
+		// so clearing on create would make the cap unreachable for a recurring
+		// turn-level failure. Only a proven-good turn clears it.
 		return { sessionId };
+	}
+
+	#forgetOrigin(originKey: string): void {
+		for (const [cacheKey, sessionId] of this.#sessions)
+			if (cacheKey.startsWith(`${originKey}#`)) {
+				this.#origins.delete(sessionId);
+				this.#sessions.delete(cacheKey);
+			}
 	}
 
 	/**
@@ -256,7 +284,12 @@ export class GjcClient implements GjcPort {
 	 * session can no longer be resumed from this cwd (#13): a turn-level
 	 * `managed_append_identity_mismatch` condemns the binding itself, so retrying
 	 * the same session id is guaranteed silence. The rebind bumps and persists
-	 * the epoch, binds a fresh session, and replays the turn exactly once.
+	 * the epoch and binds a fresh session.
+	 *
+	 * The turn is replayed only when the failed attempt provably did nothing. The
+	 * persona has full tool access by design, so replaying a turn that already ran
+	 * tools would re-run real side effects; in that case the gateway still rebinds
+	 * (so the next turn works) but surfaces the failure instead of re-running.
 	 */
 	async sendTurn(
 		sessionId: string,
@@ -275,17 +308,33 @@ export class GjcClient implements GjcPort {
 			onProgress?.({ toolCalls: 0, outputTokens: 0 });
 			return process.env.GAJAEWAY_TEST_STUB_REPLY ?? "stub reply";
 		}
+		const observed = { toolCalls: 0, outputTokens: 0, hadText: false };
 		try {
-			return await this.#runTurn(sessionId, text, systemPreamble, onProgress, options);
+			const reply = await this.#runTurn(sessionId, text, systemPreamble, onProgress, options, observed);
+			// A completed turn is the only proof this origin is healthy, so it is the
+			// only thing that restores the rebind budget.
+			const bound = this.#origins.get(sessionId);
+			if (bound) this.#rebinder.clear(bound.originKey);
+			return reply;
 		} catch (error) {
 			const code = rebindableCodeOf(error);
 			const binding = this.#origins.get(sessionId);
 			if (!code || !binding) throw error;
-			const nextEpoch = this.#rebinder.rebind(binding.originKey, code, binding.epoch);
+			// The persisted epoch is the truth; the remembered binding can be stale,
+			// and the rebind log line must not misstate the epoch transition.
+			const fromEpoch = this.#database.getSessionRecord(binding.originKey)?.epoch ?? binding.epoch;
+			const nextEpoch = this.#rebinder.rebind(binding.originKey, code, fromEpoch);
 			this.#sessions.delete(`${binding.originKey}#${binding.epoch}`);
 			this.#origins.delete(sessionId);
 			const rebound = await this.#createSession(binding.originKey, nextEpoch, options);
-			return await this.#runTurn(rebound.sessionId, text, systemPreamble, onProgress, options);
+			if (observed.toolCalls > 0 || observed.hadText || observed.outputTokens > 0)
+				throw new GjcRuntimeError(
+					`${error instanceof Error ? error.message : String(error)} (rebound to e${nextEpoch}; the turn was not replayed because it had already run ${observed.toolCalls} tool call(s))`,
+					{ ...(code ? { code } : {}), message: `${code}: the turn had already started work, so it was not replayed` },
+				);
+			const replayed = await this.#runTurn(rebound.sessionId, text, systemPreamble, onProgress, options);
+			this.#rebinder.clear(binding.originKey);
+			return replayed;
 		}
 	}
 
@@ -295,6 +344,8 @@ export class GjcClient implements GjcPort {
 		systemPreamble?: string,
 		onProgress?: (progress: TurnProgress) => void,
 		options?: TurnOptions,
+		/** Work the attempt was seen to perform; a replay is only safe when it is empty. */
+		observed?: { toolCalls: number; outputTokens: number; hadText: boolean },
 	): Promise<string> {
 		const child = this.#spawn({
 			cmd: [
@@ -338,6 +389,11 @@ export class GjcClient implements GjcPort {
 				for await (const value of child.stdout as unknown as AsyncIterable<Uint8Array>) {
 					lastActivity = Date.now();
 					stream.feed(decoder.decode(value, { stream: true }));
+					if (observed) {
+						observed.toolCalls = stream.toolCalls;
+						observed.outputTokens = stream.outputTokens;
+						observed.hadText = stream.finalText !== undefined;
+					}
 					if (onProgress) onProgress({ toolCalls: stream.toolCalls, outputTokens: stream.outputTokens });
 				}
 			} catch {
@@ -350,10 +406,7 @@ export class GjcClient implements GjcPort {
 				// in the ndjson stream or on stderr, and its code (never its wording)
 				// decides whether the binding is condemned.
 				const detail = stream.runtimeError ?? extractRuntimeError(stderr);
-				throw new GjcRuntimeError(
-					`gjc turn exited ${exitCode}: ${detail?.code ? `${detail.code}: ` : ""}${detail?.message ?? stderr.trim()}`,
-					detail ?? { message: stderr.trim() },
-				);
+				throw runtimeFailure(`gjc turn exited ${exitCode}`, detail, stderr.trim());
 			}
 			if (stream.finalText === undefined) throw new Error("gjc turn stream produced no assistant text");
 			return stream.finalText;
@@ -385,6 +438,17 @@ export class GjcClient implements GjcPort {
 }
 
 /**
+ * One framing for every gjc failure: the gateway's own context, then the
+ * runtime's code and message when it reported them, with the structured detail
+ * attached so the caller classifies on the CODE rather than on this string.
+ */
+function runtimeFailure(context: string, detail: RuntimeErrorDetail | undefined, fallback: string): GjcRuntimeError {
+	const resolved: RuntimeErrorDetail = detail ?? { message: fallback };
+	const rendered = `${resolved.code ? `${resolved.code}: ` : ""}${resolved.message ?? fallback}`;
+	return new GjcRuntimeError(`${context}: ${rendered}`, resolved);
+}
+
+/**
  * Reads the sessionId out of the SDK envelope. An `ok:false` envelope keeps the
  * runtime's own code, because that code — not the message wording — is what
  * decides whether the idempotency key is condemned and must be rebound (#13).
@@ -399,11 +463,7 @@ function parseCreateResult(stdout: string): string {
 		}
 		if (parsed?.ok && typeof parsed.result?.sessionId === "string") return parsed.result.sessionId;
 		if (parsed?.ok === false) {
-			const detail = runtimeErrorOfEnvelope(parsed);
-			throw new GjcRuntimeError(
-				`gjc session.create failed: ${detail?.code ? `${detail.code}: ` : ""}${detail?.message ?? line}`,
-				detail ?? { message: line },
-			);
+			throw runtimeFailure("gjc session.create failed", runtimeErrorOfEnvelope(parsed), line);
 		}
 	}
 	throw new Error("gjc session.create produced no parseable sessionId");

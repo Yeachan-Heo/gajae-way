@@ -71,24 +71,47 @@ export class RebindCapExceededError extends GjcRuntimeError {
 	}
 }
 
-/** True when the remedy for this code is a fresh session key, not a retry. */
+/**
+ * True when the remedy for this code is a fresh session key, not a retry.
+ * Membership is exact after the same narrow normalization the reporting path
+ * uses, so classification and the delivered notice can never disagree.
+ */
 export function isRebindableCode(code: string | undefined): boolean {
-	return code !== undefined && REBINDABLE_ERROR_CODES.has(code);
+	const normalized = normalizeCode(code);
+	return normalized !== undefined && REBINDABLE_ERROR_CODES.has(normalized);
 }
 
 /** The rebindable code carried by an error, or undefined for a genuine failure. */
 export function rebindableCodeOf(error: unknown): string | undefined {
-	const code = error instanceof GjcRuntimeError ? error.code : undefined;
+	const code = error instanceof GjcRuntimeError ? normalizeCode(error.code) : undefined;
 	return isRebindableCode(code) ? code : undefined;
 }
 
-const CODE_SHAPE = /^[a-z][a-z0-9_]*$/;
+/**
+ * Codes are reported, not filtered. A code is only ever CLASSIFIED by exact
+ * membership of REBINDABLE_ERROR_CODES, so an unfamiliar shape can never widen
+ * classification — but it must still reach the operator, because the code is the
+ * whole diagnosis (#14). Control characters are stripped and the length is
+ * bounded so a hostile or runaway code cannot flood a chat surface.
+ *
+ * Normalization is deliberately narrow: surrounding whitespace and control
+ * characters are removed, because `" resource_gone"` is the same code with
+ * transport noise. Case is NOT folded — `RESOURCE_GONE` is a different code and
+ * is treated as a genuine failure rather than assumed to be one of the four.
+ */
+const CODE_LIMIT = 64;
+
+function normalizeCode(value: unknown): string | undefined {
+	if (typeof value !== "string") return undefined;
+	const cleaned = value.replace(/\p{C}/gu, "").trim();
+	if (!cleaned) return undefined;
+	return cleaned.length > CODE_LIMIT ? `${cleaned.slice(0, CODE_LIMIT)}…` : cleaned;
+}
 
 /**
- * Pulls the runtime's structured error out of a gjc stdout/stderr blob. The gjc
- * SDK envelope is `{"ok":false,"error":{"code":…,"message":…}}` and the ndjson
- * turn stream carries `{"type":"error","error":{…}}`; both are handled, plus a
- * bare `{"code":…,"message":…}`. Non-JSON noise lines are skipped.
+ * Pulls the runtime's structured error out of a gjc stdout/stderr blob. Only a
+ * declared error frame counts: the gjc SDK envelope `{"ok":false,…}` or an
+ * ndjson `{"type":"error",…}`. Non-JSON noise lines are skipped.
  */
 export function extractRuntimeError(text: string): RuntimeErrorDetail | undefined {
 	for (const line of text.split("\n")) {
@@ -106,19 +129,25 @@ export function extractRuntimeError(text: string): RuntimeErrorDetail | undefine
 	return undefined;
 }
 
-/** Reads the structured error out of one already-parsed gjc envelope object. */
+/**
+ * Reads the structured error out of one already-parsed gjc envelope.
+ *
+ * The frame must DECLARE itself an error (`ok:false` or `type:"error"`). A
+ * nested `error` object is not sufficient: a per-tool failure frame
+ * (`{"type":"tool_execution_end","error":{…}}`) reports a tool that failed, not
+ * a condemned session key, and reading it as one caused spurious epoch bumps and
+ * turn replays.
+ */
 export function runtimeErrorOfEnvelope(envelope: unknown): RuntimeErrorDetail | undefined {
 	if (typeof envelope !== "object" || envelope === null) return undefined;
-	const record = envelope as { ok?: unknown; error?: unknown; code?: unknown; message?: unknown };
+	const record = envelope as { ok?: unknown; type?: unknown; error?: unknown; code?: unknown; message?: unknown };
+	if (record.ok !== false && record.type !== "error") return undefined;
 	const nested =
 		typeof record.error === "object" && record.error !== null
 			? (record.error as { code?: unknown; message?: unknown })
 			: undefined;
 	const candidate = nested ?? record;
-	// A bare object is only an error report when the envelope says so; otherwise a
-	// success frame carrying an unrelated `message` field would be misread.
-	if (!nested && record.ok !== false) return undefined;
-	const code = typeof candidate.code === "string" && CODE_SHAPE.test(candidate.code) ? candidate.code : undefined;
+	const code = normalizeCode(candidate.code);
 	const message = typeof candidate.message === "string" && candidate.message.length > 0 ? candidate.message : undefined;
 	if (!code && !message) return undefined;
 	return { ...(code ? { code } : {}), ...(message ? { message } : {}) };
@@ -130,24 +159,50 @@ export function runtimeErrorOfEnvelope(envelope: unknown): RuntimeErrorDetail | 
  * diagnosis and is never sensitive, so nothing else is erased.
  */
 export function redactSecrets(text: string): string {
-	return text
-		.replace(
-			/((?:token|secret|password|passwd|api[_-]?key|apikey|authorization|bearer)["']?\s*[:=]\s*["']?)[^\s"',}]+/gi,
-			"$1[redacted]",
-		)
-		.replace(/\b(?:sk|rk|pk)-[A-Za-z0-9_-]{8,}/g, "[redacted]")
-		.replace(/\b(?:ghp|gho|ghu|ghs|ghr|github_pat)_[A-Za-z0-9_]{8,}/g, "[redacted]")
-		.replace(/\bxox[abposr]-[A-Za-z0-9-]{8,}/g, "[redacted]")
-		.replace(/\bey[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}/g, "[redacted]");
+	return (
+		text
+			// Header form FIRST: `Authorization: Bearer <opaque>`, `Basic <b64>`. The
+			// key=value rule below would otherwise consume only the scheme word and
+			// leave the token itself in the clear.
+			.replace(/\b(Bearer|Basic|Token)\s+[A-Za-z0-9._~+/=-]{8,}/gi, "$1 [redacted]")
+			// key=value / key: value secret shapes, keeping the key name visible.
+			.replace(
+				/((?:token|secret|password|passwd|api[_-]?key|apikey|credential|authorization|auth|bearer)["']?\s*[:=]\s*["']?)[^\s"',}]+/gi,
+				"$1[redacted]",
+			)
+			// Vendor key prefixes, in both dash and underscore spellings.
+			.replace(/\b(?:sk|rk|pk|sk_live|sk_test|pk_live|pk_test)[-_][A-Za-z0-9_-]{8,}/gi, "[redacted]")
+			.replace(/\b(?:ghp|gho|ghu|ghs|ghr|github_pat)_[A-Za-z0-9_]{8,}/g, "[redacted]")
+			.replace(/\bxox[abposr]-[A-Za-z0-9-]{8,}/g, "[redacted]")
+			.replace(/\bey[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}/g, "[redacted]")
+	);
 }
 
-/** The runtime code and message an error should be reported with. */
+/** The first of these that survives redaction and trimming as non-empty. */
+function firstDiagnosis(...candidates: (string | undefined)[]): string | undefined {
+	for (const candidate of candidates) {
+		if (candidate === undefined) continue;
+		const cleaned = redactSecrets(candidate).trim();
+		if (cleaned) return cleaned;
+	}
+	return undefined;
+}
+
+/**
+ * The runtime code and message an error should be reported with. Truncated, and
+ * never erased: a killed or crashed child produces an empty runtime message, and
+ * reporting that as a bare `[turn failed]` is precisely the zero-diagnosis line
+ * #14 exists to remove, so the gateway's own framing is used as the fallback.
+ */
 export function describeFailure(error: unknown): RuntimeErrorDetail & { readonly text: string } {
-	const code = error instanceof GjcRuntimeError ? error.code : undefined;
-	const raw =
-		(error instanceof GjcRuntimeError ? error.runtimeMessage : undefined) ??
-		(error instanceof Error ? error.message : String(error));
-	const message = redactSecrets(raw).trim();
+	// The code reaches a chat surface too, so it is redacted and bounded exactly
+	// like the message; a secret pasted into a code field must not ride along.
+	const code = error instanceof GjcRuntimeError ? normalizeCode(redactSecrets(error.code ?? "")) : undefined;
+	const message =
+		firstDiagnosis(
+			error instanceof GjcRuntimeError ? error.runtimeMessage : undefined,
+			error instanceof Error ? error.message : String(error),
+		) ?? "the runtime produced no diagnosis";
 	const truncated = message.length > MESSAGE_LIMIT ? `${message.slice(0, MESSAGE_LIMIT).trimEnd()}…` : message;
 	return {
 		...(code ? { code } : {}),
@@ -163,8 +218,10 @@ export function describeFailure(error: unknown): RuntimeErrorDetail & { readonly
  */
 export function formatFailureNotice(error: unknown): string {
 	const described = describeFailure(error);
-	const hint = isRebindableCode(described.code) ? " Send /new to rebind this conversation." : "";
-	return `[turn failed] ${described.text}${hint}`;
+	// The cap being spent is the one failure where a rebind IS the remedy but the
+	// gateway will no longer perform it, so the manual hint is what is left.
+	const remediable = isRebindableCode(described.code) || described.code === "rebind_cap_exceeded";
+	return `[turn failed] ${described.text}${remediable ? " Send /new to rebind this conversation." : ""}`;
 }
 
 /** The subset of the gateway store a rebind needs. */
@@ -176,8 +233,17 @@ export interface RebindStore {
 /**
  * Owns the epoch-bump budget for rebindable failures. One instance per
  * GjcClient (so one per gateway process), which means the counter spans every
- * attempt for a session/origin rather than resetting per call. A successful
- * bind clears the budget: the origin is demonstrably healthy again.
+ * attempt for a session/origin rather than resetting per call.
+ *
+ * The budget is cleared ONLY by a proven-good TURN, never by a successful
+ * create. A fresh idempotency key always creates successfully, so clearing on
+ * create made the cap unreachable for a recurring turn-level failure and let the
+ * epoch grow one bump per message — the silent growth the cap exists to stop.
+ *
+ * The counter is process-local while the epoch is durable, so a gateway restart
+ * starts a fresh budget. That is a deliberate limit, not an oversight: a restart
+ * is an operator action and is visible, whereas the outage this guards against
+ * was continuous muteness inside one long-lived process.
  */
 export class SessionRebinder {
 	readonly #store: RebindStore;
@@ -191,12 +257,8 @@ export class SessionRebinder {
 		this.#log = log;
 	}
 
-	get cap(): number {
-		return this.#cap;
-	}
-
 	/** Rebinds allocated to this origin so far. */
-	used(originKey: string): number {
+	#usedFor(originKey: string): number {
 		return this.#used.get(originKey) ?? 0;
 	}
 
@@ -206,7 +268,7 @@ export class SessionRebinder {
 	 * this e7?" later. Throws once the budget is spent.
 	 */
 	rebind(originKey: string, causeCode: string, fromEpoch: number): number {
-		const used = this.used(originKey);
+		const used = this.#usedFor(originKey);
 		if (used >= this.#cap) throw new RebindCapExceededError(originKey, this.#cap, causeCode, fromEpoch);
 		const toEpoch = this.#store.withTransaction(() => this.#store.rebindEpoch(originKey));
 		this.#used.set(originKey, used + 1);
@@ -216,7 +278,7 @@ export class SessionRebinder {
 		return toEpoch;
 	}
 
-	/** Clears the budget after a proven-good bind. */
+	/** Clears the budget after a proven-good turn, or an explicit operator reset. */
 	clear(originKey: string): void {
 		this.#used.delete(originKey);
 	}

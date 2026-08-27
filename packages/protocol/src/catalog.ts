@@ -228,12 +228,18 @@ export interface WorkRunParams {
 	readonly cwd?: string;
 }
 /**
- * Live config reload: `changed` are the reloadable fields actually applied and
- * `restartRequired` names edited fields that only a restart can apply, so the
- * caller is never told a restart-only field took effect.
+ * Live config reload. `changed` are the reloadable fields actually applied,
+ * `restartRequired` names edited fields only a restart can apply, and `ignored`
+ * names edited fields no code reads at all — so the caller is never told a field
+ * took effect when it did not.
  */
 export type ConfigReloadResult =
-	| { readonly ok: true; readonly changed: readonly string[]; readonly restartRequired: readonly string[] }
+	| {
+			readonly ok: true;
+			readonly changed: readonly string[];
+			readonly restartRequired: readonly string[];
+			readonly ignored: readonly string[];
+	  }
 	| {
 			readonly ok: false;
 			readonly diagnostics: readonly { readonly code: string; readonly message: string }[];

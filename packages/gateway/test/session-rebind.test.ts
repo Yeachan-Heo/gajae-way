@@ -3,13 +3,14 @@ import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { GatewayConfig } from "../src/config";
-import { GjcClient, type GjcPort } from "../src/orchestrator/gjc-client";
+import { GjcClient, type GjcPort, GjcTurnStream } from "../src/orchestrator/gjc-client";
 import {
 	DEFAULT_REBIND_CAP,
 	extractRuntimeError,
 	formatFailureNotice,
 	GjcRuntimeError,
 	isRebindableCode,
+	RebindCapExceededError,
 	rebindableCodeOf,
 	redactSecrets,
 } from "../src/orchestrator/rebind";
@@ -116,6 +117,155 @@ test("the structured error code is parsed out of the runtime envelope, not the m
 	).toEqual({ code: "managed_append_identity_mismatch", message: "cwd" });
 	expect(extractRuntimeError(createSuccess("s1"))).toBeUndefined();
 	expect(extractRuntimeError("not json at all")).toBeUndefined();
+});
+
+test("code normalization is narrow: transport noise is stripped, case is not folded", () => {
+	// The same code with transport noise around it is the same code, and
+	// classification agrees with what the notice shows.
+	expect(extractRuntimeError('{"ok":false,"error":{"code":" resource_gone\u200b","message":"gone"}}')).toEqual({
+		code: "resource_gone",
+		message: "gone",
+	});
+	expect(rebindableCodeOf(new GjcRuntimeError("w", { code: " resource_gone ", message: "gone" }))).toBe(
+		"resource_gone",
+	);
+	// A different code is never assumed to be one of the four.
+	expect(isRebindableCode("RESOURCE_GONE")).toBe(false);
+	expect(isRebindableCode("resource_gone_x")).toBe(false);
+	expect(isRebindableCode("resource_gone")).toBe(true);
+});
+
+/** An assistant reply frame, i.e. a turn that completed. */
+function turnReply(text: string): string {
+	return `${JSON.stringify({ type: "message_end", message: { role: "assistant", content: [{ type: "text", text }] } })}\n`;
+}
+
+/** A turn-level structured error frame, as the ndjson stream renders one. */
+function turnFailure(code: string, message: string): string {
+	return `${JSON.stringify({ type: "error", error: { code, message } })}\n`;
+}
+
+test("only a DECLARED error frame is read as the failure, first one wins", () => {
+	// A per-tool failure reports a tool that failed, not a condemned session key.
+	expect(
+		extractRuntimeError('{"type":"tool_execution_end","error":{"code":"spawn_failed","message":"tool died"}}'),
+	).toBeUndefined();
+	// An ok:true envelope carrying an error field is not an error either.
+	expect(extractRuntimeError('{"ok":true,"error":{"code":"resource_gone","message":"x"}}')).toBeUndefined();
+	// First declared error wins, so a later incidental one cannot overwrite it.
+	const stream = new GjcTurnStream();
+	stream.feed(turnFailure("terminal_uncertain", "the real cause"));
+	stream.feed(turnFailure("resource_gone", "a later frame"));
+	expect(stream.runtimeError).toEqual({ code: "terminal_uncertain", message: "the real cause" });
+});
+
+test("a per-tool error frame does not rebind: a failed tool is not a condemned key", async () => {
+	const { client, database, logs } = await harness([
+		{ stdout: createSuccess("session-e0") },
+		{
+			stdout: `${JSON.stringify({ type: "tool_execution_end", error: { code: "spawn_failed", message: "tool died" } })}\n`,
+			stderr: "the child exited for an unrelated reason",
+			exitCode: 1,
+		},
+	]);
+	try {
+		const { sessionId } = await client.ensureSession("discord:dm:c1");
+		await expect(client.sendTurn(sessionId, "hello")).rejects.toThrow(/unrelated reason/);
+		expect(logs).toEqual([]);
+		expect(database.getSessionRecord("discord:dm:c1")?.epoch).toBe(0);
+	} finally {
+		database.close();
+	}
+});
+
+test("a recurring turn-level rebindable failure spends the cap and then fails explicitly", async () => {
+	// A fresh key always creates, so only a completed TURN may clear the budget.
+	// Otherwise the cap is unreachable and the epoch grows one bump per message.
+	const identityMismatch = {
+		stdout: turnFailure("managed_append_identity_mismatch", "bound session identity no longer matches the cwd"),
+		exitCode: 1,
+	};
+	const { client, database, logs } = await harness([
+		{ stdout: createSuccess("session-e0") },
+		// Each attempt: the turn fails, the rebind creates a fresh session, and the
+		// replay against that fresh session fails the same way.
+		identityMismatch,
+		{ stdout: createSuccess("session-e1") },
+		identityMismatch,
+		identityMismatch,
+		{ stdout: createSuccess("session-e2") },
+		identityMismatch,
+		identityMismatch,
+		{ stdout: createSuccess("session-e3") },
+		identityMismatch,
+		identityMismatch,
+	]);
+	// Resolve the binding the way the server does: epoch read from the store.
+	const currentSession = async () =>
+		(await client.ensureSession("discord:dm:c1", database.getSessionRecord("discord:dm:c1")?.epoch ?? 0)).sessionId;
+	try {
+		for (let attempt = 1; attempt <= DEFAULT_REBIND_CAP; attempt++) {
+			await expect(client.sendTurn(await currentSession(), "hello")).rejects.toMatchObject({
+				code: "managed_append_identity_mismatch",
+			});
+			expect(logs).toHaveLength(attempt);
+		}
+		expect(database.getSessionRecord("discord:dm:c1")?.epoch).toBe(DEFAULT_REBIND_CAP);
+		await expect(client.sendTurn(await currentSession(), "hello")).rejects.toMatchObject({
+			name: "RebindCapExceededError",
+			code: "rebind_cap_exceeded",
+		});
+		// Bounded: the 4th attempt minted no further epoch.
+		expect(logs).toHaveLength(DEFAULT_REBIND_CAP);
+		expect(database.getSessionRecord("discord:dm:c1")?.epoch).toBe(DEFAULT_REBIND_CAP);
+	} finally {
+		database.close();
+	}
+});
+
+test("a completed turn restores the budget, and an explicit /new does too", async () => {
+	const condemned = { stdout: createFailure("resource_gone", "session endpoint record is gone"), exitCode: 1 };
+	const { client, database, logs } = await harness([
+		condemned,
+		{ stdout: createSuccess("session-e1") },
+		{ stdout: turnReply("healthy again") },
+		condemned,
+		{ stdout: createSuccess("session-e2") },
+	]);
+	try {
+		const first = await client.ensureSession("discord:dm:c1");
+		expect(logs).toHaveLength(1);
+		// A completed turn is the proof of health that clears the budget.
+		expect(await client.sendTurn(first.sessionId, "hello")).toBe("healthy again");
+		client.forgetRebinds("discord:dm:c1");
+		// Budget restored, so a later rebindable failure is still allowed to rebind.
+		await client.ensureSession("discord:dm:c2");
+		expect(logs).toHaveLength(2);
+		expect(database.getSessionRecord("discord:dm:c2")?.epoch).toBe(1);
+	} finally {
+		database.close();
+	}
+});
+
+test("a turn that already ran a tool is NOT replayed after the rebind", async () => {
+	// The persona has full tool access; replaying a half-executed turn re-runs
+	// real side effects, so the gateway rebinds but surfaces the failure.
+	const startedWork = `${JSON.stringify({ type: "tool_execution_start" })}\n${turnFailure("managed_append_identity_mismatch", "identity moved")}`;
+	const { client, database, logs, commands } = await harness([
+		{ stdout: createSuccess("session-e0") },
+		{ stdout: startedWork, exitCode: 1 },
+		{ stdout: createSuccess("session-e1") },
+	]);
+	try {
+		const { sessionId } = await client.ensureSession("discord:dm:c1");
+		await expect(client.sendTurn(sessionId, "hello")).rejects.toThrow(/not replayed because it had already run 1 tool/);
+		// Rebound so the NEXT turn works, but the turn itself was not re-run.
+		expect(logs).toHaveLength(1);
+		expect(database.getSessionRecord("discord:dm:c1")).toEqual({ sessionId: "session-e1", epoch: 1 });
+		expect(commands).toHaveLength(3);
+	} finally {
+		database.close();
+	}
 });
 
 test.each(REBINDABLE)("a %s create failure bumps the epoch once, persists it, and retries", async (code, message) => {
@@ -286,6 +436,68 @@ test("secret-looking values are redacted while the diagnostic code survives", ()
 	expect(redactSecrets("unsupported_state_version: state version 9 is unsupported")).toBe(
 		"unsupported_state_version: state version 9 is unsupported",
 	);
+});
+
+test("bare header tokens and underscore-form vendor keys are redacted too", () => {
+	const cases = [
+		"startup rejected by Authorization: Bearer abcDEF123456ghiJKL",
+		"proxy said Basic YWRtaW46c3VwZXJzZWNyZXQx",
+		"key sk_live_deadbeefcafebabe0123456789 was refused",
+		"credential=hunter2hunter2hunter2 rejected",
+	];
+	for (const message of cases) {
+		const notice = formatFailureNotice(new GjcRuntimeError("wrapped", { code: "spawn_failed", message }));
+		expect(notice).toContain("spawn_failed");
+		expect(notice).toContain("[redacted]");
+		for (const leak of [
+			"abcDEF123456ghiJKL",
+			"YWRtaW46c3VwZXJzZWNyZXQx",
+			"deadbeefcafebabe0123456789",
+			"hunter2hunter2hunter2",
+		])
+			expect(notice).not.toContain(leak);
+	}
+});
+
+test("a secret pasted into the CODE field is redacted, and a runaway code is bounded", () => {
+	const leaked = formatFailureNotice(
+		new GjcRuntimeError("wrapped", { code: "sk_live_deadbeefcafebabe0123456789", message: "startup failed" }),
+	);
+	expect(leaked).not.toContain("deadbeefcafebabe0123456789");
+	expect(leaked).toContain("[redacted]");
+	const runaway = formatFailureNotice(
+		new GjcRuntimeError("wrapped", { code: "x".repeat(4000), message: "startup failed" }),
+	);
+	// Bounded for a chat surface rather than shipping a 4000-character code.
+	expect(runaway.length).toBeLessThan(400);
+	expect(runaway).toContain("…");
+});
+
+test("an unfamiliar code shape is still REPORTED, but never classified rebindable", () => {
+	const error = new GjcRuntimeError("wrapped", { code: "Runtime.Error-42", message: "state moved" });
+	expect(formatFailureNotice(error)).toBe("[turn failed] Runtime.Error-42: state moved");
+	expect(rebindableCodeOf(error)).toBeUndefined();
+	expect(extractRuntimeError('{"ok":false,"error":{"code":"Runtime.Error-42","message":"state moved"}}')).toEqual({
+		code: "Runtime.Error-42",
+		message: "state moved",
+	});
+});
+
+test("an empty runtime message never erases the notice to a bare [turn failed]", () => {
+	// A killed or crashed child produces exactly this: an exit code and no message.
+	const killed = formatFailureNotice(new GjcRuntimeError("gjc turn exited 137: ", { message: "" }));
+	expect(killed).toBe("[turn failed] gjc turn exited 137:");
+	const nothing = formatFailureNotice(new GjcRuntimeError("", { message: "   " }));
+	expect(nothing).toBe("[turn failed] the runtime produced no diagnosis");
+	expect(formatFailureNotice(new Error(""))).toBe("[turn failed] the runtime produced no diagnosis");
+});
+
+test("the cap-exceeded failure keeps a usable remedy instead of shipping a dead end", () => {
+	const notice = formatFailureNotice(
+		new RebindCapExceededError("discord:dm:c1", DEFAULT_REBIND_CAP, "resource_gone", 3),
+	);
+	expect(notice).toContain("rebind_cap_exceeded");
+	expect(notice).toContain("Send /new to rebind this conversation.");
 });
 
 test("a failed platform turn delivers the runtime code and message in the notice", async () => {

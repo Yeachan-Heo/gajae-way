@@ -2,7 +2,7 @@ import { afterEach, expect, test } from "bun:test";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { loadConfig, RELOADABLE_FIELDS, RESTART_REQUIRED_FIELDS, reloadConfig } from "../src/config";
+import { loadConfig, RELOADABLE_FIELDS, RESTART_REQUIRED_FIELDS, reloadConfig, UNCONSUMED_FIELDS } from "../src/config";
 import type { GjcPort } from "../src/orchestrator/gjc-client";
 import { type GatewayServer, startUnixServer } from "../src/server/server";
 import { GatewayDatabase } from "../src/store/db";
@@ -35,6 +35,7 @@ interface ServerFrame {
 		readonly ok?: boolean;
 		readonly changed?: readonly string[];
 		readonly restartRequired?: readonly string[];
+		readonly ignored?: readonly string[];
 		readonly diagnostics?: readonly { readonly code: string; readonly message: string }[];
 		readonly engaged?: boolean;
 		readonly pid?: number;
@@ -97,16 +98,91 @@ async function daemon(initial: Record<string, unknown>): Promise<{ client: Clien
 	return { client, home: directory, socketPath: config.socketPath };
 }
 
-test("the reloadable set is honest: only fields with no live resource binding", () => {
+test("the partition is honest and exhaustive: live, restart-only, or unconsumed", () => {
 	// mentionAllowlist and channels are what the operator actually needs live;
 	// they are read per request by the dispatch path.
 	expect(RELOADABLE_FIELDS).toContain("mentionAllowlist");
 	expect(RELOADABLE_FIELDS).toContain("channels");
 	// Anything bound to a listener, an open database, or the constructed gjc
-	// client is restart-only, and the two sets never overlap.
+	// client is restart-only, and the sets never overlap.
 	for (const field of RESTART_REQUIRED_FIELDS) expect(RELOADABLE_FIELDS).not.toContain(field);
+	for (const field of UNCONSUMED_FIELDS) {
+		expect(RELOADABLE_FIELDS).not.toContain(field);
+		expect(RESTART_REQUIRED_FIELDS).not.toContain(field);
+	}
 	expect(RESTART_REQUIRED_FIELDS).toContain("socketPath");
 	expect(RESTART_REQUIRED_FIELDS).toContain("turnTimeoutMs");
+	// logVerbosity is parsed but read by nothing, so claiming it was applied
+	// would be a false report; it is declared unconsumed instead.
+	expect(UNCONSUMED_FIELDS).toContain("logVerbosity");
+	expect(RELOADABLE_FIELDS).not.toContain("logVerbosity");
+});
+
+test("an edit to an unconsumed field is reported as ignored, never as applied", async () => {
+	directory = await mkdtemp(join(tmpdir(), "gajaeway-reload-"));
+	await writeConfig(directory, { schemaVersion: 1, logVerbosity: "info", mentionAllowlist: ["owner"] });
+	const current = await loadConfig({ home: directory });
+	await writeConfig(directory, { schemaVersion: 1, logVerbosity: "debug", mentionAllowlist: ["owner"] });
+	const result = await reloadConfig(current);
+	expect(result.ok).toBe(true);
+	if (!result.ok) return;
+	expect(result.changed).toEqual([]);
+	expect(result.restartRequired).toEqual([]);
+	expect(result.ignored).toEqual(["logVerbosity"]);
+});
+
+test("a missing config file is fail-safe: the previous policy is retained", async () => {
+	// Regression: reloading a deleted config used to publish defaults, dropping
+	// mentionAllowlist and channels and opening a mention-gated room to anyone.
+	directory = await mkdtemp(join(tmpdir(), "gajaeway-reload-"));
+	await writeConfig(directory, {
+		schemaVersion: 1,
+		mentionAllowlist: ["owner"],
+		channels: { "discord:c1": { engagement: "open" } },
+	});
+	const current = await loadConfig({ home: directory });
+	await rm(join(directory, "config.json"));
+	const vanished = await reloadConfig(current);
+	expect(vanished.ok).toBe(false);
+	if (vanished.ok) return;
+	expect(vanished.config).toBe(current);
+	expect(vanished.config.mentionAllowlist).toEqual(["owner"]);
+	expect(vanished.diagnostics[0]?.message).toContain("missing or unreadable");
+	// A directory in the config's place is the same fail-closed path.
+	await Bun.write(join(directory, "config.json", "placeholder"), "x");
+	const directoryInstead = await reloadConfig(current);
+	expect(directoryInstead.ok).toBe(false);
+	if (directoryInstead.ok) return;
+	expect(directoryInstead.config.mentionAllowlist).toEqual(["owner"]);
+});
+
+test("over the socket, a vanished config cannot widen a mention-gated room", async () => {
+	const { client, home } = await daemon({ mentionAllowlist: ["owner"], channels: {} });
+	const groupSend = (id: string, authorId: string) =>
+		client.send({
+			v: "0.1",
+			type: "request",
+			id,
+			verb: "chat.send",
+			params: {
+				origin: { platform: "discord", kind: "channel", conversationId: "c1" },
+				text: "hello",
+				messageId: `m-${id}`,
+				engagement: { mentioned: true, group: true, authorId },
+			},
+		});
+	groupSend("before", "stranger");
+	await waitFor(client.frames, 2);
+	expect(resultOf(client.frames, 1).engaged).toBe(false);
+	await rm(join(home, "config.json"));
+	client.send({ v: "0.1", type: "request", id: "reload", verb: "gateway.reloadConfig" });
+	await waitFor(client.frames, 3);
+	expect(resultOf(client.frames, 2).ok).toBe(false);
+	// Still gated: the stranger must not have been let in by an unreadable file.
+	groupSend("after", "stranger");
+	await waitFor(client.frames, 4);
+	expect(resultOf(client.frames, 3).engaged).toBe(false);
+	client.close();
 });
 
 test("a reloadable field is applied while a restart-only edit is reported and NOT applied", async () => {

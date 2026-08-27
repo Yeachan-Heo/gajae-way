@@ -88,7 +88,7 @@ async function applyConfigReload(
 	}
 	runtime.config = result.config;
 	console.error(
-		`gateway config reload (${trigger}) ok; applied=[${result.changed.join(",")}] restart-required=[${result.restartRequired.join(",")}]`,
+		`gateway config reload (${trigger}) ok; applied=[${result.changed.join(",")}] restart-required=[${result.restartRequired.join(",")}] ignored=[${result.ignored.join(",")}]`,
 	);
 	return result;
 }
@@ -129,7 +129,12 @@ export async function startUnixServer(options: GatewayServerOptions): Promise<Ga
 	// SIGHUP is what an operator reaches for; the reload verb is the same code path
 	// for the console. Registered here and removed on stop so the handler never
 	// outlives the daemon it belongs to.
-	const onHup = () => void applyConfigReload(runtime, options, "SIGHUP");
+	const onHup = () =>
+		void applyConfigReload(runtime, options, "SIGHUP").catch((error: unknown) =>
+			console.error(
+				`gateway config reload (SIGHUP) crashed: ${error instanceof Error ? error.message : String(error)}`,
+			),
+		);
 	process.on("SIGHUP", onHup);
 	// Concurrent stop() calls (shutdown verb + owner teardown) must all await the
 	// SAME settling run: an early-returning duplicate let callers proceed while
@@ -358,7 +363,7 @@ async function handleRequest(
 				type: "response",
 				id: request.id,
 				result: result.ok
-					? { ok: true, changed: result.changed, restartRequired: result.restartRequired }
+					? { ok: true, changed: result.changed, restartRequired: result.restartRequired, ignored: result.ignored }
 					: { ok: false, diagnostics: result.diagnostics },
 			});
 			return;
@@ -600,6 +605,10 @@ async function sendChat(
 			return;
 		}
 		options.database.withTransaction(() => options.database.bumpEpoch(key, JSON.stringify(origin)));
+		// An explicit reset is the manual form of a rebind, so it also restores the
+		// automatic rebind budget: otherwise an origin that spent its cap would stay
+		// capped even after the operator did exactly what the notice asked for.
+		options.gjc.forgetRebinds?.(key);
 		const payload = {
 			turnId: crypto.randomUUID(),
 			origin,

@@ -74,6 +74,13 @@ export type ReloadResult =
 			 * pretends to apply a restart-only field is worse than refusing.
 			 */
 			readonly restartRequired: readonly string[];
+			/**
+			 * Fields the operator edited that no code reads at all, so the edit has
+			 * no effect and no restart would give it one. Reported rather than
+			 * counted as applied, because claiming to apply a field nothing consumes
+			 * is the same operator lie in a quieter form.
+			 */
+			readonly ignored: readonly string[];
 	  }
 	| { readonly ok: false; readonly config: GatewayConfig; readonly diagnostics: readonly ReloadDiagnostic[] };
 
@@ -255,6 +262,22 @@ export async function loadConfig(
  * silently ignored or half-honoured.
  */
 export async function reloadConfig(current: GatewayConfig, overrides: ConfigOverrides = {}): Promise<ReloadResult> {
+	// A missing or unreadable config.json is NOT "no configuration": at boot it
+	// legitimately means defaults, but on reload it would silently publish those
+	// defaults over live policy — dropping mentionAllowlist and channels, which
+	// opens a mention-gated room to anyone. An unreadable file is exactly when the
+	// previous config must be retained.
+	if (!(await Bun.file(current.configPath).exists()))
+		return {
+			ok: false,
+			config: current,
+			diagnostics: [
+				{
+					code: "config_invalid",
+					message: `${current.configPath} is missing or unreadable; keeping the previous configuration`,
+				},
+			],
+		};
 	let candidate: GatewayConfig;
 	try {
 		candidate = await loadConfig({ home: current.home, overrides });
@@ -267,26 +290,28 @@ export async function reloadConfig(current: GatewayConfig, overrides: ConfigOver
 	}
 	const changed = RELOADABLE_FIELDS.filter((field) => !Bun.deepEquals(candidate[field], current[field]));
 	const restartRequired = RESTART_REQUIRED_FIELDS.filter((field) => !Bun.deepEquals(candidate[field], current[field]));
+	const ignored = UNCONSUMED_FIELDS.filter((field) => !Bun.deepEquals(candidate[field], current[field]));
 	const next: Record<string, unknown> = { ...current };
 	for (const field of RELOADABLE_FIELDS) {
 		if (candidate[field] === undefined) delete next[field];
 		else next[field] = candidate[field];
 	}
-	return { ok: true, config: next as unknown as GatewayConfig, changed, restartRequired };
+	return { ok: true, config: next as unknown as GatewayConfig, changed, restartRequired, ignored };
 }
 
 /**
- * Fields that are genuinely re-read at runtime, verified against their consumers:
- * `mentionAllowlist` and `channels` are read per request by the chat dispatch
- * path (engagement policy and inbound debounce), `debounceMs` likewise, and
- * `logVerbosity` is plain config state with no bound resource.
+ * Fields genuinely re-read at runtime, each verified against a real consumer:
+ * `mentionAllowlist` (server.ts chat dispatch + engagement/policy.ts),
+ * `channels` (engagement/policy.ts + debounceFor), and `debounceMs`
+ * (debounceFor). A change to one of these takes effect on the next turn.
  */
-export const RELOADABLE_FIELDS = ["logVerbosity", "mentionAllowlist", "channels", "debounceMs"] as const;
+export const RELOADABLE_FIELDS = ["mentionAllowlist", "channels", "debounceMs"] as const;
 
 /**
  * Fields bound to a live resource at startup — a listening socket, an open
  * database, the constructed gjc client, a running webhook/watcher, the monitor
  * propagator's owner target — and therefore only changeable by a restart.
+ * `credentials` belongs here because the adapters read it when they start.
  */
 export const RESTART_REQUIRED_FIELDS = [
 	"socketPath",
@@ -299,6 +324,28 @@ export const RESTART_REQUIRED_FIELDS = [
 	"scriptRoot",
 	"ownerTarget",
 ] as const;
+
+/**
+ * Parsed and validated, but read by nothing: `logVerbosity` has no consumer in
+ * any package (every log site is an unconditional console call). Editing it can
+ * therefore neither be applied nor fixed by a restart, so a reload reports it as
+ * ignored instead of claiming `applied=[logVerbosity]` for a no-op.
+ */
+export const UNCONSUMED_FIELDS = ["logVerbosity"] as const;
+
+/**
+ * Compile-time proof that every config field is classified. Add a field to
+ * GatewayConfigFile without deciding whether it is live, restart-only, or
+ * unconsumed and this stops building — silently ignoring an edited field is the
+ * behaviour the reload path exists to eliminate.
+ */
+type ClassifiedField =
+	| (typeof RELOADABLE_FIELDS)[number]
+	| (typeof RESTART_REQUIRED_FIELDS)[number]
+	| (typeof UNCONSUMED_FIELDS)[number]
+	| "schemaVersion";
+export type UnclassifiedConfigField = Exclude<keyof GatewayConfigFile, ClassifiedField>;
+export const CONFIG_PARTITION_IS_EXHAUSTIVE: UnclassifiedConfigField extends never ? true : false = true;
 
 export function configDirectory(config: GatewayConfig): string {
 	return dirname(config.configPath);

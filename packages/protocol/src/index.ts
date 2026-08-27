@@ -4,6 +4,7 @@ export {
 	type ChatProgressPayload,
 	type ChatSendParams,
 	type ChatSendResult,
+	type ConfigReloadResult,
 	type DeliveryConfirmParams,
 	type DeliveryFailParams,
 	type EngagementContext,
