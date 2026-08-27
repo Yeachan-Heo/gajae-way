@@ -1,7 +1,7 @@
 {
  "kind": "api-package-test-report",
  "schemaVersion": 1,
- "frozenCommit": "6ac3009 (round-4+5 fixes + origin/main merge; full suite re-run at this exact tree: bun x tsc --noEmit exit 0, bun test packages/ 916 pass / 0 fail / 2 skip, bunx biome ci packages/ exit 0)",
+ "frozenCommit": "7626939 (round-4+5 fixes, origin/main merge, audited resume acknowledgement; full suite re-run at this exact tree: bun x tsc --noEmit exit 0, bun test packages/ 918 pass / 0 fail / 2 skip, bunx biome ci packages/ exit 0)",
  "producedBy": "ultragoal leader after terminal-critic REJECT rounds 1-3; each round's blockers were fixed in code and this report was updated in the same series (report-only commits change no executable code)",
  "rerunCommands": [
   "bun install --frozen-lockfile (clean, 43 installs checked)",
@@ -97,6 +97,7 @@
   "baseline HEAD stored as context (baselineSha), never a checkpoint; checkpoints only record observed HEAD moves past baseline",
   "gateway uses hasNewCommit for classification; ended attempts without a new HEAD increment stalledContinuations (stalled), and the stalled hold is sticky like awaiting_operator (resume:true required)",
   "jobId injective AND schema-bounded: lanejob-<hex of exact UTF-8 name> fits the 128-char id alphabet for every accepted 64-byte name",
-  "planContinuation stalled budget gate passes record.baselineSha into the repository facts: at a full stall budget with zero checkpoints, a HEAD that moved past the baseline is progress (not a hold); adversarial test added"
+  "planContinuation stalled budget gate passes record.baselineSha into the repository facts: at a full stall budget with zero checkpoints, a HEAD that moved past the baseline is progress (not a hold); adversarial test added",
+  "resume durably clears the stalled/awaiting_operator hold via audited acknowledgeHold before the new attempt; adversarial server test proves stall -> held -> resume runs -> next ordinary call not held"
  ]
 }
