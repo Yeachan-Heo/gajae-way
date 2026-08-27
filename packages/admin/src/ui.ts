@@ -17,7 +17,7 @@
  * existing anywhere.
  */
 
-import { formatDuration } from "./format";
+import { formatClock, formatClockSeconds, formatDuration } from "./format";
 import type { MutationOperation } from "./gate";
 import { TURN_CEILING_MS, TURN_STALL_MS } from "./turns";
 import type { ConsoleSnapshot, Panel, RowView } from "./view";
@@ -31,21 +31,43 @@ function escapeHtml(value: string): string {
 		.replaceAll("'", "&#39;");
 }
 
-/** `11m ago`; mirrored byte-for-byte by `relative()` in the client script. */
-function relative(iso: string, at: Date): string {
+/**
+ * `11m ago`. Takes epoch milliseconds rather than a Date because this exact
+ * function is also shipped into the page (see SHARED_SOURCE) and the client
+ * only ever has a millisecond clock.
+ */
+function relative(iso: string, atMs: number): string {
 	const then = new Date(iso).getTime();
 	if (Number.isNaN(then)) return "—";
-	const diff = at.getTime() - then;
+	const diff = atMs - then;
 	if (diff < 10_000) return "just now";
 	return `${formatDuration(diff)} ago`;
 }
+
+/**
+ * One algorithm, two runtimes.
+ *
+ * Ages tick in the browser, so the client cannot ask the server to re-render
+ * "11m ago" every second - it must compute durations itself. Restating the
+ * algorithm in the client script is the obvious way to do that and it is a trap:
+ * the hand-written mirror had already drifted from `formatDuration` by one
+ * commit, which would have made every age change format one second after load.
+ * So the real implementations are serialised into the page instead. There is
+ * exactly one duration algorithm in this package.
+ */
+const SHARED_SOURCE = [
+	`var formatDuration = ${formatDuration.toString()};`,
+	`var formatClock = ${formatClock.toString()};`,
+	`var formatClockSeconds = ${formatClockSeconds.toString()};`,
+	`var relative = ${relative.toString()};`,
+].join("\n");
 
 type Ctx = { readonly at: Date };
 
 /** One field cell, filled from the row or left empty to serve as the template. */
 function cell(row: RowView | null, name: string, className: string, ctx: Ctx, tag = "span"): string {
 	const iso = row?.ages?.[name];
-	const value = iso ? relative(iso, ctx.at) : (row?.fields[name] ?? "");
+	const value = iso ? relative(iso, ctx.at.getTime()) : (row?.fields[name] ?? "");
 	const tone = row?.tones?.[name];
 	const attrs = [
 		`class="${className}"`,
@@ -507,39 +529,19 @@ footer{
 @media (prefers-reduced-motion: reduce){ *{ transition:none !important; animation:none !important; } }
 `;
 
-const SCRIPT = String.raw`
+const SCRIPT_BODY = String.raw`
 "use strict";
 (function(){
+__SHARED__
   var boot = document.getElementById("bootstrap");
   if (!boot) return;
   var snapshot = JSON.parse(boot.textContent || "{}");
   var meta = JSON.parse((document.getElementById("ops-meta") || {}).textContent || "{}");
   var operations = meta.operations || [];
 
-  /* ---- formatting: the exact mirror of src/format.ts ------------------- */
-
-  function formatDuration(ms){
-    var total = Math.max(0, Math.round(ms / 1000));
-    var days = Math.floor(total / 86400);
-    var hours = Math.floor((total % 86400) / 3600);
-    var minutes = Math.floor((total % 3600) / 60);
-    var seconds = total % 60;
-    if (days > 0) return days + "d " + hours + "h";
-    if (hours > 0) return hours + "h " + minutes + "m";
-    if (minutes > 0) return minutes + "m " + seconds + "s";
-    return seconds + "s";
-  }
-  function relative(iso, at){
-    var then = new Date(iso).getTime();
-    if (isNaN(then)) return "\u2014";
-    var diff = at - then;
-    if (diff < 10000) return "just now";
-    return formatDuration(diff) + " ago";
-  }
-  function clock(at){
-    function pad(n){ return String(n).padStart(2, "0"); }
-    return pad(at.getHours()) + ":" + pad(at.getMinutes()) + ":" + pad(at.getSeconds());
-  }
+  /* ---- formatting ------------------------------------------------------ */
+  /* The duration and clock helpers are not restated here; they are injected
+     above from src/format.ts, so one algorithm serves both runtimes. */
 
   /* ---- DOM writes: only what differs ---------------------------------- */
 
@@ -632,7 +634,7 @@ const SCRIPT = String.raw`
   var stopping = false;
 
   function streamMessage(){
-    var origin = snapshot.at ? clock(new Date(snapshot.at)) : "??:??:??";
+    var origin = snapshot.at ? formatClockSeconds(new Date(snapshot.at)) : "??:??:??";
     if (stopping) return { tone: "danger", text: "\u26a0 gateway is stopping \u2014 showing data from " + origin };
     if (snapshot.gateway && snapshot.gateway.reachable === false) {
       return { tone: "danger", text: "\u26a0 gateway unreachable \u2014 the daemon may be down. Data from " + origin };
@@ -1009,7 +1011,7 @@ ${operationsPanel(operations, mutationsEnabled, ctx)}
 </footer>
 <script type="application/json" id="bootstrap">${JSON.stringify(snapshot).replaceAll("<", "\\u003c")}</script>
 <script type="application/json" id="ops-meta">${JSON.stringify({ operations, mutationsEnabled }).replaceAll("<", "\\u003c")}</script>
-<script>${SCRIPT}</script>
+<script>${SCRIPT_BODY.replace("__SHARED__", SHARED_SOURCE)}</script>
 </body>
 </html>`;
 }
