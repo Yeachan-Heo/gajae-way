@@ -103,9 +103,23 @@ const CODE_LIMIT = 64;
 
 function normalizeCode(value: unknown): string | undefined {
 	if (typeof value !== "string") return undefined;
-	const cleaned = value.replace(/\p{C}/gu, "").trim();
+	const cleaned = stripControl(value).trim();
 	if (!cleaned) return undefined;
 	return cleaned.length > CODE_LIMIT ? `${cleaned.slice(0, CODE_LIMIT)}…` : cleaned;
+}
+
+/**
+ * Removes transport control characters so they cannot be used to smuggle a
+ * secret past the redactor: `sk_live_\u0000deadbeef…` matches no key pattern
+ * while the NUL is present, and stripping it afterwards would reassemble the
+ * key in the clear. Normalization therefore always runs BEFORE redaction.
+ * Newlines and tabs are kept for messages, which carry real structure; a code is
+ * a single token and keeps nothing.
+ */
+function stripControl(text: string, keepWhitespace = false): string {
+	return text.replace(/\p{C}/gu, (character) =>
+		keepWhitespace && (character === "\n" || character === "\t") ? character : "",
+	);
 }
 
 /**
@@ -151,19 +165,6 @@ export function runtimeErrorOfEnvelope(envelope: unknown): RuntimeErrorDetail | 
 	const message = typeof candidate.message === "string" && candidate.message.length > 0 ? candidate.message : undefined;
 	if (!code && !message) return undefined;
 	return { ...(code ? { code } : {}), ...(message ? { message } : {}) };
-}
-
-/**
- * Removes transport control characters so they cannot be used to smuggle a
- * secret past the redactor: `sk_live_\u0000deadbeef…` matches no key pattern
- * while the NUL is present, and stripping it afterwards would reassemble the
- * key in the clear. Normalization therefore always runs BEFORE redaction.
- * Newlines and tabs survive in messages because they carry real structure.
- */
-function stripControl(text: string, keepWhitespace = false): string {
-	return text.replace(/\p{C}/gu, (character) =>
-		keepWhitespace && (character === "\n" || character === "\t") ? character : "",
-	);
 }
 
 /**
