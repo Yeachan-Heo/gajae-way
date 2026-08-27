@@ -32,7 +32,7 @@ import { PersonaLoader } from "../persona/persona";
 import type { GatewayDatabase, InboundMessageRow } from "../store/db";
 import { DeliveryLedger } from "../store/ledger";
 import { KeyedQueue } from "./keyed-queue";
-import { composeSpeakerLabel } from "./speaker";
+import { composeSpeakerLabel, composeTurnHeader } from "./speaker";
 
 interface Connection {
 	readonly decoder: FrameDecoder;
@@ -702,6 +702,12 @@ async function runInboundTurn(
 				authorHandle?: string;
 				channelLabel?: string;
 				serverLabel?: string;
+				replyTo?: {
+					messageId?: string;
+					authorName?: string;
+					fromSelf?: boolean;
+					excerpt?: string;
+				};
 			})
 		: undefined;
 	const speaker = composeSpeakerLabel(engagement);
@@ -722,7 +728,7 @@ async function runInboundTurn(
 		const header = lines.length
 			? `[Unread messages in this conversation since your last reply]\n${lines.join("\n")}\n\n`
 			: "";
-		turnText = `${header}${speaker ? `[${speaker} | ${place} (author:${engagement?.authorId ?? "?"}, msg:${row.message_id})]\n` : ""}${userText}`;
+		turnText = `${header}${speaker ? `${composeTurnHeader({ speaker, place, authorId: engagement?.authorId, messageId: row.message_id, engagement })}\n` : ""}${userText}`;
 		options.database.contextConsume([...unread.map((entry) => entry.message_id), row.message_id]);
 	}
 	let text: string;

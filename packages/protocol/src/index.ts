@@ -20,6 +20,7 @@ export {
 	type MonitorSpec,
 	type MonitorTestParams,
 	type RecallSnippet,
+	type ReplyContext,
 	type SessionListResult,
 	type SessionRecallParams,
 	type SessionRecallResult,
