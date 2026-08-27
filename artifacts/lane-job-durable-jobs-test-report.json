@@ -1,0 +1,67 @@
+{
+	"kind": "api-package-test-report",
+	"schemaVersion": 1,
+	"frozenCommit": "ff101e1 (exact head of feat/issue-10-lane-jobs-takeover; branch code validated at 523c57f and targeted suites re-run after adding only this report; merge-base origin/main 6bd9759)",
+	"producedBy": "ultragoal leader; executor QA lane satisfied inline with real command runs recorded verbatim below",
+	"rerunCommands": [
+		"bun install --frozen-lockfile (clean, 43 installs checked)",
+		"bun x tsc --noEmit (exit 0)",
+		"bun test packages/ (887 pass / 2 skip / 0 fail, 71 files)",
+		"bun x biome ci packages/ (exit 0 after formatting monitor-batched-recovery.test.ts)",
+		"bun test packages/subsession/test/job.test.ts (26 adversarial job tests: restart-from-JSON recovery, late commit after terminal accounting, corrupt/unknown-schema rejection, duplicate attempt opRef guard, MAX_STALLED_CONTINUATIONS stall-bound escalation, summary.completed regression, repo-first evidence precedence)",
+		"bun test packages/gateway/test/lane-job-store.test.ts (3 store tests: schema v10 fresh open, deadline-killed cycle across close/reopen on one deployment path, truncated record_json surfaced not repaired)"
+	],
+	"subject": "Issue #10 durable lane jobs: packages/subsession LaneJobRecord v1 (fail-closed parse, repository-first checkpoints, attempt_ended projection for prompt_deadline_exceeded, #9 evidence classes verbatim, single-path continuation planner with operator holds preserved) plus gateway migration v10 lane_jobs persistence.",
+	"cases": [
+		{
+			"id": "QA-JOB-01",
+			"contractRef": "Issue #10 requirement 7: fail closed on unknown/corrupt durable state",
+			"invocation": "bun test packages/subsession/test/job.test.ts -t 'schema'",
+			"expected": "unknown schemaVersion / corrupt JSON / non-canonical state / duplicated opRefs / decreasing checkpoints all throw LaneJobError",
+			"observed": "all rejection paths throw; valid round-trip equals the written record",
+			"verdict": "passed"
+		},
+		{
+			"id": "QA-JOB-02",
+			"contractRef": "Issue #10 requirement 5: report recoverable without reply body",
+			"invocation": "bun test packages/subsession/test/job.test.ts -t 'repository-first'",
+			"expected": "HEAD move appends a checkpoint even when the reply body is empty; late commit after terminal accounting becomes a checkpoint on next reconciliation",
+			"observed": "both shapes reproduce the measured #9 lanes and recover evidence from repository state alone",
+			"verdict": "passed"
+		},
+		{
+			"id": "QA-JOB-03",
+			"contractRef": "Issue #10 requirement 6: genuine terminal_uncertain keeps an explicit operator hold",
+			"invocation": "bun test packages/subsession/test/job.test.ts -t 'uncertain'",
+			"expected": "status unknown / receiptState missing project to awaiting_operator with an escalation trail entry naming the op-ref",
+			"observed": "awaiting_operator forced; escalations contain the hold record; continuation planner refuses to override",
+			"verdict": "passed"
+		},
+		{
+			"id": "QA-JOB-04",
+			"contractRef": "Issue #10 requirement 7: no duplicate attempts or runaway resume loops",
+			"invocation": "bun test packages/subsession/test/job.test.ts -t 'stalled'",
+			"expected": "continuations without HEAD moves accumulate; at MAX_STALLED_CONTINUATIONS the planner returns hold_for_operator",
+			"observed": "budget gate trips at the bound; duplicate opRef append and double close both throw",
+			"verdict": "passed"
+		},
+		{
+			"id": "QA-STORE-01",
+			"contractRef": "Migration safety: lane_jobs survives gateway restart from SQLite alone",
+			"invocation": "bun test packages/gateway/test/lane-job-store.test.ts -t 'restart'",
+			"expected": "record written before process close is fully revived (attempts, checkpoints, evidence class, continuation plan) after reopen",
+			"observed": "revived record matches; classifyWorkEvidence returns work_committed_report_lost; planContinuation returns continue_same_session",
+			"verdict": "passed"
+		},
+		{
+			"id": "QA-STORE-02",
+			"contractRef": "#9 regression: summary.completed is never a success verdict",
+			"invocation": "bun test packages/subsession/test/job.test.ts -t 'summary.completed'",
+			"expected": "failed + prompt_deadline_exceeded with summary.completed true never projects to completed",
+			"observed": "projection is attempt_ended; no decision path reads summaryCompleted",
+			"verdict": "passed"
+		}
+	],
+	"residuals": [],
+	"blockers": []
+}
