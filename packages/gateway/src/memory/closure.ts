@@ -104,7 +104,12 @@ export class MemoryClosureQueue {
 		let commit = existing;
 		if (!commit) {
 			if (state !== "written") throw new Error(`memory intent ${intent.id} lacks recoverable written evidence`);
-			await memoryGit(root, ["add", "MEMORY.md", "daily"]);
+			// Stage the whole corpus, not just the capture axis. Every registered axis —
+			// built-in, custom, or an axis a human curated by hand — is memory, so a
+			// reflection or an ops rule written between two captures would otherwise stay
+			// permanently untracked and drop out of the Git history the doctrine promises
+			// to review. Naming axes here would also silently miss any axis added later.
+			await memoryGit(root, ["add", "--all", "."]);
 			await memoryGit(root, ["commit", "-m", `Memory mutation\n\nGajaeway-Mutation-Id: ${intent.id}`]);
 			commit = await this.#commitFor(root, intent.id);
 			if (!commit) throw new Error(`memory intent ${intent.id} commit trailer missing`);
