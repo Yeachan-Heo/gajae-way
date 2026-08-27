@@ -2,7 +2,9 @@ import { describe, expect, test } from "bun:test";
 import type { CliResult, ControllerOptions } from "../src/cli";
 import {
 	assertNoRetentionGap,
+	expandEntry,
 	fetchLastAssistant,
+	listTranscript,
 	RetentionGapError,
 	TranscriptIncompleteError,
 } from "../src/transcript";
@@ -97,5 +99,76 @@ describe("assertNoRetentionGap", () => {
 		} catch (error) {
 			expect((error as Error).message).toMatch(/reconcile the operation with status/);
 		}
+	});
+});
+
+describe("full-body expansion ladder", () => {
+	test("transcript.list follows the cursor and normalises entries", async () => {
+		const calls: string[][] = [];
+		const options = pagedController(
+			[
+				{ entries: [{ id: "a", kind: "assistant" }], page: { complete: false, cursor: "c1" } },
+				{ entries: [{ id: "b", artifactId: "art-1" }, { nope: true }], page: { complete: true } },
+			],
+			calls,
+		);
+		const entries = await listTranscript(options, SESSION);
+		expect(entries).toEqual([
+			{ id: "a", kind: "assistant" },
+			{ id: "b", artifactId: "art-1" },
+		]);
+		expect(calls[0]).toContain("transcript.list");
+		expect(calls[1]?.slice(-2)).toEqual(["--cursor", "c1"]);
+	});
+
+	test("transcript.list refuses an incomplete page with no cursor", async () => {
+		const options = pagedController([{ entries: [], page: { complete: false } }]);
+		await expect(listTranscript(options, SESSION)).rejects.toBeInstanceOf(TranscriptIncompleteError);
+	});
+
+	test("an inline body short-circuits the ladder", async () => {
+		const calls: string[][] = [];
+		const options = pagedController([{ text: "inline" }], calls);
+		const expanded = await expandEntry(options, SESSION, { id: "a", artifactId: "art-1" });
+		expect(expanded).toMatchObject({ text: "inline", source: "transcript.body" });
+		expect(calls).toHaveLength(1);
+	});
+
+	test("falls through to resource.body then artifact.read in order", async () => {
+		const calls: string[][] = [];
+		let index = 0;
+		const options: ControllerOptions = {
+			repo: WORKTREE,
+			run: async (args) => {
+				calls.push([...args]);
+				index += 1;
+				if (index === 1) return envelope({});
+				if (index === 2) return envelope({});
+				return envelope({ body: "from-artifact" });
+			},
+		};
+		const expanded = await expandEntry(options, SESSION, {
+			id: "a",
+			resourceId: "res-1",
+			artifactId: "art-1",
+		});
+		expect(expanded).toMatchObject({ text: "from-artifact", source: "artifact.read" });
+		expect(calls.map((call) => call[call.indexOf("--query") + 1])).toEqual([
+			"transcript.body",
+			"resource.body",
+			"artifact.read",
+		]);
+	});
+
+	test("an entry with no readable body raises instead of returning empty text", async () => {
+		const options = pagedController([{}]);
+		await expect(expandEntry(options, SESSION, { id: "a" })).rejects.toBeInstanceOf(TranscriptIncompleteError);
+	});
+
+	test("never touches .gjc state directly", async () => {
+		const calls: string[][] = [];
+		const options = pagedController([{ text: "x" }], calls);
+		await expandEntry(options, SESSION, { id: "a" });
+		expect(calls.flat().join(" ")).not.toContain(".gjc");
 	});
 });

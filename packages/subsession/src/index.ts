@@ -92,10 +92,14 @@ export {
 } from "./status";
 export {
 	assertNoRetentionGap,
+	type ExpandedEntry,
+	expandEntry,
 	fetchLastAssistant,
 	type LastAssistantResult,
+	listTranscript,
 	RetentionGapError,
 	type TailEvent,
+	type TranscriptEntry,
 	TranscriptIncompleteError,
 	type TranscriptPage,
 } from "./transcript";
