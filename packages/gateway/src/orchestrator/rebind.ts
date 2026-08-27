@@ -300,7 +300,11 @@ const CREDENTIAL_STATE_WORDS = new Set([
  * diagnosis #14 exists to deliver.
  */
 function isDiagnosticWord(value: string): boolean {
-	if (/^[a-z][a-z0-9]*(?:_[a-z0-9]+)+$/.test(value)) return true;
+	// A credential can be dressed as snake_case (`secret=missing_but_actually_
+	// deadbeefcafe`), so a long hex run inside the value disqualifies it: real
+	// codes do not carry twelve hex characters in a row.
+	if (/[0-9a-f]{12,}/i.test(value)) return false;
+	if (value.length <= 64 && /^[a-z][a-z0-9]*(?:_[a-z0-9]+)+$/.test(value)) return true;
 	return CREDENTIAL_STATE_WORDS.has(value.toLowerCase());
 }
 

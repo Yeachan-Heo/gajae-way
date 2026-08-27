@@ -581,6 +581,11 @@ test("redaction is calibrated in BOTH directions", () => {
 		"age_token=deadbeefcafebabe",
 		"ttl_secret=deadbeefcafebabe",
 		"num_api_key=deadbeefcafebabe",
+		// A credential dressed as snake_case must not ride the code exemption.
+		"secret=missing_but_actually_deadbeefcafe",
+		"token=expired_deadbeefcafebabe0123",
+		"secret=short",
+		"password=Tr0ub4dor",
 	];
 	for (const text of mustRedact) expect(redactSecrets(text)).toContain("[redacted]");
 	const mustSurvive = [
@@ -618,6 +623,9 @@ test("redaction is calibrated in BOTH directions", () => {
 		// A timestamp after a non-credential key is a timestamp.
 		"auth_expires: 2026-08-27T09:00:00Z",
 		"token_expires_at: 2026-08-27T09:00:00Z",
+		// Named states and codes after a real credential key stay readable.
+		"secret=MISSING",
+		"token=expired",
 		"[turn failed] spawn_failed: SDK startup did not complete before readiness cutoff",
 	];
 	for (const text of mustSurvive) expect(redactSecrets(text)).toBe(text);
