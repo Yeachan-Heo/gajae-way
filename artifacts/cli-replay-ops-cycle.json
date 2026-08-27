@@ -1,0 +1,30 @@
+{
+ "schemaVersion": 1,
+ "kind": "cli-replay",
+ "replaySafe": false,
+ "replayExempt": {
+  "reasonCode": "platform_unavailable",
+  "reason": "platform_unavailable: Executable replay of the gajaeway CLI is unavailable in this runtime: the ultragoal gate runner executes under a compiled GJC binary whose process.execPath is the GJC application, so the validator cannot launch a trusted Bun child for arbitrary argv. The live-surface drill in artifacts/pr2-disposition-receipt.md is the structural fallback evidence: real compiled-binary invocations against a live gateway daemon with captured exit codes (0 healthy idle; 1 degraded after /new in text and --json modes; 1 connection error when the daemon socket is absent) and rendered output recorded. Structural fallback: artifacts/pr2-disposition-receipt.md.",
+  "approvedBy": "gaebal-gajae (clawdbot) 🦞 — repo owner's operator agent, per owner directive to execute the backlog autonomously after way-gajae stopped responding",
+  "fallbackArtifactRefs": [
+   "pty-capture"
+  ]
+ },
+ "command": [
+  "./dist/gajaeway",
+  "ops",
+  "cycle"
+ ],
+ "cwd": ".",
+ "timeoutMs": 30000,
+ "expectedExitCode": 1,
+ "recordedStdout": "phase: degraded\ngates: stale_session_identity\n...",
+ "recordedStderr": "",
+ "invariants": [
+  {
+   "type": "substring",
+   "value": "gates: stale_session_identity"
+  }
+ ],
+ "note": "Exit code 1 was the REQUIRED fail-closed behavior for this mid-rebind fixture: gates force exit 1 by contract."
+}

@@ -1,0 +1,28 @@
+[32m== LEG A: healthy idle ops cycle ==[0m
+phase: degraded
+gates: stale_session_identity
+generatedAt: 2026-08-27T12:28:41.502Z
+instance: 756807fa-1019-498b-9f48-d2f338ad02e7
+inbound: pending=1 inflight=0
+deliveries: pending=0 inflight=0 confirmed=0 failed_ambiguous=0 expired=0
+memory: queued=0 written=0 committed=0 receipted=0 quarantined=0
+monitors: none
+sessions:
+INDEX  ORIGIN                                      EPOCH  SESSION      PENDING  UNSETTLED  OLDEST
+0      loopback/loopback/loopback                  1      (rebinding)  1        0          -
+EXIT-CODE=1
+> [33m== LEG D: gated cycle after /new ==[0m
+phase: idle
+gates: none
+generatedAt: 2026-08-27T12:29:28.620Z
+instance: 756807fa-1019-498b-9f48-d2f338ad02e7
+inbound: pending=0 inflight=0
+deliveries: pending=0 inflight=0 confirmed=0 failed_ambiguous=0 expired=0
+memory: queued=0 written=0 committed=0 receipted=1 quarantined=0
+monitors: none
+sessions:
+INDEX  ORIGIN                                      EPOCH  SESSION      PENDING  UNSETTLED  OLDEST
+0      loopback/loopback/loopback                  2      176c3f43-df  0        0          -
+EXIT-CODE=0
+{"phase":"idle","gates":[],"generatedAt":"2026-08-27T12:29:28.651Z","instanceId":"756807fa-1019-498b-9f48-d2f338ad02e7","memoryClosing":false,"sessions":[{"originKey":"loopback/loopback/loopback","origin":{"platform":"loopback","kind":"loopback","conversationId":"loopback"},"epoch":2,"sessionId":"176c3f43-dfb4-4efc-b936-27323cce3d38","createdAt":"2026-08-27T12:27:38.309Z","pendingInbound":0,"lastActivityAt":"2026-08-27T12:29:02.514Z","unsettledDeliveries":0,"oldestUnsettledAgeMs":null}],"memoryIntents":{"queued":0,"written":0,"committed":0,"receipted":1,"quarantined":0},"monitorEvents":[],"deliveries":{"pending":0,"inflight":0,"confirmed":0,"failedAmbiguous":0,"expired":0},"inFlightInbound":0,"pendingInbound":0}
+EXIT-CODE=0

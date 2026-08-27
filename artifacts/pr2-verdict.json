@@ -1,0 +1,99 @@
+{
+  "artifact": "pr2-verdict",
+  "schemaVersion": 1,
+  "generatedAt": "2026-08-27T12:05:00Z",
+  "signedBy": "gaebal-gajae (clawdbot) 🦞",
+  "subject": {
+    "repo": "Yeachan-Heo/gajae-way",
+    "pr": 2,
+    "title": "Add ops.cycle runtime-cycle projection for operators (replaces closed #1)",
+    "headAtReviewTime": "584d282eaee06672bdcd6133a938ee4705d269bc",
+    "base00e5cb6": "00e5cb68d32935251f4c746aeb0e0ca80345f500",
+    "currentMain": "6bd975983ccf3551b4f61ce452f3cf2fc381151b"
+  },
+  "verdict": "salvage",
+  "summary": "PR #2 remains valuable against current main and is NOT superseded by any 6bd9759 surface. The diff is a read-only, additive ops.cycle vertical slice (protocol verb + gateway SELECT-census projector + SDK method + CLI op + runbook section). Current main's admin console rebuild, scheduler/observability, memory registry, reactions/replies, and latency/streaming work neither duplicates nor contradicts it; the admin attention projection explicitly documents the gaps ops.cycle fills.",
+  "supersedenceAnalysis": [
+    {
+      "claim": "admin rebuild supersedes it",
+      "finding": "refuted",
+      "evidence": [
+        "packages/admin/src/view.ts:351-441 — snapshot projects only gateway.status, session.list, monitor.list(+inspect); no inbound-queue, delivery-state, or memory-intent census.",
+        "packages/admin/src/attention.ts:48-52 — ATTENTION_GAPS declares blindness: G3 'ambiguous and expired deliveries — gateway.status returns counts only', G5 'quarantined memory intents — no verb exposes memory_intents'. ops.cycle's typed censuses are precisely the missing verbs, so it closes current-main-declared gaps rather than duplicating anything."
+      ]
+    },
+    {
+      "claim": "scheduler/observability work supersedes it",
+      "finding": "refuted",
+      "evidence": [
+        "packages/gateway/src/server/server.ts:314-403 — the request surface serves gateway.status(pid/startedAt/schemaVersion/sessions.active/delivery.pending+oldestPendingAgeMs), ops.backup, ops.integrity; no aggregate phase, no session-epoch identity view, no unknown-settlement gate.",
+        "gateway.status.delivery carries only {pending, oldestPendingAgeMs}; cannot distinguish failed_ambiguous/expired or detect out-of-model state strings."
+      ]
+    },
+    {
+      "claim": "stale schema assumptions",
+      "finding": "none found",
+      "evidence": [
+        "PR reads sessions(origin_key, origin_ref_json, gjc_session_id, epoch, created_at, last_activity_at), inbound_messages(state CHECK 'pending','processing','done'), deliveries(state CHECK 'pending','inflight','confirmed','failed_ambiguous','expired'), memory_intents(state CHECK 'queued','written','committed','receipted','quarantined'), monitor_events(stage CHECK 'admitted','batched','dispatched','authored','delivered','failed') — identical to packages/gateway/src/store/db.ts migrate() v1..v9 on 6bd9759.",
+        "The PR performs ZERO schema migration (SELECT-only census methods); LATEST_SCHEMA_VERSION stays 9. Migration-safe by construction."
+      ]
+    },
+    {
+      "claim": "duplicate source of truth",
+      "finding": "refuted with one caveat preserved",
+      "evidence": [
+        "RuntimeCycleProjector owns no writes; single-writer withTransaction boundary untouched (db.ts:457-475). Projection documented as derived; SQLite rows + delivery ledger remain authority.",
+        "Caveat: sources.memoryClosing = MemoryClosureQueue.queueDepth is an in-memory mirror of durable state; PR correctly ORs it with the durable census (queued+written+committed>0) so restart semantics hold ('durable unsettled memory intents also project draining across a restart' unit test pins it)."
+      ]
+    },
+    {
+      "claim": "unsafe operator mutation authority",
+      "finding": "none",
+      "evidence": [
+        "ops.cycle params:undefined, read-only response; no writer added; admin MutationGate DEFAULT_ALLOWLIST (packages/admin/src/gate.ts:67-154) unaffected — cycle is a read, never gated as mutation."
+      ]
+    },
+    {
+      "claim": "misleading status semantics",
+      "finding": "addressed inside the PR already",
+      "evidence": [
+        "Degraded dominates busy phases (decidePhase gates>0 → degraded); unknown delivery/inbound states gate delivery_settlement_unknown instead of optimistic counting; failed_ambiguous is honest at-least-once, not a gate; gate→exit-code-1 contract extracted as cycleExitCode and pinned by tests for all four reasons; empty subsystems render 'monitors: none' so empty ≠ missing; dead CyclePhase values booting/gated removed in PR patch 2."
+      ]
+    },
+    {
+      "claim": "missing restart/recovery semantics",
+      "finding": "addressed",
+      "evidence": [
+        "Mid-rebind (bumpEpoch clears gjc_session_id, epoch>0: db.ts:67-77) gates stale_session_identity; epoch auto-rotation (server.ts SESSION_TURN_LIMIT, db.ts incrementTurnCount) passes through the same view, so rotation is visible not hidden.",
+        "Draining survives restart via durable intent census; in-flight processing inbound recovered at boot (db.ts:264-267 inboundRecoverProcessing; server.ts:224-225)."
+      ]
+    },
+    {
+      "claim": "conflicts with durable lane-job direction (#10)",
+      "finding": "none today; noted forward-risk",
+      "evidence": [
+        "#10 (open) asks delegated work become durable jobs instead of 30-minute foreground turns. ops.cycle observes durable queues; it adds no competing execution model. Phase vocabulary (dispatching/delivering/draining) is orthogonal to job lifecycle and extensible; a future job table would add sources, not fork this contract.",
+        "Forward-note: when lane-jobs land, revisit phase naming if 'dispatching' migrates to job states."
+      ]
+    }
+  ],
+  "transplantDeltas": {
+    "note": "Base moved 00e5cb6 -> 6bd9759; hand-port required (original PR DIRTY per gh pr checks/mergeState, 6 hunks context-shifted).",
+    "items": [
+      "server.ts imports drifted (isPlatformMessageId/reactions in 6bd9759); ops.cycle case inserted into current handleRequest switch; Runtime gains readonly cycle projector wired with existing local memory instance.",
+      "db.ts census-reader insertion point shifted (sessionRows at :99-113 on main); drop the PR's incidental inboundClaimNext one-line reformat (already one-line on main).",
+      "cli/src/main.ts drifted (work command, progress handling); renderCycle/cycleExitCode and ops cycle wiring ported onto current structure incl. usage-string updates.",
+      "protocol/catalog.ts grew reactions/work.run/chat.react entries; ops.cycle types + VERBS_V01 append applies after engagement.reaction; sdk client opsCycle() slot untouched by drift.",
+      "Tests: cycle.test.ts (pure matrix), cycle-e2e.test.ts (real-DB projector through bumpEpoch/putSession/inbound*/ledger + socket ops.cycle round-trip incl. seconds-vs-ms age regression pin >=1000ms), cli render+exit-code contract tests; align helper/config construction with current-main test seams."
+    ]
+  },
+  "reviewFindingsFromOriginalBranch": [
+    "PATCH 3 regression (pre-existing in branch, fixed): CLI summed per-session pendingInbound, missing sessionless origins (first message is durable before ensureSession); final shape carries aggregate pendingInbound in OpsCycleResult.",
+    "PATCH 4 blocker (fixed): deliveryUnsettledByOrigin SQL precedence multiplied timestamp before subtracting seconds binding → oldestUnsettledAgeMs ≈ -1.79e12 whenever non-null; fixed with parenthesized seconds delta + real-DB age bound assertion.",
+    "PATCH 2 contract honesty: CyclePhase tightened to idle|dispatching|delivering|draining|degraded."
+  ],
+  "environmentEvidence": {
+    "githubActionsBilling": "ALL recent runs repo-wide fail with annotation 'The job was not started because recent account payments have failed or your spending limit needs to be increased' (check-run annotations on runs 33061783260 [main @ 6bd9759] and 98069219888 [PR #2 head]); zero successful runs in the most recent 100. Local biome+tsc+bun test gates are the decisive available evidence until billing is repaired."
+  },
+  "decision": "SALVAGE onto 6bd9759: reimplement smallest coherent slice in worktree branch repair/pr-2-runtime-cycle, push to PR #2 head (single active PR retained), keep fail-closed contract, additive protocol, zero migrations, port fixes already won by the original adversarial loop."
+}
