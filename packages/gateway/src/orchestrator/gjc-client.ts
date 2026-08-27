@@ -5,6 +5,7 @@ import {
 	GjcRuntimeError,
 	type RuntimeErrorDetail,
 	rebindableCodeOf,
+	redactSecrets,
 	runtimeErrorOfEnvelope,
 	SessionRebinder,
 } from "./rebind";
@@ -184,6 +185,8 @@ export class GjcClient implements GjcPort {
 	readonly #sessions = new Map<string, string>();
 	/** Reverse binding, so a turn failure can be traced back to the origin it must rebind. */
 	readonly #origins = new Map<string, { originKey: string; epoch: number }>();
+	/** In-flight session binds, so concurrent callers share one create-or-rebind instead of racing two epoch bumps. */
+	readonly #inflight = new Map<string, Promise<{ sessionId: string }>>();
 	readonly #database: GatewayDatabase;
 	readonly #timeoutMs: number;
 	readonly #cwd: string;
@@ -229,6 +232,27 @@ export class GjcClient implements GjcPort {
 		if (process.env.GAJAEWAY_TEST_STUB_GJC === "1") return { sessionId: `stub-${originKey}#${epoch}` };
 		const cached = this.#cachedSession(originKey, epoch);
 		if (cached) return { sessionId: cached };
+		// One bind in flight per origin+epoch: without this, two concurrent callers
+		// whose create fails rebindably EACH bump the epoch and mint a session where
+		// the contract is exactly one rebind per condemned key. Chat turns are
+		// serialized per origin upstream; monitor propagation and any future direct
+		// caller are not. Settled entries are reaped in finally, so the map stays
+		// bounded to actually-concurrent binds.
+		const cacheKey = `${originKey}#${epoch}`;
+		const existing = this.#inflight.get(cacheKey);
+		if (existing) return existing;
+		const bind = this.#ensureSessionUncached(originKey, epoch, options).finally(() => {
+			this.#inflight.delete(cacheKey);
+		});
+		this.#inflight.set(cacheKey, bind);
+		return bind;
+	}
+
+	async #ensureSessionUncached(
+		originKey: string,
+		epoch: number,
+		options?: TurnOptions,
+	): Promise<{ sessionId: string }> {
 		try {
 			return await this.#createSession(originKey, epoch, options);
 		} catch (error) {
@@ -492,9 +516,17 @@ export class GjcClient implements GjcPort {
  * attached so the caller classifies on the CODE rather than on this string.
  */
 function runtimeFailure(context: string, detail: RuntimeErrorDetail | undefined, fallback: string): GjcRuntimeError {
+	// Redact at construction: this error's message is what every downstream catch
+	// logs verbatim (daemon log is owner-visible), so the same secret-only
+	// redaction the delivered notice applies must hold here — an envelope-less
+	// stderr echo of a credential must not survive into any durable record.
 	const resolved: RuntimeErrorDetail = detail ?? { message: fallback };
-	const rendered = `${resolved.code ? `${resolved.code}: ` : ""}${resolved.message ?? fallback}`;
-	return new GjcRuntimeError(`${context}: ${rendered}`, resolved);
+	const message = resolved.message !== undefined ? redactSecrets(resolved.message) : fallback;
+	const rendered = `${resolved.code ? `${redactSecrets(resolved.code)}: ` : ""}${message}`;
+	return new GjcRuntimeError(`${context}: ${rendered}`, {
+		code: resolved.code,
+		message,
+	});
 }
 
 /**
