@@ -24,6 +24,14 @@ import {
 	resolveReactionEmoji,
 	validateOriginRef,
 } from "@gajaeway/protocol";
+import {
+	appendAttempt,
+	closeAttempt,
+	createLaneJobRecord,
+	type LaneJobRecord,
+	newOpRef,
+	parseLaneJobRecord,
+} from "@gajaeway/subsession";
 import type { GatewayConfig } from "../config";
 import { DeliveryService } from "../delivery/delivery";
 import { ReactionBudget } from "../delivery/reaction-budget";
@@ -43,6 +51,41 @@ import type { GatewayDatabase, InboundMessageRow } from "../store/db";
 import { DeliveryLedger } from "../store/ledger";
 import { KeyedQueue } from "./keyed-queue";
 import { composeSpeakerLabel, composeTurnHeader } from "./speaker";
+
+/**
+ * Durable lane-job persistence for delegated work (issue #10).
+ *
+ * Every `work.run` call is one attempt against a job whose identity
+ * (`lanejob-work-<name>`) outlives the turn: the attempt receipt, end state,
+ * and failure code land in SQLite before the reply is produced, so a gateway
+ * restart or a reaped turn still leaves an auditable trail. Corrupt stored
+ * state fails the verb loudly instead of being silently replaced.
+ */
+function persistLaneJob(database: GatewayDatabase, record: LaneJobRecord, laneKey: string): void {
+	database.putLaneJob({
+		jobId: record.jobId,
+		laneKey,
+		state: record.state,
+		createdAt: record.createdAt,
+		updatedAt: record.updatedAt,
+		lane: record.lane,
+		json: JSON.stringify(record),
+	});
+}
+
+function loadOrCreateLaneJob(database: GatewayDatabase, jobId: string, workName: string): LaneJobRecord {
+	const stored = database.laneJobJson(jobId);
+	if (stored !== undefined) {
+		return parseLaneJobRecord(stored);
+	}
+	const created = createLaneJobRecord({
+		jobId,
+		branch: `work/${workName.toLowerCase().replace(/[^a-z0-9._/-]+/g, "-")}`,
+		worktreePath: "/",
+	});
+	persistLaneJob(database, created, `work-${workName}`);
+	return created;
+}
 
 /**
  * Completed turns per epoch before the session is rotated. Every `gjc --resume`
@@ -388,9 +431,62 @@ async function handleRequest(
 					sessionKey,
 					JSON.stringify({ platform: "work", kind: "task", conversationId: workName }),
 				);
-				return options.gjc.sendTurn(sessionId, workText, undefined, undefined, turnOptions);
+				// Issue #10: this delegated call is one ATTEMPT against a durable
+				// job. The receipt and its terminal transition persist even when
+				// this process dies mid-turn, so nothing depends on a reply body.
+				const jobId = `lanejob-work-${workName.toLowerCase().replace(/[^a-z0-9]+/g, "-")}`;
+				const prior0 = loadOrCreateLaneJob(options.database, jobId, workName);
+				// A serialized worker cannot have two live turns, so an attempt still
+				// open at call time belongs to a crashed predecessor: record it as
+				// exactly what we know - terminally uncertain - with an escalation
+				// trail entry operators can see through work.jobs.
+				const openPrior = prior0.attempts.find((attempt) => attempt.endedAt === undefined);
+				const prior = openPrior
+					? closeAttempt({
+							record: prior0,
+							opRef: openPrior.opRef,
+							endState: "terminal_uncertain",
+							endedAt: new Date().toISOString(),
+						})
+					: prior0;
+				if (openPrior) persistLaneJob(options.database, prior, `work-${workName}`);
+				const jobSlug = workName.toLowerCase().replace(/[^a-z0-9]+/g, "-");
+				const opRef = newOpRef(`work-${jobSlug}`);
+				let job = appendAttempt(prior, {
+					opRef,
+					sessionId,
+					startedAt: new Date().toISOString(),
+				});
+				persistLaneJob(options.database, job, `work-${workName}`);
+				try {
+					const reply = await options.gjc.sendTurn(sessionId, workText, undefined, undefined, turnOptions);
+					job = closeAttempt({
+						record: job,
+						opRef,
+						endState: "completed",
+						endedAt: new Date().toISOString(),
+					});
+					persistLaneJob(options.database, job, `work-${workName}`);
+					return reply;
+				} catch (error) {
+					const failureMessage = error instanceof Error ? error.message : String(error);
+					job = closeAttempt({ record: job, opRef, endState: "failed", endedAt: new Date().toISOString() });
+					persistLaneJob(options.database, job, `work-${workName}`);
+					throw new Error(failureMessage);
+				}
 			});
 			connection.write({ v: PROFILE_VERSION, type: "response", id: request.id, result: { text, sessionKey } });
+			return;
+		}
+		case "work.jobs": {
+			// Operator projection over durable lane jobs (issue #10): survives the
+			// gateway restart that would otherwise erase in-flight work knowledge.
+			connection.write({
+				v: PROFILE_VERSION,
+				type: "response",
+				id: request.id,
+				result: { jobs: options.database.laneJobRows() },
+			});
 			return;
 		}
 		case "ops.integrity":

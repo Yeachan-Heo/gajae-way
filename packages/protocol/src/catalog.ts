@@ -285,10 +285,23 @@ export interface WorkRunResult {
 	readonly sessionKey: string;
 }
 
+/** Operator projection over durable lane jobs (issue #10). */
+export interface WorkJobsResult {
+	readonly jobs: Array<{
+		readonly job_id: string;
+		readonly lane_key: string;
+		readonly state: string;
+		readonly branch: string;
+		readonly worktree_path: string;
+		readonly updated_at: string;
+	}>;
+}
+
 /**
  * Outbound reaction (chat.react): react to ONE specific message in ONE specific
  * origin. The target message id is required — "react to the last message" is not
  * expressible, because "last" changes under you. `emoji` accepts any allowlisted
+ * Outbound reaction (chat.react): react to ONE specific message in ONE specific
  * spelling (`👍`, `thumbsup`, `:thumbsup:`) and is canonicalized by the gateway.
  *
  * Allowlisted is not the same as deliverable: a platform may accept only part of
@@ -357,6 +370,7 @@ export interface VerbCatalogV01 {
 	};
 	"ops.integrity": { params: undefined; result: { readonly ok: boolean; readonly detail: string } };
 	"work.run": { params: WorkRunParams; result: WorkRunResult };
+	"work.jobs": { result: WorkJobsResult };
 	"chat.react": { params: ChatReactParams; result: ChatReactResult };
 	"engagement.reaction": { params: EngagementReactionParams; result: EngagementReactionResult };
 }
@@ -387,6 +401,7 @@ export const VERBS_V01 = [
 	"ops.backup",
 	"ops.integrity",
 	"work.run",
+	"work.jobs",
 	"chat.react",
 	"engagement.reaction",
 ] as const;

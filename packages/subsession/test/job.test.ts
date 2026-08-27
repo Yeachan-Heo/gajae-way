@@ -153,13 +153,23 @@ describe("durable record schema: versioned, frozen, fail-closed", () => {
 		expect(() => parseLaneJobRecord(JSON.stringify({ ...record(), reportSource: "vibes" }))).toThrow(/reportSource/);
 	});
 
-	test("checkpoints must be strictly increasing full SHAs; duplicate opRefs are rejected", () => {
-		const base = JSON.parse(JSON.stringify(record()));
-		base.checkpoints = [
+	test("checkpoints reject only consecutive duplicates; duplicate opRefs are rejected", () => {
+		// Git SHAs have no chronological lexical order: a rebase moves HEAD to a
+		// sha that sorts LOWER, and that history is still valid durable state.
+		const rebased = JSON.parse(JSON.stringify(record()));
+		rebased.checkpoints = [
 			{ sha: "b".repeat(40), createdAt: NOW.toISOString() },
 			{ sha: "a".repeat(40), createdAt: NOW.toISOString() },
 		];
-		expect(() => parseLaneJobRecord(JSON.stringify(base))).toThrow(/strictly increasing/);
+		const parsed = parseLaneJobRecord(JSON.stringify(rebased));
+		expect(parsed.checkpoints).toHaveLength(2);
+
+		const repeated = JSON.parse(JSON.stringify(record()));
+		repeated.checkpoints = [
+			{ sha: "a".repeat(40), createdAt: NOW.toISOString() },
+			{ sha: "a".repeat(40), createdAt: NOW.toISOString() },
+		];
+		expect(() => parseLaneJobRecord(JSON.stringify(repeated))).toThrow(/repeats the previous sha/);
 
 		const shortSha = JSON.parse(JSON.stringify(record()));
 		shortSha.checkpoints = [{ sha: "abc123", createdAt: NOW.toISOString() }];
@@ -168,6 +178,19 @@ describe("durable record schema: versioned, frozen, fail-closed", () => {
 		const dupes = JSON.parse(JSON.stringify(record()));
 		dupes.attempts = [attempt(), attempt()];
 		expect(() => parseLaneJobRecord(JSON.stringify(dupes))).toThrow(/duplicate attempt opRef/);
+	});
+
+	test("fail-closed parse: missing v1 sections are schema violations, not empty defaults", () => {
+		for (const field of ["sessions", "attempts", "checkpoints", "escalations"]) {
+			const stripped = JSON.parse(JSON.stringify(record()));
+			delete stripped[field];
+			expect(() => parseLaneJobRecord(JSON.stringify(stripped)), field).toThrow(LaneJobError);
+		}
+		const noCounter = JSON.parse(JSON.stringify(record()));
+		delete noCounter.stalledContinuations;
+		expect(() => parseLaneJobRecord(JSON.stringify(noCounter))).toThrow(/stalledContinuations/);
+		const badEndState = JSON.parse(JSON.stringify({ ...record(), attempts: [{ ...attempt(), endState: "vibes" }] }));
+		expect(() => parseLaneJobRecord(JSON.stringify(badEndState))).toThrow(/endState/);
 	});
 });
 
@@ -214,10 +237,19 @@ describe("repository-first reconciliation: commits are the progress signal", () 
 });
 
 describe("attempts: duplicate prevention and one deterministic continuation path", () => {
-	test("appendAttempt refuses a repeated opRef (no duplicate attempts after restart)", () => {
+	test("appendAttempt refuses a repeated opRef and a second open attempt", () => {
 		let current = appendAttempt(record(), attempt());
 		expect(() => appendAttempt(current, attempt())).toThrow(/duplicate|already exists/i);
-		// A fresh op-ref on the SAME session continues the job deterministically.
+		// A second OPEN op-ref while one is still running is how a restart mints
+		// duplicate work - refused; only a closed attempt allows the next.
+		expect(() => appendAttempt(current, attempt({ opRef: "gw-lanejob-01hq00000001" }))).toThrow(/still open/);
+		current = closeAttempt({
+			record: current,
+			opRef: attempt().opRef,
+			endState: "attempt_ended",
+			errorCode: "prompt_deadline_exceeded",
+			endedAt: NOW.toISOString(),
+		});
 		current = appendAttempt(current, attempt({ opRef: "gw-lanejob-01hq00000001" }));
 		expect(current.attempts).toHaveLength(2);
 		expect(current.sessions).toEqual([SESSION]);
@@ -285,12 +317,11 @@ describe("continuation planning: bounded, deterministic, operator holds preserve
 	});
 
 	test("active turn wins over continuation: observe", () => {
-		let current = appendAttempt(record(), attempt());
-		current = appendAttempt(current, attempt({ opRef: "gw-lanejob-01hq00000002" }));
-		const latest = current.attempts[1];
-		const decision = planContinuation(planInput({ record: current, latestAttempt: { endState: "running" } }));
+		// The stored truth for an active turn is an attempt with no recorded end;
+		// the planner must read that, not a synthesized running projection.
+		const current = appendAttempt(record(), attempt());
+		const decision = planContinuation(planInput({ record: current, latestAttempt: null }));
 		expect(decision.action).toBe("observe");
-		void latest;
 	});
 
 	test("deleted session needs operator sign-off; unverified authority fails closed", () => {

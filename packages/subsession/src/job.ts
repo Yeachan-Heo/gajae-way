@@ -27,6 +27,23 @@ import { assertValidOpRef } from "./send";
 import type { PromptStatusBody, SupervisorOpState } from "./status";
 import { projectOpState } from "./status";
 
+/**
+ * The exact SupervisorOpState vocabulary, mirrored here so persisted attempt
+ * end states are validated against it without importing the projection module
+ * (which would create a cycle through send.ts).
+ */
+const SUPERVISOR_OP_STATES = new Set<SupervisorOpState>([
+	"accepted",
+	"running",
+	"completed",
+	"cancelled",
+	"stopped_incomplete",
+	"failed",
+	"attempt_ended",
+	"terminal_missing_receipt",
+	"terminal_uncertain",
+]);
+
 export class LaneJobError extends Error {
 	constructor(message: string) {
 		super(message);
@@ -222,7 +239,7 @@ export function parseLaneJobRecord(raw: string): LaneJobRecord {
 		checkpoints,
 		stalledContinuations,
 		...(record.reportSource === undefined ? {} : { reportSource: asReportSource(record.reportSource) }),
-		...(typeof record.report === "string" ? { report: record.report } : {}),
+		...(record.report === undefined ? {} : { report: asString(record.report) }),
 		escalations,
 	});
 }
@@ -242,9 +259,7 @@ function assertRequiredTimestamp(value: unknown, field: string): string {
 }
 
 function parseSessions(value: unknown): readonly string[] {
-	if (value === undefined) {
-		return Object.freeze([]);
-	}
+	// Required field: absent arrays are a schema violation, not an empty history.
 	if (!Array.isArray(value)) {
 		throw new LaneJobError("sessions must be an array of runtime session ids");
 	}
@@ -252,9 +267,6 @@ function parseSessions(value: unknown): readonly string[] {
 }
 
 function parseAttempts(value: unknown): readonly JobAttempt[] {
-	if (value === undefined) {
-		return Object.freeze([]);
-	}
 	if (!Array.isArray(value)) {
 		throw new LaneJobError("attempts must be an array");
 	}
@@ -281,6 +293,9 @@ function parseAttempts(value: unknown): readonly JobAttempt[] {
 				(rest as Record<string, unknown>).errorCode = asString(attempt.errorCode);
 			}
 			if (attempt.endState !== undefined) {
+				if (typeof attempt.endState !== "string" || !SUPERVISOR_OP_STATES.has(attempt.endState as never)) {
+					throw new LaneJobError(`unknown attempt endState ${JSON.stringify(attempt.endState)}`);
+				}
 				(rest as Record<string, unknown>).endState = attempt.endState;
 			}
 			return Object.freeze({
@@ -294,13 +309,12 @@ function parseAttempts(value: unknown): readonly JobAttempt[] {
 }
 
 function parseCheckpoints(value: unknown): readonly JobCheckpoint[] {
-	if (value === undefined) {
-		return Object.freeze([]);
-	}
+	// Required: a v1 record without a checkpoints array is not the same state
+	// and must not be silently normalized into one.
 	if (!Array.isArray(value)) {
 		throw new LaneJobError("checkpoints must be an array");
 	}
-	let previous = "";
+	let previous: string | undefined;
 	return Object.freeze(
 		value.map((entry, index): JobCheckpoint => {
 			if (typeof entry !== "object" || entry === null) {
@@ -312,9 +326,11 @@ function parseCheckpoints(value: unknown): readonly JobCheckpoint[] {
 				throw new LaneJobError(`checkpoint ${index} sha is not a full commit sha`);
 			}
 			const createdAt = assertRequiredTimestamp(checkpoint.createdAt, "checkpoint.createdAt");
-			if (sha <= previous) {
-				throw new LaneJobError("checkpoints must be strictly increasing distinct commits");
+			if (sha === previous) {
+				throw new LaneJobError(`checkpoint ${index} repeats the previous sha`);
 			}
+			// Git SHAs carry no chronological lexical order (rebases move HEAD
+			// "backwards" all the time), so only consecutive duplicates are invalid.
 			previous = sha;
 			return Object.freeze({ sha, createdAt });
 		}),
@@ -322,9 +338,6 @@ function parseCheckpoints(value: unknown): readonly JobCheckpoint[] {
 }
 
 function parseCounter(value: unknown, field: string): number {
-	if (value === undefined) {
-		return 0;
-	}
 	if (typeof value !== "number" || !Number.isInteger(value) || value < 0) {
 		throw new LaneJobError(`${field} must be a non-negative integer`);
 	}
@@ -332,9 +345,6 @@ function parseCounter(value: unknown, field: string): number {
 }
 
 function parseEscalations(value: unknown): readonly string[] {
-	if (value === undefined) {
-		return Object.freeze([]);
-	}
 	if (!Array.isArray(value)) {
 		throw new LaneJobError("escalations must be an array of strings");
 	}
@@ -484,10 +494,21 @@ export function applyReconciliation(input: TransitionInput): LaneJobRecord {
 	});
 }
 
-/** Marks an attempt as ended in the job history. */
+/**
+ * Appends one attempt as the job's single open attempt.
+ *
+ * At most ONE attempt may lack `endedAt`: a second open op-ref against the
+ * same lane is exactly how a restart mints duplicate work.
+ */
 export function appendAttempt(record: LaneJobRecord, attempt: JobAttempt): LaneJobRecord {
 	if (record.attempts.some((existing) => existing.opRef === attempt.opRef)) {
 		throw new LaneJobError(`attempt ${attempt.opRef} already exists on ${record.jobId}; refusing a duplicate`);
+	}
+	const open = record.attempts.find((existing) => existing.endedAt === undefined);
+	if (open && attempt.endedAt === undefined) {
+		throw new LaneJobError(
+			`attempt ${open.opRef} is still open on ${record.jobId}; close it before appending ${attempt.opRef}`,
+		);
 	}
 	return Object.freeze({
 		...record,
@@ -585,10 +606,13 @@ export function planContinuation(input: PlanContinuationInput): ContinuationPlan
 	const sessionUsable = input.session.live && !input.session.deleted;
 
 	if (sessionUsable) {
-		if (
-			input.latestAttempt &&
-			(input.latestAttempt.endState === "accepted" || input.latestAttempt.endState === "running")
-		) {
+		// An attempt is active while it has no recorded end: that is the stored
+		// truth, not a synthesized projection. Observing it is what keeps a
+		// restart from minting a second open op-ref against the same session.
+		const openAttempt =
+			input.latestAttempt ?? (input.record.attempts.length > 0 ? input.record.attempts.at(-1) : undefined);
+		const isActiveTurn = openAttempt !== undefined && openAttempt.endState === undefined;
+		if (isActiveTurn) {
 			return {
 				action: "observe",
 				reason: "an active turn drives the job: observe, never auto-send a second prompt",
@@ -606,10 +630,11 @@ export function planContinuation(input: PlanContinuationInput): ContinuationPlan
 		return { action: "hold_for_operator", reason: "session deleted; recreation needs operator sign-off" };
 	}
 
-	if (
-		input.latestAttempt == null ||
-		!(input.latestAttempt.endState === "accepted" || input.latestAttempt.endState === "running")
-	) {
+	// Non-live session: an OPEN attempt against a dead session is an inconsistent
+	// snapshot (re-read before acting); a closed attempt resumes through the broker.
+	const lastAttempt =
+		input.latestAttempt ?? (input.record.attempts.length > 0 ? input.record.attempts.at(-1) : undefined);
+	if (lastAttempt === undefined || lastAttempt.endState !== undefined) {
 		return {
 			action: "resume_session",
 			reason: "saved non-live session whose last attempt ended: broker session.resume",

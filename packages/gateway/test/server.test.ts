@@ -2,6 +2,7 @@ import { afterEach, expect, test } from "bun:test";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { parseLaneJobRecord } from "@gajaeway/subsession";
 import type { GatewayConfig } from "../src/config";
 import type { GjcPort } from "../src/orchestrator/gjc-client";
 import { type GatewayServer, startUnixServer } from "../src/server/server";
@@ -252,8 +253,8 @@ test("debounced burst becomes one turn carrying the unread diff with speaker att
 	say("m4", "follow-up", "owner", "bellman", true);
 	for (let attempt = 0; attempt < 400 && turns.length < 2; attempt++) await Bun.sleep(10);
 	expect(turns).toHaveLength(2);
-	expect(turns[1]!.text).not.toContain("first message");
-	expect(turns[1]!.text).toContain("follow-up");
+	expect(turns[1]?.text).not.toContain("first message");
+	expect(turns[1]?.text).toContain("follow-up");
 	client.close();
 });
 
@@ -390,5 +391,84 @@ test("work.run runs a named worker session in the requested cwd and returns the 
 	client.send({ v: "0.1", type: "request", id: "bad", verb: "work.run", params: { name: "../evil", text: "x" } });
 	await waitFor(client.frames, 3);
 	expect(client.frames.find((frame) => frame.type === "error" && frame.id === "bad")).toBeDefined();
+	client.close();
+});
+
+test("work.run records a durable lane job and work.jobs projects it (issue #10)", async () => {
+	directory = await mkdtemp(join(tmpdir(), "gajaeway-server-"));
+	const config: GatewayConfig = {
+		schemaVersion: 1,
+		home: directory,
+		configPath: join(directory, "config.json"),
+		socketPath: join(directory, "gateway.sock"),
+		dbPath: join(directory, "gateway.db"),
+		logVerbosity: "info",
+	};
+	const database = await GatewayDatabase.open(config.dbPath);
+	const gjc: GjcPort = {
+		ensureSession: async () => ({ sessionId: "0f1e2d3c-4b5a-4678-8796-a5b4c3d2e1f0" }),
+		sendTurn: async () => "worker result",
+	};
+	server = await startUnixServer({ config, database, gjc, onStop: () => database.close() });
+	const client = await connect(config.socketPath);
+	client.send({ v: "0.1", type: "hello", payload: { supportedVersions: ["0.1"] } });
+	await waitFor(client.frames, 1);
+	client.send({
+		v: "0.1",
+		type: "request",
+		id: "w",
+		verb: "work.run",
+		params: { name: "Repo.Fix-2", text: "fix the bug" },
+	});
+	await waitFor(client.frames, 2);
+	expect(client.frames.find((frame) => frame.type === "response" && frame.id === "w")).toBeDefined();
+
+	client.send({ v: "0.1", type: "request", id: "jobs", verb: "work.jobs" });
+	await waitFor(client.frames, 3);
+	const jobs = client.frames.find((frame) => frame.type === "response" && frame.id === "jobs");
+	expect(jobs.result.jobs).toHaveLength(1);
+	expect(jobs.result.jobs[0].job_id).toBe("lanejob-work-repo-fix-2");
+	// The completed ATTEMPT closed; the JOB stays continuable (attempt_ended),
+	// never a terminal work-failure.
+	expect(jobs.result.jobs[0].state).toBe("attempt_ended");
+
+	// The stored authority carries the closed attempt; the record is restart-safe.
+	const raw = database.laneJobJson("lanejob-work-repo-fix-2");
+	expect(typeof raw).toBe("string");
+	const parsed = parseLaneJobRecord(raw as string);
+	expect(parsed.attempts).toHaveLength(1);
+	expect(parsed.attempts[0].endState).toBe("completed");
+	expect(parsed.attempts[0].sessionId).toBe("0f1e2d3c-4b5a-4678-8796-a5b4c3d2e1f0");
+
+	// A crashed predecessor's open attempt is recorded terminally uncertain with
+	// an escalation trail before the next attempt starts.
+	database.putLaneJob({
+		jobId: parsed.jobId,
+		laneKey: "work-Repo.Fix-2",
+		state: "running",
+		createdAt: parsed.createdAt,
+		updatedAt: new Date().toISOString(),
+		lane: parsed.lane,
+		json: JSON.stringify({
+			...parsed,
+			attempts: [{ ...parsed.attempts[0], endState: undefined, endedAt: undefined }],
+		}),
+	});
+	client.send({ v: "0.1", type: "request", id: "w2", verb: "work.run", params: { name: "Repo.Fix-2", text: "again" } });
+	async function waitId(id: string): Promise<void> {
+		for (let attempt = 0; attempt < 400 && !client.frames.some((f) => f.id === id && f.type !== undefined); attempt++)
+			await Bun.sleep(5);
+	}
+	await waitId("w2");
+	expect(client.frames.find((frame) => frame.type === "response" && frame.id === "w2")).toBeDefined();
+	const revived = parseLaneJobRecord(database.laneJobJson("lanejob-work-repo-fix-2") as string);
+	expect(revived.attempts).toHaveLength(2); // crashed-uncertain closed + the new completed attempt
+	expect(revived.escalations.some((entry: string) => entry.includes("terminal_uncertain"))).toBe(true);
+	expect(revived.attempts[0].endState).toBe("terminal_uncertain");
+	expect(revived.escalations.length).toBeGreaterThanOrEqual(1);
+	client.send({ v: "0.1", type: "request", id: "jobs2", verb: "work.jobs" });
+	for (let attempt = 0; attempt < 400 && !client.frames.some((f) => f.id === "jobs2"); attempt++) await Bun.sleep(5);
+	const jobs2 = client.frames.find((frame) => frame.type === "response" && frame.id === "jobs2");
+	expect(jobs2.result.jobs[0].state).toBe("attempt_ended");
 	client.close();
 });
