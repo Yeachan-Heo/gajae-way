@@ -22,6 +22,11 @@ export type ReceiptState = "absent" | "present" | "missing" | "unknown";
 /** Normal stop reasons carried by a `terminal_ok` outcome. */
 export type StopReason = "end_turn" | "max_tokens" | "max_turn_requests" | "refusal" | "cancelled";
 
+/** Error payload carried by a `failed` status, e.g. `prompt_deadline_exceeded`. */
+export type FailureBody = {
+	readonly code?: string;
+	readonly message?: string;
+};
 export type PromptOutcomeBody = {
 	readonly kind?: string;
 	readonly reason?: string;
@@ -38,6 +43,8 @@ export type PromptStatusBody = {
 	readonly terminalAt?: number;
 	readonly receiptState?: ReceiptState;
 	readonly outcome?: PromptOutcomeBody;
+	/** Failure detail. A lease/deadline kill is distinctly resumable, not a work-verdict. */
+	readonly error?: FailureBody;
 };
 
 export type StatusReport = {
@@ -59,8 +66,15 @@ export type SupervisorOpState =
 	| "stopped_incomplete"
 	| "failed"
 	| "terminal_missing_receipt"
+	| "failed"
+	/**
+	 * The op reached a terminal failure that does NOT end the job: a lease or
+	 * deadline kill (`error.code = prompt_deadline_exceeded`) while the session
+	 * and its work can continue. Distinctly resumable; never a hold, never a
+	 * success verdict.
+	 */
+	| "attempt_ended"
 	| "terminal_uncertain";
-
 const CANONICAL_STATUSES = new Set<PromptStatus>(["accepted", "in_flight", "terminal_ok", "failed", "unknown"]);
 
 const RECEIPT_STATES = new Set<ReceiptState>(["absent", "present", "missing", "unknown"]);
@@ -98,11 +112,21 @@ export function parseStatusReport(result: Parameters<typeof parseEnvelope>[0]): 
 				? { receiptState: receiptState as ReceiptState }
 				: {}),
 			...(outcome && typeof outcome === "object" ? { outcome } : {}),
+			...pickFailure(payload.status?.error),
 		},
 		summaryCompleted: payload.summary?.completed === true,
 	};
 }
 
+function pickFailure(source: unknown): { error?: FailureBody } {
+	if (typeof source !== "object" || source === null) {
+		return {};
+	}
+	const record = source as Record<string, unknown>;
+	const code = typeof record.code === "string" ? { code: record.code } : {};
+	const message = typeof record.message === "string" ? { message: record.message } : {};
+	return Object.keys(code).length + Object.keys(message).length > 0 ? { error: { ...code, ...message } } : {};
+}
 function pickString<K extends string>(source: Record<string, unknown> | undefined, key: K): Partial<Record<K, string>> {
 	const value = source?.[key];
 	return typeof value === "string" ? ({ [key]: value } as Partial<Record<K, string>>) : {};
@@ -112,7 +136,21 @@ function pickNumber<K extends string>(source: Record<string, unknown> | undefine
 	const value = source?.[key];
 	return typeof value === "number" ? ({ [key]: value } as Partial<Record<K, number>>) : {};
 }
+/**
+ * The failure codes that mean "the op's accounting ended, the job may continue".
+ * `prompt_deadline_exceeded` is the measured #9/#10 shape: a lease kill while
+ * worker commits were still landing. Any other (or absent) code stays `failed`.
+ */
+export const ATTEMPT_ENDED_CODES: readonly string[] = ["prompt_deadline_exceeded"];
 
+export function isAttemptEndedCode(code: string | undefined): boolean {
+	return code !== undefined && ATTEMPT_ENDED_CODES.includes(code);
+}
+
+/**
+ * A `failed` status is still terminal for the OP; the projection layer decides
+ * whether it was merely an attempt ending (see {@link isAttemptEndedCode}).
+ */
 export function isTerminalStatus(status: PromptStatus): boolean {
 	return status === "terminal_ok" || status === "failed";
 }
@@ -143,7 +181,7 @@ export function projectOpState(status: PromptStatusBody): SupervisorOpState {
 		return "terminal_uncertain";
 	}
 	if (status.status === "failed") {
-		return "failed";
+		return isAttemptEndedCode(status.error?.code) ? "attempt_ended" : "failed";
 	}
 
 	switch (status.outcome?.reason) {

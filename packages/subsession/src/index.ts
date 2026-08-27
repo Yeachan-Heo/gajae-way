@@ -24,6 +24,28 @@ export {
 	verifyReady,
 } from "./cli";
 export {
+	appendAttempt,
+	applyReconciliation,
+	type ContinuationPlan,
+	classifyWorkEvidence,
+	closeAttempt,
+	createLaneJobRecord,
+	hasNewCommit,
+	type JobAttempt,
+	type JobCheckpoint,
+	LANE_JOB_SCHEMA_VERSION,
+	LaneJobError,
+	type LaneJobRecord,
+	type LaneJobState,
+	MAX_STALLED_CONTINUATIONS,
+	type PlanContinuationInput,
+	parseLaneJobRecord,
+	planContinuation,
+	projectAttemptOutcome,
+	type ReconciliationClass,
+	type RepositoryFacts,
+} from "./job";
+export {
 	isRuntimeSessionId,
 	type LaneClaim,
 	type LaneKind,
@@ -97,7 +119,10 @@ export {
 	SkillUnavailableError,
 } from "./skills";
 export {
+	ATTEMPT_ENDED_CODES,
+	type FailureBody,
 	fetchOpState,
+	isAttemptEndedCode,
 	isPromptStatus,
 	isTerminalStatus,
 	judgeOperation,
