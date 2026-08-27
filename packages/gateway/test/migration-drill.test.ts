@@ -16,7 +16,7 @@ test("migrates a migration-001 database to the latest schema", async () => {
 		legacy.close();
 
 		const database = await GatewayDatabase.open(path);
-		expect(database.schemaVersion).toBe(10);
+		expect(database.schemaVersion).toBe(11);
 		database.close();
 
 		const migrated = new Database(path, { readonly: true });

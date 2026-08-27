@@ -247,7 +247,7 @@ function createRuntime(options: GatewayServerOptions): Runtime {
 					connection.write({ v: PROFILE_VERSION, type: "event", event: "chat.message", payload });
 		},
 	});
-	const monitorRuntime = new MonitorRuntime(options.config, registry, monitors, options.database);
+	const monitorRuntime = new MonitorRuntime(options.config, registry, monitors);
 	const reconcileTimer = setInterval(() => void monitors.reconcile(), 60_000);
 	return {
 		delivery,
@@ -279,8 +279,7 @@ function settleMonitorBatch(database: GatewayDatabase, deliveryId: string, stage
 	const events = database.monitorEventRows().filter((row) => row.batch_id === batchId);
 	if (!events.length) return;
 	database.withTransaction(() => {
-		for (const event of events)
-			if (stage === "delivered" ? event.stage === "authored" : true) database.monitorEventUpdate(event.event_id, stage);
+		for (const event of events) database.monitorEventSettle(event.event_id, stage as "delivered" | "authored");
 	});
 }
 

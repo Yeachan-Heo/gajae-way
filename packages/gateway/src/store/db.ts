@@ -11,7 +11,7 @@ export interface InboundMessageRow {
 	readonly received_at: string;
 }
 
-const LATEST_SCHEMA_VERSION = 10;
+const LATEST_SCHEMA_VERSION = 11;
 /** A scheduled cron slot the gateway claimed or fired for one monitor. */
 export interface MonitorSlotRow {
 	readonly monitor_id: string;
@@ -524,6 +524,63 @@ export class GatewayDatabase {
 			.run(row.eventId, row.monitorId, row.eventType, row.payloadJson, row.firedAt, new Date().toISOString());
 	}
 	/**
+	 * Durable dispatch lease (red-team blocker 1): a process claims an event
+	 * before sending its authoring turn. The claim stores an owner token and an
+	 * expiry; a claim is valid only while `expires_at` is in the future. This
+	 * closes the restart race where the external gjc authoring turn outlives a
+	 * dead gateway process — a new process must not re-author the same event
+	 * concurrently, and only an expired claim may be stolen.
+	 *
+	 * Semantics:
+	 * - claim succeeds iff no live (unexpired) lease exists for the event;
+	 * - stealing replaces the expired lease with a fresh lease_id + owner;
+	 * - `monitorEventReleaseLease` is lease-guarded: a stale attempt whose lease
+	 *   expired and was stolen can never release the newer owner's claim.
+	 */
+	monitorEventAcquireLease(
+		eventId: string,
+		owner: string,
+		leaseId: string,
+		ttlMs: number,
+		now = Date.now(),
+	): boolean {
+		const nowIso = new Date(now).toISOString();
+		const expiresIso = new Date(now + ttlMs).toISOString();
+		const claim = this.#database
+			.query(
+				`INSERT INTO dispatch_leases (event_id, owner, lease_id, acquired_at, expires_at) VALUES (?, ?, ?, ?, ?)
+ON CONFLICT(event_id) DO UPDATE SET owner = excluded.owner, lease_id = excluded.lease_id, acquired_at = excluded.acquired_at, expires_at = excluded.expires_at
+WHERE excluded.acquired_at IS NOT NULL AND (SELECT expires_at FROM dispatch_leases WHERE event_id = excluded.event_id) <= excluded.acquired_at`,
+			)
+			.run(eventId, owner, leaseId, nowIso, expiresIso).changes;
+		return claim > 0;
+	}
+	/** Releases a lease only when the caller still owns it (stale attempts are no-ops). */
+	monitorEventReleaseLease(eventId: string, leaseId: string): void {
+		this.#database
+			.query("DELETE FROM dispatch_leases WHERE event_id = ? AND lease_id = ?")
+			.run(eventId, leaseId);
+	}
+	/** Returns the lease id of the live (unexpired) claim, if any. */
+	monitorEventLiveLeaseOwner(eventId: string, now = Date.now()): string | undefined {
+		const row = this.#database
+			.query<{ lease_id: string; expires_at: string }, [string]>(
+				"SELECT lease_id, expires_at FROM dispatch_leases WHERE event_id = ?",
+			)
+			.get(eventId);
+		if (row && Date.parse(row.expires_at) > now) return row.lease_id;
+		return undefined;
+	}
+	/** True while the given lease is the live claim for the event. */
+	monitorEventLeaseHeld(eventId: string, leaseId: string, now = Date.now()): boolean {
+		const row = this.#database
+			.query<{ lease_id: string; expires_at: string }, [string]>(
+				"SELECT lease_id, expires_at FROM dispatch_leases WHERE event_id = ?",
+			)
+			.get(eventId);
+		return row?.lease_id === leaseId && Date.parse(row.expires_at) > now;
+	}
+	/**
 	 * Fail-closed stage transition: an unknown stage name throws instead of
 	 * writing a state no recovery path understands.
 	 */
@@ -532,6 +589,31 @@ export class GatewayDatabase {
 		this.#database
 			.query("UPDATE monitor_events SET stage = ?, batch_id = COALESCE(?, batch_id), updated_at = ? WHERE event_id = ?")
 			.run(stage, batchId, new Date().toISOString(), eventId);
+	}
+	/**
+	 * Red-team blocker 4: settlement must be MONOTONIC. Once an event is
+	 * terminally settled (`delivered`), a late/out-of-order delivery.fail can
+	 * never regress it; a duplicate confirm is a no-op. Non-terminal stages
+	 * (`authored`) still receive fail-path demotions so failed deliveries stay
+	 * operator-visible.
+	 */
+	monitorEventSettle(eventId: string, stage: "delivered" | "authored"): boolean {
+		const row = this.#database
+			.query<{ stage: string }, [string]>("SELECT stage FROM monitor_events WHERE event_id = ?")
+			.get(eventId);
+		if (!row) return false;
+		if (stage === "delivered" && row.stage !== "delivered") {
+			this.monitorEventUpdate(eventId, "delivered");
+			return true;
+		}
+		// Fail path: only demote events still in `authored`; never touch delivered
+		// (or any terminal stage).
+		if (stage === "authored" && row.stage === "authored") return false;
+		if (stage === "authored" && row.stage !== "delivered" && row.stage !== "authored_no_delivery" && row.stage !== "failed_no_retry") {
+			this.monitorEventUpdate(eventId, "authored");
+			return true;
+		}
+		return false;
 	}
 	/**
 	 * Bumps the reclaim counter; returns the new count. Reconcile stops
@@ -650,6 +732,54 @@ export class GatewayDatabase {
 			)
 			.run(monitorId, slotAt, now).changes;
 		return changes > 0;
+	}
+	/**
+	 * Red-team blocker 2: the slot claim and the event admission commit in ONE
+	 * transaction. A claim row whose event_id is NULL means the gateway fired
+	 * the slot but died before submitting the event — reconcile admits it. A
+	 * crash can therefore strand neither a claimed-but-unadmitted slot (this
+	 * row shape makes it visible) nor a duplicate event (unique slot key).
+	 */
+	monitorSlotClaimWithEvent(row: {
+		monitorId: string;
+		slotAt: string;
+		eventId: string;
+		eventType: string;
+		payloadJson: string;
+	}): boolean {
+		const now = new Date().toISOString();
+		return (
+			this.withTransaction(() => {
+				const claim = this.#database
+					.query(
+						"INSERT INTO monitor_slots (monitor_id, slot_at, event_id, created_at) VALUES (?, ?, ?, ?) ON CONFLICT(monitor_id, slot_at) DO NOTHING",
+					)
+					.run(row.monitorId, row.slotAt, row.eventId, now).changes;
+				if (claim === 0) return false;
+				this.monitorEventCreate({
+					eventId: row.eventId,
+					monitorId: row.monitorId,
+					eventType: row.eventType,
+					payloadJson: row.payloadJson,
+					firedAt: row.slotAt,
+				});
+				return true;
+			}) as boolean
+		);
+	}
+	/** Links an admitted event to its slot claim (repair of an unadmitted claim). */
+	monitorSlotLinkEvent(monitorId: string, slotAt: string, eventId: string): void {
+		this.#database
+			.query("UPDATE monitor_slots SET event_id = ? WHERE monitor_id = ? AND slot_at = ?")
+			.run(eventId, monitorId, slotAt);
+	}
+	/** Slot claims that never produced an event (crash between claim and admit). */
+	monitorSlotUnadmitted(): Array<{ monitor_id: string; slot_at: string; created_at: string }> {
+		return this.#database
+			.query(
+				"SELECT monitor_id, slot_at, created_at FROM monitor_slots WHERE event_id IS NULL ORDER BY slot_at",
+			)
+			.all() as Array<{ monitor_id: string; slot_at: string; created_at: string }>;
 	}
 	monitorSlotExists(monitorId: string, slotAt: string): boolean {
 		const row = this.#database
@@ -837,6 +967,27 @@ CREATE TABLE monitor_slots (monitor_id TEXT NOT NULL, slot_at TEXT NOT NULL, cre
 				this.#database
 					.query("INSERT INTO schema_migrations (version, applied_at) VALUES (?, ?)")
 					.run(10, new Date().toISOString());
+			});
+		}
+		if (current < 11) {
+			this.withTransaction(() => {
+				// Red-team hardening of the #29 recovery design:
+				// - dispatch_leases: durable per-event dispatch ownership (owner token +
+				//   expiry) so a NEW gateway process cannot re-author an event whose
+				//   authoring turn may still be alive in an external gjc session after
+				//   the old process died; only expired claims are recoverable, and a
+				//   stale attempt's completion can never overwrite a newer lease.
+				// - monitor_slots.event_id: slot claim and event admission commit in ONE
+				//   transaction, so a crash between "slot claimed" and "event created"
+				//   cannot strand a fired-but-unadmitted slot.
+				this.#database.exec(
+					`CREATE TABLE dispatch_leases (event_id TEXT PRIMARY KEY, owner TEXT NOT NULL, lease_id TEXT NOT NULL, acquired_at TEXT NOT NULL, expires_at TEXT NOT NULL);
+CREATE INDEX dispatch_leases_expiry ON dispatch_leases (expires_at);
+ALTER TABLE monitor_slots ADD COLUMN event_id TEXT;`,
+				);
+				this.#database
+					.query("INSERT INTO schema_migrations (version, applied_at) VALUES (?, ?)")
+					.run(11, new Date().toISOString());
 			});
 		}
 	}

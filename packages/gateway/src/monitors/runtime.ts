@@ -1,6 +1,5 @@
 import { readFile } from "node:fs/promises";
 import type { GatewayConfig } from "../config";
-import type { GatewayDatabase } from "../store/db";
 import type { MonitorPropagator } from "./propagate";
 import type { MonitorRegistry } from "./registry";
 import { startCron } from "./triggers/cron";
@@ -18,18 +17,18 @@ export class MonitorRuntime {
 	readonly #config: GatewayConfig;
 	readonly #registry: MonitorRegistry;
 	readonly #propagator: MonitorPropagator;
-	readonly #database: GatewayDatabase;
 	#stops: Stop[] = [];
+	readonly #clock?: () => Date;
 	constructor(
 		config: GatewayConfig,
 		registry: MonitorRegistry,
 		propagator: MonitorPropagator,
-		database: GatewayDatabase,
+		options: { now?: () => Date } = {},
 	) {
 		this.#config = config;
 		this.#registry = registry;
 		this.#propagator = propagator;
-		this.#database = database;
+		this.#clock = options.now;
 	}
 	async start(): Promise<void> {
 		await this.stop();
@@ -41,12 +40,17 @@ export class MonitorRuntime {
 				this.#stops.push(
 					startCron(
 						monitor.trigger.schedule,
-						(slotAt) =>
-							this.#propagator.submit(monitor.monitorId, monitor.eventTypes[0]!, { at: slotAt.toISOString() }),
-						{
-							database: this.#database,
-							monitorId: monitor.monitorId,
+						(slotAt) => {
+							// Atomic slot-claim + event admission inside the propagator;
+							// duplicate slots (restart overlap) return null and are skipped.
+							this.#propagator.submitSlot(
+								monitor.monitorId,
+								monitor.eventTypes[0]!,
+								{ at: slotAt.toISOString() },
+								slotAt,
+							);
 						},
+						{ now: this.#clock },
 					),
 				);
 			if (monitor.trigger.kind === "watcher") {

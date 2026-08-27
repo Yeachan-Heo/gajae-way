@@ -26,17 +26,16 @@ export function cronFieldMatches(field: string, value: number, min: number): boo
 	});
 }
 
+/** Absolute minute epoch — identical for the same wall-clock minute worldwide. */
+export function minuteEpoch(date: Date): number {
+	return Math.floor(date.getTime() / 60_000);
+}
+
 /**
  * Exact scheduled slot timestamps for every schedule minute in the half-open
  * window (from, now], oldest first, bounded by `budget`. Slots are computed in
  * LOCAL time — the same wall-clock contract `cronMatches` and every existing
  * cron monitor already run on; no timezone conversion is introduced.
- *
- * `fire` is only called for slots that survived dedupe (the caller claims each
- * slot in `monitor_slots` first), so a restart that spans N due minutes fires
- * exactly N events with the EXACT slot timestamp as payload `at` — never a
- * "recovery storm" replaying the whole gap, and never `now` masquerading as the
- * scheduled time.
  */
 export function cronSlotsBetween(
 	schedule: string,
@@ -60,48 +59,59 @@ export function cronSlotsBetween(
 	return fired;
 }
 
+/** Safety valve: a single catch-up sweep never authorizes more than this many slots. */
+export const DEFAULT_MAX_CATCH_UP_SLOTS = 8;
+
+/** How far back a fresh process looks for missed slots. */
+export const CATCH_UP_WINDOW_MS = 60 * 60 * 1000;
+
+/**
+ * Cron trigger with an absolute-minute cursor (red-team blocker 5).
+ *
+ * - `minute` is an absolute minute EPOCH, never minute-of-hour: a suspended
+ *   process whose next tick lands +60m later on the same wall-minute does not
+ *   return early — the epoch advanced, so the due-window scan still runs.
+ * - `fire(slotAt)` receives the EXACT scheduled slot timestamp (red-team
+ *   blocker 3); the caller persists it as the event's scheduled identity.
+ * - Dedupe/budget durability lives with the caller (the propagator claims the
+ *   slot and admits the event in one transaction); this module only computes
+	 * WHEN slots are due and always scans the bounded window when ticks were
+ *   skipped, keeping catch-up bounded by the caller-side claim + budget.
+ */
 export function startCron(
 	schedule: string,
 	fire: (slotAt: Date) => void,
-	options: { now?: () => Date; database?: GatewayDatabase; monitorId?: string; maxCatchUpSlots?: number } = {},
+	options: { now?: () => Date; maxCatchUpSlots?: number; intervalMs?: number } = {},
 ): () => void {
 	const now = options.now ?? (() => new Date());
-	const database = options.database;
-	const monitorId = options.monitorId;
 	const budget = options.maxCatchUpSlots ?? DEFAULT_MAX_CATCH_UP_SLOTS;
 	let minute = -1;
-	// How far back a fresh process looks for missed slots. Slots older than this
-	// are intentionally skipped: a bounded window prevents a long outage from
-	// turning the first tick into an unbounded authoring storm.
-	const catchUpWindowMs = 60 * 60 * 1000;
-	const claim = (slotAt: Date): boolean => {
-		if (!database || !monitorId) return true;
-		return database.monitorSlotClaim(monitorId, slotAt.toISOString());
-	};
 	const tick = () => {
 		const date = now();
-		if (date.getMinutes() === minute) return;
+		const epoch = minuteEpoch(date);
+		if (epoch === minute) return;
 		if (minute === -1) {
 			// First tick of a fresh process: catch up bounded missed slots with
-			// exact scheduled timestamps, deduped through the persisted slot
-			// ledger. Without this, a restart spanning a due minute silently
-			// skipped that slot forever (issue #29 restart-window loss). The
-			// scan covers the whole window, so it works regardless of whether
-			// the current minute itself matches the schedule.
-			minute = date.getMinutes();
-			const from = new Date(date.getTime() - catchUpWindowMs);
-			cronSlotsBetween(schedule, from, date, budget, (slotAt) => {
-				if (claim(slotAt)) fire(slotAt);
-			});
+			// exact scheduled timestamps. Without this, a restart spanning a due
+			// minute silently skipped that slot forever (issue #29 restart-window
+			// loss). The scan covers the whole window regardless of whether the
+			// current minute itself matches the schedule; caller-side slot claims
+			// keep it exactly-once per slot.
+			minute = epoch;
+			cronSlotsBetween(schedule, new Date(date.getTime() - CATCH_UP_WINDOW_MS), date, budget, fire);
 			return;
 		}
-		if (cronMatches(schedule, date) && claim(date)) fire(date);
-		minute = date.getMinutes();
+		minute = epoch;
+		if (cronMatches(schedule, date)) {
+			fire(date);
+			return;
+		}
+		// Not a due minute — but a long suspension may have skipped due slots
+		// between ticks; scan the bounded window (caller dedupes already-fired
+		// slots, so this only fires genuinely missed ones).
+		cronSlotsBetween(schedule, new Date(date.getTime() - CATCH_UP_WINDOW_MS), date, budget, fire);
 	};
 	tick();
-	const timer = setInterval(tick, 30_000);
+	const timer = setInterval(tick, options.intervalMs ?? 30_000);
 	return () => clearInterval(timer);
 }
-
-/** Safety valve: a single catch-up sweep never authorizes more than this many slots. */
-export const DEFAULT_MAX_CATCH_UP_SLOTS = 8;

@@ -124,6 +124,47 @@ export class MonitorPropagator {
 		return eventId;
 	}
 	/**
+	 * Cron slot admission (red-team blockers 2+3): the slot claim and the event
+	 * row are created in ONE transaction, and the event's `fired_at` IS the
+	 * exact scheduled slot timestamp — the durable record carries the scheduled
+	 * identity, not just the payload. Returns the eventId, or null when the
+	 * slot was already claimed (duplicate tick / restart catch-up overlap).
+	 */
+	submitSlot(monitorId: string, eventType: string, payload: unknown, slotAt: Date): string | null {
+		const monitor = this.#registry.get(monitorId);
+		if (!monitor?.enabled) throw new Error("unknown or disabled monitor");
+		const eventId = crypto.randomUUID();
+		const admitted = this.#database.monitorSlotClaimWithEvent({
+			monitorId,
+			slotAt: slotAt.toISOString(),
+			eventId,
+			eventType,
+			payloadJson: JSON.stringify(payload ?? null),
+		});
+		if (!admitted) return null;
+		this.#emit({ eventId, monitorId, eventType, firedAt: slotAt.toISOString(), stage: "admitted" });
+		const key = `${monitorId}\u0000${eventType}`;
+		if (monitor.burstPolicy === "serialize") {
+			void this.#dispatch([eventId]);
+			return eventId;
+		}
+		const previous = this.#batches.get(key);
+		if (previous) {
+			if (monitor.burstPolicy === "drop") previous.eventIds.splice(0, previous.eventIds.length, eventId);
+			else previous.eventIds.push(eventId);
+			return eventId;
+		}
+		const batch = {
+			eventIds: [eventId],
+			timer: setTimeout(() => {
+				this.#batches.delete(key);
+				void this.#dispatch(batch.eventIds);
+			}, 250),
+		};
+		this.#batches.set(key, batch);
+		return eventId;
+	}
+	/**
 	 * Recovery sweep. Oldest-first, at-most-one concurrent sweep per process:
 	 * - `batched` rows not in this process's in-flight set are orphans of a dead
 	 *   dispatch and are reclaimed exactly like `admitted`/`dispatched`/`failed`
@@ -139,6 +180,26 @@ export class MonitorPropagator {
 		if (this.#reconciling) return;
 		this.#reconciling = true;
 		try {
+			// First: admit any cron slots whose claim committed but whose event row
+			// never did (crash between the two writes in a non-atomic path). The
+			// slot row keeps the scheduled identity, so recovery restores the event
+			// with its exact scheduled fired_at.
+			for (const slot of this.#database.monitorSlotUnadmitted()) {
+				const monitor = this.#registry.get(slot.monitor_id);
+				if (!monitor?.enabled) continue;
+				const eventId = crypto.randomUUID();
+				const eventType = monitor.eventTypes[0] ?? "monitor.event";
+				this.#database.withTransaction(() => {
+					this.#database.monitorEventCreate({
+						eventId,
+						monitorId: slot.monitor_id,
+						eventType,
+						payloadJson: JSON.stringify({ at: slot.slot_at }),
+						firedAt: slot.slot_at,
+					});
+					this.#database.monitorSlotLinkEvent(slot.monitor_id, slot.slot_at, eventId);
+				});
+			}
 			// Replay oldest-first: recovery must re-author events in the order they fired.
 			for (const row of this.#database.monitorEventRows(undefined, "oldest")) {
 				if ((TERMINAL_STAGES as readonly string[]).includes(row.stage)) continue;
@@ -148,6 +209,11 @@ export class MonitorPropagator {
 					.some((intent) => intent.kind === "monitor-event" && intent.payload_json.includes(row.event_id));
 				if (output && !hasMemory) this.#author(row.event_id, output, row.stage === "authored_no_delivery");
 				else if (!output && this.#recoverable(row)) {
+					// Red-team blocker 1: a live dispatch lease owned by ANOTHER attempt
+					// means the authoring turn may still complete elsewhere; a new
+					// process must not re-author concurrently. Only unclaimed events
+					// are reclaimed here (the dispatcher acquires its own lease).
+					if (this.#database.monitorEventLiveLeaseOwner(row.event_id)) continue;
 					if (row.dispatch_attempts >= MONITOR_EVENT_MAX_DISPATCH_ATTEMPTS) {
 						this.#database.withTransaction(() =>
 							this.#database.monitorEventUpdate(row.event_id, "failed_no_retry", null),
@@ -192,11 +258,26 @@ export class MonitorPropagator {
 		const monitor = this.#registry.get(rows[0]?.monitor_id);
 		if (!monitor) return;
 		const batchId = crypto.randomUUID();
+		// Red-team blocker 1: acquire a durable lease per event BEFORE claiming the
+		// batch. The lease survives this process (owner token + expiry), so a new
+		// gateway process whose reconcile sees the stranded `batched` rows will NOT
+		// re-author while this attempt is live. Events whose lease is held by a
+		// live claim from another attempt are skipped here.
+		const owner = `gateway:${process.pid}`;
+		const leaseId = crypto.randomUUID();
+		const leaseTtlMs = 10 * 60_000;
+		const leased: typeof rows = [];
+		for (const row of rows) {
+			if (this.#database.monitorEventLiveLeaseOwner(row.event_id)) continue;
+			this.#database.monitorEventAcquireLease(row.event_id, owner, leaseId, leaseTtlMs);
+			leased.push(row);
+		}
+		if (!leased.length) return;
 		this.#database.withTransaction(() => {
-			for (const row of rows) this.#database.monitorEventUpdate(row.event_id, "batched", batchId);
+			for (const row of leased) this.#database.monitorEventUpdate(row.event_id, "batched", batchId);
 		});
 		const declared = new Set(monitor.eventTypes);
-		const sessionOrigin = declared.has(rows[0]?.event_type)
+		const sessionOrigin = declared.has(leased[0]?.event_type)
 			? eventTypeOrigin(rows[0]?.event_type)
 			: CATCH_ALL_EVENT_ORIGIN;
 		try {
@@ -204,14 +285,14 @@ export class MonitorPropagator {
 				originKey(sessionOrigin),
 				this.#database.getSessionRecord(originKey(sessionOrigin))?.epoch ?? 0,
 			);
-			const guidance = rows
+			const guidance = leased
 				.map((row) => MAINTENANCE_GUIDANCE[row.event_type])
 				.filter((entry, index, all) => entry && all.indexOf(entry) === index)
 				.join(" ");
-			const prompt = `Author monitor events.${guidance ? ` ${guidance}` : ""} Respond ONLY with a JSON array containing exactly one {"eventId","note"} entry per event: ${JSON.stringify(rows.map((row) => ({ eventId: row.event_id, eventType: row.event_type, payload: JSON.parse(row.payload_json) })))}`;
+			const prompt = `Author monitor events.${guidance ? ` ${guidance}` : ""} Respond ONLY with a JSON array containing exactly one {"eventId","note"} entry per event: ${JSON.stringify(leased.map((row) => ({ eventId: row.event_id, eventType: row.event_type, payload: JSON.parse(row.payload_json) })))}`;
 			const response = await this.#gjc.sendTurn(sessionId, prompt);
 			this.#database.withTransaction(() => {
-				for (const row of rows) this.#database.monitorEventUpdate(row.event_id, "dispatched", batchId);
+				for (const row of leased) this.#database.monitorEventUpdate(row.event_id, "dispatched", batchId);
 			});
 			const authored = JSON.parse(response) as Array<{ eventId?: unknown; note?: unknown }>;
 			if (!Array.isArray(authored)) throw new Error("authoring response is not an array");
@@ -226,7 +307,7 @@ export class MonitorPropagator {
 			const target = monitor.channelTarget ?? this.#ownerTarget;
 			if (!target) {
 				this.#database.withTransaction(() => {
-					for (const row of rows)
+					for (const row of leased)
 						if (this.#database.authoredOutput(row.event_id) !== undefined)
 							this.#database.monitorEventUpdate(row.event_id, "authored_no_delivery", batchId);
 				});
@@ -255,12 +336,17 @@ export class MonitorPropagator {
 			// The raw error body can carry secrets and is never persisted or logged.
 			const code: DispatchFailureCode = failureCode(error);
 			this.#database.withTransaction(() => {
-				for (const row of rows) {
+				for (const row of leased) {
 					this.#database.monitorEventUpdate(row.event_id, "failed", batchId);
 					this.#database.monitorFailureRecord(row.event_id, code, `dispatch phase failed (${code})`);
 				}
 			});
-			console.error(`monitor dispatch failed (${code}): events ${rows.map((row) => row.event_id).join(",")}`);
+			console.error(`monitor dispatch failed (${code}): events ${leased.map((row) => row.event_id).join(",")}`);
+		} finally {
+			// Release the leases this attempt holds. Lease-guarded: if this attempt
+			// expired and another process stole the claim, this release is a no-op,
+			// and a stale attempt's completion can never overwrite the newer claim.
+			for (const row of leased) this.#database.monitorEventReleaseLease(row.event_id, leaseId);
 		}
 	}
 	#author(eventId: string, note: string, noDelivery = false): void {
