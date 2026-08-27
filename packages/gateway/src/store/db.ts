@@ -78,16 +78,18 @@ export class GatewayDatabase {
 
 	/**
 	 * Rebind reset for a poisoned gjc session key (#13): the same semantics as
-	 * the `/new` reset path — epoch + 1 and the gjc binding cleared, so the next
-	 * session.create op derives a fresh idempotency key — but the stored origin
-	 * ref is kept, because a rebind is a runtime recovery rather than a user
-	 * command and carries no origin payload of its own.
+	 * the `/new` reset path — epoch + 1, turn_count back to 0, and the gjc
+	 * binding cleared, so the next session.create op derives a fresh idempotency
+	 * key and a recovery near the rotation boundary cannot instantly discard its
+	 * fresh binding on an inherited count — but the stored origin ref is kept,
+	 * because a rebind is a runtime recovery rather than a user command and
+	 * carries no origin payload of its own.
 	 */
 	rebindEpoch(originKey: string): number {
 		const now = new Date().toISOString();
 		this.#database
 			.query(
-				"INSERT INTO sessions (origin_key, gjc_session_id, epoch, created_at, last_activity_at) VALUES (?, '', 1, ?, ?) ON CONFLICT(origin_key) DO UPDATE SET epoch = epoch + 1, gjc_session_id = '', last_activity_at = excluded.last_activity_at",
+				"INSERT INTO sessions (origin_key, gjc_session_id, epoch, turn_count, created_at, last_activity_at) VALUES (?, '', 1, 0, ?, ?) ON CONFLICT(origin_key) DO UPDATE SET epoch = epoch + 1, gjc_session_id = '', turn_count = 0, last_activity_at = excluded.last_activity_at",
 			)
 			.run(originKey, now, now);
 		const row = this.#database

@@ -483,3 +483,69 @@ test("terminal_uncertain is logged once and the next code is classified independ
 		database.close();
 	}
 });
+
+test("a shared bind that fails rejects every waiter identically and later retries cleanly", async () => {
+	const database = await makeDatabase("gajaeway-takeover-shared-reject-");
+	let failing = true;
+	const spawn = ((options: { cmd: string[] }) => {
+		if (!options.cmd.includes("session.create")) throw new Error("unexpected turn spawn");
+		return failing
+			? fakeChild(createFailure("terminal_uncertain", "cleanup could not be proven"), "", 1)
+			: fakeChild(createSuccess("session-ok"));
+	}) as unknown as typeof Bun.spawn;
+	const client = new GjcClient(database, 5_000, directory, undefined, { spawn });
+	try {
+		const first = client.ensureSession("discord:dm:shared", 0);
+		const second = client.ensureSession("discord:dm:shared", 0);
+		const [firstOutcome, secondOutcome] = await Promise.all([
+			first.then(
+				(value) => `resolved:${value.sessionId}`,
+				(error: unknown) => `rejected:${(error as Error).message}`,
+			),
+			second.then(
+				(value) => `resolved:${value.sessionId}`,
+				(error: unknown) => `rejected:${(error as Error).message}`,
+			),
+		]);
+		expect(firstOutcome).toBe(secondOutcome);
+		expect(firstOutcome).toContain("terminal_uncertain");
+		// The finally reaper must have cleared the settled entry: the next call
+		// performs a NEW bind instead of replaying the rejected promise.
+		failing = false;
+		await expect(client.ensureSession("discord:dm:shared", 0)).resolves.toMatchObject({ sessionId: "session-ok" });
+	} finally {
+		database.close();
+	}
+});
+
+test("a code-only envelope with secret-bearing stderr never logs the raw fallback", async () => {
+	const database = await makeDatabase("gajaeway-takeover-codeonly-");
+	const leaked = "sk_live_0123456789abcdef012345";
+	const envelope = `${JSON.stringify({ ok: false, operation: "session.create", error: { code: "resource_gone" } })}\n`;
+	const spawn = (() => fakeChild(envelope, `auth failed for ${leaked}`, 1)) as unknown as typeof Bun.spawn;
+	const client = new GjcClient(database, 5_000, directory, undefined, { spawn });
+	try {
+		const error = await client.ensureSession("discord:dm:codeonly").catch((failure: unknown) => failure);
+		expect(error).toMatchObject({ code: "resource_gone" });
+		expect(String((error as Error).message)).not.toContain(leaked);
+		expect((error as GjcRuntimeError).runtimeMessage).not.toContain(leaked);
+	} finally {
+		database.close();
+	}
+});
+
+test("rebindEpoch resets turn_count so a recovery near rotation keeps its fresh binding", async () => {
+	const database = await makeDatabase("gajaeway-takeover-rotation-");
+	try {
+		database.rebindEpoch("discord:dm:rotation");
+		expect(database.incrementTurnCount("discord:dm:rotation")).toBe(1);
+		database.incrementTurnCount("discord:dm:rotation");
+		database.incrementTurnCount("discord:dm:rotation");
+		// The /new-equivalent reset semantics: a rebinding key starts its count at
+		// zero again rather than inheriting the dead epoch's count.
+		database.rebindEpoch("discord:dm:rotation");
+		expect(database.incrementTurnCount("discord:dm:rotation")).toBe(1);
+	} finally {
+		database.close();
+	}
+});

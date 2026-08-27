@@ -5,9 +5,9 @@ import {
 	GjcRuntimeError,
 	type RuntimeErrorDetail,
 	rebindableCodeOf,
-	redactSecrets,
 	runtimeErrorOfEnvelope,
 	SessionRebinder,
+	sanitizeDiagnostic,
 } from "./rebind";
 
 export interface TurnProgress {
@@ -234,10 +234,20 @@ export class GjcClient implements GjcPort {
 		if (cached) return { sessionId: cached };
 		// One bind in flight per origin+epoch: without this, two concurrent callers
 		// whose create fails rebindably EACH bump the epoch and mint a session where
-		// the contract is exactly one rebind per condemned key. Chat turns are
-		// serialized per origin upstream; monitor propagation and any future direct
-		// caller are not. Settled entries are reaped in finally, so the map stays
-		// bounded to actually-concurrent binds.
+		// the contract is exactly one rebind per condemned key. Settled entries are
+		// reaped in finally, so the map stays bounded to actually-concurrent binds.
+		return this.#bindAt(originKey, epoch, options);
+	}
+
+	/**
+	 * The ONE bind coordinator for every origin+epoch. Chat turns are serialized
+	 * per origin upstream by KeyedQueue, but monitor propagation, future direct
+	 * callers, and sendTurn's own turn-level rebind path are not — so every bind,
+	 * whatever its caller, goes through here: first caller performs
+	 * create-or-rebind, joiners await the same settled promise and receive the
+	 * identical binding instead of racing a second epoch bump.
+	 */
+	#bindAt(originKey: string, epoch: number, options?: TurnOptions): Promise<{ sessionId: string }> {
 		const cacheKey = `${originKey}#${epoch}`;
 		const existing = this.#inflight.get(cacheKey);
 		if (existing) return existing;
@@ -320,6 +330,14 @@ export class GjcClient implements GjcPort {
 		this.#forgetOrigin(originKey);
 		this.#sessions.set(cacheKey, sessionId);
 		this.#origins.set(sessionId, { originKey, epoch });
+		// Epoch-conditional publication: if another path rebound this origin PAST
+		// our epoch while our create was in flight, our stale binding must not
+		// overwrite theirs — the newer key is the live one.
+		const persistedEpoch = this.#database.getSessionRecord(originKey)?.epoch ?? -1;
+		if (persistedEpoch > epoch) {
+			console.warn(`gateway discarding superseded bind ${originKey}#e${epoch}; persisted epoch is e${persistedEpoch}`);
+			return { sessionId };
+		}
 		this.#database.withTransaction(() => this.#database.putSession(originKey, sessionId));
 		// The budget is deliberately NOT cleared here: a fresh key always creates,
 		// so clearing on create would make the cap unreachable for a recurring
@@ -385,7 +403,10 @@ export class GjcClient implements GjcPort {
 			const nextEpoch = this.#rebinder.rebind(binding.originKey, code, fromEpoch);
 			this.#sessions.delete(`${binding.originKey}#${binding.epoch}`);
 			this.#origins.delete(sessionId);
-			const rebound = await this.#createSession(binding.originKey, nextEpoch, options);
+			// The turn-level rebind binds through the SAME coordinator as
+			// ensureSession, so a concurrent ensureSession for this origin joins the
+			// fresh binding instead of racing its own epoch bump.
+			const rebound = await this.#bindAt(binding.originKey, nextEpoch, options);
 			if (observed.toolCalls > 0 || observed.hadText || observed.outputTokens > 0 || observed.pending) {
 				// Report the evidence that actually blocked the replay, and give it its
 				// own code: the automatic rebind already happened, so telling the user
@@ -516,15 +537,18 @@ export class GjcClient implements GjcPort {
  * attached so the caller classifies on the CODE rather than on this string.
  */
 function runtimeFailure(context: string, detail: RuntimeErrorDetail | undefined, fallback: string): GjcRuntimeError {
-	// Redact at construction: this error's message is what every downstream catch
-	// logs verbatim (daemon log is owner-visible), so the same secret-only
-	// redaction the delivered notice applies must hold here — an envelope-less
-	// stderr echo of a credential must not survive into any durable record.
+	// Sanitize at construction: this error's message is what every downstream
+	// catch logs verbatim (daemon log is owner-visible), so control-character
+	// stripping and the same secret-only redaction the delivered notice applies
+	// must hold here — an envelope-less stderr echo of a credential, including a
+	// code-only envelope where stderr becomes the message, must not survive into
+	// any durable record. A fully-sanitized-empty result keeps the gateway's own
+	// framing so the error is never blanked into meaninglessness.
 	const resolved: RuntimeErrorDetail = detail ?? { message: fallback };
-	const message = resolved.message !== undefined ? redactSecrets(resolved.message) : fallback;
-	const rendered = `${resolved.code ? `${redactSecrets(resolved.code)}: ` : ""}${message}`;
-	return new GjcRuntimeError(`${context}: ${rendered}`, {
-		code: resolved.code,
+	const code = resolved.code ? sanitizeDiagnostic(resolved.code) || undefined : undefined;
+	const message = sanitizeDiagnostic(resolved.message ?? fallback) || context;
+	return new GjcRuntimeError(`${context}: ${code ? `${code}: ` : ""}${message}`, {
+		...(code ? { code } : {}),
 		message,
 	});
 }

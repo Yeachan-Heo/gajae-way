@@ -228,10 +228,21 @@ export function startStdioServer(options: GatewayServerOptions): GatewayServer {
 	runtime.connections.add(connection);
 	let stopping = false;
 	let stopPromise: Promise<void> | undefined;
+	// The stdio daemon gets the SAME reload trigger as the Unix server: an
+	// operator (or supervisor) may signal either form, and deployment.md claims
+	// SIGHUP for a running gateway without qualifying the transport.
+	const onHup = () =>
+		void applyConfigReload(runtime, options, "SIGHUP").catch((error: unknown) =>
+			console.error(
+				`gateway config reload (SIGHUP) crashed: ${error instanceof Error ? error.message : String(error)}`,
+			),
+		);
+	process.on("SIGHUP", onHup);
 	const stop = (reason = "shutdown requested") => {
 		if (stopPromise) return stopPromise;
 		stopping = true;
 		stopPromise = (async () => {
+			process.off("SIGHUP", onHup);
 			connection.write({ v: PROFILE_VERSION, type: "event", event: "gateway.stopping", payload: { reason } });
 			clearInterval(runtime.reconcileTimer);
 			await runtime.turns.settle();

@@ -353,10 +353,20 @@ function isDiagnosticWord(value: string): boolean {
 function firstDiagnosis(...candidates: (string | undefined)[]): string | undefined {
 	for (const candidate of candidates) {
 		if (candidate === undefined) continue;
-		const cleaned = redactSecrets(stripControl(candidate, true)).trim();
+		const cleaned = sanitizeDiagnostic(candidate);
 		if (cleaned) return cleaned;
 	}
 	return undefined;
+}
+
+/**
+ * The one sanitizer for error text that is persisted or logged, not just
+ * delivered: control-character stripping FIRST (so a split secret cannot be
+ * reassembled around NULs), then redaction, then trim. Generic catches log
+ * `error.message` verbatim, so anything embedded in a throwable must pass here.
+ */
+export function sanitizeDiagnostic(text: string): string {
+	return redactSecrets(stripControl(text, true)).trim();
 }
 
 /**
