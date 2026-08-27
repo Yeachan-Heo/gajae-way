@@ -608,7 +608,7 @@ async function sendChat(
 		// An explicit reset is the manual form of a rebind, so it also restores the
 		// automatic rebind budget: otherwise an origin that spent its cap would stay
 		// capped even after the operator did exactly what the notice asked for.
-		options.gjc.forgetRebinds?.(key);
+		options.gjc.forgetRebinds(key);
 		const payload = {
 			turnId: crypto.randomUUID(),
 			origin,

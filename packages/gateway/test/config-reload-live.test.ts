@@ -89,6 +89,7 @@ async function daemon(initial: Record<string, unknown>): Promise<{ client: Clien
 	const database = await GatewayDatabase.open(config.dbPath);
 	const gjc: GjcPort = {
 		ensureSession: async () => ({ sessionId: "mock-session" }),
+		forgetRebinds: () => {},
 		sendTurn: async () => "mock reply",
 	};
 	server = await startUnixServer({ config, database, gjc, onStop: () => database.close() });

@@ -51,9 +51,11 @@ export interface GjcPort {
 	): Promise<string>;
 	/**
 	 * Forgets an origin's rebind budget after an explicit operator reset (`/new`),
-	 * which is the manual form of the same remedy.
+	 * which is the manual form of the same remedy. Required, not optional: the
+	 * server wiring that makes the `/new` remedy real must not be able to become a
+	 * silent no-op behind an absent method.
 	 */
-	forgetRebinds?(originKey: string): void;
+	forgetRebinds(originKey: string): void;
 }
 
 /**
@@ -330,11 +332,25 @@ export class GjcClient implements GjcPort {
 			this.#sessions.delete(`${binding.originKey}#${binding.epoch}`);
 			this.#origins.delete(sessionId);
 			const rebound = await this.#createSession(binding.originKey, nextEpoch, options);
-			if (observed.toolCalls > 0 || observed.hadText || observed.outputTokens > 0)
+			if (observed.toolCalls > 0 || observed.hadText || observed.outputTokens > 0) {
+				// Report the evidence that actually blocked the replay, and give it its
+				// own code: the automatic rebind already happened, so telling the user
+				// to /new here would bump a second epoch and discard the fresh binding.
+				const evidence = [
+					observed.toolCalls > 0 ? `${observed.toolCalls} tool call(s)` : undefined,
+					observed.hadText ? "assistant text" : undefined,
+					observed.outputTokens > 0 ? `${observed.outputTokens} output token(s)` : undefined,
+				]
+					.filter((part) => part !== undefined)
+					.join(", ");
 				throw new GjcRuntimeError(
-					`${error instanceof Error ? error.message : String(error)} (rebound to e${nextEpoch}; the turn was not replayed because it had already run ${observed.toolCalls} tool call(s))`,
-					{ ...(code ? { code } : {}), message: `${code}: the turn had already started work, so it was not replayed` },
+					`${error instanceof Error ? error.message : String(error)} (rebound to e${nextEpoch}; not replayed because the turn had already produced ${evidence})`,
+					{
+						code: "turn_not_replayed",
+						message: `${code}: the turn had already produced ${evidence}, so it was rebound to e${nextEpoch} but not replayed`,
+					},
 				);
+			}
 			return await this.#runTurn(rebound.sessionId, text, systemPreamble, onProgress, options);
 		}
 	}

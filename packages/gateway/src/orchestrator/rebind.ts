@@ -154,9 +154,27 @@ export function runtimeErrorOfEnvelope(envelope: unknown): RuntimeErrorDetail | 
 }
 
 /**
+ * Removes transport control characters so they cannot be used to smuggle a
+ * secret past the redactor: `sk_live_\u0000deadbeef…` matches no key pattern
+ * while the NUL is present, and stripping it afterwards would reassemble the
+ * key in the clear. Normalization therefore always runs BEFORE redaction.
+ * Newlines and tabs survive in messages because they carry real structure.
+ */
+function stripControl(text: string, keepWhitespace = false): string {
+	return text.replace(/\p{C}/gu, (character) =>
+		keepWhitespace && (character === "\n" || character === "\t") ? character : "",
+	);
+}
+
+/**
  * Secret scrubbing for text that reaches a chat surface. This redacts SECRETS
  * ONLY: a runtime code such as `unsupported_state_version` is the whole
  * diagnosis and is never sensitive, so nothing else is erased.
+ *
+ * Deliberately a denylist of known secret SHAPES rather than an entropy
+ * heuristic: "redact nothing but secrets" means an opaque-looking diagnostic
+ * (a session id, a hash, a state version) must survive intact, and an
+ * entropy rule cannot tell those from a key.
  */
 export function redactSecrets(text: string): string {
 	return (
@@ -165,9 +183,11 @@ export function redactSecrets(text: string): string {
 			// key=value rule below would otherwise consume only the scheme word and
 			// leave the token itself in the clear.
 			.replace(/\b(Bearer|Basic|Token)\s+[A-Za-z0-9._~+/=-]{8,}/gi, "$1 [redacted]")
-			// key=value / key: value secret shapes, keeping the key name visible.
+			// key=value / key: value secret shapes, keeping the key name visible. The
+			// key word may carry affixes, so AWS_SECRET_ACCESS_KEY= is caught as well
+			// as a bare secret=.
 			.replace(
-				/((?:token|secret|password|passwd|api[_-]?key|apikey|credential|authorization|auth|bearer)["']?\s*[:=]\s*["']?)[^\s"',}]+/gi,
+				/([A-Za-z0-9_]{0,24}(?:token|secret|password|passwd|api[_-]?key|apikey|credential|authorization|auth|bearer)[A-Za-z0-9_]{0,24}["']?\s*[:=]\s*["']?)[^\s"',}]+/gi,
 				"$1[redacted]",
 			)
 			// Vendor key prefixes, in both dash and underscore spellings.
@@ -178,11 +198,15 @@ export function redactSecrets(text: string): string {
 	);
 }
 
-/** The first of these that survives redaction and trimming as non-empty. */
+/**
+ * The first candidate that survives control-character stripping, redaction and
+ * trimming as non-empty. A child killed mid-write can emit a buffer of control
+ * characters, which must not pass for a diagnosis.
+ */
 function firstDiagnosis(...candidates: (string | undefined)[]): string | undefined {
 	for (const candidate of candidates) {
 		if (candidate === undefined) continue;
-		const cleaned = redactSecrets(candidate).trim();
+		const cleaned = redactSecrets(stripControl(candidate, true)).trim();
 		if (cleaned) return cleaned;
 	}
 	return undefined;
@@ -195,9 +219,11 @@ function firstDiagnosis(...candidates: (string | undefined)[]): string | undefin
  * #14 exists to remove, so the gateway's own framing is used as the fallback.
  */
 export function describeFailure(error: unknown): RuntimeErrorDetail & { readonly text: string } {
-	// The code reaches a chat surface too, so it is redacted and bounded exactly
-	// like the message; a secret pasted into a code field must not ride along.
-	const code = error instanceof GjcRuntimeError ? normalizeCode(redactSecrets(error.code ?? "")) : undefined;
+	// The code reaches a chat surface too, so it is normalized, then redacted, then
+	// bounded — a secret pasted into a code field must not ride along, and control
+	// characters must not be able to smuggle it past the redactor.
+	const normalizedCode = error instanceof GjcRuntimeError ? normalizeCode(error.code) : undefined;
+	const code = normalizedCode ? redactSecrets(normalizedCode) : undefined;
 	const message =
 		firstDiagnosis(
 			error instanceof GjcRuntimeError ? error.runtimeMessage : undefined,

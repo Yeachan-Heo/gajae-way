@@ -298,7 +298,9 @@ test("a turn that already ran a tool is NOT replayed after the rebind", async ()
 	]);
 	try {
 		const { sessionId } = await client.ensureSession("discord:dm:c1");
-		await expect(client.sendTurn(sessionId, "hello")).rejects.toThrow(/not replayed because it had already run 1 tool/);
+		await expect(client.sendTurn(sessionId, "hello")).rejects.toThrow(
+			/not replayed because the turn had already produced 1 tool call/,
+		);
 		// Rebound so the NEXT turn works, but the turn itself was not re-run.
 		expect(logs).toHaveLength(1);
 		expect(database.getSessionRecord("discord:dm:c1")).toEqual({ sessionId: "session-e1", epoch: 1 });
@@ -478,6 +480,64 @@ test("secret-looking values are redacted while the diagnostic code survives", ()
 	);
 });
 
+test("a control-character-split secret cannot be reassembled past the redactor", () => {
+	// Normalization must run BEFORE redaction: stripping the NUL first would let
+	// the key escape every pattern and then be reassembled in the clear.
+	const inCode = formatFailureNotice(
+		new GjcRuntimeError("wrapped", { code: "sk_live_\u0000deadbeefcafebabe0123", message: "startup failed" }),
+	);
+	expect(inCode).not.toContain("deadbeefcafebabe0123");
+	const inMessage = formatFailureNotice(
+		new GjcRuntimeError("wrapped", { code: "spawn_failed", message: "token=sk-ant\u200b-api03-abcdefghijklmnop" }),
+	);
+	expect(inMessage).not.toContain("api03-abcdefghijklmnop");
+	expect(inMessage).toContain("[redacted]");
+});
+
+test("an affixed secret key name is still redacted", () => {
+	// The key word carries affixes in real environments, so requiring it to sit
+	// immediately next to the delimiter missed the most common shape of all.
+	for (const message of [
+		"AWS_SECRET_ACCESS_KEY=wJalrXUtnFEMIK7MDENGbPxRfiCYEXAMPLEKEY refused",
+		"GITHUB_TOKEN=ghs_abcdefghijklmnopqrstuvwxyz rejected",
+		"my_api_key_value: hunter2hunter2hunter2",
+	]) {
+		const notice = formatFailureNotice(new GjcRuntimeError("wrapped", { code: "spawn_failed", message }));
+		expect(notice).toContain("[redacted]");
+		for (const leak of [
+			"wJalrXUtnFEMIK7MDENGbPxRfiCYEXAMPLEKEY",
+			"abcdefghijklmnopqrstuvwxyz",
+			"hunter2hunter2hunter2",
+		])
+			expect(notice).not.toContain(leak);
+	}
+	// A diagnostic that merely mentions state is untouched.
+	expect(redactSecrets("unsupported_state_version at schema 8")).toBe("unsupported_state_version at schema 8");
+});
+
+test("a message of only control characters does not pass for a diagnosis", () => {
+	// A SIGKILLed child can dump a partial binary buffer; .trim() does not remove
+	// C0 controls, so this used to deliver a visually bare notice.
+	expect(formatFailureNotice(new GjcRuntimeError("", { message: "\u0000\u0001\u0002" }))).toBe(
+		"[turn failed] the runtime produced no diagnosis",
+	);
+});
+
+test("the no-replay failure reports its real evidence and does NOT advise /new", () => {
+	// The automatic rebind already happened; advising /new here would bump a
+	// second epoch and discard the freshly bound transcript.
+	const notice = formatFailureNotice(
+		new GjcRuntimeError("gjc turn exited 1 (rebound to e1)", {
+			code: "turn_not_replayed",
+			message:
+				"managed_append_identity_mismatch: the turn had already produced assistant text, so it was rebound to e1 but not replayed",
+		}),
+	);
+	expect(notice).toContain("turn_not_replayed");
+	expect(notice).toContain("assistant text");
+	expect(notice).not.toContain("/new");
+});
+
 test("bare header tokens and underscore-form vendor keys are redacted too", () => {
 	const cases = [
 		"startup rejected by Authorization: Bearer abcDEF123456ghiJKL",
@@ -511,6 +571,43 @@ test("a secret pasted into the CODE field is redacted, and a runaway code is bou
 	// Bounded for a chat surface rather than shipping a 4000-character code.
 	expect(runaway.length).toBeLessThan(400);
 	expect(runaway).toContain("…");
+});
+
+test("the server's /new handler really resets the rebind budget", async () => {
+	// The wiring that makes the cap-exceeded remedy real: without it the notice
+	// tells the user to send /new and nothing changes.
+	directory = await mkdtemp(join(tmpdir(), "gajaeway-rebind-server-"));
+	const config: GatewayConfig = {
+		schemaVersion: 1,
+		home: directory,
+		configPath: join(directory, "config.json"),
+		socketPath: join(directory, "gateway.sock"),
+		dbPath: join(directory, "gateway.db"),
+		logVerbosity: "info",
+	};
+	const database = await GatewayDatabase.open(config.dbPath);
+	const forgotten: string[] = [];
+	const gjc: GjcPort = {
+		ensureSession: async () => ({ sessionId: "mock-session" }),
+		forgetRebinds: (originKey) => forgotten.push(originKey),
+		sendTurn: async () => "mock reply",
+	};
+	server = await startUnixServer({ config, database, gjc, onStop: () => database.close() });
+	const socket = await Bun.connect({ unix: config.socketPath, socket: { data: () => {} } });
+	socket.write(`${JSON.stringify({ v: "0.1", type: "hello", payload: { supportedVersions: ["0.1"] } })}\n`);
+	await Bun.sleep(60);
+	socket.write(
+		`${JSON.stringify({
+			v: "0.1",
+			type: "request",
+			id: "new",
+			verb: "chat.send",
+			params: { origin: { platform: "discord", kind: "dm", conversationId: "c1", peerId: "p1" }, text: "/new" },
+		})}\n`,
+	);
+	for (let attempt = 0; attempt < 200 && forgotten.length === 0; attempt++) await Bun.sleep(5);
+	expect(forgotten).toEqual(["discord/dm/c1/peer=p1"]);
+	socket.end();
 });
 
 test("an unfamiliar code shape is still REPORTED, but never classified rebindable", () => {
@@ -553,6 +650,7 @@ test("a failed platform turn delivers the runtime code and message in the notice
 	const database = await GatewayDatabase.open(config.dbPath);
 	const gjc: GjcPort = {
 		ensureSession: async () => ({ sessionId: "mock-session" }),
+		forgetRebinds: () => {},
 		sendTurn: async () => {
 			throw new GjcRuntimeError("gjc turn exited 1", {
 				code: "spawn_failed",

@@ -230,14 +230,38 @@ export function parseConfigFile(value: unknown): GatewayConfigFile {
 }
 
 export async function loadConfig(
-	options: { readonly home?: string; readonly env?: NodeJS.ProcessEnv; readonly overrides?: ConfigOverrides } = {},
+	options: {
+		readonly home?: string;
+		readonly env?: NodeJS.ProcessEnv;
+		readonly overrides?: ConfigOverrides;
+		/**
+		 * Require config.json to exist and be readable. Absent means defaults, which
+		 * is right at BOOT and wrong on RELOAD: publishing defaults over live policy
+		 * drops mentionAllowlist and channels and opens a mention-gated room. The
+		 * check lives here, next to the read, so there is no window between a
+		 * caller's stat and this one — and so a future reload-ish caller cannot
+		 * reintroduce the hole by forgetting to guard.
+		 */
+		readonly requireFile?: boolean;
+	} = {},
 ): Promise<GatewayConfig> {
 	const home = options.home ?? gatewayHome(options.env);
 	const configPath = join(home, "config.json");
 	let fileConfig: GatewayConfigFile = { schemaVersion: CONFIG_SCHEMA_VERSION };
-	if (await Bun.file(configPath).exists()) {
+	let raw: string | undefined;
+	try {
+		raw = await Bun.file(configPath).text();
+	} catch (error) {
+		// ENOENT, EISDIR and EACCES all land here.
+		if (options.requireFile)
+			throw new ConfigError(
+				"config_invalid",
+				`${configPath} is missing or unreadable (${(error as NodeJS.ErrnoException).code ?? "unknown"}); keeping the previous configuration`,
+			);
+	}
+	if (raw !== undefined) {
 		try {
-			fileConfig = parseConfigFile(JSON.parse(await Bun.file(configPath).text()));
+			fileConfig = parseConfigFile(JSON.parse(raw));
 		} catch (error) {
 			if (error instanceof ConfigError) throw error;
 			throw new ConfigError("config_invalid", `could not parse ${configPath}`);
@@ -262,25 +286,9 @@ export async function loadConfig(
  * silently ignored or half-honoured.
  */
 export async function reloadConfig(current: GatewayConfig, overrides: ConfigOverrides = {}): Promise<ReloadResult> {
-	// A missing or unreadable config.json is NOT "no configuration": at boot it
-	// legitimately means defaults, but on reload it would silently publish those
-	// defaults over live policy — dropping mentionAllowlist and channels, which
-	// opens a mention-gated room to anyone. An unreadable file is exactly when the
-	// previous config must be retained.
-	if (!(await Bun.file(current.configPath).exists()))
-		return {
-			ok: false,
-			config: current,
-			diagnostics: [
-				{
-					code: "config_invalid",
-					message: `${current.configPath} is missing or unreadable; keeping the previous configuration`,
-				},
-			],
-		};
 	let candidate: GatewayConfig;
 	try {
-		candidate = await loadConfig({ home: current.home, overrides });
+		candidate = await loadConfig({ home: current.home, overrides, requireFile: true });
 	} catch (error) {
 		const diagnostic =
 			error instanceof ConfigError
