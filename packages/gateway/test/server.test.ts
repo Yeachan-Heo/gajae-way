@@ -463,7 +463,6 @@ test("work.run records a durable lane job and work.jobs projects it (issue #10)"
 		}),
 	});
 	const manipulated = JSON.parse(database.laneJobJson(jobId) as string);
-	console.log("MANIPULATED:", JSON.stringify(manipulated.attempts), manipulated.state);
 	client.send({ v: "0.1", type: "request", id: "w2", verb: "work.run", params: { name: "Repo.Fix-2", text: "again" } });
 	async function waitId(id: string): Promise<void> {
 		for (let attempt = 0; attempt < 400 && !client.frames.some((f) => f.id === id); attempt++) await Bun.sleep(5);

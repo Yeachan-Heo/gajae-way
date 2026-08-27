@@ -93,5 +93,7 @@
   "awaiting_operator hold is sticky: every work.run on a held job refuses to run until resume:true; held/resume contract typed in WorkRunParams/WorkRunResult and surfaced in the CLI (--resume, HELD output)",
   "repository-first reconciliation now runs on EVERY attempt end including reaped/failed ones; creation seeds the baseline HEAD checkpoint so the pre-existing commit is never reported as worker progress; classification uses hasNewCommit (progressed vs held)",
   "lane lookup is by the exact lane key (original name); a same-name/different-worktree call fails closed with a lane-mismatch error; jobId is injective hex of the exact UTF-8 name (no hash collisions possible)"
- ]
+ ],
+ "validatedExecutableCommit": "f0078d6 (merge of origin/main into the lane-jobs branch; full suite re-run at this exact tree: bun x tsc --noEmit exit 0, bun test packages/ 914 pass / 0 fail / 2 skip, bunx biome ci packages/ exit 0)",
+ "integrationNote": "Merged origin/main (ops.cycle operator projection + README intro). Protocol seam resolved additively: work.run/work.jobs and ops.cycle coexist in VERBS_V01 and the server dispatch; no lane-job verb dropped. Debug console.log removed from server.test.ts."
 }
