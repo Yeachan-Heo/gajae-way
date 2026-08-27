@@ -745,6 +745,44 @@ describe("durable dispatch leases (restart-concurrent authoring)", () => {
 });
 
 describe("durable dispatch leases — concurrent attempts (true overlap)", () => {
+	test("submitAwaitable rejects non-serialize policies (honest seam contract)", async () => {
+		const raceHome = await mkdtemp(join(tmpdir(), "gajaeway-await-seam-"));
+		try {
+			const db = await GatewayDatabase.open(join(raceHome, "gateway.db"));
+			const registry = new MonitorRegistry(db);
+			const monitor = registry.add({
+				name: "coalesced",
+				trigger: { kind: "cron", schedule: "30 6 * * *" },
+				eventTypes: ["memory.canonicalize"],
+				burstPolicy: "coalesce",
+				enabled: true,
+			});
+			const propagator = new MonitorPropagator({
+				database: db,
+				registry,
+				gjc: {
+					ensureSession: async () => ({ sessionId: "s" }),
+					sendTurn: async (_id, text) =>
+						JSON.stringify(eventsFromPrompt(text).map(({ eventId: id }) => ({ eventId: id, note: "n" }))),
+				},
+				memory: { enqueue: () => crypto.randomUUID(), enqueueExistingId: () => {} } as never,
+				delivery: new DeliveryService(new DeliveryLedger(db)),
+				deliver: () => {},
+				emit: () => {},
+			});
+			expect(propagator.submitAwaitable(monitor.monitorId, "memory.canonicalize", { at: "x" })).rejects.toThrow(
+				/only supports burstPolicy 'serialize'/,
+			);
+			// And an unknown/disabled monitor is still rejected:
+			await expect(propagator.submitAwaitable("nope", "memory.canonicalize", {})).rejects.toThrow(
+				/unknown or disabled monitor/,
+			);
+			db.close();
+		} finally {
+			await rm(raceHome, { recursive: true, force: true });
+		}
+	});
+
 	test("stale attempt A cannot overwrite B's outcome, enqueue, or re-deliver after losing its lease", async () => {
 		const raceHome = await mkdtemp(join(tmpdir(), "gajaeway-lease-race-"));
 		try {

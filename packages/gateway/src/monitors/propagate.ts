@@ -137,9 +137,20 @@ export class MonitorPropagator {
 	 * second dispatch.
 	 */
 	async submitAwaitable(monitorId: string, eventType: string, payload: unknown): Promise<string> {
+		const monitor = this.#registry.get(monitorId);
+		if (!monitor?.enabled) throw new Error("unknown or disabled monitor");
+		// Honest contract: this seam is only exact for `serialize` monitors, whose
+		// dispatch starts immediately — the returned promise is the event's real
+		// in-flight chain. For burst policies (coalesce/dedupe/drop) the dispatch
+		// is deferred by the burst window, so no in-flight promise exists yet;
+		// fail loudly instead of pretending to be awaitable.
+		if (monitor.burstPolicy !== "serialize") {
+			throw new Error("submitAwaitable only supports burstPolicy 'serialize'");
+		}
 		const eventId = this.submit(monitorId, eventType, payload);
 		const inflight = this.#inFlightPromises.get(eventId);
-		if (inflight) await inflight;
+		if (!inflight) throw new Error("dispatch promise missing for serialize event");
+		await inflight;
 		return eventId;
 	}
 	/**
