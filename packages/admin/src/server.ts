@@ -82,6 +82,21 @@ function readPath(params: Record<string, unknown>, path: string): unknown {
 	return cursor;
 }
 
+/**
+ * At least one character a human can actually see.
+ *
+ * `String.trim` does not strip U+200B, U+FEFF, U+2060 and the rest of the
+ * zero-width format characters, so `actor: "\u200b"` would satisfy the gate's
+ * "an actor is required" check while leaving the audit trail attributed to
+ * nothing. Blanking it here routes it into the gate's existing 401, which audits
+ * the attempt as it already does - the gate's own checks stay untouched.
+ */
+const VISIBLE_CHARACTER = /[^\s\p{Cf}\p{Cc}\p{Zs}\p{Zl}\p{Zp}]/u;
+
+function visibleActor(value: unknown): string {
+	return typeof value === "string" && VISIBLE_CHARACTER.test(value) ? value : "";
+}
+
 /** The `monitor-ref` field of an operation whose confirmation names its target. */
 function targetRefField(operation: MutationOperation): string | null {
 	const field = operation.fields.find((candidate) => candidate.kind === "monitor-ref");
@@ -220,12 +235,19 @@ export function createAdminApp(options: AdminServerOptions): AdminApp {
 		if (url.pathname === "/api/mutations" && method === "POST") {
 			let body: Record<string, unknown>;
 			try {
-				body = (await httpRequest.json()) as Record<string, unknown>;
+				const parsed: unknown = await httpRequest.json();
+				// `null`, an array and a bare scalar are all valid JSON. Reading a
+				// property off them throws, which would surface as an unhandled 500
+				// on the one route that must never be sloppy.
+				if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
+					return json({ ok: false, error: "body must be a json object" }, 400);
+				}
+				body = parsed as Record<string, unknown>;
 			} catch {
 				return json({ ok: false, error: "body must be json" }, 400);
 			}
 			const operationId = String(body.operationId ?? "");
-			const actor = typeof body.actor === "string" ? body.actor : "";
+			const actor = visibleActor(body.actor);
 			const params =
 				typeof body.params === "object" && body.params !== null ? (body.params as Record<string, unknown>) : undefined;
 
@@ -272,7 +294,7 @@ export function createAdminApp(options: AdminServerOptions): AdminApp {
 
 			const decision = await gate.evaluate({
 				operationId,
-				...(typeof body.actor === "string" ? { actor: body.actor } : {}),
+				...(actor === "" ? {} : { actor }),
 				...(typeof body.confirm === "string" ? { confirm: body.confirm } : {}),
 				...(params === undefined ? {} : { params }),
 			});

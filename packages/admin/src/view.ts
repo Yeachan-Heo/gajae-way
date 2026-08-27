@@ -328,6 +328,26 @@ function project<T>(items: readonly T[], row: (item: T) => RowView): { rows: Row
 	return { rows, error: null };
 }
 
+/**
+ * A resolved answer of the wrong shape is as much a failure as a rejected one,
+ * and it must degrade a panel rather than take the page down. `read` catches the
+ * rejection; these two narrow the success.
+ */
+function asList<T>(value: unknown): readonly T[] {
+	return Array.isArray(value) ? (value as readonly T[]) : [];
+}
+
+function asMonitorSnapshot(value: unknown): MonitorSnapshot | null {
+	if (typeof value !== "object" || value === null) return null;
+	const monitor = (value as { monitor?: unknown }).monitor;
+	if (typeof monitor !== "object" || monitor === null) return null;
+	if (typeof (monitor as { monitorId?: unknown }).monitorId !== "string") return null;
+	return {
+		monitor: monitor as MonitorRecord,
+		recentEvents: asList<MonitorEventRecord>((value as { recentEvents?: unknown }).recentEvents),
+	};
+}
+
 export async function buildSnapshot(deps: SnapshotDeps): Promise<ConsoleSnapshot> {
 	const now = deps.now?.() ?? new Date();
 	const [status, sessions, monitors] = await Promise.all([
@@ -336,7 +356,9 @@ export async function buildSnapshot(deps: SnapshotDeps): Promise<ConsoleSnapshot
 		read<{ monitors: readonly MonitorRecord[] }>(deps.request, "monitor.list"),
 	]);
 
-	const monitorList = monitors.value?.monitors ?? [];
+	const monitorList = asList<MonitorRecord>(monitors.value?.monitors).filter(
+		(monitor) => typeof monitor?.monitorId === "string",
+	);
 	const inspected = await Promise.all(
 		monitorList.slice(0, MONITOR_INSPECT_LIMIT).map((monitor) =>
 			read<{ monitor: MonitorRecord; recentEvents: readonly MonitorEventRecord[] }>(deps.request, "monitor.inspect", {
@@ -347,9 +369,10 @@ export async function buildSnapshot(deps: SnapshotDeps): Promise<ConsoleSnapshot
 	const eventsById = new Map<string, readonly MonitorEventRecord[]>();
 	const monitorSnapshots: MonitorSnapshot[] = [];
 	for (const outcome of inspected) {
-		if (!outcome.value) continue;
-		eventsById.set(outcome.value.monitor.monitorId, outcome.value.recentEvents);
-		monitorSnapshots.push(outcome.value);
+		const snapshot = asMonitorSnapshot(outcome.value);
+		if (!snapshot) continue;
+		eventsById.set(snapshot.monitor.monitorId, snapshot.recentEvents);
+		monitorSnapshots.push(snapshot);
 	}
 
 	const attention = buildAttention(status.value, monitorSnapshots, now);
@@ -357,7 +380,10 @@ export async function buildSnapshot(deps: SnapshotDeps): Promise<ConsoleSnapshot
 	deps.turns.prune();
 	const turnRows = deps.turns.list().map((turn) => turnRow(turn, deps.turns.stateOf(turn), now));
 
-	const projectedSessions = project(sessions.value?.sessions ?? [], sessionRow);
+	const sessionList = asList<SessionListResult["sessions"][number]>(sessions.value?.sessions).filter(
+		(session) => typeof session?.origin?.platform === "string",
+	);
+	const projectedSessions = project(sessionList, sessionRow);
 	const projectedMonitors = project(monitorList, (monitor) =>
 		monitorRow(monitor, eventsById.get(monitor.monitorId) ?? null, now),
 	);
@@ -370,7 +396,7 @@ export async function buildSnapshot(deps: SnapshotDeps): Promise<ConsoleSnapshot
 		status: statusRow(
 			status.value,
 			status.error,
-			sessions.value?.sessions.length ?? null,
+			sessions.value === null ? null : sessionList.length,
 			deps.turns.activeCount,
 			attention,
 			now,
