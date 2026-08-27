@@ -250,7 +250,7 @@ const CREDENTIAL_KEYS = [
  * what makes `AWS_SECRET_ACCESS_KEY`, `GITHUB_TOKEN` and `my_api_key_value`
  * match while `max_tokens`, `token_count` and `auth_expired` do not.
  */
-const CREDENTIAL_KEY = `(?:^|[\\s,{(])(?:[A-Za-z0-9]+[_-])*?(?:${CREDENTIAL_KEYS.join("|")})(?:[_-](?:value|key|token|secret|string|data|b64|base64))*`;
+const CREDENTIAL_KEY = `(?:^|[\\s,{(\\["'])(?:[A-Za-z0-9]+[_-])*?(?:${CREDENTIAL_KEYS.join("|")})(?:[_-](?:value|key|token|secret|string|data|b64|base64))*["']?`;
 /** `key: "value with spaces"`; the closing quote is optional so it fails closed. */
 const CREDENTIAL_QUOTED = new RegExp(`(${CREDENTIAL_KEY}\\s*[:=]\\s*)(["'])([^"'\\n]*)(["'])?`, "gi");
 /** `key=value` — one whitespace-delimited token. */

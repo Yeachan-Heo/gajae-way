@@ -573,6 +573,14 @@ test("redaction is calibrated in BOTH directions", () => {
 		'api_key: "deadbeefcafebabe0123456789 wJalrXUtnFEMIK"', // quoted, contains whitespace
 		'token="unbalanced_quote_SECRET_value123', // an unbalanced quote must not mean "redact nothing"
 		"access_token=eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxIn0.abcdefghijklmnop",
+		// JSON-quoted keys, and vendor-prefixed credential key names.
+		'{"api_key": "wJalrXUtnFEMIK7MDENGbPxRfiCYEXAMPLEKEY"}',
+		'{"secret":"deadbeefcafe"}',
+		'{"authorization":"Bearer abcDEF123456ghiJKL"}',
+		"MS_CLIENT_SECRET=wJalrXUtnFEMIK7MDENGbPxRfiCYEXAMPLEKEYab",
+		"age_token=deadbeefcafebabe",
+		"ttl_secret=deadbeefcafebabe",
+		"num_api_key=deadbeefcafebabe",
 	];
 	for (const text of mustRedact) expect(redactSecrets(text)).toContain("[redacted]");
 	const mustSurvive = [
@@ -599,6 +607,17 @@ test("redaction is calibrated in BOTH directions", () => {
 		"disk_write_failed",
 		"risk_threshold_exceeded",
 		"monkey.patch.applied", // contains ey followed by dots
+		// Ordinary snake_case diagnostics: the two-letter vendor prefixes must not eat them.
+		"network_unreachable",
+		"task_execution_failed",
+		"disk_quota_exceeded",
+		"work_dir_missing",
+		"risk-score-threshold",
+		"mask_pattern_invalid",
+		"NETWORK_UNREACHABLE",
+		// A timestamp after a non-credential key is a timestamp.
+		"auth_expires: 2026-08-27T09:00:00Z",
+		"token_expires_at: 2026-08-27T09:00:00Z",
 		"[turn failed] spawn_failed: SDK startup did not complete before readiness cutoff",
 	];
 	for (const text of mustSurvive) expect(redactSecrets(text)).toBe(text);
