@@ -16,13 +16,42 @@ function gate(overrides: GateOptions = {}) {
 describe("DEFAULT_ALLOWLIST", () => {
 	test("never contains an outbound-message operation", () => {
 		expect(DEFAULT_ALLOWLIST.map((operation) => operation.method)).not.toContain("chat.send");
+		expect(DEFAULT_ALLOWLIST.map((operation) => operation.id)).not.toContain("chat.send");
 	});
 
-	test("every entry maps to a concrete gateway method", () => {
+	test("every entry maps to a concrete gateway method and declares its blast radius", () => {
 		for (const operation of DEFAULT_ALLOWLIST) {
 			expect(operation.method.length).toBeGreaterThan(0);
 			expect(operation.summary.length).toBeGreaterThan(0);
+			expect(["low", "medium", "high"]).toContain(operation.severity);
 		}
+	});
+
+	test("only a destructive operation demands a typed target name", () => {
+		for (const operation of DEFAULT_ALLOWLIST) {
+			if (operation.confirmToken === undefined) continue;
+			expect(operation.severity).toBe("high");
+			// The token must be resolvable from a field, or the server cannot check it.
+			expect(operation.fields.some((field) => field.kind === "monitor-ref")).toBe(true);
+		}
+	});
+
+	test("a low-severity operation adds no ceremony that cannot fail", () => {
+		for (const operation of DEFAULT_ALLOWLIST.filter((candidate) => candidate.severity === "low")) {
+			expect(operation.confirmToken).toBeUndefined();
+		}
+	});
+
+	test("every required field is typed, so no operator types json", () => {
+		for (const operation of DEFAULT_ALLOWLIST) {
+			for (const field of operation.fields) {
+				expect(["text", "monitor-ref", "path", "json"]).toContain(field.kind);
+				expect(field.label.length).toBeGreaterThan(0);
+			}
+		}
+		expect(DEFAULT_ALLOWLIST.flatMap((operation) => operation.fields).some((field) => field.kind === "json")).toBe(
+			false,
+		);
 	});
 });
 
@@ -89,11 +118,12 @@ describe("MutationGate", () => {
 		});
 		expect(decision).toMatchObject({ allowed: false, status: 403 });
 		expect(audit.at(-1)).toMatchObject({ decision: "rejected" });
+		expect(instance.mutationsEnabled).toBe(false);
 	});
 
 	test("a custom allowlist replaces the default entirely", async () => {
 		const { instance } = gate({
-			allowlist: [{ id: "only.this", method: "only.this", summary: "s" }],
+			allowlist: [{ id: "only.this", method: "only.this", summary: "s", severity: "low", fields: [] }],
 		});
 		expect(instance.operations.map((operation) => operation.id)).toEqual(["only.this"]);
 		expect(await instance.evaluate({ operationId: "ops.backup", actor: "a", confirm: "ops.backup" })).toMatchObject({
@@ -110,5 +140,22 @@ describe("MutationGate", () => {
 			params: { monitorId: "m1" },
 		});
 		expect(audit.at(-1)).toMatchObject({ params: { monitorId: "m1" } });
+	});
+
+	test("record() lets a stricter surrounding check write its own rejection", async () => {
+		const { instance, audit } = gate();
+		await instance.record({
+			operationId: "monitor.remove",
+			actor: "형님",
+			decision: "rejected",
+			reason: "name mismatch",
+		});
+		expect(audit.at(-1)).toEqual({
+			at: new Date(0).toISOString(),
+			operationId: "monitor.remove",
+			actor: "형님",
+			decision: "rejected",
+			reason: "name mismatch",
+		});
 	});
 });
