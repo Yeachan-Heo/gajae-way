@@ -83,7 +83,10 @@ export class GjcTurnStream {
 	 * happened, because re-running a side effect is worse than refusing a replay.
 	 */
 	get pending(): boolean {
-		return this.#buffer.trim().length > 0;
+		// Only an unterminated JSON frame is possible work. Real gjc renders some
+		// failures as plain text, and refusing a replay over a trailing prose
+		// fragment would disable the recovery this exists to protect.
+		return this.#buffer.trim().startsWith("{");
 	}
 
 	feed(chunk: string): void {
@@ -350,7 +353,7 @@ export class GjcClient implements GjcPort {
 					observed.toolCalls > 0 ? `${observed.toolCalls} tool call(s)` : undefined,
 					observed.hadText ? "assistant text" : undefined,
 					observed.outputTokens > 0 ? `${observed.outputTokens} output token(s)` : undefined,
-					observed.pending ? "an unterminated frame the child died mid-write" : undefined,
+					observed.pending ? "an unterminated frame from a child that died mid-write" : undefined,
 				]
 					.filter((part) => part !== undefined)
 					.join(", ");

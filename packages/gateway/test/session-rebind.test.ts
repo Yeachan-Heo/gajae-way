@@ -336,7 +336,7 @@ test("the rebind log line names the causing code and both epochs", async () => {
 	try {
 		await client.ensureSession("discord:dm:c1");
 		expect(logs[0]).toBe(
-			"gateway session rebind 1/3 origin=discord:dm:c1 cause=terminal_uncertain epoch 0 -> 1 (lifetime 1)",
+			"gateway session rebind 1/3 origin=discord:dm:c1 cause=terminal_uncertain epoch 0 -> 1 lifetime=1",
 		);
 	} finally {
 		database.close();
@@ -374,7 +374,7 @@ test("the lifetime total is logged, so growth that alternates with clean turns i
 		// The consecutive count keeps reading 1/3 — the shape the cap cannot bound.
 		expect(logs.every((line) => line.includes("rebind 1/3"))).toBe(true);
 		// The lifetime total escalates, so an operator can actually see it.
-		expect(logs.map((line) => line.match(/\(lifetime (\d+)\)/)?.[1])).toEqual(["1", "2", "3"]);
+		expect(logs.map((line) => line.match(/lifetime=(\d+)/)?.[1])).toEqual(["1", "2", "3"]);
 	} finally {
 		database.close();
 	}
@@ -419,7 +419,7 @@ test("a turn-level managed_append_identity_mismatch rebinds and replays the turn
 		expect(sessionId).toBe("session-e0");
 		expect(await client.sendTurn(sessionId, "hello")).toBe("reply after rebind");
 		expect(logs[0]).toBe(
-			"gateway session rebind 1/3 origin=discord:dm:c1 cause=managed_append_identity_mismatch epoch 0 -> 1 (lifetime 1)",
+			"gateway session rebind 1/3 origin=discord:dm:c1 cause=managed_append_identity_mismatch epoch 0 -> 1 lifetime=1",
 		);
 		expect(database.getSessionRecord("discord:dm:c1")).toEqual({ sessionId: "session-e1", epoch: 1 });
 		// The replayed turn resumes the NEW session, never the condemned one.
@@ -477,7 +477,7 @@ test("the failure notice carries the runtime code and message, with /new only wh
 			}),
 		),
 	).toBe(
-		"[turn failed] spawn_failed: SDK startup did not complete before readiness cutoff Send /new to rebind this conversation.",
+		"[turn failed] spawn_failed: SDK startup did not complete before readiness cutoff. Send /new to rebind this conversation.",
 	);
 	// Not rebindable: the diagnosis survives verbatim, the hint does not.
 	const genuine = formatFailureNotice(
@@ -886,7 +886,7 @@ test("a failed platform turn delivers the runtime code and message in the notice
 	for (let attempt = 0; attempt < 400 && frames.length < 4; attempt++) await Bun.sleep(5);
 	const notice = frames.find((frame) => frame.type === "event" && frame.event === "chat.message");
 	expect(notice?.payload?.text).toBe(
-		"[turn failed] spawn_failed: SDK startup did not complete before readiness cutoff Send /new to rebind this conversation.",
+		"[turn failed] spawn_failed: SDK startup did not complete before readiness cutoff. Send /new to rebind this conversation.",
 	);
 	socket.end();
 });

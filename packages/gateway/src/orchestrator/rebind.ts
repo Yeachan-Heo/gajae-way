@@ -257,20 +257,51 @@ const CREDENTIAL_QUOTED = new RegExp(`(${CREDENTIAL_KEY}\\s*[:=]\\s*)(["'])([^"'
 const CREDENTIAL_BARE = new RegExp(`(${CREDENTIAL_KEY}\\s*[:=]\\s*)([^\\s"',}]+)`, "gi");
 
 /**
+ * State words a runtime legitimately puts where a credential would go, so
+ * `token=expired` and `credential: unrecoverable` stay readable. Named
+ * explicitly rather than inferred from length or character classes, because a
+ * short lowercase value is otherwise indistinguishable from a weak key:
+ * `secret=short` must be redacted, `secret=missing` must not.
+ */
+const CREDENTIAL_STATE_WORDS = new Set([
+	"absent",
+	"denied",
+	"failed",
+	"forbidden",
+	"insufficient",
+	"mismatch",
+	"timeout",
+	"unavailable",
+	"empty",
+	"expired",
+	"invalid",
+	"malformed",
+	"missing",
+	"none",
+	"null",
+	"redacted",
+	"rejected",
+	"required",
+	"revoked",
+	"unauthenticated",
+	"unauthorized",
+	"undefined",
+	"unknown",
+	"unrecoverable",
+	"unset",
+	"unsupported",
+]);
+
+/**
  * The one exemption for an exact credential key: a value that is plainly a CODE
- * or a prose word rather than a credential. Runtimes do use `authorization` and
+ * or a named state rather than a credential. Runtimes do use `authorization` and
  * `credential` as field names for a reason string, and erasing
  * `authorization: insufficient_scope_for_this_operation` destroys the whole
  * diagnosis #14 exists to deliver.
- *
- * Narrow on purpose: lowercase snake_case of any length (a code), or a short
- * all-lowercase word that is not hex (prose, never `deadbeefcafe`). Anything
- * with a digit, an uppercase letter, punctuation, or unusual length is treated
- * as a credential.
  */
 function isDiagnosticWord(value: string): boolean {
 	if (/^[a-z][a-z0-9]*(?:_[a-z0-9]+)+$/.test(value)) return true;
-	return /^[a-z]+$/.test(value) && value.length <= 20 && !/^[a-f0-9]+$/.test(value);
+	return CREDENTIAL_STATE_WORDS.has(value.toLowerCase());
 }
 
 /**
@@ -322,7 +353,10 @@ export function formatFailureNotice(error: unknown): string {
 	// The cap being spent is the one failure where a rebind IS the remedy but the
 	// gateway will no longer perform it, so the manual hint is what is left.
 	const remediable = isRebindableCode(described.code) || described.code === "rebind_cap_exceeded";
-	return `[turn failed] ${described.text}${remediable ? " Send /new to rebind this conversation." : ""}`;
+	// Separated by a period, so the hint cannot read as part of a truncated
+	// runtime message on the branch's headline surface.
+	const hint = remediable ? `${/[.!?]$/.test(described.text) ? "" : "."} Send /new to rebind this conversation.` : "";
+	return `[turn failed] ${described.text}${hint}`;
 }
 
 /** The subset of the gateway store a rebind needs. */
@@ -386,7 +420,7 @@ export class SessionRebinder {
 		const lifetime = (this.#lifetime.get(originKey) ?? 0) + 1;
 		this.#lifetime.set(originKey, lifetime);
 		this.#log(
-			`gateway session rebind ${used + 1}/${this.#cap} origin=${originKey} cause=${causeCode} epoch ${fromEpoch} -> ${toEpoch} (lifetime ${lifetime})`,
+			`gateway session rebind ${used + 1}/${this.#cap} origin=${originKey} cause=${causeCode} epoch ${fromEpoch} -> ${toEpoch} lifetime=${lifetime}`,
 		);
 		return toEpoch;
 	}

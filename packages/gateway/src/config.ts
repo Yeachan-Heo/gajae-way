@@ -270,7 +270,7 @@ export async function loadConfig(
 		if (options.requireFile || code !== "ENOENT" || entryExists)
 			throw new ConfigError(
 				"config_invalid",
-				`${configPath} is ${code === "ENOENT" && !entryExists ? "missing" : `unreadable (${code ?? "unknown"})`}; keeping the previous configuration`,
+				`${configPath} is ${code === "ENOENT" && !entryExists ? "missing" : `unreadable (${code ?? "unknown"})`}${options.requireFile ? "; keeping the previous configuration" : "; refusing to start on defaults"}`,
 			);
 	}
 	if (raw !== undefined) {
