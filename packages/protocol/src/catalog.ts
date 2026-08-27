@@ -96,6 +96,16 @@ export interface ChatProgressPayload {
 	readonly toolCalls: number;
 	/** Output tokens produced so far (exact per completed message, estimated between). */
 	readonly outputTokens: number;
+	/**
+	 * True on the last progress event of a turn, including a turn that ends with a
+	 * silence token and therefore delivers nothing.
+	 *
+	 * Adapters render progress as a temporary message and clear it when the reply
+	 * lands. A suppressed turn has no delivery, so without this flag the "working"
+	 * message is orphaned in the channel forever - which is exactly what happened
+	 * in every `open` channel where the persona chose to stay silent.
+	 */
+	readonly final?: boolean;
 }
 
 export interface ChatSendResult {

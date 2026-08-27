@@ -741,10 +741,17 @@ async function runInboundTurn(
 	const intervalMs = options.progress?.intervalMs ?? 10_000;
 	let lastProgressAt = 0;
 	let lastKnown = { toolCalls: 0, outputTokens: 0 };
-	const emitProgress = (progress: { toolCalls: number; outputTokens: number }) => {
+	let progressAnnounced = false;
+	const emitProgress = (progress: { toolCalls: number; outputTokens: number }, final = false) => {
 		lastKnown = progress;
 		const now = Date.now();
-		if (now - startedAt < firstAfterMs || now - lastProgressAt < intervalMs) return;
+		// A final event is never throttled: it is what tells an adapter to remove the
+		// temporary "working" message. Throttling it would leave that message behind.
+		if (!final && (now - startedAt < firstAfterMs || now - lastProgressAt < intervalMs)) return;
+		// Nothing was ever announced, so there is no status to clear: stay quiet rather
+		// than emitting a lone terminal event for a fast turn.
+		if (final && !progressAnnounced) return;
+		if (!final) progressAnnounced = true;
 		lastProgressAt = now;
 		const payload = {
 			turnId,
@@ -752,6 +759,7 @@ async function runInboundTurn(
 			elapsedMs: now - startedAt,
 			toolCalls: progress.toolCalls,
 			outputTokens: progress.outputTokens,
+			...(final ? { final: true } : {}),
 		};
 		for (const recipient of runtime.connections)
 			if (recipient.negotiated) recipient.write({ v: PROFILE_VERSION, type: "event", event: "chat.progress", payload });
@@ -781,6 +789,10 @@ async function runInboundTurn(
 		throw error;
 	} finally {
 		clearInterval(heartbeat);
+		// Every exit path from here on must clear the adapter's temporary status: a
+		// delivered reply, a failure notice, and - the case this fixes - a turn that
+		// ends in a silence token and delivers nothing at all.
+		emitProgress(lastKnown, true);
 	}
 	options.database.withTransaction(() => {
 		options.database.updateActivity(key, JSON.stringify(origin));

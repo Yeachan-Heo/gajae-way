@@ -366,16 +366,23 @@ export function subscribeDiscordDeliveries(
 
 export function subscribeDiscordProgress(
 	gateway: GatewayClientLike,
-	status: WorkingStatus,
+	// Structural, not the concrete class: the progress path is the one piece worth
+	// testing without a Discord client, and the private message cache is irrelevant here.
+	status: Pick<WorkingStatus, "update" | "clear">,
 	log: Pick<Console, "error"> = console,
 ): () => void {
 	if (!gateway.onChatProgress) return () => {};
 	return gateway.onChatProgress((progress) => {
-		void status
-			.update(progress)
-			.catch((error) =>
-				log.error(`Discord working status update failed: ${error instanceof Error ? error.message : String(error)}`),
-			);
+		// `final` means the turn stopped working. It arrives even when the turn
+		// delivered nothing - a silence token in an open channel - which is the only
+		// signal that the temporary status must go. Clearing on delivery alone left
+		// one orphaned "working" message per suppressed turn.
+		const action = progress.final ? status.clear(progress.origin.conversationId) : status.update(progress);
+		void action.catch((error) =>
+			log.error(
+				`Discord working status ${progress.final ? "clear" : "update"} failed: ${error instanceof Error ? error.message : String(error)}`,
+			),
+		);
 	});
 }
 
