@@ -1,4 +1,11 @@
-import type { ChatSendResult, GatewayStatusResult, WorkRunParams, WorkRunResult } from "@gajaeway/protocol";
+import type {
+	ChatReactParams,
+	ChatReactResult,
+	ChatSendResult,
+	GatewayStatusResult,
+	WorkRunParams,
+	WorkRunResult,
+} from "@gajaeway/protocol";
 import {
 	type ChatMessagePayload,
 	type ChatProgressPayload,
@@ -136,6 +143,10 @@ export class GajaewayClient {
 	}
 	chatSend(origin: OriginRef, text: string): Promise<ChatSendResult> {
 		return this.request("chat.send", { origin, text });
+	}
+	/** React to one specific message; the target id is required by the verb. */
+	chatReact(params: ChatReactParams): Promise<ChatReactResult> {
+		return this.request("chat.react", params);
 	}
 	workRun(params: WorkRunParams): Promise<WorkRunResult> {
 		return this.request("work.run", params);

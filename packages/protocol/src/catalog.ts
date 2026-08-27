@@ -1,4 +1,5 @@
 import type { OriginRef } from "./origin";
+import type { ReactionAction, ReactionRef } from "./reactions";
 
 /**
  * Typed verb + event catalogs for profile v0.1. Catalogs grow additively per
@@ -141,6 +142,13 @@ export interface ChatMessagePayload {
 	 * duplicate label (honest at-least-once, spec fact 14).
 	 */
 	readonly duplicateWarning?: boolean;
+	/**
+	 * When present this delivery is a REACTION, not a message: the adapter must
+	 * react to `reaction.targetMessageId` and post nothing. `text` still carries
+	 * the bare unicode emoji so an adapter without reaction support degrades to a
+	 * visible acknowledgement instead of a lost delivery.
+	 */
+	readonly reaction?: ReactionRef;
 }
 
 export interface DeliveryConfirmParams {
@@ -275,6 +283,47 @@ export interface WorkRunResult {
 	readonly sessionKey: string;
 }
 
+/**
+ * Outbound reaction (chat.react): react to ONE specific message in ONE specific
+ * origin. The target message id is required — "react to the last message" is not
+ * expressible, because "last" changes under you. `emoji` accepts any allowlisted
+ * spelling (`👍`, `thumbsup`, `:thumbsup:`) and is canonicalized by the gateway.
+ */
+export interface ChatReactParams {
+	readonly origin: OriginRef;
+	readonly targetMessageId: string;
+	readonly emoji: string;
+}
+
+export interface ChatReactResult {
+	/** Ledger delivery id: adapters settle a reaction exactly like a message. */
+	readonly deliveryId: string;
+	/** Canonical unicode the gateway resolved the requested emoji to. */
+	readonly emoji: string;
+}
+
+/**
+ * Inbound reaction (engagement.reaction): someone reacted to a message, or took
+ * their reaction back. This is engagement metadata and NEVER a turn: it is
+ * recorded as conversation context for the next engaged turn to read, and it does
+ * not wake the persona. `engaged` is therefore always false.
+ */
+export interface EngagementReactionParams {
+	readonly origin: OriginRef;
+	/** Platform id of the message that was reacted to. */
+	readonly targetMessageId: string;
+	/** Raw platform emoji as the reactor sent it; not restricted to the allowlist. */
+	readonly emoji: string;
+	readonly action: ReactionAction;
+	readonly engagement: EngagementContext;
+}
+
+export interface EngagementReactionResult {
+	readonly recorded: boolean;
+	/** Always false: a reaction is metadata, never a turn. */
+	readonly engaged: false;
+}
+
 /** Verb catalog: verb name -> { params, result } (documentation-level typing). */
 export interface VerbCatalogV01 {
 	"gateway.status": { params: undefined; result: GatewayStatusResult };
@@ -300,6 +349,8 @@ export interface VerbCatalogV01 {
 	};
 	"ops.integrity": { params: undefined; result: { readonly ok: boolean; readonly detail: string } };
 	"work.run": { params: WorkRunParams; result: WorkRunResult };
+	"chat.react": { params: ChatReactParams; result: ChatReactResult };
+	"engagement.reaction": { params: EngagementReactionParams; result: EngagementReactionResult };
 }
 
 /** Event catalog: event name -> payload. */
@@ -328,6 +379,8 @@ export const VERBS_V01 = [
 	"ops.backup",
 	"ops.integrity",
 	"work.run",
+	"chat.react",
+	"engagement.reaction",
 ] as const;
 export const EVENTS_V01 = ["chat.message", "chat.progress", "gateway.stopping", "monitor.event"] as const;
 
