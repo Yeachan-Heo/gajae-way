@@ -6,12 +6,12 @@
  "rerunCommands": [
   "bun install --frozen-lockfile (clean, 43 installs checked)",
   "bun x tsc --noEmit (exit 0)",
-  "bun test packages/ (890 pass / 0 fail / 2 skip, 71 files)",
+  "bun test packages/ (918 pass / 0 fail / 2 skip, 72 files)",
   "bunx biome ci packages/ (exit 0, 0 errors)",
-  "bun test packages/subsession/test/job.test.ts (28 adversarial job tests incl. new fail-closed-defaults and rebased-checkpoint cases)",
-  "bun test packages/gateway/test/lane-job-store.test.ts (3 store tests: restart across close/reopen, truncated record_json surfaced not repaired)",
-  "bun test packages/gateway/test/server.test.ts (8 tests incl. the work.run -> lane_job -> work.jobs production cycle and crash-recovery reconciliation)",
-  "bun test packages/admin (admin /api/jobs route proxy test)"
+  "bun test packages/subsession/test/job.test.ts (30 adversarial job tests incl. baseline-vs-progress, stalled budget vs baseline move, jobId length bound at construction and parse, fail-closed parse invariants)",
+  "bun test packages/gateway/test/lane-job-store.test.ts (3 store tests: schema v10 fresh open, deadline-killed cycle across close/reopen on one deployment path, truncated record_json surfaced not repaired)",
+  "bun test packages/gateway/test/server.test.ts (10 tests incl. production work.run -> lane_job -> work.jobs cycle, sticky held response without running, resume:true clearing with audit trail, next ordinary call not held)",
+  "bun test packages/admin/test/server.test.ts (admin /api/jobs route proxy test)"
  ],
  "subject": "Issue #10 durable lane jobs: packages/subsession LaneJobRecord v1 (fail-closed parse, repository-first checkpoints, attempt_ended projection for prompt_deadline_exceeded, #9 evidence classes verbatim, single-path continuation planner with operator holds preserved, one-open-attempt invariant) plus gateway production wiring (work.run attempt tracking, crash reconciliation to terminal_uncertain, work.jobs + admin /api/jobs projections) and migration v10 lane_jobs persistence.",
  "criticRound1Fixes": [
@@ -89,9 +89,11 @@
  ],
  "reportIdentity": "This report lives in the tree it reports on. Report-only commits after the validated executable commit change no executable code, so the receipts above remain valid for the branch head containing this file.",
  "criticRound3Fixes": [
-  "awaiting_operator hold is sticky: every work.run on a held job refuses to run until resume:true; held/resume contract typed in WorkRunParams/WorkRunResult and surfaced in the CLI (--resume, HELD output)",
-  "repository-first reconciliation now runs on EVERY attempt end including reaped/failed ones; creation seeds the baseline HEAD checkpoint so the pre-existing commit is never reported as worker progress; classification uses hasNewCommit (progressed vs held)",
-  "lane lookup is by the exact lane key (original name); a same-name/different-worktree call fails closed with a lane-mismatch error; jobId is injective hex of the exact UTF-8 name (no hash collisions possible)"
+  "checkpoint ordering: git SHAs have no chronological lexical order; only consecutive duplicates are rejected",
+  "fail-closed parse: missing v1 sections are schema violations; endState validated against the supervisor-state vocabulary; non-string report rejected",
+  "duplicate attempts: appendAttempt enforces one open attempt; planContinuation reads the stored open attempt instead of a synthetic projection",
+  "production wiring: putLaneJob/laneJobJson/laneJobRows called by work.run and work.jobs in gateway server.ts; admin exposes /api/jobs",
+  "evidence honesty: report receipts re-pinned to the validated executable commit with per-suite counts re-run at that head"
  ],
  "criticRound4Fixes": [
   "baseline HEAD stored as context (baselineSha), never a checkpoint; checkpoints only record observed HEAD moves past baseline",
