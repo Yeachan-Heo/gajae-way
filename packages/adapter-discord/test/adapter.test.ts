@@ -147,6 +147,42 @@ test("a reaction delivery reacts to its target and never posts a message", async
 	expect(requests).toEqual([{ verb: "delivery.confirm", params: { deliveryId: "delivery-1" } }]);
 });
 
+test("a reaction delivery tears down the typing indicator and the working status", async () => {
+	// The reaction branch has its own try/finally teardown, separate from the text
+	// path's. Without this test, deleting it leaves the whole suite green while every
+	// reaction leaves a live "is typing…" hint and an orphaned "working…" message
+	// behind in the conversation.
+	const requests: Array<{ verb: string; params: unknown }> = [];
+	const ended: string[] = [];
+	const cleared: string[] = [];
+	const discord: DiscordClientLike = {
+		channels: {
+			fetch: async () => ({
+				send: async () => {},
+				messages: { fetch: async () => ({ react: async () => {} }) },
+			}),
+		},
+	};
+	const typing = { begin: () => {}, end: (conversationId: string) => void ended.push(conversationId) };
+	const status = {
+		clear: async (conversationId: string) => void cleared.push(conversationId),
+	} as unknown as WorkingStatus;
+	const reactionPayload = {
+		...delivery("👍"),
+		reaction: { targetMessageId: "target-1", emoji: "👍", emojiName: "thumbsup" },
+	};
+	await settleDiscordDelivery(mockGateway(requests), discord, reactionPayload, typing, status);
+	expect(ended).toEqual(["channel-1"]);
+	expect(cleared).toEqual(["channel-1"]);
+	// Teardown is in a finally, so it must also run when the reaction itself fails.
+	ended.length = 0;
+	cleared.length = 0;
+	const failing: DiscordClientLike = { channels: { fetch: async () => Promise.reject(new Error("gone")) } };
+	await settleDiscordDelivery(mockGateway(requests), failing, reactionPayload, typing, status);
+	expect(ended).toEqual(["channel-1"]);
+	expect(cleared).toEqual(["channel-1"]);
+});
+
 test("a reply-threaded delivery threads its first chunk and only its first chunk", async () => {
 	const requests: Array<{ verb: string; params: unknown }> = [];
 	const payloads: unknown[] = [];
