@@ -283,20 +283,17 @@ function camelCaseKey(key: string): string {
 const CREDENTIAL_KEY = `(?:^|[\\s,{(\\["'?&#/;])(?:[A-Za-z0-9]+[_-])*?(?:${[...CREDENTIAL_KEYS, ...CREDENTIAL_KEYS.map(camelCaseKey)].join("|")})(?:[_-](?:value|key|token|secret|string|data|b64|base64))*["']?`;
 /**
  * `key: [ … ]` — a list of credentials must not be delivered entry by entry.
- * Handled by a bounded scanner (`redactBracketedCredentials`) rather than a
- * plain regex so the bound can never become an egress boundary: a missing or
- * over-far closing bracket redacts the bounded window WHOLE instead of
- * letting the array's entries through.
+ * Handled by `redactBracketedCredentials`: a linear, quote/escape/depth-aware
+ * scan (no work cap that could become an egress boundary), redacting through
+ * the matching outer close — or end-of-diagnostic if none exists.
  */
 const CREDENTIAL_BRACKET_OPEN = new RegExp(`(${CREDENTIAL_KEY}\\s*[:=]\\s*)\\[`, "gi");
 
 /**
- * Redacts a credential-keyed bracketed array with a QUOTE/ESCAPE/DEPTH-AWARE
- * linear scan: a `]` inside a quoted value or a NESTED array does not end the
- * redaction — only the matching outer close does. An unterminated or malformed
- * array redacts to the end of the diagnostic (fail closed). The scan is linear
- * with no backtracking, so the DoS concern of the old bounded regex never
- * applies.
+ * Redacts a credential-keyed bracketed array with an UNBOUNDED linear,
+ * quote/escape/bracket-depth-aware scan. Redaction ends only at the matching
+ * outer close; unterminated or malformed nesting redacts through end-of-
+ * diagnostic. Linear with no backtracking, so there is no DoS concern.
  */
 function redactBracketedCredentials(text: string): string {
 	const open = new RegExp(CREDENTIAL_BRACKET_OPEN.source, "gi");
