@@ -16,7 +16,7 @@
 		"typescript": "node_modules/typescript/lib/tsc.js from devDependency typescript ^5.9.3",
 		"note": "package.json pins packageManager bun@1.3.14; the runs below were executed on bun 1.4.0 (see unverified U-5)."
 	},
-	"newTestFile": "packages/gateway/test/reactions-redteam.e2e.test.ts (32 adversarial tests, 459 expect() calls)",
+	"newTestFile": "packages/gateway/test/reactions-redteam.e2e.test.ts (38 adversarial tests, 656 expect() calls at the certified commit; it was 32/459 when generation 1 filed this report)",
 	"commands": [
 		{
 			"id": "CMD-1",
@@ -630,5 +630,142 @@
 			}
 		],
 		"note": "packages/admin previously failed to resolve its workspace imports on this machine after a clean install. That was a defect in packages/admin/package.json on origin/main, untouched by this branch, and it was fixed upstream by 546f750 'Declare the admin package's workspace dependencies'. With that in main the full suite is green."
+	},
+	"cohortCertification": {
+		"producedBy": "executor QA/red-team lane 15-ReactionsCohortQa (cohort re-certification, post-rebase)",
+		"recordedAt": "2026-08-27T08:35+09:00",
+		"frozenSourceHash": "sha256:a37edba27a6fd0f8184e323228ddda3dbce7ca2a0f13916f86e1ecabbe9a4ba7",
+		"commit": "d8733e4",
+		"branch": "feat/discord-reactions",
+		"baseRef": "origin/main at 8e2a4f3 (five commits ahead: 257c9b0, 8c09b7c, ae6071b, 357b908, d8733e4)",
+		"treeState": "clean (git status --porcelain empty before and after this lane; no product source and no test source changed)",
+		"scope": "re-certification only: no new test file, no product change, no commit, no formatter, no dependency change. This artifact file is the only file written.",
+		"commands": [
+			{
+				"id": "CC-1",
+				"command": "bun test packages/gateway/test/reactions-redteam.e2e.test.ts",
+				"exactOutput": "38 pass / 0 fail / 0 skip / 656 expect() calls; Ran 38 tests across 1 file [26.02s]",
+				"verdict": "pass",
+				"note": "32 general + 6 RT-CAPABILITY cases, unchanged by the two rebases; count matches finalCertification."
+			},
+			{
+				"id": "CC-2",
+				"command": "bun test packages/gateway packages/protocol packages/adapter-discord packages/adapter-telegram",
+				"exactOutput": "386 pass / 2 skip / 0 fail / 2466 expect() calls; Ran 388 tests across 42 files [43.10s]",
+				"verdict": "pass",
+				"note": "The 2 skips are pre-existing and unrelated to the reaction surface."
+			},
+			{
+				"id": "CC-3",
+				"command": "bun test packages/",
+				"exactOutput": "run 1: 838 pass / 2 skip / 1 fail / 3479 expect() calls; Ran 841 tests across 66 files [48.40s]. run 2 (identical command, immediately after): 839 pass / 2 skip / 0 fail / 3481 expect() calls; Ran 841 tests across 66 files [43.88s].",
+				"verdict": "pass on rerun; one flaky failure observed once",
+				"flake": {
+					"test": "inflight platform delivery is duplicate-labeled after a process crash",
+					"location": "packages/gateway/test/delivery-crash.e2e.test.ts:30 (Bun.connect -> ENOENT, \"Failed to connect\")",
+					"isolatedRerun": "bun test packages/gateway/test/delivery-crash.e2e.test.ts -> 1 pass / 0 fail / 2 expect() calls",
+					"classification": "pre-existing harness flake, NOT a reaction defect: the file is untouched by all five branch commits (git log 8e2a4f3..d8733e4 -- that path is empty), the failure is a unix-socket connect race while 66 files run in parallel, and it passes both in isolation and in the CC-2 scope."
+				}
+			},
+			{
+				"id": "CC-4",
+				"command": "bun node_modules/typescript/lib/tsc.js --noEmit -p tsconfig.json",
+				"exactOutput": "no diagnostics printed; exit code 0",
+				"verdict": "pass"
+			}
+		],
+		"rebaseIntegrity": {
+			"conflictSurface": [
+				"packages/adapter-discord/src/main.ts",
+				"packages/adapter-telegram/src/main.ts"
+			],
+			"verdict": "BOTH SIDES SURVIVED AND STILL COMPOSE, verified from source and from green tests. The reaction side and the sibling reply-metadata side occupy disjoint branches of the same functions and neither swallows the other.",
+			"evidence": {
+				"discordReactionSideStillReactsAndPostsNothing": "packages/adapter-discord/src/main.ts:364-372 — settleDiscordDelivery returns early through settleDiscordReaction when message.reaction is set, so the text path (:373-403) is never entered. Reaction ports are created once per subscription at :415 and threaded into the call at :417.",
+				"discordReplyThreadingStillThreads": "packages/adapter-discord/src/main.ts:386-390 — first chunk only, channel.send({content, reply:{messageReference: message.replyToMessageId, failIfNotExists:false}}); subsequent chunks and non-replies use the plain send at :391.",
+				"discordInboundReplyMetadataStillWired": "packages/adapter-discord/src/main.ts:21 (import), :150 (const replyTo = resolveReplyContext(message, botId)) and the payload spread, with engagement policy untouched.",
+				"telegramReactionSideStillReactsAndPostsNothing": "packages/adapter-telegram/src/main.ts:206-208 — the delivery subscription dispatches message.reaction to settleTelegramReaction (:171-197, setMessageReaction only, no sendMessage on any path) and everything else to settleTelegramDelivery.",
+				"telegramTextSideStillThreads": "packages/adapter-telegram/src/main.ts:150 — sendMessage(route.chatId, chunk, route.messageThreadId) keeps forum-topic routing; :5-6 import both the reaction mapper and resolveTelegramReplyContext, and only one resolve call exists."
+			},
+			"testsThatProtectTheReactionSide": [
+				"packages/gateway/test/reactions-redteam.e2e.test.ts RT-DISCORD-01 (:985) — six scenarios assert harness.sent === [] (nothing posted) and exactly one confirm/fail per reaction.",
+				"packages/gateway/test/reactions-redteam.e2e.test.ts RT-TELEGRAM-02 (:1217) — five outcomes assert zero sendMessage calls and exactly one ledger settlement.",
+				"packages/gateway/test/reactions-redteam.e2e.test.ts imports settleTelegramReaction from ../../adapter-telegram/src/main (:39): had the resolution dropped the reaction export from telegram main.ts, the whole 38-case file would fail to load.",
+				"packages/adapter-discord/test/reactions.test.ts and packages/adapter-telegram/test/reactions.test.ts — per-adapter reaction behaviour (custom emoji resolution, cache isolation, capability refusal)."
+			],
+			"testsThatProtectTheReplyMetadataSide": [
+				"packages/gateway/test/reply-redteam.test.ts:688-708 — readSource(\"packages/adapter-discord/src/main.ts\") asserts the EXACT set of replyTo lines (toEqual on [\"const replyTo = resolveReplyContext(message, botId);\", \"...(replyTo ? { replyTo } : {}),\"]) plus the verbatim mentioned expression. A dropped Discord reply-metadata side fails here immediately.",
+				"packages/gateway/test/reply-redteam.test.ts:710-720 — readSource(\"packages/adapter-telegram/src/main.ts\") asserts the verbatim mentioned expression including replyTo?.fromSelf === true, the verbatim resolveTelegramReplyContext(message.reply_to_message, botUserId) line, and that exactly one resolve call exists.",
+				"packages/gateway/test/server.test.ts:305 \"[REPLY:id] parts thread to the referenced message and strip the directive\" — asserts replyToMessageId: \"msg-42\" on the first emitted chat.message and undefined on the second (:342-344): the gateway half of reply-threading.",
+				"packages/adapter-telegram/test/adapter.test.ts:67 \"persists a forum topic route across restart and sends replies to its topic\" — asserts sendMessage receives thread 99, i.e. the Telegram text path still routes."
+			],
+			"coverageGap": {
+				"answer": "YES — one narrow gap remains, and it is on the merge seam itself rather than on either feature.",
+				"detail": "No test anywhere calls settleDiscordDelivery with a payload carrying message.reaction, and no test anywhere calls it with message.replyToMessageId (repo-wide search for replyToMessageId finds only packages/gateway/src/delivery/delivery.ts:15/25, packages/protocol/src/catalog.ts:126, packages/gateway/test/server.test.ts:342-344 and packages/gateway/test/reply-redteam.test.ts:703 — never an adapter call). The six settleDiscordDelivery call sites in packages/adapter-discord/test/adapter.test.ts (:98, :110, :116, :157, :231, :234) all pass plain text. subscribeTelegramDeliveries has no test at all. So the two lines of dispatch/branch logic that the rebase actually had to resolve are the only reaction/reply code in the repo with no behavioural test.",
+				"consequence": "If a future resolution deleted the reaction branch at packages/adapter-discord/src/main.ts:364-372 or the ternary at packages/adapter-telegram/src/main.ts:206-208, a reaction delivery would fall into the text path and POST the bare emoji as a message (delivery.ts:53-59 sets text = reaction.emoji by design), and all 841 tests would still be green. Likewise, deleting packages/adapter-discord/src/main.ts:386-390 would silently stop Discord reply-threading with a green suite.",
+				"currentTreeStatus": "Not a live regression: at d8733e4 all three branches are present and correct by source inspection, and every executed path is green. The gap is a missing guard, filed as BLOCKER-CC-1 below.",
+				"suggestedFix": "Two assertions in the existing packages/adapter-discord/test/adapter.test.ts and one in packages/adapter-telegram/test/adapter.test.ts: settleDiscordDelivery with {reaction} must call channel.send zero times; settleDiscordDelivery with {replyToMessageId} must send {content, reply:{messageReference}} on the first chunk only; subscribeTelegramDeliveries must route a reaction payload to setMessageReaction and never to sendMessage. Deliberately NOT written by this lane (bounded re-certification, no new test surface)."
+			}
+		},
+		"spotChecks": [
+			{
+				"requirement": "requirement 1 — an inbound reaction is metadata, never a turn",
+				"case": "RT-INBOUND-01 (packages/gateway/test/reactions-redteam.e2e.test.ts:243)",
+				"assertionsThatBite": "calls === {ensureSession:0, sendTurn:0}; turns === []; chatMessages === 0; inboundPendingCount === 0; deliveryRows === 0; exactly 20 conversation_context rows, 10 \"[reaction] reacted\" and 10 \"[reaction] removed\"; every response {recorded:true, engaged:false}.",
+				"sourceUnderTest": "packages/gateway/src/server/server.ts:562-627 — the engagement.reaction arm records one contextRecord row (:610-619) and replies {recorded:true, engaged:false} (:624); it never touches inboundEnqueue/drainOrigin (used only by chat.send at :746/:765).",
+				"regressionThatWouldBreakIt": "Wiring engagement.reaction into inboundEnqueue/drainOrigin (or letting it return engaged:true) would make ensureSession/sendTurn non-zero and emit a chat.message, failing three independent assertions. Reverting the random suffix in the synthetic context id at :611 to a bare ISO timestamp collapses the 20 same-millisecond rows to 4 on the ON CONFLICT(message_id) DO NOTHING insert, failing the row-count assertions (this is the historical BLOCKER-2 shape, and RT-INBOUND-05 at :282 isolates timestamp collision from deduplication)."
+			},
+			{
+				"requirement": "requirement 4 — a malformed reaction token costs the reaction, never the reply",
+				"case": "RT-TOKEN-03 (packages/gateway/test/reactions-redteam.e2e.test.ts:699)",
+				"assertionsThatBite": "eight replies -> texts toEqual the seven malformed strings verbatim plus \"@1 발사합니다\" for the one well-formed token; reactionEvents length 1; deliveryRows length 9; and the pure-parser cross-check parseReactionReply(reply) === undefined for all seven.",
+				"sourceUnderTest": "packages/protocol/src/reactions.ts:164-192 — REACT_TOKEN /^\\s*\\[REACT:([^\\]\\n]*)\\]/ with all-or-nothing parsing: an unresolvable emoji, or an @ with a target failing isPlatformMessageId (:158/:182), returns undefined for the WHOLE reply; resolveReactionEmoji (:80-87) accepts only allowlist unicode (modulo one U+FE0F strip) or :name:.",
+				"regressionThatWouldBreakIt": "Any move to lenient parsing — skipping a bad token instead of returning undefined at :182/:190, dropping the isPlatformMessageId check on the @target, case-insensitive [react:, or accepting a non-allowlist emoji such as 🚀 — changes both the emitted text array (the token would be stripped from the reply) and reactionEvents/deliveryRows counts, failing three assertions plus the parser cross-check."
+			},
+			{
+				"requirement": "requirement 5/7 — the platform-capability guard (RT-CAPABILITY)",
+				"case": "RT-CAPABILITY-05 (packages/gateway/test/reactions-redteam.e2e.test.ts:1380)",
+				"assertionsThatBite": "door 1 (chat.react): every spelling of every telegram-undeliverable entry returns an invalid_params error frame containing \"telegram cannot react with\", with no success response and deliveryRows === 0. door 2 (reply token): one turn per entry, one \"reaction skipped\" log line per spelling naming both the unicode and the name, reactionEvents === 0, and the reply bodies still ship verbatim with one delivery row each.",
+				"sourceUnderTest": "packages/protocol/src/reactions.ts:100-104 (TELEGRAM_INCAPABLE = {check, cross, lobster}, platformSupportsReaction) enforced structurally at BOTH doors: packages/gateway/src/server/server.ts:533-537 (chat.react throws ProtocolError invalid_params) and packages/gateway/src/server/server.ts:951-955 (reply-token path logs \"reaction skipped\" and continue, before prepareReaction at :969).",
+				"regressionThatWouldBreakIt": "Removing either guard call site: dropping :533 makes the error frame undefined and creates ledger rows (three assertions fail); dropping :951-955 makes reactionEvents non-zero and the skip-log count zero. Narrowing the guard to a single spelling (e.g. comparing raw input instead of the resolved allowlist name) fails on the alternate spellings the case sweeps, since resolveReactionEmoji canonicalises :name:, U+FE0F and unicode to one entry before the check."
+			}
+		],
+		"blockers": [
+			{
+				"id": "BLOCKER-CC-1",
+				"severity": "blocker",
+				"type": "coverage (test-only; no product fix required and none applied)",
+				"title": "The rebase seam itself is untested: the adapter dispatch branches that separate a reaction delivery from a text/reply delivery have no behavioural test, so a dropped side would pass unnoticed",
+				"location": "packages/adapter-discord/src/main.ts:364-372 (reaction branch) and packages/adapter-discord/src/main.ts:386-390 (reply-threaded send); packages/adapter-telegram/src/main.ts:206-208 (reaction/text dispatch). Nearest existing tests that should carry the assertions: packages/adapter-discord/test/adapter.test.ts:98 and packages/adapter-telegram/test/adapter.test.ts:67.",
+				"detail": "Verified by exhaustive repo search: no test passes a reaction payload or a replyToMessageId to settleDiscordDelivery, and subscribeTelegramDeliveries is never exercised. All reaction assertions enter one level below the dispatch (settleDiscordReaction / settleTelegramReaction directly). Both sides are present and correct at d8733e4, so this is a missing guard rather than a live defect — but it is precisely the code the two rebases had to resolve.",
+				"status": "reported, not fixed (lane mandate: no new files, no product source changes, bounded re-certification)"
+			}
+		],
+		"carriedForwardKnownGaps": [
+			{
+				"id": "BLOCKER-1 (historical, pre-existing on origin/main)",
+				"status": "still present in product source at packages/gateway/src/server/server.ts:124 (write: (frame) => socket.write(encodeFrame(frame))) and packages/sdk/src/client.ts:63 (socket.write(data)) — neither checks the short-write return value.",
+				"reactionSurfaceImpact": "closed: isPlatformMessageId (packages/protocol/src/reactions.ts:158) bounds every reaction id to 64 chars at both verbs and in the token parser, so no reaction path can produce an oversized frame. Unchanged by the rebase; not a blocker of this cohort."
+			},
+			{
+				"id": "F-3 (open by design)",
+				"status": "the per-turn cap of 3 does not bound chat.react, which has no turn; the per-message cap of 1 still applies. Covered by RT-CAP-03 and documented in ReactionBudget."
+			}
+		],
+		"verdict": {
+			"overall": "pass",
+			"e2eStatus": "pass",
+			"redTeamStatus": "pass with one coverage blocker (BLOCKER-CC-1); no behavioural defeat of the reaction surface or of the platform-capability guard was found",
+			"blockers": [
+				"BLOCKER-CC-1"
+			],
+			"statement": "At commit d8733e4, frozen sourceHash sha256:a37edba27a6fd0f8184e323228ddda3dbce7ca2a0f13916f86e1ecabbe9a4ba7, the reaction surface re-certifies green on all four commands and the post-rebase composition of the reaction wiring with the sibling reply-metadata work is intact in both adapter main.ts files. The single blocker is a missing test guard on the merge seam, not a broken behaviour."
+		},
+		"blockerResolution": {
+			"id": "BLOCKER-CC-1",
+			"status": "resolved by the leader after this lane reported it",
+			"fix": "Three behavioural tests now cover the merge seam: 'a reaction delivery reacts to its target and never posts a message' and 'a reply-threaded delivery threads its first chunk and only its first chunk' in packages/adapter-discord/test/adapter.test.ts, and 'the delivery subscription routes a reaction to setMessageReaction and never to sendMessage' in packages/adapter-telegram/test/adapter.test.ts.",
+			"mutationProof": "Each was verified by mutation rather than assertion. Disabling the Discord reaction branch fails the reaction test (15 pass / 1 fail); removing the Telegram reaction routing fails the subscription test (7 pass / 1 fail); removing the Discord reply-threading arm fails the threading test (15 pass / 1 fail). Each mutation was reverted with git checkout immediately after the run."
+		}
 	}
 }
