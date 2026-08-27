@@ -122,6 +122,11 @@ export type LaneJobRecord = {
 	readonly report?: string;
 	/** Bounded escalation trail once work stalls or an operator hold trips. */
 	readonly escalations: readonly string[];
+	/**
+	 * The lane's STARTING head at job creation. Context, not progress:
+	 * checkpoints only ever record moves BEYOND this SHA.
+	 */
+	readonly baselineSha?: string;
 };
 
 export type CreateLaneJobInput = {
@@ -129,6 +134,8 @@ export type CreateLaneJobInput = {
 	readonly branch: string;
 	readonly worktreePath: string;
 	readonly sessionId?: string;
+	/** The worktree HEAD at creation; the baseline progress is measured against. */
+	readonly baselineSha?: string;
 	readonly now?: () => Date;
 };
 
@@ -145,6 +152,9 @@ export function createLaneJobRecord(input: CreateLaneJobInput): LaneJobRecord {
 		throw new LaneJobError(`invalid worktree path "${input.worktreePath}"`);
 	}
 	const at = (input.now ?? (() => new Date()))().toISOString();
+	if (input.baselineSha !== undefined && !/^[0-9a-f]{40}$/.test(input.baselineSha)) {
+		throw new LaneJobError(`baselineSha is not a full commit sha`);
+	}
 	return Object.freeze({
 		schemaVersion: LANE_JOB_SCHEMA_VERSION,
 		jobId,
@@ -156,6 +166,7 @@ export function createLaneJobRecord(input: CreateLaneJobInput): LaneJobRecord {
 		attempts: Object.freeze([]),
 		checkpoints: Object.freeze([]),
 		stalledContinuations: 0,
+		...(input.baselineSha !== undefined ? { baselineSha: input.baselineSha } : {}),
 		escalations: Object.freeze([]),
 	});
 }
@@ -240,8 +251,16 @@ export function parseLaneJobRecord(raw: string): LaneJobRecord {
 		stalledContinuations,
 		...(record.reportSource === undefined ? {} : { reportSource: asReportSource(record.reportSource) }),
 		...(record.report === undefined ? {} : { report: asString(record.report) }),
+		...(record.baselineSha === undefined ? {} : { baselineSha: assertFullSha(asString(record.baselineSha)) }),
 		escalations,
 	});
+}
+
+function assertFullSha(value: string): string {
+	if (!/^[0-9a-f]{40}$/.test(value)) {
+		throw new LaneJobError("baselineSha is not a full commit sha");
+	}
+	return value;
 }
 
 function asString(value: unknown): string {
@@ -375,23 +394,31 @@ export type RepositoryFacts = {
 	readonly headSha?: string | undefined;
 	/** Checkpoints recorded at last reconciliation. */
 	readonly knownCheckpoints?: readonly JobCheckpoint[];
+	/**
+	 * The lane's STARTING head (job creation time). HEAD moves are measured
+	 * against it when no checkpoint exists yet, so the pre-existing commit is
+	 * never mistaken for worker progress.
+	 */
+	readonly baselineSha?: string | undefined;
 	/** Worker-modified tracked files in the worktree (`git status --porcelain`). */
 	readonly dirtyFiles: number;
 	/** When the repository snapshot was taken (checkpoint timestamps derive from it). */
 	readonly observedAt: string;
 };
 
-/** True when these repository facts show forward motion since `knownCheckpoints`. */
+/** True when these repository facts show forward motion past the baseline/checkpoints. */
 export function hasNewCommit(facts: RepositoryFacts): boolean {
 	const known = facts.knownCheckpoints ?? [];
-	const last = known.at(-1)?.sha ?? "";
+	const reference = known.at(-1)?.sha ?? facts.baselineSha ?? "";
 	if (!facts.headSha || !/^[0-9a-f]{40}$/.test(facts.headSha)) {
 		return false;
 	}
-	if (facts.headSha === last) {
+	// With no baseline and no checkpoints there is nothing to compare against:
+	// unknown, not progress.
+	if (reference === "") {
 		return false;
 	}
-	return last === "" ? true : !facts.headSha.startsWith(last);
+	return facts.headSha !== reference;
 }
 
 export type AttemptOutcomeInput = {
@@ -486,7 +513,11 @@ export type TransitionInput = {
 export function applyReconciliation(input: TransitionInput): LaneJobRecord {
 	const at = input.repository.observedAt;
 	const known = input.record.checkpoints;
-	const facts = { ...input.repository, knownCheckpoints: known };
+	const facts = {
+		...input.repository,
+		knownCheckpoints: known,
+		...(input.record.baselineSha === undefined ? {} : { baselineSha: input.record.baselineSha }),
+	};
 	const progressed = hasNewCommit(facts);
 	const checkpoints = progressed
 		? Object.freeze([...known, Object.freeze({ sha: facts.headSha as string, createdAt: at })])

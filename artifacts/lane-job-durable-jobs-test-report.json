@@ -88,12 +88,16 @@
   "collision-free identity lanejob-work-<slug>-<fnv1a32(exact name)>; lane block records the real worktree and actual git branch",
   "parse rejects endedAt/endState mismatches and non-last open attempts; work.jobs re-validates record JSON and flags corrupt rows"
  ],
- "reportIdentity": "This report lives in the tree it reports on. The report-only commit that last changed this file is f0078d6; it changes no executable code, so the receipts above remain valid for branch head f0078d6.",
+ "reportIdentity": "This report lives in the tree it reports on. Report-only commits after the validated executable commit change no executable code, so the receipts above remain valid for the branch head containing this file.",
  "criticRound3Fixes": [
   "awaiting_operator hold is sticky: every work.run on a held job refuses to run until resume:true; held/resume contract typed in WorkRunParams/WorkRunResult and surfaced in the CLI (--resume, HELD output)",
   "repository-first reconciliation now runs on EVERY attempt end including reaped/failed ones; creation seeds the baseline HEAD checkpoint so the pre-existing commit is never reported as worker progress; classification uses hasNewCommit (progressed vs held)",
   "lane lookup is by the exact lane key (original name); a same-name/different-worktree call fails closed with a lane-mismatch error; jobId is injective hex of the exact UTF-8 name (no hash collisions possible)"
  ],
- "validatedExecutableCommit": "f0078d6 (merge of origin/main into the lane-jobs branch; full suite re-run at this exact tree: bun x tsc --noEmit exit 0, bun test packages/ 914 pass / 0 fail / 2 skip, bunx biome ci packages/ exit 0)",
- "integrationNote": "Merged origin/main (ops.cycle operator projection + README intro). Protocol seam resolved additively: work.run/work.jobs and ops.cycle coexist in VERBS_V01 and the server dispatch; no lane-job verb dropped. Debug console.log removed from server.test.ts."
+ "validatedExecutableCommit": "a772e5e (round-4 fixes + origin/main merge; full suite re-run at this exact tree: bun x tsc --noEmit exit 0, bun test packages/ 914 pass / 0 fail / 2 skip, bunx biome ci packages/ exit 0)",
+ "criticRound4Fixes": [
+  "baseline HEAD stored as context (baselineSha), never a checkpoint; checkpoints only record observed HEAD moves past baseline",
+  "gateway uses hasNewCommit for classification; ended attempts without a new HEAD increment stalledContinuations (stalled), and the stalled hold is sticky like awaiting_operator (resume:true required)",
+  "jobId injective AND schema-bounded: lanejob-<hex of exact UTF-8 name> fits the 128-char id alphabet for every accepted 64-byte name"
+ ]
 }

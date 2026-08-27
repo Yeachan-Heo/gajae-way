@@ -34,6 +34,8 @@ function record() {
 function repo(overrides: Partial<RepositoryFacts> = {}): RepositoryFacts {
 	return {
 		headSha: undefined,
+		// A job's starting HEAD: HEAD moves are progress only past this SHA.
+		baselineSha: "0".repeat(40),
 		dirtyFiles: 0,
 		observedAt: NOW.toISOString(),
 		...overrides,

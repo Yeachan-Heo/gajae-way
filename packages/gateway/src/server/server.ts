@@ -77,7 +77,7 @@ function laneJobIdentity(workName: string): { jobId: string; laneKey: string } {
 	// while staying within the [a-z0-9-] jobId alphabet. 64-byte names cap at
 	// 128 hex chars + the prefix, inside the schema's id length bound.
 	const hex = Buffer.from(workName, "utf8").toString("hex");
-	return { jobId: `lanejob-work-${hex}`, laneKey };
+	return { jobId: `lanejob-${hex}`, laneKey };
 }
 
 function persistLaneJob(database: GatewayDatabase, record: LaneJobRecord, laneKey: string): void {
@@ -141,22 +141,15 @@ async function loadOrCreateLaneJob(
 		return existing;
 	}
 	// The lane block describes the REAL lane: actual worktree, actual branch
-	// when git can tell us, deterministic fallback otherwise.
+	// when git can tell us, deterministic fallback otherwise. The starting
+	// HEAD is stored as the BASELINE - it is context, never worker progress.
 	const facts = await collectRepoFacts(workCwd);
-	let created = createLaneJobRecord({
+	const created = createLaneJobRecord({
 		jobId,
 		branch: facts?.branch ?? `work/${workName.toLowerCase().replace(/[^a-z0-9._/-]+/g, "-")}`,
 		worktreePath: workCwd,
+		baselineSha: facts?.headSha,
 	});
-	if (facts?.headSha) {
-		// Seed the baseline HEAD so the pre-existing commit is never later
-		// reported as a worker checkpoint: only moves BEYOND this SHA count.
-		created = applyReconciliation({
-			record: created,
-			repository: { headSha: facts.headSha, dirtyFiles: facts.dirtyFiles, observedAt: new Date().toISOString() },
-			classification: "held",
-		});
-	}
 	persistLaneJob(database, created, laneKey);
 	return created;
 }
@@ -521,10 +514,11 @@ async function handleRequest(
 				// deterministic planner path for an uncertain attempt is an operator
 				// hold, not an automatic continuation. `resume: true` is the explicit
 				// operator acknowledgement that lets the next attempt start.
-				// The awaiting_operator hold is STICKY: it survives restarts and
-				// every subsequent call until an operator explicitly resumes, so a
-				// genuinely uncertain predecessor can never be racing a new one.
-				if (prior.state === "awaiting_operator" && params.resume !== true) {
+				// The awaiting_operator/stalled holds are STICKY: they survive
+				// restarts and every subsequent call until an operator explicitly
+				// resumes, so a genuinely uncertain or repeatedly stalling job can
+				// never be silently re-driven.
+				if ((prior.state === "awaiting_operator" || prior.state === "stalled") && params.resume !== true) {
 					return {
 						held: true as const,
 						jobId,
@@ -576,6 +570,7 @@ async function handleRequest(
 							dirtyFiles: facts.dirtyFiles,
 							observedAt: new Date().toISOString(),
 							knownCheckpoints: job.checkpoints,
+							baselineSha: job.baselineSha,
 						});
 						job = applyReconciliation({
 							record: job,
@@ -612,6 +607,7 @@ async function handleRequest(
 							dirtyFiles: facts.dirtyFiles,
 							observedAt: new Date().toISOString(),
 							knownCheckpoints: job.checkpoints,
+							baselineSha: job.baselineSha,
 						});
 						job = applyReconciliation({
 							record: job,
@@ -620,7 +616,7 @@ async function handleRequest(
 								dirtyFiles: facts.dirtyFiles,
 								observedAt: new Date().toISOString(),
 							},
-							classification: progressed ? "progressed" : "held",
+							classification: progressed ? "progressed" : "stalled",
 						});
 					}
 					persistLaneJob(options.database, job, laneKey);

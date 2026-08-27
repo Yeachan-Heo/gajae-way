@@ -62,6 +62,7 @@ describe("lane_jobs store (migration v10)", () => {
 			branch: "feat/issue-10-lane-jobs-takeover",
 			worktreePath: "/wt/lane-jobs",
 			sessionId: SESSION,
+			baselineSha: "0".repeat(40),
 			now: () => new Date(NOW),
 		});
 		const opRef = "gw-lanejob-01hqrestart0";
@@ -93,7 +94,12 @@ describe("lane_jobs store (migration v10)", () => {
 			expect(revived.state).toBe("attempt_ended");
 
 			// Repository evidence first, recovered without any reply body.
-			const evidence = classifyWorkEvidence({ headSha: "a".repeat(40), dirtyFiles: 3, observedAt: NOW });
+			const evidence = classifyWorkEvidence({
+				headSha: "a".repeat(40),
+				baselineSha: "0".repeat(40),
+				dirtyFiles: 3,
+				observedAt: NOW,
+			});
 			expect(evidence).toBe("work_committed_report_lost");
 
 			// Continuation stays one deterministic path and is persisted.

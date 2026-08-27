@@ -424,7 +424,7 @@ test("work.run records a durable lane job and work.jobs projects it (issue #10)"
 	const run = client.frames.find((frame) => frame.type === "response" && frame.id === "w");
 	expect(run.result).toMatchObject({ held: false, text: "worker result" });
 	const jobId = run.result.jobId;
-	expect(jobId).toBe(`lanejob-work-${Buffer.from("Repo.Fix-2", "utf8").toString("hex")}`);
+	expect(jobId).toBe(`lanejob-${Buffer.from("Repo.Fix-2", "utf8").toString("hex")}`);
 
 	client.send({ v: "0.1", type: "request", id: "jobs", verb: "work.jobs" });
 	await waitFor(client.frames, 3);
@@ -435,9 +435,9 @@ test("work.run records a durable lane job and work.jobs projects it (issue #10)"
 	// The completed ATTEMPT closed; the JOB stays continuable (attempt_ended),
 	// never a terminal work-failure.
 	expect(jobs.result.jobs[0].state).toBe("attempt_ended");
-	// The worktree facts ran: this test process IS a git worktree, so the
-	// repository-first checkpoint was recorded.
-	expect(jobs.result.jobs[0].checkpoints).toBeGreaterThanOrEqual(1);
+	// No commit was made, so the pre-existing HEAD must NOT appear as a
+	// worker checkpoint: progress is measured against the creation baseline.
+	expect(jobs.result.jobs[0].checkpoints).toBe(0);
 
 	// The stored authority carries the closed attempt; the record is restart-safe.
 	const raw = database.laneJobJson(jobId);
