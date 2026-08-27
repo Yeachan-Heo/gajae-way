@@ -89,11 +89,9 @@
  ],
  "reportIdentity": "This report lives in the tree it reports on. Report-only commits after the validated executable commit change no executable code, so the receipts above remain valid for the branch head containing this file.",
  "criticRound3Fixes": [
-  "checkpoint ordering: git SHAs have no chronological lexical order; only consecutive duplicates are rejected",
-  "fail-closed parse: missing v1 sections are schema violations; endState validated against the supervisor-state vocabulary; non-string report rejected",
-  "duplicate attempts: appendAttempt enforces one open attempt; planContinuation reads the stored open attempt instead of a synthetic projection",
-  "production wiring: putLaneJob/laneJobJson/laneJobRows called by work.run and work.jobs in gateway server.ts; admin exposes /api/jobs",
-  "evidence honesty: report receipts re-pinned to the validated executable commit with per-suite counts re-run at that head"
+  "sticky awaiting_operator/resume contract: work.run on a held job refuses to run until resume:true; held/resume outcomes typed in WorkRunParams/WorkRunResult and surfaced in the CLI",
+  "repository-first reconciliation on every attempt end (completed, reaped, failed) with baselineSha stored as creation-time context - checkpoints only record HEAD moves beyond it",
+  "exact lane-key/worktree identity: lookup by the unique original-name lane key with fail-closed lane-mismatch errors, and an injective, schema-bounded jobId (hex of the exact UTF-8 name)"
  ],
  "criticRound4Fixes": [
   "baseline HEAD stored as context (baselineSha), never a checkpoint; checkpoints only record observed HEAD moves past baseline",
