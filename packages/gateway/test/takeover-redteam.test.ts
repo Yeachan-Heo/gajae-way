@@ -716,3 +716,23 @@ test("an unterminated credential array redacts to the end of the diagnostic", ()
 	expect(notice).not.toContain("wJalrXUtnFEMIK7MDENGbPxRfiCYEXAMPLEKEY");
 	expect(notice).toContain("[redacted]");
 });
+
+test("a nested array's ] does not end credential-array redaction early", () => {
+	// G5-B1 final form: bracket DEPTH is tracked, so a valid nested array before
+	// a later generic credential cannot terminate the redaction at the inner ].
+	const message = `{"secrets":[["safe"],"wJalrXUtnFEMIK7MDENGbPxRfiCYEXAMPLEKEY"]}`;
+	const notice = formatFailureNotice(new GjcRuntimeError("wrapped", { code: "spawn_failed", message }));
+	expect(notice).not.toContain("wJalrXUtnFEMIK7MDENGbPxRfiCYEXAMPLEKEY");
+	expect(notice).toContain("[redacted]");
+});
+
+test("malformed nesting redacts to the end of the diagnostic", () => {
+	const notice = formatFailureNotice(
+		new GjcRuntimeError("wrapped", {
+			code: "spawn_failed",
+			message: `{"secrets":[["open","wJalrXUtnFEMIK7MDENGbPxRfiCYEXAMPLEKEY"] later text`,
+		}),
+	);
+	expect(notice).not.toContain("wJalrXUtnFEMIK7MDENGbPxRfiCYEXAMPLEKEY");
+	expect(notice).toContain("[redacted]");
+});
