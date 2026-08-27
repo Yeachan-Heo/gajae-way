@@ -28,19 +28,33 @@ export class DeliveryLedger {
 		);
 	}
 	markInflight(deliveryId: string): void {
-		this.#database.withTransaction(() =>
-			this.#database.deliveryUpdate(deliveryId, "inflight", this.get(deliveryId)?.attempts ?? 0),
-		);
+		const row = this.get(deliveryId);
+		if (!row || row.state === "confirmed" || row.state === "expired") return;
+		this.#database.withTransaction(() => this.#database.deliveryUpdate(deliveryId, "inflight", row.attempts));
 	}
+	/**
+	 * Terminal-state transitions are explicit (red-team blocker 2):
+	 * - `confirmed` is terminal: a late duplicate confirm is a no-op; a fail can
+	 *   NEVER rewrite a confirmed row (the platform told us it was delivered).
+	 * - `expired` is terminal: a late confirm cannot resurrect it (the platform
+	 *   connection is gone; a duplicate would be re-acked through the redelivery
+	 *   path only if the row were still live). Late-fail on expired is a no-op.
+	 * Returns true only when a transition actually happened, so callers can
+	 * distinguish "settled now" from "already settled".
+	 */
 	confirm(deliveryId: string): boolean {
 		const row = this.get(deliveryId);
 		if (!row) return false;
+		if (row.state === "confirmed" || row.state === "expired") return false;
 		this.#database.withTransaction(() => this.#database.deliveryUpdate(deliveryId, "confirmed"));
 		return true;
 	}
 	fail(deliveryId: string, ambiguous = false): boolean {
 		const row = this.get(deliveryId);
 		if (!row) return false;
+		// Terminal states never rewrite: confirmed stays delivered, expired stays
+		// expired. A late duplicate fail after confirm is recorded as a no-op.
+		if (row.state === "confirmed" || row.state === "expired") return false;
 		const attempts = row.attempts + 1;
 		const state: DeliveryState = ambiguous ? "failed_ambiguous" : attempts >= 3 ? "expired" : "pending";
 		this.#database.withTransaction(() => this.#database.deliveryUpdate(deliveryId, state, attempts));

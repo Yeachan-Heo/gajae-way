@@ -571,6 +571,19 @@ WHERE excluded.acquired_at IS NOT NULL AND (SELECT expires_at FROM dispatch_leas
 		if (row && Date.parse(row.expires_at) > now) return row.lease_id;
 		return undefined;
 	}
+	/** Extends a live lease only when the caller still owns it (stale attempts are no-ops). */
+	monitorEventRenewLease(eventId: string, leaseId: string, ttlMs: number, now = Date.now()): boolean {
+		const row = this.#database
+			.query<{ lease_id: string }, [string, string, string]>(
+				"SELECT lease_id FROM dispatch_leases WHERE event_id = ? AND lease_id = ? AND expires_at > ?",
+			)
+			.get(eventId, leaseId, new Date(now).toISOString());
+		if (!row) return false;
+		this.#database
+			.query("UPDATE dispatch_leases SET expires_at = ? WHERE event_id = ? AND lease_id = ?")
+			.run(new Date(now + ttlMs).toISOString(), eventId, leaseId);
+		return true;
+	}
 	/** True while the given lease is the live claim for the event. */
 	monitorEventLeaseHeld(eventId: string, leaseId: string, now = Date.now()): boolean {
 		const row = this.#database
@@ -723,16 +736,6 @@ WHERE excluded.acquired_at IS NOT NULL AND (SELECT expires_at FROM dispatch_leas
 		}
 		return rows;
 	}
-	/** Claims one scheduled slot for a monitor; false means it was already fired/claimed. */
-	monitorSlotClaim(monitorId: string, slotAt: string): boolean {
-		const now = new Date().toISOString();
-		const changes = this.#database
-			.query(
-				"INSERT INTO monitor_slots (monitor_id, slot_at, created_at) VALUES (?, ?, ?) ON CONFLICT(monitor_id, slot_at) DO NOTHING",
-			)
-			.run(monitorId, slotAt, now).changes;
-		return changes > 0;
-	}
 	/**
 	 * Red-team blocker 2: the slot claim and the event admission commit in ONE
 	 * transaction. A claim row whose event_id is NULL means the gateway fired
@@ -766,20 +769,6 @@ WHERE excluded.acquired_at IS NOT NULL AND (SELECT expires_at FROM dispatch_leas
 				return true;
 			}) as boolean
 		);
-	}
-	/** Links an admitted event to its slot claim (repair of an unadmitted claim). */
-	monitorSlotLinkEvent(monitorId: string, slotAt: string, eventId: string): void {
-		this.#database
-			.query("UPDATE monitor_slots SET event_id = ? WHERE monitor_id = ? AND slot_at = ?")
-			.run(eventId, monitorId, slotAt);
-	}
-	/** Slot claims that never produced an event (crash between claim and admit). */
-	monitorSlotUnadmitted(): Array<{ monitor_id: string; slot_at: string; created_at: string }> {
-		return this.#database
-			.query(
-				"SELECT monitor_id, slot_at, created_at FROM monitor_slots WHERE event_id IS NULL ORDER BY slot_at",
-			)
-			.all() as Array<{ monitor_id: string; slot_at: string; created_at: string }>;
 	}
 	monitorSlotExists(monitorId: string, slotAt: string): boolean {
 		const row = this.#database

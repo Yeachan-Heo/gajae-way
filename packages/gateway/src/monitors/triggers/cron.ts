@@ -33,16 +33,21 @@ export function minuteEpoch(date: Date): number {
 
 /**
  * Exact scheduled slot timestamps for every schedule minute in the half-open
- * window (from, now], oldest first, bounded by `budget`. Slots are computed in
- * LOCAL time — the same wall-clock contract `cronMatches` and every existing
- * cron monitor already run on; no timezone conversion is introduced.
+ * window (from, now], oldest first, computed in LOCAL time — the same
+ * wall-clock contract `cronMatches` and every existing cron monitor already
+ * run on; no timezone conversion is introduced.
+ *
+ * `fire` returning false means the slot was NOT newly admitted (already
+ * claimed durably by an earlier tick/process). Only NEW admissions count
+ * against `budget`: duplicates from previously claimed slots never consume
+ * catch-up capacity, so a genuinely missed later slot is still reached.
  */
 export function cronSlotsBetween(
 	schedule: string,
 	from: Date,
 	now: Date,
 	budget: number,
-	fire: (slotAt: Date) => void,
+	fire: (slotAt: Date) => boolean,
 ): number {
 	let fired = 0;
 	const cursor = new Date(from.getTime());
@@ -50,9 +55,9 @@ export function cronSlotsBetween(
 	cursor.setMinutes(cursor.getMinutes() + 1);
 	while (cursor.getTime() <= now.getTime()) {
 		if (cronMatches(schedule, cursor)) {
+			// Budget counts only newly admitted slots; duplicates don't consume it.
 			if (fired >= budget) break;
-			fire(new Date(cursor.getTime()));
-			fired++;
+			if (fire(new Date(cursor.getTime()))) fired++;
 		}
 		cursor.setMinutes(cursor.getMinutes() + 1);
 	}
@@ -80,7 +85,7 @@ export const CATCH_UP_WINDOW_MS = 60 * 60 * 1000;
  */
 export function startCron(
 	schedule: string,
-	fire: (slotAt: Date) => void,
+	fire: (slotAt: Date) => boolean,
 	options: { now?: () => Date; maxCatchUpSlots?: number; intervalMs?: number } = {},
 ): () => void {
 	const now = options.now ?? (() => new Date());

@@ -356,8 +356,10 @@ async function handleRequest(
 			return;
 		case "delivery.confirm": {
 			const id = (request.params as { deliveryId?: unknown } | undefined)?.deliveryId;
-			if (typeof id !== "string" || !runtime.delivery.confirm(id))
+			if (typeof id !== "string" || !options.database.deliveryRows().some((row) => row.delivery_id === id))
 				throw new ProtocolError("invalid_params", "unknown deliveryId");
+			// Confirm on an already-terminal row is an idempotent no-op (ack'd).
+			runtime.delivery.confirm(id);
 			// Monitor batch settlement: a confirmed delivery for a monitor batch
 			// (turn_id === the events' batch_id) advances its authored events to
 			// `delivered` — only AFTER the adapter confirmed (issue #29 defect 2).
@@ -372,9 +374,12 @@ async function handleRequest(
 				typeof params.deliveryId !== "string" ||
 				typeof params.reason !== "string" ||
 				(typeof params.ambiguous !== "undefined" && typeof params.ambiguous !== "boolean") ||
-				!runtime.delivery.fail(params.deliveryId, params.ambiguous)
+				!options.database.deliveryRows().some((row) => row.delivery_id === params.deliveryId)
 			)
 				throw new ProtocolError("invalid_params", "invalid delivery failure");
+			// A fail on an already-terminal row is an idempotent no-op (ack'd), not an
+			// error: the adapter may be retrying a stale outcome.
+			runtime.delivery.fail(params.deliveryId, params.ambiguous);
 			// A failed monitor-batch delivery stays distinguishable: its events keep
 			// stage `authored` (or `batched` before authoring) so reconcile and the
 			// operator projection show them as unsettled; the ledger row carries the

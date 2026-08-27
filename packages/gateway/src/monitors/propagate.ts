@@ -180,26 +180,6 @@ export class MonitorPropagator {
 		if (this.#reconciling) return;
 		this.#reconciling = true;
 		try {
-			// First: admit any cron slots whose claim committed but whose event row
-			// never did (crash between the two writes in a non-atomic path). The
-			// slot row keeps the scheduled identity, so recovery restores the event
-			// with its exact scheduled fired_at.
-			for (const slot of this.#database.monitorSlotUnadmitted()) {
-				const monitor = this.#registry.get(slot.monitor_id);
-				if (!monitor?.enabled) continue;
-				const eventId = crypto.randomUUID();
-				const eventType = monitor.eventTypes[0] ?? "monitor.event";
-				this.#database.withTransaction(() => {
-					this.#database.monitorEventCreate({
-						eventId,
-						monitorId: slot.monitor_id,
-						eventType,
-						payloadJson: JSON.stringify({ at: slot.slot_at }),
-						firedAt: slot.slot_at,
-					});
-					this.#database.monitorSlotLinkEvent(slot.monitor_id, slot.slot_at, eventId);
-				});
-			}
 			// Replay oldest-first: recovery must re-author events in the order they fired.
 			for (const row of this.#database.monitorEventRows(undefined, "oldest")) {
 				if ((TERMINAL_STAGES as readonly string[]).includes(row.stage)) continue;
@@ -273,6 +253,15 @@ export class MonitorPropagator {
 			leased.push(row);
 		}
 		if (!leased.length) return;
+		// Heartbeat: renew the lease while the authoring turn is in flight so long
+		// turns (observed 14m+ canonicalizations) never expire mid-flight, while a
+		// dead owner's lease still times out (bounded expiry = TTL after the last
+		// heartbeat).
+		const stopHeartbeat = this.#startLeaseHeartbeat(
+			leased.map((row) => row.event_id),
+			leaseId,
+			leaseTtlMs,
+		);
 		this.#database.withTransaction(() => {
 			for (const row of leased) this.#database.monitorEventUpdate(row.event_id, "batched", batchId);
 		});
@@ -291,13 +280,22 @@ export class MonitorPropagator {
 				.join(" ");
 			const prompt = `Author monitor events.${guidance ? ` ${guidance}` : ""} Respond ONLY with a JSON array containing exactly one {"eventId","note"} entry per event: ${JSON.stringify(leased.map((row) => ({ eventId: row.event_id, eventType: row.event_type, payload: JSON.parse(row.payload_json) })))}`;
 			const response = await this.#gjc.sendTurn(sessionId, prompt);
+			// Lease fencing: after an await, this attempt may no longer own the
+			// claim (expired + stolen). Every write below is conditional on the
+			// live lease; a stale attempt's completion becomes a no-op.
+			const fenced = leased.filter((row) => this.#holdsLease(row.event_id, leaseId));
+			if (!fenced.length) return;
 			this.#database.withTransaction(() => {
-				for (const row of leased) this.#database.monitorEventUpdate(row.event_id, "dispatched", batchId);
+				for (const row of fenced) this.#database.monitorEventUpdate(row.event_id, "dispatched", batchId);
 			});
 			const authored = JSON.parse(response) as Array<{ eventId?: unknown; note?: unknown }>;
 			if (!Array.isArray(authored)) throw new Error("authoring response is not an array");
 			for (const entry of authored)
-				if (typeof entry.eventId === "string" && eventIds.includes(entry.eventId) && typeof entry.note === "string")
+				if (
+					typeof entry.eventId === "string" &&
+					fenced.some((row) => row.event_id === entry.eventId) &&
+					typeof entry.note === "string"
+				)
 					this.#author(entry.eventId, entry.note);
 			// A monitor without its own channel target reports to the configured owner
 			// target when one exists: a personal agent's maintenance and event notes go
@@ -307,7 +305,7 @@ export class MonitorPropagator {
 			const target = monitor.channelTarget ?? this.#ownerTarget;
 			if (!target) {
 				this.#database.withTransaction(() => {
-					for (const row of leased)
+					for (const row of fenced)
 						if (this.#database.authoredOutput(row.event_id) !== undefined)
 							this.#database.monitorEventUpdate(row.event_id, "authored_no_delivery", batchId);
 				});
@@ -319,7 +317,9 @@ export class MonitorPropagator {
 				authored
 					.filter(
 						(entry): entry is { eventId: string; note: string } =>
-							typeof entry.eventId === "string" && typeof entry.note === "string",
+							typeof entry.eventId === "string" &&
+							typeof entry.note === "string" &&
+							fenced.some((row) => row.event_id === entry.eventId),
 					)
 					.map((entry) => entry.note)
 					.join("\n"),
@@ -337,17 +337,41 @@ export class MonitorPropagator {
 			const code: DispatchFailureCode = failureCode(error);
 			this.#database.withTransaction(() => {
 				for (const row of leased) {
+					if (!this.#holdsLease(row.event_id, leaseId)) continue;
 					this.#database.monitorEventUpdate(row.event_id, "failed", batchId);
 					this.#database.monitorFailureRecord(row.event_id, code, `dispatch phase failed (${code})`);
 				}
 			});
 			console.error(`monitor dispatch failed (${code}): events ${leased.map((row) => row.event_id).join(",")}`);
 		} finally {
+			stopHeartbeat();
 			// Release the leases this attempt holds. Lease-guarded: if this attempt
 			// expired and another process stole the claim, this release is a no-op,
 			// and a stale attempt's completion can never overwrite the newer claim.
 			for (const row of leased) this.#database.monitorEventReleaseLease(row.event_id, leaseId);
 		}
+	}
+	/**
+	 * Renews every held lease on an interval (TTL/3) so the claim stays live for
+	 * the duration of a long authoring turn without extending unboundedly after
+	 * owner death. Returns a stop function.
+	 */
+	#startLeaseHeartbeat(eventIds: string[], leaseId: string, ttlMs: number): () => void {
+		const timer = setInterval(
+			() => {
+				for (const eventId of eventIds) this.#database.monitorEventRenewLease(eventId, leaseId, ttlMs);
+			},
+			Math.max(1000, Math.floor(ttlMs / 3)),
+		);
+		timer.unref?.();
+		return () => clearInterval(timer);
+	}
+	/**
+	 * True when leaseId is still the live claim — the fencing check that gates
+	 * every state/output/failure/delivery write from this dispatch attempt.
+	 */
+	#holdsLease(eventId: string, leaseId: string): boolean {
+		return this.#database.monitorEventLeaseHeld(eventId, leaseId);
 	}
 	#author(eventId: string, note: string, noDelivery = false): void {
 		const row = this.#database.monitorEventRows().find((candidate) => candidate.event_id === eventId);

@@ -160,3 +160,45 @@ test("delivery.fail before confirmation keeps authored events authored (server p
 	expect(stages.map((row) => row.stage)).toEqual(["authored", "authored"]);
 	expect(ctx.db.deliveryRows().find((row) => row.delivery_id === ctx.deliveryId)?.state).toBe("pending");
 });
+
+test("RT-29 ledger monotonicity: late fail after confirmed is a no-op on the ledger row", async () => {
+	const ctx = await startWithMonitor();
+	ctx.send({ v: "0.1", type: "hello", payload: { supportedVersions: ["0.1"] } });
+	ctx.send({ v: "0.1", type: "request", id: "confirm", verb: "delivery.confirm", params: { deliveryId: ctx.deliveryId } });
+	await response(ctx.frames, "confirm");
+	expect(ctx.db.deliveryRows().find((row) => row.delivery_id === ctx.deliveryId)?.state).toBe("confirmed");
+	// Adapter retries a stale failure AFTER the confirm landed:
+	ctx.send({
+		v: "0.1",
+		type: "request",
+		id: "late-fail",
+		verb: "delivery.fail",
+		params: { deliveryId: ctx.deliveryId, reason: "stale retry", ambiguous: true },
+	});
+	await response(ctx.frames, "late-fail");
+	const row = ctx.db.deliveryRows().find((row) => row.delivery_id === ctx.deliveryId);
+	// Terminal confirmed is never rewritten to failed_ambiguous/pending.
+	expect(row?.state).toBe("confirmed");
+	// And the monitor events stay delivered (already covered by the other test).
+});
+
+test("RT-29 ledger monotonicity: expired row cannot be resurrected by a late confirm", async () => {
+	const ctx = await startWithMonitor();
+	ctx.send({ v: "0.1", type: "hello", payload: { supportedVersions: ["0.1"] } });
+	// Three non-ambiguous fails expire the delivery (3-attempt policy).
+	for (const id of ["f1", "f2", "f3"]) {
+		ctx.send({
+			v: "0.1",
+			type: "request",
+			id,
+			verb: "delivery.fail",
+			params: { deliveryId: ctx.deliveryId, reason: "adapter down", ambiguous: false },
+		});
+		await response(ctx.frames, id);
+	}
+	expect(ctx.db.deliveryRows().find((row) => row.delivery_id === ctx.deliveryId)?.state).toBe("expired");
+	// A late confirm cannot resurrect an expired delivery:
+	ctx.send({ v: "0.1", type: "request", id: "late-confirm", verb: "delivery.confirm", params: { deliveryId: ctx.deliveryId } });
+	await response(ctx.frames, "late-confirm");
+	expect(ctx.db.deliveryRows().find((row) => row.delivery_id === ctx.deliveryId)?.state).toBe("expired");
+});

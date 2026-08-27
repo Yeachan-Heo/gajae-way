@@ -40,16 +40,11 @@ export class MonitorRuntime {
 				this.#stops.push(
 					startCron(
 						monitor.trigger.schedule,
-						(slotAt) => {
-							// Atomic slot-claim + event admission inside the propagator;
-							// duplicate slots (restart overlap) return null and are skipped.
-							this.#propagator.submitSlot(
-								monitor.monitorId,
-								monitor.eventTypes[0]!,
-								{ at: slotAt.toISOString() },
-								slotAt,
-							);
-						},
+						// Atomic slot-claim + event admission inside the propagator.
+						// Returns whether the slot was NEWLY admitted (false for
+						// restart-overlap duplicates) so the catch-up budget counts
+						// only real admissions.
+						(slotAt) => this.#propagator.submitSlot(monitor.monitorId, monitor.eventTypes[0]!, { at: slotAt.toISOString() }, slotAt) !== null,
 						{ now: this.#clock },
 					),
 				);
