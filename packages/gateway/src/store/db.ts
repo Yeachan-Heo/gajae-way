@@ -2,7 +2,7 @@ import { Database } from "bun:sqlite";
 import { mkdir } from "node:fs/promises";
 import { dirname } from "node:path";
 
-const LATEST_SCHEMA_VERSION = 8;
+const LATEST_SCHEMA_VERSION = 9;
 
 export interface InboundMessageRow {
 	readonly message_id: string;
@@ -68,7 +68,7 @@ export class GatewayDatabase {
 		const now = new Date().toISOString();
 		this.#database
 			.query(
-				"INSERT INTO sessions (origin_key, origin_ref_json, gjc_session_id, epoch, created_at, last_activity_at) VALUES (?, ?, '', 1, ?, ?) ON CONFLICT(origin_key) DO UPDATE SET epoch = epoch + 1, gjc_session_id = '', origin_ref_json = excluded.origin_ref_json, last_activity_at = excluded.last_activity_at",
+				"INSERT INTO sessions (origin_key, origin_ref_json, gjc_session_id, epoch, created_at, last_activity_at) VALUES (?, ?, '', 1, ?, ?) ON CONFLICT(origin_key) DO UPDATE SET epoch = epoch + 1, gjc_session_id = '', turn_count = 0, origin_ref_json = excluded.origin_ref_json, last_activity_at = excluded.last_activity_at",
 			)
 			.run(originKey, originRefJson, now, now);
 		return this.#database
@@ -80,6 +80,20 @@ export class GatewayDatabase {
 		this.#database
 			.query("UPDATE sessions SET last_activity_at = ?, origin_ref_json = ? WHERE origin_key = ?")
 			.run(new Date().toISOString(), originRefJson, originKey);
+	}
+
+	/**
+	 * Counts completed turns within the current epoch. The gjc session transcript
+	 * grows with every `--resume`, so per-turn prefill latency grows without bound;
+	 * the server auto-rotates the epoch once this count reaches its ceiling.
+	 */
+	incrementTurnCount(originKey: string): number {
+		this.#database.query("UPDATE sessions SET turn_count = turn_count + 1 WHERE origin_key = ?").run(originKey);
+		return (
+			this.#database
+				.query<{ turn_count: number }, [string]>("SELECT turn_count FROM sessions WHERE origin_key = ?")
+				.get(originKey)?.turn_count ?? 0
+		);
 	}
 
 	sessionRows(): Array<{
@@ -570,6 +584,17 @@ export class GatewayDatabase {
 				this.#database
 					.query("INSERT INTO schema_migrations (version, applied_at) VALUES (?, ?)")
 					.run(8, new Date().toISOString());
+			});
+		}
+		if (current < 9) {
+			this.withTransaction(() => {
+				// Session growth bound: the gjc transcript grows with every --resume, so
+				// turns get slower forever without rotation. turn_count tracks completed
+				// turns in the current epoch; the server auto-bumps the epoch at a ceiling.
+				this.#database.exec("ALTER TABLE sessions ADD COLUMN turn_count INTEGER NOT NULL DEFAULT 0");
+				this.#database
+					.query("INSERT INTO schema_migrations (version, applied_at) VALUES (?, ?)")
+					.run(9, new Date().toISOString());
 			});
 		}
 	}

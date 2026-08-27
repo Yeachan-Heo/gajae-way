@@ -30,6 +30,12 @@ export interface TurnOptions {
 	readonly cwd?: string;
 	/** Keep gjc's own coding-assistant system prompt instead of the generic-agent override. */
 	readonly codingRegister?: boolean;
+	/**
+	 * Called once per completed assistant message while the turn is still
+	 * running, so callers can deliver intermediate replies of a long agentic
+	 * turn instead of staying silent until the process exits.
+	 */
+	readonly onAssistantText?: (text: string) => void;
 }
 
 export interface GjcPort {
@@ -45,14 +51,21 @@ export interface GjcPort {
 
 /**
  * Incremental parser for the `gjc -p --mode json` ndjson event stream.
- * Tracks tool executions and captures the final assistant text.
+ * Tracks tool executions, captures the final assistant text, and (optionally)
+ * reports each completed assistant message as it streams so long agentic turns
+ * can deliver intermediate replies instead of going silent until process exit.
  */
 export class GjcTurnStream {
 	#buffer = "";
 	#exactOutputTokens = 0;
 	#deltaChars = 0;
+	readonly #onAssistantText: ((text: string) => void) | undefined;
 	toolCalls = 0;
 	finalText: string | undefined;
+
+	constructor(onAssistantText?: (text: string) => void) {
+		this.#onAssistantText = onAssistantText;
+	}
 
 	/** Exact usage from completed messages plus a ~4-chars/token estimate of the in-flight one. */
 	get outputTokens(): number {
@@ -94,7 +107,10 @@ export class GjcTurnStream {
 				.map((part) => part.text)
 				.join("\n")
 				.trim();
-			if (text) this.finalText = text;
+			if (text) {
+				this.finalText = text;
+				this.#onAssistantText?.(text);
+			}
 		}
 	}
 }
@@ -217,7 +233,7 @@ export class GjcClient implements GjcPort {
 		// visibly working (streaming events, running tools) is never killed, while a
 		// hung child that goes silent for turnTimeoutMs is reaped (owner directive:
 		// long agentic work must not die mid-flight; liveness is reported instead).
-		const stream = new GjcTurnStream();
+		const stream = new GjcTurnStream(options?.onAssistantText);
 		let lastActivity = Date.now();
 		let killedForInactivity = false;
 		const watchdog = setInterval(() => {

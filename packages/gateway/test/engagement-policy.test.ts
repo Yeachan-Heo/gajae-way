@@ -55,3 +55,42 @@ test("mention allowlist gates group mention commands but never open channels or 
 	const dm = { platform: "discord", kind: "dm", conversationId: "d1", peerId: "p" };
 	expect(decideEngagement(dm, stranger, base as never).engaged).toBe(true);
 });
+
+test("bot authors never get the open-channel free pass; a bot mention still engages", () => {
+	const base = {
+		schemaVersion: 1 as const,
+		home: "/tmp/x",
+		configPath: "/tmp/x/config.json",
+		socketPath: "/tmp/x/s",
+		dbPath: "/tmp/x/db",
+		logVerbosity: "info" as const,
+		mentionAllowlist: ["owner-1", "sibling-bot"],
+	};
+	const channel = { platform: "discord", kind: "channel", conversationId: "c1" };
+	const open = { ...base, channels: { c1: { engagement: "open" as const } } };
+	// Sibling-bot chatter (progress spam, replies to each other) must not burn turns.
+	expect(
+		decideEngagement(
+			channel,
+			{ mentioned: false, group: true, authorId: "sibling-bot", authorIsBot: true },
+			open as never,
+		).engaged,
+	).toBe(false);
+	// A bot that explicitly mentions us gets a turn through the normal allowlisted mention path.
+	expect(
+		decideEngagement(
+			channel,
+			{ mentioned: true, group: true, authorId: "sibling-bot", authorIsBot: true },
+			open as never,
+		).engaged,
+	).toBe(true);
+	// An unlisted bot mention stays context, never a turn.
+	expect(
+		decideEngagement(channel, { mentioned: true, group: true, authorId: "rogue-bot", authorIsBot: true }, open as never)
+			.engaged,
+	).toBe(false);
+	// Humans keep the open-channel free pass.
+	expect(decideEngagement(channel, { mentioned: false, group: true, authorId: "human-2" }, open as never).engaged).toBe(
+		true,
+	);
+});

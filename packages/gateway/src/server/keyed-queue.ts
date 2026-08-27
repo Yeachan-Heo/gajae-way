@@ -23,4 +23,13 @@ export class KeyedQueue {
 		});
 		return result;
 	}
+
+	/**
+	 * Resolves once every task enqueued so far has settled. Shutdown awaits this
+	 * before closing the database: an in-flight drain's bookkeeping was hitting a
+	 * closed database mid-teardown (live "Cannot use a closed database" crash).
+	 */
+	async settle(): Promise<void> {
+		while (this.#tails.size > 0) await Promise.all([...this.#tails.values()]);
+	}
 }

@@ -57,6 +57,8 @@ export interface EngagementContext {
 	readonly group: boolean;
 	/** Platform-scoped author id of the inbound message. */
 	readonly authorId: string;
+	/** True when the platform marks the author as a bot/automation account. */
+	readonly authorIsBot?: boolean;
 	/**
 	 * Name to address the author by: the per-surface display name a reader in the
 	 * room actually sees, not the account handle. On Discord that is the guild

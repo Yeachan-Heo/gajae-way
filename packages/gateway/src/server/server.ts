@@ -44,6 +44,18 @@ import { DeliveryLedger } from "../store/ledger";
 import { KeyedQueue } from "./keyed-queue";
 import { composeSpeakerLabel, composeTurnHeader } from "./speaker";
 
+/**
+ * Completed turns per epoch before the session is rotated. Every `gjc --resume`
+ * replays the whole transcript, so an unrotated busy origin gets slower forever;
+ * durable memory (daily capture + recall) carries continuity across epochs.
+ */
+const SESSION_TURN_LIMIT = 50;
+
+/** A `gjc --resume` against a session gjc no longer has (deleted or lost binding). */
+function isStaleSessionError(error: unknown): boolean {
+	return error instanceof Error && /session\s+"?[\w-]+"?\s+not found/i.test(error.message);
+}
+
 interface Connection {
 	readonly decoder: FrameDecoder;
 	negotiated: boolean;
@@ -108,6 +120,9 @@ export async function startUnixServer(options: GatewayServerOptions): Promise<Ga
 				connection.write({ v: PROFILE_VERSION, type: "event", event: "gateway.stopping", payload: { reason } });
 			listener.stop(true);
 			clearInterval(runtime.reconcileTimer);
+			// In-flight turn drains still touch the database; close it under them and
+			// their completion bookkeeping crashes ("Cannot use a closed database").
+			await runtime.turns.settle();
 			await runtime.monitorRuntime.stop();
 			await settleMemory(runtime);
 			await options.onStop?.();
@@ -167,6 +182,7 @@ export function startStdioServer(options: GatewayServerOptions): GatewayServer {
 		stopPromise = (async () => {
 			connection.write({ v: PROFILE_VERSION, type: "event", event: "gateway.stopping", payload: { reason } });
 			clearInterval(runtime.reconcileTimer);
+			await runtime.turns.settle();
 			await runtime.monitorRuntime.stop();
 			connection.close();
 			await settleMemory(runtime);
@@ -782,8 +798,14 @@ async function drainOrigin(
 			// Debounce: a burst of messages becomes ONE turn carrying the whole diff.
 			// The window is per-channel configurable; newer arrivals during the wait
 			// are folded into this batch, with the newest message as the trigger.
+			// The window counts from the message's ARRIVAL, not from claim time: a
+			// message that already waited behind an earlier turn has served its
+			// debounce, and sleeping again inside the serialized drain was adding
+			// flat latency to every drained batch (live gajaeway-play finding).
 			const debounceMs = debounceFor(row, options.config);
-			if (debounceMs > 0) await Bun.sleep(debounceMs);
+			const waitedMs = Date.now() - Date.parse(row.received_at);
+			const remainingMs = Number.isFinite(waitedMs) ? Math.max(0, debounceMs - waitedMs) : debounceMs;
+			if (remainingMs > 0) await Bun.sleep(remainingMs);
 			const batch = [row];
 			for (let more = options.database.inboundClaimNext(key); more; more = options.database.inboundClaimNext(key))
 				batch.push(more);
@@ -798,7 +820,16 @@ async function drainOrigin(
 						`gateway inbound turn failed (${batch[batch.length - 1]?.message_id}): ${error instanceof Error ? (error.stack ?? error.message) : String(error)}`,
 					);
 			} finally {
-				for (const member of batch) options.database.inboundComplete(member.message_id);
+				for (const member of batch) {
+					try {
+						options.database.inboundComplete(member.message_id);
+					} catch (error) {
+						// One failed row must not strand the rest; startup recovery re-queues stragglers.
+						console.error(
+							`gateway inbound completion failed (${member.message_id}): ${error instanceof Error ? error.message : String(error)}`,
+						);
+					}
+				}
 			}
 		}
 	});
@@ -870,6 +901,79 @@ async function runInboundTurn(
 		options.database.contextConsume([...unread.map((entry) => entry.message_id), row.message_id]);
 	}
 	let text: string;
+	// Human-sized chat: the persona may split one message into several short parts
+	// with a line containing exactly [BREAK]; each part ships as its own delivery.
+	// Long agentic turns also produce SEVERAL assistant messages (one per model
+	// step); each is delivered the moment it completes instead of after process
+	// exit, so a multi-minute turn talks while it works (live gajaeway-play
+	// finding: turns showed nothing but "working…" until the very end).
+	const deliveredParts: string[] = [];
+	let reactionTokensSeen = false;
+	const maxTurnParts = 10;
+	const deliverAssistantText = (rawMessage: string) => {
+		if (!nonLoopback) return;
+		let message = rawMessage;
+		// Reaction reply mode (third mode next to text and silence, parsed per delivered
+		// assistant message so streamed intermediates carry it too): a message may open
+		// with [REACT:<emoji-or-name>] tokens, optionally targeting one message with
+		// `@<platform message id>`. With nothing left after the tokens the message
+		// acknowledges with a reaction and ships no text. Parsing is all-or-nothing: a
+		// malformed or non-allowlisted token yields undefined here, and the message is
+		// delivered verbatim as text — a bad token can cost the reaction, never the reply.
+		const reactionReply = parseReactionReply(message);
+		if (reactionReply) {
+			reactionTokensSeen = true;
+			for (const wanted of reactionReply.reactions) {
+				// Untargeted tokens react to the message that triggered this turn; that id is
+				// the platform's own message id whenever the adapter supplied one.
+				// A platform that cannot express this emoji would swallow the acknowledgement:
+				// skip it loudly rather than queue a delivery that can only ever fail.
+				if (!platformSupportsReaction(origin.platform, wanted.emojiName)) {
+					console.error(
+						`gateway reaction skipped for ${key}: ${origin.platform} cannot react with ${wanted.emoji} (${wanted.emojiName})`,
+					);
+					continue;
+				}
+				const targetMessageId = wanted.targetMessageId ?? row.message_id;
+				const rejection = runtime.reactions.claim({ turnId, originKey: key, targetMessageId, emoji: wanted.emoji });
+				if (rejection) {
+					// Never a silent no-op: an owner who does not see the reaction can find the
+					// reason in the daemon log.
+					console.error(
+						`gateway reaction rejected (${rejection.reason}) for ${key} message ${targetMessageId}: ${rejection.detail}`,
+					);
+					continue;
+				}
+				broadcastDelivery(
+					runtime,
+					runtime.delivery.prepareReaction(crypto.randomUUID(), origin, {
+						targetMessageId,
+						emoji: wanted.emoji,
+						emojiName: wanted.emojiName,
+					}),
+				);
+			}
+			message = reactionReply.body;
+			if (!message) return;
+		}
+		const parts = message
+			.split(/\n\s*\[BREAK\]\s*\n?/)
+			.map((part) => part.trim())
+			.filter((part) => part.length > 0 && !isSilenceToken(part))
+			.slice(0, 5);
+		for (const part of parts) {
+			if (deliveredParts.length >= maxTurnParts) return;
+			// Reply-threading: a part may open with [REPLY:<platform message id>] to
+			// answer a specific message; mentions are plain <@author id> in the text.
+			const replyMatch = part.match(/^\[REPLY:([^\]\s]+)\]\s*/);
+			const body = replyMatch ? part.slice(replyMatch[0].length).trim() : part;
+			if (!body) continue;
+			const payload = runtime.delivery.prepare(crypto.randomUUID(), origin, body, replyMatch?.[1]);
+			if (!payload) continue;
+			deliveredParts.push(body);
+			broadcastDelivery(runtime, payload);
+		}
+	};
 	// Long turns announce liveness instead of dying: throttled chat.progress events
 	// let adapters render a "working…" status while the persona runs. A heartbeat
 	// timer keeps the status ticking every interval even when the gjc stream is
@@ -903,15 +1007,43 @@ async function runInboundTurn(
 			if (recipient.negotiated) recipient.write({ v: PROFILE_VERSION, type: "event", event: "chat.progress", payload });
 	};
 	const heartbeat = setInterval(() => emitProgress(lastKnown), intervalMs);
-	try {
+	const runTurn = async () => {
 		const epoch = options.database.getSessionRecord(key)?.epoch ?? 0;
 		const { sessionId } = await options.gjc.ensureSession(key, epoch);
 		const preamble = `${await runtime.persona.systemPreamble()}\n\n${currentConversationNotice(origin, engagement)}\n\n${ACTION_GUARD_SYSTEM_NOTICE}`;
-		text = await options.gjc.sendTurn(sessionId, turnText, preamble, emitProgress);
+		return options.gjc.sendTurn(sessionId, turnText, preamble, emitProgress, {
+			onAssistantText: (message) => {
+				try {
+					deliverAssistantText(message);
+				} catch (error) {
+					// Delivery bookkeeping must never abort a running turn mid-stream.
+					console.error(
+						`gateway intermediate delivery failed (${turnId}): ${error instanceof Error ? error.message : String(error)}`,
+					);
+				}
+			},
+		});
+	};
+	try {
+		try {
+			text = await runTurn();
+		} catch (error) {
+			// A bound gjc session can vanish underneath its binding (live crash loop:
+			// `gjc turn exited 1: Session "…" not found` on every subsequent message).
+			// Rebind a fresh transcript via an epoch bump and retry once.
+			if (deliveredParts.length === 0 && isStaleSessionError(error)) {
+				console.error(`gateway rebinding stale gjc session for ${key}: ${(error as Error).message}`);
+				options.database.withTransaction(() => options.database.bumpEpoch(key, JSON.stringify(origin)));
+				text = await runTurn();
+			} else throw error;
+		}
 	} catch (error) {
 		// Never ghost a platform conversation: a failed turn still produces a visible,
 		// ledgered notice (live P1 drill finding: timeouts looked like silent ignores).
-		if (nonLoopback) {
+		// When intermediate messages already reached the room, the persona visibly
+		// spoke; a trailing "[turn failed]" would disavow real replies, so the
+		// failure stays in the daemon log only.
+		if (nonLoopback && deliveredParts.length === 0) {
 			const notice = runtime.delivery.prepare(
 				turnId,
 				origin,
@@ -932,83 +1064,27 @@ async function runInboundTurn(
 		// ends in a silence token and delivers nothing at all.
 		emitProgress(lastKnown, true);
 	}
+	const replyText = deliveredParts.length > 0 ? deliveredParts.join("\n") : text;
 	options.database.withTransaction(() => {
 		options.database.updateActivity(key, JSON.stringify(origin));
 		options.database.addRecall(
 			key,
 			JSON.stringify(origin),
-			`user: ${userText.slice(0, 500)}\nassistant: ${text.slice(0, 500)}`,
+			`user: ${userText.slice(0, 500)}\nassistant: ${replyText.slice(0, 500)}`,
 		);
+		// Session growth bound: every `gjc --resume` replays the whole transcript,
+		// so turns get slower forever on a busy origin. Rotate the epoch after a
+		// fixed number of turns; durable memory and recall provide continuity.
+		if (options.database.incrementTurnCount(key) >= SESSION_TURN_LIMIT) {
+			options.database.bumpEpoch(key, JSON.stringify(origin));
+			console.error(`gateway rotated session epoch for ${key} after ${SESSION_TURN_LIMIT} turns.`);
+		}
 	});
 	// Spec fact 22: a reply that is exactly a silence token means the persona chose not to
 	// speak. The observation is already recorded above, so nothing is delivered and no daily
 	// capture is written. This is what makes an `open` channel usable: the persona can read
 	// every message in the room without answering all of them.
-	if (isSilenceToken(text)) return;
-	// Reaction reply mode (third mode next to text and silence, parsed right here beside
-	// the silence token so the two stay one decision): a reply may open with
-	// [REACT:<emoji-or-name>] tokens, optionally targeting one message with
-	// `@<platform message id>`. With nothing left after the tokens the turn acknowledges
-	// with a reaction and sends no message at all. Parsing is all-or-nothing: a malformed
-	// or non-allowlisted token yields undefined here, and the reply is delivered verbatim
-	// as text — a bad token can cost the reaction, never the reply.
-	let replyText = text;
-	const reactionReply = nonLoopback ? parseReactionReply(text) : undefined;
-	if (reactionReply) {
-		for (const wanted of reactionReply.reactions) {
-			// Untargeted tokens react to the message that triggered this turn; that id is
-			// the platform's own message id whenever the adapter supplied one.
-			// A platform that cannot express this emoji would swallow the acknowledgement:
-			// skip it loudly rather than queue a delivery that can only ever fail.
-			if (!platformSupportsReaction(origin.platform, wanted.emojiName)) {
-				console.error(
-					`gateway reaction skipped for ${key}: ${origin.platform} cannot react with ${wanted.emoji} (${wanted.emojiName})`,
-				);
-				continue;
-			}
-			const targetMessageId = wanted.targetMessageId ?? row.message_id;
-			const rejection = runtime.reactions.claim({ turnId, originKey: key, targetMessageId, emoji: wanted.emoji });
-			if (rejection) {
-				// Never a silent no-op: an owner who does not see the reaction can find the
-				// reason in the daemon log.
-				console.error(
-					`gateway reaction rejected (${rejection.reason}) for ${key} message ${targetMessageId}: ${rejection.detail}`,
-				);
-				continue;
-			}
-			broadcastDelivery(
-				runtime,
-				runtime.delivery.prepareReaction(crypto.randomUUID(), origin, {
-					targetMessageId,
-					emoji: wanted.emoji,
-					emojiName: wanted.emojiName,
-				}),
-			);
-		}
-		replyText = reactionReply.body;
-		if (!replyText) {
-			// Reaction-only acknowledgement: nothing is spoken, but the turn happened and
-			// is captured with its token text so memory records what was acknowledged.
-			//
-			// If every reaction here was skipped — capped, duplicated, or not expressible
-			// on this platform — the turn ends having emitted nothing at all, and the
-			// daemon log is the only record OF THE SKIP; the turn itself is still in the
-			// session, in recall, and in the daily capture below. That is deliberate
-			// rather than a delivery failure: no ledger row was ever created, so there is
-			// nothing for gateway.status to show, and delivering the raw `[REACT:…]` token
-			// as text would leak control syntax into the room. For the capability case
-			// specifically, the persona is only offered emoji this origin can actually
-			// deliver (see currentConversationNotice), so reaching it means it ignored
-			// that list.
-			runtime.memory.enqueue({
-				kind: "daily_capture",
-				originRefJson: JSON.stringify(origin),
-				userText: speaker ? `${speaker} @ ${place}: ${userText}` : userText,
-				replyText: text,
-			});
-			return;
-		}
-	}
+	if (deliveredParts.length === 0 && isSilenceToken(text)) return;
 	if (!nonLoopback) {
 		connection.write({
 			v: PROFILE_VERSION,
@@ -1023,31 +1099,32 @@ async function runInboundTurn(
 	}
 	// Memory carries who spoke and where, so canonicalization keeps provenance.
 	const capturedUser = speaker ? `${speaker} @ ${place}: ${userText}` : userText;
-	// Human-sized chat: the persona may split one turn into several short messages
-	// with a line containing exactly [BREAK]; each part ships as its own delivery.
-	const parts = replyText
-		.split(/\n\s*\[BREAK\]\s*\n?/)
-		.map((part) => part.trim())
-		.filter((part) => part.length > 0 && !isSilenceToken(part))
-		.slice(0, 5);
-	for (const part of parts) {
-		// Reply-threading: a part may open with [REPLY:<platform message id>] to
-		// answer a specific message; mentions are plain <@author id> in the text.
-		const replyMatch = part.match(/^\[REPLY:([^\]\s]+)\]\s*/);
-		const body = replyMatch ? part.slice(replyMatch[0].length).trim() : part;
-		if (!body) continue;
-		const payload = runtime.delivery.prepare(crypto.randomUUID(), origin, body, replyMatch?.[1]);
-		if (!payload) continue;
-		runtime.delivery.markInflight(payload.deliveryId as string);
-		for (const recipient of runtime.connections)
-			if (recipient.negotiated) recipient.write({ v: PROFILE_VERSION, type: "event", event: "chat.message", payload });
+	// Ports without streaming (and the test stub) return only the final text; when
+	// nothing was delivered mid-turn, ship the final text through the same splitter
+	// (reaction tokens included).
+	if (deliveredParts.length === 0) deliverAssistantText(text);
+	if (deliveredParts.length === 0) {
+		// Reaction-only acknowledgement: nothing is spoken, but the turn happened and
+		// is captured with its token text so memory records what was acknowledged.
+		// If every reaction was skipped — capped, duplicated, or not expressible on
+		// this platform — the turn still emitted nothing and the daemon log is the
+		// only record of the skip; delivering the raw `[REACT:…]` token as text would
+		// leak control syntax into the room.
+		if (reactionTokensSeen)
+			runtime.memory.enqueue({
+				kind: "daily_capture",
+				originRefJson: JSON.stringify(origin),
+				userText: capturedUser,
+				replyText: text,
+			});
+		return;
 	}
 	// Durable intent is persisted synchronously; closure work deliberately does not delay delivery.
 	runtime.memory.enqueue({
 		kind: "daily_capture",
 		originRefJson: JSON.stringify(origin),
 		userText: capturedUser,
-		replyText: text,
+		replyText,
 	});
 }
 
