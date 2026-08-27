@@ -6,6 +6,7 @@ export {
 	type ChatReactResult,
 	type ChatSendParams,
 	type ChatSendResult,
+	type ConfigReloadResult,
 	type DeliveryConfirmParams,
 	type DeliveryFailParams,
 	type EngagementContext,

@@ -1,3 +1,4 @@
+import { lstat } from "node:fs/promises";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import { type OriginRef, validateOriginRef } from "@gajaeway/protocol";
@@ -63,7 +64,25 @@ export interface ReloadDiagnostic {
 }
 
 export type ReloadResult =
-	| { readonly ok: true; readonly config: GatewayConfig; readonly changed: readonly string[] }
+	| {
+			readonly ok: true;
+			readonly config: GatewayConfig;
+			/** Reloadable fields whose value actually changed and was applied. */
+			readonly changed: readonly string[];
+			/**
+			 * Fields the operator edited that CANNOT be applied live. They are
+			 * reported explicitly and left at their old values: a reload that
+			 * pretends to apply a restart-only field is worse than refusing.
+			 */
+			readonly restartRequired: readonly string[];
+			/**
+			 * Fields the operator edited that no code reads at all, so the edit has
+			 * no effect and no restart would give it one. Reported rather than
+			 * counted as applied, because claiming to apply a field nothing consumes
+			 * is the same operator lie in a quieter form.
+			 */
+			readonly ignored: readonly string[];
+	  }
 	| { readonly ok: false; readonly config: GatewayConfig; readonly diagnostics: readonly ReloadDiagnostic[] };
 
 export function gatewayHome(env: NodeJS.ProcessEnv = process.env): string {
@@ -212,14 +231,51 @@ export function parseConfigFile(value: unknown): GatewayConfigFile {
 }
 
 export async function loadConfig(
-	options: { readonly home?: string; readonly env?: NodeJS.ProcessEnv; readonly overrides?: ConfigOverrides } = {},
+	options: {
+		readonly home?: string;
+		readonly env?: NodeJS.ProcessEnv;
+		readonly overrides?: ConfigOverrides;
+		/**
+		 * Require config.json to exist and be readable. Absent means defaults, which
+		 * is right at BOOT and wrong on RELOAD: publishing defaults over live policy
+		 * drops mentionAllowlist and channels and opens a mention-gated room. The
+		 * check lives here, next to the read, so there is no window between a
+		 * caller's stat and this one — and so a future reload-ish caller cannot
+		 * reintroduce the hole by forgetting to guard.
+		 */
+		readonly requireFile?: boolean;
+	} = {},
 ): Promise<GatewayConfig> {
 	const home = options.home ?? gatewayHome(options.env);
 	const configPath = join(home, "config.json");
 	let fileConfig: GatewayConfigFile = { schemaVersion: CONFIG_SCHEMA_VERSION };
-	if (await Bun.file(configPath).exists()) {
+	let raw: string | undefined;
+	try {
+		raw = await Bun.file(configPath).text();
+	} catch (error) {
+		const code = (error as NodeJS.ErrnoException).code;
+		// ENOENT is genuinely "no configuration", and defaults are correct for a
+		// first boot. Anything else (EISDIR, EACCES, EIO) is a config file that
+		// EXISTS and cannot be read, which must never silently become a
+		// defaults-only open policy — not at reload, and not at boot either.
+		//
+		// A DANGLING SYMLINK also reports ENOENT while the directory entry plainly
+		// exists, so lstat decides: an entry that is there but unresolvable is
+		// unreadable, not absent. Without this, config.json symlinked into a
+		// dotfiles repo whose target moved booted the daemon on defaults.
+		const entryExists = await lstat(configPath).then(
+			() => true,
+			() => false,
+		);
+		if (options.requireFile || code !== "ENOENT" || entryExists)
+			throw new ConfigError(
+				"config_invalid",
+				`${configPath} is ${code === "ENOENT" && !entryExists ? "missing" : `unreadable (${code ?? "unknown"})`}${options.requireFile ? "; keeping the previous configuration" : "; refusing to start on defaults"}`,
+			);
+	}
+	if (raw !== undefined) {
 		try {
-			fileConfig = parseConfigFile(JSON.parse(await Bun.file(configPath).text()));
+			fileConfig = parseConfigFile(JSON.parse(raw));
 		} catch (error) {
 			if (error instanceof ConfigError) throw error;
 			throw new ConfigError("config_invalid", `could not parse ${configPath}`);
@@ -237,14 +293,16 @@ export async function loadConfig(
 	};
 }
 
-/** Validates a complete replacement before publishing it; failed reloads retain current. */
+/**
+ * Re-reads config.json and publishes ONLY the reloadable fields, so the daemon
+ * can never end up half-applied: a parse or validation error retains the current
+ * config untouched, and an edited restart-only field is reported rather than
+ * silently ignored or half-honoured.
+ */
 export async function reloadConfig(current: GatewayConfig, overrides: ConfigOverrides = {}): Promise<ReloadResult> {
+	let candidate: GatewayConfig;
 	try {
-		const candidate = await loadConfig({ home: current.home, overrides });
-		const changed = (["logVerbosity", "socketPath", "dbPath"] as const).filter(
-			(field) => candidate[field] !== current[field],
-		);
-		return { ok: true, config: candidate, changed };
+		candidate = await loadConfig({ home: current.home, overrides, requireFile: true });
 	} catch (error) {
 		const diagnostic =
 			error instanceof ConfigError
@@ -252,10 +310,64 @@ export async function reloadConfig(current: GatewayConfig, overrides: ConfigOver
 				: { code: "config_invalid" as const, message: "configuration reload failed" };
 		return { ok: false, config: current, diagnostics: [diagnostic] };
 	}
+	const changed = RELOADABLE_FIELDS.filter((field) => !Bun.deepEquals(candidate[field], current[field]));
+	const restartRequired = RESTART_REQUIRED_FIELDS.filter((field) => !Bun.deepEquals(candidate[field], current[field]));
+	const ignored = UNCONSUMED_FIELDS.filter((field) => !Bun.deepEquals(candidate[field], current[field]));
+	const next: Record<string, unknown> = { ...current };
+	for (const field of RELOADABLE_FIELDS) {
+		if (candidate[field] === undefined) delete next[field];
+		else next[field] = candidate[field];
+	}
+	return { ok: true, config: next as unknown as GatewayConfig, changed, restartRequired, ignored };
 }
 
-export const RELOADABLE_FIELDS = ["logVerbosity"] as const;
-export const RESTART_REQUIRED_FIELDS = ["socketPath", "dbPath"] as const;
+/**
+ * Fields genuinely re-read at runtime, each verified against a real consumer:
+ * `mentionAllowlist` (server.ts chat dispatch + engagement/policy.ts),
+ * `channels` (engagement/policy.ts + debounceFor), and `debounceMs`
+ * (debounceFor). A change to one of these takes effect on the next turn.
+ */
+export const RELOADABLE_FIELDS = ["mentionAllowlist", "channels", "debounceMs"] as const;
+
+/**
+ * Fields bound to a live resource at startup — a listening socket, an open
+ * database, the constructed gjc client, a running webhook/watcher, the monitor
+ * propagator's owner target — and therefore only changeable by a restart.
+ * `credentials` belongs here because the adapters read it when they start.
+ */
+export const RESTART_REQUIRED_FIELDS = [
+	"socketPath",
+	"dbPath",
+	"turnTimeoutMs",
+	"model",
+	"credentials",
+	"webhook",
+	"watcherRoots",
+	"scriptRoot",
+	"ownerTarget",
+] as const;
+
+/**
+ * Parsed and validated, but read by nothing: `logVerbosity` has no consumer in
+ * any package (every log site is an unconditional console call). Editing it can
+ * therefore neither be applied nor fixed by a restart, so a reload reports it as
+ * ignored instead of claiming `applied=[logVerbosity]` for a no-op.
+ */
+export const UNCONSUMED_FIELDS = ["logVerbosity"] as const;
+
+/**
+ * Compile-time proof that every config field is classified. Add a field to
+ * GatewayConfigFile without deciding whether it is live, restart-only, or
+ * unconsumed and this stops building — silently ignoring an edited field is the
+ * behaviour the reload path exists to eliminate.
+ */
+type ClassifiedField =
+	| (typeof RELOADABLE_FIELDS)[number]
+	| (typeof RESTART_REQUIRED_FIELDS)[number]
+	| (typeof UNCONSUMED_FIELDS)[number]
+	| "schemaVersion";
+export type UnclassifiedConfigField = Exclude<keyof GatewayConfigFile, ClassifiedField>;
+export const CONFIG_PARTITION_IS_EXHAUSTIVE: UnclassifiedConfigField extends never ? true : false = true;
 
 export function configDirectory(config: GatewayConfig): string {
 	return dirname(config.configPath);

@@ -1,0 +1,265 @@
+{
+  "schemaVersion": 1,
+  "kind": "api-package-test-report",
+  "generation": 6,
+  "sourceHash": "sha256:7ea82a847828430decc52d49180583a63a6fc4239ef045c381e5e35471d86377",
+  "reviewedHead": "e71a20c",
+  "branch": "fix/session-rebind-and-error-surface",
+  "purpose": "Regression check on the four generation-5 defects, re-run of every case pinned as fixed by an earlier pass, and an end-to-end re-proof of the #13/#14 primary contract and the config contract. Not an open-ended hunt.",
+  "surface": [
+    "packages/gateway/src/orchestrator/rebind.ts (classification, cap, notice, redaction)",
+    "packages/gateway/src/orchestrator/gjc-client.ts (create/turn rebind, no-replay guard) driven through a canned process seam",
+    "packages/gateway/src/config.ts (boot/reload semantics)",
+    "packages/gateway/src/server/server.ts over a REAL unix socket (chat.send, /new, gateway.reloadConfig)",
+    "packages/gateway/src/main.ts executed as a process against hostile GAJAEWAY_HOME layouts"
+  ],
+  "suite": {
+    "files": [
+      "/tmp/g6-redaction.test.ts",
+      "/tmp/g6-contract.test.ts",
+      "/tmp/g6-config.test.ts",
+      "/tmp/g6-probe.ts",
+      "/tmp/g6-probe2.ts"
+    ],
+    "commands": [
+      "bun test /tmp/g6-redaction.test.ts",
+      "bun test /tmp/g6-contract.test.ts",
+      "bun test /tmp/g6-config.test.ts",
+      "bun run /tmp/g6-probe.ts",
+      "bun run /tmp/g6-probe2.ts",
+      "bun test packages/gateway"
+    ],
+    "results": {
+      "redaction": "12 pass / 0 fail / 136 expect() calls",
+      "primaryContract": "8 pass / 0 fail / 60 expect() calls (every socket case against a live listener)",
+      "config": "7 pass / 0 fail / 39 expect() calls (three of them spawn the real daemon binary)",
+      "probes": "155 print-and-inspect redaction probes across two scripts",
+      "repoSuiteReceipt": "bun test packages/gateway at e71a20c: 135 pass / 2 skip / 0 fail / 627 expect() calls — matches the leader receipt."
+    },
+    "note": "No repo source, test or doc file was modified. artifacts/g13-g14-qa-redteam-report.json is the only repo file written. No git mutation, no lint run, .gjc untouched."
+  },
+  "cases": [
+    {
+      "id": "G6-R1-query-string-credentials",
+      "angle": "Generation-5 defect 1 regression: a credential carried in a query string must be redacted while the rest of the query stays readable.",
+      "command": "bun test /tmp/g6-redaction.test.ts -t 'gen5-1'",
+      "expectedBehavior": "`GET /v1/things?api_key=<secret>&page=2` -> `...?api_key=[redacted]&page=2`; `https://host/x?token=<secret>#frag` -> `?token=[redacted]#frag`; interior `&token=`, `?client_secret=`, `?refresh_token=`, `?access_token=` all redact and the surrounding parameters survive.",
+      "observedBehavior": "All six shapes exactly as expected. `GET /v1/things?api_key=wJalrXUtnFEMIK7MDENG&page=2` => `GET /v1/things?api_key=[redacted]&page=2`; `https://host/x?token=deadbeefcafebabe#frag` => `https://host/x?token=[redacted]#frag`; `?a=1&token=…&b=2` keeps `a=1` and `b=2`; `?client_secret=…&grant_type=refresh` keeps `grant_type=refresh`; `url=…?access_token=ya29.…&alt=json` keeps `alt=json`. No probe leaked the credential into the notice.",
+      "verdict": "pass"
+    },
+    {
+      "id": "G6-R2-two-letter-prefix-discrimination",
+      "angle": "Generation-5 defect 2 regression: the undiscriminated two-letter prefix rule must no longer erase ordinary identifiers, while real keys in those families still redact.",
+      "command": "bun test /tmp/g6-redaction.test.ts -t 'gen5-2'",
+      "expectedBehavior": "`sk_migration_runner_failed`, `pk_index_rebuild_failed at step 3`, `rk_queue_drain_timeout after 30s`, `sk-server-restart-required`, `sk_pool_exhausted` survive byte-for-byte; `sk-ant-api03-<mixed>`, `sk_live_<hex>`, `pk_test_<mixed>`, `rk_live_<mixed>` still redact, including behind a zero-width space.",
+      "observedBehavior": "All five diagnostics survive byte-for-byte, and the notice for `sk_migration_runner_failed while draining the queue` delivers the whole line. All six real-key shapes redact with no leaked substring, including `MYKEY\\u200bsk_live_…`.",
+      "verdict": "pass"
+    },
+    {
+      "id": "G6-R3-bracketed-credential-lists",
+      "angle": "Generation-5 defect 3 regression: a bracketed credential list must not be delivered entry by entry.",
+      "command": "bun test /tmp/g6-redaction.test.ts -t 'gen5-3'",
+      "expectedBehavior": "`{\"secrets\":[\"a\",\"b\"]}` -> `{\"secrets\":[redacted]}`; a list of realistic keys, a spaced list, and `credentials: [ … ]` all collapse to `[redacted]`.",
+      "observedBehavior": "`{\"secrets\":[\"a\",\"b\"]}` => `{\"secrets\":[redacted]}`; `{\"secrets\":[\"deadbeefcafe\",\"abcdef123456\"]}` => `{\"secrets\":[redacted]}`; `credentials: [sk_live_x, other]` => `credentials: [redacted]`; `{\"secrets\": [ \"wJalr…\" ]}` leaks nothing. Same-line lists are closed. The pretty-printed multi-line form is NOT (see followUp F1).",
+      "verdict": "pass"
+    },
+    {
+      "id": "G6-R4-unquoted-spaced-passphrases",
+      "angle": "Generation-5 defect 4 regression: an unquoted passphrase written with spaces must not leave a readable fragment.",
+      "command": "bun test /tmp/g6-redaction.test.ts -t 'gen5-4'",
+      "expectedBehavior": "`passphrase=correct horse battery staple` -> `passphrase=[redacted]` with none of the four words readable; `password=p@ss w0rd was rejected` -> `password=[redacted]`; the rule stops at the newline; a named state (`password=expired`) is still readable.",
+      "observedBehavior": "Both inputs collapse to `<key>=[redacted]`; none of `correct`, `horse`, `battery`, `staple`, `p@ss`, `w0rd` survive. `passwd: hunter two three` => `passwd: [redacted]`. `password=p@ss w0rd\\nnext line survives` keeps the following line intact. `password=expired` and `passphrase=required` survive as states.",
+      "verdict": "pass"
+    },
+    {
+      "id": "G6-R5-pinned-must-redact-replay",
+      "angle": "Re-run of every credential shape pinned as fixed by passes 1-5 (31 inputs: exact key names, affixed and vendor-prefixed key names, JSON-quoted keys, quoted values with whitespace, an unbalanced quote, Bearer/Basic headers, JWT triplets, snake_case-disguised credentials, plus the five generation-5 shapes).",
+      "command": "bun test /tmp/g6-redaction.test.ts -t 'pinned by an earlier pass is still redacted'",
+      "expectedBehavior": "All 31 still contain `[redacted]`.",
+      "observedBehavior": "31/31 redacted. No shape pinned by an earlier pass has reopened.",
+      "verdict": "pass"
+    },
+    {
+      "id": "G6-R6-pinned-must-survive-replay",
+      "angle": "Re-run of every diagnostic pinned as must-survive by passes 1-5 (40 inputs: quantity/state compounds, codes after a real credential key name, UUIDs, timestamps, ordinary snake_case identifiers, the two-letter-prefix set, the assembled notice line).",
+      "command": "bun test /tmp/g6-redaction.test.ts -t 'still survives byte-for-byte'",
+      "expectedBehavior": "All 40 come back identical.",
+      "observedBehavior": "40/40 identical, including `max_tokens=200000 exceeded`, `authorization: insufficient_scope_for_this_operation`, `auth_session=01a037ea-db5a-7072-91a5-73ca624323e2`, `token_expires_at: 2026-08-27T09:00:00Z`, `monkey.patch.applied`, `NETWORK_UNREACHABLE`, and the five generation-5 identifiers. No over-redaction pinned earlier has reopened.",
+      "verdict": "pass"
+    },
+    {
+      "id": "G6-R7-notice-level-invariants",
+      "angle": "Re-run of the notice-level behaviours pinned earlier: control-character smuggling in both the code and the message field, truncation without erasure, runaway-code bounding, control-only and empty diagnoses, log/notice string identity.",
+      "command": "bun test /tmp/g6-redaction.test.ts -t 'pinned notice-level'",
+      "expectedBehavior": "`sk_live_\\u0000deadbeef…` in the code field never reassembles; `sk-ant\\u200b-api03-…` in the message never reassembles; a 400-char message truncates under 340 chars with an ellipsis; a 4000-char code is bounded under 400 chars; a control-only message becomes `the runtime produced no diagnosis`; `gjc turn exited 137:` survives as the fallback diagnosis.",
+      "observedBehavior": "Every one holds. Normalization still runs before redaction in both fields.",
+      "verdict": "pass"
+    },
+    {
+      "id": "G6-C1-four-codes-rebind-over-socket",
+      "angle": "Primary contract #13 over a REAL unix socket: a live daemon with a real GjcClient (canned process seam) is driven with chat.send; each of the four codes must rebind.",
+      "command": "bun test /tmp/g6-contract.test.ts -t 'each of the four codes rebinds'",
+      "expectedBehavior": "For `resource_gone`, `spawn_failed`, `terminal_uncertain` and `managed_append_identity_mismatch`: exactly one rebind log line naming that cause, the persisted epoch becomes 1, create is retried once, and the user sees no failure notice because the retry succeeded.",
+      "observedBehavior": "All four: `logs.length === 1`, log contains `cause=<code>`, `getSessionRecord(discord/dm/c1/peer=p1).epoch === 1`, zero delivered `[turn failed]` notices. Four separate daemons on four separate sockets.",
+      "verdict": "pass"
+    },
+    {
+      "id": "G6-C2-unrelated-code-is-genuine",
+      "angle": "Primary contract #13 negative case over the socket: an unrelated structured code must not rebind, and #14 must still deliver it.",
+      "command": "bun test /tmp/g6-contract.test.ts -t 'an unrelated code is genuine'",
+      "expectedBehavior": "`unsupported_state_version` produces no rebind, no epoch bump, and a notice carrying the code and message with NO `/new` hint.",
+      "observedBehavior": "`logs === []`, epoch stayed 0, delivered notice `[turn failed] unsupported_state_version: state version 9 is unsupported` with no `/new`. Classification remains code-only: a lookalike message with a non-rebindable code, and a plain Error whose text is `resource_gone`, both classify as genuine.",
+      "verdict": "pass"
+    },
+    {
+      "id": "G6-C3-cap-fails-explicitly-on-the-fourth",
+      "angle": "Primary contract #13 cap over the socket: three consecutive rebinds, then explicit failure.",
+      "command": "bun test /tmp/g6-contract.test.ts -t 'the cap fails explicitly on the 4th'",
+      "expectedBehavior": "Turns 1-3 each spend one rebind (epoch 3, three log lines); turn 4 mints nothing, logs nothing, and delivers `rebind_cap_exceeded` with the `/new` hint; a subsequent `/new` restores the budget so the next failure rebinds again.",
+      "observedBehavior": "After three turns: 3 log lines, epoch 3. Turn 4: still 3 log lines, still epoch 3, delivered `[turn failed] rebind_cap_exceeded: rebind cap 3 reached after resource_gone at epoch 3. Send /new to rebind this conversation.` After `/new` the next failing turn produced a 4th rebind log line — the advertised remedy is real.",
+      "verdict": "pass"
+    },
+    {
+      "id": "G6-C4-recurring-turn-failure-bounded-at-epoch-3",
+      "angle": "Primary contract #13 hardest shape over the socket: a turn-level `managed_append_identity_mismatch` recurring on every message whose replay against the fresh session succeeds.",
+      "command": "bun test /tmp/g6-contract.test.ts -t 'whose replay succeeds is bounded at epoch 3'",
+      "expectedBehavior": "Ten messages must not become ten epochs: bounded at epoch 3 with three rebind log lines, and the remaining seven fail loudly with `rebind_cap_exceeded`.",
+      "observedBehavior": "Persisted epoch 3, exactly 3 log lines, and 7 delivered `rebind_cap_exceeded` notices. A replayed turn does not restore the budget.",
+      "verdict": "pass"
+    },
+    {
+      "id": "G6-C5-log-line-carries-cause-both-epochs-lifetime",
+      "angle": "Primary contract #13 observability: every rebind log line must name the cause code, both epochs and the lifetime total — including the half-rate shape the cap cannot bound.",
+      "command": "bun test /tmp/g6-contract.test.ts -t 'carries the cause, both epochs and lifetime='",
+      "expectedBehavior": "A failing turn alternating with a clean turn keeps the consecutive count at `1/3` while `lifetime=` escalates 1,2,3; each line matches `epoch N -> M` and names the cause.",
+      "observedBehavior": "Three lines, each `rebind 1/3`, each `cause=managed_append_identity_mismatch`, each matching `epoch \\d+ -> \\d+`, with `lifetime=1`, `lifetime=2`, `lifetime=3`. First line verbatim: `gateway session rebind 1/3 origin=discord/dm/c1/peer=p1 cause=managed_append_identity_mismatch epoch 0 -> 1 lifetime=1`.",
+      "verdict": "pass"
+    },
+    {
+      "id": "G6-C6-delivered-notice-carries-code-and-message",
+      "angle": "Primary contract #14 over the socket: the delivered chat.message notice must carry the runtime's own code and message.",
+      "command": "bun test /tmp/g6-contract.test.ts -t 'delivered notice carries the runtime code and message'",
+      "expectedBehavior": "The chat surface receives `[turn failed] <code>: <message>`, the same string the operator log carries.",
+      "observedBehavior": "Delivered payload text is exactly `[turn failed] unsupported_state_version: state version 9 is unsupported`, and the identical string appears on the console via `console.error(failureNotice)` in server.ts.",
+      "verdict": "pass"
+    },
+    {
+      "id": "G6-C7-turn-not-replayed-has-no-new-hint",
+      "angle": "Primary contract #14 boundary over the socket: a rebind that could not replay the turn must report its evidence and must NOT advise `/new`.",
+      "command": "bun test /tmp/g6-contract.test.ts -t 'turn_not_replayed'",
+      "expectedBehavior": "A turn that started a tool and then failed rebindably delivers `turn_not_replayed` naming the evidence, carries no `/new` hint, and the automatic rebind still happened.",
+      "observedBehavior": "Delivered `[turn failed] turn_not_replayed: managed_append_identity_mismatch: the turn had already produced 1 tool call(s), so it was rebound to e1 but not replayed` — no `/new`. Epoch 1 persisted, one rebind log line, no replay spawn.",
+      "verdict": "pass"
+    },
+    {
+      "id": "G6-F1-fresh-home-boots-on-defaults",
+      "angle": "Config contract: a first boot with no config.json.",
+      "command": "bun test /tmp/g6-config.test.ts -t 'fresh home'",
+      "expectedBehavior": "Defaults are applied (`logVerbosity=info`, `debounceMs=1000`, no mentionAllowlist, socket/db under the home) and the real daemon binary comes up and listens.",
+      "observedBehavior": "loadConfig returns exactly those defaults. `bun run packages/gateway/src/main.ts daemon` with GAJAEWAY_HOME on a fresh tmpdir created a real listening socket (lstat reports S_IFSOCK) and shut down cleanly on SIGTERM.",
+      "verdict": "pass"
+    },
+    {
+      "id": "G6-F2-unreadable-config-refused-at-boot",
+      "angle": "Config contract: chmod 000, a directory in the config's place, and a dangling symlink must be refused at BOOT with a non-zero process exit — run as a real process, not a library call.",
+      "command": "bun test /tmp/g6-config.test.ts -t 'refused at boot'",
+      "expectedBehavior": "Each of the three layouts exits 1 with a stderr line naming the failure and the word `unreadable`; none boots on defaults.",
+      "observedBehavior": "All three: exit code 1, stderr `gajaeway-gateway failed to start: … config.json is unreadable (…); refusing to start on defaults`. The dangling symlink reports ENOENT from the read yet is still classified unreadable via lstat, so it does not slip through as `missing`.",
+      "verdict": "pass"
+    },
+    {
+      "id": "G6-F3-unreadable-config-keeps-previous-at-reload",
+      "angle": "Config contract: the same three hostile layouts, plus a deleted file and malformed JSON, must keep the PREVIOUS config at reload.",
+      "command": "bun test /tmp/g6-config.test.ts -t 'keeps the PREVIOUS config at reload'",
+      "expectedBehavior": "Each returns `ok:false`, hands back the identical previous object, retains mentionAllowlist and channels, and carries a `config_invalid` diagnostic.",
+      "observedBehavior": "All five: `ok === false`, `result.config` is the same object reference as the previous config, `mentionAllowlist === [\"owner\"]`, `channels === {\"discord:c1\":{engagement:\"open\"}}`, diagnostic code `config_invalid`. A mention-gated room cannot be widened by an unreadable file.",
+      "verdict": "pass"
+    },
+    {
+      "id": "G6-F4-reload-verb-reports-all-three-classes",
+      "angle": "Config contract: the `gateway.reloadConfig` verb response over the socket must carry `changed`, `restartRequired` and `ignored` in one reply.",
+      "command": "bun test /tmp/g6-config.test.ts -t 'changed, restartRequired and ignored'",
+      "expectedBehavior": "One edit of each class at once yields `{ok:true, changed:[mentionAllowlist], restartRequired:[model], ignored:[logVerbosity]}`.",
+      "observedBehavior": "Exactly that, and the daemon logged `gateway config reload (verb reload) ok; applied=[mentionAllowlist] restart-required=[model] ignored=[logVerbosity]`. A restart-only field is reported, never half-applied.",
+      "verdict": "pass"
+    },
+    {
+      "id": "G6-N1-multiline-credential-list",
+      "angle": "NEW edge: the bracketed-list rule is line-bounded (`[^\\]\\n]*`), so a pretty-printed credential array is not collapsed.",
+      "command": "bun run /tmp/g6-probe2.ts; bun test /tmp/g6-redaction.test.ts -t 'split across lines'",
+      "expectedBehavior": "Ideally a credential array spanning newlines collapses the way the single-line form does.",
+      "observedBehavior": "`{\\n  \"secrets\": [\\n    \"wJalrXUtnFEMIK7MDENGbPxRfiCYEXAMPLEKEY\"\\n  ]\\n}` becomes `{\\n  \"secrets\": [redacted]\\n    \"wJalrXUtn…\"\\n  ]\\n}` — the opening bracket is replaced by the bare-value rule and the entries stay readable. The single-line form and the multi-line `\"api_key\": \"…\"` form are both closed; only a credential ARRAY split across lines is exposed, and only for entries that carry no vendor discriminator of their own. Recorded as followUp F1, not a defect: the shape requires a runtime to emit a pretty-printed credential array inside one error message, which no path in this repo produces, and the 240-char notice budget truncates such a blob anyway.",
+      "verdict": "informational"
+    },
+    {
+      "id": "G6-N2-digit-bearing-two-letter-prefix",
+      "angle": "NEW edge: the digit discriminator added for generation-5 defect 2 erases sk_/pk_/rk_ identifiers that legitimately carry a digit.",
+      "command": "bun test /tmp/g6-redaction.test.ts -t 'carries a digit is erased whole'",
+      "expectedBehavior": "Ideally an ordinary diagnostic survives whether or not it contains a step number or a duration.",
+      "observedBehavior": "`sk_migration_runner_failed_step_3`, `pk_shard_7_rebuild_failed`, `sk_pool_exhausted_after_30s` and `sk_2024_migration_pending` all become `[redacted]`, while `sk_pool_exhausted` and `pk_index_rebuild_failed at step 3` survive (the digit is outside the token there). The exact strings pinned in generation 5 are unaffected. Rated LOW rather than MEDIUM because no code emitted anywhere in this repo or by the gjc runtime uses an `sk_`/`pk_`/`rk_` prefix — the surviving examples are QA-authored — so the destroyed diagnostic is hypothetical rather than plausible.",
+      "verdict": "informational"
+    },
+    {
+      "id": "G6-N3-camelcase-credential-keys",
+      "angle": "NEW edge: CREDENTIAL_KEYS is an exact snake_case/hyphen vocabulary, so camelCase spellings of the same keys are not credential keys.",
+      "command": "bun run /tmp/g6-probe2.ts; bun test /tmp/g6-redaction.test.ts -t 'camelCase credential key names'",
+      "expectedBehavior": "Ideally `authToken=` and `sessionToken:` are treated like `auth_token=` and `session_token:`.",
+      "observedBehavior": "`authToken=wJalrXUtnFEMIK7MDENGbPxRfiCY` and `sessionToken: wJalrXUtnFEMIK7MDENGbPxRfiCY` survive untouched; `session_token=`, `x-api-key:`, `API_KEY:` and `apiKey=` (the last only because `apikey` is in the vocabulary and matching is case-insensitive) all redact. Same class: `api_key wJalr…` with no delimiter, `api_key -> wJalr…`, and vendor prefixes outside the discriminated list (`npm_…`, `glpat-…`). Recorded as followUp F2 — this is the documented finite-vocabulary boundary of a defense-in-depth layer, not a regression.",
+      "verdict": "informational"
+    },
+    {
+      "id": "G6-N4-passphrase-eol-tail-loss",
+      "angle": "NEW edge (deliberate): the passphrase rule added for generation-5 defect 4 consumes to end of line, so any diagnosis after the credential is lost.",
+      "command": "bun test /tmp/g6-redaction.test.ts -t 'eats the rest of the line'",
+      "expectedBehavior": "The credential must not leak; ideally the trailing diagnosis survives.",
+      "observedBehavior": "`error: password=hunter2 and token=deadbeefcafe both wrong` => `error: password=[redacted]`; `password rotation failed: password=x; retry in 30s` => `password rotation failed: password=[redacted]`. This is the fail-closed direction the generation-5 fix chose on purpose and only three credential keys use it. Recorded as followUp F3.",
+      "verdict": "informational"
+    },
+    {
+      "id": "G6-N5-repo-suite-receipt",
+      "angle": "Cross-check that this pass observes the same repository state the leader receipt describes.",
+      "command": "bun test packages/gateway",
+      "expectedBehavior": "135 pass / 2 skip / 0 fail.",
+      "observedBehavior": "135 pass / 2 skip / 0 fail / 627 expect() calls across 28 files at e71a20c — matches.",
+      "verdict": "pass"
+    }
+  ],
+  "regressions": [],
+  "defects": [],
+  "followUps": [
+    {
+      "id": "F1",
+      "severity": "LOW",
+      "title": "A bracketed credential list split across lines is not collapsed",
+      "detail": "CREDENTIAL_BRACKETED is `\\[[^\\]\\n]*\\]`, so `{\\n  \"secrets\": [\\n    \"<secret>\"\\n  ]\\n}` leaves the entries readable while the single-line form is fully closed. Only entries with no vendor discriminator of their own are exposed.",
+      "whyNotHigher": "Requires the runtime to emit a pretty-printed credential array inside one structured error message; nothing in this repo or in the gjc envelope format does that, the redactor is defense in depth behind a runtime that does not print its own credentials, and the 240-char notice budget truncates such a blob. The generation-5 fix strictly shrank this surface rather than creating it.",
+      "suggestedFix": "Let the bracketed rule span newlines (bound its length instead of forbidding `\\n`), or run the quoted-value rule inside any bracketed region that follows a credential key."
+    },
+    {
+      "id": "F2",
+      "severity": "LOW",
+      "title": "camelCase spellings of credential keys, and vendor prefixes outside the discriminated list, are unmatched",
+      "detail": "`authToken=<secret>` and `sessionToken: <secret>` survive; so do `npm_…`, `glpat-…` and a key/value separated by a space or `->`. The snake_case, SCREAMING_SNAKE and hyphenated spellings of the same keys are all covered.",
+      "whyNotHigher": "This is the explicit documented contract of the layer: exact key names plus discriminated vendor shapes, chosen because two earlier shape-guessing designs failed in both directions. Widening it is a calibration decision, not a repair.",
+      "suggestedFix": "If widened, add a camelCase-tolerant boundary (`(?<=[a-z])(?=[A-Z])` equivalent via an alternation on the key list) rather than reintroducing value-shape guessing."
+    },
+    {
+      "id": "F3",
+      "severity": "INFORMATIONAL",
+      "title": "The passphrase rule consumes the rest of the line, losing any trailing diagnosis",
+      "detail": "For `password`/`passwd`/`passphrase` only, everything after the value start is replaced, so `error: password=hunter2 and token=… both wrong` becomes `error: password=[redacted]`.",
+      "whyNotHigher": "Deliberate and fail-closed: it is the fix for generation-5 defect 4, it is scoped to three keys, and it stops at the newline so multi-line diagnoses keep their other lines.",
+      "suggestedFix": "None recommended. Narrowing it would reopen partial passphrase disclosure, which is worse."
+    },
+    {
+      "id": "F4",
+      "severity": "INFORMATIONAL",
+      "title": "Over-redaction of an sk_/pk_/rk_ identifier that carries a digit",
+      "detail": "`sk_pool_exhausted_after_30s` and `pk_shard_7_rebuild_failed` are erased whole by the digit-discriminated rule; the five strings pinned in generation 5 are unaffected.",
+      "whyNotHigher": "No runtime code in this repo or in gjc uses those prefixes, so the destroyed diagnostic is hypothetical. The alternative — dropping the digit discriminator — is exactly the generation-5 defect.",
+      "suggestedFix": "If it ever bites, require the token to also lack a `_failed`/`_timeout`/`_exhausted`-style state suffix before erasing it."
+    }
+  ],
+  "verdict": "passed",
+  "verdictRationale": "All four generation-5 defects are fixed with the exact reported inputs (G6-R1..R4). Every case pinned by passes 1-5 was re-run — 31 must-redact and 40 must-survive shapes plus the notice-level invariants — and none regressed; the regressions array is empty. The #13/#14 primary contract was re-proved end to end over a real unix socket: the four codes rebind, an unrelated code does not, the cap fails explicitly on the 4th consecutive rebind, a recurring turn-level failure whose replay succeeds is bounded at epoch 3, every rebind line carries cause, both epochs and `lifetime=`, the delivered notice carries the runtime's code and message, and `turn_not_replayed` carries no `/new` hint. The config contract holds: a fresh home boots on defaults, all three unreadable layouts exit non-zero at boot as a real process and keep the previous config at reload, and the verb reports changed/restartRequired/ignored. The four NEW findings are redaction-calibration edges of a defense-in-depth layer, none of which leaks a credential a runtime in this repo would emit or destroys a diagnostic a runtime in this repo would produce; they are listed as followUps, not blocking defects."
+}

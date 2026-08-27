@@ -53,6 +53,7 @@ async function openChannelGateway(reply: string): Promise<{ frames: any[]; datab
 	const database = await GatewayDatabase.open(config.dbPath);
 	const gjc: GjcPort = {
 		ensureSession: async () => ({ sessionId: "mock-session" }),
+		forgetRebinds: () => {},
 		sendTurn: async () => reply,
 	};
 	server = await startUnixServer({ config, database, gjc, onStop: () => database.close() });
