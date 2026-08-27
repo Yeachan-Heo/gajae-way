@@ -174,11 +174,29 @@ test("a reaction delivery tears down the typing indicator and the working status
 	await settleDiscordDelivery(mockGateway(requests), discord, reactionPayload, typing, status);
 	expect(ended).toEqual(["channel-1"]);
 	expect(cleared).toEqual(["channel-1"]);
-	// Teardown is in a finally, so it must also run when the reaction itself fails.
+	// Teardown must not depend on the reaction succeeding.
 	ended.length = 0;
 	cleared.length = 0;
 	const failing: DiscordClientLike = { channels: { fetch: async () => Promise.reject(new Error("gone")) } };
 	await settleDiscordDelivery(mockGateway(requests), failing, reactionPayload, typing, status);
+	expect(ended).toEqual(["channel-1"]);
+	expect(cleared).toEqual(["channel-1"]);
+	// And it must not depend on SETTLEMENT succeeding either. settleDiscordReaction
+	// awaits delivery.fail inside its own catch, so a gateway socket lost between
+	// dispatch and settlement throws straight out of it — the one reachable path where
+	// `finally` is load-bearing rather than decorative. Without this, moving the
+	// teardown to a plain sequential statement after the await passes every other test
+	// while stranding a typing indicator and a "working…" message on every such loss.
+	ended.length = 0;
+	cleared.length = 0;
+	const deadGateway = {
+		request: async () => {
+			throw new Error("gateway socket closed");
+		},
+	};
+	await expect(settleDiscordDelivery(deadGateway, failing, reactionPayload, typing, status)).rejects.toThrow(
+		"gateway socket closed",
+	);
 	expect(ended).toEqual(["channel-1"]);
 	expect(cleared).toEqual(["channel-1"]);
 });

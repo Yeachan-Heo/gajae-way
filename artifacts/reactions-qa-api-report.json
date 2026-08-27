@@ -767,5 +767,205 @@
 			"fix": "Three behavioural tests now cover the merge seam: 'a reaction delivery reacts to its target and never posts a message' and 'a reply-threaded delivery threads its first chunk and only its first chunk' in packages/adapter-discord/test/adapter.test.ts, and 'the delivery subscription routes a reaction to setMessageReaction and never to sendMessage' in packages/adapter-telegram/test/adapter.test.ts.",
 			"mutationProof": "Each was verified by mutation rather than assertion. Disabling the Discord reaction branch fails the reaction test (15 pass / 1 fail); removing the Telegram reaction routing fails the subscription test (7 pass / 1 fail); removing the Discord reply-threading arm fails the threading test (15 pass / 1 fail). Each mutation was reverted with git checkout immediately after the run."
 		}
+	},
+	"cohortCertificationGen3": {
+		"producedBy": "executor QA/red-team lane 19-ReactionsGen3Qa (generation 3, delta-only: the single commit b2e5db4 on top of the merged PR #21)",
+		"recordedAt": "2026-08-27T18:40+09:00",
+		"frozenSourceHash": "sha256:86dac7b0e3bf309992978873ae22f0f797ed050b145c54faf617dee1441732a3",
+		"priorGenerationSourceHash": "sha256:33b6859a3254af8387ddb02b054bfe72916cd71cf760b056fe11dc516a0dc0fb",
+		"commit": "b2e5db4 (b2e5db495be475eaa8ce8e9f3a87fb316abb3492)",
+		"branch": "feat/discord-reactions",
+		"hashProvenance": "Both hashes above are quoted verbatim from the assignment and were NOT recomputed in this lane (same posture as U-1). What WAS verified from git: HEAD is b2e5db4, the tree was clean before and after, and packages/adapter-discord/src/main.ts is byte-identical to origin/main (git show origin/main:packages/adapter-discord/src/main.ts matches the working copy at the teardown sites), so the delta is test-only.",
+		"deltaUnderReview": {
+			"mergeBase": "006ac1f (the six earlier feature commits are merged into origin/main via PR #21 at 23092ac)",
+			"commits": "exactly one: b2e5db4",
+			"files": "exactly one: packages/adapter-discord/test/adapter.test.ts (+36, test source only); no product source, no dependency, no config",
+			"noteOnDiffAgainstOriginMain": "`git diff origin/main..HEAD --name-status` reports TWO paths (D artifacts/emoji-reactions-design.md, M packages/adapter-discord/test/adapter.test.ts) because origin/main has since advanced past PR #21 with c948a9d/65efd7b (PR #17, the design spec) which this branch does not contain. Against the merge base 006ac1f the branch delta is exactly one commit and one file, as the assignment states. Not a defect; recorded so the two-file stat is not read as scope creep.",
+			"newTest": "packages/adapter-discord/test/adapter.test.ts:150-184 'a reaction delivery tears down the typing indicator and the working status'"
+		},
+		"scope": "delta re-certification and mutation red-team only. No new file, no product source change, no test source change, no commit, no formatter, no dependency change. This artifact file is the only file written; every mutation below was applied to the working tree, measured, and reverted with `git checkout -- <path>`, and `git status --porcelain` was empty after each revert (and is empty at the end of the lane).",
+		"commands": [
+			{
+				"id": "CG3-1",
+				"command": "bun test packages/adapter-discord/test/adapter.test.ts",
+				"exactOutput": "17 pass / 0 fail / 0 skip / 43 expect() calls; Ran 17 tests across 1 file [243.00ms]",
+				"verdict": "pass",
+				"note": "baseline for every mutation below; the pre-b2e5db4 count for this file was 16 tests / 40 expect() calls, so the delta is +1 test / +3 expect() calls."
+			},
+			{
+				"id": "CG3-2",
+				"command": "bun test packages/adapter-discord packages/adapter-telegram",
+				"exactOutput": "92 pass / 0 fail / 0 skip / 248 expect() calls; Ran 92 tests across 8 files [288.00ms]",
+				"verdict": "pass"
+			},
+			{
+				"id": "CG3-3",
+				"command": "bun test packages/",
+				"exactOutput": "847 pass / 2 skip / 0 fail / 3501 expect() calls; Ran 849 tests across 67 files [42.75s]",
+				"verdict": "pass",
+				"flakes": "NEITHER known parallelism flake appeared in this run (monitor-triggers.test.ts 'watcher and script honor allowlists and ActionGuard' and delivery-crash.e2e.test.ts both passed inside the 67-file run). They were still re-run in isolation for the record: see CG3-5. The 2 skips are the pre-existing ones."
+			},
+			{
+				"id": "CG3-4",
+				"command": "bun node_modules/typescript/lib/tsc.js --noEmit -p tsconfig.json",
+				"exactOutput": "no diagnostics printed; exit code 0",
+				"verdict": "pass"
+			},
+			{
+				"id": "CG3-5",
+				"command": "bun test packages/gateway/test/monitor-triggers.test.ts ; bun test packages/gateway/test/delivery-crash.e2e.test.ts",
+				"exactOutput": "monitor-triggers.test.ts: 6 pass / 0 fail / 20 expect() calls; Ran 6 tests across 1 file [637.00ms]. delivery-crash.e2e.test.ts: 1 pass / 0 fail / 2 expect() calls; Ran 1 test across 1 file [1310.00ms]",
+				"verdict": "pass",
+				"note": "isolation control for the two known pre-existing flakes; both green in-suite AND in isolation this generation, so nothing was reported green-only."
+			}
+		],
+		"mutationMatrix": {
+			"method": "Each row mutates packages/adapter-discord/src/main.ts ONLY (the reaction branch at :364-372 or the text branch at :373-403), runs CG3-1, then `git checkout -- packages/adapter-discord/src/main.ts` and `git status --porcelain` (empty every time). 'KILLED' = the new test fails; 'SURVIVED' = the whole file stays green, i.e. the mutant is invisible to the suite.",
+			"rows": [
+				{
+					"id": "MUT-1",
+					"mutation": "Remove the try/finally entirely: the reaction branch just `await settleDiscordReaction(...)` and returns (the exact CC-2 mutation).",
+					"result": "KILLED",
+					"exactOutput": "16 pass / 1 fail / 40 expect() calls; Ran 17 tests across 1 file [240.00ms]",
+					"failureSite": "packages/adapter-discord/test/adapter.test.ts:175 — expect(ended).toEqual([\"channel-1\"]) received []",
+					"rightReason": "yes: the typing indicator is never ended, which is precisely the stranded-indicator symptom CC-2 described, and no other test in the file reacts to the mutation.",
+					"restored": "git checkout -- packages/adapter-discord/src/main.ts; git status --porcelain empty"
+				},
+				{
+					"id": "MUT-2",
+					"mutation": "Vacuity probe A — success-only teardown: drop the try/finally and place `await status?.clear(...)` + `typing?.end(...)` sequentially after the awaited settleDiscordReaction call.",
+					"result": "SURVIVED",
+					"exactOutput": "17 pass / 0 fail / 43 expect() calls; Ran 17 tests across 1 file [229.00ms]",
+					"why": "settleDiscordReaction (packages/adapter-discord/src/reactions.ts:226-243) is catch-all: it converts EVERY failure into `gateway.request(\"delivery.fail\")` and returns normally. So the new test's second half (a rejecting channels.fetch) does not throw out of it — the 'failure' case executes the same straight-line path as the success case, and `finally` vs. sequential code is indistinguishable to the test. This is the residual gap filed as BLOCKER-CC-3.",
+					"restored": "yes, tree clean"
+				},
+				{
+					"id": "MUT-3",
+					"mutation": "Vacuity probe B — clear the WRONG conversation id: `status?.clear(`${conversationId}-stale`)`.",
+					"result": "KILLED",
+					"exactOutput": "16 pass / 1 fail / 41 expect() calls; Ran 17 tests across 1 file [227.00ms]",
+					"failureSite": "adapter.test.ts:176 — expect(cleared).toEqual([\"channel-1\"]) received [\"channel-1-stale\"]",
+					"restored": "yes, tree clean"
+				},
+				{
+					"id": "MUT-4",
+					"mutation": "Vacuity probe B' — end typing on the WRONG conversation id: `typing?.end(`${conversationId}-stale`)`.",
+					"result": "KILLED",
+					"exactOutput": "16 pass / 1 fail / 40 expect() calls; Ran 17 tests across 1 file [227.00ms]",
+					"failureSite": "adapter.test.ts:175 — received [\"channel-1-stale\"]",
+					"restored": "yes, tree clean"
+				},
+				{
+					"id": "MUT-5",
+					"mutation": "Vacuity probe C — swap `typing?.end(...)` for a no-op (`void message.origin.conversationId;`), keeping the finally and the status clear.",
+					"result": "KILLED",
+					"exactOutput": "16 pass / 1 fail / 40 expect() calls; Ran 17 tests across 1 file [203.00ms]",
+					"failureSite": "adapter.test.ts:175 — received []",
+					"restored": "yes, tree clean"
+				},
+				{
+					"id": "MUT-6",
+					"mutation": "Drop only `await status?.clear(...)` from the reaction finally (`void status;`).",
+					"result": "KILLED",
+					"exactOutput": "16 pass / 1 fail / 41 expect() calls; Ran 17 tests across 1 file [215.00ms]",
+					"failureSite": "adapter.test.ts:176 — received []",
+					"restored": "yes, tree clean"
+				},
+				{
+					"id": "MUT-7",
+					"mutation": "Ordering probe — swap the two teardown statements so `typing?.end(...)` runs before `await status?.clear(...)`.",
+					"result": "SURVIVED",
+					"exactOutput": "17 pass / 0 fail / 43 expect() calls; Ran 17 tests across 1 file [232.00ms]",
+					"assessment": "Ordering is unguarded, and deliberately so in this report: the two doubles record into independent arrays, and no user-visible invariant depends on which cosmetic artifact disappears first (typing?.end is synchronous, status.clear is an awaited message delete; both complete before the function returns on both orderings). Recorded as finding F-CC3-1, NOT a blocker."
+				},
+				{
+					"id": "MUT-8",
+					"mutation": "Adjacent arm — delete the TEXT path's finally teardown entirely (packages/adapter-discord/src/main.ts:400-403).",
+					"result": "KILLED",
+					"exactOutput": "15 pass / 2 fail / 42 expect() calls; Ran 17 tests across 1 file [241.00ms]",
+					"failureSite": "adapter.test.ts:244 ('typing indicator pulses while a turn runs and stops when the delivery settles', expected 4 received 9) and adapter.test.ts:316 ('working status posts one amended message per conversation and clears on delivery', expected 1 received 0)",
+					"assessment": "The text path's teardown EXISTENCE is guarded by two independent pre-existing tests. It was never the CC-2 gap.",
+					"restored": "yes, tree clean"
+				},
+				{
+					"id": "MUT-9",
+					"mutation": "Adjacent arm, throw-semantics — move the TEXT path's teardown to success-only (after `delivery.confirm`, inside the try, finally removed).",
+					"result": "SURVIVED",
+					"exactOutput": "17 pass / 0 fail / 43 expect() calls; Ran 17 tests across 1 file [227.00ms]",
+					"assessment": "The text path has the SAME residual gap as the reaction path: no test proves its teardown runs when the delivery arm fails or throws. This arm is unchanged by b2e5db4 and identical on origin/main (verified with `git show origin/main:packages/adapter-discord/src/main.ts`), so it is a pre-existing symmetric gap, folded into BLOCKER-CC-3's scope rather than filed as a regression of this commit.",
+					"restored": "yes, tree clean"
+				}
+			],
+			"runtimeProbes": {
+				"method": "`bun -e '<inline script>'` driving the real exported settleDiscordDelivery with a reaction payload, recording typing/status doubles, and a gateway whose `request` always rejects (the production shape of a gateway/socket failure). Inline eval only — no file was created.",
+				"P1_unmutatedTree": "{\"threw\":\"gateway socket closed\",\"ended\":[\"channel-1\"],\"cleared\":[\"channel-1\"]} — the rejection escapes settleDiscordReaction (its own catch block awaits `gateway.request(\"delivery.fail\", ...)` at packages/adapter-discord/src/reactions.ts:242, which is unguarded), so the `finally` at packages/adapter-discord/src/main.ts:367-370 is genuinely load-bearing on a reachable path: teardown still ran.",
+				"P2_underMUT2": "{\"mutation\":\"M2-sequential\",\"threw\":\"gateway socket closed\",\"ended\":[],\"cleared\":[]} — with the finally replaced by sequential statements, the SAME reachable scenario strands both the typing indicator and the 'working…' status message, and `bun test packages/adapter-discord/test/adapter.test.ts` is still 17 pass / 0 fail / 43 expect() calls. This is the CC-2 symptom, undetected.",
+				"reachability": "A rejecting gateway.request is not hypothetical: subscribeDiscordDeliveries wraps the call in `.catch(log.error)` at packages/adapter-discord/src/main.ts:417-420, i.e. the codebase already expects settleDiscordDelivery to reject. Any gateway socket loss between dispatch and settlement takes this path."
+			}
+		},
+		"cc2Verdict": {
+			"blocker": "BLOCKER-CC-2 (generation 2): the reaction branch's typing/status teardown was behaviourally unguarded — deleting it left all 842 tests green.",
+			"status": "CLOSED as filed.",
+			"evidence": "MUT-1 reproduces exactly the generation-2 mutation and now fails (16 pass / 1 fail / 40 expect() calls) at adapter.test.ts:175 for the right reason, and nothing else in the file reacts. The test is not vacuous in the ways the assignment asked about: a wrong conversation id fails in either arm (MUT-3, MUT-4), a no-op typing.end fails (MUT-5), and dropping the status clear alone fails (MUT-6). The commit is test-only; product source at the teardown sites is byte-identical to origin/main.",
+			"residual": "The `finally` SEMANTICS are still unguarded. The new test's 'rejecting channel fetch' half does not throw out of settleDiscordReaction (catch-all at reactions.ts:238-243), so a success-only teardown passes (MUT-2) while stranding both artifacts on a reachable gateway-failure path (probe P2). The commit message's claim that 'asserting only the happy path would have let a try/catch refactor pass' overstates what the test actually distinguishes: the test does not separate try/finally from straight-line code. Filed as BLOCKER-CC-3 below — a NEW coverage blocker, narrower than CC-2, not a re-opening of it."
+		},
+		"teardownArmAudit": {
+			"armsInRepo": "Exactly two typing/status teardown arms exist: packages/adapter-discord/src/main.ts:365-370 (reaction) and :373-403 (text). packages/adapter-telegram/src/main.ts has no typing/status teardown at all (searched: no `typing`, no `status?.clear`, no `finally` on the delivery path), so there is no telegram arm to guard.",
+			"reactionArm": "existence + identity + both statements guarded (MUT-1, MUT-3..MUT-6). Throw-arm UNGUARDED (MUT-2).",
+			"textArm": "existence guarded (MUT-8). Throw/failure-arm UNGUARDED (MUT-9) — pre-existing, identical on origin/main.",
+			"orderingBetweenClearAndEnd": "UNGUARDED in both arms (MUT-7). Assessed benign; finding F-CC3-1.",
+			"throwInsideTheFinallyItself": "Latent, unguarded, and NOT escalated: in both arms `await status?.clear(...)` precedes `typing?.end(...)`, so a REJECTING status.clear would skip typing.end and propagate. Unreachable with the shipped WorkingStatus, whose clear() swallows everything internally (packages/adapter-discord/src/main.ts:341-350: the message map lookup cannot throw and `existing.delete()` is wrapped in try/catch). Only an injected double could reject. Finding F-CC3-2."
+		},
+		"blockers": [
+			{
+				"id": "BLOCKER-CC-3",
+				"severity": "blocker",
+				"type": "coverage (test-only; no product source change required and none applied)",
+				"title": "The teardown finally's throw-arm is still unguarded in BOTH settleDiscordDelivery branches: a success-only teardown passes the whole suite while a gateway-failure strands the typing indicator and the 'working…' status",
+				"contractRef": "the same invariant as BLOCKER-CC-2 — a reaction delivery must never leave a live typing indicator or an orphaned status message",
+				"location": "packages/adapter-discord/src/main.ts:367-370 (reaction finally) and packages/adapter-discord/src/main.ts:400-403 (text finally); the catch-all that makes the new test's failure half indistinguishable from its success half is packages/adapter-discord/src/reactions.ts:238-243; the test that should carry the assertion is packages/adapter-discord/test/adapter.test.ts:150-184",
+				"detail": "b2e5db4 pins that teardown HAPPENS and pins the conversation id, but not that it happens when the guarded call THROWS. Because settleDiscordReaction converts every internal failure into delivery.fail and returns normally, the rejecting-channels.fetch case in the new test exercises the ordinary return path. MUT-2 (drop the finally, run the two teardown statements sequentially) leaves packages/adapter-discord/test/adapter.test.ts at 17 pass / 0 fail / 43 expect() calls, yet inline probe P2 shows that with a rejecting gateway.request the same mutant records ended=[] and cleared=[] where the unmutated tree records [\"channel-1\"] and [\"channel-1\"] (probe P1). MUT-9 shows the text arm has the identical hole.",
+				"reachability": "gateway.request rejects whenever the gateway socket is lost between dispatch and settlement; settleDiscordReaction's catch awaits delivery.fail unguarded (reactions.ts:242) so the rejection escapes, and subscribeDiscordDeliveries already anticipates a rejected settlement (.catch(log.error) at main.ts:417-420).",
+				"suggestedFix": "Extend the existing test at packages/adapter-discord/test/adapter.test.ts:150-184 with a third drive whose mockGateway.request REJECTS, wrapping the settleDiscordDelivery call in expect(...).rejects (or a try/catch) and still asserting ended/cleared === [\"channel-1\"]; add the mirror assertion for the text path. Two assertions, no product change. Deliberately NOT written by this lane (delta mandate: no test source, no product source).",
+				"status": "reported, not fixed"
+			}
+		],
+		"findings": [
+			{
+				"id": "F-CC3-1",
+				"severity": "minor",
+				"title": "The ordering of status.clear and typing.end inside both finallys is unasserted",
+				"location": "packages/adapter-discord/src/main.ts:368-369 and :401-402",
+				"detail": "MUT-7 (swap the two statements) survives with 17 pass / 0 fail. No user-visible invariant depends on the order — both complete before the function returns — so this is recorded rather than escalated."
+			},
+			{
+				"id": "F-CC3-2",
+				"severity": "minor",
+				"title": "A rejecting status.clear would skip typing.end in both arms",
+				"location": "packages/adapter-discord/src/main.ts:368-369 and :401-402 (awaited clear precedes the sync end)",
+				"detail": "Unreachable with the shipped WorkingStatus.clear (packages/adapter-discord/src/main.ts:341-350 swallows every failure internally), so only an injected double could trigger it. If the arms are ever hardened, ending typing first — or wrapping the clear — removes the exposure."
+			}
+		],
+		"unverified": [
+			{
+				"id": "U-G3-1",
+				"fact": "The frozen sourceHash sha256:86dac7b0e3bf309992978873ae22f0f797ed050b145c54faf617dee1441732a3 and the prior-generation hash sha256:33b6859a3254af8387ddb02b054bfe72916cd71cf760b056fe11dc516a0dc0fb were quoted from the assignment, not recomputed.",
+				"impact": "Source identity is asserted by the leader. What this lane verified independently: HEAD == b2e5db4, clean tree before/after, the branch delta against merge-base 006ac1f is one test-only commit, and the Discord adapter's product source at the teardown sites equals origin/main's."
+			},
+			{
+				"id": "U-G3-2",
+				"fact": "No live Discord API call; the reaction/typing/status seams were driven with duck-typed doubles, as in every existing adapter test, plus two inline `bun -e` probes.",
+				"impact": "Whether a real Discord client's typing indicator actually clears is still out of scope; the invariant verified is that the adapter calls typing.end / status.clear with the right conversation id on every path it can reach."
+			}
+		],
+		"verdict": {
+			"overall": "pass",
+			"e2eStatus": "pass",
+			"redTeamStatus": "pass with one NEW coverage blocker (BLOCKER-CC-3); no behavioural defeat of the reaction delivery surface was found, and BLOCKER-CC-2 as filed is closed",
+			"blockers": [
+				"BLOCKER-CC-3 — packages/adapter-discord/src/main.ts:367-370 and packages/adapter-discord/src/main.ts:400-403 (test gap at packages/adapter-discord/test/adapter.test.ts:150-184; enabling catch-all at packages/adapter-discord/src/reactions.ts:238-243)"
+			],
+			"statement": "At commit b2e5db4, frozen sourceHash sha256:86dac7b0e3bf309992978873ae22f0f797ed050b145c54faf617dee1441732a3, the delta is test-only and BLOCKER-CC-2 is CLOSED: the generation-2 mutation now fails (16 pass / 1 fail / 40 expect() calls) for the right reason and the new test resists every vacuity probe on identity and on both teardown statements. Full re-runs are green — 92 pass / 0 fail (adapter scope), 847 pass / 2 skip / 0 fail across 67 files, tsc exit 0 — with neither known parallelism flake appearing, and both flake files also green in isolation. One residual arm remains unguarded and is filed as the new BLOCKER-CC-3: neither branch of settleDiscordDelivery proves its teardown survives a THROW, because settleDiscordReaction is catch-all; a success-only teardown keeps the suite at 17 pass / 0 fail while a rejecting gateway strands both the typing indicator and the status message (probes P1/P2). Every mutation was reverted and the tree verified clean; this artifact file is the only file written."
+		}
 	}
 }
