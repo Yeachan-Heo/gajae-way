@@ -35,6 +35,26 @@ export {
 	laneSessionName,
 } from "./lane";
 export {
+	assertDeleteNotSupported,
+	buildHandoff,
+	CENSUS_KEYS,
+	type CloseGate,
+	type ContaminationClass,
+	type ContaminationInput,
+	type ContaminationSignal,
+	canClose,
+	contaminationFreeze,
+	decideRecovery,
+	detectContamination,
+	type LaneLifecycle,
+	type RecoveryAction,
+	type RecoveryDecision,
+	type RecoveryInput,
+	type RetireHandoff,
+	type RetirementCensus,
+	RetirementError,
+} from "./recovery";
+export {
 	assertValidOpRef,
 	CLIENT_REF_CONFLICT_CODE,
 	envelopeErrorCode,
