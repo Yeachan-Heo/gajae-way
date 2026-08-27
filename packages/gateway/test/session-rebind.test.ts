@@ -592,6 +592,11 @@ test("redaction is calibrated in BOTH directions", () => {
 		'{"secrets":["deadbeefcafe","abcdef123456"]}',
 		"passphrase=correct horse battery staple",
 		"password=p@ss w0rd was rejected",
+		// camelCase spellings: JS and JSON runtimes use them at least as often.
+		"apiKey=wJalrXUtnFEMIK7MDENG",
+		'accessToken: "deadbeefcafebabe"',
+		"clientSecret=deadbeefcafe",
+		"refreshToken=abcDEF123456",
 	];
 	for (const text of mustRedact) expect(redactSecrets(text)).toContain("[redacted]");
 	const mustSurvive = [
@@ -638,9 +643,23 @@ test("redaction is calibrated in BOTH directions", () => {
 		"rk_queue_drain_timeout after 30s",
 		"sk-server-restart-required",
 		"sk_pool_exhausted",
+		// camelCase quantity keys are not credential keys either.
+		"maxTokens=200000",
+		"tokenCount=1024",
 		"[turn failed] spawn_failed: SDK startup did not complete before readiness cutoff",
 	];
 	for (const text of mustSurvive) expect(redactSecrets(text)).toBe(text);
+});
+
+test("redaction stays linear on adversarial input", () => {
+	// A generic camelCase prefix pattern nested two quantifiers and took 6 seconds
+	// on a 56-character input. This function parses untrusted runtime output, so a
+	// backtracking blowup here is a denial-of-service hazard, not a slow test.
+	const started = performance.now();
+	redactSecrets("AWS_SECRET_ACCESS_KEY_sk_live_deadbeefcafebabe0123456789".repeat(8));
+	redactSecrets(`token=${"a".repeat(4000)}`);
+	redactSecrets("secret_".repeat(500));
+	expect(performance.now() - started).toBeLessThan(250);
 });
 
 test("a quoted secret containing whitespace is redacted whole, not half", () => {

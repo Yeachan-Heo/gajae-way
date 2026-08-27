@@ -256,6 +256,20 @@ const CREDENTIAL_KEYS = [
 	"authorization",
 ];
 /**
+ * `access_token` -> `accessToken`. JSON and JS runtimes spell these keys in
+ * camelCase at least as often as snake_case, and a case-insensitive match cannot
+ * see a word boundary expressed only by capitalization.
+ *
+ * Expanded into the fixed alternation rather than matched with a generic
+ * `(?:[a-z0-9]+(?=[A-Z]))*?` prefix: that shape nests two quantifiers and took
+ * 6 seconds on a 56-character input, which is a denial-of-service hazard in a
+ * function that parses untrusted runtime output.
+ */
+function camelCaseKey(key: string): string {
+	return key.replace(/[_-](.)/g, (_match, character: string) => character.toUpperCase());
+}
+
+/**
  * `[vendor_prefix_]<credential key>[_suffix][:=] value`. Both affixes are
  * separator-delimited and the suffix vocabulary is credential-only, which is
  * what makes `AWS_SECRET_ACCESS_KEY`, `GITHUB_TOKEN` and `my_api_key_value`
@@ -265,7 +279,7 @@ const CREDENTIAL_KEYS = [
  * query-string credential is the most common way a real HTTP failure line
  * carries one, and `?api_key=…` was not matching at all.
  */
-const CREDENTIAL_KEY = `(?:^|[\\s,{(\\["'?&#/;])(?:[A-Za-z0-9]+[_-])*?(?:${CREDENTIAL_KEYS.join("|")})(?:[_-](?:value|key|token|secret|string|data|b64|base64))*["']?`;
+const CREDENTIAL_KEY = `(?:^|[\\s,{(\\["'?&#/;])(?:[A-Za-z0-9]+[_-])*?(?:${[...CREDENTIAL_KEYS, ...CREDENTIAL_KEYS.map(camelCaseKey)].join("|")})(?:[_-](?:value|key|token|secret|string|data|b64|base64))*["']?`;
 /** `key: [ … ]` — a list of credentials must not be delivered entry by entry. */
 const CREDENTIAL_BRACKETED = new RegExp(`(${CREDENTIAL_KEY}\\s*[:=]\\s*)\\[[^\\]\\n]*\\]`, "gi");
 /** `key: "value with spaces"`; the closing quote is optional so it fails closed. */
