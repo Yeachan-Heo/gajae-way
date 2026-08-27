@@ -60,6 +60,7 @@ export interface DiscordInboundMessage extends DiscordMessageOriginShape {
 	 * `displayName` is what the server actually shows in the member list.
 	 */
 	readonly member?: {
+		readonly nick?: string | null;
 		readonly displayName?: string | null;
 		readonly nickname?: string | null;
 	} | null;
@@ -425,7 +426,11 @@ export interface SlashInteractionLike {
 		readonly globalName?: string | null;
 	};
 	/** Guild member for the invoking user, when the command ran in a guild. */
-	readonly member?: { readonly displayName?: string | null; readonly nickname?: string | null } | null;
+	readonly member?: {
+		readonly nick?: string | null;
+		readonly displayName?: string | null;
+		readonly nickname?: string | null;
+	} | null;
 	readonly channel?: DiscordMessageOriginShape["channel"] | null;
 	reply(options: { content: string; ephemeral?: boolean }): Promise<unknown>;
 }

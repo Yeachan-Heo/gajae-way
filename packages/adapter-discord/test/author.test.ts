@@ -62,3 +62,18 @@ describe("resolveAuthorNames", () => {
 		expect(names.handle).toBe("solo");
 	});
 });
+
+describe("raw-API member shape", () => {
+	test("honours the raw `nick` spelling an uncached interaction carries", () => {
+		expect(resolveDisplayName(author, { nick: "형님" })).toBe("형님");
+	});
+
+	test("nick and nickname agree; either one wins over the global name", () => {
+		expect(resolveDisplayName(author, { nick: "A", nickname: "A" })).toBe("A");
+		expect(resolveDisplayName(author, { nickname: "B" })).toBe("B");
+	});
+
+	test("a blank raw nick falls through to the next candidate", () => {
+		expect(resolveDisplayName(author, { nick: "", nickname: "kept" })).toBe("kept");
+	});
+});

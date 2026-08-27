@@ -27,6 +27,10 @@
         "@gajaeway/sdk": "workspace:*",
       },
     },
+    "packages/admin": {
+      "name": "@gajaeway/admin",
+      "version": "0.1.0",
+    },
     "packages/cli": {
       "name": "@gajaeway/cli",
       "version": "0.1.0",
@@ -66,6 +70,10 @@
         "@gajaeway/protocol": "workspace:*",
       },
     },
+    "packages/subsession": {
+      "name": "@gajaeway/subsession",
+      "version": "0.1.0",
+    },
   },
   "packages": {
     "@biomejs/biome": ["@biomejs/biome@2.5.2", "", { "optionalDependencies": { "@biomejs/cli-darwin-arm64": "2.5.2", "@biomejs/cli-darwin-x64": "2.5.2", "@biomejs/cli-linux-arm64": "2.5.2", "@biomejs/cli-linux-arm64-musl": "2.5.2", "@biomejs/cli-linux-x64": "2.5.2", "@biomejs/cli-linux-x64-musl": "2.5.2", "@biomejs/cli-win32-arm64": "2.5.2", "@biomejs/cli-win32-x64": "2.5.2" }, "bin": { "biome": "bin/biome" } }, "sha512-VQ3RCqr7JmDIX+w6stWYl+g/3bYofN3q2wDBHUKKc/c7i5QWrFKFBZYCYPWTE6agsUPMIZZe6/CMmVUfUAhkKA=="],
@@ -102,6 +110,8 @@
 
     "@gajaeway/adapter-telegram": ["@gajaeway/adapter-telegram@workspace:packages/adapter-telegram"],
 
+    "@gajaeway/admin": ["@gajaeway/admin@workspace:packages/admin"],
+
     "@gajaeway/cli": ["@gajaeway/cli@workspace:packages/cli"],
 
     "@gajaeway/conformance": ["@gajaeway/conformance@workspace:packages/conformance"],
@@ -111,6 +121,8 @@
     "@gajaeway/protocol": ["@gajaeway/protocol@workspace:packages/protocol"],
 
     "@gajaeway/sdk": ["@gajaeway/sdk@workspace:packages/sdk"],
+
+    "@gajaeway/subsession": ["@gajaeway/subsession@workspace:packages/subsession"],
 
     "@sapphire/async-queue": ["@sapphire/async-queue@1.5.5", "", {}, "sha512-cvGzxbba6sav2zZkH8GPf2oGk9yYoD5qrNWdu9fRehifgnFZJMV+nuy2nON2roRO4yQQ+v7MK/Pktl/HgfsUXg=="],
 

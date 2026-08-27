@@ -19,7 +19,12 @@ export type AuthorLike = {
 };
 
 export type MemberLike = {
-	/** Guild-scoped nickname, when the member set one. */
+	/**
+	 * Raw-API spelling of the guild nickname. Present on
+	 * `APIInteractionGuildMember`, which is what an uncached interaction carries.
+	 */
+	readonly nick?: string | null;
+	/** discord.js spelling of the guild nickname. */
 	readonly nickname?: string | null;
 	/** discord.js resolves this to nickname ?? globalName ?? username. */
 	readonly displayName?: string | null;
@@ -42,13 +47,14 @@ function firstNonBlank(candidates: readonly (string | null | undefined)[]): stri
 }
 
 /**
- * Precedence: guild nickname -> member display name -> global name -> handle.
+ * Precedence: guild nickname (`nick` or `nickname`) -> member display name ->
+ * global name -> handle.
  *
  * Blank and whitespace-only values are skipped rather than propagated, because
  * Discord returns an empty string for an unset global name.
  */
 export function resolveDisplayName(author: AuthorLike | undefined, member?: MemberLike): string | undefined {
-	return firstNonBlank([member?.nickname, member?.displayName, author?.globalName, author?.username]);
+	return firstNonBlank([member?.nick, member?.nickname, member?.displayName, author?.globalName, author?.username]);
 }
 
 /** Both names at once, so callers never have to recompute the precedence. */
