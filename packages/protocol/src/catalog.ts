@@ -349,6 +349,85 @@ export interface EngagementReactionResult {
 	/** Always false: a reaction is metadata, never a turn. */
 	readonly engaged: false;
 }
+/**
+ * Operator runtime-cycle projection (ops.cycle): a read-only, snapshot view of
+ * where every runtime cycle currently stands — durable inbound dispatch,
+ * delivery settlement, memory closure, monitor settlement — plus per-session
+ * identity with epoch/provenance. Derived, never authoritative: the durable
+ * SQLite rows and the delivery ledger remain the source of truth, and this
+ * projection adds no writer of its own.
+ */
+export type CyclePhase = "idle" | "dispatching" | "delivering" | "draining" | "degraded";
+
+/**
+ * Fail-closed reason a phase cannot be reported as healthy. The projection
+ * must never guess an optimistic phase over missing evidence.
+ */
+export type CycleGateReason =
+	| "stale_session_identity"
+	| "delivery_settlement_unknown"
+	| "memory_closure_blocked"
+	| "monitor_settlement_failed";
+
+export interface CycleSessionView {
+	/** Canonical, opaque origin key (protocol originKey; never reparsed). */
+	readonly originKey: string;
+	/** Validated origin ref for display provenance. */
+	readonly origin: OriginRef;
+	readonly epoch: number;
+	/**
+	 * Bound gjc session id. Empty string means the origin is mid-rebind:
+	 * epoch was bumped (or the session was never created), so identity is
+	 * stale by construction and turns rebind on dispatch.
+	 */
+	readonly sessionId: string;
+	readonly createdAt: string;
+	readonly lastActivityAt: string | null;
+	/** Durable inbound messages still awaiting their turn for this origin. */
+	readonly pendingInbound: number;
+	/** Ledger deliveries not yet confirmed/expired for this origin. */
+	readonly unsettledDeliveries: number;
+	/** Oldest unsettled delivery age in ms, null when none are unsettled. */
+	readonly oldestUnsettledAgeMs: number | null;
+}
+
+export interface OpsCycleResult {
+	/** Aggregate runtime phase; "degraded" is emitted whenever gates is non-empty. */
+	readonly phase: CyclePhase;
+	/**
+	 * Fail-closed gate reasons. Empty iff the cycle is healthy. Unknown
+	 * settlement states surface as gates, never as healthy silence.
+	 */
+	readonly gates: readonly CycleGateReason[];
+	readonly generatedAt: string;
+	/** Gateway instance id that produced this snapshot (provenance). */
+	readonly instanceId: string;
+	/** True when a memory-closure drain is in flight at snapshot time. */
+	readonly memoryClosing: boolean;
+	readonly sessions: readonly CycleSessionView[];
+	/** Settlement census of durable memory intents. */
+	readonly memoryIntents: {
+		readonly queued: number;
+		readonly written: number;
+		readonly committed: number;
+		readonly receipted: number;
+		readonly quarantined: number;
+	};
+	/** Monitor events not yet terminally settled, by stage. */
+	readonly monitorEvents: { readonly stage: string; readonly count: number }[];
+	/** Delivery ledger census across all states. */
+	readonly deliveries: {
+		readonly pending: number;
+		readonly inflight: number;
+		readonly confirmed: number;
+		readonly failedAmbiguous: number;
+		readonly expired: number;
+	};
+	/** Durable inbound messages claimed but not completed right now. */
+	readonly inFlightInbound: number;
+	/** Durable inbound messages still awaiting their turn, across ALL origins. */
+	readonly pendingInbound: number;
+}
 
 /** Verb catalog: verb name -> { params, result } (documentation-level typing). */
 export interface VerbCatalogV01 {
@@ -378,6 +457,7 @@ export interface VerbCatalogV01 {
 	"work.run": { params: WorkRunParams; result: WorkRunResult };
 	"chat.react": { params: ChatReactParams; result: ChatReactResult };
 	"engagement.reaction": { params: EngagementReactionParams; result: EngagementReactionResult };
+	"ops.cycle": { params: undefined; result: OpsCycleResult };
 }
 
 /** Event catalog: event name -> payload. */
@@ -409,6 +489,7 @@ export const VERBS_V01 = [
 	"chat.react",
 	"engagement.reaction",
 	"gateway.reloadConfig",
+	"ops.cycle",
 ] as const;
 export const EVENTS_V01 = ["chat.message", "chat.progress", "gateway.stopping", "monitor.event"] as const;
 

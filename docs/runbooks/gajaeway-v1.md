@@ -78,6 +78,19 @@ gajaeway memory search 'query terms'
 
 Memory changes are durable intents, committed in the memory Git repository, and recorded in `memory-receipts.jsonl`. Audit before manual repair; search returns bounded excerpts. Investigate quarantined mutations rather than editing receipts or Git history to hide them.
 
+## Runtime cycle
+
+`gajaeway ops cycle` projects one operator-readable snapshot of where every runtime cycle stands: aggregate phase, per-origin session identity with epoch, durable inbound queue depth, delivery settlement, memory closure, and monitor settlement:
+
+```sh
+gajaeway ops cycle          # human-readable; exits 1 when any gate is present
+gajaeway ops cycle --json   # typed OpsCycleResult for scripting; same exit contract
+```
+
+Phases are `idle`, `dispatching` (turn work accepted or claimed from the durable queue), `delivering` (unsettled ledger deliveries), `draining` (memory closure in flight or durable unsettled intents), and `degraded`. A session shown as `(rebinding)` has a bumped epoch with no bound session yet — the next turn rebinds it.
+
+The command is fail-closed by contract. `gates:` names every reason the cycle is not healthy — `stale_session_identity`, `delivery_settlement_unknown`, `memory_closure_blocked`, `monitor_settlement_failed` — and any gate forces exit code 1, so automation can never read a degraded runtime as idle. An unavailable daemon is a connection error, not a healthy report. The projection is read-only; durable SQLite rows and the delivery ledger remain the authority.
+
 ## Backup and restore drill
 
 With the daemon running, take an online SQLite backup and validate it:

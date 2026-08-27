@@ -3,6 +3,7 @@ import type {
 	ChatReactResult,
 	ChatSendResult,
 	GatewayStatusResult,
+	OpsCycleResult,
 	WorkRunParams,
 	WorkRunResult,
 } from "@gajaeway/protocol";
@@ -150,6 +151,9 @@ export class GajaewayClient {
 	}
 	workRun(params: WorkRunParams): Promise<WorkRunResult> {
 		return this.request("work.run", params);
+	}
+	opsCycle(): Promise<OpsCycleResult> {
+		return this.request("ops.cycle");
 	}
 
 	async close(): Promise<void> {

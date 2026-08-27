@@ -37,6 +37,7 @@ import { MonitorPropagator } from "../monitors/propagate";
 import { MonitorRegistry } from "../monitors/registry";
 import { MonitorRuntime } from "../monitors/runtime";
 import { backupDatabase, integrityDatabase } from "../ops/backup";
+import { RuntimeCycleProjector } from "../ops/cycle";
 import type { GjcPort } from "../orchestrator/gjc-client";
 import { formatFailureNotice } from "../orchestrator/rebind";
 import { PersonaLoader } from "../persona/persona";
@@ -130,6 +131,8 @@ interface Runtime {
 	readonly reactions: ReactionBudget;
 	/** Accepted-but-not-yet-dispatched inbound messages, keyed by message id. */
 	readonly inbound: Map<string, InboundContext>;
+	/** Read-only runtime-cycle projection (ops.cycle); owns no writes. */
+	readonly cycle: RuntimeCycleProjector;
 }
 
 export async function startUnixServer(options: GatewayServerOptions): Promise<GatewayServer> {
@@ -316,6 +319,7 @@ function createRuntime(options: GatewayServerOptions): Runtime {
 		reconcileTimer,
 		turns: new KeyedQueue(),
 		reactions: new ReactionBudget(),
+		cycle: new RuntimeCycleProjector(options.database, memory),
 		inbound: new Map(),
 	};
 }
@@ -465,6 +469,14 @@ async function handleRequest(
 			connection.write({ v: PROFILE_VERSION, type: "response", id: request.id, result: { text, sessionKey } });
 			return;
 		}
+		case "ops.cycle":
+			connection.write({
+				v: PROFILE_VERSION,
+				type: "response",
+				id: request.id,
+				result: runtime.cycle.project(),
+			});
+			return;
 		case "ops.integrity":
 			connection.write({
 				v: PROFILE_VERSION,
