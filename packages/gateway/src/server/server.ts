@@ -523,8 +523,7 @@ async function handleRequest(
 						held: true as const,
 						jobId,
 						state: prior.state,
-						reason:
-							"the job is awaiting_operator after a crash/uncertain attempt; reconcile, then re-run with resume: true",
+						reason: `the job is ${prior.state} (uncertain attempt or stalled continuations); reconcile, then re-run with resume: true`,
 					};
 				}
 				const openPrior = prior.attempts.find((attempt) => attempt.endedAt === undefined);

@@ -633,7 +633,11 @@ export function planContinuation(input: PlanContinuationInput): ContinuationPlan
 
 	const stalledOut =
 		input.record.stalledContinuations >= MAX_STALLED_CONTINUATIONS &&
-		!hasNewCommit({ ...input.repository, knownCheckpoints: input.record.checkpoints });
+		!hasNewCommit({
+			...input.repository,
+			knownCheckpoints: input.record.checkpoints,
+			baselineSha: input.record.baselineSha,
+		});
 	if (stalledOut) {
 		return {
 			action: "hold_for_operator",

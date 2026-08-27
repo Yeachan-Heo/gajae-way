@@ -94,10 +94,11 @@
   "repository-first reconciliation now runs on EVERY attempt end including reaped/failed ones; creation seeds the baseline HEAD checkpoint so the pre-existing commit is never reported as worker progress; classification uses hasNewCommit (progressed vs held)",
   "lane lookup is by the exact lane key (original name); a same-name/different-worktree call fails closed with a lane-mismatch error; jobId is injective hex of the exact UTF-8 name (no hash collisions possible)"
  ],
- "validatedExecutableCommit": "a772e5e (round-4 fixes + origin/main merge; full suite re-run at this exact tree: bun x tsc --noEmit exit 0, bun test packages/ 914 pass / 0 fail / 2 skip, bunx biome ci packages/ exit 0)",
+ "validatedExecutableCommit": "a588c9b (round-4+5 fixes + origin/main merge; full suite re-run at this exact tree: bun x tsc --noEmit exit 0, bun test packages/ 916 pass / 0 fail / 2 skip, bunx biome ci packages/ exit 0)",
  "criticRound4Fixes": [
   "baseline HEAD stored as context (baselineSha), never a checkpoint; checkpoints only record observed HEAD moves past baseline",
   "gateway uses hasNewCommit for classification; ended attempts without a new HEAD increment stalledContinuations (stalled), and the stalled hold is sticky like awaiting_operator (resume:true required)",
-  "jobId injective AND schema-bounded: lanejob-<hex of exact UTF-8 name> fits the 128-char id alphabet for every accepted 64-byte name"
+  "jobId injective AND schema-bounded: lanejob-<hex of exact UTF-8 name> fits the 128-char id alphabet for every accepted 64-byte name",
+  "planContinuation stalled budget gate passes record.baselineSha into the repository facts: at a full stall budget with zero checkpoints, a HEAD that moved past the baseline is progress (not a hold); adversarial test added"
  ]
 }

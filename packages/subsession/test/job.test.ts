@@ -155,6 +155,51 @@ describe("durable record schema: versioned, frozen, fail-closed", () => {
 		expect(() => parseLaneJobRecord(JSON.stringify({ ...record(), reportSource: "vibes" }))).toThrow(/reportSource/);
 	});
 
+	test("jobId length bound is enforced at construction AND parse (injective hex fits)", () => {
+		// A 64-byte worker name encodes to exactly 128 hex chars: the longest
+		// jobId the schema accepts.
+		const maxName = "a".repeat(64);
+		const maxId = `lanejob-${Buffer.from(maxName, "utf8").toString("hex")}`;
+		expect(maxId.length).toBe(8 + 128);
+		expect(() => createLaneJobRecord({ jobId: maxId, branch: "b", worktreePath: "/wt" })).not.toThrow();
+		// One char more is refused, both on create and on parse.
+		const overId = `lanejob-${"a".repeat(129)}`;
+		expect(() => createLaneJobRecord({ jobId: overId, branch: "b", worktreePath: "/wt" })).toThrow(/jobId/);
+		expect(() =>
+			parseLaneJobRecord(JSON.stringify({ ...JSON.parse(JSON.stringify(record())), jobId: overId })),
+		).toThrow(/jobId/);
+	});
+
+	test("stalled budget does not hold when HEAD just moved past the baseline (repo-first wins)", () => {
+		const baseline = "a".repeat(40);
+		const moved = "b".repeat(40);
+		let current = appendAttempt(record(), attempt());
+		current = closeAttempt({
+			record: current,
+			opRef: attempt().opRef,
+			endState: "attempt_ended",
+			endedAt: NOW.toISOString(),
+		});
+		// Drive the stall counter to the bound with zero checkpoints.
+		current = { ...current, stalledContinuations: MAX_STALLED_CONTINUATIONS, baselineSha: baseline };
+		const decision = planContinuation(
+			planInput({
+				record: current,
+				repository: repo({ headSha: moved, baselineSha: baseline }),
+				latestAttempt: current.attempts[0],
+			}),
+		);
+		expect(decision.action).not.toBe("hold_for_operator");
+		// Repository-first reconciliation then records B and resets the counter.
+		const reconciled = applyReconciliation({
+			record: current,
+			repository: repo({ headSha: moved, baselineSha: baseline }),
+			classification: "progressed",
+		});
+		expect(reconciled.checkpoints.map((checkpoint) => checkpoint.sha)).toEqual([moved]);
+		expect(reconciled.stalledContinuations).toBe(0);
+	});
+
 	test("checkpoints reject only consecutive duplicates; duplicate opRefs are rejected", () => {
 		// Git SHAs have no chronological lexical order: a rebase moves HEAD to a
 		// sha that sorts LOWER, and that history is still valid durable state.
