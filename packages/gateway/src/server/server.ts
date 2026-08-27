@@ -28,6 +28,7 @@ import { MonitorRegistry } from "../monitors/registry";
 import { MonitorRuntime } from "../monitors/runtime";
 import { backupDatabase, integrityDatabase } from "../ops/backup";
 import type { GjcPort } from "../orchestrator/gjc-client";
+import { formatFailureNotice } from "../orchestrator/rebind";
 import { PersonaLoader } from "../persona/persona";
 import type { GatewayDatabase, InboundMessageRow } from "../store/db";
 import { DeliveryLedger } from "../store/ledger";
@@ -759,12 +760,14 @@ async function runInboundTurn(
 	} catch (error) {
 		// Never ghost a platform conversation: a failed turn still produces a visible,
 		// ledgered notice (live P1 drill finding: timeouts looked like silent ignores).
+		// The notice carries the runtime's OWN code and message (#14): one opaque line
+		// cost ~2h of muteness because nobody could tell a poisoned session key from a
+		// timeout. The identical string is logged, so a channel transcript is enough
+		// to triage without shell access.
+		const failureNotice = formatFailureNotice(error);
+		console.error(failureNotice);
 		if (nonLoopback) {
-			const notice = runtime.delivery.prepare(
-				turnId,
-				origin,
-				"[turn failed] The reply could not be produced (timeout or runtime error). Try again, or send /new to rebind this conversation.",
-			);
+			const notice = runtime.delivery.prepare(turnId, origin, failureNotice);
 			if (notice) {
 				runtime.delivery.markInflight(notice.deliveryId as string);
 				for (const recipient of runtime.connections)
