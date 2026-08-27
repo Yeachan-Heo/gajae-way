@@ -1,14 +1,26 @@
 # gajae-way
 
-**gajae-way** gives you a persistent AI persona that lives where you already talk: Discord and Telegram DMs, channels, and threads. It can keep notes in plain Markdown files, react to scheduled work and outside events, and keep each conversation in its own private context.
+**Your AI shouldn't live in a browser tab. It should live in your DMs.**
 
-It is meant to feel like talking to one helpful presence—not operating a dashboard.
+gajae-way is a runtime that turns an AI coding agent into a *resident persona* — one that sits in your Discord and Telegram, remembers you in plain Markdown, wakes itself up on a schedule, and keeps every conversation in its own private head. No dashboard. No web app. No new place to check. You just talk to it where you already talk.
 
 ```text
 Discord / Telegram ──> gajaeway gateway ──> your persona (gjc)
                               │
                     Markdown memory + scheduled/event monitors
 ```
+
+Chat frontends are easy. What is hard is everything that happens when a real bot has to stay up for months: crashes mid-reply, two messages racing the same conversation, an agent that forgets who you are, an agent that confuses one room for another, an agent that answers a message you never sent. gajae-way is the boring, durable layer that handles those — so the persona on top can be interesting.
+
+## Why this exists
+
+- **One presence, many rooms — never one blur.** Every conversation is a validated origin (`platform/kind/conversationId`) with its own session and epoch. Your DM is not your team channel. `/new` rebinds *that* conversation and leaves the others untouched.
+- **Memory you can read with `cat`.** Turns and monitor output land in `$GAJAEWAY_HOME/memory` as Markdown across a small set of canonical axes. It is your filesystem, your git history, your grep — not a vector blob you have to trust.
+- **It acts without being asked.** Cron and event monitors give the persona its own turns, so it can canonicalize memory on a schedule or audit itself each morning while you sleep.
+- **Delivery is ledgered, not hoped for.** Replies get a durable record before they go out. After a crash, an unsettled reply is reissued and *visibly labeled a duplicate* instead of quietly pretending nothing happened.
+- **It knows when to shut up.** DMs always engage. Group traffic is mention-gated unless you explicitly open a channel — and an opened channel still lets the persona choose silence over noise.
+- **Safety floors that config cannot unlock.** Unrecoverable commands and deletions outside your own home are refused at the runtime boundary, not left to prompt discipline.
+- **Standalone binaries, not a stack.** `bun run build` emits compiled executables. Production hosts run those under launchd/systemd; the source checkout stays on your laptop.
 
 ## What it feels like
 
