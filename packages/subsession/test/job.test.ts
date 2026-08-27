@@ -175,9 +175,18 @@ describe("durable record schema: versioned, frozen, fail-closed", () => {
 		shortSha.checkpoints = [{ sha: "abc123", createdAt: NOW.toISOString() }];
 		expect(() => parseLaneJobRecord(JSON.stringify(shortSha))).toThrow(/full commit sha/);
 
+		const closed = { ...attempt(), endedAt: NOW.toISOString(), endState: "completed" };
 		const dupes = JSON.parse(JSON.stringify(record()));
-		dupes.attempts = [attempt(), attempt()];
+		dupes.attempts = [closed, { ...closed }];
 		expect(() => parseLaneJobRecord(JSON.stringify(dupes))).toThrow(/duplicate attempt opRef/);
+
+		const openNotLast = JSON.parse(JSON.stringify(record()));
+		openNotLast.attempts = [attempt(), { ...closed }];
+		expect(() => parseLaneJobRecord(JSON.stringify(openNotLast))).toThrow(/open but not the last/);
+
+		const halfClosed = JSON.parse(JSON.stringify(record()));
+		halfClosed.attempts = [{ ...attempt(), endedAt: NOW.toISOString() }];
+		expect(() => parseLaneJobRecord(JSON.stringify(halfClosed))).toThrow(/together/);
 	});
 
 	test("fail-closed parse: missing v1 sections are schema violations, not empty defaults", () => {

@@ -26,6 +26,7 @@ import {
 } from "@gajaeway/protocol";
 import {
 	appendAttempt,
+	applyReconciliation,
 	closeAttempt,
 	createLaneJobRecord,
 	type LaneJobRecord,
@@ -55,12 +56,29 @@ import { composeSpeakerLabel, composeTurnHeader } from "./speaker";
 /**
  * Durable lane-job persistence for delegated work (issue #10).
  *
- * Every `work.run` call is one attempt against a job whose identity
- * (`lanejob-work-<name>`) outlives the turn: the attempt receipt, end state,
- * and failure code land in SQLite before the reply is produced, so a gateway
+ * Every `work.run` call is one attempt against a job whose identity outlives
+ * the turn: the attempt receipt, end state, failure code, and repository
+ * checkpoints land in SQLite before the reply is produced, so a gateway
  * restart or a reaped turn still leaves an auditable trail. Corrupt stored
  * state fails the verb loudly instead of being silently replaced.
+ *
+ * Boundary note: this surface drives gjc via spawn-per-turn (`--resume`), which
+ * has no broker op accounting to poll - so attempts carry gateway-local opRefs
+ * and end states, while broker-driven op receipts/status reconciliation remain
+ * the G001 library surface for sdk-session lanes.
  */
+function laneJobIdentity(workName: string): { jobId: string; laneKey: string } {
+	const laneKey = `work-${workName}`;
+	// Collision-free: the slug is lossy, so a 32-bit FNV-1a of the EXACT name
+	// distinguishes Foo/foo, a.b/a_b, and a-b/a_b while staying [a-z0-9-].
+	let hash = 0x811c9dc5;
+	for (const byte of Buffer.from(workName, "utf8")) {
+		hash = ((hash ^ byte) * 0x01000193) >>> 0;
+	}
+	const slug = `${workName.toLowerCase().replace(/[^a-z0-9]+/g, "-")}-${hash.toString(36)}`;
+	return { jobId: `lanejob-work-${slug}`, laneKey };
+}
+
 function persistLaneJob(database: GatewayDatabase, record: LaneJobRecord, laneKey: string): void {
 	database.putLaneJob({
 		jobId: record.jobId,
@@ -73,17 +91,52 @@ function persistLaneJob(database: GatewayDatabase, record: LaneJobRecord, laneKe
 	});
 }
 
-function loadOrCreateLaneJob(database: GatewayDatabase, jobId: string, workName: string): LaneJobRecord {
+/** Reads the actual branch HEAD and dirtiness of the worktree (read-only git). */
+async function collectRepoFacts(
+	worktreePath: string,
+): Promise<{ headSha?: string; dirtyFiles: number; branch?: string } | undefined> {
+	try {
+		const head = Bun.spawnSync(["git", "-C", worktreePath, "rev-parse", "HEAD"], { stdout: "pipe", stderr: "pipe" });
+		const branch = Bun.spawnSync(["git", "-C", worktreePath, "rev-parse", "--abbrev-ref", "HEAD"], {
+			stdout: "pipe",
+			stderr: "pipe",
+		});
+		const status = Bun.spawnSync(["git", "-C", worktreePath, "status", "--porcelain"], {
+			stdout: "pipe",
+			stderr: "pipe",
+		});
+		const headSha = head.stdout.toString().trim();
+		if (!/^[0-9a-f]{40}$/.test(headSha)) return undefined;
+		const dirtyFiles = status.stdout
+			.toString()
+			.split("\n")
+			.filter((line) => line.trim()).length;
+		const branchName = branch.stdout.toString().trim();
+		return { headSha, dirtyFiles, ...(branchName ? { branch: branchName } : {}) };
+	} catch {
+		return undefined;
+	}
+}
+
+async function loadOrCreateLaneJob(
+	database: GatewayDatabase,
+	workName: string,
+	workCwd: string,
+): Promise<LaneJobRecord> {
+	const { jobId, laneKey } = laneJobIdentity(workName);
 	const stored = database.laneJobJson(jobId);
 	if (stored !== undefined) {
 		return parseLaneJobRecord(stored);
 	}
+	// The lane block describes the REAL lane: actual worktree, actual branch
+	// when git can tell us, deterministic fallback otherwise.
+	const facts = await collectRepoFacts(workCwd);
 	const created = createLaneJobRecord({
 		jobId,
-		branch: `work/${workName.toLowerCase().replace(/[^a-z0-9._/-]+/g, "-")}`,
-		worktreePath: "/",
+		branch: facts?.branch ?? `work/${workName.toLowerCase().replace(/[^a-z0-9._/-]+/g, "-")}`,
+		worktreePath: workCwd,
 	});
-	persistLaneJob(database, created, `work-${workName}`);
+	persistLaneJob(database, created, laneKey);
 	return created;
 }
 
@@ -412,7 +465,7 @@ async function handleRequest(
 			// register, bound to a caller-chosen cwd, serialized per worker name and
 			// resumable across calls (the persona's hand-rolled subsession spawning
 			// kept losing the reply body — this returns it directly).
-			const params = request.params as { name?: unknown; text?: unknown; cwd?: unknown } | undefined;
+			const params = request.params as { name?: unknown; text?: unknown; cwd?: unknown; resume?: unknown } | undefined;
 			if (typeof params?.name !== "string" || !/^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/.test(params.name))
 				throw new ProtocolError("invalid_params", "work.run requires name matching [A-Za-z0-9][A-Za-z0-9._-]{0,63}");
 			if (typeof params.text !== "string" || !params.text)
@@ -423,7 +476,8 @@ async function handleRequest(
 			const workText = params.text;
 			const workCwd = params.cwd as string | undefined;
 			const sessionKey = `work/task/${workName}`;
-			const text = await runtime.turns.run(sessionKey, async () => {
+			const effectiveCwd = workCwd ?? process.cwd();
+			const result = await runtime.turns.run(sessionKey, async () => {
 				const turnOptions = { ...(workCwd ? { cwd: workCwd } : {}), codingRegister: true };
 				const epoch = options.database.getSessionRecord(sessionKey)?.epoch ?? 0;
 				const { sessionId } = await options.gjc.ensureSession(sessionKey, epoch, turnOptions);
@@ -434,30 +488,41 @@ async function handleRequest(
 				// Issue #10: this delegated call is one ATTEMPT against a durable
 				// job. The receipt and its terminal transition persist even when
 				// this process dies mid-turn, so nothing depends on a reply body.
-				const jobId = `lanejob-work-${workName.toLowerCase().replace(/[^a-z0-9]+/g, "-")}`;
-				const prior0 = loadOrCreateLaneJob(options.database, jobId, workName);
+				const { jobId, laneKey } = laneJobIdentity(workName);
+				const prior = await loadOrCreateLaneJob(options.database, workName, effectiveCwd);
 				// A serialized worker cannot have two live turns, so an attempt still
 				// open at call time belongs to a crashed predecessor: record it as
-				// exactly what we know - terminally uncertain - with an escalation
-				// trail entry operators can see through work.jobs.
-				const openPrior = prior0.attempts.find((attempt) => attempt.endedAt === undefined);
-				const prior = openPrior
-					? closeAttempt({
-							record: prior0,
-							opRef: openPrior.opRef,
-							endState: "terminal_uncertain",
-							endedAt: new Date().toISOString(),
-						})
-					: prior0;
-				if (openPrior) persistLaneJob(options.database, prior, `work-${workName}`);
-				const jobSlug = workName.toLowerCase().replace(/[^a-z0-9]+/g, "-");
-				const opRef = newOpRef(`work-${jobSlug}`);
-				let job = appendAttempt(prior, {
+				// exactly what we know - terminally uncertain - and then HOLD. The
+				// predecessor's session may still be running after a restart; the
+				// deterministic planner path for an uncertain attempt is an operator
+				// hold, not an automatic continuation. `resume: true` is the explicit
+				// operator acknowledgement that lets the next attempt start.
+				const openPrior = prior.attempts.find((attempt) => attempt.endedAt === undefined);
+				let uncertain: LaneJobRecord | undefined;
+				if (openPrior) {
+					uncertain = closeAttempt({
+						record: prior,
+						opRef: openPrior.opRef,
+						endState: "terminal_uncertain",
+						endedAt: new Date().toISOString(),
+					});
+					persistLaneJob(options.database, uncertain, laneKey);
+					if (params.resume !== true) {
+						return {
+							held: true as const,
+							jobId,
+							state: uncertain.state,
+							reason: `attempt ${openPrior.opRef} is terminally uncertain after a crash/restart; reconcile, then re-run with resume: true`,
+						};
+					}
+				}
+				const opRef = newOpRef(`work-${workName.toLowerCase().replace(/[^a-z0-9]+/g, "-")}`);
+				let job = appendAttempt(uncertain ?? prior, {
 					opRef,
 					sessionId,
 					startedAt: new Date().toISOString(),
 				});
-				persistLaneJob(options.database, job, `work-${workName}`);
+				persistLaneJob(options.database, job, laneKey);
 				try {
 					const reply = await options.gjc.sendTurn(sessionId, workText, undefined, undefined, turnOptions);
 					job = closeAttempt({
@@ -466,26 +531,76 @@ async function handleRequest(
 						endState: "completed",
 						endedAt: new Date().toISOString(),
 					});
-					persistLaneJob(options.database, job, `work-${workName}`);
-					return reply;
+					// Repository first: whatever the reply said, a HEAD move on the
+					// worktree is the authoritative checkpoint.
+					const facts = await collectRepoFacts(effectiveCwd);
+					if (facts) {
+						job = applyReconciliation({
+							record: job,
+							repository: {
+								...(facts.headSha ? { headSha: facts.headSha } : {}),
+								dirtyFiles: facts.dirtyFiles,
+								observedAt: new Date().toISOString(),
+							},
+							classification: "progressed",
+						});
+					}
+					persistLaneJob(options.database, job, laneKey);
+					return { held: false as const, text: reply, jobId, opRef };
 				} catch (error) {
 					const failureMessage = error instanceof Error ? error.message : String(error);
-					job = closeAttempt({ record: job, opRef, endState: "failed", endedAt: new Date().toISOString() });
-					persistLaneJob(options.database, job, `work-${workName}`);
+					// The gateway's own inactivity reaper produces the deadline-kill
+					// shape: the ATTEMPT ends, the job stays continuable. Anything
+					// else is a plain attempt failure.
+					const reaped = /made no progress|timed out/.test(failureMessage);
+					job = closeAttempt({
+						record: job,
+						opRef,
+						endState: reaped ? "attempt_ended" : "failed",
+						errorCode: reaped ? "gateway_turn_reaped" : undefined,
+						endedAt: new Date().toISOString(),
+					});
+					persistLaneJob(options.database, job, laneKey);
 					throw new Error(failureMessage);
 				}
 			});
-			connection.write({ v: PROFILE_VERSION, type: "response", id: request.id, result: { text, sessionKey } });
+			connection.write({
+				v: PROFILE_VERSION,
+				type: "response",
+				id: request.id,
+				result: result.held ? result : { ...result, sessionKey },
+			});
 			return;
 		}
 		case "work.jobs": {
 			// Operator projection over durable lane jobs (issue #10): survives the
 			// gateway restart that would otherwise erase in-flight work knowledge.
+			// Each row is re-validated against the authoritative record JSON: a
+			// corrupt row is flagged as corrupt for the operator, never shown as
+			// healthy and never silently dropped.
+			const jobs = options.database.laneJobRows().map((row) => {
+				try {
+					const record = parseLaneJobRecord(options.database.laneJobJson(row.job_id) ?? "");
+					return {
+						...row,
+						attempts: record.attempts.length,
+						checkpoints: record.checkpoints.length,
+						escalations: record.escalations.length,
+					};
+				} catch (error) {
+					return {
+						...row,
+						state: "corrupt" as const,
+						corrupt: true as const,
+						error: error instanceof Error ? error.message : String(error),
+					};
+				}
+			});
 			connection.write({
 				v: PROFILE_VERSION,
 				type: "response",
 				id: request.id,
-				result: { jobs: options.database.laneJobRows() },
+				result: { jobs },
 			});
 			return;
 		}

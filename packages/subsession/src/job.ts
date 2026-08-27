@@ -272,7 +272,7 @@ function parseAttempts(value: unknown): readonly JobAttempt[] {
 	}
 	const seenOpRefs = new Set<string>();
 	return Object.freeze(
-		value.map((entry): JobAttempt => {
+		value.map((entry, index): JobAttempt => {
 			if (typeof entry !== "object" || entry === null) {
 				throw new LaneJobError("each attempt must be an object");
 			}
@@ -285,18 +285,29 @@ function parseAttempts(value: unknown): readonly JobAttempt[] {
 			}
 			seenOpRefs.add(attempt.opRef as string);
 			const rest: Partial<JobAttempt> = {};
-			if (attempt.endedAt !== undefined) {
+			const hasEndedAt = attempt.endedAt !== undefined;
+			const hasEndState = attempt.endState !== undefined;
+			// endedAt and endState are a pair: one without the other is corrupt.
+			if (hasEndedAt !== hasEndState) {
+				throw new LaneJobError(`attempt ${String(attempt.opRef)} must carry endedAt and endState together`);
+			}
+			if (hasEndedAt) {
 				assertRequiredTimestamp(attempt.endedAt, "attempt.endedAt");
 				(rest as Record<string, unknown>).endedAt = attempt.endedAt;
 			}
 			if (attempt.errorCode !== undefined) {
 				(rest as Record<string, unknown>).errorCode = asString(attempt.errorCode);
 			}
-			if (attempt.endState !== undefined) {
+			if (hasEndState) {
 				if (typeof attempt.endState !== "string" || !SUPERVISOR_OP_STATES.has(attempt.endState as never)) {
 					throw new LaneJobError(`unknown attempt endState ${JSON.stringify(attempt.endState)}`);
 				}
 				(rest as Record<string, unknown>).endState = attempt.endState;
+			}
+			// The one-open-attempt invariant is a parse-time fact too: an open
+			// attempt may only be the LAST entry of the history.
+			if (!hasEndedAt && index !== value.length - 1) {
+				throw new LaneJobError(`attempt ${String(attempt.opRef)} is open but not the last attempt`);
 			}
 			return Object.freeze({
 				opRef: attempt.opRef as string,
