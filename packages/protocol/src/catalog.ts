@@ -288,6 +288,12 @@ export interface WorkRunResult {
  * origin. The target message id is required — "react to the last message" is not
  * expressible, because "last" changes under you. `emoji` accepts any allowlisted
  * spelling (`👍`, `thumbsup`, `:thumbsup:`) and is canonicalized by the gateway.
+ *
+ * Allowlisted is not the same as deliverable: a platform may accept only part of
+ * the allowlist (Telegram publishes a fixed reaction set), and the gateway
+ * refuses an emoji that origin cannot express rather than queueing a delivery
+ * that can only fail. `reactionAllowlistFor(platform)` is what a caller should
+ * offer.
  */
 export interface ChatReactParams {
 	readonly origin: OriginRef;

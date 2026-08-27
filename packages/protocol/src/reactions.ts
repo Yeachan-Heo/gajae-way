@@ -109,10 +109,15 @@ export function reactionAllowlistFor(platform: string): readonly ReactionEmoji[]
 /**
  * Human-readable allowlist for error messages and persona guidance: the caller
  * gets told what IS accepted, on the platform it is actually speaking to.
+ *
+ * `platform` is required on purpose. An unqualified description is the exact
+ * string that invited a Telegram persona to acknowledge with an emoji Telegram
+ * would never accept, so there is no default arm to fall into.
  */
-export function reactionAllowlistDescription(platform?: string): string {
-	const entries = platform ? reactionAllowlistFor(platform) : REACTION_ALLOWLIST;
-	return entries.map((entry) => `${entry.unicode} (${entry.name})`).join(", ");
+export function reactionAllowlistDescription(platform: string): string {
+	return reactionAllowlistFor(platform)
+		.map((entry) => `${entry.unicode} (${entry.name})`)
+		.join(", ");
 }
 
 /**

@@ -1127,10 +1127,19 @@ test("RT-DISCORD-04 an inbound custom emoji is custom:name metadata that never b
 	expect(turns).toEqual([]);
 	expect(database.deliveryRows()).toHaveLength(0);
 	expect(database.contextUnread(ORIGIN_KEY, 10)[0]?.body).toBe("[reaction] reacted custom:lobster to message target-1");
-	// And the metadata spelling is not something chat.react would ever accept back.
-	await request(client, "k1", "chat.react", { origin: ORIGIN, targetMessageId: "target-1", emoji: ":lobster" });
+	// The exact metadata spelling cannot round-trip into an outbound reaction: feed
+	// back what describeInboundReaction actually produced, not a hand-written string,
+	// or the assertion proves nothing about the spelling under test.
+	await request(client, "k1", "chat.react", {
+		origin: ORIGIN,
+		targetMessageId: "target-1",
+		emoji: described?.emoji,
+	});
 	await settle();
 	expect(errorFrame(client.frames, "k1").error.message).toContain("outside the reaction allowlist");
+	// The old `:name:` spelling did resolve, which is why it was changed.
+	expect(resolveReactionEmoji(":lobster:")).toEqual({ name: "lobster", unicode: "🦞" });
+	expect(resolveReactionEmoji(described?.emoji ?? "")).toBeUndefined();
 });
 
 // ---------------------------------------------------------------------------

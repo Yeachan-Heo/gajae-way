@@ -989,6 +989,15 @@ async function runInboundTurn(
 		if (!replyText) {
 			// Reaction-only acknowledgement: nothing is spoken, but the turn happened and
 			// is captured with its token text so memory records what was acknowledged.
+			//
+			// If every reaction here was skipped — capped, duplicated, or not expressible
+			// on this platform — the turn ends having emitted nothing at all, and the
+			// daemon log is the only record. That is deliberate rather than a delivery
+			// failure: no ledger row was ever created, so there is nothing for
+			// gateway.status to show, and delivering the raw `[REACT:…]` token as text
+			// would leak control syntax into the room. The persona is only offered emoji
+			// this origin can actually deliver (see currentConversationNotice), so this
+			// state means it ignored that list.
 			runtime.memory.enqueue({
 				kind: "daily_capture",
 				originRefJson: JSON.stringify(origin),

@@ -219,6 +219,17 @@ test("spaces successive reactions on one channel by the self-imposed floor", asy
 	// Other channels have their own budget, so they are not made to wait.
 	await limiter.run("channel-2", async () => {});
 	expect(slept).toEqual([250]);
+	// Once a channel's deadline has elapsed its entry is evicted, so the map cannot
+	// grow one permanent entry per channel that ever saw a reaction. Eviction must
+	// not cost spacing: after the jump the next call reserves a fresh slot without
+	// waiting, and the one after it waits the full floor again. (The assertion
+	// above is what catches an inverted predicate: deleting a still-live deadline
+	// would drop the 250ms wait entirely.)
+	clock += 1_000;
+	await limiter.run("channel-1", async () => {});
+	expect(slept).toEqual([250]);
+	await limiter.run("channel-1", async () => {});
+	expect(slept).toEqual([250, 250]);
 });
 
 test("inbound reactions ignore our own bot and describe human adds and removes identically", () => {

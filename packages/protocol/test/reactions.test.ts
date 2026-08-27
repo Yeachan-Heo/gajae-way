@@ -3,10 +3,12 @@ import {
 	isPlatformMessageId,
 	isSilenceToken,
 	parseReactionReply,
+	platformSupportsReaction,
 	REACTION_ALLOWLIST,
 	REACTIONS_PER_MESSAGE_CAP,
 	REACTIONS_PER_TURN_CAP,
 	reactionAllowlistDescription,
+	reactionAllowlistFor,
 	resolveReactionEmoji,
 } from "../src/index";
 
@@ -30,12 +32,27 @@ describe("reaction allowlist", () => {
 			expect(resolveReactionEmoji(input)).toBeUndefined();
 	});
 
-	test("the rejection description names what IS accepted", () => {
-		const description = reactionAllowlistDescription();
+	test("the rejection description names what IS accepted, per platform", () => {
+		const discord = reactionAllowlistDescription("discord");
 		for (const entry of REACTION_ALLOWLIST) {
-			expect(description).toContain(entry.unicode);
-			expect(description).toContain(entry.name);
+			expect(discord).toContain(entry.unicode);
+			expect(discord).toContain(entry.name);
 		}
+		// Telegram cannot express these three, so it must never be told to try. The
+		// authoritative 73-emoji set lives in the Telegram adapter, whose tests assert
+		// this list matches it exactly in both directions.
+		const telegram = reactionAllowlistDescription("telegram");
+		for (const [unicode, name] of [
+			["✅", "check"],
+			["❌", "cross"],
+			["🦞", "lobster"],
+		] as const) {
+			expect(telegram).not.toContain(unicode);
+			expect(telegram).not.toContain(name);
+			expect(platformSupportsReaction("telegram", name)).toBe(false);
+			expect(platformSupportsReaction("discord", name)).toBe(true);
+		}
+		expect(reactionAllowlistFor("telegram")).toHaveLength(REACTION_ALLOWLIST.length - 3);
 	});
 
 	test("caps are bounded and small", () => {
