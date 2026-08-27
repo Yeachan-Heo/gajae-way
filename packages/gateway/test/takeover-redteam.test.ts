@@ -566,7 +566,8 @@ test("a pretty-printed multiline credential array is redacted whole", () => {
 test("the rebind budget survives a gateway restart via durable counters", async () => {
 	const database = await makeDatabase("gajaeway-takeover-durable-");
 	const logs: string[] = [];
-	const spawn = (() => fakeChild(createFailure("resource_gone", "session endpoint record is gone"), "", 1)) as unknown as typeof Bun.spawn;
+	const spawn = (() =>
+		fakeChild(createFailure("resource_gone", "session endpoint record is gone"), "", 1)) as unknown as typeof Bun.spawn;
 	try {
 		const first = new GjcClient(database, 5_000, directory, undefined, { spawn, log: (line) => logs.push(line) });
 		for (let attempt = 0; attempt < DEFAULT_REBIND_CAP; attempt++)
@@ -591,7 +592,8 @@ test("the rebind budget survives a gateway restart via durable counters", async 
 test("a corrupted durable counter fails CLOSED: rebinds blocked, no epoch consumed, /new restores", async () => {
 	const database = await makeDatabase("gajaeway-takeover-corrupt-");
 	const logs: string[] = [];
-	const spawn = (() => fakeChild(createFailure("resource_gone", "session endpoint record is gone"), "", 1)) as unknown as typeof Bun.spawn;
+	const spawn = (() =>
+		fakeChild(createFailure("resource_gone", "session endpoint record is gone"), "", 1)) as unknown as typeof Bun.spawn;
 	try {
 		// Corrupt the durable counter BEFORE any hydration, as a crash mid-write would.
 		database.metaSet("rebind_budget:discord:dm:c6", "{not-json-at-all");
