@@ -29,8 +29,17 @@ export interface EngagementContext {
 	readonly group: boolean;
 	/** Platform-scoped author id of the inbound message. */
 	readonly authorId: string;
-	/** Human-readable author name when the platform provides one. */
+	/**
+	 * Name to address the author by: the per-surface display name a reader in the
+	 * room actually sees, not the account handle. On Discord that is the guild
+	 * nickname, then the global display name, then the handle.
+	 */
 	readonly authorName?: string;
+	/**
+	 * Raw platform handle, kept separately for identification and logs. Prefer
+	 * `authorName` when speaking to or about the author.
+	 */
+	readonly authorHandle?: string;
 	/** Human-readable conversation label (channel/group name) when available. */
 	readonly channelLabel?: string;
 	/** Human-readable server/guild/workspace label when the platform has one above the channel. */
