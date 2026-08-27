@@ -365,7 +365,7 @@ function firstDiagnosis(...candidates: (string | undefined)[]): string | undefin
  * reporting that as a bare `[turn failed]` is precisely the zero-diagnosis line
  * #14 exists to remove, so the gateway's own framing is used as the fallback.
  */
-export function describeFailure(error: unknown): RuntimeErrorDetail & { readonly text: string } {
+function describeFailure(error: unknown): RuntimeErrorDetail & { readonly text: string } {
 	// The code reaches a chat surface too, so it is normalized, then redacted, then
 	// bounded — a secret pasted into a code field must not ride along, and control
 	// characters must not be able to smuggle it past the redactor.

@@ -10,6 +10,7 @@ import {
 	formatFailureNotice,
 	GjcRuntimeError,
 	isRebindableCode,
+	REBINDABLE_ERROR_CODES,
 	RebindCapExceededError,
 	rebindableCodeOf,
 	redactSecrets,
@@ -106,6 +107,19 @@ test("an unrelated code is a genuine failure, not a rebindable one", () => {
 	});
 	expect(rebindableCodeOf(lookalike)).toBeUndefined();
 	expect(rebindableCodeOf(new Error("spawn_failed"))).toBeUndefined();
+});
+
+test("the rebindable set is exactly the four measured codes", () => {
+	// Pinned at the source of truth: the incident produced exactly these four, so
+	// widening the set has to break a test rather than slip in.
+	expect([...REBINDABLE_ERROR_CODES].sort()).toEqual([
+		"managed_append_identity_mismatch",
+		"resource_gone",
+		"spawn_failed",
+		"terminal_uncertain",
+	]);
+	expect(REBINDABLE_ERROR_CODES.has("rebind_cap_exceeded")).toBe(false);
+	expect(REBINDABLE_ERROR_CODES.has("turn_not_replayed")).toBe(false);
 });
 
 test("the structured error code is parsed out of the runtime envelope, not the message", () => {
