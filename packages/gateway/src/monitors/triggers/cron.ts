@@ -103,18 +103,17 @@ export function startCron(
 			// current minute itself matches the schedule; caller-side slot claims
 			// keep it exactly-once per slot.
 			minute = epoch;
-			cronSlotsBetween(schedule, new Date(date.getTime() - CATCH_UP_WINDOW_MS), date, budget, fire);
+			cronSlotsBetween(schedule, new Date(date.getTime() - CATCH_UP_WINDOW_MS - 60_000), date, budget, fire);
 			return;
 		}
 		minute = epoch;
-		if (cronMatches(schedule, date)) {
-			fire(date);
-			return;
-		}
-		// Not a due minute — but a long suspension may have skipped due slots
-		// between ticks; scan the bounded window (caller dedupes already-fired
-		// slots, so this only fires genuinely missed ones).
-		cronSlotsBetween(schedule, new Date(date.getTime() - CATCH_UP_WINDOW_MS), date, budget, fire);
+		// Always scan the full bounded window INCLUDING the current minute: a
+		// suspension can skip earlier due slots even when the current minute also
+		// matches (e.g. */30, prior tick 06:00, resume 07:30 — the 06:30 and 07:00
+		// slots must be considered alongside 07:30). Dedupe-first admission makes
+		// re-considered slots cheap no-ops. The extra minute padding keeps the
+		// boundary slot (now-60m exactly) inside the half-open scan.
+		cronSlotsBetween(schedule, new Date(date.getTime() - CATCH_UP_WINDOW_MS - 60_000), date, budget, fire);
 	};
 	tick();
 	const timer = setInterval(tick, options.intervalMs ?? 30_000);

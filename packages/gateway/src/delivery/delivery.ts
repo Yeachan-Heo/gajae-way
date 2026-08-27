@@ -5,7 +5,7 @@ import {
 	originKey,
 	type ReactionRef,
 } from "@gajaeway/protocol";
-import type { DeliveryLedger } from "../store/ledger";
+import { type LedgerOutcome, DeliveryLedger } from "../store/ledger";
 
 export class DeliveryService {
 	readonly #ledger: DeliveryLedger;
@@ -72,10 +72,10 @@ export class DeliveryService {
 	markInflight(deliveryId: string): void {
 		this.#ledger.markInflight(deliveryId);
 	}
-	confirm(deliveryId: string): boolean {
+	confirm(deliveryId: string): LedgerOutcome {
 		return this.#ledger.confirm(deliveryId);
 	}
-	fail(deliveryId: string, ambiguous?: boolean): boolean {
+	fail(deliveryId: string, ambiguous?: boolean): LedgerOutcome {
 		return this.#ledger.fail(deliveryId, ambiguous);
 	}
 	redeliveries(): ChatMessagePayload[] {

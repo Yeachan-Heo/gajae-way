@@ -175,9 +175,11 @@ test("RT-29 ledger monotonicity: late fail after confirmed is a no-op on the led
 		verb: "delivery.fail",
 		params: { deliveryId: ctx.deliveryId, reason: "stale retry", ambiguous: true },
 	});
-	await response(ctx.frames, "late-fail");
+	const lateFail = await response(ctx.frames, "late-fail");
+	// Terminal duplicate gets an idempotent SUCCESS ack (not invalid_params)...
+	expect(lateFail.result).toEqual({ recorded: true });
 	const row = ctx.db.deliveryRows().find((row) => row.delivery_id === ctx.deliveryId);
-	// Terminal confirmed is never rewritten to failed_ambiguous/pending.
+	// ...while the terminal confirmed state is never rewritten.
 	expect(row?.state).toBe("confirmed");
 	// And the monitor events stay delivered (already covered by the other test).
 });
@@ -199,6 +201,19 @@ test("RT-29 ledger monotonicity: expired row cannot be resurrected by a late con
 	expect(ctx.db.deliveryRows().find((row) => row.delivery_id === ctx.deliveryId)?.state).toBe("expired");
 	// A late confirm cannot resurrect an expired delivery:
 	ctx.send({ v: "0.1", type: "request", id: "late-confirm", verb: "delivery.confirm", params: { deliveryId: ctx.deliveryId } });
-	await response(ctx.frames, "late-confirm");
+	const lateConfirm = await response(ctx.frames, "late-confirm");
+	// Expired is terminal: idempotent success ack, state unchanged.
+	expect(lateConfirm.result).toEqual({ settled: true });
 	expect(ctx.db.deliveryRows().find((row) => row.delivery_id === ctx.deliveryId)?.state).toBe("expired");
+	// An UNKNOWN delivery id is still invalid_params (an error frame):
+	ctx.send({ v: "0.1", type: "request", id: "unknown-id", verb: "delivery.confirm", params: { deliveryId: "nope" } });
+	for (let attempt = 0; attempt < 400; attempt++) {
+		const frame = ctx.frames.find((f) => f.id === "unknown-id");
+		if (frame) {
+			expect(frame.type).toBe("error");
+			expect((frame as { error: { code: string } }).error.code).toBe("invalid_params");
+			break;
+		}
+		await Bun.sleep(5);
+	}
 });

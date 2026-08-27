@@ -584,6 +584,103 @@ WHERE excluded.acquired_at IS NOT NULL AND (SELECT expires_at FROM dispatch_leas
 			.run(new Date(now + ttlMs).toISOString(), eventId, leaseId);
 		return true;
 	}
+	/**
+	 * Fenced stage transition (round-3 blocker 1): the lease ownership check and
+	 * the stage write happen atomically in ONE UPDATE — the WHERE clause includes
+	 * a live-lease subquery, so a lease stolen between the caller's check and the
+	 * write cannot be exploited (no TOCTOU). Returns true when this attempt's
+	 * write actually landed.
+	 */
+	monitorEventFencedUpdate(
+		eventId: string,
+		leaseId: string,
+		stage: MonitorEventStage,
+		batchId: string | null = null,
+		now = Date.now(),
+	): boolean {
+		if (!MONITOR_EVENT_STAGES.includes(stage)) throw new Error(`unknown monitor event stage: ${stage}`);
+		const changes = this.#database
+			.query(
+				`UPDATE monitor_events SET stage = ?, batch_id = COALESCE(?, batch_id), updated_at = ?
+WHERE event_id = ? AND EXISTS (
+SELECT 1 FROM dispatch_leases l WHERE l.event_id = monitor_events.event_id AND l.lease_id = ? AND l.expires_at > ?
+)`,
+			)
+			.run(stage, batchId, new Date(now).toISOString(), eventId, leaseId, new Date(now).toISOString()).changes;
+		return changes > 0;
+	}
+	/**
+	 * Fenced output write: authored_outputs upsert + authored stage transition in
+	 * one transaction, both gated on the live lease. A stale attempt cannot write
+	 * its note over the newer attempt's.
+	 */
+	monitorEventFencedAuthor(eventId: string, leaseId: string, note: string, noDelivery = false, now = Date.now()): boolean {
+		return this.withTransaction(() => {
+			const changes = this.#database
+				.query(
+					`UPDATE monitor_events SET stage = ?, updated_at = ?
+WHERE event_id = ? AND EXISTS (
+SELECT 1 FROM dispatch_leases l WHERE l.event_id = monitor_events.event_id AND l.lease_id = ? AND l.expires_at > ?
+)`,
+				)
+				.run(noDelivery ? "authored_no_delivery" : "authored", new Date(now).toISOString(), eventId, leaseId, new Date(now).toISOString()).changes;
+			if (changes === 0) return false;
+			this.authoredOutputCreate(eventId, note);
+			return true;
+		});
+	}
+	/**
+	 * Fenced delivery admission (round-3 blocker 1): the pending delivery row is
+	 * inserted only if EVERY given event still holds leaseId live, checked in the
+	 * same transaction as the insert. Returns false (nothing written) when any
+	 * event's lease was lost — a stale attempt can never emit.
+	 */
+	monitorDeliveryPrepareFenced(
+		deliveryId: string,
+		batchId: string,
+		originKey: string,
+		payloadJson: string,
+		eventIds: readonly string[],
+		leaseId: string,
+		now = Date.now(),
+	): boolean {
+		return this.withTransaction(() => {
+			for (const eventId of eventIds) {
+				const lease = this.#database
+					.query<{ lease_id: string; expires_at: string }, [string]>(
+						"SELECT lease_id, expires_at FROM dispatch_leases WHERE event_id = ?",
+					)
+					.get(eventId);
+				if (!lease || lease.lease_id !== leaseId || Date.parse(lease.expires_at) <= now) return false;
+			}
+			const nowIso = new Date(now).toISOString();
+			this.#database
+				.query(
+					"INSERT INTO deliveries (delivery_id, turn_id, origin_key, payload_json, state, attempts, created_at, updated_at) VALUES (?, ?, ?, ?, 'pending', 0, ?, ?)",
+				)
+				.run(deliveryId, batchId, originKey, payloadJson, nowIso, nowIso);
+			return true;
+		});
+	}
+	/**
+	 * Fenced failure write: failed stage + public-safe evidence row in one
+	 * transaction, both gated on the live lease (round-3 blocker 1).
+	 */
+	monitorEventFencedFail(eventId: string, leaseId: string, batchId: string, code: string, detail: string, now = Date.now()): boolean {
+		return this.withTransaction(() => {
+			const changes = this.#database
+				.query(
+					`UPDATE monitor_events SET stage = 'failed', batch_id = ?, updated_at = ?
+WHERE event_id = ? AND EXISTS (
+SELECT 1 FROM dispatch_leases l WHERE l.event_id = monitor_events.event_id AND l.lease_id = ? AND l.expires_at > ?
+)`,
+				)
+				.run(batchId, new Date(now).toISOString(), eventId, leaseId, new Date(now).toISOString()).changes;
+			if (changes === 0) return false;
+			this.monitorFailureRecord(eventId, code, detail);
+			return true;
+		});
+	}
 	/** True while the given lease is the live claim for the event. */
 	monitorEventLeaseHeld(eventId: string, leaseId: string, now = Date.now()): boolean {
 		const row = this.#database

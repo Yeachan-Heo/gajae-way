@@ -1,6 +1,7 @@
 import {
 	CATCH_ALL_EVENT_ORIGIN,
 	type ChatMessagePayload,
+	isSilenceToken,
 	eventTypeOrigin,
 	type MonitorEventRecord,
 	type OriginRef,
@@ -47,6 +48,7 @@ export class MonitorPropagator {
 	readonly #emit: (event: MonitorEventRecord) => void;
 	readonly #ownerTarget: { readonly origin: OriginRef } | undefined;
 	readonly #deliver: ((payload: ChatMessagePayload) => void) | undefined;
+	readonly #now: () => number;
 	#batches = new Map<string, { eventIds: string[]; timer: ReturnType<typeof setTimeout> }>();
 	/** Event ids this process is dispatching right now, so reconcile never double-runs them. */
 	#inFlight = new Set<string>();
@@ -63,6 +65,8 @@ export class MonitorPropagator {
 		ownerTarget?: { readonly origin: OriginRef };
 		/** Broadcasts a prepared chat.message to live adapter connections. */
 		deliver?: (payload: ChatMessagePayload) => void;
+		/** Injectable clock for deterministic lease expiry/renewal in tests. */
+		now?: () => number;
 	}) {
 		this.#database = options.database;
 		this.#registry = options.registry;
@@ -72,6 +76,7 @@ export class MonitorPropagator {
 		this.#emit = options.emit;
 		this.#ownerTarget = options.ownerTarget;
 		this.#deliver = options.deliver;
+		this.#now = options.now ?? (() => Date.now());
 	}
 	/** Cancels pending burst timers so a closed database is never touched after shutdown. */
 	dispose(): void {
@@ -193,7 +198,7 @@ export class MonitorPropagator {
 					// means the authoring turn may still complete elsewhere; a new
 					// process must not re-author concurrently. Only unclaimed events
 					// are reclaimed here (the dispatcher acquires its own lease).
-					if (this.#database.monitorEventLiveLeaseOwner(row.event_id)) continue;
+					if (this.#database.monitorEventLiveLeaseOwner(row.event_id, this.#now())) continue;
 					if (row.dispatch_attempts >= MONITOR_EVENT_MAX_DISPATCH_ATTEMPTS) {
 						this.#database.withTransaction(() =>
 							this.#database.monitorEventUpdate(row.event_id, "failed_no_retry", null),
@@ -243,13 +248,14 @@ export class MonitorPropagator {
 		// gateway process whose reconcile sees the stranded `batched` rows will NOT
 		// re-author while this attempt is live. Events whose lease is held by a
 		// live claim from another attempt are skipped here.
+		const now = this.#now;
 		const owner = `gateway:${process.pid}`;
 		const leaseId = crypto.randomUUID();
 		const leaseTtlMs = 10 * 60_000;
 		const leased: typeof rows = [];
 		for (const row of rows) {
-			if (this.#database.monitorEventLiveLeaseOwner(row.event_id)) continue;
-			this.#database.monitorEventAcquireLease(row.event_id, owner, leaseId, leaseTtlMs);
+			if (this.#database.monitorEventLiveLeaseOwner(row.event_id, now())) continue;
+			this.#database.monitorEventAcquireLease(row.event_id, owner, leaseId, leaseTtlMs, now());
 			leased.push(row);
 		}
 		if (!leased.length) return;
@@ -283,11 +289,13 @@ export class MonitorPropagator {
 			// Lease fencing: after an await, this attempt may no longer own the
 			// claim (expired + stolen). Every write below is conditional on the
 			// live lease; a stale attempt's completion becomes a no-op.
-			const fenced = leased.filter((row) => this.#holdsLease(row.event_id, leaseId));
+			// Atomic fencing: each stage write carries its live-lease check in the
+			// same UPDATE, so a lease stolen between check and write cannot be
+			// exploited (TOCTOU-free). `fenced` = rows whose write landed.
+			const fenced = leased.filter((row) =>
+				this.#database.monitorEventFencedUpdate(row.event_id, leaseId, "dispatched", batchId),
+			);
 			if (!fenced.length) return;
-			this.#database.withTransaction(() => {
-				for (const row of fenced) this.#database.monitorEventUpdate(row.event_id, "dispatched", batchId);
-			});
 			const authored = JSON.parse(response) as Array<{ eventId?: unknown; note?: unknown }>;
 			if (!Array.isArray(authored)) throw new Error("authoring response is not an array");
 			for (const entry of authored)
@@ -295,8 +303,27 @@ export class MonitorPropagator {
 					typeof entry.eventId === "string" &&
 					fenced.some((row) => row.event_id === entry.eventId) &&
 					typeof entry.note === "string"
-				)
-					this.#author(entry.eventId, entry.note);
+				) {
+					const authoredOk = this.#database.monitorEventFencedAuthor(entry.eventId, leaseId, entry.note);
+					if (!authoredOk) continue;
+					// Memory closure mirrors #author for the fenced path.
+					const row = this.#database.monitorEventRows().find((candidate) => candidate.event_id === entry.eventId);
+					if (row) {
+						this.#memory.enqueue({
+							kind: "monitor-event",
+							originRefJson: JSON.stringify(eventTypeOrigin(row.event_type)),
+							userText: `Monitor event ${entry.eventId}: ${row.event_type}`,
+							replyText: entry.note,
+						});
+					}
+					this.#emit({
+						eventId: entry.eventId,
+						monitorId: row?.monitor_id ?? "",
+						eventType: row?.event_type ?? "",
+						firedAt: row?.fired_at ?? new Date().toISOString(),
+						stage: "authored",
+					});
+				}
 			// A monitor without its own channel target reports to the configured owner
 			// target when one exists: a personal agent's maintenance and event notes go
 			// to the owner by default rather than vanishing into the logs. With no
@@ -304,44 +331,63 @@ export class MonitorPropagator {
 			// instead of pretending a delivery is still pending (issue #29 defect 3).
 			const target = monitor.channelTarget ?? this.#ownerTarget;
 			if (!target) {
-				this.#database.withTransaction(() => {
-					for (const row of fenced)
-						if (this.#database.authoredOutput(row.event_id) !== undefined)
-							this.#database.monitorEventUpdate(row.event_id, "authored_no_delivery", batchId);
-				});
+				for (const row of fenced) {
+					if (this.#database.authoredOutput(row.event_id) === undefined) continue;
+					this.#database.monitorEventFencedUpdate(row.event_id, leaseId, "authored_no_delivery", batchId);
+				}
 				return;
 			}
-			const delivery = this.#delivery.prepare(
-				batchId,
-				target.origin,
-				authored
-					.filter(
-						(entry): entry is { eventId: string; note: string } =>
-							typeof entry.eventId === "string" &&
-							typeof entry.note === "string" &&
-							fenced.some((row) => row.event_id === entry.eventId),
-					)
-					.map((entry) => entry.note)
-					.join("\n"),
-			);
-			if (delivery) {
-				this.#delivery.markInflight(delivery.deliveryId as string);
+			// Fenced delivery admission: the ledger insert is conditional on every
+			// fenced event still holding its lease (same transaction). A stale
+			// attempt therefore cannot emit a second delivery.
+			const deliveryId = crypto.randomUUID();
+			const deliveryText = authored
+				.filter(
+					(entry): entry is { eventId: string; note: string } =>
+						typeof entry.eventId === "string" &&
+						typeof entry.note === "string" &&
+						fenced.some((row) => row.event_id === entry.eventId),
+				)
+				.map((entry) => entry.note)
+				.join("\n");
+			if (!isSilenceToken(deliveryText)) {
+				const origin = target.origin;
+				const payload: ChatMessagePayload = {
+					turnId: batchId,
+					origin,
+					role: "assistant",
+					text: deliveryText,
+					final: true,
+					deliveryId,
+				};
+				const admitted = this.#database.monitorDeliveryPrepareFenced(
+					deliveryId,
+					batchId,
+					originKey(origin),
+					JSON.stringify(payload),
+					fenced.map((row) => row.event_id),
+					leaseId,
+				);
+				if (!admitted) return;
+				this.#delivery.markInflight(deliveryId);
 				// Push to live adapters NOW: without this the note sat in the ledger
 				// until the next adapter reconnect flushed redeliveries (live finding:
 				// owner-DM canonicalize note stuck inflight for minutes).
-				this.#deliver?.(delivery);
+				this.#deliver?.(payload);
 			}
 		} catch (error) {
 			// Public-safe structured evidence only: a stable phase code and event ids.
 			// The raw error body can carry secrets and is never persisted or logged.
 			const code: DispatchFailureCode = failureCode(error);
-			this.#database.withTransaction(() => {
-				for (const row of leased) {
-					if (!this.#holdsLease(row.event_id, leaseId)) continue;
-					this.#database.monitorEventUpdate(row.event_id, "failed", batchId);
-					this.#database.monitorFailureRecord(row.event_id, code, `dispatch phase failed (${code})`);
-				}
-			});
+			for (const row of leased) {
+				this.#database.monitorEventFencedFail(
+					row.event_id,
+					leaseId,
+					batchId,
+					code,
+					`dispatch phase failed (${code})`,
+				);
+			}
 			console.error(`monitor dispatch failed (${code}): events ${leased.map((row) => row.event_id).join(",")}`);
 		} finally {
 			stopHeartbeat();
@@ -359,19 +405,12 @@ export class MonitorPropagator {
 	#startLeaseHeartbeat(eventIds: string[], leaseId: string, ttlMs: number): () => void {
 		const timer = setInterval(
 			() => {
-				for (const eventId of eventIds) this.#database.monitorEventRenewLease(eventId, leaseId, ttlMs);
+				for (const eventId of eventIds) this.#database.monitorEventRenewLease(eventId, leaseId, ttlMs, this.#now());
 			},
 			Math.max(1000, Math.floor(ttlMs / 3)),
 		);
 		timer.unref?.();
 		return () => clearInterval(timer);
-	}
-	/**
-	 * True when leaseId is still the live claim — the fencing check that gates
-	 * every state/output/failure/delivery write from this dispatch attempt.
-	 */
-	#holdsLease(eventId: string, leaseId: string): boolean {
-		return this.#database.monitorEventLeaseHeld(eventId, leaseId);
 	}
 	#author(eventId: string, note: string, noDelivery = false): void {
 		const row = this.#database.monitorEventRows().find((candidate) => candidate.event_id === eventId);

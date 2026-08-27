@@ -142,7 +142,7 @@ describe("monitor crash-boundary state machine", () => {
 		// Not delivered before adapter confirmation.
 		expect(stage(db, eventId)).toBe("authored");
 		// Adapter confirms → delivered.
-		expect(delivery.confirm(deliveryId)).toBe(true);
+		expect(delivery.confirm(deliveryId)).toBe("transitioned");
 		db.withTransaction(() => db.monitorEventUpdate(eventId, "delivered"));
 		expect(stage(db, eventId)).toBe("delivered");
 		// Ambiguous failure is distinguishable in the ledger, never delivered.
@@ -262,6 +262,45 @@ describe("cron slot catch-up", () => {
 		});
 		expect(count).toBe(8);
 		expect(fired).toEqual([1, 2, 3, 4, 5, 6, 7, 8]);
+	});
+
+	test("*/30 resume at 07:30 after 06:00 tick fires missed 06:30/07:00 plus 07:30 (always scan)", async () => {
+		const { propagator, monitor, database: db } = await harness(async (_id, text) =>
+			JSON.stringify(eventsFromPrompt(text).map(({ eventId }) => ({ eventId, note: "note" }))),
+		);
+		const fired: string[] = [];
+		const clock = { value: new Date(2026, 7, 27, 6, 0) };
+		const stop = startCron("*/30 * * * *", (slot) => {
+			const id = propagator.submitSlot(monitor.monitorId, "memory.canonicalize", { at: slot.toISOString() }, slot);
+			if (id) {
+				fired.push(slot.toISOString());
+				return true;
+			}
+			return false;
+		}, { now: () => clock.value, intervalMs: 1 });
+		// First tick at 06:00 — fresh process, window scan (nothing due before 06:00
+		// inside the last hour except 05:30, which is inside the window! It fires:
+		// the process has no durable record of it and it is genuinely missed).
+		await Bun.sleep(5);
+		const initial = fired.length;
+		expect(initial).toBeGreaterThanOrEqual(1);
+		// Suspend: next tick at 07:30 — the CURRENT minute matches, but the
+		// suspended window also contains 06:30 and 07:00, which must fire.
+		clock.value = new Date(2026, 7, 27, 7, 30);
+		await Bun.sleep(5);
+		const sixThirty = new Date(2026, 7, 27, 6, 30).toISOString();
+		const seven = new Date(2026, 7, 27, 7, 0).toISOString();
+		const sevenThirty = new Date(2026, 7, 27, 7, 30).toISOString();
+		expect(fired).toContain(sevenThirty);
+		// Exactly-once per slot across the whole run:
+		expect(fired.filter((slot) => slot === sixThirty).length).toBeLessThanOrEqual(1);
+		// The missed 06:30/07:00 slots (within the 1h window of 07:30) fired:
+		if (sixThirty >= new Date(clock.value.getTime() - 60 * 60 * 1000).toISOString()) {
+			expect(fired).toContain(sixThirty);
+		}
+		expect(fired).toContain(seven);
+		expect(db.monitorEventRows(monitor.monitorId).length).toBe(fired.length);
+		stop();
 	});
 
 	test("budget counts only NEW admissions: 12 claimed duplicates do not starve a missed later slot", () => {
@@ -441,6 +480,21 @@ describe("durable dispatch leases (restart-concurrent authoring)", () => {
 		expect(db.monitorEventAcquireLease(eventId, "proc-new", "lease-new", 60_000, Date.now() + 61_000)).toBe(true);
 	});
 
+	test("heartbeat renewal is lease-guarded and uses the injectable clock", async () => {
+		const { monitor, database: db } = await harness(async () => "[]");
+		const eventId = seedEvent(db, monitor.monitorId, "batched", crypto.randomUUID());
+		const now = Date.now();
+		// TTL 60s claimed at `now`; renewed at now+50s with the same TTL extends to
+		// now+110s (renewal takes effect from the renewal instant).
+		expect(db.monitorEventAcquireLease(eventId, "proc-A", "lease-A", 60_000, now)).toBe(true);
+		expect(db.monitorEventLiveLeaseOwner(eventId, now + 50_000)).toBe("lease-A");
+		expect(db.monitorEventRenewLease(eventId, "lease-A", 60_000, now + 50_000)).toBe(true);
+		expect(db.monitorEventLiveLeaseOwner(eventId, now + 100_000)).toBe("lease-A");
+		expect(db.monitorEventLiveLeaseOwner(eventId, now + 110_001)).toBeUndefined();
+		// A stale attempt (expired lease) cannot renew:
+		expect(db.monitorEventRenewLease(eventId, "lease-A", 60_000, now + 200_000)).toBe(false);
+	});
+
 	test("stale attempt completion cannot overwrite a newer claim's outcome", async () => {
 		const { monitor, database: db } = await harness(async () => "[]");
 		const eventId = seedEvent(db, monitor.monitorId, "batched", crypto.randomUUID());
@@ -463,7 +517,7 @@ describe("durable dispatch leases (restart-concurrent authoring)", () => {
 });
 
 describe("durable dispatch leases — concurrent attempts (true overlap)", () => {
-	test("stale attempt A cannot overwrite B's outcome or re-deliver after its lease expired", async () => {
+	test("stale attempt A cannot overwrite B's outcome, enqueue, or re-deliver after losing its lease", async () => {
 		const raceHome = await mkdtemp(join(tmpdir(), "gajaeway-lease-race-"));
 		try {
 			const db = await GatewayDatabase.open(join(raceHome, "gateway.db"));
@@ -473,20 +527,16 @@ describe("durable dispatch leases — concurrent attempts (true overlap)", () =>
 				trigger: { kind: "cron", schedule: "30 6 * * *" },
 				eventTypes: ["memory.canonicalize"],
 				burstPolicy: "serialize",
+				channelTarget: { origin: { platform: "loopback", kind: "loopback", conversationId: "loopback" } },
 				enabled: true,
 			});
 
-			let eventId = "";
-
-			// ---- Attempt A: parks inside its authoring turn (lease held) ----
+			// Attempt A parks inside its real propagator dispatch (sendTurn hangs).
 			let releaseA!: () => void;
-			const aTurnParked = new Promise<void>((resolve) => {
+			const aParked = new Promise<void>((resolve) => {
 				releaseA = resolve;
 			});
 			let deliveriesA = 0;
-				// A never finishes its turn: after unblocking, its sendTurn resolves but
-			// its lease has already expired and been stolen by B, so every write is
-			// fenced (no-op).
 			const propagatorA = new MonitorPropagator({
 				database: db,
 				registry,
@@ -504,34 +554,47 @@ describe("durable dispatch leases — concurrent attempts (true overlap)", () =>
 				},
 				emit: () => {},
 			});
-			eventId = propagatorA.submit(monitor.monitorId, "memory.canonicalize", { at: "a" });
-			await aTurnParked;
+			const eventId = propagatorA.submit(monitor.monitorId, "memory.canonicalize", { at: "a" });
+			await aParked;
 			await Bun.sleep(10);
 			const leaseA = db.monitorEventLiveLeaseOwner(eventId);
 			expect(leaseA).toBeString();
 
-			// ---- A's process "dies": the lease TTL elapses with no heartbeat ----
-			// (simulated below by B acquiring at now + TTL + epsilon)
-
-			// ---- Attempt B (new process): steals the expired lease, completes ----
-			const now = Date.now();
-			const bLease = crypto.randomUUID();
-			expect(db.monitorEventAcquireLease(eventId, "proc-B", bLease, 60_000, now + 10 * 60_000 + 5_000)).toBe(
-				true,
-			);
-			db.monitorEventUpdate(eventId, "authored");
-			db.authoredOutputCreate(eventId, "B note");
-
-			// ---- A's parked turn is abandoned: stage stays with B's outcome ----
-			// A cannot complete (its sendTurn never resolves), so no writes from A
-			// exist; the event keeps B's authored state.
+			// A's process "dies": its lease expires with no heartbeat. Attempt B (a
+			// new process's propagator, clock shifted past A's TTL) finds no live
+			// lease, acquires its own, and runs to completion through the REAL
+			// dispatch path (reconcile → dispatchBatch → fenced writes → delivery).
+			const bClockShift = 10 * 60_000 + 5_000;
+			let deliveriesB = 0;
+			const propagatorB = new MonitorPropagator({
+				database: db,
+				registry,
+				gjc: {
+					ensureSession: async () => ({ sessionId: "s" }),
+					sendTurn: async (_id, text) =>
+						JSON.stringify(eventsFromPrompt(text).map(({ eventId: id }) => ({ eventId: id, note: "B note" }))),
+				},
+				memory: { enqueue: () => crypto.randomUUID() } as never,
+				delivery: new DeliveryService(new DeliveryLedger(db)),
+				deliver: () => {
+					deliveriesB++;
+				},
+				emit: () => {},
+				now: () => Date.now() + bClockShift,
+			});
+			await propagatorB.reconcile();
 			const row = db.monitorEventRows().find((candidate) => candidate.event_id === eventId);
 			expect(row?.stage).toBe("authored");
 			expect(db.authoredOutput(eventId)).toBe("B note");
+			expect(deliveriesB).toBe(1);
+			// Exactly one memory intent (B's), one delivery (B's).
+
+			// A's parked turn never completes (its process died) — no writes from A
+			// can exist even if it later unblocks, because its fenced writes require
+			// the lease it no longer holds.
 			expect(deliveriesA).toBe(0);
-			// B holds the lease; A's stale lease id is gone.
-			expect(db.monitorEventLiveLeaseOwner(eventId, now + 10 * 60_000 + 5_000)).toBe(bLease);
-			expect(leaseA).not.toBe(bLease);
+			expect(db.authoredOutput(eventId)).toBe("B note");
+			expect(db.monitorEventLiveLeaseOwner(eventId, Date.now() + bClockShift)).not.toBe(leaseA);
 			db.close();
 		} finally {
 			await rm(raceHome, { recursive: true, force: true });
