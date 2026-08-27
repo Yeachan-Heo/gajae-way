@@ -424,7 +424,7 @@ test("work.run records a durable lane job and work.jobs projects it (issue #10)"
 	const run = client.frames.find((frame) => frame.type === "response" && frame.id === "w");
 	expect(run.result).toMatchObject({ held: false, text: "worker result" });
 	const jobId = run.result.jobId;
-	expect(jobId).toMatch(/^lanejob-work-repo-fix-2-[0-9a-z]+$/);
+	expect(jobId).toBe(`lanejob-work-${Buffer.from("Repo.Fix-2", "utf8").toString("hex")}`);
 
 	client.send({ v: "0.1", type: "request", id: "jobs", verb: "work.jobs" });
 	await waitFor(client.frames, 3);
@@ -462,12 +462,15 @@ test("work.run records a durable lane job and work.jobs projects it (issue #10)"
 			attempts: [{ ...parsed.attempts[0], endState: undefined, endedAt: undefined }],
 		}),
 	});
+	const manipulated = JSON.parse(database.laneJobJson(jobId) as string);
+	console.log("MANIPULATED:", JSON.stringify(manipulated.attempts), manipulated.state);
 	client.send({ v: "0.1", type: "request", id: "w2", verb: "work.run", params: { name: "Repo.Fix-2", text: "again" } });
 	async function waitId(id: string): Promise<void> {
 		for (let attempt = 0; attempt < 400 && !client.frames.some((f) => f.id === id); attempt++) await Bun.sleep(5);
 	}
 	await waitId("w2");
-	const held = client.frames.find((frame) => frame.type === "response" && frame.id === "w2");
+	const held = client.frames.find((frame) => frame.id === "w2" && frame.type !== undefined);
+	expect(held.type).toBe("response");
 	expect(held.result).toMatchObject({ held: true, state: "awaiting_operator" });
 	expect(held.result.reason).toMatch(/terminally uncertain/);
 

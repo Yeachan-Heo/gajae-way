@@ -29,6 +29,8 @@ import {
 	applyReconciliation,
 	closeAttempt,
 	createLaneJobRecord,
+	hasNewCommit,
+	LaneJobError,
 	type LaneJobRecord,
 	newOpRef,
 	parseLaneJobRecord,
@@ -69,14 +71,12 @@ import { composeSpeakerLabel, composeTurnHeader } from "./speaker";
  */
 function laneJobIdentity(workName: string): { jobId: string; laneKey: string } {
 	const laneKey = `work-${workName}`;
-	// Collision-free: the slug is lossy, so a 32-bit FNV-1a of the EXACT name
-	// distinguishes Foo/foo, a.b/a_b, and a-b/a_b while staying [a-z0-9-].
-	let hash = 0x811c9dc5;
-	for (const byte of Buffer.from(workName, "utf8")) {
-		hash = ((hash ^ byte) * 0x01000193) >>> 0;
-	}
-	const slug = `${workName.toLowerCase().replace(/[^a-z0-9]+/g, "-")}-${hash.toString(36)}`;
-	return { jobId: `lanejob-work-${slug}`, laneKey };
+	// The jobId is INJECTIVE: each UTF-8 byte of the exact name becomes two hex
+	// digits, so distinct names (Foo/foo, a.b/a_b) always map to distinct ids
+	// while staying within the [a-z0-9-] jobId alphabet. 64-byte names cap at
+	// 128 hex chars + the prefix, inside the schema's id length bound.
+	const hex = Buffer.from(workName, "utf8").toString("hex");
+	return { jobId: `lanejob-work-${hex}`, laneKey };
 }
 
 function persistLaneJob(database: GatewayDatabase, record: LaneJobRecord, laneKey: string): void {
@@ -124,18 +124,38 @@ async function loadOrCreateLaneJob(
 	workCwd: string,
 ): Promise<LaneJobRecord> {
 	const { jobId, laneKey } = laneJobIdentity(workName);
-	const stored = database.laneJobJson(jobId);
+	// The exact lane key (original name, case- and dot-faithful) is the
+	// authoritative lookup; the derived jobId is only a storage id.
+	const stored = database.laneJobJsonByLaneKey(laneKey) ?? database.laneJobJson(jobId);
 	if (stored !== undefined) {
-		return parseLaneJobRecord(stored);
+		const existing = parseLaneJobRecord(stored);
+		if (existing.lane.worktreePath !== workCwd) {
+			// Same worker name re-pointed at a different worktree is a lane
+			// mismatch: fail closed instead of reconciling one lane's commits
+			// into another lane's history.
+			throw new LaneJobError(
+				`worker ${workName} is bound to worktree ${existing.lane.worktreePath}, not ${workCwd}; use a different name or restore the original cwd`,
+			);
+		}
+		return existing;
 	}
 	// The lane block describes the REAL lane: actual worktree, actual branch
 	// when git can tell us, deterministic fallback otherwise.
 	const facts = await collectRepoFacts(workCwd);
-	const created = createLaneJobRecord({
+	let created = createLaneJobRecord({
 		jobId,
 		branch: facts?.branch ?? `work/${workName.toLowerCase().replace(/[^a-z0-9._/-]+/g, "-")}`,
 		worktreePath: workCwd,
 	});
+	if (facts?.headSha) {
+		// Seed the baseline HEAD so the pre-existing commit is never later
+		// reported as a worker checkpoint: only moves BEYOND this SHA count.
+		created = applyReconciliation({
+			record: created,
+			repository: { headSha: facts.headSha, dirtyFiles: facts.dirtyFiles, observedAt: new Date().toISOString() },
+			classification: "held",
+		});
+	}
 	persistLaneJob(database, created, laneKey);
 	return created;
 }
@@ -497,6 +517,18 @@ async function handleRequest(
 				// deterministic planner path for an uncertain attempt is an operator
 				// hold, not an automatic continuation. `resume: true` is the explicit
 				// operator acknowledgement that lets the next attempt start.
+				// The awaiting_operator hold is STICKY: it survives restarts and
+				// every subsequent call until an operator explicitly resumes, so a
+				// genuinely uncertain predecessor can never be racing a new one.
+				if (prior.state === "awaiting_operator" && params.resume !== true) {
+					return {
+						held: true as const,
+						jobId,
+						state: prior.state,
+						reason:
+							"the job is awaiting_operator after a crash/uncertain attempt; reconcile, then re-run with resume: true",
+					};
+				}
 				const openPrior = prior.attempts.find((attempt) => attempt.endedAt === undefined);
 				let uncertain: LaneJobRecord | undefined;
 				if (openPrior) {
@@ -535,6 +567,12 @@ async function handleRequest(
 					// worktree is the authoritative checkpoint.
 					const facts = await collectRepoFacts(effectiveCwd);
 					if (facts) {
+						const progressed = hasNewCommit({
+							headSha: facts.headSha,
+							dirtyFiles: facts.dirtyFiles,
+							observedAt: new Date().toISOString(),
+							knownCheckpoints: job.checkpoints,
+						});
 						job = applyReconciliation({
 							record: job,
 							repository: {
@@ -542,7 +580,7 @@ async function handleRequest(
 								dirtyFiles: facts.dirtyFiles,
 								observedAt: new Date().toISOString(),
 							},
-							classification: "progressed",
+							classification: progressed ? "progressed" : "held",
 						});
 					}
 					persistLaneJob(options.database, job, laneKey);
@@ -560,6 +598,27 @@ async function handleRequest(
 						errorCode: reaped ? "gateway_turn_reaped" : undefined,
 						endedAt: new Date().toISOString(),
 					});
+					// Repository first HERE TOO: the measured #9 shape is commits
+					// landing right up to (or past) the kill; the repo, not the
+					// failure, decides whether progress happened.
+					const facts = await collectRepoFacts(effectiveCwd);
+					if (facts) {
+						const progressed = hasNewCommit({
+							headSha: facts.headSha,
+							dirtyFiles: facts.dirtyFiles,
+							observedAt: new Date().toISOString(),
+							knownCheckpoints: job.checkpoints,
+						});
+						job = applyReconciliation({
+							record: job,
+							repository: {
+								...(facts.headSha ? { headSha: facts.headSha } : {}),
+								dirtyFiles: facts.dirtyFiles,
+								observedAt: new Date().toISOString(),
+							},
+							classification: progressed ? "progressed" : "held",
+						});
+					}
 					persistLaneJob(options.database, job, laneKey);
 					throw new Error(failureMessage);
 				}

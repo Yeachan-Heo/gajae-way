@@ -279,11 +279,26 @@ export interface WorkRunParams {
 	readonly text: string;
 	/** Working directory for the worker session (e.g. a repo checkout). */
 	readonly cwd?: string;
+	/**
+	 * Explicit operator acknowledgement that lets a new attempt start while
+	 * the durable job is awaiting_operator (issue #10 hold semantics).
+	 */
+	readonly resume?: boolean;
 }
-export interface WorkRunResult {
-	readonly text: string;
-	readonly sessionKey: string;
-}
+/**
+ * Either a held outcome (the durable job is awaiting_operator after a crash /
+ * restart and nothing ran) or a completed attempt carrying its durable job and
+ * op identities.
+ */
+export type WorkRunResult =
+	| { readonly held: true; readonly jobId: string; readonly state: string; readonly reason: string }
+	| {
+			readonly held: false;
+			readonly text: string;
+			readonly sessionKey: string;
+			readonly jobId: string;
+			readonly opRef: string;
+	  };
 
 /** Operator projection over durable lane jobs (issue #10). */
 export interface WorkJobsResult {

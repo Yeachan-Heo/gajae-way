@@ -1,8 +1,8 @@
 {
  "kind": "api-package-test-report",
  "schemaVersion": 1,
- "frozenCommit": "259e635 (exact head of feat/issue-10-lane-jobs-takeover; merge-base origin/main 6bd9759)",
- "producedBy": "ultragoal leader after terminal-critic REJECT round 1; every command below was re-run at this exact head",
+ "frozenCommit": "23b70c5 (validated executable commit: every command in rerunCommands was executed at this tree; tsc exit 0, bun test packages/ 890 pass / 0 fail / 2 skip, bunx biome ci packages/ exit 0)",
+ "producedBy": "ultragoal leader after terminal-critic REJECT rounds 1-3; each round's blockers were fixed in code and this report was updated in the same series (report-only commits change no executable code)",
  "rerunCommands": [
   "bun install --frozen-lockfile (clean, 43 installs checked)",
   "bun x tsc --noEmit (exit 0)",
@@ -81,13 +81,17 @@
  ],
  "residuals": [],
  "blockers": [],
- "validatedSourceCommit": "259e635 -> 23b70c5 (all executable code; full suite re-run at 23b70c5: tsc exit 0, bun test packages/ 890 pass / 0 fail / 2 skip, bunx biome ci packages/ exit 0)",
- "reportIdentity": "This file lives in the tree it reports on; the report-only commit that last touched it is recorded in git history and changes no executable code, so the validation receipts above remain the authoritative counts for the branch head that contains this file.",
  "criticRound2Fixes": [
   "work.run holds (awaiting_operator + held response) on a terminally uncertain crashed predecessor; continuation requires explicit resume:true",
   "gateway inactivity reaper closes attempts as attempt_ended (errorCode gateway_turn_reaped), not flat failed",
   "repository-first reconciliation runs in production: worktree HEAD moves become durable checkpoints via applyReconciliation",
   "collision-free identity lanejob-work-<slug>-<fnv1a32(exact name)>; lane block records the real worktree and actual git branch",
   "parse rejects endedAt/endState mismatches and non-last open attempts; work.jobs re-validates record JSON and flags corrupt rows"
+ ],
+ "reportIdentity": "Report-bearing commits after 23b70c5 (bfc219d, 86c6abd, and the commit adding this text) touch only this JSON file; the validated executable tree is 23b70c5 exactly.",
+ "criticRound3Fixes": [
+  "awaiting_operator hold is sticky: every work.run on a held job refuses to run until resume:true; held/resume contract typed in WorkRunParams/WorkRunResult and surfaced in the CLI (--resume, HELD output)",
+  "repository-first reconciliation now runs on EVERY attempt end including reaped/failed ones; creation seeds the baseline HEAD checkpoint so the pre-existing commit is never reported as worker progress; classification uses hasNewCommit (progressed vs held)",
+  "lane lookup is by the exact lane key (original name); a same-name/different-worktree call fails closed with a lane-mismatch error; jobId is injective hex of the exact UTF-8 name (no hash collisions possible)"
  ]
 }
