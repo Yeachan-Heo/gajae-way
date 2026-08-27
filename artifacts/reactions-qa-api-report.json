@@ -6,7 +6,8 @@
 		"baseRef": "origin/main",
 		"mergeBase": "a5124f4",
 		"sourceHash": "sha256:072eb2bd3d9c44011b1f2a8f702c7cc6aaff953278eb64c45b96db7f68077b16",
-		"note": "Generation 1 was recorded against sourceHash sha256:072eb2bd3d9c44011b1f2a8f702c7cc6aaff953278eb64c45b96db7f68077b16. The leader then fixed BLOCKER-1's reachable path, BLOCKER-2, F-2, F-4 and F-5; generation 2 re-ran the same suite against sourceHash recorded in remediation.sourceHash below."
+		"note": "Generation 1 was recorded against sourceHash sha256:072eb2bd3d9c44011b1f2a8f702c7cc6aaff953278eb64c45b96db7f68077b16. The leader then fixed BLOCKER-1's reachable path, BLOCKER-2, F-2, F-4 and F-5; generation 2 re-ran the same suite against sourceHash recorded in remediation.sourceHash below. Generation 3 added the six RT-CAPABILITY cases for the platform-capability guard (lane 11). The branch has since been rebased twice onto a moving origin/main by another actor, so the generation hashes above are historical: they name the trees each lane actually inspected, not this commit.",
+		"currentCommit": "357b9085017b9a989ee6b6807abc3942e5c29110"
 	},
 	"producedBy": "executor QA red-team lane 4-ReactionsQaGen1",
 	"host": {
@@ -318,6 +319,48 @@
 			"expected": "no markup spelling can ever reach the Bot API; the only permitted rewrite is dropping U+FE0F; a markup spelling produces a reported failure",
 			"observed": "all eight spellings mapped to {unsupported}; '\\u2764\\uFE0F' mapped to exactly {emoji:'\\u2764'}; the ':lobster:' settlement made zero API calls and reported delivery.fail with ambiguous:false",
 			"verdict": "passed"
+		},
+		{
+			"id": "RT-CAPABILITY-01",
+			"what": "All 13 allowlist entries swept through chat.react on a telegram origin, one distinct target each.",
+			"result": "PASS. Exactly the 3 entries telegramReactionFor rejects (derived from the adapter table, never hand-written) returned invalid_params; the other 10 succeeded. 10 ledger rows, none carrying an undeliverable emoji. Cross-checks the protocol capability set against the adapter's 73-emoji table: drift fails this case.",
+			"generation": 3,
+			"producedBy": "qa lane 11-ReactionCapabilityRedTeam"
+		},
+		{
+			"id": "RT-CAPABILITY-02",
+			"what": "Same 13-entry sweep on a discord origin.",
+			"result": "PASS. Zero error frames, 13 responses, 13 ledger rows, 13 reaction events.",
+			"generation": 3,
+			"producedBy": "qa lane 11-ReactionCapabilityRedTeam"
+		},
+		{
+			"id": "RT-CAPABILITY-03",
+			"what": "[REACT:✅], [REACT:❌@77], [REACT:🦞] 본문 on telegram, log captured.",
+			"result": "PASS. 3 skip lines logged, 0 reaction events, exactly one text event '본문' — token stripped, reply text never lost.",
+			"generation": 3,
+			"producedBy": "qa lane 11-ReactionCapabilityRedTeam"
+		},
+		{
+			"id": "RT-CAPABILITY-04",
+			"what": "Mixed reply [REACT:👍][REACT:✅] 본문 on telegram.",
+			"result": "PASS. 1 skip line naming ✅ only; 1 reaction event for 👍; text delivered; 2 ledger rows, neither carrying ✅.",
+			"generation": 3,
+			"producedBy": "qa lane 11-ReactionCapabilityRedTeam"
+		},
+		{
+			"id": "RT-CAPABILITY-05",
+			"what": "Spelling attack through both doors for check/cross/lobster: :name:, NAME, name, unicode, unicode+U+FE0F (15 attempts).",
+			"result": "PASS. chat.react refused all 15 with invalid_params and 0 ledger rows; the token path logged 15 skips, emitted 0 reactions, and delivered all 3 reply bodies verbatim. Every spelling canonicalizes to the same allowlist name before the guard, so alias/case/variation-selector evasion collapses onto one refusal.",
+			"generation": 3,
+			"producedBy": "qa lane 11-ReactionCapabilityRedTeam"
+		},
+		{
+			"id": "RT-CAPABILITY-06",
+			"what": "Persona notice observed through the real turn path via the systemPreamble the gjc port receives.",
+			"result": "PASS. The telegram preamble offers exactly the 10 deliverable entries and contains no ✅/❌/🦞 anywhere; the discord preamble offers all 13.",
+			"generation": 3,
+			"producedBy": "qa lane 11-ReactionCapabilityRedTeam"
 		}
 	],
 	"contractCoverage": {
@@ -363,7 +406,10 @@
 			"RT-CAP-04",
 			"RT-TOKEN-01",
 			"RT-REACT-03",
-			"RT-INBOUND-04"
+			"RT-INBOUND-04",
+			"RT-CAPABILITY-01",
+			"RT-CAPABILITY-02",
+			"RT-CAPABILITY-05"
 		],
 		"requirement6_customGuildEmojiNameIdWithCacheAndUnicodeFallback_noMarkupToSend": [
 			"RT-DISCORD-01",
@@ -376,7 +422,11 @@
 		"requirement7_telegramImpossibleReactionIsReportedFailureNeverTextNeverNoop": [
 			"RT-TELEGRAM-01",
 			"RT-TELEGRAM-02",
-			"RT-TELEGRAM-03"
+			"RT-TELEGRAM-03",
+			"RT-CAPABILITY-01",
+			"RT-CAPABILITY-03",
+			"RT-CAPABILITY-04",
+			"RT-CAPABILITY-06"
 		]
 	},
 	"blockers": [
@@ -457,8 +507,9 @@
 		},
 		{
 			"id": "U-3",
-			"fact": "discord.js is not installed in this worktree (node_modules contains only @biomejs, @types and typescript), so nothing that constructs a real discord.js Client — including startDiscordAdapter and the messageReactionAdd/messageReactionRemove wiring — can be executed here.",
-			"impact": "The inbound Discord event wiring was verified only at the describeInboundReaction / ReconnectingGateway.sendReaction function level by reading the source; its runtime registration is unverified."
+			"fact": "discord.js IS installed and resolvable in this worktree (packages/adapter-discord/node_modules links it, and the adapter suites import from it), so the earlier claim that it was absent is withdrawn. What remains unverified is runtime event registration: no test constructs a real discord.js Client or starts startDiscordAdapter, so the messageReactionAdd / messageReactionRemove listener registration and the intents/partials actually negotiated with Discord's gateway are not exercised.",
+			"impact": "Inbound Discord reaction handling is verified at the describeInboundReaction and ReconnectingGateway.sendReaction function level, and the intents/partials constants are verified by reading them. A wiring mistake in startDiscordAdapter itself would not be caught by any test.",
+			"correctedBy": "leader, after confirming resolution and re-running the adapter suites (70 pass / 0 fail)"
 		},
 		{
 			"id": "U-4",
@@ -543,5 +594,41 @@
 				"verdict": "pass"
 			}
 		]
+	},
+	"verified": [
+		{
+			"id": "V-1",
+			"fact": "Telegram's ReactionTypeEmoji set is exactly 73 emoji, ❤ is bare U+2764 with no U+FE0F, and ✅/❌/🦞 are absent.",
+			"provenance": "Leader fetched https://core.telegram.org/bots/api on 2026-08-27 and extracted the alt-text of every emoji in the ReactionTypeEmoji 'Currently, it can be one of' enumeration: exactly 73 entries. The adapter table in packages/adapter-telegram/src/reactions.ts is that list verbatim, and packages/adapter-telegram/test/reactions.test.ts asserts it bidirectionally against the protocol capability set."
+		},
+		{
+			"id": "V-2",
+			"fact": "Discord documents no fixed per-route numeric reaction limit; 429 carries retry_after in SECONDS, the global limit is 50 req/s, and limits must not be hardcoded. discord.js RateLimitError.retryAfter is MILLISECONDS. GUILD_MESSAGE_REACTIONS (1<<10) and DIRECT_MESSAGE_REACTIONS (1<<13) are not privileged.",
+			"provenance": "Leader fetched docs.discord.com/developers/topics/rate-limits and .../events/gateway on 2026-08-27; the millisecond unit is from the @discordjs/rest RateLimitData typings in node_modules. The 250ms per-channel floor remains OUR number and is labelled unverified in the code."
+		}
+	],
+	"finalCertification": {
+		"recordedBy": "leader (the 13-ReactionsQaFinal re-certification lane failed at launch three times; these counts are the leader's own re-runs, not an independent lane's)",
+		"commit": "357b9085017b9a989ee6b6807abc3942e5c29110",
+		"baseRef": "origin/main at 8e2a4f3, after the branch was rebased onto it",
+		"commands": [
+			{
+				"command": "bun test packages/",
+				"exactOutput": "839 pass / 2 skip / 0 fail; Ran 841 tests across 66 files",
+				"verdict": "pass"
+			},
+			{
+				"command": "bun node_modules/typescript/lib/tsc.js --noEmit -p tsconfig.json",
+				"exactOutput": "no output, exit 0",
+				"verdict": "pass"
+			},
+			{
+				"command": "bun test packages/gateway/test/reactions-redteam.e2e.test.ts",
+				"exactOutput": "38 pass / 0 fail / 656 expect() calls",
+				"verdict": "pass",
+				"note": "recorded before the rebase; the suite is unchanged by it"
+			}
+		],
+		"note": "packages/admin previously failed to resolve its workspace imports on this machine after a clean install. That was a defect in packages/admin/package.json on origin/main, untouched by this branch, and it was fixed upstream by 546f750 'Declare the admin package's workspace dependencies'. With that in main the full suite is green."
 	}
 }
