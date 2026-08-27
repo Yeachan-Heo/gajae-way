@@ -1,0 +1,771 @@
+{
+	"schemaVersion": 1,
+	"kind": "api-package-test-report",
+	"subject": "Discord/Telegram emoji reactions (branch feat/discord-reactions): @gajaeway/protocol reaction catalog, gateway chat.react / engagement.reaction / reaction reply-token mode over a real unix socket with a real bun:sqlite ledger, and the two duck-typed platform adapters. API/package surface only — this change set has no GUI and no computer-use surface.",
+	"frozenSource": {
+		"baseRef": "origin/main",
+		"mergeBase": "a5124f4",
+		"sourceHash": "sha256:072eb2bd3d9c44011b1f2a8f702c7cc6aaff953278eb64c45b96db7f68077b16",
+		"note": "Generation 1 was recorded against sourceHash sha256:072eb2bd3d9c44011b1f2a8f702c7cc6aaff953278eb64c45b96db7f68077b16. The leader then fixed BLOCKER-1's reachable path, BLOCKER-2, F-2, F-4 and F-5; generation 2 re-ran the same suite against sourceHash recorded in remediation.sourceHash below. Generation 3 added the six RT-CAPABILITY cases for the platform-capability guard (lane 11). The branch has since been rebased twice onto a moving origin/main by another actor, so the generation hashes above are historical: they name the trees each lane actually inspected, not this commit.",
+		"currentCommit": "357b9085017b9a989ee6b6807abc3942e5c29110"
+	},
+	"producedBy": "executor QA red-team lane 4-ReactionsQaGen1",
+	"host": {
+		"platform": "darwin 25.5.0 arm64 (Apple M5 Max)",
+		"bun": "1.4.0 (34cbb9a40)",
+		"typescript": "node_modules/typescript/lib/tsc.js from devDependency typescript ^5.9.3",
+		"note": "package.json pins packageManager bun@1.3.14; the runs below were executed on bun 1.4.0 (see unverified U-5)."
+	},
+	"newTestFile": "packages/gateway/test/reactions-redteam.e2e.test.ts (38 adversarial tests, 656 expect() calls at the certified commit; it was 32/459 when generation 1 filed this report)",
+	"commands": [
+		{
+			"id": "CMD-1",
+			"command": "bun test packages/gateway/test/reactions-redteam.e2e.test.ts",
+			"purpose": "the new red-team suite alone",
+			"exactOutput": "32 pass / 0 fail / 0 skip / 459 expect() calls; Ran 32 tests across 1 file",
+			"wallClock": "20.48s, 20.50s, 20.30s on three consecutive runs (all three identical counts)",
+			"verdict": "pass"
+		},
+		{
+			"id": "CMD-2",
+			"command": "bun test packages/gateway packages/protocol packages/adapter-discord packages/adapter-telegram",
+			"purpose": "required package scope, new suite included",
+			"exactOutput": "227 pass / 2 skip / 0 fail / 1079 expect() calls; Ran 229 tests across 37 files",
+			"wallClock": "33.89s",
+			"verdict": "pass"
+		},
+		{
+			"id": "CMD-3",
+			"command": "bun node_modules/typescript/lib/tsc.js --noEmit -p tsconfig.json",
+			"purpose": "type check of the whole repo including the new file",
+			"exactOutput": "no diagnostics printed; process exit code 0",
+			"wallClock": "not instrumented",
+			"verdict": "pass"
+		},
+		{
+			"id": "CMD-4",
+			"command": "bun test packages",
+			"purpose": "extra: whole monorepo, to prove the new cross-package test imports break nothing (incl. packages/conformance sdk-boundary-dogfood)",
+			"exactOutput": "466 pass / 2 skip / 0 fail / 1536 expect() calls; Ran 468 tests across 51 files",
+			"wallClock": "33.95s",
+			"verdict": "pass"
+		},
+		{
+			"id": "CMD-0",
+			"command": "bun test packages/gateway packages/protocol packages/adapter-discord packages/adapter-telegram (BEFORE adding the new file)",
+			"purpose": "baseline, so the delta of the new suite is auditable",
+			"exactOutput": "195 pass / 2 skip / 0 fail / 620 expect() calls; Ran 197 tests across 36 files",
+			"wallClock": "13.73s",
+			"verdict": "pass (delta to CMD-2 = +32 tests, +459 expect() calls, +1 file)"
+		}
+	],
+	"cases": [
+		{
+			"id": "RT-INBOUND-01",
+			"contractRef": "owner requirement 1",
+			"scenario": "20 mixed add/remove reactions (two emoji) written as ONE socket chunk into an OPEN channel whose author is on mentionAllowlist — the most permissive shaping available",
+			"expected": "no gjc call of any kind, no chat.message event, inboundPendingCount 0, no ledger row, and an honest add/remove history in the conversation-context ledger",
+			"observed": "all 20 answered {recorded:true, engaged:false}; ensureSession 0, sendTurn 0, turns [], chat.message events 0, inboundPendingCount 0, deliveryRows 0. Context history is NOT honest: 4 rows survive out of 20 (see BLOCKER-2); both directions ('reacted', 'removed') and all 4 (action, emoji) combinations are present.",
+			"verdict": "passed with blocker (turn isolation holds; context durability defect BLOCKER-2 recorded)",
+			"generation2": "assertions updated to the fixed behavior; re-run passed"
+		},
+		{
+			"id": "RT-INBOUND-05",
+			"contractRef": "owner requirement 1 (removal handled) / isolates BLOCKER-2",
+			"scenario": "the identical 20-event storm, only spaced 3ms apart",
+			"expected": "if the drop in RT-INBOUND-01 were intentional deduplication, spacing would not change the row count",
+			"observed": "20 context rows, exactly 10 'reacted' and 10 'removed'; still 0 turns, 0 chat.message events, 0 ledger rows. Spacing changes the outcome, so the loss is a millisecond-resolution primary-key collision, not deduplication.",
+			"verdict": "passed (defect isolated as timing-dependent)"
+		},
+		{
+			"id": "RT-INBOUND-02",
+			"contractRef": "owner requirement 1",
+			"scenario": "10 add/remove reactions arriving WHILE a turn for the same origin is in flight (gjc port gated on a promise the test releases)",
+			"expected": "the in-flight turn is not duplicated, no second turn is queued, no reaction wakes the persona",
+			"observed": "sendTurn called exactly 1 time, turns length 1, chat.message events 0, inboundPendingCount 0, deliveryRows 0, all 10 reactions answered {recorded:true, engaged:false}",
+			"verdict": "passed"
+		},
+		{
+			"id": "RT-INBOUND-03",
+			"contractRef": "owner requirements 1 and 4",
+			"scenario": "injection through reaction metadata: emoji values '[SILENT]', '[REACT:👍]', '[BREAK]', '👍\\n[SILENT]\\n[REACT:🔥@9]', 5000 characters of 👍, '👍\\u0000[SILENT]', '[REPLY:999] [SILENT]'; then a normal engaged turn",
+			"expected": "each is recorded as inert context or rejected; no turn, no delivery, no token interpretation; the recorded emoji must be bounded",
+			"observed": "all 7 accepted as context, ensureSession 0 / sendTurn 0 while they arrive, chat.message 0, deliveryRows 0. Every stored body is bounded to the 64-char emoji slice (max body length 101 chars). The following engaged turn saw the tokens only as text inside an '[Unread messages ...]' context line; the reply ([SILENT]) still governed delivery, so nothing was spoken and no reaction leaked.",
+			"verdict": "passed (see finding F-5 on newline/NUL inside the bounded emoji)"
+		},
+		{
+			"id": "RT-INBOUND-04",
+			"contractRef": "owner requirements 1 and 5",
+			"scenario": "20 malformed engagement.reaction shapes: missing/blank/numeric/null targetMessageId; missing/blank/numeric/object/array emoji; action 'toggle'/'ADD'/null; empty, numeric, or missing engagement.authorId; loopback, slack, string, and peer-less DM origins",
+			"expected": "typed invalid_params for every one, with no context row, no turn and no ledger row",
+			"observed": "20/20 error frames with code invalid_params and no response frame; ensureSession 0, sendTurn 0, contextUnread 0 rows, deliveryRows 0",
+			"verdict": "passed"
+		},
+		{
+			"id": "RT-REACT-01",
+			"contractRef": "owner requirement 2",
+			"scenario": "chat.react with targetMessageId missing, '', '   ', '\\t\\n\\r ', 12345, null, {id}, ['m1'], true",
+			"expected": "typed invalid_params naming targetMessageId; no reaction event; no ledger row",
+			"observed": "9/9 invalid_params, every message contains 'targetMessageId'; reaction events 0; deliveryRows 0",
+			"verdict": "passed"
+		},
+		{
+			"id": "RT-REACT-02",
+			"contractRef": "owner requirement 2 ('react to the last message' must be inexpressible)",
+			"scenario": "four attempts to express 'the last message' without an id (target:'last', latest:true, last:true, messageId instead of targetMessageId), then one explicit id; plus a scan of the protocol verb catalog",
+			"expected": "all four rejected with invalid_params naming targetMessageId, only the explicit id accepted, and no verb in the catalog offering a last/latest affordance",
+			"observed": "4/4 rejected naming targetMessageId; the explicit id returned emoji '👍' with 1 ledger row; VERBS_V01 contains chat.react and engagement.reaction and zero verbs matching /last|latest/i",
+			"verdict": "passed"
+		},
+		{
+			"id": "RT-REACT-03",
+			"contractRef": "owner requirements 2 and 5",
+			"scenario": "emoji fuzzing: object, array, number, null, boolean (type errors); '🚀', '👍👎' (multi), '👍🏽' (skin-tone modifier), '<:lobster:123456789>', ':lobster', 'thumbs up', '', '   ', '👍\\u0000', '[REACT:👍]' (value errors); '👍 ' (trims to a legal emoji)",
+			"expected": "type errors say 'requires an emoji'; value errors name the allowlist; nothing outside the allowlist reaches the ledger",
+			"observed": "5/5 type errors invalid_params 'chat.react requires an emoji'; 10/10 value errors invalid_params containing 'outside the reaction allowlist' and '👍 (thumbsup)'; only the trimmed '👍 ' was accepted, producing exactly 1 ledger row and 1 reaction event",
+			"verdict": "passed"
+		},
+		{
+			"id": "RT-REACT-04",
+			"contractRef": "owner requirement 2 (valid origin required)",
+			"scenario": "origins: absent params, missing origin, string origin, platform 'slack', missing kind, DM without peerId, conversationId containing '/', empty conversationId, loopback; then a structurally valid 'monitor' origin",
+			"expected": "typed invalid_params for all malformed/unroutable origins and no ledger row",
+			"observed": "9/9 invalid_params (loopback message contains 'not available on loopback'), deliveryRows 0 for all nine. The monitor origin was ACCEPTED: emoji '👍', 1 ledger row with origin_key 'monitor/eventtype/deploys' in state inflight — recorded as finding F-2.",
+			"verdict": "passed with finding F-2",
+			"generation2": "assertions updated to the fixed behavior; re-run passed"
+		},
+		{
+			"id": "RT-REACT-05",
+			"contractRef": "owner requirements 2 and 6",
+			"scenario": "accepted spellings '❤️' (U+FE0F), ':lobster:', ' ThumbsUp ' (padded, mixed case), 'FIRE' on four distinct messages",
+			"expected": "each canonicalizes to exactly one allowlist entry, and both the reaction and the fallback text carry the allowlist unicode, never the caller's spelling",
+			"observed": "results ❤, 🦞, 👍, 🔥 with emojiName heart/lobster/thumbsup/fire; every event payload.text equals the allowlist unicode; 4 ledger rows",
+			"verdict": "passed"
+		},
+		{
+			"id": "RT-LEDGER-01",
+			"contractRef": "owner requirement 3",
+			"scenario": "one chat.react, then four bogus settlements (unknown deliveryId, numeric deliveryId, ambiguous:'yes', numeric reason), then the real delivery.confirm; gateway.status inspected in between",
+			"expected": "the row stays inflight and unattempted until a real confirm; every bogus settlement is a typed error",
+			"observed": "row inflight, gateway.status delivery.pending = 1; 4/4 bogus settlements invalid_params with state still inflight and attempts 0; the real confirm returned {settled:true} and moved the row to confirmed",
+			"verdict": "passed"
+		},
+		{
+			"id": "RT-LEDGER-02",
+			"contractRef": "owner requirement 3",
+			"scenario": "a reaction reply is failed with ambiguous:true, then a brand-new socket connection negotiates",
+			"expected": "the failure survives as a ledger row and is re-emitted to the reconnecting adapter with the reaction intact",
+			"observed": "delivery.fail returned {recorded:true}; row state failed_ambiguous; the fresh connection received exactly 1 chat.message carrying reaction {targetMessageId:'m1', emoji:'👍', emojiName:'thumbsup'}, the same deliveryId, and redelivered:true",
+			"verdict": "passed"
+		},
+		{
+			"id": "RT-LEDGER-03",
+			"contractRef": "owner requirement 3",
+			"scenario": "three consecutive definitive delivery.fail calls (ambiguous:false) on one reaction, then a reconnect",
+			"expected": "attempts increment, state stays pending until the bound, then expires, and an expired reaction is not re-offered and never reported as done",
+			"observed": "attempts 1/2/3 with states pending, pending, expired; the reconnecting client received 0 chat.message frames; the row is never 'confirmed'",
+			"verdict": "passed"
+		},
+		{
+			"id": "RT-WIRE-01",
+			"contractRef": "owner requirements 2 and 3 (silent failure forbidden)",
+			"scenario": "chat.react with a 12000-character targetMessageId",
+			"expected": "either a typed invalid_params (bounded id) or a delivered response plus event; in no case a silently vanished reaction",
+			"observed": "ACCEPTED with no length validation, ledger row created inflight carrying the full 12000-char id, and NEITHER a response frame NOR an error frame reached the client: the client is left holding an incomplete 8190-character partial line. Root cause chain: no bound at packages/gateway/src/server/server.ts:514-515 plus a connection writer that ignores short writes at packages/gateway/src/server/server.ts:122. This is BLOCKER-1.",
+			"verdict": "defect confirmed (test passes: it asserts the surviving invariant — the row is never confirmed without a confirm and the full id survives in the ledger)",
+			"generation2": "assertions updated to the fixed behavior; re-run passed"
+		},
+		{
+			"id": "RT-TOKEN-01",
+			"contractRef": "owner requirements 4 and 5",
+			"scenario": "one reply consisting of 50 repeated [REACT:👍@tN] tokens",
+			"expected": "at most REACTIONS_PER_TURN_CAP reactions, every rejection visible in the daemon log, and no reply text lost",
+			"observed": "reactions emitted for t0, t1, t2 only; 3 ledger rows; 0 text events (the reply body after the tokens is empty, which is the reaction-only acknowledgement); exactly 47 log lines 'gateway reaction rejected (turn_cap)'",
+			"verdict": "passed"
+		},
+		{
+			"id": "RT-TOKEN-02",
+			"contractRef": "owner requirement 4",
+			"scenario": "tokens in the MIDDLE of a reply: '확인 [REACT:👍] 했습니다' and '본문 [REACT:🔥@9] 끝'",
+			"expected": "no reaction; the reply is delivered verbatim including the token text",
+			"observed": "reaction events 0; text events exactly ['확인 [REACT:👍] 했습니다', '본문 [REACT:🔥@9] 끝']; 2 ledger rows",
+			"verdict": "passed"
+		},
+		{
+			"id": "RT-TOKEN-03",
+			"contractRef": "owner requirement 4 (malformed token sends the text verbatim, never drops the reply)",
+			"scenario": "8 replies: '[REACT:]', '[REACT:👍@]', unclosed '[REACT:👍', non-allowlisted '[REACT:🚀]', '[REACT:nonsense]', '[REACT:👍@ ]', lowercase '[react:👍]', and '[REACT:👍]@1' — each with trailing text; cross-checked against parseReactionReply",
+			"expected": "the first seven deliver verbatim exactly once with no reaction; the eighth is a well-formed token followed by text",
+			"observed": "text events equal the 7 verbatim replies plus '@1 발사합니다'; exactly 1 reaction event (from the well-formed case); 9 ledger rows; parseReactionReply returns undefined for all seven and body '@1 발사합니다' for the eighth",
+			"verdict": "passed"
+		},
+		{
+			"id": "RT-TOKEN-04",
+			"contractRef": "owner requirement 4 (silence contract byte-identical)",
+			"scenario": "the isSilenceToken table from packages/gateway/test/silence.test.ts replayed verbatim and extended with reaction-adjacent strings, then four live turns: '[REACT:👍] [SILENT]', '[SILENT][REACT:🔥]', '[SILENT]', '[REACT:🔥@m3]\\n[SILENT]'",
+			"expected": "silence recognition unchanged; a token followed by a silence body reacts and says nothing; a reply that does not START with a token is verbatim text; a bare silence token suppresses everything",
+			"observed": "all 7 silence spellings true and all 8 non-silence strings false, byte-identical to the existing suite; live turns produced exactly ['R:👍@m0', 'T:[SILENT][REACT:🔥]', 'R:🔥@m3'] and 3 ledger rows — the bare [SILENT] turn emitted nothing at all",
+			"verdict": "passed"
+		},
+		{
+			"id": "RT-TOKEN-05",
+			"contractRef": "owner requirement 4",
+			"scenario": "reaction tokens returned for a loopback origin ('[REACT:👍] 확인했습니다' and '[REACT:👍]')",
+			"expected": "loopback has no messages to react to, so tokens are never parsed and the reply is delivered verbatim without a ledger row",
+			"observed": "reaction events 0; text events exactly ['[REACT:👍] 확인했습니다', '[REACT:👍]']; deliveryRows 0",
+			"verdict": "passed"
+		},
+		{
+			"id": "RT-TOKEN-06",
+			"contractRef": "owner requirement 4",
+			"scenario": "'[REACT:👍]\\n첫째 문장\\n[BREAK]\\n둘째 문장\\n[BREAK]\\n[REACT:🔥] 셋째'",
+			"expected": "one reaction, three text parts in order, no part dropped, and a token inside a later part is plain text",
+			"observed": "reactions ['👍']; text events ['첫째 문장', '둘째 문장', '[REACT:🔥] 셋째'] in that order; 4 ledger rows",
+			"verdict": "passed"
+		},
+		{
+			"id": "RT-TOKEN-07",
+			"contractRef": "owner requirements 3 and 4",
+			"scenario": "'[REACT:👍@<10000 nines>] 확인했습니다' — a reaction token whose @id is 10000 characters, followed by real reply text",
+			"expected": "the reply text must never be lost; the reaction is either delivered or reported",
+			"observed": "both deliveries exist in the ledger (2 rows, both inflight): the reaction row carries the full 10000-char id and the text row carries '확인했습니다'. On the wire NEITHER frame arrived: the oversized reaction frame is truncated by the writer and desynchronizes the stream, so the following text delivery is lost too (client left with an 8190-char partial line). Same root cause as RT-WIRE-01 / BLOCKER-1.",
+			"verdict": "defect confirmed (test passes: it asserts ledger durability of both deliveries and that neither is confirmed)",
+			"generation2": "assertions updated to the fixed behavior; re-run passed"
+		},
+		{
+			"id": "RT-CAP-01",
+			"contractRef": "owner requirement 5",
+			"scenario": "three SEPARATE turns each trying to react to the same message id: [REACT:👍@same], [REACT:👍@same], [REACT:🔥@same], with console.error captured",
+			"expected": "exactly one reaction ever lands on that message across turns, and each rejection is a real log line, never a silent nothing",
+			"observed": "reactions ['👍'] only; 1 ledger row; exactly 2 captured log lines: 'reaction rejected (duplicate) ... message same' then 'reaction rejected (message_cap) ... message same'",
+			"verdict": "passed"
+		},
+		{
+			"id": "RT-CAP-02",
+			"contractRef": "owner requirement 5",
+			"scenario": "four chat.react verb calls on one message: 👍, 👍 again, 🎉, then ':thumbsup:' (a different spelling of the applied emoji)",
+			"expected": "the first succeeds; every later one is a typed protocol error naming the rejection reason",
+			"observed": "k1 -> '👍'; k2 invalid_params 'reaction rejected (duplicate)'; k3 invalid_params 'reaction rejected (message_cap)'; k4 invalid_params 'reaction rejected (duplicate)' (spelling does not bypass the cap); 1 ledger row total",
+			"verdict": "passed"
+		},
+		{
+			"id": "RT-CAP-03",
+			"contractRef": "owner requirement 5 (per-turn cap)",
+			"scenario": "five chat.react calls on five DISTINCT messages in one origin, back to back",
+			"expected": "probe whether the per-turn cap of 3 also bounds the verb path",
+			"observed": "all five accepted, 5 ledger rows, 5 reaction events. The turn cap is keyed on a turn id and chat.react passes none (packages/gateway/src/delivery/reaction-budget.ts:58-64), so it does not apply; the per-message cap still holds and every call is an auditable ledger row and an explicit caller request. Recorded as finding F-3 (documented design, not a silent drop).",
+			"verdict": "passed with finding F-3"
+		},
+		{
+			"id": "RT-CAP-04",
+			"contractRef": "owner requirement 5 (bounded allowlist)",
+			"scenario": "protocol-level invariants: both cap constants, allowlist size/uniqueness, resolution of eight non-allowlisted spellings, and parseReactionReply on 50 repeated tokens",
+			"expected": "caps 3 and 1; 13 unique names and 13 unique unicode values; nothing outside the allowlist resolves; the parser stays pure and lets the caps do the bounding",
+			"observed": "REACTIONS_PER_TURN_CAP 3, REACTIONS_PER_MESSAGE_CAP 1, 13 entries with 13 unique names and 13 unique unicode; resolveReactionEmoji undefined for '🚀', '😀', '<:lobster:1>', ':lobster', 'lobster:1', '', ' ', '👍👍'; parseReactionReply returned 50 reactions with an empty body",
+			"verdict": "passed"
+		},
+		{
+			"id": "RT-DISCORD-01",
+			"contractRef": "owner requirement 6",
+			"scenario": "six Discord settlement scenarios driven through settleDiscordReaction with a channel harness that records BOTH react() and send(): owning guild, guild without the emoji, DM with no guild, custom emoji with a null name, react() rejecting with 'Missing Permissions', and a deleted target message",
+			"expected": "channel.send() is never called on any path; no spelling handed to react() contains '<:' or '>' or is wrapped in colons; every scenario settles the ledger exactly once",
+			"observed": "sent === [] in all six; every react() spelling was either the allowlist unicode or 'name:id' (no '<:', no '>', no leading/trailing ':'); each scenario issued exactly one settlement request, either delivery.confirm or delivery.fail",
+			"verdict": "passed"
+		},
+		{
+			"id": "RT-DISCORD-02",
+			"contractRef": "owner requirements 3 and 6",
+			"scenario": "the target message fetch rejects with Discord code 10008 (Unknown Message)",
+			"expected": "delivery.fail with ambiguous:false, no confirm, no react, no send",
+			"observed": "exactly one request: delivery.fail {deliveryId:'delivery-1', reason:'Unknown Message', ambiguous:false}; reacted [] and sent []",
+			"verdict": "passed"
+		},
+		{
+			"id": "RT-DISCORD-03",
+			"contractRef": "owner requirement 6 (cache integrity)",
+			"scenario": "three guilds, two of which own a custom emoji with the SAME name ('lobster' -> 111 in guild-1, 222 in guild-2) and one which lacks it; resolved in three interleaved rounds and then used to drive three real settlements with the same resolver",
+			"expected": "per-guild resolution with no cross-guild leak, one emoji-cache scan per guild (hits and misses cached), and the same isolation when driving real settlements",
+			"observed": "every round returned lobster:111, lobster:222, 🦞 respectively; scans were exactly [1, 1, 1]; the three settlements reacted with lobster:111, lobster:222 and 🦞, sent nothing, and each confirmed",
+			"verdict": "passed"
+		},
+		{
+			"id": "RT-DISCORD-04",
+			"contractRef": "owner requirements 1 and 6",
+			"scenario": "an inbound Discord custom-emoji reaction described by describeInboundReaction, then fed to the live gateway as engagement.reaction; finally the ':lobster' spelling offered back to chat.react",
+			"expected": "the custom emoji is reported as ':lobster:' metadata only, becomes context and never a delivery or a turn, and the metadata spelling is not accepted as an outbound emoji",
+			"observed": "described emoji ':lobster:'; gateway answered {recorded:true, engaged:false}; ensureSession 0, sendTurn 0, deliveryRows 0; context body '[reaction] reacted :lobster: to message target-1'; chat.react with ':lobster' rejected as 'outside the reaction allowlist'",
+			"verdict": "passed"
+		},
+		{
+			"id": "RT-TELEGRAM-01",
+			"contractRef": "owner requirement 7",
+			"scenario": "every allowlist entry Telegram's documented 73-emoji reaction set cannot express (computed from TELEGRAM_REACTION_SET, non-empty: ✅ check, ❌ cross, 🦞 lobster), each driven through settleTelegramReaction with a bot exposing setMessageReaction AND sendMessage",
+			"expected": "the impossibility is decided before any API call; delivery.fail with ambiguous:false naming the emoji and the 73-emoji limit; never text, never a no-op",
+			"observed": "telegramReactionFor returned {unsupported} for each; zero API calls recorded (neither setMessageReaction nor sendMessage); exactly one delivery.fail per case with ambiguous:false, the right deliveryId, and a reason containing the emoji and '73'",
+			"verdict": "passed"
+		},
+		{
+			"id": "RT-TELEGRAM-02",
+			"contractRef": "owner requirement 7 (never text)",
+			"scenario": "five reaction outcomes with a bot exposing both endpoints: supported emoji, impossible emoji, missing persisted reply route, API rejection ('Bad Request: REACTIONS_DISABLED'), and a network error",
+			"expected": "sendMessage is never called on ANY outcome; each case settles exactly once with the correct ambiguity",
+			"observed": "sendMessage call count 0 in all five; supported -> delivery.confirm; impossible and missing-route -> delivery.fail ambiguous:false; API rejection and network error -> delivery.fail ambiguous:true",
+			"verdict": "passed"
+		},
+		{
+			"id": "RT-TELEGRAM-03",
+			"contractRef": "owner requirements 6 and 7",
+			"scenario": "markup and near-miss spellings offered to the Telegram mapper (':lobster:', '<:lobster:123>', 'lobster', '', ' ', '👍👍', '👍🏽', '[REACT:👍]'), the U+FE0F heart, and one live settlement with ':lobster:'",
+			"expected": "no markup spelling can ever reach the Bot API; the only permitted rewrite is dropping U+FE0F; a markup spelling produces a reported failure",
+			"observed": "all eight spellings mapped to {unsupported}; '\\u2764\\uFE0F' mapped to exactly {emoji:'\\u2764'}; the ':lobster:' settlement made zero API calls and reported delivery.fail with ambiguous:false",
+			"verdict": "passed"
+		},
+		{
+			"id": "RT-CAPABILITY-01",
+			"what": "All 13 allowlist entries swept through chat.react on a telegram origin, one distinct target each.",
+			"result": "PASS. Exactly the 3 entries telegramReactionFor rejects (derived from the adapter table, never hand-written) returned invalid_params; the other 10 succeeded. 10 ledger rows, none carrying an undeliverable emoji. Cross-checks the protocol capability set against the adapter's 73-emoji table: drift fails this case.",
+			"generation": 3,
+			"producedBy": "qa lane 11-ReactionCapabilityRedTeam"
+		},
+		{
+			"id": "RT-CAPABILITY-02",
+			"what": "Same 13-entry sweep on a discord origin.",
+			"result": "PASS. Zero error frames, 13 responses, 13 ledger rows, 13 reaction events.",
+			"generation": 3,
+			"producedBy": "qa lane 11-ReactionCapabilityRedTeam"
+		},
+		{
+			"id": "RT-CAPABILITY-03",
+			"what": "[REACT:✅], [REACT:❌@77], [REACT:🦞] 본문 on telegram, log captured.",
+			"result": "PASS. 3 skip lines logged, 0 reaction events, exactly one text event '본문' — token stripped, reply text never lost.",
+			"generation": 3,
+			"producedBy": "qa lane 11-ReactionCapabilityRedTeam"
+		},
+		{
+			"id": "RT-CAPABILITY-04",
+			"what": "Mixed reply [REACT:👍][REACT:✅] 본문 on telegram.",
+			"result": "PASS. 1 skip line naming ✅ only; 1 reaction event for 👍; text delivered; 2 ledger rows, neither carrying ✅.",
+			"generation": 3,
+			"producedBy": "qa lane 11-ReactionCapabilityRedTeam"
+		},
+		{
+			"id": "RT-CAPABILITY-05",
+			"what": "Spelling attack through both doors for check/cross/lobster: :name:, NAME, name, unicode, unicode+U+FE0F (15 attempts).",
+			"result": "PASS. chat.react refused all 15 with invalid_params and 0 ledger rows; the token path logged 15 skips, emitted 0 reactions, and delivered all 3 reply bodies verbatim. Every spelling canonicalizes to the same allowlist name before the guard, so alias/case/variation-selector evasion collapses onto one refusal.",
+			"generation": 3,
+			"producedBy": "qa lane 11-ReactionCapabilityRedTeam"
+		},
+		{
+			"id": "RT-CAPABILITY-06",
+			"what": "Persona notice observed through the real turn path via the systemPreamble the gjc port receives.",
+			"result": "PASS. The telegram preamble offers exactly the 10 deliverable entries and contains no ✅/❌/🦞 anywhere; the discord preamble offers all 13.",
+			"generation": 3,
+			"producedBy": "qa lane 11-ReactionCapabilityRedTeam"
+		}
+	],
+	"contractCoverage": {
+		"requirement1_inboundReactionIsMetadataNeverATurn_removalHandled": [
+			"RT-INBOUND-01",
+			"RT-INBOUND-02",
+			"RT-INBOUND-03",
+			"RT-INBOUND-04",
+			"RT-INBOUND-05",
+			"RT-DISCORD-04"
+		],
+		"requirement2_chatReactRequiresOriginTargetEmoji_lastMessageInexpressible": [
+			"RT-REACT-01",
+			"RT-REACT-02",
+			"RT-REACT-03",
+			"RT-REACT-04",
+			"RT-REACT-05",
+			"RT-WIRE-01"
+		],
+		"requirement3_reactionIsALedgerDeliverySettledByConfirmOrFail_noSilentFailure": [
+			"RT-LEDGER-01",
+			"RT-LEDGER-02",
+			"RT-LEDGER-03",
+			"RT-WIRE-01",
+			"RT-TOKEN-07",
+			"RT-DISCORD-02",
+			"RT-TELEGRAM-02"
+		],
+		"requirement4_replyTokens_silenceByteIdentical_malformedSendsVerbatim": [
+			"RT-TOKEN-01",
+			"RT-TOKEN-02",
+			"RT-TOKEN-03",
+			"RT-TOKEN-04",
+			"RT-TOKEN-05",
+			"RT-TOKEN-06",
+			"RT-TOKEN-07",
+			"RT-INBOUND-03"
+		],
+		"requirement5_allowlistBounded_turnCap3_messageCap1_rejectionIsErrorOrLog": [
+			"RT-CAP-01",
+			"RT-CAP-02",
+			"RT-CAP-03",
+			"RT-CAP-04",
+			"RT-TOKEN-01",
+			"RT-REACT-03",
+			"RT-INBOUND-04",
+			"RT-CAPABILITY-01",
+			"RT-CAPABILITY-02",
+			"RT-CAPABILITY-05"
+		],
+		"requirement6_customGuildEmojiNameIdWithCacheAndUnicodeFallback_noMarkupToSend": [
+			"RT-DISCORD-01",
+			"RT-DISCORD-02",
+			"RT-DISCORD-03",
+			"RT-DISCORD-04",
+			"RT-REACT-05",
+			"RT-TELEGRAM-03"
+		],
+		"requirement7_telegramImpossibleReactionIsReportedFailureNeverTextNeverNoop": [
+			"RT-TELEGRAM-01",
+			"RT-TELEGRAM-02",
+			"RT-TELEGRAM-03",
+			"RT-CAPABILITY-01",
+			"RT-CAPABILITY-03",
+			"RT-CAPABILITY-04",
+			"RT-CAPABILITY-06"
+		]
+	},
+	"blockers": [
+		{
+			"id": "BLOCKER-1",
+			"severity": "blocker",
+			"title": "A frame larger than the socket write window is silently truncated: the gateway connection writer ignores short writes",
+			"contractRef": "owner requirement 3 (a reaction is settled via delivery.confirm/fail; silent failure is forbidden)",
+			"location": "packages/gateway/src/server/server.ts:122 (`write: (frame) => socket.write(encodeFrame(frame))`); same pattern in the SDK client at packages/sdk/src/client.ts:63 (`socket.write(data)`); reachable through the unbounded id accepted at packages/gateway/src/server/server.ts:514-515",
+			"detail": "Bun's Socket.write returns a SHORT byte count when the write window is full (8192 bytes on this host). Neither writer checks the return value or waits for drain, so the unwritten tail is dropped. The receiving side is then left with an incomplete NDJSON line, and because the stream is desynchronized every following frame on that connection is lost too. Effect on reactions: a reaction (or the text delivery that follows it) is marked inflight in the ledger, is never delivered to any adapter, and therefore is never confirmed and never failed — the exact silent failure the contract forbids. It is only recoverable by a reconnect, and if the frame is oversized the redelivery truncates as well. Scope is not reaction-specific: an ordinary long reply is affected identically.",
+			"reproduction": [
+				"Reaction path (in the new suite): `bun test packages/gateway/test/reactions-redteam.e2e.test.ts` — cases RT-WIRE-01 and RT-TOKEN-07. RT-WIRE-01 sends chat.react with a 12000-character targetMessageId: the ledger row is created inflight with the full id and the client receives NO response and NO error frame, only an 8190-character partial line. RT-TOKEN-07 has a persona reply '[REACT:👍@<10000 nines>] 확인했습니다': both deliveries land in the ledger, neither frame arrives.",
+				"Plain-text path (measured with a scratch probe during this lane, not committed): an open channel whose gjc reply is '가'.repeat(20000) produces 1 ledger row, the client receives 8438 bytes in total, 0 chat.message events, and holds a 2870-character partial line. Rebuild by copying the harness from packages/gateway/test/reactions-redteam.e2e.test.ts, replying with a 20000-character string, and asserting chatMessages(client.frames).length."
+			],
+			"note": "No product source was changed by this lane. The truncation threshold is host-specific (see unverified U-4)."
+		},
+		{
+			"id": "BLOCKER-2",
+			"severity": "blocker",
+			"title": "Inbound reaction history is silently dropped when two reaction events share a millisecond",
+			"contractRef": "owner requirement 1 (inbound reactions are metadata; removal handled) and the no-silent-loss principle of requirement 3",
+			"location": "packages/gateway/src/server/server.ts:587 (synthetic context id `reaction/${action}/${target}/${authorId}/${emoji}/${new Date().toISOString()}`, with the promise-to-the-contrary comment at :581-586) combined with packages/gateway/src/store/db.ts:203 (`INSERT INTO conversation_context ... ON CONFLICT(message_id) DO NOTHING`)",
+			"detail": "The id's only distinguishing field is an ISO timestamp at MILLISECOND resolution, so two reaction events with the same action, target, author and emoji inside one millisecond produce the same primary key and the second one is discarded with no error and no log. The comment directly above that line promises the opposite ('an add/remove/add sequence keeps all three entries instead of colliding on one primary key'). This is exactly the burst shape an adapter produces when it drains a backlog of buffered updates (Telegram getUpdates batches, a Discord reconnect replay) or when a user toggles a reaction rapidly, so a removal can be swallowed and the persona then reads a history that disagrees with the room.",
+			"reproduction": [
+				"`bun test packages/gateway/test/reactions-redteam.e2e.test.ts` — RT-INBOUND-01 writes 20 mixed add/remove engagement.reaction requests in ONE socket chunk: all 20 are answered {recorded:true, engaged:false} but only 4 conversation_context rows exist afterwards (one per distinct action+emoji within that millisecond).",
+				"RT-INBOUND-05 in the same file sends the identical 20 events with a 3ms gap and keeps all 20 rows (10 'reacted', 10 'removed'), which isolates the cause as millisecond-resolution key collision rather than deduplication."
+			],
+			"note": "A monotonic counter or an adapter-supplied event id in the synthetic key would remove the collision; no fix was applied by this lane."
+		}
+	],
+	"findings": [
+		{
+			"id": "F-1",
+			"severity": "major",
+			"title": "chat.react accepts an unbounded, unvalidated targetMessageId",
+			"location": "packages/gateway/src/server/server.ts:514-515",
+			"detail": "The only validation is `typeof === 'string'` plus a non-blank trim. A 12000-character id (RT-WIRE-01) and an id containing a newline ('m11\\nm12', observed accepted during probing) both produce real ledger rows. No platform message id looks like that, and the oversized case is what makes BLOCKER-1 reachable from a single verb call."
+		},
+		{
+			"id": "F-2",
+			"severity": "minor",
+			"title": "chat.react and engagement.reaction accept a `monitor` origin that no chat adapter can settle",
+			"location": "packages/gateway/src/server/server.ts:512-513 (chat.react origin guard) and :567-568 (engagement.reaction origin guard) — both reject only `loopback`",
+			"detail": "`{platform:'monitor', kind:'eventtype', ...}` is a structurally valid OriginRef, so chat.react returns a deliveryId and writes an inflight ledger row for an origin no platform adapter subscribes to (observed in RT-REACT-04: origin_key 'monitor/eventtype/deploys', state inflight). It stays visible in gateway.status pending counts, so it is bookkeeping noise rather than a silent drop, but chat.send rejects non-discord/telegram/loopback platforms and the reaction verbs do not."
+		},
+		{
+			"id": "F-3",
+			"severity": "minor",
+			"title": "The per-turn cap does not bound the chat.react verb path",
+			"location": "packages/gateway/src/delivery/reaction-budget.ts:58-64 (turn budget applies only when a turnId is supplied)",
+			"detail": "Observed in RT-CAP-03: five chat.react calls on five distinct messages all succeed. This is the documented design (a verb call has no turn) and the per-message cap still holds, but owner requirement 5's 'per-turn cap 3' therefore has no equivalent bound for a caller driving chat.react directly."
+		},
+		{
+			"id": "F-4",
+			"severity": "minor",
+			"title": "Documentation/behaviour drift: reaction redeliveries do carry duplicateWarning",
+			"location": "packages/gateway/src/delivery/delivery.ts:33-49 (comment: 'a reaction never needs the duplicateWarning label a recovered message needs') vs packages/gateway/src/delivery/delivery.ts:79-84 (redeliveries() sets duplicateWarning for every inflight/failed_ambiguous row, reaction or not)",
+			"detail": "Observed during probing: after failing a reaction with ambiguous:true and reconnecting, the redelivered payload carries both redelivered:true and duplicateWarning:true. Harmless in practice (both adapters ignore the flag on the reaction path and post no '[recovered - may be a duplicate]' prefix for reactions), but the comment states an invariant the code does not enforce."
+		},
+		{
+			"id": "F-5",
+			"severity": "minor",
+			"title": "An inbound reaction emoji is length-bounded but not newline-sanitized before it becomes turn context",
+			"location": "packages/gateway/src/server/server.ts:577 (emoji trimmed and sliced to 64 chars) and the context line format at packages/gateway/src/server/server.ts:834 ('- [ts] name (author:..., msg:...): body')",
+			"detail": "Observed in RT-INBOUND-03: '👍\\n[SILENT]\\n[REACT:🔥@9]' and '👍\\u0000[SILENT]' are stored verbatim inside the 64-character bound. A newline inside that bound can forge one additional line in the unread-context block a turn reads. The 64-char cap keeps the blast radius to a single short forged line, and ordinary message bodies already have the same exposure, so this is noted rather than escalated."
+		}
+	],
+	"unverified": [
+		{
+			"id": "U-1",
+			"fact": "The frozen sourceHash sha256:072eb2bd3d9c44011b1f2a8f702c7cc6aaff953278eb64c45b96db7f68077b16 (baseRef origin/main, mergeBase a5124f4) was taken from the assignment and NOT recomputed in this lane.",
+			"impact": "Source identity is asserted by the leader, not by this report. `git status` was inspected: the reaction change set is present as modified/untracked files and no packages/*/src/** file was touched by this lane."
+		},
+		{
+			"id": "U-2",
+			"fact": "No live Discord or Telegram API call was made. Both adapters were exercised through their duck-typed seams (channels.fetch/messages.fetch/react/send, setMessageReaction/sendMessage) with recorded fakes.",
+			"impact": "Real platform acceptance of 'name:id' custom-emoji reactions, real 429 headers, real setMessageReaction responses, and real REACTIONS_DISABLED behaviour remain unverified by this lane."
+		},
+		{
+			"id": "U-3",
+			"fact": "discord.js IS installed and resolvable in this worktree (packages/adapter-discord/node_modules links it, and the adapter suites import from it), so the earlier claim that it was absent is withdrawn. What remains unverified is runtime event registration: no test constructs a real discord.js Client or starts startDiscordAdapter, so the messageReactionAdd / messageReactionRemove listener registration and the intents/partials actually negotiated with Discord's gateway are not exercised.",
+			"impact": "Inbound Discord reaction handling is verified at the describeInboundReaction and ReconnectingGateway.sendReaction function level, and the intents/partials constants are verified by reading them. A wiring mistake in startDiscordAdapter itself would not be caught by any test.",
+			"correctedBy": "leader, after confirming resolution and re-running the adapter suites (70 pass / 0 fail)"
+		},
+		{
+			"id": "U-4",
+			"fact": "The 8192-byte write window that triggers BLOCKER-1 is a property of this host's unix socket buffer (darwin 25.5.0, bun 1.4.0).",
+			"impact": "On a platform with a larger window the same frames may arrive intact; the missing short-write handling is still a defect, but the exact size at which it bites is host-specific. RT-WIRE-01 and RT-TOKEN-07 are written to assert the host-independent invariants and to record the truncation when it occurs."
+		},
+		{
+			"id": "U-5",
+			"fact": "package.json pins packageManager bun@1.3.14 while every command above ran on bun 1.4.0.",
+			"impact": "Counts and timings are from bun 1.4.0; behaviour differences against 1.3.14 were not checked."
+		},
+		{
+			"id": "U-6",
+			"fact": "The gjc orchestrator is stubbed through the GjcPort seam (as in every existing gateway test), so no real gjc process, model, or persona preamble was involved.",
+			"impact": "Turn composition was verified through the port contract only; whether a real persona emits well-formed reaction tokens is out of scope for this lane."
+		},
+		{
+			"id": "U-7",
+			"fact": "ReactionRateLimiter timing was driven with an injected clock/sleep (as the existing adapter suite does) and no wall-clock 250ms spacing or real retry delay was measured in the new file.",
+			"impact": "Rate-limit spacing behaviour under real timers is covered only by the pre-existing packages/adapter-discord/test/reactions.test.ts cases."
+		}
+	],
+	"artifactRefs": [
+		"packages/gateway/test/reactions-redteam.e2e.test.ts",
+		"artifacts/reactions-qa-api-report.json",
+		"artifacts/qa-api-test-report.json (shape precedent for this report)"
+	],
+	"remediation": {
+		"appliedBy": "leader",
+		"sourceHash": "recorded in the ultragoal quality gate for generation 2",
+		"resolved": [
+			{
+				"id": "BLOCKER-1",
+				"resolution": "partial-by-design: the reachable path is closed. chat.react and engagement.reaction now require targetMessageId to match isPlatformMessageId (/^[A-Za-z0-9._:-]{1,64}$/, packages/protocol/src/reactions.ts), so a reaction can no longer produce an oversized frame. The underlying short-write defect in the gateway connection writer and the SDK client is PRE-EXISTING, reachable through ordinary long chat text, and is reported as a known gap rather than fixed in this change set."
+			},
+			{
+				"id": "BLOCKER-2",
+				"resolution": "fixed: the synthetic conversation_context id for an inbound reaction now ends in a random suffix as well as the ISO timestamp, so same-millisecond reaction events no longer collide on ON CONFLICT(message_id) DO NOTHING. Covered by RT-INBOUND-01 (20 events in one batch -> 20 rows) and the gateway unit test 'a reaction storm in one millisecond keeps every event instead of colliding on one id'."
+			},
+			{
+				"id": "F-1",
+				"resolution": "fixed: targetMessageId is bounded and character-restricted in both reaction verbs and in the [REACT:...@id] token parser."
+			},
+			{
+				"id": "F-2",
+				"resolution": "fixed: both reaction verbs now require a discord or telegram origin, matching chat.send, so a monitor origin can no longer strand an inflight ledger row."
+			},
+			{
+				"id": "F-4",
+				"resolution": "fixed (documentation): the prepareReaction comment now states that a recovered reaction does carry duplicateWarning and that adapters ignore it on the reaction path."
+			},
+			{
+				"id": "F-5",
+				"resolution": "fixed: the inbound reaction emoji is stripped of C0/DEL control characters before it is recorded, so it cannot forge an extra line in the turn's context block. Covered by 'a reactor cannot forge context lines through the emoji field'."
+			}
+		],
+		"openByDesign": [
+			{
+				"id": "F-3",
+				"note": "the per-turn cap does not apply to the chat.react verb, which has no turn; the per-message cap still applies. Documented in ReactionBudget."
+			}
+		],
+		"generation2Commands": [
+			{
+				"command": "bun test packages/gateway/test/reactions-redteam.e2e.test.ts",
+				"exactOutput": "32 pass / 0 fail / 454 expect() calls; Ran 32 tests across 1 file",
+				"verdict": "pass"
+			},
+			{
+				"command": "bun test packages/",
+				"exactOutput": "470 pass / 2 skip / 0 fail / 1557 expect() calls; Ran 472 tests across 51 files",
+				"verdict": "pass"
+			},
+			{
+				"command": "bun node_modules/typescript/lib/tsc.js --noEmit -p tsconfig.json",
+				"exactOutput": "no output, exit 0",
+				"verdict": "pass"
+			},
+			{
+				"command": "bun node_modules/@biomejs/biome/bin/biome check --write <touched packages>",
+				"exactOutput": "0 errors; remaining warnings are pre-existing repo-wide noExplicitAny/noNonNullAssertion",
+				"verdict": "pass"
+			}
+		]
+	},
+	"verified": [
+		{
+			"id": "V-1",
+			"fact": "Telegram's ReactionTypeEmoji set is exactly 73 emoji, ❤ is bare U+2764 with no U+FE0F, and ✅/❌/🦞 are absent.",
+			"provenance": "Leader fetched https://core.telegram.org/bots/api on 2026-08-27 and extracted the alt-text of every emoji in the ReactionTypeEmoji 'Currently, it can be one of' enumeration: exactly 73 entries. The adapter table in packages/adapter-telegram/src/reactions.ts is that list verbatim, and packages/adapter-telegram/test/reactions.test.ts asserts it bidirectionally against the protocol capability set."
+		},
+		{
+			"id": "V-2",
+			"fact": "Discord documents no fixed per-route numeric reaction limit; 429 carries retry_after in SECONDS, the global limit is 50 req/s, and limits must not be hardcoded. discord.js RateLimitError.retryAfter is MILLISECONDS. GUILD_MESSAGE_REACTIONS (1<<10) and DIRECT_MESSAGE_REACTIONS (1<<13) are not privileged.",
+			"provenance": "Leader fetched docs.discord.com/developers/topics/rate-limits and .../events/gateway on 2026-08-27; the millisecond unit is from the @discordjs/rest RateLimitData typings in node_modules. The 250ms per-channel floor remains OUR number and is labelled unverified in the code."
+		}
+	],
+	"finalCertification": {
+		"recordedBy": "leader (the 13-ReactionsQaFinal re-certification lane failed at launch three times; these counts are the leader's own re-runs, not an independent lane's)",
+		"commit": "357b9085017b9a989ee6b6807abc3942e5c29110",
+		"baseRef": "origin/main at 8e2a4f3, after the branch was rebased onto it",
+		"commands": [
+			{
+				"command": "bun test packages/",
+				"exactOutput": "839 pass / 2 skip / 0 fail; Ran 841 tests across 66 files",
+				"verdict": "pass"
+			},
+			{
+				"command": "bun node_modules/typescript/lib/tsc.js --noEmit -p tsconfig.json",
+				"exactOutput": "no output, exit 0",
+				"verdict": "pass"
+			},
+			{
+				"command": "bun test packages/gateway/test/reactions-redteam.e2e.test.ts",
+				"exactOutput": "38 pass / 0 fail / 656 expect() calls",
+				"verdict": "pass",
+				"note": "recorded before the rebase; the suite is unchanged by it"
+			}
+		],
+		"note": "packages/admin previously failed to resolve its workspace imports on this machine after a clean install. That was a defect in packages/admin/package.json on origin/main, untouched by this branch, and it was fixed upstream by 546f750 'Declare the admin package's workspace dependencies'. With that in main the full suite is green."
+	},
+	"cohortCertification": {
+		"producedBy": "executor QA/red-team lane 15-ReactionsCohortQa (cohort re-certification, post-rebase)",
+		"recordedAt": "2026-08-27T08:35+09:00",
+		"frozenSourceHash": "sha256:a37edba27a6fd0f8184e323228ddda3dbce7ca2a0f13916f86e1ecabbe9a4ba7",
+		"commit": "d8733e4",
+		"branch": "feat/discord-reactions",
+		"baseRef": "origin/main at 8e2a4f3 (five commits ahead: 257c9b0, 8c09b7c, ae6071b, 357b908, d8733e4)",
+		"treeState": "clean (git status --porcelain empty before and after this lane; no product source and no test source changed)",
+		"scope": "re-certification only: no new test file, no product change, no commit, no formatter, no dependency change. This artifact file is the only file written.",
+		"commands": [
+			{
+				"id": "CC-1",
+				"command": "bun test packages/gateway/test/reactions-redteam.e2e.test.ts",
+				"exactOutput": "38 pass / 0 fail / 0 skip / 656 expect() calls; Ran 38 tests across 1 file [26.02s]",
+				"verdict": "pass",
+				"note": "32 general + 6 RT-CAPABILITY cases, unchanged by the two rebases; count matches finalCertification."
+			},
+			{
+				"id": "CC-2",
+				"command": "bun test packages/gateway packages/protocol packages/adapter-discord packages/adapter-telegram",
+				"exactOutput": "386 pass / 2 skip / 0 fail / 2466 expect() calls; Ran 388 tests across 42 files [43.10s]",
+				"verdict": "pass",
+				"note": "The 2 skips are pre-existing and unrelated to the reaction surface."
+			},
+			{
+				"id": "CC-3",
+				"command": "bun test packages/",
+				"exactOutput": "run 1: 838 pass / 2 skip / 1 fail / 3479 expect() calls; Ran 841 tests across 66 files [48.40s]. run 2 (identical command, immediately after): 839 pass / 2 skip / 0 fail / 3481 expect() calls; Ran 841 tests across 66 files [43.88s].",
+				"verdict": "pass on rerun; one flaky failure observed once",
+				"flake": {
+					"test": "inflight platform delivery is duplicate-labeled after a process crash",
+					"location": "packages/gateway/test/delivery-crash.e2e.test.ts:30 (Bun.connect -> ENOENT, \"Failed to connect\")",
+					"isolatedRerun": "bun test packages/gateway/test/delivery-crash.e2e.test.ts -> 1 pass / 0 fail / 2 expect() calls",
+					"classification": "pre-existing harness flake, NOT a reaction defect: the file is untouched by all five branch commits (git log 8e2a4f3..d8733e4 -- that path is empty), the failure is a unix-socket connect race while 66 files run in parallel, and it passes both in isolation and in the CC-2 scope."
+				}
+			},
+			{
+				"id": "CC-4",
+				"command": "bun node_modules/typescript/lib/tsc.js --noEmit -p tsconfig.json",
+				"exactOutput": "no diagnostics printed; exit code 0",
+				"verdict": "pass"
+			}
+		],
+		"rebaseIntegrity": {
+			"conflictSurface": [
+				"packages/adapter-discord/src/main.ts",
+				"packages/adapter-telegram/src/main.ts"
+			],
+			"verdict": "BOTH SIDES SURVIVED AND STILL COMPOSE, verified from source and from green tests. The reaction side and the sibling reply-metadata side occupy disjoint branches of the same functions and neither swallows the other.",
+			"evidence": {
+				"discordReactionSideStillReactsAndPostsNothing": "packages/adapter-discord/src/main.ts:364-372 — settleDiscordDelivery returns early through settleDiscordReaction when message.reaction is set, so the text path (:373-403) is never entered. Reaction ports are created once per subscription at :415 and threaded into the call at :417.",
+				"discordReplyThreadingStillThreads": "packages/adapter-discord/src/main.ts:386-390 — first chunk only, channel.send({content, reply:{messageReference: message.replyToMessageId, failIfNotExists:false}}); subsequent chunks and non-replies use the plain send at :391.",
+				"discordInboundReplyMetadataStillWired": "packages/adapter-discord/src/main.ts:21 (import), :150 (const replyTo = resolveReplyContext(message, botId)) and the payload spread, with engagement policy untouched.",
+				"telegramReactionSideStillReactsAndPostsNothing": "packages/adapter-telegram/src/main.ts:206-208 — the delivery subscription dispatches message.reaction to settleTelegramReaction (:171-197, setMessageReaction only, no sendMessage on any path) and everything else to settleTelegramDelivery.",
+				"telegramTextSideStillThreads": "packages/adapter-telegram/src/main.ts:150 — sendMessage(route.chatId, chunk, route.messageThreadId) keeps forum-topic routing; :5-6 import both the reaction mapper and resolveTelegramReplyContext, and only one resolve call exists."
+			},
+			"testsThatProtectTheReactionSide": [
+				"packages/gateway/test/reactions-redteam.e2e.test.ts RT-DISCORD-01 (:985) — six scenarios assert harness.sent === [] (nothing posted) and exactly one confirm/fail per reaction.",
+				"packages/gateway/test/reactions-redteam.e2e.test.ts RT-TELEGRAM-02 (:1217) — five outcomes assert zero sendMessage calls and exactly one ledger settlement.",
+				"packages/gateway/test/reactions-redteam.e2e.test.ts imports settleTelegramReaction from ../../adapter-telegram/src/main (:39): had the resolution dropped the reaction export from telegram main.ts, the whole 38-case file would fail to load.",
+				"packages/adapter-discord/test/reactions.test.ts and packages/adapter-telegram/test/reactions.test.ts — per-adapter reaction behaviour (custom emoji resolution, cache isolation, capability refusal)."
+			],
+			"testsThatProtectTheReplyMetadataSide": [
+				"packages/gateway/test/reply-redteam.test.ts:688-708 — readSource(\"packages/adapter-discord/src/main.ts\") asserts the EXACT set of replyTo lines (toEqual on [\"const replyTo = resolveReplyContext(message, botId);\", \"...(replyTo ? { replyTo } : {}),\"]) plus the verbatim mentioned expression. A dropped Discord reply-metadata side fails here immediately.",
+				"packages/gateway/test/reply-redteam.test.ts:710-720 — readSource(\"packages/adapter-telegram/src/main.ts\") asserts the verbatim mentioned expression including replyTo?.fromSelf === true, the verbatim resolveTelegramReplyContext(message.reply_to_message, botUserId) line, and that exactly one resolve call exists.",
+				"packages/gateway/test/server.test.ts:305 \"[REPLY:id] parts thread to the referenced message and strip the directive\" — asserts replyToMessageId: \"msg-42\" on the first emitted chat.message and undefined on the second (:342-344): the gateway half of reply-threading.",
+				"packages/adapter-telegram/test/adapter.test.ts:67 \"persists a forum topic route across restart and sends replies to its topic\" — asserts sendMessage receives thread 99, i.e. the Telegram text path still routes."
+			],
+			"coverageGap": {
+				"answer": "YES — one narrow gap remains, and it is on the merge seam itself rather than on either feature.",
+				"detail": "No test anywhere calls settleDiscordDelivery with a payload carrying message.reaction, and no test anywhere calls it with message.replyToMessageId (repo-wide search for replyToMessageId finds only packages/gateway/src/delivery/delivery.ts:15/25, packages/protocol/src/catalog.ts:126, packages/gateway/test/server.test.ts:342-344 and packages/gateway/test/reply-redteam.test.ts:703 — never an adapter call). The six settleDiscordDelivery call sites in packages/adapter-discord/test/adapter.test.ts (:98, :110, :116, :157, :231, :234) all pass plain text. subscribeTelegramDeliveries has no test at all. So the two lines of dispatch/branch logic that the rebase actually had to resolve are the only reaction/reply code in the repo with no behavioural test.",
+				"consequence": "If a future resolution deleted the reaction branch at packages/adapter-discord/src/main.ts:364-372 or the ternary at packages/adapter-telegram/src/main.ts:206-208, a reaction delivery would fall into the text path and POST the bare emoji as a message (delivery.ts:53-59 sets text = reaction.emoji by design), and all 841 tests would still be green. Likewise, deleting packages/adapter-discord/src/main.ts:386-390 would silently stop Discord reply-threading with a green suite.",
+				"currentTreeStatus": "Not a live regression: at d8733e4 all three branches are present and correct by source inspection, and every executed path is green. The gap is a missing guard, filed as BLOCKER-CC-1 below.",
+				"suggestedFix": "Two assertions in the existing packages/adapter-discord/test/adapter.test.ts and one in packages/adapter-telegram/test/adapter.test.ts: settleDiscordDelivery with {reaction} must call channel.send zero times; settleDiscordDelivery with {replyToMessageId} must send {content, reply:{messageReference}} on the first chunk only; subscribeTelegramDeliveries must route a reaction payload to setMessageReaction and never to sendMessage. Deliberately NOT written by this lane (bounded re-certification, no new test surface)."
+			}
+		},
+		"spotChecks": [
+			{
+				"requirement": "requirement 1 — an inbound reaction is metadata, never a turn",
+				"case": "RT-INBOUND-01 (packages/gateway/test/reactions-redteam.e2e.test.ts:243)",
+				"assertionsThatBite": "calls === {ensureSession:0, sendTurn:0}; turns === []; chatMessages === 0; inboundPendingCount === 0; deliveryRows === 0; exactly 20 conversation_context rows, 10 \"[reaction] reacted\" and 10 \"[reaction] removed\"; every response {recorded:true, engaged:false}.",
+				"sourceUnderTest": "packages/gateway/src/server/server.ts:562-627 — the engagement.reaction arm records one contextRecord row (:610-619) and replies {recorded:true, engaged:false} (:624); it never touches inboundEnqueue/drainOrigin (used only by chat.send at :746/:765).",
+				"regressionThatWouldBreakIt": "Wiring engagement.reaction into inboundEnqueue/drainOrigin (or letting it return engaged:true) would make ensureSession/sendTurn non-zero and emit a chat.message, failing three independent assertions. Reverting the random suffix in the synthetic context id at :611 to a bare ISO timestamp collapses the 20 same-millisecond rows to 4 on the ON CONFLICT(message_id) DO NOTHING insert, failing the row-count assertions (this is the historical BLOCKER-2 shape, and RT-INBOUND-05 at :282 isolates timestamp collision from deduplication)."
+			},
+			{
+				"requirement": "requirement 4 — a malformed reaction token costs the reaction, never the reply",
+				"case": "RT-TOKEN-03 (packages/gateway/test/reactions-redteam.e2e.test.ts:699)",
+				"assertionsThatBite": "eight replies -> texts toEqual the seven malformed strings verbatim plus \"@1 발사합니다\" for the one well-formed token; reactionEvents length 1; deliveryRows length 9; and the pure-parser cross-check parseReactionReply(reply) === undefined for all seven.",
+				"sourceUnderTest": "packages/protocol/src/reactions.ts:164-192 — REACT_TOKEN /^\\s*\\[REACT:([^\\]\\n]*)\\]/ with all-or-nothing parsing: an unresolvable emoji, or an @ with a target failing isPlatformMessageId (:158/:182), returns undefined for the WHOLE reply; resolveReactionEmoji (:80-87) accepts only allowlist unicode (modulo one U+FE0F strip) or :name:.",
+				"regressionThatWouldBreakIt": "Any move to lenient parsing — skipping a bad token instead of returning undefined at :182/:190, dropping the isPlatformMessageId check on the @target, case-insensitive [react:, or accepting a non-allowlist emoji such as 🚀 — changes both the emitted text array (the token would be stripped from the reply) and reactionEvents/deliveryRows counts, failing three assertions plus the parser cross-check."
+			},
+			{
+				"requirement": "requirement 5/7 — the platform-capability guard (RT-CAPABILITY)",
+				"case": "RT-CAPABILITY-05 (packages/gateway/test/reactions-redteam.e2e.test.ts:1380)",
+				"assertionsThatBite": "door 1 (chat.react): every spelling of every telegram-undeliverable entry returns an invalid_params error frame containing \"telegram cannot react with\", with no success response and deliveryRows === 0. door 2 (reply token): one turn per entry, one \"reaction skipped\" log line per spelling naming both the unicode and the name, reactionEvents === 0, and the reply bodies still ship verbatim with one delivery row each.",
+				"sourceUnderTest": "packages/protocol/src/reactions.ts:100-104 (TELEGRAM_INCAPABLE = {check, cross, lobster}, platformSupportsReaction) enforced structurally at BOTH doors: packages/gateway/src/server/server.ts:533-537 (chat.react throws ProtocolError invalid_params) and packages/gateway/src/server/server.ts:951-955 (reply-token path logs \"reaction skipped\" and continue, before prepareReaction at :969).",
+				"regressionThatWouldBreakIt": "Removing either guard call site: dropping :533 makes the error frame undefined and creates ledger rows (three assertions fail); dropping :951-955 makes reactionEvents non-zero and the skip-log count zero. Narrowing the guard to a single spelling (e.g. comparing raw input instead of the resolved allowlist name) fails on the alternate spellings the case sweeps, since resolveReactionEmoji canonicalises :name:, U+FE0F and unicode to one entry before the check."
+			}
+		],
+		"blockers": [
+			{
+				"id": "BLOCKER-CC-1",
+				"severity": "blocker",
+				"type": "coverage (test-only; no product fix required and none applied)",
+				"title": "The rebase seam itself is untested: the adapter dispatch branches that separate a reaction delivery from a text/reply delivery have no behavioural test, so a dropped side would pass unnoticed",
+				"location": "packages/adapter-discord/src/main.ts:364-372 (reaction branch) and packages/adapter-discord/src/main.ts:386-390 (reply-threaded send); packages/adapter-telegram/src/main.ts:206-208 (reaction/text dispatch). Nearest existing tests that should carry the assertions: packages/adapter-discord/test/adapter.test.ts:98 and packages/adapter-telegram/test/adapter.test.ts:67.",
+				"detail": "Verified by exhaustive repo search: no test passes a reaction payload or a replyToMessageId to settleDiscordDelivery, and subscribeTelegramDeliveries is never exercised. All reaction assertions enter one level below the dispatch (settleDiscordReaction / settleTelegramReaction directly). Both sides are present and correct at d8733e4, so this is a missing guard rather than a live defect — but it is precisely the code the two rebases had to resolve.",
+				"status": "reported, not fixed (lane mandate: no new files, no product source changes, bounded re-certification)"
+			}
+		],
+		"carriedForwardKnownGaps": [
+			{
+				"id": "BLOCKER-1 (historical, pre-existing on origin/main)",
+				"status": "still present in product source at packages/gateway/src/server/server.ts:124 (write: (frame) => socket.write(encodeFrame(frame))) and packages/sdk/src/client.ts:63 (socket.write(data)) — neither checks the short-write return value.",
+				"reactionSurfaceImpact": "closed: isPlatformMessageId (packages/protocol/src/reactions.ts:158) bounds every reaction id to 64 chars at both verbs and in the token parser, so no reaction path can produce an oversized frame. Unchanged by the rebase; not a blocker of this cohort."
+			},
+			{
+				"id": "F-3 (open by design)",
+				"status": "the per-turn cap of 3 does not bound chat.react, which has no turn; the per-message cap of 1 still applies. Covered by RT-CAP-03 and documented in ReactionBudget."
+			}
+		],
+		"verdict": {
+			"overall": "pass",
+			"e2eStatus": "pass",
+			"redTeamStatus": "pass with one coverage blocker (BLOCKER-CC-1); no behavioural defeat of the reaction surface or of the platform-capability guard was found",
+			"blockers": [
+				"BLOCKER-CC-1"
+			],
+			"statement": "At commit d8733e4, frozen sourceHash sha256:a37edba27a6fd0f8184e323228ddda3dbce7ca2a0f13916f86e1ecabbe9a4ba7, the reaction surface re-certifies green on all four commands and the post-rebase composition of the reaction wiring with the sibling reply-metadata work is intact in both adapter main.ts files. The single blocker is a missing test guard on the merge seam, not a broken behaviour."
+		},
+		"blockerResolution": {
+			"id": "BLOCKER-CC-1",
+			"status": "resolved by the leader after this lane reported it",
+			"fix": "Three behavioural tests now cover the merge seam: 'a reaction delivery reacts to its target and never posts a message' and 'a reply-threaded delivery threads its first chunk and only its first chunk' in packages/adapter-discord/test/adapter.test.ts, and 'the delivery subscription routes a reaction to setMessageReaction and never to sendMessage' in packages/adapter-telegram/test/adapter.test.ts.",
+			"mutationProof": "Each was verified by mutation rather than assertion. Disabling the Discord reaction branch fails the reaction test (15 pass / 1 fail); removing the Telegram reaction routing fails the subscription test (7 pass / 1 fail); removing the Discord reply-threading arm fails the threading test (15 pass / 1 fail). Each mutation was reverted with git checkout immediately after the run."
+		}
+	}
+}
