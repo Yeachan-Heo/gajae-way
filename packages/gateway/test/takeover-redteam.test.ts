@@ -55,6 +55,9 @@ function blockedChild(
 function createFailure(code: string, message: string): string {
 	return `${JSON.stringify({ ok: false, operation: "session.create", error: { code, message } })}\n`;
 }
+/** Every create fails rebindably: the workhorse for cap/hold assertions. */
+const failingSpawn = (() =>
+	fakeChild(createFailure("resource_gone", "session endpoint record is gone"), "", 1)) as unknown as typeof Bun.spawn;
 
 function createSuccess(sessionId: string): string {
 	return `${JSON.stringify({ ok: true, operation: "session.create", result: { sessionId } })}\n`;
@@ -612,6 +615,75 @@ test("a corrupted durable counter fails CLOSED: rebinds blocked, no epoch consum
 		client.forgetRebinds("discord:dm:c6");
 		await expect(client.ensureSession("discord:dm:c6")).rejects.toMatchObject({ code: "resource_gone" });
 		expect(database.getSessionRecord("discord:dm:c6")?.epoch).toBe(1);
+	} finally {
+		database.close();
+	}
+});
+
+test("a credential array whose closing bracket lies past the bound still redacts whole", () => {
+	// G4-B3: the 600-char work bound must not become an egress boundary. An
+	// unterminated or over-long array redacts the whole bounded window, so the
+	// early entry cannot ride through even though the `]` never arrives in time.
+	const padded = `{"secrets":[\n"wJalrXUtnFEMIK7MDENGbPxRfiCYEXAMPLEKEY",\n${"x".repeat(700)}\n]}`;
+	const notice = formatFailureNotice(new GjcRuntimeError("wrapped", { code: "spawn_failed", message: padded }));
+	expect(notice).not.toContain("wJalrXUtnFEMIK7MDENGbPxRfiCYEXAMPLEKEY");
+	expect(notice).toContain("[redacted]");
+});
+
+test("an empty durable counter value is corruption, not absence", async () => {
+	const database = await makeDatabase("gajaeway-takeover-empty-");
+	try {
+		database.metaSet("rebind_budget:discord:dm:empty", "");
+		const client = new GjcClient(database, 5_000, directory, undefined, { spawn: failingSpawn });
+		await expect(client.ensureSession("discord:dm:empty")).rejects.toMatchObject({
+			name: "RebindCapExceededError",
+		});
+		expect(database.getSessionRecord("discord:dm:empty")?.epoch ?? 0).toBe(0);
+	} finally {
+		database.close();
+	}
+});
+
+test("/new is the first operation against a corrupt counter and restores service on the first reset", async () => {
+	const database = await makeDatabase("gajaeway-takeover-corrupt-new-");
+	const logs: string[] = [];
+	try {
+		database.metaSet("rebind_budget:discord:dm:c7", "{broken");
+		const client = new GjcClient(database, 5_000, directory, undefined, {
+			spawn: failingSpawn,
+			log: (line) => logs.push(line),
+		});
+		// The operator's very first action is /new — it must rewrite the corrupt
+		// counter and lift the hold WITHOUT needing a second reset or restart.
+		client.forgetRebinds("discord:dm:c7");
+		await expect(client.ensureSession("discord:dm:c7")).rejects.toMatchObject({ code: "resource_gone" });
+		expect(database.getSessionRecord("discord:dm:c7")?.epoch).toBe(1);
+	} finally {
+		database.close();
+	}
+});
+
+test("a restart followed by clear preserves the durable lifetime audit total", async () => {
+	const database = await makeDatabase("gajaeway-takeover-lifetime-");
+	const logs: string[] = [];
+	const spawn = (() =>
+		fakeChild(createFailure("resource_gone", "session endpoint record is gone"), "", 1)) as unknown as typeof Bun.spawn;
+	try {
+		const first = new GjcClient(database, 5_000, directory, undefined, { spawn, log: (line) => logs.push(line) });
+		await expect(first.ensureSession("discord:dm:life")).rejects.toMatchObject({ code: "resource_gone" });
+		expect(logs[0]).toContain("lifetime=1");
+		database.close();
+		// "Restart": the fresh client hydrates {used:1, lifetime:1}; a proven-good
+		// turn clears `used` but the NEXT rebind must log lifetime=2, not 1.
+		const reopened = await GatewayDatabase.open(join(directory!, "gateway.db"));
+		try {
+			const second = new GjcClient(reopened, 5_000, directory, undefined, { spawn, log: (line) => logs.push(line) });
+			second.forgetRebinds("discord:dm:life");
+			await expect(second.ensureSession("discord:dm:life")).rejects.toMatchObject({ code: "resource_gone" });
+			expect(logs[logs.length - 1]).toContain("lifetime=2");
+		} finally {
+			reopened.close();
+		}
 	} finally {
 		database.close();
 	}

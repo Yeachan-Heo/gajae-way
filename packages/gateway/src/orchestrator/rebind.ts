@@ -186,17 +186,18 @@ export function runtimeErrorOfEnvelope(envelope: unknown): RuntimeErrorDetail | 
  * diagnosis and #14 exists to deliver it.
  */
 export function redactSecrets(text: string): string {
+	// A BRACKETED value is handled first via the bounded scanner (a runtime that
+	// dumps `{"secrets":[…]}` must not deliver every entry, and an over-long or
+	// unterminated array must redact WHOLE rather than leak past the bound).
+	const bracketed = redactBracketedCredentials(text);
 	return (
-		text
+		bracketed
 			// Header form FIRST: the key=value rule would otherwise consume only the
 			// scheme word and leave the token itself in the clear.
 			.replace(/\b(Bearer|Basic)\s+[A-Za-z0-9._~+/=-]{8,}/gi, "$1 [redacted]")
-			// An exact credential key, in four value shapes. A BRACKETED value is
-			// handled first (a runtime that dumps `{"secrets":[…]}` must not deliver
-			// every entry), then QUOTED — which may contain whitespace and falls back
-			// to end of line, because an unbalanced quote must never mean "redact
-			// nothing" — then the two unquoted forms.
-			.replace(CREDENTIAL_BRACKETED, "$1[redacted]")
+			// An exact credential key, in three more value shapes. QUOTED may contain
+			// whitespace and falls back to end of line, because an unbalanced quote
+			// must never mean "redact nothing" — then the two unquoted forms.
 			.replace(CREDENTIAL_QUOTED, (match, key: string, quote: string, value: string, close: string | undefined) =>
 				isDiagnosticWord(value) ? match : `${key}${quote}[redacted]${close ?? ""}`,
 			)
@@ -282,10 +283,34 @@ function camelCaseKey(key: string): string {
 const CREDENTIAL_KEY = `(?:^|[\\s,{(\\["'?&#/;])(?:[A-Za-z0-9]+[_-])*?(?:${[...CREDENTIAL_KEYS, ...CREDENTIAL_KEYS.map(camelCaseKey)].join("|")})(?:[_-](?:value|key|token|secret|string|data|b64|base64))*["']?`;
 /**
  * `key: [ … ]` — a list of credentials must not be delivered entry by entry.
- * The body is newline-tolerant (pretty-printed arrays) but bounded to 600
- * characters so a hostile stream cannot balloon the match.
+ * Handled by a bounded scanner (`redactBracketedCredentials`) rather than a
+ * plain regex so the bound can never become an egress boundary: a missing or
+ * over-far closing bracket redacts the bounded window WHOLE instead of
+ * letting the array's entries through.
  */
-const CREDENTIAL_BRACKETED = new RegExp(`(${CREDENTIAL_KEY}\\s*[:=]\\s*)\\[[^\\]]{0,600}?\\]`, "gis");
+const CREDENTIAL_BRACKET_OPEN = new RegExp(`(${CREDENTIAL_KEY}\\s*[:=]\\s*)\\[`, "gi");
+
+/**
+ * Redacts a credential-keyed bracketed array: everything up to the closing
+ * `]` — or, if none appears within the 600-character work bound, the whole
+ * bounded window — is replaced with `[redacted]`. The bound limits WORK only;
+ * content beyond it cannot survive unredacted inside the window.
+ */
+function redactBracketedCredentials(text: string): string {
+	const open = new RegExp(CREDENTIAL_BRACKET_OPEN.source, "gi");
+	let result = "";
+	let copied = 0;
+	for (let match = open.exec(text); match !== null; match = open.exec(text)) {
+		const start = match.index + match[0].length;
+		const window = text.slice(start, start + 600);
+		const close = window.indexOf("]");
+		const consumed = close === -1 ? window.length : close + 1;
+		result += text.slice(copied, match.index) + `${match[1]}[redacted]`;
+		copied = start + consumed;
+		open.lastIndex = copied;
+	}
+	return result + text.slice(copied);
+}
 /** `key: "value with spaces"`; the closing quote is optional so it fails closed. */
 const CREDENTIAL_QUOTED = new RegExp(`(${CREDENTIAL_KEY}\\s*[:=]\\s*)(["'])([^"'\\n]*)(["'])?`, "gi");
 /**
@@ -480,24 +505,27 @@ export class SessionRebinder {
 		if (this.#store.metaGet && !this.#hydrated.has(originKey)) {
 			this.#hydrated.add(originKey);
 			try {
+				// Absence (`undefined`) is the only clean "no counter yet" state: an
+				// EMPTY or malformed stored value is corruption, not absence, and must
+				// fail closed rather than reset the budget to zero.
 				const raw = this.#store.metaGet(`rebind_budget:${originKey}`);
-				const parsed = raw ? (JSON.parse(raw) as { used?: unknown; lifetime?: unknown }) : undefined;
-				if (
-					parsed &&
-					Number.isInteger(parsed.used) &&
-					(parsed.used as number) >= 0 &&
-					Number.isInteger(parsed.lifetime) &&
-					(parsed.lifetime as number) >= 0
-				)
-					return {
-						used: parsed.used as number,
-						lifetime: Math.max(parsed.used as number, parsed.lifetime as number),
-					};
-				if (parsed !== undefined) {
-					// Fail CLOSED: a corrupted durable counter blocks the origin's
-					// rebinds (operator-visible through the cap-exceeded notice) until
-					// an explicit /new rewrites it. Treating corruption as zero would
-					// make every restart an unlimited rebind path.
+				if (raw !== undefined) {
+					const parsed = JSON.parse(raw) as { used?: unknown; lifetime?: unknown };
+					if (
+						parsed &&
+						Number.isInteger(parsed.used) &&
+						(parsed.used as number) >= 0 &&
+						Number.isInteger(parsed.lifetime) &&
+						(parsed.lifetime as number) >= 0
+					) {
+						// Seed the in-memory maps so a later clear()/rebind() preserves
+						// the durable audit total instead of restarting it at 1.
+						const used = parsed.used as number;
+						const lifetime = Math.max(parsed.used as number, parsed.lifetime as number);
+						this.#used.set(originKey, used);
+						this.#lifetime.set(originKey, lifetime);
+						return { used, lifetime };
+					}
 					this.#corrupt.add(originKey);
 					this.#log(
 						`gateway rebind budget for ${originKey} is CORRUPT; rebinds are blocked until /new rewrites the counter`,
@@ -525,14 +553,20 @@ export class SessionRebinder {
 	rebind(originKey: string, causeCode: string, fromEpoch: number): number {
 		const counters = this.#countersFor(originKey);
 		if (counters.used >= this.#cap) throw new RebindCapExceededError(originKey, this.#cap, causeCode, fromEpoch);
-		const toEpoch = this.#store.withTransaction(() => this.#store.rebindEpoch(originKey));
 		const used = counters.used + 1;
 		// Lifetime is its own monotonic counter and must NOT be tied to the
 		// consecutive count: a proven-good turn clears `used` but never history.
 		const lifetime = counters.lifetime + 1;
+		// ONE durable transition: the epoch bump and its counter commit together,
+		// so a crash can never spend an epoch whose counter was not incremented
+		// (that split would let a restart allocate another rebind past the cap).
+		const toEpoch = this.#store.withTransaction(() => {
+			const epoch = this.#store.rebindEpoch(originKey);
+			this.#durable(originKey, used, lifetime);
+			return epoch;
+		});
 		this.#used.set(originKey, used);
 		this.#lifetime.set(originKey, lifetime);
-		this.#durable(originKey, used, lifetime);
 		this.#log(
 			`gateway session rebind ${used}/${this.#cap} origin=${originKey} cause=${causeCode} epoch ${fromEpoch} -> ${toEpoch} lifetime=${lifetime}`,
 		);
@@ -541,9 +575,12 @@ export class SessionRebinder {
 
 	/** Clears the budget after a proven-good turn, or an explicit operator reset. */
 	clear(originKey: string): void {
+		// Hydrate FIRST (so a restart inherits the durable lifetime), then lift the
+		// corruption hold — /new is the explicit operator rewrite of a corrupt
+		// counter, and must not re-read the value it is about to replace.
+		const { lifetime } = this.#countersFor(originKey);
 		this.#used.delete(originKey);
-		// /new is the explicit operator rewrite: it clears a corruption hold too.
 		this.#corrupt.delete(originKey);
-		this.#durable(originKey, 0, this.#countersFor(originKey).lifetime);
+		this.#durable(originKey, 0, lifetime);
 	}
 }
