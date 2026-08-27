@@ -268,9 +268,7 @@ export class GatewayDatabase {
 	/** Insertion-order view (rowid) — preserves admission order within the same millisecond. */
 	memoryIntentRowsByRowid(): Array<{ id: string; kind: string; payload_json: string; state: string }> {
 		return this.#database
-			.query(
-				"SELECT id, kind, payload_json, state FROM memory_intents ORDER BY rowid",
-			)
+			.query("SELECT id, kind, payload_json, state FROM memory_intents ORDER BY rowid")
 			.all() as Array<{ id: string; kind: string; payload_json: string; state: string }>;
 	}
 
@@ -546,13 +544,7 @@ export class GatewayDatabase {
 	 * - `monitorEventReleaseLease` is lease-guarded: a stale attempt whose lease
 	 *   expired and was stolen can never release the newer owner's claim.
 	 */
-	monitorEventAcquireLease(
-		eventId: string,
-		owner: string,
-		leaseId: string,
-		ttlMs: number,
-		now = Date.now(),
-	): boolean {
+	monitorEventAcquireLease(eventId: string, owner: string, leaseId: string, ttlMs: number, now = Date.now()): boolean {
 		const nowIso = new Date(now).toISOString();
 		const expiresIso = new Date(now + ttlMs).toISOString();
 		const claim = this.#database
@@ -566,9 +558,7 @@ WHERE excluded.acquired_at IS NOT NULL AND (SELECT expires_at FROM dispatch_leas
 	}
 	/** Releases a lease only when the caller still owns it (stale attempts are no-ops). */
 	monitorEventReleaseLease(eventId: string, leaseId: string): void {
-		this.#database
-			.query("DELETE FROM dispatch_leases WHERE event_id = ? AND lease_id = ?")
-			.run(eventId, leaseId);
+		this.#database.query("DELETE FROM dispatch_leases WHERE event_id = ? AND lease_id = ?").run(eventId, leaseId);
 	}
 	/** Returns the lease id of the live (unexpired) claim, if any. */
 	monitorEventLiveLeaseOwner(eventId: string, now = Date.now()): string | undefined {
@@ -623,7 +613,13 @@ SELECT 1 FROM dispatch_leases l WHERE l.event_id = monitor_events.event_id AND l
 	 * one transaction, both gated on the live lease. A stale attempt cannot write
 	 * its note over the newer attempt's.
 	 */
-	monitorEventFencedAuthor(eventId: string, leaseId: string, note: string, noDelivery = false, now = Date.now()): boolean {
+	monitorEventFencedAuthor(
+		eventId: string,
+		leaseId: string,
+		note: string,
+		noDelivery = false,
+		now = Date.now(),
+	): boolean {
 		return this.withTransaction(() => {
 			const changes = this.#database
 				.query(
@@ -632,7 +628,13 @@ WHERE event_id = ? AND EXISTS (
 SELECT 1 FROM dispatch_leases l WHERE l.event_id = monitor_events.event_id AND l.lease_id = ? AND l.expires_at > ?
 )`,
 				)
-				.run(noDelivery ? "authored_no_delivery" : "authored", new Date(now).toISOString(), eventId, leaseId, new Date(now).toISOString()).changes;
+				.run(
+					noDelivery ? "authored_no_delivery" : "authored",
+					new Date(now).toISOString(),
+					eventId,
+					leaseId,
+					new Date(now).toISOString(),
+				).changes;
 			if (changes === 0) return false;
 			this.authoredOutputCreate(eventId, note);
 			return true;
@@ -683,9 +685,7 @@ SELECT 1 FROM dispatch_leases l WHERE l.event_id = monitor_events.event_id AND l
 		leaseId: string,
 		note: string,
 		noDelivery: boolean,
-		monitorId: string,
 		eventType: string,
-		firedAt: string,
 		intentId: string,
 		originRefJson: string,
 		now = Date.now(),
@@ -706,8 +706,12 @@ SELECT 1 FROM dispatch_leases l WHERE l.event_id = monitor_events.event_id AND l
 					`UPDATE monitor_events SET stage = ?, updated_at = ?
 WHERE event_id = ? AND ${leasePredicate}`,
 				)
-				.run(noDelivery ? "authored_no_delivery" : "authored", new Date(now).toISOString(), eventId, ...leaseArgs)
-				.changes;
+				.run(
+					noDelivery ? "authored_no_delivery" : "authored",
+					new Date(now).toISOString(),
+					eventId,
+					...leaseArgs,
+				).changes;
 			if (changes === 0) return false;
 			this.authoredOutputCreate(eventId, note);
 			// Idempotent intent: the INSERT is keyed on the deterministic intent id;
@@ -727,8 +731,6 @@ WHERE event_id = ? AND ${leasePredicate}`,
 					replyText: note,
 				}),
 			});
-			void monitorId;
-			void firedAt;
 			return true;
 		});
 	}
@@ -736,7 +738,14 @@ WHERE event_id = ? AND ${leasePredicate}`,
 	 * Fenced failure write: failed stage + public-safe evidence row in one
 	 * transaction, both gated on the live lease (round-3 blocker 1).
 	 */
-	monitorEventFencedFail(eventId: string, leaseId: string, batchId: string, code: string, detail: string, now = Date.now()): boolean {
+	monitorEventFencedFail(
+		eventId: string,
+		leaseId: string,
+		batchId: string,
+		code: string,
+		detail: string,
+		now = Date.now(),
+	): boolean {
 		return this.withTransaction(() => {
 			const changes = this.#database
 				.query(
@@ -789,7 +798,12 @@ SELECT 1 FROM dispatch_leases l WHERE l.event_id = monitor_events.event_id AND l
 		// Fail path: only demote events still in `authored`; never touch delivered
 		// (or any terminal stage).
 		if (stage === "authored" && row.stage === "authored") return false;
-		if (stage === "authored" && row.stage !== "delivered" && row.stage !== "authored_no_delivery" && row.stage !== "failed_no_retry") {
+		if (
+			stage === "authored" &&
+			row.stage !== "delivered" &&
+			row.stage !== "authored_no_delivery" &&
+			row.stage !== "failed_no_retry"
+		) {
 			this.monitorEventUpdate(eventId, "authored");
 			return true;
 		}
@@ -918,30 +932,26 @@ SELECT 1 FROM dispatch_leases l WHERE l.event_id = monitor_events.event_id AND l
 		payloadJson: string;
 	}): boolean {
 		const now = new Date().toISOString();
-		return (
-			this.withTransaction(() => {
-				const claim = this.#database
-					.query(
-						"INSERT INTO monitor_slots (monitor_id, slot_at, event_id, created_at) VALUES (?, ?, ?, ?) ON CONFLICT(monitor_id, slot_at) DO NOTHING",
-					)
-					.run(row.monitorId, row.slotAt, row.eventId, now).changes;
-				if (claim === 0) return false;
-				this.monitorEventCreate({
-					eventId: row.eventId,
-					monitorId: row.monitorId,
-					eventType: row.eventType,
-					payloadJson: row.payloadJson,
-					firedAt: row.slotAt,
-				});
-				return true;
-			}) as boolean
-		);
+		return this.withTransaction(() => {
+			const claim = this.#database
+				.query(
+					"INSERT INTO monitor_slots (monitor_id, slot_at, event_id, created_at) VALUES (?, ?, ?, ?) ON CONFLICT(monitor_id, slot_at) DO NOTHING",
+				)
+				.run(row.monitorId, row.slotAt, row.eventId, now).changes;
+			if (claim === 0) return false;
+			this.monitorEventCreate({
+				eventId: row.eventId,
+				monitorId: row.monitorId,
+				eventType: row.eventType,
+				payloadJson: row.payloadJson,
+				firedAt: row.slotAt,
+			});
+			return true;
+		}) as boolean;
 	}
 	/** Test/recovery seam: move a monitor's creation instant (clamps catch-up). */
 	monitorSetCreatedAt(monitorId: string, createdAt: string): void {
-		this.#database
-			.query("UPDATE monitors SET created_at = ? WHERE monitor_id = ?")
-			.run(createdAt, monitorId);
+		this.#database.query("UPDATE monitors SET created_at = ? WHERE monitor_id = ?").run(createdAt, monitorId);
 	}
 	monitorSlotExists(monitorId: string, slotAt: string): boolean {
 		const row = this.#database

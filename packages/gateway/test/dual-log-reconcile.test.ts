@@ -43,6 +43,7 @@ test("reconciliation uses retained authored output and otherwise re-dispatches",
 					queued.push(mutation);
 					return "intent";
 				},
+				enqueueExistingId: () => {},
 			} as never,
 			delivery: new DeliveryService(new DeliveryLedger(database)),
 			emit: () => {},
@@ -97,7 +98,7 @@ test("reconcile replays same-millisecond events oldest-first", async () => {
 			database,
 			registry,
 			gjc: { ensureSession: async () => ({ sessionId: "s" }), sendTurn: async () => "[]" },
-			memory: { enqueue: () => "intent" } as never,
+			memory: { enqueue: () => "intent", enqueueExistingId: () => {} } as never,
 			delivery: new DeliveryService(new DeliveryLedger(database)),
 			emit: () => {},
 		});
@@ -138,7 +139,6 @@ test("a monitor without its own channel target reports authored notes to the own
 	const { GatewayDatabase } = await import("../src/store/db");
 	const { MonitorRegistry } = await import("../src/monitors/registry");
 	const { MonitorPropagator } = await import("../src/monitors/propagate");
-	const { MemoryClosureQueue } = await import("../src/memory/closure");
 	const { DeliveryService } = await import("../src/delivery/delivery");
 	const { DeliveryLedger } = await import("../src/store/ledger");
 	const directory = await mkdtemp(join(tmpdir(), "gajaeway-ownertarget-"));
@@ -164,7 +164,7 @@ test("a monitor without its own channel target reports authored notes to the own
 					})),
 				),
 		},
-		memory: { enqueue: () => {} } as never,
+		memory: { enqueue: () => {}, enqueueExistingId: () => {} } as never,
 		delivery,
 		emit: () => {},
 		deliver: (payload: unknown) => void pushed.push(payload),

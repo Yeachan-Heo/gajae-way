@@ -1,8 +1,8 @@
 import {
 	CATCH_ALL_EVENT_ORIGIN,
 	type ChatMessagePayload,
-	isSilenceToken,
 	eventTypeOrigin,
+	isSilenceToken,
 	type MonitorEventRecord,
 	type OriginRef,
 	originKey,
@@ -195,8 +195,7 @@ export class MonitorPropagator {
 				const hasMemory = this.#database
 					.memoryIntentRows()
 					.some((intent) => intent.kind === "monitor-event" && intent.payload_json.includes(row.event_id));
-				if (output && !hasMemory)
-					this.#author(row.event_id, output, row.stage === "authored_no_delivery", row);
+				if (output && !hasMemory) this.#author(row.event_id, output, row.stage === "authored_no_delivery", row);
 				else if (!output && this.#recoverable(row)) {
 					// Red-team blocker 1: a live dispatch lease owned by ANOTHER attempt
 					// means the authoring turn may still complete elsewhere; a new
@@ -316,13 +315,14 @@ export class MonitorPropagator {
 						leaseId,
 						entry.note,
 						false,
-						monitor.monitorId,
 						row.event_type,
-						row.fired_at,
 						intentId,
 						JSON.stringify(eventTypeOrigin(row.event_type)),
 					);
 					if (!authoredOk) continue;
+					// Wake the closure queue so the atomically admitted intent is
+					// processed in the same run (no restart needed).
+					this.#memory.enqueueExistingId(intentId);
 					this.#emit({
 						eventId: entry.eventId,
 						monitorId: monitor.monitorId,
@@ -387,13 +387,7 @@ export class MonitorPropagator {
 			// The raw error body can carry secrets and is never persisted or logged.
 			const code: DispatchFailureCode = failureCode(error);
 			for (const row of leased) {
-				this.#database.monitorEventFencedFail(
-					row.event_id,
-					leaseId,
-					batchId,
-					code,
-					`dispatch phase failed (${code})`,
-				);
+				this.#database.monitorEventFencedFail(row.event_id, leaseId, batchId, code, `dispatch phase failed (${code})`);
 			}
 			console.error(`monitor dispatch failed (${code}): events ${leased.map((row) => row.event_id).join(",")}`);
 		} finally {
@@ -419,7 +413,12 @@ export class MonitorPropagator {
 		timer.unref?.();
 		return () => clearInterval(timer);
 	}
-	#author(eventId: string, note: string, noDelivery = false, row?: { monitor_id: string; event_type: string; fired_at: string }): void {
+	#author(
+		eventId: string,
+		note: string,
+		noDelivery = false,
+		row?: { monitor_id: string; event_type: string; fired_at: string },
+	): void {
 		const eventRow = row ?? this.#database.monitorEventRows().find((candidate) => candidate.event_id === eventId);
 		if (!eventRow) return;
 		// Atomic output+intent with a DETERMINISTIC intent id: reconcile and a
@@ -430,12 +429,12 @@ export class MonitorPropagator {
 			"",
 			note,
 			noDelivery,
-			eventRow.monitor_id,
 			eventRow.event_type,
-			eventRow.fired_at,
 			intentId,
 			JSON.stringify(eventTypeOrigin(eventRow.event_type)),
 		);
+		// Wake the closure queue for the intent admitted above.
+		this.#memory.enqueueExistingId(intentId);
 		this.#emit({
 			eventId,
 			monitorId: eventRow.monitor_id,

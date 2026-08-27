@@ -44,7 +44,13 @@ export class MonitorRuntime {
 						// Returns whether the slot was NEWLY admitted (false for
 						// restart-overlap duplicates) so the catch-up budget counts
 						// only real admissions.
-						(slotAt) => this.#propagator.submitSlot(monitor.monitorId, monitor.eventTypes[0]!, { at: slotAt.toISOString() }, slotAt) !== null,
+						(slotAt) =>
+							this.#propagator.submitSlot(
+								monitor.monitorId,
+								monitor.eventTypes[0]!,
+								{ at: slotAt.toISOString() },
+								slotAt,
+							) !== null,
 						{ now: this.#clock },
 					),
 				);

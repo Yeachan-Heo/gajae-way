@@ -35,7 +35,7 @@ test("event-type sessions persist until their explicit epoch is bumped", async (
 			database,
 			registry,
 			gjc,
-			memory: { enqueue: () => "intent" } as never,
+			memory: { enqueue: () => "intent", enqueueExistingId: () => {} } as never,
 			delivery: new DeliveryService(new DeliveryLedger(database)),
 			emit: () => {},
 		});

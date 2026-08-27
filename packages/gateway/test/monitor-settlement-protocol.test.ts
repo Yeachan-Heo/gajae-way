@@ -161,18 +161,22 @@ test("RT-29 duplicate confirm on confirmed keeps monitor events delivered", asyn
 	ctx.send({ v: "0.1", type: "hello", payload: { supportedVersions: ["0.1"] } });
 	ctx.send({ v: "0.1", type: "request", id: "c1", verb: "delivery.confirm", params: { deliveryId: ctx.deliveryId } });
 	await response(ctx.frames, "c1");
-	expect(ctx.db.monitorEventRows().filter((row) => ctx.eventIds.includes(row.event_id)).map((row) => row.stage)).toEqual([
-		"delivered",
-		"delivered",
-	]);
+	expect(
+		ctx.db
+			.monitorEventRows()
+			.filter((row) => ctx.eventIds.includes(row.event_id))
+			.map((row) => row.stage),
+	).toEqual(["delivered", "delivered"]);
 	// Duplicate confirm (idempotent ack):
 	ctx.send({ v: "0.1", type: "request", id: "c2", verb: "delivery.confirm", params: { deliveryId: ctx.deliveryId } });
 	const dup = await response(ctx.frames, "c2");
 	expect(dup.result).toEqual({ settled: true });
-	expect(ctx.db.monitorEventRows().filter((row) => ctx.eventIds.includes(row.event_id)).map((row) => row.stage)).toEqual([
-		"delivered",
-		"delivered",
-	]);
+	expect(
+		ctx.db
+			.monitorEventRows()
+			.filter((row) => ctx.eventIds.includes(row.event_id))
+			.map((row) => row.stage),
+	).toEqual(["delivered", "delivered"]);
 });
 
 test("delivery.fail before confirmation keeps authored events authored (server protocol)", async () => {

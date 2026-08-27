@@ -78,6 +78,27 @@ export class MemoryClosureQueue {
 		return id;
 	}
 
+	/**
+	 * Idempotent admission for intents whose DB row was already written
+	 * atomically by another writer (e.g. monitorEventFencedAuthorWithIntent):
+	 * schedules the EXISTING intent for processing without inserting a
+	 * duplicate row, so same-run closure still happens while the atomic crash
+	 * boundary is preserved. Safe to call multiple times for the same id —
+	 * each call re-reads current state and skips terminal intents.
+	 */
+	enqueueExistingId(id: string): void {
+		this.#depth++;
+		this.#tail = this.#tail.then(async () => {
+			try {
+				await this.initialize();
+				const intent = this.#database.memoryIntentRows().find((row) => row.id === id);
+				if (intent && intent.state !== "receipted" && intent.state !== "quarantined") await this.#process(intent);
+			} finally {
+				this.#depth--;
+			}
+		});
+	}
+
 	async drain(): Promise<void> {
 		await this.#tail;
 	}

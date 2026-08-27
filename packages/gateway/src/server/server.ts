@@ -365,7 +365,6 @@ async function handleRequest(
 			// `delivered` — only AFTER the adapter confirmed (issue #29 defect 2),
 			// and NEVER when the ledger row is expired: a late confirm on an expired
 			// delivery must not mark monitor events delivered (round-4 blocker 3).
-			// delivery must not mark monitor events delivered (round-4 blocker 3).
 			{
 				const ledgerRow = options.database.deliveryRows().find((row) => row.delivery_id === id);
 				if (ledgerRow?.state === "confirmed") settleMonitorBatch(options.database, id, "delivered");

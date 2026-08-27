@@ -19,7 +19,6 @@ test("coalesce preserves every event identity while using one authoring turn", a
 			eventTypes: ["changed"],
 		});
 		let turns = 0;
-		let mutations = 0;
 		const gjc = {
 			ensureSession: async () => ({ sessionId: "event-session" }),
 			sendTurn: async (_id: string, text: string) => {
@@ -33,12 +32,9 @@ test("coalesce preserves every event identity while using one authoring turn", a
 			},
 		};
 		const memory = {
-			enqueue: () => {
-				mutations++;
-				return crypto.randomUUID();
-			},
+			enqueue: () => crypto.randomUUID(),
+			enqueueExistingId: () => {},
 		};
-		void memory;
 		const pipeline = new MonitorPropagator({
 			database,
 			registry,

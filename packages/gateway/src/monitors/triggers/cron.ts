@@ -1,5 +1,3 @@
-import type { GatewayDatabase } from "../../store/db";
-
 export function cronMatches(schedule: string, date: Date): boolean {
 	const fields = schedule.trim().split(/\s+/);
 	if (fields.length !== 5) throw new Error("cron schedule must have five fields");
@@ -80,7 +78,7 @@ export const CATCH_UP_WINDOW_MS = 60 * 60 * 1000;
  *   blocker 3); the caller persists it as the event's scheduled identity.
  * - Dedupe/budget durability lives with the caller (the propagator claims the
  *   slot and admits the event in one transaction); this module only computes
-	 * WHEN slots are due and always scans the bounded window when ticks were
+ * WHEN slots are due and always scans the bounded window when ticks were
  *   skipped, keeping catch-up bounded by the caller-side claim + budget.
  */
 export function startCron(
