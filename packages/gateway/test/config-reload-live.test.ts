@@ -1,5 +1,5 @@
 import { afterEach, expect, test } from "bun:test";
-import { chmod, mkdir, mkdtemp, rm } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, rm, symlink } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { loadConfig, RELOADABLE_FIELDS, RESTART_REQUIRED_FIELDS, reloadConfig, UNCONSUMED_FIELDS } from "../src/config";
@@ -180,6 +180,18 @@ test("an unreadable but PRESENT config never boots on defaults", async () => {
 	expect(defaults.mentionAllowlist).toBeUndefined();
 	expect(defaults.logVerbosity).toBe("info");
 	await rm(freshHome, { recursive: true, force: true });
+});
+
+test("a config.json symlinked to a deleted target is unreadable, not absent", async () => {
+	// An operator layout: config.json symlinked into a dotfiles repo whose target
+	// moved. The read reports ENOENT while the directory entry plainly exists, so
+	// treating it as "absent" booted the daemon on defaults and opened the room.
+	directory = await mkdtemp(join(tmpdir(), "gajaeway-reload-"));
+	await symlink(join(directory, "moved-away.json"), join(directory, "config.json"));
+	await expect(loadConfig({ home: directory })).rejects.toMatchObject({ code: "config_invalid" });
+	await rm(join(directory, "config.json"));
+	// With the entry genuinely gone, a first boot still gets defaults.
+	expect((await loadConfig({ home: directory })).logVerbosity).toBe("info");
 });
 
 test("over the socket, a vanished config cannot widen a mention-gated room", async () => {

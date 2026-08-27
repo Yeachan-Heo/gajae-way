@@ -168,75 +168,109 @@ export function runtimeErrorOfEnvelope(envelope: unknown): RuntimeErrorDetail | 
 }
 
 /**
- * Secret scrubbing for text that reaches a chat surface. This redacts SECRETS
- * ONLY: a runtime code such as `unsupported_state_version` is the whole
- * diagnosis and is never sensitive, so nothing else is erased.
+ * Secret scrubbing for text that reaches a chat surface.
  *
- * Deliberately a denylist of known secret SHAPES rather than an entropy
- * heuristic: "redact nothing but secrets" means an opaque-looking diagnostic
- * (a session id, a hash, a state version) must survive intact, and an
- * entropy rule cannot tell those from a key.
+ * Two earlier designs failed in opposite directions, so this one is deliberately
+ * boring and explicit. Guessing from the VALUE's shape both erased
+ * `max_tokens=200000` and delivered `secret=deadbeefcafe`; guessing from an
+ * affixed key word erased paths, UUIDs, SHAs and compound codes. A credential is
+ * recognised by exactly two things:
  *
- * Vendor-prefix rules deliberately do NOT anchor on a word boundary. `\b` made
- * `MYKEYsk_live_<secret>` leak, and because control characters are stripped
- * first, one zero-width space was enough to manufacture that adjacency on
- * purpose. Matching the prefix anywhere can only over-redact a secret-shaped
- * token, which is the safe direction.
+ * 1. an EXACT credential key name (`secret=`, `authorization:`,
+ *    `AWS_SECRET_ACCESS_KEY=`), delimiter-bounded so `max_tokens`,
+ *    `token_count` and `auth_expired` are not credential keys at all; and
+ * 2. a vendor SHAPE with its own discriminator (`sk_live_…`, `ghp_…`, `xox…`,
+ *    a JWT triplet, a `Bearer`/`Basic` header value).
+ *
+ * Everything else survives, because a runtime code or a file path is the whole
+ * diagnosis and #14 exists to deliver it.
  */
 export function redactSecrets(text: string): string {
 	return (
 		text
-			// Header form FIRST: `Authorization: Bearer <opaque>`, `Basic <b64>`. The
-			// key=value rule below would otherwise consume only the scheme word and
-			// leave the token itself in the clear.
-			.replace(/(Bearer|Basic|Token)\s+[A-Za-z0-9._~+/=-]{8,}/gi, "$1 [redacted]")
-			// key=value / key: value secret shapes, keeping the key name visible. The
-			// key word may carry affixes, so AWS_SECRET_ACCESS_KEY= is caught as well
-			// as a bare secret=. A QUOTED value is consumed to its closing quote,
-			// because a quoted secret may contain whitespace and stopping at the first
-			// space half-delivered it.
-			.replace(SECRET_ASSIGNMENT_QUOTED, (match, prefix: string, _quote: string, value: string, close: string) =>
-				looksLikeCredential(prefix, value) ? `${prefix}[redacted]${close}` : match,
+			// Header form FIRST: the key=value rule would otherwise consume only the
+			// scheme word and leave the token itself in the clear.
+			.replace(/\b(Bearer|Basic)\s+[A-Za-z0-9._~+/=-]{8,}/gi, "$1 [redacted]")
+			// An exact credential key. The QUOTED form is handled first and runs to
+			// the closing quote — a quoted secret may contain whitespace — falling
+			// back to end of line, because an unbalanced quote must never mean
+			// "redact nothing".
+			.replace(CREDENTIAL_QUOTED, (match, key: string, quote: string, value: string, close: string | undefined) =>
+				isDiagnosticWord(value) ? match : `${key}${quote}[redacted]${close ?? ""}`,
 			)
-			.replace(SECRET_ASSIGNMENT_BARE, (match, prefix: string, value: string) =>
-				looksLikeCredential(prefix, value) ? `${prefix}[redacted]` : match,
+			.replace(CREDENTIAL_BARE, (match, key: string, value: string) =>
+				isDiagnosticWord(value) ? match : `${key}[redacted]`,
 			)
-			// Vendor key prefixes, in both dash and underscore spellings.
-			.replace(/(?:sk|rk|pk|sk_live|sk_test|pk_live|pk_test)[-_][A-Za-z0-9_-]{8,}/gi, "[redacted]")
+			// Vendor shapes carrying their own discriminator: matched anywhere, since
+			// a leading word character used to defeat them and stripping a zero-width
+			// space could manufacture that adjacency.
+			.replace(/(?:sk|pk|rk)[-_](?:live|test|proj|ant|api)[-_][A-Za-z0-9_-]{8,}/gi, "[redacted]")
 			.replace(/(?:ghp|gho|ghu|ghs|ghr|github_pat)_[A-Za-z0-9_]{8,}/g, "[redacted]")
 			.replace(/xox[abposr]-[A-Za-z0-9-]{8,}/g, "[redacted]")
-			.replace(/ey[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}/g, "[redacted]")
+			.replace(/\bey[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}/g, "[redacted]")
+			// The ambiguous two-letter prefixes keep a word boundary: without it
+			// `network_configuration_error` and `task_runner_failed` were destroyed.
+			.replace(/\b(?:sk|pk|rk)[-_][A-Za-z0-9_-]{12,}/gi, "[redacted]")
 	);
 }
 
-const SECRET_KEY_WORD =
-	"[A-Za-z0-9_]{0,24}(?:token|secret|password|passwd|api[_-]?key|apikey|credential|authorization|auth|bearer)[A-Za-z0-9_]{0,24}";
-/** `key: "value with spaces"` — consumed to the closing quote, which is kept. */
-const SECRET_ASSIGNMENT_QUOTED = new RegExp(`(${SECRET_KEY_WORD}\\s*[:=]\\s*(["']))([^"']*)(\\2)`, "gi");
+/**
+ * Key names whose VALUE is a credential by definition. Bounded by a delimiter or
+ * string edge on both sides, so `max_tokens`, `token_count`, `auth_expired` and
+ * `oauth` are not matches: their values are limits, counts and states.
+ */
+const CREDENTIAL_KEYS = [
+	"secret",
+	"secrets",
+	"password",
+	"passwd",
+	"passphrase",
+	"token",
+	"api_key",
+	"apikey",
+	"api-key",
+	"access_key",
+	"secret_key",
+	"secret_access_key",
+	"private_key",
+	"client_secret",
+	"access_token",
+	"refresh_token",
+	"id_token",
+	"session_token",
+	"auth_token",
+	"bearer_token",
+	"credential",
+	"credentials",
+	"authorization",
+];
+/**
+ * `[vendor_prefix_]<credential key>[_suffix][:=] value`. Both affixes are
+ * separator-delimited and the suffix vocabulary is credential-only, which is
+ * what makes `AWS_SECRET_ACCESS_KEY`, `GITHUB_TOKEN` and `my_api_key_value`
+ * match while `max_tokens`, `token_count` and `auth_expired` do not.
+ */
+const CREDENTIAL_KEY = `(?:^|[\\s,{(])(?:[A-Za-z0-9]+[_-])*?(?:${CREDENTIAL_KEYS.join("|")})(?:[_-](?:value|key|token|secret|string|data|b64|base64))*`;
+/** `key: "value with spaces"`; the closing quote is optional so it fails closed. */
+const CREDENTIAL_QUOTED = new RegExp(`(${CREDENTIAL_KEY}\\s*[:=]\\s*)(["'])([^"'\\n]*)(["'])?`, "gi");
 /** `key=value` — one whitespace-delimited token. */
-const SECRET_ASSIGNMENT_BARE = new RegExp(`(${SECRET_KEY_WORD}\\s*[:=]\\s*)([^\\s"',}]+)`, "gi");
+const CREDENTIAL_BARE = new RegExp(`(${CREDENTIAL_KEY}\\s*[:=]\\s*)([^\\s"',}]+)`, "gi");
 
 /**
- * Quantity and state compounds that merely CONTAIN a secret-ish word: their
- * value is a limit, a count or a state, never a credential. Naming them
- * explicitly is honest and readable; guessing from the value's shape is not,
- * which the previous attempt proved in both directions at once — it erased
- * `max_tokens=200000` while letting `secret=deadbeefcafe` through.
+ * The one exemption for an exact credential key: a value that is plainly a CODE
+ * or a prose word rather than a credential. Runtimes do use `authorization` and
+ * `credential` as field names for a reason string, and erasing
+ * `authorization: insufficient_scope_for_this_operation` destroys the whole
+ * diagnosis #14 exists to deliver.
+ *
+ * Narrow on purpose: lowercase snake_case of any length (a code), or a short
+ * all-lowercase word that is not hex (prose, never `deadbeefcafe`). Anything
+ * with a digit, an uppercase letter, punctuation, or unusual length is treated
+ * as a credential.
  */
-const NON_SECRET_KEY =
-	/(?:^|[_-])(?:max|min|num|count|limit|total|remaining|ttl|expires?|expired|age|window|attempts?|retries|seconds|ms)(?:[_-]|$)/i;
-
-/**
- * Guards the key=value rules against erasing diagnosis, while biasing towards
- * redaction: a secret delivered to a chat surface is far worse than a lost
- * value, because the runtime CODE still carries the diagnosis either way.
- */
-function looksLikeCredential(key: string, value: string): boolean {
-	if (NON_SECRET_KEY.test(key)) return false;
-	// A short integer is a count or a limit, not a key.
-	if (/^\d+$/.test(value) && value.length <= 10) return false;
-	// Prose words after an auth-ish key stay readable; credentials are longer.
-	return value.length >= 12;
+function isDiagnosticWord(value: string): boolean {
+	if (/^[a-z][a-z0-9]*(?:_[a-z0-9]+)+$/.test(value)) return true;
+	return /^[a-z]+$/.test(value) && value.length <= 20 && !/^[a-f0-9]+$/.test(value);
 }
 
 /**

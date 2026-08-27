@@ -1,3 +1,4 @@
+import { lstat } from "node:fs/promises";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import { type OriginRef, validateOriginRef } from "@gajaeway/protocol";
@@ -257,10 +258,19 @@ export async function loadConfig(
 		// first boot. Anything else (EISDIR, EACCES, EIO) is a config file that
 		// EXISTS and cannot be read, which must never silently become a
 		// defaults-only open policy — not at reload, and not at boot either.
-		if (options.requireFile || code !== "ENOENT")
+		//
+		// A DANGLING SYMLINK also reports ENOENT while the directory entry plainly
+		// exists, so lstat decides: an entry that is there but unresolvable is
+		// unreadable, not absent. Without this, config.json symlinked into a
+		// dotfiles repo whose target moved booted the daemon on defaults.
+		const entryExists = await lstat(configPath).then(
+			() => true,
+			() => false,
+		);
+		if (options.requireFile || code !== "ENOENT" || entryExists)
 			throw new ConfigError(
 				"config_invalid",
-				`${configPath} is ${code === "ENOENT" ? "missing" : `unreadable (${code ?? "unknown"})`}; keeping the previous configuration`,
+				`${configPath} is ${code === "ENOENT" && !entryExists ? "missing" : `unreadable (${code ?? "unknown"})`}; keeping the previous configuration`,
 			);
 	}
 	if (raw !== undefined) {

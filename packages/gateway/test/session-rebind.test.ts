@@ -551,29 +551,55 @@ test("a word character before a vendor prefix does not defeat redaction", () => 
 });
 
 test("redaction is calibrated in BOTH directions", () => {
-	// Under-redaction is the likelier failure once a shape heuristic is tuned to
-	// stop over-redacting, so both sides are pinned here.
+	// Two earlier designs failed in opposite directions — a value-shape heuristic
+	// erased `max_tokens=200000` while delivering `secret=deadbeefcafe`, and an
+	// affixed key word erased paths, UUIDs and compound codes. Both directions are
+	// pinned here so the next tuning attempt cannot quietly reopen either.
 	const mustRedact = [
-		"secret=deadbeefcafe", // 12 lowercase hex: a real key with one character class
+		"secret=deadbeefcafe", // 12 lowercase hex: a real key, one character class
 		"secret=ABCDEFGHIJKL",
 		"token=abcdefghijklmnopqrstuvwx",
 		"secret=1234567890123456", // a long numeric secret is not a count
 		"AWS_SECRET_ACCESS_KEY=wJalrXUtnFEMIK7MDENGbPxRfiCYEXAMPLEKEY",
+		"GITHUB_TOKEN=ghs_abcdefghijklmnopqrstuvwxyz",
+		"my_api_key_value: hunter2hunter2hunter2",
 		"authorization: hunter2hunter2hunter2",
 		"credential=hunter2hunter2hunter2",
-		"MYKEY\u200bsk_live_deadbeefcafebabe0123456789",
+		"client_secret=abcdef123456ghijkl",
+		"password=Tr0ub4dor&3xyz",
+		"MYKEY\u200bsk_live_deadbeefcafebabe0123456789", // a leading word character must not defeat it
 		"startup rejected by Authorization: Bearer abcDEF123456ghiJKL",
+		"proxy said Basic YWRtaW46c3VwZXJzZWNyZXQx",
+		'api_key: "deadbeefcafebabe0123456789 wJalrXUtnFEMIK"', // quoted, contains whitespace
+		'token="unbalanced_quote_SECRET_value123', // an unbalanced quote must not mean "redact nothing"
+		"access_token=eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxIn0.abcdefghijklmnop",
 	];
 	for (const text of mustRedact) expect(redactSecrets(text)).toContain("[redacted]");
 	const mustSurvive = [
+		// Quantity and state compounds: the value is a limit, a count or a state.
 		"max_tokens=200000 exceeded",
 		"auth_expired: retry the handshake",
 		"oauth: exchange rejected",
 		"token_count=1024",
 		"auth_attempts=3 remaining",
 		"token_ttl=3600",
+		// Diagnosis after a real credential key name is still diagnosis.
+		"auth_error: refresh_token_expired",
+		"auth: unauthenticated",
+		"credential: unrecoverable",
+		"authorization: insufficient_scope_for_this_operation",
+		"token: resource_gone",
+		// Identifiers and prose that merely resemble a secret shape.
 		"unsupported_state_version: state version 9 is unsupported",
 		"session 01a037ea-db5a-7072-91a5-73ca624323e2 not found",
+		"auth_session=01a037ea-db5a-7072-91a5-73ca624323e2",
+		"auth_at=2026-08-27T07:00:00.000Z",
+		"network_configuration_error at startup", // contains rk_
+		"task_runner_failed after 3 retries", // contains sk_
+		"disk_write_failed",
+		"risk_threshold_exceeded",
+		"monkey.patch.applied", // contains ey followed by dots
+		"[turn failed] spawn_failed: SDK startup did not complete before readiness cutoff",
 	];
 	for (const text of mustSurvive) expect(redactSecrets(text)).toBe(text);
 });
