@@ -1,3 +1,5 @@
+import type { OriginPlatform } from "./origin";
+
 /**
  * Emoji reactions (both directions) for the gajaeway profile.
  *
@@ -97,12 +99,12 @@ export function resolveReactionEmoji(input: string): ReactionEmoji | undefined {
  */
 const TELEGRAM_INCAPABLE = new Set(["check", "cross", "lobster"]);
 
-export function platformSupportsReaction(platform: string, emojiName: string): boolean {
+export function platformSupportsReaction(platform: OriginPlatform, emojiName: string): boolean {
 	return platform === "telegram" ? !TELEGRAM_INCAPABLE.has(emojiName) : true;
 }
 
 /** The allowlist a specific platform can actually deliver. */
-export function reactionAllowlistFor(platform: string): readonly ReactionEmoji[] {
+export function reactionAllowlistFor(platform: OriginPlatform): readonly ReactionEmoji[] {
 	return REACTION_ALLOWLIST.filter((entry) => platformSupportsReaction(platform, entry.name));
 }
 
@@ -110,11 +112,13 @@ export function reactionAllowlistFor(platform: string): readonly ReactionEmoji[]
  * Human-readable allowlist for error messages and persona guidance: the caller
  * gets told what IS accepted, on the platform it is actually speaking to.
  *
- * `platform` is required on purpose. An unqualified description is the exact
- * string that invited a Telegram persona to acknowledge with an emoji Telegram
- * would never accept, so there is no default arm to fall into.
+ * `platform` is required, and typed as the closed OriginPlatform union rather
+ * than a string. An unqualified description is the exact text that invited a
+ * Telegram persona to acknowledge with an emoji Telegram never accepts, so there
+ * is no default arm to fall into, and a mis-spelled platform is a compile error
+ * rather than a silent fallback to the full list.
  */
-export function reactionAllowlistDescription(platform: string): string {
+export function reactionAllowlistDescription(platform: OriginPlatform): string {
 	return reactionAllowlistFor(platform)
 		.map((entry) => `${entry.unicode} (${entry.name})`)
 		.join(", ");
