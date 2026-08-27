@@ -457,9 +457,14 @@ export class SessionRebinder {
 	readonly #log: (line: string) => void;
 	readonly #used = new Map<string, number>();
 	/** Never cleared by health: the total this process has ever spent per origin. */
+	readonly #lifetime = new Map<string, number>();
 	/** Origins hydrated from durable counters so far (unused when the store has no meta). */
 	readonly #hydrated = new Set<string>();
-	readonly #lifetime = new Map<string, number>();
+	/**
+	 * Origins whose durable counter is corrupted: rebinds are refused (the
+	 * operator sees the cap-exceeded notice) until /new rewrites the counter.
+	 */
+	readonly #corrupt = new Set<string>();
 
 	constructor(store: RebindStore, cap = DEFAULT_REBIND_CAP, log: (line: string) => void = console.warn) {
 		this.#store = store;
@@ -488,13 +493,26 @@ export class SessionRebinder {
 						used: parsed.used as number,
 						lifetime: Math.max(parsed.used as number, parsed.lifetime as number),
 					};
+				if (parsed !== undefined) {
+					// Fail CLOSED: a corrupted durable counter blocks the origin's
+					// rebinds (operator-visible through the cap-exceeded notice) until
+					// an explicit /new rewrites it. Treating corruption as zero would
+					// make every restart an unlimited rebind path.
+					this.#corrupt.add(originKey);
+					this.#log(
+						`gateway rebind budget for ${originKey} is CORRUPT; rebinds are blocked until /new rewrites the counter`,
+					);
+				}
 			} catch {
-				// A corrupted counter reads as absent; the budget then restarts at zero
-				// rather than bricking the origin on unreadable metadata.
+				// Malformed JSON counts as corruption, not absence: fail closed, as above.
+				this.#corrupt.add(originKey);
+				this.#log(
+					`gateway rebind budget for ${originKey} is CORRUPT (unreadable); rebinds are blocked until /new rewrites the counter`,
+				);
 			}
 		}
 		return {
-			used: this.#used.get(originKey) ?? 0,
+			used: this.#corrupt.has(originKey) ? this.#cap : (this.#used.get(originKey) ?? 0),
 			lifetime: this.#lifetime.get(originKey) ?? 0,
 		};
 	}
@@ -524,6 +542,8 @@ export class SessionRebinder {
 	/** Clears the budget after a proven-good turn, or an explicit operator reset. */
 	clear(originKey: string): void {
 		this.#used.delete(originKey);
+		// /new is the explicit operator rewrite: it clears a corruption hold too.
+		this.#corrupt.delete(originKey);
 		this.#durable(originKey, 0, this.#countersFor(originKey).lifetime);
 	}
 }

@@ -587,3 +587,30 @@ test("the rebind budget survives a gateway restart via durable counters", async 
 		database.close();
 	}
 });
+
+test("a corrupted durable counter fails CLOSED: rebinds blocked, no epoch consumed, /new restores", async () => {
+	const database = await makeDatabase("gajaeway-takeover-corrupt-");
+	const logs: string[] = [];
+	const spawn = (() => fakeChild(createFailure("resource_gone", "session endpoint record is gone"), "", 1)) as unknown as typeof Bun.spawn;
+	try {
+		// Corrupt the durable counter BEFORE any hydration, as a crash mid-write would.
+		database.metaSet("rebind_budget:discord:dm:c6", "{not-json-at-all");
+		const client = new GjcClient(database, 5_000, directory, undefined, { spawn, log: (line) => logs.push(line) });
+		await expect(client.ensureSession("discord:dm:c6")).rejects.toMatchObject({
+			name: "RebindCapExceededError",
+			code: "rebind_cap_exceeded",
+		});
+		// Fail-closed means NO epoch bump and NO create beyond the first attempt.
+		expect(database.getSessionRecord("discord:dm:c6")?.epoch ?? 0).toBe(0);
+		expect(logs.some((line) => line.includes("CORRUPT"))).toBe(true);
+		// The hold is operator-visible with a usable remedy.
+		const held = await client.ensureSession("discord:dm:c6").catch((failure: unknown) => failure);
+		expect(formatFailureNotice(held)).toContain("/new");
+		// /new is the explicit operator rewrite of the corrupted counter.
+		client.forgetRebinds("discord:dm:c6");
+		await expect(client.ensureSession("discord:dm:c6")).rejects.toMatchObject({ code: "resource_gone" });
+		expect(database.getSessionRecord("discord:dm:c6")?.epoch).toBe(1);
+	} finally {
+		database.close();
+	}
+});
