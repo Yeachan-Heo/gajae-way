@@ -73,6 +73,7 @@ async function gateway(reply: string): Promise<Harness> {
 			turns.push(text);
 			return reply;
 		},
+		forgetRebinds: () => {},
 	};
 	server = await startUnixServer({ config, database, gjc, onStop: () => database.close() });
 	const client = await connect(config.socketPath);

@@ -130,6 +130,7 @@ test("intermediate assistant messages are delivered while the turn is still runn
 			options?.onAssistantText?.("done: found the culprit");
 			return "done: found the culprit";
 		},
+		forgetRebinds: () => {},
 	};
 	const { client } = await startGateway(gjc);
 	sendChannelMessage(client, "c1", "hey, dig into this");
@@ -162,6 +163,7 @@ test("a queued message does not pay the debounce window twice", async () => {
 			await Bun.sleep(600);
 			return "ack";
 		},
+		forgetRebinds: () => {},
 	};
 	directory = await mkdtemp(join(tmpdir(), "gajaeway-debounce-"));
 	const config: GatewayConfig = {
@@ -204,6 +206,7 @@ test("a stale gjc session binding is rebound once and the turn retried", async (
 			if (sessionId === "session-e0") throw new Error('gjc turn exited 1: Error: Session "dead-beef" not found.');
 			return "recovered reply";
 		},
+		forgetRebinds: () => {},
 	};
 	const { client } = await startGateway(gjc);
 	sendChannelMessage(client, "r1", "are you alive?");
