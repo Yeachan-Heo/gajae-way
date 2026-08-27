@@ -1273,3 +1273,279 @@ test("RT-TELEGRAM-03 markup and near-miss spellings can never reach Telegram", a
 	expect(requests[0]?.verb).toBe("delivery.fail");
 	expect((requests[0]?.params as { ambiguous: boolean }).ambiguous).toBe(false);
 });
+// ---------------------------------------------------------------------------
+// Requirement 8: allowlisted is NOT the same as deliverable. Telegram's Bot API
+// accepts only its own 73-emoji set, so three allowlist entries can never land
+// there. Every case below attacks that guard through a different door.
+// ---------------------------------------------------------------------------
+
+/**
+ * The allowlist entries Telegram genuinely cannot express, derived from the
+ * adapter's authoritative table (`telegramReactionFor`) instead of a hand-written
+ * list — a hand-written list would keep passing after the table changed.
+ */
+const TELEGRAM_UNDELIVERABLE = REACTION_ALLOWLIST.filter(
+	(entry) =>
+		"unsupported" in telegramReactionFor({ targetMessageId: "555", emoji: entry.unicode, emojiName: entry.name }),
+);
+const UNDELIVERABLE_NAMES = new Set(TELEGRAM_UNDELIVERABLE.map((entry) => entry.name));
+
+/** Every spelling a persona could plausibly use for one allowlist entry. */
+function spellingsOf(entry: { name: string; unicode: string }): string[] {
+	return [`:${entry.name}:`, entry.name.toUpperCase(), entry.name, entry.unicode, `${entry.unicode}\uFE0F`];
+}
+
+/** A telegram DM is engaged unconditionally, so nothing but the reaction contract can suppress a turn. */
+async function telegramMessage(
+	client: Client,
+	id: string,
+	messageId: string,
+	text = "형님 이거 봐주세요",
+): Promise<void> {
+	await request(client, id, "chat.send", {
+		origin: TELEGRAM_ORIGIN,
+		text,
+		messageId,
+		engagement: { mentioned: true, group: false, authorId: "human-1", authorName: "형님" },
+	});
+}
+
+test("RT-CAPABILITY-01 the whole allowlist swept through chat.react on telegram refuses exactly the undeliverable entries", async () => {
+	const { client, database } = await gateway([]);
+	// The premise: the set is non-empty and is not the whole allowlist, or the sweep
+	// would prove nothing either way.
+	expect(TELEGRAM_UNDELIVERABLE.length).toBeGreaterThan(0);
+	expect(TELEGRAM_UNDELIVERABLE.length).toBeLessThan(REACTION_ALLOWLIST.length);
+	// One distinct target per entry: the per-message cap must never be what refuses.
+	for (const [index, entry] of REACTION_ALLOWLIST.entries())
+		await request(client, `cap1-${index}`, "chat.react", {
+			origin: TELEGRAM_ORIGIN,
+			targetMessageId: `tgt-${index}`,
+			emoji: entry.unicode,
+		});
+	await settle();
+	for (const [index, entry] of REACTION_ALLOWLIST.entries()) {
+		const id = `cap1-${index}`;
+		if (UNDELIVERABLE_NAMES.has(entry.name)) {
+			const error = errorFrame(client.frames, id);
+			expect(error, entry.name).toBeDefined();
+			expect(error.error.code, entry.name).toBe("invalid_params");
+			expect(error.error.message, entry.name).toContain(`telegram cannot react with ${entry.unicode} (${entry.name})`);
+			expect(response(client.frames, id), entry.name).toBeUndefined();
+		} else {
+			expect(response(client.frames, id)?.result.emoji, entry.name).toBe(entry.unicode);
+			expect(errorFrame(client.frames, id), entry.name).toBeUndefined();
+		}
+	}
+	// A refusal is decided BEFORE the budget claim and the ledger row: exactly the
+	// deliverable entries produced a row, and no row carries an undeliverable emoji.
+	const rows = database.deliveryRows();
+	expect(rows).toHaveLength(REACTION_ALLOWLIST.length - TELEGRAM_UNDELIVERABLE.length);
+	for (const entry of TELEGRAM_UNDELIVERABLE)
+		expect(
+			rows.some((row) => row.payload_json.includes(entry.unicode)),
+			entry.name,
+		).toBe(false);
+	expect(reactionEvents(client.frames)).toHaveLength(rows.length);
+	// The typed error names what telegram DOES accept. Sliced after "it accepts:",
+	// because the prefix legitimately names the refused emoji itself.
+	const refusal: string = errorFrame(
+		client.frames,
+		`cap1-${REACTION_ALLOWLIST.findIndex((entry) => UNDELIVERABLE_NAMES.has(entry.name))}`,
+	).error.message;
+	const accepts = refusal.slice(refusal.indexOf("it accepts:"));
+	for (const entry of REACTION_ALLOWLIST)
+		expect(accepts.includes(`${entry.unicode} (${entry.name})`), entry.name).toBe(!UNDELIVERABLE_NAMES.has(entry.name));
+	expect(client.badLines).toBe(0);
+	expect(client.partial).toBe(0);
+});
+
+test("RT-CAPABILITY-02 the same sweep on discord refuses nothing for capability reasons", async () => {
+	const { client, database } = await gateway([]);
+	for (const [index, entry] of REACTION_ALLOWLIST.entries())
+		await request(client, `cap2-${index}`, "chat.react", {
+			origin: ORIGIN,
+			targetMessageId: `tgt-${index}`,
+			emoji: entry.unicode,
+		});
+	await settle();
+	for (const [index, entry] of REACTION_ALLOWLIST.entries()) {
+		expect(errorFrame(client.frames, `cap2-${index}`), entry.name).toBeUndefined();
+		expect(response(client.frames, `cap2-${index}`)?.result.emoji, entry.name).toBe(entry.unicode);
+	}
+	expect(database.deliveryRows()).toHaveLength(REACTION_ALLOWLIST.length);
+	expect(reactionEvents(client.frames)).toHaveLength(REACTION_ALLOWLIST.length);
+});
+
+test("RT-CAPABILITY-05 no spelling of an undeliverable emoji gets through chat.react or a reply token on telegram", async () => {
+	// One reply per undeliverable entry, carrying EVERY spelling of it as a token
+	// plus a body: all-or-nothing parsing means the tokens all resolve, so each one
+	// has to be refused on capability grounds, and the body must still ship.
+	const replies = TELEGRAM_UNDELIVERABLE.map(
+		(entry) =>
+			`${spellingsOf(entry)
+				.map((spelling) => `[REACT:${spelling}]`)
+				.join("")} 본문-${entry.name}`,
+	);
+	const { client, database, turns } = await gateway(replies);
+	const attempts: Array<[string, string]> = [];
+	for (const entry of TELEGRAM_UNDELIVERABLE)
+		for (const spelling of spellingsOf(entry)) attempts.push([entry.name, spelling]);
+	// Door 1: the verb.
+	for (const [index, [, spelling]] of attempts.entries())
+		await request(client, `cap5-${index}`, "chat.react", {
+			origin: TELEGRAM_ORIGIN,
+			targetMessageId: `spell-${index}`,
+			emoji: spelling,
+		});
+	await settle();
+	for (const [index, [name, spelling]] of attempts.entries()) {
+		const label = `${name} as ${JSON.stringify(spelling)}`;
+		const error = errorFrame(client.frames, `cap5-${index}`);
+		expect(error, label).toBeDefined();
+		expect(error.error.code, label).toBe("invalid_params");
+		expect(error.error.message, label).toContain("telegram cannot react with");
+		expect(response(client.frames, `cap5-${index}`), label).toBeUndefined();
+	}
+	expect(database.deliveryRows()).toHaveLength(0);
+	// Door 2: the reply token path, one turn per entry.
+	const skipped = await withCapturedLog(async (lines) => {
+		for (let index = 0; index < TELEGRAM_UNDELIVERABLE.length; index++) {
+			await telegramMessage(client, `cap5t-${index}`, `tg-${index}`);
+			await settle();
+		}
+		return lines.filter((line) => line.includes("reaction skipped"));
+	});
+	expect(turns).toHaveLength(TELEGRAM_UNDELIVERABLE.length);
+	// Every single token was skipped, and each skip line names the emoji it dropped.
+	expect(skipped).toHaveLength(attempts.length);
+	for (const entry of TELEGRAM_UNDELIVERABLE)
+		expect(
+			skipped.filter((line) => line.includes(entry.unicode) && line.includes(entry.name)),
+			entry.name,
+		).toHaveLength(spellingsOf(entry).length);
+	// Not one reaction was delivered, by any spelling, through either door.
+	expect(reactionEvents(client.frames)).toHaveLength(0);
+	// The bodies still shipped: a refused reaction never costs the reply.
+	expect(textEvents(client.frames).map((frame) => frame.payload.text)).toEqual(
+		TELEGRAM_UNDELIVERABLE.map((entry) => `본문-${entry.name}`),
+	);
+	expect(database.deliveryRows()).toHaveLength(TELEGRAM_UNDELIVERABLE.length);
+});
+
+test("RT-CAPABILITY-03 undeliverable reply tokens on telegram are logged, never delivered, and never cost the text", async () => {
+	const { client, turns, calls } = await gateway(["[REACT:✅]", "[REACT:❌@77]", "[REACT:🦞] 본문"]);
+	const logged = await withCapturedLog(async (lines) => {
+		for (const index of [0, 1, 2]) {
+			await telegramMessage(client, `cap3-${index}`, `tg3-${index}`);
+			await settle();
+		}
+		return lines.filter((line) => line.includes("reaction skipped"));
+	});
+	expect(calls.sendTurn).toBe(3);
+	expect(turns).toHaveLength(3);
+	// One rejection line per token, each naming the emoji and the platform.
+	expect(logged).toHaveLength(3);
+	for (const emoji of ["✅", "❌", "🦞"])
+		expect(
+			logged.some((line) => line.includes(emoji) && line.includes("telegram cannot react with")),
+			emoji,
+		).toBe(true);
+	// No reaction reached any adapter.
+	expect(reactionEvents(client.frames)).toHaveLength(0);
+	// The one reply that had a body still delivered it, with the token stripped.
+	expect(textEvents(client.frames).map((frame) => frame.payload.text)).toEqual(["본문"]);
+	// JUDGEMENT on the reaction-ONLY replies (`[REACT:✅]` and `[REACT:❌@77]`): the
+	// turn emits NOTHING — no reaction, no text, no ledger row — and the daemon log is
+	// the only record. That is what the code documents, and it is defensible: the
+	// alternative would be leaking `[REACT:…]` control syntax into the room, and there
+	// is no ledger row to fail because none was ever created. It is honest toward the
+	// OPERATOR (the log line exists, and gateway.status shows no phantom pending row),
+	// but it is silent toward the PERSONA: it believes it acknowledged and is never
+	// told otherwise. The mitigation is upstream — the conversation notice only offers
+	// this origin's deliverable emoji (RT-CAPABILITY-06) — so reaching this state means
+	// the persona ignored an explicit list. Reported as a residual risk, not a defect.
+	expect(textEvents(client.frames)).toHaveLength(1);
+});
+
+test("RT-CAPABILITY-04 a mixed reply on telegram lands the deliverable reaction, skips the rest, and still ships the text", async () => {
+	const { client, database } = await gateway(["[REACT:👍][REACT:✅] 본문"]);
+	const logged = await withCapturedLog(async (lines) => {
+		await telegramMessage(client, "cap4", "tg4-1");
+		await settle();
+		return lines.filter((line) => line.includes("reaction skipped"));
+	});
+	// Exactly one skip, for the undeliverable half.
+	expect(logged).toHaveLength(1);
+	expect(logged[0]).toContain("✅");
+	expect(logged[0]).not.toContain("👍");
+	const reactions = reactionEvents(client.frames);
+	expect(reactions).toHaveLength(1);
+	expect(reactions[0].payload.reaction).toEqual({
+		targetMessageId: "tg4-1",
+		emoji: "👍",
+		emojiName: "thumbsup",
+	});
+	expect(textEvents(client.frames).map((frame) => frame.payload.text)).toEqual(["본문"]);
+	// Two ledger rows: the surviving reaction and the text. Nothing for the skip.
+	const rows = database.deliveryRows();
+	expect(rows).toHaveLength(2);
+	expect(rows.some((row) => row.payload_json.includes("✅"))).toBe(false);
+});
+
+/**
+ * `gateway()`'s gjc port drops the systemPreamble argument, and the persona notice
+ * is only observable there. This variant is the same daemon, same socket, same
+ * cleanup bookkeeping, with a port that keeps the preamble — the notice is read off
+ * the real turn path, never rebuilt in the test.
+ */
+async function preambleGateway(): Promise<{ client: Client; preambles: string[] }> {
+	directory = await mkdtemp(join(tmpdir(), "gajaeway-reactions-redteam-"));
+	const config: GatewayConfig = {
+		schemaVersion: 1,
+		home: directory,
+		configPath: join(directory, "config.json"),
+		socketPath: join(directory, "gateway.sock"),
+		dbPath: join(directory, "gateway.db"),
+		logVerbosity: "info",
+		channels: { "chan-1": { engagement: "open" } },
+		mentionAllowlist: ["human-1"],
+	};
+	const database = await GatewayDatabase.open(config.dbPath);
+	const preambles: string[] = [];
+	const gjc: GjcPort = {
+		ensureSession: async () => ({ sessionId: "mock-session" }),
+		sendTurn: async (_sessionId, _text, systemPreamble) => {
+			preambles.push(systemPreamble ?? "");
+			return "[SILENT]";
+		},
+	};
+	server = await startUnixServer({ config, database, gjc, onStop: () => database.close() });
+	const client = await connect(config.socketPath);
+	await client.send({ v: "0.1", type: "hello", payload: { supportedVersions: ["0.1"] } });
+	for (let attempt = 0; attempt < 60 && client.frames.length < 1; attempt++) await Bun.sleep(5);
+	return { client, preambles };
+}
+
+test("RT-CAPABILITY-06 the persona notice advertises only what the origin's platform can deliver", async () => {
+	const { client, preambles } = await preambleGateway();
+	await telegramMessage(client, "cap6-tg", "tg6-1");
+	await settle();
+	await humanMessage(client, "cap6-dc", "dc6-1");
+	await settle();
+	expect(preambles).toHaveLength(2);
+	const [telegram, discord] = preambles;
+	const telegramOffer = telegram.slice(telegram.indexOf("Emoji telegram can actually deliver:"));
+	expect(telegram).toContain("Emoji telegram can actually deliver:");
+	for (const entry of REACTION_ALLOWLIST)
+		expect(telegramOffer.includes(`${entry.unicode} (${entry.name})`), entry.name).toBe(
+			!UNDELIVERABLE_NAMES.has(entry.name),
+		);
+	// Not merely absent from the offer line: absent from the WHOLE preamble, so the
+	// persona cannot pick one up from anywhere else in its instructions.
+	for (const entry of TELEGRAM_UNDELIVERABLE) expect(telegram.includes(entry.unicode), entry.name).toBe(false);
+	const discordOffer = discord.slice(discord.indexOf("Emoji discord can actually deliver:"));
+	expect(discord).toContain("Emoji discord can actually deliver:");
+	for (const entry of REACTION_ALLOWLIST)
+		expect(discordOffer, entry.name).toContain(`${entry.unicode} (${entry.name})`);
+});
