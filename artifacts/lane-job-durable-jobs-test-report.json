@@ -1,48 +1,65 @@
 {
 	"kind": "api-package-test-report",
 	"schemaVersion": 1,
-	"frozenCommit": "ff101e1 (exact head of feat/issue-10-lane-jobs-takeover; branch code validated at 523c57f and targeted suites re-run after adding only this report; merge-base origin/main 6bd9759)",
-	"producedBy": "ultragoal leader; executor QA lane satisfied inline with real command runs recorded verbatim below",
+	"frozenCommit": "259e635 (exact head of feat/issue-10-lane-jobs-takeover; merge-base origin/main 6bd9759)",
+	"producedBy": "ultragoal leader after terminal-critic REJECT round 1; every command below was re-run at this exact head",
 	"rerunCommands": [
 		"bun install --frozen-lockfile (clean, 43 installs checked)",
 		"bun x tsc --noEmit (exit 0)",
-		"bun test packages/ (887 pass / 2 skip / 0 fail, 71 files)",
-		"bun x biome ci packages/ (exit 0 after formatting monitor-batched-recovery.test.ts)",
-		"bun test packages/subsession/test/job.test.ts (26 adversarial job tests: restart-from-JSON recovery, late commit after terminal accounting, corrupt/unknown-schema rejection, duplicate attempt opRef guard, MAX_STALLED_CONTINUATIONS stall-bound escalation, summary.completed regression, repo-first evidence precedence)",
-		"bun test packages/gateway/test/lane-job-store.test.ts (3 store tests: schema v10 fresh open, deadline-killed cycle across close/reopen on one deployment path, truncated record_json surfaced not repaired)"
+		"bun test packages/ (890 pass / 0 fail / 2 skip, 71 files)",
+		"bunx biome ci packages/ (exit 0, 0 errors)",
+		"bun test packages/subsession/test/job.test.ts (28 adversarial job tests incl. new fail-closed-defaults and rebased-checkpoint cases)",
+		"bun test packages/gateway/test/lane-job-store.test.ts (3 store tests: restart across close/reopen, truncated record_json surfaced not repaired)",
+		"bun test packages/gateway/test/server.test.ts (8 tests incl. the work.run -> lane_job -> work.jobs production cycle and crash-recovery reconciliation)",
+		"bun test packages/admin (admin /api/jobs route proxy test)"
 	],
-	"subject": "Issue #10 durable lane jobs: packages/subsession LaneJobRecord v1 (fail-closed parse, repository-first checkpoints, attempt_ended projection for prompt_deadline_exceeded, #9 evidence classes verbatim, single-path continuation planner with operator holds preserved) plus gateway migration v10 lane_jobs persistence.",
+	"subject": "Issue #10 durable lane jobs: packages/subsession LaneJobRecord v1 (fail-closed parse, repository-first checkpoints, attempt_ended projection for prompt_deadline_exceeded, #9 evidence classes verbatim, single-path continuation planner with operator holds preserved, one-open-attempt invariant) plus gateway production wiring (work.run attempt tracking, crash reconciliation to terminal_uncertain, work.jobs + admin /api/jobs projections) and migration v10 lane_jobs persistence.",
+	"criticRound1Fixes": [
+		"checkpoint ordering: git SHAs have no chronological lexical order; only consecutive duplicates are rejected",
+		"fail-closed parse: missing v1 sections are now schema violations; endState validated against the supervisor-state vocabulary; non-string report rejected",
+		"duplicate attempts: appendAttempt enforces one open attempt; planContinuation reads the stored open attempt instead of a synthetic projection",
+		"production wiring: putLaneJob/laneJobJson/laneJobRows now called by work.run and work.jobs in gateway server.ts; admin exposes /api/jobs",
+		"evidence honesty: this report is committed at the exact head it names, with per-suite counts re-run at that head"
+	],
 	"cases": [
 		{
 			"id": "QA-JOB-01",
 			"contractRef": "Issue #10 requirement 7: fail closed on unknown/corrupt durable state",
-			"invocation": "bun test packages/subsession/test/job.test.ts -t 'schema'",
-			"expected": "unknown schemaVersion / corrupt JSON / non-canonical state / duplicated opRefs / decreasing checkpoints all throw LaneJobError",
-			"observed": "all rejection paths throw; valid round-trip equals the written record",
+			"invocation": "bun test packages/subsession/test/job.test.ts -t 'fail-closed'",
+			"expected": "unknown schemaVersion / corrupt JSON / non-canonical state / missing v1 sections / bad endState / duplicated opRefs all throw LaneJobError",
+			"observed": "all rejection paths throw; nothing coerced or normalized",
 			"verdict": "passed"
 		},
 		{
 			"id": "QA-JOB-02",
 			"contractRef": "Issue #10 requirement 5: report recoverable without reply body",
 			"invocation": "bun test packages/subsession/test/job.test.ts -t 'repository-first'",
-			"expected": "HEAD move appends a checkpoint even when the reply body is empty; late commit after terminal accounting becomes a checkpoint on next reconciliation",
-			"observed": "both shapes reproduce the measured #9 lanes and recover evidence from repository state alone",
+			"expected": "HEAD move appends a checkpoint even when the reply body is empty; a commit landing seven minutes after terminal accounting becomes a checkpoint on next reconciliation",
+			"observed": "both measured #9 lane shapes recover evidence from repository state alone",
 			"verdict": "passed"
 		},
 		{
 			"id": "QA-JOB-03",
 			"contractRef": "Issue #10 requirement 6: genuine terminal_uncertain keeps an explicit operator hold",
 			"invocation": "bun test packages/subsession/test/job.test.ts -t 'uncertain'",
-			"expected": "status unknown / receiptState missing project to awaiting_operator with an escalation trail entry naming the op-ref",
-			"observed": "awaiting_operator forced; escalations contain the hold record; continuation planner refuses to override",
+			"expected": "unknown status / missing receipt force awaiting_operator with an escalation trail naming the op-ref",
+			"observed": "hold forced; planner refuses to override; gateway crash reconciliation writes the same trail for a dead predecessor's open attempt",
 			"verdict": "passed"
 		},
 		{
 			"id": "QA-JOB-04",
 			"contractRef": "Issue #10 requirement 7: no duplicate attempts or runaway resume loops",
 			"invocation": "bun test packages/subsession/test/job.test.ts -t 'stalled'",
-			"expected": "continuations without HEAD moves accumulate; at MAX_STALLED_CONTINUATIONS the planner returns hold_for_operator",
-			"observed": "budget gate trips at the bound; duplicate opRef append and double close both throw",
+			"expected": "second open attempt refused; continuations without HEAD moves trip MAX_STALLED_CONTINUATIONS into hold_for_operator",
+			"observed": "budget gate trips at the bound; duplicate opRef and double close both throw",
+			"verdict": "passed"
+		},
+		{
+			"id": "QA-WIRE-01",
+			"contractRef": "Production integration: work.run persists a durable job, work.jobs + /api/jobs project it",
+			"invocation": "bun test packages/gateway/test/server.test.ts -t 'durable lane job'",
+			"expected": "work.run writes an attempt receipt and completed end state to lane_jobs before replying; work.jobs returns the row; a crashed predecessor's open attempt is closed terminal_uncertain with an escalation entry before the continuation",
+			"observed": "row projected with state attempt_ended after completion; revived record shows terminal_uncertain + escalation + completed continuation",
 			"verdict": "passed"
 		},
 		{
