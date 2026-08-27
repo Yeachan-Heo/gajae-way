@@ -1,6 +1,6 @@
 import type { ChatMessagePayload, ChatProgressPayload, EngagementContext, OriginRef } from "@gajaeway/protocol";
 import { GajaewayClient } from "@gajaeway/sdk";
-import { Client, GatewayIntentBits } from "discord.js";
+import { Client, GatewayIntentBits, Partials } from "discord.js";
 import { type AuthorLike, resolveDisplayName } from "./author";
 import { type LoadedDiscordAdapterConfig, loadDiscordAdapterConfig } from "./config";
 import { type DiscordMessageOriginShape, discordMessageOrigin } from "./origin";
@@ -380,7 +380,12 @@ export function subscribeDiscordProgress(
 }
 
 export async function startDiscordAdapter(config: LoadedDiscordAdapterConfig): Promise<void> {
-	const discord = new Client({ intents: [...new Set([...REQUIRED_INTENTS, ...(config.intents ?? [])])] });
+	const discord = new Client({
+		intents: [...new Set([...REQUIRED_INTENTS, ...(config.intents ?? [])])],
+		// DM channels are not cached on a cold start; without the Channel partial
+		// discord.js drops messageCreate for uncached DMs, silently losing owner DMs.
+		partials: [Partials.Channel],
+	});
 	const typing = new TypingIndicator(discord);
 	const status = new WorkingStatus(discord);
 	const gateway = new ReconnectingGateway(
