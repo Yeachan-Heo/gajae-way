@@ -2,10 +2,9 @@ import { afterEach, expect, test } from "bun:test";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { parseLaneJobRecord } from "@gajaeway/subsession";
+import { MAX_STALLED_CONTINUATIONS, parseLaneJobRecord } from "@gajaeway/subsession";
 import type { GatewayConfig } from "../src/config";
 import type { GjcPort } from "../src/orchestrator/gjc-client";
-import { MAX_STALLED_CONTINUATIONS, parseLaneJobRecord } from "@gajaeway/subsession";
 import { type GatewayServer, startUnixServer } from "../src/server/server";
 import { GatewayDatabase } from "../src/store/db";
 
@@ -527,7 +526,9 @@ test("a stalled durable job holds the next work.run until resume (production pat
 	await waitFor(client.frames, 2);
 	expect(client.frames.find((frame) => frame.type === "response" && frame.id === "w")).toBeDefined();
 	// Simulate the reconciliation outcome after repeated stalled continuations.
-	const first = parseLaneJobRecord(database.laneJobJson(`lanejob-${Buffer.from("stall-out", "utf8").toString("hex")}`) as string);
+	const first = parseLaneJobRecord(
+		database.laneJobJson(`lanejob-${Buffer.from("stall-out", "utf8").toString("hex")}`) as string,
+	);
 	database.putLaneJob({
 		jobId: first.jobId,
 		laneKey: `work-stall-out`,
@@ -556,7 +557,9 @@ test("a stalled durable job holds the next work.run until resume (production pat
 		params: { name: "stall-out", text: "x", resume: true },
 	});
 	await waitId2("w3");
-	expect(client.frames.find((frame) => frame.type === "response" && frame.id === "w3" && frame.result?.held === false)).toBeDefined();
+	expect(
+		client.frames.find((frame) => frame.type === "response" && frame.id === "w3" && frame.result?.held === false),
+	).toBeDefined();
 	expect(turns).toBe(2);
 	client.close();
 });
