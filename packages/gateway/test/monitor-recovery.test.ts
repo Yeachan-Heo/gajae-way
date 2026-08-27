@@ -670,15 +670,14 @@ describe("durable dispatch leases (restart-concurrent authoring)", () => {
 				emit: () => {},
 			});
 			propagator.submit(monitor.monitorId, "memory.canonicalize", { at: "same-run" });
-			// Wait for the async dispatch to admit the intent, then drain the queue:
-			// the atomically admitted intent must be processed to receipted WITHOUT a
-			// restart.
+			// Wait deterministically for the async serialize dispatch to admit the
+			// intent (bounded poll, no fixed-sleep assumption), then drain the
+			// closure queue: the intent must reach receipted in this live process.
 			for (let attempt = 0; attempt < 400; attempt++) {
 				if (db.memoryIntentRows().some((row) => row.kind === "monitor-event")) break;
 				await Bun.sleep(5);
 			}
 			await closure.drain();
-			await Bun.sleep(10);
 			const intents = db.memoryIntentRows().filter((row) => row.kind === "monitor-event");
 			expect(intents).toHaveLength(1);
 			expect(intents[0]?.state).toBe("receipted");
@@ -767,8 +766,11 @@ describe("durable dispatch leases — concurrent attempts (true overlap)", () =>
 			const aParked = new Promise<void>((resolve) => {
 				releaseA = resolve;
 			});
+			let markAReturned!: () => void;
 			let aUnblocked = false;
-			let aReturned!: () => void;
+			const aReturned = new Promise<void>((resolve) => {
+				markAReturned = resolve;
+			});
 			let deliveriesA = 0;
 			const propagatorA = new MonitorPropagator({
 				database: db,
@@ -783,10 +785,10 @@ describe("durable dispatch leases — concurrent attempts (true overlap)", () =>
 									clearInterval(check);
 									resolve();
 								}
-							}, 5);
+							}, 2);
 						});
 						const note = JSON.stringify([{ eventId, note: "A note" }]);
-						aReturned();
+						markAReturned();
 						return note;
 					},
 				},
@@ -805,10 +807,15 @@ describe("durable dispatch leases — concurrent attempts (true overlap)", () =>
 			const leaseA = db.monitorEventLiveLeaseOwner(eventId);
 			expect(leaseA).toBeString();
 
-			// A's process "dies": its lease expires with no heartbeat. Attempt B (a
-			// new process's propagator, clock shifted past A's TTL) finds no live
-			// lease, acquires its own, and runs to completion through the REAL
-			// dispatch path (reconcile → dispatchBatch → fenced writes → delivery).
+			// Await attempt A's actual dispatch chain (it parks inside sendTurn):
+			const aDispatch = propagatorA.dispatchDirect(eventId);
+			void aDispatch;
+			await aParked;
+			const leaseAConfirm = db.monitorEventLiveLeaseOwner(eventId);
+			expect(leaseAConfirm).toBe(leaseA);
+
+			// A's lease "expires": attempt B (clock shifted past A's TTL) acquires
+			// its own lease and runs the full REAL dispatch to completion.
 			const bClockShift = 10 * 60_000 + 5_000;
 			let deliveriesB = 0;
 			const propagatorB = new MonitorPropagator({
@@ -827,35 +834,34 @@ describe("durable dispatch leases — concurrent attempts (true overlap)", () =>
 				emit: () => {},
 				now: () => Date.now() + bClockShift,
 			});
-			await propagatorB.reconcile();
+			await propagatorB.dispatchDirect(eventId);
+
+			// B's outcome is durable: authored, B's note, exactly one B delivery.
 			const row = db.monitorEventRows().find((candidate) => candidate.event_id === eventId);
 			expect(row?.stage).toBe("authored");
 			expect(db.authoredOutput(eventId)).toBe("B note");
 			expect(deliveriesB).toBe(1);
 
-			// Now unblock A: its stale attempt completes with an A note. Wait for A's
-			// full dispatch chain to finish (not just a sleep), then assert fencing.
+			// Unblock A: its stale attempt completes with an A note. Await A's real
+			// dispatch promise — every write is lease-fenced, so nothing changes.
 			aUnblocked = true;
-			// Await A's actual dispatch chain completion (sendTurn returned; fenced
-			// writes flushed), not just a fixed sleep.
 			await aReturned;
-			await Bun.sleep(30);
-			expect(row?.stage).toBe("authored");
+			await aDispatch;
+			const freshRow = db.monitorEventRows().find((candidate) => candidate.event_id === eventId);
+			expect(freshRow?.stage).toBe("authored");
 			expect(db.authoredOutput(eventId)).toBe("B note");
-			// Exactly one memory intent for the event (B's; A fenced out):
+			// Exactly one deterministic memory intent for the event (B's; A fenced out):
 			const intents = db.memoryIntentRows().filter((intent) => intent.payload_json.includes(eventId));
 			expect(intents).toHaveLength(1);
-			const intent0 = intents[0];
-			expect(intent0?.payload_json).toContain("B note");
-			// Exactly one ledger delivery (B's); A emitted none:
+			expect(intents[0]?.id).toBe(`monitor-event-intent:${eventId}`);
+			expect(intents[0]?.payload_json).toContain("B note");
+			// Exactly one ledger delivery row (B's); A emitted none:
+			expect(db.deliveryRows()).toHaveLength(1);
 			expect(deliveriesA).toBe(0);
 			expect(deliveriesB).toBe(1);
-			// Exactly one ledger row total:
-			expect(db.deliveryRows()).toHaveLength(1);
 			// No A failure evidence:
 			expect(db.monitorFailure(eventId)).toBeUndefined();
-			// No A failure evidence:
-			expect(db.monitorFailure(eventId)).toBeUndefined();
+			// Lease ownership belongs to B.
 			expect(db.monitorEventLiveLeaseOwner(eventId, Date.now() + bClockShift)).not.toBe(leaseA);
 			db.close();
 		} finally {

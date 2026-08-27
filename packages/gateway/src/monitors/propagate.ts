@@ -129,6 +129,14 @@ export class MonitorPropagator {
 		return eventId;
 	}
 	/**
+	 * Awaitable dispatch of an already-admitted event (bounded test/ops seam):
+	 * resolves when the dispatch chain for this event has fully settled —
+	 * fenced writes included. Production submit() remains fire-and-forget.
+	 */
+	async dispatchDirect(eventId: string): Promise<void> {
+		await this.#dispatch([eventId]);
+	}
+	/**
 	 * Cron slot admission (red-team blockers 2+3): the slot claim and the event
 	 * row are created in ONE transaction, and the event's `fired_at` IS the
 	 * exact scheduled slot timestamp — the durable record carries the scheduled
