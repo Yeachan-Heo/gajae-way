@@ -528,10 +528,27 @@ export function applyReconciliation(input: TransitionInput): LaneJobRecord {
 			? Math.min(input.record.stalledContinuations + 1, MAX_STALLED_CONTINUATIONS)
 			: 0;
 
+	// Hitting the bound TRANSITIONS the job: the sticky hold then requires an
+	// explicit operator resume before any further attempt, in production too.
+	const budgetExhausted = stalledContinuations >= MAX_STALLED_CONTINUATIONS;
+	const state: LaneJobState =
+		budgetExhausted && input.record.state !== "done" && input.record.state !== "aborted"
+			? "stalled"
+			: input.record.state;
+	const escalations =
+		budgetExhausted && input.record.state !== "stalled"
+			? Object.freeze([
+					...input.record.escalations,
+					`${at} operator hold: continuation budget exhausted (${MAX_STALLED_CONTINUATIONS} continuations without a HEAD move)`,
+				])
+			: input.record.escalations;
+
 	return Object.freeze({
 		...input.record,
 		checkpoints,
 		stalledContinuations,
+		state,
+		escalations,
 		updatedAt: at,
 	});
 }
