@@ -1,0 +1,236 @@
+{
+  "schemaVersion": 1,
+  "kind": "api-package-test-report",
+  "generation": 3,
+  "sourceHash": "sha256:97e8188248bc7d5494349352ad66b3558c6bd54358fcbcc22379f61ba5186716",
+  "surface": ["gateway library modules (API/package)", "unix-socket RPC verb gateway.reloadConfig", "SIGHUP signal path"],
+  "suite": {
+    "files": [
+      "/tmp/g13-cap.test.ts",
+      "/tmp/g14-notice.test.ts",
+      "/tmp/g10-frames.test.ts",
+      "/tmp/g12-config.test.ts",
+      "/tmp/g2-clear-audit.test.ts"
+    ],
+    "command": "bun test /tmp/g13-cap.test.ts /tmp/g14-notice.test.ts /tmp/g10-frames.test.ts /tmp/g12-config.test.ts /tmp/g2-clear-audit.test.ts",
+    "result": "30 pass / 0 fail / 250 expect() calls",
+    "note": "Every assertion encodes the OBSERVED behaviour, including the four defects below; a green suite therefore documents the leaks rather than hiding them."
+  },
+  "cases": [
+    {
+      "id": "C1-rebind-cap-bound",
+      "angle": "Prove or break the bound: 20 messages whose first turn attempt always fails with managed_append_identity_mismatch and whose replay against the fresh session succeeds.",
+      "command": "bun test /tmp/g13-cap.test.ts -t 'case1'",
+      "expectedBehavior": "Epoch bumps at most cap=3 times, persisted epoch stops at 3, three rebind log lines naming cause + old/new epoch, and messages 4..20 fail with RebindCapExceededError.",
+      "observedBehavior": "persistedEpoch=3. Exactly 3 log lines: 'gateway session rebind 1/3 origin=discord:dm:cap cause=managed_append_identity_mismatch epoch 0 -> 1', '2/3 ... epoch 1 -> 2', '3/3 ... epoch 2 -> 3'. m1..m3 returned the replayed reply; m4..m20 (17 messages) all threw RebindCapExceededError. A replayed turn provably does NOT clear the budget.",
+      "verdict": "pass"
+    },
+    {
+      "id": "C2-clear-audit",
+      "angle": "Audit every caller of SessionRebinder.clear and try to reach it illegitimately.",
+      "command": "grep -n '#rebinder|forgetRebinds' packages/gateway/src; bun test /tmp/g13-cap.test.ts -t 'case2'; bun test /tmp/g2-clear-audit.test.ts",
+      "expectedBehavior": "Exactly two callers: the proven-good first-attempt turn path and GjcPort.forgetRebinds (server /new). No other path clears; a replay does not clear; a create does not clear.",
+      "observedBehavior": "Static audit: only gjc-client.ts:322 (sendTurn success) and gjc-client.ts:214 (forgetRebinds), the latter reached only from server.ts:611 (/new or /reset). 2a: a clean first-attempt turn clears, so a later rebindable failure bumps epoch 3 -> 4 with log '1/3' (declared intent). 2b: create-only rebind then a good turn clears (declared intent); no epoch growth without a further failure. 2c: forgetRebinds after cap exhaustion allows exactly one more rebind (epoch 3 -> 4). Live socket: a stranger's /new in a mention-gated room is refused (engaged=false) and forgetRebinds is NOT called; a plain message never calls it; the allowlisted owner's /new and /reset each call it once with originKey discord/channel/room. No path clears the budget on a replay or on session.create.",
+      "verdict": "pass"
+    },
+    {
+      "id": "C3-origin-independence",
+      "angle": "Two origins, each driven past its cap.",
+      "command": "bun test /tmp/g13-cap.test.ts -t 'case3'",
+      "expectedBehavior": "Independent budgets; one origin exhausting its cap leaves the other with a full budget.",
+      "observedBehavior": "discord:dm:a and discord:dm:b each rebound exactly 3 times (6 log lines total, each numbered 1/3..3/3 per origin) and each stopped at epoch 3 with a RebindCapExceededError on the 4th failure. Exhausting a did not consume any of b's budget.",
+      "verdict": "pass"
+    },
+    {
+      "id": "C4-concurrency-race",
+      "angle": "6 simultaneous sendTurn plus 2 simultaneous ensureSession for the SAME origin, all first attempts failing rebindably (Promise.allSettled).",
+      "command": "bun test /tmp/g13-cap.test.ts -t 'case4'",
+      "expectedBehavior": "The cap cannot be exceeded by racing; observed epoch <= 3.",
+      "observedBehavior": "Exact observed epoch = 1, with exactly 1 rebind log line and 0 RebindCapExceededError. SessionRebinder.rebind is fully synchronous (read-modify-write of #used plus a sync store transaction), so no interleaving can double-spend a slot. In addition only the FIRST racer still holds the #origins reverse binding: the other five find no binding and surface the raw managed_append_identity_mismatch (with the /new hint) without reaching the rebinder at all. Racing therefore under-rebinds rather than over-rebinding — safe with respect to the cap. Recorded as an observation, not a defect: five concurrent turns for one origin get no automatic rebind and rely on the operator hint.",
+      "verdict": "pass"
+    },
+    {
+      "id": "C5a-control-char-smuggling",
+      "angle": "NUL/ZWSP/RTL splitting a key, in the code field and in the message.",
+      "command": "bun test /tmp/g14-notice.test.ts -t 'case5: control-character smuggling'",
+      "expectedBehavior": "Normalization runs before redaction, so a split key is reassembled and then redacted; no secret material reaches the notice.",
+      "observedBehavior": "code 'sk_liv\\u0000e_<secret>', 'sk_live\\u200b_<secret>' and 'sk_live_\\u202e<secret>' all deliver '[turn failed] [redacted]: startup failed'. Messages 'token=sk-ant\\u200b-api03-<secret>', 'sk_liv\\u0000e_<secret>' and 'pass\\u200eword=<secret>' all redact. \\p{C} covers Cc and Cf (verified: 'a\\u200bb\\u200eb\\u202ec\\u0000d' strips to 'abbcd').",
+      "verdict": "pass"
+    },
+    {
+      "id": "C5b-adjacency-bypass",
+      "angle": "Defeat the vendor-prefix redaction by removing its word boundary, including manufacturing the adjacency with a control character.",
+      "command": "bun test /tmp/g14-notice.test.ts -t 'case5-DEFECT: a word character before a vendor prefix'",
+      "expectedBehavior": "A secret in the message is redacted regardless of what precedes it; control-character stripping must not create a leak.",
+      "observedBehavior": "LEAK. Every vendor-prefix rule in redactSecrets is anchored with \\b, so an [A-Za-z0-9_] immediately before the prefix removes the boundary and the token ships verbatim: 'MYKEYsk_live_deadbeefcafebabe0123456789', 'AWS_SECRET_ACCESS_KEY_sk_live_deadbeefcafebabe0123456789' and 'patghp_deadbeefcafebabe0123456789' all appear in the delivered notice in the clear. Worse, stripping manufactures the adjacency: 'MYKEY\\u200bsk_live_<secret>' produces byte-identical output to the unsplit 'MYKEYsk_live_<secret>' — i.e. a ZWSP turns a redacted secret into a leaked one. Same root cause through the 64-char code bound: code 'q'x50 + 'sk_live_<secret>' is truncated to '...qqqsk_live_deadbe…' and leaks the surviving head.",
+      "verdict": "fail"
+    },
+    {
+      "id": "C5c-truncation-boundary",
+      "angle": "A secret adjacent to and straddling the 240-char message truncation boundary.",
+      "command": "bun test /tmp/g14-notice.test.ts -t 'case5: truncation boundary'",
+      "expectedBehavior": "Redaction runs before truncation, so no truncation offset can expose secret material.",
+      "observedBehavior": "230 'y' + ' sk_live_<secret>' delivers '... [redacted…' (the marker itself is what gets cut); 200 'y' + ' sk_live_<secret> tail' delivers '... [redacted] tail'. No secret bytes in either, and the notice stays bounded (<=300 chars including framing).",
+      "verdict": "pass"
+    },
+    {
+      "id": "C5d-key-name-shapes",
+      "angle": "Affixed and unaffixed key names, over-long affixes, multi-line messages, inherited-env blobs.",
+      "command": "bun test /tmp/g14-notice.test.ts -t 'case5: affixed and unaffixed'",
+      "expectedBehavior": "key=value redaction catches bare and affixed key words; multi-line structure survives; every secret in an env-looking blob is redacted while non-secret entries stay readable.",
+      "observedBehavior": "AWS_SECRET_ACCESS_KEY=<aws> -> 'AWS_SECRET_ACCESS_KEY=[redacted]'; secret=<aws> -> 'secret=[redacted]'; MY_VERY_LONG_PREFIXED_SERVICE_ACCOUNT_TOKEN=<aws> (>24-char affix) still redacted via backtracking. Multi-line: 'password=[redacted]' and 'Authorization: [redacted] [redacted]', with \\n and \\t preserved. Env blob: OPENAI_API_KEY, AWS_SECRET_ACCESS_KEY and GITHUB_TOKEN all redacted while 'PATH=/usr/bin' and 'HOME=/root' survive.",
+      "verdict": "pass"
+    },
+    {
+      "id": "C5e-quoted-value-with-space",
+      "angle": "A quoted secret value containing whitespace.",
+      "command": "bun test /tmp/g14-notice.test.ts -t 'case5-DEFECT: a quoted secret containing whitespace'",
+      "expectedBehavior": "The whole quoted value is redacted.",
+      "observedBehavior": "PARTIAL LEAK. The value class is [^\\s\"',}]+, so only the first whitespace-delimited token is replaced: 'api_key: \"<secret> <aws>\"' delivers 'api_key: \"[redacted] wJalrXUtnFEMIKSECRETDENGbPxRfiCYEXAMPLEKEY\"' — the second half of the quoted value ships in the clear.",
+      "verdict": "fail"
+    },
+    {
+      "id": "C6-diagnostics-survive",
+      "angle": "Prove diagnostic codes and opaque diagnostic values are never redacted.",
+      "command": "bun test /tmp/g14-notice.test.ts -t 'case6: diagnostic codes'",
+      "expectedBehavior": "unsupported_state_version, invalid_params, tool_denied survive verbatim, and session-id / hash-looking values in the message are untouched.",
+      "observedBehavior": "'[turn failed] unsupported_state_version: state version 9 is unsupported', '[turn failed] invalid_params: params.origin is invalid', '[turn failed] tool_denied: bash was denied by policy'. A message carrying 'session 01HB7QG9ZX4K2N8V6T3M5R7Y1C hash sha256:97e8188248bc7d5494349352ad66b3558c6bd54358fcbcc22379f61ba5186716 state 9' contains no '[redacted]' at all.",
+      "verdict": "pass"
+    },
+    {
+      "id": "C6b-false-positive-redaction",
+      "angle": "Push a non-secret diagnostic word into the key=value rule.",
+      "command": "bun test /tmp/g14-notice.test.ts -t 'case6-DEFECT'",
+      "expectedBehavior": "Only secrets are redacted; a diagnostic word is not erased.",
+      "observedBehavior": "OVER-REDACTION. code tool_denied with message 'oauth: exchange rejected' delivers '[turn failed] tool_denied: oauth: [redacted] rejected' — 'oauth' matches the affixed 'auth' key word and the following diagnostic word is erased. The four named codes are unaffected, but the 'only SECRETS are redacted' clause is violated in the false-positive direction.",
+      "verdict": "fail"
+    },
+    {
+      "id": "C7-never-empty",
+      "angle": "Empty, whitespace-only, control-only, non-Error throwable, undefined message, fully-redacted message.",
+      "command": "bun test /tmp/g14-notice.test.ts -t 'case7'",
+      "expectedBehavior": "The notice always carries a diagnosis and is never a bare marker.",
+      "observedBehavior": "'', '   ', '\\u0000\\u0001\\u0002' and an absent message all deliver '[turn failed] the runtime produced no diagnosis'. Non-Error throwables: 'plain string failure' -> '[turn failed] plain string failure'; undefined -> '[turn failed] undefined'; null -> '[turn failed] null'; a bare object -> '[turn failed] [object Object]' (non-empty but low-value; gjc never throws bare objects, recorded as an observation). A message that redacts entirely still delivers '[turn failed] [redacted]'. No case produced a bare '[turn failed]'.",
+      "verdict": "pass"
+    },
+    {
+      "id": "C8-new-hint-set",
+      "angle": "Prove the /new hint appears for exactly the four rebindable codes plus rebind_cap_exceeded.",
+      "command": "bun test /tmp/g14-notice.test.ts -t 'case8'",
+      "expectedBehavior": "Hint for resource_gone, spawn_failed, terminal_uncertain, managed_append_identity_mismatch, rebind_cap_exceeded; no hint for turn_not_replayed or anything else.",
+      "observedBehavior": "All five codes end with ' Send /new to rebind this conversation.'. No hint for turn_not_replayed, unsupported_state_version, invalid_params, tool_denied, RESOURCE_GONE, resource_gone_x, rebind_cap_exceeded_x, Runtime.Error-42, or a plain Error with no code. A control/whitespace-padded ' resource_gone\\n\\u0000' still earns the hint (normalized to the same code); a rebindable code appearing only in the MESSAGE never does.",
+      "verdict": "pass"
+    },
+    {
+      "id": "C9-classification-code-only",
+      "angle": "Rebindable-looking text vs the code field, case variants, control/whitespace variants — through the real sendTurn path.",
+      "command": "bun test /tmp/g14-notice.test.ts -t 'case9'; bun test /tmp/g10-frames.test.ts -t 'case9'",
+      "expectedBehavior": "Only the code classifies; case variants do not classify; control/whitespace variants classify as the same code.",
+      "observedBehavior": "Unit: a message full of rebindable words with code unsupported_state_version yields rebindableCodeOf=undefined; a benign message with code resource_gone yields 'resource_gone'. RESOURCE_GONE / Resource_Gone / resource_Gone / ' RESOURCE_GONE ' all fail to classify; ' resource_gone', 'resource_gone\\n', '\\tresource_gone\\u0000', 'resou\\u200brce_gone', '\\u202eresource_gone\\u202c' and 'resource_gone ' all classify. Integration over sendTurn: an 'ok:false' stderr envelope with code unsupported_state_version and message 'resource_gone spawn_failed terminal_uncertain' produced 0 rebinds and epoch 0; code RESOURCE_GONE produced 0 rebinds and epoch 0; code ' resource\\u200b_gone\\n' produced exactly one rebind logged 'cause=resource_gone epoch 0 -> 1' and a successful replay.",
+      "verdict": "pass"
+    },
+    {
+      "id": "C10-frame-declaration",
+      "angle": "Per-tool error frames, ok:true frames carrying an error, and first-declared-frame-wins.",
+      "command": "bun test /tmp/g10-frames.test.ts -t 'case10'",
+      "expectedBehavior": "Only a frame declaring itself an error (ok:false or type:'error') is a session failure; the FIRST such frame wins.",
+      "observedBehavior": "runtimeErrorOfEnvelope returns undefined for {type:'tool_execution_end',error:{code:'resource_gone'}}, for {ok:true,error:{...}}, for a bare {error:{...}} and for {ok:false} with no code/message; extractRuntimeError agrees on the raw ndjson. Integration: a turn emitting tool_execution_start then tool_execution_end with a nested managed_append_identity_mismatch and exit 1 rebound 0 times (epoch stayed 0, error code undefined). A stream with a tool frame, then ok:false/unsupported_state_version, then type:'error'/resource_gone resolves to unsupported_state_version — the later rebindable frame does not win, and sendTurn performed 0 rebinds with epoch 0.",
+      "verdict": "pass"
+    },
+    {
+      "id": "C11-no-replay-guard",
+      "angle": "Four failure shapes plus a truncated-line variant; whether each was replayed and whether the reported evidence matched reality.",
+      "command": "bun test /tmp/g13-cap.test.ts -t 'case11'",
+      "expectedBehavior": "A turn that produced tool calls, assistant text or output tokens is rebound but NOT replayed, and reports its real evidence under code turn_not_replayed with no /new hint; a turn that provably did nothing is replayed.",
+      "observedBehavior": "11a tool_execution_start then dies: NOT replayed, turn_not_replayed, '... already produced 1 tool call(s)' (1 turn spawn) — evidence matches. 11b assistant text then fails: NOT replayed, '... assistant text' — matches. 11c usage.output=42 only: NOT replayed, '... 42 output token(s)' — matches. 11d failure on stderr only: REPLAYED (2 turn spawns), correct, the attempt did nothing. 11e tool_execution_start with NO trailing newline: REPLAYED (2 turn spawns) — evidence does NOT match reality, see defect D4.",
+      "verdict": "fail"
+    },
+    {
+      "id": "C12-config-hostile-shapes",
+      "angle": "missing file, directory in its place, chmod 000, symlink to a missing target, zero-byte file, valid JSON array/scalar/null.",
+      "command": "bun test /tmp/g12-config.test.ts -t 'case12: hostile config shapes'",
+      "expectedBehavior": "Every case returns ok:false with a config_invalid diagnostic and retains the previous config object untouched.",
+      "observedBehavior": "All 8 returned ok:false, config identical (===) to the live config, mentionAllowlist ['owner'], channels {c1:{engagement:'open'}}, debounceMs 1500 retained. Diagnostics: ENOENT / EISDIR / EACCES / ENOENT for the four unreadable shapes ('... is missing or unreadable (<errno>); keeping the previous configuration'), 'could not parse <home>/config.json' for the zero-byte file, and 'config must be an object' for [] , 42 and null.",
+      "verdict": "pass"
+    },
+    {
+      "id": "C12b-rapid-reload-delete",
+      "angle": "A config file deleted between two rapid reloads (TOCTOU window on the moved requireFile guard).",
+      "command": "bun test /tmp/g12-config.test.ts -t 'case12: a file deleted between two rapid reloads'",
+      "expectedBehavior": "Neither reload may publish defaults; the failing one retains the live config.",
+      "observedBehavior": "first: ok with changed ['mentionAllowlist','channels']; second: ok=false config_invalid with config === the live object. requireFile lives inside loadConfig next to the read, so there is no caller-side stat window; a bare loadConfig of the same (now empty) home returns undefined mentionAllowlist, confirming the guard is the only thing standing between a vanished file and a defaults publication.",
+      "verdict": "pass"
+    },
+    {
+      "id": "C12c-live-socket-gate",
+      "angle": "Missing-file reload over the real unix socket; a mention-gated room must stay gated.",
+      "command": "bun test /tmp/g12-config.test.ts -t 'case12-live'",
+      "expectedBehavior": "The verb replies ok:false with a config_invalid diagnostic and the gate is unchanged.",
+      "observedBehavior": "Verb response: {\"ok\":false,\"diagnostics\":[{\"code\":\"config_invalid\",\"message\":\"<home>/config.json is missing or unreadable (ENOENT); keeping the previous configuration\"}]}. A stranger's group message was engaged=false before AND after the failed reload, and the allowlisted 'owner' still got engaged=true, proving the retained policy is the real live one rather than a coincidence. Daemon logged 'gateway config reload (verb reload) FAILED; keeping the previous config: ...'.",
+      "verdict": "pass"
+    },
+    {
+      "id": "C13-verb-contract",
+      "angle": "changed / restartRequired / ignored honesty, restart-only edits reported but not applied, and SIGHUP vs verb equivalence.",
+      "command": "bun test /tmp/g12-config.test.ts -t 'case13'",
+      "expectedBehavior": "Reloadable edits applied and listed in changed; restart-only edits listed in restartRequired and NOT applied; unconsumed edits listed in ignored; SIGHUP and the verb share one implementation and one effect.",
+      "observedBehavior": "Library: changed ['mentionAllowlist'], restartRequired ['turnTimeoutMs','model'], ignored ['logVerbosity']; config.turnTimeoutMs / model / logVerbosity kept their old values while mentionAllowlist was applied. Removing mentionAllowlist from the file is applied as a removal (changed ['mentionAllowlist'], value undefined), not left stale. Over the socket: {\"ok\":true,\"changed\":[\"mentionAllowlist\"],\"restartRequired\":[\"turnTimeoutMs\"],\"ignored\":[\"logVerbosity\"]} and the very next group turn from 'newcomer' became engaged=true with no restart. Then a narrower file plus process.kill(pid,'SIGHUP') re-gated 'newcomer' (engaged=false) with the daemon logging 'gateway config reload (SIGHUP) ok; applied=[mentionAllowlist] ...' — same implementation, same effect, no verb involved.",
+      "verdict": "pass"
+    }
+  ],
+  "defects": [
+    {
+      "id": "D1",
+      "severity": "high",
+      "title": "Vendor-prefix secret redaction is defeated by a preceding word character, and control-character stripping manufactures that adjacency",
+      "location": "packages/gateway/src/orchestrator/rebind.ts redactSecrets (the four \\b-anchored vendor-prefix rules)",
+      "contract": "#14 'only SECRETS are redacted' / the last-two-commits claim that normalization before redaction closes control-character smuggling",
+      "repro": "formatFailureNotice(new GjcRuntimeError('w', { code: 'spawn_failed', message: 'MYKEY\\u200bsk_live_deadbeefcafebabe0123456789' }))",
+      "observed": "'[turn failed] spawn_failed: MYKEYsk_live_deadbeefcafebabe0123456789 Send /new to rebind this conversation.' — byte-identical to the unsplit 'MYKEYsk_live_...' input. Also leaks for 'AWS_SECRET_ACCESS_KEY_sk_live_<secret>' and 'pat\\u0000ghp_<secret>', and partially for a >64-char code where truncation glues padding to the prefix.",
+      "expected": "The secret is replaced with [redacted] regardless of the preceding character; stripping a control character must never turn a redacted secret into a leaked one.",
+      "impact": "A secret in a runtime message or code field is delivered verbatim to a Discord/Telegram channel and to the operator log. Reachable by anything that concatenates a key onto an identifier without a separator, and deliberately reachable with one zero-width character.",
+      "test": "/tmp/g14-notice.test.ts 'case5-DEFECT: a word character before a vendor prefix defeats redaction, and stripping manufactures it'"
+    },
+    {
+      "id": "D2",
+      "severity": "medium",
+      "title": "key=value redaction only covers the first whitespace-delimited token, so a quoted secret containing whitespace partially leaks",
+      "location": "packages/gateway/src/orchestrator/rebind.ts redactSecrets, value class [^\\s\"',}]+",
+      "contract": "#14 'only SECRETS are redacted'",
+      "repro": "formatFailureNotice(new GjcRuntimeError('w', { code: 'spawn_failed', message: 'api_key: \"deadbeefcafebabe0123456789 wJalrXUtnFEMIKSECRETDENGbPxRfiCYEXAMPLEKEY\"' }))",
+      "observed": "'api_key: \"[redacted] wJalrXUtnFEMIKSECRETDENGbPxRfiCYEXAMPLEKEY\"'",
+      "expected": "The whole quoted value is redacted when the opening quote was consumed.",
+      "impact": "Any secret value quoted in a runtime error blob and containing a space is half-delivered to the chat surface.",
+      "test": "/tmp/g14-notice.test.ts 'case5-DEFECT: a quoted secret containing whitespace is only partly redacted'"
+    },
+    {
+      "id": "D3",
+      "severity": "low",
+      "title": "False-positive redaction erases non-secret diagnostic text after an auth-ish key word",
+      "location": "packages/gateway/src/orchestrator/rebind.ts redactSecrets, affixed key-word rule",
+      "contract": "#14 'only SECRETS are redacted'",
+      "repro": "formatFailureNotice(new GjcRuntimeError('w', { code: 'tool_denied', message: 'oauth: exchange rejected' }))",
+      "observed": "'[turn failed] tool_denied: oauth: [redacted] rejected'",
+      "expected": "A diagnostic sentence that merely contains an auth-ish word plus a colon is not erased.",
+      "impact": "Diagnosis loss in the direction the affixed-key-word change (commit 79776a5/4ef3940) widened. The four named diagnostic codes are unaffected, so this degrades triage rather than breaking the named obligation.",
+      "test": "/tmp/g14-notice.test.ts 'case6-DEFECT: a non-secret word after an auth-ish key word is falsely redacted'"
+    },
+    {
+      "id": "D4",
+      "severity": "low",
+      "title": "No-replay evidence is lost when the failing turn's last ndjson line has no trailing newline, so a turn that already ran a tool is replayed",
+      "location": "packages/gateway/src/orchestrator/gjc-client.ts GjcTurnStream.feed (line-delimited: the trailing partial line is never parsed) feeding sendTurn's observed{} guard",
+      "contract": "#13/#14 'the turn is replayed only when the failed attempt provably did nothing' and 'the no-replay path reports its real evidence'",
+      "repro": "First turn attempt writes '{\"type\":\"tool_execution_start\",\"name\":\"bash\"}' WITHOUT a trailing newline, then exits 1 with managed_append_identity_mismatch on stderr.",
+      "observed": "REPLAYED (2 turn spawns) and reported as a clean replay; the identical stream WITH a newline is correctly reported as 'not replayed because the turn had already produced 1 tool call(s)'.",
+      "expected": "Buffered evidence is accounted for before deciding to replay, so a tool that already started blocks the replay.",
+      "impact": "Latent: needs a child killed mid-write (SIGKILL during an ndjson write). When it happens the persona re-runs real side effects, which is exactly the outcome the guard exists to prevent.",
+      "test": "/tmp/g13-cap.test.ts 'case11: no-replay guard evidence' (scenario 11e)"
+    }
+  ],
+  "observations": [
+    "Concurrency (C4): the cap is safe because SessionRebinder.rebind is synchronous, but five of six racing turns for one origin never reach the rebinder at all — the first rebind deletes the #origins reverse binding, so the rest surface the raw rebindable failure plus the /new hint. Bounded in the safe direction; noted, not a defect.",
+    "ensureSession's rebind logs the CALLER-supplied from-epoch, while sendTurn deliberately re-reads the persisted epoch. Both lines carry cause + old + new epoch, so #13's logging obligation holds; the create path can only misstate the old epoch if a caller passes a stale one.",
+    "A non-Error throwable delivers '[turn failed] [object Object]' — non-empty per #14, but carries no diagnosis. Not reachable from the gjc paths in this change set."
+  ]
+}

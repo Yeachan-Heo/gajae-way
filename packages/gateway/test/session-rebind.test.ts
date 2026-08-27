@@ -494,6 +494,74 @@ test("a control-character-split secret cannot be reassembled past the redactor",
 	expect(inMessage).toContain("[redacted]");
 });
 
+test("a word character before a vendor prefix does not defeat redaction", () => {
+	// `\b` used to anchor these rules, so `MYKEYsk_live_<secret>` leaked — and
+	// because control characters are stripped first, one zero-width space was
+	// enough to manufacture that adjacency deliberately.
+	for (const message of [
+		"MYKEY\u200bsk_live_deadbeefcafebabe0123456789",
+		"MYKEYsk_live_deadbeefcafebabe0123456789",
+		"AWS_SECRET_ACCESS_KEY_sk_live_deadbeefcafebabe0123456789",
+		"pat\u0000ghp_abcdefghijklmnopqrstuvwx",
+	]) {
+		const notice = formatFailureNotice(new GjcRuntimeError("w", { code: "spawn_failed", message }));
+		expect(notice).toContain("[redacted]");
+		expect(notice).not.toContain("deadbeefcafebabe0123456789");
+		expect(notice).not.toContain("abcdefghijklmnopqrstuvwx");
+	}
+});
+
+test("a quoted secret containing whitespace is redacted whole, not half", () => {
+	const notice = formatFailureNotice(
+		new GjcRuntimeError("w", {
+			code: "spawn_failed",
+			message: 'api_key: "deadbeefcafebabe0123456789 wJalrXUtnFEMIKSECRETDENGbPxRfiCYEXAMPLEKEY"',
+		}),
+	);
+	expect(notice).not.toContain("deadbeefcafebabe0123456789");
+	expect(notice).not.toContain("wJalrXUtnFEMIKSECRETDENGbPxRfiCYEXAMPLEKEY");
+	expect(notice).toContain("[redacted]");
+});
+
+test("prose after an auth-ish word is diagnosis, not a secret, and survives", () => {
+	// Redacting `oauth: exchange rejected` loses the whole diagnosis to protect
+	// nothing; only credential-shaped values are erased.
+	expect(
+		formatFailureNotice(new GjcRuntimeError("w", { code: "tool_denied", message: "oauth: exchange rejected" })),
+	).toBe("[turn failed] tool_denied: oauth: exchange rejected");
+	expect(redactSecrets("authorization: denied by policy")).toBe("authorization: denied by policy");
+	expect(redactSecrets("authorization: hunter2hunter2hunter2")).toContain("[redacted]");
+});
+
+test("an unterminated final frame counts as work, so the turn is not replayed", async () => {
+	// A child killed mid-write leaves its last frame in the parser buffer, where
+	// it is never parsed; replaying then re-runs the side effect the guard exists
+	// to prevent.
+	const { client, database, logs, commands } = await harness([
+		{ stdout: createSuccess("session-e0") },
+		// tool_execution_start with NO trailing newline, failure on stderr.
+		{
+			stdout: `${JSON.stringify({ type: "tool_execution_start", name: "bash" })}`,
+			stderr: JSON.stringify({
+				ok: false,
+				error: { code: "managed_append_identity_mismatch", message: "identity moved" },
+			}),
+			exitCode: 1,
+		},
+		{ stdout: createSuccess("session-e1") },
+	]);
+	try {
+		const { sessionId } = await client.ensureSession("discord:dm:c1");
+		await expect(client.sendTurn(sessionId, "hello")).rejects.toThrow(/unterminated frame/);
+		expect(logs).toHaveLength(1);
+		expect(database.getSessionRecord("discord:dm:c1")).toEqual({ sessionId: "session-e1", epoch: 1 });
+		// create, failed turn, rebind create — and no replay.
+		expect(commands).toHaveLength(3);
+	} finally {
+		database.close();
+	}
+});
+
 test("an affixed secret key name is still redacted", () => {
 	// The key word carries affixes in real environments, so requiring it to sit
 	// immediately next to the delimiter missed the most common shape of all.

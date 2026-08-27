@@ -76,6 +76,16 @@ export class GjcTurnStream {
 		return this.#exactOutputTokens + Math.ceil(this.#deltaChars / 4);
 	}
 
+	/**
+	 * True when a partial, unterminated line is still buffered. A child killed
+	 * mid-write leaves its last frame here, so the frame is never parsed: the
+	 * no-replay guard treats a pending buffer as work that may already have
+	 * happened, because re-running a side effect is worse than refusing a replay.
+	 */
+	get pending(): boolean {
+		return this.#buffer.trim().length > 0;
+	}
+
 	feed(chunk: string): void {
 		this.#buffer += chunk;
 		let index = this.#buffer.indexOf("\n");
@@ -310,7 +320,7 @@ export class GjcClient implements GjcPort {
 			onProgress?.({ toolCalls: 0, outputTokens: 0 });
 			return process.env.GAJAEWAY_TEST_STUB_REPLY ?? "stub reply";
 		}
-		const observed = { toolCalls: 0, outputTokens: 0, hadText: false };
+		const observed = { toolCalls: 0, outputTokens: 0, hadText: false, pending: false };
 		try {
 			const reply = await this.#runTurn(sessionId, text, systemPreamble, onProgress, options, observed);
 			// A turn that completed WITHOUT needing a rebind is the only proof this
@@ -332,7 +342,7 @@ export class GjcClient implements GjcPort {
 			this.#sessions.delete(`${binding.originKey}#${binding.epoch}`);
 			this.#origins.delete(sessionId);
 			const rebound = await this.#createSession(binding.originKey, nextEpoch, options);
-			if (observed.toolCalls > 0 || observed.hadText || observed.outputTokens > 0) {
+			if (observed.toolCalls > 0 || observed.hadText || observed.outputTokens > 0 || observed.pending) {
 				// Report the evidence that actually blocked the replay, and give it its
 				// own code: the automatic rebind already happened, so telling the user
 				// to /new here would bump a second epoch and discard the fresh binding.
@@ -340,6 +350,7 @@ export class GjcClient implements GjcPort {
 					observed.toolCalls > 0 ? `${observed.toolCalls} tool call(s)` : undefined,
 					observed.hadText ? "assistant text" : undefined,
 					observed.outputTokens > 0 ? `${observed.outputTokens} output token(s)` : undefined,
+					observed.pending ? "an unterminated frame the child died mid-write" : undefined,
 				]
 					.filter((part) => part !== undefined)
 					.join(", ");
@@ -362,7 +373,7 @@ export class GjcClient implements GjcPort {
 		onProgress?: (progress: TurnProgress) => void,
 		options?: TurnOptions,
 		/** Work the attempt was seen to perform; a replay is only safe when it is empty. */
-		observed?: { toolCalls: number; outputTokens: number; hadText: boolean },
+		observed?: { toolCalls: number; outputTokens: number; hadText: boolean; pending: boolean },
 	): Promise<string> {
 		const child = this.#spawn({
 			cmd: [
@@ -410,6 +421,7 @@ export class GjcClient implements GjcPort {
 						observed.toolCalls = stream.toolCalls;
 						observed.outputTokens = stream.outputTokens;
 						observed.hadText = stream.finalText !== undefined;
+						observed.pending = stream.pending;
 					}
 					if (onProgress) onProgress({ toolCalls: stream.toolCalls, outputTokens: stream.outputTokens });
 				}

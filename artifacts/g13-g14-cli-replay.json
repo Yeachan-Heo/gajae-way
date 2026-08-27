@@ -1,0 +1,16 @@
+{
+  "schemaVersion": 1,
+  "kind": "cli-replay",
+  "replaySafe": true,
+  "command": ["bun", "-e", "console.log(\"g13g14-redteam-ok\")"],
+  "cwd": ".",
+  "env": { "LC_ALL": "C" },
+  "timeoutMs": 30000,
+  "expectedExitCode": 0,
+  "recordedStdout": "g13g14-redteam-ok\n",
+  "recordedStderr": "",
+  "invariants": [
+    { "type": "substring", "value": "g13g14-redteam-ok" },
+    { "type": "not_substring", "value": "error" }
+  ]
+}

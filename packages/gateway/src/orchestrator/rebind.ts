@@ -176,6 +176,12 @@ export function runtimeErrorOfEnvelope(envelope: unknown): RuntimeErrorDetail | 
  * heuristic: "redact nothing but secrets" means an opaque-looking diagnostic
  * (a session id, a hash, a state version) must survive intact, and an
  * entropy rule cannot tell those from a key.
+ *
+ * Vendor-prefix rules deliberately do NOT anchor on a word boundary. `\b` made
+ * `MYKEYsk_live_<secret>` leak, and because control characters are stripped
+ * first, one zero-width space was enough to manufacture that adjacency on
+ * purpose. Matching the prefix anywhere can only over-redact a secret-shaped
+ * token, which is the safe direction.
  */
 export function redactSecrets(text: string): string {
 	return (
@@ -183,20 +189,40 @@ export function redactSecrets(text: string): string {
 			// Header form FIRST: `Authorization: Bearer <opaque>`, `Basic <b64>`. The
 			// key=value rule below would otherwise consume only the scheme word and
 			// leave the token itself in the clear.
-			.replace(/\b(Bearer|Basic|Token)\s+[A-Za-z0-9._~+/=-]{8,}/gi, "$1 [redacted]")
+			.replace(/(Bearer|Basic|Token)\s+[A-Za-z0-9._~+/=-]{8,}/gi, "$1 [redacted]")
 			// key=value / key: value secret shapes, keeping the key name visible. The
 			// key word may carry affixes, so AWS_SECRET_ACCESS_KEY= is caught as well
-			// as a bare secret=.
-			.replace(
-				/([A-Za-z0-9_]{0,24}(?:token|secret|password|passwd|api[_-]?key|apikey|credential|authorization|auth|bearer)[A-Za-z0-9_]{0,24}["']?\s*[:=]\s*["']?)[^\s"',}]+/gi,
-				"$1[redacted]",
+			// as a bare secret=. A QUOTED value is consumed to its closing quote,
+			// because a quoted secret may contain whitespace and stopping at the first
+			// space half-delivered it.
+			.replace(SECRET_ASSIGNMENT_QUOTED, "$1[redacted]$3")
+			.replace(SECRET_ASSIGNMENT_BARE, (match, prefix: string, value: string) =>
+				looksLikeCredential(value) ? `${prefix}[redacted]` : match,
 			)
 			// Vendor key prefixes, in both dash and underscore spellings.
-			.replace(/\b(?:sk|rk|pk|sk_live|sk_test|pk_live|pk_test)[-_][A-Za-z0-9_-]{8,}/gi, "[redacted]")
-			.replace(/\b(?:ghp|gho|ghu|ghs|ghr|github_pat)_[A-Za-z0-9_]{8,}/g, "[redacted]")
-			.replace(/\bxox[abposr]-[A-Za-z0-9-]{8,}/g, "[redacted]")
-			.replace(/\bey[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}/g, "[redacted]")
+			.replace(/(?:sk|rk|pk|sk_live|sk_test|pk_live|pk_test)[-_][A-Za-z0-9_-]{8,}/gi, "[redacted]")
+			.replace(/(?:ghp|gho|ghu|ghs|ghr|github_pat)_[A-Za-z0-9_]{8,}/g, "[redacted]")
+			.replace(/xox[abposr]-[A-Za-z0-9-]{8,}/g, "[redacted]")
+			.replace(/ey[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}/g, "[redacted]")
 	);
+}
+
+const SECRET_KEY_WORD =
+	"[A-Za-z0-9_]{0,24}(?:token|secret|password|passwd|api[_-]?key|apikey|credential|authorization|auth|bearer)[A-Za-z0-9_]{0,24}";
+/** `key: "value with spaces"` — consumed to the closing quote, which is kept. */
+const SECRET_ASSIGNMENT_QUOTED = new RegExp(`(${SECRET_KEY_WORD}\\s*[:=]\\s*(["']))[^"']*(\\2)`, "gi");
+/** `key=value` — one whitespace-delimited token. */
+const SECRET_ASSIGNMENT_BARE = new RegExp(`(${SECRET_KEY_WORD}\\s*[:=]\\s*)([^\\s"',}]+)`, "gi");
+
+/**
+ * Guards the key=value rule against erasing diagnosis. `oauth: exchange
+ * rejected` contains an auth-ish word and a colon but "exchange" is prose, not a
+ * credential; a credential is long and carries a digit, mixed case, or base64
+ * punctuation.
+ */
+function looksLikeCredential(value: string): boolean {
+	if (value.length < 8) return false;
+	return /[0-9]/.test(value) || /[a-z]/.test(value) === false || /[A-Z]/.test(value) || /[-_+/=]/.test(value);
 }
 
 /**
