@@ -761,16 +761,17 @@ describe("durable dispatch leases — concurrent attempts (true overlap)", () =>
 
 			// Attempt A parks inside its real propagator dispatch (sendTurn hangs,
 			// then RETURNS an A note only after B has completed — the stale
-			// completion path the fencing must neutralize).
+			// completion path the fencing must neutralize). A uses the awaitable
+			// seam so we hold the EXACT original dispatch promise.
 			let releaseA!: () => void;
 			const aParked = new Promise<void>((resolve) => {
 				releaseA = resolve;
 			});
 			let markAReturned!: () => void;
-			let aUnblocked = false;
 			const aReturned = new Promise<void>((resolve) => {
 				markAReturned = resolve;
 			});
+			let aUnblocked = false;
 			let deliveriesA = 0;
 			const propagatorA = new MonitorPropagator({
 				database: db,
@@ -800,22 +801,21 @@ describe("durable dispatch leases — concurrent attempts (true overlap)", () =>
 				emit: () => {},
 			});
 			let eventId = "";
-			const submitA = propagatorA.submit(monitor.monitorId, "memory.canonicalize", { at: "a" });
-			eventId = submitA;
+			const aDispatch: Promise<string> = propagatorA
+				.submitAwaitable(monitor.monitorId, "memory.canonicalize", { at: "a" })
+				.then((submitted) => {
+					eventId = submitted;
+					return submitted;
+				});
 			await aParked;
 			await Bun.sleep(10);
+			eventId = db.monitorEventRows()[0]?.event_id ?? eventId;
 			const leaseA = db.monitorEventLiveLeaseOwner(eventId);
 			expect(leaseA).toBeString();
 
-			// Await attempt A's actual dispatch chain (it parks inside sendTurn):
-			const aDispatch = propagatorA.dispatchDirect(eventId);
-			void aDispatch;
-			await aParked;
-			const leaseAConfirm = db.monitorEventLiveLeaseOwner(eventId);
-			expect(leaseAConfirm).toBe(leaseA);
-
-			// A's lease "expires": attempt B (clock shifted past A's TTL) acquires
-			// its own lease and runs the full REAL dispatch to completion.
+			// A's lease "expires": attempt B (clock shifted past A's TTL) finds no
+			// live lease, acquires its own via the SAME awaitable seam, and runs the
+			// full real dispatch to completion.
 			const bClockShift = 10 * 60_000 + 5_000;
 			let deliveriesB = 0;
 			const propagatorB = new MonitorPropagator({
@@ -834,23 +834,23 @@ describe("durable dispatch leases — concurrent attempts (true overlap)", () =>
 				emit: () => {},
 				now: () => Date.now() + bClockShift,
 			});
-			await propagatorB.dispatchDirect(eventId);
-
-			// B's outcome is durable: authored, B's note, exactly one B delivery.
+			// B's production recovery path: reconcile claims the expired event and
+			// dispatches it (real chain; asserted below by deliveries/intents).
+			await propagatorB.reconcile();
 			const row = db.monitorEventRows().find((candidate) => candidate.event_id === eventId);
 			expect(row?.stage).toBe("authored");
 			expect(db.authoredOutput(eventId)).toBe("B note");
 			expect(deliveriesB).toBe(1);
 
-			// Unblock A: its stale attempt completes with an A note. Await A's real
-			// dispatch promise — every write is lease-fenced, so nothing changes.
+			// Unblock A: its stale attempt completes with an A note. Await A's exact
+			// original dispatch promise — every write is lease-fenced (no-op).
 			aUnblocked = true;
 			await aReturned;
 			await aDispatch;
 			const freshRow = db.monitorEventRows().find((candidate) => candidate.event_id === eventId);
 			expect(freshRow?.stage).toBe("authored");
 			expect(db.authoredOutput(eventId)).toBe("B note");
-			// Exactly one deterministic memory intent for the event (B's; A fenced out):
+			// Exactly one deterministic memory intent (B's; A fenced out):
 			const intents = db.memoryIntentRows().filter((intent) => intent.payload_json.includes(eventId));
 			expect(intents).toHaveLength(1);
 			expect(intents[0]?.id).toBe(`monitor-event-intent:${eventId}`);
@@ -861,8 +861,8 @@ describe("durable dispatch leases — concurrent attempts (true overlap)", () =>
 			expect(deliveriesB).toBe(1);
 			// No A failure evidence:
 			expect(db.monitorFailure(eventId)).toBeUndefined();
-			// Lease ownership belongs to B.
-			expect(db.monitorEventLiveLeaseOwner(eventId, Date.now() + bClockShift)).not.toBe(leaseA);
+			// Lease state explicit: B released on completion → owner undefined.
+			expect(db.monitorEventLiveLeaseOwner(eventId, Date.now() + bClockShift)).toBeUndefined();
 			db.close();
 		} finally {
 			await rm(raceHome, { recursive: true, force: true });

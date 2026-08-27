@@ -54,6 +54,8 @@ export class MonitorPropagator {
 	#inFlight = new Set<string>();
 	/** Re-entrancy guard: only one reconcile sweep may run at a time in this process. */
 	#reconciling = false;
+	/** In-flight dispatch promises per event, for awaitable submission. */
+	#inFlightPromises = new Map<string, Promise<void>>();
 	constructor(options: {
 		database: GatewayDatabase;
 		registry: MonitorRegistry;
@@ -129,12 +131,16 @@ export class MonitorPropagator {
 		return eventId;
 	}
 	/**
-	 * Awaitable dispatch of an already-admitted event (bounded test/ops seam):
-	 * resolves when the dispatch chain for this event has fully settled —
-	 * fenced writes included. Production submit() remains fire-and-forget.
+	 * Awaitable submission (bounded test/ops seam): performs the SAME admission
+	 * and burst/dispatch semantics as submit(), but resolves when THIS event's
+	 * dispatch chain has fully settled — the exact original promise, never a
+	 * second dispatch.
 	 */
-	async dispatchDirect(eventId: string): Promise<void> {
-		await this.#dispatch([eventId]);
+	async submitAwaitable(monitorId: string, eventType: string, payload: unknown): Promise<string> {
+		const eventId = this.submit(monitorId, eventType, payload);
+		const inflight = this.#inFlightPromises.get(eventId);
+		if (inflight) await inflight;
+		return eventId;
 	}
 	/**
 	 * Cron slot admission (red-team blockers 2+3): the slot claim and the event
@@ -242,11 +248,16 @@ export class MonitorPropagator {
 	}
 	async #dispatch(eventIds: string[]): Promise<void> {
 		for (const id of eventIds) this.#inFlight.add(id);
-		try {
-			await this.#dispatchBatch(eventIds);
-		} finally {
-			for (const id of eventIds) this.#inFlight.delete(id);
-		}
+		// Track the exact in-flight promise per event so awaitable submission can
+		// await the ORIGINAL chain (no second dispatch, no double authoring).
+		const promise = this.#dispatchBatch(eventIds).finally(() => {
+			for (const id of eventIds) {
+				this.#inFlight.delete(id);
+				if (this.#inFlightPromises.get(id) === promise) this.#inFlightPromises.delete(id);
+			}
+		});
+		for (const id of eventIds) this.#inFlightPromises.set(id, promise);
+		await promise;
 	}
 	async #dispatchBatch(eventIds: string[]): Promise<void> {
 		const rows = this.#database.monitorEventRows().filter((row) => eventIds.includes(row.event_id));
