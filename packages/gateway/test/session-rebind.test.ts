@@ -550,6 +550,34 @@ test("a word character before a vendor prefix does not defeat redaction", () => 
 	}
 });
 
+test("redaction is calibrated in BOTH directions", () => {
+	// Under-redaction is the likelier failure once a shape heuristic is tuned to
+	// stop over-redacting, so both sides are pinned here.
+	const mustRedact = [
+		"secret=deadbeefcafe", // 12 lowercase hex: a real key with one character class
+		"secret=ABCDEFGHIJKL",
+		"token=abcdefghijklmnopqrstuvwx",
+		"secret=1234567890123456", // a long numeric secret is not a count
+		"AWS_SECRET_ACCESS_KEY=wJalrXUtnFEMIK7MDENGbPxRfiCYEXAMPLEKEY",
+		"authorization: hunter2hunter2hunter2",
+		"credential=hunter2hunter2hunter2",
+		"MYKEY\u200bsk_live_deadbeefcafebabe0123456789",
+		"startup rejected by Authorization: Bearer abcDEF123456ghiJKL",
+	];
+	for (const text of mustRedact) expect(redactSecrets(text)).toContain("[redacted]");
+	const mustSurvive = [
+		"max_tokens=200000 exceeded",
+		"auth_expired: retry the handshake",
+		"oauth: exchange rejected",
+		"token_count=1024",
+		"auth_attempts=3 remaining",
+		"token_ttl=3600",
+		"unsupported_state_version: state version 9 is unsupported",
+		"session 01a037ea-db5a-7072-91a5-73ca624323e2 not found",
+	];
+	for (const text of mustSurvive) expect(redactSecrets(text)).toBe(text);
+});
+
 test("a quoted secret containing whitespace is redacted whole, not half", () => {
 	const notice = formatFailureNotice(
 		new GjcRuntimeError("w", {

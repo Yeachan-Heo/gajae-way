@@ -196,10 +196,10 @@ export function redactSecrets(text: string): string {
 			// because a quoted secret may contain whitespace and stopping at the first
 			// space half-delivered it.
 			.replace(SECRET_ASSIGNMENT_QUOTED, (match, prefix: string, _quote: string, value: string, close: string) =>
-				looksLikeCredential(value) ? `${prefix}[redacted]${close}` : match,
+				looksLikeCredential(prefix, value) ? `${prefix}[redacted]${close}` : match,
 			)
 			.replace(SECRET_ASSIGNMENT_BARE, (match, prefix: string, value: string) =>
-				looksLikeCredential(value) ? `${prefix}[redacted]` : match,
+				looksLikeCredential(prefix, value) ? `${prefix}[redacted]` : match,
 			)
 			// Vendor key prefixes, in both dash and underscore spellings.
 			.replace(/(?:sk|rk|pk|sk_live|sk_test|pk_live|pk_test)[-_][A-Za-z0-9_-]{8,}/gi, "[redacted]")
@@ -217,17 +217,26 @@ const SECRET_ASSIGNMENT_QUOTED = new RegExp(`(${SECRET_KEY_WORD}\\s*[:=]\\s*(["'
 const SECRET_ASSIGNMENT_BARE = new RegExp(`(${SECRET_KEY_WORD}\\s*[:=]\\s*)([^\\s"',}]+)`, "gi");
 
 /**
- * Guards the key=value rules against erasing diagnosis. An affixed key word
- * matches far more than credentials — `max_tokens=200000`, `oauth: exchange
- * rejected`, `auth_expired: ...` — and redacting those loses the whole
- * diagnosis to protect nothing. A credential is LONG and mixes character
- * classes; a limit, a count, or a prose word does not.
+ * Quantity and state compounds that merely CONTAIN a secret-ish word: their
+ * value is a limit, a count or a state, never a credential. Naming them
+ * explicitly is honest and readable; guessing from the value's shape is not,
+ * which the previous attempt proved in both directions at once — it erased
+ * `max_tokens=200000` while letting `secret=deadbeefcafe` through.
  */
-function looksLikeCredential(value: string): boolean {
-	if (value.length < 12) return false;
-	if (/^\d+$/.test(value)) return false; // a limit or a count, not a key
-	const classes = [/[a-z]/, /[A-Z]/, /[0-9]/, /[-_+/=.]/].filter((pattern) => pattern.test(value)).length;
-	return classes >= 2;
+const NON_SECRET_KEY =
+	/(?:^|[_-])(?:max|min|num|count|limit|total|remaining|ttl|expires?|expired|age|window|attempts?|retries|seconds|ms)(?:[_-]|$)/i;
+
+/**
+ * Guards the key=value rules against erasing diagnosis, while biasing towards
+ * redaction: a secret delivered to a chat surface is far worse than a lost
+ * value, because the runtime CODE still carries the diagnosis either way.
+ */
+function looksLikeCredential(key: string, value: string): boolean {
+	if (NON_SECRET_KEY.test(key)) return false;
+	// A short integer is a count or a limit, not a key.
+	if (/^\d+$/.test(value) && value.length <= 10) return false;
+	// Prose words after an auth-ish key stay readable; credentials are longer.
+	return value.length >= 12;
 }
 
 /**
