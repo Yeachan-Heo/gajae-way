@@ -586,6 +586,12 @@ test("redaction is calibrated in BOTH directions", () => {
 		"token=expired_deadbeefcafebabe0123",
 		"secret=short",
 		"password=Tr0ub4dor",
+		// URL query strings, credential lists, and unquoted spaced passphrases.
+		"GET /v1/things?api_key=wJalrXUtnFEMIK7MDENG&page=2 failed",
+		"https://host/x?token=deadbeefcafebabe#frag",
+		'{"secrets":["deadbeefcafe","abcdef123456"]}',
+		"passphrase=correct horse battery staple",
+		"password=p@ss w0rd was rejected",
 	];
 	for (const text of mustRedact) expect(redactSecrets(text)).toContain("[redacted]");
 	const mustSurvive = [
@@ -626,6 +632,12 @@ test("redaction is calibrated in BOTH directions", () => {
 		// Named states and codes after a real credential key stay readable.
 		"secret=MISSING",
 		"token=expired",
+		// Ordinary identifiers that merely start with a two-letter vendor prefix.
+		"sk_migration_runner_failed while draining the queue",
+		"pk_index_rebuild_failed at step 3",
+		"rk_queue_drain_timeout after 30s",
+		"sk-server-restart-required",
+		"sk_pool_exhausted",
 		"[turn failed] spawn_failed: SDK startup did not complete before readiness cutoff",
 	];
 	for (const text of mustSurvive) expect(redactSecrets(text)).toBe(text);

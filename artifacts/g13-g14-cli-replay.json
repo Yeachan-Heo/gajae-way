@@ -1,16 +1,20 @@
 {
   "schemaVersion": 1,
   "kind": "cli-replay",
+  "generation": 5,
   "replaySafe": true,
-  "command": ["bun", "-e", "console.log(\"g13g14-redteam-ok\")"],
+  "command": ["bun", "-e", "console.log(\"g13g14-redteam-gen5-ok\")"],
   "cwd": ".",
   "env": { "LC_ALL": "C" },
   "timeoutMs": 30000,
   "expectedExitCode": 0,
-  "recordedStdout": "g13g14-redteam-ok\n",
+  "recordedStdout": "g13g14-redteam-gen5-ok\n",
   "recordedStderr": "",
+  "recordedExitCode": 0,
+  "recordedAt": "2026-08-27T08:47:00Z",
   "invariants": [
-    { "type": "substring", "value": "g13g14-redteam-ok" },
+    { "type": "substring", "value": "g13g14-redteam-gen5-ok" },
     { "type": "not_substring", "value": "error" }
-  ]
+  ],
+  "note": "Side-effect-free replay probe. The generation-5 red-team evidence itself is not replay-safe from a repo artifact: it spawns unix sockets, chmods temp homes and boots the daemon entrypoint, so it lives in /tmp test files listed in artifacts/g13-g14-qa-redteam-report.json (suite.files)."
 }

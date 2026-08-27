@@ -191,12 +191,20 @@ export function redactSecrets(text: string): string {
 			// Header form FIRST: the key=value rule would otherwise consume only the
 			// scheme word and leave the token itself in the clear.
 			.replace(/\b(Bearer|Basic)\s+[A-Za-z0-9._~+/=-]{8,}/gi, "$1 [redacted]")
-			// An exact credential key. The QUOTED form is handled first and runs to
-			// the closing quote — a quoted secret may contain whitespace — falling
-			// back to end of line, because an unbalanced quote must never mean
-			// "redact nothing".
+			// An exact credential key, in four value shapes. A BRACKETED value is
+			// handled first (a runtime that dumps `{"secrets":[…]}` must not deliver
+			// every entry), then QUOTED — which may contain whitespace and falls back
+			// to end of line, because an unbalanced quote must never mean "redact
+			// nothing" — then the two unquoted forms.
+			.replace(CREDENTIAL_BRACKETED, "$1[redacted]")
 			.replace(CREDENTIAL_QUOTED, (match, key: string, quote: string, value: string, close: string | undefined) =>
 				isDiagnosticWord(value) ? match : `${key}${quote}[redacted]${close ?? ""}`,
+			)
+			// A human passphrase can contain spaces unquoted, and leaving every word
+			// after the first is partial disclosure of exactly the shape that needs
+			// protecting most, so these keys consume the rest of the line.
+			.replace(PASSPHRASE_TO_END_OF_LINE, (match, key: string, value: string) =>
+				isDiagnosticWord(value.trim()) ? match : `${key}[redacted]`,
 			)
 			.replace(CREDENTIAL_BARE, (match, key: string, value: string) =>
 				isDiagnosticWord(value) ? match : `${key}[redacted]`,
@@ -208,9 +216,12 @@ export function redactSecrets(text: string): string {
 			.replace(/(?:ghp|gho|ghu|ghs|ghr|github_pat)_[A-Za-z0-9_]{8,}/g, "[redacted]")
 			.replace(/xox[abposr]-[A-Za-z0-9-]{8,}/g, "[redacted]")
 			.replace(/\bey[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}/g, "[redacted]")
-			// The ambiguous two-letter prefixes keep a word boundary: without it
-			// `network_configuration_error` and `task_runner_failed` were destroyed.
-			.replace(/\b(?:sk|pk|rk)[-_][A-Za-z0-9_-]{12,}/gi, "[redacted]")
+			// An undiscriminated two-letter prefix additionally requires a DIGIT in
+			// the token. Real keys in these families always carry one; ordinary
+			// identifiers such as `sk_migration_runner_failed`, `pk_index_rebuild`
+			// and `rk_queue_drain_timeout` never do, and erasing them destroyed the
+			// whole diagnosis.
+			.replace(/\b(?:sk|pk|rk)[-_](?=[A-Za-z0-9_-]*[0-9])[A-Za-z0-9_-]{12,}/gi, "[redacted]")
 	);
 }
 
@@ -249,12 +260,24 @@ const CREDENTIAL_KEYS = [
  * separator-delimited and the suffix vocabulary is credential-only, which is
  * what makes `AWS_SECRET_ACCESS_KEY`, `GITHUB_TOKEN` and `my_api_key_value`
  * match while `max_tokens`, `token_count` and `auth_expired` do not.
+ *
+ * The left boundary includes URL punctuation (`?`, `&`, `#`, `/`, `;`): a
+ * query-string credential is the most common way a real HTTP failure line
+ * carries one, and `?api_key=…` was not matching at all.
  */
-const CREDENTIAL_KEY = `(?:^|[\\s,{(\\["'])(?:[A-Za-z0-9]+[_-])*?(?:${CREDENTIAL_KEYS.join("|")})(?:[_-](?:value|key|token|secret|string|data|b64|base64))*["']?`;
+const CREDENTIAL_KEY = `(?:^|[\\s,{(\\["'?&#/;])(?:[A-Za-z0-9]+[_-])*?(?:${CREDENTIAL_KEYS.join("|")})(?:[_-](?:value|key|token|secret|string|data|b64|base64))*["']?`;
+/** `key: [ … ]` — a list of credentials must not be delivered entry by entry. */
+const CREDENTIAL_BRACKETED = new RegExp(`(${CREDENTIAL_KEY}\\s*[:=]\\s*)\\[[^\\]\\n]*\\]`, "gi");
 /** `key: "value with spaces"`; the closing quote is optional so it fails closed. */
 const CREDENTIAL_QUOTED = new RegExp(`(${CREDENTIAL_KEY}\\s*[:=]\\s*)(["'])([^"'\\n]*)(["'])?`, "gi");
-/** `key=value` — one whitespace-delimited token. */
-const CREDENTIAL_BARE = new RegExp(`(${CREDENTIAL_KEY}\\s*[:=]\\s*)([^\\s"',}]+)`, "gi");
+/**
+ * `password=correct horse battery staple` — a human passphrase is written with
+ * spaces and unquoted, so for these keys only the value runs to end of line.
+ */
+const PASSPHRASE_TO_END_OF_LINE =
+	/((?:^|[\s,{(["'?&#/;])(?:[A-Za-z0-9]+[_-])*?(?:password|passwd|passphrase)\s*[:=]\s*)([^\n]+)/gi;
+/** `key=value` — one token, stopped by whitespace or URL/JSON punctuation. */
+const CREDENTIAL_BARE = new RegExp(`(${CREDENTIAL_KEY}\\s*[:=]\\s*)([^\\s"',}&#]+)`, "gi");
 
 /**
  * State words a runtime legitimately puts where a credential would go, so

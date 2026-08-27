@@ -1,317 +1,334 @@
 {
   "schemaVersion": 1,
   "kind": "api-package-test-report",
-  "generation": 4,
-  "sourceHash": "sha256:f8673b39d77f478890ad2373abfb6c98d23c2473344ac315009256c5ba46c9fb",
-  "reviewedHead": "b83ad30",
-  "sourceHashNote": "The frozen generation-4 sourceHash names 7995fcd. HEAD advanced to b83ad30 ('Calibrate secret redaction in both directions instead of guessing from shape') mid-pass, which REPLACED the redaction gate this assignment targets: looksLikeCredential(value) with '12+ chars, not purely numeric, 2+ character classes' became looksLikeCredential(key, value) = a NON_SECRET_KEY word denylist + a short-integer reject + value.length >= 12. Per 0-Main, every case below was run against b83ad30 because that is what would ship; sourceHash is left at the frozen value for the leader to re-freeze and reconcile.",
+  "generation": 5,
+  "sourceHash": "sha256:b74f973ff68096235180869cf8c99d875b2c9df8391879b1c9817ae6fc806cc0",
+  "reviewedHead": "abf6919",
+  "branch": "fix/session-rebind-and-error-surface",
   "surface": [
-    "gateway library modules (API/package)",
+    "gateway library modules (API/package): orchestrator/rebind.ts, orchestrator/gjc-client.ts, config.ts, server/server.ts",
     "unix-socket RPC verbs chat.send and gateway.reloadConfig over a real listening socket",
-    "SIGHUP signal path",
-    "real gjc/0.15.3 CLI (`gjc -p --mode json`, `gjc --resume <unknown>`) for ndjson framing evidence"
+    "SIGHUP signal path on a live server",
+    "boot entrypoint executed as a process: `bun packages/gateway/src/main.ts daemon` with GAJAEWAY_HOME pointed at hostile homes"
   ],
   "suite": {
     "files": [
-      "/tmp/g13-cap.test.ts",
-      "/tmp/g14-notice.test.ts",
-      "/tmp/g10-frames.test.ts",
-      "/tmp/g12-config.test.ts",
-      "/tmp/g2-clear-audit.test.ts",
-      "/tmp/g4-redaction.test.ts",
-      "/tmp/g4-pending.test.ts",
-      "/tmp/g4-config.test.ts",
-      "/tmp/g4-e2e.test.ts",
-      "/tmp/g4-cap.test.ts"
+      "/tmp/rt-redact-under.test.ts",
+      "/tmp/rt-redact-over.test.ts",
+      "/tmp/rt-redact-extra.test.ts",
+      "/tmp/rt-defects.test.ts",
+      "/tmp/rt-cap.test.ts",
+      "/tmp/rt-cap3.test.ts",
+      "/tmp/rt-noreplay.test.ts",
+      "/tmp/rt-config.test.ts",
+      "/tmp/rt-e2e.test.ts"
     ],
-    "command": "bun test /tmp/g13-cap.test.ts /tmp/g14-notice.test.ts /tmp/g10-frames.test.ts /tmp/g12-config.test.ts /tmp/g2-clear-audit.test.ts /tmp/g4-redaction.test.ts /tmp/g4-pending.test.ts /tmp/g4-config.test.ts /tmp/g4-e2e.test.ts /tmp/g4-cap.test.ts",
-    "result": "51 pass / 0 fail / 499 expect() calls across 10 files",
-    "generation3Rerun": "30 pass / 0 fail / 255 expect() calls after 5 re-points (see repointedCases); before re-pointing it was 25 pass / 5 fail, every failure being an expectation that encoded a now-fixed defect or the added lifetime field.",
-    "repoSuiteReceipt": "bun test packages/gateway at b83ad30: 134 pass / 2 skip / 0 fail / 572 expect() calls (leader receipt was 133 pass; b83ad30 added a redaction-calibration test).",
-    "note": "Every assertion encodes the OBSERVED behaviour of b83ad30, including the five defects below, so a green suite documents them rather than hiding them."
+    "command": "bun test /tmp/rt-redact-under.test.ts /tmp/rt-redact-over.test.ts /tmp/rt-redact-extra.test.ts /tmp/rt-defects.test.ts /tmp/rt-cap.test.ts /tmp/rt-cap3.test.ts /tmp/rt-noreplay.test.ts /tmp/rt-config.test.ts /tmp/rt-e2e.test.ts",
+    "result": "15 pass / 0 fail / 15 expect() calls across 9 files (probes are print-and-inspect matrices; the assertions only pin the invariants that must hold)",
+    "repoSuiteReceipt": "bun test packages/gateway at abf6919: 135 pass / 2 skip / 0 fail / 617 expect() calls — matches the leader receipt exactly.",
+    "bootProbe": "GAJAEWAY_HOME=<tmp with chmod 000 config.json> bun packages/gateway/src/main.ts daemon",
+    "note": "No repo source, test or doc file was modified. The only files written are artifacts/g13-g14-qa-redteam-report.json and artifacts/g13-g14-cli-replay.json."
   },
   "cases": [
     {
-      "id": "G4-1a-regression-old-gate-leaks",
-      "angle": "Task 1 baseline: the four values 0-Main reported leaking under the old 2-class gate.",
-      "command": "bun test /tmp/g4-redaction.test.ts -t 'g4-1a'",
-      "expectedBehavior": "secret=deadbeefcafe, secret=ABCDEFGHIJKL, token=abcdefghijklmnopqrstuvwx and secret=1234567890123456 are all redacted.",
-      "observedBehavior": "All four now redact to '<key>=[redacted]'. The old gate's 2-character-class requirement was the leak; b83ad30 removed it.",
+      "id": "G5-1a-credential-key-vocabulary",
+      "angle": "Under-redaction: every one of the 23 names in CREDENTIAL_KEYS with a realistic 28-char secret, in three shapes (`key=v`, `key: v`, UPPER env `KEY=v`) — 69 attempts.",
+      "command": "bun test /tmp/rt-redact-under.test.ts",
+      "expectedBehavior": "All 69 deliver `<key>=[redacted]`; no attempt ships `deadbeefcafe0123456789abcdef`.",
+      "observedBehavior": "69/69 redacted. secret, secrets, password, passwd, passphrase, token, api_key, apikey, api-key, access_key, secret_key, secret_access_key, private_key, client_secret, access_token, refresh_token, id_token, session_token, auth_token, bearer_token, credential, credentials, authorization — all three shapes, all cases folded (the regex is /gi).",
       "verdict": "pass"
     },
     {
-      "id": "G4-1b-single-class-short-numeric",
-      "angle": "Task 1: make the gate MISS a real secret — 12-char all-lowercase, all-uppercase, purely numeric, 11-char, lowercase-only base64, and exactly 12 chars of one class.",
-      "command": "bun test /tmp/g4-redaction.test.ts -t 'g4-1b'",
-      "expectedBehavior": "Every one of those shapes is redacted; the only survivor is below the declared 12-char floor.",
-      "observedBehavior": "REDACTED: api_key=abcdefghijkl, api_key=ABCDEFGHIJKL, password=123456789012, api_key=123456789012345678901234, api_key=abcdefghijklmnopqrstuvwx, token=qqqqqqqqqqqq, token=QQQQQQQQQQQQ, token=111111111111, token=------------, api_key: \"abcdefghijkl\". Also redacted in the header form: 'Authorization: Bearer abcdefghijkl' and 'Authorization: Bearer 123456789012'. The only misses are BELOW the floor: token=Abcdefghij1 (11) and secret=deadbeefca1 (11) ship verbatim — the documented boundary, not a hole, and 11-char provider keys are not a real shape.",
+      "id": "G5-1b-vendor-prefixed-and-suffixed-keys",
+      "angle": "Under-redaction: separator-delimited vendor prefixes and the credential-only suffix vocabulary.",
+      "command": "bun test /tmp/rt-redact-under.test.ts",
+      "expectedBehavior": "AWS_SECRET_ACCESS_KEY, GITHUB_TOKEN, my_api_key_value, openai_api_key, x-api-key, MY-SECRET-VALUE, acme_client_secret_b64, svc_token_string, a_b_c_secret all redact.",
+      "observedBehavior": "9/9 redacted. The mirror image also holds: max_tokens=200000, token_count: 8192, auth_expired and oauth survive untouched (case G5-2a).",
       "verdict": "pass"
     },
     {
-      "id": "G4-1c-exempt-word-smuggling",
-      "angle": "Task 1 (redirected by 0-Main): the NON_SECRET_KEY denylist is now the whole discriminator — smuggle a real 26-char credential behind an exempt word.",
-      "command": "bun test /tmp/g4-redaction.test.ts -t 'g4-1c'",
-      "expectedBehavior": "A credential-shaped value is redacted regardless of what else the key name happens to contain.",
-      "observedBehavior": "LEAK, 18/18 attempts. Every one of these delivers the secret verbatim to the chat surface: max_token=, max_secret=, MAX_TOKEN=, AWS_MAX_SECRET_ACCESS_KEY=, auth_expires_secret=, expired_password=, retries_token=, token_ttl_secret=, count_api_key=, age_token=, ms_token=, num_credential=, total_authorization=, remaining_secret=, window_passwd=, attempt_token=, seconds_apikey=, and the quoted form max_token: \"<secret>\". Confirmed end to end: formatFailureNotice for expired_password=deadbeefcafebabe0123456789 contains the secret. A word that merely CONTAINS an exempt word (maximal_token, message_token, damage_token) is correctly NOT exempt, which is the only thing keeping the hole from being wider.",
+      "id": "G5-1c-value-shapes",
+      "angle": "Under-redaction: JSON double-quoted, single-quoted, unbalanced quote, unbalanced quote followed by prose, quoted value containing spaces, multi-line, quoted key inside JSON with whitespace variants.",
+      "command": "bun test /tmp/rt-redact-under.test.ts",
+      "expectedBehavior": "Every shape redacts; an unbalanced quote must fail closed (redact to end of line, never redact nothing).",
+      "observedBehavior": "All redact. `token=\"deadbeef… and then more` -> `token=\"[redacted]` (fails closed, consuming the trailing prose). `password: \"<secret> more words\"` -> `password: \"[redacted]\"`. `{\\n  \"password\": \"<secret>\"\\n}` -> redacted. `{ \"credentials\" :  { \"token\" :   \"<secret>\" } }` redacts the inner secret but mangles the structural `{` (see G5-2e / defect G5-D3).",
+      "verdict": "pass"
+    },
+    {
+      "id": "G5-1d-secret-in-the-code-field",
+      "angle": "Under-redaction: a secret pasted into the structured CODE field, which also reaches the chat surface.",
+      "command": "bun test /tmp/rt-redact-over.test.ts",
+      "expectedBehavior": "The code is normalized, then redacted, then bounded.",
+      "observedBehavior": "code `sk_live_deadbeefcafe0123` -> `[redacted]`, text `[redacted]: m`. code `secret=deadbeefcafe0123456` -> `secret=[redacted]`. code `resource_gone` untouched. A 4000-char code is truncated to 64 + `…` and the notice stays under 400 chars.",
+      "verdict": "pass"
+    },
+    {
+      "id": "G5-1e-control-character-smuggling",
+      "angle": "Under-redaction: a secret (and a credential KEY) split by control characters — NUL inside the value, NUL inside the key name, NUL between key and `=`, U+200B inside a vendor prefix.",
+      "command": "bun test /tmp/rt-redact-over.test.ts",
+      "expectedBehavior": "stripControl runs BEFORE redaction on the reporting path, so every reassembled key/secret is caught.",
+      "observedBehavior": "Through describeFailure (the only path a notice takes): `sec\\u0000ret=<secret>` -> `secret=[redacted]`; `tok\\u0000en=<secret>` -> `token=[redacted]`; `secret\\u0000=<secret>` -> `secret=[redacted]`; `sk_live_dead\\u0000beef…` and `sk_live_dead\\u200bbeef…` -> `[redacted]`; a pure control-character buffer falls through to the gateway framing instead of an empty diagnosis. Note: redactSecrets() called directly on `sec\\u0000ret=<secret>` does NOT redact — correct by design, because normalization is the caller's documented precondition and every production caller honours it.",
+      "verdict": "pass"
+    },
+    {
+      "id": "G5-1f-state-word-prefix-and-casing",
+      "angle": "Under-redaction: a state word used as a PREFIX of a real secret, plus casing variants of the state words.",
+      "command": "bun test /tmp/rt-redact-under.test.ts",
+      "expectedBehavior": "`secret=missing_but_actually_deadbeefcafe` must redact (it is not the state word `missing`); `secret=missing` must survive.",
+      "observedBehavior": "`secret=missing_but_actually_deadbeefcafe` -> `secret=[redacted]`; `token=expired_deadbeefcafe0123` -> `token=[redacted]`; `secret=short` -> `secret=[redacted]`. Casing variants (`secret=MISSING`, `secret=Missing`, `token=UNSET`) survive — the state-word set is matched case-insensitively, which is the documented intent, not a leak of a credential shape.",
+      "verdict": "pass"
+    },
+    {
+      "id": "G5-1g-vendor-shapes-and-headers",
+      "angle": "Under-redaction: vendor discriminators and header values with no key name at all.",
+      "command": "bun test /tmp/rt-redact-under.test.ts",
+      "expectedBehavior": "sk_live_, sk_test_, sk-ant-, ghp_, github_pat_, xoxb-, xoxp-, a JWT triplet, `Bearer <v>` and `Basic <v>` all redact.",
+      "observedBehavior": "11/11 redacted. `Authorization: Bearer <secret>` -> `Authorization: [redacted] [redacted]` (the scheme word is consumed by the credential-key rule after the header rule already replaced the token; cosmetic, no leak).",
+      "verdict": "pass"
+    },
+    {
+      "id": "G5-1h-truncation-boundary",
+      "angle": "Under-redaction: a secret placed so that the 240-char MESSAGE_LIMIT cut lands inside it (pads 225/228/230/232/235/240) plus a vendor shape at the boundary.",
+      "command": "bun test /tmp/rt-redact-over.test.ts",
+      "expectedBehavior": "Redaction runs before truncation, so no partial secret can survive the cut.",
+      "observedBehavior": "7/7 leaked=false. Tails show `secret=[redact…`, `secret=[red…`, `… [redacted…` — the truncation only ever cuts the placeholder.",
+      "verdict": "pass"
+    },
+    {
+      "id": "G5-1i-url-query-credential-LEAK",
+      "angle": "Under-redaction: a credential key preceded by URL punctuation instead of whitespace/brace/quote.",
+      "command": "bun test /tmp/rt-defects.test.ts",
+      "expectedBehavior": "`?access_token=<secret>` is an exact credential key with a value and must redact.",
+      "observedBehavior": "LEAK, delivered verbatim to the chat surface. `[turn failed] spawn_failed: gjc: POST https://api.anthropic.com/v1/messages?access_token=sk9deadbeefcafe0123456789 -> 401 unauthorized. Send /new to rebind this conversation.` Same for `?api_key=deadbeefcafe0123456789&limit=10` and `#token=deadbeefcafe0123456789`. CREDENTIAL_KEY's left boundary is `(?:^|[\\s,{(\\[\"'])`, and `?`, `&`, `#`, `/` are not in it. Defect G5-D1.",
       "verdict": "fail"
     },
     {
-      "id": "G4-1d-separator-asymmetry",
-      "angle": "Task 1: the denylist is matched against the captured prefix, whose affix class is [A-Za-z0-9_] only.",
-      "command": "bun test /tmp/g4-redaction.test.ts -t 'g4-1d'",
-      "expectedBehavior": "Whether a key is exempt should not depend on the separator an operator or a runtime happened to use.",
-      "observedBehavior": "It does. 'max-tokens=200000000000' -> 'max-tokens=[redacted]' (over-redacted) while 'max_tokens=200000000000' survives; 'max_token=<26-char secret>' leaks while 'limit-token=<same secret>' redacts. A dash immediately after the key word ('max-token-limit=/var/log/gateway-quota.log') breaks the assignment match entirely and nothing is redacted or reported.",
+      "id": "G5-1j-array-valued-credential-key-LEAK",
+      "angle": "Under-redaction: a credential key whose JSON value is an array or an object.",
+      "command": "bun test /tmp/rt-defects.test.ts",
+      "expectedBehavior": "`{\"secrets\":[\"<secret>\",\"<secret2>\"]}` must not deliver either secret.",
+      "observedBehavior": "LEAK. Output: `{\"secrets\":[redacted]\"deadbeefcafe0123456789\",\"hunter2trombone\"]}` — the bare rule consumed the `[` as the whole value, so both secrets ship in the clear and the structural token is redacted instead. Same for `{\"credentials\":[\"<secret>\"]}`. Defect G5-D3.",
       "verdict": "fail"
     },
     {
-      "id": "G4-2a-diagnosis-not-behind-a-key",
-      "angle": "Task 2: file paths, UUIDs, session ids, git SHAs, stack frames and JSON blobs that are NOT the value of an auth-ish key.",
-      "command": "bun test /tmp/g4-redaction.test.ts -t 'g4-2a'",
-      "expectedBehavior": "All survive byte-for-byte.",
-      "observedBehavior": "All ten survive unchanged, including a two-frame stack trace with real paths, a ULID + sha256 pair, 'max_tokens=200000', 'oauth: exchange rejected', 'token_expires_at=2026-08-27T17:12:00Z', and both JSON blob shapes ('error: {\"auth\": {\"code\": \"resource_gone\"}}' and 'auth: {\"code\":\"resource_gone\",\"hint\":\"send /new\"}'). Quoted JSON keys never reach the assignment rules because the quote sits between the key word and the colon.",
-      "verdict": "pass"
-    },
-    {
-      "id": "G4-2b-over-redaction-behind-a-key",
-      "angle": "Task 2: the same diagnosis material placed AFTER an auth-ish key word.",
-      "command": "bun test /tmp/g4-redaction.test.ts -t 'g4-2b'",
-      "expectedBehavior": "#14: only secrets are redacted; ordinary diagnostics must survive.",
-      "observedBehavior": "OVER-REDACTION, 13/13. 'auth: unauthenticated' -> 'auth: [redacted]'; 'auth_error: refresh_token_expired' -> 'auth_error: [redacted]'; 'credential: unrecoverable' -> 'credential: [redacted]'; 'authorization: insufficient_scope_for_this_operation' -> 'authorization: [redacted]'; 'auth_reason=configuration mismatch' -> 'auth_reason=[redacted] mismatch'; and token=<path>, auth_session=<uuid>, auth_session=<ULID>, token=<git SHA>, auth_at=<ISO timestamp>, authorization=<semver+build>, auth_attempts=999999999999, 'authorize: /Users/x/pkg/src/server.ts:113:9' all become '[redacted]'. The code comment declares this bias deliberate ('a secret delivered to a chat surface is far worse than a lost value'), so the value is a diagnosis-loss tradeoff rather than an accident — but the loss is total for the message half of the notice.",
+      "id": "G5-1k-multi-word-unquoted-value-LEAK",
+      "angle": "Under-redaction: an unquoted credential value that contains whitespace.",
+      "command": "bun test /tmp/rt-defects.test.ts",
+      "expectedBehavior": "No part of the credential reaches the surface.",
+      "observedBehavior": "PARTIAL LEAK. `password=p@ss w0rd was rejected by the keychain` -> `password=[redacted] w0rd was rejected…`; `passphrase=correct horse battery staple` -> `passphrase=[redacted] horse battery staple`. The bare rule is one whitespace-delimited token by design; a spaced passphrase leaks all but its first word. Defect G5-D4 (low).",
       "verdict": "fail"
     },
     {
-      "id": "G4-3a-vendor-prefix-destroys-prose",
-      "angle": "Task 3: the \\b removal on the vendor-prefix rules — find legitimate text it now destroys (words containing sk_, sk-, rk_, pk_, or ey + two dotted segments).",
-      "command": "bun test /tmp/g4-redaction.test.ts -t 'g4-3a'",
-      "expectedBehavior": "Ordinary diagnostic prose survives; only secret-shaped tokens are redacted.",
-      "observedBehavior": "DESTROYED, 13/13. 'disk_usage_exceeded: no space left on device' -> 'di[redacted]: no space left on device'; 'network_unreachable: dial tcp failed' -> 'netwo[redacted]: dial tcp failed'; 'task_execution_timeout after 300000ms' -> 'ta[redacted] after 300000ms'; also risk_assessment_failed, ask_permission_denied, task-runner-timeout, work_dir_missing, work_queue_stalled, apk_install_failed, TASK_EXECUTION_FAILED (the rule is /i), mask_pattern_invalid. The `ey` rule eats dotted symbol paths: 'at monkey_patch_util.test_module.expected_name (x.ts:1:1)' -> 'at monk[redacted] (x.ts:1:1)' and 'they_failed_here.module_name.function_call ...' -> 'th[redacted] ...'. Near misses survive only because their tail is under 8 chars ('fork_failed: EAGAIN', 'backpack_sync_error'). Real vendor keys and a real JWT still redact, so the rule is not simply broken — it is unbounded.",
+      "id": "G5-1l-pem-block",
+      "angle": "Under-redaction: a PEM private-key block, which carries no key=value and no vendor discriminator.",
+      "command": "bun test /tmp/rt-defects.test.ts",
+      "expectedBehavior": "Not covered by the two declared recognisers, so a miss here is a scope statement rather than a broken rule.",
+      "observedBehavior": "Delivered verbatim: `-----BEGIN RSA PRIVATE KEY-----\\nMIIEowIBAAKCAQEA9deadbeefcafe0123456789\\n-----END RSA PRIVATE KEY-----`. Recorded as a residual gap (observations), not a defect: the design explicitly recognises exact key names and vendor shapes only, and a gjc failure blob printing a PEM body is not an observed shape.",
+      "verdict": "observation"
+    },
+    {
+      "id": "G5-2a-diagnosis-survival",
+      "angle": "Over-redaction: 31 strings a real gjc failure contains — the six runtime codes, compound codes, POSIX and Windows paths, UUID, ULID, git SHA, ISO timestamp, semver+build, a stack frame, an `ey`-containing snake_case identifier, prose after `authorization:`/`token:`/`secret:`, max_tokens/token_count/oauth, a sha256 digest, an idempotency key, a JSON error envelope, a URL with query params, and `no api_key was configured`.",
+      "command": "bun test /tmp/rt-redact-over.test.ts",
+      "expectedBehavior": "Byte-identical output — the diagnosis is what #14 exists to deliver.",
+      "observedBehavior": "30/31 identical. `network_unreachable`, `task_execution_failed`, `disk_quota_exceeded`, `risk_threshold_exceeded`, `eyeball_tracker_service`, `keying_strategy_failed` all survive. The single failure is the sk_/pk_/rk_ family in G5-2b.",
+      "verdict": "pass"
+    },
+    {
+      "id": "G5-2b-sk-prefixed-identifier-DESTROYED",
+      "angle": "Over-redaction: snake_case/kebab identifiers that literally BEGIN with sk_/pk_/rk_ (the assignment's `snake_case identifiers containing sk_/rk_/pk_` angle).",
+      "command": "bun test /tmp/rt-defects.test.ts",
+      "expectedBehavior": "A runtime code is not a credential; only a vendor discriminator (`sk_live_`, `sk-ant-`) should trigger the shape rule.",
+      "observedBehavior": "Whole diagnosis erased on the delivered surface: `[turn failed] spawn_failed: [redacted] while draining the queue.` for `sk_migration_runner_failed while draining the queue`. Also `pk_index_rebuild_failed at step 3`, `rk_queue_drain_timeout after 30s`, `sk-server-restart-required`, `sk_pool_exhausted`. The trigger is the fallback `\\b(?:sk|pk|rk)[-_][A-Za-z0-9_-]{12,}` — measured boundary: `sk_` + 11 chars survives, `sk_` + 12 chars is redacted. `disk_quota_exceeded` survives only because `\\b` blocks the `sk_` inside a word. Defect G5-D2.",
       "verdict": "fail"
     },
     {
-      "id": "G4-3b-vendor-prefix-destroys-the-code",
-      "angle": "Task 3, escalated: the same rules run over the CODE field, which #14 says is the whole diagnosis.",
-      "command": "bun test /tmp/g4-redaction.test.ts -t 'g4-3b'",
-      "expectedBehavior": "A runtime code reaches the operator and the channel intact; it is never sensitive.",
-      "observedBehavior": "TOTAL DIAGNOSIS LOSS for a plausible code family: code disk_quota_exceeded delivers '[turn failed] di[redacted]: startup failed'; task_execution_timeout -> 'ta[redacted]'; network_unreachable -> 'netwo[redacted]'; work_dir_missing -> 'wo[redacted]'; risk_check_failed -> 'ri[redacted]'. The five codes the contract names (the four rebindable ones plus rebind_cap_exceeded) are unaffected — by luck of spelling, not by design.",
+      "id": "G5-2c-prose-after-a-credential-key",
+      "angle": "Over-redaction: the documented exemption — a lowercase snake_case code or a named state word after a real credential key.",
+      "command": "bun test /tmp/rt-redact-over.test.ts",
+      "expectedBehavior": "`authorization: insufficient scope for this operation, ask the owner`, `token: expired 4 minutes ago`, `secret: missing from the keychain entry`, `authorization=insufficient_scope_for_this_operation` all survive.",
+      "observedBehavior": "All survive byte-identical.",
+      "verdict": "pass"
+    },
+    {
+      "id": "G5-2d-snake-case-exemption-cost",
+      "angle": "The other side of that exemption: a real credential that happens to be lowercase snake_case.",
+      "command": "bun test /tmp/rt-defects.test.ts",
+      "expectedBehavior": "Declared behaviour: `secret=missing` survives, `secret=short` is redacted — the exemption is by value vocabulary/shape, so a snake_case-shaped secret is knowingly exempt.",
+      "observedBehavior": "`secret=hunter2trombone_x1` and `authorization=my_super_secret_value` are delivered verbatim. This is the documented, deliberate tradeoff in the rebuilt design (isDiagnosticWord's `^[a-z][a-z0-9]*(?:_[a-z0-9]+)+$` branch), so it is reported as a residual risk rather than a defect. Real provider keys (mixed case, digits, no underscore grouping, or a vendor discriminator) do not match it; a human passphrase like `correct_horse_battery_staple` does.",
+      "verdict": "observation"
+    },
+    {
+      "id": "G5-2e-structural-token-consumed",
+      "angle": "Over-redaction: a `{` immediately after a credential key.",
+      "command": "bun test /tmp/rt-defects.test.ts",
+      "expectedBehavior": "A brace is not a secret; nested keys and file paths behind it are diagnosis.",
+      "observedBehavior": "`{\"credentials\": {\"file\": \"/Users/x/creds.json\"}} could not be read` -> `{\"credentials\": [redacted]\"file\": \"/Users/x/creds.json\"}} could not be read`; `token: {status: expired, age: 4m}` -> `token: [redacted] expired, age: 4m}` (loses `status:`). Structural corruption plus, in the array form, the leak in G5-1j. Defect G5-D3.",
       "verdict": "fail"
     },
     {
-      "id": "G4-4-quoted-value-rule",
-      "angle": "Task 4: several quoted pairs in one message, an unbalanced quote, nested quotes, a quoted value spanning a newline, and an empty quoted value.",
-      "command": "bun test /tmp/g4-redaction.test.ts -t 'g4-4'",
-      "expectedBehavior": "Each quoted secret is fully redacted; non-secret quoted values and empty values survive; no shape leaves secret material in the clear.",
-      "observedBehavior": "Correct for four shapes: several pairs -> 'api_key: \"[redacted]\" token: \"[redacted]\" note: \"keep me\"'; a value spanning a newline -> 'api_key: \"[redacted]\"'; the D2 whitespace case -> 'api_key: \"[redacted]\"'; empty values ('api_key: \"\"', \"api_key: ''\") untouched. FAILS OPEN for four shapes: an unbalanced quote ('api_key: \"<secret> and then prose') ships the secret verbatim; nested single-in-double ('api_key: \"it's <secret>\"') ships it; nested double-in-single (\"api_key: 'the \\\"<secret>\\\" value'\") ships it; a mismatched pair ('api_key: \"<secret>'\") ships it. And 'api_key: \"<secret1> and later token: \"<secret2>\"' produces 'api_key: \"[redacted]\"<secret2>\"' — the match spans quote 1 to quote 2, so the PROSE and the second key name are erased while the second secret is delivered.",
-      "verdict": "fail"
-    },
-    {
-      "id": "G4-5a-real-gjc-framing",
-      "angle": "Task 5: does a NORMAL gjc turn stream end with a trailing newline, or is automatic replay effectively dead? Measured against the real binary, not assumed.",
-      "command": "gjc -p --mode json 'Reply with exactly the word: ok' > /tmp/g4-gjc-ok.out; gjc --resume 00000000-0000-4000-8000-000000000000 -p --mode json hi; bun test /tmp/g4-pending.test.ts -t 'g4-5a'",
-      "expectedBehavior": "If real gjc output is newline-terminated, the pending guard costs nothing for a normal failing turn.",
-      "observedBehavior": "NOT a regression. Real gjc/0.15.3 `-p --mode json` emitted 21062 bytes / 14 frames (session, agent_start, turn_start, 3x message_start, 3x message_end, 3x message_update, turn_end, agent_end), ends with '}\\n', and the fragment after the last newline is ''. Fed whole or one character at a time, GjcTurnStream.pending is false and finalText is set. The real FAILING shape (`gjc --resume <unknown-id>`) writes 0 bytes to stdout and a non-JSON stack trace to stderr, so pending is false there too. Automatic replay is alive.",
+      "id": "G5-3a-cap-bounds-a-recurring-turn-failure",
+      "angle": "Cap: EVERY turn's first attempt dies with a turn-level `managed_append_identity_mismatch` and the replay on the rebound session succeeds — the exact shape that used to make the cap unreachable.",
+      "command": "bun test /tmp/rt-cap3.test.ts",
+      "expectedBehavior": "A replayed turn must NOT clear the budget, so the epoch stops at the cap and every later turn fails explicitly.",
+      "observedBehavior": "Bounded. 8 turns: 3 succeeded via replay (rebinds 1/3, 2/3, 3/3; epoch 0->1->2->3, lifetime=1..3), then turns 4-8 all threw RebindCapExceededError with `[turn failed] rebind_cap_exceeded: rebind cap 3 reached after managed_append_identity_mismatch at epoch 3. Send /new to rebind this conversation.` Final epoch 3 and no further bumps.",
       "verdict": "pass"
     },
     {
-      "id": "G4-5b-pending-boundaries",
-      "angle": "Task 5: realistic ndjson — a message_end frame followed by a partial frame, and one with a clean trailing newline.",
-      "command": "bun test /tmp/g4-pending.test.ts -t 'g4-5b'",
-      "expectedBehavior": "pending is true only when a real partial frame is buffered.",
-      "observedBehavior": "message_end + clean newline -> false; message_end + a complete second frame -> false; message_end + trailing whitespace only -> false (the guard trims); empty stream -> false; message_end + '{\"type\":\"tool_execution_start\",\"na' -> true; a bare partial frame -> true. No false positive on any complete stream.",
+      "id": "G5-3b-alternating-pattern",
+      "angle": "Cap: the deliberately permitted shape — a failing turn (fail + successful replay) alternating with a fully clean turn.",
+      "command": "bun test /tmp/rt-cap2.test.ts (B2 scenario; superseded assertions live in /tmp/rt-cap3.test.ts)",
+      "expectedBehavior": "Permitted by design: the clean turn is genuine evidence of health and clears the CONSECUTIVE budget, so the epoch grows at half rate while `lifetime=` makes it visible.",
+      "observedBehavior": "Confirmed exactly as documented. 10 turns (5 failing) -> epoch 5, five rebinds, every log line reading `1/3`, and `lifetime=1,2,3,4,5`: `gateway session rebind 1/3 origin=o2 cause=managed_append_identity_mismatch epoch 4 -> 5 lifetime=5`. Zero cap rejections. Reported as observed behaviour, not a defect.",
+      "verdict": "observation"
+    },
+    {
+      "id": "G5-3c-concurrency",
+      "angle": "Cap: Promise.all of 6 concurrent failing turns on one origin/session, plus 5 concurrent ensureSession+sendTurn drivers.",
+      "command": "bun test /tmp/rt-cap2.test.ts /tmp/rt-cap.test.ts",
+      "expectedBehavior": "Concurrency must not multiply the budget or the epoch.",
+      "observedBehavior": "Bounded. 6 concurrent turns on one sessionId -> exactly ONE rebind (`1/3`, epoch 0->1, lifetime=1); the other five find their binding already dropped and surface the original code instead of rebinding again. In the 5-driver variant one turn surfaced `resource_gone` and four succeeded on the rebound session; epoch 1.",
       "verdict": "pass"
     },
     {
-      "id": "G4-5c-replay-decision",
-      "angle": "Task 5: does the guard refuse a replay for a normal failing turn?",
-      "command": "bun test /tmp/g4-pending.test.ts -t 'g4-5c'",
-      "expectedBehavior": "The realistic failing turn (empty stdout, error on stderr) is replayed; only a mid-write truncation is refused.",
-      "observedBehavior": "'realistic failing turn: empty stdout, error on stderr' -> REPLAYED (2 turn spawns). A tool frame WITH a trailing newline -> NOT REPLAYED, '1 tool call(s)'. The same frame truncated mid-write -> NOT REPLAYED, 'an unterminated frame the child died mid-write'. message_end + a partial frame -> NOT REPLAYED, '7 output token(s), an unterminated frame the child died mid-write'. The guard costs a replay only in the mid-write case it was written for.",
+      "id": "G5-3d-independent-origins",
+      "angle": "Cap: two origins each driven to exhaustion.",
+      "command": "bun test /tmp/rt-cap.test.ts",
+      "expectedBehavior": "Per-origin budgets, per-origin epochs, per-origin cap errors.",
+      "observedBehavior": "Independent. oa and ob each got 1/3, 2/3, 3/3 with their own epoch 0->3 and lifetime 1..3, and each then raised RebindCapExceededError naming its own originKey. `/new` (forgetRebinds) on a capped origin restores the budget and the next failure logs `1/3 … epoch 3 -> 4 lifetime=4` — lifetime is never reset, which is what keeps the pattern visible.",
       "verdict": "pass"
     },
     {
-      "id": "G4-6a-boot",
-      "angle": "Task 6: fresh home must boot on defaults; chmod 000, a directory, a symlink to a missing target and a zero-byte file must be refused at BOOT.",
-      "command": "bun test /tmp/g4-config.test.ts -t 'g4-6a'",
-      "expectedBehavior": "Absent -> defaults. Every shape that EXISTS but cannot be read or parsed -> refused.",
-      "observedBehavior": "fresh home -> BOOTED ON DEFAULTS (mentionAllowlist undefined). chmod 000 -> REFUSED config_invalid 'unreadable (EACCES)'. directory in its place -> REFUSED config_invalid 'unreadable (EISDIR)'. zero-byte file -> REFUSED config_invalid 'could not parse'. symlink to a missing target -> BOOTED ON DEFAULTS with mentionAllowlist=undefined: the read returns ENOENT, so a config.json that exists as a link with a deleted target is indistinguishable from no configuration and the gateway comes up with an open policy. That is the same absent-vs-unreadable fail-open the requireFile split was added to close, reached through a link instead of a mode bit.",
-      "verdict": "fail"
-    },
-    {
-      "id": "G4-6b-reload",
-      "angle": "Task 6: all five shapes at RELOAD must keep the previous config.",
-      "command": "bun test /tmp/g4-config.test.ts -t 'g4-6b'",
-      "expectedBehavior": "ok:false with a config_invalid diagnostic and the previous config object retained, for every shape including the absent file.",
-      "observedBehavior": "All five returned ok:false with result.config === the live object (identity, not a copy) and mentionAllowlist ['owner'] / channels {c1:{engagement:'open'}} / debounceMs 1500 intact. Diagnostics: 'is missing' (absent), 'unreadable (EACCES)', 'unreadable (EISDIR)', 'is missing' (dangling symlink), 'could not parse' (zero-byte).",
+      "id": "G5-4a-no-replay-guard-matrix",
+      "angle": "No-replay guard: trailing prose, trailing unterminated JSON frame, tool_execution_start then death, assistant text then failure, output tokens only, stderr-only failure, whitespace-only tail, prose containing a mid-string brace, leading-space unterminated frame.",
+      "command": "bun test /tmp/rt-noreplay.test.ts",
+      "expectedBehavior": "Replay only when the failed attempt provably did nothing; otherwise rebind and surface `turn_not_replayed`.",
+      "observedBehavior": "Correct in all 9. REPLAYED (2 turn spawns): trailing prose, stderr-only failure, whitespace-only tail, prose containing `{` mid-string. REFUSED with `turn_not_replayed` (1 turn spawn) and evidence named: unterminated frame (`an unterminated frame from a child that died mid-write`), 1 tool call(s), `assistant text, 7 output token(s)`, `2 output token(s)`, leading-space unterminated frame. Every refusal still rebound to e1, so the next turn works. GjcTurnStream.pending probes: `''`/spaces/`prose`/`}`/`[` -> false; `{\"a\":1`, ` \\n {\"a\":1`, `{\"a\":1}` -> true (a newline-less complete frame is conservatively pending, which is the safe direction).",
       "verdict": "pass"
     },
     {
-      "id": "G4-6c-live-gate",
-      "angle": "Task 6: prove the mention-gated room stays gated over the REAL unix socket for shapes gen-3 did not cover (EACCES and the dangling symlink).",
-      "command": "bun test /tmp/g4-config.test.ts -t 'g4-6c-live'",
-      "expectedBehavior": "The verb replies ok:false config_invalid and the live allowlist is unchanged.",
-      "observedBehavior": "Both shapes: verb response {\"ok\":false,\"diagnostics\":[{\"code\":\"config_invalid\",\"message\":\"<home>/config.json is unreadable (EACCES)|is missing; keeping the previous configuration\"}]}; a stranger's mention-gated group message was engaged=false before AND after the failed reload, and the allowlisted 'owner' was still engaged=true afterwards — so the retained policy is the real live one. The daemon logged 'gateway config reload (verb reload) FAILED; keeping the previous config: ...' in both runs.",
+      "id": "G5-5a-config-matrix-boot-and-reload",
+      "angle": "Config: fresh home, valid file, chmod 000, directory, dangling symlink, symlink to a valid file, zero-byte, JSON array, JSON null, JSON string, truncated JSON, wrong schemaVersion — each at BOOT (loadConfig) and at RELOAD (reloadConfig against a live config carrying mentionAllowlist+channels).",
+      "command": "bun test /tmp/rt-config.test.ts",
+      "expectedBehavior": "ENOENT with no directory entry means defaults at BOOT only; every other shape refuses at boot and keeps the previous config at reload.",
+      "observedBehavior": "12/12 correct. BOOT: fresh home -> defaults; valid and symlink-to-valid -> loaded; chmod 000 -> `unreadable (EACCES); refusing to start on defaults`; directory -> `unreadable (EISDIR)`; DANGLING SYMLINK -> `unreadable (ENOENT); refusing to start on defaults` (the generation-4 fail-open is closed by lstat); zero-byte and truncated -> `could not parse`; array/null/string -> `config must be an object`; schemaVersion 2 -> `schemaVersion must be 1`. RELOAD: every shape including the fresh home returns ok:false, keeps `mentionAllowlist=[\"live-user\"]`, and reports one config_invalid diagnostic ending `; keeping the previous configuration`.",
       "verdict": "pass"
     },
     {
-      "id": "G4-7a-live-four-codes",
-      "angle": "Task 7: over the real unix socket with a real GjcClient, the four codes rebind and an unrelated code does not.",
-      "command": "bun test /tmp/g4-e2e.test.ts -t 'g4-7a-live'",
-      "expectedBehavior": "resource_gone / spawn_failed / terminal_uncertain / managed_append_identity_mismatch each bump the epoch once with a log line carrying cause + both epochs + lifetime; unsupported_state_version bumps nothing and surfaces as a genuine failure with no /new hint.",
-      "observedBehavior": "Each of the four rooms reached epoch 1 with exactly one log line, e.g. 'gateway session rebind 1/3 origin=discord/channel/resource cause=resource_gone epoch 0 -> 1 (lifetime 1)' — same shape for spawn_failed, terminal_uncertain and managed_append_identity_mismatch. unsupported_state_version: epoch 0, zero log lines, and the delivered chat.message read exactly '[turn failed] unsupported_state_version: runtime says unsupported_state_version' with no '/new'.",
+      "id": "G5-5b-deleted-between-two-rapid-reloads",
+      "angle": "Config: config.json unlinked between two reloads issued in the same tick.",
+      "command": "bun test /tmp/rt-config.test.ts",
+      "expectedBehavior": "The reload that sees the file applies it; the one that does not keeps the live policy and reports. No half-applied state either way.",
+      "observedBehavior": "reload#1 ok, applied `[mentionAllowlist,channels]`; reload#2 (after unlink) ok:false, kept `[\"live-user\"]`, diagnostic `<home>/config.json is missing; keeping the previous configuration`; reload#3 identical. A subsequent BOOT on the same now-empty home correctly falls back to defaults, confirming the requireFile split is the only difference between the two callers.",
       "verdict": "pass"
     },
     {
-      "id": "G4-7b-live-cap",
-      "angle": "Task 7: the cap fails explicitly on the 4th, the log line carries code + both epochs + lifetime, and the delivered notice carries code and message.",
-      "command": "bun test /tmp/g4-e2e.test.ts -t 'g4-7b-live'",
-      "expectedBehavior": "Three rebinds then an explicit rebind_cap_exceeded, with the runtime's own code and message in the delivered notice.",
-      "observedBehavior": "epoch stopped at 3 with exactly three log lines: 'gateway session rebind 1/3 origin=discord/channel/caproom cause=resource_gone epoch 0 -> 1 (lifetime 1)', '2/3 ... epoch 1 -> 2 (lifetime 2)', '3/3 ... epoch 2 -> 3 (lifetime 3)'. Messages 1-3 delivered '[turn failed] resource_gone: the session endpoint record is gone Send /new to rebind this conversation.'; messages 4 and 5 delivered '[turn failed] rebind_cap_exceeded: rebind cap 3 reached after resource_gone at epoch 3 Send /new to rebind this conversation.'. The identical string was written to the operator log by the same call site.",
+      "id": "G5-5c-field-partition-reporting",
+      "angle": "Config: a file editing reloadable, restart-only and unconsumed fields at once.",
+      "command": "bun test /tmp/rt-config.test.ts",
+      "expectedBehavior": "changed = live fields only; restart-only reported and NOT applied; unconsumed reported as ignored.",
+      "observedBehavior": "changed=[mentionAllowlist,debounceMs]; restartRequired=[socketPath,turnTimeoutMs,model,webhook]; ignored=[logVerbosity]. The published config kept the old socketPath and logVerbosity=info while taking the new allowlist and debounce.",
       "verdict": "pass"
     },
     {
-      "id": "G4-7c-live-new",
-      "angle": "Task 7: /new over the socket is the manual remedy the notice advertises.",
-      "command": "bun test /tmp/g4-e2e.test.ts -t 'g4-7c-live'",
-      "expectedBehavior": "A capped origin that receives /new can rebind again; the epoch and the lifetime total both stay honest.",
-      "observedBehavior": "Four failing messages capped the origin at epoch 3 with a rebind_cap_exceeded notice. The allowlisted author's /new bumped the epoch to 4 and cleared the budget, and the next rebindable failure was allowed and logged 'gateway session rebind 1/3 origin=discord/channel/newroom cause=terminal_uncertain epoch 4 -> 5 (lifetime 4)' — consecutive counter reset to 1/3, lifetime correctly continued at 4.",
+      "id": "G5-5d-boot-entrypoint-exit-code",
+      "angle": "Config: the boot entrypoint as a real process with an unreadable config — the launchd crash-loop angle.",
+      "command": "GAJAEWAY_HOME=$(mktemp -d) with chmod 000 config.json; bun packages/gateway/src/main.ts daemon",
+      "expectedBehavior": "Non-zero exit with the reason on stderr, not an unhandled rejection stack.",
+      "observedBehavior": "EXIT=1, stderr exactly `gajaeway-gateway failed to start: /tmp/rt-boot-zyHy/config.json is unreadable (EACCES); refusing to start on defaults`. No stack, no `error: Unhandled`. Dangling-symlink home: EXIT=1, `… is unreadable (ENOENT); refusing to start on defaults`. Wrong subcommand still exits 2 with the usage line.",
       "verdict": "pass"
     },
     {
-      "id": "G4-8a-cap-bound",
-      "angle": "Task 8: prove the epoch is bounded for a recurring turn-level failure whose replay succeeds (25 messages).",
-      "command": "bun test /tmp/g4-cap.test.ts -t 'g4-8a'",
-      "expectedBehavior": "At most cap=3 bumps; messages past the cap fail explicitly.",
-      "observedBehavior": "persistedEpoch=3 with exactly 3 log lines (1/3, 2/3, 3/3, lifetimes 1..3). m1-m3 returned the replayed reply; m4-m25 (22 messages) all threw RebindCapExceededError. A replayed turn provably does not restore the budget.",
+      "id": "G5-6a-e2e-notice-over-the-unix-socket",
+      "angle": "#13/#14 end to end: 10 failure kinds driven through chat.send over a real listening unix socket, comparing the DELIVERED chat.message text with the logged line.",
+      "command": "bun test /tmp/rt-e2e.test.ts",
+      "expectedBehavior": "The delivered notice carries the runtime's own code and message, is identical to the logged string, and is byte-equal to formatFailureNotice(error).",
+      "observedBehavior": "10/10 identical (logged===delivered true in every case) and equal to formatFailureNotice. Examples: `[turn failed] resource_gone: session endpoint record is gone. Send /new to rebind this conversation.`; `[turn failed] unsupported_state_version: state moved` (genuine, no hint); `[turn failed] gjc turn exited 137:` (killed child, never erased to a bare `[turn failed]`); `[turn failed] spawn_failed: env AWS_SECRET_ACCESS_KEY=[redacted] rejected; token=[redacted]. Send /new to rebind this conversation.`",
       "verdict": "pass"
     },
     {
-      "id": "G4-8b-alternating-pattern",
-      "angle": "Task 8: report what the alternating fail/clean-turn pattern does (deliberately permitted).",
-      "command": "bun test /tmp/g4-cap.test.ts -t 'g4-8b'",
-      "expectedBehavior": "Per the declared design the cap does not bound this shape; the lifetime total must make the growth visible.",
-      "observedBehavior": "12 rounds of (fail-then-successful-replay, then a fully clean turn) produced 12 rebinds and persistedEpoch=12 with zero cap rejections. Every consecutive counter read '1/3' — the cap never fires — while the lifetime totals ran 1..12, the last line being 'gateway session rebind 1/3 origin=discord:group:alternating cause=managed_append_identity_mismatch epoch 11 -> 12 (lifetime 12)'. Epoch grows at half rate (one bump per two messages) and is visible only through the lifetime field. Recorded as the permitted observation the design names, not a defect.",
+      "id": "G5-6b-hint-policy-turn_not_replayed",
+      "angle": "#14 hint policy: the four rebindable codes plus rebind_cap_exceeded get the `/new` hint; `turn_not_replayed` must NOT.",
+      "command": "bun test /tmp/rt-e2e.test.ts",
+      "expectedBehavior": "turn_not_replayed carries no `/new` hint (the automatic rebind already happened; a second reset would discard the fresh binding).",
+      "observedBehavior": "Hint present for resource_gone, spawn_failed, terminal_uncertain, managed_append_identity_mismatch, rebind_cap_exceeded. Hint ABSENT for turn_not_replayed over the socket: `[turn failed] turn_not_replayed: resource_gone: rebound to e2, not replayed` — asserted `not.toContain('/new')`. Also absent for unfamiliar codes, `RESOURCE_GONE` (case is not folded), and codeless errors. ` resource_gone ` with transport whitespace still gets the hint. The hint is period-separated and is not appended twice when the message already ends in `.`",
       "verdict": "pass"
     },
     {
-      "id": "G4-8c-replay-does-not-clear",
-      "angle": "Task 8: a replayed turn must never clear the budget, or 8a's bound collapses.",
-      "command": "bun test /tmp/g4-cap.test.ts -t 'g4-8c'",
-      "expectedBehavior": "Three successful replays still leave the budget spent.",
-      "observedBehavior": "Three fail-then-replay turns each returned 'replayed' and consumed one slot (1/3, 2/3, 3/3); the fourth threw RebindCapExceededError with the epoch held at 3.",
+      "id": "G5-6c-new-and-reload-verbs-live",
+      "angle": "#13 remedy wiring plus the shared reload implementation, both over the real socket, plus SIGHUP on the same live server.",
+      "command": "bun test /tmp/rt-e2e.test.ts",
+      "expectedBehavior": "`/new` calls forgetRebinds for the exact origin key; `gateway.reloadConfig` and SIGHUP go through one implementation and log the same applied/restart-required/ignored breakdown.",
+      "observedBehavior": "`/new` -> forgetRebinds(['discord/dm/c1/peer=p1']). Reload verb ok -> result `{ok:true,changed:['mentionAllowlist','debounceMs'],restartRequired:['model'],ignored:['logVerbosity']}` and log `gateway config reload (verb r1) ok; applied=[mentionAllowlist,debounceMs] restart-required=[model] ignored=[logVerbosity]`. After chmod 000 the verb returned ok:false with the keep-previous diagnostic, and a SIGHUP raised on the same server logged the identical failure through the same code path.",
       "verdict": "pass"
-    }
-  ],
-  "repointedCases": [
-    {
-      "id": "C1-rebind-cap-bound",
-      "file": "/tmp/g13-cap.test.ts 'case1'",
-      "reason": "Not a defect fix: commit 7995fcd added the per-origin LIFETIME total to the rebind log line, so the two exact-line expectations were extended with ' (lifetime 1)' / ' (lifetime 3)'.",
-      "was": "gateway session rebind 1/3 origin=discord:dm:cap cause=managed_append_identity_mismatch epoch 0 -> 1",
-      "now": "gateway session rebind 1/3 origin=discord:dm:cap cause=managed_append_identity_mismatch epoch 0 -> 1 (lifetime 1)"
-    },
-    {
-      "id": "C11-no-replay-guard (scenario 11e)",
-      "file": "/tmp/g13-cap.test.ts 'case11'",
-      "reason": "Defect D4 fixed: GjcTurnStream.pending now reports the buffered partial line and sendTurn's guard consumes it.",
-      "was": "expect(observed['11e tool frame with NO trailing newline']).toStartWith('REPLAYED')",
-      "now": "toStartWith('NOT REPLAYED') and toContain('an unterminated frame the child died mid-write')"
-    },
-    {
-      "id": "C5b-adjacency-bypass",
-      "file": "/tmp/g14-notice.test.ts 'case5-DEFECT: a word character before a vendor prefix ...'",
-      "reason": "Defect D1 (HIGH) fixed in 7954ff6: the \\b anchors were removed from every vendor-prefix rule, so a preceding word character (or one manufactured by stripping a ZWSP) no longer leaks the token, and the >64-char code case no longer leaks a surviving head.",
-      "was": "expect(line).toContain(SECRET) for MYKEYsk_live_<secret>, MYKEY\\u200bsk_live_<secret>, AWS_SECRET_ACCESS_KEY_sk_live_<secret>, pat\\u0000ghp_<secret>; expect(inCode).toContain('sk_live_deadbe')",
-      "now": "not.toContain(SECRET) for all four, plain === '[turn failed] spawn_failed: MYKEY[redacted] Send /new to rebind this conversation.', and the code case no longer contains 'sk_live_deadbe'. NOTE: this fix is the root cause of new defect G4-D2."
-    },
-    {
-      "id": "C5e-quoted-value-with-space",
-      "file": "/tmp/g14-notice.test.ts 'case5-DEFECT: a quoted secret containing whitespace ...'",
-      "reason": "Defect D2 fixed: SECRET_ASSIGNMENT_QUOTED consumes the value to its closing quote.",
-      "was": "expect(line).toContain(AWS) — the second half of the quoted value shipped in the clear",
-      "now": "toContain('api_key: \"[redacted]\"') and not.toContain(AWS)"
-    },
-    {
-      "id": "C6b-false-positive-redaction",
-      "file": "/tmp/g14-notice.test.ts 'case6-DEFECT: a non-secret word after an auth-ish key word ...'",
-      "reason": "Defect D3 fixed: the key=value rules are gated by looksLikeCredential, so short prose after an auth-ish key word survives. Also extended with the max_tokens case the architect pass found.",
-      "was": "'[turn failed] tool_denied: oauth: [redacted] rejected'",
-      "now": "'[turn failed] tool_denied: oauth: exchange rejected' and '[turn failed] tool_denied: max_tokens=200000 exceeded'"
     }
   ],
   "defects": [
     {
-      "id": "G4-D1",
-      "severity": "high",
-      "title": "The NON_SECRET_KEY denylist disarms the whole key=value gate: a real credential is delivered verbatim whenever the key name contains an exempt word",
-      "location": "packages/gateway/src/orchestrator/rebind.ts looksLikeCredential / NON_SECRET_KEY (introduced in b83ad30)",
-      "contract": "#14 'only SECRETS redacted' — the secret half of that obligation",
-      "repro": "formatFailureNotice(new GjcRuntimeError('w', { code: 'spawn_failed', message: 'expired_password=deadbeefcafebabe0123456789' }))",
-      "observed": "'[turn failed] spawn_failed: expired_password=deadbeefcafebabe0123456789 Send /new to rebind this conversation.' — the secret in the clear. 18/18 exempt-word spellings leak, including max_token=, max_secret=, MAX_TOKEN=, AWS_MAX_SECRET_ACCESS_KEY=, auth_expires_secret=, retries_token=, token_ttl_secret=, count_api_key=, age_token=, ms_token=, num_credential=, total_authorization=, remaining_secret=, window_passwd=, attempt_token=, seconds_apikey=, and the quoted form.",
-      "expected": "A credential-shaped value is redacted; an exempt key word may suppress redaction only for values that are actually quantities.",
-      "impact": "Under-redaction is the failure the previous gate was replaced to fix, and the replacement reintroduces it through a different door: the discriminator is now a 20-word hand-written list matched anywhere at an underscore boundary in the key. 'expired_token=', 'expired_password=' and 'attempt_token=' are ordinary auth-error vocabulary, so this is reachable from a real provider error blob. The value shape is ignored entirely, so no length or entropy check backs it up.",
-      "test": "/tmp/g4-redaction.test.ts 'g4-1c-DEFECT: an exempt NON_SECRET_KEY word anywhere in the key delivers a real credential verbatim'"
-    },
-    {
-      "id": "G4-D2",
-      "severity": "high",
-      "title": "The \\b removal on the vendor-prefix rules destroys ordinary diagnostics, including the runtime CODE that is the whole diagnosis",
-      "location": "packages/gateway/src/orchestrator/rebind.ts redactSecrets, the unanchored /(?:sk|rk|pk|...)[-_][A-Za-z0-9_-]{8,}/gi and /ey[...]{8,}\\.[...]{8,}\\.[...]{8,}/ rules (introduced in 7954ff6 to fix generation-3 D1)",
-      "contract": "#14 'only SECRETS redacted; ordinary diagnostics must survive' and '#14 exists to remove the zero-diagnosis line'",
-      "repro": "formatFailureNotice(new GjcRuntimeError('w', { code: 'disk_quota_exceeded', message: 'network_unreachable: dial tcp failed' }))",
-      "observed": "'[turn failed] di[redacted]: netwo[redacted]: dial tcp failed' — both halves of the notice destroyed. 13/13 realistic diagnostic strings are damaged: disk_usage_exceeded, risk_assessment_failed, task_execution_timeout, ask_permission_denied, task-runner-timeout, network_unreachable, work_dir_missing, work_queue_stalled, apk_install_failed, TASK_EXECUTION_FAILED, mask_pattern_invalid, and any dotted symbol path whose first segment contains 'ey' ('at monkey_patch_util.test_module.expected_name' -> 'at monk[redacted]').",
-      "expected": "A prefix match should require that the surrounding token actually look like a key (e.g. a boundary plus a shape/entropy test), not redact any word containing 'sk_' followed by 8 characters. The comment claiming the unanchored rule 'can only over-redact a secret-shaped token' is false: 'network_unreachable' is not secret-shaped.",
-      "impact": "Worse than the leak it replaced for triage purposes: the fix traded a conditional secret leak for unconditional diagnosis loss on a whole family of plausible codes. The four rebindable codes and rebind_cap_exceeded escape only because of how they are spelled, so any new gjc code containing sk_/rk_/pk_ silently becomes an opaque line — precisely the ~2h-of-muteness failure #14 exists to eliminate.",
-      "test": "/tmp/g4-redaction.test.ts 'g4-3a-DEFECT ...' and 'g4-3b-DEFECT: a runtime CODE containing sk_/rk_ is destroyed ...'"
-    },
-    {
-      "id": "G4-D3",
+      "id": "G5-D1",
       "severity": "medium",
-      "title": "The quoted-value rule fails open on an unbalanced, nested or mismatched quote",
-      "location": "packages/gateway/src/orchestrator/rebind.ts SECRET_ASSIGNMENT_QUOTED (value class [^\"']*, closing group \\2) plus SECRET_ASSIGNMENT_BARE's exclusion of \" and '",
-      "contract": "#14 'only SECRETS redacted'",
-      "repro": "redactSecrets('api_key: \"deadbeefcafebabe0123456789 and then prose') and redactSecrets(`api_key: \"it's deadbeefcafebabe0123456789\"`)",
-      "observed": "Both return the input unchanged — the secret is delivered in full. Same for a double-quoted secret inside single quotes and for a mismatched pair ('api_key: \"<secret>\\''). And 'api_key: \"<s1> and later token: \"<s2>\"' returns 'api_key: \"[redacted]\"<s2>\"': the quoted match spans quote 1 to quote 2, erasing the prose and the second key name while shipping the second secret.",
-      "expected": "An opening quote after an auth-ish key means everything up to the next quote OR the end of the line is a candidate value; a missing or mismatched closing quote must never mean 'redact nothing'.",
-      "impact": "A truncated or nested-quote runtime blob — the normal shape when a child is killed mid-write or when a provider embeds a quoted message — delivers the credential whole. The bare rule cannot rescue it because it excludes quote characters from the value class.",
-      "test": "/tmp/g4-redaction.test.ts 'g4-4: quoted-value shapes ...'"
+      "title": "A credential in a URL query or fragment is delivered verbatim: the credential-key left boundary excludes `?`, `&` and `#`",
+      "location": "packages/gateway/src/orchestrator/rebind.ts CREDENTIAL_KEY — `(?:^|[\\s,{(\\[\"'])`",
+      "contract": "#14 'only secrets redacted' (the redaction half: an exact credential key with a value must be redacted)",
+      "repro": "formatFailureNotice(new GjcRuntimeError('gjc turn exited 1', { code: 'spawn_failed', message: 'gjc: POST https://api.anthropic.com/v1/messages?access_token=sk9deadbeefcafe0123456789 -> 401 unauthorized' }))",
+      "observed": "`[turn failed] spawn_failed: gjc: POST https://api.anthropic.com/v1/messages?access_token=sk9deadbeefcafe0123456789 -> 401 unauthorized. Send /new to rebind this conversation.` — the token ships to the chat surface. Same for `GET /v1/sessions?api_key=deadbeefcafe0123456789&limit=10 -> 403` and `https://x/y#token=deadbeefcafe0123456789`. The identical key with a space or brace before it redacts, so this is purely the delimiter class.",
+      "expected": "`?`, `&`, `#` and `/` are as much a key delimiter as a space; a query-string credential is the most common way a real HTTP failure line carries one.",
+      "impact": "An upstream 401/403 line — exactly the failure #14 exists to surface — leaks a provider credential to Discord/Telegram and to the delivery ledger. Realistic for any provider that accepts a token as a query parameter.",
+      "test": "/tmp/rt-defects.test.ts 'confirmed leaks on the real notice surface'"
     },
     {
-      "id": "G4-D4",
+      "id": "G5-D2",
       "severity": "medium",
-      "title": "Real diagnosis is erased whenever it follows an auth-ish key word: prose states, compound codes, paths, UUIDs, session ids, git SHAs, timestamps and versions",
-      "location": "packages/gateway/src/orchestrator/rebind.ts looksLikeCredential — value.length >= 12 is the only shape test",
-      "contract": "#14 'only SECRETS redacted — ordinary diagnostics must survive'",
-      "repro": "redactSecrets('auth_error: refresh_token_expired')",
-      "observed": "'auth_error: [redacted]'. 13/13 cases lose their diagnosis: 'auth: unauthenticated', 'credential: unrecoverable', 'authorization: insufficient_scope_for_this_operation', 'auth_reason=configuration mismatch', token=<absolute path>, auth_session=<uuid>, auth_session=<ULID>, token=<git SHA>, auth_at=<ISO timestamp>, authorization=<semver+build>, auth_attempts=999999999999, 'authorize: /Users/x/pkg/src/server.ts:113:9'.",
-      "expected": "The declared contract sentence promises credential-shaped values only. A UUID, a path, a SHA and an English word are not credentials.",
-      "impact": "Diagnosis loss in the direction b83ad30 deliberately traded away ('a secret delivered to a chat surface is far worse than a lost value'), which is a defensible call for the value half — but the code comment's premise that 'the runtime CODE still carries the diagnosis either way' is exactly what G4-D2 breaks, so the two defects together can leave a notice with no diagnosis at all. Reported so the tradeoff is a decision rather than an accident.",
-      "test": "/tmp/g4-redaction.test.ts 'g4-2b-DEFECT: real diagnosis IS erased when it follows an auth-ish key word'"
+      "title": "Any identifier beginning with sk_/pk_/rk_ and 12+ following characters is erased, destroying the whole diagnosis",
+      "location": "packages/gateway/src/orchestrator/rebind.ts redactSecrets — the fallback `\\b(?:sk|pk|rk)[-_][A-Za-z0-9_-]{12,}`",
+      "contract": "#14 'only secrets redacted — a runtime code or a file path is the whole diagnosis'",
+      "repro": "redactSecrets('sk_migration_runner_failed while draining the queue')",
+      "observed": "`[redacted] while draining the queue`, delivered as `[turn failed] spawn_failed: [redacted] while draining the queue.` Also `pk_index_rebuild_failed at step 3`, `rk_queue_drain_timeout after 30s`, `sk-server-restart-required`, `sk_pool_exhausted`. Measured boundary: `sk_` + 11 chars survives, `sk_` + 12 chars is redacted, so the rule is a length coin-flip on ordinary identifiers.",
+      "expected": "Only a vendor discriminator should trigger the shape rule (`sk_live_`, `sk_test_`, `sk-ant-`, `sk_proj_`, `sk_api_` — already covered by the preceding, discriminated pattern). A bare two-letter prefix plus a snake_case word is an identifier, not a key.",
+      "impact": "Diagnosis loss in the direction the rebuild explicitly set out to remove: the notice becomes `[redacted] while draining the queue`, which is the zero-diagnosis line #14 exists to eliminate. `\\b` only protects prefixes that appear INSIDE a word (disk_, risk_, task_); an identifier that starts with sk_/pk_/rk_ has no protection.",
+      "test": "/tmp/rt-defects.test.ts 'over-redaction on the real notice surface' and /tmp/rt-redact-over.test.ts 'snake sk_'"
     },
     {
-      "id": "G4-D5",
+      "id": "G5-D3",
       "severity": "medium",
-      "title": "A config.json symlinked to a deleted target boots on defaults, so the absent-vs-unreadable split still fails open at BOOT",
-      "location": "packages/gateway/src/config.ts loadConfig — the ENOENT branch",
-      "contract": "Reload/boot contract: 'ENOENT means defaults at boot; anything else (EISDIR, EACCES, EIO) is a config file that EXISTS and cannot be read, which must never silently become a defaults-only open policy — not at reload, and not at boot either.'",
-      "repro": "rm $HOME/config.json && ln -s $HOME/nope.json $HOME/config.json && loadConfig({ home })",
-      "observed": "BOOTED ON DEFAULTS with mentionAllowlist=undefined and channels=undefined, i.e. a mention-gated room becomes open. chmod 000 (EACCES), a directory (EISDIR) and a zero-byte file are all correctly refused; only the dangling symlink slips through because Bun.file(...).text() reports ENOENT for it.",
-      "expected": "A config.json that exists as a directory entry but cannot be resolved is an unreadable file, not an absent one. An lstat (or a readlink check) distinguishes them; the reload path is already correct because requireFile refuses every error.",
-      "impact": "Boot-time fail-open reachable by an ordinary operator layout (config.json symlinked into a dotfiles repo whose target moved or was deleted). It is exactly the hole the architect pass closed for mode/type errors, reached through a link. RELOAD is unaffected: all five shapes retain the previous config, proven over the real socket for two of them.",
-      "test": "/tmp/g4-config.test.ts 'g4-6a: boot refuses every unreadable shape but boots on a genuinely absent file'"
+      "title": "A structural `{` or `[` after a credential key is consumed as the value: array/object-valued credentials leak while the JSON structure is corrupted",
+      "location": "packages/gateway/src/orchestrator/rebind.ts CREDENTIAL_BARE — value class `[^\\s\"',}]+` matches `{` and `[`",
+      "contract": "#14 'only secrets redacted' — broken in BOTH directions by one rule",
+      "repro": "redactSecrets('{\"secrets\":[\"deadbeefcafe0123456789\",\"hunter2trombone\"]}') and redactSecrets('{\"credentials\": {\"file\": \"/Users/x/creds.json\"}} could not be read')",
+      "observed": "`{\"secrets\":[redacted]\"deadbeefcafe0123456789\",\"hunter2trombone\"]}` — BOTH secrets are delivered in the clear while the `[` is replaced. `{\"credentials\": [redacted]\"file\": \"/Users/x/creds.json\"}}` loses the nested key name. `token: {status: expired, age: 4m}` -> `token: [redacted] expired, age: 4m}` loses `status:`. Nested object form (`{ \"credentials\" : { \"token\" : \"<secret>\" } }`) still redacts the inner secret because the inner key matches, but an ARRAY has no inner key and nothing rescues it.",
+      "expected": "A brace or bracket is not a value. Either skip structural openers (leaving the nested keys to match on their own) or treat the balanced region as the value.",
+      "impact": "A runtime that dumps a credential list (`{\"secrets\":[…]}`) delivers every entry verbatim, and the structural corruption makes a JSON blob harder to read at the same time. Lower likelihood than G5-D1 but the same class of leak.",
+      "test": "/tmp/rt-defects.test.ts and /tmp/rt-redact-extra.test.ts 'json array of secrets'"
+    },
+    {
+      "id": "G5-D4",
+      "severity": "low",
+      "title": "An unquoted credential value containing spaces leaks every word after the first",
+      "location": "packages/gateway/src/orchestrator/rebind.ts CREDENTIAL_BARE — one whitespace-delimited token",
+      "contract": "#14 'only secrets redacted'",
+      "repro": "redactSecrets('passphrase=correct horse battery staple')",
+      "observed": "`passphrase=[redacted] horse battery staple`; `password=p@ss w0rd was rejected by the keychain` -> `password=[redacted] w0rd was rejected by the keychain`.",
+      "expected": "For `passphrase`/`password` specifically, an unquoted value plausibly runs to end of line; at minimum the residue should not be a readable fragment of the credential.",
+      "impact": "Partial credential disclosure. Low because a runtime normally quotes or omits a spaced value, and the first token is already gone — but a human passphrase is exactly the shape that survives.",
+      "test": "/tmp/rt-defects.test.ts 'confirmed leaks on the real notice surface'"
     }
   ],
   "observations": [
-    "Task 5 answered in the negative: the pending guard is NOT a product regression. Real gjc/0.15.3 `-p --mode json` output is newline-terminated (14 frames, ends '}\\n', empty trailing fragment) and a real failing `--resume` writes 0 bytes to stdout, so a normal successful-then-failing turn leaves no pending buffer and automatic replay stays alive. The guard only fires on a genuine mid-write truncation.",
-    "Task 8 alternating pattern (permitted by design): 12 rounds of fail-then-replay interleaved with clean turns produced epoch 12, 12 rebinds, zero cap rejections, every consecutive counter reading '1/3', and lifetime totals 1..12. The lifetime field is the only thing that makes this visible, and it does.",
-    "The two redaction defects interact: G4-D2 can destroy the code while G4-D4 destroys the message, so a single notice can carry neither. The five contract-named codes are safe today only because of their spelling.",
-    "Repo suite at b83ad30: bun test packages/gateway = 134 pass / 2 skip / 0 fail (leader receipt 133 pass; b83ad30 added one redaction-calibration test). No repo source, test or doc file was modified by this pass; the only files written are the two artifacts."
+    "The generation-4 defects are all closed at abf6919: the exempt-word smuggling hole (G4-D1) is gone because key names are now an exact list, the vendor-prefix destruction of prose and codes (G4-D2/G4-D4) is gone for every string in the 31-case survival matrix except the sk_/pk_/rk_ family (G5-D2), the unbalanced-quote fail-open (G4-D3) now fails closed, and the dangling-symlink boot fail-open (G4-D5) is refused with `unreadable (ENOENT); refusing to start on defaults`.",
+    "The snake_case value exemption is a knowing tradeoff, reported as a residual risk rather than a defect: `secret=hunter2trombone_x1` and `authorization=my_super_secret_value` are delivered verbatim because isDiagnosticWord exempts `^[a-z][a-z0-9]*(?:_[a-z0-9]+)+$`. Provider-issued keys do not match that shape; human passphrases and word-list secrets do.",
+    "State-word casing variants (`secret=MISSING`, `secret=Missing`, `token=UNSET`) survive by design — CREDENTIAL_STATE_WORDS is matched after toLowerCase(). Verified as intended behaviour, not a leak of a credential shape.",
+    "redactSecrets() alone does not catch a credential KEY split by a control character (`sec\\u0000ret=<secret>`); every production caller runs stripControl first (describeFailure/firstDiagnosis), and through that path all five smuggling attempts are redacted. Documented precondition, not a defect.",
+    "A PEM private-key block is not covered by either recogniser and is delivered verbatim. Out of the declared scope (exact key names + vendor discriminators) and not an observed gjc output shape, so recorded here rather than as a defect.",
+    "Alternating-pattern receipt as requested: 10 turns with 5 failing produced epoch 5, five rebinds, every consecutive counter reading `1/3`, and `lifetime=1,2,3,4,5`. A 12-round variant produced the same half-rate growth. The lifetime field is the only thing that makes the pattern visible, and it does.",
+    "The cap now genuinely bounds the shape it was built for: a turn-level failure that recurs every turn and whose replay succeeds stops at epoch 3 and then fails explicitly forever, because a replayed turn does not clear the budget. Concurrency (6 in-flight failing turns on one origin) spends exactly one rebind.",
+    "Repo suite at abf6919: bun test packages/gateway = 135 pass / 2 skip / 0 fail / 617 expect(), matching the leader receipt. /tmp/rt-cap2.test.ts is retained for the B2 alternating log evidence; its A2/C2 assertions were mis-specified scenarios (the stub let a clean first attempt clear the budget) and are superseded by /tmp/rt-cap3.test.ts, which drives the recurring failure correctly.",
+    "The four defects are all inside redactSecrets. Every other contract obligation checked in this pass — classification by structured code only, the epoch/persist/retry-once mechanics, the consecutive cap and its clear rules, the no-replay guard, the log line format with both epochs and `lifetime=N`, the single string shared by log and notice, the `/new` hint policy including turn_not_replayed, and the whole boot/reload config partition — held under every attack attempted."
   ],
   "verdict": "failed",
   "blockingCases": [
-    "G4-1c-exempt-word-smuggling (G4-D1, high): a real credential is delivered verbatim behind any exempt key word",
-    "G4-3a / G4-3b-vendor-prefix-destroys-prose-and-code (G4-D2, high): ordinary diagnostics and whole runtime codes are destroyed",
-    "G4-4-quoted-value-rule (G4-D3, medium): unbalanced, nested and mismatched quotes fail open",
-    "G4-2b-over-redaction-behind-a-key (G4-D4, medium): real diagnosis erased after an auth-ish key word",
-    "G4-6a-boot (G4-D5, medium): a dangling config.json symlink boots on defaults and opens a mention-gated room",
-    "G4-1d-separator-asymmetry (part of G4-D1/G4-D4): exemption depends on whether the key used '_' or '-'"
+    "G5-1i-url-query-credential-LEAK (G5-D1, medium): `?access_token=<secret>` / `&api_key=<secret>` / `#token=<secret>` are delivered verbatim to the chat surface",
+    "G5-2b-sk-prefixed-identifier-DESTROYED (G5-D2, medium): any sk_/pk_/rk_-initial identifier with 12+ following characters is replaced by `[redacted]`, erasing the diagnosis",
+    "G5-1j-array-valued-credential-key-LEAK / G5-2e-structural-token-consumed (G5-D3, medium): `{\"secrets\":[\"<secret>\"]}` ships every secret while the bracket is redacted",
+    "G5-1k-multi-word-unquoted-value-LEAK (G5-D4, low): a spaced passphrase leaks every word after the first"
   ]
 }
