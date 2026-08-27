@@ -30,6 +30,10 @@
     "packages/admin": {
       "name": "@gajaeway/admin",
       "version": "0.1.0",
+      "dependencies": {
+        "@gajaeway/protocol": "workspace:*",
+        "@gajaeway/sdk": "workspace:*",
+      },
     },
     "packages/cli": {
       "name": "@gajaeway/cli",

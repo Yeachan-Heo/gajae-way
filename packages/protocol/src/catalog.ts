@@ -1,4 +1,5 @@
 import type { OriginRef } from "./origin";
+import type { ReactionAction, ReactionRef } from "./reactions";
 
 /**
  * Typed verb + event catalogs for profile v0.1. Catalogs grow additively per
@@ -19,6 +20,33 @@ export interface GatewayStatusResult {
 	readonly sessions: { readonly active: number };
 	/** Delivery ledger health (P1+). */
 	readonly delivery?: { readonly pending: number; readonly oldestPendingAgeMs: number | null };
+}
+
+/**
+ * The message an inbound message replies to, when the platform reports one.
+ *
+ * A reply is the only signal that says *which* of the many messages in a busy
+ * room is being answered, so it is carried as metadata rather than folded into
+ * engagement decisions. Every field except `messageId` is optional on purpose:
+ * platforms hand out the reference id eagerly but the referenced author and
+ * text only when they are already resolved, and an adapter must never delay
+ * inbound handling on an extra API fetch to fill this in. Absent beats guessed.
+ */
+export interface ReplyContext {
+	/** Platform-scoped id of the referenced message. Always known when a reply exists. */
+	readonly messageId: string;
+	/** Platform-scoped author id of the referenced message, when it is already resolved. */
+	readonly authorId?: string;
+	/** Display name of the referenced author, resolved with the same precedence as `authorName`. */
+	readonly authorName?: string;
+	/**
+	 * True when the referenced message was authored by our own agent account,
+	 * false when it was authored by somebody else. Absent means the referenced
+	 * author is unknown, so ownership could not be decided — never assume false.
+	 */
+	readonly fromSelf?: boolean;
+	/** Short single-line excerpt of the referenced text, when the platform included it. */
+	readonly excerpt?: string;
 }
 
 /** Inbound engagement metadata supplied by adapters for group-capable origins. */
@@ -46,6 +74,12 @@ export interface EngagementContext {
 	readonly channelLabel?: string;
 	/** Human-readable server/guild/workspace label when the platform has one above the channel. */
 	readonly serverLabel?: string;
+	/**
+	 * The message this one replies to, when the platform reports a reply. Absent
+	 * for every message that is not a reply, so existing payloads are unchanged.
+	 * Metadata only: a reply never decides engagement by itself.
+	 */
+	readonly replyTo?: ReplyContext;
 }
 
 export interface ChatSendParams {
@@ -65,6 +99,16 @@ export interface ChatProgressPayload {
 	readonly toolCalls: number;
 	/** Output tokens produced so far (exact per completed message, estimated between). */
 	readonly outputTokens: number;
+	/**
+	 * True on the last progress event of a turn, including a turn that ends with a
+	 * silence token and therefore delivers nothing.
+	 *
+	 * Adapters render progress as a temporary message and clear it when the reply
+	 * lands. A suppressed turn has no delivery, so without this flag the "working"
+	 * message is orphaned in the channel forever - which is exactly what happened
+	 * in every `open` channel where the persona chose to stay silent.
+	 */
+	readonly final?: boolean;
 }
 
 export interface ChatSendResult {
@@ -100,6 +144,13 @@ export interface ChatMessagePayload {
 	 * duplicate label (honest at-least-once, spec fact 14).
 	 */
 	readonly duplicateWarning?: boolean;
+	/**
+	 * When present this delivery is a REACTION, not a message: the adapter must
+	 * react to `reaction.targetMessageId` and post nothing. `text` still carries
+	 * the bare unicode emoji so an adapter without reaction support degrades to a
+	 * visible acknowledgement instead of a lost delivery.
+	 */
+	readonly reaction?: ReactionRef;
 }
 
 export interface DeliveryConfirmParams {
@@ -234,6 +285,53 @@ export interface WorkRunResult {
 	readonly sessionKey: string;
 }
 
+/**
+ * Outbound reaction (chat.react): react to ONE specific message in ONE specific
+ * origin. The target message id is required — "react to the last message" is not
+ * expressible, because "last" changes under you. `emoji` accepts any allowlisted
+ * spelling (`👍`, `thumbsup`, `:thumbsup:`) and is canonicalized by the gateway.
+ *
+ * Allowlisted is not the same as deliverable: a platform may accept only part of
+ * the allowlist (Telegram publishes a fixed reaction set), and the gateway
+ * refuses an emoji that origin cannot express rather than queueing a delivery
+ * that can only fail. `reactionAllowlistFor(platform)` is what a caller should
+ * offer.
+ */
+export interface ChatReactParams {
+	readonly origin: OriginRef;
+	readonly targetMessageId: string;
+	readonly emoji: string;
+}
+
+export interface ChatReactResult {
+	/** Ledger delivery id: adapters settle a reaction exactly like a message. */
+	readonly deliveryId: string;
+	/** Canonical unicode the gateway resolved the requested emoji to. */
+	readonly emoji: string;
+}
+
+/**
+ * Inbound reaction (engagement.reaction): someone reacted to a message, or took
+ * their reaction back. This is engagement metadata and NEVER a turn: it is
+ * recorded as conversation context for the next engaged turn to read, and it does
+ * not wake the persona. `engaged` is therefore always false.
+ */
+export interface EngagementReactionParams {
+	readonly origin: OriginRef;
+	/** Platform id of the message that was reacted to. */
+	readonly targetMessageId: string;
+	/** Raw platform emoji as the reactor sent it; not restricted to the allowlist. */
+	readonly emoji: string;
+	readonly action: ReactionAction;
+	readonly engagement: EngagementContext;
+}
+
+export interface EngagementReactionResult {
+	readonly recorded: boolean;
+	/** Always false: a reaction is metadata, never a turn. */
+	readonly engaged: false;
+}
+
 /** Verb catalog: verb name -> { params, result } (documentation-level typing). */
 export interface VerbCatalogV01 {
 	"gateway.status": { params: undefined; result: GatewayStatusResult };
@@ -259,6 +357,8 @@ export interface VerbCatalogV01 {
 	};
 	"ops.integrity": { params: undefined; result: { readonly ok: boolean; readonly detail: string } };
 	"work.run": { params: WorkRunParams; result: WorkRunResult };
+	"chat.react": { params: ChatReactParams; result: ChatReactResult };
+	"engagement.reaction": { params: EngagementReactionParams; result: EngagementReactionResult };
 }
 
 /** Event catalog: event name -> payload. */
@@ -287,6 +387,8 @@ export const VERBS_V01 = [
 	"ops.backup",
 	"ops.integrity",
 	"work.run",
+	"chat.react",
+	"engagement.reaction",
 ] as const;
 export const EVENTS_V01 = ["chat.message", "chat.progress", "gateway.stopping", "monitor.event"] as const;
 

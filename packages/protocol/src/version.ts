@@ -18,6 +18,8 @@ export const CAPABILITIES = [
 	"gateway.core",
 	/** Loopback chat verbs: chat.send + chat.* events (P0). */
 	"chat.loopback",
+	/** Emoji reactions in both directions: chat.react + engagement.reaction. */
+	"chat.reactions",
 ] as const;
 
 export type Capability = (typeof CAPABILITIES)[number];

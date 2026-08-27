@@ -15,7 +15,7 @@ import type { MonitorRegistry } from "./registry";
 /** Product-level semantics for the seeded maintenance events (generic, persona-independent). */
 const MAINTENANCE_GUIDANCE: Record<string, string | undefined> = {
 	"memory.canonicalize":
-		"For memory.canonicalize events: read the memory tree's daily/ captures, append the durable facts into their canonical axis files (people/ projects/ decisions/ events/ tasks/ channels/), keep every original byte (never delete or summarize-replace, move stray root files into an axis directory with their raw content preserved), and make new files reachable from MEMORY.md. The gateway commits; you only write files.",
+		"For memory.canonicalize events: read the memory tree's daily/ captures, append the durable facts into their canonical axis files (people/ projects/ decisions/ events/ tasks/ channels/ ops/ reflections/ plus any axis registered in the corpus's axes.json), keep every original byte (never delete or summarize-replace, move stray root files into an axis directory with their raw content preserved), and make new files reachable from MEMORY.md. ops/ holds repeatable operating rules, runtime/session/tool procedure, principles distilled from failure, and state the next executor picks up; it is routable, so write into ops/rules/, ops/distillations/ or ops/handoffs/ and never one growing file, and never put raw transcript, secrets or dated small talk there. reflections/ holds what you learned about your own behaviour as dated append-only entries named reflections/YYYY-MM-DD.md (several entries per day are fine, per-subject files are not); each entry records source/time, the observed failure or drift, the invariant learned, why it matters, the concrete next action, and its promotion target - an operating invariant promotes to ops/rules, a cross-incident learning to ops/distillations, and a project or person correction to that axis. ops constrains what to do before acting; decisions/ records what was chosen at a point in time and why. The gateway commits; you only write files.",
 	"memory.audit":
 		"For memory.audit events: run the memory validator (gajaeway memory audit) and put a one-line pass report or the failure diagnostics plus your repair attempt into the note.",
 };
@@ -30,6 +30,8 @@ export class MonitorPropagator {
 	readonly #ownerTarget: { readonly origin: OriginRef } | undefined;
 	readonly #deliver: ((payload: ChatMessagePayload) => void) | undefined;
 	#batches = new Map<string, { eventIds: string[]; timer: ReturnType<typeof setTimeout> }>();
+	/** Event ids this process is dispatching right now, so reconcile never double-runs them. */
+	#inFlight = new Set<string>();
 	constructor(options: {
 		database: GatewayDatabase;
 		registry: MonitorRegistry;
@@ -104,11 +106,31 @@ export class MonitorPropagator {
 				.memoryIntentRows()
 				.some((intent) => intent.kind === "monitor-event" && intent.payload_json.includes(row.event_id));
 			if (output && !hasMemory) this.#author(row.event_id, output);
-			else if (!output && (row.stage === "admitted" || row.stage === "dispatched" || row.stage === "failed"))
-				await this.#dispatch([row.event_id]);
+			else if (!output && this.#recoverable(row.stage, row.event_id)) await this.#dispatch([row.event_id]);
 		}
 	}
+
+	/**
+	 * `batched` is a live stage: a dispatch that is still awaiting its authoring turn sits there
+	 * for minutes. It is also where an event is stranded forever if the process dies mid-dispatch,
+	 * and reconcile used to skip it, so a restart during canonicalization silently killed that run
+	 * (observed: two `memory.canonicalize` events stuck at `batched`, one for six hours).
+	 * The in-flight set tells the two apart exactly — anything batched that this process is not
+	 * currently dispatching is an orphan, including every batched row after a restart.
+	 */
+	#recoverable(stage: string, eventId: string): boolean {
+		if (stage === "admitted" || stage === "dispatched" || stage === "failed") return true;
+		return stage === "batched" && !this.#inFlight.has(eventId);
+	}
 	async #dispatch(eventIds: string[]): Promise<void> {
+		for (const id of eventIds) this.#inFlight.add(id);
+		try {
+			await this.#dispatchBatch(eventIds);
+		} finally {
+			for (const id of eventIds) this.#inFlight.delete(id);
+		}
+	}
+	async #dispatchBatch(eventIds: string[]): Promise<void> {
 		const rows = this.#database.monitorEventRows().filter((row) => eventIds.includes(row.event_id));
 		if (!rows.length) return;
 		const monitor = this.#registry.get(rows[0]?.monitor_id);

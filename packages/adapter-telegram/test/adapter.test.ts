@@ -8,6 +8,7 @@ import {
 	chunkTelegramMessage,
 	type GatewayClientLike,
 	settleTelegramDelivery,
+	subscribeTelegramDeliveries,
 	TelegramAdapter,
 	TelegramBotApi,
 	type TelegramUpdate,
@@ -157,6 +158,57 @@ test("fails delivery ambiguously when transport times out after dispatch", async
 				params: { deliveryId: "delivery-1", reason: "timeout after dispatch", ambiguous: true },
 			},
 		]);
+	} finally {
+		await rm(home, { recursive: true, force: true });
+	}
+});
+
+// The delivery subscription is the merge seam: it chooses between the reaction
+// path and the text path. Deleting that choice leaves every other test green
+// while a reaction gets POSTED as the bare emoji, which is exactly the outcome
+// the reported-failure policy exists to prevent.
+test("the delivery subscription routes a reaction to setMessageReaction and never to sendMessage", async () => {
+	const home = await temporaryHome();
+	try {
+		const state = await TelegramAdapterState.load(home);
+		const origin = telegramMessageOrigin({ chat: { id: 22, type: "private" }, from: { id: 44 } });
+		await state.rememberOrigin(origin);
+		const requests: Array<{ verb: string; params: unknown }> = [];
+		const sent: string[] = [];
+		const reacted: Array<{ chatId: string; messageId: string; emoji: string }> = [];
+		let handler: ((message: ChatMessagePayload) => void) | undefined;
+		const gateway: GatewayClientLike = {
+			request: async <T>(verb: string, params?: unknown) => {
+				requests.push({ verb, params });
+				return {} as T;
+			},
+			onChatMessage: (given) => {
+				handler = given;
+				return () => {};
+			},
+		};
+		subscribeTelegramDeliveries(
+			gateway,
+			{
+				sendMessage: async (_chatId, text) => void sent.push(text),
+				setMessageReaction: async (chatId, messageId, emoji) => void reacted.push({ chatId, messageId, emoji }),
+			},
+			state,
+		);
+		handler?.({
+			...delivery(origin, "👍"),
+			reaction: { targetMessageId: "77", emoji: "👍", emojiName: "thumbsup" },
+		});
+		for (let attempt = 0; attempt < 20 && requests.length === 0; attempt++) await Bun.sleep(5);
+		expect(reacted).toEqual([{ chatId: "22", messageId: "77", emoji: "👍" }]);
+		expect(sent).toEqual([]);
+		expect(requests).toEqual([{ verb: "delivery.confirm", params: { deliveryId: "delivery-1" } }]);
+		// The same subscription still delivers ordinary text through sendMessage.
+		requests.length = 0;
+		handler?.(delivery(origin, "안녕하세요"));
+		for (let attempt = 0; attempt < 20 && requests.length === 0; attempt++) await Bun.sleep(5);
+		expect(sent).toEqual(["안녕하세요"]);
+		expect(reacted).toHaveLength(1);
 	} finally {
 		await rm(home, { recursive: true, force: true });
 	}

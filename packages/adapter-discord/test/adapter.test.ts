@@ -119,6 +119,54 @@ test("prefixes ambiguous redelivery and records failed settlement", async () => 
 	]);
 });
 
+// The merge seam between this lane's reaction wiring and the reply-metadata lane
+// lives inside settleDiscordDelivery's dispatch. Both branches are exercised here
+// because deleting either one leaves every other test in the repo green: a lost
+// reaction branch would POST the bare emoji as a message, and a lost reply branch
+// would silently stop threading.
+test("a reaction delivery reacts to its target and never posts a message", async () => {
+	const requests: Array<{ verb: string; params: unknown }> = [];
+	const sent: string[] = [];
+	const reacted: string[] = [];
+	const discord: DiscordClientLike = {
+		channels: {
+			fetch: async () => ({
+				send: async (text: string) => void sent.push(text),
+				messages: {
+					fetch: async () => ({ react: async (emoji: string) => void reacted.push(emoji) }),
+				},
+			}),
+		},
+	};
+	await settleDiscordDelivery(mockGateway(requests), discord, {
+		...delivery("👍"),
+		reaction: { targetMessageId: "target-1", emoji: "👍", emojiName: "thumbsup" },
+	});
+	expect(reacted).toEqual(["👍"]);
+	expect(sent).toEqual([]);
+	expect(requests).toEqual([{ verb: "delivery.confirm", params: { deliveryId: "delivery-1" } }]);
+});
+
+test("a reply-threaded delivery threads its first chunk and only its first chunk", async () => {
+	const requests: Array<{ verb: string; params: unknown }> = [];
+	const payloads: unknown[] = [];
+	const discord: DiscordClientLike = {
+		channels: { fetch: async () => ({ send: async (payload: unknown) => void payloads.push(payload) }) },
+	};
+	await settleDiscordDelivery(mockGateway(requests), discord, {
+		...delivery("x".repeat(2_001)),
+		replyToMessageId: "msg-42",
+	});
+	expect(payloads).toHaveLength(2);
+	expect(payloads[0]).toEqual({
+		content: "x".repeat(2_000),
+		reply: { messageReference: "msg-42", failIfNotExists: false },
+	});
+	// The continuation is a plain string: threading every chunk would spam the reference.
+	expect(payloads[1]).toBe("x");
+	expect(requests).toEqual([{ verb: "delivery.confirm", params: { deliveryId: "delivery-1" } }]);
+});
+
 test("delivery subscription filters non-Discord and missing delivery ids", async () => {
 	let handler: ((message: ChatMessagePayload) => void) | undefined;
 	const requests: Array<{ verb: string; params: unknown }> = [];

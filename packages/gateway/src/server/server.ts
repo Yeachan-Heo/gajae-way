@@ -1,10 +1,12 @@
 import { unlink } from "node:fs/promises";
 import {
 	CAPABILITIES,
+	type ChatMessagePayload,
 	encodeFrame,
 	type Frame,
 	FrameDecoder,
 	type HelloPayload,
+	isPlatformMessageId,
 	isSilenceToken,
 	LOOPBACK_ORIGIN,
 	negotiate,
@@ -12,11 +14,19 @@ import {
 	originKey,
 	PROFILE_VERSION,
 	ProtocolError,
+	parseReactionReply,
+	platformSupportsReaction,
+	REACTIONS_PER_MESSAGE_CAP,
+	REACTIONS_PER_TURN_CAP,
+	type ReactionRef,
 	type RequestFrame,
+	reactionAllowlistDescription,
+	resolveReactionEmoji,
 	validateOriginRef,
 } from "@gajaeway/protocol";
 import type { GatewayConfig } from "../config";
 import { DeliveryService } from "../delivery/delivery";
+import { ReactionBudget } from "../delivery/reaction-budget";
 import { decideEngagement } from "../engagement/policy";
 import { ACTION_GUARD_SYSTEM_NOTICE } from "../guard/action-guard";
 import { MemoryClosureQueue } from "../memory/closure";
@@ -32,7 +42,7 @@ import { PersonaLoader } from "../persona/persona";
 import type { GatewayDatabase, InboundMessageRow } from "../store/db";
 import { DeliveryLedger } from "../store/ledger";
 import { KeyedQueue } from "./keyed-queue";
-import { composeSpeakerLabel } from "./speaker";
+import { composeSpeakerLabel, composeTurnHeader } from "./speaker";
 
 /**
  * Completed turns per epoch before the session is rotated. Every `gjc --resume`
@@ -80,6 +90,8 @@ interface Runtime {
 	readonly monitorRuntime: MonitorRuntime;
 	readonly reconcileTimer: ReturnType<typeof setInterval>;
 	readonly turns: KeyedQueue;
+	/** Per-turn / per-message reaction caps shared by chat.react and the reply-token path. */
+	readonly reactions: ReactionBudget;
 	/** Accepted-but-not-yet-dispatched inbound messages, keyed by message id. */
 	readonly inbound: Map<string, InboundContext>;
 }
@@ -244,6 +256,7 @@ function createRuntime(options: GatewayServerOptions): Runtime {
 		monitorRuntime,
 		reconcileTimer,
 		turns: new KeyedQueue(),
+		reactions: new ReactionBudget(),
 		inbound: new Map(),
 	};
 }
@@ -503,6 +516,131 @@ async function handleRequest(
 			void runtime.monitorRuntime.refresh();
 			return;
 		}
+		case "chat.react": {
+			// React to ONE named message. The target id is mandatory: "react to the last
+			// message" is unimplementable without racing whoever spoke next, so it is not
+			// expressible in the params at all.
+			const params = request.params as { origin?: unknown; targetMessageId?: unknown; emoji?: unknown } | undefined;
+			let origin: ReturnType<typeof validateOriginRef>;
+			try {
+				origin = validateOriginRef(params?.origin as typeof LOOPBACK_ORIGIN);
+			} catch {
+				throw new ProtocolError("invalid_params", "chat.react requires a valid origin");
+			}
+			// Only the chat platforms have messages to react to; chat.send guards the same
+			// way. A monitor origin would otherwise produce a ledger row no adapter can settle.
+			if (origin.platform !== "discord" && origin.platform !== "telegram")
+				throw new ProtocolError("invalid_params", "chat.react requires a discord or telegram origin");
+			if (typeof params?.targetMessageId !== "string" || !isPlatformMessageId(params.targetMessageId.trim()))
+				throw new ProtocolError(
+					"invalid_params",
+					"chat.react requires targetMessageId to be a platform message id ([A-Za-z0-9._:-], 1-64 chars)",
+				);
+			if (typeof params.emoji !== "string") throw new ProtocolError("invalid_params", "chat.react requires an emoji");
+			const resolved = resolveReactionEmoji(params.emoji);
+			if (!resolved)
+				throw new ProtocolError(
+					"invalid_params",
+					`emoji ${JSON.stringify(params.emoji)} is outside the reaction allowlist: ${reactionAllowlistDescription(origin.platform)}`,
+				);
+			// Allowlisted is not the same as deliverable: Telegram accepts only its own
+			// reaction set, so asking for one it cannot express would be a guaranteed dead
+			// delivery. Refuse it here instead of letting the persona believe it acknowledged.
+			if (!platformSupportsReaction(origin.platform, resolved.name))
+				throw new ProtocolError(
+					"invalid_params",
+					`${origin.platform} cannot react with ${resolved.unicode} (${resolved.name}); it accepts: ${reactionAllowlistDescription(origin.platform)}`,
+				);
+			const reaction: ReactionRef = {
+				targetMessageId: params.targetMessageId.trim(),
+				emoji: resolved.unicode,
+				emojiName: resolved.name,
+			};
+			const rejection = runtime.reactions.claim({
+				originKey: originKey(origin),
+				targetMessageId: reaction.targetMessageId,
+				emoji: reaction.emoji,
+			});
+			// Cap violations are reported, never silently dropped: the caller must be able
+			// to tell "not sent" from "sent and invisible".
+			if (rejection)
+				throw new ProtocolError("invalid_params", `reaction rejected (${rejection.reason}): ${rejection.detail}`);
+			const payload = runtime.delivery.prepareReaction(crypto.randomUUID(), origin, reaction);
+			broadcastDelivery(runtime, payload);
+			connection.write({
+				v: PROFILE_VERSION,
+				type: "response",
+				id: request.id,
+				result: { deliveryId: payload.deliveryId, emoji: reaction.emoji },
+			});
+			return;
+		}
+		case "engagement.reaction": {
+			// Inbound reaction: engagement metadata, NEVER a turn. It is recorded in the
+			// conversation-context ledger so the next engaged turn reads it as part of the
+			// unread diff, and it deliberately never touches inboundEnqueue/drainOrigin —
+			// a reaction must not wake the persona and make it speak.
+			const params = request.params as
+				| {
+						origin?: unknown;
+						targetMessageId?: unknown;
+						emoji?: unknown;
+						action?: unknown;
+						engagement?: { authorId?: unknown; authorName?: unknown };
+				  }
+				| undefined;
+			let origin: ReturnType<typeof validateOriginRef>;
+			try {
+				origin = validateOriginRef(params?.origin as typeof LOOPBACK_ORIGIN);
+			} catch {
+				throw new ProtocolError("invalid_params", "engagement.reaction requires a valid origin");
+			}
+			if (origin.platform !== "discord" && origin.platform !== "telegram")
+				throw new ProtocolError("invalid_params", "engagement.reaction requires a discord or telegram origin");
+			if (typeof params?.targetMessageId !== "string" || !isPlatformMessageId(params.targetMessageId.trim()))
+				throw new ProtocolError(
+					"invalid_params",
+					"engagement.reaction requires targetMessageId to be a platform message id ([A-Za-z0-9._:-], 1-64 chars)",
+				);
+			if (typeof params.emoji !== "string" || !params.emoji.trim())
+				throw new ProtocolError("invalid_params", "engagement.reaction requires a non-empty emoji");
+			if (params.action !== "add" && params.action !== "remove")
+				throw new ProtocolError("invalid_params", "engagement.reaction action must be add or remove");
+			if (typeof params.engagement?.authorId !== "string" || !params.engagement.authorId)
+				throw new ProtocolError("invalid_params", "engagement.reaction requires engagement.authorId");
+			// The reactor's emoji is untrusted text that ends up in the turn's context
+			// block: bound it and strip control characters so it cannot forge extra lines
+			// (a newline here would look like another context entry to the persona).
+			const emoji = stripControlCharacters(params.emoji).trim().slice(0, 64);
+			if (!emoji) throw new ProtocolError("invalid_params", "engagement.reaction requires a non-empty emoji");
+			const targetMessageId = params.targetMessageId.trim();
+			const authorId = params.engagement.authorId;
+			const actor = typeof params.engagement.authorName === "string" ? params.engagement.authorName : undefined;
+			// A REMOVAL means the reactor took the signal back. It is recorded as its own
+			// entry instead of erasing the add, because the persona may already have read
+			// the add: the honest record is "reacted, then un-reacted", not "never reacted".
+			// The synthetic id ends in a random suffix, not just a timestamp: two reactions
+			// in the same millisecond (a reaction storm, or an add/remove/add burst) would
+			// otherwise collide on the primary key and the later ones would be dropped by
+			// the ON CONFLICT DO NOTHING insert, silently losing reaction history.
+			options.database.contextRecord({
+				messageId: `reaction/${params.action}/${targetMessageId}/${authorId}/${emoji}/${new Date().toISOString()}/${crypto.randomUUID().slice(0, 8)}`,
+				originKey: originKey(origin),
+				authorId,
+				...(actor ? { authorName: actor } : {}),
+				body:
+					params.action === "add"
+						? `[reaction] reacted ${emoji} to message ${targetMessageId}`
+						: `[reaction] removed their ${emoji} reaction from message ${targetMessageId}`,
+			});
+			connection.write({
+				v: PROFILE_VERSION,
+				type: "response",
+				id: request.id,
+				result: { recorded: true, engaged: false },
+			});
+			return;
+		}
 		case "chat.send":
 			await sendChat(connection, request, options, runtime);
 			return;
@@ -733,6 +871,12 @@ async function runInboundTurn(
 				authorHandle?: string;
 				channelLabel?: string;
 				serverLabel?: string;
+				replyTo?: {
+					messageId?: string;
+					authorName?: string;
+					fromSelf?: boolean;
+					excerpt?: string;
+				};
 			})
 		: undefined;
 	const speaker = composeSpeakerLabel(engagement);
@@ -753,7 +897,7 @@ async function runInboundTurn(
 		const header = lines.length
 			? `[Unread messages in this conversation since your last reply]\n${lines.join("\n")}\n\n`
 			: "";
-		turnText = `${header}${speaker ? `[${speaker} | ${place} (author:${engagement?.authorId ?? "?"}, msg:${row.message_id})]\n` : ""}${userText}`;
+		turnText = `${header}${speaker ? `${composeTurnHeader({ speaker, place, authorId: engagement?.authorId, messageId: row.message_id, engagement })}\n` : ""}${userText}`;
 		options.database.contextConsume([...unread.map((entry) => entry.message_id), row.message_id]);
 	}
 	let text: string;
@@ -764,9 +908,54 @@ async function runInboundTurn(
 	// exit, so a multi-minute turn talks while it works (live gajaeway-play
 	// finding: turns showed nothing but "working…" until the very end).
 	const deliveredParts: string[] = [];
+	let reactionTokensSeen = false;
 	const maxTurnParts = 10;
-	const deliverAssistantText = (message: string) => {
+	const deliverAssistantText = (rawMessage: string) => {
 		if (!nonLoopback) return;
+		let message = rawMessage;
+		// Reaction reply mode (third mode next to text and silence, parsed per delivered
+		// assistant message so streamed intermediates carry it too): a message may open
+		// with [REACT:<emoji-or-name>] tokens, optionally targeting one message with
+		// `@<platform message id>`. With nothing left after the tokens the message
+		// acknowledges with a reaction and ships no text. Parsing is all-or-nothing: a
+		// malformed or non-allowlisted token yields undefined here, and the message is
+		// delivered verbatim as text — a bad token can cost the reaction, never the reply.
+		const reactionReply = parseReactionReply(message);
+		if (reactionReply) {
+			reactionTokensSeen = true;
+			for (const wanted of reactionReply.reactions) {
+				// Untargeted tokens react to the message that triggered this turn; that id is
+				// the platform's own message id whenever the adapter supplied one.
+				// A platform that cannot express this emoji would swallow the acknowledgement:
+				// skip it loudly rather than queue a delivery that can only ever fail.
+				if (!platformSupportsReaction(origin.platform, wanted.emojiName)) {
+					console.error(
+						`gateway reaction skipped for ${key}: ${origin.platform} cannot react with ${wanted.emoji} (${wanted.emojiName})`,
+					);
+					continue;
+				}
+				const targetMessageId = wanted.targetMessageId ?? row.message_id;
+				const rejection = runtime.reactions.claim({ turnId, originKey: key, targetMessageId, emoji: wanted.emoji });
+				if (rejection) {
+					// Never a silent no-op: an owner who does not see the reaction can find the
+					// reason in the daemon log.
+					console.error(
+						`gateway reaction rejected (${rejection.reason}) for ${key} message ${targetMessageId}: ${rejection.detail}`,
+					);
+					continue;
+				}
+				broadcastDelivery(
+					runtime,
+					runtime.delivery.prepareReaction(crypto.randomUUID(), origin, {
+						targetMessageId,
+						emoji: wanted.emoji,
+						emojiName: wanted.emojiName,
+					}),
+				);
+			}
+			message = reactionReply.body;
+			if (!message) return;
+		}
 		const parts = message
 			.split(/\n\s*\[BREAK\]\s*\n?/)
 			.map((part) => part.trim())
@@ -782,10 +971,7 @@ async function runInboundTurn(
 			const payload = runtime.delivery.prepare(crypto.randomUUID(), origin, body, replyMatch?.[1]);
 			if (!payload) continue;
 			deliveredParts.push(body);
-			runtime.delivery.markInflight(payload.deliveryId as string);
-			for (const recipient of runtime.connections)
-				if (recipient.negotiated)
-					recipient.write({ v: PROFILE_VERSION, type: "event", event: "chat.message", payload });
+			broadcastDelivery(runtime, payload);
 		}
 	};
 	// Long turns announce liveness instead of dying: throttled chat.progress events
@@ -797,10 +983,17 @@ async function runInboundTurn(
 	const intervalMs = options.progress?.intervalMs ?? 10_000;
 	let lastProgressAt = 0;
 	let lastKnown = { toolCalls: 0, outputTokens: 0 };
-	const emitProgress = (progress: { toolCalls: number; outputTokens: number }) => {
+	let progressAnnounced = false;
+	const emitProgress = (progress: { toolCalls: number; outputTokens: number }, final = false) => {
 		lastKnown = progress;
 		const now = Date.now();
-		if (now - startedAt < firstAfterMs || now - lastProgressAt < intervalMs) return;
+		// A final event is never throttled: it is what tells an adapter to remove the
+		// temporary "working" message. Throttling it would leave that message behind.
+		if (!final && (now - startedAt < firstAfterMs || now - lastProgressAt < intervalMs)) return;
+		// Nothing was ever announced, so there is no status to clear: stay quiet rather
+		// than emitting a lone terminal event for a fast turn.
+		if (final && !progressAnnounced) return;
+		if (!final) progressAnnounced = true;
 		lastProgressAt = now;
 		const payload = {
 			turnId,
@@ -808,6 +1001,7 @@ async function runInboundTurn(
 			elapsedMs: now - startedAt,
 			toolCalls: progress.toolCalls,
 			outputTokens: progress.outputTokens,
+			...(final ? { final: true } : {}),
 		};
 		for (const recipient of runtime.connections)
 			if (recipient.negotiated) recipient.write({ v: PROFILE_VERSION, type: "event", event: "chat.progress", payload });
@@ -865,6 +1059,10 @@ async function runInboundTurn(
 		throw error;
 	} finally {
 		clearInterval(heartbeat);
+		// Every exit path from here on must clear the adapter's temporary status: a
+		// delivered reply, a failure notice, and - the case this fixes - a turn that
+		// ends in a silence token and delivers nothing at all.
+		emitProgress(lastKnown, true);
 	}
 	const replyText = deliveredParts.length > 0 ? deliveredParts.join("\n") : text;
 	options.database.withTransaction(() => {
@@ -902,9 +1100,25 @@ async function runInboundTurn(
 	// Memory carries who spoke and where, so canonicalization keeps provenance.
 	const capturedUser = speaker ? `${speaker} @ ${place}: ${userText}` : userText;
 	// Ports without streaming (and the test stub) return only the final text; when
-	// nothing was delivered mid-turn, ship the final text through the same splitter.
+	// nothing was delivered mid-turn, ship the final text through the same splitter
+	// (reaction tokens included).
 	if (deliveredParts.length === 0) deliverAssistantText(text);
-	if (deliveredParts.length === 0) return;
+	if (deliveredParts.length === 0) {
+		// Reaction-only acknowledgement: nothing is spoken, but the turn happened and
+		// is captured with its token text so memory records what was acknowledged.
+		// If every reaction was skipped — capped, duplicated, or not expressible on
+		// this platform — the turn still emitted nothing and the daemon log is the
+		// only record of the skip; delivering the raw `[REACT:…]` token as text would
+		// leak control syntax into the room.
+		if (reactionTokensSeen)
+			runtime.memory.enqueue({
+				kind: "daily_capture",
+				originRefJson: JSON.stringify(origin),
+				userText: capturedUser,
+				replyText: text,
+			});
+		return;
+	}
 	// Durable intent is persisted synchronously; closure work deliberately does not delay delivery.
 	runtime.memory.enqueue({
 		kind: "daily_capture",
@@ -912,6 +1126,27 @@ async function runInboundTurn(
 		userText: capturedUser,
 		replyText,
 	});
+}
+
+/**
+ * Replaces C0 control characters and DEL with a space. An inbound reaction emoji is
+ * rendered into the turn's context block line by line, so a stray newline there
+ * would read as another entry the persona was told about.
+ */
+function stripControlCharacters(value: string): string {
+	let stripped = "";
+	for (const character of value) {
+		const code = character.codePointAt(0) ?? 0;
+		stripped += code < 0x20 || code === 0x7f ? " " : character;
+	}
+	return stripped;
+}
+
+/** Marks a prepared delivery in flight and fans it out to every negotiated adapter. */
+function broadcastDelivery(runtime: Runtime, payload: ChatMessagePayload): void {
+	runtime.delivery.markInflight(payload.deliveryId as string);
+	for (const recipient of runtime.connections)
+		if (recipient.negotiated) recipient.write({ v: PROFILE_VERSION, type: "event", event: "chat.message", payload });
 }
 
 /**
@@ -935,6 +1170,13 @@ function currentConversationNotice(origin: OriginRef, engagement?: { mentioned?:
 					engagement?.mentioned
 						? "You were explicitly addressed here: reply."
 						: "You were NOT addressed: you are listening in on a room. Unless this message clearly needs you or adds real value for you to answer, reply with exactly [SILENT] and nothing else — that suppresses delivery while the message stays recorded. Do not respond to every message.",
+				]
+			: []),
+		// The third reply mode: acknowledge without speaking. Kept next to the silence
+		// guidance because the persona chooses between exactly these three shapes.
+		...(origin.platform === "discord" || origin.platform === "telegram"
+			? [
+					`Reaction replies: start your reply with [REACT:<emoji>] to react to the message that triggered this turn, or [REACT:<emoji>@<message id>] to react to a specific message. With nothing after the token you acknowledge with a reaction and say nothing; text after the token is sent as well. Emoji ${origin.platform} can actually deliver: ${reactionAllowlistDescription(origin.platform)}. At most ${REACTIONS_PER_TURN_CAP} reactions per turn and ${REACTIONS_PER_MESSAGE_CAP} per message.`,
 				]
 			: []),
 	].join("\n");

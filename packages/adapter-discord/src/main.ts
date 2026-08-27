@@ -1,9 +1,39 @@
-import type { ChatMessagePayload, ChatProgressPayload, EngagementContext, OriginRef } from "@gajaeway/protocol";
+import type {
+	ChatMessagePayload,
+	ChatProgressPayload,
+	EngagementContext,
+	OriginRef,
+	ReactionAction,
+} from "@gajaeway/protocol";
 import { GajaewayClient } from "@gajaeway/sdk";
-import { Client, GatewayIntentBits } from "discord.js";
-import { resolveDisplayName } from "./author";
+import { Client, GatewayIntentBits, Partials } from "discord.js";
+import { type AuthorLike, resolveDisplayName } from "./author";
 import { type LoadedDiscordAdapterConfig, loadDiscordAdapterConfig } from "./config";
 import { type DiscordMessageOriginShape, discordMessageOrigin } from "./origin";
+import {
+	type DiscordInboundReaction,
+	type DiscordReactingUser,
+	describeInboundReaction,
+	GuildEmojiResolver,
+	ReactionRateLimiter,
+	settleDiscordReaction,
+} from "./reactions";
+import { type ReplyMessageLike, resolveReplyContext } from "./reply";
+
+/**
+ * Reaction state that must outlive a single delivery: the guild custom-emoji
+ * lookup cache and the per-channel request self-throttle. One pair per delivery
+ * subscription, so a long-running adapter shares both across every reaction
+ * while a direct caller stays independent.
+ */
+export interface DiscordReactionPorts {
+	readonly resolver: GuildEmojiResolver;
+	readonly limiter: ReactionRateLimiter;
+}
+
+export function createReactionPorts(): DiscordReactionPorts {
+	return { resolver: new GuildEmojiResolver(), limiter: new ReactionRateLimiter() };
+}
 
 const DISCORD_MESSAGE_LIMIT = 2_000;
 // Discord clears the typing hint after ~10s, so refresh inside that window while a turn is running.
@@ -15,7 +45,22 @@ const REQUIRED_INTENTS = [
 	GatewayIntentBits.GuildMessages,
 	GatewayIntentBits.MessageContent,
 	GatewayIntentBits.DirectMessages,
+	// Without the reaction intents Discord never dispatches messageReactionAdd /
+	// messageReactionRemove at all, so inbound reactions would silently not exist.
+	// GUILD_MESSAGE_REACTIONS (1 << 10) carries MESSAGE_REACTION_ADD/REMOVE and
+	// DIRECT_MESSAGE_REACTIONS (1 << 13) does the same for DMs; neither is a
+	// privileged intent, so no portal approval is needed
+	// (https://docs.discord.com/developers/events/gateway, verified 2026-08-27).
+	GatewayIntentBits.GuildMessageReactions,
+	GatewayIntentBits.DirectMessageReactions,
 ];
+/**
+ * Reactions on messages this process never cached (anything from before the last
+ * restart) arrive as PARTIAL structures, and discord.js drops those events
+ * entirely unless the partials are enabled. Our own outbound messages are exactly
+ * the ones people react to, and they are the first thing to fall out of cache.
+ */
+const REQUIRED_PARTIALS = [Partials.Message, Partials.Channel, Partials.Reaction, Partials.User];
 
 export interface GatewayClientLike {
 	request<T = unknown>(verb: string, params?: unknown): Promise<T>;
@@ -43,7 +88,7 @@ export interface DiscordClientLike {
 	channels: { fetch(id: string): Promise<unknown> };
 }
 
-export interface DiscordInboundMessage extends DiscordMessageOriginShape {
+export interface DiscordInboundMessage extends DiscordMessageOriginShape, ReplyMessageLike {
 	readonly id: string;
 	readonly content: string;
 	readonly author: {
@@ -53,7 +98,7 @@ export interface DiscordInboundMessage extends DiscordMessageOriginShape {
 		/** Account-wide display name, shown when a guild has no nickname. */
 		readonly globalName?: string | null;
 	};
-	readonly mentions?: { has(user: unknown): boolean };
+	readonly mentions?: { has(user: unknown): boolean; readonly repliedUser?: AuthorLike | null };
 	readonly guild?: { readonly name?: string } | null;
 	/**
 	 * Guild membership for this message, present only for guild messages.
@@ -102,6 +147,7 @@ export function engagementForMessage(message: DiscordInboundMessage, botUser: un
 	const botId = typeof botUser === "object" && botUser !== null && "id" in botUser ? String(botUser.id) : "";
 	const contentMention = botId !== "" && new RegExp(`<@!?${escapeRegExp(botId)}>`).test(message.content);
 	const displayName = resolveAuthorDisplayName(message);
+	const replyTo = resolveReplyContext(message, botId);
 	return {
 		mentioned: Boolean(message.mentions?.has(botUser) || contentMention),
 		group: origin.kind !== "dm",
@@ -111,6 +157,8 @@ export function engagementForMessage(message: DiscordInboundMessage, botUser: un
 		...(message.author.username ? { authorHandle: message.author.username } : {}),
 		...(message.channel.name ? { channelLabel: `#${message.channel.name}` } : {}),
 		...(message.guild?.name ? { serverLabel: message.guild.name } : {}),
+		// Metadata only: a reply — even a reply to us — never promotes engagement.
+		...(replyTo ? { replyTo } : {}),
 	};
 }
 
@@ -309,9 +357,20 @@ export async function settleDiscordDelivery(
 	message: ChatMessagePayload,
 	typing?: TypingPort,
 	status?: WorkingStatus,
+	reactions: DiscordReactionPorts = createReactionPorts(),
 ): Promise<void> {
 	if (message.origin.platform !== "discord" || !message.deliveryId) return;
 	const deliveryId = message.deliveryId;
+	// A reaction delivery reacts and posts nothing; it settles on the same ledger.
+	if (message.reaction) {
+		try {
+			await settleDiscordReaction(gateway, discord, message, reactions.resolver, reactions.limiter);
+		} finally {
+			await status?.clear(message.origin.conversationId);
+			typing?.end(message.origin.conversationId);
+		}
+		return;
+	}
 	try {
 		const channel = await discord.channels.fetch(message.origin.conversationId);
 		if (!isDiscordTextChannel(channel)) {
@@ -352,8 +411,11 @@ export function subscribeDiscordDeliveries(
 	status?: WorkingStatus,
 	log: Pick<Console, "error"> = console,
 ): () => void {
+	// One reaction port pair per subscription: the emoji cache and the throttle are
+	// only useful across deliveries, and a live adapter has exactly one subscription.
+	const reactions = createReactionPorts();
 	return gateway.onChatMessage((message) => {
-		void settleDiscordDelivery(gateway, discord, message, typing, status).catch((error) =>
+		void settleDiscordDelivery(gateway, discord, message, typing, status, reactions).catch((error) =>
 			log.error(
 				`Discord delivery settlement request failed: ${error instanceof Error ? error.message : String(error)}`,
 			),
@@ -363,21 +425,35 @@ export function subscribeDiscordDeliveries(
 
 export function subscribeDiscordProgress(
 	gateway: GatewayClientLike,
-	status: WorkingStatus,
+	// Structural, not the concrete class: the progress path is the one piece worth
+	// testing without a Discord client, and the private message cache is irrelevant here.
+	status: Pick<WorkingStatus, "update" | "clear">,
 	log: Pick<Console, "error"> = console,
 ): () => void {
 	if (!gateway.onChatProgress) return () => {};
 	return gateway.onChatProgress((progress) => {
-		void status
-			.update(progress)
-			.catch((error) =>
-				log.error(`Discord working status update failed: ${error instanceof Error ? error.message : String(error)}`),
-			);
+		// `final` means the turn stopped working. It arrives even when the turn
+		// delivered nothing - a silence token in an open channel - which is the only
+		// signal that the temporary status must go. Clearing on delivery alone left
+		// one orphaned "working" message per suppressed turn.
+		const action = progress.final ? status.clear(progress.origin.conversationId) : status.update(progress);
+		void action.catch((error) =>
+			log.error(
+				`Discord working status ${progress.final ? "clear" : "update"} failed: ${error instanceof Error ? error.message : String(error)}`,
+			),
+		);
 	});
 }
 
 export async function startDiscordAdapter(config: LoadedDiscordAdapterConfig): Promise<void> {
-	const discord = new Client({ intents: [...new Set([...REQUIRED_INTENTS, ...(config.intents ?? [])])] });
+	const discord = new Client({
+		intents: [...new Set([...REQUIRED_INTENTS, ...(config.intents ?? [])])],
+		// DM channels are not cached on a cold start; without the Channel partial
+		// discord.js drops messageCreate for uncached DMs, silently losing owner DMs.
+		// REQUIRED_PARTIALS carries that Channel partial plus the reaction partials,
+		// which uncached reaction events need for the same reason.
+		partials: REQUIRED_PARTIALS,
+	});
 	const typing = new TypingIndicator(discord);
 	const status = new WorkingStatus(discord);
 	const gateway = new ReconnectingGateway(
@@ -391,6 +467,17 @@ export async function startDiscordAdapter(config: LoadedDiscordAdapterConfig): P
 		const engagement = decideInbound(message, discord.user, config.channels);
 		if (!engagement) return;
 		gateway.sendInbound(message.id as string, discordMessageOrigin(message), message.content, engagement);
+	});
+	// A reaction is engagement metadata, never a turn: it goes out on its own verb.
+	discord.on("messageReactionAdd", (reaction, user) => {
+		gateway.sendReaction(reaction, user, "add", discord.user);
+	});
+	// A REMOVAL means the reactor retracted the signal. It is recorded as its own
+	// metadata event rather than erasing the add, because the persona may already
+	// have read the add — rewriting history behind it would make its memory of the
+	// conversation disagree with what it was told.
+	discord.on("messageReactionRemove", (reaction, user) => {
+		gateway.sendReaction(reaction, user, "remove", discord.user);
 	});
 	discord.on("interactionCreate", (interaction) => {
 		if (interaction.isChatInputCommand()) void handleSlashCommand(interaction, gateway);
@@ -508,6 +595,27 @@ class ReconnectingGateway {
 
 	sendInbound(messageId: string, origin: OriginRef, text: string, engagement: EngagementContext): void {
 		void this.requestInbound(messageId, origin, text, engagement);
+	}
+
+	/**
+	 * Inbound reaction -> engagement.reaction, fire and forget.
+	 *
+	 * Deliberately NOT routed through requestInbound: that path dedupes on the
+	 * platform message id (a reaction carries its *target's* id, so the second
+	 * reaction on a message would be swallowed as a duplicate) and it starts the
+	 * typing indicator, which promises a reply that metadata never produces.
+	 */
+	sendReaction(
+		reaction: DiscordInboundReaction,
+		user: DiscordReactingUser,
+		action: ReactionAction,
+		botUser: unknown,
+	): void {
+		const described = describeInboundReaction(reaction, user, botUser, action);
+		if (!described) return;
+		const client = this.#client;
+		if (!client) return;
+		void client.request("engagement.reaction", described).catch(() => this.scheduleReconnect());
 	}
 
 	/** Like sendInbound but reports the gateway's engagement decision to the caller. */
