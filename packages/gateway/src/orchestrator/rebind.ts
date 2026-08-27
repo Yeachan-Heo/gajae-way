@@ -195,7 +195,9 @@ export function redactSecrets(text: string): string {
 			// as a bare secret=. A QUOTED value is consumed to its closing quote,
 			// because a quoted secret may contain whitespace and stopping at the first
 			// space half-delivered it.
-			.replace(SECRET_ASSIGNMENT_QUOTED, "$1[redacted]$3")
+			.replace(SECRET_ASSIGNMENT_QUOTED, (match, prefix: string, _quote: string, value: string, close: string) =>
+				looksLikeCredential(value) ? `${prefix}[redacted]${close}` : match,
+			)
 			.replace(SECRET_ASSIGNMENT_BARE, (match, prefix: string, value: string) =>
 				looksLikeCredential(value) ? `${prefix}[redacted]` : match,
 			)
@@ -210,19 +212,22 @@ export function redactSecrets(text: string): string {
 const SECRET_KEY_WORD =
 	"[A-Za-z0-9_]{0,24}(?:token|secret|password|passwd|api[_-]?key|apikey|credential|authorization|auth|bearer)[A-Za-z0-9_]{0,24}";
 /** `key: "value with spaces"` — consumed to the closing quote, which is kept. */
-const SECRET_ASSIGNMENT_QUOTED = new RegExp(`(${SECRET_KEY_WORD}\\s*[:=]\\s*(["']))[^"']*(\\2)`, "gi");
+const SECRET_ASSIGNMENT_QUOTED = new RegExp(`(${SECRET_KEY_WORD}\\s*[:=]\\s*(["']))([^"']*)(\\2)`, "gi");
 /** `key=value` — one whitespace-delimited token. */
 const SECRET_ASSIGNMENT_BARE = new RegExp(`(${SECRET_KEY_WORD}\\s*[:=]\\s*)([^\\s"',}]+)`, "gi");
 
 /**
- * Guards the key=value rule against erasing diagnosis. `oauth: exchange
- * rejected` contains an auth-ish word and a colon but "exchange" is prose, not a
- * credential; a credential is long and carries a digit, mixed case, or base64
- * punctuation.
+ * Guards the key=value rules against erasing diagnosis. An affixed key word
+ * matches far more than credentials — `max_tokens=200000`, `oauth: exchange
+ * rejected`, `auth_expired: ...` — and redacting those loses the whole
+ * diagnosis to protect nothing. A credential is LONG and mixes character
+ * classes; a limit, a count, or a prose word does not.
  */
 function looksLikeCredential(value: string): boolean {
-	if (value.length < 8) return false;
-	return /[0-9]/.test(value) || /[a-z]/.test(value) === false || /[A-Z]/.test(value) || /[-_+/=]/.test(value);
+	if (value.length < 12) return false;
+	if (/^\d+$/.test(value)) return false; // a limit or a count, not a key
+	const classes = [/[a-z]/, /[A-Z]/, /[0-9]/, /[-_+/=.]/].filter((pattern) => pattern.test(value)).length;
+	return classes >= 2;
 }
 
 /**

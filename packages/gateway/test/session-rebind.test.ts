@@ -533,6 +533,22 @@ test("prose after an auth-ish word is diagnosis, not a secret, and survives", ()
 	expect(redactSecrets("authorization: hunter2hunter2hunter2")).toContain("[redacted]");
 });
 
+test("an ordinary diagnostic that merely contains an auth-ish key word survives", () => {
+	// The affixed key word matches far more than credentials; redacting
+	// `max_tokens=200000` loses the diagnosis to protect nothing.
+	for (const text of [
+		"max_tokens=200000 exceeded",
+		"auth_expired: retry the handshake",
+		"oauth: exchange rejected",
+		"token_count=1024",
+		'authorization: "expired"',
+	])
+		expect(redactSecrets(text)).toBe(text);
+	// A credential in exactly those shapes is still erased.
+	expect(redactSecrets("AWS_SECRET_ACCESS_KEY=wJalrXUtnFEMIK7MDENGbPxRfiCYEXAMPLEKEY")).toContain("[redacted]");
+	expect(redactSecrets('api_key: "deadbeefcafebabe0123456789 wJalrXUtnFEMIKSECRETDENGbPxRfi"')).toContain("[redacted]");
+});
+
 test("an unterminated final frame counts as work, so the turn is not replayed", async () => {
 	// A child killed mid-write leaves its last frame in the parser buffer, where
 	// it is never parsed; replaying then re-runs the side effect the guard exists

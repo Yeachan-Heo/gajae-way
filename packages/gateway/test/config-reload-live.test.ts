@@ -1,5 +1,5 @@
 import { afterEach, expect, test } from "bun:test";
-import { mkdtemp, rm } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { loadConfig, RELOADABLE_FIELDS, RESTART_REQUIRED_FIELDS, reloadConfig, UNCONSUMED_FIELDS } from "../src/config";
@@ -148,13 +148,38 @@ test("a missing config file is fail-safe: the previous policy is retained", asyn
 	if (vanished.ok) return;
 	expect(vanished.config).toBe(current);
 	expect(vanished.config.mentionAllowlist).toEqual(["owner"]);
-	expect(vanished.diagnostics[0]?.message).toContain("missing or unreadable");
+	// The diagnostic distinguishes absent from unreadable, which is the invariant.
+	expect(vanished.diagnostics[0]?.message).toContain("is missing");
 	// A directory in the config's place is the same fail-closed path.
 	await Bun.write(join(directory, "config.json", "placeholder"), "x");
 	const directoryInstead = await reloadConfig(current);
 	expect(directoryInstead.ok).toBe(false);
 	if (directoryInstead.ok) return;
 	expect(directoryInstead.config.mentionAllowlist).toEqual(["owner"]);
+});
+
+test("an unreadable but PRESENT config never boots on defaults", async () => {
+	// Regression: distinguishing "absent" from "unreadable" is the whole point.
+	// Absent means a first boot and defaults are right; a config that exists and
+	// cannot be read must never silently become an open mention policy.
+	directory = await mkdtemp(join(tmpdir(), "gajaeway-reload-"));
+	const configPath = join(directory, "config.json");
+	await writeConfig(directory, { schemaVersion: 1, mentionAllowlist: ["owner"] });
+	await chmod(configPath, 0o000);
+	await expect(loadConfig({ home: directory })).rejects.toMatchObject({ code: "config_invalid" });
+	await chmod(configPath, 0o644);
+	expect((await loadConfig({ home: directory })).mentionAllowlist).toEqual(["owner"]);
+	// A directory in its place is refused at boot too.
+	const directoryHome = await mkdtemp(join(tmpdir(), "gajaeway-reload-"));
+	await mkdir(join(directoryHome, "config.json"));
+	await expect(loadConfig({ home: directoryHome })).rejects.toMatchObject({ code: "config_invalid" });
+	await rm(directoryHome, { recursive: true, force: true });
+	// A genuinely absent config still means defaults.
+	const freshHome = await mkdtemp(join(tmpdir(), "gajaeway-reload-"));
+	const defaults = await loadConfig({ home: freshHome });
+	expect(defaults.mentionAllowlist).toBeUndefined();
+	expect(defaults.logVerbosity).toBe("info");
+	await rm(freshHome, { recursive: true, force: true });
 });
 
 test("over the socket, a vanished config cannot widen a mention-gated room", async () => {

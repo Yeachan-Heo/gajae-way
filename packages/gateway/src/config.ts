@@ -252,11 +252,15 @@ export async function loadConfig(
 	try {
 		raw = await Bun.file(configPath).text();
 	} catch (error) {
-		// ENOENT, EISDIR and EACCES all land here.
-		if (options.requireFile)
+		const code = (error as NodeJS.ErrnoException).code;
+		// ENOENT is genuinely "no configuration", and defaults are correct for a
+		// first boot. Anything else (EISDIR, EACCES, EIO) is a config file that
+		// EXISTS and cannot be read, which must never silently become a
+		// defaults-only open policy — not at reload, and not at boot either.
+		if (options.requireFile || code !== "ENOENT")
 			throw new ConfigError(
 				"config_invalid",
-				`${configPath} is missing or unreadable (${(error as NodeJS.ErrnoException).code ?? "unknown"}); keeping the previous configuration`,
+				`${configPath} is ${code === "ENOENT" ? "missing" : `unreadable (${code ?? "unknown"})`}; keeping the previous configuration`,
 			);
 	}
 	if (raw !== undefined) {
