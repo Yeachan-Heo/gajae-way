@@ -106,6 +106,7 @@ export function engagementForMessage(message: DiscordInboundMessage, botUser: un
 		mentioned: Boolean(message.mentions?.has(botUser) || contentMention),
 		group: origin.kind !== "dm",
 		authorId: message.author.id,
+		...(message.author.bot ? { authorIsBot: true } : {}),
 		...(displayName ? { authorName: displayName } : {}),
 		...(message.author.username ? { authorHandle: message.author.username } : {}),
 		...(message.channel.name ? { channelLabel: `#${message.channel.name}` } : {}),

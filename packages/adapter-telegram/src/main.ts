@@ -164,6 +164,7 @@ export function engagementForMessage(
 		mentioned,
 		group: origin.kind !== "dm",
 		authorId: String(message.from?.id ?? ""),
+		...(message.from?.is_bot ? { authorIsBot: true } : {}),
 		...(authorName ? { authorName } : {}),
 		...(message.chat.title ? { channelLabel: message.chat.title } : {}),
 	};
