@@ -13,9 +13,11 @@ export interface InboundMessageRow {
 
 const LATEST_SCHEMA_VERSION = 13;
 /** Maximum number of prior messages supplied to one engaged conversation turn. */
-export const CONVERSATION_DIFF_MAX_ROWS = 40;
+export const CONVERSATION_DIFF_MAX_ROWS = 60;
 /** Maximum age of prior messages supplied to one engaged conversation turn. */
 export const CONVERSATION_DIFF_MAX_AGE_MS = 6 * 60 * 60 * 1000;
+/** Consumed context bodies older than this are deleted after aggregate evidence is retained. */
+export const CONVERSATION_CONTEXT_RETENTION_MS = 7 * 24 * 60 * 60 * 1000;
 
 export interface ConversationContextRow {
 	readonly message_id: string;
@@ -37,6 +39,11 @@ export interface ConversationContextDiagnostics {
 export interface ConversationContextWindow {
 	readonly rows: readonly ConversationContextRow[];
 	readonly selectedMessageIds: readonly string[];
+	readonly effectiveFloor: string;
+	readonly expiredCount: number;
+	readonly truncatedCount: number;
+	readonly omittedOldestAt: string | null;
+	readonly omittedNewestAt: string | null;
 	readonly diagnostics: ConversationContextDiagnostics;
 }
 /** A scheduled cron slot the gateway claimed or fired for one monitor. */
@@ -398,7 +405,7 @@ export class GatewayDatabase {
 		body: string;
 		receivedAt?: string;
 	}): void {
-		this.#database
+		const inserted = this.#database
 			.query(
 				"INSERT INTO conversation_context (message_id, origin_key, author_id, author_name, body, received_at) VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT(message_id) DO NOTHING",
 			)
@@ -410,6 +417,53 @@ export class GatewayDatabase {
 				row.body,
 				row.receivedAt ?? new Date().toISOString(),
 			);
+		if (inserted.changes > 0) this.contextMaintain();
+	}
+
+	/**
+	 * Active retention boundary. Unread rows older than the six-hour relevance
+	 * window are expired with aggregate-only evidence; consumed bodies are kept
+	 * for a short operational interval, then deleted. Recent unread rows remain
+	 * untouched so a failed turn can retry them.
+	 */
+	contextMaintain(
+		now = new Date(),
+		retentionMs = CONVERSATION_CONTEXT_RETENTION_MS,
+	): { expired: number; deleted: number } {
+		if (!Number.isSafeInteger(retentionMs) || retentionMs < CONVERSATION_DIFF_MAX_AGE_MS)
+			throw new Error("context retention must cover the unread relevance window");
+		return this.withTransaction(() => {
+			const at = now.toISOString();
+			const relevanceCutoff = new Date(now.getTime() - CONVERSATION_DIFF_MAX_AGE_MS).toISOString();
+			const groups = this.#database
+				.query<
+					{ origin_key: string; count: number; oldest: string | null; newest: string | null },
+					[string]
+				>(
+					"SELECT origin_key, COUNT(*) AS count, MIN(received_at) AS oldest, MAX(received_at) AS newest FROM conversation_context WHERE consumed_at IS NULL AND received_at < ? GROUP BY origin_key",
+				)
+				.all(relevanceCutoff);
+			let expired = 0;
+			for (const group of groups) {
+				this.#database
+					.query(
+						"UPDATE conversation_context SET consumed_at = ? WHERE origin_key = ? AND consumed_at IS NULL AND received_at < ?",
+					)
+					.run(at, group.origin_key, relevanceCutoff);
+				this.#recordContextOmissions(
+					group.origin_key,
+					{ count: group.count, oldest: group.oldest, newest: group.newest },
+					{ count: 0, oldest: null, newest: null },
+					at,
+				);
+				expired += group.count;
+			}
+			const deleteCutoff = new Date(now.getTime() - retentionMs).toISOString();
+			const deleted = this.#database
+				.query("DELETE FROM conversation_context WHERE consumed_at IS NOT NULL AND received_at < ?")
+				.run(deleteCutoff).changes;
+			return { expired, deleted };
+		});
 	}
 
 	contextUnread(originKey: string, limit = 100): ConversationContextRow[] {
@@ -418,9 +472,16 @@ export class GatewayDatabase {
 				{ message_id: string; author_id: string | null; author_name: string | null; body: string; received_at: string },
 				[string, number]
 			>(
-				"SELECT message_id, author_id, author_name, body, received_at FROM conversation_context WHERE origin_key = ? AND consumed_at IS NULL ORDER BY received_at, message_id LIMIT ?",
+				"SELECT message_id, author_id, author_name, body, received_at FROM conversation_context WHERE origin_key = ? AND consumed_at IS NULL ORDER BY received_at, message_id, rowid LIMIT ?",
 			)
 			.all(originKey, limit);
+	}
+
+	/** When the current session row for this origin was created, if any. */
+	contextSessionCreatedAt(originKey: string): string | undefined {
+		return this.#database
+			.query<{ created_at: string }, [string]>("SELECT created_at FROM sessions WHERE origin_key = ?")
+			.get(originKey)?.created_at;
 	}
 
 	/**
@@ -429,7 +490,7 @@ export class GatewayDatabase {
 	 * turn outcome; omitted rows are consumed immediately so they cannot replay in
 	 * later chunks. Bodies never enter the aggregate diagnostics table.
 	 */
-	contextPrepareWindow(
+	contextWindow(
 		originKey: string,
 		triggerMessageId: string,
 		now = new Date(),
@@ -445,7 +506,11 @@ export class GatewayDatabase {
 				)
 				.get(originKey);
 			const ageFloor = new Date(now.getTime() - maxAgeMs).toISOString();
-			const effectiveFloor = state?.floor_at && state.floor_at > ageFloor ? state.floor_at : ageFloor;
+			const sessionFloor = this.contextSessionCreatedAt(originKey);
+			const effectiveFloor = [ageFloor, sessionFloor, state?.floor_at]
+				.filter((value): value is string => value !== undefined && value !== null)
+				.sort()
+				.at(-1) as string;
 			const expired = this.#contextAggregate(
 				"origin_key = ? AND consumed_at IS NULL AND message_id <> ? AND received_at < ?",
 				[originKey, triggerMessageId, effectiveFloor],
@@ -506,6 +571,16 @@ export class GatewayDatabase {
 			return {
 				rows,
 				selectedMessageIds: rows.map((row) => row.message_id),
+				effectiveFloor,
+				expiredCount: expired.count,
+				truncatedCount: truncated.count,
+				omittedOldestAt:
+					[expired.oldest, truncated.oldest].filter((value): value is string => value !== null).sort()[0] ?? null,
+				omittedNewestAt:
+					[expired.newest, truncated.newest]
+						.filter((value): value is string => value !== null)
+						.sort()
+						.at(-1) ?? null,
 				diagnostics: this.contextDiagnostics(originKey),
 			};
 		});
@@ -623,11 +698,6 @@ export class GatewayDatabase {
 			for (const id of messageIds)
 				this.#database.query("UPDATE conversation_context SET consumed_at = ? WHERE message_id = ?").run(now, id);
 		});
-	}
-
-	contextPrune(maxAgeMs: number): number {
-		const cutoff = new Date(Date.now() - maxAgeMs).toISOString();
-		return this.#database.query("DELETE FROM conversation_context WHERE received_at < ?").run(cutoff).changes;
 	}
 
 	/** Startup recovery: a turn killed mid-flight must not strand its claimed message. */

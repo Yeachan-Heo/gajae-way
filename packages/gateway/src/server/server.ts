@@ -1315,16 +1315,30 @@ async function runInboundTurn(
 	let turnText = userText;
 	let contextMessageIds: readonly string[] = [];
 	if (nonLoopback) {
-		const prepared = options.database.contextPrepareWindow(key, row.message_id);
+		const prepared = options.database.contextWindow(key, row.message_id);
 		const unread = prepared.rows;
 		contextMessageIds = [...prepared.selectedMessageIds, row.message_id];
 		const lines = unread.map(
 			(entry) =>
 				`- [${entry.received_at}] ${entry.author_name ?? "unknown"} (author:${entry.author_id ?? "?"}, msg:${entry.message_id}): ${entry.body.slice(0, 1000)}`,
 		);
+		// Truncation is stated, never silent: a persona that cannot see it was given
+		// a partial view will treat the oldest surviving line as the beginning of the
+		// conversation.
+		const omitted = prepared.expiredCount + prepared.truncatedCount;
+		const omittedRange =
+			prepared.omittedOldestAt && prepared.omittedNewestAt
+				? `; timestamps ${prepared.omittedOldestAt}..${prepared.omittedNewestAt}`
+				: "";
+		const droppedNote =
+			omitted > 0
+				? `[${omitted} older unread message(s) omitted: ${prepared.expiredCount} expired outside floor ${prepared.effectiveFloor}, ${prepared.truncatedCount} truncated by the newest-${prepared.rows.length} window${omittedRange}]\n`
+				: "";
 		const header = lines.length
-			? `[Unread messages in this conversation since your last reply]\n${lines.join("\n")}\n\n`
-			: "";
+			? `[Unread messages in this conversation since your last reply]\n${droppedNote}${lines.join("\n")}\n\n`
+			: droppedNote
+				? `${droppedNote}\n`
+				: "";
 		turnText = `${header}${speaker ? `${composeTurnHeader({ speaker, place, authorId: engagement?.authorId, messageId: row.message_id, engagement })}\n` : ""}${userText}`;
 	}
 	let text: string;
