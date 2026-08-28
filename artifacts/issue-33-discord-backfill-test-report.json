@@ -1,0 +1,20 @@
+{
+  "kind": "api-package-test-report",
+  "issue": 33,
+  "head": "b16e9f1274d4daaef1885f08386a9bc567096479",
+  "commands": [
+    "PATH=/mnt/offloading/.bun/bin:$PATH bun test packages/adapter-discord/test/recovery.test.ts",
+    "PATH=/mnt/offloading/.bun/bin:$PATH bun test packages/adapter-discord",
+    "PATH=/mnt/offloading/.bun/bin:$PATH bun test packages",
+    "PATH=/mnt/offloading/.bun/bin:$PATH bun run build",
+    "PATH=/mnt/offloading/.bun/bin:$PATH bun node_modules/.bin/biome check packages/adapter-discord/src/main.ts packages/adapter-discord/src/recovery.ts packages/adapter-discord/test/recovery.test.ts"
+  ],
+  "results": {
+    "recoveryTest": "15 pass, 0 fail",
+    "adapterTest": "76 pass, 0 fail",
+    "packageTest": "1071 pass, 2 skip, 0 fail",
+    "build": "all five Bun compile targets succeeded",
+    "formatter": "checked 3 files, no fixes applied"
+  },
+  "notes": "The full package run emits an expected session-rebind startup-failure diagnostic from its existing test scenario; the suite completed with zero failing tests."
+}
