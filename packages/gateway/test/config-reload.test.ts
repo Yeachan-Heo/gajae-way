@@ -63,3 +63,13 @@ test("turnTimeoutMs parses when bounded and rejects out-of-range values", () => 
 	expect(() => parseConfigFile({ schemaVersion: 1, turnTimeoutMs: 5_000 })).toThrow("turnTimeoutMs");
 	expect(() => parseConfigFile({ schemaVersion: 1, turnTimeoutMs: "long" })).toThrow("turnTimeoutMs");
 });
+
+test("model accepts an explicit selector or a preset", () => {
+	expect(parseConfigFile({ schemaVersion: 1, model: "openai/gpt-5.2" }).model).toBe("openai/gpt-5.2");
+	expect(parseConfigFile({ schemaVersion: 1, model: { preset: "reliable" } }).model).toEqual({ preset: "reliable" });
+	expect(() => parseConfigFile({ schemaVersion: 1, model: { preset: "" } })).toThrow("model.preset");
+	expect(() => parseConfigFile({ schemaVersion: 1, model: { preset: "reliable", extra: true } })).toThrow(
+		"contain only preset",
+	);
+	expect(() => parseConfigFile({ schemaVersion: 1, model: ["one", "two"] })).toThrow("model must be an object");
+});
