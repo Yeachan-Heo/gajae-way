@@ -1,3 +1,4 @@
+import type { GjcModelSelection } from "../config";
 import type { GatewayDatabase } from "../store/db";
 import {
 	DEFAULT_REBIND_CAP,
@@ -64,6 +65,11 @@ export interface GjcPort {
 	 * silent no-op behind an absent method.
 	 */
 	forgetRebinds(originKey: string): void;
+}
+
+export function gjcModelArgs(model: GjcModelSelection | undefined): readonly string[] {
+	if (!model) return [];
+	return typeof model === "string" ? ["--model", model] : ["--mpreset", model.preset];
 }
 
 /**
@@ -190,7 +196,7 @@ export class GjcClient implements GjcPort {
 	readonly #database: GatewayDatabase;
 	readonly #timeoutMs: number;
 	readonly #cwd: string;
-	readonly #model: string | undefined;
+	readonly #model: GjcModelSelection | undefined;
 	readonly #rebinder: SessionRebinder;
 	readonly #spawn: SpawnFn;
 
@@ -200,7 +206,7 @@ export class GjcClient implements GjcPort {
 		database: GatewayDatabase,
 		timeoutMs = 300_000,
 		cwd = process.cwd(),
-		model?: string,
+		model?: GjcModelSelection,
 		deps: {
 			/** Rebinds allowed per session/origin before the gateway fails loudly. */
 			readonly rebindCap?: number;
@@ -471,7 +477,7 @@ export class GjcClient implements GjcPort {
 				"--mode",
 				"json",
 				...(options?.codingRegister ? [] : ["--system-prompt", GENERIC_AGENT_SYSTEM_PROMPT]),
-				...(this.#model ? ["--model", this.#model] : []),
+				...gjcModelArgs(this.#model),
 				...(systemPreamble ? ["--append-system-prompt", systemPreamble] : []),
 				text,
 			],

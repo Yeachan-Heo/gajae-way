@@ -2,6 +2,7 @@ import { expect, test } from "bun:test";
 import { mkdtemp, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { ENGAGEMENT_GATES } from "../src/config";
 import { checkConfigFile, configCheckExitCode, defaultConfigPath, renderConfigCheck } from "../src/config-check";
 
 async function configFile(body: string): Promise<string> {
@@ -29,11 +30,13 @@ test("a bootable config reports open and mention-only channel counts", async () 
 	expect(renderConfigCheck(result)[1]).toContain("open 1, mention-only 1");
 });
 
-test('engagement "closed" is rejected before a restart can strand the host', async () => {
-	// The exact live break: mention-only was spelled as a value instead of an
-	// omitted field, so the gateway exited 1 on boot while the adapter stayed up.
+test("an unknown engagement gate is rejected before a restart can strand the host", async () => {
+	// The exact live break: an invalid gate value must fail the offline preflight
+	// instead of the gateway exiting 1 on boot while the adapter stayed up.
+	// (#31 made "closed" and "open-mention-only" valid gates; only unknown
+	// values are rejected.)
 	const path = await configFile(
-		JSON.stringify({ schemaVersion: 1, channels: { "1508664765415690340": { engagement: "closed" } } }),
+		JSON.stringify({ schemaVersion: 1, channels: { "1508664765415690340": { engagement: "mention-only" } } }),
 	);
 	const result = await checkConfigFile(path);
 	expect(result.ok).toBe(false);
@@ -42,6 +45,16 @@ test('engagement "closed" is rejected before a restart can strand the host', asy
 	expect(result.message).toContain("engagement");
 	expect(configCheckExitCode(result)).toBe(1);
 	expect(renderConfigCheck(result)[0]).toStartWith("FAIL ");
+});
+
+test("every defined engagement gate passes the offline preflight", async () => {
+	for (const gate of ENGAGEMENT_GATES) {
+		const path = await configFile(
+			JSON.stringify({ schemaVersion: 1, channels: { "1508664765415690340": { engagement: gate } } }),
+		);
+		const result = await checkConfigFile(path);
+		expect(result.ok, `gate ${gate}`).toBe(true);
+	}
 });
 
 test("an out-of-range debounce is rejected", async () => {

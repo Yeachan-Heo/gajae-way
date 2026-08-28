@@ -123,7 +123,7 @@ Run the Discord and Telegram binaries as separate managed services after the gat
 ## Troubleshooting
 
 - **Socket missing:** verify the gateway service, configured socket path, parent permissions, and service log.
-- **Every turn fails with an API error:** confirm `gjc` is on the service `PATH` and its model-key environment variables are present. A poisoned conversation session can be rebound with `/new`.
+- **Every turn fails with an API error:** confirm `gjc` is on the service `PATH` and its model-key environment variables are present. If the log says a model was not found, use an explicit selector (`"model": "provider/model"`) or activate a gjc profile (`"model": { "preset": "profile-name" }`); profile default-role arrays retain gjc's native fallback-chain handling. A poisoned conversation session can be rebound with `/new`.
 - **launchd hangs:** move the working directory, state, `gjc`, and symlink targets out of TCC-protected paths; then send `/new` to sessions created under the old location.
 - **Webhook or monitor failure:** verify the gateway configuration and use `gajaeway monitors inspect <monitor-id>`.
 - **Recovery or restore:** use the [operator runbook](runbooks/gajaeway-v1.md), especially its backup, restore, crash-recovery, and schema guidance.

@@ -1,7 +1,13 @@
 import { expect, test } from "bun:test";
-import { GjcTurnStream } from "../src/orchestrator/gjc-client";
+import { GjcTurnStream, gjcModelArgs } from "../src/orchestrator/gjc-client";
 
 const line = (value: unknown) => `${JSON.stringify(value)}\n`;
+
+test("maps explicit models and presets to distinct gjc flags", () => {
+	expect(gjcModelArgs(undefined)).toEqual([]);
+	expect(gjcModelArgs("openai/gpt-5.2")).toEqual(["--model", "openai/gpt-5.2"]);
+	expect(gjcModelArgs({ preset: "reliable" })).toEqual(["--mpreset", "reliable"]);
+});
 
 test("counts tool executions and captures the final assistant text across chunk splits", () => {
 	const stream = new GjcTurnStream();
