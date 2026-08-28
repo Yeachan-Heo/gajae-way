@@ -1,7 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import type { EngagementContext } from "@gajaeway/protocol";
 import type { GatewayConfig } from "../src/config";
-import { CONFIG_SCHEMA_VERSION as SCHEMA, ENGAGEMENT_GATES } from "../src/config";
+import { ENGAGEMENT_GATES, CONFIG_SCHEMA_VERSION as SCHEMA } from "../src/config";
 import { decideEngagement } from "../src/engagement/policy";
 
 const OWNER = "660473980301344768";
