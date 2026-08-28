@@ -20,6 +20,18 @@ export interface GatewayStatusResult {
 	readonly sessions: { readonly active: number };
 	/** Delivery ledger health (P1+). */
 	readonly delivery?: { readonly pending: number; readonly oldestPendingAgeMs: number | null };
+	/** Aggregate-only conversation diff health; never includes message bodies. */
+	readonly contextDiff?: ConversationContextDiagnostics;
+}
+
+export interface ConversationContextDiagnostics {
+	readonly unread: number;
+	readonly expired: number;
+	readonly truncated: number;
+	readonly omittedOldestAt: string | null;
+	readonly omittedNewestAt: string | null;
+	/** Durable reset floor for a specific origin; null on aggregate projections. */
+	readonly floorAt: string | null;
 }
 
 /**
@@ -85,6 +97,10 @@ export interface EngagementContext {
 export interface ChatSendParams {
 	readonly origin: OriginRef;
 	readonly text: string;
+	/** Stable platform message id for idempotent live/backfill ingestion. */
+	readonly messageId?: string;
+	/** Platform event time, when available; ordering and age policy use this value. */
+	readonly receivedAt?: string;
 	/** Required for non-loopback origins; the gateway applies engagement policy. */
 	readonly engagement?: EngagementContext;
 }
@@ -419,6 +435,8 @@ export interface CycleSessionView {
 	readonly unsettledDeliveries: number;
 	/** Oldest unsettled delivery age in ms, null when none are unsettled. */
 	readonly oldestUnsettledAgeMs: number | null;
+	/** Per-origin unread/omission diagnostics; never includes message bodies. */
+	readonly contextDiff: ConversationContextDiagnostics;
 }
 
 export interface OpsCycleResult {
@@ -457,6 +475,8 @@ export interface OpsCycleResult {
 	readonly inFlightInbound: number;
 	/** Durable inbound messages still awaiting their turn, across ALL origins. */
 	readonly pendingInbound: number;
+	/** Aggregate unread/omission diagnostics across origins. */
+	readonly contextDiff: ConversationContextDiagnostics;
 }
 
 /** Verb catalog: verb name -> { params, result } (documentation-level typing). */

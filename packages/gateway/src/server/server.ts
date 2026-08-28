@@ -516,6 +516,7 @@ async function handleRequest(
 					schemaVersion: options.database.schemaVersion,
 					sessions: { active: options.database.activeSessionCount },
 					delivery: runtime.delivery.status(),
+					contextDiff: options.database.contextDiagnostics(),
 				},
 			});
 			return;
@@ -1062,6 +1063,7 @@ async function sendChat(
 				origin?: unknown;
 				text?: unknown;
 				messageId?: unknown;
+				receivedAt?: unknown;
 				engagement?: { mentioned?: unknown; group?: unknown; authorId?: unknown };
 		  }
 		| undefined;
@@ -1095,7 +1097,11 @@ async function sendChat(
 			});
 			return;
 		}
-		options.database.withTransaction(() => options.database.bumpEpoch(key, JSON.stringify(origin)));
+		const floorAt = new Date().toISOString();
+		options.database.withTransaction(() => {
+			options.database.bumpEpoch(key, JSON.stringify(origin));
+			options.database.contextSetFloor(key, floorAt);
+		});
 		// An explicit reset is the manual form of a rebind, so it also restores the
 		// automatic rebind budget: otherwise an origin that spent its cap would stay
 		// capped even after the operator did exactly what the notice asked for.
@@ -1139,6 +1145,7 @@ async function sendChat(
 		throw new ProtocolError("invalid_params", "non-loopback chat.send requires engagement");
 	const engaged = decideEngagement(origin, params.engagement as never, runtime.config).engaged;
 	const inboundMessageId = typeof params.messageId === "string" && params.messageId ? params.messageId : undefined;
+	const receivedAt = parseReceivedAt(params.receivedAt);
 	// Declined messages are still context, never commands (protocol contract): every
 	// platform message lands in the conversation-context ledger so the next engaged
 	// turn reads the full unread diff since the persona's last reply.
@@ -1150,6 +1157,7 @@ async function sendChat(
 			authorId: typeof engagement?.authorId === "string" ? engagement.authorId : undefined,
 			authorName: typeof engagement?.authorName === "string" ? engagement.authorName : undefined,
 			body: userText,
+			...(receivedAt ? { receivedAt } : {}),
 		});
 	}
 	if (!engaged) {
@@ -1172,6 +1180,7 @@ async function sendChat(
 		originRefJson: JSON.stringify(origin),
 		body: userText,
 		engagementJson: params.engagement ? JSON.stringify(params.engagement) : undefined,
+		...(receivedAt ? { receivedAt } : {}),
 	});
 	if (!accepted) {
 		// Duplicate message id: already accepted once, so acknowledge without dispatching.
@@ -1251,6 +1260,15 @@ function debounceFor(row: InboundMessageRow, config: GatewayServerOptions["confi
 		(origin.platform === "discord" ? config.channels?.[origin.conversationId ?? ""] : undefined);
 	return channel?.debounceMs ?? config.debounceMs ?? 0;
 }
+
+function parseReceivedAt(value: unknown): string | undefined {
+	if (value === undefined) return undefined;
+	if (typeof value !== "string" || !value)
+		throw new ProtocolError("invalid_params", "receivedAt must be an ISO timestamp");
+	const timestamp = Date.parse(value);
+	if (!Number.isFinite(timestamp)) throw new ProtocolError("invalid_params", "receivedAt must be an ISO timestamp");
+	return new Date(timestamp).toISOString();
+}
 async function runInboundTurn(
 	batch: readonly InboundMessageRow[],
 	fallback: Connection,
@@ -1295,8 +1313,11 @@ async function runInboundTurn(
 	// last reply (the read-cursor diff), then the triggering message with speaker
 	// attribution — so the persona always reads "the messages above".
 	let turnText = userText;
+	let contextMessageIds: readonly string[] = [];
 	if (nonLoopback) {
-		const unread = options.database.contextUnread(key, 100).filter((entry) => entry.message_id !== row.message_id);
+		const prepared = options.database.contextPrepareWindow(key, row.message_id);
+		const unread = prepared.rows;
+		contextMessageIds = [...prepared.selectedMessageIds, row.message_id];
 		const lines = unread.map(
 			(entry) =>
 				`- [${entry.received_at}] ${entry.author_name ?? "unknown"} (author:${entry.author_id ?? "?"}, msg:${entry.message_id}): ${entry.body.slice(0, 1000)}`,
@@ -1305,7 +1326,6 @@ async function runInboundTurn(
 			? `[Unread messages in this conversation since your last reply]\n${lines.join("\n")}\n\n`
 			: "";
 		turnText = `${header}${speaker ? `${composeTurnHeader({ speaker, place, authorId: engagement?.authorId, messageId: row.message_id, engagement })}\n` : ""}${userText}`;
-		options.database.contextConsume([...unread.map((entry) => entry.message_id), row.message_id]);
 	}
 	let text: string;
 	// Human-sized chat: the persona may split one message into several short parts
@@ -1315,6 +1335,7 @@ async function runInboundTurn(
 	// exit, so a multi-minute turn talks while it works (live gajaeway-play
 	// finding: turns showed nothing but "working…" until the very end).
 	const deliveredParts: string[] = [];
+	let assistantDeliveryStarted = false;
 	let reactionTokensSeen = false;
 	const maxTurnParts = 10;
 	const deliverAssistantText = (rawMessage: string) => {
@@ -1351,6 +1372,7 @@ async function runInboundTurn(
 					);
 					continue;
 				}
+				assistantDeliveryStarted = true;
 				broadcastDelivery(
 					runtime,
 					runtime.delivery.prepareReaction(crypto.randomUUID(), origin, {
@@ -1378,6 +1400,7 @@ async function runInboundTurn(
 			const payload = runtime.delivery.prepare(crypto.randomUUID(), origin, body, replyMatch?.[1]);
 			if (!payload) continue;
 			deliveredParts.push(body);
+			assistantDeliveryStarted = true;
 			broadcastDelivery(runtime, payload);
 		}
 	};
@@ -1433,6 +1456,7 @@ async function runInboundTurn(
 	};
 	try {
 		text = await runTurn();
+		if (nonLoopback) options.database.contextConsume(contextMessageIds);
 	} catch (error) {
 		// A prose-only "session not found" failure (gjc emits no structured code
 		// for it) is deliberately NOT auto-rebound: #13 mandates exact-code-only
@@ -1450,7 +1474,11 @@ async function runInboundTurn(
 		// failure stays in the daemon log only.
 		const failureNotice = formatFailureNotice(error);
 		console.error(failureNotice);
-		if (nonLoopback && deliveredParts.length === 0) {
+		// A runtime failure before any assistant delivery leaves selected context
+		// unread for retry. Once a real text/reaction delivery has started, retrying
+		// the same window could duplicate an answer, so that window is consumed.
+		if (nonLoopback && assistantDeliveryStarted) options.database.contextConsume(contextMessageIds);
+		if (nonLoopback && !assistantDeliveryStarted) {
 			const notice = runtime.delivery.prepare(turnId, origin, failureNotice);
 			if (notice) {
 				runtime.delivery.markInflight(notice.deliveryId as string);

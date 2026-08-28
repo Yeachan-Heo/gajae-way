@@ -16,6 +16,7 @@ export interface GatewayClientLike {
 
 export interface TelegramMessage extends TelegramMessageOriginShape {
 	readonly message_id: number;
+	readonly date?: number;
 	readonly text?: string;
 	readonly reply_to_message?: TelegramReplyMessageShape;
 }
@@ -240,7 +241,13 @@ export class TelegramAdapter {
 			origin.kind !== "dm" && this.config.chats?.[origin.parentId ?? origin.conversationId]?.engagement === "open"
 				? { ...baseEngagement, mentioned: true }
 				: baseEngagement;
-		await gateway.request("chat.send", { origin, text: message.text, engagement });
+		await gateway.request("chat.send", {
+			origin,
+			text: message.text,
+			engagement,
+			messageId: String(message.message_id),
+			...(typeof message.date === "number" ? { receivedAt: new Date(message.date * 1000).toISOString() } : {}),
+		});
 		return true;
 	}
 }

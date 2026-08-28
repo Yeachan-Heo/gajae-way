@@ -11,7 +11,34 @@ export interface InboundMessageRow {
 	readonly received_at: string;
 }
 
-const LATEST_SCHEMA_VERSION = 12;
+const LATEST_SCHEMA_VERSION = 13;
+/** Maximum number of prior messages supplied to one engaged conversation turn. */
+export const CONVERSATION_DIFF_MAX_ROWS = 40;
+/** Maximum age of prior messages supplied to one engaged conversation turn. */
+export const CONVERSATION_DIFF_MAX_AGE_MS = 6 * 60 * 60 * 1000;
+
+export interface ConversationContextRow {
+	readonly message_id: string;
+	readonly author_id: string | null;
+	readonly author_name: string | null;
+	readonly body: string;
+	readonly received_at: string;
+}
+
+export interface ConversationContextDiagnostics {
+	readonly unread: number;
+	readonly expired: number;
+	readonly truncated: number;
+	readonly omittedOldestAt: string | null;
+	readonly omittedNewestAt: string | null;
+	readonly floorAt: string | null;
+}
+
+export interface ConversationContextWindow {
+	readonly rows: readonly ConversationContextRow[];
+	readonly selectedMessageIds: readonly string[];
+	readonly diagnostics: ConversationContextDiagnostics;
+}
 /** A scheduled cron slot the gateway claimed or fired for one monitor. */
 export interface MonitorSlotRow {
 	readonly monitor_id: string;
@@ -324,6 +351,7 @@ export class GatewayDatabase {
 		originRefJson: string;
 		body: string;
 		engagementJson?: string;
+		receivedAt?: string;
 	}): boolean {
 		const changes = this.#database
 			.query(
@@ -335,7 +363,7 @@ export class GatewayDatabase {
 				row.originRefJson,
 				row.body,
 				row.engagementJson ?? null,
-				new Date().toISOString(),
+				row.receivedAt ?? new Date().toISOString(),
 			);
 		return changes.changes > 0;
 	}
@@ -368,6 +396,7 @@ export class GatewayDatabase {
 		authorId?: string;
 		authorName?: string;
 		body: string;
+		receivedAt?: string;
 	}): void {
 		this.#database
 			.query(
@@ -379,20 +408,11 @@ export class GatewayDatabase {
 				row.authorId ?? null,
 				row.authorName ?? null,
 				row.body,
-				new Date().toISOString(),
+				row.receivedAt ?? new Date().toISOString(),
 			);
 	}
 
-	contextUnread(
-		originKey: string,
-		limit = 100,
-	): Array<{
-		message_id: string;
-		author_id: string | null;
-		author_name: string | null;
-		body: string;
-		received_at: string;
-	}> {
+	contextUnread(originKey: string, limit = 100): ConversationContextRow[] {
 		return this.#database
 			.query<
 				{ message_id: string; author_id: string | null; author_name: string | null; body: string; received_at: string },
@@ -401,6 +421,199 @@ export class GatewayDatabase {
 				"SELECT message_id, author_id, author_name, body, received_at FROM conversation_context WHERE origin_key = ? AND consumed_at IS NULL ORDER BY received_at, message_id LIMIT ?",
 			)
 			.all(originKey, limit);
+	}
+
+	/**
+	 * Atomically prepares the newest bounded unread diff and expires everything
+	 * outside it. Selected rows remain unread until the caller proves a terminal
+	 * turn outcome; omitted rows are consumed immediately so they cannot replay in
+	 * later chunks. Bodies never enter the aggregate diagnostics table.
+	 */
+	contextPrepareWindow(
+		originKey: string,
+		triggerMessageId: string,
+		now = new Date(),
+		limit = CONVERSATION_DIFF_MAX_ROWS,
+		maxAgeMs = CONVERSATION_DIFF_MAX_AGE_MS,
+	): ConversationContextWindow {
+		if (!Number.isSafeInteger(limit) || limit < 1) throw new Error("context window limit must be positive");
+		if (!Number.isSafeInteger(maxAgeMs) || maxAgeMs < 0) throw new Error("context max age must be non-negative");
+		return this.withTransaction(() => {
+			const state = this.#database
+				.query<{ floor_at: string | null }, [string]>(
+					"SELECT floor_at FROM conversation_context_state WHERE origin_key = ?",
+				)
+				.get(originKey);
+			const ageFloor = new Date(now.getTime() - maxAgeMs).toISOString();
+			const effectiveFloor = state?.floor_at && state.floor_at > ageFloor ? state.floor_at : ageFloor;
+			const expired = this.#contextAggregate(
+				"origin_key = ? AND consumed_at IS NULL AND message_id <> ? AND received_at < ?",
+				[originKey, triggerMessageId, effectiveFloor],
+			);
+			if (expired.count > 0) {
+				this.#database
+					.query(
+						"UPDATE conversation_context SET consumed_at = ? WHERE origin_key = ? AND consumed_at IS NULL AND message_id <> ? AND received_at < ?",
+					)
+					.run(now.toISOString(), originKey, triggerMessageId, effectiveFloor);
+			}
+
+			const newest = this.#database
+				.query<ConversationContextRow & { row_id: number }, [string, string, string, number]>(
+					"SELECT rowid AS row_id, message_id, author_id, author_name, body, received_at FROM conversation_context WHERE origin_key = ? AND consumed_at IS NULL AND message_id <> ? AND received_at >= ? ORDER BY received_at DESC, message_id DESC, rowid DESC LIMIT ?",
+				)
+				.all(originKey, triggerMessageId, effectiveFloor, limit);
+			const boundary = newest[newest.length - 1];
+			const truncated = boundary
+				? this.#contextAggregate(
+						"origin_key = ? AND consumed_at IS NULL AND message_id <> ? AND received_at >= ? AND (received_at < ? OR (received_at = ? AND message_id < ?) OR (received_at = ? AND message_id = ? AND rowid < ?))",
+						[
+							originKey,
+							triggerMessageId,
+							effectiveFloor,
+							boundary.received_at,
+							boundary.received_at,
+							boundary.message_id,
+							boundary.received_at,
+							boundary.message_id,
+							boundary.row_id,
+						],
+					)
+				: { count: 0, oldest: null, newest: null };
+			if (boundary && truncated.count > 0) {
+				this.#database
+					.query(
+						"UPDATE conversation_context SET consumed_at = ? WHERE origin_key = ? AND consumed_at IS NULL AND message_id <> ? AND received_at >= ? AND (received_at < ? OR (received_at = ? AND message_id < ?) OR (received_at = ? AND message_id = ? AND rowid < ?))",
+					)
+					.run(
+						now.toISOString(),
+						originKey,
+						triggerMessageId,
+						effectiveFloor,
+						boundary.received_at,
+						boundary.received_at,
+						boundary.message_id,
+						boundary.received_at,
+						boundary.message_id,
+						boundary.row_id,
+					);
+			}
+			this.#recordContextOmissions(originKey, expired, truncated, now.toISOString());
+			const rows = newest
+				.slice()
+				.reverse()
+				.map(({ row_id: _rowId, ...row }) => row);
+			return {
+				rows,
+				selectedMessageIds: rows.map((row) => row.message_id),
+				diagnostics: this.contextDiagnostics(originKey),
+			};
+		});
+	}
+
+	/** Establishes a durable reset floor and expires every pre-floor unread row. */
+	contextSetFloor(originKey: string, floorAt = new Date().toISOString()): void {
+		const expired = this.#contextAggregate("origin_key = ? AND consumed_at IS NULL AND received_at < ?", [
+			originKey,
+			floorAt,
+		]);
+		if (expired.count > 0)
+			this.#database
+				.query(
+					"UPDATE conversation_context SET consumed_at = ? WHERE origin_key = ? AND consumed_at IS NULL AND received_at < ?",
+				)
+				.run(floorAt, originKey, floorAt);
+		this.#database
+			.query(
+				"INSERT INTO conversation_context_state (origin_key, floor_at, expired_count, truncated_count, omitted_oldest_at, omitted_newest_at, last_omitted_at) VALUES (?, ?, ?, 0, ?, ?, ?) ON CONFLICT(origin_key) DO UPDATE SET floor_at = excluded.floor_at, expired_count = conversation_context_state.expired_count + excluded.expired_count, omitted_oldest_at = CASE WHEN conversation_context_state.omitted_oldest_at IS NULL OR excluded.omitted_oldest_at < conversation_context_state.omitted_oldest_at THEN excluded.omitted_oldest_at ELSE conversation_context_state.omitted_oldest_at END, omitted_newest_at = CASE WHEN conversation_context_state.omitted_newest_at IS NULL OR excluded.omitted_newest_at > conversation_context_state.omitted_newest_at THEN excluded.omitted_newest_at ELSE conversation_context_state.omitted_newest_at END, last_omitted_at = CASE WHEN excluded.expired_count > 0 THEN excluded.last_omitted_at ELSE conversation_context_state.last_omitted_at END",
+			)
+			.run(originKey, floorAt, expired.count, expired.oldest, expired.newest, floorAt);
+	}
+
+	contextDiagnostics(originKey?: string): ConversationContextDiagnostics {
+		const unread = originKey
+			? (this.#database
+					.query<{ n: number }, [string]>(
+						"SELECT COUNT(*) AS n FROM conversation_context WHERE origin_key = ? AND consumed_at IS NULL",
+					)
+					.get(originKey)?.n ?? 0)
+			: (this.#database
+					.query<{ n: number }, []>("SELECT COUNT(*) AS n FROM conversation_context WHERE consumed_at IS NULL")
+					.get()?.n ?? 0);
+		const state = originKey
+			? this.#database
+					.query<
+						{
+							expired: number;
+							truncated: number;
+							oldest: string | null;
+							newest: string | null;
+							floor: string | null;
+						},
+						[string]
+					>(
+						"SELECT expired_count AS expired, truncated_count AS truncated, omitted_oldest_at AS oldest, omitted_newest_at AS newest, floor_at AS floor FROM conversation_context_state WHERE origin_key = ?",
+					)
+					.get(originKey)
+			: this.#database
+					.query<{ expired: number; truncated: number; oldest: string | null; newest: string | null; floor: null }, []>(
+						"SELECT COALESCE(SUM(expired_count), 0) AS expired, COALESCE(SUM(truncated_count), 0) AS truncated, MIN(omitted_oldest_at) AS oldest, MAX(omitted_newest_at) AS newest, NULL AS floor FROM conversation_context_state",
+					)
+					.get();
+		return {
+			unread,
+			expired: state?.expired ?? 0,
+			truncated: state?.truncated ?? 0,
+			omittedOldestAt: state?.oldest ?? null,
+			omittedNewestAt: state?.newest ?? null,
+			floorAt: state?.floor ?? null,
+		};
+	}
+
+	contextDiagnosticsByOrigin(): Map<string, ConversationContextDiagnostics> {
+		const origins = this.#database
+			.query<{ origin_key: string }, []>(
+				"SELECT origin_key FROM conversation_context UNION SELECT origin_key FROM conversation_context_state",
+			)
+			.all();
+		return new Map(origins.map((row) => [row.origin_key, this.contextDiagnostics(row.origin_key)]));
+	}
+
+	#contextAggregate(
+		where: string,
+		params: readonly (string | number)[],
+	): {
+		count: number;
+		oldest: string | null;
+		newest: string | null;
+	} {
+		const row = this.#database
+			.query<{ count: number; oldest: string | null; newest: string | null }, (string | number)[]>(
+				`SELECT COUNT(*) AS count, MIN(received_at) AS oldest, MAX(received_at) AS newest FROM conversation_context WHERE ${where}`,
+			)
+			.get(...params);
+		return row ?? { count: 0, oldest: null, newest: null };
+	}
+
+	#recordContextOmissions(
+		originKey: string,
+		expired: { count: number; oldest: string | null; newest: string | null },
+		truncated: { count: number; oldest: string | null; newest: string | null },
+		at: string,
+	): void {
+		if (expired.count === 0 && truncated.count === 0) return;
+		const oldest =
+			[expired.oldest, truncated.oldest].filter((value): value is string => value !== null).sort()[0] ?? null;
+		const newest =
+			[expired.newest, truncated.newest]
+				.filter((value): value is string => value !== null)
+				.sort()
+				.at(-1) ?? null;
+		this.#database
+			.query(
+				"INSERT INTO conversation_context_state (origin_key, floor_at, expired_count, truncated_count, omitted_oldest_at, omitted_newest_at, last_omitted_at) VALUES (?, NULL, ?, ?, ?, ?, ?) ON CONFLICT(origin_key) DO UPDATE SET expired_count = conversation_context_state.expired_count + excluded.expired_count, truncated_count = conversation_context_state.truncated_count + excluded.truncated_count, omitted_oldest_at = CASE WHEN conversation_context_state.omitted_oldest_at IS NULL OR excluded.omitted_oldest_at < conversation_context_state.omitted_oldest_at THEN excluded.omitted_oldest_at ELSE conversation_context_state.omitted_oldest_at END, omitted_newest_at = CASE WHEN conversation_context_state.omitted_newest_at IS NULL OR excluded.omitted_newest_at > conversation_context_state.omitted_newest_at THEN excluded.omitted_newest_at ELSE conversation_context_state.omitted_newest_at END, last_omitted_at = excluded.last_omitted_at",
+			)
+			.run(originKey, expired.count, truncated.count, oldest, newest, at);
 	}
 
 	contextConsume(messageIds: readonly string[]): void {
@@ -1232,6 +1445,19 @@ ALTER TABLE monitor_slots ADD COLUMN event_id TEXT;`,
 				this.#database
 					.query("INSERT INTO schema_migrations (version, applied_at) VALUES (?, ?)")
 					.run(12, new Date().toISOString());
+			});
+		}
+		if (current < 13) {
+			this.withTransaction(() => {
+				// Issue #35: durable reset floors plus aggregate-only omission evidence.
+				// Existing context rows remain intact and unread until the bounded policy
+				// classifies them; lane jobs, monitor tables, and meta counters are untouched.
+				this.#database.exec(
+					"CREATE TABLE IF NOT EXISTS conversation_context_state (origin_key TEXT PRIMARY KEY, floor_at TEXT, expired_count INTEGER NOT NULL DEFAULT 0, truncated_count INTEGER NOT NULL DEFAULT 0, omitted_oldest_at TEXT, omitted_newest_at TEXT, last_omitted_at TEXT)",
+				);
+				this.#database
+					.query("INSERT INTO schema_migrations (version, applied_at) VALUES (?, ?)")
+					.run(13, new Date().toISOString());
 			});
 		}
 	}

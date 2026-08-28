@@ -276,6 +276,10 @@ function statusRow(
 		: delivery.pending === 0
 			? "deliveries clear"
 			: `${pluralise(delivery.pending, "delivery", "deliveries")} pending · oldest ${formatDuration(delivery.oldestPendingAgeMs ?? 0)}`;
+	const context = status?.contextDiff;
+	const contextLabel = !context
+		? "conversation diff not reported"
+		: `${formatCount(context.unread)} unread · ${formatCount(context.expired)} expired · ${formatCount(context.truncated)} truncated`;
 
 	return {
 		key: "status",
@@ -291,6 +295,7 @@ function statusRow(
 			working: working === 0 ? "idle" : `${formatCount(working)} working`,
 			attention: attention.length === 0 ? "nothing needs you" : `⚠ ${pluralise(attention.length, "item")} needs you`,
 			delivery: deliveryLabel,
+			context: contextLabel,
 			profile: status ? `profile ${status.profileVersion}` : (statusError ?? "no answer from the socket"),
 			stream: `data ${formatClockSeconds(now)}`,
 		},
@@ -298,6 +303,7 @@ function statusRow(
 			alive: status ? "ok" : "danger",
 			attention: attention.length === 0 ? "muted" : danger ? "danger" : "warn",
 			delivery: !delivery ? "muted" : delivery.pending === 0 ? "ok" : "warn",
+			context: !context ? "muted" : context.unread > 0 || context.expired > 0 || context.truncated > 0 ? "warn" : "ok",
 			working: working === 0 ? "muted" : "active",
 		},
 	};

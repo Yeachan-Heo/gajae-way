@@ -104,6 +104,7 @@ test("deduplicates update ids durably before sending an inbound turn", async () 
 		expect(requests[0]?.params).toEqual({
 			origin: { platform: "telegram", kind: "topic", conversationId: "-100123.99", parentId: "-100123" },
 			text: "hello @agent",
+			messageId: "7",
 			engagement: { mentioned: true, group: true, authorId: "42" },
 		});
 	} finally {
