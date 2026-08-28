@@ -1,6 +1,6 @@
 import type { Dirent } from "node:fs";
 import { lstat, readdir, readFile, realpath, stat } from "node:fs/promises";
-import { basename, isAbsolute, join, relative, resolve, sep } from "node:path";
+import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { type OriginRef, originKey, validateOriginRef } from "@gajaeway/protocol";
 import type { GatewayConfig } from "../config";
 import { redactSecrets } from "../orchestrator/rebind";
@@ -108,15 +108,6 @@ function publicApproved(text: string): boolean {
 	return /^\s*(?:[-*]\s*)?bootstrap-(?:visibility|safe)\s*:\s*(?:public|true)\s*$/im.test(text);
 }
 
-function navigationOnly(text: string): string {
-	return text
-		.split(/\r?\n/)
-		.filter((line) => /^\s{0,3}(?:#{1,6}\s+|[-*]\s+\[[^\]]+\]\([^)]+\.md(?:#[^)]+)?\)\s*$)/.test(line))
-		.map(cleanLine)
-		.filter(Boolean)
-		.join("\n");
-}
-
 function dailyEntries(text: string, key: string): string {
 	return text
 		.split(/(?=^##\s+)/m)
@@ -153,6 +144,44 @@ async function readSection(
 	const body = transform(await readFile(target, "utf8")).trim();
 	if (!body) throw new Error("no_safe_content");
 	return { name, path: relativePath.replaceAll("\\", "/"), freshness: info.mtime.toISOString(), body };
+}
+
+async function readNavigationSection(
+	root: string,
+	relativePath: string,
+	name: string,
+	allowed: readonly string[],
+): Promise<{ readonly section: SourceSection; readonly rejected: number }> {
+	const target = await confinedFile(root, relativePath, allowed);
+	const info = await stat(target);
+	if (info.size > MAX_SOURCE_BYTES) throw new Error("source_too_large");
+	const text = await readFile(target, "utf8");
+	const body = text
+		.split(/\r?\n/)
+		.filter((line) => /^\s{0,3}#{1,6}\s+/.test(line))
+		.map((line) => boundedLine(line, 200));
+	let rejected = 0;
+	for (const match of text.matchAll(/\[([^\]\r\n]+)\]\(([^)#]+\.md)(?:#[^)]+)?\)/g)) {
+		try {
+			const pointer = decodeURIComponent(match[2] ?? "").replaceAll("\\", "/");
+			if (isAbsolute(pointer)) throw new Error("absolute_or_empty_path");
+			const path = join(dirname(relativePath), pointer).replaceAll("\\", "/");
+			await confinedFile(root, path, allowed);
+			body.push(`- [${boundedLine(match[1] ?? "memory", 120)}](${path})`);
+		} catch {
+			rejected++;
+		}
+	}
+	if (body.length === 0) throw new Error("no_safe_content");
+	return {
+		section: {
+			name,
+			path: relativePath.replaceAll("\\", "/"),
+			freshness: info.mtime.toISOString(),
+			body: body.join("\n"),
+		},
+		rejected,
+	};
 }
 
 async function markdownFiles(root: string, directory: string, allowed: readonly string[]): Promise<string[]> {
@@ -300,21 +329,20 @@ export async function buildSessionBootstrap(input: {
 			if (eligibleLinks.size < safeLinks.size)
 				diagnostics.push(`public MEMORY links omitted: ${safeLinks.size - eligibleLinks.size}`);
 		}
-		const body = mapText
+		const headings = mapText
 			.split(/\r?\n/)
-			.filter((line) => {
-				if (/^\s{0,3}#{1,6}\s+/.test(line)) return true;
-				const match = line.match(/\]\(([^)#]+\.md)(?:#[^)]+)?\)/);
-				if (!match) return false;
-				try {
-					return eligibleLinks.has(decodeURIComponent(match[1] ?? "").replaceAll("\\", "/"));
-				} catch {
-					return false;
-				}
-			})
-			.map(cleanLine)
-			.filter(Boolean)
-			.join("\n");
+			.filter((line) => /^\s{0,3}#{1,6}\s+/.test(line))
+			.map((line) => boundedLine(line, 200));
+		const pointers: string[] = [];
+		for (const match of mapText.matchAll(/\[([^\]\r\n]+)\]\(([^)#]+\.md)(?:#[^)]+)?\)/g)) {
+			try {
+				const path = decodeURIComponent(match[2] ?? "").replaceAll("\\", "/");
+				if (eligibleLinks.has(path)) pointers.push(`- [${boundedLine(match[1] ?? "memory", 120)}](${path})`);
+			} catch {
+				diagnostics.push("MEMORY link rejected: malformed_percent_escape");
+			}
+		}
+		const body = [...headings, ...pointers].join("\n");
 		if (!body) throw new Error("no_safe_content");
 		candidates.push({ name: "Memory navigation map", path: "MEMORY.md", freshness: mapInfo.mtime.toISOString(), body });
 	} catch (error) {
@@ -361,15 +389,14 @@ export async function buildSessionBootstrap(input: {
 	}
 
 	try {
-		candidates.push(
-			await readSection(
-				resolved.memory,
-				"ops/rules/index.md",
-				"Operating rules index",
-				resolved.allowed,
-				navigationOnly,
-			),
+		const rules = await readNavigationSection(
+			resolved.memory,
+			"ops/rules/index.md",
+			"Operating rules index",
+			resolved.allowed,
 		);
+		candidates.push(rules.section);
+		if (rules.rejected > 0) diagnostics.push(`ops/rules/index.md links rejected: ${rules.rejected}`);
 	} catch (error) {
 		diagnostics.push(`ops/rules/index.md: ${diagnosticCode(error)}`);
 	}

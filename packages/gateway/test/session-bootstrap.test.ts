@@ -130,6 +130,35 @@ describe("session bootstrap builder", () => {
 		);
 	});
 
+	test("a safe first MEMORY link cannot smuggle a trailing private link on the same line", async () => {
+		const config = await setup();
+		await writeFile(
+			join(home, "memory", "channels", "c1.md"),
+			"origin-key: discord/channel/c1\nbootstrap-safe: public\ncurrent",
+		);
+		await writeFile(join(home, "outside.md"), "outside");
+		await writeFile(join(home, "memory", "MEMORY.md"), "# Map\n- [safe](channels/c1.md) and [private](../outside.md)");
+		const result = await build(config);
+		expect(result.text).toContain("[safe](channels/c1.md)");
+		expect(result.text).not.toContain("../outside.md");
+		expect(result.text).not.toContain("[private]");
+	});
+
+	test("ops rules index emits only individually decoded and confined pointers", async () => {
+		const config = await setup();
+		await mkdir(join(home, "memory", "ops", "rules"), { recursive: true });
+		await writeFile(join(home, "memory", "ops", "rules", "safe.md"), "safe rule");
+		await writeFile(
+			join(home, "memory", "ops", "rules", "index.md"),
+			"# Rules\n- [safe](safe.md) and [escape](%2e%2e/%2e%2e/outside.md)",
+		);
+		const result = await build(config);
+		expect(result.text).toContain("[safe](ops/rules/safe.md)");
+		expect(result.text).not.toContain("%2e%2e/outside.md");
+		expect(result.text).not.toContain("[escape]");
+		expect(result.diagnostics).toContain("ops/rules/index.md links rejected: 1");
+	});
+
 	test("a configured memory-root symlink to a canonical directory is allowed", async () => {
 		const config = await setup();
 		await rm(join(home, "memory"), { recursive: true, force: true });
