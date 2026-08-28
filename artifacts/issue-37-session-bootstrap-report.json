@@ -5,8 +5,8 @@
   "repository": "Yeachan-Heo/gajae-way",
   "branch": "feat/issue-37-session-memory-bootstrap",
   "base": "c72615333cba90d66b562eaf1d413e387ec21064",
-  "executableHead": "e4862924e9dedb0b0a3207cdc2f4b39d617ac531",
-  "generatedAt": "2026-08-28T13:20:31Z",
+  "executableHead": "c6c8ffcabeb2906a79ddbd3a1da5b9fdbdc23900",
+  "generatedAt": "2026-08-28T13:27:39Z",
   "summary": "Fresh origin epochs receive one trusted, bounded session bootstrap with canonical channel metadata and confined memory navigation. Durable schema-14 projection commits only after terminal text or intentional-silence success; failed attempts retry with the stable origin+epoch marker. Public navigation and associated documents are full-origin filtered and privacy gated.",
   "securityReview": {
     "reviewer": "agent://0-BootstrapSecurityReview",
@@ -19,6 +19,8 @@
       "Every MEMORY and ops/rules/index pointer is decoded, confined, and re-rendered individually, so a safe first link cannot smuggle a trailing private or traversal link on the same source line.",
       "Navigation headings and link labels pass through the same credential/secret redaction before trusted-system serialization; adjacent source-line text is discarded while safe confined paths remain visible.",
       "Daily sections are parsed structurally and admitted only when every declared stable origin is well-formed and resolves to one consistent current-origin key; mixed-order, duplicate/conflicting, and nested-heading private origins poison the whole section.",
+      "Public navigation uses fixed trusted headings; DM headings have Markdown destinations removed. Heading links therefore cannot emit traversal/private pointer strings.",
+      "ASCII controls and Unicode format/line separators are replaced with spaces before credential detection. Split token/password/secret/API-key/header keys redact the remainder of their logical line, so fragments are neither leaked nor concatenated into an emitted secret.",
       "Included source material is system-delimited as reference data, never executable instructions.",
       "Diagnostics use bounded logical codes rather than raw filesystem errors; participant metadata is count/length bounded.",
       "The canonical opaque originKey is used in conversation-isolation guidance.",
@@ -42,6 +44,8 @@
   ],
   "securityPrivacyRedTeam": [
     { "case": "malformed percent traversal", "result": "passed" },
+    { "case": "heading-link traversal/private pointer text", "result": "passed" },
+    { "case": "NUL and zero-width/control-split credentials across channel/daily/MEMORY/rules", "result": "passed" },
     { "case": "escaped symlink", "result": "passed" },
     { "case": "configured memory-root symlink", "result": "passed" },
     { "case": "public channel rejects unapproved associated body", "result": "passed" },
@@ -51,12 +55,12 @@
     { "case": "missing MEMORY/daily/rules sources", "result": "passed with bounded diagnostics" }
   ],
   "verification": [
-    { "command": "bun test --max-concurrency 1 packages", "status": "passed", "evidence": "1094 passed, 2 skipped, 0 failed; 4654 expectations across 83 files" },
+    { "command": "bun test --max-concurrency 1 packages", "status": "passed", "evidence": "1096 passed, 2 skipped, 0 failed; 4675 expectations across 83 files" },
     { "command": "bunx tsc --noEmit", "status": "passed", "evidence": "no diagnostics" },
     { "command": "bun run build", "status": "passed", "evidence": "gateway, Discord, Telegram, admin, and CLI standalone binaries compiled" },
     { "command": "bunx biome check <changed files> && git diff --check", "status": "passed_with_baseline_warnings", "evidence": "no errors or fixes; 11 pre-existing warnings in touched legacy files; diff check clean" },
     { "command": "bun test packages/gateway/bench/retrieval-golden.bench.test.ts", "status": "skipped_by_suite", "evidence": "0 failed; benchmark test is repository-marked skip" },
-    { "command": "bun test packages/gateway/test/session-bootstrap.test.ts packages/gateway/test/context-turn.test.ts packages/gateway/test/session-rebind.test.ts packages/gateway/test/migration-drill.test.ts", "status": "passed", "evidence": "77 passed, 0 failed; 495 expectations" }
+    { "command": "bun test packages/gateway/test/session-bootstrap.test.ts packages/gateway/test/context-turn.test.ts packages/gateway/test/session-rebind.test.ts packages/gateway/test/migration-drill.test.ts", "status": "passed", "evidence": "79 passed, 0 failed; 516 expectations" }
   ],
   "migration": {
     "from": 13,
