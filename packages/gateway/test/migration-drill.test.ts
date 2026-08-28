@@ -16,7 +16,7 @@ test("migrates a migration-001 database to the latest schema", async () => {
 		legacy.close();
 
 		const database = await GatewayDatabase.open(path);
-		expect(database.schemaVersion).toBe(13);
+		expect(database.schemaVersion).toBe(14);
 		database.close();
 
 		const migrated = new Database(path, { readonly: true });
@@ -69,7 +69,7 @@ DELETE FROM schema_migrations WHERE version > 10;
 		v10.close();
 
 		const upgraded = await GatewayDatabase.open(path);
-		expect(upgraded.schemaVersion).toBe(13);
+		expect(upgraded.schemaVersion).toBe(14);
 		expect(upgraded.laneJobJson("lanejob-test")).toBe('{"schemaVersion":1}');
 		const tables = new Set(
 			new Database(path, { readonly: true })
@@ -85,7 +85,7 @@ DELETE FROM schema_migrations WHERE version > 10;
 	}
 });
 
-test("upgrades live schema 12 to 13 without losing lane jobs, monitors, slots, or rebind counters", async () => {
+test("upgrades live schema 12 through bootstrap schema 14 without losing current data", async () => {
 	const directory = await mkdtemp(join(tmpdir(), "gajaeway-migration-v12-"));
 	const path = join(directory, "gateway.db");
 	try {
@@ -100,6 +100,7 @@ test("upgrades live schema 12 to 13 without losing lane jobs, monitors, slots, o
 			json: '{"schemaVersion":1}',
 		});
 		latest.metaSet("rebind_budget:discord/channel/c1", '{"used":2,"lifetime":7}');
+		latest.putSession("discord/channel/c1", "session-v12");
 		latest.close();
 
 		const v12 = new Database(path);
@@ -113,10 +114,20 @@ DELETE FROM schema_migrations WHERE version = 13;
 		v12.close();
 
 		const upgraded = await GatewayDatabase.open(path);
-		expect(upgraded.schemaVersion).toBe(13);
+		expect(upgraded.schemaVersion).toBe(14);
 		expect(upgraded.laneJobJson("lanejob-v12")).toBe('{"schemaVersion":1}');
 		expect(upgraded.metaGet("rebind_budget:discord/channel/c1")).toBe('{"used":2,"lifetime":7}');
 		expect(upgraded.monitorSlotExists("monitor-v12", "2026-08-28T00:00:00.000Z")).toBe(true);
+		expect(upgraded.getSessionBootstrap("missing")).toBeUndefined();
+		expect(upgraded.getSessionRecord("discord/channel/c1")).toEqual({ sessionId: "session-v12", epoch: 0 });
+		expect(upgraded.getSessionBootstrap("discord/channel/c1")).toMatchObject({
+			epoch: 0,
+			lastBootstrappedEpoch: -1,
+			appliedAt: null,
+			includedSections: [],
+			byteCount: 0,
+			truncated: false,
+		});
 		upgraded.close();
 
 		const preserved = new Database(path, { readonly: true });

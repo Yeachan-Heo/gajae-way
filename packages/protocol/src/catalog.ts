@@ -212,7 +212,18 @@ export interface SessionListResult {
 		readonly createdAt: string;
 		readonly lastActivityAt: string | null;
 		readonly epoch: number;
+		readonly bootstrap: SessionBootstrapProjection;
 	}[];
+}
+
+export interface SessionBootstrapProjection {
+	readonly epoch: number;
+	readonly pending: boolean;
+	readonly appliedAt: string | null;
+	readonly includedSections: readonly string[];
+	readonly byteCount: number;
+	readonly truncated: boolean;
+	readonly diagnostics: readonly string[];
 }
 
 /**
@@ -437,6 +448,8 @@ export interface CycleSessionView {
 	readonly oldestUnsettledAgeMs: number | null;
 	/** Per-origin unread/omission diagnostics; never includes message bodies. */
 	readonly contextDiff: ConversationContextDiagnostics;
+	/** Durable metadata-only bootstrap projection; source bodies are never exposed. */
+	readonly bootstrap: SessionBootstrapProjection;
 }
 
 export interface OpsCycleResult {

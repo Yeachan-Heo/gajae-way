@@ -301,6 +301,30 @@ test("a rebind whose REPLAY succeeds still spends the budget: no unbounded epoch
 	}
 });
 
+test("a replay-safe automatic rebind rebuilds the trusted preamble for the new epoch", async () => {
+	const { client, database, commands } = await harness([
+		{ stdout: createSuccess("session-e0") },
+		{ stdout: turnFailure("managed_append_identity_mismatch", "identity moved"), exitCode: 1 },
+		{ stdout: createSuccess("session-e1") },
+		{ stdout: turnReply("ok") },
+	]);
+	try {
+		const { sessionId } = await client.ensureSession("discord:dm:c1");
+		expect(
+			await client.sendTurn(sessionId, "hello", "bootstrap epoch 0", undefined, {
+				systemPreambleForEpoch: (epoch) => `bootstrap epoch ${epoch}`,
+			}),
+		).toBe("ok");
+		const turnCommands = commands.filter((command) => command.includes("--resume"));
+		expect(turnCommands).toHaveLength(2);
+		expect(turnCommands[0]).toContain("bootstrap epoch 0");
+		expect(turnCommands[1]).toContain("bootstrap epoch 1");
+		expect(database.getSessionRecord("discord:dm:c1")?.epoch).toBe(1);
+	} finally {
+		database.close();
+	}
+});
+
 test("a turn that already ran a tool is NOT replayed after the rebind", async () => {
 	// The persona has full tool access; replaying a half-executed turn re-runs
 	// real side effects, so the gateway rebinds but surfaces the failure.

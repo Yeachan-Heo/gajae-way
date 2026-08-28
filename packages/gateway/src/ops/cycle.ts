@@ -38,6 +38,12 @@ export interface RuntimeCycleSources {
 		readonly epoch: number;
 		readonly created_at: string;
 		readonly last_activity_at: string | null;
+		readonly last_bootstrapped_epoch: number;
+		readonly bootstrap_applied_at: string | null;
+		readonly bootstrap_sections_json: string;
+		readonly bootstrap_byte_count: number;
+		readonly bootstrap_truncated: number;
+		readonly bootstrap_diagnostics_json: string;
 	}>;
 	readonly inboundPendingByOrigin: ReadonlyMap<string, number>;
 	readonly contextByOrigin: ReadonlyMap<string, ReturnType<GatewayDatabase["contextDiagnostics"]>>;
@@ -129,6 +135,15 @@ export function projectRuntimeCycle(sources: RuntimeCycleSources, generatedAt: s
 				omittedNewestAt: null,
 				floorAt: null,
 			},
+			bootstrap: {
+				epoch: row.epoch,
+				pending: row.last_bootstrapped_epoch < row.epoch,
+				appliedAt: row.bootstrap_applied_at,
+				includedSections: parseStringList(row.bootstrap_sections_json),
+				byteCount: row.bootstrap_byte_count,
+				truncated: row.bootstrap_truncated === 1,
+				diagnostics: parseStringList(row.bootstrap_diagnostics_json),
+			},
 		};
 	});
 
@@ -188,6 +203,15 @@ export function projectRuntimeCycle(sources: RuntimeCycleSources, generatedAt: s
 		pendingInbound,
 		contextDiff: sources.contextDiff,
 	};
+}
+
+function parseStringList(value: string): readonly string[] {
+	try {
+		const parsed = JSON.parse(value);
+		return Array.isArray(parsed) && parsed.every((item) => typeof item === "string") ? parsed : ["projection_corrupt"];
+	} catch {
+		return ["projection_corrupt"];
+	}
 }
 
 function decidePhase(state: {

@@ -193,6 +193,15 @@ function turnRow(turn: TrackedTurn, state: "running" | "stalled" | "finished", n
 
 function sessionRow(session: SessionListResult["sessions"][number]): RowView {
 	const last = parseIso(session.lastActivityAt);
+	const bootstrap = session.bootstrap ?? {
+		epoch: session.epoch,
+		pending: true,
+		appliedAt: null,
+		includedSections: [],
+		byteCount: 0,
+		truncated: false,
+		diagnostics: ["projection_unavailable"],
+	};
 	return {
 		key: originId(session.origin),
 		tone: "muted",
@@ -200,6 +209,9 @@ function sessionRow(session: SessionListResult["sessions"][number]): RowView {
 			title: originLabel(session.origin),
 			key: originId(session.origin),
 			epoch: `epoch ${formatCount(session.epoch)}`,
+			bootstrap: bootstrap.pending
+				? `bootstrap pending for epoch ${formatCount(bootstrap.epoch)}`
+				: `bootstrap applied · ${formatCount(bootstrap.byteCount)} bytes · ${bootstrap.includedSections.join(", ") || "metadata only"}${bootstrap.truncated ? " · truncated" : ""}`,
 			activity: last ? "" : "no activity yet",
 			created: "",
 		},

@@ -11,7 +11,7 @@ export interface InboundMessageRow {
 	readonly received_at: string;
 }
 
-const LATEST_SCHEMA_VERSION = 13;
+const LATEST_SCHEMA_VERSION = 14;
 /** Maximum number of prior messages supplied to one engaged conversation turn. */
 export const CONVERSATION_DIFF_MAX_ROWS = 60;
 /** Maximum age of prior messages supplied to one engaged conversation turn. */
@@ -46,6 +46,15 @@ export interface ConversationContextWindow {
 	readonly omittedNewestAt: string | null;
 	readonly omissionRevision: number;
 	readonly diagnostics: ConversationContextDiagnostics;
+}
+
+function parseStringList(value: string): readonly string[] {
+	try {
+		const parsed = JSON.parse(value);
+		return Array.isArray(parsed) && parsed.every((item) => typeof item === "string") ? parsed : ["projection_corrupt"];
+	} catch {
+		return ["projection_corrupt"];
+	}
 }
 /** A scheduled cron slot the gateway claimed or fired for one monitor. */
 export interface MonitorSlotRow {
@@ -150,6 +159,75 @@ export class GatewayDatabase {
 		return row ? { sessionId: row.gjc_session_id, epoch: row.epoch } : undefined;
 	}
 
+	getSessionBootstrap(originKey: string):
+		| {
+				epoch: number;
+				lastBootstrappedEpoch: number;
+				appliedAt: string | null;
+				includedSections: readonly string[];
+				byteCount: number;
+				truncated: boolean;
+				diagnostics: readonly string[];
+		  }
+		| undefined {
+		const row = this.#database
+			.query<
+				{
+					epoch: number;
+					last_bootstrapped_epoch: number;
+					bootstrap_applied_at: string | null;
+					bootstrap_sections_json: string;
+					bootstrap_byte_count: number;
+					bootstrap_truncated: number;
+					bootstrap_diagnostics_json: string;
+				},
+				[string]
+			>(
+				"SELECT epoch, last_bootstrapped_epoch, bootstrap_applied_at, bootstrap_sections_json, bootstrap_byte_count, bootstrap_truncated, bootstrap_diagnostics_json FROM sessions WHERE origin_key = ?",
+			)
+			.get(originKey);
+		if (!row) return undefined;
+		return {
+			epoch: row.epoch,
+			lastBootstrappedEpoch: row.last_bootstrapped_epoch,
+			appliedAt: row.bootstrap_applied_at,
+			includedSections: parseStringList(row.bootstrap_sections_json),
+			byteCount: row.bootstrap_byte_count,
+			truncated: row.bootstrap_truncated === 1,
+			diagnostics: parseStringList(row.bootstrap_diagnostics_json),
+		};
+	}
+
+	markSessionBootstrapped(
+		originKey: string,
+		epoch: number,
+		projection: {
+			readonly includedSections: readonly string[];
+			readonly byteCount: number;
+			readonly truncated: boolean;
+			readonly diagnostics: readonly string[];
+		},
+	): boolean {
+		const now = new Date().toISOString();
+		return (
+			this.#database
+				.query(
+					"UPDATE sessions SET last_bootstrapped_epoch = ?, bootstrap_applied_at = ?, bootstrap_sections_json = ?, bootstrap_byte_count = ?, bootstrap_truncated = ?, bootstrap_diagnostics_json = ? WHERE origin_key = ? AND epoch = ? AND last_bootstrapped_epoch < ?",
+				)
+				.run(
+					epoch,
+					now,
+					JSON.stringify(projection.includedSections),
+					projection.byteCount,
+					projection.truncated ? 1 : 0,
+					JSON.stringify(projection.diagnostics),
+					originKey,
+					epoch,
+					epoch,
+				).changes === 1
+		);
+	}
+
 	bumpEpoch(originKey: string, originRefJson: string): number {
 		const now = new Date().toISOString();
 		this.#database
@@ -210,14 +288,28 @@ export class GatewayDatabase {
 		created_at: string;
 		last_activity_at: string | null;
 		epoch: number;
+		last_bootstrapped_epoch: number;
+		bootstrap_applied_at: string | null;
+		bootstrap_sections_json: string;
+		bootstrap_byte_count: number;
+		bootstrap_truncated: number;
+		bootstrap_diagnostics_json: string;
 	}> {
 		return this.#database
-			.query("SELECT origin_ref_json, created_at, last_activity_at, epoch FROM sessions ORDER BY created_at")
+			.query(
+				"SELECT origin_ref_json, created_at, last_activity_at, epoch, last_bootstrapped_epoch, bootstrap_applied_at, bootstrap_sections_json, bootstrap_byte_count, bootstrap_truncated, bootstrap_diagnostics_json FROM sessions ORDER BY created_at",
+			)
 			.all() as Array<{
 			origin_ref_json: string | null;
 			created_at: string;
 			last_activity_at: string | null;
 			epoch: number;
+			last_bootstrapped_epoch: number;
+			bootstrap_applied_at: string | null;
+			bootstrap_sections_json: string;
+			bootstrap_byte_count: number;
+			bootstrap_truncated: number;
+			bootstrap_diagnostics_json: string;
 		}>;
 	}
 	/**
@@ -232,10 +324,16 @@ export class GatewayDatabase {
 		epoch: number;
 		created_at: string;
 		last_activity_at: string | null;
+		last_bootstrapped_epoch: number;
+		bootstrap_applied_at: string | null;
+		bootstrap_sections_json: string;
+		bootstrap_byte_count: number;
+		bootstrap_truncated: number;
+		bootstrap_diagnostics_json: string;
 	}> {
 		return this.#database
 			.query(
-				"SELECT origin_key, origin_ref_json, gjc_session_id, epoch, created_at, last_activity_at FROM sessions ORDER BY created_at",
+				"SELECT origin_key, origin_ref_json, gjc_session_id, epoch, created_at, last_activity_at, last_bootstrapped_epoch, bootstrap_applied_at, bootstrap_sections_json, bootstrap_byte_count, bootstrap_truncated, bootstrap_diagnostics_json FROM sessions ORDER BY created_at",
 			)
 			.all() as Array<{
 			origin_key: string;
@@ -244,6 +342,12 @@ export class GatewayDatabase {
 			epoch: number;
 			created_at: string;
 			last_activity_at: string | null;
+			last_bootstrapped_epoch: number;
+			bootstrap_applied_at: string | null;
+			bootstrap_sections_json: string;
+			bootstrap_byte_count: number;
+			bootstrap_truncated: number;
+			bootstrap_diagnostics_json: string;
 		}>;
 	}
 
@@ -1604,6 +1708,33 @@ ALTER TABLE monitor_slots ADD COLUMN event_id TEXT;`,
 				this.#database
 					.query("INSERT INTO schema_migrations (version, applied_at) VALUES (?, ?)")
 					.run(13, new Date().toISOString());
+			});
+		}
+		if (current < 14) {
+			this.withTransaction(() => {
+				// Issue #37: durable once-per-origin-epoch bootstrap projection. Pending
+				// state is the monotonic inequality epoch > last_bootstrapped_epoch, so
+				// every existing and newly bumped epoch starts pending without a second
+				// state machine that can drift from sessions. Bodies are never persisted.
+				const columns = new Set(
+					this.#database
+						.query<{ name: string }, []>("PRAGMA table_info(sessions)")
+						.all()
+						.map((row) => row.name),
+				);
+				const additions = [
+					["last_bootstrapped_epoch", "INTEGER NOT NULL DEFAULT -1"],
+					["bootstrap_applied_at", "TEXT"],
+					["bootstrap_sections_json", "TEXT NOT NULL DEFAULT '[]'"],
+					["bootstrap_byte_count", "INTEGER NOT NULL DEFAULT 0"],
+					["bootstrap_truncated", "INTEGER NOT NULL DEFAULT 0 CHECK(bootstrap_truncated IN (0,1))"],
+					["bootstrap_diagnostics_json", "TEXT NOT NULL DEFAULT '[]'"],
+				] as const;
+				for (const [name, declaration] of additions)
+					if (!columns.has(name)) this.#database.exec(`ALTER TABLE sessions ADD COLUMN ${name} ${declaration}`);
+				this.#database
+					.query("INSERT INTO schema_migrations (version, applied_at) VALUES (?, ?)")
+					.run(14, new Date().toISOString());
 			});
 		}
 	}

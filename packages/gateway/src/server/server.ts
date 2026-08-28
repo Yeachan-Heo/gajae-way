@@ -52,6 +52,7 @@ import { backupDatabase, integrityDatabase } from "../ops/backup";
 import { RuntimeCycleProjector } from "../ops/cycle";
 import type { GjcPort } from "../orchestrator/gjc-client";
 import { formatFailureNotice } from "../orchestrator/rebind";
+import { buildSessionBootstrap, type SessionBootstrap } from "../persona/bootstrap";
 import { PersonaLoader } from "../persona/persona";
 import type { GatewayDatabase, InboundMessageRow, MonitorEventStage } from "../store/db";
 import { DeliveryLedger } from "../store/ledger";
@@ -826,6 +827,7 @@ async function handleRequest(
 				createdAt: row.created_at,
 				lastActivityAt: row.last_activity_at,
 				epoch: row.epoch,
+				bootstrap: bootstrapProjection(row),
 			}));
 			connection.write({ v: PROFILE_VERSION, type: "response", id: request.id, result: { sessions } });
 			return;
@@ -1292,6 +1294,44 @@ function parseReceivedAt(value: unknown): string | undefined {
 	if (!Number.isFinite(timestamp)) throw new ProtocolError("invalid_params", "receivedAt must be an ISO timestamp");
 	return new Date(timestamp).toISOString();
 }
+
+function bootstrapProjection(row: {
+	readonly epoch: number;
+	readonly last_bootstrapped_epoch: number;
+	readonly bootstrap_applied_at: string | null;
+	readonly bootstrap_sections_json: string;
+	readonly bootstrap_byte_count: number;
+	readonly bootstrap_truncated: number;
+	readonly bootstrap_diagnostics_json: string;
+}): {
+	readonly epoch: number;
+	readonly pending: boolean;
+	readonly appliedAt: string | null;
+	readonly includedSections: readonly string[];
+	readonly byteCount: number;
+	readonly truncated: boolean;
+	readonly diagnostics: readonly string[];
+} {
+	const strings = (value: string): readonly string[] => {
+		try {
+			const parsed = JSON.parse(value);
+			return Array.isArray(parsed) && parsed.every((item) => typeof item === "string")
+				? parsed
+				: ["projection_corrupt"];
+		} catch {
+			return ["projection_corrupt"];
+		}
+	};
+	return {
+		epoch: row.epoch,
+		pending: row.last_bootstrapped_epoch < row.epoch,
+		appliedAt: row.bootstrap_applied_at,
+		includedSections: strings(row.bootstrap_sections_json),
+		byteCount: row.bootstrap_byte_count,
+		truncated: row.bootstrap_truncated === 1,
+		diagnostics: strings(row.bootstrap_diagnostics_json),
+	};
+}
 async function runInboundTurn(
 	batch: readonly InboundMessageRow[],
 	fallback: Connection,
@@ -1475,10 +1515,36 @@ async function runInboundTurn(
 	};
 	const heartbeat = setInterval(() => emitProgress(lastKnown), intervalMs);
 	const runTurn = async () => {
-		const epoch = options.database.getSessionRecord(key)?.epoch ?? 0;
-		const { sessionId } = await options.gjc.ensureSession(key, epoch);
-		const preamble = `${await runtime.persona.systemPreamble()}\n\n${currentConversationNotice(origin, engagement)}\n\n${ACTION_GUARD_SYSTEM_NOTICE}`;
-		return options.gjc.sendTurn(sessionId, turnText, preamble, emitProgress, {
+		const bootstraps = new Map<number, SessionBootstrap>();
+		const preambleForEpoch = async (epoch: number): Promise<string> => {
+			const state = options.database.getSessionBootstrap(key);
+			const bootstrap =
+				!state || state.lastBootstrappedEpoch < epoch
+					? await buildSessionBootstrap({
+							home: runtime.config.home,
+							origin,
+							epoch,
+							engagement,
+							config: runtime.config,
+						})
+					: undefined;
+			if (bootstrap) bootstraps.set(epoch, bootstrap);
+			return [
+				await runtime.persona.systemPreamble(),
+				currentConversationNotice(origin, engagement),
+				...(bootstrap ? [bootstrap.text] : []),
+				ACTION_GUARD_SYSTEM_NOTICE,
+			].join("\n\n");
+		};
+		const requestedEpoch = options.database.getSessionRecord(key)?.epoch ?? 0;
+		const { sessionId } = await options.gjc.ensureSession(key, requestedEpoch);
+		// session.create itself may condemn and rebind the requested epoch. The
+		// persisted row is the effective binding authority, so the first preamble
+		// on that fresh session must use the rebound epoch rather than a stale ID.
+		const boundEpoch = options.database.getSessionRecord(key)?.epoch ?? requestedEpoch;
+		const preamble = await preambleForEpoch(boundEpoch);
+		const result = await options.gjc.sendTurn(sessionId, turnText, preamble, emitProgress, {
+			systemPreambleForEpoch: preambleForEpoch,
 			onAssistantText: (message) => {
 				try {
 					deliverAssistantText(message);
@@ -1490,6 +1556,16 @@ async function runInboundTurn(
 				}
 			},
 		});
+		const terminalEpoch = options.database.getSessionRecord(key)?.epoch ?? boundEpoch;
+		const applied = bootstraps.get(terminalEpoch);
+		if (applied)
+			options.database.markSessionBootstrapped(key, terminalEpoch, {
+				includedSections: applied.includedSections,
+				byteCount: applied.byteCount,
+				truncated: applied.truncated,
+				diagnostics: applied.diagnostics,
+			});
+		return result;
 	};
 	try {
 		text = await runTurn();
@@ -1633,7 +1709,7 @@ function currentConversationNotice(origin: OriginRef, engagement?: { mentioned?:
 	return [
 		"## Current conversation",
 		`You are replying inside ${where}. This session is bound to exactly this one conversation.`,
-		`Shared memory (memory/daily and canonical axes) records EVERY conversation, each entry tagged with its origin. Entries whose origin differs from ${origin.platform}/${origin.kind}/${origin.conversationId} happened elsewhere: treat them as background knowledge only, never as something said here, and do not import their topics or in-flight work into this conversation unprompted.`,
+		`Shared memory (memory/daily and canonical axes) records EVERY conversation, each entry tagged with its origin. Entries whose canonical origin key differs from ${originKey(origin)} happened elsewhere: treat them as background knowledge only, never as something said here, and do not import their topics or in-flight work into this conversation unprompted.`,
 		...(origin.kind !== "dm" && origin.kind !== "loopback"
 			? [
 					engagement?.mentioned
