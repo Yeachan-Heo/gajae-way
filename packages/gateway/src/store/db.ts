@@ -2,8 +2,6 @@ import { Database } from "bun:sqlite";
 import { mkdir } from "node:fs/promises";
 import { dirname } from "node:path";
 
-const LATEST_SCHEMA_VERSION = 10;
-
 export interface InboundMessageRow {
 	readonly message_id: string;
 	readonly origin_key: string;
@@ -11,6 +9,22 @@ export interface InboundMessageRow {
 	readonly body: string;
 	readonly engagement_json: string | null;
 	readonly received_at: string;
+}
+
+const LATEST_SCHEMA_VERSION = 12;
+/** A scheduled cron slot the gateway claimed or fired for one monitor. */
+export interface MonitorSlotRow {
+	readonly monitor_id: string;
+	readonly slot_at: string;
+	readonly created_at: string;
+}
+
+/** Public-safe dispatch failure evidence (never a raw error body). */
+export interface MonitorFailureRow {
+	readonly event_id: string;
+	readonly code: string;
+	readonly detail: string;
+	readonly failed_at: string;
 }
 
 export class DatabaseStartupError extends Error {
@@ -21,6 +35,43 @@ export class DatabaseStartupError extends Error {
 		this.code = code;
 	}
 }
+
+/**
+ * Durable monitor-event stage contract (fail-closed). `monitorEventUpdate`
+ * rejects any stage outside this set, so a typo or a corrupt write cannot
+ * invent a state the recovery logic does not know how to reclaim.
+ *
+ * - admitted: durable row exists, not yet claimed by a dispatch.
+ * - batched: claimed by a dispatch awaiting its authoring turn (a live stage,
+ *   minutes at most) or stranded there by a crash mid-dispatch.
+ * - dispatched: authoring turn sent, output not yet parsed.
+ * - authored: note authored; delivery to the target is pending or settled.
+ * - delivered: the batch's ledger delivery was confirmed by the adapter.
+ * - authored_no_delivery: terminal — the monitor has no channel target and no
+ *   owner target is configured, so nothing will ever be delivered. Explicit
+ *   instead of `authored`-forever so the operator sees a finished state.
+ * - failed: the last dispatch attempt failed; reconcile redispatches.
+ * - failed_no_retry: dispatch failed and reconcile will not retry it again
+ *   (reclaim budget exhausted); operator-visible terminal state.
+ */
+export const MONITOR_EVENT_STAGES = [
+	"admitted",
+	"batched",
+	"dispatched",
+	"authored",
+	"delivered",
+	"authored_no_delivery",
+	"failed",
+	"failed_no_retry",
+] as const;
+export type MonitorEventStage = (typeof MONITOR_EVENT_STAGES)[number];
+/** Stages whose rows reconcile() may claim and redispatch. */
+export const RECONCILABLE_STAGES: readonly MonitorEventStage[] = ["admitted", "batched", "dispatched", "failed"];
+/** Terminal stages: no further transition will ever happen without operator action. */
+export const TERMINAL_STAGES: readonly MonitorEventStage[] = ["delivered", "authored_no_delivery", "failed_no_retry"];
+
+/** Upper bound on how often a single event may be reclaimed by reconcile. */
+export const MONITOR_EVENT_MAX_DISPATCH_ATTEMPTS = 5;
 
 export class GatewayDatabase {
 	readonly #database: Database;
@@ -235,6 +286,13 @@ export class GatewayDatabase {
 				"INSERT INTO memory_intents (id, kind, payload_json, state, created_at, updated_at) VALUES (?, ?, ?, 'queued', ?, ?)",
 			)
 			.run(row.id, row.kind, row.payloadJson, now, now);
+	}
+
+	/** Insertion-order view (rowid) — preserves admission order within the same millisecond. */
+	memoryIntentRowsByRowid(): Array<{ id: string; kind: string; payload_json: string; state: string }> {
+		return this.#database
+			.query("SELECT id, kind, payload_json, state FROM memory_intents ORDER BY rowid")
+			.all() as Array<{ id: string; kind: string; payload_json: string; state: string }>;
 	}
 
 	memoryIntentUpdate(id: string, state: "queued" | "written" | "committed" | "receipted" | "quarantined"): void {
@@ -495,10 +553,358 @@ export class GatewayDatabase {
 			)
 			.run(row.eventId, row.monitorId, row.eventType, row.payloadJson, row.firedAt, new Date().toISOString());
 	}
-	monitorEventUpdate(eventId: string, stage: string, batchId: string | null = null): void {
+	/**
+	 * Durable dispatch lease (red-team blocker 1): a process claims an event
+	 * before sending its authoring turn. The claim stores an owner token and an
+	 * expiry; a claim is valid only while `expires_at` is in the future. This
+	 * closes the restart race where the external gjc authoring turn outlives a
+	 * dead gateway process — a new process must not re-author the same event
+	 * concurrently, and only an expired claim may be stolen.
+	 *
+	 * Semantics:
+	 * - claim succeeds iff no live (unexpired) lease exists for the event;
+	 * - stealing replaces the expired lease with a fresh lease_id + owner;
+	 * - `monitorEventReleaseLease` is lease-guarded: a stale attempt whose lease
+	 *   expired and was stolen can never release the newer owner's claim.
+	 */
+	monitorEventAcquireLease(eventId: string, owner: string, leaseId: string, ttlMs: number, now = Date.now()): boolean {
+		const nowIso = new Date(now).toISOString();
+		const expiresIso = new Date(now + ttlMs).toISOString();
+		const claim = this.#database
+			.query(
+				`INSERT INTO dispatch_leases (event_id, owner, lease_id, acquired_at, expires_at) VALUES (?, ?, ?, ?, ?)
+ON CONFLICT(event_id) DO UPDATE SET owner = excluded.owner, lease_id = excluded.lease_id, acquired_at = excluded.acquired_at, expires_at = excluded.expires_at
+WHERE excluded.acquired_at IS NOT NULL AND (SELECT expires_at FROM dispatch_leases WHERE event_id = excluded.event_id) <= excluded.acquired_at`,
+			)
+			.run(eventId, owner, leaseId, nowIso, expiresIso).changes;
+		return claim > 0;
+	}
+	/** Releases a lease only when the caller still owns it (stale attempts are no-ops). */
+	monitorEventReleaseLease(eventId: string, leaseId: string): void {
+		this.#database.query("DELETE FROM dispatch_leases WHERE event_id = ? AND lease_id = ?").run(eventId, leaseId);
+	}
+	/** Total live (unexpired) leases — test/ops hygiene seam for leak detection. */
+	monitorLeaseLiveCount(now = Date.now()): number {
+		return (
+			this.#database
+				.query<{ n: number }, [string]>("SELECT COUNT(*) AS n FROM dispatch_leases WHERE expires_at > ?")
+				.get(new Date(now).toISOString())?.n ?? 0
+		);
+	}
+	/** Returns the lease id of the live (unexpired) claim, if any. */
+	monitorEventLiveLeaseOwner(eventId: string, now = Date.now()): string | undefined {
+		const row = this.#database
+			.query<{ lease_id: string; expires_at: string }, [string]>(
+				"SELECT lease_id, expires_at FROM dispatch_leases WHERE event_id = ?",
+			)
+			.get(eventId);
+		if (row && Date.parse(row.expires_at) > now) return row.lease_id;
+		return undefined;
+	}
+	/** Extends a live lease only when the caller still owns it (stale attempts are no-ops). */
+	monitorEventRenewLease(eventId: string, leaseId: string, ttlMs: number, now = Date.now()): boolean {
+		const row = this.#database
+			.query<{ lease_id: string }, [string, string, string]>(
+				"SELECT lease_id FROM dispatch_leases WHERE event_id = ? AND lease_id = ? AND expires_at > ?",
+			)
+			.get(eventId, leaseId, new Date(now).toISOString());
+		if (!row) return false;
+		this.#database
+			.query("UPDATE dispatch_leases SET expires_at = ? WHERE event_id = ? AND lease_id = ?")
+			.run(new Date(now + ttlMs).toISOString(), eventId, leaseId);
+		return true;
+	}
+	/**
+	 * Fenced stage transition (round-3 blocker 1): the lease ownership check and
+	 * the stage write happen atomically in ONE UPDATE — the WHERE clause includes
+	 * a live-lease subquery, so a lease stolen between the caller's check and the
+	 * write cannot be exploited (no TOCTOU). Returns true when this attempt's
+	 * write actually landed.
+	 */
+	monitorEventFencedUpdate(
+		eventId: string,
+		leaseId: string,
+		stage: MonitorEventStage,
+		batchId: string | null = null,
+		now = Date.now(),
+	): boolean {
+		if (!MONITOR_EVENT_STAGES.includes(stage)) throw new Error(`unknown monitor event stage: ${stage}`);
+		const changes = this.#database
+			.query(
+				`UPDATE monitor_events SET stage = ?, batch_id = COALESCE(?, batch_id), updated_at = ?
+WHERE event_id = ? AND EXISTS (
+SELECT 1 FROM dispatch_leases l WHERE l.event_id = monitor_events.event_id AND l.lease_id = ? AND l.expires_at > ?
+)`,
+			)
+			.run(stage, batchId, new Date(now).toISOString(), eventId, leaseId, new Date(now).toISOString()).changes;
+		return changes > 0;
+	}
+	/**
+	 * Fenced output write: authored_outputs upsert + authored stage transition in
+	 * one transaction, both gated on the live lease. A stale attempt cannot write
+	 * its note over the newer attempt's.
+	 */
+	monitorEventFencedAuthor(
+		eventId: string,
+		leaseId: string,
+		note: string,
+		noDelivery = false,
+		now = Date.now(),
+	): boolean {
+		return this.withTransaction(() => {
+			const changes = this.#database
+				.query(
+					`UPDATE monitor_events SET stage = ?, updated_at = ?
+WHERE event_id = ? AND EXISTS (
+SELECT 1 FROM dispatch_leases l WHERE l.event_id = monitor_events.event_id AND l.lease_id = ? AND l.expires_at > ?
+)`,
+				)
+				.run(
+					noDelivery ? "authored_no_delivery" : "authored",
+					new Date(now).toISOString(),
+					eventId,
+					leaseId,
+					new Date(now).toISOString(),
+				).changes;
+			if (changes === 0) return false;
+			this.authoredOutputCreate(eventId, note);
+			return true;
+		});
+	}
+	/**
+	 * Fenced delivery admission (round-3 blocker 1): the pending delivery row is
+	 * inserted only if EVERY given event still holds leaseId live, checked in the
+	 * same transaction as the insert. Returns false (nothing written) when any
+	 * event's lease was lost — a stale attempt can never emit.
+	 */
+	monitorDeliveryPrepareFenced(
+		deliveryId: string,
+		batchId: string,
+		originKey: string,
+		payloadJson: string,
+		eventIds: readonly string[],
+		leaseId: string,
+		now = Date.now(),
+	): boolean {
+		return this.withTransaction(() => {
+			for (const eventId of eventIds) {
+				const lease = this.#database
+					.query<{ lease_id: string; expires_at: string }, [string]>(
+						"SELECT lease_id, expires_at FROM dispatch_leases WHERE event_id = ?",
+					)
+					.get(eventId);
+				if (!lease || lease.lease_id !== leaseId || Date.parse(lease.expires_at) <= now) return false;
+			}
+			const nowIso = new Date(now).toISOString();
+			this.#database
+				.query(
+					"INSERT INTO deliveries (delivery_id, turn_id, origin_key, payload_json, state, attempts, created_at, updated_at) VALUES (?, ?, ?, ?, 'pending', 0, ?, ?)",
+				)
+				.run(deliveryId, batchId, originKey, payloadJson, nowIso, nowIso);
+			return true;
+		});
+	}
+	/**
+	 * Atomic LEASE-FENCED authored output + memory-intent admission (round-3/4
+	 * blockers): the authored_outputs upsert and the queued monitor-event intent
+	 * commit in ONE transaction, and the stage UPDATE carries the live-lease
+	 * predicate — a crash or interleaving between writes can never produce zero
+	 * or duplicate intents for the same event, and a stale attempt cannot write.
+	 */
+	monitorEventFencedAuthorWithIntent(
+		eventId: string,
+		leaseId: string,
+		note: string,
+		noDelivery: boolean,
+		eventType: string,
+		intentId: string,
+		originRefJson: string,
+		now = Date.now(),
+	): boolean {
+		return this.withTransaction(() => {
+			// leaseId === "" means UNFENCED (reconcile re-author path: single-flight,
+			// event already proven non-terminal). Dispatch attempts always pass a
+			// real lease id and get the EXISTS predicate.
+			const leasePredicate =
+				leaseId === ""
+					? "1=1"
+					: `EXISTS (
+SELECT 1 FROM dispatch_leases l WHERE l.event_id = monitor_events.event_id AND l.lease_id = ? AND l.expires_at > ?
+)`;
+			const leaseArgs = leaseId === "" ? [] : [leaseId, new Date(now).toISOString()];
+			const changes = this.#database
+				.query(
+					`UPDATE monitor_events SET stage = ?, updated_at = ?
+WHERE event_id = ? AND ${leasePredicate}`,
+				)
+				.run(
+					noDelivery ? "authored_no_delivery" : "authored",
+					new Date(now).toISOString(),
+					eventId,
+					...leaseArgs,
+				).changes;
+			if (changes === 0) return false;
+			this.authoredOutputCreate(eventId, note);
+			// Idempotent intent: the INSERT is keyed on the deterministic intent id;
+			// a second admission for the same event is a no-op.
+			const existing = this.#database
+				.query<{ id: string }, [string]>("SELECT id FROM memory_intents WHERE id = ?")
+				.get(intentId);
+			if (existing) return true;
+			this.memoryIntentCreate({
+				id: intentId,
+				kind: "monitor-event",
+				payloadJson: JSON.stringify({
+					kind: "monitor-event",
+					identity: `monitor-event:${eventId}`,
+					originRefJson,
+					userText: `Monitor event ${eventId}: ${eventType}`,
+					replyText: note,
+				}),
+			});
+			return true;
+		});
+	}
+	/**
+	 * Fenced failure write: failed stage + public-safe evidence row in one
+	 * transaction, both gated on the live lease (round-3 blocker 1).
+	 */
+	monitorEventFencedFail(
+		eventId: string,
+		leaseId: string,
+		batchId: string,
+		code: string,
+		detail: string,
+		now = Date.now(),
+	): boolean {
+		return this.withTransaction(() => {
+			const changes = this.#database
+				.query(
+					`UPDATE monitor_events SET stage = 'failed', batch_id = ?, updated_at = ?
+WHERE event_id = ? AND EXISTS (
+SELECT 1 FROM dispatch_leases l WHERE l.event_id = monitor_events.event_id AND l.lease_id = ? AND l.expires_at > ?
+)`,
+				)
+				.run(batchId, new Date(now).toISOString(), eventId, leaseId, new Date(now).toISOString()).changes;
+			if (changes === 0) return false;
+			this.monitorFailureRecord(eventId, code, detail);
+			return true;
+		});
+	}
+	/** True while the given lease is the live claim for the event. */
+	monitorEventLeaseHeld(eventId: string, leaseId: string, now = Date.now()): boolean {
+		const row = this.#database
+			.query<{ lease_id: string; expires_at: string }, [string]>(
+				"SELECT lease_id, expires_at FROM dispatch_leases WHERE event_id = ?",
+			)
+			.get(eventId);
+		return row?.lease_id === leaseId && Date.parse(row.expires_at) > now;
+	}
+	/**
+	 * Fail-closed stage transition: an unknown stage name throws instead of
+	 * writing a state no recovery path understands.
+	 */
+	monitorEventUpdate(eventId: string, stage: MonitorEventStage, batchId: string | null = null): void {
+		if (!MONITOR_EVENT_STAGES.includes(stage)) throw new Error(`unknown monitor event stage: ${stage}`);
 		this.#database
 			.query("UPDATE monitor_events SET stage = ?, batch_id = COALESCE(?, batch_id), updated_at = ? WHERE event_id = ?")
 			.run(stage, batchId, new Date().toISOString(), eventId);
+	}
+	/**
+	 * Red-team blocker 4: settlement must be MONOTONIC. Once an event is
+	 * terminally settled (`delivered`), a late/out-of-order delivery.fail can
+	 * never regress it; a duplicate confirm is a no-op. Non-terminal stages
+	 * (`authored`) still receive fail-path demotions so failed deliveries stay
+	 * operator-visible.
+	 */
+	/**
+	 * Atomic confirm + settlement (terminal-critic blocker 2): the ledger row
+	 * transition to `confirmed` and the batch monitor-event settlement commit in
+	 * ONE transaction. `outcome` distinguishes unknown / transitioned /
+	 * already_terminal so the server can ack idempotently. A crash can no longer
+	 * leave confirmed-ledger/authored-event pairs.
+	 */
+	deliveryConfirmWithSettle(
+		deliveryId: string,
+		monitorEventStage: "delivered" | "authored",
+	): "unknown" | "transitioned" | "already_terminal" {
+		return this.withTransaction(() => {
+			const delivery = this.#database
+				.query<{ delivery_id: string; turn_id: string; state: string }, [string]>(
+					"SELECT delivery_id, turn_id, state FROM deliveries WHERE delivery_id = ?",
+				)
+				.get(deliveryId);
+			if (!delivery) return "unknown";
+			if (delivery.state === "confirmed" || delivery.state === "expired") {
+				// Idempotent no-op: already terminal. Repairs a legacy split state
+				// (confirmed ledger, authored events) if one exists.
+				if (delivery.state === "confirmed") {
+					this.settleMonitorEventsForTurn(delivery.turn_id, monitorEventStage);
+				}
+				return "already_terminal";
+			}
+			this.#database
+				.query("UPDATE deliveries SET state = 'confirmed', updated_at = ? WHERE delivery_id = ?")
+				.run(new Date().toISOString(), deliveryId);
+			this.settleMonitorEventsForTurn(delivery.turn_id, monitorEventStage);
+			return "transitioned";
+		});
+	}
+	/** Settles the monitor batch of a turn id (used by the atomic confirm path). */
+	settleMonitorEventsForTurn(turnId: string, stage: "delivered" | "authored"): void {
+		const events = this.#database
+			.query<{ event_id: string }, [string]>("SELECT event_id FROM monitor_events WHERE batch_id = ?")
+			.all(turnId);
+		for (const event of events) this.monitorEventSettle(event.event_id, stage);
+	}
+	monitorEventSettle(eventId: string, stage: "delivered" | "authored"): boolean {
+		const row = this.#database
+			.query<{ stage: string }, [string]>("SELECT stage FROM monitor_events WHERE event_id = ?")
+			.get(eventId);
+		if (!row) return false;
+		// delivered may ONLY be reached from authored: an omitted event still in
+		// dispatched/batched can never be promoted by a batch-wide settlement
+		// (terminal-critic blocker 3).
+		if (stage === "delivered" && row.stage === "authored") {
+			this.monitorEventUpdate(eventId, "delivered");
+			return true;
+		}
+		// Fail path: only demote events still in `authored`; never touch delivered
+		// (or any terminal stage).
+		if (stage === "authored" && row.stage === "authored") return false;
+		if (
+			stage === "authored" &&
+			row.stage !== "delivered" &&
+			row.stage !== "authored_no_delivery" &&
+			row.stage !== "failed_no_retry"
+		) {
+			this.monitorEventUpdate(eventId, "authored");
+			return true;
+		}
+		return false;
+	}
+	/**
+	 * Bumps the reclaim counter; returns the new count. Reconcile stops
+	 * reclaiming an event once it exceeds MONITOR_EVENT_MAX_DISPATCH_ATTEMPTS.
+	 */
+	monitorEventIncrementAttempts(eventId: string): number {
+		this.#database
+			.query("UPDATE monitor_events SET dispatch_attempts = dispatch_attempts + 1, updated_at = ? WHERE event_id = ?")
+			.run(new Date().toISOString(), eventId);
+		return (
+			this.#database
+				.query<{ n: number }, [string]>("SELECT dispatch_attempts AS n FROM monitor_events WHERE event_id = ?")
+				.get(eventId)?.n ?? 0
+		);
+	}
+	monitorEventDispatchAttempts(eventId: string): number {
+		return (
+			this.#database
+				.query<{ dispatch_attempts: number }, [string]>(
+					"SELECT dispatch_attempts FROM monitor_events WHERE event_id = ?",
+				)
+				.get(eventId)?.dispatch_attempts ?? 0
+		);
 	}
 	/**
 	 * `order` is explicit because listings want newest-first while recovery must replay in the
@@ -515,6 +921,7 @@ export class GatewayDatabase {
 		fired_at: string;
 		stage: string;
 		batch_id: string | null;
+		dispatch_attempts: number;
 		updated_at: string;
 	}> {
 		const direction = order === "oldest" ? "ASC" : "DESC";
@@ -532,6 +939,7 @@ export class GatewayDatabase {
 			fired_at: string;
 			stage: string;
 			batch_id: string | null;
+			dispatch_attempts: number;
 			updated_at: string;
 		}>;
 	}
@@ -546,6 +954,91 @@ export class GatewayDatabase {
 		return this.#database
 			.query<{ output_text: string }, [string]>("SELECT output_text FROM authored_outputs WHERE event_id = ?")
 			.get(eventId)?.output_text;
+	}
+	/** Latest public-safe failure evidence for one event, if any. */
+	monitorFailure(eventId: string): MonitorFailureRow | undefined {
+		return (
+			this.#database
+				.query<MonitorFailureRow, [string]>(
+					"SELECT event_id, code, detail, failed_at FROM monitor_failures WHERE event_id = ? ORDER BY rowid DESC LIMIT 1",
+				)
+				.get(eventId) ?? undefined
+		);
+	}
+	/**
+	 * Persists bounded, public-safe dispatch evidence: a stable machine code plus
+	 * a one-line detail that must never contain secrets or raw error bodies.
+	 * Keeps the newest 20 rows per event and deletes stale rows so the table
+	 * cannot grow without bound across retries.
+	 */
+	monitorFailureRecord(eventId: string, code: string, detail: string): void {
+		// Runs inside the caller's transaction when one is open (dispatch failure
+		// bookkeeping must be atomic with the stage transition); standalone otherwise.
+		this.#database
+			.query("INSERT INTO monitor_failures (event_id, code, detail, failed_at) VALUES (?, ?, ?, ?)")
+			.run(eventId, code, detail.slice(0, 500), new Date().toISOString());
+		this.#database
+			.query(
+				"DELETE FROM monitor_failures WHERE event_id = ? AND rowid NOT IN (SELECT rowid FROM monitor_failures WHERE event_id = ? ORDER BY rowid DESC LIMIT 20)",
+			)
+			.run(eventId, eventId);
+	}
+	monitorFailures(eventIds: readonly string[]): Map<string, MonitorFailureRow> {
+		const rows = new Map<string, MonitorFailureRow>();
+		for (const eventId of eventIds) {
+			const row = this.monitorFailure(eventId);
+			if (row) rows.set(eventId, row);
+		}
+		return rows;
+	}
+	/**
+	 * Red-team blocker 2: the slot claim and the event admission commit in ONE
+	 * transaction. A claim row whose event_id is NULL means the gateway fired
+	 * the slot but died before submitting the event — reconcile admits it. A
+	 * crash can therefore strand neither a claimed-but-unadmitted slot (this
+	 * row shape makes it visible) nor a duplicate event (unique slot key).
+	 */
+	monitorSlotClaimWithEvent(row: {
+		monitorId: string;
+		slotAt: string;
+		eventId: string;
+		eventType: string;
+		payloadJson: string;
+	}): boolean {
+		const now = new Date().toISOString();
+		return this.withTransaction(() => {
+			const claim = this.#database
+				.query(
+					"INSERT INTO monitor_slots (monitor_id, slot_at, event_id, created_at) VALUES (?, ?, ?, ?) ON CONFLICT(monitor_id, slot_at) DO NOTHING",
+				)
+				.run(row.monitorId, row.slotAt, row.eventId, now).changes;
+			if (claim === 0) return false;
+			this.monitorEventCreate({
+				eventId: row.eventId,
+				monitorId: row.monitorId,
+				eventType: row.eventType,
+				payloadJson: row.payloadJson,
+				firedAt: row.slotAt,
+			});
+			return true;
+		}) as boolean;
+	}
+	/** Test/recovery seam: move a monitor's creation instant (clamps catch-up). */
+	monitorSetCreatedAt(monitorId: string, createdAt: string): void {
+		this.#database.query("UPDATE monitors SET created_at = ? WHERE monitor_id = ?").run(createdAt, monitorId);
+	}
+	monitorSlotExists(monitorId: string, slotAt: string): boolean {
+		const row = this.#database
+			.query<{ n: number }, [string, string]>(
+				"SELECT COUNT(*) AS n FROM monitor_slots WHERE monitor_id = ? AND slot_at = ?",
+			)
+			.get(monitorId, slotAt);
+		return (row?.n ?? 0) > 0;
+	}
+	/** Drops slot ledger entries older than the retention window (bounded table). */
+	monitorSlotPrune(olderThanMs: number, now = Date.now()): number {
+		const cutoff = new Date(now - olderThanMs).toISOString();
+		return this.#database.query("DELETE FROM monitor_slots WHERE slot_at < ?").run(cutoff).changes;
 	}
 
 	deliveryPrune(before: string): number {
@@ -707,6 +1200,38 @@ export class GatewayDatabase {
 				this.#database
 					.query("INSERT INTO schema_migrations (version, applied_at) VALUES (?, ?)")
 					.run(10, new Date().toISOString());
+			});
+		}
+		if (current < 11) {
+			this.withTransaction(() => {
+				// Monitor recovery (issue #29): extend the monitor event state contract,
+				// preserve every legacy row, and add bounded operator evidence/slot tables.
+				// Existing schema-10 lane_jobs deployments reach this step without loss.
+				this.#database.exec(
+					`CREATE TABLE monitor_events_new (event_id TEXT PRIMARY KEY, monitor_id TEXT NOT NULL, event_type TEXT NOT NULL, payload_json TEXT NOT NULL, fired_at TEXT NOT NULL, stage TEXT NOT NULL CHECK(stage IN ('admitted','batched','dispatched','authored','delivered','authored_no_delivery','failed','failed_no_retry')), batch_id TEXT, dispatch_attempts INTEGER NOT NULL DEFAULT 0, updated_at TEXT NOT NULL);
+INSERT INTO monitor_events_new (event_id, monitor_id, event_type, payload_json, fired_at, stage, batch_id, dispatch_attempts, updated_at) SELECT event_id, monitor_id, event_type, payload_json, fired_at, stage, batch_id, 0, updated_at FROM monitor_events;
+DROP TABLE monitor_events;
+ALTER TABLE monitor_events_new RENAME TO monitor_events;
+CREATE TABLE monitor_failures (id INTEGER PRIMARY KEY AUTOINCREMENT, event_id TEXT NOT NULL, code TEXT NOT NULL, detail TEXT NOT NULL, failed_at TEXT NOT NULL);
+CREATE INDEX monitor_failures_event ON monitor_failures (event_id, failed_at);
+CREATE TABLE monitor_slots (monitor_id TEXT NOT NULL, slot_at TEXT NOT NULL, created_at TEXT NOT NULL, PRIMARY KEY (monitor_id, slot_at));`,
+				);
+				this.#database
+					.query("INSERT INTO schema_migrations (version, applied_at) VALUES (?, ?)")
+					.run(11, new Date().toISOString());
+			});
+		}
+		if (current < 12) {
+			this.withTransaction(() => {
+				// Durable dispatch ownership and atomic scheduled-slot admission.
+				this.#database.exec(
+					`CREATE TABLE dispatch_leases (event_id TEXT PRIMARY KEY, owner TEXT NOT NULL, lease_id TEXT NOT NULL, acquired_at TEXT NOT NULL, expires_at TEXT NOT NULL);
+CREATE INDEX dispatch_leases_expiry ON dispatch_leases (expires_at);
+ALTER TABLE monitor_slots ADD COLUMN event_id TEXT;`,
+				);
+				this.#database
+					.query("INSERT INTO schema_migrations (version, applied_at) VALUES (?, ?)")
+					.run(12, new Date().toISOString());
 			});
 		}
 	}

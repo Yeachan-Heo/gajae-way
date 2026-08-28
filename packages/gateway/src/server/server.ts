@@ -53,7 +53,7 @@ import { RuntimeCycleProjector } from "../ops/cycle";
 import type { GjcPort } from "../orchestrator/gjc-client";
 import { formatFailureNotice } from "../orchestrator/rebind";
 import { PersonaLoader } from "../persona/persona";
-import type { GatewayDatabase, InboundMessageRow } from "../store/db";
+import type { GatewayDatabase, InboundMessageRow, MonitorEventStage } from "../store/db";
 import { DeliveryLedger } from "../store/ledger";
 import { KeyedQueue } from "./keyed-queue";
 import { composeSpeakerLabel, composeTurnHeader } from "./speaker";
@@ -433,6 +433,25 @@ function createRuntime(options: GatewayServerOptions): Runtime {
 		inbound: new Map(),
 	};
 }
+/**
+ * Monitor-batch settlement (issue #29 defect 2): the delivery ledger row for a
+ * monitor batch carries turn_id === batch_id. When the adapter confirms that
+ * delivery, every event of the batch that has already reached `authored`
+ * advances to `delivered`. Failure paths never mark `delivered`: on
+ * delivery.fail the events stay `authored` (distinguishable, operator-visible)
+ * while the ledger row itself records failed/ambiguous.
+ */
+function settleMonitorBatch(database: GatewayDatabase, deliveryId: string, stage: MonitorEventStage): void {
+	const delivery = database.deliveryRows().find((row) => row.delivery_id === deliveryId);
+	if (!delivery) return;
+	const batchId = delivery.turn_id;
+	const events = database.monitorEventRows().filter((row) => row.batch_id === batchId);
+	if (!events.length) return;
+	database.withTransaction(() => {
+		for (const event of events) database.monitorEventSettle(event.event_id, stage as "delivered" | "authored");
+	});
+}
+
 async function handleFrame(
 	connection: Connection,
 	frame: Frame,
@@ -519,8 +538,17 @@ async function handleRequest(
 		}
 		case "delivery.confirm": {
 			const id = (request.params as { deliveryId?: unknown } | undefined)?.deliveryId;
-			if (typeof id !== "string" || !runtime.delivery.confirm(id))
-				throw new ProtocolError("invalid_params", "unknown deliveryId");
+			if (typeof id !== "string") throw new ProtocolError("invalid_params", "unknown deliveryId");
+			// unknown -> invalid_params; already-terminal -> idempotent no-op ack.
+			const confirmOutcome = options.database.deliveryConfirmWithSettle(id, "delivered");
+			if (confirmOutcome === "unknown") throw new ProtocolError("invalid_params", "unknown deliveryId");
+			// Monitor batch settlement: a confirmed delivery for a monitor batch
+			// (turn_id === the events' batch_id) advances its authored events to
+			// `delivered` — only AFTER the adapter confirmed (issue #29 defect 2),
+			// and NEVER when the ledger row is expired: a late confirm on an expired
+			// delivery must not mark monitor events delivered (round-4 blocker 3);
+			// confirmation + settlement are now ONE transaction (terminal-critic
+			// blocker 2), so no split-state repair window exists.
 			connection.write({ v: PROFILE_VERSION, type: "response", id: request.id, result: { settled: true } });
 			return;
 		}
@@ -530,10 +558,21 @@ async function handleRequest(
 				!params ||
 				typeof params.deliveryId !== "string" ||
 				typeof params.reason !== "string" ||
-				(typeof params.ambiguous !== "undefined" && typeof params.ambiguous !== "boolean") ||
-				!runtime.delivery.fail(params.deliveryId, params.ambiguous)
+				(typeof params.ambiguous !== "undefined" && typeof params.ambiguous !== "boolean")
 			)
 				throw new ProtocolError("invalid_params", "invalid delivery failure");
+			// unknown -> invalid_params; already-terminal -> idempotent no-op ack (the
+			// adapter may be retrying a stale outcome).
+			const failOutcome = runtime.delivery.fail(params.deliveryId, params.ambiguous);
+			if (failOutcome === "unknown") throw new ProtocolError("invalid_params", "unknown deliveryId");
+			// A failed monitor-batch delivery stays distinguishable: its events keep
+			// stage `authored` (or `batched` before authoring) so reconcile and the
+			// operator projection show them as unsettled; the ledger row carries the
+			// failed/ambiguous state. Never silently `delivered`. Monotonic: only a
+			// transitioned fail touches still-unsettled events.
+			if (failOutcome === "transitioned" && typeof params.deliveryId === "string") {
+				settleMonitorBatch(options.database, params.deliveryId, "authored");
+			}
 			connection.write({ v: PROFILE_VERSION, type: "response", id: request.id, result: { recorded: true } });
 			return;
 		}

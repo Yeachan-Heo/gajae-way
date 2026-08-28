@@ -56,12 +56,14 @@ export type MonitorSnapshot = {
 	readonly recentEvents: readonly MonitorEventRecord[];
 };
 
-const STUCK_STAGES = new Set(["admitted", "dispatched", "failed"]);
+const STUCK_STAGES = new Set(["admitted", "batched", "dispatched", "failed"]);
 
 function stageSentence(stage: string): string {
 	switch (stage) {
 		case "admitted":
 			return "admitted but never dispatched to a session";
+		case "batched":
+			return "claimed by a dispatch that never finished (stranded or still in flight)";
 		case "dispatched":
 			return "dispatched but no output was authored";
 		case "failed":

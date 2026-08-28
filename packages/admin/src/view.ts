@@ -219,6 +219,10 @@ function lastOutcome(events: readonly MonitorEventRecord[] | null): { label: str
 			return { label: "✓ delivered", tone: "ok", at: latest.firedAt };
 		case "authored":
 			return { label: "◐ authored, delivery pending", tone: "warn", at: latest.firedAt };
+		case "authored_no_delivery":
+			return { label: "○ authored, no delivery target", tone: "muted", at: latest.firedAt };
+		case "failed_no_retry":
+			return { label: "✕ failed, retries exhausted", tone: "danger", at: latest.firedAt };
 		case "failed":
 			return { label: "✕ failed", tone: "danger", at: latest.firedAt };
 		default:

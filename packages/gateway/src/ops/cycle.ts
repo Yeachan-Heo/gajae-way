@@ -130,6 +130,10 @@ export function projectRuntimeCycle(sources: RuntimeCycleSources, generatedAt: s
 
 	const monitorFailed = sources.monitorStages.get("failed") ?? 0;
 	if (monitorFailed > 0) gates.add("monitor_settlement_failed");
+	// Events stuck at a non-terminal stage are visibly unresolved (issue #29:
+	// `batched` rows used to strand forever while the projection stayed green).
+	if (sources.monitorStages.get("batched") || sources.monitorStages.get("dispatched"))
+		gates.add("monitor_settlement_stuck");
 
 	const pendingInbound = sources.pendingInbound;
 	const unsettled = totalUnsettled(sources);

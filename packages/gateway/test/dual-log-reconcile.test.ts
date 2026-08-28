@@ -44,6 +44,7 @@ test("reconciliation uses retained authored output and otherwise re-dispatches",
 					queued.push(mutation);
 					return "intent";
 				},
+				enqueueExistingId: () => {},
 			} as never,
 			delivery: new DeliveryService(new DeliveryLedger(database)),
 			emit: () => {},
@@ -71,8 +72,11 @@ test("reconciliation uses retained authored output and otherwise re-dispatches",
 			}),
 		);
 		await pipeline.reconcile();
-		expect(queued).toHaveLength(2);
-		expect(JSON.stringify(queued[0])).toContain("retained authored knowledge");
+		const intents = database.memoryIntentRowsByRowid().filter((row) => row.kind === "monitor-event");
+		expect(intents).toHaveLength(2);
+		const replyTexts = intents.map((row) => (JSON.parse(row.payload_json) as { replyText: string }).replyText);
+		expect(replyTexts.some((text) => text.includes("retained authored knowledge"))).toBe(true);
+		expect(replyTexts.some((text) => text.includes("authored by model"))).toBe(true);
 		expect(dispatches).toContain(originKey(eventTypeOrigin("changed")));
 		expect(database.authoredOutput(missing)).toBe("authored by model");
 		database.close();
@@ -91,7 +95,6 @@ test("reconcile replays same-millisecond events oldest-first", async () => {
 			trigger: { kind: "cron", schedule: "* * * * *" },
 			eventTypes: ["changed"],
 		});
-		const queued: string[] = [];
 		const pipeline = new MonitorPropagator({
 			database,
 			registry,
@@ -100,12 +103,7 @@ test("reconcile replays same-millisecond events oldest-first", async () => {
 				forgetRebinds: () => {},
 				sendTurn: async () => "[]",
 			},
-			memory: {
-				enqueue: (mutation: { replyText: string }) => {
-					queued.push(mutation.replyText);
-					return "intent";
-				},
-			} as never,
+			memory: { enqueue: () => "intent", enqueueExistingId: () => {} } as never,
 			delivery: new DeliveryService(new DeliveryLedger(database)),
 			emit: () => {},
 		});
@@ -126,7 +124,13 @@ test("reconcile replays same-millisecond events oldest-first", async () => {
 			}
 		});
 		await pipeline.reconcile();
-		expect(queued).toEqual(["authored-0", "authored-1"]);
+		// Insertion order (rowid) preserves the oldest-first replay; the
+		// (created_at, id) index scrambles same-millisecond UUID ties.
+		const intents = database
+			.memoryIntentRowsByRowid()
+			.filter((row) => row.kind === "monitor-event")
+			.map((row) => (JSON.parse(row.payload_json) as { replyText: string }).replyText);
+		expect(intents).toEqual(["authored-0", "authored-1"]);
 		database.close();
 	} finally {
 		await rm(directory, { recursive: true, force: true });
@@ -140,7 +144,6 @@ test("a monitor without its own channel target reports authored notes to the own
 	const { GatewayDatabase } = await import("../src/store/db");
 	const { MonitorRegistry } = await import("../src/monitors/registry");
 	const { MonitorPropagator } = await import("../src/monitors/propagate");
-	const { MemoryClosureQueue } = await import("../src/memory/closure");
 	const { DeliveryService } = await import("../src/delivery/delivery");
 	const { DeliveryLedger } = await import("../src/store/ledger");
 	const directory = await mkdtemp(join(tmpdir(), "gajaeway-ownertarget-"));
@@ -167,7 +170,7 @@ test("a monitor without its own channel target reports authored notes to the own
 					})),
 				),
 		},
-		memory: { enqueue: () => {} } as never,
+		memory: { enqueue: () => {}, enqueueExistingId: () => {} } as never,
 		delivery,
 		emit: () => {},
 		deliver: (payload: unknown) => void pushed.push(payload),

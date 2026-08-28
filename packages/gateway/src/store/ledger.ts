@@ -1,6 +1,8 @@
 import type { GatewayDatabase } from "./db";
 
 export type DeliveryState = "pending" | "inflight" | "confirmed" | "failed_ambiguous" | "expired";
+/** Outcome of a settlement attempt against the ledger. */
+export type LedgerOutcome = "unknown" | "transitioned" | "already_terminal";
 export interface DeliveryRow {
 	readonly deliveryId: string;
 	readonly turnId: string;
@@ -28,23 +30,37 @@ export class DeliveryLedger {
 		);
 	}
 	markInflight(deliveryId: string): void {
-		this.#database.withTransaction(() =>
-			this.#database.deliveryUpdate(deliveryId, "inflight", this.get(deliveryId)?.attempts ?? 0),
-		);
-	}
-	confirm(deliveryId: string): boolean {
 		const row = this.get(deliveryId);
-		if (!row) return false;
+		if (!row || row.state === "confirmed" || row.state === "expired") return;
+		this.#database.withTransaction(() => this.#database.deliveryUpdate(deliveryId, "inflight", row.attempts));
+	}
+	/**
+	 * Terminal-state transitions are explicit (red-team blocker 2 / round 3):
+	 * - `confirmed` is terminal: a late duplicate confirm is a no-op; a fail can
+	 *   NEVER rewrite a confirmed row (the platform told us it was delivered).
+	 * - `expired` is terminal: a late confirm cannot resurrect it (the platform
+	 *   connection is gone; a duplicate would be re-acked through the redelivery
+	 *   path only if the row were still live). Late-fail on expired is a no-op.
+	 * Returns "unknown" (no such delivery), "transitioned" (applied now), or
+	 * "already_terminal" (idempotent no-op on a settled row).
+	 */
+	confirm(deliveryId: string): LedgerOutcome {
+		const row = this.get(deliveryId);
+		if (!row) return "unknown";
+		if (row.state === "confirmed" || row.state === "expired") return "already_terminal";
 		this.#database.withTransaction(() => this.#database.deliveryUpdate(deliveryId, "confirmed"));
-		return true;
+		return "transitioned";
 	}
-	fail(deliveryId: string, ambiguous = false): boolean {
+	fail(deliveryId: string, ambiguous = false): LedgerOutcome {
 		const row = this.get(deliveryId);
-		if (!row) return false;
+		if (!row) return "unknown";
+		// Terminal states never rewrite: confirmed stays delivered, expired stays
+		// expired. A late duplicate fail after confirm is recorded as a no-op.
+		if (row.state === "confirmed" || row.state === "expired") return "already_terminal";
 		const attempts = row.attempts + 1;
 		const state: DeliveryState = ambiguous ? "failed_ambiguous" : attempts >= 3 ? "expired" : "pending";
 		this.#database.withTransaction(() => this.#database.deliveryUpdate(deliveryId, state, attempts));
-		return true;
+		return "transitioned";
 	}
 	listUndelivered(freshnessMs: number, now = Date.now()): DeliveryRow[] {
 		return this.rows().filter(

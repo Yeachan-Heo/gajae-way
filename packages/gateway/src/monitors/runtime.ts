@@ -18,10 +18,17 @@ export class MonitorRuntime {
 	readonly #registry: MonitorRegistry;
 	readonly #propagator: MonitorPropagator;
 	#stops: Stop[] = [];
-	constructor(config: GatewayConfig, registry: MonitorRegistry, propagator: MonitorPropagator) {
+	readonly #clock?: () => Date;
+	constructor(
+		config: GatewayConfig,
+		registry: MonitorRegistry,
+		propagator: MonitorPropagator,
+		options: { now?: () => Date } = {},
+	) {
 		this.#config = config;
 		this.#registry = registry;
 		this.#propagator = propagator;
+		this.#clock = options.now;
 	}
 	async start(): Promise<void> {
 		await this.stop();
@@ -31,8 +38,20 @@ export class MonitorRuntime {
 		for (const monitor of monitors) {
 			if (monitor.trigger.kind === "cron")
 				this.#stops.push(
-					startCron(monitor.trigger.schedule, () =>
-						this.#propagator.submit(monitor.monitorId, monitor.eventTypes[0]!, { at: new Date().toISOString() }),
+					startCron(
+						monitor.trigger.schedule,
+						// Atomic slot-claim + event admission inside the propagator.
+						// Returns whether the slot was NEWLY admitted (false for
+						// restart-overlap duplicates) so the catch-up budget counts
+						// only real admissions.
+						(slotAt) =>
+							this.#propagator.submitSlot(
+								monitor.monitorId,
+								monitor.eventTypes[0]!,
+								{ at: slotAt.toISOString() },
+								slotAt,
+							) !== null,
+						{ now: this.#clock },
 					),
 				);
 			if (monitor.trigger.kind === "watcher") {
