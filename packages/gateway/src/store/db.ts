@@ -393,12 +393,19 @@ export class GatewayDatabase {
 		this.#database.query("UPDATE inbound_messages SET state = 'done' WHERE message_id = ?").run(messageId);
 	}
 
-	inboundDiscardBefore(originKey: string, floorAt: string): number {
-		return this.#database
+	inboundDiscardBefore(originKey: string, floorAt: string): string[] {
+		const ids = this.#database
+			.query<{ message_id: string }, [string, string]>(
+				"SELECT message_id FROM inbound_messages WHERE origin_key = ? AND state = 'pending' AND received_at <= ?",
+			)
+			.all(originKey, floorAt)
+			.map((row) => row.message_id);
+		this.#database
 			.query(
 				"UPDATE inbound_messages SET state = 'done' WHERE origin_key = ? AND state = 'pending' AND received_at <= ?",
 			)
-			.run(originKey, floorAt).changes;
+			.run(originKey, floorAt);
+		return ids;
 	}
 
 	/**

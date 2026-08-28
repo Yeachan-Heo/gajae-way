@@ -1113,11 +1113,13 @@ async function sendChat(
 			return;
 		}
 		const floorAt = new Date().toISOString();
+		let discardedInbound: string[] = [];
 		options.database.withTransaction(() => {
 			options.database.bumpEpoch(key, JSON.stringify(origin));
 			options.database.contextSetFloor(key, floorAt);
-			options.database.inboundDiscardBefore(key, floorAt);
+			discardedInbound = options.database.inboundDiscardBefore(key, floorAt);
 		});
+		for (const messageId of discardedInbound) runtime.inbound.delete(messageId);
 		// An explicit reset is the manual form of a rebind, so it also restores the
 		// automatic rebind budget: otherwise an origin that spent its cap would stay
 		// capped even after the operator did exactly what the notice asked for.
