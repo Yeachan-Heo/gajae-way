@@ -92,20 +92,35 @@ function safeLabel(value: string): string {
 	return boundedLine(safeText(value), 120) || "memory";
 }
 
-function metadataMatches(text: string, key: string): boolean {
-	for (const line of text.split(/\r?\n/).slice(0, 80)) {
+function associatedOriginKeys(text: string): { readonly keys: ReadonlySet<string>; readonly malformed: boolean } {
+	const keys = new Set<string>();
+	let malformed = false;
+	for (const line of text.split(/\r?\n/)) {
 		const match = line.match(/^\s*(?:[-*]\s*)?(origin(?:-key|-id)?)\s*:\s*(.+?)\s*$/i);
 		if (!match) continue;
 		const field = match[1]?.toLowerCase();
 		const value = match[2]?.replace(/^['"]|['"]$/g, "") ?? "";
-		if (field !== "origin") return value === key;
+		if (!value) {
+			malformed = true;
+			continue;
+		}
+		if (field !== "origin") {
+			keys.add(value);
+			continue;
+		}
 		try {
-			return originKey(validateOriginRef(JSON.parse(value) as OriginRef)) === key;
+			keys.add(originKey(validateOriginRef(JSON.parse(value) as OriginRef)));
 		} catch {
-			return value === key;
+			if (value.startsWith("{") || value.startsWith("[")) malformed = true;
+			else keys.add(value);
 		}
 	}
-	return false;
+	return { keys, malformed };
+}
+
+function metadataMatches(text: string, key: string): boolean {
+	const association = associatedOriginKeys(text);
+	return !association.malformed && association.keys.size === 1 && association.keys.has(key);
 }
 
 function publicApproved(text: string): boolean {

@@ -113,6 +113,59 @@ describe("session bootstrap builder", () => {
 		expect(result.text).not.toContain("DM SECRET");
 	});
 
+	test("public daily entries fail closed when current and private origins are mixed in either order", async () => {
+		const config = await setup();
+		await mkdir(join(home, "memory", "daily", "2026-08"), { recursive: true });
+		await writeFile(
+			join(home, "memory", "daily", "2026-08", "2026-08-28.md"),
+			[
+				"## current then private",
+				"- origin: discord/channel/c1",
+				"- user: current-neighbor-one",
+				'- origin: {"platform":"discord","kind":"dm","conversationId":"secret-one","peerId":"p1"}',
+				"- user: PRIVATE ONE",
+				"",
+				"## private then current",
+				'- origin: {"platform":"discord","kind":"dm","conversationId":"secret-two","peerId":"p2"}',
+				"- user: PRIVATE TWO",
+				"- origin-key: discord/channel/c1",
+				"- user: current-neighbor-two",
+				"",
+				"## clean current",
+				"- origin-key: discord/channel/c1",
+				"- user: CLEAN CURRENT",
+			].join("\n"),
+		);
+		const result = await build(config);
+		expect(result.text).toContain("CLEAN CURRENT");
+		for (const privateText of ["PRIVATE ONE", "PRIVATE TWO", "current-neighbor-one", "current-neighbor-two"])
+			expect(result.text).not.toContain(privateText);
+	});
+
+	test("a nested heading with a conflicting origin poisons the whole daily section", async () => {
+		const config = await setup();
+		await mkdir(join(home, "memory", "daily"), { recursive: true });
+		await writeFile(
+			join(home, "memory", "daily", "2026-08-28.md"),
+			[
+				"## mixed section",
+				"- origin-key: discord/channel/c1",
+				"- user: apparently current",
+				"### private neighbor",
+				'- origin: {"platform":"discord","kind":"dm","conversationId":"nested-secret","peerId":"p"}',
+				"- user: NESTED PRIVATE",
+				"",
+				"## clean section",
+				"- origin: discord/channel/c1",
+				"- user: CLEAN FLAT",
+			].join("\n"),
+		);
+		const result = await build(config);
+		expect(result.text).toContain("CLEAN FLAT");
+		expect(result.text).not.toContain("apparently current");
+		expect(result.text).not.toContain("NESTED PRIVATE");
+	});
+
 	test("malicious MEMORY traversal and escaped symlink are diagnosed and never read", async () => {
 		const config = await setup();
 		const outside = join(home, "outside.md");
