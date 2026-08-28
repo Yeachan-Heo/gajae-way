@@ -14,6 +14,12 @@ afterEach(async () => {
 });
 async function start(): Promise<string> {
 	const socket = join(home, "gateway.sock");
+	// Channels are `closed` by default now, so this fixture has to say which gate it
+	// is testing: the subject here is crash recovery, not engagement.
+	await Bun.write(
+		join(home, "config.json"),
+		JSON.stringify({ schemaVersion: 1, channels: { channel: { engagement: "open" } } }),
+	);
 	child = Bun.spawn({
 		cmd: ["bun", "packages/gateway/src/main.ts", "daemon"],
 		cwd: join(import.meta.dir, "../../.."),
