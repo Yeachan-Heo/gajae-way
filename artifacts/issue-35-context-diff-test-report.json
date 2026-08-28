@@ -2,19 +2,19 @@
 	"schemaVersion": 1,
 	"kind": "api-package-test-report",
 	"subject": "Issue #35 residual conversation context cursor, reset floor, retention, diagnostics, and schema-13 migration",
-	"testedCommit": "eddcc730902b6cf0199c622e8d70824d47597fb7",
+	"testedCommit": "d57743d5553354a69e2f4865306fb97ff4d7039b",
 	"baseCommit": "9d3139ba334d35b92ef96b1efeb0d8ec50144bff",
-	"recordedAt": "2026-08-28T11:39:13Z",
+	"recordedAt": "2026-08-28T12:07:41Z",
 	"results": [
 		{
 			"command": "bun test packages/gateway/test/context-diff.test.ts packages/gateway/test/context-turn.test.ts packages/gateway/test/server.test.ts packages/gateway/test/inbound-wiring.test.ts packages/gateway/test/inbound-queue.test.ts packages/gateway/test/session-rebind.test.ts packages/gateway/test/migration-drill.test.ts packages/gateway/test/monitor-recovery.test.ts packages/gateway/test/cycle.test.ts packages/admin/test/view.test.ts packages/admin/test/server.test.ts packages/cli/test/main.test.ts packages/adapter-discord/test/adapter.test.ts packages/adapter-telegram/test/adapter.test.ts",
 			"status": "passed",
-			"summary": "222 passed, 0 failed"
+			"summary": "227 passed, 0 failed"
 		},
 		{
 			"command": "bun test packages",
 			"status": "passed",
-			"summary": "1068 passed, 2 skipped, 0 failed across 82 files"
+			"summary": "1073 passed, 2 skipped, 0 failed across 82 files; one earlier parallel-run ENOENT flake in delivery-crash.e2e passed in isolation and the clean full rerun"
 		},
 		{
 			"command": "bun ./node_modules/typescript/bin/tsc --noEmit",
@@ -51,7 +51,9 @@
 		"Newest 60 rows inside the six-hour/session/reset floor are selected and presented chronologically with deterministic timestamp/message-id/row ordering.",
 		"Omitted rows are consumed once, aggregate evidence is retained without bodies, and pending omission evidence is acknowledged with the successful cursor.",
 		"Failures before assistant delivery preserve selected context; terminal text, intentional silence, and duplicate-safe intermediate delivery followed by failure consume it.",
+		"Intermediate text and reaction deliveries are both duplicate-safe; delivery state advances only after ledger admission.",
 		"/new and /reset persist an origin floor across restart without relying on sessions.created_at mutation.",
+		"Reset floors use a durable context row boundary, discard queued pre-reset inbound work, and preserve later omission generations created while a turn is in flight.",
 		"Active maintenance expires stale unread rows and deletes only consumed bodies older than seven days while preserving recent retry-relevant rows.",
 		"Schema 12 upgrades monotonically to 13 while preserving lane jobs, monitor events/slots, and durable rebind counters.",
 		"Gateway status, ops cycle, CLI, and admin expose counts and timestamp ranges only, never context bodies."
