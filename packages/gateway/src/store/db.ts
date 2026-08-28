@@ -383,9 +383,16 @@ export class GatewayDatabase {
 			);
 	}
 
+	/**
+	 * Oldest-first unread rows, optionally bounded to what arrived at or after
+	 * `since`. The cutoff exists because a session that was just created has no
+	 * "last reply" to diff against: without it, a fresh session inherits every
+	 * message the channel ever recorded and reads day-old instructions as current.
+	 */
 	contextUnread(
 		originKey: string,
 		limit = 100,
+		since?: string,
 	): Array<{
 		message_id: string;
 		author_id: string | null;
@@ -398,9 +405,41 @@ export class GatewayDatabase {
 				{ message_id: string; author_id: string | null; author_name: string | null; body: string; received_at: string },
 				[string, number]
 			>(
-				"SELECT message_id, author_id, author_name, body, received_at FROM conversation_context WHERE origin_key = ? AND consumed_at IS NULL ORDER BY received_at, message_id LIMIT ?",
+				since
+					? "SELECT message_id, author_id, author_name, body, received_at FROM conversation_context WHERE origin_key = ? AND consumed_at IS NULL AND received_at >= ? ORDER BY received_at, message_id LIMIT ?"
+					: "SELECT message_id, author_id, author_name, body, received_at FROM conversation_context WHERE origin_key = ? AND consumed_at IS NULL ORDER BY received_at, message_id LIMIT ?",
 			)
-			.all(originKey, limit);
+			.all(...((since ? [originKey, since, limit] : [originKey, limit]) as [string, number]));
+	}
+
+	/** How many unread rows fall before the cutoff, i.e. what the digest is dropping. */
+	contextUnreadOlderCount(originKey: string, since: string): number {
+		return (
+			this.#database
+				.query<{ n: number }, [string, string]>(
+					"SELECT COUNT(*) AS n FROM conversation_context WHERE origin_key = ? AND consumed_at IS NULL AND received_at < ?",
+				)
+				.get(originKey, since)?.n ?? 0
+		);
+	}
+
+	/**
+	 * Marks pre-cutoff rows consumed so a dropped backlog is dropped once, not
+	 * re-evaluated on every turn. The rows stay in the table as history.
+	 */
+	contextConsumeOlderThan(originKey: string, before: string): number {
+		return this.#database
+			.query(
+				"UPDATE conversation_context SET consumed_at = ? WHERE origin_key = ? AND consumed_at IS NULL AND received_at < ?",
+			)
+			.run(new Date().toISOString(), originKey, before).changes;
+	}
+
+	/** When the current session row for this origin was created, if any. */
+	sessionCreatedAt(originKey: string): string | undefined {
+		return this.#database
+			.query<{ created_at: string }, [string]>("SELECT created_at FROM sessions WHERE origin_key = ?")
+			.get(originKey)?.created_at;
 	}
 
 	contextConsume(messageIds: readonly string[]): void {
