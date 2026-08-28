@@ -1,3 +1,4 @@
+import type { GjcModelSelection } from "../config";
 import type { GatewayDatabase } from "../store/db";
 
 export interface TurnProgress {
@@ -47,6 +48,11 @@ export interface GjcPort {
 		onProgress?: (progress: TurnProgress) => void,
 		options?: TurnOptions,
 	): Promise<string>;
+}
+
+export function gjcModelArgs(model: GjcModelSelection | undefined): readonly string[] {
+	if (!model) return [];
+	return typeof model === "string" ? ["--model", model] : ["--mpreset", model.preset];
 }
 
 /**
@@ -139,11 +145,11 @@ export class GjcClient implements GjcPort {
 	readonly #database: GatewayDatabase;
 	readonly #timeoutMs: number;
 	readonly #cwd: string;
-	readonly #model: string | undefined;
+	readonly #model: GjcModelSelection | undefined;
 
 	// 300s ceiling: the persona is an action-capable agent that runs real tools per
 	// turn; 120s killed live owner turns mid-investigation (P1 drill finding).
-	constructor(database: GatewayDatabase, timeoutMs = 300_000, cwd = process.cwd(), model?: string) {
+	constructor(database: GatewayDatabase, timeoutMs = 300_000, cwd = process.cwd(), model?: GjcModelSelection) {
 		this.#database = database;
 		this.#timeoutMs = timeoutMs;
 		this.#cwd = cwd;
@@ -219,7 +225,7 @@ export class GjcClient implements GjcPort {
 				"--mode",
 				"json",
 				...(options?.codingRegister ? [] : ["--system-prompt", GENERIC_AGENT_SYSTEM_PROMPT]),
-				...(this.#model ? ["--model", this.#model] : []),
+				...gjcModelArgs(this.#model),
 				...(systemPreamble ? ["--append-system-prompt", systemPreamble] : []),
 				text,
 			],

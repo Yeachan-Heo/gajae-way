@@ -8,6 +8,8 @@ export interface CredentialFileReference {
 	readonly credentialFile: string;
 }
 
+export type GjcModelSelection = string | { readonly preset: string };
+
 export interface GatewayConfigFile {
 	readonly schemaVersion: typeof CONFIG_SCHEMA_VERSION;
 	readonly logVerbosity?: "debug" | "info" | "warn" | "error";
@@ -15,8 +17,8 @@ export interface GatewayConfigFile {
 	readonly dbPath?: string;
 	/** Per-turn gjc ceiling in milliseconds; default 300000. Long agentic turns need more. */
 	readonly turnTimeoutMs?: number;
-	/** gjc model override for persona turns (fuzzy, e.g. "opus" or "openai/gpt-5.2"); unset = gjc's own default. */
-	readonly model?: string;
+	/** Explicit gjc model selector, or a model profile preset whose default role may contain a fallback chain. */
+	readonly model?: GjcModelSelection;
 	readonly credentials?: Readonly<Record<string, CredentialFileReference>>;
 	readonly channels?: Readonly<Record<string, ChannelPolicy>>;
 	/** Default inbound debounce window in milliseconds; per-channel `debounceMs` overrides it. */
@@ -83,6 +85,17 @@ function optionalString(value: unknown, field: string): string | undefined {
 		throw new ConfigError("config_invalid", `${field} must be a non-empty string`);
 	}
 	return value;
+}
+
+function parseModel(value: unknown): GjcModelSelection | undefined {
+	if (value === undefined) return undefined;
+	if (typeof value === "string") return optionalString(value, "model");
+	const input = requireObject(value, "model");
+	const preset = optionalString(input.preset, "model.preset");
+	if (!preset || Object.keys(input).length !== 1) {
+		throw new ConfigError("config_invalid", "model must be a non-empty string or contain only preset");
+	}
+	return { preset };
 }
 
 function parseCredentials(value: unknown): Readonly<Record<string, CredentialFileReference>> | undefined {
@@ -189,6 +202,7 @@ export function parseConfigFile(value: unknown): GatewayConfigFile {
 	if (logVerbosity !== undefined && !["debug", "info", "warn", "error"].includes(logVerbosity)) {
 		throw new ConfigError("config_invalid", "logVerbosity must be debug, info, warn, or error");
 	}
+	const model = parseModel(input.model);
 	return {
 		schemaVersion: CONFIG_SCHEMA_VERSION,
 		...(logVerbosity ? { logVerbosity: logVerbosity as GatewayConfigFile["logVerbosity"] } : {}),
@@ -206,7 +220,7 @@ export function parseConfigFile(value: unknown): GatewayConfigFile {
 			? {}
 			: { mentionAllowlist: parseStringArray(input.mentionAllowlist, "mentionAllowlist") }),
 		...(input.debounceMs === undefined ? {} : { debounceMs: parseDebounce(input.debounceMs, "debounceMs") }),
-		...(optionalString(input.model, "model") ? { model: optionalString(input.model, "model") } : {}),
+		...(model ? { model } : {}),
 		...(input.ownerTarget === undefined ? {} : { ownerTarget: parseOwnerTarget(input.ownerTarget) }),
 	};
 }
