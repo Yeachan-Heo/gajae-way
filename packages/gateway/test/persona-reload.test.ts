@@ -21,6 +21,7 @@ test("persona USER.md edits are included on the next turn", async () => {
 	const database = await GatewayDatabase.open(config.dbPath);
 	const gjc: GjcPort = {
 		ensureSession: async () => ({ sessionId: "session" }),
+		forgetRebinds: () => {},
 		sendTurn: async (_id, _text, preamble) => {
 			seen.push(preamble ?? "");
 			return "reply";

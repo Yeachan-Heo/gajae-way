@@ -26,6 +26,7 @@ test("event-type sessions persist until their explicit epoch is bumped", async (
 				calls.push({ origin, epoch });
 				return { sessionId: `session-${epoch}` };
 			},
+			forgetRebinds: () => {},
 			sendTurn: async (_id: string, text: string) =>
 				JSON.stringify([
 					{ eventId: (JSON.parse(text.match(/\[.*\]$/s)![0]) as Array<{ eventId: string }>)[0]!.eventId, note: "ok" },

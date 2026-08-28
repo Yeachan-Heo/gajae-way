@@ -11,7 +11,7 @@ export interface InboundMessageRow {
 	readonly received_at: string;
 }
 
-const LATEST_SCHEMA_VERSION = 11;
+const LATEST_SCHEMA_VERSION = 12;
 /** A scheduled cron slot the gateway claimed or fired for one monitor. */
 export interface MonitorSlotRow {
 	readonly monitor_id: string;
@@ -125,6 +125,29 @@ export class GatewayDatabase {
 		return this.#database
 			.query<{ epoch: number }, [string]>("SELECT epoch FROM sessions WHERE origin_key = ?")
 			.get(originKey)!.epoch;
+	}
+
+	/**
+	 * Rebind reset for a poisoned gjc session key (#13): the same semantics as
+	 * the `/new` reset path — epoch + 1, turn_count back to 0, and the gjc
+	 * binding cleared, so the next session.create op derives a fresh idempotency
+	 * key and a recovery near the rotation boundary cannot instantly discard its
+	 * fresh binding on an inherited count — but the stored origin ref is kept,
+	 * because a rebind is a runtime recovery rather than a user command and
+	 * carries no origin payload of its own.
+	 */
+	rebindEpoch(originKey: string): number {
+		const now = new Date().toISOString();
+		this.#database
+			.query(
+				"INSERT INTO sessions (origin_key, gjc_session_id, epoch, turn_count, created_at, last_activity_at) VALUES (?, '', 1, 0, ?, ?) ON CONFLICT(origin_key) DO UPDATE SET epoch = epoch + 1, gjc_session_id = '', turn_count = 0, last_activity_at = excluded.last_activity_at",
+			)
+			.run(originKey, now, now);
+		const row = this.#database
+			.query<{ epoch: number }, [string]>("SELECT epoch FROM sessions WHERE origin_key = ?")
+			.get(originKey);
+		if (!row) throw new Error(`session row for ${originKey} disappeared during rebind`);
+		return row.epoch;
 	}
 
 	updateActivity(originKey: string, originRefJson: string): void {
@@ -1168,16 +1191,22 @@ SELECT 1 FROM dispatch_leases l WHERE l.event_id = monitor_events.event_id AND l
 		}
 		if (current < 10) {
 			this.withTransaction(() => {
-				// Monitor recovery (issue #29): SQLite cannot ALTER a CHECK constraint, so
-				// monitor_events is rebuilt with the extended stage contract (authored_
-				// no_delivery, failed_no_retry) plus a per-event reclaim counter, and the
-				// new bounded evidence tables are created. Recovery semantics:
-				// - every legacy row keeps its stage (reconcile now reclaims `batched`),
-				// - the two live stranded `batched` rows stay `batched` and are reclaimed
-				//   automatically by the next reconcile — no manual DB mutation.
-				// Fail-closed: any legacy stage outside the contract is surfaced by the
-				// runtime cycle projection as `monitor_settlement_stuck`, never silently
-				// accepted.
+				// Issue #10: durable lane jobs. One row per job; the record JSON is the
+				// fail-closed authority (schema-validated on read by @gajaeway/subsession),
+				// while the status column stays a plain indexed projection for operators.
+				this.#database.exec(
+					"CREATE TABLE lane_jobs (job_id TEXT PRIMARY KEY, lane_key TEXT NOT NULL UNIQUE, branch TEXT NOT NULL, worktree_path TEXT NOT NULL, state TEXT NOT NULL CHECK(state IN ('running','attempt_ended','awaiting_operator','stalled','done','aborted')), record_json TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL)",
+				);
+				this.#database
+					.query("INSERT INTO schema_migrations (version, applied_at) VALUES (?, ?)")
+					.run(10, new Date().toISOString());
+			});
+		}
+		if (current < 11) {
+			this.withTransaction(() => {
+				// Monitor recovery (issue #29): extend the monitor event state contract,
+				// preserve every legacy row, and add bounded operator evidence/slot tables.
+				// Existing schema-10 lane_jobs deployments reach this step without loss.
 				this.#database.exec(
 					`CREATE TABLE monitor_events_new (event_id TEXT PRIMARY KEY, monitor_id TEXT NOT NULL, event_type TEXT NOT NULL, payload_json TEXT NOT NULL, fired_at TEXT NOT NULL, stage TEXT NOT NULL CHECK(stage IN ('admitted','batched','dispatched','authored','delivered','authored_no_delivery','failed','failed_no_retry')), batch_id TEXT, dispatch_attempts INTEGER NOT NULL DEFAULT 0, updated_at TEXT NOT NULL);
 INSERT INTO monitor_events_new (event_id, monitor_id, event_type, payload_json, fired_at, stage, batch_id, dispatch_attempts, updated_at) SELECT event_id, monitor_id, event_type, payload_json, fired_at, stage, batch_id, 0, updated_at FROM monitor_events;
@@ -1189,20 +1218,12 @@ CREATE TABLE monitor_slots (monitor_id TEXT NOT NULL, slot_at TEXT NOT NULL, cre
 				);
 				this.#database
 					.query("INSERT INTO schema_migrations (version, applied_at) VALUES (?, ?)")
-					.run(10, new Date().toISOString());
+					.run(11, new Date().toISOString());
 			});
 		}
-		if (current < 11) {
+		if (current < 12) {
 			this.withTransaction(() => {
-				// Red-team hardening of the #29 recovery design:
-				// - dispatch_leases: durable per-event dispatch ownership (owner token +
-				//   expiry) so a NEW gateway process cannot re-author an event whose
-				//   authoring turn may still be alive in an external gjc session after
-				//   the old process died; only expired claims are recoverable, and a
-				//   stale attempt's completion can never overwrite a newer lease.
-				// - monitor_slots.event_id: slot claim and event admission commit in ONE
-				//   transaction, so a crash between "slot claimed" and "event created"
-				//   cannot strand a fired-but-unadmitted slot.
+				// Durable dispatch ownership and atomic scheduled-slot admission.
 				this.#database.exec(
 					`CREATE TABLE dispatch_leases (event_id TEXT PRIMARY KEY, owner TEXT NOT NULL, lease_id TEXT NOT NULL, acquired_at TEXT NOT NULL, expires_at TEXT NOT NULL);
 CREATE INDEX dispatch_leases_expiry ON dispatch_leases (expires_at);
@@ -1210,9 +1231,74 @@ ALTER TABLE monitor_slots ADD COLUMN event_id TEXT;`,
 				);
 				this.#database
 					.query("INSERT INTO schema_migrations (version, applied_at) VALUES (?, ?)")
-					.run(11, new Date().toISOString());
+					.run(12, new Date().toISOString());
 			});
 		}
+	}
+	// --- Issue #10: durable lane jobs ---------------------------------------
+
+	/**
+	 * Upserts a validated lane job record. Callers MUST pass an already
+	 * schema-validated record (parseLaneJobRecord output); the database stores
+	 * the JSON verbatim so reads can re-validate fail-closed.
+	 */
+	putLaneJob(job: {
+		readonly jobId: string;
+		readonly laneKey: string;
+		readonly state: string;
+		readonly createdAt: string;
+		readonly updatedAt: string;
+		readonly lane: { readonly branch: string; readonly worktreePath: string };
+		readonly json: string;
+	}): void {
+		this.#database
+			.query(
+				"INSERT INTO lane_jobs (job_id, lane_key, branch, worktree_path, state, record_json, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(job_id) DO UPDATE SET lane_key = excluded.lane_key, branch = excluded.branch, worktree_path = excluded.worktree_path, state = excluded.state, record_json = excluded.record_json, updated_at = excluded.updated_at",
+			)
+			.run(
+				job.jobId,
+				job.laneKey,
+				job.lane.branch,
+				job.lane.worktreePath,
+				job.state,
+				job.json,
+				job.createdAt,
+				job.updatedAt,
+			);
+	}
+
+	laneJobJson(jobId: string): string | undefined {
+		return this.#database
+			.query<{ record_json: string }, [string]>("SELECT record_json FROM lane_jobs WHERE job_id = ?")
+			.get(jobId)?.record_json;
+	}
+
+	laneJobJsonByLaneKey(laneKey: string): string | undefined {
+		return this.#database
+			.query<{ record_json: string }, [string]>("SELECT record_json FROM lane_jobs WHERE lane_key = ?")
+			.get(laneKey)?.record_json;
+	}
+
+	laneJobRows(): Array<{
+		job_id: string;
+		lane_key: string;
+		state: string;
+		branch: string;
+		worktree_path: string;
+		updated_at: string;
+	}> {
+		return this.#database
+			.query(
+				"SELECT job_id, lane_key, state, branch, worktree_path, updated_at FROM lane_jobs ORDER BY updated_at DESC",
+			)
+			.all() as Array<{
+			job_id: string;
+			lane_key: string;
+			state: string;
+			branch: string;
+			worktree_path: string;
+			updated_at: string;
+		}>;
 	}
 
 	get instanceId(): string {

@@ -63,7 +63,8 @@ async function gateway(reply: string): Promise<Harness> {
 		socketPath: join(directory, "gateway.sock"),
 		dbPath: join(directory, "gateway.db"),
 		logVerbosity: "info",
-		channels: { "chan-1": { engagement: "open" } },
+		// Both keys: a bare id only resolves for discord, so telegram needs the prefixed form.
+		channels: { "chan-1": { engagement: "open" }, "telegram:chan-1": { engagement: "open" } },
 	};
 	const database = await GatewayDatabase.open(config.dbPath);
 	const turns: string[] = [];
@@ -73,6 +74,7 @@ async function gateway(reply: string): Promise<Harness> {
 			turns.push(text);
 			return reply;
 		},
+		forgetRebinds: () => {},
 	};
 	server = await startUnixServer({ config, database, gjc, onStop: () => database.close() });
 	const client = await connect(config.socketPath);

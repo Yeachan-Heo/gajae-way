@@ -63,6 +63,7 @@ test("a duplicate message id is acknowledged but never dispatched twice", async 
 	const turns: string[] = [];
 	const gjc: GjcPort = {
 		ensureSession: async () => ({ sessionId: "mock-session" }),
+		forgetRebinds: () => {},
 		sendTurn: async (_session, text) => {
 			turns.push(text);
 			return "mock reply";
@@ -97,6 +98,7 @@ test("a message arriving while a turn is in flight is drained afterwards, not dr
 	});
 	const gjc: GjcPort = {
 		ensureSession: async () => ({ sessionId: "mock-session" }),
+		forgetRebinds: () => {},
 		sendTurn: async (_session, text) => {
 			turns.push(text);
 			if (turns.length === 1) await gate;

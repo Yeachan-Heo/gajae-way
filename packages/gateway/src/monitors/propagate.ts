@@ -58,6 +58,8 @@ export class MonitorPropagator {
 	#reconciling = false;
 	/** In-flight dispatch promises per event, for awaitable submission. */
 	#inFlightPromises = new Map<string, Promise<void>>();
+	/** Serialize GJC monitor turns per session origin; binds can coalesce, turns cannot. */
+	#turnChains = new Map<string, Promise<void>>();
 	constructor(options: {
 		database: GatewayDatabase;
 		registry: MonitorRegistry;
@@ -345,13 +347,27 @@ export class MonitorPropagator {
 			leaseTtlMs,
 		);
 		const declared = new Set(monitor.eventTypes);
-		const sessionOrigin = declared.has(claimed[0]?.event_type)
-			? eventTypeOrigin(rows[0]?.event_type)
-			: CATCH_ALL_EVENT_ORIGIN;
+		const sessionOriginKey = originKey(
+			declared.has(claimed[0]?.event_type) ? eventTypeOrigin(claimed[0]!.event_type) : CATCH_ALL_EVENT_ORIGIN,
+		);
+		// Preserve PR #26's per-origin turn serialization while the PR #30 lease
+		// remains heartbeated. A later batch waits for the prior turn, then owns the
+		// session until this dispatch's finally block releases the chain.
+		const previousTurn = this.#turnChains.get(sessionOriginKey);
+		let releaseTurn!: () => void;
+		const currentTurn = new Promise<void>((resolve) => {
+			releaseTurn = resolve;
+		});
+		const trackedTurn = (previousTurn ?? Promise.resolve()).then(
+			() => currentTurn,
+			() => currentTurn,
+		);
+		this.#turnChains.set(sessionOriginKey, trackedTurn);
+		if (previousTurn) await previousTurn.catch(() => undefined);
 		try {
 			const { sessionId } = await this.#gjc.ensureSession(
-				originKey(sessionOrigin),
-				this.#database.getSessionRecord(originKey(sessionOrigin))?.epoch ?? 0,
+				sessionOriginKey,
+				this.#database.getSessionRecord(sessionOriginKey)?.epoch ?? 0,
 			);
 			const guidance = claimed
 				.map((row) => MAINTENANCE_GUIDANCE[row.event_type])
@@ -487,6 +503,8 @@ export class MonitorPropagator {
 			// expired and another process stole the claim, this release is a no-op,
 			// and a stale attempt's completion can never overwrite the newer claim.
 			for (const row of leased) this.#database.monitorEventReleaseLease(row.event_id, leaseId);
+			releaseTurn();
+			if (this.#turnChains.get(sessionOriginKey) === trackedTurn) this.#turnChains.delete(sessionOriginKey);
 		}
 	}
 	/**

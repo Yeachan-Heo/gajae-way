@@ -26,6 +26,7 @@ test("reconciliation uses retained authored output and otherwise re-dispatches",
 				dispatches.push(origin);
 				return { sessionId: "event-session" };
 			},
+			forgetRebinds: () => {},
 			sendTurn: async (_id: string, text: string) =>
 				JSON.stringify(
 					(JSON.parse(text.match(/\[.*\]$/s)![0]) as Array<{ eventId: string }>).map(({ eventId }) => ({
@@ -97,7 +98,11 @@ test("reconcile replays same-millisecond events oldest-first", async () => {
 		const pipeline = new MonitorPropagator({
 			database,
 			registry,
-			gjc: { ensureSession: async () => ({ sessionId: "s" }), sendTurn: async () => "[]" },
+			gjc: {
+				ensureSession: async () => ({ sessionId: "s" }),
+				forgetRebinds: () => {},
+				sendTurn: async () => "[]",
+			},
 			memory: { enqueue: () => "intent", enqueueExistingId: () => {} } as never,
 			delivery: new DeliveryService(new DeliveryLedger(database)),
 			emit: () => {},
@@ -156,6 +161,7 @@ test("a monitor without its own channel target reports authored notes to the own
 		registry,
 		gjc: {
 			ensureSession: async () => ({ sessionId: "s" }),
+			forgetRebinds: () => {},
 			sendTurn: async (_id: string, prompt: string) =>
 				JSON.stringify(
 					(JSON.parse(prompt.match(/\[.*\]$/s)?.[0] ?? "[]") as Array<{ eventId: string }>).map(({ eventId }) => ({

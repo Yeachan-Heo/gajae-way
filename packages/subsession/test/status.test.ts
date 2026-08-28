@@ -94,6 +94,32 @@ describe("parseStatusReport", () => {
 		const report = parseStatusReport(envelope({ status: { status: "accepted", receiptState: "weird" } }));
 		expect(report.status.receiptState).toBeUndefined();
 	});
+
+	test("keeps the error envelope so a deadline kill stays diagnosable (#9)", () => {
+		const report = parseStatusReport(
+			envelope({
+				operationRef: "r",
+				status: {
+					status: "failed",
+					acceptedAt: 1787803784311,
+					startedAt: 1787803784312,
+					terminalAt: 1787805584444,
+					error: { code: "prompt_deadline_exceeded", message: "Prompt deadline exceeded." },
+				},
+				summary: { completed: true },
+			}),
+		);
+		expect(report.status.error).toEqual({
+			code: "prompt_deadline_exceeded",
+			message: "Prompt deadline exceeded.",
+		});
+		expect(report.status.terminalAt).toBe(1787805584444);
+	});
+
+	test("an envelope without an error body leaves the field absent", () => {
+		const report = parseStatusReport(envelope({ status: { status: "failed", receiptState: "present" } }));
+		expect(report.status.error).toBeUndefined();
+	});
 });
 
 describe("projectOpState", () => {

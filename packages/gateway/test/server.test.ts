@@ -2,6 +2,7 @@ import { afterEach, expect, test } from "bun:test";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { MAX_STALLED_CONTINUATIONS, parseLaneJobRecord } from "@gajaeway/subsession";
 import type { GatewayConfig } from "../src/config";
 import type { GjcPort } from "../src/orchestrator/gjc-client";
 import { type GatewayServer, startUnixServer } from "../src/server/server";
@@ -51,6 +52,7 @@ test("requires negotiation then serves status, shutdown, and validates chat para
 	const database = await GatewayDatabase.open(config.dbPath);
 	const gjc: GjcPort = {
 		ensureSession: async () => ({ sessionId: "mock-session" }),
+		forgetRebinds: () => {},
 		sendTurn: async () => "mock reply",
 	};
 	server = await startUnixServer({
@@ -69,7 +71,7 @@ test("requires negotiation then serves status, shutdown, and validates chat para
 	expect(client.frames[1].type).toBe("negotiated");
 	client.send({ v: "0.1", type: "request", id: "status", verb: "gateway.status" });
 	await waitFor(client.frames, 3);
-	expect(client.frames[2].result.schemaVersion).toBe(11);
+	expect(client.frames[2].result.schemaVersion).toBe(12);
 	expect(client.frames[2].result.startedAt).toBe("2026-01-01T00:00:00.000Z");
 	client.send({
 		v: "0.1",
@@ -110,6 +112,7 @@ test("a failed platform turn still delivers a visible ledgered failure notice", 
 	const database = await GatewayDatabase.open(config.dbPath);
 	const gjc: GjcPort = {
 		ensureSession: async () => ({ sessionId: "mock-session" }),
+		forgetRebinds: () => {},
 		sendTurn: async () => {
 			throw new Error("gjc turn timed out after 300000ms");
 		},
@@ -152,6 +155,7 @@ test("long turns broadcast throttled chat.progress liveness events", async () =>
 	const database = await GatewayDatabase.open(config.dbPath);
 	const gjc: GjcPort = {
 		ensureSession: async () => ({ sessionId: "mock-session" }),
+		forgetRebinds: () => {},
 		sendTurn: async (_session, _text, _preamble, onProgress) => {
 			for (let call = 1; call <= 3; call++) {
 				await Bun.sleep(5);
@@ -216,6 +220,7 @@ test("debounced burst becomes one turn carrying the unread diff with speaker att
 	const turns: Array<{ text: string; preamble: string }> = [];
 	const gjc: GjcPort = {
 		ensureSession: async () => ({ sessionId: "mock-session" }),
+		forgetRebinds: () => {},
 		sendTurn: async (_session, text, preamble) => {
 			turns.push({ text, preamble: preamble ?? "" });
 			return "batched reply";
@@ -252,8 +257,8 @@ test("debounced burst becomes one turn carrying the unread diff with speaker att
 	say("m4", "follow-up", "owner", "bellman", true);
 	for (let attempt = 0; attempt < 400 && turns.length < 2; attempt++) await Bun.sleep(10);
 	expect(turns).toHaveLength(2);
-	expect(turns[1]!.text).not.toContain("first message");
-	expect(turns[1]!.text).toContain("follow-up");
+	expect(turns[1]?.text).not.toContain("first message");
+	expect(turns[1]?.text).toContain("follow-up");
 	client.close();
 });
 
@@ -272,6 +277,7 @@ test("group turns carry silence guidance: listeners are told to default to [SILE
 	const preambles: string[] = [];
 	const gjc: GjcPort = {
 		ensureSession: async () => ({ sessionId: "mock-session" }),
+		forgetRebinds: () => {},
 		sendTurn: async (_session, _text, preamble) => {
 			preambles.push(preamble ?? "");
 			return "[SILENT]";
@@ -315,6 +321,7 @@ test("[REPLY:id] parts thread to the referenced message and strip the directive"
 	const database = await GatewayDatabase.open(config.dbPath);
 	const gjc: GjcPort = {
 		ensureSession: async () => ({ sessionId: "mock-session" }),
+		forgetRebinds: () => {},
 		sendTurn: async () => "[REPLY:msg-42] threaded answer\n[BREAK]\nplain follow-up",
 	};
 	server = await startUnixServer({ config, database, gjc, onStop: () => database.close() });
@@ -362,6 +369,7 @@ test("work.run runs a named worker session in the requested cwd and returns the 
 			seen.push({ key, options });
 			return { sessionId: "worker-session" };
 		},
+		forgetRebinds: () => {},
 		sendTurn: async (_session, text, _preamble, _progress, options) => {
 			seen.push({ text, options });
 			return "worker result";
@@ -380,7 +388,7 @@ test("work.run runs a named worker session in the requested cwd and returns the 
 	});
 	await waitFor(client.frames, 2);
 	const response = client.frames.find((frame) => frame.type === "response" && frame.id === "w");
-	expect(response.result).toEqual({ text: "worker result", sessionKey: "work/task/repo-fix" });
+	expect(response.result).toMatchObject({ text: "worker result", sessionKey: "work/task/repo-fix", held: false });
 	expect(seen[0]).toMatchObject({
 		key: "work/task/repo-fix",
 		options: { cwd: "/tmp/some-repo", codingRegister: true },
@@ -390,5 +398,258 @@ test("work.run runs a named worker session in the requested cwd and returns the 
 	client.send({ v: "0.1", type: "request", id: "bad", verb: "work.run", params: { name: "../evil", text: "x" } });
 	await waitFor(client.frames, 3);
 	expect(client.frames.find((frame) => frame.type === "error" && frame.id === "bad")).toBeDefined();
+	client.close();
+});
+
+test("work.run records a durable lane job and work.jobs projects it (issue #10)", async () => {
+	directory = await mkdtemp(join(tmpdir(), "gajaeway-server-"));
+	const config: GatewayConfig = {
+		schemaVersion: 1,
+		home: directory,
+		configPath: join(directory, "config.json"),
+		socketPath: join(directory, "gateway.sock"),
+		dbPath: join(directory, "gateway.db"),
+		logVerbosity: "info",
+	};
+	const database = await GatewayDatabase.open(config.dbPath);
+	const gjc: GjcPort = {
+		ensureSession: async () => ({ sessionId: "0f1e2d3c-4b5a-4678-8796-a5b4c3d2e1f0" }),
+		sendTurn: async () => "worker result",
+		forgetRebinds: () => {},
+	};
+	server = await startUnixServer({ config, database, gjc, onStop: () => database.close() });
+	const client = await connect(config.socketPath);
+	client.send({ v: "0.1", type: "hello", payload: { supportedVersions: ["0.1"] } });
+	await waitFor(client.frames, 1);
+	client.send({
+		v: "0.1",
+		type: "request",
+		id: "w",
+		verb: "work.run",
+		params: { name: "Repo.Fix-2", text: "fix the bug" },
+	});
+	await waitFor(client.frames, 2);
+	const run = client.frames.find((frame) => frame.type === "response" && frame.id === "w");
+	expect(run.result).toMatchObject({ held: false, text: "worker result" });
+	const jobId = run.result.jobId;
+	expect(jobId).toBe(`lanejob-${Buffer.from("Repo.Fix-2", "utf8").toString("hex")}`);
+
+	client.send({ v: "0.1", type: "request", id: "jobs", verb: "work.jobs" });
+	await waitFor(client.frames, 3);
+	const jobs = client.frames.find((frame) => frame.type === "response" && frame.id === "jobs");
+	expect(jobs.result.jobs).toHaveLength(1);
+	expect(jobs.result.jobs[0].job_id).toBe(jobId);
+	expect(jobs.result.jobs[0].lane_key).toBe("work-Repo.Fix-2");
+	// The completed ATTEMPT closed; the JOB stays continuable (attempt_ended),
+	// never a terminal work-failure.
+	expect(jobs.result.jobs[0].state).toBe("attempt_ended");
+	// No commit was made, so the pre-existing HEAD must NOT appear as a
+	// worker checkpoint: progress is measured against the creation baseline.
+	expect(jobs.result.jobs[0].checkpoints).toBe(0);
+
+	// The stored authority carries the closed attempt; the record is restart-safe.
+	const raw = database.laneJobJson(jobId);
+	expect(typeof raw).toBe("string");
+	const parsed = parseLaneJobRecord(raw as string);
+	expect(parsed.attempts).toHaveLength(1);
+	expect(parsed.attempts[0].endState).toBe("completed");
+	expect(parsed.attempts[0].sessionId).toBe("0f1e2d3c-4b5a-4678-8796-a5b4c3d2e1f0");
+	expect(parsed.lane.worktreePath).toBe(process.cwd());
+
+	// A crashed predecessor's open attempt holds the job: the next work.run
+	// records the uncertainty and REFUSES to continue without an operator ack.
+	database.putLaneJob({
+		jobId: parsed.jobId,
+		laneKey: "work-Repo.Fix-2",
+		state: "running",
+		createdAt: parsed.createdAt,
+		updatedAt: new Date().toISOString(),
+		lane: parsed.lane,
+		json: JSON.stringify({
+			...parsed,
+			attempts: [{ ...parsed.attempts[0], endState: undefined, endedAt: undefined }],
+		}),
+	});
+	const manipulated = JSON.parse(database.laneJobJson(jobId) as string);
+	client.send({ v: "0.1", type: "request", id: "w2", verb: "work.run", params: { name: "Repo.Fix-2", text: "again" } });
+	async function waitId(id: string): Promise<void> {
+		for (let attempt = 0; attempt < 400 && !client.frames.some((f) => f.id === id); attempt++) await Bun.sleep(5);
+	}
+	await waitId("w2");
+	const held = client.frames.find((frame) => frame.id === "w2" && frame.type !== undefined);
+	expect(held.type).toBe("response");
+	expect(held.result).toMatchObject({ held: true, state: "awaiting_operator" });
+	expect(held.result.reason).toMatch(/terminally uncertain/);
+
+	// resume: true is the explicit operator acknowledgement.
+	client.send({
+		v: "0.1",
+		type: "request",
+		id: "w3",
+		verb: "work.run",
+		params: { name: "Repo.Fix-2", text: "again", resume: true },
+	});
+	await waitId("w3");
+	const resumed = client.frames.find((frame) => frame.type === "response" && frame.id === "w3");
+	expect(resumed.result).toMatchObject({ held: false, text: "worker result" });
+	const revived = parseLaneJobRecord(database.laneJobJson(jobId) as string);
+	// Uncertain predecessor closed + resumed attempt: the crash case writes
+	// exactly one hold, one continuation.
+	expect(revived.attempts).toHaveLength(2);
+	expect(revived.attempts[0].endState).toBe("terminal_uncertain");
+	expect(revived.escalations.some((entry) => entry.includes("terminal_uncertain"))).toBe(true);
+	// Only the LAST attempt is open, and it closed completed.
+	expect(revived.attempts.at(-1)?.endState).toBe("completed");
+	client.send({ v: "0.1", type: "request", id: "jobs2", verb: "work.jobs" });
+	await waitId("jobs2");
+	const jobs2 = client.frames.find((frame) => frame.type === "response" && frame.id === "jobs2");
+	expect(jobs2.result.jobs[0].state).toBe("attempt_ended");
+	client.close();
+});
+
+test("a stalled durable job holds the next work.run until resume (production path)", async () => {
+	directory = await mkdtemp(join(tmpdir(), "gajaeway-server-"));
+	const config: GatewayConfig = {
+		schemaVersion: 1,
+		home: directory,
+		configPath: join(directory, "config.json"),
+		socketPath: join(directory, "gateway.sock"),
+		dbPath: join(directory, "gateway.db"),
+		logVerbosity: "info",
+	};
+	const database = await GatewayDatabase.open(config.dbPath);
+	let turns = 0;
+	const gjc: GjcPort = {
+		ensureSession: async () => ({ sessionId: "0f1e2d3c-4b5a-4678-8796-a5b4c3d2e1f0" }),
+		sendTurn: async () => {
+			turns += 1;
+			return "worker result";
+		},
+		forgetRebinds: () => {},
+	};
+	server = await startUnixServer({ config, database, gjc, onStop: () => database.close() });
+	const client = await connect(config.socketPath);
+	client.send({ v: "0.1", type: "hello", payload: { supportedVersions: ["0.1"] } });
+	await waitFor(client.frames, 1);
+	client.send({ v: "0.1", type: "request", id: "w", verb: "work.run", params: { name: "stall-out", text: "x" } });
+	await waitFor(client.frames, 2);
+	expect(client.frames.find((frame) => frame.type === "response" && frame.id === "w")).toBeDefined();
+	// Simulate the reconciliation outcome after repeated stalled continuations.
+	const first = parseLaneJobRecord(
+		database.laneJobJson(`lanejob-${Buffer.from("stall-out", "utf8").toString("hex")}`) as string,
+	);
+	database.putLaneJob({
+		jobId: first.jobId,
+		laneKey: `work-stall-out`,
+		state: "stalled",
+		createdAt: first.createdAt,
+		updatedAt: new Date().toISOString(),
+		lane: first.lane,
+		json: JSON.stringify({ ...first, state: "stalled", stalledContinuations: MAX_STALLED_CONTINUATIONS }),
+	});
+	client.send({ v: "0.1", type: "request", id: "w2", verb: "work.run", params: { name: "stall-out", text: "x" } });
+	async function waitId2(id: string): Promise<void> {
+		for (let attempt = 0; attempt < 400 && !client.frames.some((f) => f.id === id && f.type !== undefined); attempt++)
+			await Bun.sleep(5);
+	}
+	await waitId2("w2");
+	const held = client.frames.find((frame) => frame.type === "response" && frame.id === "w2");
+	expect(held.result).toMatchObject({ held: true, state: "stalled" });
+	// The turn must NOT have run while held.
+	expect(turns).toBe(1);
+	// resume:true is the explicit operator acknowledgement that proceeds.
+	client.send({
+		v: "0.1",
+		type: "request",
+		id: "w3",
+		verb: "work.run",
+		params: { name: "stall-out", text: "x", resume: true },
+	});
+	await waitId2("w3");
+	expect(
+		client.frames.find((frame) => frame.type === "response" && frame.id === "w3" && frame.result?.held === false),
+	).toBeDefined();
+	expect(turns).toBe(2);
+	client.close();
+});
+test("resuming a stalled job clears the hold durably: the next ordinary call is not held", async () => {
+	directory = await mkdtemp(join(tmpdir(), "gajaeway-server-"));
+	const config: GatewayConfig = {
+		schemaVersion: 1,
+		home: directory,
+		configPath: join(directory, "config.json"),
+		socketPath: join(directory, "gateway.sock"),
+		dbPath: join(directory, "gateway.db"),
+		logVerbosity: "info",
+	};
+	const database = await GatewayDatabase.open(config.dbPath);
+	let turns = 0;
+	const gjc: GjcPort = {
+		ensureSession: async () => ({ sessionId: "0f1e2d3c-4b5a-4678-8796-a5b4c3d2e1f0" }),
+		sendTurn: async () => {
+			turns += 1;
+			return "worker result";
+		},
+		forgetRebinds: () => {},
+	};
+	server = await startUnixServer({ config, database, gjc, onStop: () => database.close() });
+	const client = await connect(config.socketPath);
+	client.send({ v: "0.1", type: "hello", payload: { supportedVersions: ["0.1"] } });
+	await waitFor(client.frames, 1);
+	const jobId = `lanejob-${Buffer.from("stall-clear", "utf8").toString("hex")}`;
+
+	// First run succeeds (creates the job).
+	client.send({ v: "0.1", type: "request", id: "w1", verb: "work.run", params: { name: "stall-clear", text: "x" } });
+	async function waitId3(id: string): Promise<void> {
+		for (let attempt = 0; attempt < 400 && !client.frames.some((f) => f.id === id && f.type !== undefined); attempt++)
+			await Bun.sleep(5);
+	}
+	await waitId3("w1");
+
+	// Force the stalled hold, as reconciliation would after repeat stalls.
+	const first = parseLaneJobRecord(database.laneJobJson(jobId) as string);
+	database.putLaneJob({
+		jobId: first.jobId,
+		laneKey: "work-stall-clear",
+		state: "stalled",
+		createdAt: first.createdAt,
+		updatedAt: new Date().toISOString(),
+		lane: first.lane,
+		json: JSON.stringify({ ...first, state: "stalled", stalledContinuations: MAX_STALLED_CONTINUATIONS }),
+	});
+
+	// Ordinary call: held.
+	client.send({ v: "0.1", type: "request", id: "w2", verb: "work.run", params: { name: "stall-clear", text: "x" } });
+	await waitId3("w2");
+	expect(client.frames.find((frame) => frame.id === "w2" && frame.type === "response")?.result).toMatchObject({
+		held: true,
+		state: "stalled",
+	});
+	expect(turns).toBe(1);
+
+	// resume:true: runs AND durably clears the hold with an audit entry.
+	client.send({
+		v: "0.1",
+		type: "request",
+		id: "w3",
+		verb: "work.run",
+		params: { name: "stall-clear", text: "x", resume: true },
+	});
+	await waitId3("w3");
+	expect(client.frames.find((frame) => frame.id === "w3" && frame.type === "response")?.result).toMatchObject({
+		held: false,
+		text: "worker result",
+	});
+	const afterResume = parseLaneJobRecord(database.laneJobJson(jobId) as string);
+	expect(afterResume.stalledContinuations).toBe(0);
+	expect(afterResume.escalations.some((entry) => entry.includes("operator resume acknowledged"))).toBe(true);
+
+	// The NEXT ordinary call is not held by the old stalled state.
+	client.send({ v: "0.1", type: "request", id: "w4", verb: "work.run", params: { name: "stall-clear", text: "x" } });
+	await waitId3("w4");
+	expect(client.frames.find((frame) => frame.id === "w4" && frame.type === "response")?.result).toMatchObject({
+		held: false,
+	});
+	expect(turns).toBe(3);
 	client.close();
 });

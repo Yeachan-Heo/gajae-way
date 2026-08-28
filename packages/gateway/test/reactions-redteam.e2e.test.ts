@@ -174,6 +174,7 @@ async function gateway(reply: string[] | ((text: string) => string | Promise<str
 			if (typeof reply === "function") return reply(text);
 			return reply[index++] ?? "unused";
 		},
+		forgetRebinds: () => {},
 	};
 	server = await startUnixServer({ config, database, gjc, onStop: () => database.close() });
 	const client = await connect(config.socketPath);
@@ -1519,6 +1520,7 @@ async function preambleGateway(): Promise<{ client: Client; preambles: string[] 
 			preambles.push(systemPreamble ?? "");
 			return "[SILENT]";
 		},
+		forgetRebinds: () => {},
 	};
 	server = await startUnixServer({ config, database, gjc, onStop: () => database.close() });
 	const client = await connect(config.socketPath);

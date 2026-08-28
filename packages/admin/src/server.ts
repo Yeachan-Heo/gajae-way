@@ -54,6 +54,7 @@ export type AdminApp = {
 const READ_ROUTES: Record<string, string> = {
 	"/api/status": "gateway.status",
 	"/api/sessions": "session.list",
+	"/api/jobs": "work.jobs",
 	"/api/monitors": "monitor.list",
 };
 

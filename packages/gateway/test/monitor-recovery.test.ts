@@ -26,7 +26,7 @@ afterEach(async () => {
 });
 
 function fakeGjc(sendTurn: GjcPort["sendTurn"]): GjcPort {
-	return { ensureSession: async () => ({ sessionId: "s1" }), sendTurn };
+	return { ensureSession: async () => ({ sessionId: "s1" }), forgetRebinds: () => {}, sendTurn };
 }
 
 async function harness(
@@ -339,6 +339,7 @@ describe("cron slot catch-up", () => {
 				database: db,
 				registry,
 				gjc: {
+					forgetRebinds: () => {},
 					ensureSession: async () => ({ sessionId: "s" }),
 					sendTurn: async (_id, text) =>
 						JSON.stringify(eventsFromPrompt(text).map(({ eventId: id }) => ({ eventId: id, note: "note" }))),
@@ -658,6 +659,7 @@ describe("durable dispatch leases (restart-concurrent authoring)", () => {
 				database: db,
 				registry,
 				gjc: {
+					forgetRebinds: () => {},
 					ensureSession: async () => ({ sessionId: "s" }),
 					sendTurn: async (_id, text) =>
 						JSON.stringify(eventsFromPrompt(text).map(({ eventId: id }) => ({ eventId: id, note: "note" }))),
@@ -762,6 +764,7 @@ describe("durable dispatch leases — concurrent attempts (true overlap)", () =>
 				database: db,
 				registry,
 				gjc: {
+					forgetRebinds: () => {},
 					ensureSession: async () => ({ sessionId: "s" }),
 					sendTurn: async () => {
 						sendTurnRan = true;
@@ -808,6 +811,7 @@ describe("durable dispatch leases — concurrent attempts (true overlap)", () =>
 				database: db,
 				registry,
 				gjc: {
+					forgetRebinds: () => {},
 					ensureSession: async () => ({ sessionId: "s" }),
 					sendTurn: async (_id, text) => {
 						turnsA++;
@@ -826,6 +830,7 @@ describe("durable dispatch leases — concurrent attempts (true overlap)", () =>
 				database: db,
 				registry,
 				gjc: {
+					forgetRebinds: () => {},
 					ensureSession: async () => ({ sessionId: "s" }),
 					sendTurn: async () => {
 						turnsB++;
@@ -902,6 +907,7 @@ describe("durable dispatch leases — concurrent attempts (true overlap)", () =>
 				database: db,
 				registry,
 				gjc: {
+					forgetRebinds: () => {},
 					ensureSession: async () => ({ sessionId: "s" }),
 					sendTurn: async () =>
 						// Malicious/partial response: omits the second event entirely.
@@ -993,6 +999,7 @@ describe("durable dispatch leases — concurrent attempts (true overlap)", () =>
 				database: db,
 				registry,
 				gjc: {
+					forgetRebinds: () => {},
 					ensureSession: async () => ({ sessionId: "s" }),
 					sendTurn: async (_id, text) =>
 						JSON.stringify(eventsFromPrompt(text).map(({ eventId: id }) => ({ eventId: id, note: "n" }))),
@@ -1047,6 +1054,7 @@ describe("durable dispatch leases — concurrent attempts (true overlap)", () =>
 				database: db,
 				registry,
 				gjc: {
+					forgetRebinds: () => {},
 					ensureSession: async () => ({ sessionId: "s" }),
 					sendTurn: async () => {
 						releaseA();
@@ -1092,6 +1100,7 @@ describe("durable dispatch leases — concurrent attempts (true overlap)", () =>
 				database: db,
 				registry,
 				gjc: {
+					forgetRebinds: () => {},
 					ensureSession: async () => ({ sessionId: "s" }),
 					sendTurn: async (_id, text) =>
 						JSON.stringify(eventsFromPrompt(text).map(({ eventId: id }) => ({ eventId: id, note: "B note" }))),

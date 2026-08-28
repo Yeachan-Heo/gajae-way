@@ -24,7 +24,19 @@ import {
 	resolveReactionEmoji,
 	validateOriginRef,
 } from "@gajaeway/protocol";
-import type { GatewayConfig } from "../config";
+import {
+	acknowledgeHold,
+	appendAttempt,
+	applyReconciliation,
+	closeAttempt,
+	createLaneJobRecord,
+	hasNewCommit,
+	LaneJobError,
+	type LaneJobRecord,
+	newOpRef,
+	parseLaneJobRecord,
+} from "@gajaeway/subsession";
+import { type ConfigOverrides, type GatewayConfig, type ReloadResult, reloadConfig } from "../config";
 import { DeliveryService } from "../delivery/delivery";
 import { ReactionBudget } from "../delivery/reaction-budget";
 import { decideEngagement } from "../engagement/policy";
@@ -39,6 +51,7 @@ import { MonitorRuntime } from "../monitors/runtime";
 import { backupDatabase, integrityDatabase } from "../ops/backup";
 import { RuntimeCycleProjector } from "../ops/cycle";
 import type { GjcPort } from "../orchestrator/gjc-client";
+import { formatFailureNotice } from "../orchestrator/rebind";
 import { PersonaLoader } from "../persona/persona";
 import type { GatewayDatabase, InboundMessageRow, MonitorEventStage } from "../store/db";
 import { DeliveryLedger } from "../store/ledger";
@@ -46,16 +59,109 @@ import { KeyedQueue } from "./keyed-queue";
 import { composeSpeakerLabel, composeTurnHeader } from "./speaker";
 
 /**
+ * Durable lane-job persistence for delegated work (issue #10).
+ *
+ * Every `work.run` call is one attempt against a job whose identity outlives
+ * the turn: the attempt receipt, end state, failure code, and repository
+ * checkpoints land in SQLite before the reply is produced, so a gateway
+ * restart or a reaped turn still leaves an auditable trail. Corrupt stored
+ * state fails the verb loudly instead of being silently replaced.
+ *
+ * Boundary note: this surface drives gjc via spawn-per-turn (`--resume`), which
+ * has no broker op accounting to poll - so attempts carry gateway-local opRefs
+ * and end states, while broker-driven op receipts/status reconciliation remain
+ * the G001 library surface for sdk-session lanes.
+ */
+function laneJobIdentity(workName: string): { jobId: string; laneKey: string } {
+	const laneKey = `work-${workName}`;
+	// The jobId is INJECTIVE: each UTF-8 byte of the exact name becomes two hex
+	// digits, so distinct names (Foo/foo, a.b/a_b) always map to distinct ids
+	// while staying within the [a-z0-9-] jobId alphabet. 64-byte names cap at
+	// 128 hex chars + the prefix, inside the schema's id length bound.
+	const hex = Buffer.from(workName, "utf8").toString("hex");
+	return { jobId: `lanejob-${hex}`, laneKey };
+}
+
+function persistLaneJob(database: GatewayDatabase, record: LaneJobRecord, laneKey: string): void {
+	database.putLaneJob({
+		jobId: record.jobId,
+		laneKey,
+		state: record.state,
+		createdAt: record.createdAt,
+		updatedAt: record.updatedAt,
+		lane: record.lane,
+		json: JSON.stringify(record),
+	});
+}
+
+/** Reads the actual branch HEAD and dirtiness of the worktree (read-only git). */
+async function collectRepoFacts(
+	worktreePath: string,
+): Promise<{ headSha?: string; dirtyFiles: number; branch?: string } | undefined> {
+	try {
+		const head = Bun.spawnSync(["git", "-C", worktreePath, "rev-parse", "HEAD"], { stdout: "pipe", stderr: "pipe" });
+		const branch = Bun.spawnSync(["git", "-C", worktreePath, "rev-parse", "--abbrev-ref", "HEAD"], {
+			stdout: "pipe",
+			stderr: "pipe",
+		});
+		const status = Bun.spawnSync(["git", "-C", worktreePath, "status", "--porcelain"], {
+			stdout: "pipe",
+			stderr: "pipe",
+		});
+		const headSha = head.stdout.toString().trim();
+		if (!/^[0-9a-f]{40}$/.test(headSha)) return undefined;
+		const dirtyFiles = status.stdout
+			.toString()
+			.split("\n")
+			.filter((line) => line.trim()).length;
+		const branchName = branch.stdout.toString().trim();
+		return { headSha, dirtyFiles, ...(branchName ? { branch: branchName } : {}) };
+	} catch {
+		return undefined;
+	}
+}
+
+async function loadOrCreateLaneJob(
+	database: GatewayDatabase,
+	workName: string,
+	workCwd: string,
+): Promise<LaneJobRecord> {
+	const { jobId, laneKey } = laneJobIdentity(workName);
+	// The exact lane key (original name, case- and dot-faithful) is the
+	// authoritative lookup; the derived jobId is only a storage id.
+	const stored = database.laneJobJsonByLaneKey(laneKey) ?? database.laneJobJson(jobId);
+	if (stored !== undefined) {
+		const existing = parseLaneJobRecord(stored);
+		if (existing.lane.worktreePath !== workCwd) {
+			// Same worker name re-pointed at a different worktree is a lane
+			// mismatch: fail closed instead of reconciling one lane's commits
+			// into another lane's history.
+			throw new LaneJobError(
+				`worker ${workName} is bound to worktree ${existing.lane.worktreePath}, not ${workCwd}; use a different name or restore the original cwd`,
+			);
+		}
+		return existing;
+	}
+	// The lane block describes the REAL lane: actual worktree, actual branch
+	// when git can tell us, deterministic fallback otherwise. The starting
+	// HEAD is stored as the BASELINE - it is context, never worker progress.
+	const facts = await collectRepoFacts(workCwd);
+	const created = createLaneJobRecord({
+		jobId,
+		branch: facts?.branch ?? `work/${workName.toLowerCase().replace(/[^a-z0-9._/-]+/g, "-")}`,
+		worktreePath: workCwd,
+		baselineSha: facts?.headSha,
+	});
+	persistLaneJob(database, created, laneKey);
+	return created;
+}
+
+/**
  * Completed turns per epoch before the session is rotated. Every `gjc --resume`
  * replays the whole transcript, so an unrotated busy origin gets slower forever;
  * durable memory (daily capture + recall) carries continuity across epochs.
  */
 const SESSION_TURN_LIMIT = 50;
-
-/** A `gjc --resume` against a session gjc no longer has (deleted or lost binding). */
-function isStaleSessionError(error: unknown): boolean {
-	return error instanceof Error && /session\s+"?[\w-]+"?\s+not found/i.test(error.message);
-}
 
 interface Connection {
 	readonly decoder: FrameDecoder;
@@ -73,6 +179,8 @@ export interface GatewayServerOptions {
 	readonly startedAt?: string;
 	readonly onStop?: () => void | Promise<void>;
 	readonly persona?: PersonaLoader;
+	/** Per-process CLI overrides, reapplied on every live reload so they survive it. */
+	readonly overrides?: ConfigOverrides;
 	/** Test seam for chat.progress throttling; production uses the 15s defaults. */
 	readonly progress?: { readonly firstAfterMs?: number; readonly intervalMs?: number };
 }
@@ -81,7 +189,45 @@ interface InboundContext {
 	readonly requestId: string;
 	readonly connection: Connection;
 }
+/**
+ * The ONE reload implementation, shared by the SIGHUP handler and the
+ * `gateway.reloadConfig` verb: changing a single mention-allowlist entry used to
+ * require a full gateway restart, and restarting is exactly what poisons session
+ * keys and produced the outage this branch also fixes.
+ *
+ * Fail-safe by construction: `reloadConfig` validates the whole file before
+ * publishing and returns the previous config on any error, so a failed reload
+ * cannot leave the daemon half-applied. Every outcome is logged with the fields
+ * applied and the fields refused as restart-only.
+ */
+async function applyConfigReload(
+	runtime: Runtime,
+	options: GatewayServerOptions,
+	trigger: string,
+): Promise<ReloadResult> {
+	const result = await reloadConfig(runtime.config, options.overrides);
+	if (!result.ok) {
+		console.error(
+			`gateway config reload (${trigger}) FAILED; keeping the previous config: ${result.diagnostics
+				.map((diagnostic) => `${diagnostic.code}: ${diagnostic.message}`)
+				.join("; ")}`,
+		);
+		return result;
+	}
+	runtime.config = result.config;
+	console.error(
+		`gateway config reload (${trigger}) ok; applied=[${result.changed.join(",")}] restart-required=[${result.restartRequired.join(",")}] ignored=[${result.ignored.join(",")}]`,
+	);
+	return result;
+}
+
 interface Runtime {
+	/**
+	 * The live config. Mutable on purpose: SIGHUP and the reload verb republish it
+	 * here, and every per-request read goes through it, so a reloadable field
+	 * takes effect on the next turn without a restart.
+	 */
+	config: GatewayConfig;
 	readonly delivery: DeliveryService;
 	readonly persona: PersonaLoader;
 	readonly connections: Set<Connection>;
@@ -112,6 +258,16 @@ export async function startUnixServer(options: GatewayServerOptions): Promise<Ga
 	let stopping = false;
 	let stopPromise: Promise<void> | undefined;
 	let listener: ReturnType<typeof Bun.listen>;
+	// SIGHUP is what an operator reaches for; the reload verb is the same code path
+	// for the console. Registered here and removed on stop so the handler never
+	// outlives the daemon it belongs to.
+	const onHup = () =>
+		void applyConfigReload(runtime, options, "SIGHUP").catch((error: unknown) =>
+			console.error(
+				`gateway config reload (SIGHUP) crashed: ${error instanceof Error ? error.message : String(error)}`,
+			),
+		);
+	process.on("SIGHUP", onHup);
 	// Concurrent stop() calls (shutdown verb + owner teardown) must all await the
 	// SAME settling run: an early-returning duplicate let callers proceed while
 	// memory closure was still writing, racing filesystem teardown (live flake).
@@ -119,6 +275,7 @@ export async function startUnixServer(options: GatewayServerOptions): Promise<Ga
 		if (stopPromise) return stopPromise;
 		stopping = true;
 		stopPromise = (async () => {
+			process.off("SIGHUP", onHup);
 			for (const connection of runtime.connections)
 				connection.write({ v: PROFILE_VERSION, type: "event", event: "gateway.stopping", payload: { reason } });
 			listener.stop(true);
@@ -179,10 +336,21 @@ export function startStdioServer(options: GatewayServerOptions): GatewayServer {
 	runtime.connections.add(connection);
 	let stopping = false;
 	let stopPromise: Promise<void> | undefined;
+	// The stdio daemon gets the SAME reload trigger as the Unix server: an
+	// operator (or supervisor) may signal either form, and deployment.md claims
+	// SIGHUP for a running gateway without qualifying the transport.
+	const onHup = () =>
+		void applyConfigReload(runtime, options, "SIGHUP").catch((error: unknown) =>
+			console.error(
+				`gateway config reload (SIGHUP) crashed: ${error instanceof Error ? error.message : String(error)}`,
+			),
+		);
+	process.on("SIGHUP", onHup);
 	const stop = (reason = "shutdown requested") => {
 		if (stopPromise) return stopPromise;
 		stopping = true;
 		stopPromise = (async () => {
+			process.off("SIGHUP", onHup);
 			connection.write({ v: PROFILE_VERSION, type: "event", event: "gateway.stopping", payload: { reason } });
 			clearInterval(runtime.reconcileTimer);
 			await runtime.turns.settle();
@@ -250,6 +418,7 @@ function createRuntime(options: GatewayServerOptions): Runtime {
 	const monitorRuntime = new MonitorRuntime(options.config, registry, monitors);
 	const reconcileTimer = setInterval(() => void monitors.reconcile(), 60_000);
 	return {
+		config: options.config,
 		delivery,
 		persona: options.persona ?? new PersonaLoader(options.config.home),
 		connections,
@@ -354,6 +523,19 @@ async function handleRequest(
 			connection.write({ v: PROFILE_VERSION, type: "response", id: request.id, result: { stopping: true } });
 			await stop();
 			return;
+		case "gateway.reloadConfig": {
+			// Same implementation as SIGHUP; the console gets it without signals.
+			const result = await applyConfigReload(runtime, options, `verb ${request.id}`);
+			connection.write({
+				v: PROFILE_VERSION,
+				type: "response",
+				id: request.id,
+				result: result.ok
+					? { ok: true, changed: result.changed, restartRequired: result.restartRequired, ignored: result.ignored }
+					: { ok: false, diagnostics: result.diagnostics },
+			});
+			return;
+		}
 		case "delivery.confirm": {
 			const id = (request.params as { deliveryId?: unknown } | undefined)?.deliveryId;
 			if (typeof id !== "string") throw new ProtocolError("invalid_params", "unknown deliveryId");
@@ -412,7 +594,7 @@ async function handleRequest(
 			// register, bound to a caller-chosen cwd, serialized per worker name and
 			// resumable across calls (the persona's hand-rolled subsession spawning
 			// kept losing the reply body — this returns it directly).
-			const params = request.params as { name?: unknown; text?: unknown; cwd?: unknown } | undefined;
+			const params = request.params as { name?: unknown; text?: unknown; cwd?: unknown; resume?: unknown } | undefined;
 			if (typeof params?.name !== "string" || !/^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/.test(params.name))
 				throw new ProtocolError("invalid_params", "work.run requires name matching [A-Za-z0-9][A-Za-z0-9._-]{0,63}");
 			if (typeof params.text !== "string" || !params.text)
@@ -423,7 +605,8 @@ async function handleRequest(
 			const workText = params.text;
 			const workCwd = params.cwd as string | undefined;
 			const sessionKey = `work/task/${workName}`;
-			const text = await runtime.turns.run(sessionKey, async () => {
+			const effectiveCwd = workCwd ?? process.cwd();
+			const result = await runtime.turns.run(sessionKey, async () => {
 				const turnOptions = { ...(workCwd ? { cwd: workCwd } : {}), codingRegister: true };
 				const epoch = options.database.getSessionRecord(sessionKey)?.epoch ?? 0;
 				const { sessionId } = await options.gjc.ensureSession(sessionKey, epoch, turnOptions);
@@ -431,9 +614,178 @@ async function handleRequest(
 					sessionKey,
 					JSON.stringify({ platform: "work", kind: "task", conversationId: workName }),
 				);
-				return options.gjc.sendTurn(sessionId, workText, undefined, undefined, turnOptions);
+				// Issue #10: this delegated call is one ATTEMPT against a durable
+				// job. The receipt and its terminal transition persist even when
+				// this process dies mid-turn, so nothing depends on a reply body.
+				const { jobId, laneKey } = laneJobIdentity(workName);
+				const prior = await loadOrCreateLaneJob(options.database, workName, effectiveCwd);
+				// A serialized worker cannot have two live turns, so an attempt still
+				// open at call time belongs to a crashed predecessor: record it as
+				// exactly what we know - terminally uncertain - and then HOLD. The
+				// predecessor's session may still be running after a restart; the
+				// deterministic planner path for an uncertain attempt is an operator
+				// hold, not an automatic continuation. `resume: true` is the explicit
+				// operator acknowledgement that lets the next attempt start.
+				// The awaiting_operator/stalled holds are STICKY: they survive
+				// restarts and every subsequent call until an operator explicitly
+				// resumes, so a genuinely uncertain or repeatedly stalling job can
+				// never be silently re-driven.
+				if ((prior.state === "awaiting_operator" || prior.state === "stalled") && params.resume !== true) {
+					return {
+						held: true as const,
+						jobId,
+						state: prior.state,
+						reason: `the job is ${prior.state} (uncertain attempt or stalled continuations); reconcile, then re-run with resume: true`,
+					};
+				}
+				const openPrior = prior.attempts.find((attempt) => attempt.endedAt === undefined);
+				let uncertain: LaneJobRecord | undefined;
+				if (openPrior) {
+					uncertain = closeAttempt({
+						record: prior,
+						opRef: openPrior.opRef,
+						endState: "terminal_uncertain",
+						endedAt: new Date().toISOString(),
+					});
+					persistLaneJob(options.database, uncertain, laneKey);
+					if (params.resume !== true) {
+						return {
+							held: true as const,
+							jobId,
+							state: uncertain.state,
+							reason: `attempt ${openPrior.opRef} is terminally uncertain after a crash/restart; reconcile, then re-run with resume: true`,
+						};
+					}
+				}
+				// resume:true is an explicit operator acknowledgement: the sticky
+				// hold (stalled budget or uncertain predecessor) is CLEARED and
+				// the acknowledgement is audited in the escalation trail BEFORE
+				// the new attempt starts. Without this, a successfully resumed
+				// job would stay sticky-stalled and be held forever.
+				let acknowledged = uncertain ?? prior;
+				if (acknowledged.state === "stalled" || acknowledged.state === "awaiting_operator") {
+					acknowledged = acknowledgeHold({
+						record: acknowledged,
+						note: "operator resumed the lane via work.run resume:true",
+						at: new Date().toISOString(),
+					});
+					persistLaneJob(options.database, acknowledged, laneKey);
+				}
+				const opRef = newOpRef(`work-${workName.toLowerCase().replace(/[^a-z0-9]+/g, "-")}`);
+				let job = appendAttempt(acknowledged, {
+					opRef,
+					sessionId,
+					startedAt: new Date().toISOString(),
+				});
+				persistLaneJob(options.database, job, laneKey);
+				try {
+					const reply = await options.gjc.sendTurn(sessionId, workText, undefined, undefined, turnOptions);
+					job = closeAttempt({
+						record: job,
+						opRef,
+						endState: "completed",
+						endedAt: new Date().toISOString(),
+					});
+					// Repository first: whatever the reply said, a HEAD move on the
+					// worktree is the authoritative checkpoint.
+					const facts = await collectRepoFacts(effectiveCwd);
+					if (facts) {
+						const progressed = hasNewCommit({
+							headSha: facts.headSha,
+							dirtyFiles: facts.dirtyFiles,
+							observedAt: new Date().toISOString(),
+							knownCheckpoints: job.checkpoints,
+							baselineSha: job.baselineSha,
+						});
+						job = applyReconciliation({
+							record: job,
+							repository: {
+								...(facts.headSha ? { headSha: facts.headSha } : {}),
+								dirtyFiles: facts.dirtyFiles,
+								observedAt: new Date().toISOString(),
+							},
+							classification: progressed ? "progressed" : "held",
+						});
+					}
+					persistLaneJob(options.database, job, laneKey);
+					return { held: false as const, text: reply, jobId, opRef };
+				} catch (error) {
+					const failureMessage = error instanceof Error ? error.message : String(error);
+					// The gateway's own inactivity reaper produces the deadline-kill
+					// shape: the ATTEMPT ends, the job stays continuable. Anything
+					// else is a plain attempt failure.
+					const reaped = /made no progress|timed out/.test(failureMessage);
+					job = closeAttempt({
+						record: job,
+						opRef,
+						endState: reaped ? "attempt_ended" : "failed",
+						errorCode: reaped ? "gateway_turn_reaped" : undefined,
+						endedAt: new Date().toISOString(),
+					});
+					// Repository first HERE TOO: the measured #9 shape is commits
+					// landing right up to (or past) the kill; the repo, not the
+					// failure, decides whether progress happened.
+					const facts = await collectRepoFacts(effectiveCwd);
+					if (facts) {
+						const progressed = hasNewCommit({
+							headSha: facts.headSha,
+							dirtyFiles: facts.dirtyFiles,
+							observedAt: new Date().toISOString(),
+							knownCheckpoints: job.checkpoints,
+							baselineSha: job.baselineSha,
+						});
+						job = applyReconciliation({
+							record: job,
+							repository: {
+								...(facts.headSha ? { headSha: facts.headSha } : {}),
+								dirtyFiles: facts.dirtyFiles,
+								observedAt: new Date().toISOString(),
+							},
+							classification: progressed ? "progressed" : "stalled",
+						});
+					}
+					persistLaneJob(options.database, job, laneKey);
+					throw new Error(failureMessage);
+				}
 			});
-			connection.write({ v: PROFILE_VERSION, type: "response", id: request.id, result: { text, sessionKey } });
+			connection.write({
+				v: PROFILE_VERSION,
+				type: "response",
+				id: request.id,
+				result: result.held ? result : { ...result, sessionKey },
+			});
+			return;
+		}
+		case "work.jobs": {
+			// Operator projection over durable lane jobs (issue #10): survives the
+			// gateway restart that would otherwise erase in-flight work knowledge.
+			// Each row is re-validated against the authoritative record JSON: a
+			// corrupt row is flagged as corrupt for the operator, never shown as
+			// healthy and never silently dropped.
+			const jobs = options.database.laneJobRows().map((row) => {
+				try {
+					const record = parseLaneJobRecord(options.database.laneJobJson(row.job_id) ?? "");
+					return {
+						...row,
+						attempts: record.attempts.length,
+						checkpoints: record.checkpoints.length,
+						escalations: record.escalations.length,
+					};
+				} catch (error) {
+					return {
+						...row,
+						state: "corrupt" as const,
+						corrupt: true as const,
+						error: error instanceof Error ? error.message : String(error),
+					};
+				}
+			});
+			connection.write({
+				v: PROFILE_VERSION,
+				type: "response",
+				id: request.id,
+				result: { jobs },
+			});
 			return;
 		}
 		case "ops.cycle":
@@ -726,7 +1078,7 @@ async function sendChat(
 	if (params.text === "/new" || params.text === "/reset") {
 		// Session resets are commands: in group surfaces they obey the mention
 		// allowlist, or any room member could wipe the persona's conversation state.
-		const allowlist = options.config.mentionAllowlist;
+		const allowlist = runtime.config.mentionAllowlist;
 		const authorId = (params.engagement as { authorId?: unknown } | undefined)?.authorId;
 		if (
 			origin.platform !== "loopback" &&
@@ -744,6 +1096,10 @@ async function sendChat(
 			return;
 		}
 		options.database.withTransaction(() => options.database.bumpEpoch(key, JSON.stringify(origin)));
+		// An explicit reset is the manual form of a rebind, so it also restores the
+		// automatic rebind budget: otherwise an origin that spent its cap would stay
+		// capped even after the operator did exactly what the notice asked for.
+		options.gjc.forgetRebinds(key);
 		const payload = {
 			turnId: crypto.randomUUID(),
 			origin,
@@ -781,7 +1137,7 @@ async function sendChat(
 			typeof params.engagement.authorId !== "string")
 	)
 		throw new ProtocolError("invalid_params", "non-loopback chat.send requires engagement");
-	const engaged = decideEngagement(origin, params.engagement as never, options.config).engaged;
+	const engaged = decideEngagement(origin, params.engagement as never, runtime.config).engaged;
 	const inboundMessageId = typeof params.messageId === "string" && params.messageId ? params.messageId : undefined;
 	// Declined messages are still context, never commands (protocol contract): every
 	// platform message lands in the conversation-context ledger so the next engaged
@@ -853,7 +1209,7 @@ async function drainOrigin(
 			// message that already waited behind an earlier turn has served its
 			// debounce, and sleeping again inside the serialized drain was adding
 			// flat latency to every drained batch (live gajaeway-play finding).
-			const debounceMs = debounceFor(row, options.config);
+			const debounceMs = debounceFor(row, runtime.config);
 			const waitedMs = Date.now() - Date.parse(row.received_at);
 			const remainingMs = Number.isFinite(waitedMs) ? Math.max(0, debounceMs - waitedMs) : debounceMs;
 			if (remainingMs > 0) await Bun.sleep(remainingMs);
@@ -1076,30 +1432,26 @@ async function runInboundTurn(
 		});
 	};
 	try {
-		try {
-			text = await runTurn();
-		} catch (error) {
-			// A bound gjc session can vanish underneath its binding (live crash loop:
-			// `gjc turn exited 1: Session "…" not found` on every subsequent message).
-			// Rebind a fresh transcript via an epoch bump and retry once.
-			if (deliveredParts.length === 0 && isStaleSessionError(error)) {
-				console.error(`gateway rebinding stale gjc session for ${key}: ${(error as Error).message}`);
-				options.database.withTransaction(() => options.database.bumpEpoch(key, JSON.stringify(origin)));
-				text = await runTurn();
-			} else throw error;
-		}
+		text = await runTurn();
 	} catch (error) {
+		// A prose-only "session not found" failure (gjc emits no structured code
+		// for it) is deliberately NOT auto-rebound: #13 mandates exact-code-only
+		// classification, and every retry against the same dead key is guaranteed
+		// silence. The failure surfaces through #14's structured notice instead,
+		// where the operator's remedy — /new — is one message away.
 		// Never ghost a platform conversation: a failed turn still produces a visible,
 		// ledgered notice (live P1 drill finding: timeouts looked like silent ignores).
+		// The notice carries the runtime's OWN code and message (#14): one opaque line
+		// cost ~2h of muteness because nobody could tell a poisoned session key from a
+		// timeout. The identical string is logged, so a channel transcript is enough
+		// to triage without shell access.
 		// When intermediate messages already reached the room, the persona visibly
 		// spoke; a trailing "[turn failed]" would disavow real replies, so the
 		// failure stays in the daemon log only.
+		const failureNotice = formatFailureNotice(error);
+		console.error(failureNotice);
 		if (nonLoopback && deliveredParts.length === 0) {
-			const notice = runtime.delivery.prepare(
-				turnId,
-				origin,
-				"[turn failed] The reply could not be produced (timeout or runtime error). Try again, or send /new to rebind this conversation.",
-			);
+			const notice = runtime.delivery.prepare(turnId, origin, failureNotice);
 			if (notice) {
 				runtime.delivery.markInflight(notice.deliveryId as string);
 				for (const recipient of runtime.connections)

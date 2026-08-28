@@ -41,6 +41,7 @@ async function startWithMonitor(): Promise<{
 	const db = await GatewayDatabase.open(config.dbPath);
 	database = db;
 	const gjc: GjcPort = {
+		forgetRebinds: () => {},
 		ensureSession: async () => ({ sessionId: "mock-session" }),
 		sendTurn: async () => "mock reply",
 	};

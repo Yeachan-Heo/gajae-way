@@ -32,7 +32,7 @@ The CLI does not start the daemon: `gajaeway daemon run` prints the launcher com
   "credentials": { "discord": { "credentialFile": "/absolute/path/discord-token" } },
   "channels": { "channel-id": { "engagement": "open", "debounceMs": 500 } },
   "turnTimeoutMs": 900000,
-  "model": "opus",
+  "model": { "preset": "codex-medium" },
   "debounceMs": 1000,
   "mentionAllowlist": ["owner-author-id"],
   "webhook": { "bind": "127.0.0.1", "port": 8080, "exposeNonLoopback": false },
@@ -42,6 +42,8 @@ The CLI does not start the daemon: `gajaeway daemon run` prints the launcher com
 ```
 
 Use schema version 1 only. Each credential is a file reference, never an inline secret or environment fallback; a credential file may be referenced by exactly one configured credential. Create secret files with restrictive ownership and mode, keep them outside version control, and rotate by replacing the file and restarting the service.
+
+`model` accepts either a gjc model selector string such as `"openai/gpt-5.2"` or a preset object such as `{ "preset": "codex-medium" }`. Presets are resolved by gjc from its merged built-in and `~/.gjc/agent/models.yml` profile catalog. A preset's `model_mapping.default` may be an ordered selector array; gajaeway invokes the preset with `--mpreset`, so gjc retains its native availability checks, retry budgets, sticky selection, and fallback-chain behavior instead of the gateway attempting unsafe whole-turn retries.
 
 ## Adapters and engagement
 
@@ -122,3 +124,5 @@ On startup, the delivery ledger redelivers unsettled output. Ambiguous prior del
 - **Quarantined mutation:** inspect the intent payload, memory repository state, and Git error; repair the source condition, then use the documented recovery workflow rather than deleting the evidence.
 - **Backup failure:** supply an absolute target path whose parent directory already exists; never target the live `gateway.db`.
 - **Every turn on one origin fails with the same gjc `api_error` (for example "cannot restore Claude OAuth MCP tool alias"):** the bound gjc session transcript is poisoned and every resume replays the failure. Send `/new` to that conversation to rebind a fresh session; prior in-session context is lost by design. The daemon log carries the exact error; the conversation receives the `[turn failed]` notice.
+- **Repeated `gateway session rebind` lines for one origin:** the gateway rebinds automatically when the runtime condemns a session key (`resource_gone`, `spawn_failed`, `terminal_uncertain`, `managed_append_identity_mismatch`). Each line carries `cause=<code>`, the epoch transition, and `lifetime=<N>` — the total this process has ever spent for that origin, which a completed unaided turn does NOT reset. A rising `lifetime` with the consecutive count stuck at `1/3` means a failure alternating with healthy turns: the epoch is still growing, so investigate the cause code rather than waiting for the cap. After three consecutive rebinds the turn fails with `rebind_cap_exceeded` and the conversation is told to send `/new`, which also restores the budget.
+- **`config.json is unreadable (...); refusing to start on defaults`:** the file exists but cannot be read (permissions, a directory in its place, or a symlink whose target is missing). The daemon exits non-zero rather than booting on defaults, because defaults would drop `mentionAllowlist` and open a mention-gated room. Fix the file, then start again; a reload in a running daemon keeps the previous configuration and reports the same diagnostic.

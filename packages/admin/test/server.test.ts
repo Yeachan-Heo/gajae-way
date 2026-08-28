@@ -20,6 +20,7 @@ describe("read surface", () => {
 	test.each([
 		["/api/status", "gateway.status"],
 		["/api/sessions", "session.list"],
+		["/api/jobs", "work.jobs"],
 		["/api/monitors", "monitor.list"],
 	])("%s proxies %s", async (path, method) => {
 		const instance = app();
