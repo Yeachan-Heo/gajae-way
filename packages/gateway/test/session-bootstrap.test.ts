@@ -159,6 +159,30 @@ describe("session bootstrap builder", () => {
 		expect(result.diagnostics).toContain("ops/rules/index.md links rejected: 1");
 	});
 
+	test("navigation headings and labels redact credential shapes while preserving safe paths", async () => {
+		const config = await setup();
+		await writeFile(
+			join(home, "memory", "channels", "c1.md"),
+			"origin-key: discord/channel/c1\nbootstrap-safe: public\ncurrent",
+		);
+		await mkdir(join(home, "memory", "ops", "rules"), { recursive: true });
+		await writeFile(join(home, "memory", "ops", "rules", "safe.md"), "safe rule");
+		await writeFile(
+			join(home, "memory", "MEMORY.md"),
+			"# password=hunter2\n- [api_key=map-token](channels/c1.md) secret=adjacent-map",
+		);
+		await writeFile(
+			join(home, "memory", "ops", "rules", "index.md"),
+			"# Authorization: Bearer rules-token\n- [token=rules-token](safe.md) password=adjacent-rules",
+		);
+		const result = await build(config);
+		expect(result.text).toContain("channels/c1.md");
+		expect(result.text).toContain("ops/rules/safe.md");
+		expect(result.text).toContain("[REDACTED]");
+		for (const secret of ["hunter2", "map-token", "adjacent-map", "rules-token", "adjacent-rules"])
+			expect(result.text).not.toContain(secret);
+	});
+
 	test("a configured memory-root symlink to a canonical directory is allowed", async () => {
 		const config = await setup();
 		await rm(join(home, "memory"), { recursive: true, force: true });

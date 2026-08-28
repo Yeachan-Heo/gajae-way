@@ -88,6 +88,10 @@ function safeText(value: string): string {
 		.replace(/(password|passwd|secret|token|api[_-]?key)\s*[:=]\s*[^\s]+/gi, "$1: [REDACTED]");
 }
 
+function safeLabel(value: string): string {
+	return boundedLine(safeText(value), 120) || "memory";
+}
+
 function metadataMatches(text: string, key: string): boolean {
 	for (const line of text.split(/\r?\n/).slice(0, 80)) {
 		const match = line.match(/^\s*(?:[-*]\s*)?(origin(?:-key|-id)?)\s*:\s*(.+?)\s*$/i);
@@ -159,7 +163,7 @@ async function readNavigationSection(
 	const body = text
 		.split(/\r?\n/)
 		.filter((line) => /^\s{0,3}#{1,6}\s+/.test(line))
-		.map((line) => boundedLine(line, 200));
+		.map((line) => boundedLine(safeText(line), 200));
 	let rejected = 0;
 	for (const match of text.matchAll(/\[([^\]\r\n]+)\]\(([^)#]+\.md)(?:#[^)]+)?\)/g)) {
 		try {
@@ -167,7 +171,7 @@ async function readNavigationSection(
 			if (isAbsolute(pointer)) throw new Error("absolute_or_empty_path");
 			const path = join(dirname(relativePath), pointer).replaceAll("\\", "/");
 			await confinedFile(root, path, allowed);
-			body.push(`- [${boundedLine(match[1] ?? "memory", 120)}](${path})`);
+			body.push(`- [${safeLabel(match[1] ?? "memory")}](${path})`);
 		} catch {
 			rejected++;
 		}
@@ -332,12 +336,12 @@ export async function buildSessionBootstrap(input: {
 		const headings = mapText
 			.split(/\r?\n/)
 			.filter((line) => /^\s{0,3}#{1,6}\s+/.test(line))
-			.map((line) => boundedLine(line, 200));
+			.map((line) => boundedLine(safeText(line), 200));
 		const pointers: string[] = [];
 		for (const match of mapText.matchAll(/\[([^\]\r\n]+)\]\(([^)#]+\.md)(?:#[^)]+)?\)/g)) {
 			try {
 				const path = decodeURIComponent(match[2] ?? "").replaceAll("\\", "/");
-				if (eligibleLinks.has(path)) pointers.push(`- [${boundedLine(match[1] ?? "memory", 120)}](${path})`);
+				if (eligibleLinks.has(path)) pointers.push(`- [${safeLabel(match[1] ?? "memory")}](${path})`);
 			} catch {
 				diagnostics.push("MEMORY link rejected: malformed_percent_escape");
 			}
