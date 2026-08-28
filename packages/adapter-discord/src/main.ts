@@ -1,3 +1,4 @@
+import { join } from "node:path";
 import type {
 	ChatMessagePayload,
 	ChatProgressPayload,
@@ -8,7 +9,7 @@ import type {
 import { GajaewayClient } from "@gajaeway/sdk";
 import { Client, GatewayIntentBits, Partials } from "discord.js";
 import { type AuthorLike, resolveDisplayName } from "./author";
-import { type LoadedDiscordAdapterConfig, loadDiscordAdapterConfig } from "./config";
+import { adapterHome, type LoadedDiscordAdapterConfig, loadDiscordAdapterConfig } from "./config";
 import { type DiscordMessageOriginShape, discordMessageOrigin } from "./origin";
 import {
 	type DiscordInboundReaction,
@@ -18,6 +19,17 @@ import {
 	ReactionRateLimiter,
 	settleDiscordReaction,
 } from "./reactions";
+import {
+	recoveryCursorPath as defaultRecoveryCursorPath,
+	loadRecoveryCursors,
+	RECOVERY_MAX_PAGES,
+	type RecoverableChannel,
+	type RecoveryCursorState,
+	RecoveryGate,
+	recoverConversation,
+	saveRecoveryCursors,
+	snowflakeIsAfter,
+} from "./recovery";
 import { type ReplyMessageLike, resolveReplyContext } from "./reply";
 
 /**
@@ -462,6 +474,8 @@ export async function startDiscordAdapter(config: LoadedDiscordAdapterConfig): P
 		config,
 		typing,
 		status,
+		join(adapterHome(), "adapters", "discord", "recovery-cursor.json"),
+		() => discord.user,
 	);
 	discord.on("messageCreate", (message) => {
 		const engagement = decideInbound(message, discord.user, config.channels);
@@ -497,6 +511,7 @@ export async function startDiscordAdapter(config: LoadedDiscordAdapterConfig): P
 					`Discord slash-command registration failed: ${error instanceof Error ? error.message : String(error)}`,
 				),
 			);
+		void gateway.recoverMissedMessages();
 	});
 	console.log("Discord adapter starting.");
 	await gateway.connect();
@@ -561,13 +576,17 @@ export async function handleSlashCommand(
 	}
 }
 
-class ReconnectingGateway {
+export class ReconnectingGateway {
 	#client: GajaewayClient | undefined;
 	#reconnecting = false;
 	#attempt = 0;
 	#deliveryOff: (() => void) | undefined;
 	#progressOff: (() => void) | undefined;
-	readonly #inbound = new LruSet();
+	readonly #inbound = new RecoveryGate();
+	#cursors: RecoveryCursorState | undefined;
+	#cursorLoads: Promise<void> | undefined;
+	#cursorSaves: Promise<void> = Promise.resolve();
+	#recovering = false;
 
 	constructor(
 		readonly socketPath: string,
@@ -575,7 +594,13 @@ class ReconnectingGateway {
 		readonly config: LoadedDiscordAdapterConfig,
 		readonly typing?: TypingPort,
 		readonly status?: WorkingStatus,
-	) {}
+		readonly recoveryCursorPath: string = defaultRecoveryCursorPath(),
+		readonly getBotUser: () => unknown = () => undefined,
+		initialClient?: GajaewayClient,
+	) {
+		this.#client = initialClient;
+		void this.ensureCursors();
+	}
 
 	async connect(): Promise<void> {
 		try {
@@ -588,9 +613,101 @@ class ReconnectingGateway {
 			this.#progressOff = this.status ? subscribeDiscordProgress(client, this.status) : undefined;
 			console.log("Discord adapter connected to gateway.");
 			this.monitor(client);
+			void this.recoverMissedMessages();
 		} catch {
 			this.scheduleReconnect();
 		}
+	}
+
+	/**
+	 * Bounded catch-up for messages missed while the adapter or its gateway link was
+	 * offline (issue #33). Runs after Discord ready and after every gateway reconnect;
+	 * safe alongside live traffic because the gateway durably dedupes on message id.
+	 */
+	async recoverMissedMessages(): Promise<void> {
+		if (this.#recovering || !this.#client) return;
+		const botUser = this.getBotUser();
+		if (!botUser) return;
+		const channelIds = Object.keys(this.config.channels ?? {});
+		if (channelIds.length === 0) return;
+		this.#recovering = true;
+		try {
+			await this.ensureCursors();
+			for (const channelId of channelIds) await this.recoverChannel(channelId, botUser);
+		} finally {
+			this.#recovering = false;
+		}
+	}
+
+	private async recoverChannel(channelId: string, botUser: unknown): Promise<void> {
+		let fetched: unknown;
+		try {
+			fetched = await this.discord.channels.fetch(channelId);
+		} catch (error) {
+			console.error(
+				`Discord recovery could not fetch channel ${channelId}: ${error instanceof Error ? error.message : String(error)}`,
+			);
+			return;
+		}
+		if (!isRecoverableChannel(fetched)) return;
+		const outcome = await recoverConversation(fetched, {
+			cursor: this.#cursors?.conversations[channelId],
+			nowMs: Date.now(),
+			deliver: async (message) => {
+				// Same normalization as live messageCreate: one decision, one origin shape,
+				// one gateway verb — recovery never forks engagement semantics.
+				const engagement = decideInbound(message, botUser, this.config.channels);
+				if (!engagement) return "duplicate";
+				return this.requestRecovered(message.id, discordMessageOrigin(message), message.content, engagement);
+			},
+		});
+		if (outcome.failed) {
+			console.error(
+				`Discord recovery paused for channel ${channelId} at message ${outcome.advancedTo}; gateway unavailable, retrying on next reconnect.`,
+			);
+			return;
+		}
+		if (outcome.truncated) {
+			console.error(
+				`Discord recovery hit the ${RECOVERY_MAX_PAGES}-page bound for channel ${channelId} after ${outcome.delivered} message(s); cursor advanced to ${outcome.advancedTo}.`,
+			);
+			return;
+		}
+		if (outcome.delivered > 0) {
+			console.log(`Discord recovery backfilled ${outcome.delivered} message(s) for channel ${channelId}.`);
+		}
+	}
+
+	private ensureCursors(): Promise<void> {
+		this.#cursorLoads ??= loadRecoveryCursors(this.recoveryCursorPath)
+			.then((state) => {
+				this.#cursors = state;
+			})
+			.catch((error: unknown) =>
+				console.error(`Discord recovery cursor load failed: ${error instanceof Error ? error.message : String(error)}`),
+			);
+		return this.#cursorLoads;
+	}
+
+	/**
+	 * Records the highest acked message id for a conversation and persists it (serialized,
+	 * fire-and-forget). A failed persist only widens the next refetch window; the gateway's
+	 * message-id dedupe keeps the replay exactly-once.
+	 */
+	private advanceCursor(conversationId: string, messageId: string): void {
+		const current = this.#cursors;
+		if (!current) return;
+		const existing = current.conversations[conversationId];
+		if (existing !== undefined && !snowflakeIsAfter(messageId, existing)) return;
+		const next: RecoveryCursorState = { conversations: { ...current.conversations, [conversationId]: messageId } };
+		this.#cursors = next;
+		this.#cursorSaves = this.#cursorSaves
+			.then(() => saveRecoveryCursors(this.recoveryCursorPath, next))
+			.catch((error: unknown) =>
+				console.error(
+					`Discord recovery cursor persist failed: ${error instanceof Error ? error.message : String(error)}`,
+				),
+			);
 	}
 
 	sendInbound(messageId: string, origin: OriginRef, text: string, engagement: EngagementContext): void {
@@ -625,22 +742,52 @@ class ReconnectingGateway {
 		text: string,
 		engagement: EngagementContext,
 	): Promise<{ engaged?: boolean } | undefined> {
-		if (!this.#inbound.addIfAbsent(messageId)) return;
-		const client = this.#client;
-		if (!client) return;
-		// The gateway acknowledges engagement before running the turn, so typing starts only for
-		// turns that will actually produce a reply and never outlives the delivery that clears it.
-		// The platform message id travels with the turn: the gateway keys its durable inbound
-		// queue on it, so a replayed or backfilled message is deduped there and not just in the
-		// adapter's in-memory set, which does not survive a restart.
-		try {
-			const result = await client.request<{ engaged?: boolean }>("chat.send", { origin, text, engagement, messageId });
-			if (result?.engaged) this.typing?.begin(origin.conversationId);
-			return result;
-		} catch {
-			this.scheduleReconnect();
-			return undefined;
-		}
+		let result: { engaged?: boolean } | undefined;
+		const verdict = await this.#inbound.join(messageId, async () => {
+			const client = this.#client;
+			if (!client) {
+				this.scheduleReconnect();
+				return "unavailable";
+			}
+			try {
+				// The gateway acknowledges engagement before running the turn, so typing starts only for
+				// turns that will actually produce a reply and never outlives the delivery that clears it.
+				result = await client.request<{ engaged?: boolean }>("chat.send", { origin, text, engagement, messageId });
+				this.advanceCursor(origin.conversationId, messageId);
+				if (result?.engaged) this.typing?.begin(origin.conversationId);
+				return "acked";
+			} catch {
+				this.scheduleReconnect();
+				return "unavailable";
+			}
+		});
+		return verdict === "acked" ? result : undefined;
+	}
+
+	/**
+	 * Recovery send for messages missed while offline (issue #33): same LRU dedupe, same
+	 * chat.send verb, same durable gateway exactly-once as live sends. Returns whether the
+	 * gateway acknowledged ("acked"), the message was already known ("duplicate"), or the
+	 * send must be retried later ("unavailable" — the recovery cursor does not advance).
+	 */
+	async requestRecovered(
+		messageId: string,
+		origin: OriginRef,
+		text: string,
+		engagement: EngagementContext,
+	): Promise<"acked" | "duplicate" | "unavailable"> {
+		return this.#inbound.join(messageId, async () => {
+			const client = this.#client;
+			if (!client) return "unavailable";
+			try {
+				await client.request("chat.send", { origin, text, engagement, messageId });
+				this.advanceCursor(origin.conversationId, messageId);
+				return "acked";
+			} catch {
+				this.scheduleReconnect();
+				return "unavailable";
+			}
+		});
 	}
 
 	private monitor(client: GajaewayClient): void {
@@ -684,6 +831,14 @@ function isDiscordTypingChannel(value: unknown): value is DiscordTypingChannelLi
 	return typeof value === "object" && value !== null && "sendTyping" in value && typeof value.sendTyping === "function";
 }
 
+function isRecoverableChannel(value: unknown): value is RecoverableChannel {
+	return (
+		typeof value === "object" &&
+		value !== null &&
+		"messages" in value &&
+		typeof (value as { messages?: { fetch?: unknown } }).messages?.fetch === "function"
+	);
+}
 if (import.meta.main) {
 	loadDiscordAdapterConfig()
 		.then(startDiscordAdapter)
