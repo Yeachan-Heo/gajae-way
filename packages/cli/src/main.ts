@@ -311,12 +311,14 @@ export async function main(args = process.argv.slice(2)): Promise<void> {
 			}
 			case "work": {
 				const [command, ...args] = parsed.rest;
-				if (command !== "run") throw new Error('usage: gajaeway work run <name> [--cwd DIR] "<task text>"');
+				if (command !== "run") throw new Error('usage: gajaeway work run <name> [--cwd DIR] [--resume] "<task text>"');
 				const name = args[0];
 				let cwd: string | undefined;
+				let resume = false;
 				const textParts: string[] = [];
 				for (let i = 1; i < args.length; i++) {
 					if (args[i] === "--cwd") cwd = args[++i];
+					else if (args[i] === "--resume") resume = true;
 					else textParts.push(args[i] as string);
 				}
 				const text = textParts.join(" ").trim();
@@ -325,12 +327,20 @@ export async function main(args = process.argv.slice(2)): Promise<void> {
 				// gateway's own inactivity ceiling allows, not the default 30s.
 				const client = await GajaewayClient.connectSocket(parsed.socket, { requestTimeoutMs: 3_600_000 });
 				try {
-					const result = await client.request<{ text: string; sessionKey: string }>("work.run", {
+					const result = await client.request<
+						| { held: true; jobId: string; state: string; reason: string }
+						| { held: false; text: string; sessionKey: string; jobId: string; opRef: string }
+					>("work.run", {
 						name,
 						text,
 						...(cwd ? { cwd } : {}),
+						...(resume ? { resume: true } : {}),
 					});
-					console.log(result.text);
+					if (result.held) {
+						console.log(`HELD: ${result.reason}\njob: ${result.jobId} state: ${result.state}`);
+					} else {
+						console.log(result.text);
+					}
 				} finally {
 					await client.close();
 				}

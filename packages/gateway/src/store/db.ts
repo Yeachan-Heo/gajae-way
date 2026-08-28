@@ -2,7 +2,7 @@ import { Database } from "bun:sqlite";
 import { mkdir } from "node:fs/promises";
 import { dirname } from "node:path";
 
-const LATEST_SCHEMA_VERSION = 9;
+const LATEST_SCHEMA_VERSION = 10;
 
 export interface InboundMessageRow {
 	readonly message_id: string;
@@ -696,6 +696,84 @@ export class GatewayDatabase {
 					.run(9, new Date().toISOString());
 			});
 		}
+		if (current < 10) {
+			this.withTransaction(() => {
+				// Issue #10: durable lane jobs. One row per job; the record JSON is the
+				// fail-closed authority (schema-validated on read by @gajaeway/subsession),
+				// while the status column stays a plain indexed projection for operators.
+				this.#database.exec(
+					"CREATE TABLE lane_jobs (job_id TEXT PRIMARY KEY, lane_key TEXT NOT NULL UNIQUE, branch TEXT NOT NULL, worktree_path TEXT NOT NULL, state TEXT NOT NULL CHECK(state IN ('running','attempt_ended','awaiting_operator','stalled','done','aborted')), record_json TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL)",
+				);
+				this.#database
+					.query("INSERT INTO schema_migrations (version, applied_at) VALUES (?, ?)")
+					.run(10, new Date().toISOString());
+			});
+		}
+	}
+	// --- Issue #10: durable lane jobs ---------------------------------------
+
+	/**
+	 * Upserts a validated lane job record. Callers MUST pass an already
+	 * schema-validated record (parseLaneJobRecord output); the database stores
+	 * the JSON verbatim so reads can re-validate fail-closed.
+	 */
+	putLaneJob(job: {
+		readonly jobId: string;
+		readonly laneKey: string;
+		readonly state: string;
+		readonly createdAt: string;
+		readonly updatedAt: string;
+		readonly lane: { readonly branch: string; readonly worktreePath: string };
+		readonly json: string;
+	}): void {
+		this.#database
+			.query(
+				"INSERT INTO lane_jobs (job_id, lane_key, branch, worktree_path, state, record_json, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(job_id) DO UPDATE SET lane_key = excluded.lane_key, branch = excluded.branch, worktree_path = excluded.worktree_path, state = excluded.state, record_json = excluded.record_json, updated_at = excluded.updated_at",
+			)
+			.run(
+				job.jobId,
+				job.laneKey,
+				job.lane.branch,
+				job.lane.worktreePath,
+				job.state,
+				job.json,
+				job.createdAt,
+				job.updatedAt,
+			);
+	}
+
+	laneJobJson(jobId: string): string | undefined {
+		return this.#database
+			.query<{ record_json: string }, [string]>("SELECT record_json FROM lane_jobs WHERE job_id = ?")
+			.get(jobId)?.record_json;
+	}
+
+	laneJobJsonByLaneKey(laneKey: string): string | undefined {
+		return this.#database
+			.query<{ record_json: string }, [string]>("SELECT record_json FROM lane_jobs WHERE lane_key = ?")
+			.get(laneKey)?.record_json;
+	}
+
+	laneJobRows(): Array<{
+		job_id: string;
+		lane_key: string;
+		state: string;
+		branch: string;
+		worktree_path: string;
+		updated_at: string;
+	}> {
+		return this.#database
+			.query(
+				"SELECT job_id, lane_key, state, branch, worktree_path, updated_at FROM lane_jobs ORDER BY updated_at DESC",
+			)
+			.all() as Array<{
+			job_id: string;
+			lane_key: string;
+			state: string;
+			branch: string;
+			worktree_path: string;
+			updated_at: string;
+		}>;
 	}
 
 	get instanceId(): string {

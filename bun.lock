@@ -61,6 +61,7 @@
       },
       "dependencies": {
         "@gajaeway/protocol": "workspace:*",
+        "@gajaeway/subsession": "workspace:*",
       },
     },
     "packages/protocol": {

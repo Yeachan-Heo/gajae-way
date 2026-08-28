@@ -1,0 +1,103 @@
+{
+	"kind": "api-package-test-report",
+	"schemaVersion": 1,
+	"frozenCommit": "7626939 (round-4+5 fixes, origin/main merge, audited resume acknowledgement; full suite re-run at this exact tree: bun x tsc --noEmit exit 0, bun test packages/ 918 pass / 0 fail / 2 skip, bunx biome ci packages/ exit 0)",
+	"producedBy": "ultragoal leader after terminal-critic REJECT rounds 1-3; each round's blockers were fixed in code and this report was updated in the same series (report-only commits change no executable code)",
+	"rerunCommands": [
+		"bun install --frozen-lockfile (clean, 43 installs checked)",
+		"bun x tsc --noEmit (exit 0)",
+		"bun test packages/ (918 pass / 0 fail / 2 skip, 72 files)",
+		"bunx biome ci packages/ (exit 0, 0 errors)",
+		"bun test packages/subsession/test/job.test.ts (30 adversarial job tests incl. baseline-vs-progress, stalled budget vs baseline move, jobId length bound at construction and parse, fail-closed parse invariants)",
+		"bun test packages/gateway/test/lane-job-store.test.ts (3 store tests: schema v10 fresh open, deadline-killed cycle across close/reopen on one deployment path, truncated record_json surfaced not repaired)",
+		"bun test packages/gateway/test/server.test.ts (10 tests incl. production work.run -> lane_job -> work.jobs cycle, sticky held response without running, resume:true clearing with audit trail, next ordinary call not held)",
+		"bun test packages/admin/test/server.test.ts (admin /api/jobs route proxy test)"
+	],
+	"subject": "Issue #10 durable lane jobs: packages/subsession LaneJobRecord v1 (fail-closed parse, repository-first checkpoints, attempt_ended projection for prompt_deadline_exceeded, #9 evidence classes verbatim, single-path continuation planner with operator holds preserved, one-open-attempt invariant) plus gateway production wiring (work.run attempt tracking, crash reconciliation to terminal_uncertain, work.jobs + admin /api/jobs projections) and migration v10 lane_jobs persistence.",
+	"criticRound1Fixes": [
+		"checkpoint ordering: git SHAs have no chronological lexical order; only consecutive duplicates are rejected",
+		"fail-closed parse: missing v1 sections are now schema violations; endState validated against the supervisor-state vocabulary; non-string report rejected",
+		"duplicate attempts: appendAttempt enforces one open attempt; planContinuation reads the stored open attempt instead of a synthetic projection",
+		"production wiring: putLaneJob/laneJobJson/laneJobRows now called by work.run and work.jobs in gateway server.ts; admin exposes /api/jobs",
+		"evidence honesty: this report is committed at the exact head it names, with per-suite counts re-run at that head"
+	],
+	"cases": [
+		{
+			"id": "QA-JOB-01",
+			"contractRef": "Issue #10 requirement 7: fail closed on unknown/corrupt durable state",
+			"invocation": "bun test packages/subsession/test/job.test.ts -t 'fail-closed'",
+			"expected": "unknown schemaVersion / corrupt JSON / non-canonical state / missing v1 sections / bad endState / duplicated opRefs all throw LaneJobError",
+			"observed": "all rejection paths throw; nothing coerced or normalized",
+			"verdict": "passed"
+		},
+		{
+			"id": "QA-JOB-02",
+			"contractRef": "Issue #10 requirement 5: report recoverable without reply body",
+			"invocation": "bun test packages/subsession/test/job.test.ts -t 'repository-first'",
+			"expected": "HEAD move appends a checkpoint even when the reply body is empty; a commit landing seven minutes after terminal accounting becomes a checkpoint on next reconciliation",
+			"observed": "both measured #9 lane shapes recover evidence from repository state alone",
+			"verdict": "passed"
+		},
+		{
+			"id": "QA-JOB-03",
+			"contractRef": "Issue #10 requirement 6: genuine terminal_uncertain keeps an explicit operator hold",
+			"invocation": "bun test packages/subsession/test/job.test.ts -t 'uncertain'",
+			"expected": "unknown status / missing receipt force awaiting_operator with an escalation trail naming the op-ref",
+			"observed": "hold forced; planner refuses to override; gateway crash reconciliation writes the same trail for a dead predecessor's open attempt",
+			"verdict": "passed"
+		},
+		{
+			"id": "QA-JOB-04",
+			"contractRef": "Issue #10 requirement 7: no duplicate attempts or runaway resume loops",
+			"invocation": "bun test packages/subsession/test/job.test.ts -t 'stalled'",
+			"expected": "second open attempt refused; continuations without HEAD moves trip MAX_STALLED_CONTINUATIONS into hold_for_operator",
+			"observed": "budget gate trips at the bound; duplicate opRef and double close both throw",
+			"verdict": "passed"
+		},
+		{
+			"id": "QA-WIRE-01",
+			"contractRef": "Production integration: work.run persists a durable job, work.jobs + /api/jobs project it",
+			"invocation": "bun test packages/gateway/test/server.test.ts -t 'durable lane job'",
+			"expected": "work.run writes an attempt receipt and completed end state to lane_jobs before replying; work.jobs returns the row; a crashed predecessor's open attempt is closed terminal_uncertain with an escalation entry before the continuation",
+			"observed": "row projected with state attempt_ended after completion; revived record shows terminal_uncertain + escalation + completed continuation",
+			"verdict": "passed"
+		},
+		{
+			"id": "QA-STORE-01",
+			"contractRef": "Migration safety: lane_jobs survives gateway restart from SQLite alone",
+			"invocation": "bun test packages/gateway/test/lane-job-store.test.ts -t 'restart'",
+			"expected": "record written before process close is fully revived (attempts, checkpoints, evidence class, continuation plan) after reopen",
+			"observed": "revived record matches; classifyWorkEvidence returns work_committed_report_lost; planContinuation returns continue_same_session",
+			"verdict": "passed"
+		},
+		{
+			"id": "QA-STORE-02",
+			"contractRef": "#9 regression: summary.completed is never a success verdict",
+			"invocation": "bun test packages/subsession/test/job.test.ts -t 'summary.completed'",
+			"expected": "failed + prompt_deadline_exceeded with summary.completed true never projects to completed",
+			"observed": "projection is attempt_ended; no decision path reads summaryCompleted",
+			"verdict": "passed"
+		}
+	],
+	"residuals": [],
+	"blockers": [],
+	"criticRound2Fixes": [
+		"work.run holds (awaiting_operator + held response) on a terminally uncertain crashed predecessor; continuation requires explicit resume:true",
+		"gateway inactivity reaper closes attempts as attempt_ended (errorCode gateway_turn_reaped), not flat failed",
+		"repository-first reconciliation runs in production: worktree HEAD moves become durable checkpoints via applyReconciliation",
+		"parse rejects endedAt/endState mismatches and non-last open attempts; work.jobs re-validates record JSON and flags corrupt rows"
+	],
+	"reportIdentity": "This report lives in the tree it reports on. Report-only commits after the validated executable commit change no executable code, so the receipts above remain valid for the branch head containing this file.",
+	"criticRound3Fixes": [
+		"sticky awaiting_operator/resume contract: work.run on a held job refuses to run until resume:true; held/resume outcomes typed in WorkRunParams/WorkRunResult and surfaced in the CLI",
+		"repository-first reconciliation on every attempt end (completed, reaped, failed) with baselineSha stored as creation-time context - checkpoints only record HEAD moves beyond it",
+		"exact lane-key/worktree identity: lookup by the unique original-name lane key with fail-closed lane-mismatch errors, and an injective, schema-bounded jobId (hex of the exact UTF-8 name)"
+	],
+	"criticRound4Fixes": [
+		"baseline HEAD stored as context (baselineSha), never a checkpoint; checkpoints only record observed HEAD moves past baseline",
+		"gateway uses hasNewCommit for classification; ended attempts without a new HEAD increment stalledContinuations (stalled), and the stalled hold is sticky like awaiting_operator (resume:true required)",
+		"jobId injective AND schema-bounded: lanejob-<hex of exact UTF-8 name> fits the 128-char id alphabet for every accepted 64-byte name",
+		"planContinuation stalled budget gate passes record.baselineSha into the repository facts: at a full stall budget with zero checkpoints, a HEAD that moved past the baseline is progress (not a hold); adversarial test added",
+		"resume durably clears the stalled/awaiting_operator hold via audited acknowledgeHold before the new attempt; adversarial server test proves stall -> held -> resume runs -> next ordinary call not held"
+	]
+}

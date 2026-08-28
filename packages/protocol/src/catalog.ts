@@ -279,7 +279,40 @@ export interface WorkRunParams {
 	readonly text: string;
 	/** Working directory for the worker session (e.g. a repo checkout). */
 	readonly cwd?: string;
+	/**
+	 * Explicit operator acknowledgement that lets a new attempt start while
+	 * the durable job is awaiting_operator (issue #10 hold semantics).
+	 */
+	readonly resume?: boolean;
 }
+
+/**
+ * Either a held outcome (the durable job is awaiting_operator after a crash /
+ * restart and nothing ran) or a completed attempt carrying its durable job and
+ * op identities.
+ */
+export type WorkRunResult =
+	| { readonly held: true; readonly jobId: string; readonly state: string; readonly reason: string }
+	| {
+			readonly held: false;
+			readonly text: string;
+			readonly sessionKey: string;
+			readonly jobId: string;
+			readonly opRef: string;
+	  };
+
+/** Operator projection over durable lane jobs (issue #10). */
+export interface WorkJobsResult {
+	readonly jobs: Array<{
+		readonly job_id: string;
+		readonly lane_key: string;
+		readonly state: string;
+		readonly branch: string;
+		readonly worktree_path: string;
+		readonly updated_at: string;
+	}>;
+}
+
 /**
  * Live config reload. `changed` are the reloadable fields actually applied,
  * `restartRequired` names edited fields only a restart can apply, and `ignored`
@@ -298,15 +331,11 @@ export type ConfigReloadResult =
 			readonly diagnostics: readonly { readonly code: string; readonly message: string }[];
 	  };
 
-export interface WorkRunResult {
-	readonly text: string;
-	readonly sessionKey: string;
-}
-
 /**
  * Outbound reaction (chat.react): react to ONE specific message in ONE specific
  * origin. The target message id is required — "react to the last message" is not
  * expressible, because "last" changes under you. `emoji` accepts any allowlisted
+ * Outbound reaction (chat.react): react to ONE specific message in ONE specific
  * spelling (`👍`, `thumbsup`, `:thumbsup:`) and is canonicalized by the gateway.
  *
  * Allowlisted is not the same as deliverable: a platform may accept only part of
@@ -455,6 +484,7 @@ export interface VerbCatalogV01 {
 	};
 	"ops.integrity": { params: undefined; result: { readonly ok: boolean; readonly detail: string } };
 	"work.run": { params: WorkRunParams; result: WorkRunResult };
+	"work.jobs": { result: WorkJobsResult };
 	"chat.react": { params: ChatReactParams; result: ChatReactResult };
 	"engagement.reaction": { params: EngagementReactionParams; result: EngagementReactionResult };
 	"ops.cycle": { params: undefined; result: OpsCycleResult };
@@ -486,6 +516,7 @@ export const VERBS_V01 = [
 	"ops.backup",
 	"ops.integrity",
 	"work.run",
+	"work.jobs",
 	"chat.react",
 	"engagement.reaction",
 	"gateway.reloadConfig",
