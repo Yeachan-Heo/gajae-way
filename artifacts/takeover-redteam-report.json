@@ -1,0 +1,70 @@
+{
+  "schemaVersion": 1,
+  "kind": "test-report",
+  "generatedAt": "2026-08-27T12:13:32Z",
+  "head": "3c69f2d",
+  "commands": [
+    "bun test packages/gateway/test/takeover-redteam.test.ts",
+    "bun test packages/gateway/test/session-rebind.test.ts packages/gateway/test/config-reload-live.test.ts"
+  ],
+  "summary": {
+    "pass": 6,
+    "fail": 1
+  },
+  "cases": [
+    {
+      "id": "TAKEOVER-01",
+      "name": "Cap-integrity across mixed rebind and clean-turn sequences",
+      "status": "passed",
+      "evidence": "Mixed turn-level rebinds logged lifetime=1 and lifetime=2 while each consecutive budget reset to 1/3; three subsequent consecutive failures advanced epoch to 5, then RebindCapExceededError surfaced with a /new hint."
+    },
+    {
+      "id": "TAKEOVER-02",
+      "name": "Concurrent ensureSession for one origin while rebind is in flight",
+      "status": "failed",
+      "evidence": "packages/gateway/test/takeover-redteam.test.ts:178 expected both callers to receive session-e1 and one epoch bump; actual Set contained session-e1 and session-e2. The implementation spawned two initial creates, bumped e0->e1 and e1->e2, and minted two sessions."
+    },
+    {
+      "id": "TAKEOVER-03",
+      "name": "Prose-matching defense for create and turn failures",
+      "status": "passed",
+      "evidence": "Unrelated code unsupported_state_version with either rebind-looking message performed no rebind at create or turn level; epoch and spawn counts remained unchanged."
+    },
+    {
+      "id": "TAKEOVER-04",
+      "name": "Redaction adversarials for quoted headers, URL/camelCase keys, control splits, and hostile code",
+      "status": "passed",
+      "evidence": "Authorization Bearer 40-hex JSON value, ?apikey query value, apiKey value, control-split value, and sk_live_ plus 60-character hostile code were redacted; hostile notice remained bounded."
+    },
+    {
+      "id": "TAKEOVER-05",
+      "name": "Replay-side-effect guard after streamed assistant text",
+      "status": "passed",
+      "evidence": "onAssistantText delivered one partial message; managed_append_identity_mismatch caused one rebind and no replay turn spawn, with turn_not_replayed notice and no /new hint."
+    },
+    {
+      "id": "TAKEOVER-06",
+      "name": "Overlapping SIGHUP and verb reload while a turn is mid-debounce",
+      "status": "passed",
+      "evidence": "Two SIGHUP handlers and one gateway.reloadConfig ran during a 250ms debounce; probes distinguished mentionAllowlist/channels mixtures and observed the complete new policy. A malformed follow-up returned ok:false diagnostics and retained the previous complete policy."
+    },
+    {
+      "id": "TAKEOVER-07",
+      "name": "terminal_uncertain visibility and independent next classification",
+      "status": "passed",
+      "evidence": "Exactly one log line carried cause=terminal_uncertain epoch 0 -> 1; a later resource_gone failure logged independently as epoch 2 -> 3 and rebound successfully."
+    }
+  ],
+  "blockers": [
+    {
+      "id": "TAKEOVER-02",
+      "file": "packages/gateway/test/takeover-redteam.test.ts",
+      "line": 178,
+      "message": "Concurrent ensureSession calls double-bump the origin epoch and mint two sessions.",
+      "excerpt": "error: expect(received).toEqual(expected)\n\nSet {\n+   \"session-e2\",\n    \"session-e1\",\n}\n\nExpected both calls to share session-e1; received session-e1 and session-e2."
+    }
+  ],
+  "advisories": [
+    "Gateway chat turns are serialized by KeyedQueue, but direct GjcClient callers (including monitor propagation and future callers) can still reach this race."
+  ]
+}

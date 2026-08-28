@@ -130,6 +130,7 @@ test("intermediate assistant messages are delivered while the turn is still runn
 			options?.onAssistantText?.("done: found the culprit");
 			return "done: found the culprit";
 		},
+		forgetRebinds: () => {},
 	};
 	const { client } = await startGateway(gjc);
 	sendChannelMessage(client, "c1", "hey, dig into this");
@@ -162,6 +163,7 @@ test("a queued message does not pay the debounce window twice", async () => {
 			await Bun.sleep(600);
 			return "ack";
 		},
+		forgetRebinds: () => {},
 	};
 	directory = await mkdtemp(join(tmpdir(), "gajaeway-debounce-"));
 	const config: GatewayConfig = {
@@ -191,19 +193,19 @@ test("a queued message does not pay the debounce window twice", async () => {
 	expect(gapAfterFirstTurn).toBeLessThan(400);
 });
 
-test("a stale gjc session binding is rebound once and the turn retried", async () => {
+test("a prose-only stale session failure surfaces visibly without a prose-driven rebind", async () => {
+	// #13 mandates exact-code-only classification. gjc emits no structured code
+	// for "session not found", so the old main behavior — a regex-driven epoch
+	// bump and retry that could loop forever against a dead key — is replaced by
+	// a visible structured failure whose remedy (/new) the operator controls.
 	let calls = 0;
-	const epochs: number[] = [];
 	const gjc: GjcPort = {
-		ensureSession: async (_key, epoch) => {
-			epochs.push(epoch ?? 0);
-			return { sessionId: `session-e${epoch}` };
-		},
-		sendTurn: async (sessionId) => {
+		ensureSession: async () => ({ sessionId: "session-e0" }),
+		sendTurn: async () => {
 			calls++;
-			if (sessionId === "session-e0") throw new Error('gjc turn exited 1: Error: Session "dead-beef" not found.');
-			return "recovered reply";
+			throw new Error('gjc turn exited 1: Error: Session "dead-beef" not found.');
 		},
+		forgetRebinds: () => {},
 	};
 	const { client } = await startGateway(gjc);
 	sendChannelMessage(client, "r1", "are you alive?");
@@ -212,7 +214,7 @@ test("a stale gjc session binding is rebound once and the turn retried", async (
 		await Bun.sleep(5);
 	}
 	const message = client.frames.find((frame: any) => frame.type === "event" && frame.event === "chat.message");
-	expect(calls).toBe(2);
-	expect(epochs).toEqual([0, 1]);
-	expect(message.payload.text).toContain("recovered reply");
+	expect(calls).toBe(1);
+	expect(message.payload.text).toContain("[turn failed]");
+	expect(message.payload.text).toContain('Session "dead-beef" not found');
 });

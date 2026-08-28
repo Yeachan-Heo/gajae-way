@@ -280,6 +280,24 @@ export interface WorkRunParams {
 	/** Working directory for the worker session (e.g. a repo checkout). */
 	readonly cwd?: string;
 }
+/**
+ * Live config reload. `changed` are the reloadable fields actually applied,
+ * `restartRequired` names edited fields only a restart can apply, and `ignored`
+ * names edited fields no code reads at all — so the caller is never told a field
+ * took effect when it did not.
+ */
+export type ConfigReloadResult =
+	| {
+			readonly ok: true;
+			readonly changed: readonly string[];
+			readonly restartRequired: readonly string[];
+			readonly ignored: readonly string[];
+	  }
+	| {
+			readonly ok: false;
+			readonly diagnostics: readonly { readonly code: string; readonly message: string }[];
+	  };
+
 export interface WorkRunResult {
 	readonly text: string;
 	readonly sessionKey: string;
@@ -415,6 +433,7 @@ export interface OpsCycleResult {
 export interface VerbCatalogV01 {
 	"gateway.status": { params: undefined; result: GatewayStatusResult };
 	"gateway.shutdown": { params: undefined; result: { readonly stopping: true } };
+	"gateway.reloadConfig": { params: undefined; result: ConfigReloadResult };
 	"chat.send": { params: ChatSendParams; result: ChatSendResult };
 	"delivery.confirm": { params: DeliveryConfirmParams; result: { readonly settled: true } };
 	"delivery.fail": { params: DeliveryFailParams; result: { readonly recorded: true } };
@@ -469,6 +488,7 @@ export const VERBS_V01 = [
 	"work.run",
 	"chat.react",
 	"engagement.reaction",
+	"gateway.reloadConfig",
 	"ops.cycle",
 ] as const;
 export const EVENTS_V01 = ["chat.message", "chat.progress", "gateway.stopping", "monitor.event"] as const;

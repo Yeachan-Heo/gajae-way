@@ -31,11 +31,15 @@ platform/kind/conversationId[/parent=…][/peer=…]
 
 It is opaque after creation—callers must not parse it back into fields. Each origin key has one `gjc` session and an epoch. `/new` (and `/reset`) increments that origin’s epoch and binds the next turn to a new session, leaving other origins untouched. Session creation is idempotent and includes the gateway instance, normalized origin key, and epoch, so a crash around creation can safely retry.
 
-Turns are serialized by origin key with `KeyedQueue`. Different conversations can work concurrently, but two messages for the same origin cannot race two `gjc --resume` processes. Each `gjc` child—creation or a turn—has a 300-second ceiling. A failing platform turn generates the visible, ledgered notice:
+Turns are serialized by origin key with `KeyedQueue`. Different conversations can work concurrently, but two messages for the same origin cannot race two `gjc --resume` processes. Each `gjc` child—creation or a turn—has a 300-second ceiling. A failing platform turn generates a visible, ledgered notice carrying the runtime's own error code and message, truncated but never erased, with only secrets redacted:
 
 ```text
-[turn failed] The reply could not be produced (timeout or runtime error). Try again, or send /new to rebind this conversation.
+[turn failed] spawn_failed: SDK startup did not complete before readiness cutoff. Send /new to rebind this conversation.
 ```
+
+The same string goes to the daemon log, so a channel transcript is enough to triage without shell access. The `/new` hint appears only when a rebind is plausibly the remedy.
+
+Four runtime codes—`resource_gone`, `spawn_failed`, `terminal_uncertain`, and turn-level `managed_append_identity_mismatch`—are permanent for the derived idempotency key and absent for a fresh one, so the gateway treats them as *rebindable*: it bumps and persists the epoch using the same reset semantics as `/new` and retries once, up to `DEFAULT_REBIND_CAP` (3) consecutive rebinds per origin, after which it fails explicitly rather than growing the epoch silently. Every rebind logs the causing code, both epochs, and a per-origin lifetime total. A completed turn that needed no rebind, or an explicit `/new`, restores the budget.
 
 The persona preamble comes from `SOUL.md`, `AGENTS.md`, and `USER.md` in `$GAJAEWAY_HOME/workspace`; the same directory is passed to `gjc` as the session working directory.
 
