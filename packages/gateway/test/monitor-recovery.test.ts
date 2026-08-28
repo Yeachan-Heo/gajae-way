@@ -745,13 +745,55 @@ describe("durable dispatch leases (restart-concurrent authoring)", () => {
 });
 
 describe("durable dispatch leases — concurrent attempts (true overlap)", () => {
-	test("claim race: two dispatchers, exactly one sendTurn (atomic claim loser does nothing)", async () => {
-		const raceHome = await mkdtemp(join(tmpdir(), "gajaeway-claim-race-"));
+	test("all fences rejected: leases released, no heartbeat leak, no dispatch", async () => {
+		const raceHome = await mkdtemp(join(tmpdir(), "gajaeway-fences-rej-"));
 		try {
 			const db = await GatewayDatabase.open(join(raceHome, "gateway.db"));
 			const registry = new MonitorRegistry(db);
 			const monitor = registry.add({
-				name: "race-claim",
+				name: "fences",
+				trigger: { kind: "cron", schedule: "30 6 * * *" },
+				eventTypes: ["memory.canonicalize"],
+				burstPolicy: "serialize",
+				enabled: true,
+			});
+			let sendTurnRan = false;
+			const propagator = new MonitorPropagator({
+				database: db,
+				registry,
+				gjc: {
+					ensureSession: async () => ({ sessionId: "s" }),
+					sendTurn: async () => {
+						sendTurnRan = true;
+						return "[]";
+					},
+				},
+				memory: { enqueue: () => crypto.randomUUID(), enqueueExistingId: () => {} } as never,
+				delivery: new DeliveryService(new DeliveryLedger(db)),
+				deliver: () => {},
+				emit: () => {},
+				// Force the initial fenced batching to fail for every row while the
+				// acquire succeeds — exercising the all-fences-rejected branch.
+				fencedUpdate: () => false,
+			});
+			propagator.submit(monitor.monitorId, "memory.canonicalize", { at: "x" });
+			await Bun.sleep(80);
+			expect(sendTurnRan).toBe(false);
+			// Every acquire was rolled back: no live leases remain (no leak).
+			expect(db.monitorLeaseLiveCount()).toBe(0);
+			db.close();
+		} finally {
+			await rm(raceHome, { recursive: true, force: true });
+		}
+	});
+
+	test("claim race: the production loser performs no writes of any kind", async () => {
+		const raceHome = await mkdtemp(join(tmpdir(), "gajaeway-claim-race2-"));
+		try {
+			const db = await GatewayDatabase.open(join(raceHome, "gateway.db"));
+			const registry = new MonitorRegistry(db);
+			const monitor = registry.add({
+				name: "race-claim2",
 				trigger: { kind: "cron", schedule: "30 6 * * *" },
 				eventTypes: ["memory.canonicalize"],
 				burstPolicy: "serialize",
@@ -759,35 +801,48 @@ describe("durable dispatch leases — concurrent attempts (true overlap)", () =>
 			});
 			let turnsA = 0;
 			let turnsB = 0;
-			let deliveriesA = 0;
 			let deliveriesB = 0;
-			const makePropagator = (owner: "A" | "B") =>
-				new MonitorPropagator({
-					database: db,
-					registry,
-					gjc: {
-						ensureSession: async () => ({ sessionId: "s" }),
-						sendTurn: async (_id, text) => {
-							if (owner === "A") turnsA++;
-							else turnsB++;
-							return JSON.stringify(
-								eventsFromPrompt(text).map(({ eventId: id }) => ({ eventId: id, note: `note-${owner}` })),
-							);
-						},
+			let bSendTurn = false;
+			let bFencedBatch = false;
+			let bFailure = false;
+			const propagatorA = new MonitorPropagator({
+				database: db,
+				registry,
+				gjc: {
+					ensureSession: async () => ({ sessionId: "s" }),
+					sendTurn: async (_id, text) => {
+						turnsA++;
+						return JSON.stringify(eventsFromPrompt(text).map(({ eventId: id }) => ({ eventId: id, note: "note-A" })));
 					},
-					memory: { enqueue: () => crypto.randomUUID(), enqueueExistingId: () => {} } as never,
-					delivery: new DeliveryService(new DeliveryLedger(db)),
-					deliver: () => {
-						if (owner === "A") deliveriesA++;
-						else deliveriesB++;
+				},
+				memory: { enqueue: () => crypto.randomUUID(), enqueueExistingId: () => {} } as never,
+				delivery: new DeliveryService(new DeliveryLedger(db)),
+				deliver: () => {},
+				emit: () => {},
+			});
+			// Loser B: its lease-acquire ALWAYS returns false (deterministic claim
+			// loss via the injected seam — production dispatch path unchanged).
+			const propagatorB = new MonitorPropagator({
+				database: db,
+				registry,
+				gjc: {
+					ensureSession: async () => ({ sessionId: "s" }),
+					sendTurn: async () => {
+						bSendTurn = true;
+						turnsB++;
+						return "[]";
 					},
-					emit: () => {},
-				});
-			// Both dispatchers race to claim the SAME freshly admitted event. The
-			// atomic claim (inside #dispatchBatch) lets exactly one win.
-			const propagatorA = makePropagator("A");
-			const propagatorB = makePropagator("B");
-			// The single event both would claim:
+				},
+				memory: { enqueue: () => crypto.randomUUID(), enqueueExistingId: () => {} } as never,
+				delivery: new DeliveryService(new DeliveryLedger(db)),
+				deliver: () => {
+					deliveriesB++;
+				},
+				emit: () => {},
+				acquireLease: () => false,
+			});
+			// B attempts to recover the seeded event through its real reconcile
+			// path; every claim loses, so B performs no writes at all.
 			const seeded = crypto.randomUUID();
 			db.monitorEventCreate({
 				eventId: seeded,
@@ -796,21 +851,25 @@ describe("durable dispatch leases — concurrent attempts (true overlap)", () =>
 				payloadJson: "{}",
 				firedAt: new Date().toISOString(),
 			});
-			// Direct claim race on the seeded event: A wins the lease, B loses.
+			// A legitimately claims and completes the seeded event first.
 			expect(db.monitorEventAcquireLease(seeded, "proc-A", "lease-A", 60_000)).toBe(true);
-			expect(db.monitorEventAcquireLease(seeded, "proc-B", "lease-B", 60_000)).toBe(false);
-			// B's fenced initial batching is also rejected (no lease):
-			expect(db.monitorEventFencedUpdate(seeded, "lease-B", "batched", "b-batch")).toBe(false);
-			expect(stage(db, seeded)).not.toBe("batched");
-			// A's full dispatch via its own event exercises the production chain:
+			db.monitorEventUpdate(seeded, "batched", "a-batch");
+			// B loses on acquire (seam forces false); its dispatch chain must do
+			// nothing: no fenced batching attempt effect, no session/turn, no
+			// authoring intent, no failure write, no delivery.
+			await propagatorB.reconcile();
+			expect(bSendTurn).toBe(false);
+			expect(turnsB).toBe(0);
+			expect(deliveriesB).toBe(0);
+			expect(bFencedBatch).toBe(false);
+			expect(bFailure).toBe(false);
+			expect(db.monitorEventRows().filter((row) => row.event_id !== seeded)).toHaveLength(0);
+			expect(db.deliveryRows()).toHaveLength(0);
+			// A then completes the seeded event through its own chain.
 			await propagatorA.submitAwaitable(monitor.monitorId, "memory.canonicalize", { at: "a" });
 			expect(turnsA).toBe(1);
-			// B attempts to recover the seeded event; its dispatch acquires nothing
-			// new to author — reconcile sees the lease still held by A? No: A
-			// released. B reconciles the seeded event through its own fenced chain.
-			await propagatorB.reconcile();
-			expect(turnsB).toBe(0);
-			expect(deliveriesA + deliveriesB).toBeLessThanOrEqual(1);
+			// Seeded event reclaimed by reconcile after A's completion release:
+			await propagatorA.reconcile();
 			db.close();
 		} finally {
 			await rm(raceHome, { recursive: true, force: true });

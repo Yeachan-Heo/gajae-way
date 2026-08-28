@@ -560,6 +560,14 @@ WHERE excluded.acquired_at IS NOT NULL AND (SELECT expires_at FROM dispatch_leas
 	monitorEventReleaseLease(eventId: string, leaseId: string): void {
 		this.#database.query("DELETE FROM dispatch_leases WHERE event_id = ? AND lease_id = ?").run(eventId, leaseId);
 	}
+	/** Total live (unexpired) leases — test/ops hygiene seam for leak detection. */
+	monitorLeaseLiveCount(now = Date.now()): number {
+		return (
+			this.#database
+				.query<{ n: number }, [string]>("SELECT COUNT(*) AS n FROM dispatch_leases WHERE expires_at > ?")
+				.get(new Date(now).toISOString())?.n ?? 0
+		);
+	}
 	/** Returns the lease id of the live (unexpired) claim, if any. */
 	monitorEventLiveLeaseOwner(eventId: string, now = Date.now()): string | undefined {
 		const row = this.#database

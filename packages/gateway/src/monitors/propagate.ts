@@ -49,6 +49,8 @@ export class MonitorPropagator {
 	readonly #ownerTarget: { readonly origin: OriginRef } | undefined;
 	readonly #deliver: ((payload: ChatMessagePayload) => void) | undefined;
 	readonly #now: () => number;
+	readonly #acquireLease: (eventId: string, owner: string, leaseId: string, ttlMs: number, now: number) => boolean;
+	readonly #fencedUpdate: (eventId: string, leaseId: string, batchId: string, now: number) => boolean;
 	#batches = new Map<string, { eventIds: string[]; timer: ReturnType<typeof setTimeout> }>();
 	/** Event ids this process is dispatching right now, so reconcile never double-runs them. */
 	#inFlight = new Set<string>();
@@ -69,6 +71,14 @@ export class MonitorPropagator {
 		deliver?: (payload: ChatMessagePayload) => void;
 		/** Injectable clock for deterministic lease expiry/renewal in tests. */
 		now?: () => number;
+		/**
+		 * Injectable lease-acquire (test/ops seam): defaults to the durable DB
+		 * claim. Tests may wrap it to force deterministic claim outcomes while
+		 * keeping the production dispatch path identical.
+		 */
+		acquireLease?: (eventId: string, owner: string, leaseId: string, ttlMs: number, now: number) => boolean;
+		/** Injectable fenced-batching seam (tests): defaults to the durable fenced update. */
+		fencedUpdate?: (eventId: string, leaseId: string, batchId: string, now: number) => boolean;
 	}) {
 		this.#database = options.database;
 		this.#registry = options.registry;
@@ -79,6 +89,13 @@ export class MonitorPropagator {
 		this.#ownerTarget = options.ownerTarget;
 		this.#deliver = options.deliver;
 		this.#now = options.now ?? (() => Date.now());
+		this.#acquireLease =
+			options.acquireLease ??
+			((eventId, owner, leaseId, ttlMs, at) =>
+				this.#database.monitorEventAcquireLease(eventId, owner, leaseId, ttlMs, at));
+		this.#fencedUpdate =
+			options.fencedUpdate ??
+			((eventId, lease, batch, at) => this.#database.monitorEventFencedUpdate(eventId, lease, "batched", batch, at));
 	}
 	/** Cancels pending burst timers so a closed database is never touched after shutdown. */
 	dispose(): void {
@@ -302,29 +319,31 @@ export class MonitorPropagator {
 		for (const row of rows) {
 			// The atomic claim is the ONLY gate: acquireLease fails when a live
 			// lease exists (check-to-claim race impossible inside one statement).
-			if (this.#database.monitorEventAcquireLease(row.event_id, owner, leaseId, leaseTtlMs, now())) {
+			if (this.#acquireLease(row.event_id, owner, leaseId, leaseTtlMs, now())) {
 				leased.push(row);
 			}
 		}
 		if (!leased.length) return;
+		// Fence the initial stage claim: only rows we still own transition.
+		const claimed: typeof leased = [];
+		for (const row of leased) {
+			if (this.#fencedUpdate(row.event_id, leaseId, batchId, now())) claimed.push(row);
+		}
+		if (!claimed.length) {
+			// Ownership stolen between claim and batching: release every acquired
+			// lease and bail — no heartbeat, no dispatch, no writes.
+			for (const row of leased) this.#database.monitorEventReleaseLease(row.event_id, leaseId);
+			return;
+		}
 		// Heartbeat: renew the lease while the authoring turn is in flight so long
 		// turns (observed 14m+ canonicalizations) never expire mid-flight, while a
 		// dead owner's lease still times out (bounded expiry = TTL after the last
 		// heartbeat).
 		const stopHeartbeat = this.#startLeaseHeartbeat(
-			leased.map((row) => row.event_id),
+			claimed.map((row) => row.event_id),
 			leaseId,
 			leaseTtlMs,
 		);
-		// Fence the initial stage claim too: only rows we still own transition.
-		const claimed: typeof leased = [];
-		for (const row of leased) {
-			if (this.#database.monitorEventFencedUpdate(row.event_id, leaseId, "batched", batchId, now())) claimed.push(row);
-		}
-		if (!claimed.length) {
-			for (const row of claimed) this.#database.monitorEventReleaseLease(row.event_id, leaseId);
-			return;
-		}
 		const declared = new Set(monitor.eventTypes);
 		const sessionOrigin = declared.has(claimed[0]?.event_type)
 			? eventTypeOrigin(rows[0]?.event_type)
