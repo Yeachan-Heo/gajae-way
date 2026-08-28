@@ -1,0 +1,59 @@
+{
+	"schemaVersion": 1,
+	"kind": "api-package-test-report",
+	"subject": "Issue #35 residual conversation context cursor, reset floor, retention, diagnostics, and schema-13 migration",
+	"testedCommit": "eddcc730902b6cf0199c622e8d70824d47597fb7",
+	"baseCommit": "9d3139ba334d35b92ef96b1efeb0d8ec50144bff",
+	"recordedAt": "2026-08-28T11:39:13Z",
+	"results": [
+		{
+			"command": "bun test packages/gateway/test/context-diff.test.ts packages/gateway/test/context-turn.test.ts packages/gateway/test/server.test.ts packages/gateway/test/inbound-wiring.test.ts packages/gateway/test/inbound-queue.test.ts packages/gateway/test/session-rebind.test.ts packages/gateway/test/migration-drill.test.ts packages/gateway/test/monitor-recovery.test.ts packages/gateway/test/cycle.test.ts packages/admin/test/view.test.ts packages/admin/test/server.test.ts packages/cli/test/main.test.ts packages/adapter-discord/test/adapter.test.ts packages/adapter-telegram/test/adapter.test.ts",
+			"status": "passed",
+			"summary": "222 passed, 0 failed"
+		},
+		{
+			"command": "bun test packages",
+			"status": "passed",
+			"summary": "1068 passed, 2 skipped, 0 failed across 82 files"
+		},
+		{
+			"command": "bun ./node_modules/typescript/bin/tsc --noEmit",
+			"status": "passed",
+			"summary": "No diagnostics"
+		},
+		{
+			"command": "bun run build",
+			"status": "passed",
+			"summary": "Gateway, Discord, Telegram, admin, and CLI binaries compiled"
+		},
+		{
+			"command": "GAJAEWAY_BENCH=1 bun test packages/gateway/bench/retrieval-golden.bench.test.ts",
+			"status": "passed",
+			"summary": "7/7 golden queries ranked expected result first"
+		},
+		{
+			"command": "bun ./node_modules/@biomejs/biome/bin/biome check $(git diff --name-only --diff-filter=ACM origin/main...HEAD)",
+			"status": "passed_with_warnings",
+			"summary": "Changed-file check completed with 0 errors and 11 pre-existing warnings in touched legacy files"
+		},
+		{
+			"command": "bun ./node_modules/@biomejs/biome/bin/biome check .",
+			"status": "baseline_failed",
+			"summary": "Repository-wide check reports 13 pre-existing errors and 69 warnings, primarily unrelated artifact/config formatting and monitor/rebind lint findings; no broad formatting rewrite was performed"
+		},
+		{
+			"command": "git diff --check",
+			"status": "passed",
+			"summary": "No whitespace errors"
+		}
+	],
+	"contracts": [
+		"Newest 60 rows inside the six-hour/session/reset floor are selected and presented chronologically with deterministic timestamp/message-id/row ordering.",
+		"Omitted rows are consumed once, aggregate evidence is retained without bodies, and pending omission evidence is acknowledged with the successful cursor.",
+		"Failures before assistant delivery preserve selected context; terminal text, intentional silence, and duplicate-safe intermediate delivery followed by failure consume it.",
+		"/new and /reset persist an origin floor across restart without relying on sessions.created_at mutation.",
+		"Active maintenance expires stale unread rows and deletes only consumed bodies older than seven days while preserving recent retry-relevant rows.",
+		"Schema 12 upgrades monotonically to 13 while preserving lane jobs, monitor events/slots, and durable rebind counters.",
+		"Gateway status, ops cycle, CLI, and admin expose counts and timestamp ranges only, never context bodies."
+	]
+}
