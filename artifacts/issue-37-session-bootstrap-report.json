@@ -5,8 +5,8 @@
   "repository": "Yeachan-Heo/gajae-way",
   "branch": "feat/issue-37-session-memory-bootstrap",
   "base": "c72615333cba90d66b562eaf1d413e387ec21064",
-  "executableHead": "78f6a52d1dc7837daa2494a3e824a860b49af857",
-  "generatedAt": "2026-08-28T13:03:07Z",
+  "executableHead": "47f49cf79a79a573ad4ed65c2c8951b1cf222ad9",
+  "generatedAt": "2026-08-28T13:09:08Z",
   "summary": "Fresh origin epochs receive one trusted, bounded session bootstrap with canonical channel metadata and confined memory navigation. Durable schema-14 projection commits only after terminal text or intentional-silence success; failed attempts retry with the stable origin+epoch marker. Public navigation and associated documents are full-origin filtered and privacy gated.",
   "securityReview": {
     "reviewer": "agent://0-BootstrapSecurityReview",
@@ -17,6 +17,7 @@
       "Association requires a complete canonical origin key or validated JSON OriginRef; bare conversation IDs are rejected.",
       "Public MEMORY links are reduced to current-origin public-safe channel/project/task/handoff pointers plus the rules index; other/global pointers are omitted.",
       "Every MEMORY and ops/rules/index pointer is decoded, confined, and re-rendered individually, so a safe first link cannot smuggle a trailing private or traversal link on the same source line.",
+      "Navigation headings and link labels pass through the same credential/secret redaction before trusted-system serialization; adjacent source-line text is discarded while safe confined paths remain visible.",
       "Included source material is system-delimited as reference data, never executable instructions.",
       "Diagnostics use bounded logical codes rather than raw filesystem errors; participant metadata is count/length bounded.",
       "The canonical opaque originKey is used in conversation-isolation guidance.",
@@ -49,12 +50,12 @@
     { "case": "missing MEMORY/daily/rules sources", "result": "passed with bounded diagnostics" }
   ],
   "verification": [
-    { "command": "bun test packages", "status": "passed", "evidence": "1091 passed, 2 skipped, 0 failed; 4638 expectations across 83 files" },
+    { "command": "bun test packages", "status": "passed", "evidence": "1092 passed, 2 skipped, 0 failed; 4646 expectations across 83 files" },
     { "command": "bunx tsc --noEmit", "status": "passed", "evidence": "no diagnostics" },
     { "command": "bun run build", "status": "passed", "evidence": "gateway, Discord, Telegram, admin, and CLI standalone binaries compiled" },
     { "command": "bunx biome check <changed files> && git diff --check", "status": "passed_with_baseline_warnings", "evidence": "no errors or fixes; 11 pre-existing warnings in touched legacy files; diff check clean" },
     { "command": "bun test packages/gateway/bench/retrieval-golden.bench.test.ts", "status": "skipped_by_suite", "evidence": "0 failed; benchmark test is repository-marked skip" },
-    { "command": "bun test packages/gateway/test/session-bootstrap.test.ts packages/gateway/test/context-turn.test.ts packages/gateway/test/session-rebind.test.ts packages/gateway/test/migration-drill.test.ts", "status": "passed", "evidence": "74 passed, 0 failed; 479 expectations" }
+    { "command": "bun test packages/gateway/test/session-bootstrap.test.ts packages/gateway/test/context-turn.test.ts packages/gateway/test/session-rebind.test.ts packages/gateway/test/migration-drill.test.ts", "status": "passed", "evidence": "75 passed, 0 failed; 487 expectations" }
   ],
   "migration": {
     "from": 13,
