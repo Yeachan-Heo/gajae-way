@@ -22,6 +22,7 @@ test("coalesce preserves every event identity while using one authoring turn", a
 		let mutations = 0;
 		const gjc = {
 			ensureSession: async () => ({ sessionId: "event-session" }),
+			forgetRebinds: () => {},
 			sendTurn: async (_id: string, text: string) => {
 				turns++;
 				return JSON.stringify(

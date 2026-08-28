@@ -11,20 +11,30 @@ export function decideEngagement(
 	const configured =
 		config.channels?.[`${origin.platform}:${origin.conversationId}`] ??
 		(origin.platform === "discord" ? config.channels?.[origin.conversationId] : undefined);
-	// An explicitly opened channel is a room the persona inhabits: it hears every
-	// HUMAN (silence tokens keep it from answering everything), so the allowlist
-	// does not gate humans there. Bot authors never get that free pass: every bot
+	// Three explicit gates. The previous shape had two states and the second one
+	// silently changed meaning depending on whether `mentionAllowlist` happened to
+	// be populated - a security-relevant setting flipping on the presence of an
+	// unrelated field. Unset now means `closed`, the safe default.
+	//
+	// Bot authors never get the free pass an `open` channel gives humans: every bot
 	// status/progress/chatter message was burning a full serialized gjc turn, which
-	// is what queued real owner messages behind minutes of noise turns (live
-	// gajaeway-play finding: 67% of inbound was sibling-bot chatter). A bot must
-	// mention us explicitly to get a turn; its message stays recorded as unread
-	// conversation context either way. Mention-triggered turns in ordinary group
-	// surfaces are commands, and commands are allowlisted: an unlisted author's
-	// mention stays context, never a turn (owner directive: prompt-injection
-	// posture — non-owners are untrusted).
-	if (configured?.engagement === "open" && !engagement.authorIsBot) return { engaged: true };
+	// queued real owner messages behind minutes of noise (live finding: 67% of
+	// inbound was sibling-bot chatter). A bot must mention us to get a turn; its
+	// message stays recorded as unread context either way.
+	const gate = configured?.engagement ?? "closed";
+	if (gate === "open" && !engagement.authorIsBot) return { engaged: true };
 	if (!engagement.mentioned) return { engaged: false };
+	// `open-mention-only`: anyone may address the persona, but only by addressing it.
+	if (gate === "open-mention-only") return { engaged: true };
+	// `closed` (and `open` for a bot author): addressed AND authorised. An empty
+	// allowlist means owner-only rather than everyone - the previous code fell
+	// through to "anyone who mentions us", which is the opposite of failing closed.
 	const allowlist = config.mentionAllowlist;
-	if (allowlist && allowlist.length > 0 && !allowlist.includes(engagement.authorId)) return { engaged: false };
+	if (!allowlist || allowlist.length === 0) {
+		const owner = config.ownerTarget?.origin;
+		const ownerId = owner && "peerId" in owner ? (owner as { peerId?: string }).peerId : undefined;
+		return { engaged: ownerId !== undefined && engagement.authorId === ownerId };
+	}
+	if (!allowlist.includes(engagement.authorId)) return { engaged: false };
 	return { engaged: true };
 }

@@ -24,7 +24,7 @@ import {
 	resolveReactionEmoji,
 	validateOriginRef,
 } from "@gajaeway/protocol";
-import type { GatewayConfig } from "../config";
+import { type ConfigOverrides, type GatewayConfig, type ReloadResult, reloadConfig } from "../config";
 import { DeliveryService } from "../delivery/delivery";
 import { ReactionBudget } from "../delivery/reaction-budget";
 import { decideEngagement } from "../engagement/policy";
@@ -39,6 +39,7 @@ import { MonitorRuntime } from "../monitors/runtime";
 import { backupDatabase, integrityDatabase } from "../ops/backup";
 import { RuntimeCycleProjector } from "../ops/cycle";
 import type { GjcPort } from "../orchestrator/gjc-client";
+import { formatFailureNotice } from "../orchestrator/rebind";
 import { PersonaLoader } from "../persona/persona";
 import type { GatewayDatabase, InboundMessageRow } from "../store/db";
 import { DeliveryLedger } from "../store/ledger";
@@ -51,11 +52,6 @@ import { composeSpeakerLabel, composeTurnHeader } from "./speaker";
  * durable memory (daily capture + recall) carries continuity across epochs.
  */
 const SESSION_TURN_LIMIT = 50;
-
-/** A `gjc --resume` against a session gjc no longer has (deleted or lost binding). */
-function isStaleSessionError(error: unknown): boolean {
-	return error instanceof Error && /session\s+"?[\w-]+"?\s+not found/i.test(error.message);
-}
 
 interface Connection {
 	readonly decoder: FrameDecoder;
@@ -73,6 +69,8 @@ export interface GatewayServerOptions {
 	readonly startedAt?: string;
 	readonly onStop?: () => void | Promise<void>;
 	readonly persona?: PersonaLoader;
+	/** Per-process CLI overrides, reapplied on every live reload so they survive it. */
+	readonly overrides?: ConfigOverrides;
 	/** Test seam for chat.progress throttling; production uses the 15s defaults. */
 	readonly progress?: { readonly firstAfterMs?: number; readonly intervalMs?: number };
 }
@@ -81,7 +79,45 @@ interface InboundContext {
 	readonly requestId: string;
 	readonly connection: Connection;
 }
+/**
+ * The ONE reload implementation, shared by the SIGHUP handler and the
+ * `gateway.reloadConfig` verb: changing a single mention-allowlist entry used to
+ * require a full gateway restart, and restarting is exactly what poisons session
+ * keys and produced the outage this branch also fixes.
+ *
+ * Fail-safe by construction: `reloadConfig` validates the whole file before
+ * publishing and returns the previous config on any error, so a failed reload
+ * cannot leave the daemon half-applied. Every outcome is logged with the fields
+ * applied and the fields refused as restart-only.
+ */
+async function applyConfigReload(
+	runtime: Runtime,
+	options: GatewayServerOptions,
+	trigger: string,
+): Promise<ReloadResult> {
+	const result = await reloadConfig(runtime.config, options.overrides);
+	if (!result.ok) {
+		console.error(
+			`gateway config reload (${trigger}) FAILED; keeping the previous config: ${result.diagnostics
+				.map((diagnostic) => `${diagnostic.code}: ${diagnostic.message}`)
+				.join("; ")}`,
+		);
+		return result;
+	}
+	runtime.config = result.config;
+	console.error(
+		`gateway config reload (${trigger}) ok; applied=[${result.changed.join(",")}] restart-required=[${result.restartRequired.join(",")}] ignored=[${result.ignored.join(",")}]`,
+	);
+	return result;
+}
+
 interface Runtime {
+	/**
+	 * The live config. Mutable on purpose: SIGHUP and the reload verb republish it
+	 * here, and every per-request read goes through it, so a reloadable field
+	 * takes effect on the next turn without a restart.
+	 */
+	config: GatewayConfig;
 	readonly delivery: DeliveryService;
 	readonly persona: PersonaLoader;
 	readonly connections: Set<Connection>;
@@ -112,6 +148,16 @@ export async function startUnixServer(options: GatewayServerOptions): Promise<Ga
 	let stopping = false;
 	let stopPromise: Promise<void> | undefined;
 	let listener: ReturnType<typeof Bun.listen>;
+	// SIGHUP is what an operator reaches for; the reload verb is the same code path
+	// for the console. Registered here and removed on stop so the handler never
+	// outlives the daemon it belongs to.
+	const onHup = () =>
+		void applyConfigReload(runtime, options, "SIGHUP").catch((error: unknown) =>
+			console.error(
+				`gateway config reload (SIGHUP) crashed: ${error instanceof Error ? error.message : String(error)}`,
+			),
+		);
+	process.on("SIGHUP", onHup);
 	// Concurrent stop() calls (shutdown verb + owner teardown) must all await the
 	// SAME settling run: an early-returning duplicate let callers proceed while
 	// memory closure was still writing, racing filesystem teardown (live flake).
@@ -119,6 +165,7 @@ export async function startUnixServer(options: GatewayServerOptions): Promise<Ga
 		if (stopPromise) return stopPromise;
 		stopping = true;
 		stopPromise = (async () => {
+			process.off("SIGHUP", onHup);
 			for (const connection of runtime.connections)
 				connection.write({ v: PROFILE_VERSION, type: "event", event: "gateway.stopping", payload: { reason } });
 			listener.stop(true);
@@ -179,10 +226,21 @@ export function startStdioServer(options: GatewayServerOptions): GatewayServer {
 	runtime.connections.add(connection);
 	let stopping = false;
 	let stopPromise: Promise<void> | undefined;
+	// The stdio daemon gets the SAME reload trigger as the Unix server: an
+	// operator (or supervisor) may signal either form, and deployment.md claims
+	// SIGHUP for a running gateway without qualifying the transport.
+	const onHup = () =>
+		void applyConfigReload(runtime, options, "SIGHUP").catch((error: unknown) =>
+			console.error(
+				`gateway config reload (SIGHUP) crashed: ${error instanceof Error ? error.message : String(error)}`,
+			),
+		);
+	process.on("SIGHUP", onHup);
 	const stop = (reason = "shutdown requested") => {
 		if (stopPromise) return stopPromise;
 		stopping = true;
 		stopPromise = (async () => {
+			process.off("SIGHUP", onHup);
 			connection.write({ v: PROFILE_VERSION, type: "event", event: "gateway.stopping", payload: { reason } });
 			clearInterval(runtime.reconcileTimer);
 			await runtime.turns.settle();
@@ -250,6 +308,7 @@ function createRuntime(options: GatewayServerOptions): Runtime {
 	const monitorRuntime = new MonitorRuntime(options.config, registry, monitors);
 	const reconcileTimer = setInterval(() => void monitors.reconcile(), 60_000);
 	return {
+		config: options.config,
 		delivery,
 		persona: options.persona ?? new PersonaLoader(options.config.home),
 		connections,
@@ -335,6 +394,19 @@ async function handleRequest(
 			connection.write({ v: PROFILE_VERSION, type: "response", id: request.id, result: { stopping: true } });
 			await stop();
 			return;
+		case "gateway.reloadConfig": {
+			// Same implementation as SIGHUP; the console gets it without signals.
+			const result = await applyConfigReload(runtime, options, `verb ${request.id}`);
+			connection.write({
+				v: PROFILE_VERSION,
+				type: "response",
+				id: request.id,
+				result: result.ok
+					? { ok: true, changed: result.changed, restartRequired: result.restartRequired, ignored: result.ignored }
+					: { ok: false, diagnostics: result.diagnostics },
+			});
+			return;
+		}
 		case "delivery.confirm": {
 			const id = (request.params as { deliveryId?: unknown } | undefined)?.deliveryId;
 			if (typeof id !== "string" || !runtime.delivery.confirm(id))
@@ -687,7 +759,7 @@ async function sendChat(
 	if (params.text === "/new" || params.text === "/reset") {
 		// Session resets are commands: in group surfaces they obey the mention
 		// allowlist, or any room member could wipe the persona's conversation state.
-		const allowlist = options.config.mentionAllowlist;
+		const allowlist = runtime.config.mentionAllowlist;
 		const authorId = (params.engagement as { authorId?: unknown } | undefined)?.authorId;
 		if (
 			origin.platform !== "loopback" &&
@@ -705,6 +777,10 @@ async function sendChat(
 			return;
 		}
 		options.database.withTransaction(() => options.database.bumpEpoch(key, JSON.stringify(origin)));
+		// An explicit reset is the manual form of a rebind, so it also restores the
+		// automatic rebind budget: otherwise an origin that spent its cap would stay
+		// capped even after the operator did exactly what the notice asked for.
+		options.gjc.forgetRebinds(key);
 		const payload = {
 			turnId: crypto.randomUUID(),
 			origin,
@@ -742,7 +818,7 @@ async function sendChat(
 			typeof params.engagement.authorId !== "string")
 	)
 		throw new ProtocolError("invalid_params", "non-loopback chat.send requires engagement");
-	const engaged = decideEngagement(origin, params.engagement as never, options.config).engaged;
+	const engaged = decideEngagement(origin, params.engagement as never, runtime.config).engaged;
 	const inboundMessageId = typeof params.messageId === "string" && params.messageId ? params.messageId : undefined;
 	// Declined messages are still context, never commands (protocol contract): every
 	// platform message lands in the conversation-context ledger so the next engaged
@@ -814,7 +890,7 @@ async function drainOrigin(
 			// message that already waited behind an earlier turn has served its
 			// debounce, and sleeping again inside the serialized drain was adding
 			// flat latency to every drained batch (live gajaeway-play finding).
-			const debounceMs = debounceFor(row, options.config);
+			const debounceMs = debounceFor(row, runtime.config);
 			const waitedMs = Date.now() - Date.parse(row.received_at);
 			const remainingMs = Number.isFinite(waitedMs) ? Math.max(0, debounceMs - waitedMs) : debounceMs;
 			if (remainingMs > 0) await Bun.sleep(remainingMs);
@@ -1037,30 +1113,26 @@ async function runInboundTurn(
 		});
 	};
 	try {
-		try {
-			text = await runTurn();
-		} catch (error) {
-			// A bound gjc session can vanish underneath its binding (live crash loop:
-			// `gjc turn exited 1: Session "…" not found` on every subsequent message).
-			// Rebind a fresh transcript via an epoch bump and retry once.
-			if (deliveredParts.length === 0 && isStaleSessionError(error)) {
-				console.error(`gateway rebinding stale gjc session for ${key}: ${(error as Error).message}`);
-				options.database.withTransaction(() => options.database.bumpEpoch(key, JSON.stringify(origin)));
-				text = await runTurn();
-			} else throw error;
-		}
+		text = await runTurn();
 	} catch (error) {
+		// A prose-only "session not found" failure (gjc emits no structured code
+		// for it) is deliberately NOT auto-rebound: #13 mandates exact-code-only
+		// classification, and every retry against the same dead key is guaranteed
+		// silence. The failure surfaces through #14's structured notice instead,
+		// where the operator's remedy — /new — is one message away.
 		// Never ghost a platform conversation: a failed turn still produces a visible,
 		// ledgered notice (live P1 drill finding: timeouts looked like silent ignores).
+		// The notice carries the runtime's OWN code and message (#14): one opaque line
+		// cost ~2h of muteness because nobody could tell a poisoned session key from a
+		// timeout. The identical string is logged, so a channel transcript is enough
+		// to triage without shell access.
 		// When intermediate messages already reached the room, the persona visibly
 		// spoke; a trailing "[turn failed]" would disavow real replies, so the
 		// failure stays in the daemon log only.
+		const failureNotice = formatFailureNotice(error);
+		console.error(failureNotice);
 		if (nonLoopback && deliveredParts.length === 0) {
-			const notice = runtime.delivery.prepare(
-				turnId,
-				origin,
-				"[turn failed] The reply could not be produced (timeout or runtime error). Try again, or send /new to rebind this conversation.",
-			);
+			const notice = runtime.delivery.prepare(turnId, origin, failureNotice);
 			if (notice) {
 				runtime.delivery.markInflight(notice.deliveryId as string);
 				for (const recipient of runtime.connections)

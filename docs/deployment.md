@@ -57,7 +57,20 @@ Use `config.json` schema version 1. Every configured secret is a credential-file
 }
 ```
 
-`socketPath`, `dbPath`, `logVerbosity`, credentials, channels, webhook, watcher roots, and script root are optional. Socket and database paths default inside the home directory, and log verbosity defaults to `info`. `logVerbosity` is reloadable; changing socket or database paths requires a restart.
+`socketPath`, `dbPath`, `logVerbosity`, credentials, channels, webhook, watcher roots, and script root are optional. Socket and database paths default inside the home directory, and log verbosity defaults to `info`.
+
+## Reloading configuration without a restart
+
+A running gateway re-reads `config.json` on `SIGHUP` (`kill -HUP <pid>`) or on the `gateway.reloadConfig` verb; both run the same implementation, so the console and the signal behave identically.
+
+The reload is fail-safe and reports exactly what it did:
+
+- `changed` — fields applied live. Only `mentionAllowlist`, `channels`, and `debounceMs` are re-read at runtime; a change to one of these takes effect on the next turn.
+- `restartRequired` — fields you edited that are bound to a startup resource (`socketPath`, `dbPath`, `turnTimeoutMs`, `model`, `credentials`, `webhook`, `watcherRoots`, `scriptRoot`, `ownerTarget`). They are reported and deliberately NOT applied; restart to pick them up.
+- `ignored` — fields you edited that no code reads at all. `logVerbosity` is currently parsed but unconsumed, so editing it has no effect and no restart would give it one.
+- On a parse or validation error, or when `config.json` is missing or unreadable, the reload fails, keeps the previous configuration untouched, and returns a diagnostic. A missing file never publishes defaults over live policy, because that would drop the mention allowlist and open a mention-gated room.
+
+Every reload is logged with the trigger and all three field lists.
 
 The Discord adapter has a separate `$GAJAEWAY_HOME/adapter-discord.json` because it reads its own token:
 

@@ -7,8 +7,8 @@ import { MemoryClosureQueue } from "../src/memory/closure";
 import { MonitorPropagator } from "../src/monitors/propagate";
 import { MonitorRegistry } from "../src/monitors/registry";
 import type { GjcPort } from "../src/orchestrator/gjc-client";
-import { DeliveryLedger } from "../src/store/ledger";
 import { GatewayDatabase } from "../src/store/db";
+import { DeliveryLedger } from "../src/store/ledger";
 
 let home = "";
 let database: GatewayDatabase | undefined;
@@ -33,7 +33,7 @@ async function harness(sendTurn: GjcPort["sendTurn"]) {
 	const propagator = new MonitorPropagator({
 		database,
 		registry,
-		gjc: { ensureSession: async () => ({ sessionId: "s1" }), sendTurn },
+		gjc: { ensureSession: async () => ({ sessionId: "s1" }), sendTurn, forgetRebinds: () => {} },
 		memory: new MemoryClosureQueue(database, home),
 		delivery: new DeliveryService(new DeliveryLedger(database)),
 		emit: () => {},
@@ -41,13 +41,14 @@ async function harness(sendTurn: GjcPort["sendTurn"]) {
 	return { propagator, monitor, database };
 }
 
-const stage = (db: GatewayDatabase, id: string) =>
-	db.monitorEventRows().find((row) => row.event_id === id)?.stage;
+const stage = (db: GatewayDatabase, id: string) => db.monitorEventRows().find((row) => row.event_id === id)?.stage;
 
 test("an event stranded at batched by a dead process is recovered by reconcile", async () => {
-	const { propagator, monitor, database: db } = await harness(async () =>
-		JSON.stringify([{ eventId: "PLACEHOLDER", note: "done" }]),
-	);
+	const {
+		propagator,
+		monitor,
+		database: db,
+	} = await harness(async () => JSON.stringify([{ eventId: "PLACEHOLDER", note: "done" }]));
 
 	// Simulate the crash: the row is left at `batched` with no authored output, exactly the
 	// state a gateway restart mid-dispatch leaves behind.
@@ -75,7 +76,11 @@ test("reconcile does not touch an event this process is still dispatching", asyn
 		release = resolve;
 	});
 	let turns = 0;
-	const { propagator, monitor, database: db } = await harness(async () => {
+	const {
+		propagator,
+		monitor,
+		database: db,
+	} = await harness(async () => {
 		turns++;
 		await parked;
 		return JSON.stringify([{ eventId: "x", note: "done" }]);
@@ -95,7 +100,11 @@ test("reconcile does not touch an event this process is still dispatching", asyn
 });
 
 test("a failed event is still recovered, as before", async () => {
-	const { propagator, monitor, database: db } = await harness(async () => {
+	const {
+		propagator,
+		monitor,
+		database: db,
+	} = await harness(async () => {
 		throw new Error("turn exploded");
 	});
 	const eventId = propagator.submit(monitor.monitorId, "memory.canonicalize", { at: "now" });

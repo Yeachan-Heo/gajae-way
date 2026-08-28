@@ -31,8 +31,8 @@ export async function bootGateway(
 	const startedAt = new Date().toISOString();
 	const close = async () => database.close();
 	const server = options.stdio
-		? startStdioServer({ config, database, gjc, persona, startedAt, onStop: close })
-		: await startUnixServer({ config, database, gjc, persona, startedAt, onStop: close });
+		? startStdioServer({ config, database, gjc, persona, startedAt, onStop: close, overrides: options.overrides })
+		: await startUnixServer({ config, database, gjc, persona, startedAt, onStop: close, overrides: options.overrides });
 	console.error(JSON.stringify({ recovery: { recovered: pending, pending, pruned } }));
 	return server;
 }
