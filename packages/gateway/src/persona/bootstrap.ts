@@ -59,6 +59,16 @@ function normalizeUnsafeSeparators(value: string): string {
 	return normalized;
 }
 
+function credentialDetectionShadow(value: string): string {
+	let shadow = "";
+	for (const character of value) {
+		const code = character.codePointAt(0) ?? 0;
+		if ((code < 0x20 && code !== 0x0a) || code === 0x7f || FORMAT_OR_LINE_SEPARATOR.test(character)) continue;
+		shadow += character;
+	}
+	return shadow;
+}
+
 function hasUnsafeSeparators(value: string): boolean {
 	return [...value].some((character) => {
 		const code = character.codePointAt(0) ?? 0;
@@ -100,9 +110,12 @@ function diagnosticCode(error: unknown): string {
 }
 
 function safeText(value: string): string {
-	return normalizeUnsafeSeparators(value)
+	return value
 		.split("\n")
-		.map((line) => {
+		.map((sourceLine) => {
+			const line = normalizeUnsafeSeparators(sourceLine);
+			const shadow = credentialDetectionShadow(sourceLine);
+			if (redactSecrets(shadow) !== shadow) return "[REDACTED]";
 			const splitCredential = line.match(SPLIT_CREDENTIAL_KEY);
 			if (splitCredential?.index !== undefined) return `${line.slice(0, splitCredential.index)}[REDACTED]`;
 			return redactSecrets(line)

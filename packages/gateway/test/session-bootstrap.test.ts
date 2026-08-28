@@ -254,19 +254,22 @@ describe("session bootstrap builder", () => {
 		const config = await setup();
 		await writeFile(
 			join(home, "memory", "channels", "c1.md"),
-			"origin-key: discord/channel/c1\nbootstrap-safe: public\nto\0ken=CHANNEL-CREDENTIAL",
+			"origin-key: discord/channel/c1\nbootstrap-safe: public\nto\0ken=CHANNEL-CREDENTIAL\nsk_l\0ive_abcdefgh",
 		);
 		await mkdir(join(home, "memory", "daily"), { recursive: true });
 		await writeFile(
 			join(home, "memory", "daily", "2026-08-28.md"),
-			"## entry\n- origin-key: discord/channel/c1\n- user: pass\u200bword=DAILY-CREDENTIAL",
+			"## entry\n- origin-key: discord/channel/c1\n- user: pass\u200bword=DAILY-CREDENTIAL\n- reply: ghp_ab\u200bcdefgh",
 		);
 		await mkdir(join(home, "memory", "ops", "rules"), { recursive: true });
 		await writeFile(join(home, "memory", "ops", "rules", "safe.md"), "safe rule");
-		await writeFile(join(home, "memory", "MEMORY.md"), "# Map\n- [a\u2060pi_key=MAP-CREDENTIAL](channels/c1.md)");
+		await writeFile(
+			join(home, "memory", "MEMORY.md"),
+			"# Map\n- [a\u2060pi_key=MAP-CREDENTIAL](channels/c1.md)\n- [xoxb-abc\u2060defgh](channels/c1.md)",
+		);
 		await writeFile(
 			join(home, "memory", "ops", "rules", "index.md"),
-			"# Rules\n- [sec\u200cret=RULES-CREDENTIAL](safe.md)",
+			"# Rules\n- [sec\u200cret=RULES-CREDENTIAL](safe.md)\n- [pk_te\u200bst_abcdefgh](safe.md)",
 		);
 		const result = await build(config);
 		expect(result.text).toContain("channels/c1.md");
@@ -281,6 +284,14 @@ describe("session bootstrap builder", () => {
 			"password=DAILY-CREDENTIAL",
 			"api_key=MAP-CREDENTIAL",
 			"secret=RULES-CREDENTIAL",
+			"sk_live_abcdefgh",
+			"ghp_abcdefgh",
+			"xoxb-abcdefgh",
+			"pk_test_abcdefgh",
+			"sk_l ive_abcdefgh",
+			"ghp_ab cdefgh",
+			"xoxb-abc defgh",
+			"pk_te st_abcdefgh",
 		])
 			expect(result.text).not.toContain(leaked);
 		for (const separator of [String.fromCharCode(0), "​", "‌", "⁠"]) expect(result.text).not.toContain(separator);
