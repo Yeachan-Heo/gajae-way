@@ -213,6 +213,19 @@ export class MonitorPropagator {
 		if (this.#reconciling) return;
 		this.#reconciling = true;
 		try {
+			// Legacy split-state repair: a crash between ledger confirm and batch
+			// settlement (pre-atomic path) can leave confirmed deliveries with
+			// authored events. Repair them deterministically on startup.
+			for (const delivery of this.#database.deliveryRows()) {
+				if (delivery.state !== "confirmed") continue;
+				const batch = this.#database.monitorEventRows().filter((row) => row.batch_id === delivery.turn_id);
+				const needsRepair = batch.some((row) => row.stage === "authored");
+				if (!needsRepair) continue;
+				this.#database.withTransaction(() => {
+					for (const row of batch)
+						if (row.stage === "authored") this.#database.monitorEventUpdate(row.event_id, "delivered");
+				});
+			}
 			// Replay oldest-first: recovery must re-author events in the order they fired.
 			for (const row of this.#database.monitorEventRows(undefined, "oldest")) {
 				if ((TERMINAL_STAGES as readonly string[]).includes(row.stage)) continue;
@@ -287,9 +300,11 @@ export class MonitorPropagator {
 		const leaseTtlMs = 10 * 60_000;
 		const leased: typeof rows = [];
 		for (const row of rows) {
-			if (this.#database.monitorEventLiveLeaseOwner(row.event_id, now())) continue;
-			this.#database.monitorEventAcquireLease(row.event_id, owner, leaseId, leaseTtlMs, now());
-			leased.push(row);
+			// The atomic claim is the ONLY gate: acquireLease fails when a live
+			// lease exists (check-to-claim race impossible inside one statement).
+			if (this.#database.monitorEventAcquireLease(row.event_id, owner, leaseId, leaseTtlMs, now())) {
+				leased.push(row);
+			}
 		}
 		if (!leased.length) return;
 		// Heartbeat: renew the lease while the authoring turn is in flight so long
@@ -301,11 +316,17 @@ export class MonitorPropagator {
 			leaseId,
 			leaseTtlMs,
 		);
-		this.#database.withTransaction(() => {
-			for (const row of leased) this.#database.monitorEventUpdate(row.event_id, "batched", batchId);
-		});
+		// Fence the initial stage claim too: only rows we still own transition.
+		const claimed: typeof leased = [];
+		for (const row of leased) {
+			if (this.#database.monitorEventFencedUpdate(row.event_id, leaseId, "batched", batchId, now())) claimed.push(row);
+		}
+		if (!claimed.length) {
+			for (const row of claimed) this.#database.monitorEventReleaseLease(row.event_id, leaseId);
+			return;
+		}
 		const declared = new Set(monitor.eventTypes);
-		const sessionOrigin = declared.has(leased[0]?.event_type)
+		const sessionOrigin = declared.has(claimed[0]?.event_type)
 			? eventTypeOrigin(rows[0]?.event_type)
 			: CATCH_ALL_EVENT_ORIGIN;
 		try {
@@ -313,11 +334,11 @@ export class MonitorPropagator {
 				originKey(sessionOrigin),
 				this.#database.getSessionRecord(originKey(sessionOrigin))?.epoch ?? 0,
 			);
-			const guidance = leased
+			const guidance = claimed
 				.map((row) => MAINTENANCE_GUIDANCE[row.event_type])
 				.filter((entry, index, all) => entry && all.indexOf(entry) === index)
 				.join(" ");
-			const prompt = `Author monitor events.${guidance ? ` ${guidance}` : ""} Respond ONLY with a JSON array containing exactly one {"eventId","note"} entry per event: ${JSON.stringify(leased.map((row) => ({ eventId: row.event_id, eventType: row.event_type, payload: JSON.parse(row.payload_json) })))}`;
+			const prompt = `Author monitor events.${guidance ? ` ${guidance}` : ""} Respond ONLY with a JSON array containing exactly one {"eventId","note"} entry per event: ${JSON.stringify(claimed.map((row) => ({ eventId: row.event_id, eventType: row.event_type, payload: JSON.parse(row.payload_json) })))}`;
 			const response = await this.#gjc.sendTurn(sessionId, prompt);
 			// Lease fencing: after an await, this attempt may no longer own the
 			// claim (expired + stolen). Every write below is conditional on the
@@ -325,12 +346,33 @@ export class MonitorPropagator {
 			// Atomic fencing: each stage write carries its live-lease check in the
 			// same UPDATE, so a lease stolen between check and write cannot be
 			// exploited (TOCTOU-free). `fenced` = rows whose write landed.
-			const fenced = leased.filter((row) =>
+			const fenced = claimed.filter((row) =>
 				this.#database.monitorEventFencedUpdate(row.event_id, leaseId, "dispatched", batchId),
 			);
 			if (!fenced.length) return;
 			const authored = JSON.parse(response) as Array<{ eventId?: unknown; note?: unknown }>;
 			if (!Array.isArray(authored)) throw new Error("authoring response is not an array");
+			// Strict response contract: exactly one valid entry per claimed event —
+			// a partial/missing/duplicate/extra response is a structured failure.
+			// Omitted events must stay recoverable (dispatched/failed), never
+			// silently delivered alongside their batch.
+			const claimedIds = new Set(claimed.map((row) => row.event_id));
+			const seenIds = new Set<string>();
+			for (const entry of authored) {
+				if (typeof entry.eventId !== "string" || typeof entry.note !== "string") {
+					throw new Error("authoring response entry missing eventId or note");
+				}
+				if (!claimedIds.has(entry.eventId)) {
+					throw new Error(`authoring response contains unknown event ${entry.eventId}`);
+				}
+				if (seenIds.has(entry.eventId)) {
+					throw new Error(`authoring response duplicates event ${entry.eventId}`);
+				}
+				seenIds.add(entry.eventId);
+			}
+			for (const id of claimedIds) {
+				if (!seenIds.has(id)) throw new Error(`authoring response omits event ${id}`);
+			}
 			for (const entry of authored)
 				if (
 					typeof entry.eventId === "string" &&
@@ -419,7 +461,7 @@ export class MonitorPropagator {
 			for (const row of leased) {
 				this.#database.monitorEventFencedFail(row.event_id, leaseId, batchId, code, `dispatch phase failed (${code})`);
 			}
-			console.error(`monitor dispatch failed (${code}): events ${leased.map((row) => row.event_id).join(",")}`);
+			console.error(`monitor dispatch failed (${code}): events ${claimed.map((row) => row.event_id).join(",")}`);
 		} finally {
 			stopHeartbeat();
 			// Release the leases this attempt holds. Lease-guarded: if this attempt

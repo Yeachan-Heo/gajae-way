@@ -786,12 +786,55 @@ SELECT 1 FROM dispatch_leases l WHERE l.event_id = monitor_events.event_id AND l
 	 * (`authored`) still receive fail-path demotions so failed deliveries stay
 	 * operator-visible.
 	 */
+	/**
+	 * Atomic confirm + settlement (terminal-critic blocker 2): the ledger row
+	 * transition to `confirmed` and the batch monitor-event settlement commit in
+	 * ONE transaction. `outcome` distinguishes unknown / transitioned /
+	 * already_terminal so the server can ack idempotently. A crash can no longer
+	 * leave confirmed-ledger/authored-event pairs.
+	 */
+	deliveryConfirmWithSettle(
+		deliveryId: string,
+		monitorEventStage: "delivered" | "authored",
+	): "unknown" | "transitioned" | "already_terminal" {
+		return this.withTransaction(() => {
+			const delivery = this.#database
+				.query<{ delivery_id: string; turn_id: string; state: string }, [string]>(
+					"SELECT delivery_id, turn_id, state FROM deliveries WHERE delivery_id = ?",
+				)
+				.get(deliveryId);
+			if (!delivery) return "unknown";
+			if (delivery.state === "confirmed" || delivery.state === "expired") {
+				// Idempotent no-op: already terminal. Repairs a legacy split state
+				// (confirmed ledger, authored events) if one exists.
+				if (delivery.state === "confirmed") {
+					this.settleMonitorEventsForTurn(delivery.turn_id, monitorEventStage);
+				}
+				return "already_terminal";
+			}
+			this.#database
+				.query("UPDATE deliveries SET state = 'confirmed', updated_at = ? WHERE delivery_id = ?")
+				.run(new Date().toISOString(), deliveryId);
+			this.settleMonitorEventsForTurn(delivery.turn_id, monitorEventStage);
+			return "transitioned";
+		});
+	}
+	/** Settles the monitor batch of a turn id (used by the atomic confirm path). */
+	settleMonitorEventsForTurn(turnId: string, stage: "delivered" | "authored"): void {
+		const events = this.#database
+			.query<{ event_id: string }, [string]>("SELECT event_id FROM monitor_events WHERE batch_id = ?")
+			.all(turnId);
+		for (const event of events) this.monitorEventSettle(event.event_id, stage);
+	}
 	monitorEventSettle(eventId: string, stage: "delivered" | "authored"): boolean {
 		const row = this.#database
 			.query<{ stage: string }, [string]>("SELECT stage FROM monitor_events WHERE event_id = ?")
 			.get(eventId);
 		if (!row) return false;
-		if (stage === "delivered" && row.stage !== "delivered") {
+		// delivered may ONLY be reached from authored: an omitted event still in
+		// dispatched/batched can never be promoted by a batch-wide settlement
+		// (terminal-critic blocker 3).
+		if (stage === "delivered" && row.stage === "authored") {
 			this.monitorEventUpdate(eventId, "delivered");
 			return true;
 		}

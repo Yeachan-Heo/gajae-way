@@ -358,17 +358,15 @@ async function handleRequest(
 			const id = (request.params as { deliveryId?: unknown } | undefined)?.deliveryId;
 			if (typeof id !== "string") throw new ProtocolError("invalid_params", "unknown deliveryId");
 			// unknown -> invalid_params; already-terminal -> idempotent no-op ack.
-			const confirmOutcome = runtime.delivery.confirm(id);
+			const confirmOutcome = options.database.deliveryConfirmWithSettle(id, "delivered");
 			if (confirmOutcome === "unknown") throw new ProtocolError("invalid_params", "unknown deliveryId");
 			// Monitor batch settlement: a confirmed delivery for a monitor batch
 			// (turn_id === the events' batch_id) advances its authored events to
 			// `delivered` — only AFTER the adapter confirmed (issue #29 defect 2),
 			// and NEVER when the ledger row is expired: a late confirm on an expired
-			// delivery must not mark monitor events delivered (round-4 blocker 3).
-			{
-				const ledgerRow = options.database.deliveryRows().find((row) => row.delivery_id === id);
-				if (ledgerRow?.state === "confirmed") settleMonitorBatch(options.database, id, "delivered");
-			}
+			// delivery must not mark monitor events delivered (round-4 blocker 3);
+			// confirmation + settlement are now ONE transaction (terminal-critic
+			// blocker 2), so no split-state repair window exists.
 			connection.write({ v: PROFILE_VERSION, type: "response", id: request.id, result: { settled: true } });
 			return;
 		}
