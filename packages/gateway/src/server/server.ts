@@ -59,6 +59,15 @@ import { KeyedQueue } from "./keyed-queue";
 import { composeSpeakerLabel, composeTurnHeader } from "./speaker";
 
 /**
+ * Unread-context bounds. The digest answers "what did I miss since I last
+ * spoke", so it must never hand the persona a backlog it could mistake for the
+ * present: at most 6 hours of wall clock, at most 60 lines, and never anything
+ * older than the current session itself.
+ */
+export const UNREAD_CONTEXT_MAX_AGE_MS = 6 * 60 * 60 * 1000;
+export const UNREAD_CONTEXT_MAX_LINES = 60;
+
+/**
  * Durable lane-job persistence for delegated work (issue #10).
  *
  * Every `work.run` call is one attempt against a job whose identity outlives
@@ -1296,14 +1305,35 @@ async function runInboundTurn(
 	// attribution — so the persona always reads "the messages above".
 	let turnText = userText;
 	if (nonLoopback) {
-		const unread = options.database.contextUnread(key, 100).filter((entry) => entry.message_id !== row.message_id);
+		// Bound the unread diff. Two independent cutoffs, because both failure modes
+		// were observed live on 2026-08-28: a freshly created session inherited a
+		// day of channel history and replayed a 26-hour-old instruction as if it had
+		// just been given, and unread rows had accumulated into the hundreds for
+		// channels the persona had never held a session in.
+		const sessionStart = options.database.sessionCreatedAt(key);
+		const windowStart = new Date(Date.now() - UNREAD_CONTEXT_MAX_AGE_MS).toISOString();
+		const cutoff = sessionStart && sessionStart > windowStart ? sessionStart : windowStart;
+		const dropped = options.database.contextUnreadOlderCount(key, cutoff);
+		if (dropped > 0) options.database.contextConsumeOlderThan(key, cutoff);
+		const unread = options.database
+			.contextUnread(key, UNREAD_CONTEXT_MAX_LINES, cutoff)
+			.filter((entry) => entry.message_id !== row.message_id);
 		const lines = unread.map(
 			(entry) =>
 				`- [${entry.received_at}] ${entry.author_name ?? "unknown"} (author:${entry.author_id ?? "?"}, msg:${entry.message_id}): ${entry.body.slice(0, 1000)}`,
 		);
+		// Truncation is stated, never silent: a persona that cannot see it was given
+		// a partial view will treat the oldest surviving line as the beginning of the
+		// conversation.
+		const droppedNote =
+			dropped > 0
+				? `[${dropped} older unread message(s) omitted: outside this session's context window, which starts at ${cutoff}]\n`
+				: "";
 		const header = lines.length
-			? `[Unread messages in this conversation since your last reply]\n${lines.join("\n")}\n\n`
-			: "";
+			? `[Unread messages in this conversation since your last reply]\n${droppedNote}${lines.join("\n")}\n\n`
+			: droppedNote
+				? `${droppedNote}\n`
+				: "";
 		turnText = `${header}${speaker ? `${composeTurnHeader({ speaker, place, authorId: engagement?.authorId, messageId: row.message_id, engagement })}\n` : ""}${userText}`;
 		options.database.contextConsume([...unread.map((entry) => entry.message_id), row.message_id]);
 	}
