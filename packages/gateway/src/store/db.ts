@@ -44,6 +44,7 @@ export interface ConversationContextWindow {
 	readonly truncatedCount: number;
 	readonly omittedOldestAt: string | null;
 	readonly omittedNewestAt: string | null;
+	readonly omissionRevision: number;
 	readonly diagnostics: ConversationContextDiagnostics;
 }
 /** A scheduled cron slot the gateway claimed or fired for one monitor. */
@@ -358,7 +359,6 @@ export class GatewayDatabase {
 		originRefJson: string;
 		body: string;
 		engagementJson?: string;
-		receivedAt?: string;
 	}): boolean {
 		const changes = this.#database
 			.query(
@@ -370,7 +370,7 @@ export class GatewayDatabase {
 				row.originRefJson,
 				row.body,
 				row.engagementJson ?? null,
-				row.receivedAt ?? new Date().toISOString(),
+				new Date().toISOString(),
 			);
 		return changes.changes > 0;
 	}
@@ -391,6 +391,14 @@ export class GatewayDatabase {
 
 	inboundComplete(messageId: string): void {
 		this.#database.query("UPDATE inbound_messages SET state = 'done' WHERE message_id = ?").run(messageId);
+	}
+
+	inboundDiscardBefore(originKey: string, floorAt: string): number {
+		return this.#database
+			.query(
+				"UPDATE inbound_messages SET state = 'done' WHERE origin_key = ? AND state = 'pending' AND received_at <= ?",
+			)
+			.run(originKey, floorAt).changes;
 	}
 
 	/**
@@ -481,6 +489,16 @@ export class GatewayDatabase {
 			.get(originKey)?.created_at;
 	}
 
+	contextFloorAt(originKey: string): string | undefined {
+		return (
+			this.#database
+				.query<{ floor_at: string | null }, [string]>(
+					"SELECT floor_at FROM conversation_context_state WHERE origin_key = ?",
+				)
+				.get(originKey)?.floor_at ?? undefined
+		);
+	}
+
 	/**
 	 * Atomically prepares the newest bounded unread diff and expires everything
 	 * outside it. Selected rows remain unread until the caller proves a terminal
@@ -498,10 +516,11 @@ export class GatewayDatabase {
 		if (!Number.isSafeInteger(maxAgeMs) || maxAgeMs < 0) throw new Error("context max age must be non-negative");
 		return this.withTransaction(() => {
 			const state = this.#database
-				.query<{ floor_at: string | null }, [string]>(
-					"SELECT floor_at FROM conversation_context_state WHERE origin_key = ?",
+				.query<{ floor_at: string | null; floor_row_id: number }, [string]>(
+					"SELECT floor_at, floor_row_id FROM conversation_context_state WHERE origin_key = ?",
 				)
 				.get(originKey);
+			const floorRowId = state?.floor_row_id ?? 0;
 			const ageFloor = new Date(now.getTime() - maxAgeMs).toISOString();
 			const sessionFloor = this.contextSessionCreatedAt(originKey);
 			const effectiveFloor = [ageFloor, sessionFloor, state?.floor_at]
@@ -509,22 +528,22 @@ export class GatewayDatabase {
 				.sort()
 				.at(-1) as string;
 			const expired = this.#contextAggregate(
-				"origin_key = ? AND consumed_at IS NULL AND message_id <> ? AND received_at < ?",
-				[originKey, triggerMessageId, effectiveFloor],
+				"origin_key = ? AND consumed_at IS NULL AND message_id <> ? AND (received_at < ? OR rowid <= ?)",
+				[originKey, triggerMessageId, effectiveFloor, floorRowId],
 			);
 			if (expired.count > 0) {
 				this.#database
 					.query(
-						"UPDATE conversation_context SET consumed_at = ? WHERE origin_key = ? AND consumed_at IS NULL AND message_id <> ? AND received_at < ?",
+						"UPDATE conversation_context SET consumed_at = ? WHERE origin_key = ? AND consumed_at IS NULL AND message_id <> ? AND (received_at < ? OR rowid <= ?)",
 					)
-					.run(now.toISOString(), originKey, triggerMessageId, effectiveFloor);
+					.run(now.toISOString(), originKey, triggerMessageId, effectiveFloor, floorRowId);
 			}
 
 			const newest = this.#database
-				.query<ConversationContextRow & { row_id: number }, [string, string, string, number]>(
-					"SELECT rowid AS row_id, message_id, author_id, author_name, body, received_at FROM conversation_context WHERE origin_key = ? AND consumed_at IS NULL AND message_id <> ? AND received_at >= ? ORDER BY received_at DESC, message_id DESC, rowid DESC LIMIT ?",
+				.query<ConversationContextRow & { row_id: number }, [string, string, string, number, number]>(
+					"SELECT rowid AS row_id, message_id, author_id, author_name, body, received_at FROM conversation_context WHERE origin_key = ? AND consumed_at IS NULL AND message_id <> ? AND received_at >= ? AND rowid > ? ORDER BY received_at DESC, message_id DESC, rowid DESC LIMIT ?",
 				)
-				.all(originKey, triggerMessageId, effectiveFloor, limit);
+				.all(originKey, triggerMessageId, effectiveFloor, floorRowId, limit);
 			const boundary = newest[newest.length - 1];
 			const truncated = boundary
 				? this.#contextAggregate(
@@ -574,6 +593,7 @@ export class GatewayDatabase {
 				truncatedCount: pending.truncated,
 				omittedOldestAt: pending.oldest,
 				omittedNewestAt: pending.newest,
+				omissionRevision: pending.revision,
 				diagnostics: this.contextDiagnostics(originKey),
 			};
 		});
@@ -581,35 +601,41 @@ export class GatewayDatabase {
 
 	/** Establishes a durable reset floor and expires every pre-floor unread row. */
 	contextSetFloor(originKey: string, floorAt = new Date().toISOString()): void {
-		const expired = this.#contextAggregate("origin_key = ? AND consumed_at IS NULL AND received_at < ?", [
-			originKey,
-			floorAt,
-		]);
+		const floorRowId =
+			this.#database
+				.query<{ row_id: number }, [string]>(
+					"SELECT COALESCE(MAX(rowid), 0) AS row_id FROM conversation_context WHERE origin_key = ?",
+				)
+				.get(originKey)?.row_id ?? 0;
+		const expired = this.#contextAggregate(
+			"origin_key = ? AND consumed_at IS NULL AND (received_at < ? OR rowid <= ?)",
+			[originKey, floorAt, floorRowId],
+		);
 		if (expired.count > 0)
 			this.#database
 				.query(
-					"UPDATE conversation_context SET consumed_at = ? WHERE origin_key = ? AND consumed_at IS NULL AND received_at < ?",
+					"UPDATE conversation_context SET consumed_at = ? WHERE origin_key = ? AND consumed_at IS NULL AND (received_at < ? OR rowid <= ?)",
 				)
-				.run(floorAt, originKey, floorAt);
+				.run(floorAt, originKey, floorAt, floorRowId);
 		this.#database
 			.query(
-				"INSERT INTO conversation_context_state (origin_key, floor_at) VALUES (?, ?) ON CONFLICT(origin_key) DO UPDATE SET floor_at = excluded.floor_at",
+				"INSERT INTO conversation_context_state (origin_key, floor_at, floor_row_id) VALUES (?, ?, ?) ON CONFLICT(origin_key) DO UPDATE SET floor_at = excluded.floor_at, floor_row_id = excluded.floor_row_id",
 			)
-			.run(originKey, floorAt);
+			.run(originKey, floorAt, floorRowId);
 		this.#recordContextOmissions(originKey, expired, { count: 0, oldest: null, newest: null }, floorAt);
 	}
 
 	/** Commits a successful/duplicate-safe turn cursor and acknowledges its omission notice atomically. */
-	contextCommitWindow(originKey: string, messageIds: readonly string[]): void {
+	contextCommitWindow(originKey: string, messageIds: readonly string[], omissionRevision: number): void {
 		const now = new Date().toISOString();
 		this.withTransaction(() => {
 			for (const id of messageIds)
 				this.#database.query("UPDATE conversation_context SET consumed_at = ? WHERE message_id = ?").run(now, id);
 			this.#database
 				.query(
-					"UPDATE conversation_context_state SET pending_expired_count = 0, pending_truncated_count = 0, pending_omitted_oldest_at = NULL, pending_omitted_newest_at = NULL WHERE origin_key = ?",
+					"UPDATE conversation_context_state SET pending_expired_count = 0, pending_truncated_count = 0, pending_omitted_oldest_at = NULL, pending_omitted_newest_at = NULL WHERE origin_key = ? AND omission_revision = ?",
 				)
-				.run(originKey);
+				.run(originKey, omissionRevision);
 		});
 	}
 
@@ -695,7 +721,7 @@ export class GatewayDatabase {
 		this.#database.query("INSERT OR IGNORE INTO conversation_context_state (origin_key) VALUES (?)").run(originKey);
 		this.#database
 			.query(
-				"UPDATE conversation_context_state SET expired_count = expired_count + ?, truncated_count = truncated_count + ?, pending_expired_count = pending_expired_count + ?, pending_truncated_count = pending_truncated_count + ?, omitted_oldest_at = CASE WHEN omitted_oldest_at IS NULL OR ? < omitted_oldest_at THEN ? ELSE omitted_oldest_at END, omitted_newest_at = CASE WHEN omitted_newest_at IS NULL OR ? > omitted_newest_at THEN ? ELSE omitted_newest_at END, pending_omitted_oldest_at = CASE WHEN pending_omitted_oldest_at IS NULL OR ? < pending_omitted_oldest_at THEN ? ELSE pending_omitted_oldest_at END, pending_omitted_newest_at = CASE WHEN pending_omitted_newest_at IS NULL OR ? > pending_omitted_newest_at THEN ? ELSE pending_omitted_newest_at END, last_omitted_at = ? WHERE origin_key = ?",
+				"UPDATE conversation_context_state SET expired_count = expired_count + ?, truncated_count = truncated_count + ?, pending_expired_count = pending_expired_count + ?, pending_truncated_count = pending_truncated_count + ?, omission_revision = omission_revision + 1, omitted_oldest_at = CASE WHEN omitted_oldest_at IS NULL OR ? < omitted_oldest_at THEN ? ELSE omitted_oldest_at END, omitted_newest_at = CASE WHEN omitted_newest_at IS NULL OR ? > omitted_newest_at THEN ? ELSE omitted_newest_at END, pending_omitted_oldest_at = CASE WHEN pending_omitted_oldest_at IS NULL OR ? < pending_omitted_oldest_at THEN ? ELSE pending_omitted_oldest_at END, pending_omitted_newest_at = CASE WHEN pending_omitted_newest_at IS NULL OR ? > pending_omitted_newest_at THEN ? ELSE pending_omitted_newest_at END, last_omitted_at = ? WHERE origin_key = ?",
 			)
 			.run(
 				expired.count,
@@ -720,13 +746,17 @@ export class GatewayDatabase {
 		truncated: number;
 		oldest: string | null;
 		newest: string | null;
+		revision: number;
 	} {
 		return (
 			this.#database
-				.query<{ expired: number; truncated: number; oldest: string | null; newest: string | null }, [string]>(
-					"SELECT pending_expired_count AS expired, pending_truncated_count AS truncated, pending_omitted_oldest_at AS oldest, pending_omitted_newest_at AS newest FROM conversation_context_state WHERE origin_key = ?",
+				.query<
+					{ expired: number; truncated: number; oldest: string | null; newest: string | null; revision: number },
+					[string]
+				>(
+					"SELECT pending_expired_count AS expired, pending_truncated_count AS truncated, pending_omitted_oldest_at AS oldest, pending_omitted_newest_at AS newest, omission_revision AS revision FROM conversation_context_state WHERE origin_key = ?",
 				)
-				.get(originKey) ?? { expired: 0, truncated: 0, oldest: null, newest: null }
+				.get(originKey) ?? { expired: 0, truncated: 0, oldest: null, newest: null, revision: 0 }
 		);
 	}
 
@@ -1562,7 +1592,7 @@ ALTER TABLE monitor_slots ADD COLUMN event_id TEXT;`,
 				// Existing context rows remain intact and unread until the bounded policy
 				// classifies them; lane jobs, monitor tables, and meta counters are untouched.
 				this.#database.exec(
-					"CREATE TABLE IF NOT EXISTS conversation_context_state (origin_key TEXT PRIMARY KEY, floor_at TEXT, expired_count INTEGER NOT NULL DEFAULT 0, truncated_count INTEGER NOT NULL DEFAULT 0, omitted_oldest_at TEXT, omitted_newest_at TEXT, last_omitted_at TEXT, pending_expired_count INTEGER NOT NULL DEFAULT 0, pending_truncated_count INTEGER NOT NULL DEFAULT 0, pending_omitted_oldest_at TEXT, pending_omitted_newest_at TEXT)",
+					"CREATE TABLE IF NOT EXISTS conversation_context_state (origin_key TEXT PRIMARY KEY, floor_at TEXT, floor_row_id INTEGER NOT NULL DEFAULT 0, expired_count INTEGER NOT NULL DEFAULT 0, truncated_count INTEGER NOT NULL DEFAULT 0, omitted_oldest_at TEXT, omitted_newest_at TEXT, last_omitted_at TEXT, pending_expired_count INTEGER NOT NULL DEFAULT 0, pending_truncated_count INTEGER NOT NULL DEFAULT 0, pending_omitted_oldest_at TEXT, pending_omitted_newest_at TEXT, omission_revision INTEGER NOT NULL DEFAULT 0)",
 				);
 				this.#database
 					.query("INSERT INTO schema_migrations (version, applied_at) VALUES (?, ?)")

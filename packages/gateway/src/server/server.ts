@@ -236,6 +236,7 @@ interface Runtime {
 	readonly monitors: MonitorPropagator;
 	readonly monitorRuntime: MonitorRuntime;
 	readonly reconcileTimer: ReturnType<typeof setInterval>;
+	readonly contextMaintenanceTimer: ReturnType<typeof setInterval>;
 	readonly turns: KeyedQueue;
 	/** Per-turn / per-message reaction caps shared by chat.react and the reply-token path. */
 	readonly reactions: ReactionBudget;
@@ -280,6 +281,7 @@ export async function startUnixServer(options: GatewayServerOptions): Promise<Ga
 				connection.write({ v: PROFILE_VERSION, type: "event", event: "gateway.stopping", payload: { reason } });
 			listener.stop(true);
 			clearInterval(runtime.reconcileTimer);
+			clearInterval(runtime.contextMaintenanceTimer);
 			// In-flight turn drains still touch the database; close it under them and
 			// their completion bookkeeping crashes ("Cannot use a closed database").
 			await runtime.turns.settle();
@@ -353,6 +355,7 @@ export function startStdioServer(options: GatewayServerOptions): GatewayServer {
 			process.off("SIGHUP", onHup);
 			connection.write({ v: PROFILE_VERSION, type: "event", event: "gateway.stopping", payload: { reason } });
 			clearInterval(runtime.reconcileTimer);
+			clearInterval(runtime.contextMaintenanceTimer);
 			await runtime.turns.settle();
 			await runtime.monitorRuntime.stop();
 			connection.close();
@@ -417,6 +420,17 @@ function createRuntime(options: GatewayServerOptions): Runtime {
 	});
 	const monitorRuntime = new MonitorRuntime(options.config, registry, monitors);
 	const reconcileTimer = setInterval(() => void monitors.reconcile(), 60_000);
+	options.database.contextMaintain();
+	const contextMaintenanceTimer = setInterval(
+		() => {
+			try {
+				options.database.contextMaintain();
+			} catch (error) {
+				console.error(`gateway context maintenance failed: ${error instanceof Error ? error.message : String(error)}`);
+			}
+		},
+		60 * 60 * 1000,
+	);
 	return {
 		config: options.config,
 		delivery,
@@ -427,6 +441,7 @@ function createRuntime(options: GatewayServerOptions): Runtime {
 		monitors,
 		monitorRuntime,
 		reconcileTimer,
+		contextMaintenanceTimer,
 		turns: new KeyedQueue(),
 		reactions: new ReactionBudget(),
 		cycle: new RuntimeCycleProjector(options.database, memory),
@@ -1101,6 +1116,7 @@ async function sendChat(
 		options.database.withTransaction(() => {
 			options.database.bumpEpoch(key, JSON.stringify(origin));
 			options.database.contextSetFloor(key, floorAt);
+			options.database.inboundDiscardBefore(key, floorAt);
 		});
 		// An explicit reset is the manual form of a rebind, so it also restores the
 		// automatic rebind budget: otherwise an origin that spent its cap would stay
@@ -1180,7 +1196,6 @@ async function sendChat(
 		originRefJson: JSON.stringify(origin),
 		body: userText,
 		engagementJson: params.engagement ? JSON.stringify(params.engagement) : undefined,
-		...(receivedAt ? { receivedAt } : {}),
 	});
 	if (!accepted) {
 		// Duplicate message id: already accepted once, so acknowledge without dispatching.
@@ -1211,6 +1226,12 @@ async function drainOrigin(
 	let ownFailure: unknown;
 	await runtime.turns.run(key, async () => {
 		for (let row = options.database.inboundClaimNext(key); row; row = options.database.inboundClaimNext(key)) {
+			const resetFloor = options.database.contextFloorAt(key);
+			if (resetFloor && row.received_at <= resetFloor) {
+				runtime.inbound.delete(row.message_id);
+				options.database.inboundComplete(row.message_id);
+				continue;
+			}
 			// Debounce: a burst of messages becomes ONE turn carrying the whole diff.
 			// The window is per-channel configurable; newer arrivals during the wait
 			// are folded into this batch, with the newest message as the trigger.
@@ -1314,10 +1335,12 @@ async function runInboundTurn(
 	// attribution — so the persona always reads "the messages above".
 	let turnText = userText;
 	let contextMessageIds: readonly string[] = [];
+	let contextOmissionRevision = 0;
 	if (nonLoopback) {
 		const prepared = options.database.contextWindow(key, row.message_id);
 		const unread = prepared.rows;
 		contextMessageIds = [...prepared.selectedMessageIds, row.message_id];
+		contextOmissionRevision = prepared.omissionRevision;
 		const lines = unread.map(
 			(entry) =>
 				`- [${entry.received_at}] ${entry.author_name ?? "unknown"} (author:${entry.author_id ?? "?"}, msg:${entry.message_id}): ${entry.body.slice(0, 1000)}`,
@@ -1386,15 +1409,13 @@ async function runInboundTurn(
 					);
 					continue;
 				}
+				const payload = runtime.delivery.prepareReaction(crypto.randomUUID(), origin, {
+					targetMessageId,
+					emoji: wanted.emoji,
+					emojiName: wanted.emojiName,
+				});
 				assistantDeliveryStarted = true;
-				broadcastDelivery(
-					runtime,
-					runtime.delivery.prepareReaction(crypto.randomUUID(), origin, {
-						targetMessageId,
-						emoji: wanted.emoji,
-						emojiName: wanted.emojiName,
-					}),
-				);
+				broadcastDelivery(runtime, payload);
 			}
 			message = reactionReply.body;
 			if (!message) return;
@@ -1470,7 +1491,7 @@ async function runInboundTurn(
 	};
 	try {
 		text = await runTurn();
-		if (nonLoopback) options.database.contextCommitWindow(key, contextMessageIds);
+		if (nonLoopback) options.database.contextCommitWindow(key, contextMessageIds, contextOmissionRevision);
 	} catch (error) {
 		// A prose-only "session not found" failure (gjc emits no structured code
 		// for it) is deliberately NOT auto-rebound: #13 mandates exact-code-only
@@ -1491,7 +1512,8 @@ async function runInboundTurn(
 		// A runtime failure before any assistant delivery leaves selected context
 		// unread for retry. Once a real text/reaction delivery has started, retrying
 		// the same window could duplicate an answer, so that window is consumed.
-		if (nonLoopback && assistantDeliveryStarted) options.database.contextCommitWindow(key, contextMessageIds);
+		if (nonLoopback && assistantDeliveryStarted)
+			options.database.contextCommitWindow(key, contextMessageIds, contextOmissionRevision);
 		if (nonLoopback && !assistantDeliveryStarted) {
 			const notice = runtime.delivery.prepare(turnId, origin, failureNotice);
 			if (notice) {

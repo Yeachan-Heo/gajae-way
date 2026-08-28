@@ -11,7 +11,7 @@ import {
 } from "../src/store/db";
 
 const ORIGIN_KEY = "discord/channel/context-diff";
-const NOW = new Date("2026-08-28T11:00:00.000Z");
+const NOW = new Date();
 let directory = "";
 let database: GatewayDatabase | undefined;
 
@@ -60,7 +60,7 @@ test("287-row stale backlog selects only newest recent rows chronologically and 
 	expect(first.diagnostics.expired).toBe(226);
 	expect(first.diagnostics.truncated).toBe(0);
 
-	db.contextCommitWindow(ORIGIN_KEY, [...first.selectedMessageIds, "trigger-current"]);
+	db.contextCommitWindow(ORIGIN_KEY, [...first.selectedMessageIds, "trigger-current"], first.omissionRevision);
 	record(db, "trigger-next", "next owner turn", new Date(NOW.getTime() + 1_000).toISOString(), "owner");
 	const next = db.contextWindow(ORIGIN_KEY, "trigger-next", new Date(NOW.getTime() + 1_000));
 	expect(next.rows).toEqual([]);
@@ -84,7 +84,7 @@ test("more than the count bound keeps newest N once and expires older recent row
 	expect(window.rows[0]?.body).toBe("body-7");
 	expect(window.rows.at(-1)?.body).toBe(`body-${CONVERSATION_DIFF_MAX_ROWS + 6}`);
 	expect(window.diagnostics.truncated).toBe(7);
-	db.contextCommitWindow(ORIGIN_KEY, [...window.selectedMessageIds, "trigger"]);
+	db.contextCommitWindow(ORIGIN_KEY, [...window.selectedMessageIds, "trigger"], window.omissionRevision);
 
 	record(db, "trigger-2", "again", new Date(NOW.getTime() + 1_000).toISOString());
 	expect(db.contextWindow(ORIGIN_KEY, "trigger-2", new Date(NOW.getTime() + 1_000)).rows).toEqual([]);
@@ -121,6 +121,19 @@ test("reset floor survives restart and excludes every pre-reset row", async () =
 	expect(window.diagnostics.expired).toBe(1);
 });
 
+test("reset floor excludes rows recorded before reset even when event timestamps tie or point into the future", async () => {
+	const db = await open();
+	const floor = NOW.toISOString();
+	record(db, "equal-event", "equal", floor);
+	record(db, "future-event", "future", new Date(NOW.getTime() + 60_000).toISOString());
+	db.withTransaction(() => db.contextSetFloor(ORIGIN_KEY, floor));
+	record(db, "after-reset", "new", new Date(NOW.getTime() + 1).toISOString());
+	record(db, "trigger", "current", new Date(NOW.getTime() + 2).toISOString());
+
+	const window = db.contextWindow(ORIGIN_KEY, "trigger", new Date(NOW.getTime() + 2));
+	expect(window.rows.map((row) => row.message_id)).toEqual(["after-reset"]);
+});
+
 test("session creation time participates in the effective context floor", async () => {
 	const db = await open();
 	record(db, "before-session", "pre-session context", new Date(Date.now() - 60_000).toISOString());
@@ -150,4 +163,19 @@ test("active maintenance drops old bodies but preserves recent retry-relevant un
 	const raw = new Database(join(directory, "gateway.db"), { readonly: true });
 	expect(raw.query<{ n: number }, []>("SELECT COUNT(*) AS n FROM conversation_context").get()?.n).toBe(1);
 	raw.close();
+});
+
+test("a later omission generation is not cleared by an older in-flight window commit", async () => {
+	const db = await open();
+	const stale = new Date(NOW.getTime() - CONVERSATION_DIFF_MAX_AGE_MS - 60_000).toISOString();
+	record(db, "stale-before-window", "old one", stale);
+	record(db, "trigger", "current", NOW.toISOString());
+	const first = db.contextWindow(ORIGIN_KEY, "trigger", NOW);
+	expect(first.expiredCount).toBe(1);
+
+	record(db, "stale-while-running", "old two", stale);
+	db.contextCommitWindow(ORIGIN_KEY, ["trigger"], first.omissionRevision);
+	record(db, "next-trigger", "next", new Date(NOW.getTime() + 1).toISOString());
+	const next = db.contextWindow(ORIGIN_KEY, "next-trigger", new Date(NOW.getTime() + 1));
+	expect(next.expiredCount).toBeGreaterThanOrEqual(1);
 });
