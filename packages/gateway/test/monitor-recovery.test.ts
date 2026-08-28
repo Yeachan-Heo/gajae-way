@@ -788,12 +788,12 @@ describe("durable dispatch leases — concurrent attempts (true overlap)", () =>
 	});
 
 	test("claim race: the production loser performs no writes of any kind", async () => {
-		const raceHome = await mkdtemp(join(tmpdir(), "gajaeway-claim-race2-"));
+		const raceHome = await mkdtemp(join(tmpdir(), "gajaeway-claim-race-"));
 		try {
 			const db = await GatewayDatabase.open(join(raceHome, "gateway.db"));
 			const registry = new MonitorRegistry(db);
 			const monitor = registry.add({
-				name: "race-claim2",
+				name: "race-claim",
 				trigger: { kind: "cron", schedule: "30 6 * * *" },
 				eventTypes: ["memory.canonicalize"],
 				burstPolicy: "serialize",
@@ -802,9 +802,8 @@ describe("durable dispatch leases — concurrent attempts (true overlap)", () =>
 			let turnsA = 0;
 			let turnsB = 0;
 			let deliveriesB = 0;
-			let bSendTurn = false;
-			let bFencedBatch = false;
-			let bFailure = false;
+			let bAcquireCalls = 0;
+			let bFencedBatchCalls = 0;
 			const propagatorA = new MonitorPropagator({
 				database: db,
 				registry,
@@ -821,14 +820,14 @@ describe("durable dispatch leases — concurrent attempts (true overlap)", () =>
 				emit: () => {},
 			});
 			// Loser B: its lease-acquire ALWAYS returns false (deterministic claim
-			// loss via the injected seam — production dispatch path unchanged).
+			// loss via the injected seam — production dispatch path unchanged). The
+			// seam counters prove the REAL #dispatchBatch path was reached.
 			const propagatorB = new MonitorPropagator({
 				database: db,
 				registry,
 				gjc: {
 					ensureSession: async () => ({ sessionId: "s" }),
 					sendTurn: async () => {
-						bSendTurn = true;
 						turnsB++;
 						return "[]";
 					},
@@ -839,10 +838,18 @@ describe("durable dispatch leases — concurrent attempts (true overlap)", () =>
 					deliveriesB++;
 				},
 				emit: () => {},
-				acquireLease: () => false,
+				acquireLease: () => {
+					bAcquireCalls++;
+					return false;
+				},
+				fencedUpdate: () => {
+					bFencedBatchCalls++;
+					return false;
+				},
 			});
-			// B attempts to recover the seeded event through its real reconcile
-			// path; every claim loses, so B performs no writes at all.
+			// Seed ONE recoverable event with NO live lease (crash-mid-dispatch
+			// shape). Both dispatchers reconcile; B's atomic claim deterministically
+			// loses via the injected seam.
 			const seeded = crypto.randomUUID();
 			db.monitorEventCreate({
 				eventId: seeded,
@@ -851,25 +858,25 @@ describe("durable dispatch leases — concurrent attempts (true overlap)", () =>
 				payloadJson: "{}",
 				firedAt: new Date().toISOString(),
 			});
-			// A legitimately claims and completes the seeded event first.
-			expect(db.monitorEventAcquireLease(seeded, "proc-A", "lease-A", 60_000)).toBe(true);
-			db.monitorEventUpdate(seeded, "batched", "a-batch");
-			// B loses on acquire (seam forces false); its dispatch chain must do
-			// nothing: no fenced batching attempt effect, no session/turn, no
-			// authoring intent, no failure write, no delivery.
+			// B loses: reconcile reaches #dispatchBatch (seam called exactly once),
+			// the false acquire pushes nothing, and no downstream write occurs.
 			await propagatorB.reconcile();
-			expect(bSendTurn).toBe(false);
+			expect(bAcquireCalls).toBe(1);
+			expect(bFencedBatchCalls).toBe(0);
 			expect(turnsB).toBe(0);
 			expect(deliveriesB).toBe(0);
-			expect(bFencedBatch).toBe(false);
-			expect(bFailure).toBe(false);
-			expect(db.monitorEventRows().filter((row) => row.event_id !== seeded)).toHaveLength(0);
+			const seededRow = db.monitorEventRows().find((candidate) => candidate.event_id === seeded);
+			expect(seededRow?.stage).toBe("admitted");
+			expect(db.authoredOutput(seeded)).toBeUndefined();
+			expect(db.monitorFailure(seeded)).toBeUndefined();
+			expect(db.memoryIntentRows().filter((row) => row.payload_json.includes(seeded))).toHaveLength(0);
 			expect(db.deliveryRows()).toHaveLength(0);
-			// A then completes the seeded event through its own chain.
-			await propagatorA.submitAwaitable(monitor.monitorId, "memory.canonicalize", { at: "a" });
-			expect(turnsA).toBe(1);
-			// Seeded event reclaimed by reconcile after A's completion release:
+			// A then claims and completes the seeded event through its own chain.
 			await propagatorA.reconcile();
+			expect(turnsA).toBe(1);
+			expect(db.monitorEventRows().find((candidate) => candidate.event_id === seeded)?.stage).toBe(
+				"authored_no_delivery",
+			);
 			db.close();
 		} finally {
 			await rm(raceHome, { recursive: true, force: true });
