@@ -33,6 +33,7 @@ if (!stress) {
 				registry,
 				gjc: {
 					ensureSession: async () => ({ sessionId: "stress-session" }),
+					forgetRebinds: () => {},
 					sendTurn: async (_sessionId, prompt) => {
 						turns++;
 						return JSON.stringify(

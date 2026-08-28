@@ -117,6 +117,7 @@ test("ops.cycle verb serves a fresh fail-closed snapshot over the socket", async
 	const gjc: GjcPort = {
 		ensureSession: async () => ({ sessionId: "mock-session" }),
 		sendTurn: async () => "mock reply",
+		forgetRebinds: () => {},
 	};
 	server = await startUnixServer({ config, database, gjc, onStop: () => database.close() });
 

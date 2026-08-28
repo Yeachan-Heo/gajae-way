@@ -32,6 +32,13 @@ export class MonitorPropagator {
 	#batches = new Map<string, { eventIds: string[]; timer: ReturnType<typeof setTimeout> }>();
 	/** Event ids this process is dispatching right now, so reconcile never double-runs them. */
 	#inFlight = new Set<string>();
+	/**
+	 * Per-origin turn chains: two batches for the same session origin must not
+	 * run ensureSession/sendTurn concurrently. Binds coalesce in the client,
+	 * but TURNS do not — concurrent same-origin resumes (and any rebinds they
+	 * trigger) would race the session binding.
+	 */
+	#turnChains = new Map<string, Promise<void>>();
 	constructor(options: {
 		database: GatewayDatabase;
 		registry: MonitorRegistry;
@@ -140,13 +147,38 @@ export class MonitorPropagator {
 			for (const row of rows) this.#database.monitorEventUpdate(row.event_id, "batched", batchId);
 		});
 		const declared = new Set(monitor.eventTypes);
-		const sessionOrigin = declared.has(rows[0]?.event_type)
-			? eventTypeOrigin(rows[0]?.event_type)
-			: CATCH_ALL_EVENT_ORIGIN;
+		const sessionOriginKey = originKey(
+			declared.has(rows[0]?.event_type) ? eventTypeOrigin(rows[0]?.event_type) : CATCH_ALL_EVENT_ORIGIN,
+		);
+		// Serialize per session origin: concurrent same-origin turn dispatches
+		// (a batch firing while reconcile replays another) would run two gjc
+		// resumes — and possibly two rebinds — against one binding.
+		const previous = this.#turnChains.get(sessionOriginKey) ?? Promise.resolve();
+		const chain = previous.then(
+			() => this.#dispatchTurnBatch(eventIds, monitor, sessionOriginKey, batchId),
+			() => this.#dispatchTurnBatch(eventIds, monitor, sessionOriginKey, batchId),
+		);
+		const tracked = chain.catch(() => undefined);
+		this.#turnChains.set(sessionOriginKey, tracked);
+		try {
+			await chain;
+		} finally {
+			if (this.#turnChains.get(sessionOriginKey) === tracked) this.#turnChains.delete(sessionOriginKey);
+		}
+	}
+
+	async #dispatchTurnBatch(
+		eventIds: string[],
+		monitor: NonNullable<ReturnType<MonitorRegistry["get"]>>,
+		sessionOriginKey: string,
+		batchId: string,
+	): Promise<void> {
+		const rows = this.#database.monitorEventRows().filter((row) => eventIds.includes(row.event_id));
+		if (!rows.length) return;
 		try {
 			const { sessionId } = await this.#gjc.ensureSession(
-				originKey(sessionOrigin),
-				this.#database.getSessionRecord(originKey(sessionOrigin))?.epoch ?? 0,
+				sessionOriginKey,
+				this.#database.getSessionRecord(sessionOriginKey)?.epoch ?? 0,
 			);
 			const guidance = rows
 				.map((row) => MAINTENANCE_GUIDANCE[row.event_type])

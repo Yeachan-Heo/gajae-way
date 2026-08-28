@@ -52,6 +52,7 @@ test("requires negotiation then serves status, shutdown, and validates chat para
 	const database = await GatewayDatabase.open(config.dbPath);
 	const gjc: GjcPort = {
 		ensureSession: async () => ({ sessionId: "mock-session" }),
+		forgetRebinds: () => {},
 		sendTurn: async () => "mock reply",
 	};
 	server = await startUnixServer({
@@ -111,6 +112,7 @@ test("a failed platform turn still delivers a visible ledgered failure notice", 
 	const database = await GatewayDatabase.open(config.dbPath);
 	const gjc: GjcPort = {
 		ensureSession: async () => ({ sessionId: "mock-session" }),
+		forgetRebinds: () => {},
 		sendTurn: async () => {
 			throw new Error("gjc turn timed out after 300000ms");
 		},
@@ -153,6 +155,7 @@ test("long turns broadcast throttled chat.progress liveness events", async () =>
 	const database = await GatewayDatabase.open(config.dbPath);
 	const gjc: GjcPort = {
 		ensureSession: async () => ({ sessionId: "mock-session" }),
+		forgetRebinds: () => {},
 		sendTurn: async (_session, _text, _preamble, onProgress) => {
 			for (let call = 1; call <= 3; call++) {
 				await Bun.sleep(5);
@@ -217,6 +220,7 @@ test("debounced burst becomes one turn carrying the unread diff with speaker att
 	const turns: Array<{ text: string; preamble: string }> = [];
 	const gjc: GjcPort = {
 		ensureSession: async () => ({ sessionId: "mock-session" }),
+		forgetRebinds: () => {},
 		sendTurn: async (_session, text, preamble) => {
 			turns.push({ text, preamble: preamble ?? "" });
 			return "batched reply";
@@ -273,6 +277,7 @@ test("group turns carry silence guidance: listeners are told to default to [SILE
 	const preambles: string[] = [];
 	const gjc: GjcPort = {
 		ensureSession: async () => ({ sessionId: "mock-session" }),
+		forgetRebinds: () => {},
 		sendTurn: async (_session, _text, preamble) => {
 			preambles.push(preamble ?? "");
 			return "[SILENT]";
@@ -316,6 +321,7 @@ test("[REPLY:id] parts thread to the referenced message and strip the directive"
 	const database = await GatewayDatabase.open(config.dbPath);
 	const gjc: GjcPort = {
 		ensureSession: async () => ({ sessionId: "mock-session" }),
+		forgetRebinds: () => {},
 		sendTurn: async () => "[REPLY:msg-42] threaded answer\n[BREAK]\nplain follow-up",
 	};
 	server = await startUnixServer({ config, database, gjc, onStop: () => database.close() });
@@ -363,6 +369,7 @@ test("work.run runs a named worker session in the requested cwd and returns the 
 			seen.push({ key, options });
 			return { sessionId: "worker-session" };
 		},
+		forgetRebinds: () => {},
 		sendTurn: async (_session, text, _preamble, _progress, options) => {
 			seen.push({ text, options });
 			return "worker result";
@@ -408,6 +415,7 @@ test("work.run records a durable lane job and work.jobs projects it (issue #10)"
 	const gjc: GjcPort = {
 		ensureSession: async () => ({ sessionId: "0f1e2d3c-4b5a-4678-8796-a5b4c3d2e1f0" }),
 		sendTurn: async () => "worker result",
+		forgetRebinds: () => {},
 	};
 	server = await startUnixServer({ config, database, gjc, onStop: () => database.close() });
 	const client = await connect(config.socketPath);
@@ -517,6 +525,7 @@ test("a stalled durable job holds the next work.run until resume (production pat
 			turns += 1;
 			return "worker result";
 		},
+		forgetRebinds: () => {},
 	};
 	server = await startUnixServer({ config, database, gjc, onStop: () => database.close() });
 	const client = await connect(config.socketPath);
@@ -581,6 +590,7 @@ test("resuming a stalled job clears the hold durably: the next ordinary call is 
 			turns += 1;
 			return "worker result";
 		},
+		forgetRebinds: () => {},
 	};
 	server = await startUnixServer({ config, database, gjc, onStop: () => database.close() });
 	const client = await connect(config.socketPath);

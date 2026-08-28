@@ -33,7 +33,7 @@ async function harness(sendTurn: GjcPort["sendTurn"]) {
 	const propagator = new MonitorPropagator({
 		database,
 		registry,
-		gjc: { ensureSession: async () => ({ sessionId: "s1" }), sendTurn },
+		gjc: { ensureSession: async () => ({ sessionId: "s1" }), sendTurn, forgetRebinds: () => {} },
 		memory: new MemoryClosureQueue(database, home),
 		delivery: new DeliveryService(new DeliveryLedger(database)),
 		emit: () => {},
