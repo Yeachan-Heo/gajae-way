@@ -1470,7 +1470,7 @@ async function runInboundTurn(
 	};
 	try {
 		text = await runTurn();
-		if (nonLoopback) options.database.contextConsume(contextMessageIds);
+		if (nonLoopback) options.database.contextCommitWindow(key, contextMessageIds);
 	} catch (error) {
 		// A prose-only "session not found" failure (gjc emits no structured code
 		// for it) is deliberately NOT auto-rebound: #13 mandates exact-code-only
@@ -1491,7 +1491,7 @@ async function runInboundTurn(
 		// A runtime failure before any assistant delivery leaves selected context
 		// unread for retry. Once a real text/reaction delivery has started, retrying
 		// the same window could duplicate an answer, so that window is consumed.
-		if (nonLoopback && assistantDeliveryStarted) options.database.contextConsume(contextMessageIds);
+		if (nonLoopback && assistantDeliveryStarted) options.database.contextCommitWindow(key, contextMessageIds);
 		if (nonLoopback && !assistantDeliveryStarted) {
 			const notice = runtime.delivery.prepare(turnId, origin, failureNotice);
 			if (notice) {

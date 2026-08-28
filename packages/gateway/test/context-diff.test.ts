@@ -56,13 +56,15 @@ test("287-row stale backlog selects only newest recent rows chronologically and 
 		Array.from({ length: CONVERSATION_DIFF_MAX_ROWS }, (_, index) => `recent-${index}`),
 	);
 	expect(first.rows.some((row) => row.body.startsWith("/old-command"))).toBe(false);
+	expect(first.expiredCount).toBe(226);
 	expect(first.diagnostics.expired).toBe(226);
 	expect(first.diagnostics.truncated).toBe(0);
 
-	db.contextConsume([...first.selectedMessageIds, "trigger-current"]);
+	db.contextCommitWindow(ORIGIN_KEY, [...first.selectedMessageIds, "trigger-current"]);
 	record(db, "trigger-next", "next owner turn", new Date(NOW.getTime() + 1_000).toISOString(), "owner");
 	const next = db.contextWindow(ORIGIN_KEY, "trigger-next", new Date(NOW.getTime() + 1_000));
 	expect(next.rows).toEqual([]);
+	expect(next.expiredCount).toBe(0);
 	expect(next.diagnostics.expired).toBe(226);
 });
 
@@ -82,7 +84,7 @@ test("more than the count bound keeps newest N once and expires older recent row
 	expect(window.rows[0]?.body).toBe("body-7");
 	expect(window.rows.at(-1)?.body).toBe(`body-${CONVERSATION_DIFF_MAX_ROWS + 6}`);
 	expect(window.diagnostics.truncated).toBe(7);
-	db.contextConsume([...window.selectedMessageIds, "trigger"]);
+	db.contextCommitWindow(ORIGIN_KEY, [...window.selectedMessageIds, "trigger"]);
 
 	record(db, "trigger-2", "again", new Date(NOW.getTime() + 1_000).toISOString());
 	expect(db.contextWindow(ORIGIN_KEY, "trigger-2", new Date(NOW.getTime() + 1_000)).rows).toEqual([]);
