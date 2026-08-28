@@ -25,6 +25,14 @@ memory/
 
 `MEMORY.md` is strictly a navigation map: it contains generated pointers to canonical files, not long-form facts. Keep durable knowledge in axis files, then regenerate the map rather than turning `MEMORY.md` into a second store.
 
+## Fresh-session bootstrap safety
+
+The first attempted turn in each origin epoch receives a trusted, bounded navigation bootstrap. The gateway reads from the resolved `$GAJAEWAY_HOME/memory` root only. The memory root may itself be a symlink to the canonical corpus, and symlinks that resolve inside that canonical root remain supported; traversal, malformed percent escapes, absolute links, dangling targets, non-files, and targets outside the resolved memory root are rejected. Rejected sources produce compact diagnostic codes, never source bodies or raw operating-system error strings.
+
+Association is canonical and exact. A channel/project/task/handoff document must declare `origin-key: <opaque originKey>` (the aliases `origin-id:` and `origin:` accept the same complete key; `origin:` may also contain a valid JSON `OriginRef` whose normalized key matches). A bare conversation ID is never sufficient because platforms, thread parents, and DM peers can share it. Public/group origins additionally require `bootstrap-safe: public` or `bootstrap-visibility: public` before an associated document body or pointer is eligible. Daily capture is parsed entry-by-entry and only entries whose full canonical origin matches the current origin are eligible; other-origin and DM entries are omitted. `MEMORY.md` and `ops/rules/index.md` contribute headings and validated Markdown pointers only, not prose bodies.
+
+The complete `Session bootstrap` section is at most 8192 UTF-8 bytes. Sections have deterministic priority, are included whole, carry their logical source path and filesystem freshness timestamp, and are never sliced mid-line or mid-codepoint. Omitted section names/counts and optional-source failures appear in the bounded diagnostics section. Secret-shaped values are redacted, source material is explicitly delimited as reference data rather than instructions, and the database/admin/ops projections retain only epoch, applied time, included section names, byte count, truncation, and diagnostic codes.
+
 ## The axis registry
 
 An axis is not a name in a list. It is a **descriptor** that tells every other part of the memory system how to treat its files, so map generation, audit, canonicalization and retrieval never test an axis by id:

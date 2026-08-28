@@ -40,6 +40,12 @@ const boundSession = {
 	epoch: 3,
 	created_at: "2026-08-01T00:00:00.000Z",
 	last_activity_at: "2026-08-02T00:00:00.000Z",
+	last_bootstrapped_epoch: 3,
+	bootstrap_applied_at: "2026-08-01T00:01:00.000Z",
+	bootstrap_sections_json: '["Current conversation metadata"]',
+	bootstrap_byte_count: 512,
+	bootstrap_truncated: 0,
+	bootstrap_diagnostics_json: "[]",
 };
 
 describe("runtime cycle projection", () => {

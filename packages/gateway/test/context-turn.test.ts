@@ -241,6 +241,201 @@ test("/new persists a floor that excludes pre-reset context after gateway restar
 	client.close();
 });
 
+test("epoch bootstrap commits on first terminal success and is not repeated after restart", async () => {
+	const gatewayConfig = await config();
+	let database = await GatewayDatabase.open(gatewayConfig.dbPath);
+	const preambles: string[] = [];
+	const gjc: GjcPort = {
+		ensureSession: async () => {
+			database.putSession(ORIGIN_KEY, "session");
+			return { sessionId: "session" };
+		},
+		forgetRebinds: () => {},
+		sendTurn: async (_session, _text, preamble) => {
+			preambles.push(preamble ?? "");
+			return "ok";
+		},
+	};
+	let { client } = await start(gatewayConfig, database, gjc);
+	send(client, "bootstrap-first", "first request");
+	await waitUntil(() => preambles.length === 1);
+	expect(preambles[0]).toContain("## Session bootstrap");
+	expect(database.getSessionBootstrap(ORIGIN_KEY)).toMatchObject({
+		epoch: 0,
+		lastBootstrappedEpoch: 0,
+		byteCount: expect.any(Number),
+	});
+	send(client, "bootstrap-second", "second request");
+	await waitUntil(() => preambles.length === 2);
+	expect(preambles[1]).not.toContain("## Session bootstrap");
+	client.close();
+	await server?.stop();
+	server = undefined;
+
+	database = await GatewayDatabase.open(gatewayConfig.dbPath);
+	({ client } = await start(gatewayConfig, database, gjc));
+	send(client, "bootstrap-after-restart", "after restart");
+	await waitUntil(() => preambles.length === 3);
+	expect(preambles[2]).not.toContain("## Session bootstrap");
+	client.close();
+});
+
+test("pre-success failure retries the same stable bootstrap and intentional silence commits it", async () => {
+	const gatewayConfig = await config();
+	let database = await GatewayDatabase.open(gatewayConfig.dbPath);
+	database.putSession(ORIGIN_KEY, "session");
+	const preambles: string[] = [];
+	let attempt = 0;
+	const gjc: GjcPort = {
+		ensureSession: async () => ({ sessionId: "session" }),
+		forgetRebinds: () => {},
+		sendTurn: async (_session, _text, preamble) => {
+			preambles.push(preamble ?? "");
+			if (attempt++ === 0) throw new Error("failed before delivery");
+			return "[SILENT]";
+		},
+	};
+	let { client } = await start(gatewayConfig, database, gjc);
+	send(client, "bootstrap-fail", "first request");
+	await waitUntil(() => client.frames.some((frame) => frame.type === "error" && frame.id === "bootstrap-fail"));
+	expect(database.getSessionBootstrap(ORIGIN_KEY)?.lastBootstrappedEpoch).toBe(-1);
+	client.close();
+	await server?.stop();
+	server = undefined;
+	database = await GatewayDatabase.open(gatewayConfig.dbPath);
+	({ client } = await start(gatewayConfig, database, gjc));
+	send(client, "bootstrap-retry", "retry request");
+	await waitUntil(() => preambles.length === 2);
+	const marker = /bootstrap-id: (session-bootstrap:[a-f0-9]+)/.exec(preambles[0] ?? "")?.[1];
+	expect(marker).toBeString();
+	expect(preambles[1]).toContain(`bootstrap-id: ${marker}`);
+	await waitUntil(() => database.getSessionBootstrap(ORIGIN_KEY)?.lastBootstrappedEpoch === 0);
+	expect(
+		client.frames.filter((frame) => frame.event === "chat.message" && frame.payload?.text === "[SILENT]"),
+	).toHaveLength(0);
+	client.close();
+});
+
+test("intermediate delivery failure keeps bootstrap pending but consumes the body before stable-marker retry", async () => {
+	const gatewayConfig = await config();
+	const database = await GatewayDatabase.open(gatewayConfig.dbPath);
+	database.putSession(ORIGIN_KEY, "session");
+	const attempts: Array<{ text: string; preamble: string }> = [];
+	let first = true;
+	const gjc: GjcPort = {
+		ensureSession: async () => ({ sessionId: "session" }),
+		forgetRebinds: () => {},
+		sendTurn: async (_session, text, preamble, _progress, options) => {
+			attempts.push({ text, preamble: preamble ?? "" });
+			if (first) {
+				first = false;
+				options?.onAssistantText?.("visible answer");
+				throw new Error("failed after delivery");
+			}
+			return "ok";
+		},
+	};
+	const { client } = await start(gatewayConfig, database, gjc);
+	send(client, "bootstrap-visible-fail", "body that must not replay");
+	await waitUntil(() => client.frames.some((frame) => frame.type === "error" && frame.id === "bootstrap-visible-fail"));
+	expect(database.getSessionBootstrap(ORIGIN_KEY)?.lastBootstrappedEpoch).toBe(-1);
+	send(client, "bootstrap-visible-retry", "next body");
+	await waitUntil(() => attempts.length === 2);
+	const marker = /bootstrap-id: (session-bootstrap:[a-f0-9]+)/.exec(attempts[0]?.preamble ?? "")?.[1];
+	expect(attempts[1]?.preamble).toContain(`bootstrap-id: ${marker}`);
+	expect(attempts[1]?.text).not.toContain("body that must not replay");
+	expect(attempts[1]?.text.match(/next body/g)).toHaveLength(1);
+	client.close();
+});
+
+test("/new atomically establishes a fresh floor and pending epoch bootstrap", async () => {
+	const gatewayConfig = await config();
+	const database = await GatewayDatabase.open(gatewayConfig.dbPath);
+	database.putSession(ORIGIN_KEY, "session-0");
+	const preambles: string[] = [];
+	const gjc: GjcPort = {
+		ensureSession: async (_key, epoch) => ({ sessionId: `session-${epoch}` }),
+		forgetRebinds: () => {},
+		sendTurn: async (_session, _text, preamble) => {
+			preambles.push(preamble ?? "");
+			return "ok";
+		},
+	};
+	const { client } = await start(gatewayConfig, database, gjc);
+	send(client, "before-reset-success", "before reset");
+	await waitUntil(() => database.getSessionBootstrap(ORIGIN_KEY)?.lastBootstrappedEpoch === 0);
+	send(client, "bootstrap-reset", "/new");
+	await waitUntil(() => database.getSessionRecord(ORIGIN_KEY)?.epoch === 1);
+	expect(database.getSessionBootstrap(ORIGIN_KEY)).toMatchObject({ epoch: 1, lastBootstrappedEpoch: 0 });
+	expect(database.contextDiagnostics(ORIGIN_KEY).floorAt).not.toBeNull();
+	send(client, "after-reset-success", "after reset");
+	await waitUntil(() => preambles.length === 2);
+	expect(preambles[1]).toContain("epoch: 1");
+	expect(preambles[1]).toContain("## Session bootstrap");
+	client.close();
+});
+
+test("turn-limit rotation makes the next epoch bootstrap pending exactly once", async () => {
+	const gatewayConfig = await config();
+	const database = await GatewayDatabase.open(gatewayConfig.dbPath);
+	database.putSession(ORIGIN_KEY, "session-0");
+	const preambles: string[] = [];
+	const epochs: number[] = [];
+	const gjc: GjcPort = {
+		ensureSession: async (_key, epoch = 0) => {
+			epochs.push(epoch);
+			return { sessionId: `session-${epoch}` };
+		},
+		forgetRebinds: () => {},
+		sendTurn: async (_session, _text, preamble) => {
+			preambles.push(preamble ?? "");
+			return "ok";
+		},
+	};
+	const { client } = await start(gatewayConfig, database, gjc);
+	for (let turn = 0; turn < 50; turn++) {
+		send(client, `rotation-${turn}`, `turn ${turn}`);
+		await waitUntil(() => preambles.length === turn + 1);
+	}
+	await waitUntil(() => database.getSessionRecord(ORIGIN_KEY)?.epoch === 1);
+	expect(database.getSessionBootstrap(ORIGIN_KEY)).toMatchObject({ epoch: 1, lastBootstrappedEpoch: 0 });
+	send(client, "rotation-epoch-one", "fresh epoch");
+	await waitUntil(() => preambles.length === 51);
+	expect(preambles.filter((preamble) => preamble.includes("## Session bootstrap"))).toHaveLength(2);
+	expect(preambles[50]).toContain("epoch: 1");
+	send(client, "rotation-epoch-one-second", "same epoch");
+	await waitUntil(() => preambles.length === 52);
+	expect(preambles[51]).not.toContain("## Session bootstrap");
+	expect(epochs.at(-1)).toBe(1);
+	client.close();
+});
+
+test("a create-time automatic rebind bootstraps and commits the effective epoch", async () => {
+	const gatewayConfig = await config();
+	const database = await GatewayDatabase.open(gatewayConfig.dbPath);
+	database.putSession(ORIGIN_KEY, "");
+	const preambles: string[] = [];
+	const gjc: GjcPort = {
+		ensureSession: async () => {
+			database.rebindEpoch(ORIGIN_KEY);
+			database.putSession(ORIGIN_KEY, "session-1");
+			return { sessionId: "session-1" };
+		},
+		forgetRebinds: () => {},
+		sendTurn: async (_session, _text, preamble) => {
+			preambles.push(preamble ?? "");
+			return "ok";
+		},
+	};
+	const { client } = await start(gatewayConfig, database, gjc);
+	send(client, "create-rebind", "fresh binding");
+	await waitUntil(() => database.getSessionBootstrap(ORIGIN_KEY)?.lastBootstrappedEpoch === 1);
+	expect(preambles).toHaveLength(1);
+	expect(preambles[0]).toContain("epoch: 1");
+	expect(preambles[0]).not.toContain("epoch: 0");
+	client.close();
+});
+
 test("gateway startup prunes old consumed context even when the database was quiet", async () => {
 	const gatewayConfig = await config();
 	const initial = await GatewayDatabase.open(gatewayConfig.dbPath);

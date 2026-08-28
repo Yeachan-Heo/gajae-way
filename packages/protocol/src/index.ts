@@ -31,6 +31,7 @@ export {
 	type OpsCycleResult,
 	type RecallSnippet,
 	type ReplyContext,
+	type SessionBootstrapProjection,
 	type SessionListResult,
 	type SessionRecallParams,
 	type SessionRecallResult,

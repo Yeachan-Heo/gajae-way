@@ -28,12 +28,15 @@ function printSessions(
 		epoch: number;
 		createdAt: string;
 		lastActivityAt: string | null;
+		bootstrap: { readonly pending: boolean; readonly byteCount: number; readonly truncated: boolean };
 	}>,
 ): void {
-	console.log("INDEX  ORIGIN                                      EPOCH  CREATED AT                 LAST ACTIVITY AT");
+	console.log(
+		"INDEX  ORIGIN                                      EPOCH  BOOTSTRAP        CREATED AT                 LAST ACTIVITY AT",
+	);
 	for (const [index, session] of sessions.entries())
 		console.log(
-			`${String(index).padEnd(6)} ${originKey(session.origin).padEnd(43)} ${String(session.epoch).padEnd(6)} ${session.createdAt.padEnd(26)} ${session.lastActivityAt ?? "-"}`,
+			`${String(index).padEnd(6)} ${originKey(session.origin).padEnd(43)} ${String(session.epoch).padEnd(6)} ${(session.bootstrap.pending ? "pending" : `${session.bootstrap.byteCount}B${session.bootstrap.truncated ? "/trunc" : ""}`).padEnd(16)} ${session.createdAt.padEnd(26)} ${session.lastActivityAt ?? "-"}`,
 		);
 }
 
@@ -212,6 +215,15 @@ export async function main(args = process.argv.slice(2)): Promise<void> {
 							epoch: number;
 							createdAt: string;
 							lastActivityAt: string | null;
+							bootstrap: {
+								epoch: number;
+								pending: boolean;
+								appliedAt: string | null;
+								includedSections: string[];
+								byteCount: number;
+								truncated: boolean;
+								diagnostics: string[];
+							};
 						}>;
 					}>("session.list");
 					const [command, selector] = parsed.rest;
@@ -229,6 +241,13 @@ export async function main(args = process.argv.slice(2)): Promise<void> {
 						console.log(`epoch: ${session.epoch}`);
 						console.log(`createdAt: ${session.createdAt}`);
 						console.log(`lastActivityAt: ${session.lastActivityAt ?? "-"}`);
+						console.log(`bootstrapEpoch: ${session.bootstrap.epoch}`);
+						console.log(`bootstrapPending: ${session.bootstrap.pending}`);
+						console.log(`bootstrapAppliedAt: ${session.bootstrap.appliedAt ?? "-"}`);
+						console.log(`bootstrapSections: ${session.bootstrap.includedSections.join(", ") || "-"}`);
+						console.log(`bootstrapBytes: ${session.bootstrap.byteCount}`);
+						console.log(`bootstrapTruncated: ${session.bootstrap.truncated}`);
+						console.log(`bootstrapDiagnostics: ${session.bootstrap.diagnostics.join(", ") || "-"}`);
 					} else throw new Error("usage: gajaeway sessions list [--json]|inspect <originKey-or-index>");
 				} finally {
 					await client.close();

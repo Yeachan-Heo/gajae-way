@@ -47,6 +47,8 @@ export interface TurnOptions {
 	 * turn instead of staying silent until the process exits.
 	 */
 	readonly onAssistantText?: (text: string) => void;
+	/** Rebuilds epoch-bound trusted preamble after an automatic session rebind. */
+	readonly systemPreambleForEpoch?: (epoch: number) => string | Promise<string>;
 }
 
 export interface GjcPort {
@@ -455,7 +457,10 @@ export class GjcClient implements GjcPort {
 					},
 				);
 			}
-			return await this.#runTurn(rebound.sessionId, text, systemPreamble, onProgress, options);
+			const reboundPreamble = options?.systemPreambleForEpoch
+				? await options.systemPreambleForEpoch(nextEpoch)
+				: systemPreamble;
+			return await this.#runTurn(rebound.sessionId, text, reboundPreamble, onProgress, options);
 		}
 	}
 
