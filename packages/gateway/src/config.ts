@@ -37,8 +37,24 @@ export interface GatewayConfig extends GatewayConfigFile {
 	readonly socketPath: string;
 	readonly dbPath: string;
 }
+/**
+ * The three gates. Unset means `closed`: the safe default under the
+ * prompt-injection posture this runtime states elsewhere.
+ */
+export const ENGAGEMENT_GATES = ["open", "open-mention-only", "closed"] as const;
+export type EngagementGate = (typeof ENGAGEMENT_GATES)[number];
+
 export interface ChannelPolicy {
-	readonly engagement?: "open";
+	/**
+	 * Which gate this channel is on. Explicit, because the previous two-state
+	 * shape ("open" or unset) silently changed meaning depending on whether
+	 * `mentionAllowlist` happened to be populated.
+	 *
+	 * - `open`: every human message is a turn; bots still need a mention
+	 * - `open-mention-only`: anyone may address the persona, but only by mention
+	 * - `closed`: mention required AND the author must be allowlisted
+	 */
+	readonly engagement?: EngagementGate;
 	/** Per-channel inbound debounce override in milliseconds. */
 	readonly debounceMs?: number;
 }
@@ -133,13 +149,16 @@ function parseChannels(value: unknown): Readonly<Record<string, ChannelPolicy>> 
 	const channels: Record<string, ChannelPolicy> = {};
 	for (const [conversationId, channel] of Object.entries(input)) {
 		const item = requireObject(channel, `channels.${conversationId}`);
-		if (item.engagement !== undefined && item.engagement !== "open")
-			throw new ConfigError("config_invalid", `channels.${conversationId}.engagement must be open`);
+		if (item.engagement !== undefined && !ENGAGEMENT_GATES.includes(item.engagement as EngagementGate))
+			throw new ConfigError(
+				"config_invalid",
+				`channels.${conversationId}.engagement must be one of ${ENGAGEMENT_GATES.join(", ")}`,
+			);
 		if (item.debounceMs !== undefined) parseDebounce(item.debounceMs, `channels.${conversationId}.debounceMs`);
 		if (Object.keys(item).some((key) => !["engagement", "debounceMs"].includes(key)))
 			throw new ConfigError("config_invalid", `channels.${conversationId} contains an unknown field`);
 		channels[conversationId] = {
-			...(item.engagement === "open" ? { engagement: "open" as const } : {}),
+			...(item.engagement === undefined ? {} : { engagement: item.engagement as EngagementGate }),
 			...(item.debounceMs === undefined ? {} : { debounceMs: item.debounceMs as number }),
 		};
 	}
