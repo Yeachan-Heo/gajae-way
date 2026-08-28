@@ -91,6 +91,7 @@ export interface DiscordClientLike {
 export interface DiscordInboundMessage extends DiscordMessageOriginShape, ReplyMessageLike {
 	readonly id: string;
 	readonly content: string;
+	readonly createdTimestamp?: number;
 	readonly author: {
 		readonly id: string;
 		readonly bot?: boolean;
@@ -466,7 +467,13 @@ export async function startDiscordAdapter(config: LoadedDiscordAdapterConfig): P
 	discord.on("messageCreate", (message) => {
 		const engagement = decideInbound(message, discord.user, config.channels);
 		if (!engagement) return;
-		gateway.sendInbound(message.id as string, discordMessageOrigin(message), message.content, engagement);
+		gateway.sendInbound(
+			message.id as string,
+			discordMessageOrigin(message),
+			message.content,
+			engagement,
+			typeof message.createdTimestamp === "number" ? new Date(message.createdTimestamp).toISOString() : undefined,
+		);
 	});
 	// A reaction is engagement metadata, never a turn: it goes out on its own verb.
 	discord.on("messageReactionAdd", (reaction, user) => {
@@ -593,8 +600,14 @@ class ReconnectingGateway {
 		}
 	}
 
-	sendInbound(messageId: string, origin: OriginRef, text: string, engagement: EngagementContext): void {
-		void this.requestInbound(messageId, origin, text, engagement);
+	sendInbound(
+		messageId: string,
+		origin: OriginRef,
+		text: string,
+		engagement: EngagementContext,
+		receivedAt?: string,
+	): void {
+		void this.requestInbound(messageId, origin, text, engagement, receivedAt);
 	}
 
 	/**
@@ -624,6 +637,7 @@ class ReconnectingGateway {
 		origin: OriginRef,
 		text: string,
 		engagement: EngagementContext,
+		receivedAt?: string,
 	): Promise<{ engaged?: boolean } | undefined> {
 		if (!this.#inbound.addIfAbsent(messageId)) return;
 		const client = this.#client;
@@ -634,7 +648,13 @@ class ReconnectingGateway {
 		// queue on it, so a replayed or backfilled message is deduped there and not just in the
 		// adapter's in-memory set, which does not survive a restart.
 		try {
-			const result = await client.request<{ engaged?: boolean }>("chat.send", { origin, text, engagement, messageId });
+			const result = await client.request<{ engaged?: boolean }>("chat.send", {
+				origin,
+				text,
+				engagement,
+				messageId,
+				...(receivedAt ? { receivedAt } : {}),
+			});
 			if (result?.engaged) this.typing?.begin(origin.conversationId);
 			return result;
 		} catch {

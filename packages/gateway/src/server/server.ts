@@ -59,15 +59,6 @@ import { KeyedQueue } from "./keyed-queue";
 import { composeSpeakerLabel, composeTurnHeader } from "./speaker";
 
 /**
- * Unread-context bounds. The digest answers "what did I miss since I last
- * spoke", so it must never hand the persona a backlog it could mistake for the
- * present: at most 6 hours of wall clock, at most 60 lines, and never anything
- * older than the current session itself.
- */
-export const UNREAD_CONTEXT_MAX_AGE_MS = 6 * 60 * 60 * 1000;
-export const UNREAD_CONTEXT_MAX_LINES = 60;
-
-/**
  * Durable lane-job persistence for delegated work (issue #10).
  *
  * Every `work.run` call is one attempt against a job whose identity outlives
@@ -245,6 +236,7 @@ interface Runtime {
 	readonly monitors: MonitorPropagator;
 	readonly monitorRuntime: MonitorRuntime;
 	readonly reconcileTimer: ReturnType<typeof setInterval>;
+	readonly contextMaintenanceTimer: ReturnType<typeof setInterval>;
 	readonly turns: KeyedQueue;
 	/** Per-turn / per-message reaction caps shared by chat.react and the reply-token path. */
 	readonly reactions: ReactionBudget;
@@ -289,6 +281,7 @@ export async function startUnixServer(options: GatewayServerOptions): Promise<Ga
 				connection.write({ v: PROFILE_VERSION, type: "event", event: "gateway.stopping", payload: { reason } });
 			listener.stop(true);
 			clearInterval(runtime.reconcileTimer);
+			clearInterval(runtime.contextMaintenanceTimer);
 			// In-flight turn drains still touch the database; close it under them and
 			// their completion bookkeeping crashes ("Cannot use a closed database").
 			await runtime.turns.settle();
@@ -362,6 +355,7 @@ export function startStdioServer(options: GatewayServerOptions): GatewayServer {
 			process.off("SIGHUP", onHup);
 			connection.write({ v: PROFILE_VERSION, type: "event", event: "gateway.stopping", payload: { reason } });
 			clearInterval(runtime.reconcileTimer);
+			clearInterval(runtime.contextMaintenanceTimer);
 			await runtime.turns.settle();
 			await runtime.monitorRuntime.stop();
 			connection.close();
@@ -426,6 +420,17 @@ function createRuntime(options: GatewayServerOptions): Runtime {
 	});
 	const monitorRuntime = new MonitorRuntime(options.config, registry, monitors);
 	const reconcileTimer = setInterval(() => void monitors.reconcile(), 60_000);
+	options.database.contextMaintain();
+	const contextMaintenanceTimer = setInterval(
+		() => {
+			try {
+				options.database.contextMaintain();
+			} catch (error) {
+				console.error(`gateway context maintenance failed: ${error instanceof Error ? error.message : String(error)}`);
+			}
+		},
+		60 * 60 * 1000,
+	);
 	return {
 		config: options.config,
 		delivery,
@@ -436,6 +441,7 @@ function createRuntime(options: GatewayServerOptions): Runtime {
 		monitors,
 		monitorRuntime,
 		reconcileTimer,
+		contextMaintenanceTimer,
 		turns: new KeyedQueue(),
 		reactions: new ReactionBudget(),
 		cycle: new RuntimeCycleProjector(options.database, memory),
@@ -525,6 +531,7 @@ async function handleRequest(
 					schemaVersion: options.database.schemaVersion,
 					sessions: { active: options.database.activeSessionCount },
 					delivery: runtime.delivery.status(),
+					contextDiff: options.database.contextDiagnostics(),
 				},
 			});
 			return;
@@ -1071,6 +1078,7 @@ async function sendChat(
 				origin?: unknown;
 				text?: unknown;
 				messageId?: unknown;
+				receivedAt?: unknown;
 				engagement?: { mentioned?: unknown; group?: unknown; authorId?: unknown };
 		  }
 		| undefined;
@@ -1104,7 +1112,14 @@ async function sendChat(
 			});
 			return;
 		}
-		options.database.withTransaction(() => options.database.bumpEpoch(key, JSON.stringify(origin)));
+		const floorAt = new Date().toISOString();
+		let discardedInbound: string[] = [];
+		options.database.withTransaction(() => {
+			options.database.bumpEpoch(key, JSON.stringify(origin));
+			options.database.contextSetFloor(key, floorAt);
+			discardedInbound = options.database.inboundDiscardBefore(key, floorAt);
+		});
+		for (const messageId of discardedInbound) runtime.inbound.delete(messageId);
 		// An explicit reset is the manual form of a rebind, so it also restores the
 		// automatic rebind budget: otherwise an origin that spent its cap would stay
 		// capped even after the operator did exactly what the notice asked for.
@@ -1148,6 +1163,7 @@ async function sendChat(
 		throw new ProtocolError("invalid_params", "non-loopback chat.send requires engagement");
 	const engaged = decideEngagement(origin, params.engagement as never, runtime.config).engaged;
 	const inboundMessageId = typeof params.messageId === "string" && params.messageId ? params.messageId : undefined;
+	const receivedAt = parseReceivedAt(params.receivedAt);
 	// Declined messages are still context, never commands (protocol contract): every
 	// platform message lands in the conversation-context ledger so the next engaged
 	// turn reads the full unread diff since the persona's last reply.
@@ -1159,6 +1175,7 @@ async function sendChat(
 			authorId: typeof engagement?.authorId === "string" ? engagement.authorId : undefined,
 			authorName: typeof engagement?.authorName === "string" ? engagement.authorName : undefined,
 			body: userText,
+			...(receivedAt ? { receivedAt } : {}),
 		});
 	}
 	if (!engaged) {
@@ -1211,6 +1228,12 @@ async function drainOrigin(
 	let ownFailure: unknown;
 	await runtime.turns.run(key, async () => {
 		for (let row = options.database.inboundClaimNext(key); row; row = options.database.inboundClaimNext(key)) {
+			const resetFloor = options.database.contextFloorAt(key);
+			if (resetFloor && row.received_at <= resetFloor) {
+				runtime.inbound.delete(row.message_id);
+				options.database.inboundComplete(row.message_id);
+				continue;
+			}
 			// Debounce: a burst of messages becomes ONE turn carrying the whole diff.
 			// The window is per-channel configurable; newer arrivals during the wait
 			// are folded into this batch, with the newest message as the trigger.
@@ -1260,6 +1283,15 @@ function debounceFor(row: InboundMessageRow, config: GatewayServerOptions["confi
 		(origin.platform === "discord" ? config.channels?.[origin.conversationId ?? ""] : undefined);
 	return channel?.debounceMs ?? config.debounceMs ?? 0;
 }
+
+function parseReceivedAt(value: unknown): string | undefined {
+	if (value === undefined) return undefined;
+	if (typeof value !== "string" || !value)
+		throw new ProtocolError("invalid_params", "receivedAt must be an ISO timestamp");
+	const timestamp = Date.parse(value);
+	if (!Number.isFinite(timestamp)) throw new ProtocolError("invalid_params", "receivedAt must be an ISO timestamp");
+	return new Date(timestamp).toISOString();
+}
 async function runInboundTurn(
 	batch: readonly InboundMessageRow[],
 	fallback: Connection,
@@ -1304,20 +1336,13 @@ async function runInboundTurn(
 	// last reply (the read-cursor diff), then the triggering message with speaker
 	// attribution — so the persona always reads "the messages above".
 	let turnText = userText;
+	let contextMessageIds: readonly string[] = [];
+	let contextOmissionRevision = 0;
 	if (nonLoopback) {
-		// Bound the unread diff. Two independent cutoffs, because both failure modes
-		// were observed live on 2026-08-28: a freshly created session inherited a
-		// day of channel history and replayed a 26-hour-old instruction as if it had
-		// just been given, and unread rows had accumulated into the hundreds for
-		// channels the persona had never held a session in.
-		const sessionStart = options.database.sessionCreatedAt(key);
-		const windowStart = new Date(Date.now() - UNREAD_CONTEXT_MAX_AGE_MS).toISOString();
-		const cutoff = sessionStart && sessionStart > windowStart ? sessionStart : windowStart;
-		const dropped = options.database.contextUnreadOlderCount(key, cutoff);
-		if (dropped > 0) options.database.contextConsumeOlderThan(key, cutoff);
-		const unread = options.database
-			.contextUnread(key, UNREAD_CONTEXT_MAX_LINES, cutoff)
-			.filter((entry) => entry.message_id !== row.message_id);
+		const prepared = options.database.contextWindow(key, row.message_id);
+		const unread = prepared.rows;
+		contextMessageIds = [...prepared.selectedMessageIds, row.message_id];
+		contextOmissionRevision = prepared.omissionRevision;
 		const lines = unread.map(
 			(entry) =>
 				`- [${entry.received_at}] ${entry.author_name ?? "unknown"} (author:${entry.author_id ?? "?"}, msg:${entry.message_id}): ${entry.body.slice(0, 1000)}`,
@@ -1325,9 +1350,14 @@ async function runInboundTurn(
 		// Truncation is stated, never silent: a persona that cannot see it was given
 		// a partial view will treat the oldest surviving line as the beginning of the
 		// conversation.
+		const omitted = prepared.expiredCount + prepared.truncatedCount;
+		const omittedRange =
+			prepared.omittedOldestAt && prepared.omittedNewestAt
+				? `; timestamps ${prepared.omittedOldestAt}..${prepared.omittedNewestAt}`
+				: "";
 		const droppedNote =
-			dropped > 0
-				? `[${dropped} older unread message(s) omitted: outside this session's context window, which starts at ${cutoff}]\n`
+			omitted > 0
+				? `[${omitted} older unread message(s) omitted: ${prepared.expiredCount} expired outside floor ${prepared.effectiveFloor}, ${prepared.truncatedCount} truncated by the newest-${prepared.rows.length} window${omittedRange}]\n`
 				: "";
 		const header = lines.length
 			? `[Unread messages in this conversation since your last reply]\n${droppedNote}${lines.join("\n")}\n\n`
@@ -1335,7 +1365,6 @@ async function runInboundTurn(
 				? `${droppedNote}\n`
 				: "";
 		turnText = `${header}${speaker ? `${composeTurnHeader({ speaker, place, authorId: engagement?.authorId, messageId: row.message_id, engagement })}\n` : ""}${userText}`;
-		options.database.contextConsume([...unread.map((entry) => entry.message_id), row.message_id]);
 	}
 	let text: string;
 	// Human-sized chat: the persona may split one message into several short parts
@@ -1345,6 +1374,7 @@ async function runInboundTurn(
 	// exit, so a multi-minute turn talks while it works (live gajaeway-play
 	// finding: turns showed nothing but "working…" until the very end).
 	const deliveredParts: string[] = [];
+	let assistantDeliveryStarted = false;
 	let reactionTokensSeen = false;
 	const maxTurnParts = 10;
 	const deliverAssistantText = (rawMessage: string) => {
@@ -1381,14 +1411,13 @@ async function runInboundTurn(
 					);
 					continue;
 				}
-				broadcastDelivery(
-					runtime,
-					runtime.delivery.prepareReaction(crypto.randomUUID(), origin, {
-						targetMessageId,
-						emoji: wanted.emoji,
-						emojiName: wanted.emojiName,
-					}),
-				);
+				const payload = runtime.delivery.prepareReaction(crypto.randomUUID(), origin, {
+					targetMessageId,
+					emoji: wanted.emoji,
+					emojiName: wanted.emojiName,
+				});
+				assistantDeliveryStarted = true;
+				broadcastDelivery(runtime, payload);
 			}
 			message = reactionReply.body;
 			if (!message) return;
@@ -1408,6 +1437,7 @@ async function runInboundTurn(
 			const payload = runtime.delivery.prepare(crypto.randomUUID(), origin, body, replyMatch?.[1]);
 			if (!payload) continue;
 			deliveredParts.push(body);
+			assistantDeliveryStarted = true;
 			broadcastDelivery(runtime, payload);
 		}
 	};
@@ -1463,6 +1493,7 @@ async function runInboundTurn(
 	};
 	try {
 		text = await runTurn();
+		if (nonLoopback) options.database.contextCommitWindow(key, contextMessageIds, contextOmissionRevision);
 	} catch (error) {
 		// A prose-only "session not found" failure (gjc emits no structured code
 		// for it) is deliberately NOT auto-rebound: #13 mandates exact-code-only
@@ -1480,7 +1511,12 @@ async function runInboundTurn(
 		// failure stays in the daemon log only.
 		const failureNotice = formatFailureNotice(error);
 		console.error(failureNotice);
-		if (nonLoopback && deliveredParts.length === 0) {
+		// A runtime failure before any assistant delivery leaves selected context
+		// unread for retry. Once a real text/reaction delivery has started, retrying
+		// the same window could duplicate an answer, so that window is consumed.
+		if (nonLoopback && assistantDeliveryStarted)
+			options.database.contextCommitWindow(key, contextMessageIds, contextOmissionRevision);
+		if (nonLoopback && !assistantDeliveryStarted) {
 			const notice = runtime.delivery.prepare(turnId, origin, failureNotice);
 			if (notice) {
 				runtime.delivery.markInflight(notice.deliveryId as string);

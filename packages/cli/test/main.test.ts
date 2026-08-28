@@ -45,6 +45,14 @@ function cycleResult(overrides: Partial<OpsCycleResult> = {}): OpsCycleResult {
 		deliveries: { pending: 0, inflight: 0, confirmed: 0, failedAmbiguous: 0, expired: 0 },
 		inFlightInbound: 0,
 		pendingInbound: 0,
+		contextDiff: {
+			unread: 0,
+			expired: 0,
+			truncated: 0,
+			omittedOldestAt: null,
+			omittedNewestAt: null,
+			floorAt: null,
+		},
 		...overrides,
 	};
 }
@@ -79,6 +87,14 @@ describe("cycle rendering", () => {
 						pendingInbound: 2,
 						unsettledDeliveries: 1,
 						oldestUnsettledAgeMs: 42_000,
+						contextDiff: {
+							unread: 0,
+							expired: 0,
+							truncated: 0,
+							omittedOldestAt: null,
+							omittedNewestAt: null,
+							floorAt: "2026-08-01T00:00:00.000Z",
+						},
 					},
 				],
 			}),
@@ -91,6 +107,7 @@ describe("cycle rendering", () => {
 	test("census lines always render so an empty subsystem is distinguishable from a missing one", () => {
 		const lines = renderCycle(cycleResult()).join("\n");
 		expect(lines).toContain("inbound: pending=0 inflight=0");
+		expect(lines).toContain("context: unread=0 expired=0 truncated=0 omitted_oldest=- omitted_newest=-");
 		expect(lines).toContain("deliveries: pending=0 inflight=0 confirmed=0 failed_ambiguous=0 expired=0");
 		expect(lines).toContain("memory: queued=0 written=0 committed=0 receipted=0 quarantined=0");
 		expect(lines).toContain("monitors: none");

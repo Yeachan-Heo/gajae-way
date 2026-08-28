@@ -71,8 +71,16 @@ test("requires negotiation then serves status, shutdown, and validates chat para
 	expect(client.frames[1].type).toBe("negotiated");
 	client.send({ v: "0.1", type: "request", id: "status", verb: "gateway.status" });
 	await waitFor(client.frames, 3);
-	expect(client.frames[2].result.schemaVersion).toBe(12);
+	expect(client.frames[2].result.schemaVersion).toBe(13);
 	expect(client.frames[2].result.startedAt).toBe("2026-01-01T00:00:00.000Z");
+	expect(client.frames[2].result.contextDiff).toEqual({
+		unread: 0,
+		expired: 0,
+		truncated: 0,
+		omittedOldestAt: null,
+		omittedNewestAt: null,
+		floorAt: null,
+	});
 	client.send({
 		v: "0.1",
 		type: "request",

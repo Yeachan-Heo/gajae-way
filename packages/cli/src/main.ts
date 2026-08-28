@@ -56,6 +56,9 @@ export function renderCycle(cycle: OpsCycleResult): string[] {
 	lines.push(`instance: ${cycle.instanceId}`);
 	lines.push(`inbound: pending=${cycle.pendingInbound} inflight=${cycle.inFlightInbound}`);
 	lines.push(
+		`context: unread=${cycle.contextDiff.unread} expired=${cycle.contextDiff.expired} truncated=${cycle.contextDiff.truncated} omitted_oldest=${cycle.contextDiff.omittedOldestAt ?? "-"} omitted_newest=${cycle.contextDiff.omittedNewestAt ?? "-"}`,
+	);
+	lines.push(
 		`deliveries: pending=${cycle.deliveries.pending} inflight=${cycle.deliveries.inflight} confirmed=${cycle.deliveries.confirmed} failed_ambiguous=${cycle.deliveries.failedAmbiguous} expired=${cycle.deliveries.expired}`,
 	);
 	lines.push(

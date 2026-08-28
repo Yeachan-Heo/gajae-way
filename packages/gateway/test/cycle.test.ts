@@ -8,6 +8,15 @@ function sources(overrides: Partial<RuntimeCycleSources> = {}): RuntimeCycleSour
 		sessionRows: [],
 		inboundCounts: new Map(),
 		inboundPendingByOrigin: new Map(),
+		contextByOrigin: new Map(),
+		contextDiff: {
+			unread: 0,
+			expired: 0,
+			truncated: 0,
+			omittedOldestAt: null,
+			omittedNewestAt: null,
+			floorAt: null,
+		},
 		inFlightInbound: 0,
 		pendingInbound: 0,
 		unknownInboundStates: [],
@@ -223,6 +232,28 @@ describe("runtime cycle projection", () => {
 		expect(result.sessions[0].pendingInbound).toBe(2);
 		expect(result.sessions[0].unsettledDeliveries).toBe(1);
 		expect(result.sessions[0].oldestUnsettledAgeMs).toBe(42_000);
+	});
+
+	test("aggregate and per-origin context drift project without exposing message bodies", () => {
+		const context = {
+			unread: 4,
+			expired: 287,
+			truncated: 12,
+			omittedOldestAt: "2026-08-27T00:00:00.000Z",
+			omittedNewestAt: "2026-08-28T01:00:00.000Z",
+			floorAt: "2026-08-28T02:00:00.000Z",
+		};
+		const result = projectRuntimeCycle(
+			sources({
+				sessionRows: [boundSession],
+				contextByOrigin: new Map([[boundSession.origin_key, context]]),
+				contextDiff: { ...context, floorAt: null },
+			}),
+			generatedAt,
+		);
+		expect(result.contextDiff).toEqual({ ...context, floorAt: null });
+		expect(result.sessions[0]?.contextDiff).toEqual(context);
+		expect(JSON.stringify(result)).not.toContain("private body");
 	});
 
 	test("an unparseable stored origin ref still surfaces the session instead of hiding it", () => {

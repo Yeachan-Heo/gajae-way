@@ -7,6 +7,7 @@ export {
 	type ChatSendParams,
 	type ChatSendResult,
 	type ConfigReloadResult,
+	type ConversationContextDiagnostics,
 	type CycleGateReason,
 	type CyclePhase,
 	type CycleSessionView,
