@@ -236,6 +236,56 @@ describe("session bootstrap builder", () => {
 			expect(result.text).not.toContain(secret);
 	});
 
+	test("navigation headings cannot emit traversal or private pointer strings", async () => {
+		const config = await setup();
+		await mkdir(join(home, "memory", "ops", "rules"), { recursive: true });
+		await writeFile(join(home, "memory", "MEMORY.md"), "# [private map](../outside.md)");
+		await writeFile(join(home, "memory", "ops", "rules", "index.md"), "# [private rules](../../outside.md)");
+		const result = await build(config);
+		expect(result.text).toContain("# Memory navigation");
+		expect(result.text).toContain("# Operating rules index");
+		expect(result.text).not.toContain("../outside.md");
+		expect(result.text).not.toContain("../../outside.md");
+		expect(result.text).not.toContain("private map");
+		expect(result.text).not.toContain("private rules");
+	});
+
+	test("control-split credential shapes are normalized and redacted across every source class", async () => {
+		const config = await setup();
+		await writeFile(
+			join(home, "memory", "channels", "c1.md"),
+			"origin-key: discord/channel/c1\nbootstrap-safe: public\nto\0ken=CHANNEL-CREDENTIAL",
+		);
+		await mkdir(join(home, "memory", "daily"), { recursive: true });
+		await writeFile(
+			join(home, "memory", "daily", "2026-08-28.md"),
+			"## entry\n- origin-key: discord/channel/c1\n- user: pass\u200bword=DAILY-CREDENTIAL",
+		);
+		await mkdir(join(home, "memory", "ops", "rules"), { recursive: true });
+		await writeFile(join(home, "memory", "ops", "rules", "safe.md"), "safe rule");
+		await writeFile(join(home, "memory", "MEMORY.md"), "# Map\n- [a\u2060pi_key=MAP-CREDENTIAL](channels/c1.md)");
+		await writeFile(
+			join(home, "memory", "ops", "rules", "index.md"),
+			"# Rules\n- [sec\u200cret=RULES-CREDENTIAL](safe.md)",
+		);
+		const result = await build(config);
+		expect(result.text).toContain("channels/c1.md");
+		expect(result.text).toContain("ops/rules/safe.md");
+		expect(result.text).toContain("[REDACTED]");
+		for (const leaked of [
+			"CHANNEL-CREDENTIAL",
+			"DAILY-CREDENTIAL",
+			"MAP-CREDENTIAL",
+			"RULES-CREDENTIAL",
+			"token=CHANNEL-CREDENTIAL",
+			"password=DAILY-CREDENTIAL",
+			"api_key=MAP-CREDENTIAL",
+			"secret=RULES-CREDENTIAL",
+		])
+			expect(result.text).not.toContain(leaked);
+		for (const separator of [String.fromCharCode(0), "​", "‌", "⁠"]) expect(result.text).not.toContain(separator);
+	});
+
 	test("a configured memory-root symlink to a canonical directory is allowed", async () => {
 		const config = await setup();
 		await rm(join(home, "memory"), { recursive: true, force: true });

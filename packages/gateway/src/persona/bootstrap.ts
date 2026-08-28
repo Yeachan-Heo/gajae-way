@@ -45,6 +45,27 @@ function inside(root: string, path: string): boolean {
 	return child === "" || (!child.startsWith(`..${sep}`) && child !== ".." && !isAbsolute(child));
 }
 
+const FORMAT_OR_LINE_SEPARATOR = /[\p{Cf}\p{Zl}\p{Zp}]/u;
+const SPLIT_CREDENTIAL_KEY =
+	/(?:a\s*u\s*t\s*h\s*o\s*r\s*i\s*z\s*a\s*t\s*i\s*o\s*n|c\s*o\s*o\s*k\s*i\s*e|s\s*e\s*t\s*-?\s*c\s*o\s*o\s*k\s*i\s*e|p\s*a\s*s\s*s\s*w\s*o\s*r\s*d|p\s*a\s*s\s*s\s*w\s*d|s\s*e\s*c\s*r\s*e\s*t|t\s*o\s*k\s*e\s*n|a\s*p\s*i\s*[_-]?\s*k\s*e\s*y)\s*[:=]/i;
+
+function normalizeUnsafeSeparators(value: string): string {
+	let normalized = "";
+	for (const character of value) {
+		const code = character.codePointAt(0) ?? 0;
+		normalized +=
+			(code < 0x20 && code !== 0x0a) || code === 0x7f || FORMAT_OR_LINE_SEPARATOR.test(character) ? " " : character;
+	}
+	return normalized;
+}
+
+function hasUnsafeSeparators(value: string): boolean {
+	return [...value].some((character) => {
+		const code = character.codePointAt(0) ?? 0;
+		return code < 0x20 || code === 0x7f || FORMAT_OR_LINE_SEPARATOR.test(character);
+	});
+}
+
 async function roots(home: string): Promise<Roots> {
 	const memoryPath = join(home, "memory");
 	const memory = await realpath(memoryPath).catch(() => resolve(memoryPath));
@@ -53,6 +74,7 @@ async function roots(home: string): Promise<Roots> {
 
 async function confinedFile(root: string, relativePath: string, allowed: readonly string[]): Promise<string> {
 	if (!relativePath || isAbsolute(relativePath)) throw new Error("absolute_or_empty_path");
+	if (hasUnsafeSeparators(relativePath)) throw new Error("unsafe_path_separator");
 	const lexical = resolve(root, relativePath);
 	if (!inside(root, lexical)) throw new Error("path_traversal");
 	const entry = await lstat(lexical);
@@ -64,12 +86,7 @@ async function confinedFile(root: string, relativePath: string, allowed: readonl
 }
 
 function cleanLine(value: string): string {
-	let cleaned = "";
-	for (const character of value) {
-		const code = character.codePointAt(0) ?? 0;
-		cleaned += code < 0x20 || code === 0x7f ? " " : character;
-	}
-	return cleaned.trim();
+	return normalizeUnsafeSeparators(value).trim();
 }
 
 function boundedLine(value: string, max = 160): string {
@@ -83,13 +100,25 @@ function diagnosticCode(error: unknown): string {
 }
 
 function safeText(value: string): string {
-	return redactSecrets(value)
-		.replace(/(authorization|cookie|set-cookie)\s*:[^\n]*/gi, "$1: [REDACTED]")
-		.replace(/(password|passwd|secret|token|api[_-]?key)\s*[:=]\s*[^\s]+/gi, "$1: [REDACTED]");
+	return normalizeUnsafeSeparators(value)
+		.split("\n")
+		.map((line) => {
+			const splitCredential = line.match(SPLIT_CREDENTIAL_KEY);
+			if (splitCredential?.index !== undefined) return `${line.slice(0, splitCredential.index)}[REDACTED]`;
+			return redactSecrets(line)
+				.replace(/(authorization|cookie|set-cookie)\s*:[^\n]*/gi, "$1: [REDACTED]")
+				.replace(/(password|passwd|secret|token|api[_-]?key)\s*[:=]\s*[^\s]+/gi, "$1: [REDACTED]");
+		})
+		.join("\n");
 }
 
 function safeLabel(value: string): string {
 	return boundedLine(safeText(value), 120) || "memory";
+}
+
+function safeHeading(value: string): string {
+	const withoutLinks = value.replace(/\[([^\]\r\n]+)\]\([^)]+\)/g, "$1");
+	return boundedLine(safeText(withoutLinks), 200);
 }
 
 function associatedOriginKeys(text: string): { readonly keys: ReadonlySet<string>; readonly malformed: boolean } {
@@ -175,10 +204,7 @@ async function readNavigationSection(
 	const info = await stat(target);
 	if (info.size > MAX_SOURCE_BYTES) throw new Error("source_too_large");
 	const text = await readFile(target, "utf8");
-	const body = text
-		.split(/\r?\n/)
-		.filter((line) => /^\s{0,3}#{1,6}\s+/.test(line))
-		.map((line) => boundedLine(safeText(line), 200));
+	const body = [`# ${name}`];
 	let rejected = 0;
 	for (const match of text.matchAll(/\[([^\]\r\n]+)\]\(([^)#]+\.md)(?:#[^)]+)?\)/g)) {
 		try {
@@ -348,10 +374,12 @@ export async function buildSessionBootstrap(input: {
 			if (eligibleLinks.size < safeLinks.size)
 				diagnostics.push(`public MEMORY links omitted: ${safeLinks.size - eligibleLinks.size}`);
 		}
-		const headings = mapText
-			.split(/\r?\n/)
-			.filter((line) => /^\s{0,3}#{1,6}\s+/.test(line))
-			.map((line) => boundedLine(safeText(line), 200));
+		const headings = group
+			? ["# Memory navigation"]
+			: mapText
+					.split(/\r?\n/)
+					.filter((line) => /^\s{0,3}#{1,6}\s+/.test(line))
+					.map(safeHeading);
 		const pointers: string[] = [];
 		for (const match of mapText.matchAll(/\[([^\]\r\n]+)\]\(([^)#]+\.md)(?:#[^)]+)?\)/g)) {
 			try {
