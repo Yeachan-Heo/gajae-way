@@ -16,6 +16,7 @@ import {
 	type RecoverableChannel,
 	type RecoveryCursorState,
 	RecoveryGate,
+	recordAttempt,
 	recordDeadLetter,
 	recoverConversation,
 	recoveryCursorPath,
@@ -754,7 +755,7 @@ test("a uniform terminal-looking failure across messages discards nothing", asyn
 	expect(gateway.recoveryRetryPending).toBe(true);
 });
 
-test("a single oversized message is discarded once a later message proves the path works", async () => {
+test("a fresh acked for a later message in the same pass commits the held discard", async () => {
 	const cursorPath = join(home, "oversized-one", "recovery-cursor.json");
 	const base = Date.now() - 60 * 60 * 1000;
 	// The oversized message is FIRST: head-of-line, with no earlier success to lean on.
@@ -931,4 +932,165 @@ test("a replayed discard after a crash does not double-count the dead letter", a
 	const replayed = await loadRecoveryCursors(cursorPath);
 	expect(replayed.deadLetters).toHaveLength(1);
 	expect(replayed.deadLetterDigest["channel-1"].count).toBe(1);
+});
+
+const channelOrigin1 = { platform: "discord", kind: "channel", conversationId: "channel-1" } as const;
+
+test("a duplicate from an already-acked id never authorizes a discard", async () => {
+	const cursorPath = join(home, "duplicate-evidence", "recovery-cursor.json");
+	const base = Date.now() - 60 * 60 * 1000;
+	const all = Array.from({ length: 5 }, (_, index) => message(snowflakeFromTimestamp(base + index * 1_000)));
+	const sends: string[] = [];
+	const client = {
+		request: async (verb: string, params?: unknown) => {
+			if (verb !== "chat.send") return {};
+			const id = (params as { messageId: string }).messageId;
+			sends.push(id);
+			// The pre-acked id is the only one that ever succeeds; everything else looks
+			// per-payload terminal. Uniform terminal failure + one stale ack in the window.
+			if (id === all[2].id) return {};
+			throw Object.assign(new Error("message too long"), { code: "payload_too_large" });
+		},
+	};
+	const gateway = wiredGateway(fakeChannel(all), client, cursorPath);
+	await settle();
+	// A send that landed BEFORE this pass: the in-process gate now answers "duplicate" for it.
+	expect(await gateway.requestRecovered(all[2].id, channelOrigin1, "earlier", { mentioned: true } as never)).toEqual({
+		verdict: "acked",
+	});
+	await gateway.recoverMissedMessages();
+	await settle();
+	// The stale ack was never re-sent, so the pass only ever saw a cached duplicate.
+	expect(sends.filter((id) => id === all[2].id)).toHaveLength(1);
+	expect(gateway.deadLetters).toEqual([]);
+	expect(gateway.deadLetterDigest).toEqual({});
+	const state = await loadRecoveryCursors(cursorPath);
+	expect(BigInt(state.recoveredThrough["channel-1"] ?? "0") < BigInt(all[0].id)).toBe(true);
+	expect(gateway.recoveryRetryPending).toBe(true);
+});
+
+test("a success from a previous pass does not authorize a discard in this pass", async () => {
+	const cursorPath = join(home, "stale-evidence", "recovery-cursor.json");
+	const base = Date.now() - 60 * 60 * 1000;
+	const oversized = message(snowflakeFromTimestamp(base), { content: "oversized payload" });
+	const good = message(snowflakeFromTimestamp(base + 1_000));
+	const client = {
+		request: async (verb: string, params?: unknown) => {
+			if (verb !== "chat.send") return {};
+			if ((params as { messageId: string }).messageId === oversized.id) {
+				throw Object.assign(new Error("content too long"), { code: "payload_too_large" });
+			}
+			return {};
+		},
+	};
+	const gateway = wiredGateway(fakeChannel([oversized, good]), client, cursorPath);
+	await settle();
+	// `good` landed in an earlier pass, so this pass gets "duplicate" for it: stale evidence.
+	await gateway.requestRecovered(good.id, channelOrigin1, good.content, { mentioned: true } as never);
+	await gateway.recoverMissedMessages();
+	await settle();
+	expect(gateway.deadLetters).toEqual([]);
+	const state = await loadRecoveryCursors(cursorPath);
+	expect(BigInt(state.recoveredThrough["channel-1"] ?? "0") < BigInt(oversized.id)).toBe(true);
+	expect(gateway.recoveryRetryPending).toBe(true);
+});
+
+test("a refetched page neither double-fires onDiscard nor inflates the uniform limit", async () => {
+	// A channel that ignores `after`: every page is the same two ids.
+	const page = [message("100"), message("200")];
+	const channel: RecoverableChannel = { messages: { fetch: async () => page } };
+	const discards: string[] = [];
+	const held = await recoverConversation(channel, {
+		cursor: "10",
+		nowMs: 0,
+		pageLimit: 2,
+		maxPages: 3,
+		uniformFailureLimit: 3,
+		deliver: async () => "discard-candidate",
+		onDiscard: (item) => discards.push(item.id),
+	});
+	// Two DISTINCT ids seen three times: the uniform limit of 3 must not fire.
+	expect(held.held).toBe(2);
+	expect(held.discarded).toBe(0);
+	expect(discards).toEqual([]);
+	expect(held.truncated).toBe(true);
+	expect(held.failed).toBe(true);
+	// Same refetch, but the second id finally lands: exactly one discard, for the other id.
+	let calls = 0;
+	const commits: string[] = [];
+	const outcome = await recoverConversation(channel, {
+		cursor: "10",
+		nowMs: 0,
+		pageLimit: 2,
+		maxPages: 3,
+		uniformFailureLimit: 3,
+		deliver: async (item) => {
+			calls++;
+			return item.id === "200" && calls > 2 ? "acked" : "discard-candidate";
+		},
+		onDiscard: (item) => commits.push(item.id),
+	});
+	expect(commits).toEqual(["100"]);
+	expect(outcome.discarded).toBe(1);
+	expect(outcome.advancedTo).toBe("200");
+});
+
+test("ledger cap eviction preserves the active head-of-line entry", () => {
+	let state = cursorState({});
+	// "100" is the head-of-line blocker: two terminal attempts already recorded.
+	state = recordAttempt(state, "100", "channel-1", "terminal-message", "content too long", 3);
+	state = recordAttempt(state, "100", "channel-1", "terminal-message", "content too long", 3);
+	state = recordAttempt(state, "200", "channel-1", "retryable", "reset", 3);
+	state = recordAttempt(state, "300", "channel-1", "retryable", "reset", 3);
+	state = recordAttempt(state, "400", "channel-1", "retryable", "reset", 3);
+	expect(Object.keys(state.attempts)).toHaveLength(3);
+	expect(state.attempts["100"]).toMatchObject({ attempts: 2, terminalAttempts: 2 });
+	// The oldest INACTIVE entry is the one evicted, never the blocked head-of-line message.
+	expect(state.attempts["200"]).toBeUndefined();
+	expect(state.attempts["400"]).toBeDefined();
+	// Cap reached with every entry active: keep them and say so loudly.
+	const errors: string[] = [];
+	const original = console.error;
+	console.error = (...args: unknown[]) => {
+		errors.push(args.map(String).join(" "));
+	};
+	let tight = cursorState({});
+	try {
+		tight = recordAttempt(tight, "100", "channel-1", "terminal-message", "content too long", 1);
+		tight = recordAttempt(tight, "500", "channel-2", "terminal-message", "content too long", 1);
+	} finally {
+		console.error = original;
+	}
+	expect(Object.keys(tight.attempts).sort()).toEqual(["100", "500"]);
+	expect(tight.attempts["100"].terminalAttempts).toBe(1);
+	expect(errors.some((line) => line.includes("over its 1-entry cap"))).toBe(true);
+});
+
+test("a channel that lost access marks the pass incomplete and leaves its cursor alone", async () => {
+	const cursorPath = join(home, "lost-access", "recovery-cursor.json");
+	const inbound = message(snowflakeFromTimestamp(Date.now() - 60_000));
+	const gateway = new ReconnectingGateway(
+		"socket",
+		// A deleted channel / revoked permission resolves to nothing fetchable.
+		{ channels: { fetch: async (id: string) => (id === "channel-gone" ? null : fakeChannel([inbound])) } },
+		{
+			tokenFile: "token",
+			token: "redacted",
+			configPath: "config",
+			channels: { "channel-gone": {}, "channel-1": {} },
+		} as never,
+		undefined,
+		undefined,
+		cursorPath,
+		() => bot,
+		{ request: async () => ({}), onChatMessage: () => () => {} } as never,
+		async () => {},
+	);
+	await gateway.recoverMissedMessages();
+	await settle();
+	const state = await loadRecoveryCursors(cursorPath);
+	expect(state.recoveredThrough["channel-1"]).toBe(inbound.id);
+	expect(state.recoveredThrough["channel-gone"]).toBeUndefined();
+	expect(state.quarantined["channel-gone"]).toBeUndefined();
+	expect(gateway.recoveryRetryPending).toBe(true);
 });
