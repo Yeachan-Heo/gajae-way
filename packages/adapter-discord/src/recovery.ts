@@ -9,18 +9,23 @@ import type { DiscordInboundMessage } from "./main";
  *
  * Exactly-once rests on two durable layers that already existed: the gateway's
  * inbound_messages/conversation_context tables dedupe on the platform message id, and this
- * module's per-conversation last-acked cursor keeps the refetch window tight. The cursor
- * advances only after the gateway acknowledges a send (or reports a known duplicate); an
- * unavailable gateway leaves the message unacked so the next reconnect retries it.
+ * module's per-conversation recovery watermark keeps the refetch window tight.
+ *
+ * The watermark is *recovery* progress only: it records the highest id a recovery pass
+ * actually walked past (delivered, known-duplicate, or deliberately skipped). Live sends
+ * never write it, because a live message is no proof that the older messages behind it were
+ * ever seen — advancing on live traffic is exactly how issue #33 recurs after a partial
+ * backfill.
  */
 
 export interface RecoveryCursorState {
-	readonly conversations: Readonly<Record<string, string>>;
+	/** Highest message id a recovery pass walked past, per recovered conversation. */
+	readonly recoveredThrough: Readonly<Record<string, string>>;
 }
 
 export type RecoveryGateResult = "acked" | "duplicate" | "unavailable";
 
-const EMPTY_STATE: RecoveryCursorState = { conversations: {} };
+const EMPTY_STATE: RecoveryCursorState = { recoveredThrough: {} };
 
 export function recoveryCursorPath(home: string = adapterHome()): string {
 	return join(home, "adapters", "discord", "recovery-cursor.json");
@@ -89,23 +94,37 @@ export async function loadRecoveryCursors(path: string): Promise<RecoveryCursorS
 		throw error;
 	}
 	if (typeof raw !== "object" || raw === null || Array.isArray(raw)) return EMPTY_STATE;
-	const conversations: Record<string, string> = {};
-	const entries = (raw as { conversations?: unknown }).conversations;
+	const recoveredThrough: Record<string, string> = {};
+	const entries = (raw as { recoveredThrough?: unknown }).recoveredThrough;
 	if (typeof entries === "object" && entries !== null && !Array.isArray(entries)) {
 		for (const [id, value] of Object.entries(entries)) {
-			if (typeof value === "string" && /^\d+$/.test(value)) conversations[id] = value;
+			if (typeof value === "string" && /^\d+$/.test(value)) recoveredThrough[id] = value;
 		}
 	}
-	return { conversations };
+	return { recoveredThrough };
 }
 
 /** Atomic write (tmp + rename) so a crash mid-write never truncates the cursor file. */
 export async function saveRecoveryCursors(path: string, state: RecoveryCursorState): Promise<void> {
-	const payload = `${JSON.stringify({ conversations: state.conversations }, null, "\t")}\n`;
+	const payload = `${JSON.stringify({ recoveredThrough: state.recoveredThrough }, null, "\t")}\n`;
 	await mkdir(dirname(path), { recursive: true, mode: 0o700 });
 	const tmp = `${path}.${process.pid}.tmp`;
 	await writeFile(tmp, payload, { encoding: "utf8", mode: 0o600 });
 	await rename(tmp, path);
+}
+
+/**
+ * Keeps only the conversations recovery actually iterates (the configured channels).
+ * Thread and DM conversation ids are never backfilled, so persisting their watermarks
+ * would grow recovery-cursor.json without bound while nothing ever reads them.
+ */
+export function pruneRecoveryCursors(state: RecoveryCursorState, recoverable: Iterable<string>): RecoveryCursorState {
+	const allowed = new Set(recoverable);
+	const recoveredThrough: Record<string, string> = {};
+	for (const [id, value] of Object.entries(state.recoveredThrough)) {
+		if (allowed.has(id)) recoveredThrough[id] = value;
+	}
+	return { recoveredThrough };
 }
 
 /** Discord snowflakes are time-ordered 64-bit ints; compare numerically, not lexically. */
@@ -124,6 +143,17 @@ export function snowflakeFromTimestamp(timestampMs: number): string {
 export const RECOVERY_PAGE_LIMIT = 100;
 export const RECOVERY_MAX_PAGES = 5;
 export const RECOVERY_BOOTSTRAP_LOOKBACK_MS = 24 * 60 * 60 * 1000;
+/**
+ * Per-message send budget during recovery. After this many `unavailable` verdicts for the
+ * same message id the caller must log it loudly and skip it forward: one poison message
+ * must not head-of-line block a channel's backfill forever.
+ */
+export const RECOVERY_MAX_ATTEMPTS = 3;
+/** Backoff floor between per-message send attempts inside one recovery pass. */
+export const RECOVERY_ATTEMPT_BACKOFF_MS = 500;
+/** Backoff floor/ceiling for re-running a failed or truncated recovery pass. */
+export const RECOVERY_RETRY_BASE_MS = 1_000;
+export const RECOVERY_RETRY_MAX_MS = 60_000;
 
 /** The slice of a discord.js text-based channel recovery needs: forward paged history. */
 export interface RecoverableChannel {
@@ -141,13 +171,19 @@ export interface RecoverableChannel {
 	};
 }
 
-/** Per-message delivery verdict handed back by the caller's send path. */
-export type RecoveryDelivery = "acked" | "duplicate" | "unavailable";
+/**
+ * Per-message delivery verdict handed back by the caller's send path. `skip` means the
+ * caller deliberately gave up on this message (poison message past its attempt budget, or
+ * nothing to engage with): the cursor advances past it so the rest of the gap can drain.
+ */
+export type RecoveryDelivery = "acked" | "duplicate" | "unavailable" | "skip";
 
 export interface RecoveryOutcome {
-	/** Highest message id known acked (or already duplicated) after this run. */
+	/** Highest message id this run walked past (delivered, duplicate, or skipped). */
 	readonly advancedTo: string;
 	readonly delivered: number;
+	/** Messages the run walked past without a send (empty content or caller `skip`). */
+	readonly skipped: number;
 	/** True when the gap exceeded the page bound; older messages may remain unrecovered. */
 	readonly truncated: boolean;
 	/** True when a delivery was unavailable; the caller must retry from `advancedTo`. */
@@ -181,6 +217,7 @@ export async function recoverConversation(
 	const skipEmpty = options.skipEmptyContent ?? true;
 	let cursor = options.cursor ?? snowflakeFromTimestamp(options.nowMs - RECOVERY_BOOTSTRAP_LOOKBACK_MS);
 	let delivered = 0;
+	let skipped = 0;
 	for (let page = 0; page < maxPages; page++) {
 		const fetched = await channel.messages.fetch({ after: cursor, limit: pageLimit });
 		// discord.js returns a Collection (entries); fake channels return arrays. Normalize
@@ -194,29 +231,31 @@ export async function recoverConversation(
 		if (rawBatch.length >= pageLimit && batch.length === 0) {
 			// A broken/repeated page must not spin until the bound while pretending to
 			// make progress. Leave the cursor unchanged so the next reconnect retries it.
-			return { advancedTo: cursor, delivered, truncated: true, failed: false };
+			return { advancedTo: cursor, delivered, skipped, truncated: true, failed: false };
 		}
 		batch.sort((a, b) => {
 			const ai = BigInt(a.id);
 			const bi = BigInt(b.id);
 			return ai < bi ? -1 : ai > bi ? 1 : 0;
 		});
-		if (batch.length === 0) return { advancedTo: cursor, delivered, truncated: false, failed: false };
+		if (batch.length === 0) return { advancedTo: cursor, delivered, skipped, truncated: false, failed: false };
 		for (const message of batch) {
 			if (skipEmpty && message.content.trim() === "") {
 				// Thread starters / system entries carry no text: skip without a send so the
 				// cursor still advances and later messages keep backfilling.
 				cursor = message.id;
+				skipped++;
 				continue;
 			}
 			const verdict = await options.deliver(message);
 			if (verdict === "unavailable") {
-				return { advancedTo: cursor, delivered, truncated: false, failed: true };
+				return { advancedTo: cursor, delivered, skipped, truncated: false, failed: true };
 			}
 			cursor = message.id;
-			delivered++;
+			if (verdict === "skip") skipped++;
+			else delivered++;
 		}
-		if (batch.length < pageLimit) return { advancedTo: cursor, delivered, truncated: false, failed: false };
+		if (batch.length < pageLimit) return { advancedTo: cursor, delivered, skipped, truncated: false, failed: false };
 	}
-	return { advancedTo: cursor, delivered, truncated: true, failed: false };
+	return { advancedTo: cursor, delivered, skipped, truncated: true, failed: false };
 }
