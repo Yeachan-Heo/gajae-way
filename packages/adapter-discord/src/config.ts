@@ -14,11 +14,26 @@ import { dirname, isAbsolute, join, resolve } from "node:path";
  */
 export interface DiscordVoiceConfig {
 	readonly apiKeyFile: string;
-	/** Pinned language; omitted means auto-detect, which is the tested default. */
+	/**
+	 * Pinned language for transcription; omitted means auto-detect.
+	 *
+	 * Auto-detect measured p=1.0 on long Korean speech but failed *confidently*
+	 * on short clips — a 1.9s Korean message came back as Spanish at p=0.999 —
+	 * so a single-language deployment should pin this. A confidence floor cannot
+	 * substitute: the wrong answer arrived at maximum confidence.
+	 */
 	readonly languageCode?: string;
 	readonly endpoint?: string;
 	readonly model?: string;
 	readonly timeoutMs?: number;
+	/** Outbound speech; omitted fields fall back to the tested ElevenLabs defaults. */
+	readonly voiceId?: string;
+	readonly speechModel?: string;
+	readonly speechEndpoint?: string;
+	readonly outputFormat?: string;
+	/** Spoken length cap. Text always ships in full; the voice is a courtesy. */
+	readonly maxSpokenChars?: number;
+	readonly speechTimeoutMs?: number;
 }
 
 export interface LoadedDiscordVoiceConfig extends DiscordVoiceConfig {
@@ -109,12 +124,22 @@ async function loadVoiceConfig(raw: unknown, configPath: string): Promise<Loaded
 	if (!isObject(raw) || typeof raw.apiKeyFile !== "string" || raw.apiKeyFile.trim() === "") {
 		throw new DiscordAdapterStartupError("Discord adapter voice requires a non-empty apiKeyFile credential-file path.");
 	}
-	for (const field of ["languageCode", "endpoint", "model"] as const) {
+	for (const field of [
+		"languageCode",
+		"endpoint",
+		"model",
+		"voiceId",
+		"speechModel",
+		"speechEndpoint",
+		"outputFormat",
+	] as const) {
 		if (raw[field] !== undefined && typeof raw[field] !== "string")
 			throw new DiscordAdapterStartupError(`Discord adapter voice ${field} must be a string when set.`);
 	}
-	if (raw.timeoutMs !== undefined && (!Number.isInteger(raw.timeoutMs) || (raw.timeoutMs as number) <= 0)) {
-		throw new DiscordAdapterStartupError("Discord adapter voice timeoutMs must be a positive integer when set.");
+	for (const field of ["timeoutMs", "maxSpokenChars", "speechTimeoutMs"] as const) {
+		const value = raw[field];
+		if (value !== undefined && (!Number.isInteger(value) || (value as number) <= 0))
+			throw new DiscordAdapterStartupError(`Discord adapter voice ${field} must be a positive integer when set.`);
 	}
 	const apiKeyFile = isAbsolute(raw.apiKeyFile) ? raw.apiKeyFile : resolve(dirname(configPath), raw.apiKeyFile);
 	let apiKey: string;

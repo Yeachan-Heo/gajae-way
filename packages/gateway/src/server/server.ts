@@ -189,6 +189,16 @@ interface InboundContext {
 	readonly turnId: string;
 	readonly requestId: string;
 	readonly connection: Connection;
+	/**
+	 * True when the platform message that started this turn was spoken.
+	 *
+	 * Deliberately held with the in-flight turn rather than persisted on the
+	 * inbound row: it decides how the *reply* is delivered, and a delivery
+	 * recovered after a restart should ship as text rather than resurrect a
+	 * voice reply to a conversation that has moved on. Losing it degrades to
+	 * text-only, which is the safe direction.
+	 */
+	readonly voice?: boolean;
 }
 /**
  * The ONE reload implementation, shared by the SIGHUP handler and the
@@ -1081,6 +1091,7 @@ async function sendChat(
 				text?: unknown;
 				messageId?: unknown;
 				receivedAt?: unknown;
+				voice?: unknown;
 				engagement?: { mentioned?: unknown; group?: unknown; authorId?: unknown };
 		  }
 		| undefined;
@@ -1211,7 +1222,12 @@ async function sendChat(
 		});
 		return;
 	}
-	runtime.inbound.set(messageId, { turnId, requestId: request.id, connection });
+	runtime.inbound.set(messageId, {
+		turnId,
+		requestId: request.id,
+		connection,
+		...(params.voice === true ? { voice: true } : {}),
+	});
 	connection.write({ v: PROFILE_VERSION, type: "response", id: request.id, result: { turnId, engaged: true } });
 	await drainOrigin(key, messageId, connection, options, runtime);
 }
@@ -1346,6 +1362,9 @@ async function runInboundTurn(
 	runtime.inbound.delete(row.message_id);
 	const connection = context?.connection ?? fallback;
 	const turnId = context?.turnId ?? crypto.randomUUID();
+	// Absent for a delivery recovered after a restart, which is why that case
+	// degrades to text-only rather than speaking into a stale conversation.
+	const voiceTurn = context?.voice === true;
 	const key = row.origin_key;
 	const origin = validateOriginRef(JSON.parse(row.origin_ref_json) as typeof LOOPBACK_ORIGIN);
 	const userText = row.body;
@@ -1467,6 +1486,10 @@ async function runInboundTurn(
 			.map((part) => part.trim())
 			.filter((part) => part.length > 0 && !isSilenceToken(part))
 			.slice(0, 5);
+		// A spoken turn is answered in both modalities, and the whole reply is
+		// spoken ONCE rather than once per part: the flag rides on the final part
+		// so the audio lands after every line of text is already readable.
+		const spoken = spokenReply(parts, voiceTurn);
 		for (const part of parts) {
 			if (deliveredParts.length >= maxTurnParts) return;
 			// Reply-threading: a part may open with [REPLY:<platform message id>] to
@@ -1478,7 +1501,8 @@ async function runInboundTurn(
 			if (!payload) continue;
 			deliveredParts.push(body);
 			assistantDeliveryStarted = true;
-			broadcastDelivery(runtime, payload);
+			const last = part === parts[parts.length - 1];
+			broadcastDelivery(runtime, last && spoken !== "" ? { ...payload, voiceText: spoken } : payload);
 		}
 	};
 	// Long turns announce liveness instead of dying: throttled chat.progress events
@@ -1685,6 +1709,25 @@ function stripControlCharacters(value: string): string {
 		stripped += code < 0x20 || code === 0x7f ? " " : character;
 	}
 	return stripped;
+}
+
+/**
+ * The single spoken form of a whole reply, or "" when this turn is not spoken.
+ *
+ * The owner's rule is one reply, written once, delivered in both modalities when
+ * the question was spoken — so every part is joined into ONE utterance rather
+ * than one voice message per `[BREAK]`, which would talk over itself and bill
+ * per part.
+ *
+ * `[REPLY:...]` prefixes are stripped: the token is routing metadata, and
+ * reading a platform message id aloud is noise the listener cannot use.
+ */
+export function spokenReply(parts: readonly string[], voiceTurn: boolean): string {
+	if (!voiceTurn) return "";
+	return parts
+		.map((part) => part.replace(/^\[REPLY:[^\]\s]+\]\s*/, "").trim())
+		.filter((body) => body.length > 0)
+		.join("\n\n");
 }
 
 /** Marks a prepared delivery in flight and fans it out to every negotiated adapter. */

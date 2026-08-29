@@ -167,6 +167,22 @@ export interface ChatMessagePayload {
 	 * visible acknowledgement instead of a lost delivery.
 	 */
 	readonly reaction?: ReactionRef;
+	/**
+	 * When present the adapter must ALSO post this text as a spoken voice
+	 * message, in addition to delivering `text` normally.
+	 *
+	 * Set when the turn was triggered by a voice message: the owner asked for a
+	 * voice reply to be paired with its text automatically, decided by the
+	 * inbound modality rather than by anything the persona has to remember.
+	 * The two cannot share one platform message — Discord requires empty content
+	 * on a voice message — so the adapter sends text first, then the audio.
+	 *
+	 * Absent on redelivery after a restart: the modality lives with the in-flight
+	 * turn, not in the delivery ledger, so a recovered delivery degrades to
+	 * text-only. Text is the deliverable and voice is the courtesy, so that is
+	 * the safe direction to lose.
+	 */
+	readonly voiceText?: string;
 }
 
 export interface DeliveryConfirmParams {

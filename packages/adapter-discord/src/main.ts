@@ -6,10 +6,10 @@ import type {
 	ReactionAction,
 } from "@gajaeway/protocol";
 import { GajaewayClient } from "@gajaeway/sdk";
-import { Client, GatewayIntentBits, Partials } from "discord.js";
+import { AttachmentBuilder, Client, GatewayIntentBits, MessageFlags, Partials } from "discord.js";
 import { type AttachmentCarrier, describeInboundBody, firstVoiceMessage } from "./attachments";
 import { type AuthorLike, resolveDisplayName } from "./author";
-import { type LoadedDiscordAdapterConfig, loadDiscordAdapterConfig } from "./config";
+import { type LoadedDiscordAdapterConfig, type LoadedDiscordVoiceConfig, loadDiscordAdapterConfig } from "./config";
 import { type DiscordMessageOriginShape, discordMessageOrigin } from "./origin";
 import {
 	type DiscordInboundReaction,
@@ -20,6 +20,7 @@ import {
 	settleDiscordReaction,
 } from "./reactions";
 import { type ReplyMessageLike, resolveReplyContext } from "./reply";
+import { type SpeechConfig, type SpeechPorts, synthesizeVoice } from "./speech";
 import {
 	type TranscriptionPorts,
 	type TranscriptResult,
@@ -79,8 +80,24 @@ export interface GatewayClientLike {
 
 export interface DiscordTextChannelLike {
 	send(
-		payload: string | { content: string; reply?: { messageReference: string; failIfNotExists?: boolean } },
+		payload:
+			| string
+			| { content: string; reply?: { messageReference: string; failIfNotExists?: boolean } }
+			// A voice message carries no content: only the attachment and the flag.
+			| { files: readonly unknown[]; flags: number },
 	): Promise<unknown>;
+}
+
+/**
+ * Everything the delivery path needs to speak a reply.
+ *
+ * Absent when no voice key is configured, which is what makes the whole feature
+ * opt-in: with no `speech` the adapter behaves exactly as it did before, and a
+ * `voiceText` on a delivery is simply ignored.
+ */
+export interface DiscordSpeechPorts {
+	readonly config: SpeechConfig;
+	readonly ports: SpeechPorts;
 }
 
 export interface DiscordTypingChannelLike {
@@ -420,6 +437,7 @@ export async function settleDiscordDelivery(
 	typing?: TypingPort,
 	status?: WorkingStatus,
 	reactions: DiscordReactionPorts = createReactionPorts(),
+	speech?: DiscordSpeechPorts,
 ): Promise<void> {
 	if (message.origin.platform !== "discord" || !message.deliveryId) return;
 	const deliveryId = message.deliveryId;
@@ -453,6 +471,11 @@ export async function settleDiscordDelivery(
 				});
 			else await channel.send(chunk);
 		}
+		// Voice rides AFTER the text, and only after the text actually landed:
+		// pairing them is for a readable history, so the readable half must be
+		// the one that is guaranteed. A synthesis failure is logged and the
+		// delivery still confirms — the words arrived, which is the deliverable.
+		if (message.voiceText && speech) await sendVoiceMessage(channel, message.voiceText, speech);
 		await gateway.request("delivery.confirm", { deliveryId });
 	} catch (error) {
 		await gateway.request("delivery.fail", {
@@ -466,18 +489,45 @@ export async function settleDiscordDelivery(
 	}
 }
 
+/**
+ * Posts a spoken copy of a reply as a real Discord voice message.
+ *
+ * Never throws: the text half of this delivery has already been sent and
+ * confirmed-in-progress, so failing here would turn a missing courtesy into a
+ * failed delivery and a duplicate on retry.
+ */
+async function sendVoiceMessage(
+	channel: DiscordTextChannelLike,
+	text: string,
+	speech: DiscordSpeechPorts,
+): Promise<void> {
+	try {
+		const voice = await synthesizeVoice(text, speech.config, speech.ports);
+		if (!voice) return;
+		const attachment = new AttachmentBuilder(Buffer.from(voice.ogg), { name: "voice-message.ogg" })
+			.setDuration(voice.seconds)
+			.setWaveform(voice.waveform);
+		// IsVoiceMessage is what makes Discord render a waveform and a play button
+		// instead of a file card, and it requires empty content.
+		await channel.send({ files: [attachment], flags: MessageFlags.IsVoiceMessage });
+	} catch (error) {
+		console.error(`Discord voice reply failed: ${error instanceof Error ? error.message : String(error)}`);
+	}
+}
+
 export function subscribeDiscordDeliveries(
 	gateway: GatewayClientLike,
 	discord: DiscordClientLike,
 	typing?: TypingPort,
 	status?: WorkingStatus,
 	log: Pick<Console, "error"> = console,
+	speech?: DiscordSpeechPorts,
 ): () => void {
 	// One reaction port pair per subscription: the emoji cache and the throttle are
 	// only useful across deliveries, and a live adapter has exactly one subscription.
 	const reactions = createReactionPorts();
 	return gateway.onChatMessage((message) => {
-		void settleDiscordDelivery(gateway, discord, message, typing, status, reactions).catch((error) =>
+		void settleDiscordDelivery(gateway, discord, message, typing, status, reactions, speech).catch((error) =>
 			log.error(
 				`Discord delivery settlement request failed: ${error instanceof Error ? error.message : String(error)}`,
 			),
@@ -507,6 +557,57 @@ export function subscribeDiscordProgress(
 	});
 }
 
+/**
+ * Builds the speech ports from config, or undefined when voice is not set up.
+ *
+ * The same `voice` section powers inbound transcription and outbound speech: one
+ * provider, one key, one place to turn it off.
+ *
+ * The waveform decoder shells out to ffmpeg and is wired only as an optional
+ * port — Discord needs `duration_secs`, which is read from the Ogg stream
+ * itself, so a host without ffmpeg still sends a real voice message and only
+ * loses the shape of the bar.
+ */
+export function discordSpeechPorts(voice: LoadedDiscordVoiceConfig | undefined): DiscordSpeechPorts | undefined {
+	if (!voice) return undefined;
+	// Mapped field by field on purpose. `LoadedDiscordVoiceConfig` structurally
+	// satisfies `SpeechConfig`, so passing it straight through type-checks while
+	// silently feeding the speech-to-text `endpoint`/`model`/`timeoutMs` into the
+	// text-to-speech call. The two services share a key, not a URL.
+	return {
+		config: {
+			apiKey: voice.apiKey,
+			...(voice.voiceId ? { voiceId: voice.voiceId } : {}),
+			...(voice.speechModel ? { model: voice.speechModel } : {}),
+			...(voice.speechEndpoint ? { endpoint: voice.speechEndpoint } : {}),
+			...(voice.outputFormat ? { outputFormat: voice.outputFormat } : {}),
+			...(voice.maxSpokenChars ? { maxSpokenChars: voice.maxSpokenChars } : {}),
+			...(voice.speechTimeoutMs ? { timeoutMs: voice.speechTimeoutMs } : {}),
+		},
+		ports: {
+			fetch,
+			decodePcm: decodePcmWithFfmpeg,
+			log: (line) => console.error(`Discord ${line}`),
+		},
+	};
+}
+
+/** Decodes to mono 8 kHz PCM for waveform peaks only; resolves undefined if ffmpeg is absent. */
+async function decodePcmWithFfmpeg(ogg: Uint8Array): Promise<Int16Array | undefined> {
+	const child = Bun.spawn(["ffmpeg", "-v", "error", "-i", "pipe:0", "-ac", "1", "-ar", "8000", "-f", "s16le", "-"], {
+		stdin: "pipe",
+		stdout: "pipe",
+		stderr: "pipe",
+	});
+	child.stdin.write(ogg);
+	await child.stdin.end();
+	const raw = new Uint8Array(await new Response(child.stdout).arrayBuffer());
+	if ((await child.exited) !== 0 || raw.byteLength < 2) return undefined;
+	// The byte length can be odd if ffmpeg was cut off; drop the trailing half sample.
+	const usable = raw.byteLength - (raw.byteLength % 2);
+	return new Int16Array(raw.buffer.slice(raw.byteOffset, raw.byteOffset + usable));
+}
+
 export async function startDiscordAdapter(config: LoadedDiscordAdapterConfig): Promise<void> {
 	const discord = new Client({
 		intents: [...new Set([...REQUIRED_INTENTS, ...(config.intents ?? [])])],
@@ -524,6 +625,7 @@ export async function startDiscordAdapter(config: LoadedDiscordAdapterConfig): P
 		config,
 		typing,
 		status,
+		discordSpeechPorts(config.voice),
 	);
 	// Transcription makes ingress asynchronous, and two messages in one
 	// conversation must not overtake each other while one waits on the network.
@@ -546,7 +648,11 @@ export async function startDiscordAdapter(config: LoadedDiscordAdapterConfig): P
 			// history shows a url and nothing about what was said. Doing this in the
 			// runtime rather than the persona is a standing owner instruction.
 			const body = withTranscript(rendered, await transcribeIfVoice(message, config.voice));
-			gateway.sendInbound(message.id as string, origin, body, engagement, receivedAt);
+			// The modality of the question decides the modality of the answer: a
+			// spoken message is answered in voice and text both, without the
+			// persona having to ask for it.
+			const spoken = firstVoiceMessage(message) !== undefined;
+			gateway.sendInbound(message.id as string, origin, body, engagement, receivedAt, spoken);
 		});
 	});
 	// A reaction is engagement metadata, never a turn: it goes out on its own verb.
@@ -656,6 +762,7 @@ class ReconnectingGateway {
 		readonly config: LoadedDiscordAdapterConfig,
 		readonly typing?: TypingPort,
 		readonly status?: WorkingStatus,
+		readonly speech?: DiscordSpeechPorts,
 	) {}
 
 	async connect(): Promise<void> {
@@ -664,7 +771,14 @@ class ReconnectingGateway {
 			this.#client = client;
 			this.#attempt = 0;
 			this.#deliveryOff?.();
-			this.#deliveryOff = subscribeDiscordDeliveries(client, this.discord, this.typing, this.status);
+			this.#deliveryOff = subscribeDiscordDeliveries(
+				client,
+				this.discord,
+				this.typing,
+				this.status,
+				console,
+				this.speech,
+			);
 			this.#progressOff?.();
 			this.#progressOff = this.status ? subscribeDiscordProgress(client, this.status) : undefined;
 			console.log("Discord adapter connected to gateway.");
@@ -680,8 +794,9 @@ class ReconnectingGateway {
 		text: string,
 		engagement: EngagementContext,
 		receivedAt?: string,
+		voice?: boolean,
 	): void {
-		void this.requestInbound(messageId, origin, text, engagement, receivedAt);
+		void this.requestInbound(messageId, origin, text, engagement, receivedAt, voice);
 	}
 
 	/**
@@ -712,6 +827,8 @@ class ReconnectingGateway {
 		text: string,
 		engagement: EngagementContext,
 		receivedAt?: string,
+		/** The message was spoken, so the reply is owed in both modalities. */
+		voice?: boolean,
 	): Promise<{ engaged?: boolean } | undefined> {
 		if (!this.#inbound.addIfAbsent(messageId)) return;
 		const client = this.#client;
@@ -728,6 +845,7 @@ class ReconnectingGateway {
 				engagement,
 				messageId,
 				...(receivedAt ? { receivedAt } : {}),
+				...(voice ? { voice: true } : {}),
 			});
 			if (result?.engaged) this.typing?.begin(origin.conversationId);
 			return result;
