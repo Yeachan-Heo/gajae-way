@@ -2,16 +2,41 @@ import { readFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { dirname, isAbsolute, join, resolve } from "node:path";
 
+/**
+ * Inbound voice-message transcription.
+ *
+ * The key lives in a file, never inline, for the same reason the Discord token
+ * does: a config is readable, quotable, and gets pasted into issues.
+ *
+ * Absent `voice` means transcription is off and voice messages arrive with
+ * their url alone — the pre-existing behaviour — so omitting this section can
+ * never break an existing deployment.
+ */
+export interface DiscordVoiceConfig {
+	readonly apiKeyFile: string;
+	/** Pinned language; omitted means auto-detect, which is the tested default. */
+	readonly languageCode?: string;
+	readonly endpoint?: string;
+	readonly model?: string;
+	readonly timeoutMs?: number;
+}
+
+export interface LoadedDiscordVoiceConfig extends DiscordVoiceConfig {
+	readonly apiKey: string;
+}
+
 export interface DiscordAdapterConfig {
 	readonly tokenFile: string;
 	readonly gatewaySocket?: string;
 	readonly intents?: readonly number[];
 	readonly channels?: Readonly<Record<string, { readonly engagement?: "open" }>>;
+	readonly voice?: DiscordVoiceConfig;
 }
 
 export interface LoadedDiscordAdapterConfig extends DiscordAdapterConfig {
 	readonly token: string;
 	readonly configPath: string;
+	readonly voice?: LoadedDiscordVoiceConfig;
 }
 
 export class DiscordAdapterStartupError extends Error {
@@ -66,7 +91,42 @@ export async function loadDiscordAdapterConfig(
 	if (!token) {
 		throw new DiscordAdapterStartupError(`Discord token credential file ${tokenFile} is empty.`);
 	}
-	return { ...raw, tokenFile, token, configPath } as LoadedDiscordAdapterConfig;
+	const voice = await loadVoiceConfig(raw.voice, configPath);
+	return { ...raw, tokenFile, token, configPath, ...(voice ? { voice } : {}) } as LoadedDiscordAdapterConfig;
+}
+
+/**
+ * Resolves the voice section, or undefined when it is absent.
+ *
+ * A *present but broken* voice section is a startup error, not a silent
+ * downgrade. Transcription failures at runtime fail open on purpose, but a
+ * misspelled key path is a deployment mistake the operator has to see — falling
+ * back to "no transcription" would hide it behind behaviour that looks merely
+ * unconfigured.
+ */
+async function loadVoiceConfig(raw: unknown, configPath: string): Promise<LoadedDiscordVoiceConfig | undefined> {
+	if (raw === undefined) return undefined;
+	if (!isObject(raw) || typeof raw.apiKeyFile !== "string" || raw.apiKeyFile.trim() === "") {
+		throw new DiscordAdapterStartupError("Discord adapter voice requires a non-empty apiKeyFile credential-file path.");
+	}
+	for (const field of ["languageCode", "endpoint", "model"] as const) {
+		if (raw[field] !== undefined && typeof raw[field] !== "string")
+			throw new DiscordAdapterStartupError(`Discord adapter voice ${field} must be a string when set.`);
+	}
+	if (raw.timeoutMs !== undefined && (!Number.isInteger(raw.timeoutMs) || (raw.timeoutMs as number) <= 0)) {
+		throw new DiscordAdapterStartupError("Discord adapter voice timeoutMs must be a positive integer when set.");
+	}
+	const apiKeyFile = isAbsolute(raw.apiKeyFile) ? raw.apiKeyFile : resolve(dirname(configPath), raw.apiKeyFile);
+	let apiKey: string;
+	try {
+		apiKey = (await readFile(apiKeyFile, "utf8")).trim();
+	} catch {
+		throw new DiscordAdapterStartupError(
+			`Unable to read voice API key credential file ${apiKeyFile}. Check voice.apiKeyFile and file permissions.`,
+		);
+	}
+	if (!apiKey) throw new DiscordAdapterStartupError(`Voice API key credential file ${apiKeyFile} is empty.`);
+	return { ...(raw as unknown as DiscordVoiceConfig), apiKeyFile, apiKey };
 }
 
 function isObject(value: unknown): value is Record<string, unknown> {

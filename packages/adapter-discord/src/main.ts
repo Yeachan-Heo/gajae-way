@@ -7,7 +7,7 @@ import type {
 } from "@gajaeway/protocol";
 import { GajaewayClient } from "@gajaeway/sdk";
 import { Client, GatewayIntentBits, Partials } from "discord.js";
-import { type AttachmentCarrier, describeInboundBody } from "./attachments";
+import { type AttachmentCarrier, describeInboundBody, firstVoiceMessage } from "./attachments";
 import { type AuthorLike, resolveDisplayName } from "./author";
 import { type LoadedDiscordAdapterConfig, loadDiscordAdapterConfig } from "./config";
 import { type DiscordMessageOriginShape, discordMessageOrigin } from "./origin";
@@ -20,6 +20,12 @@ import {
 	settleDiscordReaction,
 } from "./reactions";
 import { type ReplyMessageLike, resolveReplyContext } from "./reply";
+import {
+	type TranscriptionPorts,
+	transcribeVoiceMessage,
+	type VoiceTranscriptionConfig,
+	withTranscript,
+} from "./voice";
 
 /**
  * Reaction state that must outlive a single delivery: the guild custom-emoji
@@ -185,6 +191,59 @@ export function decideInbound(
 	const base = engagementForMessage(message, botUser);
 	const open = origin.kind !== "dm" && channels?.[origin.conversationId]?.engagement === "open";
 	return open && !message.author.bot ? { ...base, mentioned: true } : base;
+}
+
+/**
+ * Preserves arrival order per conversation across asynchronous ingress work.
+ *
+ * Transcribing a voice message takes a network round-trip, so a short text
+ * message arriving right after a long voice message would otherwise reach the
+ * gateway first and the persona would read the conversation backwards. Each
+ * conversation gets its own chain; separate conversations stay parallel, because
+ * one slow transcription must not stall an unrelated room.
+ *
+ * The chain is dropped as soon as it drains so a long-lived adapter does not
+ * accumulate an entry per conversation it has ever seen.
+ */
+export class OrderedIngress {
+	private readonly chains = new Map<string, Promise<void>>();
+
+	run(key: string, task: () => Promise<void>): void {
+		const previous = this.chains.get(key) ?? Promise.resolve();
+		// A rejected task must not poison the chain for later messages.
+		const next = previous
+			.then(task)
+			.catch((error: unknown) =>
+				console.error(`Discord ingress failed: ${error instanceof Error ? error.message : String(error)}`),
+			);
+		this.chains.set(key, next);
+		void next.then(() => {
+			if (this.chains.get(key) === next) this.chains.delete(key);
+		});
+	}
+
+	/** Test seam: settles once nothing is in flight. */
+	async drain(): Promise<void> {
+		while (this.chains.size > 0) await Promise.all([...this.chains.values()]);
+	}
+}
+
+/**
+ * Transcribes an inbound voice message, or resolves undefined when there is
+ * nothing to transcribe or transcription is not configured.
+ *
+ * Every failure resolves undefined rather than throwing: the message must still
+ * be delivered with its url when speech-to-text is unavailable.
+ */
+export async function transcribeIfVoice(
+	message: AttachmentCarrier,
+	voice: VoiceTranscriptionConfig | undefined,
+	ports: TranscriptionPorts = { fetch, log: (line) => console.error(`Discord ${line}`) },
+): Promise<string | undefined> {
+	if (!voice) return undefined;
+	const url = firstVoiceMessage(message)?.url;
+	if (typeof url !== "string" || url === "") return undefined;
+	return await transcribeVoiceMessage(url, voice, ports);
 }
 
 export function chunkDiscordMessage(text: string): string[] {
@@ -465,21 +524,29 @@ export async function startDiscordAdapter(config: LoadedDiscordAdapterConfig): P
 		typing,
 		status,
 	);
+	// Transcription makes ingress asynchronous, and two messages in one
+	// conversation must not overtake each other while one waits on the network.
+	// The gateway serializes turns per origin, but it serializes them in arrival
+	// order, so the ordering has to be preserved here, before it hands them over.
+	const ingress = new OrderedIngress();
 	discord.on("messageCreate", (message) => {
 		const engagement = decideInbound(message, discord.user, config.channels);
 		if (!engagement) return;
 		// Attachments are rendered into the body: a voice message or an uncaptioned
 		// image has no content at all, and the gateway rejects empty text, so
 		// forwarding content alone dropped the message without a trace.
-		const body = describeInboundBody(message);
-		if (body === "") return;
-		gateway.sendInbound(
-			message.id as string,
-			discordMessageOrigin(message),
-			body,
-			engagement,
-			typeof message.createdTimestamp === "number" ? new Date(message.createdTimestamp).toISOString() : undefined,
-		);
+		const rendered = describeInboundBody(message);
+		if (rendered === "") return;
+		const origin = discordMessageOrigin(message);
+		const receivedAt =
+			typeof message.createdTimestamp === "number" ? new Date(message.createdTimestamp).toISOString() : undefined;
+		ingress.run(origin.conversationId, async () => {
+			// A voice message carries no text at all, so without a transcript the
+			// history shows a url and nothing about what was said. Doing this in the
+			// runtime rather than the persona is a standing owner instruction.
+			const body = withTranscript(rendered, await transcribeIfVoice(message, config.voice));
+			gateway.sendInbound(message.id as string, origin, body, engagement, receivedAt);
+		});
 	});
 	// A reaction is engagement metadata, never a turn: it goes out on its own verb.
 	discord.on("messageReactionAdd", (reaction, user) => {
