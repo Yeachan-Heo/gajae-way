@@ -40,6 +40,13 @@ export interface DiscordVoiceConfig {
 	 */
 	readonly maxSpokenChars?: number;
 	readonly speechTimeoutMs?: number;
+	/**
+	 * Playback speed, 0.7-1.2 (the provider's range). Defaults to the ceiling:
+	 * the owner asked for faster delivery and billing is per character, so speed
+	 * costs nothing. Out-of-range values are clamped, not rejected, because a
+	 * typo here should not silence the voice reply entirely.
+	 */
+	readonly speechSpeed?: number;
 }
 
 export interface LoadedDiscordVoiceConfig extends DiscordVoiceConfig {
@@ -146,6 +153,10 @@ async function loadVoiceConfig(raw: unknown, configPath: string): Promise<Loaded
 		const value = raw[field];
 		if (value !== undefined && (!Number.isInteger(value) || (value as number) <= 0))
 			throw new DiscordAdapterStartupError(`Discord adapter voice ${field} must be a positive integer when set.`);
+	}
+	// Fractional on purpose, so it is validated as a finite number rather than an integer.
+	if (raw.speechSpeed !== undefined && (typeof raw.speechSpeed !== "number" || !Number.isFinite(raw.speechSpeed))) {
+		throw new DiscordAdapterStartupError("Discord adapter voice speechSpeed must be a finite number when set.");
 	}
 	const apiKeyFile = isAbsolute(raw.apiKeyFile) ? raw.apiKeyFile : resolve(dirname(configPath), raw.apiKeyFile);
 	let apiKey: string;

@@ -35,6 +35,16 @@ const DEFAULT_TTS_ENDPOINT = "https://api.elevenlabs.io/v1/text-to-speech";
  */
 const DEFAULT_MAX_SPOKEN_CHARS = Number.POSITIVE_INFINITY;
 const DEFAULT_TIMEOUT_MS = 30_000;
+/**
+ * Playback speed. The owner asked for faster delivery, and 1.2 is the provider's
+ * ceiling — measured: the same line runs 3.77s at 1.0 and 2.56s at 1.2, and 1.3
+ * is rejected outright. Faster is also cheaper in listening time, not in quota:
+ * billing is per character, so speed costs nothing.
+ */
+const DEFAULT_SPEED = 1.2;
+/** Provider-enforced bounds; outside them the request is a validation error. */
+export const MIN_SPEED = 0.7;
+export const MAX_SPEED = 1.2;
 /** Opus in Ogg is always timestamped at 48 kHz regardless of the input rate. */
 const OPUS_GRANULE_RATE = 48_000;
 const WAVEFORM_BUCKETS = 64;
@@ -47,6 +57,8 @@ export interface SpeechConfig {
 	readonly endpoint?: string;
 	readonly maxSpokenChars?: number;
 	readonly timeoutMs?: number;
+	/** Playback speed, clamped to the provider's 0.7-1.2 range. */
+	readonly speed?: number;
 }
 
 export interface SpeechPorts {
@@ -136,7 +148,14 @@ export async function synthesizeVoice(
 		const response = await ports.fetch(`${base}/${voiceId}?output_format=${format}`, {
 			method: "POST",
 			headers: { "xi-api-key": config.apiKey, "Content-Type": "application/json" },
-			body: JSON.stringify({ text: spoken, model_id: config.model ?? DEFAULT_MODEL }),
+			body: JSON.stringify({
+				text: spoken,
+				model_id: config.model ?? DEFAULT_MODEL,
+				// Clamped rather than passed through: an out-of-range speed is a 400
+				// from the provider, which would cost the whole voice reply over a
+				// config typo.
+				voice_settings: { speed: clampSpeed(config.speed ?? DEFAULT_SPEED) },
+			}),
 			signal: controller.signal,
 		});
 		if (!response.ok) {
@@ -160,6 +179,12 @@ export async function synthesizeVoice(
 	} finally {
 		clearTimeout(timer);
 	}
+}
+
+/** Keeps a configured speed inside the provider's accepted range. */
+export function clampSpeed(speed: number): number {
+	if (!Number.isFinite(speed)) return DEFAULT_SPEED;
+	return Math.min(MAX_SPEED, Math.max(MIN_SPEED, speed));
 }
 
 /**

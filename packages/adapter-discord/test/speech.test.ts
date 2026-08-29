@@ -1,6 +1,6 @@
 import { expect, test } from "bun:test";
 import { discordSpeechPorts } from "../src/main";
-import { oggOpusDuration, speakable, synthesizeVoice } from "../src/speech";
+import { clampSpeed, MAX_SPEED, MIN_SPEED, oggOpusDuration, speakable, synthesizeVoice } from "../src/speech";
 
 const KEY = { apiKey: "test-key" };
 
@@ -219,4 +219,30 @@ test("synthesis sends the whole reply when uncapped", async () => {
 	await synthesizeVoice(long, KEY, { fetch });
 	expect(JSON.parse(String(calls[0]?.init?.body)).text).toBe(speakable(long));
 	expect(JSON.parse(String(calls[0]?.init?.body)).text.length).toBeGreaterThan(600);
+});
+
+// Owner asked for faster delivery. 1.2 is the provider's ceiling: measured, the
+// same line runs 3.77s at 1.0 and 2.56s at 1.2, and 1.3 is rejected with
+// invalid_voice_settings. Billing is per character, so speed is free.
+test("speech is sent at the provider's maximum speed by default", async () => {
+	const { fetch, calls } = stubFetch([new Response(oggWithGranule(48_000), { status: 200 })]);
+	await synthesizeVoice("안녕", KEY, { fetch });
+	expect(JSON.parse(String(calls[0]?.init?.body)).voice_settings).toEqual({ speed: 1.2 });
+});
+
+test("a configured speed is forwarded", async () => {
+	const { fetch, calls } = stubFetch([new Response(oggWithGranule(48_000), { status: 200 })]);
+	await synthesizeVoice("안녕", { ...KEY, speed: 0.9 }, { fetch });
+	expect(JSON.parse(String(calls[0]?.init?.body)).voice_settings.speed).toBe(0.9);
+});
+
+// An out-of-range speed is a 400 from the provider, which would cost the entire
+// voice reply over a config typo. Clamping keeps the audio.
+test("an out-of-range speed is clamped rather than losing the voice reply", async () => {
+	expect(clampSpeed(1.3)).toBe(MAX_SPEED);
+	expect(clampSpeed(0.1)).toBe(MIN_SPEED);
+	expect(clampSpeed(Number.NaN)).toBe(1.2);
+	const { fetch, calls } = stubFetch([new Response(oggWithGranule(48_000), { status: 200 })]);
+	await synthesizeVoice("안녕", { ...KEY, speed: 99 }, { fetch });
+	expect(JSON.parse(String(calls[0]?.init?.body)).voice_settings.speed).toBe(1.2);
 });

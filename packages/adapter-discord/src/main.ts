@@ -583,6 +583,7 @@ export function discordSpeechPorts(voice: LoadedDiscordVoiceConfig | undefined):
 			...(voice.outputFormat ? { outputFormat: voice.outputFormat } : {}),
 			...(voice.maxSpokenChars ? { maxSpokenChars: voice.maxSpokenChars } : {}),
 			...(voice.speechTimeoutMs ? { timeoutMs: voice.speechTimeoutMs } : {}),
+			...(voice.speechSpeed !== undefined ? { speed: voice.speechSpeed } : {}),
 		},
 		ports: {
 			fetch,
