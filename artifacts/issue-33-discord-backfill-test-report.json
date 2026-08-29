@@ -1,8 +1,8 @@
 {
   "kind": "api-package-test-report",
   "issue": 33,
-  "head": "f584bfb",
-  "headNote": "Final code commit the evidence was produced against (round 3, review-2 fixes); this artifact commit is the only commit on top of it, since a commit cannot embed its own sha.",
+  "head": "aa90692",
+  "headNote": "Final code commit the evidence was produced against (round 4, review-3 fixes); this artifact commit is the only commit on top of it, since a commit cannot embed its own sha.",
   "commands": [
     "bunx biome ci packages/",
     "bunx tsc --noEmit -p tsconfig.json",
@@ -12,8 +12,8 @@
   "results": {
     "biome": "rc 0; checked 171 files, 67 warnings + 1 info (all pre-existing, none in packages/adapter-discord)",
     "typecheck": "rc 0",
-    "adapterTest": "rc 0; 88 pass, 0 fail, 232 expect() calls across 6 files",
-    "packageTest": "rc 0; 1083 pass, 2 skip, 0 fail, 4523 expect() calls across 81 files"
+    "adapterTest": "rc 0; 98 pass, 0 fail, 270 expect() calls across 6 files",
+    "packageTest": "rc 0; 1093 pass, 2 skip, 0 fail, 4561 expect() calls across 81 files"
   },
-  "notes": "Round 3 closes review-2 findings A-D. A: the gateway.status delivery-safety inference is deleted; every failed chat.send is classified retryable / terminal-message / write-path-unknown (unknown is the default), only an all-terminal attempt streak may discard, and every discard writes a durable bounded dead-letter record (message id, conversation id, classification, attempts, ISO timestamp, summary) in the cursor store, observable via the deadLetters getter. B: early-return paths in recoverMissedMessages reschedule with backoff (recoveryRetryPending is observable); only an empty channel config returns without rescheduling. C: retainRecoveryCursors quarantines rather than deletes unrecoverable watermarks, bounded to 100 entries oldest-first, and recovery reads the quarantined watermark on re-add. D: the per-pass persistence NIT is documented at the advanceRecovered call site. Recovery still does not backfill threads/DMs (needs Discord thread enumeration, out of scope); their watermarks are bounded by the quarantine cap. Each new test was verified to fail under a targeted source mutation. The full package run emits an expected session-rebind startup-failure diagnostic from its existing test scenario; the suite completed with zero failing tests."
+  "notes": "Round 4 closes review-3 findings. MAJOR 1: invalid_params/malformed_frame/unsupported_frame_type are no longer terminal (the gateway raises invalid_params for contract violations that fail every message); terminal now needs per-payload evidence (payload_too_large from local encodeFrame, content-size text) AND non-uniformity - candidates are held without advancing the cursor and only commit when a later message lands, with a bail-out at RECOVERY_UNIFORM_FAILURE_LIMIT consecutive candidates. MAJOR 2: channel.messages.fetch is guarded per conversation (failed + fetchError), each channel's replay runs in its own try/catch, and only a fully clean pass resets the backoff - every other exit arms the scheduled retry. MINOR 3: a never-evicted per-conversation dead-letter digest (count, first/last id and timestamps) keeps mass discards auditable past the 50-record cap. MINOR 4: a bounded, persisted cross-pass attempt ledger converges on the discard threshold for alternating terminal/transient failures. MINOR 5: dead-letter recording is idempotent per message id. NIT 6: quarantine and ledger retention sort on explicit persisted seq metadata instead of JS key order. Durability: the cursor/dead-letter save fsyncs the temp file before the atomic rename and best-effort fsyncs the directory, with the residual window documented. Recovery still does not backfill threads/DMs (needs Discord thread enumeration, out of scope); their watermarks are retained under the quarantine cap. Each new test was verified to fail under a targeted source mutation. The full package run emits an expected session-rebind startup-failure diagnostic from its existing test scenario; the suite completed with zero failing tests."
 }
