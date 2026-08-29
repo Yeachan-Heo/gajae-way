@@ -1,4 +1,4 @@
-import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
+import { mkdir, open, readFile, rename } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import { adapterHome } from "./config";
 import type { DiscordInboundMessage } from "./main";
@@ -19,9 +19,10 @@ import type { DiscordInboundMessage } from "./main";
  */
 
 /**
- * How a failed recovery send is classified. Only `terminal-message` may ever be discarded:
- * `retryable` and `write-path-unknown` leave the gap intact so nothing is lost when the
- * gateway write path might still be degraded or partially applied.
+ * How a failed recovery send is classified. Only `terminal-message` may ever be discarded,
+ * and only with per-payload evidence (this message's own content/size) plus proof that the
+ * failure is NOT uniform across messages: `retryable` and `write-path-unknown` leave the gap
+ * intact so nothing is lost when the gateway write path might be degraded or contract-broken.
  */
 export type RecoveryFailureClass = "retryable" | "terminal-message" | "write-path-unknown";
 
@@ -36,6 +37,37 @@ export interface RecoveryDeadLetter {
 	readonly summary: string;
 }
 
+/**
+ * Per-conversation discard aggregate. Survives dead-letter eviction, so a mass-discard event
+ * stays auditable even after the bounded record list has rolled over.
+ */
+export interface RecoveryDeadLetterDigest {
+	readonly conversationId: string;
+	readonly classification: RecoveryFailureClass;
+	readonly count: number;
+	readonly firstMessageId: string;
+	readonly lastMessageId: string;
+	readonly firstAt: string;
+	readonly lastAt: string;
+}
+
+/** A parked watermark plus the insertion sequence its retention bound sorts on. */
+export interface QuarantinedWatermark {
+	readonly watermark: string;
+	readonly seq: number;
+}
+
+/** Cross-pass attempt accounting for one missed message id. */
+export interface RecoveryAttemptRecord {
+	readonly conversationId: string;
+	/** Failed send attempts across every pass. */
+	readonly attempts: number;
+	/** Subset of `attempts` classified `terminal-message`; only these can reach discard. */
+	readonly terminalAttempts: number;
+	readonly seq: number;
+	readonly summary: string;
+}
+
 export interface RecoveryCursorState {
 	/** Highest message id a recovery pass walked past, per recoverable conversation. */
 	readonly recoveredThrough: Readonly<Record<string, string>>;
@@ -43,16 +75,33 @@ export interface RecoveryCursorState {
 	 * Watermarks for conversations recovery does not currently iterate: channels removed
 	 * from config, plus thread/DM ids that never get backfill. Kept (not deleted) so a
 	 * channel re-added to config resumes instead of replaying the bootstrap window, and
-	 * bounded to RECOVERY_QUARANTINE_CAP entries, oldest insertion pruned first.
+	 * bounded to RECOVERY_QUARANTINE_CAP entries, lowest `seq` (oldest) pruned first.
 	 */
-	readonly quarantined: Readonly<Record<string, string>>;
+	readonly quarantined: Readonly<Record<string, QuarantinedWatermark>>;
+	/**
+	 * Cross-pass per-message attempt ledger, so a message that alternates terminal and
+	 * transient failures still reaches its discard threshold instead of blocking its
+	 * channel forever. Bounded by RECOVERY_ATTEMPT_LEDGER_CAP, lowest `seq` pruned first.
+	 */
+	readonly attempts: Readonly<Record<string, RecoveryAttemptRecord>>;
 	/** Bounded discard log, oldest pruned first (RECOVERY_DEAD_LETTER_CAP). */
 	readonly deadLetters: readonly RecoveryDeadLetter[];
+	/** Per-conversation discard aggregates; never evicted. */
+	readonly deadLetterDigest: Readonly<Record<string, RecoveryDeadLetterDigest>>;
+	/** Monotonic allocator for the `seq` fields above. */
+	readonly sequence: number;
 }
 
 export type RecoveryGateResult = "acked" | "duplicate" | "unavailable";
 
-const EMPTY_STATE: RecoveryCursorState = { recoveredThrough: {}, quarantined: {}, deadLetters: [] };
+const EMPTY_STATE: RecoveryCursorState = {
+	recoveredThrough: {},
+	quarantined: {},
+	attempts: {},
+	deadLetters: [],
+	deadLetterDigest: {},
+	sequence: 0,
+};
 
 export function recoveryCursorPath(home: string = adapterHome()): string {
 	return join(home, "adapters", "discord", "recovery-cursor.json");
@@ -121,11 +170,23 @@ export async function loadRecoveryCursors(path: string): Promise<RecoveryCursorS
 		throw error;
 	}
 	if (typeof raw !== "object" || raw === null || Array.isArray(raw)) return EMPTY_STATE;
-	const record = raw as { recoveredThrough?: unknown; quarantined?: unknown; deadLetters?: unknown };
+	const record = raw as Record<string, unknown>;
+	const quarantined = readQuarantined(record.quarantined);
+	const attempts = readAttempts(record.attempts);
+	const seqs = [
+		...Object.values(quarantined).map((entry) => entry.seq),
+		...Object.values(attempts).map((entry) => entry.seq),
+	];
+	const stored = typeof record.sequence === "number" && Number.isSafeInteger(record.sequence) ? record.sequence : 0;
 	return {
 		recoveredThrough: readWatermarks(record.recoveredThrough),
-		quarantined: readWatermarks(record.quarantined),
+		quarantined,
+		attempts,
 		deadLetters: readDeadLetters(record.deadLetters),
+		deadLetterDigest: readDigest(record.deadLetterDigest),
+		// Never hand back a sequence below anything already stored, or fresh entries would
+		// collide with old ones and the retention order would be wrong after a restart.
+		sequence: Math.max(stored, ...seqs, 0),
 	};
 }
 
@@ -137,6 +198,41 @@ function readWatermarks(entries: unknown): Record<string, string> {
 		}
 	}
 	return watermarks;
+}
+
+function readQuarantined(entries: unknown): Record<string, QuarantinedWatermark> {
+	const parked: Record<string, QuarantinedWatermark> = {};
+	if (typeof entries === "object" && entries !== null && !Array.isArray(entries)) {
+		for (const [id, value] of Object.entries(entries)) {
+			if (typeof value !== "object" || value === null) continue;
+			const entry = value as Record<string, unknown>;
+			if (typeof entry.watermark !== "string" || !/^\d+$/.test(entry.watermark)) continue;
+			parked[id] = {
+				watermark: entry.watermark,
+				seq: typeof entry.seq === "number" && Number.isSafeInteger(entry.seq) ? entry.seq : 0,
+			};
+		}
+	}
+	return parked;
+}
+
+function readAttempts(entries: unknown): Record<string, RecoveryAttemptRecord> {
+	const ledger: Record<string, RecoveryAttemptRecord> = {};
+	if (typeof entries === "object" && entries !== null && !Array.isArray(entries)) {
+		for (const [id, value] of Object.entries(entries)) {
+			if (typeof value !== "object" || value === null) continue;
+			const entry = value as Record<string, unknown>;
+			if (typeof entry.conversationId !== "string") continue;
+			ledger[id] = {
+				conversationId: entry.conversationId,
+				attempts: typeof entry.attempts === "number" ? entry.attempts : 0,
+				terminalAttempts: typeof entry.terminalAttempts === "number" ? entry.terminalAttempts : 0,
+				seq: typeof entry.seq === "number" && Number.isSafeInteger(entry.seq) ? entry.seq : 0,
+				summary: typeof entry.summary === "string" ? entry.summary : "",
+			};
+		}
+	}
+	return ledger;
 }
 
 function readDeadLetters(entries: unknown): RecoveryDeadLetter[] {
@@ -159,21 +255,57 @@ function readDeadLetters(entries: unknown): RecoveryDeadLetter[] {
 	return letters.slice(Math.max(0, letters.length - RECOVERY_DEAD_LETTER_CAP));
 }
 
-/** Atomic write (tmp + rename) so a crash mid-write never truncates the cursor file. */
+function readDigest(entries: unknown): Record<string, RecoveryDeadLetterDigest> {
+	const digest: Record<string, RecoveryDeadLetterDigest> = {};
+	if (typeof entries === "object" && entries !== null && !Array.isArray(entries)) {
+		for (const [id, value] of Object.entries(entries)) {
+			if (typeof value !== "object" || value === null) continue;
+			const entry = value as Record<string, unknown>;
+			if (typeof entry.count !== "number" || entry.count <= 0) continue;
+			digest[id] = {
+				conversationId: typeof entry.conversationId === "string" ? entry.conversationId : id,
+				classification: entry.classification === "retryable" ? "retryable" : "terminal-message",
+				count: entry.count,
+				firstMessageId: typeof entry.firstMessageId === "string" ? entry.firstMessageId : "",
+				lastMessageId: typeof entry.lastMessageId === "string" ? entry.lastMessageId : "",
+				firstAt: typeof entry.firstAt === "string" ? entry.firstAt : "",
+				lastAt: typeof entry.lastAt === "string" ? entry.lastAt : "",
+			};
+		}
+	}
+	return digest;
+}
+
+/**
+ * Atomic write (tmp + rename) plus an fsync of the temp file and of its directory, so a
+ * completed save survives a host crash and never leaves a truncated file behind. Directory
+ * fsync is best-effort: platforms that reject fsync on a directory fd still get the atomic
+ * rename and the file-level fsync.
+ */
 export async function saveRecoveryCursors(path: string, state: RecoveryCursorState): Promise<void> {
-	const payload = `${JSON.stringify(
-		{
-			recoveredThrough: state.recoveredThrough,
-			quarantined: state.quarantined,
-			deadLetters: state.deadLetters,
-		},
-		null,
-		"\t",
-	)}\n`;
-	await mkdir(dirname(path), { recursive: true, mode: 0o700 });
+	const payload = `${JSON.stringify(state, null, "\t")}\n`;
+	const directory = dirname(path);
+	await mkdir(directory, { recursive: true, mode: 0o700 });
 	const tmp = `${path}.${process.pid}.tmp`;
-	await writeFile(tmp, payload, { encoding: "utf8", mode: 0o600 });
+	const handle = await open(tmp, "w", 0o600);
+	try {
+		await handle.writeFile(payload, "utf8");
+		await handle.sync();
+	} finally {
+		await handle.close();
+	}
 	await rename(tmp, path);
+	try {
+		const dirHandle = await open(directory, "r");
+		try {
+			await dirHandle.sync();
+		} finally {
+			await dirHandle.close();
+		}
+	} catch {
+		// Best-effort: the rename is already atomic, only the directory entry's durability
+		// window widens on platforms that refuse fsync on a directory handle.
+	}
 }
 
 /**
@@ -183,7 +315,8 @@ export async function saveRecoveryCursors(path: string, state: RecoveryCursorSta
  * window, and a quarantined key becomes live again the moment its channel is configured.
  *
  * Unbounded growth (thread/DM ids, long-dead channels) is the thing that is bounded:
- * `quarantined` keeps at most `cap` entries and drops the oldest insertions first.
+ * `quarantined` keeps at most `cap` entries and drops the lowest `seq` first. Ordering is
+ * explicit metadata, never JS object key order (numeric-looking ids reorder there).
  */
 export function retainRecoveryCursors(
 	state: RecoveryCursorState,
@@ -192,34 +325,100 @@ export function retainRecoveryCursors(
 ): RecoveryCursorState {
 	const allowed = new Set(recoverable);
 	const recoveredThrough: Record<string, string> = {};
-	const quarantined: Record<string, string> = {};
-	// Quarantined first so already-parked keys stay older than freshly parked ones.
-	for (const [id, value] of [...Object.entries(state.quarantined), ...Object.entries(state.recoveredThrough)]) {
+	const quarantined: Record<string, QuarantinedWatermark> = {};
+	let sequence = state.sequence;
+	for (const [id, value] of Object.entries(state.recoveredThrough)) {
 		if (allowed.has(id)) recoveredThrough[id] = value;
-		else quarantined[id] = value;
+		else quarantined[id] = { watermark: value, seq: ++sequence };
 	}
-	const parked = Object.keys(quarantined);
-	for (const id of parked.slice(0, Math.max(0, parked.length - cap))) delete quarantined[id];
-	return { recoveredThrough, quarantined, deadLetters: state.deadLetters };
+	for (const [id, entry] of Object.entries(state.quarantined)) {
+		// A previously parked key keeps its original seq (it is genuinely older); a key that
+		// became recoverable again graduates back to the live map.
+		if (allowed.has(id)) recoveredThrough[id] ??= entry.watermark;
+		else quarantined[id] = entry;
+	}
+	const parked = Object.entries(quarantined).sort((a, b) => a[1].seq - b[1].seq);
+	for (const [id] of parked.slice(0, Math.max(0, parked.length - cap))) delete quarantined[id];
+	return { ...state, recoveredThrough, quarantined, sequence };
 }
 
-/** Appends a discard record, keeping at most `cap` entries (oldest dropped first). */
+/**
+ * Records one failed send attempt for `messageId`, accumulating across passes so an
+ * alternating terminal/transient failure still reaches the discard threshold. Bounded by
+ * `cap`, lowest `seq` pruned first.
+ */
+export function recordAttempt(
+	state: RecoveryCursorState,
+	messageId: string,
+	conversationId: string,
+	classification: RecoveryFailureClass,
+	summary: string,
+	cap = RECOVERY_ATTEMPT_LEDGER_CAP,
+): RecoveryCursorState {
+	const previous = state.attempts[messageId];
+	const sequence = previous ? state.sequence : state.sequence + 1;
+	const attempts: Record<string, RecoveryAttemptRecord> = {
+		...state.attempts,
+		[messageId]: {
+			conversationId,
+			attempts: (previous?.attempts ?? 0) + 1,
+			terminalAttempts: (previous?.terminalAttempts ?? 0) + (classification === "terminal-message" ? 1 : 0),
+			seq: previous?.seq ?? sequence,
+			summary,
+		},
+	};
+	const ledger = Object.entries(attempts).sort((a, b) => a[1].seq - b[1].seq);
+	for (const [id] of ledger.slice(0, Math.max(0, ledger.length - cap))) delete attempts[id];
+	return { ...state, attempts, sequence };
+}
+
+/** Drops the attempt ledger entry for a message that finally landed (or was discarded). */
+export function clearAttempt(state: RecoveryCursorState, messageId: string): RecoveryCursorState {
+	if (!state.attempts[messageId]) return state;
+	const attempts = { ...state.attempts };
+	delete attempts[messageId];
+	return { ...state, attempts };
+}
+
+/**
+ * Appends a discard record (at most `cap` entries, oldest dropped first) and updates the
+ * per-conversation digest, which is never evicted so mass discards stay auditable. Recording
+ * is idempotent per message id within the retained window: a crash between the discard
+ * persist and the end of the pass re-sends the id, and the replay must not double-count it.
+ */
 export function recordDeadLetter(
 	state: RecoveryCursorState,
 	entry: RecoveryDeadLetter,
 	cap = RECOVERY_DEAD_LETTER_CAP,
 ): RecoveryCursorState {
+	if (state.deadLetters.some((existing) => existing.messageId === entry.messageId)) return state;
 	const deadLetters = [...state.deadLetters, entry];
-	return { ...state, deadLetters: deadLetters.slice(Math.max(0, deadLetters.length - cap)) };
+	const previous = state.deadLetterDigest[entry.conversationId];
+	const digest: RecoveryDeadLetterDigest = {
+		conversationId: entry.conversationId,
+		classification: entry.classification,
+		count: (previous?.count ?? 0) + 1,
+		firstMessageId: previous?.firstMessageId ?? entry.messageId,
+		lastMessageId: entry.messageId,
+		firstAt: previous?.firstAt ?? entry.at,
+		lastAt: entry.at,
+	};
+	return {
+		...state,
+		deadLetters: deadLetters.slice(Math.max(0, deadLetters.length - cap)),
+		deadLetterDigest: { ...state.deadLetterDigest, [entry.conversationId]: digest },
+	};
 }
 
-/** Protocol error codes that can only ever fail for this exact message payload. */
-const TERMINAL_ERROR_CODES = new Set([
-	"payload_too_large",
-	"invalid_params",
-	"malformed_frame",
-	"unsupported_frame_type",
-]);
+/**
+ * Protocol error codes that can only fail because of THIS message's own payload.
+ * `payload_too_large` is raised by the local encodeFrame for this frame's bytes, so it is
+ * per-payload evidence. Codes like invalid_params / malformed_frame / unsupported_frame_type
+ * are deliberately NOT here: the gateway raises invalid_params for contract violations
+ * ("non-loopback chat.send requires engagement", "requires a valid origin"), which fail every
+ * message deterministically — treating those as terminal would discard a whole backfill.
+ */
+const TERMINAL_ERROR_CODES = new Set(["payload_too_large"]);
 /** Protocol error codes that describe a transient link/gateway condition. */
 const RETRYABLE_ERROR_CODES = new Set([
 	"gateway_shutting_down",
@@ -228,16 +427,21 @@ const RETRYABLE_ERROR_CODES = new Set([
 	"missing_required_capability",
 ]);
 const RETRYABLE_ERRNO = /^(ECONN|EPIPE|ETIMEDOUT|ENOTCONN|EAGAIN|EBUSY|SQLITE_BUSY|SQLITE_LOCKED)/;
-const TERMINAL_TEXT =
-	/payload too large|message too long|content too long|malformed|unsupported (payload|frame|attachment)|invalid params|validation (failed|rejected)/i;
+/**
+ * Content faults that name THIS message's own payload (size/encoding of its text). Contract
+ * wording like "invalid params" or "requires engagement" is excluded on purpose: it describes
+ * the caller's contract, not the message, and hits every message alike.
+ */
+const TERMINAL_TEXT = /payload too large|message too long|content too long|content exceeds|frame exceeds/i;
 const RETRYABLE_TEXT =
 	/timed out|timeout|econnreset|econnrefused|epipe|enotconn|socket hang up|sqlite_busy|sqlite_locked|database is locked|queue (is )?(saturated|full)|backpressure|temporarily|try again|unavailable|\b5\d{2}\b/i;
 
 /**
  * Classifies a failed `chat.send`. The default is deliberately `write-path-unknown`: a
  * failure nobody recognized may have partially applied on the gateway write path, so the
- * caller must retry it and MUST NOT advance the cursor past it. A successful liveness probe
- * is never evidence that a send is safe to abandon.
+ * caller must retry it and MUST NOT advance the cursor past it. `terminal-message` means only
+ * "the evidence points at this payload"; the caller must still prove the failure is not
+ * uniform across messages before discarding anything (see recoverConversation).
  */
 export function classifyRecoveryFailure(error: unknown): RecoveryFailureClass {
 	const code = (error as { code?: unknown } | null | undefined)?.code;
@@ -275,10 +479,9 @@ export const RECOVERY_PAGE_LIMIT = 100;
 export const RECOVERY_MAX_PAGES = 5;
 export const RECOVERY_BOOTSTRAP_LOOKBACK_MS = 24 * 60 * 60 * 1000;
 /**
- * Per-message send budget during recovery. A message that fails this many times in one pass
- * is either retried later (retryable / write-path-unknown) or, only when every failure was
- * terminal for this exact message, dead-lettered and skipped forward so it cannot
- * head-of-line block the channel's backfill forever.
+ * Cross-pass terminal-failure budget for one message id. Once a message has burned this many
+ * `terminal-message` attempts it becomes a discard *candidate*; the discard only commits when
+ * a later message in the same pass succeeds (proof the failure is not uniform).
  */
 export const RECOVERY_MAX_ATTEMPTS = 3;
 /** Backoff floor between per-message send attempts inside one recovery pass. */
@@ -290,6 +493,14 @@ export const RECOVERY_RETRY_MAX_MS = 60_000;
 export const RECOVERY_QUARANTINE_CAP = 100;
 /** Retention bound for the durable discard log. */
 export const RECOVERY_DEAD_LETTER_CAP = 50;
+/** Retention bound for the cross-pass per-message attempt ledger. */
+export const RECOVERY_ATTEMPT_LEDGER_CAP = 200;
+/**
+ * How many consecutive discard candidates (distinct message ids, no success in between) mean
+ * "this looks uniform, not message-specific". At that point the pass bails out without
+ * discarding anything and without advancing the cursor.
+ */
+export const RECOVERY_UNIFORM_FAILURE_LIMIT = 3;
 
 /** The slice of a discord.js text-based channel recovery needs: forward paged history. */
 export interface RecoverableChannel {
@@ -308,22 +519,31 @@ export interface RecoverableChannel {
 }
 
 /**
- * Per-message delivery verdict handed back by the caller's send path. `skip` means the
- * caller deliberately gave up on this message (poison message past its attempt budget, or
- * nothing to engage with): the cursor advances past it so the rest of the gap can drain.
+ * Per-message delivery verdict handed back by the caller's send path.
+ *
+ * - `skip`: nothing to send (no engagement, empty content); the cursor advances.
+ * - `discard-candidate`: this message burned its terminal-failure budget and looks
+ *   message-specific. It is NOT discarded here: the cursor is held until a later message in
+ *   the same pass succeeds, which is the only proof the failure is not uniform.
  */
-export type RecoveryDelivery = "acked" | "duplicate" | "unavailable" | "skip";
+export type RecoveryDelivery = "acked" | "duplicate" | "unavailable" | "skip" | "discard-candidate";
 
 export interface RecoveryOutcome {
-	/** Highest message id this run walked past (delivered, duplicate, or skipped). */
+	/** Highest message id this run walked past (delivered, duplicate, skipped or discarded). */
 	readonly advancedTo: string;
 	readonly delivered: number;
 	/** Messages the run walked past without a send (empty content or caller `skip`). */
 	readonly skipped: number;
+	/** Discards committed this run (candidate + a later success proving non-uniformity). */
+	readonly discarded: number;
+	/** Candidates still held at the end of the run: nothing was discarded or advanced past. */
+	readonly held: number;
 	/** True when the gap exceeded the page bound; older messages may remain unrecovered. */
 	readonly truncated: boolean;
-	/** True when a delivery was unavailable; the caller must retry from `advancedTo`. */
+	/** True when the run could not finish (unavailable delivery, uniform failure, fetch error). */
 	readonly failed: boolean;
+	/** Set when the history fetch itself threw; the caller logs it and retries the channel. */
+	readonly fetchError?: string;
 }
 
 export interface RecoveryOptions {
@@ -331,7 +551,10 @@ export interface RecoveryOptions {
 	readonly nowMs: number;
 	readonly pageLimit?: number;
 	readonly maxPages?: number;
+	readonly uniformFailureLimit?: number;
 	deliver(message: DiscordInboundMessage): Promise<RecoveryDelivery>;
+	/** Called once per committed discard, before the cursor moves past the message. */
+	onDiscard?(message: DiscordInboundMessage): void;
 	/**
 	 * Treats empty/whitespace-only content (thread starters, system entries) as intentional
 	 * non-text: skipped without a send, cursor advances past them. Default: skip.
@@ -341,8 +564,10 @@ export interface RecoveryOptions {
 
 /**
  * Replays the bounded gap after `cursor` in ascending id order, delivering each message and
- * advancing only past acknowledged (or known-duplicate) ones. Stops early on an unavailable
- * delivery; reports `truncated` when `maxPages` full pages were consumed.
+ * advancing only past finished ones. Stops early on an unavailable delivery or when discard
+ * candidates pile up (uniform failure); reports `truncated` when `maxPages` full pages were
+ * consumed. A throwing history fetch is contained here: it ends this conversation's run with
+ * `failed` + `fetchError`, never the caller's whole pass.
  */
 export async function recoverConversation(
 	channel: RecoverableChannel,
@@ -350,12 +575,38 @@ export async function recoverConversation(
 ): Promise<RecoveryOutcome> {
 	const pageLimit = options.pageLimit ?? RECOVERY_PAGE_LIMIT;
 	const maxPages = options.maxPages ?? RECOVERY_MAX_PAGES;
+	const uniformLimit = options.uniformFailureLimit ?? RECOVERY_UNIFORM_FAILURE_LIMIT;
 	const skipEmpty = options.skipEmptyContent ?? true;
 	let cursor = options.cursor ?? snowflakeFromTimestamp(options.nowMs - RECOVERY_BOOTSTRAP_LOOKBACK_MS);
 	let delivered = 0;
 	let skipped = 0;
+	let discarded = 0;
+	// Candidates whose discard is not yet justified. They sit between the cursor and the
+	// message being delivered, so nothing advances past them until one later message lands.
+	let held: DiscordInboundMessage[] = [];
+	const commitHeld = (): void => {
+		for (const candidate of held) {
+			options.onDiscard?.(candidate);
+			discarded++;
+		}
+		held = [];
+	};
 	for (let page = 0; page < maxPages; page++) {
-		const fetched = await channel.messages.fetch({ after: cursor, limit: pageLimit });
+		let fetched: Awaited<ReturnType<RecoverableChannel["messages"]["fetch"]>>;
+		try {
+			fetched = await channel.messages.fetch({ after: cursor, limit: pageLimit });
+		} catch (error) {
+			return {
+				advancedTo: cursor,
+				delivered,
+				skipped,
+				discarded,
+				held: held.length,
+				truncated: false,
+				failed: true,
+				fetchError: error instanceof Error ? error.message : String(error),
+			};
+		}
 		// discord.js returns a Collection (entries); fake channels return arrays. Normalize
 		// to values first, then sort numerically so either API ordering is safe.
 		const rawBatch = [
@@ -367,31 +618,77 @@ export async function recoverConversation(
 		if (rawBatch.length >= pageLimit && batch.length === 0) {
 			// A broken/repeated page must not spin until the bound while pretending to
 			// make progress. Leave the cursor unchanged so the next reconnect retries it.
-			return { advancedTo: cursor, delivered, skipped, truncated: true, failed: false };
+			return { advancedTo: cursor, delivered, skipped, discarded, held: held.length, truncated: true, failed: false };
 		}
 		batch.sort((a, b) => {
 			const ai = BigInt(a.id);
 			const bi = BigInt(b.id);
 			return ai < bi ? -1 : ai > bi ? 1 : 0;
 		});
-		if (batch.length === 0) return { advancedTo: cursor, delivered, skipped, truncated: false, failed: false };
+		if (batch.length === 0) {
+			return {
+				advancedTo: cursor,
+				delivered,
+				skipped,
+				discarded,
+				held: held.length,
+				truncated: false,
+				failed: held.length > 0,
+			};
+		}
 		for (const message of batch) {
 			if (skipEmpty && message.content.trim() === "") {
-				// Thread starters / system entries carry no text: skip without a send so the
-				// cursor still advances and later messages keep backfilling.
-				cursor = message.id;
+				// Thread starters / system entries carry no text: skip without a send. This is
+				// not delivery evidence, so it cannot justify a held discard: keep holding.
+				if (held.length === 0) cursor = message.id;
 				skipped++;
 				continue;
 			}
 			const verdict = await options.deliver(message);
 			if (verdict === "unavailable") {
-				return { advancedTo: cursor, delivered, skipped, truncated: false, failed: true };
+				return { advancedTo: cursor, delivered, skipped, discarded, held: held.length, truncated: false, failed: true };
 			}
+			if (verdict === "discard-candidate") {
+				held.push(message);
+				if (held.length >= uniformLimit) {
+					// Same-looking terminal failure on `uniformLimit` consecutive distinct ids:
+					// that is a write-path problem, not a payload problem. Discard nothing.
+					return {
+						advancedTo: cursor,
+						delivered,
+						skipped,
+						discarded,
+						held: held.length,
+						truncated: false,
+						failed: true,
+					};
+				}
+				continue;
+			}
+			if (verdict === "skip") {
+				// Nothing was sent, so this is not evidence the write path works: a held
+				// candidate stays held and the cursor stays behind it.
+				if (held.length === 0) cursor = message.id;
+				skipped++;
+				continue;
+			}
+			// A message actually landed: the write path works, so the held candidates really
+			// are message-specific. Commit their discards and advance past all of them.
+			commitHeld();
 			cursor = message.id;
-			if (verdict === "skip") skipped++;
-			else delivered++;
+			delivered++;
 		}
-		if (batch.length < pageLimit) return { advancedTo: cursor, delivered, skipped, truncated: false, failed: false };
+		if (batch.length < pageLimit) {
+			return {
+				advancedTo: cursor,
+				delivered,
+				skipped,
+				discarded,
+				held: held.length,
+				truncated: false,
+				failed: held.length > 0,
+			};
+		}
 	}
-	return { advancedTo: cursor, delivered, skipped, truncated: true, failed: false };
+	return { advancedTo: cursor, delivered, skipped, discarded, held: held.length, truncated: true, failed: false };
 }
