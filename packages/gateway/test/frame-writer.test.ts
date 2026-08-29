@@ -85,6 +85,33 @@ test("fails closed at the configured queue bound and wakes a blocked write", asy
 	expect(sink.text()).not.toContain('"id":"second"');
 });
 
+test("settles a blocked frame when the transport closes", async () => {
+	const sink = new FakeSink(4);
+	const writer = new OrderedFrameWriter(sink);
+	writer.write(response("blocked", "x".repeat(100)));
+	await Bun.sleep(0);
+	writer.close();
+	await writer.settled();
+	expect(writer.closed).toBe(true);
+	expect(sink.closed).toBe(true);
+});
+
+test("fails closed when queued bytes exceed the limit independently of frame count", async () => {
+	const sink = new FakeSink(4);
+	const failures: unknown[] = [];
+	const writer = new OrderedFrameWriter(sink, (error) => failures.push(error), {
+		maxQueuedFrames: 10,
+		maxQueuedBytes: 500,
+	});
+	writer.write(response("first", "x".repeat(100)));
+	await Bun.sleep(0);
+	writer.write(response("second", "x".repeat(400)));
+	await writer.settled();
+	expect(writer.closed).toBe(true);
+	expect(failures).toHaveLength(1);
+	expect(sink.text()).not.toContain('"id":"second"');
+});
+
 test("rejects fractional socket write counts instead of corrupting the offset", async () => {
 	const failures: unknown[] = [];
 	const writer = new OrderedFrameWriter({ write: () => 1.5, close: () => {} }, (error) => failures.push(error));

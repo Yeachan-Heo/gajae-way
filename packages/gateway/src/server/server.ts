@@ -175,6 +175,26 @@ interface Connection {
 export interface GatewayServer {
 	stop(reason?: string): Promise<void>;
 }
+
+async function settleConnection(connection: Connection, timeoutMs: number): Promise<void> {
+	let timer: ReturnType<typeof setTimeout> | undefined;
+	let timedOut = false;
+	await Promise.race([
+		connection.settle(),
+		new Promise<void>((resolve) => {
+			timer = setTimeout(() => {
+				timedOut = true;
+				resolve();
+			}, timeoutMs);
+		}),
+	]);
+	if (timer !== undefined) clearTimeout(timer);
+	if (timedOut) {
+		connection.close();
+		await connection.settle();
+	}
+}
+
 export interface GatewayServerOptions {
 	readonly config: GatewayConfig;
 	readonly database: GatewayDatabase;
@@ -255,6 +275,8 @@ interface Runtime {
 	readonly reactions: ReactionBudget;
 	/** Accepted-but-not-yet-dispatched inbound messages, keyed by message id. */
 	readonly inbound: Map<string, InboundContext>;
+	/** Every admitted request except the shutdown request itself, so stop() can quiesce all writers. */
+	readonly requests: Set<Promise<void>>;
 	/** Read-only runtime-cycle projection (ops.cycle); owns no writes. */
 	readonly cycle: RuntimeCycleProjector;
 }
@@ -292,15 +314,15 @@ export async function startUnixServer(options: GatewayServerOptions): Promise<Ga
 			process.off("SIGHUP", onHup);
 			clearInterval(runtime.reconcileTimer);
 			clearInterval(runtime.contextMaintenanceTimer);
-			// Quiesce producers before taking the final writer snapshot. In-flight
-			// turns and monitor jobs can still emit frames after stop() is requested.
-			// Closing the listener only after they settle prevents those frames from
-			// being dropped or racing database teardown.
+			// Stop accepting new sockets first, but keep existing sockets alive. Then
+			// quiesce every admitted producer before taking the final writer snapshot.
+			listener.stop(false);
+			await Promise.all([...runtime.requests]);
 			await runtime.turns.settle();
 			await runtime.monitorRuntime.stop();
 			for (const connection of runtime.connections)
 				connection.write({ v: PROFILE_VERSION, type: "event", event: "gateway.stopping", payload: { reason } });
-			await Promise.all([...runtime.connections].map((connection) => connection.settle()));
+			await Promise.all([...runtime.connections].map((connection) => settleConnection(connection, 5_000)));
 			listener.stop(true);
 			await settleMemory(runtime);
 			await options.onStop?.();
@@ -329,8 +351,15 @@ export async function startUnixServer(options: GatewayServerOptions): Promise<Ga
 			data(socket, data) {
 				const connection = socket.data.connection;
 				try {
-					for (const frame of connection.decoder.feed(Buffer.from(data).toString()))
-						void handleFrame(connection, frame, options, runtime, stop, () => stopping);
+					for (const frame of connection.decoder.feed(Buffer.from(data).toString())) {
+						const task = handleFrame(connection, frame, options, runtime, stop, () => stopping);
+						if (frame.type === "request" && frame.verb === "gateway.shutdown") continue;
+						runtime.requests.add(task);
+						void task.then(
+							() => runtime.requests.delete(task),
+							() => runtime.requests.delete(task),
+						);
+					}
 				} catch (error) {
 					writeError(connection, error);
 				}
@@ -474,6 +503,7 @@ function createRuntime(options: GatewayServerOptions): Runtime {
 		reactions: new ReactionBudget(),
 		cycle: new RuntimeCycleProjector(options.database, memory),
 		inbound: new Map(),
+		requests: new Set(),
 	};
 }
 /**
