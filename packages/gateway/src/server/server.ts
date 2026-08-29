@@ -56,6 +56,7 @@ import { buildSessionBootstrap, type SessionBootstrap } from "../persona/bootstr
 import { PersonaLoader } from "../persona/persona";
 import type { GatewayDatabase, InboundMessageRow, MonitorEventStage } from "../store/db";
 import { DeliveryLedger } from "../store/ledger";
+import { OrderedFrameWriter } from "./frame-writer";
 import { KeyedQueue } from "./keyed-queue";
 import { composeSpeakerLabel, composeTurnHeader } from "./speaker";
 
@@ -169,6 +170,7 @@ interface Connection {
 	negotiated: boolean;
 	write(frame: Frame): void;
 	close(): void;
+	settle(): Promise<void>;
 }
 export interface GatewayServer {
 	stop(reason?: string): Promise<void>;
@@ -290,6 +292,7 @@ export async function startUnixServer(options: GatewayServerOptions): Promise<Ga
 			process.off("SIGHUP", onHup);
 			for (const connection of runtime.connections)
 				connection.write({ v: PROFILE_VERSION, type: "event", event: "gateway.stopping", payload: { reason } });
+			await Promise.all([...runtime.connections].map((connection) => connection.settle()));
 			listener.stop(true);
 			clearInterval(runtime.reconcileTimer);
 			clearInterval(runtime.contextMaintenanceTimer);
@@ -302,17 +305,23 @@ export async function startUnixServer(options: GatewayServerOptions): Promise<Ga
 		})();
 		return stopPromise;
 	};
-	listener = Bun.listen<{ connection: Connection }>({
+	listener = Bun.listen<{ connection: Connection; writer: OrderedFrameWriter }>({
 		unix: options.config.socketPath,
 		socket: {
 			open(socket) {
+				const writer = new OrderedFrameWriter(
+					{ write: (bytes) => socket.write(bytes), close: () => socket.end() },
+					(error) =>
+						console.error(`gateway socket write failed: ${error instanceof Error ? error.message : String(error)}`),
+				);
 				const connection: Connection = {
 					decoder: new FrameDecoder(),
 					negotiated: false,
-					write: (frame) => socket.write(encodeFrame(frame)),
-					close: () => socket.end(),
+					write: (frame) => writer.write(frame),
+					close: () => writer.close(),
+					settle: () => writer.settled(),
 				};
-				socket.data = { connection };
+				socket.data = { connection, writer };
 				runtime.connections.add(connection);
 			},
 			data(socket, data) {
@@ -324,10 +333,15 @@ export async function startUnixServer(options: GatewayServerOptions): Promise<Ga
 					writeError(connection, error);
 				}
 			},
+			drain(socket) {
+				socket.data.writer.drain();
+			},
 			close(socket) {
+				socket.data.writer.close();
 				runtime.connections.delete(socket.data.connection);
 			},
-			error(_socket, error) {
+			error(socket, error) {
+				socket.data.writer.fail(error);
 				console.error(`gateway socket error: ${error.message}`);
 			},
 		},
@@ -345,6 +359,7 @@ export function startStdioServer(options: GatewayServerOptions): GatewayServer {
 		negotiated: false,
 		write: (frame) => process.stdout.write(encodeFrame(frame)),
 		close: () => process.stdin.pause(),
+		settle: async () => {},
 	};
 	runtime.connections.add(connection);
 	let stopping = false;

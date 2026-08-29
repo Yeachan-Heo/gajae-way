@@ -1,9 +1,10 @@
 import { afterEach, expect, test } from "bun:test";
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { MAX_STALLED_CONTINUATIONS, parseLaneJobRecord } from "@gajaeway/subsession";
 import type { GatewayConfig } from "../src/config";
+import { memoryRoot } from "../src/memory/doctrine";
 import type { GjcPort } from "../src/orchestrator/gjc-client";
 import { type GatewayServer, startUnixServer } from "../src/server/server";
 import { GatewayDatabase } from "../src/store/db";
@@ -17,21 +18,31 @@ afterEach(async () => {
 	directory = "";
 });
 
-async function connect(socketPath: string): Promise<{ send(value: unknown): void; frames: any[]; close(): void }> {
+async function connect(
+	socketPath: string,
+): Promise<{ send(value: unknown): void; frames: any[]; wireLines: string[]; close(): void }> {
 	const frames: any[] = [];
-	let buffered = "";
+	const wireLines: string[] = [];
+	let buffered = Buffer.alloc(0);
 	const socket = await Bun.connect({
 		unix: socketPath,
 		socket: {
 			data(_socket, data) {
-				buffered += Buffer.from(data).toString();
-				const lines = buffered.split("\n");
-				buffered = lines.pop() ?? "";
-				for (const line of lines) if (line) frames.push(JSON.parse(line));
+				buffered = Buffer.concat([buffered, Buffer.from(data)]);
+				let newline = buffered.indexOf(10);
+				while (newline >= 0) {
+					const line = buffered.subarray(0, newline).toString("utf8");
+					buffered = buffered.subarray(newline + 1);
+					if (line) {
+						wireLines.push(line);
+						frames.push(JSON.parse(line));
+					}
+					newline = buffered.indexOf(10);
+				}
 			},
 		},
 	});
-	return { send: (value) => socket.write(`${JSON.stringify(value)}\n`), frames, close: () => socket.end() };
+	return { send: (value) => socket.write(`${JSON.stringify(value)}\n`), frames, wireLines, close: () => socket.end() };
 }
 
 async function waitFor(frames: any[], count: number): Promise<void> {
@@ -215,6 +226,81 @@ test("long turns broadcast throttled chat.progress liveness events", async () =>
 	expect(progress[0].payload.elapsedMs).toBeGreaterThanOrEqual(0);
 	const reply = client.frames.find((frame) => frame.type === "event" && frame.event === "chat.message");
 	expect(reply.payload.text).toBe("done");
+	client.close();
+});
+
+test("large memory.audit and concurrent progress remain independently parseable frames", async () => {
+	directory = await mkdtemp(join(tmpdir(), "gajaeway-server-frame-writer-"));
+	const config: GatewayConfig = {
+		schemaVersion: 1,
+		home: directory,
+		configPath: join(directory, "config.json"),
+		socketPath: join(directory, "gateway.sock"),
+		dbPath: join(directory, "gateway.db"),
+		logVerbosity: "info",
+		dmPolicy: "open" as const,
+	};
+	const root = memoryRoot(directory);
+	await mkdir(root, { recursive: true });
+	for (let index = 0; index < 2200; index++)
+		await writeFile(
+			join(root, `orphan-${index.toString().padStart(4, "0")}.md`),
+			`orphan ${index} ${"x".repeat(80)}\n`,
+		);
+	const database = await GatewayDatabase.open(config.dbPath);
+	const gjc: GjcPort = {
+		ensureSession: async () => ({ sessionId: "mock-session" }),
+		forgetRebinds: () => {},
+		sendTurn: async (_session, _text, _preamble, onProgress) => {
+			onProgress?.({ toolCalls: 1, outputTokens: 100 });
+			await Bun.sleep(5);
+			return "done";
+		},
+	};
+	server = await startUnixServer({
+		config,
+		database,
+		gjc,
+		progress: { firstAfterMs: 0, intervalMs: 0 },
+		onStop: () => database.close(),
+	});
+	const client = await connect(config.socketPath);
+	client.send({ v: "0.1", type: "hello", payload: { supportedVersions: ["0.1"] } });
+	await waitFor(client.frames, 1);
+	client.send({ v: "0.1", type: "request", id: "audit", verb: "memory.audit", params: {} });
+	client.send({
+		v: "0.1",
+		type: "request",
+		id: "progress-turn",
+		verb: "chat.send",
+		params: {
+			origin: { platform: "discord", kind: "dm", conversationId: "c1", peerId: "p1" },
+			text: "hello",
+			engagement: { mentioned: false, group: false, authorId: "p1" },
+		},
+	});
+	for (let attempt = 0; attempt < 800; attempt++) {
+		if (
+			client.frames.some((frame) => frame.type === "response" && frame.id === "audit") &&
+			client.frames.some((frame) => frame.type === "event" && frame.event === "chat.message")
+		)
+			break;
+		await Bun.sleep(5);
+	}
+	const audit = client.frames.find((frame) => frame.type === "response" && frame.id === "audit");
+	expect(audit).toBeDefined();
+	const auditIndex = client.frames.indexOf(audit);
+	const auditLine = client.wireLines[auditIndex];
+	expect(Buffer.byteLength(`${auditLine}\n`, "utf8")).toBeGreaterThan(219_000);
+	expect(JSON.parse(auditLine)).toEqual(audit);
+	expect(
+		client.frames.filter((frame) => frame.type === "event" && frame.event === "chat.progress").length,
+	).toBeGreaterThan(0);
+	expect(client.frames.find((frame) => frame.type === "event" && frame.event === "chat.message")?.payload.text).toBe(
+		"done",
+	);
+	expect(client.frames.filter((frame) => frame.type === "response" && frame.id === "audit")).toHaveLength(1);
+	expect(client.wireLines).toHaveLength(client.frames.length);
 	client.close();
 });
 

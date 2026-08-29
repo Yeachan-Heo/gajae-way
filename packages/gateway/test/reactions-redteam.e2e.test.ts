@@ -648,11 +648,8 @@ test("RT-WIRE-01 a 12000-character targetMessageId is rejected before it can bec
 	await request(client, "k1", "chat.react", { origin: ORIGIN, targetMessageId: huge, emoji: "👍" });
 	await settle();
 	// RT-WIRE-01 (was a blocker, now fixed): chat.react bounds targetMessageId to a
-	// platform message id, so an oversized id can no longer reach the connection
-	// writer — which ignores short writes and would silently truncate the frame
-	// (packages/gateway/src/server/server.ts, the `socket.write` in the listener). That
-	// writer defect is pre-existing and reachable through long chat text as well; this
-	// case only proves the reaction verb no longer opens a path to it.
+	// platform message id, and the per-connection writer also fully flushes every
+	// UTF-8 frame before allowing the next response or event onto the socket.
 	const failure = errorFrame(client.frames, "k1");
 	expect(failure?.error.code).toBe("invalid_params");
 	expect(failure?.error.message).toContain("targetMessageId");
