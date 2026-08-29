@@ -12,9 +12,11 @@ import {
 	RECOVERY_MAX_PAGES,
 	RECOVERY_PAGE_LIMIT,
 	RECOVERY_RETRY_BASE_MS,
+	RECOVERY_UNIFORM_FAILURE_LIMIT,
 	type RecoverableChannel,
 	type RecoveryCursorState,
 	RecoveryGate,
+	recordDeadLetter,
 	recoverConversation,
 	recoveryCursorPath,
 	retainRecoveryCursors,
@@ -27,7 +29,12 @@ const bot = { id: "bot-9" };
 
 /** Full cursor-store state from just its watermarks. */
 function cursorState(recoveredThrough: Record<string, string>): RecoveryCursorState {
-	return { recoveredThrough, quarantined: {}, deadLetters: [] };
+	return { recoveredThrough, quarantined: {}, attempts: {}, deadLetters: [], deadLetterDigest: {}, sequence: 0 };
+}
+
+/** Quarantined watermarks without their ordering metadata, for readable assertions. */
+function watermarks(parked: Readonly<Record<string, { watermark: string }>>): Record<string, string> {
+	return Object.fromEntries(Object.entries(parked).map(([id, entry]) => [id, entry.watermark]));
 }
 
 function message(id: string, overrides: Partial<DiscordInboundMessage> = {}): DiscordInboundMessage {
@@ -130,7 +137,15 @@ test("non-engaged missed message is delivered exactly once and advances the curs
 	]);
 	const deliver = wiredDeliver(gateway, lru);
 	const first = await recoverConversation(channel, { nowMs: 0, deliver });
-	expect(first).toEqual({ advancedTo: "100", delivered: 1, skipped: 0, truncated: false, failed: false });
+	expect(first).toEqual({
+		advancedTo: "100",
+		delivered: 1,
+		skipped: 0,
+		discarded: 0,
+		held: 0,
+		truncated: false,
+		failed: false,
+	});
 	const [send] = gateway.sent;
 	expect(send.messageId).toBe("100");
 	expect((send.engagement as { mentioned: boolean }).mentioned).toBe(false);
@@ -203,7 +218,15 @@ test("interrupted recovery before ack leaves the message retryable", async () =>
 	};
 	const channel = fakeChannel([message("501"), message("502"), message("503")]);
 	const outcome = await recoverConversation(channel, { cursor: "0", nowMs: 0, deliver });
-	expect(outcome).toEqual({ advancedTo: "501", delivered: 1, skipped: 0, truncated: false, failed: true });
+	expect(outcome).toEqual({
+		advancedTo: "501",
+		delivered: 1,
+		skipped: 0,
+		discarded: 0,
+		held: 0,
+		truncated: false,
+		failed: true,
+	});
 	// Retry after reconnect: the failed message is still first, later ones still pending.
 	const retry = await recoverConversation(channel, { cursor: outcome.advancedTo, nowMs: 0, deliver });
 	expect(attempted.filter((id) => id === "502")).toHaveLength(2);
@@ -234,7 +257,10 @@ test("gateway rejection is retried inside the pass and then persisted once", asy
 	// one watermark. A reconnect afterwards has nothing left to replay.
 	expect(requests).toEqual(["chat.send", "chat.send"]);
 	await settle();
-	expect(await loadRecoveryCursors(cursorPath)).toEqual(cursorState({ "channel-1": inbound.id }));
+	const persisted = await loadRecoveryCursors(cursorPath);
+	expect(persisted.recoveredThrough).toEqual({ "channel-1": inbound.id });
+	// The ledger entry for the retried message is released once it lands.
+	expect(persisted.attempts).toEqual({});
 	const secondGateway = wiredGateway(fakeChannel([inbound]), client, cursorPath);
 	await secondGateway.recoverMissedMessages();
 	await secondGateway.recoverMissedMessages();
@@ -430,11 +456,7 @@ test("unrecoverable watermarks are quarantined, bounded, and never deleted", asy
 		"channel-1",
 	]);
 	expect(retained.recoveredThrough).toEqual({ "channel-1": "10" });
-	expect(retained.quarantined).toEqual({ "thread-7": "20", "dm-3": "30" });
-	// Bounded: oldest quarantined insertions are pruned once the cap is exceeded.
-	const many = cursorState(Object.fromEntries(Array.from({ length: 5 }, (_, i) => [`thread-${i}`, `${i + 1}`])));
-	const capped = retainRecoveryCursors(many, [], 2);
-	expect(Object.keys(capped.quarantined)).toEqual(["thread-3", "thread-4"]);
+	expect(watermarks(retained.quarantined)).toEqual({ "thread-7": "20", "dm-3": "30" });
 	const cursorPath = join(home, "prune", "recovery-cursor.json");
 	const inbound = message(snowflakeFromTimestamp(Date.now() - 60_000));
 	// Boundary: a thread key already on disk moves to quarantine, not into recoveredThrough.
@@ -451,7 +473,27 @@ test("unrecoverable watermarks are quarantined, bounded, and never deleted", asy
 	const state = await loadRecoveryCursors(cursorPath);
 	expect(state.recoveredThrough).toEqual({ "channel-1": inbound.id });
 	// A live thread send never creates a key at all; the pre-existing thread key survives.
-	expect(state.quarantined).toEqual({ "thread-7": "1" });
+	expect(watermarks(state.quarantined)).toEqual({ "thread-7": "1" });
+});
+
+test("quarantine pruning uses insertion sequence, not JS key order", async () => {
+	// Numeric-looking conversation ids: JS object key order sorts these numerically, so a
+	// cap that trusted key order would prune "2" (newest) and keep "10" (oldest).
+	let state = cursorState({});
+	for (const id of ["10", "9", "2"]) {
+		state = retainRecoveryCursors({ ...state, recoveredThrough: { ...state.recoveredThrough, [id]: "1000" } }, [id]);
+		state = retainRecoveryCursors(state, []);
+	}
+	expect(Object.keys(watermarks(state.quarantined)).sort()).toEqual(["10", "2", "9"]);
+	const capped = retainRecoveryCursors(state, [], 2);
+	// Oldest insertion ("10") is the one pruned; the two newest survive.
+	expect(Object.keys(capped.quarantined).sort()).toEqual(["2", "9"]);
+	const path = join(home, "quarantine-order", "recovery-cursor.json");
+	await saveRecoveryCursors(path, capped);
+	const reloaded = await loadRecoveryCursors(path);
+	expect(Object.keys(reloaded.quarantined).sort()).toEqual(["2", "9"]);
+	// A restart must not restart the sequence, or new entries would tie with old ones.
+	expect(reloaded.sequence).toBeGreaterThanOrEqual(3);
 });
 
 test("skip-heavy gap keeps durable progress across the page bound", async () => {
@@ -620,7 +662,7 @@ test("a channel dropped from config and re-added resumes from its quarantined wa
 	// Config edit: channel-1 is gone, so its watermark is quarantined on the next save.
 	await wiredGateway(fakeChannel([first]), client, cursorPath, { "channel-2": {} }).recoverMissedMessages();
 	await settle();
-	expect((await loadRecoveryCursors(cursorPath)).quarantined["channel-1"]).toBe(first.id);
+	expect((await loadRecoveryCursors(cursorPath)).quarantined["channel-1"].watermark).toBe(first.id);
 	// Re-added: recovery resumes after the retained watermark, not from the 24h bootstrap.
 	const channel = fakeChannel([first, second]);
 	await wiredGateway(channel, client, cursorPath).recoverMissedMessages();
@@ -629,26 +671,264 @@ test("a channel dropped from config and re-added resumes from its quarantined wa
 	expect((await loadRecoveryCursors(cursorPath)).recoveredThrough["channel-1"]).toBe(second.id);
 });
 
-test("the dead-letter store respects its cap and drops the oldest record", async () => {
+test("mass discards keep an audit digest after the dead-letter cap evicts records", async () => {
 	const cursorPath = join(home, "dead-letter-cap", "recovery-cursor.json");
 	const base = Date.now() - 6 * 60 * 60 * 1000;
-	const all = Array.from({ length: RECOVERY_DEAD_LETTER_CAP + 3 }, (_, index) =>
-		message(snowflakeFromTimestamp(base + index * 10)),
+	// Alternating oversized/deliverable pairs: every oversized message is provably
+	// message-specific (the next one lands), so each discard commits.
+	const pairs = RECOVERY_DEAD_LETTER_CAP + 3;
+	const all = Array.from({ length: pairs * 2 }, (_, index) =>
+		message(snowflakeFromTimestamp(base + index * 10), {
+			content: index % 2 === 0 ? `oversized ${index}` : `hello <@${bot.id}>`,
+		}),
 	);
+	const oversized = all.filter((_, index) => index % 2 === 0);
 	const client = {
 		request: async (_verb: string, params?: unknown) => {
-			throw Object.assign(new Error(`rejected ${(params as { messageId: string }).messageId}`), {
-				code: "invalid_params",
-			});
+			const id = (params as { messageId: string }).messageId;
+			if (oversized.some((item) => item.id === id)) {
+				throw Object.assign(new Error("message too long for this platform"), { code: "payload_too_large" });
+			}
+			return {};
 		},
 	};
 	const gateway = wiredGateway(fakeChannel(all), client, cursorPath);
 	await gateway.recoverMissedMessages();
 	expect(gateway.deadLetters).toHaveLength(RECOVERY_DEAD_LETTER_CAP);
+	// The aggregate survives eviction: the mass event stays auditable.
+	expect(gateway.deadLetterDigest["channel-1"]).toMatchObject({
+		conversationId: "channel-1",
+		classification: "terminal-message",
+		count: pairs,
+		firstMessageId: oversized[0].id,
+		lastMessageId: oversized[oversized.length - 1].id,
+	});
 	// One serialized persist per discard: give the chain room to drain before reading.
-	await settle(500);
+	await settle(1_000);
 	const state = await loadRecoveryCursors(cursorPath);
 	expect(state.deadLetters).toHaveLength(RECOVERY_DEAD_LETTER_CAP);
-	expect(state.deadLetters[0].messageId).toBe(all[3].id);
-	expect(state.deadLetters[RECOVERY_DEAD_LETTER_CAP - 1].messageId).toBe(all[all.length - 1].id);
+	expect(state.deadLetters[0].messageId).toBe(oversized[3].id);
+	expect(state.deadLetters[RECOVERY_DEAD_LETTER_CAP - 1].messageId).toBe(oversized[oversized.length - 1].id);
+	expect(state.deadLetterDigest["channel-1"].count).toBe(pairs);
+});
+
+test("a contract-level invalid_params failure is never treated as message-specific", async () => {
+	const cursorPath = join(home, "contract-regression", "recovery-cursor.json");
+	const base = Date.now() - 60 * 60 * 1000;
+	const all = Array.from({ length: 5 }, (_, index) => message(snowflakeFromTimestamp(base + index * 10)));
+	const sends: string[] = [];
+	// Exactly what the gateway raises for a contract regression: every message fails.
+	const client = failingClient(
+		Object.assign(new Error("non-loopback chat.send requires engagement"), { code: "invalid_params" }),
+		sends,
+	);
+	const gateway = wiredGateway(fakeChannel(all), client, cursorPath);
+	await gateway.recoverMissedMessages();
+	await settle();
+	expect(classifyRecoveryFailure(Object.assign(new Error("requires a valid origin"), { code: "invalid_params" }))).toBe(
+		"write-path-unknown",
+	);
+	expect(gateway.deadLetters).toEqual([]);
+	const state = await loadRecoveryCursors(cursorPath);
+	expect(BigInt(state.recoveredThrough["channel-1"] ?? "0") < BigInt(all[0].id)).toBe(true);
+	expect(gateway.recoveryRetryPending).toBe(true);
+});
+
+test("a uniform terminal-looking failure across messages discards nothing", async () => {
+	const cursorPath = join(home, "uniform-terminal", "recovery-cursor.json");
+	const base = Date.now() - 60 * 60 * 1000;
+	const all = Array.from({ length: 6 }, (_, index) => message(snowflakeFromTimestamp(base + index * 10)));
+	const sends: string[] = [];
+	// payload_too_large IS per-payload evidence, but here it hits every message: that is a
+	// write-path problem, so the uniform-failure guard must refuse to discard anything.
+	const client = failingClient(Object.assign(new Error("message too long"), { code: "payload_too_large" }), sends);
+	const gateway = wiredGateway(fakeChannel(all), client, cursorPath);
+	await gateway.recoverMissedMessages();
+	await settle();
+	expect(gateway.deadLetters).toEqual([]);
+	expect(gateway.deadLetterDigest).toEqual({});
+	// Bailed out at the uniform-failure limit instead of grinding through the whole page.
+	expect(new Set(sends).size).toBe(RECOVERY_UNIFORM_FAILURE_LIMIT);
+	const state = await loadRecoveryCursors(cursorPath);
+	expect(BigInt(state.recoveredThrough["channel-1"] ?? "0") < BigInt(all[0].id)).toBe(true);
+	expect(gateway.recoveryRetryPending).toBe(true);
+});
+
+test("a single oversized message is discarded once a later message proves the path works", async () => {
+	const cursorPath = join(home, "oversized-one", "recovery-cursor.json");
+	const base = Date.now() - 60 * 60 * 1000;
+	// The oversized message is FIRST: head-of-line, with no earlier success to lean on.
+	const oversized = message(snowflakeFromTimestamp(base), { content: "oversized payload" });
+	const good = message(snowflakeFromTimestamp(base + 1_000));
+	const client = {
+		request: async (_verb: string, params?: unknown) => {
+			if ((params as { messageId: string }).messageId === oversized.id) {
+				throw Object.assign(new Error("content too long"), { code: "payload_too_large" });
+			}
+			return {};
+		},
+	};
+	const gateway = wiredGateway(fakeChannel([oversized, good]), client, cursorPath);
+	await gateway.recoverMissedMessages();
+	await settle();
+	expect(gateway.deadLetters).toHaveLength(1);
+	expect(gateway.deadLetters[0]).toMatchObject({ messageId: oversized.id, classification: "terminal-message" });
+	const state = await loadRecoveryCursors(cursorPath);
+	expect(state.recoveredThrough["channel-1"]).toBe(good.id);
+	// The ledger entry is released once the message is resolved.
+	expect(state.attempts[oversized.id]).toBeUndefined();
+});
+
+test("a throwing history fetch leaves other channels recovered and arms a retry", async () => {
+	const cursorPath = join(home, "history-throw", "recovery-cursor.json");
+	const inbound = message(snowflakeFromTimestamp(Date.now() - 60_000));
+	const healthy = fakeChannel([inbound]);
+	const broken: RecoverableChannel = {
+		messages: {
+			fetch: async () => {
+				throw new Error("discord history 500");
+			},
+		},
+	};
+	const gateway = new ReconnectingGateway(
+		"socket",
+		{ channels: { fetch: async (id: string) => (id === "channel-broken" ? broken : healthy) } },
+		{
+			tokenFile: "token",
+			token: "redacted",
+			configPath: "config",
+			channels: { "channel-broken": {}, "channel-1": {} },
+		} as never,
+		undefined,
+		undefined,
+		cursorPath,
+		() => bot,
+		{ request: async () => ({}), onChatMessage: () => () => {} } as never,
+		async () => {},
+	);
+	await gateway.recoverMissedMessages();
+	await settle();
+	// The broken channel did not abort the pass: the channel behind it still backfilled.
+	expect((await loadRecoveryCursors(cursorPath)).recoveredThrough["channel-1"]).toBe(inbound.id);
+	expect(gateway.recoveryRetryPending).toBe(true);
+});
+
+test("a throwing history fetch is contained in the outcome instead of thrown", async () => {
+	const channel: RecoverableChannel = {
+		messages: {
+			fetch: async () => {
+				throw new Error("discord history 500");
+			},
+		},
+	};
+	const outcome = await recoverConversation(channel, { cursor: "10", nowMs: 0, deliver: async () => "acked" });
+	expect(outcome.failed).toBe(true);
+	expect(outcome.fetchError).toBe("discord history 500");
+	expect(outcome.advancedTo).toBe("10");
+});
+
+test("one channel's unexpected throw leaves later channels recovered and arms a retry", async () => {
+	const cursorPath = join(home, "channel-throw", "recovery-cursor.json");
+	const inbound = message(snowflakeFromTimestamp(Date.now() - 60_000));
+	// A thread message with no parentId makes origin normalization throw inside deliver: an
+	// unexpected error from the middle of one channel's replay, not a guarded fetch.
+	const poisonOrigin = message(snowflakeFromTimestamp(Date.now() - 120_000), {
+		channel: { id: "channel-broken", isThread: () => true, parentId: null },
+	} as Partial<DiscordInboundMessage>);
+	const gateway = new ReconnectingGateway(
+		"socket",
+		{
+			channels: {
+				fetch: async (id: string) => (id === "channel-broken" ? fakeChannel([poisonOrigin]) : fakeChannel([inbound])),
+			},
+		},
+		{
+			tokenFile: "token",
+			token: "redacted",
+			configPath: "config",
+			channels: { "channel-broken": {}, "channel-1": {} },
+		} as never,
+		undefined,
+		undefined,
+		cursorPath,
+		() => bot,
+		{ request: async () => ({}), onChatMessage: () => () => {} } as never,
+		async () => {},
+	);
+	await gateway.recoverMissedMessages();
+	await settle();
+	expect((await loadRecoveryCursors(cursorPath)).recoveredThrough["channel-1"]).toBe(inbound.id);
+	expect(gateway.recoveryRetryPending).toBe(true);
+});
+
+test("cross-pass accounting discards a message that alternates terminal and transient failures", async () => {
+	const cursorPath = join(home, "alternating", "recovery-cursor.json");
+	const base = Date.now() - 60 * 60 * 1000;
+	const flaky = message(snowflakeFromTimestamp(base), { content: "oversized payload" });
+	const good = message(snowflakeFromTimestamp(base + 1_000));
+	let call = 0;
+	const client = {
+		request: async (_verb: string, params?: unknown) => {
+			if ((params as { messageId: string }).messageId !== flaky.id) return {};
+			call++;
+			// Alternates: no single pass ever collects RECOVERY_MAX_ATTEMPTS terminal failures.
+			throw call % 2 === 1
+				? Object.assign(new Error("content too long"), { code: "payload_too_large" })
+				: Object.assign(new Error("connection reset"), { code: "ECONNRESET" });
+		},
+	};
+	const gateway = wiredGateway(fakeChannel([flaky, good]), client, cursorPath);
+	await gateway.recoverMissedMessages();
+	expect(gateway.deadLetters).toEqual([]);
+	expect(gateway.deadLetters).toHaveLength(0);
+	// Later passes keep accumulating the terminal half of the alternation.
+	await gateway.recoverMissedMessages();
+	await gateway.recoverMissedMessages();
+	await settle();
+	expect(gateway.deadLetters).toHaveLength(1);
+	expect(gateway.deadLetters[0].messageId).toBe(flaky.id);
+	expect(gateway.deadLetters[0].attempts).toBeGreaterThanOrEqual(RECOVERY_MAX_ATTEMPTS);
+	expect((await loadRecoveryCursors(cursorPath)).recoveredThrough["channel-1"]).toBe(good.id);
+});
+
+test("dead-letter recording is idempotent per message id", async () => {
+	const entry = {
+		messageId: "42",
+		conversationId: "channel-1",
+		classification: "terminal-message",
+		attempts: 3,
+		at: new Date().toISOString(),
+		summary: "content too long",
+	} as const;
+	const once = recordDeadLetter(cursorState({}), entry);
+	const twice = recordDeadLetter(once, { ...entry, at: new Date().toISOString() });
+	expect(twice).toBe(once);
+	expect(twice.deadLetters).toHaveLength(1);
+	expect(twice.deadLetterDigest["channel-1"].count).toBe(1);
+});
+
+test("a replayed discard after a crash does not double-count the dead letter", async () => {
+	const cursorPath = join(home, "replay-discard", "recovery-cursor.json");
+	const base = Date.now() - 60 * 60 * 1000;
+	const oversized = message(snowflakeFromTimestamp(base), { content: "oversized payload" });
+	const good = message(snowflakeFromTimestamp(base + 1_000));
+	const client = {
+		request: async (_verb: string, params?: unknown) => {
+			if ((params as { messageId: string }).messageId === oversized.id) {
+				throw Object.assign(new Error("content too long"), { code: "payload_too_large" });
+			}
+			return {};
+		},
+	};
+	await wiredGateway(fakeChannel([oversized, good]), client, cursorPath).recoverMissedMessages();
+	await settle();
+	const afterCrash = await loadRecoveryCursors(cursorPath);
+	expect(afterCrash.deadLetters).toHaveLength(1);
+	// "Crash" before the watermark advanced: rewind the cursor and replay the same window.
+	await saveRecoveryCursors(cursorPath, { ...afterCrash, recoveredThrough: {} });
+	await wiredGateway(fakeChannel([oversized, good]), client, cursorPath).recoverMissedMessages();
+	await settle();
+	const replayed = await loadRecoveryCursors(cursorPath);
+	expect(replayed.deadLetters).toHaveLength(1);
+	expect(replayed.deadLetterDigest["channel-1"].count).toBe(1);
 });
