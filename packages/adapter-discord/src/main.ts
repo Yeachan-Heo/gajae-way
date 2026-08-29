@@ -21,6 +21,7 @@ import {
 } from "./reactions";
 import {
 	classifyRecoveryFailure,
+	clearAttempt,
 	recoveryCursorPath as defaultRecoveryCursorPath,
 	loadRecoveryCursors,
 	RECOVERY_ATTEMPT_BACKOFF_MS,
@@ -31,8 +32,10 @@ import {
 	type RecoverableChannel,
 	type RecoveryCursorState,
 	type RecoveryDeadLetter,
+	type RecoveryDeadLetterDigest,
 	type RecoveryFailureClass,
 	RecoveryGate,
+	recordAttempt,
 	recordDeadLetter,
 	recoverConversation,
 	retainRecoveryCursors,
@@ -663,7 +666,10 @@ export class ReconnectingGateway {
 			return;
 		}
 		this.#recovering = true;
-		let incomplete = false;
+		// A pass counts as complete only when every channel finished cleanly. Anything else —
+		// an unusable cursor store, a channel that reported an open gap, an unexpected throw —
+		// arms the backoff retry. No path may reset the backoff without one of the two.
+		let completed = false;
 		try {
 			await this.ensureCursors();
 			if (!this.#cursors) {
@@ -672,16 +678,29 @@ export class ReconnectingGateway {
 				console.error(
 					`Discord recovery refused: cursor store ${this.recoveryCursorPath} is unusable (${this.#cursorFault ?? "unknown error"}); retrying with backoff.`,
 				);
-				incomplete = true;
 				return;
 			}
+			let incomplete = false;
 			for (const channelId of channelIds) {
-				if (await this.recoverChannel(channelId, botUser)) incomplete = true;
+				try {
+					if (await this.recoverChannel(channelId, botUser)) incomplete = true;
+				} catch (error) {
+					// One channel's failure must never abort the pass or the channels behind it.
+					console.error(
+						`Discord recovery aborted for channel ${channelId}: ${error instanceof Error ? error.message : String(error)}`,
+					);
+					incomplete = true;
+				}
 			}
+			completed = !incomplete;
+		} catch (error) {
+			console.error(
+				`Discord recovery pass failed: ${error instanceof Error ? error.message : String(error)}; retrying with backoff.`,
+			);
 		} finally {
 			this.#recovering = false;
-			if (incomplete) this.scheduleRecoveryRetry();
-			else this.#retryAttempt = 0;
+			if (completed) this.#retryAttempt = 0;
+			else this.scheduleRecoveryRetry();
 		}
 	}
 
@@ -693,6 +712,11 @@ export class ReconnectingGateway {
 	/** Durable discard log, newest last; bounded by RECOVERY_DEAD_LETTER_CAP. */
 	get deadLetters(): readonly RecoveryDeadLetter[] {
 		return this.#cursors?.deadLetters ?? [];
+	}
+
+	/** Per-conversation discard aggregates; survive dead-letter eviction. */
+	get deadLetterDigest(): Readonly<Record<string, RecoveryDeadLetterDigest>> {
+		return this.#cursors?.deadLetterDigest ?? {};
 	}
 
 	/** True while a backoff retry of the recovery pass is armed. */
@@ -715,7 +739,7 @@ export class ReconnectingGateway {
 		const cursors = this.#cursors;
 		// A quarantined watermark (channel previously dropped from config) counts: resuming
 		// from it beats replaying the whole bootstrap window on re-add.
-		const before = cursors?.recoveredThrough[channelId] ?? cursors?.quarantined[channelId];
+		const before = cursors?.recoveredThrough[channelId] ?? cursors?.quarantined[channelId]?.watermark;
 		const outcome = await recoverConversation(fetched, {
 			cursor: before,
 			nowMs: Date.now(),
@@ -727,51 +751,76 @@ export class ReconnectingGateway {
 				const origin = discordMessageOrigin(message);
 				let failure: RecoveryFailureClass = "write-path-unknown";
 				let summary = "unclassified chat.send failure";
-				let terminalStreak = 0;
 				for (let attempt = 1; attempt <= RECOVERY_MAX_ATTEMPTS; attempt++) {
 					const result = await this.requestRecovered(message.id, origin, message.content, engagement);
-					if (result.verdict !== "unavailable") return result.verdict;
+					if (result.verdict !== "unavailable") {
+						this.forgetAttempts(message.id);
+						return result.verdict;
+					}
 					failure = result.failure;
 					summary = result.summary;
-					if (failure === "terminal-message") terminalStreak++;
+					// Cross-pass accounting: a message alternating terminal and transient
+					// failures still converges on its budget instead of blocking its channel.
+					this.noteAttempt(message.id, channelId, failure, summary);
 					if (attempt < RECOVERY_MAX_ATTEMPTS) await this.sleep(RECOVERY_ATTEMPT_BACKOFF_MS * 2 ** (attempt - 1));
 				}
-				// Out of per-pass budget. Discard is allowed ONLY when every attempt failed
-				// terminally for this exact message; a transient failure or anything we could
-				// not confidently classify leaves the gap intact (the cursor stays behind this
-				// message) and is retried by the scheduled pass.
-				if (terminalStreak < RECOVERY_MAX_ATTEMPTS) {
+				this.flushCursors();
+				const terminalAttempts = this.#cursors?.attempts[message.id]?.terminalAttempts ?? 0;
+				// Out of per-pass budget. A discard is only *proposed* here, and only with
+				// per-payload evidence (terminal classification) sustained across passes.
+				// recoverConversation still refuses to commit it until a later message lands,
+				// so a contract regression that fails every message discards nothing.
+				if (failure === "terminal-message" && terminalAttempts >= RECOVERY_MAX_ATTEMPTS) {
 					console.error(
-						`Discord recovery holding message ${message.id} in channel ${channelId} after ${RECOVERY_MAX_ATTEMPTS} failed chat.send attempts (${failure}: ${summary}); cursor stays behind it and the pass retries with backoff.`,
+						`Discord recovery proposes discarding message ${message.id} in channel ${channelId} after ${terminalAttempts} terminal chat.send rejections (${summary}); held until a later message proves the write path works.`,
 					);
-					return "unavailable";
+					return "discard-candidate";
 				}
 				console.error(
-					`Discord recovery is DISCARDING message ${message.id} in channel ${channelId}: ${RECOVERY_MAX_ATTEMPTS} terminal chat.send rejections (${summary}). Dead-lettered; the rest of the backfill continues.`,
+					`Discord recovery holding message ${message.id} in channel ${channelId} after ${RECOVERY_MAX_ATTEMPTS} failed chat.send attempts (${failure}: ${summary}); cursor stays behind it and the pass retries with backoff.`,
+				);
+				return "unavailable";
+			},
+			onDiscard: (message) => {
+				const ledger = this.#cursors?.attempts[message.id];
+				console.error(
+					`Discord recovery is DISCARDING message ${message.id} in channel ${channelId} after ${ledger?.terminalAttempts ?? RECOVERY_MAX_ATTEMPTS} terminal chat.send rejections (${ledger?.summary ?? "terminal rejection"}). Dead-lettered; the rest of the backfill continues.`,
 				);
 				this.deadLetter({
 					messageId: message.id,
 					conversationId: channelId,
 					classification: "terminal-message",
-					attempts: RECOVERY_MAX_ATTEMPTS,
+					attempts: ledger?.terminalAttempts ?? RECOVERY_MAX_ATTEMPTS,
 					at: new Date().toISOString(),
-					summary,
+					summary: ledger?.summary ?? "terminal rejection",
 				});
-				return "skip";
+				this.forgetAttempts(message.id);
 			},
 		});
 		// Durable progress is everything the run walked past — acked sends, known duplicates
-		// and dead-lettered discards alike. Anything narrower strands the gap behind a page
-		// bound full of skipped messages.
+		// and committed discards alike. Anything narrower strands the gap behind a page bound
+		// full of skipped messages.
 		//
 		// NIT (accepted): this runs once per pass, so a crash mid-pass loses the in-pass
 		// window and the next pass re-sends it. Exactly-once there rests on the gateway's
 		// durable message-id dedupe (inbound_messages/conversation_context), not on this
-		// watermark; per-message persistence would cost one fsync per replayed message.
+		// watermark; per-message persistence would cost one fsync per replayed message. The
+		// dead-letter record is written before the cursor moves and is idempotent per message
+		// id, so the replay cannot double-count a discard.
 		this.advanceRecovered(channelId, outcome.advancedTo);
-		if (outcome.failed) {
+		if (outcome.fetchError) {
 			console.error(
-				`Discord recovery paused for channel ${channelId} at message ${outcome.advancedTo}; gateway unavailable, retrying with backoff.`,
+				`Discord recovery could not read history for channel ${channelId}: ${outcome.fetchError}; other channels continue, retrying with backoff.`,
+			);
+			return true;
+		}
+		if (outcome.failed) {
+			const reason =
+				outcome.held > 0
+					? `${outcome.held} message(s) failed the same way with nothing succeeding in between — treating it as a gateway write-path problem, discarding nothing`
+					: "gateway unavailable";
+			console.error(
+				`Discord recovery paused for channel ${channelId} at message ${outcome.advancedTo}; ${reason}, retrying with backoff.`,
 			);
 			return true;
 		}
@@ -785,9 +834,9 @@ export class ReconnectingGateway {
 			);
 			return true;
 		}
-		if (outcome.delivered > 0 || outcome.skipped > 0) {
+		if (outcome.delivered > 0 || outcome.skipped > 0 || outcome.discarded > 0) {
 			console.log(
-				`Discord recovery backfilled ${outcome.delivered} message(s) and skipped ${outcome.skipped} for channel ${channelId}.`,
+				`Discord recovery backfilled ${outcome.delivered} message(s), skipped ${outcome.skipped} and discarded ${outcome.discarded} for channel ${channelId}.`,
 			);
 		}
 		return false;
@@ -816,6 +865,36 @@ export class ReconnectingGateway {
 		this.persist(recordDeadLetter(current, entry));
 	}
 
+	/**
+	 * Stages one failed attempt in the cross-pass ledger. Staged, not persisted: the retry
+	 * loop calls this up to RECOVERY_MAX_ATTEMPTS times per message and `flushCursors` writes
+	 * the accumulated result once, so a blocked message costs one save instead of three.
+	 */
+	private noteAttempt(
+		messageId: string,
+		conversationId: string,
+		classification: RecoveryFailureClass,
+		summary: string,
+	): void {
+		const current = this.#cursors;
+		if (!current) return;
+		this.#cursors = recordAttempt(current, messageId, conversationId, classification, summary);
+	}
+
+	/** Drops the ledger entry for a message that landed or was discarded. */
+	private forgetAttempts(messageId: string): void {
+		const current = this.#cursors;
+		if (!current) return;
+		const next = clearAttempt(current, messageId);
+		if (next !== current) this.persist(next);
+	}
+
+	/** Persists whatever is currently staged in memory. */
+	private flushCursors(): void {
+		const current = this.#cursors;
+		if (current) this.persist(current);
+	}
+
 	private ensureCursors(): Promise<void> {
 		this.#cursorLoads ??= loadRecoveryCursors(this.recoveryCursorPath)
 			.then((state) => {
@@ -842,7 +921,7 @@ export class ReconnectingGateway {
 	private advanceRecovered(conversationId: string, messageId: string): void {
 		const current = this.#cursors;
 		if (!current) return;
-		const existing = current.recoveredThrough[conversationId] ?? current.quarantined[conversationId];
+		const existing = current.recoveredThrough[conversationId] ?? current.quarantined[conversationId]?.watermark;
 		if (existing !== undefined && !snowflakeIsAfter(messageId, existing)) return;
 		this.persist(
 			retainRecoveryCursors(
