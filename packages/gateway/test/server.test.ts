@@ -48,6 +48,8 @@ test("requires negotiation then serves status, shutdown, and validates chat para
 		socketPath: join(directory, "gateway.sock"),
 		dbPath: join(directory, "gateway.db"),
 		logVerbosity: "info",
+		// This harness drives DM turns; DMs are authorisation-gated now.
+		dmPolicy: "open" as const,
 	};
 	const database = await GatewayDatabase.open(config.dbPath);
 	const gjc: GjcPort = {
@@ -116,6 +118,8 @@ test("a failed platform turn still delivers a visible ledgered failure notice", 
 		socketPath: join(directory, "gateway.sock"),
 		dbPath: join(directory, "gateway.db"),
 		logVerbosity: "info",
+		// This harness drives DM turns; DMs are authorisation-gated now.
+		dmPolicy: "open" as const,
 	};
 	const database = await GatewayDatabase.open(config.dbPath);
 	const gjc: GjcPort = {
@@ -159,6 +163,8 @@ test("long turns broadcast throttled chat.progress liveness events", async () =>
 		socketPath: join(directory, "gateway.sock"),
 		dbPath: join(directory, "gateway.db"),
 		logVerbosity: "info",
+		// This harness drives DM turns; DMs are authorisation-gated now.
+		dmPolicy: "open" as const,
 	};
 	const database = await GatewayDatabase.open(config.dbPath);
 	const gjc: GjcPort = {
@@ -221,6 +227,8 @@ test("debounced burst becomes one turn carrying the unread diff with speaker att
 		socketPath: join(directory, "gateway.sock"),
 		dbPath: join(directory, "gateway.db"),
 		logVerbosity: "info",
+		// This harness drives DM turns; DMs are authorisation-gated now.
+		dmPolicy: "open" as const,
 		debounceMs: 80,
 		channels: { c1: { engagement: "open" } },
 	};
@@ -279,6 +287,8 @@ test("group turns carry silence guidance: listeners are told to default to [SILE
 		socketPath: join(directory, "gateway.sock"),
 		dbPath: join(directory, "gateway.db"),
 		logVerbosity: "info",
+		// This harness drives DM turns; DMs are authorisation-gated now.
+		dmPolicy: "open" as const,
 		channels: { c1: { engagement: "open", debounceMs: 0 } },
 	};
 	const database = await GatewayDatabase.open(config.dbPath);
@@ -325,6 +335,8 @@ test("[REPLY:id] parts thread to the referenced message and strip the directive"
 		socketPath: join(directory, "gateway.sock"),
 		dbPath: join(directory, "gateway.db"),
 		logVerbosity: "info",
+		// This harness drives DM turns; DMs are authorisation-gated now.
+		dmPolicy: "open" as const,
 	};
 	const database = await GatewayDatabase.open(config.dbPath);
 	const gjc: GjcPort = {
@@ -369,6 +381,8 @@ test("work.run runs a named worker session in the requested cwd and returns the 
 		socketPath: join(directory, "gateway.sock"),
 		dbPath: join(directory, "gateway.db"),
 		logVerbosity: "info",
+		// This harness drives DM turns; DMs are authorisation-gated now.
+		dmPolicy: "open" as const,
 	};
 	const database = await GatewayDatabase.open(config.dbPath);
 	const seen: Array<{ key?: string; text?: string; options?: unknown }> = [];
@@ -418,6 +432,8 @@ test("work.run records a durable lane job and work.jobs projects it (issue #10)"
 		socketPath: join(directory, "gateway.sock"),
 		dbPath: join(directory, "gateway.db"),
 		logVerbosity: "info",
+		// This harness drives DM turns; DMs are authorisation-gated now.
+		dmPolicy: "open" as const,
 	};
 	const database = await GatewayDatabase.open(config.dbPath);
 	const gjc: GjcPort = {
@@ -524,6 +540,8 @@ test("a stalled durable job holds the next work.run until resume (production pat
 		socketPath: join(directory, "gateway.sock"),
 		dbPath: join(directory, "gateway.db"),
 		logVerbosity: "info",
+		// This harness drives DM turns; DMs are authorisation-gated now.
+		dmPolicy: "open" as const,
 	};
 	const database = await GatewayDatabase.open(config.dbPath);
 	let turns = 0;
@@ -589,6 +607,8 @@ test("resuming a stalled job clears the hold durably: the next ordinary call is 
 		socketPath: join(directory, "gateway.sock"),
 		dbPath: join(directory, "gateway.db"),
 		logVerbosity: "info",
+		// This harness drives DM turns; DMs are authorisation-gated now.
+		dmPolicy: "open" as const,
 	};
 	const database = await GatewayDatabase.open(config.dbPath);
 	let turns = 0;

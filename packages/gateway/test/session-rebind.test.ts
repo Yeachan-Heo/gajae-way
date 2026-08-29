@@ -862,6 +862,8 @@ test("the server's /new handler really resets the rebind budget", async () => {
 		socketPath: join(directory, "gateway.sock"),
 		dbPath: join(directory, "gateway.db"),
 		logVerbosity: "info",
+		// This harness drives DM turns; DMs are authorisation-gated now.
+		dmPolicy: "open" as const,
 	};
 	const database = await GatewayDatabase.open(config.dbPath);
 	const forgotten: string[] = [];
@@ -924,6 +926,8 @@ test("a failed platform turn delivers the runtime code and message in the notice
 		socketPath: join(directory, "gateway.sock"),
 		dbPath: join(directory, "gateway.db"),
 		logVerbosity: "info",
+		// This harness drives DM turns; DMs are authorisation-gated now.
+		dmPolicy: "open" as const,
 	};
 	const database = await GatewayDatabase.open(config.dbPath);
 	const gjc: GjcPort = {

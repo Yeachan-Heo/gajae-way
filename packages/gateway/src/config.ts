@@ -26,6 +26,12 @@ export interface GatewayConfigFile {
 	readonly debounceMs?: number;
 	/** Author ids allowed to trigger mention-gated group turns; absent/empty = anyone. */
 	readonly mentionAllowlist?: readonly string[];
+	/**
+	 * Who may open a direct-message turn. DMs used to bypass authorisation
+	 * entirely, which made the private surface the unauthenticated one.
+	 * Unset means `allowlist`.
+	 */
+	readonly dmPolicy?: DmPolicy;
 	/** Default recipient origin for monitor/maintenance notes without their own channel target. */
 	readonly ownerTarget?: { readonly origin: OriginRef };
 	readonly webhook?: { readonly bind?: string; readonly port: number; readonly exposeNonLoopback?: boolean };
@@ -45,6 +51,14 @@ export interface GatewayConfig extends GatewayConfigFile {
  */
 export const ENGAGEMENT_GATES = ["open", "open-mention-only", "closed"] as const;
 export type EngagementGate = (typeof ENGAGEMENT_GATES)[number];
+
+/**
+ * Direct-message gates. Unset means `allowlist`: the owner plus explicitly
+ * named authors. `open` exists so that widening this surface is a deliberate,
+ * auditable edit rather than a default nobody chose.
+ */
+export const DM_POLICIES = ["owner-only", "allowlist", "open"] as const;
+export type DmPolicy = (typeof DM_POLICIES)[number];
 
 export interface ChannelPolicy {
 	/**
@@ -231,6 +245,12 @@ function parseTurnTimeout(value: unknown): number {
 	return value as number;
 }
 
+function parseDmPolicy(value: unknown): DmPolicy {
+	if (typeof value !== "string" || !DM_POLICIES.includes(value as DmPolicy))
+		throw new ConfigError("config_invalid", `dmPolicy must be one of ${DM_POLICIES.join(", ")}`);
+	return value as DmPolicy;
+}
+
 export function parseConfigFile(value: unknown): GatewayConfigFile {
 	const input = requireObject(value, "config");
 	if (input.schemaVersion !== CONFIG_SCHEMA_VERSION) {
@@ -259,6 +279,7 @@ export function parseConfigFile(value: unknown): GatewayConfigFile {
 			: { mentionAllowlist: parseStringArray(input.mentionAllowlist, "mentionAllowlist") }),
 		...(input.debounceMs === undefined ? {} : { debounceMs: parseDebounce(input.debounceMs, "debounceMs") }),
 		...(model ? { model } : {}),
+		...(input.dmPolicy === undefined ? {} : { dmPolicy: parseDmPolicy(input.dmPolicy) }),
 		...(input.ownerTarget === undefined ? {} : { ownerTarget: parseOwnerTarget(input.ownerTarget) }),
 	};
 }
@@ -360,7 +381,7 @@ export async function reloadConfig(current: GatewayConfig, overrides: ConfigOver
  * `channels` (engagement/policy.ts + debounceFor), and `debounceMs`
  * (debounceFor). A change to one of these takes effect on the next turn.
  */
-export const RELOADABLE_FIELDS = ["mentionAllowlist", "channels", "debounceMs"] as const;
+export const RELOADABLE_FIELDS = ["mentionAllowlist", "channels", "debounceMs", "dmPolicy"] as const;
 
 /**
  * Fields bound to a live resource at startup — a listening socket, an open
