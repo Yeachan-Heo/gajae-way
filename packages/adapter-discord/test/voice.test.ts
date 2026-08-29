@@ -41,6 +41,32 @@ test("readTranscript takes the text and rejects everything that is not a transcr
 	expect(readTranscript("nope")).toBeUndefined();
 });
 
+// A real 2.4s owner message contained a desk knock and no speech. Auto-detect
+// guessed Serbo-Croatian at p=0.266 and returned "[mumbling]"; pinned to Korean
+// the same clip returned "[노크 소리]". Either one, injected into the body, would
+// enter the permanent history as something the owner had said.
+test("a non-speech event tag is not a transcript and is never attributed to the speaker", () => {
+	expect(readTranscript({ text: "[mumbling]" })).toBeUndefined();
+	expect(readTranscript({ text: "[노크 소리]" })).toBeUndefined();
+	expect(readTranscript({ text: "[BLANK_AUDIO]" })).toBeUndefined();
+	expect(readTranscript({ text: "(laughs)" })).toBeUndefined();
+	expect(readTranscript({ text: "  [mumbling]  " })).toBeUndefined();
+	// Several events and nothing else is still no speech.
+	expect(readTranscript({ text: "[noise] [노크 소리]" })).toBeUndefined();
+	expect(readTranscript({ text: "(coughs)[silence]" })).toBeUndefined();
+});
+
+test("speech is kept even when the transcriber annotates an event alongside it", () => {
+	// The words are real here, so dropping the whole transcript would lose them.
+	expect(readTranscript({ text: "[noise] 형님 테스트입니다" })).toBe("[noise] 형님 테스트입니다");
+	expect(readTranscript({ text: "안녕하세요 (laughs)" })).toBe("안녕하세요 (laughs)");
+});
+
+test("ordinary speech containing brackets is not mistaken for an event tag", () => {
+	expect(readTranscript({ text: "대괄호 [main] 브랜치 말이야" })).toBe("대괄호 [main] 브랜치 말이야");
+	expect(readTranscript({ text: "[REPLY:123] 이거 봐" })).toBe("[REPLY:123] 이거 봐");
+});
+
 test("withTranscript puts the transcript after the attachment line and leaves the url first", () => {
 	expect(withTranscript("[voice message · 3.2s · url]", "안녕")).toBe("[voice message · 3.2s · url]\n안녕");
 });

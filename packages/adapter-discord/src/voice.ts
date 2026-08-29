@@ -103,6 +103,21 @@ export async function transcribeVoiceMessage(
 }
 
 /**
+ * Non-speech audio events, which Scribe reports as a bracketed tag instead of
+ * words: `[mumbling]`, `[노크 소리]`, `(laughs)`, `[BLANK_AUDIO]`.
+ *
+ * These are descriptions of the recording, not things the speaker said, and the
+ * language is the transcriber's rather than the speaker's. Injecting one into
+ * the body would attribute it to the author — a knock on a desk would enter the
+ * permanent history as the owner having said "[노크 소리]".
+ *
+ * Matched structurally rather than by keyword, because the tag vocabulary is the
+ * provider's and is localized: any transcript consisting only of bracketed or
+ * parenthesized runs is an event report, not speech.
+ */
+const NON_SPEECH_TAG = /^(?:\s*(?:\[[^\]]*\]|\([^)]*\)))+\s*$/;
+
+/**
  * Reads the transcript out of a Scribe response.
  *
  * Kept separate and exported because the shape is the one part of this module a
@@ -114,7 +129,11 @@ export function readTranscript(payload: unknown): string | undefined {
 	const text = (payload as { text?: unknown }).text;
 	if (typeof text !== "string") return undefined;
 	const trimmed = text.trim();
-	return trimmed === "" ? undefined : trimmed;
+	if (trimmed === "") return undefined;
+	// Nothing was said, so there is nothing to attribute to the speaker. The
+	// attachment line already tells the reader audio arrived.
+	if (NON_SPEECH_TAG.test(trimmed)) return undefined;
+	return trimmed;
 }
 
 /**
