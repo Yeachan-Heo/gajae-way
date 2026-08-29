@@ -290,16 +290,18 @@ export async function startUnixServer(options: GatewayServerOptions): Promise<Ga
 		stopping = true;
 		stopPromise = (async () => {
 			process.off("SIGHUP", onHup);
+			clearInterval(runtime.reconcileTimer);
+			clearInterval(runtime.contextMaintenanceTimer);
+			// Quiesce producers before taking the final writer snapshot. In-flight
+			// turns and monitor jobs can still emit frames after stop() is requested.
+			// Closing the listener only after they settle prevents those frames from
+			// being dropped or racing database teardown.
+			await runtime.turns.settle();
+			await runtime.monitorRuntime.stop();
 			for (const connection of runtime.connections)
 				connection.write({ v: PROFILE_VERSION, type: "event", event: "gateway.stopping", payload: { reason } });
 			await Promise.all([...runtime.connections].map((connection) => connection.settle()));
 			listener.stop(true);
-			clearInterval(runtime.reconcileTimer);
-			clearInterval(runtime.contextMaintenanceTimer);
-			// In-flight turn drains still touch the database; close it under them and
-			// their completion bookkeeping crashes ("Cannot use a closed database").
-			await runtime.turns.settle();
-			await runtime.monitorRuntime.stop();
 			await settleMemory(runtime);
 			await options.onStop?.();
 		})();

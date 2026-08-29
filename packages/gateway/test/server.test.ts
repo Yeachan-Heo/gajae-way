@@ -304,6 +304,68 @@ test("large memory.audit and concurrent progress remain independently parseable 
 	client.close();
 });
 
+test("shutdown quiesces an in-flight turn before final stopping frame", async () => {
+	directory = await mkdtemp(join(tmpdir(), "gajaeway-server-shutdown-writer-"));
+	const config: GatewayConfig = {
+		schemaVersion: 1,
+		home: directory,
+		configPath: join(directory, "config.json"),
+		socketPath: join(directory, "gateway.sock"),
+		dbPath: join(directory, "gateway.db"),
+		logVerbosity: "info",
+		dmPolicy: "open" as const,
+	};
+	let entered!: () => void;
+	let release!: () => void;
+	const turnEntered = new Promise<void>((resolve) => (entered = resolve));
+	const turnRelease = new Promise<void>((resolve) => (release = resolve));
+	const database = await GatewayDatabase.open(config.dbPath);
+	const gjc: GjcPort = {
+		ensureSession: async () => ({ sessionId: "mock-session" }),
+		forgetRebinds: () => {},
+		sendTurn: async () => {
+			entered();
+			await turnRelease;
+			return "late reply";
+		},
+	};
+	server = await startUnixServer({ config, database, gjc, onStop: () => database.close() });
+	const client = await connect(config.socketPath);
+	client.send({ v: "0.1", type: "hello", payload: { supportedVersions: ["0.1"] } });
+	await waitFor(client.frames, 1);
+	client.send({
+		v: "0.1",
+		type: "request",
+		id: "turn",
+		verb: "chat.send",
+		params: {
+			origin: { platform: "discord", kind: "dm", conversationId: "c1", peerId: "p1" },
+			text: "hello",
+			engagement: { mentioned: false, group: false, authorId: "p1" },
+		},
+	});
+	await turnEntered;
+	client.send({ v: "0.1", type: "request", id: "shutdown", verb: "gateway.shutdown" });
+	for (let attempt = 0; attempt < 400; attempt++) {
+		if (client.frames.some((frame) => frame.type === "response" && frame.id === "shutdown")) break;
+		await Bun.sleep(5);
+	}
+	expect(client.frames.find((frame) => frame.type === "response" && frame.id === "shutdown")).toBeDefined();
+	release();
+	for (let attempt = 0; attempt < 400; attempt++) {
+		if (client.frames.some((frame) => frame.type === "event" && frame.event === "gateway.stopping")) break;
+		await Bun.sleep(5);
+	}
+	const replyIndex = client.frames.findIndex((frame) => frame.type === "event" && frame.event === "chat.message");
+	const stoppingIndex = client.frames.findIndex(
+		(frame) => frame.type === "event" && frame.event === "gateway.stopping",
+	);
+	expect(replyIndex).toBeGreaterThan(1);
+	expect(stoppingIndex).toBeGreaterThan(replyIndex);
+	expect(client.frames[replyIndex]?.payload.text).toBe("late reply");
+	client.close();
+});
+
 test("debounced burst becomes one turn carrying the unread diff with speaker attribution", async () => {
 	directory = await mkdtemp(join(tmpdir(), "gajaeway-server-"));
 	const config: GatewayConfig = {

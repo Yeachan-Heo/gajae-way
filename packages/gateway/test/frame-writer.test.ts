@@ -67,3 +67,29 @@ test("failure closes the writer and does not create an unhandled rejection", asy
 	expect(writer.closed).toBe(true);
 	expect(failures).toHaveLength(1);
 });
+
+test("fails closed at the configured queue bound and wakes a blocked write", async () => {
+	const sink = new FakeSink(4);
+	const failures: unknown[] = [];
+	const writer = new OrderedFrameWriter(sink, (error) => failures.push(error), {
+		maxQueuedFrames: 2,
+		maxQueuedBytes: 100_000,
+	});
+	writer.write(response("first", "x".repeat(100)));
+	await Bun.sleep(0);
+	writer.write(response("second", "x"));
+	writer.write(response("third", "x"));
+	await writer.settled();
+	expect(writer.closed).toBe(true);
+	expect(failures).toHaveLength(1);
+	expect(sink.text()).not.toContain('"id":"second"');
+});
+
+test("rejects fractional socket write counts instead of corrupting the offset", async () => {
+	const failures: unknown[] = [];
+	const writer = new OrderedFrameWriter({ write: () => 1.5, close: () => {} }, (error) => failures.push(error));
+	writer.write(response("fractional", "x"));
+	await writer.settled();
+	expect(writer.closed).toBe(true);
+	expect(failures[0]).toBeInstanceOf(Error);
+});
