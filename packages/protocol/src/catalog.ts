@@ -275,6 +275,13 @@ export interface MonitorSpec {
 	readonly burstPolicy?: BurstPolicyKind;
 	/** Channel target for authored output: at most one (spec fact 7). */
 	readonly channelTarget?: { readonly origin: OriginRef } | null;
+	/**
+	 * Per-monitor execution instruction handed to the authoring turn. Without it
+	 * a monitor's session only learns that an event fired, so it can do nothing
+	 * but write a receipt note. Free text, bounded length; the JSON-array
+	 * response contract is unaffected.
+	 */
+	readonly instruction?: string;
 	readonly enabled?: boolean;
 }
 

@@ -16,7 +16,7 @@ test("migrates a migration-001 database to the latest schema", async () => {
 		legacy.close();
 
 		const database = await GatewayDatabase.open(path);
-		expect(database.schemaVersion).toBe(14);
+		expect(database.schemaVersion).toBe(15);
 		database.close();
 
 		const migrated = new Database(path, { readonly: true });
@@ -69,7 +69,7 @@ DELETE FROM schema_migrations WHERE version > 10;
 		v10.close();
 
 		const upgraded = await GatewayDatabase.open(path);
-		expect(upgraded.schemaVersion).toBe(14);
+		expect(upgraded.schemaVersion).toBe(15);
 		expect(upgraded.laneJobJson("lanejob-test")).toBe('{"schemaVersion":1}');
 		const tables = new Set(
 			new Database(path, { readonly: true })
@@ -114,7 +114,7 @@ DELETE FROM schema_migrations WHERE version = 13;
 		v12.close();
 
 		const upgraded = await GatewayDatabase.open(path);
-		expect(upgraded.schemaVersion).toBe(14);
+		expect(upgraded.schemaVersion).toBe(15);
 		expect(upgraded.laneJobJson("lanejob-v12")).toBe('{"schemaVersion":1}');
 		expect(upgraded.metaGet("rebind_budget:discord/channel/c1")).toBe('{"used":2,"lifetime":7}');
 		expect(upgraded.monitorSlotExists("monitor-v12", "2026-08-28T00:00:00.000Z")).toBe(true);
@@ -134,6 +134,37 @@ DELETE FROM schema_migrations WHERE version = 13;
 		expect(preserved.query<{ n: number }, []>("SELECT COUNT(*) AS n FROM monitors").get()?.n).toBe(1);
 		expect(preserved.query<{ n: number }, []>("SELECT COUNT(*) AS n FROM monitor_events").get()?.n).toBe(1);
 		preserved.close();
+	} finally {
+		await rm(directory, { recursive: true, force: true });
+	}
+});
+
+test("upgrades a schema 14 monitors table to 15 without losing existing monitors", async () => {
+	const directory = await mkdtemp(join(tmpdir(), "gajaeway-migration-v14-"));
+	const path = join(directory, "gateway.db");
+	try {
+		const latest = await GatewayDatabase.open(path);
+		latest.close();
+
+		// Recreate the deployed schema-14 monitors table: no `instruction` column,
+		// one live monitor row.
+		const v14 = new Database(path);
+		v14.exec(`
+DROP TABLE monitors;
+CREATE TABLE monitors (monitor_id TEXT PRIMARY KEY, name TEXT NOT NULL, trigger_json TEXT NOT NULL, event_types_json TEXT NOT NULL, burst_policy TEXT NOT NULL, channel_target_json TEXT, enabled INTEGER NOT NULL DEFAULT 1, created_at TEXT NOT NULL);
+INSERT INTO monitors (monitor_id, name, trigger_json, event_types_json, burst_policy, channel_target_json, enabled, created_at) VALUES ('monitor-v14', 'v14', '{"kind":"cron","schedule":"0 * * * *"}', '["v14.event"]', 'coalesce', NULL, 1, '2026-08-28T00:00:00.000Z');
+DELETE FROM schema_migrations WHERE version > 14;
+`);
+		v14.close();
+
+		const upgraded = await GatewayDatabase.open(path);
+		expect(upgraded.schemaVersion).toBe(15);
+		const rows = upgraded.monitorRows();
+		expect(rows).toHaveLength(1);
+		// The pre-existing monitor survives and reads back with no instruction.
+		expect(rows[0]?.monitor_id).toBe("monitor-v14");
+		expect(rows[0]?.instruction).toBeNull();
+		upgraded.close();
 	} finally {
 		await rm(directory, { recursive: true, force: true });
 	}

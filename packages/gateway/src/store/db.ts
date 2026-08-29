@@ -11,7 +11,7 @@ export interface InboundMessageRow {
 	readonly received_at: string;
 }
 
-const LATEST_SCHEMA_VERSION = 14;
+const LATEST_SCHEMA_VERSION = 15;
 /** Maximum number of prior messages supplied to one engaged conversation turn. */
 export const CONVERSATION_DIFF_MAX_ROWS = 60;
 /** Maximum age of prior messages supplied to one engaged conversation turn. */
@@ -959,10 +959,11 @@ export class GatewayDatabase {
 		burstPolicy: string;
 		channelTargetJson: string | null;
 		enabled: boolean;
+		instruction: string | null;
 	}): void {
 		this.#database
 			.query(
-				"INSERT INTO monitors (monitor_id, name, trigger_json, event_types_json, burst_policy, channel_target_json, enabled, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+				"INSERT INTO monitors (monitor_id, name, trigger_json, event_types_json, burst_policy, channel_target_json, enabled, created_at, instruction) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
 			)
 			.run(
 				row.id,
@@ -973,6 +974,7 @@ export class GatewayDatabase {
 				row.channelTargetJson,
 				row.enabled ? 1 : 0,
 				new Date().toISOString(),
+				row.instruction,
 			);
 	}
 	monitorRows(): Array<{
@@ -984,10 +986,11 @@ export class GatewayDatabase {
 		channel_target_json: string | null;
 		enabled: number;
 		created_at: string;
+		instruction: string | null;
 	}> {
 		return this.#database
 			.query(
-				"SELECT monitor_id, name, trigger_json, event_types_json, burst_policy, channel_target_json, enabled, created_at FROM monitors ORDER BY created_at",
+				"SELECT monitor_id, name, trigger_json, event_types_json, burst_policy, channel_target_json, enabled, created_at, instruction FROM monitors ORDER BY created_at",
 			)
 			.all() as Array<{
 			monitor_id: string;
@@ -998,6 +1001,7 @@ export class GatewayDatabase {
 			channel_target_json: string | null;
 			enabled: number;
 			created_at: string;
+			instruction: string | null;
 		}>;
 	}
 	monitorDelete(id: string): boolean {
@@ -1735,6 +1739,23 @@ ALTER TABLE monitor_slots ADD COLUMN event_id TEXT;`,
 				this.#database
 					.query("INSERT INTO schema_migrations (version, applied_at) VALUES (?, ?)")
 					.run(14, new Date().toISOString());
+			});
+		}
+		if (current < 15) {
+			this.withTransaction(() => {
+				// Per-monitor authoring instruction. Nullable additive column: every
+				// existing monitor keeps firing with no instruction and the authoring
+				// prompt falls back to the built-in maintenance guidance.
+				const columns = new Set(
+					this.#database
+						.query<{ name: string }, []>("PRAGMA table_info(monitors)")
+						.all()
+						.map((row) => row.name),
+				);
+				if (!columns.has("instruction")) this.#database.exec("ALTER TABLE monitors ADD COLUMN instruction TEXT");
+				this.#database
+					.query("INSERT INTO schema_migrations (version, applied_at) VALUES (?, ?)")
+					.run(15, new Date().toISOString());
 			});
 		}
 	}
