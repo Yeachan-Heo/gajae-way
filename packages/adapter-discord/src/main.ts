@@ -22,6 +22,7 @@ import {
 import { type ReplyMessageLike, resolveReplyContext } from "./reply";
 import {
 	type TranscriptionPorts,
+	type TranscriptResult,
 	transcribeVoiceMessage,
 	type VoiceTranscriptionConfig,
 	withTranscript,
@@ -239,7 +240,7 @@ export async function transcribeIfVoice(
 	message: AttachmentCarrier,
 	voice: VoiceTranscriptionConfig | undefined,
 	ports: TranscriptionPorts = { fetch, log: (line) => console.error(`Discord ${line}`) },
-): Promise<string | undefined> {
+): Promise<TranscriptResult | undefined> {
 	if (!voice) return undefined;
 	const url = firstVoiceMessage(message)?.url;
 	if (typeof url !== "string" || url === "") return undefined;
