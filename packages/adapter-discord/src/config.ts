@@ -14,11 +14,39 @@ import { dirname, isAbsolute, join, resolve } from "node:path";
  */
 export interface DiscordVoiceConfig {
 	readonly apiKeyFile: string;
-	/** Pinned language; omitted means auto-detect, which is the tested default. */
+	/**
+	 * Pinned language for transcription; omitted means auto-detect.
+	 *
+	 * Auto-detect measured p=1.0 on long Korean speech but failed *confidently*
+	 * on short clips — a 1.9s Korean message came back as Spanish at p=0.999 —
+	 * so a single-language deployment should pin this. A confidence floor cannot
+	 * substitute: the wrong answer arrived at maximum confidence.
+	 */
 	readonly languageCode?: string;
 	readonly endpoint?: string;
 	readonly model?: string;
 	readonly timeoutMs?: number;
+	/** Outbound speech; omitted fields fall back to the tested ElevenLabs defaults. */
+	readonly voiceId?: string;
+	readonly speechModel?: string;
+	readonly speechEndpoint?: string;
+	readonly outputFormat?: string;
+	/**
+	 * Optional spoken length cap. Unset means the whole reply is spoken.
+	 *
+	 * Capping was tried and reverted: a listener cannot read the remainder out of
+	 * the text, so a truncated utterance is a truncated answer for the only
+	 * person the audio exists for.
+	 */
+	readonly maxSpokenChars?: number;
+	readonly speechTimeoutMs?: number;
+	/**
+	 * Playback speed, 0.7-1.2 (the provider's range). Defaults to the ceiling:
+	 * the owner asked for faster delivery and billing is per character, so speed
+	 * costs nothing. Out-of-range values are clamped, not rejected, because a
+	 * typo here should not silence the voice reply entirely.
+	 */
+	readonly speechSpeed?: number;
 }
 
 export interface LoadedDiscordVoiceConfig extends DiscordVoiceConfig {
@@ -109,12 +137,26 @@ async function loadVoiceConfig(raw: unknown, configPath: string): Promise<Loaded
 	if (!isObject(raw) || typeof raw.apiKeyFile !== "string" || raw.apiKeyFile.trim() === "") {
 		throw new DiscordAdapterStartupError("Discord adapter voice requires a non-empty apiKeyFile credential-file path.");
 	}
-	for (const field of ["languageCode", "endpoint", "model"] as const) {
+	for (const field of [
+		"languageCode",
+		"endpoint",
+		"model",
+		"voiceId",
+		"speechModel",
+		"speechEndpoint",
+		"outputFormat",
+	] as const) {
 		if (raw[field] !== undefined && typeof raw[field] !== "string")
 			throw new DiscordAdapterStartupError(`Discord adapter voice ${field} must be a string when set.`);
 	}
-	if (raw.timeoutMs !== undefined && (!Number.isInteger(raw.timeoutMs) || (raw.timeoutMs as number) <= 0)) {
-		throw new DiscordAdapterStartupError("Discord adapter voice timeoutMs must be a positive integer when set.");
+	for (const field of ["timeoutMs", "maxSpokenChars", "speechTimeoutMs"] as const) {
+		const value = raw[field];
+		if (value !== undefined && (!Number.isInteger(value) || (value as number) <= 0))
+			throw new DiscordAdapterStartupError(`Discord adapter voice ${field} must be a positive integer when set.`);
+	}
+	// Fractional on purpose, so it is validated as a finite number rather than an integer.
+	if (raw.speechSpeed !== undefined && (typeof raw.speechSpeed !== "number" || !Number.isFinite(raw.speechSpeed))) {
+		throw new DiscordAdapterStartupError("Discord adapter voice speechSpeed must be a finite number when set.");
 	}
 	const apiKeyFile = isAbsolute(raw.apiKeyFile) ? raw.apiKeyFile : resolve(dirname(configPath), raw.apiKeyFile);
 	let apiKey: string;
