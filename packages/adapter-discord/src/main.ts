@@ -7,6 +7,7 @@ import type {
 } from "@gajaeway/protocol";
 import { GajaewayClient } from "@gajaeway/sdk";
 import { Client, GatewayIntentBits, Partials } from "discord.js";
+import { type AttachmentCarrier, describeInboundBody } from "./attachments";
 import { type AuthorLike, resolveDisplayName } from "./author";
 import { type LoadedDiscordAdapterConfig, loadDiscordAdapterConfig } from "./config";
 import { type DiscordMessageOriginShape, discordMessageOrigin } from "./origin";
@@ -88,7 +89,7 @@ export interface DiscordClientLike {
 	channels: { fetch(id: string): Promise<unknown> };
 }
 
-export interface DiscordInboundMessage extends DiscordMessageOriginShape, ReplyMessageLike {
+export interface DiscordInboundMessage extends DiscordMessageOriginShape, ReplyMessageLike, AttachmentCarrier {
 	readonly id: string;
 	readonly content: string;
 	readonly createdTimestamp?: number;
@@ -467,10 +468,15 @@ export async function startDiscordAdapter(config: LoadedDiscordAdapterConfig): P
 	discord.on("messageCreate", (message) => {
 		const engagement = decideInbound(message, discord.user, config.channels);
 		if (!engagement) return;
+		// Attachments are rendered into the body: a voice message or an uncaptioned
+		// image has no content at all, and the gateway rejects empty text, so
+		// forwarding content alone dropped the message without a trace.
+		const body = describeInboundBody(message);
+		if (body === "") return;
 		gateway.sendInbound(
 			message.id as string,
 			discordMessageOrigin(message),
-			message.content,
+			body,
 			engagement,
 			typeof message.createdTimestamp === "number" ? new Date(message.createdTimestamp).toISOString() : undefined,
 		);
