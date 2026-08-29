@@ -1,20 +1,21 @@
 {
   "kind": "api-package-test-report",
   "issue": 33,
-  "head": "e2656d7",
+  "head": "3bff60e",
+  "headNote": "Code head the evidence was produced against; this artifact commit is the only commit on top of it, since a commit cannot embed its own sha.",
   "commands": [
-    "PATH=/mnt/offloading/.bun/bin:$PATH bun test packages/adapter-discord/test/recovery.test.ts",
-    "PATH=/mnt/offloading/.bun/bin:$PATH bun test packages/adapter-discord",
-    "PATH=/mnt/offloading/.bun/bin:$PATH bun test packages",
-    "PATH=/mnt/offloading/.bun/bin:$PATH bun run build",
-    "PATH=/mnt/offloading/.bun/bin:$PATH bun node_modules/.bin/biome check packages/adapter-discord/src/main.ts packages/adapter-discord/src/recovery.ts packages/adapter-discord/test/recovery.test.ts"
+    "bunx biome ci packages/",
+    "bunx tsc --noEmit -p tsconfig.json",
+    "bun test packages/adapter-discord/test/recovery.test.ts",
+    "bun test packages/adapter-discord",
+    "bun test packages"
   ],
   "results": {
-    "recoveryTest": "15 pass, 0 fail",
-    "adapterTest": "76 pass, 0 fail",
-    "packageTest": "1071 pass, 2 skip, 0 fail",
-    "build": "all five Bun compile targets succeeded",
-    "formatter": "checked 3 files, no fixes applied"
+    "biome": "rc 0; checked 171 files, 67 warnings (all pre-existing, none in packages/adapter-discord)",
+    "typecheck": "rc 0",
+    "recoveryTest": "21 pass, 0 fail, 66 expect() calls",
+    "adapterTest": "82 pass, 0 fail, 201 expect() calls",
+    "packageTest": "1077 pass, 2 skip, 0 fail, 4492 expect() calls"
   },
-  "notes": "The full package run emits an expected session-rebind startup-failure diagnostic from its existing test scenario; the suite completed with zero failing tests."
+  "notes": "Review fixes: the durable watermark is now recoveredThrough (recovery progress only, never live sends); thread/DM keys are pruned on save; outcome.advancedTo drives durable progress so skip-heavy gaps cross the page bound; per-message send attempts are bounded with backoff and a gateway.status probe separates a poison message (skipped forward) from an outage; failed/truncated passes schedule a backoff retry; the truncated log no longer claims an unchanged cursor advanced; an unreadable cursor store fails recovery closed and is exposed via cursorFault. Each fix has a regression test in packages/adapter-discord/test/recovery.test.ts verified to fail when the fix is reverted. The full package run emits an expected session-rebind startup-failure diagnostic from its existing test scenario; the suite completed with zero failing tests."
 }
