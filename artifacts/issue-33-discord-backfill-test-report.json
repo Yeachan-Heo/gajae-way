@@ -1,21 +1,19 @@
 {
   "kind": "api-package-test-report",
   "issue": 33,
-  "head": "3bff60e",
-  "headNote": "Code head the evidence was produced against; this artifact commit is the only commit on top of it, since a commit cannot embed its own sha.",
+  "head": "f584bfb",
+  "headNote": "Final code commit the evidence was produced against (round 3, review-2 fixes); this artifact commit is the only commit on top of it, since a commit cannot embed its own sha.",
   "commands": [
     "bunx biome ci packages/",
     "bunx tsc --noEmit -p tsconfig.json",
-    "bun test packages/adapter-discord/test/recovery.test.ts",
     "bun test packages/adapter-discord",
-    "bun test packages"
+    "bun test packages/"
   ],
   "results": {
-    "biome": "rc 0; checked 171 files, 67 warnings (all pre-existing, none in packages/adapter-discord)",
+    "biome": "rc 0; checked 171 files, 67 warnings + 1 info (all pre-existing, none in packages/adapter-discord)",
     "typecheck": "rc 0",
-    "recoveryTest": "21 pass, 0 fail, 66 expect() calls",
-    "adapterTest": "82 pass, 0 fail, 201 expect() calls",
-    "packageTest": "1077 pass, 2 skip, 0 fail, 4492 expect() calls"
+    "adapterTest": "rc 0; 88 pass, 0 fail, 232 expect() calls across 6 files",
+    "packageTest": "rc 0; 1083 pass, 2 skip, 0 fail, 4523 expect() calls across 81 files"
   },
-  "notes": "Review fixes: the durable watermark is now recoveredThrough (recovery progress only, never live sends); thread/DM keys are pruned on save; outcome.advancedTo drives durable progress so skip-heavy gaps cross the page bound; per-message send attempts are bounded with backoff and a gateway.status probe separates a poison message (skipped forward) from an outage; failed/truncated passes schedule a backoff retry; the truncated log no longer claims an unchanged cursor advanced; an unreadable cursor store fails recovery closed and is exposed via cursorFault. Each fix has a regression test in packages/adapter-discord/test/recovery.test.ts verified to fail when the fix is reverted. The full package run emits an expected session-rebind startup-failure diagnostic from its existing test scenario; the suite completed with zero failing tests."
+  "notes": "Round 3 closes review-2 findings A-D. A: the gateway.status delivery-safety inference is deleted; every failed chat.send is classified retryable / terminal-message / write-path-unknown (unknown is the default), only an all-terminal attempt streak may discard, and every discard writes a durable bounded dead-letter record (message id, conversation id, classification, attempts, ISO timestamp, summary) in the cursor store, observable via the deadLetters getter. B: early-return paths in recoverMissedMessages reschedule with backoff (recoveryRetryPending is observable); only an empty channel config returns without rescheduling. C: retainRecoveryCursors quarantines rather than deletes unrecoverable watermarks, bounded to 100 entries oldest-first, and recovery reads the quarantined watermark on re-add. D: the per-pass persistence NIT is documented at the advanceRecovered call site. Recovery still does not backfill threads/DMs (needs Discord thread enumeration, out of scope); their watermarks are bounded by the quarantine cap. Each new test was verified to fail under a targeted source mutation. The full package run emits an expected session-rebind startup-failure diagnostic from its existing test scenario; the suite completed with zero failing tests."
 }
