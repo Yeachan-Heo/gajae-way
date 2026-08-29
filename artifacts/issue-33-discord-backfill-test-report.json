@@ -1,19 +1,21 @@
 {
   "kind": "api-package-test-report",
   "issue": 33,
-  "head": "aa90692",
-  "headNote": "Final code commit the evidence was produced against (round 4, review-3 fixes); this artifact commit is the only commit on top of it, since a commit cannot embed its own sha.",
+  "head": "d5ad853",
+  "headNote": "Final code commit the evidence was produced against (round 5, review-4 fixes); this artifact commit is the only commit on top of it, since a commit cannot embed its own sha.",
   "commands": [
+    "bun install --frozen-lockfile",
     "bunx biome ci packages/",
     "bunx tsc --noEmit -p tsconfig.json",
     "bun test packages/adapter-discord",
     "bun test packages/"
   ],
   "results": {
+    "install": "rc 0; checked 42 installs across 46 packages (no changes)",
     "biome": "rc 0; checked 171 files, 67 warnings + 1 info (all pre-existing, none in packages/adapter-discord)",
     "typecheck": "rc 0",
-    "adapterTest": "rc 0; 98 pass, 0 fail, 270 expect() calls across 6 files",
-    "packageTest": "rc 0; 1093 pass, 2 skip, 0 fail, 4561 expect() calls across 81 files"
+    "adapterTest": "rc 0; 103 pass, 0 fail, 298 expect() calls across 6 files",
+    "packageTest": "rc 0; 1098 pass, 2 skip, 0 fail, 4589 expect() calls across 81 files"
   },
-  "notes": "Round 4 closes review-3 findings. MAJOR 1: invalid_params/malformed_frame/unsupported_frame_type are no longer terminal (the gateway raises invalid_params for contract violations that fail every message); terminal now needs per-payload evidence (payload_too_large from local encodeFrame, content-size text) AND non-uniformity - candidates are held without advancing the cursor and only commit when a later message lands, with a bail-out at RECOVERY_UNIFORM_FAILURE_LIMIT consecutive candidates. MAJOR 2: channel.messages.fetch is guarded per conversation (failed + fetchError), each channel's replay runs in its own try/catch, and only a fully clean pass resets the backoff - every other exit arms the scheduled retry. MINOR 3: a never-evicted per-conversation dead-letter digest (count, first/last id and timestamps) keeps mass discards auditable past the 50-record cap. MINOR 4: a bounded, persisted cross-pass attempt ledger converges on the discard threshold for alternating terminal/transient failures. MINOR 5: dead-letter recording is idempotent per message id. NIT 6: quarantine and ledger retention sort on explicit persisted seq metadata instead of JS key order. Durability: the cursor/dead-letter save fsyncs the temp file before the atomic rename and best-effort fsyncs the directory, with the residual window documented. Recovery still does not backfill threads/DMs (needs Discord thread enumeration, out of scope); their watermarks are retained under the quarantine cap. Each new test was verified to fail under a targeted source mutation. The full package run emits an expected session-rebind startup-failure diagnostic from its existing test scenario; the suite completed with zero failing tests."
+  "notes": "Round 5 closes review-4 findings. MAJOR-A: only an `acked` chat.send landing later in the SAME pass, after the candidate failures, authorizes a discard; `duplicate` (previous-pass success or the in-process RecoveryGate acked cache) is explicitly not evidence, so held candidates are dropped without discarding, the cursor stays behind the first failure and the retry is armed. MINOR-B: held-candidate and uniform-failure accounting is a Map keyed by message id, so a refetched page cannot inflate the limit or double-fire onDiscard; an id that is held and then acks is removed from the held set rather than discarded. NIT-C: attempt-ledger cap eviction protects active entries (current message, per-conversation head-of-line blocker and most recent entry) and evicts only inactive ones by seq; an all-active overflow is kept and logged loudly instead of resetting a blocked message's counts. NIT-D: a channel that cannot be fetched or is not readable history is an explicit per-channel failure with a diagnostic - cursor untouched, pass incomplete, retry armed. Recovery still does not backfill threads/DMs (needs Discord thread enumeration, out of scope); their watermarks stay bounded by the quarantine cap. Every new test was verified to fail under a targeted source mutation. The full package run emits an expected session-rebind startup-failure diagnostic from its existing test scenario; the suite completed with zero failing tests."
 }
