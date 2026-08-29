@@ -369,10 +369,14 @@ export class MonitorPropagator {
 				sessionOriginKey,
 				this.#database.getSessionRecord(sessionOriginKey)?.epoch ?? 0,
 			);
-			const guidance = claimed
+			// Guidance order: the monitor's own instruction first (it is what the
+			// owner actually asked this monitor to do), then any built-in
+			// maintenance semantics for the claimed event types. Without either,
+			// the authoring turn only gets the receipt-note contract.
+			const maintenance = claimed
 				.map((row) => MAINTENANCE_GUIDANCE[row.event_type])
-				.filter((entry, index, all) => entry && all.indexOf(entry) === index)
-				.join(" ");
+				.filter((entry, index, all) => entry && all.indexOf(entry) === index);
+			const guidance = [monitor.instruction?.trim() || undefined, ...maintenance].filter(Boolean).join(" ");
 			const prompt = `Author monitor events.${guidance ? ` ${guidance}` : ""} Respond ONLY with a JSON array containing exactly one {"eventId","note"} entry per event: ${JSON.stringify(claimed.map((row) => ({ eventId: row.event_id, eventType: row.event_type, payload: JSON.parse(row.payload_json) })))}`;
 			const response = await this.#gjc.sendTurn(sessionId, prompt);
 			// Lease fencing: after an await, this attempt may no longer own the
