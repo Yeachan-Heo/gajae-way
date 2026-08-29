@@ -101,9 +101,7 @@ describe("direct messages", () => {
 	test("the owner is always engaged", () => {
 		expect(decideEngagement(DM, ctx({ authorId: OWNER }), config()).engaged).toBe(true);
 		expect(decideEngagement(DM, ctx({ authorId: OWNER }), config({ dmPolicy: "owner-only" })).engaged).toBe(true);
-		expect(decideEngagement(DM, ctx({ authorId: OWNER }), config({ mentionAllowlist: [ALLOWED] })).engaged).toBe(
-			true,
-		);
+		expect(decideEngagement(DM, ctx({ authorId: OWNER }), config({ mentionAllowlist: [ALLOWED] })).engaged).toBe(true);
 	});
 
 	test("an allowlisted author is engaged by default", () => {

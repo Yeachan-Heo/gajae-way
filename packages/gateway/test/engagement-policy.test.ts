@@ -56,9 +56,9 @@ test("mention allowlist gates group mention commands and DMs but never open chan
 	// DMs are authorised like anything else: allowlisted in, stranger out.
 	const dm = { platform: "discord", kind: "dm", conversationId: "d1", peerId: "p" };
 	expect(decideEngagement(dm, stranger, base as never).engaged).toBe(false);
-	expect(
-		decideEngagement(dm, { mentioned: false, group: false, authorId: "owner-1" }, base as never).engaged,
-	).toBe(true);
+	expect(decideEngagement(dm, { mentioned: false, group: false, authorId: "owner-1" }, base as never).engaged).toBe(
+		true,
+	);
 });
 
 test("bot authors never get the open-channel free pass; a bot mention still engages", () => {
