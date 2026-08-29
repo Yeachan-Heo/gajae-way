@@ -5,22 +5,30 @@ import { join } from "node:path";
 import type { DiscordInboundMessage } from "../src/main";
 import { decideInbound, LruSet, ReconnectingGateway } from "../src/main";
 import {
+	classifyRecoveryFailure,
 	loadRecoveryCursors,
-	pruneRecoveryCursors,
+	RECOVERY_DEAD_LETTER_CAP,
 	RECOVERY_MAX_ATTEMPTS,
 	RECOVERY_MAX_PAGES,
 	RECOVERY_PAGE_LIMIT,
+	RECOVERY_RETRY_BASE_MS,
 	type RecoverableChannel,
 	type RecoveryCursorState,
 	RecoveryGate,
 	recoverConversation,
 	recoveryCursorPath,
+	retainRecoveryCursors,
 	saveRecoveryCursors,
 	snowflakeFromTimestamp,
 	snowflakeIsAfter,
 } from "../src/recovery";
 
 const bot = { id: "bot-9" };
+
+/** Full cursor-store state from just its watermarks. */
+function cursorState(recoveredThrough: Record<string, string>): RecoveryCursorState {
+	return { recoveredThrough, quarantined: {}, deadLetters: [] };
+}
 
 function message(id: string, overrides: Partial<DiscordInboundMessage> = {}): DiscordInboundMessage {
 	return {
@@ -97,13 +105,13 @@ test("cursor path lives under the adapter home", () => {
 
 test("cursor store round-trips and ignores malformed state", async () => {
 	const path = recoveryCursorPath(home);
-	expect(await loadRecoveryCursors(join(home, "missing.json"))).toEqual({ recoveredThrough: {} });
-	await saveRecoveryCursors(path, { recoveredThrough: { "channel-1": "1000", bad: "x" } } as RecoveryCursorState);
+	expect(await loadRecoveryCursors(join(home, "missing.json"))).toEqual(cursorState({}));
+	await saveRecoveryCursors(path, cursorState({ "channel-1": "1000", bad: "x" }));
 	const state = await loadRecoveryCursors(path);
 	expect(state.recoveredThrough["channel-1"]).toBe("1000");
 	expect(state.recoveredThrough.bad).toBeUndefined();
 	await writeFile(path, "not json{", "utf8");
-	expect(await loadRecoveryCursors(path)).toEqual({ recoveredThrough: {} });
+	expect(await loadRecoveryCursors(path)).toEqual(cursorState({}));
 });
 
 test("snowflake ordering and bootstrap cursor are time-correct", () => {
@@ -226,7 +234,7 @@ test("gateway rejection is retried inside the pass and then persisted once", asy
 	// one watermark. A reconnect afterwards has nothing left to replay.
 	expect(requests).toEqual(["chat.send", "chat.send"]);
 	await settle();
-	expect(await loadRecoveryCursors(cursorPath)).toEqual({ recoveredThrough: { "channel-1": inbound.id } });
+	expect(await loadRecoveryCursors(cursorPath)).toEqual(cursorState({ "channel-1": inbound.id }));
 	const secondGateway = wiredGateway(fakeChannel([inbound]), client, cursorPath);
 	await secondGateway.recoverMissedMessages();
 	await secondGateway.recoverMissedMessages();
@@ -344,9 +352,9 @@ test("bootstrap lookback bounds the first-run gap to 24h", async () => {
 
 test("cursor file survives an interrupted persist without truncation", async () => {
 	const path = join(home, "atomic", "recovery-cursor.json");
-	await saveRecoveryCursors(path, { recoveredThrough: { c: "777" } });
+	await saveRecoveryCursors(path, cursorState({ c: "777" }));
 	expect(await readFile(path, "utf8")).toContain("777");
-	expect(await loadRecoveryCursors(path)).toEqual({ recoveredThrough: { c: "777" } });
+	expect(await loadRecoveryCursors(path)).toEqual(cursorState({ c: "777" }));
 });
 
 /** Fake gateway client + one fake Discord channel behind a real ReconnectingGateway. */
@@ -355,6 +363,7 @@ function wiredGateway(
 	client: { request: (verb: string, params?: unknown) => Promise<unknown> },
 	cursorPath: string,
 	channels: Record<string, Record<string, never>> = { "channel-1": {} },
+	getBotUser: () => unknown = () => bot,
 ): ReconnectingGateway {
 	return new ReconnectingGateway(
 		"socket",
@@ -363,15 +372,15 @@ function wiredGateway(
 		undefined,
 		undefined,
 		cursorPath,
-		() => bot,
+		getBotUser,
 		{ ...client, onChatMessage: () => () => {} } as never,
 		async () => {},
 	);
 }
 
 /** Lets the fire-and-forget cursor persist chain settle. */
-function settle(): Promise<void> {
-	return new Promise((resolve) => setTimeout(resolve, 10));
+function settle(ms = 10): Promise<void> {
+	return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 const channelOrigin = { platform: "discord", kind: "channel", conversationId: "channel-1" } as const;
@@ -416,14 +425,20 @@ test("live sends never advance the recovery watermark past an unrecovered gap", 
 	expect((await loadRecoveryCursors(cursorPath)).recoveredThrough["channel-1"]).toBe(missedSecond.id);
 });
 
-test("watermarks are pruned to recoverable channels and threads/DMs are never persisted", async () => {
-	expect(
-		pruneRecoveryCursors({ recoveredThrough: { "channel-1": "10", "thread-7": "20", "dm-3": "30" } }, ["channel-1"]),
-	).toEqual({ recoveredThrough: { "channel-1": "10" } });
+test("unrecoverable watermarks are quarantined, bounded, and never deleted", async () => {
+	const retained = retainRecoveryCursors(cursorState({ "channel-1": "10", "thread-7": "20", "dm-3": "30" }), [
+		"channel-1",
+	]);
+	expect(retained.recoveredThrough).toEqual({ "channel-1": "10" });
+	expect(retained.quarantined).toEqual({ "thread-7": "20", "dm-3": "30" });
+	// Bounded: oldest quarantined insertions are pruned once the cap is exceeded.
+	const many = cursorState(Object.fromEntries(Array.from({ length: 5 }, (_, i) => [`thread-${i}`, `${i + 1}`])));
+	const capped = retainRecoveryCursors(many, [], 2);
+	expect(Object.keys(capped.quarantined)).toEqual(["thread-3", "thread-4"]);
 	const cursorPath = join(home, "prune", "recovery-cursor.json");
 	const inbound = message(snowflakeFromTimestamp(Date.now() - 60_000));
-	// Boundary: a stale thread key already on disk is dropped by the next recovery save.
-	await saveRecoveryCursors(cursorPath, { recoveredThrough: { "thread-7": "1", "channel-1": "2" } });
+	// Boundary: a thread key already on disk moves to quarantine, not into recoveredThrough.
+	await saveRecoveryCursors(cursorPath, cursorState({ "thread-7": "1", "channel-1": "2" }));
 	const gateway = wiredGateway(fakeChannel([inbound]), { request: async () => ({}) }, cursorPath);
 	await gateway.requestInbound(
 		snowflakeFromTimestamp(Date.now()),
@@ -433,7 +448,10 @@ test("watermarks are pruned to recoverable channels and threads/DMs are never pe
 	);
 	await gateway.recoverMissedMessages();
 	await settle();
-	expect((await loadRecoveryCursors(cursorPath)).recoveredThrough).toEqual({ "channel-1": inbound.id });
+	const state = await loadRecoveryCursors(cursorPath);
+	expect(state.recoveredThrough).toEqual({ "channel-1": inbound.id });
+	// A live thread send never creates a key at all; the pre-existing thread key survives.
+	expect(state.quarantined).toEqual({ "thread-7": "1" });
 });
 
 test("skip-heavy gap keeps durable progress across the page bound", async () => {
@@ -454,23 +472,18 @@ test("skip-heavy gap keeps durable progress across the page bound", async () => 
 	expect((await loadRecoveryCursors(cursorPath)).recoveredThrough["channel-1"]).toBe(all[all.length - 1].id);
 });
 
-test("an always-failing message is skipped forward after its attempt budget", async () => {
+test("a terminal message is discarded after the attempt threshold and dead-lettered", async () => {
 	const cursorPath = join(home, "poison", "recovery-cursor.json");
 	const base = Date.now() - 60 * 60 * 1000;
 	const good = message(snowflakeFromTimestamp(base));
 	const poison = message(snowflakeFromTimestamp(base + 1_000));
 	const later = message(snowflakeFromTimestamp(base + 2_000));
 	const sends: string[] = [];
-	let probes = 0;
 	const client = {
-		request: async (verb: string, params?: unknown) => {
-			if (verb === "gateway.status") {
-				probes++;
-				return {};
-			}
+		request: async (_verb: string, params?: unknown) => {
 			const id = (params as { messageId: string }).messageId;
 			sends.push(id);
-			if (id === poison.id) throw new Error("permanently rejected");
+			if (id === poison.id) throw Object.assign(new Error("content exceeds limit"), { code: "payload_too_large" });
 			return {};
 		},
 	};
@@ -478,10 +491,20 @@ test("an always-failing message is skipped forward after its attempt budget", as
 	await gateway.recoverMissedMessages();
 	await settle();
 	expect(sends.filter((id) => id === poison.id)).toHaveLength(RECOVERY_MAX_ATTEMPTS);
-	expect(probes).toBe(1);
-	// Head-of-line block broken: the message after the poison one still gets delivered.
+	// Head-of-line block broken: the message after the discarded one still gets delivered.
 	expect(sends).toContain(later.id);
-	expect((await loadRecoveryCursors(cursorPath)).recoveredThrough["channel-1"]).toBe(later.id);
+	const state = await loadRecoveryCursors(cursorPath);
+	expect(state.recoveredThrough["channel-1"]).toBe(later.id);
+	expect(state.deadLetters).toHaveLength(1);
+	expect(state.deadLetters[0]).toMatchObject({
+		messageId: poison.id,
+		conversationId: "channel-1",
+		classification: "terminal-message",
+		attempts: RECOVERY_MAX_ATTEMPTS,
+	});
+	expect(state.deadLetters[0].summary).toContain("payload_too_large");
+	expect(Date.parse(state.deadLetters[0].at)).toBeGreaterThan(0);
+	expect(gateway.deadLetters).toHaveLength(1);
 });
 
 test("repeated-page bail logs the cursor as unchanged instead of claiming progress", async () => {
@@ -491,7 +514,7 @@ test("repeated-page bail logs the cursor as unchanged instead of claiming progre
 		message(snowflakeFromTimestamp(base + index * 10)),
 	);
 	const stuck = page[page.length - 1].id;
-	await saveRecoveryCursors(cursorPath, { recoveredThrough: { "channel-1": stuck } });
+	await saveRecoveryCursors(cursorPath, cursorState({ "channel-1": stuck }));
 	// A channel that ignores `after` returns the same full page forever.
 	const channel: RecoverableChannel = { messages: { fetch: async () => page } };
 	const errors: string[] = [];
@@ -517,4 +540,115 @@ test("an unreadable cursor store fails recovery closed and stays observable", as
 	await gateway.recoverMissedMessages();
 	expect(channel.fetches).toHaveLength(0);
 	expect(gateway.cursorFault).toContain("EISDIR");
+});
+
+/** Fails every chat.send with `error`, recording the ids it was asked to send. */
+function failingClient(error: unknown, sends: string[]) {
+	return {
+		request: async (verb: string, params?: unknown) => {
+			if (verb !== "chat.send") return {};
+			sends.push((params as { messageId: string }).messageId);
+			throw error;
+		},
+	};
+}
+
+test("failure classification never guesses in favour of discarding", () => {
+	expect(classifyRecoveryFailure(Object.assign(new Error("nope"), { code: "payload_too_large" }))).toBe(
+		"terminal-message",
+	);
+	expect(classifyRecoveryFailure(new Error("chat.send: message too long for this platform"))).toBe("terminal-message");
+	expect(classifyRecoveryFailure(Object.assign(new Error("reset"), { code: "ECONNRESET" }))).toBe("retryable");
+	expect(classifyRecoveryFailure(new Error("request timed out after 5000ms"))).toBe("retryable");
+	expect(classifyRecoveryFailure(new Error("SQLITE_BUSY: database is locked"))).toBe("retryable");
+	expect(classifyRecoveryFailure(Object.assign(new Error("boom"), { code: "verb_failed" }))).toBe("write-path-unknown");
+	expect(classifyRecoveryFailure(new Error("gateway said no"))).toBe("write-path-unknown");
+});
+
+test("a transient failure outlasting the in-pass budget neither advances nor discards", async () => {
+	const cursorPath = join(home, "transient", "recovery-cursor.json");
+	const inbound = message(snowflakeFromTimestamp(Date.now() - 60 * 60 * 1000));
+	const sends: string[] = [];
+	const client = failingClient(Object.assign(new Error("connection reset"), { code: "ECONNRESET" }), sends);
+	const gateway = wiredGateway(fakeChannel([inbound]), client, cursorPath);
+	await gateway.recoverMissedMessages();
+	await settle();
+	expect(sends).toHaveLength(RECOVERY_MAX_ATTEMPTS);
+	const state = await loadRecoveryCursors(cursorPath);
+	// The cursor may record the bootstrap floor it scanned from, but never the failed message.
+	expect(BigInt(state.recoveredThrough["channel-1"] ?? "0") < BigInt(inbound.id)).toBe(true);
+	expect(state.deadLetters).toEqual([]);
+	expect(gateway.recoveryRetryPending).toBe(true);
+});
+
+test("an unclassifiable failure never advances the cursor and is never dead-lettered", async () => {
+	const cursorPath = join(home, "unknown-class", "recovery-cursor.json");
+	const inbound = message(snowflakeFromTimestamp(Date.now() - 60 * 60 * 1000));
+	const sends: string[] = [];
+	const client = failingClient(Object.assign(new Error("write path did something"), { code: "verb_failed" }), sends);
+	const gateway = wiredGateway(fakeChannel([inbound]), client, cursorPath);
+	await gateway.recoverMissedMessages();
+	await settle();
+	expect(sends).toHaveLength(RECOVERY_MAX_ATTEMPTS);
+	const state = await loadRecoveryCursors(cursorPath);
+	expect(BigInt(state.recoveredThrough["channel-1"] ?? "0") < BigInt(inbound.id)).toBe(true);
+	expect(state.deadLetters).toEqual([]);
+});
+
+test("a scheduled retry that cannot proceed reschedules itself", async () => {
+	const cursorPath = join(home, "reschedule", "recovery-cursor.json");
+	const channel = fakeChannel([message(snowflakeFromTimestamp(Date.now() - 60_000))]);
+	let botUser: unknown;
+	const gateway = wiredGateway(channel, { request: async () => ({}) }, cursorPath, { "channel-1": {} }, () => botUser);
+	await gateway.recoverMissedMessages();
+	expect(channel.fetches).toHaveLength(0);
+	expect(gateway.recoveryRetryPending).toBe(true);
+	// Discord becomes ready: the armed retry resumes the pass instead of evaporating.
+	botUser = bot;
+	await new Promise((resolve) => setTimeout(resolve, RECOVERY_RETRY_BASE_MS + 200));
+	expect(channel.fetches.length).toBeGreaterThan(0);
+});
+
+test("a channel dropped from config and re-added resumes from its quarantined watermark", async () => {
+	const cursorPath = join(home, "readd", "recovery-cursor.json");
+	const base = Date.now() - 60 * 60 * 1000;
+	const first = message(snowflakeFromTimestamp(base));
+	const second = message(snowflakeFromTimestamp(base + 1_000));
+	const client = { request: async () => ({}) };
+	await wiredGateway(fakeChannel([first]), client, cursorPath).recoverMissedMessages();
+	await settle();
+	// Config edit: channel-1 is gone, so its watermark is quarantined on the next save.
+	await wiredGateway(fakeChannel([first]), client, cursorPath, { "channel-2": {} }).recoverMissedMessages();
+	await settle();
+	expect((await loadRecoveryCursors(cursorPath)).quarantined["channel-1"]).toBe(first.id);
+	// Re-added: recovery resumes after the retained watermark, not from the 24h bootstrap.
+	const channel = fakeChannel([first, second]);
+	await wiredGateway(channel, client, cursorPath).recoverMissedMessages();
+	await settle();
+	expect(channel.fetches[0].after).toBe(first.id);
+	expect((await loadRecoveryCursors(cursorPath)).recoveredThrough["channel-1"]).toBe(second.id);
+});
+
+test("the dead-letter store respects its cap and drops the oldest record", async () => {
+	const cursorPath = join(home, "dead-letter-cap", "recovery-cursor.json");
+	const base = Date.now() - 6 * 60 * 60 * 1000;
+	const all = Array.from({ length: RECOVERY_DEAD_LETTER_CAP + 3 }, (_, index) =>
+		message(snowflakeFromTimestamp(base + index * 10)),
+	);
+	const client = {
+		request: async (_verb: string, params?: unknown) => {
+			throw Object.assign(new Error(`rejected ${(params as { messageId: string }).messageId}`), {
+				code: "invalid_params",
+			});
+		},
+	};
+	const gateway = wiredGateway(fakeChannel(all), client, cursorPath);
+	await gateway.recoverMissedMessages();
+	expect(gateway.deadLetters).toHaveLength(RECOVERY_DEAD_LETTER_CAP);
+	// One serialized persist per discard: give the chain room to drain before reading.
+	await settle(500);
+	const state = await loadRecoveryCursors(cursorPath);
+	expect(state.deadLetters).toHaveLength(RECOVERY_DEAD_LETTER_CAP);
+	expect(state.deadLetters[0].messageId).toBe(all[3].id);
+	expect(state.deadLetters[RECOVERY_DEAD_LETTER_CAP - 1].messageId).toBe(all[all.length - 1].id);
 });
