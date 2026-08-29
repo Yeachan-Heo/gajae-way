@@ -20,9 +20,9 @@ import {
 	settleDiscordReaction,
 } from "./reactions";
 import {
+	classifyRecoveryFailure,
 	recoveryCursorPath as defaultRecoveryCursorPath,
 	loadRecoveryCursors,
-	pruneRecoveryCursors,
 	RECOVERY_ATTEMPT_BACKOFF_MS,
 	RECOVERY_MAX_ATTEMPTS,
 	RECOVERY_MAX_PAGES,
@@ -30,10 +30,15 @@ import {
 	RECOVERY_RETRY_MAX_MS,
 	type RecoverableChannel,
 	type RecoveryCursorState,
+	type RecoveryDeadLetter,
+	type RecoveryFailureClass,
 	RecoveryGate,
+	recordDeadLetter,
 	recoverConversation,
+	retainRecoveryCursors,
 	saveRecoveryCursors,
 	snowflakeIsAfter,
+	summarizeRecoveryFailure,
 } from "./recovery";
 import { type ReplyMessageLike, resolveReplyContext } from "./reply";
 
@@ -581,6 +586,11 @@ export async function handleSlashCommand(
 	}
 }
 
+/** Outcome of one recovery send; every failure carries its classification. */
+export type RecoveredSendResult =
+	| { readonly verdict: "acked" | "duplicate" }
+	| { readonly verdict: "unavailable"; readonly failure: RecoveryFailureClass; readonly summary: string };
+
 export class ReconnectingGateway {
 	#client: GajaewayClient | undefined;
 	#reconnecting = false;
@@ -635,11 +645,23 @@ export class ReconnectingGateway {
 	 * safe alongside live traffic because the gateway durably dedupes on message id.
 	 */
 	async recoverMissedMessages(): Promise<void> {
-		if (this.#recovering || !this.#client) return;
-		const botUser = this.getBotUser();
-		if (!botUser) return;
 		const channelIds = Object.keys(this.config.channels ?? {});
+		// Nothing configured means nothing to recover, ever: that is the one early return
+		// that must not reschedule.
 		if (channelIds.length === 0) return;
+		if (this.#recovering) {
+			// A pass is already running and owns the follow-up decision for its own outcome;
+			// this caller still gets a retry so its trigger is not silently dropped.
+			this.scheduleRecoveryRetry();
+			return;
+		}
+		const botUser = this.getBotUser();
+		if (!this.#client || !botUser) {
+			// A fired retry that cannot proceed (no gateway link yet, Discord not ready) must
+			// reschedule itself, otherwise the gap waits for a reconnect that may never come.
+			this.scheduleRecoveryRetry();
+			return;
+		}
 		this.#recovering = true;
 		let incomplete = false;
 		try {
@@ -668,6 +690,16 @@ export class ReconnectingGateway {
 		return this.#cursorFault;
 	}
 
+	/** Durable discard log, newest last; bounded by RECOVERY_DEAD_LETTER_CAP. */
+	get deadLetters(): readonly RecoveryDeadLetter[] {
+		return this.#cursors?.deadLetters ?? [];
+	}
+
+	/** True while a backoff retry of the recovery pass is armed. */
+	get recoveryRetryPending(): boolean {
+		return this.#retryTimer !== undefined;
+	}
+
 	/** True when the gap for this channel is still open and a retry is scheduled. */
 	private async recoverChannel(channelId: string, botUser: unknown): Promise<boolean> {
 		let fetched: unknown;
@@ -680,7 +712,10 @@ export class ReconnectingGateway {
 			return true;
 		}
 		if (!isRecoverableChannel(fetched)) return false;
-		const before = this.#cursors?.recoveredThrough[channelId];
+		const cursors = this.#cursors;
+		// A quarantined watermark (channel previously dropped from config) counts: resuming
+		// from it beats replaying the whole bootstrap window on re-add.
+		const before = cursors?.recoveredThrough[channelId] ?? cursors?.quarantined[channelId];
 		const outcome = await recoverConversation(fetched, {
 			cursor: before,
 			nowMs: Date.now(),
@@ -690,24 +725,49 @@ export class ReconnectingGateway {
 				const engagement = decideInbound(message, botUser, this.config.channels);
 				if (!engagement) return "skip";
 				const origin = discordMessageOrigin(message);
+				let failure: RecoveryFailureClass = "write-path-unknown";
+				let summary = "unclassified chat.send failure";
+				let terminalStreak = 0;
 				for (let attempt = 1; attempt <= RECOVERY_MAX_ATTEMPTS; attempt++) {
-					const verdict = await this.requestRecovered(message.id, origin, message.content, engagement);
-					if (verdict !== "unavailable") return verdict;
+					const result = await this.requestRecovered(message.id, origin, message.content, engagement);
+					if (result.verdict !== "unavailable") return result.verdict;
+					failure = result.failure;
+					summary = result.summary;
+					if (failure === "terminal-message") terminalStreak++;
 					if (attempt < RECOVERY_MAX_ATTEMPTS) await this.sleep(RECOVERY_ATTEMPT_BACKOFF_MS * 2 ** (attempt - 1));
 				}
-				// Out of budget. A responsive gateway means this one message is poison, not the
-				// link: skip it forward (loudly) so the rest of the gap still drains. An
-				// unresponsive gateway is an outage — leave the gap intact and retry later.
-				if (!(await this.gatewayResponsive())) return "unavailable";
+				// Out of per-pass budget. Discard is allowed ONLY when every attempt failed
+				// terminally for this exact message; a transient failure or anything we could
+				// not confidently classify leaves the gap intact (the cursor stays behind this
+				// message) and is retried by the scheduled pass.
+				if (terminalStreak < RECOVERY_MAX_ATTEMPTS) {
+					console.error(
+						`Discord recovery holding message ${message.id} in channel ${channelId} after ${RECOVERY_MAX_ATTEMPTS} failed chat.send attempts (${failure}: ${summary}); cursor stays behind it and the pass retries with backoff.`,
+					);
+					return "unavailable";
+				}
 				console.error(
-					`Discord recovery is SKIPPING poison message ${message.id} in channel ${channelId} after ${RECOVERY_MAX_ATTEMPTS} failed chat.send attempts; that message is dropped, the rest of the backfill continues.`,
+					`Discord recovery is DISCARDING message ${message.id} in channel ${channelId}: ${RECOVERY_MAX_ATTEMPTS} terminal chat.send rejections (${summary}). Dead-lettered; the rest of the backfill continues.`,
 				);
+				this.deadLetter({
+					messageId: message.id,
+					conversationId: channelId,
+					classification: "terminal-message",
+					attempts: RECOVERY_MAX_ATTEMPTS,
+					at: new Date().toISOString(),
+					summary,
+				});
 				return "skip";
 			},
 		});
 		// Durable progress is everything the run walked past — acked sends, known duplicates
-		// and deliberate skips alike. Anything narrower strands the gap behind a page bound
-		// full of skipped messages.
+		// and dead-lettered discards alike. Anything narrower strands the gap behind a page
+		// bound full of skipped messages.
+		//
+		// NIT (accepted): this runs once per pass, so a crash mid-pass loses the in-pass
+		// window and the next pass re-sends it. Exactly-once there rests on the gateway's
+		// durable message-id dedupe (inbound_messages/conversation_context), not on this
+		// watermark; per-message persistence would cost one fsync per replayed message.
 		this.advanceRecovered(channelId, outcome.advancedTo);
 		if (outcome.failed) {
 			console.error(
@@ -747,19 +807,13 @@ export class ReconnectingGateway {
 	}
 
 	/**
-	 * Liveness probe that tells a poison message apart from a gateway outage: a message that
-	 * keeps failing while `gateway.status` answers is the message's fault, not the link's.
+	 * Durably records a discarded message before the cursor moves past it. Console lines are
+	 * lost on restart; this record is what makes a discard auditable and replayable by hand.
 	 */
-	private async gatewayResponsive(): Promise<boolean> {
-		const client = this.#client;
-		if (!client) return false;
-		try {
-			await client.request("gateway.status");
-			return true;
-		} catch {
-			this.scheduleReconnect();
-			return false;
-		}
+	private deadLetter(entry: RecoveryDeadLetter): void {
+		const current = this.#cursors;
+		if (!current) return;
+		this.persist(recordDeadLetter(current, entry));
 	}
 
 	private ensureCursors(): Promise<void> {
@@ -781,19 +835,25 @@ export class ReconnectingGateway {
 	/**
 	 * Records recovery progress for a conversation and persists it (serialized,
 	 * fire-and-forget). Only completed recovery progress lands here — live sends must never
-	 * push this watermark past a gap they did not backfill (issue #33). Keys outside the
-	 * configured channels are pruned on save: recovery never iterates threads/DMs, so their
-	 * ids would only grow the file forever.
+	 * push this watermark past a gap they did not backfill (issue #33). Watermarks for
+	 * conversations recovery does not iterate (threads/DMs, channels dropped from config)
+	 * are moved to the bounded `quarantined` section rather than deleted.
 	 */
 	private advanceRecovered(conversationId: string, messageId: string): void {
 		const current = this.#cursors;
 		if (!current) return;
-		const existing = current.recoveredThrough[conversationId];
+		const existing = current.recoveredThrough[conversationId] ?? current.quarantined[conversationId];
 		if (existing !== undefined && !snowflakeIsAfter(messageId, existing)) return;
-		const next = pruneRecoveryCursors(
-			{ recoveredThrough: { ...current.recoveredThrough, [conversationId]: messageId } },
-			Object.keys(this.config.channels ?? {}),
+		this.persist(
+			retainRecoveryCursors(
+				{ ...current, recoveredThrough: { ...current.recoveredThrough, [conversationId]: messageId } },
+				Object.keys(this.config.channels ?? {}),
+			),
 		);
+	}
+
+	/** Serialized, fire-and-forget cursor-store write; a failed persist only widens the gap. */
+	private persist(next: RecoveryCursorState): void {
 		this.#cursors = next;
 		this.#cursorSaves = this.#cursorSaves
 			.then(() => saveRecoveryCursors(this.recoveryCursorPath, next))
@@ -865,26 +925,40 @@ export class ReconnectingGateway {
 	 * gateway acknowledged ("acked"), the message was already known ("duplicate"), or the
 	 * send must be retried later ("unavailable" — the recovery watermark does not advance).
 	 *
-	 * A rejected send does NOT tear the link down: the caller retries within its attempt
-	 * budget and then probes `gateway.status`, which is what distinguishes one poison
-	 * message from a dead gateway.
+	 * Every failure carries a classification, because that is the only thing allowed to
+	 * decide whether a message may ever be discarded. An attempt that merely joined another
+	 * in-flight send reports `write-path-unknown`, the safe default.
 	 */
 	async requestRecovered(
 		messageId: string,
 		origin: OriginRef,
 		text: string,
 		engagement: EngagementContext,
-	): Promise<"acked" | "duplicate" | "unavailable"> {
-		return this.#inbound.join(messageId, async () => {
+	): Promise<RecoveredSendResult> {
+		let failure: RecoveryFailureClass | undefined;
+		let summary: string | undefined;
+		const verdict = await this.#inbound.join(messageId, async () => {
 			const client = this.#client;
-			if (!client) return "unavailable";
+			if (!client) {
+				failure = "retryable";
+				summary = "gateway link not connected";
+				return "unavailable";
+			}
 			try {
 				await client.request("chat.send", { origin, text, engagement, messageId });
 				return "acked";
-			} catch {
+			} catch (error) {
+				failure = classifyRecoveryFailure(error);
+				summary = summarizeRecoveryFailure(error);
 				return "unavailable";
 			}
 		});
+		if (verdict !== "unavailable") return { verdict };
+		return {
+			verdict,
+			failure: failure ?? "write-path-unknown",
+			summary: summary ?? "unclassified chat.send failure",
+		};
 	}
 
 	private monitor(client: GajaewayClient): void {
