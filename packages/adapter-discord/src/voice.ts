@@ -66,7 +66,7 @@ export async function transcribeVoiceMessage(
 	url: string,
 	config: VoiceTranscriptionConfig,
 	ports: TranscriptionPorts,
-): Promise<string | undefined> {
+): Promise<TranscriptResult | undefined> {
 	const timeoutMs = config.timeoutMs ?? DEFAULT_TIMEOUT_MS;
 	try {
 		const audio = await withTimeout(timeoutMs, (signal) => ports.fetch(url, { signal }));
@@ -103,30 +103,104 @@ export async function transcribeVoiceMessage(
 }
 
 /**
- * Reads the transcript out of a Scribe response.
+ * Non-speech audio events, which Scribe reports as a bracketed tag instead of
+ * words: `[mumbling]`, `[노크 소리]`, `(laughs)`, `[BLANK_AUDIO]`.
+ *
+ * These describe the recording; they are not things the speaker said, and the
+ * wording is the transcriber's rather than the speaker's. Passing one through as
+ * a transcript attributes it to the author — a knock on a desk would enter the
+ * permanent history as the owner having said "[노크 소리]".
+ *
+ * Dropping it silently is equally wrong: "this clip contains no speech" is a
+ * real fact about the message, and the persona needs it to decide whether to
+ * respond, ask, or ignore. So it is neither attributed nor discarded — it is
+ * reported as what it is.
+ *
+ * Matched structurally rather than by keyword, because the tag vocabulary is the
+ * provider's and is localized: any transcript consisting only of bracketed or
+ * parenthesized runs is an event report, not speech.
+ */
+const NON_SPEECH_TAG = /^(?:\s*(?:\[[^\]]*\]|\([^)]*\)))+\s*$/;
+
+/**
+ * What a transcription attempt actually produced.
+ *
+ * Three outcomes rather than `string | undefined`, because "the speaker said X",
+ * "the clip held no speech" and "transcription did not happen" are different
+ * facts and the persona acts differently on each. Collapsing the middle case
+ * into either neighbour is what made the first version of this wrong.
+ */
+export type TranscriptResult =
+	| { readonly kind: "speech"; readonly text: string }
+	| {
+			readonly kind: "non-speech";
+			/** The transcriber's own description, tags stripped: `mumbling`, `노크 소리`. */
+			readonly label: string;
+			readonly language?: string;
+			readonly languageProbability?: number;
+	  };
+
+/**
+ * Reads the transcription outcome out of a Scribe response.
  *
  * Kept separate and exported because the shape is the one part of this module a
  * provider change would break, and a unit test on it is worth more than a mock
- * of the whole call.
+ * of the whole call. Returns undefined only when there is no usable answer at
+ * all — a malformed payload, or silence, which the attachment line already
+ * conveys on its own.
  */
-export function readTranscript(payload: unknown): string | undefined {
+export function readTranscript(payload: unknown): TranscriptResult | undefined {
 	if (typeof payload !== "object" || payload === null) return undefined;
-	const text = (payload as { text?: unknown }).text;
-	if (typeof text !== "string") return undefined;
-	const trimmed = text.trim();
-	return trimmed === "" ? undefined : trimmed;
+	const record = payload as { text?: unknown; language_code?: unknown; language_probability?: unknown };
+	if (typeof record.text !== "string") return undefined;
+	const trimmed = record.text.trim();
+	if (trimmed === "") return undefined;
+	if (!NON_SPEECH_TAG.test(trimmed)) return { kind: "speech", text: trimmed };
+	return {
+		kind: "non-speech",
+		label: stripTags(trimmed),
+		// Detection confidence is the diagnostic that matters here: a non-speech
+		// result at p=0.27 means auto-detection gave up, which is actionable in a
+		// way that the same result at p=1.0 is not.
+		...(typeof record.language_code === "string" ? { language: record.language_code } : {}),
+		...(typeof record.language_probability === "number" ? { languageProbability: record.language_probability } : {}),
+	};
+}
+
+/** Unwraps `[a] (b)` to `a, b` so the label reads as prose inside our own brackets. */
+function stripTags(tagged: string): string {
+	const labels = [...tagged.matchAll(/\[([^\]]*)\]|\(([^)]*)\)/g)]
+		.map((match) => (match[1] ?? match[2] ?? "").trim())
+		.filter((label) => label !== "");
+	return labels.length > 0 ? labels.join(", ") : tagged;
 }
 
 /**
- * Appends a transcript to an inbound body.
+ * Appends the transcription outcome to an inbound body.
  *
- * The transcript goes after the attachment line so the body reads
- * "here is the thing, here is what it said", and the url stays first because it
- * is the original and the transcript is a derivative.
+ * Speech is appended bare, as the speaker's words. A non-speech result is
+ * appended in the adapter's own bracketed style, the same shape as the
+ * attachment line above it, so it reads unambiguously as the runtime reporting
+ * on the recording rather than as anything the author said.
  */
-export function withTranscript(body: string, transcript: string | undefined): string {
-	if (!transcript) return body;
-	return body === "" ? transcript : `${body}\n${transcript}`;
+export function withTranscript(body: string, result: TranscriptResult | undefined): string {
+	const line = renderTranscript(result);
+	if (line === undefined) return body;
+	return body === "" ? line : `${body}\n${line}`;
+}
+
+/** The body line for a transcription outcome, or undefined when there is none. */
+export function renderTranscript(result: TranscriptResult | undefined): string | undefined {
+	if (!result) return undefined;
+	if (result.kind === "speech") return result.text;
+	const parts = ["no speech", result.label];
+	if (result.language !== undefined && result.languageProbability !== undefined)
+		parts.push(`detected ${result.language} p=${round2(result.languageProbability)}`);
+	return `[${parts.join(" · ")}]`;
+}
+
+function round2(value: number): number {
+	return Math.round(value * 100) / 100;
 }
 
 /** Rejects rather than hanging a turn on a third party that stopped answering. */

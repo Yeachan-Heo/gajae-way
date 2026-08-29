@@ -1,7 +1,7 @@
 import { expect, test } from "bun:test";
 import { firstVoiceMessage } from "../src/attachments";
 import { OrderedIngress, transcribeIfVoice } from "../src/main";
-import { readTranscript, transcribeVoiceMessage, withTranscript } from "../src/voice";
+import { readTranscript, renderTranscript, transcribeVoiceMessage, withTranscript } from "../src/voice";
 
 const KEY = { apiKey: "test-key" };
 const URL = "https://cdn.discordapp.com/attachments/1/2/voice-message.ogg?ex=abc";
@@ -29,9 +29,9 @@ function stubFetch(responses: Array<Response | Error>) {
 
 const audio = () => new Response(new Uint8Array([1, 2, 3, 4]), { status: 200 });
 
-test("readTranscript takes the text and rejects everything that is not a transcript", () => {
-	expect(readTranscript({ text: "안녕하세요" })).toBe("안녕하세요");
-	expect(readTranscript({ text: "  padded  " })).toBe("padded");
+test("readTranscript reports speech as speech and rejects everything unusable", () => {
+	expect(readTranscript({ text: "안녕하세요" })).toEqual({ kind: "speech", text: "안녕하세요" });
+	expect(readTranscript({ text: "  padded  " })).toEqual({ kind: "speech", text: "padded" });
 	// Silence transcribes to an empty string, which would render as a blank line.
 	expect(readTranscript({ text: "" })).toBeUndefined();
 	expect(readTranscript({ text: "   " })).toBeUndefined();
@@ -41,18 +41,82 @@ test("readTranscript takes the text and rejects everything that is not a transcr
 	expect(readTranscript("nope")).toBeUndefined();
 });
 
-test("withTranscript puts the transcript after the attachment line and leaves the url first", () => {
-	expect(withTranscript("[voice message · 3.2s · url]", "안녕")).toBe("[voice message · 3.2s · url]\n안녕");
+// A real 2.4s owner message contained a desk knock and no speech. Auto-detect
+// guessed Serbo-Croatian at p=0.266 and returned "[mumbling]"; pinned to Korean
+// the same clip returned "[노크 소리]". Passed through as a transcript, either one
+// would enter the permanent history as something the owner had said. Dropped, the
+// fact that the clip held no speech would be lost — so it is reported as its own
+// outcome instead of being folded into either neighbour.
+test("a non-speech event becomes its own outcome, never speech", () => {
+	expect(readTranscript({ text: "[mumbling]" })).toMatchObject({ kind: "non-speech", label: "mumbling" });
+	expect(readTranscript({ text: "[노크 소리]" })).toMatchObject({ kind: "non-speech", label: "노크 소리" });
+	expect(readTranscript({ text: "[BLANK_AUDIO]" })).toMatchObject({ kind: "non-speech", label: "BLANK_AUDIO" });
+	expect(readTranscript({ text: "(laughs)" })).toMatchObject({ kind: "non-speech", label: "laughs" });
+	expect(readTranscript({ text: "  [mumbling]  " })).toMatchObject({ kind: "non-speech", label: "mumbling" });
+	// Several events and nothing else is still no speech.
+	expect(readTranscript({ text: "[noise] [노크 소리]" })).toMatchObject({
+		kind: "non-speech",
+		label: "noise, 노크 소리",
+	});
+	expect(readTranscript({ text: "(coughs)[silence]" })).toMatchObject({
+		kind: "non-speech",
+		label: "coughs, silence",
+	});
 });
 
-test("withTranscript leaves the body untouched when there is no transcript", () => {
+// The confidence is the actionable part: a non-speech result at p=0.27 means
+// auto-detection gave up, which reads differently from the same result at p=1.0.
+test("detection language and confidence ride along on a non-speech outcome", () => {
+	expect(readTranscript({ text: "[mumbling]", language_code: "sh", language_probability: 0.266 })).toEqual({
+		kind: "non-speech",
+		label: "mumbling",
+		language: "sh",
+		languageProbability: 0.266,
+	});
+});
+
+test("speech is kept even when the transcriber annotates an event alongside it", () => {
+	// The words are real here, so demoting the whole transcript would lose them.
+	expect(readTranscript({ text: "[noise] 형님 테스트입니다" })).toEqual({
+		kind: "speech",
+		text: "[noise] 형님 테스트입니다",
+	});
+	expect(readTranscript({ text: "안녕하세요 (laughs)" })).toEqual({ kind: "speech", text: "안녕하세요 (laughs)" });
+});
+
+test("ordinary speech containing brackets is not mistaken for an event tag", () => {
+	expect(readTranscript({ text: "대괄호 [main] 브랜치 말이야" })).toMatchObject({ kind: "speech" });
+	expect(readTranscript({ text: "[REPLY:123] 이거 봐" })).toMatchObject({ kind: "speech" });
+});
+
+test("speech is appended bare, as the speaker's own words", () => {
+	expect(withTranscript("[voice message · 3.2s · url]", { kind: "speech", text: "안녕" })).toBe(
+		"[voice message · 3.2s · url]\n안녕",
+	);
+});
+
+// The adapter's own bracketed style is what distinguishes a runtime observation
+// from an utterance: it matches the attachment line directly above it.
+test("a non-speech outcome is reported in the adapter's bracket style, not as an utterance", () => {
+	expect(renderTranscript({ kind: "non-speech", label: "노크 소리" })).toBe("[no speech · 노크 소리]");
+	expect(renderTranscript({ kind: "non-speech", label: "mumbling", language: "sh", languageProbability: 0.266 })).toBe(
+		"[no speech · mumbling · detected sh p=0.27]",
+	);
+	expect(withTranscript("[voice message · 2.4s · url]", { kind: "non-speech", label: "노크 소리" })).toBe(
+		"[voice message · 2.4s · url]\n[no speech · 노크 소리]",
+	);
+});
+
+test("withTranscript leaves the body untouched when there is no outcome at all", () => {
 	expect(withTranscript("[voice message · 3.2s · url]", undefined)).toBe("[voice message · 3.2s · url]");
-	expect(withTranscript("[voice message · 3.2s · url]", "")).toBe("[voice message · 3.2s · url]");
 });
 
 test("a voice message is fetched and transcribed", async () => {
 	const { fetch, calls } = stubFetch([audio(), Response.json({ text: "웨이가재 보이스 테스트" })]);
-	expect(await transcribeVoiceMessage(URL, KEY, { fetch })).toBe("웨이가재 보이스 테스트");
+	expect(await transcribeVoiceMessage(URL, KEY, { fetch })).toEqual({
+		kind: "speech",
+		text: "웨이가재 보이스 테스트",
+	});
 	expect(calls[0]?.url).toBe(URL);
 	expect(calls[1]?.url).toBe("https://api.elevenlabs.io/v1/speech-to-text");
 	expect((calls[1]?.init?.headers as Record<string, string>)["xi-api-key"]).toBe("test-key");
@@ -128,7 +192,10 @@ test("a voice attachment with no url is skipped rather than fetched as undefined
 
 test("a configured voice message is transcribed end to end", async () => {
 	const { fetch } = stubFetch([audio(), Response.json({ text: "잘하자 가재야" })]);
-	expect(await transcribeIfVoice({ attachments: [VOICE] }, KEY, { fetch })).toBe("잘하자 가재야");
+	expect(await transcribeIfVoice({ attachments: [VOICE] }, KEY, { fetch })).toEqual({
+		kind: "speech",
+		text: "잘하자 가재야",
+	});
 });
 
 // Ingress became asynchronous, so ordering is now this adapter's problem: the
