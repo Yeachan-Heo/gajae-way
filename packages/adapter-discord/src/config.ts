@@ -31,7 +31,13 @@ export interface DiscordVoiceConfig {
 	readonly speechModel?: string;
 	readonly speechEndpoint?: string;
 	readonly outputFormat?: string;
-	/** Spoken length cap. Text always ships in full; the voice is a courtesy. */
+	/**
+	 * Optional spoken length cap. Unset means the whole reply is spoken.
+	 *
+	 * Capping was tried and reverted: a listener cannot read the remainder out of
+	 * the text, so a truncated utterance is a truncated answer for the only
+	 * person the audio exists for.
+	 */
 	readonly maxSpokenChars?: number;
 	readonly speechTimeoutMs?: number;
 }

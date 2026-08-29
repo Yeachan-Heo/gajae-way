@@ -26,11 +26,14 @@ const DEFAULT_VOICE_ID = "pNInz6obpgDQGcFmaJgB";
 const DEFAULT_MODEL = "eleven_multilingual_v2";
 const DEFAULT_TTS_ENDPOINT = "https://api.elevenlabs.io/v1/text-to-speech";
 /**
- * Spoken length cap. Text is always complete; the voice is a convenience, and
- * reading a long report aloud burns character quota that cannot even be
- * inspected (the key's scope excludes `user_read`).
+ * No spoken length cap by default (owner decision, 2026-08-29).
+ *
+ * A cap was the wrong instinct: someone listening instead of reading cannot go
+ * fetch the rest from the text, so truncating the audio truncates the answer for
+ * exactly the person the audio is for. Quota is the cheaper thing to spend.
+ * `voice.maxSpokenChars` still exists for a deployment that wants a bound.
  */
-const DEFAULT_MAX_SPOKEN_CHARS = 600;
+const DEFAULT_MAX_SPOKEN_CHARS = Number.POSITIVE_INFINITY;
 const DEFAULT_TIMEOUT_MS = 30_000;
 /** Opus in Ogg is always timestamped at 48 kHz regardless of the input rate. */
 const OPUS_GRANULE_RATE = 48_000;

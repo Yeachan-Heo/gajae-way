@@ -200,3 +200,23 @@ test("markup-heavy input does not backtrack pathologically", () => {
 	speakable("```" + "a".repeat(20_000));
 	expect(Date.now() - start).toBeLessThan(1_000);
 });
+
+// Owner decision, 2026-08-29: no cap by default. A listener cannot read the
+// remainder out of the text message, so truncating the audio truncates the
+// answer for exactly the person the audio exists for.
+test("a long reply is spoken in full when no cap is configured", () => {
+	const body = "가".repeat(5_000);
+	expect(speakable(body)).toHaveLength(5_000);
+});
+
+test("an explicitly configured cap still applies", () => {
+	expect(speakable("가".repeat(5_000), 100)).toHaveLength(100);
+});
+
+test("synthesis sends the whole reply when uncapped", async () => {
+	const { fetch, calls } = stubFetch([new Response(oggWithGranule(48_000), { status: 200 })]);
+	const long = `${"긴 보고입니다. ".repeat(200)}끝`;
+	await synthesizeVoice(long, KEY, { fetch });
+	expect(JSON.parse(String(calls[0]?.init?.body)).text).toBe(speakable(long));
+	expect(JSON.parse(String(calls[0]?.init?.body)).text.length).toBeGreaterThan(600);
+});
