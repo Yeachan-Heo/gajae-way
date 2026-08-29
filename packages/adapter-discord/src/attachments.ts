@@ -63,6 +63,18 @@ export function isVoiceMessageAttachment(attachment: AttachmentLike): boolean {
 }
 
 /**
+ * The voice message on a message, when there is one.
+ *
+ * Discord's own client sends a voice message alone, and the API rejects mixing
+ * one with other attachments, so the first match is the only match in practice —
+ * but a hostile or future payload could carry several, and transcribing all of
+ * them would multiply a third-party call by an attacker-chosen factor.
+ */
+export function firstVoiceMessage(message: AttachmentCarrier): AttachmentLike | undefined {
+	return collectAttachments(message).find(isVoiceMessageAttachment);
+}
+
+/**
  * Renders one attachment as a single bracketed line.
  *
  * The kind label comes first so the persona can dispatch on it without parsing
