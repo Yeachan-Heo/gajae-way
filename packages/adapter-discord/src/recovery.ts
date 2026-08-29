@@ -344,8 +344,14 @@ export function retainRecoveryCursors(
 
 /**
  * Records one failed send attempt for `messageId`, accumulating across passes so an
- * alternating terminal/transient failure still reaches the discard threshold. Bounded by
- * `cap`, lowest `seq` pruned first.
+ * alternating terminal/transient failure still reaches the discard threshold.
+ *
+ * Cap eviction never resets an ACTIVE entry: the message just recorded, each conversation's
+ * head-of-line blocker (its numerically lowest message id, the one recovery keeps retrying)
+ * and each conversation's most recent entry are protected. Only inactive entries are evicted,
+ * lowest `seq` first, because dropping an active entry would silently reset the very counts
+ * that let a blocked channel eventually drain. If every entry is active the ledger is left
+ * over its cap and the overflow is logged loudly instead.
  */
 export function recordAttempt(
 	state: RecoveryCursorState,
@@ -367,9 +373,41 @@ export function recordAttempt(
 			summary,
 		},
 	};
-	const ledger = Object.entries(attempts).sort((a, b) => a[1].seq - b[1].seq);
-	for (const [id] of ledger.slice(0, Math.max(0, ledger.length - cap))) delete attempts[id];
+	let overflow = Object.keys(attempts).length - cap;
+	if (overflow > 0) {
+		const active = activeLedgerIds(attempts, messageId);
+		const evictable = Object.entries(attempts)
+			.filter(([id]) => !active.has(id))
+			.sort((a, b) => a[1].seq - b[1].seq);
+		for (const [id] of evictable) {
+			if (overflow <= 0) break;
+			delete attempts[id];
+			overflow--;
+		}
+		if (overflow > 0) {
+			console.error(
+				`Discord recovery attempt ledger is ${overflow} entry(s) over its ${cap}-entry cap with every entry still active; keeping them rather than resetting a blocked message's attempt counts.`,
+			);
+		}
+	}
 	return { ...state, attempts, sequence };
+}
+
+/** Ledger ids that must survive cap eviction: the current one, plus per-conversation
+ * head-of-line and most-recent entries. */
+function activeLedgerIds(attempts: Record<string, RecoveryAttemptRecord>, current: string): Set<string> {
+	const active = new Set<string>([current]);
+	const headOfLine = new Map<string, string>();
+	const newest = new Map<string, { id: string; seq: number }>();
+	for (const [id, entry] of Object.entries(attempts)) {
+		const head = headOfLine.get(entry.conversationId);
+		if (head === undefined || snowflakeIsAfter(head, id)) headOfLine.set(entry.conversationId, id);
+		const latest = newest.get(entry.conversationId);
+		if (latest === undefined || entry.seq > latest.seq) newest.set(entry.conversationId, { id, seq: entry.seq });
+	}
+	for (const id of headOfLine.values()) active.add(id);
+	for (const entry of newest.values()) active.add(entry.id);
+	return active;
 }
 
 /** Drops the attempt ledger entry for a message that finally landed (or was discarded). */
@@ -521,10 +559,14 @@ export interface RecoverableChannel {
 /**
  * Per-message delivery verdict handed back by the caller's send path.
  *
+ * - `acked`: a chat.send just landed. This is the ONLY write-path evidence recovery accepts.
+ * - `duplicate`: some earlier attempt already covered this id — a previous pass, or just the
+ *   in-process RecoveryGate acked cache. It says nothing about the write path right now and
+ *   can never justify a discard.
  * - `skip`: nothing to send (no engagement, empty content); the cursor advances.
  * - `discard-candidate`: this message burned its terminal-failure budget and looks
- *   message-specific. It is NOT discarded here: the cursor is held until a later message in
- *   the same pass succeeds, which is the only proof the failure is not uniform.
+ *   message-specific. It is NOT discarded here: it is held until a fresh `acked` lands later
+ *   in the same pass, which is the only proof the failure is not uniform.
  */
 export type RecoveryDelivery = "acked" | "duplicate" | "unavailable" | "skip" | "discard-candidate";
 
@@ -534,9 +576,9 @@ export interface RecoveryOutcome {
 	readonly delivered: number;
 	/** Messages the run walked past without a send (empty content or caller `skip`). */
 	readonly skipped: number;
-	/** Discards committed this run (candidate + a later success proving non-uniformity). */
+	/** Discards committed this run (candidate + a later FRESH acked in the same pass). */
 	readonly discarded: number;
-	/** Candidates still held at the end of the run: nothing was discarded or advanced past. */
+	/** Distinct candidates still held at the end of the run: not discarded, not advanced past. */
 	readonly held: number;
 	/** True when the gap exceeded the page bound; older messages may remain unrecovered. */
 	readonly truncated: boolean;
@@ -581,15 +623,17 @@ export async function recoverConversation(
 	let delivered = 0;
 	let skipped = 0;
 	let discarded = 0;
-	// Candidates whose discard is not yet justified. They sit between the cursor and the
-	// message being delivered, so nothing advances past them until one later message lands.
-	let held: DiscordInboundMessage[] = [];
+	// Candidates whose discard is not yet justified, keyed by message id so a refetched page
+	// can neither inflate the uniform-failure limit nor fire onDiscard twice for one id. They
+	// sit between the cursor and the message being delivered, so nothing advances past them
+	// until a FRESH acked send lands later in this same pass.
+	const held = new Map<string, DiscordInboundMessage>();
 	const commitHeld = (): void => {
-		for (const candidate of held) {
+		for (const candidate of held.values()) {
 			options.onDiscard?.(candidate);
 			discarded++;
 		}
-		held = [];
+		held.clear();
 	};
 	for (let page = 0; page < maxPages; page++) {
 		let fetched: Awaited<ReturnType<RecoverableChannel["messages"]["fetch"]>>;
@@ -601,7 +645,7 @@ export async function recoverConversation(
 				delivered,
 				skipped,
 				discarded,
-				held: held.length,
+				held: held.size,
 				truncated: false,
 				failed: true,
 				fetchError: error instanceof Error ? error.message : String(error),
@@ -618,7 +662,7 @@ export async function recoverConversation(
 		if (rawBatch.length >= pageLimit && batch.length === 0) {
 			// A broken/repeated page must not spin until the bound while pretending to
 			// make progress. Leave the cursor unchanged so the next reconnect retries it.
-			return { advancedTo: cursor, delivered, skipped, discarded, held: held.length, truncated: true, failed: false };
+			return { advancedTo: cursor, delivered, skipped, discarded, held: held.size, truncated: true, failed: false };
 		}
 		batch.sort((a, b) => {
 			const ai = BigInt(a.id);
@@ -631,49 +675,57 @@ export async function recoverConversation(
 				delivered,
 				skipped,
 				discarded,
-				held: held.length,
+				held: held.size,
 				truncated: false,
-				failed: held.length > 0,
+				failed: held.size > 0,
 			};
 		}
 		for (const message of batch) {
 			if (skipEmpty && message.content.trim() === "") {
 				// Thread starters / system entries carry no text: skip without a send. This is
 				// not delivery evidence, so it cannot justify a held discard: keep holding.
-				if (held.length === 0) cursor = message.id;
+				if (held.size === 0) cursor = message.id;
 				skipped++;
 				continue;
 			}
 			const verdict = await options.deliver(message);
 			if (verdict === "unavailable") {
-				return { advancedTo: cursor, delivered, skipped, discarded, held: held.length, truncated: false, failed: true };
+				return { advancedTo: cursor, delivered, skipped, discarded, held: held.size, truncated: false, failed: true };
 			}
 			if (verdict === "discard-candidate") {
-				held.push(message);
-				if (held.length >= uniformLimit) {
-					// Same-looking terminal failure on `uniformLimit` consecutive distinct ids:
-					// that is a write-path problem, not a payload problem. Discard nothing.
+				held.set(message.id, message);
+				if (held.size >= uniformLimit) {
+					// The same terminal-looking failure on `uniformLimit` DISTINCT ids with no
+					// fresh ack in between: that is a write-path problem, not a payload problem.
+					// Drop the held candidates without discarding and leave the cursor alone.
 					return {
 						advancedTo: cursor,
 						delivered,
 						skipped,
 						discarded,
-						held: held.length,
+						held: held.size,
 						truncated: false,
 						failed: true,
 					};
 				}
 				continue;
 			}
-			if (verdict === "skip") {
-				// Nothing was sent, so this is not evidence the write path works: a held
-				// candidate stays held and the cursor stays behind it.
-				if (held.length === 0) cursor = message.id;
-				skipped++;
+			if (verdict === "skip" || verdict === "duplicate") {
+				// Neither is proof that the write path works right now. `skip` sent nothing at
+				// all, and `duplicate` only says some earlier attempt — possibly in a previous
+				// pass, possibly just the in-process gate's acked cache — already covered this
+				// id. Held candidates keep being held and the cursor stays behind them.
+				if (held.size === 0) cursor = message.id;
+				if (verdict === "duplicate") delivered++;
+				else skipped++;
 				continue;
 			}
-			// A message actually landed: the write path works, so the held candidates really
-			// are message-specific. Commit their discards and advance past all of them.
+			// A fresh chat.send just returned acked, in this pass, after the held candidates
+			// failed. That is the only accepted evidence that the write path works, so those
+			// candidates really are message-specific: commit their discards and advance.
+			// This id is never discarded on the strength of its own ack: a refetched page can
+			// put an id in `held` and then land it on a later attempt.
+			held.delete(message.id);
 			commitHeld();
 			cursor = message.id;
 			delivered++;
@@ -684,11 +736,11 @@ export async function recoverConversation(
 				delivered,
 				skipped,
 				discarded,
-				held: held.length,
+				held: held.size,
 				truncated: false,
-				failed: held.length > 0,
+				failed: held.size > 0,
 			};
 		}
 	}
-	return { advancedTo: cursor, delivered, skipped, discarded, held: held.length, truncated: true, failed: false };
+	return { advancedTo: cursor, delivered, skipped, discarded, held: held.size, truncated: true, failed: held.size > 0 };
 }
