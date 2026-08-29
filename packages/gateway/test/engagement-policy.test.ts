@@ -11,9 +11,11 @@ const config: GatewayConfig = {
 	logVerbosity: "info",
 };
 const engagement = { mentioned: false, group: true, authorId: "author" };
-test("DMs and loopback engage while unmentioned groups decline", () => {
+test("loopback engages while unmentioned groups and unauthorised DMs decline", () => {
+	// A DM from nobody in particular is no longer a free turn: with no owner and
+	// no allowlist configured, the DM path fails closed.
 	expect(decideEngagement({ platform: "discord", kind: "dm", conversationId: "dm" }, undefined, config)).toEqual({
-		engaged: true,
+		engaged: false,
 	});
 	expect(
 		decideEngagement({ platform: "loopback", kind: "loopback", conversationId: "loopback" }, undefined, config),
@@ -31,7 +33,7 @@ test("per-channel open override engages group messages", () => {
 	).toEqual({ engaged: true });
 });
 
-test("mention allowlist gates group mention commands but never open channels or DMs", () => {
+test("mention allowlist gates group mention commands and DMs but never open channels", () => {
 	const base = {
 		schemaVersion: 1 as const,
 		home: "/tmp/x",
@@ -51,9 +53,12 @@ test("mention allowlist gates group mention commands but never open channels or 
 	expect(
 		decideEngagement(channel, { mentioned: false, group: true, authorId: "intruder-9" }, open as never).engaged,
 	).toBe(true);
-	// DMs engage regardless: the DM peer is the conversation itself.
+	// DMs are authorised like anything else: allowlisted in, stranger out.
 	const dm = { platform: "discord", kind: "dm", conversationId: "d1", peerId: "p" };
-	expect(decideEngagement(dm, stranger, base as never).engaged).toBe(true);
+	expect(decideEngagement(dm, stranger, base as never).engaged).toBe(false);
+	expect(
+		decideEngagement(dm, { mentioned: false, group: false, authorId: "owner-1" }, base as never).engaged,
+	).toBe(true);
 });
 
 test("bot authors never get the open-channel free pass; a bot mention still engages", () => {
