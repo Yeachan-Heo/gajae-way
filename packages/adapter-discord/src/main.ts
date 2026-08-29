@@ -731,11 +731,19 @@ export class ReconnectingGateway {
 			fetched = await this.discord.channels.fetch(channelId);
 		} catch (error) {
 			console.error(
-				`Discord recovery could not fetch channel ${channelId}: ${error instanceof Error ? error.message : String(error)}`,
+				`Discord recovery could not fetch channel ${channelId}: ${error instanceof Error ? error.message : String(error)}; cursor unchanged, retrying with backoff.`,
 			);
 			return true;
 		}
-		if (!isRecoverableChannel(fetched)) return false;
+		if (!isRecoverableChannel(fetched)) {
+			// Deleted channel, revoked permission, or a non-text channel id in config: the gap
+			// for this channel is unknown, not empty. Never treat that as a clean pass — leave
+			// the cursor where it is and let the retry (and the operator) see it.
+			console.error(
+				`Discord recovery has no readable history for channel ${channelId} (deleted, no access, or not a text channel); cursor unchanged, retrying with backoff.`,
+			);
+			return true;
+		}
 		const cursors = this.#cursors;
 		// A quarantined watermark (channel previously dropped from config) counts: resuming
 		// from it beats replaying the whole bootstrap window on re-add.
