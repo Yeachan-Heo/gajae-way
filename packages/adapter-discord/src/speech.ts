@@ -74,6 +74,11 @@ export function speakable(text: string, maxChars: number = DEFAULT_MAX_SPOKEN_CH
 	const stripped = text
 		// Fenced code first: its contents must not survive as loose lines.
 		.replace(/```[\s\S]*?```/g, " ")
+		// An UNTERMINATED fence runs to the end. Without this the leftover ``` fell
+		// through to the inline-code rule below, which consumed two of the three
+		// backticks and left one to be spoken, while the code itself was read aloud
+		// and billed.
+		.replace(/```[\s\S]*$/, " ")
 		.replace(/`([^`]*)`/g, "$1")
 		// A markdown link keeps its label and loses its target.
 		.replace(/\[([^\]]*)\]\((?:[^)]*)\)/g, "$1")
@@ -86,9 +91,24 @@ export function speakable(text: string, maxChars: number = DEFAULT_MAX_SPOKEN_CH
 	if (stripped.length <= maxChars) return stripped;
 	// Cut on a sentence boundary when one is near the cap, so the voice does not
 	// stop mid-word. The text message carries the remainder either way.
-	const window = stripped.slice(0, maxChars);
+	const window = cutToCodePoint(stripped, maxChars);
 	const boundary = Math.max(window.lastIndexOf(". "), window.lastIndexOf("? "), window.lastIndexOf("다. "));
 	return (boundary > maxChars * 0.6 ? window.slice(0, boundary + 1) : window).trim();
+}
+
+/**
+ * Slices to at most `limit` UTF-16 units without splitting a surrogate pair.
+ *
+ * A bare `slice` can cut between the halves of an astral character and leave a
+ * lone surrogate, which is not valid text to hand a provider — and the cap lands
+ * at an arbitrary offset by definition, so it will eventually happen.
+ */
+function cutToCodePoint(text: string, limit: number): string {
+	if (text.length <= limit) return text;
+	const code = text.charCodeAt(limit - 1);
+	// A high surrogate at the boundary means its pair is the character being cut.
+	const end = code >= 0xd800 && code <= 0xdbff ? limit - 1 : limit;
+	return text.slice(0, end);
 }
 
 /**

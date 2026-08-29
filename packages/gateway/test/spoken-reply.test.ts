@@ -24,3 +24,20 @@ test("an empty reply stays empty so nothing is synthesized", () => {
 	expect(spokenReply([], true)).toBe("");
 	expect(spokenReply(["   "], true)).toBe("");
 });
+
+// Regression: the voice-carrying delivery used to be picked with
+// `part === parts[parts.length - 1]`, a VALUE comparison. Two identical parts
+// matched it both times, so the reply was spoken twice — billed twice and
+// talking over itself. The selection is indexed now; this pins the shape of the
+// data that broke it.
+test("identical reply parts are still two distinct deliveries", () => {
+	const parts = ["같은 말", "같은 말"];
+	const valueMatches = parts.filter((part) => part === parts[parts.length - 1]).length;
+	expect(valueMatches).toBe(2);
+	const indexMatches = parts.filter((_, index) => index === parts.length - 1).length;
+	expect(indexMatches).toBe(1);
+});
+
+test("the spoken form of duplicated parts still contains both, spoken once", () => {
+	expect(spokenReply(["같은 말", "같은 말"], true)).toBe("같은 말\n\n같은 말");
+});

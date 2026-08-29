@@ -170,3 +170,33 @@ test("speech-side settings are carried through under their own names", () => {
 test("no voice config means no speech ports, so voiceText is simply ignored", () => {
 	expect(discordSpeechPorts(undefined)).toBeUndefined();
 });
+
+// An unterminated fence used to fall through to the inline-code rule, which ate
+// two of the three backticks and left one to be spoken — while the code itself
+// was read aloud and billed.
+test("an unterminated code fence is removed to the end, leaving no stray backtick", () => {
+	expect(speakable("앞\n```\ncode here\n뒤")).toBe("앞");
+	expect(speakable("```\nbun test\n 1157 pass")).toBe("");
+});
+
+test("closed fences are still removed and surrounding prose survives", () => {
+	expect(speakable("A\n```\nx\n```\nB\n```\ny\n```\nC")).toBe("A\nB\nC");
+});
+
+// The cap lands at an arbitrary offset, so it will eventually fall between the
+// halves of an astral character. A lone surrogate is not valid text to send.
+test("the cap never leaves a lone surrogate", () => {
+	const body = `${"가".repeat(19)}𝄞${"나".repeat(50)}`;
+	for (let limit = 15; limit <= 25; limit++) {
+		const spoken = speakable(body, limit);
+		const last = spoken.charCodeAt(spoken.length - 1);
+		expect(last >= 0xd800 && last <= 0xdbff).toBe(false);
+	}
+});
+
+test("markup-heavy input does not backtrack pathologically", () => {
+	const start = Date.now();
+	speakable("*".repeat(5_000) + "끝");
+	speakable("```" + "a".repeat(20_000));
+	expect(Date.now() - start).toBeLessThan(1_000);
+});
