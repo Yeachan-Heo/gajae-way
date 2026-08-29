@@ -3,7 +3,18 @@ import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { OpsCycleResult } from "@gajaeway/protocol";
-import { cycleExitCode, main, parseArgs, renderCycle, restoreDatabase, socketPath } from "../src/main";
+import {
+	CLI_USAGE,
+	COMMANDS,
+	cycleExitCode,
+	main,
+	parseArgs,
+	renderCycle,
+	restoreDatabase,
+	socketPath,
+	USAGE_EXIT_CODE,
+	usageFor,
+} from "../src/main";
 
 describe("cli arguments", () => {
 	test("resolves home and socket override", () => {
@@ -173,4 +184,52 @@ describe("cycle rendering", () => {
 		])
 			expect(cycleExitCode(cycleResult({ gates: [gate as OpsCycleResult["gates"][number]] }))).toBe(1);
 	});
+});
+describe("usage guard", () => {
+	test("an empty argv is a usage error, not a dispatchable command", () => {
+		expect(usageFor(undefined)).toBe(CLI_USAGE);
+		expect(parseArgs([]).command).toBeUndefined();
+		expect(usageFor(parseArgs([]).command)).toBe(CLI_USAGE);
+	});
+
+	test("an unknown subcommand is a usage error", () => {
+		for (const command of ["bogus", "--help", "-h", "status-ish", ""]) expect(usageFor(command)).toBe(CLI_USAGE);
+	});
+
+	test("every dispatchable command passes the guard", () => {
+		for (const command of COMMANDS) expect(usageFor(command)).toBeUndefined();
+	});
+
+	test("a socket override alone still resolves to no command", () => {
+		expect(usageFor(parseArgs(["--socket", "/tmp/x"]).command)).toBe(CLI_USAGE);
+	});
+});
+
+describe("usage exits the process instead of blocking", () => {
+	async function run(args: string[]): Promise<{ code: number; stderr: string; stdout: string }> {
+		const child = Bun.spawn(["bun", join(import.meta.dir, "../src/main.ts"), ...args], {
+			stdout: "pipe",
+			stderr: "pipe",
+			env: { ...process.env, GAJAEWAY_HOME: join(tmpdir(), "gajaeway-cli-usage-nonexistent") },
+		});
+		const [stdout, stderr, code] = await Promise.all([
+			new Response(child.stdout).text(),
+			new Response(child.stderr).text(),
+			child.exited,
+		]);
+		return { code, stderr, stdout };
+	}
+
+	test("no arguments prints usage on stderr and exits non-zero", async () => {
+		const result = await run([]);
+		expect(result.code).toBe(USAGE_EXIT_CODE);
+		expect(result.stderr).toContain(CLI_USAGE);
+		expect(result.stdout).toBe("");
+	}, 30_000);
+
+	test("an unknown subcommand prints usage on stderr and exits non-zero", async () => {
+		const result = await run(["bogus"]);
+		expect(result.code).toBe(USAGE_EXIT_CODE);
+		expect(result.stderr).toContain(CLI_USAGE);
+	}, 30_000);
 });

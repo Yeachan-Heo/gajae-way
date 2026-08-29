@@ -9,6 +9,7 @@
 
 import { GajaewayClient } from "@gajaeway/sdk";
 import { jsonlAuditLog } from "./audit";
+import { ADMIN_USAGE, USAGE_EXIT_CODE, usageFor } from "./cli";
 import { startAdminServer } from "./server";
 
 function gajaewayHome(): string {
@@ -27,6 +28,13 @@ function adminPort(): number {
 		throw new Error(`GAJAEWAY_ADMIN_PORT must be a port number, got ${JSON.stringify(raw)}`);
 	}
 	return port;
+}
+
+// Before the socket connect and the port bind: an argv the binary cannot serve
+// must fail here, not after it has taken a gateway connection or a port.
+if (usageFor(process.argv.slice(2)) !== undefined) {
+	console.error(ADMIN_USAGE);
+	process.exit(USAGE_EXIT_CODE);
 }
 
 const socket = socketPath();

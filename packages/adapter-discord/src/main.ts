@@ -8,6 +8,7 @@ import type {
 } from "@gajaeway/protocol";
 import { GajaewayClient } from "@gajaeway/sdk";
 import { AttachmentBuilder, Client, GatewayIntentBits, MessageFlags, Partials } from "discord.js";
+import pkg from "../package.json";
 import { type AttachmentCarrier, describeInboundBody, firstVoiceMessage } from "./attachments";
 import { type AuthorLike, resolveDisplayName } from "./author";
 import {
@@ -16,6 +17,7 @@ import {
 	type LoadedDiscordVoiceConfig,
 	loadDiscordAdapterConfig,
 } from "./config";
+import { AdapterAlreadyRunningError, AdapterLock } from "./lock";
 import { type DiscordMessageOriginShape, discordMessageOrigin } from "./origin";
 import {
 	type DiscordInboundReaction,
@@ -1317,11 +1319,58 @@ function isRecoverableChannel(value: unknown): value is RecoverableChannel {
 		typeof (value as { messages?: { fetch?: unknown } }).messages?.fetch === "function"
 	);
 }
+export const DISCORD_USAGE = [
+	"usage: gajaeway-discord [--help] [--version]",
+	"",
+	"Runs the Discord adapter in the foreground. Configuration is read from",
+	"$GAJAEWAY_HOME/adapter-discord.json; one instance at a time per home.",
+].join("\n");
+
+/** Usage errors exit 2, as `gajaeway-gateway` does; 1 stays a runtime failure. */
+export const USAGE_EXIT_CODE = 2;
+
+export type DiscordArgv =
+	| { readonly kind: "run" }
+	| { readonly kind: "help" }
+	| { readonly kind: "version" }
+	| { readonly kind: "usage"; readonly message: string };
+
+/**
+ * Resolved before any connection work. `--help` used to boot a real adapter,
+ * which meant that merely asking what the binary does opened a second Discord
+ * session alongside the resident one.
+ */
+export function parseDiscordArgs(args: readonly string[]): DiscordArgv {
+	if (args.length === 0) return { kind: "run" };
+	if (args.length === 1 && (args[0] === "--help" || args[0] === "-h")) return { kind: "help" };
+	if (args.length === 1 && (args[0] === "--version" || args[0] === "-v")) return { kind: "version" };
+	return { kind: "usage", message: `gajaeway-discord: unexpected argument ${args[0]}\n${DISCORD_USAGE}` };
+}
+
 if (import.meta.main) {
-	loadDiscordAdapterConfig()
-		.then(startDiscordAdapter)
-		.catch((error) => {
-			console.error(error instanceof Error ? error.message : String(error));
-			process.exitCode = 1;
-		});
+	const argv = parseDiscordArgs(process.argv.slice(2));
+	if (argv.kind === "help") {
+		console.log(DISCORD_USAGE);
+	} else if (argv.kind === "version") {
+		console.log(pkg.version);
+	} else if (argv.kind === "usage") {
+		console.error(argv.message);
+		process.exit(USAGE_EXIT_CODE);
+	} else {
+		// The lock is taken before the config is even read: refusing early keeps a
+		// stray start from touching the resident instance's gateway session.
+		AdapterLock.acquire(adapterHome())
+			.then(async (lock) => {
+				// Registering a signal handler suppresses the default terminate, so
+				// the lock is dropped and the exit is then performed by hand.
+				const release = (): void => void lock.release().finally(() => process.exit(0));
+				process.once("SIGINT", release);
+				process.once("SIGTERM", release);
+				await startDiscordAdapter(await loadDiscordAdapterConfig());
+			})
+			.catch((error) => {
+				console.error(error instanceof Error ? error.message : String(error));
+				process.exitCode = error instanceof AdapterAlreadyRunningError ? USAGE_EXIT_CODE : 1;
+			});
+	}
 }
