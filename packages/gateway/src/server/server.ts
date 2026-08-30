@@ -58,6 +58,7 @@ import type { GatewayDatabase, InboundMessageRow, MonitorEventStage } from "../s
 import { DeliveryLedger } from "../store/ledger";
 import { InterimSpeechGate, type InterimSpeechLimits } from "./interim-speech";
 import { KeyedQueue } from "./keyed-queue";
+import { applyModelCommand } from "./model-command";
 import { composeSpeakerLabel, composeTurnHeader } from "./speaker";
 
 /**
@@ -1111,6 +1112,47 @@ async function sendChat(
 		throw new ProtocolError("invalid_params", "chat.send requires a valid origin");
 	}
 	const key = originKey(origin);
+	// #20: `/model` reads or rewrites this conversation's model selection. It
+	// shares the command authorisation of `/new` below: in a group surface a
+	// non-allowlisted member must not repoint the persona at another model.
+	if (userText === "/model" || userText.startsWith("/model ")) {
+		if (!commandAuthorised(origin, runtime.config.mentionAllowlist, params.engagement)) {
+			connection.write({
+				v: PROFILE_VERSION,
+				type: "response",
+				id: request.id,
+				result: { turnId: null, engaged: false },
+			});
+			return;
+		}
+		const outcome = applyModelCommand(userText, key, origin, options.database, runtime.config.model);
+		if (outcome.resetSession) resetConversationSession(key, origin, options, runtime);
+		const payload = {
+			turnId: crypto.randomUUID(),
+			origin,
+			role: "assistant" as const,
+			text: outcome.text,
+			final: true,
+		};
+		connection.write({
+			v: PROFILE_VERSION,
+			type: "response",
+			id: request.id,
+			result: { turnId: payload.turnId, engaged: true },
+		});
+		if (origin.platform === "loopback")
+			connection.write({ v: PROFILE_VERSION, type: "event", event: "chat.message", id: request.id, payload });
+		else {
+			const delivery = runtime.delivery.prepare(payload.turnId, origin, payload.text);
+			if (delivery) {
+				runtime.delivery.markInflight(delivery.deliveryId as string);
+				for (const recipient of runtime.connections)
+					if (recipient.negotiated)
+						recipient.write({ v: PROFILE_VERSION, type: "event", event: "chat.message", payload: delivery });
+			}
+		}
+		return;
+	}
 	if (params.text === "/new" || params.text === "/reset") {
 		// Session resets are commands: in group surfaces they obey the mention
 		// allowlist, or any room member could wipe the persona's conversation state.
@@ -1131,18 +1173,7 @@ async function sendChat(
 			});
 			return;
 		}
-		const floorAt = new Date().toISOString();
-		let discardedInbound: string[] = [];
-		options.database.withTransaction(() => {
-			options.database.bumpEpoch(key, JSON.stringify(origin));
-			options.database.contextSetFloor(key, floorAt);
-			discardedInbound = options.database.inboundDiscardBefore(key, floorAt);
-		});
-		for (const messageId of discardedInbound) runtime.inbound.delete(messageId);
-		// An explicit reset is the manual form of a rebind, so it also restores the
-		// automatic rebind budget: otherwise an origin that spent its cap would stay
-		// capped even after the operator did exactly what the notice asked for.
-		options.gjc.forgetRebinds(key);
+		resetConversationSession(key, origin, options, runtime);
 		const payload = {
 			turnId: crypto.randomUUID(),
 			origin,
@@ -1597,8 +1628,12 @@ async function runInboundTurn(
 		// on that fresh session must use the rebound epoch rather than a stale ID.
 		const boundEpoch = options.database.getSessionRecord(key)?.epoch ?? requestedEpoch;
 		const preamble = await preambleForEpoch(boundEpoch);
+		// #20: a per-conversation model override beats the gateway-wide config for
+		// this spawn. A corrupt stored row reads as undefined and we fall back.
+		const modelOverride = options.database.conversationModelGet(key)?.selection;
 		const result = await options.gjc.sendTurn(sessionId, turnText, preamble, emitProgress, {
 			systemPreambleForEpoch: preambleForEpoch,
+			...(modelOverride ? { model: modelOverride } : {}),
 			onAssistantText: (message, toolCallsSoFar) => {
 				try {
 					// Mid-work speech only (issue #71). The runtime's LAST streamed message
@@ -1814,4 +1849,52 @@ function currentConversationNotice(origin: OriginRef, engagement?: { mentioned?:
 function writeError(connection: Connection, error: unknown, id?: string): void {
 	const protocol = error instanceof ProtocolError ? error : new ProtocolError("verb_failed", "gateway request failed");
 	connection.write({ v: PROFILE_VERSION, type: "error", ...(id ? { id } : {}), error: protocol.toPayload() });
+}
+
+/**
+ * Command authorisation shared by `/new`, `/reset` and `/model`: in group
+ * surfaces a populated allowlist gates them, or any room member could wipe or
+ * repoint the persona's conversation state.
+ */
+function commandAuthorised(
+	origin: { readonly platform: string; readonly kind: string },
+	allowlist: readonly string[] | undefined,
+	engagement: unknown,
+): boolean {
+	if (origin.platform === "loopback" || origin.kind === "dm") return true;
+	if (!allowlist || allowlist.length === 0) return true;
+	const authorId = (engagement as { authorId?: unknown } | undefined)?.authorId;
+	return typeof authorId === "string" && allowlist.includes(authorId);
+}
+
+/**
+ * Drops this conversation's session: new epoch, context floor at now, queued
+ * inbound discarded. An explicit reset is the manual form of a rebind, so it
+ * also restores the automatic rebind budget - otherwise an origin that spent
+ * its cap would stay capped even after the operator did exactly what the
+ * notice asked for.
+ */
+function resetConversationSession(
+	key: string,
+	origin: unknown,
+	options: {
+		readonly database: {
+			withTransaction(fn: () => void): void;
+			bumpEpoch(key: string, originJson: string): unknown;
+			contextSetFloor(key: string, floorAt: string): unknown;
+			inboundDiscardBefore(key: string, floorAt: string): string[];
+		};
+		readonly gjc: { forgetRebinds(key: string): void };
+	},
+	runtime: { readonly inbound: { delete(messageId: string): unknown } },
+): void {
+	const floorAt = new Date().toISOString();
+	let discardedInbound: string[] = [];
+	options.database.withTransaction(() => {
+		options.database.bumpEpoch(key, JSON.stringify(origin));
+		options.database.contextSetFloor(key, floorAt);
+		discardedInbound = options.database.inboundDiscardBefore(key, floorAt);
+	});
+	for (const messageId of discardedInbound) runtime.inbound.delete(messageId);
+	options.gjc.forgetRebinds(key);
 }

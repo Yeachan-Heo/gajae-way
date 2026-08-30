@@ -2,6 +2,33 @@ import { Database } from "bun:sqlite";
 import { mkdir } from "node:fs/promises";
 import { dirname } from "node:path";
 
+/**
+ * A gjc model selection: either an explicit selector string or a model profile
+ * preset. Structurally identical to the config type; duplicated as a local
+ * shape so the store layer does not import the config module.
+ */
+export type GjcModelSelection = string | { readonly preset: string };
+
+export interface ConversationModelRecord {
+	readonly selection: GjcModelSelection;
+	readonly setBy?: string;
+	readonly updatedAt: string;
+}
+
+/**
+ * Validates a stored selection. Fails closed on anything unexpected: a bad row
+ * must not become argv for a gjc spawn.
+ */
+export function parseModelSelection(value: unknown): GjcModelSelection | undefined {
+	if (typeof value === "string") return value.trim() === "" ? undefined : value;
+	if (typeof value !== "object" || value === null) return undefined;
+	const keys = Object.keys(value);
+	if (keys.length !== 1 || keys[0] !== "preset") return undefined;
+	const preset = (value as { preset?: unknown }).preset;
+	if (typeof preset !== "string" || preset.trim() === "") return undefined;
+	return { preset };
+}
+
 export interface InboundMessageRow {
 	readonly message_id: string;
 	readonly origin_key: string;
@@ -11,7 +38,7 @@ export interface InboundMessageRow {
 	readonly received_at: string;
 }
 
-const LATEST_SCHEMA_VERSION = 15;
+const LATEST_SCHEMA_VERSION = 16;
 /** Maximum number of prior messages supplied to one engaged conversation turn. */
 export const CONVERSATION_DIFF_MAX_ROWS = 60;
 /** Maximum age of prior messages supplied to one engaged conversation turn. */
@@ -1758,6 +1785,68 @@ ALTER TABLE monitor_slots ADD COLUMN event_id TEXT;`,
 					.run(15, new Date().toISOString());
 			});
 		}
+		if (current < 16) {
+			this.withTransaction(() => {
+				// Issue #20: per-conversation model override. This lives beside session
+				// state rather than in config.json, because config is the owner's file
+				// (a slash command must not race their editor) and `model` is not a
+				// reloadable field, so a config write would not be read until restart.
+				this.#database.exec(
+					"CREATE TABLE IF NOT EXISTS conversation_model (origin_key TEXT PRIMARY KEY, selection_json TEXT NOT NULL, set_by TEXT, updated_at TEXT NOT NULL)",
+				);
+				this.#database
+					.query("INSERT INTO schema_migrations (version, applied_at) VALUES (?, ?)")
+					.run(16, new Date().toISOString());
+			});
+		}
+	}
+
+	// --- Issue #20: per-conversation model override -------------------------
+
+	/**
+	 * Reads a conversation's model override. Returns undefined when none is set
+	 * and, deliberately, also when the stored row fails to parse: a corrupt
+	 * override must degrade to the configured default rather than propagate a
+	 * malformed selector into a gjc spawn.
+	 */
+	conversationModelGet(originKey: string): ConversationModelRecord | undefined {
+		const row = this.#database
+			.query<{ selection_json: string; set_by: string | null; updated_at: string }, [string]>(
+				"SELECT selection_json, set_by, updated_at FROM conversation_model WHERE origin_key = ?",
+			)
+			.get(originKey);
+		if (!row) return undefined;
+		let selection: unknown;
+		try {
+			selection = JSON.parse(row.selection_json);
+		} catch {
+			return undefined;
+		}
+		const parsed = parseModelSelection(selection);
+		if (!parsed) return undefined;
+		return {
+			selection: parsed,
+			...(row.set_by === null ? {} : { setBy: row.set_by }),
+			updatedAt: row.updated_at,
+		};
+	}
+
+	/** Writes (or replaces) a conversation's model override. */
+	conversationModelSet(originKey: string, selection: GjcModelSelection, setBy?: string): void {
+		this.#database
+			.query(
+				"INSERT OR REPLACE INTO conversation_model (origin_key, selection_json, set_by, updated_at) VALUES (?, ?, ?, ?)",
+			)
+			.run(originKey, JSON.stringify(selection), setBy ?? null, new Date().toISOString());
+	}
+
+	/** Drops a conversation's override. Reports whether a row was actually removed. */
+	conversationModelClear(originKey: string): boolean {
+		const before = this.#database
+			.query<{ n: number }, [string]>("SELECT COUNT(*) AS n FROM conversation_model WHERE origin_key = ?")
+			.get(originKey);
+		this.#database.query("DELETE FROM conversation_model WHERE origin_key = ?").run(originKey);
+		return (before?.n ?? 0) > 0;
 	}
 	// --- Issue #10: durable lane jobs ---------------------------------------
 
