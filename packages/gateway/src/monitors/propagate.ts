@@ -761,6 +761,9 @@ function failureCode(error: unknown, failureClass: AuthoringFailureClass): Dispa
 	// Context exhaustion outranks the phase codes: it is the one class the safety
 	// net acts on, and an operator must be able to see it in the event row.
 	if (failureClass === "context") return "authoring_context_exhausted";
+	// A malformed body never parses: that is a response-contract failure, not a
+	// mystery internal error.
+	if (error instanceof SyntaxError) return "authoring_response_invalid";
 	const message = error instanceof Error ? error.message : String(error);
 	if (message.includes("authoring response is not an array")) return "authoring_response_invalid";
 	if (message.includes("sendTurn")) return "authoring_turn_failed";
