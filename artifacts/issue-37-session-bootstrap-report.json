@@ -1,0 +1,74 @@
+{
+  "schemaVersion": 1,
+  "kind": "api-package-adversarial-test-report",
+  "issue": 37,
+  "repository": "Yeachan-Heo/gajae-way",
+  "branch": "feat/issue-37-session-memory-bootstrap",
+  "base": "c72615333cba90d66b562eaf1d413e387ec21064",
+  "executableHead": "38efb025d86a3fd1193fa0086026eeaf7b466e7d",
+  "generatedAt": "2026-08-28T13:37:14Z",
+  "summary": "Fresh origin epochs receive one trusted, bounded session bootstrap with canonical channel metadata and confined memory navigation. Durable schema-14 projection commits only after terminal text or intentional-silence success; failed attempts retry with the stable origin+epoch marker. Public navigation and associated documents are full-origin filtered and privacy gated.",
+  "securityReview": {
+    "reviewer": "agent://0-BootstrapSecurityReview",
+    "initialVerdict": "BLOCK",
+    "appliedFindings": [
+      "Create-time rebind now re-reads the effective persisted epoch before building the preamble.",
+      "Memory reads are confined to the resolved memory root; workspace targets and escaped symlinks are rejected.",
+      "Association requires a complete canonical origin key or validated JSON OriginRef; bare conversation IDs are rejected.",
+      "Public MEMORY links are reduced to current-origin public-safe channel/project/task/handoff pointers plus the rules index; other/global pointers are omitted.",
+      "Every MEMORY and ops/rules/index pointer is decoded, confined, and re-rendered individually, so a safe first link cannot smuggle a trailing private or traversal link on the same source line.",
+      "Navigation headings and link labels pass through the same credential/secret redaction before trusted-system serialization; adjacent source-line text is discarded while safe confined paths remain visible.",
+      "Daily sections are parsed structurally and admitted only when every declared stable origin is well-formed and resolves to one consistent current-origin key; mixed-order, duplicate/conflicting, and nested-heading private origins poison the whole section.",
+      "Public navigation uses fixed trusted headings; DM headings have Markdown destinations removed. Heading links therefore cannot emit traversal/private pointer strings.",
+      "ASCII controls and Unicode format/line separators are replaced with spaces before credential detection. Split token/password/secret/API-key/header keys redact the remainder of their logical line, so fragments are neither leaked nor concatenated into an emitted secret.",
+      "Vendor-token detection uses a separator-collapsed matching shadow only for detection; the shadow is never emitted. NUL/format splits inside sk_live, ghp, xox, and pk_test shapes redact the original normalized logical line.",
+      "Included source material is system-delimited as reference data, never executable instructions.",
+      "Diagnostics use bounded logical codes rather than raw filesystem errors; participant metadata is count/length bounded.",
+      "The canonical opaque originKey is used in conversation-isolation guidance.",
+      "docs/memory.md now defines provenance, symlink, public-safety, redaction, and byte-budget contracts."
+    ],
+    "documentedResidualSemantic": "The gateway deliberately follows the issue contract's send-then-terminal-commit model. A process death in the narrow external-success/SQLite-commit gap retries the same stable origin+epoch bootstrap ID; the section explicitly instructs idempotent non-reapplication. Real intermediate delivery followed by failure consumes the unread body while leaving bootstrap pending, preventing harmful answer/body replay."
+  },
+  "restartExactlyOnceRedTeam": [
+    { "case": "epoch 0 first terminal text success", "result": "passed", "evidence": "context-turn test commits epoch 0 and includes bootstrap once" },
+    { "case": "ordinary second turn", "result": "passed", "evidence": "same test proves no Session bootstrap section" },
+    { "case": "restart after successful terminal", "result": "passed", "evidence": "database reopen proves no repeat" },
+    { "case": "restart before successful terminal", "result": "passed", "evidence": "failed attempt, gateway stop/database reopen, stable-marker retry, intentional silence commit" },
+    { "case": "pre-delivery failure", "result": "passed", "evidence": "last_bootstrapped_epoch remains -1 and identical marker retries" },
+    { "case": "intentional silence", "result": "passed", "evidence": "terminal [SILENT] commits bootstrap without chat delivery" },
+    { "case": "intermediate delivery then failure", "result": "passed", "evidence": "bootstrap remains pending, prior unread body is consumed, next request body appears once, stable marker repeats" },
+    { "case": "/new", "result": "passed", "evidence": "transaction establishes context floor and epoch 1 pending state; next turn bootstraps epoch 1 once" },
+    { "case": "create-time automatic rebind", "result": "passed", "evidence": "effective persisted epoch 1 is bootstrapped and committed; stale epoch 0 is absent" },
+    { "case": "turn-time replay-safe rebind", "result": "passed", "evidence": "GjcClient test proves rebound preamble resolver changes epoch 0 to epoch 1" },
+    { "case": "turn-limit rotation", "result": "passed", "evidence": "50 successes rotate to pending epoch 1; turns 51/52 prove one bootstrap" },
+    { "case": "source edit between epochs", "result": "passed", "evidence": "builder re-reads changed channel record for epoch 1" }
+  ],
+  "securityPrivacyRedTeam": [
+    { "case": "malformed percent traversal", "result": "passed" },
+    { "case": "heading-link traversal/private pointer text", "result": "passed" },
+    { "case": "NUL and zero-width/control-split credentials across channel/daily/MEMORY/rules", "result": "passed" },
+    { "case": "NUL and Unicode-format splits inside vendor-token shapes across all source classes", "result": "passed" },
+    { "case": "escaped symlink", "result": "passed" },
+    { "case": "configured memory-root symlink", "result": "passed" },
+    { "case": "public channel rejects unapproved associated body", "result": "passed" },
+    { "case": "public map omits global and other-origin pointers", "result": "passed" },
+    { "case": "daily capture exact-origin filtering excludes DM entry and rejects mixed-origin sections in either order or nested headings", "result": "passed" },
+    { "case": "deterministic multibyte UTF-8 8192-byte boundary", "result": "passed" },
+    { "case": "missing MEMORY/daily/rules sources", "result": "passed with bounded diagnostics" }
+  ],
+  "verification": [
+    { "command": "bun test --max-concurrency 1 packages", "status": "passed", "evidence": "1096 passed, 2 skipped, 0 failed; 4683 expectations across 83 files" },
+    { "command": "bunx tsc --noEmit", "status": "passed", "evidence": "no diagnostics" },
+    { "command": "bun run build", "status": "passed", "evidence": "gateway, Discord, Telegram, admin, and CLI standalone binaries compiled" },
+    { "command": "bunx biome check <changed files> && git diff --check", "status": "passed_with_baseline_warnings", "evidence": "no errors or fixes; 11 pre-existing warnings in touched legacy files; diff check clean" },
+    { "command": "bun test packages/gateway/bench/retrieval-golden.bench.test.ts", "status": "skipped_by_suite", "evidence": "0 failed; benchmark test is repository-marked skip" },
+    { "command": "bun test packages/gateway/test/session-bootstrap.test.ts packages/gateway/test/context-turn.test.ts packages/gateway/test/session-rebind.test.ts packages/gateway/test/migration-drill.test.ts", "status": "passed", "evidence": "79 passed, 0 failed; 524 expectations" }
+  ],
+  "migration": {
+    "from": 13,
+    "to": 14,
+    "strategy": "monotonic additive session columns",
+    "preservation": "migration drill preserves session identity, lane jobs, monitors, slots, rebind counters, and current tables/data",
+    "rawBootstrapBodiesPersisted": false
+  }
+}

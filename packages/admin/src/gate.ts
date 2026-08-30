@@ -98,6 +98,13 @@ export const DEFAULT_ALLOWLIST: readonly MutationOperation[] = [
 				placeholder: "review.due",
 				hint: "Declared up front, never inferred. Comma-separated for more than one.",
 			},
+			{
+				name: "instruction",
+				label: "Execution instruction",
+				kind: "text",
+				required: false,
+				hint: "What the agent should actually do when this fires. Without it the session only writes a receipt note.",
+			},
 		],
 		consequence: "A new schedule starts firing as soon as it is created.",
 	},

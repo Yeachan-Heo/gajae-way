@@ -20,6 +20,18 @@ export interface GatewayStatusResult {
 	readonly sessions: { readonly active: number };
 	/** Delivery ledger health (P1+). */
 	readonly delivery?: { readonly pending: number; readonly oldestPendingAgeMs: number | null };
+	/** Aggregate-only conversation diff health; never includes message bodies. */
+	readonly contextDiff?: ConversationContextDiagnostics;
+}
+
+export interface ConversationContextDiagnostics {
+	readonly unread: number;
+	readonly expired: number;
+	readonly truncated: number;
+	readonly omittedOldestAt: string | null;
+	readonly omittedNewestAt: string | null;
+	/** Durable reset floor for a specific origin; null on aggregate projections. */
+	readonly floorAt: string | null;
 }
 
 /**
@@ -85,6 +97,10 @@ export interface EngagementContext {
 export interface ChatSendParams {
 	readonly origin: OriginRef;
 	readonly text: string;
+	/** Stable platform message id for idempotent live/backfill ingestion. */
+	readonly messageId?: string;
+	/** Platform event time, when available; ordering and age policy use this value. */
+	readonly receivedAt?: string;
 	/** Required for non-loopback origins; the gateway applies engagement policy. */
 	readonly engagement?: EngagementContext;
 }
@@ -151,6 +167,22 @@ export interface ChatMessagePayload {
 	 * visible acknowledgement instead of a lost delivery.
 	 */
 	readonly reaction?: ReactionRef;
+	/**
+	 * When present the adapter must ALSO post this text as a spoken voice
+	 * message, in addition to delivering `text` normally.
+	 *
+	 * Set when the turn was triggered by a voice message: the owner asked for a
+	 * voice reply to be paired with its text automatically, decided by the
+	 * inbound modality rather than by anything the persona has to remember.
+	 * The two cannot share one platform message — Discord requires empty content
+	 * on a voice message — so the adapter sends text first, then the audio.
+	 *
+	 * Absent on redelivery after a restart: the modality lives with the in-flight
+	 * turn, not in the delivery ledger, so a recovered delivery degrades to
+	 * text-only. Text is the deliverable and voice is the courtesy, so that is
+	 * the safe direction to lose.
+	 */
+	readonly voiceText?: string;
 }
 
 export interface DeliveryConfirmParams {
@@ -196,7 +228,18 @@ export interface SessionListResult {
 		readonly createdAt: string;
 		readonly lastActivityAt: string | null;
 		readonly epoch: number;
+		readonly bootstrap: SessionBootstrapProjection;
 	}[];
+}
+
+export interface SessionBootstrapProjection {
+	readonly epoch: number;
+	readonly pending: boolean;
+	readonly appliedAt: string | null;
+	readonly includedSections: readonly string[];
+	readonly byteCount: number;
+	readonly truncated: boolean;
+	readonly diagnostics: readonly string[];
 }
 
 /**
@@ -248,6 +291,13 @@ export interface MonitorSpec {
 	readonly burstPolicy?: BurstPolicyKind;
 	/** Channel target for authored output: at most one (spec fact 7). */
 	readonly channelTarget?: { readonly origin: OriginRef } | null;
+	/**
+	 * Per-monitor execution instruction handed to the authoring turn. Without it
+	 * a monitor's session only learns that an event fired, so it can do nothing
+	 * but write a receipt note. Free text, bounded length; the JSON-array
+	 * response contract is unaffected.
+	 */
+	readonly instruction?: string;
 	readonly enabled?: boolean;
 }
 
@@ -419,6 +469,10 @@ export interface CycleSessionView {
 	readonly unsettledDeliveries: number;
 	/** Oldest unsettled delivery age in ms, null when none are unsettled. */
 	readonly oldestUnsettledAgeMs: number | null;
+	/** Per-origin unread/omission diagnostics; never includes message bodies. */
+	readonly contextDiff: ConversationContextDiagnostics;
+	/** Durable metadata-only bootstrap projection; source bodies are never exposed. */
+	readonly bootstrap: SessionBootstrapProjection;
 }
 
 export interface OpsCycleResult {
@@ -457,6 +511,8 @@ export interface OpsCycleResult {
 	readonly inFlightInbound: number;
 	/** Durable inbound messages still awaiting their turn, across ALL origins. */
 	readonly pendingInbound: number;
+	/** Aggregate unread/omission diagnostics across origins. */
+	readonly contextDiff: ConversationContextDiagnostics;
 }
 
 /** Verb catalog: verb name -> { params, result } (documentation-level typing). */

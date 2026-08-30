@@ -43,6 +43,7 @@ describe("status bar", () => {
 			working: "idle",
 			attention: "nothing needs you",
 			delivery: "deliveries clear",
+			context: "3 unread · 287 expired · 12 truncated",
 			profile: "profile v0.1",
 		});
 		expect(state.status.tone).toBe("ok");

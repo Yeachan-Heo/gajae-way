@@ -38,8 +38,16 @@ export interface RuntimeCycleSources {
 		readonly epoch: number;
 		readonly created_at: string;
 		readonly last_activity_at: string | null;
+		readonly last_bootstrapped_epoch: number;
+		readonly bootstrap_applied_at: string | null;
+		readonly bootstrap_sections_json: string;
+		readonly bootstrap_byte_count: number;
+		readonly bootstrap_truncated: number;
+		readonly bootstrap_diagnostics_json: string;
 	}>;
 	readonly inboundPendingByOrigin: ReadonlyMap<string, number>;
+	readonly contextByOrigin: ReadonlyMap<string, ReturnType<GatewayDatabase["contextDiagnostics"]>>;
+	readonly contextDiff: ReturnType<GatewayDatabase["contextDiagnostics"]>;
 	readonly inboundCounts: ReadonlyMap<string, number>;
 	readonly pendingInbound: number;
 	readonly inFlightInbound: number;
@@ -72,6 +80,7 @@ export class RuntimeCycleProjector {
 		const sessions = this.#database.sessionIdentityRows();
 		const inbound = this.#database.inboundStateCounts();
 		const pendingByOrigin = new Map(this.#database.inboundPendingByOrigin().map((r) => [r.origin_key, r.n]));
+		const contextByOrigin = this.#database.contextDiagnosticsByOrigin();
 		const deliveries = this.#database.deliveryStateCounts();
 		const unsettled = new Map(
 			this.#database.deliveryUnsettledByOrigin(nowMs).map((r) => [r.origin_key, { n: r.n, oldestMs: r.oldest_ms }]),
@@ -93,6 +102,8 @@ export class RuntimeCycleProjector {
 			memoryIntents: new Map(memory.map((r) => [r.state, r.n])),
 			monitorStages: new Map(monitors.map((r) => [r.stage, r.n])),
 			inboundPendingByOrigin: pendingByOrigin,
+			contextByOrigin,
+			contextDiff: this.#database.contextDiagnostics(),
 			memoryClosing: this.#memory.queueDepth > 0,
 			instanceId: this.#database.instanceId,
 		};
@@ -116,6 +127,23 @@ export function projectRuntimeCycle(sources: RuntimeCycleSources, generatedAt: s
 			lastActivityAt: row.last_activity_at,
 			unsettledDeliveries: sources.unsettledByOrigin.get(row.origin_key)?.n ?? 0,
 			oldestUnsettledAgeMs: sources.unsettledByOrigin.get(row.origin_key)?.oldestMs ?? null,
+			contextDiff: sources.contextByOrigin.get(row.origin_key) ?? {
+				unread: 0,
+				expired: 0,
+				truncated: 0,
+				omittedOldestAt: null,
+				omittedNewestAt: null,
+				floorAt: null,
+			},
+			bootstrap: {
+				epoch: row.epoch,
+				pending: row.last_bootstrapped_epoch < row.epoch,
+				appliedAt: row.bootstrap_applied_at,
+				includedSections: parseStringList(row.bootstrap_sections_json),
+				byteCount: row.bootstrap_byte_count,
+				truncated: row.bootstrap_truncated === 1,
+				diagnostics: parseStringList(row.bootstrap_diagnostics_json),
+			},
 		};
 	});
 
@@ -173,7 +201,17 @@ export function projectRuntimeCycle(sources: RuntimeCycleSources, generatedAt: s
 		},
 		inFlightInbound: sources.inFlightInbound,
 		pendingInbound,
+		contextDiff: sources.contextDiff,
 	};
+}
+
+function parseStringList(value: string): readonly string[] {
+	try {
+		const parsed = JSON.parse(value);
+		return Array.isArray(parsed) && parsed.every((item) => typeof item === "string") ? parsed : ["projection_corrupt"];
+	} catch {
+		return ["projection_corrupt"];
+	}
 }
 
 function decidePhase(state: {

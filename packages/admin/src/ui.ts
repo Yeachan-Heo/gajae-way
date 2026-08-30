@@ -128,6 +128,7 @@ function sessionRow(row: RowView | null, ctx: Ctx): string {
 	return `<li ${rowAttrs(row)}>
 <p class="row__title">${cell(row, "title", "row__name", ctx, "strong")}<span class="row__spacer"></span>${cell(row, "activity", "row__age", ctx, "time")}</p>
 <p class="row__meta">${cell(row, "epoch", "row__tag", ctx)}<span class="row__dot">·</span>opened ${cell(row, "created", "row__age", ctx, "time")}</p>
+<p class="row__meta">${cell(row, "bootstrap", "", ctx)}</p>
 <p class="row__meta">${cell(row, "key", "mono row__key", ctx)}</p>
 </li>`;
 }

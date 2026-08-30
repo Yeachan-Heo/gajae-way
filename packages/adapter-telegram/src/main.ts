@@ -240,7 +240,11 @@ export class TelegramAdapter {
 			origin.kind !== "dm" && this.config.chats?.[origin.parentId ?? origin.conversationId]?.engagement === "open"
 				? { ...baseEngagement, mentioned: true }
 				: baseEngagement;
-		await gateway.request("chat.send", { origin, text: message.text, engagement });
+		await gateway.request("chat.send", {
+			origin,
+			text: message.text,
+			engagement,
+		});
 		return true;
 	}
 }

@@ -12,12 +12,15 @@ A monitor turns an external or scheduled signal into a Gajae-authored event. It 
   "trigger": { "kind": "cron", "schedule": "30 8 * * 1-5" },
   "eventTypes": ["review.due"],
   "burstPolicy": "dedupe",
+  "instruction": "Read the open review queue, pick the oldest item, and post a one-paragraph verdict.",
   "channelTarget": {
     "origin": { "platform": "discord", "kind": "dm", "conversationId": "owner", "peerId": "owner" }
   },
   "enabled": true
 }
 ```
+
+`instruction` is the per-monitor execution instruction. It is prepended to the guidance section of the authoring prompt, so the event session is told what to *do*, not just that an event fired. It is optional (at most 4000 characters); a monitor without one falls back to the built-in maintenance guidance for its event types, and with neither the session only writes a receipt note.
 
 The four trigger kinds are:
 

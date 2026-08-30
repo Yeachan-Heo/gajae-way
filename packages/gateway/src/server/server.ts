@@ -52,6 +52,7 @@ import { backupDatabase, integrityDatabase } from "../ops/backup";
 import { RuntimeCycleProjector } from "../ops/cycle";
 import type { GjcPort } from "../orchestrator/gjc-client";
 import { formatFailureNotice } from "../orchestrator/rebind";
+import { buildSessionBootstrap, type SessionBootstrap } from "../persona/bootstrap";
 import { PersonaLoader } from "../persona/persona";
 import type { GatewayDatabase, InboundMessageRow, MonitorEventStage } from "../store/db";
 import { DeliveryLedger } from "../store/ledger";
@@ -188,6 +189,16 @@ interface InboundContext {
 	readonly turnId: string;
 	readonly requestId: string;
 	readonly connection: Connection;
+	/**
+	 * True when the platform message that started this turn was spoken.
+	 *
+	 * Deliberately held with the in-flight turn rather than persisted on the
+	 * inbound row: it decides how the *reply* is delivered, and a delivery
+	 * recovered after a restart should ship as text rather than resurrect a
+	 * voice reply to a conversation that has moved on. Losing it degrades to
+	 * text-only, which is the safe direction.
+	 */
+	readonly voice?: boolean;
 }
 /**
  * The ONE reload implementation, shared by the SIGHUP handler and the
@@ -236,6 +247,7 @@ interface Runtime {
 	readonly monitors: MonitorPropagator;
 	readonly monitorRuntime: MonitorRuntime;
 	readonly reconcileTimer: ReturnType<typeof setInterval>;
+	readonly contextMaintenanceTimer: ReturnType<typeof setInterval>;
 	readonly turns: KeyedQueue;
 	/** Per-turn / per-message reaction caps shared by chat.react and the reply-token path. */
 	readonly reactions: ReactionBudget;
@@ -280,6 +292,7 @@ export async function startUnixServer(options: GatewayServerOptions): Promise<Ga
 				connection.write({ v: PROFILE_VERSION, type: "event", event: "gateway.stopping", payload: { reason } });
 			listener.stop(true);
 			clearInterval(runtime.reconcileTimer);
+			clearInterval(runtime.contextMaintenanceTimer);
 			// In-flight turn drains still touch the database; close it under them and
 			// their completion bookkeeping crashes ("Cannot use a closed database").
 			await runtime.turns.settle();
@@ -353,6 +366,7 @@ export function startStdioServer(options: GatewayServerOptions): GatewayServer {
 			process.off("SIGHUP", onHup);
 			connection.write({ v: PROFILE_VERSION, type: "event", event: "gateway.stopping", payload: { reason } });
 			clearInterval(runtime.reconcileTimer);
+			clearInterval(runtime.contextMaintenanceTimer);
 			await runtime.turns.settle();
 			await runtime.monitorRuntime.stop();
 			connection.close();
@@ -417,6 +431,17 @@ function createRuntime(options: GatewayServerOptions): Runtime {
 	});
 	const monitorRuntime = new MonitorRuntime(options.config, registry, monitors);
 	const reconcileTimer = setInterval(() => void monitors.reconcile(), 60_000);
+	options.database.contextMaintain();
+	const contextMaintenanceTimer = setInterval(
+		() => {
+			try {
+				options.database.contextMaintain();
+			} catch (error) {
+				console.error(`gateway context maintenance failed: ${error instanceof Error ? error.message : String(error)}`);
+			}
+		},
+		60 * 60 * 1000,
+	);
 	return {
 		config: options.config,
 		delivery,
@@ -427,6 +452,7 @@ function createRuntime(options: GatewayServerOptions): Runtime {
 		monitors,
 		monitorRuntime,
 		reconcileTimer,
+		contextMaintenanceTimer,
 		turns: new KeyedQueue(),
 		reactions: new ReactionBudget(),
 		cycle: new RuntimeCycleProjector(options.database, memory),
@@ -516,6 +542,7 @@ async function handleRequest(
 					schemaVersion: options.database.schemaVersion,
 					sessions: { active: options.database.activeSessionCount },
 					delivery: runtime.delivery.status(),
+					contextDiff: options.database.contextDiagnostics(),
 				},
 			});
 			return;
@@ -810,6 +837,7 @@ async function handleRequest(
 				createdAt: row.created_at,
 				lastActivityAt: row.last_activity_at,
 				epoch: row.epoch,
+				bootstrap: bootstrapProjection(row),
 			}));
 			connection.write({ v: PROFILE_VERSION, type: "response", id: request.id, result: { sessions } });
 			return;
@@ -1062,6 +1090,8 @@ async function sendChat(
 				origin?: unknown;
 				text?: unknown;
 				messageId?: unknown;
+				receivedAt?: unknown;
+				voice?: unknown;
 				engagement?: { mentioned?: unknown; group?: unknown; authorId?: unknown };
 		  }
 		| undefined;
@@ -1095,7 +1125,14 @@ async function sendChat(
 			});
 			return;
 		}
-		options.database.withTransaction(() => options.database.bumpEpoch(key, JSON.stringify(origin)));
+		const floorAt = new Date().toISOString();
+		let discardedInbound: string[] = [];
+		options.database.withTransaction(() => {
+			options.database.bumpEpoch(key, JSON.stringify(origin));
+			options.database.contextSetFloor(key, floorAt);
+			discardedInbound = options.database.inboundDiscardBefore(key, floorAt);
+		});
+		for (const messageId of discardedInbound) runtime.inbound.delete(messageId);
 		// An explicit reset is the manual form of a rebind, so it also restores the
 		// automatic rebind budget: otherwise an origin that spent its cap would stay
 		// capped even after the operator did exactly what the notice asked for.
@@ -1139,6 +1176,7 @@ async function sendChat(
 		throw new ProtocolError("invalid_params", "non-loopback chat.send requires engagement");
 	const engaged = decideEngagement(origin, params.engagement as never, runtime.config).engaged;
 	const inboundMessageId = typeof params.messageId === "string" && params.messageId ? params.messageId : undefined;
+	const receivedAt = parseReceivedAt(params.receivedAt);
 	// Declined messages are still context, never commands (protocol contract): every
 	// platform message lands in the conversation-context ledger so the next engaged
 	// turn reads the full unread diff since the persona's last reply.
@@ -1150,6 +1188,7 @@ async function sendChat(
 			authorId: typeof engagement?.authorId === "string" ? engagement.authorId : undefined,
 			authorName: typeof engagement?.authorName === "string" ? engagement.authorName : undefined,
 			body: userText,
+			...(receivedAt ? { receivedAt } : {}),
 		});
 	}
 	if (!engaged) {
@@ -1183,7 +1222,12 @@ async function sendChat(
 		});
 		return;
 	}
-	runtime.inbound.set(messageId, { turnId, requestId: request.id, connection });
+	runtime.inbound.set(messageId, {
+		turnId,
+		requestId: request.id,
+		connection,
+		...(params.voice === true ? { voice: true } : {}),
+	});
 	connection.write({ v: PROFILE_VERSION, type: "response", id: request.id, result: { turnId, engaged: true } });
 	await drainOrigin(key, messageId, connection, options, runtime);
 }
@@ -1202,6 +1246,12 @@ async function drainOrigin(
 	let ownFailure: unknown;
 	await runtime.turns.run(key, async () => {
 		for (let row = options.database.inboundClaimNext(key); row; row = options.database.inboundClaimNext(key)) {
+			const resetFloor = options.database.contextFloorAt(key);
+			if (resetFloor && row.received_at <= resetFloor) {
+				runtime.inbound.delete(row.message_id);
+				options.database.inboundComplete(row.message_id);
+				continue;
+			}
 			// Debounce: a burst of messages becomes ONE turn carrying the whole diff.
 			// The window is per-channel configurable; newer arrivals during the wait
 			// are folded into this batch, with the newest message as the trigger.
@@ -1251,6 +1301,53 @@ function debounceFor(row: InboundMessageRow, config: GatewayServerOptions["confi
 		(origin.platform === "discord" ? config.channels?.[origin.conversationId ?? ""] : undefined);
 	return channel?.debounceMs ?? config.debounceMs ?? 0;
 }
+
+function parseReceivedAt(value: unknown): string | undefined {
+	if (value === undefined) return undefined;
+	if (typeof value !== "string" || !value)
+		throw new ProtocolError("invalid_params", "receivedAt must be an ISO timestamp");
+	const timestamp = Date.parse(value);
+	if (!Number.isFinite(timestamp)) throw new ProtocolError("invalid_params", "receivedAt must be an ISO timestamp");
+	return new Date(timestamp).toISOString();
+}
+
+function bootstrapProjection(row: {
+	readonly epoch: number;
+	readonly last_bootstrapped_epoch: number;
+	readonly bootstrap_applied_at: string | null;
+	readonly bootstrap_sections_json: string;
+	readonly bootstrap_byte_count: number;
+	readonly bootstrap_truncated: number;
+	readonly bootstrap_diagnostics_json: string;
+}): {
+	readonly epoch: number;
+	readonly pending: boolean;
+	readonly appliedAt: string | null;
+	readonly includedSections: readonly string[];
+	readonly byteCount: number;
+	readonly truncated: boolean;
+	readonly diagnostics: readonly string[];
+} {
+	const strings = (value: string): readonly string[] => {
+		try {
+			const parsed = JSON.parse(value);
+			return Array.isArray(parsed) && parsed.every((item) => typeof item === "string")
+				? parsed
+				: ["projection_corrupt"];
+		} catch {
+			return ["projection_corrupt"];
+		}
+	};
+	return {
+		epoch: row.epoch,
+		pending: row.last_bootstrapped_epoch < row.epoch,
+		appliedAt: row.bootstrap_applied_at,
+		includedSections: strings(row.bootstrap_sections_json),
+		byteCount: row.bootstrap_byte_count,
+		truncated: row.bootstrap_truncated === 1,
+		diagnostics: strings(row.bootstrap_diagnostics_json),
+	};
+}
 async function runInboundTurn(
 	batch: readonly InboundMessageRow[],
 	fallback: Connection,
@@ -1265,6 +1362,9 @@ async function runInboundTurn(
 	runtime.inbound.delete(row.message_id);
 	const connection = context?.connection ?? fallback;
 	const turnId = context?.turnId ?? crypto.randomUUID();
+	// Absent for a delivery recovered after a restart, which is why that case
+	// degrades to text-only rather than speaking into a stale conversation.
+	const voiceTurn = context?.voice === true;
 	const key = row.origin_key;
 	const origin = validateOriginRef(JSON.parse(row.origin_ref_json) as typeof LOOPBACK_ORIGIN);
 	const userText = row.body;
@@ -1295,17 +1395,35 @@ async function runInboundTurn(
 	// last reply (the read-cursor diff), then the triggering message with speaker
 	// attribution — so the persona always reads "the messages above".
 	let turnText = userText;
+	let contextMessageIds: readonly string[] = [];
+	let contextOmissionRevision = 0;
 	if (nonLoopback) {
-		const unread = options.database.contextUnread(key, 100).filter((entry) => entry.message_id !== row.message_id);
+		const prepared = options.database.contextWindow(key, row.message_id);
+		const unread = prepared.rows;
+		contextMessageIds = [...prepared.selectedMessageIds, row.message_id];
+		contextOmissionRevision = prepared.omissionRevision;
 		const lines = unread.map(
 			(entry) =>
 				`- [${entry.received_at}] ${entry.author_name ?? "unknown"} (author:${entry.author_id ?? "?"}, msg:${entry.message_id}): ${entry.body.slice(0, 1000)}`,
 		);
+		// Truncation is stated, never silent: a persona that cannot see it was given
+		// a partial view will treat the oldest surviving line as the beginning of the
+		// conversation.
+		const omitted = prepared.expiredCount + prepared.truncatedCount;
+		const omittedRange =
+			prepared.omittedOldestAt && prepared.omittedNewestAt
+				? `; timestamps ${prepared.omittedOldestAt}..${prepared.omittedNewestAt}`
+				: "";
+		const droppedNote =
+			omitted > 0
+				? `[${omitted} older unread message(s) omitted: ${prepared.expiredCount} expired outside floor ${prepared.effectiveFloor}, ${prepared.truncatedCount} truncated by the newest-${prepared.rows.length} window${omittedRange}]\n`
+				: "";
 		const header = lines.length
-			? `[Unread messages in this conversation since your last reply]\n${lines.join("\n")}\n\n`
-			: "";
+			? `[Unread messages in this conversation since your last reply]\n${droppedNote}${lines.join("\n")}\n\n`
+			: droppedNote
+				? `${droppedNote}\n`
+				: "";
 		turnText = `${header}${speaker ? `${composeTurnHeader({ speaker, place, authorId: engagement?.authorId, messageId: row.message_id, engagement })}\n` : ""}${userText}`;
-		options.database.contextConsume([...unread.map((entry) => entry.message_id), row.message_id]);
 	}
 	let text: string;
 	// Human-sized chat: the persona may split one message into several short parts
@@ -1315,6 +1433,7 @@ async function runInboundTurn(
 	// exit, so a multi-minute turn talks while it works (live gajaeway-play
 	// finding: turns showed nothing but "working…" until the very end).
 	const deliveredParts: string[] = [];
+	let assistantDeliveryStarted = false;
 	let reactionTokensSeen = false;
 	const maxTurnParts = 10;
 	const deliverAssistantText = (rawMessage: string) => {
@@ -1351,14 +1470,13 @@ async function runInboundTurn(
 					);
 					continue;
 				}
-				broadcastDelivery(
-					runtime,
-					runtime.delivery.prepareReaction(crypto.randomUUID(), origin, {
-						targetMessageId,
-						emoji: wanted.emoji,
-						emojiName: wanted.emojiName,
-					}),
-				);
+				const payload = runtime.delivery.prepareReaction(crypto.randomUUID(), origin, {
+					targetMessageId,
+					emoji: wanted.emoji,
+					emojiName: wanted.emojiName,
+				});
+				assistantDeliveryStarted = true;
+				broadcastDelivery(runtime, payload);
 			}
 			message = reactionReply.body;
 			if (!message) return;
@@ -1368,17 +1486,39 @@ async function runInboundTurn(
 			.map((part) => part.trim())
 			.filter((part) => part.length > 0 && !isSilenceToken(part))
 			.slice(0, 5);
+		// Which deliveries actually happen is decided BEFORE the loop, because the
+		// audio has to ride the last one. Deciding inside the loop cannot: a part
+		// may be dropped for an empty body, and the part budget may cut the loop
+		// off early, so "the last element of `parts`" is not "the last delivery".
+		const planned: Array<{ readonly body: string; readonly replyTo?: string }> = [];
 		for (const part of parts) {
-			if (deliveredParts.length >= maxTurnParts) return;
+			if (planned.length >= maxTurnParts) break;
 			// Reply-threading: a part may open with [REPLY:<platform message id>] to
 			// answer a specific message; mentions are plain <@author id> in the text.
 			const replyMatch = part.match(/^\[REPLY:([^\]\s]+)\]\s*/);
 			const body = replyMatch ? part.slice(replyMatch[0].length).trim() : part;
 			if (!body) continue;
-			const payload = runtime.delivery.prepare(crypto.randomUUID(), origin, body, replyMatch?.[1]);
+			planned.push({ body, ...(replyMatch?.[1] ? { replyTo: replyMatch[1] } : {}) });
+		}
+		// A spoken turn is answered in both modalities, and the whole reply is spoken
+		// ONCE rather than once per part. Built from the PLANNED bodies so the audio
+		// never reads out text the part budget dropped.
+		const spoken = spokenReply(
+			planned.map((step) => step.body),
+			voiceTurn,
+		);
+		for (let index = 0; index < planned.length; index++) {
+			if (deliveredParts.length >= maxTurnParts) return;
+			const step = planned[index] as { body: string; replyTo?: string };
+			const payload = runtime.delivery.prepare(crypto.randomUUID(), origin, step.body, step.replyTo);
 			if (!payload) continue;
-			deliveredParts.push(body);
-			broadcastDelivery(runtime, payload);
+			deliveredParts.push(step.body);
+			assistantDeliveryStarted = true;
+			// Indexed, not compared by value: two identical parts made `part ===
+			// parts.at(-1)` true for both and the reply was spoken twice, billed
+			// twice, and talked over itself.
+			const isLast = index === planned.length - 1;
+			broadcastDelivery(runtime, isLast && spoken !== "" ? { ...payload, voiceText: spoken } : payload);
 		}
 	};
 	// Long turns announce liveness instead of dying: throttled chat.progress events
@@ -1415,10 +1555,36 @@ async function runInboundTurn(
 	};
 	const heartbeat = setInterval(() => emitProgress(lastKnown), intervalMs);
 	const runTurn = async () => {
-		const epoch = options.database.getSessionRecord(key)?.epoch ?? 0;
-		const { sessionId } = await options.gjc.ensureSession(key, epoch);
-		const preamble = `${await runtime.persona.systemPreamble()}\n\n${currentConversationNotice(origin, engagement)}\n\n${ACTION_GUARD_SYSTEM_NOTICE}`;
-		return options.gjc.sendTurn(sessionId, turnText, preamble, emitProgress, {
+		const bootstraps = new Map<number, SessionBootstrap>();
+		const preambleForEpoch = async (epoch: number): Promise<string> => {
+			const state = options.database.getSessionBootstrap(key);
+			const bootstrap =
+				!state || state.lastBootstrappedEpoch < epoch
+					? await buildSessionBootstrap({
+							home: runtime.config.home,
+							origin,
+							epoch,
+							engagement,
+							config: runtime.config,
+						})
+					: undefined;
+			if (bootstrap) bootstraps.set(epoch, bootstrap);
+			return [
+				await runtime.persona.systemPreamble(),
+				currentConversationNotice(origin, engagement),
+				...(bootstrap ? [bootstrap.text] : []),
+				ACTION_GUARD_SYSTEM_NOTICE,
+			].join("\n\n");
+		};
+		const requestedEpoch = options.database.getSessionRecord(key)?.epoch ?? 0;
+		const { sessionId } = await options.gjc.ensureSession(key, requestedEpoch);
+		// session.create itself may condemn and rebind the requested epoch. The
+		// persisted row is the effective binding authority, so the first preamble
+		// on that fresh session must use the rebound epoch rather than a stale ID.
+		const boundEpoch = options.database.getSessionRecord(key)?.epoch ?? requestedEpoch;
+		const preamble = await preambleForEpoch(boundEpoch);
+		const result = await options.gjc.sendTurn(sessionId, turnText, preamble, emitProgress, {
+			systemPreambleForEpoch: preambleForEpoch,
 			onAssistantText: (message) => {
 				try {
 					deliverAssistantText(message);
@@ -1430,9 +1596,20 @@ async function runInboundTurn(
 				}
 			},
 		});
+		const terminalEpoch = options.database.getSessionRecord(key)?.epoch ?? boundEpoch;
+		const applied = bootstraps.get(terminalEpoch);
+		if (applied)
+			options.database.markSessionBootstrapped(key, terminalEpoch, {
+				includedSections: applied.includedSections,
+				byteCount: applied.byteCount,
+				truncated: applied.truncated,
+				diagnostics: applied.diagnostics,
+			});
+		return result;
 	};
 	try {
 		text = await runTurn();
+		if (nonLoopback) options.database.contextCommitWindow(key, contextMessageIds, contextOmissionRevision);
 	} catch (error) {
 		// A prose-only "session not found" failure (gjc emits no structured code
 		// for it) is deliberately NOT auto-rebound: #13 mandates exact-code-only
@@ -1450,7 +1627,12 @@ async function runInboundTurn(
 		// failure stays in the daemon log only.
 		const failureNotice = formatFailureNotice(error);
 		console.error(failureNotice);
-		if (nonLoopback && deliveredParts.length === 0) {
+		// A runtime failure before any assistant delivery leaves selected context
+		// unread for retry. Once a real text/reaction delivery has started, retrying
+		// the same window could duplicate an answer, so that window is consumed.
+		if (nonLoopback && assistantDeliveryStarted)
+			options.database.contextCommitWindow(key, contextMessageIds, contextOmissionRevision);
+		if (nonLoopback && !assistantDeliveryStarted) {
 			const notice = runtime.delivery.prepare(turnId, origin, failureNotice);
 			if (notice) {
 				runtime.delivery.markInflight(notice.deliveryId as string);
@@ -1545,6 +1727,25 @@ function stripControlCharacters(value: string): string {
 	return stripped;
 }
 
+/**
+ * The single spoken form of a whole reply, or "" when this turn is not spoken.
+ *
+ * The owner's rule is one reply, written once, delivered in both modalities when
+ * the question was spoken — so every part is joined into ONE utterance rather
+ * than one voice message per `[BREAK]`, which would talk over itself and bill
+ * per part.
+ *
+ * `[REPLY:...]` prefixes are stripped: the token is routing metadata, and
+ * reading a platform message id aloud is noise the listener cannot use.
+ */
+export function spokenReply(parts: readonly string[], voiceTurn: boolean): string {
+	if (!voiceTurn) return "";
+	return parts
+		.map((part) => part.replace(/^\[REPLY:[^\]\s]+\]\s*/, "").trim())
+		.filter((body) => body.length > 0)
+		.join("\n\n");
+}
+
 /** Marks a prepared delivery in flight and fans it out to every negotiated adapter. */
 function broadcastDelivery(runtime: Runtime, payload: ChatMessagePayload): void {
 	runtime.delivery.markInflight(payload.deliveryId as string);
@@ -1567,7 +1768,7 @@ function currentConversationNotice(origin: OriginRef, engagement?: { mentioned?:
 	return [
 		"## Current conversation",
 		`You are replying inside ${where}. This session is bound to exactly this one conversation.`,
-		`Shared memory (memory/daily and canonical axes) records EVERY conversation, each entry tagged with its origin. Entries whose origin differs from ${origin.platform}/${origin.kind}/${origin.conversationId} happened elsewhere: treat them as background knowledge only, never as something said here, and do not import their topics or in-flight work into this conversation unprompted.`,
+		`Shared memory (memory/daily and canonical axes) records EVERY conversation, each entry tagged with its origin. Entries whose canonical origin key differs from ${originKey(origin)} happened elsewhere: treat them as background knowledge only, never as something said here, and do not import their topics or in-flight work into this conversation unprompted.`,
 		...(origin.kind !== "dm" && origin.kind !== "loopback"
 			? [
 					engagement?.mentioned

@@ -193,6 +193,15 @@ function turnRow(turn: TrackedTurn, state: "running" | "stalled" | "finished", n
 
 function sessionRow(session: SessionListResult["sessions"][number]): RowView {
 	const last = parseIso(session.lastActivityAt);
+	const bootstrap = session.bootstrap ?? {
+		epoch: session.epoch,
+		pending: true,
+		appliedAt: null,
+		includedSections: [],
+		byteCount: 0,
+		truncated: false,
+		diagnostics: ["projection_unavailable"],
+	};
 	return {
 		key: originId(session.origin),
 		tone: "muted",
@@ -200,6 +209,9 @@ function sessionRow(session: SessionListResult["sessions"][number]): RowView {
 			title: originLabel(session.origin),
 			key: originId(session.origin),
 			epoch: `epoch ${formatCount(session.epoch)}`,
+			bootstrap: bootstrap.pending
+				? `bootstrap pending for epoch ${formatCount(bootstrap.epoch)}`
+				: `bootstrap applied · ${formatCount(bootstrap.byteCount)} bytes · ${bootstrap.includedSections.join(", ") || "metadata only"}${bootstrap.truncated ? " · truncated" : ""}`,
 			activity: last ? "" : "no activity yet",
 			created: "",
 		},
@@ -276,6 +288,10 @@ function statusRow(
 		: delivery.pending === 0
 			? "deliveries clear"
 			: `${pluralise(delivery.pending, "delivery", "deliveries")} pending · oldest ${formatDuration(delivery.oldestPendingAgeMs ?? 0)}`;
+	const context = status?.contextDiff;
+	const contextLabel = !context
+		? "conversation diff not reported"
+		: `${formatCount(context.unread)} unread · ${formatCount(context.expired)} expired · ${formatCount(context.truncated)} truncated`;
 
 	return {
 		key: "status",
@@ -291,6 +307,7 @@ function statusRow(
 			working: working === 0 ? "idle" : `${formatCount(working)} working`,
 			attention: attention.length === 0 ? "nothing needs you" : `⚠ ${pluralise(attention.length, "item")} needs you`,
 			delivery: deliveryLabel,
+			context: contextLabel,
 			profile: status ? `profile ${status.profileVersion}` : (statusError ?? "no answer from the socket"),
 			stream: `data ${formatClockSeconds(now)}`,
 		},
@@ -298,6 +315,7 @@ function statusRow(
 			alive: status ? "ok" : "danger",
 			attention: attention.length === 0 ? "muted" : danger ? "danger" : "warn",
 			delivery: !delivery ? "muted" : delivery.pending === 0 ? "ok" : "warn",
+			context: !context ? "muted" : context.unread > 0 || context.expired > 0 || context.truncated > 0 ? "warn" : "ok",
 			working: working === 0 ? "muted" : "active",
 		},
 	};

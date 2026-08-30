@@ -12,6 +12,14 @@ export const STATUS: GatewayStatusResult = {
 	schemaVersion: 8,
 	sessions: { active: 2 },
 	delivery: { pending: 0, oldestPendingAgeMs: null },
+	contextDiff: {
+		unread: 3,
+		expired: 287,
+		truncated: 12,
+		omittedOldestAt: "2026-08-26T00:00:00.000Z",
+		omittedNewestAt: "2026-08-27T10:00:00.000Z",
+		floorAt: null,
+	},
 };
 
 export const MONITOR: MonitorRecord = {

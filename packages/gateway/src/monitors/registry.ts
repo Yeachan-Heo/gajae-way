@@ -2,6 +2,8 @@ import { type MonitorRecord, type MonitorSpec, type TriggerSpec, validateOriginR
 import type { GatewayDatabase } from "../store/db";
 
 const BURST_POLICIES = new Set(["coalesce", "dedupe", "serialize", "drop"]);
+/** Upper bound on a per-monitor authoring instruction, in characters. */
+export const MONITOR_INSTRUCTION_MAX_LENGTH = 4000;
 
 export class MonitorRegistry {
 	readonly #database: GatewayDatabase;
@@ -11,12 +13,14 @@ export class MonitorRegistry {
 	add(spec: MonitorSpec): MonitorRecord {
 		validateSpec(spec);
 		const trigger = spec.trigger.kind === "webhook" ? { ...spec.trigger, route: crypto.randomUUID() } : spec.trigger;
+		const instruction = spec.instruction?.trim() || undefined;
 		const record: MonitorRecord = {
 			...spec,
 			trigger,
 			monitorId: crypto.randomUUID(),
 			burstPolicy: spec.burstPolicy ?? "coalesce",
 			enabled: spec.enabled ?? true,
+			instruction,
 			createdAt: new Date().toISOString(),
 		};
 		this.#database.withTransaction(() =>
@@ -28,6 +32,7 @@ export class MonitorRegistry {
 				burstPolicy: record.burstPolicy,
 				channelTargetJson: record.channelTarget ? JSON.stringify(record.channelTarget) : null,
 				enabled: record.enabled,
+				instruction: instruction ?? null,
 			}),
 		);
 		return record;
@@ -52,6 +57,7 @@ function rowToRecord(row: ReturnType<GatewayDatabase["monitorRows"]>[number]): M
 		burstPolicy: row.burst_policy as MonitorRecord["burstPolicy"],
 		channelTarget: row.channel_target_json ? JSON.parse(row.channel_target_json) : null,
 		enabled: Boolean(row.enabled),
+		instruction: row.instruction ?? undefined,
 		createdAt: row.created_at,
 	};
 }
@@ -67,6 +73,11 @@ export function validateSpec(spec: MonitorSpec): void {
 	if (spec.burstPolicy && !BURST_POLICIES.has(spec.burstPolicy)) throw new Error("invalid monitor burstPolicy");
 	validateTrigger(spec.trigger);
 	if (spec.channelTarget) validateOriginRef(spec.channelTarget.origin);
+	if (spec.instruction !== undefined) {
+		if (typeof spec.instruction !== "string") throw new Error("monitor instruction must be a string");
+		if (spec.instruction.length > MONITOR_INSTRUCTION_MAX_LENGTH)
+			throw new Error(`monitor instruction must be at most ${MONITOR_INSTRUCTION_MAX_LENGTH} characters`);
+	}
 }
 function validateTrigger(trigger: TriggerSpec): void {
 	if (!trigger || typeof trigger !== "object") throw new Error("monitor trigger is required");
