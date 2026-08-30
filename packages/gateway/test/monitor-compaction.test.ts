@@ -9,6 +9,7 @@ import {
 	type CompactionPort,
 	classifyAuthoringFailure,
 	decideSessionRoll,
+	isAsideTimeoutFailure,
 	MONITOR_CONTEXT_FAILURE_ROLL_THRESHOLD,
 	MONITOR_DIGEST_MAX_LENGTH,
 	MONITOR_DIGEST_MAX_NOTES,
@@ -141,7 +142,7 @@ test("the default compaction port is honest about doing nothing", async () => {
 	expect((await unavailableCompactionPort.run("event-session-e0")).status).toBe("unavailable");
 });
 
-test("authoring failures are classified as context-class only on context evidence", () => {
+test("authoring failures split across exactly three axes, and only context evidence is context", () => {
 	for (const message of [
 		"authoring response is empty",
 		"gjc sendTurn failed: context_too_large",
@@ -153,10 +154,28 @@ test("authoring failures are classified as context-class only on context evidenc
 	for (const message of [
 		"authoring response is not an array",
 		"Unexpected token < in JSON at position 0",
+		"JSON Parse error: Unexpected identifier",
 		"authoring response omits event abc",
-		"gjc ensureSession failed: socket closed",
+		"authoring response duplicates event abc",
 	])
-		expect(classifyAuthoringFailure(new Error(message))).toBe("other");
+		expect(classifyAuthoringFailure(new Error(message))).toBe("protocol");
+	for (const message of [
+		"aside collection worker timed out after 300s",
+		"aside_timeout",
+		"external tool failed: gh exited 1",
+		"memory lock held, run skipped",
+		"gjc ensureSession failed: socket closed",
+		"something nobody has seen before",
+	])
+		expect(classifyAuthoringFailure(new Error(message))).toBe("executor");
+	// The aside worker's cap is recognised as its own executor failure, and is
+	// never allowed to look like context exhaustion even when the message also
+	// mentions a long prompt.
+	expect(isAsideTimeoutFailure(new Error("aside collection timed out after 300000ms"))).toBe(true);
+	expect(isAsideTimeoutFailure(new Error("context_too_large"))).toBe(false);
+	expect(classifyAuthoringFailure(new Error("aside collection worker timed out after 300s; prompt is too long"))).toBe(
+		"executor",
+	);
 });
 
 test("the roll decision needs both the failure streak and a non-successful native compaction", () => {
@@ -360,7 +379,7 @@ test("a native compaction that fails outright rolls with its own structured reas
 	}
 });
 
-test("a malformed JSON response never rolls: it is not evidence about context", async () => {
+test("a protocol-class failure never rolls, however many times it repeats", async () => {
 	const directory = await mkdtemp(join(tmpdir(), "gajaeway-monitor-badjson-"));
 	try {
 		const compaction = stubPort("unavailable");
@@ -388,7 +407,9 @@ test("a malformed JSON response never rolls: it is not evidence about context", 
 		expect(turns.some((turn) => turn.prompt.includes("Context compaction"))).toBe(false);
 		const state = pipeline.sessionSafetyState(sessionKey);
 		expect(state.contextFailures).toBe(0);
-		expect(state.otherFailures).toBe(5);
+		expect(state.protocolFailures).toBe(5);
+		expect(state.executorFailures).toBe(0);
+		expect(state.staleContextFailures).toBe(0);
 		expect(state.pendingRoll).toBeUndefined();
 		database.close();
 	} finally {
@@ -471,6 +492,151 @@ test("a monitor with no instruction is unchanged, and rolls with a digest that o
 		expect(rolled.prompt).toContain("Context compaction");
 		expect(rolled.prompt).not.toContain("Standing instruction");
 		expect(rolled.prompt.startsWith("Author monitor events.\nContext compaction")).toBe(true);
+		database.close();
+	} finally {
+		await rm(directory, { recursive: true, force: true });
+	}
+});
+
+test("a healthy answer resets the streak, so isolated context failures never roll", async () => {
+	const directory = await mkdtemp(join(tmpdir(), "gajaeway-monitor-streak-reset-"));
+	try {
+		const compaction = stubPort("unavailable");
+		let fail = false;
+		const { database, registry, pipeline, turns } = await harness(directory, {
+			contextFailureRollThreshold: 2,
+			compaction,
+			respond: (prompt) => {
+				if (!fail) return echoNotes(prompt);
+				throw new Error("gjc sendTurn failed: context_too_large");
+			},
+		});
+		const monitor = registry.add({
+			name: "flaky",
+			trigger: { kind: "cron", schedule: "*/10 * * * *" },
+			eventTypes: ["flaky.tick"],
+			burstPolicy: "serialize",
+		});
+		const sessionKey = originKey(eventTypeOrigin("flaky.tick"));
+		// A single context_too_large, then a healthy turn — twice. The failures are
+		// never consecutive, so nothing may arm.
+		for (const tick of [0, 1, 2, 3]) {
+			fail = tick % 2 === 0;
+			await pipeline.submitAwaitable(monitor.monitorId, "flaky.tick", { tick });
+			const midway = pipeline.sessionSafetyState(sessionKey);
+			// Exactly one failure is on the books right after a failure, and the
+			// following healthy answer wipes it.
+			expect(midway.contextFailures).toBe(fail ? 1 : 0);
+			expect(midway.pendingRoll).toBeUndefined();
+		}
+		// Both failures were treated as real context failures (native compaction
+		// was asked each time) — they simply never became a streak.
+		expect(compaction.calls).toHaveLength(2);
+		expect(database.getSessionRecord(sessionKey)?.epoch).toBe(0);
+		expect(turns.some((turn) => turn.prompt.includes("Context compaction"))).toBe(false);
+		const state = pipeline.sessionSafetyState(sessionKey);
+		expect(state.contextFailures).toBe(0);
+		expect(state.lastRoll).toBeUndefined();
+		database.close();
+	} finally {
+		await rm(directory, { recursive: true, force: true });
+	}
+});
+
+test("a context failure on a replayed stale event does not feed the current session's streak", async () => {
+	const directory = await mkdtemp(join(tmpdir(), "gajaeway-monitor-stale-"));
+	try {
+		const compaction = stubPort("unavailable");
+		let mode: "ok" | "executor" | "context" = "executor";
+		const { database, registry, pipeline, turns } = await harness(directory, {
+			// 1 makes the assertion sharp: any COUNTED context failure would arm
+			// immediately, so a still-disarmed net proves the stale failure was
+			// dropped rather than merely under threshold.
+			contextFailureRollThreshold: 1,
+			compaction,
+			respond: (prompt) => {
+				if (mode === "ok") return echoNotes(prompt);
+				if (mode === "executor") throw new Error("external tool failed: gh exited 1");
+				throw new Error("gjc sendTurn failed: context_too_large");
+			},
+		});
+		const monitor = registry.add({
+			name: "stale",
+			trigger: { kind: "cron", schedule: "*/10 * * * *" },
+			eventTypes: ["stale.tick"],
+			burstPolicy: "serialize",
+		});
+		const sessionKey = originKey(eventTypeOrigin("stale.tick"));
+		// Park an event at `failed` with an executor failure: retryable, and no
+		// context evidence on the books.
+		const staleId = await pipeline.submitAwaitable(monitor.monitorId, "stale.tick", { tick: 0 });
+		expect(database.monitorFailure(staleId)?.code).toBe("executor_failed");
+		expect(pipeline.sessionSafetyState(sessionKey).contextFailures).toBe(0);
+		// Now the session starts answering with a context rejection, and reconcile
+		// replays that old event into it.
+		mode = "context";
+		await pipeline.reconcile();
+		const replayRow = database.monitorEventRows(monitor.monitorId).find((row) => row.event_id === staleId);
+		expect(replayRow?.dispatch_attempts).toBeGreaterThan(0);
+		expect(database.monitorFailure(staleId)?.code).toBe("authoring_context_exhausted");
+		// The replayed failure is recorded, but as stale: no streak, no arm, no roll.
+		const afterReplay = pipeline.sessionSafetyState(sessionKey);
+		expect(afterReplay.staleContextFailures).toBe(1);
+		expect(afterReplay.contextFailures).toBe(0);
+		expect(afterReplay.pendingRoll).toBeUndefined();
+		// No session row is even written when every turn throws, so "epoch 0" is
+		// the absence of a roll; the bound session id says the same thing directly.
+		expect(database.getSessionRecord(sessionKey)?.epoch ?? 0).toBe(0);
+		expect(new Set(turns.map((turn) => turn.sessionId))).toEqual(new Set(["event-session-e0"]));
+		// A native compaction is never requested on behalf of a stale event either.
+		expect(compaction.calls).toHaveLength(0);
+		// The same failure from the session's OWN fresh work still arms: the guard
+		// narrows the trigger, it does not disable it.
+		await pipeline.submitAwaitable(monitor.monitorId, "stale.tick", { tick: 1 });
+		const afterFresh = pipeline.sessionSafetyState(sessionKey);
+		expect(afterFresh.contextFailures).toBe(1);
+		expect(afterFresh.pendingRoll).toBe("context_failures_native_compaction_unavailable");
+		expect(compaction.calls).toEqual(["event-session-e0"]);
+		database.close();
+	} finally {
+		await rm(directory, { recursive: true, force: true });
+	}
+});
+
+test("an aside-worker timeout streak never rolls: an executor failure is not context evidence", async () => {
+	const directory = await mkdtemp(join(tmpdir(), "gajaeway-monitor-aside-"));
+	try {
+		const compaction = stubPort("unavailable");
+		const { database, registry, pipeline, turns } = await harness(directory, {
+			contextFailureRollThreshold: 2,
+			compaction,
+			// The real shape: the aside collection worker gives up at its 300s cap.
+			respond: () => {
+				throw new Error("aside collection worker timed out after 300000ms");
+			},
+		});
+		const monitor = registry.add({
+			name: "aside",
+			trigger: { kind: "cron", schedule: "*/10 * * * *" },
+			eventTypes: ["aside.tick"],
+			burstPolicy: "serialize",
+		});
+		const sessionKey = originKey(eventTypeOrigin("aside.tick"));
+		const eventIds: string[] = [];
+		for (let tick = 0; tick < 5; tick += 1)
+			eventIds.push(await pipeline.submitAwaitable(monitor.monitorId, "aside.tick", { tick }));
+		// Its own failure code, never aggregated with context exhaustion.
+		for (const eventId of eventIds) expect(database.monitorFailure(eventId)?.code).toBe("aside_timeout");
+		expect(compaction.calls).toHaveLength(0);
+		expect(database.getSessionRecord(sessionKey)?.epoch ?? 0).toBe(0);
+		expect(new Set(turns.map((turn) => turn.sessionId))).toEqual(new Set(["event-session-e0"]));
+		expect(turns.some((turn) => turn.prompt.includes("Context compaction"))).toBe(false);
+		const state = pipeline.sessionSafetyState(sessionKey);
+		expect(state.executorFailures).toBe(5);
+		expect(state.contextFailures).toBe(0);
+		expect(state.protocolFailures).toBe(0);
+		expect(state.pendingRoll).toBeUndefined();
+		expect(state.lastRoll).toBeUndefined();
 		database.close();
 	} finally {
 		await rm(directory, { recursive: true, force: true });
