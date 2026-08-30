@@ -9,28 +9,54 @@ import { MonitorRegistry } from "../src/monitors/registry";
 import {
 	buildMonitorSessionDigest,
 	EmptyAuthoringResponseError,
+	fallbackReasonCode,
 	isContextExhaustionFailure,
 	MONITOR_CONTEXT_FAILURE_THRESHOLD,
 	MONITOR_DIGEST_MAX_LENGTH,
 	MONITOR_DIGEST_MAX_NOTES,
+	shouldRollAfterNativeCompaction,
 } from "../src/monitors/session-health";
+import {
+	type CompactionOutcome,
+	type CompactionPort,
+	type CompactionRequest,
+	NO_CONTROL_CHANNEL,
+	UnavailableCompactionPort,
+} from "../src/orchestrator/compaction";
 import { GjcRuntimeError } from "../src/orchestrator/rebind";
 import { GatewayDatabase } from "../src/store/db";
 import { DeliveryLedger } from "../src/store/ledger";
 
 /**
- * Issue #68. gjc owns compaction (its `-p --mode json` path runs through
- * AgentSession.prompt() with compaction enabled), so the gateway must NOT roll a
- * monitor session on a turn ceiling. It observes health and falls back only on
- * proven compaction failure: consecutive context-family authoring failures.
+ * Issue #68. Order of preference is fixed: gjc owns compaction, so the gateway
+ * asks the runtime to compact (`compaction.run` behind CompactionPort) and only
+ * rolls the session as a last resort — when that native attempt left the session
+ * unrecovered AND context-family failures recurred to the threshold.
  *
  * Harness shape mirrors monitor-instruction.test.ts, with a scripted gjc port so
  * each turn's outcome (healthy / context-family failure / malformed response) is
- * chosen per turn.
+ * chosen per turn, plus an injectable CompactionPort recording every call.
  */
 type TurnOutcome = "ok" | "context_too_large" | "empty" | "bad_json" | "runtime_other";
 
-async function harness(directory: string, outcome: (turn: number) => TurnOutcome, contextFailureThreshold?: number) {
+/** Records every compaction.run call and returns a scripted outcome. */
+function recordingCompactionPort(outcome: CompactionOutcome) {
+	const calls: CompactionRequest[] = [];
+	const port: CompactionPort = {
+		run: async (request) => {
+			calls.push(request);
+			return outcome;
+		},
+	};
+	return { port, calls };
+}
+
+async function harness(
+	directory: string,
+	outcome: (turn: number) => TurnOutcome,
+	contextFailureThreshold?: number,
+	compaction?: CompactionPort,
+) {
 	const database = await GatewayDatabase.open(join(directory, "gateway.db"));
 	const registry = new MonitorRegistry(database);
 	const turns: Array<{ sessionId: string; prompt: string }> = [];
@@ -78,6 +104,7 @@ async function harness(directory: string, outcome: (turn: number) => TurnOutcome
 		delivery: new DeliveryService(new DeliveryLedger(database)),
 		emit: () => {},
 		...(contextFailureThreshold === undefined ? {} : { contextFailureThreshold }),
+		...(compaction === undefined ? {} : { compaction }),
 	});
 	return { database, registry, pipeline, turns };
 }
@@ -317,4 +344,151 @@ test("no event is lost or authored twice across a fallback roll boundary", async
 
 test("the default threshold demands a run of failures, not a single blip", () => {
 	expect(MONITOR_CONTEXT_FAILURE_THRESHOLD).toBeGreaterThan(1);
+});
+
+test("the fallback gate is a pure decision over the streak and the native result", () => {
+	const base = { consecutiveContextFailures: 2, threshold: 2 } as const;
+	// The runtime says it compacted: never roll, whatever the streak.
+	expect(shouldRollAfterNativeCompaction({ ...base, native: "compacted" })).toBe(false);
+	// Unrecovered results permit the last resort.
+	expect(shouldRollAfterNativeCompaction({ ...base, native: "unavailable" })).toBe(true);
+	expect(shouldRollAfterNativeCompaction({ ...base, native: "failed" })).toBe(true);
+	expect(shouldRollAfterNativeCompaction({ ...base, native: "skipped" })).toBe(true);
+	// No native attempt at all is not proof of anything.
+	expect(shouldRollAfterNativeCompaction({ ...base, native: "not_attempted" })).toBe(false);
+	// Below the threshold nothing rolls, however unrecovered the session is.
+	expect(shouldRollAfterNativeCompaction({ consecutiveContextFailures: 1, threshold: 2, native: "unavailable" })).toBe(
+		false,
+	);
+	// The reason code names the native result, so an operator can tell the cases apart.
+	expect(fallbackReasonCode("unavailable")).toBe("context_exhausted_after_native_unavailable");
+	expect(fallbackReasonCode("failed")).toBe("context_exhausted_after_native_failed");
+});
+
+test("the default compaction port reports unavailable instead of faking a compaction", async () => {
+	const outcome = await new UnavailableCompactionPort().run({
+		sessionId: "s-1",
+		originKey: "monitor/eventtype/x",
+		epoch: 0,
+	});
+	expect(outcome).toEqual({ status: "unavailable", code: NO_CONTROL_CHANNEL });
+});
+
+test("native compaction is attempted on context pressure, and success prevents the fallback", async () => {
+	const directory = await mkdtemp(join(tmpdir(), "gajaeway-monitor-health-native-ok-"));
+	try {
+		const { port, calls } = recordingCompactionPort({ status: "compacted", code: "compacted_by_runtime" });
+		// Every turn is context-family: without the native remedy this would roll.
+		const { database, registry, pipeline } = await harness(directory, () => "context_too_large", 2, port);
+		const monitor = serializeMonitor(registry, "native.tick");
+		const sessionKey = originKey(eventTypeOrigin("native.tick"));
+		for (let tick = 0; tick < 5; tick += 1) await pipeline.submitAwaitable(monitor.monitorId, "native.tick", { tick });
+		// The runtime was asked every time, with the bound session id and epoch.
+		expect(calls).toHaveLength(5);
+		expect(calls[0]).toEqual({ sessionId: "event-session-e0", originKey: sessionKey, epoch: 0 });
+		// A reported compaction clears the streak, so the last resort never fires.
+		// (No session row exists at all while every turn fails before the counter,
+		// which is epoch 0 by definition.)
+		expect(database.getSessionRecord(sessionKey)?.epoch ?? 0).toBe(0);
+		database.close();
+	} finally {
+		await rm(directory, { recursive: true, force: true });
+	}
+});
+
+test("a skipped or failed native compaction still gates on the threshold, then rolls", async () => {
+	const directory = await mkdtemp(join(tmpdir(), "gajaeway-monitor-health-native-skip-"));
+	try {
+		const { port, calls } = recordingCompactionPort({ status: "skipped", code: "below_compaction_threshold" });
+		const { database, registry, pipeline } = await harness(
+			directory,
+			(turn) => (turn < 2 ? "context_too_large" : "ok"),
+			2,
+			port,
+		);
+		const monitor = serializeMonitor(registry, "skipped.tick");
+		const sessionKey = originKey(eventTypeOrigin("skipped.tick"));
+		await pipeline.submitAwaitable(monitor.monitorId, "skipped.tick", { tick: 0 });
+		// One failure plus a skipped compaction is not yet the threshold.
+		expect(database.getSessionRecord(sessionKey)?.epoch ?? 0).toBe(0);
+		await pipeline.submitAwaitable(monitor.monitorId, "skipped.tick", { tick: 1 });
+		expect(calls).toHaveLength(2);
+		await pipeline.submitAwaitable(monitor.monitorId, "skipped.tick", { tick: 2 });
+		expect(database.getSessionRecord(sessionKey)?.epoch).toBe(1);
+		database.close();
+	} finally {
+		await rm(directory, { recursive: true, force: true });
+	}
+});
+
+test("an unavailable port plus threshold context failures fires the fallback with a native-aware reason", async () => {
+	const directory = await mkdtemp(join(tmpdir(), "gajaeway-monitor-health-native-unavail-"));
+	try {
+		const { port, calls } = recordingCompactionPort({ status: "unavailable", code: NO_CONTROL_CHANNEL });
+		const { database, registry, pipeline, turns } = await harness(
+			directory,
+			(turn) => (turn < 2 ? "context_too_large" : "ok"),
+			2,
+			port,
+		);
+		const monitor = serializeMonitor(registry, "unavail.tick", "Report the queue.");
+		const sessionKey = originKey(eventTypeOrigin("unavail.tick"));
+		const logged: string[] = [];
+		const original = console.error;
+		console.error = (...args: unknown[]) => {
+			logged.push(args.map(String).join(" "));
+		};
+		try {
+			for (let tick = 0; tick < 3; tick += 1)
+				await pipeline.submitAwaitable(monitor.monitorId, "unavail.tick", { tick });
+		} finally {
+			console.error = original;
+		}
+		expect(calls).toHaveLength(2);
+		expect(database.getSessionRecord(sessionKey)?.epoch).toBe(1);
+		// The roll's structured reason names both facts: context exhausted, and what
+		// the native attempt did about it.
+		const rollLine = logged.find((line) => line.startsWith("monitor session rolled"))!;
+		expect(rollLine).toContain(`reason=${fallbackReasonCode("unavailable")}`);
+		expect(rollLine).toContain("native_compaction=unavailable");
+		expect(rollLine).toContain("consecutive_context_failures=2/2");
+		// The native attempt itself is logged with its own coded status.
+		expect(logged.some((line) => line.includes(`native compaction`) && line.includes(NO_CONTROL_CHANNEL))).toBe(true);
+		// And the fresh session's first prompt carries the digest.
+		expect(turns.at(-1)!.prompt).toContain("Session recovery");
+		database.close();
+	} finally {
+		await rm(directory, { recursive: true, force: true });
+	}
+});
+
+test("the digest path never calls a model: no extra turn, and no gjc surface in the module", async () => {
+	const directory = await mkdtemp(join(tmpdir(), "gajaeway-monitor-health-nollm-"));
+	try {
+		const { port } = recordingCompactionPort({ status: "unavailable", code: NO_CONTROL_CHANNEL });
+		const { database, registry, pipeline, turns } = await harness(
+			directory,
+			(turn) => (turn < 2 ? "context_too_large" : "ok"),
+			2,
+			port,
+		);
+		const monitor = serializeMonitor(registry, "nollm.tick", "Keep it short.");
+		const sessionKey = originKey(eventTypeOrigin("nollm.tick"));
+		for (let tick = 0; tick < 3; tick += 1) await pipeline.submitAwaitable(monitor.monitorId, "nollm.tick", { tick });
+		expect(database.getSessionRecord(sessionKey)?.epoch).toBe(1);
+		// Exactly one turn per dispatch: building the digest summarised nothing with
+		// a model, it only reassembled durable text.
+		expect(turns).toHaveLength(3);
+		const rolled = turns.at(-1)!;
+		// The digest is verbatim assembly of the instruction plus stored notes.
+		expect(rolled.prompt).toContain("Standing instruction: Keep it short.");
+		// Static guarantee: the digest module cannot reach a model at all.
+		const source = await Bun.file("packages/gateway/src/monitors/session-health.ts").text();
+		expect(source).not.toContain("sendTurn");
+		expect(source).not.toContain("GjcPort");
+		expect(source).not.toContain("gjc-client");
+		database.close();
+	} finally {
+		await rm(directory, { recursive: true, force: true });
+	}
 });

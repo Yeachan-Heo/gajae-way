@@ -14,23 +14,31 @@
  * observed past 900K, so the budget the strategy trusts and the budget the
  * provider enforces disagree.
  *
- * Therefore compaction is the runtime's job and the gateway does NOT try to do
- * it. The gateway's job is:
+ * Therefore compaction is the runtime's job. The gateway's order of preference
+ * is fixed:
  *
  * 1. observe monitor session health (turn count, and whether an authoring
- *    failure was context-family or not), and
- * 2. fall back ONLY on PROVEN compaction failure — a run of consecutive
- *    context-family failures — by rolling the session with a digest that
- *    preserves continuity.
+ *    failure was context-family or not);
+ * 2. on context pressure, ASK THE RUNTIME to compact through its own control
+ *    surface (`compaction.run`, behind CompactionPort);
+ * 3. only when that native attempt is explicitly `failed`/`skipped`, or no
+ *    control channel exists at all (`unavailable`), AND context-family failures
+ *    have recurred to the threshold, roll the session with a digest.
  *
- * A healthy session is never rolled, however many turns it accumulates: a turn
- * ceiling would throw away working context to protect against a failure the
- * runtime is already handling.
+ * Step 3 is the last resort. A healthy session is never rolled, however many
+ * turns it accumulates: a turn ceiling would throw away working context to
+ * protect against a failure the runtime is already handling.
  *
- * Everything in this module is pure (no database, clock, or config), so the
- * classification and the digest bounds are unit-testable on their own.
+ * The gateway NEVER summarises with an LLM. The digest below is pure string
+ * assembly over the monitor's own instruction and its already-authored notes —
+ * a second summary contract would drift from GJC's.
+ *
+ * Everything in this module is pure (no database, clock, config, or model
+ * calls), so the classification, the fallback gate and the digest bounds are
+ * unit-testable on their own.
  */
 
+import type { CompactionStatus } from "../orchestrator/compaction";
 import { GjcRuntimeError, NO_ASSISTANT_TEXT_CODE } from "../orchestrator/rebind";
 
 /**
@@ -61,8 +69,43 @@ export const CONTEXT_EXHAUSTION_CODES: ReadonlySet<string> = new Set([
 	"context_window_exceeded",
 ]);
 
-/** The public-safe reason recorded when the fallback roll fires. */
-export const CONTEXT_EXHAUSTION_REASON = "compaction_failed_context_exhausted";
+/**
+ * Native-compaction results that leave the session unrecovered, and therefore
+ * permit the last-resort digest roll. `compacted` is deliberately absent: if the
+ * runtime says it compacted, the gateway must not roll.
+ */
+const UNRECOVERED_BY_NATIVE: ReadonlySet<CompactionStatus> = new Set<CompactionStatus>([
+	"failed",
+	"skipped",
+	"unavailable",
+]);
+
+/** No native attempt has been made for this session yet. */
+export type NativeCompactionState = CompactionStatus | "not_attempted";
+
+/**
+ * The fallback gate, as one pure decision. Both conditions are required:
+ * context-family failures have recurred to the threshold, AND the native
+ * compaction attempt left the session unrecovered.
+ */
+export function shouldRollAfterNativeCompaction(input: {
+	readonly consecutiveContextFailures: number;
+	readonly threshold: number;
+	readonly native: NativeCompactionState;
+}): boolean {
+	if (input.consecutiveContextFailures < input.threshold) return false;
+	return input.native !== "not_attempted" && UNRECOVERED_BY_NATIVE.has(input.native);
+}
+
+/**
+ * The public-safe reason code recorded when the fallback fires. It names BOTH
+ * facts an operator needs: that the context was exhausted, and what the native
+ * compaction attempt did about it (`…after_native_unavailable`,
+ * `…after_native_failed`, `…after_native_skipped`).
+ */
+export function fallbackReasonCode(native: NativeCompactionState): string {
+	return `context_exhausted_after_native_${native}`;
+}
 
 /**
  * True when this failure is context-family. Code-based: an error without a

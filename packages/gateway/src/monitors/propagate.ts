@@ -10,19 +10,22 @@ import {
 } from "@gajaeway/protocol";
 import type { DeliveryService } from "../delivery/delivery";
 import type { MemoryClosureQueue } from "../memory/closure";
+import { type CompactionPort, type CompactionStatus, UnavailableCompactionPort } from "../orchestrator/compaction";
 import type { GjcPort } from "../orchestrator/gjc-client";
 import type { GatewayDatabase } from "../store/db";
 import { MONITOR_EVENT_MAX_DISPATCH_ATTEMPTS, RECONCILABLE_STAGES, TERMINAL_STAGES } from "../store/db";
 import type { MonitorRegistry } from "./registry";
 import {
 	buildMonitorSessionDigest,
-	CONTEXT_EXHAUSTION_REASON,
 	EmptyAuthoringResponseError,
+	fallbackReasonCode,
 	isContextExhaustionFailure,
 	isEmptyAuthoringResponse,
 	MONITOR_CONTEXT_FAILURE_THRESHOLD,
 	MONITOR_DIGEST_MAX_NOTES,
 	type MonitorDigestNote,
+	type NativeCompactionState,
+	shouldRollAfterNativeCompaction,
 } from "./session-health";
 
 /** Product-level semantics for the seeded maintenance events (generic, persona-independent). */
@@ -98,6 +101,14 @@ export class MonitorPropagator {
 	readonly #contextFailures = new Map<string, number>();
 	/** Consecutive context-family failures that trigger the fallback roll. */
 	readonly #contextFailureThreshold: number;
+	/**
+	 * Result of the most recent native-compaction attempt per session origin. The
+	 * fallback roll requires this to be an unrecovered status, so the gateway can
+	 * never roll a session the runtime just told it it had compacted.
+	 */
+	readonly #nativeCompaction = new Map<string, NativeCompactionState>();
+	/** GJC's own compaction control surface (`compaction.run`). */
+	readonly #compaction: CompactionPort;
 	constructor(options: {
 		database: GatewayDatabase;
 		registry: MonitorRegistry;
@@ -125,6 +136,13 @@ export class MonitorPropagator {
 		 * MONITOR_CONTEXT_FAILURE_THRESHOLD.
 		 */
 		contextFailureThreshold?: number;
+		/**
+		 * GJC's native compaction control surface. Defaults to
+		 * UnavailableCompactionPort, which honestly reports that a one-shot
+		 * `gjc -p --mode json` process has no control channel rather than
+		 * pretending a compaction ran.
+		 */
+		compaction?: CompactionPort;
 	}) {
 		this.#database = options.database;
 		this.#registry = options.registry;
@@ -143,6 +161,7 @@ export class MonitorPropagator {
 			options.fencedUpdate ??
 			((eventId, lease, batch, at) => this.#database.monitorEventFencedUpdate(eventId, lease, "batched", batch, at));
 		this.#contextFailureThreshold = options.contextFailureThreshold ?? MONITOR_CONTEXT_FAILURE_THRESHOLD;
+		this.#compaction = options.compaction ?? new UnavailableCompactionPort();
 	}
 	/** Cancels pending burst timers so a closed database is never touched after shutdown. */
 	dispose(): void {
@@ -414,19 +433,23 @@ export class MonitorPropagator {
 		// source of a failure code. The previous message-substring mapping matched
 		// literals ("sendTurn", "ensureSession") that no real error carries, so
 		// every production authoring failure was recorded as `internal_error`.
+		// The session this attempt bound, so the compaction control action and the
+		// failure path can name it after the turn threw.
+		let boundSessionId: string | undefined;
 		let phase: DispatchPhase = "bind";
 		try {
-			// Fallback boundary (issue #68). It sits HERE, after the per-origin turn
-			// chain has been acquired and before this batch's session is bound: the
-			// previous batch's authoring turn has already settled, and this batch's
-			// events are claimed under live leases but not yet authored. A roll can
-			// therefore neither strand an in-flight batch nor let one be authored
-			// twice — the events simply land in the new epoch's session.
-			const digest = this.#rollIfCompactionProvenFailed(sessionOriginKey, JSON.stringify(sessionOrigin), monitor);
+			// Last-resort fallback boundary (issue #68). It sits HERE, after the
+			// per-origin turn chain has been acquired and before this batch's session
+			// is bound: the previous batch's authoring turn has already settled, and
+			// this batch's events are claimed under live leases but not yet authored.
+			// A roll can therefore neither strand an in-flight batch nor let one be
+			// authored twice — the events simply land in the new epoch's session.
+			const digest = this.#rollIfNativeCompactionFailed(sessionOriginKey, JSON.stringify(sessionOrigin), monitor);
 			const { sessionId } = await this.#gjc.ensureSession(
 				sessionOriginKey,
 				this.#database.getSessionRecord(sessionOriginKey)?.epoch ?? 0,
 			);
+			boundSessionId = sessionId;
 			// Guidance order: the monitor's own instruction first (it is what the
 			// owner actually asked this monitor to do), then any built-in
 			// maintenance semantics for the claimed event types. Without either,
@@ -578,21 +601,35 @@ export class MonitorPropagator {
 			// The raw error body can carry secrets and is never persisted or logged.
 			const contextExhausted = isContextExhaustionFailure(error);
 			const code: DispatchFailureCode = contextExhausted ? "authoring_context_exhausted" : failureCode(error, phase);
-			// Health accounting for the fallback gate: only context-family failures
-			// accumulate. Anything else is proof the session still answers, so the
-			// streak is cleared — a monitor whose JSON keeps failing must never be
-			// mistaken for one whose context is exhausted.
+			// Health accounting: only context-family failures accumulate. Anything
+			// else is proof the session still answers, so the streak AND the recorded
+			// native-compaction state are cleared — a monitor whose JSON keeps
+			// failing must never be mistaken for one whose context is exhausted.
 			if (contextExhausted) {
 				const streak = (this.#contextFailures.get(sessionOriginKey) ?? 0) + 1;
 				this.#contextFailures.set(sessionOriginKey, streak);
 				console.error(
 					`monitor authoring context failure ${streak}/${this.#contextFailureThreshold} origin=${sessionOriginKey} code=${code}`,
 				);
-			} else this.#contextFailures.delete(sessionOriginKey);
+			} else {
+				this.#contextFailures.delete(sessionOriginKey);
+				this.#nativeCompaction.delete(sessionOriginKey);
+			}
 			for (const row of leased) {
 				this.#database.monitorEventFencedFail(row.event_id, leaseId, batchId, code, `dispatch phase failed (${code})`);
 			}
 			console.error(`monitor dispatch failed (${code}): events ${claimed.map((row) => row.event_id).join(",")}`);
+			// PREFERRED REMEDY, tried before any gateway-side fallback: ask the
+			// runtime to compact this session through its own control surface. The
+			// leases and the per-origin turn chain are still held here, so no other
+			// attempt can touch the session while the control action runs.
+			if (contextExhausted) {
+				await this.#runNativeCompaction(
+					sessionOriginKey,
+					boundSessionId,
+					this.#database.getSessionRecord(sessionOriginKey)?.epoch ?? 0,
+				);
+			}
 		} finally {
 			stopHeartbeat();
 			// Release the leases this attempt holds. Lease-guarded: if this attempt
@@ -604,30 +641,71 @@ export class MonitorPropagator {
 		}
 	}
 	/**
-	 * THE ONE monitor-session recovery choke point (issue #68).
+	 * THE ONE place the gateway asks GJC to compact a monitor session.
 	 *
-	 * gjc owns compaction: the non-interactive `-p --mode json` path runs through
-	 * AgentSession.prompt() with compaction enabled by default, and the gateway
-	 * deliberately does not attempt its own. This is the FALLBACK for the case
-	 * where compaction is proven not to be working — a run of consecutive
-	 * context-family failures on one session (observed: zero compaction entries,
-	 * 14 MB transcripts, every turn failing at ~918K tokens on gjc 0.15.3, which
-	 * predates adaptive compaction).
+	 * Compaction belongs to the runtime (`compaction.run` on its control surface),
+	 * and the gateway must never grow a second, drifting summariser. The default
+	 * port reports `unavailable` because a one-shot `gjc -p --mode json` process
+	 * has no control channel to carry the action; a real SDK/control session drops
+	 * in behind CompactionPort with no change here.
 	 *
-	 * A healthy session is never rolled, however many turns it has accumulated.
-	 * When the runtime handles the case natively (a newer gjc, or a compaction
-	 * signal the gateway can read), this method is the only place that changes.
+	 * The recorded status is what gates the last-resort roll: a `compacted` result
+	 * clears the failure streak, because the runtime has just fixed the condition
+	 * the streak was evidence of.
+	 */
+	async #runNativeCompaction(sessionOriginKey: string, sessionId: string | undefined, epoch: number): Promise<void> {
+		if (!sessionId) {
+			// The turn failed before a session was bound, so there is nothing to
+			// compact and no attempt to report.
+			this.#nativeCompaction.set(sessionOriginKey, "not_attempted");
+			return;
+		}
+		let outcome: { status: CompactionStatus; code: string };
+		try {
+			outcome = await this.#compaction.run({ sessionId, originKey: sessionOriginKey, epoch });
+		} catch {
+			// A port that throws is a failed attempt, not a crash of the dispatcher.
+			// The raw error is dropped: only the coded status is public-safe.
+			outcome = { status: "failed", code: "compaction_port_threw" };
+		}
+		this.#nativeCompaction.set(sessionOriginKey, outcome.status);
+		console.error(`monitor native compaction origin=${sessionOriginKey} status=${outcome.status} code=${outcome.code}`);
+		if (outcome.status === "compacted") {
+			// The runtime says the context is compacted, so the accumulated failures
+			// are no longer evidence of anything: the next turn starts clean and the
+			// fallback must not fire.
+			this.#contextFailures.delete(sessionOriginKey);
+		}
+	}
+	/**
+	 * THE LAST RESORT (issue #68). Rolls the session with a continuity digest,
+	 * but ONLY when both conditions hold: context-family authoring failures have
+	 * recurred to the threshold, AND the native compaction attempt left the
+	 * session unrecovered (`failed`, `skipped`, or `unavailable`). A session the
+	 * runtime reported as compacted is never rolled, and neither is a healthy one,
+	 * however many turns it has accumulated.
+	 *
+	 * The digest is pure string assembly (no model call) over the monitor's own
+	 * instruction and its already-authored notes.
 	 *
 	 * Returns the digest to inject into this turn's prompt, or undefined when no
 	 * roll fired.
 	 */
-	#rollIfCompactionProvenFailed(
+	#rollIfNativeCompactionFailed(
 		sessionOriginKey: string,
 		originRefJson: string,
 		monitor: MonitorRecord,
 	): string | undefined {
 		const streak = this.#contextFailures.get(sessionOriginKey) ?? 0;
-		if (streak < this.#contextFailureThreshold) return undefined;
+		const native = this.#nativeCompaction.get(sessionOriginKey) ?? "not_attempted";
+		if (
+			!shouldRollAfterNativeCompaction({
+				consecutiveContextFailures: streak,
+				threshold: this.#contextFailureThreshold,
+				native,
+			})
+		)
+			return undefined;
 		// Read the turn count BEFORE the roll: bumpEpoch resets it, and the count of
 		// the epoch that died is the useful number for an operator.
 		const turnsInFailedEpoch = this.#database.sessionTurnCount(sessionOriginKey);
@@ -643,11 +721,13 @@ export class MonitorPropagator {
 		// (and a fresh idempotency key) for this origin.
 		this.#database.withTransaction(() => this.#database.bumpEpoch(sessionOriginKey, originRefJson));
 		this.#contextFailures.delete(sessionOriginKey);
-		// Coded reason only: the operator gets the structured cause and the counts,
-		// never the runtime's raw error text (it can carry secrets). The per-event
-		// `authoring_context_exhausted` failure rows are the durable evidence.
+		this.#nativeCompaction.delete(sessionOriginKey);
+		// Coded reason only: the operator gets the structured cause — including what
+		// the native attempt did — and the counts, never the runtime's raw error
+		// text (it can carry secrets). The per-event `authoring_context_exhausted`
+		// failure rows are the durable evidence.
 		console.error(
-			`monitor session rolled reason=${CONTEXT_EXHAUSTION_REASON} origin=${sessionOriginKey} monitor=${monitor.monitorId} consecutive_context_failures=${streak}/${this.#contextFailureThreshold} turns_in_failed_epoch=${turnsInFailedEpoch} digest_bytes=${digest.length}`,
+			`monitor session rolled reason=${fallbackReasonCode(native)} origin=${sessionOriginKey} monitor=${monitor.monitorId} native_compaction=${native} consecutive_context_failures=${streak}/${this.#contextFailureThreshold} turns_in_failed_epoch=${turnsInFailedEpoch} digest_bytes=${digest.length}`,
 		);
 		return digest;
 	}

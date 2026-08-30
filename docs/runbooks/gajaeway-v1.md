@@ -46,7 +46,7 @@ Use schema version 1 only. Each credential is a file reference, never an inline 
 
 `model` accepts either a gjc model selector string such as `"openai/gpt-5.2"` or a preset object such as `{ "preset": "codex-medium" }`. Presets are resolved by gjc from its merged built-in and `~/.gjc/agent/models.yml` profile catalog. A preset's `model_mapping.default` may be an ordered selector array; gajaeway invokes the preset with `--mpreset`, so gjc retains its native availability checks, retry budgets, sticky selection, and fallback-chain behavior instead of the gateway attempting unsafe whole-turn retries.
 
-`monitorContextFailureThreshold` (1–10, default 2) is how many consecutive context-family authoring failures (empty/zero-token answer, `context_too_large`) on one monitor session constitute proven compaction failure. Only then does the gateway roll that session and seed the new one with a digest of the monitor's instruction and its recent authored notes. gjc owns compaction; a healthy session is never rolled. Restart-only. See `docs/monitors.md`.
+`monitorContextFailureThreshold` (1–10, default 2) governs the last-resort monitor session roll. On context pressure the gateway first asks GJC to compact the session through its own control action (`compaction.run`); only if that attempt is `failed`, `skipped`, or `unavailable` — and context-family authoring failures (empty/zero-token answer, `context_too_large`) have recurred this many times in a row — does the gateway roll the session and seed the new one with a digest of the monitor's instruction and its recent authored notes. The gateway never summarises with a model. Restart-only. See `docs/monitors.md`.
 
 ## Adapters and engagement
 
