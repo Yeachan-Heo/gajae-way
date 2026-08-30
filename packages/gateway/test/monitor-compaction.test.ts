@@ -6,8 +6,8 @@ import { eventTypeOrigin, originKey } from "@gajaeway/protocol";
 import { DeliveryService } from "../src/delivery/delivery";
 import {
 	buildMonitorCompactionDigest,
-	classifyAuthoringFailure,
 	type CompactionPort,
+	classifyAuthoringFailure,
 	decideSessionRoll,
 	MONITOR_CONTEXT_FAILURE_ROLL_THRESHOLD,
 	MONITOR_DIGEST_MAX_LENGTH,
@@ -315,8 +315,7 @@ test("a compaction port that reports success keeps the session, however long the
 			burstPolicy: "serialize",
 		});
 		const sessionKey = originKey(eventTypeOrigin("native.tick"));
-		for (let tick = 0; tick < 6; tick += 1)
-			await pipeline.submitAwaitable(monitor.monitorId, "native.tick", { tick });
+		for (let tick = 0; tick < 6; tick += 1) await pipeline.submitAwaitable(monitor.monitorId, "native.tick", { tick });
 		// Native compaction was asked every time and said it handled it, so the
 		// safety net stays holstered.
 		expect(compaction.calls).toHaveLength(6);
@@ -428,8 +427,7 @@ test("no event is lost or authored twice across a roll boundary", async () => {
 		expect(database.getSessionRecord(sessionKey)?.epoch).toBe(1);
 		await pipeline.reconcile();
 		// No loss: every event, including the two that failed, ends with its note.
-		for (const eventId of [...healthy, ...failed])
-			expect(database.authoredOutput(eventId)).toBe(`note for ${eventId}`);
+		for (const eventId of [...healthy, ...failed]) expect(database.authoredOutput(eventId)).toBe(`note for ${eventId}`);
 		// No duplicate: a successful event is requested exactly once, and a failed
 		// one exactly twice (its failure plus its single recovery). Only the event
 		// PAYLOAD counts as a request; a rolled session's digest legitimately

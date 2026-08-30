@@ -66,8 +66,7 @@ test("turnTimeoutMs parses when bounded and rejects out-of-range values", () => 
 
 test("monitorContextFailureRollThreshold parses when bounded and rejects out-of-range values", () => {
 	expect(
-		parseConfigFile({ schemaVersion: 1, monitorContextFailureRollThreshold: 3 })
-			.monitorContextFailureRollThreshold,
+		parseConfigFile({ schemaVersion: 1, monitorContextFailureRollThreshold: 3 }).monitorContextFailureRollThreshold,
 	).toBe(3);
 	// Unset means the code default (MONITOR_CONTEXT_FAILURE_ROLL_THRESHOLD), not a config value.
 	expect(parseConfigFile({ schemaVersion: 1 }).monitorContextFailureRollThreshold).toBeUndefined();

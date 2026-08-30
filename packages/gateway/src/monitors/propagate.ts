@@ -16,8 +16,8 @@ import { MONITOR_EVENT_MAX_DISPATCH_ATTEMPTS, RECONCILABLE_STAGES, TERMINAL_STAG
 import {
 	type AuthoringFailureClass,
 	buildMonitorCompactionDigest,
-	classifyAuthoringFailure,
 	type CompactionPort,
+	classifyAuthoringFailure,
 	decideSessionRoll,
 	MONITOR_CONTEXT_FAILURE_ROLL_THRESHOLD,
 	MONITOR_DIGEST_MAX_NOTES,
@@ -157,8 +157,7 @@ export class MonitorPropagator {
 			options.fencedUpdate ??
 			((eventId, lease, batch, at) => this.#database.monitorEventFencedUpdate(eventId, lease, "batched", batch, at));
 		this.#compaction = options.compaction ?? unavailableCompactionPort;
-		this.#contextFailureRollThreshold =
-			options.contextFailureRollThreshold ?? MONITOR_CONTEXT_FAILURE_ROLL_THRESHOLD;
+		this.#contextFailureRollThreshold = options.contextFailureRollThreshold ?? MONITOR_CONTEXT_FAILURE_ROLL_THRESHOLD;
 	}
 	/** Cancels pending burst timers so a closed database is never touched after shutdown. */
 	dispose(): void {

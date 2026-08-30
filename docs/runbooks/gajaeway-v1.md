@@ -38,7 +38,7 @@ The CLI does not start the daemon: `gajaeway daemon run` prints the launcher com
   "webhook": { "bind": "127.0.0.1", "port": 8080, "exposeNonLoopback": false },
   "watcherRoots": ["/absolute/path"],
   "scriptRoot": "/absolute/path",
-  "monitorSessionTurnLimit": 24
+  "monitorContextFailureRollThreshold": 2
 }
 ```
 
@@ -46,7 +46,7 @@ Use schema version 1 only. Each credential is a file reference, never an inline 
 
 `model` accepts either a gjc model selector string such as `"openai/gpt-5.2"` or a preset object such as `{ "preset": "codex-medium" }`. Presets are resolved by gjc from its merged built-in and `~/.gjc/agent/models.yml` profile catalog. A preset's `model_mapping.default` may be an ordered selector array; gajaeway invokes the preset with `--mpreset`, so gjc retains its native availability checks, retry budgets, sticky selection, and fallback-chain behavior instead of the gateway attempting unsafe whole-turn retries.
 
-`monitorSessionTurnLimit` (2–500, default 24) is the authoring-turn ceiling for a monitor's event session before the gateway compacts it: the epoch rolls and the new session's first prompt carries a digest of the monitor's instruction and its recent authored notes. It is restart-only and separate from the 50-turn chat rotation. See `docs/monitors.md`.
+`monitorContextFailureRollThreshold` (1–20, default 2) is the monitor safety net, not a turn ceiling: native gjc auto-compaction keeps monitor sessions bounded, and a monitor that keeps answering is never rolled however many turns it takes. Only after this many consecutive context-class authoring failures (empty response, context-length rejection, zero-token completion) AND a native-compaction request that came back `unavailable`/`failed`/`skipped` does the epoch roll, with the new session's first prompt carrying a digest of the monitor's instruction and its recent authored notes. Restart-only, and separate from the 50-turn chat rotation. See `docs/monitors.md`.
 
 ## Adapters and engagement
 

@@ -261,10 +261,7 @@ function parseTurnTimeout(value: unknown): number {
  */
 function parseMonitorContextFailureRollThreshold(value: unknown): number {
 	if (!Number.isInteger(value) || (value as number) < 1 || (value as number) > 20)
-		throw new ConfigError(
-			"config_invalid",
-			"monitorContextFailureRollThreshold must be an integer between 1 and 20",
-		);
+		throw new ConfigError("config_invalid", "monitorContextFailureRollThreshold must be an integer between 1 and 20");
 	return value as number;
 }
 
