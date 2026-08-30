@@ -75,15 +75,27 @@ export const unavailableCompactionPort: CompactionPort = {
 };
 
 /**
- * Authoring failure classes.
+ * Authoring failure classes. THREE axes, deliberately the minimum that keeps
+ * the roll trigger honest:
  *
- * `context` — evidence that the session's context is the problem: an empty
- * response, an explicit context-length rejection, or a zero-token completion.
- * These are what a compaction failure looks like from the outside.
- * `other` — everything else (malformed JSON, contract violations, transport
- * errors). They say nothing about context size and MUST NOT arm a roll.
+ * - `context` — evidence that the session's context is the problem: an empty
+ *   response, an explicit context-length rejection, or a zero-token completion.
+ *   This is what a compaction failure looks like from the outside, and it is
+ *   the ONLY class the roll decision looks at.
+ * - `executor` — the work around the turn failed: a worker timeout (the aside
+ *   collection worker's 300s cap is the canonical case), an external tool
+ *   failure, a lock that made the run skip. The model may never have been
+ *   asked. Misreading these as context exhaustion would roll healthy sessions
+ *   every time an unrelated tool was slow.
+ * - `protocol` — the answer arrived but broke the contract: unparseable JSON,
+ *   wrong shape, missing/duplicate/unknown events. A non-empty answer proves
+ *   the context still works, so this is the opposite of context evidence.
+ *
+ * Unrecognised runtime failures fall into `executor`: they are unexplained
+ * machinery, not proof about context size, and the safety net must stay
+ * holstered without positive evidence.
  */
-export type AuthoringFailureClass = "context" | "other";
+export type AuthoringFailureClass = "context" | "executor" | "protocol";
 
 /** Substrings that identify a context-exhaustion failure across providers. */
 const CONTEXT_FAILURE_MARKERS = [
@@ -97,13 +109,62 @@ const CONTEXT_FAILURE_MARKERS = [
 	"0-token",
 ];
 
+/** Substrings that identify a contract violation in an answer that DID arrive. */
+const PROTOCOL_FAILURE_MARKERS = [
+	"authoring response is not an array",
+	"authoring response entry missing",
+	"authoring response contains unknown event",
+	"authoring response duplicates event",
+	"authoring response omits event",
+	"json",
+	"unexpected token",
+	"unexpected end of",
+];
+
+/**
+ * Substrings that identify executor-side failure. Listed for readability and
+ * for the aside-timeout case specifically; unrecognised failures land here
+ * anyway.
+ */
+const EXECUTOR_FAILURE_MARKERS = [
+	"timeout",
+	"timed out",
+	"aside",
+	"tool failed",
+	"external tool",
+	"lock",
+	"skipped",
+	"econnrefused",
+	"socket",
+	"spawn",
+];
+
+/** True when the failure is the aside collection worker giving up (its 300s cap). */
+export function isAsideTimeoutFailure(error: unknown): boolean {
+	const message = (error instanceof Error ? error.message : String(error)).toLowerCase();
+	if (message.includes("aside_timeout")) return true;
+	return message.includes("aside") && (message.includes("timeout") || message.includes("timed out"));
+}
+
 /**
  * Classifies an authoring failure. Pure, message-based: the raw message is
  * inspected here and then discarded — only the class escapes, never the text.
+ *
+ * Order matters. An executor timeout must never be read as context exhaustion,
+ * so the executor markers are checked BEFORE the context markers when they are
+ * unambiguous (aside timeout), and a protocol violation outranks the generic
+ * executor markers because "JSON" strings often mention sockets and tools.
  */
 export function classifyAuthoringFailure(error: unknown): AuthoringFailureClass {
 	const message = (error instanceof Error ? error.message : String(error)).toLowerCase();
-	return CONTEXT_FAILURE_MARKERS.some((marker) => message.includes(marker)) ? "context" : "other";
+	// Unambiguous executor failure first: an aside timeout says nothing at all
+	// about the session's context.
+	if (isAsideTimeoutFailure(error)) return "executor";
+	if (PROTOCOL_FAILURE_MARKERS.some((marker) => message.includes(marker))) return "protocol";
+	if (CONTEXT_FAILURE_MARKERS.some((marker) => message.includes(marker))) return "context";
+	if (EXECUTOR_FAILURE_MARKERS.some((marker) => message.includes(marker))) return "executor";
+	// No positive evidence: treat as executor machinery, never as context.
+	return "executor";
 }
 
 /**

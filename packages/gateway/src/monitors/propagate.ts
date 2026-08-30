@@ -19,6 +19,7 @@ import {
 	type CompactionPort,
 	classifyAuthoringFailure,
 	decideSessionRoll,
+	isAsideTimeoutFailure,
 	MONITOR_CONTEXT_FAILURE_ROLL_THRESHOLD,
 	MONITOR_DIGEST_MAX_NOTES,
 	type MonitorDigestNote,
@@ -49,6 +50,12 @@ type DispatchFailureCode =
 	// because only this class is evidence that compaction did not happen.
 	| "authoring_context_exhausted"
 	| "authoring_response_invalid"
+	// Executor-class: the aside collection worker hit its 300s cap. Its own code
+	// so it can never be read as, or aggregated with, context exhaustion.
+	| "aside_timeout"
+	// Executor-class: a worker timeout, external tool failure or lock skip that
+	// is not the aside worker.
+	| "executor_failed"
 	| "delivery_prepare_failed"
 	| "internal_error";
 
@@ -66,10 +73,22 @@ export interface MonitorDispatchFailure {
 export interface MonitorSessionSafetyState {
 	/** Authoring turns taken in the current epoch. OBSERVATIONAL ONLY. */
 	turns: number;
-	/** Consecutive context-class authoring failures with no answered turn since. */
+	/**
+	 * Consecutive context-class authoring failures attributable to the CURRENT
+	 * session, with no answered turn since. Reset by any non-empty answer and by
+	 * a roll. This is the only counter the roll decision reads.
+	 */
 	contextFailures: number;
-	/** Non-context authoring failures seen in this epoch (diagnostic). */
-	otherFailures: number;
+	/**
+	 * Context-class failures that were NOT counted because they came from a
+	 * stale or replayed event, or from a dead epoch (diagnostic). A dead
+	 * session's failures must never roll its successor.
+	 */
+	staleContextFailures: number;
+	/** Executor-class failures in this epoch — timeouts, tools, locks (diagnostic). */
+	executorFailures: number;
+	/** Protocol-class failures in this epoch — malformed or off-contract answers (diagnostic). */
+	protocolFailures: number;
 	/** Result of the last native-compaction attempt, or undefined if never attempted. */
 	nativeCompaction: NativeCompactionStatus | undefined;
 	/** Armed roll: consumed at the next dispatch boundary. */
@@ -426,8 +445,17 @@ export class MonitorPropagator {
 		this.#turnChains.set(sessionOriginKey, trackedTurn);
 		if (previousTurn) await previousTurn.catch(() => undefined);
 		// Bound outside the try so the failure handler can ask the compaction port
-		// to act on the very session that failed.
+		// to act on the very session that failed, and can tell whether that
+		// session is still the live one.
 		let boundSessionId: string | undefined;
+		let boundSessionEpoch: number | undefined;
+		// A replayed batch: reconcile bumps dispatch_attempts before re-dispatching
+		// a stranded or failed event, so a non-zero count means these events are
+		// not this session's own fresh work. Their context failure says nothing
+		// about the CURRENT session and must not feed its streak — the payload is
+		// old, and the failure may well have been produced against a session that
+		// no longer exists.
+		const replayedBatch = claimed.some((row) => row.dispatch_attempts > 0);
 		try {
 			// Safety-net roll boundary (issue #68). It sits HERE, after the
 			// per-origin turn chain has been acquired and before this batch's
@@ -437,11 +465,10 @@ export class MonitorPropagator {
 			// batch nor let one be authored twice — the events simply land in the
 			// new epoch's session. Leases and fencing are untouched.
 			const digest = this.#rollSessionIfArmed(sessionOriginKey, JSON.stringify(sessionOrigin), monitor);
-			const { sessionId } = await this.#gjc.ensureSession(
-				sessionOriginKey,
-				this.#database.getSessionRecord(sessionOriginKey)?.epoch ?? 0,
-			);
+			const boundEpoch = this.#database.getSessionRecord(sessionOriginKey)?.epoch ?? 0;
+			const { sessionId } = await this.#gjc.ensureSession(sessionOriginKey, boundEpoch);
 			boundSessionId = sessionId;
+			boundSessionEpoch = boundEpoch;
 			// Guidance order: the monitor's own instruction first (it is what the
 			// owner actually asked this monitor to do), then any built-in
 			// maintenance semantics for the claimed event types. Without either,
@@ -587,7 +614,14 @@ export class MonitorPropagator {
 				this.#database.monitorEventFencedFail(row.event_id, leaseId, batchId, code, `dispatch phase failed (${code})`);
 			}
 			console.error(`monitor dispatch failed (${code}): events ${claimed.map((row) => row.event_id).join(",")}`);
-			await this.#recordAuthoringFailure(sessionOriginKey, failureClass, boundSessionId, monitor);
+			await this.#recordAuthoringFailure({
+				sessionOriginKey,
+				failureClass,
+				sessionId: boundSessionId,
+				boundEpoch: boundSessionEpoch,
+				replayed: replayedBatch,
+				monitor,
+			});
 		} finally {
 			stopHeartbeat();
 			// Release the leases this attempt holds. Lease-guarded: if this attempt
@@ -608,7 +642,9 @@ export class MonitorPropagator {
 		const fresh: MonitorSessionSafetyState = {
 			turns: 0,
 			contextFailures: 0,
-			otherFailures: 0,
+			staleContextFailures: 0,
+			executorFailures: 0,
+			protocolFailures: 0,
 			nativeCompaction: undefined,
 			pendingRoll: undefined,
 			lastRoll: undefined,
@@ -620,22 +656,44 @@ export class MonitorPropagator {
 	 * THE ONE monitor-session failure classifier and native-compaction request
 	 * point (issue #68).
 	 *
-	 * A context-class failure means the session could not answer because of its
-	 * context. The response is to ask for native compaction first; the safety net
-	 * only arms when that request did not succeed AND the failure has repeated
-	 * `contextFailureRollThreshold` times in a row.
+	 * Only a context-class failure of the CURRENT session's own fresh work can
+	 * feed the streak. Everything else is recorded and dropped:
+	 * - executor-class (aside worker timeout, tool failure, lock skip) and
+	 *   protocol-class (malformed or off-contract answer) are not evidence about
+	 *   context size at all.
+	 * - a replayed batch (reconcile revived it) carries an old payload and may
+	 *   have failed against a session that is already gone.
+	 * - a bound epoch that is no longer current means the failure belongs to a
+	 *   dead session; its record must never roll the successor.
+	 *
+	 * When it does count, native compaction is requested first and the safety net
+	 * arms only if that did not succeed AND the streak has reached
+	 * `contextFailureRollThreshold` consecutive failures.
 	 */
-	async #recordAuthoringFailure(
-		sessionOriginKey: string,
-		failureClass: AuthoringFailureClass,
-		sessionId: string | undefined,
-		monitor: MonitorRecord,
-	): Promise<void> {
+	async #recordAuthoringFailure(input: {
+		sessionOriginKey: string;
+		failureClass: AuthoringFailureClass;
+		sessionId: string | undefined;
+		boundEpoch: number | undefined;
+		replayed: boolean;
+		monitor: MonitorRecord;
+	}): Promise<void> {
+		const { sessionOriginKey, failureClass, sessionId, boundEpoch, replayed, monitor } = input;
 		const state = this.#safetyState(sessionOriginKey);
-		if (failureClass !== "context") {
-			// A malformed response, a bind error or a delivery error says nothing
-			// about context size. Recorded for the operator, never a roll trigger.
-			state.otherFailures += 1;
+		if (failureClass === "executor") {
+			state.executorFailures += 1;
+			return;
+		}
+		if (failureClass === "protocol") {
+			state.protocolFailures += 1;
+			return;
+		}
+		const liveEpoch = this.#database.getSessionRecord(sessionOriginKey)?.epoch ?? 0;
+		if (replayed || boundEpoch === undefined || boundEpoch !== liveEpoch) {
+			state.staleContextFailures += 1;
+			console.error(
+				`monitor context failure not counted for ${sessionOriginKey} (monitor ${monitor.monitorId}): replayed=${replayed} bound_epoch=${boundEpoch ?? "none"} live_epoch=${liveEpoch}`,
+			);
 			return;
 		}
 		state.contextFailures += 1;
@@ -691,7 +749,11 @@ export class MonitorPropagator {
 		this.#database.withTransaction(() => this.#database.bumpEpoch(sessionOriginKey, originRefJson));
 		state.pendingRoll = undefined;
 		state.lastRoll = reason;
+		// The new epoch starts with a clean slate: the previous session's failure
+		// evidence is about a session that no longer exists.
 		state.contextFailures = 0;
+		state.executorFailures = 0;
+		state.protocolFailures = 0;
 		state.turns = 0;
 		console.error(
 			`monitor session rolled for ${sessionOriginKey} (monitor ${monitor.monitorId}): reason=${reason} native_compaction=${state.nativeCompaction ?? "not_attempted"} digest=${digest.length}B.`,
@@ -760,12 +822,15 @@ function failureCode(error: unknown, failureClass: AuthoringFailureClass): Dispa
 	// Context exhaustion outranks the phase codes: it is the one class the safety
 	// net acts on, and an operator must be able to see it in the event row.
 	if (failureClass === "context") return "authoring_context_exhausted";
-	// A malformed body never parses: that is a response-contract failure, not a
+	// A malformed or off-contract body is a response-contract failure, not a
 	// mystery internal error.
-	if (error instanceof SyntaxError) return "authoring_response_invalid";
+	if (failureClass === "protocol") return "authoring_response_invalid";
+	// Executor class from here down. The aside collection worker's timeout gets
+	// its own code so it can never be aggregated with context exhaustion.
+	if (isAsideTimeoutFailure(error)) return "aside_timeout";
 	const message = error instanceof Error ? error.message : String(error);
-	if (message.includes("authoring response is not an array")) return "authoring_response_invalid";
 	if (message.includes("sendTurn")) return "authoring_turn_failed";
 	if (message.includes("ensureSession")) return "session_bind_failed";
+	if (/timeout|timed out|tool failed|external tool|lock/i.test(message)) return "executor_failed";
 	return "internal_error";
 }
