@@ -8,8 +8,10 @@ import {
 	buildMonitorCompactionDigest,
 	type CompactionPort,
 	classifyAuthoringFailure,
+	classifyExecutorFailure,
 	decideSessionRoll,
 	isAsideTimeoutFailure,
+	isOrphanedExecutorFailure,
 	MONITOR_CONTEXT_FAILURE_ROLL_THRESHOLD,
 	MONITOR_DIGEST_MAX_LENGTH,
 	MONITOR_DIGEST_MAX_NOTES,
@@ -166,6 +168,7 @@ test("authoring failures split across exactly three axes, and only context evide
 		"memory lock held, run skipped",
 		"gjc ensureSession failed: socket closed",
 		"something nobody has seen before",
+		"aside exec collection exceeded 360s; child killed but Aside daemon task still running",
 	])
 		expect(classifyAuthoringFailure(new Error(message))).toBe("executor");
 	// The aside worker's cap is recognised as its own executor failure, and is
@@ -174,6 +177,33 @@ test("authoring failures split across exactly three axes, and only context evide
 	expect(isAsideTimeoutFailure(new Error("aside collection timed out after 300000ms"))).toBe(true);
 	expect(isAsideTimeoutFailure(new Error("context_too_large"))).toBe(false);
 	expect(classifyAuthoringFailure(new Error("aside collection worker timed out after 300s; prompt is too long"))).toBe(
+		"executor",
+	);
+});
+
+test("the executor class names its sub-kinds, with an orphaned external run outranking the timeout", () => {
+	// The drill shape: the child died on the wrapper's cap, the daemon job did
+	// not, and the next tick would stack another one.
+	for (const message of [
+		"aside exec collection exceeded 360s; child killed but Aside daemon task still running",
+		"child process terminated at 300s, external work still running",
+		"orphaned_executor: aside session left open",
+		"wrapper killed the child; daemon job is still active",
+	]) {
+		expect(isOrphanedExecutorFailure(new Error(message))).toBe(true);
+		expect(classifyExecutorFailure(new Error(message))).toBe("executor_orphaned_external_work");
+		// Still executor class: the class axis stays at three.
+		expect(classifyAuthoringFailure(new Error(message))).toBe("executor");
+	}
+	// A plain timeout with nothing left behind is a timeout, not an orphan.
+	expect(isOrphanedExecutorFailure(new Error("aside collection worker timed out after 300000ms"))).toBe(false);
+	expect(classifyExecutorFailure(new Error("aside collection worker timed out after 300000ms"))).toBe(
+		"executor_timeout",
+	);
+	expect(classifyExecutorFailure(new Error("external tool failed: gh exited 1"))).toBe("executor_failed");
+	// And an orphan report that also mentions context stays executor: a stacked
+	// external job is not evidence about this session's context.
+	expect(classifyAuthoringFailure(new Error("child killed but daemon task still running; prompt is too long"))).toBe(
 		"executor",
 	);
 });
@@ -637,6 +667,98 @@ test("an aside-worker timeout streak never rolls: an executor failure is not con
 		expect(state.protocolFailures).toBe(0);
 		expect(state.pendingRoll).toBeUndefined();
 		expect(state.lastRoll).toBeUndefined();
+		database.close();
+	} finally {
+		await rm(directory, { recursive: true, force: true });
+	}
+});
+
+/** The measured drill message: child dead on the wrapper's cap, daemon job alive. */
+const ORPHANED_MESSAGE =
+	"aside exec collection exceeded 360s; child killed but Aside daemon task still running (3 sessions, 10 tabs)";
+
+test("an orphaned-executor streak never rolls and never touches the context streak", async () => {
+	const directory = await mkdtemp(join(tmpdir(), "gajaeway-monitor-orphaned-"));
+	try {
+		const compaction = stubPort("unavailable");
+		const { database, registry, pipeline, turns } = await harness(directory, {
+			contextFailureRollThreshold: 2,
+			compaction,
+			respond: () => {
+				throw new Error(ORPHANED_MESSAGE);
+			},
+		});
+		const monitor = registry.add({
+			name: "orphan",
+			trigger: { kind: "cron", schedule: "*/10 * * * *" },
+			eventTypes: ["orphan.tick"],
+			burstPolicy: "serialize",
+		});
+		const sessionKey = originKey(eventTypeOrigin("orphan.tick"));
+		const eventIds: string[] = [];
+		for (let tick = 0; tick < 5; tick += 1)
+			eventIds.push(await pipeline.submitAwaitable(monitor.monitorId, "orphan.tick", { tick }));
+		// Its own code, never aggregated with the plain timeout or with context.
+		for (const eventId of eventIds) expect(database.monitorFailure(eventId)?.code).toBe("orphaned_executor");
+		// The session is left completely alone: no compaction request, no roll.
+		expect(compaction.calls).toHaveLength(0);
+		expect(database.getSessionRecord(sessionKey)?.epoch ?? 0).toBe(0);
+		expect(new Set(turns.map((turn) => turn.sessionId))).toEqual(new Set(["event-session-e0"]));
+		expect(turns.some((turn) => turn.prompt.includes("Context compaction"))).toBe(false);
+		const state = pipeline.sessionSafetyState(sessionKey);
+		expect(state.contextFailures).toBe(0);
+		expect(state.orphanedExecutorFailures).toBe(5);
+		expect(state.executorFailures).toBe(5);
+		expect(state.protocolFailures).toBe(0);
+		// The operator gets a coded reason, which is the whole point of this class.
+		expect(state.lastExecutorReason).toBe("executor_orphaned_external_work");
+		expect(state.pendingRoll).toBeUndefined();
+		expect(state.lastRoll).toBeUndefined();
+		database.close();
+	} finally {
+		await rm(directory, { recursive: true, force: true });
+	}
+});
+
+test("interleaved orphaned-executor and context failures advance only the context streak", async () => {
+	const directory = await mkdtemp(join(tmpdir(), "gajaeway-monitor-orphan-mixed-"));
+	try {
+		const compaction = stubPort("unavailable");
+		let mode: "orphaned" | "context" = "orphaned";
+		const { database, registry, pipeline, turns } = await harness(directory, {
+			contextFailureRollThreshold: 2,
+			compaction,
+			respond: () => {
+				if (mode === "orphaned") throw new Error(ORPHANED_MESSAGE);
+				throw new Error("gjc sendTurn failed: context_too_large");
+			},
+		});
+		const monitor = registry.add({
+			name: "mixed",
+			trigger: { kind: "cron", schedule: "*/10 * * * *" },
+			eventTypes: ["mixed.tick"],
+			burstPolicy: "serialize",
+		});
+		const sessionKey = originKey(eventTypeOrigin("mixed.tick"));
+		// orphaned, context, orphaned, context: the orphans neither advance nor
+		// reset the streak, so the two context failures still reach the threshold.
+		const expectedContextStreak = [0, 1, 1, 2];
+		const sequence: Array<"orphaned" | "context"> = ["orphaned", "context", "orphaned", "context"];
+		for (const [index, step] of sequence.entries()) {
+			mode = step;
+			await pipeline.submitAwaitable(monitor.monitorId, "mixed.tick", { tick: index });
+			expect(pipeline.sessionSafetyState(sessionKey).contextFailures).toBe(expectedContextStreak[index]);
+		}
+		const state = pipeline.sessionSafetyState(sessionKey);
+		expect(state.orphanedExecutorFailures).toBe(2);
+		expect(state.executorFailures).toBe(2);
+		// Native compaction was requested for the context failures only.
+		expect(compaction.calls).toHaveLength(2);
+		// The threshold was reached by context evidence alone, so the net is armed.
+		expect(state.pendingRoll).toBe("context_failures_native_compaction_unavailable");
+		// Still not rolled: that happens at the next dispatch boundary.
+		expect(database.getSessionRecord(sessionKey)?.epoch ?? 0).toBe(0);
+		expect(new Set(turns.map((turn) => turn.sessionId))).toEqual(new Set(["event-session-e0"]));
 		database.close();
 	} finally {
 		await rm(directory, { recursive: true, force: true });
