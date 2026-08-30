@@ -67,10 +67,16 @@ Keeping that bounded is gjc's job, not the gateway's. The non-interactive `-p --
 The gateway's job is the second line: detecting that native compaction silently stopped working. A monitor that keeps answering is **never** rolled, whatever its turn count — the count is recorded and reported, and is purely observational. Instead the gateway classifies each authoring failure onto exactly three axes:
 
 - **context** — empty response, a context-length rejection, or a zero-token completion. This is what a compaction failure looks like from outside, and it is the only class the roll decision reads.
-- **executor** — the work around the turn failed: a worker timeout (the aside collection worker's 300s cap is the canonical case, recorded as `aside_timeout`), an external tool failure, a lock that made the run skip. The model may never have been asked. Unrecognised runtime errors land here too: without positive evidence the safety net stays holstered.
+- **executor** — the work around the turn failed: a worker timeout, an external tool failure, a lock that made the run skip. The model may never have been asked. Unrecognised runtime errors land here too: without positive evidence the safety net stays holstered.
 - **protocol** — the answer arrived but broke the contract: unparseable JSON, wrong shape, missing/duplicate/unknown events. A non-empty answer proves the context still works, so this is the opposite of context evidence.
 
-Executor and protocol failures are counted for the operator and can never arm a roll, however long they repeat.
+The executor class carries a sub-kind, reported as `lastExecutorReason`, because the operator action differs:
+
+- `executor_timeout` — the worker hit its cap and nothing was left behind. The aside collection worker's 300s cap is the canonical case, recorded as `aside_timeout`.
+- `executor_orphaned_external_work` — the child CLI process was killed on the wrapper's timeout but the external daemon's job kept running, so the next tick stacks a duplicate on top. Measured: aside exec collection took 7–13 minutes, the wrapper killed the child at 300/360s, the Aside daemon task stayed `running`, and 3 sessions and 10 tabs accumulated. Recorded as `orphaned_executor`, and it outranks the timeout match — the same message looks like a timeout, but "external work is still running" is the actionable part. The remedy is reclaiming that external job; the gateway therefore names the reason and leaves the session completely alone, with no streak, no compaction request and no roll.
+- `executor_failed` — anything else on the executor side.
+
+Executor and protocol failures are counted for the operator and can never arm a roll, however long they repeat. `lastExecutorReason` deliberately survives a roll: an unreclaimed external executor is not fixed by rolling a session.
 
 The streak is strictly **consecutive** and strictly about the **current** session:
 
