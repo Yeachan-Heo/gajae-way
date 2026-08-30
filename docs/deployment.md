@@ -71,6 +71,32 @@ The Discord adapter has a separate `$GAJAEWAY_HOME/adapter-discord.json` because
 
 Keep token files out of version control and restrict their permissions. Replace a token file and restart the relevant service to rotate it.
 
+### Voice rooms
+
+Live voice conversation is opt-in through a `voice` block in the same file. The bot joins only on an explicit `/voice join` and leaves on `/voice leave`, an empty room, or the idle timeout, closing its speech-to-text streams so a quiet room is never billed:
+
+```json
+{
+  "tokenFile": "/Users/me/gajaeway/secrets/discord-token",
+  "voice": {
+    "enabled": true,
+    "silenceEndMs": 700,
+    "energyGate": { "minDurationMs": 300, "rmsThreshold": 0.02 },
+    "idleLeaveMs": 300000,
+    "unread": { "maxItems": 20, "maxCharsPerItem": 200 },
+    "joinCommandAllowlist": ["discord-user-id"],
+    "elevenlabs": {
+      "apiKeyFile": "/Users/me/gajaeway/secrets/elevenlabs-key",
+      "tts": { "voiceId": "your-fixed-voice-id" }
+    }
+  }
+}
+```
+
+Every threshold, timeout, and cap is configurable and range-checked at startup; the adapter refuses to start on an out-of-range value or an unsupported key instead of silently substituting a default. The voice interface requires the `GuildVoiceStates` intent, which the adapter now requests by default, and its audio path needs no external `ffmpeg`.
+
+Voice conversation shares one session with the voice channel's built-in text chat, so progress updates, an interrupted reply's full text, and duplicate-delivery warnings all land in that text channel.
+
 ## Service manager: launchd example
 
 Install binaries and state outside macOS TCC-protected directories such as Desktop, Documents, and Downloads. A launchd process can hang when its working directory, `gjc`, or a symlink target lies there. Put the binaries, `gjc`, and `$GAJAEWAY_HOME` somewhere such as `~/gajaeway`.

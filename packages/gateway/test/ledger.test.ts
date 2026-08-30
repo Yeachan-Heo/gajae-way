@@ -27,3 +27,27 @@ test("delivery ledger transitions pending, inflight, retry, expiry, and confirma
 		await rm(directory, { recursive: true, force: true });
 	}
 });
+
+test("permits multiple delivery rows for one turn id", async () => {
+	const directory = await mkdtemp(join(tmpdir(), "gajaeway-ledger-"));
+	try {
+		const database = await GatewayDatabase.open(join(directory, "gateway.db"));
+		const ledger = new DeliveryLedger(database);
+		ledger.createPending({
+			deliveryId: "part-one",
+			turnId: "turn-1",
+			originKey: "discord/channel/c",
+			payloadJson: "{}",
+		});
+		ledger.createPending({
+			deliveryId: "part-two",
+			turnId: "turn-1",
+			originKey: "discord/channel/c",
+			payloadJson: "{}",
+		});
+		expect(database.deliveryRows().filter((row) => row.turn_id === "turn-1")).toHaveLength(2);
+		database.close();
+	} finally {
+		await rm(directory, { recursive: true, force: true });
+	}
+});

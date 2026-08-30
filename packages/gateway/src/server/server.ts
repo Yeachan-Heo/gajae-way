@@ -1,6 +1,13 @@
 import { unlink } from "node:fs/promises";
 import {
 	CAPABILITIES,
+	CHAT_CONTEXT_AT_MAX_AGE_MS,
+	CHAT_CONTEXT_AT_MAX_FUTURE_MS,
+	CHAT_CONTEXT_MAX_ENTRIES_PER_REQUEST,
+	type ChatContextEntry,
+	type ChatContextResult,
+	type ChatTurnEndPayload,
+	type EngagementContext,
 	encodeFrame,
 	type Frame,
 	FrameDecoder,
@@ -487,12 +494,122 @@ async function handleRequest(
 			void runtime.monitorRuntime.refresh();
 			return;
 		}
+		case "chat.context": {
+			const result = applyChatContext(request.params, options.database);
+			connection.write({ v: PROFILE_VERSION, type: "response", id: request.id, result });
+			return;
+		}
 		case "chat.send":
 			await sendChat(connection, request, options, runtime);
 			return;
 		default:
 			throw new ProtocolError("unknown_verb", `unknown verb: ${request.verb}`);
 	}
+}
+function isRecord(value: unknown): value is { readonly [key: string]: unknown } {
+	return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function applyChatContext(params: unknown, database: GatewayDatabase): ChatContextResult {
+	if (!isRecord(params)) throw new ProtocolError("invalid_params", "chat.context requires params");
+	let origin: OriginRef;
+	try {
+		origin = validateOriginRef(params.origin as OriginRef);
+	} catch {
+		throw new ProtocolError("invalid_params", "chat.context requires a valid origin");
+	}
+	if (
+		!Array.isArray(params.entries) ||
+		params.entries.length < 1 ||
+		params.entries.length > CHAT_CONTEXT_MAX_ENTRIES_PER_REQUEST
+	)
+		throw new ProtocolError("invalid_params", "chat.context entries exceed the request-size ceiling");
+	if (!isRecord(params.cap)) throw new ProtocolError("invalid_params", "chat.context requires cap");
+	const maxItems = params.cap.maxItems;
+	const maxCharsPerItem = params.cap.maxCharsPerItem;
+	if (
+		typeof maxItems !== "number" ||
+		!Number.isInteger(maxItems) ||
+		maxItems < 1 ||
+		maxItems > 100 ||
+		typeof maxCharsPerItem !== "number" ||
+		!Number.isInteger(maxCharsPerItem) ||
+		maxCharsPerItem < 50 ||
+		maxCharsPerItem > 1000
+	)
+		throw new ProtocolError("invalid_params", "chat.context cap is out of range");
+
+	const now = Date.now();
+	const entries: ChatContextEntry[] = [];
+	for (const value of params.entries) {
+		if (
+			!isRecord(value) ||
+			typeof value.messageId !== "string" ||
+			typeof value.text !== "string" ||
+			typeof value.at !== "string"
+		)
+			throw new ProtocolError("invalid_params", "chat.context entries have invalid fields");
+		const atMs = Date.parse(value.at);
+		if (!Number.isFinite(atMs) || atMs > now + CHAT_CONTEXT_AT_MAX_FUTURE_MS || atMs < now - CHAT_CONTEXT_AT_MAX_AGE_MS)
+			throw new ProtocolError("invalid_params", "chat.context entry at is outside the accepted envelope");
+		if (!isRecord(value.engagement))
+			throw new ProtocolError("invalid_params", "chat.context entry requires engagement");
+		const engagement = value.engagement;
+		if (
+			typeof engagement.mentioned !== "boolean" ||
+			typeof engagement.group !== "boolean" ||
+			typeof engagement.authorId !== "string"
+		)
+			throw new ProtocolError("invalid_params", "chat.context engagement is invalid");
+		const authorName = engagement.authorName;
+		const authorHandle = engagement.authorHandle;
+		const channelLabel = engagement.channelLabel;
+		const serverLabel = engagement.serverLabel;
+		if (
+			(authorName !== undefined && typeof authorName !== "string") ||
+			(authorHandle !== undefined && typeof authorHandle !== "string") ||
+			(channelLabel !== undefined && typeof channelLabel !== "string") ||
+			(serverLabel !== undefined && typeof serverLabel !== "string")
+		)
+			throw new ProtocolError("invalid_params", "chat.context engagement is invalid");
+		const normalizedEngagement: EngagementContext = {
+			mentioned: engagement.mentioned,
+			group: engagement.group,
+			authorId: engagement.authorId,
+			...(typeof authorName === "string" ? { authorName } : {}),
+			...(typeof authorHandle === "string" ? { authorHandle } : {}),
+			...(typeof channelLabel === "string" ? { channelLabel } : {}),
+			...(typeof serverLabel === "string" ? { serverLabel } : {}),
+		};
+		entries.push({ messageId: value.messageId, text: value.text, engagement: normalizedEngagement, at: value.at });
+	}
+
+	const key = originKey(origin);
+	return database.withTransaction(() => {
+		const sorted = entries.slice().sort((a, b) => {
+			const atDiff = Date.parse(a.at) - Date.parse(b.at);
+			if (atDiff !== 0) return atDiff;
+			return a.messageId < b.messageId ? -1 : a.messageId > b.messageId ? 1 : 0;
+		});
+		const dropped = Math.max(0, sorted.length - maxItems);
+		const retained = sorted.slice(dropped);
+		let truncated = 0;
+		const rows = retained.map((entry) => {
+			const characters = Array.from(entry.text);
+			const body = characters.length > maxCharsPerItem ? characters.slice(0, maxCharsPerItem).join("") : entry.text;
+			if (characters.length > maxCharsPerItem) truncated++;
+			return {
+				messageId: entry.messageId,
+				originKey: key,
+				authorId: entry.engagement.authorId,
+				authorName: entry.engagement.authorName,
+				body,
+				receivedAt: new Date(Date.parse(entry.at)).toISOString(),
+			};
+		});
+		const { recorded } = database.contextRecordBatch(rows);
+		return { recorded, dropped, truncated, engaged: false };
+	});
 }
 async function sendChat(
 	connection: Connection,
@@ -589,6 +706,7 @@ async function sendChat(
 			authorId: typeof engagement?.authorId === "string" ? engagement.authorId : undefined,
 			authorName: typeof engagement?.authorName === "string" ? engagement.authorName : undefined,
 			body: userText,
+			receivedAt: new Date().toISOString(),
 		});
 	}
 	if (!engaged) {
@@ -689,6 +807,7 @@ async function runInboundTurn(
 	runtime.inbound.delete(row.message_id);
 	const connection = context?.connection ?? fallback;
 	const turnId = context?.turnId ?? crypto.randomUUID();
+	const deliveryIds: string[] = [];
 	const key = row.origin_key;
 	const origin = validateOriginRef(JSON.parse(row.origin_ref_json) as typeof LOOPBACK_ORIGIN);
 	const userText = row.body;
@@ -770,8 +889,10 @@ async function runInboundTurn(
 				for (const recipient of runtime.connections)
 					if (recipient.negotiated)
 						recipient.write({ v: PROFILE_VERSION, type: "event", event: "chat.message", payload: notice });
+				if (notice.deliveryId) deliveryIds.push(notice.deliveryId);
 			}
 		}
+		emitTurnEnd(runtime, connection, origin, turnId, "failed", deliveryIds);
 		throw error;
 	} finally {
 		clearInterval(heartbeat);
@@ -788,7 +909,10 @@ async function runInboundTurn(
 	// speak. The observation is already recorded above, so nothing is delivered and no daily
 	// capture is written. This is what makes an `open` channel usable: the persona can read
 	// every message in the room without answering all of them.
-	if (isSilenceToken(text)) return;
+	if (isSilenceToken(text)) {
+		emitTurnEnd(runtime, connection, origin, turnId, "no_output", deliveryIds);
+		return;
+	}
 	if (!nonLoopback) {
 		connection.write({
 			v: PROFILE_VERSION,
@@ -797,6 +921,7 @@ async function runInboundTurn(
 			...(context ? { id: context.requestId } : {}),
 			payload: { turnId, origin, role: "assistant", text, final: true },
 		});
+		emitTurnEnd(runtime, connection, origin, turnId, "completed", deliveryIds);
 		// Durable intent is persisted synchronously; closure work deliberately does not delay delivery.
 		runtime.memory.enqueue({ kind: "daily_capture", originRefJson: JSON.stringify(origin), userText, replyText: text });
 		return;
@@ -816,12 +941,14 @@ async function runInboundTurn(
 		const replyMatch = part.match(/^\[REPLY:([^\]\s]+)\]\s*/);
 		const body = replyMatch ? part.slice(replyMatch[0].length).trim() : part;
 		if (!body) continue;
-		const payload = runtime.delivery.prepare(crypto.randomUUID(), origin, body, replyMatch?.[1]);
+		const payload = runtime.delivery.prepare(turnId, origin, body, replyMatch?.[1]);
 		if (!payload) continue;
 		runtime.delivery.markInflight(payload.deliveryId as string);
 		for (const recipient of runtime.connections)
 			if (recipient.negotiated) recipient.write({ v: PROFILE_VERSION, type: "event", event: "chat.message", payload });
+		if (payload.deliveryId) deliveryIds.push(payload.deliveryId);
 	}
+	emitTurnEnd(runtime, connection, origin, turnId, "completed", deliveryIds);
 	// Durable intent is persisted synchronously; closure work deliberately does not delay delivery.
 	runtime.memory.enqueue({
 		kind: "daily_capture",
@@ -829,6 +956,29 @@ async function runInboundTurn(
 		userText: capturedUser,
 		replyText: text,
 	});
+}
+
+function emitTurnEnd(
+	runtime: Runtime,
+	connection: Connection,
+	origin: OriginRef,
+	turnId: string,
+	outcome: ChatTurnEndPayload["outcome"],
+	deliveryIds: readonly string[],
+): void {
+	const payload: ChatTurnEndPayload = {
+		turnId,
+		origin,
+		outcome,
+		deliveryIds: [...deliveryIds],
+		at: new Date().toISOString(),
+	};
+	const frame: Frame = { v: PROFILE_VERSION, type: "event", event: "chat.turnEnd", payload };
+	if (origin.platform === "loopback") {
+		connection.write(frame);
+		return;
+	}
+	for (const recipient of runtime.connections) if (recipient.negotiated) recipient.write(frame);
 }
 
 /**

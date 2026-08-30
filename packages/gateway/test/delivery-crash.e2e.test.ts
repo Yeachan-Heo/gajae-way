@@ -66,6 +66,7 @@ test("inflight platform delivery is duplicate-labeled after a process crash", as
 	});
 	const event = await waitFor(first.frames, (frame) => frame.type === "event" && frame.event === "chat.message");
 	const deliveryId = event.payload.deliveryId;
+	const turnId = event.payload.turnId;
 	child?.kill("SIGKILL");
 	if (child) await child.exited;
 	child = undefined;
@@ -73,6 +74,7 @@ test("inflight platform delivery is duplicate-labeled after a process crash", as
 	const second = await client(await start());
 	const redelivery = await waitFor(second.frames, (frame) => frame.type === "event" && frame.event === "chat.message");
 	expect(redelivery.payload).toMatchObject({ deliveryId, redelivered: true, duplicateWarning: true });
+	expect(redelivery.payload.turnId).toBe(turnId);
 	second.send({ v: "0.1", type: "request", id: "confirm", verb: "delivery.confirm", params: { deliveryId } });
 	await waitFor(second.frames, (frame) => frame.id === "confirm");
 	second.send({ v: "0.1", type: "request", id: "status", verb: "gateway.status" });

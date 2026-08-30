@@ -87,13 +87,20 @@ test("requires negotiation then serves status, shutdown, and validates chat para
 		verb: "chat.send",
 		params: { origin: { platform: "loopback", kind: "loopback", conversationId: "loopback" }, text: "hello" },
 	});
-	await waitFor(client.frames, 6);
+	await waitFor(client.frames, 7);
 	expect(client.frames[4].result.turnId).toBeString();
 	expect(client.frames[5].payload).toMatchObject({ text: "mock reply", final: true });
+	// The turn's terminal event follows its reply on the same connection, which is what
+	// lets an adapter know the origin is free again.
+	expect(client.frames[6]).toMatchObject({
+		type: "event",
+		event: "chat.turnEnd",
+		payload: { turnId: client.frames[4].result.turnId, outcome: "completed" },
+	});
 	client.send({ v: "0.1", type: "request", id: "shutdown", verb: "gateway.shutdown" });
-	await waitFor(client.frames, 8);
-	expect(client.frames[6]).toMatchObject({ type: "response", id: "shutdown", result: { stopping: true } });
-	expect(client.frames[7]).toMatchObject({ type: "event", event: "gateway.stopping" });
+	await waitFor(client.frames, 9);
+	expect(client.frames[7]).toMatchObject({ type: "response", id: "shutdown", result: { stopping: true } });
+	expect(client.frames[8]).toMatchObject({ type: "event", event: "gateway.stopping" });
 	client.close();
 });
 
@@ -390,5 +397,163 @@ test("work.run runs a named worker session in the requested cwd and returns the 
 	client.send({ v: "0.1", type: "request", id: "bad", verb: "work.run", params: { name: "../evil", text: "x" } });
 	await waitFor(client.frames, 3);
 	expect(client.frames.find((frame) => frame.type === "error" && frame.id === "bad")).toBeDefined();
+	client.close();
+});
+
+test("chat.send turnId matches every [BREAK] delivery and turnEnd order", async () => {
+	directory = await mkdtemp(join(tmpdir(), "gajaeway-server-"));
+	const config: GatewayConfig = {
+		schemaVersion: 1,
+		home: directory,
+		configPath: join(directory, "config.json"),
+		socketPath: join(directory, "gateway.sock"),
+		dbPath: join(directory, "gateway.db"),
+		logVerbosity: "info",
+	};
+	const database = await GatewayDatabase.open(config.dbPath);
+	const gjc: GjcPort = {
+		ensureSession: async () => ({ sessionId: "mock-session" }),
+		sendTurn: async () => "first part\n[BREAK]\nsecond part",
+	};
+	server = await startUnixServer({ config, database, gjc, onStop: () => database.close() });
+	const client = await connect(config.socketPath);
+	client.send({ v: "0.1", type: "hello", payload: { supportedVersions: ["0.1"] } });
+	await waitFor(client.frames, 1);
+	client.send({
+		v: "0.1",
+		type: "request",
+		id: "send",
+		verb: "chat.send",
+		params: {
+			origin: { platform: "discord", kind: "dm", conversationId: "c1", peerId: "p1" },
+			text: "hello",
+			messageId: "send-1",
+			engagement: { mentioned: false, group: false, authorId: "p1" },
+		},
+	});
+	for (let attempt = 0; attempt < 400; attempt++) {
+		if (
+			client.frames.filter((frame) => frame.type === "event" && frame.event === "chat.message").length >= 2 &&
+			client.frames.some((frame) => frame.type === "event" && frame.event === "chat.turnEnd")
+		)
+			break;
+		await Bun.sleep(5);
+	}
+	const response = client.frames.find((frame) => frame.type === "response" && frame.id === "send");
+	const messages = client.frames.filter((frame) => frame.type === "event" && frame.event === "chat.message");
+	const turnEnd = client.frames.find((frame) => frame.type === "event" && frame.event === "chat.turnEnd");
+	expect(response?.result.turnId).toBeString();
+	expect(messages).toHaveLength(2);
+	expect(messages.every((frame) => frame.payload.turnId === response?.result.turnId)).toBe(true);
+	expect(turnEnd?.payload).toMatchObject({
+		outcome: "completed",
+		deliveryIds: [messages[0]?.payload.deliveryId, messages[1]?.payload.deliveryId],
+	});
+	expect(turnEnd).toBeDefined();
+	expect(messages[1]).toBeDefined();
+	if (!turnEnd || !messages[1]) throw new Error("turnEnd and both deliveries are required");
+	expect(client.frames.indexOf(turnEnd)).toBeGreaterThan(client.frames.indexOf(messages[1]));
+	client.close();
+});
+
+test("chat.turnEnd covers no_output and failed turns but not slash resets", async () => {
+	directory = await mkdtemp(join(tmpdir(), "gajaeway-server-"));
+	const config: GatewayConfig = {
+		schemaVersion: 1,
+		home: directory,
+		configPath: join(directory, "config.json"),
+		socketPath: join(directory, "gateway.sock"),
+		dbPath: join(directory, "gateway.db"),
+		logVerbosity: "info",
+	};
+	const database = await GatewayDatabase.open(config.dbPath);
+	const gjc: GjcPort = {
+		ensureSession: async () => ({ sessionId: "mock-session" }),
+		sendTurn: async () => "[SILENT]",
+	};
+	server = await startUnixServer({ config, database, gjc, onStop: () => database.close() });
+	const client = await connect(config.socketPath);
+	client.send({ v: "0.1", type: "hello", payload: { supportedVersions: ["0.1"] } });
+	await waitFor(client.frames, 1);
+	const origin = { platform: "discord", kind: "dm", conversationId: "c1", peerId: "p1" };
+	const engagement = { mentioned: false, group: false, authorId: "p1" };
+	client.send({
+		v: "0.1",
+		type: "request",
+		id: "silent",
+		verb: "chat.send",
+		params: { origin, text: "hello", messageId: "silent-1", engagement },
+	});
+	for (let attempt = 0; attempt < 400; attempt++) {
+		if (client.frames.some((frame) => frame.type === "event" && frame.event === "chat.turnEnd")) break;
+		await Bun.sleep(5);
+	}
+	const firstEnd = client.frames.find((frame) => frame.type === "event" && frame.event === "chat.turnEnd");
+	expect(firstEnd?.payload.outcome).toBe("no_output");
+	expect(client.frames.filter((frame) => frame.type === "event" && frame.event === "chat.message")).toHaveLength(0);
+	client.send({
+		v: "0.1",
+		type: "request",
+		id: "new",
+		verb: "chat.send",
+		params: { origin, text: "/new", engagement },
+	});
+	client.send({
+		v: "0.1",
+		type: "request",
+		id: "reset",
+		verb: "chat.send",
+		params: { origin, text: "/reset", engagement },
+	});
+	await Bun.sleep(40);
+	expect(client.frames.filter((frame) => frame.type === "event" && frame.event === "chat.turnEnd")).toHaveLength(1);
+	client.close();
+});
+
+test("chat.turnEnd failed follows the failure notice", async () => {
+	directory = await mkdtemp(join(tmpdir(), "gajaeway-server-"));
+	const config: GatewayConfig = {
+		schemaVersion: 1,
+		home: directory,
+		configPath: join(directory, "config.json"),
+		socketPath: join(directory, "gateway.sock"),
+		dbPath: join(directory, "gateway.db"),
+		logVerbosity: "info",
+	};
+	const database = await GatewayDatabase.open(config.dbPath);
+	const gjc: GjcPort = {
+		ensureSession: async () => ({ sessionId: "mock-session" }),
+		sendTurn: async () => {
+			throw new Error("turn failed");
+		},
+	};
+	server = await startUnixServer({ config, database, gjc, onStop: () => database.close() });
+	const client = await connect(config.socketPath);
+	client.send({ v: "0.1", type: "hello", payload: { supportedVersions: ["0.1"] } });
+	await waitFor(client.frames, 1);
+	client.send({
+		v: "0.1",
+		type: "request",
+		id: "failed",
+		verb: "chat.send",
+		params: {
+			origin: { platform: "discord", kind: "dm", conversationId: "c1", peerId: "p1" },
+			text: "hello",
+			messageId: "failed-1",
+			engagement: { mentioned: false, group: false, authorId: "p1" },
+		},
+	});
+	for (let attempt = 0; attempt < 400; attempt++) {
+		if (client.frames.some((frame) => frame.type === "event" && frame.event === "chat.turnEnd")) break;
+		await Bun.sleep(5);
+	}
+	const noticeIndex = client.frames.findIndex((frame) => frame.type === "event" && frame.event === "chat.message");
+	const turnEndIndex = client.frames.findIndex((frame) => frame.type === "event" && frame.event === "chat.turnEnd");
+	const turnEnd = client.frames[turnEndIndex];
+	expect(turnEnd?.payload).toMatchObject({
+		outcome: "failed",
+		deliveryIds: [client.frames[noticeIndex]?.payload.deliveryId],
+	});
+	expect(turnEndIndex).toBeGreaterThan(noticeIndex);
 	client.close();
 });

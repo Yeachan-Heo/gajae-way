@@ -1,11 +1,15 @@
 import type { ChatMessagePayload, ChatProgressPayload, EngagementContext, OriginRef } from "@gajaeway/protocol";
 import { GajaewayClient } from "@gajaeway/sdk";
+import { shouldAdmitTurn } from "@gajaeway/voice-core";
 import { Client, GatewayIntentBits } from "discord.js";
 import { resolveDisplayName } from "./author";
 import { type LoadedDiscordAdapterConfig, loadDiscordAdapterConfig } from "./config";
+import { LruSet } from "./lru-set";
 import { type DiscordMessageOriginShape, discordMessageOrigin } from "./origin";
+import { handleVoiceCommand, voiceOriginKey } from "./voice/commands";
+import { createVoiceDeliveryRouter, type VoiceDeliveryRouter } from "./voice/router";
+import { createVoiceRuntime, type VoiceRuntime } from "./voice/runtime";
 
-const DISCORD_MESSAGE_LIMIT = 2_000;
 // Discord clears the typing hint after ~10s, so refresh inside that window while a turn is running.
 const TYPING_REFRESH_MS = 7_000;
 // Hard ceiling above the gateway's 300s gjc turn timeout: a lost turn must not type forever.
@@ -15,6 +19,9 @@ const REQUIRED_INTENTS = [
 	GatewayIntentBits.GuildMessages,
 	GatewayIntentBits.MessageContent,
 	GatewayIntentBits.DirectMessages,
+	// Voice rooms: receiving speech and noticing the bot being moved or kicked both
+	// depend on voice-state events, so the intent is required for the voice interface.
+	GatewayIntentBits.GuildVoiceStates,
 ];
 
 export interface GatewayClientLike {
@@ -78,25 +85,6 @@ export function resolveAuthorDisplayName(message: DiscordInboundMessage): string
 	return resolveDisplayName(message.author, message.member);
 }
 
-/** Bounded inbound message-id memory prevents gateway replay/reconnect duplicate turns. */
-export class LruSet {
-	readonly #values = new Map<string, undefined>();
-	constructor(readonly limit = 10_000) {
-		if (!Number.isSafeInteger(limit) || limit < 1) throw new Error("LRU limit must be a positive integer");
-	}
-
-	addIfAbsent(value: string): boolean {
-		if (this.#values.has(value)) {
-			this.#values.delete(value);
-			this.#values.set(value, undefined);
-			return false;
-		}
-		this.#values.set(value, undefined);
-		if (this.#values.size > this.limit) this.#values.delete(this.#values.keys().next().value as string);
-		return true;
-	}
-}
-
 export function engagementForMessage(message: DiscordInboundMessage, botUser: unknown): EngagementContext {
 	const origin = discordMessageOrigin(message);
 	const botId = typeof botUser === "object" && botUser !== null && "id" in botUser ? String(botUser.id) : "";
@@ -136,14 +124,8 @@ export function decideInbound(
 	return open && !message.author.bot ? { ...base, mentioned: true } : base;
 }
 
-export function chunkDiscordMessage(text: string): string[] {
-	if (text.length === 0) return [""];
-	const chunks: string[] = [];
-	for (let offset = 0; offset < text.length; offset += DISCORD_MESSAGE_LIMIT) {
-		chunks.push(text.slice(offset, offset + DISCORD_MESSAGE_LIMIT));
-	}
-	return chunks;
-}
+export { LruSet } from "./lru-set";
+export { chunkDiscordMessage } from "./voice/router";
 
 export function deliveryFailureIsAmbiguous(error: unknown): boolean {
 	const code = typeof error === "object" && error !== null && "code" in error ? String(error.code) : "";
@@ -302,46 +284,28 @@ export class WorkingStatus {
 	}
 }
 
+/**
+ * The one delivery settlement path. Text delivery is the default and audio is only ever
+ * chosen after a known voice modality resolves and redelivery has been excluded, so this
+ * function is never forked: voice support is added by passing the voice-aware router.
+ */
 export async function settleDiscordDelivery(
 	gateway: Pick<GatewayClientLike, "request">,
 	discord: DiscordClientLike,
 	message: ChatMessagePayload,
 	typing?: TypingPort,
 	status?: WorkingStatus,
+	router?: VoiceDeliveryRouter,
 ): Promise<void> {
-	if (message.origin.platform !== "discord" || !message.deliveryId) return;
-	const deliveryId = message.deliveryId;
-	try {
-		const channel = await discord.channels.fetch(message.origin.conversationId);
-		if (!isDiscordTextChannel(channel)) {
-			throw Object.assign(new Error(`Discord channel ${message.origin.conversationId} cannot receive messages`), {
-				code: 10003,
-			});
-		}
-		const text = message.duplicateWarning ? `[recovered - may be a duplicate] ${message.text}` : message.text;
-		const chunks = chunkDiscordMessage(text);
-		for (let index = 0; index < chunks.length; index++) {
-			// Reply-threading applies to the first chunk only; failIfNotExists keeps a
-			// deleted target from failing the whole delivery.
-			const chunk = chunks[index] as string;
-			if (index === 0 && message.replyToMessageId)
-				await channel.send({
-					content: chunk,
-					reply: { messageReference: message.replyToMessageId, failIfNotExists: false },
-				});
-			else await channel.send(chunk);
-		}
-		await gateway.request("delivery.confirm", { deliveryId });
-	} catch (error) {
-		await gateway.request("delivery.fail", {
-			deliveryId,
-			reason: error instanceof Error ? error.message : String(error),
-			ambiguous: deliveryFailureIsAmbiguous(error),
-		});
-	} finally {
-		await status?.clear(message.origin.conversationId);
-		typing?.end(message.origin.conversationId);
-	}
+	await (router ?? createTextOnlyDeliveryRouter())(gateway, discord, message, typing, status);
+}
+
+/**
+ * Settlement for a process with no voice runtime: no modality ever resolves, so every
+ * delivery takes the text path. Text-only deployments keep exactly their old behavior.
+ */
+function createTextOnlyDeliveryRouter(): VoiceDeliveryRouter {
+	return createVoiceDeliveryRouter({ submitContext: async () => undefined });
 }
 
 export function subscribeDiscordDeliveries(
@@ -350,9 +314,13 @@ export function subscribeDiscordDeliveries(
 	typing?: TypingPort,
 	status?: WorkingStatus,
 	log: Pick<Console, "error"> = console,
+	router?: VoiceDeliveryRouter,
 ): () => void {
+	// One router per subscription: its in-flight and settled-id memory is scoped to the
+	// gateway connection, which is what makes double-confirm and re-speaking impossible.
+	const settle = router ?? createTextOnlyDeliveryRouter();
 	return gateway.onChatMessage((message) => {
-		void settleDiscordDelivery(gateway, discord, message, typing, status).catch((error) =>
+		void settleDiscordDelivery(gateway, discord, message, typing, status, settle).catch((error) =>
 			log.error(
 				`Discord delivery settlement request failed: ${error instanceof Error ? error.message : String(error)}`,
 			),
@@ -379,12 +347,16 @@ export async function startDiscordAdapter(config: LoadedDiscordAdapterConfig): P
 	const discord = new Client({ intents: [...new Set([...REQUIRED_INTENTS, ...(config.intents ?? [])])] });
 	const typing = new TypingIndicator(discord);
 	const status = new WorkingStatus(discord);
+	// Voice is opt-in. A configured-but-unusable credential fails startup here rather
+	// than degrading to a silently text-only bot.
+	const voice = createVoiceRuntime(config, discord);
 	const gateway = new ReconnectingGateway(
 		config.gatewaySocket ?? defaultGatewaySocket(),
 		discord,
 		config,
 		typing,
 		status,
+		voice,
 	);
 	discord.on("messageCreate", (message) => {
 		const engagement = decideInbound(message, discord.user, config.channels);
@@ -392,8 +364,37 @@ export async function startDiscordAdapter(config: LoadedDiscordAdapterConfig): P
 		gateway.sendInbound(message.id as string, discordMessageOrigin(message), message.content, engagement);
 	});
 	discord.on("interactionCreate", (interaction) => {
-		if (interaction.isChatInputCommand()) void handleSlashCommand(interaction, gateway);
+		if (!interaction.isChatInputCommand()) return;
+		if (voice && interaction.commandName === "voice") {
+			void handleVoiceCommand(interaction as never, voice.sessions);
+			return;
+		}
+		void handleSlashCommand(interaction, gateway);
 	});
+	if (voice) {
+		// The bot being moved or removed, and the room emptying out, are both voice-state
+		// events: the lifecycle owner decides which of them ends the session.
+		discord.on("voiceStateUpdate", (previous, next) => {
+			const channelId = previous.channelId ?? next.channelId;
+			if (!channelId) return;
+			const session = voice.sessions.get(voiceOriginKey(channelId));
+			if (!session) return;
+			void session.handleVoiceStateChange({
+				userId: next.id ?? previous.id,
+				oldChannelId: previous.channelId,
+				newChannelId: next.channelId,
+				members: [...(next.channel?.members?.values() ?? [])].map((member) => ({
+					id: member.id,
+					bot: member.user?.bot === true,
+				})),
+			});
+		});
+		for (const signal of ["SIGINT", "SIGTERM"] as const) {
+			process.once(signal, () => {
+				void voice.closeAll("shutdown");
+			});
+		}
+	}
 	discord.once("ready", () => {
 		console.log("Discord adapter connected.");
 		// Slash-command mapping: /new and /reset are first-class Discord commands
@@ -403,6 +404,18 @@ export async function startDiscordAdapter(config: LoadedDiscordAdapterConfig): P
 			.set([
 				{ name: "new", description: "Start a fresh persona session in this conversation" },
 				{ name: "reset", description: "Reset this conversation's persona session" },
+				...(voice
+					? [
+							{
+								name: "voice",
+								description: "Join or leave this server's voice conversation",
+								options: [
+									{ type: 1, name: "join", description: "Join your current voice channel" },
+									{ type: 1, name: "leave", description: "Leave the voice channel" },
+								],
+							},
+						]
+					: []),
 			])
 			.catch((error: unknown) =>
 				console.error(
@@ -452,15 +465,23 @@ export async function handleSlashCommand(
 	if (!interaction.channel || !interaction.user) return;
 	try {
 		const origin = discordMessageOrigin({ author: { id: interaction.user.id }, channel: interaction.channel });
-		const result = await gateway.requestInbound(`slash-${interaction.id}`, origin, `/${interaction.commandName}`, {
-			mentioned: true,
-			group: origin.kind !== "dm",
-			authorId: interaction.user.id,
-			...(resolveInteractionDisplayName(interaction)
-				? { authorName: resolveInteractionDisplayName(interaction) as string }
-				: {}),
-			...(interaction.user.username ? { authorHandle: interaction.user.username } : {}),
-		});
+		const result = await gateway.requestInbound(
+			`slash-${interaction.id}`,
+			origin,
+			`/${interaction.commandName}`,
+			{
+				mentioned: true,
+				group: origin.kind !== "dm",
+				authorId: interaction.user.id,
+				...(resolveInteractionDisplayName(interaction)
+					? { authorName: resolveInteractionDisplayName(interaction) as string }
+					: {}),
+				...(interaction.user.username ? { authorHandle: interaction.user.username } : {}),
+			},
+			// The session verbs reply without running a turn, so they never terminate and
+			// must not mark the origin busy.
+			{ admit: false },
+		);
 		// Honest ack: the gateway allowlist may decline the command (non-owner in a
 		// group surface) — never claim a reset that did not happen.
 		await interaction.reply(
@@ -473,12 +494,17 @@ export async function handleSlashCommand(
 	}
 }
 
-class ReconnectingGateway {
+/**
+ * Exported for tests: reconnect behavior is a real contract, including the voice
+ * teardown that must happen when the gateway socket is lost.
+ */
+export class ReconnectingGateway {
 	#client: GajaewayClient | undefined;
 	#reconnecting = false;
 	#attempt = 0;
 	#deliveryOff: (() => void) | undefined;
 	#progressOff: (() => void) | undefined;
+	#turnEndOff: (() => void) | undefined;
 	readonly #inbound = new LruSet();
 
 	constructor(
@@ -487,6 +513,7 @@ class ReconnectingGateway {
 		readonly config: LoadedDiscordAdapterConfig,
 		readonly typing?: TypingPort,
 		readonly status?: WorkingStatus,
+		readonly voice?: VoiceRuntime,
 	) {}
 
 	async connect(): Promise<void> {
@@ -495,7 +522,16 @@ class ReconnectingGateway {
 			this.#client = client;
 			this.#attempt = 0;
 			this.#deliveryOff?.();
-			this.#deliveryOff = subscribeDiscordDeliveries(client, this.discord, this.typing, this.status);
+			this.#deliveryOff = subscribeDiscordDeliveries(
+				client,
+				this.discord,
+				this.typing,
+				this.status,
+				console,
+				this.#voiceRouter(client),
+			);
+			this.#turnEndOff?.();
+			this.#turnEndOff = this.voice ? this.#subscribeTurnEnd(client) : undefined;
 			this.#progressOff?.();
 			this.#progressOff = this.status ? subscribeDiscordProgress(client, this.status) : undefined;
 			console.log("Discord adapter connected to gateway.");
@@ -509,13 +545,22 @@ class ReconnectingGateway {
 		void this.requestInbound(messageId, origin, text, engagement);
 	}
 
-	/** Like sendInbound but reports the gateway's engagement decision to the caller. */
+	/**
+	 * Like sendInbound but reports the gateway's decision to the caller, including the
+	 * assigned turn id.
+	 *
+	 * The turn id is what makes an origin's busy state knowable: it is recorded in the
+	 * voice turn book for BOTH modalities, so speech arriving during an in-flight text
+	 * turn becomes unread context instead of a second turn. Slash-command paths pass
+	 * `admit: false` because they answer without running a turn and so never terminate.
+	 */
 	async requestInbound(
 		messageId: string,
 		origin: OriginRef,
 		text: string,
 		engagement: EngagementContext,
-	): Promise<{ engaged?: boolean } | undefined> {
+		options: { readonly admit?: boolean; readonly modality?: "voice" | "text" } = {},
+	): Promise<{ engaged?: boolean; turnId?: string | null } | undefined> {
 		if (!this.#inbound.addIfAbsent(messageId)) return;
 		const client = this.#client;
 		if (!client) return;
@@ -525,13 +570,69 @@ class ReconnectingGateway {
 		// queue on it, so a replayed or backfilled message is deduped there and not just in the
 		// adapter's in-memory set, which does not survive a restart.
 		try {
-			const result = await client.request<{ engaged?: boolean }>("chat.send", { origin, text, engagement, messageId });
+			const result = await client.request<{ engaged?: boolean; turnId?: string | null }>("chat.send", {
+				origin,
+				text,
+				engagement,
+				messageId,
+			});
 			if (result?.engaged) this.typing?.begin(origin.conversationId);
+			this.#recordTurn(messageId, origin, result, options);
 			return result;
 		} catch {
 			this.scheduleReconnect();
 			return undefined;
 		}
+	}
+
+	/**
+	 * A voice-aware router when a room can exist, and the plain text router otherwise.
+	 * Modality is resolved per turn id, so a text turn is never spoken.
+	 */
+	#voiceRouter(client: GajaewayClient): VoiceDeliveryRouter {
+		const voice = this.voice;
+		if (!voice) return createTextOnlyDeliveryRouter();
+		return createVoiceDeliveryRouter({
+			modality: {
+				resolve: (turnId) => voice.resolveModality(turnId),
+				recordPart: (turnId, atMs, final) => voice.recordDeliveryPart(turnId, atMs, final),
+			},
+			// Playback belongs to the room that owns the delivery's conversation. When that
+			// room is gone the router falls back to text rather than speaking into nothing.
+			playback: {
+				play: async (message) => {
+					const playback = voice.playbackFor(message.origin.conversationId);
+					if (playback === undefined) throw new Error("no live voice room owns this delivery");
+					return playback.play(message);
+				},
+			},
+			submitContext: (params) => client.contextBatch(params),
+		});
+	}
+
+	/** The turn's terminal event is what releases the origin so speech can start a new turn. */
+	#subscribeTurnEnd(client: GajaewayClient): () => void {
+		return client.onTurnEnd((payload) => {
+			this.voice?.sessions.get(voiceOriginKey(payload.origin.conversationId))?.settleTurn(payload.turnId);
+		});
+	}
+
+	/** Only a turn the gateway actually accepted, and that will terminate, is tracked. */
+	#recordTurn(
+		messageId: string,
+		origin: OriginRef,
+		result: { engaged?: boolean; turnId?: string | null } | undefined,
+		options: { readonly admit?: boolean; readonly modality?: "voice" | "text" },
+	): void {
+		if (options.admit === false) return;
+		const session = this.voice?.sessions.get(voiceOriginKey(origin.conversationId));
+		if (!session || !shouldAdmitTurn({ engaged: result?.engaged, turnId: result?.turnId })) return;
+		session.admitTurn({
+			messageId,
+			turnId: result?.turnId as string,
+			modality: options.modality ?? "text",
+			acceptedAtMs: Date.now(),
+		});
 	}
 
 	private monitor(client: GajaewayClient): void {
@@ -547,6 +648,10 @@ class ReconnectingGateway {
 	private scheduleReconnect(): void {
 		if (this.#reconnecting) return;
 		this.#reconnecting = true;
+		// A voice room outlives the socket it speaks through, so losing the gateway must
+		// close it: keeping the audio path open would transcribe (and bill) speech that
+		// can no longer become a turn.
+		void this.voice?.closeAll("gateway_lost");
 		this.#client = undefined;
 		this.#deliveryOff?.();
 		const delay = Math.min(30_000, 500 * 2 ** Math.min(this.#attempt++, 6));

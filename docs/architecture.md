@@ -9,9 +9,10 @@ The Bun workspace is divided into small packages:
 | `@gajaeway/protocol` | Versioned NDJSON frames, negotiation, verb/event catalogues, and canonical origins. |
 | `@gajaeway/sdk` | Client for the gateway’s Unix-domain socket or stdio transport. |
 | `@gajaeway/gateway` | Daemon: configuration, SQLite state, sessions, delivery, memory, monitors, and the `gjc` boundary. |
-| `@gajaeway/adapter-discord` | Discord ingress and outbound delivery, including typing hints. |
+| `@gajaeway/adapter-discord` | Discord ingress and outbound delivery, including typing hints and the voice-room interface. |
 | `@gajaeway/adapter-telegram` | Telegram ingress and outbound delivery. |
 | `@gajaeway/cli` | Owner commands over the gateway socket. |
+| `@gajaeway/voice-core` | Dependency-free pure voice logic: utterance boundaries, energy and barge-in gates, merge window, voice unread caps, origin-turn bookkeeping, alignment truncation, and PCM conversion. |
 
 `bun run build` compiles the gateway, Discord adapter, Telegram adapter, and CLI into standalone executables. The gateway still invokes the external `gjc` executable for session creation and each turn.
 

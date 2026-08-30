@@ -1,4 +1,12 @@
-import type { ChatSendResult, GatewayStatusResult, WorkRunParams, WorkRunResult } from "@gajaeway/protocol";
+import type {
+	ChatContextParams,
+	ChatContextResult,
+	ChatSendResult,
+	ChatTurnEndPayload,
+	GatewayStatusResult,
+	WorkRunParams,
+	WorkRunResult,
+} from "@gajaeway/protocol";
 import {
 	type ChatMessagePayload,
 	type ChatProgressPayload,
@@ -114,6 +122,10 @@ export class GajaewayClient {
 		return this.on("chat.progress", (payload) => handler(payload as ChatProgressPayload));
 	}
 
+	onTurnEnd(handler: (payload: ChatTurnEndPayload) => void): () => void {
+		return this.on("chat.turnEnd", (payload) => handler(payload as ChatTurnEndPayload));
+	}
+
 	async request<T = unknown>(verb: string, params?: unknown): Promise<T> {
 		if (!this.#transport) throw new Error("client is not connected");
 		const id = `${++this.#id}`;
@@ -136,6 +148,9 @@ export class GajaewayClient {
 	}
 	chatSend(origin: OriginRef, text: string): Promise<ChatSendResult> {
 		return this.request("chat.send", { origin, text });
+	}
+	contextBatch(params: ChatContextParams): Promise<ChatContextResult> {
+		return this.request("chat.context", params);
 	}
 	workRun(params: WorkRunParams): Promise<WorkRunResult> {
 		return this.request("work.run", params);

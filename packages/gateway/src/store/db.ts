@@ -13,6 +13,15 @@ export interface InboundMessageRow {
 	readonly received_at: string;
 }
 
+interface ContextRecordInput {
+	readonly messageId: string;
+	readonly originKey: string;
+	readonly authorId?: string;
+	readonly authorName?: string;
+	readonly body: string;
+	readonly receivedAt: string;
+}
+
 export class DatabaseStartupError extends Error {
 	readonly code: "newer_schema" | "integrity_check_failed";
 	constructor(code: DatabaseStartupError["code"], message: string) {
@@ -191,25 +200,22 @@ export class GatewayDatabase {
 	 * Conversation context ledger: every inbound platform message (engaged or not)
 	 * is recorded here; a turn consumes the unread diff since the last reply.
 	 */
-	contextRecord(row: {
-		messageId: string;
-		originKey: string;
-		authorId?: string;
-		authorName?: string;
-		body: string;
-	}): void {
-		this.#database
+	contextRecord(row: ContextRecordInput): boolean {
+		const changes = this.#database
 			.query(
 				"INSERT INTO conversation_context (message_id, origin_key, author_id, author_name, body, received_at) VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT(message_id) DO NOTHING",
 			)
-			.run(
-				row.messageId,
-				row.originKey,
-				row.authorId ?? null,
-				row.authorName ?? null,
-				row.body,
-				new Date().toISOString(),
-			);
+			.run(row.messageId, row.originKey, row.authorId ?? null, row.authorName ?? null, row.body, row.receivedAt);
+		return changes.changes > 0;
+	}
+
+	contextRecordBatch(rows: readonly ContextRecordInput[]): { recorded: number } {
+		const record = (): { recorded: number } => {
+			let recorded = 0;
+			for (const row of rows) if (this.contextRecord(row)) recorded++;
+			return { recorded };
+		};
+		return this.#inTransaction ? record() : this.withTransaction(record);
 	}
 
 	contextUnread(

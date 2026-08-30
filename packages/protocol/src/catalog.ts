@@ -1,5 +1,9 @@
 import type { OriginRef } from "./origin";
 
+export const CHAT_CONTEXT_MAX_ENTRIES_PER_REQUEST = 200;
+export const CHAT_CONTEXT_AT_MAX_FUTURE_MS = 60_000;
+export const CHAT_CONTEXT_AT_MAX_AGE_MS = 86_400_000;
+
 /**
  * Typed verb + event catalogs for profile v0.1. Catalogs grow additively per
  * phase inside the fixed generic envelope (ARCH-006). The gateway action
@@ -44,6 +48,34 @@ export interface EngagementContext {
 	readonly channelLabel?: string;
 	/** Human-readable server/guild/workspace label when the platform has one above the channel. */
 	readonly serverLabel?: string;
+}
+
+export interface ChatContextEntry {
+	readonly messageId: string;
+	readonly text: string;
+	readonly engagement: EngagementContext;
+	readonly at: string;
+}
+
+export interface ChatContextParams {
+	readonly origin: OriginRef;
+	readonly entries: readonly ChatContextEntry[];
+	readonly cap: { readonly maxItems: number; readonly maxCharsPerItem: number };
+}
+
+export interface ChatContextResult {
+	readonly recorded: number;
+	readonly dropped: number;
+	readonly truncated: number;
+	readonly engaged: false;
+}
+
+export interface ChatTurnEndPayload {
+	readonly turnId: string;
+	readonly origin: OriginRef;
+	readonly outcome: "completed" | "failed" | "no_output";
+	readonly deliveryIds: readonly string[];
+	readonly at: string;
 }
 
 export interface ChatSendParams {
@@ -237,6 +269,8 @@ export interface VerbCatalogV01 {
 	"gateway.status": { params: undefined; result: GatewayStatusResult };
 	"gateway.shutdown": { params: undefined; result: { readonly stopping: true } };
 	"chat.send": { params: ChatSendParams; result: ChatSendResult };
+	"chat.context": { params: ChatContextParams; result: ChatContextResult };
+
 	"delivery.confirm": { params: DeliveryConfirmParams; result: { readonly settled: true } };
 	"delivery.fail": { params: DeliveryFailParams; result: { readonly recorded: true } };
 	"session.recall": { params: SessionRecallParams; result: SessionRecallResult };
@@ -262,6 +296,8 @@ export interface VerbCatalogV01 {
 /** Event catalog: event name -> payload. */
 export interface EventCatalogV01 {
 	"chat.message": ChatMessagePayload;
+	"chat.turnEnd": ChatTurnEndPayload;
+
 	"chat.progress": ChatProgressPayload;
 	"gateway.stopping": { readonly reason: string };
 	"monitor.event": MonitorEventRecord;
@@ -271,6 +307,7 @@ export const VERBS_V01 = [
 	"gateway.status",
 	"gateway.shutdown",
 	"chat.send",
+	"chat.context",
 	"delivery.confirm",
 	"delivery.fail",
 	"session.recall",
@@ -286,7 +323,13 @@ export const VERBS_V01 = [
 	"ops.integrity",
 	"work.run",
 ] as const;
-export const EVENTS_V01 = ["chat.message", "chat.progress", "gateway.stopping", "monitor.event"] as const;
+export const EVENTS_V01 = [
+	"chat.message",
+	"chat.progress",
+	"chat.turnEnd",
+	"gateway.stopping",
+	"monitor.event",
+] as const;
 
 export type VerbName = keyof VerbCatalogV01;
 export type EventName = keyof EventCatalogV01;

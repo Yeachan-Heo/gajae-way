@@ -11,8 +11,12 @@
 		"test": "bun test"
 	},
 	"dependencies": {
+		"@discordjs/opus": "^0.10.0",
+		"@discordjs/voice": "0.19.2",
 		"@gajaeway/protocol": "workspace:*",
+		"@gajaeway/voice-core": "workspace:*",
 		"@gajaeway/sdk": "workspace:*",
+		"@snazzah/davey": "^0.1.12",
 		"discord.js": "^14.25.1"
 	}
 }

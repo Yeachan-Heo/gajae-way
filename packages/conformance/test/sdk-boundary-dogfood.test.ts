@@ -7,9 +7,14 @@ import { join, relative } from "node:path";
  *
  * Every SDK-consumer package (owner CLI, platform adapters) must be
  * implementable by a third party: it may import ONLY the public packages
- * (@gajaeway/sdk, @gajaeway/protocol), Bun/node builtins, its own files, and
- * its declared platform library. Any import that reaches into the gateway's
- * internals (or the legacy tree) is a privileged import and fails this test.
+ * (@gajaeway/sdk, @gajaeway/protocol, @gajaeway/voice-core), Bun/node builtins,
+ * its own files, and its declared platform libraries. Any import that reaches
+ * into the gateway's internals (or the legacy tree) is a privileged import and
+ * fails this test.
+ *
+ * @gajaeway/voice-core is public for the same reason the protocol package is: it
+ * has zero dependencies, holds no gateway internals, and exists precisely so a
+ * third-party adapter can reuse the provider-agnostic voice logic.
  */
 
 const ROOT = join(import.meta.dir, "..", "..", "..");
@@ -18,11 +23,20 @@ const ROOT = join(import.meta.dir, "..", "..", "..");
 const CONSUMER_PACKAGES: Record<string, readonly string[]> = {
 	"packages/cli": [],
 	// Adapters join this table in P1/P2; listing them now costs nothing.
-	"packages/adapter-discord": ["discord.js", "@discordjs/ws", "@discordjs/rest"],
+	"packages/adapter-discord": [
+		"discord.js",
+		"@discordjs/ws",
+		"@discordjs/rest",
+		// Voice-room platform libraries: audio transport, the native Opus codec, and
+		// Discord's end-to-end audio encryption.
+		"@discordjs/voice",
+		"@discordjs/opus",
+		"@snazzah/davey",
+	],
 	"packages/adapter-telegram": ["grammy", "node-telegram-bot-api"],
 };
 
-const PUBLIC_IMPORTS = ["@gajaeway/sdk", "@gajaeway/protocol"];
+const PUBLIC_IMPORTS = ["@gajaeway/sdk", "@gajaeway/protocol", "@gajaeway/voice-core"];
 
 const FORBIDDEN_PREFIXES = [
 	"@gajaeway/gateway",
