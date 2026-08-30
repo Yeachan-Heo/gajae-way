@@ -36,6 +36,15 @@ export const REBINDABLE_ERROR_CODES: ReadonlySet<string> = new Set([
  */
 export const DEFAULT_REBIND_CAP = 3;
 
+/**
+ * The code the gateway itself assigns when a turn exits cleanly but produced no
+ * assistant text. The gjc runtime reports nothing for this shape, and callers
+ * must classify it by code rather than by message wording, so the gateway
+ * supplies one. It is NOT rebindable: the session key is fine, the context is
+ * not.
+ */
+export const NO_ASSISTANT_TEXT_CODE = "no_assistant_text";
+
 /** Message budget for a delivered failure notice: truncated, never erased. */
 const MESSAGE_LIMIT = 240;
 

@@ -58,15 +58,19 @@ The durable propagation path is:
 
 The admission log occurs before propagation. Systematic state is held in the gateway database (`monitor_event` stages such as `admitted`, `batched`, `dispatched`, `authored`, and `failed`); the authored note is separately persisted and fed to the Markdown-memory closure queue. This dual logging preserves both operational history and human-readable memory.
 
-## Session compaction
+## Session health and the compaction fallback
 
-Monitor authoring shares one gjc session per event-type origin, and every turn is replayed by `gjc --resume`, so an uncompacted monitor session grows without bound: a 10-minute monitor authors about 144 turns a day, and the session eventually returns empty text while dispatch settles as `internal_error`.
+Compaction is the runtime's job. gjc's non-interactive `-p --mode json` path runs through `AgentSession.prompt()` with compaction enabled by default (`strategy = context-full`), so the gateway does not attempt its own and does not rotate monitor sessions on a turn count. A healthy session keeps its context however many turns it accumulates.
 
-The gateway therefore counts every authoring turn against a monitor-only ceiling (default 24 turns, config field `monitorSessionTurnLimit`, restart-only). On reaching it the next dispatch rolls the session epoch — a fresh gjc session and idempotency key — and injects a compact digest into that session's first authoring prompt: the monitor's standing instruction plus its most recent authored notes, each clipped and the whole digest capped. Continuity is carried by the digest, not by the discarded transcript.
+What the gateway does is observe. Every monitor authoring turn is counted on the session row, so growth is visible instead of invisible, and every authoring failure is classified: context-family (a zero-token/empty answer, or a runtime code such as `context_too_large`) versus everything else (a malformed response, a failed turn, a bind failure). Classification is by structured code and error type only, never by message wording.
 
-The roll happens after the per-origin turn chain is taken and before the session is bound, so a batch can neither be stranded nor authored twice across the boundary; leases and fencing are untouched. All of it lives in one place (`packages/gateway/src/monitors/compaction.ts` plus the single `#compactSessionIfDue` call site) so it can be replaced by native gjc compaction when the CLI exposes it on the non-interactive `--session` path.
+The fallback fires only on *proven* compaction failure: `monitorContextFailureThreshold` consecutive context-family failures on the same session (default 2, range 1–10, restart-only). Any turn that produces text clears the streak, so a monitor whose JSON keeps failing is never mistaken for one whose context is exhausted. On the threshold, the next dispatch rolls the session epoch — a fresh gjc session and idempotency key — and injects a digest into that session's first authoring prompt: the monitor's standing instruction plus its most recent authored notes, each clipped and the whole digest capped. Continuity is carried by the digest, not by the discarded transcript.
 
-The chat path keeps its own, separate ceiling of 50 turns; human-paced turns are self-limiting, monitor turns are not.
+The roll happens after the per-origin turn chain is taken and before the session is bound, so a batch can neither be stranded nor authored twice across the boundary; leases and fencing are untouched. Operator evidence is coded, never raw: each affected event gets an `authoring_context_exhausted` failure row, and the roll logs `reason=compaction_failed_context_exhausted` with the streak, the turn count of the dead epoch, and the digest size.
+
+Background (issue #68): two production monitor sessions reached 14.7 MB and 13.9 MB with zero compaction entries, the last healthy turn running at ~918K context tokens. The host ran gjc 0.15.3 and adaptive compaction landed in 0.15.4; the model catalog also advertises a 372000-token window while observed provider usage passed 900K. All fallback logic lives in `packages/gateway/src/monitors/session-health.ts` plus the single `#rollIfCompactionProvenFailed` call site, so it can be dropped once the runtime handles the case.
+
+The chat path keeps its own turn rotation at 50 turns; that path has no compaction contract to rely on.
 
 ## Burst policies
 

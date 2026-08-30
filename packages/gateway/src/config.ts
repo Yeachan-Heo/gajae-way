@@ -35,12 +35,13 @@ export interface GatewayConfigFile {
 	/** Default recipient origin for monitor/maintenance notes without their own channel target. */
 	readonly ownerTarget?: { readonly origin: OriginRef };
 	/**
-	 * Authoring turns per monitor session epoch before the gateway compacts it
-	 * (issue #68). Separate from the chat-path SESSION_TURN_LIMIT because monitor
-	 * turns are machine-paced: a 10-minute monitor authors ~144 turns a day.
-	 * Default MONITOR_SESSION_TURN_LIMIT.
+	 * Consecutive context-family authoring failures (empty/zero-token answer,
+	 * over-budget context) on one monitor session before the gateway rolls it
+	 * with a continuity digest (issue #68). gjc owns compaction; this is the
+	 * proven-failure fallback, so a healthy session is never rolled however many
+	 * turns it accumulates. Default MONITOR_CONTEXT_FAILURE_THRESHOLD.
 	 */
-	readonly monitorSessionTurnLimit?: number;
+	readonly monitorContextFailureThreshold?: number;
 	readonly webhook?: { readonly bind?: string; readonly port: number; readonly exposeNonLoopback?: boolean };
 	readonly watcherRoots?: readonly string[];
 	readonly scriptRoot?: string;
@@ -253,13 +254,14 @@ function parseTurnTimeout(value: unknown): number {
 }
 
 /**
- * Bounded 2..500: below 2 there is no session to compact (every turn rolls),
- * above 500 a 10-minute monitor would take over three days to reach the
- * threshold, which is the unbounded growth this setting exists to stop.
+ * Bounded 1..10. 1 means "roll on the first context-family failure", which
+ * trades a healthy session for a single blip and is a deliberate opt-in, not a
+ * default. Above 10 the fallback would take hours to fire on a 10-minute
+ * monitor, which is the outage this setting exists to end.
  */
-function parseMonitorSessionTurnLimit(value: unknown): number {
-	if (!Number.isInteger(value) || (value as number) < 2 || (value as number) > 500)
-		throw new ConfigError("config_invalid", "monitorSessionTurnLimit must be an integer between 2 and 500");
+function parseMonitorContextFailureThreshold(value: unknown): number {
+	if (!Number.isInteger(value) || (value as number) < 1 || (value as number) > 10)
+		throw new ConfigError("config_invalid", "monitorContextFailureThreshold must be an integer between 1 and 10");
 	return value as number;
 }
 
@@ -299,9 +301,11 @@ export function parseConfigFile(value: unknown): GatewayConfigFile {
 		...(model ? { model } : {}),
 		...(input.dmPolicy === undefined ? {} : { dmPolicy: parseDmPolicy(input.dmPolicy) }),
 		...(input.ownerTarget === undefined ? {} : { ownerTarget: parseOwnerTarget(input.ownerTarget) }),
-		...(input.monitorSessionTurnLimit === undefined
+		...(input.monitorContextFailureThreshold === undefined
 			? {}
-			: { monitorSessionTurnLimit: parseMonitorSessionTurnLimit(input.monitorSessionTurnLimit) }),
+			: {
+					monitorContextFailureThreshold: parseMonitorContextFailureThreshold(input.monitorContextFailureThreshold),
+				}),
 	};
 }
 
@@ -421,7 +425,7 @@ export const RESTART_REQUIRED_FIELDS = [
 	"watcherRoots",
 	"scriptRoot",
 	"ownerTarget",
-	"monitorSessionTurnLimit",
+	"monitorContextFailureThreshold",
 ] as const;
 
 /**

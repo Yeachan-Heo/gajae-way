@@ -13,13 +13,17 @@ import type { MemoryClosureQueue } from "../memory/closure";
 import type { GjcPort } from "../orchestrator/gjc-client";
 import type { GatewayDatabase } from "../store/db";
 import { MONITOR_EVENT_MAX_DISPATCH_ATTEMPTS, RECONCILABLE_STAGES, TERMINAL_STAGES } from "../store/db";
-import {
-	buildMonitorCompactionDigest,
-	MONITOR_DIGEST_MAX_NOTES,
-	MONITOR_SESSION_TURN_LIMIT,
-	type MonitorDigestNote,
-} from "./compaction";
 import type { MonitorRegistry } from "./registry";
+import {
+	buildMonitorSessionDigest,
+	CONTEXT_EXHAUSTION_REASON,
+	EmptyAuthoringResponseError,
+	isContextExhaustionFailure,
+	isEmptyAuthoringResponse,
+	MONITOR_CONTEXT_FAILURE_THRESHOLD,
+	MONITOR_DIGEST_MAX_NOTES,
+	type MonitorDigestNote,
+} from "./session-health";
 
 /** Product-level semantics for the seeded maintenance events (generic, persona-independent). */
 const MAINTENANCE_GUIDANCE: Record<string, string | undefined> = {
@@ -37,9 +41,26 @@ const MAINTENANCE_GUIDANCE: Record<string, string | undefined> = {
 type DispatchFailureCode =
 	| "session_bind_failed"
 	| "authoring_turn_failed"
+	/** Context-family: the session answered nothing, or the runtime reported an over-budget context. */
+	| "authoring_context_exhausted"
 	| "authoring_response_invalid"
 	| "delivery_prepare_failed"
 	| "internal_error";
+
+/** The dispatch stage an attempt was in when it threw; the source of its failure code. */
+type DispatchPhase = "bind" | "turn" | "author" | "deliver";
+
+/**
+ * A violation of the authoring response contract (unparseable, wrong shape,
+ * missing/duplicate/unknown entries). Its own class so classification is
+ * type-based: the response is bad, the session and the runtime are fine.
+ */
+class AuthoringResponseError extends Error {
+	constructor(message: string) {
+		super(message);
+		this.name = "AuthoringResponseError";
+	}
+}
 
 export interface MonitorDispatchFailure {
 	readonly eventId: string;
@@ -67,8 +88,16 @@ export class MonitorPropagator {
 	#inFlightPromises = new Map<string, Promise<void>>();
 	/** Serialize GJC monitor turns per session origin; binds can coalesce, turns cannot. */
 	#turnChains = new Map<string, Promise<void>>();
-	/** Authoring turns per monitor session epoch before it is compacted (issue #68). */
-	readonly #sessionTurnLimit: number;
+	/**
+	 * Consecutive context-family authoring failures per session origin (issue
+	 * #68). In-process by design: the streak is evidence about a LIVE session, and
+	 * a restart re-binds and re-tries that session anyway — if its context is
+	 * still exhausted the streak rebuilds within two turns, and if it is not,
+	 * there was nothing to roll.
+	 */
+	readonly #contextFailures = new Map<string, number>();
+	/** Consecutive context-family failures that trigger the fallback roll. */
+	readonly #contextFailureThreshold: number;
 	constructor(options: {
 		database: GatewayDatabase;
 		registry: MonitorRegistry;
@@ -91,11 +120,11 @@ export class MonitorPropagator {
 		/** Injectable fenced-batching seam (tests): defaults to the durable fenced update. */
 		fencedUpdate?: (eventId: string, leaseId: string, batchId: string, now: number) => boolean;
 		/**
-		 * Authoring turns per monitor session epoch before compaction rolls it.
-		 * Config-supplied (`monitorSessionTurnLimit`); defaults to
-		 * MONITOR_SESSION_TURN_LIMIT.
+		 * Consecutive context-family authoring failures before the fallback roll
+		 * fires. Config-supplied (`monitorContextFailureThreshold`); defaults to
+		 * MONITOR_CONTEXT_FAILURE_THRESHOLD.
 		 */
-		sessionTurnLimit?: number;
+		contextFailureThreshold?: number;
 	}) {
 		this.#database = options.database;
 		this.#registry = options.registry;
@@ -113,7 +142,7 @@ export class MonitorPropagator {
 		this.#fencedUpdate =
 			options.fencedUpdate ??
 			((eventId, lease, batch, at) => this.#database.monitorEventFencedUpdate(eventId, lease, "batched", batch, at));
-		this.#sessionTurnLimit = options.sessionTurnLimit ?? MONITOR_SESSION_TURN_LIMIT;
+		this.#contextFailureThreshold = options.contextFailureThreshold ?? MONITOR_CONTEXT_FAILURE_THRESHOLD;
 	}
 	/** Cancels pending burst timers so a closed database is never touched after shutdown. */
 	dispose(): void {
@@ -381,15 +410,19 @@ export class MonitorPropagator {
 		);
 		this.#turnChains.set(sessionOriginKey, trackedTurn);
 		if (previousTurn) await previousTurn.catch(() => undefined);
+		// The dispatch phase is tracked explicitly, because it is the only honest
+		// source of a failure code. The previous message-substring mapping matched
+		// literals ("sendTurn", "ensureSession") that no real error carries, so
+		// every production authoring failure was recorded as `internal_error`.
+		let phase: DispatchPhase = "bind";
 		try {
-			// Compaction boundary (issue #68). It sits HERE, after the per-origin
-			// turn chain has been acquired and before this batch's session is
-			// bound: the previous batch's authoring turn has already settled, and
-			// this batch's events are claimed under live leases but not yet
-			// authored. A roll can therefore neither strand an in-flight batch nor
-			// let one be authored twice — the events simply land in the new epoch's
-			// session.
-			const digest = this.#compactSessionIfDue(sessionOriginKey, JSON.stringify(sessionOrigin), monitor);
+			// Fallback boundary (issue #68). It sits HERE, after the per-origin turn
+			// chain has been acquired and before this batch's session is bound: the
+			// previous batch's authoring turn has already settled, and this batch's
+			// events are claimed under live leases but not yet authored. A roll can
+			// therefore neither strand an in-flight batch nor let one be authored
+			// twice — the events simply land in the new epoch's session.
+			const digest = this.#rollIfCompactionProvenFailed(sessionOriginKey, JSON.stringify(sessionOrigin), monitor);
 			const { sessionId } = await this.#gjc.ensureSession(
 				sessionOriginKey,
 				this.#database.getSessionRecord(sessionOriginKey)?.epoch ?? 0,
@@ -403,12 +436,23 @@ export class MonitorPropagator {
 				.filter((entry, index, all) => entry && all.indexOf(entry) === index);
 			const guidance = [monitor.instruction?.trim() || undefined, ...maintenance].filter(Boolean).join(" ");
 			const prompt = `Author monitor events.${guidance ? ` ${guidance}` : ""}${digest ? `\n${digest}\n` : ""} Respond ONLY with a JSON array containing exactly one {"eventId","note"} entry per event: ${JSON.stringify(claimed.map((row) => ({ eventId: row.event_id, eventType: row.event_type, payload: JSON.parse(row.payload_json) })))}`;
+			phase = "turn";
 			const response = await this.#gjc.sendTurn(sessionId, prompt);
-			// The authoring turn is now part of the session transcript whatever its
-			// content, so it is counted here rather than after the response is
-			// validated: an invalid response still grew the context, and not
-			// counting it is exactly how this session escaped rotation (#68).
+			phase = "author";
+			// Observability, not a rotation trigger: the turn is now part of the
+			// session transcript whatever its content, so it is counted here rather
+			// than after the response is validated. gjc owns compaction; the count
+			// is what makes a monitor session's growth visible (issue #68).
 			this.#database.incrementTurnCount(sessionOriginKey, JSON.stringify(sessionOrigin));
+			// An empty answer is the same evidence as a zero-token turn: the session
+			// said nothing. Raised as a coded failure so it is classified, recorded
+			// and counted exactly like a runtime context error.
+			if (isEmptyAuthoringResponse(response)) throw new EmptyAuthoringResponseError();
+			// The session produced text, so its context is demonstrably usable: any
+			// prior context-failure streak is stale evidence and is cleared here.
+			// Whatever goes wrong below (bad JSON, missing entries) is a response
+			// defect, not an exhausted session, and must never trigger the fallback.
+			this.#contextFailures.delete(sessionOriginKey);
 			// Lease fencing: after an await, this attempt may no longer own the
 			// claim (expired + stolen). Every write below is conditional on the
 			// live lease; a stale attempt's completion becomes a no-op.
@@ -419,8 +463,13 @@ export class MonitorPropagator {
 				this.#database.monitorEventFencedUpdate(row.event_id, leaseId, "dispatched", batchId),
 			);
 			if (!fenced.length) return;
-			const authored = JSON.parse(response) as Array<{ eventId?: unknown; note?: unknown }>;
-			if (!Array.isArray(authored)) throw new Error("authoring response is not an array");
+			let authored: Array<{ eventId?: unknown; note?: unknown }>;
+			try {
+				authored = JSON.parse(response) as Array<{ eventId?: unknown; note?: unknown }>;
+			} catch {
+				throw new AuthoringResponseError("authoring response is not valid JSON");
+			}
+			if (!Array.isArray(authored)) throw new AuthoringResponseError("authoring response is not an array");
 			// Strict response contract: exactly one valid entry per claimed event —
 			// a partial/missing/duplicate/extra response is a structured failure.
 			// Omitted events must stay recoverable (dispatched/failed), never
@@ -429,18 +478,18 @@ export class MonitorPropagator {
 			const seenIds = new Set<string>();
 			for (const entry of authored) {
 				if (typeof entry.eventId !== "string" || typeof entry.note !== "string") {
-					throw new Error("authoring response entry missing eventId or note");
+					throw new AuthoringResponseError("authoring response entry missing eventId or note");
 				}
 				if (!claimedIds.has(entry.eventId)) {
-					throw new Error(`authoring response contains unknown event ${entry.eventId}`);
+					throw new AuthoringResponseError(`authoring response contains unknown event ${entry.eventId}`);
 				}
 				if (seenIds.has(entry.eventId)) {
-					throw new Error(`authoring response duplicates event ${entry.eventId}`);
+					throw new AuthoringResponseError(`authoring response duplicates event ${entry.eventId}`);
 				}
 				seenIds.add(entry.eventId);
 			}
 			for (const id of claimedIds) {
-				if (!seenIds.has(id)) throw new Error(`authoring response omits event ${id}`);
+				if (!seenIds.has(id)) throw new AuthoringResponseError(`authoring response omits event ${id}`);
 			}
 			for (const entry of authored)
 				if (
@@ -508,6 +557,7 @@ export class MonitorPropagator {
 					final: true,
 					deliveryId,
 				};
+				phase = "deliver";
 				const admitted = this.#database.monitorDeliveryPrepareFenced(
 					deliveryId,
 					batchId,
@@ -526,7 +576,19 @@ export class MonitorPropagator {
 		} catch (error) {
 			// Public-safe structured evidence only: a stable phase code and event ids.
 			// The raw error body can carry secrets and is never persisted or logged.
-			const code: DispatchFailureCode = failureCode(error);
+			const contextExhausted = isContextExhaustionFailure(error);
+			const code: DispatchFailureCode = contextExhausted ? "authoring_context_exhausted" : failureCode(error, phase);
+			// Health accounting for the fallback gate: only context-family failures
+			// accumulate. Anything else is proof the session still answers, so the
+			// streak is cleared — a monitor whose JSON keeps failing must never be
+			// mistaken for one whose context is exhausted.
+			if (contextExhausted) {
+				const streak = (this.#contextFailures.get(sessionOriginKey) ?? 0) + 1;
+				this.#contextFailures.set(sessionOriginKey, streak);
+				console.error(
+					`monitor authoring context failure ${streak}/${this.#contextFailureThreshold} origin=${sessionOriginKey} code=${code}`,
+				);
+			} else this.#contextFailures.delete(sessionOriginKey);
 			for (const row of leased) {
 				this.#database.monitorEventFencedFail(row.event_id, leaseId, batchId, code, `dispatch phase failed (${code})`);
 			}
@@ -542,24 +604,36 @@ export class MonitorPropagator {
 		}
 	}
 	/**
-	 * THE ONE monitor-session compaction choke point (issue #68).
+	 * THE ONE monitor-session recovery choke point (issue #68).
 	 *
-	 * Everything compaction-related happens here: the threshold read, the epoch
-	 * roll and the digest that carries continuity into the next session. When the
-	 * gjc CLI grows native compaction on the `gjc --session <id> -p --mode json`
-	 * path it currently exposes (today only `--resume`, `--session-dir` and
-	 * `--no-session` exist there), replace the BODY of this method with that call
-	 * and delete the digest injection — no other call site in the gateway needs
-	 * to change.
+	 * gjc owns compaction: the non-interactive `-p --mode json` path runs through
+	 * AgentSession.prompt() with compaction enabled by default, and the gateway
+	 * deliberately does not attempt its own. This is the FALLBACK for the case
+	 * where compaction is proven not to be working — a run of consecutive
+	 * context-family failures on one session (observed: zero compaction entries,
+	 * 14 MB transcripts, every turn failing at ~918K tokens on gjc 0.15.3, which
+	 * predates adaptive compaction).
+	 *
+	 * A healthy session is never rolled, however many turns it has accumulated.
+	 * When the runtime handles the case natively (a newer gjc, or a compaction
+	 * signal the gateway can read), this method is the only place that changes.
 	 *
 	 * Returns the digest to inject into this turn's prompt, or undefined when no
-	 * roll was due.
+	 * roll fired.
 	 */
-	#compactSessionIfDue(sessionOriginKey: string, originRefJson: string, monitor: MonitorRecord): string | undefined {
-		if (this.#database.sessionTurnCount(sessionOriginKey) < this.#sessionTurnLimit) return undefined;
+	#rollIfCompactionProvenFailed(
+		sessionOriginKey: string,
+		originRefJson: string,
+		monitor: MonitorRecord,
+	): string | undefined {
+		const streak = this.#contextFailures.get(sessionOriginKey) ?? 0;
+		if (streak < this.#contextFailureThreshold) return undefined;
+		// Read the turn count BEFORE the roll: bumpEpoch resets it, and the count of
+		// the epoch that died is the useful number for an operator.
+		const turnsInFailedEpoch = this.#database.sessionTurnCount(sessionOriginKey);
 		// Build the digest BEFORE the roll: it reads durable authored notes, which
 		// the roll does not touch, but reading first keeps the ordering obvious.
-		const digest = buildMonitorCompactionDigest({
+		const digest = buildMonitorSessionDigest({
 			monitorName: monitor.name,
 			instruction: monitor.instruction,
 			notes: this.#recentAuthoredNotes(monitor.monitorId),
@@ -568,8 +642,12 @@ export class MonitorPropagator {
 		// the gjc binding cleared, so the next ensureSession mints a fresh session
 		// (and a fresh idempotency key) for this origin.
 		this.#database.withTransaction(() => this.#database.bumpEpoch(sessionOriginKey, originRefJson));
+		this.#contextFailures.delete(sessionOriginKey);
+		// Coded reason only: the operator gets the structured cause and the counts,
+		// never the runtime's raw error text (it can carry secrets). The per-event
+		// `authoring_context_exhausted` failure rows are the durable evidence.
 		console.error(
-			`monitor session compacted for ${sessionOriginKey} after ${this.#sessionTurnLimit} authoring turns (monitor ${monitor.monitorId}, digest ${digest.length}B).`,
+			`monitor session rolled reason=${CONTEXT_EXHAUSTION_REASON} origin=${sessionOriginKey} monitor=${monitor.monitorId} consecutive_context_failures=${streak}/${this.#contextFailureThreshold} turns_in_failed_epoch=${turnsInFailedEpoch} digest_bytes=${digest.length}`,
 		);
 		return digest;
 	}
@@ -631,10 +709,22 @@ export class MonitorPropagator {
 	}
 }
 
-function failureCode(error: unknown): DispatchFailureCode {
-	const message = error instanceof Error ? error.message : String(error);
-	if (message.includes("authoring response is not an array")) return "authoring_response_invalid";
-	if (message.includes("sendTurn")) return "authoring_turn_failed";
-	if (message.includes("ensureSession")) return "session_bind_failed";
-	return "internal_error";
+/**
+ * The failure code for a dispatch that threw, derived from the phase it was in
+ * and the error's TYPE — never from message wording. Response-contract
+ * violations are their own class, so a malformed answer is never reported as an
+ * infrastructure failure (and vice versa).
+ */
+function failureCode(error: unknown, phase: DispatchPhase): DispatchFailureCode {
+	if (error instanceof AuthoringResponseError) return "authoring_response_invalid";
+	switch (phase) {
+		case "bind":
+			return "session_bind_failed";
+		case "turn":
+			return "authoring_turn_failed";
+		case "deliver":
+			return "delivery_prepare_failed";
+		default:
+			return "internal_error";
+	}
 }

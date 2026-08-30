@@ -38,7 +38,7 @@ The CLI does not start the daemon: `gajaeway daemon run` prints the launcher com
   "webhook": { "bind": "127.0.0.1", "port": 8080, "exposeNonLoopback": false },
   "watcherRoots": ["/absolute/path"],
   "scriptRoot": "/absolute/path",
-  "monitorSessionTurnLimit": 24
+  "monitorContextFailureThreshold": 2
 }
 ```
 
@@ -46,7 +46,7 @@ Use schema version 1 only. Each credential is a file reference, never an inline 
 
 `model` accepts either a gjc model selector string such as `"openai/gpt-5.2"` or a preset object such as `{ "preset": "codex-medium" }`. Presets are resolved by gjc from its merged built-in and `~/.gjc/agent/models.yml` profile catalog. A preset's `model_mapping.default` may be an ordered selector array; gajaeway invokes the preset with `--mpreset`, so gjc retains its native availability checks, retry budgets, sticky selection, and fallback-chain behavior instead of the gateway attempting unsafe whole-turn retries.
 
-`monitorSessionTurnLimit` (2–500, default 24) is the authoring-turn ceiling for a monitor's event session before the gateway compacts it: the epoch rolls and the new session's first prompt carries a digest of the monitor's instruction and its recent authored notes. It is restart-only and separate from the 50-turn chat rotation. See `docs/monitors.md`.
+`monitorContextFailureThreshold` (1–10, default 2) is how many consecutive context-family authoring failures (empty/zero-token answer, `context_too_large`) on one monitor session constitute proven compaction failure. Only then does the gateway roll that session and seed the new one with a digest of the monitor's instruction and its recent authored notes. gjc owns compaction; a healthy session is never rolled. Restart-only. See `docs/monitors.md`.
 
 ## Adapters and engagement
 

@@ -64,13 +64,21 @@ test("turnTimeoutMs parses when bounded and rejects out-of-range values", () => 
 	expect(() => parseConfigFile({ schemaVersion: 1, turnTimeoutMs: "long" })).toThrow("turnTimeoutMs");
 });
 
-test("monitorSessionTurnLimit parses when bounded and rejects out-of-range values", () => {
-	expect(parseConfigFile({ schemaVersion: 1, monitorSessionTurnLimit: 12 }).monitorSessionTurnLimit).toBe(12);
-	// Unset means the code default (MONITOR_SESSION_TURN_LIMIT), not a config value.
-	expect(parseConfigFile({ schemaVersion: 1 }).monitorSessionTurnLimit).toBeUndefined();
-	expect(() => parseConfigFile({ schemaVersion: 1, monitorSessionTurnLimit: 1 })).toThrow("monitorSessionTurnLimit");
-	expect(() => parseConfigFile({ schemaVersion: 1, monitorSessionTurnLimit: 501 })).toThrow("monitorSessionTurnLimit");
-	expect(() => parseConfigFile({ schemaVersion: 1, monitorSessionTurnLimit: 24.5 })).toThrow("monitorSessionTurnLimit");
+test("monitorContextFailureThreshold parses when bounded and rejects out-of-range values", () => {
+	expect(parseConfigFile({ schemaVersion: 1, monitorContextFailureThreshold: 3 }).monitorContextFailureThreshold).toBe(
+		3,
+	);
+	// Unset means the code default (MONITOR_CONTEXT_FAILURE_THRESHOLD), not a config value.
+	expect(parseConfigFile({ schemaVersion: 1 }).monitorContextFailureThreshold).toBeUndefined();
+	expect(() => parseConfigFile({ schemaVersion: 1, monitorContextFailureThreshold: 0 })).toThrow(
+		"monitorContextFailureThreshold",
+	);
+	expect(() => parseConfigFile({ schemaVersion: 1, monitorContextFailureThreshold: 11 })).toThrow(
+		"monitorContextFailureThreshold",
+	);
+	expect(() => parseConfigFile({ schemaVersion: 1, monitorContextFailureThreshold: 2.5 })).toThrow(
+		"monitorContextFailureThreshold",
+	);
 });
 
 test("model accepts an explicit selector or a preset", () => {

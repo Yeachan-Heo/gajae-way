@@ -4,6 +4,7 @@ import {
 	DEFAULT_REBIND_CAP,
 	extractRuntimeError,
 	GjcRuntimeError,
+	NO_ASSISTANT_TEXT_CODE,
 	type RuntimeErrorDetail,
 	rebindableCodeOf,
 	runtimeErrorOfEnvelope,
@@ -535,7 +536,15 @@ export class GjcClient implements GjcPort {
 				const detail = stream.runtimeError ?? extractRuntimeError(stderr);
 				throw runtimeFailure(`gjc turn exited ${exitCode}`, detail, stderr.trim());
 			}
-			if (stream.finalText === undefined) throw new Error("gjc turn stream produced no assistant text");
+			// A clean exit with no assistant text is the observed shape of a session
+			// whose context is exhausted (issue #68: 918K-token monitor sessions
+			// returned zero tokens turn after turn). It is reported with a structured
+			// code so callers classify it by code, never by message wording.
+			if (stream.finalText === undefined)
+				throw new GjcRuntimeError("gjc turn stream produced no assistant text", {
+					code: NO_ASSISTANT_TEXT_CODE,
+					message: "the turn completed without producing any assistant text",
+				});
 			return stream.finalText;
 		} finally {
 			clearInterval(watchdog);
