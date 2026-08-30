@@ -119,11 +119,14 @@ function sendChannelMessage(client: { send(value: unknown): void }, id: string, 
 }
 
 test("intermediate assistant messages are delivered while the turn is still running", async () => {
+	// Issue #71: the mid-work message must be something a person would say
+	// (a finding here). Pure process narration like "checking the logs now" is
+	// suppressed by the InterimSpeechGate; see interim-speech.test.ts.
 	let releaseTurn: (() => void) | undefined;
 	const gjc: GjcPort = {
 		ensureSession: async () => ({ sessionId: "mock-session" }),
 		sendTurn: async (_session, _text, _preamble, _progress, options?: TurnOptions) => {
-			options?.onAssistantText?.("working on it — checking the logs now");
+			options?.onAssistantText?.("the 500s hit every 3 minutes, not randomly");
 			await new Promise<void>((resolve) => {
 				releaseTurn = resolve;
 			});
@@ -141,7 +144,7 @@ test("intermediate assistant messages are delivered while the turn is still runn
 	}
 	const midTurn = client.frames.filter((frame: any) => frame.type === "event" && frame.event === "chat.message");
 	expect(midTurn.length).toBe(1);
-	expect(midTurn[0].payload.text).toContain("checking the logs");
+	expect(midTurn[0].payload.text).toContain("every 3 minutes");
 	releaseTurn?.();
 	for (let attempt = 0; attempt < 100; attempt++) {
 		const count = client.frames.filter((frame: any) => frame.type === "event" && frame.event === "chat.message").length;
