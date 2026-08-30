@@ -5,13 +5,12 @@ import {
 	encodeFrame,
 	type Frame,
 	FrameDecoder,
-	type HelloPayload,
 	HANDOFF_DEPTH_CAP,
 	type HandoffDigestEntry,
-	handoffOriginLabel,
 	type HandoffProvenance,
+	type HelloPayload,
+	handoffOriginLabel,
 	isPlatformMessageId,
-	parseHandoffReply,
 	isSilenceToken,
 	LOOPBACK_ORIGIN,
 	negotiate,
@@ -19,6 +18,7 @@ import {
 	originKey,
 	PROFILE_VERSION,
 	ProtocolError,
+	parseHandoffReply,
 	parseReactionReply,
 	platformSupportsReaction,
 	REACTIONS_PER_MESSAGE_CAP,
@@ -61,8 +61,8 @@ import { buildSessionBootstrap, type SessionBootstrap } from "../persona/bootstr
 import { PersonaLoader } from "../persona/persona";
 import type { GatewayDatabase, InboundMessageRow, MonitorEventStage } from "../store/db";
 import { DeliveryLedger } from "../store/ledger";
-import { KeyedQueue } from "./keyed-queue";
 import { dispatchHandoff, inboundHandoffProvenance } from "./handoff";
+import { KeyedQueue } from "./keyed-queue";
 import { composeSpeakerLabel, composeTurnHeader } from "./speaker";
 
 /**
@@ -1455,7 +1455,7 @@ async function runInboundTurn(
 	if (digestEntries.length === 0)
 		digestEntries.push({
 			at: row.received_at,
-			author: relayed ? `relayed from ${relayed.sourceOriginKey}` : (speaker || "requester"),
+			author: relayed ? `relayed from ${relayed.sourceOriginKey}` : speaker || "requester",
 			text: userText,
 		});
 	// One handoff per turn: the first `[HANDOFF:<target>]` wins and every later one
