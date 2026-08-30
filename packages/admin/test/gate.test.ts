@@ -52,14 +52,20 @@ describe("MutationGate", () => {
 		expect(decision).toMatchObject({ allowed: false, status: 401 });
 	});
 
-	test("treats a whitespace actor as anonymous", async () => {
-		const { instance } = gate();
+	test.each([
+		["ascii whitespace", "   "],
+		["a newline", "\n\t"],
+		["a zero-width space", "\u200b"],
+		["a word joiner", "\u2060"],
+	])("an actor that is only %s cannot mutate", async (_label, actor) => {
+		const { instance, audit } = gate();
 		const decision = await instance.evaluate({
 			operationId: "ops.backup",
-			actor: "   ",
+			actor,
 			confirm: "ops.backup",
 		});
 		expect(decision).toMatchObject({ allowed: false, status: 401 });
+		expect(audit.at(-1)).toMatchObject({ decision: "rejected", actor: "anonymous" });
 	});
 
 	test("requires the confirmation to echo the operation id", async () => {

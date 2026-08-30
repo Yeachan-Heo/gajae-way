@@ -29,7 +29,7 @@ For how memory, monitors, and the gateway work, see [the documentation](docs/).
    bun run build
    ```
 
-   This creates `dist/gajaeway-gateway`, `dist/gajaeway-discord`, `dist/gajaeway-telegram`, and `dist/gajaeway`.
+   This creates `dist/gajaeway-gateway`, `dist/gajaeway-discord`, `dist/gajaeway-telegram`, `dist/gajaeway`, and `dist/gajaeway-admin`.
 
 2. Choose a private home directory and create `$GAJAEWAY_HOME/config.json` plus separate credential files. The gateway configuration references credential **files**, rather than storing secret values inline. See [deployment](docs/deployment.md) for the complete layout and examples.
 
@@ -49,7 +49,7 @@ For how memory, monitors, and the gateway work, see [the documentation](docs/).
    dist/gajaeway-discord
    ```
 
-   Start `dist/gajaeway-telegram` separately when using Telegram.
+   Start `dist/gajaeway-telegram` separately when using Telegram. `dist/gajaeway-admin` is an optional loopback-only web console over a running gateway — see [deployment](docs/deployment.md#admin-console).
 
 ## Make it yours
 

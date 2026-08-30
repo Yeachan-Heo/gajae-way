@@ -29,7 +29,13 @@ function harness(options: { request?: GatewayRequest; mutationsEnabled?: boolean
 	return {
 		calls,
 		audit,
-		fetch: (path, init) => handler(new Request(`http://admin.test${path}`, init)),
+		fetch: (path, init) =>
+			handler(
+				new Request(`http://127.0.0.1:8788${path}`, {
+					...init,
+					headers: { host: "127.0.0.1:8788", ...((init?.headers ?? {}) as Record<string, string>) },
+				}),
+			),
 	};
 }
 
@@ -80,6 +86,42 @@ describe("read surface", () => {
 		const app = harness();
 		expect((await app.fetch("/api/whatever")).status).toBe(404);
 		expect(app.calls).toHaveLength(0);
+	});
+});
+
+describe("host pinning", () => {
+	test.each([
+		"127.0.0.1:8788",
+		"127.0.0.1",
+		"localhost:8788",
+		"[::1]:8788",
+	])("%s is accepted as loopback", async (host) => {
+		const app = harness();
+		expect((await app.fetch("/api/status", { headers: { host } })).status).toBe(200);
+	});
+
+	test("a rebound host cannot read the gateway", async () => {
+		const app = harness();
+		const response = await app.fetch("/api/status", { headers: { host: "evil.example" } });
+		expect(response.status).toBe(403);
+		expect(app.calls).toHaveLength(0);
+	});
+
+	test("a rebound host cannot mutate, and never reaches the gate", async () => {
+		const app = harness();
+		const response = await app.fetch("/api/mutations", {
+			...post({ operationId: "ops.integrity", actor: "형님", confirm: "ops.integrity" }),
+			headers: { "content-type": "application/json", host: "evil.example" },
+		});
+		expect(response.status).toBe(403);
+		expect(app.calls).toHaveLength(0);
+		expect(app.audit).toHaveLength(0);
+	});
+
+	test("a request with no host header is refused", async () => {
+		const handler = createHandler({ request: async () => ({}) });
+		const response = await handler(new Request("http://127.0.0.1:8788/api/status"));
+		expect(response.status).toBe(403);
 	});
 });
 

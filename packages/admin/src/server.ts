@@ -33,6 +33,21 @@ const READ_ROUTES: Record<string, { method: string; params?: unknown }> = {
 	"/api/monitors": { method: "monitor.list" },
 };
 
+/**
+ * The loopback bind is not an authentication boundary on its own: under DNS
+ * rebinding a browser resolves an attacker's name to 127.0.0.1, so its requests
+ * are same-origin and reach this handler with the attacker's `Host`. Pinning
+ * the header closes that path, which matters because the operation ids are
+ * public on `/api/operations` and the confirmation is just an echo of them.
+ */
+const LOOPBACK_HOSTS = new Set(["127.0.0.1", "localhost", "[::1]"]);
+
+function isLoopbackHost(header: string | null): boolean {
+	if (header === null) return false;
+	const host = header.startsWith("[") ? header.slice(0, header.indexOf("]") + 1) : (header.split(":")[0] ?? "");
+	return LOOPBACK_HOSTS.has(host);
+}
+
 function json(body: unknown, status = 200): Response {
 	return new Response(JSON.stringify(body), {
 		status,
@@ -45,6 +60,10 @@ export function createHandler(options: AdminServerOptions): (request: Request) =
 
 	return async (request: Request): Promise<Response> => {
 		const url = new URL(request.url);
+
+		if (!isLoopbackHost(request.headers.get("host"))) {
+			return json({ ok: false, error: "unexpected host header" }, 403);
+		}
 
 		if (request.method === "GET" && (url.pathname === "/" || url.pathname === "/index.html")) {
 			return new Response(renderIndex(gate.operations), {

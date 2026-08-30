@@ -76,7 +76,12 @@ export class MutationGate {
 	}
 
 	async evaluate(request: MutationRequest): Promise<GateDecision> {
-		const actor = request.actor?.trim() || "anonymous";
+		// `trim()` only strips Unicode whitespace, so a zero-width space would pass
+		// as an identity and attribute a real mutation to an invisible actor. An
+		// attribution is only an attribution if it carries a letter or a digit.
+		const declared = request.actor?.trim() ?? "";
+		const identified = /[\p{L}\p{N}]/u.test(declared);
+		const actor = identified ? declared : "anonymous";
 
 		if (!this.#enabled) {
 			return await this.#reject(request, actor, 403, "mutations are disabled for this deployment");
@@ -85,7 +90,7 @@ export class MutationGate {
 		if (!operation) {
 			return await this.#reject(request, actor, 404, `operation ${request.operationId} is not allowlisted`);
 		}
-		if (actor === "anonymous") {
+		if (!identified) {
 			return await this.#reject(request, actor, 401, "an actor is required for a mutation");
 		}
 		if (request.confirm !== request.operationId) {

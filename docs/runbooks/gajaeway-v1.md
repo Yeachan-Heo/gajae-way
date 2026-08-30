@@ -5,7 +5,7 @@
 For production, compile standalone binaries — no source checkout, node_modules, or Bun install is needed on the host:
 
 ```sh
-bun run build   # emits dist/gajaeway-gateway, dist/gajaeway-discord, dist/gajaeway-telegram, dist/gajaeway
+bun run build   # emits dist/gajaeway-gateway, dist/gajaeway-discord, dist/gajaeway-telegram, dist/gajaeway, dist/gajaeway-admin
 dist/gajaeway-gateway daemon
 ```
 
