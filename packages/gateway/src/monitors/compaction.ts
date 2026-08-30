@@ -147,6 +147,66 @@ export function isAsideTimeoutFailure(error: unknown): boolean {
 }
 
 /**
+ * Executor sub-kinds, reported as structured operator-facing reasons. The class
+ * axis stays at three (context / executor / protocol); this is the breakdown
+ * WITHIN executor, because "the worker timed out" and "the worker timed out and
+ * left external work running" need different operator action.
+ *
+ * `executor_orphaned_external_work` is the measured failure mode: the child CLI
+ * process was killed on the wrapper's timeout (300s/360s) while the external
+ * daemon's job kept running, so the next tick stacked another one on top. Drill
+ * observation: aside exec collection took 7–13 minutes, the wrapper killed the
+ * child at 300/360s, the Aside daemon task stayed `running`, and 3 sessions and
+ * 10 tabs accumulated.
+ *
+ * That is not a session problem, so it must NEVER touch the session: no streak,
+ * no compaction request, no roll. The gateway's whole job here is to name it.
+ */
+export type ExecutorFailureReason = "executor_orphaned_external_work" | "executor_timeout" | "executor_failed";
+
+/**
+ * Substrings that identify an orphaned external executor: the child died, the
+ * external work did not.
+ */
+const ORPHANED_EXECUTOR_MARKERS = [
+	"orphaned_executor",
+	"orphaned executor",
+	"daemon task still running",
+	"daemon job still running",
+	"external work still running",
+	"task still running",
+	"still running after",
+	"orphaned",
+];
+
+/**
+ * True when the failure left external executor work running behind a dead child
+ * process. Checked before every other executor marker: an orphaned run is the
+ * actionable signal, and the same message usually also looks like a timeout.
+ */
+export function isOrphanedExecutorFailure(error: unknown): boolean {
+	const message = (error instanceof Error ? error.message : String(error)).toLowerCase();
+	if (ORPHANED_EXECUTOR_MARKERS.some((marker) => message.includes(marker))) return true;
+	// The generic shape of the drill: a killed/terminated child alongside a
+	// daemon that is still alive.
+	const childDied = /kill|terminated|exited|abort/.test(message);
+	const externalAlive = /daemon|external/.test(message) && /running|alive|active|pending/.test(message);
+	return childDied && externalAlive;
+}
+
+/**
+ * Names the executor sub-kind. Pure and message-based; the message is inspected
+ * here and discarded, only the coded reason escapes.
+ */
+export function classifyExecutorFailure(error: unknown): ExecutorFailureReason {
+	if (isOrphanedExecutorFailure(error)) return "executor_orphaned_external_work";
+	const message = (error instanceof Error ? error.message : String(error)).toLowerCase();
+	if (isAsideTimeoutFailure(error) || message.includes("timeout") || message.includes("timed out"))
+		return "executor_timeout";
+	return "executor_failed";
+}
+
+/**
  * Classifies an authoring failure. Pure, message-based: the raw message is
  * inspected here and then discarded — only the class escapes, never the text.
  *
@@ -157,9 +217,9 @@ export function isAsideTimeoutFailure(error: unknown): boolean {
  */
 export function classifyAuthoringFailure(error: unknown): AuthoringFailureClass {
 	const message = (error instanceof Error ? error.message : String(error)).toLowerCase();
-	// Unambiguous executor failure first: an aside timeout says nothing at all
-	// about the session's context.
-	if (isAsideTimeoutFailure(error)) return "executor";
+	// Unambiguous executor failures first: an orphaned external run or an aside
+	// timeout says nothing at all about the session's context.
+	if (isOrphanedExecutorFailure(error) || isAsideTimeoutFailure(error)) return "executor";
 	if (PROTOCOL_FAILURE_MARKERS.some((marker) => message.includes(marker))) return "protocol";
 	if (CONTEXT_FAILURE_MARKERS.some((marker) => message.includes(marker))) return "context";
 	if (EXECUTOR_FAILURE_MARKERS.some((marker) => message.includes(marker))) return "executor";

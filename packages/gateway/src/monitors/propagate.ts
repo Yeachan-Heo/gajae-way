@@ -18,8 +18,11 @@ import {
 	buildMonitorCompactionDigest,
 	type CompactionPort,
 	classifyAuthoringFailure,
+	classifyExecutorFailure,
 	decideSessionRoll,
+	type ExecutorFailureReason,
 	isAsideTimeoutFailure,
+	isOrphanedExecutorFailure,
 	MONITOR_CONTEXT_FAILURE_ROLL_THRESHOLD,
 	MONITOR_DIGEST_MAX_NOTES,
 	type MonitorDigestNote,
@@ -53,8 +56,13 @@ type DispatchFailureCode =
 	// Executor-class: the aside collection worker hit its 300s cap. Its own code
 	// so it can never be read as, or aggregated with, context exhaustion.
 	| "aside_timeout"
+	// Executor-class: the child process died on the wrapper's timeout while the
+	// external daemon's work kept running, so the next tick stacks a duplicate.
+	// Its own code because the operator action is "reclaim the external
+	// executor", not anything to do with this session.
+	| "orphaned_executor"
 	// Executor-class: a worker timeout, external tool failure or lock skip that
-	// is not the aside worker.
+	// is neither the aside worker nor an orphaned external run.
 	| "executor_failed"
 	| "delivery_prepare_failed"
 	| "internal_error";
@@ -87,6 +95,18 @@ export interface MonitorSessionSafetyState {
 	staleContextFailures: number;
 	/** Executor-class failures in this epoch — timeouts, tools, locks (diagnostic). */
 	executorFailures: number;
+	/**
+	 * Executor-class failures that left external work running behind a dead
+	 * child (diagnostic). Never part of the context streak: the session is fine,
+	 * the external executor is not.
+	 */
+	orphanedExecutorFailures: number;
+	/**
+	 * Coded reason of the last executor-class failure. Survives a roll on
+	 * purpose: an unreclaimed external executor is not fixed by rolling a
+	 * session, so the signal must not be wiped by one.
+	 */
+	lastExecutorReason: ExecutorFailureReason | undefined;
 	/** Protocol-class failures in this epoch — malformed or off-contract answers (diagnostic). */
 	protocolFailures: number;
 	/** Result of the last native-compaction attempt, or undefined if never attempted. */
@@ -617,6 +637,9 @@ export class MonitorPropagator {
 			await this.#recordAuthoringFailure({
 				sessionOriginKey,
 				failureClass,
+				// Passed for PURE classification only (executor sub-kind). The message
+				// is never logged or persisted from here.
+				error,
 				sessionId: boundSessionId,
 				boundEpoch: boundSessionEpoch,
 				replayed: replayedBatch,
@@ -643,6 +666,8 @@ export class MonitorPropagator {
 			turns: 0,
 			contextFailures: 0,
 			staleContextFailures: 0,
+			orphanedExecutorFailures: 0,
+			lastExecutorReason: undefined,
 			executorFailures: 0,
 			protocolFailures: 0,
 			nativeCompaction: undefined,
@@ -658,9 +683,12 @@ export class MonitorPropagator {
 	 *
 	 * Only a context-class failure of the CURRENT session's own fresh work can
 	 * feed the streak. Everything else is recorded and dropped:
-	 * - executor-class (aside worker timeout, tool failure, lock skip) and
-	 *   protocol-class (malformed or off-contract answer) are not evidence about
-	 *   context size at all.
+	 * - executor-class (aside worker timeout, orphaned external run, tool
+	 *   failure, lock skip) and protocol-class (malformed or off-contract
+	 *   answer) are not evidence about context size at all. The executor
+	 *   sub-kind is named for the operator (`lastExecutorReason`), and the
+	 *   orphaned case is counted separately because its remedy is reclaiming an
+	 *   external daemon job, not touching this session.
 	 * - a replayed batch (reconcile revived it) carries an old payload and may
 	 *   have failed against a session that is already gone.
 	 * - a bound epoch that is no longer current means the failure belongs to a
@@ -673,15 +701,28 @@ export class MonitorPropagator {
 	async #recordAuthoringFailure(input: {
 		sessionOriginKey: string;
 		failureClass: AuthoringFailureClass;
+		/** Inspected by pure classifiers only; never logged, never persisted. */
+		error: unknown;
 		sessionId: string | undefined;
 		boundEpoch: number | undefined;
 		replayed: boolean;
 		monitor: MonitorRecord;
 	}): Promise<void> {
-		const { sessionOriginKey, failureClass, sessionId, boundEpoch, replayed, monitor } = input;
+		const { sessionOriginKey, failureClass, error, sessionId, boundEpoch, replayed, monitor } = input;
 		const state = this.#safetyState(sessionOriginKey);
 		if (failureClass === "executor") {
 			state.executorFailures += 1;
+			const reason = classifyExecutorFailure(error);
+			state.lastExecutorReason = reason;
+			if (reason === "executor_orphaned_external_work") {
+				state.orphanedExecutorFailures += 1;
+				// Name it and stop. The session answered nothing wrong; an external
+				// daemon job outlived its child process and the next tick will stack
+				// another one. Rolling the session would hide that, not fix it.
+				console.error(
+					`monitor executor orphaned for ${sessionOriginKey} (monitor ${monitor.monitorId}): reason=${reason} orphaned_failures=${state.orphanedExecutorFailures} context_failures=${state.contextFailures} (unchanged) — external executor work was not reclaimed; the session is left untouched.`,
+				);
+			}
 			return;
 		}
 		if (failureClass === "protocol") {
@@ -753,6 +794,7 @@ export class MonitorPropagator {
 		// evidence is about a session that no longer exists.
 		state.contextFailures = 0;
 		state.executorFailures = 0;
+		state.orphanedExecutorFailures = 0;
 		state.protocolFailures = 0;
 		state.turns = 0;
 		console.error(
@@ -825,8 +867,12 @@ function failureCode(error: unknown, failureClass: AuthoringFailureClass): Dispa
 	// A malformed or off-contract body is a response-contract failure, not a
 	// mystery internal error.
 	if (failureClass === "protocol") return "authoring_response_invalid";
-	// Executor class from here down. The aside collection worker's timeout gets
-	// its own code so it can never be aggregated with context exhaustion.
+	// Executor class from here down, most specific first. An orphaned external
+	// run outranks the aside timeout: the same message usually looks like a
+	// timeout, but "external work is still running" is the actionable part. Both
+	// get their own code so neither can ever be aggregated with context
+	// exhaustion.
+	if (isOrphanedExecutorFailure(error)) return "orphaned_executor";
 	if (isAsideTimeoutFailure(error)) return "aside_timeout";
 	const message = error instanceof Error ? error.message : String(error);
 	if (message.includes("sendTurn")) return "authoring_turn_failed";
