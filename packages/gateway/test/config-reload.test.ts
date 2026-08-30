@@ -73,3 +73,37 @@ test("model accepts an explicit selector or a preset", () => {
 	);
 	expect(() => parseConfigFile({ schemaVersion: 1, model: ["one", "two"] })).toThrow("model must be an object");
 });
+
+test("handoffTargets parses validated origins and rejects unusable aliases", () => {
+	const origin = { platform: "discord", kind: "channel", conversationId: "chan-b" } as const;
+	expect(parseConfigFile({ schemaVersion: 1, handoffTargets: { "way-dev": origin } }).handoffTargets).toEqual({
+		"way-dev": origin,
+	});
+	expect(parseConfigFile({ schemaVersion: 1 }).handoffTargets).toBeUndefined();
+	// A half-built origin must never become a plausible key nothing is bound to.
+	expect(() => parseConfigFile({ schemaVersion: 1, handoffTargets: { "way-dev": { platform: "discord" } } })).toThrow(
+		"handoffTargets.way-dev",
+	);
+	// An alias the token grammar cannot express is a config error, not a dead entry:
+	// `[HANDOFF:<target>]` stops at the first "]" and the target is trimmed.
+	expect(() => parseConfigFile({ schemaVersion: 1, handoffTargets: { "way dev": origin } })).toThrow("way dev");
+	expect(() => parseConfigFile({ schemaVersion: 1, handoffTargets: { "way]dev": origin } })).toThrow("way]dev");
+});
+
+test("handoffTargets is applied live by a reload, so retargeting a room needs no restart", async () => {
+	const path = await home();
+	const before = { platform: "discord", kind: "channel", conversationId: "chan-b" } as const;
+	const after = { platform: "discord", kind: "channel", conversationId: "chan-c" } as const;
+	await Bun.write(
+		join(path, "config.json"),
+		JSON.stringify({ schemaVersion: 1, handoffTargets: { "way-dev": before } }),
+	);
+	const current = await loadConfig({ home: path });
+	await Bun.write(join(path, "config.json"), JSON.stringify({ schemaVersion: 1, handoffTargets: { "way-dev": after } }));
+	const result = await reloadConfig(current);
+	expect(result.ok).toBe(true);
+	if (result.ok) {
+		expect(result.changed).toContain("handoffTargets");
+		expect(result.config.handoffTargets).toEqual({ "way-dev": after });
+	}
+});

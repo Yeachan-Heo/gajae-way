@@ -409,8 +409,10 @@ export async function reloadConfig(current: GatewayConfig, overrides: ConfigOver
 /**
  * Fields genuinely re-read at runtime, each verified against a real consumer:
  * `mentionAllowlist` (server.ts chat dispatch + engagement/policy.ts),
- * `channels` (engagement/policy.ts + debounceFor), and `debounceMs`
- * (debounceFor). A change to one of these takes effect on the next turn.
+ * `channels` (engagement/policy.ts + debounceFor), `debounceMs`
+ * (debounceFor), and `handoffTargets` (server/handoff.ts target binding +
+ * the handoff guidance in the turn's conversation notice). A change to one
+ * of these takes effect on the next turn.
  */
 export const RELOADABLE_FIELDS = ["mentionAllowlist", "channels", "debounceMs", "dmPolicy", "handoffTargets"] as const;
 

@@ -47,6 +47,18 @@ The first attempted turn in every origin epoch also receives a trusted `Session 
 
 Bootstrap completion is durable in schema 14. An epoch is pending while `epoch > last_bootstrapped_epoch`; `/new`, automatic rebind, and turn-limit rotation therefore establish pending state in the same session-row update that bumps the epoch. The gateway commits the projection only after a terminal text or intentional-silence success. A failure before terminal success retries with the same stable bootstrap ID. If an intermediate reply was already delivered before failure, the unread body is consumed to prevent a harmful answer replay, while the still-pending bootstrap is safely re-presented under that same idempotent ID on the next turn. Session and ops projections expose only epoch, applied time, included section names, byte count, truncation, and diagnostics—never source bodies.
 
+## Session-to-session handoff
+
+Work surfaces in the wrong room. A reply whose FIRST LINE is `[HANDOFF:<target>]` is not a message but a handoff: the rest of the body is what the target conversation's session needs to know and do. The target resolves either to a `handoffTargets` alias (an operator-declared origin, the intended path) or to a conversation that already has a session, named by its canonical origin key or an unambiguous conversation ID. Nothing is ever constructed from a bare ID by guessing a platform and kind, because a plausible key nothing is bound to is exactly the silent drop this path must not have.
+
+The target origin receives ONE durable inbound event whose body is a bounded payload: the relaying session's words, a bounded pure digest of the source conversation (no LLM call, hard byte caps, and dropped entries are stated), and provenance — source origin, source message, requester, timestamp, and the relay chain. It is drained by that origin's own queue under the existing per-origin `KeyedQueue` serialization, so the target session answers in the target channel like any other turn.
+
+Authority does not travel. The payload states in words that nothing in it was said in the target room and that it grants no permission the target session does not already have, and the target's system notice repeats it, so a relayed request cannot read as an instruction that arrived locally.
+
+The chain in the provenance is what makes the loop check local: the hop appends its own origin key, refuses any target already in the chain, and refuses a hop past `HANDOFF_DEPTH_CAP` (2). That is also what makes the nested target turn deadlock-free — no hop can wait on a turn lock its own call stack holds. The idempotency key is derived from the causal facts alone (source origin, source message, target origin), so a replayed or reconciled handoff collides on the durable inbound insert and the target turn runs exactly once.
+
+The source room gets one pointer line naming where the work went, never the work or an excerpt of it; every refusal (unresolvable target, ambiguous target, cycle, depth, failed target turn, a second token in one turn) is delivered there as a loud `[handoff failed] <code>` notice. A dropped handoff is worse than no handoff, because the human believes the work moved.
+
 ## Delivery and crash semantics
 
 Before an outbound reply is emitted, the gateway creates a durable ledger item. States are `pending`, `inflight`, `confirmed`, `failed_ambiguous`, and `expired`. Adapters mark an item inflight before attempting platform delivery and confirm it after success. A non-ambiguous failure returns to `pending` with exponential backoff; after three attempts it expires. An ambiguous failure stays `failed_ambiguous`.

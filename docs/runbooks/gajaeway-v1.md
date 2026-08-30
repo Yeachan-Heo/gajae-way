@@ -35,6 +35,7 @@ The CLI does not start the daemon: `gajaeway daemon run` prints the launcher com
   "model": { "preset": "codex-medium" },
   "debounceMs": 1000,
   "mentionAllowlist": ["owner-author-id"],
+  "handoffTargets": { "gajae-way-dev": { "platform": "discord", "kind": "channel", "conversationId": "channel-id" } },
   "webhook": { "bind": "127.0.0.1", "port": 8080, "exposeNonLoopback": false },
   "watcherRoots": ["/absolute/path"],
   "scriptRoot": "/absolute/path"
@@ -44,6 +45,8 @@ The CLI does not start the daemon: `gajaeway daemon run` prints the launcher com
 Use schema version 1 only. Each credential is a file reference, never an inline secret or environment fallback; a credential file may be referenced by exactly one configured credential. Create secret files with restrictive ownership and mode, keep them outside version control, and rotate by replacing the file and restarting the service.
 
 `model` accepts either a gjc model selector string such as `"openai/gpt-5.2"` or a preset object such as `{ "preset": "codex-medium" }`. Presets are resolved by gjc from its merged built-in and `~/.gjc/agent/models.yml` profile catalog. A preset's `model_mapping.default` may be an ordered selector array; gajaeway invokes the preset with `--mpreset`, so gjc retains its native availability checks, retry budgets, sticky selection, and fallback-chain behavior instead of the gateway attempting unsafe whole-turn retries.
+
+`handoffTargets` binds the aliases a persona may hand work to: alias -> a full origin. Only declared aliases are offered to the persona in a turn, and an alias whose origin resolves to the current conversation is not offered at all. It is reloadable, so retargeting a room takes effect on the next turn. A `[HANDOFF:<target>]` naming anything else fails loudly in the source channel and wakes no other session.
 
 ## Adapters and engagement
 
