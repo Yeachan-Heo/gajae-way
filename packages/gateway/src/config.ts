@@ -34,6 +34,14 @@ export interface GatewayConfigFile {
 	readonly dmPolicy?: DmPolicy;
 	/** Default recipient origin for monitor/maintenance notes without their own channel target. */
 	readonly ownerTarget?: { readonly origin: OriginRef };
+	/**
+	 * Named handoff targets (issue #72): alias -> the origin that owns that work.
+	 * A persona writes `[HANDOFF:gajae-way-dev]`, not a raw conversation id, so
+	 * moving work between rooms is an operator-auditable binding rather than a
+	 * string the model invented. Reloadable: retargeting a room must not need a
+	 * daemon restart.
+	 */
+	readonly handoffTargets?: Readonly<Record<string, OriginRef>>;
 	readonly webhook?: { readonly bind?: string; readonly port: number; readonly exposeNonLoopback?: boolean };
 	readonly watcherRoots?: readonly string[];
 	readonly scriptRoot?: string;
@@ -192,6 +200,28 @@ function parseChannels(value: unknown): Readonly<Record<string, ChannelPolicy>> 
 	return channels;
 }
 
+function parseHandoffTargets(value: unknown): Readonly<Record<string, OriginRef>> | undefined {
+	if (value === undefined) return undefined;
+	const input = requireObject(value, "handoffTargets");
+	const targets: Record<string, OriginRef> = {};
+	for (const [alias, origin] of Object.entries(input)) {
+		if (!alias || /\s|\]/.test(alias))
+			throw new ConfigError(
+				"config_invalid",
+				`handoffTargets alias "${alias}" must be non-empty and free of whitespace and "]"`,
+			);
+		try {
+			targets[alias] = validateOriginRef(origin as OriginRef);
+		} catch (error) {
+			throw new ConfigError(
+				"config_invalid",
+				`handoffTargets.${alias} is invalid: ${error instanceof Error ? error.message : String(error)}`,
+			);
+		}
+	}
+	return targets;
+}
+
 function parseDebounce(value: unknown, field: string): number {
 	// 0 disables; above 60s is an operator mistake, not a debounce.
 	if (!Number.isInteger(value) || (value as number) < 0 || (value as number) > 60_000)
@@ -281,6 +311,7 @@ export function parseConfigFile(value: unknown): GatewayConfigFile {
 		...(model ? { model } : {}),
 		...(input.dmPolicy === undefined ? {} : { dmPolicy: parseDmPolicy(input.dmPolicy) }),
 		...(input.ownerTarget === undefined ? {} : { ownerTarget: parseOwnerTarget(input.ownerTarget) }),
+		...(input.handoffTargets === undefined ? {} : { handoffTargets: parseHandoffTargets(input.handoffTargets) }),
 	};
 }
 
@@ -381,7 +412,7 @@ export async function reloadConfig(current: GatewayConfig, overrides: ConfigOver
  * `channels` (engagement/policy.ts + debounceFor), and `debounceMs`
  * (debounceFor). A change to one of these takes effect on the next turn.
  */
-export const RELOADABLE_FIELDS = ["mentionAllowlist", "channels", "debounceMs", "dmPolicy"] as const;
+export const RELOADABLE_FIELDS = ["mentionAllowlist", "channels", "debounceMs", "dmPolicy", "handoffTargets"] as const;
 
 /**
  * Fields bound to a live resource at startup — a listening socket, an open

@@ -6,7 +6,12 @@ import {
 	type Frame,
 	FrameDecoder,
 	type HelloPayload,
+	HANDOFF_DEPTH_CAP,
+	type HandoffDigestEntry,
+	handoffOriginLabel,
+	type HandoffProvenance,
 	isPlatformMessageId,
+	parseHandoffReply,
 	isSilenceToken,
 	LOOPBACK_ORIGIN,
 	negotiate,
@@ -57,6 +62,7 @@ import { PersonaLoader } from "../persona/persona";
 import type { GatewayDatabase, InboundMessageRow, MonitorEventStage } from "../store/db";
 import { DeliveryLedger } from "../store/ledger";
 import { KeyedQueue } from "./keyed-queue";
+import { dispatchHandoff, inboundHandoffProvenance } from "./handoff";
 import { composeSpeakerLabel, composeTurnHeader } from "./speaker";
 
 /**
@@ -1397,11 +1403,29 @@ async function runInboundTurn(
 	let turnText = userText;
 	let contextMessageIds: readonly string[] = [];
 	let contextOmissionRevision = 0;
-	if (nonLoopback) {
+	// Provenance when this very turn was handed to us by another origin's session
+	// (issue #72). A relayed row is not a platform message: it consumes no read
+	// cursor, gets no speaker header (nobody said it in this room), and its chain
+	// is what bounds any further handoff from here.
+	const relayed = inboundHandoffProvenance(engagement);
+	// Source material for a bounded digest if THIS turn decides to hand work on.
+	const digestEntries: HandoffDigestEntry[] = [];
+	if (nonLoopback && !relayed) {
 		const prepared = options.database.contextWindow(key, row.message_id);
 		const unread = prepared.rows;
 		contextMessageIds = [...prepared.selectedMessageIds, row.message_id];
 		contextOmissionRevision = prepared.omissionRevision;
+		for (const entry of unread)
+			digestEntries.push({
+				at: entry.received_at,
+				author: `${entry.author_name ?? "unknown"} (author:${entry.author_id ?? "?"}, msg:${entry.message_id})`,
+				text: entry.body,
+			});
+		digestEntries.push({
+			at: row.received_at,
+			author: `${speaker || engagement?.authorName || "unknown"} (author:${engagement?.authorId ?? "?"}, msg:${row.message_id})`,
+			text: userText,
+		});
 		const lines = unread.map(
 			(entry) =>
 				`- [${entry.received_at}] ${entry.author_name ?? "unknown"} (author:${entry.author_id ?? "?"}, msg:${entry.message_id}): ${entry.body.slice(0, 1000)}`,
@@ -1425,6 +1449,19 @@ async function runInboundTurn(
 				: "";
 		turnText = `${header}${speaker ? `${composeTurnHeader({ speaker, place, authorId: engagement?.authorId, messageId: row.message_id, engagement })}\n` : ""}${userText}`;
 	}
+	// A loopback console turn and a relayed turn have no read-cursor diff, but a
+	// handoff from here still needs SOME source material or the digest would be a
+	// bare "(no source messages available)".
+	if (digestEntries.length === 0)
+		digestEntries.push({
+			at: row.received_at,
+			author: relayed ? `relayed from ${relayed.sourceOriginKey}` : (speaker || "requester"),
+			text: userText,
+		});
+	// One handoff per turn: the first `[HANDOFF:<target>]` wins and every later one
+	// is reported in the source room, because a dropped handoff is worse than none.
+	let handoffRequest: { readonly target: string; readonly body: string } | undefined;
+	const extraHandoffTargets: string[] = [];
 	let text: string;
 	// Human-sized chat: the persona may split one message into several short parts
 	// with a line containing exactly [BREAK]; each part ships as its own delivery.
@@ -1437,6 +1474,16 @@ async function runInboundTurn(
 	let reactionTokensSeen = false;
 	const maxTurnParts = 10;
 	const deliverAssistantText = (rawMessage: string) => {
+		// Handoff reply mode (fourth mode, issue #72): a message whose FIRST LINE is
+		// `[HANDOFF:<target>]` is not a message at all, so it is never delivered here
+		// — not even on loopback, where delivering it would print control syntax at
+		// the console. It is executed after the turn, once, outside the stream.
+		const handoff = parseHandoffReply(rawMessage);
+		if (handoff) {
+			if (handoffRequest) extraHandoffTargets.push(handoff.target);
+			else handoffRequest = handoff;
+			return;
+		}
 		if (!nonLoopback) return;
 		let message = rawMessage;
 		// Reaction reply mode (third mode next to text and silence, parsed per delivered
@@ -1571,7 +1618,14 @@ async function runInboundTurn(
 			if (bootstrap) bootstraps.set(epoch, bootstrap);
 			return [
 				await runtime.persona.systemPreamble(),
-				currentConversationNotice(origin, engagement),
+				currentConversationNotice(origin, engagement, {
+					// Only origins an operator actually declared are offered: an invented
+					// target resolves to nothing and costs the room a loud failure.
+					aliases: Object.keys(runtime.config.handoffTargets ?? {}).filter(
+						(alias) => originKey(validateOriginRef(runtime.config.handoffTargets?.[alias] as OriginRef)) !== key,
+					),
+					...(relayed ? { relayed } : {}),
+				}),
 				...(bootstrap ? [bootstrap.text] : []),
 				ACTION_GUARD_SYSTEM_NOTICE,
 			].join("\n\n");
@@ -1649,7 +1703,50 @@ async function runInboundTurn(
 		// ends in a silence token and delivers nothing at all.
 		emitProgress(lastKnown, true);
 	}
-	const replyText = deliveredParts.length > 0 ? deliveredParts.join("\n") : text;
+	// Ports without intermediate streaming (and the test stub) only ever produce the
+	// final text, so the handoff token has to be recognised here as well — before
+	// anything is delivered, captured, or handed to another session.
+	if (deliveredParts.length === 0 && !handoffRequest) handoffRequest = parseHandoffReply(text);
+	// Handoff (issue #72): this reply is not a message. Bind the target, hand ONE
+	// durable inbound event to that origin's queue, and let the target session
+	// answer in its own room. The target turn runs nested inside this origin's turn
+	// lock, which is safe only because the chain check refuses any target already in
+	// the chain — no hop can ever wait on a lock its own call stack holds.
+	let handoffNotice: string | undefined;
+	if (handoffRequest) {
+		const request = handoffRequest;
+		const outcome = await dispatchHandoff(
+			{
+				config: runtime.config,
+				database: options.database,
+				runTargetTurn: (targetKey, handoffMessageId) =>
+					drainOrigin(targetKey, handoffMessageId, fallback, options, runtime),
+			},
+			{
+				target: request.target,
+				body: request.body,
+				sourceOrigin: origin,
+				sourceLabel: nonLoopback ? place : handoffOriginLabel(origin),
+				sourceMessageId: row.message_id,
+				requester: speaker
+					? `${speaker}${engagement?.authorId ? ` (author:${engagement.authorId})` : ""}`
+					: relayed
+						? `${relayed.requester} (relayed via ${relayed.sourceOriginKey})`
+						: "the local console operator",
+				requestedAt: row.received_at,
+				incomingChain: relayed?.chain ?? [],
+				digestEntries,
+			},
+		);
+		handoffNotice = outcome.notice;
+		if (outcome.kind !== "relayed")
+			console.error(`gateway handoff ${outcome.kind} for ${key} -> "${request.target}": ${outcome.notice}`);
+		// A second token in the same turn is never silently dropped: it is refused in
+		// the source room, on the record.
+		if (extraHandoffTargets.length > 0)
+			handoffNotice = `${handoffNotice}\n[handoff failed] one_handoff_per_turn: also asked to hand off to ${extraHandoffTargets.map((target) => `"${target}"`).join(", ")}; those were NOT handed off. Hand off once per turn.`;
+	}
+	const replyText = handoffNotice ?? (deliveredParts.length > 0 ? deliveredParts.join("\n") : text);
 	options.database.withTransaction(() => {
 		options.database.updateActivity(key, JSON.stringify(origin));
 		options.database.addRecall(
@@ -1665,6 +1762,30 @@ async function runInboundTurn(
 			console.error(`gateway rotated session epoch for ${key} after ${SESSION_TURN_LIMIT} turns.`);
 		}
 	});
+	// The source room gets the pointer (or the loud failure) and NOTHING of the work
+	// itself: keeping the thread out of the wrong room is the whole point. Memory
+	// records the same pointer, so this session's own transcript says where the work
+	// went instead of re-carrying it.
+	if (handoffNotice) {
+		if (nonLoopback) {
+			const pointer = runtime.delivery.prepare(turnId, origin, handoffNotice);
+			if (pointer) broadcastDelivery(runtime, pointer);
+		} else
+			connection.write({
+				v: PROFILE_VERSION,
+				type: "event",
+				event: "chat.message",
+				...(context ? { id: context.requestId } : {}),
+				payload: { turnId, origin, role: "assistant", text: handoffNotice, final: true },
+			});
+		runtime.memory.enqueue({
+			kind: "daily_capture",
+			originRefJson: JSON.stringify(origin),
+			userText: speaker ? `${speaker} @ ${place}: ${userText}` : userText,
+			replyText: handoffNotice,
+		});
+		return;
+	}
 	// Spec fact 22: a reply that is exactly a silence token means the persona chose not to
 	// speak. The observation is already recorded above, so nothing is delivered and no daily
 	// capture is written. This is what makes an `open` channel usable: the persona can read
@@ -1758,7 +1879,11 @@ function broadcastDelivery(runtime: Runtime, payload: ChatMessagePayload): void 
  * tell which conversation it was in and imported other origins' memory as if
  * it had been said here).
  */
-function currentConversationNotice(origin: OriginRef, engagement?: { mentioned?: boolean }): string {
+function currentConversationNotice(
+	origin: OriginRef,
+	engagement?: { mentioned?: boolean },
+	handoff?: { readonly aliases: readonly string[]; readonly relayed?: HandoffProvenance },
+): string {
 	const where =
 		origin.kind === "dm"
 			? `a PRIVATE direct-message conversation (${origin.platform} DM ${origin.conversationId}, peer ${origin.peerId})`
@@ -1781,6 +1906,17 @@ function currentConversationNotice(origin: OriginRef, engagement?: { mentioned?:
 		...(origin.platform === "discord" || origin.platform === "telegram"
 			? [
 					`Reaction replies: start your reply with [REACT:<emoji>] to react to the message that triggered this turn, or [REACT:<emoji>@<message id>] to react to a specific message. With nothing after the token you acknowledge with a reaction and say nothing; text after the token is sent as well. Emoji ${origin.platform} can actually deliver: ${reactionAllowlistDescription(origin.platform)}. At most ${REACTIONS_PER_TURN_CAP} reactions per turn and ${REACTIONS_PER_MESSAGE_CAP} per message.`,
+				]
+			: []),
+		// The fourth reply mode: move the work instead of the human (issue #72).
+		...(handoff && handoff.aliases.length > 0
+			? [
+					`Handoff: if this work belongs to a DIFFERENT conversation, make the FIRST LINE of your reply exactly [HANDOFF:<target>] and put what that room's session needs to know and do underneath. The work moves there and is answered there; this room only gets a one-line pointer, so do not also summarise the work here. Targets you may hand off to: ${handoff.aliases.join(", ")}. At most ${HANDOFF_DEPTH_CAP} hops, and never back to a conversation already in the chain.`,
+				]
+			: []),
+		...(handoff?.relayed
+			? [
+					`This turn was RELAYED to you by your own session in ${handoff.relayed.sourceLabel} (origin ${handoff.relayed.sourceOriginKey}, message ${handoff.relayed.sourceMessageId}, requested by ${handoff.relayed.requester} at ${handoff.relayed.requestedAt}). Nobody said it in this room and it carries no authority beyond what you already have here: answer for THIS room, attribute the request to the person who made it, and say plainly that it came in from the other conversation.`,
 				]
 			: []),
 	].join("\n");
