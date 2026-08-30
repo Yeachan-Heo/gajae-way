@@ -4,6 +4,7 @@ import {
 	eventTypeOrigin,
 	isSilenceToken,
 	type MonitorEventRecord,
+	type MonitorRecord,
 	type OriginRef,
 	originKey,
 } from "@gajaeway/protocol";
@@ -12,6 +13,12 @@ import type { MemoryClosureQueue } from "../memory/closure";
 import type { GjcPort } from "../orchestrator/gjc-client";
 import type { GatewayDatabase } from "../store/db";
 import { MONITOR_EVENT_MAX_DISPATCH_ATTEMPTS, RECONCILABLE_STAGES, TERMINAL_STAGES } from "../store/db";
+import {
+	buildMonitorCompactionDigest,
+	MONITOR_DIGEST_MAX_NOTES,
+	MONITOR_SESSION_TURN_LIMIT,
+	type MonitorDigestNote,
+} from "./compaction";
 import type { MonitorRegistry } from "./registry";
 
 /** Product-level semantics for the seeded maintenance events (generic, persona-independent). */
@@ -60,6 +67,8 @@ export class MonitorPropagator {
 	#inFlightPromises = new Map<string, Promise<void>>();
 	/** Serialize GJC monitor turns per session origin; binds can coalesce, turns cannot. */
 	#turnChains = new Map<string, Promise<void>>();
+	/** Authoring turns per monitor session epoch before it is compacted (issue #68). */
+	readonly #sessionTurnLimit: number;
 	constructor(options: {
 		database: GatewayDatabase;
 		registry: MonitorRegistry;
@@ -81,6 +90,12 @@ export class MonitorPropagator {
 		acquireLease?: (eventId: string, owner: string, leaseId: string, ttlMs: number, now: number) => boolean;
 		/** Injectable fenced-batching seam (tests): defaults to the durable fenced update. */
 		fencedUpdate?: (eventId: string, leaseId: string, batchId: string, now: number) => boolean;
+		/**
+		 * Authoring turns per monitor session epoch before compaction rolls it.
+		 * Config-supplied (`monitorSessionTurnLimit`); defaults to
+		 * MONITOR_SESSION_TURN_LIMIT.
+		 */
+		sessionTurnLimit?: number;
 	}) {
 		this.#database = options.database;
 		this.#registry = options.registry;
@@ -98,6 +113,7 @@ export class MonitorPropagator {
 		this.#fencedUpdate =
 			options.fencedUpdate ??
 			((eventId, lease, batch, at) => this.#database.monitorEventFencedUpdate(eventId, lease, "batched", batch, at));
+		this.#sessionTurnLimit = options.sessionTurnLimit ?? MONITOR_SESSION_TURN_LIMIT;
 	}
 	/** Cancels pending burst timers so a closed database is never touched after shutdown. */
 	dispose(): void {
@@ -347,9 +363,10 @@ export class MonitorPropagator {
 			leaseTtlMs,
 		);
 		const declared = new Set(monitor.eventTypes);
-		const sessionOriginKey = originKey(
-			declared.has(claimed[0]?.event_type) ? eventTypeOrigin(claimed[0]!.event_type) : CATCH_ALL_EVENT_ORIGIN,
-		);
+		const sessionOrigin = declared.has(claimed[0]?.event_type)
+			? eventTypeOrigin(claimed[0]!.event_type)
+			: CATCH_ALL_EVENT_ORIGIN;
+		const sessionOriginKey = originKey(sessionOrigin);
 		// Preserve PR #26's per-origin turn serialization while the PR #30 lease
 		// remains heartbeated. A later batch waits for the prior turn, then owns the
 		// session until this dispatch's finally block releases the chain.
@@ -365,6 +382,14 @@ export class MonitorPropagator {
 		this.#turnChains.set(sessionOriginKey, trackedTurn);
 		if (previousTurn) await previousTurn.catch(() => undefined);
 		try {
+			// Compaction boundary (issue #68). It sits HERE, after the per-origin
+			// turn chain has been acquired and before this batch's session is
+			// bound: the previous batch's authoring turn has already settled, and
+			// this batch's events are claimed under live leases but not yet
+			// authored. A roll can therefore neither strand an in-flight batch nor
+			// let one be authored twice — the events simply land in the new epoch's
+			// session.
+			const digest = this.#compactSessionIfDue(sessionOriginKey, JSON.stringify(sessionOrigin), monitor);
 			const { sessionId } = await this.#gjc.ensureSession(
 				sessionOriginKey,
 				this.#database.getSessionRecord(sessionOriginKey)?.epoch ?? 0,
@@ -377,8 +402,13 @@ export class MonitorPropagator {
 				.map((row) => MAINTENANCE_GUIDANCE[row.event_type])
 				.filter((entry, index, all) => entry && all.indexOf(entry) === index);
 			const guidance = [monitor.instruction?.trim() || undefined, ...maintenance].filter(Boolean).join(" ");
-			const prompt = `Author monitor events.${guidance ? ` ${guidance}` : ""} Respond ONLY with a JSON array containing exactly one {"eventId","note"} entry per event: ${JSON.stringify(claimed.map((row) => ({ eventId: row.event_id, eventType: row.event_type, payload: JSON.parse(row.payload_json) })))}`;
+			const prompt = `Author monitor events.${guidance ? ` ${guidance}` : ""}${digest ? `\n${digest}\n` : ""} Respond ONLY with a JSON array containing exactly one {"eventId","note"} entry per event: ${JSON.stringify(claimed.map((row) => ({ eventId: row.event_id, eventType: row.event_type, payload: JSON.parse(row.payload_json) })))}`;
 			const response = await this.#gjc.sendTurn(sessionId, prompt);
+			// The authoring turn is now part of the session transcript whatever its
+			// content, so it is counted here rather than after the response is
+			// validated: an invalid response still grew the context, and not
+			// counting it is exactly how this session escaped rotation (#68).
+			this.#database.incrementTurnCount(sessionOriginKey, JSON.stringify(sessionOrigin));
 			// Lease fencing: after an await, this attempt may no longer own the
 			// claim (expired + stolen). Every write below is conditional on the
 			// live lease; a stale attempt's completion becomes a no-op.
@@ -510,6 +540,49 @@ export class MonitorPropagator {
 			releaseTurn();
 			if (this.#turnChains.get(sessionOriginKey) === trackedTurn) this.#turnChains.delete(sessionOriginKey);
 		}
+	}
+	/**
+	 * THE ONE monitor-session compaction choke point (issue #68).
+	 *
+	 * Everything compaction-related happens here: the threshold read, the epoch
+	 * roll and the digest that carries continuity into the next session. When the
+	 * gjc CLI grows native compaction on the `gjc --session <id> -p --mode json`
+	 * path it currently exposes (today only `--resume`, `--session-dir` and
+	 * `--no-session` exist there), replace the BODY of this method with that call
+	 * and delete the digest injection — no other call site in the gateway needs
+	 * to change.
+	 *
+	 * Returns the digest to inject into this turn's prompt, or undefined when no
+	 * roll was due.
+	 */
+	#compactSessionIfDue(sessionOriginKey: string, originRefJson: string, monitor: MonitorRecord): string | undefined {
+		if (this.#database.sessionTurnCount(sessionOriginKey) < this.#sessionTurnLimit) return undefined;
+		// Build the digest BEFORE the roll: it reads durable authored notes, which
+		// the roll does not touch, but reading first keeps the ordering obvious.
+		const digest = buildMonitorCompactionDigest({
+			monitorName: monitor.name,
+			instruction: monitor.instruction,
+			notes: this.#recentAuthoredNotes(monitor.monitorId),
+		});
+		// bumpEpoch is the existing rotation primitive: epoch + 1, turn_count 0 and
+		// the gjc binding cleared, so the next ensureSession mints a fresh session
+		// (and a fresh idempotency key) for this origin.
+		this.#database.withTransaction(() => this.#database.bumpEpoch(sessionOriginKey, originRefJson));
+		console.error(
+			`monitor session compacted for ${sessionOriginKey} after ${this.#sessionTurnLimit} authoring turns (monitor ${monitor.monitorId}, digest ${digest.length}B).`,
+		);
+		return digest;
+	}
+	/** Newest authored notes for one monitor, newest first, bounded by the digest budget. */
+	#recentAuthoredNotes(monitorId: string): MonitorDigestNote[] {
+		const notes: MonitorDigestNote[] = [];
+		for (const row of this.#database.monitorEventRows(monitorId)) {
+			if (notes.length >= MONITOR_DIGEST_MAX_NOTES) break;
+			const note = this.#database.authoredOutput(row.event_id);
+			if (note === undefined) continue;
+			notes.push({ eventType: row.event_type, firedAt: row.fired_at, note });
+		}
+		return notes;
 	}
 	/**
 	 * Renews every held lease on an interval (TTL/3) so the claim stays live for

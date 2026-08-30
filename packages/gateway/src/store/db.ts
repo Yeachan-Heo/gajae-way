@@ -273,9 +273,30 @@ export class GatewayDatabase {
 	 * Counts completed turns within the current epoch. The gjc session transcript
 	 * grows with every `--resume`, so per-turn prefill latency grows without bound;
 	 * the server auto-rotates the epoch once this count reaches its ceiling.
+	 *
+	 * The write is an upsert because monitor authoring origins (issue #68) reach
+	 * this path before any chat turn ever bound their session row: the old
+	 * UPDATE-only statement silently counted nothing for them, so a monitor
+	 * session sat at turn_count = 0 forever and grew without bound. When
+	 * `originRefJson` is given the row is created with it, so the seeded row is
+	 * projectable (admin/cycle) instead of an origin-less stub.
 	 */
-	incrementTurnCount(originKey: string): number {
-		this.#database.query("UPDATE sessions SET turn_count = turn_count + 1 WHERE origin_key = ?").run(originKey);
+	incrementTurnCount(originKey: string, originRefJson?: string): number {
+		const now = new Date().toISOString();
+		this.#database
+			.query(
+				"INSERT INTO sessions (origin_key, origin_ref_json, gjc_session_id, epoch, turn_count, created_at, last_activity_at) VALUES (?, ?, '', 0, 1, ?, ?) ON CONFLICT(origin_key) DO UPDATE SET turn_count = turn_count + 1",
+			)
+			.run(originKey, originRefJson ?? null, now, now);
+		return (
+			this.#database
+				.query<{ turn_count: number }, [string]>("SELECT turn_count FROM sessions WHERE origin_key = ?")
+				.get(originKey)?.turn_count ?? 0
+		);
+	}
+
+	/** Completed turns in the current epoch, without mutating the counter. */
+	sessionTurnCount(originKey: string): number {
 		return (
 			this.#database
 				.query<{ turn_count: number }, [string]>("SELECT turn_count FROM sessions WHERE origin_key = ?")

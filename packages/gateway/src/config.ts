@@ -34,6 +34,13 @@ export interface GatewayConfigFile {
 	readonly dmPolicy?: DmPolicy;
 	/** Default recipient origin for monitor/maintenance notes without their own channel target. */
 	readonly ownerTarget?: { readonly origin: OriginRef };
+	/**
+	 * Authoring turns per monitor session epoch before the gateway compacts it
+	 * (issue #68). Separate from the chat-path SESSION_TURN_LIMIT because monitor
+	 * turns are machine-paced: a 10-minute monitor authors ~144 turns a day.
+	 * Default MONITOR_SESSION_TURN_LIMIT.
+	 */
+	readonly monitorSessionTurnLimit?: number;
 	readonly webhook?: { readonly bind?: string; readonly port: number; readonly exposeNonLoopback?: boolean };
 	readonly watcherRoots?: readonly string[];
 	readonly scriptRoot?: string;
@@ -245,6 +252,17 @@ function parseTurnTimeout(value: unknown): number {
 	return value as number;
 }
 
+/**
+ * Bounded 2..500: below 2 there is no session to compact (every turn rolls),
+ * above 500 a 10-minute monitor would take over three days to reach the
+ * threshold, which is the unbounded growth this setting exists to stop.
+ */
+function parseMonitorSessionTurnLimit(value: unknown): number {
+	if (!Number.isInteger(value) || (value as number) < 2 || (value as number) > 500)
+		throw new ConfigError("config_invalid", "monitorSessionTurnLimit must be an integer between 2 and 500");
+	return value as number;
+}
+
 function parseDmPolicy(value: unknown): DmPolicy {
 	if (typeof value !== "string" || !DM_POLICIES.includes(value as DmPolicy))
 		throw new ConfigError("config_invalid", `dmPolicy must be one of ${DM_POLICIES.join(", ")}`);
@@ -281,6 +299,9 @@ export function parseConfigFile(value: unknown): GatewayConfigFile {
 		...(model ? { model } : {}),
 		...(input.dmPolicy === undefined ? {} : { dmPolicy: parseDmPolicy(input.dmPolicy) }),
 		...(input.ownerTarget === undefined ? {} : { ownerTarget: parseOwnerTarget(input.ownerTarget) }),
+		...(input.monitorSessionTurnLimit === undefined
+			? {}
+			: { monitorSessionTurnLimit: parseMonitorSessionTurnLimit(input.monitorSessionTurnLimit) }),
 	};
 }
 
@@ -386,7 +407,8 @@ export const RELOADABLE_FIELDS = ["mentionAllowlist", "channels", "debounceMs", 
 /**
  * Fields bound to a live resource at startup — a listening socket, an open
  * database, the constructed gjc client, a running webhook/watcher, the monitor
- * propagator's owner target — and therefore only changeable by a restart.
+ * propagator's owner target and its monitor session turn limit — and therefore
+ * only changeable by a restart.
  * `credentials` belongs here because the adapters read it when they start.
  */
 export const RESTART_REQUIRED_FIELDS = [
@@ -399,6 +421,7 @@ export const RESTART_REQUIRED_FIELDS = [
 	"watcherRoots",
 	"scriptRoot",
 	"ownerTarget",
+	"monitorSessionTurnLimit",
 ] as const;
 
 /**

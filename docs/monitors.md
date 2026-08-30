@@ -58,6 +58,16 @@ The durable propagation path is:
 
 The admission log occurs before propagation. Systematic state is held in the gateway database (`monitor_event` stages such as `admitted`, `batched`, `dispatched`, `authored`, and `failed`); the authored note is separately persisted and fed to the Markdown-memory closure queue. This dual logging preserves both operational history and human-readable memory.
 
+## Session compaction
+
+Monitor authoring shares one gjc session per event-type origin, and every turn is replayed by `gjc --resume`, so an uncompacted monitor session grows without bound: a 10-minute monitor authors about 144 turns a day, and the session eventually returns empty text while dispatch settles as `internal_error`.
+
+The gateway therefore counts every authoring turn against a monitor-only ceiling (default 24 turns, config field `monitorSessionTurnLimit`, restart-only). On reaching it the next dispatch rolls the session epoch — a fresh gjc session and idempotency key — and injects a compact digest into that session's first authoring prompt: the monitor's standing instruction plus its most recent authored notes, each clipped and the whole digest capped. Continuity is carried by the digest, not by the discarded transcript.
+
+The roll happens after the per-origin turn chain is taken and before the session is bound, so a batch can neither be stranded nor authored twice across the boundary; leases and fencing are untouched. All of it lives in one place (`packages/gateway/src/monitors/compaction.ts` plus the single `#compactSessionIfDue` call site) so it can be replaced by native gjc compaction when the CLI exposes it on the non-interactive `--session` path.
+
+The chat path keeps its own, separate ceiling of 50 turns; human-paced turns are self-limiting, monitor turns are not.
+
 ## Burst policies
 
 Burst handling is per monitor and event type. The default is `coalesce`.
