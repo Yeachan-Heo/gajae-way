@@ -57,6 +57,7 @@ import { PersonaLoader } from "../persona/persona";
 import type { GatewayDatabase, InboundMessageRow, MonitorEventStage } from "../store/db";
 import { DeliveryLedger } from "../store/ledger";
 import { OrderedFrameWriter } from "./frame-writer";
+import { InterimSpeechGate, type InterimSpeechLimits } from "./interim-speech";
 import { KeyedQueue } from "./keyed-queue";
 import { composeSpeakerLabel, composeTurnHeader } from "./speaker";
 
@@ -206,6 +207,11 @@ export interface GatewayServerOptions {
 	readonly overrides?: ConfigOverrides;
 	/** Test seam for chat.progress throttling; production uses the 15s defaults. */
 	readonly progress?: { readonly firstAfterMs?: number; readonly intervalMs?: number };
+	/**
+	 * Mid-work speech pacing (issue #71). Production uses the defaults in
+	 * interim-speech.ts (2 per turn, 45s apart); tests shrink them.
+	 */
+	readonly interimSpeech?: Partial<InterimSpeechLimits>;
 }
 interface InboundContext {
 	readonly turnId: string;
@@ -1476,15 +1482,23 @@ async function runInboundTurn(
 	// Human-sized chat: the persona may split one message into several short parts
 	// with a line containing exactly [BREAK]; each part ships as its own delivery.
 	// Long agentic turns also produce SEVERAL assistant messages (one per model
-	// step); each is delivered the moment it completes instead of after process
-	// exit, so a multi-minute turn talks while it works (live gajaeway-play
-	// finding: turns showed nothing but "working…" until the very end).
+	// step); a mid-work message is delivered the moment it completes instead of
+	// after process exit, so a multi-minute turn talks while it works (live
+	// gajaeway-play finding: turns showed nothing but "working…" until the very
+	// end). Issue #71: those mid-work messages pass an InterimSpeechGate first —
+	// the same live channel showed one turn arriving as 5 procedural fragments.
+	// The gate is a BACKSTOP; the base system prompt is the primary mechanism.
 	const deliveredParts: string[] = [];
 	let assistantDeliveryStarted = false;
 	let reactionTokensSeen = false;
 	const maxTurnParts = 10;
+	const interimSpeech = new InterimSpeechGate(options.interimSpeech);
+	// The raw message body last handed to delivery, so the final answer is not
+	// delivered twice when the runtime already streamed it as its last message.
+	let lastDeliveredRaw: string | undefined;
 	const deliverAssistantText = (rawMessage: string) => {
 		if (!nonLoopback) return;
+		lastDeliveredRaw = rawMessage;
 		let message = rawMessage;
 		// Reaction reply mode (third mode next to text and silence, parsed per delivered
 		// assistant message so streamed intermediates carry it too): a message may open
@@ -1634,6 +1648,15 @@ async function runInboundTurn(
 			systemPreambleForEpoch: preambleForEpoch,
 			onAssistantText: (message) => {
 				try {
+					// Mid-work speech only (issue #71). The runtime's LAST streamed message
+					// is also the final answer, and it is gated here like any other: when
+					// the gate suppresses it, the post-turn delivery below ships it, so an
+					// answer can be delayed by the gate but never lost.
+					const decision = interimSpeech.admit(message, Date.now());
+					if (!decision.deliver) {
+						console.error(`gateway mid-work speech suppressed (${turnId}, ${decision.reason}).`);
+						return;
+					}
 					deliverAssistantText(message);
 				} catch (error) {
 					// Delivery bookkeeping must never abort a running turn mid-stream.
@@ -1731,10 +1754,13 @@ async function runInboundTurn(
 	}
 	// Memory carries who spoke and where, so canonicalization keeps provenance.
 	const capturedUser = speaker ? `${speaker} @ ${place}: ${userText}` : userText;
-	// Ports without streaming (and the test stub) return only the final text; when
-	// nothing was delivered mid-turn, ship the final text through the same splitter
-	// (reaction tokens included).
-	if (deliveredParts.length === 0) deliverAssistantText(text);
+	// The final answer is never gated. Ports without streaming (and the test stub)
+	// return only the final text, and the mid-work gate (issue #71) may have
+	// suppressed the runtime's last streamed message; either way the final text
+	// ships here through the same splitter (reaction tokens included). It is
+	// skipped only when that exact body was already the last thing delivered,
+	// which is the streaming happy path.
+	if (lastDeliveredRaw !== text) deliverAssistantText(text);
 	if (deliveredParts.length === 0) {
 		// Reaction-only acknowledgement: nothing is spoken, but the turn happened and
 		// is captured with its token text so memory records what was acknowledged.
