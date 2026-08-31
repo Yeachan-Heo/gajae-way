@@ -564,10 +564,59 @@ export class MonitorPropagator {
 }
 
 /**
- * Secret-free structural summary of a thrown value: the error class name plus
- * the innermost stack frame function names. Deliberately excludes the message
- * body, file paths, URLs and line numbers — those are the parts that can carry
- * tokens, private paths or user data. Function identifiers cannot.
+ * Error classes the shape summary is allowed to name. Anything unrecognized —
+ * including a class or `error.name` an attacker or a third-party library
+ * controls — is reported as `Error`, never echoed.
+ */
+const KNOWN_ERROR_CLASSES: ReadonlySet<string> = new Set([
+	"Error",
+	"TypeError",
+	"RangeError",
+	"SyntaxError",
+	"ReferenceError",
+	"EvalError",
+	"URIError",
+	"AggregateError",
+	"DOMException",
+	"SQLiteError",
+	"GjcCliError",
+]);
+
+/**
+ * Stack frame identifiers the shape summary is allowed to name: the dispatch
+ * path this diagnostic exists to disambiguate. Anything else becomes
+ * `unknown_frame`, so a frame name is never echoed just because it happens to
+ * be identifier-shaped.
+ */
+const KNOWN_DISPATCH_FRAMES: ReadonlySet<string> = new Set([
+	"withTransaction",
+	"#dispatchBatch",
+	"#dispatch",
+	"#author",
+	"#startLeaseHeartbeat",
+	"submit",
+	"reconcile",
+	"monitorEventFencedFail",
+	"monitorEventFencedAuthorWithIntent",
+	"monitorDeliveryPrepareFenced",
+	"monitorEventRenewLease",
+	"monitorEventReleaseLease",
+	"ensureSession",
+	"sendTurn",
+	"markInflight",
+	"enqueueExistingId",
+	"processTicksAndRejections",
+]);
+
+/**
+ * Secret-free structural summary of a thrown value: the error class plus the
+ * innermost dispatch-path stack frames, both resolved through allowlists.
+ *
+ * Character filtering alone is NOT sufficient and was the flaw in the first
+ * version of this function: a credential like `ghp_SECRETVALUE` is entirely
+ * identifier-shaped, so it survives any `[A-Za-z0-9_]`-style filter. A value
+ * reaches the persisted detail only if it is a member of a fixed set defined in
+ * this file, which no error payload can extend.
  *
  * Exists because every dispatch failure previously collapsed to the fixed
  * string `dispatch phase failed (internal_error)`, which made two hosts with
@@ -577,25 +626,24 @@ export class MonitorPropagator {
  */
 function failureShape(error: unknown): string {
 	if (!(error instanceof Error)) return `${typeof error}:non-error`;
-	const name = sanitizeIdentifier(error.constructor?.name ?? error.name ?? "Error");
+	const raw = error.constructor?.name ?? error.name ?? "Error";
+	const name = KNOWN_ERROR_CLASSES.has(raw) ? raw : "Error";
 	const frames: string[] = [];
 	for (const line of (error.stack ?? "").split("\n")) {
 		// Bun/V8 frames look like `    at #dispatchBatch (/path/file:1881:37)`.
 		const match = /^\s*at\s+(?:async\s+)?([^\s(]+)/.exec(line);
 		if (!match) continue;
-		const fn = sanitizeIdentifier(match[1] ?? "");
-		// `<anonymous>` and bare paths carry no diagnostic value once the path is
-		// stripped, so they are not worth a frame slot.
-		if (!fn || fn === "anonymous") continue;
-		frames.push(fn);
+		const candidate = match[1] ?? "";
+		// `<anonymous>` and bare paths carry no diagnostic value, so they are not
+		// worth a frame slot at all.
+		if (!candidate || candidate.includes("<") || candidate.includes("/")) continue;
+		frames.push(KNOWN_DISPATCH_FRAMES.has(candidate) ? candidate : "unknown_frame");
 		if (frames.length === 3) break;
 	}
+	// All-unknown frames say nothing beyond "it threw somewhere else", and the
+	// class name alone is the more honest summary.
+	if (frames.every((frame) => frame === "unknown_frame")) return name;
 	return frames.length > 0 ? `${name}@${frames.join("<-")}` : name;
-}
-
-/** Keeps identifier-ish characters only, so no path, URL or secret can survive. */
-function sanitizeIdentifier(value: string): string {
-	return value.replace(/[^A-Za-z0-9_#$.]/g, "").slice(0, 48);
 }
 
 function failureCode(error: unknown): DispatchFailureCode {

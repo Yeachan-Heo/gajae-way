@@ -29,7 +29,7 @@ describe("dispatch failure classification", () => {
 		expect(classifyFailure(new Error("something nobody has classified yet")).code).toBe("internal_error");
 	});
 
-	test("shape carries the error class and stack function names", () => {
+	test("shape carries the error class and known dispatch frames", () => {
 		const error = new Error("Database has closed");
 		error.stack = [
 			"Error: Database has closed",
@@ -75,16 +75,22 @@ describe("dispatch failure classification", () => {
 	});
 
 	test("caps the frame count so the detail column cannot grow unbounded", () => {
+		const known = ["withTransaction", "#dispatchBatch", "#author", "submit", "reconcile", "ensureSession"];
 		const error = new Error("boom");
-		error.stack = ["Error: boom", ...Array.from({ length: 40 }, (_, i) => `    at frame${i} (/p:${i}:1)`)].join("\n");
-		const { shape } = classifyFailure(error);
-		expect(shape).toBe("Error@frame0<-frame1<-frame2");
+		error.stack = ["Error: boom", ...known.map((fn, i) => `    at ${fn} (/p:${i}:1)`)].join("\n");
+		expect(classifyFailure(error).shape).toBe("Error@withTransaction<-#dispatchBatch<-#author");
 	});
 
-	test("skips anonymous frames, which carry no diagnostic value once paths are stripped", () => {
+	test("an all-unknown stack degrades to the class name rather than a row of placeholders", () => {
 		const error = new Error("boom");
-		error.stack = ["Error: boom", "    at <anonymous> (/p:1:1)", "    at async realFrame (/p:2:2)"].join("\n");
-		expect(classifyFailure(error).shape).toBe("Error@realFrame");
+		error.stack = ["Error: boom", ...Array.from({ length: 40 }, (_, i) => `    at frame${i} (/p:${i}:1)`)].join("\n");
+		expect(classifyFailure(error).shape).toBe("Error");
+	});
+
+	test("skips anonymous frames and bare paths entirely", () => {
+		const error = new Error("boom");
+		error.stack = ["Error: boom", "    at <anonymous> (/p:1:1)", "    at async withTransaction (/p:2:2)"].join("\n");
+		expect(classifyFailure(error).shape).toBe("Error@withTransaction");
 	});
 
 	test("survives non-Error throws without inventing a stack", () => {
@@ -97,5 +103,45 @@ describe("dispatch failure classification", () => {
 		const error = new Error("boom");
 		error.stack = undefined;
 		expect(classifyFailure(error).shape).toBe("Error");
+	});
+
+	test("does not echo a hostile error.name (allowlist, not character filtering)", () => {
+		const error = new Error("boom");
+		Object.defineProperty(error, "name", { value: "ghp_SECRETVALUE" });
+		const { shape } = classifyFailure(error);
+		expect(shape).not.toContain("ghp_SECRETVALUE");
+		expect(shape).toBe("Error");
+	});
+
+	test("does not echo a hostile constructor name", () => {
+		class ghp_SECRETVALUE extends Error {}
+		const error = new ghp_SECRETVALUE("boom");
+		error.stack = "x\n    at withTransaction (/p:1:1)";
+		const { shape } = classifyFailure(error);
+		expect(shape).not.toContain("ghp_SECRETVALUE");
+		expect(shape).toBe("Error@withTransaction");
+	});
+
+	test("does not echo a hostile stack frame identifier", () => {
+		const error = new Error("boom");
+		error.stack = ["Error: boom", "    at ghp_SECRETVALUE (/p:1:1)", "    at withTransaction (/p:2:2)"].join("\n");
+		const { shape } = classifyFailure(error);
+		expect(shape).not.toContain("ghp_SECRETVALUE");
+		expect(shape).toBe("Error@unknown_frame<-withTransaction");
+	});
+
+	test("a credential-shaped frame is identifier-shaped, proving character filters are insufficient", () => {
+		// Regression guard for the first version of this code, which kept any
+		// [A-Za-z0-9_#$.] value and therefore leaked exactly this string.
+		expect(/^[A-Za-z0-9_#$.]+$/.test("ghp_SECRETVALUE")).toBe(true);
+		const error = new Error("boom");
+		error.stack = "Error: boom\n    at ghp_SECRETVALUE (/p:1:1)";
+		expect(classifyFailure(error).shape).toBe("Error");
+	});
+
+	test("keeps recognized non-generic error classes", () => {
+		const error = new RangeError("Cannot use a closed database");
+		error.stack = "RangeError: x\n    at withTransaction (/p:1:1)";
+		expect(classifyFailure(error).shape).toBe("RangeError@withTransaction");
 	});
 });
