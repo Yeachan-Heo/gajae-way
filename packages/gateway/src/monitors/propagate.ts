@@ -23,21 +23,28 @@ const MAINTENANCE_GUIDANCE: Record<string, string | undefined> = {
 };
 
 /**
- * Stable, public-safe dispatch failure codes. The raw error message is NEVER
- * persisted or logged — it can carry secrets (tokens, URLs, file paths); the
- * structured code plus the dispatch phase is what the operator gets.
+ * The phase a dispatch was in when it threw. The failure code is DERIVED from
+ * this phase, never from matching the error text: text matching collapsed every
+ * real cause into `internal_error` (observed live: 1780 consecutive
+ * `internal_error` rows over two days with zero recoverable cause, because the
+ * throw happened before any of the matched strings could appear).
  */
-type DispatchFailureCode =
-	| "session_bind_failed"
-	| "authoring_turn_failed"
-	| "authoring_response_invalid"
-	| "delivery_prepare_failed"
-	| "internal_error";
+type DispatchPhase =
+	| "session_bind"
+	| "authoring_turn"
+	| "authoring_response"
+	| "authoring_commit"
+	| "delivery_prepare";
 
-export interface MonitorDispatchFailure {
-	readonly eventId: string;
-	readonly code: DispatchFailureCode;
-}
+const PHASE_FAILURE_CODE = {
+	session_bind: "session_bind_failed",
+	authoring_turn: "authoring_turn_failed",
+	authoring_response: "authoring_response_invalid",
+	authoring_commit: "authoring_commit_failed",
+	delivery_prepare: "delivery_prepare_failed",
+} as const satisfies Record<DispatchPhase, string>;
+
+type DispatchFailureCode = (typeof PHASE_FAILURE_CODE)[DispatchPhase];
 
 export class MonitorPropagator {
 	readonly #database: GatewayDatabase;
@@ -364,11 +371,15 @@ export class MonitorPropagator {
 		);
 		this.#turnChains.set(sessionOriginKey, trackedTurn);
 		if (previousTurn) await previousTurn.catch(() => undefined);
+		// Advanced as the dispatch progresses, so a throw anywhere below is
+		// attributed to the phase that actually ran instead of guessed from text.
+		let phase: DispatchPhase = "session_bind";
 		try {
 			const { sessionId } = await this.#gjc.ensureSession(
 				sessionOriginKey,
 				this.#database.getSessionRecord(sessionOriginKey)?.epoch ?? 0,
 			);
+			phase = "authoring_turn";
 			// Guidance order: the monitor's own instruction first (it is what the
 			// owner actually asked this monitor to do), then any built-in
 			// maintenance semantics for the claimed event types. Without either,
@@ -379,6 +390,7 @@ export class MonitorPropagator {
 			const guidance = [monitor.instruction?.trim() || undefined, ...maintenance].filter(Boolean).join(" ");
 			const prompt = `Author monitor events.${guidance ? ` ${guidance}` : ""} Respond ONLY with a JSON array containing exactly one {"eventId","note"} entry per event: ${JSON.stringify(claimed.map((row) => ({ eventId: row.event_id, eventType: row.event_type, payload: JSON.parse(row.payload_json) })))}`;
 			const response = await this.#gjc.sendTurn(sessionId, prompt);
+			phase = "authoring_response";
 			// Lease fencing: after an await, this attempt may no longer own the
 			// claim (expired + stolen). Every write below is conditional on the
 			// live lease; a stale attempt's completion becomes a no-op.
@@ -412,6 +424,7 @@ export class MonitorPropagator {
 			for (const id of claimedIds) {
 				if (!seenIds.has(id)) throw new Error(`authoring response omits event ${id}`);
 			}
+			phase = "authoring_commit";
 			for (const entry of authored)
 				if (
 					typeof entry.eventId === "string" &&
@@ -442,6 +455,7 @@ export class MonitorPropagator {
 						stage: "authored",
 					});
 				}
+			phase = "delivery_prepare";
 			// A monitor without its own channel target reports to the configured owner
 			// target when one exists: a personal agent's maintenance and event notes go
 			// to the owner by default rather than vanishing into the logs. With no
@@ -494,11 +508,13 @@ export class MonitorPropagator {
 				this.#deliver?.(payload);
 			}
 		} catch (error) {
-			// Public-safe structured evidence only: a stable phase code and event ids.
-			// The raw error body can carry secrets and is never persisted or logged.
-			const code: DispatchFailureCode = failureCode(error);
+			// Two surfaces, two audiences: the durable row keeps the phase code plus a
+			// redacted cause (local SQLite, for the operator debugging the failure),
+			// while stderr and every channel-facing projection keep the code alone.
+			const code: DispatchFailureCode = PHASE_FAILURE_CODE[phase];
+			const diagnostic = dispatchDiagnostic(phase, error);
 			for (const row of leased) {
-				this.#database.monitorEventFencedFail(row.event_id, leaseId, batchId, code, `dispatch phase failed (${code})`);
+				this.#database.monitorEventFencedFail(row.event_id, leaseId, batchId, code, diagnostic);
 			}
 			console.error(`monitor dispatch failed (${code}): events ${claimed.map((row) => row.event_id).join(",")}`);
 		} finally {
@@ -558,10 +574,30 @@ export class MonitorPropagator {
 	}
 }
 
-function failureCode(error: unknown): DispatchFailureCode {
-	const message = error instanceof Error ? error.message : String(error);
-	if (message.includes("authoring response is not an array")) return "authoring_response_invalid";
-	if (message.includes("sendTurn")) return "authoring_turn_failed";
-	if (message.includes("ensureSession")) return "session_bind_failed";
-	return "internal_error";
+/**
+ * Local-only diagnostic line for `monitor_failures.detail`: the phase, the error
+ * class, and the redacted first line of its message. This row lives in the
+ * gateway's own SQLite file (same trust boundary as the message bodies it
+ * already stores) and is NEVER what goes to a channel or to stdout/stderr —
+ * those get the phase code alone. Without a cause here an operator has nothing
+ * but a code, which is exactly how the 1780-failure incident stayed unexplained.
+ */
+function dispatchDiagnostic(phase: DispatchPhase, error: unknown): string {
+	const name = error instanceof Error ? error.name : typeof error;
+	const raw = error instanceof Error ? error.message : String(error);
+	return `phase=${phase} error=${name}: ${redactSecrets(raw)}`.slice(0, 400);
+}
+
+/** Credential-shaped substrings never reach the durable row, even locally. */
+const SECRET_PATTERNS: readonly RegExp[] = [
+	/(?:bearer|token|authorization|api[_-]?key|secret|password|passwd)["'\s]*[:=]["'\s]*\S+/gi,
+	/\b(?:sk|pk|ghp|gho|ghs|github_pat|xox[abps])[-_][A-Za-z0-9_-]{8,}/g,
+	/\b[A-Za-z0-9_-]{12,}\.[A-Za-z0-9_-]{12,}\.[A-Za-z0-9_-]{12,}\b/g,
+	/\/\/[^/\s:@]+:[^/\s@]+@/g,
+];
+
+function redactSecrets(text: string): string {
+	let redacted = text.replace(/\s+/g, " ").trim();
+	for (const pattern of SECRET_PATTERNS) redacted = redacted.replace(pattern, "<redacted>");
+	return redacted.slice(0, 300);
 }

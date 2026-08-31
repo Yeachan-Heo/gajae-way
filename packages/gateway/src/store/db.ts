@@ -1422,7 +1422,11 @@ SELECT 1 FROM dispatch_leases l WHERE l.event_id = monitor_events.event_id AND l
 			.query<{ output_text: string }, [string]>("SELECT output_text FROM authored_outputs WHERE event_id = ?")
 			.get(eventId)?.output_text;
 	}
-	/** Latest public-safe failure evidence for one event, if any. */
+	/**
+	 * Latest failure evidence for one event, if any. `code` is the public-safe
+	 * phase code; `detail` is a local-only redacted diagnostic and must not be
+	 * projected into a channel message.
+	 */
 	monitorFailure(eventId: string): MonitorFailureRow | undefined {
 		return (
 			this.#database
@@ -1433,8 +1437,10 @@ SELECT 1 FROM dispatch_leases l WHERE l.event_id = monitor_events.event_id AND l
 		);
 	}
 	/**
-	 * Persists bounded, public-safe dispatch evidence: a stable machine code plus
-	 * a one-line detail that must never contain secrets or raw error bodies.
+	 * Persists bounded dispatch evidence: a stable machine code plus a one-line
+	 * detail. The detail stays inside this database (operator debugging) and
+	 * carries a redacted cause — callers redact credential-shaped text before
+	 * writing; only the code is safe to log or deliver.
 	 * Keeps the newest 20 rows per event and deletes stale rows so the table
 	 * cannot grow without bound across retries.
 	 */

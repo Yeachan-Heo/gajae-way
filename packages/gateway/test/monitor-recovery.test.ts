@@ -25,13 +25,20 @@ afterEach(async () => {
 	home = "";
 });
 
-function fakeGjc(sendTurn: GjcPort["sendTurn"]): GjcPort {
-	return { ensureSession: async () => ({ sessionId: "s1" }), forgetRebinds: () => {}, sendTurn };
+function fakeGjc(sendTurn: GjcPort["sendTurn"], ensureSession?: GjcPort["ensureSession"]): GjcPort {
+	return {
+		ensureSession: ensureSession ?? (async () => ({ sessionId: "s1" })),
+		forgetRebinds: () => {},
+		sendTurn,
+	};
 }
 
 async function harness(
 	sendTurn: GjcPort["sendTurn"],
-	options: { ownerTarget?: { origin: { platform: "loopback"; kind: "loopback"; conversationId: "loopback" } } } = {},
+	options: {
+		ownerTarget?: { origin: { platform: "loopback"; kind: "loopback"; conversationId: "loopback" } };
+		ensureSession?: GjcPort["ensureSession"];
+	} = {},
 ) {
 	home = await mkdtemp(join(tmpdir(), "gajaeway-monitor-"));
 	database = await GatewayDatabase.open(join(home, "gateway.db"));
@@ -46,7 +53,7 @@ async function harness(
 	const propagator = new MonitorPropagator({
 		database,
 		registry,
-		gjc: fakeGjc(sendTurn),
+		gjc: fakeGjc(sendTurn, options.ensureSession),
 		memory: { enqueue: () => crypto.randomUUID(), enqueueExistingId: () => {} } as never,
 		delivery: new DeliveryService(new DeliveryLedger(database)),
 		emit: () => {},
@@ -204,10 +211,70 @@ describe("monitor crash-boundary state machine", () => {
 		expect(turns).toBe(attemptsAfter);
 		const failure = db.monitorFailure(eventId);
 		expect(failure).toBeDefined();
-		// Public-safe: no raw error body persisted.
-		expect(failure?.detail).toBeDefined();
-		expect(failure?.detail).not.toContain("turn exploded");
-		expect(failure?.code.length ?? 0).toBeGreaterThan(0);
+		// Durable evidence names the phase that actually ran and carries the cause,
+		// so an operator is never left with a bare code (the 1780-failure incident).
+		expect(failure?.code).toBe("authoring_turn_failed");
+		expect(failure?.detail).toContain("phase=authoring_turn");
+		expect(failure?.detail).toContain("turn exploded");
+	});
+
+	test("a session-bind throw is attributed to session_bind, not a catch-all code", async () => {
+		const {
+			propagator,
+			monitor,
+			database: db,
+		} = await harness(
+			async () => {
+				throw new Error("sendTurn should never run");
+			},
+			{
+				ensureSession: async () => {
+					throw new Error("spawn ENOENT: gjc binary missing");
+				},
+			},
+		);
+		const eventId = seedEvent(db, monitor.monitorId, "failed");
+		await propagator.reconcile();
+		const failure = db.monitorFailure(eventId);
+		expect(failure?.code).toBe("session_bind_failed");
+		expect(failure?.detail).toContain("phase=session_bind");
+		expect(failure?.detail).toContain("spawn ENOENT");
+	});
+
+	test("a non-JSON authoring response is attributed to the response phase", async () => {
+		const {
+			propagator,
+			monitor,
+			database: db,
+		} = await harness(async () => "I could not do it, sorry.");
+		const eventId = seedEvent(db, monitor.monitorId, "failed");
+		await propagator.reconcile();
+		const failure = db.monitorFailure(eventId);
+		expect(failure?.code).toBe("authoring_response_invalid");
+		expect(failure?.detail).toContain("phase=authoring_response");
+	});
+
+	test("credential-shaped text in the cause is redacted before it is persisted", async () => {
+		const {
+			propagator,
+			monitor,
+			database: db,
+		} = await harness(async () => {
+			throw new Error(
+				'gjc rejected the turn: Authorization: Bearer ghp_abcdefghijklmnop1234 body={"token":"xoxb-9999-aaaaaaaaaaaa"} at https://user:hunter2@gateway.internal/turn',
+			);
+		});
+		const eventId = seedEvent(db, monitor.monitorId, "failed");
+		await propagator.reconcile();
+		const failure = db.monitorFailure(eventId);
+		expect(failure?.code).toBe("authoring_turn_failed");
+		const detail = failure?.detail ?? "";
+		expect(detail).toContain("gjc rejected the turn");
+		expect(detail).toContain("<redacted>");
+		expect(detail).not.toContain("ghp_abcdefghijklmnop1234");
+		expect(detail).not.toContain("xoxb-9999-aaaaaaaaaaaa");
+		expect(detail).not.toContain("hunter2");
+		expect(detail.length).toBeLessThanOrEqual(400);
 	});
 
 	test("concurrent reconcile sweeps collapse into one", async () => {
