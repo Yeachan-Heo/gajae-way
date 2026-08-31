@@ -335,4 +335,80 @@ describe("session bootstrap builder", () => {
 		expect(next.text).toContain("version two");
 		expect(next.text).not.toContain("version one");
 	});
+
+	// Issue #70: daily files measured 45KB-255KB against a 24KiB per-source cut
+	// that rejected them by stat.size before reading, so every rotated epoch
+	// started with zero recent memory while ~6277B of the 8KiB budget went
+	// unused, and `truncated` still reported 0.
+	test("an oversized daily file is excerpted from the tail instead of dropped whole", async () => {
+		const config = await setup();
+		await mkdir(join(home, "memory", "daily", "2026-08"), { recursive: true });
+		const filler = Array.from(
+			{ length: 400 },
+			(_, i) =>
+				`## entry-${String(i).padStart(4, "0")}\n- origin: discord/channel/c1\n- user: OLD BODY ${i} ${"x".repeat(80)}`,
+		).join("\n\n");
+		const newest = "## entry-9999\n- origin: discord/channel/c1\n- user: NEWEST BODY MARKER";
+		const body = `${filler}\n\n${newest}`;
+		expect(Buffer.byteLength(body, "utf8")).toBeGreaterThan(24 * 1024);
+		await writeFile(join(home, "memory", "daily", "2026-08", "2026-08-28.md"), body);
+
+		const result = await build(config);
+
+		// The newest entry is what a session actually needs, and it is present.
+		expect(result.text).toContain("NEWEST BODY MARKER");
+		// The oldest entries are gone, which is the point of a tail excerpt.
+		expect(result.text).not.toContain("OLD BODY 0 ");
+		// Previously this file contributed nothing at all.
+		expect(result.diagnostics.some((line) => line.includes("source_too_large"))).toBe(false);
+	});
+
+	test("an excerpted source sets truncated and is reported in diagnostics", async () => {
+		const config = await setup();
+		await mkdir(join(home, "memory", "daily", "2026-08"), { recursive: true });
+		const body = Array.from(
+			{ length: 400 },
+			(_, i) =>
+				`## entry-${String(i).padStart(4, "0")}\n- origin: discord/channel/c1\n- user: body ${i} ${"y".repeat(80)}`,
+		).join("\n\n");
+		await writeFile(join(home, "memory", "daily", "2026-08", "2026-08-28.md"), body);
+
+		const result = await build(config);
+
+		// The second half of #70: a bootstrap that dropped or excerpted content
+		// used to report truncated=0 and read as complete.
+		expect(result.truncated).toBe(true);
+		expect(result.diagnostics.some((line) => line.startsWith("excerpted ") && line.includes("tail only"))).toBe(true);
+	});
+
+	test("an excerpt is labelled inline so it cannot be mistaken for the whole record", async () => {
+		const config = await setup();
+		await mkdir(join(home, "memory", "daily", "2026-08"), { recursive: true });
+		const body = Array.from(
+			{ length: 400 },
+			(_, i) =>
+				`## entry-${String(i).padStart(4, "0")}\n- origin: discord/channel/c1\n- user: body ${i} ${"z".repeat(80)}`,
+		).join("\n\n");
+		await writeFile(join(home, "memory", "daily", "2026-08", "2026-08-28.md"), body);
+
+		const result = await build(config);
+
+		expect(result.text).toContain("excerpt: tail only,");
+		expect(result.text).toContain("older entries omitted");
+	});
+
+	test("a source within the cap is unchanged and reports no excerpt", async () => {
+		const config = await setup();
+		await mkdir(join(home, "memory", "daily", "2026-08"), { recursive: true });
+		await writeFile(
+			join(home, "memory", "daily", "2026-08", "2026-08-28.md"),
+			"## now\n- origin: discord/channel/c1\n- user: small body",
+		);
+
+		const result = await build(config);
+
+		expect(result.text).toContain("small body");
+		expect(result.text).not.toContain("excerpt: tail only,");
+		expect(result.diagnostics.some((line) => line.startsWith("excerpted "))).toBe(false);
+	});
 });
