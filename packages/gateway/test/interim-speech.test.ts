@@ -292,3 +292,65 @@ test("the working indicator still announces and clears around a gated turn", asy
 	expect(progressFrames.length).toBeGreaterThan(0);
 	expect(progressFrames.at(-1).payload.final).toBe(true);
 });
+
+// ---------------------------------------------------------------------------
+// Regression: plain declarative (반말) narration and the pre-tool structural gate.
+// The first round of this feature only recognized polite Korean intent endings,
+// so every line jip-gajae actually leaked in #playground-ko (2026-08-31) passed
+// the gate. These cases are the measured strings, verbatim.
+// ---------------------------------------------------------------------------
+
+test("plain declarative narration is procedural too", () => {
+	expect(isProceduralNarration("이미지부터 보고 끼어들 자리인지 판단한다")).toBe(true);
+	expect(isProceduralNarration("로그부터 확인한다")).toBe(true);
+	expect(isProceduralNarration("채널 히스토리를 먼저 본다")).toBe(true);
+});
+
+test("a past-tense report survives the plain declarative rule", () => {
+	// "확인했다" is a finding about work already done, not an announcement of work.
+	expect(isProceduralNarration("어댑터 기동 시각을 확인했다, 08-29 그대로다")).toBe(false);
+	expect(isProceduralNarration("로그를 봤는데 500이 3분마다 찍힌다")).toBe(false);
+});
+
+test("a message streamed before the turn ran any tool is suppressed as pre-tool", () => {
+	const gate = new InterimSpeechGate({ minGapMs: 0 });
+	// Verbatim leak: mixed narration that no content regex classifies as procedural.
+	const decision = gate.admit("형님 멘션이다. 기동부터 찍고 한 방만 친다.", 1_000, { toolCallsSoFar: 0 });
+	expect(decision.deliver).toBe(false);
+	expect(decision.deliver === false && decision.reason).toBe("pre-tool");
+	expect(gate.deliveredCount).toBe(0);
+});
+
+test("the same message after a tool ran is delivered", () => {
+	const gate = new InterimSpeechGate({ minGapMs: 0 });
+	const decision = gate.admit("kickstart가 안 걸렸다. 지금 바로 넣는다.", 1_000, { toolCallsSoFar: 3 });
+	expect(decision.deliver).toBe(true);
+	expect(gate.deliveredCount).toBe(1);
+});
+
+test("pre-tool suppression does not spend the turn budget", () => {
+	const gate = new InterimSpeechGate({ minGapMs: 0, maxPerTurn: 1 });
+	gate.admit("먼저 상황을 본다", 1_000, { toolCallsSoFar: 0 });
+	gate.admit("채널부터 읽는다", 2_000, { toolCallsSoFar: 0 });
+	const real = gate.admit("빌드가 stale main으로 붙어서 픽스 없는 바이너리가 나왔다", 3_000, { toolCallsSoFar: 5 });
+	expect(real.deliver).toBe(true);
+});
+
+test("a pre-tool narration turn delivers only its final answer", async () => {
+	const gjc: GjcPort = {
+		ensureSession: async () => ({ sessionId: "s-pretool" }),
+		sendTurn: async (_session, _text, _preamble, _progress, options?: TurnOptions) => {
+			// Exactly the observed shape: thinking out loud before touching a tool.
+			options?.onAssistantText?.("형님 질문이다. 생각 누수부터 원인 잡고 바로 답한다.", 0);
+			options?.onAssistantText?.("맞다. 도구 돌기 전에 혼잣말이 채팅으로 나갔다.", 0);
+			options?.onAssistantText?.("원인은 게이트가 도구 전 혼잣말을 밀어내는 거다", 12);
+			return "원인은 게이트가 도구 전 혼잣말을 밀어내는 거다";
+		},
+		forgetRebinds: () => {},
+	};
+	const client = await startGateway(gjc, { minGapMs: 0 });
+	sendChannelMessage(client, "p1", "생각 새는거 원인이 뭐야?");
+	const all = await waitForMessages(client, 1);
+	expect(all.length).toBe(1);
+	expect(all[0].payload.text).toContain("도구 전 혼잣말");
+});
