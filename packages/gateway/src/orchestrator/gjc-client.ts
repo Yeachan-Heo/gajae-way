@@ -42,6 +42,15 @@ export interface TurnOptions {
 	/** Keep gjc's own coding-assistant system prompt instead of the generic-agent override. */
 	readonly codingRegister?: boolean;
 	/**
+	 * Environment overrides for the spawned gjc process.
+	 *
+	 * Used by `session.attach` to pin the native state root, so the session is
+	 * created in exactly the store the interactive child will later resume from.
+	 * Without it the daemon's own environment decides, and a child that resolved a
+	 * different root dies with `Session "<id>" not found`.
+	 */
+	readonly env?: Readonly<Record<string, string>>;
+	/**
 	 * Called once per completed assistant message while the turn is still
 	 * running, so callers can deliver intermediate replies of a long agentic
 	 * turn instead of staying silent until the process exits.
@@ -72,6 +81,297 @@ export interface GjcPort {
 export function gjcModelArgs(model: GjcModelSelection | undefined): readonly string[] {
 	if (!model) return [];
 	return typeof model === "string" ? ["--model", model] : ["--mpreset", model.preset];
+}
+
+/**
+ * Upper bound on the assembled `--append-system-prompt` payload.
+ *
+ * argv has an OS length ceiling (`E2BIG`). Failing closed here keeps the lease
+ * from being handed out alongside an argv that `spawn` cannot exec.
+ * `SESSION_BOOTSTRAP_MAX_BYTES` already bounds only the bootstrap portion.
+ */
+export const ATTACH_PREAMBLE_MAX_BYTES = 32_768;
+
+/** Wrapper-owned: consumed by the CLI, never present on child argv. */
+const WRAPPER_OWNED_FLAGS = new Set(["--socket", "--new"]);
+/** Forwarded, presence-only (consumes no following token). */
+const FORWARDED_PRESENCE_FLAGS = new Set(["--thinking"]);
+/**
+ * Forwarded, value-taking (flag AND value reach the child).
+ *
+ * `--worktree`/`-w` are deliberately ABSENT because they are WRAPPER-OWNED, not
+ * refused and not forwarded. Native gjc chdirs into a worktree it names itself
+ * (observed suffix `hazard-branch-f6ddf077`) BEFORE resolving the session, so a
+ * forwarded flag makes the gateway-bound session read as a different project and
+ * the TUI offers to fork it. The gateway instead prepares the worktree with plain
+ * `git worktree add`, binds the session in that directory, and spawns the child
+ * there with no worktree flag — measured to resume cleanly with no fork prompt.
+ */
+const FORWARDED_VALUE_FLAGS = new Set(["--model", "--mpreset"]);
+
+/** Wrapper-owned and value-taking: consumed here, acted on by the gateway. */
+const WRAPPER_OWNED_VALUE_FLAGS = new Set(["--worktree", "-w"]);
+/**
+ * Refused, value-taking. The value is CONSUMED as part of the refusal so it
+ * cannot leak through as a positional (e.g. `--resume ID` must not put `ID` on
+ * child argv).
+ */
+const REFUSED_VALUE_FLAGS = new Set([
+	"--resume",
+	"-r",
+	"--session-dir",
+	"--append-system-prompt",
+	"--mode",
+	"--system-prompt",
+]);
+/** Refused, presence-only. */
+const REFUSED_PRESENCE_FLAGS = new Set(["-p", "--print", "--continue", "-c", "--fork", "--no-session"]);
+
+function looksLikeFlag(token: string): boolean {
+	return token.startsWith("-") && token !== "-" && token !== "--";
+}
+
+/**
+ * The ONE definition of a blank value: absent, empty, or whitespace-only.
+ *
+ * Both value forms must agree on this. They previously diverged — the separate
+ * token was trimmed while the inline `--model=   ` form was only compared to
+ * `""` — which let a whitespace-only selector through.
+ */
+function isBlankValue(value: string | undefined): boolean {
+	return value === undefined || value.trim() === "";
+}
+
+/**
+ * True when `token` can serve as a flag's value in the SEPARATE-token form.
+ *
+ * Rejects a blank token plus the `--` separator and any other flag, none of
+ * which are values: `--model ""` or `--model --` would otherwise hand gjc a
+ * selector it cannot resolve.
+ */
+function isUsableValue(token: string | undefined): token is string {
+	if (token === undefined) return false;
+	if (token === "--" || looksLikeFlag(token)) return false;
+	return !isBlankValue(token);
+}
+
+export interface GjcWrapperFlagClassification {
+	/** Tokens (flag and value) that go to the child. */
+	readonly forwarded: string[];
+	/** Refused tokens, named back to the operator. Non-empty means fail-closed. */
+	readonly refused: string[];
+	/** Wrapper-owned tokens seen and dropped. */
+	readonly wrapperOwned: string[];
+	/** True when the operator supplied a model selector, which suppresses `config.model`. */
+	readonly operatorModel: boolean;
+	/** Reasons for refusals that are unsupported capabilities rather than policy. */
+	readonly unsupported: string[];
+	/**
+	 * Worktree the operator asked for, when `--worktree`/`-w` was given.
+	 *
+	 * `undefined` means no worktree flag. A present-but-empty branch (bare
+	 * `--worktree`) means "a managed worktree, name it for me", which the gateway
+	 * resolves to a default branch name.
+	 */
+	readonly worktreeBranch?: string;
+}
+
+/**
+ * THE closed allowlist for operator flags on `gajaeway gjc`.
+ *
+ * Fail-closed: anything not explicitly forwarded is refused, including unknown
+ * flags. Session-selection and system-prompt flags are refused because the
+ * binder owns `--resume`, `--session-dir`, and `--append-system-prompt`; letting
+ * an operator set them would unbind the managed session or overwrite the persona.
+ */
+export function classifyGjcWrapperFlags(args: readonly string[]): GjcWrapperFlagClassification {
+	const forwarded: string[] = [];
+	const refused: string[] = [];
+	const unsupported: string[] = [];
+	const wrapperOwned: string[] = [];
+	let operatorModel = false;
+	let worktreeBranch: string | undefined;
+
+	for (let i = 0; i < args.length; i++) {
+		const token = args[i];
+		if (token === undefined) continue;
+		// `--` ends flag classification; the binder uses no positionals.
+		if (token === "--") break;
+
+		const eq = token.indexOf("=");
+		const name = eq > 0 ? token.slice(0, eq) : token;
+		const hasInlineValue = eq > 0;
+		// `--model=` and `--model=   ` both carry a syntactically present but blank
+		// value; they fail closed exactly like a missing one.
+		const inlineValue = hasInlineValue ? token.slice(eq + 1) : undefined;
+		const hasUsableInlineValue = hasInlineValue && !isBlankValue(inlineValue);
+
+		if (WRAPPER_OWNED_FLAGS.has(name)) {
+			wrapperOwned.push(token);
+			continue;
+		}
+		if (WRAPPER_OWNED_VALUE_FLAGS.has(name)) {
+			// Consumed here and acted on by the gateway; never forwarded.
+			wrapperOwned.push(token);
+			if (hasUsableInlineValue) {
+				worktreeBranch = inlineValue;
+			} else if (!hasInlineValue && isUsableValue(args[i + 1])) {
+				worktreeBranch = args[i + 1];
+				i += 1;
+			} else {
+				// Bare `--worktree`: a managed worktree with a gateway-chosen name.
+				worktreeBranch = "";
+			}
+			continue;
+		}
+		if (REFUSED_VALUE_FLAGS.has(name)) {
+			refused.push(name);
+			// Consume the following token so a refused flag's value cannot survive as
+			// a positional. An empty token is consumed too (it is this flag's value,
+			// not payload), but `--` and another flag are left alone.
+			if (!hasInlineValue) {
+				const next = args[i + 1];
+				if (next !== undefined && next !== "--" && !looksLikeFlag(next)) i += 1;
+			}
+			continue;
+		}
+		if (REFUSED_PRESENCE_FLAGS.has(name)) {
+			refused.push(name);
+			continue;
+		}
+		if (FORWARDED_PRESENCE_FLAGS.has(name)) {
+			forwarded.push(token);
+			continue;
+		}
+		if (FORWARDED_VALUE_FLAGS.has(name)) {
+			const isModelSelector = name === "--model" || name === "--mpreset";
+			// A repeated model selector would put two model flags on one argv, which
+			// is exactly what operator precedence exists to prevent.
+			if (isModelSelector && operatorModel) {
+				refused.push(name);
+				if (!hasInlineValue && isUsableValue(args[i + 1])) i += 1;
+				continue;
+			}
+			if (hasInlineValue) {
+				if (!hasUsableInlineValue) {
+					// `--model=` / `--mpreset=` / `--worktree=` with nothing after the `=`.
+					refused.push(name);
+					continue;
+				}
+				if (isModelSelector) operatorModel = true;
+				forwarded.push(token);
+				continue;
+			}
+			const next = args[i + 1];
+			// `--worktree` takes an OPTIONAL value; the model selectors do not. An
+			// unusable value (missing, `--`, another flag, or empty) must never be
+			// forwarded as a model selector, or gjc resolves a blank model.
+			if (!isUsableValue(next)) {
+				if (isModelSelector) {
+					refused.push(name);
+					continue;
+				}
+				forwarded.push(token);
+				continue;
+			}
+			if (isModelSelector) operatorModel = true;
+			forwarded.push(token);
+			forwarded.push(next);
+			i += 1;
+			continue;
+		}
+		// Unknown flag: fail closed rather than widening the vendor surface.
+		if (looksLikeFlag(name)) {
+			refused.push(name);
+		}
+		// A bare positional is not a flag; the binder ignores it.
+	}
+
+	return { forwarded, refused, wrapperOwned, operatorModel, unsupported, worktreeBranch };
+}
+
+/**
+ * Every environment variable that can decide WHERE native gjc keeps session
+ * state, including the legacy `PI_*` aliases and the XDG data root.
+ *
+ * `session.create` runs in the daemon's environment; the TUI runs in the
+ * operator's. If any of these disagree the child resolves a different store and
+ * dies with `Session "<id>" not found` — reproduced with a daemon and CLI given
+ * different `GJC_CODING_AGENT_DIR` values.
+ *
+ * The list must stay COMPLETE rather than convenient: a selector that is missing
+ * here is a selector the operator's shell can silently win.
+ */
+const NATIVE_STATE_ENV_KEYS = [
+	"GJC_CODING_AGENT_DIR",
+	"PI_CODING_AGENT_DIR",
+	"GJC_CONFIG_DIR",
+	"PI_CONFIG_DIR",
+	"XDG_DATA_HOME",
+	"HOME",
+] as const;
+
+/**
+ * The daemon's native-state decision, expressed TOTALLY.
+ *
+ * `set` are the values the daemon has; `unset` are the selectors it does not.
+ * Returning only `set` would be a patch, not a decision: a selector the
+ * operator exports but the daemon does not would survive and strand the child.
+ */
+export function nativeStateEnv(source: Record<string, string | undefined> = process.env): {
+	set: Record<string, string>;
+	unset: string[];
+} {
+	const set: Record<string, string> = {};
+	const unset: string[] = [];
+	for (const key of NATIVE_STATE_ENV_KEYS) {
+		const value = source[key];
+		if (typeof value === "string" && value !== "") set[key] = value;
+		else unset.push(key);
+	}
+	return { set, unset };
+}
+
+/**
+ * Assemble the child argv for an attached terminal session.
+ *
+ * The binder injects `--resume <bound sessionId>` and the persona
+ * `--append-system-prompt`. It never emits `--system-prompt`, `-p`, `--print`,
+ * or `--mode`: the native coding register is preserved by OMISSION of the
+ * generic-agent prompt, and the child must stay interactive.
+ *
+ * It deliberately does NOT inject `--session-dir`, even though the gateway owns
+ * an epoch-scoped directory. `session.create` is issued through
+ * `gjc sdk session raw`, which REJECTS `--session-dir`, so the bound session
+ * always lives in gjc's default managed scope; telling the TUI to look in the
+ * epoch directory instead made it exit with `Session "<id>" not found`. That was
+ * found by the live drill, which is precisely what the drill exists to catch.
+ * Resume stays stable because the spawn cwd is always the persona workspace, so
+ * the create and the resume resolve the same scope. `--session-dir` remains
+ * REFUSED for operators: redirecting the store would unbind the managed session.
+ */
+export function assembleGjcAttachArgv(input: {
+	readonly sessionId: string;
+	readonly personaPreamble: string;
+	readonly forwarded: readonly string[];
+	readonly configModel: GjcModelSelection | undefined;
+}): string[] {
+	const operatorModel = input.forwarded.some((token) => {
+		const name = token.includes("=") ? token.slice(0, token.indexOf("=")) : token;
+		return name === "--model" || name === "--mpreset";
+	});
+	// Operator precedence: an operator model selector suppresses config.model so
+	// a single argv never carries two model flags.
+	const modelArgs = operatorModel ? [] : gjcModelArgs(input.configModel);
+	return [
+		"gjc",
+		"--resume",
+		input.sessionId,
+		"--append-system-prompt",
+		input.personaPreamble,
+		...modelArgs,
+		...input.forwarded,
+	];
 }
 
 /**
@@ -164,8 +464,16 @@ export class GjcTurnStream {
 }
 
 /**
- * The only module permitted to spawn or otherwise touch the gjc runtime
- * (plan ARCH-007: sole vendor adapter behind a gateway-owned port).
+ * ARCH-007 (reworded for the `gajaeway gjc` terminal entrypath): this module is
+ * the sole assembler of gjc argv and the sole binder of managed sessions. The
+ * spawn site is no longer unique — `gajaeway gjc` spawns an interactive TTY
+ * child in the operator's terminal, because a child spawned inside the daemon
+ * would inherit daemon stdio and could never be an interactive TUI. That CLI
+ * spawn is an OPAQUE CONSUMER of the preassembled `SessionAttachResult.argv`:
+ * flag classification lives only in `classifyGjcWrapperFlags`, argv assembly
+ * only in `assembleGjcAttachArgv`, and the CLI must not classify, extend, or
+ * reorder what it receives. Under `GAJAEWAY_TEST_STUB_GJC=1` the only argv
+ * mutation the CLI may make is rewriting `argv[0]` to the test stub child.
  *
  * P0 strategy per the spike verdict (artifacts/p0-gjc-spike-report.md):
  * - Session identity: atomic idempotent create-or-resume via
@@ -230,6 +538,24 @@ export class GjcClient implements GjcPort {
 	}
 
 	/**
+	 * Deterministic test-seam session id, row-first.
+	 *
+	 * Row-first is load-bearing, not cosmetic. The old recipe was a pure function
+	 * of origin+epoch, so a test could "prove" sequential resume by recomputing
+	 * the formula and comparing it to itself — while the persist seam was in fact
+	 * missing. Returning the PERSISTED id when the row already holds one at this
+	 * epoch means a second attach can only match if `putSession` really ran; and
+	 * the freshly minted id is deliberately NOT the formula, so nothing can be
+	 * recomputed. A per-call random id would be wrong in the other direction: the
+	 * second attach would mint a new id and overwrite the row.
+	 */
+	#stubSession(originKey: string, epoch: number): { sessionId: string } {
+		const row = this.#database.getSessionRecord(originKey);
+		if (row && row.sessionId !== "" && row.epoch === epoch) return { sessionId: row.sessionId };
+		return { sessionId: `stub-session-${crypto.randomUUID()}` };
+	}
+
+	/**
 	 * Binds an origin to a gjc session, rebinding once when the runtime condemns
 	 * the derived idempotency key (#13). A rebindable code means the key is dead
 	 * forever, so retrying it is guaranteed silence; the epoch is bumped through
@@ -237,7 +563,7 @@ export class GjcClient implements GjcPort {
 	 * retried exactly once per attempt.
 	 */
 	async ensureSession(originKey: string, epoch = 0, options?: TurnOptions): Promise<{ sessionId: string }> {
-		if (process.env.GAJAEWAY_TEST_STUB_GJC === "1") return { sessionId: `stub-${originKey}#${epoch}` };
+		if (process.env.GAJAEWAY_TEST_STUB_GJC === "1") return this.#stubSession(originKey, epoch);
 		const cached = this.#cachedSession(originKey, epoch);
 		if (cached) return { sessionId: cached };
 		// One bind in flight per origin+epoch: without this, two concurrent callers
@@ -342,7 +668,9 @@ export class GjcClient implements GjcPort {
 			stdin: new Response(JSON.stringify({ cwd: options?.cwd ?? this.#cwd })).body ?? "ignore",
 			stdout: "pipe",
 			stderr: "pipe",
-			env: process.env as Record<string, string>,
+			// Caller overrides last: the attach path pins the native state root here
+			// so create and the later interactive resume share one store.
+			env: { ...(process.env as Record<string, string>), ...(options?.env ?? {}) },
 		});
 		const [stdout, stderr, exitCode] = await this.#bounded(child, "session.create");
 		if (exitCode !== 0) {

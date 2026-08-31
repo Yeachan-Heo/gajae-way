@@ -270,4 +270,37 @@ describe("runtime cycle projection", () => {
 		expect(result.sessions).toHaveLength(1);
 		expect(result.sessions[0].originKey).toBe(boundSession.origin_key);
 	});
+
+	test("a bound terminal-origin row projects identifiers only (AC-16)", () => {
+		const terminalSession = {
+			...boundSession,
+			origin_key: "loopback/loopback/terminal",
+			origin_ref_json: JSON.stringify({ platform: "loopback", kind: "loopback", conversationId: "terminal" }),
+			gjc_session_id: "stub-session-9d3f",
+		};
+		const result = projectRuntimeCycle(sources({ sessionRows: [terminalSession] }), generatedAt);
+		const row = result.sessions[0];
+
+		expect(row?.originKey).toBe("loopback/loopback/terminal");
+		expect(row?.sessionId).toBe("stub-session-9d3f");
+		expect(row?.origin?.conversationId).toBe("terminal");
+		expect(result.gates).toEqual([]);
+		// Identifier-only: no lease holder, child pid, PTY state, or delivery health
+		// may leak onto the view for this origin.
+		for (const forbidden of ["lease", "holder", "childPid", "pty", "deliveryHealth"]) {
+			expect(Object.keys(row ?? {})).not.toContain(forbidden);
+		}
+	});
+
+	test("a terminal row mid-rebind is reported as stale identity, never healthy (AC-16)", () => {
+		const rebinding = {
+			...boundSession,
+			origin_key: "loopback/loopback/terminal",
+			origin_ref_json: JSON.stringify({ platform: "loopback", kind: "loopback", conversationId: "terminal" }),
+			gjc_session_id: "",
+		};
+		const result = projectRuntimeCycle(sources({ sessionRows: [rebinding] }), generatedAt);
+		expect(result.gates).toContain("stale_session_identity");
+		expect(result.sessions[0]?.sessionId).toBe("");
+	});
 });

@@ -1,0 +1,18 @@
+# Verification log for the gajaeway gjc entrypath change set.
+# Generated 2026-08-31T09:17:11Z
+# Exit codes below are captured from the commands, not asserted.
+
+$ bunx tsc --noEmit -p tsconfig.json
+(no diagnostics)
+exit=0
+
+$ bun test packages
+ 1309 pass
+ 2 skip
+ 0 fail
+Ran 1311 tests across 96 files. [67.06s]
+
+$ bunx biome check <files in git diff>
+packages/gateway/src/server/server.ts:1085:63 lint/style/noNonNullAssertion ━━━━━━━━━━━━━━━━━━━━━━━━
+Checked 17 files in 21ms. No fixes applied.
+Found 1 warning.

@@ -1,0 +1,33 @@
+# Final scope probe: control, daemon/CLI env split, and --worktree.
+# Generated 2026-08-31T07:48:56Z
+
+############ control ############
+daemon agent dir: <inherit>
+cli    agent dir: <inherit>
+extra args: <none>
+--- first ---
+gjc --resume e9735b9d-b085-4603-aed4-f63ec321b646
+--- second ---
+gjc --resume e9735b9d-b085-4603-aed4-f63ec321b646
+gateway row:
+e9735b9d-b085-4603-aed4-f63ec321b646 @e0
+############ envsplit ############
+daemon agent dir: /tmp/gjc-scope-agentA
+cli    agent dir: /tmp/gjc-scope-agentB
+extra args: <none>
+--- first ---
+gjc --resume 994f60b6-213c-4d5d-a66d-5a1f0b8b2e72
+--- second ---
+gjc --resume 994f60b6-213c-4d5d-a66d-5a1f0b8b2e72
+gateway row:
+994f60b6-213c-4d5d-a66d-5a1f0b8b2e72 @e0
+############ worktree ############
+daemon agent dir: <inherit>
+cli    agent dir: <inherit>
+extra args: --worktree probe-branch
+--- first ---
+gjc --resume baaa782d-d826-47ce-885e-258c2cb97f71
+--- second ---
+gjc --resume baaa782d-d826-47ce-885e-258c2cb97f71
+gateway row:
+baaa782d-d826-47ce-885e-258c2cb97f71 @e0

@@ -1,0 +1,202 @@
+# Archived evidence for refusing --worktree. Captured directly against native gjc.
+
+gjc version: gjc/0.15.5
+
+############ A. session.create rejects --session-dir ############
+$ gjc sdk session raw global --op session.create --idempotency-key hazard-A --session-dir /tmp/gjc-worktree-hazard/store --json-input-stdin
+Unknown option '--session-dir'. To specify a positional argument starting with a '-', place it at the end of the command after '--', as in '-- "--session-dir"
+
+gjc sdk serve --stdio | --socket <path> [--session <id>]; gjc sdk session list|inspect|send|status|tail; gjc sdk guides refresh|list|show|status|trust
+
+-> The gateway therefore cannot pin the native store for the session it binds.
+
+############ B. bind a session the way the gateway does, then resume WITH --worktree ############
+$ gjc sdk session raw global --op session.create --idempotency-key hazard-B --json-input-stdin   (cwd = persona workspace)
+{"ok":true,"operation":"session.create","result":{"sessionId":"8c003dae-4d03-43d8-93f1-a3387492e852","cwd":"/tmp/gjc-worktree-hazard/workspace","endpointGeneration":1}}
+bound session id: 8c003dae-4d03-43d8-93f1-a3387492e852
+
+$ gjc --resume 8c003dae-4d03-43d8-93f1-a3387492e852 --worktree hazard-branch   (under a PTY, in the persona workspace)
+--- observed output ---
+t project: /private/tmp/gjc-worktree-hazard/workspace. Fork into current directory? [y/N] 
+[Uncaught Exception] AbortError: Aborted with Ctrl+D
+    at unknown
+    at new AbortError (internal:repl/node-errors:45:25)
+    at [_ttyWrite] (internal:readline/interface:654:65)
+    at onkeypress (internal:readline/interface:79:24)
+    at emit (node:events:103:22)
+    at emitKeys (internal:readline/utils:328:18)
+    at onData (internal:readline/emitKeypressEvents:18:44)
+    at emit (node:events:100:22)
+    at addChunk (internal:streams/readable:267:47)
+    at readableAddChunkPushByteMode (internal:streams/readable:245:18)
+[Uncaught Exception] crash recorded at /Users/bellman/.gjc/agent/gjc-crash.log
+
+--- worktree directory native gjc created (note the generated suffix) ---
+hazard-branch-f6ddf077
+
+-> CONFIRMED: resuming the managed session under --worktree offers to FORK it.
+
+############ C. control: same resume WITHOUT --worktree ############
+AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAHJkr/ByZK/wAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\8[?2026l[23;2t[?2026h7_Ga=d,d=I,i=1406435763,q=2\8[?2026l[2B
+[0 q[?25h[?2004l[?1000l[?1002l[?1006l[?1007l[?2031l
+Resume this session with:
+gjc --resume 8c003dae-4d03-43d8-93f1-a3387492e852
+[?2004l[?1000l[?1002l[?1006l[?1007l[?2031l[<u[>4;0m[?25h
+-> No fork prompt without --worktree: the hazard is specific to the flag.
+
+############ D. the third path: keep --worktree in child argv, spawned FROM the prepared worktree ############
+# Raised by the terminal critic: if the gateway already prepared the worktree and bound the
+# session there, does native gjc no-op when the flag is retained? Measured, not assumed.
+$ cd <workspace>/.worktrees/feature-x
+$ gjc sdk session raw global --op session.create --idempotency-key p3-1 --json-input-stdin   (cwd = the prepared worktree)
+{"ok":true,"operation":"session.create","result":{"sessionId":"8a9d390e-73b3-4ec6-aa92-1da4a66760b1","cwd":"/tmp/p3/ws/.worktrees/feature-x","endpointGeneration":1}}
+
+$ gjc --resume 8a9d390e-73b3-4ec6-aa92-1da4a66760b1 --worktree feature-x   (under a PTY, cwd = the prepared worktree)
+GJC warming workspace
+>
+[Uncaught Exception] Error: branch_in_use:feature-x
+    at mjr (/$bunfs/root/gjc:19539:586)
+    at Heo (/$bunfs/root/gjc:19539:3904)
+    at run (/$bunfs/root/gjc:27105:201)
+    at nar (/$bunfs/root/gjc:437:130)
+
+-> CLOSED. Native gjc does not no-op; it refuses because the branch is already checked out
+   in the worktree the gateway prepared. Retaining the flag in child argv crashes the TUI.
+
+############ Summary: every route to AC-8's literal observable ############
+  A/B  forward the flag from the persona workspace  -> different-project FORK prompt (section B)
+  C    same session without the flag                -> clean resume (control, section C)
+  D    forward the flag from the prepared worktree  -> branch_in_use crash (this section)
+  E    pre-bind in the worktree gjc itself will choose -> requires predicting gjc's generated
+       suffix (observed hazard-branch-f6ddf077), i.e. reimplementing vendor behavior, which is
+       the ARCH-007 escalation trigger rather than an available option.
+  Note: pinning the native STORE is possible (via the epoch-scoped state root, which is how
+  AC-11 is satisfied), but it does not help here: the fork decision is driven by the project
+  cwd gjc resolves into, not by where sessions are stored.
+
+############ F. the fourth path: let gjc own the worktree AND create the session, then adopt its id ############
+# Idea: if the gateway never pre-creates the worktree and never pre-creates the session, it can
+# forward `--worktree <branch>` literally, let gjc create both inside its own worktree, then read
+# the session id back out of the state root the gateway pinned and persist it. Measured.
+$ cd <workspace>
+$ gjc --worktree feature-y          (under a PTY, stdin held open, GJC_CODING_AGENT_DIR = fresh epoch root)
+
+  gjc DID create its own worktree:  .worktrees/feature-y-9abb5600
+  but the TUI then blocked on first-run onboarding:
+
+    ❯ Analyze supported local evidence
+        GJC checks Codex, Claude, OpenCode, OMP, and OMO directory metadata...
+      Which GJC workflow do you want help with?
+      I'm experienced with GJC
+      Later
+    ↑/↓ select · Enter choose · Esc cancel
+
+  sessions created in the pinned root: none
+
+-> CLOSED. An epoch-scoped state root is by definition fresh, so a child launched into it without
+   `--resume` lands in gjc's first-run onboarding wizard and never creates a session for the
+   gateway to adopt. Reusing a warm shared root instead would abandon the epoch scoping that
+   satisfies AC-11. Note this is NOT a defect in the shipped path: there the session is created by
+   `session.create` (which does not onboard) and the child always launches with `--resume`, which
+   is why the live drill starts cleanly in a fresh epoch root.
+
+############ G. onboarding-seeded literal launch — ATTEMPTED, NOT MEASURED ############
+# Raised by the terminal critic, correctly: section F stopped while gjc was WAITING for
+# interactive onboarding, which proves only that no session existed before the wizard was
+# answered. So: answer/seed onboarding in a fresh epoch root, then retry the literal
+# no---resume launch and adopt whatever session id appears.
+#
+# I could not complete this measurement, and I am recording that rather than claiming a result.
+# Two attempts, both blocked on the same interactive prerequisite:
+#
+#  G.1  Piped arrow-key and Enter sequences into the PTY via `script`. The wizard did not
+#       advance; the captured frame still shows "Which GJC workflow do you want help with?"
+#       after the drive script had finished sending input.
+#  G.2  Bypassed the wizard for session creation by binding through `session.create` with
+#       cwd = the worktree gjc itself had created (`.worktrees/feature-z-8edfebbe`), then
+#       resumed with `--resume <id> --worktree feature-z` retained. That launch ALSO landed in
+#       the onboarding wizard, so it produced no verdict on the worktree question: no fork
+#       prompt, no branch_in_use, no clean resume - just the wizard.
+#
+# What that state root DID accumulate: agent.db, config.yml, model-presets, models.db, sdk/,
+# sessions/ (empty), terminal-sessions/, resident-cache/, sidecar-cache/.
+#
+# STATUS: route G is NOT shown to be impossible. It is unmeasured. What is known about it:
+#   - it requires seeding gjc's onboarding/config state into every fresh epoch root, which is
+#     vendor-internal knowledge of the kind ARCH-007 exists to keep out of this codebase;
+#   - it requires a two-phase attach: spawn WITHOUT `--resume`, then discover and adopt the
+#     session gjc creates. That inverts the invariant that `GjcClient` is the sole BINDER and
+#     that `session.attach` returns an already-bound session, which is a locked architectural
+#     decision, not an implementation detail.
+#
+# So the honest blocker is not "impossible" but "the only remaining route requires changing a
+# locked invariant plus depending on vendor onboarding internals" - a decision for the user.
+#
+# IMPORTANT, and separately verified: the SHIPPED path does not hit this wizard. The child is
+# always launched with `--resume <bound id>` after `session.create` has initialised the root,
+# and the live drill starts cleanly in fresh epoch roots - three invocations, all exit 0, with
+# transcripts written to e0/agent/sessions and e1/agent/sessions
+# (artifacts/gjc-entrypath-drill-log.txt).
+
+############ H. ask gjc for the worktree path instead of replicating it — CLOSED ############
+# Route E was rejected because replicating gjc's generated worktree suffix would be vendor
+# reimplementation. But replication is not the only way to learn the path: the gateway could
+# ASK gjc, bind the session in the directory gjc names, and then forward `--worktree` literally.
+# That would satisfy AC-8 as written without inverting the binder invariant, and without the
+# `branch_in_use` collision of route D, because gjc would own the worktree it finds.
+#
+# Checked the surface: gjc 0.15.5 exposes no worktree query. `gjc worktree` and `gjc worktrees`
+# both just print the version banner (not subcommands), `--help` lists no worktree command, and
+# the only worktree surface is the launch-time `-w, --worktree[=<value>]` flag itself.
+#
+# -> CLOSED. There is no way to resolve a managed worktree path without launching gjc, so the
+#    gateway cannot bind there before spawning.
+
+############ Status of AC-8's literal observable ############
+#   measured and closed: A, B, D, F, H          (with C as the control)
+#   rejected on architecture: E                 (replicating vendor naming = ARCH-007 trigger)
+#   UNMEASURED: G                               (needs onboarding seeding + a two-phase attach
+#                                                that inverts the sole-binder invariant)
+# The escalation rests on G requiring a locked architectural decision, not on impossibility.
+
+############ I. gjc-created worktree + gateway-bound session + literal flag — PROMISING, INCOMPLETE ############
+# This variant avoids BOTH objections that closed E and G:
+#   - no vendor naming replication: gjc creates the worktree, the gateway reads the path off disk;
+#   - no binder inversion: the gateway still binds the session itself via `session.create`.
+#
+# 1) Let gjc create its own worktree with a NON-interactive run:
+$ gjc -p --worktree feature-w --no-tools "say ok"        (GJC_CODING_AGENT_DIR = fresh root)
+  Agent run failed.                                      <- the run failed, but...
+  worktree created: .worktrees/feature-w-b323a413         <- ...the worktree was created anyway
+  -> the gateway can learn the path from the filesystem, without replicating the suffix.
+#
+# 2) Gateway binds the session IN that gjc-owned worktree:
+$ gjc sdk session raw global --op session.create --idempotency-key p6-1 --json-input-stdin
+  {"ok":true,...,"sessionId":"891710df-8e37-4fba-848f-f45119f51d0e",
+   "cwd":"/tmp/p6/ws/.worktrees/feature-w-b323a413"}
+  transcript written to <root>/sessions/v2-.../..._891710df-....jsonl
+#
+# 3) Resume with the flag RETAINED, i.e. AC-8's literal observable:
+$ gjc --resume 891710df-8e37-4fba-848f-f45119f51d0e --worktree feature-w   (PTY, cwd = workspace)
+  branch_in_use        : 0     <- no collision, unlike route D
+  Fork into current    : 0     <- no fork prompt, unlike route B
+  not found            : 0     <- the session resolved
+  warming workspace    : 3
+  Which GJC workflow   : 1     <- blocked here: first-run onboarding in this throwaway root
+#
+# STATUS: the two failure modes that closed routes B and D did NOT occur. That is a positive
+# signal, and it is the strongest evidence yet that AC-8's literal observable may be reachable.
+# It is NOT a completed measurement: the launch stalled in onboarding, so no clean "Resume this
+# session" line was ever produced, and I am not claiming one.
+#
+# Open questions this route would still have to answer before it could ship:
+#   - the onboarding wizard. It did not appear in the live drill's fresh epoch roots but did
+#     appear here, and the difference is not yet characterised. A prerequisite the gateway
+#     cannot reliably answer is a hard blocker for an unattended entrypath.
+#   - it depends on a throwaway `-p` warm-up invocation per worktree whose own failure mode is
+#     already visible above ("Agent run failed" while still creating the worktree). Spending a
+#     model call per worktree, and relying on a failed run's side effect, is a design decision.
+#   - whether the second and subsequent attaches stay stable once the worktree exists.
+#
+# This is recorded so the AC-8 decision is made with the best available information rather than
+# on my earlier, weaker claim that no route existed.

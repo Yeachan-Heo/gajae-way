@@ -243,6 +243,73 @@ export interface SessionBootstrapProjection {
 }
 
 /**
+ * `session.attach` — bind the single managed terminal origin and hand back a
+ * fully assembled child argv for the native gjc TUI.
+ *
+ * ARCH-007: the gateway's GjcClient is the sole assembler of gjc argv and the
+ * sole binder of managed sessions. The CLI spawn of a TTY child is an opaque
+ * consumer of `argv`; it must not classify, extend, or reorder it.
+ */
+export interface SessionAttachParams {
+	/** Rotate the epoch with `/new` reset semantics before binding. */
+	readonly reset?: boolean;
+	/**
+	 * Unclassified operator rest. Wrapper-owned flags (`--socket`, `--new`) are
+	 * already consumed by the CLI. The gateway classifies this against the closed
+	 * allowlist and refuses the whole call when any token is refused or unknown.
+	 */
+	readonly argv?: readonly string[];
+	/** Advisory only on a same-UID unix socket; never treated as authentication. */
+	readonly holder?: { readonly pid?: number; readonly label?: string };
+}
+
+export interface SessionAttachResult {
+	readonly sessionId: string;
+	/** Spawn cwd; always the persona workspace. */
+	readonly cwd: string;
+	readonly epoch: number;
+	readonly originKey: string;
+	/**
+	 * The epoch's directory, and the root of its session storage.
+	 *
+	 * Native gjc writes its transcript under `<sessionDir>/agent/sessions/...`,
+	 * because the gateway pins `<sessionDir>/agent` as the native state root for
+	 * both the `session.create` it issues and the child it hands back. It is NOT
+	 * injected as `--session-dir`: the create path (`gjc sdk session raw`) rejects
+	 * that flag, and pointing the child at a store its session was never written
+	 * to made every launch die with `Session "<id>" not found`. Retained across
+	 * rotation, so a previous epoch's transcripts survive `--new`.
+	 */
+	readonly sessionDir: string;
+	/**
+	 * Diagnostic copy of the injected `--append-system-prompt` value so tests do
+	 * not have to parse argv. NEVER a second injection channel.
+	 */
+	readonly personaPreamble: string;
+	/** Opaque spawn input. The CLI passes this to spawn unmodified. */
+	readonly argv: readonly string[];
+	readonly lease: { readonly holder: string };
+	/**
+	 * The native-state environment the child MUST run with.
+	 *
+	 * Required for correctness, not convenience: `session.create` runs in the
+	 * daemon's environment, so the native state root the daemon resolved is the
+	 * only place the bound session exists. A child that resolved a different root
+	 * dies with `Session "<id>" not found` (reproduced).
+	 *
+	 * `childEnv` carries the values the daemon has set and `childEnvUnset` names
+	 * the selectors it does NOT have set. Both are needed for the override to be
+	 * TOTAL: a value-only patch cannot clear a selector the operator's shell
+	 * exports but the daemon does not, which is the common production split (a
+	 * service-managed daemon with a clean environment, an operator shell with
+	 * these variables set).
+	 */
+	readonly childEnv: Readonly<Record<string, string>>;
+	/** Native-state selectors the child must have UNSET. See `childEnv`. */
+	readonly childEnvUnset: readonly string[];
+}
+
+/**
  * Memory system surface (P3, spec fact 8): filesystem-first Markdown memory.
  * memory.audit runs the structural validator; memory.search is map-then-BM25
  * retrieval over the canonical tree. Both are read-only verbs.
@@ -545,6 +612,7 @@ export interface VerbCatalogV01 {
 	"chat.react": { params: ChatReactParams; result: ChatReactResult };
 	"engagement.reaction": { params: EngagementReactionParams; result: EngagementReactionResult };
 	"ops.cycle": { params: undefined; result: OpsCycleResult };
+	"session.attach": { params: SessionAttachParams; result: SessionAttachResult };
 }
 
 /** Event catalog: event name -> payload. */
@@ -578,6 +646,7 @@ export const VERBS_V01 = [
 	"engagement.reaction",
 	"gateway.reloadConfig",
 	"ops.cycle",
+	"session.attach",
 ] as const;
 export const EVENTS_V01 = ["chat.message", "chat.progress", "gateway.stopping", "monitor.event"] as const;
 

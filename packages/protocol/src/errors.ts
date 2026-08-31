@@ -19,6 +19,13 @@ export const ERROR_CODES = [
 	"gateway_shutting_down",
 	"unauthorized",
 	"action_execution_disabled",
+	/**
+	 * The terminal gjc lease is held by another connection (`session.attach`).
+	 * Additive under ARCH-006. Carries `detail: { holder }` so a client can
+	 * classify the refusal without parsing English; `verb_failed` is not reused
+	 * because it is indistinguishable from a bind failure.
+	 */
+	"session_lease_held",
 ] as const;
 
 export type ErrorCode = (typeof ERROR_CODES)[number];

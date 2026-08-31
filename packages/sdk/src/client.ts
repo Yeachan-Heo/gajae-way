@@ -101,6 +101,14 @@ export class GajaewayClient {
 	#negotiated?: Promise<void>;
 	#requestTimeoutMs: number;
 	#id = 0;
+	/**
+	 * Transport-death subscribers (`onTransportTerminal`). Kept separate from
+	 * `#events`, which observes protocol event FRAMES only and therefore can
+	 * never see the transport itself dying.
+	 */
+	#terminalHandlers = new Set<(error: Error) => void>();
+	#terminated = false;
+	#closingIntentionally = false;
 
 	private constructor(transport?: Transport, options?: GajaewayClientOptions) {
 		this.#transport = transport;
@@ -112,6 +120,26 @@ export class GajaewayClient {
 		handlers.add(handler);
 		this.#events.set(event, handlers);
 		return () => handlers.delete(handler);
+	}
+
+	/**
+	 * One-shot notification that the transport died unexpectedly.
+	 *
+	 * Never fires for an intentional `close()`. Exists because socket `close`,
+	 * socket `error`, and decoder failure all funnel into the private failure
+	 * path, which only rejects PENDING requests — so a consumer holding no
+	 * pending request (e.g. `gajaeway gjc` waiting on a spawned child) would
+	 * otherwise never learn the daemon is gone while the gateway has already
+	 * released its lease.
+	 *
+	 * Returns an unsubscribe function. The raw socket and the Transport are
+	 * deliberately not reachable from this surface.
+	 */
+	onTransportTerminal(handler: (error: Error) => void): () => void {
+		this.#terminalHandlers.add(handler);
+		return () => {
+			this.#terminalHandlers.delete(handler);
+		};
 	}
 
 	onChatMessage(handler: (message: ChatMessagePayload) => void): () => void {
@@ -157,6 +185,9 @@ export class GajaewayClient {
 	}
 
 	async close(): Promise<void> {
+		// Set before any teardown so the terminal notification cannot fire for an
+		// intentional close, no matter which path reaches #fail first.
+		this.#closingIntentionally = true;
 		await this.#transport?.close();
 		this.#fail(new Error("client closed"));
 	}
@@ -241,6 +272,14 @@ export class GajaewayClient {
 			pending.reject(error);
 		}
 		this.#pending.clear();
+		// Terminal notification last, after pending rejections, and exactly once.
+		// All three abrupt paths (socket close, socket error, decoder failure)
+		// already funnel here, so this one site covers them uniformly.
+		if (this.#closingIntentionally || this.#terminated) return;
+		this.#terminated = true;
+		const handlers = [...this.#terminalHandlers];
+		this.#terminalHandlers.clear();
+		for (const handler of handlers) handler(error);
 	}
 }
 

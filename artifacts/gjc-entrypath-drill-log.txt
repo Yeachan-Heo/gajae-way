@@ -1,0 +1,219 @@
+=== AC-17 live drill ===
+date: 2026-08-31T07:56:31Z
+GAJAEWAY_HOME: /tmp/gjc-live-drill-home
+gjc version: gjc/0.15.5
+
+daemon pid: 42819
+socket: up
+
+--- first: gajaeway gjc  ---
+exit code: 0
+output tail:
+8;2;127;29;29m────────────────────────────────────────────────────────────────────────────────[39m[0m[0 q[?25l[?2026l[23;2t[1B
+[0 q[?25h[?2004l[?1000l[?1002l[?1006l[?1007l[?2031l
+Resume this session with:
+gjc --resume 02fc31f1-f670-4eb0-a931-427f16c76a35
+[?2004l[?1000l[?1002l[?1006l[?1007l[?2031l[<u[>4;0m[?25h
+session tree:
+/tmp/gjc-live-drill-home/sessions
+/tmp/gjc-live-drill-home/sessions/terminal
+/tmp/gjc-live-drill-home/sessions/terminal/e0
+/tmp/gjc-live-drill-home/sessions/terminal/e0/bound-agent-dir
+/tmp/gjc-live-drill-home/sessions/terminal/e0/agent
+/tmp/gjc-live-drill-home/sessions/terminal/e0/agent/models.db-shm
+/tmp/gjc-live-drill-home/sessions/terminal/e0/agent/agent.db
+/tmp/gjc-live-drill-home/sessions/terminal/e0/agent/models.db-wal
+/tmp/gjc-live-drill-home/sessions/terminal/e0/agent/gjc-crash-index.json
+/tmp/gjc-live-drill-home/sessions/terminal/e0/agent/gjc-crash-index.json.retired
+/tmp/gjc-live-drill-home/sessions/terminal/e0/agent/terminal-sessions
+/tmp/gjc-live-drill-home/sessions/terminal/e0/agent/terminal-sessions/ttys014
+/tmp/gjc-live-drill-home/sessions/terminal/e0/agent/sessions
+/tmp/gjc-live-drill-home/sessions/terminal/e0/agent/sessions/v2-yl7iukykowqpde336k2qlih6gqlck6y5zjecbdczfldy2nvozlpa
+/tmp/gjc-live-drill-home/sessions/terminal/e0/agent/sessions/v2-yl7iukykowqpde336k2qlih6gqlck6y5zjecbdczfldy2nvozlpa/.gjc-managed-session-internal
+/tmp/gjc-live-drill-home/sessions/terminal/e0/agent/sessions/v2-yl7iukykowqpde336k2qlih6gqlck6y5zjecbdczfldy2nvozlpa/.gjc-managed-session-internal/receipts
+/tmp/gjc-live-drill-home/sessions/terminal/e0/agent/sessions/v2-yl7iukykowqpde336k2qlih6gqlck6y5zjecbdczfldy2nvozlpa/.gjc-managed-session-internal/locks
+/tmp/gjc-live-drill-home/sessions/terminal/e0/agent/sessions/v2-yl7iukykowqpde336k2qlih6gqlck6y5zjecbdczfldy2nvozlpa/.gjc-managed-session-internal/tombstones
+/tmp/gjc-live-drill-home/sessions/terminal/e0/agent/sessions/v2-yl7iukykowqpde336k2qlih6gqlck6y5zjecbdczfldy2nvozlpa/2026-08-31T07-56-34-173Z_02fc31f1-f670-4eb0-a931-427f16c76a35
+/tmp/gjc-live-drill-home/sessions/terminal/e0/agent/sessions/v2-yl7iukykowqpde336k2qlih6gqlck6y5zjecbdczfldy2nvozlpa/2026-08-31T07-56-34-173Z_02fc31f1-f670-4eb0-a931-427f16c76a35.jsonl
+/tmp/gjc-live-drill-home/sessions/terminal/e0/agent/sessions/v2-yl7iukykowqpde336k2qlih6gqlck6y5zjecbdczfldy2nvozlpa/.gjc-managed-session-scope.v2.json
+/tmp/gjc-live-drill-home/sessions/terminal/e0/agent/models.db
+/tmp/gjc-live-drill-home/sessions/terminal/e0/agent/sdk
+/tmp/gjc-live-drill-home/sessions/terminal/e0/agent/sdk/broker.lock
+/tmp/gjc-live-drill-home/sessions/terminal/e0/agent/sdk/broker.lock/owner.json
+/tmp/gjc-live-drill-home/sessions/terminal/e0/agent/sdk/broker.identity
+/tmp/gjc-live-drill-home/sessions/terminal/e0/agent/sdk/sessions
+/tmp/gjc-live-drill-home/sessions/terminal/e0/agent/sdk/sessions/index.jsonl
+/tmp/gjc-live-drill-home/sessions/terminal/e0/agent/sdk/broker.json
+/tmp/gjc-live-drill-home/sessions/terminal/e0/agent/sdk/lifecycle-ledger.jsonl
+/tmp/gjc-live-drill-home/sessions/terminal/e0/agent/agent.db-wal
+/tmp/gjc-live-drill-home/sessions/terminal/e0/agent/resident-cache
+/tmp/gjc-live-drill-home/sessions/terminal/e0/agent/resident-cache/i-ngYClP
+/tmp/gjc-live-drill-home/sessions/terminal/e0/agent/resident-cache/i-ngYClP/owner.json
+/tmp/gjc-live-drill-home/sessions/terminal/e0/agent/sidecar-cache
+/tmp/gjc-live-drill-home/sessions/terminal/e0/agent/agent.db-shm
+/tmp/gjc-live-drill-home/sessions/terminal/e0/bound-cwd
+
+session ids after first: 02fc31f1-f670-4eb0-a931-427f16c76a35 @e0
+marker written to: /tmp/gjc-live-drill-home/sessions/terminal/e0/drill-marker.txt
+
+--- second: gajaeway gjc  ---
+exit code: 0
+output tail:
+8;2;127;29;29m────────────────────────────────────────────────────────────────────────────────[39m[0m[0 q[?25l[?2026l[23;2t[1B
+[0 q[?25h[?2004l[?1000l[?1002l[?1006l[?1007l[?2031l
+Resume this session with:
+gjc --resume 02fc31f1-f670-4eb0-a931-427f16c76a35
+[?2004l[?1000l[?1002l[?1006l[?1007l[?2031l[<u[>4;0m[?25h
+session tree:
+/tmp/gjc-live-drill-home/sessions
+/tmp/gjc-live-drill-home/sessions/terminal
+/tmp/gjc-live-drill-home/sessions/terminal/e0
+/tmp/gjc-live-drill-home/sessions/terminal/e0/bound-agent-dir
+/tmp/gjc-live-drill-home/sessions/terminal/e0/agent
+/tmp/gjc-live-drill-home/sessions/terminal/e0/agent/models.db-shm
+/tmp/gjc-live-drill-home/sessions/terminal/e0/agent/agent.db
+/tmp/gjc-live-drill-home/sessions/terminal/e0/agent/models.db-wal
+/tmp/gjc-live-drill-home/sessions/terminal/e0/agent/gjc-crash-index.json
+/tmp/gjc-live-drill-home/sessions/terminal/e0/agent/gjc-crash-index.json.retired
+/tmp/gjc-live-drill-home/sessions/terminal/e0/agent/terminal-sessions
+/tmp/gjc-live-drill-home/sessions/terminal/e0/agent/terminal-sessions/ttys014
+/tmp/gjc-live-drill-home/sessions/terminal/e0/agent/sessions
+/tmp/gjc-live-drill-home/sessions/terminal/e0/agent/sessions/v2-yl7iukykowqpde336k2qlih6gqlck6y5zjecbdczfldy2nvozlpa
+/tmp/gjc-live-drill-home/sessions/terminal/e0/agent/sessions/v2-yl7iukykowqpde336k2qlih6gqlck6y5zjecbdczfldy2nvozlpa/.gjc-managed-session-internal
+/tmp/gjc-live-drill-home/sessions/terminal/e0/agent/sessions/v2-yl7iukykowqpde336k2qlih6gqlck6y5zjecbdczfldy2nvozlpa/.gjc-managed-session-internal/receipts
+/tmp/gjc-live-drill-home/sessions/terminal/e0/agent/sessions/v2-yl7iukykowqpde336k2qlih6gqlck6y5zjecbdczfldy2nvozlpa/.gjc-managed-session-internal/locks
+/tmp/gjc-live-drill-home/sessions/terminal/e0/agent/sessions/v2-yl7iukykowqpde336k2qlih6gqlck6y5zjecbdczfldy2nvozlpa/.gjc-managed-session-internal/tombstones
+/tmp/gjc-live-drill-home/sessions/terminal/e0/agent/sessions/v2-yl7iukykowqpde336k2qlih6gqlck6y5zjecbdczfldy2nvozlpa/2026-08-31T07-56-34-173Z_02fc31f1-f670-4eb0-a931-427f16c76a35
+/tmp/gjc-live-drill-home/sessions/terminal/e0/agent/sessions/v2-yl7iukykowqpde336k2qlih6gqlck6y5zjecbdczfldy2nvozlpa/2026-08-31T07-56-34-173Z_02fc31f1-f670-4eb0-a931-427f16c76a35.jsonl
+/tmp/gjc-live-drill-home/sessions/terminal/e0/agent/sessions/v2-yl7iukykowqpde336k2qlih6gqlck6y5zjecbdczfldy2nvozlpa/.gjc-managed-session-scope.v2.json
+/tmp/gjc-live-drill-home/sessions/terminal/e0/agent/models.db
+/tmp/gjc-live-drill-home/sessions/terminal/e0/agent/sdk
+/tmp/gjc-live-drill-home/sessions/terminal/e0/agent/sdk/broker.lock
+/tmp/gjc-live-drill-home/sessions/terminal/e0/agent/sdk/broker.lock/owner.json
+/tmp/gjc-live-drill-home/sessions/terminal/e0/agent/sdk/broker.identity
+/tmp/gjc-live-drill-home/sessions/terminal/e0/agent/sdk/sessions
+/tmp/gjc-live-drill-home/sessions/terminal/e0/agent/sdk/sessions/index.jsonl
+/tmp/gjc-live-drill-home/sessions/terminal/e0/agent/sdk/sessions/index-audit.jsonl
+/tmp/gjc-live-drill-home/sessions/terminal/e0/agent/sdk/broker.json
+/tmp/gjc-live-drill-home/sessions/terminal/e0/agent/sdk/lifecycle-ledger.jsonl
+/tmp/gjc-live-drill-home/sessions/terminal/e0/agent/agent.db-wal
+/tmp/gjc-live-drill-home/sessions/terminal/e0/agent/resident-cache
+/tmp/gjc-live-drill-home/sessions/terminal/e0/agent/resident-cache/i-ngYClP
+/tmp/gjc-live-drill-home/sessions/terminal/e0/agent/resident-cache/i-ngYClP/owner.json
+/tmp/gjc-live-drill-home/sessions/terminal/e0/agent/sidecar-cache
+/tmp/gjc-live-drill-home/sessions/terminal/e0/agent/agent.db-shm
+/tmp/gjc-live-drill-home/sessions/terminal/e0/drill-marker.txt
+/tmp/gjc-live-drill-home/sessions/terminal/e0/bound-cwd
+
+session ids after second: 02fc31f1-f670-4eb0-a931-427f16c76a35 @e0
+
+--- new: gajaeway gjc --new ---
+exit code: 0
+output tail:
+;203;203m─[0m[38;2;244;230;230m─[0m[38;2;234;205;205m╯[0m       [38;2;111;71;67m│[39m [38;2;111;71;67m────────────────────────────────────[39m [38;2;111;71;67m│[39m [0m[0 q[?25l[?2026l[23;2t[17B
+[0 q[?25h[?2004l[?1000l[?1002l[?1006l[?1007l[?2031l
+Resume this session with:
+gjc --resume 5f02cb5e-aadd-4094-bdf1-eab3015c3cdc
+[?2004l[?1000l[?1002l[?1006l[?1007l[?2031l[<u[>4;0m[?25h
+session tree:
+/tmp/gjc-live-drill-home/sessions
+/tmp/gjc-live-drill-home/sessions/terminal
+/tmp/gjc-live-drill-home/sessions/terminal/e1
+/tmp/gjc-live-drill-home/sessions/terminal/e1/bound-agent-dir
+/tmp/gjc-live-drill-home/sessions/terminal/e1/agent
+/tmp/gjc-live-drill-home/sessions/terminal/e1/agent/models.db-shm
+/tmp/gjc-live-drill-home/sessions/terminal/e1/agent/agent.db
+/tmp/gjc-live-drill-home/sessions/terminal/e1/agent/models.db-wal
+/tmp/gjc-live-drill-home/sessions/terminal/e1/agent/gjc-crash-index.json
+/tmp/gjc-live-drill-home/sessions/terminal/e1/agent/gjc-crash-index.json.retired
+/tmp/gjc-live-drill-home/sessions/terminal/e1/agent/terminal-sessions
+/tmp/gjc-live-drill-home/sessions/terminal/e1/agent/terminal-sessions/ttys014
+/tmp/gjc-live-drill-home/sessions/terminal/e1/agent/sessions
+/tmp/gjc-live-drill-home/sessions/terminal/e1/agent/sessions/v2-yl7iukykowqpde336k2qlih6gqlck6y5zjecbdczfldy2nvozlpa
+/tmp/gjc-live-drill-home/sessions/terminal/e1/agent/sessions/v2-yl7iukykowqpde336k2qlih6gqlck6y5zjecbdczfldy2nvozlpa/.gjc-managed-session-internal
+/tmp/gjc-live-drill-home/sessions/terminal/e1/agent/sessions/v2-yl7iukykowqpde336k2qlih6gqlck6y5zjecbdczfldy2nvozlpa/.gjc-managed-session-internal/receipts
+/tmp/gjc-live-drill-home/sessions/terminal/e1/agent/sessions/v2-yl7iukykowqpde336k2qlih6gqlck6y5zjecbdczfldy2nvozlpa/.gjc-managed-session-internal/locks
+/tmp/gjc-live-drill-home/sessions/terminal/e1/agent/sessions/v2-yl7iukykowqpde336k2qlih6gqlck6y5zjecbdczfldy2nvozlpa/.gjc-managed-session-internal/tombstones
+/tmp/gjc-live-drill-home/sessions/terminal/e1/agent/sessions/v2-yl7iukykowqpde336k2qlih6gqlck6y5zjecbdczfldy2nvozlpa/2026-08-31T07-56-37-756Z_5f02cb5e-aadd-4094-bdf1-eab3015c3cdc
+/tmp/gjc-live-drill-home/sessions/terminal/e1/agent/sessions/v2-yl7iukykowqpde336k2qlih6gqlck6y5zjecbdczfldy2nvozlpa/.gjc-managed-session-scope.v2.json
+/tmp/gjc-live-drill-home/sessions/terminal/e1/agent/sessions/v2-yl7iukykowqpde336k2qlih6gqlck6y5zjecbdczfldy2nvozlpa/2026-08-31T07-56-37-756Z_5f02cb5e-aadd-4094-bdf1-eab3015c3cdc.jsonl
+/tmp/gjc-live-drill-home/sessions/terminal/e1/agent/models.db
+/tmp/gjc-live-drill-home/sessions/terminal/e1/agent/sdk
+/tmp/gjc-live-drill-home/sessions/terminal/e1/agent/sdk/broker.lock
+/tmp/gjc-live-drill-home/sessions/terminal/e1/agent/sdk/broker.lock/owner.json
+/tmp/gjc-live-drill-home/sessions/terminal/e1/agent/sdk/broker.identity
+/tmp/gjc-live-drill-home/sessions/terminal/e1/agent/sdk/sessions
+/tmp/gjc-live-drill-home/sessions/terminal/e1/agent/sdk/sessions/index.jsonl
+/tmp/gjc-live-drill-home/sessions/terminal/e1/agent/sdk/broker.json
+/tmp/gjc-live-drill-home/sessions/terminal/e1/agent/sdk/lifecycle-ledger.jsonl
+/tmp/gjc-live-drill-home/sessions/terminal/e1/agent/agent.db-wal
+/tmp/gjc-live-drill-home/sessions/terminal/e1/agent/resident-cache
+/tmp/gjc-live-drill-home/sessions/terminal/e1/agent/resident-cache/i-N2PJCY
+/tmp/gjc-live-drill-home/sessions/terminal/e1/agent/resident-cache/i-N2PJCY/owner.json
+/tmp/gjc-live-drill-home/sessions/terminal/e1/agent/sidecar-cache
+/tmp/gjc-live-drill-home/sessions/terminal/e1/agent/agent.db-shm
+/tmp/gjc-live-drill-home/sessions/terminal/e1/bound-cwd
+/tmp/gjc-live-drill-home/sessions/terminal/e0
+/tmp/gjc-live-drill-home/sessions/terminal/e0/bound-agent-dir
+/tmp/gjc-live-drill-home/sessions/terminal/e0/agent
+/tmp/gjc-live-drill-home/sessions/terminal/e0/agent/models.db-shm
+/tmp/gjc-live-drill-home/sessions/terminal/e0/agent/agent.db
+/tmp/gjc-live-drill-home/sessions/terminal/e0/agent/models.db-wal
+/tmp/gjc-live-drill-home/sessions/terminal/e0/agent/gjc-crash-index.json
+/tmp/gjc-live-drill-home/sessions/terminal/e0/agent/gjc-crash-index.json.retired
+/tmp/gjc-live-drill-home/sessions/terminal/e0/agent/terminal-sessions
+/tmp/gjc-live-drill-home/sessions/terminal/e0/agent/terminal-sessions/ttys014
+/tmp/gjc-live-drill-home/sessions/terminal/e0/agent/sessions
+/tmp/gjc-live-drill-home/sessions/terminal/e0/agent/sessions/v2-yl7iukykowqpde336k2qlih6gqlck6y5zjecbdczfldy2nvozlpa
+/tmp/gjc-live-drill-home/sessions/terminal/e0/agent/sessions/v2-yl7iukykowqpde336k2qlih6gqlck6y5zjecbdczfldy2nvozlpa/.gjc-managed-session-internal
+/tmp/gjc-live-drill-home/sessions/terminal/e0/agent/sessions/v2-yl7iukykowqpde336k2qlih6gqlck6y5zjecbdczfldy2nvozlpa/.gjc-managed-session-internal/receipts
+/tmp/gjc-live-drill-home/sessions/terminal/e0/agent/sessions/v2-yl7iukykowqpde336k2qlih6gqlck6y5zjecbdczfldy2nvozlpa/.gjc-managed-session-internal/locks
+/tmp/gjc-live-drill-home/sessions/terminal/e0/agent/sessions/v2-yl7iukykowqpde336k2qlih6gqlck6y5zjecbdczfldy2nvozlpa/.gjc-managed-session-internal/tombstones
+/tmp/gjc-live-drill-home/sessions/terminal/e0/agent/sessions/v2-yl7iukykowqpde336k2qlih6gqlck6y5zjecbdczfldy2nvozlpa/2026-08-31T07-56-34-173Z_02fc31f1-f670-4eb0-a931-427f16c76a35
+/tmp/gjc-live-drill-home/sessions/terminal/e0/agent/sessions/v2-yl7iukykowqpde336k2qlih6gqlck6y5zjecbdczfldy2nvozlpa/2026-08-31T07-56-34-173Z_02fc31f1-f670-4eb0-a931-427f16c76a35.jsonl
+/tmp/gjc-live-drill-home/sessions/terminal/e0/agent/sessions/v2-yl7iukykowqpde336k2qlih6gqlck6y5zjecbdczfldy2nvozlpa/.gjc-managed-session-scope.v2.json
+/tmp/gjc-live-drill-home/sessions/terminal/e0/agent/models.db
+/tmp/gjc-live-drill-home/sessions/terminal/e0/agent/sdk
+/tmp/gjc-live-drill-home/sessions/terminal/e0/agent/sdk/broker.lock
+/tmp/gjc-live-drill-home/sessions/terminal/e0/agent/sdk/broker.lock/owner.json
+/tmp/gjc-live-drill-home/sessions/terminal/e0/agent/sdk/broker.identity
+/tmp/gjc-live-drill-home/sessions/terminal/e0/agent/sdk/sessions
+/tmp/gjc-live-drill-home/sessions/terminal/e0/agent/sdk/sessions/index.jsonl
+/tmp/gjc-live-drill-home/sessions/terminal/e0/agent/sdk/sessions/index-audit.jsonl
+/tmp/gjc-live-drill-home/sessions/terminal/e0/agent/sdk/broker.json
+/tmp/gjc-live-drill-home/sessions/terminal/e0/agent/sdk/lifecycle-ledger.jsonl
+/tmp/gjc-live-drill-home/sessions/terminal/e0/agent/agent.db-wal
+/tmp/gjc-live-drill-home/sessions/terminal/e0/agent/resident-cache
+/tmp/gjc-live-drill-home/sessions/terminal/e0/agent/resident-cache/i-ngYClP
+/tmp/gjc-live-drill-home/sessions/terminal/e0/agent/resident-cache/i-ngYClP/owner.json
+/tmp/gjc-live-drill-home/sessions/terminal/e0/agent/sidecar-cache
+/tmp/gjc-live-drill-home/sessions/terminal/e0/agent/agent.db-shm
+/tmp/gjc-live-drill-home/sessions/terminal/e0/drill-marker.txt
+/tmp/gjc-live-drill-home/sessions/terminal/e0/bound-cwd
+
+session ids after --new: 5f02cb5e-aadd-4094-bdf1-eab3015c3cdc @e1
+epoch dirs after --new:
+/tmp/gjc-live-drill-home/sessions/terminal/e0
+/tmp/gjc-live-drill-home/sessions/terminal/e1
+marker survived: yes
+marker contents: drill-marker
+
+=== gateway ops cycle ===
+phase: idle
+gates: none
+generatedAt: 2026-08-31T07:56:38.930Z
+instance: 2abb79cb-a23d-4760-ac8b-63610f1c68e2
+inbound: pending=0 inflight=0
+context: unread=0 expired=0 truncated=0 omitted_oldest=- omitted_newest=-
+deliveries: pending=0 inflight=0 confirmed=0 failed_ambiguous=0 expired=0
+memory: queued=0 written=0 committed=0 receipted=0 quarantined=0
+monitors: none
+sessions:
+INDEX  ORIGIN                                      EPOCH  SESSION      PENDING  UNSETTLED  OLDEST
+0      loopback/loopback/terminal                  1      5f02cb5e-aa  0        0          -
+
+=== daemon log tail ===
+gateway recovered 0 inbound message(s) stranded in processing.
+{"recovery":{"recovered":0,"pending":0,"pruned":0}}
+
+daemon stopped

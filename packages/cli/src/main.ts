@@ -3,6 +3,7 @@ import { isAbsolute, join } from "node:path";
 import type { OpsCycleResult } from "@gajaeway/protocol";
 import { LOOPBACK_ORIGIN, originKey } from "@gajaeway/protocol";
 import { GajaewayClient } from "@gajaeway/sdk";
+import { runGjc } from "./gjc";
 
 export function socketPath(home = process.env.GAJAEWAY_HOME): string {
 	return `${home ?? `${process.env.HOME ?? "~"}/.gajaeway`}/gateway.sock`;
@@ -11,8 +12,18 @@ export function socketPath(home = process.env.GAJAEWAY_HOME): string {
 export function parseArgs(args: string[]): { command?: string; rest: string[]; socket: string } {
 	let socket = socketPath();
 	const rest: string[] = [];
+	let sawSeparator = false;
 	for (let i = 0; i < args.length; i++) {
-		if (args[i] === "--socket") socket = args[++i] ?? socket;
+		// `--` ends option parsing. Everything after it is payload for the
+		// subcommand (notably `gajaeway gjc`, which forwards its rest to the
+		// gateway), so a literal `--socket` there must reach the subcommand
+		// untouched instead of silently retargeting this process.
+		if (!sawSeparator && args[i] === "--") {
+			sawSeparator = true;
+			rest.push(args[i]);
+			continue;
+		}
+		if (!sawSeparator && args[i] === "--socket") socket = args[++i] ?? socket;
 		else rest.push(args[i]);
 	}
 	return { command: rest[0], rest: rest.slice(1), socket };
@@ -198,6 +209,13 @@ export async function main(args = process.argv.slice(2)): Promise<void> {
 				}
 				break;
 			}
+			case "gjc": {
+				// Launches the native interactive gjc TUI as a gateway-managed persona
+				// session. All logic lives in ./gjc so main.ts does not grow a second
+				// vendor adapter.
+				process.exitCode = await runGjc(parsed.socket, parsed.rest);
+				break;
+			}
 			case "chat":
 				await chat(parsed.socket);
 				break;
@@ -370,7 +388,7 @@ export async function main(args = process.argv.slice(2)): Promise<void> {
 			}
 			default:
 				throw new Error(
-					"usage: gajaeway [--socket PATH] status|shutdown|chat|daemon run|sessions list [--json]|sessions inspect <originKey-or-index>|memory audit|memory search <query>|monitors ...|work run <name> [--cwd DIR] <text>|ops backup <path>|ops cycle [--json]|ops integrity|ops restore <backupPath>",
+					"usage: gajaeway [--socket PATH] status|shutdown|chat|gjc [--new] [gjc flags]|daemon run|sessions list [--json]|sessions inspect <originKey-or-index>|memory audit|memory search <query>|monitors ...|work run <name> [--cwd DIR] <text>|ops backup <path>|ops cycle [--json]|ops integrity|ops restore <backupPath>",
 				);
 		}
 	} catch (error) {

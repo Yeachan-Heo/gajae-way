@@ -31,6 +31,8 @@ export {
 	type OpsCycleResult,
 	type RecallSnippet,
 	type ReplyContext,
+	type SessionAttachParams,
+	type SessionAttachResult,
 	type SessionBootstrapProjection,
 	type SessionListResult,
 	type SessionRecallParams,
@@ -75,6 +77,7 @@ export {
 	type OriginRef,
 	OriginRefError,
 	originKey,
+	TERMINAL_ORIGIN,
 	validateOriginRef,
 } from "./origin";
 export {

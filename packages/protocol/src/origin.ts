@@ -96,6 +96,26 @@ export const LOOPBACK_ORIGIN: OriginRef = {
 	conversationId: "loopback",
 };
 
+/**
+ * The single managed origin for the `gajaeway gjc` terminal entrypath.
+ *
+ * Deliberately a fixed `conversationId` on the existing closed `loopback`
+ * platform rather than a new ORIGIN_PLATFORMS member: adding a platform is a
+ * closed-enum break for every `OriginRef` consumer (session.list, ops.cycle,
+ * chat.message), and neither a capability flag nor a profile bump protects an
+ * older client that calls `originKey()`. Distinct from LOOPBACK_ORIGIN, which
+ * belongs to `gajaeway chat`.
+ *
+ * This origin is ATTACH-ONLY: turn-driving verbs must refuse it, because the
+ * live native TUI holds the bound session and a `-p` turn would corrupt that
+ * transcript.
+ */
+export const TERMINAL_ORIGIN: OriginRef = {
+	platform: "loopback",
+	kind: "loopback",
+	conversationId: "terminal",
+};
+
 /** Origin of the event-type session executing events of one declared type (P4). */
 export function eventTypeOrigin(eventType: string): OriginRef {
 	return { platform: "monitor", kind: "eventtype", conversationId: eventType };

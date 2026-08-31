@@ -1,4 +1,5 @@
-import { unlink } from "node:fs/promises";
+import { mkdir, unlink } from "node:fs/promises";
+import { join } from "node:path";
 import {
 	CAPABILITIES,
 	type ChatMessagePayload,
@@ -22,6 +23,9 @@ import {
 	type RequestFrame,
 	reactionAllowlistDescription,
 	resolveReactionEmoji,
+	type SessionAttachParams,
+	type SessionAttachResult,
+	TERMINAL_ORIGIN,
 	validateOriginRef,
 } from "@gajaeway/protocol";
 import {
@@ -50,7 +54,13 @@ import { MonitorRegistry } from "../monitors/registry";
 import { MonitorRuntime } from "../monitors/runtime";
 import { backupDatabase, integrityDatabase } from "../ops/backup";
 import { RuntimeCycleProjector } from "../ops/cycle";
-import type { GjcPort } from "../orchestrator/gjc-client";
+import {
+	ATTACH_PREAMBLE_MAX_BYTES,
+	assembleGjcAttachArgv,
+	classifyGjcWrapperFlags,
+	type GjcPort,
+	nativeStateEnv,
+} from "../orchestrator/gjc-client";
 import { formatFailureNotice } from "../orchestrator/rebind";
 import { buildSessionBootstrap, type SessionBootstrap } from "../persona/bootstrap";
 import { PersonaLoader } from "../persona/persona";
@@ -165,10 +175,31 @@ async function loadOrCreateLaneJob(
 const SESSION_TURN_LIMIT = 50;
 
 interface Connection {
+	/**
+	 * Stable per-connection identity, assigned at accept time.
+	 *
+	 * Required by the terminal gjc lease: the lease is released by id on every
+	 * disconnect path, and `session_lease_held` reports the holder. Without it
+	 * `detail.holder` would be `undefined`.
+	 */
+	readonly id: string;
 	readonly decoder: FrameDecoder;
 	negotiated: boolean;
 	write(frame: Frame): void;
 	close(): void;
+}
+
+/**
+ * Exclusive claim on the single managed terminal origin (`session.attach`).
+ *
+ * In-memory and connection-scoped on purpose: the lease must die exactly when
+ * the CLI's socket dies, and the daemon is required for this entrypath anyway,
+ * so a daemon restart correctly drops it. A SQLite row would outlive the
+ * process and strand the origin.
+ */
+interface TerminalLease {
+	readonly connectionId: string;
+	readonly holder: string;
 }
 export interface GatewayServer {
 	stop(reason?: string): Promise<void>;
@@ -242,6 +273,12 @@ interface Runtime {
 	readonly delivery: DeliveryService;
 	readonly persona: PersonaLoader;
 	readonly connections: Set<Connection>;
+	/**
+	 * The exclusive terminal gjc lease, or undefined when the origin is free.
+	 * Claimed synchronously in `session.attach` and released on every disconnect
+	 * path plus `stop()`.
+	 */
+	terminalLease?: TerminalLease;
 	readonly memory: MemoryClosureQueue;
 	readonly registry: MonitorRegistry;
 	readonly monitors: MonitorPropagator;
@@ -288,6 +325,8 @@ export async function startUnixServer(options: GatewayServerOptions): Promise<Ga
 		stopping = true;
 		stopPromise = (async () => {
 			process.off("SIGHUP", onHup);
+			// The daemon is going away, so no terminal lease can still be valid.
+			runtime.terminalLease = undefined;
 			for (const connection of runtime.connections)
 				connection.write({ v: PROFILE_VERSION, type: "event", event: "gateway.stopping", payload: { reason } });
 			listener.stop(true);
@@ -307,6 +346,7 @@ export async function startUnixServer(options: GatewayServerOptions): Promise<Ga
 		socket: {
 			open(socket) {
 				const connection: Connection = {
+					id: crypto.randomUUID(),
 					decoder: new FrameDecoder(),
 					negotiated: false,
 					write: (frame) => socket.write(encodeFrame(frame)),
@@ -325,9 +365,14 @@ export async function startUnixServer(options: GatewayServerOptions): Promise<Ga
 				}
 			},
 			close(socket) {
+				// Release before dropping the connection: the lease must not outlive
+				// the socket, or the next attach is refused forever.
+				releaseTerminalLease(runtime, socket.data.connection.id);
 				runtime.connections.delete(socket.data.connection);
 			},
-			error(_socket, error) {
+			error(socket, error) {
+				// An abrupt socket error is the same hazard as a close.
+				releaseTerminalLease(runtime, socket.data?.connection?.id);
 				console.error(`gateway socket error: ${error.message}`);
 			},
 		},
@@ -341,6 +386,7 @@ export function startStdioServer(options: GatewayServerOptions): GatewayServer {
 	void runtime.monitors.reconcile();
 	void runtime.monitorRuntime.start();
 	const connection: Connection = {
+		id: crypto.randomUUID(),
 		decoder: new FrameDecoder(),
 		negotiated: false,
 		write: (frame) => process.stdout.write(encodeFrame(frame)),
@@ -364,6 +410,7 @@ export function startStdioServer(options: GatewayServerOptions): GatewayServer {
 		stopping = true;
 		stopPromise = (async () => {
 			process.off("SIGHUP", onHup);
+			runtime.terminalLease = undefined;
 			connection.write({ v: PROFILE_VERSION, type: "event", event: "gateway.stopping", payload: { reason } });
 			clearInterval(runtime.reconcileTimer);
 			clearInterval(runtime.contextMaintenanceTimer);
@@ -383,7 +430,109 @@ export function startStdioServer(options: GatewayServerOptions): GatewayServer {
 			writeError(connection, error);
 		}
 	});
+	// stdin ending is this transport's disconnect: the same hazard as a unix
+	// socket close, so it must release the terminal lease too.
+	const onStdinEnd = () => releaseTerminalLease(runtime, connection.id);
+	process.stdin.on("end", onStdinEnd);
+	process.stdin.on("close", onStdinEnd);
 	return { stop };
+}
+
+/**
+ * Drop the terminal lease, but only when it still names this connection.
+ *
+ * Guarded so a late close from a previously-released connection cannot steal the
+ * lease out from under a newer holder.
+ */
+function releaseTerminalLease(runtime: Runtime, connectionId: string | undefined): void {
+	if (connectionId === undefined) return;
+	if (runtime.terminalLease?.connectionId === connectionId) runtime.terminalLease = undefined;
+}
+
+/**
+ * The terminal origin is ATTACH-ONLY.
+ *
+ * A live native TUI holds the bound session. Driving a turn on that same session
+ * from the chat surface would run `gjc --resume … -p` against the transcript the
+ * TUI is editing, corrupting it and racing the child. `session.attach` is the
+ * only supported way in, and wrapper-owned `--new` is the only rotation.
+ *
+ * Deliberately NOT applied to `chat.react` / `engagement.reaction`: both already
+ * refuse any non-discord/telegram platform before touching state, so a guard
+ * there would be unreachable and its test vacuous. A regression test pins those
+ * platform gates instead.
+ */
+function assertTerminalOriginAttachOnly(origin: OriginRef): void {
+	if (originKey(origin) === originKey(TERMINAL_ORIGIN)) {
+		throw new ProtocolError("invalid_params", "terminal origin is attach-only");
+	}
+}
+
+/**
+ * Prepare (or reuse) a managed worktree and return its absolute path.
+ *
+ * Uses plain `git worktree add`, not any gjc worktree machinery. That matters
+ * twice over: the gateway must know the path BEFORE it binds a session there,
+ * and native gjc names its own worktrees with an unpredictable suffix, so
+ * forwarding `--worktree` would put the child in a directory the gateway never
+ * bound — which the real TUI reports as a different project and offers to fork.
+ */
+async function prepareWorktree(workspace: string, branch: string): Promise<string> {
+	const safe = branch
+		.replace(/\.\./g, "")
+		.replace(/[^A-Za-z0-9._/-]/g, "-")
+		.replace(/^[-/]+/, "");
+	if (safe === "") {
+		throw new ProtocolError("invalid_params", `unusable worktree branch name: ${branch}`);
+	}
+	const path = join(workspace, ".worktrees", safe);
+	if (await Bun.file(join(path, ".git")).exists()) return path;
+
+	const inRepo = Bun.spawnSync(["git", "-C", workspace, "rev-parse", "--git-dir"], {
+		stdout: "pipe",
+		stderr: "pipe",
+	});
+	if (inRepo.exitCode !== 0) {
+		throw new ProtocolError(
+			"invalid_params",
+			`--worktree needs the persona workspace to be a git repository: ${workspace}`,
+		);
+	}
+	await mkdir(join(workspace, ".worktrees"), { recursive: true, mode: 0o700 });
+	// Reuse the branch when it already exists; otherwise create it.
+	const hasBranch =
+		Bun.spawnSync(["git", "-C", workspace, "rev-parse", "--verify", `refs/heads/${safe}`], {
+			stdout: "pipe",
+			stderr: "pipe",
+		}).exitCode === 0;
+	const add = hasBranch
+		? ["git", "-C", workspace, "worktree", "add", path, safe]
+		: ["git", "-C", workspace, "worktree", "add", "-b", safe, path];
+	const result = Bun.spawnSync(add, { stdout: "pipe", stderr: "pipe" });
+	if (result.exitCode !== 0) {
+		throw new ProtocolError(
+			"verb_failed",
+			`git worktree add failed for ${safe}: ${new TextDecoder().decode(result.stderr).trim()}`,
+		);
+	}
+	return path;
+}
+
+/**
+ * The cwd an epoch's session is bound to, recorded in the gateway's own
+ * per-epoch artifact directory.
+ *
+ * One origin holds one session, and a native session belongs to the project it
+ * was created in. An epoch's cwd is therefore fixed for that epoch's lifetime: a
+ * later attach asking for a different directory cannot resume the same session,
+ * and must be told so plainly instead of being handed to gjc to discover as an
+ * interactive fork prompt.
+ */
+async function readPointer(sessionDir: string, name: string): Promise<string | undefined> {
+	const file = Bun.file(join(sessionDir, name));
+	if (!(await file.exists())) return undefined;
+	const text = (await file.text()).trim();
+	return text === "" ? undefined : text;
 }
 
 /**
@@ -1072,6 +1221,9 @@ async function handleRequest(
 			});
 			return;
 		}
+		case "session.attach":
+			await attachTerminalSession(connection, request, options, runtime);
+			return;
 		case "chat.send":
 			await sendChat(connection, request, options, runtime);
 			return;
@@ -1079,6 +1231,237 @@ async function handleRequest(
 			throw new ProtocolError("unknown_verb", `unknown verb: ${request.verb}`);
 	}
 }
+/**
+ * `session.attach` — bind the single managed terminal origin and hand back a
+ * fully assembled child argv for the native gjc TUI.
+ *
+ * Step order is load-bearing and must not be reordered:
+ *  1. classify flags — a refused flag must never claim the lease;
+ *  2. check + claim the lease SYNCHRONOUSLY, with no await in between, or two
+ *     overlapping attaches can both win (including while the first is still
+ *     blocked inside the bind);
+ *  3. optional epoch rotation;
+ *  4. bind, then PERSIST (`putSession` writes the id, `updateActivity` writes
+ *     `origin_ref_json` — `updateActivity` is UPDATE-only and can never be the
+ *     sole write, or ops.cycle mislabels the row as the chat loopback origin);
+ *  5. re-read the epoch, because the bind itself may have rebound it;
+ *  6. build the preamble and argv, bounded.
+ *
+ * Every failure after the claim clears the lease before throwing.
+ */
+async function attachTerminalSession(
+	connection: Connection,
+	request: RequestFrame,
+	options: GatewayServerOptions,
+	runtime: Runtime,
+): Promise<void> {
+	const raw = request.params;
+	// Strict, and BEFORE any claim: `typeof null === "object"` and an array is
+	// also an object, so a loose check would let malformed input take the lease
+	// and then be silently treated as an empty attach.
+	if (raw !== undefined && (raw === null || typeof raw !== "object" || Array.isArray(raw))) {
+		throw new ProtocolError("invalid_params", "session.attach params must be an object");
+	}
+	const params = raw as SessionAttachParams | undefined;
+	const reset = params?.reset;
+	if (reset !== undefined && typeof reset !== "boolean") {
+		throw new ProtocolError("invalid_params", "session.attach reset must be a boolean");
+	}
+	const argvField = params?.argv;
+	if (argvField !== undefined && (!Array.isArray(argvField) || argvField.some((token) => typeof token !== "string"))) {
+		throw new ProtocolError("invalid_params", "session.attach argv must be an array of strings");
+	}
+	const rawArgv: readonly string[] = argvField ?? [];
+	const holderField = params?.holder;
+	if (holderField !== undefined) {
+		if (holderField === null || typeof holderField !== "object" || Array.isArray(holderField)) {
+			throw new ProtocolError("invalid_params", "session.attach holder must be an object");
+		}
+		if (holderField.pid !== undefined && typeof holderField.pid !== "number") {
+			throw new ProtocolError("invalid_params", "session.attach holder.pid must be a number");
+		}
+		if (holderField.label !== undefined && typeof holderField.label !== "string") {
+			throw new ProtocolError("invalid_params", "session.attach holder.label must be a string");
+		}
+	}
+
+	const origin = TERMINAL_ORIGIN;
+	const key = originKey(origin);
+
+	// 1. Classify BEFORE claiming: a refused invocation must leave the origin free.
+	const classified = classifyGjcWrapperFlags(rawArgv);
+	if (classified.refused.length > 0) {
+		// Unsupported capabilities carry their reason; policy refusals just name the
+		// flag. An operator should never have to guess which kind they hit.
+		const message =
+			classified.unsupported.length > 0
+				? `session.attach refuses ${classified.refused.join(", ")}: ${classified.unsupported.join("; ")}`
+				: `session.attach refuses ${classified.refused.join(", ")}`;
+		throw new ProtocolError("invalid_params", message, {
+			refused: classified.refused,
+			...(classified.unsupported.length > 0 ? { unsupported: classified.unsupported } : {}),
+		});
+	}
+
+	// 2. Check + claim synchronously. No await may appear between these.
+	const existing = runtime.terminalLease;
+	if (existing) {
+		const stillConnected = [...runtime.connections].some((candidate) => candidate.id === existing.connectionId);
+		if (stillConnected) {
+			throw new ProtocolError("session_lease_held", `${existing.holder} holds the terminal gjc lease`, {
+				holder: existing.holder,
+			});
+		}
+		// The recorded connection is gone (a release path we do not own, e.g. an
+		// unhooked teardown). Drop the stale claim rather than stranding the origin.
+		runtime.terminalLease = undefined;
+	}
+	const holder = `pid=${params?.holder?.pid ?? "unknown"} connection=${connection.id}`;
+	runtime.terminalLease = { connectionId: connection.id, holder };
+
+	try {
+		// 3. Optional rotation, with the same semantics as chat `/new`.
+		if (reset === true) {
+			options.database.bumpEpoch(key, JSON.stringify(origin));
+			options.gjc.forgetRebinds(key);
+		}
+
+		// 4. Resolve the cwd BEFORE binding. A native session belongs to the project
+		// it was created in, so the directory must be settled first: the create and
+		// every later resume of this epoch have to agree on it.
+		const workspaceCwd = join(options.config.home, "workspace");
+		const epochBefore = options.database.getSessionRecord(key)?.epoch ?? 0;
+		// The gateway's per-epoch artifact directory. Deliberately NOT passed to the
+		// child as `--session-dir` (`gjc sdk session raw` rejects that flag, so the
+		// bound session lives in gjc's default managed scope and pointing the TUI
+		// elsewhere made it exit with "Session not found"). It holds the epoch's
+		// bound cwd and makes the epoch boundary visible on disk.
+		const sessionDirBefore = join(options.config.home, "sessions", "terminal", `e${epochBefore}`);
+		await mkdir(sessionDirBefore, { recursive: true, mode: 0o700 });
+
+		const requestedCwd =
+			classified.worktreeBranch === undefined
+				? workspaceCwd
+				: await prepareWorktree(
+						workspaceCwd,
+						classified.worktreeBranch === "" ? "gajaeway" : classified.worktreeBranch,
+					);
+
+		// An epoch's session cannot move between projects. Refuse the mismatch with
+		// the remedy named, rather than letting gjc surface it as an interactive
+		// "Fork into current directory?" prompt that would split the session.
+		const boundCwd = await readPointer(sessionDirBefore, "bound-cwd");
+		if (boundCwd !== undefined && boundCwd !== requestedCwd) {
+			throw new ProtocolError(
+				"invalid_params",
+				`this session is bound to ${boundCwd}; pass the matching --worktree or use --new to start a session in ${requestedCwd}`,
+				{ boundCwd, requestedCwd },
+			);
+		}
+
+		// Epoch-scoped native state root. This is what makes the epoch directory the
+		// real session store (AC-11) instead of a bookkeeping folder: gjc writes its
+		// transcript under `<agentDir>/sessions/...`, verified against real gjc. It
+		// also makes daemon/CLI environment divergence structurally impossible,
+		// because the gateway dictates the root for BOTH the create below and the
+		// child, rather than hoping the two agree.
+		//
+		// Reuse the epoch's recorded root when there is one. A bind can REBIND and
+		// bump the epoch underneath us, so the root that the create actually used is
+		// authoritative for the child — deriving it from the post-bind epoch would
+		// point the child at a directory its session was never written to.
+		const agentDir = (await readPointer(sessionDirBefore, "bound-agent-dir")) ?? join(sessionDirBefore, "agent");
+		await mkdir(agentDir, { recursive: true, mode: 0o700 });
+		const nativeStateOverride = { GJC_CODING_AGENT_DIR: agentDir };
+
+		const { sessionId } = await options.gjc.ensureSession(key, epochBefore, {
+			cwd: requestedCwd,
+			codingRegister: true,
+			env: nativeStateOverride,
+		});
+		// The bind is the only await before we write. If this connection lost the
+		// lease while it was in flight (its socket dropped, and a later attach then
+		// bound and persisted its own session), this stale result must NOT be
+		// written: `putSession` would overwrite the newer holder's id and strand it.
+		if (runtime.terminalLease?.connectionId !== connection.id) {
+			throw new ProtocolError("verb_failed", "session.attach lost the terminal lease while binding");
+		}
+		options.database.putSession(key, sessionId);
+		options.database.updateActivity(key, JSON.stringify(origin));
+
+		// 5. Re-read the epoch: the bind may have rebound it.
+		const epoch = options.database.getSessionRecord(key)?.epoch ?? epochBefore;
+		const sessionDir = join(options.config.home, "sessions", "terminal", `e${epoch}`);
+		await mkdir(sessionDir, { recursive: true, mode: 0o700 });
+		// Record the epoch's cwd and its native state root so later attaches at this
+		// epoch resolve exactly what the create used. When a rebind moved us to a new
+		// epoch, this writes the pointer into the NEW epoch directory, so the mapping
+		// from epoch to actual session store stays discoverable instead of implied.
+		await Bun.write(join(sessionDir, "bound-cwd"), `${requestedCwd}\n`);
+		await Bun.write(join(sessionDir, "bound-agent-dir"), `${agentDir}\n`);
+
+		// 6. Preamble: persona + bootstrap SECTION + ActionGuard floor. The bootstrap
+		// is always injected and never marked consumed, which is what keeps its
+		// stable id identical across attaches at the same epoch.
+		const bootstrap = await buildSessionBootstrap({
+			home: options.config.home,
+			origin,
+			epoch,
+			config: runtime.config,
+		});
+		const personaPreamble = [await runtime.persona.systemPreamble(), bootstrap.text, ACTION_GUARD_SYSTEM_NOTICE].join(
+			"\n\n",
+		);
+		const preambleBytes = Buffer.byteLength(personaPreamble, "utf8");
+		if (preambleBytes > ATTACH_PREAMBLE_MAX_BYTES) {
+			throw new ProtocolError(
+				"verb_failed",
+				`attach preamble exceeds ${ATTACH_PREAMBLE_MAX_BYTES} bytes (${preambleBytes})`,
+			);
+		}
+
+		const argv = assembleGjcAttachArgv({
+			sessionId,
+			personaPreamble,
+			forwarded: classified.forwarded,
+			configModel: runtime.config.model,
+		});
+
+		// Captured once so the returned set/unset pair is internally consistent, then
+		// overridden with the epoch-scoped root the create above actually used.
+		const nativeState = nativeStateEnv();
+		const childSet = { ...nativeState.set, ...nativeStateOverride };
+		const childUnset = nativeState.unset.filter((key) => !(key in childSet));
+
+		const result: SessionAttachResult = {
+			sessionId,
+			// The directory the session is actually bound to: the persona workspace,
+			// or the prepared worktree when the operator asked for one.
+			cwd: requestedCwd,
+			epoch,
+			originKey: key,
+			sessionDir,
+			personaPreamble,
+			argv,
+			lease: { holder },
+			// Pin the native state root the DAEMON resolved, TOTALLY: the bound
+			// session only exists in that store, and a selector the operator exports
+			// but the daemon does not must be CLEARED, not merely left alone.
+			childEnv: childSet,
+			childEnvUnset: childUnset,
+		};
+		connection.write({ v: PROFILE_VERSION, type: "response", id: request.id, result });
+	} catch (error) {
+		// Never leave the origin leased after a failed attach.
+		releaseTerminalLease(runtime, connection.id);
+		if (error instanceof ProtocolError) throw error;
+		throw new ProtocolError(
+			"verb_failed",
+			`session.attach failed: ${error instanceof Error ? error.message : String(error)}`,
+		);
+	}
+}
+
 async function sendChat(
 	connection: Connection,
 	request: RequestFrame,
@@ -1104,6 +1487,10 @@ async function sendChat(
 	} catch {
 		throw new ProtocolError("invalid_params", "chat.send requires a valid origin");
 	}
+	// Attach-only BEFORE the `/new` branch: a `chat.send` of `/new` from the
+	// terminal origin would otherwise rotate the epoch that a live TUI is bound
+	// to. Wrapper-owned `--new` on session.attach is the only rotation.
+	assertTerminalOriginAttachOnly(origin);
 	const key = originKey(origin);
 	if (params.text === "/new" || params.text === "/reset") {
 		// Session resets are commands: in group surfaces they obey the mention

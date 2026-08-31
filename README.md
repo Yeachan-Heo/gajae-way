@@ -63,6 +63,16 @@ For how memory, monitors, and the gateway work, see [the documentation](docs/).
 
    Start `dist/gajaeway-telegram` separately when using Telegram.
 
+## Work in your own terminal
+
+`gajaeway gjc` opens the native `gjc` coding TUI as **your persona's session** rather than a standalone one:
+
+```sh
+dist/gajaeway gjc
+```
+
+It resumes the same managed conversation every time, injects your `SOUL.md` / `AGENTS.md` / `USER.md`, and starts `--new` when you want a fresh one. `--model`, `--mpreset`, and `--thinking` are passed through, and `--worktree <branch>` puts you in a managed git worktree with your persona session bound there. Session-selection flags are refused because the gateway owns the binding. A session stays with the directory it was created in, so switching between the workspace and a worktree needs `--new`. The gateway daemon must be running, and only one terminal session may hold it at a time.
+
 ## Make it yours
 
 Put `SOUL.md`, `AGENTS.md`, and `USER.md` in `$GAJAEWAY_HOME/workspace`. They are read for each turn and that workspace is also your persona’s working directory. Keep the home directory private: it contains configuration, the gateway database, your workspace, and memory.
