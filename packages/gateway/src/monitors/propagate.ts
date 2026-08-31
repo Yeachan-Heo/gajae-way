@@ -32,6 +32,7 @@ type DispatchFailureCode =
 	| "authoring_turn_failed"
 	| "authoring_response_invalid"
 	| "delivery_prepare_failed"
+	| "database_closed"
 	| "internal_error";
 
 export interface MonitorDispatchFailure {
@@ -494,13 +495,17 @@ export class MonitorPropagator {
 				this.#deliver?.(payload);
 			}
 		} catch (error) {
-			// Public-safe structured evidence only: a stable phase code and event ids.
-			// The raw error body can carry secrets and is never persisted or logged.
-			const code: DispatchFailureCode = failureCode(error);
+			// Public-safe structured evidence only: a stable phase code, a
+			// secret-free shape summary, and the event ids. The raw error body is
+			// still NEVER persisted or logged — it can carry secrets.
+			const { code, shape } = classifyFailure(error);
+			const detail = `dispatch phase failed (${code}) [${shape}]`;
 			for (const row of leased) {
-				this.#database.monitorEventFencedFail(row.event_id, leaseId, batchId, code, `dispatch phase failed (${code})`);
+				this.#database.monitorEventFencedFail(row.event_id, leaseId, batchId, code, detail);
 			}
-			console.error(`monitor dispatch failed (${code}): events ${claimed.map((row) => row.event_id).join(",")}`);
+			console.error(
+				`monitor dispatch failed (${code}) [${shape}]: batch ${batchId} events ${claimed.map((row) => row.event_id).join(",")}`,
+			);
 		} finally {
 			stopHeartbeat();
 			// Release the leases this attempt holds. Lease-guarded: if this attempt
@@ -558,10 +563,57 @@ export class MonitorPropagator {
 	}
 }
 
+/**
+ * Secret-free structural summary of a thrown value: the error class name plus
+ * the innermost stack frame function names. Deliberately excludes the message
+ * body, file paths, URLs and line numbers — those are the parts that can carry
+ * tokens, private paths or user data. Function identifiers cannot.
+ *
+ * Exists because every dispatch failure previously collapsed to the fixed
+ * string `dispatch phase failed (internal_error)`, which made two hosts with
+ * demonstrably different root causes indistinguishable in `monitor_failures`
+ * (issue #64: 715+ byte-identical rows, only some of which had a cause
+ * recoverable from the daemon log at all).
+ */
+function failureShape(error: unknown): string {
+	if (!(error instanceof Error)) return `${typeof error}:non-error`;
+	const name = sanitizeIdentifier(error.constructor?.name ?? error.name ?? "Error");
+	const frames: string[] = [];
+	for (const line of (error.stack ?? "").split("\n")) {
+		// Bun/V8 frames look like `    at #dispatchBatch (/path/file:1881:37)`.
+		const match = /^\s*at\s+(?:async\s+)?([^\s(]+)/.exec(line);
+		if (!match) continue;
+		const fn = sanitizeIdentifier(match[1] ?? "");
+		// `<anonymous>` and bare paths carry no diagnostic value once the path is
+		// stripped, so they are not worth a frame slot.
+		if (!fn || fn === "anonymous") continue;
+		frames.push(fn);
+		if (frames.length === 3) break;
+	}
+	return frames.length > 0 ? `${name}@${frames.join("<-")}` : name;
+}
+
+/** Keeps identifier-ish characters only, so no path, URL or secret can survive. */
+function sanitizeIdentifier(value: string): string {
+	return value.replace(/[^A-Za-z0-9_#$.]/g, "").slice(0, 48);
+}
+
 function failureCode(error: unknown): DispatchFailureCode {
 	const message = error instanceof Error ? error.message : String(error);
 	if (message.includes("authoring response is not an array")) return "authoring_response_invalid";
 	if (message.includes("sendTurn")) return "authoring_turn_failed";
 	if (message.includes("ensureSession")) return "session_bind_failed";
+	// Observed live and previously indistinguishable from any other internal
+	// error: the dispatch transaction runs against an already-closed handle.
+	if (message.includes("Database has closed") || message.includes("closed database")) return "database_closed";
 	return "internal_error";
+}
+
+/**
+ * Public-safe classification: a stable phase code plus a secret-free shape.
+ * Exported for tests, which assert both the code mapping and the guarantee that
+ * no message body, path or URL leaks into the persisted shape.
+ */
+export function classifyFailure(error: unknown): { code: DispatchFailureCode; shape: string } {
+	return { code: failureCode(error), shape: failureShape(error) };
 }
