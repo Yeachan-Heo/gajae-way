@@ -45,11 +45,26 @@ export type InterimSuppressionReason =
 	/** Turn already spent its mid-work budget. */
 	| "turn-cap"
 	/** Too soon after the previous mid-work message. */
-	| "rate";
+	| "rate"
+	/**
+	 * Emitted before the turn ran a single tool. A message at that point cannot
+	 * contain a finding - nothing has been looked at yet - so it is by
+	 * construction the model thinking out loud. This is the language-independent
+	 * rule: the content regexes below only ever caught the polite Korean intent
+	 * endings, so plain declarative narration ("...판단한다", "...찍고 한 방만 친다")
+	 * shipped to the channel unchanged (measured 2026-08-31 in #playground-ko).
+	 */
+	| "pre-tool";
 
 export type InterimSpeechDecision =
 	| { readonly deliver: true }
 	| { readonly deliver: false; readonly reason: InterimSuppressionReason };
+
+/** What the turn has done so far, at the moment this message was streamed. */
+export interface InterimSpeechContext {
+	/** Tool executions started in this turn before this message. */
+	readonly toolCallsSoFar?: number;
+}
 
 /**
  * Sentence split that works for both languages present in this product.
@@ -87,6 +102,14 @@ function sentences(text: string): string[] {
 // 볼/봐/본 are separate syllables from the 보 stem, so the inflected forms are listed.
 const KOREAN_INSPECTION = /(보|볼|봐|본|확인|조회|검색|읽|살펴|점검|찾아|뒤져|훑어|파악)/;
 const KOREAN_INTENT_ENDING = /(게요|게용|겠습니다|겠어요|겠네요|려고요|려구요|볼까|중이|중입니다|고 있|부터요)/;
+/**
+ * Plain declarative (반말) narration: "판단한다", "먼저 찍는다", "막는다". Present-tense
+ * only - a past form ("확인했다", "봤다") is a report of something already found and
+ * must survive. Kept separate from the polite endings above because those were the
+ * only shapes the original rule covered.
+ */
+const KOREAN_PLAIN_INTENT = /(한다|본다|는다|간다|긴다|친다|린다|잡는다|막는다|넣는다)$/;
+const KOREAN_PAST = /(았|었|했|봤|왔|졌)다/;
 const ENGLISH_INSPECTION =
 	/\b(check(ing)?|look(ing)?|read(ing)?|inspect(ing)?|review(ing)?|scan(ning)?|search(ing)?|quer(y|ying)|grep(ping)?|open(ing)?|examin(e|ing)|dig(ging)?|pull(ing)? up|verify(ing)?)\b/i;
 const ENGLISH_INTENT =
@@ -102,6 +125,8 @@ const ENGLISH_PROGRESSIVE_VERDICT =
 
 function isProceduralSentence(sentence: string): boolean {
 	if (KOREAN_INSPECTION.test(sentence) && KOREAN_INTENT_ENDING.test(sentence)) return true;
+	if (KOREAN_INSPECTION.test(sentence) && KOREAN_PLAIN_INTENT.test(sentence) && !KOREAN_PAST.test(sentence))
+		return true;
 	if (ENGLISH_PROGRESSIVE.test(sentence)) return !ENGLISH_PROGRESSIVE_VERDICT.test(sentence);
 	return ENGLISH_INTENT.test(sentence) && ENGLISH_INSPECTION.test(sentence);
 }
@@ -173,9 +198,12 @@ export class InterimSpeechGate {
 	 * Only call this for MID-WORK messages: the final answer is delivered by the
 	 * caller unconditionally and must never pass through here.
 	 */
-	admit(text: string, nowMs: number): InterimSpeechDecision {
+	admit(text: string, nowMs: number, context?: InterimSpeechContext): InterimSpeechDecision {
 		const trimmed = text.trim();
 		if (!trimmed) return { deliver: false, reason: "empty" };
+		// Structural gate first: cheaper than the regexes and it does not care what
+		// language or register the narration used.
+		if (context?.toolCallsSoFar === 0) return { deliver: false, reason: "pre-tool" };
 		// Content before rate: a suppressed narration line must not consume the
 		// turn's budget, otherwise four narration steps would starve one real
 		// finding arriving later in the same turn.

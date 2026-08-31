@@ -1599,13 +1599,13 @@ async function runInboundTurn(
 		const preamble = await preambleForEpoch(boundEpoch);
 		const result = await options.gjc.sendTurn(sessionId, turnText, preamble, emitProgress, {
 			systemPreambleForEpoch: preambleForEpoch,
-			onAssistantText: (message) => {
+			onAssistantText: (message, toolCallsSoFar) => {
 				try {
 					// Mid-work speech only (issue #71). The runtime's LAST streamed message
 					// is also the final answer, and it is gated here like any other: when
 					// the gate suppresses it, the post-turn delivery below ships it, so an
 					// answer can be delayed by the gate but never lost.
-					const decision = interimSpeech.admit(message, Date.now());
+					const decision = interimSpeech.admit(message, Date.now(), { toolCallsSoFar });
 					if (!decision.deliver) {
 						console.error(`gateway mid-work speech suppressed (${turnId}, ${decision.reason}).`);
 						return;
