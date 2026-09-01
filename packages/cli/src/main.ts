@@ -1,8 +1,17 @@
 import { copyFile, stat } from "node:fs/promises";
 import { isAbsolute, join } from "node:path";
-import type { OpsCycleResult } from "@gajaeway/protocol";
+import type { MonitorRecord, OpsCycleResult } from "@gajaeway/protocol";
 import { LOOPBACK_ORIGIN, originKey } from "@gajaeway/protocol";
 import { GajaewayClient } from "@gajaeway/sdk";
+import {
+	columnNames,
+	type ListOptions,
+	MONITOR_COLUMNS,
+	parseListOptions,
+	renderList,
+	SESSION_COLUMNS,
+	type SessionListRow,
+} from "./list";
 
 export function socketPath(home = process.env.GAJAEWAY_HOME): string {
 	return `${home ?? `${process.env.HOME ?? "~"}/.gajaeway`}/gateway.sock`;
@@ -20,24 +29,6 @@ export function parseArgs(args: string[]): { command?: string; rest: string[]; s
 
 function gatewayHome(): string {
 	return process.env.GAJAEWAY_HOME ?? `${process.env.HOME ?? "~"}/.gajaeway`;
-}
-
-function printSessions(
-	sessions: Array<{
-		origin: Parameters<typeof originKey>[0];
-		epoch: number;
-		createdAt: string;
-		lastActivityAt: string | null;
-		bootstrap: { readonly pending: boolean; readonly byteCount: number; readonly truncated: boolean };
-	}>,
-): void {
-	console.log(
-		"INDEX  ORIGIN                                      EPOCH  BOOTSTRAP        CREATED AT                 LAST ACTIVITY AT",
-	);
-	for (const [index, session] of sessions.entries())
-		console.log(
-			`${String(index).padEnd(6)} ${originKey(session.origin).padEnd(43)} ${String(session.epoch).padEnd(6)} ${(session.bootstrap.pending ? "pending" : `${session.bootstrap.byteCount}B${session.bootstrap.truncated ? "/trunc" : ""}`).padEnd(16)} ${session.createdAt.padEnd(26)} ${session.lastActivityAt ?? "-"}`,
-		);
 }
 
 /**
@@ -206,7 +197,11 @@ export async function main(args = process.argv.slice(2)): Promise<void> {
 					console.log("Launch the gateway out-of-band with: bun packages/gateway/src/main.ts daemon");
 				else throw new Error("usage: gajaeway daemon run");
 				break;
+			// Flag validation happens before the socket connect so a bad
+			// `--fields`/`--limit` fails fast without a running gateway.
 			case "sessions": {
+				const listOptions =
+					parsed.rest[0] === "list" ? parseListOptions(parsed.rest.slice(1), SESSION_COLUMNS) : undefined;
 				const client = await GajaewayClient.connectSocket(parsed.socket);
 				try {
 					const result = await client.request<{
@@ -228,9 +223,12 @@ export async function main(args = process.argv.slice(2)): Promise<void> {
 					}>("session.list");
 					const [command, selector] = parsed.rest;
 					if (command === "list") {
-						if (selector === "--json") console.log(JSON.stringify(result));
-						else if (!selector) printSessions(result.sessions);
-						else throw new Error("usage: gajaeway sessions list [--json]");
+						const options = listOptions as ListOptions;
+						for (const line of renderList(SESSION_COLUMNS, result.sessions satisfies SessionListRow[], options, {
+							key: "sessions",
+							result,
+						}))
+							console.log(line);
 					} else if (command === "inspect" && selector) {
 						const index = Number(selector);
 						const session = Number.isInteger(index)
@@ -248,7 +246,10 @@ export async function main(args = process.argv.slice(2)): Promise<void> {
 						console.log(`bootstrapBytes: ${session.bootstrap.byteCount}`);
 						console.log(`bootstrapTruncated: ${session.bootstrap.truncated}`);
 						console.log(`bootstrapDiagnostics: ${session.bootstrap.diagnostics.join(", ") || "-"}`);
-					} else throw new Error("usage: gajaeway sessions list [--json]|inspect <originKey-or-index>");
+					} else
+						throw new Error(
+							`usage: gajaeway sessions list [--json] [--fields ${columnNames(SESSION_COLUMNS).join(",")}] [--limit N] [--offset N]|inspect <originKey-or-index>`,
+						);
 				} finally {
 					await client.close();
 				}
@@ -298,13 +299,22 @@ export async function main(args = process.argv.slice(2)): Promise<void> {
 				break;
 			}
 			case "monitors": {
+				const listOptions =
+					parsed.rest[0] === "list" ? parseListOptions(parsed.rest.slice(1), MONITOR_COLUMNS) : undefined;
 				const client = await GajaewayClient.connectSocket(parsed.socket);
 				try {
 					const [command, ...args] = parsed.rest;
 					if (command === "add" && args[0] === "--json" && args[1])
 						console.log(JSON.stringify(await client.request("monitor.add", JSON.parse(args[1]))));
-					else if (command === "list") console.log(JSON.stringify(await client.request("monitor.list")));
-					else if (command === "inspect" && args[0])
+					else if (command === "list") {
+						const options = listOptions as ListOptions;
+						const result = await client.request<{ monitors: MonitorRecord[] }>("monitor.list");
+						for (const line of renderList(MONITOR_COLUMNS, result.monitors, options, {
+							key: "monitors",
+							result,
+						}))
+							console.log(line);
+					} else if (command === "inspect" && args[0])
 						console.log(JSON.stringify(await client.request("monitor.inspect", { monitorId: args[0] })));
 					else if (command === "remove" && args[0])
 						console.log(JSON.stringify(await client.request("monitor.remove", { monitorId: args[0] })));
@@ -326,7 +336,7 @@ export async function main(args = process.argv.slice(2)): Promise<void> {
 						);
 					} else
 						throw new Error(
-							"usage: gajaeway monitors add --json '<MonitorSpec json>'|list|inspect <id>|remove <id>|test <id> [--type T] [--payload J]",
+							`usage: gajaeway monitors add --json '<MonitorSpec json>'|list [--json] [--fields ${columnNames(MONITOR_COLUMNS).join(",")}] [--limit N] [--offset N]|inspect <id>|remove <id>|test <id> [--type T] [--payload J]`,
 						);
 				} finally {
 					await client.close();
@@ -372,7 +382,7 @@ export async function main(args = process.argv.slice(2)): Promise<void> {
 			}
 			default:
 				throw new Error(
-					"usage: gajaeway [--socket PATH] status|shutdown|chat|daemon run|sessions list [--json]|sessions inspect <originKey-or-index>|memory audit|memory search <query>|monitors ...|work run <name> [--cwd DIR] <text>|ops backup <path>|ops cycle [--json]|ops integrity|ops restore <backupPath>",
+					"usage: gajaeway [--socket PATH] status|shutdown|chat|daemon run|sessions list [--json] [--fields a,b,c] [--limit N] [--offset N]|sessions inspect <originKey-or-index>|memory audit|memory search <query>|monitors ...|work run <name> [--cwd DIR] <text>|ops backup <path>|ops cycle [--json]|ops integrity|ops restore <backupPath>",
 				);
 		}
 	} catch (error) {

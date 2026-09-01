@@ -3,13 +3,37 @@ import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { OpsCycleResult } from "@gajaeway/protocol";
-import { cycleExitCode, parseArgs, renderCycle, restoreDatabase, socketPath } from "../src/main";
+import { cycleExitCode, main, parseArgs, renderCycle, restoreDatabase, socketPath } from "../src/main";
 
 describe("cli arguments", () => {
 	test("resolves home and socket override", () => {
 		expect(socketPath("/tmp/gajae")).toBe("/tmp/gajae/gateway.sock");
 		expect(parseArgs(["--socket", "/tmp/x", "status"])).toEqual({ command: "status", rest: [], socket: "/tmp/x" });
 	});
+});
+
+describe("list flag validation", () => {
+	// A bad column name must not require a reachable gateway to be reported.
+	const cases = [
+		["monitors", "list", "--fields", "bogus"],
+		["sessions", "list", "--fields", "bogus"],
+		["monitors", "list", "--limit", "nope"],
+	];
+	for (const args of cases)
+		test(`${args.join(" ")} fails before connecting`, async () => {
+			const errors: string[] = [];
+			const original = console.error;
+			console.error = (line: string) => errors.push(line);
+			const previousExit = process.exitCode ?? 0;
+			try {
+				await main(["--socket", "/nonexistent/gajaeway-list-test.sock", ...args]);
+			} finally {
+				console.error = original;
+				process.exitCode = previousExit;
+			}
+			expect(errors).toHaveLength(1);
+			expect(errors[0]).toMatch(/^(unknown field\(s\): bogus \(valid: |--limit expects a non-negative integer)/);
+		});
 });
 
 test("offline restore preserves the current database then copies a header-validated backup", async () => {
