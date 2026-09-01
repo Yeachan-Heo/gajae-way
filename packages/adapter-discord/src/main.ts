@@ -906,7 +906,19 @@ export class ReconnectingGateway {
 			this.#recovering = false;
 			if (completed) this.#retryAttempt = 0;
 			else this.scheduleRecoveryRetry();
+			// A resolved pass means its progress is on disk. Persists stay
+			// fire-and-forget during the pass so one slow write cannot stall the
+			// backfill, but a caller that awaits the pass and then crashes must not
+			// lose the watermark it was told about — and a reader that awaits it must
+			// not observe the previous cursor. In the finally, so an early return and a
+			// failed pass flush what they already queued.
+			await this.cursorsFlushed;
 		}
+	}
+
+	/** Resolves once every cursor write queued so far has hit the cursor store. */
+	get cursorsFlushed(): Promise<void> {
+		return this.#cursorSaves;
 	}
 
 	/** Last recovery cursor load error, or undefined while persistence is healthy. */

@@ -405,7 +405,11 @@ function wiredGateway(
 	);
 }
 
-/** Lets the fire-and-forget cursor persist chain settle. */
+/**
+ * Lets a fire-and-forget persist chain finish. A resolved recovery pass has
+ * already flushed its own writes, so this only covers the live-send path, whose
+ * persists are not tied to a pass a caller can await.
+ */
 function settle(ms = 10): Promise<void> {
 	return new Promise((resolve) => setTimeout(resolve, ms));
 }
@@ -882,10 +886,11 @@ test("cross-pass accounting discards a message that alternates terminal and tran
 	await gateway.recoverMissedMessages();
 	expect(gateway.deadLetters).toEqual([]);
 	expect(gateway.deadLetters).toHaveLength(0);
-	// Later passes keep accumulating the terminal half of the alternation.
+	// Later passes keep accumulating the terminal half of the alternation. No sleep
+	// between the pass and the read: an awaited pass has already flushed its cursor,
+	// and a 10ms guess raced the write on a loaded runner.
 	await gateway.recoverMissedMessages();
 	await gateway.recoverMissedMessages();
-	await settle();
 	expect(gateway.deadLetters).toHaveLength(1);
 	expect(gateway.deadLetters[0].messageId).toBe(flaky.id);
 	expect(gateway.deadLetters[0].attempts).toBeGreaterThanOrEqual(RECOVERY_MAX_ATTEMPTS);
