@@ -38,6 +38,7 @@ import {
 } from "@gajaeway/subsession";
 import { type ConfigOverrides, type GatewayConfig, type ReloadResult, reloadConfig } from "../config";
 import { DeliveryService } from "../delivery/delivery";
+import { stripLeakedPreamble } from "../delivery/leaked-preamble";
 import { ReactionBudget } from "../delivery/reaction-budget";
 import { decideEngagement } from "../engagement/policy";
 import { ACTION_GUARD_SYSTEM_NOTICE } from "../guard/action-guard";
@@ -1545,7 +1546,10 @@ async function runInboundTurn(
 	const deliverAssistantText = (rawMessage: string) => {
 		if (!nonLoopback) return;
 		lastDeliveredRaw = rawMessage;
-		let message = rawMessage;
+		// A leaked reasoning line before the control token ("찐빠") is stripped
+		// first: every parser below anchors its token at the start, so narration
+		// in front of it both kills the directive and ships the aside to the room.
+		let message = stripLeakedPreamble(rawMessage);
 		// Reaction reply mode (third mode next to text and silence, parsed per delivered
 		// assistant message so streamed intermediates carry it too): a message may open
 		// with [REACT:<emoji-or-name>] tokens, optionally targeting one message with
@@ -1602,9 +1606,10 @@ async function runInboundTurn(
 			if (planned.length >= maxTurnParts) break;
 			// Reply-threading: a part may open with [REPLY:<platform message id>] to
 			// answer a specific message; mentions are plain <@author id> in the text.
-			const replyMatch = part.match(/^\[REPLY:([^\]\s]+)\]\s*/);
-			const body = replyMatch ? part.slice(replyMatch[0].length).trim() : part;
-			if (!body) continue;
+			const cleaned = stripLeakedPreamble(part);
+			const replyMatch = cleaned.match(/^\[REPLY:([^\]\s]+)\]\s*/);
+			const body = replyMatch ? cleaned.slice(replyMatch[0].length).trim() : cleaned;
+			if (!body || isSilenceToken(body)) continue;
 			planned.push({ body, ...(replyMatch?.[1] ? { replyTo: replyMatch[1] } : {}) });
 		}
 		// A spoken turn is answered in both modalities, and the whole reply is spoken
@@ -1789,7 +1794,7 @@ async function runInboundTurn(
 	// speak. The observation is already recorded above, so nothing is delivered and no daily
 	// capture is written. This is what makes an `open` channel usable: the persona can read
 	// every message in the room without answering all of them.
-	if (deliveredParts.length === 0 && isSilenceToken(text)) return;
+	if (deliveredParts.length === 0 && isSilenceToken(stripLeakedPreamble(text))) return;
 	if (!nonLoopback) {
 		connection.write({
 			v: PROFILE_VERSION,

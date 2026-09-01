@@ -9,6 +9,7 @@ import {
 	originKey,
 } from "@gajaeway/protocol";
 import type { DeliveryService } from "../delivery/delivery";
+import { stripLeakedPreamble } from "../delivery/leaked-preamble";
 import type { MemoryClosureQueue } from "../memory/closure";
 import type { GjcPort } from "../orchestrator/gjc-client";
 import type { GatewayDatabase } from "../store/db";
@@ -600,7 +601,9 @@ export class MonitorPropagator {
 				)
 				.map((entry) => entry.note)
 				.join("\n");
-			if (!isSilenceToken(deliveryText)) {
+			// A note that narrates before its silence token is still a silence
+			// request, not a message for the room (see stripLeakedPreamble).
+			if (!isSilenceToken(stripLeakedPreamble(deliveryText))) {
 				const origin = target.origin;
 				const payload: ChatMessagePayload = {
 					turnId: batchId,
