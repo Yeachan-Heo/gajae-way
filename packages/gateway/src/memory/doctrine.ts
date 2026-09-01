@@ -255,9 +255,16 @@ export async function regenerateMap(root: string, registry?: AxisRegistry): Prom
 	await rename(staging, target);
 }
 
-/** The root the capture axis is registered at; `daily/` unless a deployment moved it. */
+/**
+ * The root the capture axis is registered at; `daily/` unless a deployment
+ * re-rooted it. The registry always carries the axis, because a declaration can
+ * only add or override one, so its absence is a corrupt registry rather than a
+ * corpus that opted out of capture.
+ */
 export async function captureRoot(root: string, registry?: AxisRegistry): Promise<string> {
-	return (registry ?? (await loadRegistry(root))).byId("daily")?.root ?? "daily";
+	const axis = (registry ?? (await loadRegistry(root))).byId("daily");
+	if (!axis) throw new Error("memory registry carries no daily capture axis");
+	return axis.root;
 }
 
 export async function appendDaily(
