@@ -1,3 +1,4 @@
+import { join } from "node:path";
 import type {
 	ChatMessagePayload,
 	ChatProgressPayload,
@@ -9,7 +10,12 @@ import { GajaewayClient } from "@gajaeway/sdk";
 import { AttachmentBuilder, Client, GatewayIntentBits, MessageFlags, Partials } from "discord.js";
 import { type AttachmentCarrier, describeInboundBody, firstVoiceMessage } from "./attachments";
 import { type AuthorLike, resolveDisplayName } from "./author";
-import { type LoadedDiscordAdapterConfig, type LoadedDiscordVoiceConfig, loadDiscordAdapterConfig } from "./config";
+import {
+	adapterHome,
+	type LoadedDiscordAdapterConfig,
+	type LoadedDiscordVoiceConfig,
+	loadDiscordAdapterConfig,
+} from "./config";
 import { type DiscordMessageOriginShape, discordMessageOrigin } from "./origin";
 import {
 	type DiscordInboundReaction,
@@ -19,6 +25,30 @@ import {
 	ReactionRateLimiter,
 	settleDiscordReaction,
 } from "./reactions";
+import {
+	classifyRecoveryFailure,
+	clearAttempt,
+	recoveryCursorPath as defaultRecoveryCursorPath,
+	loadRecoveryCursors,
+	RECOVERY_ATTEMPT_BACKOFF_MS,
+	RECOVERY_MAX_ATTEMPTS,
+	RECOVERY_MAX_PAGES,
+	RECOVERY_RETRY_BASE_MS,
+	RECOVERY_RETRY_MAX_MS,
+	type RecoverableChannel,
+	type RecoveryCursorState,
+	type RecoveryDeadLetter,
+	type RecoveryDeadLetterDigest,
+	type RecoveryFailureClass,
+	RecoveryGate,
+	recordAttempt,
+	recordDeadLetter,
+	recoverConversation,
+	retainRecoveryCursors,
+	saveRecoveryCursors,
+	snowflakeIsAfter,
+	summarizeRecoveryFailure,
+} from "./recovery";
 import { type ReplyMessageLike, resolveReplyContext } from "./reply";
 import { type SpeechConfig, type SpeechPorts, synthesizeVoice } from "./speech";
 import {
@@ -626,6 +656,10 @@ export async function startDiscordAdapter(config: LoadedDiscordAdapterConfig): P
 		config,
 		typing,
 		status,
+		join(adapterHome(), "adapters", "discord", "recovery-cursor.json"),
+		() => discord.user,
+		undefined,
+		undefined,
 		discordSpeechPorts(config.voice),
 	);
 	// Transcription makes ingress asynchronous, and two messages in one
@@ -685,6 +719,7 @@ export async function startDiscordAdapter(config: LoadedDiscordAdapterConfig): P
 					`Discord slash-command registration failed: ${error instanceof Error ? error.message : String(error)}`,
 				),
 			);
+		void gateway.recoverMissedMessages();
 	});
 	console.log("Discord adapter starting.");
 	await gateway.connect();
@@ -749,13 +784,25 @@ export async function handleSlashCommand(
 	}
 }
 
-class ReconnectingGateway {
+/** Outcome of one recovery send; every failure carries its classification. */
+export type RecoveredSendResult =
+	| { readonly verdict: "acked" | "duplicate" }
+	| { readonly verdict: "unavailable"; readonly failure: RecoveryFailureClass; readonly summary: string };
+
+export class ReconnectingGateway {
 	#client: GajaewayClient | undefined;
 	#reconnecting = false;
 	#attempt = 0;
 	#deliveryOff: (() => void) | undefined;
 	#progressOff: (() => void) | undefined;
-	readonly #inbound = new LruSet();
+	readonly #inbound = new RecoveryGate();
+	#cursors: RecoveryCursorState | undefined;
+	#cursorLoads: Promise<void> | undefined;
+	#cursorFault: string | undefined;
+	#cursorSaves: Promise<void> = Promise.resolve();
+	#recovering = false;
+	#retryTimer: ReturnType<typeof setTimeout> | undefined;
+	#retryAttempt = 0;
 
 	constructor(
 		readonly socketPath: string,
@@ -763,8 +810,16 @@ class ReconnectingGateway {
 		readonly config: LoadedDiscordAdapterConfig,
 		readonly typing?: TypingPort,
 		readonly status?: WorkingStatus,
+		readonly recoveryCursorPath: string = defaultRecoveryCursorPath(),
+		readonly getBotUser: () => unknown = () => undefined,
+		initialClient?: GajaewayClient,
+		/** Injectable only so tests do not pay real recovery backoff. */
+		readonly sleep: (ms: number) => Promise<void> = (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
 		readonly speech?: DiscordSpeechPorts,
-	) {}
+	) {
+		this.#client = initialClient;
+		void this.ensureCursors();
+	}
 
 	async connect(): Promise<void> {
 		try {
@@ -784,9 +839,319 @@ class ReconnectingGateway {
 			this.#progressOff = this.status ? subscribeDiscordProgress(client, this.status) : undefined;
 			console.log("Discord adapter connected to gateway.");
 			this.monitor(client);
+			void this.recoverMissedMessages();
 		} catch {
 			this.scheduleReconnect();
 		}
+	}
+
+	/**
+	 * Bounded catch-up for messages missed while the adapter or its gateway link was
+	 * offline (issue #33). Runs after Discord ready and after every gateway reconnect;
+	 * safe alongside live traffic because the gateway durably dedupes on message id.
+	 */
+	async recoverMissedMessages(): Promise<void> {
+		const channelIds = Object.keys(this.config.channels ?? {});
+		// Nothing configured means nothing to recover, ever: that is the one early return
+		// that must not reschedule.
+		if (channelIds.length === 0) return;
+		if (this.#recovering) {
+			// A pass is already running and owns the follow-up decision for its own outcome;
+			// this caller still gets a retry so its trigger is not silently dropped.
+			this.scheduleRecoveryRetry();
+			return;
+		}
+		const botUser = this.getBotUser();
+		if (!this.#client || !botUser) {
+			// A fired retry that cannot proceed (no gateway link yet, Discord not ready) must
+			// reschedule itself, otherwise the gap waits for a reconnect that may never come.
+			this.scheduleRecoveryRetry();
+			return;
+		}
+		this.#recovering = true;
+		// A pass counts as complete only when every channel finished cleanly. Anything else —
+		// an unusable cursor store, a channel that reported an open gap, an unexpected throw —
+		// arms the backoff retry. No path may reset the backoff without one of the two.
+		let completed = false;
+		try {
+			await this.ensureCursors();
+			if (!this.#cursors) {
+				// Fail closed: without a readable watermark a backfill cannot record progress,
+				// so it would replay the same bootstrap window forever and never close the gap.
+				console.error(
+					`Discord recovery refused: cursor store ${this.recoveryCursorPath} is unusable (${this.#cursorFault ?? "unknown error"}); retrying with backoff.`,
+				);
+				return;
+			}
+			let incomplete = false;
+			for (const channelId of channelIds) {
+				try {
+					if (await this.recoverChannel(channelId, botUser)) incomplete = true;
+				} catch (error) {
+					// One channel's failure must never abort the pass or the channels behind it.
+					console.error(
+						`Discord recovery aborted for channel ${channelId}: ${error instanceof Error ? error.message : String(error)}`,
+					);
+					incomplete = true;
+				}
+			}
+			completed = !incomplete;
+		} catch (error) {
+			console.error(
+				`Discord recovery pass failed: ${error instanceof Error ? error.message : String(error)}; retrying with backoff.`,
+			);
+		} finally {
+			this.#recovering = false;
+			if (completed) this.#retryAttempt = 0;
+			else this.scheduleRecoveryRetry();
+		}
+	}
+
+	/** Last recovery cursor load error, or undefined while persistence is healthy. */
+	get cursorFault(): string | undefined {
+		return this.#cursorFault;
+	}
+
+	/** Durable discard log, newest last; bounded by RECOVERY_DEAD_LETTER_CAP. */
+	get deadLetters(): readonly RecoveryDeadLetter[] {
+		return this.#cursors?.deadLetters ?? [];
+	}
+
+	/** Per-conversation discard aggregates; survive dead-letter eviction. */
+	get deadLetterDigest(): Readonly<Record<string, RecoveryDeadLetterDigest>> {
+		return this.#cursors?.deadLetterDigest ?? {};
+	}
+
+	/** True while a backoff retry of the recovery pass is armed. */
+	get recoveryRetryPending(): boolean {
+		return this.#retryTimer !== undefined;
+	}
+
+	/** True when the gap for this channel is still open and a retry is scheduled. */
+	private async recoverChannel(channelId: string, botUser: unknown): Promise<boolean> {
+		let fetched: unknown;
+		try {
+			fetched = await this.discord.channels.fetch(channelId);
+		} catch (error) {
+			console.error(
+				`Discord recovery could not fetch channel ${channelId}: ${error instanceof Error ? error.message : String(error)}; cursor unchanged, retrying with backoff.`,
+			);
+			return true;
+		}
+		if (!isRecoverableChannel(fetched)) {
+			// Deleted channel, revoked permission, or a non-text channel id in config: the gap
+			// for this channel is unknown, not empty. Never treat that as a clean pass — leave
+			// the cursor where it is and let the retry (and the operator) see it.
+			console.error(
+				`Discord recovery has no readable history for channel ${channelId} (deleted, no access, or not a text channel); cursor unchanged, retrying with backoff.`,
+			);
+			return true;
+		}
+		const cursors = this.#cursors;
+		// A quarantined watermark (channel previously dropped from config) counts: resuming
+		// from it beats replaying the whole bootstrap window on re-add.
+		const before = cursors?.recoveredThrough[channelId] ?? cursors?.quarantined[channelId]?.watermark;
+		const outcome = await recoverConversation(fetched, {
+			cursor: before,
+			nowMs: Date.now(),
+			deliver: async (message) => {
+				// Same normalization as live messageCreate: one decision, one origin shape,
+				// one gateway verb — recovery never forks engagement semantics.
+				const engagement = decideInbound(message, botUser, this.config.channels);
+				if (!engagement) return "skip";
+				const origin = discordMessageOrigin(message);
+				let failure: RecoveryFailureClass = "write-path-unknown";
+				let summary = "unclassified chat.send failure";
+				for (let attempt = 1; attempt <= RECOVERY_MAX_ATTEMPTS; attempt++) {
+					const result = await this.requestRecovered(message.id, origin, message.content, engagement);
+					if (result.verdict !== "unavailable") {
+						this.forgetAttempts(message.id);
+						return result.verdict;
+					}
+					failure = result.failure;
+					summary = result.summary;
+					// Cross-pass accounting: a message alternating terminal and transient
+					// failures still converges on its budget instead of blocking its channel.
+					this.noteAttempt(message.id, channelId, failure, summary);
+					if (attempt < RECOVERY_MAX_ATTEMPTS) await this.sleep(RECOVERY_ATTEMPT_BACKOFF_MS * 2 ** (attempt - 1));
+				}
+				this.flushCursors();
+				const terminalAttempts = this.#cursors?.attempts[message.id]?.terminalAttempts ?? 0;
+				// Out of per-pass budget. A discard is only *proposed* here, and only with
+				// per-payload evidence (terminal classification) sustained across passes.
+				// recoverConversation still refuses to commit it until a later message lands,
+				// so a contract regression that fails every message discards nothing.
+				if (failure === "terminal-message" && terminalAttempts >= RECOVERY_MAX_ATTEMPTS) {
+					console.error(
+						`Discord recovery proposes discarding message ${message.id} in channel ${channelId} after ${terminalAttempts} terminal chat.send rejections (${summary}); held until a later message proves the write path works.`,
+					);
+					return "discard-candidate";
+				}
+				console.error(
+					`Discord recovery holding message ${message.id} in channel ${channelId} after ${RECOVERY_MAX_ATTEMPTS} failed chat.send attempts (${failure}: ${summary}); cursor stays behind it and the pass retries with backoff.`,
+				);
+				return "unavailable";
+			},
+			onDiscard: (message) => {
+				const ledger = this.#cursors?.attempts[message.id];
+				console.error(
+					`Discord recovery is DISCARDING message ${message.id} in channel ${channelId} after ${ledger?.terminalAttempts ?? RECOVERY_MAX_ATTEMPTS} terminal chat.send rejections (${ledger?.summary ?? "terminal rejection"}). Dead-lettered; the rest of the backfill continues.`,
+				);
+				this.deadLetter({
+					messageId: message.id,
+					conversationId: channelId,
+					classification: "terminal-message",
+					attempts: ledger?.terminalAttempts ?? RECOVERY_MAX_ATTEMPTS,
+					at: new Date().toISOString(),
+					summary: ledger?.summary ?? "terminal rejection",
+				});
+				this.forgetAttempts(message.id);
+			},
+		});
+		// Durable progress is everything the run walked past — acked sends, known duplicates
+		// and committed discards alike. Anything narrower strands the gap behind a page bound
+		// full of skipped messages.
+		//
+		// NIT (accepted): this runs once per pass, so a crash mid-pass loses the in-pass
+		// window and the next pass re-sends it. Exactly-once there rests on the gateway's
+		// durable message-id dedupe (inbound_messages/conversation_context), not on this
+		// watermark; per-message persistence would cost one fsync per replayed message. The
+		// dead-letter record is written before the cursor moves and is idempotent per message
+		// id, so the replay cannot double-count a discard.
+		this.advanceRecovered(channelId, outcome.advancedTo);
+		if (outcome.fetchError) {
+			console.error(
+				`Discord recovery could not read history for channel ${channelId}: ${outcome.fetchError}; other channels continue, retrying with backoff.`,
+			);
+			return true;
+		}
+		if (outcome.failed) {
+			const reason =
+				outcome.held > 0
+					? `${outcome.held} message(s) failed the same way with nothing succeeding in between — treating it as a gateway write-path problem, discarding nothing`
+					: "gateway unavailable";
+			console.error(
+				`Discord recovery paused for channel ${channelId} at message ${outcome.advancedTo}; ${reason}, retrying with backoff.`,
+			);
+			return true;
+		}
+		if (outcome.truncated) {
+			const progress =
+				before !== undefined && outcome.advancedTo === before
+					? `cursor unchanged at ${before}`
+					: `cursor advanced to ${outcome.advancedTo}`;
+			console.error(
+				`Discord recovery hit the ${RECOVERY_MAX_PAGES}-page bound for channel ${channelId} after ${outcome.delivered} message(s) and ${outcome.skipped} skip(s); ${progress}.`,
+			);
+			return true;
+		}
+		if (outcome.delivered > 0 || outcome.skipped > 0 || outcome.discarded > 0) {
+			console.log(
+				`Discord recovery backfilled ${outcome.delivered} message(s), skipped ${outcome.skipped} and discarded ${outcome.discarded} for channel ${channelId}.`,
+			);
+		}
+		return false;
+	}
+
+	/** Re-runs recovery after a backoff so a paused or truncated gap keeps draining. */
+	private scheduleRecoveryRetry(): void {
+		if (this.#retryTimer) return;
+		const delay = Math.min(RECOVERY_RETRY_MAX_MS, RECOVERY_RETRY_BASE_MS * 2 ** Math.min(this.#retryAttempt++, 6));
+		console.log(`Discord recovery retrying in ${delay}ms.`);
+		const timer = setTimeout(() => {
+			this.#retryTimer = undefined;
+			void this.recoverMissedMessages();
+		}, delay);
+		timer.unref?.();
+		this.#retryTimer = timer;
+	}
+
+	/**
+	 * Durably records a discarded message before the cursor moves past it. Console lines are
+	 * lost on restart; this record is what makes a discard auditable and replayable by hand.
+	 */
+	private deadLetter(entry: RecoveryDeadLetter): void {
+		const current = this.#cursors;
+		if (!current) return;
+		this.persist(recordDeadLetter(current, entry));
+	}
+
+	/**
+	 * Stages one failed attempt in the cross-pass ledger. Staged, not persisted: the retry
+	 * loop calls this up to RECOVERY_MAX_ATTEMPTS times per message and `flushCursors` writes
+	 * the accumulated result once, so a blocked message costs one save instead of three.
+	 */
+	private noteAttempt(
+		messageId: string,
+		conversationId: string,
+		classification: RecoveryFailureClass,
+		summary: string,
+	): void {
+		const current = this.#cursors;
+		if (!current) return;
+		this.#cursors = recordAttempt(current, messageId, conversationId, classification, summary);
+	}
+
+	/** Drops the ledger entry for a message that landed or was discarded. */
+	private forgetAttempts(messageId: string): void {
+		const current = this.#cursors;
+		if (!current) return;
+		const next = clearAttempt(current, messageId);
+		if (next !== current) this.persist(next);
+	}
+
+	/** Persists whatever is currently staged in memory. */
+	private flushCursors(): void {
+		const current = this.#cursors;
+		if (current) this.persist(current);
+	}
+
+	private ensureCursors(): Promise<void> {
+		this.#cursorLoads ??= loadRecoveryCursors(this.recoveryCursorPath)
+			.then((state) => {
+				this.#cursors = state;
+				this.#cursorFault = undefined;
+			})
+			.catch((error: unknown) => {
+				// Observable and retryable: drop the memoized load so the next recovery pass
+				// tries again instead of silently running without persistence forever.
+				this.#cursorFault = error instanceof Error ? error.message : String(error);
+				this.#cursorLoads = undefined;
+				console.error(`Discord recovery cursor load failed: ${this.#cursorFault}`);
+			});
+		return this.#cursorLoads;
+	}
+
+	/**
+	 * Records recovery progress for a conversation and persists it (serialized,
+	 * fire-and-forget). Only completed recovery progress lands here — live sends must never
+	 * push this watermark past a gap they did not backfill (issue #33). Watermarks for
+	 * conversations recovery does not iterate (threads/DMs, channels dropped from config)
+	 * are moved to the bounded `quarantined` section rather than deleted.
+	 */
+	private advanceRecovered(conversationId: string, messageId: string): void {
+		const current = this.#cursors;
+		if (!current) return;
+		const existing = current.recoveredThrough[conversationId] ?? current.quarantined[conversationId]?.watermark;
+		if (existing !== undefined && !snowflakeIsAfter(messageId, existing)) return;
+		this.persist(
+			retainRecoveryCursors(
+				{ ...current, recoveredThrough: { ...current.recoveredThrough, [conversationId]: messageId } },
+				Object.keys(this.config.channels ?? {}),
+			),
+		);
+	}
+
+	/** Serialized, fire-and-forget cursor-store write; a failed persist only widens the gap. */
+	private persist(next: RecoveryCursorState): void {
+		this.#cursors = next;
+		this.#cursorSaves = this.#cursorSaves
+			.then(() => saveRecoveryCursors(this.recoveryCursorPath, next))
+			.catch((error: unknown) =>
+				console.error(
+					`Discord recovery cursor persist failed: ${error instanceof Error ? error.message : String(error)}`,
+				),
+			);
 	}
 
 	sendInbound(
@@ -831,29 +1196,76 @@ class ReconnectingGateway {
 		/** The message was spoken, so the reply is owed in both modalities. */
 		voice?: boolean,
 	): Promise<{ engaged?: boolean } | undefined> {
-		if (!this.#inbound.addIfAbsent(messageId)) return;
-		const client = this.#client;
-		if (!client) return;
-		// The gateway acknowledges engagement before running the turn, so typing starts only for
-		// turns that will actually produce a reply and never outlives the delivery that clears it.
-		// The platform message id travels with the turn: the gateway keys its durable inbound
-		// queue on it, so a replayed or backfilled message is deduped there and not just in the
-		// adapter's in-memory set, which does not survive a restart.
-		try {
-			const result = await client.request<{ engaged?: boolean }>("chat.send", {
-				origin,
-				text,
-				engagement,
-				messageId,
-				...(receivedAt ? { receivedAt } : {}),
-				...(voice ? { voice: true } : {}),
-			});
-			if (result?.engaged) this.typing?.begin(origin.conversationId);
-			return result;
-		} catch {
-			this.scheduleReconnect();
-			return undefined;
-		}
+		let result: { engaged?: boolean } | undefined;
+		const verdict = await this.#inbound.join(messageId, async () => {
+			const client = this.#client;
+			if (!client) {
+				this.scheduleReconnect();
+				return "unavailable";
+			}
+			try {
+				// The gateway acknowledges engagement before running the turn, so typing starts only for
+				// turns that will actually produce a reply and never outlives the delivery that clears it.
+				result = await client.request<{ engaged?: boolean }>("chat.send", {
+					origin,
+					text,
+					engagement,
+					messageId,
+					...(receivedAt ? { receivedAt } : {}),
+					...(voice ? { voice: true } : {}),
+				});
+				// No recovery-watermark write here on purpose: a live message is no evidence that
+				// the older messages behind it were ever backfilled (issue #33).
+				if (result?.engaged) this.typing?.begin(origin.conversationId);
+				return "acked";
+			} catch {
+				this.scheduleReconnect();
+				return "unavailable";
+			}
+		});
+		return verdict === "acked" ? result : undefined;
+	}
+
+	/**
+	 * Recovery send for messages missed while offline (issue #33): same LRU dedupe, same
+	 * chat.send verb, same durable gateway exactly-once as live sends. Returns whether the
+	 * gateway acknowledged ("acked"), the message was already known ("duplicate"), or the
+	 * send must be retried later ("unavailable" — the recovery watermark does not advance).
+	 *
+	 * Every failure carries a classification, because that is the only thing allowed to
+	 * decide whether a message may ever be discarded. An attempt that merely joined another
+	 * in-flight send reports `write-path-unknown`, the safe default.
+	 */
+	async requestRecovered(
+		messageId: string,
+		origin: OriginRef,
+		text: string,
+		engagement: EngagementContext,
+	): Promise<RecoveredSendResult> {
+		let failure: RecoveryFailureClass | undefined;
+		let summary: string | undefined;
+		const verdict = await this.#inbound.join(messageId, async () => {
+			const client = this.#client;
+			if (!client) {
+				failure = "retryable";
+				summary = "gateway link not connected";
+				return "unavailable";
+			}
+			try {
+				await client.request("chat.send", { origin, text, engagement, messageId });
+				return "acked";
+			} catch (error) {
+				failure = classifyRecoveryFailure(error);
+				summary = summarizeRecoveryFailure(error);
+				return "unavailable";
+			}
+		});
+		if (verdict !== "unavailable") return { verdict };
+		return {
+			verdict,
+			failure: failure ?? "write-path-unknown",
+			summary: summary ?? "unclassified chat.send failure",
+		};
 	}
 
 	private monitor(client: GajaewayClient): void {
@@ -897,6 +1309,14 @@ function isDiscordTypingChannel(value: unknown): value is DiscordTypingChannelLi
 	return typeof value === "object" && value !== null && "sendTyping" in value && typeof value.sendTyping === "function";
 }
 
+function isRecoverableChannel(value: unknown): value is RecoverableChannel {
+	return (
+		typeof value === "object" &&
+		value !== null &&
+		"messages" in value &&
+		typeof (value as { messages?: { fetch?: unknown } }).messages?.fetch === "function"
+	);
+}
 if (import.meta.main) {
 	loadDiscordAdapterConfig()
 		.then(startDiscordAdapter)
