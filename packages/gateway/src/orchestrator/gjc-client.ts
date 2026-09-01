@@ -4,6 +4,7 @@ import {
 	DEFAULT_REBIND_CAP,
 	extractRuntimeError,
 	GjcRuntimeError,
+	RESUME_UNUSABLE_CODE,
 	type RuntimeErrorDetail,
 	rebindableCodeOf,
 	runtimeErrorOfEnvelope,
@@ -101,6 +102,13 @@ export class GjcTurnStream {
 	finalText: string | undefined;
 	/** Structured error frame seen in the stream, if the runtime emitted one. */
 	runtimeError: RuntimeErrorDetail | undefined;
+	/**
+	 * Count of parseable protocol frames seen on stdout. Zero after a non-zero
+	 * exit means the child never spoke the protocol at all — it died before the
+	 * turn began (e.g. resuming a session id the runtime no longer has), which is
+	 * an observation about the BINDING, not about this turn's content.
+	 */
+	frames = 0;
 
 	constructor(onAssistantText?: (text: string, toolCallsSoFar?: number) => void) {
 		this.#onAssistantText = onAssistantText;
@@ -145,6 +153,7 @@ export class GjcTurnStream {
 		};
 		try {
 			event = JSON.parse(line) as typeof event;
+			this.frames++;
 		} catch {
 			return; // non-JSON noise line
 		}
@@ -545,7 +554,19 @@ export class GjcClient implements GjcPort {
 				// in the ndjson stream or on stderr, and its code (never its wording)
 				// decides whether the binding is condemned.
 				const detail = stream.runtimeError ?? extractRuntimeError(stderr);
-				throw runtimeFailure(`gjc turn exited ${exitCode}`, detail, stderr.trim());
+				// Measured gap (jip-gajae, 2026-09-01): a session id the runtime no
+				// longer holds makes `--resume` die as an uncaught exception with NO
+				// structured code, so every tick of a monitor failed identically
+				// forever and recovery needed hand-edited SQL. The gateway's OWN
+				// observation supplies the code here: a non-zero exit with zero
+				// protocol frames means the child never began the turn, so the binding
+				// — not the turn — is what failed. This is still code-based
+				// classification; no message text is ever matched.
+				const resolved: RuntimeErrorDetail | undefined =
+					detail?.code === undefined && stream.frames === 0
+						? { code: RESUME_UNUSABLE_CODE, message: detail?.message ?? stderr.trim() }
+						: detail;
+				throw runtimeFailure(`gjc turn exited ${exitCode}`, resolved, stderr.trim());
 			}
 			if (stream.finalText === undefined) throw new Error("gjc turn stream produced no assistant text");
 			return stream.finalText;
