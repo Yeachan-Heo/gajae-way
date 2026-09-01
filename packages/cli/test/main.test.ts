@@ -31,7 +31,9 @@ describe("cli arguments", () => {
 		const previousExit = process.exitCode;
 		try {
 			await main(["--socket", join(tmpdir(), "gajaeway-absent.sock"), "memory", "audit", "--fix"]);
+			await main(["--socket", join(tmpdir(), "gajaeway-absent.sock"), "memory", "autolink", "--dry-run"]);
 			expect(errors.join("\n")).toContain("unknown argument: --fix");
+			expect(errors.join("\n")).toContain("unknown argument: --dry-run");
 			expect(process.exitCode).toBe(1);
 		} finally {
 			console.error = console_error;

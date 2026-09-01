@@ -255,6 +255,11 @@ export async function regenerateMap(root: string, registry?: AxisRegistry): Prom
 	await rename(staging, target);
 }
 
+/** The root the capture axis is registered at; `daily/` unless a deployment moved it. */
+export async function captureRoot(root: string, registry?: AxisRegistry): Promise<string> {
+	return (registry ?? (await loadRegistry(root))).byId("daily")?.root ?? "daily";
+}
+
 export async function appendDaily(
 	root: string,
 	originRefJson: string,
@@ -262,7 +267,11 @@ export async function appendDaily(
 	replyText: string,
 ): Promise<string> {
 	const date = new Date().toISOString().slice(0, 10);
-	const path = join(root, "daily", `${date}.md`);
+	// Resolved, never hardcoded: a deployment that re-roots the capture axis in
+	// axes.json would otherwise append into a directory nothing creates, and every
+	// turn would lose its capture to ENOENT.
+	const registry = await loadRegistry(root);
+	const path = join(root, await captureRoot(root, registry), `${date}.md`);
 	// Each field must stay on one physical line: a captured newline would let reply text
 	// containing "## " forge an entry delimiter and escape its own list item.
 	const bounded = (text: string) =>
@@ -272,6 +281,6 @@ export async function appendDaily(
 			.replaceAll(/\r\n|\r|\n/g, "\\n");
 	const entry = `\n## ${new Date().toISOString()}\n\n- origin: ${bounded(originRefJson)}\n- user: ${bounded(userText)}\n- reply: ${bounded(replyText)}\n`;
 	await appendFile(path, entry, { encoding: "utf8" });
-	await regenerateMap(root);
+	await regenerateMap(root, registry);
 	return relative(root, path).replaceAll("\\", "/");
 }

@@ -440,19 +440,53 @@ test("an unregistered directory is an orphan and is never auto-promoted to canon
 
 // ------------------------------------------------------- fail-closed registry
 
-test("a declaration that names a built-in replaces it instead of being rejected", async () => {
+test("a declaration that names a built-in overrides it instead of being rejected", async () => {
 	const registry = createRegistry([
 		{ ...RUNBOOK, id: "ops", root: "ops", partitions: ["rules", "runbooks", "incidents"], promotesTo: [] },
 	]);
 	const ops = registry.byId("ops");
 	expect(ops?.partitions).toEqual(["rules", "runbooks", "incidents"]);
-	// Replacement, not addition: exactly one axis owns the id and the root.
+	// Override, not addition: exactly one axis owns the id and the root.
 	expect(registry.axes.filter((axis) => axis.id === "ops")).toHaveLength(1);
 	expect(registry.axes).toHaveLength(BUILT_IN_AXES.length);
 	// The override is what layout policy is judged against, so a corpus partition
 	// the built-in never knew about stops being a violation.
 	expect(layoutViolation(ops as AxisDescriptor, "ops/incidents/2026-08-14-lock.md")).toBeUndefined();
 	expect(layoutViolation(ops as AxisDescriptor, "ops/handoffs/old.md")).toContain("declared partition");
+});
+
+test("an omitted field keeps the built-in's value rather than the new-axis default", async () => {
+	// The documented minimal repair: widen ops's partitions and state nothing else.
+	// Falling back to schema defaults here would silently demote the axis to
+	// index=recent, retrievalPriority=0 and displayName="ops".
+	const built = BUILT_IN_AXES.find((axis) => axis.id === "ops") as AxisDescriptor;
+	const ops = createRegistry([{ id: "ops", partitions: [...built.partitions, "incidents"] }]).byId("ops");
+	expect(ops).toEqual({ ...built, partitions: [...built.partitions, "incidents"] });
+
+	// A new axis still takes the documented defaults, because it has nothing to inherit.
+	const fresh = createRegistry([{ id: "runbooks" }]).byId("runbooks");
+	expect(fresh).toEqual({
+		id: "runbooks",
+		displayName: "runbooks",
+		root: "runbooks",
+		nesting: "nested",
+		partitions: [],
+		index: "recent",
+		layout: "free",
+		retrievalPriority: 0,
+		orphanPolicy: "any-depth",
+		appendOnly: false,
+		promotesTo: [],
+	});
+});
+
+test("an override may still relax a built-in, but only by saying so", async () => {
+	const daily = createRegistry([{ id: "daily", layout: "free", appendOnly: false }]).byId("daily");
+	expect(daily?.appendOnly).toBe(false);
+	// Inherited, not defaulted away: the capture axis keeps its promotion targets.
+	expect(daily?.promotesTo).toContain("ops");
+	// The dated/append-only invariant is still enforced against the merged result.
+	expect(() => createRegistry([{ id: "reflections", appendOnly: false }])).toThrow(/must be appendOnly/);
 });
 
 test("an override still may not claim another axis's root, and may not be declared twice", async () => {

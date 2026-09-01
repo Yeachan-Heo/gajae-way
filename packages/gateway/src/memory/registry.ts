@@ -257,8 +257,8 @@ function malformed(message: string): never {
 	throw new AxisRegistryError("malformed_descriptor", message);
 }
 
-function stringArray(value: unknown, field: string, id: string): readonly string[] {
-	if (value === undefined) return [];
+function stringArray(value: unknown, field: string, id: string, fallback: readonly string[]): readonly string[] {
+	if (value === undefined) return fallback;
 	if (!Array.isArray(value) || value.some((item) => typeof item !== "string"))
 		malformed(`axis ${id}: ${field} must be an array of strings`);
 	return value as readonly string[];
@@ -272,11 +272,14 @@ function oneOf<T extends string>(value: unknown, allowed: readonly T[], field: s
 }
 
 /**
- * Normalize one declared descriptor. Optional fields take documented defaults;
- * anything present is validated strictly, and an unknown field is a typo that
- * would otherwise be silently ignored, so it fails closed.
+ * Normalize one declared descriptor. An omitted field falls back to `base` when
+ * the declaration restates an existing axis, and to the documented default
+ * otherwise, so restating `ops` to widen its partitions cannot silently demote
+ * the rest of the axis to new-axis defaults. Anything present is validated
+ * strictly, and an unknown field is a typo that would otherwise be ignored, so
+ * it fails closed.
  */
-export function parseDescriptor(value: unknown): AxisDescriptor {
+export function parseDescriptor(value: unknown, base?: AxisDescriptor): AxisDescriptor {
 	if (typeof value !== "object" || value === null || Array.isArray(value))
 		malformed("axis descriptor must be an object");
 	const raw = value as Record<string, unknown>;
@@ -285,7 +288,7 @@ export function parseDescriptor(value: unknown): AxisDescriptor {
 		malformed(`axis id must match ${ID.source} (received ${JSON.stringify(id)})`);
 	for (const key of Object.keys(raw)) if (!FIELDS.has(key)) malformed(`axis ${id}: unknown field ${key}`);
 
-	const root = raw.root === undefined ? id : raw.root;
+	const root = raw.root === undefined ? (base?.root ?? id) : raw.root;
 	if (typeof root !== "string" || !root.length) malformed(`axis ${id}: root must be a non-empty string`);
 	const segments = root.split("/");
 	if (root.startsWith("/") || root.includes("\\") || segments.some((segment) => !SEGMENT.test(segment)))
@@ -295,30 +298,37 @@ export function parseDescriptor(value: unknown): AxisDescriptor {
 	if (RESERVED_ROOTS.has(segments[0].toLowerCase()))
 		malformed(`axis ${id}: root ${JSON.stringify(root)} collides with a reserved corpus name`);
 
-	const displayName = raw.displayName === undefined ? id : raw.displayName;
+	const displayName = raw.displayName === undefined ? (base?.displayName ?? id) : raw.displayName;
 	if (typeof displayName !== "string" || !displayName.trim().length)
 		malformed(`axis ${id}: displayName must be a non-empty string`);
 
-	const nesting = oneOf(raw.nesting, ["flat", "nested"] as const, "nesting", id, "nested");
-	const partitions = stringArray(raw.partitions, "partitions", id);
+	const nesting = oneOf(raw.nesting, ["flat", "nested"] as const, "nesting", id, base?.nesting ?? "nested");
+	const partitions = stringArray(raw.partitions, "partitions", id, base?.partitions ?? []);
 	for (const partition of partitions)
 		if (!SEGMENT.test(partition)) malformed(`axis ${id}: partition ${JSON.stringify(partition)} is not a path segment`);
 	if (new Set(partitions).size !== partitions.length) malformed(`axis ${id}: partitions contain a duplicate`);
 	if (nesting === "flat" && partitions.length) malformed(`axis ${id}: a flat axis cannot declare partitions`);
 
-	const index = oneOf(raw.index, ["recent", "tree"] as const, "index", id, "recent");
-	const layout = oneOf(raw.layout, ["dated", "free"] as const, "layout", id, "free");
-	const orphanPolicy = oneOf(raw.orphanPolicy, ["any-depth", "partitioned"] as const, "orphanPolicy", id, "any-depth");
+	const index = oneOf(raw.index, ["recent", "tree"] as const, "index", id, base?.index ?? "recent");
+	const layout = oneOf(raw.layout, ["dated", "free"] as const, "layout", id, base?.layout ?? "free");
+	const orphanPolicy = oneOf(
+		raw.orphanPolicy,
+		["any-depth", "partitioned"] as const,
+		"orphanPolicy",
+		id,
+		base?.orphanPolicy ?? "any-depth",
+	);
 	if (orphanPolicy === "partitioned" && !partitions.length)
 		malformed(`axis ${id}: orphanPolicy partitioned requires at least one partition`);
 	if (orphanPolicy === "partitioned" && layout === "dated")
 		malformed(`axis ${id}: a dated axis cannot also be partitioned`);
 
-	const retrievalPriority = raw.retrievalPriority === undefined ? 0 : raw.retrievalPriority;
+	const retrievalPriority =
+		raw.retrievalPriority === undefined ? (base?.retrievalPriority ?? 0) : raw.retrievalPriority;
 	if (typeof retrievalPriority !== "number" || !Number.isFinite(retrievalPriority))
 		malformed(`axis ${id}: retrievalPriority must be a finite number`);
 
-	const appendOnly = raw.appendOnly === undefined ? layout === "dated" : raw.appendOnly;
+	const appendOnly = raw.appendOnly === undefined ? (base?.appendOnly ?? layout === "dated") : raw.appendOnly;
 	if (typeof appendOnly !== "boolean") malformed(`axis ${id}: appendOnly must be a boolean`);
 	// A dated axis is dated precisely because entries accumulate; letting one be
 	// rewritable would make the date meaningless.
@@ -335,7 +345,7 @@ export function parseDescriptor(value: unknown): AxisDescriptor {
 		retrievalPriority,
 		orphanPolicy,
 		appendOnly,
-		promotesTo: stringArray(raw.promotesTo, "promotesTo", id),
+		promotesTo: stringArray(raw.promotesTo, "promotesTo", id, base?.promotesTo ?? []),
 	};
 }
 
@@ -371,9 +381,11 @@ function assertAcyclic(axes: readonly AxisDescriptor[]): void {
 
 /**
  * Build a registry from the built-ins plus declared custom axes. A declaration
- * whose id names a built-in *replaces* that built-in in place: the built-in set
- * is a default, not a floor, so a deployment whose `ops` corpus has its own
- * partitions restates the axis instead of editing this module or moving files.
+ * whose id names a built-in *overrides* it: stated fields win, omitted fields
+ * keep the built-in's value. The built-in set is a default, not a floor, so a
+ * deployment whose `ops` corpus grew its own partitions restates just those
+ * partitions instead of editing this module or moving files, and cannot demote
+ * the rest of the axis to new-axis defaults by omission.
  * Everything else fails closed: two declarations may not share an id, a root may
  * not contain or sit inside another axis's root, and a promotion target must
  * exist and must not close a cycle.
@@ -382,7 +394,11 @@ export function createRegistry(custom: readonly unknown[] = []): AxisRegistry {
 	const axes = [...BUILT_IN_AXES];
 	const declaredIds = new Set<string>();
 	for (const declared of custom) {
-		const axis = parseDescriptor(declared);
+		const id = (declared as { id?: unknown })?.id;
+		const axis = parseDescriptor(
+			declared,
+			axes.find((existing) => existing.id === id),
+		);
 		if (declaredIds.has(axis.id))
 			throw new AxisRegistryError("duplicate_axis_id", `axis id ${axis.id} is declared twice`);
 		declaredIds.add(axis.id);

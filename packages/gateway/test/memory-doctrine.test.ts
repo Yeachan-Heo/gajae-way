@@ -1,5 +1,5 @@
 import { afterEach, expect, test } from "bun:test";
-import { mkdtemp, readFile, rm } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { appendDaily, initializeMemory } from "../src/memory/doctrine";
@@ -8,6 +8,25 @@ let home = "";
 afterEach(async () => {
 	if (home) await rm(home, { recursive: true, force: true });
 	home = "";
+});
+
+test("capture follows the registered root of the capture axis, not a hardcoded daily/", async () => {
+	home = await mkdtemp(join(tmpdir(), "gajaeway-capture-root-"));
+	const root = join(home, "memory");
+	await mkdir(root, { recursive: true, mode: 0o700 });
+	await writeFile(
+		join(root, "axes.json"),
+		`${JSON.stringify({ version: 1, axes: [{ id: "daily", root: "capture" }] })}\n`,
+	);
+	await initializeMemory(home);
+
+	const path = await appendDaily(root, "{}", "u1", "r1");
+
+	// Written where the registry says, and reachable from the generated map: a
+	// hardcoded daily/ would have thrown ENOENT and lost the turn's capture.
+	expect(path).toStartWith("capture/");
+	expect(await readFile(join(root, path), "utf8")).toContain("- user: u1");
+	expect(await readFile(join(root, "MEMORY.md"), "utf8")).toContain(path);
 });
 
 test("multi-line reply text cannot forge an entry delimiter or escape its list item", async () => {

@@ -314,7 +314,7 @@ export async function main(args = process.argv.slice(2)): Promise<void> {
 				break;
 			}
 			case "memory": {
-				const usage = "usage: gajaeway memory audit|autolink|search <query>";
+				const usage = "usage: gajaeway memory audit|memory autolink|memory search <query>";
 				// An unrecognised argument is refused before the socket is opened rather
 				// than ignored: a run of `memory audit --fix` that silently degraded to a
 				// plain audit would read as a repair attempt that reproduced the failure.
