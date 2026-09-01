@@ -21,13 +21,23 @@
  * - `terminal_uncertain`: startup cleanup could not be proven.
  * - `managed_append_identity_mismatch`: turn-level; the bound session's identity
  *   no longer matches the cwd, so it can never be resumed from here again.
+ * - `resume_unusable`: turn-level; the child exited non-zero without emitting a
+ *   single protocol frame, so it died before the turn began. Measured cause: the
+ *   runtime no longer holds the bound session id (`--resume` raises an uncaught
+ *   exception with no structured code), which made every monitor tick fail
+ *   identically until `gateway.db` was hand-edited. The code is synthesized from
+ *   the gateway's own observation, never from message text.
  */
 export const REBINDABLE_ERROR_CODES: ReadonlySet<string> = new Set([
 	"resource_gone",
 	"spawn_failed",
 	"terminal_uncertain",
 	"managed_append_identity_mismatch",
+	"resume_unusable",
 ]);
+
+/** The code the gateway synthesizes for a child that died before the turn began. */
+export const RESUME_UNUSABLE_CODE = "resume_unusable";
 
 /**
  * Reviewer-mandated ceiling (gaebal-gajae): silent unbounded epoch growth is

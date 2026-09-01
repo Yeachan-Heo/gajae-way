@@ -109,12 +109,13 @@ test("an unrelated code is a genuine failure, not a rebindable one", () => {
 	expect(rebindableCodeOf(new Error("spawn_failed"))).toBeUndefined();
 });
 
-test("the rebindable set is exactly the four measured codes", () => {
-	// Pinned at the source of truth: the incident produced exactly these four, so
+test("the rebindable set is exactly the five measured codes", () => {
+	// Pinned at the source of truth: every entry came from a measured incident, so
 	// widening the set has to break a test rather than slip in.
 	expect([...REBINDABLE_ERROR_CODES].sort()).toEqual([
 		"managed_append_identity_mismatch",
 		"resource_gone",
+		"resume_unusable",
 		"spawn_failed",
 		"terminal_uncertain",
 	]);
@@ -467,6 +468,55 @@ test("a turn-level managed_append_identity_mismatch rebinds and replays the turn
 	}
 });
 
+// Measured incident (jip-gajae host, 2026-09-01): the runtime had dropped the
+// bound session, so `--resume <id>` died as an uncaught exception with NO
+// structured code. 58 monitor ticks failed identically in one day and recovery
+// required hand-editing gateway.db. A child that exits non-zero without ever
+// emitting a protocol frame never began the turn, so the BINDING is what failed.
+test("a resume that dies before emitting any frame rebinds and replays the turn once", async () => {
+	const { client, database, logs, commands } = await harness([
+		{ stdout: createSuccess("session-e0") },
+		{
+			stdout: `[Uncaught Exception] Error: Session "session-e0" not found.\n    at pyn (/$bunfs/root/gjc-darwin-arm64:25863:1146)\n`,
+			exitCode: 1,
+		},
+		{ stdout: createSuccess("session-e1") },
+		{
+			stdout: `${JSON.stringify({ type: "message_end", message: { role: "assistant", content: [{ type: "text", text: "reply after auto reset" }] } })}\n`,
+		},
+	]);
+	try {
+		const { sessionId } = await client.ensureSession("discord:dm:c1");
+		expect(await client.sendTurn(sessionId, "hello")).toBe("reply after auto reset");
+		expect(logs[0]).toBe(
+			"gateway session rebind 1/3 origin=discord:dm:c1 cause=resume_unusable epoch 0 -> 1 lifetime=1",
+		);
+		expect(database.getSessionRecord("discord:dm:c1")).toEqual({ sessionId: "session-e1", epoch: 1 });
+		expect(commands[3]).toContain("session-e1");
+	} finally {
+		database.close();
+	}
+});
+
+// The guard is narrow on purpose: a child that DID speak the protocol failed at
+// the turn, not at the binding, and must not be turned into an epoch bump.
+test("a non-zero exit that emitted frames is not treated as an unusable resume", async () => {
+	const { client, database, logs } = await harness([
+		{ stdout: createSuccess("session-e0") },
+		{
+			stdout: `${JSON.stringify({ type: "tool_execution_start" })}\nprovider hung up\n`,
+			exitCode: 1,
+		},
+	]);
+	try {
+		const { sessionId } = await client.ensureSession("discord:dm:c1");
+		await expect(client.sendTurn(sessionId, "hello")).rejects.toMatchObject({ code: undefined });
+		expect(logs).toEqual([]);
+		expect(database.getSessionRecord("discord:dm:c1")?.epoch).toBe(0);
+	} finally {
+		database.close();
+	}
+});
 test("a non-rebindable turn failure is surfaced with its code and never rebinds", async () => {
 	const { client, database, logs } = await harness([
 		{ stdout: createSuccess("session-e0") },
