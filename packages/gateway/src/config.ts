@@ -34,6 +34,15 @@ export interface GatewayConfigFile {
 	readonly dmPolicy?: DmPolicy;
 	/** Default recipient origin for monitor/maintenance notes without their own channel target. */
 	readonly ownerTarget?: { readonly origin: OriginRef };
+	/**
+	 * Consecutive context-class authoring failures (empty response,
+	 * context-length rejection, zero-token completion) before the monitor
+	 * safety net rolls that session — and only when a native-compaction request
+	 * did not succeed (issue #68). This is NOT a turn ceiling: a monitor that
+	 * keeps answering is never rolled. Default
+	 * MONITOR_CONTEXT_FAILURE_ROLL_THRESHOLD.
+	 */
+	readonly monitorContextFailureRollThreshold?: number;
 	readonly webhook?: { readonly bind?: string; readonly port: number; readonly exposeNonLoopback?: boolean };
 	readonly watcherRoots?: readonly string[];
 	readonly scriptRoot?: string;
@@ -245,6 +254,17 @@ function parseTurnTimeout(value: unknown): number {
 	return value as number;
 }
 
+/**
+ * Bounded 1..20. 1 rolls on the first context-class failure, which is
+ * aggressive but a legitimate operator choice; above 20 the safety net would
+ * never fire before the monitor had spent hours failing every turn.
+ */
+function parseMonitorContextFailureRollThreshold(value: unknown): number {
+	if (!Number.isInteger(value) || (value as number) < 1 || (value as number) > 20)
+		throw new ConfigError("config_invalid", "monitorContextFailureRollThreshold must be an integer between 1 and 20");
+	return value as number;
+}
+
 function parseDmPolicy(value: unknown): DmPolicy {
 	if (typeof value !== "string" || !DM_POLICIES.includes(value as DmPolicy))
 		throw new ConfigError("config_invalid", `dmPolicy must be one of ${DM_POLICIES.join(", ")}`);
@@ -281,6 +301,13 @@ export function parseConfigFile(value: unknown): GatewayConfigFile {
 		...(model ? { model } : {}),
 		...(input.dmPolicy === undefined ? {} : { dmPolicy: parseDmPolicy(input.dmPolicy) }),
 		...(input.ownerTarget === undefined ? {} : { ownerTarget: parseOwnerTarget(input.ownerTarget) }),
+		...(input.monitorContextFailureRollThreshold === undefined
+			? {}
+			: {
+					monitorContextFailureRollThreshold: parseMonitorContextFailureRollThreshold(
+						input.monitorContextFailureRollThreshold,
+					),
+				}),
 	};
 }
 
@@ -386,7 +413,8 @@ export const RELOADABLE_FIELDS = ["mentionAllowlist", "channels", "debounceMs", 
 /**
  * Fields bound to a live resource at startup — a listening socket, an open
  * database, the constructed gjc client, a running webhook/watcher, the monitor
- * propagator's owner target — and therefore only changeable by a restart.
+ * propagator's owner target and its monitor session turn limit — and therefore
+ * only changeable by a restart.
  * `credentials` belongs here because the adapters read it when they start.
  */
 export const RESTART_REQUIRED_FIELDS = [
@@ -399,6 +427,7 @@ export const RESTART_REQUIRED_FIELDS = [
 	"watcherRoots",
 	"scriptRoot",
 	"ownerTarget",
+	"monitorContextFailureRollThreshold",
 ] as const;
 
 /**

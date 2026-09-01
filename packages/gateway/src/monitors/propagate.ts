@@ -4,6 +4,7 @@ import {
 	eventTypeOrigin,
 	isSilenceToken,
 	type MonitorEventRecord,
+	type MonitorRecord,
 	type OriginRef,
 	originKey,
 } from "@gajaeway/protocol";
@@ -12,6 +13,23 @@ import type { MemoryClosureQueue } from "../memory/closure";
 import type { GjcPort } from "../orchestrator/gjc-client";
 import type { GatewayDatabase } from "../store/db";
 import { MONITOR_EVENT_MAX_DISPATCH_ATTEMPTS, RECONCILABLE_STAGES, TERMINAL_STAGES } from "../store/db";
+import {
+	type AuthoringFailureClass,
+	buildMonitorCompactionDigest,
+	type CompactionPort,
+	classifyAuthoringFailure,
+	classifyExecutorFailure,
+	decideSessionRoll,
+	type ExecutorFailureReason,
+	isAsideTimeoutFailure,
+	isOrphanedExecutorFailure,
+	MONITOR_CONTEXT_FAILURE_ROLL_THRESHOLD,
+	MONITOR_DIGEST_MAX_NOTES,
+	type MonitorDigestNote,
+	type NativeCompactionStatus,
+	type SessionRollReason,
+	unavailableCompactionPort,
+} from "./compaction";
 import type { MonitorRegistry } from "./registry";
 
 /** Product-level semantics for the seeded maintenance events (generic, persona-independent). */
@@ -30,13 +48,73 @@ const MAINTENANCE_GUIDANCE: Record<string, string | undefined> = {
 type DispatchFailureCode =
 	| "session_bind_failed"
 	| "authoring_turn_failed"
+	// Context-class authoring failure: empty response, context-length rejection
+	// or a zero-token completion. Distinct from `authoring_response_invalid`
+	// because only this class is evidence that compaction did not happen.
+	| "authoring_context_exhausted"
 	| "authoring_response_invalid"
+	// Executor-class: the aside collection worker hit its 300s cap. Its own code
+	// so it can never be read as, or aggregated with, context exhaustion.
+	| "aside_timeout"
+	// Executor-class: the child process died on the wrapper's timeout while the
+	// external daemon's work kept running, so the next tick stacks a duplicate.
+	// Its own code because the operator action is "reclaim the external
+	// executor", not anything to do with this session.
+	| "orphaned_executor"
+	// Executor-class: a worker timeout, external tool failure or lock skip that
+	// is neither the aside worker nor an orphaned external run.
+	| "executor_failed"
 	| "delivery_prepare_failed"
 	| "internal_error";
 
 export interface MonitorDispatchFailure {
 	readonly eventId: string;
 	readonly code: DispatchFailureCode;
+}
+
+/**
+ * Observable safety-net state for one monitor session origin (issue #68).
+ *
+ * `turns` is recorded but never a roll trigger — it exists so an operator can
+ * see how long a session has been alive next to the failure evidence.
+ */
+export interface MonitorSessionSafetyState {
+	/** Authoring turns taken in the current epoch. OBSERVATIONAL ONLY. */
+	turns: number;
+	/**
+	 * Consecutive context-class authoring failures attributable to the CURRENT
+	 * session, with no answered turn since. Reset by any non-empty answer and by
+	 * a roll. This is the only counter the roll decision reads.
+	 */
+	contextFailures: number;
+	/**
+	 * Context-class failures that were NOT counted because they came from a
+	 * stale or replayed event, or from a dead epoch (diagnostic). A dead
+	 * session's failures must never roll its successor.
+	 */
+	staleContextFailures: number;
+	/** Executor-class failures in this epoch — timeouts, tools, locks (diagnostic). */
+	executorFailures: number;
+	/**
+	 * Executor-class failures that left external work running behind a dead
+	 * child (diagnostic). Never part of the context streak: the session is fine,
+	 * the external executor is not.
+	 */
+	orphanedExecutorFailures: number;
+	/**
+	 * Coded reason of the last executor-class failure. Survives a roll on
+	 * purpose: an unreclaimed external executor is not fixed by rolling a
+	 * session, so the signal must not be wiped by one.
+	 */
+	lastExecutorReason: ExecutorFailureReason | undefined;
+	/** Protocol-class failures in this epoch — malformed or off-contract answers (diagnostic). */
+	protocolFailures: number;
+	/** Result of the last native-compaction attempt, or undefined if never attempted. */
+	nativeCompaction: NativeCompactionStatus | undefined;
+	/** Armed roll: consumed at the next dispatch boundary. */
+	pendingRoll: SessionRollReason | undefined;
+	/** Reason of the last roll actually performed. */
+	lastRoll: SessionRollReason | undefined;
 }
 
 export class MonitorPropagator {
@@ -60,6 +138,16 @@ export class MonitorPropagator {
 	#inFlightPromises = new Map<string, Promise<void>>();
 	/** Serialize GJC monitor turns per session origin; binds can coalesce, turns cannot. */
 	#turnChains = new Map<string, Promise<void>>();
+	/**
+	 * Per-session-origin safety-net state (issue #68). Process-local on purpose:
+	 * it is evidence about the CURRENT live session, and a restart mints a fresh
+	 * bind anyway, so persisting it would only carry a stale verdict forward.
+	 */
+	readonly #safety = new Map<string, MonitorSessionSafetyState>();
+	/** THE ONE seam that asks for native compaction. */
+	readonly #compaction: CompactionPort;
+	/** Consecutive context-class authoring failures required before a roll. */
+	readonly #contextFailureRollThreshold: number;
 	constructor(options: {
 		database: GatewayDatabase;
 		registry: MonitorRegistry;
@@ -81,6 +169,15 @@ export class MonitorPropagator {
 		acquireLease?: (eventId: string, owner: string, leaseId: string, ttlMs: number, now: number) => boolean;
 		/** Injectable fenced-batching seam (tests): defaults to the durable fenced update. */
 		fencedUpdate?: (eventId: string, leaseId: string, batchId: string, now: number) => boolean;
+		/** Native-compaction seam. Defaults to the honest `unavailable` port. */
+		compaction?: CompactionPort;
+		/**
+		 * Consecutive context-class authoring failures required before the
+		 * safety net rolls a session. Config-supplied
+		 * (`monitorContextFailureRollThreshold`); defaults to
+		 * MONITOR_CONTEXT_FAILURE_ROLL_THRESHOLD.
+		 */
+		contextFailureRollThreshold?: number;
 	}) {
 		this.#database = options.database;
 		this.#registry = options.registry;
@@ -98,6 +195,8 @@ export class MonitorPropagator {
 		this.#fencedUpdate =
 			options.fencedUpdate ??
 			((eventId, lease, batch, at) => this.#database.monitorEventFencedUpdate(eventId, lease, "batched", batch, at));
+		this.#compaction = options.compaction ?? unavailableCompactionPort;
+		this.#contextFailureRollThreshold = options.contextFailureRollThreshold ?? MONITOR_CONTEXT_FAILURE_ROLL_THRESHOLD;
 	}
 	/** Cancels pending burst timers so a closed database is never touched after shutdown. */
 	dispose(): void {
@@ -347,9 +446,10 @@ export class MonitorPropagator {
 			leaseTtlMs,
 		);
 		const declared = new Set(monitor.eventTypes);
-		const sessionOriginKey = originKey(
-			declared.has(claimed[0]?.event_type) ? eventTypeOrigin(claimed[0]!.event_type) : CATCH_ALL_EVENT_ORIGIN,
-		);
+		const sessionOrigin = declared.has(claimed[0]?.event_type)
+			? eventTypeOrigin(claimed[0]!.event_type)
+			: CATCH_ALL_EVENT_ORIGIN;
+		const sessionOriginKey = originKey(sessionOrigin);
 		// Preserve PR #26's per-origin turn serialization while the PR #30 lease
 		// remains heartbeated. A later batch waits for the prior turn, then owns the
 		// session until this dispatch's finally block releases the chain.
@@ -364,11 +464,31 @@ export class MonitorPropagator {
 		);
 		this.#turnChains.set(sessionOriginKey, trackedTurn);
 		if (previousTurn) await previousTurn.catch(() => undefined);
+		// Bound outside the try so the failure handler can ask the compaction port
+		// to act on the very session that failed, and can tell whether that
+		// session is still the live one.
+		let boundSessionId: string | undefined;
+		let boundSessionEpoch: number | undefined;
+		// A replayed batch: reconcile bumps dispatch_attempts before re-dispatching
+		// a stranded or failed event, so a non-zero count means these events are
+		// not this session's own fresh work. Their context failure says nothing
+		// about the CURRENT session and must not feed its streak — the payload is
+		// old, and the failure may well have been produced against a session that
+		// no longer exists.
+		const replayedBatch = claimed.some((row) => row.dispatch_attempts > 0);
 		try {
-			const { sessionId } = await this.#gjc.ensureSession(
-				sessionOriginKey,
-				this.#database.getSessionRecord(sessionOriginKey)?.epoch ?? 0,
-			);
+			// Safety-net roll boundary (issue #68). It sits HERE, after the
+			// per-origin turn chain has been acquired and before this batch's
+			// session is bound: the previous batch's authoring turn has already
+			// settled, and this batch's events are claimed under live leases but
+			// not yet authored. A roll can therefore neither strand an in-flight
+			// batch nor let one be authored twice — the events simply land in the
+			// new epoch's session. Leases and fencing are untouched.
+			const digest = this.#rollSessionIfArmed(sessionOriginKey, JSON.stringify(sessionOrigin), monitor);
+			const boundEpoch = this.#database.getSessionRecord(sessionOriginKey)?.epoch ?? 0;
+			const { sessionId } = await this.#gjc.ensureSession(sessionOriginKey, boundEpoch);
+			boundSessionId = sessionId;
+			boundSessionEpoch = boundEpoch;
 			// Guidance order: the monitor's own instruction first (it is what the
 			// owner actually asked this monitor to do), then any built-in
 			// maintenance semantics for the claimed event types. Without either,
@@ -377,8 +497,20 @@ export class MonitorPropagator {
 				.map((row) => MAINTENANCE_GUIDANCE[row.event_type])
 				.filter((entry, index, all) => entry && all.indexOf(entry) === index);
 			const guidance = [monitor.instruction?.trim() || undefined, ...maintenance].filter(Boolean).join(" ");
-			const prompt = `Author monitor events.${guidance ? ` ${guidance}` : ""} Respond ONLY with a JSON array containing exactly one {"eventId","note"} entry per event: ${JSON.stringify(claimed.map((row) => ({ eventId: row.event_id, eventType: row.event_type, payload: JSON.parse(row.payload_json) })))}`;
+			const prompt = `Author monitor events.${guidance ? ` ${guidance}` : ""}${digest ? `\n${digest}\n` : ""} Respond ONLY with a JSON array containing exactly one {"eventId","note"} entry per event: ${JSON.stringify(claimed.map((row) => ({ eventId: row.event_id, eventType: row.event_type, payload: JSON.parse(row.payload_json) })))}`;
 			const response = await this.#gjc.sendTurn(sessionId, prompt);
+			// The authoring turn is now part of the session transcript whatever its
+			// content, so it is counted here rather than after the response is
+			// validated. The count is OBSERVATIONAL: it is reported, and it never
+			// rolls a session on its own — native gjc compaction owns keeping the
+			// context bounded while the session is answering.
+			const turns = this.#database.incrementTurnCount(sessionOriginKey, JSON.stringify(sessionOrigin));
+			this.#safetyState(sessionOriginKey).turns = turns;
+			// A non-empty answer is proof the session still has usable context, so
+			// it clears the context-failure streak. A malformed answer is still an
+			// answer: it must not arm the safety net.
+			if (response.trim()) this.#safetyState(sessionOriginKey).contextFailures = 0;
+			else throw new Error("authoring response is empty");
 			// Lease fencing: after an await, this attempt may no longer own the
 			// claim (expired + stolen). Every write below is conditional on the
 			// live lease; a stale attempt's completion becomes a no-op.
@@ -496,11 +628,23 @@ export class MonitorPropagator {
 		} catch (error) {
 			// Public-safe structured evidence only: a stable phase code and event ids.
 			// The raw error body can carry secrets and is never persisted or logged.
-			const code: DispatchFailureCode = failureCode(error);
+			const failureClass = classifyAuthoringFailure(error);
+			const code: DispatchFailureCode = failureCode(error, failureClass);
 			for (const row of leased) {
 				this.#database.monitorEventFencedFail(row.event_id, leaseId, batchId, code, `dispatch phase failed (${code})`);
 			}
 			console.error(`monitor dispatch failed (${code}): events ${claimed.map((row) => row.event_id).join(",")}`);
+			await this.#recordAuthoringFailure({
+				sessionOriginKey,
+				failureClass,
+				// Passed for PURE classification only (executor sub-kind). The message
+				// is never logged or persisted from here.
+				error,
+				sessionId: boundSessionId,
+				boundEpoch: boundSessionEpoch,
+				replayed: replayedBatch,
+				monitor,
+			});
 		} finally {
 			stopHeartbeat();
 			// Release the leases this attempt holds. Lease-guarded: if this attempt
@@ -510,6 +654,164 @@ export class MonitorPropagator {
 			releaseTurn();
 			if (this.#turnChains.get(sessionOriginKey) === trackedTurn) this.#turnChains.delete(sessionOriginKey);
 		}
+	}
+	/** Read-only safety-net evidence for one session origin (ops/tests). */
+	sessionSafetyState(sessionOriginKey: string): MonitorSessionSafetyState {
+		return { ...this.#safetyState(sessionOriginKey) };
+	}
+	#safetyState(sessionOriginKey: string): MonitorSessionSafetyState {
+		const existing = this.#safety.get(sessionOriginKey);
+		if (existing) return existing;
+		const fresh: MonitorSessionSafetyState = {
+			turns: 0,
+			contextFailures: 0,
+			staleContextFailures: 0,
+			orphanedExecutorFailures: 0,
+			lastExecutorReason: undefined,
+			executorFailures: 0,
+			protocolFailures: 0,
+			nativeCompaction: undefined,
+			pendingRoll: undefined,
+			lastRoll: undefined,
+		};
+		this.#safety.set(sessionOriginKey, fresh);
+		return fresh;
+	}
+	/**
+	 * THE ONE monitor-session failure classifier and native-compaction request
+	 * point (issue #68).
+	 *
+	 * Only a context-class failure of the CURRENT session's own fresh work can
+	 * feed the streak. Everything else is recorded and dropped:
+	 * - executor-class (aside worker timeout, orphaned external run, tool
+	 *   failure, lock skip) and protocol-class (malformed or off-contract
+	 *   answer) are not evidence about context size at all. The executor
+	 *   sub-kind is named for the operator (`lastExecutorReason`), and the
+	 *   orphaned case is counted separately because its remedy is reclaiming an
+	 *   external daemon job, not touching this session.
+	 * - a replayed batch (reconcile revived it) carries an old payload and may
+	 *   have failed against a session that is already gone.
+	 * - a bound epoch that is no longer current means the failure belongs to a
+	 *   dead session; its record must never roll the successor.
+	 *
+	 * When it does count, native compaction is requested first and the safety net
+	 * arms only if that did not succeed AND the streak has reached
+	 * `contextFailureRollThreshold` consecutive failures.
+	 */
+	async #recordAuthoringFailure(input: {
+		sessionOriginKey: string;
+		failureClass: AuthoringFailureClass;
+		/** Inspected by pure classifiers only; never logged, never persisted. */
+		error: unknown;
+		sessionId: string | undefined;
+		boundEpoch: number | undefined;
+		replayed: boolean;
+		monitor: MonitorRecord;
+	}): Promise<void> {
+		const { sessionOriginKey, failureClass, error, sessionId, boundEpoch, replayed, monitor } = input;
+		const state = this.#safetyState(sessionOriginKey);
+		if (failureClass === "executor") {
+			state.executorFailures += 1;
+			const reason = classifyExecutorFailure(error);
+			state.lastExecutorReason = reason;
+			if (reason === "executor_orphaned_external_work") {
+				state.orphanedExecutorFailures += 1;
+				// Name it and stop. The session answered nothing wrong; an external
+				// daemon job outlived its child process and the next tick will stack
+				// another one. Rolling the session would hide that, not fix it.
+				console.error(
+					`monitor executor orphaned for ${sessionOriginKey} (monitor ${monitor.monitorId}): reason=${reason} orphaned_failures=${state.orphanedExecutorFailures} context_failures=${state.contextFailures} (unchanged) — external executor work was not reclaimed; the session is left untouched.`,
+				);
+			}
+			return;
+		}
+		if (failureClass === "protocol") {
+			state.protocolFailures += 1;
+			return;
+		}
+		const liveEpoch = this.#database.getSessionRecord(sessionOriginKey)?.epoch ?? 0;
+		if (replayed || boundEpoch === undefined || boundEpoch !== liveEpoch) {
+			state.staleContextFailures += 1;
+			console.error(
+				`monitor context failure not counted for ${sessionOriginKey} (monitor ${monitor.monitorId}): replayed=${replayed} bound_epoch=${boundEpoch ?? "none"} live_epoch=${liveEpoch}`,
+			);
+			return;
+		}
+		state.contextFailures += 1;
+		const status = sessionId ? await this.#requestNativeCompaction(sessionId) : "unavailable";
+		state.nativeCompaction = status;
+		const reason = decideSessionRoll({
+			consecutiveContextFailures: state.contextFailures,
+			threshold: this.#contextFailureRollThreshold,
+			nativeCompaction: status,
+		});
+		if (!reason) return;
+		// Arm, do not roll here: the roll must happen at the dispatch boundary
+		// where no batch is in flight.
+		state.pendingRoll = reason;
+		console.error(
+			`monitor session safety net armed for ${sessionOriginKey} (monitor ${monitor.monitorId}): reason=${reason} context_failures=${state.contextFailures}/${this.#contextFailureRollThreshold} native_compaction=${status} turns=${state.turns}`,
+		);
+	}
+	/**
+	 * Asks the runtime to compact this session natively — the first line of
+	 * defence, and the ONLY place the gateway requests it. A port that throws did
+	 * not compact, so it reports `failed`; the thrown message never escapes.
+	 */
+	async #requestNativeCompaction(sessionId: string): Promise<NativeCompactionStatus> {
+		try {
+			return (await this.#compaction.run(sessionId)).status;
+		} catch {
+			return "failed";
+		}
+	}
+	/**
+	 * THE ONE monitor-session roll choke point (issue #68). LAST RESORT: it fires
+	 * only for a roll armed by `#recordAuthoringFailure`, never on turn count.
+	 *
+	 * Returns the digest to inject into this turn's prompt, or undefined when no
+	 * roll was armed. The digest is pure text assembly — a roll costs no model
+	 * turn.
+	 */
+	#rollSessionIfArmed(sessionOriginKey: string, originRefJson: string, monitor: MonitorRecord): string | undefined {
+		const state = this.#safetyState(sessionOriginKey);
+		const reason = state.pendingRoll;
+		if (!reason) return undefined;
+		// Build the digest BEFORE the roll: it reads durable authored notes, which
+		// the roll does not touch, but reading first keeps the ordering obvious.
+		const digest = buildMonitorCompactionDigest({
+			monitorName: monitor.name,
+			instruction: monitor.instruction,
+			notes: this.#recentAuthoredNotes(monitor.monitorId),
+		});
+		// bumpEpoch is the existing rotation primitive: epoch + 1, turn_count 0 and
+		// the gjc binding cleared, so the next ensureSession mints a fresh session
+		// (and a fresh idempotency key) for this origin.
+		this.#database.withTransaction(() => this.#database.bumpEpoch(sessionOriginKey, originRefJson));
+		state.pendingRoll = undefined;
+		state.lastRoll = reason;
+		// The new epoch starts with a clean slate: the previous session's failure
+		// evidence is about a session that no longer exists.
+		state.contextFailures = 0;
+		state.executorFailures = 0;
+		state.orphanedExecutorFailures = 0;
+		state.protocolFailures = 0;
+		state.turns = 0;
+		console.error(
+			`monitor session rolled for ${sessionOriginKey} (monitor ${monitor.monitorId}): reason=${reason} native_compaction=${state.nativeCompaction ?? "not_attempted"} digest=${digest.length}B.`,
+		);
+		return digest;
+	}
+	/** Newest authored notes for one monitor, newest first, bounded by the digest budget. */
+	#recentAuthoredNotes(monitorId: string): MonitorDigestNote[] {
+		const notes: MonitorDigestNote[] = [];
+		for (const row of this.#database.monitorEventRows(monitorId)) {
+			if (notes.length >= MONITOR_DIGEST_MAX_NOTES) break;
+			const note = this.#database.authoredOutput(row.event_id);
+			if (note === undefined) continue;
+			notes.push({ eventType: row.event_type, firedAt: row.fired_at, note });
+		}
+		return notes;
 	}
 	/**
 	 * Renews every held lease on an interval (TTL/3) so the claim stays live for
@@ -558,10 +860,23 @@ export class MonitorPropagator {
 	}
 }
 
-function failureCode(error: unknown): DispatchFailureCode {
+function failureCode(error: unknown, failureClass: AuthoringFailureClass): DispatchFailureCode {
+	// Context exhaustion outranks the phase codes: it is the one class the safety
+	// net acts on, and an operator must be able to see it in the event row.
+	if (failureClass === "context") return "authoring_context_exhausted";
+	// A malformed or off-contract body is a response-contract failure, not a
+	// mystery internal error.
+	if (failureClass === "protocol") return "authoring_response_invalid";
+	// Executor class from here down, most specific first. An orphaned external
+	// run outranks the aside timeout: the same message usually looks like a
+	// timeout, but "external work is still running" is the actionable part. Both
+	// get their own code so neither can ever be aggregated with context
+	// exhaustion.
+	if (isOrphanedExecutorFailure(error)) return "orphaned_executor";
+	if (isAsideTimeoutFailure(error)) return "aside_timeout";
 	const message = error instanceof Error ? error.message : String(error);
-	if (message.includes("authoring response is not an array")) return "authoring_response_invalid";
 	if (message.includes("sendTurn")) return "authoring_turn_failed";
 	if (message.includes("ensureSession")) return "session_bind_failed";
+	if (/timeout|timed out|tool failed|external tool|lock/i.test(message)) return "executor_failed";
 	return "internal_error";
 }

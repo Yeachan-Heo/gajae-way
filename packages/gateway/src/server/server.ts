@@ -164,6 +164,11 @@ async function loadOrCreateLaneJob(
  * Completed turns per epoch before the session is rotated. Every `gjc --resume`
  * replays the whole transcript, so an unrotated busy origin gets slower forever;
  * durable memory (daily capture + recall) carries continuity across epochs.
+ *
+ * INBOUND CHAT ONLY. Monitor authoring sessions have NO turn ceiling: native
+ * gjc auto-compaction keeps them bounded, and monitors/compaction.ts is the
+ * safety net that rolls one only after repeated context-class failures with no
+ * successful native compaction (issue #68).
  */
 const SESSION_TURN_LIMIT = 50;
 
@@ -471,6 +476,7 @@ function createRuntime(options: GatewayServerOptions): Runtime {
 		memory,
 		delivery,
 		ownerTarget: options.config.ownerTarget,
+		contextFailureRollThreshold: options.config.monitorContextFailureRollThreshold,
 		emit: (payload) => {
 			for (const connection of connections)
 				if (connection.negotiated)

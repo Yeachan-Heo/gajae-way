@@ -64,6 +64,23 @@ test("turnTimeoutMs parses when bounded and rejects out-of-range values", () => 
 	expect(() => parseConfigFile({ schemaVersion: 1, turnTimeoutMs: "long" })).toThrow("turnTimeoutMs");
 });
 
+test("monitorContextFailureRollThreshold parses when bounded and rejects out-of-range values", () => {
+	expect(
+		parseConfigFile({ schemaVersion: 1, monitorContextFailureRollThreshold: 3 }).monitorContextFailureRollThreshold,
+	).toBe(3);
+	// Unset means the code default (MONITOR_CONTEXT_FAILURE_ROLL_THRESHOLD), not a config value.
+	expect(parseConfigFile({ schemaVersion: 1 }).monitorContextFailureRollThreshold).toBeUndefined();
+	expect(() => parseConfigFile({ schemaVersion: 1, monitorContextFailureRollThreshold: 0 })).toThrow(
+		"monitorContextFailureRollThreshold",
+	);
+	expect(() => parseConfigFile({ schemaVersion: 1, monitorContextFailureRollThreshold: 21 })).toThrow(
+		"monitorContextFailureRollThreshold",
+	);
+	expect(() => parseConfigFile({ schemaVersion: 1, monitorContextFailureRollThreshold: 2.5 })).toThrow(
+		"monitorContextFailureRollThreshold",
+	);
+});
+
 test("model accepts an explicit selector or a preset", () => {
 	expect(parseConfigFile({ schemaVersion: 1, model: "openai/gpt-5.2" }).model).toBe("openai/gpt-5.2");
 	expect(parseConfigFile({ schemaVersion: 1, model: { preset: "reliable" } }).model).toEqual({ preset: "reliable" });

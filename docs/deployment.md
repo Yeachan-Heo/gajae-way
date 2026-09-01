@@ -66,7 +66,7 @@ A running gateway re-reads `config.json` on `SIGHUP` (`kill -HUP <pid>`) or on t
 The reload is fail-safe and reports exactly what it did:
 
 - `changed` — fields applied live. Only `mentionAllowlist`, `channels`, and `debounceMs` are re-read at runtime; a change to one of these takes effect on the next turn.
-- `restartRequired` — fields you edited that are bound to a startup resource (`socketPath`, `dbPath`, `turnTimeoutMs`, `model`, `credentials`, `webhook`, `watcherRoots`, `scriptRoot`, `ownerTarget`). They are reported and deliberately NOT applied; restart to pick them up.
+- `restartRequired` — fields you edited that are bound to a startup resource (`socketPath`, `dbPath`, `turnTimeoutMs`, `model`, `credentials`, `webhook`, `watcherRoots`, `scriptRoot`, `ownerTarget`, `monitorContextFailureRollThreshold`). They are reported and deliberately NOT applied; restart to pick them up.
 - `ignored` — fields you edited that no code reads at all. `logVerbosity` is currently parsed but unconsumed, so editing it has no effect and no restart would give it one.
 - On a parse or validation error, or when `config.json` is missing or unreadable, the reload fails, keeps the previous configuration untouched, and returns a diagnostic. A missing file never publishes defaults over live policy, because that would drop the mention allowlist and open a mention-gated room.
 
