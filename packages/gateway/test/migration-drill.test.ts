@@ -16,7 +16,7 @@ test("migrates a migration-001 database to the latest schema", async () => {
 		legacy.close();
 
 		const database = await GatewayDatabase.open(path);
-		expect(database.schemaVersion).toBe(15);
+		expect(database.schemaVersion).toBe(16);
 		database.close();
 
 		const migrated = new Database(path, { readonly: true });
@@ -69,7 +69,7 @@ DELETE FROM schema_migrations WHERE version > 10;
 		v10.close();
 
 		const upgraded = await GatewayDatabase.open(path);
-		expect(upgraded.schemaVersion).toBe(15);
+		expect(upgraded.schemaVersion).toBe(16);
 		expect(upgraded.laneJobJson("lanejob-test")).toBe('{"schemaVersion":1}');
 		const tables = new Set(
 			new Database(path, { readonly: true })
@@ -114,7 +114,7 @@ DELETE FROM schema_migrations WHERE version = 13;
 		v12.close();
 
 		const upgraded = await GatewayDatabase.open(path);
-		expect(upgraded.schemaVersion).toBe(15);
+		expect(upgraded.schemaVersion).toBe(16);
 		expect(upgraded.laneJobJson("lanejob-v12")).toBe('{"schemaVersion":1}');
 		expect(upgraded.metaGet("rebind_budget:discord/channel/c1")).toBe('{"used":2,"lifetime":7}');
 		expect(upgraded.monitorSlotExists("monitor-v12", "2026-08-28T00:00:00.000Z")).toBe(true);
@@ -158,7 +158,7 @@ DELETE FROM schema_migrations WHERE version > 14;
 		v14.close();
 
 		const upgraded = await GatewayDatabase.open(path);
-		expect(upgraded.schemaVersion).toBe(15);
+		expect(upgraded.schemaVersion).toBe(16);
 		const rows = upgraded.monitorRows();
 		expect(rows).toHaveLength(1);
 		// The pre-existing monitor survives and reads back with no instruction.
@@ -192,4 +192,25 @@ test("online backup copy retains a session row", async () => {
 	} finally {
 		await rm(directory, { recursive: true, force: true });
 	}
+});
+
+test("upgrades a schema 15 database to 16 and keeps a per-conversation model override usable", async () => {
+	const directory = await mkdtemp(join(tmpdir(), "gw-migrate-16-"));
+	const path = join(directory, "gateway.db");
+	const latest = await GatewayDatabase.open(path);
+	latest.close();
+
+	// Recreate a deployed schema-15 database: no conversation_model table.
+	const v15 = new Database(path);
+	v15.exec(`
+DROP TABLE IF EXISTS conversation_model;
+DELETE FROM schema_migrations WHERE version > 15;
+`);
+	v15.close();
+
+	const upgraded = await GatewayDatabase.open(path);
+	expect(upgraded.schemaVersion).toBe(16);
+	upgraded.conversationModelSet("discord:c1", { preset: "gpt-heavy" }, "owner");
+	expect(upgraded.conversationModelGet("discord:c1")?.selection).toEqual({ preset: "gpt-heavy" });
+	upgraded.close();
 });

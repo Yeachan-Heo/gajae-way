@@ -55,6 +55,12 @@ export interface TurnOptions {
 	readonly onAssistantText?: (text: string, toolCallsSoFar?: number) => void;
 	/** Rebuilds epoch-bound trusted preamble after an automatic session rebind. */
 	readonly systemPreambleForEpoch?: (epoch: number) => string | Promise<string>;
+	/**
+	 * Per-turn model selection, overriding the gateway-wide `model` config
+	 * (#20). The selector is argv on the spawned process, so it takes effect
+	 * from the spawn it is passed to - never retroactively on a live session.
+	 */
+	readonly model?: GjcModelSelection;
 }
 
 export interface GjcPort {
@@ -488,7 +494,7 @@ export class GjcClient implements GjcPort {
 				"--mode",
 				"json",
 				...(options?.codingRegister ? [] : ["--system-prompt", GENERIC_AGENT_SYSTEM_PROMPT]),
-				...gjcModelArgs(this.#model),
+				...gjcModelArgs(options?.model ?? this.#model),
 				...(systemPreamble ? ["--append-system-prompt", systemPreamble] : []),
 				text,
 			],
