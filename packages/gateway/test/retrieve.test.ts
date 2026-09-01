@@ -43,3 +43,31 @@ test("korean queries match inflected forms via cjk character bigrams", async () 
 	const latin = await searchMemory(root, "resign");
 	expect(latin.find((hit) => hit.path === "decisions/other.md")).toBeUndefined();
 });
+
+test("a strong hit pulls its crosslinked neighbour in as a discounted secondary hit", async () => {
+	const { mkdtemp, mkdir, writeFile } = await import("node:fs/promises");
+	const { tmpdir } = await import("node:os");
+	const { join } = await import("node:path");
+	const { initializeMemory } = await import("../src/memory/doctrine");
+	const { searchMemory } = await import("../src/memory/retrieve");
+	const home = await mkdtemp(join(tmpdir(), "gajaeway-linkhop-"));
+	const root = await initializeMemory(home);
+	await mkdir(join(root, "decisions"), { recursive: true });
+	await mkdir(join(root, "people"), { recursive: true });
+	// The neighbour deliberately contains NO query terms: only the link reaches it.
+	await writeFile(join(root, "people/collab.md"), "# collab\n\n조용한 협력자 프로필.\n");
+	await writeFile(
+		join(root, "decisions/cutover.md"),
+		"# cutover decision\n\ncutover 결정은 [collab](../people/collab.md) 협의로 확정.\n",
+	);
+	const hits = await searchMemory(root, "cutover 결정");
+	expect(hits[0]?.path).toBe("decisions/cutover.md");
+	const neighbour = hits.find((hit) => hit.path === "people/collab.md");
+	expect(neighbour).toBeDefined();
+	expect(neighbour!.score).toBeLessThan(hits[0]!.score);
+	expect(neighbour!.excerpt).toContain("linked from decisions/cutover.md");
+	// Secondary hits never displace direct hits under a tight limit.
+	const tight = await searchMemory(root, "cutover 결정", 1);
+	expect(tight).toHaveLength(1);
+	expect(tight[0]?.path).toBe("decisions/cutover.md");
+});

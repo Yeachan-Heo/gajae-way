@@ -76,47 +76,72 @@ export async function searchMemory(
 	const documentFrequency = new Map<string, number>();
 	for (const document of tokens)
 		for (const term of new Set(document)) documentFrequency.set(term, (documentFrequency.get(term) ?? 0) + 1);
-	return (
-		documents
-			.map((document, index) => {
-				const counts = new Map<string, number>();
-				for (const term of tokens[index]) counts.set(term, (counts.get(term) ?? 0) + 1);
-				const score = terms.reduce((total, term) => {
-					const frequency = counts.get(term) ?? 0;
-					if (!frequency) return total;
-					const idf = Math.log(
-						1 +
-							(documents.length - (documentFrequency.get(term) ?? 0) + 0.5) /
-								((documentFrequency.get(term) ?? 0) + 0.5),
-					);
-					return (
-						total +
-						idf * ((frequency * 2.2) / (frequency + 1.2 * (1 - 0.75 + (0.75 * tokens[index].length) / averageLength)))
-					);
-				}, 0);
-				const lower = document.text.toLowerCase();
-				const match =
-					terms
-						.map((term) => lower.indexOf(term))
-						.filter((at) => at >= 0)
-						.sort((a, b) => a - b)[0] ?? 0;
-				return {
-					path: document.path,
-					score,
-					excerpt: document.text.slice(Math.max(0, match - 50), Math.max(0, match - 50) + 200).replace(/\s+/g, " "),
-				};
-			})
-			.filter((hit) => hit.score > 0)
-			// Equal-scoring documents are ordered by the axis's declared retrieval
-			// priority, so operating doctrine outranks raw capture on a tie instead of
-			// whichever path happens to sort first.
-			.sort(
-				(a, b) =>
-					b.score - a.score ||
-					priority(b.path) - priority(a.path) ||
-					(mappedSet.has(b.path) ? 1 : 0) - (mappedSet.has(a.path) ? 1 : 0) ||
-					a.path.localeCompare(b.path),
-			)
-			.slice(0, Math.max(0, Math.min(50, Math.floor(limit))))
-	);
+	const scored = documents
+		.map((document, index) => {
+			const counts = new Map<string, number>();
+			for (const term of tokens[index]) counts.set(term, (counts.get(term) ?? 0) + 1);
+			const score = terms.reduce((total, term) => {
+				const frequency = counts.get(term) ?? 0;
+				if (!frequency) return total;
+				const idf = Math.log(
+					1 +
+						(documents.length - (documentFrequency.get(term) ?? 0) + 0.5) / ((documentFrequency.get(term) ?? 0) + 0.5),
+				);
+				return (
+					total +
+					idf * ((frequency * 2.2) / (frequency + 1.2 * (1 - 0.75 + (0.75 * tokens[index].length) / averageLength)))
+				);
+			}, 0);
+			const lower = document.text.toLowerCase();
+			const match =
+				terms
+					.map((term) => lower.indexOf(term))
+					.filter((at) => at >= 0)
+					.sort((a, b) => a - b)[0] ?? 0;
+			return {
+				path: document.path,
+				score,
+				excerpt: document.text.slice(Math.max(0, match - 50), Math.max(0, match - 50) + 200).replace(/\s+/g, " "),
+			};
+		})
+		.filter((hit) => hit.score > 0)
+		// Equal-scoring documents are ordered by the axis's declared retrieval
+		// priority, so operating doctrine outranks raw capture on a tie instead of
+		// whichever path happens to sort first.
+		.sort(
+			(a, b) =>
+				b.score - a.score ||
+				priority(b.path) - priority(a.path) ||
+				(mappedSet.has(b.path) ? 1 : 0) - (mappedSet.has(a.path) ? 1 : 0) ||
+				a.path.localeCompare(b.path),
+		);
+	const cap = Math.max(0, Math.min(50, Math.floor(limit)));
+	const top = scored.slice(0, cap);
+	// Link expansion: canonical notes crosslink related people/projects/decisions,
+	// so a strong hit pulls its 1-hop neighbours in as discounted secondary hits.
+	// That stitches context BM25 alone cannot see (the neighbour may not contain
+	// the query terms at all), without ever displacing a direct lexical hit.
+	if (top.length && top.length < cap) {
+		const have = new Set(top.map((hit) => hit.path));
+		const byPath = new Map(documents.map((document) => [document.path, document]));
+		for (const hit of [...top]) {
+			if (top.length >= cap) break;
+			const source = byPath.get(hit.path);
+			if (!source) continue;
+			for (const match of source.text.matchAll(/\]\(([^)#\s]+\.md)\)/g)) {
+				if (top.length >= cap) break;
+				const neighbour = safePointer(root, join(hit.path, "..", match[1] as string));
+				if (!neighbour || have.has(neighbour) || !byPath.has(neighbour)) continue;
+				have.add(neighbour);
+				const text = byPath.get(neighbour)?.text ?? "";
+				top.push({
+					path: neighbour,
+					score: hit.score * 0.3,
+					excerpt: `[linked from ${hit.path}] ${text.slice(0, 180).replace(/\s+/g, " ")}`,
+				});
+			}
+		}
+		top.sort((a, b) => b.score - a.score || priority(b.path) - priority(a.path) || a.path.localeCompare(b.path));
+	}
+	return top;
 }
