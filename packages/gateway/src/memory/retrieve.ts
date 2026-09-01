@@ -8,7 +8,21 @@ export interface MemoryHit {
 	score: number;
 	excerpt: string;
 }
-const words = (text: string) => text.toLowerCase().match(/[\p{L}\p{N}_]+/gu) ?? [];
+// CJK text is unsegmented/agglutinative: a whole-word tokenizer makes the
+// inflected form ("정본화를") a different term from its stem ("정본화"), so
+// Korean queries silently missed. CJK words therefore index their character
+// bigrams alongside the whole word, symmetrically for documents and queries.
+const CJK_RE = /[\u1100-\u11ff\u3040-\u30ff\u3130-\u318f\u4e00-\u9fff\uac00-\ud7af]/u;
+const words = (text: string): string[] => {
+	const terms = text.toLowerCase().match(/[\p{L}\p{N}_]+/gu) ?? [];
+	const out: string[] = [];
+	for (const term of terms) {
+		out.push(term);
+		if (term.length >= 2 && CJK_RE.test(term))
+			for (let index = 0; index < term.length - 1; index++) out.push(term.slice(index, index + 2));
+	}
+	return out;
+};
 
 async function pointers(root: string): Promise<string[]> {
 	const map = await readFile(join(root, "MEMORY.md"), "utf8");

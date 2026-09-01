@@ -22,3 +22,24 @@ test("retrieves mapped Markdown with BM25", async () => {
 		await rm(home, { recursive: true, force: true });
 	}
 });
+
+test("korean queries match inflected forms via cjk character bigrams", async () => {
+	const { mkdtemp } = await import("node:fs/promises");
+	const { tmpdir } = await import("node:os");
+	const { join } = await import("node:path");
+	const { mkdir, writeFile } = await import("node:fs/promises");
+	const { initializeMemory } = await import("../src/memory/doctrine");
+	const { searchMemory } = await import("../src/memory/retrieve");
+	const home = await mkdtemp(join(tmpdir(), "gajaeway-cjk-"));
+	const root = await initializeMemory(home);
+	await mkdir(join(root, "decisions"), { recursive: true });
+	await writeFile(join(root, "decisions/canon.md"), "# 결정\n\n정본화를 매 6시간 주기로 돌린다.\n");
+	await writeFile(join(root, "decisions/other.md"), "# 결정\n\n배포 절차는 재서명을 포함한다.\n");
+	// Stem query hits the document that only contains the inflected form.
+	const hits = await searchMemory(root, "정본화 주기");
+	expect(hits.length).toBeGreaterThanOrEqual(1);
+	expect(hits[0]?.path).toBe("decisions/canon.md");
+	// Latin behavior unchanged: exact word match still required.
+	const latin = await searchMemory(root, "resign");
+	expect(latin.find((hit) => hit.path === "decisions/other.md")).toBeUndefined();
+});
