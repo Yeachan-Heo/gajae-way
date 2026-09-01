@@ -71,3 +71,29 @@ test("a strong hit pulls its crosslinked neighbour in as a discounted secondary 
 	expect(tight).toHaveLength(1);
 	expect(tight[0]?.path).toBe("decisions/cutover.md");
 });
+
+test("tags boost ranking and pull tag-group neighbours in as secondary hits", async () => {
+	const { mkdtemp, mkdir, writeFile } = await import("node:fs/promises");
+	const { tmpdir } = await import("node:os");
+	const { join } = await import("node:path");
+	const { initializeMemory } = await import("../src/memory/doctrine");
+	const { searchMemory } = await import("../src/memory/retrieve");
+	const home = await mkdtemp(join(tmpdir(), "gajaeway-tags-"));
+	const root = await initializeMemory(home);
+	await mkdir(join(root, "ops/rules"), { recursive: true });
+	await mkdir(join(root, "decisions"), { recursive: true });
+	// Tagged note mentions the term once; untagged note mentions it once too —
+	// the tag must break the tie in the tagged note's favor.
+	await writeFile(join(root, "ops/rules/deploy.md"), "---\ntags: [deployment]\n---\n# 배포 규칙\n\n배포 절차.\n");
+	await writeFile(join(root, "decisions/log.md"), "# 기록\n\n배포 언급 한 번.\n");
+	// Same tag, zero query terms in its body: reachable only through the tag group.
+	await writeFile(
+		join(root, "ops/rules/rollback.md"),
+		"---\ntags: [deployment]\n---\n# 롤백 규칙\n\n되돌리기 절차만 서술.\n",
+	);
+	const hits = await searchMemory(root, "배포");
+	expect(hits[0]?.path).toBe("ops/rules/deploy.md");
+	const grouped = hits.find((hit) => hit.path === "ops/rules/rollback.md");
+	expect(grouped).toBeDefined();
+	expect(grouped!.excerpt).toContain("shared tag #deployment");
+});

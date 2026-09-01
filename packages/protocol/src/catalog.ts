@@ -526,6 +526,10 @@ export interface VerbCatalogV01 {
 	"session.recall": { params: SessionRecallParams; result: SessionRecallResult };
 	"session.list": { params: undefined; result: SessionListResult };
 	"memory.audit": { params: undefined; result: MemoryAuditResult };
+	"memory.autolink": {
+		params: undefined;
+		result: { readonly filesChanged: number; readonly linksAdded: number; readonly aliases: number };
+	};
 	"memory.search": { params: MemorySearchParams; result: MemorySearchResult };
 	"monitor.add": { params: MonitorSpec; result: { readonly monitorId: string } };
 	"monitor.list": { params: undefined; result: { readonly monitors: readonly MonitorRecord[] } };
@@ -564,6 +568,7 @@ export const VERBS_V01 = [
 	"session.recall",
 	"session.list",
 	"memory.audit",
+	"memory.autolink",
 	"memory.search",
 	"monitor.add",
 	"monitor.list",

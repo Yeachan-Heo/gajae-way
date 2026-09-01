@@ -41,6 +41,7 @@ import { DeliveryService } from "../delivery/delivery";
 import { ReactionBudget } from "../delivery/reaction-budget";
 import { decideEngagement } from "../engagement/policy";
 import { ACTION_GUARD_SYSTEM_NOTICE } from "../guard/action-guard";
+import { autolinkCorpus } from "../memory/autolink";
 import { MemoryClosureQueue } from "../memory/closure";
 import { initializeMemory } from "../memory/doctrine";
 import { searchMemory } from "../memory/retrieve";
@@ -875,6 +876,14 @@ async function handleRequest(
 				id: request.id,
 				result: { ok: issues.length === 0, issues },
 			});
+			return;
+		}
+		case "memory.autolink": {
+			// Deterministic crosslink sweep: alias index from canonical filenames,
+			// titles, and frontmatter aliases; first mention per file gets linked.
+			const root = await initializeMemory(options.config.home);
+			const report = await autolinkCorpus(root);
+			connection.write({ v: PROFILE_VERSION, type: "response", id: request.id, result: report });
 			return;
 		}
 		case "memory.search": {
