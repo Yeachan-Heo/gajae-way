@@ -57,6 +57,7 @@ import { buildSessionBootstrap, type SessionBootstrap } from "../persona/bootstr
 import { PersonaLoader } from "../persona/persona";
 import type { GatewayDatabase, InboundMessageRow, MonitorEventStage } from "../store/db";
 import { DeliveryLedger } from "../store/ledger";
+import { OrderedFrameWriter } from "./frame-writer";
 import { InterimSpeechGate, type InterimSpeechLimits } from "./interim-speech";
 import { KeyedQueue } from "./keyed-queue";
 import { composeSpeakerLabel, composeTurnHeader } from "./speaker";
@@ -171,10 +172,31 @@ interface Connection {
 	negotiated: boolean;
 	write(frame: Frame): void;
 	close(): void;
+	settle(): Promise<void>;
 }
 export interface GatewayServer {
 	stop(reason?: string): Promise<void>;
 }
+
+async function settleConnection(connection: Connection, timeoutMs: number): Promise<void> {
+	let timer: ReturnType<typeof setTimeout> | undefined;
+	let timedOut = false;
+	await Promise.race([
+		connection.settle(),
+		new Promise<void>((resolve) => {
+			timer = setTimeout(() => {
+				timedOut = true;
+				resolve();
+			}, timeoutMs);
+		}),
+	]);
+	if (timer !== undefined) clearTimeout(timer);
+	if (timedOut) {
+		connection.close();
+		await connection.settle();
+	}
+}
+
 export interface GatewayServerOptions {
 	readonly config: GatewayConfig;
 	readonly database: GatewayDatabase;
@@ -260,6 +282,8 @@ interface Runtime {
 	readonly reactions: ReactionBudget;
 	/** Accepted-but-not-yet-dispatched inbound messages, keyed by message id. */
 	readonly inbound: Map<string, InboundContext>;
+	/** Every admitted request except the shutdown request itself, so stop() can quiesce all writers. */
+	readonly requests: Set<Promise<void>>;
 	/** Read-only runtime-cycle projection (ops.cycle); owns no writes. */
 	readonly cycle: RuntimeCycleProjector;
 }
@@ -295,64 +319,67 @@ export async function startUnixServer(options: GatewayServerOptions): Promise<Ga
 		stopping = true;
 		stopPromise = (async () => {
 			process.off("SIGHUP", onHup);
-			for (const connection of runtime.connections)
-				connection.write({ v: PROFILE_VERSION, type: "event", event: "gateway.stopping", payload: { reason } });
-			listener.stop(true);
 			clearInterval(runtime.reconcileTimer);
 			clearInterval(runtime.contextMaintenanceTimer);
-			// In-flight turn drains still touch the database; close it under them and
-			// their completion bookkeeping crashes ("Cannot use a closed database").
+			// Stop accepting new sockets first, but keep existing sockets alive. Then
+			// quiesce every admitted producer before taking the final writer snapshot.
+			listener.stop(false);
+			await Promise.all([...runtime.requests]);
 			await runtime.turns.settle();
 			await runtime.monitorRuntime.stop();
+			for (const connection of runtime.connections)
+				connection.write({ v: PROFILE_VERSION, type: "event", event: "gateway.stopping", payload: { reason } });
+			await Promise.all([...runtime.connections].map((connection) => settleConnection(connection, 5_000)));
+			listener.stop(true);
 			await settleMemory(runtime);
 			await options.onStop?.();
 		})();
 		return stopPromise;
 	};
-	listener = Bun.listen<{ connection: Connection; flush: () => void }>({
+	listener = Bun.listen<{ connection: Connection; writer: OrderedFrameWriter }>({
 		unix: options.config.socketPath,
 		socket: {
 			open(socket) {
-				// Backpressure-safe writes: socket.write may accept only part of a
-				// large frame (live finding: a 236-issue audit response truncated
-				// mid-line and the CLI died with "frame is not valid JSON"). Frames
-				// queue in an outbox that drains as the kernel buffer frees up.
-				let outbox = Buffer.alloc(0);
-				const flush = () => {
-					while (outbox.length > 0) {
-						const written = socket.write(outbox);
-						if (written <= 0) return;
-						outbox = outbox.subarray(written);
-					}
-				};
+				const writer = new OrderedFrameWriter(
+					{ write: (bytes) => socket.write(bytes), close: () => socket.end() },
+					(error) =>
+						console.error(`gateway socket write failed: ${error instanceof Error ? error.message : String(error)}`),
+				);
 				const connection: Connection = {
 					decoder: new FrameDecoder(),
 					negotiated: false,
-					write: (frame) => {
-						outbox = Buffer.concat([outbox, Buffer.from(encodeFrame(frame))]);
-						flush();
-					},
-					close: () => socket.end(),
+					write: (frame) => writer.write(frame),
+					close: () => writer.close(),
+					settle: () => writer.settled(),
 				};
-				socket.data = { connection, flush };
+				socket.data = { connection, writer };
 				runtime.connections.add(connection);
 			},
 			data(socket, data) {
 				const connection = socket.data.connection;
 				try {
-					for (const frame of connection.decoder.feed(Buffer.from(data).toString()))
-						void handleFrame(connection, frame, options, runtime, stop, () => stopping);
+					for (const frame of connection.decoder.feed(Buffer.from(data).toString())) {
+						const task = handleFrame(connection, frame, options, runtime, stop, () => stopping);
+						if (frame.type === "request" && frame.verb === "gateway.shutdown") continue;
+						runtime.requests.add(task);
+						void task.then(
+							() => runtime.requests.delete(task),
+							() => runtime.requests.delete(task),
+						);
+					}
 				} catch (error) {
 					writeError(connection, error);
 				}
 			},
 			drain(socket) {
-				socket.data.flush();
+				socket.data.writer.drain();
 			},
 			close(socket) {
+				socket.data.writer.close();
 				runtime.connections.delete(socket.data.connection);
 			},
-			error(_socket, error) {
+			error(socket, error) {
+				socket.data.writer.fail(error);
 				console.error(`gateway socket error: ${error.message}`);
 			},
 		},
@@ -370,6 +397,7 @@ export function startStdioServer(options: GatewayServerOptions): GatewayServer {
 		negotiated: false,
 		write: (frame) => process.stdout.write(encodeFrame(frame)),
 		close: () => process.stdin.pause(),
+		settle: async () => {},
 	};
 	runtime.connections.add(connection);
 	let stopping = false;
@@ -482,6 +510,7 @@ function createRuntime(options: GatewayServerOptions): Runtime {
 		reactions: new ReactionBudget(),
 		cycle: new RuntimeCycleProjector(options.database, memory),
 		inbound: new Map(),
+		requests: new Set(),
 	};
 }
 /**
