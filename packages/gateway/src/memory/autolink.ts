@@ -131,34 +131,42 @@ export function autolinkText(
 	selfPath: string,
 	index: readonly AliasEntry[],
 ): { text: string; added: number } {
-	let out = text;
-	let added = 0;
+	// Single pass over the file: protected ranges are computed ONCE and edits are
+	// collected first, then applied back-to-front so offsets stay valid. The
+	// original per-alias rescan was O(aliases x text) and blocked the gateway
+	// event loop for minutes on a 2,400-file corpus (live gaebal-gajae incident:
+	// 90%+ CPU, status/audit timeouts while the sweep ran).
+	const ranges = protectedRanges(text);
+	const edits: Array<{ start: number; end: number; target: string }> = [];
+	const taken: Array<[number, number]> = [];
 	for (const entry of index) {
 		if (entry.path === selfPath) continue;
 		const target = relative(join(selfPath, ".."), entry.path).replaceAll("\\", "/");
 		// One link per target per file, ever: a file that already links this
 		// canonical note (by hand or by an earlier sweep) is left alone. This is
 		// what makes the sweep idempotent and keeps prose from turning blue.
-		if (out.includes(`](${target})`)) continue;
-		const ranges = protectedRanges(out);
+		if (text.includes(`](${target})`) || edits.some((edit) => edit.target === target)) continue;
 		const pattern = new RegExp(entry.alias.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), "giu");
-		for (const match of out.matchAll(pattern)) {
+		for (const match of text.matchAll(pattern)) {
 			const start = match.index;
 			const end = start + match[0].length;
-			if (inRanges(ranges, start, end)) continue;
+			if (inRanges(ranges, start, end) || inRanges(taken, start, end)) continue;
 			// Boundaries: prefix-strict (no letter/digit before, so "가재" never
 			// matches inside "웨이가재"), suffix Latin-strict only — Korean particles
 			// attach directly to the noun ("개발가재를"), so a CJK suffix is a valid
 			// mention edge while a Latin/digit suffix is a longer identifier.
-			const before = out[start - 1] ?? " ";
-			const after = out[end] ?? " ";
+			const before = text[start - 1] ?? " ";
+			const after = text[end] ?? " ";
 			if (/[\p{L}\p{N}_]/u.test(before) || /[A-Za-z0-9_]/.test(after)) continue;
-			out = `${out.slice(0, start)}[${match[0]}](${target})${out.slice(end)}`;
-			added++;
+			edits.push({ start, end, target });
+			taken.push([start, end]);
 			break; // first occurrence per alias per file
 		}
 	}
-	return { text: out, added };
+	let out = text;
+	for (const edit of edits.sort((a, b) => b.start - a.start))
+		out = `${out.slice(0, edit.start)}[${out.slice(edit.start, edit.end)}](${edit.target})${out.slice(edit.end)}`;
+	return { text: out, added: edits.length };
 }
 
 export async function autolinkCorpus(root: string): Promise<AutolinkReport> {
@@ -178,7 +186,8 @@ export async function autolinkCorpus(root: string): Promise<AutolinkReport> {
 	const index = await buildAliasIndex(root, files, texts);
 	let filesChanged = 0;
 	let linksAdded = 0;
-	for (const path of files) {
+	for (let position = 0; position < files.length; position++) {
+		const path = files[position] as string;
 		const text = texts.get(path);
 		if (text === undefined) continue;
 		const { text: rewritten, added } = autolinkText(text, path, index);
@@ -187,6 +196,8 @@ export async function autolinkCorpus(root: string): Promise<AutolinkReport> {
 			filesChanged++;
 			linksAdded += added;
 		}
+		// Yield the event loop regularly: the sweep must never freeze live turns.
+		if (position % 20 === 19) await Bun.sleep(0);
 	}
 	if (filesChanged > 0) {
 		await regenerateMap(root, registry);
