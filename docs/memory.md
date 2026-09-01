@@ -51,7 +51,7 @@ An axis is not a name in a list. It is a **descriptor** that tells every other p
 | `appendOnly` | entries are only ever appended to, never rewritten in place |
 | `promotesTo` | axis ids this axis promotes durable material into; must be acyclic |
 
-The built-in axes live in exactly one place, `packages/gateway/src/memory/registry.ts`. A deployment adds its own without editing that module by writing `memory/axes.json`:
+The built-in axes live in exactly one place, `packages/gateway/src/memory/registry.ts`. A deployment adds its own — or restates a built-in — without editing that module by writing `memory/axes.json`:
 
 ```json
 {
@@ -76,7 +76,9 @@ The built-in axes live in exactly one place, `packages/gateway/src/memory/regist
 
 Only `id` is required; every other field takes the documented default (`root` defaults to the id, `nesting` to `nested`, `index` to `recent`, `layout` to `free`, `orphanPolicy` to `any-depth`, `retrievalPriority` to `0`, `appendOnly` to whether the layout is dated). A registered axis is created, indexed, audited and searched by the same code as a built-in.
 
-The registry **fails closed**. Startup refuses to run, rather than quietly dropping an axis and orphaning everything under it, when a declaration has an id that collides with another axis, a root that contains or sits inside another axis's root, a promotion target that is not registered, a promotion cycle, an unknown field, or any malformed value. Registration is also the *only* way a directory becomes canonical: writing into an unregistered directory never promotes it, and the audit keeps reporting it as an orphan.
+A declaration whose `id` names a built-in **replaces** that built-in wholesale: the built-in set is a default, not a floor. This is how a deployment whose `ops/` tree grew its own partitions (`ops/incidents/`, `ops/runbooks/`, …) clears `axis_layout_violation` without moving a single file — restate `ops` with the partitions the corpus actually uses, or with `"orphanPolicy": "any-depth"` if it should stop being partitioned at all. Because the replacement is wholesale, every field is taken from the declaration, so omitted fields fall back to the documented default rather than the built-in's value.
+
+The registry **fails closed**. Startup refuses to run, rather than quietly dropping an axis and orphaning everything under it, when a declaration is repeated twice, claims a root that contains or sits inside another axis's root, has a promotion target that is not registered, closes a promotion cycle, carries an unknown field, or holds any malformed value. Registration is also the *only* way a directory becomes canonical: writing into an unregistered directory never promotes it, and the audit keeps reporting it as an orphan.
 
 ### What each built-in takes and refuses
 
@@ -143,7 +145,7 @@ It returns JSON issues and exits non-zero when memory is not structurally sound.
 
 - `map_dangling` — a `MEMORY.md` pointer does not exist.
 - `unmapped_axis_dir` — an axis has no heading in the map.
-- `long_form_map` — a map line exceeds 200 characters.
+- `long_form_map` — a map line carries more than 200 characters of prose. A link is measured by its text, not by its target, so a generated pointer to a deep path is navigation rather than long-form content.
 - `duplicate_file_hash` — two Markdown files have identical content.
 - `orphan_file` — Markdown exists outside every registered axis root (except `MEMORY.md`); register the axis in `axes.json` to make it canonical.
 - `out_of_root_link` — a Markdown link or map pointer escapes the memory root. Percent-escapes are decoded first, so `%2e%2e/secret.md` is reported as an escape rather than a missing file.
@@ -151,6 +153,8 @@ It returns JSON issues and exits non-zero when memory is not structurally sound.
 - `map_content_drift` — the map does not point to the newest entry of an append-only axis (`daily`, `reflections`).
 
 Audit before manual repair. Repair the source Markdown or map generation problem, not the diagnostic evidence.
+
+The audit is **read-only and takes no arguments**: there is no `--fix`, and passing one is refused rather than ignored, because a flag that silently degraded to a plain audit would look like a repair attempt that reproduced the failure. Repair is by hand and by policy — register the directory in `axes.json` (`orphan_file`), restate the axis with the partitions the corpus actually uses (`axis_layout_violation`), or move/merge the files — and then re-run the audit.
 
 ## Retrieval and quality checks
 

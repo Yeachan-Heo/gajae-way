@@ -7,6 +7,7 @@ import {
 	type AxisDescriptor,
 	BUILT_IN_AXES,
 	createRegistry,
+	layoutViolation,
 	loadRegistry,
 	REGISTRY_FILE,
 } from "../src/memory/registry";
@@ -439,8 +440,63 @@ test("an unregistered directory is an orphan and is never auto-promoted to canon
 
 // ------------------------------------------------------- fail-closed registry
 
-test("a custom axis may not take a built-in id", async () => {
-	expect(() => createRegistry([{ ...RUNBOOK, id: "ops", root: "ops-custom" }])).toThrow(/already registered/);
+test("a declaration that names a built-in replaces it instead of being rejected", async () => {
+	const registry = createRegistry([
+		{ ...RUNBOOK, id: "ops", root: "ops", partitions: ["rules", "runbooks", "incidents"], promotesTo: [] },
+	]);
+	const ops = registry.byId("ops");
+	expect(ops?.partitions).toEqual(["rules", "runbooks", "incidents"]);
+	// Replacement, not addition: exactly one axis owns the id and the root.
+	expect(registry.axes.filter((axis) => axis.id === "ops")).toHaveLength(1);
+	expect(registry.axes).toHaveLength(BUILT_IN_AXES.length);
+	// The override is what layout policy is judged against, so a corpus partition
+	// the built-in never knew about stops being a violation.
+	expect(layoutViolation(ops as AxisDescriptor, "ops/incidents/2026-08-14-lock.md")).toBeUndefined();
+	expect(layoutViolation(ops as AxisDescriptor, "ops/handoffs/old.md")).toContain("declared partition");
+});
+
+test("an override still may not claim another axis's root, and may not be declared twice", async () => {
+	expect(() => createRegistry([{ ...RUNBOOK, id: "ops", root: "daily/ops" }])).toThrow(/overlaps axis daily/);
+	expect(() =>
+		createRegistry([
+			{ ...RUNBOOK, id: "ops", root: "ops" },
+			{ ...RUNBOOK, id: "ops", root: "ops" },
+		]),
+	).toThrow(/declared twice/);
+});
+
+test("a built-in that another built-in promotes into survives being overridden", async () => {
+	// daily promotes into ops; replacing ops must keep that target resolvable.
+	const registry = createRegistry([{ ...RUNBOOK, id: "ops", root: "ops", promotesTo: [] }]);
+	expect(registry.byId("daily")?.promotesTo).toContain("ops");
+	expect(registry.byId("ops")?.displayName).toBe(RUNBOOK.displayName);
+});
+
+test("overriding a built-in clears the layout violations its declared partitions caused", async () => {
+	// The gajaeway host case: an ops/ tree that grew incidents/, runbooks/ and
+	// infra/ long before the built-in's three partitions were written down.
+	const root = await withCustomAxes({
+		id: "ops",
+		displayName: "Operating doctrine",
+		root: "ops",
+		nesting: "nested",
+		partitions: ["rules", "distillations", "handoffs", "incidents", "runbooks", "infra"],
+		index: "tree",
+		orphanPolicy: "partitioned",
+	});
+	await initializeMemory(home);
+	for (const path of ["ops/incidents/2026-08-14-lock.md", "ops/infra/services.md"]) {
+		await mkdir(join(root, path, ".."), { recursive: true });
+		await writeFile(join(root, path), `# ${path}\n`);
+	}
+	await regenerateMap(root);
+
+	expect((await validateMemory(root)).filter((issue) => issue.path.startsWith("ops/"))).toEqual([]);
+	// Still partitioned: a file directly under the root remains a violation.
+	await writeFile(join(root, "ops/loose.md"), "# loose\n");
+	expect((await validateMemory(root)).map((issue) => `${issue.code}:${issue.path}`)).toContain(
+		"axis_layout_violation:ops/loose.md",
+	);
 });
 
 test("a custom axis may not overlap another axis's canonical root", async () => {
