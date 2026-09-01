@@ -280,6 +280,12 @@ export async function main(args = process.argv.slice(2)): Promise<void> {
 				break;
 			}
 			case "memory": {
+				const usage = "usage: gajaeway memory audit|autolink|search <query>";
+				// An unrecognised argument is refused before the socket is opened rather
+				// than ignored: a run of `memory audit --fix` that silently degraded to a
+				// plain audit would read as a repair attempt that reproduced the failure.
+				if ((parsed.rest[0] === "audit" || parsed.rest[0] === "autolink") && parsed.rest.length > 1)
+					throw new Error(`${usage} (unknown argument: ${parsed.rest[1]})`);
 				const client = await GajaewayClient.connectSocket(parsed.socket);
 				try {
 					if (parsed.rest[0] === "audit") {
@@ -292,7 +298,7 @@ export async function main(args = process.argv.slice(2)): Promise<void> {
 						console.log(
 							JSON.stringify(await client.request("memory.search", { query: parsed.rest.slice(1).join(" ") })),
 						);
-					} else throw new Error("usage: gajaeway memory audit|autolink|search <query>");
+					} else throw new Error(usage);
 				} finally {
 					await client.close();
 				}

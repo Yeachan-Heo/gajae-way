@@ -24,8 +24,12 @@ export async function validateMemory(root: string, registry?: AxisRegistry): Pro
 	const mapPath = join(root, "MEMORY.md");
 	const map = await readFile(mapPath, "utf8");
 	const pointers = [...map.matchAll(/\]\(([^)]+\.md)\)/g)].map((match) => match[1]);
+	// The rule bans long-form prose in a navigation-only map, so a line is measured
+	// as what it says, not as what it points at: a generated `- [path](path)`
+	// pointer counts its path once. Otherwise a legitimately deep corpus path makes
+	// the generated map fail an audit that no operator action could ever clear.
 	for (const [index, line] of map.split("\n").entries())
-		if (line.length > 200)
+		if (line.replaceAll(/\[([^\]]*)\]\([^)]*\)/g, "$1").length > 200)
 			issues.push({ code: "long_form_map", path: "MEMORY.md", message: `line ${index + 1} exceeds 200 characters` });
 	for (const pointer of pointers) {
 		// Confinement is judged once, by the link scan below, which sees MEMORY.md as

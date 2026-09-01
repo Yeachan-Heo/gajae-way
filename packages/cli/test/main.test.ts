@@ -10,6 +10,23 @@ describe("cli arguments", () => {
 		expect(socketPath("/tmp/gajae")).toBe("/tmp/gajae/gateway.sock");
 		expect(parseArgs(["--socket", "/tmp/x", "status"])).toEqual({ command: "status", rest: [], socket: "/tmp/x" });
 	});
+
+	test("an unknown memory-audit argument is refused instead of degrading to a plain audit", async () => {
+		// `memory audit --fix` used to connect, run the read-only audit and exit 1,
+		// which reads as a repair attempt that reproduced the failure.
+		const errors: string[] = [];
+		const console_error = console.error;
+		console.error = (message: unknown) => errors.push(String(message));
+		const previousExit = process.exitCode;
+		try {
+			await main(["--socket", join(tmpdir(), "gajaeway-absent.sock"), "memory", "audit", "--fix"]);
+			expect(errors.join("\n")).toContain("unknown argument: --fix");
+			expect(process.exitCode).toBe(1);
+		} finally {
+			console.error = console_error;
+			process.exitCode = previousExit ?? 0;
+		}
+	});
 });
 
 describe("list flag validation", () => {

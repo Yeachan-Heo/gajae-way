@@ -37,6 +37,13 @@ test("validator reports long_form_map", async () => {
 	await appendFile(join(memory, "MEMORY.md"), `${"x".repeat(201)}\n`);
 	await issue("long_form_map");
 });
+test("a generated pointer to a deep path is navigation, not long-form prose", async () => {
+	const memory = await root();
+	const deep = `daily/${"nested-directory-with-a-long-name/".repeat(3)}entry.md`;
+	await appendFile(join(memory, "MEMORY.md"), `- [${deep}](${deep})\n`);
+	// The rendered line is 240 characters; what it says is 111.
+	expect((await validateMemory(memory)).some((found) => found.code === "long_form_map")).toBe(false);
+});
 test("validator reports duplicate_file_hash", async () => {
 	const memory = await root();
 	await writeFile(join(memory, "daily", "a.md"), "same\n");

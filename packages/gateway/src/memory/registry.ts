@@ -370,24 +370,32 @@ function assertAcyclic(axes: readonly AxisDescriptor[]): void {
 }
 
 /**
- * Build a registry from the built-ins plus declared custom axes. Fails closed on
- * every ambiguity: a custom axis may not take a built-in's id, may not claim a
- * root that contains or sits inside another axis's root, may not promote into an
- * axis that does not exist, and may not close a promotion cycle.
+ * Build a registry from the built-ins plus declared custom axes. A declaration
+ * whose id names a built-in *replaces* that built-in in place: the built-in set
+ * is a default, not a floor, so a deployment whose `ops` corpus has its own
+ * partitions restates the axis instead of editing this module or moving files.
+ * Everything else fails closed: two declarations may not share an id, a root may
+ * not contain or sit inside another axis's root, and a promotion target must
+ * exist and must not close a cycle.
  */
 export function createRegistry(custom: readonly unknown[] = []): AxisRegistry {
 	const axes = [...BUILT_IN_AXES];
+	const declaredIds = new Set<string>();
 	for (const declared of custom) {
 		const axis = parseDescriptor(declared);
-		const clash = axes.find((existing) => existing.id === axis.id);
-		if (clash) throw new AxisRegistryError("duplicate_axis_id", `axis id ${axis.id} is already registered`);
-		const overlap = axes.find((existing) => overlaps(existing.root, axis.root) || overlaps(axis.root, existing.root));
+		if (declaredIds.has(axis.id))
+			throw new AxisRegistryError("duplicate_axis_id", `axis id ${axis.id} is declared twice`);
+		declaredIds.add(axis.id);
+		const replaced = axes.findIndex((existing) => existing.id === axis.id);
+		const others = axes.filter((_, index) => index !== replaced);
+		const overlap = others.find((existing) => overlaps(existing.root, axis.root) || overlaps(axis.root, existing.root));
 		if (overlap)
 			throw new AxisRegistryError(
 				"overlapping_axis_root",
 				`axis ${axis.id} root ${axis.root} overlaps axis ${overlap.id} root ${overlap.root}`,
 			);
-		axes.push(axis);
+		if (replaced === -1) axes.push(axis);
+		else axes[replaced] = axis;
 	}
 	assertAcyclic(axes);
 	const byId = new Map(axes.map((axis) => [axis.id, axis]));
