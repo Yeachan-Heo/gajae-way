@@ -113,6 +113,21 @@ describe("session bootstrap builder", () => {
 		expect(result.text).not.toContain("DM SECRET");
 	});
 
+	test("daily navigation follows a re-rooted capture axis", async () => {
+		const config = await setup();
+		await writeFile(
+			join(home, "memory", "axes.json"),
+			`${JSON.stringify({ version: 1, axes: [{ id: "daily", root: "capture" }] })}\n`,
+		);
+		await mkdir(join(home, "memory", "capture"), { recursive: true });
+		await writeFile(
+			join(home, "memory", "capture", "2026-08-28.md"),
+			"## now\n- origin: discord/channel/c1\n- user: re-rooted body",
+		);
+		const result = await build(config);
+		expect(result.text).toContain("re-rooted body");
+	});
+
 	test("public daily entries fail closed when current and private origins are mixed in either order", async () => {
 		const config = await setup();
 		await mkdir(join(home, "memory", "daily", "2026-08"), { recursive: true });

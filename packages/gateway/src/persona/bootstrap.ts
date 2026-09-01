@@ -3,6 +3,7 @@ import { lstat, readdir, readFile, realpath, stat } from "node:fs/promises";
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { type OriginRef, originKey, validateOriginRef } from "@gajaeway/protocol";
 import type { GatewayConfig } from "../config";
+import { captureRoot } from "../memory/doctrine";
 import { redactSecrets } from "../orchestrator/rebind";
 
 export const SESSION_BOOTSTRAP_MAX_BYTES = 8 * 1024;
@@ -272,9 +273,9 @@ async function markdownFiles(root: string, directory: string, allowed: readonly 
 	return found.sort();
 }
 
-function datePaths(now: Date): string[] {
+function datePaths(now: Date, captureRoot: string): string[] {
 	const day = now.toISOString().slice(0, 10);
-	return [`daily/${day.slice(0, 7)}/${day}.md`, `daily/${day}.md`];
+	return [`${captureRoot}/${day.slice(0, 7)}/${day}.md`, `${captureRoot}/${day}.md`];
 }
 
 function markerFor(key: string, epoch: number): string {
@@ -428,12 +429,15 @@ export async function buildSessionBootstrap(input: {
 	if (!channelFound) diagnostics.push("current channel record: no explicitly associated safe file");
 
 	const now = input.now ?? new Date();
+	// The capture axis is wherever the registry says it is: a re-rooted daily axis
+	// must still reach the session, not silently drop out of every bootstrap.
+	const capture = await captureRoot(resolved.memory);
 	for (const [label, date] of [
 		["Today daily entries", now],
 		["Yesterday daily entries", new Date(now.getTime() - 86_400_000)],
 	] as const) {
 		let included = false;
-		for (const path of datePaths(date)) {
+		for (const path of datePaths(date, capture)) {
 			try {
 				candidates.push(
 					await readSection(resolved.memory, path, label, resolved.allowed, (text) => dailyEntries(text, key)),

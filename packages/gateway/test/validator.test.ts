@@ -44,6 +44,11 @@ test("a generated pointer to a deep path is navigation, not long-form prose", as
 	// The rendered line is 240 characters; what it says is 111.
 	expect((await validateMemory(memory)).some((found) => found.code === "long_form_map")).toBe(false);
 });
+test("long-form prose still fails even when it carries a link", async () => {
+	const memory = await root();
+	await appendFile(join(memory, "MEMORY.md"), `${"x".repeat(190)} [see](daily/a.md) ${"y".repeat(20)}\n`);
+	await issue("long_form_map");
+});
 test("validator reports duplicate_file_hash", async () => {
 	const memory = await root();
 	await writeFile(join(memory, "daily", "a.md"), "same\n");
