@@ -17,6 +17,35 @@ export function socketPath(home = process.env.GAJAEWAY_HOME): string {
 	return `${home ?? `${process.env.HOME ?? "~"}/.gajaeway`}/gateway.sock`;
 }
 
+/**
+ * Every dispatchable top-level subcommand. An empty argv used to fall through
+ * the switch into the shared catch, which only *sets* an exit code — a probe
+ * with no arguments has to terminate before `main` opens a gateway socket,
+ * never after, so the list is checked up front.
+ */
+export const COMMANDS = [
+	"status",
+	"shutdown",
+	"chat",
+	"daemon",
+	"sessions",
+	"ops",
+	"memory",
+	"monitors",
+	"work",
+] as const;
+
+export const CLI_USAGE =
+	"usage: gajaeway [--socket PATH] status|shutdown|chat|daemon run|sessions list [--json] [--fields a,b,c] [--limit N] [--offset N]|sessions inspect <originKey-or-index>|memory audit|memory search <query>|monitors ...|work run <name> [--cwd DIR] <text>|ops backup <path>|ops cycle [--json]|ops integrity|ops restore <backupPath>";
+
+/** Usage errors exit 2, as `gajaeway-gateway` does; 1 stays a runtime failure. */
+export const USAGE_EXIT_CODE = 2;
+
+/** The usage text when `command` cannot be dispatched, undefined when it can. */
+export function usageFor(command: string | undefined): string | undefined {
+	return command !== undefined && (COMMANDS as readonly string[]).includes(command) ? undefined : CLI_USAGE;
+}
+
 export function parseArgs(args: string[]): { command?: string; rest: string[]; socket: string } {
 	let socket = socketPath();
 	const rest: string[] = [];
@@ -169,6 +198,11 @@ async function chat(socket: string): Promise<void> {
 
 export async function main(args = process.argv.slice(2)): Promise<void> {
 	const parsed = parseArgs(args);
+	const usage = usageFor(parsed.command);
+	if (usage !== undefined) {
+		console.error(usage);
+		process.exit(USAGE_EXIT_CODE);
+	}
 	try {
 		switch (parsed.command) {
 			case "status": {
@@ -387,9 +421,7 @@ export async function main(args = process.argv.slice(2)): Promise<void> {
 				break;
 			}
 			default:
-				throw new Error(
-					"usage: gajaeway [--socket PATH] status|shutdown|chat|daemon run|sessions list [--json] [--fields a,b,c] [--limit N] [--offset N]|sessions inspect <originKey-or-index>|memory audit|memory search <query>|monitors ...|work run <name> [--cwd DIR] <text>|ops backup <path>|ops cycle [--json]|ops integrity|ops restore <backupPath>",
-				);
+				throw new Error(CLI_USAGE);
 		}
 	} catch (error) {
 		console.error(error instanceof Error ? error.message : String(error));

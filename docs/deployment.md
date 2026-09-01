@@ -14,8 +14,11 @@ The result is:
 dist/gajaeway-gateway
 dist/gajaeway-discord
 dist/gajaeway-telegram
+dist/gajaeway-admin
 dist/gajaeway
 ```
+
+Each binary requires its verb: `gajaeway-gateway daemon`, `gajaeway-admin serve`, and a subcommand for `gajaeway`. Invoked with no arguments they print usage on stderr and exit 2, so probing one never blocks. `gajaeway-discord` and `gajaeway-telegram` run in the foreground with no arguments; `gajaeway-discord --help` and `--version` answer without connecting, and a second `gajaeway-discord` refuses to boot while `$GAJAEWAY_HOME/adapter-discord.pid` names a live process.
 
 A production host does not need a source checkout, `node_modules`, or Bun to run those binaries. It **does** need the external `gjc` executable on `PATH`: the gateway spawns `gjc` to create each session and for every turn.
 
@@ -28,6 +31,7 @@ $GAJAEWAY_HOME/
   config.json
   adapter-discord.json
   adapter-telegram.json
+  adapter-discord.pid        # single-instance lock, held by the running Discord adapter
   gateway.sock
   gateway.db
   workspace/                 # SOUL.md, AGENTS.md, USER.md; gjc working directory
