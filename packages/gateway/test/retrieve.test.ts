@@ -22,3 +22,78 @@ test("retrieves mapped Markdown with BM25", async () => {
 		await rm(home, { recursive: true, force: true });
 	}
 });
+
+test("korean queries match inflected forms via cjk character bigrams", async () => {
+	const { mkdtemp } = await import("node:fs/promises");
+	const { tmpdir } = await import("node:os");
+	const { join } = await import("node:path");
+	const { mkdir, writeFile } = await import("node:fs/promises");
+	const { initializeMemory } = await import("../src/memory/doctrine");
+	const { searchMemory } = await import("../src/memory/retrieve");
+	const home = await mkdtemp(join(tmpdir(), "gajaeway-cjk-"));
+	const root = await initializeMemory(home);
+	await mkdir(join(root, "decisions"), { recursive: true });
+	await writeFile(join(root, "decisions/canon.md"), "# 결정\n\n정본화를 매 6시간 주기로 돌린다.\n");
+	await writeFile(join(root, "decisions/other.md"), "# 결정\n\n배포 절차는 재서명을 포함한다.\n");
+	// Stem query hits the document that only contains the inflected form.
+	const hits = await searchMemory(root, "정본화 주기");
+	expect(hits.length).toBeGreaterThanOrEqual(1);
+	expect(hits[0]?.path).toBe("decisions/canon.md");
+	// Latin behavior unchanged: exact word match still required.
+	const latin = await searchMemory(root, "resign");
+	expect(latin.find((hit) => hit.path === "decisions/other.md")).toBeUndefined();
+});
+
+test("a strong hit pulls its crosslinked neighbour in as a discounted secondary hit", async () => {
+	const { mkdtemp, mkdir, writeFile } = await import("node:fs/promises");
+	const { tmpdir } = await import("node:os");
+	const { join } = await import("node:path");
+	const { initializeMemory } = await import("../src/memory/doctrine");
+	const { searchMemory } = await import("../src/memory/retrieve");
+	const home = await mkdtemp(join(tmpdir(), "gajaeway-linkhop-"));
+	const root = await initializeMemory(home);
+	await mkdir(join(root, "decisions"), { recursive: true });
+	await mkdir(join(root, "people"), { recursive: true });
+	// The neighbour deliberately contains NO query terms: only the link reaches it.
+	await writeFile(join(root, "people/collab.md"), "# collab\n\n조용한 협력자 프로필.\n");
+	await writeFile(
+		join(root, "decisions/cutover.md"),
+		"# cutover decision\n\ncutover 결정은 [collab](../people/collab.md) 협의로 확정.\n",
+	);
+	const hits = await searchMemory(root, "cutover 결정");
+	expect(hits[0]?.path).toBe("decisions/cutover.md");
+	const neighbour = hits.find((hit) => hit.path === "people/collab.md");
+	expect(neighbour).toBeDefined();
+	expect(neighbour!.score).toBeLessThan(hits[0]!.score);
+	expect(neighbour!.excerpt).toContain("linked from decisions/cutover.md");
+	// Secondary hits never displace direct hits under a tight limit.
+	const tight = await searchMemory(root, "cutover 결정", 1);
+	expect(tight).toHaveLength(1);
+	expect(tight[0]?.path).toBe("decisions/cutover.md");
+});
+
+test("tags boost ranking and pull tag-group neighbours in as secondary hits", async () => {
+	const { mkdtemp, mkdir, writeFile } = await import("node:fs/promises");
+	const { tmpdir } = await import("node:os");
+	const { join } = await import("node:path");
+	const { initializeMemory } = await import("../src/memory/doctrine");
+	const { searchMemory } = await import("../src/memory/retrieve");
+	const home = await mkdtemp(join(tmpdir(), "gajaeway-tags-"));
+	const root = await initializeMemory(home);
+	await mkdir(join(root, "ops/rules"), { recursive: true });
+	await mkdir(join(root, "decisions"), { recursive: true });
+	// Tagged note mentions the term once; untagged note mentions it once too —
+	// the tag must break the tie in the tagged note's favor.
+	await writeFile(join(root, "ops/rules/deploy.md"), "---\ntags: [deployment]\n---\n# 배포 규칙\n\n배포 절차.\n");
+	await writeFile(join(root, "decisions/log.md"), "# 기록\n\n배포 언급 한 번.\n");
+	// Same tag, zero query terms in its body: reachable only through the tag group.
+	await writeFile(
+		join(root, "ops/rules/rollback.md"),
+		"---\ntags: [deployment]\n---\n# 롤백 규칙\n\n되돌리기 절차만 서술.\n",
+	);
+	const hits = await searchMemory(root, "배포");
+	expect(hits[0]?.path).toBe("ops/rules/deploy.md");
+	const grouped = hits.find((hit) => hit.path === "ops/rules/rollback.md");
+	expect(grouped).toBeDefined();
+	expect(grouped!.excerpt).toContain("shared tag #deployment");
+});

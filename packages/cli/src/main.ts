@@ -285,11 +285,13 @@ export async function main(args = process.argv.slice(2)): Promise<void> {
 						const result = await client.request<{ ok: boolean; issues: unknown[] }>("memory.audit");
 						console.log(JSON.stringify(result.issues));
 						if (!result.ok) process.exitCode = 1;
+					} else if (parsed.rest[0] === "autolink") {
+						console.log(JSON.stringify(await client.request("memory.autolink")));
 					} else if (parsed.rest[0] === "search" && parsed.rest.slice(1).join(" ")) {
 						console.log(
 							JSON.stringify(await client.request("memory.search", { query: parsed.rest.slice(1).join(" ") })),
 						);
-					} else throw new Error("usage: gajaeway memory audit|search <query>");
+					} else throw new Error("usage: gajaeway memory audit|autolink|search <query>");
 				} finally {
 					await client.close();
 				}

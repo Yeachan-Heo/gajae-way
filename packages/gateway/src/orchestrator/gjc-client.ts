@@ -47,7 +47,12 @@ export interface TurnOptions {
 	 * running, so callers can deliver intermediate replies of a long agentic
 	 * turn instead of staying silent until the process exits.
 	 */
-	readonly onAssistantText?: (text: string) => void;
+	/**
+	 * Second argument is how many tools this turn has already started, so the
+	 * caller can tell a pre-tool thought from a post-tool finding. Optional on
+	 * purpose: test doubles that only care about the text stay one-argument.
+	 */
+	readonly onAssistantText?: (text: string, toolCallsSoFar?: number) => void;
 	/** Rebuilds epoch-bound trusted preamble after an automatic session rebind. */
 	readonly systemPreambleForEpoch?: (epoch: number) => string | Promise<string>;
 }
@@ -85,13 +90,13 @@ export class GjcTurnStream {
 	#buffer = "";
 	#exactOutputTokens = 0;
 	#deltaChars = 0;
-	readonly #onAssistantText: ((text: string) => void) | undefined;
+	readonly #onAssistantText: ((text: string, toolCallsSoFar?: number) => void) | undefined;
 	toolCalls = 0;
 	finalText: string | undefined;
 	/** Structured error frame seen in the stream, if the runtime emitted one. */
 	runtimeError: RuntimeErrorDetail | undefined;
 
-	constructor(onAssistantText?: (text: string) => void) {
+	constructor(onAssistantText?: (text: string, toolCallsSoFar?: number) => void) {
 		this.#onAssistantText = onAssistantText;
 	}
 
@@ -158,7 +163,7 @@ export class GjcTurnStream {
 				.trim();
 			if (text) {
 				this.finalText = text;
-				this.#onAssistantText?.(text);
+				this.#onAssistantText?.(text, this.toolCalls);
 			}
 		}
 	}

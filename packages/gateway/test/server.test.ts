@@ -829,3 +829,42 @@ test("resuming a stalled job clears the hold durably: the next ordinary call is 
 	expect(turns).toBe(3);
 	client.close();
 });
+
+test("responses larger than one socket buffer arrive intact (backpressure outbox)", async () => {
+	directory = await mkdtemp(join(tmpdir(), "gajaeway-server-"));
+	const config: GatewayConfig = {
+		schemaVersion: 1,
+		home: directory,
+		configPath: join(directory, "config.json"),
+		socketPath: join(directory, "gateway.sock"),
+		dbPath: join(directory, "gateway.db"),
+		logVerbosity: "info",
+	};
+	const database = await GatewayDatabase.open(config.dbPath);
+	// A ~700KB reply forces multiple kernel-buffer writes on the unix socket.
+	const bigReply = `big:${"x".repeat(700_000)}:end`;
+	const gjc: GjcPort = {
+		ensureSession: async () => ({ sessionId: "mock-session" }),
+		sendTurn: async () => bigReply,
+		forgetRebinds: () => {},
+	};
+	server = await startUnixServer({ config, database, gjc, onStop: () => database.close() });
+	const client = await connect(config.socketPath);
+	client.send({ v: "0.1", type: "hello", payload: { supportedVersions: ["0.1"] } });
+	await waitFor(client.frames, 1);
+	client.send({
+		v: "0.1",
+		type: "request",
+		id: "big",
+		verb: "chat.send",
+		params: { origin: { platform: "loopback", kind: "loopback", conversationId: "loopback" }, text: "go" },
+	});
+	for (let attempt = 0; attempt < 400; attempt++) {
+		if (client.frames.some((frame) => frame.type === "event" && frame.event === "chat.message")) break;
+		await Bun.sleep(10);
+	}
+	const message = client.frames.find((frame) => frame.type === "event" && frame.event === "chat.message");
+	expect(message).toBeDefined();
+	expect(message.payload.text).toBe(bigReply);
+	client.close();
+});

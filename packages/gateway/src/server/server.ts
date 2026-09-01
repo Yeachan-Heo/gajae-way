@@ -41,6 +41,7 @@ import { DeliveryService } from "../delivery/delivery";
 import { ReactionBudget } from "../delivery/reaction-budget";
 import { decideEngagement } from "../engagement/policy";
 import { ACTION_GUARD_SYSTEM_NOTICE } from "../guard/action-guard";
+import { autolinkCorpus } from "../memory/autolink";
 import { MemoryClosureQueue } from "../memory/closure";
 import { initializeMemory } from "../memory/doctrine";
 import { searchMemory } from "../memory/retrieve";
@@ -924,6 +925,14 @@ async function handleRequest(
 			});
 			return;
 		}
+		case "memory.autolink": {
+			// Deterministic crosslink sweep: alias index from canonical filenames,
+			// titles, and frontmatter aliases; first mention per file gets linked.
+			const root = await initializeMemory(options.config.home);
+			const report = await autolinkCorpus(root);
+			connection.write({ v: PROFILE_VERSION, type: "response", id: request.id, result: report });
+			return;
+		}
 		case "memory.search": {
 			const params = (request.params ?? {}) as { query?: unknown; limit?: unknown };
 			if (typeof params.query !== "string") throw new ProtocolError("invalid_params", "memory.search requires query");
@@ -1646,13 +1655,13 @@ async function runInboundTurn(
 		const preamble = await preambleForEpoch(boundEpoch);
 		const result = await options.gjc.sendTurn(sessionId, turnText, preamble, emitProgress, {
 			systemPreambleForEpoch: preambleForEpoch,
-			onAssistantText: (message) => {
+			onAssistantText: (message, toolCallsSoFar) => {
 				try {
 					// Mid-work speech only (issue #71). The runtime's LAST streamed message
 					// is also the final answer, and it is gated here like any other: when
 					// the gate suppresses it, the post-turn delivery below ships it, so an
 					// answer can be delayed by the gate but never lost.
-					const decision = interimSpeech.admit(message, Date.now());
+					const decision = interimSpeech.admit(message, Date.now(), { toolCallsSoFar });
 					if (!decision.deliver) {
 						console.error(`gateway mid-work speech suppressed (${turnId}, ${decision.reason}).`);
 						return;
