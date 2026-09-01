@@ -309,17 +309,32 @@ export async function startUnixServer(options: GatewayServerOptions): Promise<Ga
 		})();
 		return stopPromise;
 	};
-	listener = Bun.listen<{ connection: Connection }>({
+	listener = Bun.listen<{ connection: Connection; flush: () => void }>({
 		unix: options.config.socketPath,
 		socket: {
 			open(socket) {
+				// Backpressure-safe writes: socket.write may accept only part of a
+				// large frame (live finding: a 236-issue audit response truncated
+				// mid-line and the CLI died with "frame is not valid JSON"). Frames
+				// queue in an outbox that drains as the kernel buffer frees up.
+				let outbox = Buffer.alloc(0);
+				const flush = () => {
+					while (outbox.length > 0) {
+						const written = socket.write(outbox);
+						if (written <= 0) return;
+						outbox = outbox.subarray(written);
+					}
+				};
 				const connection: Connection = {
 					decoder: new FrameDecoder(),
 					negotiated: false,
-					write: (frame) => socket.write(encodeFrame(frame)),
+					write: (frame) => {
+						outbox = Buffer.concat([outbox, Buffer.from(encodeFrame(frame))]);
+						flush();
+					},
 					close: () => socket.end(),
 				};
-				socket.data = { connection };
+				socket.data = { connection, flush };
 				runtime.connections.add(connection);
 			},
 			data(socket, data) {
@@ -330,6 +345,9 @@ export async function startUnixServer(options: GatewayServerOptions): Promise<Ga
 				} catch (error) {
 					writeError(connection, error);
 				}
+			},
+			drain(socket) {
+				socket.data.flush();
 			},
 			close(socket) {
 				runtime.connections.delete(socket.data.connection);
