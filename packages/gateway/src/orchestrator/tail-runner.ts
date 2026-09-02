@@ -243,16 +243,27 @@ export class TailRunner {
 			handle.sessionId,
 			...(handle.cursor ? ["--cursor", handle.cursor] : []),
 			"--until-idle",
-			...(handle.strict ? ["--strict"] : []),
+			// `--strict` only means something relative to a checkpoint. A cursorless
+			// attach has no checkpoint, and the runtime reports the ring's pre-attach
+			// drop as a retention gap on every poll (measured on gjc 0.16.0), so a
+			// strict cursorless tail could never observe its own turn. Cursorless
+			// polls run non-strict; duplicate/historical frames are fenced by the
+			// accepted-op-ref attribution filter and deterministic delivery ids.
+			...(handle.strict && handle.cursor ? ["--strict"] : []),
 			"--all-events",
 			"--timeout-ms",
 			String(this.#pollTimeoutMs),
 		];
 		const result = await this.#run(args, { timeoutMs: this.#pollTimeoutMs + 5_000 });
 		const decoded = decodeTailResult(result);
-		if (decoded.gap) {
+		if (decoded.gap && (handle.strict && handle.cursor)) {
 			await handle.retentionGap(decoded.gap);
 			return;
+		}
+		if (decoded.gap) {
+			// Non-strict poll: the gap is diagnostic (the ring dropped pre-attach
+			// history), not a hold. Frames after the resync point still arrive.
+			handle.noteGap(decoded.gap);
 		}
 		if (decoded.error) throw decoded.error;
 		await handle.receiveBatch(decoded.frames, decoded.cursor);
@@ -423,6 +434,14 @@ class ManagedTailHandle implements TailHandle {
 		await this.#deliver(frame);
 	}
 
+	#gapNoted = false;
+
+	noteGap(gap: { cursor?: string; resync?: unknown }): void {
+		if (this.#gapNoted) return;
+		this.#gapNoted = true;
+		this.#input.onDiagnostic?.(`tail_gap_nonstrict session=${this.sessionId} resync=${JSON.stringify(gap.resync ?? null)}`);
+	}
+
 	async retentionGap(gap: { cursor?: string; resync?: unknown }): Promise<void> {
 		if (this.#closed) return;
 		// A strict gap is not a terminal event. It never falls through into a
@@ -517,6 +536,9 @@ function decodeTailResult(result: CliResult): DecodedTail {
 		if (errorCode === "retention_gap") {
 			return { frames: [], terminal: false, gap: { resync: recordOf(error?.details)?.resync ?? error?.resync } };
 		}
+		// `--until-idle` bounded by `--timeout-ms` on a quiet session: nothing to
+		// report this poll. Not an error, not terminal, not a gap.
+		if (errorCode === "tail_timeout") return { frames: [], terminal: false };
 		return {
 			frames: [],
 			terminal: false,
@@ -525,21 +547,15 @@ function decodeTailResult(result: CliResult): DecodedTail {
 	}
 	const payload = recordOf(envelope.result) ?? {};
 	const gap = recordOf(payload.gap);
-	if (gap?.code === "retention_gap") {
-		return {
-			frames: [],
-			terminal: false,
-			gap: {
-				...(opaqueCursorOf(payload) ? { cursor: opaqueCursorOf(payload) } : {}),
-				resync: gap.resync,
-			},
-		};
-	}
 	const items = Array.isArray(payload.items) ? payload.items : [];
+	// A non-strict reply may carry BOTH a diagnostic gap (pre-checkpoint history
+	// dropped) and the live frames after the resync point. The poll decides
+	// whether the gap is a hold (strict, checkpointed) or a diagnostic.
 	return {
 		frames: items.flatMap(normalizeTailFrame),
 		...(opaqueCursorOf(payload) ? { cursor: opaqueCursorOf(payload) } : {}),
 		terminal: payload.terminal === true,
+		...(gap?.code === "retention_gap" ? { gap: { ...(opaqueCursorOf(payload) ? { cursor: opaqueCursorOf(payload) } : {}), resync: gap.resync } } : {}),
 	};
 }
 
