@@ -211,17 +211,16 @@ test("a live reclaim token blocks a second reclaimer instead of letting two unli
 	expect((await readFile(join(dir, "gajaeway.pid"), "utf8")).trim()).toBe("9999");
 });
 
-test("a reclaim token left by a crashed reclaimer is itself reclaimed when its owner is provably dead", async () => {
+test("an orphan reclaim token is fail-closed and names the manual fix, even when its owner is dead", async () => {
 	const dir = await home();
-	const logs: string[] = [];
 	await writeFile(join(dir, "gajaeway.pid"), "9999\n");
 	await writeFile(join(dir, "gajaeway.pid.reclaim"), "8888\n");
-	const lock = await DaemonLock.acquire(
-		dir,
-		ports(1002, () => "dead", logs),
-	);
-	expect(logs).toContain("daemon_lock_reclaim_token_reclaimed stale_pid=8888");
-	expect(logs).toContain("daemon_lock_reclaimed stale_pid=9999");
-	expect(await Bun.file(join(dir, "gajaeway.pid.reclaim")).exists()).toBe(false);
-	await lock.release();
+	await expect(
+		DaemonLock.acquire(
+			dir,
+			ports(1002, () => "dead"),
+		),
+	).rejects.toThrow("remove");
+	expect((await readFile(join(dir, "gajaeway.pid"), "utf8")).trim()).toBe("9999");
+	expect(await Bun.file(join(dir, "gajaeway.pid.reclaim")).exists()).toBe(true);
 });

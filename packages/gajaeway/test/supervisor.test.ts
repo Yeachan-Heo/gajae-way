@@ -230,3 +230,25 @@ test("stopAdapters gives up on a factory that never resolves after the adapter d
 	expect(logs).toContain("adapter_stop_timeout adapter=telegram");
 	expect(server.ports[0]?.closed).toBeGreaterThan(0);
 });
+
+test("a factory resolving late with a wedged stop still has its port closed inside the single adapter deadline", async () => {
+	const server = new FakeServer();
+	const late = deferred<AdapterHandle>();
+	const logs: string[] = [];
+	const supervisor = new AdapterSupervisor({
+		server,
+		escalate: () => {},
+		log: (line) => logs.push(line),
+		stopTimeoutMs: 150,
+	});
+	await supervisor.start("discord", async () => await late.promise);
+	await until(() => server.ports.length === 1);
+	const started = Date.now();
+	const stopping = supervisor.stopAdapters();
+	await Bun.sleep(50);
+	late.resolve({ settled: new Promise(() => {}), stop: () => new Promise(() => {}) });
+	await stopping;
+	expect(Date.now() - started).toBeLessThan(600);
+	expect(logs).toContain("adapter_stop_timeout adapter=discord");
+	expect(server.ports[0]?.closed).toBeGreaterThan(0);
+});

@@ -159,9 +159,17 @@ export class AdapterSupervisor {
 					// Give the start observers a tick to attach `disposed`.
 					await Promise.resolve();
 				}
-				if (generation.disposed) await completesBefore(generation.disposed, remaining());
-				else if (generation.handle) await completesBefore(this.#dispose(entry, generation, remaining()), remaining());
-				else this.#log(`adapter_stop_timeout adapter=${entry.name}`);
+				const disposal =
+					generation.disposed ?? (generation.handle ? this.#dispose(entry, generation, remaining()) : undefined);
+				const done = disposal ? await completesBefore(disposal, remaining()) : false;
+				if (!done) {
+					// The budget is spent: whatever the late teardown is still doing, the
+					// port is closed NOW so the daemon can release its lock without a
+					// straggler reaching the gateway afterwards.
+					this.#log(`adapter_stop_timeout adapter=${entry.name}`);
+					generation.controller.abort();
+					generation.port.close();
+				}
 			}),
 		);
 	}
