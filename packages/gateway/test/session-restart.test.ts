@@ -332,3 +332,32 @@ test("a settled-but-unaccepted batch on a session the runtime cannot answer for 
 	expect(port.sends[0]!.opRef).not.toBe("gw-p-00000000000000000000000000000001");
 	expect(port.sends[0]!.sessionId).not.toBe("pre-cutover-session");
 });
+
+class ColdBindFlakyPort extends ScriptedSessionPort {
+	bindAttempts = 0;
+	async bind(input: Parameters<ScriptedSessionPort["bind"]>[0]) {
+		this.bindAttempts++;
+		if (this.bindAttempts === 1) throw new Error("gjc sdk request failed: spawn_failed");
+		return await super.bind(input);
+	}
+}
+
+test("a settle whose bind fails releases the rows and retries the bind with backoff instead of stranding a settled batch", async () => {
+	home = await mkdtemp(join(tmpdir(), "gajaeway-session-restart-"));
+	database = await GatewayDatabase.open(join(home, "gateway.db"));
+	const port = new ColdBindFlakyPort({ onSend: (input, scripted) => scripted.complete(input.opRef, "bound later") });
+	const logs: string[] = [];
+	const terminal: string[] = [];
+	manager = makeManager(port, logs, terminal);
+	enqueue("m-1", "hello under load");
+	await manager.notifyInbound(KEY);
+	await eventually(() => logs.some((line) => line.startsWith(`persona_bind_failed origin=${KEY}`)), "bind failure was not recorded");
+	// No settled-but-unbound batch survives the failure; the rows are pending again.
+	expect(database.inboundNonterminalBatches(KEY)).toEqual([]);
+	expect(database.inboundPendingCount(KEY)).toBe(1);
+	// The backoff timer (real setTimeout in this harness, 2s for attempt 1) retries the settle.
+	await new Promise((resolve) => setTimeout(resolve, 2_300));
+	await eventually(() => port.sends.length === 1, "settle was not retried after the bind failure");
+	expect(port.bindAttempts).toBe(2);
+	await eventually(() => terminal.length === 1, "retried turn did not complete");
+});

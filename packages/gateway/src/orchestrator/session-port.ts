@@ -214,7 +214,19 @@ export class BrokerSessionPort implements SessionPort {
 		return { sessionId: created.sessionId, originKey: input.originKey, epoch: input.epoch, repo: input.repo };
 	}
 
-	async #createSession(repo: string, idempotencyKey: string): Promise<{ readonly sessionId?: unknown }> {
+	#createChain: Promise<unknown> = Promise.resolve();
+
+	/** Cold creates are serialized per agent dir: parallel launches starve gjc's lifecycle launcher. */
+	#createSession(repo: string, idempotencyKey: string): Promise<{ readonly sessionId?: unknown }> {
+		const run = this.#createChain.then(async () => await this.#createSessionUnserialized(repo, idempotencyKey));
+		this.#createChain = run.then(
+			() => undefined,
+			() => undefined,
+		);
+		return run;
+	}
+
+	async #createSessionUnserialized(repo: string, idempotencyKey: string): Promise<{ readonly sessionId?: unknown }> {
 		let lastFailure: unknown;
 		for (let attempt = 1; attempt <= SESSION_CREATE_ATTEMPTS; attempt++) {
 			try {
@@ -583,8 +595,18 @@ function sanitizeStatusReport(report: StatusReport): StatusReport {
 	};
 }
 
+/**
+ * Create failures that are safe to retry under the SAME idempotency key: the
+ * runtime either has not created the session (spawn_failed) or cannot yet
+ * prove what it created (terminal_uncertain, uncertain_after_send). The key
+ * guarantees the retry resolves to the same session, never a second one.
+ * Measured: five simultaneous cold binds on one agent dir starve gjc's
+ * lifecycle launcher and surface all three codes.
+ */
 function isTransientCreateFailure(error: unknown): boolean {
-	return error instanceof GjcCliError && envelopeErrorCode(error.details) === "terminal_uncertain";
+	if (!(error instanceof GjcCliError)) return false;
+	const code = envelopeErrorCode(error.details);
+	return code === "terminal_uncertain" || code === "uncertain_after_send" || code === "spawn_failed";
 }
 
 function sessionCreateRef(instanceId: string, originKey: string, epoch: number, repo: string): string {

@@ -460,6 +460,15 @@ class OriginActor {
 		const record = this.#manager.database.getSessionRecord(this.originKey);
 		const sessionId = batch.sessionId ?? (record?.epoch === batch.epoch ? record.sessionId : undefined);
 		if (!sessionId) {
+			if (batch.state === "settled" && !retired) {
+				// Settled but never bound/sent: no operation exists anywhere, so the
+				// rows go back to pending and the next settle binds (exactly-once-safe).
+				const attempt = this.#manager.database.inboundBatchRequeueFreshTurn(batch.batchKey);
+				this.#manager.log(
+					`recovery_requeue_unbound origin=${this.originKey} epoch=${batch.epoch} opRef=${batch.opRef} attempt=${attempt}`,
+				);
+				return;
+			}
 			this.#manager.log(
 				`recovery_hold origin=${this.originKey} epoch=${batch.epoch} opRef=${batch.opRef} reason=${retired ? "retired_session_binding_unavailable" : "session_binding_unavailable"}`,
 			);
@@ -740,7 +749,27 @@ class OriginActor {
 		}
 		const batch = this.#manager.database.inboundNonterminalBatches(this.originKey, epoch).find((candidate) => candidate.batchKey === batchKey);
 		if (!batch) throw new Error(`settled batch ${batchKey} disappeared before send`);
-		const binding = await this.#ensureSession(epoch);
+		let binding: SessionBinding;
+		try {
+			binding = await this.#ensureSession(epoch);
+		} catch (error) {
+			// Nothing was sent: release the rows and retry the settle with backoff
+			// instead of leaving a settled-but-unbound batch for the recovery sweep.
+			const attempt = this.#manager.database.inboundBatchRequeueFreshTurn(batchKey);
+			this.#state = "idle";
+			this.#deadline = undefined;
+			this.#manager.log(
+				`persona_bind_failed origin=${this.originKey} epoch=${epoch} attempt=${attempt} detail=${safeDiagnostic(error)}`,
+			);
+			const delay = Math.min(30_000, 1_000 * 2 ** Math.min(attempt, 5));
+			const timer = this.#manager.schedule(() => {
+				this.#graceTimers.delete(timer);
+				if (this.#stopped || this.#manager.stopped) return;
+				void this.enqueue(async () => await this.#armSettle()).catch(() => {});
+			}, delay);
+			this.#graceTimers.add(timer);
+			return;
+		}
 		this.#manager.database.inboundBatchBindSession(batchKey, binding.sessionId);
 		const lifecycle = await this.#manager.startTurn({
 			originKey: this.originKey,
