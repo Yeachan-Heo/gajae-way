@@ -46,10 +46,13 @@ export async function bootGatewayFromConfig(
 			instanceId: database.instanceId,
 			cwd: join(config.home, "workspace"),
 		});
-		// F92-C-P1-005: the Stage 0 floor is a boot gate, never an offline config check.
-		await broker.preflight();
+		// The persona workspace is the broker's cwd. It must exist before the
+		// first gjc spawn: a missing cwd surfaces as `ENOENT posix_spawn 'gjc'`,
+		// which reads as "gjc is not installed" and hid a fresh-home boot failure.
 		const persona = new PersonaLoader(config.home);
 		await persona.ensureWorkspace();
+		// F92-C-P1-005: the Stage 0 floor is a boot gate, never an offline config check.
+		await broker.preflight();
 		// Generic product default: memory maintenance crons exist on every fresh
 		// deployment (seeded once; operator removals are never resurrected).
 		seedDefaultMonitors(new MonitorRegistry(database), database);

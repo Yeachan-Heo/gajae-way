@@ -32,3 +32,4 @@ jobs:
       - run: bun test packages/
       # Frozen-corpus retrieval benchmark gate (separate from unit tests).
       - run: GAJAEWAY_BENCH=1 bun test packages/gateway/bench
+      - run: scripts/smoke-binary.sh
