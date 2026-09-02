@@ -75,6 +75,7 @@ test("persistent-session control-plane logs use grep-stable fields", async () =>
 
 		let healthy = true;
 		broker = new BrokerSupervisor({
+			ssotAgentDir: null,
 			home,
 			instanceId: "observability",
 			healthProbe: async () => healthy,

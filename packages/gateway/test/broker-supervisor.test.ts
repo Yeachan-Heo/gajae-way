@@ -46,6 +46,7 @@ test("observes the gjc-owned agent-dir daemon, never spawns a host, and fences r
 		return HEALTHY;
 	};
 	const broker = new BrokerSupervisor({
+		ssotAgentDir: null,
 		home,
 		instanceId: "instance-1",
 		spawn: (() => {
@@ -94,6 +95,7 @@ test("red-team: an unhealthy health flip-flop never consumes or double-publishes
 		firstFailedRecoveryObserved = resolve;
 	});
 	const broker = new BrokerSupervisor({
+		ssotAgentDir: null,
 		home,
 		instanceId: "instance-health-flip-flop",
 		healthProbe: async () => {
@@ -147,6 +149,7 @@ test("default readiness probes cwd scope so the non-Git persona workspace never 
 	const home = await temporaryHome("gajaeway-broker-readiness-scope-");
 	const commands: string[][] = [];
 	const broker = new BrokerSupervisor({
+		ssotAgentDir: null,
 		home,
 		instanceId: "instance-readiness-scope",
 		command: async (args) => {
@@ -166,6 +169,7 @@ test("default readiness probes cwd scope so the non-Git persona workspace never 
 test("readiness rejects a zero-exit generic help reply: only a structural session-list envelope is healthy", async () => {
 	const home = await temporaryHome("gajaeway-broker-generic-help-");
 	const broker = new BrokerSupervisor({
+		ssotAgentDir: null,
 		home,
 		instanceId: "instance-generic",
 		command: async () => GENERIC_HELP,
@@ -187,6 +191,7 @@ test("reclaims only stale process remnants while preserving persistent session a
 	await writeFile(staleSocket, "stale endpoint");
 	await writeFile(join(stateDir, "broker.lock"), `${JSON.stringify({ pid: 424_242, generation: 9 })}\n`);
 	const broker = new BrokerSupervisor({
+		ssotAgentDir: null,
 		home,
 		instanceId,
 		healthProbe: async () => true,
@@ -216,6 +221,7 @@ test("refuses to clean a private broker directory owned by a live process", asyn
 	await mkdir(stateDir, { recursive: true });
 	await writeFile(join(stateDir, "broker.lock"), `${JSON.stringify({ pid: 424_243, generation: 1 })}\n`);
 	const broker = new BrokerSupervisor({
+		ssotAgentDir: null,
 		home,
 		instanceId: "instance-live",
 		healthProbe: async () => true,
@@ -234,7 +240,7 @@ test("boot aborts before accepting connections when the Stage 0 version floor is
 		return { exitCode: 0, stdout: "gjc/0.15.5\n", stderr: "" };
 	};
 
-	await expect(bootGateway({ home, broker: { command } })).rejects.toThrow(
+	await expect(bootGateway({ home, broker: { ssotAgentDir: null, command } })).rejects.toThrow(
 		`requires gjc >= ${MIN_GJC_VERSION}; found 0.15.5`,
 	);
 	expect(commands).toEqual([["--version"]]);
@@ -245,7 +251,7 @@ test("boot aborts when the sdk surface answers generic help instead of a session
 	const home = await temporaryHome("gajaeway-broker-preflight-marker-");
 	const command: CliRunner = async (args) =>
 		args[0] === "--version" ? { exitCode: 0, stdout: `gjc/${MIN_GJC_VERSION}\n`, stderr: "" } : GENERIC_HELP;
-	await expect(bootGateway({ home, broker: { command } })).rejects.toThrow("did not answer a valid session-list envelope");
+	await expect(bootGateway({ home, broker: { ssotAgentDir: null, command } })).rejects.toThrow("did not answer a valid session-list envelope");
 	expect(await Bun.file(join(home, "gateway.sock")).exists()).toBe(false);
 });
 
@@ -259,7 +265,7 @@ test("boot starts the broker before the Unix server and routes ordered shutdown 
 	let spawned = 0;
 	const server = await bootGateway({
 		home,
-		broker: {
+		broker: { ssotAgentDir: null,
 			command,
 			spawn: (() => {
 				spawned++;
@@ -328,6 +334,7 @@ test("an explicit agent dir is supervised in place so pre-cutover sessions are a
 	await mkdir(inherited, { recursive: true });
 	const commands: string[][] = [];
 	const broker = new BrokerSupervisor({
+		ssotAgentDir: null,
 		home,
 		instanceId: "instance-adopt",
 		agentDir: inherited,
@@ -352,7 +359,7 @@ test("an explicit agent dir is supervised in place so pre-cutover sessions are a
 
 test("start pins steeringMode=all and interruptMode=wait in the private agent dir without touching other keys", async () => {
 	const home = await temporaryHome("gajaeway-broker-steering-");
-	const broker = new BrokerSupervisor({ home, instanceId: "instance-steer", command: async () => HEALTHY, healthIntervalMs: 60_000 });
+	const broker = new BrokerSupervisor({ home, instanceId: "instance-steer", ssotAgentDir: null, command: async () => HEALTHY, healthIntervalMs: 60_000 });
 	await mkdir(broker.agentDir, { recursive: true });
 	await writeFile(join(broker.agentDir, "config.yml"), "modelRoles:\n  default: x/y\nsteeringMode: one-at-a-time\nfollowUpMode: one-at-a-time\n");
 	try {
@@ -366,4 +373,32 @@ test("start pins steeringMode=all and interruptMode=wait in the private agent di
 	} finally {
 		await broker.stop();
 	}
+});
+
+test("start seeds the private agent dir from the operator SSOT and fails loudly when models.yml is missing", async () => {
+	const home = await temporaryHome("gajaeway-broker-ssot-");
+	const ssot = join(home, "ssot");
+	await mkdir(join(ssot, "model-presets"), { recursive: true });
+	await writeFile(join(ssot, "models.yml"), "providers:\n  p:\n    baseUrl: https://x\n");
+	await writeFile(join(ssot, "model-presets", "state.json"), "{\"presets\":{}}");
+	await writeFile(join(ssot, "config.yml"), "modelRoles:\n  default: p/m\nsteeringMode: one-at-a-time\n");
+	const logs: string[] = [];
+	const broker = new BrokerSupervisor({ home, instanceId: "instance-ssot", ssotAgentDir: ssot, command: async () => HEALTHY, healthIntervalMs: 60_000, log: (line) => logs.push(line) });
+	try {
+		await broker.start();
+		expect(await readFile(join(broker.agentDir, "models.yml"), "utf8")).toContain("baseUrl: https://x");
+		expect(await readFile(join(broker.agentDir, "model-presets", "state.json"), "utf8")).toContain("presets");
+		const config = await readFile(join(broker.agentDir, "config.yml"), "utf8");
+		expect(config).toContain("default: p/m");
+		expect(config).toContain("steeringMode: all");
+		expect(config).toContain("interruptMode: wait");
+		expect(config.match(/steeringMode:/g)).toHaveLength(1);
+		expect(logs.some((line) => line.startsWith("broker_agent_dir_seeded"))).toBe(true);
+	} finally {
+		await broker.stop();
+	}
+	const empty = join(home, "empty-ssot");
+	await mkdir(empty, { recursive: true });
+	const missing = new BrokerSupervisor({ home, instanceId: "instance-ssot-missing", ssotAgentDir: empty, command: async () => HEALTHY });
+	await expect(missing.start()).rejects.toThrow("operator SSOT");
 });
