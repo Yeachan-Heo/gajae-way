@@ -50,8 +50,11 @@ export async function bootGateway(options: BootGatewayOptions = {}): Promise<Gat
 		const personaWorkspace = join(config.home, "workspace");
 		const startedAt = new Date().toISOString();
 		await broker.start();
+		const supervisor = broker;
 		const tailRunner = new TailRunner({
-			run: broker.cli,
+			run: supervisor.cli,
+			// Event-driven: frames stream from the host as emitted; no interval polling.
+			stream: (sessionId) => supervisor.openStream(sessionId),
 			repo: personaWorkspace,
 			stallTimeoutMs: config.stallTimeoutMs,
 		});

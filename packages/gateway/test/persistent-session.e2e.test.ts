@@ -108,7 +108,7 @@ liveTest(
 				database,
 				cli: broker.cli,
 				instanceId: database.instanceId,
-				tailRunner: new TailRunner({ run: broker.cli, repo, pollIntervalMs: 250 }),
+				tailRunner: new TailRunner({ run: broker.cli, stream: (sessionId) => broker.openStream(sessionId), repo, pollIntervalMs: 250 }),
 			});
 			const binding = await port.bind({ originKey: "loopback/loopback/persistent-e2e", epoch: 0, repo });
 			sessionId = binding.sessionId;

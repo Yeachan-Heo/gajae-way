@@ -267,3 +267,75 @@ test("a cursorless attach polls non-strict, treats the runtime's pre-attach gap 
 		await tail.close();
 	}
 });
+
+test("event-driven: after one backfill poll, host stream frames are delivered as emitted with no further polls", async () => {
+	const argv: string[][] = [];
+	const delivered: string[] = [];
+	const terminals: string[] = [];
+	let pushLine: ((line: string) => void) | undefined;
+	let closeStream: (() => void) | undefined;
+	let opened = 0;
+	const run: CliRunner = async (args) => {
+		argv.push([...args]);
+		return { exitCode: 0, stdout: JSON.stringify({ ok: true, result: { items: [], terminal: true } }), stderr: "" };
+	};
+	const runner = new TailRunner({
+		run,
+		repo: "/tmp/gajaeway-tail-stream",
+		pollIntervalMs: 1,
+		sleep: (ms) => Bun.sleep(ms),
+		stream: () => {
+			opened++;
+			const queue: string[] = [];
+			let notify: (() => void) | undefined;
+			let done = false;
+			pushLine = (line) => {
+				queue.push(line);
+				notify?.();
+			};
+			closeStream = () => {
+				done = true;
+				notify?.();
+			};
+			const lines = (async function* () {
+				for (;;) {
+					if (queue.length > 0) {
+						yield queue.shift()!;
+						continue;
+					}
+					if (done) return;
+					await new Promise<void>((resolve) => {
+						notify = resolve;
+					});
+					notify = undefined;
+				}
+			})();
+			return { lines, close: () => closeStream?.() };
+		},
+	});
+	const tail = await runner.attach({
+		sessionId: "stream-1",
+		brokerGeneration: 1,
+		repo: "/tmp/gajaeway-tail-stream",
+		onFrame: async (frame) => {
+			if (frame.assistantText) delivered.push(frame.assistantText);
+			if (frame.rawKind === "agent_end" || frame.idle) terminals.push(frame.rawKind);
+		},
+	});
+	try {
+		await tail.markAccepted("turn-stream");
+		await eventually(() => opened === 1, "stream was not opened after the backfill poll");
+		const pollsAfterOpen = argv.length;
+		pushLine!(JSON.stringify({ type: "hello", protocolVersion: 3 }));
+		pushLine!(JSON.stringify({ type: "activity", sessionId: "stream-1", state: "busy" }));
+		pushLine!(JSON.stringify({ type: "turn_stream", sessionId: "stream-1", phase: "finalized", text: "LIVE_OK", finalAnswer: true, messageRef: "7" }));
+		pushLine!(JSON.stringify({ type: "agent_end", sessionId: "stream-1", turnId: "t-1" }));
+		pushLine!(JSON.stringify({ type: "activity", sessionId: "stream-1", state: "idle" }));
+		await eventually(() => delivered.includes("LIVE_OK") && terminals.includes("agent_end"), "live frames were not delivered from the stream");
+		await Bun.sleep(30);
+		// No interval polling while the stream is healthy.
+		expect(argv.length).toBe(pollsAfterOpen);
+	} finally {
+		await tail.close();
+	}
+});

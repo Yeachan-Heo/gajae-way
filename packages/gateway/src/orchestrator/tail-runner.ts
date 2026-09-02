@@ -78,8 +78,22 @@ export interface TailHandle {
 	close(): Promise<void>;
 }
 
+/** A resident event stream for one session (`gjc sdk serve --stdio --session <id>`). */
+export interface TailStream {
+	readonly lines: AsyncIterable<string>;
+	close(): void;
+}
+export type TailStreamSpawner = (sessionId: string) => TailStream;
+
 export interface TailRunnerOptions {
 	readonly run: CliRunner;
+	/**
+	 * Event-driven transport. When present, each handle performs ONE non-strict
+	 * backfill poll (pre-attach history, steer echoes), then consumes the live
+	 * stream: frames arrive the instant the host emits them, no interval polling.
+	 * Absent (tests), the handle falls back to the bounded poll loop.
+	 */
+	readonly stream?: TailStreamSpawner;
 	/** Default session workspace. A handle may override it for future generic ports. */
 	readonly repo: string;
 	readonly maxTailProcesses?: number;
@@ -114,6 +128,7 @@ export class TailCapacityError extends Error {
  */
 export class TailRunner {
 	readonly #run: CliRunner;
+	readonly #stream: TailStreamSpawner | undefined;
 	readonly #repo: string;
 	readonly #maxTailProcesses: number;
 	readonly #idleTtlMs: number;
@@ -129,6 +144,7 @@ export class TailRunner {
 
 	constructor(options: TailRunnerOptions) {
 		this.#run = options.run;
+		this.#stream = options.stream;
 		this.#repo = options.repo;
 		this.#maxTailProcesses = positiveInteger(options.maxTailProcesses, DEFAULT_MAX_TAIL_PROCESSES, "maxTailProcesses");
 		this.#idleTtlMs = positiveInteger(options.idleTtlMs, DEFAULT_IDLE_TTL_MS, "idleTtlMs");
@@ -159,6 +175,10 @@ export class TailRunner {
 
 	get pollIntervalMs(): number {
 		return this.#pollIntervalMs;
+	}
+
+	get streamSpawner(): TailStreamSpawner | undefined {
+		return this.#stream;
 	}
 
 	sleep(ms: number): Promise<void> {
@@ -464,6 +484,8 @@ class ManagedTailHandle implements TailHandle {
 	async close(): Promise<void> {
 		if (this.#closed) return;
 		this.#closed = true;
+		this.#stream?.close();
+		this.#stream = undefined;
 		if (!this.#ready) this.#readyReject(new Error(`tail ${this.sessionId} was closed before readiness`));
 		this.#runner.release(this);
 	}
@@ -489,7 +511,14 @@ class ManagedTailHandle implements TailHandle {
 		await this.#input.onFrame?.(frame);
 	}
 
+	#stream: TailStream | undefined;
+
 	async #run(): Promise<void> {
+		const spawner = this.#runner.streamSpawner;
+		if (spawner) {
+			await this.#runStreaming(spawner);
+			return;
+		}
 		while (!this.#closed) {
 			this.#polling = true;
 			try {
@@ -510,6 +539,53 @@ class ManagedTailHandle implements TailHandle {
 				this.#polling = false;
 			}
 			if (this.#closed || this.#pausedForGap) return;
+			await this.#runner.sleep(this.#runner.pollIntervalMs);
+		}
+	}
+
+	/**
+	 * Event-driven observation: one backfill poll establishes readiness and
+	 * replays pre-attach history, then the resident stream delivers every host
+	 * frame as it is emitted. A stream that ends while the handle is open is
+	 * re-opened after a backfill, so nothing emitted in between is lost.
+	 */
+	async #runStreaming(spawner: TailStreamSpawner): Promise<void> {
+		while (!this.#closed) {
+			this.#polling = true;
+			try {
+				await this.#runner.poll(this);
+				if (!this.#ready) {
+					this.#ready = true;
+					this.#readyResolve();
+				}
+			} catch (error) {
+				if (!this.#ready) {
+					this.#ready = true;
+					this.#readyReject(error);
+					await this.close();
+					return;
+				}
+				this.#input.onDiagnostic?.(`tail_error session=${this.sessionId} detail=${sanitizeDiagnostic(error instanceof Error ? error.message : String(error)) || "sdk_error"}`);
+			} finally {
+				this.#polling = false;
+			}
+			if (this.#closed || this.#pausedForGap) return;
+			const stream = spawner(this.sessionId);
+			this.#stream = stream;
+			try {
+				for await (const line of stream.lines) {
+					if (this.#closed) break;
+					const frames = decodeStreamLine(line);
+					for (const frame of frames) await this.receive(frame);
+				}
+			} catch (error) {
+				this.#input.onDiagnostic?.(`tail_stream_error session=${this.sessionId} detail=${sanitizeDiagnostic(error instanceof Error ? error.message : String(error)) || "sdk_error"}`);
+			} finally {
+				this.#stream = undefined;
+				stream.close();
+			}
+			if (this.#closed || this.#pausedForGap) return;
+			this.#input.onDiagnostic?.(`tail_stream_reopen session=${this.sessionId}`);
 			await this.#runner.sleep(this.#runner.pollIntervalMs);
 		}
 	}
@@ -557,6 +633,48 @@ function decodeTailResult(result: CliResult): DecodedTail {
 		terminal: payload.terminal === true,
 		...(gap?.code === "retention_gap" ? { gap: { ...(opaqueCursorOf(payload) ? { cursor: opaqueCursorOf(payload) } : {}), resync: gap.resync } } : {}),
 	};
+}
+
+/**
+ * Host WebSocket frames relayed by `gjc sdk serve --stdio` are the same
+ * lifecycle vocabulary the `tail` CLI projects into items (`activity`,
+ * `agent_start`/`agent_end`, `turn_stream`, transcript rows), just unwrapped:
+ * `{type, ...payload}` instead of `{kind, payload}`. Project them onto the one
+ * TailFrame shape so the actor never learns which transport delivered them.
+ */
+export function decodeStreamLine(line: string): readonly TailFrame[] {
+	const trimmed = line.trim();
+	if (!trimmed) return [];
+	let parsed: unknown;
+	try {
+		parsed = JSON.parse(trimmed);
+	} catch {
+		return [];
+	}
+	const frame = recordOf(parsed);
+	if (!frame || typeof frame.type !== "string") return [];
+	if (frame.type === "hello" || frame.type === "pong") return [];
+	const { type, generation, seq, id, ...payload } = frame;
+	if (type === "event" && typeof frame.kind === "string") {
+		// Ring-projected events carry kind/payload/generation/seq already.
+		return normalizeTailFrame({ kind: frame.kind, payload: recordOf(frame.payload) ?? payload, generation, seq, id });
+	}
+	if (type === "turn_stream") {
+		// A finalized assistant answer is the live equivalent of an assistant
+		// transcript row; partial phases are progress only.
+		if (payload.phase === "finalized" && typeof payload.text === "string" && payload.text.length > 0) {
+			const ref = typeof payload.messageRef === "string" ? payload.messageRef : undefined;
+			return normalizeTailFrame({
+				kind: "transcript",
+				...(ref ? { id: `turn_stream:${ref}` } : {}),
+				payload: { role: "assistant", content: [{ type: "text", text: payload.text }], ...(payload.clientRef ? { clientRef: payload.clientRef } : {}) },
+			});
+		}
+		return normalizeTailFrame({ kind: "turn_stream", payload });
+	}
+	const turnId = typeof payload.turnId === "string" ? payload.turnId : undefined;
+	const stableId = typeof id === "string" ? id : turnId ? `${type}:${turnId}` : undefined;
+	return normalizeTailFrame({ kind: type, payload, ...(stableId ? { id: stableId } : {}), generation, seq });
 }
 
 function normalizeTailFrame(value: unknown): readonly TailFrame[] {
