@@ -1,0 +1,16 @@
+{
+	"name": "@gajaeway/app",
+	"private": true,
+	"type": "module",
+	"bin": {
+		"gajaeway": "./src/main.ts"
+	},
+	"dependencies": {
+		"@gajaeway/gateway": "workspace:*",
+		"@gajaeway/admin": "workspace:*",
+		"@gajaeway/adapter-discord": "workspace:*",
+		"@gajaeway/adapter-telegram": "workspace:*",
+		"@gajaeway/cli": "workspace:*",
+		"@gajaeway/protocol": "workspace:*"
+	}
+}
