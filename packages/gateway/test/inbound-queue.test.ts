@@ -144,3 +144,20 @@ test("trigger-only uniqueness permits members and retired epochs but rejects a s
 	db.inboundEnqueue({ ...message("d", "d"), receivedAt: "2026-09-01T00:00:02.000Z" });
 	expect(() => settle("d", 1)).toThrow(InboundBatchConflictError);
 });
+
+test("an accepted batch with a delivered steer can still be released for a fresh turn (steer rows never block requeue)", async () => {
+	const db = await open();
+	const cutoff = "2026-09-01T00:00:02.000Z";
+	db.inboundEnqueue({ ...message("trigger", "start"), receivedAt: "2026-09-01T00:00:00.000Z" });
+	const batchKey = "discord:dm:1|0|trigger|2026-09-01T00:00:02.000Z";
+	const opRef = "gw-p-0123456789abcdef0123456789abcdef";
+	db.inboundSettleBatch({ originKey: "discord:dm:1", epoch: 0, cutoff, batchKey, opRef });
+	expect(db.inboundBatchAccept(batchKey)).toBe(true);
+	db.inboundEnqueue({ ...message("steer-1", "mid-turn"), receivedAt: "2026-09-01T00:00:05.000Z" });
+	expect(db.inboundSteerAccepted({ messageId: "steer-1", batchKey, epoch: 0, opRef })).toBe(true);
+	// Live finding (layofflabs-2): this threw "cannot be requeued" because the
+	// delivered steer row is already done, and recovery stranded the origin.
+	expect(db.inboundBatchRequeueFreshTurn(batchKey)).toBe(1);
+	expect(db.inboundPendingCount("discord:dm:1")).toBe(1);
+	expect(db.inboundNonterminalBatches("discord:dm:1")).toEqual([]);
+});
