@@ -75,24 +75,14 @@ export class DaemonLock {
 		// dead pid it observed (same inode, same content) before unlinking.
 		const token = `${path}.reclaim`;
 		if (!(await claim(token, ports.pid))) {
-			// A reclaimer that crashed between token creation and cleanup would
-			// otherwise refuse every future start. The token names its owner: reclaim
-			// it only when that owner is provably dead, by the same rule as the lock.
+			// Fail closed. Automatically reclaiming an orphan token reopens the very
+			// race the token exists to close (two starters can both prove the orphan
+			// owner dead and both proceed). A crashed reclaimer is rare and the fix is
+			// a one-line manual removal; the message says exactly that.
 			const tokenHolder = await readHolder(token).catch(() => undefined);
-			if (
-				tokenHolder === undefined ||
-				tokenHolder === ports.pid ||
-				safeLiveness(ports, tokenHolder, token) !== "dead"
-			) {
-				throw new DaemonLockRefusalError(
-					`daemon lock ${path} is being reclaimed by another process (${token}); retry shortly, or remove the token by hand only after confirming no gajaeway daemon is starting`,
-				);
-			}
-			await rm(token, { force: true });
-			ports.log?.(`daemon_lock_reclaim_token_reclaimed stale_pid=${tokenHolder}`);
-			if (!(await claim(token, ports.pid))) {
-				throw new DaemonLockRefusalError(`daemon lock ${path} is being reclaimed by another process; retry shortly`);
-			}
+			throw new DaemonLockRefusalError(
+				`daemon lock ${path} is being reclaimed by another process${tokenHolder === undefined ? "" : ` (pid ${tokenHolder})`}; retry shortly. If no gajaeway daemon is starting, remove ${token} by hand.`,
+			);
 		}
 		try {
 			const before = await identity(path);

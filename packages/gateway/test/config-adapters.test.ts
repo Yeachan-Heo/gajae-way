@@ -88,6 +88,11 @@ const rejections: Array<[string, Record<string, unknown>, string]> = [
 		"adapters.discord.voice.speechSpeed must be a finite number when set",
 	],
 	[
+		"relative credential path",
+		{ credentials: { telegram: { credentialFile: "secrets/telegram" } }, adapters: { telegram: {} } },
+		"credentials.telegram.credentialFile must be an absolute path",
+	],
+	[
 		"voice unknown field",
 		{ credentials: creds, adapters: { discord: { voice: { apiKeyFile: "x" } } } },
 		"adapters.discord.voice.apiKeyFile is not a recognised field",
