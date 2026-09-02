@@ -172,6 +172,7 @@ async function loadOrCreateLaneJob(
 const DEFAULT_STALL_CHECK_INTERVAL_MS = 5_000;
 /** /restart: hard-exit budget after the ordered stop begins. */
 const RESTART_HARD_EXIT_MS = 15_000;
+const RESTART_EXIT_CODE = 75;
 interface Connection {
 	readonly decoder: FrameDecoder;
 	negotiated: boolean;
@@ -216,6 +217,8 @@ export interface GatewayServerOptions {
 	readonly overrides?: ConfigOverrides;
 	/** Test seam for chat.progress throttling; production uses the 15s defaults. */
 	readonly progress?: { readonly firstAfterMs?: number; readonly intervalMs?: number };
+	/** Test seam: how /restart ends the process after the ordered stop (default process.exit). */
+	readonly exitProcess?: (code: number) => void;
 	/** Test seam for the persona tail stall heartbeat; production uses the 5s default. */
 	readonly stallCheckIntervalMs?: number;
 	/** Mid-work speech pacing (issue #71). */
@@ -1344,11 +1347,13 @@ async function sendChat(
 		console.error(`gateway restart requested by owner via ${key}`);
 		// Let the ack leave the socket, then exit cleanly; the supervisor restarts us.
 		setTimeout(() => {
-			void runtime.stop?.("owner /restart");
-			// The whole point is a fresh process: if the ordered stop wedges on a
-			// producer, exit anyway and let the supervisor relaunch. Durable inbound
-			// and session state recover on boot.
-			setTimeout(() => process.exit(0), RESTART_HARD_EXIT_MS).unref();
+			// Exit non-zero on purpose: launchd KeepAlive=true and systemd
+			// Restart=on-failure only relaunch after an unsuccessful exit. A wedged
+			// ordered stop still exits within the hard budget. Durable inbound and
+			// session state recover on boot.
+			const exit = options.exitProcess ?? ((code: number) => process.exit(code));
+			void runtime.stop?.("owner /restart").then(() => exit(RESTART_EXIT_CODE), () => exit(RESTART_EXIT_CODE));
+			setTimeout(() => exit(RESTART_EXIT_CODE), RESTART_HARD_EXIT_MS).unref();
 		}, 1_500);
 		return;
 	}
