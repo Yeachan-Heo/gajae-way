@@ -307,6 +307,7 @@ export class BrokerSupervisor implements PersonaBroker {
 		try {
 			await mkdir(this.agentDir, { recursive: true, mode: 0o700 });
 			await chmod(this.agentDir, 0o700);
+			await ensureSteeringDefaults(this.agentDir);
 			await this.#launchGeneration();
 		} catch (error) {
 			this.#stopping = true;
@@ -605,6 +606,32 @@ export class BrokerSupervisor implements PersonaBroker {
 		});
 		return await collectCommand(child, options?.timeoutMs ?? DEFAULT_COMMAND_TIMEOUT_MS);
 	}
+}
+
+/**
+ * The persona turn model is "always steer, never interrupt the conversation":
+ * every mid-turn message must reach the running turn immediately. gjc's own
+ * defaults (`steeringMode: one-at-a-time`, `interruptMode: wait`) would queue
+ * steers and defer them past tool calls, so the private agent dir is pinned to
+ * `steeringMode: all` / `interruptMode: immediate`. Other operator settings in
+ * config.yml are left untouched.
+ */
+export const STEERING_DEFAULTS: Readonly<Record<string, string>> = { steeringMode: "all", interruptMode: "immediate" };
+
+export async function ensureSteeringDefaults(agentDir: string): Promise<void> {
+	const path = join(agentDir, "config.yml");
+	let text = "";
+	try {
+		text = await readFile(path, "utf8");
+	} catch (error) {
+		if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+	}
+	let next = text;
+	for (const [key, value] of Object.entries(STEERING_DEFAULTS)) {
+		const line = new RegExp(`^${key}:[ \\t]*.*$`, "m");
+		next = line.test(next) ? next.replace(line, `${key}: ${value}`) : `${next}${next.length && !next.endsWith("\n") ? "\n" : ""}${key}: ${value}\n`;
+	}
+	if (next !== text) await writeFile(path, next, { mode: 0o600 });
 }
 
 function bindAgentDir(args: readonly string[], agentDir: string): readonly string[] {
