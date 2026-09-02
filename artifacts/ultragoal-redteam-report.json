@@ -2,11 +2,11 @@
  "schemaVersion": 1,
  "kind": "api-package-test-report",
  "sourceHash": "see quality gate: computed over HEAD listed above",
- "head": "bdbd6eef7d9a5a1397922f54a1e6fa0b4e9ad201",
+ "head": "5de94585865baf365d231005af9a40c39fc5103b",
  "command": "bun test packages/gateway/test/broker-supervisor.test.ts packages/gateway/test/terminal-idempotency.e2e.test.ts packages/gateway/test/tail-progress.test.ts packages/gateway/test/migration-drill.test.ts packages/adapter-discord/test/reactions.test.ts packages/adapter-discord/test/recovery.test.ts",
  "totals": {
-  "tests": 103,
-  "passed": 103,
+  "tests": 104,
+  "passed": 104,
   "failed": 0
  },
  "cases": [
@@ -158,6 +158,12 @@
    "id": "G3-F3",
    "obligation": "wedged strikes scoped per daemon identity",
    "testSubstring": "red-team G3-F3",
+   "verdict": "passed"
+  },
+  {
+   "id": "G4-F1",
+   "obligation": "strike attributed to the probed discovery record; mid-probe flip never charges the successor",
+   "testSubstring": "red-team G4-F1",
    "verdict": "passed"
   }
  ]
