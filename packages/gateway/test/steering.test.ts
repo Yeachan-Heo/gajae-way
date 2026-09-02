@@ -80,7 +80,10 @@ test("a mid-turn message issues one steer, keeps one send, and is attributed in 
 
 	enqueue("correction", "mention the rollback caveat");
 	await manager.notifyInbound(ORIGIN_KEY);
-	await eventually(() => observedTailText.includes("mention the rollback caveat"), "steer echo did not reach the running tail");
+	await eventually(
+		() => observedTailText.includes("mention the rollback caveat"),
+		"steer echo did not reach the running tail",
+	);
 
 	expect(port.sends).toHaveLength(1);
 	expect(port.steers).toEqual([
@@ -107,7 +110,9 @@ test("a mid-turn message issues one steer, keeps one send, and is attributed in 
 
 	port.complete(running.opRef, "done");
 	await eventually(
-		() => database?.inboundBatchRows(batch.batchKey).every((row) => row.state === "done" && row.batch_state === "done") === true,
+		() =>
+			database?.inboundBatchRows(batch.batchKey).every((row) => row.state === "done" && row.batch_state === "done") ===
+			true,
 		"running batch did not complete after its tail terminal event",
 	);
 });

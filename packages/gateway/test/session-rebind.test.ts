@@ -3,15 +3,15 @@ import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { GjcClient } from "../src/orchestrator/gjc-client";
-import { personaBatchKey, personaBatchOpRef, PersonaSessionManager } from "../src/orchestrator/persona-session";
+import { PersonaSessionManager, personaBatchKey, personaBatchOpRef } from "../src/orchestrator/persona-session";
 import {
 	extractRuntimeError,
+	formatFailureNotice,
+	GjcRuntimeError,
 	isRebindableCode,
 	REBINDABLE_ERROR_CODES,
 	rebindableCodeOf,
 	redactSecrets,
-	formatFailureNotice,
-	GjcRuntimeError,
 } from "../src/orchestrator/rebind";
 import { GatewayDatabase } from "../src/store/db";
 import { ScriptedSessionPort } from "./session-port.fake";
@@ -54,7 +54,11 @@ test.each([
 test("rebind classification is narrow and the measured code set is pinned", () => {
 	expect(isRebindableCode("RESOURCE_GONE")).toBe(false);
 	expect(isRebindableCode("resource_gone_x")).toBe(false);
-	expect(rebindableCodeOf(new GjcRuntimeError("lookalike", { code: "invalid_params", message: "session endpoint record is gone" }))).toBeUndefined();
+	expect(
+		rebindableCodeOf(
+			new GjcRuntimeError("lookalike", { code: "invalid_params", message: "session endpoint record is gone" }),
+		),
+	).toBeUndefined();
 	// resume_unusable (#96) stays classified: the per-turn `--resume` spawn it was
 	// measured on is gone, but a bind-time create/resume can still report it.
 	expect([...REBINDABLE_ERROR_CODES].sort()).toEqual([
@@ -67,16 +71,24 @@ test("rebind classification is narrow and the measured code set is pinned", () =
 });
 
 test("runtime parsing accepts only declared SDK error envelopes", () => {
+	expect(extractRuntimeError('noise\n{"ok":false,"error":{"code":" resource_gone\u200b","message":"gone"}}')).toEqual({
+		code: "resource_gone",
+		message: "gone",
+	});
 	expect(
-		extractRuntimeError('noise\n{"ok":false,"error":{"code":" resource_gone\u200b","message":"gone"}}'),
-	).toEqual({ code: "resource_gone", message: "gone" });
-	expect(extractRuntimeError('{"type":"tool_execution_end","error":{"code":"spawn_failed","message":"tool failed"}}')).toBeUndefined();
+		extractRuntimeError('{"type":"tool_execution_end","error":{"code":"spawn_failed","message":"tool failed"}}'),
+	).toBeUndefined();
 	expect(extractRuntimeError('{"ok":true,"error":{"code":"resource_gone","message":"not a failure"}}')).toBeUndefined();
 });
 
 test("bind diagnostics preserve codes while redacting credential-bearing details", () => {
 	const secret = "sk-live-0123456789abcdef";
-	const notice = formatFailureNotice(new GjcRuntimeError("wrapped", { code: "spawn_failed", message: `Authorization: Bearer ${secret}; api_key=${secret}` }));
+	const notice = formatFailureNotice(
+		new GjcRuntimeError("wrapped", {
+			code: "spawn_failed",
+			message: `Authorization: Bearer ${secret}; api_key=${secret}`,
+		}),
+	);
 	expect(notice).toContain("spawn_failed");
 	expect(notice).toContain("[redacted]");
 	expect(notice).not.toContain(secret);
@@ -89,7 +101,12 @@ test("bind-time condemned session.create rebinds exactly once with the next epoc
 	const spawn = ((options: { readonly cmd: readonly string[] }) => {
 		commands.push([...options.cmd]);
 		return commands.length === 1
-			? child(JSON.stringify({ ok: false, error: { code: "resource_gone", message: "saved session no longer exists" } }) + "\n", "", 1)
+			? child(
+					JSON.stringify({ ok: false, error: { code: "resource_gone", message: "saved session no longer exists" } }) +
+						"\n",
+					"",
+					1,
+				)
 			: child(JSON.stringify({ ok: true, result: { sessionId: "session-e1" } }) + "\n");
 	}) as unknown as typeof Bun.spawn;
 	const client = new GjcClient(db, home, { spawn, log: () => {} });
@@ -141,7 +158,10 @@ test("concurrent bind callers share one in-flight session.create", async () => {
 	await Bun.sleep(1);
 	expect(calls).toBe(1);
 	release();
-	await expect(Promise.all([first, second])).resolves.toEqual([{ sessionId: "shared-session" }, { sessionId: "shared-session" }]);
+	await expect(Promise.all([first, second])).resolves.toEqual([
+		{ sessionId: "shared-session" },
+		{ sessionId: "shared-session" },
+	]);
 });
 
 test("missing recovery evidence holds a settled batch instead of replaying a turn", async () => {
@@ -178,7 +198,10 @@ test("missing recovery evidence holds a settled batch instead of replaying a tur
 	try {
 		await manager.recover();
 		expect(port.sendAttempts).toEqual([]);
-		expect(db.inboundBatchRows(batchKey)[0]).toMatchObject({ batch_state: "settled", bound_session_id: binding.sessionId });
+		expect(db.inboundBatchRows(batchKey)[0]).toMatchObject({
+			batch_state: "settled",
+			bound_session_id: binding.sessionId,
+		});
 	} finally {
 		await manager.stop();
 	}

@@ -4,9 +4,9 @@ import { type ConfigOverrides, loadConfig } from "./config";
 import { seedDefaultMonitors } from "./monitors/defaults";
 import { MonitorRegistry } from "./monitors/registry";
 import { BrokerSupervisor, type BrokerSupervisorDependencies } from "./orchestrator/broker";
+import { sanitizeDiagnostic } from "./orchestrator/rebind";
 import { BrokerSessionPort } from "./orchestrator/session-port";
 import { TailRunner } from "./orchestrator/tail-runner";
-import { sanitizeDiagnostic } from "./orchestrator/rebind";
 import { PersonaLoader } from "./persona/persona";
 import { type GatewayServer, startStdioServer, startUnixServer } from "./server/server";
 import { GatewayDatabase } from "./store/db";
@@ -79,7 +79,7 @@ export async function bootGateway(options: BootGatewayOptions = {}): Promise<Gat
 			: await startUnixServer({
 					config,
 					database,
-				sessionPort,
+					sessionPort,
 					persona,
 					broker,
 					startedAt,
@@ -102,4 +102,3 @@ export async function bootGateway(options: BootGatewayOptions = {}): Promise<Gat
 function diagnostic(error: unknown): string {
 	return sanitizeDiagnostic(error instanceof Error ? error.message : String(error)) || "unknown_error";
 }
-

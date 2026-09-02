@@ -119,7 +119,8 @@ export class GjcClient {
 	#cachedSession(originKey: string, epoch: number): string | undefined {
 		const cacheKey = `${originKey}#${epoch}`;
 		const record = this.#database.getSessionRecord(originKey);
-		const cached = this.#sessions.get(cacheKey) ?? (record?.epoch === epoch && record.sessionId ? record.sessionId : undefined);
+		const cached =
+			this.#sessions.get(cacheKey) ?? (record?.epoch === epoch && record.sessionId ? record.sessionId : undefined);
 		if (!cached) return undefined;
 		this.#sessions.set(cacheKey, cached);
 		return cached;
@@ -168,7 +169,8 @@ export class GjcClient {
 	}
 
 	#forgetOrigin(originKey: string): void {
-		for (const cacheKey of this.#sessions.keys()) if (cacheKey.startsWith(`${originKey}#`)) this.#sessions.delete(cacheKey);
+		for (const cacheKey of this.#sessions.keys())
+			if (cacheKey.startsWith(`${originKey}#`)) this.#sessions.delete(cacheKey);
 	}
 
 	async #bounded(child: ReturnType<typeof Bun.spawn>, label: string): Promise<[string, string, number]> {

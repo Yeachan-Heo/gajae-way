@@ -107,7 +107,9 @@ test("failed turn preserves selected context; later successful text consumes it 
 	const { client } = await start(gatewayConfig, database, sessionPort);
 
 	send(client, "trigger-failed", "first owner request");
-	await waitUntil(() => client.frames.some((frame) => frame.event === "chat.message" && frame.payload.text.startsWith("[turn failed]")));
+	await waitUntil(() =>
+		client.frames.some((frame) => frame.event === "chat.message" && frame.payload.text.startsWith("[turn failed]")),
+	);
 	expect(
 		database
 			.contextUnread(ORIGIN_KEY)
@@ -138,7 +140,7 @@ test("successful intentional silence advances the context cursor", async () => {
 	client.close();
 });
 
-	test("suppressed pre-tool assistant text followed by failure keeps the selected context unread", async () => {
+test("suppressed pre-tool assistant text followed by failure keeps the selected context unread", async () => {
 	const gatewayConfig = await config();
 	const database = await GatewayDatabase.open(gatewayConfig.dbPath);
 	database.contextRecord({ messageId: "context-human", originKey: ORIGIN_KEY, body: "relevant context" });
@@ -151,14 +153,21 @@ test("successful intentional silence advances the context cursor", async () => {
 	});
 	const { client } = await start(gatewayConfig, database, sessionPort);
 	send(client, "intermediate-trigger", "owner request");
-	await waitUntil(() => client.frames.some((frame) => frame.event === "chat.message" && frame.payload.text.startsWith("[turn failed]")));
-	expect(database.contextUnread(ORIGIN_KEY).map((row) => row.message_id).sort()).toEqual(["context-human", "intermediate-trigger"]);
+	await waitUntil(() =>
+		client.frames.some((frame) => frame.event === "chat.message" && frame.payload.text.startsWith("[turn failed]")),
+	);
+	expect(
+		database
+			.contextUnread(ORIGIN_KEY)
+			.map((row) => row.message_id)
+			.sort(),
+	).toEqual(["context-human", "intermediate-trigger"]);
 	const messages = client.frames.filter((frame) => frame.event === "chat.message");
 	expect(messages.map((frame) => frame.payload.text)).toEqual(["[turn failed] runtime failed after visible reply"]);
 	client.close();
 });
 
-	test("suppressed pre-tool reaction text followed by failure keeps the selected context unread", async () => {
+test("suppressed pre-tool reaction text followed by failure keeps the selected context unread", async () => {
 	const gatewayConfig = await config();
 	const database = await GatewayDatabase.open(gatewayConfig.dbPath);
 	const sessionPort = sessionPortFromScript({
@@ -170,14 +179,16 @@ test("successful intentional silence advances the context cursor", async () => {
 	});
 	const { client } = await start(gatewayConfig, database, sessionPort);
 	send(client, "reaction-trigger", "owner request");
-	await waitUntil(() => client.frames.some((frame) => frame.event === "chat.message" && frame.payload.text.startsWith("[turn failed]")));
+	await waitUntil(() =>
+		client.frames.some((frame) => frame.event === "chat.message" && frame.payload.text.startsWith("[turn failed]")),
+	);
 	expect(database.contextUnread(ORIGIN_KEY).map((row) => row.message_id)).toEqual(["reaction-trigger"]);
 	const messages = client.frames.filter((frame) => frame.event === "chat.message");
 	expect(messages.map((frame) => frame.payload.text)).toEqual(["[turn failed] runtime failed after visible reaction"]);
 	client.close();
 });
 
-	test("/new retires a pre-reset trigger queued behind an in-flight turn", async () => {
+test("/new retires a pre-reset trigger queued behind an in-flight turn", async () => {
 	const gatewayConfig = await config();
 	const database = await GatewayDatabase.open(gatewayConfig.dbPath);
 	let release: (() => void) | undefined;
@@ -289,7 +300,9 @@ test("pre-success failure retries the same stable bootstrap and intentional sile
 	});
 	let { client } = await start(gatewayConfig, database, sessionPort);
 	send(client, "bootstrap-fail", "first request");
-	await waitUntil(() => client.frames.some((frame) => frame.event === "chat.message" && frame.payload.text.startsWith("[turn failed]")));
+	await waitUntil(() =>
+		client.frames.some((frame) => frame.event === "chat.message" && frame.payload.text.startsWith("[turn failed]")),
+	);
 	expect(database.getSessionBootstrap(ORIGIN_KEY)?.lastBootstrappedEpoch).toBe(-1);
 	client.close();
 	await server?.stop();
@@ -328,7 +341,9 @@ test("intermediate delivery failure keeps bootstrap pending but consumes the bod
 	});
 	const { client } = await start(gatewayConfig, database, sessionPort);
 	send(client, "bootstrap-visible-fail", "body that must not replay");
-	await waitUntil(() => client.frames.some((frame) => frame.event === "chat.message" && frame.payload.text.startsWith("[turn failed]")));
+	await waitUntil(() =>
+		client.frames.some((frame) => frame.event === "chat.message" && frame.payload.text.startsWith("[turn failed]")),
+	);
 	expect(database.getSessionBootstrap(ORIGIN_KEY)?.lastBootstrappedEpoch).toBe(-1);
 	send(client, "bootstrap-visible-retry", "next body");
 	await waitUntil(() => attempts.length === 2);
@@ -386,7 +401,6 @@ test("persistent sessions do not auto-rotate on a turn count", async () => {
 	expect(preambles.filter((preamble) => preamble.includes("## Session bootstrap"))).toHaveLength(1);
 	client.close();
 });
-
 
 test("gateway startup prunes old consumed context even when the database was quiet", async () => {
 	const gatewayConfig = await config();

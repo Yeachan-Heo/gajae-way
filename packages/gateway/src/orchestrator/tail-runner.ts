@@ -211,7 +211,13 @@ export class TailRunner {
 	 * coordinate is validated and recorded so an arbitrary historical replay can
 	 * never be started implicitly.
 	 */
-	async attachResync(input: TailAttachInput & { readonly cursor: string; readonly resync: TailResyncCoordinate; readonly operatorApproved: true }): Promise<TailHandle> {
+	async attachResync(
+		input: TailAttachInput & {
+			readonly cursor: string;
+			readonly resync: TailResyncCoordinate;
+			readonly operatorApproved: true;
+		},
+	): Promise<TailHandle> {
 		if (!validResyncCoordinate(input.resync)) throw new Error("tail resync coordinate is invalid");
 		const { operatorApproved: _operatorApproved, ...tailInput } = input;
 		return await this.attach({ ...tailInput, strict: false });
@@ -224,16 +230,24 @@ export class TailRunner {
 
 	/** Reaps only idle handles; an active turn is never evicted for capacity. */
 	async reapIdle(now = this.#now()): Promise<number> {
-		const idle = [...this.#handles].filter((handle) => handle.idleSince !== undefined && now - handle.idleSince >= this.#idleTtlMs);
+		const idle = [...this.#handles].filter(
+			(handle) => handle.idleSince !== undefined && now - handle.idleSince >= this.#idleTtlMs,
+		);
 		for (const handle of idle) await handle.close();
 		return idle.length;
 	}
 
 	/** An authenticated control reply is the only affirmative compaction observation. */
-	recordCompactionReceipt(input: { readonly sessionId: string; readonly originKey: string; readonly result: unknown }): void {
+	recordCompactionReceipt(input: {
+		readonly sessionId: string;
+		readonly originKey: string;
+		readonly result: unknown;
+	}): void {
 		const receipt = recordOf(input.result);
 		const outcome = receipt?.started === true ? "started" : receipt?.skipped === true ? "skipped" : "received";
-		this.#log(`compaction_event sessionId=${input.sessionId} originKey=${input.originKey} source=control_receipt result=${outcome}`);
+		this.#log(
+			`compaction_event sessionId=${input.sessionId} originKey=${input.originKey} source=control_receipt result=${outcome}`,
+		);
 	}
 
 	async #acquireSlot(priority: "current" | "retired"): Promise<void> {
@@ -241,7 +255,9 @@ export class TailRunner {
 		while (this.#handles.size >= this.#maxTailProcesses) {
 			const evictable = [...this.#handles]
 				.filter((handle) => !handle.running)
-				.sort((left, right) => (left.idleSince ?? Number.POSITIVE_INFINITY) - (right.idleSince ?? Number.POSITIVE_INFINITY))[0];
+				.sort(
+					(left, right) => (left.idleSince ?? Number.POSITIVE_INFINITY) - (right.idleSince ?? Number.POSITIVE_INFINITY),
+				)[0];
 			if (evictable) {
 				await evictable.close();
 				continue;
@@ -278,7 +294,7 @@ export class TailRunner {
 		];
 		const result = await this.#run(args, { timeoutMs: this.#pollTimeoutMs + 5_000 });
 		const decoded = decodeTailResult(result);
-		if (decoded.gap && (handle.strict && handle.cursor)) {
+		if (decoded.gap && handle.strict && handle.cursor) {
 			await handle.retentionGap(decoded.gap);
 			return;
 		}
@@ -461,7 +477,9 @@ class ManagedTailHandle implements TailHandle {
 	noteGap(gap: { cursor?: string; resync?: unknown }): void {
 		if (this.#gapNoted) return;
 		this.#gapNoted = true;
-		this.#input.onDiagnostic?.(`tail_gap_nonstrict session=${this.sessionId} resync=${JSON.stringify(gap.resync ?? null)}`);
+		this.#input.onDiagnostic?.(
+			`tail_gap_nonstrict session=${this.sessionId} resync=${JSON.stringify(gap.resync ?? null)}`,
+		);
 	}
 
 	async retentionGap(gap: { cursor?: string; resync?: unknown }): Promise<void> {
@@ -537,7 +555,9 @@ class ManagedTailHandle implements TailHandle {
 					await this.close();
 					return;
 				}
-				this.#input.onDiagnostic?.(`tail_error session=${this.sessionId} detail=${sanitizeDiagnostic(error instanceof Error ? error.message : String(error)) || "sdk_error"}`);
+				this.#input.onDiagnostic?.(
+					`tail_error session=${this.sessionId} detail=${sanitizeDiagnostic(error instanceof Error ? error.message : String(error)) || "sdk_error"}`,
+				);
 			} finally {
 				this.#polling = false;
 			}
@@ -568,7 +588,9 @@ class ManagedTailHandle implements TailHandle {
 					await this.close();
 					return;
 				}
-				this.#input.onDiagnostic?.(`tail_error session=${this.sessionId} detail=${sanitizeDiagnostic(error instanceof Error ? error.message : String(error)) || "sdk_error"}`);
+				this.#input.onDiagnostic?.(
+					`tail_error session=${this.sessionId} detail=${sanitizeDiagnostic(error instanceof Error ? error.message : String(error)) || "sdk_error"}`,
+				);
 			} finally {
 				this.#polling = false;
 			}
@@ -583,7 +605,9 @@ class ManagedTailHandle implements TailHandle {
 					for (const frame of frames) await this.receive(frame);
 				}
 			} catch (error) {
-				this.#input.onDiagnostic?.(`tail_stream_error session=${this.sessionId} detail=${sanitizeDiagnostic(error instanceof Error ? error.message : String(error)) || "sdk_error"}`);
+				this.#input.onDiagnostic?.(
+					`tail_stream_error session=${this.sessionId} detail=${sanitizeDiagnostic(error instanceof Error ? error.message : String(error)) || "sdk_error"}`,
+				);
 			} finally {
 				this.#stream = undefined;
 				stream.close();
@@ -620,7 +644,11 @@ function decodeTailResult(result: CliResult): DecodedTail {
 	try {
 		envelope = JSON.parse(result.stdout) as Record<string, unknown>;
 	} catch {
-		return { frames: [], terminal: false, error: new Error(`session tail did not print a JSON envelope (exit ${result.exitCode})`) };
+		return {
+			frames: [],
+			terminal: false,
+			error: new Error(`session tail did not print a JSON envelope (exit ${result.exitCode})`),
+		};
 	}
 	const error = recordOf(envelope.error);
 	const errorCode = typeof error?.code === "string" ? error.code : undefined;
@@ -647,7 +675,9 @@ function decodeTailResult(result: CliResult): DecodedTail {
 		frames: items.flatMap(normalizeTailFrame),
 		...(opaqueCursorOf(payload) ? { cursor: opaqueCursorOf(payload) } : {}),
 		terminal: payload.terminal === true,
-		...(gap?.code === "retention_gap" ? { gap: { ...(opaqueCursorOf(payload) ? { cursor: opaqueCursorOf(payload) } : {}), resync: gap.resync } } : {}),
+		...(gap?.code === "retention_gap"
+			? { gap: { ...(opaqueCursorOf(payload) ? { cursor: opaqueCursorOf(payload) } : {}), resync: gap.resync } }
+			: {}),
 	};
 }
 
@@ -683,7 +713,11 @@ export function decodeStreamLine(line: string): readonly TailFrame[] {
 			return normalizeTailFrame({
 				kind: "transcript",
 				...(ref ? { id: `turn_stream:${ref}` } : {}),
-				payload: { role: "assistant", content: [{ type: "text", text: payload.text }], ...(payload.clientRef ? { clientRef: payload.clientRef } : {}) },
+				payload: {
+					role: "assistant",
+					content: [{ type: "text", text: payload.text }],
+					...(payload.clientRef ? { clientRef: payload.clientRef } : {}),
+				},
 			});
 		}
 		return normalizeTailFrame({ kind: "turn_stream", payload });
@@ -701,11 +735,23 @@ function normalizeTailFrame(value: unknown): readonly TailFrame[] {
 	const kind: TailEventKind = OBSERVED_TAIL_KIND_SET.has(rawKind) ? (rawKind as TailEventKind) : "unknown";
 	const generation = typeof item.generation === "number" ? item.generation : undefined;
 	const seq = typeof item.seq === "number" ? item.seq : undefined;
-	const id = typeof item.id === "string" && item.id.length > 0 ? item.id : generation !== undefined && seq !== undefined ? `${generation}:${seq}` : undefined;
+	const id =
+		typeof item.id === "string" && item.id.length > 0
+			? item.id
+			: generation !== undefined && seq !== undefined
+				? `${generation}:${seq}`
+				: undefined;
 	const text = rawKind === "transcript" && payload.role === "assistant" ? contentText(payload.content) : undefined;
-	const clientRef = typeof payload.clientRef === "string" ? payload.clientRef : typeof item.clientRef === "string" ? item.clientRef : undefined;
-	const idle = rawKind === "activity" && [payload.state, payload.status, payload.activity].some((value) => value === "idle");
-	if (rawKind === "tool_activity" && (payload.phase === "started" || payload.phase === "start")) payload.toolCallStarted = true;
+	const clientRef =
+		typeof payload.clientRef === "string"
+			? payload.clientRef
+			: typeof item.clientRef === "string"
+				? item.clientRef
+				: undefined;
+	const idle =
+		rawKind === "activity" && [payload.state, payload.status, payload.activity].some((value) => value === "idle");
+	if (rawKind === "tool_activity" && (payload.phase === "started" || payload.phase === "start"))
+		payload.toolCallStarted = true;
 	return [
 		{
 			kind,
@@ -750,9 +796,10 @@ function opaqueCursorOf(payload: Record<string, unknown>): string | undefined {
 }
 
 function recordOf(value: unknown): Record<string, unknown> | undefined {
-	return typeof value === "object" && value !== null && !Array.isArray(value) ? (value as Record<string, unknown>) : undefined;
+	return typeof value === "object" && value !== null && !Array.isArray(value)
+		? (value as Record<string, unknown>)
+		: undefined;
 }
-
 
 function positiveInteger(value: number | undefined, fallback: number, name: string): number {
 	const result = value ?? fallback;

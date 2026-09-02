@@ -61,17 +61,40 @@ test("persistent-session control-plane logs use grep-stable fields", async () =>
 		await manager.notifyInbound(originKey);
 		await eventually(() => port.steers.length === 1, "steer was not delivered");
 		port.emitStall(first.sessionId, 4_321);
-		await eventually(() => lines.some((line) => line.startsWith(`stall_alert originKey=${originKey} sessionId=${first.sessionId} silentMs=4321`)), "stall alert was not logged");
+		await eventually(
+			() =>
+				lines.some((line) =>
+					line.startsWith(`stall_alert originKey=${originKey} sessionId=${first.sessionId} silentMs=4321`),
+				),
+			"stall alert was not logged",
+		);
 		await manager.reset(originKey, JSON.stringify(origin));
-		await eventually(() => lines.some((line) => line.includes(`retired_hold originKey=${originKey} batchKey=`)), "retired batch hold was not logged");
-		expect(lines.some((line) => line.startsWith(`steer_delivered originKey=${originKey} opRef=${first.opRef} messageId=m-2`))).toBe(true);
+		await eventually(
+			() => lines.some((line) => line.includes(`retired_hold originKey=${originKey} batchKey=`)),
+			"retired batch hold was not logged",
+		);
+		expect(
+			lines.some((line) =>
+				line.startsWith(`steer_delivered originKey=${originKey} opRef=${first.opRef} messageId=m-2`),
+			),
+		).toBe(true);
 
 		const runner = new TailRunner({
-			run: async () => ({ exitCode: 0, stdout: JSON.stringify({ ok: true, result: { items: [], terminal: true } }), stderr: "" }),
+			run: async () => ({
+				exitCode: 0,
+				stdout: JSON.stringify({ ok: true, result: { items: [], terminal: true } }),
+				stderr: "",
+			}),
 			repo: join(home, "workspace"),
 		});
 		runner.recordCompactionReceipt({ sessionId: first.sessionId, originKey, result: { started: true } });
-		expect(lines.some((line) => line === `compaction_event sessionId=${first.sessionId} originKey=${originKey} source=control_receipt result=started`)).toBe(true);
+		expect(
+			lines.some(
+				(line) =>
+					line ===
+					`compaction_event sessionId=${first.sessionId} originKey=${originKey} source=control_receipt result=started`,
+			),
+		).toBe(true);
 
 		let healthy = true;
 		broker = new BrokerSupervisor({

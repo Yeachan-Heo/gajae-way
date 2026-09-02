@@ -53,7 +53,12 @@ test("red-team: receipt-bound tail frames flush before later live frames, exactl
 		}
 		return tailResult([], undefined, true);
 	};
-	const runner = new TailRunner({ run, repo: "/tmp/gajaeway-tail-gen3-order", pollIntervalMs: 1, sleep: (ms) => Bun.sleep(ms) });
+	const runner = new TailRunner({
+		run,
+		repo: "/tmp/gajaeway-tail-gen3-order",
+		pollIntervalMs: 1,
+		sleep: (ms) => Bun.sleep(ms),
+	});
 	const tail = await runner.attach({
 		sessionId: "tail-order",
 		brokerGeneration: 1,
@@ -104,7 +109,12 @@ test("red-team: a failed delivery keeps its cursor uncommitted while later tail 
 		}
 		return tailResult([], undefined, true);
 	};
-	const runner = new TailRunner({ run, repo: "/tmp/gajaeway-tail-gen3-failure", pollIntervalMs: 1, sleep: (ms) => Bun.sleep(ms) });
+	const runner = new TailRunner({
+		run,
+		repo: "/tmp/gajaeway-tail-gen3-failure",
+		pollIntervalMs: 1,
+		sleep: (ms) => Bun.sleep(ms),
+	});
 	const tail = await runner.attach({
 		sessionId: "tail-failure",
 		brokerGeneration: 1,
@@ -128,7 +138,10 @@ test("red-team: a failed delivery keeps its cursor uncommitted while later tail 
 			"failed frame did not become a bounded tail diagnostic",
 		);
 		releaseLivePoll.release();
-		await eventually(() => delivered.includes("later delivery"), "a failed callback poisoned delivery of the later frame");
+		await eventually(
+			() => delivered.includes("later delivery"),
+			"a failed callback poisoned delivery of the later frame",
+		);
 		// A checkpoint after the rejected frame would make its side effect unrecoverable.
 		expect(cursors).toEqual([]);
 	} finally {
@@ -145,10 +158,18 @@ test("red-team: closing a tail during a buffered delivery fences later frames an
 	const run: CliRunner = async () => {
 		calls++;
 		if (calls === 1)
-			return tailResult([assistantFrame("first", "first"), assistantFrame("after-close", "after close")], "cursor-close");
+			return tailResult(
+				[assistantFrame("first", "first"), assistantFrame("after-close", "after close")],
+				"cursor-close",
+			);
 		return tailResult([], undefined, true);
 	};
-	const runner = new TailRunner({ run, repo: "/tmp/gajaeway-tail-gen3-close", pollIntervalMs: 1, sleep: (ms) => Bun.sleep(ms) });
+	const runner = new TailRunner({
+		run,
+		repo: "/tmp/gajaeway-tail-gen3-close",
+		pollIntervalMs: 1,
+		sleep: (ms) => Bun.sleep(ms),
+	});
 	const tail = await runner.attach({
 		sessionId: "tail-close",
 		brokerGeneration: 1,
@@ -187,7 +208,12 @@ test("red-team: an empty terminal poll never checkpoints past buffered frames st
 		// Every later poll is an empty terminal page carrying a newer checkpoint.
 		return tailResult([], "cursor-empty-terminal", true);
 	};
-	const runner = new TailRunner({ run, repo: "/tmp/gajaeway-tail-gen4-empty", pollIntervalMs: 1, sleep: (ms) => Bun.sleep(ms) });
+	const runner = new TailRunner({
+		run,
+		repo: "/tmp/gajaeway-tail-gen4-empty",
+		pollIntervalMs: 1,
+		sleep: (ms) => Bun.sleep(ms),
+	});
 	const tail = await runner.attach({
 		sessionId: "tail-empty-terminal",
 		brokerGeneration: 1,
@@ -234,14 +260,22 @@ test("a cursorless attach polls non-strict, treats the runtime's pre-attach gap 
 				result: {
 					checkpoint: { revision: 4, generation: 1, seq: 0 },
 					gap: { code: "retention_gap", resync: { revision: 4, generation: 1, seq: 0 } },
-					items: calls === 1 ? [{ kind: "transcript", id: "live-1", payload: { role: "assistant", content: [{ text: "live" }] } }] : [],
+					items:
+						calls === 1
+							? [{ kind: "transcript", id: "live-1", payload: { role: "assistant", content: [{ text: "live" }] } }]
+							: [],
 					terminal: calls > 1,
 				},
 			}),
 			stderr: "",
 		};
 	};
-	const runner = new TailRunner({ run, repo: "/tmp/gajaeway-tail-cursorless", pollIntervalMs: 1, sleep: (ms) => Bun.sleep(ms) });
+	const runner = new TailRunner({
+		run,
+		repo: "/tmp/gajaeway-tail-cursorless",
+		pollIntervalMs: 1,
+		sleep: (ms) => Bun.sleep(ms),
+	});
 	const tail = await runner.attach({
 		sessionId: "tail-cursorless",
 		brokerGeneration: 1,
@@ -328,10 +362,22 @@ test("event-driven: after one backfill poll, host stream frames are delivered as
 		const pollsAfterOpen = argv.length;
 		pushLine!(JSON.stringify({ type: "hello", protocolVersion: 3 }));
 		pushLine!(JSON.stringify({ type: "activity", sessionId: "stream-1", state: "busy" }));
-		pushLine!(JSON.stringify({ type: "turn_stream", sessionId: "stream-1", phase: "finalized", text: "LIVE_OK", finalAnswer: true, messageRef: "7" }));
+		pushLine!(
+			JSON.stringify({
+				type: "turn_stream",
+				sessionId: "stream-1",
+				phase: "finalized",
+				text: "LIVE_OK",
+				finalAnswer: true,
+				messageRef: "7",
+			}),
+		);
 		pushLine!(JSON.stringify({ type: "agent_end", sessionId: "stream-1", turnId: "t-1" }));
 		pushLine!(JSON.stringify({ type: "activity", sessionId: "stream-1", state: "idle" }));
-		await eventually(() => delivered.includes("LIVE_OK") && terminals.includes("agent_end"), "live frames were not delivered from the stream");
+		await eventually(
+			() => delivered.includes("LIVE_OK") && terminals.includes("agent_end"),
+			"live frames were not delivered from the stream",
+		);
 		await Bun.sleep(30);
 		// No interval polling while the stream is healthy.
 		expect(argv.length).toBe(pollsAfterOpen);

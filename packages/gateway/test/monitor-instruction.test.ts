@@ -9,6 +9,7 @@ import { GatewayDatabase } from "../src/store/db";
 import { DeliveryLedger } from "../src/store/ledger";
 
 import { ScriptedSessionPort } from "./session-port.fake";
+
 /** Real registry + generic SessionPort harness honoring the JSON authoring contract. */
 async function harness(directory: string) {
 	const database = await GatewayDatabase.open(join(directory, "gateway.db"));

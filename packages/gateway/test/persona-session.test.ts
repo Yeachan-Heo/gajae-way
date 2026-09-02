@@ -44,7 +44,10 @@ function enqueue(messageId: string, body: string): void {
 	expect(accepted).toBe(true);
 }
 
-async function harness(port: ScriptedSessionPort, hooks: { terminal?: (text: string) => void; retired?: () => void } = {}) {
+async function harness(
+	port: ScriptedSessionPort,
+	hooks: { terminal?: (text: string) => void; retired?: () => void } = {},
+) {
 	home = await mkdtemp(join(tmpdir(), "gajaeway-persona-session-"));
 	database = await GatewayDatabase.open(join(home, "gateway.db"));
 	manager = new PersonaSessionManager({
@@ -66,7 +69,9 @@ async function harness(port: ScriptedSessionPort, hooks: { terminal?: (text: str
 }
 
 test("actor settles durable inbound, sends one deterministic caller op-ref, then completes on tail terminal", async () => {
-	const port = new ScriptedSessionPort({ onSend: (input, scripted) => scripted.complete(input.opRef, "persona reply") });
+	const port = new ScriptedSessionPort({
+		onSend: (input, scripted) => scripted.complete(input.opRef, "persona reply"),
+	});
 	const terminal: string[] = [];
 	await harness(port, { terminal: (text) => terminal.push(text) });
 	enqueue("m-1", "hello");
@@ -148,7 +153,10 @@ test("a retired stalled turn detaches into a durable hold and reconciles termina
 	port.emitStall(send.sessionId);
 	await manager?.recover();
 	port.complete(send.opRef, "must remain fenced");
-	await eventually(() => database?.inboundBatchRows(batchKey)[0]?.batch_state === "done", "retired hold did not reconcile terminal");
+	await eventually(
+		() => database?.inboundBatchRows(batchKey)[0]?.batch_state === "done",
+		"retired hold did not reconcile terminal",
+	);
 	expect(terminal).toEqual([]);
 });
 
@@ -184,7 +192,13 @@ test("startup recovery reconstructs an accepted durable batch and reconciles its
 });
 
 test("the immutable first-row settle cutoff yields a safe op-ref even when platform ids contain SDK-unsafe bytes", async () => {
-	const opRef = personaBatchOpRef("instance", "discord/channel/room", 4, "message id / with spaces", "2026-09-01T00:00:00.000Z");
+	const opRef = personaBatchOpRef(
+		"instance",
+		"discord/channel/room",
+		4,
+		"message id / with spaces",
+		"2026-09-01T00:00:00.000Z",
+	);
 	expect(opRef).toMatch(/^gw-p-[0-9a-f]{32}$/);
 });
 
@@ -230,8 +244,24 @@ test("pending rows older than maxInboundAgeMs are expired instead of answered (s
 		},
 	});
 	const old = new Date(Date.now() - 5 * 60_000).toISOString();
-	expect(database.inboundEnqueue({ messageId: "old-1", originKey: KEY, originRefJson: JSON.stringify(ORIGIN), body: "stale question", receivedAt: old })).toBe(true);
-	expect(database.inboundEnqueue({ messageId: "old-2", originKey: KEY, originRefJson: JSON.stringify(ORIGIN), body: "stale follow-up", receivedAt: old })).toBe(true);
+	expect(
+		database.inboundEnqueue({
+			messageId: "old-1",
+			originKey: KEY,
+			originRefJson: JSON.stringify(ORIGIN),
+			body: "stale question",
+			receivedAt: old,
+		}),
+	).toBe(true);
+	expect(
+		database.inboundEnqueue({
+			messageId: "old-2",
+			originKey: KEY,
+			originRefJson: JSON.stringify(ORIGIN),
+			body: "stale follow-up",
+			receivedAt: old,
+		}),
+	).toBe(true);
 	enqueue("fresh-1", "fresh question");
 	await manager.notifyInbound(KEY);
 	await eventually(() => sent.length === 1, "fresh row was not answered");

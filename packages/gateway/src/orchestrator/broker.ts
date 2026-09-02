@@ -125,7 +125,9 @@ export function isHealthySessionList(result: CliResult): boolean {
 		const parsed = JSON.parse(result.stdout) as { ok?: unknown; result?: unknown };
 		if (parsed.ok !== true) return false;
 		const body = parsed.result;
-		return typeof body === "object" && body !== null && Array.isArray((body as Record<string, unknown>)[SESSION_LIST_MARKER]);
+		return (
+			typeof body === "object" && body !== null && Array.isArray((body as Record<string, unknown>)[SESSION_LIST_MARKER])
+		);
 	} catch {
 		return false;
 	}
@@ -153,9 +155,7 @@ export async function preflightGjcRuntime(
 	}
 	if (!minimum) throw new Error(`invalid configured gjc minimum version ${minimumVersion}`);
 	if (compareVersions(found, minimum) < 0) {
-		throw new Error(
-			`gjc runtime preflight failed: requires gjc >= ${minimumVersion}; found ${formatVersion(found)}`,
-		);
+		throw new Error(`gjc runtime preflight failed: requires gjc >= ${minimumVersion}; found ${formatVersion(found)}`);
 	}
 	const capability = await sdk([...brokerHealthArgs()], { timeoutMs: DEFAULT_COMMAND_TIMEOUT_MS });
 	if (!isHealthySessionList(capability)) {
@@ -230,7 +230,8 @@ export class BrokerSupervisor implements PersonaBroker {
 		this.cli = (args, commandOptions) => this.#command(bindAgentDir(args, this.agentDir), commandOptions);
 		this.#healthProbe =
 			options.healthProbe ??
-			(async ({ cli }) => isHealthySessionList(await cli([...brokerHealthArgs()], { timeoutMs: this.#healthProbeTimeoutMs })));
+			(async ({ cli }) =>
+				isHealthySessionList(await cli([...brokerHealthArgs()], { timeoutMs: this.#healthProbeTimeoutMs })));
 		this.#startupStabilizationMs = options.healthProbe ? 0 : DEFAULT_STARTUP_STABILIZATION_MS;
 		this.#isPidAlive = options.isPidAlive ?? defaultPidAlive;
 		this.#healthIntervalMs = positiveInteger(options.healthIntervalMs, DEFAULT_HEALTH_INTERVAL_MS, "healthIntervalMs");
@@ -239,8 +240,16 @@ export class BrokerSupervisor implements PersonaBroker {
 			DEFAULT_HEALTH_PROBE_TIMEOUT_MS,
 			"healthProbeTimeoutMs",
 		);
-		this.#readinessAttempts = positiveInteger(options.readinessAttempts, DEFAULT_READINESS_ATTEMPTS, "readinessAttempts");
-		this.#readinessDelayMs = nonNegativeInteger(options.readinessDelayMs, DEFAULT_READINESS_DELAY_MS, "readinessDelayMs");
+		this.#readinessAttempts = positiveInteger(
+			options.readinessAttempts,
+			DEFAULT_READINESS_ATTEMPTS,
+			"readinessAttempts",
+		);
+		this.#readinessDelayMs = nonNegativeInteger(
+			options.readinessDelayMs,
+			DEFAULT_READINESS_DELAY_MS,
+			"readinessDelayMs",
+		);
 		this.#restartInitialMs = nonNegativeInteger(
 			options.restartBackoff?.initialMs,
 			DEFAULT_RESTART_INITIAL_MS,
@@ -519,7 +528,9 @@ export class BrokerSupervisor implements PersonaBroker {
 		if (this.#stopping || this.#active !== active) return;
 		this.#healthStrikes++;
 		if (this.#healthStrikes < HEALTH_FAILURE_STRIKES) {
-			this.#log(`broker health probe strike ${this.#healthStrikes}/${HEALTH_FAILURE_STRIKES}; generation ${active.generation} retained`);
+			this.#log(
+				`broker health probe strike ${this.#healthStrikes}/${HEALTH_FAILURE_STRIKES}; generation ${active.generation} retained`,
+			);
 			return;
 		}
 		// The daemon is gjc-owned; a sustained probe failure fences this generation
@@ -669,7 +680,9 @@ export async function seedAgentDirFromSsot(ssot: string, agentDir: string, log: 
 		models = await readFile(modelsPath, "utf8");
 	} catch (error) {
 		if ((error as NodeJS.ErrnoException).code === "ENOENT")
-			throw new Error(`gjc runtime preflight failed: operator SSOT ${modelsPath} is missing; the persona broker cannot reach a model provider`);
+			throw new Error(
+				`gjc runtime preflight failed: operator SSOT ${modelsPath} is missing; the persona broker cannot reach a model provider`,
+			);
 		throw error;
 	}
 	await writeFile(join(agentDir, "models.yml"), models, { mode: 0o600 });
@@ -704,7 +717,9 @@ export async function ensureSteeringDefaults(agentDir: string): Promise<void> {
 	let next = text;
 	for (const [key, value] of Object.entries(STEERING_DEFAULTS)) {
 		const line = new RegExp(`^${key}:[ \\t]*.*$`, "m");
-		next = line.test(next) ? next.replace(line, `${key}: ${value}`) : `${next}${next.length && !next.endsWith("\n") ? "\n" : ""}${key}: ${value}\n`;
+		next = line.test(next)
+			? next.replace(line, `${key}: ${value}`)
+			: `${next}${next.length && !next.endsWith("\n") ? "\n" : ""}${key}: ${value}\n`;
 	}
 	if (next !== text) await writeFile(path, next, { mode: 0o600 });
 }

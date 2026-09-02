@@ -67,7 +67,7 @@ test("persona state stays running until a terminal tail event is injected", asyn
 	}
 });
 
-	test("tail runner alarms exactly at the stall threshold, diagnoses unknown kinds, and records authenticated compaction receipts", async () => {
+test("tail runner alarms exactly at the stall threshold, diagnoses unknown kinds, and records authenticated compaction receipts", async () => {
 	let now = 0;
 	let wakePoll!: () => void;
 	const stalls: number[] = [];
@@ -105,7 +105,9 @@ test("persona state stays running until a terminal tail event is injected", asyn
 	try {
 		expect(logs).toContain("unknown_runtime_event session=tail-session kind=compaction_observed");
 		runner.recordCompactionReceipt({ sessionId: "tail-session", originKey: ORIGIN_KEY, result: { started: true } });
-		expect(logs).toContain(`compaction_event sessionId=tail-session originKey=${ORIGIN_KEY} source=control_receipt result=started`);
+		expect(logs).toContain(
+			`compaction_event sessionId=tail-session originKey=${ORIGIN_KEY} source=control_receipt result=started`,
+		);
 		tail.setTurnRunning(true);
 		now = 119_999;
 		runner.checkStalls(now);
@@ -173,7 +175,11 @@ test("chat.progress is emitted only from observed tail activity and preserves ta
 		const send = port.sends[0]!;
 		port.emitActivity(send.sessionId, { toolCalls: 3, outputTokens: 77 });
 		await eventually(
-			() => frames.some((frame) => frame.event === "chat.progress" && frame.payload.toolCalls === 3 && frame.payload.outputTokens === 77),
+			() =>
+				frames.some(
+					(frame) =>
+						frame.event === "chat.progress" && frame.payload.toolCalls === 3 && frame.payload.outputTokens === 77,
+				),
 			"tail activity did not become progress",
 		);
 		port.complete(send.opRef, "done");

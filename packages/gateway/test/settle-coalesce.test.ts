@@ -92,8 +92,15 @@ test("rapid idle fragments coalesce once at the first-row cutoff with every spea
 	expect(port.sends).toHaveLength(1);
 	expect(port.steers).toEqual([]);
 	const batch = database.inboundNonterminalBatches(ORIGIN_KEY)[0]!;
-	expect(database.inboundBatchRows(batch.batchKey).map((row) => row.batch_role)).toEqual(["trigger", "member", "member"]);
+	expect(database.inboundBatchRows(batch.batchKey).map((row) => row.batch_role)).toEqual([
+		"trigger",
+		"member",
+		"member",
+	]);
 
 	port.complete(send.opRef, "coalesced done");
-	await eventually(() => database?.inboundPendingCount(ORIGIN_KEY) === 0, "coalesced rows remained pending after tail terminal");
+	await eventually(
+		() => database?.inboundPendingCount(ORIGIN_KEY) === 0,
+		"coalesced rows remained pending after tail terminal",
+	);
 });

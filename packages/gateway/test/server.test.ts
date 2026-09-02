@@ -6,8 +6,8 @@ import { MAX_STALLED_CONTINUATIONS, parseLaneJobRecord } from "@gajaeway/subsess
 import type { GatewayConfig } from "../src/config";
 import { memoryRoot } from "../src/memory/doctrine";
 import { type GatewayServer, startUnixServer } from "../src/server/server";
-import { ScriptedSessionPort, sessionPortFromResponder } from "./session-port.fake";
 import { GatewayDatabase } from "../src/store/db";
+import { ScriptedSessionPort, sessionPortFromResponder } from "./session-port.fake";
 
 let directory = "";
 let server: GatewayServer | undefined;
@@ -137,8 +137,20 @@ test("unauthorized direct messages cannot invoke /new or /model", async () => {
 	const engagement = { mentioned: false, group: false, authorId: "intruder" };
 	client.send({ v: "0.1", type: "hello", payload: { supportedVersions: ["0.1"] } });
 	await waitFor(client.frames, 1);
-	client.send({ v: "0.1", type: "request", id: "model", verb: "chat.send", params: { origin, text: "/model set forbidden", engagement } });
-	client.send({ v: "0.1", type: "request", id: "new", verb: "chat.send", params: { origin, text: "/new", engagement } });
+	client.send({
+		v: "0.1",
+		type: "request",
+		id: "model",
+		verb: "chat.send",
+		params: { origin, text: "/model set forbidden", engagement },
+	});
+	client.send({
+		v: "0.1",
+		type: "request",
+		id: "new",
+		verb: "chat.send",
+		params: { origin, text: "/new", engagement },
+	});
 	await waitFor(client.frames, 3);
 	expect(client.frames.filter((frame) => frame.type === "response" && frame.result?.engaged === false)).toHaveLength(2);
 	expect(sessionPort.binds).toEqual([]);
@@ -382,7 +394,7 @@ test("shutdown quiesces an in-flight turn before final stopping frame", async ()
 	client.close();
 });
 
-	test("a settled burst becomes one turn carrying the unread diff with speaker attribution", async () => {
+test("a settled burst becomes one turn carrying the unread diff with speaker attribution", async () => {
 	directory = await mkdtemp(join(tmpdir(), "gajaeway-server-"));
 	const config: GatewayConfig = {
 		schemaVersion: 1,
@@ -465,9 +477,19 @@ test("a settled burst without platform message ids still carries every fragment 
 	client.send({ v: "0.1", type: "hello", payload: { supportedVersions: ["0.1"] } });
 	await waitFor(client.frames, 1);
 	const origin = { platform: "discord", kind: "dm", conversationId: "d1", peerId: "owner" };
-	for (const [id, text] of [["f1", "fragment one"], ["f2", "fragment two"], ["f3", "fragment three"]] as const) {
+	for (const [id, text] of [
+		["f1", "fragment one"],
+		["f2", "fragment two"],
+		["f3", "fragment three"],
+	] as const) {
 		// No messageId: the sender never recorded these in the unread-context ledger.
-		client.send({ v: "0.1", type: "request", id, verb: "chat.send", params: { origin, text, engagement: { mentioned: false, group: false, authorId: "owner" } } });
+		client.send({
+			v: "0.1",
+			type: "request",
+			id,
+			verb: "chat.send",
+			params: { origin, text, engagement: { mentioned: false, group: false, authorId: "owner" } },
+		});
 		await Bun.sleep(10);
 	}
 	for (let attempt = 0; attempt < 400 && turns.length === 0; attempt++) await Bun.sleep(10);
@@ -496,7 +518,15 @@ test("a backlog older than maxInboundAgeMs is expired on boot recovery instead o
 	const key = "discord/dm/d-stale/peer=owner";
 	const old = new Date(Date.now() - 30 * 60_000).toISOString();
 	// Left behind by an outage: pending for 30 minutes before this boot.
-	expect(database.inboundEnqueue({ messageId: "stale-1", originKey: key, originRefJson: JSON.stringify(origin), body: "from before the outage", receivedAt: old })).toBe(true);
+	expect(
+		database.inboundEnqueue({
+			messageId: "stale-1",
+			originKey: key,
+			originRefJson: JSON.stringify(origin),
+			body: "from before the outage",
+			receivedAt: old,
+		}),
+	).toBe(true);
 	const turns: string[] = [];
 	const sessionPort = sessionPortFromResponder({
 		respond: async (_session, text) => {
@@ -512,7 +542,17 @@ test("a backlog older than maxInboundAgeMs is expired on boot recovery instead o
 		const client = await connect(config.socketPath);
 		client.send({ v: "0.1", type: "hello", payload: { supportedVersions: ["0.1"] } });
 		await waitFor(client.frames, 1);
-		client.send({ v: "0.1", type: "request", id: "f", verb: "chat.send", params: { origin, text: "fresh after the outage", engagement: { mentioned: false, group: false, authorId: "owner" } } });
+		client.send({
+			v: "0.1",
+			type: "request",
+			id: "f",
+			verb: "chat.send",
+			params: {
+				origin,
+				text: "fresh after the outage",
+				engagement: { mentioned: false, group: false, authorId: "owner" },
+			},
+		});
 		for (let attempt = 0; attempt < 400 && turns.length === 0; attempt++) await Bun.sleep(10);
 		expect(turns).toHaveLength(1);
 		expect(turns[0]).toContain("fresh after the outage");
@@ -540,18 +580,39 @@ test("/restart is owner-only and triggers an ordered gateway stop after acknowle
 	const sessionPort = sessionPortFromResponder({ respond: async () => "unused" });
 	const stops: string[] = [];
 	const exits: number[] = [];
-	server = await startUnixServer({ config, database, sessionPort, exitProcess: (code) => exits.push(code), onStop: () => { stops.push("stopped"); database.close(); } });
+	server = await startUnixServer({
+		config,
+		database,
+		sessionPort,
+		exitProcess: (code) => exits.push(code),
+		onStop: () => {
+			stops.push("stopped");
+			database.close();
+		},
+	});
 	const client = await connect(config.socketPath);
 	client.send({ v: "0.1", type: "hello", payload: { supportedVersions: ["0.1"] } });
 	await waitFor(client.frames, 1);
 	const origin = { platform: "discord", kind: "dm", conversationId: "d-owner", peerId: "owner" };
 	// A non-owner is refused.
-	client.send({ v: "0.1", type: "request", id: "r1", verb: "chat.send", params: { origin, text: "/restart", engagement: { mentioned: false, group: false, authorId: "stranger" } } });
+	client.send({
+		v: "0.1",
+		type: "request",
+		id: "r1",
+		verb: "chat.send",
+		params: { origin, text: "/restart", engagement: { mentioned: false, group: false, authorId: "stranger" } },
+	});
 	await waitFor(client.frames, 2);
 	expect(client.frames.find((f: any) => f.id === "r1")?.result).toEqual({ turnId: null, engaged: false });
 	expect(stops).toEqual([]);
 	// The owner gets an ack and the gateway stops shortly after.
-	client.send({ v: "0.1", type: "request", id: "r2", verb: "chat.send", params: { origin, text: "/restart", engagement: { mentioned: false, group: false, authorId: "owner" } } });
+	client.send({
+		v: "0.1",
+		type: "request",
+		id: "r2",
+		verb: "chat.send",
+		params: { origin, text: "/restart", engagement: { mentioned: false, group: false, authorId: "owner" } },
+	});
 	await waitFor(client.frames, 3);
 	expect(client.frames.find((f: any) => f.id === "r2")?.result.engaged).toBe(true);
 	for (let attempt = 0; attempt < 400 && stops.length === 0; attempt++) await Bun.sleep(10);
@@ -621,7 +682,9 @@ test("[REPLY:id] parts thread to the referenced message and strip the directive"
 		dmPolicy: "open" as const,
 	};
 	const database = await GatewayDatabase.open(config.dbPath);
-	const sessionPort = sessionPortFromResponder({ respond: async () => "[REPLY:msg-42] threaded answer\n[BREAK]\nplain follow-up" });
+	const sessionPort = sessionPortFromResponder({
+		respond: async () => "[REPLY:msg-42] threaded answer\n[BREAK]\nplain follow-up",
+	});
 	server = await startUnixServer({ config, database, sessionPort, onStop: () => database.close() });
 	const client = await connect(config.socketPath);
 	client.send({ v: "0.1", type: "hello", payload: { supportedVersions: ["0.1"] } });
@@ -663,7 +726,9 @@ test("work.run runs a named worker session in the requested cwd and returns the 
 		dmPolicy: "open" as const,
 	};
 	const database = await GatewayDatabase.open(config.dbPath);
-	const sessionPort = new ScriptedSessionPort({ onSend: (input, scripted) => scripted.complete(input.opRef, "worker result") });
+	const sessionPort = new ScriptedSessionPort({
+		onSend: (input, scripted) => scripted.complete(input.opRef, "worker result"),
+	});
 	server = await startUnixServer({ config, database, sessionPort, onStop: () => database.close() });
 	const client = await connect(config.socketPath);
 	client.send({ v: "0.1", type: "hello", payload: { supportedVersions: ["0.1"] } });

@@ -3,9 +3,9 @@ import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { GatewayConfig } from "../src/config";
-import { ScriptedSessionPort } from "./session-port.fake";
 import { type GatewayServer, startUnixServer } from "../src/server/server";
 import { GatewayDatabase } from "../src/store/db";
+import { ScriptedSessionPort } from "./session-port.fake";
 
 let directory = "";
 let server: GatewayServer | undefined;
@@ -86,7 +86,7 @@ test("a duplicate message id is acknowledged but never dispatched twice", async 
 	client.close();
 });
 
-	test("a message arriving while a persistent turn is in flight is steered into that turn", async () => {
+test("a message arriving while a persistent turn is in flight is steered into that turn", async () => {
 	const config = await makeConfig();
 	const database = await GatewayDatabase.open(config.dbPath);
 	const sessionPort = new ScriptedSessionPort();

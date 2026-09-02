@@ -482,207 +482,213 @@ export class MonitorPropagator {
 		// One generic port owns all same-origin authoring serialization; monitor
 		// leases remain active while a prior call is awaiting a terminal receipt.
 		await this.#sessionPort.runExclusive(sessionOriginKey, async () => {
-		// Bound outside the try so the failure handler can ask the compaction port
-		// to act on the very session that failed, and can tell whether that
-		// session is still the live one.
-		let boundSessionId: string | undefined;
-		let boundSessionEpoch: number | undefined;
-		// A replayed batch: reconcile bumps dispatch_attempts before re-dispatching
-		// a stranded or failed event, so a non-zero count means these events are
-		// not this session's own fresh work. Their context failure says nothing
-		// about the CURRENT session and must not feed its streak — the payload is
-		// old, and the failure may well have been produced against a session that
-		// no longer exists.
-		const replayedBatch = claimed.some((row) => row.dispatch_attempts > 0);
-		try {
-			// Safety-net roll boundary (issue #68). It sits HERE, after the
-			// per-origin turn chain has been acquired and before this batch's
-			// session is bound: the previous batch's authoring turn has already
-			// settled, and this batch's events are claimed under live leases but
-			// not yet authored. A roll can therefore neither strand an in-flight
-			// batch nor let one be authored twice — the events simply land in the
-			// new epoch's session. Leases and fencing are untouched.
-			const digest = this.#rollSessionIfArmed(sessionOriginKey, JSON.stringify(sessionOrigin), monitor);
-			const boundEpoch = this.#database.getSessionRecord(sessionOriginKey)?.epoch ?? 0;
-			const { sessionId } = await this.#sessionPort.bind({
-				originKey: sessionOriginKey,
-				epoch: boundEpoch,
-				repo: this.#repo,
-			});
-			boundSessionId = sessionId;
-			boundSessionEpoch = boundEpoch;
-			// Guidance order: the monitor's own instruction first (it is what the
-			// owner actually asked this monitor to do), then any built-in
-			// maintenance semantics for the claimed event types. Without either,
-			// the authoring turn only gets the receipt-note contract.
-			const maintenance = claimed
-				.map((row) => MAINTENANCE_GUIDANCE[row.event_type])
-				.filter((entry, index, all) => entry && all.indexOf(entry) === index);
-			const guidance = [monitor.instruction?.trim() || undefined, ...maintenance].filter(Boolean).join(" ");
-			const prompt = `Author monitor events.${guidance ? ` ${guidance}` : ""}${digest ? `\n${digest}\n` : ""} Respond ONLY with a JSON array containing exactly one {"eventId","note"} entry per event: ${JSON.stringify(claimed.map((row) => ({ eventId: row.event_id, eventType: row.event_type, payload: JSON.parse(row.payload_json) })))}`;
-			const opRef = `gw-m-${batchId.replaceAll("-", "")}`;
-			const response = (
-				await this.#sessionPort.request({
-					sessionId,
-					repo: this.#repo,
+			// Bound outside the try so the failure handler can ask the compaction port
+			// to act on the very session that failed, and can tell whether that
+			// session is still the live one.
+			let boundSessionId: string | undefined;
+			let boundSessionEpoch: number | undefined;
+			// A replayed batch: reconcile bumps dispatch_attempts before re-dispatching
+			// a stranded or failed event, so a non-zero count means these events are
+			// not this session's own fresh work. Their context failure says nothing
+			// about the CURRENT session and must not feed its streak — the payload is
+			// old, and the failure may well have been produced against a session that
+			// no longer exists.
+			const replayedBatch = claimed.some((row) => row.dispatch_attempts > 0);
+			try {
+				// Safety-net roll boundary (issue #68). It sits HERE, after the
+				// per-origin turn chain has been acquired and before this batch's
+				// session is bound: the previous batch's authoring turn has already
+				// settled, and this batch's events are claimed under live leases but
+				// not yet authored. A roll can therefore neither strand an in-flight
+				// batch nor let one be authored twice — the events simply land in the
+				// new epoch's session. Leases and fencing are untouched.
+				const digest = this.#rollSessionIfArmed(sessionOriginKey, JSON.stringify(sessionOrigin), monitor);
+				const boundEpoch = this.#database.getSessionRecord(sessionOriginKey)?.epoch ?? 0;
+				const { sessionId } = await this.#sessionPort.bind({
 					originKey: sessionOriginKey,
-					text: prompt,
-					opRef,
-				})
-			).assistant.text;
-			// The authoring turn is now part of the session transcript whatever its
-			// content, so it is counted here rather than after the response is
-			// validated. The count is OBSERVATIONAL: it is reported, and it never
-			// rolls a session on its own — native gjc compaction owns keeping the
-			// context bounded while the session is answering.
-			const turns = this.#database.incrementTurnCount(sessionOriginKey, JSON.stringify(sessionOrigin));
-			this.#safetyState(sessionOriginKey).turns = turns;
-			// A non-empty answer is proof the session still has usable context, so
-			// it clears the context-failure streak. A malformed answer is still an
-			// answer: it must not arm the safety net.
-			if (response.trim()) this.#safetyState(sessionOriginKey).contextFailures = 0;
-			else throw new Error("authoring response is empty");
-			// Lease fencing: after an await, this attempt may no longer own the
-			// claim (expired + stolen). Every write below is conditional on the
-			// live lease; a stale attempt's completion becomes a no-op.
-			// Atomic fencing: each stage write carries its live-lease check in the
-			// same UPDATE, so a lease stolen between check and write cannot be
-			// exploited (TOCTOU-free). `fenced` = rows whose write landed.
-			const fenced = claimed.filter((row) =>
-				this.#database.monitorEventFencedUpdate(row.event_id, leaseId, "dispatched", batchId),
-			);
-			if (!fenced.length) return;
-			const authored = JSON.parse(response) as Array<{ eventId?: unknown; note?: unknown }>;
-			if (!Array.isArray(authored)) throw new Error("authoring response is not an array");
-			// Strict response contract: exactly one valid entry per claimed event —
-			// a partial/missing/duplicate/extra response is a structured failure.
-			// Omitted events must stay recoverable (dispatched/failed), never
-			// silently delivered alongside their batch.
-			const claimedIds = new Set(claimed.map((row) => row.event_id));
-			const seenIds = new Set<string>();
-			for (const entry of authored) {
-				if (typeof entry.eventId !== "string" || typeof entry.note !== "string") {
-					throw new Error("authoring response entry missing eventId or note");
-				}
-				if (!claimedIds.has(entry.eventId)) {
-					throw new Error(`authoring response contains unknown event ${entry.eventId}`);
-				}
-				if (seenIds.has(entry.eventId)) {
-					throw new Error(`authoring response duplicates event ${entry.eventId}`);
-				}
-				seenIds.add(entry.eventId);
-			}
-			for (const id of claimedIds) {
-				if (!seenIds.has(id)) throw new Error(`authoring response omits event ${id}`);
-			}
-			for (const entry of authored)
-				if (
-					typeof entry.eventId === "string" &&
-					fenced.some((row) => row.event_id === entry.eventId) &&
-					typeof entry.note === "string"
-				) {
-					const row = this.#database.monitorEventRows().find((candidate) => candidate.event_id === entry.eventId);
-					if (!row) continue;
-					const intentId = `monitor-event-intent:${entry.eventId}`;
-					const authoredOk = this.#database.monitorEventFencedAuthorWithIntent(
-						entry.eventId,
-						leaseId,
-						entry.note,
-						false,
-						row.event_type,
-						intentId,
-						JSON.stringify(eventTypeOrigin(row.event_type)),
-					);
-					if (!authoredOk) continue;
-					// Wake the closure queue so the atomically admitted intent is
-					// processed in the same run (no restart needed).
-					this.#memory.enqueueExistingId(intentId);
-					this.#emit({
-						eventId: entry.eventId,
-						monitorId: monitor.monitorId,
-						eventType: row.event_type,
-						firedAt: row.fired_at,
-						stage: "authored",
-					});
-				}
-			// A monitor without its own channel target reports to the configured owner
-			// target when one exists: a personal agent's maintenance and event notes go
-			// to the owner by default rather than vanishing into the logs. With no
-			// target at all the event settles terminally as `authored_no_delivery`
-			// instead of pretending a delivery is still pending (issue #29 defect 3).
-			const target = monitor.channelTarget ?? this.#ownerTarget;
-			if (!target) {
-				for (const row of fenced) {
-					if (this.#database.authoredOutput(row.event_id) === undefined) continue;
-					this.#database.monitorEventFencedUpdate(row.event_id, leaseId, "authored_no_delivery", batchId);
-				}
-				return;
-			}
-			// Fenced delivery admission: the ledger insert is conditional on every
-			// fenced event still holding its lease (same transaction). A stale
-			// attempt therefore cannot emit a second delivery.
-			const deliveryId = crypto.randomUUID();
-			const deliveryText = authored
-				.filter(
-					(entry): entry is { eventId: string; note: string } =>
-						typeof entry.eventId === "string" &&
-						typeof entry.note === "string" &&
-						fenced.some((row) => row.event_id === entry.eventId),
-				)
-				.map((entry) => entry.note)
-				.join("\n");
-			if (!isSilenceToken(deliveryText)) {
-				const origin = target.origin;
-				const payload: ChatMessagePayload = {
-					turnId: batchId,
-					origin,
-					role: "assistant",
-					text: deliveryText,
-					final: true,
-					deliveryId,
-				};
-				const admitted = this.#database.monitorDeliveryPrepareFenced(
-					deliveryId,
-					batchId,
-					originKey(origin),
-					JSON.stringify(payload),
-					fenced.map((row) => row.event_id),
-					leaseId,
+					epoch: boundEpoch,
+					repo: this.#repo,
+				});
+				boundSessionId = sessionId;
+				boundSessionEpoch = boundEpoch;
+				// Guidance order: the monitor's own instruction first (it is what the
+				// owner actually asked this monitor to do), then any built-in
+				// maintenance semantics for the claimed event types. Without either,
+				// the authoring turn only gets the receipt-note contract.
+				const maintenance = claimed
+					.map((row) => MAINTENANCE_GUIDANCE[row.event_type])
+					.filter((entry, index, all) => entry && all.indexOf(entry) === index);
+				const guidance = [monitor.instruction?.trim() || undefined, ...maintenance].filter(Boolean).join(" ");
+				const prompt = `Author monitor events.${guidance ? ` ${guidance}` : ""}${digest ? `\n${digest}\n` : ""} Respond ONLY with a JSON array containing exactly one {"eventId","note"} entry per event: ${JSON.stringify(claimed.map((row) => ({ eventId: row.event_id, eventType: row.event_type, payload: JSON.parse(row.payload_json) })))}`;
+				const opRef = `gw-m-${batchId.replaceAll("-", "")}`;
+				const response = (
+					await this.#sessionPort.request({
+						sessionId,
+						repo: this.#repo,
+						originKey: sessionOriginKey,
+						text: prompt,
+						opRef,
+					})
+				).assistant.text;
+				// The authoring turn is now part of the session transcript whatever its
+				// content, so it is counted here rather than after the response is
+				// validated. The count is OBSERVATIONAL: it is reported, and it never
+				// rolls a session on its own — native gjc compaction owns keeping the
+				// context bounded while the session is answering.
+				const turns = this.#database.incrementTurnCount(sessionOriginKey, JSON.stringify(sessionOrigin));
+				this.#safetyState(sessionOriginKey).turns = turns;
+				// A non-empty answer is proof the session still has usable context, so
+				// it clears the context-failure streak. A malformed answer is still an
+				// answer: it must not arm the safety net.
+				if (response.trim()) this.#safetyState(sessionOriginKey).contextFailures = 0;
+				else throw new Error("authoring response is empty");
+				// Lease fencing: after an await, this attempt may no longer own the
+				// claim (expired + stolen). Every write below is conditional on the
+				// live lease; a stale attempt's completion becomes a no-op.
+				// Atomic fencing: each stage write carries its live-lease check in the
+				// same UPDATE, so a lease stolen between check and write cannot be
+				// exploited (TOCTOU-free). `fenced` = rows whose write landed.
+				const fenced = claimed.filter((row) =>
+					this.#database.monitorEventFencedUpdate(row.event_id, leaseId, "dispatched", batchId),
 				);
-				if (!admitted) return;
-				this.#delivery.markInflight(deliveryId);
-				// Push to live adapters NOW: without this the note sat in the ledger
-				// until the next adapter reconnect flushed redeliveries (live finding:
-				// owner-DM canonicalize note stuck inflight for minutes).
-				this.#deliver?.(payload);
+				if (!fenced.length) return;
+				const authored = JSON.parse(response) as Array<{ eventId?: unknown; note?: unknown }>;
+				if (!Array.isArray(authored)) throw new Error("authoring response is not an array");
+				// Strict response contract: exactly one valid entry per claimed event —
+				// a partial/missing/duplicate/extra response is a structured failure.
+				// Omitted events must stay recoverable (dispatched/failed), never
+				// silently delivered alongside their batch.
+				const claimedIds = new Set(claimed.map((row) => row.event_id));
+				const seenIds = new Set<string>();
+				for (const entry of authored) {
+					if (typeof entry.eventId !== "string" || typeof entry.note !== "string") {
+						throw new Error("authoring response entry missing eventId or note");
+					}
+					if (!claimedIds.has(entry.eventId)) {
+						throw new Error(`authoring response contains unknown event ${entry.eventId}`);
+					}
+					if (seenIds.has(entry.eventId)) {
+						throw new Error(`authoring response duplicates event ${entry.eventId}`);
+					}
+					seenIds.add(entry.eventId);
+				}
+				for (const id of claimedIds) {
+					if (!seenIds.has(id)) throw new Error(`authoring response omits event ${id}`);
+				}
+				for (const entry of authored)
+					if (
+						typeof entry.eventId === "string" &&
+						fenced.some((row) => row.event_id === entry.eventId) &&
+						typeof entry.note === "string"
+					) {
+						const row = this.#database.monitorEventRows().find((candidate) => candidate.event_id === entry.eventId);
+						if (!row) continue;
+						const intentId = `monitor-event-intent:${entry.eventId}`;
+						const authoredOk = this.#database.monitorEventFencedAuthorWithIntent(
+							entry.eventId,
+							leaseId,
+							entry.note,
+							false,
+							row.event_type,
+							intentId,
+							JSON.stringify(eventTypeOrigin(row.event_type)),
+						);
+						if (!authoredOk) continue;
+						// Wake the closure queue so the atomically admitted intent is
+						// processed in the same run (no restart needed).
+						this.#memory.enqueueExistingId(intentId);
+						this.#emit({
+							eventId: entry.eventId,
+							monitorId: monitor.monitorId,
+							eventType: row.event_type,
+							firedAt: row.fired_at,
+							stage: "authored",
+						});
+					}
+				// A monitor without its own channel target reports to the configured owner
+				// target when one exists: a personal agent's maintenance and event notes go
+				// to the owner by default rather than vanishing into the logs. With no
+				// target at all the event settles terminally as `authored_no_delivery`
+				// instead of pretending a delivery is still pending (issue #29 defect 3).
+				const target = monitor.channelTarget ?? this.#ownerTarget;
+				if (!target) {
+					for (const row of fenced) {
+						if (this.#database.authoredOutput(row.event_id) === undefined) continue;
+						this.#database.monitorEventFencedUpdate(row.event_id, leaseId, "authored_no_delivery", batchId);
+					}
+					return;
+				}
+				// Fenced delivery admission: the ledger insert is conditional on every
+				// fenced event still holding its lease (same transaction). A stale
+				// attempt therefore cannot emit a second delivery.
+				const deliveryId = crypto.randomUUID();
+				const deliveryText = authored
+					.filter(
+						(entry): entry is { eventId: string; note: string } =>
+							typeof entry.eventId === "string" &&
+							typeof entry.note === "string" &&
+							fenced.some((row) => row.event_id === entry.eventId),
+					)
+					.map((entry) => entry.note)
+					.join("\n");
+				if (!isSilenceToken(deliveryText)) {
+					const origin = target.origin;
+					const payload: ChatMessagePayload = {
+						turnId: batchId,
+						origin,
+						role: "assistant",
+						text: deliveryText,
+						final: true,
+						deliveryId,
+					};
+					const admitted = this.#database.monitorDeliveryPrepareFenced(
+						deliveryId,
+						batchId,
+						originKey(origin),
+						JSON.stringify(payload),
+						fenced.map((row) => row.event_id),
+						leaseId,
+					);
+					if (!admitted) return;
+					this.#delivery.markInflight(deliveryId);
+					// Push to live adapters NOW: without this the note sat in the ledger
+					// until the next adapter reconnect flushed redeliveries (live finding:
+					// owner-DM canonicalize note stuck inflight for minutes).
+					this.#deliver?.(payload);
+				}
+			} catch (error) {
+				// Public-safe structured evidence only: a stable phase code and event ids.
+				// The raw error body can carry secrets and is never persisted or logged.
+				const failureClass = classifyAuthoringFailure(error);
+				const code: DispatchFailureCode = failureCode(error, failureClass);
+				for (const row of leased) {
+					this.#database.monitorEventFencedFail(
+						row.event_id,
+						leaseId,
+						batchId,
+						code,
+						`dispatch phase failed (${code})`,
+					);
+				}
+				console.error(`monitor dispatch failed (${code}): events ${claimed.map((row) => row.event_id).join(",")}`);
+				await this.#recordAuthoringFailure({
+					sessionOriginKey,
+					failureClass,
+					// Passed for PURE classification only (executor sub-kind). The message
+					// is never logged or persisted from here.
+					error,
+					sessionId: boundSessionId,
+					boundEpoch: boundSessionEpoch,
+					replayed: replayedBatch,
+					monitor,
+				});
+			} finally {
+				stopHeartbeat();
+				// Release the leases this attempt holds. Lease-guarded: if this attempt
+				// expired and another process stole the claim, this release is a no-op,
+				// and a stale attempt's completion can never overwrite the newer claim.
+				for (const row of leased) this.#database.monitorEventReleaseLease(row.event_id, leaseId);
 			}
-		} catch (error) {
-			// Public-safe structured evidence only: a stable phase code and event ids.
-			// The raw error body can carry secrets and is never persisted or logged.
-			const failureClass = classifyAuthoringFailure(error);
-			const code: DispatchFailureCode = failureCode(error, failureClass);
-			for (const row of leased) {
-				this.#database.monitorEventFencedFail(row.event_id, leaseId, batchId, code, `dispatch phase failed (${code})`);
-			}
-			console.error(`monitor dispatch failed (${code}): events ${claimed.map((row) => row.event_id).join(",")}`);
-			await this.#recordAuthoringFailure({
-				sessionOriginKey,
-				failureClass,
-				// Passed for PURE classification only (executor sub-kind). The message
-				// is never logged or persisted from here.
-				error,
-				sessionId: boundSessionId,
-				boundEpoch: boundSessionEpoch,
-				replayed: replayedBatch,
-				monitor,
-			});
-		} finally {
-			stopHeartbeat();
-			// Release the leases this attempt holds. Lease-guarded: if this attempt
-			// expired and another process stole the claim, this release is a no-op,
-			// and a stale attempt's completion can never overwrite the newer claim.
-			for (const row of leased) this.#database.monitorEventReleaseLease(row.event_id, leaseId);
-		}
 		});
 	}
 	/** Read-only safety-net evidence for one session origin (ops/tests). */

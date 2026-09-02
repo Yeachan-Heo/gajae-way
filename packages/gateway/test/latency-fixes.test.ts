@@ -4,9 +4,9 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { GatewayConfig } from "../src/config";
 import type { SessionPort } from "../src/orchestrator/session-port";
-import { ScriptedSessionPort, sessionPortFromScript } from "./session-port.fake";
 import { type GatewayServer, startUnixServer } from "../src/server/server";
 import { GatewayDatabase } from "../src/store/db";
+import { ScriptedSessionPort, sessionPortFromScript } from "./session-port.fake";
 
 let directory = "";
 let server: GatewayServer | undefined;
@@ -16,7 +16,6 @@ afterEach(async () => {
 	if (directory) await rm(directory, { recursive: true, force: true });
 	directory = "";
 });
-
 
 test("SessionPort.runExclusive serializes same-origin work and releases after rejection", async () => {
 	const port = new ScriptedSessionPort();
@@ -70,9 +69,9 @@ async function connect(socketPath: string): Promise<{ send(value: unknown): void
 	return { send: (value) => socket.write(`${JSON.stringify(value)}\n`), frames, close: () => socket.end() };
 }
 
-async function startGateway(
-	options: { readonly sessionPort: SessionPort },
-): Promise<{ client: Awaited<ReturnType<typeof connect>>; config: GatewayConfig }> {
+async function startGateway(options: {
+	readonly sessionPort: SessionPort;
+}): Promise<{ client: Awaited<ReturnType<typeof connect>>; config: GatewayConfig }> {
 	directory = await mkdtemp(join(tmpdir(), "gajaeway-latency-"));
 	const config: GatewayConfig = {
 		schemaVersion: 1,
@@ -133,7 +132,7 @@ test("tail frames deliver an assistant finding before the persistent operation r
 	expect(messages[1].payload.text).toContain("found the culprit");
 });
 
-	test("a message arriving during an active persistent turn is steered without a second send", async () => {
+test("a message arriving during an active persistent turn is steered without a second send", async () => {
 	const turnStarts: number[] = [];
 	const sessionPort = sessionPortFromScript({
 		bind: async () => ({ sessionId: "mock-session" }),

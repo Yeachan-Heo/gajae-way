@@ -22,12 +22,11 @@ test("a stdio gateway.shutdown request completes ordered shutdown and exits the 
 	try {
 		const output = new Response(child.stdout as ReadableStream).text();
 		child.stdin.write(`${JSON.stringify({ v: "0.1", type: "hello", payload: { supportedVersions: ["0.1"] } })}\n`);
-		child.stdin.write(`${JSON.stringify({ v: "0.1", type: "request", id: "bye", verb: "gateway.shutdown", params: {} })}\n`);
+		child.stdin.write(
+			`${JSON.stringify({ v: "0.1", type: "request", id: "bye", verb: "gateway.shutdown", params: {} })}\n`,
+		);
 		child.stdin.flush();
-		const exit = await Promise.race([
-			child.exited,
-			Bun.sleep(15_000).then(() => "timeout" as const),
-		]);
+		const exit = await Promise.race([child.exited, Bun.sleep(15_000).then(() => "timeout" as const)]);
 		expect(exit).not.toBe("timeout");
 		const frames = (await output)
 			.split("\n")

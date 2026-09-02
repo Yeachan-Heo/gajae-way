@@ -23,19 +23,37 @@ test("broker SessionPort preserves caller op-ref, model choice, bootstrap prompt
 	const calls: string[][] = [];
 	const run: CliRunner = async (args) => {
 		calls.push([...args]);
-		if (args.includes("session.create")) return { exitCode: 0, stdout: JSON.stringify({ ok: true, result: { sessionId: "sdk-1" } }), stderr: "" };
-		if (args.includes("model.set")) return { exitCode: 0, stdout: JSON.stringify({ ok: true, result: { changed: true } }), stderr: "" };
-		if (args.includes("send")) return { exitCode: 0, stdout: JSON.stringify({ ok: true, result: { sessionId: "sdk-1", commandId: "cmd-1" } }), stderr: "" };
+		if (args.includes("session.create"))
+			return { exitCode: 0, stdout: JSON.stringify({ ok: true, result: { sessionId: "sdk-1" } }), stderr: "" };
+		if (args.includes("model.set"))
+			return { exitCode: 0, stdout: JSON.stringify({ ok: true, result: { changed: true } }), stderr: "" };
+		if (args.includes("send"))
+			return {
+				exitCode: 0,
+				stdout: JSON.stringify({ ok: true, result: { sessionId: "sdk-1", commandId: "cmd-1" } }),
+				stderr: "",
+			};
 		if (args.includes("status"))
 			return {
 				exitCode: 0,
-				stdout: JSON.stringify({ ok: true, result: { operationRef: "gw-work-1", status: { status: "terminal_ok" }, summary: { completed: true } } }),
+				stdout: JSON.stringify({
+					ok: true,
+					result: { operationRef: "gw-work-1", status: { status: "terminal_ok" }, summary: { completed: true } },
+				}),
 				stderr: "",
 			};
 		if (args.includes("tail"))
 			return { exitCode: 0, stdout: JSON.stringify({ ok: true, result: { items: [], terminal: true } }), stderr: "" };
 		if (args.includes("session.last_assistant"))
-			return { exitCode: 0, stdout: JSON.stringify({ type: "query_response", ok: true, page: { items: ["finished body"], complete: true } }), stderr: "" };
+			return {
+				exitCode: 0,
+				stdout: JSON.stringify({
+					type: "query_response",
+					ok: true,
+					page: { items: ["finished body"], complete: true },
+				}),
+				stderr: "",
+			};
 		throw new Error(`unexpected command ${args.join(" ")}`);
 	};
 	const tailRunner = new TailRunner({ run, repo: join(home, "workspace"), stallTimeoutMs: 1_000 });
@@ -64,7 +82,9 @@ test("broker SessionPort preserves caller op-ref, model choice, bootstrap prompt
 		expect.arrayContaining(["sdk", "session", "raw", "global", "--op", "session.create", "--idempotency-key"]),
 	);
 	const send = calls.find((args) => args.includes("send"))!;
-	expect(send).toEqual(expect.arrayContaining(["--op-ref", "gw-work-1", "--text", "trusted bootstrap\n\nimplement it"]));
+	expect(send).toEqual(
+		expect.arrayContaining(["--op-ref", "gw-work-1", "--text", "trusted bootstrap\n\nimplement it"]),
+	);
 	expect(calls.find((args) => args.includes("model.set"))).toEqual(
 		expect.arrayContaining(["raw", "control", "sdk-1", "--op", "model.set"]),
 	);
@@ -85,7 +105,17 @@ test("broker SessionPort reuses the durable epoch binding and does not recreate 
 		if (args.includes("inspect"))
 			return {
 				exitCode: 0,
-				stdout: JSON.stringify({ ok: true, result: { session: { sessionId: "sdk-1", live: true, deleted: false, locator: { cwd: "/tmp/repo", worktreeRoot: "/tmp/repo" } } } }),
+				stdout: JSON.stringify({
+					ok: true,
+					result: {
+						session: {
+							sessionId: "sdk-1",
+							live: true,
+							deleted: false,
+							locator: { cwd: "/tmp/repo", worktreeRoot: "/tmp/repo" },
+						},
+					},
+				}),
 				stderr: "",
 			};
 		return { exitCode: 0, stdout: JSON.stringify({ ok: true, result: { sessionId: "sdk-1" } }), stderr: "" };
@@ -112,7 +142,10 @@ test("broker SessionPort resumes saved dead authority through the SDK control be
 		if (args.includes("inspect"))
 			return {
 				exitCode: 0,
-				stdout: JSON.stringify({ ok: true, result: { session: { sessionId: "saved-1", locator: { repo }, live, deleted: false } } }),
+				stdout: JSON.stringify({
+					ok: true,
+					result: { session: { sessionId: "saved-1", locator: { repo }, live, deleted: false } },
+				}),
 				stderr: "",
 			};
 		if (args.includes("session.resume")) {
@@ -121,7 +154,12 @@ test("broker SessionPort resumes saved dead authority through the SDK control be
 		}
 		throw new Error(`unexpected command ${args.join(" ")}`);
 	};
-	const port = new BrokerSessionPort({ database, cli: run, instanceId: "instance-1", tailRunner: new TailRunner({ run, repo }) });
+	const port = new BrokerSessionPort({
+		database,
+		cli: run,
+		instanceId: "instance-1",
+		tailRunner: new TailRunner({ run, repo }),
+	});
 	await expect(port.resume({ sessionId: "saved-1", repo, originKey: "discord/channel/c", epoch: 3 })).resolves.toEqual({
 		sessionId: "saved-1",
 		repo,
@@ -152,7 +190,9 @@ test("broker SessionPort preserves a structured client-ref conflict emitted with
 		instanceId: "instance-1",
 		tailRunner: new TailRunner({ run, repo: join(home, "workspace") }),
 	});
-	await expect(port.send({ sessionId: "sdk-1", repo: join(home, "workspace"), text: "duplicate", opRef: "gw-work-1" })).rejects.toMatchObject({
+	await expect(
+		port.send({ sessionId: "sdk-1", repo: join(home, "workspace"), text: "duplicate", opRef: "gw-work-1" }),
+	).rejects.toMatchObject({
 		name: "OpRefRejectedError",
 		code: "client_ref_conflict",
 	});
@@ -182,7 +222,9 @@ test("broker SessionPort retries a terminal-uncertain lifecycle create with the 
 			sleeps.push(milliseconds);
 		},
 	});
-	await expect(port.bind({ originKey: "loopback/loopback/retry", epoch: 0, repo: join(home, "workspace") })).resolves.toMatchObject({
+	await expect(
+		port.bind({ originKey: "loopback/loopback/retry", epoch: 0, repo: join(home, "workspace") }),
+	).resolves.toMatchObject({
 		sessionId: "sdk-after-retry",
 	});
 	expect(createCalls).toBe(2);
@@ -205,11 +247,25 @@ test("bind rebinds a persisted session the broker no longer indexes instead of h
 		const cli = async (args: readonly string[]) => {
 			commands.push([...args]);
 			if (args.includes("inspect") && args.includes("dead-session"))
-				return { exitCode: 1, stdout: JSON.stringify({ ok: false, error: { code: "session_unavailable", message: "not indexed" } }), stderr: "" };
-			if (args.includes("session.create")) return { exitCode: 0, stdout: JSON.stringify({ ok: true, result: { sessionId: "fresh-session" } }), stderr: "" };
+				return {
+					exitCode: 1,
+					stdout: JSON.stringify({ ok: false, error: { code: "session_unavailable", message: "not indexed" } }),
+					stderr: "",
+				};
+			if (args.includes("session.create"))
+				return {
+					exitCode: 0,
+					stdout: JSON.stringify({ ok: true, result: { sessionId: "fresh-session" } }),
+					stderr: "",
+				};
 			return { exitCode: 0, stdout: JSON.stringify({ ok: true, result: {} }), stderr: "" };
 		};
-		const port = new BrokerSessionPort({ database, cli, instanceId: "i", tailRunner: new TailRunner({ run: cli, repo }) });
+		const port = new BrokerSessionPort({
+			database,
+			cli,
+			instanceId: "i",
+			tailRunner: new TailRunner({ run: cli, repo }),
+		});
 		const binding = await port.bind({ originKey: "monitor/eventtype/x", epoch: 1, repo });
 		expect(binding.sessionId).toBe("fresh-session");
 		expect(binding.epoch).toBe(2);

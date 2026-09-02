@@ -54,19 +54,16 @@ import { backupDatabase, integrityDatabase } from "../ops/backup";
 import { RuntimeCycleProjector } from "../ops/cycle";
 import type { BrokerSupervisor } from "../orchestrator/broker";
 import {
-	PersonaSessionManager,
 	type PersonaFailureInput,
+	PersonaSessionManager,
 	type PersonaTailFrameInput,
 	type PersonaTerminalInput,
 	type PersonaTurnLifecycle,
 	type PersonaTurnStartInput,
 } from "../orchestrator/persona-session";
-import {
-	SessionRequestTimeoutError,
-	type SessionPort,
-} from "../orchestrator/session-port";
-import { deterministicTailDeliveryId } from "../orchestrator/tail-runner";
 import { formatFailureNotice, sanitizeDiagnostic } from "../orchestrator/rebind";
+import { type SessionPort, SessionRequestTimeoutError } from "../orchestrator/session-port";
+import { deterministicTailDeliveryId } from "../orchestrator/tail-runner";
 import { buildSessionBootstrap } from "../persona/bootstrap";
 import { PersonaLoader } from "../persona/persona";
 import type { GatewayDatabase, InboundMessageRow, MonitorEventStage } from "../store/db";
@@ -486,7 +483,9 @@ async function settleMemory(runtime: Runtime): Promise<void> {
 		await runtime.memory.initialize();
 		await runtime.memory.drain();
 	} catch (error) {
-		console.error(`gateway memory settle failed during shutdown; intents remain durable for next boot: ${diagnostic(error)}`);
+		console.error(
+			`gateway memory settle failed during shutdown; intents remain durable for next boot: ${diagnostic(error)}`,
+		);
 	}
 }
 
@@ -552,23 +551,20 @@ function createRuntime(options: GatewayServerOptions): Runtime {
 	const monitorRuntime = new MonitorRuntime(options.config, registry, monitors);
 	const reconcileTimer = setInterval(() => {
 		void monitors.reconcile();
-		void personaSessions.recover().catch((error: unknown) =>
-			console.error(`persona recovery sweep failed: ${diagnostic(error)}`),
-		);
+		void personaSessions
+			.recover()
+			.catch((error: unknown) => console.error(`persona recovery sweep failed: ${diagnostic(error)}`));
 	}, 60_000);
 	// AC6: the 120s stall alarm is a running-server obligation, not only a
 	// generic-request polling side effect. This heartbeat drives every persona
 	// tail's threshold check; it never aborts a turn (alarm overlay only).
-	const stallTimer = setInterval(
-		() => {
-			try {
-				personaSessions.checkStalls();
-			} catch (error) {
-				console.error(`persona stall check failed: ${diagnostic(error)}`);
-			}
-		},
-		options.stallCheckIntervalMs ?? DEFAULT_STALL_CHECK_INTERVAL_MS,
-	);
+	const stallTimer = setInterval(() => {
+		try {
+			personaSessions.checkStalls();
+		} catch (error) {
+			console.error(`persona stall check failed: ${diagnostic(error)}`);
+		}
+	}, options.stallCheckIntervalMs ?? DEFAULT_STALL_CHECK_INTERVAL_MS);
 	options.database.contextMaintain();
 	const contextMaintenanceTimer = setInterval(
 		() => {
@@ -580,13 +576,17 @@ function createRuntime(options: GatewayServerOptions): Runtime {
 		},
 		60 * 60 * 1000,
 	);
-	const brokerWithGeneration = options.broker as (BrokerSupervisor & { onGeneration?: BrokerSupervisor["onGeneration"] }) | undefined;
+	const brokerWithGeneration = options.broker as
+		| (BrokerSupervisor & { onGeneration?: BrokerSupervisor["onGeneration"] })
+		| undefined;
 	const stopBrokerGenerationListener =
 		typeof brokerWithGeneration?.onGeneration === "function"
 			? brokerWithGeneration.onGeneration((generation) => {
-					void personaSessions.onBrokerGeneration(generation).catch((error: unknown) =>
-						console.error(`persona broker-generation reconciliation failed: ${diagnostic(error)}`),
-					);
+					void personaSessions
+						.onBrokerGeneration(generation)
+						.catch((error: unknown) =>
+							console.error(`persona broker-generation reconciliation failed: ${diagnostic(error)}`),
+						);
 				})
 			: undefined;
 	runtime = {
@@ -609,9 +609,9 @@ function createRuntime(options: GatewayServerOptions): Runtime {
 		inbound,
 		requests: new Set(),
 	};
-	void personaSessions.recover().catch((error: unknown) =>
-		console.error(`persona startup recovery failed: ${diagnostic(error)}`),
-	);
+	void personaSessions
+		.recover()
+		.catch((error: unknown) => console.error(`persona startup recovery failed: ${diagnostic(error)}`));
 	return runtime;
 }
 /**
@@ -670,7 +670,9 @@ async function handleFrame(
 		// Non-protocol failures are sanitized on the wire and in daemon logs: SDK
 		// envelopes can carry provider text containing credentials.
 		if (!(error instanceof ProtocolError))
-			console.error(`gateway request failed${frame.type === "request" ? ` (${frame.verb})` : ""}: ${diagnostic(error)}`);
+			console.error(
+				`gateway request failed${frame.type === "request" ? ` (${frame.verb})` : ""}: ${diagnostic(error)}`,
+			);
 		writeError(connection, error, frame.type === "request" ? frame.id : undefined);
 	}
 }
@@ -1330,18 +1332,36 @@ async function sendChat(
 		const owner = ownerPeerIdOf(runtime.config);
 		const authorId = (params.engagement as { authorId?: string } | undefined)?.authorId;
 		if (!commandAuthorised(origin, runtime.config, params.engagement) || owner === undefined || authorId !== owner) {
-			connection.write({ v: PROFILE_VERSION, type: "response", id: request.id, result: { turnId: null, engaged: false } });
+			connection.write({
+				v: PROFILE_VERSION,
+				type: "response",
+				id: request.id,
+				result: { turnId: null, engaged: false },
+			});
 			return;
 		}
-		const payload = { turnId: crypto.randomUUID(), origin, role: "assistant" as const, text: "Restarting the gateway; back in a few seconds.", final: true };
-		connection.write({ v: PROFILE_VERSION, type: "response", id: request.id, result: { turnId: payload.turnId, engaged: true } });
-		if (origin.platform === "loopback") connection.write({ v: PROFILE_VERSION, type: "event", event: "chat.message", id: request.id, payload });
+		const payload = {
+			turnId: crypto.randomUUID(),
+			origin,
+			role: "assistant" as const,
+			text: "Restarting the gateway; back in a few seconds.",
+			final: true,
+		};
+		connection.write({
+			v: PROFILE_VERSION,
+			type: "response",
+			id: request.id,
+			result: { turnId: payload.turnId, engaged: true },
+		});
+		if (origin.platform === "loopback")
+			connection.write({ v: PROFILE_VERSION, type: "event", event: "chat.message", id: request.id, payload });
 		else {
 			const delivery = runtime.delivery.prepare(payload.turnId, origin, payload.text);
 			if (delivery) {
 				runtime.delivery.markInflight(delivery.deliveryId as string);
 				for (const recipient of runtime.connections)
-					if (recipient.negotiated) recipient.write({ v: PROFILE_VERSION, type: "event", event: "chat.message", payload: delivery });
+					if (recipient.negotiated)
+						recipient.write({ v: PROFILE_VERSION, type: "event", event: "chat.message", payload: delivery });
 			}
 		}
 		console.error(`gateway restart requested by owner via ${key}`);
@@ -1352,7 +1372,10 @@ async function sendChat(
 			// ordered stop still exits within the hard budget. Durable inbound and
 			// session state recover on boot.
 			const exit = options.exitProcess ?? ((code: number) => process.exit(code));
-			void runtime.stop?.("owner /restart").then(() => exit(RESTART_EXIT_CODE), () => exit(RESTART_EXIT_CODE));
+			void runtime.stop?.("owner /restart").then(
+				() => exit(RESTART_EXIT_CODE),
+				() => exit(RESTART_EXIT_CODE),
+			);
 			setTimeout(() => exit(RESTART_EXIT_CODE), RESTART_HARD_EXIT_MS).unref();
 		}, 1_500);
 		return;
@@ -1563,7 +1586,10 @@ async function createInboundTurnLifecycle(
 	const maxTurnParts = 10;
 	const interimSpeech = new InterimSpeechGate(options.interimSpeech);
 	let lastDeliveredRaw: string | undefined;
-	const deliverAssistantText = (rawMessage: string, tailEvent?: { readonly sessionId: string; readonly eventId: string }) => {
+	const deliverAssistantText = (
+		rawMessage: string,
+		tailEvent?: { readonly sessionId: string; readonly eventId: string },
+	) => {
 		if (!nonLoopback) return;
 		lastDeliveredRaw = rawMessage;
 		let message = rawMessage;
@@ -1618,7 +1644,10 @@ async function createInboundTurnLifecycle(
 			const deliveryId =
 				tailEvent === undefined
 					? undefined
-					: deterministicTailDeliveryId(tailEvent.sessionId, index === 0 ? tailEvent.eventId : `${tailEvent.eventId}:${index}`);
+					: deterministicTailDeliveryId(
+							tailEvent.sessionId,
+							index === 0 ? tailEvent.eventId : `${tailEvent.eventId}:${index}`,
+						);
 			const payload = runtime.delivery.prepare(crypto.randomUUID(), origin, step.body, step.replyTo, deliveryId);
 			if (!payload) continue;
 			deliveredParts.push(step.body);
@@ -1662,7 +1691,10 @@ async function createInboundTurnLifecycle(
 		if (polling || !options.sessionPort.progress) return;
 		polling = true;
 		try {
-			const snapshot = await options.sessionPort.progress({ sessionId: input.sessionId, repo: join(options.config.home, "workspace") });
+			const snapshot = await options.sessionPort.progress({
+				sessionId: input.sessionId,
+				repo: join(options.config.home, "workspace"),
+			});
 			if (!snapshot) return;
 			baseline ??= snapshot;
 			lastKnown = {
@@ -1698,10 +1730,7 @@ async function createInboundTurnLifecycle(
 				const decision = interimSpeech.admit(frame.assistantText, Date.now(), { toolCallsSoFar: lastKnown.toolCalls });
 				if (!decision.deliver) console.error(`gateway mid-work speech suppressed (${turnId}, ${decision.reason}).`);
 				else
-					deliverAssistantText(
-						frame.assistantText,
-						frame.eventId ? { sessionId, eventId: frame.eventId } : undefined,
-					);
+					deliverAssistantText(frame.assistantText, frame.eventId ? { sessionId, eventId: frame.eventId } : undefined);
 			} catch (error) {
 				console.error(`gateway intermediate delivery failed (${turnId}): ${diagnostic(error)}`);
 			}
@@ -1752,7 +1781,12 @@ async function createInboundTurnLifecycle(
 						...(context ? { id: context.requestId } : {}),
 						payload: { turnId, origin, role: "assistant", text, final: true },
 					});
-				runtime.memory.enqueue({ kind: "daily_capture", originRefJson: JSON.stringify(origin), userText, replyText: text });
+				runtime.memory.enqueue({
+					kind: "daily_capture",
+					originRefJson: JSON.stringify(origin),
+					userText,
+					replyText: text,
+				});
 				return;
 			}
 			const capturedUser = speaker ? `${speaker} @ ${place}: ${userText}` : userText;
@@ -1803,7 +1837,8 @@ async function createInboundTurnLifecycle(
 		onFrame,
 		onTerminal,
 		onFailure,
-		onStall: ({ elapsedMs }) => console.error(`gateway persona turn stalled (${turnId}) after ${elapsedMs}ms; retaining status reconciliation.`),
+		onStall: ({ elapsedMs }) =>
+			console.error(`gateway persona turn stalled (${turnId}) after ${elapsedMs}ms; retaining status reconciliation.`),
 	};
 }
 
@@ -1845,7 +1880,9 @@ function bootstrapProjection(row: {
 	const strings = (value: string): readonly string[] => {
 		try {
 			const parsed = JSON.parse(value);
-			return Array.isArray(parsed) && parsed.every((item) => typeof item === "string") ? parsed : ["projection_corrupt"];
+			return Array.isArray(parsed) && parsed.every((item) => typeof item === "string")
+				? parsed
+				: ["projection_corrupt"];
 		} catch {
 			return ["projection_corrupt"];
 		}
