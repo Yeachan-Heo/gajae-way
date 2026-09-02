@@ -82,6 +82,14 @@ export interface EngagementContext {
 	 * `authorName` when speaking to or about the author.
 	 */
 	readonly authorHandle?: string;
+	/**
+	 * Server/clan tag the author wears next to their name, when the platform has
+	 * such a badge and the author enabled it. On Discord this is the primary
+	 * guild tag (`User#primaryGuild.tag`), which is exactly what a reader in the
+	 * room sees and what tells them which server that account belongs to — the
+	 * persona was blind to it while every human could read it.
+	 */
+	readonly authorServerTag?: string;
 	/** Human-readable conversation label (channel/group name) when available. */
 	readonly channelLabel?: string;
 	/** Human-readable server/guild/workspace label when the platform has one above the channel. */

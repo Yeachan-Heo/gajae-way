@@ -74,6 +74,35 @@ test("derives engagement from Discord mentions and recognizes DMs as non-group",
 	expect(dm).toEqual({ mentioned: false, group: false, authorId: "author-1" });
 });
 
+test("reports the author's server tag, which every human in the room can already read", () => {
+	const bot = { id: "bot.1" };
+	const tagged = engagementForMessage(
+		{
+			id: "1",
+			content: "hello <@!bot.1>",
+			author: { id: "author-2", username: "leesayah", primaryGuild: { tag: "GJC", identityEnabled: true } },
+			channel: { id: "channel" },
+			mentions: { has: () => false },
+		},
+		bot,
+	);
+	expect(tagged.authorServerTag).toBe("GJC");
+	// A tag the account is not displaying is invisible to the room; reporting it
+	// would let the persona claim to see a badge nobody else can.
+	const hidden = engagementForMessage(
+		{
+			id: "2",
+			content: "hello <@!bot.1>",
+			author: { id: "author-3", username: "nobadge", primaryGuild: { tag: "GJC", identityEnabled: false } },
+			channel: { id: "channel" },
+			mentions: { has: () => false },
+		},
+		bot,
+	);
+	expect(hidden.authorServerTag).toBeUndefined();
+	expect("authorServerTag" in hidden).toBe(false);
+});
+
 test("LRU idempotency accepts each id once and evicts least recent ids", () => {
 	const ids = new LruSet(2);
 	expect(ids.addIfAbsent("a")).toBe(true);

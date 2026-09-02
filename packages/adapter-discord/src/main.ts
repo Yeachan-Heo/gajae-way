@@ -10,7 +10,7 @@ import { GajaewayClient } from "@gajaeway/sdk";
 import { AttachmentBuilder, Client, GatewayIntentBits, MessageFlags, Partials } from "discord.js";
 import pkg from "../package.json";
 import { type AttachmentCarrier, describeInboundBody, firstVoiceMessage } from "./attachments";
-import { type AuthorLike, resolveDisplayName } from "./author";
+import { type AuthorLike, resolveDisplayName, resolveServerTag } from "./author";
 import {
 	adapterHome,
 	type LoadedDiscordAdapterConfig,
@@ -169,6 +169,12 @@ export interface DiscordInboundMessage extends DiscordMessageOriginShape, ReplyM
 		readonly username?: string;
 		/** Account-wide display name, shown when a guild has no nickname. */
 		readonly globalName?: string | null;
+		/** Server tag badge (`primary_guild`), rendered next to the name. */
+		readonly primaryGuild?: {
+			readonly tag?: string | null;
+			readonly identityEnabled?: boolean | null;
+			readonly identityGuildId?: string | null;
+		} | null;
 	};
 	readonly mentions?: { has(user: unknown): boolean; readonly repliedUser?: AuthorLike | null };
 	readonly guild?: { readonly name?: string } | null;
@@ -219,6 +225,7 @@ export function engagementForMessage(message: DiscordInboundMessage, botUser: un
 	const botId = typeof botUser === "object" && botUser !== null && "id" in botUser ? String(botUser.id) : "";
 	const contentMention = botId !== "" && new RegExp(`<@!?${escapeRegExp(botId)}>`).test(message.content);
 	const displayName = resolveAuthorDisplayName(message);
+	const serverTag = resolveServerTag(message.author);
 	const replyTo = resolveReplyContext(message, botId);
 	return {
 		mentioned: Boolean(message.mentions?.has(botUser) || contentMention),
@@ -227,6 +234,7 @@ export function engagementForMessage(message: DiscordInboundMessage, botUser: un
 		...(message.author.bot ? { authorIsBot: true } : {}),
 		...(displayName ? { authorName: displayName } : {}),
 		...(message.author.username ? { authorHandle: message.author.username } : {}),
+		...(serverTag ? { authorServerTag: serverTag } : {}),
 		...(message.channel.name ? { channelLabel: `#${message.channel.name}` } : {}),
 		...(message.guild?.name ? { serverLabel: message.guild.name } : {}),
 		// Metadata only: a reply — even a reply to us — never promotes engagement.
@@ -751,6 +759,11 @@ export interface SlashInteractionLike {
 		readonly id: string;
 		readonly username?: string;
 		readonly globalName?: string | null;
+		readonly primaryGuild?: {
+			readonly tag?: string | null;
+			readonly identityEnabled?: boolean | null;
+			readonly identityGuildId?: string | null;
+		} | null;
 	};
 	/** Guild member for the invoking user, when the command ran in a guild. */
 	readonly member?: {
@@ -779,6 +792,7 @@ export async function handleSlashCommand(
 	if (!interaction.channel || !interaction.user) return;
 	try {
 		const origin = discordMessageOrigin({ author: { id: interaction.user.id }, channel: interaction.channel });
+		const interactionServerTag = resolveServerTag(interaction.user);
 		const result = await gateway.requestInbound(`slash-${interaction.id}`, origin, `/${interaction.commandName}`, {
 			mentioned: true,
 			group: origin.kind !== "dm",
@@ -787,6 +801,7 @@ export async function handleSlashCommand(
 				? { authorName: resolveInteractionDisplayName(interaction) as string }
 				: {}),
 			...(interaction.user.username ? { authorHandle: interaction.user.username } : {}),
+			...(interactionServerTag ? { authorServerTag: interactionServerTag } : {}),
 		});
 		// Honest ack: the gateway allowlist may decline the command (non-owner in a
 		// group surface) — never claim a reset that did not happen.

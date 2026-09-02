@@ -1445,6 +1445,7 @@ async function createInboundTurnLifecycle(
 				authorId?: string;
 				authorName?: string;
 				authorHandle?: string;
+				authorServerTag?: string;
 				channelLabel?: string;
 				serverLabel?: string;
 				replyTo?: { messageId?: string; authorName?: string; fromSelf?: boolean; excerpt?: string };

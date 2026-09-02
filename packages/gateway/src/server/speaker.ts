@@ -20,19 +20,26 @@ export type SpeakerEngagement =
 			readonly authorId?: string;
 			readonly authorName?: string;
 			readonly authorHandle?: string;
+			readonly authorServerTag?: string;
 	  }
 	| undefined;
 
 export function composeSpeakerLabel(engagement: SpeakerEngagement): string | undefined {
 	const displayName = nonBlank(engagement?.authorName);
 	const handle = nonBlank(engagement?.authorHandle);
+	// The server tag is a badge every reader in the room can see, and it is the
+	// only part of the header that says which server an account belongs to. It
+	// rides the name in brackets, the way Discord itself renders it.
+	const serverTag = nonBlank(engagement?.authorServerTag);
+	const tagged = (label: string): string => (serverTag ? `${label} [${serverTag}]` : label);
 
 	if (!displayName) {
 		// No usable name: fall back to the handle before the opaque id, since a
 		// handle is still something a human can look up.
-		return handle ?? nonBlank(engagement?.authorId);
+		const fallback = handle ?? nonBlank(engagement?.authorId);
+		return fallback ? tagged(fallback) : undefined;
 	}
-	return handle && handle !== displayName ? `${displayName} (@${handle})` : displayName;
+	return tagged(handle && handle !== displayName ? `${displayName} (@${handle})` : displayName);
 }
 
 function nonBlank(value: string | undefined): string | undefined {
