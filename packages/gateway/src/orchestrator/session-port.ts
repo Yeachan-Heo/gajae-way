@@ -142,6 +142,7 @@ export interface BrokerSessionPortOptions {
 const DEFAULT_REQUEST_WAIT_MS = 30 * 60_000;
 const DEFAULT_STATUS_POLL_MS = 500;
 const SESSION_CREATE_ATTEMPTS = 5;
+const SESSION_CREATE_READINESS_MS = 60_000;
 const SESSION_CREATE_RETRY_MS = 1_000;
 
 /**
@@ -241,7 +242,11 @@ export class BrokerSessionPort implements SessionPort {
 						"--idempotency-key",
 						idempotencyKey,
 						"--json-input",
-						JSON.stringify({ cwd: repo }),
+						// A fresh session host boots the full agent (~10s measured on the
+						// persona host); the runtime's 10s default readiness cutoff turns a
+						// slow-but-healthy cold start into spawn_failed. Use the maximum
+						// budget: create is idempotent under this key either way.
+						JSON.stringify({ cwd: repo, readinessTimeoutMs: SESSION_CREATE_READINESS_MS }),
 					]),
 					"session.create",
 				);
