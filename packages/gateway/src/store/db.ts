@@ -781,6 +781,14 @@ export class GatewayDatabase {
 	}
 
 	/** Origins with accepted/settled batches that need actor reconstruction after boot. */
+	/** Origins with unbatched pending rows: after a restart these have no batch and no timer, so recovery must arm them. */
+	inboundPendingOrigins(): readonly string[] {
+		return this.#database
+			.query<{ origin_key: string }, []>("SELECT DISTINCT origin_key FROM inbound_messages WHERE state = 'pending' AND batch_state IS NULL")
+			.all()
+			.map((row) => row.origin_key);
+	}
+
 	inboundNonterminalOrigins(): readonly string[] {
 		return this.#database
 			.query<{ origin_key: string }, []>(

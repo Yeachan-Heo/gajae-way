@@ -227,14 +227,18 @@ export class PersonaSessionManager {
 	/** Reconstructs durable accepted/settled batches after a gateway restart. */
 	recover(): Promise<void> {
 		if (this.#stopped) return Promise.resolve();
+		const origins = new Set<string>([...this.#database.inboundNonterminalOrigins(), ...this.#database.inboundPendingOrigins()]);
 		return Promise.all(
-			this.#database.inboundNonterminalOrigins().map((originKey) =>
+			[...origins].map((originKey) =>
 				this.#actor(originKey).enqueue(async () => {
 					// Outage backlog: anything older than the stale floor is expired
 					// before recovery so it is never answered late.
 					this.expireStale(originKey);
 					await this.#actor(originKey).recover();
 					await this.#actor(originKey).reconcile();
+					// Unbatched pending rows (released before the restart, or arrived
+					// while down) have no timer: arm the settle so they drain now.
+					await this.#actor(originKey).admit();
 				}),
 			),
 		).then(() => undefined);
