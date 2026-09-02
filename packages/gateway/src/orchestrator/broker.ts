@@ -718,7 +718,11 @@ export const STEERING_DEFAULTS: Readonly<Record<string, string>> = { steeringMod
  * daemon and sessions are never affected. Safe on every restart: sessions are
  * durable and resume through recovery.
  */
-export async function reapAgentDir(agentDir: string, log: (line: string) => void, isPidAlive: (pid: number) => boolean | Promise<boolean>): Promise<void> {
+export async function reapAgentDir(
+	agentDir: string,
+	log: (line: string) => void,
+	isPidAlive: (pid: number) => boolean | Promise<boolean>,
+): Promise<void> {
 	let killed = 0;
 	try {
 		const ps = Bun.spawnSync(["ps", "-Ao", "pid=,ppid=,args="]);
@@ -729,9 +733,11 @@ export async function reapAgentDir(agentDir: string, log: (line: string) => void
 			.filter((m): m is RegExpMatchArray => m !== null)
 			.map((m) => ({ pid: Number(m[1]), ppid: Number(m[2]), args: m[3] ?? "" }));
 		const owned = new Set<number>();
-		for (const row of rows) if (/gjc sdk broker-internal/.test(row.args) && row.args.includes(`--agent-dir ${agentDir}`)) owned.add(row.pid);
 		for (const row of rows)
-			if (/gjc sdk (session-host-internal|serve --stdio|session tail)/.test(row.args) && owned.has(row.ppid)) owned.add(row.pid);
+			if (/gjc sdk broker-internal/.test(row.args) && row.args.includes(`--agent-dir ${agentDir}`)) owned.add(row.pid);
+		for (const row of rows)
+			if (/gjc sdk (session-host-internal|serve --stdio|session tail)/.test(row.args) && owned.has(row.ppid))
+				owned.add(row.pid);
 		for (const pid of owned) {
 			if (pid === process.pid || !(await isPidAlive(pid))) continue;
 			try {
@@ -752,7 +758,9 @@ export async function reapAgentDir(agentDir: string, log: (line: string) => void
 					}
 		}
 	} catch (error) {
-		log(`broker_reap_processes_failed detail=${sanitizeDiagnostic(error instanceof Error ? error.message : String(error))}`);
+		log(
+			`broker_reap_processes_failed detail=${sanitizeDiagnostic(error instanceof Error ? error.message : String(error))}`,
+		);
 	}
 	let tombstones = 0;
 	const sdk = join(agentDir, "sdk");
@@ -772,7 +780,8 @@ export async function reapAgentDir(agentDir: string, log: (line: string) => void
 				tombstones++;
 			}
 	}
-	if (killed > 0 || tombstones > 0) log(`broker_reaped agentDir=${agentDir} processes=${killed} tombstones=${tombstones}`);
+	if (killed > 0 || tombstones > 0)
+		log(`broker_reaped agentDir=${agentDir} processes=${killed} tombstones=${tombstones}`);
 }
 
 export function defaultSsotAgentDir(): string {

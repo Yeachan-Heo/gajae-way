@@ -432,7 +432,14 @@ test("start seeds the private agent dir from the operator SSOT and fails loudly 
 
 test("boot reap removes lock tombstones and spawn residue from the private agent dir only", async () => {
 	const home = await temporaryHome("gajaeway-broker-reap-");
-	const broker = new BrokerSupervisor({ home, instanceId: "instance-reap", ssotAgentDir: null, command: async () => HEALTHY, healthIntervalMs: 60_000, isPidAlive: () => false });
+	const broker = new BrokerSupervisor({
+		home,
+		instanceId: "instance-reap",
+		ssotAgentDir: null,
+		command: async () => HEALTHY,
+		healthIntervalMs: 60_000,
+		isPidAlive: () => false,
+	});
 	const sdk = join(broker.agentDir, "sdk");
 	await mkdir(join(sdk, "sessions"), { recursive: true });
 	await mkdir(join(sdk, ".broker.lock.stale-deadbeef"), { recursive: true });

@@ -534,7 +534,8 @@ class ManagedTailHandle implements TailHandle {
 				return;
 			}
 			this.#deliveredIds.add(key);
-			if (this.#deliveredIds.size > DELIVERED_ID_CAP) this.#deliveredIds.delete(this.#deliveredIds.values().next().value as string);
+			if (this.#deliveredIds.size > DELIVERED_ID_CAP)
+				this.#deliveredIds.delete(this.#deliveredIds.values().next().value as string);
 		}
 		const attributedOpRef = tailOperationRef(frame);
 		if (attributedOpRef && this.#acceptedOpRef && attributedOpRef !== this.#acceptedOpRef) {
