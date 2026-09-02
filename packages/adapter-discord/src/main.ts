@@ -11,12 +11,7 @@ import { AttachmentBuilder, Client, GatewayIntentBits, MessageFlags, Partials } 
 import pkg from "../package.json";
 import { type AttachmentCarrier, describeInboundBody, firstVoiceMessage } from "./attachments";
 import { type AuthorLike, resolveDisplayName, resolveServerTag } from "./author";
-import {
-	adapterHome,
-	type LoadedDiscordAdapterConfig,
-	type LoadedDiscordVoiceConfig,
-	loadDiscordAdapterConfig,
-} from "./config";
+import { adapterHome, type LoadedDiscordVoiceConfig, loadDiscordAdapterConfig } from "./config";
 import { AdapterAlreadyRunningError, AdapterLock } from "./lock";
 import { type DiscordMessageOriginShape, discordMessageOrigin } from "./origin";
 import {
@@ -30,7 +25,6 @@ import {
 import {
 	classifyRecoveryFailure,
 	clearAttempt,
-	recoveryCursorPath as defaultRecoveryCursorPath,
 	loadRecoveryCursors,
 	RECOVERY_ATTEMPT_BACKOFF_MS,
 	RECOVERY_MAX_ATTEMPTS,
@@ -76,29 +70,13 @@ export function createReactionPorts(): DiscordReactionPorts {
 	return { resolver: new GuildEmojiResolver(), limiter: new ReactionRateLimiter() };
 }
 
-/** Gateway liveness probe cadence; three consecutive failures reconnect. */
-const MONITOR_INTERVAL_MS = 30_000;
-const MONITOR_RETRY_MS = 5_000;
-const MONITOR_STRIKES = 3;
-/** Working-status without a progress tick for this long is stale (gateway ticks every 15s). */
-const WORKING_STATUS_STALE_MS = 90_000;
-
-/**
- * A single slow/failed status probe (gateway busy under load) must not tear
- * down a healthy link and its delivery subscription: only a sustained failure
- * (MONITOR_STRIKES consecutive) reconnects. A closed socket is still detected
- * immediately through the client's own close path.
- */
-export function monitorFailureDecision(
-	strikes: number,
-): { action: "retry"; strikes: number } | { action: "reconnect" } {
-	return strikes + 1 >= MONITOR_STRIKES ? { action: "reconnect" } : { action: "retry", strikes: strikes + 1 };
-}
 const DISCORD_MESSAGE_LIMIT = 2_000;
 // Discord clears the typing hint after ~10s, so refresh inside that window while a turn is running.
 const TYPING_REFRESH_MS = 7_000;
 // Hard ceiling above the gateway's 300s gjc turn timeout: a lost turn must not type forever.
 const TYPING_MAX_MS = 330_000;
+/** Working-status without a progress tick for this long is stale (gateway ticks every 15s). */
+const WORKING_STATUS_STALE_MS = 90_000;
 const REQUIRED_INTENTS = [
 	GatewayIntentBits.Guilds,
 	GatewayIntentBits.GuildMessages,
@@ -125,8 +103,33 @@ export interface GatewayClientLike {
 	request<T = unknown>(verb: string, params?: unknown): Promise<T>;
 	onChatMessage(handler: (message: ChatMessagePayload) => void): () => void;
 	onChatProgress?(handler: (progress: ChatProgressPayload) => void): () => void;
-	close?(): Promise<void>;
+	close?(): void | Promise<void>;
 }
+
+export interface AdapterHandle {
+	readonly stop: () => Promise<void>;
+	readonly settled: Promise<void>;
+}
+
+/** Structural copy of the composition-owned generation contract. */
+export interface Generation {
+	readonly id: number;
+	readonly signal: AbortSignal;
+	readonly port: GatewayClientLike & { open(): Promise<unknown> };
+	track<T>(task: Promise<T>): Promise<T>;
+	sleep(ms: number): Promise<void>;
+}
+
+export interface DiscordAdapterInput {
+	readonly token: string;
+	readonly intents?: readonly number[];
+	readonly voice?: LoadedDiscordVoiceConfig;
+	/** Snapshot used solely to enumerate Discord history during recovery. */
+	readonly recoveryChannels: readonly string[];
+	readonly recoveryCursorPath: string;
+}
+
+export type OpenGatewayClient = GatewayClientLike & { open(): Promise<unknown> };
 
 export interface DiscordTextChannelLike {
 	send(
@@ -161,6 +164,19 @@ export interface TypingPort {
 
 export interface DiscordClientLike {
 	channels: { fetch(id: string): Promise<unknown> };
+}
+
+export interface DiscordAdapterClient extends DiscordClientLike {
+	readonly user?: unknown;
+	readonly application?: {
+		readonly commands?: {
+			set(commands: readonly { readonly name: string; readonly description: string }[]): Promise<unknown>;
+		};
+	};
+	on(event: string, listener: (...args: unknown[]) => void): unknown;
+	once(event: string, listener: (...args: unknown[]) => void): unknown;
+	login(token: string): Promise<unknown>;
+	destroy(): void;
 }
 
 export interface DiscordInboundMessage extends DiscordMessageOriginShape, ReplyMessageLike, AttachmentCarrier {
@@ -248,25 +264,14 @@ export function engagementForMessage(message: DiscordInboundMessage, botUser: un
 
 /**
  * Decides whether an incoming Discord message becomes a turn, and with what engagement.
- * Returns undefined when the message must be ignored outright.
- *
- * Collaboration means hearing other bots, so only our own messages are dropped. An `open`
- * channel promotes a human message to a mention so the persona joins the room without being
- * called; bot authors never get that promotion, because two open-channel bots would answer each
- * other forever. A bot has to address us explicitly to get a turn.
+ * Returns undefined when the message must be ignored outright. Engagement gates belong
+ * to the gateway, so this adapter reports only facts observed from Discord.
  */
-export function decideInbound(
-	message: DiscordInboundMessage,
-	botUser: unknown,
-	channels: Readonly<Record<string, { readonly engagement?: "open" }>> | undefined,
-): EngagementContext | undefined {
+export function decideInbound(message: DiscordInboundMessage, botUser: unknown): EngagementContext | undefined {
 	if (message.id === undefined) return undefined;
 	const botId = typeof botUser === "object" && botUser !== null && "id" in botUser ? String(botUser.id) : "";
 	if (botId !== "" && message.author.id === botId) return undefined;
-	const origin = discordMessageOrigin(message);
-	const base = engagementForMessage(message, botUser);
-	const open = origin.kind !== "dm" && channels?.[origin.conversationId]?.engagement === "open";
-	return open && !message.author.bot ? { ...base, mentioned: true } : base;
+	return engagementForMessage(message, botUser);
 }
 
 /**
@@ -368,6 +373,11 @@ export class TypingIndicator implements TypingPort {
 		if (!run) return;
 		if (run.timer) clearTimeout(run.timer);
 		this.#runs.delete(conversationId);
+	}
+
+	dispose(): void {
+		for (const run of this.#runs.values()) if (run.timer) clearTimeout(run.timer);
+		this.#runs.clear();
 	}
 
 	async #pulse(
@@ -494,6 +504,10 @@ export class WorkingStatus {
 		}
 	}
 
+	async dispose(): Promise<void> {
+		await Promise.all([...this.#messages.keys()].map((conversationId) => this.clear(conversationId)));
+	}
+
 	async clear(conversationId: string): Promise<void> {
 		const timer = this.#staleTimers.get(conversationId);
 		if (timer) clearTimeout(timer);
@@ -594,6 +608,10 @@ async function sendVoiceMessage(
 	}
 }
 
+export type DiscordTaskTracker = <T>(task: Promise<T>) => Promise<T>;
+
+const identityDiscordTrack: DiscordTaskTracker = (task) => task;
+
 export function subscribeDiscordDeliveries(
 	gateway: GatewayClientLike,
 	discord: DiscordClientLike,
@@ -601,12 +619,15 @@ export function subscribeDiscordDeliveries(
 	status?: WorkingStatus,
 	log: Pick<Console, "error"> = console,
 	speech?: DiscordSpeechPorts,
+	track: DiscordTaskTracker = identityDiscordTrack,
+	shouldHandle: () => boolean = () => true,
 ): () => void {
 	// One reaction port pair per subscription: the emoji cache and the throttle are
 	// only useful across deliveries, and a live adapter has exactly one subscription.
 	const reactions = createReactionPorts();
 	return gateway.onChatMessage((message) => {
-		void settleDiscordDelivery(gateway, discord, message, typing, status, reactions, speech).catch((error) =>
+		if (!shouldHandle()) return;
+		void track(settleDiscordDelivery(gateway, discord, message, typing, status, reactions, speech)).catch((error) =>
 			log.error(
 				`Discord delivery settlement request failed: ${error instanceof Error ? error.message : String(error)}`,
 			),
@@ -620,15 +641,18 @@ export function subscribeDiscordProgress(
 	// testing without a Discord client, and the private message cache is irrelevant here.
 	status: Pick<WorkingStatus, "update" | "clear">,
 	log: Pick<Console, "error"> = console,
+	track: DiscordTaskTracker = identityDiscordTrack,
+	shouldHandle: () => boolean = () => true,
 ): () => void {
 	if (!gateway.onChatProgress) return () => {};
 	return gateway.onChatProgress((progress) => {
+		if (!shouldHandle()) return;
 		// `final` means the turn stopped working. It arrives even when the turn
 		// delivered nothing - a silence token in an open channel - which is the only
 		// signal that the temporary status must go. Clearing on delivery alone left
 		// one orphaned "working" message per suppressed turn.
 		const action = progress.final ? status.clear(progress.origin.conversationId) : status.update(progress);
-		void action.catch((error) =>
+		void track(action).catch((error) =>
 			log.error(
 				`Discord working status ${progress.final ? "clear" : "update"} failed: ${error instanceof Error ? error.message : String(error)}`,
 			),
@@ -688,36 +712,83 @@ async function decodePcmWithFfmpeg(ogg: Uint8Array): Promise<Int16Array | undefi
 	return new Int16Array(raw.buffer.slice(raw.byteOffset, raw.byteOffset + usable));
 }
 
-export async function startDiscordAdapter(config: LoadedDiscordAdapterConfig): Promise<void> {
+const DISCORD_UNRECOVERABLE_CLOSE_CODES = new Set([4004, 4010, 4011, 4012, 4013, 4014]);
+
+/** Starts a production Discord client for one composition-owned generation. */
+export async function startDiscordAdapter(
+	input: DiscordAdapterInput,
+	gateway: OpenGatewayClient,
+	gen: Generation,
+): Promise<AdapterHandle> {
 	const discord = new Client({
-		intents: [...new Set([...REQUIRED_INTENTS, ...(config.intents ?? [])])],
+		intents: [...new Set([...REQUIRED_INTENTS, ...(input.intents ?? [])])],
 		// DM channels are not cached on a cold start; without the Channel partial
 		// discord.js drops messageCreate for uncached DMs, silently losing owner DMs.
 		// REQUIRED_PARTIALS carries that Channel partial plus the reaction partials,
 		// which uncached reaction events need for the same reason.
 		partials: REQUIRED_PARTIALS,
+	}) as unknown as DiscordAdapterClient;
+	return startDiscordAdapterWithClient(input, gateway, gen, discord);
+}
+
+/** Test seam for lifecycle faults without opening a Discord websocket. */
+export async function startDiscordAdapterWithClient(
+	input: DiscordAdapterInput,
+	gateway: OpenGatewayClient,
+	gen: Generation,
+	discord: DiscordAdapterClient,
+	log: Pick<Console, "error" | "log"> = console,
+): Promise<AdapterHandle> {
+	const typing = new TypingIndicator(discord, TYPING_REFRESH_MS, TYPING_MAX_MS, log);
+	const status = new WorkingStatus(discord, log);
+	const tasks = new Set<Promise<unknown>>();
+	let stopped = false;
+	let destroyed = false;
+	let stopPromise: Promise<void> | undefined;
+	let settle: (() => void) | undefined;
+	let rejectSettled: ((error: unknown) => void) | undefined;
+	let settledDone = false;
+	const settled = new Promise<void>((resolve, reject) => {
+		settle = resolve;
+		rejectSettled = reject;
 	});
-	const typing = new TypingIndicator(discord);
-	const status = new WorkingStatus(discord);
-	const gateway = new ReconnectingGateway(
-		config.gatewaySocket ?? defaultGatewaySocket(),
+	// `start()` can throw after rejecting `settled`; retain the rejection for the
+	// supervisor without producing an unhandled-rejection warning first.
+	void settled.catch(() => {});
+	const track: DiscordTaskTracker = <T>(task: Promise<T>): Promise<T> => {
+		const tracked = gen.track(task);
+		tasks.add(tracked);
+		void tracked.finally(() => tasks.delete(tracked)).catch(() => {});
+		return tracked;
+	};
+	const active = (): boolean => !stopped && !gen.signal.aborted;
+	const fail = (error: unknown): void => {
+		if (!active() || settledDone) return;
+		settledDone = true;
+		rejectSettled?.(error);
+	};
+	const link = new DiscordGatewayLink(
+		gateway,
 		discord,
-		config,
+		input,
 		typing,
 		status,
-		join(adapterHome(), "adapters", "discord", "recovery-cursor.json"),
+		input.recoveryCursorPath,
 		() => discord.user,
 		undefined,
-		undefined,
-		discordSpeechPorts(config.voice),
+		discordSpeechPorts(input.voice),
+		gen,
 	);
+
 	// Transcription makes ingress asynchronous, and two messages in one
 	// conversation must not overtake each other while one waits on the network.
 	// The gateway serializes turns per origin, but it serializes them in arrival
 	// order, so the ordering has to be preserved here, before it hands them over.
 	const ingress = new OrderedIngress();
-	discord.on("messageCreate", (message) => {
-		const engagement = decideInbound(message, discord.user, config.channels);
+	discord.on("messageCreate", (...args) => {
+		if (!active()) return;
+		const message = args[0] as DiscordInboundMessage;
+		const engagement = decideInbound(message, discord.user);
 		if (!engagement) return;
 		// Attachments are rendered into the body: a voice message or an uncaptioned
 		// image has no content at all, and the gateway rejects empty text, so
@@ -728,52 +799,129 @@ export async function startDiscordAdapter(config: LoadedDiscordAdapterConfig): P
 		const receivedAt =
 			typeof message.createdTimestamp === "number" ? new Date(message.createdTimestamp).toISOString() : undefined;
 		ingress.run(origin.conversationId, async () => {
+			if (!active()) return;
 			// A voice message carries no text at all, so without a transcript the
 			// history shows a url and nothing about what was said. Doing this in the
 			// runtime rather than the persona is a standing owner instruction.
-			const body = withTranscript(rendered, await transcribeIfVoice(message, config.voice));
+			const body = withTranscript(rendered, await transcribeIfVoice(message, input.voice));
+			if (!active()) return;
 			// The modality of the question decides the modality of the answer: a
 			// spoken message is answered in voice and text both, without the
 			// persona having to ask for it.
 			const spoken = firstVoiceMessage(message) !== undefined;
-			gateway.sendInbound(message.id as string, origin, body, engagement, receivedAt, spoken);
+			link.sendInbound(message.id, origin, body, engagement, receivedAt, spoken);
 		});
 	});
 	// A reaction is engagement metadata, never a turn: it goes out on its own verb.
-	discord.on("messageReactionAdd", (reaction, user) => {
-		gateway.sendReaction(reaction, user, "add", discord.user);
+	discord.on("messageReactionAdd", (...args) => {
+		if (active())
+			link.sendReaction(args[0] as DiscordInboundReaction, args[1] as DiscordReactingUser, "add", discord.user);
 	});
 	// A REMOVAL means the reactor retracted the signal. It is recorded as its own
 	// metadata event rather than erasing the add, because the persona may already
 	// have read the add — rewriting history behind it would make its memory of the
 	// conversation disagree with what it was told.
-	discord.on("messageReactionRemove", (reaction, user) => {
-		gateway.sendReaction(reaction, user, "remove", discord.user);
+	discord.on("messageReactionRemove", (...args) => {
+		if (active())
+			link.sendReaction(args[0] as DiscordInboundReaction, args[1] as DiscordReactingUser, "remove", discord.user);
 	});
-	discord.on("interactionCreate", (interaction) => {
-		if (interaction.isChatInputCommand()) void handleSlashCommand(interaction, gateway);
+	discord.on("interactionCreate", (...args) => {
+		if (!active()) return;
+		const interaction = args[0] as SlashInteractionLike;
+		if (interaction.isChatInputCommand?.()) void handleSlashCommand(interaction, link, log);
 	});
 	discord.once("ready", () => {
-		console.log("Discord adapter connected.");
+		if (!active()) return;
+		log.log("Discord adapter connected.");
 		// Slash-command mapping: /new and /reset are first-class Discord commands
 		// that route into the gateway's session-reset verbs for the invoking
 		// conversation (typing "/new" as chat text never reaches messageCreate).
 		void discord.application?.commands
-			.set([
+			?.set([
 				{ name: "new", description: "Start a fresh persona session in this conversation" },
 				{ name: "reset", description: "Reset this conversation's persona session" },
 				{ name: "restart", description: "Restart the gateway process (owner only)" },
 			])
 			.catch((error: unknown) =>
-				console.error(
+				log.error(
 					`Discord slash-command registration failed: ${error instanceof Error ? error.message : String(error)}`,
 				),
 			);
-		void gateway.recoverMissedMessages();
+		void link.recoverMissedMessages();
 	});
-	console.log("Discord adapter starting.");
-	await gateway.connect();
-	await discord.login(config.token);
+	discord.on("shardDisconnect", (...args) => {
+		if (!active()) return;
+		const close = args[0];
+		const code =
+			typeof close === "object" && close !== null && "code" in close && typeof close.code === "number"
+				? close.code
+				: undefined;
+		if (code !== undefined && DISCORD_UNRECOVERABLE_CLOSE_CODES.has(code)) {
+			const error = new Error(`discord_unrecoverable_close code=${code}`);
+			log.error(error.message);
+			fail(error);
+		}
+	});
+	discord.on("shardReconnecting", () => {
+		if (active()) log.error("Discord shard reconnecting.");
+	});
+	discord.on("shardError", (...args) => {
+		if (active()) log.error(`Discord shard error: ${describeError(args[0])}`);
+	});
+	discord.on("error", (...args) => {
+		if (active()) log.error(`Discord client error: ${describeError(args[0])}`);
+	});
+
+	const deliveryOff = subscribeDiscordDeliveries(
+		gateway,
+		discord,
+		typing,
+		status,
+		log,
+		discordSpeechPorts(input.voice),
+		track,
+		active,
+	);
+	const progressOff = subscribeDiscordProgress(gateway, status, log, track, active);
+	const stop = (): Promise<void> => {
+		stopPromise ??= (async () => {
+			stopped = true;
+			deliveryOff();
+			progressOff();
+			await link.stop();
+			typing.dispose();
+			await status.dispose();
+			await Promise.allSettled([...tasks]);
+			if (!destroyed) {
+				destroyed = true;
+				discord.destroy();
+			}
+			await gateway.close?.();
+			if (!settledDone) {
+				settledDone = true;
+				settle?.();
+			}
+		})();
+		return stopPromise;
+	};
+
+	try {
+		log.log("Discord adapter starting.");
+		await gateway.open();
+	} catch (error) {
+		fail(error);
+		await stop();
+		throw error;
+	}
+	void discord.login(input.token).then(
+		() => {},
+		(error: unknown) => {
+			if (!active()) return;
+			fail(error);
+			void stop();
+		},
+	);
+	return { stop, settled };
 }
 
 /** Duck-typed slice of a Discord chat-input command interaction. */
@@ -810,7 +958,7 @@ export function resolveInteractionDisplayName(
 
 export async function handleSlashCommand(
 	interaction: SlashInteractionLike,
-	gateway: Pick<ReconnectingGateway, "requestInbound">,
+	gateway: Pick<DiscordGatewayLink, "requestInbound">,
 	log: Pick<Console, "error"> = console,
 ): Promise<void> {
 	if (!interaction.isChatInputCommand?.()) return;
@@ -846,12 +994,7 @@ export type RecoveredSendResult =
 	| { readonly verdict: "acked" | "duplicate" }
 	| { readonly verdict: "unavailable"; readonly failure: RecoveryFailureClass; readonly summary: string };
 
-export class ReconnectingGateway {
-	#client: GajaewayClient | undefined;
-	#reconnecting = false;
-	#attempt = 0;
-	#deliveryOff: (() => void) | undefined;
-	#progressOff: (() => void) | undefined;
+export class DiscordGatewayLink {
 	readonly #inbound = new RecoveryGate();
 	#cursors: RecoveryCursorState | undefined;
 	#cursorLoads: Promise<void> | undefined;
@@ -860,68 +1003,56 @@ export class ReconnectingGateway {
 	#recovering = false;
 	#retryTimer: ReturnType<typeof setTimeout> | undefined;
 	#retryAttempt = 0;
+	#stopped = false;
+	readonly #stopController = new AbortController();
+	#activeRecovery: Promise<void> | undefined;
+
+	readonly sleep: (ms: number) => Promise<void>;
 
 	constructor(
-		readonly socketPath: string,
+		readonly gateway: GatewayClientLike,
 		readonly discord: DiscordClientLike,
-		readonly config: LoadedDiscordAdapterConfig,
-		readonly typing?: TypingPort,
-		readonly status?: WorkingStatus,
-		readonly recoveryCursorPath: string = defaultRecoveryCursorPath(),
-		readonly getBotUser: () => unknown = () => undefined,
-		initialClient?: GajaewayClient,
-		/** Injectable only so tests do not pay real recovery backoff. */
-		readonly sleep: (ms: number) => Promise<void> = (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
-		readonly speech?: DiscordSpeechPorts,
+		readonly input: DiscordAdapterInput,
+		readonly typing: TypingPort | undefined,
+		readonly status: WorkingStatus | undefined,
+		readonly recoveryCursorPath: string,
+		readonly getBotUser: () => unknown,
+		sleep: ((ms: number) => Promise<void>) | undefined,
+		readonly speech: DiscordSpeechPorts | undefined,
+		readonly gen: Generation,
 	) {
-		this.#client = initialClient;
+		this.sleep = sleep ?? ((ms) => this.gen.sleep(ms));
 		void this.ensureCursors();
 	}
 
-	async connect(): Promise<void> {
-		try {
-			const client = await GajaewayClient.connectSocket(this.socketPath);
-			this.#client = client;
-			this.#attempt = 0;
-			this.#deliveryOff?.();
-			this.#deliveryOff = subscribeDiscordDeliveries(
-				client,
-				this.discord,
-				this.typing,
-				this.status,
-				console,
-				this.speech,
-			);
-			this.#progressOff?.();
-			this.#progressOff = this.status ? subscribeDiscordProgress(client, this.status) : undefined;
-			console.log("Discord adapter connected to gateway.");
-			this.monitor(client);
-			void this.recoverMissedMessages();
-		} catch {
-			this.scheduleReconnect();
-		}
-	}
-
 	/**
-	 * Bounded catch-up for messages missed while the adapter or its gateway link was
-	 * offline (issue #33). Runs after Discord ready and after every gateway reconnect;
-	 * safe alongside live traffic because the gateway durably dedupes on message id.
+	 * Bounded catch-up for messages missed while the adapter was offline. Recovery
+	 * uses the restart-bound channel snapshot only; engagement remains gateway-owned.
 	 */
 	async recoverMissedMessages(): Promise<void> {
-		const channelIds = Object.keys(this.config.channels ?? {});
-		// Nothing configured means nothing to recover, ever: that is the one early return
-		// that must not reschedule.
-		if (channelIds.length === 0) return;
-		if (this.#recovering) {
-			// A pass is already running and owns the follow-up decision for its own outcome;
-			// this caller still gets a retry so its trigger is not silently dropped.
+		if (!this.active()) return;
+		if (this.#activeRecovery) {
 			this.scheduleRecoveryRetry();
 			return;
 		}
+		const pass = this.#recoverMissedMessages();
+		this.#activeRecovery = pass;
+		try {
+			await pass;
+		} finally {
+			if (this.#activeRecovery === pass) this.#activeRecovery = undefined;
+		}
+	}
+
+	async #recoverMissedMessages(): Promise<void> {
+		const channelIds = this.input.recoveryChannels;
+		// Nothing configured means nothing to recover, ever: that is the one early return
+		// that must not reschedule.
+		if (channelIds.length === 0 || !this.active()) return;
 		const botUser = this.getBotUser();
-		if (!this.#client || !botUser) {
-			// A fired retry that cannot proceed (no gateway link yet, Discord not ready) must
-			// reschedule itself, otherwise the gap waits for a reconnect that may never come.
+		if (!botUser) {
+			// A fired retry that cannot proceed (Discord is not ready) must reschedule itself,
+			// otherwise the gap waits for an event that may never arrive.
 			this.scheduleRecoveryRetry();
 			return;
 		}
@@ -932,6 +1063,7 @@ export class ReconnectingGateway {
 		let completed = false;
 		try {
 			await this.ensureCursors();
+			if (!this.active()) return;
 			if (!this.#cursors) {
 				// Fail closed: without a readable watermark a backfill cannot record progress,
 				// so it would replay the same bootstrap window forever and never close the gap.
@@ -942,6 +1074,7 @@ export class ReconnectingGateway {
 			}
 			let incomplete = false;
 			for (const channelId of channelIds) {
+				if (!this.active()) return;
 				try {
 					if (await this.recoverChannel(channelId, botUser)) incomplete = true;
 				} catch (error) {
@@ -954,13 +1087,16 @@ export class ReconnectingGateway {
 			}
 			completed = !incomplete;
 		} catch (error) {
-			console.error(
-				`Discord recovery pass failed: ${error instanceof Error ? error.message : String(error)}; retrying with backoff.`,
-			);
+			if (this.active())
+				console.error(
+					`Discord recovery pass failed: ${error instanceof Error ? error.message : String(error)}; retrying with backoff.`,
+				);
 		} finally {
 			this.#recovering = false;
-			if (completed) this.#retryAttempt = 0;
-			else this.scheduleRecoveryRetry();
+			if (this.active()) {
+				if (completed) this.#retryAttempt = 0;
+				else this.scheduleRecoveryRetry();
+			}
 			// A resolved pass means its progress is on disk. Persists stay
 			// fire-and-forget during the pass so one slow write cannot stall the
 			// backfill, but a caller that awaits the pass and then crashes must not
@@ -1007,6 +1143,7 @@ export class ReconnectingGateway {
 			);
 			return true;
 		}
+		if (!this.active()) return false;
 		if (!isRecoverableChannel(fetched)) {
 			// Deleted channel, revoked permission, or a non-text channel id in config: the gap
 			// for this channel is unknown, not empty. Never treat that as a clean pass — leave
@@ -1024,9 +1161,10 @@ export class ReconnectingGateway {
 			cursor: before,
 			nowMs: Date.now(),
 			deliver: async (message) => {
+				if (!this.active()) return "unavailable";
 				// Same normalization as live messageCreate: one decision, one origin shape,
 				// one gateway verb — recovery never forks engagement semantics.
-				const engagement = decideInbound(message, botUser, this.config.channels);
+				const engagement = decideInbound(message, botUser);
 				if (!engagement) return "skip";
 				const origin = discordMessageOrigin(message);
 				let failure: RecoveryFailureClass = "write-path-unknown";
@@ -1042,7 +1180,8 @@ export class ReconnectingGateway {
 					// Cross-pass accounting: a message alternating terminal and transient
 					// failures still converges on its budget instead of blocking its channel.
 					this.noteAttempt(message.id, channelId, failure, summary);
-					if (attempt < RECOVERY_MAX_ATTEMPTS) await this.sleep(RECOVERY_ATTEMPT_BACKOFF_MS * 2 ** (attempt - 1));
+					if (attempt < RECOVERY_MAX_ATTEMPTS)
+						await this.waitForRecovery(RECOVERY_ATTEMPT_BACKOFF_MS * 2 ** (attempt - 1));
 				}
 				this.flushCursors();
 				const terminalAttempts = this.#cursors?.attempts[message.id]?.terminalAttempts ?? 0;
@@ -1124,12 +1263,12 @@ export class ReconnectingGateway {
 
 	/** Re-runs recovery after a backoff so a paused or truncated gap keeps draining. */
 	private scheduleRecoveryRetry(): void {
-		if (this.#retryTimer) return;
+		if (!this.active() || this.#retryTimer) return;
 		const delay = Math.min(RECOVERY_RETRY_MAX_MS, RECOVERY_RETRY_BASE_MS * 2 ** Math.min(this.#retryAttempt++, 6));
 		console.log(`Discord recovery retrying in ${delay}ms.`);
 		const timer = setTimeout(() => {
 			this.#retryTimer = undefined;
-			void this.recoverMissedMessages();
+			if (this.active()) void this.recoverMissedMessages();
 		}, delay);
 		timer.unref?.();
 		this.#retryTimer = timer;
@@ -1206,13 +1345,14 @@ export class ReconnectingGateway {
 		this.persist(
 			retainRecoveryCursors(
 				{ ...current, recoveredThrough: { ...current.recoveredThrough, [conversationId]: messageId } },
-				Object.keys(this.config.channels ?? {}),
+				this.input.recoveryChannels,
 			),
 		);
 	}
 
 	/** Serialized, fire-and-forget cursor-store write; a failed persist only widens the gap. */
 	private persist(next: RecoveryCursorState): void {
+		if (!this.active()) return;
 		this.#cursors = next;
 		this.#cursorSaves = this.#cursorSaves
 			.then(() => saveRecoveryCursors(this.recoveryCursorPath, next))
@@ -1248,11 +1388,12 @@ export class ReconnectingGateway {
 		action: ReactionAction,
 		botUser: unknown,
 	): void {
+		if (!this.active()) return;
 		const described = describeInboundReaction(reaction, user, botUser, action);
 		if (!described) return;
-		const client = this.#client;
-		if (!client) return;
-		void client.request("engagement.reaction", described).catch(() => this.scheduleReconnect());
+		void this.gateway.request("engagement.reaction", described).catch((error) => {
+			if (this.active()) console.error(`Discord gateway request failed: ${describeError(error)}`);
+		});
 	}
 
 	/** Like sendInbound but reports the gateway's engagement decision to the caller. */
@@ -1265,17 +1406,14 @@ export class ReconnectingGateway {
 		/** The message was spoken, so the reply is owed in both modalities. */
 		voice?: boolean,
 	): Promise<{ engaged?: boolean } | undefined> {
+		if (!this.active()) return undefined;
 		let result: { engaged?: boolean } | undefined;
 		const verdict = await this.#inbound.join(messageId, async () => {
-			const client = this.#client;
-			if (!client) {
-				this.scheduleReconnect();
-				return "unavailable";
-			}
+			if (!this.active()) return "unavailable";
 			try {
 				// The gateway acknowledges engagement before running the turn, so typing starts only for
 				// turns that will actually produce a reply and never outlives the delivery that clears it.
-				result = await client.request<{ engaged?: boolean }>("chat.send", {
+				result = await this.gateway.request<{ engaged?: boolean }>("chat.send", {
 					origin,
 					text,
 					engagement,
@@ -1285,10 +1423,10 @@ export class ReconnectingGateway {
 				});
 				// No recovery-watermark write here on purpose: a live message is no evidence that
 				// the older messages behind it were ever backfilled (issue #33).
-				if (result?.engaged) this.typing?.begin(origin.conversationId);
+				if (result?.engaged && this.active()) this.typing?.begin(origin.conversationId);
 				return "acked";
-			} catch {
-				this.scheduleReconnect();
+			} catch (error) {
+				if (this.active()) console.error(`Discord gateway request failed: ${describeError(error)}`);
 				return "unavailable";
 			}
 		});
@@ -1300,10 +1438,6 @@ export class ReconnectingGateway {
 	 * chat.send verb, same durable gateway exactly-once as live sends. Returns whether the
 	 * gateway acknowledged ("acked"), the message was already known ("duplicate"), or the
 	 * send must be retried later ("unavailable" — the recovery watermark does not advance).
-	 *
-	 * Every failure carries a classification, because that is the only thing allowed to
-	 * decide whether a message may ever be discarded. An attempt that merely joined another
-	 * in-flight send reports `write-path-unknown`, the safe default.
 	 */
 	async requestRecovered(
 		messageId: string,
@@ -1314,18 +1448,18 @@ export class ReconnectingGateway {
 		let failure: RecoveryFailureClass | undefined;
 		let summary: string | undefined;
 		const verdict = await this.#inbound.join(messageId, async () => {
-			const client = this.#client;
-			if (!client) {
+			if (!this.active()) {
 				failure = "retryable";
-				summary = "gateway link not connected";
+				summary = "adapter stopped";
 				return "unavailable";
 			}
 			try {
-				await client.request("chat.send", { origin, text, engagement, messageId });
+				await this.gateway.request("chat.send", { origin, text, engagement, messageId });
 				return "acked";
 			} catch (error) {
 				failure = classifyRecoveryFailure(error);
 				summary = summarizeRecoveryFailure(error);
+				if (this.active()) console.error(`Discord gateway request failed: ${summary}`);
 				return "unavailable";
 			}
 		});
@@ -1337,44 +1471,75 @@ export class ReconnectingGateway {
 		};
 	}
 
-	private monitor(client: GajaewayClient, strikes = 0): void {
-		setTimeout(
-			() => {
-				if (this.#client !== client) return;
-				void client.request("gateway.status").then(
-					() => this.monitor(client, 0),
-					() => {
-						const next = monitorFailureDecision(strikes);
-						if (next.action === "reconnect") this.scheduleReconnect();
-						else this.monitor(client, next.strikes);
-					},
-				);
-			},
-			strikes === 0 ? MONITOR_INTERVAL_MS : MONITOR_RETRY_MS,
-		);
+	async stop(): Promise<void> {
+		this.#stopped = true;
+		this.#stopController.abort();
+		if (this.#retryTimer) clearTimeout(this.#retryTimer);
+		this.#retryTimer = undefined;
+		await this.#activeRecovery?.catch(() => {});
+		await this.cursorsFlushed;
 	}
 
-	private scheduleReconnect(): void {
-		if (this.#reconnecting) return;
-		this.#reconnecting = true;
-		this.#client = undefined;
-		this.#deliveryOff?.();
-		const delay = Math.min(30_000, 500 * 2 ** Math.min(this.#attempt++, 6));
-		const jitter = Math.floor(Math.random() * Math.max(1, delay / 4));
-		console.log(`Discord adapter gateway reconnecting in ${delay + jitter}ms.`);
-		setTimeout(() => {
-			this.#reconnecting = false;
-			void this.connect();
-		}, delay + jitter);
+	private active(): boolean {
+		return !this.#stopped && !this.gen.signal.aborted;
 	}
-}
 
-function defaultGatewaySocket(): string {
-	return `${process.env.GAJAEWAY_HOME ?? `${process.env.HOME ?? "~"}/.gajaeway`}/gateway.sock`;
+	private async waitForRecovery(ms: number): Promise<void> {
+		if (!this.active()) return;
+		await awaitWithAbort(this.sleep(ms), this.#stopController.signal);
+	}
 }
 
 function escapeRegExp(value: string): string {
 	return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+function describeError(error: unknown): string {
+	return error instanceof Error ? error.message : String(error);
+}
+
+function awaitWithAbort<T>(task: Promise<T>, signal: AbortSignal): Promise<T> {
+	return new Promise((resolve, reject) => {
+		const onAbort = () => {
+			signal.removeEventListener("abort", onAbort);
+			reject(Object.assign(new Error("The operation was aborted"), { name: "AbortError" }));
+		};
+		if (signal.aborted) {
+			void task.catch(() => {});
+			onAbort();
+			return;
+		}
+		signal.addEventListener("abort", onAbort, { once: true });
+		void task.then(
+			(value) => {
+				signal.removeEventListener("abort", onAbort);
+				resolve(value);
+			},
+			(error: unknown) => {
+				signal.removeEventListener("abort", onAbort);
+				reject(error);
+			},
+		);
+	});
+}
+
+function abortableGenerationSleep(ms: number, signal: AbortSignal): Promise<void> {
+	return new Promise((resolve, reject) => {
+		if (signal.aborted) {
+			reject(Object.assign(new Error("The operation was aborted"), { name: "AbortError" }));
+			return;
+		}
+		const timer = setTimeout(() => {
+			signal.removeEventListener("abort", onAbort);
+			resolve();
+		}, ms);
+		const onAbort = () => {
+			clearTimeout(timer);
+			signal.removeEventListener("abort", onAbort);
+			reject(Object.assign(new Error("The operation was aborted"), { name: "AbortError" }));
+		};
+		signal.addEventListener("abort", onAbort, { once: true });
+	});
 }
 
 function isDiscordTextChannel(value: unknown): value is DiscordTextChannelLike {
@@ -1431,16 +1596,58 @@ if (import.meta.main) {
 		console.error(argv.message);
 		process.exit(USAGE_EXIT_CODE);
 	} else {
-		// The lock is taken before the config is even read: refusing early keeps a
-		// stray start from touching the resident instance's gateway session.
-		AdapterLock.acquire(adapterHome())
+		void AdapterLock.acquire(adapterHome())
 			.then(async (lock) => {
-				// Registering a signal handler suppresses the default terminate, so
-				// the lock is dropped and the exit is then performed by hand.
-				const release = (): void => void lock.release().finally(() => process.exit(0));
+				const home = adapterHome();
+				const controller = new AbortController();
+				let handle: AdapterHandle | undefined;
+				let stopping: Promise<void> | undefined;
+				const stop = (): Promise<void> => {
+					stopping ??= (async () => {
+						controller.abort();
+						await handle?.stop();
+						await lock.release();
+					})();
+					return stopping;
+				};
+				const release = (): void => void stop().finally(() => process.exit(0));
 				process.once("SIGINT", release);
 				process.once("SIGTERM", release);
-				await startDiscordAdapter(await loadDiscordAdapterConfig());
+				try {
+					const config = await loadDiscordAdapterConfig();
+					const client = await GajaewayClient.connectSocket(config.gatewaySocket ?? join(home, "gateway.sock"));
+					// The temporary socket bridge negotiates before the adapter registers event
+					// handlers. S5 deletes it once in-process ports provide replay ordering.
+					const gateway: OpenGatewayClient = {
+						request: (verb, params) => client.request(verb, params),
+						onChatMessage: (handler) => client.on("chat.message", (payload) => handler(payload as ChatMessagePayload)),
+						onChatProgress: (handler) =>
+							client.on("chat.progress", (payload) => handler(payload as ChatProgressPayload)),
+						open: async () => ({ replayed: 0 }),
+						close: () => client.close(),
+					};
+					const gen: Generation = {
+						id: 1,
+						signal: controller.signal,
+						port: gateway,
+						track: (task) => task,
+						sleep: (ms) => abortableGenerationSleep(ms, controller.signal),
+					};
+					handle = await startDiscordAdapter(
+						{
+							token: config.token,
+							intents: config.intents,
+							voice: config.voice,
+							recoveryChannels: Object.keys(config.channels ?? {}),
+							recoveryCursorPath: join(home, "adapters", "discord", "recovery-cursor.json"),
+						},
+						gateway,
+						gen,
+					);
+					await handle.settled;
+				} finally {
+					await stop();
+				}
 			})
 			.catch((error) => {
 				console.error(error instanceof Error ? error.message : String(error));

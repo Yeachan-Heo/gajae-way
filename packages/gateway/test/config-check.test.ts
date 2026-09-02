@@ -27,7 +27,8 @@ test("a bootable config reports open and mention-only channel counts", async () 
 	expect(result.channels).toHaveLength(2);
 	expect(result.openChannels).toEqual(["1469222606497648690"]);
 	expect(configCheckExitCode(result)).toBe(0);
-	expect(renderConfigCheck(result)[1]).toContain("open 1, mention-only 1");
+	expect(renderConfigCheck(result)[1]).toBe("  adapters: none");
+	expect(renderConfigCheck(result)[2]).toContain("open 1, mention-only 1");
 });
 
 test("an unknown engagement gate is rejected before a restart can strand the host", async () => {

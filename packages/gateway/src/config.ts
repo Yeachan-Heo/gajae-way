@@ -11,6 +11,33 @@ export interface CredentialFileReference {
 
 export type GjcModelSelection = string | { readonly preset: string };
 
+/** Non-secret voice options for the Discord adapter; the key comes from credentials.discordVoice. */
+export interface DiscordVoiceOptions {
+	readonly languageCode?: string;
+	readonly endpoint?: string;
+	readonly model?: string;
+	readonly timeoutMs?: number;
+	readonly voiceId?: string;
+	readonly speechModel?: string;
+	readonly speechEndpoint?: string;
+	readonly outputFormat?: string;
+	readonly maxSpokenChars?: number;
+	readonly speechTimeoutMs?: number;
+	readonly speechSpeed?: number;
+}
+
+export interface DiscordAdapterSection {
+	readonly intents?: readonly number[];
+	readonly voice?: DiscordVoiceOptions;
+}
+
+export type TelegramAdapterSection = Record<never, never>;
+
+export interface AdaptersConfig {
+	readonly discord?: DiscordAdapterSection;
+	readonly telegram?: TelegramAdapterSection;
+}
+
 export interface GatewayConfigFile {
 	readonly schemaVersion: typeof CONFIG_SCHEMA_VERSION;
 	readonly logVerbosity?: "debug" | "info" | "warn" | "error";
@@ -48,6 +75,11 @@ export interface GatewayConfigFile {
 	readonly webhook?: { readonly bind?: string; readonly port: number; readonly exposeNonLoopback?: boolean };
 	readonly watcherRoots?: readonly string[];
 	readonly scriptRoot?: string;
+	/**
+	 * In-process platform adapters. Presence of a section enables that adapter;
+	 * secrets stay in `credentials` (discord, discordVoice, telegram).
+	 */
+	readonly adapters?: AdaptersConfig;
 }
 
 export interface GatewayConfig extends GatewayConfigFile {
@@ -181,6 +213,92 @@ function parseCredentials(value: unknown): Readonly<Record<string, CredentialFil
 	return credentials;
 }
 
+const DISCORD_VOICE_STRING_FIELDS = [
+	"languageCode",
+	"endpoint",
+	"model",
+	"voiceId",
+	"speechModel",
+	"speechEndpoint",
+	"outputFormat",
+] as const;
+const DISCORD_VOICE_INTEGER_FIELDS = ["timeoutMs", "maxSpokenChars", "speechTimeoutMs"] as const;
+const DISCORD_VOICE_FIELDS = new Set<string>([
+	...DISCORD_VOICE_STRING_FIELDS,
+	...DISCORD_VOICE_INTEGER_FIELDS,
+	"speechSpeed",
+]);
+
+function parseDiscordVoice(value: unknown): DiscordVoiceOptions {
+	const input = requireObject(value, "adapters.discord.voice");
+	for (const key of Object.keys(input)) {
+		if (!DISCORD_VOICE_FIELDS.has(key))
+			throw new ConfigError("config_invalid", `adapters.discord.voice.${key} is not a recognised field`);
+	}
+	for (const field of DISCORD_VOICE_STRING_FIELDS) {
+		if (input[field] !== undefined && typeof input[field] !== "string")
+			throw new ConfigError("config_invalid", `adapters.discord.voice.${field} must be a string when set`);
+	}
+	for (const field of DISCORD_VOICE_INTEGER_FIELDS) {
+		const item = input[field];
+		if (item !== undefined && (!Number.isInteger(item) || (item as number) <= 0))
+			throw new ConfigError("config_invalid", `adapters.discord.voice.${field} must be a positive integer when set`);
+	}
+	if (input.speechSpeed !== undefined && (typeof input.speechSpeed !== "number" || !Number.isFinite(input.speechSpeed)))
+		throw new ConfigError("config_invalid", "adapters.discord.voice.speechSpeed must be a finite number when set");
+	return input as DiscordVoiceOptions;
+}
+
+function parseAdapters(
+	value: unknown,
+	credentials: Readonly<Record<string, CredentialFileReference>> | undefined,
+): AdaptersConfig | undefined {
+	if (value === undefined) return undefined;
+	const input = requireObject(value, "adapters");
+	for (const key of Object.keys(input)) {
+		if (key !== "discord" && key !== "telegram")
+			throw new ConfigError("config_invalid", `adapters.${key} is not a supported adapter (discord, telegram)`);
+	}
+	const adapters: { discord?: DiscordAdapterSection; telegram?: TelegramAdapterSection } = {};
+	if (input.discord !== undefined) {
+		const discord = requireObject(input.discord, "adapters.discord");
+		for (const key of Object.keys(discord)) {
+			if (key !== "intents" && key !== "voice")
+				throw new ConfigError("config_invalid", `adapters.discord.${key} is not a recognised field`);
+		}
+		if (!credentials?.discord)
+			throw new ConfigError("config_invalid", "adapters.discord requires credentials.discord.credentialFile");
+		if (
+			discord.intents !== undefined &&
+			(!Array.isArray(discord.intents) || discord.intents.some((intent) => !Number.isInteger(intent)))
+		)
+			throw new ConfigError("config_invalid", "adapters.discord.intents must be an array of integer intent values");
+		const section: { intents?: readonly number[]; voice?: DiscordVoiceOptions } = {};
+		if (discord.intents !== undefined) section.intents = discord.intents as number[];
+		if (discord.voice !== undefined) {
+			if (!credentials?.discordVoice)
+				throw new ConfigError(
+					"config_invalid",
+					"adapters.discord.voice requires credentials.discordVoice.credentialFile",
+				);
+			section.voice = parseDiscordVoice(discord.voice);
+		}
+		adapters.discord = section;
+	}
+	if (input.telegram !== undefined) {
+		const telegram = requireObject(input.telegram, "adapters.telegram");
+		if (Object.keys(telegram).length !== 0)
+			throw new ConfigError(
+				"config_invalid",
+				`adapters.telegram.${Object.keys(telegram)[0]} is not a recognised field`,
+			);
+		if (!credentials?.telegram)
+			throw new ConfigError("config_invalid", "adapters.telegram requires credentials.telegram.credentialFile");
+		adapters.telegram = {};
+	}
+	return adapters;
+}
+
 function parseChannels(value: unknown): Readonly<Record<string, ChannelPolicy>> | undefined {
 	if (value === undefined) return undefined;
 	const input = requireObject(value, "channels");
@@ -307,14 +425,17 @@ export function parseConfigFile(value: unknown): GatewayConfigFile {
 		);
 	}
 	const model = parseModel(input.model);
+	const credentials = parseCredentials(input.credentials);
+	const adapters = parseAdapters(input.adapters, credentials);
 	return {
 		schemaVersion: CONFIG_SCHEMA_VERSION,
+		...(adapters ? { adapters } : {}),
 		...(logVerbosity ? { logVerbosity: logVerbosity as GatewayConfigFile["logVerbosity"] } : {}),
 		...(optionalString(input.socketPath, "socketPath")
 			? { socketPath: optionalString(input.socketPath, "socketPath") }
 			: {}),
 		...(optionalString(input.dbPath, "dbPath") ? { dbPath: optionalString(input.dbPath, "dbPath") } : {}),
-		...(parseCredentials(input.credentials) ? { credentials: parseCredentials(input.credentials) } : {}),
+		...(credentials ? { credentials } : {}),
 		...(parseChannels(input.channels) ? { channels: parseChannels(input.channels) } : {}),
 		...(input.webhook === undefined ? {} : { webhook: parseWebhook(input.webhook) }),
 		...(input.watcherRoots === undefined ? {} : { watcherRoots: parseStringArray(input.watcherRoots, "watcherRoots") }),
@@ -452,6 +573,7 @@ export const RESTART_REQUIRED_FIELDS = [
 	"socketPath",
 	"dbPath",
 	"model",
+	"adapters",
 	"credentials",
 	"webhook",
 	"watcherRoots",

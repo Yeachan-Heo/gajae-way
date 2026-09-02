@@ -29,7 +29,7 @@ async function start(): Promise<string> {
 		stdout: "ignore",
 		stderr: "inherit",
 	});
-	await Bun.sleep(100);
+	for (let i = 0; i < 300 && !(await Bun.file(socket).exists()); i++) await Bun.sleep(10);
 	return socket;
 }
 async function client(socketPath: string) {

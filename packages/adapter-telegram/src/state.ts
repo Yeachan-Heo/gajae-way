@@ -50,12 +50,22 @@ export class TelegramAdapterState {
 		return this.#updateId;
 	}
 
-	async acceptUpdate(updateId: number): Promise<boolean> {
+	isNew(updateId: number): boolean {
 		if (!Number.isSafeInteger(updateId)) throw new Error("Telegram update_id must be a safe integer");
-		if (this.#updateId !== undefined && updateId <= this.#updateId) return false;
+		return this.#updateId === undefined || updateId > this.#updateId;
+	}
+
+	async commit(updateId: number): Promise<void> {
+		if (!Number.isSafeInteger(updateId)) throw new Error("Telegram update_id must be a safe integer");
+		if (this.#updateId !== undefined && updateId <= this.#updateId) return;
+		const previous = this.#updateId;
 		this.#updateId = updateId;
-		await this.save();
-		return true;
+		try {
+			await this.save();
+		} catch (error) {
+			this.#updateId = previous;
+			throw error;
+		}
 	}
 
 	async rememberOrigin(origin: OriginRef, messageThreadId?: number): Promise<void> {

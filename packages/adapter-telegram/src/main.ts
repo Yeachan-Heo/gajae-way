@@ -1,18 +1,42 @@
+import { join } from "node:path";
 import type { ChatMessagePayload, EngagementContext, OriginRef } from "@gajaeway/protocol";
+import { ProtocolError } from "@gajaeway/protocol";
 import { GajaewayClient } from "@gajaeway/sdk";
-import { type LoadedTelegramAdapterConfig, loadTelegramAdapterConfig } from "./config";
+import { adapterHome, loadTelegramAdapterConfig } from "./config";
 import { type TelegramMessageOriginShape, telegramMessageOrigin } from "./origin";
 import { telegramReactionFor } from "./reactions";
 import { resolveTelegramReplyContext, type TelegramReplyMessageShape } from "./reply";
 import { TelegramAdapterState } from "./state";
 
 const TELEGRAM_MESSAGE_LIMIT = 4_096;
+const TELEGRAM_BACKOFF_INITIAL_MS = 1_000;
+const TELEGRAM_BACKOFF_MAX_MS = 30_000;
 
 export interface GatewayClientLike {
 	request<T = unknown>(verb: string, params?: unknown): Promise<T>;
 	onChatMessage(handler: (message: ChatMessagePayload) => void): () => void;
-	close?(): Promise<void>;
+	close?(): void | Promise<void>;
 }
+
+export interface AdapterHandle {
+	readonly stop: () => Promise<void>;
+	readonly settled: Promise<void>;
+}
+
+/** Structural copy of the composition-owned generation contract. */
+export interface Generation {
+	readonly id: number;
+	readonly signal: AbortSignal;
+	readonly port: GatewayClientLike & { open(): Promise<unknown> };
+	track<T>(task: Promise<T>): Promise<T>;
+	sleep(ms: number): Promise<void>;
+}
+
+export interface TelegramAdapterInput {
+	readonly token: string;
+}
+
+export type OpenGatewayClient = GatewayClientLike & { open(): Promise<unknown> };
 
 export interface TelegramMessage extends TelegramMessageOriginShape {
 	readonly message_id: number;
@@ -70,11 +94,12 @@ export class TelegramBotApi {
 		readonly fetcher: FetchLike = fetch,
 	) {}
 
-	async call<T>(method: string, parameters: Record<string, unknown> = {}): Promise<T> {
+	async call<T>(method: string, parameters: Record<string, unknown> = {}, signal?: AbortSignal): Promise<T> {
 		const response = await this.fetcher(`https://api.telegram.org/bot${this.token}/${method}`, {
 			method: "POST",
 			headers: { "content-type": "application/json" },
 			body: JSON.stringify(parameters),
+			signal,
 		});
 		let body: unknown;
 		try {
@@ -90,15 +115,19 @@ export class TelegramBotApi {
 		return body.result as T;
 	}
 
-	getUpdates(offset?: number): Promise<TelegramUpdate[]> {
+	getUpdates(offset?: number, signal?: AbortSignal): Promise<TelegramUpdate[]> {
 		// `allowed_updates` REPLACES Telegram's default set, so "message" has to be
 		// listed explicitly to keep the existing text path working while opting into
 		// "message_reaction" (which is never in the default set).
-		return this.call("getUpdates", {
-			timeout: 30,
-			allowed_updates: ["message", "message_reaction"],
-			...(offset === undefined ? {} : { offset }),
-		});
+		return this.call(
+			"getUpdates",
+			{
+				timeout: 30,
+				allowed_updates: ["message", "message_reaction"],
+				...(offset === undefined ? {} : { offset }),
+			},
+			signal,
+		);
 	}
 
 	sendMessage(chatId: string, text: string, messageThreadId?: number): Promise<unknown> {
@@ -196,17 +225,24 @@ export async function settleTelegramReaction(
 	}
 }
 
+export type TaskTracker = <T>(task: Promise<T>) => Promise<T>;
+
+const identityTrack: TaskTracker = (task) => task;
+
 export function subscribeTelegramDeliveries(
 	gateway: GatewayClientLike,
 	bot: Pick<TelegramBotApi, "sendMessage" | "setMessageReaction">,
 	state: TelegramAdapterState,
 	log: Pick<Console, "error"> = console,
+	track: TaskTracker = identityTrack,
+	shouldHandle: () => boolean = () => true,
 ): () => void {
 	return gateway.onChatMessage((message) => {
+		if (!shouldHandle()) return;
 		const settled = message.reaction
 			? settleTelegramReaction(gateway, bot, state, message)
 			: settleTelegramDelivery(gateway, bot, state, message);
-		void settled.catch((error) =>
+		void track(settled).catch((error) =>
 			log.error(
 				`Telegram delivery settlement request failed: ${error instanceof Error ? error.message : String(error)}`,
 			),
@@ -219,33 +255,39 @@ export class TelegramAdapter {
 		readonly state: TelegramAdapterState,
 		readonly botUsername: string,
 		readonly botUserId: string,
-		readonly config: Pick<LoadedTelegramAdapterConfig, "chats">,
+		readonly log: Pick<Console, "error"> = console,
 	) {}
 
 	async handleUpdate(gateway: Pick<GatewayClientLike, "request">, update: TelegramUpdate): Promise<boolean> {
-		if (!(await this.state.acceptUpdate(update.update_id))) return false;
-		// An inbound reaction is engagement metadata, never a turn: it is reported via
-		// engagement.reaction and must never reach chat.send.
-		const reaction = describeTelegramReaction(update.message_reaction, this.botUserId);
-		if (reaction) {
-			await gateway.request("engagement.reaction", reaction);
+		if (!this.state.isNew(update.update_id)) return false;
+		try {
+			// An inbound reaction is engagement metadata, never a turn: it is reported via
+			// engagement.reaction and must never reach chat.send.
+			const reaction = describeTelegramReaction(update.message_reaction, this.botUserId);
+			if (reaction) await gateway.request("engagement.reaction", reaction);
+			else {
+				const message = update.message;
+				if (message?.from && message.text) {
+					const origin = telegramMessageOrigin(message);
+					await this.state.rememberOrigin(origin, origin.kind === "topic" ? message.message_thread_id : undefined);
+					await gateway.request("chat.send", {
+						origin,
+						text: message.text,
+						engagement: engagementForMessage(message, origin, this.botUsername, this.botUserId),
+						messageId: `telegram:${this.botUserId}:update:${update.update_id}`,
+					});
+				}
+			}
+			await this.state.commit(update.update_id);
 			return true;
+		} catch (error) {
+			if (error instanceof ProtocolError && error.code === "invalid_params") {
+				this.log.error(`telegram_update_rejected update_id=${update.update_id} code=${error.code}`);
+				await this.state.commit(update.update_id);
+				return true;
+			}
+			throw error;
 		}
-		const message = update.message;
-		if (!message?.from || !message.text) return true;
-		const origin = telegramMessageOrigin(message);
-		await this.state.rememberOrigin(origin, origin.kind === "topic" ? message.message_thread_id : undefined);
-		const baseEngagement = engagementForMessage(message, origin, this.botUsername, this.botUserId);
-		const engagement =
-			origin.kind !== "dm" && this.config.chats?.[origin.parentId ?? origin.conversationId]?.engagement === "open"
-				? { ...baseEngagement, mentioned: true }
-				: baseEngagement;
-		await gateway.request("chat.send", {
-			origin,
-			text: message.text,
-			engagement,
-		});
-		return true;
 	}
 }
 
@@ -328,95 +370,162 @@ export function engagementForMessage(
 	};
 }
 
-export async function startTelegramAdapter(config: LoadedTelegramAdapterConfig): Promise<void> {
-	const state = await TelegramAdapterState.load(adapterHome());
-	const bot = new TelegramBotApi(config.token);
-	const identity = await bot.call<{ id: number | string; username?: string }>("getMe");
-	if (!identity.username) throw new Error("Telegram bot account has no username");
-	const adapter = new TelegramAdapter(state, identity.username, String(identity.id), config);
-	const gateway = new ReconnectingGateway(config.gatewaySocket ?? defaultGatewaySocket(), bot, state);
-	await gateway.connect();
-	for (;;) {
-		try {
-			for (const update of await bot.getUpdates(state.updateId === undefined ? undefined : state.updateId + 1))
-				await adapter.handleUpdate(gateway, update);
-		} catch {
-			await Bun.sleep(1_000);
-		}
-	}
+/** Starts a generation-owned poller using a production Telegram Bot API client. */
+export async function startTelegramAdapter(
+	input: TelegramAdapterInput,
+	gateway: OpenGatewayClient,
+	home: string,
+	gen: Generation,
+): Promise<AdapterHandle> {
+	return startTelegramAdapterWithBot(input, gateway, home, gen, new TelegramBotApi(input.token));
 }
 
-class ReconnectingGateway implements GatewayClientLike {
-	#client: GajaewayClient | undefined;
-	#reconnecting = false;
-	#attempt = 0;
-	#deliveryOff: (() => void) | undefined;
-	#handlers = new Set<(message: ChatMessagePayload) => void>();
+/** Test seam for the generation lifecycle; production callers use `startTelegramAdapter`. */
+export async function startTelegramAdapterWithBot(
+	_input: TelegramAdapterInput,
+	gateway: OpenGatewayClient,
+	home: string,
+	gen: Generation,
+	bot: Pick<TelegramBotApi, "call" | "getUpdates" | "sendMessage" | "setMessageReaction">,
+	log: Pick<Console, "error"> = console,
+): Promise<AdapterHandle> {
+	const state = await TelegramAdapterState.load(home);
+	const stopController = new AbortController();
+	const signal = combinedSignal(gen.signal, stopController.signal);
+	let deliveryOff: (() => void) | undefined;
+	let stopPromise: Promise<void> | undefined;
+	let opened = false;
+	let adapter: TelegramAdapter | undefined;
+	const tasks = new Set<Promise<unknown>>();
 
-	constructor(
-		readonly socketPath: string,
-		readonly bot: TelegramBotApi,
-		readonly state: TelegramAdapterState,
-	) {}
+	const track: TaskTracker = <T>(task: Promise<T>): Promise<T> => {
+		const tracked = gen.track(task);
+		tasks.add(tracked);
+		void tracked.finally(() => tasks.delete(tracked)).catch(() => {});
+		return tracked;
+	};
 
-	async connect(): Promise<void> {
-		try {
-			const client = await GajaewayClient.connectSocket(this.socketPath);
-			this.#client = client;
-			this.#attempt = 0;
-			this.#deliveryOff?.();
-			this.#deliveryOff = subscribeTelegramDeliveries(client, this.bot, this.state);
-			this.monitor(client);
-		} catch {
-			this.scheduleReconnect();
-		}
-	}
+	const poller = track(
+		(async () => {
+			let attempt = 0;
+			while (!signal.aborted) {
+				try {
+					if (!adapter) {
+						const identity = await bot.call<{ id: number | string; username?: string }>("getMe", {}, signal);
+						if (!identity.username) throw new Error("Telegram bot account has no username");
+						adapter = new TelegramAdapter(state, identity.username, String(identity.id), log);
+					}
+					if (!opened) {
+						deliveryOff ??= subscribeTelegramDeliveries(gateway, bot, state, log, track, () => !signal.aborted);
+						await gateway.open();
+						opened = true;
+					}
+					const offset = state.updateId === undefined ? undefined : state.updateId + 1;
+					for (const update of await bot.getUpdates(offset, signal)) {
+						if (signal.aborted) break;
+						await adapter.handleUpdate(gateway, update);
+					}
+					attempt = 0;
+				} catch (error) {
+					if (signal.aborted || isAbortError(error)) return;
+					if (isFatalTelegramError(error)) throw error;
+					if (error instanceof TelegramApiError && error.status === 409) log.error("telegram_poll_conflict");
+					try {
+						await awaitWithAbort(gen.sleep(telegramBackoffDelay(attempt++)), signal);
+					} catch (sleepError) {
+						if (signal.aborted || isAbortError(sleepError)) return;
+						throw sleepError;
+					}
+				}
+			}
+		})(),
+	);
+	// A start failure can reject before the supervisor observes the handle. Keep the
+	// process from reporting that rejection twice while preserving `settled` for it.
+	void poller.catch(() => {});
 
-	async request<T = unknown>(verb: string, params?: unknown): Promise<T> {
-		if (!this.#client) throw new Error("gateway is not connected");
-		try {
-			return await this.#client.request<T>(verb, params);
-		} catch (error) {
-			this.scheduleReconnect();
-			throw error;
-		}
-	}
-
-	onChatMessage(handler: (message: ChatMessagePayload) => void): () => void {
-		this.#handlers.add(handler);
-		return () => this.#handlers.delete(handler);
-	}
-
-	private monitor(client: GajaewayClient): void {
-		setTimeout(() => {
-			if (this.#client !== client) return;
-			void client.request("gateway.status").then(
-				() => this.monitor(client),
-				() => this.scheduleReconnect(),
-			);
-		}, 30_000);
-	}
-
-	private scheduleReconnect(): void {
-		if (this.#reconnecting) return;
-		this.#reconnecting = true;
-		this.#client = undefined;
-		this.#deliveryOff?.();
-		const delay = Math.min(30_000, 500 * 2 ** Math.min(this.#attempt++, 6));
-		const jitter = Math.floor(Math.random() * Math.max(1, delay / 4));
-		setTimeout(() => {
-			this.#reconnecting = false;
-			void this.connect();
-		}, delay + jitter);
-	}
+	return {
+		settled: poller,
+		stop: () => {
+			stopPromise ??= (async () => {
+				stopController.abort();
+				deliveryOff?.();
+				deliveryOff = undefined;
+				await poller.catch(() => {});
+				await Promise.allSettled([...tasks]);
+				await gateway.close?.();
+			})();
+			return stopPromise;
+		},
+	};
 }
 
-function adapterHome(): string {
-	return process.env.GAJAEWAY_HOME ?? `${process.env.HOME ?? "~"}/.gajaeway`;
+export function telegramBackoffDelay(attempt: number, random: () => number = Math.random): number {
+	const base = Math.min(TELEGRAM_BACKOFF_MAX_MS, TELEGRAM_BACKOFF_INITIAL_MS * 2 ** Math.max(0, attempt));
+	return Math.max(1, Math.round(base * (0.75 + random() * 0.5)));
 }
 
-function defaultGatewaySocket(): string {
-	return `${adapterHome()}/gateway.sock`;
+function isFatalTelegramError(error: unknown): error is TelegramApiError {
+	return error instanceof TelegramApiError && (error.status === 401 || error.status === 404);
+}
+
+function combinedSignal(...signals: readonly AbortSignal[]): AbortSignal {
+	if (signals.some((signal) => signal.aborted)) return AbortSignal.abort();
+	const controller = new AbortController();
+	for (const signal of signals) signal.addEventListener("abort", () => controller.abort(), { once: true });
+	return controller.signal;
+}
+
+function abortableSleep(ms: number, signal: AbortSignal): Promise<void> {
+	return new Promise((resolve, reject) => {
+		if (signal.aborted) {
+			reject(abortError());
+			return;
+		}
+		const timer = setTimeout(() => {
+			signal.removeEventListener("abort", onAbort);
+			resolve();
+		}, ms);
+		const onAbort = () => {
+			clearTimeout(timer);
+			signal.removeEventListener("abort", onAbort);
+			reject(abortError());
+		};
+		signal.addEventListener("abort", onAbort, { once: true });
+	});
+}
+
+function abortError(): Error {
+	return Object.assign(new Error("The operation was aborted"), { name: "AbortError" });
+}
+
+function isAbortError(error: unknown): boolean {
+	return error instanceof Error && error.name === "AbortError";
+}
+
+function awaitWithAbort<T>(task: Promise<T>, signal: AbortSignal): Promise<T> {
+	return new Promise((resolve, reject) => {
+		const onAbort = () => {
+			signal.removeEventListener("abort", onAbort);
+			reject(abortError());
+		};
+		if (signal.aborted) {
+			void task.catch(() => {});
+			onAbort();
+			return;
+		}
+		signal.addEventListener("abort", onAbort, { once: true });
+		void task.then(
+			(value) => {
+				signal.removeEventListener("abort", onAbort);
+				resolve(value);
+			},
+			(error: unknown) => {
+				signal.removeEventListener("abort", onAbort);
+				reject(error);
+			},
+		);
+	});
 }
 
 function isObject(value: unknown): value is Record<string, unknown> {
@@ -428,10 +537,33 @@ function isTelegramResult(value: unknown): value is { readonly ok: true; readonl
 }
 
 if (import.meta.main) {
-	loadTelegramAdapterConfig()
-		.then(startTelegramAdapter)
-		.catch((error) => {
-			console.error(error instanceof Error ? error.message : String(error));
-			process.exitCode = 1;
-		});
+	void (async () => {
+		const config = await loadTelegramAdapterConfig();
+		const client = await GajaewayClient.connectSocket(config.gatewaySocket ?? join(adapterHome(), "gateway.sock"));
+		const gateway: OpenGatewayClient = {
+			request: (verb, params) => client.request(verb, params),
+			onChatMessage: (handler) => client.on("chat.message", (payload) => handler(payload as ChatMessagePayload)),
+			open: async () => ({ replayed: 0 }),
+			close: () => client.close(),
+		};
+		const controller = new AbortController();
+		const gen: Generation = {
+			id: 1,
+			signal: controller.signal,
+			port: gateway,
+			track: (task) => task,
+			sleep: (ms) => abortableSleep(ms, controller.signal),
+		};
+		const handle = await startTelegramAdapter({ token: config.token }, gateway, adapterHome(), gen);
+		const stop = (): void => {
+			controller.abort();
+			void handle.stop();
+		};
+		process.once("SIGINT", stop);
+		process.once("SIGTERM", stop);
+		await handle.settled;
+	})().catch((error) => {
+		console.error(error instanceof Error ? error.message : String(error));
+		process.exitCode = 1;
+	});
 }

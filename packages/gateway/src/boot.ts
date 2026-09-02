@@ -1,6 +1,6 @@
 import { chmod, mkdir } from "node:fs/promises";
 import { join } from "node:path";
-import { type ConfigOverrides, loadConfig } from "./config";
+import { type ConfigOverrides, type GatewayConfig, loadConfig } from "./config";
 import { seedDefaultMonitors } from "./monitors/defaults";
 import { MonitorRegistry } from "./monitors/registry";
 import { BrokerSupervisor, type BrokerSupervisorDependencies } from "./orchestrator/broker";
@@ -12,17 +12,29 @@ import { type GatewayServer, startStdioServer, startUnixServer } from "./server/
 import { GatewayDatabase } from "./store/db";
 import { DeliveryLedger } from "./store/ledger";
 
-export interface BootGatewayOptions {
+export interface BootGatewayRuntimeOptions {
 	readonly stdio?: boolean;
 	readonly overrides?: ConfigOverrides;
 	/** Test/deployment seam for the broker command and lifecycle process. */
 	readonly broker?: BrokerSupervisorDependencies;
+	/** Composite daemon shutdown owner for the gateway.shutdown verb. */
+	readonly shutdown?: (reason: string) => Promise<void>;
+}
+
+export interface BootGatewayOptions extends BootGatewayRuntimeOptions {
 	/** Explicit home is useful for isolated boot tests; normal startup uses GAJAEWAY_HOME. */
 	readonly home?: string;
 }
 
 export async function bootGateway(options: BootGatewayOptions = {}): Promise<GatewayServer> {
 	const config = await loadConfig({ home: options.home, overrides: options.overrides });
+	return await bootGatewayFromConfig(config, options);
+}
+
+export async function bootGatewayFromConfig(
+	config: GatewayConfig,
+	options: BootGatewayRuntimeOptions = {},
+): Promise<GatewayServer> {
 	await mkdir(config.home, { recursive: true, mode: 0o700 });
 	await chmod(config.home, 0o700);
 	const database = await GatewayDatabase.open(config.dbPath);
@@ -75,6 +87,7 @@ export async function bootGateway(options: BootGatewayOptions = {}): Promise<Gat
 					startedAt,
 					onStop: close,
 					overrides: options.overrides,
+					shutdown: options.shutdown,
 				})
 			: await startUnixServer({
 					config,
@@ -85,6 +98,7 @@ export async function bootGateway(options: BootGatewayOptions = {}): Promise<Gat
 					startedAt,
 					onStop: close,
 					overrides: options.overrides,
+					shutdown: options.shutdown,
 				});
 		console.error(JSON.stringify({ recovery: { recovered: pending, pending, pruned } }));
 		return server;
