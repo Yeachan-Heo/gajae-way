@@ -1046,3 +1046,19 @@ test("responses larger than one socket buffer arrive intact (backpressure outbox
 	expect(message.payload.text).toBe(bigReply);
 	client.close();
 });
+
+test("every turn preamble carries the attachment-scope rule", async () => {
+	directory = await mkdtemp(join(tmpdir(), "gajaeway-server-"));
+	const config: GatewayConfig = { schemaVersion: 1, home: directory, configPath: join(directory, "config.json"), socketPath: join(directory, "gateway.sock"), dbPath: join(directory, "gateway.db"), logVerbosity: "info", dmPolicy: "open" as const, settleWindowMs: 0 };
+	const database = await GatewayDatabase.open(config.dbPath);
+	const preambles: string[] = [];
+	const sessionPort = sessionPortFromResponder({ respond: async (_s, _t, preamble) => { preambles.push(preamble ?? ""); return "ok"; } });
+	server = await startUnixServer({ config, database, sessionPort, onStop: () => database.close() });
+	const client = await connect(config.socketPath);
+	client.send({ v: "0.1", type: "hello", payload: { supportedVersions: ["0.1"] } });
+	await waitFor(client.frames, 1);
+	client.send({ v: "0.1", type: "request", id: "a", verb: "chat.send", params: { origin: { platform: "discord", kind: "dm", conversationId: "d-att", peerId: "owner" }, text: "hi", engagement: { mentioned: false, group: false, authorId: "owner" } } });
+	for (let attempt = 0; attempt < 400 && preambles.length === 0; attempt++) await Bun.sleep(10);
+	expect(preambles[0]).toContain("If the current message lists none, it has none");
+	client.close();
+});
