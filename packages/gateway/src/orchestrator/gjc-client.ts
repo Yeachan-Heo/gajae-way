@@ -360,7 +360,7 @@ export class GjcClient implements GjcPort {
 				"--json-input-stdin",
 			],
 			cwd: options?.cwd ?? this.#cwd,
-			stdin: new Response(JSON.stringify({ cwd: options?.cwd ?? this.#cwd })).body ?? "ignore",
+			stdin: new Response(JSON.stringify({ cwd: options?.cwd ?? this.#cwd, readinessTimeoutMs: 60_000 })).body ?? "ignore",
 			stdout: "pipe",
 			stderr: "pipe",
 			env: process.env as Record<string, string>,
