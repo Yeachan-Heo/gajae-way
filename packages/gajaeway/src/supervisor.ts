@@ -142,21 +142,25 @@ export class AdapterSupervisor {
 			[...this.#entries.values()].map(async (entry) => {
 				const generation = entry.current;
 				if (!generation) return;
+				// ONE absolute deadline per adapter covers both the pending factory and
+				// the handle disposal, so a late start cannot double the stop budget.
+				const deadline = this.#now() + this.#stopTimeoutMs;
+				const remaining = () => Math.max(0, deadline - this.#now());
 				if (!generation.handle && generation.start) {
-					// Wait (bounded) for the pending factory. #started/#failed observe the
-					// outcome and dispose; awaiting `disposed` afterwards joins that work.
+					// #started/#failed observe the outcome and dispose; awaiting
+					// `disposed` afterwards joins that work.
 					await completesBefore(
 						generation.start.then(
 							() => undefined,
 							() => undefined,
 						),
-						this.#stopTimeoutMs,
+						remaining(),
 					);
 					// Give the start observers a tick to attach `disposed`.
 					await Promise.resolve();
 				}
-				if (generation.disposed) await generation.disposed;
-				else if (generation.handle) await this.#dispose(entry, generation);
+				if (generation.disposed) await completesBefore(generation.disposed, remaining());
+				else if (generation.handle) await completesBefore(this.#dispose(entry, generation, remaining()), remaining());
 				else this.#log(`adapter_stop_timeout adapter=${entry.name}`);
 			}),
 		);
@@ -301,14 +305,14 @@ export class AdapterSupervisor {
 		void restart.catch(() => {});
 	}
 
-	async #dispose(entry: AdapterEntry, managed: ManagedGeneration): Promise<void> {
+	async #dispose(entry: AdapterEntry, managed: ManagedGeneration, budgetMs = this.#stopTimeoutMs): Promise<void> {
 		managed.disposed ??= (async () => {
 			managed.controller.abort();
 			const work = Promise.allSettled([
 				...(managed.handle ? [Promise.resolve().then(async () => await managed.handle?.stop())] : []),
 				this.#drainTracked(managed),
 			]).then(() => undefined);
-			const completed = await completesBefore(work, this.#stopTimeoutMs);
+			const completed = await completesBefore(work, budgetMs);
 			if (!completed) this.#log(`adapter_stop_timeout adapter=${entry.name}`);
 			managed.port.close();
 			this.#log(`adapter_stopped adapter=${entry.name} generation=${managed.id}`);
