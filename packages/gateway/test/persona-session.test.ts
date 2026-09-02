@@ -99,7 +99,8 @@ test("a message admitted while a persistent turn is running becomes an operator-
 	await manager?.notifyInbound(KEY);
 
 	expect(port.steers).toHaveLength(1);
-	expect(port.steers[0]).toMatchObject({ sessionId: port.sends[0]!.sessionId, text: "correction" });
+	expect(port.steers[0]).toMatchObject({ sessionId: port.sends[0]!.sessionId });
+	expect(port.steers[0]!.text.endsWith("\ncorrection")).toBe(true);
 	port.complete(port.sends[0]!.opRef, "done");
 	await eventually(
 		() => database?.inboundBatchRows(latestBatchKey)[0]?.batch_state === "done",
