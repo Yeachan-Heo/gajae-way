@@ -2,7 +2,7 @@
  "schemaVersion": 1,
  "kind": "api-package-test-report",
  "sourceHash": "see quality gate: computed over HEAD listed above",
- "head": "5de94585865baf365d231005af9a40c39fc5103b",
+ "head": "329aa34d4f27f90e8f55f82b1ee32788dfbeabfb",
  "command": "bun test packages/gateway/test/broker-supervisor.test.ts packages/gateway/test/terminal-idempotency.e2e.test.ts packages/gateway/test/tail-progress.test.ts packages/gateway/test/migration-drill.test.ts packages/adapter-discord/test/reactions.test.ts packages/adapter-discord/test/recovery.test.ts",
  "totals": {
   "tests": 104,
@@ -114,7 +114,7 @@
   },
   {
    "id": "M18",
-   "obligation": "schema 18 migration: dispatched_at first-bind immutability, per-part terminal claim",
+   "obligation": "schema 18 migration from a genuine v17 table: columns added, existing bound row untouched, first-bind floor, per-part claim, requeue clears",
    "verdict": "passed",
    "testSubstring": "migration 18 adds"
   },
