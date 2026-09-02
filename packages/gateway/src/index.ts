@@ -6,3 +6,4 @@ export { checkConfigFile, configCheckExitCode, defaultConfigPath, renderConfigCh
 export type { BrokerSupervisorDependencies } from "./orchestrator/broker";
 export { sanitizeDiagnostic } from "./orchestrator/rebind";
 export type { GatewayServer, LocalGatewayPort } from "./server/server";
+export { RESTART_EXIT_CODE } from "./server/server";

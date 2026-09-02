@@ -87,7 +87,10 @@ test("a mid-turn message issues one steer, keeps one send, and is attributed in 
 
 	expect(port.sends).toHaveLength(1);
 	expect(port.steers).toEqual([
-		expect.objectContaining({ sessionId: running.sessionId, text: expect.stringMatching(/^\[Additional message[^\n]*\]\nmention the rollback caveat$/) }),
+		expect.objectContaining({
+			sessionId: running.sessionId,
+			text: expect.stringMatching(/^\[Additional message[^\n]*\]\nmention the rollback caveat$/),
+		}),
 	]);
 	expect(port.tailFrames(running.sessionId)).toEqual(
 		expect.arrayContaining([

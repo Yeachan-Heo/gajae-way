@@ -1,6 +1,6 @@
 import { lstat } from "node:fs/promises";
 import { homedir } from "node:os";
-import { dirname, join } from "node:path";
+import { dirname, isAbsolute, join } from "node:path";
 import { type OriginRef, validateOriginRef } from "@gajaeway/protocol";
 
 export const CONFIG_SCHEMA_VERSION = 1;
@@ -200,6 +200,12 @@ function parseCredentials(value: unknown): Readonly<Record<string, CredentialFil
 		const credentialFile = optionalString(item.credentialFile, `credentials.${name}.credentialFile`);
 		if (!credentialFile || Object.keys(item).length !== 1) {
 			throw new ConfigError("config_invalid", `credentials.${name} must contain only credentialFile`);
+		}
+		if (!isAbsolute(credentialFile)) {
+			throw new ConfigError(
+				"config_invalid",
+				`credentials.${name}.credentialFile must be an absolute path (config.json is read by one process from one home; relative paths were resolved against the old adapter-*.json location)`,
+			);
 		}
 		if (paths.has(credentialFile)) {
 			throw new ConfigError(

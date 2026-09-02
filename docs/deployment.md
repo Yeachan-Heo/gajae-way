@@ -158,7 +158,7 @@ Stop the old units in ingress-to-core order: the Discord adapter unit, the Teleg
 
 | Before | `config.json` now |
 |---|---|
-| `adapter-discord.json.tokenFile` | `credentials.discord.credentialFile` |
+| `adapter-discord.json.tokenFile` | `credentials.discord.credentialFile` (must be absolute; the old loader resolved relative paths against the adapter JSON, which no longer exists) |
 | `voice.apiKeyFile` | `credentials.discordVoice.credentialFile` |
 | `intents` and `voice.*` | `adapters.discord.intents` and `adapters.discord.voice.*` |
 | `channels` | `channels["discord:<id>"]` |

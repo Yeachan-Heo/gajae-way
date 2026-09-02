@@ -130,13 +130,34 @@ export class AdapterSupervisor {
 		return this.#stopPromise;
 	}
 
-	/** Stops currently live handles; the daemon runs this alongside admin shutdown. */
+	/**
+	 * Stops currently live handles and JOINS in-flight starts: a factory that
+	 * resolves after stop() still produces a handle that must be torn down before
+	 * the daemon releases its lock, so the wait is bounded by the adapter deadline
+	 * and the late handle's disposal is awaited rather than fire-and-forget.
+	 */
 	async stopAdapters(): Promise<void> {
 		await this.stop();
 		await Promise.all(
 			[...this.#entries.values()].map(async (entry) => {
 				const generation = entry.current;
-				if (generation?.handle) await this.#dispose(entry, generation);
+				if (!generation) return;
+				if (!generation.handle && generation.start) {
+					// Wait (bounded) for the pending factory. #started/#failed observe the
+					// outcome and dispose; awaiting `disposed` afterwards joins that work.
+					await completesBefore(
+						generation.start.then(
+							() => undefined,
+							() => undefined,
+						),
+						this.#stopTimeoutMs,
+					);
+					// Give the start observers a tick to attach `disposed`.
+					await Promise.resolve();
+				}
+				if (generation.disposed) await generation.disposed;
+				else if (generation.handle) await this.#dispose(entry, generation);
+				else this.#log(`adapter_stop_timeout adapter=${entry.name}`);
 			}),
 		);
 	}

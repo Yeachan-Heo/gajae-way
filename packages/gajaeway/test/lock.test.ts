@@ -177,3 +177,39 @@ test("--only-new refuses a live holder immediately without polling", async () =>
 	).rejects.toThrow("--only-new");
 	expect(polls).toBe(1);
 });
+
+test("a stale lock replaced by a live owner between liveness proof and unlink is never clobbered", async () => {
+	const dir = await home();
+	const path = join(dir, "gajaeway.pid");
+	await writeFile(path, "9999\n");
+	// The reclaimer proves 9999 dead; while it is inside the reclaim window, a
+	// different daemon (2002) already re-claimed the file. Liveness for 2002 is
+	// "alive" so the reclaimer must observe the replacement and refuse.
+	let calls = 0;
+	const liveness = (pid: number): PidLiveness => {
+		if (pid === 9999) {
+			calls++;
+			// Simulate the replacement racing in right after the liveness proof.
+			void writeFile(path, "2002\n");
+			return "dead";
+		}
+		return "alive";
+	};
+	await expect(DaemonLock.acquire(dir, ports(1001, liveness))).rejects.toBeInstanceOf(DaemonLockRefusalError);
+	expect(calls).toBe(1);
+	expect((await readFile(path, "utf8")).trim()).toBe("2002");
+	expect(await Bun.file(`${path}.reclaim`).exists()).toBe(false);
+});
+
+test("a stale reclaim token blocks a second reclaimer instead of letting two unlink", async () => {
+	const dir = await home();
+	await writeFile(join(dir, "gajaeway.pid"), "9999\n");
+	await writeFile(join(dir, "gajaeway.pid.reclaim"), "1001\n");
+	await expect(
+		DaemonLock.acquire(
+			dir,
+			ports(1002, () => "dead"),
+		),
+	).rejects.toThrow("being reclaimed by another process");
+	expect((await readFile(join(dir, "gajaeway.pid"), "utf8")).trim()).toBe("9999");
+});

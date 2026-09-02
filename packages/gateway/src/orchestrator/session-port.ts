@@ -59,7 +59,11 @@ export interface SessionPort {
 	 * coordinates (gajae-code#5200); undefined when the newest row predates
 	 * the turn.
 	 */
-	fetchAssistantSince?(input: { sessionId: string; repo: string; notBeforeMs: number }): Promise<LastAssistantResult | undefined>;
+	fetchAssistantSince?(input: {
+		sessionId: string;
+		repo: string;
+		notBeforeMs: number;
+	}): Promise<LastAssistantResult | undefined>;
 	attachTail(input: TailAttachInput): Promise<TailHandle>;
 	runCompaction(input: SessionCompactionInput): Promise<{ readonly status: SessionCompactionStatus }>;
 	/** Presentation/recovery tick; it never kills a running SDK turn. */
@@ -457,15 +461,40 @@ export class BrokerSessionPort implements SessionPort {
 		return page !== undefined && Array.isArray(page.items) && page.items.length === 0 && page.complete === true;
 	}
 
-	async fetchAssistantSince(input: { sessionId: string; repo: string; notBeforeMs: number }): Promise<LastAssistantResult | undefined> {
-		const result = await this.#cli(["sdk", "session", "raw", "query", input.sessionId, "--query", "transcript.list", "--repo", input.repo, "--json-input", "{}"], { timeoutMs: 15_000 });
-		const rows = (JSON.parse(result.stdout) as { page?: { items?: Array<{ role?: string; ts?: string; textSummary?: string; body?: string }> } }).page?.items ?? [];
+	async fetchAssistantSince(input: {
+		sessionId: string;
+		repo: string;
+		notBeforeMs: number;
+	}): Promise<LastAssistantResult | undefined> {
+		const result = await this.#cli(
+			[
+				"sdk",
+				"session",
+				"raw",
+				"query",
+				input.sessionId,
+				"--query",
+				"transcript.list",
+				"--repo",
+				input.repo,
+				"--json-input",
+				"{}",
+			],
+			{ timeoutMs: 15_000 },
+		);
+		const rows =
+			(
+				JSON.parse(result.stdout) as {
+					page?: { items?: Array<{ role?: string; ts?: string; textSummary?: string; body?: string }> };
+				}
+			).page?.items ?? [];
 		const last = [...rows].reverse().find((row) => row.role === "assistant");
 		if (!last) return undefined;
 		const at = typeof last.ts === "string" ? Date.parse(last.ts) : Number.NaN;
 		// Clock skew tolerance: the host stamps rows; the status startedAt comes from the same host.
 		if (!Number.isFinite(at) || at + 2_000 < input.notBeforeMs) return undefined;
-		const text = (typeof last.textSummary === "string" && last.textSummary) || (typeof last.body === "string" ? last.body : "");
+		const text =
+			(typeof last.textSummary === "string" && last.textSummary) || (typeof last.body === "string" ? last.body : "");
 		return { text, pages: 1, complete: true };
 	}
 
