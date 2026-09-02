@@ -44,6 +44,26 @@ export function decideEngagement(
 	return { engaged: true };
 }
 
+/**
+ * Whether the persona should treat this message as addressed to it. Adapters
+ * report the raw `mentioned` fact only; an `open` channel counts as addressed
+ * for human authors under the CURRENT config, so an open→closed reload changes
+ * the notice on the next turn without an adapter restart.
+ */
+export function isAddressed(
+	origin: { readonly platform: string; readonly kind: string; readonly conversationId: string },
+	engagement: Partial<Pick<EngagementContext, "mentioned" | "group" | "authorIsBot">> | undefined,
+	config: GatewayConfig,
+): boolean {
+	if (engagement?.mentioned) return true;
+	if (origin.kind === "dm" || origin.platform === "loopback") return true;
+	if (!engagement?.group || engagement.authorIsBot) return false;
+	const configured =
+		config.channels?.[`${origin.platform}:${origin.conversationId}`] ??
+		(origin.platform === "discord" ? config.channels?.[origin.conversationId] : undefined);
+	return configured?.engagement === "open";
+}
+
 function ownerPeerId(config: GatewayConfig): string | undefined {
 	const owner = config.ownerTarget?.origin;
 	return owner && "peerId" in owner ? (owner as { peerId?: string }).peerId : undefined;

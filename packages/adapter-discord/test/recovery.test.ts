@@ -2,8 +2,8 @@ import { afterAll, beforeAll, expect, test } from "bun:test";
 import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import type { DiscordInboundMessage } from "../src/main";
-import { decideInbound, LruSet, monitorFailureDecision, ReconnectingGateway } from "../src/main";
+import type { DiscordInboundMessage, Generation } from "../src/main";
+import { DiscordGatewayLink, decideInbound, LruSet } from "../src/main";
 import {
 	classifyRecoveryFailure,
 	loadRecoveryCursors,
@@ -86,14 +86,10 @@ function fakeGateway() {
 }
 
 /** Mirrors the live path: adapter LRU + decideInbound + gateway durable dedupe. */
-function wiredDeliver(
-	gateway: ReturnType<typeof fakeGateway>,
-	lru: LruSet,
-	channels?: Record<string, { engagement?: "open" }>,
-) {
+function wiredDeliver(gateway: ReturnType<typeof fakeGateway>, lru: LruSet) {
 	return async (m: ReturnType<typeof message>) => {
 		if (!lru.addIfAbsent(m.id)) return "duplicate";
-		const engagement = decideInbound(m, bot, channels);
+		const engagement = decideInbound(m, bot);
 		if (!engagement) return "duplicate";
 		return gateway.send(m.id, engagement);
 	};
@@ -178,9 +174,9 @@ test("live/backfill race delivers exactly once by message id", async () => {
 	const gateway = fakeGateway();
 	const lru = new LruSet();
 	const channel = fakeChannel([message("400")]);
-	const deliver = wiredDeliver(gateway, lru, { "channel-1": { engagement: "open" } });
+	const deliver = wiredDeliver(gateway, lru);
 	// Live messageCreate wins the race; recovery replays the same id moments later.
-	const engagement = decideInbound(message("400"), bot, { "channel-1": { engagement: "open" } });
+	const engagement = decideInbound(message("400"), bot);
 	expect(gateway.send("400", engagement)).toBe("acked");
 	const outcome = await recoverConversation(channel, { cursor: "0", nowMs: 0, deliver });
 	expect(outcome.delivered).toBe(1);
@@ -268,24 +264,13 @@ test("gateway rejection is retried inside the pass and then persisted once", asy
 	expect(requests).toEqual(["chat.send", "chat.send"]);
 });
 
-test("cold-start recovery waits for both gateway client and Discord user", async () => {
+test("cold-start recovery waits for Discord user readiness", async () => {
 	const cursorPath = join(home, "cold-start", "recovery-cursor.json");
 	const inbound = message(snowflakeFromTimestamp(Date.now()));
 	let fetches = 0;
 	let botUser: unknown;
 	const channel = fakeChannel([inbound]);
-	const client = {
-		request: async () => ({}),
-		onChatMessage: () => () => {},
-	};
-	const config = {
-		tokenFile: "token",
-		token: "redacted",
-		configPath: "config",
-		channels: { "channel-1": {} },
-	} as const;
-	const gateway = new ReconnectingGateway(
-		"socket",
+	const gateway = recoveryLink(
 		{
 			channels: {
 				fetch: async () => {
@@ -294,12 +279,10 @@ test("cold-start recovery waits for both gateway client and Discord user", async
 				},
 			},
 		},
-		config,
-		undefined,
-		undefined,
+		{ request: async () => ({}) },
 		cursorPath,
+		["channel-1"],
 		() => botUser,
-		client as never,
 	);
 	await gateway.recoverMissedMessages();
 	expect(fetches).toBe(0);
@@ -384,25 +367,53 @@ test("cursor file survives an interrupted persist without truncation", async () 
 	expect(await loadRecoveryCursors(path)).toEqual(cursorState({ c: "777" }));
 });
 
-/** Fake gateway client + one fake Discord channel behind a real ReconnectingGateway. */
+/** Fake gateway client + one fake Discord channel behind a real DiscordGatewayLink. */
 function wiredGateway(
 	channel: RecoverableChannel,
 	client: { request: (verb: string, params?: unknown) => Promise<unknown> },
 	cursorPath: string,
 	channels: Record<string, Record<string, never>> = { "channel-1": {} },
 	getBotUser: () => unknown = () => bot,
-): ReconnectingGateway {
-	return new ReconnectingGateway(
-		"socket",
+): DiscordGatewayLink {
+	return recoveryLink(
 		{ channels: { fetch: async () => channel } },
-		{ tokenFile: "token", token: "redacted", configPath: "config", channels } as never,
+		client,
+		cursorPath,
+		Object.keys(channels),
+		getBotUser,
+	);
+}
+
+function recoveryLink(
+	discord: { channels: { fetch(id: string): Promise<unknown> } },
+	client: { request: (verb: string, params?: unknown) => Promise<unknown> },
+	cursorPath: string,
+	recoveryChannels: readonly string[],
+	getBotUser: () => unknown = () => bot,
+): DiscordGatewayLink {
+	return new DiscordGatewayLink(
+		{ request: client.request, onChatMessage: () => () => {} } as never,
+		discord,
+		{ token: "redacted", recoveryChannels, recoveryCursorPath: cursorPath },
 		undefined,
 		undefined,
 		cursorPath,
 		getBotUser,
-		{ ...client, onChatMessage: () => () => {} } as never,
 		async () => {},
+		undefined,
+		recoveryGeneration(),
 	);
+}
+
+function recoveryGeneration(): Generation {
+	const controller = new AbortController();
+	return {
+		id: 1,
+		signal: controller.signal,
+		port: {} as never,
+		track: (task) => task,
+		sleep: async () => {},
+	};
 }
 
 /**
@@ -795,21 +806,11 @@ test("a throwing history fetch leaves other channels recovered and arms a retry"
 			},
 		},
 	};
-	const gateway = new ReconnectingGateway(
-		"socket",
+	const gateway = recoveryLink(
 		{ channels: { fetch: async (id: string) => (id === "channel-broken" ? broken : healthy) } },
-		{
-			tokenFile: "token",
-			token: "redacted",
-			configPath: "config",
-			channels: { "channel-broken": {}, "channel-1": {} },
-		} as never,
-		undefined,
-		undefined,
+		{ request: async () => ({}) },
 		cursorPath,
-		() => bot,
-		{ request: async () => ({}), onChatMessage: () => () => {} } as never,
-		async () => {},
+		["channel-broken", "channel-1"],
 	);
 	await gateway.recoverMissedMessages();
 	await settle();
@@ -840,25 +841,15 @@ test("one channel's unexpected throw leaves later channels recovered and arms a 
 	const poisonOrigin = message(snowflakeFromTimestamp(Date.now() - 120_000), {
 		channel: { id: "channel-broken", isThread: () => true, parentId: null },
 	} as Partial<DiscordInboundMessage>);
-	const gateway = new ReconnectingGateway(
-		"socket",
+	const gateway = recoveryLink(
 		{
 			channels: {
 				fetch: async (id: string) => (id === "channel-broken" ? fakeChannel([poisonOrigin]) : fakeChannel([inbound])),
 			},
 		},
-		{
-			tokenFile: "token",
-			token: "redacted",
-			configPath: "config",
-			channels: { "channel-broken": {}, "channel-1": {} },
-		} as never,
-		undefined,
-		undefined,
+		{ request: async () => ({}) },
 		cursorPath,
-		() => bot,
-		{ request: async () => ({}), onChatMessage: () => () => {} } as never,
-		async () => {},
+		["channel-broken", "channel-1"],
 	);
 	await gateway.recoverMissedMessages();
 	await settle();
@@ -1074,22 +1065,12 @@ test("ledger cap eviction preserves the active head-of-line entry", () => {
 test("a channel that lost access marks the pass incomplete and leaves its cursor alone", async () => {
 	const cursorPath = join(home, "lost-access", "recovery-cursor.json");
 	const inbound = message(snowflakeFromTimestamp(Date.now() - 60_000));
-	const gateway = new ReconnectingGateway(
-		"socket",
+	const gateway = recoveryLink(
 		// A deleted channel / revoked permission resolves to nothing fetchable.
 		{ channels: { fetch: async (id: string) => (id === "channel-gone" ? null : fakeChannel([inbound])) } },
-		{
-			tokenFile: "token",
-			token: "redacted",
-			configPath: "config",
-			channels: { "channel-gone": {}, "channel-1": {} },
-		} as never,
-		undefined,
-		undefined,
+		{ request: async () => ({}) },
 		cursorPath,
-		() => bot,
-		{ request: async () => ({}), onChatMessage: () => () => {} } as never,
-		async () => {},
+		["channel-gone", "channel-1"],
 	);
 	await gateway.recoverMissedMessages();
 	await settle();
@@ -1098,12 +1079,6 @@ test("a channel that lost access marks the pass incomplete and leaves its cursor
 	expect(state.recoveredThrough["channel-gone"]).toBeUndefined();
 	expect(state.quarantined["channel-gone"]).toBeUndefined();
 	expect(gateway.recoveryRetryPending).toBe(true);
-});
-
-test("gateway liveness monitor reconnects only after three consecutive status failures", () => {
-	expect(monitorFailureDecision(0)).toEqual({ action: "retry", strikes: 1 });
-	expect(monitorFailureDecision(1)).toEqual({ action: "retry", strikes: 2 });
-	expect(monitorFailureDecision(2)).toEqual({ action: "reconnect" });
 });
 
 test("a rejected engagement.reaction is logged, never a reconnect (live: 313 reconnects replaying one poisoned delivery)", async () => {

@@ -40,7 +40,7 @@ import {
 import { type ConfigOverrides, type GatewayConfig, type ReloadResult, reloadConfig } from "../config";
 import { DeliveryService } from "../delivery/delivery";
 import { ReactionBudget } from "../delivery/reaction-budget";
-import { decideEngagement } from "../engagement/policy";
+import { decideEngagement, isAddressed } from "../engagement/policy";
 import { ACTION_GUARD_SYSTEM_NOTICE } from "../guard/action-guard";
 import { autolinkCorpus } from "../memory/autolink";
 import { MemoryClosureQueue } from "../memory/closure";
@@ -181,8 +181,19 @@ interface Connection {
 	close(): void;
 	settle(): Promise<void>;
 }
+export interface LocalGatewayPort {
+	readonly label: string;
+	request<T = unknown>(verb: string, params?: unknown): Promise<T>;
+	on(event: string, handler: (payload: unknown) => void): () => void;
+	/** Unopened -> open. Replays reach handlers registered before this call. */
+	open(): Promise<{ readonly replayed: number }>;
+	/** Any state -> closed. Idempotent; admitted server work continues draining. */
+	close(): void;
+}
+
 export interface GatewayServer {
 	stop(reason?: string): Promise<void>;
+	attach(label: string): LocalGatewayPort;
 }
 
 async function settleConnection(connection: Connection, timeoutMs: number): Promise<void> {
@@ -224,6 +235,8 @@ export interface GatewayServerOptions {
 	readonly stallCheckIntervalMs?: number;
 	/** Mid-work speech pacing (issue #71). */
 	readonly interimSpeech?: Partial<InterimSpeechLimits>;
+	/** Composite daemon shutdown owner. When absent, gateway.shutdown stops this server directly. */
+	readonly shutdown?: (reason: string) => Promise<void>;
 }
 interface InboundContext {
 	readonly turnId: string;
@@ -378,15 +391,8 @@ export async function startUnixServer(options: GatewayServerOptions): Promise<Ga
 			data(socket, data) {
 				const connection = socket.data.connection;
 				try {
-					for (const frame of connection.decoder.feed(Buffer.from(data).toString())) {
-						const task = handleFrame(connection, frame, options, runtime, stop, () => stopping);
-						if (frame.type === "request" && frame.verb === "gateway.shutdown") continue;
-						runtime.requests.add(task);
-						void task.then(
-							() => runtime.requests.delete(task),
-							() => runtime.requests.delete(task),
-						);
-					}
+					for (const frame of connection.decoder.feed(Buffer.from(data).toString()))
+						admit(connection, frame, options, runtime, stop, () => stopping);
 				} catch (error) {
 					writeError(connection, error);
 				}
@@ -404,7 +410,7 @@ export async function startUnixServer(options: GatewayServerOptions): Promise<Ga
 			},
 		},
 	});
-	return { stop };
+	return { stop, attach: (label) => attachLocalPort(label, options, runtime, stop, () => stopping) };
 }
 
 export function startStdioServer(options: GatewayServerOptions): GatewayServer {
@@ -458,22 +464,13 @@ export function startStdioServer(options: GatewayServerOptions): GatewayServer {
 	runtime.stop = stop;
 	process.stdin.on("data", (data: Buffer) => {
 		try {
-			for (const frame of connection.decoder.feed(data.toString())) {
-				const task = handleFrame(connection, frame, options, runtime, stop, () => stopping);
-				// Same guard as the Unix server: the shutdown request awaits stop(),
-				// which awaits runtime.requests, so tracking it would self-await forever.
-				if (frame.type === "request" && frame.verb === "gateway.shutdown") continue;
-				runtime.requests.add(task);
-				task.then(
-					() => runtime.requests.delete(task),
-					() => runtime.requests.delete(task),
-				);
-			}
+			for (const frame of connection.decoder.feed(data.toString()))
+				admit(connection, frame, options, runtime, stop, () => stopping);
 		} catch (error) {
 			writeError(connection, error);
 		}
 	});
-	return { stop };
+	return { stop, attach: (label) => attachLocalPort(label, options, runtime, stop, () => stopping) };
 }
 
 /**
@@ -637,6 +634,163 @@ function settleMonitorBatch(database: GatewayDatabase, deliveryId: string, stage
 	});
 }
 
+function admit(
+	connection: Connection,
+	frame: Frame,
+	options: GatewayServerOptions,
+	runtime: Runtime,
+	stop: (reason?: string) => Promise<void>,
+	isStopping: () => boolean,
+): void {
+	const task = handleFrame(connection, frame, options, runtime, stop, isStopping);
+	// A shutdown request awaits stop(), which awaits runtime.requests. Tracking it
+	// would make the stop path await itself.
+	if (frame.type === "request" && frame.verb === "gateway.shutdown") return;
+	runtime.requests.add(task);
+	void task.then(
+		() => runtime.requests.delete(task),
+		() => runtime.requests.delete(task),
+	);
+}
+
+function attachLocalPort(
+	label: string,
+	options: GatewayServerOptions,
+	runtime: Runtime,
+	stop: (reason?: string) => Promise<void>,
+	isStopping: () => boolean,
+): LocalGatewayPort {
+	type PendingRequest = {
+		readonly resolve: (value: unknown) => void;
+		readonly reject: (reason?: unknown) => void;
+	};
+
+	let state: "unopened" | "open" | "closed" = "unopened";
+	let opening = false;
+	let replayed = 0;
+	let connection!: Connection;
+	const handlers = new Map<string, Set<(payload: unknown) => void>>();
+	const pending = new Map<string, PendingRequest>();
+
+	const close = () => {
+		if (state === "closed") return;
+		state = "closed";
+		runtime.connections.delete(connection);
+		for (const request of pending.values()) request.reject(new Error(`local port ${label} closed`));
+		pending.clear();
+	};
+
+	const handlerError = (event: string, error: unknown) =>
+		console.error(`local_port_handler_error connection=${label} event=${event} error=${diagnostic(error)}`);
+
+	connection = {
+		decoder: new FrameDecoder(),
+		negotiated: false,
+		write: (frame) => {
+			if (state === "closed") return;
+			try {
+				const cloned = cloneLocalFrame(frame);
+				if (opening && cloned.type === "event" && cloned.event === "chat.message") replayed++;
+				switch (cloned.type) {
+					case "response": {
+						const request = pending.get(cloned.id);
+						if (!request) return;
+						pending.delete(cloned.id);
+						request.resolve(cloned.result);
+						return;
+					}
+					case "error": {
+						const request = cloned.id ? pending.get(cloned.id) : undefined;
+						if (!request || !cloned.id) return;
+						pending.delete(cloned.id);
+						request.reject(new ProtocolError(cloned.error.code, cloned.error.message, cloned.error.detail));
+						return;
+					}
+					case "event": {
+						const eventHandlers = handlers.get(cloned.event);
+						if (!eventHandlers) return;
+						for (const handler of [...eventHandlers]) {
+							try {
+								const result = (handler as (payload: unknown) => unknown)(cloned.payload);
+								if (result instanceof Promise) void result.catch((error: unknown) => handlerError(cloned.event, error));
+							} catch (error) {
+								handlerError(cloned.event, error);
+							}
+						}
+						return;
+					}
+					default:
+						return;
+				}
+			} catch (error) {
+				console.error(`local_port_write_error connection=${label} error=${diagnostic(error)}`);
+			}
+		},
+		close,
+		settle: async () => {},
+	};
+	runtime.connections.add(connection);
+
+	return {
+		label,
+		request<T = unknown>(verb: string, params?: unknown): Promise<T> {
+			if (state === "unopened") return Promise.reject(new Error(`local port ${label} not open`));
+			if (state === "closed") return Promise.reject(new Error(`local port ${label} closed`));
+			const id = crypto.randomUUID();
+			return new Promise<T>((resolve, reject) => {
+				pending.set(id, { resolve: resolve as (value: unknown) => void, reject });
+				try {
+					admit(
+						connection,
+						cloneLocalFrame({ v: PROFILE_VERSION, type: "request", id, verb, params }),
+						options,
+						runtime,
+						stop,
+						isStopping,
+					);
+				} catch (error) {
+					pending.delete(id);
+					reject(error);
+				}
+			});
+		},
+		on(event: string, handler: (payload: unknown) => void): () => void {
+			const eventHandlers = handlers.get(event) ?? new Set<(payload: unknown) => void>();
+			eventHandlers.add(handler);
+			handlers.set(event, eventHandlers);
+			return () => {
+				eventHandlers.delete(handler);
+				if (eventHandlers.size === 0) handlers.delete(event);
+			};
+		},
+		async open(): Promise<{ readonly replayed: number }> {
+			if (state === "open") throw new Error(`local port ${label} already open`);
+			if (state === "closed") throw new Error(`local port ${label} closed`);
+			const hello = cloneLocalFrame({
+				v: PROFILE_VERSION,
+				type: "hello",
+				payload: { supportedVersions: [PROFILE_VERSION] },
+			});
+			state = "open";
+			opening = true;
+			try {
+				await handleFrame(connection, hello, options, runtime, stop, isStopping);
+			} finally {
+				opening = false;
+			}
+			console.error(`local_port_open connection=${label} replayed=${replayed}`);
+			return { replayed };
+		},
+		close,
+	};
+}
+
+function cloneLocalFrame(frame: Frame): Frame {
+	const encoded = JSON.stringify(frame);
+	if (encoded === undefined) throw new Error("local port frame is not serializable");
+	return JSON.parse(encoded) as Frame;
+}
+
 async function handleFrame(
 	connection: Connection,
 	frame: Frame,
@@ -707,7 +861,7 @@ async function handleRequest(
 			return;
 		case "gateway.shutdown":
 			connection.write({ v: PROFILE_VERSION, type: "response", id: request.id, result: { stopping: true } });
-			await stop();
+			await (options.shutdown ?? stop)("gateway.shutdown verb");
 			return;
 		case "gateway.reloadConfig": {
 			// Same implementation as SIGHUP; the console gets it without signals.
@@ -1598,7 +1752,7 @@ async function createInboundTurnLifecycle(
 			: undefined;
 	const systemPreamble = [
 		await runtime.persona.systemPreamble(),
-		currentConversationNotice(origin, engagement),
+		currentConversationNotice(origin, isAddressed(origin, engagement, runtime.config)),
 		...(bootstrap ? [bootstrap.text] : []),
 		ATTACHMENT_SCOPE_NOTICE,
 		ACTION_GUARD_SYSTEM_NOTICE,
@@ -1970,7 +2124,7 @@ function broadcastDelivery(runtime: Runtime, payload: ChatMessagePayload): void 
  * tell which conversation it was in and imported other origins' memory as if
  * it had been said here).
  */
-function currentConversationNotice(origin: OriginRef, engagement?: { mentioned?: boolean }): string {
+function currentConversationNotice(origin: OriginRef, addressed: boolean): string {
 	const where =
 		origin.kind === "dm"
 			? `a PRIVATE direct-message conversation (${origin.platform} DM ${origin.conversationId}, peer ${origin.peerId})`
@@ -1983,7 +2137,7 @@ function currentConversationNotice(origin: OriginRef, engagement?: { mentioned?:
 		`Shared memory (memory/daily and canonical axes) records EVERY conversation, each entry tagged with its origin. Entries whose canonical origin key differs from ${originKey(origin)} happened elsewhere: treat them as background knowledge only, never as something said here, and do not import their topics or in-flight work into this conversation unprompted.`,
 		...(origin.kind !== "dm" && origin.kind !== "loopback"
 			? [
-					engagement?.mentioned
+					addressed
 						? "You were explicitly addressed here: reply."
 						: "You were NOT addressed: you are listening in on a room. Unless this message clearly needs you or adds real value for you to answer, reply with exactly [SILENT] and nothing else — that suppresses delivery while the message stays recorded. Do not respond to every message.",
 				]

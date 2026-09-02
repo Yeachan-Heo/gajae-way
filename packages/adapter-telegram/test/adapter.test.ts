@@ -91,20 +91,21 @@ test("deduplicates update ids durably before sending an inbound turn", async () 
 	const home = await temporaryHome();
 	try {
 		const state = await TelegramAdapterState.load(home);
-		const adapter = new TelegramAdapter(state, "agent", "900", { chats: {} });
+		const adapter = new TelegramAdapter(state, "agent", "900");
 		const requests: Array<{ verb: string; params: unknown }> = [];
 		const gateway = mockGateway(requests);
 		const update: TelegramUpdate = { update_id: 81, message: topicMessage };
 		expect(await adapter.handleUpdate(gateway, update)).toBe(true);
 		expect(await adapter.handleUpdate(gateway, update)).toBe(false);
 		expect(requests).toHaveLength(1);
-		const restarted = new TelegramAdapter(await TelegramAdapterState.load(home), "agent", "900", { chats: {} });
+		const restarted = new TelegramAdapter(await TelegramAdapterState.load(home), "agent", "900");
 		expect(await restarted.handleUpdate(gateway, update)).toBe(false);
 		expect(requests).toHaveLength(1);
 		expect(requests[0]?.params).toEqual({
 			origin: { platform: "telegram", kind: "topic", conversationId: "-100123.99", parentId: "-100123" },
 			text: "hello @agent",
 			engagement: { mentioned: true, group: true, authorId: "42" },
+			messageId: "telegram:900:update:81",
 		});
 	} finally {
 		await rm(home, { recursive: true, force: true });

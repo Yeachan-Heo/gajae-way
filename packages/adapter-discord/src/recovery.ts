@@ -1,6 +1,5 @@
 import { mkdir, open, readFile, rename } from "node:fs/promises";
 import { dirname, join } from "node:path";
-import { adapterHome } from "./config";
 import type { DiscordInboundMessage } from "./main";
 
 /**
@@ -103,7 +102,7 @@ const EMPTY_STATE: RecoveryCursorState = {
 	sequence: 0,
 };
 
-export function recoveryCursorPath(home: string = adapterHome()): string {
+export function recoveryCursorPath(home: string): string {
 	return join(home, "adapters", "discord", "recovery-cursor.json");
 }
 

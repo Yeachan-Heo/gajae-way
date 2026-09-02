@@ -21,6 +21,8 @@ export interface ConfigCheckOk {
 	readonly path: string;
 	readonly channels: readonly string[];
 	readonly openChannels: readonly string[];
+	/** Enabled in-process adapters, in declaration order. */
+	readonly adapters: readonly string[];
 }
 
 export interface ConfigCheckFailure {
@@ -54,11 +56,13 @@ export async function checkConfigFile(path: string): Promise<ConfigCheckResult> 
 	try {
 		const config = parseConfigFile(parsed);
 		const channels = Object.keys(config.channels ?? {});
+		const adapters = Object.keys(config.adapters ?? {});
 		return {
 			ok: true,
 			path,
 			channels,
 			openChannels: channels.filter((id) => config.channels?.[id]?.engagement === "open"),
+			adapters,
 		};
 	} catch (error) {
 		return {
@@ -73,9 +77,13 @@ export async function checkConfigFile(path: string): Promise<ConfigCheckResult> 
 export function renderConfigCheck(result: ConfigCheckResult): string[] {
 	if (!result.ok) return [`FAIL ${result.path}`, `  ${result.code}: ${result.message}`];
 	const mentionOnly = result.channels.length - result.openChannels.length;
+	const perPlatform = ["discord", "telegram"]
+		.map((platform) => `${platform} ${result.channels.filter((id) => id.startsWith(`${platform}:`)).length}`)
+		.join(", ");
 	return [
 		`OK ${result.path}`,
-		`  channels: ${result.channels.length} (open ${result.openChannels.length}, mention-only ${mentionOnly})`,
+		`  adapters: ${result.adapters.length === 0 ? "none" : result.adapters.join(", ")}`,
+		`  channels: ${result.channels.length} (open ${result.openChannels.length}, mention-only ${mentionOnly}; ${perPlatform})`,
 		"  channel policy applies at gateway start only: restart, then confirm the new pid started after this file's mtime.",
 	];
 }

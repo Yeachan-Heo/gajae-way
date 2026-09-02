@@ -623,7 +623,7 @@ test("/restart is owner-only and triggers an ordered gateway stop after acknowle
 	server = undefined;
 });
 
-test("group turns carry silence guidance: listeners are told to default to [SILENT]", async () => {
+test("open-room turns are addressed under gateway-owned gating; a [SILENT] reply still suppresses delivery", async () => {
 	directory = await mkdtemp(join(tmpdir(), "gajaeway-server-"));
 	const config: GatewayConfig = {
 		schemaVersion: 1,
@@ -661,8 +661,11 @@ test("group turns carry silence guidance: listeners are told to default to [SILE
 		},
 	});
 	for (let attempt = 0; attempt < 400 && preambles.length === 0; attempt++) await Bun.sleep(5);
-	expect(preambles[0]).toContain("You were NOT addressed");
-	expect(preambles[0]).toContain("[SILENT]");
+	// The gateway derives "addressed" from live config: an open room engages
+	// humans without a mention, so the persona is told to reply rather than
+	// listen in. Adapters no longer fake `mentioned` to get this effect.
+	expect(preambles[0]).toContain("You were explicitly addressed here");
+	expect(preambles[0]).not.toContain("You were NOT addressed");
 	// The silence-token reply suppresses delivery: no chat.message event arrives.
 	await Bun.sleep(50);
 	expect(client.frames.filter((frame) => frame.type === "event" && frame.event === "chat.message")).toHaveLength(0);
