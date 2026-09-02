@@ -1710,32 +1710,13 @@ async function createInboundTurnLifecycle(
 		for (const recipient of runtime.connections)
 			if (recipient.negotiated) recipient.write({ v: PROFILE_VERSION, type: "event", event: "chat.progress", payload });
 	};
-	// Session-cumulative counters at turn start; progress reports the delta for THIS turn.
-	let baseline: { toolCalls: number; outputTokens: number } | undefined;
-	let polling = false;
-	const pollProgress = async () => {
-		if (polling || !options.sessionPort.progress) return;
-		polling = true;
-		try {
-			const snapshot = await options.sessionPort.progress({
-				sessionId: input.sessionId,
-				repo: join(options.config.home, "workspace"),
-			});
-			if (!snapshot) return;
-			baseline ??= snapshot;
-			lastKnown = {
-				toolCalls: Math.max(lastKnown.toolCalls, snapshot.toolCalls - baseline.toolCalls),
-				outputTokens: Math.max(lastKnown.outputTokens, snapshot.outputTokens - baseline.outputTokens),
-			};
-		} finally {
-			polling = false;
-		}
-	};
-	void pollProgress();
+	// Counters come only from the live tail (onFrame): tool_activity frames and
+	// finalized assistant text. gjc 0.16.0's stream carries no token counters,
+	// and polling transcript.list/usage.get cost two gjc spawns (~1s CPU each)
+	// every interval per running turn, which starved the broker health probe
+	// under load. The heartbeat now only re-presents the last tail observation.
 	const heartbeat = setInterval(() => {
-		void pollProgress().then(() => {
-			if (tailActivitySeen) emitProgress(lastKnown);
-		});
+		if (tailActivitySeen) emitProgress(lastKnown);
 	}, intervalMs);
 	const endProgress = () => {
 		if (ended) return;
