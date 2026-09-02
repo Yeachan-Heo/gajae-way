@@ -610,13 +610,14 @@ export class BrokerSupervisor implements PersonaBroker {
 
 /**
  * The persona turn model is "always steer, never interrupt the conversation":
- * every mid-turn message must reach the running turn immediately. gjc's own
- * defaults (`steeringMode: one-at-a-time`, `interruptMode: wait`) would queue
- * steers and defer them past tool calls, so the private agent dir is pinned to
- * `steeringMode: all` / `interruptMode: immediate`. Other operator settings in
+ * every mid-turn message must reach the running turn. gjc's `steeringMode:
+ * one-at-a-time` would queue steers, so it is pinned to `all`. `interruptMode`
+ * is pinned to `wait`: gjc's `immediate` re-checks steers after every tool
+ * call and can derail a tool chain mid-flight (upstream behavior), so steers
+ * are folded in at turn boundaries instead. Other operator settings in
  * config.yml are left untouched.
  */
-export const STEERING_DEFAULTS: Readonly<Record<string, string>> = { steeringMode: "all", interruptMode: "immediate" };
+export const STEERING_DEFAULTS: Readonly<Record<string, string>> = { steeringMode: "all", interruptMode: "wait" };
 
 export async function ensureSteeringDefaults(agentDir: string): Promise<void> {
 	const path = join(agentDir, "config.yml");

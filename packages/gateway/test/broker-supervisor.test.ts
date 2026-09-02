@@ -350,7 +350,7 @@ test("an explicit agent dir is supervised in place so pre-cutover sessions are a
 
 
 
-test("start pins steeringMode=all and interruptMode=immediate in the private agent dir without touching other keys", async () => {
+test("start pins steeringMode=all and interruptMode=wait in the private agent dir without touching other keys", async () => {
 	const home = await temporaryHome("gajaeway-broker-steering-");
 	const broker = new BrokerSupervisor({ home, instanceId: "instance-steer", command: async () => HEALTHY, healthIntervalMs: 60_000 });
 	await mkdir(broker.agentDir, { recursive: true });
@@ -359,7 +359,7 @@ test("start pins steeringMode=all and interruptMode=immediate in the private age
 		await broker.start();
 		const text = await readFile(join(broker.agentDir, "config.yml"), "utf8");
 		expect(text).toContain("steeringMode: all");
-		expect(text).toContain("interruptMode: immediate");
+		expect(text).toContain("interruptMode: wait");
 		expect(text).toContain("followUpMode: one-at-a-time");
 		expect(text).toContain("default: x/y");
 		expect(text.match(/steeringMode:/g)).toHaveLength(1);
