@@ -81,19 +81,19 @@ test("a mid-turn message issues one steer, keeps one send, and is attributed in 
 	enqueue("correction", "mention the rollback caveat");
 	await manager.notifyInbound(ORIGIN_KEY);
 	await eventually(
-		() => observedTailText.includes("mention the rollback caveat"),
+		() => observedTailText.some((text) => text.endsWith("\nmention the rollback caveat")),
 		"steer echo did not reach the running tail",
 	);
 
 	expect(port.sends).toHaveLength(1);
 	expect(port.steers).toEqual([
-		expect.objectContaining({ sessionId: running.sessionId, text: "mention the rollback caveat" }),
+		expect.objectContaining({ sessionId: running.sessionId, text: expect.stringMatching(/^\[Additional message[^\n]*\]\nmention the rollback caveat$/) }),
 	]);
 	expect(port.tailFrames(running.sessionId)).toEqual(
 		expect.arrayContaining([
 			expect.objectContaining({
 				steerEcho: true,
-				payload: { role: "user", content: [{ text: "mention the rollback caveat" }] },
+				payload: { role: "user", content: [{ text: expect.stringMatching(/\nmention the rollback caveat$/) }] },
 			}),
 		]),
 	);
