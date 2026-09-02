@@ -112,6 +112,7 @@ const DEFAULT_STALL_TIMEOUT_MS = 120_000;
 const DEFAULT_POLL_TIMEOUT_MS = 30_000;
 const DEFAULT_POLL_INTERVAL_MS = 250;
 const UNKNOWN_KIND_DIAGNOSTIC_CAP = 20;
+const STREAM_REOPEN_GIVE_UP = 6;
 
 export class TailCapacityError extends Error {
 	constructor() {
@@ -512,6 +513,7 @@ class ManagedTailHandle implements TailHandle {
 	}
 
 	#stream: TailStream | undefined;
+	#reopenFailures = 0;
 
 	async #run(): Promise<void> {
 		const spawner = this.#runner.streamSpawner;
@@ -572,6 +574,7 @@ class ManagedTailHandle implements TailHandle {
 			if (this.#closed || this.#pausedForGap) return;
 			const stream = spawner(this.sessionId);
 			this.#stream = stream;
+			const openedAt = this.#runner.now();
 			try {
 				for await (const line of stream.lines) {
 					if (this.#closed) break;
@@ -585,8 +588,20 @@ class ManagedTailHandle implements TailHandle {
 				stream.close();
 			}
 			if (this.#closed || this.#pausedForGap) return;
-			this.#input.onDiagnostic?.(`tail_stream_reopen session=${this.sessionId}`);
-			await this.#runner.sleep(this.#runner.pollIntervalMs);
+			// A relay that ends immediately (endpoint_stale: the host died) must not
+			// spin. Back off exponentially; after the cap, surface a retention gap
+			// so the actor reconciles via status and rebinds instead of waiting on
+			// a dead endpoint forever.
+			const sinceOpen = this.#runner.now() - openedAt;
+			this.#reopenFailures = sinceOpen < 5_000 ? this.#reopenFailures + 1 : 0;
+			if (this.#reopenFailures >= STREAM_REOPEN_GIVE_UP) {
+				this.#input.onDiagnostic?.(`tail_stream_dead session=${this.sessionId} reopens=${this.#reopenFailures}`);
+				await this.retentionGap({ resync: { revision: 0, generation: 0, seq: 0 } });
+				return;
+			}
+			const backoff = Math.min(30_000, this.#runner.pollIntervalMs * 2 ** this.#reopenFailures);
+			this.#input.onDiagnostic?.(`tail_stream_reopen session=${this.sessionId} backoffMs=${backoff}`);
+			await this.#runner.sleep(backoff);
 		}
 	}
 }
