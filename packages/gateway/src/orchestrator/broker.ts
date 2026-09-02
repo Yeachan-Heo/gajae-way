@@ -91,6 +91,17 @@ const DEFAULT_HEALTH_INTERVAL_MS = 5_000;
 const DEFAULT_HEALTH_PROBE_TIMEOUT_MS = 10_000;
 /** Consecutive failed periodic probes before a generation is fenced. A single slow probe under load must not retire every live turn. */
 const HEALTH_FAILURE_STRIKES = 3;
+/** Concurrent `gjc sdk` invocations per gateway; more only multiplies daemon spawn races. */
+const MAX_CONCURRENT_CLI = 4;
+/** How long a non-probe invocation waits for a fenced generation to recover before failing. */
+const BROKER_WAIT_MS = 60_000;
+
+export class GjcCliUnavailableError extends Error {
+	readonly code = "broker_unavailable";
+	constructor(message: string) {
+		super(`gjc sdk request failed: broker_unavailable (${message})`);
+	}
+}
 const DEFAULT_COMMAND_TIMEOUT_MS = 30_000;
 // The first agent-dir-scoped command auto-starts gjc's own broker daemon; give
 // its lifecycle launcher a moment to converge after the first successful probe.
@@ -622,7 +633,45 @@ export class BrokerSupervisor implements PersonaBroker {
 		return { lines, close };
 	}
 
+	/**
+	 * Every `gjc sdk` invocation that cannot reach the daemon auto-spawns a
+	 * detached broker. N concurrent invocations during an outage therefore race
+	 * to spawn N brokers, wedge the lock tree with quarantine tombstones, and the
+	 * daemon never comes back (live: 14 brokers on one agent dir). Two fences:
+	 * a hard cap on concurrent invocations, and while no generation is active only
+	 * the health probe runs; everything else waits for the observed recovery.
+	 */
+	#inflight = 0;
+	readonly #cliQueue: Array<() => void> = [];
+
+	async #acquireCliSlot(args: readonly string[]): Promise<void> {
+		const isProbe = args.includes("list") && args.includes("--scope");
+		if (!isProbe) {
+			const deadline = Date.now() + BROKER_WAIT_MS;
+			while (!this.#active && !this.#stopping && this.#generation > 0) {
+				if (Date.now() >= deadline) throw new GjcCliUnavailableError("broker generation fenced; daemon has not recovered");
+				await new Promise<void>((resolve) => setTimeout(resolve, 250));
+			}
+		}
+		if (this.#inflight >= MAX_CONCURRENT_CLI) await new Promise<void>((resolve) => this.#cliQueue.push(resolve));
+		this.#inflight++;
+	}
+
+	#releaseCliSlot(): void {
+		this.#inflight--;
+		this.#cliQueue.shift()?.();
+	}
+
 	async #runCommand(args: readonly string[], options?: { readonly timeoutMs?: number }): Promise<CliResult> {
+		await this.#acquireCliSlot(args);
+		try {
+			return await this.#runCommandUnfenced(args, options);
+		} finally {
+			this.#releaseCliSlot();
+		}
+	}
+
+	async #runCommandUnfenced(args: readonly string[], options?: { readonly timeoutMs?: number }): Promise<CliResult> {
 		const agentDir = args.includes("--agent-dir") ? this.agentDir : undefined;
 		const child = this.#spawn({
 			cmd: ["gjc", ...args],
