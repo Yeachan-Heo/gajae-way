@@ -1,4 +1,5 @@
-import { chmod, mkdir, open, readFile, rename, unlink, writeFile } from "node:fs/promises";
+import { chmod, cp, mkdir, open, readFile, rename, unlink, writeFile } from "node:fs/promises";
+import { homedir } from "node:os";
 import { join } from "node:path";
 import type { CliResult, CliRunner } from "@gajaeway/subsession";
 import { sanitizeDiagnostic } from "./rebind";
@@ -45,6 +46,12 @@ export interface BrokerSupervisorOptions {
 	 * never adopted; every origin binds a fresh session on first use.
 	 */
 	readonly agentDir?: string;
+	/**
+	 * Operator SSOT for provider/model configuration (`models.yml`,
+	 * `model-presets/`, `config.yml`). Defaults to `~/.gjc/agent`. Seeded into the
+	 * private agent dir on every start; set to `null` to disable seeding (tests).
+	 */
+	readonly ssotAgentDir?: string | null;
 	/** Process seam for gjc command execution; production uses Bun.spawn bound to Bun. */
 	readonly spawn?: SpawnFn;
 	/** Command seam used by preflight and CliRunner; production spawns gjc commands directly. */
@@ -175,6 +182,7 @@ export class BrokerSupervisor implements PersonaBroker {
 	readonly #spawn: SpawnFn;
 	readonly #command: GjcCommandRunner;
 	readonly #healthProbe: BrokerHealthProbe;
+	readonly #ssotAgentDir: string | undefined;
 	readonly #isPidAlive: PidAliveProbe;
 	readonly #cwd: string;
 	readonly #healthIntervalMs: number;
@@ -213,6 +221,7 @@ export class BrokerSupervisor implements PersonaBroker {
 		this.discoveryPath = join(this.agentDir, "sdk", "broker.json");
 		this.lockPath = join(this.stateDir, "broker.lock");
 		this.#cwd = options.cwd ?? options.home;
+		this.#ssotAgentDir = options.ssotAgentDir === null ? undefined : (options.ssotAgentDir ?? defaultSsotAgentDir());
 		this.#spawn = options.spawn ?? Bun.spawn.bind(Bun);
 		this.#command = options.command ?? ((args, commandOptions) => this.#runCommand(args, commandOptions));
 		this.cli = (args, commandOptions) => this.#command(bindAgentDir(args, this.agentDir), commandOptions);
@@ -307,6 +316,7 @@ export class BrokerSupervisor implements PersonaBroker {
 		try {
 			await mkdir(this.agentDir, { recursive: true, mode: 0o700 });
 			await chmod(this.agentDir, 0o700);
+			if (this.#ssotAgentDir) await seedAgentDirFromSsot(this.#ssotAgentDir, this.agentDir, this.#log);
 			await ensureSteeringDefaults(this.agentDir);
 			await this.#launchGeneration();
 		} catch (error) {
@@ -618,6 +628,51 @@ export class BrokerSupervisor implements PersonaBroker {
  * config.yml are left untouched.
  */
 export const STEERING_DEFAULTS: Readonly<Record<string, string>> = { steeringMode: "all", interruptMode: "wait" };
+
+export function defaultSsotAgentDir(): string {
+	const home = process.env.HOME ?? homedir();
+	return join(home, ".gjc", "agent");
+}
+
+/**
+ * The operator's `~/.gjc/agent` is the single source of truth for provider and
+ * model configuration. The gateway's private agent dir is isolation, not a
+ * second place to edit config: on every start it is re-seeded from the SSOT
+ * (`models.yml`, `model-presets/`, and `config.yml` operator keys), then the
+ * turn-model steering keys are pinned on top. A missing SSOT `models.yml` is
+ * a boot failure: the persona could otherwise bind sessions that cannot reach
+ * any model provider.
+ */
+export async function seedAgentDirFromSsot(ssot: string, agentDir: string, log: (line: string) => void): Promise<void> {
+	const modelsPath = join(ssot, "models.yml");
+	let models: string;
+	try {
+		models = await readFile(modelsPath, "utf8");
+	} catch (error) {
+		if ((error as NodeJS.ErrnoException).code === "ENOENT")
+			throw new Error(`gjc runtime preflight failed: operator SSOT ${modelsPath} is missing; the persona broker cannot reach a model provider`);
+		throw error;
+	}
+	await writeFile(join(agentDir, "models.yml"), models, { mode: 0o600 });
+	const presets = join(ssot, "model-presets");
+	try {
+		await cp(presets, join(agentDir, "model-presets"), { recursive: true, force: true });
+	} catch (error) {
+		if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+	}
+	let operatorConfig = "";
+	try {
+		operatorConfig = await readFile(join(ssot, "config.yml"), "utf8");
+	} catch (error) {
+		if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+	}
+	const stripped = operatorConfig
+		.split("\n")
+		.filter((line) => !Object.keys(STEERING_DEFAULTS).some((key) => line.startsWith(`${key}:`)))
+		.join("\n");
+	await writeFile(join(agentDir, "config.yml"), `${stripped.replace(/\s+$/, "")}\n`, { mode: 0o600 });
+	log(`broker_agent_dir_seeded ssot=${ssot} agentDir=${agentDir}`);
+}
 
 export async function ensureSteeringDefaults(agentDir: string): Promise<void> {
 	const path = join(agentDir, "config.yml");

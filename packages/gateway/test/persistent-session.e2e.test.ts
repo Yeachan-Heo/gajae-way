@@ -88,6 +88,7 @@ liveTest(
 		await mkdir(repo, { recursive: true, mode: 0o700 });
 		const database = await GatewayDatabase.open(join(home, "gateway.db"));
 		const broker = new BrokerSupervisor({
+			ssotAgentDir: null,
 			home,
 			instanceId: database.instanceId,
 			cwd: repo,
