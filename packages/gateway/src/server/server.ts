@@ -41,6 +41,7 @@ import { type ConfigOverrides, type GatewayConfig, type ReloadResult, reloadConf
 import { DeliveryService } from "../delivery/delivery";
 import { ReactionBudget } from "../delivery/reaction-budget";
 import { decideEngagement } from "../engagement/policy";
+import { ATTACHMENT_SCOPE_NOTICE } from "./attachment-scope";
 import { ACTION_GUARD_SYSTEM_NOTICE } from "../guard/action-guard";
 import { autolinkCorpus } from "../memory/autolink";
 import { MemoryClosureQueue } from "../memory/closure";
@@ -1575,6 +1576,7 @@ async function createInboundTurnLifecycle(
 		await runtime.persona.systemPreamble(),
 		currentConversationNotice(origin, engagement),
 		...(bootstrap ? [bootstrap.text] : []),
+		ATTACHMENT_SCOPE_NOTICE,
 		ACTION_GUARD_SYSTEM_NOTICE,
 	].join("\n\n");
 	const modelOverride = options.database.conversationModelGet(key)?.selection;
