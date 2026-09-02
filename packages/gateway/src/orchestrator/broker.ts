@@ -543,6 +543,55 @@ export class BrokerSupervisor implements PersonaBroker {
 		}
 	}
 
+	/**
+	 * Event-driven observation transport: one resident `gjc sdk serve --stdio
+	 * --session <id>` relay per attached session. The relay forwards the host's
+	 * live WebSocket frames to stdout the instant they are emitted; the gateway
+	 * holds stdin open (the relay exits on stdin EOF) and never writes to it.
+	 */
+	openStream(sessionId: string): { readonly lines: AsyncIterable<string>; close(): void } {
+		const child = this.#spawn({
+			cmd: ["gjc", "sdk", "serve", "--stdio", "--session", sessionId],
+			cwd: this.#cwd,
+			stdin: "pipe",
+			stdout: "pipe",
+			stderr: "ignore",
+			env: brokerEnvironment(this.agentDir),
+		});
+		let closed = false;
+		const close = () => {
+			if (closed) return;
+			closed = true;
+			try {
+				child.kill();
+			} catch {
+				// best effort: the relay also exits on stdin close
+			}
+		};
+		const lines = (async function* () {
+			const reader = (child.stdout as ReadableStream<Uint8Array>).getReader();
+			const decoder = new TextDecoder();
+			let buffer = "";
+			try {
+				for (;;) {
+					const { value, done } = await reader.read();
+					if (done) break;
+					buffer += decoder.decode(value, { stream: true });
+					let newline = buffer.indexOf("\n");
+					while (newline >= 0) {
+						yield buffer.slice(0, newline);
+						buffer = buffer.slice(newline + 1);
+						newline = buffer.indexOf("\n");
+					}
+				}
+				if (buffer.length > 0) yield buffer;
+			} finally {
+				reader.releaseLock();
+			}
+		})();
+		return { lines, close };
+	}
+
 	async #runCommand(args: readonly string[], options?: { readonly timeoutMs?: number }): Promise<CliResult> {
 		const agentDir = args.includes("--agent-dir") ? this.agentDir : undefined;
 		const child = this.#spawn({
