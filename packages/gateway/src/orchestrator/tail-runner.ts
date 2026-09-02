@@ -114,6 +114,7 @@ const DEFAULT_POLL_TIMEOUT_MS = 30_000;
 const DEFAULT_POLL_INTERVAL_MS = 250;
 const UNKNOWN_KIND_DIAGNOSTIC_CAP = 20;
 const STREAM_REOPEN_GIVE_UP = 6;
+const DELIVERED_ID_CAP = 2_000;
 
 export class TailCapacityError extends Error {
 	constructor() {
@@ -520,7 +521,21 @@ class ManagedTailHandle implements TailHandle {
 		this.#pendingCursor = undefined;
 	}
 
+	/** Frame ids already handed to the actor; a backfill after a stream reopen replays history and must never re-deliver. */
+	readonly #deliveredIds = new Set<string>();
+
 	async #deliver(frame: TailFrame): Promise<void> {
+		// Finalized answers are also keyed by messageRef so a backfill transcript row
+		// and the live turn_stream frame for the same answer never both deliver.
+		const key = frame.eventId ?? (frame.assistantText ? `text:${Bun.hash(frame.assistantText)}` : undefined);
+		if (key) {
+			if (this.#deliveredIds.has(key)) {
+				this.#input.onDiagnostic?.(`tail_frame_duplicate session=${this.sessionId} event=${key}`);
+				return;
+			}
+			this.#deliveredIds.add(key);
+			if (this.#deliveredIds.size > DELIVERED_ID_CAP) this.#deliveredIds.delete(this.#deliveredIds.values().next().value as string);
+		}
 		const attributedOpRef = tailOperationRef(frame);
 		if (attributedOpRef && this.#acceptedOpRef && attributedOpRef !== this.#acceptedOpRef) {
 			this.#input.onDiagnostic?.(
