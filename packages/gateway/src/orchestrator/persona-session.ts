@@ -492,7 +492,12 @@ class OriginActor {
 		// session is provably not live (inspect answered live=false, or is gone):
 		// nothing can still be running there, so the fresh-turn re-fire is
 		// exactly-once-safe. A merely unreachable but possibly-live session holds.
-		const sessionDead = (first.session !== undefined && first.session.live === false) || (first.failed && second.failed);
+		const raw = this.#manager.port.liveness ? await this.#manager.port.liveness({ sessionId, repo: this.#manager.repo }) : undefined;
+		const sessionDead =
+			(first.session !== undefined && first.session.live === false) ||
+			(first.failed && second.failed) ||
+			raw?.live === false ||
+			raw?.disowned === true;
 		const releasable = batch.state === "settled" || (batch.state === "accepted" && sessionDead);
 		if (releasable && !retired && status.status.status === "unknown" && disownedByBroker) {
 			const attempt = this.#manager.database.inboundBatchRequeueFreshTurn(batch.batchKey);
