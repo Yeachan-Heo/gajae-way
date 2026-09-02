@@ -956,17 +956,23 @@ export class GatewayDatabase {
 	 * Gives a new epoch the thread it is joining instead of only the unread diff.
 	 */
 	recentConversation(originKey: string, conversationId: string, limit: number): Array<{ id?: string; at: string; author: string; body: string }> {
+		// /new sets a floor: nothing from before the reset is ever shown again.
+		const state = this.#database
+			.query<{ floor_at: string | null; floor_row_id: number | null }, [string]>("SELECT floor_at, floor_row_id FROM conversation_context_state WHERE origin_key = ?")
+			.get(originKey);
+		const floorAt = state?.floor_at ?? "";
+		const floorRowId = state?.floor_row_id ?? 0;
 		const inbound = this.#database
-			.query<{ message_id: string; received_at: string; author_name: string | null; author_id: string | null; body: string }, [string, number]>(
-				"SELECT message_id, received_at, author_name, author_id, body FROM conversation_context WHERE origin_key = ? AND body NOT LIKE '[reaction]%' ORDER BY received_at DESC LIMIT ?",
+			.query<{ message_id: string; received_at: string; author_name: string | null; author_id: string | null; body: string }, [string, string, number, number]>(
+				"SELECT message_id, received_at, author_name, author_id, body FROM conversation_context WHERE origin_key = ? AND body NOT LIKE '[reaction]%' AND received_at >= ? AND rowid > ? ORDER BY received_at DESC LIMIT ?",
 			)
-			.all(originKey, limit)
+			.all(originKey, floorAt, floorRowId, limit)
 			.map((row) => ({ id: row.message_id, at: row.received_at, author: row.author_name ?? row.author_id ?? "unknown", body: row.body }));
 		const replies = this.#database
-			.query<{ created_at: string; payload_json: string }, [string, number]>(
-				"SELECT created_at, payload_json FROM deliveries WHERE state = 'confirmed' AND json_extract(payload_json, '$.origin.conversationId') = ? AND json_extract(payload_json, '$.reaction') IS NULL ORDER BY created_at DESC LIMIT ?",
+			.query<{ created_at: string; payload_json: string }, [string, string, number]>(
+				"SELECT created_at, payload_json FROM deliveries WHERE state = 'confirmed' AND json_extract(payload_json, '$.origin.conversationId') = ? AND json_extract(payload_json, '$.reaction') IS NULL AND created_at >= ? ORDER BY created_at DESC LIMIT ?",
 			)
-			.all(conversationId, limit)
+			.all(conversationId, floorAt, limit)
 			.map((row) => {
 				const text = (JSON.parse(row.payload_json) as { text?: unknown }).text;
 				return { at: row.created_at, author: "you", body: typeof text === "string" ? text : "" };
