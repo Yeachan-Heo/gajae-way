@@ -400,6 +400,11 @@ class OriginActor {
 		this.#queue = task.then(
 			() => undefined,
 			(error) => {
+				// B: snapshot_capacity_exceeded is a recoverable tail backpressure signal, not a mailbox crash log
+				if (String((error as Error)?.message ?? error).includes("snapshot_capacity_exceeded")) {
+					this.#manager.log(`retired_hold originKey=${this.originKey} reason=snapshot_capacity_exceeded detail=${safeDiagnostic(error)}`);
+					return;
+				}
 				this.#manager.log(`persona actor ${this.originKey} failed: ${safeDiagnostic(error)}`);
 			},
 		);

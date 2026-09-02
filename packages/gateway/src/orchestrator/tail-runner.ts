@@ -631,6 +631,12 @@ function decodeTailResult(result: CliResult): DecodedTail {
 		// `--until-idle` bounded by `--timeout-ms` on a quiet session: nothing to
 		// report this poll. Not an error, not terminal, not a gap.
 		if (errorCode === "tail_timeout") return { frames: [], terminal: false };
+		// B: snapshot too large for single tail poll — do not fail the actor.
+		// Treat as a non-terminal retention diagnostic so reconciliation can
+		// requeue a fresh turn instead of crashing the mailbox.
+		if (errorCode === "snapshot_capacity_exceeded") {
+			return { frames: [], terminal: false, gap: { resync: recordOf(error?.details)?.resync ?? error?.resync } };
+		}
 		return {
 			frames: [],
 			terminal: false,

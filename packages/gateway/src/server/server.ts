@@ -1563,6 +1563,7 @@ async function createInboundTurnLifecycle(
 	const maxTurnParts = 10;
 	const interimSpeech = new InterimSpeechGate(options.interimSpeech);
 	let lastDeliveredRaw: string | undefined;
+	const deliveredBodySet = new Set<string>();
 	const deliverAssistantText = (rawMessage: string, tailEvent?: { readonly sessionId: string; readonly eventId: string }) => {
 		if (!nonLoopback) return;
 		lastDeliveredRaw = rawMessage;
@@ -1602,7 +1603,13 @@ async function createInboundTurnLifecycle(
 			.filter((part) => part.length > 0 && !isSilenceToken(part))
 			.slice(0, 5);
 		const planned: Array<{ readonly body: string; readonly replyTo?: string }> = [];
-		for (const part of parts) {
+		// A: skip bodies already delivered in this turn (onFrame vs onTerminal dupe, or retry storm)
+		const dedupedParts = parts.filter((body) => {
+			const key = body.trim();
+			if (deliveredBodySet.has(key)) return false;
+			return true;
+		});
+		for (const part of dedupedParts) {
 			if (planned.length >= maxTurnParts) break;
 			const replyMatch = part.match(/^\[REPLY:([^\]\s]+)\]\s*/);
 			const body = replyMatch ? part.slice(replyMatch[0].length).trim() : part;
@@ -1621,6 +1628,7 @@ async function createInboundTurnLifecycle(
 					: deterministicTailDeliveryId(tailEvent.sessionId, index === 0 ? tailEvent.eventId : `${tailEvent.eventId}:${index}`);
 			const payload = runtime.delivery.prepare(crypto.randomUUID(), origin, step.body, step.replyTo, deliveryId);
 			if (!payload) continue;
+			deliveredBodySet.add(step.body.trim());
 			deliveredParts.push(step.body);
 			assistantDeliveryStarted = true;
 			const isLast = index === planned.length - 1;
