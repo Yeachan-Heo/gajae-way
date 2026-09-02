@@ -101,8 +101,10 @@ test("red-team: an unhealthy health flip-flop never consumes or double-publishes
 		healthProbe: async () => {
 			probeCalls++;
 			if (probeCalls === 1) return true;
-			if (probeCalls === 2) return false;
-			if (probeCalls === 3) {
+			// Three consecutive periodic strikes fence the generation (hysteresis:
+			// one slow probe under load never retires live turns).
+			if (probeCalls <= 4) return false;
+			if (probeCalls === 5) {
 				firstFailedRecoveryObserved();
 				return false;
 			}
