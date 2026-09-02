@@ -2,10 +2,10 @@
 
 **Your AI shouldn't live in a browser tab. It should live in your DMs.**
 
-gajae-way is a runtime that turns an AI coding agent into a *resident persona* — one that sits in your Discord and Telegram, remembers you in plain Markdown, wakes itself up on a schedule, and keeps every conversation in its own private head. No dashboard. No web app. No new place to check. You just talk to it where you already talk.
+gajae-way is a runtime that turns an AI coding agent into a *resident persona* — one that sits in your Discord and Telegram, remembers you in plain Markdown, wakes itself up on a schedule, and keeps every conversation in its own private head. No hosted dashboard. No new place to check for ordinary conversation. You just talk to it where you already talk.
 
 ```text
-Discord / Telegram ──> gajaeway gateway ──> your persona (gjc)
+Discord / Telegram ──> gajaeway daemon ──> gateway ──> your persona (gjc)
                               │
                     Markdown memory + scheduled/event monitors
 ```
@@ -18,9 +18,9 @@ Chat frontends are easy. What is hard is everything that happens when a real bot
 - **Memory you can read with `cat`.** Turns and monitor output land in `$GAJAEWAY_HOME/memory` as Markdown across a small set of canonical axes. It is your filesystem, your git history, your grep — not a vector blob you have to trust.
 - **It acts without being asked.** Cron and event monitors give the persona its own turns, so it can canonicalize memory on a schedule or audit itself each morning while you sleep.
 - **Delivery is ledgered, not hoped for.** Replies get a durable record before they go out. After a crash, an unsettled reply is reissued and *visibly labeled a duplicate* instead of quietly pretending nothing happened.
-- **It knows when to shut up.** DMs always engage. Group traffic is mention-gated unless you explicitly open a channel — and an opened channel still lets the persona choose silence over noise.
+- **It knows when to shut up.** Direct messages follow your configured policy. Group traffic is mention-gated unless you explicitly open a channel — and an opened channel still lets the persona choose silence over noise.
 - **Safety floors that config cannot unlock.** Unrecoverable commands and deletions outside your own home are refused at the runtime boundary, not left to prompt discipline.
-- **Standalone binaries, not a stack.** `bun run build` emits compiled executables. Production hosts run those under launchd/systemd; the source checkout stays on your laptop.
+- **One binary, one daemon.** `bun run build` emits `dist/gajaeway`. One `gajaeway daemon run` process owns the gateway, enabled Discord and Telegram adapters, and the admin console; production runs it under launchd or systemd.
 
 ## What it feels like
 
@@ -35,33 +35,33 @@ For how memory, monitors, and the gateway work, see [the documentation](docs/).
 
 ## Start in five steps
 
-1. Build the standalone programs on a machine with Bun:
+1. Build the standalone binary on a machine with Bun:
 
    ```sh
    bun run build
    ```
 
-   This creates `dist/gajaeway-gateway`, `dist/gajaeway-discord`, `dist/gajaeway-telegram`, and `dist/gajaeway`.
+   This creates exactly `dist/gajaeway`.
 
-2. Choose a private home directory and create `$GAJAEWAY_HOME/config.json` plus separate credential files. The gateway configuration references credential **files**, rather than storing secret values inline. See [deployment](docs/deployment.md) for the complete layout and examples.
+2. Choose a private `$GAJAEWAY_HOME` and create separate, permission-restricted credential files for each platform token (and a Discord voice key when voice is enabled).
 
-3. Create `$GAJAEWAY_HOME/adapter-discord.json` with its own `tokenFile` reference for Discord. Create the analogous Telegram adapter configuration when using Telegram.
-
-4. Run the gateway as a long-lived daemon under your service manager:
+3. Create `$GAJAEWAY_HOME/config.json` with `credentials` pointing at those files and `adapters` naming each platform to enable. Validate it before starting:
 
    ```sh
-   dist/gajaeway-gateway daemon
+   dist/gajaeway config check
+   ```
+
+   See [deployment](docs/deployment.md) for the complete configuration and channel examples.
+
+4. Install one launchd unit that runs the composite daemon:
+
+   ```sh
+   dist/gajaeway daemon run
    ```
 
    The host also needs the external `gjc` program on `PATH`; it supplies the AI runtime for every turn.
 
-5. Start the Discord adapter, then send your bot a DM:
-
-   ```sh
-   dist/gajaeway-discord
-   ```
-
-   Start `dist/gajaeway-telegram` separately when using Telegram.
+5. Send a DM to the enabled Discord or Telegram bot. The daemon receives platform traffic, operates the gateway, and delivers replies in the same process.
 
 ## Make it yours
 
@@ -75,4 +75,4 @@ Put `SOUL.md`, `AGENTS.md`, and `USER.md` in `$GAJAEWAY_HOME/workspace`. They ar
 
 ## Development
 
-This repository is a Bun/TypeScript workspace. Build with `bun run build`; run tests with `bun test packages`. Production hosts run the compiled binaries, not this source checkout.
+This repository is a Bun/TypeScript workspace. Build with `bun run build`; run tests with `bun test packages`. Production hosts run the compiled binary, not this source checkout. For development, run the composite daemon directly with `bun packages/gajaeway/src/main.ts daemon run`.

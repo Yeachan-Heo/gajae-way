@@ -2,137 +2,194 @@
 
 ## Production unit
 
-Production runs the compiled standalone binaries. Build them on a machine with Bun:
+Build the compiled production binary on a machine with Bun:
 
 ```sh
 bun run build
 ```
 
-The result is:
+The build output is exactly:
 
 ```text
-dist/gajaeway-gateway
-dist/gajaeway-discord
-dist/gajaeway-telegram
-dist/gajaeway-admin
 dist/gajaeway
 ```
 
-Each binary requires its verb: `gajaeway-gateway daemon`, `gajaeway-admin serve`, and a subcommand for `gajaeway`. Invoked with no arguments they print usage on stderr and exit 2, so probing one never blocks. `gajaeway-discord` and `gajaeway-telegram` run in the foreground with no arguments; `gajaeway-discord --help` and `--version` answer without connecting, and a second `gajaeway-discord` refuses to boot while `$GAJAEWAY_HOME/adapter-discord.pid` names a live process.
+Install that file as `gajaeway` on the production host. It is the only executable; one long-lived `gajaeway daemon run` process composes the gateway, enabled platform adapters, and admin console.
 
-A production host does not need a source checkout, `node_modules`, or Bun to run those binaries. It **does** need the external `gjc` executable on `PATH`: gateway startup owns one private gjc agent directory for the instance, and gjc's own daemon for that directory hosts the persistent sessions (auto-started on first use; requires gjc >= 0.15.6, verified on 0.16.0). Model-provider credentials are inherited from the gateway process environment; do not place them in the broker agent directory. Provider/model configuration lives in the operator SSOT `~/.gjc/agent`; the gateway seeds its private agent directory from it on every start.
+| Invocation | Role |
+|---|---|
+| `gajaeway daemon run` | Starts the one composite daemon. |
+| `gajaeway config check [path]` | Validates a configuration file without starting the daemon. |
+| `gajaeway [--socket PATH] status|shutdown|chat|sessions …|ops …|memory …|monitors …|work …` | On-demand clients of the resident daemon. `--socket PATH` overrides the default client socket path. |
+| `gajaeway --help`, `gajaeway --version` | Prints usage or the version without connecting. |
+
+Normal shutdown exits 0. A boot failure or an adapter escalation exits 1. Invalid usage and a second daemon for the same home exit 2.
+
+A production host does not need a source checkout, `node_modules`, or Bun to run the binary. It does need the external `gjc` executable on `PATH`: the daemon owns one private gjc agent directory for its instance, while gjc owns the persistent session daemon. Model-provider credentials are inherited from the daemon environment; keep provider/model configuration in the operator SSOT at `~/.gjc/agent`, not in the private broker directory.
 
 ## Home and configuration
 
-`GAJAEWAY_HOME` selects the state directory; it defaults to `~/.gajaeway`. The gateway makes the home directory private (`0700`). A typical layout is:
+`GAJAEWAY_HOME` selects the state directory and defaults to `~/.gajaeway`. The daemon makes the home directory private (`0700`). A typical layout is:
 
 ```text
 $GAJAEWAY_HOME/
   config.json
-  adapter-discord.json
-  adapter-telegram.json
-  adapter-discord.pid        # single-instance lock, held by the running Discord adapter
-  gateway.sock
+  gajaeway.pid                  # daemon ownership lock
+  gateway.sock                  # local client transport
   gateway.db
-  workspace/                 # SOUL.md, AGENTS.md, USER.md; gjc working directory
-  memory/                    # Markdown files and private Git repository
-  broker/<instance-id>/agent/ # private broker-owned GJC state; not a credential store
+  admin-audit.jsonl             # admin request audit trail
+  adapter-telegram-state.json   # durable Telegram update cursor
+  adapters/
+    discord/
+      recovery-cursor.json
+  workspace/                    # SOUL.md, AGENTS.md, USER.md; gjc working directory
+  memory/                       # Markdown files and private Git repository
+  broker/<instance-id>/agent/   # private broker-owned GJC state; not a credential store
   memory-receipts.jsonl
   secrets/
     discord-token
+    discord-voice-key
     telegram-token
 ```
 
-Use `config.json` schema version 1. Every configured secret is a credential-file reference; a credential file may be referenced by only one configured credential.
+The ownership lock is `$GAJAEWAY_HOME/gajaeway.pid`. It is fail-closed: the daemon reclaims it only when its PID is provably dead. A readable lock naming a live process, an unreadable/malformed lock, and an unprovable PID all refuse startup.
+
+Use schema version 1. Every secret is a credential-file reference, never an inline token; a credential file may be referenced by only one configured credential. This complete example enables both adapters and Discord voice:
 
 ```json
 {
   "schemaVersion": 1,
   "logVerbosity": "info",
-  "socketPath": "/Users/me/gajaeway/gateway.sock",
-  "dbPath": "/Users/me/gajaeway/gateway.db",
+  "socketPath": "/Users/me/gajaeway/state/gateway.sock",
+  "dbPath": "/Users/me/gajaeway/state/gateway.db",
   "credentials": {
     "discord": { "credentialFile": "/Users/me/gajaeway/secrets/discord-token" },
+    "discordVoice": { "credentialFile": "/Users/me/gajaeway/secrets/discord-voice-key" },
     "telegram": { "credentialFile": "/Users/me/gajaeway/secrets/telegram-token" }
   },
-  "channels": { "discord-channel-id": { "engagement": "open" } },
+  "adapters": {
+    "discord": {
+      "intents": [1, 512],
+      "voice": {
+        "languageCode": "ko",
+        "voiceId": "voice-id",
+        "speechSpeed": 1.2
+      }
+    },
+    "telegram": {}
+  },
+  "channels": {
+    "discord:123456789": { "engagement": "open", "settleWindowMs": 500 },
+    "telegram:-100123456789": { "engagement": "open" }
+  },
+  "model": { "preset": "codex-medium" },
+  "settleWindowMs": 2000,
+  "stallTimeoutMs": 120000,
+  "maxInboundAgeMs": 600000,
+  "mentionAllowlist": ["owner-author-id"],
+  "dmPolicy": "allowlist",
+  "ownerTarget": {
+    "origin": {
+      "platform": "discord",
+      "kind": "dm",
+      "conversationId": "owner-dm",
+      "peerId": "owner-author-id"
+    }
+  },
   "webhook": { "bind": "127.0.0.1", "port": 8080, "exposeNonLoopback": false },
   "watcherRoots": ["/Users/me/automations"],
   "scriptRoot": "/Users/me/automations",
-  "settleWindowMs": 2000,
-  "stallTimeoutMs": 120000
+  "monitorContextFailureRollThreshold": 2
 }
 ```
 
-`socketPath`, `dbPath`, `logVerbosity`, credentials, channels, webhook, watcher roots, script root, `settleWindowMs`, and `stallTimeoutMs` are optional. Socket and database paths default inside the home directory, `settleWindowMs` defaults to 2000 ms, `stallTimeoutMs` defaults to 120000 ms, and log verbosity defaults to `info`. `turnTimeoutMs` is rejected because persistent-session liveness is alert-only.
+### Adapters, credentials, and channels
 
-## Reloading configuration without a restart
+Presence enables an adapter: `adapters.discord` requires `credentials.discord`; its optional `voice` section also requires `credentials.discordVoice`; and `adapters.telegram: {}` requires `credentials.telegram`. Credentials are read once from the same configuration snapshot used to boot the gateway.
 
-A running gateway re-reads `config.json` on `SIGHUP` (`kill -HUP <pid>`) or on the `gateway.reloadConfig` verb; both run the same implementation, so the console and the signal behave identically.
+Use `discord:<id>` and `telegram:<id>` channel keys for new configuration. A bare ID remains accepted as a Discord channel key, but never as a Telegram key. Platform adapters report observed facts such as mentions and bot authorship; the gateway applies the live channel engagement policy.
 
-The reload is fail-safe and reports exactly what it did:
+Both `adapters` and `credentials` are restart-required. A configuration reload can apply live policy fields, but it reports changes to either of those sections without applying them until the daemon restarts. Discord recovery channels are also enumerated at daemon start from `discord:<id>` keys and Discord bare IDs, so a channel change that must affect recovery needs a restart.
 
-- `changed` — fields applied live. `mentionAllowlist`, `channels`, `settleWindowMs`, and `stallTimeoutMs` are re-read at runtime; a change takes effect on the next actor event.
-- `restartRequired` — fields you edited that are bound to a startup resource (`socketPath`, `dbPath`, `model`, `credentials`, `webhook`, `watcherRoots`, `scriptRoot`, `ownerTarget`, `monitorContextFailureRollThreshold`). They are reported and deliberately NOT applied; restart to pick them up.
-- `ignored` — fields you edited that no code reads at all. `logVerbosity` is currently parsed but unconsumed, so editing it has no effect and no restart would give it one.
-- On a parse or validation error, or when `config.json` is missing or unreadable, the reload fails, keeps the previous configuration untouched, and returns a diagnostic. A missing file never publishes defaults over live policy, because that would drop the mention allowlist and open a mention-gated room.
+Other startup-bound fields are `socketPath`, `dbPath`, `model`, `webhook`, `watcherRoots`, `scriptRoot`, `ownerTarget`, and `monitorContextFailureRollThreshold`. `mentionAllowlist`, `channels`, `settleWindowMs`, `stallTimeoutMs`, `maxInboundAgeMs`, and `dmPolicy` are live-reloadable. A failed reload retains the previous configuration.
 
-Every reload is logged with the trigger and all three field lists.
+## Admin console
 
-The Discord adapter has a separate `$GAJAEWAY_HOME/adapter-discord.json` because it reads its own token:
-
-```json
-{
-  "tokenFile": "/Users/me/gajaeway/secrets/discord-token",
-  "gatewaySocket": "/Users/me/gajaeway/gateway.sock",
-  "channels": { "discord-channel-id": { "engagement": "open" } }
-}
-```
-
-Keep token files out of version control and restrict their permissions. Replace a token file and restart the relevant service to rotate it.
+`GAJAEWAY_ADMIN_PORT` selects the loopback-only admin HTTP port. It defaults to `8788` and must be an integer from `1` through `65535`; an invalid environment value fails boot. Port `0` is a direct test seam only and is not accepted through the environment. Admin actions are recorded in `$GAJAEWAY_HOME/admin-audit.jsonl`.
 
 ## Service manager: launchd example
 
-Install binaries and state outside macOS TCC-protected directories such as Desktop, Documents, and Downloads. A launchd process can hang when its working directory, `gjc`, or a symlink target lies there. Put the binaries, `gjc`, and `$GAJAEWAY_HOME` somewhere such as `~/gajaeway`.
-
-A user agent can launch the gateway:
+Install the binary, `gjc`, and the state directory outside macOS TCC-protected locations such as Desktop, Documents, and Downloads. A user LaunchAgent can use this single plist as `~/Library/LaunchAgents/dev.gajaeway.plist`:
 
 ```xml
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0"><dict>
-  <key>Label</key><string>dev.gajaeway.gateway</string>
+  <key>Label</key><string>dev.gajaeway</string>
   <key>ProgramArguments</key><array>
-    <string>/Users/me/gajaeway/bin/gajaeway-gateway</string><string>daemon</string>
+    <string>/Users/me/gajaeway/bin/gajaeway</string>
+    <string>daemon</string>
+    <string>run</string>
   </array>
   <key>WorkingDirectory</key><string>/Users/me/gajaeway</string>
   <key>EnvironmentVariables</key><dict>
     <key>GAJAEWAY_HOME</key><string>/Users/me/gajaeway/state</string>
-    <key>PATH</key><string>/Users/me/gajaeway/bin:/usr/local/bin:/usr/bin:/bin</string>
+    <key>GAJAEWAY_ADMIN_PORT</key><string>8788</string>
+    <key>PATH</key><string>/Users/me/gajaeway/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
     <key>YOUR_MODEL_KEY</key><string>replace-with-provider-key</string>
   </dict>
   <key>RunAtLoad</key><true/>
   <key>KeepAlive</key><true/>
-  <key>StandardOutPath</key><string>/Users/me/gajaeway/gateway.log</string>
-  <key>StandardErrorPath</key><string>/Users/me/gajaeway/gateway.log</string>
+  <key>StandardOutPath</key><string>/Users/me/gajaeway/gajaeway.log</string>
+  <key>StandardErrorPath</key><string>/Users/me/gajaeway/gajaeway.log</string>
 </dict></plist>
 ```
 
-Model keys used by `gjc` are inherited from the gateway environment. A launchd job does not inherit your shell, so provide the required model-key variables in `EnvironmentVariables` (or an equivalent protected secret mechanism) and protect the plist:
+The `PATH` must resolve the external `gjc` program as well as the app binary. A launchd job does not inherit shell model-key variables, so put required provider variables in `EnvironmentVariables` (or an equivalent protected secret mechanism) and protect the plist accordingly.
 
-```sh
-chmod 600 ~/Library/LaunchAgents/dev.gajaeway.gateway.plist
-launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/dev.gajaeway.gateway.plist
-```
+## Migrating from the split binaries
 
-Run the Discord and Telegram binaries as separate managed services after the gateway. The CLI is an on-demand client; it does not start the daemon.
+| Before | After |
+|---|---|
+| Three or four launchd units: `dev.gajaeway-gateway`, `dev.gajaeway-discord`, `dev.gajaeway-telegram`, and optionally `dev.gajaeway-admin`. | One `dev.gajaeway` unit runs `gajaeway daemon run`. |
+| Independent process lifecycles and restarts. | One daemon owns the gateway, admin console, enabled adapters, lock, signals, and exit status. |
+
+Stop the old units in ingress-to-core order: the Discord adapter unit, the Telegram adapter unit, the admin unit when present, then the gateway unit. After all are stopped, remove the old plist files.
+
+| Before | `config.json` now |
+|---|---|
+| `adapter-discord.json.tokenFile` | `credentials.discord.credentialFile` |
+| `voice.apiKeyFile` | `credentials.discordVoice.credentialFile` |
+| `intents` and `voice.*` | `adapters.discord.intents` and `adapters.discord.voice.*` |
+| `channels` | `channels["discord:<id>"]` |
+| `adapter-telegram.json.tokenFile` | `credentials.telegram.credentialFile` |
+| `chats` | `channels["telegram:<id>"]` |
+| `gatewaySocket` | Dropped; all in-process components use local ports. |
+
+**Old-file list (remove only after the old units are stopped):**
+
+- `adapter-discord.pid`
+
+Preserve these state files and directories: `gateway.db`, `adapter-telegram-state.json`, `adapters/discord/recovery-cursor.json`, `memory/`, and `workspace/`.
+
+1. Put the mapped configuration and credential files under the chosen home, then validate it:
+
+   ```sh
+   gajaeway config check
+   ```
+
+2. Load `dev.gajaeway` and let launchd start `gajaeway daemon run`; then verify a Discord or Telegram DM reaches the bot.
+3. The rollback boundary is packaging and service configuration only: restore the archived old plists and binaries if needed. The database schema is unchanged, so do not down-migrate `gateway.db` for this migration.
 
 ## Troubleshooting
 
-- **Socket missing:** verify the gateway service, configured socket path, parent permissions, and service log.
-- **Every turn fails with an API error:** confirm `gjc` is on the service `PATH` and its model-key environment variables are present. If the log says a model was not found, use an explicit selector (`"model": "provider/model"`) or activate a gjc profile (`"model": { "preset": "profile-name" }`); profile default-role arrays retain gjc's native fallback-chain handling. A poisoned conversation session can be rebound with `/new`.
-- **launchd hangs:** move the working directory, state, `gjc`, and symlink targets out of TCC-protected paths; then send `/new` to sessions created under the old location.
-- **Webhook or monitor failure:** verify the gateway configuration and use `gajaeway monitors inspect <monitor-id>`.
+- **`adapter_escalated adapter=<name> failures=5` crash loop:** the supervisor retried four failures and the fifth terminated the daemon with exit 1 for launchd `KeepAlive`. Repair the credential or platform configuration. To operate degraded while investigating, remove `adapters.<name>` from `config.json`, validate, and restart.
+- **`telegram_poll_conflict`:** another Telegram poller is using the same token. Stop the competing poller. HTTP 409 is logged and polling continues with transient backoff; it is not a fatal Telegram error.
+- **Second-instance refusal (exit 2):** another daemon owns the home, or the ownership file cannot be safely interpreted. Do not delete `$GAJAEWAY_HOME/gajaeway.pid` unless no daemon is running; only a PID proven dead is reclaimed automatically.
+- **`broker health probe miss N/3`:** gjc health did not answer within the ten-second probe timeout. After three consecutive misses the broker generation is fenced and recovery is awaited. Check the gjc executable, its environment, and the daemon log before restarting the service.
+- **Every turn fails with an API error:** confirm `gjc` is on the service `PATH` and required model-key environment variables are present. A poisoned conversation session can be rebound with `/new`.
+- **launchd hangs:** move the working directory, state directory, `gjc`, and symlink targets out of TCC-protected paths; then send `/new` to sessions created under the old location.
+- **Webhook or monitor failure:** verify the configuration and use `gajaeway monitors inspect <monitor-id>`.
 - **Recovery or restore:** use the [operator runbook](runbooks/gajaeway-v1.md), especially its backup, restore, crash-recovery, and schema guidance.
 
 Read [architecture](architecture.md) for delivery semantics and [memory](memory.md) for the private Markdown repository.

@@ -2,16 +2,22 @@
 
 ## Install and run
 
-For production, compile standalone binaries — no source checkout, node_modules, or Bun install is needed on the host:
+For production, compile the one standalone binary — no source checkout, `node_modules`, or Bun install is needed on the host:
 
 ```sh
-bun run build   # emits dist/gajaeway-gateway, dist/gajaeway-discord, dist/gajaeway-telegram, dist/gajaeway
-dist/gajaeway-gateway daemon
+bun run build   # emits dist/gajaeway
+dist/gajaeway daemon run
 ```
 
-The external `gjc` binary remains a runtime dependency on PATH. Gateway startup owns one private gjc agent directory (`<home>/broker/<instanceId>/agent`); gjc's own daemon for that directory hosts the persistent sessions and is auto-started by the gateway's first `gjc sdk` probe. The supervisor observes daemon health and publishes a new generation when it recovers; it never spawns or kills the daemon. On every start the private agent directory is re-seeded from the operator SSOT `~/.gjc/agent` (`models.yml`, `model-presets/`, and `config.yml` operator keys; `steeringMode: all` / `interruptMode: wait` are pinned on top). Edit provider/model configuration in `~/.gjc/agent` only — never in the private directory, which is overwritten on boot. A missing SSOT `models.yml` fails boot. Before seeding, boot reaps everything the previous incarnation left in that private directory: gjc daemon/host/relay processes bound to it and lock tombstones from spawn races (`broker_reaped` log line). The operator's own `~/.gjc/agent` daemon is never touched, so restarting the gateway is always safe. For development, run straight from source: `bun packages/gateway/src/main.ts daemon`.
+The external `gjc` binary remains a runtime dependency on `PATH`. The composite daemon owns one private gjc agent directory (`<home>/broker/<instanceId>/agent`); gjc's own daemon for that directory hosts the persistent sessions and is auto-started by the gateway's first `gjc sdk` probe. The supervisor observes daemon health and publishes a new generation when it recovers; it never spawns or kills the daemon. On every start the private agent directory is re-seeded from the operator SSOT `~/.gjc/agent` (`models.yml`, `model-presets/`, and `config.yml` operator keys; `steeringMode: all` / `interruptMode: wait` are pinned on top). Edit provider/model configuration in `~/.gjc/agent` only — never in the private directory, which is overwritten on boot. A missing SSOT `models.yml` fails boot. Before seeding, boot reaps everything the previous incarnation left in that private directory: gjc daemon/host/relay processes bound to it and lock tombstones from spawn races (`broker_reaped` log line). The operator's own `~/.gjc/agent` daemon is never touched, so restarting the gateway is always safe. For development, run straight from source: `bun packages/gateway/src/main.ts daemon`.
 
-The CLI does not start the daemon: `gajaeway daemon run` prints the launcher command, and `gajaeway status` requires the daemon socket. Run the launcher under your service manager (systemd/launchd/container supervisor), keep its state directory private, and stop the service before an offline restore.
+For development, run the composite daemon from source:
+
+```sh
+bun packages/gajaeway/src/main.ts daemon run
+```
+
+Client verbs such as `gajaeway status` connect to the resident daemon. Run `gajaeway daemon run` under your service manager (systemd, launchd, or a container supervisor), keep its state directory private, and stop the single service before an offline restore.
 
 ### macOS launchd deployment pitfalls (learned live)
 
@@ -29,8 +35,19 @@ The CLI does not start the daemon: `gajaeway daemon run` prints the launcher com
   "logVerbosity": "info",
   "socketPath": "/absolute/path/gateway.sock",
   "dbPath": "/absolute/path/gateway.db",
-  "credentials": { "discord": { "credentialFile": "/absolute/path/discord-token" } },
-  "channels": { "channel-id": { "engagement": "open", "settleWindowMs": 500 } },
+  "credentials": {
+    "discord": { "credentialFile": "/absolute/path/discord-token" },
+    "discordVoice": { "credentialFile": "/absolute/path/discord-voice-key" },
+    "telegram": { "credentialFile": "/absolute/path/telegram-token" }
+  },
+  "adapters": {
+    "discord": { "intents": [1, 512], "voice": { "languageCode": "ko", "voiceId": "voice-id" } },
+    "telegram": {}
+  },
+  "channels": {
+    "discord:channel-id": { "engagement": "open", "settleWindowMs": 500 },
+    "telegram:chat-id": { "engagement": "open" }
+  },
   "model": { "preset": "codex-medium" },
   "settleWindowMs": 1000,
   "stallTimeoutMs": 120000,
@@ -42,7 +59,7 @@ The CLI does not start the daemon: `gajaeway daemon run` prints the launcher com
 }
 ```
 
-Use schema version 1 only. Each credential is a file reference, never an inline secret or environment fallback; a credential file may be referenced by exactly one configured credential. Create secret files with restrictive ownership and mode, keep them outside version control, and rotate by replacing the file and restarting the service.
+Use schema version 1 only. Each credential is a file reference, never an inline secret or environment fallback; a credential file may be referenced by exactly one configured credential. Create secret files with restrictive ownership and mode, keep them outside version control, and rotate by replacing the file and restarting the single service. Presence of `adapters.discord` or `adapters.telegram` enables that adapter. `adapters` and `credentials` are restart-required, as is Discord recovery-channel enumeration: it is derived at daemon start from `discord:<id>` keys and Discord bare IDs. Use prefixed keys for new configuration; bare IDs remain Discord-only compatibility keys.
 
 `model` accepts either a gjc model selector string such as `"openai/gpt-5.2"` or a preset object such as `{ "preset": "codex-medium" }`. The gateway applies it through the persistent session’s authenticated `model.set` control; presets are resolved by gjc from its merged built-in and `~/.gjc/agent/models.yml` profile catalog, so gjc retains its native availability checks, retry budgets, sticky selection, and fallback-chain behavior.
 
@@ -52,7 +69,7 @@ Use schema version 1 only. Each credential is a file reference, never an inline 
 
 ## Adapters and engagement
 
-Create separate credential files for Discord and Telegram tokens, then reference them as `credentials.discord` and `credentials.telegram`. Configure group/channel engagement with `channels.<conversation-id>.engagement: "open"`; unconfigured group traffic remains mention-gated. Direct messages engage normally. Verify adapter connectivity from its service logs and use `gajaeway sessions list` to confirm accepted traffic.
+Create separate credential files for Discord and Telegram tokens (and a Discord voice key when voice is enabled), then reference them through `credentials` and enable platforms through `adapters`. Configure group/channel engagement with `channels["discord:<id>"]` or `channels["telegram:<id>"]`; unconfigured group traffic remains mention-gated. Direct messages engage normally. Adapters report platform facts, while the gateway applies the current engagement gate. Verify accepted traffic with `gajaeway sessions list`.
 
 ### Emoji reactions
 
@@ -107,23 +124,24 @@ gajaeway ops integrity
 gajaeway ops backup /absolute/backup/gateway.db
 ```
 
-For restore, stop the service first. The CLI refuses restore while the gateway socket exists. It validates the SQLite header, copies the current database to `gateway.db.pre-restore-<timestamp>`, then copies the backup into `$GAJAEWAY_HOME/gateway.db`:
+For restore, stop the single service first. Confirm both the gateway socket and `$GAJAEWAY_HOME/gajaeway.pid` are gone. The CLI refuses restore while the socket exists. It validates the SQLite header, copies the current database to `gateway.db.pre-restore-<timestamp>`, then copies the backup into `$GAJAEWAY_HOME/gateway.db`:
 
 ```sh
-# stop the service and confirm its gateway.sock is gone
+# stop dev.gajaeway and confirm gateway.sock and gajaeway.pid are gone
 gajaeway ops restore /absolute/backup/gateway.db
-# restart the service
+# restart dev.gajaeway
 gajaeway ops integrity
 ```
 
 Practice this sequence on a disposable home directory before relying on it during an incident.
 
-### Persistent-session binary rollback
+### Single-binary rollback
 
-A code revert is safe only after the current gateway has reconciled all current and retired batches. Stop intake, wait until `batch_state IN ('settled','accepted')` is zero, verify `gajaeway ops integrity`, then stop the gateway so it releases its broker ownership lock in order (the gjc daemon itself is gjc-owned and is not killed). For the pre-cutover binary, restore `settleWindowMs` to `debounceMs` globally and in every channel policy and add that binary's `turnTimeoutMs`; the persistent build rejects the latter. Remove a broker private directory only after acquiring its lock and proving the recorded PID is dead. Start the reverted binary only after the schema down-marker below succeeds, then smoke one adopted session and verify its delivery.
+A code revert replaces the one `gajaeway` binary and restarts the one service; it never starts platform components independently. Before a rollback, stop intake, wait until `batch_state IN ('settled','accepted')` is zero, verify `gajaeway ops integrity`, then stop the composite daemon so it releases its broker ownership lock in order (the gjc daemon itself is gjc-owned and is not killed). Start the reverted single-binary release only after any required schema rollback below succeeds, then smoke one adopted session and verify its delivery.
+
 ### Persistent-session schema rollback
 
-Do not down-mark a live database. First stop external intake while the v17 gateway is still running, reconcile every current and retired batch until `batch_state IN ('settled','accepted')` is zero, and verify integrity. Take a backup before the transactional down-marker `DELETE FROM schema_migrations WHERE version = 17;`, then verify the v16 marker before starting the pre-cutover binary. Version 17 is the one additive migration that adds the batch-to-session binding used to reattach retired holds after `/new`; it leaves the legacy inbound state column unchanged. If quiescence cannot be proved, refuse the down-step and restore the pre-cutover backup instead.
+Do not down-mark a live database. First stop external intake while the current daemon is still running, reconcile every current and retired batch until `batch_state IN ('settled','accepted')` is zero, and verify integrity. Take a backup before the transactional down-marker `DELETE FROM schema_migrations WHERE version = 17;`, then verify the v16 marker before starting the prior single-binary release. Version 17 is the one additive migration that adds the batch-to-session binding used to reattach retired holds after `/new`; it leaves the legacy inbound state column unchanged. If quiescence cannot be proved, refuse the down-step and restore the pre-cutover backup instead.
 
 ## Crash recovery
 
@@ -131,11 +149,20 @@ On startup, the delivery ledger redelivers unsettled output. Ambiguous prior del
 
 ## Troubleshooting
 
-- **Socket missing:** start the out-of-band service and verify `socketPath`, directory permissions, and service logs.
-- **Newer-schema refusal:** do not downgrade against that database. Restore a compatible backup or run a gateway that supports its schema.
+### Daemon and adapter log signals
+
+The following grep-stable names identify the composite lifecycle and platform supervision: `gajaeway daemon starting pid=… home=`, `gajaeway daemon ready pid=… home= adapters=[…] admin=…`, `gajaeway daemon stopping reason=…`, `gajaeway daemon stopped status=…`, `gajaeway daemon stop forced`, `boot_aborted phase=…`, and `daemon_lock_reclaimed stale_pid=…`. Local replay is recorded as `local_port_open connection=… replayed=N`.
+
+Adapter lifecycle signals are `adapter_started adapter=… generation=…`, `adapter_failed adapter=… generation=… reason=… restartInMs=…`, `adapter_escalated adapter=… failures=5`, `adapter_disposed_after_stop adapter=… generation=…`, `adapter_stopped adapter=… generation=…`, and `adapter_stop_timeout adapter=…`. Platform-specific signals are `telegram_update_rejected update_id=… code=…`, `telegram_poll_conflict`, and `discord_unrecoverable_close code=…`.
+
+- **Socket missing:** confirm the single `dev.gajaeway` service is running, then verify `socketPath`, directory permissions, and the daemon log.
+- **`adapter_escalated adapter=<name> failures=5`:** the fifth consecutive adapter failure exits the daemon with status 1 after four supervised retries. Repair the platform fault. To run degraded while investigating, remove `adapters.<name>` from `config.json`, validate it, and restart the single service.
+- **`daemon lock … is unreadable or malformed`:** the lock is fail-closed. Remove `$GAJAEWAY_HOME/gajaeway.pid` by hand only after confirming no gajaeway daemon is running; otherwise correct the live owner or lock problem.
+- **`adapter_stop_timeout adapter=<name>`:** the adapter did not stop within its ten-second deadline. Its local port is closed and shutdown continues; investigate the platform client or network call. A complete daemon shutdown has a thirty-second force deadline signalled by `gajaeway daemon stop forced`.
+- **Newer-schema refusal:** do not downgrade against that database. Restore a compatible backup or run a daemon that supports its schema.
 - **Quarantined mutation:** inspect the intent payload, memory repository state, and Git error; repair the source condition, then use the documented recovery workflow rather than deleting the evidence.
 - **Backup failure:** supply an absolute target path whose parent directory already exists; never target the live `gateway.db`.
-- **Every turn on one origin fails with the same gjc `api_error` (for example "cannot restore Claude OAuth MCP tool alias"):** the persistent broker-hosted session may be poisoned. Send `/new` to create a fresh epoch; prior in-session context is lost by design. The daemon log carries the exact error and the conversation receives the `[turn failed]` notice.
-- **Repeated structured recovery signals:** `recovery_hold` and `retired_hold` retain a durable batch; `stall_alert originKey=… sessionId=… silentMs=…` is alert-only; `broker_restart generation=… backoffMs=…` records a supervised replacement. None of these signals permits a blind re-send or abort. Use `/new` only to establish a fresh epoch for later traffic; an accepted old batch remains fenced until status/tail proves a terminal result.
-- **Session bootstrap remains pending:** inspect `session.list` or `ops.cycle`. A pending projection means the current epoch has not completed a terminal successful turn yet; pre-success failures deliberately retry it. Repeated attempts carry the same origin+epoch bootstrap ID. Do not mark it complete manually or copy source bodies into the database. Repair unreadable memory files or rejected links at their source. In public/group channels, associated channel/project/task/handoff documents need an exact full `origin:`/`origin-key:` match and `bootstrap-safe: public` (or `bootstrap-visibility: public`); bare conversation IDs never qualify. Daily sections are admitted only when every stable-origin declaration is well formed and resolves to one consistent current-origin key. The configured `memory/` root may itself be a symlink, but every followed target must remain beneath that resolved memory root.
-- **`config.json is unreadable (...); refusing to start on defaults`:** the file exists but cannot be read (permissions, a directory in its place, or a symlink whose target is missing). The daemon exits non-zero rather than booting on defaults, because defaults would drop `mentionAllowlist` and open a mention-gated room. Fix the file, then start again; a reload in a running daemon keeps the previous config and reports the same diagnostic.
+- **Every turn on one origin fails with the same gjc `api_error`:** the persistent broker-hosted session may be poisoned. Send `/new` to create a fresh epoch; prior in-session context is lost by design. The daemon log carries the exact error and the conversation receives the `[turn failed]` notice.
+- **Repeated structured recovery signals:** `recovery_hold` and `retired_hold` retain a durable batch; `stall_alert originKey=… sessionId=… silentMs=…` is alert-only; `broker_restart generation=… backoffMs=…` records a supervised replacement. None permits a blind re-send or abort. Use `/new` only to establish a fresh epoch for later traffic; an accepted old batch remains fenced until status/tail proves a terminal result.
+- **Session bootstrap remains pending:** inspect `sessions inspect <originKey-or-index>` or `gajaeway ops cycle`. A pending projection means the current epoch has not completed a terminal successful turn yet; pre-success failures deliberately retry it. Repeated attempts carry the same origin+epoch bootstrap ID. Do not mark it complete manually or copy source bodies into the database. Repair unreadable memory files or rejected links at their source. In public/group channels, associated channel/project/task/handoff documents need an exact full `origin:`/`origin-key:` match and `bootstrap-safe: public` (or `bootstrap-visibility: public`); bare conversation IDs never qualify. Daily sections are admitted only when every stable-origin declaration is well formed and resolves to one consistent current-origin key. The configured `memory/` root may itself be a symlink, but every followed target must remain beneath that resolved memory root.
+- **`config.json is unreadable (...); refusing to start on defaults`:** the file exists but cannot be read (permissions, a directory in its place, or a symlink whose target is missing). The daemon exits non-zero rather than booting on defaults. Fix the file, then start the service again; a reload in a running daemon keeps the previous configuration and reports the same diagnostic.
