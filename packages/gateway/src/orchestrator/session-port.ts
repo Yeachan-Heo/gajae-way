@@ -178,7 +178,26 @@ export class BrokerSessionPort implements SessionPort {
 		if (!Number.isSafeInteger(input.epoch) || input.epoch < 0) throw new Error("session epoch must be a non-negative integer");
 		const existing = this.#database.getSessionRecord(input.originKey);
 		if (existing?.epoch === input.epoch && existing.sessionId) {
-			return { sessionId: existing.sessionId, originKey: input.originKey, epoch: input.epoch, repo: input.repo };
+			// A persisted binding is only reusable if the broker still indexes it. A
+			// binding written against a store the current runtime cannot read
+			// (pre-cutover session ids) must be rebound, not handed to a send that
+			// will fail with session_unavailable forever. Inspect failure (transport
+			// outage) keeps the binding: that is not evidence the session is gone.
+			let indexed = true;
+			try {
+				// Judged on the raw envelope: gjc >= 0.16.0 reports a live session with a
+				// locator that lacks `repo`, which the subsession normalizer treats as
+				// absent. "Not indexed" is the broker disowning the id, nothing else.
+				const result = await this.#cli(["sdk", "session", "inspect", existing.sessionId, "--repo", input.repo]);
+				const envelope = JSON.parse(result.stdout) as { ok?: unknown; error?: { code?: unknown } };
+				if (envelope.ok === false) indexed = envelope.error?.code !== "session_unavailable";
+			} catch {
+				indexed = true;
+			}
+			if (indexed) return { sessionId: existing.sessionId, originKey: input.originKey, epoch: input.epoch, repo: input.repo };
+			const rebound = this.#database.rebindEpoch(input.originKey);
+			console.error(`session_rebound origin=${input.originKey} epoch=${input.epoch} nextEpoch=${rebound} session=${existing.sessionId} reason=not_indexed_by_broker`);
+			return await this.bind({ ...input, epoch: rebound });
 		}
 		const idempotencyKey = sessionCreateRef(this.#instanceId, input.originKey, input.epoch, input.repo);
 		const created = await this.#createSession(input.repo, idempotencyKey);

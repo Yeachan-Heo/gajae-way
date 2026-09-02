@@ -82,6 +82,12 @@ test("broker SessionPort reuses the durable epoch binding and does not recreate 
 	const calls: string[][] = [];
 	const run: CliRunner = async (args) => {
 		calls.push([...args]);
+		if (args.includes("inspect"))
+			return {
+				exitCode: 0,
+				stdout: JSON.stringify({ ok: true, result: { session: { sessionId: "sdk-1", live: true, deleted: false, locator: { cwd: "/tmp/repo", worktreeRoot: "/tmp/repo" } } } }),
+				stderr: "",
+			};
 		return { exitCode: 0, stdout: JSON.stringify({ ok: true, result: { sessionId: "sdk-1" } }), stderr: "" };
 	};
 	const port = new BrokerSessionPort({
@@ -181,4 +187,35 @@ test("broker SessionPort retries a terminal-uncertain lifecycle create with the 
 	});
 	expect(createCalls).toBe(2);
 	expect(sleeps).toEqual([1_000]);
+});
+
+test("bind rebinds a persisted session the broker no longer indexes instead of handing it to a send", async () => {
+	const { mkdtemp, rm } = await import("node:fs/promises");
+	const { tmpdir } = await import("node:os");
+	const { join } = await import("node:path");
+	const { GatewayDatabase } = await import("../src/store/db");
+	const { BrokerSessionPort } = await import("../src/orchestrator/session-port");
+	const { TailRunner } = await import("../src/orchestrator/tail-runner");
+	const home = await mkdtemp(join(tmpdir(), "gajaeway-bind-dead-"));
+	const database = await GatewayDatabase.open(join(home, "gateway.db"));
+	try {
+		const repo = join(home, "workspace");
+		database.putSessionAtEpoch("monitor/eventtype/x", "dead-session", 1);
+		const commands: string[][] = [];
+		const cli = async (args: readonly string[]) => {
+			commands.push([...args]);
+			if (args.includes("inspect") && args.includes("dead-session"))
+				return { exitCode: 1, stdout: JSON.stringify({ ok: false, error: { code: "session_unavailable", message: "not indexed" } }), stderr: "" };
+			if (args.includes("session.create")) return { exitCode: 0, stdout: JSON.stringify({ ok: true, result: { sessionId: "fresh-session" } }), stderr: "" };
+			return { exitCode: 0, stdout: JSON.stringify({ ok: true, result: {} }), stderr: "" };
+		};
+		const port = new BrokerSessionPort({ database, cli, instanceId: "i", tailRunner: new TailRunner({ run: cli, repo }) });
+		const binding = await port.bind({ originKey: "monitor/eventtype/x", epoch: 1, repo });
+		expect(binding.sessionId).toBe("fresh-session");
+		expect(binding.epoch).toBe(2);
+		expect(database.getSessionRecord("monitor/eventtype/x")).toMatchObject({ epoch: 2, sessionId: "fresh-session" });
+	} finally {
+		database.close();
+		await rm(home, { recursive: true, force: true });
+	}
 });
