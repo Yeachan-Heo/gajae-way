@@ -840,18 +840,26 @@ function nonNegativeInteger(value: number | undefined, fallback: number, name: s
 }
 
 /**
- * The durable identity of one delivered part of a persona batch: the inbound
- * trigger, the part's exact text, and its index. Never the tail event id or the
- * session: a finalized transcript row that arrives on the tail and the same
- * answer surfaced later by status reconcile (or by a rebuilt lifecycle after a
- * gateway restart) must hash to one ledger row.
+ * Identity of one INTERIM delivery of a persona batch: the inbound trigger,
+ * the part's exact text, and its index. Two different mid-turn findings get two
+ * ids; the same finding replayed (stream reopen backfill, gateway restart with
+ * an id-less frame) hashes to the row that already exists.
  */
-export function deterministicTriggerDeliveryId(
+export function deterministicInterimDeliveryId(
 	originKey: string,
 	triggerMessageId: string,
 	text: string,
 	part: number,
 ): string {
 	const digest = createHash("sha256").update(`${originKey}|${triggerMessageId}|${part}|`).update(text).digest("hex");
-	return `gw-t-${digest.slice(0, 32)}`;
+	return `gw-i-${digest.slice(0, 32)}`;
+}
+
+/**
+ * Identity of the batch's ONE terminal reply slot per part: the inbound trigger
+ * and the part index, never the text. A regenerated or reconciled second answer
+ * for the same trigger hashes to the same row and is dropped by the ledger.
+ */
+export function deterministicTerminalDeliveryId(originKey: string, triggerMessageId: string, part: number): string {
+	return `gw-t-${createHash("sha256").update(`${originKey}|${triggerMessageId}|${part}`).digest("hex").slice(0, 32)}`;
 }

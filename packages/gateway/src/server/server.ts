@@ -63,7 +63,7 @@ import {
 } from "../orchestrator/persona-session";
 import { formatFailureNotice, sanitizeDiagnostic } from "../orchestrator/rebind";
 import { type SessionPort, SessionRequestTimeoutError } from "../orchestrator/session-port";
-import { deterministicTriggerDeliveryId } from "../orchestrator/tail-runner";
+import { deterministicInterimDeliveryId, deterministicTerminalDeliveryId } from "../orchestrator/tail-runner";
 import { buildSessionBootstrap } from "../persona/bootstrap";
 import { PersonaLoader } from "../persona/persona";
 import type { GatewayDatabase, InboundMessageRow, MonitorEventStage } from "../store/db";
@@ -1612,7 +1612,7 @@ async function createInboundTurnLifecycle(
 	const maxTurnParts = 10;
 	const interimSpeech = new InterimSpeechGate(options.interimSpeech);
 	let lastDeliveredRaw: string | undefined;
-	const deliverAssistantText = (rawMessage: string) => {
+	const deliverAssistantText = (rawMessage: string, source: "interim" | "terminal") => {
 		if (!nonLoopback) return;
 		lastDeliveredRaw = rawMessage;
 		let message = rawMessage;
@@ -1664,14 +1664,27 @@ async function createInboundTurnLifecycle(
 		for (let index = 0; index < planned.length; index++) {
 			if (deliveredParts.length >= maxTurnParts) return;
 			const step = planned[index] as { body: string; replyTo?: string };
-			// Every delivery of this batch is keyed on the durable inbound trigger
-			// and the exact text of the part. A tail frame that carries the
-			// finalized answer and a later onTerminal for the same batch (fence ->
-			// status reconcile, recovery re-adoption, retired replay, gateway
-			// restart) therefore produce the SAME id and collide in the ledger via
-			// INSERT OR IGNORE. Two genuinely different interim texts get two ids;
-			// a replayed id-less interim frame after restart gets its old id back.
-			const deliveryId = deterministicTriggerDeliveryId(key, input.batch.triggerMessageId, step.body, index);
+			// Interim parts are keyed on (trigger, text, part): distinct findings get
+			// distinct rows, a replayed finding (stream backfill, id-less frame after
+			// restart) collides. The terminal reply owns ONE slot per part keyed on
+			// (trigger, part) only, so a regenerated or reconciled second answer for
+			// the same inbound message can never post, whatever its text.
+			const deliveryId =
+				source === "terminal"
+					? deterministicTerminalDeliveryId(key, input.batch.triggerMessageId, index)
+					: deterministicInterimDeliveryId(key, input.batch.triggerMessageId, step.body, index);
+			if (source === "terminal") {
+				// A finalized answer that already shipped on the tail satisfied the
+				// slot; the durable claim makes that survive a gateway restart.
+				const interimId = deterministicInterimDeliveryId(key, input.batch.triggerMessageId, step.body, index);
+				const priorRow = runtime.delivery.get(interimId);
+				const owner = options.database.inboundBatchClaimTerminal(
+					input.batch.batchKey,
+					index,
+					priorRow ? interimId : deliveryId,
+				);
+				if (owner !== deliveryId) continue;
+			}
 			const payload = runtime.delivery.prepare(crypto.randomUUID(), origin, step.body, step.replyTo, deliveryId);
 			if (!payload) continue;
 			deliveredParts.push(step.body);
@@ -1734,7 +1747,7 @@ async function createInboundTurnLifecycle(
 			try {
 				const decision = interimSpeech.admit(frame.assistantText, Date.now(), { toolCallsSoFar: lastKnown.toolCalls });
 				if (!decision.deliver) console.error(`gateway mid-work speech suppressed (${turnId}, ${decision.reason}).`);
-				else deliverAssistantText(frame.assistantText);
+				else deliverAssistantText(frame.assistantText, "interim");
 			} catch (error) {
 				console.error(`gateway intermediate delivery failed (${turnId}): ${diagnostic(error)}`);
 			}
@@ -1794,7 +1807,7 @@ async function createInboundTurnLifecycle(
 				return;
 			}
 			const capturedUser = speaker ? `${speaker} @ ${place}: ${userText}` : userText;
-			if (lastDeliveredRaw !== text) deliverAssistantText(text);
+			if (lastDeliveredRaw !== text) deliverAssistantText(text, "terminal");
 			if (deliveredParts.length === 0) {
 				if (reactionTokensSeen)
 					runtime.memory.enqueue({

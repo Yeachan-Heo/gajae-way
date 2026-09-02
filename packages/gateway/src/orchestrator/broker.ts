@@ -95,6 +95,8 @@ const DEFAULT_HEALTH_INTERVAL_MS = 5_000;
 const DEFAULT_HEALTH_PROBE_TIMEOUT_MS = 10_000;
 /** Consecutive failed periodic probes before a generation is fenced. A single slow probe under load must not retire every live turn. */
 const HEALTH_FAILURE_STRIKES = 3;
+/** Consecutive readiness attempts that find a live-looking endpoint failing the application probe before the daemon is retired. */
+const WEDGED_DAEMON_STRIKES = 3;
 /** Concurrent `gjc sdk` invocations per gateway; more only multiplies daemon spawn races. */
 const MAX_CONCURRENT_CLI = 4;
 /** How long a non-probe invocation waits for a fenced generation to recover before failing. */
@@ -667,6 +669,12 @@ export class BrokerSupervisor implements PersonaBroker {
 	}
 
 	async #awaitHealthy(active: ActiveBroker): Promise<void> {
+		// A daemon that keeps publishing a fresh heartbeat but fails the
+		// application probe (session Router wedged) would otherwise be probed
+		// forever: readiness refuses to launch while discovery looks live. After
+		// this many consecutive live-but-unhealthy attempts the daemon is retired
+		// and the next attempt launches a replacement.
+		let liveButUnhealthy = 0;
 		for (let attempt = 0; attempt < this.#readinessAttempts; attempt++) {
 			if (this.#stopping) throw new Error("broker observation stopped during readiness");
 			if (this.#active !== active) throw new Error("broker observation was replaced before readiness completed");
@@ -675,14 +683,23 @@ export class BrokerSupervisor implements PersonaBroker {
 					if (this.#startupStabilizationMs > 0) await sleep(this.#startupStabilizationMs);
 					return;
 				}
-				// The endpoint probe never spawns. gjc auto-starts its daemon on the
-				// first agent-dir-scoped sdk command, so when no live discovery exists
-				// one CLI call is the launch trigger; its envelope is not the health
-				// verdict, the next endpoint probe is.
-				if (this.#spawnsDaemon && !(await readBrokerDiscovery(this.discoveryPath, this.#isPidAlive))) {
-					const launch = await this.cli([...brokerHealthArgs()], { timeoutMs: DEFAULT_COMMAND_TIMEOUT_MS });
-					if (!isHealthySessionList(launch))
-						this.#log(`broker daemon launch command exited ${launch.exitCode} without a session-list envelope`);
+				if (this.#spawnsDaemon) {
+					const discovery = await readBrokerDiscovery(this.discoveryPath, this.#isPidAlive);
+					if (discovery && ++liveButUnhealthy >= WEDGED_DAEMON_STRIKES) {
+						this.#log(
+							`broker_daemon_retired pid=${discovery.pid} reason=live_endpoint_failed_application_probe strikes=${liveButUnhealthy}`,
+						);
+						await this.#retireDaemon(discovery.pid);
+						liveButUnhealthy = 0;
+					} else if (!discovery) {
+						// The endpoint probe never spawns. gjc auto-starts its daemon on
+						// the first agent-dir-scoped sdk command, so when no live discovery
+						// exists one CLI call is the launch trigger; its envelope is not
+						// the health verdict, the next endpoint probe is.
+						const launch = await this.cli([...brokerHealthArgs()], { timeoutMs: DEFAULT_COMMAND_TIMEOUT_MS });
+						if (!isHealthySessionList(launch))
+							this.#log(`broker daemon launch command exited ${launch.exitCode} without a session-list envelope`);
+					}
 				}
 			} catch (error) {
 				this.#log(`broker health probe during startup failed: ${diagnostic(error)}`);
@@ -690,6 +707,27 @@ export class BrokerSupervisor implements PersonaBroker {
 			if (attempt + 1 < this.#readinessAttempts) await sleep(this.#readinessDelayMs);
 		}
 		throw new Error(`broker daemon did not become healthy after ${this.#readinessAttempts} probe(s)`);
+	}
+
+	/**
+	 * Ends the private daemon process (and its hosts) so gjc can start a fresh
+	 * one, and removes its stale discovery so readiness stops trusting it. The
+	 * agent directory itself is never touched: sessions are durable and resume.
+	 */
+	async #retireDaemon(pid: number): Promise<void> {
+		await reapAgentDir(this.agentDir, this.#log, this.#isPidAlive);
+		if (await this.#isPidAlive(pid)) {
+			try {
+				process.kill(pid, "SIGKILL");
+			} catch {
+				// already gone
+			}
+		}
+		try {
+			await unlink(this.discoveryPath);
+		} catch (error) {
+			if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+		}
 	}
 
 	#startHealthTimer(): void {

@@ -1,0 +1,129 @@
+{
+ "schemaVersion": 1,
+ "kind": "api-package-test-report",
+ "sourceHash": "sha256:881cead94042b40886ab650eb389b38de64e3ececd2ea2dcb3b8d74a3b90168c",
+ "head": "72180c36da4768e14e90775b7c21f1de671d2e60",
+ "command": "bun test packages/gateway/test/broker-supervisor.test.ts packages/gateway/test/terminal-idempotency.e2e.test.ts packages/gateway/test/tail-progress.test.ts packages/adapter-discord/test/reactions.test.ts packages/adapter-discord/test/recovery.test.ts",
+ "junit": "/tmp/junit.xml",
+ "totals": {
+  "tests": 90,
+  "passed": 90,
+  "failed": 0
+ },
+ "cases": [
+  {
+   "id": "P1",
+   "obligation": "token mismatch -> probe false",
+   "verdict": "passed",
+   "testSubstring": "bad token, or a silent daemon"
+  },
+  {
+   "id": "P2",
+   "obligation": "heartbeat 15001 rejected / 14999 accepted",
+   "verdict": "passed",
+   "testSubstring": "red-team P2/P5"
+  },
+  {
+   "id": "P3",
+   "obligation": "non-hello first frame -> false",
+   "verdict": "passed",
+   "testSubstring": "red-team P3/P7"
+  },
+  {
+   "id": "P4",
+   "obligation": "silent/stalled daemon resolves false at timeout, not before, not hanging",
+   "verdict": "passed",
+   "testSubstring": "red-team B1"
+  },
+  {
+   "id": "P5",
+   "obligation": "malformed/missing/dead-pid discovery -> false, no throw",
+   "verdict": "passed",
+   "testSubstring": "red-team P2/P5"
+  },
+  {
+   "id": "P6",
+   "obligation": "probe lane not starved by 4+1 observation spawns",
+   "verdict": "passed",
+   "testSubstring": "has its own lane"
+  },
+  {
+   "id": "P6b",
+   "obligation": "timed-out child holds slot until exit",
+   "verdict": "passed",
+   "testSubstring": "red-team F6"
+  },
+  {
+   "id": "P7",
+   "obligation": "live discovery -> zero gjc spawns at readiness",
+   "verdict": "passed",
+   "testSubstring": "red-team P3/P7"
+  },
+  {
+   "id": "B1",
+   "obligation": "hello-OK but routing stalled/erroring -> unhealthy; routing OK -> healthy; wrong protocolVersion -> false",
+   "verdict": "passed",
+   "testSubstring": "red-team B1"
+  },
+  {
+   "id": "F4",
+   "obligation": "structural URL validation incl. userinfo attack",
+   "verdict": "passed",
+   "testSubstring": "red-team F4"
+  },
+  {
+   "id": "I1",
+   "obligation": "fenced tail then status reconcile -> one onTerminal per batch",
+   "verdict": "passed",
+   "testSubstring": "invokes onTerminal for one batch at most once"
+  },
+  {
+   "id": "B2",
+   "obligation": "answer shipped on tail, gateway restart, reconcile -> no new ledger row",
+   "verdict": "passed",
+   "testSubstring": "red-team B2"
+  },
+  {
+   "id": "I2/I5",
+   "obligation": "[BREAK] parts keyed per part; same text replay collides; different text documented as new id",
+   "verdict": "passed",
+   "testSubstring": "red-team I2/I5"
+  },
+  {
+   "id": "I4",
+   "obligation": "id-less interim frames: distinct texts distinct ids, replayed text collides",
+   "verdict": "passed",
+   "testSubstring": "red-team I4"
+  },
+  {
+   "id": "I6",
+   "obligation": "tail-less reconcile never reposts previous turn (omitStartedAt, session-wide last_assistant)",
+   "verdict": "passed",
+   "testSubstring": "never reposts a previous turn"
+  },
+  {
+   "id": "A1",
+   "obligation": "50035 from messages.fetch and from react -> ambiguous:false",
+   "verdict": "passed",
+   "testSubstring": "50035"
+  },
+  {
+   "id": "A2",
+   "obligation": "a non-permanent Discord failure (429 exhausting retries) stays ambiguous:true",
+   "verdict": "passed",
+   "testSubstring": "outlives the attempt bound"
+  },
+  {
+   "id": "A3",
+   "obligation": "engagement.reaction rejection logs, never reconnects",
+   "verdict": "passed",
+   "testSubstring": "never a reconnect"
+  },
+  {
+   "id": "G1",
+   "obligation": "chat.progress from tail only; no transcript.list/usage.get; one final frame",
+   "verdict": "passed",
+   "testSubstring": "red-team G1"
+  }
+ ]
+}

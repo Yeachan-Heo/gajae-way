@@ -15,7 +15,7 @@ import type { GjcModelSelection } from "../config";
 import type { GatewayDatabase, InboundBatch, InboundMessageRow } from "../store/db";
 import { sanitizeDiagnostic } from "./rebind";
 import type { SessionBinding, SessionPort } from "./session-port";
-import { deterministicTriggerDeliveryId, TailCapacityError, type TailFrame, type TailHandle } from "./tail-runner";
+import { deterministicInterimDeliveryId, TailCapacityError, type TailFrame, type TailHandle } from "./tail-runner";
 
 export const DEFAULT_SETTLE_WINDOW_MS = 2_000;
 export const DEFAULT_STALL_TIMEOUT_MS = 120_000;
@@ -1164,7 +1164,7 @@ class OriginActor {
 						originKey: this.originKey,
 						sessionId,
 						eventId: frame.eventId,
-						deliveryId: deterministicTriggerDeliveryId(
+						deliveryId: deterministicInterimDeliveryId(
 							this.originKey,
 							bound.batch.triggerMessageId,
 							frame.assistantText,
@@ -1320,18 +1320,16 @@ class OriginActor {
 					bound.tailTerminalObserved && bound.lastAssistantText !== undefined ? bound.lastAssistantText : undefined;
 				if (text === undefined) {
 					// Tail-less reconcile: only accept an assistant row produced by THIS
-					// batch. The floor must be stamped BEFORE dispatch, or a crash between
-					// the daemon finishing and the gateway recording acceptance would push
-					// the floor past the real answer and discard it. The settle cutoff is
-					// exactly that: durable in the batch key before the send ever happens.
-					// The runtime's own startedAt tightens the floor when it is reported
-					// and cannot postdate the answer, so the earlier of the two wins.
-					const settledAt = settleCutoffMs(bound.batch.batchKey);
+					// operation. The runtime's own startedAt is exact; when it is absent
+					// the fallback is dispatched_at, stamped at bind BEFORE the send and
+					// never moved by a re-bind, so it can neither postdate the answer
+					// (accepted_at could) nor predate the previous turn's answer (the
+					// settle cutoff could, on the failed-steer backlog path).
 					const startedAt = report.status.startedAt;
-					const candidates = [settledAt, typeof startedAt === "number" ? startedAt : Number.NaN].filter(
-						Number.isFinite,
-					);
-					const notBeforeMs = candidates.length > 0 ? Math.min(...candidates) : undefined;
+					const dispatchedAt = this.#manager.database.inboundBatchDispatchedAt(bound.batch.batchKey);
+					const dispatchedMs = dispatchedAt ? Date.parse(dispatchedAt) : Number.NaN;
+					const notBeforeMs =
+						typeof startedAt === "number" ? startedAt : Number.isFinite(dispatchedMs) ? dispatchedMs : undefined;
 					const port = this.#manager.port;
 					if (notBeforeMs !== undefined && port.fetchAssistantSince) {
 						const since = await port.fetchAssistantSince({
@@ -1537,17 +1535,6 @@ export function personaBatchKey(
 	retryAttempt = 0,
 ): string {
 	return `${originKey}|${epoch}|${oldestMessageId}|${cutoff}|${retryAttempt}`;
-}
-
-/**
- * The settle cutoff is the second-to-last `|` segment of a persona batch key
- * (origin keys may themselves contain `|`-free but arbitrary text, so parse
- * from the right). It is the durable pre-dispatch timestamp for that batch.
- */
-export function settleCutoffMs(batchKey: string): number {
-	const parts = batchKey.split("|");
-	const cutoff = parts.length >= 5 ? parts[parts.length - 2] : undefined;
-	return cutoff ? Date.parse(cutoff) : Number.NaN;
 }
 
 /** The actor's one prompt body is fixed at the durable boundary; later rows route through steering or the next batch. */

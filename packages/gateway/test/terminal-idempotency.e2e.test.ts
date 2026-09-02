@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { GatewayConfig } from "../src/config";
 import { PersonaSessionManager } from "../src/orchestrator/persona-session";
-import { deterministicTriggerDeliveryId } from "../src/orchestrator/tail-runner";
+import { deterministicTerminalDeliveryId } from "../src/orchestrator/tail-runner";
 import { type GatewayServer, startUnixServer } from "../src/server/server";
 import { GatewayDatabase } from "../src/store/db";
 import { ScriptedSessionPort } from "./session-port.fake";
@@ -164,7 +164,7 @@ test("red-team B2: the answer ships on the tail, the gateway restarts, status re
 	await eventually(() => messages(client).length === 1, "tail answer was not delivered");
 	const before = database!.deliveryRows().filter((row) => row.origin_key === "discord/channel/chan-1");
 	expect(before).toHaveLength(1);
-	expect(before[0]!.delivery_id.startsWith("gw-t-")).toBe(true);
+	expect(before[0]!.delivery_id.startsWith("gw-i-")).toBe(true);
 	// The gateway dies before the batch completes; the daemon finishes the op.
 	const dbPath = join(directory, "gateway.db");
 	await server!.stop();
@@ -193,7 +193,7 @@ test("red-team B2: the answer ships on the tail, the gateway restarts, status re
 	expect(after.map((row) => row.delivery_id)).toEqual(before.map((row) => row.delivery_id));
 }, 20_000);
 
-test("red-team I2/I5: [BREAK] parts are keyed per part; a regenerated different answer for the same trigger still adds no row", async () => {
+test("red-team I2/I5: [BREAK] parts own per-part terminal slots; a regenerated DIFFERENT answer for the same trigger posts nothing", async () => {
 	const port = new ScriptedSessionPort();
 	const { client } = await startGateway(port);
 	sendChannelMessage(client, "b1", "세 조각으로");
@@ -203,19 +203,86 @@ test("red-team I2/I5: [BREAK] parts are keyed per part; a regenerated different 
 	await eventually(() => messages(client).length === 3, "three parts were not delivered");
 	const rows = () => database!.deliveryRows().filter((row) => row.origin_key === "discord/channel/chan-1");
 	expect(rows().map((row) => JSON.parse(row.payload_json).text)).toEqual(["하나", "둘", "셋"]);
-	expect(new Set(rows().map((row) => row.delivery_id)).size).toBe(3);
-	// A second terminal for the same trigger with different text: identity is
-	// trigger+text+part, so genuinely new text WOULD get a new id. That is the
-	// documented tradeoff: the ledger guards against replaying the same answer,
-	// not against the model producing a different one for a retried op.
-	const regenerated = deterministicTriggerDeliveryId("discord/channel/chan-1", "m-b1", "다른 답", 0);
-	expect(rows().some((row) => row.delivery_id === regenerated)).toBe(false);
-	// Same text, same part, replayed: no new row.
-	const replay = deterministicTriggerDeliveryId("discord/channel/chan-1", "m-b1", "둘", 1);
-	expect(rows().some((row) => row.delivery_id === replay)).toBe(true);
-	expect(
-		database!.deliveryCreate({ id: replay, turnId: "replay", originKey: "discord/channel/chan-1", payloadJson: "{}" }),
-	).toBe(false);
+	expect(rows().every((row) => row.delivery_id.startsWith("gw-t-"))).toBe(true);
+	// A second onTerminal for the SAME trigger with DIFFERENT text: the terminal
+	// id is text-independent, so every part collides with the existing slot and
+	// the ledger refuses the insert. Exercise the real ledger, not a computed id.
+	for (let part = 0; part < 3; part++) {
+		const id = deterministicTerminalDeliveryId("discord/channel/chan-1", "m-b1", part);
+		expect(
+			database!.deliveryCreate({
+				id,
+				turnId: "regenerated",
+				originKey: "discord/channel/chan-1",
+				payloadJson: JSON.stringify({ text: "다른 답" }),
+			}),
+		).toBe(false);
+	}
+	expect(rows()).toHaveLength(3);
+});
+
+test("red-team G2-B3: a message that arrived mid-turn and dispatched later never inherits the previous answer", async () => {
+	const port = new ScriptedSessionPort();
+	port.omitStartedAt = true;
+	port.fetchLastAssistant = async ({ sessionId }) => {
+		const last = [...port.transcript(sessionId)].reverse().find((text) => text.length > 0);
+		if (last === undefined) throw new Error("no assistant row");
+		return { text: last, pages: 1, complete: true };
+	};
+	directory = await mkdtemp(join(tmpdir(), "gajaeway-terminal-backlog-"));
+	database = await GatewayDatabase.open(join(directory, "gateway.db"));
+	const terminals: Array<{ trigger: string; text: string }> = [];
+	const manager = new PersonaSessionManager({
+		database,
+		port,
+		instanceId: "backlog",
+		repo: join(directory, "workspace"),
+		settleWindowMs: 0,
+		onTurnStart: ({ rows, batch }) => ({
+			text: rows.map((row) => row.body).join("\n"),
+			onTerminal: ({ text }) => {
+				terminals.push({ trigger: batch.triggerMessageId, text });
+			},
+		}),
+		log: () => {},
+	});
+	const enqueue = (messageId: string, body: string, receivedAt: string) =>
+		expect(
+			database!.inboundEnqueue({
+				messageId,
+				originKey: "discord/channel/chan-1",
+				originRefJson: JSON.stringify({ platform: "discord", kind: "channel", conversationId: "chan-1" }),
+				body,
+				receivedAt,
+			}),
+		).toBe(true);
+	try {
+		// Turn 1 is running when message 2 arrives (steer fails, row stays pending).
+		enqueue("m-c1", "첫 질문", new Date(Date.now() - 5_000).toISOString());
+		await manager.notifyInbound("discord/channel/chan-1");
+		await eventually(() => port.sends.length === 1, "first turn was not sent");
+		enqueue("m-c2", "밀린 질문", new Date(Date.now() - 4_000).toISOString());
+		// Turn 1 completes AFTER message 2's inclusion cutoff (received_at + 0ms).
+		await Bun.sleep(50);
+		port.complete(port.sends[0]!.opRef, "첫 답");
+		await eventually(() => terminals.length === 1, "first reply missing");
+		// The backlog batch dispatches now with an old cutoff; its op then ends
+		// with NO assistant row of its own.
+		await manager.notifyInbound("discord/channel/chan-1");
+		await eventually(() => port.sends.length === 2, "backlog turn was not sent");
+		const second = port.sends[1]!;
+		port.seedOperation(second.opRef, second.sessionId, "terminal_ok", "");
+		await manager.reconcile("discord/channel/chan-1");
+		await Bun.sleep(400);
+		await manager.reconcile("discord/channel/chan-1");
+		await eventually(() => terminals.length === 2, "backlog batch never completed");
+		expect(terminals).toEqual([
+			{ trigger: "m-c1", text: "첫 답" },
+			{ trigger: "m-c2", text: "" },
+		]);
+	} finally {
+		await manager.stop();
+	}
 });
 
 test("red-team I4: two different id-less interim texts get distinct ids; the same interim text replayed collides", async () => {

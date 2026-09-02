@@ -50,6 +50,10 @@ export interface InboundMessageRow {
 	readonly accepted_at: string | null;
 	/** Bound before send so an accepted retired batch can reattach after restart. */
 	readonly bound_session_id: string | null;
+	/** Stamped at bind, before the send; the earliest wall clock this batch's answer can carry. */
+	readonly dispatched_at: string | null;
+	/** The ledger delivery that satisfied this batch's single terminal reply slot. */
+	readonly terminal_delivery_id: string | null;
 }
 
 export interface InboundBatch {
@@ -71,7 +75,7 @@ export class InboundBatchConflictError extends Error {
 	}
 }
 
-const LATEST_SCHEMA_VERSION = 17;
+const LATEST_SCHEMA_VERSION = 18;
 /** Maximum number of prior messages supplied to one engaged conversation turn. */
 export const CONVERSATION_DIFF_MAX_ROWS = 60;
 /** Maximum age of prior messages supplied to one engaged conversation turn. */
@@ -563,7 +567,7 @@ export class GatewayDatabase {
 		return (
 			this.#database
 				.query<InboundMessageRow, [string]>(
-					"SELECT message_id, origin_key, origin_ref_json, body, engagement_json, state, received_at, batch_key, batch_role, batch_epoch, batch_state, attributed_op_ref, accepted_at, bound_session_id FROM inbound_messages WHERE origin_key = ? AND state = 'pending' AND batch_state IS NULL ORDER BY received_at, message_id LIMIT 1",
+					"SELECT message_id, origin_key, origin_ref_json, body, engagement_json, state, received_at, batch_key, batch_role, batch_epoch, batch_state, attributed_op_ref, accepted_at, bound_session_id, dispatched_at, terminal_delivery_id FROM inbound_messages WHERE origin_key = ? AND state = 'pending' AND batch_state IS NULL ORDER BY received_at, message_id LIMIT 1",
 				)
 				.get(originKey) ?? undefined
 		);
@@ -615,7 +619,7 @@ export class GatewayDatabase {
 			if ((existing ?? 0) > 0) throw new InboundBatchConflictError(input.originKey, input.epoch);
 			const rows = this.#database
 				.query<InboundMessageRow, [string, string]>(
-					"SELECT message_id, origin_key, origin_ref_json, body, engagement_json, state, received_at, batch_key, batch_role, batch_epoch, batch_state, attributed_op_ref, accepted_at, bound_session_id FROM inbound_messages WHERE origin_key = ? AND state = 'pending' AND batch_state IS NULL AND received_at <= ? ORDER BY received_at, message_id",
+					"SELECT message_id, origin_key, origin_ref_json, body, engagement_json, state, received_at, batch_key, batch_role, batch_epoch, batch_state, attributed_op_ref, accepted_at, bound_session_id, dispatched_at, terminal_delivery_id FROM inbound_messages WHERE origin_key = ? AND state = 'pending' AND batch_state IS NULL AND received_at <= ? ORDER BY received_at, message_id",
 				)
 				.all(input.originKey, input.cutoff);
 			for (const [index, row] of rows.entries())
@@ -654,8 +658,12 @@ export class GatewayDatabase {
 		});
 	}
 
-	/** Persists the owning SDK session before send, including for settled crash recovery. */
-	inboundBatchBindSession(batchKey: string, sessionId: string): boolean {
+	/**
+	 * Persists the owning SDK session before send, including for settled crash
+	 * recovery, and stamps `dispatched_at` on the FIRST bind only: a re-bind
+	 * during recovery must not move the floor past an answer already written.
+	 */
+	inboundBatchBindSession(batchKey: string, sessionId: string, dispatchedAt = new Date().toISOString()): boolean {
 		if (!sessionId) throw new Error("batch session id must not be empty");
 		return this.withTransaction(() => {
 			const rows = this.inboundBatchRows(batchKey);
@@ -665,10 +673,55 @@ export class GatewayDatabase {
 			return (
 				this.#database
 					.query(
-						"UPDATE inbound_messages SET bound_session_id = ? WHERE batch_key = ? AND state = 'pending' AND batch_state IN ('settled', 'accepted')",
+						"UPDATE inbound_messages SET bound_session_id = ?, dispatched_at = COALESCE(dispatched_at, ?) WHERE batch_key = ? AND state = 'pending' AND batch_state IN ('settled', 'accepted')",
 					)
-					.run(sessionId, batchKey).changes > 0
+					.run(sessionId, dispatchedAt, batchKey).changes > 0
 			);
+		});
+	}
+
+	/** The batch's pre-send dispatch stamp, if it was ever bound. */
+	inboundBatchDispatchedAt(batchKey: string): string | undefined {
+		return (
+			this.#database
+				.query<{ dispatched_at: string | null }, [string]>(
+					"SELECT dispatched_at FROM inbound_messages WHERE batch_key = ? AND dispatched_at IS NOT NULL LIMIT 1",
+				)
+				.get(batchKey)?.dispatched_at ?? undefined
+		);
+	}
+
+	/**
+	 * Claims one terminal reply slot (`part`) of a batch for `deliveryId`. The
+	 * trigger row stores the claims as a JSON map of part -> delivery id.
+	 * Returns the id that owns the slot after the call: the claimant's when the
+	 * slot was free, otherwise the earlier winner's. Durable, so a rebuilt
+	 * lifecycle after a restart sees the claim.
+	 */
+	inboundBatchClaimTerminal(batchKey: string, part: number, deliveryId: string): string {
+		return this.withTransaction(() => {
+			const row = this.#database
+				.query<{ terminal_delivery_id: string | null }, [string]>(
+					"SELECT terminal_delivery_id FROM inbound_messages WHERE batch_key = ? AND batch_role = 'trigger'",
+				)
+				.get(batchKey);
+			let claims: Record<string, string> = {};
+			if (row?.terminal_delivery_id) {
+				try {
+					const parsed: unknown = JSON.parse(row.terminal_delivery_id);
+					if (typeof parsed === "object" && parsed !== null) claims = parsed as Record<string, string>;
+				} catch {
+					claims = {};
+				}
+			}
+			const key = String(part);
+			const owner = claims[key];
+			if (owner) return owner;
+			claims[key] = deliveryId;
+			this.#database
+				.query("UPDATE inbound_messages SET terminal_delivery_id = ? WHERE batch_key = ? AND batch_role = 'trigger'")
+				.run(JSON.stringify(claims), batchKey);
+			return deliveryId;
 		});
 	}
 
@@ -730,7 +783,7 @@ export class GatewayDatabase {
 	inboundBatchRows(batchKey: string): readonly InboundMessageRow[] {
 		return this.#database
 			.query<InboundMessageRow, [string]>(
-				"SELECT message_id, origin_key, origin_ref_json, body, engagement_json, state, received_at, batch_key, batch_role, batch_epoch, batch_state, attributed_op_ref, accepted_at, bound_session_id FROM inbound_messages WHERE batch_key = ? ORDER BY received_at, message_id",
+				"SELECT message_id, origin_key, origin_ref_json, body, engagement_json, state, received_at, batch_key, batch_role, batch_epoch, batch_state, attributed_op_ref, accepted_at, bound_session_id, dispatched_at, terminal_delivery_id FROM inbound_messages WHERE batch_key = ? ORDER BY received_at, message_id",
 			)
 			.all(batchKey);
 	}
@@ -2226,6 +2279,30 @@ ALTER TABLE monitor_slots ADD COLUMN event_id TEXT;`,
 				this.#database
 					.query("INSERT INTO schema_migrations (version, applied_at) VALUES (?, ?)")
 					.run(17, new Date().toISOString());
+			});
+		}
+		if (current < 18) {
+			this.withTransaction(() => {
+				// dispatched_at: wall-clock stamped at bind time, BEFORE the send, so a
+				// tail-less reconcile has a transcript floor that can never postdate
+				// the answer (accepted_at is stamped after the CLI returns and can).
+				// terminal_delivery_id: which ledger delivery satisfied this batch's
+				// one terminal reply slot; a later terminal for the same batch is a
+				// no-op regardless of text.
+				const columns = new Set(
+					this.#database
+						.query<{ name: string }, []>("PRAGMA table_info(inbound_messages)")
+						.all()
+						.map((row) => row.name),
+				);
+				for (const [name, declaration] of [
+					["dispatched_at", "TEXT"],
+					["terminal_delivery_id", "TEXT"],
+				] as const)
+					if (!columns.has(name)) this.#database.exec(`ALTER TABLE inbound_messages ADD COLUMN ${name} ${declaration}`);
+				this.#database
+					.query("INSERT INTO schema_migrations (version, applied_at) VALUES (?, ?)")
+					.run(18, new Date().toISOString());
 			});
 		}
 	}

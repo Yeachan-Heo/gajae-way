@@ -459,6 +459,64 @@ test("red-team P3/P7: a non-hello first frame is rejected, and a live endpoint m
 	}
 });
 
+test("red-team G2-B1: a daemon that keeps a fresh heartbeat but cannot route session.list is retired and relaunched", async () => {
+	const home = await temporaryHome("gajaeway-broker-wedged-");
+	// Generation A: greets, keeps its heartbeat fresh, never answers session.list.
+	const wedged = fakeBrokerTransport("secret-token", { router: "stall" });
+	// Generation B: the replacement gjc launches after A is retired.
+	const replacement = fakeBrokerTransport("secret-token");
+	let launches = 0;
+	const killed: number[] = [];
+	const wedgedPid = 424242;
+	let agentDir = "";
+	const broker = new BrokerSupervisor({
+		ssotAgentDir: null,
+		home,
+		instanceId: "instance-wedged",
+		command: async () => {
+			launches++;
+			await writeDiscovery(agentDir, discoveryBody(replacement.url, "secret-token", { pid: process.pid }));
+			return HEALTHY;
+		},
+		isPidAlive: (pid) => pid === process.pid || (pid === wedgedPid && !killed.includes(pid)),
+		healthIntervalMs: 60_000,
+		healthProbeTimeoutMs: 100,
+		readinessDelayMs: 0,
+		readinessAttempts: 20,
+		log: () => {},
+	});
+	agentDir = broker.agentDir;
+	const originalKill = process.kill;
+	(process as { kill: typeof process.kill }).kill = ((pid: number, signal?: string | number) => {
+		if (pid === wedgedPid) {
+			killed.push(pid);
+			return true;
+		}
+		return originalKill(pid, signal as NodeJS.Signals);
+	}) as typeof process.kill;
+	try {
+		// The wedged daemon refreshes its heartbeat the whole time.
+		await writeDiscovery(agentDir, discoveryBody(wedged.url, "secret-token", { pid: wedgedPid }));
+		const refresher = setInterval(() => {
+			if (killed.length === 0)
+				void writeDiscovery(agentDir, discoveryBody(wedged.url, "secret-token", { pid: wedgedPid }));
+		}, 20);
+		try {
+			await broker.start();
+		} finally {
+			clearInterval(refresher);
+		}
+		expect(killed).toEqual([wedgedPid]);
+		expect(launches).toBe(1);
+		expect(replacement.requests.length).toBeGreaterThanOrEqual(1);
+	} finally {
+		(process as { kill: typeof process.kill }).kill = originalKill;
+		await broker.stop();
+		wedged.stop();
+		replacement.stop();
+	}
+});
+
 test("red-team F6: a timed-out CLI child holds its slot until it has actually exited", async () => {
 	const home = await temporaryHome("gajaeway-broker-timeout-child-");
 	const transport = fakeBrokerTransport("secret-token");
