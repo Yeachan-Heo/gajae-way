@@ -1105,3 +1105,37 @@ test("gateway liveness monitor reconnects only after three consecutive status fa
 	expect(monitorFailureDecision(1)).toEqual({ action: "retry", strikes: 2 });
 	expect(monitorFailureDecision(2)).toEqual({ action: "reconnect" });
 });
+
+test("a rejected engagement.reaction is logged, never a reconnect (live: 313 reconnects replaying one poisoned delivery)", async () => {
+	const cursorPath = join(home, "reaction-no-reconnect", "recovery-cursor.json");
+	const logs: string[] = [];
+	const original = console.error;
+	console.error = (line: unknown) => void logs.push(String(line));
+	const originalLog = console.log;
+	const reconnects: string[] = [];
+	console.log = (line: unknown) => void reconnects.push(String(line));
+	try {
+		const gateway = wiredGateway(
+			fakeChannel([]),
+			{
+				request: async (verb: string) => {
+					if (verb === "engagement.reaction") throw new Error("unhealthy_failed_closed");
+					return {};
+				},
+			},
+			cursorPath,
+		);
+		gateway.sendReaction(
+			{ emoji: { name: "👍" }, message: { id: "154471973767270411", channel: { id: "channel-1", name: "general" } } },
+			{ id: "user-1" },
+			"add",
+			bot,
+		);
+		await settle(20);
+		expect(logs.some((line) => line.includes("engagement.reaction failed: unhealthy_failed_closed"))).toBe(true);
+		expect(reconnects.filter((line) => line.includes("reconnecting"))).toEqual([]);
+	} finally {
+		console.error = original;
+		console.log = originalLog;
+	}
+});

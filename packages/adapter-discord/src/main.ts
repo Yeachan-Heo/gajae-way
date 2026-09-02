@@ -333,8 +333,10 @@ export function chunkDiscordMessage(text: string): string[] {
 
 export function deliveryFailureIsAmbiguous(error: unknown): boolean {
 	const code = typeof error === "object" && error !== null && "code" in error ? String(error.code) : "";
-	// Discord's known permanent target/permission errors have not dispatched a message.
-	return !new Set(["10003", "10008", "50001", "50013"]).has(code);
+	// Discord's known permanent errors have not dispatched anything: unknown channel
+	// (10003), unknown message (10008), missing access/permissions (50001, 50013),
+	// and a request Discord will reject identically forever (50035 Invalid Form Body).
+	return !new Set(["10003", "10008", "50001", "50013", "50035"]).has(code);
 }
 
 /**
@@ -1252,7 +1254,12 @@ export class ReconnectingGateway {
 		if (!described) return;
 		const client = this.#client;
 		if (!client) return;
-		void client.request("engagement.reaction", described).catch(() => this.scheduleReconnect());
+		// A rejected engagement note is metadata, not a link failure: reconnecting
+		// here replays every undelivered ledger row and re-arms typing/status for
+		// nothing. The monitor owns reconnect decisions.
+		void client.request("engagement.reaction", described).catch((error) => {
+			console.error(`Discord engagement.reaction failed: ${error instanceof Error ? error.message : String(error)}`);
+		});
 	}
 
 	/** Like sendInbound but reports the gateway's engagement decision to the caller. */

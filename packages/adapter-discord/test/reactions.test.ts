@@ -107,6 +107,57 @@ test("a deleted target message fails definitively and never confirms", async () 
 	]);
 });
 
+test("a non-snowflake target Discord rejects with 50035 fails definitively (live: UUID target replayed 19 times)", async () => {
+	const requests: Request[] = [];
+	const discord: DiscordClientLike = {
+		channels: {
+			fetch: async () => ({
+				send: async () => {},
+				messages: {
+					fetch: async (id: string) =>
+						Promise.reject(
+							Object.assign(
+								new Error(`Invalid Form Body\nmessage_id[NUMBER_TYPE_COERCE]: Value "${id}" is not snowflake.`),
+								{
+									code: 50035,
+								},
+							),
+						),
+				},
+			}),
+		},
+	};
+	await settleDiscordReaction(
+		mockGateway(requests),
+		discord,
+		reactionDelivery({ targetMessageId: "406f6a86-8033-4655-a91b-a8cc36019bdb", emoji: "👍", emojiName: "thumbsup" }),
+		new GuildEmojiResolver(),
+		instantLimiter(),
+		silent,
+	);
+	expect(requests).toHaveLength(1);
+	expect(requests[0]?.verb).toBe("delivery.fail");
+	expect(requests[0]?.params).toMatchObject({ deliveryId: "delivery-1", ambiguous: false });
+});
+
+test("Discord 50035 Invalid Form Body is permanent: the same request would fail identically on every redelivery", async () => {
+	const requests: Request[] = [];
+	const harness = channelHarness(undefined, async () => {
+		throw Object.assign(new Error("Invalid Form Body"), { code: 50035 });
+	});
+	await settleDiscordReaction(
+		mockGateway(requests),
+		harness.discord,
+		reactionDelivery({ targetMessageId: "154471973767270411", emoji: "👍", emojiName: "thumbsup" }),
+		new GuildEmojiResolver(),
+		instantLimiter(),
+		silent,
+	);
+	expect(requests).toEqual([
+		{ verb: "delivery.fail", params: { deliveryId: "delivery-1", reason: "Invalid Form Body", ambiguous: false } },
+	]);
+});
+
 test("a channel that cannot hold reactions fails definitively", async () => {
 	const requests: Request[] = [];
 	const discord: DiscordClientLike = { channels: { fetch: async () => ({ send: async () => {} }) } };
