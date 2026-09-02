@@ -170,6 +170,8 @@ async function loadOrCreateLaneJob(
 const DEFAULT_STALL_CHECK_INTERVAL_MS = 5_000;
 /** /restart: hard-exit budget after the ordered stop begins. */
 const RESTART_HARD_EXIT_MS = 15_000;
+/** Messages of recent thread history shown to a freshly started session. */
+const RECENT_HISTORY_MESSAGES = 30;
 const RESTART_EXIT_CODE = 75;
 interface Connection {
 	readonly decoder: FrameDecoder;
@@ -1522,6 +1524,7 @@ async function createInboundTurnLifecycle(
 	const place =
 		[engagement?.channelLabel, engagement?.serverLabel].filter(Boolean).join(" | ") ||
 		`${origin.platform} ${origin.kind} ${origin.conversationId}`;
+	const bootstrapState = options.database.getSessionBootstrap(key);
 	let turnText = userText;
 	let contextMessageIds: readonly string[] = [];
 	let contextOmissionRevision = 0;
@@ -1542,11 +1545,25 @@ async function createInboundTurnLifecycle(
 			omitted > 0
 				? `[${omitted} older unread message(s) omitted: ${prepared.expiredCount} expired outside floor ${prepared.effectiveFloor}, ${prepared.truncatedCount} truncated by the newest-${prepared.rows.length} window${omittedRange}]\n`
 				: "";
-		const header = lines.length
-			? `[Unread messages in this conversation since your last reply]\n${droppedNote}${lines.join("\n")}\n\n`
-			: droppedNote
-				? `${droppedNote}\n`
-				: "";
+		// A fresh session (new epoch) also gets the recent thread it is joining,
+		// not only the unread diff: without it the persona answers as if the
+		// conversation had just started.
+		const isFreshSession = !bootstrapState || bootstrapState.lastBootstrappedEpoch < input.epoch;
+		const recent = isFreshSession ? options.database.recentConversation(key, origin.conversationId, RECENT_HISTORY_MESSAGES) : [];
+		const inWindowIds = new Set(prepared.selectedMessageIds);
+		const recentLines = recent
+			.filter((entry) => entry.id === undefined || (!inWindowIds.has(entry.id) && entry.id !== row.message_id))
+			.map((entry) => `- [${entry.at}] ${entry.author}: ${entry.body.slice(0, 500)}`);
+		const recentBlock = recentLines.length
+			? `[Recent conversation history (this session just started; already answered unless listed as unread below)]\n${recentLines.join("\n")}\n\n`
+			: "";
+		const header = `${recentBlock}${
+			lines.length
+				? `[Unread messages in this conversation since your last reply]\n${droppedNote}${lines.join("\n")}\n\n`
+				: droppedNote
+					? `${droppedNote}\n`
+					: ""
+		}`;
 		// AC2: every coalesced batch member is part of THIS turn's text, whether or
 		// not the adapter recorded it in the unread-context ledger (a member without
 		// a platform messageId never reaches that ledger). Members already present
@@ -1561,7 +1578,6 @@ async function createInboundTurnLifecycle(
 		turnText = input.rows.map((member) => member.body).join("\n");
 	}
 
-	const bootstrapState = options.database.getSessionBootstrap(key);
 	const bootstrap =
 		!bootstrapState || bootstrapState.lastBootstrappedEpoch < input.epoch
 			? await buildSessionBootstrap({

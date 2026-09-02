@@ -1062,3 +1062,28 @@ test("every turn preamble carries the attachment-scope rule", async () => {
 	expect(preambles[0]).toContain("If the current message lists none, it has none");
 	client.close();
 });
+
+test("a fresh session's first turn carries recent conversation history, a later turn does not", async () => {
+	directory = await mkdtemp(join(tmpdir(), "gajaeway-server-"));
+	const config: GatewayConfig = { schemaVersion: 1, home: directory, configPath: join(directory, "config.json"), socketPath: join(directory, "gateway.sock"), dbPath: join(directory, "gateway.db"), logVerbosity: "info", dmPolicy: "open" as const, settleWindowMs: 0 };
+	const database = await GatewayDatabase.open(config.dbPath);
+	const key = "discord/dm/d-hist/peer=owner";
+	for (let i = 1; i <= 3; i++) database.contextRecord({ messageId: `old-${i}`, originKey: key, authorId: "owner", authorName: "bellman", body: `earlier message ${i}`, receivedAt: new Date(Date.now() - 60_000 * (4 - i)).toISOString() });
+	database.contextCommitWindow(key, ["old-1", "old-2", "old-3"], 0);
+	const turns: string[] = [];
+	const sessionPort = sessionPortFromResponder({ respond: async (_s, text) => { turns.push(text); return "ok"; } });
+	server = await startUnixServer({ config, database, sessionPort, onStop: () => database.close() });
+	const client = await connect(config.socketPath);
+	client.send({ v: "0.1", type: "hello", payload: { supportedVersions: ["0.1"] } });
+	await waitFor(client.frames, 1);
+	const origin = { platform: "discord", kind: "dm", conversationId: "d-hist", peerId: "owner" };
+	const say = (id: string, text: string) => client.send({ v: "0.1", type: "request", id, verb: "chat.send", params: { origin, text, messageId: id, engagement: { mentioned: false, group: false, authorId: "owner", authorName: "bellman" } } });
+	say("n1", "new question");
+	for (let attempt = 0; attempt < 400 && turns.length === 0; attempt++) await Bun.sleep(10);
+	expect(turns[0]).toContain("[Recent conversation history");
+	expect(turns[0]).toContain("earlier message 2");
+	say("n2", "follow-up");
+	for (let attempt = 0; attempt < 400 && turns.length < 2; attempt++) await Bun.sleep(10);
+	expect(turns[1]).not.toContain("[Recent conversation history");
+	client.close();
+});
