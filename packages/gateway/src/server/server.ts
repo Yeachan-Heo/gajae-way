@@ -41,7 +41,6 @@ import { type ConfigOverrides, type GatewayConfig, type ReloadResult, reloadConf
 import { DeliveryService } from "../delivery/delivery";
 import { ReactionBudget } from "../delivery/reaction-budget";
 import { decideEngagement } from "../engagement/policy";
-import { ATTACHMENT_SCOPE_NOTICE } from "./attachment-scope";
 import { ACTION_GUARD_SYSTEM_NOTICE } from "../guard/action-guard";
 import { autolinkCorpus } from "../memory/autolink";
 import { MemoryClosureQueue } from "../memory/closure";
@@ -69,6 +68,7 @@ import { buildSessionBootstrap } from "../persona/bootstrap";
 import { PersonaLoader } from "../persona/persona";
 import type { GatewayDatabase, InboundMessageRow, MonitorEventStage } from "../store/db";
 import { DeliveryLedger } from "../store/ledger";
+import { ATTACHMENT_SCOPE_NOTICE } from "./attachment-scope";
 import { OrderedFrameWriter } from "./frame-writer";
 import { InterimSpeechGate, type InterimSpeechLimits } from "./interim-speech";
 import { applyModelCommand } from "./model-command";
@@ -1551,7 +1551,12 @@ async function createInboundTurnLifecycle(
 		// conversation had just started.
 		const isFreshSession = !bootstrapState || bootstrapState.lastBootstrappedEpoch < input.epoch;
 		const recent = isFreshSession
-			? options.database.recentConversation(key, origin.conversationId, RECENT_HISTORY_MAX, new Date(Date.now() - RECENT_HISTORY_WINDOW_MS).toISOString())
+			? options.database.recentConversation(
+					key,
+					origin.conversationId,
+					RECENT_HISTORY_MAX,
+					new Date(Date.now() - RECENT_HISTORY_WINDOW_MS).toISOString(),
+				)
 			: [];
 		const inWindowIds = new Set(prepared.selectedMessageIds);
 		const recentLines = recent
