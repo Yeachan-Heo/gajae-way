@@ -542,7 +542,7 @@ export class MonitorPropagator {
 				this.#database.monitorEventFencedUpdate(row.event_id, leaseId, "dispatched", batchId),
 			);
 			if (!fenced.length) return;
-			const authored = JSON.parse(response) as Array<{ eventId?: unknown; note?: unknown }>;
+			const authored = parseAuthoredArray(response);
 			if (!Array.isArray(authored)) throw new Error("authoring response is not an array");
 			// Strict response contract: exactly one valid entry per claimed event —
 			// a partial/missing/duplicate/extra response is a structured failure.
@@ -652,7 +652,8 @@ export class MonitorPropagator {
 			const failureClass = classifyAuthoringFailure(error);
 			const code: DispatchFailureCode = failureCode(error, failureClass);
 			for (const row of leased) {
-				this.#database.monitorEventFencedFail(row.event_id, leaseId, batchId, code, `dispatch phase failed (${code})`);
+				// #64: the detail must carry the actual cause (sanitized), not echo the code.
+				this.#database.monitorEventFencedFail(row.event_id, leaseId, batchId, code, `dispatch phase failed (${code}): ${failureDetail(error)}`);
 			}
 			console.error(`monitor dispatch failed (${code}): events ${claimed.map((row) => row.event_id).join(",")}`);
 			await this.#recordAuthoringFailure({
@@ -924,4 +925,70 @@ function failureCode(error: unknown, failureClass: AuthoringFailureClass): Dispa
 	if (message.includes("ensureSession")) return "session_bind_failed";
 	if (/timeout|timed out|tool failed|external tool|lock/i.test(message)) return "executor_failed";
 	return "internal_error";
+}
+
+/**
+ * The authoring turn frequently does real work (posts, files, tool calls) and
+ * then answers in prose or a fenced ```json block around the array. A strict
+ * JSON.parse of the whole reply marked those events failed even though the
+ * side effect had happened (live: sns-x-v7 / sns-threads-v7 "failed_no_retry"
+ * while the posts were up). Accept the whole reply as JSON, a fenced block, or
+ * the last top-level [...] array in the text; anything else is still invalid.
+ */
+export function parseAuthoredArray(response: string): unknown {
+	const text = response.trim();
+	const attempts: string[] = [text];
+	const fenced = [...text.matchAll(/```(?:json)?\s*([\s\S]*?)```/g)].map((m) => m[1]?.trim() ?? "");
+	attempts.push(...fenced.reverse());
+	// Every balanced top-level [...] span in the text, last first (the array
+	// usually closes the reply); string contents are skipped so notes with
+	// brackets do not split the span.
+	const spans: string[] = [];
+	for (let start = text.indexOf("["); start >= 0; start = text.indexOf("[", start + 1)) {
+		let depth = 0;
+		let inString = false;
+		for (let i = start; i < text.length; i++) {
+			const ch = text[i];
+			if (inString) {
+				if (ch === "\\") i++;
+				else if (ch === '"') inString = false;
+				continue;
+			}
+			if (ch === '"') inString = true;
+			else if (ch === "[") depth++;
+			else if (ch === "]" && --depth === 0) {
+				spans.push(text.slice(start, i + 1));
+				break;
+			}
+		}
+	}
+	attempts.push(...spans.reverse());
+	let lastError: unknown;
+	for (const candidate of attempts) {
+		if (!candidate) continue;
+		try {
+			const parsed = JSON.parse(candidate) as unknown;
+			if (Array.isArray(parsed)) return parsed;
+		} catch (error) {
+			lastError = error;
+		}
+	}
+	throw new Error(`authoring response is not a JSON array (${lastError instanceof Error ? lastError.message : "no array found"})`);
+}
+
+/**
+ * Actionable but public-safe failure detail (#64 vs. the raw-body ban): the
+ * error class, a stable error code when the error carries one, and the first
+ * in-repo stack frame (file:line). The raw message is deliberately NOT
+ * persisted — SDK error bodies can carry prompt content.
+ */
+function failureDetail(error: unknown): string {
+	const name = error instanceof Error ? error.constructor.name : typeof error;
+	const code = (error as { code?: unknown } | undefined)?.code;
+	const stableCode = typeof code === "string" && /^[a-z0-9_.-]{1,64}$/i.test(code) ? code : undefined;
+	const frame =
+		error instanceof Error && error.stack
+			? (error.stack.split("\n").find((line) => /^\s+at .*(packages|src)\//.test(line)) ?? "").trim().replace(/^at\s+/, "").replace(/.*\/(packages\/[^)]+)\)?$/, "$1")
+			: "";
+	return [name, stableCode ? `code=${stableCode}` : "", frame ? `at ${frame}` : ""].filter(Boolean).join(" ").slice(0, 300);
 }
