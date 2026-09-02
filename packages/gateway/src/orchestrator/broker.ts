@@ -88,7 +88,9 @@ type LockRecord = {
 };
 
 const DEFAULT_HEALTH_INTERVAL_MS = 5_000;
-const DEFAULT_HEALTH_PROBE_TIMEOUT_MS = 2_000;
+const DEFAULT_HEALTH_PROBE_TIMEOUT_MS = 10_000;
+/** Consecutive failed periodic probes before a generation is fenced. A single slow probe under load must not retire every live turn. */
+const HEALTH_FAILURE_STRIKES = 3;
 const DEFAULT_COMMAND_TIMEOUT_MS = 30_000;
 // The first agent-dir-scoped command auto-starts gjc's own broker daemon; give
 // its lifecycle launcher a moment to converge after the first successful probe.
@@ -187,6 +189,7 @@ export class BrokerSupervisor implements PersonaBroker {
 	readonly #cwd: string;
 	readonly #healthIntervalMs: number;
 	readonly #healthProbeTimeoutMs: number;
+	#healthStrikes = 0;
 	readonly #readinessAttempts: number;
 	readonly #readinessDelayMs: number;
 	readonly #restartInitialMs: number;
@@ -510,11 +513,17 @@ export class BrokerSupervisor implements PersonaBroker {
 		if (healthy && !this.#stopping && this.#active === active) {
 			// A completed periodic probe is the stable-health boundary that resets restart backoff.
 			this.#restartFailures = 0;
+			this.#healthStrikes = 0;
 			return;
 		}
 		if (this.#stopping || this.#active !== active) return;
-		// The daemon is gjc-owned; a failed probe fences this generation and waits
-		// (with backoff) for the daemon to answer again, then publishes a new one.
+		this.#healthStrikes++;
+		if (this.#healthStrikes < HEALTH_FAILURE_STRIKES) {
+			this.#log(`broker health probe strike ${this.#healthStrikes}/${HEALTH_FAILURE_STRIKES}; generation ${active.generation} retained`);
+			return;
+		}
+		// The daemon is gjc-owned; a sustained probe failure fences this generation
+		// and waits (with backoff) for the daemon to answer again, then publishes a new one.
 		this.#clearHealthTimer();
 		this.#active = undefined;
 		this.#log(`broker daemon generation ${active.generation} failed health; awaiting recovery`);
