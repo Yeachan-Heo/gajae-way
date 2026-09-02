@@ -576,6 +576,87 @@ test("red-team G3-F3: wedged-daemon strikes are scoped to one daemon; a self-rep
 	}
 });
 
+test("red-team G4-F1: a strike is charged to the discovery record that was probed, so a mid-probe flip to B never counts against B", async () => {
+	const home = await temporaryHome("gajaeway-broker-strike-race-");
+	// A stalls every probe. B is wedged on its first two probes, then healthy.
+	// Sequence: A fails once, then discovery flips to B WHILE A's 2nd probe is
+	// in flight. Post-probe attribution would read B and charge A's 2nd failure
+	// to B (B: 1), then B's own two failures make 3 and B is killed. Probing
+	// the record that was read charges it to A (A: 2), B starts at 0, survives
+	// its two real strikes and comes healthy. Nothing is retired.
+	const stalled = fakeBrokerTransport("secret-token", { router: "stall" });
+	let bFailures = 0;
+	const bServer = Bun.serve({
+		hostname: "127.0.0.1",
+		port: 0,
+		fetch(request, srv) {
+			if (new URL(request.url).searchParams.get("token") !== "secret-token")
+				return new Response("Unauthorized", { status: 401 });
+			return srv.upgrade(request) ? undefined : new Response("no", { status: 400 });
+		},
+		websocket: {
+			open(socket) {
+				socket.send(JSON.stringify({ type: "broker_hello", protocolVersion: 3 }));
+			},
+			message(socket, raw) {
+				const frame = JSON.parse(String(raw)) as { id?: string };
+				if (bFailures < 2) {
+					bFailures++;
+					return; // stall
+				}
+				socket.send(JSON.stringify({ type: "broker_response", id: frame.id, ok: true, result: { sessions: [] } }));
+			},
+		},
+	});
+	const bUrl = `ws://127.0.0.1:${bServer.port}`;
+	const killed: number[] = [];
+	let agentDir = "";
+	const broker = new BrokerSupervisor({
+		ssotAgentDir: null,
+		home,
+		instanceId: "instance-strike-race",
+		command: async () => HEALTHY,
+		isPidAlive: (pid) => pid === process.pid || ((pid === 2001 || pid === 2002) && !killed.includes(pid)),
+		healthIntervalMs: 60_000,
+		healthProbeTimeoutMs: 120,
+		readinessDelayMs: 0,
+		readinessAttempts: 20,
+		log: () => {},
+	});
+	agentDir = broker.agentDir;
+	const originalKill = process.kill;
+	(process as { kill: typeof process.kill }).kill = ((pid: number, signal?: string | number) => {
+		if (pid === 2001 || pid === 2002) {
+			killed.push(pid);
+			return true;
+		}
+		return originalKill(pid, signal as NodeJS.Signals);
+	}) as typeof process.kill;
+	try {
+		await writeDiscovery(agentDir, discoveryBody(stalled.url, "secret-token", { pid: 2001 }));
+		const flipper = setInterval(() => {
+			// A's 2nd request has arrived and is stalling: flip discovery now.
+			if (stalled.requests.length >= 2) {
+				clearInterval(flipper);
+				void writeDiscovery(agentDir, discoveryBody(bUrl, "secret-token", { pid: 2002 }));
+			}
+		}, 2);
+		try {
+			await broker.start();
+		} finally {
+			clearInterval(flipper);
+		}
+		expect(stalled.requests.length).toBe(2);
+		expect(bFailures).toBe(2);
+		expect(killed).toEqual([]);
+	} finally {
+		(process as { kill: typeof process.kill }).kill = originalKill;
+		await broker.stop();
+		stalled.stop();
+		bServer.stop(true);
+	}
+});
+
 test("red-team F6: a timed-out CLI child holds its slot until it has actually exited", async () => {
 	const home = await temporaryHome("gajaeway-broker-timeout-child-");
 	const transport = fakeBrokerTransport("secret-token");

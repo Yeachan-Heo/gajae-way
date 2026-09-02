@@ -516,9 +516,12 @@ test("red-team G3-B2: a batch bound before the upgrade, on a runtime without sta
 		const batch = database.inboundNonterminalBatches("discord/channel/chan-1")[0]!;
 		await manager.stop();
 		// Model the schema-17 row: bound, but no dispatch floor was ever recorded.
-		new Database(join(directory, "gateway.db")).exec(
-			`UPDATE inbound_messages SET dispatched_at = NULL WHERE batch_key = '${batch.batchKey}'`,
-		);
+		const raw = new Database(join(directory, "gateway.db"));
+		try {
+			raw.exec(`UPDATE inbound_messages SET dispatched_at = NULL WHERE batch_key = '${batch.batchKey}'`);
+		} finally {
+			raw.close();
+		}
 		// The old daemon finished with a real answer, then the gateway restarted.
 		port.seedOperation(send.opRef, send.sessionId, "terminal_ok", "진짜 답");
 		const recovered = new PersonaSessionManager({

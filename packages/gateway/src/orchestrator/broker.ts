@@ -681,12 +681,21 @@ export class BrokerSupervisor implements PersonaBroker {
 			if (this.#stopping) throw new Error("broker observation stopped during readiness");
 			if (this.#active !== active) throw new Error("broker observation was replaced before readiness completed");
 			try {
-				if (await this.#healthProbe(this.#probeContext())) {
-					if (this.#startupStabilizationMs > 0) await sleep(this.#startupStabilizationMs);
-					return;
-				}
-				if (this.#spawnsDaemon) {
+				if (!this.#spawnsDaemon) {
+					if (await this.#healthProbe(this.#probeContext())) {
+						if (this.#startupStabilizationMs > 0) await sleep(this.#startupStabilizationMs);
+						return;
+					}
+				} else {
+					// Read discovery ONCE and probe exactly that record, so the verdict
+					// and the identity a strike is charged to can never diverge (a
+					// daemon replaced mid-probe must not inherit its predecessor's
+					// failures).
 					const discovery = await readBrokerDiscovery(this.discoveryPath, this.#isPidAlive);
+					if (discovery && (await probeBrokerEndpoint(discovery, this.#healthProbeTimeoutMs))) {
+						if (this.#startupStabilizationMs > 0) await sleep(this.#startupStabilizationMs);
+						return;
+					}
 					const identity = discovery ? `${discovery.pid}|${discovery.url}` : undefined;
 					if (identity !== struckIdentity) {
 						liveButUnhealthy = 0;
