@@ -468,6 +468,29 @@ class OriginActor {
 		const first = await this.#inspectForRecovery(sessionId);
 		const status = await this.#statusForRecovery(sessionId, batch.opRef);
 		const second = await this.#inspectForRecovery(sessionId);
+		// A settled batch whose session the runtime cannot answer for at all (both
+		// inspects failed AND status is unreachable) — e.g. a pre-cutover store the
+		// current gjc no longer reads — has no operation the runtime could be
+		// holding, so releasing its rows back to pending is exactly-once-safe:
+		// the next settle binds a live session. A reachable runtime, even with an
+		// unknown status, keeps the hold: it may have accepted the send.
+		if (
+			batch.state === "settled" &&
+			!retired &&
+			first.failed &&
+			second.failed &&
+			status.status.status === "unknown" &&
+			status.unreachable === true
+		) {
+			const attempt = this.#manager.database.inboundBatchRequeueFreshTurn(batch.batchKey);
+			// The binding itself is unusable: recreate through the existing rebind
+			// primitive (epoch bump) so the next settle binds a fresh live session.
+			const nextEpoch = this.#manager.database.rebindEpoch(this.originKey);
+			this.#manager.log(
+				`recovery_requeue_unaccepted origin=${this.originKey} epoch=${batch.epoch} nextEpoch=${nextEpoch} opRef=${batch.opRef} session=${sessionId} attempt=${attempt}`,
+			);
+			return;
+		}
 		const authorityShifted =
 			first.failed ||
 			second.failed ||
@@ -616,11 +639,13 @@ class OriginActor {
 		}
 	}
 
-	async #statusForRecovery(sessionId: string, opRef: string): Promise<StatusReport> {
+	async #statusForRecovery(sessionId: string, opRef: string): Promise<StatusReport & { unreachable?: boolean }> {
 		try {
 			return await this.#manager.port.status({ sessionId, repo: this.#manager.repo, opRef });
 		} catch {
-			return { operationRef: opRef, status: { status: "unknown" }, summaryCompleted: false };
+			// Transport/session-unreachable, as opposed to a reachable runtime that
+			// reported an undecidable operation state.
+			return { operationRef: opRef, status: { status: "unknown" }, summaryCompleted: false, unreachable: true };
 		}
 	}
 

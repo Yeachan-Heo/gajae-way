@@ -5,6 +5,7 @@ import { join } from "node:path";
 import { PersonaSessionManager, personaBatchKey, personaBatchOpRef } from "../src/orchestrator/persona-session";
 import { GatewayDatabase } from "../src/store/db";
 import { ScriptedSessionPort } from "./session-port.fake";
+import type { BrokerSession, StatusReport } from "@gajaeway/subsession";
 
 const ORIGIN = { platform: "loopback", kind: "loopback", conversationId: "restart" } as const;
 const KEY = "loopback/loopback/restart";
@@ -295,4 +296,39 @@ test("a recovered failed operation on a live saved session re-fires exactly one 
 	expect(terminal).toEqual(["replacement reply"]);
 	expect(database.inboundPendingCount(KEY)).toBe(0);
 	expect(database.inboundNonterminalBatches(KEY)).toEqual([]);
+});
+
+class UnreadableStorePort extends ScriptedSessionPort {
+	// The runtime cannot answer for this session at all (e.g. a pre-cutover
+	// store the current gjc no longer reads): inspect and status both throw.
+	async inspect(_input: { sessionId: string; repo: string }): Promise<BrokerSession | undefined> {
+		throw new Error("session.list returned a malformed session row.");
+	}
+	async status(input: { sessionId: string; repo: string; opRef: string }): Promise<StatusReport> {
+		if (this.sends.length === 0) throw new Error("SDK session is unavailable through the session Router.");
+		return await super.status(input);
+	}
+}
+
+test("a settled-but-unaccepted batch on a session the runtime cannot answer for is released and re-fired on a fresh session", async () => {
+	home = await mkdtemp(join(tmpdir(), "gajaeway-session-restart-"));
+	database = await GatewayDatabase.open(join(home, "gateway.db"));
+	const port = new UnreadableStorePort();
+	const logs: string[] = [];
+	// Durable state left by the previous binary: a bound session record and a
+	// settled (never accepted) batch pointing at a session the new runtime cannot read.
+	database.putSession(KEY, "pre-cutover-session");
+	enqueue("m-1", "hello after cutover");
+	const cutoff = new Date().toISOString();
+	const batchKey = `${KEY}|0|m-1|${cutoff}|0`;
+	database.inboundSettleBatch({ originKey: KEY, epoch: 0, cutoff, batchKey, opRef: "gw-p-00000000000000000000000000000001" });
+	database.inboundBatchBindSession(batchKey, "pre-cutover-session");
+	manager = makeManager(port, logs);
+
+	await manager.recover();
+	expect(logs.some((line) => line.startsWith(`recovery_requeue_unaccepted origin=${KEY}`))).toBe(true);
+	await eventually(() => port.sends.length === 1, "released rows were not re-settled on a fresh session");
+	expect(port.sends[0]!.text).toBe("hello after cutover");
+	expect(port.sends[0]!.opRef).not.toBe("gw-p-00000000000000000000000000000001");
+	expect(port.sends[0]!.sessionId).not.toBe("pre-cutover-session");
 });

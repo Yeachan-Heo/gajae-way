@@ -39,11 +39,10 @@ export interface BrokerSupervisorOptions {
 	/** The persona workspace is the working directory for agent-dir-bound gjc commands. */
 	readonly cwd?: string;
 	/**
-	 * Explicit agent directory. Defaults to the instance-private
-	 * `<home>/broker/<instanceId>/agent`. Deployments that predate the persistent
-	 * turn model bound their sessions under the operator's `GJC_AGENT_DIR`; the
-	 * boot path passes that value here so those sessions are adopted, not
-	 * abandoned in an empty private store.
+	 * Explicit agent directory (tests/tooling). Production always uses the
+	 * instance-private `<home>/broker/<instanceId>/agent`: pre-cutover stores
+	 * written by older gjc are not readable by the current runtime, so they are
+	 * never adopted; every origin binds a fresh session on first use.
 	 */
 	readonly agentDir?: string;
 	/** Process seam for gjc command execution; production uses Bun.spawn bound to Bun. */
