@@ -35,6 +35,8 @@ export interface SessionPort {
 	liveness?(input: { sessionId: string; repo: string }): Promise<{ readonly live: boolean | undefined; readonly disowned: boolean }>;
 	/** Live turn counters (tool calls in the transcript, output tokens from usage.get); undefined when unsupported. */
 	progress?(input: { sessionId: string; repo: string }): Promise<{ readonly toolCalls: number; readonly outputTokens: number } | undefined>;
+	/** True when the session's prompt queue has no pending messages (queue.messages.list empty). */
+	queueEmpty?(input: { sessionId: string; repo: string }): Promise<boolean>;
 	/** Restores a saved, non-deleted session through `session.resume`; it never creates a replacement. */
 	resume(input: { sessionId: string; repo: string; originKey: string; epoch: number }): Promise<SessionBinding>;
 	send(input: SessionSendInput): Promise<SendReceipt>;
@@ -415,6 +417,12 @@ export class BrokerSessionPort implements SessionPort {
 		} catch {
 			return undefined;
 		}
+	}
+
+	async queueEmpty(input: { sessionId: string; repo: string }): Promise<boolean> {
+		const result = await this.#cli(["sdk", "session", "raw", "query", input.sessionId, "--query", "queue.messages.list", "--repo", input.repo, "--json-input", "{}"], { timeoutMs: 10_000 });
+		const page = (JSON.parse(result.stdout) as { ok?: unknown; page?: { items?: unknown[]; complete?: unknown } }).page;
+		return page !== undefined && Array.isArray(page.items) && page.items.length === 0 && page.complete === true;
 	}
 
 	async fetchLastAssistant(input: { sessionId: string; repo: string }): Promise<LastAssistantResult> {

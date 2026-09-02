@@ -30,6 +30,8 @@ const DEFAULT_MAX_INBOUND_AGE_MS = 10 * 60_000;
  * completes with an explicit corroboration log.
  */
 const STATUS_TERMINAL_GRACE_MS = 250;
+/** Consecutive recovery sweeps (60s apart) an unknown op on a live idle session is held before release. */
+const HOLD_RELEASE_SWEEPS = 2;
 
 export type PersonaActorState = "idle" | "settling" | "turn-running";
 
@@ -623,9 +625,29 @@ class OriginActor {
 			case "recreate":
 				await this.#recreateAfterResumeFailure(batch, retired);
 				return;
-			case "operator_hold":
-				this.#manager.log(`recovery_hold origin=${this.originKey} epoch=${batch.epoch} opRef=${batch.opRef} reason=${decision.reason}`);
+			case "operator_hold": {
+				// A live session whose runtime has NO record of this op-ref and whose
+				// prompt queue is empty cannot be running it: the send never landed
+				// (gateway restarted between send and ack). Release + rebind after the
+				// hold has persisted across HOLD_RELEASE_SWEEPS consecutive sweeps so a
+				// transient index lag never triggers a duplicate.
+				const count = (this.#holdSweeps.get(batch.opRef) ?? 0) + 1;
+				this.#holdSweeps.set(batch.opRef, count);
+				const liveIdle = status.status.status === "unknown" && raw?.live === true && !retired;
+				if (liveIdle && count >= HOLD_RELEASE_SWEEPS && (await this.#queueIsEmpty(sessionId))) {
+					this.#holdSweeps.delete(batch.opRef);
+					const attempt = this.#manager.database.inboundBatchRequeueFreshTurn(batch.batchKey);
+					this.#manager.expireStale(this.originKey);
+					const nextEpoch = this.#manager.database.rebindEpoch(this.originKey);
+					this.#manager.log(
+						`recovery_requeue_unaccepted origin=${this.originKey} epoch=${batch.epoch} nextEpoch=${nextEpoch} opRef=${batch.opRef} session=${sessionId} attempt=${attempt} reason=unknown_op_on_live_idle_session sweeps=${count}`,
+					);
+					await this.#armSettle();
+					return;
+				}
+				this.#manager.log(`recovery_hold origin=${this.originKey} epoch=${batch.epoch} opRef=${batch.opRef} reason=${decision.reason} sweeps=${count}`);
 				return;
+			}
 		}
 	}
 
@@ -683,6 +705,18 @@ class OriginActor {
 		);
 		if (retired)
 			this.#manager.log(`retired_hold originKey=${this.originKey} batchKey=${batch.batchKey} epoch=${batch.epoch} opRef=${batch.opRef} reason=resume_impossible`);
+	}
+
+	readonly #holdSweeps = new Map<string, number>();
+
+	async #queueIsEmpty(sessionId: string): Promise<boolean> {
+		const port = this.#manager.port;
+		if (!port.queueEmpty) return false;
+		try {
+			return await port.queueEmpty({ sessionId, repo: this.#manager.repo });
+		} catch {
+			return false;
+		}
 	}
 
 	async #inspectForRecovery(sessionId: string): Promise<{ readonly session: BrokerSession | undefined; readonly failed: boolean }> {
