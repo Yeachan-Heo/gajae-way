@@ -8,6 +8,7 @@ import { MonitorPropagator } from "../../src/monitors/propagate";
 import { MonitorRegistry } from "../../src/monitors/registry";
 import { GatewayDatabase } from "../../src/store/db";
 import { DeliveryLedger } from "../../src/store/ledger";
+import { sessionPortFromScript } from "../session-port.fake";
 
 const stress = process.env.GAJAEWAY_STRESS === "1";
 
@@ -31,10 +32,9 @@ if (!stress) {
 			const pipeline = new MonitorPropagator({
 				database,
 				registry,
-				gjc: {
-					ensureSession: async () => ({ sessionId: "stress-session" }),
-					forgetRebinds: () => {},
-					sendTurn: async (_sessionId, prompt) => {
+				sessionPort: sessionPortFromScript({
+					bind: async () => ({ sessionId: "stress-session" }),
+					respond: async (_sessionId, prompt) => {
 						turns++;
 						return JSON.stringify(
 							(JSON.parse(prompt.match(/\[.*\]$/s)![0]) as Array<{ eventId: string }>).map(({ eventId }) => ({
@@ -43,7 +43,7 @@ if (!stress) {
 							})),
 						);
 					},
-				},
+				}),
 				memory,
 				delivery: new DeliveryService(new DeliveryLedger(database)),
 				emit: () => {},

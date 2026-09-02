@@ -29,22 +29,59 @@ export function parseModelSelection(value: unknown): GjcModelSelection | undefin
 	return { preset };
 }
 
+export const INBOUND_BATCH_STATES = ["settled", "accepted", "done"] as const;
+export type InboundBatchState = (typeof INBOUND_BATCH_STATES)[number];
+export const INBOUND_BATCH_ROLES = ["trigger", "member", "steer"] as const;
+export type InboundBatchRole = (typeof INBOUND_BATCH_ROLES)[number];
+
 export interface InboundMessageRow {
 	readonly message_id: string;
 	readonly origin_key: string;
 	readonly origin_ref_json: string;
 	readonly body: string;
 	readonly engagement_json: string | null;
+	readonly state: "pending" | "processing" | "done";
 	readonly received_at: string;
+	readonly batch_key: string | null;
+	readonly batch_role: InboundBatchRole | null;
+	readonly batch_epoch: number | null;
+	readonly batch_state: InboundBatchState | null;
+	readonly attributed_op_ref: string | null;
+	readonly accepted_at: string | null;
+	/** Bound before send so an accepted retired batch can reattach after restart. */
+	readonly bound_session_id: string | null;
 }
 
-const LATEST_SCHEMA_VERSION = 16;
+export interface InboundBatch {
+	readonly batchKey: string;
+	readonly originKey: string;
+	readonly epoch: number;
+	readonly state: Extract<InboundBatchState, "settled" | "accepted">;
+	readonly opRef: string;
+	readonly acceptedAt: string | null;
+	readonly sessionId: string | null;
+	readonly triggerMessageId: string;
+}
+
+/** A second current-generation trigger would violate at-most-one active batch. */
+export class InboundBatchConflictError extends Error {
+	constructor(originKey: string, epoch: number) {
+		super(`origin ${originKey} already has a nonterminal batch in epoch ${epoch}`);
+		this.name = "InboundBatchConflictError";
+	}
+}
+
+const LATEST_SCHEMA_VERSION = 17;
 /** Maximum number of prior messages supplied to one engaged conversation turn. */
 export const CONVERSATION_DIFF_MAX_ROWS = 60;
 /** Maximum age of prior messages supplied to one engaged conversation turn. */
 export const CONVERSATION_DIFF_MAX_AGE_MS = 6 * 60 * 60 * 1000;
 /** Consumed context bodies older than this are deleted after aggregate evidence is retained. */
 export const CONVERSATION_CONTEXT_RETENTION_MS = 7 * 24 * 60 * 60 * 1000;
+
+function freshTurnMetaKey(originKey: string, epoch: number, triggerMessageId: string): string {
+	return `fresh_turn_attempt:${originKey}:${epoch}:${triggerMessageId}`;
+}
 
 export interface ConversationContextRow {
 	readonly message_id: string;
@@ -297,14 +334,12 @@ export class GatewayDatabase {
 	}
 
 	/**
-	 * Counts completed turns within the current epoch. The gjc session transcript
-	 * grows with every `--resume`, so per-turn prefill latency grows without bound;
-	 * the server auto-rotates the epoch once this count reaches its ceiling.
+	 * Counts completed monitor-authoring turns within the current epoch for
+	 * observability and safety diagnostics. Persistent SDK sessions rely on native
+	 * compaction; this count never rotates a persona or worker epoch.
 	 *
 	 * The write is an upsert because monitor authoring origins (issue #68) reach
-	 * this path before any chat turn ever bound their session row: the old
-	 * UPDATE-only statement silently counted nothing for them, so a monitor
-	 * session sat at turn_count = 0 forever and grew without bound. When
+	 * this path before any chat turn ever bound their session row. When
 	 * `originRefJson` is given the row is created with it, so the seeded row is
 	 * projectable (admin/cycle) instead of an origin-less stub.
 	 */
@@ -511,53 +546,276 @@ export class GatewayDatabase {
 		originRefJson: string;
 		body: string;
 		engagementJson?: string;
+		receivedAt?: string;
 	}): boolean {
+		const receivedAt = row.receivedAt ?? new Date().toISOString();
+		if (!Number.isFinite(Date.parse(receivedAt))) throw new Error("inbound receivedAt must be an ISO timestamp");
 		const changes = this.#database
 			.query(
 				"INSERT INTO inbound_messages (message_id, origin_key, origin_ref_json, body, engagement_json, state, received_at) VALUES (?, ?, ?, ?, ?, 'pending', ?) ON CONFLICT(message_id) DO NOTHING",
 			)
-			.run(
-				row.messageId,
-				row.originKey,
-				row.originRefJson,
-				row.body,
-				row.engagementJson ?? null,
-				new Date().toISOString(),
-			);
+			.run(row.messageId, row.originKey, row.originRefJson, row.body, row.engagementJson ?? null, receivedAt);
 		return changes.changes > 0;
 	}
 
-	/** Claims the oldest pending message for an origin, so replay and live dispatch cannot double-run it. */
+	/** Oldest unbatched inbound row; a fixed settle window is always anchored here. */
+	inboundPendingOldest(originKey: string): InboundMessageRow | undefined {
+		return (
+			this.#database
+				.query<InboundMessageRow, [string]>(
+				"SELECT message_id, origin_key, origin_ref_json, body, engagement_json, state, received_at, batch_key, batch_role, batch_epoch, batch_state, attributed_op_ref, accepted_at, bound_session_id FROM inbound_messages WHERE origin_key = ? AND state = 'pending' AND batch_state IS NULL ORDER BY received_at, message_id LIMIT 1",
+				)
+				.get(originKey) ?? undefined
+		);
+	}
+
+	/**
+	 * Legacy claim path. Batched rows are intentionally invisible here: their
+	 * legacy state remains pending until terminal reconciliation, so a pre-Stage-3
+	 * drain must never consume an accepted lifecycle row as ordinary work.
+	 */
 	inboundClaimNext(originKey: string): InboundMessageRow | undefined {
 		return this.withTransaction(() => {
-			const row = this.#database
-				.query<InboundMessageRow, [string]>(
-					"SELECT message_id, origin_key, origin_ref_json, body, engagement_json, received_at FROM inbound_messages WHERE origin_key = ? AND state = 'pending' ORDER BY received_at, message_id LIMIT 1",
-				)
-				.get(originKey);
+			const row = this.inboundPendingOldest(originKey);
 			if (!row) return undefined;
-			this.#database.query("UPDATE inbound_messages SET state = 'processing' WHERE message_id = ?").run(row.message_id);
+			this.#database
+				.query("UPDATE inbound_messages SET state = 'processing' WHERE message_id = ? AND batch_state IS NULL")
+				.run(row.message_id);
 			return row;
 		});
 	}
 
+	/** Completes only legacy/unbatched work; lifecycle rows complete through inboundBatchComplete(). */
 	inboundComplete(messageId: string): void {
-		this.#database.query("UPDATE inbound_messages SET state = 'done' WHERE message_id = ?").run(messageId);
+		this.#database
+			.query("UPDATE inbound_messages SET state = 'done' WHERE message_id = ? AND batch_state IS NULL")
+			.run(messageId);
+	}
+
+	/**
+	 * Commits an immutable, fixed-from-first batch boundary. The trigger-only
+	 * partial index is checked before members are written, so an N-message batch
+	 * and a retired old epoch can both be represented without a race.
+	 */
+	inboundSettleBatch(input: {
+		originKey: string;
+		epoch: number;
+		cutoff: string;
+		batchKey: string;
+		opRef: string;
+	}): readonly InboundMessageRow[] {
+		if (!Number.isSafeInteger(input.epoch) || input.epoch < 0) throw new Error("batch epoch must be a non-negative integer");
+		return this.withTransaction(() => {
+			const existing = this.#database
+				.query<{ n: number }, [string, number]>(
+					"SELECT COUNT(*) AS n FROM inbound_messages WHERE origin_key = ? AND batch_epoch = ? AND batch_role = 'trigger' AND batch_state IN ('settled', 'accepted')",
+				)
+				.get(input.originKey, input.epoch)?.n;
+			if ((existing ?? 0) > 0) throw new InboundBatchConflictError(input.originKey, input.epoch);
+			const rows = this.#database
+				.query<InboundMessageRow, [string, string]>(
+					"SELECT message_id, origin_key, origin_ref_json, body, engagement_json, state, received_at, batch_key, batch_role, batch_epoch, batch_state, attributed_op_ref, accepted_at, bound_session_id FROM inbound_messages WHERE origin_key = ? AND state = 'pending' AND batch_state IS NULL AND received_at <= ? ORDER BY received_at, message_id",
+				)
+				.all(input.originKey, input.cutoff);
+			for (const [index, row] of rows.entries())
+				this.#database
+					.query(
+						"UPDATE inbound_messages SET batch_key = ?, batch_role = ?, batch_epoch = ?, batch_state = 'settled', attributed_op_ref = ? WHERE message_id = ? AND state = 'pending' AND batch_state IS NULL",
+					)
+					.run(input.batchKey, index === 0 ? "trigger" : "member", input.epoch, input.opRef, row.message_id);
+			return rows.map((row, index) => ({
+				...row,
+				batch_key: input.batchKey,
+				batch_role: index === 0 ? "trigger" : "member",
+				batch_epoch: input.epoch,
+				batch_state: "settled",
+				attributed_op_ref: input.opRef,
+				bound_session_id: null,
+			}));
+		});
+	}
+
+	/** Records the accepted receipt boundary without falsely marking the turn terminal. */
+	inboundBatchAccept(batchKey: string, acceptedAt = new Date().toISOString()): boolean {
+		return this.withTransaction(() => {
+			const rows = this.inboundBatchRows(batchKey);
+			if (rows.length === 0) return false;
+			if (rows.every((row) => row.batch_state === "accepted")) return false;
+			if (rows.some((row) => row.batch_state !== "settled" || row.state !== "pending")) {
+				throw new Error(`batch ${batchKey} cannot transition to accepted from its current lifecycle state`);
+			}
+			this.#database
+				.query(
+					"UPDATE inbound_messages SET batch_state = 'accepted', accepted_at = ? WHERE batch_key = ? AND state = 'pending' AND batch_state = 'settled'",
+				)
+				.run(acceptedAt, batchKey);
+			return true;
+		});
+	}
+
+	/** Persists the owning SDK session before send, including for settled crash recovery. */
+	inboundBatchBindSession(batchKey: string, sessionId: string): boolean {
+		if (!sessionId) throw new Error("batch session id must not be empty");
+		return this.withTransaction(() => {
+			const rows = this.inboundBatchRows(batchKey);
+			if (rows.length === 0) return false;
+			if (rows.some((row) => row.bound_session_id !== null && row.bound_session_id !== sessionId))
+				throw new Error(`batch ${batchKey} is already bound to another session`);
+			return (
+				this.#database
+					.query(
+						"UPDATE inbound_messages SET bound_session_id = ? WHERE batch_key = ? AND state = 'pending' AND batch_state IN ('settled', 'accepted')",
+					)
+					.run(sessionId, batchKey).changes > 0
+			);
+		});
+	}
+
+	/**
+	 * Terminal reconciliation is the sole dual-column completion transition: legacy
+	 * state and lifecycle state become done in the same SQLite statement.
+	 */
+	inboundBatchComplete(batchKey: string): number {
+		return this.#database
+			.query(
+				"UPDATE inbound_messages SET state = 'done', batch_state = 'done' WHERE batch_key = ? AND state = 'pending' AND batch_state IN ('settled', 'accepted')",
+			)
+			.run(batchKey).changes;
+	}
+
+	/**
+	 * Releases a conclusively failed batch for exactly one same-session fresh turn.
+	 * The retry ordinal is durable, so a crash cannot recreate the same op-ref.
+	 */
+	inboundBatchRequeueFreshTurn(batchKey: string): number {
+		return this.withTransaction(() => {
+			const rows = this.inboundBatchRows(batchKey);
+			const trigger = rows.find((row) => row.batch_role === "trigger");
+			if (!trigger || trigger.batch_epoch === null) throw new Error(`batch ${batchKey} has no retryable trigger`);
+			if (rows.some((row) => row.state !== "pending" || !["settled", "accepted"].includes(row.batch_state ?? "")))
+				throw new Error(`batch ${batchKey} cannot be requeued from its current lifecycle state`);
+			const key = freshTurnMetaKey(trigger.origin_key, trigger.batch_epoch, trigger.message_id);
+			const prior = Number.parseInt(this.metaGet(key) ?? "0", 10);
+			const attempt = Number.isSafeInteger(prior) && prior >= 0 ? prior + 1 : 1;
+			this.metaSet(key, String(attempt));
+			this.#database
+				.query(
+					"UPDATE inbound_messages SET batch_key = NULL, batch_role = NULL, batch_epoch = NULL, batch_state = NULL, attributed_op_ref = NULL, accepted_at = NULL, bound_session_id = NULL WHERE batch_key = ? AND state = 'pending' AND batch_state IN ('settled', 'accepted')",
+				)
+				.run(batchKey);
+			return attempt;
+		});
+	}
+
+	freshTurnAttempt(originKey: string, epoch: number, triggerMessageId: string): number {
+		const value = Number.parseInt(this.metaGet(freshTurnMetaKey(originKey, epoch, triggerMessageId)) ?? "0", 10);
+		return Number.isSafeInteger(value) && value >= 0 ? value : 0;
+	}
+
+	/** A steering receipt consumes just that row; failed/ambiguous steering stays unbatched pending. */
+	inboundSteerAccepted(input: { messageId: string; batchKey: string; epoch: number; opRef: string }): boolean {
+		const result = this.#database
+			.query(
+				"UPDATE inbound_messages SET state = 'done', batch_key = ?, batch_role = 'steer', batch_epoch = ?, batch_state = 'done', attributed_op_ref = ?, accepted_at = ? WHERE message_id = ? AND state = 'pending' AND batch_state IS NULL",
+			)
+			.run(input.batchKey, input.epoch, input.opRef, new Date().toISOString(), input.messageId);
+		return result.changes === 1;
+	}
+
+	inboundBatchRows(batchKey: string): readonly InboundMessageRow[] {
+		return this.#database
+			.query<InboundMessageRow, [string]>(
+				"SELECT message_id, origin_key, origin_ref_json, body, engagement_json, state, received_at, batch_key, batch_role, batch_epoch, batch_state, attributed_op_ref, accepted_at, bound_session_id FROM inbound_messages WHERE batch_key = ? ORDER BY received_at, message_id",
+			)
+			.all(batchKey);
+	}
+
+	/** Current and retired nonterminal trigger rows are the recovery subjects. */
+	inboundNonterminalBatches(originKey: string, epoch?: number): readonly InboundBatch[] {
+		const rows =
+			epoch === undefined
+				? this.#database
+						.query<
+						{
+							batch_key: string;
+							origin_key: string;
+							batch_epoch: number;
+							batch_state: Extract<InboundBatchState, "settled" | "accepted">;
+							attributed_op_ref: string;
+							accepted_at: string | null;
+							bound_session_id: string | null;
+							message_id: string;
+						},
+							[string]
+						>(
+							"SELECT batch_key, origin_key, batch_epoch, batch_state, attributed_op_ref, accepted_at, bound_session_id, message_id FROM inbound_messages WHERE origin_key = ? AND batch_role = 'trigger' AND batch_state IN ('settled', 'accepted') ORDER BY batch_epoch, received_at, message_id",
+						)
+						.all(originKey)
+				: this.#database
+						.query<
+						{
+							batch_key: string;
+							origin_key: string;
+							batch_epoch: number;
+							batch_state: Extract<InboundBatchState, "settled" | "accepted">;
+							attributed_op_ref: string;
+							accepted_at: string | null;
+							bound_session_id: string | null;
+							message_id: string;
+						},
+							[string, number]
+						>(
+							"SELECT batch_key, origin_key, batch_epoch, batch_state, attributed_op_ref, accepted_at, bound_session_id, message_id FROM inbound_messages WHERE origin_key = ? AND batch_epoch = ? AND batch_role = 'trigger' AND batch_state IN ('settled', 'accepted') ORDER BY received_at, message_id",
+						)
+						.all(originKey, epoch);
+		return rows.map((row) => ({
+			batchKey: row.batch_key,
+			originKey: row.origin_key,
+			epoch: row.batch_epoch,
+			state: row.batch_state,
+			opRef: row.attributed_op_ref,
+			acceptedAt: row.accepted_at,
+			sessionId: row.bound_session_id,
+			triggerMessageId: row.message_id,
+		}));
+	}
+
+	/** Origins with accepted/settled batches that need actor reconstruction after boot. */
+	inboundNonterminalOrigins(): readonly string[] {
+		return this.#database
+			.query<{ origin_key: string }, []>(
+				"SELECT DISTINCT origin_key FROM inbound_messages WHERE batch_role = 'trigger' AND batch_state IN ('settled', 'accepted') ORDER BY origin_key",
+			)
+			.all()
+			.map((row) => row.origin_key);
+	}
+
+	inboundNonterminalBatchCount(): number {
+		return (
+			this.#database.query<{ n: number }, []>("SELECT COUNT(*) AS n FROM inbound_messages WHERE batch_role = 'trigger' AND batch_state IN ('settled', 'accepted')").get()
+				?.n ?? 0
+		);
 	}
 
 	inboundDiscardBefore(originKey: string, floorAt: string): string[] {
-		const ids = this.#database
-			.query<{ message_id: string }, [string, string]>(
-				"SELECT message_id FROM inbound_messages WHERE origin_key = ? AND state = 'pending' AND received_at <= ?",
-			)
-			.all(originKey, floorAt)
-			.map((row) => row.message_id);
-		this.#database
-			.query(
-				"UPDATE inbound_messages SET state = 'done' WHERE origin_key = ? AND state = 'pending' AND received_at <= ?",
-			)
-			.run(originKey, floorAt);
-		return ids;
+		const discard = () => {
+			const ids = this.#database
+				.query<{ message_id: string }, [string, string]>(
+					"SELECT message_id FROM inbound_messages WHERE origin_key = ? AND state = 'pending' AND batch_state IS NULL AND received_at <= ?",
+				)
+				.all(originKey, floorAt)
+				.map((row) => row.message_id);
+			this.#database
+				.query(
+					"UPDATE inbound_messages SET state = 'done' WHERE origin_key = ? AND state = 'pending' AND batch_state IS NULL AND received_at <= ?",
+				)
+				.run(originKey, floorAt);
+			return ids;
+		};
+		// resetConversationSession already owns a single atomic transaction; opening
+		// another one would break its epoch/floor invariant. Standalone callers get
+		// the same atomic select-and-discard boundary here.
+		return this.#inTransaction ? discard() : this.withTransaction(discard);
 	}
 
 	/**
@@ -681,8 +939,10 @@ export class GatewayDatabase {
 				.get(originKey);
 			const floorRowId = state?.floor_row_id ?? 0;
 			const ageFloor = new Date(now.getTime() - maxAgeMs).toISOString();
-			const sessionFloor = this.contextSessionCreatedAt(originKey);
-			const effectiveFloor = [ageFloor, sessionFloor, state?.floor_at]
+			// `/new` owns the durable context floor. A session row is written only after
+			// inbound acceptance, so treating its creation timestamp as a floor would
+			// erase the very first settled batch before its persistent session can read it.
+			const effectiveFloor = [ageFloor, state?.floor_at]
 				.filter((value): value is string => value !== undefined && value !== null)
 				.sort()
 				.at(-1) as string;
@@ -930,8 +1190,9 @@ export class GatewayDatabase {
 
 	/** Startup recovery: a turn killed mid-flight must not strand its claimed message. */
 	inboundRecoverProcessing(): number {
-		return this.#database.query("UPDATE inbound_messages SET state = 'pending' WHERE state = 'processing'").run()
-			.changes;
+		return this.#database
+			.query("UPDATE inbound_messages SET state = 'pending' WHERE state = 'processing' AND batch_state IS NULL")
+			.run().changes;
 	}
 
 	inboundPendingCount(originKey: string): number {
@@ -958,13 +1219,49 @@ export class GatewayDatabase {
 			.run(originKey, sessionId, new Date().toISOString());
 	}
 
-	deliveryCreate(row: { id: string; turnId: string; originKey: string; payloadJson: string }): void {
-		const now = new Date().toISOString();
+	/**
+	 * Fenced persistent-session binding. A create response may race `/new`; the
+	 * binding must never overwrite a newer durable epoch with an old session id.
+	 */
+	putSessionAtEpoch(originKey: string, sessionId: string, epoch: number): boolean {
+		if (!Number.isSafeInteger(epoch) || epoch < 0) throw new Error("session epoch must be a non-negative integer");
+		return (
+			this.#database
+				.query(
+					"INSERT INTO sessions (origin_key, gjc_session_id, epoch, created_at) VALUES (?, ?, ?, ?) ON CONFLICT(origin_key) DO UPDATE SET gjc_session_id = excluded.gjc_session_id WHERE sessions.epoch = excluded.epoch",
+				)
+				.run(originKey, sessionId, epoch, new Date().toISOString()).changes === 1
+		);
+	}
+
+	/** Opaque runtime-issued tail checkpoint for a bound SDK session. */
+	tailCursorGet(sessionId: string): string | undefined {
+		return this.#database.query<{ cursor: string }, [string]>("SELECT cursor FROM session_tail_cursors WHERE session_id = ?").get(sessionId)?.cursor;
+	}
+
+	/** Commits a cursor only after the caller has applied all preceding tail effects. */
+	tailCursorCommit(sessionId: string, cursor: string): void {
+		if (cursor.length === 0) throw new Error("tail cursor must not be empty");
 		this.#database
 			.query(
-				"INSERT INTO deliveries (delivery_id, turn_id, origin_key, payload_json, state, attempts, created_at, updated_at) VALUES (?, ?, ?, ?, 'pending', 0, ?, ?)",
+				"INSERT INTO session_tail_cursors (session_id, cursor, updated_at) VALUES (?, ?, ?) ON CONFLICT(session_id) DO UPDATE SET cursor = excluded.cursor, updated_at = excluded.updated_at",
 			)
-			.run(row.id, row.turnId, row.originKey, row.payloadJson, now, now);
+			.run(sessionId, cursor, new Date().toISOString());
+	}
+
+	tailCursorClear(sessionId: string): void {
+		this.#database.query("DELETE FROM session_tail_cursors WHERE session_id = ?").run(sessionId);
+	}
+
+	deliveryCreate(row: { id: string; turnId: string; originKey: string; payloadJson: string }): boolean {
+		const now = new Date().toISOString();
+		return (
+			this.#database
+				.query(
+					"INSERT OR IGNORE INTO deliveries (delivery_id, turn_id, origin_key, payload_json, state, attempts, created_at, updated_at) VALUES (?, ?, ?, ?, 'pending', 0, ?, ?)",
+				)
+				.run(row.id, row.turnId, row.originKey, row.payloadJson, now, now).changes === 1
+		);
 	}
 
 	deliveryUpdate(id: string, state: string, attempts?: number): void {
@@ -1695,9 +1992,8 @@ SELECT 1 FROM dispatch_leases l WHERE l.event_id = monitor_events.event_id AND l
 		}
 		if (current < 9) {
 			this.withTransaction(() => {
-				// Session growth bound: the gjc transcript grows with every --resume, so
-				// turns get slower forever without rotation. turn_count tracks completed
-				// turns in the current epoch; the server auto-bumps the epoch at a ceiling.
+				// v9 retained an observational monitor turn count. Persistent SDK sessions
+				// now rely on native compaction; no gateway turn ceiling consumes this column.
 				this.#database.exec("ALTER TABLE sessions ADD COLUMN turn_count INTEGER NOT NULL DEFAULT 0");
 				this.#database
 					.query("INSERT INTO schema_migrations (version, applied_at) VALUES (?, ?)")
@@ -1818,6 +2114,41 @@ ALTER TABLE monitor_slots ADD COLUMN event_id TEXT;`,
 				this.#database
 					.query("INSERT INTO schema_migrations (version, applied_at) VALUES (?, ?)")
 					.run(16, new Date().toISOString());
+			});
+		}
+		if (current < 17) {
+			this.withTransaction(() => {
+				// Issue #92: lifecycle state and its durable session/cursor binding are
+				// additive. Do not rewrite the legacy state column or its v16 CHECK.
+				const columns = new Set(
+					this.#database
+						.query<{ name: string }, []>("PRAGMA table_info(inbound_messages)")
+						.all()
+						.map((row) => row.name),
+				);
+				const additions = [
+					["batch_key", "TEXT"],
+					["batch_role", "TEXT CHECK(batch_role IS NULL OR batch_role IN ('trigger', 'member', 'steer'))"],
+					["batch_epoch", "INTEGER"],
+					["batch_state", "TEXT CHECK(batch_state IS NULL OR batch_state IN ('settled', 'accepted', 'done'))"],
+					["attributed_op_ref", "TEXT"],
+					["accepted_at", "TEXT"],
+					["bound_session_id", "TEXT"],
+				] as const;
+				for (const [name, declaration] of additions)
+					if (!columns.has(name)) this.#database.exec(`ALTER TABLE inbound_messages ADD COLUMN ${name} ${declaration}`);
+				this.#database.exec(
+					"CREATE UNIQUE INDEX IF NOT EXISTS inbound_messages_nonterminal_trigger ON inbound_messages (origin_key, batch_epoch) WHERE batch_role = 'trigger' AND batch_state IN ('settled', 'accepted')",
+				);
+				this.#database.exec(
+					"CREATE TABLE IF NOT EXISTS session_tail_cursors (session_id TEXT PRIMARY KEY, cursor TEXT NOT NULL, updated_at TEXT NOT NULL)",
+				);
+				this.#database.exec(
+					"UPDATE inbound_messages SET bound_session_id = (SELECT gjc_session_id FROM sessions WHERE sessions.origin_key = inbound_messages.origin_key AND sessions.epoch = inbound_messages.batch_epoch AND sessions.gjc_session_id <> '') WHERE bound_session_id IS NULL AND batch_state IN ('settled', 'accepted')",
+				);
+				this.#database
+					.query("INSERT INTO schema_migrations (version, applied_at) VALUES (?, ?)")
+					.run(17, new Date().toISOString());
 			});
 		}
 	}

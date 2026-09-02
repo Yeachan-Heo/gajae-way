@@ -3,9 +3,9 @@ import { chmod, mkdir, mkdtemp, rm, symlink } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { loadConfig, RELOADABLE_FIELDS, RESTART_REQUIRED_FIELDS, reloadConfig, UNCONSUMED_FIELDS } from "../src/config";
-import type { GjcPort } from "../src/orchestrator/gjc-client";
 import { type GatewayServer, startUnixServer } from "../src/server/server";
 import { GatewayDatabase } from "../src/store/db";
+import { sessionPortFromResponder } from "./session-port.fake";
 
 /**
  * Live config reload.
@@ -87,12 +87,8 @@ async function daemon(initial: Record<string, unknown>): Promise<{ client: Clien
 	await writeConfig(directory, { schemaVersion: 1, ...initial });
 	const config = await loadConfig({ home: directory });
 	const database = await GatewayDatabase.open(config.dbPath);
-	const gjc: GjcPort = {
-		ensureSession: async () => ({ sessionId: "mock-session" }),
-		forgetRebinds: () => {},
-		sendTurn: async () => "mock reply",
-	};
-	server = await startUnixServer({ config, database, gjc, onStop: () => database.close() });
+	const sessionPort = sessionPortFromResponder({ respond: async () => "mock reply" });
+	server = await startUnixServer({ config, database, sessionPort, onStop: () => database.close() });
 	const client = await connect(config.socketPath);
 	client.send({ v: "0.1", type: "hello", payload: { supportedVersions: ["0.1"] } });
 	await waitFor(client.frames, 1);
@@ -104,6 +100,8 @@ test("the partition is honest and exhaustive: live, restart-only, or unconsumed"
 	// they are read per request by the dispatch path.
 	expect(RELOADABLE_FIELDS).toContain("mentionAllowlist");
 	expect(RELOADABLE_FIELDS).toContain("channels");
+	expect(RELOADABLE_FIELDS).toContain("settleWindowMs");
+	expect(RELOADABLE_FIELDS).toContain("stallTimeoutMs");
 	// Anything bound to a listener, an open database, or the constructed gjc
 	// client is restart-only, and the sets never overlap.
 	for (const field of RESTART_REQUIRED_FIELDS) expect(RELOADABLE_FIELDS).not.toContain(field);
@@ -112,7 +110,6 @@ test("the partition is honest and exhaustive: live, restart-only, or unconsumed"
 		expect(RESTART_REQUIRED_FIELDS).not.toContain(field);
 	}
 	expect(RESTART_REQUIRED_FIELDS).toContain("socketPath");
-	expect(RESTART_REQUIRED_FIELDS).toContain("turnTimeoutMs");
 	// logVerbosity is parsed but read by nothing, so claiming it was applied
 	// would be a false report; it is declared unconsumed instead.
 	expect(UNCONSUMED_FIELDS).toContain("logVerbosity");
@@ -223,23 +220,21 @@ test("over the socket, a vanished config cannot widen a mention-gated room", asy
 	client.close();
 });
 
-test("a reloadable field is applied while a restart-only edit is reported and NOT applied", async () => {
+test("a reloadable policy edit is applied while obsolete turnTimeoutMs is rejected", async () => {
 	directory = await mkdtemp(join(tmpdir(), "gajaeway-reload-"));
-	await writeConfig(directory, { schemaVersion: 1, mentionAllowlist: ["owner"], turnTimeoutMs: 300_000 });
+	await writeConfig(directory, { schemaVersion: 1, mentionAllowlist: ["owner"], settleWindowMs: 300 });
 	const current = await loadConfig({ home: directory });
 	await writeConfig(directory, {
 		schemaVersion: 1,
 		mentionAllowlist: ["owner", "second"],
+		settleWindowMs: 900,
 		turnTimeoutMs: 900_000,
 	});
 	const result = await reloadConfig(current);
-	expect(result.ok).toBe(true);
-	if (!result.ok) return;
-	expect(result.changed).toEqual(["mentionAllowlist"]);
-	expect(result.restartRequired).toEqual(["turnTimeoutMs"]);
-	expect(result.config.mentionAllowlist).toEqual(["owner", "second"]);
-	// Refused, not half-applied: the live value stays at the old one.
-	expect(result.config.turnTimeoutMs).toBe(300_000);
+	expect(result.ok).toBe(false);
+	if (result.ok) return;
+	expect(result.config).toBe(current);
+	expect(result.diagnostics[0]?.message).toContain("turnTimeoutMs was removed");
 });
 
 test("an invalid config leaves the old one intact and reports the error", async () => {

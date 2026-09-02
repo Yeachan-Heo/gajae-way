@@ -4,9 +4,9 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { isSilenceToken } from "@gajaeway/protocol";
 import type { GatewayConfig } from "../src/config";
-import type { GjcPort } from "../src/orchestrator/gjc-client";
 import { type GatewayServer, startUnixServer } from "../src/server/server";
 import { GatewayDatabase } from "../src/store/db";
+import { sessionPortFromResponder } from "./session-port.fake";
 
 let directory = "";
 let server: GatewayServer | undefined;
@@ -48,15 +48,11 @@ async function openChannelGateway(reply: string): Promise<{ frames: any[]; datab
 		socketPath: join(directory, "gateway.sock"),
 		dbPath: join(directory, "gateway.db"),
 		logVerbosity: "info",
-		channels: { "chan-1": { engagement: "open" } },
+		channels: { "chan-1": { engagement: "open", settleWindowMs: 0 } },
 	};
 	const database = await GatewayDatabase.open(config.dbPath);
-	const gjc: GjcPort = {
-		ensureSession: async () => ({ sessionId: "mock-session" }),
-		forgetRebinds: () => {},
-		sendTurn: async () => reply,
-	};
-	server = await startUnixServer({ config, database, gjc, onStop: () => database.close() });
+	const sessionPort = sessionPortFromResponder({ respond: async () => reply });
+	server = await startUnixServer({ config, database, sessionPort, onStop: () => database.close() });
 	const client = await connect(config.socketPath);
 	client.send({ v: "0.1", type: "hello", payload: { supportedVersions: ["0.1"] } });
 	for (let attempt = 0; attempt < 60 && client.frames.length < 1; attempt++) await Bun.sleep(5);

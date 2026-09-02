@@ -9,9 +9,10 @@ import { MonitorPropagator } from "../src/monitors/propagate";
 import { MonitorRegistry } from "../src/monitors/registry";
 import { MonitorRuntime } from "../src/monitors/runtime";
 import { cronSlotsBetween, startCron } from "../src/monitors/triggers/cron";
-import type { GjcPort } from "../src/orchestrator/gjc-client";
+import type { SessionPortResponder } from "./session-port.fake";
 import { GatewayDatabase, MONITOR_EVENT_MAX_DISPATCH_ATTEMPTS } from "../src/store/db";
 import { DeliveryLedger } from "../src/store/ledger";
+import { sessionPortFromScript } from "./session-port.fake";
 
 let home = "";
 let database: GatewayDatabase | undefined;
@@ -25,12 +26,12 @@ afterEach(async () => {
 	home = "";
 });
 
-function fakeGjc(sendTurn: GjcPort["sendTurn"]): GjcPort {
-	return { ensureSession: async () => ({ sessionId: "s1" }), forgetRebinds: () => {}, sendTurn };
+function fakeSessionPort(respond: SessionPortResponder) {
+	return sessionPortFromScript({ bind: async () => ({ sessionId: "s1" }), respond });
 }
 
 async function harness(
-	sendTurn: GjcPort["sendTurn"],
+	respond: SessionPortResponder,
 	options: { ownerTarget?: { origin: { platform: "loopback"; kind: "loopback"; conversationId: "loopback" } } } = {},
 ) {
 	home = await mkdtemp(join(tmpdir(), "gajaeway-monitor-"));
@@ -46,7 +47,7 @@ async function harness(
 	const propagator = new MonitorPropagator({
 		database,
 		registry,
-		gjc: fakeGjc(sendTurn),
+		sessionPort: fakeSessionPort(respond),
 		memory: { enqueue: () => crypto.randomUUID(), enqueueExistingId: () => {} } as never,
 		delivery: new DeliveryService(new DeliveryLedger(database)),
 		emit: () => {},
@@ -338,12 +339,11 @@ describe("cron slot catch-up", () => {
 			const propagator = new MonitorPropagator({
 				database: db,
 				registry,
-				gjc: {
-					forgetRebinds: () => {},
-					ensureSession: async () => ({ sessionId: "s" }),
-					sendTurn: async (_id, text) =>
+				sessionPort: sessionPortFromScript({
+					bind: async () => ({ sessionId: "s" }),
+					respond: async (_id, text) =>
 						JSON.stringify(eventsFromPrompt(text).map(({ eventId: id }) => ({ eventId: id, note: "note" }))),
-				},
+				}),
 				memory: closure,
 				delivery: new DeliveryService(new DeliveryLedger(db)),
 				deliver: () => {},
@@ -658,12 +658,11 @@ describe("durable dispatch leases (restart-concurrent authoring)", () => {
 			const propagator = new MonitorPropagator({
 				database: db,
 				registry,
-				gjc: {
-					forgetRebinds: () => {},
-					ensureSession: async () => ({ sessionId: "s" }),
-					sendTurn: async (_id, text) =>
+				sessionPort: sessionPortFromScript({
+					bind: async () => ({ sessionId: "s" }),
+					respond: async (_id, text) =>
 						JSON.stringify(eventsFromPrompt(text).map(({ eventId: id }) => ({ eventId: id, note: "note" }))),
-				},
+				}),
 				memory: closure,
 				delivery: new DeliveryService(new DeliveryLedger(db)),
 				deliver: () => {
@@ -759,18 +758,17 @@ describe("durable dispatch leases — concurrent attempts (true overlap)", () =>
 				burstPolicy: "serialize",
 				enabled: true,
 			});
-			let sendTurnRan = false;
+			let responseRan = false;
 			const propagator = new MonitorPropagator({
 				database: db,
 				registry,
-				gjc: {
-					forgetRebinds: () => {},
-					ensureSession: async () => ({ sessionId: "s" }),
-					sendTurn: async () => {
-						sendTurnRan = true;
+				sessionPort: sessionPortFromScript({
+					bind: async () => ({ sessionId: "s" }),
+					respond: async () => {
+						responseRan = true;
 						return "[]";
 					},
-				},
+				}),
 				memory: { enqueue: () => crypto.randomUUID(), enqueueExistingId: () => {} } as never,
 				delivery: new DeliveryService(new DeliveryLedger(db)),
 				deliver: () => {},
@@ -781,7 +779,7 @@ describe("durable dispatch leases — concurrent attempts (true overlap)", () =>
 			});
 			propagator.submit(monitor.monitorId, "memory.canonicalize", { at: "x" });
 			await Bun.sleep(80);
-			expect(sendTurnRan).toBe(false);
+			expect(responseRan).toBe(false);
 			// Every acquire was rolled back: no live leases remain (no leak).
 			expect(db.monitorLeaseLiveCount()).toBe(0);
 			db.close();
@@ -810,14 +808,13 @@ describe("durable dispatch leases — concurrent attempts (true overlap)", () =>
 			const propagatorA = new MonitorPropagator({
 				database: db,
 				registry,
-				gjc: {
-					forgetRebinds: () => {},
-					ensureSession: async () => ({ sessionId: "s" }),
-					sendTurn: async (_id, text) => {
+				sessionPort: sessionPortFromScript({
+					bind: async () => ({ sessionId: "s" }),
+					respond: async (_id, text) => {
 						turnsA++;
 						return JSON.stringify(eventsFromPrompt(text).map(({ eventId: id }) => ({ eventId: id, note: "note-A" })));
 					},
-				},
+				}),
 				memory: { enqueue: () => crypto.randomUUID(), enqueueExistingId: () => {} } as never,
 				delivery: new DeliveryService(new DeliveryLedger(db)),
 				deliver: () => {},
@@ -829,14 +826,13 @@ describe("durable dispatch leases — concurrent attempts (true overlap)", () =>
 			const propagatorB = new MonitorPropagator({
 				database: db,
 				registry,
-				gjc: {
-					forgetRebinds: () => {},
-					ensureSession: async () => ({ sessionId: "s" }),
-					sendTurn: async () => {
+				sessionPort: sessionPortFromScript({
+					bind: async () => ({ sessionId: "s" }),
+					respond: async () => {
 						turnsB++;
 						return "[]";
 					},
-				},
+				}),
 				memory: { enqueue: () => crypto.randomUUID(), enqueueExistingId: () => {} } as never,
 				delivery: new DeliveryService(new DeliveryLedger(db)),
 				deliver: () => {
@@ -906,13 +902,12 @@ describe("durable dispatch leases — concurrent attempts (true overlap)", () =>
 			const propagator = new MonitorPropagator({
 				database: db,
 				registry,
-				gjc: {
-					forgetRebinds: () => {},
-					ensureSession: async () => ({ sessionId: "s" }),
-					sendTurn: async () =>
+				sessionPort: sessionPortFromScript({
+					bind: async () => ({ sessionId: "s" }),
+					respond: async () =>
 						// Malicious/partial response: omits the second event entirely.
 						JSON.stringify([]),
-				},
+				}),
 				memory: closure,
 				delivery: new DeliveryService(new DeliveryLedger(db)),
 				deliver: () => {
@@ -998,12 +993,11 @@ describe("durable dispatch leases — concurrent attempts (true overlap)", () =>
 			const propagator = new MonitorPropagator({
 				database: db,
 				registry,
-				gjc: {
-					forgetRebinds: () => {},
-					ensureSession: async () => ({ sessionId: "s" }),
-					sendTurn: async (_id, text) =>
+				sessionPort: sessionPortFromScript({
+					bind: async () => ({ sessionId: "s" }),
+					respond: async (_id, text) =>
 						JSON.stringify(eventsFromPrompt(text).map(({ eventId: id }) => ({ eventId: id, note: "n" }))),
-				},
+				}),
 				memory: { enqueue: () => crypto.randomUUID(), enqueueExistingId: () => {} } as never,
 				delivery: new DeliveryService(new DeliveryLedger(db)),
 				deliver: () => {},
@@ -1036,10 +1030,10 @@ describe("durable dispatch leases — concurrent attempts (true overlap)", () =>
 				enabled: true,
 			});
 
-			// Attempt A parks inside its real propagator dispatch (sendTurn hangs,
-			// then RETURNS an A note only after B has completed — the stale
-			// completion path the fencing must neutralize). A uses the awaitable
-			// seam so we hold the EXACT original dispatch promise.
+			// Attempt A parks inside its real propagator dispatch (the response waits,
+			// then returns an A note only after B has completed — the stale completion
+			// path the fencing must neutralize). A uses the awaitable seam so we hold
+			// the exact original dispatch promise.
 			let releaseA!: () => void;
 			const aParked = new Promise<void>((resolve) => {
 				releaseA = resolve;
@@ -1053,10 +1047,9 @@ describe("durable dispatch leases — concurrent attempts (true overlap)", () =>
 			const propagatorA = new MonitorPropagator({
 				database: db,
 				registry,
-				gjc: {
-					forgetRebinds: () => {},
-					ensureSession: async () => ({ sessionId: "s" }),
-					sendTurn: async () => {
+				sessionPort: sessionPortFromScript({
+					bind: async () => ({ sessionId: "s" }),
+					respond: async () => {
 						releaseA();
 						await new Promise<void>((resolve) => {
 							const check = setInterval(() => {
@@ -1070,7 +1063,7 @@ describe("durable dispatch leases — concurrent attempts (true overlap)", () =>
 						markAReturned();
 						return note;
 					},
-				},
+				}),
 				memory: { enqueue: () => crypto.randomUUID(), enqueueExistingId: () => {} } as never,
 				delivery: new DeliveryService(new DeliveryLedger(db)),
 				deliver: () => {
@@ -1099,12 +1092,11 @@ describe("durable dispatch leases — concurrent attempts (true overlap)", () =>
 			const propagatorB = new MonitorPropagator({
 				database: db,
 				registry,
-				gjc: {
-					forgetRebinds: () => {},
-					ensureSession: async () => ({ sessionId: "s" }),
-					sendTurn: async (_id, text) =>
+				sessionPort: sessionPortFromScript({
+					bind: async () => ({ sessionId: "s" }),
+					respond: async (_id, text) =>
 						JSON.stringify(eventsFromPrompt(text).map(({ eventId: id }) => ({ eventId: id, note: "B note" }))),
-				},
+				}),
 				memory: { enqueue: () => crypto.randomUUID(), enqueueExistingId: () => {} } as never,
 				delivery: new DeliveryService(new DeliveryLedger(db)),
 				deliver: () => {

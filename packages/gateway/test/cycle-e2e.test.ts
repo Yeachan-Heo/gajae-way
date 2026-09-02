@@ -5,10 +5,10 @@ import { join } from "node:path";
 import type { OriginRef } from "@gajaeway/protocol";
 import type { GatewayConfig } from "../src/config";
 import { RuntimeCycleProjector } from "../src/ops/cycle";
-import type { GjcPort } from "../src/orchestrator/gjc-client";
 import { type GatewayServer, startUnixServer } from "../src/server/server";
 import { GatewayDatabase } from "../src/store/db";
 import { DeliveryLedger } from "../src/store/ledger";
+import { sessionPortFromResponder } from "./session-port.fake";
 
 let directory = "";
 let server: GatewayServer | undefined;
@@ -114,12 +114,8 @@ test("ops.cycle verb serves a fresh fail-closed snapshot over the socket", async
 		originKey: key,
 		payloadJson: JSON.stringify({ turnId: "t1", origin: discordDm, role: "assistant", text: "hi", final: true }),
 	});
-	const gjc: GjcPort = {
-		ensureSession: async () => ({ sessionId: "mock-session" }),
-		sendTurn: async () => "mock reply",
-		forgetRebinds: () => {},
-	};
-	server = await startUnixServer({ config, database, gjc, onStop: () => database.close() });
+	const sessionPort = sessionPortFromResponder({ respond: async () => "mock reply" });
+	server = await startUnixServer({ config, database, sessionPort, onStop: () => database.close() });
 
 	// Minimal negotiated client, mirroring server.test.ts's raw-socket helper.
 	const frames: unknown[] = [];

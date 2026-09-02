@@ -6,9 +6,10 @@ import { DeliveryService } from "../src/delivery/delivery";
 import { MemoryClosureQueue } from "../src/memory/closure";
 import { MonitorPropagator } from "../src/monitors/propagate";
 import { MonitorRegistry } from "../src/monitors/registry";
-import type { GjcPort } from "../src/orchestrator/gjc-client";
+import type { SessionPortResponder } from "./session-port.fake";
 import { GatewayDatabase } from "../src/store/db";
 import { DeliveryLedger } from "../src/store/ledger";
+import { sessionPortFromScript } from "./session-port.fake";
 
 let home = "";
 let database: GatewayDatabase | undefined;
@@ -19,7 +20,7 @@ afterEach(async () => {
 	home = "";
 });
 
-async function harness(sendTurn: GjcPort["sendTurn"]) {
+async function harness(respond: SessionPortResponder) {
 	home = await mkdtemp(join(tmpdir(), "gajaeway-monitor-"));
 	database = await GatewayDatabase.open(join(home, "gateway.db"));
 	const registry = new MonitorRegistry(database);
@@ -33,7 +34,7 @@ async function harness(sendTurn: GjcPort["sendTurn"]) {
 	const propagator = new MonitorPropagator({
 		database,
 		registry,
-		gjc: { ensureSession: async () => ({ sessionId: "s1" }), sendTurn, forgetRebinds: () => {} },
+		sessionPort: sessionPortFromScript({ bind: async () => ({ sessionId: "s1" }), respond }),
 		memory: new MemoryClosureQueue(database, home),
 		delivery: new DeliveryService(new DeliveryLedger(database)),
 		emit: () => {},

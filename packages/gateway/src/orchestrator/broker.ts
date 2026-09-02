@@ -1,0 +1,649 @@
+import { chmod, mkdir, open, readFile, rename, unlink, writeFile } from "node:fs/promises";
+import { join } from "node:path";
+import type { CliResult, CliRunner } from "@gajaeway/subsession";
+import { sanitizeDiagnostic } from "./rebind";
+
+/** The Stage 0 capability report was run successfully on this runtime floor. */
+export const MIN_GJC_VERSION = "0.15.6";
+/** Structural marker the health/capability probe requires from `sdk session list`. */
+const SESSION_LIST_MARKER = "sessions";
+export const DEFAULT_PERSONA_HOST_ID = "persona";
+
+/** Process seam for gjc command execution; the gateway never spawns a session host itself. */
+export type SpawnFn = typeof Bun.spawn;
+
+/** A command seam for preflight and the broker-bound SDK CLI. */
+export type GjcCommandRunner = CliRunner;
+
+export interface BrokerRestartBackoff {
+	readonly initialMs?: number;
+	readonly maxMs?: number;
+}
+
+export interface BrokerHealthContext {
+	readonly agentDir: string;
+	readonly cli: CliRunner;
+}
+
+export type BrokerHealthProbe = (context: BrokerHealthContext) => boolean | Promise<boolean>;
+export type PidAliveProbe = (pid: number) => boolean | Promise<boolean>;
+export type BrokerGenerationListener = (generation: number) => void;
+
+export interface BrokerSupervisorOptions {
+	/** Gateway-private root; state is nested beneath broker/<instanceId>. */
+	readonly home: string;
+	/** Durable database meta.instance_id, never an origin or a mutable display name. */
+	readonly instanceId: string;
+	/** One explicit persona host today; the lookup API keeps this boundary ready for more hosts. */
+	readonly personaHostId?: string;
+	/** The persona workspace is the working directory for agent-dir-bound gjc commands. */
+	readonly cwd?: string;
+	/** Process seam for gjc command execution; production uses Bun.spawn bound to Bun. */
+	readonly spawn?: SpawnFn;
+	/** Command seam used by preflight and CliRunner; production spawns gjc commands directly. */
+	readonly command?: GjcCommandRunner;
+	/** Health seam; production issues an agent-dir-scoped session-list envelope probe. */
+	readonly healthProbe?: BrokerHealthProbe;
+	/** Stale-lock proof seam. */
+	readonly isPidAlive?: PidAliveProbe;
+	readonly healthIntervalMs?: number;
+	readonly healthProbeTimeoutMs?: number;
+	readonly readinessAttempts?: number;
+	readonly readinessDelayMs?: number;
+	readonly restartBackoff?: BrokerRestartBackoff;
+	readonly log?: (line: string) => void;
+}
+
+/** Dependencies accepted by boot; home, instance identity, and cwd are gateway-owned facts. */
+export type BrokerSupervisorDependencies = Omit<BrokerSupervisorOptions, "home" | "instanceId" | "cwd">;
+
+export interface PersonaBroker {
+	readonly personaHostId: string;
+	readonly agentDir: string;
+	readonly generation: number;
+	readonly cli: CliRunner;
+}
+
+type ActiveBroker = {
+	readonly generation: number;
+};
+
+type LockRecord = {
+	readonly pid: number;
+	readonly generation: number;
+};
+
+const DEFAULT_HEALTH_INTERVAL_MS = 5_000;
+const DEFAULT_HEALTH_PROBE_TIMEOUT_MS = 2_000;
+const DEFAULT_COMMAND_TIMEOUT_MS = 30_000;
+// The first agent-dir-scoped command auto-starts gjc's own broker daemon; give
+// its lifecycle launcher a moment to converge after the first successful probe.
+// Injected test probes define readiness themselves and skip this grace.
+const DEFAULT_STARTUP_STABILIZATION_MS = 500;
+const DEFAULT_READINESS_ATTEMPTS = 20;
+const DEFAULT_READINESS_DELAY_MS = 100;
+const DEFAULT_RESTART_INITIAL_MS = 250;
+const DEFAULT_RESTART_MAX_MS = 10_000;
+
+/**
+ * Session hosting is gjc's own concern: the first agent-dir-scoped `gjc sdk`
+ * command auto-starts a per-agent-dir broker daemon that owns session host
+ * children. The gateway therefore never spawns a host process; it isolates the
+ * persona broker by owning a PRIVATE agent dir and supervises that daemon by
+ * observing it (health, generation fencing), not by owning its process. Stage 0
+ * (artifacts/p2b-issue92-capability-report.md) reached this daemon through its
+ * then-public `broker-internal` entrypoint; gjc >= 0.16.0 no longer exposes it
+ * on the CLI surface, which is why observation is the only portable contract.
+ */
+export function brokerHealthArgs(): readonly string[] {
+	// `cwd` scope: the persona workspace is not a Git checkout, and gjc >= 0.16.0
+	// refuses `--scope all` outside one. A cwd-scoped listing still proves the
+	// agent-dir daemon answers a structural session-list envelope.
+	return ["sdk", "session", "list", "--scope", "cwd"];
+}
+
+/** A session-list envelope is healthy only when it is a structurally valid `ok` reply. */
+export function isHealthySessionList(result: CliResult): boolean {
+	if (result.exitCode !== 0) return false;
+	try {
+		const parsed = JSON.parse(result.stdout) as { ok?: unknown; result?: unknown };
+		if (parsed.ok !== true) return false;
+		const body = parsed.result;
+		return typeof body === "object" && body !== null && Array.isArray((body as Record<string, unknown>)[SESSION_LIST_MARKER]);
+	} catch {
+		return false;
+	}
+}
+
+/**
+ * Enforces the Stage 0 runtime floor before the gateway accepts any connection:
+ * a semantic version at or above the verified floor, plus proof that the `sdk`
+ * surface answers a structurally valid session-list envelope (never trusting a
+ * zero exit code alone, which generic help output also produces).
+ */
+export async function preflightGjcRuntime(
+	run: GjcCommandRunner,
+	minimumVersion = MIN_GJC_VERSION,
+	sdk: GjcCommandRunner = run,
+): Promise<void> {
+	const version = await run(["--version"], { timeoutMs: DEFAULT_HEALTH_PROBE_TIMEOUT_MS });
+	if (version.exitCode !== 0) {
+		throw new Error(`gjc runtime preflight failed: gjc --version exited ${version.exitCode}`);
+	}
+	const found = parseGjcVersion(version.stdout || version.stderr);
+	const minimum = parseGjcVersion(minimumVersion);
+	if (!found) {
+		throw new Error("gjc runtime preflight failed: gjc --version did not report a semantic version");
+	}
+	if (!minimum) throw new Error(`invalid configured gjc minimum version ${minimumVersion}`);
+	if (compareVersions(found, minimum) < 0) {
+		throw new Error(
+			`gjc runtime preflight failed: requires gjc >= ${minimumVersion}; found ${formatVersion(found)}`,
+		);
+	}
+	const capability = await sdk([...brokerHealthArgs()], { timeoutMs: DEFAULT_COMMAND_TIMEOUT_MS });
+	if (!isHealthySessionList(capability)) {
+		throw new Error(
+			`gjc runtime preflight failed: \`gjc sdk session list\` did not answer a valid session-list envelope (exit ${capability.exitCode})`,
+		);
+	}
+}
+
+/**
+ * Supervises the gateway's private persona broker: it owns the agent dir and its
+ * lock, observes the gjc-managed daemon's health, and publishes a generation
+ * every time the daemon is observed to come back after a failure. It deliberately
+ * exposes only generation and a broker-bound CLI: session recovery remains with
+ * the per-origin actor, never this supervisor.
+ */
+export class BrokerSupervisor implements PersonaBroker {
+	readonly personaHostId: string;
+	readonly stateDir: string;
+	readonly agentDir: string;
+	/** gjc's own daemon publishes its endpoint discovery here. */
+	readonly discoveryPath: string;
+	readonly lockPath: string;
+	readonly cli: CliRunner;
+
+	readonly #spawn: SpawnFn;
+	readonly #command: GjcCommandRunner;
+	readonly #healthProbe: BrokerHealthProbe;
+	readonly #isPidAlive: PidAliveProbe;
+	readonly #cwd: string;
+	readonly #healthIntervalMs: number;
+	readonly #healthProbeTimeoutMs: number;
+	readonly #readinessAttempts: number;
+	readonly #readinessDelayMs: number;
+	readonly #restartInitialMs: number;
+	readonly #restartMaxMs: number;
+	readonly #startupStabilizationMs: number;
+	readonly #log: (line: string) => void;
+	readonly #listeners = new Set<BrokerGenerationListener>();
+
+	#lock: Awaited<ReturnType<typeof open>> | undefined;
+	#active: ActiveBroker | undefined;
+	#generation = 0;
+	#restartFailures = 0;
+	#healthTimer: ReturnType<typeof setInterval> | undefined;
+	#restartTimer: ReturnType<typeof setTimeout> | undefined;
+	#healthCheckInFlight = false;
+	#launching = false;
+	#started = false;
+	#stopping = false;
+	#startPromise: Promise<void> | undefined;
+	#stopPromise: Promise<void> | undefined;
+
+	constructor(options: BrokerSupervisorOptions) {
+		if (!/^[A-Za-z0-9._-]+$/.test(options.instanceId)) {
+			throw new Error("broker instance id must contain only letters, numbers, dots, underscores, or hyphens");
+		}
+		this.personaHostId = options.personaHostId ?? DEFAULT_PERSONA_HOST_ID;
+		if (!/^[A-Za-z0-9._-]+$/.test(this.personaHostId)) {
+			throw new Error("broker persona host id must contain only letters, numbers, dots, underscores, or hyphens");
+		}
+		this.stateDir = join(options.home, "broker", options.instanceId);
+		this.agentDir = join(this.stateDir, "agent");
+		this.discoveryPath = join(this.agentDir, "sdk", "broker.json");
+		this.lockPath = join(this.stateDir, "broker.lock");
+		this.#cwd = options.cwd ?? options.home;
+		this.#spawn = options.spawn ?? Bun.spawn.bind(Bun);
+		this.#command = options.command ?? ((args, commandOptions) => this.#runCommand(args, commandOptions));
+		this.cli = (args, commandOptions) => this.#command(bindAgentDir(args, this.agentDir), commandOptions);
+		this.#healthProbe =
+			options.healthProbe ??
+			(async ({ cli }) => isHealthySessionList(await cli([...brokerHealthArgs()], { timeoutMs: this.#healthProbeTimeoutMs })));
+		this.#startupStabilizationMs = options.healthProbe ? 0 : DEFAULT_STARTUP_STABILIZATION_MS;
+		this.#isPidAlive = options.isPidAlive ?? defaultPidAlive;
+		this.#healthIntervalMs = positiveInteger(options.healthIntervalMs, DEFAULT_HEALTH_INTERVAL_MS, "healthIntervalMs");
+		this.#healthProbeTimeoutMs = positiveInteger(
+			options.healthProbeTimeoutMs,
+			DEFAULT_HEALTH_PROBE_TIMEOUT_MS,
+			"healthProbeTimeoutMs",
+		);
+		this.#readinessAttempts = positiveInteger(options.readinessAttempts, DEFAULT_READINESS_ATTEMPTS, "readinessAttempts");
+		this.#readinessDelayMs = nonNegativeInteger(options.readinessDelayMs, DEFAULT_READINESS_DELAY_MS, "readinessDelayMs");
+		this.#restartInitialMs = nonNegativeInteger(
+			options.restartBackoff?.initialMs,
+			DEFAULT_RESTART_INITIAL_MS,
+			"restartBackoff.initialMs",
+		);
+		this.#restartMaxMs = nonNegativeInteger(
+			options.restartBackoff?.maxMs,
+			DEFAULT_RESTART_MAX_MS,
+			"restartBackoff.maxMs",
+		);
+		if (this.#restartMaxMs < this.#restartInitialMs) {
+			throw new Error("restartBackoff.maxMs must be greater than or equal to restartBackoff.initialMs");
+		}
+		this.#log = options.log ?? ((line) => console.error(line));
+	}
+
+	/** Takes ownership of the private agent dir and does not resolve until its daemon answers healthy. */
+	async start(): Promise<void> {
+		if (this.#started) return;
+		if (this.#startPromise) return await this.#startPromise;
+		this.#stopping = false;
+		const start = this.#start();
+		this.#startPromise = start;
+		try {
+			await start;
+			this.#started = true;
+		} finally {
+			this.#startPromise = undefined;
+		}
+	}
+
+	/** Runs the boot-time capability gate against the private agent dir. */
+	async preflight(): Promise<void> {
+		// The sdk probe is agent-dir-bound so it exercises (and auto-starts) the private daemon.
+		await preflightGjcRuntime(this.#command, MIN_GJC_VERSION, this.cli);
+	}
+
+	/** The current daemon generation; it starts at 1 and increases every time the daemon is observed to recover. */
+	get generation(): number {
+		return this.#generation;
+	}
+
+	/** Explicit one-host lookup; callers cannot accidentally select a per-origin broker. */
+	brokerFor(personaHostId: string): PersonaBroker {
+		if (personaHostId !== this.personaHostId) {
+			throw new Error(`no broker is registered for persona host ${personaHostId}`);
+		}
+		return this;
+	}
+
+	/** Consumers may fence work on a host replacement without handing recovery policy to this class. */
+	onGeneration(listener: BrokerGenerationListener): () => void {
+		this.#listeners.add(listener);
+		return () => this.#listeners.delete(listener);
+	}
+
+	/** Stops observation and releases ownership; the gjc daemon's own lifecycle is not the gateway's to end. */
+	async stop(): Promise<void> {
+		if (this.#stopPromise) return await this.#stopPromise;
+		this.#stopping = true;
+		const starting = this.#startPromise;
+		const stop = (async () => {
+			if (starting) await starting.catch(() => {});
+			await this.#stop();
+		})();
+		this.#stopPromise = stop;
+		try {
+			await stop;
+		} finally {
+			this.#stopPromise = undefined;
+		}
+	}
+
+	async #start(): Promise<void> {
+		await this.#acquireLock();
+		try {
+			await mkdir(this.agentDir, { recursive: true, mode: 0o700 });
+			await chmod(this.agentDir, 0o700);
+			await this.#launchGeneration();
+		} catch (error) {
+			this.#stopping = true;
+			if (!this.#active) await this.#releaseLock();
+			throw error;
+		}
+	}
+
+	async #stop(): Promise<void> {
+		this.#clearHealthTimer();
+		if (this.#restartTimer) {
+			clearTimeout(this.#restartTimer);
+			this.#restartTimer = undefined;
+		}
+		this.#active = undefined;
+		await this.#releaseLock();
+		this.#started = false;
+	}
+
+	async #acquireLock(): Promise<void> {
+		const root = join(this.stateDir, "..");
+		await mkdir(root, { recursive: true, mode: 0o700 });
+		await chmod(root, 0o700);
+		for (let attempt = 0; attempt < 3; attempt++) {
+			await mkdir(this.stateDir, { recursive: true, mode: 0o700 });
+			await chmod(this.stateDir, 0o700);
+			try {
+				this.#lock = await open(this.lockPath, "wx", 0o600);
+				await this.#writeLock();
+				return;
+			} catch (error) {
+				if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+			}
+			const stale = await this.#staleLockRecord();
+			if (!stale) continue;
+			const live = await this.#isPidAlive(stale.pid);
+			if (live) {
+				throw new Error(
+					`broker ownership lock is held by live pid ${stale.pid} for gateway instance ${this.stateDir}; refusing to take over`,
+				);
+			}
+			await this.#removeStaleState(stale);
+		}
+		throw new Error(`could not acquire broker ownership lock at ${this.lockPath}`);
+	}
+
+	/** Returns a stale candidate only when an existing lock contains a usable PID. */
+	async #staleLockRecord(): Promise<LockRecord | undefined> {
+		let raw: string;
+		try {
+			raw = await readFile(this.lockPath, "utf8");
+		} catch (error) {
+			if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined;
+			throw error;
+		}
+		let parsed: unknown;
+		try {
+			parsed = JSON.parse(raw);
+		} catch {
+			throw new Error(`broker ownership lock ${this.lockPath} is malformed; refusing stale cleanup`);
+		}
+		if (
+			typeof parsed !== "object" ||
+			parsed === null ||
+			typeof (parsed as { pid?: unknown }).pid !== "number" ||
+			!Number.isSafeInteger((parsed as { pid: number }).pid) ||
+			(parsed as { pid: number }).pid <= 0 ||
+			typeof (parsed as { generation?: unknown }).generation !== "number" ||
+			!Number.isSafeInteger((parsed as { generation: number }).generation) ||
+			(parsed as { generation: number }).generation < 0
+		) {
+			throw new Error(`broker ownership lock ${this.lockPath} is malformed; refusing stale cleanup`);
+		}
+		return parsed as LockRecord;
+	}
+
+	/**
+	 * A dead PID proves only the old process and its endpoint/lock remnants are
+	 * stale. The private agent directory carries durable broker authority and
+	 * must survive takeover; recursive removal would erase sessions that AC4 is
+	 * specifically meant to recover.
+	 */
+	async #removeStaleState(stale: LockRecord): Promise<void> {
+		// Two reclaimers may race on the same dead lock. Rename (atomic) rather than
+		// unlink: the loser's rename fails with ENOENT because the winner already
+		// moved it, and a lock the winner has since re-created is never touched.
+		const tombstone = `${this.lockPath}.stale-${stale.pid}-${process.pid}-${Date.now()}`;
+		try {
+			await rename(this.lockPath, tombstone);
+		} catch (error) {
+			if ((error as NodeJS.ErrnoException).code === "ENOENT") return;
+			throw error;
+		}
+		try {
+			if ((await readFile(tombstone, "utf8")).includes(`"pid":${stale.pid}`)) await unlink(tombstone);
+			else await rename(tombstone, this.lockPath);
+		} catch (error) {
+			if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+		}
+		try {
+			await unlink(join(this.stateDir, "broker.sock"));
+		} catch (error) {
+			if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+		}
+	}
+
+	async #writeLock(): Promise<void> {
+		if (!this.#lock) throw new Error("broker ownership lock is not held");
+		await writeFile(this.lockPath, `${JSON.stringify({ pid: process.pid, generation: this.#generation })}\n`, {
+			mode: 0o600,
+		});
+		await chmod(this.lockPath, 0o600);
+	}
+
+	async #releaseLock(): Promise<void> {
+		const lock = this.#lock;
+		this.#lock = undefined;
+		if (!lock) return;
+		await lock.close();
+		try {
+			await unlink(this.lockPath);
+		} catch (error) {
+			if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+		}
+	}
+
+	/** A generation begins when the agent-dir daemon is observed healthy; the first probe auto-starts it. */
+	async #launchGeneration(): Promise<void> {
+		this.#launching = true;
+		const active: ActiveBroker = { generation: this.#generation + 1 };
+		try {
+			this.#active = active;
+			await this.#awaitHealthy(active);
+			if (this.#active !== active) throw new Error("broker observation was cancelled during readiness");
+			// The public generation advances only once the daemon is OBSERVED healthy;
+			// a failed recovery attempt never burns a generation number.
+			this.#generation = active.generation;
+			await this.#writeLock();
+			this.#publishGeneration(active.generation);
+			this.#startHealthTimer();
+		} catch (error) {
+			if (this.#active === active) this.#active = undefined;
+			throw error;
+		} finally {
+			this.#launching = false;
+		}
+	}
+
+	async #awaitHealthy(active: ActiveBroker): Promise<void> {
+		for (let attempt = 0; attempt < this.#readinessAttempts; attempt++) {
+			if (this.#stopping) throw new Error("broker observation stopped during readiness");
+			if (this.#active !== active) throw new Error("broker observation was replaced before readiness completed");
+			try {
+				if (await this.#healthProbe({ agentDir: this.agentDir, cli: this.cli })) {
+					if (this.#startupStabilizationMs > 0) await sleep(this.#startupStabilizationMs);
+					return;
+				}
+			} catch (error) {
+				this.#log(`broker health probe during startup failed: ${diagnostic(error)}`);
+			}
+			if (attempt + 1 < this.#readinessAttempts) await sleep(this.#readinessDelayMs);
+		}
+		throw new Error(`broker daemon did not become healthy after ${this.#readinessAttempts} probe(s)`);
+	}
+
+	#startHealthTimer(): void {
+		this.#clearHealthTimer();
+		this.#healthTimer = setInterval(() => void this.#checkHealth(), this.#healthIntervalMs);
+	}
+
+	#clearHealthTimer(): void {
+		if (!this.#healthTimer) return;
+		clearInterval(this.#healthTimer);
+		this.#healthTimer = undefined;
+	}
+
+	async #checkHealth(): Promise<void> {
+		if (this.#healthCheckInFlight || this.#stopping) return;
+		const active = this.#active;
+		if (!active) return;
+		this.#healthCheckInFlight = true;
+		let healthy = false;
+		try {
+			healthy = await this.#healthProbe({ agentDir: this.agentDir, cli: this.cli });
+		} catch (error) {
+			this.#log(`broker health probe failed: ${diagnostic(error)}`);
+		} finally {
+			this.#healthCheckInFlight = false;
+		}
+		if (healthy && !this.#stopping && this.#active === active) {
+			// A completed periodic probe is the stable-health boundary that resets restart backoff.
+			this.#restartFailures = 0;
+			return;
+		}
+		if (this.#stopping || this.#active !== active) return;
+		// The daemon is gjc-owned; a failed probe fences this generation and waits
+		// (with backoff) for the daemon to answer again, then publishes a new one.
+		this.#clearHealthTimer();
+		this.#active = undefined;
+		this.#log(`broker daemon generation ${active.generation} failed health; awaiting recovery`);
+		this.#scheduleRestart("broker health probe failed");
+	}
+
+	#scheduleRestart(reason: string): void {
+		if (this.#stopping || this.#restartTimer) return;
+		const multiplier = 2 ** Math.min(this.#restartFailures, 30);
+		const delay = Math.min(this.#restartInitialMs * multiplier, this.#restartMaxMs);
+		this.#restartFailures++;
+		this.#log(`broker_restart generation=${this.#generation + 1} backoffMs=${delay} reason=${reason}`);
+		this.#restartTimer = setTimeout(() => {
+			this.#restartTimer = undefined;
+			void this.#restart();
+		}, delay);
+	}
+
+	async #restart(): Promise<void> {
+		if (this.#stopping) return;
+		try {
+			await this.#launchGeneration();
+		} catch (error) {
+			if (this.#stopping) return;
+			this.#log(`broker recovery observation failed: ${diagnostic(error)}`);
+			if (!this.#active) this.#scheduleRestart("broker restart readiness failed");
+		}
+	}
+
+	#publishGeneration(generation: number): void {
+		for (const listener of this.#listeners) {
+			try {
+				listener(generation);
+			} catch (error) {
+				this.#log(`broker generation listener failed: ${diagnostic(error)}`);
+			}
+		}
+	}
+
+	async #runCommand(args: readonly string[], options?: { readonly timeoutMs?: number }): Promise<CliResult> {
+		const agentDir = args.includes("--agent-dir") ? this.agentDir : undefined;
+		const child = this.#spawn({
+			cmd: ["gjc", ...args],
+			cwd: this.#cwd,
+			stdin: "ignore",
+			stdout: "pipe",
+			stderr: "pipe",
+			// Broker-bound commands share the same private state while retaining provider variables.
+			env: agentDir ? brokerEnvironment(agentDir) : (process.env as Record<string, string>),
+		});
+		return await collectCommand(child, options?.timeoutMs ?? DEFAULT_COMMAND_TIMEOUT_MS);
+	}
+}
+
+function bindAgentDir(args: readonly string[], agentDir: string): readonly string[] {
+	if (args[0] !== "sdk") throw new Error("broker CliRunner accepts only gjc sdk commands");
+	const bound = [...args];
+	const agentDirCount = bound.filter((arg) => arg === "--agent-dir").length;
+	if (agentDirCount > 1 || bound.some((arg) => arg.startsWith("--agent-dir="))) {
+		throw new Error("broker CliRunner accepts at most one explicit --agent-dir argument");
+	}
+	const agentDirIndex = bound.indexOf("--agent-dir");
+	if (agentDirIndex >= 0) {
+		if (bound[agentDirIndex + 1] !== agentDir) {
+			throw new Error("broker CliRunner cannot target an agent directory other than its owned broker state");
+		}
+		bound.splice(agentDirIndex, 2);
+	}
+	if (bound[1] === "session") bound.splice(2, 0, "--agent-dir", agentDir);
+	else bound.push("--agent-dir", agentDir);
+	return bound;
+}
+
+function brokerEnvironment(agentDir: string): Record<string, string> {
+	return {
+		...process.env,
+		GJC_AGENT_DIR: agentDir,
+		GJC_CODING_AGENT_DIR: agentDir,
+	} as Record<string, string>;
+}
+async function collectCommand(child: ReturnType<typeof Bun.spawn>, timeoutMs: number): Promise<CliResult> {
+	let timer: ReturnType<typeof setTimeout> | undefined;
+	try {
+		const result = await Promise.race([
+			Promise.all([
+				new Response(child.stdout as ReadableStream).text(),
+				new Response(child.stderr as ReadableStream).text(),
+				child.exited,
+			]),
+			new Promise<never>((_, reject) => {
+				timer = setTimeout(() => {
+					child.kill();
+					reject(new Error(`gjc command timed out after ${timeoutMs}ms`));
+				}, timeoutMs);
+			}),
+		]);
+		return { stdout: result[0], stderr: result[1], exitCode: result[2] };
+	} finally {
+		if (timer) clearTimeout(timer);
+	}
+}
+
+function parseGjcVersion(value: string): readonly [number, number, number] | undefined {
+	const match = value.match(/(?:gjc\/)?(\d+)\.(\d+)\.(\d+)(?:[-+][0-9A-Za-z.-]+)?/);
+	if (!match) return undefined;
+	return [Number(match[1]), Number(match[2]), Number(match[3])];
+}
+
+function compareVersions(left: readonly number[], right: readonly number[]): number {
+	for (let index = 0; index < 3; index++) {
+		if (left[index] !== right[index]) return left[index] - right[index];
+	}
+	return 0;
+}
+
+function formatVersion(version: readonly [number, number, number]): string {
+	return version.join(".");
+}
+
+function diagnostic(error: unknown): string {
+	return sanitizeDiagnostic(error instanceof Error ? error.message : String(error)) || "unknown_error";
+}
+
+function defaultPidAlive(pid: number): boolean {
+	try {
+		process.kill(pid, 0);
+		return true;
+	} catch (error) {
+		const code = (error as NodeJS.ErrnoException).code;
+		if (code === "ESRCH") return false;
+		if (code === "EPERM") return true;
+		throw error;
+	}
+}
+
+function positiveInteger(value: number | undefined, fallback: number, name: string): number {
+	const result = value ?? fallback;
+	if (!Number.isSafeInteger(result) || result <= 0) throw new Error(`${name} must be a positive integer`);
+	return result;
+}
+
+function nonNegativeInteger(value: number | undefined, fallback: number, name: string): number {
+	const result = value ?? fallback;
+	if (!Number.isSafeInteger(result) || result < 0) throw new Error(`${name} must be a non-negative integer`);
+	return result;
+}
+
+function sleep(ms: number): Promise<void> {
+	return new Promise((resolve) => setTimeout(resolve, ms));
+}

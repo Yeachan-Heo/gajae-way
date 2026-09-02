@@ -1,4 +1,5 @@
 import { unlink } from "node:fs/promises";
+import { join } from "node:path";
 import {
 	CAPABILITIES,
 	type ChatMessagePayload,
@@ -51,15 +52,27 @@ import { MonitorRegistry } from "../monitors/registry";
 import { MonitorRuntime } from "../monitors/runtime";
 import { backupDatabase, integrityDatabase } from "../ops/backup";
 import { RuntimeCycleProjector } from "../ops/cycle";
-import type { GjcPort } from "../orchestrator/gjc-client";
-import { formatFailureNotice } from "../orchestrator/rebind";
-import { buildSessionBootstrap, type SessionBootstrap } from "../persona/bootstrap";
+import type { BrokerSupervisor } from "../orchestrator/broker";
+import {
+	PersonaSessionManager,
+	type PersonaFailureInput,
+	type PersonaTailFrameInput,
+	type PersonaTerminalInput,
+	type PersonaTurnLifecycle,
+	type PersonaTurnStartInput,
+} from "../orchestrator/persona-session";
+import {
+	SessionRequestTimeoutError,
+	type SessionPort,
+} from "../orchestrator/session-port";
+import { deterministicTailDeliveryId } from "../orchestrator/tail-runner";
+import { formatFailureNotice, sanitizeDiagnostic } from "../orchestrator/rebind";
+import { buildSessionBootstrap } from "../persona/bootstrap";
 import { PersonaLoader } from "../persona/persona";
 import type { GatewayDatabase, InboundMessageRow, MonitorEventStage } from "../store/db";
 import { DeliveryLedger } from "../store/ledger";
 import { OrderedFrameWriter } from "./frame-writer";
 import { InterimSpeechGate, type InterimSpeechLimits } from "./interim-speech";
-import { KeyedQueue } from "./keyed-queue";
 import { applyModelCommand } from "./model-command";
 import { composeSpeakerLabel, composeTurnHeader } from "./speaker";
 
@@ -67,15 +80,9 @@ import { composeSpeakerLabel, composeTurnHeader } from "./speaker";
  * Durable lane-job persistence for delegated work (issue #10).
  *
  * Every `work.run` call is one attempt against a job whose identity outlives
- * the turn: the attempt receipt, end state, failure code, and repository
- * checkpoints land in SQLite before the reply is produced, so a gateway
- * restart or a reaped turn still leaves an auditable trail. Corrupt stored
- * state fails the verb loudly instead of being silently replaced.
- *
- * Boundary note: this surface drives gjc via spawn-per-turn (`--resume`), which
- * has no broker op accounting to poll - so attempts carry gateway-local opRefs
- * and end states, while broker-driven op receipts/status reconciliation remain
- * the G001 library surface for sdk-session lanes.
+ * the turn. Its caller-supplied operation reference, accepted receipt, and
+ * terminal transition persist through the broker-backed SessionPort, so a
+ * gateway restart leaves an auditable record instead of an orphaned operation.
  */
 function laneJobIdentity(workName: string): { jobId: string; laneKey: string } {
 	const laneKey = `work-${workName}`;
@@ -161,18 +168,8 @@ async function loadOrCreateLaneJob(
 	return created;
 }
 
-/**
- * Completed turns per epoch before the session is rotated. Every `gjc --resume`
- * replays the whole transcript, so an unrotated busy origin gets slower forever;
- * durable memory (daily capture + recall) carries continuity across epochs.
- *
- * INBOUND CHAT ONLY. Monitor authoring sessions have NO turn ceiling: native
- * gjc auto-compaction keeps them bounded, and monitors/compaction.ts is the
- * safety net that rolls one only after repeated context-class failures with no
- * successful native compaction (issue #68).
- */
-const SESSION_TURN_LIMIT = 50;
-
+/** Persona tail stall heartbeat; well under the 120s stallTimeoutMs so alarms land within one interval of the threshold. */
+const DEFAULT_STALL_CHECK_INTERVAL_MS = 5_000;
 interface Connection {
 	readonly decoder: FrameDecoder;
 	negotiated: boolean;
@@ -206,18 +203,20 @@ async function settleConnection(connection: Connection, timeoutMs: number): Prom
 export interface GatewayServerOptions {
 	readonly config: GatewayConfig;
 	readonly database: GatewayDatabase;
-	readonly gjc: GjcPort;
+	/** Production and tests both inject the sole broker-backed turn transport. */
+	readonly sessionPort: SessionPort;
 	readonly startedAt?: string;
 	readonly onStop?: () => void | Promise<void>;
 	readonly persona?: PersonaLoader;
+	/** Broker ownership is released after request/turn/tail-like runtime work has drained. */
+	readonly broker?: BrokerSupervisor;
 	/** Per-process CLI overrides, reapplied on every live reload so they survive it. */
 	readonly overrides?: ConfigOverrides;
 	/** Test seam for chat.progress throttling; production uses the 15s defaults. */
 	readonly progress?: { readonly firstAfterMs?: number; readonly intervalMs?: number };
-	/**
-	 * Mid-work speech pacing (issue #71). Production uses the defaults in
-	 * interim-speech.ts (2 per turn, 45s apart); tests shrink them.
-	 */
+	/** Test seam for the persona tail stall heartbeat; production uses the 5s default. */
+	readonly stallCheckIntervalMs?: number;
+	/** Mid-work speech pacing (issue #71). */
 	readonly interimSpeech?: Partial<InterimSpeechLimits>;
 }
 interface InboundContext {
@@ -261,6 +260,7 @@ async function applyConfigReload(
 		return result;
 	}
 	runtime.config = result.config;
+	runtime.personaSessions.setStallTimeoutMs(result.config.stallTimeoutMs);
 	console.error(
 		`gateway config reload (${trigger}) ok; applied=[${result.changed.join(",")}] restart-required=[${result.restartRequired.join(",")}] ignored=[${result.ignored.join(",")}]`,
 	);
@@ -268,22 +268,21 @@ async function applyConfigReload(
 }
 
 interface Runtime {
-	/**
-	 * The live config. Mutable on purpose: SIGHUP and the reload verb republish it
-	 * here, and every per-request read goes through it, so a reloadable field
-	 * takes effect on the next turn without a restart.
-	 */
+	/** The live config republished by SIGHUP/reload. */
 	config: GatewayConfig;
 	readonly delivery: DeliveryService;
 	readonly persona: PersonaLoader;
+	readonly sessionPort: SessionPort;
+	readonly personaSessions: PersonaSessionManager;
 	readonly connections: Set<Connection>;
 	readonly memory: MemoryClosureQueue;
 	readonly registry: MonitorRegistry;
 	readonly monitors: MonitorPropagator;
 	readonly monitorRuntime: MonitorRuntime;
 	readonly reconcileTimer: ReturnType<typeof setInterval>;
+	readonly stallTimer: ReturnType<typeof setInterval>;
 	readonly contextMaintenanceTimer: ReturnType<typeof setInterval>;
-	readonly turns: KeyedQueue;
+	readonly stopBrokerGenerationListener?: () => void;
 	/** Per-turn / per-message reaction caps shared by chat.react and the reply-token path. */
 	readonly reactions: ReactionBudget;
 	/** Accepted-but-not-yet-dispatched inbound messages, keyed by message id. */
@@ -312,9 +311,7 @@ export async function startUnixServer(options: GatewayServerOptions): Promise<Ga
 	// outlives the daemon it belongs to.
 	const onHup = () =>
 		void applyConfigReload(runtime, options, "SIGHUP").catch((error: unknown) =>
-			console.error(
-				`gateway config reload (SIGHUP) crashed: ${error instanceof Error ? error.message : String(error)}`,
-			),
+			console.error(`gateway config reload (SIGHUP) crashed: ${diagnostic(error)}`),
 		);
 	process.on("SIGHUP", onHup);
 	// Concurrent stop() calls (shutdown verb + owner teardown) must all await the
@@ -326,13 +323,21 @@ export async function startUnixServer(options: GatewayServerOptions): Promise<Ga
 		stopPromise = (async () => {
 			process.off("SIGHUP", onHup);
 			clearInterval(runtime.reconcileTimer);
+			clearInterval(runtime.stallTimer);
 			clearInterval(runtime.contextMaintenanceTimer);
 			// Stop accepting new sockets first, but keep existing sockets alive. Then
 			// quiesce every admitted producer before taking the final writer snapshot.
 			listener.stop(false);
 			await Promise.all([...runtime.requests]);
-			await runtime.turns.settle();
+			await runtime.personaSessions.drain();
+			await runtime.personaSessions.stop();
+			runtime.stopBrokerGenerationListener?.();
 			await runtime.monitorRuntime.stop();
+			// Cancels pending monitor burst timers so a closed database is never touched.
+			runtime.monitors.dispose();
+			// The broker has no recovery policy; it is only stopped after all current
+			// producers and monitor/tail-like runtime work have drained.
+			await options.broker?.stop();
 			for (const connection of runtime.connections)
 				connection.write({ v: PROFILE_VERSION, type: "event", event: "gateway.stopping", payload: { reason } });
 			await Promise.all([...runtime.connections].map((connection) => settleConnection(connection, 5_000)));
@@ -348,8 +353,7 @@ export async function startUnixServer(options: GatewayServerOptions): Promise<Ga
 			open(socket) {
 				const writer = new OrderedFrameWriter(
 					{ write: (bytes) => socket.write(bytes), close: () => socket.end() },
-					(error) =>
-						console.error(`gateway socket write failed: ${error instanceof Error ? error.message : String(error)}`),
+					(error) => console.error(`gateway socket write failed: ${diagnostic(error)}`),
 				);
 				const connection: Connection = {
 					decoder: new FrameDecoder(),
@@ -413,9 +417,7 @@ export function startStdioServer(options: GatewayServerOptions): GatewayServer {
 	// SIGHUP for a running gateway without qualifying the transport.
 	const onHup = () =>
 		void applyConfigReload(runtime, options, "SIGHUP").catch((error: unknown) =>
-			console.error(
-				`gateway config reload (SIGHUP) crashed: ${error instanceof Error ? error.message : String(error)}`,
-			),
+			console.error(`gateway config reload (SIGHUP) crashed: ${diagnostic(error)}`),
 		);
 	process.on("SIGHUP", onHup);
 	const stop = (reason = "shutdown requested") => {
@@ -424,10 +426,19 @@ export function startStdioServer(options: GatewayServerOptions): GatewayServer {
 		stopPromise = (async () => {
 			process.off("SIGHUP", onHup);
 			connection.write({ v: PROFILE_VERSION, type: "event", event: "gateway.stopping", payload: { reason } });
+			// Same producer quiescence as the Unix server: in-flight stdio requests are
+			// tracked and awaited before persona/tail/broker teardown.
+			await Promise.all([...runtime.requests]);
 			clearInterval(runtime.reconcileTimer);
+			clearInterval(runtime.stallTimer);
 			clearInterval(runtime.contextMaintenanceTimer);
-			await runtime.turns.settle();
+			await runtime.personaSessions.drain();
+			await runtime.personaSessions.stop();
+			runtime.stopBrokerGenerationListener?.();
 			await runtime.monitorRuntime.stop();
+			// Cancels pending monitor burst timers so a closed database is never touched.
+			runtime.monitors.dispose();
+			await options.broker?.stop();
 			connection.close();
 			await settleMemory(runtime);
 			await options.onStop?.();
@@ -436,8 +447,17 @@ export function startStdioServer(options: GatewayServerOptions): GatewayServer {
 	};
 	process.stdin.on("data", (data: Buffer) => {
 		try {
-			for (const frame of connection.decoder.feed(data.toString()))
-				void handleFrame(connection, frame, options, runtime, stop, () => stopping);
+			for (const frame of connection.decoder.feed(data.toString())) {
+				const task = handleFrame(connection, frame, options, runtime, stop, () => stopping);
+				// Same guard as the Unix server: the shutdown request awaits stop(),
+				// which awaits runtime.requests, so tracking it would self-await forever.
+				if (frame.type === "request" && frame.verb === "gateway.shutdown") continue;
+				runtime.requests.add(task);
+				task.then(
+					() => runtime.requests.delete(task),
+					() => runtime.requests.delete(task),
+				);
+			}
 		} catch (error) {
 			writeError(connection, error);
 		}
@@ -456,28 +476,57 @@ async function settleMemory(runtime: Runtime): Promise<void> {
 		await runtime.memory.initialize();
 		await runtime.memory.drain();
 	} catch (error) {
-		console.error(
-			`gateway memory settle failed during shutdown; intents remain durable for next boot: ${error instanceof Error ? error.message : String(error)}`,
-		);
+		console.error(`gateway memory settle failed during shutdown; intents remain durable for next boot: ${diagnostic(error)}`);
 	}
 }
 
 function createRuntime(options: GatewayServerOptions): Runtime {
+	const sessionPort = options.sessionPort;
 	const connections = new Set<Connection>();
-	// A turn killed mid-flight leaves its claimed message stranded; recover before serving.
+	const inbound = new Map<string, InboundContext>();
+	// Legacy v16 processing rows can exist before the additive actor cutover. Batch
+	// rows stay visible for the actor and are never reset by this recovery pass.
 	const recovered = options.database.inboundRecoverProcessing();
 	console.error(`gateway recovered ${recovered} inbound message(s) stranded in processing.`);
 	const delivery = new DeliveryService(new DeliveryLedger(options.database));
 	const registry = new MonitorRegistry(options.database);
 	const memory = new MemoryClosureQueue(options.database, options.config.home);
+	let runtime!: Runtime;
+	const personaSessions = new PersonaSessionManager({
+		database: options.database,
+		port: sessionPort,
+		instanceId: options.database.instanceId,
+		repo: join(options.config.home, "workspace"),
+		settleWindowMs: options.config.settleWindowMs,
+		settleWindowFor: (row) => settleWindowFor(row, runtime.config),
+		stallTimeoutMs: options.config.stallTimeoutMs,
+		brokerGeneration: () => options.broker?.generation ?? 0,
+		onTurnStart: async (input) => await createInboundTurnLifecycle(input, options, runtime),
+		onInboundDiscard: (messageIds) => {
+			for (const messageId of messageIds) inbound.delete(messageId);
+		},
+	});
 	const monitors = new MonitorPropagator({
 		database: options.database,
 		registry,
-		gjc: options.gjc,
+		sessionPort,
 		memory,
 		delivery,
 		ownerTarget: options.config.ownerTarget,
 		contextFailureRollThreshold: options.config.monitorContextFailureRollThreshold,
+		repo: join(options.config.home, "workspace"),
+		// AC7: the ONE production compaction seam. Native compaction runs through the
+		// broker-bound SessionPort, whose authenticated control receipt is the only
+		// affirmative compaction observation (logged by the TailRunner); the monitor
+		// propagator never re-implements compaction locally.
+		compaction: {
+			run: async (sessionId) =>
+				await sessionPort.runCompaction({
+					sessionId,
+					repo: join(options.config.home, "workspace"),
+					originKey: `monitor/session/${sessionId}`,
+				}),
+		},
 		emit: (payload) => {
 			for (const connection of connections)
 				if (connection.negotiated)
@@ -490,35 +539,69 @@ function createRuntime(options: GatewayServerOptions): Runtime {
 		},
 	});
 	const monitorRuntime = new MonitorRuntime(options.config, registry, monitors);
-	const reconcileTimer = setInterval(() => void monitors.reconcile(), 60_000);
+	const reconcileTimer = setInterval(() => {
+		void monitors.reconcile();
+		void personaSessions.recover().catch((error: unknown) =>
+			console.error(`persona recovery sweep failed: ${diagnostic(error)}`),
+		);
+	}, 60_000);
+	// AC6: the 120s stall alarm is a running-server obligation, not only a
+	// generic-request polling side effect. This heartbeat drives every persona
+	// tail's threshold check; it never aborts a turn (alarm overlay only).
+	const stallTimer = setInterval(
+		() => {
+			try {
+				personaSessions.checkStalls();
+			} catch (error) {
+				console.error(`persona stall check failed: ${diagnostic(error)}`);
+			}
+		},
+		options.stallCheckIntervalMs ?? DEFAULT_STALL_CHECK_INTERVAL_MS,
+	);
 	options.database.contextMaintain();
 	const contextMaintenanceTimer = setInterval(
 		() => {
 			try {
 				options.database.contextMaintain();
 			} catch (error) {
-				console.error(`gateway context maintenance failed: ${error instanceof Error ? error.message : String(error)}`);
+				console.error(`gateway context maintenance failed: ${diagnostic(error)}`);
 			}
 		},
 		60 * 60 * 1000,
 	);
-	return {
+	const brokerWithGeneration = options.broker as (BrokerSupervisor & { onGeneration?: BrokerSupervisor["onGeneration"] }) | undefined;
+	const stopBrokerGenerationListener =
+		typeof brokerWithGeneration?.onGeneration === "function"
+			? brokerWithGeneration.onGeneration((generation) => {
+					void personaSessions.onBrokerGeneration(generation).catch((error: unknown) =>
+						console.error(`persona broker-generation reconciliation failed: ${diagnostic(error)}`),
+					);
+				})
+			: undefined;
+	runtime = {
 		config: options.config,
 		delivery,
 		persona: options.persona ?? new PersonaLoader(options.config.home),
+		sessionPort,
+		personaSessions,
 		connections,
 		memory,
 		registry,
 		monitors,
 		monitorRuntime,
 		reconcileTimer,
+		stallTimer,
 		contextMaintenanceTimer,
-		turns: new KeyedQueue(),
+		...(stopBrokerGenerationListener ? { stopBrokerGenerationListener } : {}),
 		reactions: new ReactionBudget(),
 		cycle: new RuntimeCycleProjector(options.database, memory),
-		inbound: new Map(),
+		inbound,
 		requests: new Set(),
 	};
+	void personaSessions.recover().catch((error: unknown) =>
+		console.error(`persona startup recovery failed: ${diagnostic(error)}`),
+	);
+	return runtime;
 }
 /**
  * Monitor-batch settlement (issue #29 defect 2): the delivery ledger row for a
@@ -573,12 +656,10 @@ async function handleFrame(
 			await handleRequest(connection, frame, options, runtime, stop);
 		}
 	} catch (error) {
-		// Non-protocol failures are sanitized on the wire; keep the real cause in the
-		// daemon log or turn failures are undiagnosable (live P1 drill finding).
+		// Non-protocol failures are sanitized on the wire and in daemon logs: SDK
+		// envelopes can carry provider text containing credentials.
 		if (!(error instanceof ProtocolError))
-			console.error(
-				`gateway request failed${frame.type === "request" ? ` (${frame.verb})` : ""}: ${error instanceof Error ? (error.stack ?? error.message) : String(error)}`,
-			);
+			console.error(`gateway request failed${frame.type === "request" ? ` (${frame.verb})` : ""}: ${diagnostic(error)}`);
 		writeError(connection, error, frame.type === "request" ? frame.id : undefined);
 	}
 }
@@ -673,15 +754,15 @@ async function handleRequest(
 				);
 				connection.write({ v: PROFILE_VERSION, type: "response", id: request.id, result });
 			} catch (error) {
-				throw new ProtocolError("invalid_params", error instanceof Error ? error.message : "invalid backup path");
+				throw new ProtocolError("invalid_params", diagnostic(error) || "invalid backup path");
 			}
 			return;
 		}
 		case "work.run": {
-			// First-class delegated work: a named worker gjc session in the coding
-			// register, bound to a caller-chosen cwd, serialized per worker name and
-			// resumable across calls (the persona's hand-rolled subsession spawning
-			// kept losing the reply body — this returns it directly).
+			// First-class delegated work: a named worker SDK session in the coding
+			// register, bound to a caller-chosen cwd and serialized per worker name.
+			// Its broker-backed request/response operation returns the terminal body
+			// directly without spawning a one-off child.
 			const params = request.params as { name?: unknown; text?: unknown; cwd?: unknown; resume?: unknown } | undefined;
 			if (typeof params?.name !== "string" || !/^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/.test(params.name))
 				throw new ProtocolError("invalid_params", "work.run requires name matching [A-Za-z0-9][A-Za-z0-9._-]{0,63}");
@@ -694,10 +775,14 @@ async function handleRequest(
 			const workCwd = params.cwd as string | undefined;
 			const sessionKey = `work/task/${workName}`;
 			const effectiveCwd = workCwd ?? process.cwd();
-			const result = await runtime.turns.run(sessionKey, async () => {
-				const turnOptions = { ...(workCwd ? { cwd: workCwd } : {}), codingRegister: true };
+			const result = await runtime.sessionPort.runExclusive(sessionKey, async () => {
 				const epoch = options.database.getSessionRecord(sessionKey)?.epoch ?? 0;
-				const { sessionId } = await options.gjc.ensureSession(sessionKey, epoch, turnOptions);
+				const { sessionId } = await runtime.sessionPort.bind({
+					originKey: sessionKey,
+					epoch,
+					repo: effectiveCwd,
+					codingRegister: true,
+				});
 				options.database.updateActivity(
 					sessionKey,
 					JSON.stringify({ platform: "work", kind: "task", conversationId: workName }),
@@ -767,7 +852,16 @@ async function handleRequest(
 				});
 				persistLaneJob(options.database, job, laneKey);
 				try {
-					const reply = await options.gjc.sendTurn(sessionId, workText, undefined, undefined, turnOptions);
+					const reply = (
+						await runtime.sessionPort.request({
+							sessionId,
+							repo: effectiveCwd,
+							originKey: sessionKey,
+							text: workText,
+							opRef,
+							codingRegister: true,
+						})
+					).assistant.text;
 					job = closeAttempt({
 						record: job,
 						opRef,
@@ -798,11 +892,10 @@ async function handleRequest(
 					persistLaneJob(options.database, job, laneKey);
 					return { held: false as const, text: reply, jobId, opRef };
 				} catch (error) {
-					const failureMessage = error instanceof Error ? error.message : String(error);
-					// The gateway's own inactivity reaper produces the deadline-kill
-					// shape: the ATTEMPT ends, the job stays continuable. Anything
-					// else is a plain attempt failure.
-					const reaped = /made no progress|timed out/.test(failureMessage);
+					const failureMessage = diagnostic(error);
+					// A bounded response wait never aborts the SDK turn. It records an
+					// attempt-ended durable boundary so the lane remains reconcilable.
+					const reaped = error instanceof SessionRequestTimeoutError;
 					job = closeAttempt({
 						record: job,
 						opRef,
@@ -864,7 +957,7 @@ async function handleRequest(
 						...row,
 						state: "corrupt" as const,
 						corrupt: true as const,
-						error: error instanceof Error ? error.message : String(error),
+						error: diagnostic(error),
 					};
 				}
 			});
@@ -964,7 +1057,7 @@ async function handleRequest(
 				});
 				void runtime.monitorRuntime.refresh();
 			} catch (error) {
-				throw new ProtocolError("invalid_params", error instanceof Error ? error.message : "invalid monitor");
+				throw new ProtocolError("invalid_params", diagnostic(error) || "invalid monitor");
 			}
 			return;
 		}
@@ -1174,11 +1267,11 @@ async function sendChat(
 		throw new ProtocolError("invalid_params", "chat.send requires a valid origin");
 	}
 	const key = originKey(origin);
-	// #20: `/model` reads or rewrites this conversation's model selection. It
-	// shares the command authorisation of `/new` below: in a group surface a
-	// non-allowlisted member must not repoint the persona at another model.
+	// `/model` is a privileged control path. Apply the same direct-message and
+	// group authorisation policy as ordinary engagement before inspecting or
+	// mutating the durable override.
 	if (userText === "/model" || userText.startsWith("/model ")) {
-		if (!commandAuthorised(origin, runtime.config.mentionAllowlist, params.engagement)) {
+		if (!commandAuthorised(origin, runtime.config, params.engagement)) {
 			connection.write({
 				v: PROFILE_VERSION,
 				type: "response",
@@ -1188,7 +1281,11 @@ async function sendChat(
 			return;
 		}
 		const outcome = applyModelCommand(userText, key, origin, options.database, runtime.config.model);
-		if (outcome.resetSession) resetConversationSession(key, origin, options, runtime);
+		if (outcome.rebind) {
+			const selection = outcome.rebind.kind === "set" ? outcome.rebind.selection : runtime.config.model;
+			if (!selection) throw new Error("/model clear produced a rebind without a configured gateway default");
+			await runtime.personaSessions.rebindModel(key, selection);
+		}
 		const payload = {
 			turnId: crypto.randomUUID(),
 			origin,
@@ -1216,17 +1313,9 @@ async function sendChat(
 		return;
 	}
 	if (params.text === "/new" || params.text === "/reset") {
-		// Session resets are commands: in group surfaces they obey the mention
-		// allowlist, or any room member could wipe the persona's conversation state.
-		const allowlist = runtime.config.mentionAllowlist;
-		const authorId = (params.engagement as { authorId?: unknown } | undefined)?.authorId;
-		if (
-			origin.platform !== "loopback" &&
-			origin.kind !== "dm" &&
-			allowlist &&
-			allowlist.length > 0 &&
-			(typeof authorId !== "string" || !allowlist.includes(authorId))
-		) {
+		// Session resets are privileged control paths: an unauthorized DM must not
+		// erase the caller's session merely because commands bypass normal dispatch.
+		if (!commandAuthorised(origin, runtime.config, params.engagement)) {
 			connection.write({
 				v: PROFILE_VERSION,
 				type: "response",
@@ -1235,7 +1324,7 @@ async function sendChat(
 			});
 			return;
 		}
-		resetConversationSession(key, origin, options, runtime);
+		await runtime.personaSessions.reset(key, JSON.stringify(origin));
 		const payload = {
 			turnId: crypto.randomUUID(),
 			origin,
@@ -1301,9 +1390,8 @@ async function sendChat(
 	}
 	const messageId = inboundMessageId ?? crypto.randomUUID();
 	const turnId = crypto.randomUUID();
-	// Persist before dispatch: the insert is the acceptance boundary. A message that arrives
-	// while a turn for the same origin is in flight stays durable and is drained afterwards
-	// instead of being dropped outright (five real owner messages were lost that way).
+	// Persist before dispatch: this insert is the durable acceptance boundary. The
+	// per-origin actor receives the notification only after this transaction wins.
 	const accepted = options.database.inboundEnqueue({
 		messageId,
 		originKey: key,
@@ -1328,77 +1416,326 @@ async function sendChat(
 		...(params.voice === true ? { voice: true } : {}),
 	});
 	connection.write({ v: PROFILE_VERSION, type: "response", id: request.id, result: { turnId, engaged: true } });
-	await drainOrigin(key, messageId, connection, options, runtime);
+	await runtime.personaSessions.notifyInbound(key);
 }
-// One origin == one gjc session: serialize turns per origin key so a burst of inbound
-// messages can never race two `gjc --resume` processes on one session. The drain runs
-// inside that serialization, and inboundClaimNext is the atomic hand-off, so a message
-// enqueued mid-turn is dispatched exactly once — either by the in-flight drain or by its
-// own queued slot.
-async function drainOrigin(
-	key: string,
-	ownMessageId: string,
-	fallback: Connection,
+async function createInboundTurnLifecycle(
+	input: PersonaTurnStartInput,
 	options: GatewayServerOptions,
 	runtime: Runtime,
-): Promise<void> {
-	let ownFailure: unknown;
-	await runtime.turns.run(key, async () => {
-		for (let row = options.database.inboundClaimNext(key); row; row = options.database.inboundClaimNext(key)) {
-			const resetFloor = options.database.contextFloorAt(key);
-			if (resetFloor && row.received_at <= resetFloor) {
-				runtime.inbound.delete(row.message_id);
-				options.database.inboundComplete(row.message_id);
-				continue;
-			}
-			// Debounce: a burst of messages becomes ONE turn carrying the whole diff.
-			// The window is per-channel configurable; newer arrivals during the wait
-			// are folded into this batch, with the newest message as the trigger.
-			// The window counts from the message's ARRIVAL, not from claim time: a
-			// message that already waited behind an earlier turn has served its
-			// debounce, and sleeping again inside the serialized drain was adding
-			// flat latency to every drained batch (live gajaeway-play finding).
-			const debounceMs = debounceFor(row, runtime.config);
-			const waitedMs = Date.now() - Date.parse(row.received_at);
-			const remainingMs = Number.isFinite(waitedMs) ? Math.max(0, debounceMs - waitedMs) : debounceMs;
-			if (remainingMs > 0) await Bun.sleep(remainingMs);
-			const batch = [row];
-			for (let more = options.database.inboundClaimNext(key); more; more = options.database.inboundClaimNext(key))
-				batch.push(more);
-			try {
-				await runInboundTurn(batch, fallback, options, runtime);
-			} catch (error) {
-				// The originating request reports its own failure; a drained message has no
-				// live requester left, so its failure only belongs in the daemon log.
-				if (batch.some((member) => member.message_id === ownMessageId)) ownFailure = error;
-				else
+): Promise<PersonaTurnLifecycle> {
+	// The newest message carries the live requester/voice context. Earlier members
+	// remain in the durable context window and are included in the composed prompt.
+	const row = input.rows[input.rows.length - 1] as InboundMessageRow;
+	for (const member of input.rows) if (member !== row) runtime.inbound.delete(member.message_id);
+	const context = runtime.inbound.get(row.message_id);
+	runtime.inbound.delete(row.message_id);
+	const connection = context?.connection ?? [...runtime.connections][0];
+	const turnId = context?.turnId ?? crypto.randomUUID();
+	const voiceTurn = context?.voice === true;
+	const key = row.origin_key;
+	const origin = validateOriginRef(JSON.parse(row.origin_ref_json) as typeof LOOPBACK_ORIGIN);
+	const userText = row.body;
+	const nonLoopback = origin.platform !== "loopback";
+	const engagement = row.engagement_json
+		? (JSON.parse(row.engagement_json) as {
+				mentioned?: boolean;
+				group?: boolean;
+				authorId?: string;
+				authorName?: string;
+				authorHandle?: string;
+				channelLabel?: string;
+				serverLabel?: string;
+				replyTo?: { messageId?: string; authorName?: string; fromSelf?: boolean; excerpt?: string };
+			})
+		: undefined;
+	const speaker = composeSpeakerLabel(engagement);
+	const place =
+		[engagement?.channelLabel, engagement?.serverLabel].filter(Boolean).join(" | ") ||
+		`${origin.platform} ${origin.kind} ${origin.conversationId}`;
+	let turnText = userText;
+	let contextMessageIds: readonly string[] = [];
+	let contextOmissionRevision = 0;
+	if (nonLoopback) {
+		const prepared = options.database.contextWindow(key, row.message_id);
+		contextMessageIds = [...prepared.selectedMessageIds, row.message_id];
+		contextOmissionRevision = prepared.omissionRevision;
+		const lines = prepared.rows.map(
+			(entry) =>
+				`- [${entry.received_at}] ${entry.author_name ?? "unknown"} (author:${entry.author_id ?? "?"}, msg:${entry.message_id}): ${entry.body.slice(0, 1000)}`,
+		);
+		const omitted = prepared.expiredCount + prepared.truncatedCount;
+		const omittedRange =
+			prepared.omittedOldestAt && prepared.omittedNewestAt
+				? `; timestamps ${prepared.omittedOldestAt}..${prepared.omittedNewestAt}`
+				: "";
+		const droppedNote =
+			omitted > 0
+				? `[${omitted} older unread message(s) omitted: ${prepared.expiredCount} expired outside floor ${prepared.effectiveFloor}, ${prepared.truncatedCount} truncated by the newest-${prepared.rows.length} window${omittedRange}]\n`
+				: "";
+		const header = lines.length
+			? `[Unread messages in this conversation since your last reply]\n${droppedNote}${lines.join("\n")}\n\n`
+			: droppedNote
+				? `${droppedNote}\n`
+				: "";
+		turnText = `${header}${speaker ? `${composeTurnHeader({ speaker, place, authorId: engagement?.authorId, messageId: row.message_id, engagement })}\n` : ""}${userText}`;
+	}
+
+	const bootstrapState = options.database.getSessionBootstrap(key);
+	const bootstrap =
+		!bootstrapState || bootstrapState.lastBootstrappedEpoch < input.epoch
+			? await buildSessionBootstrap({
+					home: runtime.config.home,
+					origin,
+					epoch: input.epoch,
+					engagement,
+					config: runtime.config,
+				})
+			: undefined;
+	const systemPreamble = [
+		await runtime.persona.systemPreamble(),
+		currentConversationNotice(origin, engagement),
+		...(bootstrap ? [bootstrap.text] : []),
+		ACTION_GUARD_SYSTEM_NOTICE,
+	].join("\n\n");
+	const modelOverride = options.database.conversationModelGet(key)?.selection;
+	const effectiveModel = modelOverride ?? runtime.config.model;
+
+	const deliveredParts: string[] = [];
+	let assistantDeliveryStarted = false;
+	let reactionTokensSeen = false;
+	const maxTurnParts = 10;
+	const interimSpeech = new InterimSpeechGate(options.interimSpeech);
+	let lastDeliveredRaw: string | undefined;
+	const deliverAssistantText = (rawMessage: string, tailEvent?: { readonly sessionId: string; readonly eventId: string }) => {
+		if (!nonLoopback) return;
+		lastDeliveredRaw = rawMessage;
+		let message = rawMessage;
+		const reactionReply = parseReactionReply(message);
+		if (reactionReply) {
+			reactionTokensSeen = true;
+			for (const wanted of reactionReply.reactions) {
+				if (!platformSupportsReaction(origin.platform, wanted.emojiName)) {
 					console.error(
-						`gateway inbound turn failed (${batch[batch.length - 1]?.message_id}): ${error instanceof Error ? (error.stack ?? error.message) : String(error)}`,
+						`gateway reaction skipped for ${key}: ${origin.platform} cannot react with ${wanted.emoji} (${wanted.emojiName})`,
 					);
-			} finally {
-				for (const member of batch) {
-					try {
-						options.database.inboundComplete(member.message_id);
-					} catch (error) {
-						// One failed row must not strand the rest; startup recovery re-queues stragglers.
-						console.error(
-							`gateway inbound completion failed (${member.message_id}): ${error instanceof Error ? error.message : String(error)}`,
-						);
-					}
+					continue;
 				}
+				const targetMessageId = wanted.targetMessageId ?? row.message_id;
+				const rejection = runtime.reactions.claim({ turnId, originKey: key, targetMessageId, emoji: wanted.emoji });
+				if (rejection) {
+					console.error(
+						`gateway reaction rejected (${rejection.reason}) for ${key} message ${targetMessageId}: ${rejection.detail}`,
+					);
+					continue;
+				}
+				const payload = runtime.delivery.prepareReaction(crypto.randomUUID(), origin, {
+					targetMessageId,
+					emoji: wanted.emoji,
+					emojiName: wanted.emojiName,
+				});
+				assistantDeliveryStarted = true;
+				broadcastDelivery(runtime, payload);
+			}
+			message = reactionReply.body;
+			if (!message) return;
+		}
+		const parts = message
+			.split(/\n\s*\[BREAK\]\s*\n?/)
+			.map((part) => part.trim())
+			.filter((part) => part.length > 0 && !isSilenceToken(part))
+			.slice(0, 5);
+		const planned: Array<{ readonly body: string; readonly replyTo?: string }> = [];
+		for (const part of parts) {
+			if (planned.length >= maxTurnParts) break;
+			const replyMatch = part.match(/^\[REPLY:([^\]\s]+)\]\s*/);
+			const body = replyMatch ? part.slice(replyMatch[0].length).trim() : part;
+			if (body) planned.push({ body, ...(replyMatch?.[1] ? { replyTo: replyMatch[1] } : {}) });
+		}
+		const spoken = spokenReply(
+			planned.map((step) => step.body),
+			voiceTurn,
+		);
+		for (let index = 0; index < planned.length; index++) {
+			if (deliveredParts.length >= maxTurnParts) return;
+			const step = planned[index] as { body: string; replyTo?: string };
+			const deliveryId =
+				tailEvent === undefined
+					? undefined
+					: deterministicTailDeliveryId(tailEvent.sessionId, index === 0 ? tailEvent.eventId : `${tailEvent.eventId}:${index}`);
+			const payload = runtime.delivery.prepare(crypto.randomUUID(), origin, step.body, step.replyTo, deliveryId);
+			if (!payload) continue;
+			deliveredParts.push(step.body);
+			assistantDeliveryStarted = true;
+			const isLast = index === planned.length - 1;
+			broadcastDelivery(runtime, isLast && spoken !== "" ? { ...payload, voiceText: spoken } : payload);
+		}
+	};
+
+	const startedAt = Date.now();
+	const firstAfterMs = options.progress?.firstAfterMs ?? 10_000;
+	const intervalMs = options.progress?.intervalMs ?? 10_000;
+	let lastProgressAt = 0;
+	let lastKnown = { toolCalls: 0, outputTokens: 0 };
+	/** Heartbeats present the most recent tail observation; they never invent progress. */
+	let tailActivitySeen = false;
+	let progressAnnounced = false;
+	let ended = false;
+	const emitProgress = (progress: { toolCalls: number; outputTokens: number }, final = false) => {
+		lastKnown = progress;
+		const now = Date.now();
+		if (!final && (!tailActivitySeen || now - startedAt < firstAfterMs || now - lastProgressAt < intervalMs)) return;
+		if (final && !progressAnnounced) return;
+		if (!final) progressAnnounced = true;
+		lastProgressAt = now;
+		const payload = {
+			turnId,
+			origin,
+			elapsedMs: now - startedAt,
+			toolCalls: progress.toolCalls,
+			outputTokens: progress.outputTokens,
+			...(final ? { final: true } : {}),
+		};
+		for (const recipient of runtime.connections)
+			if (recipient.negotiated) recipient.write({ v: PROFILE_VERSION, type: "event", event: "chat.progress", payload });
+	};
+	const heartbeat = setInterval(() => {
+		if (tailActivitySeen) emitProgress(lastKnown);
+	}, intervalMs);
+	const endProgress = () => {
+		if (ended) return;
+		ended = true;
+		clearInterval(heartbeat);
+		emitProgress(lastKnown, true);
+	};
+
+	const onFrame = async ({ frame, sessionId }: PersonaTailFrameInput) => {
+		if (ended) return;
+		tailActivitySeen = true;
+		if (frame.assistantText && !frame.steerEcho) {
+			lastKnown = {
+				toolCalls: lastKnown.toolCalls,
+				outputTokens: lastKnown.outputTokens + Math.ceil(frame.assistantText.length / 4),
+			};
+			try {
+				const decision = interimSpeech.admit(frame.assistantText, Date.now(), { toolCallsSoFar: lastKnown.toolCalls });
+				if (!decision.deliver) console.error(`gateway mid-work speech suppressed (${turnId}, ${decision.reason}).`);
+				else
+					deliverAssistantText(
+						frame.assistantText,
+						frame.eventId ? { sessionId, eventId: frame.eventId } : undefined,
+					);
+			} catch (error) {
+				console.error(`gateway intermediate delivery failed (${turnId}): ${diagnostic(error)}`);
 			}
 		}
-	});
-	if (ownFailure) throw ownFailure;
+		const reportedTools = frame.payload.toolCalls;
+		const reportedTokens = frame.payload.outputTokens;
+		lastKnown = {
+			toolCalls:
+				typeof reportedTools === "number" && Number.isFinite(reportedTools)
+					? Math.max(lastKnown.toolCalls, reportedTools)
+					: /tool/i.test(frame.rawKind)
+						? lastKnown.toolCalls + 1
+						: lastKnown.toolCalls,
+			outputTokens:
+				typeof reportedTokens === "number" && Number.isFinite(reportedTokens)
+					? Math.max(lastKnown.outputTokens, reportedTokens)
+					: lastKnown.outputTokens,
+		};
+		emitProgress(lastKnown);
+	};
+
+	const onTerminal = async ({ text }: PersonaTerminalInput) => {
+		try {
+			if (nonLoopback) options.database.contextCommitWindow(key, contextMessageIds, contextOmissionRevision);
+			if (bootstrap)
+				options.database.markSessionBootstrapped(key, input.epoch, {
+					includedSections: bootstrap.includedSections,
+					byteCount: bootstrap.byteCount,
+					truncated: bootstrap.truncated,
+					diagnostics: bootstrap.diagnostics,
+				});
+			const replyText = deliveredParts.length > 0 ? deliveredParts.join("\n") : text;
+			options.database.withTransaction(() => {
+				options.database.updateActivity(key, JSON.stringify(origin));
+				options.database.addRecall(
+					key,
+					JSON.stringify(origin),
+					`user: ${userText.slice(0, 500)}\nassistant: ${replyText.slice(0, 500)}`,
+				);
+			});
+			if (deliveredParts.length === 0 && isSilenceToken(text)) return;
+			if (!nonLoopback) {
+				if (connection)
+					connection.write({
+						v: PROFILE_VERSION,
+						type: "event",
+						event: "chat.message",
+						...(context ? { id: context.requestId } : {}),
+						payload: { turnId, origin, role: "assistant", text, final: true },
+					});
+				runtime.memory.enqueue({ kind: "daily_capture", originRefJson: JSON.stringify(origin), userText, replyText: text });
+				return;
+			}
+			const capturedUser = speaker ? `${speaker} @ ${place}: ${userText}` : userText;
+			if (lastDeliveredRaw !== text) deliverAssistantText(text);
+			if (deliveredParts.length === 0) {
+				if (reactionTokensSeen)
+					runtime.memory.enqueue({
+						kind: "daily_capture",
+						originRefJson: JSON.stringify(origin),
+						userText: capturedUser,
+						replyText: text,
+					});
+				return;
+			}
+			runtime.memory.enqueue({
+				kind: "daily_capture",
+				originRefJson: JSON.stringify(origin),
+				userText: capturedUser,
+				replyText,
+			});
+		} finally {
+			endProgress();
+		}
+	};
+
+	const onFailure = async ({ error }: PersonaFailureInput) => {
+		try {
+			const failureNotice = formatFailureNotice(error);
+			console.error(failureNotice);
+			if (nonLoopback && assistantDeliveryStarted)
+				options.database.contextCommitWindow(key, contextMessageIds, contextOmissionRevision);
+			if (nonLoopback && !assistantDeliveryStarted) {
+				const notice = runtime.delivery.prepare(turnId, origin, failureNotice);
+				if (notice) {
+					runtime.delivery.markInflight(notice.deliveryId as string);
+					broadcastDelivery(runtime, notice);
+				}
+			}
+		} finally {
+			endProgress();
+		}
+	};
+
+	return {
+		text: turnText,
+		systemPreamble,
+		...(effectiveModel ? { effectiveModel } : {}),
+		onFrame,
+		onTerminal,
+		onFailure,
+		onStall: ({ elapsedMs }) => console.error(`gateway persona turn stalled (${turnId}) after ${elapsedMs}ms; retaining status reconciliation.`),
+	};
 }
 
-function debounceFor(row: InboundMessageRow, config: GatewayServerOptions["config"]): number {
+function settleWindowFor(row: InboundMessageRow, config: GatewayConfig): number {
 	const origin = JSON.parse(row.origin_ref_json) as { platform?: string; conversationId?: string };
 	if (origin.platform === "loopback") return 0;
 	const channel =
 		config.channels?.[`${origin.platform}:${origin.conversationId}`] ??
 		(origin.platform === "discord" ? config.channels?.[origin.conversationId ?? ""] : undefined);
-	return channel?.debounceMs ?? config.debounceMs ?? 0;
+	return channel?.settleWindowMs ?? config.settleWindowMs ?? 2_000;
 }
 
 function parseReceivedAt(value: unknown): string | undefined {
@@ -1430,9 +1767,7 @@ function bootstrapProjection(row: {
 	const strings = (value: string): readonly string[] => {
 		try {
 			const parsed = JSON.parse(value);
-			return Array.isArray(parsed) && parsed.every((item) => typeof item === "string")
-				? parsed
-				: ["projection_corrupt"];
+			return Array.isArray(parsed) && parsed.every((item) => typeof item === "string") ? parsed : ["projection_corrupt"];
 		} catch {
 			return ["projection_corrupt"];
 		}
@@ -1446,394 +1781,6 @@ function bootstrapProjection(row: {
 		truncated: row.bootstrap_truncated === 1,
 		diagnostics: strings(row.bootstrap_diagnostics_json),
 	};
-}
-async function runInboundTurn(
-	batch: readonly InboundMessageRow[],
-	fallback: Connection,
-	options: GatewayServerOptions,
-	runtime: Runtime,
-): Promise<void> {
-	// The newest message triggers the turn; older batch members are part of the
-	// unread diff. Their live requesters (if any) already got their responses.
-	const row = batch[batch.length - 1] as InboundMessageRow;
-	for (const member of batch) if (member !== row) runtime.inbound.delete(member.message_id);
-	const context = runtime.inbound.get(row.message_id);
-	runtime.inbound.delete(row.message_id);
-	const connection = context?.connection ?? fallback;
-	const turnId = context?.turnId ?? crypto.randomUUID();
-	// Absent for a delivery recovered after a restart, which is why that case
-	// degrades to text-only rather than speaking into a stale conversation.
-	const voiceTurn = context?.voice === true;
-	const key = row.origin_key;
-	const origin = validateOriginRef(JSON.parse(row.origin_ref_json) as typeof LOOPBACK_ORIGIN);
-	const userText = row.body;
-	const nonLoopback = origin.platform !== "loopback";
-	const engagement = row.engagement_json
-		? (JSON.parse(row.engagement_json) as {
-				mentioned?: boolean;
-				group?: boolean;
-				authorId?: string;
-				authorName?: string;
-				authorHandle?: string;
-				channelLabel?: string;
-				serverLabel?: string;
-				replyTo?: {
-					messageId?: string;
-					authorName?: string;
-					fromSelf?: boolean;
-					excerpt?: string;
-				};
-			})
-		: undefined;
-	const speaker = composeSpeakerLabel(engagement);
-	// "channel | server" when the platform labels both (e.g. "#playground-ko | GAJAE").
-	const place =
-		[engagement?.channelLabel, engagement?.serverLabel].filter(Boolean).join(" | ") ||
-		`${origin.platform} ${origin.kind} ${origin.conversationId}`;
-	// Compose the turn: everything said in this conversation since the persona's
-	// last reply (the read-cursor diff), then the triggering message with speaker
-	// attribution — so the persona always reads "the messages above".
-	let turnText = userText;
-	let contextMessageIds: readonly string[] = [];
-	let contextOmissionRevision = 0;
-	if (nonLoopback) {
-		const prepared = options.database.contextWindow(key, row.message_id);
-		const unread = prepared.rows;
-		contextMessageIds = [...prepared.selectedMessageIds, row.message_id];
-		contextOmissionRevision = prepared.omissionRevision;
-		const lines = unread.map(
-			(entry) =>
-				`- [${entry.received_at}] ${entry.author_name ?? "unknown"} (author:${entry.author_id ?? "?"}, msg:${entry.message_id}): ${entry.body.slice(0, 1000)}`,
-		);
-		// Truncation is stated, never silent: a persona that cannot see it was given
-		// a partial view will treat the oldest surviving line as the beginning of the
-		// conversation.
-		const omitted = prepared.expiredCount + prepared.truncatedCount;
-		const omittedRange =
-			prepared.omittedOldestAt && prepared.omittedNewestAt
-				? `; timestamps ${prepared.omittedOldestAt}..${prepared.omittedNewestAt}`
-				: "";
-		const droppedNote =
-			omitted > 0
-				? `[${omitted} older unread message(s) omitted: ${prepared.expiredCount} expired outside floor ${prepared.effectiveFloor}, ${prepared.truncatedCount} truncated by the newest-${prepared.rows.length} window${omittedRange}]\n`
-				: "";
-		const header = lines.length
-			? `[Unread messages in this conversation since your last reply]\n${droppedNote}${lines.join("\n")}\n\n`
-			: droppedNote
-				? `${droppedNote}\n`
-				: "";
-		turnText = `${header}${speaker ? `${composeTurnHeader({ speaker, place, authorId: engagement?.authorId, messageId: row.message_id, engagement })}\n` : ""}${userText}`;
-	}
-	let text: string;
-	// Human-sized chat: the persona may split one message into several short parts
-	// with a line containing exactly [BREAK]; each part ships as its own delivery.
-	// Long agentic turns also produce SEVERAL assistant messages (one per model
-	// step); a mid-work message is delivered the moment it completes instead of
-	// after process exit, so a multi-minute turn talks while it works (live
-	// gajaeway-play finding: turns showed nothing but "working…" until the very
-	// end). Issue #71: those mid-work messages pass an InterimSpeechGate first —
-	// the same live channel showed one turn arriving as 5 procedural fragments.
-	// The gate is a BACKSTOP; the base system prompt is the primary mechanism.
-	const deliveredParts: string[] = [];
-	let assistantDeliveryStarted = false;
-	let reactionTokensSeen = false;
-	const maxTurnParts = 10;
-	const interimSpeech = new InterimSpeechGate(options.interimSpeech);
-	// The raw message body last handed to delivery, so the final answer is not
-	// delivered twice when the runtime already streamed it as its last message.
-	let lastDeliveredRaw: string | undefined;
-	const deliverAssistantText = (rawMessage: string) => {
-		if (!nonLoopback) return;
-		lastDeliveredRaw = rawMessage;
-		let message = rawMessage;
-		// Reaction reply mode (third mode next to text and silence, parsed per delivered
-		// assistant message so streamed intermediates carry it too): a message may open
-		// with [REACT:<emoji-or-name>] tokens, optionally targeting one message with
-		// `@<platform message id>`. With nothing left after the tokens the message
-		// acknowledges with a reaction and ships no text. Parsing is all-or-nothing: a
-		// malformed or non-allowlisted token yields undefined here, and the message is
-		// delivered verbatim as text — a bad token can cost the reaction, never the reply.
-		const reactionReply = parseReactionReply(message);
-		if (reactionReply) {
-			reactionTokensSeen = true;
-			for (const wanted of reactionReply.reactions) {
-				// Untargeted tokens react to the message that triggered this turn; that id is
-				// the platform's own message id whenever the adapter supplied one.
-				// A platform that cannot express this emoji would swallow the acknowledgement:
-				// skip it loudly rather than queue a delivery that can only ever fail.
-				if (!platformSupportsReaction(origin.platform, wanted.emojiName)) {
-					console.error(
-						`gateway reaction skipped for ${key}: ${origin.platform} cannot react with ${wanted.emoji} (${wanted.emojiName})`,
-					);
-					continue;
-				}
-				const targetMessageId = wanted.targetMessageId ?? row.message_id;
-				const rejection = runtime.reactions.claim({ turnId, originKey: key, targetMessageId, emoji: wanted.emoji });
-				if (rejection) {
-					// Never a silent no-op: an owner who does not see the reaction can find the
-					// reason in the daemon log.
-					console.error(
-						`gateway reaction rejected (${rejection.reason}) for ${key} message ${targetMessageId}: ${rejection.detail}`,
-					);
-					continue;
-				}
-				const payload = runtime.delivery.prepareReaction(crypto.randomUUID(), origin, {
-					targetMessageId,
-					emoji: wanted.emoji,
-					emojiName: wanted.emojiName,
-				});
-				assistantDeliveryStarted = true;
-				broadcastDelivery(runtime, payload);
-			}
-			message = reactionReply.body;
-			if (!message) return;
-		}
-		const parts = message
-			.split(/\n\s*\[BREAK\]\s*\n?/)
-			.map((part) => part.trim())
-			.filter((part) => part.length > 0 && !isSilenceToken(part))
-			.slice(0, 5);
-		// Which deliveries actually happen is decided BEFORE the loop, because the
-		// audio has to ride the last one. Deciding inside the loop cannot: a part
-		// may be dropped for an empty body, and the part budget may cut the loop
-		// off early, so "the last element of `parts`" is not "the last delivery".
-		const planned: Array<{ readonly body: string; readonly replyTo?: string }> = [];
-		for (const part of parts) {
-			if (planned.length >= maxTurnParts) break;
-			// Reply-threading: a part may open with [REPLY:<platform message id>] to
-			// answer a specific message; mentions are plain <@author id> in the text.
-			const replyMatch = part.match(/^\[REPLY:([^\]\s]+)\]\s*/);
-			const body = replyMatch ? part.slice(replyMatch[0].length).trim() : part;
-			if (!body) continue;
-			planned.push({ body, ...(replyMatch?.[1] ? { replyTo: replyMatch[1] } : {}) });
-		}
-		// A spoken turn is answered in both modalities, and the whole reply is spoken
-		// ONCE rather than once per part. Built from the PLANNED bodies so the audio
-		// never reads out text the part budget dropped.
-		const spoken = spokenReply(
-			planned.map((step) => step.body),
-			voiceTurn,
-		);
-		for (let index = 0; index < planned.length; index++) {
-			if (deliveredParts.length >= maxTurnParts) return;
-			const step = planned[index] as { body: string; replyTo?: string };
-			const payload = runtime.delivery.prepare(crypto.randomUUID(), origin, step.body, step.replyTo);
-			if (!payload) continue;
-			deliveredParts.push(step.body);
-			assistantDeliveryStarted = true;
-			// Indexed, not compared by value: two identical parts made `part ===
-			// parts.at(-1)` true for both and the reply was spoken twice, billed
-			// twice, and talked over itself.
-			const isLast = index === planned.length - 1;
-			broadcastDelivery(runtime, isLast && spoken !== "" ? { ...payload, voiceText: spoken } : payload);
-		}
-	};
-	// Long turns announce liveness instead of dying: throttled chat.progress events
-	// let adapters render a "working…" status while the persona runs. A heartbeat
-	// timer keeps the status ticking every interval even when the gjc stream is
-	// silent (e.g. a long tool run producing no events).
-	const startedAt = Date.now();
-	const firstAfterMs = options.progress?.firstAfterMs ?? 10_000;
-	const intervalMs = options.progress?.intervalMs ?? 10_000;
-	let lastProgressAt = 0;
-	let lastKnown = { toolCalls: 0, outputTokens: 0 };
-	let progressAnnounced = false;
-	const emitProgress = (progress: { toolCalls: number; outputTokens: number }, final = false) => {
-		lastKnown = progress;
-		const now = Date.now();
-		// A final event is never throttled: it is what tells an adapter to remove the
-		// temporary "working" message. Throttling it would leave that message behind.
-		if (!final && (now - startedAt < firstAfterMs || now - lastProgressAt < intervalMs)) return;
-		// Nothing was ever announced, so there is no status to clear: stay quiet rather
-		// than emitting a lone terminal event for a fast turn.
-		if (final && !progressAnnounced) return;
-		if (!final) progressAnnounced = true;
-		lastProgressAt = now;
-		const payload = {
-			turnId,
-			origin,
-			elapsedMs: now - startedAt,
-			toolCalls: progress.toolCalls,
-			outputTokens: progress.outputTokens,
-			...(final ? { final: true } : {}),
-		};
-		for (const recipient of runtime.connections)
-			if (recipient.negotiated) recipient.write({ v: PROFILE_VERSION, type: "event", event: "chat.progress", payload });
-	};
-	const heartbeat = setInterval(() => emitProgress(lastKnown), intervalMs);
-	const runTurn = async () => {
-		const bootstraps = new Map<number, SessionBootstrap>();
-		const preambleForEpoch = async (epoch: number): Promise<string> => {
-			const state = options.database.getSessionBootstrap(key);
-			const bootstrap =
-				!state || state.lastBootstrappedEpoch < epoch
-					? await buildSessionBootstrap({
-							home: runtime.config.home,
-							origin,
-							epoch,
-							engagement,
-							config: runtime.config,
-						})
-					: undefined;
-			if (bootstrap) bootstraps.set(epoch, bootstrap);
-			return [
-				await runtime.persona.systemPreamble(),
-				currentConversationNotice(origin, engagement),
-				...(bootstrap ? [bootstrap.text] : []),
-				ACTION_GUARD_SYSTEM_NOTICE,
-			].join("\n\n");
-		};
-		const requestedEpoch = options.database.getSessionRecord(key)?.epoch ?? 0;
-		const { sessionId } = await options.gjc.ensureSession(key, requestedEpoch);
-		// session.create itself may condemn and rebind the requested epoch. The
-		// persisted row is the effective binding authority, so the first preamble
-		// on that fresh session must use the rebound epoch rather than a stale ID.
-		const boundEpoch = options.database.getSessionRecord(key)?.epoch ?? requestedEpoch;
-		const preamble = await preambleForEpoch(boundEpoch);
-		// #20: a per-conversation model override beats the gateway-wide config for
-		// this spawn. A corrupt stored row reads as undefined and we fall back.
-		const modelOverride = options.database.conversationModelGet(key)?.selection;
-		const result = await options.gjc.sendTurn(sessionId, turnText, preamble, emitProgress, {
-			systemPreambleForEpoch: preambleForEpoch,
-			...(modelOverride ? { model: modelOverride } : {}),
-			onAssistantText: (message, toolCallsSoFar) => {
-				try {
-					// Mid-work speech only (issue #71). The runtime's LAST streamed message
-					// is also the final answer, and it is gated here like any other: when
-					// the gate suppresses it, the post-turn delivery below ships it, so an
-					// answer can be delayed by the gate but never lost.
-					const decision = interimSpeech.admit(message, Date.now(), { toolCallsSoFar });
-					if (!decision.deliver) {
-						console.error(`gateway mid-work speech suppressed (${turnId}, ${decision.reason}).`);
-						return;
-					}
-					deliverAssistantText(message);
-				} catch (error) {
-					// Delivery bookkeeping must never abort a running turn mid-stream.
-					console.error(
-						`gateway intermediate delivery failed (${turnId}): ${error instanceof Error ? error.message : String(error)}`,
-					);
-				}
-			},
-		});
-		const terminalEpoch = options.database.getSessionRecord(key)?.epoch ?? boundEpoch;
-		const applied = bootstraps.get(terminalEpoch);
-		if (applied)
-			options.database.markSessionBootstrapped(key, terminalEpoch, {
-				includedSections: applied.includedSections,
-				byteCount: applied.byteCount,
-				truncated: applied.truncated,
-				diagnostics: applied.diagnostics,
-			});
-		return result;
-	};
-	try {
-		text = await runTurn();
-		if (nonLoopback) options.database.contextCommitWindow(key, contextMessageIds, contextOmissionRevision);
-	} catch (error) {
-		// A prose-only "session not found" failure (gjc emits no structured code
-		// for it) is deliberately NOT auto-rebound: #13 mandates exact-code-only
-		// classification, and every retry against the same dead key is guaranteed
-		// silence. The failure surfaces through #14's structured notice instead,
-		// where the operator's remedy — /new — is one message away.
-		// Never ghost a platform conversation: a failed turn still produces a visible,
-		// ledgered notice (live P1 drill finding: timeouts looked like silent ignores).
-		// The notice carries the runtime's OWN code and message (#14): one opaque line
-		// cost ~2h of muteness because nobody could tell a poisoned session key from a
-		// timeout. The identical string is logged, so a channel transcript is enough
-		// to triage without shell access.
-		// When intermediate messages already reached the room, the persona visibly
-		// spoke; a trailing "[turn failed]" would disavow real replies, so the
-		// failure stays in the daemon log only.
-		const failureNotice = formatFailureNotice(error);
-		console.error(failureNotice);
-		// A runtime failure before any assistant delivery leaves selected context
-		// unread for retry. Once a real text/reaction delivery has started, retrying
-		// the same window could duplicate an answer, so that window is consumed.
-		if (nonLoopback && assistantDeliveryStarted)
-			options.database.contextCommitWindow(key, contextMessageIds, contextOmissionRevision);
-		if (nonLoopback && !assistantDeliveryStarted) {
-			const notice = runtime.delivery.prepare(turnId, origin, failureNotice);
-			if (notice) {
-				runtime.delivery.markInflight(notice.deliveryId as string);
-				for (const recipient of runtime.connections)
-					if (recipient.negotiated)
-						recipient.write({ v: PROFILE_VERSION, type: "event", event: "chat.message", payload: notice });
-			}
-		}
-		throw error;
-	} finally {
-		clearInterval(heartbeat);
-		// Every exit path from here on must clear the adapter's temporary status: a
-		// delivered reply, a failure notice, and - the case this fixes - a turn that
-		// ends in a silence token and delivers nothing at all.
-		emitProgress(lastKnown, true);
-	}
-	const replyText = deliveredParts.length > 0 ? deliveredParts.join("\n") : text;
-	options.database.withTransaction(() => {
-		options.database.updateActivity(key, JSON.stringify(origin));
-		options.database.addRecall(
-			key,
-			JSON.stringify(origin),
-			`user: ${userText.slice(0, 500)}\nassistant: ${replyText.slice(0, 500)}`,
-		);
-		// Session growth bound: every `gjc --resume` replays the whole transcript,
-		// so turns get slower forever on a busy origin. Rotate the epoch after a
-		// fixed number of turns; durable memory and recall provide continuity.
-		if (options.database.incrementTurnCount(key) >= SESSION_TURN_LIMIT) {
-			options.database.bumpEpoch(key, JSON.stringify(origin));
-			console.error(`gateway rotated session epoch for ${key} after ${SESSION_TURN_LIMIT} turns.`);
-		}
-	});
-	// Spec fact 22: a reply that is exactly a silence token means the persona chose not to
-	// speak. The observation is already recorded above, so nothing is delivered and no daily
-	// capture is written. This is what makes an `open` channel usable: the persona can read
-	// every message in the room without answering all of them.
-	if (deliveredParts.length === 0 && isSilenceToken(text)) return;
-	if (!nonLoopback) {
-		connection.write({
-			v: PROFILE_VERSION,
-			type: "event",
-			event: "chat.message",
-			...(context ? { id: context.requestId } : {}),
-			payload: { turnId, origin, role: "assistant", text, final: true },
-		});
-		// Durable intent is persisted synchronously; closure work deliberately does not delay delivery.
-		runtime.memory.enqueue({ kind: "daily_capture", originRefJson: JSON.stringify(origin), userText, replyText: text });
-		return;
-	}
-	// Memory carries who spoke and where, so canonicalization keeps provenance.
-	const capturedUser = speaker ? `${speaker} @ ${place}: ${userText}` : userText;
-	// The final answer is never gated. Ports without streaming (and the test stub)
-	// return only the final text, and the mid-work gate (issue #71) may have
-	// suppressed the runtime's last streamed message; either way the final text
-	// ships here through the same splitter (reaction tokens included). It is
-	// skipped only when that exact body was already the last thing delivered,
-	// which is the streaming happy path.
-	if (lastDeliveredRaw !== text) deliverAssistantText(text);
-	if (deliveredParts.length === 0) {
-		// Reaction-only acknowledgement: nothing is spoken, but the turn happened and
-		// is captured with its token text so memory records what was acknowledged.
-		// If every reaction was skipped — capped, duplicated, or not expressible on
-		// this platform — the turn still emitted nothing and the daemon log is the
-		// only record of the skip; delivering the raw `[REACT:…]` token as text would
-		// leak control syntax into the room.
-		if (reactionTokensSeen)
-			runtime.memory.enqueue({
-				kind: "daily_capture",
-				originRefJson: JSON.stringify(origin),
-				userText: capturedUser,
-				replyText: text,
-			});
-		return;
-	}
-	// Durable intent is persisted synchronously; closure work deliberately does not delay delivery.
-	runtime.memory.enqueue({
-		kind: "daily_capture",
-		originRefJson: JSON.stringify(origin),
-		userText: capturedUser,
-		replyText,
-	});
 }
 
 /**
@@ -1908,55 +1855,24 @@ function currentConversationNotice(origin: OriginRef, engagement?: { mentioned?:
 			: []),
 	].join("\n");
 }
+function diagnostic(error: unknown): string {
+	return sanitizeDiagnostic(error instanceof Error ? error.message : String(error)) || "unknown_error";
+}
+
 function writeError(connection: Connection, error: unknown, id?: string): void {
 	const protocol = error instanceof ProtocolError ? error : new ProtocolError("verb_failed", "gateway request failed");
 	connection.write({ v: PROFILE_VERSION, type: "error", ...(id ? { id } : {}), error: protocol.toPayload() });
 }
 
 /**
- * Command authorisation shared by `/new`, `/reset` and `/model`: in group
- * surfaces a populated allowlist gates them, or any room member could wipe or
- * repoint the persona's conversation state.
+ * Command authorization is exactly ordinary engagement authorization: loopback,
+ * DM policy, owner identity, allowlist, and group gates apply before `/new`,
+ * `/reset`, or `/model` can mutate persistent session state.
  */
 function commandAuthorised(
-	origin: { readonly platform: string; readonly kind: string },
-	allowlist: readonly string[] | undefined,
+	origin: { readonly platform: string; readonly kind: string; readonly conversationId: string },
+	config: GatewayConfig,
 	engagement: unknown,
 ): boolean {
-	if (origin.platform === "loopback" || origin.kind === "dm") return true;
-	if (!allowlist || allowlist.length === 0) return true;
-	const authorId = (engagement as { authorId?: unknown } | undefined)?.authorId;
-	return typeof authorId === "string" && allowlist.includes(authorId);
-}
-
-/**
- * Drops this conversation's session: new epoch, context floor at now, queued
- * inbound discarded. An explicit reset is the manual form of a rebind, so it
- * also restores the automatic rebind budget - otherwise an origin that spent
- * its cap would stay capped even after the operator did exactly what the
- * notice asked for.
- */
-function resetConversationSession(
-	key: string,
-	origin: unknown,
-	options: {
-		readonly database: {
-			withTransaction(fn: () => void): void;
-			bumpEpoch(key: string, originJson: string): unknown;
-			contextSetFloor(key: string, floorAt: string): unknown;
-			inboundDiscardBefore(key: string, floorAt: string): string[];
-		};
-		readonly gjc: { forgetRebinds(key: string): void };
-	},
-	runtime: { readonly inbound: { delete(messageId: string): unknown } },
-): void {
-	const floorAt = new Date().toISOString();
-	let discardedInbound: string[] = [];
-	options.database.withTransaction(() => {
-		options.database.bumpEpoch(key, JSON.stringify(origin));
-		options.database.contextSetFloor(key, floorAt);
-		discardedInbound = options.database.inboundDiscardBefore(key, floorAt);
-	});
-	for (const messageId of discardedInbound) runtime.inbound.delete(messageId);
-	options.gjc.forgetRebinds(key);
+	return decideEngagement(origin, engagement as Parameters<typeof decideEngagement>[1], config).engaged;
 }

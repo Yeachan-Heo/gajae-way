@@ -45,10 +45,10 @@ function storeJob(database: GatewayDatabase, record: LaneJobRecord, laneKey = "p
 }
 
 describe("lane_jobs store (migration v10)", () => {
-	test("fresh database opens at combined schema 12 with the lane_jobs table", async () => {
+	test("fresh database opens at the current schema with the lane_jobs table", async () => {
 		const database = await openDatabase();
 		try {
-			expect(database.schemaVersion).toBe(16);
+			expect(database.schemaVersion).toBe(17);
 			expect(database.laneJobRows()).toEqual([]);
 			expect(database.laneJobJson("lanejob-none")).toBeUndefined();
 		} finally {

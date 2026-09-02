@@ -8,31 +8,30 @@ import { MONITOR_INSTRUCTION_MAX_LENGTH, MonitorRegistry } from "../src/monitors
 import { GatewayDatabase } from "../src/store/db";
 import { DeliveryLedger } from "../src/store/ledger";
 
-/**
- * Harness shape mirrors monitor-burst.test.ts: a real registry + propagator over
- * a real database, with the gjc port replaced by a prompt recorder that honours
- * the JSON-array authoring contract.
- */
+import { ScriptedSessionPort } from "./session-port.fake";
+/** Real registry + generic SessionPort harness honoring the JSON authoring contract. */
 async function harness(directory: string) {
 	const database = await GatewayDatabase.open(join(directory, "gateway.db"));
 	const registry = new MonitorRegistry(database);
 	const prompts: string[] = [];
-	const pipeline = new MonitorPropagator({
-		database,
-		registry,
-		gjc: {
-			ensureSession: async () => ({ sessionId: "event-session" }),
-			forgetRebinds: () => {},
-			sendTurn: async (_id: string, text: string) => {
-				prompts.push(text);
-				return JSON.stringify(
-					(JSON.parse(text.match(/\[.*\]$/s)![0]) as Array<{ eventId: string }>).map(({ eventId }) => ({
+	const sessionPort = new ScriptedSessionPort({
+		onSend: (input, scripted) => {
+			prompts.push(input.text);
+			scripted.complete(
+				input.opRef,
+				JSON.stringify(
+					(JSON.parse(input.text.match(/\[.*\]$/s)![0]) as Array<{ eventId: string }>).map(({ eventId }) => ({
 						eventId,
 						note: "recorded",
 					})),
-				);
-			},
+				),
+			);
 		},
+	});
+	const pipeline = new MonitorPropagator({
+		database,
+		registry,
+		sessionPort,
 		memory: { enqueue: () => crypto.randomUUID(), enqueueExistingId: () => {} } as never,
 		delivery: new DeliveryService(new DeliveryLedger(database)),
 		emit: () => {},

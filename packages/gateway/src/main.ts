@@ -1,5 +1,6 @@
 import { bootGateway } from "./boot";
 import { checkConfigFile, configCheckExitCode, defaultConfigPath, renderConfigCheck } from "./config-check";
+import { sanitizeDiagnostic } from "./orchestrator/rebind";
 
 const [command, ...args] = process.argv.slice(2);
 if (command === "config" && args[0] === "check") {
@@ -21,7 +22,7 @@ if (command === "config" && args[0] === "check") {
 		process.once("SIGINT", shutdown);
 		process.once("SIGTERM", shutdown);
 	} catch (error) {
-		console.error(`gajaeway-gateway failed to start: ${error instanceof Error ? error.message : String(error)}`);
+		console.error(`gajaeway-gateway failed to start: ${sanitizeDiagnostic(error instanceof Error ? error.message : String(error)) || "unknown_error"}`);
 		process.exit(1);
 	}
 }

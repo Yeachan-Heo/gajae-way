@@ -8,6 +8,7 @@ import { MonitorPropagator } from "../src/monitors/propagate";
 import { MonitorRegistry } from "../src/monitors/registry";
 import { GatewayDatabase } from "../src/store/db";
 import { DeliveryLedger } from "../src/store/ledger";
+import { sessionPortFromScript } from "./session-port.fake";
 
 test("reconciliation uses retained authored output and otherwise re-dispatches", async () => {
 	const directory = await mkdtemp(join(tmpdir(), "gajaeway-reconcile-"));
@@ -21,24 +22,23 @@ test("reconciliation uses retained authored output and otherwise re-dispatches",
 		});
 		const queued: unknown[] = [];
 		const dispatches: string[] = [];
-		const gjc = {
-			ensureSession: async (origin: string) => {
+		const sessionPort = sessionPortFromScript({
+			bind: async (origin: string) => {
 				dispatches.push(origin);
 				return { sessionId: "event-session" };
 			},
-			forgetRebinds: () => {},
-			sendTurn: async (_id: string, text: string) =>
+			respond: async (_id: string, text: string) =>
 				JSON.stringify(
 					(JSON.parse(text.match(/\[.*\]$/s)![0]) as Array<{ eventId: string }>).map(({ eventId }) => ({
 						eventId,
 						note: "authored by model",
 					})),
 				),
-		};
+		});
 		const pipeline = new MonitorPropagator({
 			database,
 			registry,
-			gjc,
+			sessionPort,
 			memory: {
 				enqueue: (mutation: unknown) => {
 					queued.push(mutation);
@@ -98,11 +98,10 @@ test("reconcile replays same-millisecond events oldest-first", async () => {
 		const pipeline = new MonitorPropagator({
 			database,
 			registry,
-			gjc: {
-				ensureSession: async () => ({ sessionId: "s" }),
-				forgetRebinds: () => {},
-				sendTurn: async () => "[]",
-			},
+			sessionPort: sessionPortFromScript({
+				bind: async () => ({ sessionId: "s" }),
+				respond: async () => "[]",
+			}),
 			memory: { enqueue: () => "intent", enqueueExistingId: () => {} } as never,
 			delivery: new DeliveryService(new DeliveryLedger(database)),
 			emit: () => {},
@@ -159,17 +158,16 @@ test("a monitor without its own channel target reports authored notes to the own
 	const pipeline = new MonitorPropagator({
 		database,
 		registry,
-		gjc: {
-			ensureSession: async () => ({ sessionId: "s" }),
-			forgetRebinds: () => {},
-			sendTurn: async (_id: string, prompt: string) =>
+		sessionPort: sessionPortFromScript({
+			bind: async () => ({ sessionId: "s" }),
+			respond: async (_id: string, prompt: string) =>
 				JSON.stringify(
 					(JSON.parse(prompt.match(/\[.*\]$/s)?.[0] ?? "[]") as Array<{ eventId: string }>).map(({ eventId }) => ({
 						eventId,
 						note: "owner-target note",
 					})),
 				),
-		},
+		}),
 		memory: { enqueue: () => {}, enqueueExistingId: () => {} } as never,
 		delivery,
 		emit: () => {},

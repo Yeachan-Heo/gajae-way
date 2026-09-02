@@ -10,7 +10,7 @@ import {
 } from "@gajaeway/protocol";
 import type { DeliveryService } from "../delivery/delivery";
 import type { MemoryClosureQueue } from "../memory/closure";
-import type { GjcPort } from "../orchestrator/gjc-client";
+import type { SessionPort } from "../orchestrator/session-port";
 import type { GatewayDatabase } from "../store/db";
 import { MONITOR_EVENT_MAX_DISPATCH_ATTEMPTS, RECONCILABLE_STAGES, TERMINAL_STAGES } from "../store/db";
 import {
@@ -131,7 +131,7 @@ export interface MonitorSessionSafetyState {
 export class MonitorPropagator {
 	readonly #database: GatewayDatabase;
 	readonly #registry: MonitorRegistry;
-	readonly #gjc: GjcPort;
+	readonly #sessionPort: SessionPort;
 	readonly #memory: MemoryClosureQueue;
 	readonly #delivery: DeliveryService;
 	readonly #emit: (event: MonitorEventRecord) => void;
@@ -147,8 +147,8 @@ export class MonitorPropagator {
 	#reconciling = false;
 	/** In-flight dispatch promises per event, for awaitable submission. */
 	#inFlightPromises = new Map<string, Promise<void>>();
-	/** Serialize GJC monitor turns per session origin; binds can coalesce, turns cannot. */
-	#turnChains = new Map<string, Promise<void>>();
+	/** Per-origin serialization lives in SessionPort, shared with all SDK callers. */
+	readonly #repo: string;
 	/**
 	 * Per-session-origin safety-net state (issue #68). Process-local on purpose:
 	 * it is evidence about the CURRENT live session, and a restart mints a fresh
@@ -164,7 +164,7 @@ export class MonitorPropagator {
 	constructor(options: {
 		database: GatewayDatabase;
 		registry: MonitorRegistry;
-		gjc: GjcPort;
+		sessionPort: SessionPort;
 		memory: MemoryClosureQueue;
 		delivery: DeliveryService;
 		emit: (event: MonitorEventRecord) => void;
@@ -172,6 +172,8 @@ export class MonitorPropagator {
 		ownerTarget?: { readonly origin: OriginRef };
 		/** Broadcasts a prepared chat.message to live adapter connections. */
 		deliver?: (payload: ChatMessagePayload) => void;
+		/** Workspace used for broker-session creation and all SDK queries. */
+		repo?: string;
 		/** Injectable clock for deterministic lease expiry/renewal in tests. */
 		now?: () => number;
 		/**
@@ -200,7 +202,7 @@ export class MonitorPropagator {
 	}) {
 		this.#database = options.database;
 		this.#registry = options.registry;
-		this.#gjc = options.gjc;
+		this.#sessionPort = options.sessionPort;
 		this.#memory = options.memory;
 		this.#delivery = options.delivery;
 		this.#emit = options.emit;
@@ -218,6 +220,7 @@ export class MonitorPropagator {
 		this.#contextFailureRollThreshold = options.contextFailureRollThreshold ?? MONITOR_CONTEXT_FAILURE_ROLL_THRESHOLD;
 		this.#protocolFailureRollThreshold =
 			options.protocolFailureRollThreshold ?? MONITOR_PROTOCOL_FAILURE_ROLL_THRESHOLD;
+		this.#repo = options.repo ?? process.cwd();
 	}
 	/** Cancels pending burst timers so a closed database is never touched after shutdown. */
 	dispose(): void {
@@ -349,7 +352,12 @@ export class MonitorPropagator {
 	 * never an infinite dispatch loop.
 	 */
 	async reconcile(): Promise<void> {
-		if (this.#reconciling) return;
+		if (this.#reconciling) {
+			// Yield once so a caller racing the first sweep observes its claimed work
+			// rather than an artificial pre-bind microtask gap in the shared port.
+			await Bun.sleep(0);
+			return;
+		}
 		this.#reconciling = true;
 		try {
 			// Legacy split-state repair: a crash between ledger confirm and batch
@@ -471,20 +479,9 @@ export class MonitorPropagator {
 			? eventTypeOrigin(claimed[0]!.event_type)
 			: CATCH_ALL_EVENT_ORIGIN;
 		const sessionOriginKey = originKey(sessionOrigin);
-		// Preserve PR #26's per-origin turn serialization while the PR #30 lease
-		// remains heartbeated. A later batch waits for the prior turn, then owns the
-		// session until this dispatch's finally block releases the chain.
-		const previousTurn = this.#turnChains.get(sessionOriginKey);
-		let releaseTurn!: () => void;
-		const currentTurn = new Promise<void>((resolve) => {
-			releaseTurn = resolve;
-		});
-		const trackedTurn = (previousTurn ?? Promise.resolve()).then(
-			() => currentTurn,
-			() => currentTurn,
-		);
-		this.#turnChains.set(sessionOriginKey, trackedTurn);
-		if (previousTurn) await previousTurn.catch(() => undefined);
+		// One generic port owns all same-origin authoring serialization; monitor
+		// leases remain active while a prior call is awaiting a terminal receipt.
+		await this.#sessionPort.runExclusive(sessionOriginKey, async () => {
 		// Bound outside the try so the failure handler can ask the compaction port
 		// to act on the very session that failed, and can tell whether that
 		// session is still the live one.
@@ -507,7 +504,11 @@ export class MonitorPropagator {
 			// new epoch's session. Leases and fencing are untouched.
 			const digest = this.#rollSessionIfArmed(sessionOriginKey, JSON.stringify(sessionOrigin), monitor);
 			const boundEpoch = this.#database.getSessionRecord(sessionOriginKey)?.epoch ?? 0;
-			const { sessionId } = await this.#gjc.ensureSession(sessionOriginKey, boundEpoch);
+			const { sessionId } = await this.#sessionPort.bind({
+				originKey: sessionOriginKey,
+				epoch: boundEpoch,
+				repo: this.#repo,
+			});
 			boundSessionId = sessionId;
 			boundSessionEpoch = boundEpoch;
 			// Guidance order: the monitor's own instruction first (it is what the
@@ -519,7 +520,16 @@ export class MonitorPropagator {
 				.filter((entry, index, all) => entry && all.indexOf(entry) === index);
 			const guidance = [monitor.instruction?.trim() || undefined, ...maintenance].filter(Boolean).join(" ");
 			const prompt = `Author monitor events.${guidance ? ` ${guidance}` : ""}${digest ? `\n${digest}\n` : ""} Respond ONLY with a JSON array containing exactly one {"eventId","note"} entry per event: ${JSON.stringify(claimed.map((row) => ({ eventId: row.event_id, eventType: row.event_type, payload: JSON.parse(row.payload_json) })))}`;
-			const response = await this.#gjc.sendTurn(sessionId, prompt);
+			const opRef = `gw-m-${batchId.replaceAll("-", "")}`;
+			const response = (
+				await this.#sessionPort.request({
+					sessionId,
+					repo: this.#repo,
+					originKey: sessionOriginKey,
+					text: prompt,
+					opRef,
+				})
+			).assistant.text;
 			// The authoring turn is now part of the session transcript whatever its
 			// content, so it is counted here rather than after the response is
 			// validated. The count is OBSERVATIONAL: it is reported, and it never
@@ -672,9 +682,8 @@ export class MonitorPropagator {
 			// expired and another process stole the claim, this release is a no-op,
 			// and a stale attempt's completion can never overwrite the newer claim.
 			for (const row of leased) this.#database.monitorEventReleaseLease(row.event_id, leaseId);
-			releaseTurn();
-			if (this.#turnChains.get(sessionOriginKey) === trackedTurn) this.#turnChains.delete(sessionOriginKey);
 		}
+		});
 	}
 	/** Read-only safety-net evidence for one session origin (ops/tests). */
 	sessionSafetyState(sessionOriginKey: string): MonitorSessionSafetyState {
@@ -829,9 +838,9 @@ export class MonitorPropagator {
 			instruction: monitor.instruction,
 			notes: this.#recentAuthoredNotes(monitor.monitorId),
 		});
-		// bumpEpoch is the existing rotation primitive: epoch + 1, turn_count 0 and
-		// the gjc binding cleared, so the next ensureSession mints a fresh session
-		// (and a fresh idempotency key) for this origin.
+		// bumpEpoch is the existing rotation primitive: epoch + 1 and turn_count 0.
+		// The next broker-backed SessionPort bind mints a fresh session and
+		// idempotency key for this monitor origin.
 		this.#database.withTransaction(() => this.#database.bumpEpoch(sessionOriginKey, originRefJson));
 		state.pendingRoll = undefined;
 		state.lastRoll = reason;
@@ -920,8 +929,8 @@ function failureCode(error: unknown, failureClass: AuthoringFailureClass): Dispa
 	if (isOrphanedExecutorFailure(error)) return "orphaned_executor";
 	if (isAsideTimeoutFailure(error)) return "aside_timeout";
 	const message = error instanceof Error ? error.message : String(error);
-	if (message.includes("sendTurn")) return "authoring_turn_failed";
-	if (message.includes("ensureSession")) return "session_bind_failed";
+	if (message.includes("session send") || message.includes("SessionPort")) return "authoring_turn_failed";
+	if (message.includes("session bind")) return "session_bind_failed";
 	if (/timeout|timed out|tool failed|external tool|lock/i.test(message)) return "executor_failed";
 	return "internal_error";
 }

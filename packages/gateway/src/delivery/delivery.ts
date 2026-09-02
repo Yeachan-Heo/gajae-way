@@ -12,9 +12,14 @@ export class DeliveryService {
 	constructor(ledger: DeliveryLedger) {
 		this.#ledger = ledger;
 	}
-	prepare(turnId: string, origin: OriginRef, text: string, replyToMessageId?: string): ChatMessagePayload | undefined {
+	prepare(
+		turnId: string,
+		origin: OriginRef,
+		text: string,
+		replyToMessageId?: string,
+		deliveryId: string = crypto.randomUUID(),
+	): ChatMessagePayload | undefined {
 		if (isSilenceToken(text)) return undefined;
-		const deliveryId = crypto.randomUUID();
 		const payload: ChatMessagePayload = {
 			turnId,
 			origin,
@@ -24,12 +29,15 @@ export class DeliveryService {
 			deliveryId,
 			...(replyToMessageId ? { replyToMessageId } : {}),
 		};
-		this.#ledger.createPending({
-			deliveryId,
-			turnId,
-			originKey: originKey(origin),
-			payloadJson: JSON.stringify(payload),
-		});
+		if (
+			!this.#ledger.createPending({
+				deliveryId,
+				turnId,
+				originKey: originKey(origin),
+				payloadJson: JSON.stringify(payload),
+			})
+		)
+			return undefined;
 		return payload;
 	}
 	/**

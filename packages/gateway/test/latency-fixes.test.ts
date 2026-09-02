@@ -3,9 +3,8 @@ import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { GatewayConfig } from "../src/config";
-import type { GjcPort, TurnOptions } from "../src/orchestrator/gjc-client";
-import { GjcTurnStream } from "../src/orchestrator/gjc-client";
-import { KeyedQueue } from "../src/server/keyed-queue";
+import type { SessionPort } from "../src/orchestrator/session-port";
+import { ScriptedSessionPort, sessionPortFromScript } from "./session-port.fake";
 import { type GatewayServer, startUnixServer } from "../src/server/server";
 import { GatewayDatabase } from "../src/store/db";
 
@@ -18,35 +17,24 @@ afterEach(async () => {
 	directory = "";
 });
 
-test("GjcTurnStream reports each completed assistant message as it streams", () => {
-	const reported: string[] = [];
-	const stream = new GjcTurnStream((text) => reported.push(text));
-	const message = (text: string) =>
-		`${JSON.stringify({ type: "message_end", message: { role: "assistant", content: [{ type: "text", text }] } })}\n`;
-	stream.feed(message("first step done"));
-	stream.feed(`${JSON.stringify({ type: "tool_execution_start" })}\n`);
-	stream.feed(message("second step done"));
-	expect(reported).toEqual(["first step done", "second step done"]);
-	expect(stream.finalText).toBe("second step done");
-	expect(stream.toolCalls).toBe(1);
-});
 
-test("KeyedQueue.settle resolves only after every enqueued task settles", async () => {
-	const queue = new KeyedQueue();
-	let done = 0;
-	void queue.run("a", async () => {
+test("SessionPort.runExclusive serializes same-origin work and releases after rejection", async () => {
+	const port = new ScriptedSessionPort();
+	const order: string[] = [];
+	const first = port.runExclusive("a", async () => {
 		await Bun.sleep(20);
-		done++;
+		order.push("first");
 	});
-	void queue
-		.run("b", async () => {
-			await Bun.sleep(10);
-			done++;
-			throw new Error("failed tasks settle too");
-		})
-		.catch(() => {});
-	await queue.settle();
-	expect(done).toBe(2);
+	const rejected = port.runExclusive("a", async () => {
+		order.push("second");
+		throw new Error("failed work releases the session lock");
+	});
+	const other = port.runExclusive("b", async () => {
+		await Bun.sleep(10);
+		order.push("other");
+	});
+	await Promise.all([first, rejected.catch(() => undefined), other]);
+	expect(order).toEqual(["other", "first", "second"]);
 });
 
 test("turn_count survives increments and resets on epoch bump", async () => {
@@ -83,7 +71,7 @@ async function connect(socketPath: string): Promise<{ send(value: unknown): void
 }
 
 async function startGateway(
-	gjc: GjcPort,
+	options: { readonly sessionPort: SessionPort },
 ): Promise<{ client: Awaited<ReturnType<typeof connect>>; config: GatewayConfig }> {
 	directory = await mkdtemp(join(tmpdir(), "gajaeway-latency-"));
 	const config: GatewayConfig = {
@@ -94,9 +82,10 @@ async function startGateway(
 		dbPath: join(directory, "gateway.db"),
 		logVerbosity: "info",
 		channels: { "chan-1": { engagement: "open" } },
+		settleWindowMs: 0,
 	};
 	const database = await GatewayDatabase.open(config.dbPath);
-	server = await startUnixServer({ config, database, gjc, onStop: () => database.close() });
+	server = await startUnixServer({ config, database, ...options, onStop: () => database.close() });
 	const client = await connect(config.socketPath);
 	client.send({ v: "0.1", type: "hello", payload: { supportedVersions: ["0.1"] } });
 	for (let attempt = 0; attempt < 60 && client.frames.length < 1; attempt++) await Bun.sleep(5);
@@ -118,57 +107,43 @@ function sendChannelMessage(client: { send(value: unknown): void }, id: string, 
 	});
 }
 
-test("intermediate assistant messages are delivered while the turn is still running", async () => {
-	// Issue #71: the mid-work message must be something a person would say
-	// (a finding here). Pure process narration like "checking the logs now" is
-	// suppressed by the InterimSpeechGate; see interim-speech.test.ts.
-	let releaseTurn: (() => void) | undefined;
-	const gjc: GjcPort = {
-		ensureSession: async () => ({ sessionId: "mock-session" }),
-		sendTurn: async (_session, _text, _preamble, _progress, options?: TurnOptions) => {
-			options?.onAssistantText?.("the 500s hit every 3 minutes, not randomly");
-			await new Promise<void>((resolve) => {
-				releaseTurn = resolve;
-			});
-			options?.onAssistantText?.("done: found the culprit");
-			return "done: found the culprit";
-		},
-		forgetRebinds: () => {},
-	};
-	const { client } = await startGateway(gjc);
+test("tail frames deliver an assistant finding before the persistent operation reaches terminal", async () => {
+	const sessionPort = new ScriptedSessionPort();
+	const { client } = await startGateway({ sessionPort });
 	sendChannelMessage(client, "c1", "hey, dig into this");
-	// The first assistant message must arrive BEFORE the turn completes.
+	for (let attempt = 0; attempt < 100 && sessionPort.sends.length === 0; attempt++) await Bun.sleep(5);
+	const send = sessionPort.sends[0]!;
+	sessionPort.emitTool(send.sessionId);
+	sessionPort.emitAssistant(send.sessionId, "the 500s hit every 3 minutes, not randomly");
 	for (let attempt = 0; attempt < 100; attempt++) {
 		if (client.frames.some((frame: any) => frame.type === "event" && frame.event === "chat.message")) break;
 		await Bun.sleep(5);
 	}
 	const midTurn = client.frames.filter((frame: any) => frame.type === "event" && frame.event === "chat.message");
-	expect(midTurn.length).toBe(1);
+	expect(midTurn).toHaveLength(1);
 	expect(midTurn[0].payload.text).toContain("every 3 minutes");
-	releaseTurn?.();
+	sessionPort.complete(send.opRef, "done: found the culprit");
 	for (let attempt = 0; attempt < 100; attempt++) {
 		const count = client.frames.filter((frame: any) => frame.type === "event" && frame.event === "chat.message").length;
 		if (count >= 2) break;
 		await Bun.sleep(5);
 	}
 	const messages = client.frames.filter((frame: any) => frame.type === "event" && frame.event === "chat.message");
-	// The final assistant message arrives exactly once (streamed, never redelivered).
-	expect(messages.length).toBe(2);
+	expect(messages).toHaveLength(2);
 	expect(messages[1].payload.text).toContain("found the culprit");
 });
 
-test("a queued message does not pay the debounce window twice", async () => {
+	test("a message arriving during an active persistent turn is steered without a second send", async () => {
 	const turnStarts: number[] = [];
-	const gjc: GjcPort = {
-		ensureSession: async () => ({ sessionId: "mock-session" }),
-		sendTurn: async () => {
+	const sessionPort = sessionPortFromScript({
+		bind: async () => ({ sessionId: "mock-session" }),
+		respond: async () => {
 			turnStarts.push(Date.now());
 			await Bun.sleep(600);
 			return "ack";
 		},
-		forgetRebinds: () => {},
-	};
-	directory = await mkdtemp(join(tmpdir(), "gajaeway-debounce-"));
+	});
+	directory = await mkdtemp(join(tmpdir(), "gajaeway-settle-"));
 	const config: GatewayConfig = {
 		schemaVersion: 1,
 		home: directory,
@@ -176,24 +151,21 @@ test("a queued message does not pay the debounce window twice", async () => {
 		socketPath: join(directory, "gateway.sock"),
 		dbPath: join(directory, "gateway.db"),
 		logVerbosity: "info",
-		channels: { "chan-1": { engagement: "open", debounceMs: 500 } },
+		channels: { "chan-1": { engagement: "open", settleWindowMs: 500 } },
 	};
 	const database = await GatewayDatabase.open(config.dbPath);
-	server = await startUnixServer({ config, database, gjc, onStop: () => database.close() });
+	server = await startUnixServer({ config, database, sessionPort, onStop: () => database.close() });
 	const client = await connect(config.socketPath);
 	client.send({ v: "0.1", type: "hello", payload: { supportedVersions: ["0.1"] } });
 	for (let attempt = 0; attempt < 60 && client.frames.length < 1; attempt++) await Bun.sleep(5);
 	sendChannelMessage(client, "d1", "first");
-	// Arrives while turn 1 (500ms debounce + 600ms turn) is in flight; by the time it
-	// is claimed it has already outwaited its debounce window.
+	// It arrives while the first turn is active, so persistent-session admission
+	// steers it into the accepted operation instead of creating another turn.
 	await Bun.sleep(700);
 	sendChannelMessage(client, "d2", "second");
-	for (let attempt = 0; attempt < 400 && turnStarts.length < 2; attempt++) await Bun.sleep(5);
-	expect(turnStarts.length).toBe(2);
-	// Turn 1 ends ~1100ms in; the second message (waiting since ~700ms) must start
-	// nearly immediately after, not after another full 500ms debounce.
-	const gapAfterFirstTurn = (turnStarts[1] as number) - ((turnStarts[0] as number) + 600);
-	expect(gapAfterFirstTurn).toBeLessThan(400);
+	for (let attempt = 0; attempt < 400 && sessionPort.steers.length < 1; attempt++) await Bun.sleep(5);
+	expect(turnStarts.length).toBe(1);
+	expect(sessionPort.steers).toHaveLength(1);
 });
 
 test("a prose-only stale session failure surfaces visibly without a prose-driven rebind", async () => {
@@ -202,15 +174,14 @@ test("a prose-only stale session failure surfaces visibly without a prose-driven
 	// bump and retry that could loop forever against a dead key — is replaced by
 	// a visible structured failure whose remedy (/new) the operator controls.
 	let calls = 0;
-	const gjc: GjcPort = {
-		ensureSession: async () => ({ sessionId: "session-e0" }),
-		sendTurn: async () => {
+	const sessionPort = sessionPortFromScript({
+		bind: async () => ({ sessionId: "session-e0" }),
+		respond: async () => {
 			calls++;
-			throw new Error('gjc turn exited 1: Error: Session "dead-beef" not found.');
+			throw new Error('session send failed: Session "dead-beef" not found.');
 		},
-		forgetRebinds: () => {},
-	};
-	const { client } = await startGateway(gjc);
+	});
+	const { client } = await startGateway({ sessionPort });
 	sendChannelMessage(client, "r1", "are you alive?");
 	for (let attempt = 0; attempt < 200; attempt++) {
 		if (client.frames.some((frame: any) => frame.type === "event" && frame.event === "chat.message")) break;

@@ -22,6 +22,7 @@ import { MonitorPropagator } from "../src/monitors/propagate";
 import { MonitorRegistry } from "../src/monitors/registry";
 import { GatewayDatabase } from "../src/store/db";
 import { DeliveryLedger } from "../src/store/ledger";
+import { sessionPortFromScript } from "./session-port.fake";
 
 /**
  * Issue #68, final design: native gjc auto-compaction is the primary defence
@@ -75,17 +76,16 @@ async function harness(
 	const pipeline = new MonitorPropagator({
 		database,
 		registry,
-		gjc: {
+		sessionPort: sessionPortFromScript({
 			// One session id per epoch: exactly what a real bind does, so a roll is
 			// observable as a new transcript.
-			ensureSession: async (_key: string, epoch = 0) => ({ sessionId: `event-session-e${epoch}` }),
-			forgetRebinds: () => {},
-			sendTurn: async (sessionId: string, text: string) => {
+			bind: async (_key: string, epoch = 0) => ({ sessionId: `event-session-e${epoch}` }),
+			respond: async (sessionId: string, text: string) => {
 				const index = turns.length;
 				turns.push({ sessionId, prompt: text });
 				return options.respond ? options.respond(text, index) : echoNotes(text);
 			},
-		},
+		}),
 		memory: { enqueue: () => crypto.randomUUID(), enqueueExistingId: () => {} } as never,
 		delivery: new DeliveryService(new DeliveryLedger(database)),
 		emit: () => {},
@@ -151,7 +151,7 @@ test("the default compaction port is honest about doing nothing", async () => {
 test("authoring failures split across exactly three axes, and only context evidence is context", () => {
 	for (const message of [
 		"authoring response is empty",
-		"gjc sendTurn failed: context_too_large",
+		"session send failed: context_too_large",
 		"maximum context length exceeded",
 		"prompt is too long for this model",
 		"provider returned a 0-token completion",
@@ -170,7 +170,7 @@ test("authoring failures split across exactly three axes, and only context evide
 		"aside_timeout",
 		"external tool failed: gh exited 1",
 		"memory lock held, run skipped",
-		"gjc ensureSession failed: socket closed",
+		"session bind failed: socket closed",
 		"something nobody has seen before",
 		"aside exec collection exceeded 360s; child killed but Aside daemon task still running",
 	])
@@ -563,7 +563,7 @@ test("a healthy answer resets the streak, so isolated context failures never rol
 			compaction,
 			respond: (prompt) => {
 				if (!fail) return echoNotes(prompt);
-				throw new Error("gjc sendTurn failed: context_too_large");
+				throw new Error("session send failed: context_too_large");
 			},
 		});
 		const monitor = registry.add({
@@ -612,7 +612,7 @@ test("a context failure on a replayed stale event does not feed the current sess
 			respond: (prompt) => {
 				if (mode === "ok") return echoNotes(prompt);
 				if (mode === "executor") throw new Error("external tool failed: gh exited 1");
-				throw new Error("gjc sendTurn failed: context_too_large");
+				throw new Error("session send failed: context_too_large");
 			},
 		});
 		const monitor = registry.add({
@@ -755,7 +755,7 @@ test("interleaved orphaned-executor and context failures advance only the contex
 			compaction,
 			respond: () => {
 				if (mode === "orphaned") throw new Error(ORPHANED_MESSAGE);
-				throw new Error("gjc sendTurn failed: context_too_large");
+				throw new Error("session send failed: context_too_large");
 			},
 		});
 		const monitor = registry.add({

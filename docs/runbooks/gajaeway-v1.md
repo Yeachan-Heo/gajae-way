@@ -9,7 +9,7 @@ bun run build   # emits dist/gajaeway-gateway, dist/gajaeway-discord, dist/gajae
 dist/gajaeway-gateway daemon
 ```
 
-The external `gjc` binary remains a runtime dependency on PATH (the gateway spawns it per turn). For development, run straight from source: `bun packages/gateway/src/main.ts daemon`.
+The external `gjc` binary remains a runtime dependency on PATH. Gateway startup owns one private gjc agent directory (`<home>/broker/<instanceId>/agent`); gjc's own daemon for that directory hosts the persistent sessions and is auto-started by the gateway's first `gjc sdk` probe. The supervisor observes daemon health and publishes a new generation when it recovers; it never spawns or kills the daemon. For development, run straight from source: `bun packages/gateway/src/main.ts daemon`.
 
 The CLI does not start the daemon: `gajaeway daemon run` prints the launcher command, and `gajaeway status` requires the daemon socket. Run the launcher under your service manager (systemd/launchd/container supervisor), keep its state directory private, and stop the service before an offline restore.
 
@@ -30,10 +30,10 @@ The CLI does not start the daemon: `gajaeway daemon run` prints the launcher com
   "socketPath": "/absolute/path/gateway.sock",
   "dbPath": "/absolute/path/gateway.db",
   "credentials": { "discord": { "credentialFile": "/absolute/path/discord-token" } },
-  "channels": { "channel-id": { "engagement": "open", "debounceMs": 500 } },
-  "turnTimeoutMs": 900000,
+  "channels": { "channel-id": { "engagement": "open", "settleWindowMs": 500 } },
   "model": { "preset": "codex-medium" },
-  "debounceMs": 1000,
+  "settleWindowMs": 1000,
+  "stallTimeoutMs": 120000,
   "mentionAllowlist": ["owner-author-id"],
   "webhook": { "bind": "127.0.0.1", "port": 8080, "exposeNonLoopback": false },
   "watcherRoots": ["/absolute/path"],
@@ -44,9 +44,11 @@ The CLI does not start the daemon: `gajaeway daemon run` prints the launcher com
 
 Use schema version 1 only. Each credential is a file reference, never an inline secret or environment fallback; a credential file may be referenced by exactly one configured credential. Create secret files with restrictive ownership and mode, keep them outside version control, and rotate by replacing the file and restarting the service.
 
-`model` accepts either a gjc model selector string such as `"openai/gpt-5.2"` or a preset object such as `{ "preset": "codex-medium" }`. Presets are resolved by gjc from its merged built-in and `~/.gjc/agent/models.yml` profile catalog. A preset's `model_mapping.default` may be an ordered selector array; gajaeway invokes the preset with `--mpreset`, so gjc retains its native availability checks, retry budgets, sticky selection, and fallback-chain behavior instead of the gateway attempting unsafe whole-turn retries.
+`model` accepts either a gjc model selector string such as `"openai/gpt-5.2"` or a preset object such as `{ "preset": "codex-medium" }`. The gateway applies it through the persistent session’s authenticated `model.set` control; presets are resolved by gjc from its merged built-in and `~/.gjc/agent/models.yml` profile catalog, so gjc retains its native availability checks, retry budgets, sticky selection, and fallback-chain behavior.
 
-`monitorContextFailureRollThreshold` (1–20, default 2) is the monitor safety net, not a turn ceiling: native gjc auto-compaction keeps monitor sessions bounded, and a monitor that keeps answering is never rolled however many turns it takes. The epoch rolls only after this many **consecutive** context-class authoring failures (empty response, context-length rejection, zero-token completion) attributable to the current session AND a native-compaction request that came back `unavailable`/`failed`/`skipped`; the new session's first prompt then carries a digest of the monitor's instruction and its recent authored notes. Any healthy answer resets the streak, and failures that are executor-class or protocol-class (malformed or off-contract answers), or that come from a reconcile-replayed stale event or a dead epoch, never count. Executor-class failures report a sub-kind: `aside_timeout` and other worker/tool/lock failures, and `orphaned_executor` for a child process killed on the wrapper's timeout while the external daemon's job kept running — that one means "reclaim the external executor", never "roll the session". Restart-only, and separate from the 50-turn chat rotation. See `docs/monitors.md`.
+`monitorContextFailureRollThreshold` (1–20, default 2) is the monitor safety net, not a turn ceiling: native gjc auto-compaction keeps monitor sessions bounded, and a monitor that keeps answering is never rolled however many turns it takes. The epoch rolls only after this many **consecutive** context-class authoring failures (empty response, context-length rejection, zero-token completion) attributable to the current session AND a native-compaction request that came back `unavailable`/`failed`/`skipped`; the new session's first prompt then carries a digest of the monitor's instruction and its recent authored notes. Any healthy answer resets the streak, and failures that are executor-class or protocol-class (malformed or off-contract answers), or that come from a reconcile-replayed stale event or a dead epoch, never count. Executor-class failures report a sub-kind: `aside_timeout` and other worker/tool/lock failures, and `orphaned_executor` for a child process killed on the wrapper's timeout while the external daemon's job kept running — that one means "reclaim the external executor", never "roll the session". See `docs/monitors.md`.
+
+`turnTimeoutMs` was removed with the persistent-session cutover. Configuration containing it is rejected; use `stallTimeoutMs` for an alert-only tail silence threshold. It never kills or replaces a running SDK operation.
 
 ## Adapters and engagement
 
@@ -116,6 +118,13 @@ gajaeway ops integrity
 
 Practice this sequence on a disposable home directory before relying on it during an incident.
 
+### Persistent-session binary rollback
+
+A code revert is safe only after the current gateway has reconciled all current and retired batches. Stop intake, wait until `batch_state IN ('settled','accepted')` is zero, verify `gajaeway ops integrity`, then stop the gateway so it releases its broker ownership lock in order (the gjc daemon itself is gjc-owned and is not killed). For the pre-cutover binary, restore `settleWindowMs` to `debounceMs` globally and in every channel policy and add that binary's `turnTimeoutMs`; the persistent build rejects the latter. Remove a broker private directory only after acquiring its lock and proving the recorded PID is dead. Start the reverted binary only after the schema down-marker below succeeds, then smoke one adopted session and verify its delivery.
+### Persistent-session schema rollback
+
+Do not down-mark a live database. First stop external intake while the v17 gateway is still running, reconcile every current and retired batch until `batch_state IN ('settled','accepted')` is zero, and verify integrity. Take a backup before the transactional down-marker `DELETE FROM schema_migrations WHERE version = 17;`, then verify the v16 marker before starting the pre-cutover binary. Version 17 is the one additive migration that adds the batch-to-session binding used to reattach retired holds after `/new`; it leaves the legacy inbound state column unchanged. If quiescence cannot be proved, refuse the down-step and restore the pre-cutover backup instead.
+
 ## Crash recovery
 
 On startup, the delivery ledger redelivers unsettled output. Ambiguous prior delivery is visibly duplicate-labeled, so adapters must preserve that label. Memory closure resumes durable intents and receipts successful Git closure; irrecoverable intent work is quarantined. Monitor reconciliation resumes admitted, dispatched, or failed events and repairs authored events whose memory closure is missing.
@@ -126,7 +135,7 @@ On startup, the delivery ledger redelivers unsettled output. Ambiguous prior del
 - **Newer-schema refusal:** do not downgrade against that database. Restore a compatible backup or run a gateway that supports its schema.
 - **Quarantined mutation:** inspect the intent payload, memory repository state, and Git error; repair the source condition, then use the documented recovery workflow rather than deleting the evidence.
 - **Backup failure:** supply an absolute target path whose parent directory already exists; never target the live `gateway.db`.
-- **Every turn on one origin fails with the same gjc `api_error` (for example "cannot restore Claude OAuth MCP tool alias"):** the bound gjc session transcript is poisoned and every resume replays the failure. Send `/new` to that conversation to rebind a fresh session; prior in-session context is lost by design. The daemon log carries the exact error; the conversation receives the `[turn failed]` notice.
-- **Repeated `gateway session rebind` lines for one origin:** the gateway rebinds automatically when the runtime condemns a session key (`resource_gone`, `spawn_failed`, `terminal_uncertain`, `managed_append_identity_mismatch`). Each line carries `cause=<code>`, the epoch transition, and `lifetime=<N>` — the total this process has ever spent for that origin, which a completed unaided turn does NOT reset. A rising `lifetime` with the consecutive count stuck at `1/3` means a failure alternating with healthy turns: the epoch is still growing, so investigate the cause code rather than waiting for the cap. After three consecutive rebinds the turn fails with `rebind_cap_exceeded` and the conversation is told to send `/new`, which also restores the budget.
+- **Every turn on one origin fails with the same gjc `api_error` (for example "cannot restore Claude OAuth MCP tool alias"):** the persistent broker-hosted session may be poisoned. Send `/new` to create a fresh epoch; prior in-session context is lost by design. The daemon log carries the exact error and the conversation receives the `[turn failed]` notice.
+- **Repeated structured recovery signals:** `recovery_hold` and `retired_hold` retain a durable batch; `stall_alert originKey=… sessionId=… silentMs=…` is alert-only; `broker_restart generation=… backoffMs=…` records a supervised replacement. None of these signals permits a blind re-send or abort. Use `/new` only to establish a fresh epoch for later traffic; an accepted old batch remains fenced until status/tail proves a terminal result.
 - **Session bootstrap remains pending:** inspect `session.list` or `ops.cycle`. A pending projection means the current epoch has not completed a terminal successful turn yet; pre-success failures deliberately retry it. Repeated attempts carry the same origin+epoch bootstrap ID. Do not mark it complete manually or copy source bodies into the database. Repair unreadable memory files or rejected links at their source. In public/group channels, associated channel/project/task/handoff documents need an exact full `origin:`/`origin-key:` match and `bootstrap-safe: public` (or `bootstrap-visibility: public`); bare conversation IDs never qualify. Daily sections are admitted only when every stable-origin declaration is well formed and resolves to one consistent current-origin key. The configured `memory/` root may itself be a symlink, but every followed target must remain beneath that resolved memory root.
 - **`config.json is unreadable (...); refusing to start on defaults`:** the file exists but cannot be read (permissions, a directory in its place, or a symlink whose target is missing). The daemon exits non-zero rather than booting on defaults, because defaults would drop `mentionAllowlist` and open a mention-gated room. Fix the file, then start again; a reload in a running daemon keeps the previous config and reports the same diagnostic.

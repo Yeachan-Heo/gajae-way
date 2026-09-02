@@ -16,7 +16,7 @@ test("migrates a migration-001 database to the latest schema", async () => {
 		legacy.close();
 
 		const database = await GatewayDatabase.open(path);
-		expect(database.schemaVersion).toBe(16);
+		expect(database.schemaVersion).toBe(17);
 		database.close();
 
 		const migrated = new Database(path, { readonly: true });
@@ -69,7 +69,7 @@ DELETE FROM schema_migrations WHERE version > 10;
 		v10.close();
 
 		const upgraded = await GatewayDatabase.open(path);
-		expect(upgraded.schemaVersion).toBe(16);
+		expect(upgraded.schemaVersion).toBe(17);
 		expect(upgraded.laneJobJson("lanejob-test")).toBe('{"schemaVersion":1}');
 		const tables = new Set(
 			new Database(path, { readonly: true })
@@ -114,7 +114,7 @@ DELETE FROM schema_migrations WHERE version = 13;
 		v12.close();
 
 		const upgraded = await GatewayDatabase.open(path);
-		expect(upgraded.schemaVersion).toBe(16);
+		expect(upgraded.schemaVersion).toBe(17);
 		expect(upgraded.laneJobJson("lanejob-v12")).toBe('{"schemaVersion":1}');
 		expect(upgraded.metaGet("rebind_budget:discord/channel/c1")).toBe('{"used":2,"lifetime":7}');
 		expect(upgraded.monitorSlotExists("monitor-v12", "2026-08-28T00:00:00.000Z")).toBe(true);
@@ -158,7 +158,7 @@ DELETE FROM schema_migrations WHERE version > 14;
 		v14.close();
 
 		const upgraded = await GatewayDatabase.open(path);
-		expect(upgraded.schemaVersion).toBe(16);
+		expect(upgraded.schemaVersion).toBe(17);
 		const rows = upgraded.monitorRows();
 		expect(rows).toHaveLength(1);
 		// The pre-existing monitor survives and reads back with no instruction.
@@ -209,8 +209,60 @@ DELETE FROM schema_migrations WHERE version > 15;
 	v15.close();
 
 	const upgraded = await GatewayDatabase.open(path);
-	expect(upgraded.schemaVersion).toBe(16);
+	expect(upgraded.schemaVersion).toBe(17);
 	upgraded.conversationModelSet("discord:c1", { preset: "gpt-heavy" }, "owner");
 	expect(upgraded.conversationModelGet("discord:c1")?.selection).toEqual({ preset: "gpt-heavy" });
 	upgraded.close();
+});
+
+test("migration 17 adds the durable batch binding and the rollback drill refuses live work before allowing a verified-zero down-marker", async () => {
+	const directory = await mkdtemp(join(tmpdir(), "gw-migrate-17-"));
+	const path = join(directory, "gateway.db");
+	const backupPath = join(directory, "gateway-before-downmark.db");
+	try {
+		const database = await GatewayDatabase.open(path);
+		expect(database.schemaVersion).toBe(17);
+		expect(database.putSessionAtEpoch("discord:dm:1", "session-v17", 0)).toBe(true);
+		database.backupInto(backupPath);
+		database.close();
+
+		const raw = new Database(path);
+		const columns = raw.query<{ name: string }, []>("PRAGMA table_info(inbound_messages)").all().map((column) => column.name);
+		for (const column of ["batch_key", "batch_role", "batch_epoch", "batch_state", "attributed_op_ref", "accepted_at", "bound_session_id"])
+			expect(columns).toContain(column);
+		const tableSql = raw.query<{ sql: string }, []>("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'inbound_messages'").get()?.sql;
+		expect(tableSql).toContain("state IN ('pending','processing','done')");
+		raw.exec(`
+INSERT INTO inbound_messages (message_id, origin_key, origin_ref_json, body, engagement_json, state, received_at)
+VALUES ('v17-batch', 'discord:dm:1', '{}', 'body', NULL, 'pending', '2026-09-01T00:00:00.000Z');
+UPDATE inbound_messages SET batch_key = 'batch', batch_role = 'trigger', batch_epoch = 0, batch_state = 'accepted', attributed_op_ref = 'gw-p-0123456789abcdef0123456789abcdef' WHERE message_id = 'v17-batch';
+`);
+		const live = raw.query<{ n: number }, []>("SELECT COUNT(*) AS n FROM inbound_messages WHERE batch_role = 'trigger' AND batch_state IN ('settled', 'accepted')").get()?.n;
+		expect(live).toBe(1);
+		expect(() => {
+			if (live !== 0) throw new Error("refusing schema down-marker while nonterminal batches remain");
+			raw.exec("DELETE FROM schema_migrations WHERE version = 17");
+		}).toThrow("refusing schema down-marker");
+		expect(raw.query<{ n: number }, []>("SELECT COUNT(*) AS n FROM schema_migrations WHERE version = 17").get()?.n).toBe(1);
+
+		raw.exec("UPDATE inbound_messages SET state = 'done', batch_state = 'done' WHERE message_id = 'v17-batch'");
+		const drained = raw.query<{ n: number }, []>("SELECT COUNT(*) AS n FROM inbound_messages WHERE batch_role = 'trigger' AND batch_state IN ('settled', 'accepted')").get()?.n;
+		expect(drained).toBe(0);
+		raw.exec("DELETE FROM schema_migrations WHERE version = 17");
+		raw.close();
+
+		const v16Guard = new Database(path, { readonly: true });
+		expect(v16Guard.query<{ version: number }, []>("SELECT MAX(version) AS version FROM schema_migrations").get()?.version).toBe(16);
+		v16Guard.close();
+		const backup = new Database(backupPath, { readonly: true });
+		expect(backup.query<{ version: number }, []>("SELECT MAX(version) AS version FROM schema_migrations").get()?.version).toBe(17);
+		backup.close();
+
+		const reopened = await GatewayDatabase.open(path);
+		expect(reopened.schemaVersion).toBe(17);
+		expect(reopened.inboundBatchRows("batch")[0]).toMatchObject({ state: "done", batch_state: "done" });
+		reopened.close();
+	} finally {
+		await rm(directory, { recursive: true, force: true });
+	}
 });

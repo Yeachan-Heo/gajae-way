@@ -19,8 +19,8 @@ export class DeliveryLedger {
 	constructor(database: GatewayDatabase) {
 		this.#database = database;
 	}
-	createPending(row: { deliveryId: string; turnId: string; originKey: string; payloadJson: string }): void {
-		this.#database.withTransaction(() =>
+	createPending(row: { deliveryId: string; turnId: string; originKey: string; payloadJson: string }): boolean {
+		return this.#database.withTransaction(() =>
 			this.#database.deliveryCreate({
 				id: row.deliveryId,
 				turnId: row.turnId,

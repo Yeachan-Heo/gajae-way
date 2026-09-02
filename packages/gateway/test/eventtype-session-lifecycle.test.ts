@@ -8,6 +8,7 @@ import { MonitorPropagator } from "../src/monitors/propagate";
 import { MonitorRegistry } from "../src/monitors/registry";
 import { GatewayDatabase } from "../src/store/db";
 import { DeliveryLedger } from "../src/store/ledger";
+import { sessionPortFromScript } from "./session-port.fake";
 
 test("event-type sessions persist until their explicit epoch is bumped", async () => {
 	const directory = await mkdtemp(join(tmpdir(), "gajaeway-eventtype-"));
@@ -21,21 +22,20 @@ test("event-type sessions persist until their explicit epoch is bumped", async (
 			burstPolicy: "serialize",
 		});
 		const calls: Array<{ origin: string; epoch: number }> = [];
-		const gjc = {
-			ensureSession: async (origin: string, epoch = 0) => {
+		const sessionPort = sessionPortFromScript({
+			bind: async (origin: string, epoch = 0) => {
 				calls.push({ origin, epoch });
 				return { sessionId: `session-${epoch}` };
 			},
-			forgetRebinds: () => {},
-			sendTurn: async (_id: string, text: string) =>
+			respond: async (_id: string, text: string) =>
 				JSON.stringify([
 					{ eventId: (JSON.parse(text.match(/\[.*\]$/s)![0]) as Array<{ eventId: string }>)[0]!.eventId, note: "ok" },
 				]),
-		};
+		});
 		const pipeline = new MonitorPropagator({
 			database,
 			registry,
-			gjc,
+			sessionPort,
 			memory: { enqueue: () => "intent", enqueueExistingId: () => {} } as never,
 			delivery: new DeliveryService(new DeliveryLedger(database)),
 			emit: () => {},
