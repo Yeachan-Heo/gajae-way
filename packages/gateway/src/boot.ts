@@ -1,4 +1,4 @@
-import { chmod, mkdir } from "node:fs/promises";
+import { chmod, mkdir, stat } from "node:fs/promises";
 import { join } from "node:path";
 import { type ConfigOverrides, loadConfig } from "./config";
 import { seedDefaultMonitors } from "./monitors/defaults";
@@ -28,10 +28,13 @@ export async function bootGateway(options: BootGatewayOptions = {}): Promise<Gat
 	const database = await GatewayDatabase.open(config.dbPath);
 	let broker: BrokerSupervisor | undefined;
 	try {
-		// A pre-cutover deployment bound its persona sessions under the operator's
-		// GJC_AGENT_DIR; supervising that store adopts them (session.resume) instead
-		// of starting an empty private one and holding every recorded binding.
-		const inheritedAgentDir = process.env.GJC_AGENT_DIR?.trim();
+		// A pre-cutover deployment bound its persona sessions under the gateway
+		// home's `gjc-agent` store (the former GjcClient default), or under an
+		// explicit GJC_AGENT_DIR. Supervising that store adopts those sessions
+		// (session.resume) instead of starting an empty private one and holding
+		// every recorded binding as ambiguous authority.
+		const homeAgentDir = join(config.home, "gjc-agent");
+		const inheritedAgentDir = (await exists(homeAgentDir)) ? homeAgentDir : process.env.GJC_AGENT_DIR?.trim();
 		broker = new BrokerSupervisor({
 			...options.broker,
 			home: config.home,
@@ -103,4 +106,12 @@ export async function bootGateway(options: BootGatewayOptions = {}): Promise<Gat
 
 function diagnostic(error: unknown): string {
 	return sanitizeDiagnostic(error instanceof Error ? error.message : String(error)) || "unknown_error";
+}
+
+async function exists(path: string): Promise<boolean> {
+	try {
+		return (await stat(path)).isDirectory();
+	} catch {
+		return false;
+	}
 }
