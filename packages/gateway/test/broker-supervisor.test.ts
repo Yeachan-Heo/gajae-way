@@ -378,3 +378,35 @@ test("boot adopts GJC_AGENT_DIR from the environment as the supervised agent dir
 		else process.env.GJC_AGENT_DIR = previous;
 	}
 });
+
+test("boot prefers the home gjc-agent store (former per-turn default) over GJC_AGENT_DIR when it exists", async () => {
+	const home = await temporaryHome("gajaeway-broker-adopt-home-");
+	const homeStore = join(home, "gjc-agent");
+	await mkdir(homeStore, { recursive: true });
+	const previous = process.env.GJC_AGENT_DIR;
+	process.env.GJC_AGENT_DIR = join(home, "elsewhere");
+	const commands: string[][] = [];
+	try {
+		const server = await bootGateway({
+			home,
+			broker: {
+				command: async (args) => {
+					commands.push([...args]);
+					return args[0] === "--version" ? { exitCode: 0, stdout: `gjc/${MIN_GJC_VERSION}\n`, stderr: "" } : HEALTHY;
+				},
+				healthProbe: async () => true,
+				healthIntervalMs: 60_000,
+				log: () => {},
+			},
+		});
+		try {
+			expect(commands.some((args) => args.includes(homeStore))).toBe(true);
+			expect(commands.some((args) => args.includes(join(home, "elsewhere")))).toBe(false);
+		} finally {
+			await server.stop("test shutdown");
+		}
+	} finally {
+		if (previous === undefined) delete process.env.GJC_AGENT_DIR;
+		else process.env.GJC_AGENT_DIR = previous;
+	}
+});
