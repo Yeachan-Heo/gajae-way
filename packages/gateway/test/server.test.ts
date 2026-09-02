@@ -478,6 +478,52 @@ test("a settled burst without platform message ids still carries every fragment 
 	client.close();
 });
 
+test("a backlog older than maxInboundAgeMs is expired on boot recovery instead of answered late", async () => {
+	directory = await mkdtemp(join(tmpdir(), "gajaeway-server-"));
+	const config: GatewayConfig = {
+		schemaVersion: 1,
+		home: directory,
+		configPath: join(directory, "config.json"),
+		socketPath: join(directory, "gateway.sock"),
+		dbPath: join(directory, "gateway.db"),
+		logVerbosity: "info",
+		dmPolicy: "open" as const,
+		settleWindowMs: 0,
+		maxInboundAgeMs: 60_000,
+	};
+	const database = await GatewayDatabase.open(config.dbPath);
+	const origin = { platform: "discord", kind: "dm", conversationId: "d-stale", peerId: "owner" };
+	const key = "discord/dm/d-stale/peer=owner";
+	const old = new Date(Date.now() - 30 * 60_000).toISOString();
+	// Left behind by an outage: pending for 30 minutes before this boot.
+	expect(database.inboundEnqueue({ messageId: "stale-1", originKey: key, originRefJson: JSON.stringify(origin), body: "from before the outage", receivedAt: old })).toBe(true);
+	const turns: string[] = [];
+	const sessionPort = sessionPortFromResponder({
+		respond: async (_session, text) => {
+			turns.push(text);
+			return "ok";
+		},
+	});
+	const logs: string[] = [];
+	const original = console.error;
+	console.error = (...args: unknown[]) => logs.push(args.map(String).join(" "));
+	try {
+		server = await startUnixServer({ config, database, sessionPort, onStop: () => database.close() });
+		const client = await connect(config.socketPath);
+		client.send({ v: "0.1", type: "hello", payload: { supportedVersions: ["0.1"] } });
+		await waitFor(client.frames, 1);
+		client.send({ v: "0.1", type: "request", id: "f", verb: "chat.send", params: { origin, text: "fresh after the outage", engagement: { mentioned: false, group: false, authorId: "owner" } } });
+		for (let attempt = 0; attempt < 400 && turns.length === 0; attempt++) await Bun.sleep(10);
+		expect(turns).toHaveLength(1);
+		expect(turns[0]).toContain("fresh after the outage");
+		expect(turns[0]).not.toContain("from before the outage");
+		expect(logs.some((line) => line.startsWith(`inbound_expired origin=${key} count=1`))).toBe(true);
+		client.close();
+	} finally {
+		console.error = original;
+	}
+});
+
 test("group turns carry silence guidance: listeners are told to default to [SILENT]", async () => {
 	directory = await mkdtemp(join(tmpdir(), "gajaeway-server-"));
 	const config: GatewayConfig = {

@@ -21,6 +21,7 @@ export const DEFAULT_SETTLE_WINDOW_MS = 2_000;
 export const DEFAULT_STALL_TIMEOUT_MS = 120_000;
 const RETIRED_REATTACH_DELAY_MS = 25;
 const RETIRED_REATTACH_MAX_ATTEMPTS = 3;
+const DEFAULT_MAX_INBOUND_AGE_MS = 10 * 60_000;
 /**
  * Grace before a decidable-terminal status may complete a batch whose tail has
  * not produced terminal evidence. One bounded hold keeps the tail the live
@@ -84,6 +85,8 @@ export interface PersonaSessionManagerOptions {
 	readonly settleWindowMs?: number;
 	/** Resolves the live global/per-channel settle window from the first row. */
 	readonly settleWindowFor?: (row: InboundMessageRow) => number;
+	/** Pending rows older than this are expired instead of answered (0 disables). Default 10 minutes. */
+	readonly maxInboundAgeMs?: number;
 	readonly stallTimeoutMs?: number;
 	readonly brokerGeneration?: () => number;
 	readonly now?: () => number;
@@ -118,6 +121,7 @@ export class PersonaSessionManager {
 	readonly #settleWindowMs: number;
 	readonly #settleWindowFor: (row: InboundMessageRow) => number;
 	#stallTimeoutMs: number;
+	#maxInboundAgeMs: number;
 	readonly #brokerGeneration: () => number;
 	readonly #now: () => number;
 	readonly #setTimeout: (work: () => void, delayMs: number) => unknown;
@@ -137,6 +141,7 @@ export class PersonaSessionManager {
 		this.#repo = options.repo;
 		this.#settleWindowMs = nonNegativeInteger(options.settleWindowMs, DEFAULT_SETTLE_WINDOW_MS, "settleWindowMs");
 		this.#stallTimeoutMs = positiveInteger(options.stallTimeoutMs, DEFAULT_STALL_TIMEOUT_MS, "stallTimeoutMs");
+		this.#maxInboundAgeMs = nonNegativeInteger(options.maxInboundAgeMs, DEFAULT_MAX_INBOUND_AGE_MS, "maxInboundAgeMs");
 		this.#settleWindowFor = options.settleWindowFor ?? (() => this.#settleWindowMs);
 		this.#brokerGeneration = options.brokerGeneration ?? (() => 0);
 		this.#now = options.now ?? (() => Date.now());
@@ -173,6 +178,26 @@ export class PersonaSessionManager {
 		return Promise.all(actors.map((actor) => actor.enqueue(async () => await actor.tick()))).then(() => undefined);
 	}
 
+	get maxInboundAgeMs(): number {
+		return this.#maxInboundAgeMs;
+	}
+
+	setMaxInboundAgeMs(ageMs: number | undefined): void {
+		this.#maxInboundAgeMs = nonNegativeInteger(ageMs, DEFAULT_MAX_INBOUND_AGE_MS, "maxInboundAgeMs");
+	}
+
+	/** Expires unbatched pending rows older than the stale floor; returns the expired count. */
+	expireStale(originKey: string): number {
+		if (this.#maxInboundAgeMs === 0) return 0;
+		const floorAt = new Date(this.#now() - this.#maxInboundAgeMs).toISOString();
+		const expired = this.#database.inboundExpireStale(originKey, floorAt);
+		if (expired.length > 0) {
+			this.#log(`inbound_expired origin=${originKey} count=${expired.length} floor=${floorAt} ids=${expired.slice(0, 5).join(",")}${expired.length > 5 ? ",…" : ""}`);
+			void this.#onInboundDiscard?.(expired);
+		}
+		return expired.length;
+	}
+
 	setStallTimeoutMs(timeoutMs: number | undefined): void {
 		this.#stallTimeoutMs = positiveInteger(timeoutMs, DEFAULT_STALL_TIMEOUT_MS, "stallTimeoutMs");
 		this.#port.setStallTimeoutMs(this.#stallTimeoutMs);
@@ -202,6 +227,9 @@ export class PersonaSessionManager {
 		return Promise.all(
 			this.#database.inboundNonterminalOrigins().map((originKey) =>
 				this.#actor(originKey).enqueue(async () => {
+					// Outage backlog: anything older than the stale floor is expired
+					// before recovery so it is never answered late.
+					this.expireStale(originKey);
 					await this.#actor(originKey).recover();
 					await this.#actor(originKey).reconcile();
 				}),
@@ -464,6 +492,7 @@ class OriginActor {
 				// Settled but never bound/sent: no operation exists anywhere, so the
 				// rows go back to pending and the next settle binds (exactly-once-safe).
 				const attempt = this.#manager.database.inboundBatchRequeueFreshTurn(batch.batchKey);
+			this.#manager.expireStale(this.originKey);
 				this.#manager.log(
 					`recovery_requeue_unbound origin=${this.originKey} epoch=${batch.epoch} opRef=${batch.opRef} attempt=${attempt}`,
 				);
@@ -501,6 +530,7 @@ class OriginActor {
 		const releasable = batch.state === "settled" || (batch.state === "accepted" && sessionDead);
 		if (releasable && !retired && status.status.status === "unknown" && disownedByBroker) {
 			const attempt = this.#manager.database.inboundBatchRequeueFreshTurn(batch.batchKey);
+			this.#manager.expireStale(this.originKey);
 			// The binding itself is unusable: recreate through the existing rebind
 			// primitive (epoch bump) so the next settle binds a fresh live session.
 			const nextEpoch = this.#manager.database.rebindEpoch(this.originKey);
@@ -738,6 +768,7 @@ class OriginActor {
 	async #settle(): Promise<void> {
 		if (this.#state !== "settling" || this.#deadline === undefined) return;
 		this.#clearTimer();
+		this.#manager.expireStale(this.originKey);
 		const first = this.#manager.database.inboundPendingOldest(this.originKey);
 		if (!first) {
 			this.#state = "idle";
@@ -771,6 +802,7 @@ class OriginActor {
 			// Nothing was sent: release the rows and retry the settle with backoff
 			// instead of leaving a settled-but-unbound batch for the recovery sweep.
 			const attempt = this.#manager.database.inboundBatchRequeueFreshTurn(batchKey);
+			this.#manager.expireStale(this.originKey);
 			this.#state = "idle";
 			this.#deadline = undefined;
 			this.#manager.log(

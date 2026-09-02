@@ -209,3 +209,33 @@ test("live per-channel settle resolution is evaluated from the durable first row
 	await eventually(() => rowsSeen.length === 1, "live settle resolver did not dispatch immediately");
 	expect(port.sends).toHaveLength(1);
 });
+
+test("pending rows older than maxInboundAgeMs are expired instead of answered (stale floor)", async () => {
+	const port = new ScriptedSessionPort({ onSend: (input, scripted) => scripted.complete(input.opRef, "reply") });
+	const sent: string[] = [];
+	const logs: string[] = [];
+	home = await mkdtemp(join(tmpdir(), "gajaeway-persona-session-"));
+	database = await GatewayDatabase.open(join(home, "gateway.db"));
+	manager = new PersonaSessionManager({
+		database,
+		port,
+		instanceId: "instance-test",
+		repo: join(home, "workspace"),
+		settleWindowMs: 0,
+		maxInboundAgeMs: 60_000,
+		log: (line) => logs.push(line),
+		onTurnStart: ({ rows }) => {
+			sent.push(rows.map((row) => row.body).join("|"));
+			return { text: rows.map((row) => row.body).join("\n") };
+		},
+	});
+	const old = new Date(Date.now() - 5 * 60_000).toISOString();
+	expect(database.inboundEnqueue({ messageId: "old-1", originKey: KEY, originRefJson: JSON.stringify(ORIGIN), body: "stale question", receivedAt: old })).toBe(true);
+	expect(database.inboundEnqueue({ messageId: "old-2", originKey: KEY, originRefJson: JSON.stringify(ORIGIN), body: "stale follow-up", receivedAt: old })).toBe(true);
+	enqueue("fresh-1", "fresh question");
+	await manager.notifyInbound(KEY);
+	await eventually(() => sent.length === 1, "fresh row was not answered");
+	expect(sent).toEqual(["fresh question"]);
+	expect(logs.some((line) => line.startsWith(`inbound_expired origin=${KEY} count=2`))).toBe(true);
+	expect(database.inboundPendingCount(KEY)).toBe(0);
+});
