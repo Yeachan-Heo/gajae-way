@@ -1588,10 +1588,15 @@ async function runInboundTurn(
 			message = reactionReply.body;
 			if (!message) return;
 		}
+		// Control tokens are internal protocol, never user-visible. Models routinely
+		// wrap them in a "reasoning" preamble ("...nothing to add.\n\n[SILENT]"), so a
+		// part is judged by whether it CONTAINS the token, not whether it equals it:
+		// any part carrying a silence token is dropped whole, and [REPLY:id] is
+		// honoured wherever it appears and always stripped from the delivered text.
 		const parts = message
 			.split(/\n\s*\[BREAK\]\s*\n?/)
 			.map((part) => part.trim())
-			.filter((part) => part.length > 0 && !isSilenceToken(part))
+			.filter((part) => part.length > 0 && !isSilenceToken(part) && !containsSilenceToken(part))
 			.slice(0, 5);
 		// Which deliveries actually happen is decided BEFORE the loop, because the
 		// audio has to ride the last one. Deciding inside the loop cannot: a part
@@ -1602,8 +1607,8 @@ async function runInboundTurn(
 			if (planned.length >= maxTurnParts) break;
 			// Reply-threading: a part may open with [REPLY:<platform message id>] to
 			// answer a specific message; mentions are plain <@author id> in the text.
-			const replyMatch = part.match(/^\[REPLY:([^\]\s]+)\]\s*/);
-			const body = replyMatch ? part.slice(replyMatch[0].length).trim() : part;
+			const replyMatch = part.match(/\[REPLY:([^\]\s]+)\]/);
+			const body = (replyMatch ? part.replace(/\s*\[REPLY:[^\]\s]+\]\s*/g, " ") : part).replace(/\s*\[BREAK\]\s*/g, " ").trim();
 			if (!body) continue;
 			planned.push({ body, ...(replyMatch?.[1] ? { replyTo: replyMatch[1] } : {}) });
 		}
@@ -1918,6 +1923,11 @@ function writeError(connection: Connection, error: unknown, id?: string): void {
  * surfaces a populated allowlist gates them, or any room member could wipe or
  * repoint the persona's conversation state.
  */
+/** True when a part carries a silence token anywhere (a leaked reasoning preamble around it is still silence). */
+function containsSilenceToken(part: string): boolean {
+	return /\[(SILENT|silent)\]/.test(part);
+}
+
 function commandAuthorised(
 	origin: { readonly platform: string; readonly kind: string },
 	allowlist: readonly string[] | undefined,
