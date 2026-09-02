@@ -386,6 +386,7 @@ class ManagedTailHandle implements TailHandle {
 	}
 
 	async markAccepted(opRef: string): Promise<void> {
+		this.#deliveredIds.clear();
 		if (this.#closed || this.#accepted) return;
 		this.#accepted = true;
 		this.#acceptedOpRef = opRef;
@@ -527,7 +528,11 @@ class ManagedTailHandle implements TailHandle {
 	async #deliver(frame: TailFrame): Promise<void> {
 		// Finalized answers are also keyed by messageRef so a backfill transcript row
 		// and the live turn_stream frame for the same answer never both deliver.
-		const key = frame.eventId ?? (frame.assistantText ? `text:${Bun.hash(frame.assistantText)}` : undefined);
+		// gjc 0.16 synthesizes `generation:seq` ids that restart per revision, so
+		// every turn's first answer is "1:1": never a dedupe key. Only a real id
+		// or the answer text counts, and only within the current accepted turn.
+		const synthetic = frame.eventId !== undefined && /^\d+:\d+$/.test(frame.eventId);
+		const key = frame.eventId && !synthetic ? frame.eventId : frame.assistantText ? `text:${Bun.hash(frame.assistantText)}` : undefined;
 		if (key) {
 			if (this.#deliveredIds.has(key)) {
 				this.#input.onDiagnostic?.(`tail_frame_duplicate session=${this.sessionId} event=${key}`);
