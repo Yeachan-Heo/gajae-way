@@ -5,6 +5,9 @@
 	"bin": {
 		"gajaeway": "./src/main.ts"
 	},
+	"exports": {
+		".": "./src/index.ts"
+	},
 	"dependencies": {
 		"@gajaeway/sdk": "workspace:*",
 		"@gajaeway/protocol": "workspace:*"

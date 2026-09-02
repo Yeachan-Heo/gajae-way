@@ -53,6 +53,20 @@
         "@gajaeway/protocol": "workspace:*",
       },
     },
+    "packages/gajaeway": {
+      "name": "@gajaeway/app",
+      "bin": {
+        "gajaeway": "./src/main.ts",
+      },
+      "dependencies": {
+        "@gajaeway/adapter-discord": "workspace:*",
+        "@gajaeway/adapter-telegram": "workspace:*",
+        "@gajaeway/admin": "workspace:*",
+        "@gajaeway/cli": "workspace:*",
+        "@gajaeway/gateway": "workspace:*",
+        "@gajaeway/protocol": "workspace:*",
+      },
+    },
     "packages/gateway": {
       "name": "@gajaeway/gateway",
       "version": "0.1.0",
@@ -116,6 +130,8 @@
     "@gajaeway/adapter-telegram": ["@gajaeway/adapter-telegram@workspace:packages/adapter-telegram"],
 
     "@gajaeway/admin": ["@gajaeway/admin@workspace:packages/admin"],
+
+    "@gajaeway/app": ["@gajaeway/app@workspace:packages/gajaeway"],
 
     "@gajaeway/cli": ["@gajaeway/cli@workspace:packages/cli"],
 

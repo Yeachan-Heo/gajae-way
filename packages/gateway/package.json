@@ -6,6 +6,10 @@
 	"bin": {
 		"gajaeway-gateway": "./src/main.ts"
 	},
+	"exports": {
+		".": "./src/index.ts",
+		"./test-broker": "./src/orchestrator/test-broker.ts"
+	},
 	"dependencies": {
 		"@gajaeway/protocol": "workspace:*",
 		"@gajaeway/subsession": "workspace:*"

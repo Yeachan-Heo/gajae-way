@@ -1,0 +1,140 @@
+import { afterEach, expect, test } from "bun:test";
+import { chmod, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { DaemonLock, DaemonLockRefusalError, type PidLiveness } from "../src/lock";
+
+const homes: string[] = [];
+afterEach(async () => {
+	await Promise.all(
+		homes.splice(0).map(async (home) => {
+			await chmod(join(home, "gajaeway.pid"), 0o600).catch(() => {});
+			await rm(home, { recursive: true, force: true });
+		}),
+	);
+});
+
+async function home(): Promise<string> {
+	const path = await mkdtemp(join(tmpdir(), "gajaeway-daemon-lock-"));
+	homes.push(path);
+	return path;
+}
+
+function ports(pid: number, liveness: (holder: number) => PidLiveness, logs: string[] = []) {
+	return { pid, liveness, log: (line: string) => logs.push(line) };
+}
+
+test("a fresh daemon lock claims gajaeway.pid and releases it", async () => {
+	const dir = await home();
+	const lock = await DaemonLock.acquire(
+		dir,
+		ports(1001, () => "dead"),
+	);
+	expect(await Bun.file(lock.path).text()).toBe("1001\n");
+	await lock.release();
+	expect(await Bun.file(lock.path).exists()).toBe(false);
+});
+
+test("a live holder and an EPERM-equivalent liveness result both refuse", async () => {
+	const dir = await home();
+	const path = join(dir, "gajaeway.pid");
+	await writeFile(path, "2002\n");
+	for (const liveness of ["alive", "alive"] as const) {
+		await expect(
+			DaemonLock.acquire(
+				dir,
+				ports(1001, () => liveness),
+			),
+		).rejects.toMatchObject({
+			name: "DaemonLockRefusalError",
+			exitCode: 2,
+		});
+	}
+});
+
+test("a lock naming this process refuses rather than unlinking itself", async () => {
+	const dir = await home();
+	await writeFile(join(dir, "gajaeway.pid"), `${process.pid}\n`);
+	await expect(
+		DaemonLock.acquire(
+			dir,
+			ports(process.pid, () => "dead"),
+		),
+	).rejects.toThrow("lock names this process; a previous run of this pid left it behind");
+});
+
+test("malformed and unreadable lock files fail closed", async () => {
+	const malformedHome = await home();
+	await writeFile(join(malformedHome, "gajaeway.pid"), "not-a-pid\n");
+	await expect(
+		DaemonLock.acquire(
+			malformedHome,
+			ports(1001, () => "dead"),
+		),
+	).rejects.toThrow("is unreadable or malformed");
+
+	const unreadableHome = await home();
+	const unreadable = join(unreadableHome, "gajaeway.pid");
+	await writeFile(unreadable, "2002\n");
+	await chmod(unreadable, 0o000);
+	await expect(
+		DaemonLock.acquire(
+			unreadableHome,
+			ports(1001, () => "dead"),
+		),
+	).rejects.toThrow("is unreadable or malformed");
+});
+
+test("only an ESRCH-equivalent dead PID is reclaimed and logged", async () => {
+	const dir = await home();
+	const path = join(dir, "gajaeway.pid");
+	const logs: string[] = [];
+	await writeFile(path, "2002\n");
+	const lock = await DaemonLock.acquire(
+		dir,
+		ports(1001, () => "dead", logs),
+	);
+	expect(await readFile(path, "utf8")).toBe("1001\n");
+	expect(logs).toEqual(["daemon_lock_reclaimed stale_pid=2002"]);
+	await lock.release();
+});
+
+test("an unknown liveness probe never reclaims a valid lock", async () => {
+	const dir = await home();
+	await writeFile(join(dir, "gajaeway.pid"), "2002\n");
+	await expect(
+		DaemonLock.acquire(
+			dir,
+			ports(1001, () => "unknown"),
+		),
+	).rejects.toThrow("cannot prove whether pid 2002 is running");
+});
+
+test("a reclaim race lets one owner win and refuses the loser", async () => {
+	const dir = await home();
+	await writeFile(join(dir, "gajaeway.pid"), "9999\n");
+	const liveness = (pid: number): PidLiveness => (pid === 9999 ? "dead" : "alive");
+	const results = await Promise.allSettled([
+		DaemonLock.acquire(dir, ports(1001, liveness)),
+		DaemonLock.acquire(dir, ports(1002, liveness)),
+	]);
+	const winners = results.filter(
+		(result): result is PromiseFulfilledResult<DaemonLock> => result.status === "fulfilled",
+	);
+	const losers = results.filter((result): result is PromiseRejectedResult => result.status === "rejected");
+	expect(winners).toHaveLength(1);
+	expect(losers).toHaveLength(1);
+	expect(losers[0]?.reason).toBeInstanceOf(DaemonLockRefusalError);
+	await winners[0]?.value.release();
+});
+
+test("release leaves a replaced lock untouched", async () => {
+	const dir = await home();
+	const lock = await DaemonLock.acquire(
+		dir,
+		ports(1001, () => "dead"),
+	);
+	await writeFile(lock.path, "2002\n");
+	await lock.release();
+	expect(await Bun.file(lock.path).text()).toBe("2002\n");
+});
