@@ -60,9 +60,9 @@ The admission log occurs before propagation. Systematic state is held in the gat
 
 ## Session context: native compaction and the safety net
 
-Monitor authoring shares one gjc session per event-type origin, and every turn is replayed by `gjc --resume`, so a monitor session accumulates context fast: a 10-minute monitor authors about 144 turns a day.
+Monitor authoring shares one persistent broker-hosted `gjc` session per event-type origin, so a monitor session accumulates context fast: a 10-minute monitor authors about 144 turns a day.
 
-Keeping that bounded is gjc's job, not the gateway's. The non-interactive `-p --mode json` path goes through `AgentSession.prompt()` exactly like the interactive one, so native auto-compaction applies to authoring turns, and the GJC SDK also exposes a `compaction.run` control action for an explicit request. The production incident behind issue #68 was not missing compaction but late compaction: the session overflowed with zero entries left, the authoring turn came back empty, and dispatch settled as `internal_error`. The host now runs gjc 0.15.5 with adaptive compaction (base 70%, floor 45%), which is the first line of defence.
+Keeping that bounded is `gjc`'s job, not the gateway's. Persistent SDK sessions apply native auto-compaction, and the GJC SDK also exposes a `compaction.run` control action for an explicit request. The production incident behind issue #68 was not missing compaction but late compaction: the session overflowed with zero entries left, the authoring turn came back empty, and dispatch settled as `internal_error`. The host now runs gjc 0.15.6 with adaptive compaction (base 70%, floor 45%), which is the first line of defence.
 
 The gateway's job is the second line: detecting that native compaction silently stopped working. A monitor that keeps answering is **never** rolled, whatever its turn count — the count is recorded and reported, and is purely observational. Instead the gateway classifies each authoring failure onto exactly three axes:
 
@@ -90,7 +90,11 @@ A roll bumps the session epoch (fresh gjc session and idempotency key) and injec
 
 The roll happens after the per-origin turn chain is taken and before the session is bound, so a batch can neither be stranded nor authored twice across the boundary; leases and fencing are untouched. All of it lives in one place (`packages/gateway/src/monitors/compaction.ts` plus the single `#rollSessionIfArmed` call site).
 
-The chat path keeps its own, separate rotation at 50 turns; monitor sessions have no turn ceiling at all.
+Persona sessions likewise do not rotate on a turn count. Native SDK compaction is observed, while `/new` remains the explicit epoch boundary.
+
+## Persistent-session operator signals
+
+Monitor authoring uses the same broker-bound `SessionPort` and its request/response convenience. The daemon emits grep-stable signals: `broker_restart generation=… backoffMs=…` for a supervised lifecycle replacement, `compaction_event sessionId=… originKey=…` when native compaction is observed, and `stall_alert originKey=… sessionId=… silentMs=…` for an alert-only silent running operation. A held retired batch is logged as `retired_hold originKey=… batchKey=…`; do not resend it manually. Status and tail evidence decide terminal state.
 
 ## Burst policies
 

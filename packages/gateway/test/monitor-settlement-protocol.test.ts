@@ -3,9 +3,9 @@ import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { GatewayConfig } from "../src/config";
-import type { GjcPort } from "../src/orchestrator/gjc-client";
 import { type GatewayServer, startUnixServer } from "../src/server/server";
 import { GatewayDatabase } from "../src/store/db";
+import { sessionPortFromResponder } from "./session-port.fake";
 
 let directory = "";
 let server: GatewayServer | undefined;
@@ -40,12 +40,8 @@ async function startWithMonitor(): Promise<{
 	};
 	const db = await GatewayDatabase.open(config.dbPath);
 	database = db;
-	const gjc: GjcPort = {
-		forgetRebinds: () => {},
-		ensureSession: async () => ({ sessionId: "mock-session" }),
-		sendTurn: async () => "mock reply",
-	};
-	server = await startUnixServer({ config, database: db, gjc, onStop: () => db.close() });
+	const sessionPort = sessionPortFromResponder({ respond: async () => "mock reply" });
+	server = await startUnixServer({ config, database: db, sessionPort, onStop: () => db.close() });
 	const client = await connect(config.socketPath);
 	// Seed a monitor batch with two authored events directly through the store:
 	// the handler wiring under test is delivery settlement, not authoring.

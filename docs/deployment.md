@@ -20,7 +20,7 @@ dist/gajaeway
 
 Each binary requires its verb: `gajaeway-gateway daemon`, `gajaeway-admin serve`, and a subcommand for `gajaeway`. Invoked with no arguments they print usage on stderr and exit 2, so probing one never blocks. `gajaeway-discord` and `gajaeway-telegram` run in the foreground with no arguments; `gajaeway-discord --help` and `--version` answer without connecting, and a second `gajaeway-discord` refuses to boot while `$GAJAEWAY_HOME/adapter-discord.pid` names a live process.
 
-A production host does not need a source checkout, `node_modules`, or Bun to run those binaries. It **does** need the external `gjc` executable on `PATH`: the gateway spawns `gjc` to create each session and for every turn.
+A production host does not need a source checkout, `node_modules`, or Bun to run those binaries. It **does** need the external `gjc` executable on `PATH`: gateway startup owns one private gjc agent directory for the instance, and gjc's own daemon for that directory hosts the persistent sessions (auto-started on first use; requires gjc >= 0.15.6, verified on 0.16.0). Model-provider credentials are inherited from the gateway process environment; do not place them in the broker agent directory.
 
 ## Home and configuration
 
@@ -36,6 +36,7 @@ $GAJAEWAY_HOME/
   gateway.db
   workspace/                 # SOUL.md, AGENTS.md, USER.md; gjc working directory
   memory/                    # Markdown files and private Git repository
+  broker/<instance-id>/agent/ # private broker-owned GJC state; not a credential store
   memory-receipts.jsonl
   secrets/
     discord-token
@@ -57,11 +58,13 @@ Use `config.json` schema version 1. Every configured secret is a credential-file
   "channels": { "discord-channel-id": { "engagement": "open" } },
   "webhook": { "bind": "127.0.0.1", "port": 8080, "exposeNonLoopback": false },
   "watcherRoots": ["/Users/me/automations"],
-  "scriptRoot": "/Users/me/automations"
+  "scriptRoot": "/Users/me/automations",
+  "settleWindowMs": 2000,
+  "stallTimeoutMs": 120000
 }
 ```
 
-`socketPath`, `dbPath`, `logVerbosity`, credentials, channels, webhook, watcher roots, and script root are optional. Socket and database paths default inside the home directory, and log verbosity defaults to `info`.
+`socketPath`, `dbPath`, `logVerbosity`, credentials, channels, webhook, watcher roots, script root, `settleWindowMs`, and `stallTimeoutMs` are optional. Socket and database paths default inside the home directory, `settleWindowMs` defaults to 2000 ms, `stallTimeoutMs` defaults to 120000 ms, and log verbosity defaults to `info`. `turnTimeoutMs` is rejected because persistent-session liveness is alert-only.
 
 ## Reloading configuration without a restart
 
@@ -69,8 +72,8 @@ A running gateway re-reads `config.json` on `SIGHUP` (`kill -HUP <pid>`) or on t
 
 The reload is fail-safe and reports exactly what it did:
 
-- `changed` — fields applied live. Only `mentionAllowlist`, `channels`, and `debounceMs` are re-read at runtime; a change to one of these takes effect on the next turn.
-- `restartRequired` — fields you edited that are bound to a startup resource (`socketPath`, `dbPath`, `turnTimeoutMs`, `model`, `credentials`, `webhook`, `watcherRoots`, `scriptRoot`, `ownerTarget`, `monitorContextFailureRollThreshold`). They are reported and deliberately NOT applied; restart to pick them up.
+- `changed` — fields applied live. `mentionAllowlist`, `channels`, `settleWindowMs`, and `stallTimeoutMs` are re-read at runtime; a change takes effect on the next actor event.
+- `restartRequired` — fields you edited that are bound to a startup resource (`socketPath`, `dbPath`, `model`, `credentials`, `webhook`, `watcherRoots`, `scriptRoot`, `ownerTarget`, `monitorContextFailureRollThreshold`). They are reported and deliberately NOT applied; restart to pick them up.
 - `ignored` — fields you edited that no code reads at all. `logVerbosity` is currently parsed but unconsumed, so editing it has no effect and no restart would give it one.
 - On a parse or validation error, or when `config.json` is missing or unreadable, the reload fails, keeps the previous configuration untouched, and returns a diagnostic. A missing file never publishes defaults over live policy, because that would drop the mention allowlist and open a mention-gated room.
 

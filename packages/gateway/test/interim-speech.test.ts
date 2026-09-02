@@ -3,11 +3,11 @@ import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { GatewayConfig } from "../src/config";
-import type { GjcPort, TurnOptions } from "../src/orchestrator/gjc-client";
-import { GENERIC_AGENT_SYSTEM_PROMPT } from "../src/orchestrator/gjc-client";
+import type { SessionPort } from "../src/orchestrator/session-port";
 import { InterimSpeechGate, isNearDuplicate, isProceduralNarration } from "../src/server/interim-speech";
 import { type GatewayServer, startUnixServer } from "../src/server/server";
 import { GatewayDatabase } from "../src/store/db";
+import { ScriptedSessionPort } from "./session-port.fake";
 
 // ---------------------------------------------------------------------------
 // Pure content gate
@@ -97,10 +97,6 @@ test("suppressed narration does not spend the turn budget", () => {
 	expect(gate.admit("원인은 auth 토큰 갱신 실패예요", 0).deliver).toBe(true);
 });
 
-test("the base system prompt carries the mid-work speech rule", () => {
-	// The gate is the backstop; this instruction is the primary mechanism.
-	expect(GENERIC_AGENT_SYSTEM_PROMPT).toContain("Never narrate your process");
-});
 
 // ---------------------------------------------------------------------------
 // Wired through the server
@@ -132,7 +128,11 @@ async function connect(socketPath: string): Promise<{ send(value: unknown): void
 	return { send: (value) => socket.write(`${JSON.stringify(value)}\n`), frames, close: () => socket.end() };
 }
 
-async function startGateway(gjc: GjcPort, interimSpeech?: { maxPerTurn?: number; minGapMs?: number }) {
+async function startGateway(
+	sessionPort: SessionPort,
+	interimSpeech?: { maxPerTurn?: number; minGapMs?: number },
+	progress?: { firstAfterMs?: number; intervalMs?: number },
+) {
 	directory = await mkdtemp(join(tmpdir(), "gajaeway-interim-"));
 	const config: GatewayConfig = {
 		schemaVersion: 1,
@@ -142,14 +142,16 @@ async function startGateway(gjc: GjcPort, interimSpeech?: { maxPerTurn?: number;
 		dbPath: join(directory, "gateway.db"),
 		logVerbosity: "info",
 		channels: { "chan-1": { engagement: "open" } },
+		settleWindowMs: 0,
 	};
 	const database = await GatewayDatabase.open(config.dbPath);
 	server = await startUnixServer({
 		config,
 		database,
-		gjc,
+		sessionPort,
 		onStop: () => database.close(),
 		...(interimSpeech ? { interimSpeech } : {}),
+		...(progress ? { progress } : {}),
 	});
 	const client = await connect(config.socketPath);
 	client.send({ v: "0.1", type: "hello", payload: { supportedVersions: ["0.1"] } });
@@ -184,108 +186,68 @@ async function waitForMessages(client: { frames: any[] }, count: number): Promis
 	return messages(client);
 }
 
+async function waitForSend(port: ScriptedSessionPort) {
+	for (let attempt = 0; attempt < 300 && port.sends.length === 0; attempt++) await Bun.sleep(5);
+	expect(port.sends).toHaveLength(1);
+	return port.sends[0]!;
+}
+
 test("a turn that narrates four steps delivers only its final answer", async () => {
-	// The live #71 shape: 4 procedural fragments inside one turn.
-	const gjc: GjcPort = {
-		ensureSession: async () => ({ sessionId: "mock-session" }),
-		sendTurn: async (_session, _text, _preamble, _progress, options?: TurnOptions) => {
-			options?.onAssistantText?.("채널이랑 직전 지시를 더 볼게요");
-			options?.onAssistantText?.("관련 파일부터 보겠습니다");
-			options?.onAssistantText?.("DB에서 해당 행을 조회해볼게요");
-			options?.onAssistantText?.("로그를 확인해볼게요");
-			options?.onAssistantText?.("원인은 auth 토큰 갱신 실패였어요");
-			return "원인은 auth 토큰 갱신 실패였어요";
-		},
-		forgetRebinds: () => {},
-	};
-	const client = await startGateway(gjc);
+	const port = new ScriptedSessionPort();
+	const client = await startGateway(port);
 	sendChannelMessage(client, "n1", "무슨 일이야?");
+	const send = await waitForSend(port);
+	port.emitAssistant(send.sessionId, "채널이랑 직전 지시를 더 볼게요");
+	port.emitAssistant(send.sessionId, "관련 파일부터 보겠습니다");
+	port.emitAssistant(send.sessionId, "DB에서 해당 행을 조회해볼게요");
+	port.emitAssistant(send.sessionId, "로그를 확인해볼게요");
+	port.emitTool(send.sessionId);
+	port.complete(send.opRef, "원인은 auth 토큰 갱신 실패였어요");
 	const delivered = await waitForMessages(client, 1);
-	await Bun.sleep(80);
-	expect(messages(client).length).toBe(1);
+	expect(messages(client)).toHaveLength(1);
 	expect(delivered[0].payload.text).toContain("auth 토큰 갱신 실패");
 });
 
 test("a real mid-work finding is delivered while the turn is still running", async () => {
-	let releaseTurn: (() => void) | undefined;
-	const gjc: GjcPort = {
-		ensureSession: async () => ({ sessionId: "mock-session" }),
-		sendTurn: async (_session, _text, _preamble, _progress, options?: TurnOptions) => {
-			options?.onAssistantText?.("어 이거 500이 3분마다 찍히고 있는데");
-			await new Promise<void>((resolve) => {
-				releaseTurn = resolve;
-			});
-			options?.onAssistantText?.("원인은 auth 토큰 갱신 실패");
-			return "원인은 auth 토큰 갱신 실패";
-		},
-		forgetRebinds: () => {},
-	};
-	// minGapMs 0 so the final answer is not held back by pacing in this test.
-	const client = await startGateway(gjc, { minGapMs: 0 });
+	const port = new ScriptedSessionPort();
+	const client = await startGateway(port, { minGapMs: 0 });
 	sendChannelMessage(client, "f1", "무슨 일이야?");
+	const send = await waitForSend(port);
+	port.emitTool(send.sessionId);
+	port.emitAssistant(send.sessionId, "어 이거 500이 3분마다 찍히고 있는데");
 	const midTurn = await waitForMessages(client, 1);
-	expect(midTurn.length).toBe(1);
+	expect(midTurn).toHaveLength(1);
 	expect(midTurn[0].payload.text).toContain("3분마다");
-	releaseTurn?.();
+	port.complete(send.opRef, "원인은 auth 토큰 갱신 실패");
 	const all = await waitForMessages(client, 2);
-	expect(all.length).toBe(2);
+	expect(all).toHaveLength(2);
 	expect(all[1].payload.text).toContain("auth 토큰 갱신 실패");
 });
 
 test("a mid-work message inside the minimum gap is dropped, and the final answer still arrives", async () => {
-	const gjc: GjcPort = {
-		ensureSession: async () => ({ sessionId: "mock-session" }),
-		sendTurn: async (_session, _text, _preamble, _progress, options?: TurnOptions) => {
-			options?.onAssistantText?.("500이 3분마다 찍히고 있어요");
-			options?.onAssistantText?.("retry 루프가 3번째에서 죽네요");
-			return "원인은 auth 토큰 갱신 실패";
-		},
-		forgetRebinds: () => {},
-	};
-	const client = await startGateway(gjc, { minGapMs: 45_000 });
+	const port = new ScriptedSessionPort();
+	const client = await startGateway(port, { minGapMs: 45_000 });
 	sendChannelMessage(client, "g1", "무슨 일이야?");
+	const send = await waitForSend(port);
+	port.emitTool(send.sessionId);
+	port.emitAssistant(send.sessionId, "500이 3분마다 찍히고 있어요");
+	port.emitAssistant(send.sessionId, "retry 루프가 3번째에서 죽네요");
+	port.complete(send.opRef, "원인은 auth 토큰 갱신 실패");
 	const all = await waitForMessages(client, 2);
-	await Bun.sleep(80);
-	expect(messages(client).length).toBe(2);
+	expect(messages(client)).toHaveLength(2);
 	expect(all[0].payload.text).toContain("3분마다");
-	// The second mid-work message was rate-dropped; the final answer is never gated.
 	expect(all[1].payload.text).toContain("auth 토큰 갱신 실패");
 });
 
 test("the working indicator still announces and clears around a gated turn", async () => {
-	const gjc: GjcPort = {
-		ensureSession: async () => ({ sessionId: "mock-session" }),
-		sendTurn: async (_session, _text, _preamble, progress, options?: TurnOptions) => {
-			options?.onAssistantText?.("파일부터 확인해볼게요");
-			await Bun.sleep(40);
-			progress?.({ toolCalls: 6, outputTokens: 120 });
-			await Bun.sleep(40);
-			return "다 됐어요";
-		},
-		forgetRebinds: () => {},
-	};
-	directory = await mkdtemp(join(tmpdir(), "gajaeway-interim-progress-"));
-	const config: GatewayConfig = {
-		schemaVersion: 1,
-		home: directory,
-		configPath: join(directory, "config.json"),
-		socketPath: join(directory, "gateway.sock"),
-		dbPath: join(directory, "gateway.db"),
-		logVerbosity: "info",
-		channels: { "chan-1": { engagement: "open" } },
-	};
-	const database = await GatewayDatabase.open(config.dbPath);
-	server = await startUnixServer({
-		config,
-		database,
-		gjc,
-		onStop: () => database.close(),
-		progress: { firstAfterMs: 0, intervalMs: 0 },
-	});
-	const client = await connect(config.socketPath);
-	client.send({ v: "0.1", type: "hello", payload: { supportedVersions: ["0.1"] } });
-	for (let attempt = 0; attempt < 60 && client.frames.length < 1; attempt++) await Bun.sleep(5);
+	const port = new ScriptedSessionPort();
+	const client = await startGateway(port, undefined, { firstAfterMs: 0, intervalMs: 0 });
 	sendChannelMessage(client, "p1", "상태 어때?");
+	const send = await waitForSend(port);
+	port.emitAssistant(send.sessionId, "파일부터 확인해볼게요");
+	port.emitTool(send.sessionId);
+	port.emitAssistant(send.sessionId, "다 됐어요");
+	port.complete(send.opRef, "다 됐어요");
 	const delivered = await waitForMessages(client, 1);
 	expect(delivered[0].payload.text).toContain("다 됐어요");
 	const progressFrames = client.frames.filter((frame: any) => frame.event === "chat.progress");
@@ -337,20 +299,15 @@ test("pre-tool suppression does not spend the turn budget", () => {
 });
 
 test("a pre-tool narration turn delivers only its final answer", async () => {
-	const gjc: GjcPort = {
-		ensureSession: async () => ({ sessionId: "s-pretool" }),
-		sendTurn: async (_session, _text, _preamble, _progress, options?: TurnOptions) => {
-			// Exactly the observed shape: thinking out loud before touching a tool.
-			options?.onAssistantText?.("형님 질문이다. 생각 누수부터 원인 잡고 바로 답한다.", 0);
-			options?.onAssistantText?.("맞다. 도구 돌기 전에 혼잣말이 채팅으로 나갔다.", 0);
-			options?.onAssistantText?.("원인은 게이트가 도구 전 혼잣말을 밀어내는 거다", 12);
-			return "원인은 게이트가 도구 전 혼잣말을 밀어내는 거다";
-		},
-		forgetRebinds: () => {},
-	};
-	const client = await startGateway(gjc, { minGapMs: 0 });
+	const port = new ScriptedSessionPort();
+	const client = await startGateway(port, { minGapMs: 0 });
 	sendChannelMessage(client, "p1", "생각 새는거 원인이 뭐야?");
+	const send = await waitForSend(port);
+	port.emitAssistant(send.sessionId, "형님 질문이다. 생각 누수부터 원인 잡고 바로 답한다.");
+	port.emitAssistant(send.sessionId, "맞다. 도구 돌기 전에 혼잣말이 채팅으로 나갔다.");
+	port.emitTool(send.sessionId);
+	port.complete(send.opRef, "원인은 게이트가 도구 전 혼잣말을 밀어내는 거다");
 	const all = await waitForMessages(client, 1);
-	expect(all.length).toBe(1);
+	expect(all).toHaveLength(1);
 	expect(all[0].payload.text).toContain("도구 전 혼잣말");
 });

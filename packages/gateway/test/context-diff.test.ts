@@ -134,19 +134,20 @@ test("reset floor excludes rows recorded before reset even when event timestamps
 	expect(window.rows.map((row) => row.message_id)).toEqual(["after-reset"]);
 });
 
-test("session creation time participates in the effective context floor", async () => {
+test("session creation does not discard context; only /new owns the durable floor", async () => {
 	const db = await open();
 	record(db, "before-session", "pre-session context", new Date(Date.now() - 60_000).toISOString());
 	db.putSession(ORIGIN_KEY, "session-1");
-	const sessionFloor = db.contextSessionCreatedAt(ORIGIN_KEY);
-	expect(sessionFloor).toBeString();
-	const after = new Date(Date.parse(sessionFloor as string) + 1).toISOString();
+	const sessionCreatedAt = db.contextSessionCreatedAt(ORIGIN_KEY);
+	expect(sessionCreatedAt).toBeString();
+	const after = new Date(Date.parse(sessionCreatedAt as string) + 1).toISOString();
 	record(db, "after-session", "current session context", after);
 	const triggerAt = new Date(Date.parse(after) + 1).toISOString();
 	record(db, "trigger", "current", triggerAt);
 
 	const window = db.contextWindow(ORIGIN_KEY, "trigger", new Date(triggerAt));
-	expect(window.rows.map((row) => row.message_id)).toEqual(["after-session"]);
+	expect(window.rows.map((row) => row.message_id)).toEqual(["before-session", "after-session"]);
+	expect(window.diagnostics.floorAt).toBeNull();
 });
 
 test("active maintenance drops old bodies but preserves recent retry-relevant unread rows", async () => {

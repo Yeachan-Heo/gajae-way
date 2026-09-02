@@ -7,6 +7,7 @@ import { MonitorPropagator } from "../src/monitors/propagate";
 import { MonitorRegistry } from "../src/monitors/registry";
 import { GatewayDatabase } from "../src/store/db";
 import { DeliveryLedger } from "../src/store/ledger";
+import { sessionPortFromScript } from "./session-port.fake";
 
 test("coalesce preserves every event identity while using one authoring turn", async () => {
 	const directory = await mkdtemp(join(tmpdir(), "gajaeway-monitor-"));
@@ -19,10 +20,9 @@ test("coalesce preserves every event identity while using one authoring turn", a
 			eventTypes: ["changed"],
 		});
 		let turns = 0;
-		const gjc = {
-			ensureSession: async () => ({ sessionId: "event-session" }),
-			forgetRebinds: () => {},
-			sendTurn: async (_id: string, text: string) => {
+		const sessionPort = sessionPortFromScript({
+			bind: async () => ({ sessionId: "event-session" }),
+			respond: async (_id: string, text: string) => {
 				turns++;
 				return JSON.stringify(
 					(JSON.parse(text.match(/\[.*\]$/s)![0]) as Array<{ eventId: string }>).map(({ eventId }) => ({
@@ -31,7 +31,7 @@ test("coalesce preserves every event identity while using one authoring turn", a
 					})),
 				);
 			},
-		};
+		});
 		const memory = {
 			enqueue: () => crypto.randomUUID(),
 			enqueueExistingId: () => {},
@@ -39,7 +39,7 @@ test("coalesce preserves every event identity while using one authoring turn", a
 		const pipeline = new MonitorPropagator({
 			database,
 			registry,
-			gjc,
+			sessionPort,
 			memory: memory as never,
 			delivery: new DeliveryService(new DeliveryLedger(database)),
 			emit: () => {},

@@ -16,14 +16,14 @@ export interface GatewayConfigFile {
 	readonly logVerbosity?: "debug" | "info" | "warn" | "error";
 	readonly socketPath?: string;
 	readonly dbPath?: string;
-	/** Per-turn gjc ceiling in milliseconds; default 300000. Long agentic turns need more. */
-	readonly turnTimeoutMs?: number;
 	/** Explicit gjc model selector, or a model profile preset whose default role may contain a fallback chain. */
 	readonly model?: GjcModelSelection;
 	readonly credentials?: Readonly<Record<string, CredentialFileReference>>;
 	readonly channels?: Readonly<Record<string, ChannelPolicy>>;
-	/** Default inbound debounce window in milliseconds; per-channel `debounceMs` overrides it. */
-	readonly debounceMs?: number;
+	/** Fixed-from-first inbound settle window in milliseconds; per-channel `settleWindowMs` overrides it. */
+	readonly settleWindowMs?: number;
+	/** Tail liveness alarm threshold in milliseconds. It never kills a running turn. */
+	readonly stallTimeoutMs?: number;
 	/** Author ids allowed to trigger mention-gated group turns; absent/empty = anyone. */
 	readonly mentionAllowlist?: readonly string[];
 	/**
@@ -80,8 +80,8 @@ export interface ChannelPolicy {
 	 * - `closed`: mention required AND the author must be allowlisted
 	 */
 	readonly engagement?: EngagementGate;
-	/** Per-channel inbound debounce override in milliseconds. */
-	readonly debounceMs?: number;
+	/** Per-channel fixed-from-first inbound settle window override in milliseconds. */
+	readonly settleWindowMs?: number;
 }
 
 export interface ConfigOverrides {
@@ -190,23 +190,36 @@ function parseChannels(value: unknown): Readonly<Record<string, ChannelPolicy>> 
 				"config_invalid",
 				`channels.${conversationId}.engagement must be one of ${ENGAGEMENT_GATES.join(", ")}`,
 			);
-		if (item.debounceMs !== undefined) parseDebounce(item.debounceMs, `channels.${conversationId}.debounceMs`);
-		if (Object.keys(item).some((key) => !["engagement", "debounceMs"].includes(key)))
+		if (item.debounceMs !== undefined) {
+			throw new ConfigError(
+				"config_invalid",
+				`channels.${conversationId}.debounceMs was renamed to channels.${conversationId}.settleWindowMs; update the configuration`,
+			);
+		}
+		if (item.settleWindowMs !== undefined) parseSettleWindow(item.settleWindowMs, `channels.${conversationId}.settleWindowMs`);
+		if (Object.keys(item).some((key) => !["engagement", "settleWindowMs"].includes(key)))
 			throw new ConfigError("config_invalid", `channels.${conversationId} contains an unknown field`);
 		channels[conversationId] = {
 			...(item.engagement === undefined ? {} : { engagement: item.engagement as EngagementGate }),
-			...(item.debounceMs === undefined ? {} : { debounceMs: item.debounceMs as number }),
+			...(item.settleWindowMs === undefined ? {} : { settleWindowMs: item.settleWindowMs as number }),
 		};
 	}
 	return channels;
 }
 
-function parseDebounce(value: unknown, field: string): number {
-	// 0 disables; above 60s is an operator mistake, not a debounce.
+function parseSettleWindow(value: unknown, field: string): number {
+	// 0 is valid for an explicit immediate loopback-like policy; the fixed window remains first-fragment anchored.
 	if (!Number.isInteger(value) || (value as number) < 0 || (value as number) > 60_000)
 		throw new ConfigError("config_invalid", `${field} must be an integer between 0 and 60000`);
 	return value as number;
 }
+
+function parseStallTimeout(value: unknown): number {
+	if (!Number.isInteger(value) || (value as number) < 1_000 || (value as number) > 3_600_000)
+		throw new ConfigError("config_invalid", "stallTimeoutMs must be an integer between 1000 and 3600000");
+	return value as number;
+}
+
 
 function parseOwnerTarget(value: unknown): { readonly origin: OriginRef } {
 	const input = requireObject(value, "ownerTarget");
@@ -247,12 +260,6 @@ function parseWebhook(value: unknown): {
 	};
 }
 
-function parseTurnTimeout(value: unknown): number {
-	// Bounded 30s..3600s: below breaks trivial turns, above is an operator mistake.
-	if (!Number.isInteger(value) || (value as number) < 30_000 || (value as number) > 3_600_000)
-		throw new ConfigError("config_invalid", "turnTimeoutMs must be an integer between 30000 and 3600000");
-	return value as number;
-}
 
 /**
  * Bounded 1..20. 1 rolls on the first context-class failure, which is
@@ -280,6 +287,18 @@ export function parseConfigFile(value: unknown): GatewayConfigFile {
 	if (logVerbosity !== undefined && !["debug", "info", "warn", "error"].includes(logVerbosity)) {
 		throw new ConfigError("config_invalid", "logVerbosity must be debug, info, warn, or error");
 	}
+	if (input.debounceMs !== undefined) {
+		throw new ConfigError(
+			"config_invalid",
+			"debounceMs was renamed to settleWindowMs; update the configuration (and channels.*.debounceMs to channels.*.settleWindowMs)",
+		);
+	}
+	if (input.turnTimeoutMs !== undefined) {
+		throw new ConfigError(
+			"config_invalid",
+			"turnTimeoutMs was removed with persistent SDK sessions; use stallTimeoutMs for tail-stall alerts (it never kills a running turn)",
+		);
+	}
 	const model = parseModel(input.model);
 	return {
 		schemaVersion: CONFIG_SCHEMA_VERSION,
@@ -293,11 +312,11 @@ export function parseConfigFile(value: unknown): GatewayConfigFile {
 		...(input.webhook === undefined ? {} : { webhook: parseWebhook(input.webhook) }),
 		...(input.watcherRoots === undefined ? {} : { watcherRoots: parseStringArray(input.watcherRoots, "watcherRoots") }),
 		...(input.scriptRoot === undefined ? {} : { scriptRoot: optionalString(input.scriptRoot, "scriptRoot") }),
-		...(input.turnTimeoutMs === undefined ? {} : { turnTimeoutMs: parseTurnTimeout(input.turnTimeoutMs) }),
 		...(input.mentionAllowlist === undefined
 			? {}
 			: { mentionAllowlist: parseStringArray(input.mentionAllowlist, "mentionAllowlist") }),
-		...(input.debounceMs === undefined ? {} : { debounceMs: parseDebounce(input.debounceMs, "debounceMs") }),
+		...(input.settleWindowMs === undefined ? {} : { settleWindowMs: parseSettleWindow(input.settleWindowMs, "settleWindowMs") }),
+		...(input.stallTimeoutMs === undefined ? {} : { stallTimeoutMs: parseStallTimeout(input.stallTimeoutMs) }),
 		...(model ? { model } : {}),
 		...(input.dmPolicy === undefined ? {} : { dmPolicy: parseDmPolicy(input.dmPolicy) }),
 		...(input.ownerTarget === undefined ? {} : { ownerTarget: parseOwnerTarget(input.ownerTarget) }),
@@ -370,7 +389,8 @@ export async function loadConfig(
 		socketPath: overrides.socketPath ?? fileConfig.socketPath ?? join(home, "gateway.sock"),
 		dbPath: overrides.dbPath ?? fileConfig.dbPath ?? join(home, "gateway.db"),
 		logVerbosity: overrides.logVerbosity ?? fileConfig.logVerbosity ?? "info",
-		debounceMs: fileConfig.debounceMs ?? 1_000,
+		settleWindowMs: fileConfig.settleWindowMs ?? 2_000,
+		stallTimeoutMs: fileConfig.stallTimeoutMs ?? 120_000,
 	};
 }
 
@@ -403,24 +423,16 @@ export async function reloadConfig(current: GatewayConfig, overrides: ConfigOver
 }
 
 /**
- * Fields genuinely re-read at runtime, each verified against a real consumer:
- * `mentionAllowlist` (server.ts chat dispatch + engagement/policy.ts),
- * `channels` (engagement/policy.ts + debounceFor), and `debounceMs`
- * (debounceFor). A change to one of these takes effect on the next turn.
+ * Fields genuinely re-read at runtime: `mentionAllowlist` (server.ts chat dispatch +
+ * engagement/policy.ts), channels and `settleWindowMs` (fixed-window admission),
+ * and `stallTimeoutMs` (tail liveness alarms). Each applies to the next actor event.
  */
-export const RELOADABLE_FIELDS = ["mentionAllowlist", "channels", "debounceMs", "dmPolicy"] as const;
+export const RELOADABLE_FIELDS = ["mentionAllowlist", "channels", "settleWindowMs", "stallTimeoutMs", "dmPolicy"] as const;
 
-/**
- * Fields bound to a live resource at startup — a listening socket, an open
- * database, the constructed gjc client, a running webhook/watcher, the monitor
- * propagator's owner target and its monitor session turn limit — and therefore
- * only changeable by a restart.
- * `credentials` belongs here because the adapters read it when they start.
- */
+/** Fields bound to live startup resources and therefore changeable only by restart. */
 export const RESTART_REQUIRED_FIELDS = [
 	"socketPath",
 	"dbPath",
-	"turnTimeoutMs",
 	"model",
 	"credentials",
 	"webhook",

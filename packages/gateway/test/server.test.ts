@@ -5,8 +5,8 @@ import { join } from "node:path";
 import { MAX_STALLED_CONTINUATIONS, parseLaneJobRecord } from "@gajaeway/subsession";
 import type { GatewayConfig } from "../src/config";
 import { memoryRoot } from "../src/memory/doctrine";
-import type { GjcPort } from "../src/orchestrator/gjc-client";
 import { type GatewayServer, startUnixServer } from "../src/server/server";
+import { ScriptedSessionPort, sessionPortFromResponder } from "./session-port.fake";
 import { GatewayDatabase } from "../src/store/db";
 
 let directory = "";
@@ -63,15 +63,11 @@ test("requires negotiation then serves status, shutdown, and validates chat para
 		dmPolicy: "open" as const,
 	};
 	const database = await GatewayDatabase.open(config.dbPath);
-	const gjc: GjcPort = {
-		ensureSession: async () => ({ sessionId: "mock-session" }),
-		forgetRebinds: () => {},
-		sendTurn: async () => "mock reply",
-	};
+	const sessionPort = sessionPortFromResponder({ respond: async () => "mock reply" });
 	server = await startUnixServer({
 		config,
 		database,
-		gjc,
+		sessionPort,
 		startedAt: "2026-01-01T00:00:00.000Z",
 		onStop: () => database.close(),
 	});
@@ -84,7 +80,7 @@ test("requires negotiation then serves status, shutdown, and validates chat para
 	expect(client.frames[1].type).toBe("negotiated");
 	client.send({ v: "0.1", type: "request", id: "status", verb: "gateway.status" });
 	await waitFor(client.frames, 3);
-	expect(client.frames[2].result.schemaVersion).toBe(16);
+	expect(client.frames[2].result.schemaVersion).toBe(17);
 	expect(client.frames[2].result.startedAt).toBe("2026-01-01T00:00:00.000Z");
 	expect(client.frames[2].result.contextDiff).toEqual({
 		unread: 0,
@@ -120,6 +116,37 @@ test("requires negotiation then serves status, shutdown, and validates chat para
 	client.close();
 });
 
+test("unauthorized direct messages cannot invoke /new or /model", async () => {
+	directory = await mkdtemp(join(tmpdir(), "gajaeway-server-command-auth-"));
+	const config: GatewayConfig = {
+		schemaVersion: 1,
+		home: directory,
+		configPath: join(directory, "config.json"),
+		socketPath: join(directory, "gateway.sock"),
+		dbPath: join(directory, "gateway.db"),
+		logVerbosity: "info",
+		dmPolicy: "allowlist",
+		mentionAllowlist: ["allowed"],
+		ownerTarget: { origin: { platform: "discord", kind: "dm", conversationId: "owner", peerId: "owner" } },
+	};
+	const database = await GatewayDatabase.open(config.dbPath);
+	const sessionPort = new ScriptedSessionPort();
+	server = await startUnixServer({ config, database, sessionPort, onStop: () => database.close() });
+	const client = await connect(config.socketPath);
+	const origin = { platform: "discord", kind: "dm", conversationId: "private", peerId: "intruder" };
+	const engagement = { mentioned: false, group: false, authorId: "intruder" };
+	client.send({ v: "0.1", type: "hello", payload: { supportedVersions: ["0.1"] } });
+	await waitFor(client.frames, 1);
+	client.send({ v: "0.1", type: "request", id: "model", verb: "chat.send", params: { origin, text: "/model set forbidden", engagement } });
+	client.send({ v: "0.1", type: "request", id: "new", verb: "chat.send", params: { origin, text: "/new", engagement } });
+	await waitFor(client.frames, 3);
+	expect(client.frames.filter((frame) => frame.type === "response" && frame.result?.engaged === false)).toHaveLength(2);
+	expect(sessionPort.binds).toEqual([]);
+	expect(database.getSessionRecord("discord/dm/private/peer=intruder")).toBeUndefined();
+	expect(database.conversationModelGet("discord/dm/private/peer=intruder")).toBeUndefined();
+	client.close();
+});
+
 test("a failed platform turn still delivers a visible ledgered failure notice", async () => {
 	directory = await mkdtemp(join(tmpdir(), "gajaeway-server-"));
 	const config: GatewayConfig = {
@@ -133,14 +160,10 @@ test("a failed platform turn still delivers a visible ledgered failure notice", 
 		dmPolicy: "open" as const,
 	};
 	const database = await GatewayDatabase.open(config.dbPath);
-	const gjc: GjcPort = {
-		ensureSession: async () => ({ sessionId: "mock-session" }),
-		forgetRebinds: () => {},
-		sendTurn: async () => {
-			throw new Error("gjc turn timed out after 300000ms");
-		},
-	};
-	server = await startUnixServer({ config, database, gjc, onStop: () => database.close() });
+	const sessionPort = new ScriptedSessionPort({
+		onSend: (input, scripted) => scripted.fail(input.opRef, "session operation stalled without terminal evidence"),
+	});
+	server = await startUnixServer({ config, database, sessionPort, onStop: () => database.close() });
 	const client = await connect(config.socketPath);
 	client.send({ v: "0.1", type: "hello", payload: { supportedVersions: ["0.1"] } });
 	await waitFor(client.frames, 1);
@@ -155,13 +178,12 @@ test("a failed platform turn still delivers a visible ledgered failure notice", 
 			engagement: { mentioned: false, group: false, authorId: "p1" },
 		},
 	});
-	await waitFor(client.frames, 4);
+	await waitFor(client.frames, 3);
 	expect(client.frames[1].result.engaged).toBe(true);
 	const notice = client.frames.find((frame) => frame.type === "event" && frame.event === "chat.message");
 	expect(notice.payload.text).toStartWith("[turn failed]");
 	expect(notice.payload.deliveryId).toBeString();
-	const errorFrame = client.frames.find((frame) => frame.type === "error" && frame.id === "dm");
-	expect(errorFrame.error.code).toBe("verb_failed");
+	expect(client.frames.find((frame) => frame.type === "error" && frame.id === "dm")).toBeUndefined();
 	client.close();
 });
 
@@ -178,21 +200,19 @@ test("long turns broadcast throttled chat.progress liveness events", async () =>
 		dmPolicy: "open" as const,
 	};
 	const database = await GatewayDatabase.open(config.dbPath);
-	const gjc: GjcPort = {
-		ensureSession: async () => ({ sessionId: "mock-session" }),
-		forgetRebinds: () => {},
-		sendTurn: async (_session, _text, _preamble, onProgress) => {
+	const sessionPort = sessionPortFromResponder({
+		respond: async (_session, _text, _preamble, onProgress) => {
 			for (let call = 1; call <= 3; call++) {
 				await Bun.sleep(5);
 				onProgress?.({ toolCalls: call, outputTokens: call * 100 });
 			}
 			return "done";
 		},
-	};
+	});
 	server = await startUnixServer({
 		config,
 		database,
-		gjc,
+		sessionPort,
 		progress: { firstAfterMs: 0, intervalMs: 0 },
 		onStop: () => database.close(),
 	});
@@ -248,19 +268,17 @@ test("large memory.audit and concurrent progress remain independently parseable 
 			`orphan ${index} ${"x".repeat(80)}\n`,
 		);
 	const database = await GatewayDatabase.open(config.dbPath);
-	const gjc: GjcPort = {
-		ensureSession: async () => ({ sessionId: "mock-session" }),
-		forgetRebinds: () => {},
-		sendTurn: async (_session, _text, _preamble, onProgress) => {
+	const sessionPort = sessionPortFromResponder({
+		respond: async (_session, _text, _preamble, onProgress) => {
 			onProgress?.({ toolCalls: 1, outputTokens: 100 });
 			await Bun.sleep(5);
 			return "done";
 		},
-	};
+	});
 	server = await startUnixServer({
 		config,
 		database,
-		gjc,
+		sessionPort,
 		progress: { firstAfterMs: 0, intervalMs: 0 },
 		onStop: () => database.close(),
 	});
@@ -320,16 +338,14 @@ test("shutdown quiesces an in-flight turn before final stopping frame", async ()
 	const turnEntered = new Promise<void>((resolve) => (entered = resolve));
 	const turnRelease = new Promise<void>((resolve) => (release = resolve));
 	const database = await GatewayDatabase.open(config.dbPath);
-	const gjc: GjcPort = {
-		ensureSession: async () => ({ sessionId: "mock-session" }),
-		forgetRebinds: () => {},
-		sendTurn: async () => {
+	const sessionPort = sessionPortFromResponder({
+		respond: async () => {
 			entered();
 			await turnRelease;
 			return "late reply";
 		},
-	};
-	server = await startUnixServer({ config, database, gjc, onStop: () => database.close() });
+	});
+	server = await startUnixServer({ config, database, sessionPort, onStop: () => database.close() });
 	const client = await connect(config.socketPath);
 	client.send({ v: "0.1", type: "hello", payload: { supportedVersions: ["0.1"] } });
 	await waitFor(client.frames, 1);
@@ -366,7 +382,7 @@ test("shutdown quiesces an in-flight turn before final stopping frame", async ()
 	client.close();
 });
 
-test("debounced burst becomes one turn carrying the unread diff with speaker attribution", async () => {
+	test("a settled burst becomes one turn carrying the unread diff with speaker attribution", async () => {
 	directory = await mkdtemp(join(tmpdir(), "gajaeway-server-"));
 	const config: GatewayConfig = {
 		schemaVersion: 1,
@@ -377,20 +393,18 @@ test("debounced burst becomes one turn carrying the unread diff with speaker att
 		logVerbosity: "info",
 		// This harness drives DM turns; DMs are authorisation-gated now.
 		dmPolicy: "open" as const,
-		debounceMs: 80,
+		settleWindowMs: 80,
 		channels: { c1: { engagement: "open" } },
 	};
 	const database = await GatewayDatabase.open(config.dbPath);
 	const turns: Array<{ text: string; preamble: string }> = [];
-	const gjc: GjcPort = {
-		ensureSession: async () => ({ sessionId: "mock-session" }),
-		forgetRebinds: () => {},
-		sendTurn: async (_session, text, preamble) => {
+	const sessionPort = sessionPortFromResponder({
+		respond: async (_session, text, preamble) => {
 			turns.push({ text, preamble: preamble ?? "" });
 			return "batched reply";
 		},
-	};
-	server = await startUnixServer({ config, database, gjc, onStop: () => database.close() });
+	});
+	server = await startUnixServer({ config, database, sessionPort, onStop: () => database.close() });
 	const client = await connect(config.socketPath);
 	client.send({ v: "0.1", type: "hello", payload: { supportedVersions: ["0.1"] } });
 	await waitFor(client.frames, 1);
@@ -437,19 +451,17 @@ test("group turns carry silence guidance: listeners are told to default to [SILE
 		logVerbosity: "info",
 		// This harness drives DM turns; DMs are authorisation-gated now.
 		dmPolicy: "open" as const,
-		channels: { c1: { engagement: "open", debounceMs: 0 } },
+		channels: { c1: { engagement: "open", settleWindowMs: 0 } },
 	};
 	const database = await GatewayDatabase.open(config.dbPath);
 	const preambles: string[] = [];
-	const gjc: GjcPort = {
-		ensureSession: async () => ({ sessionId: "mock-session" }),
-		forgetRebinds: () => {},
-		sendTurn: async (_session, _text, preamble) => {
+	const sessionPort = sessionPortFromResponder({
+		respond: async (_session, _text, preamble) => {
 			preambles.push(preamble ?? "");
 			return "[SILENT]";
 		},
-	};
-	server = await startUnixServer({ config, database, gjc, onStop: () => database.close() });
+	});
+	server = await startUnixServer({ config, database, sessionPort, onStop: () => database.close() });
 	const client = await connect(config.socketPath);
 	client.send({ v: "0.1", type: "hello", payload: { supportedVersions: ["0.1"] } });
 	await waitFor(client.frames, 1);
@@ -487,12 +499,8 @@ test("[REPLY:id] parts thread to the referenced message and strip the directive"
 		dmPolicy: "open" as const,
 	};
 	const database = await GatewayDatabase.open(config.dbPath);
-	const gjc: GjcPort = {
-		ensureSession: async () => ({ sessionId: "mock-session" }),
-		forgetRebinds: () => {},
-		sendTurn: async () => "[REPLY:msg-42] threaded answer\n[BREAK]\nplain follow-up",
-	};
-	server = await startUnixServer({ config, database, gjc, onStop: () => database.close() });
+	const sessionPort = sessionPortFromResponder({ respond: async () => "[REPLY:msg-42] threaded answer\n[BREAK]\nplain follow-up" });
+	server = await startUnixServer({ config, database, sessionPort, onStop: () => database.close() });
 	const client = await connect(config.socketPath);
 	client.send({ v: "0.1", type: "hello", payload: { supportedVersions: ["0.1"] } });
 	await waitFor(client.frames, 1);
@@ -533,19 +541,8 @@ test("work.run runs a named worker session in the requested cwd and returns the 
 		dmPolicy: "open" as const,
 	};
 	const database = await GatewayDatabase.open(config.dbPath);
-	const seen: Array<{ key?: string; text?: string; options?: unknown }> = [];
-	const gjc: GjcPort = {
-		ensureSession: async (key, _epoch, options) => {
-			seen.push({ key, options });
-			return { sessionId: "worker-session" };
-		},
-		forgetRebinds: () => {},
-		sendTurn: async (_session, text, _preamble, _progress, options) => {
-			seen.push({ text, options });
-			return "worker result";
-		},
-	};
-	server = await startUnixServer({ config, database, gjc, onStop: () => database.close() });
+	const sessionPort = new ScriptedSessionPort({ onSend: (input, scripted) => scripted.complete(input.opRef, "worker result") });
+	server = await startUnixServer({ config, database, sessionPort, onStop: () => database.close() });
 	const client = await connect(config.socketPath);
 	client.send({ v: "0.1", type: "hello", payload: { supportedVersions: ["0.1"] } });
 	await waitFor(client.frames, 1);
@@ -559,12 +556,13 @@ test("work.run runs a named worker session in the requested cwd and returns the 
 	await waitFor(client.frames, 2);
 	const response = client.frames.find((frame) => frame.type === "response" && frame.id === "w");
 	expect(response.result).toMatchObject({ text: "worker result", sessionKey: "work/task/repo-fix", held: false });
-	expect(seen[0]).toMatchObject({
-		key: "work/task/repo-fix",
-		options: { cwd: "/tmp/some-repo", codingRegister: true },
+	expect(sessionPort.binds[0]).toMatchObject({
+		originKey: "work/task/repo-fix",
+		repo: "/tmp/some-repo",
+		codingRegister: true,
 	});
-	expect(seen[1]).toMatchObject({ text: "fix the bug", options: { cwd: "/tmp/some-repo", codingRegister: true } });
-	// Invalid names are rejected before touching gjc.
+	expect(sessionPort.sends[0]).toMatchObject({ text: "fix the bug", repo: "/tmp/some-repo", codingRegister: true });
+	// Invalid names are rejected before touching the SessionPort.
 	client.send({ v: "0.1", type: "request", id: "bad", verb: "work.run", params: { name: "../evil", text: "x" } });
 	await waitFor(client.frames, 3);
 	expect(client.frames.find((frame) => frame.type === "error" && frame.id === "bad")).toBeDefined();
@@ -584,12 +582,11 @@ test("work.run records a durable lane job and work.jobs projects it (issue #10)"
 		dmPolicy: "open" as const,
 	};
 	const database = await GatewayDatabase.open(config.dbPath);
-	const gjc: GjcPort = {
-		ensureSession: async () => ({ sessionId: "0f1e2d3c-4b5a-4678-8796-a5b4c3d2e1f0" }),
-		sendTurn: async () => "worker result",
-		forgetRebinds: () => {},
-	};
-	server = await startUnixServer({ config, database, gjc, onStop: () => database.close() });
+	const sessionPort = sessionPortFromResponder({
+		bind: async () => ({ sessionId: "0f1e2d3c-4b5a-4678-8796-a5b4c3d2e1f0" }),
+		respond: async () => "worker result",
+	});
+	server = await startUnixServer({ config, database, sessionPort, onStop: () => database.close() });
 	const client = await connect(config.socketPath);
 	client.send({ v: "0.1", type: "hello", payload: { supportedVersions: ["0.1"] } });
 	await waitFor(client.frames, 1);
@@ -693,15 +690,14 @@ test("a stalled durable job holds the next work.run until resume (production pat
 	};
 	const database = await GatewayDatabase.open(config.dbPath);
 	let turns = 0;
-	const gjc: GjcPort = {
-		ensureSession: async () => ({ sessionId: "0f1e2d3c-4b5a-4678-8796-a5b4c3d2e1f0" }),
-		sendTurn: async () => {
+	const sessionPort = sessionPortFromResponder({
+		bind: async () => ({ sessionId: "0f1e2d3c-4b5a-4678-8796-a5b4c3d2e1f0" }),
+		respond: async () => {
 			turns += 1;
 			return "worker result";
 		},
-		forgetRebinds: () => {},
-	};
-	server = await startUnixServer({ config, database, gjc, onStop: () => database.close() });
+	});
+	server = await startUnixServer({ config, database, sessionPort, onStop: () => database.close() });
 	const client = await connect(config.socketPath);
 	client.send({ v: "0.1", type: "hello", payload: { supportedVersions: ["0.1"] } });
 	await waitFor(client.frames, 1);
@@ -760,15 +756,14 @@ test("resuming a stalled job clears the hold durably: the next ordinary call is 
 	};
 	const database = await GatewayDatabase.open(config.dbPath);
 	let turns = 0;
-	const gjc: GjcPort = {
-		ensureSession: async () => ({ sessionId: "0f1e2d3c-4b5a-4678-8796-a5b4c3d2e1f0" }),
-		sendTurn: async () => {
+	const sessionPort = sessionPortFromResponder({
+		bind: async () => ({ sessionId: "0f1e2d3c-4b5a-4678-8796-a5b4c3d2e1f0" }),
+		respond: async () => {
 			turns += 1;
 			return "worker result";
 		},
-		forgetRebinds: () => {},
-	};
-	server = await startUnixServer({ config, database, gjc, onStop: () => database.close() });
+	});
+	server = await startUnixServer({ config, database, sessionPort, onStop: () => database.close() });
 	const client = await connect(config.socketPath);
 	client.send({ v: "0.1", type: "hello", payload: { supportedVersions: ["0.1"] } });
 	await waitFor(client.frames, 1);
@@ -843,12 +838,8 @@ test("responses larger than one socket buffer arrive intact (backpressure outbox
 	const database = await GatewayDatabase.open(config.dbPath);
 	// A ~700KB reply forces multiple kernel-buffer writes on the unix socket.
 	const bigReply = `big:${"x".repeat(700_000)}:end`;
-	const gjc: GjcPort = {
-		ensureSession: async () => ({ sessionId: "mock-session" }),
-		sendTurn: async () => bigReply,
-		forgetRebinds: () => {},
-	};
-	server = await startUnixServer({ config, database, gjc, onStop: () => database.close() });
+	const sessionPort = sessionPortFromResponder({ respond: async () => bigReply });
+	server = await startUnixServer({ config, database, sessionPort, onStop: () => database.close() });
 	const client = await connect(config.socketPath);
 	client.send({ v: "0.1", type: "hello", payload: { supportedVersions: ["0.1"] } });
 	await waitFor(client.frames, 1);

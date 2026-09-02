@@ -2,7 +2,7 @@ import { afterEach, expect, test } from "bun:test";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { GatewayDatabase } from "../src/store/db";
+import { GatewayDatabase, InboundBatchConflictError } from "../src/store/db";
 
 let home = "";
 let database: GatewayDatabase | undefined;
@@ -90,4 +90,57 @@ test("claims are scoped per origin", async () => {
 	expect(db.inboundClaimNext("discord:dm:1")?.body).toBe("a");
 	expect(db.inboundClaimNext("discord:dm:1")).toBeUndefined();
 	expect(db.inboundClaimNext("discord:dm:2")?.body).toBe("b");
+});
+
+test("discarding at /new touches only unbatched pending rows and terminal completion moves both lifecycle columns", async () => {
+	const db = await open();
+	const cutoff = "2026-09-01T00:00:02.000Z";
+	db.inboundEnqueue({ ...message("trigger", "start"), receivedAt: "2026-09-01T00:00:00.000Z" });
+	db.inboundEnqueue({ ...message("member", "follow"), receivedAt: "2026-09-01T00:00:01.000Z" });
+	const settled = db.inboundSettleBatch({
+		originKey: "discord:dm:1",
+		epoch: 0,
+		cutoff,
+		batchKey: "discord:dm:1|0|trigger|2026-09-01T00:00:02.000Z",
+		opRef: "gw-p-0123456789abcdef0123456789abcdef",
+	});
+	expect(settled.map((item) => item.batch_role)).toEqual(["trigger", "member"]);
+	expect(db.inboundBatchAccept(settled[0]!.batch_key!)).toBe(true);
+	db.inboundEnqueue({ ...message("unbatched", "discard"), receivedAt: "2026-09-01T00:00:01.500Z" });
+
+	expect(db.inboundDiscardBefore("discord:dm:1", cutoff)).toEqual(["unbatched"]);
+	const accepted = db.inboundBatchRows(settled[0]!.batch_key!);
+	expect(accepted).toEqual(
+		expect.arrayContaining([
+			expect.objectContaining({ message_id: "trigger", state: "pending", batch_state: "accepted" }),
+			expect.objectContaining({ message_id: "member", state: "pending", batch_state: "accepted" }),
+		]),
+	);
+	expect(db.inboundBatchComplete(settled[0]!.batch_key!)).toBe(2);
+	expect(db.inboundBatchRows(settled[0]!.batch_key!)).toEqual(
+		expect.arrayContaining([
+			expect.objectContaining({ state: "done", batch_state: "done" }),
+		]),
+	);
+});
+
+test("trigger-only uniqueness permits members and retired epochs but rejects a second current trigger", async () => {
+	const db = await open();
+	const settle = (id: string, epoch: number) =>
+		db.inboundSettleBatch({
+			originKey: "discord:dm:1",
+			epoch,
+			cutoff: "2026-09-01T00:00:02.000Z",
+			batchKey: `discord:dm:1|${epoch}|${id}|cutoff`,
+			opRef: `gw-p-${id.padEnd(32, "0")}`,
+		});
+	db.inboundEnqueue({ ...message("a", "a"), receivedAt: "2026-09-01T00:00:00.000Z" });
+	db.inboundEnqueue({ ...message("b", "b"), receivedAt: "2026-09-01T00:00:01.000Z" });
+	const old = settle("a", 0);
+	db.inboundBatchAccept(old[0]!.batch_key!);
+	db.inboundEnqueue({ ...message("c", "c"), receivedAt: "2026-09-01T00:00:02.000Z" });
+	const current = settle("c", 1);
+	expect(current).toHaveLength(1);
+	db.inboundEnqueue({ ...message("d", "d"), receivedAt: "2026-09-01T00:00:02.000Z" });
+	expect(() => settle("d", 1)).toThrow(InboundBatchConflictError);
 });

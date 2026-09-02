@@ -3,9 +3,9 @@ import { mkdir, mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { GatewayConfig } from "../src/config";
-import type { GjcPort } from "../src/orchestrator/gjc-client";
 import { startUnixServer } from "../src/server/server";
 import { GatewayDatabase } from "../src/store/db";
+import { sessionPortFromResponder } from "./session-port.fake";
 
 test("persona USER.md edits are included on the next turn", async () => {
 	const home = await mkdtemp(join(tmpdir(), "gajaeway-persona-"));
@@ -19,15 +19,13 @@ test("persona USER.md edits are included on the next turn", async () => {
 	};
 	const seen: string[] = [];
 	const database = await GatewayDatabase.open(config.dbPath);
-	const gjc: GjcPort = {
-		ensureSession: async () => ({ sessionId: "session" }),
-		forgetRebinds: () => {},
-		sendTurn: async (_id, _text, preamble) => {
+	const sessionPort = sessionPortFromResponder({
+		respond: async (_id, _text, preamble) => {
 			seen.push(preamble ?? "");
 			return "reply";
 		},
-	};
-	const server = await startUnixServer({ config, database, gjc, onStop: () => database.close() });
+	});
+	const server = await startUnixServer({ config, database, sessionPort, onStop: () => database.close() });
 	try {
 		await mkdir(join(home, "workspace"), { recursive: true });
 		await Bun.write(join(home, "workspace/USER.md"), "first");

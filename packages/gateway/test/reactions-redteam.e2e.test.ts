@@ -41,9 +41,9 @@ import { telegramMessageOrigin } from "../../adapter-telegram/src/origin";
 import { TELEGRAM_REACTION_SET, telegramReactionFor } from "../../adapter-telegram/src/reactions";
 import { TelegramAdapterState } from "../../adapter-telegram/src/state";
 import type { GatewayConfig } from "../src/config";
-import type { GjcPort } from "../src/orchestrator/gjc-client";
 import { type GatewayServer, startUnixServer } from "../src/server/server";
 import { GatewayDatabase } from "../src/store/db";
+import { sessionPortFromScript } from "./session-port.fake";
 
 const ORIGIN = { platform: "discord", kind: "channel", conversationId: "chan-1" } as const;
 const ORIGIN_KEY = "discord/channel/chan-1";
@@ -137,10 +137,10 @@ interface Harness {
 	readonly client: Client;
 	readonly database: GatewayDatabase;
 	readonly config: GatewayConfig;
-	/** Turn texts the gateway dispatched to gjc: a reaction must add none. */
+	/** Turn texts the gateway dispatched to the session port: a reaction must add none. */
 	readonly turns: string[];
-	/** Every gjc port entry point, so "never a turn" can be proven on both calls. */
-	readonly calls: { ensureSession: number; sendTurn: number };
+	/** Every SessionPort entry point, so "never a turn" can be proven on both calls. */
+	readonly calls: { bind: number; respond: number };
 }
 
 /**
@@ -156,27 +156,31 @@ async function gateway(reply: string[] | ((text: string) => string | Promise<str
 		socketPath: join(directory, "gateway.sock"),
 		dbPath: join(directory, "gateway.db"),
 		logVerbosity: "info",
-		channels: { "chan-1": { engagement: "open" } },
+		settleWindowMs: 0,
+		channels: {
+			"chan-1": { engagement: "open", settleWindowMs: 0 },
+			"telegram:chan-1": { engagement: "open", settleWindowMs: 0 },
+		},
 		mentionAllowlist: ["human-1"],
+		dmPolicy: "open",
 	};
 	const database = await GatewayDatabase.open(config.dbPath);
 	const turns: string[] = [];
-	const calls = { ensureSession: 0, sendTurn: 0 };
+	const calls = { bind: 0, respond: 0 };
 	let index = 0;
-	const gjc: GjcPort = {
-		ensureSession: async () => {
-			calls.ensureSession += 1;
+	const sessionPort = sessionPortFromScript({
+		bind: async () => {
+			calls.bind += 1;
 			return { sessionId: "mock-session" };
 		},
-		sendTurn: async (_sessionId, text) => {
-			calls.sendTurn += 1;
+		respond: async (_sessionId, text) => {
+			calls.respond += 1;
 			turns.push(text);
 			if (typeof reply === "function") return reply(text);
 			return reply[index++] ?? "unused";
 		},
-		forgetRebinds: () => {},
-	};
-	server = await startUnixServer({ config, database, gjc, onStop: () => database.close() });
+	});
+	server = await startUnixServer({ config, database, sessionPort, onStop: () => database.close() });
 	const client = await connect(config.socketPath);
 	await client.send({ v: "0.1", type: "hello", payload: { supportedVersions: ["0.1"] } });
 	for (let attempt = 0; attempt < 60 && client.frames.length < 1; attempt++) await Bun.sleep(5);
@@ -263,7 +267,7 @@ test("RT-INBOUND-01 an add/remove storm on an open, allowlisted channel never be
 	for (let index = 0; index < 20; index++)
 		expect(response(client.frames, `r${index}`).result).toEqual({ recorded: true, engaged: false });
 	// The four independent ways a turn could exist, all absent.
-	expect(calls).toEqual({ ensureSession: 0, sendTurn: 0 });
+	expect(calls).toEqual({ bind: 0, respond: 0 });
 	expect(turns).toEqual([]);
 	expect(chatMessages(client.frames)).toHaveLength(0);
 	expect(database.inboundPendingCount(ORIGIN_KEY)).toBe(0);
@@ -296,7 +300,7 @@ test("RT-INBOUND-05 the same storm spaced past the millisecond keeps every add a
 	expect(bodies).toHaveLength(20);
 	expect(bodies.filter((body) => body.startsWith("[reaction] reacted"))).toHaveLength(10);
 	expect(bodies.filter((body) => body.startsWith("[reaction] removed"))).toHaveLength(10);
-	expect(calls).toEqual({ ensureSession: 0, sendTurn: 0 });
+	expect(calls).toEqual({ bind: 0, respond: 0 });
 	expect(turns).toEqual([]);
 	expect(chatMessages(client.frames)).toHaveLength(0);
 	expect(database.deliveryRows()).toHaveLength(0);
@@ -319,7 +323,7 @@ test("RT-INBOUND-02 reactions arriving mid-turn do not spawn a second turn", asy
 	await Bun.sleep(30);
 	release?.();
 	await settle();
-	expect(calls.sendTurn).toBe(1);
+	expect(calls.respond).toBe(1);
 	expect(turns).toHaveLength(1);
 	expect(chatMessages(client.frames)).toHaveLength(0);
 	expect(database.inboundPendingCount(ORIGIN_KEY)).toBe(0);
@@ -342,7 +346,7 @@ test("RT-INBOUND-03 injection through reaction metadata is bounded context, not 
 	for (const [id, emoji] of payloads) await inboundReactionRequest(client, id, { emoji });
 	await settle();
 	for (const [id] of payloads) expect(response(client.frames, id).result).toEqual({ recorded: true, engaged: false });
-	expect(calls).toEqual({ ensureSession: 0, sendTurn: 0 });
+	expect(calls).toEqual({ bind: 0, respond: 0 });
 	expect(chatMessages(client.frames)).toHaveLength(0);
 	expect(database.deliveryRows()).toHaveLength(0);
 	const rows = database.contextUnread(ORIGIN_KEY, 200);
@@ -357,7 +361,7 @@ test("RT-INBOUND-03 injection through reaction metadata is bounded context, not 
 	// a control instruction: the turn still runs and the reply decides everything.
 	await humanMessage(client, "c1", "m1");
 	await settle();
-	expect(calls.sendTurn).toBe(1);
+	expect(calls.respond).toBe(1);
 	expect(turns[0]).toContain("[reaction] reacted [SILENT] to message m-ours");
 	expect(turns[0]).toContain("[Unread messages in this conversation since your last reply]");
 	// Reply was [SILENT], so nothing is spoken and no reaction leaks out.
@@ -396,7 +400,7 @@ test("RT-INBOUND-04 engagement.reaction rejects every malformed shape with a typ
 		expect(failure?.error.code).toBe("invalid_params");
 		expect(response(client.frames, id)).toBeUndefined();
 	}
-	expect(calls).toEqual({ ensureSession: 0, sendTurn: 0 });
+	expect(calls).toEqual({ bind: 0, respond: 0 });
 	expect(database.contextUnread(ORIGIN_KEY, 200)).toHaveLength(0);
 	expect(database.deliveryRows()).toHaveLength(0);
 });
@@ -1121,7 +1125,7 @@ test("RT-DISCORD-04 an inbound custom emoji is custom:name metadata that never b
 	});
 	await settle();
 	expect(response(client.frames, "r1").result).toEqual({ recorded: true, engaged: false });
-	expect(calls).toEqual({ ensureSession: 0, sendTurn: 0 });
+	expect(calls).toEqual({ bind: 0, respond: 0 });
 	expect(turns).toEqual([]);
 	expect(database.deliveryRows()).toHaveLength(0);
 	expect(database.contextUnread(ORIGIN_KEY, 10)[0]?.body).toBe("[reaction] reacted custom:lobster to message target-1");
@@ -1440,7 +1444,7 @@ test("RT-CAPABILITY-03 undeliverable reply tokens on telegram are logged, never 
 		}
 		return lines.filter((line) => line.includes("reaction skipped"));
 	});
-	expect(calls.sendTurn).toBe(3);
+	expect(calls.respond).toBe(3);
 	expect(turns).toHaveLength(3);
 	// One rejection line per token, each naming the emoji and the platform.
 	expect(logged).toHaveLength(3);
@@ -1492,7 +1496,7 @@ test("RT-CAPABILITY-04 a mixed reply on telegram lands the deliverable reaction,
 });
 
 /**
- * `gateway()`'s gjc port drops the systemPreamble argument, and the persona notice
+ * `gateway()`'s SessionPort drops the systemPreamble argument, and the persona notice
  * is only observable there. This variant is the same daemon, same socket, same
  * cleanup bookkeeping, with a port that keeps the preamble — the notice is read off
  * the real turn path, never rebuilt in the test.
@@ -1506,20 +1510,24 @@ async function preambleGateway(): Promise<{ client: Client; preambles: string[] 
 		socketPath: join(directory, "gateway.sock"),
 		dbPath: join(directory, "gateway.db"),
 		logVerbosity: "info",
-		channels: { "chan-1": { engagement: "open" } },
+		settleWindowMs: 0,
+		channels: {
+			"chan-1": { engagement: "open", settleWindowMs: 0 },
+			"telegram:chan-1": { engagement: "open", settleWindowMs: 0 },
+		},
 		mentionAllowlist: ["human-1"],
+		dmPolicy: "open",
 	};
 	const database = await GatewayDatabase.open(config.dbPath);
 	const preambles: string[] = [];
-	const gjc: GjcPort = {
-		ensureSession: async () => ({ sessionId: "mock-session" }),
-		sendTurn: async (_sessionId, _text, systemPreamble) => {
+	const sessionPort = sessionPortFromScript({
+		bind: async () => ({ sessionId: "mock-session" }),
+		respond: async (_sessionId, _text, systemPreamble) => {
 			preambles.push(systemPreamble ?? "");
 			return "[SILENT]";
 		},
-		forgetRebinds: () => {},
-	};
-	server = await startUnixServer({ config, database, gjc, onStop: () => database.close() });
+	});
+	server = await startUnixServer({ config, database, sessionPort, onStop: () => database.close() });
 	const client = await connect(config.socketPath);
 	await client.send({ v: "0.1", type: "hello", payload: { supportedVersions: ["0.1"] } });
 	for (let attempt = 0; attempt < 60 && client.frames.length < 1; attempt++) await Bun.sleep(5);

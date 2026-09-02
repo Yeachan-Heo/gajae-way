@@ -333,7 +333,7 @@ export async function buildSessionBootstrap(input: {
 		...(input.engagement?.channelLabel ? [`channel-label: ${boundedLine(input.engagement.channelLabel)}`] : []),
 		...(input.engagement?.serverLabel ? [`server-label: ${boundedLine(input.engagement.serverLabel)}`] : []),
 		`engagement-gate: ${gate}`,
-		`debounce-ms: ${channelPolicy?.debounceMs ?? input.config.debounceMs ?? 0}`,
+		`settle-window-ms: ${channelPolicy?.settleWindowMs ?? input.config.settleWindowMs ?? 2_000}`,
 		...(owner
 			? group
 				? [`owner-target: configured ${owner.platform}/${owner.kind}; same-origin=${originKey(owner) === key}`]

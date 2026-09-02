@@ -27,3 +27,18 @@ test("delivery ledger transitions pending, inflight, retry, expiry, and confirma
 		await rm(directory, { recursive: true, force: true });
 	}
 });
+
+test("a deterministic tail delivery id is admitted once across replay", async () => {
+	const directory = await mkdtemp(join(tmpdir(), "gajaeway-ledger-"));
+	try {
+		const database = await GatewayDatabase.open(join(directory, "gateway.db"));
+		const ledger = new DeliveryLedger(database);
+		const row = { deliveryId: "gw-d-tail-event", turnId: "turn", originKey: "discord/channel/c", payloadJson: "{}" };
+		expect(ledger.createPending(row)).toBe(true);
+		expect(ledger.createPending(row)).toBe(false);
+		expect(ledger.counts().pending).toBe(1);
+		database.close();
+	} finally {
+		await rm(directory, { recursive: true, force: true });
+	}
+});

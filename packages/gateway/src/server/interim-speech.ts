@@ -13,11 +13,11 @@
  * reaction, a heads-up that this will take a while, or a question that unblocks
  * them.
  *
- * DESIGN INTENT: the base system prompt is the PRIMARY mechanism (see
- * GENERIC_AGENT_SYSTEM_PROMPT). This module is the BACKSTOP — a model that
- * ignores the instruction must not be able to flood the room. Therefore the
- * rules here are deliberately few and conservative: they suppress only what is
- * unmistakably process narration and default to delivering anything else.
+ * DESIGN INTENT: tail-framed assistant text is filtered before outward delivery.
+ * This module is the backstop — a model that narrates routine activity must not
+ * be able to flood the room. Therefore the rules here are deliberately few and
+ * conservative: they suppress only what is unmistakably process narration and
+ * default to delivering anything else.
  * Tightening this into an exhaustive regex zoo would start eating real replies,
  * which is the worse failure: a suppressed finding is invisible forever, while
  * a leaked narration line is merely noise.

@@ -35,7 +35,13 @@ fi
 run "bun install --frozen-lockfile" bun install --frozen-lockfile
 run "biome ci packages/" bunx biome ci packages/
 run "tsc --noEmit" bunx tsc --noEmit -p tsconfig.json
-run "bun test packages/" bun test packages/
+run "bun test packages/" env GAJAEWAY_E2E_GJC=0 bun test packages/
+if [ "${GAJAEWAY_E2E_GJC:-}" = "1" ]; then
+	run "persistent-session real GJC E2E" env GAJAEWAY_E2E_GJC=1 bun test packages/gateway/test/persistent-session.e2e.test.ts
+else
+	printf '\n=== persistent-session real GJC E2E ===\n'
+	printf '[SKIP] set GAJAEWAY_E2E_GJC=1 with inherited provider credentials to run the scratch broker check\n'
+fi
 run "bench gate" env GAJAEWAY_BENCH=1 bun test packages/gateway/bench
 
 printf '\n=== summary ===\n'

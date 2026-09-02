@@ -7,15 +7,14 @@ export interface ModelOverrideStore {
 	conversationModelClear(originKey: string): boolean;
 }
 
+export type ModelRebindIntent =
+	| { readonly kind: "set"; readonly selection: GjcModelSelection }
+	| { readonly kind: "clear" };
+
 export interface ModelCommandOutcome {
 	readonly text: string;
-	/**
-	 * Whether the caller must reset the conversation's session. The selector is
-	 * argv on an already-running gjc process, so a change cannot reach a live
-	 * session: either we reset, or the command is a lie until an unrelated
-	 * restart happens.
-	 */
-	readonly resetSession: boolean;
+	/** A same-session control transition the per-origin actor must serialize. */
+	readonly rebind?: ModelRebindIntent;
 }
 
 /** Renders a selection the way the owner typed it. */
@@ -42,10 +41,8 @@ export function parseModelArgument(argument: string): GjcModelSelection | { read
 
 /**
  * Executes `/model`, `/model <choice>`, `/model set <choice>` or
- * `/model clear`, returning the reply text and whether a session reset is
- * required. Reporting where the effective selection came from is deliberate:
- * "which model am I talking to" is unanswerable otherwise, and a silent
- * config default is the thing people get wrong.
+ * `/model clear`. A change returns a same-session rebind intent; the actor
+ * applies it through `model.set` without changing the conversation epoch.
  */
 export function applyModelCommand(
 	text: string,
@@ -64,14 +61,19 @@ export function applyModelCommand(
 		return "🦞 model: **gjc default** (no gateway setting, no conversation override)";
 	};
 
-	if (rest === "" || head === "show") return { text: showEffective(), resetSession: false };
+	if (rest === "" || head === "show") return { text: showEffective() };
 
 	if (head === "clear" || head === "reset" || head === "default") {
-		const removed = store.conversationModelClear(originKey);
-		if (!removed) return { text: `no conversation override to clear. ${showEffective()}`, resetSession: false };
+		const existing = store.conversationModelGet(originKey)?.selection;
+		if (!existing) return { text: `no conversation override to clear. ${showEffective()}` };
+		if (!configModel)
+			return {
+				text: "cannot live-clear this override because no gateway default model is configured. Set a gateway model or choose an explicit model instead.",
+			};
+		store.conversationModelClear(originKey);
 		return {
-			text: `🦞 cleared this conversation's override, session reset. ${showEffective()}`,
-			resetSession: true,
+			text: `🦞 cleared this conversation's override. ${showEffective()} The model applies from the next turn on this same session.`,
+			rebind: { kind: "clear" },
 		};
 	}
 
@@ -80,14 +82,11 @@ export function applyModelCommand(
 	if (typeof parsed !== "string" && "error" in parsed)
 		return {
 			text: `could not read that selection (${parsed.error}). usage: \`/model\`, \`/model set <preset-or-selector>\`, \`/model clear\``,
-			resetSession: false,
 		};
 	store.conversationModelSet(originKey, parsed, setBy);
-	// Say the reset out loud. A model change that silently applied "sometime
-	// later" would be indistinguishable from one that did nothing.
 	const scope = origin.platform === "loopback" ? "this session" : "this conversation";
 	return {
-		text: `🦞 model set to **${describeSelection(parsed)}** for ${scope}. session reset so it takes effect now.`,
-		resetSession: true,
+		text: `🦞 model set to **${describeSelection(parsed)}** for ${scope}. It applies from the next turn on this same session.`,
+		rebind: { kind: "set", selection: parsed },
 	};
 }

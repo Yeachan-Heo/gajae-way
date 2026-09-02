@@ -19,14 +19,14 @@
  * - `resource_gone`: the session endpoint record is gone.
  * - `spawn_failed`: SDK startup did not complete before the readiness cutoff.
  * - `terminal_uncertain`: startup cleanup could not be proven.
- * - `managed_append_identity_mismatch`: turn-level; the bound session's identity
+ * - `managed_append_identity_mismatch`: the bound session identity
  *   no longer matches the cwd, so it can never be resumed from here again.
- * - `resume_unusable`: turn-level; the child exited non-zero without emitting a
- *   single protocol frame, so it died before the turn began. Measured cause: the
- *   runtime no longer holds the bound session id (`--resume` raises an uncaught
- *   exception with no structured code), which made every monitor tick fail
- *   identically until `gateway.db` was hand-edited. The code is synthesized from
- *   the gateway's own observation, never from message text.
+ * - `resume_unusable`: the runtime no longer holds the bound session id, so the
+ *   session cannot be re-attached from here (measured on the former per-turn
+ *   process path, where the runtime raised an uncaught exception with no
+ *   structured code and every monitor tick failed identically until `gateway.db`
+ *   was hand-edited). Kept as a bind-time classification; it is never inferred
+ *   from message text.
  */
 export const REBINDABLE_ERROR_CODES: ReadonlySet<string> = new Set([
 	"resource_gone",

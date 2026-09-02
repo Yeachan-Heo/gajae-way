@@ -3,9 +3,9 @@ import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { GatewayConfig } from "../src/config";
-import type { GjcPort } from "../src/orchestrator/gjc-client";
 import { type GatewayServer, startUnixServer } from "../src/server/server";
 import { GatewayDatabase } from "../src/store/db";
+import { sessionPortFromResponder } from "./session-port.fake";
 
 const ORIGIN = { platform: "discord", kind: "channel", conversationId: "chan-1" } as const;
 const ORIGIN_KEY = "discord/channel/chan-1";
@@ -64,19 +64,20 @@ async function gateway(reply: string): Promise<Harness> {
 		dbPath: join(directory, "gateway.db"),
 		logVerbosity: "info",
 		// Both keys: a bare id only resolves for discord, so telegram needs the prefixed form.
-		channels: { "chan-1": { engagement: "open" }, "telegram:chan-1": { engagement: "open" } },
+		channels: {
+			"chan-1": { engagement: "open", settleWindowMs: 0 },
+			"telegram:chan-1": { engagement: "open", settleWindowMs: 0 },
+		},
 	};
 	const database = await GatewayDatabase.open(config.dbPath);
 	const turns: string[] = [];
-	const gjc: GjcPort = {
-		ensureSession: async () => ({ sessionId: "mock-session" }),
-		sendTurn: async (_sessionId, text) => {
+	const sessionPort = sessionPortFromResponder({
+		respond: async (_sessionId, text) => {
 			turns.push(text);
 			return reply;
 		},
-		forgetRebinds: () => {},
-	};
-	server = await startUnixServer({ config, database, gjc, onStop: () => database.close() });
+	});
+	server = await startUnixServer({ config, database, sessionPort, onStop: () => database.close() });
 	const client = await connect(config.socketPath);
 	client.send({ v: "0.1", type: "hello", payload: { supportedVersions: ["0.1"] } });
 	for (let attempt = 0; attempt < 60 && client.frames.length < 1; attempt++) await Bun.sleep(5);

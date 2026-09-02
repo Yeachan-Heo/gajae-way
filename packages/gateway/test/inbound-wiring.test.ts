@@ -3,7 +3,7 @@ import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { GatewayConfig } from "../src/config";
-import type { GjcPort } from "../src/orchestrator/gjc-client";
+import { ScriptedSessionPort } from "./session-port.fake";
 import { type GatewayServer, startUnixServer } from "../src/server/server";
 import { GatewayDatabase } from "../src/store/db";
 
@@ -61,15 +61,13 @@ test("a duplicate message id is acknowledged but never dispatched twice", async 
 	const config = await makeConfig();
 	const database = await GatewayDatabase.open(config.dbPath);
 	const turns: string[] = [];
-	const gjc: GjcPort = {
-		ensureSession: async () => ({ sessionId: "mock-session" }),
-		forgetRebinds: () => {},
-		sendTurn: async (_session, text) => {
-			turns.push(text);
-			return "mock reply";
+	const sessionPort = new ScriptedSessionPort({
+		onSend: (input, scripted) => {
+			turns.push(input.text);
+			scripted.complete(input.opRef, "mock reply");
 		},
-	};
-	server = await startUnixServer({ config, database, gjc, onStop: () => database.close() });
+	});
+	server = await startUnixServer({ config, database, sessionPort, onStop: () => database.close() });
 	const client = await connect(config.socketPath);
 	client.send({ v: "0.1", type: "hello", payload: { supportedVersions: ["0.1"] } });
 	await waitFor(client.frames, 1);
@@ -88,42 +86,28 @@ test("a duplicate message id is acknowledged but never dispatched twice", async 
 	client.close();
 });
 
-test("a message arriving while a turn is in flight is drained afterwards, not dropped", async () => {
+	test("a message arriving while a persistent turn is in flight is steered into that turn", async () => {
 	const config = await makeConfig();
 	const database = await GatewayDatabase.open(config.dbPath);
-	const turns: string[] = [];
-	let release: (() => void) | undefined;
-	const gate = new Promise<void>((resolve) => {
-		release = resolve;
-	});
-	const gjc: GjcPort = {
-		ensureSession: async () => ({ sessionId: "mock-session" }),
-		forgetRebinds: () => {},
-		sendTurn: async (_session, text) => {
-			turns.push(text);
-			if (turns.length === 1) await gate;
-			return `reply to ${text}`;
-		},
-	};
-	server = await startUnixServer({ config, database, gjc, onStop: () => database.close() });
+	const sessionPort = new ScriptedSessionPort();
+	server = await startUnixServer({ config, database, sessionPort, onStop: () => database.close() });
 	const client = await connect(config.socketPath);
 	client.send({ v: "0.1", type: "hello", payload: { supportedVersions: ["0.1"] } });
 	await waitFor(client.frames, 1);
 
 	client.send(chatSend("one", "msg-1", "first"));
 	await waitFor(client.frames, 2);
-	// The first turn is now parked inside gjc.sendTurn; the second message must survive it.
+	// The actor sends the correction through operator-gated turn.steer instead of
+	// waiting for a second legacy CLI turn.
 	client.send(chatSend("two", "msg-2", "second"));
 	await waitFor(client.frames, 3);
-	expect(turns).toEqual(["first"]);
-	expect(database.inboundPendingCount("loopback/loopback/loopback")).toBe(1);
+	expect(sessionPort.sends.map((send) => send.text)).toEqual(["first"]);
+	expect(sessionPort.steers.map((steer) => steer.text)).toEqual(["second"]);
+	sessionPort.complete(sessionPort.sends[0]!.opRef, "reply to first");
+	await waitFor(client.frames, 4);
 
-	release?.();
-	await waitFor(client.frames, 5);
-
-	expect(turns).toEqual(["first", "second"]);
 	const replies = client.frames.filter((frame) => frame.event === "chat.message").map((frame) => frame.payload.text);
-	expect(replies).toEqual(["reply to first", "reply to second"]);
+	expect(replies).toEqual(["reply to first"]);
 	expect(database.inboundPendingCount("loopback/loopback/loopback")).toBe(0);
 	client.close();
 });

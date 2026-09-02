@@ -1,0 +1,493 @@
+{
+  "schemaVersion": 1,
+  "kind": "api-package-test-report",
+  "generation": 6,
+  "sourceHash": "sha256:dbb424fc2ce64b0a18e8b17ce64d667c634804d1d6accef2fbf2f9db6c2c927f",
+  "reviewedHead": "da9e2e9a4c8e6de803f430b678c25384c6b7214e",
+  "subject": "Issue #92 persistent persona SDK-session cutover boundary QA/red-team",
+  "scope": {
+    "source": "Generation-6 frozen source hash supplied by the assignment. This lane made no product-source or test-source edits.",
+    "qaChanges": [
+      "No product-source or test-source edits were made in this lane; Generation-6 evidence was rerun against the supplied frozen source hash.",
+      "artifacts/issue92-boundary-qa-report.json: rewritten for generation 6"
+    ],
+    "staleLockDisposition": "No duplicate concurrent stale-lock case was added: packages/gateway/test/broker-supervisor.test.ts verifies that a dead-pid lock removes only stale remnants, preserves agent/sessions/saved-session-1/transcript.json, and permits start. Generation 6 also reviews the atomic-rename reclaim fix, which prevents a losing concurrent reclaimer from unlinking a newly recreated live lock.",
+    "testPolicy": "The required gateway full suite, credentialed live E2E, TypeScript check, subsession diff check, and gjc version check were each run exactly once. The retained Gen5 broker health flip-flop case ran in the full gateway suite."
+  },
+  "runtime": {
+    "gjcVersionInvocation": "gjc --version",
+    "gjcVersion": "gjc/0.16.0",
+    "gjcVersionStdout": "gjc/0.16.0",
+    "brokerTopology": "The gateway observes the gjc-owned per-agent-dir daemon. The first agent-dir-scoped sdk command auto-starts it; BrokerSupervisor owns the private agent directory and lock and probes sdk session list --scope cwd for a structural envelope whose result.sessions field is an array. Generation advances only after observed healthy recovery, and the retained Gen5 flip-flop case is included in the Gen6 full-suite evidence."
+  },
+  "rerunCommands": [
+    "bun test packages/gateway",
+    "GAJAEWAY_E2E_GJC=1 bun test packages/gateway/test/persistent-session.e2e.test.ts",
+    "bunx tsc --noEmit",
+    "git diff --exit-code -- packages/subsession/src",
+    "gjc --version"
+  ],
+  "contractCoverage": [
+    {
+      "contractRef": "AC1",
+      "obligation": "A mid-turn inbound message is steered into the running turn and no second turn fires.",
+      "status": "covered",
+      "provingRefs": [
+        "packages/gateway/test/steering.test.ts :: same-turn steer and transcript attribution",
+        "packages/gateway/test/redteam-issue92.test.ts :: broker death during a steer leaves the row durable and re-fires it once after terminal recovery",
+        "SE-CLI-LIVE-E2E :: live send plus in-flight steer passed"
+      ],
+      "adversarialCaseRefs": ["RT-BROKER-DEATH-DURING-STEER", "RT-COVERAGE-FUZZ", "LIVE-PERSISTENT-SESSION-E2E"]
+    },
+    {
+      "contractRef": "AC2",
+      "obligation": "Rapid idle fragments coalesce into exactly one fixed-from-first settle-window turn.",
+      "status": "covered",
+      "provingRefs": [
+        "packages/gateway/test/settle-coalesce.test.ts :: one fixed-from-first batch",
+        "packages/gateway/test/redteam-issue92.test.ts :: 500ms fragments through the exact two-second boundary"
+      ],
+      "adversarialCaseRefs": ["RT-SETTLE-STARVATION", "RT-COVERAGE-FUZZ"]
+    },
+    {
+      "contractRef": "AC3",
+      "obligation": "Every inbound id is attributable to a trigger or steer and none is silently dropped.",
+      "status": "covered",
+      "provingRefs": [
+        "packages/gateway/test/coverage-audit.test.ts :: boundary, failed-steer, and broker-generation attribution audits",
+        "packages/gateway/test/redteam-issue92.test.ts :: unknown hold, reset, and 12-seed coverage fuzz"
+      ],
+      "adversarialCaseRefs": ["RT-UNKNOWN-OP-NONSTEERABLE-HOLD", "RT-COVERAGE-FUZZ", "RT-NEW-WHILE-ACCEPTED"]
+    },
+    {
+      "contractRef": "AC4",
+      "obligation": "Restart resumes the same session and reconciles or re-fires interrupted durable work at most once.",
+      "status": "covered",
+      "provingRefs": [
+        "packages/gateway/test/session-restart.test.ts :: accepted, conflict, unknown, dead, authority-shift, terminal, and retired-hold recovery paths",
+        "packages/gateway/test/redteam-issue92.test.ts :: accepted-before-attribution restart, dead idle binding resume-once, and inspect outage",
+        "packages/gateway/test/redteam-issue92.test.ts :: an idle binding whose session died is resumed exactly once before the next send",
+        "packages/gateway/test/redteam-issue92.test.ts :: an inspect outage on an idle binding never blocks the send and never fabricates a resume",
+        "packages/gateway/test/broker-supervisor.test.ts :: red-team: an unhealthy health flip-flop never consumes or double-publishes a generation",
+        "SE-CLI-LIVE-E2E :: current gjc/0.16.0 live session completed"
+      ],
+      "adversarialCaseRefs": ["RT-SEND-ACCEPT-ATTRIBUTION-CRASH", "RT-IDLE-DEAD-BINDING-RESUME-ONCE", "RT-IDLE-INSPECT-OUTAGE", "RT-BROKER-GENERATION-FLIP-FLOP"]
+    },
+    {
+      "contractRef": "AC5",
+      "obligation": "/model rebinds the existing session and the next turn uses the new model.",
+      "status": "covered",
+      "provingRefs": [
+        "packages/gateway/test/session-rebind.test.ts",
+        "packages/gateway/test/model-command.test.ts",
+        "SE-CLI-LIVE-E2E :: real session model selection then request passed"
+      ],
+      "adversarialCaseRefs": ["LIVE-PERSISTENT-SESSION-E2E"]
+    },
+    {
+      "contractRef": "AC6",
+      "obligation": "Tail is the lifecycle source; a 120-second event silence alerts without aborting a running turn.",
+      "status": "covered",
+      "provingRefs": [
+        "packages/gateway/test/tail-liveness.test.ts :: terminal tail authority and exact stall threshold",
+        "packages/gateway/test/redteam-issue92.test.ts :: retention-gap, grace, slow-tail, stop-grace, and retired-stall cases",
+        "packages/gateway/test/tail-runner-gen3-redteam.test.ts :: receipt/cursor/close ordering including empty-terminal deferred flush"
+      ],
+      "adversarialCaseRefs": ["RT-TAIL-RETENTION-GAP", "RT-TERMINAL-GRACE-TAIL-WINS", "RT-SLOW-TAIL-GRACE-NONSTEERABLE", "RT-TAIL-EMPTY-TERMINAL-CURSOR-FENCE"]
+    },
+    {
+      "contractRef": "AC7",
+      "obligation": "Native compaction observation reaches the gateway log through the production SessionPort composition.",
+      "status": "covered",
+      "provingRefs": [
+        "packages/gateway/test/redteam-issue92.test.ts :: production monitor composition through SessionPort",
+        "packages/gateway/test/tail-liveness.test.ts :: authenticated compaction receipt logging"
+      ],
+      "adversarialCaseRefs": ["RT-COMPACTION-WIRED"]
+    },
+    {
+      "contractRef": "AC8",
+      "obligation": "Hard cutover removes the resume spawn and KeyedQueue path for all origins.",
+      "status": "covered",
+      "provingRefs": [
+        "packages/gateway/test/cutover-proof.test.ts :: no resume argv, KeyedQueue subject, abort path, or coexistence switch",
+        "packages/gateway/test/redteam-issue92.test.ts :: source and persistence non-goal probes"
+      ],
+      "adversarialCaseRefs": ["RT-NONGOAL-NO-ABORT", "RT-NONGOAL-NO-COEXISTENCE", "RT-NONGOAL-NO-PER-MESSAGE-REPLY", "RT-NONGOAL-NO-TRANSCRIPT-RECEIPT-PERSISTENCE"]
+    }
+  ],
+  "surfaceEvidence": [
+    {
+      "id": "SE-CLI-LIVE-E2E",
+      "surface": "cli",
+      "contractRefs": ["AC1", "AC3", "AC4", "AC5", "AC6"],
+      "invocation": "GAJAEWAY_E2E_GJC=1 bun test packages/gateway/test/persistent-session.e2e.test.ts",
+      "runCount": 1,
+      "verdict": "passed",
+      "result": {
+        "passed": 1,
+        "failed": 0,
+        "skipped": 0,
+        "expectCalls": 9,
+        "tests": 1,
+        "files": 1,
+        "reportedDurationSeconds": 78.15
+      },
+      "evidence": "On gjc/0.16.0, a real private-agent-dir session completed send, in-flight steer, tail marker observation, and duplicate op-ref rejection."
+    },
+    {
+      "id": "SE-API-FULL-SUITE-BASELINE",
+      "surface": "api",
+      "contractRefs": ["AC1", "AC2", "AC3", "AC4", "AC5", "AC6", "AC7", "AC8"],
+      "invocation": "bun test packages/gateway",
+      "runCount": 1,
+      "verdict": "passed",
+      "result": {
+        "passed": 603,
+        "failed": 0,
+        "skipped": 3,
+        "expectCalls": 4016,
+        "tests": 606,
+        "files": 68,
+        "reportedDurationSeconds": 65.61
+      },
+      "evidence": "The single Generation-6 full-suite run passed all 603 tests, including the retained broker-supervisor health flip-flop case, named red-team suites, session-restart recovery coverage, and stdio shutdown E2E."
+    },
+    {
+      "id": "SE-API-REDTEAM-BASELINE",
+      "surface": "api",
+      "contractRefs": ["AC1", "AC2", "AC3", "AC4", "AC6", "AC7", "AC8"],
+      "invocation": "bun test packages/gateway (embedded red-team and recovery suites; no separate rerun)",
+      "runCount": 1,
+      "verdict": "passed",
+      "result": {
+        "redteamIssue92TestStatements": 15,
+        "tailRunnerGen3RedteamTestStatements": 4,
+        "stdioShutdownE2eTestStatements": 1,
+        "brokerSupervisorTestStatements": 10,
+        "sessionRestartTestStatements": 7
+      },
+      "evidence": "The single passing full-suite run included all 20 named existing adversarial statements, all 10 broker-supervisor statements including the retained flip-flop case, and all 7 session-restart recovery statements."
+    },
+    {
+      "id": "SE-API-GEN5-FLIP-FLOP",
+      "surface": "api",
+      "contractRefs": ["AC4"],
+      "invocation": "bun test packages/gateway (packages/gateway/test/broker-supervisor.test.ts included)",
+      "runCount": 1,
+      "verdict": "passed",
+      "result": {
+        "testFileStatements": 10,
+        "packagePassed": 603,
+        "packageFailed": 0,
+        "packageSkipped": 3,
+        "packageTests": 606,
+        "packageFiles": 68,
+        "reportedDurationSeconds": 65.61
+      },
+      "expected": "generationDuringOutage is 1; the single observed recovery yields broker.generation 2 and listener sequence [1, 2].",
+      "observed": "generationDuringOutage is 1; the recovered broker generation and listener sequence are 2 and [1, 2].",
+      "evidence": "The retained deterministic health sequence is healthy at startup, unhealthy for the periodic probe and first recovery probe, then healthy; the case passed in the one Generation-6 full-suite run."
+    },
+    {
+      "id": "SE-API-TSC",
+      "surface": "api",
+      "contractRefs": ["AC1", "AC2", "AC3", "AC4", "AC5", "AC6", "AC7", "AC8"],
+      "invocation": "bunx tsc --noEmit",
+      "runCount": 1,
+      "verdict": "passed",
+      "result": {
+        "exitCode": 0,
+        "stdout": "",
+        "stderr": "",
+        "reportedDuration": "not emitted by command"
+      },
+      "evidence": "No TypeScript diagnostics were emitted by the single Generation-6 check (bunx tsc --noEmit)."
+    },
+    {
+      "id": "SE-INTEGRITY-SUBSESSION-DIFF",
+      "surface": "integrity",
+      "contractRefs": ["AC8"],
+      "invocation": "git diff --exit-code -- packages/subsession/src",
+      "runCount": 1,
+      "verdict": "passed",
+      "result": {
+        "exitCode": 0
+      },
+      "evidence": "No uncommitted changes exist under packages/subsession/src."
+    }
+  ],
+  "adversarialCases": [
+    {
+      "id": "RT-TAIL-RETENTION-GAP",
+      "contractRefs": ["AC6"],
+      "scenario": "A strict tail retention gap occurs while an accepted turn is in flight.",
+      "expectedBehavior": "Do not infer terminal or create another turn; retain a non-steerable hold until real terminal evidence.",
+      "verdict": "passed",
+      "provingRef": "packages/gateway/test/redteam-issue92.test.ts :: a strict tail retention gap does not infer terminal or create another turn",
+      "surfaceEvidenceRef": "SE-API-REDTEAM-BASELINE"
+    },
+    {
+      "id": "RT-BROKER-DEATH-DURING-STEER",
+      "contractRefs": ["AC1", "AC3", "AC4"],
+      "scenario": "The first turn.steer throws as if the broker dies during dispatch.",
+      "expectedBehavior": "The row stays durable and becomes one later batch after terminal recovery.",
+      "verdict": "passed",
+      "provingRef": "packages/gateway/test/redteam-issue92.test.ts :: broker death during a steer leaves the row unconsumed and sends it once after terminal recovery",
+      "surfaceEvidenceRef": "SE-API-REDTEAM-BASELINE"
+    },
+    {
+      "id": "RT-SETTLE-STARVATION",
+      "contractRefs": ["AC2", "AC3"],
+      "scenario": "500ms fragments continue through the exact +2000ms fixed cutoff.",
+      "expectedBehavior": "Exactly one cutoff batch contains the boundary row; post-fire input steers; no row is lost.",
+      "verdict": "passed",
+      "provingRef": "packages/gateway/test/redteam-issue92.test.ts :: fixed-from-first settling fires at two seconds under 500ms fragments and includes the exact boundary",
+      "surfaceEvidenceRef": "SE-API-REDTEAM-BASELINE"
+    },
+    {
+      "id": "RT-SEND-ACCEPT-ATTRIBUTION-CRASH",
+      "contractRefs": ["AC4"],
+      "scenario": "The broker accepts the deterministic op-ref before durable batch acceptance, then the gateway restarts.",
+      "expectedBehavior": "Reconcile the same operation reference without a second send.",
+      "verdict": "passed",
+      "provingRef": "packages/gateway/test/redteam-issue92.test.ts :: restart after broker acceptance but before durable acceptance reconciles the same op-ref without another send",
+      "surfaceEvidenceRef": "SE-API-REDTEAM-BASELINE"
+    },
+    {
+      "id": "RT-NEW-WHILE-ACCEPTED",
+      "contractRefs": ["AC3", "AC4"],
+      "scenario": "/new arrives with an accepted old batch, an unbatched pre-floor row, and new-epoch work.",
+      "expectedBehavior": "Discard only the unbatched pre-floor row, preserve the accepted batch, and suppress stale output.",
+      "verdict": "passed",
+      "provingRef": "packages/gateway/test/redteam-issue92.test.ts :: /new preserves an accepted batch, discards only unbatched pre-floor work, and fences stale output",
+      "surfaceEvidenceRef": "SE-API-REDTEAM-BASELINE"
+    },
+    {
+      "id": "RT-RETIRED-STALL-HOLD",
+      "contractRefs": ["AC4", "AC6"],
+      "scenario": "A retired accepted turn stalls while the next epoch has work.",
+      "expectedBehavior": "Alert and hold without aborting, blocking the new epoch, or delivering stale output.",
+      "verdict": "passed",
+      "provingRef": "packages/gateway/test/redteam-issue92.test.ts :: a stall on a retired hold does not abort it, block the next epoch, or deliver stale output",
+      "surfaceEvidenceRef": "SE-API-REDTEAM-BASELINE"
+    },
+    {
+      "id": "RT-UNKNOWN-OP-NONSTEERABLE-HOLD",
+      "contractRefs": ["AC3"],
+      "scenario": "turn.send returns client_ref_conflict and operation status is unknown; another inbound row arrives.",
+      "expectedBehavior": "The unresolved operation is non-steerable and the later row remains unbatched and pending.",
+      "verdict": "passed",
+      "provingRef": "packages/gateway/test/redteam-issue92.test.ts :: unknown send outcomes are non-steerable holds that retain subsequent rows",
+      "surfaceEvidenceRef": "SE-API-REDTEAM-BASELINE"
+    },
+    {
+      "id": "RT-TERMINAL-GRACE-TAIL-WINS",
+      "contractRefs": ["AC6"],
+      "scenario": "A terminal tail frame arrives during status-terminal grace.",
+      "expectedBehavior": "Tail settles exactly once and status fallback does not deliver a duplicate.",
+      "verdict": "passed",
+      "provingRef": "packages/gateway/test/redteam-issue92.test.ts :: a terminal tail frame arriving during the status grace wins once without status-fallback delivery",
+      "surfaceEvidenceRef": "SE-API-REDTEAM-BASELINE"
+    },
+    {
+      "id": "RT-SLOW-TAIL-GRACE-NONSTEERABLE",
+      "contractRefs": ["AC1", "AC6"],
+      "scenario": "Status is terminal while the terminal tail is slow and new inbound arrives during grace.",
+      "expectedBehavior": "The bound turn remains non-steerable, then one bounded status reconciliation settles it and later tail cannot deliver twice.",
+      "verdict": "passed",
+      "provingRef": "packages/gateway/test/redteam-issue92.test.ts :: slow tail keeps a status-terminal turn non-steerable until the bounded grace, then status settles it once",
+      "surfaceEvidenceRef": "SE-API-REDTEAM-BASELINE"
+    },
+    {
+      "id": "RT-GRACE-CANCELLED-AT-STOP",
+      "contractRefs": ["AC4", "AC6"],
+      "scenario": "The actor stops while the terminal-status grace callback is pending.",
+      "expectedBehavior": "The callback is cancelled and never touches the closed database.",
+      "verdict": "passed",
+      "provingRef": "packages/gateway/test/redteam-issue92.test.ts :: stopping during terminal-status grace cancels the grace callback so nothing touches a closed database",
+      "surfaceEvidenceRef": "SE-API-REDTEAM-BASELINE"
+    },
+    {
+      "id": "RT-COVERAGE-FUZZ",
+      "contractRefs": ["AC1", "AC2", "AC3", "AC4"],
+      "scenario": "Twelve deterministic interleavings combine boundary fragments, failed steers, and broker-generation changes.",
+      "expectedBehavior": "Every seed leaves every id done exactly once with no orphan or duplicate row.",
+      "verdict": "passed",
+      "provingRef": "packages/gateway/test/redteam-issue92.test.ts :: red-team coverage fuzz",
+      "surfaceEvidenceRef": "SE-API-REDTEAM-BASELINE"
+    },
+    {
+      "id": "RT-NONGOAL-NO-ABORT",
+      "contractRefs": ["AC8"],
+      "scenario": "The complete gateway source is probed for a running-turn interrupt or abort path.",
+      "expectedBehavior": "No turn.abort or turn.replace path remains.",
+      "verdict": "passed",
+      "provingRef": "packages/gateway/test/redteam-issue92.test.ts :: red-team non-goal probes",
+      "surfaceEvidenceRef": "SE-API-REDTEAM-BASELINE"
+    },
+    {
+      "id": "RT-NONGOAL-NO-COEXISTENCE",
+      "contractRefs": ["AC8"],
+      "scenario": "The config parser receives legacy and persistent turn-path feature fields.",
+      "expectedBehavior": "No coexistence configuration survives parsing.",
+      "verdict": "passed",
+      "provingRef": "packages/gateway/test/redteam-issue92.test.ts :: red-team non-goal probes",
+      "surfaceEvidenceRef": "SE-API-REDTEAM-BASELINE"
+    },
+    {
+      "id": "RT-NONGOAL-NO-PER-MESSAGE-REPLY",
+      "contractRefs": ["AC8"],
+      "scenario": "Several fragments coalesce and steer into one turn.",
+      "expectedBehavior": "Turn-level attribution holds without a per-message response guarantee.",
+      "verdict": "passed",
+      "provingRef": "packages/gateway/test/redteam-issue92.test.ts :: fixed-window and non-goal probes",
+      "surfaceEvidenceRef": "SE-API-REDTEAM-BASELINE"
+    },
+    {
+      "id": "RT-NONGOAL-NO-TRANSCRIPT-RECEIPT-PERSISTENCE",
+      "contractRefs": ["AC8"],
+      "scenario": "Fresh inbound_messages schema is inspected after migration.",
+      "expectedBehavior": "Only ratified batch metadata exists; no transcript, receipt, or pending op-ref persistence is added.",
+      "verdict": "passed",
+      "provingRef": "packages/gateway/test/redteam-issue92.test.ts :: red-team non-goal probes",
+      "surfaceEvidenceRef": "SE-API-REDTEAM-BASELINE"
+    },
+    {
+      "id": "RT-COMPACTION-WIRED",
+      "contractRefs": ["AC7"],
+      "scenario": "The production monitor composition is traced through SessionPort to TailRunner receipt logging.",
+      "expectedBehavior": "The production seam invokes runCompaction and records the authenticated compaction receipt.",
+      "verdict": "passed",
+      "provingRef": "packages/gateway/test/redteam-issue92.test.ts :: compaction observation is wired from production monitor composition through the SessionPort",
+      "surfaceEvidenceRef": "SE-API-REDTEAM-BASELINE"
+    },
+    {
+      "id": "RT-IDLE-DEAD-BINDING-RESUME-ONCE",
+      "contractRefs": ["AC4"],
+      "scenario": "An idle saved session is dead before the next send.",
+      "expectedBehavior": "session.resume happens exactly once before one send; a dead binding is never sent to directly.",
+      "verdict": "passed",
+      "provingRef": "packages/gateway/test/redteam-issue92.test.ts :: an idle binding whose session died is resumed exactly once before the next send",
+      "surfaceEvidenceRef": "SE-API-REDTEAM-BASELINE"
+    },
+    {
+      "id": "RT-IDLE-INSPECT-OUTAGE",
+      "contractRefs": ["AC4"],
+      "scenario": "Inspect fails while an idle saved binding is about to process new input.",
+      "expectedBehavior": "The send is not blocked and no unproven resume is fabricated.",
+      "verdict": "passed",
+      "provingRef": "packages/gateway/test/redteam-issue92.test.ts :: an inspect outage on an idle binding never blocks the send and never fabricates a resume",
+      "surfaceEvidenceRef": "SE-API-REDTEAM-BASELINE"
+    },
+    {
+      "id": "RT-TAIL-FLUSH-ORDERING",
+      "contractRefs": ["AC6"],
+      "scenario": "Receipt-bound tail frames and later live frames race while delivery is held.",
+      "expectedBehavior": "Buffered receipt frames flush exactly once before later live frames and cursor commits preserve that order.",
+      "verdict": "passed",
+      "provingRef": "packages/gateway/test/tail-runner-gen3-redteam.test.ts :: receipt-bound tail frames flush before later live frames, exactly once and before their cursors",
+      "surfaceEvidenceRef": "SE-API-REDTEAM-BASELINE"
+    },
+    {
+      "id": "RT-TAIL-FAILED-DELIVERY-CURSOR-FENCE",
+      "contractRefs": ["AC6"],
+      "scenario": "A tail delivery fails while later frames remain available.",
+      "expectedBehavior": "The failed cursor is not committed and later frames remain deliverable.",
+      "verdict": "passed",
+      "provingRef": "packages/gateway/test/tail-runner-gen3-redteam.test.ts :: a failed delivery keeps its cursor uncommitted while later tail frames remain deliverable",
+      "surfaceEvidenceRef": "SE-API-REDTEAM-BASELINE"
+    },
+    {
+      "id": "RT-TAIL-CLOSE-MID-FLUSH",
+      "contractRefs": ["AC6"],
+      "scenario": "The tail closes during a buffered delivery.",
+      "expectedBehavior": "Later frames and cursor commits are fenced after close.",
+      "verdict": "passed",
+      "provingRef": "packages/gateway/test/tail-runner-gen3-redteam.test.ts :: closing a tail during a buffered delivery fences later frames and cursor commits",
+      "surfaceEvidenceRef": "SE-API-REDTEAM-BASELINE"
+    },
+    {
+      "id": "RT-TAIL-EMPTY-TERMINAL-CURSOR-FENCE",
+      "contractRefs": ["AC6"],
+      "scenario": "An empty terminal page advertises a newer cursor while buffered frames still await delivery.",
+      "expectedBehavior": "No cursor commits until the deferred buffered side effect completes.",
+      "verdict": "passed",
+      "provingRef": "packages/gateway/test/tail-runner-gen3-redteam.test.ts :: an empty terminal poll never checkpoints past buffered frames still being delivered",
+      "surfaceEvidenceRef": "SE-API-REDTEAM-BASELINE"
+    },
+    {
+      "id": "RT-STDIO-SHUTDOWN-SELF-AWAIT",
+      "contractRefs": ["AC4"],
+      "scenario": "A gateway.shutdown request runs from the stdio request task itself.",
+      "expectedBehavior": "Ordered shutdown resolves and the daemon exits rather than self-awaiting its in-flight request.",
+      "verdict": "passed",
+      "provingRef": "packages/gateway/test/stdio-shutdown.e2e.test.ts :: a stdio gateway.shutdown request completes ordered shutdown and exits the daemon",
+      "surfaceEvidenceRef": "SE-API-REDTEAM-BASELINE"
+    },
+    {
+      "id": "RT-BROKER-GENERATION-FLIP-FLOP",
+      "contractRefs": ["AC4"],
+      "scenario": "Startup is healthy, then a periodic health probe and the first recovery probe are unhealthy before the next recovery probe returns healthy.",
+      "expectedBehavior": "The public generation remains 1 throughout the outage, then exactly one observed recovery publishes generation 2 with listener sequence [1, 2].",
+      "verdict": "passed",
+      "provingRef": "packages/gateway/test/broker-supervisor.test.ts :: red-team: an unhealthy health flip-flop never consumes or double-publishes a generation",
+      "surfaceEvidenceRef": "SE-API-GEN5-FLIP-FLOP",
+      "observed": "generationDuringOutage remained 1; the recovered broker generation and listener sequence were 2 and [1, 2]."
+    },
+    {
+      "id": "LIVE-PERSISTENT-SESSION-E2E",
+      "contractRefs": ["AC1", "AC3", "AC4", "AC5", "AC6"],
+      "scenario": "A credentialed scratch gjc session performs a send, in-flight steer, tail-marker observation, and duplicate op-ref rejection.",
+      "expectedBehavior": "The gjc-owned agent-dir daemon starts and all live assertions complete.",
+      "verdict": "passed",
+      "provingRef": "packages/gateway/test/persistent-session.e2e.test.ts :: real gjc-hosted scratch session accepts sends, a mid-turn steer, tail evidence, and duplicate-op-ref rejection",
+      "surfaceEvidenceRef": "SE-CLI-LIVE-E2E"
+    }
+  ],
+  "priorBlockers": [
+    {
+      "id": "B92-UNKNOWN-HOLD-MUTATION",
+      "status": "resolved",
+      "provingTest": "packages/gateway/test/redteam-issue92.test.ts :: unknown send outcomes are non-steerable holds that retain subsequent rows"
+    },
+    {
+      "id": "B92-COMPACTION-OBSERVABILITY",
+      "status": "resolved",
+      "provingTest": "packages/gateway/test/redteam-issue92.test.ts :: compaction observation is wired from production monitor composition through the SessionPort"
+    },
+    {
+      "id": "B92-LIVE-BROKER-INTERNAL-COMPATIBILITY",
+      "status": "resolved",
+      "provingTest": "GAJAEWAY_E2E_GJC=1 bun test packages/gateway/test/persistent-session.e2e.test.ts :: 1 pass, 0 fail on gjc/0.16.0"
+    },
+    {
+      "id": "B92-PREFLIGHT-MARKER",
+      "status": "resolved",
+      "provingTest": "packages/gateway/test/broker-supervisor.test.ts :: readiness rejects a zero-exit generic help reply and boot aborts on a generic sdk reply"
+    },
+    {
+      "id": "B92-BROKER-TOPOLOGY-CONTRACT",
+      "status": "resolved",
+      "provingTest": "packages/gateway/test/broker-supervisor.test.ts :: observes the gjc-owned agent-dir daemon, never spawns a host, and fences recovery with generation"
+    },
+    {
+      "id": "B92-STDIO-SHUTDOWN-SELF-AWAIT",
+      "status": "resolved",
+      "provingTest": "packages/gateway/test/stdio-shutdown.e2e.test.ts :: a stdio gateway.shutdown request completes ordered shutdown and exits the daemon"
+    },
+    {
+      "id": "B92-TAIL-EMPTY-TERMINAL-CURSOR",
+      "status": "resolved",
+      "provingTest": "packages/gateway/test/tail-runner-gen3-redteam.test.ts :: an empty terminal poll never checkpoints past buffered frames still being delivered"
+    },
+    {
+      "id": "B92-GEN5-GENERATION-RETRY-CONSUMPTION",
+      "status": "resolved",
+      "provingTest": "packages/gateway/test/broker-supervisor.test.ts :: red-team: an unhealthy health flip-flop never consumes or double-publishes a generation"
+    }
+  ],
+  "blockers": [],
+  "overallVerdict": "passed",
+  "conclusion": "Generation 6 re-ran the Issue #92 boundary evidence against sourceHash sha256:dbb424fc2ce64b0a18e8b17ce64d667c634804d1d6accef2fbf2f9db6c2c927f. The gateway suite passed 603/0 with 3 skips across 606 tests and 68 files (4016 expect calls); the credentialed gjc/0.16.0 live E2E passed 1/0; tsc and the packages/subsession/src diff check passed. The retained broker health flip-flop now keeps generation 1 throughout the outage and publishes exactly generation 2 with listener sequence [1, 2]. AC4 is covered by session-restart.test.ts and both idle-binding red-team cases; no blockers remain."
+}
