@@ -27,6 +27,8 @@ export interface RunDaemonOptions {
 	readonly adminPort?: number;
 	readonly exit?: (code: number) => void;
 	readonly log?: (line: string) => void;
+	/** `daemon run --only-new`: refuse immediately when a live daemon holds the home instead of waiting it out. */
+	readonly onlyNew?: boolean;
 }
 
 interface AdminLifecycle {
@@ -197,7 +199,11 @@ export class Daemon {
 export async function runDaemon(options: RunDaemonOptions = {}): Promise<Daemon> {
 	const home = options.home ?? gatewayHome();
 	const log = options.log ?? ((line: string) => console.error(line));
-	const lock = await DaemonLock.acquire(home, { ...defaultDaemonLockPorts(), log });
+	const lock = await DaemonLock.acquire(
+		home,
+		{ ...defaultDaemonLockPorts(), log },
+		{ onlyNew: options.onlyNew === true },
+	);
 	const daemon = new Daemon({ lock, exit: options.exit, log });
 	daemon.installSignalHandlers();
 	log(`gajaeway daemon starting pid=${process.pid} home=${home}`);

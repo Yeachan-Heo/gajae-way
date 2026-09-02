@@ -6,6 +6,7 @@ try {
 		home: process.env.GAJAEWAY_HOME,
 		broker: testOnlyBrokerDependencies(),
 		adminPort: 0,
+		onlyNew: process.argv.includes("--only-new"),
 	});
 	await daemon.stopped;
 } catch (error) {

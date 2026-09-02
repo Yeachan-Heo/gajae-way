@@ -4,10 +4,10 @@ import { isDaemonLockRefusal, runDaemon } from "./daemon";
 import { VERSION } from "./version";
 
 export const APP_USAGE =
-	"usage: gajaeway [--socket PATH] daemon run|config check [path]|status|shutdown|chat|sessions ...|ops ...|memory ...|monitors ...|work ...";
+	"usage: gajaeway [--socket PATH] daemon run [--only-new]|config check [path]|status|shutdown|chat|sessions ...|ops ...|memory ...|monitors ...|work ...";
 
 export type AppArgs =
-	| { readonly kind: "daemon" }
+	| { readonly kind: "daemon"; readonly onlyNew: boolean }
 	| { readonly kind: "config-check"; readonly path?: string }
 	| { readonly kind: "help" }
 	| { readonly kind: "version" }
@@ -18,14 +18,21 @@ export type AppArgs =
 export function parseAppArgs(args: readonly string[]): AppArgs {
 	if (args.length === 1 && (args[0] === "--help" || args[0] === "-h")) return { kind: "help" };
 	if (args.length === 1 && (args[0] === "--version" || args[0] === "-v")) return { kind: "version" };
-	if (args.length === 2 && args[0] === "daemon" && args[1] === "run") return { kind: "daemon" };
+	if (args[0] === "daemon" && args[1] === "run") {
+		const flags = args.slice(2);
+		if (flags.every((flag) => flag === "--only-new")) return { kind: "daemon", onlyNew: flags.includes("--only-new") };
+	}
 	if (args[0] === "config" && args[1] === "check" && args.length <= 3)
 		return { kind: "config-check", ...(args[2] === undefined ? {} : { path: args[2] }) };
 	if (args[0] === "daemon" || args[0] === "config") return { kind: "usage" };
 
 	const parsed = parseArgs([...args]);
-	if (parsed.command === "daemon")
-		return parsed.rest.length === 1 && parsed.rest[0] === "run" ? { kind: "daemon" } : { kind: "usage" };
+	if (parsed.command === "daemon") {
+		const [verb, ...flags] = parsed.rest;
+		return verb === "run" && flags.every((flag) => flag === "--only-new")
+			? { kind: "daemon", onlyNew: flags.includes("--only-new") }
+			: { kind: "usage" };
+	}
 	if (parsed.command === "config")
 		return parsed.rest[0] === "check" && parsed.rest.length <= 2
 			? { kind: "config-check", ...(parsed.rest[1] === undefined ? {} : { path: parsed.rest[1] }) }
@@ -51,7 +58,7 @@ export async function main(args = process.argv.slice(2)): Promise<void> {
 		}
 		case "daemon":
 			try {
-				const daemon = await runDaemon();
+				const daemon = await runDaemon({ onlyNew: parsed.onlyNew });
 				await daemon.stopped;
 			} catch (error) {
 				console.error(error instanceof Error ? error.message : String(error));

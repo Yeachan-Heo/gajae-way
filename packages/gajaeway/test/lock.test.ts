@@ -35,21 +35,21 @@ test("a fresh daemon lock claims gajaeway.pid and releases it", async () => {
 	expect(await Bun.file(lock.path).exists()).toBe(false);
 });
 
-test("a live holder and an EPERM-equivalent liveness result both refuse", async () => {
+test("a live holder (including an EPERM-equivalent liveness result) that never exits is refused after the wait", async () => {
 	const dir = await home();
 	const path = join(dir, "gajaeway.pid");
 	await writeFile(path, "2002\n");
-	for (const liveness of ["alive", "alive"] as const) {
-		await expect(
-			DaemonLock.acquire(
-				dir,
-				ports(1001, () => liveness),
-			),
-		).rejects.toMatchObject({
-			name: "DaemonLockRefusalError",
-			exitCode: 2,
-		});
-	}
+	await expect(
+		DaemonLock.acquire(
+			dir,
+			ports(1001, () => "alive"),
+			{ waitMs: 200, sleep: async () => {} },
+		),
+	).rejects.toMatchObject({
+		name: "DaemonLockRefusalError",
+		exitCode: 2,
+	});
+	expect((await readFile(path, "utf8")).trim()).toBe("2002");
 });
 
 test("a lock naming this process refuses rather than unlinking itself", async () => {
@@ -137,4 +137,43 @@ test("release leaves a replaced lock untouched", async () => {
 	await writeFile(lock.path, "2002\n");
 	await lock.release();
 	expect(await Bun.file(lock.path).text()).toBe("2002\n");
+});
+
+test("a live holder is waited out (never signalled); the lock is claimed once it exits", async () => {
+	const dir = await home();
+	await writeFile(join(dir, "gajaeway.pid"), "4242\n");
+	const logs: string[] = [];
+	let polls = 0;
+	const lock = await DaemonLock.acquire(
+		dir,
+		{ pid: 9001, liveness: () => (++polls >= 4 ? "dead" : "alive"), log: (line) => void logs.push(line) },
+		{ waitMs: 5_000, sleep: async () => {} },
+	);
+	try {
+		expect(polls).toBeGreaterThanOrEqual(4);
+		expect(logs.some((line) => line.startsWith("daemon_predecessor_live pid=4242"))).toBe(true);
+		expect(logs).toContain("daemon_predecessor_exited pid=4242");
+		expect((await readFile(join(dir, "gajaeway.pid"), "utf8")).trim()).toBe("9001");
+	} finally {
+		await lock.release();
+	}
+});
+
+test("a holder that outlives the wait refuses (exit for the service manager to retry) and keeps its lock", async () => {
+	const dir = await home();
+	await writeFile(join(dir, "gajaeway.pid"), "4243\n");
+	await expect(
+		DaemonLock.acquire(dir, { pid: 9002, liveness: () => "alive" }, { waitMs: 300, sleep: async () => {} }),
+	).rejects.toBeInstanceOf(DaemonLockRefusalError);
+	expect((await readFile(join(dir, "gajaeway.pid"), "utf8")).trim()).toBe("4243");
+});
+
+test("--only-new refuses a live holder immediately without polling", async () => {
+	const dir = await home();
+	await writeFile(join(dir, "gajaeway.pid"), "4244\n");
+	let polls = 0;
+	await expect(
+		DaemonLock.acquire(dir, { pid: 9003, liveness: () => (polls++, "alive") }, { onlyNew: true }),
+	).rejects.toThrow("--only-new");
+	expect(polls).toBe(1);
 });

@@ -1,8 +1,6 @@
 import { join } from "node:path";
 import type { ChatMessagePayload, EngagementContext, OriginRef } from "@gajaeway/protocol";
 import { ProtocolError } from "@gajaeway/protocol";
-import { GajaewayClient } from "@gajaeway/sdk";
-import { adapterHome, loadTelegramAdapterConfig } from "./config";
 import { type TelegramMessageOriginShape, telegramMessageOrigin } from "./origin";
 import { telegramReactionFor } from "./reactions";
 import { resolveTelegramReplyContext, type TelegramReplyMessageShape } from "./reply";
@@ -534,36 +532,4 @@ function isObject(value: unknown): value is Record<string, unknown> {
 
 function isTelegramResult(value: unknown): value is { readonly ok: true; readonly result: unknown } {
 	return isObject(value) && value.ok === true && "result" in value;
-}
-
-if (import.meta.main) {
-	void (async () => {
-		const config = await loadTelegramAdapterConfig();
-		const client = await GajaewayClient.connectSocket(config.gatewaySocket ?? join(adapterHome(), "gateway.sock"));
-		const gateway: OpenGatewayClient = {
-			request: (verb, params) => client.request(verb, params),
-			onChatMessage: (handler) => client.on("chat.message", (payload) => handler(payload as ChatMessagePayload)),
-			open: async () => ({ replayed: 0 }),
-			close: () => client.close(),
-		};
-		const controller = new AbortController();
-		const gen: Generation = {
-			id: 1,
-			signal: controller.signal,
-			port: gateway,
-			track: (task) => task,
-			sleep: (ms) => abortableSleep(ms, controller.signal),
-		};
-		const handle = await startTelegramAdapter({ token: config.token }, gateway, adapterHome(), gen);
-		const stop = (): void => {
-			controller.abort();
-			void handle.stop();
-		};
-		process.once("SIGINT", stop);
-		process.once("SIGTERM", stop);
-		await handle.settled;
-	})().catch((error) => {
-		console.error(error instanceof Error ? error.message : String(error));
-		process.exitCode = 1;
-	});
 }

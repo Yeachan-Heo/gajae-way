@@ -3,7 +3,6 @@ import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { ChatMessagePayload } from "@gajaeway/protocol";
-import { loadTelegramAdapterConfig, TelegramAdapterStartupError } from "../src/config";
 import {
 	chunkTelegramMessage,
 	type GatewayClientLike,
@@ -24,26 +23,6 @@ const topicMessage = {
 	is_topic_message: true,
 	text: "hello @agent",
 };
-
-test("loads a token exclusively from its configured credential file", async () => {
-	const home = await temporaryHome();
-	try {
-		await writeFile(join(home, "token"), " test-token \n");
-		await writeFile(
-			join(home, "adapter-telegram.json"),
-			JSON.stringify({ tokenFile: "token", chats: { "1": { engagement: "open" } } }),
-		);
-		const config = await loadTelegramAdapterConfig({ GAJAEWAY_HOME: home });
-		expect(config.token).toBe("test-token");
-		expect(config.tokenFile).toBe(join(home, "token"));
-		await writeFile(join(home, "adapter-telegram.json"), "{}");
-		await expect(loadTelegramAdapterConfig({ GAJAEWAY_HOME: home })).rejects.toBeInstanceOf(
-			TelegramAdapterStartupError,
-		);
-	} finally {
-		await rm(home, { recursive: true, force: true });
-	}
-});
 
 test("maps private chats, groups, and forum topics to isolated origins", () => {
 	expect(telegramMessageOrigin({ chat: { id: 10, type: "private" }, from: { id: 11 } })).toEqual({

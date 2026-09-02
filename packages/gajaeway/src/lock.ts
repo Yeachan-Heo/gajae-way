@@ -36,10 +36,33 @@ export function defaultDaemonLockPorts(): DaemonLockPorts {
 	return { pid: process.pid, liveness: processLiveness, log: (line) => console.error(line) };
 }
 
+/** How long a newcomer waits for a live predecessor to finish its ordered shutdown before failing closed. */
+export const PREDECESSOR_EXIT_WAIT_MS = 20_000;
+
+export interface DaemonLockAcquireOptions {
+	/**
+	 * `--only-new`: a live holder is an immediate refusal. Without it the newcomer
+	 * waits (bounded) for the holder to exit - the service manager already sent
+	 * it the stop signal, or is about to - and only then claims the lock.
+	 */
+	readonly onlyNew?: boolean;
+	readonly waitMs?: number;
+	readonly sleep?: (ms: number) => Promise<void>;
+}
+
 /**
- * Per-home daemon ownership guard. A state that cannot be proven stale is never
- * reclaimed: the gateway's socket boot path unlinks blindly, so a second owner
- * would otherwise take down the resident daemon.
+ * Per-home daemon ownership guard, and the daemon's lifecycle belongs to the
+ * service manager (launchd / systemd): this never signals a peer. A state that
+ * cannot be proven stale is never reclaimed - the gateway's socket boot path
+ * unlinks blindly, so a second owner would otherwise take down the resident
+ * daemon.
+ *
+ * Live finding (2026-09-03): `launchctl kickstart -k` restarts the job before
+ * the previous process has finished its ordered shutdown; two daemons then
+ * supervised one private gjc broker and took turns retiring it. A live holder
+ * is therefore WAITED OUT rather than refused outright, and a holder that
+ * outlives the wait makes the newcomer exit for the service manager to retry
+ * under its own throttle.
  */
 export class DaemonLock {
 	private constructor(
@@ -47,7 +70,11 @@ export class DaemonLock {
 		readonly pid: number,
 	) {}
 
-	static async acquire(home: string, ports: DaemonLockPorts = defaultDaemonLockPorts()): Promise<DaemonLock> {
+	static async acquire(
+		home: string,
+		ports: DaemonLockPorts = defaultDaemonLockPorts(),
+		options: DaemonLockAcquireOptions = {},
+	): Promise<DaemonLock> {
 		const path = join(home, "gajaeway.pid");
 		await mkdir(home, { recursive: true, mode: 0o700 });
 		if (await claim(path, ports.pid)) return new DaemonLock(path, ports.pid);
@@ -58,8 +85,20 @@ export class DaemonLock {
 		}
 
 		switch (safeLiveness(ports, holder, path)) {
-			case "alive":
-				throw new DaemonLockRefusalError(`Another gajaeway daemon is already running (pid ${holder})`);
+			case "alive": {
+				if (options.onlyNew)
+					throw new DaemonLockRefusalError(
+						`Another gajaeway daemon is already running (pid ${holder}); --only-new refuses to wait for it`,
+					);
+				const waitMs = options.waitMs ?? PREDECESSOR_EXIT_WAIT_MS;
+				ports.log?.(`daemon_predecessor_live pid=${holder} action=wait maxMs=${waitMs}`);
+				if (!(await waitForDead(ports, holder, path, waitMs, options.sleep ?? ((ms) => Bun.sleep(ms)))))
+					throw new DaemonLockRefusalError(
+						`Another gajaeway daemon is already running (pid ${holder}) and did not exit within ${waitMs}ms; the service manager owns its lifecycle, retry after it exits`,
+					);
+				ports.log?.(`daemon_predecessor_exited pid=${holder}`);
+				break;
+			}
 			case "unknown":
 				throw new DaemonLockRefusalError(
 					`daemon lock ${path} cannot prove whether pid ${holder} is running; remove it by hand only after confirming no gajaeway daemon is running`,
@@ -91,6 +130,21 @@ export class DaemonLock {
 			// An unreadable or replaced lock is not ours to remove.
 		}
 	}
+}
+
+async function waitForDead(
+	ports: DaemonLockPorts,
+	pid: number,
+	path: string,
+	timeoutMs: number,
+	sleep: (ms: number) => Promise<void>,
+): Promise<boolean> {
+	const deadline = Date.now() + timeoutMs;
+	while (Date.now() < deadline) {
+		if (safeLiveness(ports, pid, path) === "dead") return true;
+		await sleep(100);
+	}
+	return safeLiveness(ports, pid, path) === "dead";
 }
 
 function safeLiveness(ports: DaemonLockPorts, pid: number, path: string): PidLiveness {

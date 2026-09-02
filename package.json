@@ -10,7 +10,7 @@
   "description": "Gajae Way operator-agent runtime",
   "scripts": {
     "test": "bun test packages",
-    "build": "bun build --compile packages/gateway/src/main.ts --outfile dist/gajaeway-gateway && bun build --compile packages/adapter-discord/src/main.ts --outfile dist/gajaeway-discord && bun build --compile packages/adapter-telegram/src/main.ts --outfile dist/gajaeway-telegram && bun build --compile packages/admin/src/main.ts --outfile dist/gajaeway-admin && bun build --compile packages/cli/src/main.ts --outfile dist/gajaeway"
+    "build": "rm -rf dist && bun build --compile packages/gajaeway/src/main.ts --outfile dist/gajaeway"
   },
   "devDependencies": {
     "@biomejs/biome": "2.5.2",

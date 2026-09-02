@@ -23,22 +23,12 @@ export function socketPath(home = process.env.GAJAEWAY_HOME): string {
  * with no arguments has to terminate before `main` opens a gateway socket,
  * never after, so the list is checked up front.
  */
-export const COMMANDS = [
-	"status",
-	"shutdown",
-	"chat",
-	"daemon",
-	"sessions",
-	"ops",
-	"memory",
-	"monitors",
-	"work",
-] as const;
+export const COMMANDS = ["status", "shutdown", "chat", "sessions", "ops", "memory", "monitors", "work"] as const;
 
 export const CLI_USAGE =
-	"usage: gajaeway [--socket PATH] status|shutdown|chat|daemon run|sessions list [--json] [--fields a,b,c] [--limit N] [--offset N]|sessions inspect <originKey-or-index>|memory audit|memory search <query>|monitors ...|work run <name> [--cwd DIR] <text>|ops backup <path>|ops cycle [--json]|ops integrity|ops restore <backupPath>";
+	"usage: gajaeway [--socket PATH] status|shutdown|chat|sessions list [--json] [--fields a,b,c] [--limit N] [--offset N]|sessions inspect <originKey-or-index>|memory audit|memory search <query>|monitors ...|work run <name> [--cwd DIR] <text>|ops backup <path>|ops cycle [--json]|ops integrity|ops restore <backupPath>";
 
-/** Usage errors exit 2, as `gajaeway-gateway` does; 1 stays a runtime failure. */
+/** Usage errors exit 2; 1 stays a runtime failure. */
 export const USAGE_EXIT_CODE = 2;
 
 /** The usage text when `command` cannot be dispatched, undefined when it can. */
@@ -225,11 +215,6 @@ export async function main(args = process.argv.slice(2)): Promise<void> {
 			}
 			case "chat":
 				await chat(parsed.socket);
-				break;
-			case "daemon":
-				if (parsed.rest[0] === "run")
-					console.log("Launch the gateway out-of-band with: bun packages/gateway/src/main.ts daemon");
-				else throw new Error("usage: gajaeway daemon run");
 				break;
 			// Flag validation happens before the socket connect so a bad
 			// `--fields`/`--limit` fails fast without a running gateway.
@@ -428,5 +413,3 @@ export async function main(args = process.argv.slice(2)): Promise<void> {
 		process.exitCode = 1;
 	}
 }
-
-if (import.meta.main) await main();

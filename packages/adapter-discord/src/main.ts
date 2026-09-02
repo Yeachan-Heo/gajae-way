@@ -6,13 +6,10 @@ import type {
 	OriginRef,
 	ReactionAction,
 } from "@gajaeway/protocol";
-import { GajaewayClient } from "@gajaeway/sdk";
 import { AttachmentBuilder, Client, GatewayIntentBits, MessageFlags, Partials } from "discord.js";
-import pkg from "../package.json";
 import { type AttachmentCarrier, describeInboundBody, firstVoiceMessage } from "./attachments";
 import { type AuthorLike, resolveDisplayName, resolveServerTag } from "./author";
-import { adapterHome, type LoadedDiscordVoiceConfig, loadDiscordAdapterConfig } from "./config";
-import { AdapterAlreadyRunningError, AdapterLock } from "./lock";
+import type { LoadedDiscordVoiceConfig } from "./config";
 import { type DiscordMessageOriginShape, discordMessageOrigin } from "./origin";
 import {
 	type DiscordInboundReaction,
@@ -1532,25 +1529,6 @@ function awaitWithAbort<T>(task: Promise<T>, signal: AbortSignal): Promise<T> {
 	});
 }
 
-function abortableGenerationSleep(ms: number, signal: AbortSignal): Promise<void> {
-	return new Promise((resolve, reject) => {
-		if (signal.aborted) {
-			reject(Object.assign(new Error("The operation was aborted"), { name: "AbortError" }));
-			return;
-		}
-		const timer = setTimeout(() => {
-			signal.removeEventListener("abort", onAbort);
-			resolve();
-		}, ms);
-		const onAbort = () => {
-			clearTimeout(timer);
-			signal.removeEventListener("abort", onAbort);
-			reject(Object.assign(new Error("The operation was aborted"), { name: "AbortError" }));
-		};
-		signal.addEventListener("abort", onAbort, { once: true });
-	});
-}
-
 function isDiscordTextChannel(value: unknown): value is DiscordTextChannelLike {
 	return typeof value === "object" && value !== null && "send" in value && typeof value.send === "function";
 }
@@ -1566,101 +1544,4 @@ function isRecoverableChannel(value: unknown): value is RecoverableChannel {
 		"messages" in value &&
 		typeof (value as { messages?: { fetch?: unknown } }).messages?.fetch === "function"
 	);
-}
-export const DISCORD_USAGE = [
-	"usage: gajaeway-discord [--help] [--version]",
-	"",
-	"Runs the Discord adapter in the foreground. Configuration is read from",
-	"$GAJAEWAY_HOME/adapter-discord.json; one instance at a time per home.",
-].join("\n");
-
-/** Usage errors exit 2, as `gajaeway-gateway` does; 1 stays a runtime failure. */
-export const USAGE_EXIT_CODE = 2;
-
-export type DiscordArgv =
-	| { readonly kind: "run" }
-	| { readonly kind: "help" }
-	| { readonly kind: "version" }
-	| { readonly kind: "usage"; readonly message: string };
-
-/**
- * Resolved before any connection work. `--help` used to boot a real adapter,
- * which meant that merely asking what the binary does opened a second Discord
- * session alongside the resident one.
- */
-export function parseDiscordArgs(args: readonly string[]): DiscordArgv {
-	if (args.length === 0) return { kind: "run" };
-	if (args.length === 1 && (args[0] === "--help" || args[0] === "-h")) return { kind: "help" };
-	if (args.length === 1 && (args[0] === "--version" || args[0] === "-v")) return { kind: "version" };
-	return { kind: "usage", message: `gajaeway-discord: unexpected argument ${args[0]}\n${DISCORD_USAGE}` };
-}
-
-if (import.meta.main) {
-	const argv = parseDiscordArgs(process.argv.slice(2));
-	if (argv.kind === "help") {
-		console.log(DISCORD_USAGE);
-	} else if (argv.kind === "version") {
-		console.log(pkg.version);
-	} else if (argv.kind === "usage") {
-		console.error(argv.message);
-		process.exit(USAGE_EXIT_CODE);
-	} else {
-		void AdapterLock.acquire(adapterHome())
-			.then(async (lock) => {
-				const home = adapterHome();
-				const controller = new AbortController();
-				let handle: AdapterHandle | undefined;
-				let stopping: Promise<void> | undefined;
-				const stop = (): Promise<void> => {
-					stopping ??= (async () => {
-						controller.abort();
-						await handle?.stop();
-						await lock.release();
-					})();
-					return stopping;
-				};
-				const release = (): void => void stop().finally(() => process.exit(0));
-				process.once("SIGINT", release);
-				process.once("SIGTERM", release);
-				try {
-					const config = await loadDiscordAdapterConfig();
-					const client = await GajaewayClient.connectSocket(config.gatewaySocket ?? join(home, "gateway.sock"));
-					// The temporary socket bridge negotiates before the adapter registers event
-					// handlers. S5 deletes it once in-process ports provide replay ordering.
-					const gateway: OpenGatewayClient = {
-						request: (verb, params) => client.request(verb, params),
-						onChatMessage: (handler) => client.on("chat.message", (payload) => handler(payload as ChatMessagePayload)),
-						onChatProgress: (handler) =>
-							client.on("chat.progress", (payload) => handler(payload as ChatProgressPayload)),
-						open: async () => ({ replayed: 0 }),
-						close: () => client.close(),
-					};
-					const gen: Generation = {
-						id: 1,
-						signal: controller.signal,
-						port: gateway,
-						track: (task) => task,
-						sleep: (ms) => abortableGenerationSleep(ms, controller.signal),
-					};
-					handle = await startDiscordAdapter(
-						{
-							token: config.token,
-							intents: config.intents,
-							voice: config.voice,
-							recoveryChannels: Object.keys(config.channels ?? {}),
-							recoveryCursorPath: join(home, "adapters", "discord", "recovery-cursor.json"),
-						},
-						gateway,
-						gen,
-					);
-					await handle.settled;
-				} finally {
-					await stop();
-				}
-			})
-			.catch((error) => {
-				console.error(error instanceof Error ? error.message : String(error));
-				process.exitCode = error instanceof AdapterAlreadyRunningError ? USAGE_EXIT_CODE : 1;
-			});
-	}
 }

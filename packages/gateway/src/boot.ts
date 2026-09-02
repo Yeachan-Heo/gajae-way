@@ -11,7 +11,6 @@ import { PersonaLoader } from "./persona/persona";
 import { type GatewayServer, startStdioServer, startUnixServer } from "./server/server";
 import { GatewayDatabase } from "./store/db";
 import { DeliveryLedger } from "./store/ledger";
-import { claimGatewayHome, defaultTakeoverPorts, releaseGatewayHome, type TakeoverPorts } from "./takeover";
 
 export interface BootGatewayRuntimeOptions {
 	readonly stdio?: boolean;
@@ -20,10 +19,6 @@ export interface BootGatewayRuntimeOptions {
 	readonly broker?: BrokerSupervisorDependencies;
 	/** Composite daemon shutdown owner for the gateway.shutdown verb. */
 	readonly shutdown?: (reason: string) => Promise<void>;
-	/** `--only-new`: refuse to start while a live same-home gateway exists instead of waiting for it to exit. */
-	readonly onlyNew?: boolean;
-	/** Test seam for the pid-record/liveness ports; production reads the process table. */
-	readonly takeover?: TakeoverPorts;
 }
 
 export interface BootGatewayOptions extends BootGatewayRuntimeOptions {
@@ -42,14 +37,6 @@ export async function bootGatewayFromConfig(
 ): Promise<GatewayServer> {
 	await mkdir(config.home, { recursive: true, mode: 0o700 });
 	await chmod(config.home, 0o700);
-	// Ownership of the home is settled BEFORE the socket, the database, or the
-	// broker lock are touched: a predecessor still running its ordered shutdown
-	// is waited out (the service manager owns its lifecycle), never contested.
-	await claimGatewayHome(
-		config.home,
-		{ onlyNew: options.onlyNew === true },
-		options.takeover ?? defaultTakeoverPorts(),
-	);
 	const database = await GatewayDatabase.open(config.dbPath);
 	let broker: BrokerSupervisor | undefined;
 	try {
@@ -89,10 +76,7 @@ export async function bootGatewayFromConfig(
 			instanceId: database.instanceId,
 			tailRunner,
 		});
-		const close = async () => {
-			database.close();
-			await releaseGatewayHome(config.home);
-		};
+		const close = async () => database.close();
 		const server = options.stdio
 			? startStdioServer({
 					config,
@@ -125,7 +109,6 @@ export async function bootGatewayFromConfig(
 			console.error(`broker cleanup after failed boot failed: ${diagnostic(stopError)}`);
 		}
 		database.close();
-		await releaseGatewayHome(config.home);
 		throw error;
 	}
 }

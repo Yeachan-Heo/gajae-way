@@ -61,7 +61,9 @@ test("config check exits zero for valid input and one for invalid input", async 
 });
 
 test("parser keeps app verbs out of the legacy cli dispatcher and delegates socket clients", () => {
-	expect(parseAppArgs(["daemon", "run"])).toEqual({ kind: "daemon" });
+	expect(parseAppArgs(["daemon", "run"])).toEqual({ kind: "daemon", onlyNew: false });
+	expect(parseAppArgs(["daemon", "run", "--only-new"])).toEqual({ kind: "daemon", onlyNew: true });
+	expect(parseAppArgs(["daemon", "run", "--bogus"])).toEqual({ kind: "usage" });
 	expect(parseAppArgs(["daemon", "nope"])).toEqual({ kind: "usage" });
 	expect(parseAppArgs(["--socket", "/tmp/gateway.sock", "status"])).toEqual({
 		kind: "cli",
