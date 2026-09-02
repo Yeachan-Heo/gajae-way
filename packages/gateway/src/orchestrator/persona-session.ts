@@ -1310,11 +1310,23 @@ class OriginActor {
 			if (!bound.retired && report.status.status === "terminal_ok") {
 				// The live tail already carried the finalized answer; only a tail-less
 				// reconcile (post-crash) needs the transcript round trip.
-				const text =
-					bound.tailTerminalObserved && bound.lastAssistantText !== undefined
-						? bound.lastAssistantText
-						: (await this.#manager.port.fetchLastAssistant({ sessionId: bound.sessionId, repo: this.#manager.repo }))
-								.text;
+				let text: string | undefined =
+					bound.tailTerminalObserved && bound.lastAssistantText !== undefined ? bound.lastAssistantText : undefined;
+				if (text === undefined) {
+					// Tail-less reconcile: only accept an assistant row produced by THIS
+					// op (>= its startedAt). A row older than the turn is the previous
+					// answer; re-posting it is worse than posting nothing.
+					const startedAt = report.status.startedAt;
+					const port = this.#manager.port;
+					if (typeof startedAt === "number" && port.fetchAssistantSince) {
+						const since = await port.fetchAssistantSince({ sessionId: bound.sessionId, repo: this.#manager.repo, notBeforeMs: startedAt });
+						if (since === undefined)
+							this.#manager.log(`terminal_text_unavailable origin=${this.originKey} epoch=${bound.epoch} opRef=${bound.batch.opRef} reason=no_assistant_row_since_start`);
+						text = since?.text ?? "";
+					} else {
+						text = (await port.fetchLastAssistant({ sessionId: bound.sessionId, repo: this.#manager.repo })).text;
+					}
+				}
 				await bound.lifecycle.onTerminal?.({ ...bound, text, status: report });
 			} else if (!bound.retired) {
 				await bound.lifecycle.onFailure?.({ ...bound, error: terminalError(report), status: report });

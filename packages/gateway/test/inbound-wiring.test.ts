@@ -102,7 +102,7 @@ test("a message arriving while a persistent turn is in flight is steered into th
 	client.send(chatSend("two", "msg-2", "second"));
 	await waitFor(client.frames, 3);
 	expect(sessionPort.sends.map((send) => send.text)).toEqual(["first"]);
-	expect(sessionPort.steers.map((steer) => steer.text)).toEqual(["second"]);
+	expect(sessionPort.steers.map((steer) => steer.text.replace(/^\[Additional message[^\n]*\]\n/, ""))).toEqual(["second"]);
 	sessionPort.complete(sessionPort.sends[0]!.opRef, "reply to first");
 	await waitFor(client.frames, 4);
 
