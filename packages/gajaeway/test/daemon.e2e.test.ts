@@ -95,21 +95,21 @@ test("the daemon owns its lock, exposes status and admin, and shutdown cleans so
 	const daemon = await start(home);
 	const socket = join(home, "gateway.sock");
 
-	const status = await command(["packages/cli/src/main.ts", "--socket", socket, "status"], home);
+	const status = await command(["packages/gajaeway/src/main.ts", "--socket", socket, "status"], home);
 	expect(status.code).toBe(0);
 	expect(JSON.parse(status.stdout)).toMatchObject({ pid: daemon.child.pid });
 
 	const second = await command(["packages/gajaeway/test/daemon-entry.ts"], home);
 	expect(second.code).toBe(2);
 	expect(second.stderr).toContain("Another gajaeway daemon is already running");
-	const stillRunning = await command(["packages/cli/src/main.ts", "--socket", socket, "status"], home);
+	const stillRunning = await command(["packages/gajaeway/src/main.ts", "--socket", socket, "status"], home);
 	expect(stillRunning.code).toBe(0);
 
 	const admin = await fetch(`${daemon.adminUrl}/api/status`);
 	expect(admin.status).toBe(200);
 	expect(await admin.json()).toMatchObject({ ok: true });
 
-	const shutdown = await command(["packages/cli/src/main.ts", "--socket", socket, "shutdown"], home);
+	const shutdown = await command(["packages/gajaeway/src/main.ts", "--socket", socket, "shutdown"], home);
 	expect(shutdown.code).toBe(0);
 	expect(await within(daemon.child.exited, 10_000)).toBe(0);
 	expect(await Bun.file(socket).exists()).toBe(false);

@@ -3,9 +3,6 @@
 	"version": "0.1.0",
 	"private": true,
 	"type": "module",
-	"bin": {
-		"gajaeway-gateway": "./src/main.ts"
-	},
 	"exports": {
 		".": "./src/index.ts",
 		"./test-broker": "./src/orchestrator/test-broker.ts"

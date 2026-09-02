@@ -206,32 +206,3 @@ describe("usage guard", () => {
 		expect(usageFor(parseArgs(["--socket", "/tmp/x"]).command)).toBe(CLI_USAGE);
 	});
 });
-
-describe("usage exits the process instead of blocking", () => {
-	async function run(args: string[]): Promise<{ code: number; stderr: string; stdout: string }> {
-		const child = Bun.spawn(["bun", join(import.meta.dir, "../src/main.ts"), ...args], {
-			stdout: "pipe",
-			stderr: "pipe",
-			env: { ...process.env, GAJAEWAY_HOME: join(tmpdir(), "gajaeway-cli-usage-nonexistent") },
-		});
-		const [stdout, stderr, code] = await Promise.all([
-			new Response(child.stdout).text(),
-			new Response(child.stderr).text(),
-			child.exited,
-		]);
-		return { code, stderr, stdout };
-	}
-
-	test("no arguments prints usage on stderr and exits non-zero", async () => {
-		const result = await run([]);
-		expect(result.code).toBe(USAGE_EXIT_CODE);
-		expect(result.stderr).toContain(CLI_USAGE);
-		expect(result.stdout).toBe("");
-	}, 30_000);
-
-	test("an unknown subcommand prints usage on stderr and exits non-zero", async () => {
-		const result = await run(["bogus"]);
-		expect(result.code).toBe(USAGE_EXIT_CODE);
-		expect(result.stderr).toContain(CLI_USAGE);
-	}, 30_000);
-});

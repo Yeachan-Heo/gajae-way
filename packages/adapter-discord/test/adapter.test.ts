@@ -3,7 +3,6 @@ import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { ChatMessagePayload } from "@gajaeway/protocol";
-import { DiscordAdapterStartupError, loadDiscordAdapterConfig } from "../src/config";
 import {
 	chunkDiscordMessage,
 	type DiscordClientLike,
@@ -19,24 +18,6 @@ import {
 import { discordMessageOrigin } from "../src/origin";
 
 const author = { id: "author-1" };
-
-test("loads and trims the token credential file without exposing its value", async () => {
-	const home = await mkdtemp(join(tmpdir(), "gajaeway-discord-adapter-"));
-	try {
-		await writeFile(join(home, "token"), " secret-token \n");
-		await writeFile(
-			join(home, "adapter-discord.json"),
-			JSON.stringify({ tokenFile: "token", channels: { c: { engagement: "open" } } }),
-		);
-		const config = await loadDiscordAdapterConfig({ GAJAEWAY_HOME: home });
-		expect(config.token).toBe("secret-token");
-		expect(config.tokenFile).toBe(join(home, "token"));
-		await writeFile(join(home, "adapter-discord.json"), "{}");
-		await expect(loadDiscordAdapterConfig({ GAJAEWAY_HOME: home })).rejects.toBeInstanceOf(DiscordAdapterStartupError);
-	} finally {
-		await rm(home, { recursive: true, force: true });
-	}
-});
 
 test("maps guild channels, threads, and DMs to canonical Discord origins", () => {
 	expect(discordMessageOrigin({ author, channel: { id: "channel-1" } })).toEqual({

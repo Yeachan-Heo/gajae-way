@@ -2,7 +2,7 @@ import { readFile } from "node:fs/promises";
 import { ConfigError, gatewayHome, parseConfigFile } from "./config";
 
 /**
- * Offline config validation (`gajaeway-gateway config check [path]`).
+ * Offline config validation (`gajaeway config check [path]`).
  *
  * Channel policy is read only at boot, so an invalid value never degrades a
  * running gateway — it stops the *next* one from starting. Observed twice in one
