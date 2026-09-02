@@ -170,6 +170,8 @@ async function loadOrCreateLaneJob(
 
 /** Persona tail stall heartbeat; well under the 120s stallTimeoutMs so alarms land within one interval of the threshold. */
 const DEFAULT_STALL_CHECK_INTERVAL_MS = 5_000;
+/** /restart: hard-exit budget after the ordered stop begins. */
+const RESTART_HARD_EXIT_MS = 15_000;
 interface Connection {
 	readonly decoder: FrameDecoder;
 	negotiated: boolean;
@@ -1341,7 +1343,13 @@ async function sendChat(
 		}
 		console.error(`gateway restart requested by owner via ${key}`);
 		// Let the ack leave the socket, then exit cleanly; the supervisor restarts us.
-		setTimeout(() => void runtime.stop?.("owner /restart"), 1_500);
+		setTimeout(() => {
+			void runtime.stop?.("owner /restart");
+			// The whole point is a fresh process: if the ordered stop wedges on a
+			// producer, exit anyway and let the supervisor relaunch. Durable inbound
+			// and session state recover on boot.
+			setTimeout(() => process.exit(0), RESTART_HARD_EXIT_MS).unref();
+		}, 1_500);
 		return;
 	}
 	if (params.text === "/new" || params.text === "/reset") {
