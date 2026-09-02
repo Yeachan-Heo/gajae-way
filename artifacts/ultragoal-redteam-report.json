@@ -1,13 +1,12 @@
 {
  "schemaVersion": 1,
  "kind": "api-package-test-report",
- "sourceHash": "sha256:881cead94042b40886ab650eb389b38de64e3ececd2ea2dcb3b8d74a3b90168c",
- "head": "72180c36da4768e14e90775b7c21f1de671d2e60",
- "command": "bun test packages/gateway/test/broker-supervisor.test.ts packages/gateway/test/terminal-idempotency.e2e.test.ts packages/gateway/test/tail-progress.test.ts packages/adapter-discord/test/reactions.test.ts packages/adapter-discord/test/recovery.test.ts",
- "junit": "/tmp/junit.xml",
+ "sourceHash": "sha256:5fef9c989e80938962f0ab364d5760beae1dad6a24e9339e47363a01ed690085",
+ "head": "ebae6d9e1c85bc46b916f059a1e8c0a923f2715e",
+ "command": "bun test packages/gateway/test/broker-supervisor.test.ts packages/gateway/test/terminal-idempotency.e2e.test.ts packages/gateway/test/tail-progress.test.ts packages/gateway/test/migration-drill.test.ts packages/adapter-discord/test/reactions.test.ts packages/adapter-discord/test/recovery.test.ts",
  "totals": {
-  "tests": 90,
-  "passed": 90,
+  "tests": 100,
+  "passed": 100,
   "failed": 0
  },
  "cases": [
@@ -31,7 +30,7 @@
   },
   {
    "id": "P4",
-   "obligation": "silent/stalled daemon resolves false at timeout, not before, not hanging",
+   "obligation": "stalled daemon resolves false at timeout, not before, not hanging",
    "verdict": "passed",
    "testSubstring": "red-team B1"
   },
@@ -66,6 +65,12 @@
    "testSubstring": "red-team B1"
   },
   {
+   "id": "G2-B1",
+   "obligation": "live-heartbeat but wedged router is retired and relaunched",
+   "verdict": "passed",
+   "testSubstring": "red-team G2-B1"
+  },
+  {
    "id": "F4",
    "obligation": "structural URL validation incl. userinfo attack",
    "verdict": "passed",
@@ -79,13 +84,13 @@
   },
   {
    "id": "B2",
-   "obligation": "answer shipped on tail, gateway restart, reconcile -> no new ledger row",
+   "obligation": "answer shipped on tail (gw-i-), gateway restart, reconcile -> no new ledger row",
    "verdict": "passed",
    "testSubstring": "red-team B2"
   },
   {
    "id": "I2/I5",
-   "obligation": "[BREAK] parts keyed per part; same text replay collides; different text documented as new id",
+   "obligation": "[BREAK] per-part terminal slots; regenerated DIFFERENT text posts nothing (real deliveryCreate)",
    "verdict": "passed",
    "testSubstring": "red-team I2/I5"
   },
@@ -102,6 +107,18 @@
    "testSubstring": "never reposts a previous turn"
   },
   {
+   "id": "G2-B3",
+   "obligation": "failed-steer backlog: late-dispatched batch never inherits previous answer",
+   "verdict": "passed",
+   "testSubstring": "red-team G2-B3"
+  },
+  {
+   "id": "M18",
+   "obligation": "schema 18 migration: dispatched_at first-bind immutability, per-part terminal claim",
+   "verdict": "passed",
+   "testSubstring": "migration 18 adds"
+  },
+  {
    "id": "A1",
    "obligation": "50035 from messages.fetch and from react -> ambiguous:false",
    "verdict": "passed",
@@ -109,7 +126,7 @@
   },
   {
    "id": "A2",
-   "obligation": "a non-permanent Discord failure (429 exhausting retries) stays ambiguous:true",
+   "obligation": "non-permanent failure (429 exhausting retries) stays ambiguous:true",
    "verdict": "passed",
    "testSubstring": "outlives the attempt bound"
   },
