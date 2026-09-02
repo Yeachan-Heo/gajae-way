@@ -547,13 +547,19 @@ class OriginActor {
 		const session = second.session;
 
 
+		// gjc >= 0.16.0 omits locator.repo, so the subsession normalizer yields
+		// undefined for a perfectly known session; the raw envelope is the
+		// liveness authority and the normalized record only adds repo/deleted.
+		const rawLive = raw?.live;
+		const knownById = rawLive !== undefined && raw?.disowned !== true;
 		const recoveryInput = {
 			session: {
-				live: session?.live ?? false,
+				live: session?.live ?? rawLive ?? false,
 				deleted: session?.deleted ?? false,
 				...(authorityShifted ? { ambiguous: true } : {}),
 				savedAuthorityValid:
-					session !== undefined && session.sessionId === sessionId && !session.deleted && session.repo === this.#manager.repo,
+					(session !== undefined && session.sessionId === sessionId && !session.deleted && session.repo === this.#manager.repo) ||
+					(session === undefined && knownById),
 				locatorMatches: session?.repo === undefined || session.repo === this.#manager.repo,
 				// The instance-scoped op-ref namespace and broker lock leave this actor as
 				// the only mutation owner for a persona origin.
