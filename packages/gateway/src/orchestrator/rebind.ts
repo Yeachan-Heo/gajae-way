@@ -6,7 +6,7 @@
  * (`gajaeway-<instanceId>-<originKey>-e<epoch>`). When the runtime condemns that
  * key, the session.create op fails identically forever and the host goes mute;
  * recovery used to require hand-editing `gateway.db` to bump `epoch`. A poisoned
- * key is not a broken conversation, so the four codes below are classified as
+ * key is not a broken conversation, so the codes below are classified as
  * REBINDABLE: the remedy is a new key (epoch bump), not a retry.
  *
  * Classification is strictly code-based. Human-readable message text is never
@@ -34,6 +34,10 @@ export const REBINDABLE_ERROR_CODES: ReadonlySet<string> = new Set([
 	"terminal_uncertain",
 	"managed_append_identity_mismatch",
 	"resume_unusable",
+	// Measured 2026-09-02 (집가재): the runtime remembers the key with an earlier
+	// request body (readinessTimeoutMs added on stable) and rejects every
+	// session.create for that origin+epoch forever. The key is dead; mint a new one.
+	"idempotency_conflict",
 ]);
 
 /** The code the gateway synthesizes for a child that died before the turn began. */
@@ -107,7 +111,7 @@ export function rebindableCodeOf(error: unknown): string | undefined {
  * Normalization is deliberately narrow: surrounding whitespace and control
  * characters are removed, because `" resource_gone"` is the same code with
  * transport noise. Case is NOT folded — `RESOURCE_GONE` is a different code and
- * is treated as a genuine failure rather than assumed to be one of the four.
+ * is treated as a genuine failure rather than assumed to be a rebindable one.
  */
 const CODE_LIMIT = 64;
 

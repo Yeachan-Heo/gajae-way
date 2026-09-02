@@ -1645,17 +1645,27 @@ async function createInboundTurnLifecycle(
 			message = reactionReply.body;
 			if (!message) return;
 		}
+		// Control tokens are internal protocol, never user-visible. Models routinely
+		// wrap them in a "reasoning" preamble ("...nothing to add.\n\n[SILENT]"), so a
+		// part is judged by whether it CONTAINS the token, not whether it equals it:
+		// any part carrying a silence token is dropped whole, and [REPLY:id] is
+		// honoured wherever it appears and always stripped from the delivered text.
 		const parts = message
 			.split(/\n\s*\[BREAK\]\s*\n?/)
 			.map((part) => part.trim())
-			.filter((part) => part.length > 0 && !isSilenceToken(part))
+			.filter((part) => part.length > 0 && !isSilenceToken(part) && !containsSilenceToken(part))
 			.slice(0, 5);
 		const planned: Array<{ readonly body: string; readonly replyTo?: string }> = [];
 		for (const part of parts) {
 			if (planned.length >= maxTurnParts) break;
-			const replyMatch = part.match(/^\[REPLY:([^\]\s]+)\]\s*/);
-			const body = replyMatch ? part.slice(replyMatch[0].length).trim() : part;
-			if (body) planned.push({ body, ...(replyMatch?.[1] ? { replyTo: replyMatch[1] } : {}) });
+			// Reply-threading: a part may open with [REPLY:<platform message id>] to
+			// answer a specific message; mentions are plain <@author id> in the text.
+			const replyMatch = part.match(/\[REPLY:([^\]\s]+)\]/);
+			const body = (replyMatch ? part.replace(/\s*\[REPLY:[^\]\s]+\]\s*/g, " ") : part)
+				.replace(/\s*\[BREAK\]\s*/g, " ")
+				.trim();
+			if (!body) continue;
+			planned.push({ body, ...(replyMatch?.[1] ? { replyTo: replyMatch[1] } : {}) });
 		}
 		const spoken = spokenReply(
 			planned.map((step) => step.body),
@@ -2004,6 +2014,11 @@ function writeError(connection: Connection, error: unknown, id?: string): void {
 function ownerPeerIdOf(config: GatewayConfig): string | undefined {
 	const owner = config.ownerTarget?.origin;
 	return owner && "peerId" in owner ? (owner as { peerId?: string }).peerId : undefined;
+}
+
+/** True when a part carries a silence token anywhere (a leaked reasoning preamble around it is still silence). */
+function containsSilenceToken(part: string): boolean {
+	return /\[(SILENT|silent)\]/.test(part);
 }
 
 function commandAuthorised(

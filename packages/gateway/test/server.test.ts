@@ -1145,3 +1145,50 @@ test("a fresh session's first turn carries recent conversation history, a later 
 	expect(turns[1]).not.toContain("[Recent conversation history");
 	client.close();
 });
+
+test("control tokens never leak: a silence token inside a preamble silences, and [REPLY:id] mid-text is stripped", async () => {
+	directory = await mkdtemp(join(tmpdir(), "gajaeway-server-"));
+	const config: GatewayConfig = {
+		schemaVersion: 1,
+		home: directory,
+		configPath: join(directory, "config.json"),
+		socketPath: join(directory, "gateway.sock"),
+		dbPath: join(directory, "gateway.db"),
+		logVerbosity: "info",
+		dmPolicy: "open" as const,
+		channels: { c1: { engagement: "open", settleWindowMs: 0 } },
+	};
+	const database = await GatewayDatabase.open(config.dbPath);
+	const replies = [
+		"Pure geopolitics chat, not addressed to me, nothing to add.\n\n[SILENT]",
+		"This is a real bug report.\n\n[REPLY:1544704223634260038] 알겠고 인정",
+	];
+	const sessionPort = sessionPortFromResponder({ respond: async () => replies.shift() ?? "[SILENT]" });
+	server = await startUnixServer({ config, database, sessionPort, onStop: () => database.close() });
+	const client = await connect(config.socketPath);
+	client.send({ v: "0.1", type: "hello", payload: { supportedVersions: ["0.1"] } });
+	await waitFor(client.frames, 1);
+	const origin = { platform: "discord", kind: "channel", conversationId: "c1" };
+	const say = (id: string, text: string) =>
+		client.send({
+			v: "0.1",
+			type: "request",
+			id,
+			verb: "chat.send",
+			params: {
+				origin,
+				text,
+				messageId: id,
+				engagement: { mentioned: true, group: true, authorId: "owner", authorName: "bellman" },
+			},
+		});
+	say("m1", "first");
+	await Bun.sleep(400);
+	say("m2", "second");
+	await Bun.sleep(600);
+	const messages = client.frames
+		.filter((f: any) => f.type === "event" && f.event === "chat.message" && f.payload?.text)
+		.map((f: any) => f.payload);
+	expect(messages.map((m: any) => m.text)).toEqual(["This is a real bug report. 알겠고 인정"]);
+	expect(messages[0].replyToMessageId).toBe("1544704223634260038");
+});

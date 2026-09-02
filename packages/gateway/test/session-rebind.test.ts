@@ -62,6 +62,7 @@ test("rebind classification is narrow and the measured code set is pinned", () =
 	// resume_unusable (#96) stays classified: the per-turn `--resume` spawn it was
 	// measured on is gone, but a bind-time create/resume can still report it.
 	expect([...REBINDABLE_ERROR_CODES].sort()).toEqual([
+		"idempotency_conflict",
 		"managed_append_identity_mismatch",
 		"resource_gone",
 		"resume_unusable",

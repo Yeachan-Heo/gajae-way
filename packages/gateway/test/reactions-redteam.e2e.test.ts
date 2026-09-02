@@ -758,10 +758,11 @@ test("RT-TOKEN-04 the silence-token contract is byte-identical next to reaction 
 			: `T:${frame.payload.text}`,
 	);
 	// Turn 1: token consumed, the remaining body is a silence token, so nothing is
-	// spoken. Turn 2: no LEADING token, so the whole reply is verbatim text.
+	// spoken. Turn 2: a silence token ANYWHERE in the text silences the part —
+	// control tokens are never delivered verbatim (live leak, 2026-09-02).
 	// Turn 3: silence suppresses everything. Turn 4: reaction only.
-	expect(observed).toEqual(["R:👍@m0", "T:[SILENT][REACT:🔥]", "R:🔥@m3"]);
-	expect(database.deliveryRows()).toHaveLength(3);
+	expect(observed).toEqual(["R:👍@m0", "R:🔥@m3"]);
+	expect(database.deliveryRows()).toHaveLength(2);
 });
 
 test("RT-TOKEN-05 reaction tokens on a loopback origin are never parsed", async () => {
