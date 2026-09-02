@@ -797,6 +797,16 @@ export class GatewayDatabase {
 		);
 	}
 
+	/**
+	 * Stale floor: unbatched pending rows older than `floorAt` are completed
+	 * without a turn. Used after outages/recovery so an old backlog is never
+	 * answered late; it never touches settled/accepted rows (those belong to a
+	 * turn or a hold and are released through their own recovery paths).
+	 */
+	inboundExpireStale(originKey: string, floorAt: string): string[] {
+		return this.inboundDiscardBefore(originKey, floorAt);
+	}
+
 	inboundDiscardBefore(originKey: string, floorAt: string): string[] {
 		const discard = () => {
 			const ids = this.#database

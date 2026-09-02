@@ -24,6 +24,8 @@ export interface GatewayConfigFile {
 	readonly settleWindowMs?: number;
 	/** Tail liveness alarm threshold in milliseconds. It never kills a running turn. */
 	readonly stallTimeoutMs?: number;
+	/** Pending inbound older than this is expired instead of answered after an outage (0 disables). */
+	readonly maxInboundAgeMs?: number;
 	/** Author ids allowed to trigger mention-gated group turns; absent/empty = anyone. */
 	readonly mentionAllowlist?: readonly string[];
 	/**
@@ -214,6 +216,12 @@ function parseSettleWindow(value: unknown, field: string): number {
 	return value as number;
 }
 
+function parseMaxInboundAge(value: unknown): number {
+	if (!Number.isInteger(value) || (value as number) < 0 || (value as number) > 86_400_000)
+		throw new ConfigError("config_invalid", "maxInboundAgeMs must be an integer between 0 and 86400000");
+	return value as number;
+}
+
 function parseStallTimeout(value: unknown): number {
 	if (!Number.isInteger(value) || (value as number) < 1_000 || (value as number) > 3_600_000)
 		throw new ConfigError("config_invalid", "stallTimeoutMs must be an integer between 1000 and 3600000");
@@ -317,6 +325,7 @@ export function parseConfigFile(value: unknown): GatewayConfigFile {
 			: { mentionAllowlist: parseStringArray(input.mentionAllowlist, "mentionAllowlist") }),
 		...(input.settleWindowMs === undefined ? {} : { settleWindowMs: parseSettleWindow(input.settleWindowMs, "settleWindowMs") }),
 		...(input.stallTimeoutMs === undefined ? {} : { stallTimeoutMs: parseStallTimeout(input.stallTimeoutMs) }),
+		...(input.maxInboundAgeMs === undefined ? {} : { maxInboundAgeMs: parseMaxInboundAge(input.maxInboundAgeMs) }),
 		...(model ? { model } : {}),
 		...(input.dmPolicy === undefined ? {} : { dmPolicy: parseDmPolicy(input.dmPolicy) }),
 		...(input.ownerTarget === undefined ? {} : { ownerTarget: parseOwnerTarget(input.ownerTarget) }),
@@ -391,6 +400,7 @@ export async function loadConfig(
 		logVerbosity: overrides.logVerbosity ?? fileConfig.logVerbosity ?? "info",
 		settleWindowMs: fileConfig.settleWindowMs ?? 2_000,
 		stallTimeoutMs: fileConfig.stallTimeoutMs ?? 120_000,
+		maxInboundAgeMs: fileConfig.maxInboundAgeMs ?? 600_000,
 	};
 }
 
@@ -427,7 +437,7 @@ export async function reloadConfig(current: GatewayConfig, overrides: ConfigOver
  * engagement/policy.ts), channels and `settleWindowMs` (fixed-window admission),
  * and `stallTimeoutMs` (tail liveness alarms). Each applies to the next actor event.
  */
-export const RELOADABLE_FIELDS = ["mentionAllowlist", "channels", "settleWindowMs", "stallTimeoutMs", "dmPolicy"] as const;
+export const RELOADABLE_FIELDS = ["mentionAllowlist", "channels", "settleWindowMs", "stallTimeoutMs", "maxInboundAgeMs", "dmPolicy"] as const;
 
 /** Fields bound to live startup resources and therefore changeable only by restart. */
 export const RESTART_REQUIRED_FIELDS = [

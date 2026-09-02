@@ -261,6 +261,7 @@ async function applyConfigReload(
 	}
 	runtime.config = result.config;
 	runtime.personaSessions.setStallTimeoutMs(result.config.stallTimeoutMs);
+	runtime.personaSessions.setMaxInboundAgeMs(result.config.maxInboundAgeMs);
 	console.error(
 		`gateway config reload (${trigger}) ok; applied=[${result.changed.join(",")}] restart-required=[${result.restartRequired.join(",")}] ignored=[${result.ignored.join(",")}]`,
 	);
@@ -500,6 +501,7 @@ function createRuntime(options: GatewayServerOptions): Runtime {
 		settleWindowMs: options.config.settleWindowMs,
 		settleWindowFor: (row) => settleWindowFor(row, runtime.config),
 		stallTimeoutMs: options.config.stallTimeoutMs,
+		maxInboundAgeMs: options.config.maxInboundAgeMs,
 		brokerGeneration: () => options.broker?.generation ?? 0,
 		onTurnStart: async (input) => await createInboundTurnLifecycle(input, options, runtime),
 		onInboundDiscard: (messageIds) => {
