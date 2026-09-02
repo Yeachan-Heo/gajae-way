@@ -63,7 +63,7 @@ import {
 } from "../orchestrator/persona-session";
 import { formatFailureNotice, sanitizeDiagnostic } from "../orchestrator/rebind";
 import { type SessionPort, SessionRequestTimeoutError } from "../orchestrator/session-port";
-import { deterministicTailDeliveryId } from "../orchestrator/tail-runner";
+import { deterministicInterimDeliveryId, deterministicTerminalDeliveryId } from "../orchestrator/tail-runner";
 import { buildSessionBootstrap } from "../persona/bootstrap";
 import { PersonaLoader } from "../persona/persona";
 import type { GatewayDatabase, InboundMessageRow, MonitorEventStage } from "../store/db";
@@ -1612,10 +1612,7 @@ async function createInboundTurnLifecycle(
 	const maxTurnParts = 10;
 	const interimSpeech = new InterimSpeechGate(options.interimSpeech);
 	let lastDeliveredRaw: string | undefined;
-	const deliverAssistantText = (
-		rawMessage: string,
-		tailEvent?: { readonly sessionId: string; readonly eventId: string },
-	) => {
+	const deliverAssistantText = (rawMessage: string, source: "interim" | "terminal") => {
 		if (!nonLoopback) return;
 		lastDeliveredRaw = rawMessage;
 		let message = rawMessage;
@@ -1667,13 +1664,27 @@ async function createInboundTurnLifecycle(
 		for (let index = 0; index < planned.length; index++) {
 			if (deliveredParts.length >= maxTurnParts) return;
 			const step = planned[index] as { body: string; replyTo?: string };
+			// Interim parts are keyed on (trigger, text, part): distinct findings get
+			// distinct rows, a replayed finding (stream backfill, id-less frame after
+			// restart) collides. The terminal reply owns ONE slot per part keyed on
+			// (trigger, part) only, so a regenerated or reconciled second answer for
+			// the same inbound message can never post, whatever its text.
 			const deliveryId =
-				tailEvent === undefined
-					? undefined
-					: deterministicTailDeliveryId(
-							tailEvent.sessionId,
-							index === 0 ? tailEvent.eventId : `${tailEvent.eventId}:${index}`,
-						);
+				source === "terminal"
+					? deterministicTerminalDeliveryId(key, input.batch.triggerMessageId, index)
+					: deterministicInterimDeliveryId(key, input.batch.triggerMessageId, step.body, index);
+			if (source === "terminal") {
+				// A finalized answer that already shipped on the tail satisfied the
+				// slot; the durable claim makes that survive a gateway restart.
+				const interimId = deterministicInterimDeliveryId(key, input.batch.triggerMessageId, step.body, index);
+				const priorRow = runtime.delivery.get(interimId);
+				const owner = options.database.inboundBatchClaimTerminal(
+					input.batch.batchKey,
+					index,
+					priorRow ? interimId : deliveryId,
+				);
+				if (owner !== deliveryId) continue;
+			}
 			const payload = runtime.delivery.prepare(crypto.randomUUID(), origin, step.body, step.replyTo, deliveryId);
 			if (!payload) continue;
 			deliveredParts.push(step.body);
@@ -1710,32 +1721,13 @@ async function createInboundTurnLifecycle(
 		for (const recipient of runtime.connections)
 			if (recipient.negotiated) recipient.write({ v: PROFILE_VERSION, type: "event", event: "chat.progress", payload });
 	};
-	// Session-cumulative counters at turn start; progress reports the delta for THIS turn.
-	let baseline: { toolCalls: number; outputTokens: number } | undefined;
-	let polling = false;
-	const pollProgress = async () => {
-		if (polling || !options.sessionPort.progress) return;
-		polling = true;
-		try {
-			const snapshot = await options.sessionPort.progress({
-				sessionId: input.sessionId,
-				repo: join(options.config.home, "workspace"),
-			});
-			if (!snapshot) return;
-			baseline ??= snapshot;
-			lastKnown = {
-				toolCalls: Math.max(lastKnown.toolCalls, snapshot.toolCalls - baseline.toolCalls),
-				outputTokens: Math.max(lastKnown.outputTokens, snapshot.outputTokens - baseline.outputTokens),
-			};
-		} finally {
-			polling = false;
-		}
-	};
-	void pollProgress();
+	// Counters come only from the live tail (onFrame): tool_activity frames and
+	// finalized assistant text. gjc 0.16.0's stream carries no token counters,
+	// and polling transcript.list/usage.get cost two gjc spawns (~1s CPU each)
+	// every interval per running turn, which starved the broker health probe
+	// under load. The heartbeat now only re-presents the last tail observation.
 	const heartbeat = setInterval(() => {
-		void pollProgress().then(() => {
-			if (tailActivitySeen) emitProgress(lastKnown);
-		});
+		if (tailActivitySeen) emitProgress(lastKnown);
 	}, intervalMs);
 	const endProgress = () => {
 		if (ended) return;
@@ -1755,8 +1747,7 @@ async function createInboundTurnLifecycle(
 			try {
 				const decision = interimSpeech.admit(frame.assistantText, Date.now(), { toolCallsSoFar: lastKnown.toolCalls });
 				if (!decision.deliver) console.error(`gateway mid-work speech suppressed (${turnId}, ${decision.reason}).`);
-				else
-					deliverAssistantText(frame.assistantText, frame.eventId ? { sessionId, eventId: frame.eventId } : undefined);
+				else deliverAssistantText(frame.assistantText, "interim");
 			} catch (error) {
 				console.error(`gateway intermediate delivery failed (${turnId}): ${diagnostic(error)}`);
 			}
@@ -1816,7 +1807,7 @@ async function createInboundTurnLifecycle(
 				return;
 			}
 			const capturedUser = speaker ? `${speaker} @ ${place}: ${userText}` : userText;
-			if (lastDeliveredRaw !== text) deliverAssistantText(text);
+			if (lastDeliveredRaw !== text) deliverAssistantText(text, "terminal");
 			if (deliveredParts.length === 0) {
 				if (reactionTokensSeen)
 					runtime.memory.enqueue({

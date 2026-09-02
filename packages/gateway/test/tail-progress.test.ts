@@ -118,3 +118,72 @@ test("a started server drives the persona tail stall heartbeat and stops it on s
 	expect(port.stallChecks).toBe(afterStop);
 	await rm(home, { recursive: true, force: true });
 });
+
+test("red-team G1: chat.progress runs on tail frames only; a turn never issues transcript.list or usage.get", async () => {
+	const home = await mkdtemp(join(tmpdir(), "gajaeway-tail-progress-nospawn-"));
+	const config: GatewayConfig = {
+		schemaVersion: 1,
+		home,
+		configPath: join(home, "config.json"),
+		socketPath: join(home, "gateway.sock"),
+		dbPath: join(home, "gateway.db"),
+		logVerbosity: "info",
+		dmPolicy: "open",
+	};
+	const database = await GatewayDatabase.open(config.dbPath);
+	const port = new ScriptedSessionPort();
+	// SessionPort no longer has a progress() member at all; a compile-time
+	// guarantee the query path is gone, not merely unused.
+	const hasProgress = "progress" in port;
+	expect(hasProgress).toBe(false);
+	const server = await startUnixServer({
+		config,
+		database,
+		sessionPort: port,
+		progress: { firstAfterMs: 0, intervalMs: 5 },
+		onStop: () => database.close(),
+	});
+	let socket: Awaited<ReturnType<typeof Bun.connect>> | undefined;
+	const frames: any[] = [];
+	try {
+		let buffered = "";
+		socket = await Bun.connect({
+			unix: config.socketPath,
+			socket: {
+				data(_socket, data) {
+					buffered += Buffer.from(data).toString();
+					const lines = buffered.split("\n");
+					buffered = lines.pop() ?? "";
+					for (const line of lines) if (line) frames.push(JSON.parse(line));
+				},
+			},
+		});
+		socket.write(`${JSON.stringify({ v: "0.1", type: "hello", payload: { supportedVersions: ["0.1"] } })}\n`);
+		await eventually(() => frames.length >= 1, "negotiation did not complete");
+		socket.write(
+			`${JSON.stringify({
+				v: "0.1",
+				type: "request",
+				id: "turn",
+				verb: "chat.send",
+				params: { origin: { platform: "loopback", kind: "loopback", conversationId: "nospawn" }, text: "go" },
+			})}\n`,
+		);
+		await eventually(() => port.sends.length === 1, "turn was not sent");
+		const send = port.sends[0]!;
+		port.emitActivity(send.sessionId, { toolCalls: 1, outputTokens: 10 });
+		await eventually(
+			() => frames.some((frame) => frame.event === "chat.progress" && !frame.payload.final),
+			"no non-final progress",
+		);
+		port.complete(send.opRef, "done");
+		await eventually(
+			() => frames.filter((frame) => frame.event === "chat.progress" && frame.payload.final === true).length === 1,
+			"exactly one final progress frame expected",
+		);
+	} finally {
+		socket?.end();
+		await server.stop();
+		await rm(home, { recursive: true, force: true });
+	}
+});

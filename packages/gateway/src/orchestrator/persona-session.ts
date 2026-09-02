@@ -15,7 +15,7 @@ import type { GjcModelSelection } from "../config";
 import type { GatewayDatabase, InboundBatch, InboundMessageRow } from "../store/db";
 import { sanitizeDiagnostic } from "./rebind";
 import type { SessionBinding, SessionPort } from "./session-port";
-import { deterministicTailDeliveryId, TailCapacityError, type TailFrame, type TailHandle } from "./tail-runner";
+import { deterministicInterimDeliveryId, TailCapacityError, type TailFrame, type TailHandle } from "./tail-runner";
 
 export const DEFAULT_SETTLE_WINDOW_MS = 2_000;
 export const DEFAULT_STALL_TIMEOUT_MS = 120_000;
@@ -1164,7 +1164,12 @@ class OriginActor {
 						originKey: this.originKey,
 						sessionId,
 						eventId: frame.eventId,
-						deliveryId: deterministicTailDeliveryId(sessionId, frame.eventId),
+						deliveryId: deterministicInterimDeliveryId(
+							this.originKey,
+							bound.batch.triggerMessageId,
+							frame.assistantText,
+							0,
+						),
 						text: frame.assistantText,
 					});
 				}
@@ -1315,24 +1320,38 @@ class OriginActor {
 					bound.tailTerminalObserved && bound.lastAssistantText !== undefined ? bound.lastAssistantText : undefined;
 				if (text === undefined) {
 					// Tail-less reconcile: only accept an assistant row produced by THIS
-					// op (>= its startedAt). A row older than the turn is the previous
-					// answer; re-posting it is worse than posting nothing.
+					// operation. The runtime's own startedAt is exact; when it is absent
+					// the fallback is dispatched_at, stamped at the batch's first bind
+					// BEFORE the send and cleared on requeue, so it can neither postdate
+					// the answer (accepted_at could) nor predate the previous turn's
+					// answer (the settle cutoff could, on the failed-steer backlog path).
 					const startedAt = report.status.startedAt;
+					const dispatchedAt = this.#manager.database.inboundBatchDispatchedAt(bound.batch.batchKey);
+					const dispatchedMs = dispatchedAt ? Date.parse(dispatchedAt) : Number.NaN;
+					const notBeforeMs =
+						typeof startedAt === "number" ? startedAt : Number.isFinite(dispatchedMs) ? dispatchedMs : undefined;
 					const port = this.#manager.port;
-					if (typeof startedAt === "number" && port.fetchAssistantSince) {
-						const since = await port.fetchAssistantSince({
-							sessionId: bound.sessionId,
-							repo: this.#manager.repo,
-							notBeforeMs: startedAt,
-						});
-						if (since === undefined)
-							this.#manager.log(
-								`terminal_text_unavailable origin=${this.originKey} epoch=${bound.epoch} opRef=${bound.batch.opRef} reason=no_assistant_row_since_start`,
-							);
-						text = since?.text ?? "";
-					} else {
-						text = (await port.fetchLastAssistant({ sessionId: bound.sessionId, repo: this.#manager.repo })).text;
+					if (notBeforeMs === undefined || !port.fetchAssistantSince) {
+						// No trustworthy floor (a pre-v18 batch already bound before the
+						// upgrade, on a runtime that omits startedAt). Completing with ""
+						// would discard a real answer; posting the unbounded last row
+						// could repost the previous turn. Hold for the operator instead.
+						bound.nonSteerable = true;
+						this.#manager.log(
+							`recovery_hold origin=${this.originKey} epoch=${bound.epoch} opRef=${bound.batch.opRef} reason=no_turn_floor`,
+						);
+						return;
 					}
+					const since = await port.fetchAssistantSince({
+						sessionId: bound.sessionId,
+						repo: this.#manager.repo,
+						notBeforeMs,
+					});
+					if (since === undefined)
+						this.#manager.log(
+							`terminal_text_unavailable origin=${this.originKey} epoch=${bound.epoch} opRef=${bound.batch.opRef} reason=no_assistant_row_since_start`,
+						);
+					text = since?.text ?? "";
 				}
 				await bound.lifecycle.onTerminal?.({ ...bound, text, status: report });
 			} else if (!bound.retired) {

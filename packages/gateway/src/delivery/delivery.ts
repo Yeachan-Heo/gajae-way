@@ -40,6 +40,10 @@ export class DeliveryService {
 			return undefined;
 		return payload;
 	}
+	/** A ledger row by id; used to recognise a terminal reply that already shipped under its interim id. */
+	get(deliveryId: string) {
+		return this.#ledger.get(deliveryId);
+	}
 	/**
 	 * A reaction is a LEDGER DELIVERY, not a separate class of work.
 	 *

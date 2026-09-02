@@ -36,11 +36,6 @@ export interface SessionPort {
 		sessionId: string;
 		repo: string;
 	}): Promise<{ readonly live: boolean | undefined; readonly disowned: boolean }>;
-	/** Live turn counters (tool calls in the transcript, output tokens from usage.get); undefined when unsupported. */
-	progress?(input: {
-		sessionId: string;
-		repo: string;
-	}): Promise<{ readonly toolCalls: number; readonly outputTokens: number } | undefined>;
 	/** True when the session's prompt queue has no pending messages (queue.messages.list empty). */
 	queueEmpty?(input: { sessionId: string; repo: string }): Promise<boolean>;
 	/** Restores a saved, non-deleted session through `session.resume`; it never creates a replacement. */
@@ -55,9 +50,14 @@ export interface SessionPort {
 	status(input: { sessionId: string; repo: string; opRef: string }): Promise<StatusReport>;
 	fetchLastAssistant(input: { sessionId: string; repo: string }): Promise<LastAssistantResult>;
 	/**
-	 * Last assistant row NOT older than `notBeforeMs` (the op's own startedAt).
-	 * Turn-scoped by wall clock, independent of gjc ring coordinates
-	 * (gajae-code#5200); undefined when the newest row predates the turn.
+	 * Last assistant row NOT older than `notBeforeMs`. Callers pass the op's
+	 * reported startedAt when present, otherwise the batch's `dispatched_at`
+	 * (stamped at its first bind, before the send, never moved by a re-bind
+	 * and cleared on requeue). The settle/inclusion cutoff is deliberately not
+	 * a floor source: on the failed-steer backlog path it predates the previous
+	 * turn's answer. Turn-scoped by wall clock, independent of gjc ring
+	 * coordinates (gajae-code#5200); undefined when the newest row predates
+	 * the turn.
 	 */
 	fetchAssistantSince?(input: {
 		sessionId: string;
@@ -438,74 +438,6 @@ export class BrokerSessionPort implements SessionPort {
 
 	async status(input: { sessionId: string; repo: string; opRef: string }): Promise<StatusReport> {
 		return await fetchOpState(this.#controller(input.repo), input.sessionId, input.opRef);
-	}
-
-	/**
-	 * The host pushes no tool/usage frames on the live stream (only lifecycle +
-	 * finalized text), so mid-turn counters are read from the two queries that
-	 * do carry them: transcript.list (assistant toolCall content) and usage.get.
-	 */
-	async progress(input: {
-		sessionId: string;
-		repo: string;
-	}): Promise<{ readonly toolCalls: number; readonly outputTokens: number } | undefined> {
-		try {
-			const [transcript, usage] = await Promise.all([
-				this.#cli(
-					[
-						"sdk",
-						"session",
-						"raw",
-						"query",
-						input.sessionId,
-						"--query",
-						"transcript.list",
-						"--repo",
-						input.repo,
-						"--json-input",
-						"{}",
-					],
-					{ timeoutMs: 10_000 },
-				),
-				this.#cli(
-					[
-						"sdk",
-						"session",
-						"raw",
-						"query",
-						input.sessionId,
-						"--query",
-						"usage.get",
-						"--repo",
-						input.repo,
-						"--json-input",
-						"{}",
-					],
-					{ timeoutMs: 10_000 },
-				),
-			]);
-			const rows =
-				(
-					JSON.parse(transcript.stdout) as {
-						page?: { items?: Array<{ role?: string; content?: Array<{ type?: string }> }> };
-					}
-				).page?.items ?? [];
-			const toolCalls = rows.reduce(
-				(count, row) =>
-					count +
-					(row.role === "assistant" && Array.isArray(row.content)
-						? row.content.filter((part) => part?.type === "toolCall").length
-						: 0),
-				0,
-			);
-			const usageRow = (JSON.parse(usage.stdout) as { page?: { items?: Array<{ output?: unknown }> } }).page
-				?.items?.[0];
-			const outputTokens =
-				typeof usageRow?.output === "number" && Number.isFinite(usageRow.output) ? usageRow.output : 0;
-			return { toolCalls, outputTokens };
-		} catch {
-			return undefined;
-		}
 	}
 
 	async queueEmpty(input: { sessionId: string; repo: string }): Promise<boolean> {

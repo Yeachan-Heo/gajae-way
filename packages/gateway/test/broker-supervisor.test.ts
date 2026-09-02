@@ -5,7 +5,13 @@ import { join } from "node:path";
 import type { CliRunner } from "@gajaeway/subsession";
 import { bootGateway } from "../src/boot";
 import type { GatewayConfig } from "../src/config";
-import { BrokerSupervisor, MIN_GJC_VERSION } from "../src/orchestrator/broker";
+import {
+	BrokerSupervisor,
+	MIN_GJC_VERSION,
+	probeBrokerDiscovery,
+	probeBrokerEndpoint,
+	readBrokerDiscovery,
+} from "../src/orchestrator/broker";
 import { startUnixServer } from "../src/server/server";
 import { GatewayDatabase } from "../src/store/db";
 import { sessionPortFromResponder } from "./session-port.fake";
@@ -147,39 +153,614 @@ test("red-team: an unhealthy health flip-flop never consumes or double-publishes
 	}
 });
 
-test("default readiness probes cwd scope so the non-Git persona workspace never fails the daemon probe", async () => {
-	const home = await temporaryHome("gajaeway-broker-readiness-scope-");
+/**
+ * A stand-in for gjc's broker transport: token-gated upgrade, unsolicited
+ * broker_hello on open, and a `broker_response` to `session.list`. `router`
+ * models the daemon's session Router: "ok" answers, "error" answers ok:false,
+ * "stall" never answers (accept loop alive, routing wedged).
+ */
+function fakeBrokerTransport(
+	token: string,
+	options: { hello?: boolean; protocolVersion?: number; router?: "ok" | "error" | "stall" } = {},
+) {
+	const requests: unknown[] = [];
+	const server = Bun.serve({
+		hostname: "127.0.0.1",
+		port: 0,
+		fetch(request, srv) {
+			const url = new URL(request.url);
+			if (request.headers.get("upgrade")?.toLowerCase() !== "websocket")
+				return new Response("Upgrade Required", { status: 426 });
+			if (url.searchParams.get("token") !== token) return new Response("Unauthorized", { status: 401 });
+			return srv.upgrade(request) ? undefined : new Response("upgrade failed", { status: 400 });
+		},
+		websocket: {
+			open(socket) {
+				if (options.hello !== false)
+					socket.send(JSON.stringify({ type: "broker_hello", protocolVersion: options.protocolVersion ?? 3 }));
+			},
+			message(socket, raw) {
+				const frame = JSON.parse(String(raw)) as { id?: string; operation?: string };
+				requests.push(frame);
+				if ((options.router ?? "ok") === "stall") return;
+				if (options.router === "error")
+					socket.send(
+						JSON.stringify({ type: "broker_response", id: frame.id, ok: false, error: { code: "unavailable" } }),
+					);
+				else if (frame.operation === "session.list")
+					socket.send(JSON.stringify({ type: "broker_response", id: frame.id, ok: true, result: { sessions: [] } }));
+				else
+					socket.send(
+						JSON.stringify({ type: "broker_response", id: frame.id, ok: false, error: { code: "unknown_operation" } }),
+					);
+			},
+		},
+	});
+	return { url: `ws://127.0.0.1:${server.port}`, requests, stop: () => server.stop(true) };
+}
+
+async function writeDiscovery(agentDir: string, body: Record<string, unknown>): Promise<string> {
+	await mkdir(join(agentDir, "sdk"), { recursive: true });
+	const path = join(agentDir, "sdk", "broker.json");
+	await writeFile(path, JSON.stringify(body));
+	return path;
+}
+
+function discoveryBody(url: string, token: string, extra: Record<string, unknown> = {}): Record<string, unknown> {
+	return {
+		version: 1,
+		protocolVersion: 3,
+		pid: process.pid,
+		incarnation: "darwin:1:1",
+		host: "127.0.0.1",
+		port: Number(new URL(url).port),
+		url,
+		token,
+		startedAt: Date.now() - 1_000,
+		heartbeatAt: Date.now(),
+		...extra,
+	};
+}
+
+test("default readiness spawns gjc once to launch the daemon, then judges health only by the published endpoint", async () => {
+	const home = await temporaryHome("gajaeway-broker-readiness-endpoint-");
 	const commands: string[][] = [];
+	const transport = fakeBrokerTransport("secret-token");
+	let agentDir = "";
 	const broker = new BrokerSupervisor({
 		ssotAgentDir: null,
 		home,
-		instanceId: "instance-readiness-scope",
+		instanceId: "instance-readiness-endpoint",
 		command: async (args) => {
 			commands.push([...args]);
+			// gjc's first agent-dir command auto-starts its daemon, which then publishes discovery.
+			await writeDiscovery(agentDir, discoveryBody(transport.url, "secret-token"));
 			return HEALTHY;
 		},
 		healthIntervalMs: 60_000,
+		readinessDelayMs: 0,
 	});
+	agentDir = broker.agentDir;
 	try {
 		await broker.start();
 		expect(commands).toEqual([["sdk", "session", "--agent-dir", broker.agentDir, "list", "--scope", "cwd"]]);
 	} finally {
 		await broker.stop();
+		transport.stop();
 	}
 });
 
-test("readiness rejects a zero-exit generic help reply: only a structural session-list envelope is healthy", async () => {
-	const home = await temporaryHome("gajaeway-broker-generic-help-");
+test("readiness fails closed when the daemon never publishes a live endpoint, even if the CLI answers", async () => {
+	const home = await temporaryHome("gajaeway-broker-no-endpoint-");
+	let commands = 0;
 	const broker = new BrokerSupervisor({
 		ssotAgentDir: null,
 		home,
-		instanceId: "instance-generic",
-		command: async () => GENERIC_HELP,
+		instanceId: "instance-no-endpoint",
+		command: async () => {
+			commands++;
+			return HEALTHY;
+		},
 		readinessAttempts: 2,
 		readinessDelayMs: 0,
 		log: () => {},
 	});
 	await expect(broker.start()).rejects.toThrow("did not become healthy");
+	expect(commands).toBe(2);
+});
+
+test("endpoint probe: discovery is rejected for a stale heartbeat, a dead pid, a bad token, or a silent daemon", async () => {
+	const home = await temporaryHome("gajaeway-broker-endpoint-probe-");
+	const transport = fakeBrokerTransport("secret-token");
+	const silent = fakeBrokerTransport("secret-token", { hello: false });
+	const alive = async () => true;
+	const dead = async () => false;
+	try {
+		const fresh = await writeDiscovery(join(home, "fresh"), discoveryBody(transport.url, "secret-token"));
+		expect(await readBrokerDiscovery(fresh, alive)).toMatchObject({ pid: process.pid, url: transport.url });
+		expect(await readBrokerDiscovery(fresh, dead)).toBeUndefined();
+
+		const stale = await writeDiscovery(
+			join(home, "stale"),
+			discoveryBody(transport.url, "secret-token", { heartbeatAt: Date.now() - 16_000 }),
+		);
+		expect(await readBrokerDiscovery(stale, alive)).toBeUndefined();
+
+		const context = (discoveryPath: string) => ({
+			agentDir: home,
+			cli: async () => HEALTHY,
+			discoveryPath,
+			isPidAlive: alive,
+			timeoutMs: 500,
+		});
+		expect(await probeBrokerDiscovery(context(fresh))).toBe(true);
+		expect(await probeBrokerDiscovery(context(join(home, "missing", "broker.json")))).toBe(false);
+		expect(
+			await probeBrokerEndpoint({ pid: process.pid, url: transport.url, token: "wrong", heartbeatAt: Date.now() }, 500),
+		).toBe(false);
+		expect(
+			await probeBrokerEndpoint(
+				{ pid: process.pid, url: silent.url, token: "secret-token", heartbeatAt: Date.now() },
+				100,
+			),
+		).toBe(false);
+		const closed = fakeBrokerTransport("secret-token");
+		closed.stop();
+		expect(
+			await probeBrokerEndpoint(
+				{ pid: process.pid, url: closed.url, token: "secret-token", heartbeatAt: Date.now() },
+				500,
+			),
+		).toBe(false);
+	} finally {
+		transport.stop();
+		silent.stop();
+	}
+});
+
+test("endpoint probe costs milliseconds: 20 sequential probes finish well under one CLI cold start", async () => {
+	const home = await temporaryHome("gajaeway-broker-endpoint-cost-");
+	const transport = fakeBrokerTransport("secret-token");
+	try {
+		const path = await writeDiscovery(home, discoveryBody(transport.url, "secret-token"));
+		const context = {
+			agentDir: home,
+			cli: async () => HEALTHY,
+			discoveryPath: path,
+			isPidAlive: async () => true,
+			timeoutMs: 500,
+		};
+		const started = performance.now();
+		for (let index = 0; index < 20; index++) expect(await probeBrokerDiscovery(context)).toBe(true);
+		expect(performance.now() - started).toBeLessThan(500);
+	} finally {
+		transport.stop();
+	}
+});
+
+test("red-team B1: a daemon that greets but cannot route session.list is unhealthy; one that routes is healthy", async () => {
+	const stalled = fakeBrokerTransport("secret-token", { router: "stall" });
+	const erroring = fakeBrokerTransport("secret-token", { router: "error" });
+	const healthy = fakeBrokerTransport("secret-token");
+	const at = (url: string) => ({ pid: process.pid, url, token: "secret-token", heartbeatAt: Date.now() });
+	try {
+		const started = performance.now();
+		expect(await probeBrokerEndpoint(at(stalled.url), 300)).toBe(false);
+		// A stalled router is detected at the timeout, never earlier and never by hanging.
+		expect(performance.now() - started).toBeGreaterThanOrEqual(290);
+		expect(performance.now() - started).toBeLessThan(1_000);
+		expect(await probeBrokerEndpoint(at(erroring.url), 500)).toBe(false);
+		expect(await probeBrokerEndpoint(at(healthy.url), 500)).toBe(true);
+		// The probe issued a real read-only operation, not just a hello.
+		expect(healthy.requests).toEqual([expect.objectContaining({ type: "broker_request", operation: "session.list" })]);
+		// A hello with the wrong protocol version is not a broker we know how to talk to.
+		const wrongVersion = fakeBrokerTransport("secret-token", { protocolVersion: 2 });
+		try {
+			expect(await probeBrokerEndpoint(at(wrongVersion.url), 500)).toBe(false);
+		} finally {
+			wrongVersion.stop();
+		}
+	} finally {
+		stalled.stop();
+		erroring.stop();
+		healthy.stop();
+	}
+});
+
+test("red-team F4: discovery URL is validated structurally, never by string prefix", async () => {
+	const home = await temporaryHome("gajaeway-broker-url-");
+	const alive = async () => true;
+	const cases: Array<[string, boolean]> = [
+		["ws://127.0.0.1:60232", true],
+		["ws://127.0.0.1:60232/", true],
+		["ws://127.0.0.1:80@evil.example", false],
+		["ws://127.0.0.1:60232/path", false],
+		["ws://127.0.0.1:60232?x=1", false],
+		["ws://127.0.0.1:60232#frag", false],
+		["ws://localhost:60232", false],
+		["wss://127.0.0.1:60232", false],
+		["ws://127.0.0.1", false],
+		["not a url", false],
+	];
+	for (const [url, ok] of cases) {
+		const path = await writeDiscovery(
+			join(home, Bun.hash(url).toString(16)),
+			discoveryBody("ws://127.0.0.1:1", "t", { url }),
+		);
+		expect(await readBrokerDiscovery(path, alive), url).toEqual(ok ? expect.objectContaining({ url }) : undefined);
+	}
+});
+
+test("red-team P2/P5: heartbeat TTL boundary and malformed discovery never throw", async () => {
+	const home = await temporaryHome("gajaeway-broker-ttl-");
+	const alive = async () => true;
+	const now = Date.now();
+	const fresh = await writeDiscovery(
+		join(home, "a"),
+		discoveryBody("ws://127.0.0.1:1", "t", { heartbeatAt: now - 14_999 }),
+	);
+	const stale = await writeDiscovery(
+		join(home, "b"),
+		discoveryBody("ws://127.0.0.1:1", "t", { heartbeatAt: now - 15_001 }),
+	);
+	expect(await readBrokerDiscovery(fresh, alive, now)).toBeDefined();
+	expect(await readBrokerDiscovery(stale, alive, now)).toBeUndefined();
+	await mkdir(join(home, "c", "sdk"), { recursive: true });
+	await writeFile(join(home, "c", "sdk", "broker.json"), "{not json");
+	expect(await readBrokerDiscovery(join(home, "c", "sdk", "broker.json"), alive)).toBeUndefined();
+	await writeFile(join(home, "c", "sdk", "broker.json"), "null");
+	expect(await readBrokerDiscovery(join(home, "c", "sdk", "broker.json"), alive)).toBeUndefined();
+	await writeFile(join(home, "c", "sdk", "broker.json"), JSON.stringify([1, 2]));
+	expect(await readBrokerDiscovery(join(home, "c", "sdk", "broker.json"), alive)).toBeUndefined();
+});
+
+test("red-team P3/P7: a non-hello first frame is rejected, and a live endpoint means zero gjc spawns at readiness", async () => {
+	const home = await temporaryHome("gajaeway-broker-nohello-");
+	// A daemon that speaks first but not with a hello.
+	const rogue = Bun.serve({
+		hostname: "127.0.0.1",
+		port: 0,
+		fetch: (request, srv) => (srv.upgrade(request) ? undefined : new Response("no", { status: 400 })),
+		websocket: {
+			open(socket) {
+				socket.send(JSON.stringify({ type: "broker_response", id: "x", ok: true }));
+				socket.close();
+			},
+			message() {},
+		},
+	});
+	const transport = fakeBrokerTransport("secret-token");
+	let spawned = 0;
+	const broker = new BrokerSupervisor({
+		ssotAgentDir: null,
+		home,
+		instanceId: "instance-no-spawn",
+		command: async () => {
+			spawned++;
+			return HEALTHY;
+		},
+		healthIntervalMs: 60_000,
+		readinessDelayMs: 0,
+	});
+	try {
+		expect(
+			await probeBrokerEndpoint(
+				{ pid: process.pid, url: `ws://127.0.0.1:${rogue.port}`, token: "t", heartbeatAt: Date.now() },
+				500,
+			),
+		).toBe(false);
+		await writeDiscovery(broker.agentDir, discoveryBody(transport.url, "secret-token"));
+		await broker.start();
+		expect(spawned).toBe(0);
+	} finally {
+		await broker.stop();
+		transport.stop();
+		rogue.stop(true);
+	}
+});
+
+test("red-team G2-B1: a daemon that keeps a fresh heartbeat but cannot route session.list is retired and relaunched", async () => {
+	const home = await temporaryHome("gajaeway-broker-wedged-");
+	// Generation A: greets, keeps its heartbeat fresh, never answers session.list.
+	const wedged = fakeBrokerTransport("secret-token", { router: "stall" });
+	// Generation B: the replacement gjc launches after A is retired.
+	const replacement = fakeBrokerTransport("secret-token");
+	let launches = 0;
+	const killed: number[] = [];
+	const wedgedPid = 424242;
+	let agentDir = "";
+	const broker = new BrokerSupervisor({
+		ssotAgentDir: null,
+		home,
+		instanceId: "instance-wedged",
+		command: async () => {
+			launches++;
+			await writeDiscovery(agentDir, discoveryBody(replacement.url, "secret-token", { pid: process.pid }));
+			return HEALTHY;
+		},
+		isPidAlive: (pid) => pid === process.pid || (pid === wedgedPid && !killed.includes(pid)),
+		healthIntervalMs: 60_000,
+		healthProbeTimeoutMs: 100,
+		readinessDelayMs: 0,
+		readinessAttempts: 20,
+		log: () => {},
+	});
+	agentDir = broker.agentDir;
+	const originalKill = process.kill;
+	(process as { kill: typeof process.kill }).kill = ((pid: number, signal?: string | number) => {
+		if (pid === wedgedPid) {
+			killed.push(pid);
+			return true;
+		}
+		return originalKill(pid, signal as NodeJS.Signals);
+	}) as typeof process.kill;
+	try {
+		// The wedged daemon refreshes its heartbeat the whole time.
+		await writeDiscovery(agentDir, discoveryBody(wedged.url, "secret-token", { pid: wedgedPid }));
+		const refresher = setInterval(() => {
+			if (killed.length === 0)
+				void writeDiscovery(agentDir, discoveryBody(wedged.url, "secret-token", { pid: wedgedPid }));
+		}, 20);
+		try {
+			await broker.start();
+		} finally {
+			clearInterval(refresher);
+		}
+		expect(killed).toEqual([wedgedPid]);
+		expect(launches).toBe(1);
+		expect(replacement.requests.length).toBeGreaterThanOrEqual(1);
+	} finally {
+		(process as { kill: typeof process.kill }).kill = originalKill;
+		await broker.stop();
+		wedged.stop();
+		replacement.stop();
+	}
+});
+
+test("red-team G3-F3: wedged-daemon strikes are scoped to one daemon; a self-replaced daemon starts from zero", async () => {
+	const home = await temporaryHome("gajaeway-broker-strike-scope-");
+	// Daemon A (pid 1001) is wedged. After two failed probes it self-replaces
+	// with daemon B (pid 1002) on a transport that fails ONE probe and then
+	// routes. B must never be retired: it only ever accrued one strike of its own.
+	const wedged = fakeBrokerTransport("secret-token", { router: "stall" });
+	let bAnswers = false;
+	const flaky = fakeBrokerTransport("secret-token", { router: "stall" });
+	const healthy = fakeBrokerTransport("secret-token");
+	const killed: number[] = [];
+	let agentDir = "";
+	const broker = new BrokerSupervisor({
+		ssotAgentDir: null,
+		home,
+		instanceId: "instance-strike-scope",
+		command: async () => HEALTHY,
+		isPidAlive: (pid) => pid === process.pid || ((pid === 1001 || pid === 1002) && !killed.includes(pid)),
+		healthIntervalMs: 60_000,
+		healthProbeTimeoutMs: 60,
+		readinessDelayMs: 0,
+		readinessAttempts: 20,
+		log: () => {},
+	});
+	agentDir = broker.agentDir;
+	const originalKill = process.kill;
+	(process as { kill: typeof process.kill }).kill = ((pid: number, signal?: string | number) => {
+		if (pid === 1001 || pid === 1002) {
+			killed.push(pid);
+			return true;
+		}
+		return originalKill(pid, signal as NodeJS.Signals);
+	}) as typeof process.kill;
+	// Discovery script: A twice, then B (flaky) once, then B (healthy).
+	let phase = 0;
+	const refresher = setInterval(() => {
+		phase++;
+		const body =
+			phase <= 4
+				? discoveryBody(wedged.url, "secret-token", { pid: 1001 })
+				: !bAnswers
+					? discoveryBody(flaky.url, "secret-token", { pid: 1002 })
+					: discoveryBody(healthy.url, "secret-token", { pid: 1002 });
+		if (phase >= 7) bAnswers = true;
+		void writeDiscovery(agentDir, body);
+	}, 30);
+	try {
+		await writeDiscovery(agentDir, discoveryBody(wedged.url, "secret-token", { pid: 1001 }));
+		await broker.start();
+		expect(killed).not.toContain(1002);
+	} finally {
+		clearInterval(refresher);
+		(process as { kill: typeof process.kill }).kill = originalKill;
+		await broker.stop();
+		wedged.stop();
+		flaky.stop();
+		healthy.stop();
+	}
+});
+
+test("red-team G4-F1: a strike is charged to the discovery record that was probed, so a mid-probe flip to B never counts against B", async () => {
+	const home = await temporaryHome("gajaeway-broker-strike-race-");
+	// A stalls every probe. B is wedged on its first two probes, then healthy.
+	// Sequence: A fails once, then discovery flips to B WHILE A's 2nd probe is
+	// in flight. Post-probe attribution would read B and charge A's 2nd failure
+	// to B (B: 1), then B's own two failures make 3 and B is killed. Probing
+	// the record that was read charges it to A (A: 2), B starts at 0, survives
+	// its two real strikes and comes healthy. Nothing is retired.
+	const stalled = fakeBrokerTransport("secret-token", { router: "stall" });
+	let bFailures = 0;
+	const bServer = Bun.serve({
+		hostname: "127.0.0.1",
+		port: 0,
+		fetch(request, srv) {
+			if (new URL(request.url).searchParams.get("token") !== "secret-token")
+				return new Response("Unauthorized", { status: 401 });
+			return srv.upgrade(request) ? undefined : new Response("no", { status: 400 });
+		},
+		websocket: {
+			open(socket) {
+				socket.send(JSON.stringify({ type: "broker_hello", protocolVersion: 3 }));
+			},
+			message(socket, raw) {
+				const frame = JSON.parse(String(raw)) as { id?: string };
+				if (bFailures < 2) {
+					bFailures++;
+					return; // stall
+				}
+				socket.send(JSON.stringify({ type: "broker_response", id: frame.id, ok: true, result: { sessions: [] } }));
+			},
+		},
+	});
+	const bUrl = `ws://127.0.0.1:${bServer.port}`;
+	const killed: number[] = [];
+	let agentDir = "";
+	const broker = new BrokerSupervisor({
+		ssotAgentDir: null,
+		home,
+		instanceId: "instance-strike-race",
+		command: async () => HEALTHY,
+		isPidAlive: (pid) => pid === process.pid || ((pid === 2001 || pid === 2002) && !killed.includes(pid)),
+		healthIntervalMs: 60_000,
+		healthProbeTimeoutMs: 120,
+		readinessDelayMs: 0,
+		readinessAttempts: 20,
+		log: () => {},
+	});
+	agentDir = broker.agentDir;
+	const originalKill = process.kill;
+	(process as { kill: typeof process.kill }).kill = ((pid: number, signal?: string | number) => {
+		if (pid === 2001 || pid === 2002) {
+			killed.push(pid);
+			return true;
+		}
+		return originalKill(pid, signal as NodeJS.Signals);
+	}) as typeof process.kill;
+	try {
+		await writeDiscovery(agentDir, discoveryBody(stalled.url, "secret-token", { pid: 2001 }));
+		const flipper = setInterval(() => {
+			// A's 2nd request has arrived and is stalling: flip discovery now.
+			if (stalled.requests.length >= 2) {
+				clearInterval(flipper);
+				void writeDiscovery(agentDir, discoveryBody(bUrl, "secret-token", { pid: 2002 }));
+			}
+		}, 2);
+		try {
+			await broker.start();
+		} finally {
+			clearInterval(flipper);
+		}
+		expect(stalled.requests.length).toBe(2);
+		expect(bFailures).toBe(2);
+		expect(killed).toEqual([]);
+	} finally {
+		(process as { kill: typeof process.kill }).kill = originalKill;
+		await broker.stop();
+		stalled.stop();
+		bServer.stop(true);
+	}
+});
+
+test("red-team F6: a timed-out CLI child holds its slot until it has actually exited", async () => {
+	const home = await temporaryHome("gajaeway-broker-timeout-child-");
+	const transport = fakeBrokerTransport("secret-token");
+	let exitChild: (() => void) | undefined;
+	let live = 0;
+	const broker = new BrokerSupervisor({
+		ssotAgentDir: null,
+		home,
+		instanceId: "instance-timeout-child",
+		spawn: (() => {
+			live++;
+			const exited = new Promise<number>((resolve) => {
+				exitChild = () => {
+					live--;
+					resolve(143);
+				};
+			});
+			const never = () => new ReadableStream<Uint8Array>({ start() {} });
+			return { stdout: never(), stderr: never(), exited, kill: () => exitChild?.() } as unknown as ReturnType<
+				typeof Bun.spawn
+			>;
+		}) as unknown as typeof Bun.spawn,
+		healthIntervalMs: 60_000,
+		readinessDelayMs: 0,
+	});
+	try {
+		await writeDiscovery(broker.agentDir, discoveryBody(transport.url, "secret-token"));
+		await broker.start();
+		const started = performance.now();
+		await expect(broker.cli(["sdk", "session", "status", "s", "--repo", home], { timeoutMs: 50 })).rejects.toThrow(
+			"timed out",
+		);
+		// kill() resolved `exited`, so the slot was released only once the child was gone.
+		expect(live).toBe(0);
+		expect(performance.now() - started).toBeGreaterThanOrEqual(45);
+	} finally {
+		await broker.stop();
+		transport.stop();
+	}
+});
+
+test("the CLI health probe has its own lane: saturating the shared cap with slow observation calls never delays it", async () => {
+	const home = await temporaryHome("gajaeway-broker-probe-lane-");
+	const transport = fakeBrokerTransport("secret-token");
+	const releases: Array<() => void> = [];
+	const spawnedArgs: string[][] = [];
+	const child = (args: string[]) => {
+		const isProbe = args.includes("list") && args.includes("--scope");
+		spawnedArgs.push(args);
+		const stdout = isProbe
+			? Promise.resolve(HEALTHY.stdout)
+			: new Promise<string>((resolve) => releases.push(() => resolve(JSON.stringify({ ok: true, result: {} }))));
+		const body = (text: Promise<string>) =>
+			new ReadableStream<Uint8Array>({
+				async start(controller) {
+					controller.enqueue(new TextEncoder().encode(await text));
+					controller.close();
+				},
+			});
+		return {
+			stdout: body(stdout),
+			stderr: body(Promise.resolve("")),
+			exited: stdout.then(() => 0),
+			kill: () => {},
+		} as unknown as ReturnType<typeof Bun.spawn>;
+	};
+	const broker = new BrokerSupervisor({
+		ssotAgentDir: null,
+		home,
+		instanceId: "instance-probe-lane",
+		spawn: ((options: { cmd: string[] }) => child(options.cmd.slice(1))) as unknown as typeof Bun.spawn,
+		healthIntervalMs: 60_000,
+		readinessDelayMs: 0,
+		healthProbeTimeoutMs: 1_000,
+	});
+	try {
+		// Readiness: the launch command runs once, then the endpoint probe judges health.
+		await writeDiscovery(broker.agentDir, discoveryBody(transport.url, "secret-token"));
+		await broker.start();
+		// Saturate every shared slot (MAX_CONCURRENT_CLI = 4) plus a queued fifth with slow status calls.
+		const observation = Array.from({ length: 5 }, (_, index) =>
+			broker.cli(["sdk", "session", "status", `s-${index}`, "--repo", home], { timeoutMs: 30_000 }),
+		);
+		await eventually(
+			() => spawnedArgs.filter((args) => args.includes("status")).length === 4,
+			"shared slots did not fill",
+		);
+		const started = performance.now();
+		const probe = await broker.cli(["sdk", "session", "list", "--scope", "cwd"], { timeoutMs: 1_000 });
+		expect(performance.now() - started).toBeLessThan(500);
+		expect(JSON.parse(probe.stdout)).toMatchObject({ ok: true });
+		expect(spawnedArgs.filter((args) => args.includes("status")).length).toBe(4);
+		// The queued fifth call only spawns after a slot frees, so drain until all five settled.
+		let settled = 0;
+		for (const task of observation) void task.then(() => settled++);
+		while (settled < observation.length) {
+			for (const release of releases.splice(0)) release();
+			await Bun.sleep(5);
+		}
+	} finally {
+		for (const release of releases.splice(0)) release();
+		await broker.stop();
+		transport.stop();
+	}
 });
 
 test("reclaims only stale process remnants while preserving persistent session authority and transcript evidence", async () => {
@@ -350,6 +931,11 @@ test("an explicit agent dir is supervised in place so pre-cutover sessions are a
 			commands.push([...args]);
 			return HEALTHY;
 		},
+		// The launch command must bind the adopted dir; health itself is stubbed.
+		healthProbe: async ({ cli }) => {
+			await cli(["sdk", "session", "list", "--scope", "cwd"]);
+			return true;
+		},
 		healthIntervalMs: 60_000,
 	});
 	try {
@@ -370,6 +956,7 @@ test("start pins steeringMode=all and interruptMode=wait in the private agent di
 		instanceId: "instance-steer",
 		ssotAgentDir: null,
 		command: async () => HEALTHY,
+		healthProbe: async () => true,
 		healthIntervalMs: 60_000,
 	});
 	await mkdir(broker.agentDir, { recursive: true });
@@ -403,6 +990,7 @@ test("start seeds the private agent dir from the operator SSOT and fails loudly 
 		instanceId: "instance-ssot",
 		ssotAgentDir: ssot,
 		command: async () => HEALTHY,
+		healthProbe: async () => true,
 		healthIntervalMs: 60_000,
 		log: (line) => logs.push(line),
 	});
@@ -426,6 +1014,7 @@ test("start seeds the private agent dir from the operator SSOT and fails loudly 
 		instanceId: "instance-ssot-missing",
 		ssotAgentDir: empty,
 		command: async () => HEALTHY,
+		healthProbe: async () => true,
 	});
 	await expect(missing.start()).rejects.toThrow("operator SSOT");
 });
@@ -437,6 +1026,7 @@ test("boot reap removes lock tombstones and spawn residue from the private agent
 		instanceId: "instance-reap",
 		ssotAgentDir: null,
 		command: async () => HEALTHY,
+		healthProbe: async () => true,
 		healthIntervalMs: 60_000,
 		isPidAlive: () => false,
 	});

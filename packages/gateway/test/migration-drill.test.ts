@@ -16,7 +16,7 @@ test("migrates a migration-001 database to the latest schema", async () => {
 		legacy.close();
 
 		const database = await GatewayDatabase.open(path);
-		expect(database.schemaVersion).toBe(17);
+		expect(database.schemaVersion).toBe(18);
 		database.close();
 
 		const migrated = new Database(path, { readonly: true });
@@ -69,7 +69,7 @@ DELETE FROM schema_migrations WHERE version > 10;
 		v10.close();
 
 		const upgraded = await GatewayDatabase.open(path);
-		expect(upgraded.schemaVersion).toBe(17);
+		expect(upgraded.schemaVersion).toBe(18);
 		expect(upgraded.laneJobJson("lanejob-test")).toBe('{"schemaVersion":1}');
 		const tables = new Set(
 			new Database(path, { readonly: true })
@@ -114,7 +114,7 @@ DELETE FROM schema_migrations WHERE version = 13;
 		v12.close();
 
 		const upgraded = await GatewayDatabase.open(path);
-		expect(upgraded.schemaVersion).toBe(17);
+		expect(upgraded.schemaVersion).toBe(18);
 		expect(upgraded.laneJobJson("lanejob-v12")).toBe('{"schemaVersion":1}');
 		expect(upgraded.metaGet("rebind_budget:discord/channel/c1")).toBe('{"used":2,"lifetime":7}');
 		expect(upgraded.monitorSlotExists("monitor-v12", "2026-08-28T00:00:00.000Z")).toBe(true);
@@ -158,7 +158,7 @@ DELETE FROM schema_migrations WHERE version > 14;
 		v14.close();
 
 		const upgraded = await GatewayDatabase.open(path);
-		expect(upgraded.schemaVersion).toBe(17);
+		expect(upgraded.schemaVersion).toBe(18);
 		const rows = upgraded.monitorRows();
 		expect(rows).toHaveLength(1);
 		// The pre-existing monitor survives and reads back with no instruction.
@@ -209,7 +209,7 @@ DELETE FROM schema_migrations WHERE version > 15;
 	v15.close();
 
 	const upgraded = await GatewayDatabase.open(path);
-	expect(upgraded.schemaVersion).toBe(17);
+	expect(upgraded.schemaVersion).toBe(18);
 	upgraded.conversationModelSet("discord:c1", { preset: "gpt-heavy" }, "owner");
 	expect(upgraded.conversationModelGet("discord:c1")?.selection).toEqual({ preset: "gpt-heavy" });
 	upgraded.close();
@@ -221,7 +221,7 @@ test("migration 17 adds the durable batch binding and the rollback drill refuses
 	const backupPath = join(directory, "gateway-before-downmark.db");
 	try {
 		const database = await GatewayDatabase.open(path);
-		expect(database.schemaVersion).toBe(17);
+		expect(database.schemaVersion).toBe(18);
 		expect(database.putSessionAtEpoch("discord:dm:1", "session-v17", 0)).toBe(true);
 		database.backupInto(backupPath);
 		database.close();
@@ -258,7 +258,7 @@ UPDATE inbound_messages SET batch_key = 'batch', batch_role = 'trigger', batch_e
 		expect(live).toBe(1);
 		expect(() => {
 			if (live !== 0) throw new Error("refusing schema down-marker while nonterminal batches remain");
-			raw.exec("DELETE FROM schema_migrations WHERE version = 17");
+			raw.exec("DELETE FROM schema_migrations WHERE version >= 17");
 		}).toThrow("refusing schema down-marker");
 		expect(
 			raw.query<{ n: number }, []>("SELECT COUNT(*) AS n FROM schema_migrations WHERE version = 17").get()?.n,
@@ -271,7 +271,7 @@ UPDATE inbound_messages SET batch_key = 'batch', batch_role = 'trigger', batch_e
 			)
 			.get()?.n;
 		expect(drained).toBe(0);
-		raw.exec("DELETE FROM schema_migrations WHERE version = 17");
+		raw.exec("DELETE FROM schema_migrations WHERE version >= 17");
 		raw.close();
 
 		const v16Guard = new Database(path, { readonly: true });
@@ -282,13 +282,92 @@ UPDATE inbound_messages SET batch_key = 'batch', batch_role = 'trigger', batch_e
 		const backup = new Database(backupPath, { readonly: true });
 		expect(
 			backup.query<{ version: number }, []>("SELECT MAX(version) AS version FROM schema_migrations").get()?.version,
-		).toBe(17);
+		).toBe(18);
 		backup.close();
 
 		const reopened = await GatewayDatabase.open(path);
-		expect(reopened.schemaVersion).toBe(17);
+		expect(reopened.schemaVersion).toBe(18);
 		expect(reopened.inboundBatchRows("batch")[0]).toMatchObject({ state: "done", batch_state: "done" });
 		reopened.close();
+	} finally {
+		await rm(directory, { recursive: true, force: true });
+	}
+});
+
+test("migration 18 adds the pre-send dispatch stamp and the terminal reply slot to a genuine schema-17 table", async () => {
+	const directory = await mkdtemp(join(tmpdir(), "gw-migrate-18-"));
+	const path = join(directory, "gateway.db");
+	try {
+		const latest = await GatewayDatabase.open(path);
+		latest.close();
+		// Rebuild a deployed schema-17 database: the two v18 columns do not exist,
+		// and one accepted batch is live and bound (the shape an upgrade meets).
+		const v17 = new Database(path);
+		v17.exec(`
+ALTER TABLE inbound_messages DROP COLUMN dispatched_at;
+ALTER TABLE inbound_messages DROP COLUMN terminal_delivery_id;
+DELETE FROM schema_migrations WHERE version > 17;
+INSERT INTO inbound_messages (message_id, origin_key, origin_ref_json, body, engagement_json, state, received_at)
+VALUES ('v18-live', 'discord:dm:1', '{}', 'body', NULL, 'pending', '2026-09-02T00:00:00.000Z');
+UPDATE inbound_messages SET batch_key = 'b18', batch_role = 'trigger', batch_epoch = 0, batch_state = 'accepted', attributed_op_ref = 'gw-p-0123456789abcdef0123456789abcdef', accepted_at = '2026-09-02T00:00:01.000Z', bound_session_id = 's-old' WHERE message_id = 'v18-live';
+`);
+		const before = v17
+			.query<{ name: string }, []>("PRAGMA table_info(inbound_messages)")
+			.all()
+			.map((column) => column.name);
+		expect(before).not.toContain("dispatched_at");
+		expect(before).not.toContain("terminal_delivery_id");
+		expect(
+			v17.query<{ version: number }, []>("SELECT MAX(version) AS version FROM schema_migrations").get()?.version,
+		).toBe(17);
+		v17.close();
+
+		const upgraded = await GatewayDatabase.open(path);
+		expect(upgraded.schemaVersion).toBe(18);
+		const after = new Database(path, { readonly: true });
+		const columns = after
+			.query<{ name: string }, []>("PRAGMA table_info(inbound_messages)")
+			.all()
+			.map((column) => column.name);
+		after.close();
+		expect(columns).toContain("dispatched_at");
+		expect(columns).toContain("terminal_delivery_id");
+		// The pre-existing bound row is untouched by the migration.
+		const row = upgraded.inboundBatchRows("b18")[0];
+		expect(row).toMatchObject({
+			message_id: "v18-live",
+			state: "pending",
+			batch_state: "accepted",
+			accepted_at: "2026-09-02T00:00:01.000Z",
+			bound_session_id: "s-old",
+			dispatched_at: null,
+			terminal_delivery_id: null,
+		});
+		// An already-bound legacy batch never gets a recovery-time floor: that
+		// stamp could postdate the answer the old daemon wrote.
+		expect(upgraded.inboundBatchBindSession("b18", "s-old", "2026-09-02T00:00:05.000Z")).toBe(true);
+		expect(upgraded.inboundBatchDispatchedAt("b18")).toBeUndefined();
+		// A never-bound batch is stamped on its first bind only; a re-bind keeps it.
+		const v18 = new Database(path);
+		v18.exec(`
+INSERT INTO inbound_messages (message_id, origin_key, origin_ref_json, body, engagement_json, state, received_at)
+VALUES ('v18-fresh', 'discord:dm:2', '{}', 'body', NULL, 'pending', '2026-09-02T00:00:00.000Z');
+UPDATE inbound_messages SET batch_key = 'b18f', batch_role = 'trigger', batch_epoch = 0, batch_state = 'settled', attributed_op_ref = 'gw-p-0123456789abcdef0123456789abcdee' WHERE message_id = 'v18-fresh';
+`);
+		v18.close();
+		expect(upgraded.inboundBatchBindSession("b18f", "s-new", "2026-09-02T00:00:05.000Z")).toBe(true);
+		expect(upgraded.inboundBatchDispatchedAt("b18f")).toBe("2026-09-02T00:00:05.000Z");
+		expect(upgraded.inboundBatchBindSession("b18f", "s-new", "2026-09-02T00:01:00.000Z")).toBe(true);
+		expect(upgraded.inboundBatchDispatchedAt("b18f")).toBe("2026-09-02T00:00:05.000Z");
+		// Terminal slots are per part and first-claim wins.
+		expect(upgraded.inboundBatchClaimTerminal("b18f", 0, "gw-t-a")).toBe("gw-t-a");
+		expect(upgraded.inboundBatchClaimTerminal("b18f", 0, "gw-t-b")).toBe("gw-t-a");
+		expect(upgraded.inboundBatchClaimTerminal("b18f", 1, "gw-t-c")).toBe("gw-t-c");
+		// A fresh-turn requeue releases the floor and the terminal claims with the rows.
+		expect(upgraded.inboundBatchRequeueFreshTurn("b18f")).toBe(1);
+		expect(upgraded.inboundBatchDispatchedAt("b18f")).toBeUndefined();
+		expect(upgraded.inboundBatchRows("b18f")).toEqual([]);
+		upgraded.close();
 	} finally {
 		await rm(directory, { recursive: true, force: true });
 	}
