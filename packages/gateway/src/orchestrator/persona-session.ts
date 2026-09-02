@@ -30,6 +30,7 @@ const DEFAULT_MAX_INBOUND_AGE_MS = 10 * 60_000;
  * completes with an explicit corroboration log.
  */
 const STATUS_TERMINAL_GRACE_MS = 250;
+const SETTLE_FAILURE_RETRY_MS = 2_000;
 /** Consecutive recovery sweeps (60s apart) an unknown op on a live idle session is held before release. */
 const HOLD_RELEASE_SWEEPS = 2;
 
@@ -799,9 +800,19 @@ class OriginActor {
 		this.#deadline = arrivedAt + this.#manager.settleWindowFor(first);
 		const delay = Math.max(0, this.#deadline - this.#manager.now());
 		this.#timer = this.#manager.schedule(() => {
-			void this.enqueue(async () => await this.tick()).catch((error: unknown) =>
-				this.#manager.log(`persona_settle_failed origin=${this.originKey} detail=${safeDiagnostic(error)}`),
-			);
+			void this.enqueue(async () => await this.tick()).catch((error: unknown) => {
+				this.#manager.log(`persona_settle_failed origin=${this.originKey} detail=${safeDiagnostic(error)}`);
+				// A failed settle must not strand the origin in "settling" with no
+				// timer: reset and re-arm with a short delay so pending rows drain.
+				this.#state = "idle";
+				this.#deadline = undefined;
+				const retry = this.#manager.schedule(() => {
+					this.#graceTimers.delete(retry);
+					if (this.#stopped || this.#manager.stopped) return;
+					void this.enqueue(async () => await this.#armSettle()).catch(() => {});
+				}, SETTLE_FAILURE_RETRY_MS);
+				this.#graceTimers.add(retry);
+			});
 		}, delay);
 	}
 
