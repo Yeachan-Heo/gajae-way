@@ -109,10 +109,11 @@ test("an unrelated code is a genuine failure, not a rebindable one", () => {
 	expect(rebindableCodeOf(new Error("spawn_failed"))).toBeUndefined();
 });
 
-test("the rebindable set is exactly the five measured codes", () => {
+test("the rebindable set is exactly the six measured codes", () => {
 	// Pinned at the source of truth: every entry came from a measured incident, so
 	// widening the set has to break a test rather than slip in.
 	expect([...REBINDABLE_ERROR_CODES].sort()).toEqual([
+		"idempotency_conflict",
 		"managed_append_identity_mismatch",
 		"resource_gone",
 		"resume_unusable",
