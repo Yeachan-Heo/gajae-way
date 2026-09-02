@@ -15,6 +15,14 @@ import { EVENTS_V01, VERBS_V01 } from "@gajaeway/protocol";
 const ROOT = join(import.meta.dir, "..", "..", "..");
 const GATEWAY_SRC = join(ROOT, "packages/gateway/src");
 
+// Namespaced dotted literals in quotes: "gateway.status", "chat.message", ...
+// File-ish literals (gateway.sock, gateway.db, *.json, ...) are not verbs.
+const VERB_LITERAL_RE =
+	/["'`]((?:gateway|chat|session|memory|monitor|delivery|engagement|ops|work)\.[a-zA-Z0-9_.]+)["'`]/g;
+const NON_VERB_SUFFIX_RE = /\.(sock|db|json|jsonl|sqlite|md|ts|js|log|lock|pid)$/;
+/** gjc SDK ops that appear in comments and remaining adapter call sites. */
+const GJC_VENDOR_OPS = new Set(["session.create", "session.resume", "session.last_assistant", "session.close"]);
+
 function collectSourceFiles(dir: string, out: string[] = []): string[] {
 	let entries: string[];
 	try {
@@ -37,7 +45,7 @@ function harvest(pattern: RegExp): Set<string> {
 	for (const file of collectSourceFiles(GATEWAY_SRC)) {
 		// The gjc vendor adapter speaks gjc's own SDK protocol (session.create
 		// ops etc.), not the gajaeway profile; it is outside the inventory.
-		if (file.endsWith("gjc-client.ts")) continue;
+		if (file.endsWith("gjc-client.ts") || file.endsWith("session-port.ts") || file.endsWith("test-broker.ts")) continue;
 		// Monitor EVENT TYPE names (memory.canonicalize etc.) are data flowing through
 		// the monitor pipeline, not protocol verbs/events; the seeded defaults and the
 		// per-type authoring guidance reference them as plain strings.
@@ -45,17 +53,11 @@ function harvest(pattern: RegExp): Set<string> {
 		const text = readFileSync(file, "utf8");
 		for (const match of text.matchAll(pattern)) {
 			const name = match[1];
-			if (name && !NON_VERB_SUFFIX_RE.test(name)) found.add(name);
+			if (name && !NON_VERB_SUFFIX_RE.test(name) && !GJC_VENDOR_OPS.has(name)) found.add(name);
 		}
 	}
 	return found;
 }
-
-// Namespaced dotted literals in quotes: "gateway.status", "chat.message", ...
-// File-ish literals (gateway.sock, gateway.db, *.json, ...) are not verbs.
-const VERB_LITERAL_RE =
-	/["'`]((?:gateway|chat|session|memory|monitor|delivery|engagement|ops|work)\.[a-zA-Z0-9_.]+)["'`]/g;
-const NON_VERB_SUFFIX_RE = /\.(sock|db|json|jsonl|sqlite|md|ts|js|log|lock|pid)$/;
 
 describe("sdk-coverage-inventory", () => {
 	test("every catalog verb is implemented by the gateway", () => {

@@ -12,7 +12,9 @@ type StubOperation = {
 /**
  * Deterministic daemon-process seam retained for crash-recovery E2E tests.
  * It is imported only by `test/daemon-entry.ts`; production `main.ts` has no
- * test-broker dependency or environment-selected implementation path.
+ * test-broker dependency or environment-selected implementation path. Operator
+ * SSOT is disabled: CI runners have no `~/.gjc/agent/models.yml`, and this
+ * stub never talks to a model provider.
  */
 export function testOnlyBrokerDependencies(): BrokerSupervisorDependencies {
 	const sessions = new Map<string, string>();
@@ -89,6 +91,7 @@ export function testOnlyBrokerDependencies(): BrokerSupervisorDependencies {
 		command,
 		spawn: inertChild as SpawnFn,
 		healthProbe: async () => true,
+		ssotAgentDir: null,
 	};
 }
 
