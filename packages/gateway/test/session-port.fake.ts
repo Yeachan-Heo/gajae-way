@@ -1,4 +1,4 @@
-import { OpRefRejectedError, type BrokerSession, type SendReceipt, type StatusReport } from "@gajaeway/subsession";
+import { type BrokerSession, OpRefRejectedError, type SendReceipt, type StatusReport } from "@gajaeway/subsession";
 import type { GjcModelSelection } from "../src/config";
 import type {
 	SessionBindInput,
@@ -28,13 +28,19 @@ export class ScriptedSessionPort implements SessionPort {
 	readonly #tailFrames = new Map<string, TailFrame[]>();
 	readonly #chains = new Map<string, Promise<void>>();
 	readonly onSend?: (input: SessionSendInput, port: ScriptedSessionPort) => void | Promise<void>;
-	readonly #onBind: ((input: SessionBindInput) => string | { readonly sessionId: string } | Promise<string | { readonly sessionId: string }>) | undefined;
+	readonly #onBind:
+		| ((
+				input: SessionBindInput,
+		  ) => string | { readonly sessionId: string } | Promise<string | { readonly sessionId: string }>)
+		| undefined;
 	readonly #sessionIdForBind: ((input: SessionBindInput) => string) | undefined;
 
 	constructor(
 		options: {
 			onSend?: (input: SessionSendInput, port: ScriptedSessionPort) => void | Promise<void>;
-			onBind?: (input: SessionBindInput) => string | { readonly sessionId: string } | Promise<string | { readonly sessionId: string }>;
+			onBind?: (
+				input: SessionBindInput,
+			) => string | { readonly sessionId: string } | Promise<string | { readonly sessionId: string }>;
 			sessionIdForBind?: (input: SessionBindInput) => string;
 		} = {},
 	) {
@@ -72,7 +78,8 @@ export class ScriptedSessionPort implements SessionPort {
 		const failure = this.#resumeFailures.get(input.sessionId);
 		if (failure) throw failure;
 		const state = this.#sessionStates.get(input.sessionId);
-		if (!state || state.deleted || state.repo !== input.repo) throw new Error(`scripted saved authority unavailable for ${input.sessionId}`);
+		if (!state || state.deleted || state.repo !== input.repo)
+			throw new Error(`scripted saved authority unavailable for ${input.sessionId}`);
 		this.#sessionStates.set(input.sessionId, { ...state, live: true });
 		return { sessionId: input.sessionId, originKey: input.originKey, epoch: input.epoch, repo: input.repo };
 	}
@@ -91,7 +98,11 @@ export class ScriptedSessionPort implements SessionPort {
 		this.steers.push(input);
 	}
 
-	async setModel(input: { sessionId: string; repo: string; selection: GjcModelSelection }): Promise<{ readonly changed: boolean }> {
+	async setModel(input: {
+		sessionId: string;
+		repo: string;
+		selection: GjcModelSelection;
+	}): Promise<{ readonly changed: boolean }> {
 		this.models.push(input);
 		return { changed: true };
 	}
@@ -114,7 +125,8 @@ export class ScriptedSessionPort implements SessionPort {
 
 	async fetchLastAssistant(input: { sessionId: string; repo: string }) {
 		const operation = [...this.#operations.values()].reverse().find((entry) => entry.sessionId === input.sessionId);
-		if (!operation || operation.state !== "terminal_ok") throw new Error("scripted session has no terminal assistant output");
+		if (!operation || operation.state !== "terminal_ok")
+			throw new Error("scripted session has no terminal assistant output");
 		return { text: operation.text, pages: 1, complete: true };
 	}
 
@@ -127,7 +139,11 @@ export class ScriptedSessionPort implements SessionPort {
 		return handle;
 	}
 
-	async runCompaction(_input: { sessionId: string; repo: string; originKey: string }): Promise<{ readonly status: "unavailable" }> {
+	async runCompaction(_input: {
+		sessionId: string;
+		repo: string;
+		originKey: string;
+	}): Promise<{ readonly status: "unavailable" }> {
 		return { status: "unavailable" };
 	}
 
@@ -175,14 +191,17 @@ export class ScriptedSessionPort implements SessionPort {
 		for (let attempts = 0; attempts < 10_000; attempts++) {
 			const status = await this.status({ sessionId: input.sessionId, repo: input.repo, opRef: input.opRef });
 			if (status.status.status === "terminal_ok") {
-				return { receipt, status, assistant: await this.fetchLastAssistant({ sessionId: input.sessionId, repo: input.repo }) };
+				return {
+					receipt,
+					status,
+					assistant: await this.fetchLastAssistant({ sessionId: input.sessionId, repo: input.repo }),
+				};
 			}
 			if (status.status.status === "failed") throw new Error(status.status.error?.message ?? "scripted failure");
 			await Bun.sleep(1);
 		}
 		throw new Error("scripted request did not settle");
 	}
-
 
 	emitAssistant(sessionId: string, text: string, eventId = `event-${crypto.randomUUID()}`, opRef?: string): void {
 		const transcript = this.#transcripts.get(sessionId) ?? [];
@@ -282,7 +301,6 @@ export class ScriptedSessionPort implements SessionPort {
 		this.sends.push(input);
 		this.#operations.set(input.opRef, { sessionId: input.sessionId, state, text });
 	}
-
 
 	transcript(sessionId: string): readonly string[] {
 		return this.#transcripts.get(sessionId) ?? [];
@@ -421,7 +439,9 @@ class ScriptedTailHandle implements TailHandle {
 		if (this.#closed) return;
 		this.#accepted = true;
 		this.#acceptedOpRef = opRef;
-		const buffered = this.#buffer.splice(0).filter((frame) => frameOperationRef(frame) === undefined || frameOperationRef(frame) === opRef);
+		const buffered = this.#buffer
+			.splice(0)
+			.filter((frame) => frameOperationRef(frame) === undefined || frameOperationRef(frame) === opRef);
 		// Not awaited: markAccepted runs inside the origin mailbox and onFrame
 		// re-enters it (production ManagedTailHandle has the identical shape).
 		this.#flush = this.#flush.then(async () => {
@@ -446,7 +466,8 @@ class ScriptedTailHandle implements TailHandle {
 	}
 
 	stall(elapsedMs: number): void {
-		if (!this.#closed) void this.#input.onStall?.({ sessionId: this.sessionId, brokerGeneration: this.brokerGeneration, elapsedMs });
+		if (!this.#closed)
+			void this.#input.onStall?.({ sessionId: this.sessionId, brokerGeneration: this.brokerGeneration, elapsedMs });
 	}
 
 	async close(): Promise<void> {
@@ -457,6 +478,7 @@ class ScriptedTailHandle implements TailHandle {
 }
 
 function frameOperationRef(frame: TailFrame): string | undefined {
-	for (const value of [frame.payload.opRef, frame.payload.operationRef]) if (typeof value === "string" && value.length > 0) return value;
+	for (const value of [frame.payload.opRef, frame.payload.operationRef])
+		if (typeof value === "string" && value.length > 0) return value;
 	return undefined;
 }

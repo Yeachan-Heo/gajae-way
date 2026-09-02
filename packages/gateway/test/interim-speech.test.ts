@@ -97,7 +97,6 @@ test("suppressed narration does not spend the turn budget", () => {
 	expect(gate.admit("원인은 auth 토큰 갱신 실패예요", 0).deliver).toBe(true);
 });
 
-
 // ---------------------------------------------------------------------------
 // Wired through the server
 // ---------------------------------------------------------------------------

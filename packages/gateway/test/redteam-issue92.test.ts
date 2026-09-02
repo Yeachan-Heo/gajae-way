@@ -1,9 +1,9 @@
 import { Database } from "bun:sqlite";
 import { expect, test } from "bun:test";
-import type { BrokerSession } from "@gajaeway/subsession";
 import { mkdtemp, readdir, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import type { BrokerSession } from "@gajaeway/subsession";
 import { OpRefRejectedError } from "@gajaeway/subsession";
 import { parseConfigFile } from "../src/config";
 import { PersonaSessionManager, personaBatchKey, personaBatchOpRef } from "../src/orchestrator/persona-session";
@@ -771,7 +771,9 @@ test("red-team: an idle binding whose session died is resumed exactly once befor
 });
 
 test("red-team: an inspect outage on an idle binding never blocks the send and never fabricates a resume", async () => {
-	const port = new InspectUnavailableIdleRecoveryPort({ onSend: (input, scripted) => scripted.complete(input.opRef, "reply") });
+	const port = new InspectUnavailableIdleRecoveryPort({
+		onSend: (input, scripted) => scripted.complete(input.opRef, "reply"),
+	});
 	const target = await fixture({ port, settleWindowMs: 0 });
 	try {
 		enqueue(target, "outage-1", "first turn");

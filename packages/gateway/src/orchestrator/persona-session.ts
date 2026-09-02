@@ -2,20 +2,20 @@ import { createHash } from "node:crypto";
 import {
 	assertControlAllowed,
 	assertValidOpRef,
+	type BrokerSession,
 	CLIENT_REF_CONFLICT_CODE,
 	decideRecovery,
 	isOpRefRejection,
 	isTerminalStatus,
 	OpRefRejectedError,
 	projectOpState,
-	type BrokerSession,
 	type StatusReport,
 } from "@gajaeway/subsession";
 import type { GjcModelSelection } from "../config";
 import type { GatewayDatabase, InboundBatch, InboundMessageRow } from "../store/db";
 import { sanitizeDiagnostic } from "./rebind";
-import { TailCapacityError, deterministicTailDeliveryId, type TailFrame, type TailHandle } from "./tail-runner";
 import type { SessionBinding, SessionPort } from "./session-port";
+import { deterministicTailDeliveryId, TailCapacityError, type TailFrame, type TailHandle } from "./tail-runner";
 
 export const DEFAULT_SETTLE_WINDOW_MS = 2_000;
 export const DEFAULT_STALL_TIMEOUT_MS = 120_000;
@@ -195,7 +195,9 @@ export class PersonaSessionManager {
 		const floorAt = new Date(this.#now() - this.#maxInboundAgeMs).toISOString();
 		const expired = this.#database.inboundExpireStale(originKey, floorAt);
 		if (expired.length > 0) {
-			this.#log(`inbound_expired origin=${originKey} count=${expired.length} floor=${floorAt} ids=${expired.slice(0, 5).join(",")}${expired.length > 5 ? ",…" : ""}`);
+			this.#log(
+				`inbound_expired origin=${originKey} count=${expired.length} floor=${floorAt} ids=${expired.slice(0, 5).join(",")}${expired.length > 5 ? ",…" : ""}`,
+			);
 			void this.#onInboundDiscard?.(expired);
 		}
 		return expired.length;
@@ -227,7 +229,10 @@ export class PersonaSessionManager {
 	/** Reconstructs durable accepted/settled batches after a gateway restart. */
 	recover(): Promise<void> {
 		if (this.#stopped) return Promise.resolve();
-		const origins = new Set<string>([...this.#database.inboundNonterminalOrigins(), ...this.#database.inboundPendingOrigins()]);
+		const origins = new Set<string>([
+			...this.#database.inboundNonterminalOrigins(),
+			...this.#database.inboundPendingOrigins(),
+		]);
 		return Promise.all(
 			[...origins].map((originKey) =>
 				this.#actor(originKey).enqueue(async () => {
@@ -250,9 +255,9 @@ export class PersonaSessionManager {
 	}
 
 	onBrokerGeneration(generation: number): Promise<void> {
-		return Promise.all([...this.#actors.values()].map((actor) => actor.enqueue(async () => await actor.onBrokerGeneration(generation)))).then(
-			() => undefined,
-		);
+		return Promise.all(
+			[...this.#actors.values()].map((actor) => actor.enqueue(async () => await actor.onBrokerGeneration(generation))),
+		).then(() => undefined);
 	}
 
 	state(originKey: string): PersonaActorState {
@@ -348,7 +353,9 @@ export class PersonaSessionManager {
 		await this.#onInboundDiscard?.(messageIds);
 	}
 
-	async emitAssistant(input: Parameters<NonNullable<PersonaSessionManagerOptions["onAssistantText"]>>[0]): Promise<void> {
+	async emitAssistant(
+		input: Parameters<NonNullable<PersonaSessionManagerOptions["onAssistantText"]>>[0],
+	): Promise<void> {
 		await this.#onAssistantText?.(input);
 	}
 
@@ -456,19 +463,27 @@ class OriginActor {
 		}
 		for (const batch of this.#manager.database.inboundNonterminalBatches(this.originKey)) {
 			if (batch.epoch < nextEpoch && !this.#retired.has(`${batch.epoch}:${batch.batchKey}`)) {
-				this.#manager.log(`retired_hold originKey=${this.originKey} batchKey=${batch.batchKey} epoch=${batch.epoch} opRef=${batch.opRef} reason=/new`);
+				this.#manager.log(
+					`retired_hold originKey=${this.originKey} batchKey=${batch.batchKey} epoch=${batch.epoch} opRef=${batch.opRef} reason=/new`,
+				);
 			}
 		}
 		this.#state = "idle";
 		this.#deadline = undefined;
-		this.#manager.log(`persona_new origin=${this.originKey} epoch=${nextEpoch} discarded_unbatched=${discarded.length}`);
+		this.#manager.log(
+			`persona_new origin=${this.originKey} epoch=${nextEpoch} discarded_unbatched=${discarded.length}`,
+		);
 		await this.#armSettle();
 	}
 
 	/** Mailbox-serialized live rebind. The caller supplies a verified concrete selection. */
 	async rebindModel(selection: GjcModelSelection): Promise<void> {
 		const binding = await this.#ensureSession(this.#epoch());
-		const receipt = await this.#manager.port.setModel({ sessionId: binding.sessionId, repo: this.#manager.repo, selection });
+		const receipt = await this.#manager.port.setModel({
+			sessionId: binding.sessionId,
+			repo: this.#manager.repo,
+			selection,
+		});
 		this.#appliedModel.set(binding.sessionId, describeModel(selection));
 		this.#manager.log(
 			`persona_model origin=${this.originKey} epoch=${binding.epoch} session=${binding.sessionId} effective=${describeModel(selection)} changed=${receipt.changed} source=/model`,
@@ -483,12 +498,18 @@ class OriginActor {
 	async recover(): Promise<void> {
 		this.#recoveryScanned = true;
 		for (const batch of this.#manager.database.inboundNonterminalBatches(this.originKey)) {
-			if (this.#current?.batch.batchKey === batch.batchKey || this.#retired.has(retiredKey({ epoch: batch.epoch, batch }))) continue;
+			if (
+				this.#current?.batch.batchKey === batch.batchKey ||
+				this.#retired.has(retiredKey({ epoch: batch.epoch, batch }))
+			)
+				continue;
 			try {
 				await this.#recoverBatch(batch);
 			} catch (error) {
 				// One unrecoverable batch must not abort recovery of the others.
-				this.#manager.log(`recovery_batch_failed origin=${this.originKey} epoch=${batch.epoch} opRef=${batch.opRef} detail=${safeDiagnostic(error)}`);
+				this.#manager.log(
+					`recovery_batch_failed origin=${this.originKey} epoch=${batch.epoch} opRef=${batch.opRef} detail=${safeDiagnostic(error)}`,
+				);
 			}
 		}
 		if (!this.#current) await this.#armSettle();
@@ -504,7 +525,7 @@ class OriginActor {
 				// Settled but never bound/sent: no operation exists anywhere, so the
 				// rows go back to pending and the next settle binds (exactly-once-safe).
 				const attempt = this.#manager.database.inboundBatchRequeueFreshTurn(batch.batchKey);
-			this.#manager.expireStale(this.originKey);
+				this.#manager.expireStale(this.originKey);
 				this.#manager.log(
 					`recovery_requeue_unbound origin=${this.originKey} epoch=${batch.epoch} opRef=${batch.opRef} attempt=${attempt}`,
 				);
@@ -528,12 +549,16 @@ class OriginActor {
 		// holding, so releasing its rows back to pending is exactly-once-safe:
 		// the next settle binds a live session. A reachable runtime, even with an
 		// unknown status, keeps the hold: it may have accepted the send.
-		const disownedByBroker = status.unreachable === true && (status.unreachableCode === "session_unavailable" || (first.failed && second.failed));
+		const disownedByBroker =
+			status.unreachable === true &&
+			(status.unreachableCode === "session_unavailable" || (first.failed && second.failed));
 		// An ACCEPTED op is only released when the broker disowns the id AND the
 		// session is provably not live (inspect answered live=false, or is gone):
 		// nothing can still be running there, so the fresh-turn re-fire is
 		// exactly-once-safe. A merely unreachable but possibly-live session holds.
-		const raw = this.#manager.port.liveness ? await this.#manager.port.liveness({ sessionId, repo: this.#manager.repo }) : undefined;
+		const raw = this.#manager.port.liveness
+			? await this.#manager.port.liveness({ sessionId, repo: this.#manager.repo })
+			: undefined;
 		const sessionDead =
 			(first.session !== undefined && first.session.live === false) ||
 			(first.failed && second.failed) ||
@@ -558,7 +583,6 @@ class OriginActor {
 			!sameRecoveryAuthority(first.session, second.session);
 		const session = second.session;
 
-
 		// gjc >= 0.16.0 omits locator.repo, so the subsession normalizer yields
 		// undefined for a perfectly known session; the raw envelope is the
 		// liveness authority and the normalized record only adds repo/deleted.
@@ -570,7 +594,10 @@ class OriginActor {
 				deleted: session?.deleted ?? false,
 				...(authorityShifted ? { ambiguous: true } : {}),
 				savedAuthorityValid:
-					(session !== undefined && session.sessionId === sessionId && !session.deleted && session.repo === this.#manager.repo) ||
+					(session !== undefined &&
+						session.sessionId === sessionId &&
+						!session.deleted &&
+						session.repo === this.#manager.repo) ||
 					(session === undefined && knownById),
 				locatorMatches: session?.repo === undefined || session.repo === this.#manager.repo,
 				// The instance-scoped op-ref namespace and broker lock leave this actor as
@@ -623,8 +650,7 @@ class OriginActor {
 						...recoveryInput,
 						lane: { ...recoveryInput.lane, resumeImpossible: true },
 					});
-					if (afterResumeFailure.action === "recreate")
-						await this.#recreateAfterResumeFailure(batch, retired);
+					if (afterResumeFailure.action === "recreate") await this.#recreateAfterResumeFailure(batch, retired);
 					else
 						this.#manager.log(
 							`recovery_hold origin=${this.originKey} epoch=${batch.epoch} opRef=${batch.opRef} reason=session_resume_failed detail=${safeDiagnostic(error)}`,
@@ -655,14 +681,20 @@ class OriginActor {
 					await this.#armSettle();
 					return;
 				}
-				this.#manager.log(`recovery_hold origin=${this.originKey} epoch=${batch.epoch} opRef=${batch.opRef} reason=${decision.reason} sweeps=${count}`);
+				this.#manager.log(
+					`recovery_hold origin=${this.originKey} epoch=${batch.epoch} opRef=${batch.opRef} reason=${decision.reason} sweeps=${count}`,
+				);
 				return;
 			}
 		}
 	}
 
-
-	async #adoptRecoveredBatch(batch: InboundBatch, sessionId: string, retired: boolean, accepted: boolean): Promise<BoundTurn> {
+	async #adoptRecoveredBatch(
+		batch: InboundBatch,
+		sessionId: string,
+		retired: boolean,
+		accepted: boolean,
+	): Promise<BoundTurn> {
 		this.#manager.database.inboundBatchBindSession(batch.batchKey, sessionId);
 		const lifecycle = await this.#manager.startTurn({
 			originKey: this.originKey,
@@ -678,7 +710,9 @@ class OriginActor {
 		} catch (error) {
 			if (!retired || !(error instanceof TailCapacityError)) throw error;
 			detached = true;
-			this.#manager.log(`retired_hold originKey=${this.originKey} batchKey=${batch.batchKey} epoch=${batch.epoch} opRef=${batch.opRef} reason=tail_capacity`);
+			this.#manager.log(
+				`retired_hold originKey=${this.originKey} batchKey=${batch.batchKey} epoch=${batch.epoch} opRef=${batch.opRef} reason=tail_capacity`,
+			);
 		}
 		const bound: BoundTurn = {
 			originKey: this.originKey,
@@ -714,7 +748,9 @@ class OriginActor {
 			`recovery_hold origin=${this.originKey} epoch=${batch.epoch} opRef=${batch.opRef} reason=${reason}`,
 		);
 		if (retired)
-			this.#manager.log(`retired_hold originKey=${this.originKey} batchKey=${batch.batchKey} epoch=${batch.epoch} opRef=${batch.opRef} reason=resume_impossible`);
+			this.#manager.log(
+				`retired_hold originKey=${this.originKey} batchKey=${batch.batchKey} epoch=${batch.epoch} opRef=${batch.opRef} reason=resume_impossible`,
+			);
 	}
 
 	readonly #holdSweeps = new Map<string, number>();
@@ -729,7 +765,9 @@ class OriginActor {
 		}
 	}
 
-	async #inspectForRecovery(sessionId: string): Promise<{ readonly session: BrokerSession | undefined; readonly failed: boolean }> {
+	async #inspectForRecovery(
+		sessionId: string,
+	): Promise<{ readonly session: BrokerSession | undefined; readonly failed: boolean }> {
 		try {
 			return { session: await this.#manager.port.inspect({ sessionId, repo: this.#manager.repo }), failed: false };
 		} catch {
@@ -792,7 +830,9 @@ class OriginActor {
 
 	async logShutdownHold(): Promise<void> {
 		if (this.#current)
-			this.#manager.log(`shutdown_hold origin=${this.originKey} epoch=${this.#current.epoch} opRef=${this.#current.batch.opRef}`);
+			this.#manager.log(
+				`shutdown_hold origin=${this.originKey} epoch=${this.#current.epoch} opRef=${this.#current.batch.opRef}`,
+			);
 	}
 
 	async #armSettle(): Promise<void> {
@@ -839,7 +879,14 @@ class OriginActor {
 		const cutoff = new Date(this.#deadline).toISOString();
 		const retryAttempt = this.#manager.database.freshTurnAttempt(this.originKey, epoch, first.message_id);
 		const batchKey = personaBatchKey(this.originKey, epoch, first.message_id, cutoff, retryAttempt);
-		const opRef = personaBatchOpRef(this.#manager.instanceId, this.originKey, epoch, first.message_id, cutoff, retryAttempt);
+		const opRef = personaBatchOpRef(
+			this.#manager.instanceId,
+			this.originKey,
+			epoch,
+			first.message_id,
+			cutoff,
+			retryAttempt,
+		);
 		const rows = this.#manager.database.inboundSettleBatch({
 			originKey: this.originKey,
 			epoch,
@@ -853,7 +900,9 @@ class OriginActor {
 			await this.#armSettle();
 			return;
 		}
-		const batch = this.#manager.database.inboundNonterminalBatches(this.originKey, epoch).find((candidate) => candidate.batchKey === batchKey);
+		const batch = this.#manager.database
+			.inboundNonterminalBatches(this.originKey, epoch)
+			.find((candidate) => candidate.batchKey === batchKey);
 		if (!batch) throw new Error(`settled batch ${batchKey} disappeared before send`);
 		let binding: SessionBinding;
 		try {
@@ -937,12 +986,12 @@ class OriginActor {
 		} catch (error) {
 			// A command failure can occur after broker acceptance. Reconcile its exact
 			// durable op-ref; an unknown status remains held and is never resent.
-			if (
-				(error instanceof OpRefRejectedError && error.code === CLIENT_REF_CONFLICT_CODE) ||
-				isOpRefRejection(error)
-			)
+			if ((error instanceof OpRefRejectedError && error.code === CLIENT_REF_CONFLICT_CODE) || isOpRefRejection(error))
 				this.#manager.log(`recovery_client_ref_conflict origin=${this.originKey} epoch=${epoch} opRef=${opRef}`);
-			else this.#manager.log(`persona_send_ambiguous origin=${this.originKey} opRef=${opRef} detail=${safeDiagnostic(error)}`);
+			else
+				this.#manager.log(
+					`persona_send_ambiguous origin=${this.originKey} opRef=${opRef} detail=${safeDiagnostic(error)}`,
+				);
 			await this.#reconcileBound(current);
 			if (this.#manager.database.inboundBatchRows(batchKey)[0]?.batch_state !== "settled") return;
 			throw error;
@@ -981,8 +1030,14 @@ class OriginActor {
 					opRef: current.batch.opRef,
 				})
 			) {
-				await this.#manager.emitSteer({ originKey: this.originKey, messageId: row.message_id, opRef: current.batch.opRef });
-				this.#manager.log(`steer_delivered originKey=${this.originKey} opRef=${current.batch.opRef} messageId=${row.message_id}`);
+				await this.#manager.emitSteer({
+					originKey: this.originKey,
+					messageId: row.message_id,
+					opRef: current.batch.opRef,
+				});
+				this.#manager.log(
+					`steer_delivered originKey=${this.originKey} opRef=${current.batch.opRef} messageId=${row.message_id}`,
+				);
 			}
 		}
 	}
@@ -999,11 +1054,20 @@ class OriginActor {
 			if (failed || session === undefined || session.live) return binding;
 			if (!session.deleted && session.repo === this.#manager.repo) {
 				try {
-					await this.#manager.port.resume({ sessionId: existing.sessionId, repo: this.#manager.repo, originKey: this.originKey, epoch });
-					this.#manager.log(`session_resumed origin=${this.originKey} epoch=${epoch} session=${existing.sessionId} reason=idle_dead_binding`);
+					await this.#manager.port.resume({
+						sessionId: existing.sessionId,
+						repo: this.#manager.repo,
+						originKey: this.originKey,
+						epoch,
+					});
+					this.#manager.log(
+						`session_resumed origin=${this.originKey} epoch=${epoch} session=${existing.sessionId} reason=idle_dead_binding`,
+					);
 					return binding;
 				} catch (error) {
-					this.#manager.log(`session_resume_failed origin=${this.originKey} epoch=${epoch} session=${existing.sessionId} detail=${safeDiagnostic(error)}`);
+					this.#manager.log(
+						`session_resume_failed origin=${this.originKey} epoch=${epoch} session=${existing.sessionId} detail=${safeDiagnostic(error)}`,
+					);
 				}
 			}
 			// Deleted or unresumable: fall through to the epoch-scoped idempotent bind,
@@ -1035,12 +1099,16 @@ class OriginActor {
 				await this.enqueue(async () => await this.#onTailFrame(sessionId, epoch, generation, retired, frame));
 			},
 			onRetentionGap: (gap) => {
-				void this.enqueue(async () => await this.#onRetentionGap(sessionId, epoch, generation, retired, gap.resync)).catch((error: unknown) =>
+				void this.enqueue(
+					async () => await this.#onRetentionGap(sessionId, epoch, generation, retired, gap.resync),
+				).catch((error: unknown) =>
 					this.#manager.log(`persona_retention_gap_failed origin=${this.originKey} detail=${safeDiagnostic(error)}`),
 				);
 			},
 			onStall: ({ elapsedMs }) => {
-				void this.enqueue(async () => await this.#onStall(sessionId, epoch, generation, retired, elapsedMs)).catch(() => {});
+				void this.enqueue(async () => await this.#onStall(sessionId, epoch, generation, retired, elapsedMs)).catch(
+					() => {},
+				);
 			},
 			onDiagnostic: (line) => this.#manager.log(line),
 		});
@@ -1063,7 +1131,9 @@ class OriginActor {
 			`recovery_hold origin=${this.originKey} epoch=${epoch} opRef=${bound.batch.opRef} reason=tail_retention_gap resync=${resyncCoordinate(resync)}`,
 		);
 		if (retired || bound.retired)
-			this.#manager.log(`retired_hold originKey=${this.originKey} batchKey=${bound.batch.batchKey} epoch=${epoch} opRef=${bound.batch.opRef} reason=tail_retention_gap`);
+			this.#manager.log(
+				`retired_hold originKey=${this.originKey} batchKey=${bound.batch.batchKey} epoch=${epoch} opRef=${bound.batch.opRef} reason=tail_retention_gap`,
+			);
 	}
 
 	async #onTailFrame(
@@ -1076,7 +1146,8 @@ class OriginActor {
 		const bound = this.#findBound(sessionId, epoch, brokerGeneration);
 		if (!bound) return;
 		if (bound.retired || retired) {
-			if (frame.assistantText) this.#manager.log(`stale_output origin=${this.originKey} epoch=${epoch} session=${sessionId}`);
+			if (frame.assistantText)
+				this.#manager.log(`stale_output origin=${this.originKey} epoch=${epoch} session=${sessionId}`);
 		} else {
 			if (frame.assistantText && !frame.steerEcho) bound.lastAssistantText = frame.assistantText;
 			await bound.lifecycle.onFrame?.({ ...bound, frame });
@@ -1115,7 +1186,9 @@ class OriginActor {
 			bound.tail?.setTurnRunning(false);
 			await bound.tail?.close();
 			bound.detached = true;
-			this.#manager.log(`retired_hold originKey=${this.originKey} batchKey=${bound.batch.batchKey} epoch=${epoch} opRef=${bound.batch.opRef} reason=stall`);
+			this.#manager.log(
+				`retired_hold originKey=${this.originKey} batchKey=${bound.batch.batchKey} epoch=${epoch} opRef=${bound.batch.opRef} reason=stall`,
+			);
 			this.#scheduleRetiredReattach(bound);
 		}
 	}
@@ -1128,14 +1201,20 @@ class OriginActor {
 	async #reconcileBound(bound: BoundTurn): Promise<void> {
 		let report: StatusReport;
 		try {
-			report = await this.#manager.port.status({ sessionId: bound.sessionId, repo: this.#manager.repo, opRef: bound.batch.opRef });
+			report = await this.#manager.port.status({
+				sessionId: bound.sessionId,
+				repo: this.#manager.repo,
+				opRef: bound.batch.opRef,
+			});
 		} catch (error) {
 			bound.nonSteerable = true;
 			// The broker disowning the id (session_unavailable) with the session
 			// provably not live means nothing is running there: release the batch
 			// and rebind instead of holding an adopted turn forever.
 			if (sdkStatusErrorCode(error) === "session_unavailable" && !bound.retired) {
-				const raw = this.#manager.port.liveness ? await this.#manager.port.liveness({ sessionId: bound.sessionId, repo: this.#manager.repo }) : undefined;
+				const raw = this.#manager.port.liveness
+					? await this.#manager.port.liveness({ sessionId: bound.sessionId, repo: this.#manager.repo })
+					: undefined;
 				if (raw?.live !== true) {
 					await bound.tail?.close();
 					const attempt = this.#manager.database.inboundBatchRequeueFreshTurn(bound.batch.batchKey);
@@ -1152,12 +1231,16 @@ class OriginActor {
 					return;
 				}
 			}
-			this.#manager.log(`recovery_hold origin=${this.originKey} epoch=${bound.epoch} opRef=${bound.batch.opRef} reason=status_unavailable detail=${safeDiagnostic(error)}`);
+			this.#manager.log(
+				`recovery_hold origin=${this.originKey} epoch=${bound.epoch} opRef=${bound.batch.opRef} reason=status_unavailable detail=${safeDiagnostic(error)}`,
+			);
 			return;
 		}
 		if (report.status.status === "unknown") {
 			bound.nonSteerable = true;
-			this.#manager.log(`recovery_hold origin=${this.originKey} epoch=${bound.epoch} opRef=${bound.batch.opRef} reason=operation_state_unknown`);
+			this.#manager.log(
+				`recovery_hold origin=${this.originKey} epoch=${bound.epoch} opRef=${bound.batch.opRef} reason=operation_state_unknown`,
+			);
 			return;
 		}
 		const rows = this.#manager.database.inboundBatchRows(bound.batch.batchKey);
@@ -1183,7 +1266,9 @@ class OriginActor {
 			// explicit log line instead of a silent shortcut.
 			bound.statusTerminalHolds += 1;
 			bound.nonSteerable = true;
-			this.#manager.log(`recovery_hold origin=${this.originKey} epoch=${bound.epoch} opRef=${bound.batch.opRef} reason=tail_terminal_evidence_unavailable`);
+			this.#manager.log(
+				`recovery_hold origin=${this.originKey} epoch=${bound.epoch} opRef=${bound.batch.opRef} reason=tail_terminal_evidence_unavailable`,
+			);
 			const timer = this.#manager.schedule(() => {
 				this.#graceTimers.delete(timer);
 				if (this.#stopped || this.#manager.stopped) return;
@@ -1210,7 +1295,9 @@ class OriginActor {
 			if (this.#current === bound) {
 				this.#current = undefined;
 				this.#state = "idle";
-				this.#manager.log(`recovery_fresh_turn origin=${this.originKey} epoch=${bound.epoch} opRef=${bound.batch.opRef}`);
+				this.#manager.log(
+					`recovery_fresh_turn origin=${this.originKey} epoch=${bound.epoch} opRef=${bound.batch.opRef}`,
+				);
 				await this.#armSettle();
 			}
 			return;
@@ -1222,13 +1309,16 @@ class OriginActor {
 				const text =
 					bound.tailTerminalObserved && bound.lastAssistantText !== undefined
 						? bound.lastAssistantText
-						: (await this.#manager.port.fetchLastAssistant({ sessionId: bound.sessionId, repo: this.#manager.repo })).text;
+						: (await this.#manager.port.fetchLastAssistant({ sessionId: bound.sessionId, repo: this.#manager.repo }))
+								.text;
 				await bound.lifecycle.onTerminal?.({ ...bound, text, status: report });
 			} else if (!bound.retired) {
 				await bound.lifecycle.onFailure?.({ ...bound, error: terminalError(report), status: report });
 			}
 		} catch (error) {
-			this.#manager.log(`persona_terminal_delivery_failed origin=${this.originKey} opRef=${bound.batch.opRef} detail=${safeDiagnostic(error)}`);
+			this.#manager.log(
+				`persona_terminal_delivery_failed origin=${this.originKey} opRef=${bound.batch.opRef} detail=${safeDiagnostic(error)}`,
+			);
 			throw error;
 		}
 		const completed = this.#manager.database.inboundBatchComplete(bound.batch.batchKey);
@@ -1258,28 +1348,33 @@ class OriginActor {
 
 	#scheduleRetiredReattach(bound: BoundTurn, attempt = 0): void {
 		const key = retiredKey(bound);
-		if (this.#retiredReattachTimers.has(key) || attempt >= RETIRED_REATTACH_MAX_ATTEMPTS || bound.tailEvidenceUnavailable) return;
+		if (
+			this.#retiredReattachTimers.has(key) ||
+			attempt >= RETIRED_REATTACH_MAX_ATTEMPTS ||
+			bound.tailEvidenceUnavailable
+		)
+			return;
 		const timer = this.#manager.schedule(() => {
 			this.#retiredReattachTimers.delete(key);
-			void this
-				.enqueue(async () => {
-					if (this.#retired.get(key) !== bound || !bound.detached || bound.tailEvidenceUnavailable) return;
-					try {
-						const tail = await this.#attachTail(bound.sessionId, bound.epoch, true);
-						bound.tail = tail;
-						bound.brokerGeneration = this.#manager.brokerGeneration;
-						bound.detached = false;
-						tail.setTurnRunning(true);
-						await tail.markAccepted(bound.batch.opRef);
-					} catch (error) {
-						if (error instanceof TailCapacityError) {
-							this.#scheduleRetiredReattach(bound, attempt + 1);
-							return;
-						}
-						this.#manager.log(`recovery_hold origin=${this.originKey} epoch=${bound.epoch} opRef=${bound.batch.opRef} reason=retired_tail_reattach_failed detail=${safeDiagnostic(error)}`);
+			void this.enqueue(async () => {
+				if (this.#retired.get(key) !== bound || !bound.detached || bound.tailEvidenceUnavailable) return;
+				try {
+					const tail = await this.#attachTail(bound.sessionId, bound.epoch, true);
+					bound.tail = tail;
+					bound.brokerGeneration = this.#manager.brokerGeneration;
+					bound.detached = false;
+					tail.setTurnRunning(true);
+					await tail.markAccepted(bound.batch.opRef);
+				} catch (error) {
+					if (error instanceof TailCapacityError) {
+						this.#scheduleRetiredReattach(bound, attempt + 1);
+						return;
 					}
-				})
-				.catch(() => {});
+					this.#manager.log(
+						`recovery_hold origin=${this.originKey} epoch=${bound.epoch} opRef=${bound.batch.opRef} reason=retired_tail_reattach_failed detail=${safeDiagnostic(error)}`,
+					);
+				}
+			}).catch(() => {});
 		}, RETIRED_REATTACH_DELAY_MS);
 		this.#retiredReattachTimers.set(key, timer);
 	}
@@ -1300,8 +1395,7 @@ class OriginActor {
 			return this.#current;
 		}
 		return [...this.#retired.values()].find(
-			(bound) =>
-				bound.sessionId === sessionId && bound.epoch === epoch && bound.brokerGeneration === brokerGeneration,
+			(bound) => bound.sessionId === sessionId && bound.epoch === epoch && bound.brokerGeneration === brokerGeneration,
 		);
 	}
 
@@ -1316,7 +1410,11 @@ class OriginActor {
 }
 
 function terminalError(status: StatusReport): Error {
-	return new Error(sanitizeDiagnostic(status.status.error?.message ?? status.status.error?.code ?? `session status ${status.status.status}`));
+	return new Error(
+		sanitizeDiagnostic(
+			status.status.error?.message ?? status.status.error?.code ?? `session status ${status.status.status}`,
+		),
+	);
 }
 
 function safeDiagnostic(error: unknown): string {
@@ -1337,7 +1435,9 @@ function sdkStatusErrorCode(error: unknown): string | undefined {
 function resyncCoordinate(value: unknown): string {
 	if (typeof value !== "object" || value === null || Array.isArray(value)) return "unavailable";
 	const coordinate = value as { revision?: unknown; generation?: unknown; seq?: unknown };
-	return [coordinate.revision, coordinate.generation, coordinate.seq].every((part) => typeof part === "number" && Number.isSafeInteger(part) && part >= 0)
+	return [coordinate.revision, coordinate.generation, coordinate.seq].every(
+		(part) => typeof part === "number" && Number.isSafeInteger(part) && part >= 0,
+	)
 		? `${coordinate.revision}:${coordinate.generation}:${coordinate.seq}`
 		: "unavailable";
 }
@@ -1361,7 +1461,11 @@ export function personaBatchOpRef(
 }
 
 function describeModel(selection: GjcModelSelection | undefined): string {
-	return selection === undefined ? "gjc-default" : typeof selection === "string" ? selection : `preset:${selection.preset}`;
+	return selection === undefined
+		? "gjc-default"
+		: typeof selection === "string"
+			? selection
+			: `preset:${selection.preset}`;
 }
 
 function sameRecoveryAuthority(left: BrokerSession | undefined, right: BrokerSession | undefined): boolean {
@@ -1376,7 +1480,13 @@ function sameRecoveryAuthority(left: BrokerSession | undefined, right: BrokerSes
 	);
 }
 
-export function personaBatchKey(originKey: string, epoch: number, oldestMessageId: string, cutoff: string, retryAttempt = 0): string {
+export function personaBatchKey(
+	originKey: string,
+	epoch: number,
+	oldestMessageId: string,
+	cutoff: string,
+	retryAttempt = 0,
+): string {
 	return `${originKey}|${epoch}|${oldestMessageId}|${cutoff}|${retryAttempt}`;
 }
 

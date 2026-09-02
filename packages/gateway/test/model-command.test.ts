@@ -1,11 +1,11 @@
 import { describe, expect, test } from "bun:test";
-import { applyModelCommand, parseModelArgument } from "../src/server/model-command";
-import type { GjcModelSelection } from "../src/store/db";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { GatewayConfig } from "../src/config";
+import { applyModelCommand, parseModelArgument } from "../src/server/model-command";
 import { type GatewayServer, startUnixServer } from "../src/server/server";
+import type { GjcModelSelection } from "../src/store/db";
 import { GatewayDatabase } from "../src/store/db";
 import { ScriptedSessionPort } from "./session-port.fake";
 
@@ -168,31 +168,79 @@ test("/model live-rebind keeps the session transcript and applies the new model 
 		client.send({ v: "0.1", type: "hello", payload: { supportedVersions: ["0.1"] } });
 		await Bun.sleep(5);
 		const origin = { platform: "loopback", kind: "loopback", conversationId: "model" };
-		client.send({ v: "0.1", type: "request", id: "first", verb: "chat.send", params: { origin, messageId: "m-1", text: "first" } });
+		client.send({
+			v: "0.1",
+			type: "request",
+			id: "first",
+			verb: "chat.send",
+			params: { origin, messageId: "m-1", text: "first" },
+		});
 		await waitFor(() => port.sends.length === 1, "first persistent turn did not start");
 		const first = port.sends[0]!;
 		port.complete(first.opRef, "first transcript");
-		await waitFor(() => port.transcript(first.sessionId).includes("first transcript"), "first transcript was not retained");
+		await waitFor(
+			() => port.transcript(first.sessionId).includes("first transcript"),
+			"first transcript was not retained",
+		);
 
-		client.send({ v: "0.1", type: "request", id: "model", verb: "chat.send", params: { origin, text: "/model set next" } });
-		await waitFor(() => port.models.some((entry) => entry.selection && typeof entry.selection !== "string" && entry.selection.preset === "next"), "live model.set was not issued");
-		expect(database.getSessionRecord("loopback/loopback/model")).toMatchObject({ epoch: 0, sessionId: first.sessionId });
+		client.send({
+			v: "0.1",
+			type: "request",
+			id: "model",
+			verb: "chat.send",
+			params: { origin, text: "/model set next" },
+		});
+		await waitFor(
+			() =>
+				port.models.some(
+					(entry) => entry.selection && typeof entry.selection !== "string" && entry.selection.preset === "next",
+				),
+			"live model.set was not issued",
+		);
+		expect(database.getSessionRecord("loopback/loopback/model")).toMatchObject({
+			epoch: 0,
+			sessionId: first.sessionId,
+		});
 		expect(port.transcript(first.sessionId)).toContain("first transcript");
-		expect(logs.some((line) => line.includes(`persona_model origin=loopback/loopback/model epoch=0 session=${first.sessionId} effective=preset:next changed=true source=/model`))).toBe(true);
+		expect(
+			logs.some((line) =>
+				line.includes(
+					`persona_model origin=loopback/loopback/model epoch=0 session=${first.sessionId} effective=preset:next changed=true source=/model`,
+				),
+			),
+		).toBe(true);
 
-		client.send({ v: "0.1", type: "request", id: "second", verb: "chat.send", params: { origin, messageId: "m-2", text: "second" } });
+		client.send({
+			v: "0.1",
+			type: "request",
+			id: "second",
+			verb: "chat.send",
+			params: { origin, messageId: "m-2", text: "second" },
+		});
 		await waitFor(() => port.sends.length === 2, "next persistent turn did not start");
 		const second = port.sends[1]!;
 		expect(second.sessionId).toBe(first.sessionId);
 		expect(second.model).toBeUndefined();
 		expect(port.models.at(-1)).toMatchObject({ sessionId: first.sessionId, selection: { preset: "next" } });
 		port.complete(second.opRef, "second transcript");
-		client.send({ v: "0.1", type: "request", id: "clear", verb: "chat.send", params: { origin, text: "/model clear" } });
+		client.send({
+			v: "0.1",
+			type: "request",
+			id: "clear",
+			verb: "chat.send",
+			params: { origin, text: "/model clear" },
+		});
 		await waitFor(() => {
 			const selection = port.models.at(-1)?.selection;
 			return typeof selection !== "string" && selection?.preset === "base";
 		}, "clearing the override did not restore the configured model on the same session");
-		client.send({ v: "0.1", type: "request", id: "third", verb: "chat.send", params: { origin, messageId: "m-3", text: "third" } });
+		client.send({
+			v: "0.1",
+			type: "request",
+			id: "third",
+			verb: "chat.send",
+			params: { origin, messageId: "m-3", text: "third" },
+		});
 		await waitFor(() => port.sends.length === 3, "cleared-model persistent turn did not start");
 		expect(port.sends[2]?.sessionId).toBe(first.sessionId);
 		port.complete(port.sends[2]!.opRef, "third transcript");

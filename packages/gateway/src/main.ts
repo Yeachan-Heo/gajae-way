@@ -22,7 +22,9 @@ if (command === "config" && args[0] === "check") {
 		process.once("SIGINT", shutdown);
 		process.once("SIGTERM", shutdown);
 	} catch (error) {
-		console.error(`gajaeway-gateway failed to start: ${sanitizeDiagnostic(error instanceof Error ? error.message : String(error)) || "unknown_error"}`);
+		console.error(
+			`gajaeway-gateway failed to start: ${sanitizeDiagnostic(error instanceof Error ? error.message : String(error)) || "unknown_error"}`,
+		);
 		process.exit(1);
 	}
 }

@@ -58,22 +58,37 @@ async function waitForTerminal(
 
 function assistantTextsFromTail(stdout: string): readonly string[] {
 	const parsed: unknown = JSON.parse(stdout);
-	if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed) || (parsed as { ok?: unknown }).ok !== true)
+	if (
+		typeof parsed !== "object" ||
+		parsed === null ||
+		Array.isArray(parsed) ||
+		(parsed as { ok?: unknown }).ok !== true
+	)
 		throw new Error("live SDK tail did not return a successful envelope");
 	const result = (parsed as { result?: unknown }).result;
-	if (typeof result !== "object" || result === null || Array.isArray(result)) throw new Error("live SDK tail did not return a result object");
+	if (typeof result !== "object" || result === null || Array.isArray(result))
+		throw new Error("live SDK tail did not return a result object");
 	const items = (result as { items?: unknown }).items;
 	if (!Array.isArray(items)) throw new Error("live SDK tail did not return items");
 	return items.flatMap((item) => {
 		if (typeof item !== "object" || item === null || Array.isArray(item)) return [];
 		const record = item as { kind?: unknown; payload?: unknown };
-		if (record.kind !== "transcript" || typeof record.payload !== "object" || record.payload === null || Array.isArray(record.payload)) return [];
+		if (
+			record.kind !== "transcript" ||
+			typeof record.payload !== "object" ||
+			record.payload === null ||
+			Array.isArray(record.payload)
+		)
+			return [];
 		const payload = record.payload as { role?: unknown; content?: unknown };
 		if (payload.role !== "assistant" || !Array.isArray(payload.content)) return [];
 		return payload.content.flatMap((block) =>
 			typeof block === "string"
 				? [block]
-				: typeof block === "object" && block !== null && !Array.isArray(block) && typeof (block as { text?: unknown }).text === "string"
+				: typeof block === "object" &&
+						block !== null &&
+						!Array.isArray(block) &&
+						typeof (block as { text?: unknown }).text === "string"
 					? [(block as { text: string }).text]
 					: [],
 		);
@@ -109,7 +124,12 @@ liveTest(
 				database,
 				cli: broker.cli,
 				instanceId: database.instanceId,
-				tailRunner: new TailRunner({ run: broker.cli, stream: (sessionId) => broker.openStream(sessionId), repo, pollIntervalMs: 250 }),
+				tailRunner: new TailRunner({
+					run: broker.cli,
+					stream: (sessionId) => broker.openStream(sessionId),
+					repo,
+					pollIntervalMs: 250,
+				}),
 			});
 			const binding = await port.bind({ originKey: "loopback/loopback/persistent-e2e", epoch: 0, repo });
 			sessionId = binding.sessionId;
@@ -135,8 +155,7 @@ liveTest(
 			const receipt = await port.send({
 				sessionId,
 				repo,
-				text:
-					"Without using tools, write a detailed 1,800-word explanation of persistent-session recovery. Use multiple sections and do not finish early; end with PERSISTENT_E2E_BASELINE.",
+				text: "Without using tools, write a detailed 1,800-word explanation of persistent-session recovery. Use multiple sections and do not finish early; end with PERSISTENT_E2E_BASELINE.",
 				opRef: steerRef,
 			});
 			expect(receipt.operationRef).toBe(steerRef);

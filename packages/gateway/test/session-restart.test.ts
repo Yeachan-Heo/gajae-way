@@ -2,10 +2,10 @@ import { afterEach, expect, test } from "bun:test";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import type { BrokerSession, StatusReport } from "@gajaeway/subsession";
 import { PersonaSessionManager, personaBatchKey, personaBatchOpRef } from "../src/orchestrator/persona-session";
 import { GatewayDatabase } from "../src/store/db";
 import { ScriptedSessionPort } from "./session-port.fake";
-import type { BrokerSession, StatusReport } from "@gajaeway/subsession";
 
 const ORIGIN = { platform: "loopback", kind: "loopback", conversationId: "restart" } as const;
 const KEY = "loopback/loopback/restart";
@@ -67,7 +67,10 @@ function enqueue(messageId: string, body: string, receivedAt = new Date().toISOS
 	).toBe(true);
 }
 
-async function startAccepted(port: ScriptedSessionPort, logs: string[]): Promise<{ opRef: string; batchKey: string; sessionId: string }> {
+async function startAccepted(
+	port: ScriptedSessionPort,
+	logs: string[],
+): Promise<{ opRef: string; batchKey: string; sessionId: string }> {
 	manager = makeManager(port, logs);
 	enqueue("m-1", "restart me");
 	await manager.notifyInbound(KEY);
@@ -102,72 +105,81 @@ test("restart observes an accepted nonterminal batch on the same live session wi
 	expect(port.inspections.filter((entry) => entry.sessionId === accepted.sessionId)).toHaveLength(2);
 	expect(database.inboundBatchRows(accepted.batchKey)[0]).toMatchObject({ state: "pending", batch_state: "accepted" });
 	port.complete(accepted.opRef, "transcript survived restart");
-	await eventually(() => database?.inboundBatchRows(accepted.batchKey)[0]?.batch_state === "done", "observed batch did not reach terminal completion");
+	await eventually(
+		() => database?.inboundBatchRows(accepted.batchKey)[0]?.batch_state === "done",
+		"observed batch did not reach terminal completion",
+	);
 	expect(terminal).toEqual(["transcript survived restart"]);
 });
 
-	test("client_ref_conflict reconciles the same deterministic op-ref without a second accepted send, including after restart", async () => {
-		home = await mkdtemp(join(tmpdir(), "gajaeway-session-restart-"));
-		database = await GatewayDatabase.open(join(home, "gateway.db"));
-		const port = new ScriptedSessionPort();
-		const logs: string[] = [];
-		const repo = join(home, "workspace");
-		const receivedAt = "2026-09-02T00:00:00.000Z";
-		const cutoff = receivedAt;
-		const opRef = personaBatchOpRef("restart-test", KEY, 0, "m-conflict", cutoff);
-		port.seedAcceptedSend({ sessionId: "session-1", repo, text: "replay exactly once", opRef });
-		manager = new PersonaSessionManager({
-			database,
-			port,
-			instanceId: "restart-test",
-			repo,
-			settleWindowMs: 0,
-			now: () => Date.parse(receivedAt),
-			setTimeout: (work) => {
-				void Promise.resolve().then(work);
-				return 0;
-			},
-			clearTimeout: () => {},
-			onTurnStart: ({ rows }) => ({ text: rows.map((row) => row.body).join("\n") }),
-			log: (line) => logs.push(line),
-		});
-		enqueue("m-conflict", "replay exactly once", receivedAt);
-		await manager.notifyInbound(KEY);
-		await eventually(
-			() => logs.includes(`recovery_client_ref_conflict origin=${KEY} epoch=0 opRef=${opRef}`),
-			"client_ref_conflict was not reconciled through status",
-		);
-		const batch = database.inboundNonterminalBatches(KEY)[0]!;
-		expect(batch).toMatchObject({ opRef, state: "accepted", sessionId: "session-1" });
-		await manager.stop();
-		manager = makeManager(port, logs);
-		await manager.recover();
-		expect(port.sendAttempts.map((send) => send.opRef)).toEqual([opRef, opRef]);
-		expect(port.sends).toHaveLength(1);
-		port.complete(opRef, "conflict reconciled");
-		await eventually(() => database?.inboundBatchRows(batch.batchKey)[0]?.batch_state === "done", "conflict-reconciled batch did not complete");
+test("client_ref_conflict reconciles the same deterministic op-ref without a second accepted send, including after restart", async () => {
+	home = await mkdtemp(join(tmpdir(), "gajaeway-session-restart-"));
+	database = await GatewayDatabase.open(join(home, "gateway.db"));
+	const port = new ScriptedSessionPort();
+	const logs: string[] = [];
+	const repo = join(home, "workspace");
+	const receivedAt = "2026-09-02T00:00:00.000Z";
+	const cutoff = receivedAt;
+	const opRef = personaBatchOpRef("restart-test", KEY, 0, "m-conflict", cutoff);
+	port.seedAcceptedSend({ sessionId: "session-1", repo, text: "replay exactly once", opRef });
+	manager = new PersonaSessionManager({
+		database,
+		port,
+		instanceId: "restart-test",
+		repo,
+		settleWindowMs: 0,
+		now: () => Date.parse(receivedAt),
+		setTimeout: (work) => {
+			void Promise.resolve().then(work);
+			return 0;
+		},
+		clearTimeout: () => {},
+		onTurnStart: ({ rows }) => ({ text: rows.map((row) => row.body).join("\n") }),
+		log: (line) => logs.push(line),
 	});
+	enqueue("m-conflict", "replay exactly once", receivedAt);
+	await manager.notifyInbound(KEY);
+	await eventually(
+		() => logs.includes(`recovery_client_ref_conflict origin=${KEY} epoch=0 opRef=${opRef}`),
+		"client_ref_conflict was not reconciled through status",
+	);
+	const batch = database.inboundNonterminalBatches(KEY)[0]!;
+	expect(batch).toMatchObject({ opRef, state: "accepted", sessionId: "session-1" });
+	await manager.stop();
+	manager = makeManager(port, logs);
+	await manager.recover();
+	expect(port.sendAttempts.map((send) => send.opRef)).toEqual([opRef, opRef]);
+	expect(port.sends).toHaveLength(1);
+	port.complete(opRef, "conflict reconciled");
+	await eventually(
+		() => database?.inboundBatchRows(batch.batchKey)[0]?.batch_state === "done",
+		"conflict-reconciled batch did not complete",
+	);
+});
 
-	test("a settled batch whose operation is unknown stays held and is never resent", async () => {
-		home = await mkdtemp(join(tmpdir(), "gajaeway-session-restart-"));
-		database = await GatewayDatabase.open(join(home, "gateway.db"));
-		const port = new ScriptedSessionPort();
-		const logs: string[] = [];
-		const repo = join(home, "workspace");
-		const binding = await port.bind({ originKey: KEY, epoch: 0, repo });
-		expect(database.putSessionAtEpoch(KEY, binding.sessionId, 0)).toBe(true);
-		const cutoff = "2026-09-02T00:00:01.000Z";
-		const batchKey = personaBatchKey(KEY, 0, "m-unknown", cutoff);
-		const opRef = personaBatchOpRef("restart-test", KEY, 0, "m-unknown", cutoff);
-		enqueue("m-unknown", "do not replay unknown", "2026-09-02T00:00:00.000Z");
-		database.inboundSettleBatch({ originKey: KEY, epoch: 0, cutoff, batchKey, opRef });
-		database.inboundBatchBindSession(batchKey, binding.sessionId);
-		manager = makeManager(port, logs);
-		await manager.recover();
-		expect(port.sendAttempts).toEqual([]);
-		expect(database.inboundBatchRows(batchKey)[0]).toMatchObject({ batch_state: "settled", bound_session_id: binding.sessionId });
-		expect(logs.some((line) => line.startsWith(`recovery_hold origin=${KEY} epoch=0 opRef=${opRef}`))).toBe(true);
+test("a settled batch whose operation is unknown stays held and is never resent", async () => {
+	home = await mkdtemp(join(tmpdir(), "gajaeway-session-restart-"));
+	database = await GatewayDatabase.open(join(home, "gateway.db"));
+	const port = new ScriptedSessionPort();
+	const logs: string[] = [];
+	const repo = join(home, "workspace");
+	const binding = await port.bind({ originKey: KEY, epoch: 0, repo });
+	expect(database.putSessionAtEpoch(KEY, binding.sessionId, 0)).toBe(true);
+	const cutoff = "2026-09-02T00:00:01.000Z";
+	const batchKey = personaBatchKey(KEY, 0, "m-unknown", cutoff);
+	const opRef = personaBatchOpRef("restart-test", KEY, 0, "m-unknown", cutoff);
+	enqueue("m-unknown", "do not replay unknown", "2026-09-02T00:00:00.000Z");
+	database.inboundSettleBatch({ originKey: KEY, epoch: 0, cutoff, batchKey, opRef });
+	database.inboundBatchBindSession(batchKey, binding.sessionId);
+	manager = makeManager(port, logs);
+	await manager.recover();
+	expect(port.sendAttempts).toEqual([]);
+	expect(database.inboundBatchRows(batchKey)[0]).toMatchObject({
+		batch_state: "settled",
+		bound_session_id: binding.sessionId,
 	});
+	expect(logs.some((line) => line.startsWith(`recovery_hold origin=${KEY} epoch=0 opRef=${opRef}`))).toBe(true);
+});
 
 test("dead plus active is a sticky hold and never silently resumes or resends", async () => {
 	home = await mkdtemp(join(tmpdir(), "gajaeway-session-restart-"));
@@ -183,7 +195,9 @@ test("dead plus active is a sticky hold and never silently resumes or resends", 
 	expect(port.resumes).toEqual([]);
 	expect(port.sends).toHaveLength(1);
 	expect(database.inboundBatchRows(accepted.batchKey)[0]).toMatchObject({ state: "pending", batch_state: "accepted" });
-	expect(logs.some((line) => line.startsWith(`recovery_hold origin=${KEY} epoch=0 opRef=${accepted.opRef}`))).toBe(true);
+	expect(logs.some((line) => line.startsWith(`recovery_hold origin=${KEY} epoch=0 opRef=${accepted.opRef}`))).toBe(
+		true,
+	);
 });
 
 test("an inspect authority shift holds the batch rather than trusting a stale active operation", async () => {
@@ -203,7 +217,7 @@ test("an inspect authority shift holds the batch rather than trusting a stale ac
 	expect(logs.some((line) => line.includes("reason=broker authority is ambiguous"))).toBe(true);
 });
 
-	test("dead terminal saved authority resumes, holds once, then reconciles from status when tail evidence is unavailable", async () => {
+test("dead terminal saved authority resumes, holds once, then reconciles from status when tail evidence is unavailable", async () => {
 	home = await mkdtemp(join(tmpdir(), "gajaeway-session-restart-"));
 	database = await GatewayDatabase.open(join(home, "gateway.db"));
 	const port = new ScriptedSessionPort();
@@ -216,19 +230,23 @@ test("an inspect authority shift holds the batch rather than trusting a stale ac
 	manager = makeManager(port, logs, terminal);
 
 	await manager.recover();
-	expect(port.resumes).toEqual([{ sessionId: accepted.sessionId, repo: join(home, "workspace"), originKey: KEY, epoch: 0 }]);
+	expect(port.resumes).toEqual([
+		{ sessionId: accepted.sessionId, repo: join(home, "workspace"), originKey: KEY, epoch: 0 },
+	]);
 	// Exactly one send ever: the recovered terminal batch is reconciled, never resent.
 	expect(port.sends).toHaveLength(1);
 	// The tail is the live authority, so the first decidable-terminal reconcile
 	// holds; the bounded grace then treats post-crash tail evidence as genuinely
 	// unavailable and completes from status with an explicit corroboration log.
 	expect(logs.some((line) => line.includes("reason=tail_terminal_evidence_unavailable"))).toBe(true);
-	expect(logs.some((line) => line.includes("terminal_status_reconciled") && line.includes("tail_evidence=unavailable"))).toBe(true);
+	expect(
+		logs.some((line) => line.includes("terminal_status_reconciled") && line.includes("tail_evidence=unavailable")),
+	).toBe(true);
 	expect(database.inboundBatchRows(accepted.batchKey)[0]).toMatchObject({ state: "done", batch_state: "done" });
 	expect(terminal).toEqual(["saved transcript"]);
 });
 
-	test("resume-impossible remains an explicit hold without terminal tail evidence", async () => {
+test("resume-impossible remains an explicit hold without terminal tail evidence", async () => {
 	home = await mkdtemp(join(tmpdir(), "gajaeway-session-restart-"));
 	database = await GatewayDatabase.open(join(home, "gateway.db"));
 	const port = new ScriptedSessionPort();
@@ -257,7 +275,11 @@ test("a retired hold reattaches after restart and does not block the new epoch",
 	manager = makeManager(port, logs);
 
 	await manager.recover();
-	expect(database.inboundNonterminalBatches(KEY)[0]).toMatchObject({ epoch: 0, state: "accepted", sessionId: accepted.sessionId });
+	expect(database.inboundNonterminalBatches(KEY)[0]).toMatchObject({
+		epoch: 0,
+		state: "accepted",
+		sessionId: accepted.sessionId,
+	});
 	enqueue("m-new", "new epoch work");
 	await manager.notifyInbound(KEY);
 	await eventually(() => port.sends.length === 2, "retired hold blocked new-epoch send");
@@ -286,7 +308,9 @@ test("a recovered failed operation on a live saved session re-fires exactly one 
 	await eventually(() => port.sends.length === 2, "recovery did not settle a replacement turn");
 	port.complete(port.sends[1]!.opRef, "replacement reply");
 	// live+terminal(failed) => fresh_turn: requeue once, one replacement send, never a resend of the failed ref.
-	expect(logs.some((line) => line.startsWith(`recovery_fresh_turn origin=${KEY} epoch=0 opRef=${accepted.opRef}`))).toBe(true);
+	expect(
+		logs.some((line) => line.startsWith(`recovery_fresh_turn origin=${KEY} epoch=0 opRef=${accepted.opRef}`)),
+	).toBe(true);
 	const replacement = port.sends[1]!;
 	expect(replacement.opRef).not.toBe(accepted.opRef);
 	expect(replacement.opRef).toMatch(/^gw-p-[0-9a-f]{32}$/);
@@ -321,7 +345,13 @@ test("a settled-but-unaccepted batch on a session the runtime cannot answer for 
 	enqueue("m-1", "hello after cutover");
 	const cutoff = new Date().toISOString();
 	const batchKey = `${KEY}|0|m-1|${cutoff}|0`;
-	database.inboundSettleBatch({ originKey: KEY, epoch: 0, cutoff, batchKey, opRef: "gw-p-00000000000000000000000000000001" });
+	database.inboundSettleBatch({
+		originKey: KEY,
+		epoch: 0,
+		cutoff,
+		batchKey,
+		opRef: "gw-p-00000000000000000000000000000001",
+	});
 	database.inboundBatchBindSession(batchKey, "pre-cutover-session");
 	manager = makeManager(port, logs);
 
@@ -351,7 +381,10 @@ test("a settle whose bind fails releases the rows and retries the bind with back
 	manager = makeManager(port, logs, terminal);
 	enqueue("m-1", "hello under load");
 	await manager.notifyInbound(KEY);
-	await eventually(() => logs.some((line) => line.startsWith(`persona_bind_failed origin=${KEY}`)), "bind failure was not recorded");
+	await eventually(
+		() => logs.some((line) => line.startsWith(`persona_bind_failed origin=${KEY}`)),
+		"bind failure was not recorded",
+	);
 	// No settled-but-unbound batch survives the failure; the rows are pending again.
 	expect(database.inboundNonterminalBatches(KEY)).toEqual([]);
 	expect(database.inboundPendingCount(KEY)).toBe(1);
@@ -388,7 +421,13 @@ test("a settled batch whose id the Router disowns is released and re-fired even 
 	enqueue("m-1", "hello");
 	const cutoff = new Date().toISOString();
 	const batchKey = `${KEY}|0|m-1|${cutoff}|0`;
-	database.inboundSettleBatch({ originKey: KEY, epoch: 0, cutoff, batchKey, opRef: "gw-p-00000000000000000000000000000002" });
+	database.inboundSettleBatch({
+		originKey: KEY,
+		epoch: 0,
+		cutoff,
+		batchKey,
+		opRef: "gw-p-00000000000000000000000000000002",
+	});
 	database.inboundBatchBindSession(batchKey, staleId);
 	manager = makeManager(port, logs);
 	await manager.recover();

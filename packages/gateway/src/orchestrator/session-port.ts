@@ -2,27 +2,27 @@ import { createHash } from "node:crypto";
 import {
 	assertControlAllowed,
 	assertValidOpRef,
-	TranscriptIncompleteError,
-	GjcCliError,
-	fetchOpState,
-	envelopeErrorCode,
-	inspectSession,
-	isTerminalStatus,
-	OpRefRejectedError,
-	parseEnvelope,
-	sendPrompt,
 	type BrokerSession,
+	type CliResult,
 	type CliRunner,
 	type ControllerOptions,
-	type CliResult,
+	envelopeErrorCode,
+	fetchOpState,
+	GjcCliError,
+	inspectSession,
+	isTerminalStatus,
 	type LastAssistantResult,
+	OpRefRejectedError,
+	parseEnvelope,
 	type SendReceipt,
 	type StatusReport,
+	sendPrompt,
+	TranscriptIncompleteError,
 } from "@gajaeway/subsession";
 import type { GjcModelSelection } from "../config";
 import type { GatewayDatabase } from "../store/db";
 import { sanitizeDiagnostic } from "./rebind";
-import { type TailAttachInput, type TailHandle, TailRunner } from "./tail-runner";
+import type { TailAttachInput, TailHandle, TailRunner } from "./tail-runner";
 
 /**
  * Generic broker-backed session surface. Callers own prompt composition,
@@ -32,16 +32,26 @@ import { type TailAttachInput, type TailHandle, TailRunner } from "./tail-runner
 export interface SessionPort {
 	bind(input: SessionBindInput): Promise<SessionBinding>;
 	inspect(input: { sessionId: string; repo: string }): Promise<BrokerSession | undefined>;
-	liveness?(input: { sessionId: string; repo: string }): Promise<{ readonly live: boolean | undefined; readonly disowned: boolean }>;
+	liveness?(input: {
+		sessionId: string;
+		repo: string;
+	}): Promise<{ readonly live: boolean | undefined; readonly disowned: boolean }>;
 	/** Live turn counters (tool calls in the transcript, output tokens from usage.get); undefined when unsupported. */
-	progress?(input: { sessionId: string; repo: string }): Promise<{ readonly toolCalls: number; readonly outputTokens: number } | undefined>;
+	progress?(input: {
+		sessionId: string;
+		repo: string;
+	}): Promise<{ readonly toolCalls: number; readonly outputTokens: number } | undefined>;
 	/** True when the session's prompt queue has no pending messages (queue.messages.list empty). */
 	queueEmpty?(input: { sessionId: string; repo: string }): Promise<boolean>;
 	/** Restores a saved, non-deleted session through `session.resume`; it never creates a replacement. */
 	resume(input: { sessionId: string; repo: string; originKey: string; epoch: number }): Promise<SessionBinding>;
 	send(input: SessionSendInput): Promise<SendReceipt>;
 	steer(input: SessionSteerInput): Promise<void>;
-	setModel(input: { sessionId: string; repo: string; selection: GjcModelSelection }): Promise<{ readonly changed: boolean }>;
+	setModel(input: {
+		sessionId: string;
+		repo: string;
+		selection: GjcModelSelection;
+	}): Promise<{ readonly changed: boolean }>;
 	status(input: { sessionId: string; repo: string; opRef: string }): Promise<StatusReport>;
 	fetchLastAssistant(input: { sessionId: string; repo: string }): Promise<LastAssistantResult>;
 	attachTail(input: TailAttachInput): Promise<TailHandle>;
@@ -183,7 +193,8 @@ export class BrokerSessionPort implements SessionPort {
 	}
 
 	async bind(input: SessionBindInput): Promise<SessionBinding> {
-		if (!Number.isSafeInteger(input.epoch) || input.epoch < 0) throw new Error("session epoch must be a non-negative integer");
+		if (!Number.isSafeInteger(input.epoch) || input.epoch < 0)
+			throw new Error("session epoch must be a non-negative integer");
 		const existing = this.#database.getSessionRecord(input.originKey);
 		if (existing?.epoch === input.epoch && existing.sessionId) {
 			// A persisted binding is only reusable if the broker still indexes it. A
@@ -202,9 +213,12 @@ export class BrokerSessionPort implements SessionPort {
 			} catch {
 				indexed = true;
 			}
-			if (indexed) return { sessionId: existing.sessionId, originKey: input.originKey, epoch: input.epoch, repo: input.repo };
+			if (indexed)
+				return { sessionId: existing.sessionId, originKey: input.originKey, epoch: input.epoch, repo: input.repo };
 			const rebound = this.#database.rebindEpoch(input.originKey);
-			console.error(`session_rebound origin=${input.originKey} epoch=${input.epoch} nextEpoch=${rebound} session=${existing.sessionId} reason=not_indexed_by_broker`);
+			console.error(
+				`session_rebound origin=${input.originKey} epoch=${input.epoch} nextEpoch=${rebound} session=${existing.sessionId} reason=not_indexed_by_broker`,
+			);
 			return await this.bind({ ...input, epoch: rebound });
 		}
 		const idempotencyKey = sessionCreateRef(this.#instanceId, input.originKey, input.epoch, input.repo);
@@ -217,7 +231,9 @@ export class BrokerSessionPort implements SessionPort {
 			throw new Error(`session bind for ${input.originKey} epoch ${input.epoch} lost to epoch ${persistedEpoch}`);
 		}
 		if (!this.#database.putSessionAtEpoch(input.originKey, created.sessionId, input.epoch)) {
-			throw new Error(`session bind for ${input.originKey} epoch ${input.epoch} lost to a concurrent durable epoch change`);
+			throw new Error(
+				`session bind for ${input.originKey} epoch ${input.epoch} lost to a concurrent durable epoch change`,
+			);
 		}
 		// session.create returns once the host is admitted; the Router indexes it
 		// a moment later. A tail/send before that answers session_unavailable, so
@@ -235,12 +251,17 @@ export class BrokerSessionPort implements SessionPort {
 		for (;;) {
 			try {
 				const result = await this.#cli(["sdk", "session", "inspect", sessionId, "--repo", repo], { timeoutMs: 10_000 });
-				const envelope = JSON.parse(result.stdout) as { ok?: unknown; result?: { session?: { live?: unknown } }; error?: { code?: unknown } };
+				const envelope = JSON.parse(result.stdout) as {
+					ok?: unknown;
+					result?: { session?: { live?: unknown } };
+					error?: { code?: unknown };
+				};
 				// Only a broker that explicitly reports the id as not indexed / not
 				// live keeps us waiting; anything else is treated as ready (the send
 				// path still has its own recovery if that turns out to be wrong).
 				const disowned = envelope.ok === false && envelope.error?.code === "session_unavailable";
-				const notLive = envelope.ok === true && envelope.result?.session !== undefined && envelope.result.session.live === false;
+				const notLive =
+					envelope.ok === true && envelope.result?.session !== undefined && envelope.result.session.live === false;
 				if (!disowned && !notLive) return;
 				lastCode = disowned ? "session_unavailable" : "not_live";
 			} catch (error) {
@@ -248,7 +269,8 @@ export class BrokerSessionPort implements SessionPort {
 				if (code !== "session_unavailable") return;
 				lastCode = code;
 			}
-			if (Date.now() >= deadline) throw new Error(`session ${sessionId} was created but never became live (${lastCode})`);
+			if (Date.now() >= deadline)
+				throw new Error(`session ${sessionId} was created but never became live (${lastCode})`);
 			await this.#sleep(SESSION_READY_POLL_MS);
 		}
 	}
@@ -300,10 +322,19 @@ export class BrokerSessionPort implements SessionPort {
 	 * `locator.repo`, which makes the subsession normalizer return undefined for a
 	 * perfectly well-known session. `disowned` = the broker rejects the id.
 	 */
-	async liveness(input: { sessionId: string; repo: string }): Promise<{ readonly live: boolean | undefined; readonly disowned: boolean }> {
+	async liveness(input: {
+		sessionId: string;
+		repo: string;
+	}): Promise<{ readonly live: boolean | undefined; readonly disowned: boolean }> {
 		try {
-			const result = await this.#cli(["sdk", "session", "inspect", input.sessionId, "--repo", input.repo], { timeoutMs: 10_000 });
-			const envelope = JSON.parse(result.stdout) as { ok?: unknown; result?: { session?: { live?: unknown } }; error?: { code?: unknown } };
+			const result = await this.#cli(["sdk", "session", "inspect", input.sessionId, "--repo", input.repo], {
+				timeoutMs: 10_000,
+			});
+			const envelope = JSON.parse(result.stdout) as {
+				ok?: unknown;
+				result?: { session?: { live?: unknown } };
+				error?: { code?: unknown };
+			};
 			if (envelope.ok === false) return { live: undefined, disowned: envelope.error?.code === "session_unavailable" };
 			const live = envelope.result?.session?.live;
 			return { live: typeof live === "boolean" ? live : undefined, disowned: false };
@@ -371,7 +402,11 @@ export class BrokerSessionPort implements SessionPort {
 		);
 	}
 
-	async setModel(input: { sessionId: string; repo: string; selection: GjcModelSelection }): Promise<{ readonly changed: boolean }> {
+	async setModel(input: {
+		sessionId: string;
+		repo: string;
+		selection: GjcModelSelection;
+	}): Promise<{ readonly changed: boolean }> {
 		const payload = typeof input.selection === "string" ? { id: input.selection } : { preset: input.selection.preset };
 		const result = parseEnvelope<{ changed?: unknown }>(
 			await this.#cli([
@@ -400,19 +435,63 @@ export class BrokerSessionPort implements SessionPort {
 	 * finalized text), so mid-turn counters are read from the two queries that
 	 * do carry them: transcript.list (assistant toolCall content) and usage.get.
 	 */
-	async progress(input: { sessionId: string; repo: string }): Promise<{ readonly toolCalls: number; readonly outputTokens: number } | undefined> {
+	async progress(input: {
+		sessionId: string;
+		repo: string;
+	}): Promise<{ readonly toolCalls: number; readonly outputTokens: number } | undefined> {
 		try {
 			const [transcript, usage] = await Promise.all([
-				this.#cli(["sdk", "session", "raw", "query", input.sessionId, "--query", "transcript.list", "--repo", input.repo, "--json-input", "{}"], { timeoutMs: 10_000 }),
-				this.#cli(["sdk", "session", "raw", "query", input.sessionId, "--query", "usage.get", "--repo", input.repo, "--json-input", "{}"], { timeoutMs: 10_000 }),
+				this.#cli(
+					[
+						"sdk",
+						"session",
+						"raw",
+						"query",
+						input.sessionId,
+						"--query",
+						"transcript.list",
+						"--repo",
+						input.repo,
+						"--json-input",
+						"{}",
+					],
+					{ timeoutMs: 10_000 },
+				),
+				this.#cli(
+					[
+						"sdk",
+						"session",
+						"raw",
+						"query",
+						input.sessionId,
+						"--query",
+						"usage.get",
+						"--repo",
+						input.repo,
+						"--json-input",
+						"{}",
+					],
+					{ timeoutMs: 10_000 },
+				),
 			]);
-			const rows = (JSON.parse(transcript.stdout) as { page?: { items?: Array<{ role?: string; content?: Array<{ type?: string }> }> } }).page?.items ?? [];
+			const rows =
+				(
+					JSON.parse(transcript.stdout) as {
+						page?: { items?: Array<{ role?: string; content?: Array<{ type?: string }> }> };
+					}
+				).page?.items ?? [];
 			const toolCalls = rows.reduce(
-				(count, row) => count + (row.role === "assistant" && Array.isArray(row.content) ? row.content.filter((part) => part?.type === "toolCall").length : 0),
+				(count, row) =>
+					count +
+					(row.role === "assistant" && Array.isArray(row.content)
+						? row.content.filter((part) => part?.type === "toolCall").length
+						: 0),
 				0,
 			);
-			const usageRow = (JSON.parse(usage.stdout) as { page?: { items?: Array<{ output?: unknown }> } }).page?.items?.[0];
-			const outputTokens = typeof usageRow?.output === "number" && Number.isFinite(usageRow.output) ? usageRow.output : 0;
+			const usageRow = (JSON.parse(usage.stdout) as { page?: { items?: Array<{ output?: unknown }> } }).page
+				?.items?.[0];
+			const outputTokens =
+				typeof usageRow?.output === "number" && Number.isFinite(usageRow.output) ? usageRow.output : 0;
 			return { toolCalls, outputTokens };
 		} catch {
 			return undefined;
@@ -420,7 +499,22 @@ export class BrokerSessionPort implements SessionPort {
 	}
 
 	async queueEmpty(input: { sessionId: string; repo: string }): Promise<boolean> {
-		const result = await this.#cli(["sdk", "session", "raw", "query", input.sessionId, "--query", "queue.messages.list", "--repo", input.repo, "--json-input", "{}"], { timeoutMs: 10_000 });
+		const result = await this.#cli(
+			[
+				"sdk",
+				"session",
+				"raw",
+				"query",
+				input.sessionId,
+				"--query",
+				"queue.messages.list",
+				"--repo",
+				input.repo,
+				"--json-input",
+				"{}",
+			],
+			{ timeoutMs: 10_000 },
+		);
 		const page = (JSON.parse(result.stdout) as { ok?: unknown; page?: { items?: unknown[]; complete?: unknown } }).page;
 		return page !== undefined && Array.isArray(page.items) && page.items.length === 0 && page.complete === true;
 	}
@@ -477,12 +571,14 @@ export class BrokerSessionPort implements SessionPort {
 				"compaction.run",
 			);
 			this.#tailRunner.recordCompactionReceipt({ sessionId: input.sessionId, originKey: input.originKey, result });
-			if (result.started === true || result.status === "started" || result.status === "completed") return { status: "succeeded" };
+			if (result.started === true || result.status === "started" || result.status === "completed")
+				return { status: "succeeded" };
 			if (result.skipped === true || result.status === "skipped") return { status: "skipped" };
 			return { status: "failed" };
 		} catch (error) {
 			const code = sdkErrorCode(error);
-			if (code === "unsupported_operation" || code === "not_supported" || code === "unknown_operation") return { status: "unavailable" };
+			if (code === "unsupported_operation" || code === "not_supported" || code === "unknown_operation")
+				return { status: "unavailable" };
 			return { status: "failed" };
 		}
 	}
@@ -533,7 +629,8 @@ export class BrokerSessionPort implements SessionPort {
 			brokerGeneration: 0,
 			repo: input.repo,
 			...(input.originKey ? { originKey: input.originKey } : {}),
-			onStall: ({ elapsedMs }) => console.error(`session stall sessionId=${input.sessionId} opRef=${input.opRef} silentMs=${elapsedMs}`),
+			onStall: ({ elapsedMs }) =>
+				console.error(`session stall sessionId=${input.sessionId} opRef=${input.opRef} silentMs=${elapsedMs}`),
 		});
 		tail.setTurnRunning(true);
 		try {
@@ -547,7 +644,8 @@ export class BrokerSessionPort implements SessionPort {
 				await this.#sleep(pollMs);
 				status = await this.status({ sessionId: input.sessionId, repo: input.repo, opRef: input.opRef });
 			}
-			if (!isTerminalStatus(status.status.status)) throw new SessionRequestTimeoutError(input.sessionId, input.opRef, status);
+			if (!isTerminalStatus(status.status.status))
+				throw new SessionRequestTimeoutError(input.sessionId, input.opRef, status);
 			if (status.status.status !== "terminal_ok") throw new SessionTerminalError(status);
 			return {
 				receipt,
@@ -661,10 +759,19 @@ function sanitizedDetails(details: unknown): unknown {
 
 function sanitizeSdkFailure(error: unknown): Error {
 	if (error instanceof OpRefRejectedError)
-		return new OpRefRejectedError(error.opRef, stableErrorCode(error.code) ?? "sdk_error", sanitizedDetails(error.details));
+		return new OpRefRejectedError(
+			error.opRef,
+			stableErrorCode(error.code) ?? "sdk_error",
+			sanitizedDetails(error.details),
+		);
 	if (error instanceof GjcCliError) {
 		const code = sdkErrorCode(error) ?? "sdk_error";
-		return new GjcCliError(`gjc sdk request failed: ${code}`, error.exitCode, sanitizeDiagnostic(error.stderr), sanitizedDetails(error.details));
+		return new GjcCliError(
+			`gjc sdk request failed: ${code}`,
+			error.exitCode,
+			sanitizeDiagnostic(error.stderr),
+			sanitizedDetails(error.details),
+		);
 	}
 	return new Error(sanitizeDiagnostic(error instanceof Error ? error.message : String(error)) || "sdk_error");
 }

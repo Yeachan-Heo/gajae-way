@@ -198,7 +198,8 @@ function parseChannels(value: unknown): Readonly<Record<string, ChannelPolicy>> 
 				`channels.${conversationId}.debounceMs was renamed to channels.${conversationId}.settleWindowMs; update the configuration`,
 			);
 		}
-		if (item.settleWindowMs !== undefined) parseSettleWindow(item.settleWindowMs, `channels.${conversationId}.settleWindowMs`);
+		if (item.settleWindowMs !== undefined)
+			parseSettleWindow(item.settleWindowMs, `channels.${conversationId}.settleWindowMs`);
 		if (Object.keys(item).some((key) => !["engagement", "settleWindowMs"].includes(key)))
 			throw new ConfigError("config_invalid", `channels.${conversationId} contains an unknown field`);
 		channels[conversationId] = {
@@ -227,7 +228,6 @@ function parseStallTimeout(value: unknown): number {
 		throw new ConfigError("config_invalid", "stallTimeoutMs must be an integer between 1000 and 3600000");
 	return value as number;
 }
-
 
 function parseOwnerTarget(value: unknown): { readonly origin: OriginRef } {
 	const input = requireObject(value, "ownerTarget");
@@ -267,7 +267,6 @@ function parseWebhook(value: unknown): {
 		...(input.exposeNonLoopback ? { exposeNonLoopback: true } : {}),
 	};
 }
-
 
 /**
  * Bounded 1..20. 1 rolls on the first context-class failure, which is
@@ -323,7 +322,9 @@ export function parseConfigFile(value: unknown): GatewayConfigFile {
 		...(input.mentionAllowlist === undefined
 			? {}
 			: { mentionAllowlist: parseStringArray(input.mentionAllowlist, "mentionAllowlist") }),
-		...(input.settleWindowMs === undefined ? {} : { settleWindowMs: parseSettleWindow(input.settleWindowMs, "settleWindowMs") }),
+		...(input.settleWindowMs === undefined
+			? {}
+			: { settleWindowMs: parseSettleWindow(input.settleWindowMs, "settleWindowMs") }),
 		...(input.stallTimeoutMs === undefined ? {} : { stallTimeoutMs: parseStallTimeout(input.stallTimeoutMs) }),
 		...(input.maxInboundAgeMs === undefined ? {} : { maxInboundAgeMs: parseMaxInboundAge(input.maxInboundAgeMs) }),
 		...(model ? { model } : {}),
@@ -437,7 +438,14 @@ export async function reloadConfig(current: GatewayConfig, overrides: ConfigOver
  * engagement/policy.ts), channels and `settleWindowMs` (fixed-window admission),
  * and `stallTimeoutMs` (tail liveness alarms). Each applies to the next actor event.
  */
-export const RELOADABLE_FIELDS = ["mentionAllowlist", "channels", "settleWindowMs", "stallTimeoutMs", "maxInboundAgeMs", "dmPolicy"] as const;
+export const RELOADABLE_FIELDS = [
+	"mentionAllowlist",
+	"channels",
+	"settleWindowMs",
+	"stallTimeoutMs",
+	"maxInboundAgeMs",
+	"dmPolicy",
+] as const;
 
 /** Fields bound to live startup resources and therefore changeable only by restart. */
 export const RESTART_REQUIRED_FIELDS = [

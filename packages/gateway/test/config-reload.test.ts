@@ -105,9 +105,15 @@ test("settleWindowMs and stallTimeoutMs have operational defaults and obsolete d
 
 test("settle and stall fields reload atomically as live actor policy", async () => {
 	const path = await home();
-	await Bun.write(join(path, "config.json"), JSON.stringify({ schemaVersion: 1, settleWindowMs: 2_000, stallTimeoutMs: 120_000 }));
+	await Bun.write(
+		join(path, "config.json"),
+		JSON.stringify({ schemaVersion: 1, settleWindowMs: 2_000, stallTimeoutMs: 120_000 }),
+	);
 	const current = await loadConfig({ home: path });
-	await Bun.write(join(path, "config.json"), JSON.stringify({ schemaVersion: 1, settleWindowMs: 500, stallTimeoutMs: 240_000 }));
+	await Bun.write(
+		join(path, "config.json"),
+		JSON.stringify({ schemaVersion: 1, settleWindowMs: 500, stallTimeoutMs: 240_000 }),
+	);
 	const result = await reloadConfig(current);
 	expect(result.ok).toBe(true);
 	if (!result.ok) return;

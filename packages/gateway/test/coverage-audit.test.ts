@@ -2,8 +2,8 @@ import { expect, test } from "bun:test";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import type { InboundBatch } from "../src/store/db";
 import { PersonaSessionManager } from "../src/orchestrator/persona-session";
+import type { InboundBatch } from "../src/store/db";
 import { GatewayDatabase } from "../src/store/db";
 import { ScriptedSessionPort } from "./session-port.fake";
 
@@ -26,14 +26,16 @@ type Fixture = {
 	close(): Promise<void>;
 };
 
-async function fixture(options: {
-	readonly port?: ScriptedSessionPort;
-	readonly settleWindowMs?: number;
-	readonly now?: () => number;
-	readonly setTimeout?: (work: () => void, delayMs: number) => unknown;
-	readonly clearTimeout?: (timer: unknown) => void;
-	readonly brokerGeneration?: () => number;
-} = {}): Promise<Fixture> {
+async function fixture(
+	options: {
+		readonly port?: ScriptedSessionPort;
+		readonly settleWindowMs?: number;
+		readonly now?: () => number;
+		readonly setTimeout?: (work: () => void, delayMs: number) => unknown;
+		readonly clearTimeout?: (timer: unknown) => void;
+		readonly brokerGeneration?: () => number;
+	} = {},
+): Promise<Fixture> {
 	const home = await mkdtemp(join(tmpdir(), "gajaeway-coverage-audit-"));
 	const database = await GatewayDatabase.open(join(home, "gateway.db"));
 	const batches = new Map<string, InboundBatch>();
@@ -65,7 +67,12 @@ async function fixture(options: {
 	};
 }
 
-function enqueue(database: GatewayDatabase, messageId: string, body: string, receivedAt = new Date().toISOString()): void {
+function enqueue(
+	database: GatewayDatabase,
+	messageId: string,
+	body: string,
+	receivedAt = new Date().toISOString(),
+): void {
 	expect(
 		database.inboundEnqueue({
 			messageId,
@@ -167,7 +174,10 @@ test("coverage audit preserves attribution when a broker generation changes mid-
 		await fixtureState.manager.notifyInbound(ORIGIN_KEY);
 		await eventually(() => fixtureState.port.steers.length === 1, "post-restart message was not steered");
 		expect(fixtureState.port.sends).toHaveLength(1);
-		expect(fixtureState.port.steers[0]).toMatchObject({ sessionId: running.sessionId, text: "arrived after broker replacement" });
+		expect(fixtureState.port.steers[0]).toMatchObject({
+			sessionId: running.sessionId,
+			text: "arrived after broker replacement",
+		});
 
 		fixtureState.port.complete(running.opRef, "restarted done");
 		await eventually(

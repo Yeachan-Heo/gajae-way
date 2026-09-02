@@ -71,7 +71,11 @@ test("chat.progress is silent until a tail observation supplies its counters", a
 		const send = port.sends[0]!;
 		port.emitActivity(send.sessionId, { toolCalls: 2, outputTokens: 42 });
 		await eventually(
-			() => frames.some((frame) => frame.event === "chat.progress" && frame.payload.toolCalls === 2 && frame.payload.outputTokens === 42),
+			() =>
+				frames.some(
+					(frame) =>
+						frame.event === "chat.progress" && frame.payload.toolCalls === 2 && frame.payload.outputTokens === 42,
+				),
 			"tail activity did not feed chat.progress",
 		);
 		port.complete(send.opRef, "done");

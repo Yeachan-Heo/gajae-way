@@ -563,7 +563,7 @@ export class GatewayDatabase {
 		return (
 			this.#database
 				.query<InboundMessageRow, [string]>(
-				"SELECT message_id, origin_key, origin_ref_json, body, engagement_json, state, received_at, batch_key, batch_role, batch_epoch, batch_state, attributed_op_ref, accepted_at, bound_session_id FROM inbound_messages WHERE origin_key = ? AND state = 'pending' AND batch_state IS NULL ORDER BY received_at, message_id LIMIT 1",
+					"SELECT message_id, origin_key, origin_ref_json, body, engagement_json, state, received_at, batch_key, batch_role, batch_epoch, batch_state, attributed_op_ref, accepted_at, bound_session_id FROM inbound_messages WHERE origin_key = ? AND state = 'pending' AND batch_state IS NULL ORDER BY received_at, message_id LIMIT 1",
 				)
 				.get(originKey) ?? undefined
 		);
@@ -604,7 +604,8 @@ export class GatewayDatabase {
 		batchKey: string;
 		opRef: string;
 	}): readonly InboundMessageRow[] {
-		if (!Number.isSafeInteger(input.epoch) || input.epoch < 0) throw new Error("batch epoch must be a non-negative integer");
+		if (!Number.isSafeInteger(input.epoch) || input.epoch < 0)
+			throw new Error("batch epoch must be a non-negative integer");
 		return this.withTransaction(() => {
 			const existing = this.#database
 				.query<{ n: number }, [string, number]>(
@@ -740,16 +741,16 @@ export class GatewayDatabase {
 			epoch === undefined
 				? this.#database
 						.query<
-						{
-							batch_key: string;
-							origin_key: string;
-							batch_epoch: number;
-							batch_state: Extract<InboundBatchState, "settled" | "accepted">;
-							attributed_op_ref: string;
-							accepted_at: string | null;
-							bound_session_id: string | null;
-							message_id: string;
-						},
+							{
+								batch_key: string;
+								origin_key: string;
+								batch_epoch: number;
+								batch_state: Extract<InboundBatchState, "settled" | "accepted">;
+								attributed_op_ref: string;
+								accepted_at: string | null;
+								bound_session_id: string | null;
+								message_id: string;
+							},
 							[string]
 						>(
 							"SELECT batch_key, origin_key, batch_epoch, batch_state, attributed_op_ref, accepted_at, bound_session_id, message_id FROM inbound_messages WHERE origin_key = ? AND batch_role = 'trigger' AND batch_state IN ('settled', 'accepted') ORDER BY batch_epoch, received_at, message_id",
@@ -757,16 +758,16 @@ export class GatewayDatabase {
 						.all(originKey)
 				: this.#database
 						.query<
-						{
-							batch_key: string;
-							origin_key: string;
-							batch_epoch: number;
-							batch_state: Extract<InboundBatchState, "settled" | "accepted">;
-							attributed_op_ref: string;
-							accepted_at: string | null;
-							bound_session_id: string | null;
-							message_id: string;
-						},
+							{
+								batch_key: string;
+								origin_key: string;
+								batch_epoch: number;
+								batch_state: Extract<InboundBatchState, "settled" | "accepted">;
+								attributed_op_ref: string;
+								accepted_at: string | null;
+								bound_session_id: string | null;
+								message_id: string;
+							},
 							[string, number]
 						>(
 							"SELECT batch_key, origin_key, batch_epoch, batch_state, attributed_op_ref, accepted_at, bound_session_id, message_id FROM inbound_messages WHERE origin_key = ? AND batch_epoch = ? AND batch_role = 'trigger' AND batch_state IN ('settled', 'accepted') ORDER BY received_at, message_id",
@@ -788,7 +789,9 @@ export class GatewayDatabase {
 	/** Origins with unbatched pending rows: after a restart these have no batch and no timer, so recovery must arm them. */
 	inboundPendingOrigins(): readonly string[] {
 		return this.#database
-			.query<{ origin_key: string }, []>("SELECT DISTINCT origin_key FROM inbound_messages WHERE state = 'pending' AND batch_state IS NULL")
+			.query<{ origin_key: string }, []>(
+				"SELECT DISTINCT origin_key FROM inbound_messages WHERE state = 'pending' AND batch_state IS NULL",
+			)
 			.all()
 			.map((row) => row.origin_key);
 	}
@@ -804,8 +807,11 @@ export class GatewayDatabase {
 
 	inboundNonterminalBatchCount(): number {
 		return (
-			this.#database.query<{ n: number }, []>("SELECT COUNT(*) AS n FROM inbound_messages WHERE batch_role = 'trigger' AND batch_state IN ('settled', 'accepted')").get()
-				?.n ?? 0
+			this.#database
+				.query<{ n: number }, []>(
+					"SELECT COUNT(*) AS n FROM inbound_messages WHERE batch_role = 'trigger' AND batch_state IN ('settled', 'accepted')",
+				)
+				.get()?.n ?? 0
 		);
 	}
 
@@ -1258,7 +1264,9 @@ export class GatewayDatabase {
 
 	/** Opaque runtime-issued tail checkpoint for a bound SDK session. */
 	tailCursorGet(sessionId: string): string | undefined {
-		return this.#database.query<{ cursor: string }, [string]>("SELECT cursor FROM session_tail_cursors WHERE session_id = ?").get(sessionId)?.cursor;
+		return this.#database
+			.query<{ cursor: string }, [string]>("SELECT cursor FROM session_tail_cursors WHERE session_id = ?")
+			.get(sessionId)?.cursor;
 	}
 
 	/** Commits a cursor only after the caller has applied all preceding tail effects. */

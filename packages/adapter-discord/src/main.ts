@@ -89,7 +89,9 @@ const WORKING_STATUS_STALE_MS = 90_000;
  * (MONITOR_STRIKES consecutive) reconnects. A closed socket is still detected
  * immediately through the client's own close path.
  */
-export function monitorFailureDecision(strikes: number): { action: "retry"; strikes: number } | { action: "reconnect" } {
+export function monitorFailureDecision(
+	strikes: number,
+): { action: "retry"; strikes: number } | { action: "reconnect" } {
 	return strikes + 1 >= MONITOR_STRIKES ? { action: "reconnect" } : { action: "retry", strikes: strikes + 1 };
 }
 const DISCORD_MESSAGE_LIMIT = 2_000;
@@ -1336,17 +1338,20 @@ export class ReconnectingGateway {
 	}
 
 	private monitor(client: GajaewayClient, strikes = 0): void {
-		setTimeout(() => {
-			if (this.#client !== client) return;
-			void client.request("gateway.status").then(
-				() => this.monitor(client, 0),
-				() => {
-					const next = monitorFailureDecision(strikes);
-					if (next.action === "reconnect") this.scheduleReconnect();
-					else this.monitor(client, next.strikes);
-				},
-			);
-		}, strikes === 0 ? MONITOR_INTERVAL_MS : MONITOR_RETRY_MS);
+		setTimeout(
+			() => {
+				if (this.#client !== client) return;
+				void client.request("gateway.status").then(
+					() => this.monitor(client, 0),
+					() => {
+						const next = monitorFailureDecision(strikes);
+						if (next.action === "reconnect") this.scheduleReconnect();
+						else this.monitor(client, next.strikes);
+					},
+				);
+			},
+			strikes === 0 ? MONITOR_INTERVAL_MS : MONITOR_RETRY_MS,
+		);
 	}
 
 	private scheduleReconnect(): void {

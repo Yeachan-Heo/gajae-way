@@ -36,7 +36,9 @@ test("a condemned bind cannot grow epochs past the durable rebind cap", async ()
 	const logs: string[] = [];
 	const client = new GjcClient(db, home, {
 		spawn: (() =>
-			failedChild(JSON.stringify({ ok: false, error: { code: "resource_gone", message: "session is gone" } }) + "\n")) as unknown as typeof Bun.spawn,
+			failedChild(
+				JSON.stringify({ ok: false, error: { code: "resource_gone", message: "session is gone" } }) + "\n",
+			)) as unknown as typeof Bun.spawn,
 		log: (line) => logs.push(line),
 	});
 
@@ -56,12 +58,15 @@ test("an explicit rebind-budget clear is the only way to retry a capped bind", a
 	const client = new GjcClient(db, home, {
 		spawn: (() => {
 			attempts++;
-			return failedChild(JSON.stringify({ ok: false, error: { code: "resource_gone", message: "session is gone" } }) + "\n");
+			return failedChild(
+				JSON.stringify({ ok: false, error: { code: "resource_gone", message: "session is gone" } }) + "\n",
+			);
 		}) as unknown as typeof Bun.spawn,
 		log: () => {},
 	});
 
-	for (let attempt = 0; attempt < DEFAULT_REBIND_CAP; attempt++) await client.ensureSession("discord/dm/reset").catch(() => {});
+	for (let attempt = 0; attempt < DEFAULT_REBIND_CAP; attempt++)
+		await client.ensureSession("discord/dm/reset").catch(() => {});
 	const held = await client.ensureSession("discord/dm/reset").catch((error: unknown) => error);
 	expect(formatFailureNotice(held)).toContain("/new");
 	client.forgetRebinds("discord/dm/reset");
@@ -74,7 +79,9 @@ test("durable rebind accounting survives a new bind client after a restart", asy
 	let attempts = 0;
 	const spawn = (() => {
 		attempts++;
-		return failedChild(JSON.stringify({ ok: false, error: { code: "resource_gone", message: "session is gone" } }) + "\n");
+		return failedChild(
+			JSON.stringify({ ok: false, error: { code: "resource_gone", message: "session is gone" } }) + "\n",
+		);
 	}) as unknown as typeof Bun.spawn;
 	const first = new GjcClient(db, home, { spawn, log: () => {} });
 	await first.ensureSession("discord/dm/durable").catch(() => {});
@@ -96,17 +103,22 @@ test("concurrent non-rebindable bind failures share one request and later retry 
 		spawn: (() => {
 			calls++;
 			return failing
-				? failedChild(JSON.stringify({ ok: false, error: { code: "invalid_params", message: "bad caller input" } }) + "\n")
+				? failedChild(
+						JSON.stringify({ ok: false, error: { code: "invalid_params", message: "bad caller input" } }) + "\n",
+					)
 				: ({
-					stdout: new Response(JSON.stringify({ ok: true, result: { sessionId: "recovered" } }) + "\n").body,
-					stderr: new Response("").body,
-					exited: Promise.resolve(0),
-					kill: () => {},
-				} as unknown as ReturnType<typeof Bun.spawn>);
+						stdout: new Response(JSON.stringify({ ok: true, result: { sessionId: "recovered" } }) + "\n").body,
+						stderr: new Response("").body,
+						exited: Promise.resolve(0),
+						kill: () => {},
+					} as unknown as ReturnType<typeof Bun.spawn>);
 		}) as unknown as typeof Bun.spawn,
 		log: () => {},
 	});
-	const results = await Promise.allSettled([client.ensureSession("discord/dm/shared-failure"), client.ensureSession("discord/dm/shared-failure")]);
+	const results = await Promise.allSettled([
+		client.ensureSession("discord/dm/shared-failure"),
+		client.ensureSession("discord/dm/shared-failure"),
+	]);
 	expect(results.every((result) => result.status === "rejected")).toBe(true);
 	expect(calls).toBe(1);
 	failing = false;
@@ -120,7 +132,10 @@ test("a rebindable-looking message with a non-rebindable code cannot advance the
 	const client = new GjcClient(db, home, {
 		spawn: (() => {
 			calls++;
-			return failedChild(JSON.stringify({ ok: false, error: { code: "invalid_params", message: "session endpoint record is gone" } }) + "\n");
+			return failedChild(
+				JSON.stringify({ ok: false, error: { code: "invalid_params", message: "session endpoint record is gone" } }) +
+					"\n",
+			);
 		}) as unknown as typeof Bun.spawn,
 		log: () => {},
 	});
@@ -133,7 +148,10 @@ test("runtime failure text is redacted before a bind failure reaches callers", a
 	const db = await openDatabase();
 	const secret = "sk-live-never-log-this";
 	const client = new GjcClient(db, home, {
-		spawn: (() => failedChild(JSON.stringify({ ok: false, error: { code: "resource_gone", message: `provider denied ${secret}` } }) + "\n")) as unknown as typeof Bun.spawn,
+		spawn: (() =>
+			failedChild(
+				JSON.stringify({ ok: false, error: { code: "resource_gone", message: `provider denied ${secret}` } }) + "\n",
+			)) as unknown as typeof Bun.spawn,
 		log: () => {},
 	});
 

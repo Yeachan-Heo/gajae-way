@@ -70,7 +70,11 @@ export function testOnlyBrokerDependencies(): BrokerSupervisorDependencies {
 			const operation = [...operations.values()].reverse().find((entry) => entry.sessionId === sessionId);
 			return {
 				exitCode: 0,
-				stdout: JSON.stringify({ type: "query_response", ok: true, page: { items: [operation ? stubReply(operation.text) : ""], complete: true } }),
+				stdout: JSON.stringify({
+					type: "query_response",
+					ok: true,
+					page: { items: [operation ? stubReply(operation.text) : ""], complete: true },
+				}),
 				stderr: "",
 			};
 		}

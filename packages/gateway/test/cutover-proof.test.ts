@@ -35,7 +35,9 @@ test("hard cutover leaves no resume argv, KeyedQueue subject, or turn-abort path
 test("configuration has no turn-path coexistence switch and rejects the removed timeout", async () => {
 	const config = await readFile(join(SOURCE_ROOT, "config.ts"), "utf8");
 
-	expect(config).not.toMatch(/\b(?:legacyTurn|persistentTurn|turnPath|turnMode|turnTransport|useLegacyTurn|usePersistentTurn|turnPathFeatureFlag)\b/i);
+	expect(config).not.toMatch(
+		/\b(?:legacyTurn|persistentTurn|turnPath|turnMode|turnTransport|useLegacyTurn|usePersistentTurn|turnPathFeatureFlag)\b/i,
+	);
 	for (const field of ["legacyTurn", "persistentTurn", "turnPath", "turnMode", "turnTransport"]) {
 		const parsed = parseConfigFile({ schemaVersion: 1, [field]: true });
 		expect(parsed).not.toHaveProperty(field);

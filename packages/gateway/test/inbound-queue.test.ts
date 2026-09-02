@@ -118,9 +118,7 @@ test("discarding at /new touches only unbatched pending rows and terminal comple
 	);
 	expect(db.inboundBatchComplete(settled[0]!.batch_key!)).toBe(2);
 	expect(db.inboundBatchRows(settled[0]!.batch_key!)).toEqual(
-		expect.arrayContaining([
-			expect.objectContaining({ state: "done", batch_state: "done" }),
-		]),
+		expect.arrayContaining([expect.objectContaining({ state: "done", batch_state: "done" })]),
 	);
 });
 
