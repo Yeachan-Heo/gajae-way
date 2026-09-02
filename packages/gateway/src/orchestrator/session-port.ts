@@ -32,6 +32,7 @@ import { type TailAttachInput, type TailHandle, TailRunner } from "./tail-runner
 export interface SessionPort {
 	bind(input: SessionBindInput): Promise<SessionBinding>;
 	inspect(input: { sessionId: string; repo: string }): Promise<BrokerSession | undefined>;
+	liveness?(input: { sessionId: string; repo: string }): Promise<{ readonly live: boolean | undefined; readonly disowned: boolean }>;
 	/** Restores a saved, non-deleted session through `session.resume`; it never creates a replacement. */
 	resume(input: { sessionId: string; repo: string; originKey: string; epoch: number }): Promise<SessionBinding>;
 	send(input: SessionSendInput): Promise<SendReceipt>;
@@ -288,6 +289,23 @@ export class BrokerSessionPort implements SessionPort {
 			}
 		}
 		throw sanitizeSdkFailure(lastFailure ?? new Error("session.create did not produce a result"));
+	}
+
+	/**
+	 * Raw liveness judged on the broker envelope: gjc >= 0.16.0 omits
+	 * `locator.repo`, which makes the subsession normalizer return undefined for a
+	 * perfectly well-known session. `disowned` = the broker rejects the id.
+	 */
+	async liveness(input: { sessionId: string; repo: string }): Promise<{ readonly live: boolean | undefined; readonly disowned: boolean }> {
+		try {
+			const result = await this.#cli(["sdk", "session", "inspect", input.sessionId, "--repo", input.repo], { timeoutMs: 10_000 });
+			const envelope = JSON.parse(result.stdout) as { ok?: unknown; result?: { session?: { live?: unknown } }; error?: { code?: unknown } };
+			if (envelope.ok === false) return { live: undefined, disowned: envelope.error?.code === "session_unavailable" };
+			const live = envelope.result?.session?.live;
+			return { live: typeof live === "boolean" ? live : undefined, disowned: false };
+		} catch (error) {
+			return { live: undefined, disowned: sdkErrorCode(error) === "session_unavailable" };
+		}
 	}
 
 	async inspect(input: { sessionId: string; repo: string }): Promise<BrokerSession | undefined> {
