@@ -385,3 +385,26 @@ test("event-driven: after one backfill poll, host stream frames are delivered as
 		await tail.close();
 	}
 });
+
+test("a backfill after a stream reopen never re-delivers an already delivered answer (diff-only contract)", async () => {
+	const delivered: string[] = [];
+	let polls = 0;
+	const run: CliRunner = async () => {
+		polls++;
+		// Every cursorless backfill replays the same finalized answer from the ring.
+		return { exitCode: 0, stdout: JSON.stringify({ ok: true, result: { items: [{ kind: "transcript", id: "row-7", payload: { role: "assistant", content: [{ text: "ANSWER" }] } }], terminal: polls > 1 } }), stderr: "" };
+	};
+	let ended = false;
+	const runner = new TailRunner({
+		run, repo: "/tmp/gajaeway-tail-dup", pollIntervalMs: 1, sleep: (ms) => Bun.sleep(ms),
+		stream: () => ({ lines: (async function* () { while (!ended) { await Bun.sleep(5); } })(), close: () => { ended = true; } }),
+	});
+	const tail = await runner.attach({ sessionId: "dup-1", brokerGeneration: 1, repo: "/tmp/gajaeway-tail-dup", onFrame: async (f) => { if (f.assistantText) delivered.push(f.assistantText); } });
+	try {
+		await tail.markAccepted("turn-dup");
+		await eventually(() => delivered.length === 1, "first delivery missing");
+		ended = true; // stream drops -> reopen -> backfill replays row-7
+		await Bun.sleep(80);
+		expect(delivered).toEqual(["ANSWER"]);
+	} finally { await tail.close(); }
+});
