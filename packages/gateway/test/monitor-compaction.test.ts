@@ -63,6 +63,7 @@ async function harness(
 	directory: string,
 	options: {
 		contextFailureRollThreshold?: number;
+		protocolFailureRollThreshold?: number;
 		compaction?: CompactionPort;
 		/** Per-turn response. Defaults to a valid note per claimed event. */
 		respond?: (prompt: string, index: number) => string;
@@ -92,6 +93,9 @@ async function harness(
 		...(options.contextFailureRollThreshold === undefined
 			? {}
 			: { contextFailureRollThreshold: options.contextFailureRollThreshold }),
+		...(options.protocolFailureRollThreshold === undefined
+			? {}
+			: { protocolFailureRollThreshold: options.protocolFailureRollThreshold }),
 	});
 	return { database, registry, pipeline, turns };
 }
@@ -409,12 +413,20 @@ test("a native compaction that fails outright rolls with its own structured reas
 	}
 });
 
-test("a protocol-class failure never rolls, however many times it repeats", async () => {
+// Reversal of a former invariant ("a protocol-class failure never rolls"), on
+// measured evidence: on the jip-gajae host 2026-09-02 an off-contract monitor
+// session failed 19/19 ticks in one day while a sibling monitor on the same
+// gateway delivered fine. Nothing remediated it and the answer text may not be
+// logged, so it was both unfixable and undiagnosable. A protocol failure still
+// NEVER feeds the context streak and never requests compaction — it now has its
+// own streak and its own coded reason instead.
+test("a protocol-class failure names the violated rule and rolls only after its own streak", async () => {
 	const directory = await mkdtemp(join(tmpdir(), "gajaeway-monitor-badjson-"));
 	try {
 		const compaction = stubPort("unavailable");
 		const { database, registry, pipeline, turns } = await harness(directory, {
 			contextFailureRollThreshold: 2,
+			protocolFailureRollThreshold: 3,
 			compaction,
 			respond: () => "sure! here are your notes:",
 		});
@@ -426,21 +438,34 @@ test("a protocol-class failure never rolls, however many times it repeats", asyn
 		});
 		const sessionKey = originKey(eventTypeOrigin("bad.tick"));
 		const eventIds: string[] = [];
-		for (let tick = 0; tick < 5; tick += 1)
+		for (let tick = 0; tick < 2; tick += 1)
 			eventIds.push(await pipeline.submitAwaitable(monitor.monitorId, "bad.tick", { tick }));
-		// The failure is recorded as a contract failure and nothing rolls.
+		// Below its own threshold nothing is touched: a single off-contract answer
+		// is not proof the session is broken.
+		expect(database.getSessionRecord(sessionKey)?.epoch).toBe(0);
+		let state = pipeline.sessionSafetyState(sessionKey);
+		expect(state.protocolFailures).toBe(2);
+		expect(state.pendingRoll).toBeUndefined();
+		// The coded sub-kind is the whole diagnosis, because the offending answer
+		// text is never logged.
+		expect(state.lastProtocolReason).toBe("protocol_unparseable_json");
+		eventIds.push(await pipeline.submitAwaitable(monitor.monitorId, "bad.tick", { tick: 2 }));
+		// Every attempt is still reported as a contract failure, and context-class
+		// machinery is never engaged.
 		for (const eventId of eventIds) {
 			expect(database.monitorFailure(eventId)?.code).toBe("authoring_response_invalid");
 		}
 		expect(compaction.calls).toHaveLength(0);
-		expect(database.getSessionRecord(sessionKey)?.epoch).toBe(0);
 		expect(turns.some((turn) => turn.prompt.includes("Context compaction"))).toBe(false);
-		const state = pipeline.sessionSafetyState(sessionKey);
+		state = pipeline.sessionSafetyState(sessionKey);
 		expect(state.contextFailures).toBe(0);
-		expect(state.protocolFailures).toBe(5);
 		expect(state.executorFailures).toBe(0);
 		expect(state.staleContextFailures).toBe(0);
-		expect(state.pendingRoll).toBeUndefined();
+		expect(state.pendingRoll).toBe("protocol_failures_off_contract");
+		// The roll itself lands at the next dispatch boundary, never mid-batch.
+		await pipeline.submitAwaitable(monitor.monitorId, "bad.tick", { tick: 3 });
+		expect(database.getSessionRecord(sessionKey)?.epoch).toBe(1);
+		expect(pipeline.sessionSafetyState(sessionKey).lastRoll).toBe("protocol_failures_off_contract");
 		database.close();
 	} finally {
 		await rm(directory, { recursive: true, force: true });

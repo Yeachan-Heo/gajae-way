@@ -41,6 +41,15 @@ export const MONITOR_DIGEST_MAX_LENGTH = 2400;
 export const MONITOR_CONTEXT_FAILURE_ROLL_THRESHOLD = 2;
 
 /**
+ * Consecutive protocol-class failures before the safety net rolls the session.
+ * Higher than the context threshold on purpose: an off-contract answer can be a
+ * one-off, but a whole streak of them is a session that no longer follows its
+ * own contract. Measured trigger: 19 identical failures in one day with no
+ * remediation at all (jip-gajae `sns-threads`, 2026-09-02).
+ */
+export const MONITOR_PROTOCOL_FAILURE_ROLL_THRESHOLD = 3;
+
+/**
  * Outcome of asking the runtime to compact a session natively.
  *
  * `unavailable` is the honest default: the gateway currently has no wired path
@@ -207,6 +216,50 @@ export function classifyExecutorFailure(error: unknown): ExecutorFailureReason {
 }
 
 /**
+ * Protocol sub-kinds, reported as structured operator-facing reasons.
+ *
+ * Measured gap (jip-gajae host, 2026-09-02): `sns-threads` failed 19/19 ticks in
+ * one day with `authoring_response_invalid` while `sns-x` was delivering from
+ * the same gateway. The class alone did not say WHICH contract rule the answer
+ * broke, and the answer text may not be logged (it can carry secrets), so the
+ * failure was undiagnosable from the outside and nothing ever remediated it.
+ *
+ * These reasons are derived from the classifier's own markers, so they name the
+ * violated rule without ever emitting the offending text.
+ */
+export type ProtocolFailureReason =
+	| "protocol_response_not_array"
+	| "protocol_entry_missing_field"
+	| "protocol_unknown_event"
+	| "protocol_duplicate_event"
+	| "protocol_omitted_event"
+	| "protocol_unparseable_json"
+	| "protocol_off_contract";
+
+/** Marker -> reason, in check order. First match wins. */
+const PROTOCOL_REASON_MARKERS: ReadonlyArray<readonly [string, ProtocolFailureReason]> = [
+	["authoring response is not an array", "protocol_response_not_array"],
+	["authoring response entry missing", "protocol_entry_missing_field"],
+	["authoring response contains unknown event", "protocol_unknown_event"],
+	["authoring response duplicates event", "protocol_duplicate_event"],
+	["authoring response omits event", "protocol_omitted_event"],
+	["unexpected token", "protocol_unparseable_json"],
+	["unexpected end of", "protocol_unparseable_json"],
+	["json", "protocol_unparseable_json"],
+];
+
+/**
+ * Names the protocol sub-kind. Pure and message-based, exactly like
+ * `classifyExecutorFailure`: the message is inspected here and discarded, only
+ * the coded reason escapes.
+ */
+export function classifyProtocolFailure(error: unknown): ProtocolFailureReason {
+	const message = (error instanceof Error ? error.message : String(error)).toLowerCase();
+	for (const [marker, reason] of PROTOCOL_REASON_MARKERS) if (message.includes(marker)) return reason;
+	return "protocol_off_contract";
+}
+
+/**
  * Classifies an authoring failure. Pure, message-based: the raw message is
  * inspected here and then discarded — only the class escapes, never the text.
  *
@@ -236,7 +289,8 @@ export function classifyAuthoringFailure(error: unknown): AuthoringFailureClass 
 export type SessionRollReason =
 	| "context_failures_native_compaction_unavailable"
 	| "context_failures_native_compaction_failed"
-	| "context_failures_native_compaction_skipped";
+	| "context_failures_native_compaction_skipped"
+	| "protocol_failures_off_contract";
 
 const ROLL_REASON_BY_STATUS: Partial<Record<NativeCompactionStatus, SessionRollReason>> = {
 	unavailable: "context_failures_native_compaction_unavailable",

@@ -19,14 +19,17 @@ import {
 	type CompactionPort,
 	classifyAuthoringFailure,
 	classifyExecutorFailure,
+	classifyProtocolFailure,
 	decideSessionRoll,
 	type ExecutorFailureReason,
 	isAsideTimeoutFailure,
 	isOrphanedExecutorFailure,
 	MONITOR_CONTEXT_FAILURE_ROLL_THRESHOLD,
 	MONITOR_DIGEST_MAX_NOTES,
+	MONITOR_PROTOCOL_FAILURE_ROLL_THRESHOLD,
 	type MonitorDigestNote,
 	type NativeCompactionStatus,
+	type ProtocolFailureReason,
 	type SessionRollReason,
 	unavailableCompactionPort,
 } from "./compaction";
@@ -109,6 +112,14 @@ export interface MonitorSessionSafetyState {
 	lastExecutorReason: ExecutorFailureReason | undefined;
 	/** Protocol-class failures in this epoch — malformed or off-contract answers (diagnostic). */
 	protocolFailures: number;
+	/**
+	 * Coded reason of the last protocol-class failure. The offending answer text
+	 * is never logged (it can carry secrets), so this coded rule name is the only
+	 * diagnosis an operator gets — without it, an off-contract session is
+	 * indistinguishable from any other invalid answer (measured: jip-gajae
+	 * `sns-threads`, 19 identical failures in one day).
+	 */
+	lastProtocolReason: ProtocolFailureReason | undefined;
 	/** Result of the last native-compaction attempt, or undefined if never attempted. */
 	nativeCompaction: NativeCompactionStatus | undefined;
 	/** Armed roll: consumed at the next dispatch boundary. */
@@ -148,6 +159,8 @@ export class MonitorPropagator {
 	readonly #compaction: CompactionPort;
 	/** Consecutive context-class authoring failures required before a roll. */
 	readonly #contextFailureRollThreshold: number;
+	/** Consecutive protocol-class (off-contract) failures required before a roll. */
+	readonly #protocolFailureRollThreshold: number;
 	constructor(options: {
 		database: GatewayDatabase;
 		registry: MonitorRegistry;
@@ -178,6 +191,12 @@ export class MonitorPropagator {
 		 * MONITOR_CONTEXT_FAILURE_ROLL_THRESHOLD.
 		 */
 		contextFailureRollThreshold?: number;
+		/**
+		 * Consecutive protocol-class failures required before the safety net rolls
+		 * a session that keeps answering off contract. Defaults to
+		 * MONITOR_PROTOCOL_FAILURE_ROLL_THRESHOLD.
+		 */
+		protocolFailureRollThreshold?: number;
 	}) {
 		this.#database = options.database;
 		this.#registry = options.registry;
@@ -197,6 +216,8 @@ export class MonitorPropagator {
 			((eventId, lease, batch, at) => this.#database.monitorEventFencedUpdate(eventId, lease, "batched", batch, at));
 		this.#compaction = options.compaction ?? unavailableCompactionPort;
 		this.#contextFailureRollThreshold = options.contextFailureRollThreshold ?? MONITOR_CONTEXT_FAILURE_ROLL_THRESHOLD;
+		this.#protocolFailureRollThreshold =
+			options.protocolFailureRollThreshold ?? MONITOR_PROTOCOL_FAILURE_ROLL_THRESHOLD;
 	}
 	/** Cancels pending burst timers so a closed database is never touched after shutdown. */
 	dispose(): void {
@@ -670,6 +691,7 @@ export class MonitorPropagator {
 			lastExecutorReason: undefined,
 			executorFailures: 0,
 			protocolFailures: 0,
+			lastProtocolReason: undefined,
 			nativeCompaction: undefined,
 			pendingRoll: undefined,
 			lastRoll: undefined,
@@ -727,6 +749,29 @@ export class MonitorPropagator {
 		}
 		if (failureClass === "protocol") {
 			state.protocolFailures += 1;
+			const protocolReason = classifyProtocolFailure(error);
+			state.lastProtocolReason = protocolReason;
+			// The answer itself may never be logged, so name the violated rule and
+			// the streak instead: that is the whole diagnosis an operator gets.
+			console.error(
+				`monitor answer off contract for ${sessionOriginKey} (monitor ${monitor.monitorId}): reason=${protocolReason} protocol_failures=${state.protocolFailures}/${this.#protocolFailureRollThreshold} context_failures=${state.contextFailures} (unchanged)`,
+			);
+			// A protocol failure says nothing about context size, so it never feeds
+			// the context streak and never requests compaction. It does get its own
+			// remedy: an epoch's worth of identical off-contract answers is a session
+			// that cannot follow its own contract any more, and before this the
+			// gateway retried it forever with no remediation at all (measured:
+			// jip-gajae `sns-threads`, 19/19 ticks in one day).
+			const staleBinding =
+				replayed ||
+				boundEpoch === undefined ||
+				boundEpoch !== (this.#database.getSessionRecord(sessionOriginKey)?.epoch ?? 0);
+			if (!staleBinding && state.protocolFailures >= this.#protocolFailureRollThreshold) {
+				state.pendingRoll = "protocol_failures_off_contract";
+				console.error(
+					`monitor session safety net armed for ${sessionOriginKey} (monitor ${monitor.monitorId}): reason=protocol_failures_off_contract protocol_failures=${state.protocolFailures}/${this.#protocolFailureRollThreshold} last_reason=${protocolReason} turns=${state.turns}`,
+				);
+			}
 			return;
 		}
 		const liveEpoch = this.#database.getSessionRecord(sessionOriginKey)?.epoch ?? 0;
