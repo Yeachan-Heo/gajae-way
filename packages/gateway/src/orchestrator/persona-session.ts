@@ -488,7 +488,13 @@ class OriginActor {
 		// the next settle binds a live session. A reachable runtime, even with an
 		// unknown status, keeps the hold: it may have accepted the send.
 		const disownedByBroker = status.unreachable === true && (status.unreachableCode === "session_unavailable" || (first.failed && second.failed));
-		if (batch.state === "settled" && !retired && status.status.status === "unknown" && disownedByBroker) {
+		// An ACCEPTED op is only released when the broker disowns the id AND the
+		// session is provably not live (inspect answered live=false, or is gone):
+		// nothing can still be running there, so the fresh-turn re-fire is
+		// exactly-once-safe. A merely unreachable but possibly-live session holds.
+		const sessionDead = (first.session !== undefined && first.session.live === false) || (first.failed && second.failed);
+		const releasable = batch.state === "settled" || (batch.state === "accepted" && sessionDead);
+		if (releasable && !retired && status.status.status === "unknown" && disownedByBroker) {
 			const attempt = this.#manager.database.inboundBatchRequeueFreshTurn(batch.batchKey);
 			// The binding itself is unusable: recreate through the existing rebind
 			// primitive (epoch bump) so the next settle binds a fresh live session.
