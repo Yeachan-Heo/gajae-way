@@ -1077,6 +1077,27 @@ class OriginActor {
 			report = await this.#manager.port.status({ sessionId: bound.sessionId, repo: this.#manager.repo, opRef: bound.batch.opRef });
 		} catch (error) {
 			bound.nonSteerable = true;
+			// The broker disowning the id (session_unavailable) with the session
+			// provably not live means nothing is running there: release the batch
+			// and rebind instead of holding an adopted turn forever.
+			if (sdkStatusErrorCode(error) === "session_unavailable" && !bound.retired) {
+				const raw = this.#manager.port.liveness ? await this.#manager.port.liveness({ sessionId: bound.sessionId, repo: this.#manager.repo }) : undefined;
+				if (raw?.live !== true) {
+					await bound.tail?.close();
+					const attempt = this.#manager.database.inboundBatchRequeueFreshTurn(bound.batch.batchKey);
+					this.#manager.expireStale(this.originKey);
+					const nextEpoch = this.#manager.database.rebindEpoch(this.originKey);
+					if (this.#current === bound) {
+						this.#current = undefined;
+						this.#state = "idle";
+					}
+					this.#manager.log(
+						`recovery_requeue_unaccepted origin=${this.originKey} epoch=${bound.epoch} nextEpoch=${nextEpoch} opRef=${bound.batch.opRef} session=${bound.sessionId} attempt=${attempt} reason=router_disowned`,
+					);
+					await this.#armSettle();
+					return;
+				}
+			}
 			this.#manager.log(`recovery_hold origin=${this.originKey} epoch=${bound.epoch} opRef=${bound.batch.opRef} reason=status_unavailable detail=${safeDiagnostic(error)}`);
 			return;
 		}
