@@ -1477,7 +1477,18 @@ async function createInboundTurnLifecycle(
 			: droppedNote
 				? `${droppedNote}\n`
 				: "";
-		turnText = `${header}${speaker ? `${composeTurnHeader({ speaker, place, authorId: engagement?.authorId, messageId: row.message_id, engagement })}\n` : ""}${userText}`;
+		// AC2: every coalesced batch member is part of THIS turn's text, whether or
+		// not the adapter recorded it in the unread-context ledger (a member without
+		// a platform messageId never reaches that ledger). Members already present
+		// in the ledger window are not repeated.
+		const inWindow = new Set(prepared.selectedMessageIds);
+		const members = input.rows
+			.filter((member) => member !== row && !inWindow.has(member.message_id))
+			.map((member) => `- [${member.received_at}] (msg:${member.message_id}): ${member.body.slice(0, 1000)}`);
+		const memberBlock = members.length ? `[Earlier messages in this same turn]\n${members.join("\n")}\n\n` : "";
+		turnText = `${header}${memberBlock}${speaker ? `${composeTurnHeader({ speaker, place, authorId: engagement?.authorId, messageId: row.message_id, engagement })}\n` : ""}${userText}`;
+	} else if (input.rows.length > 1) {
+		turnText = input.rows.map((member) => member.body).join("\n");
 	}
 
 	const bootstrapState = options.database.getSessionBootstrap(key);

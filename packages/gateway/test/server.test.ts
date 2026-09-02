@@ -440,6 +440,44 @@ test("shutdown quiesces an in-flight turn before final stopping frame", async ()
 	client.close();
 });
 
+test("a settled burst without platform message ids still carries every fragment in the one turn (AC2)", async () => {
+	directory = await mkdtemp(join(tmpdir(), "gajaeway-server-"));
+	const config: GatewayConfig = {
+		schemaVersion: 1,
+		home: directory,
+		configPath: join(directory, "config.json"),
+		socketPath: join(directory, "gateway.sock"),
+		dbPath: join(directory, "gateway.db"),
+		logVerbosity: "info",
+		dmPolicy: "open" as const,
+		settleWindowMs: 80,
+	};
+	const database = await GatewayDatabase.open(config.dbPath);
+	const turns: string[] = [];
+	const sessionPort = sessionPortFromResponder({
+		respond: async (_session, text) => {
+			turns.push(text);
+			return "ok";
+		},
+	});
+	server = await startUnixServer({ config, database, sessionPort, onStop: () => database.close() });
+	const client = await connect(config.socketPath);
+	client.send({ v: "0.1", type: "hello", payload: { supportedVersions: ["0.1"] } });
+	await waitFor(client.frames, 1);
+	const origin = { platform: "discord", kind: "dm", conversationId: "d1", peerId: "owner" };
+	for (const [id, text] of [["f1", "fragment one"], ["f2", "fragment two"], ["f3", "fragment three"]] as const) {
+		// No messageId: the sender never recorded these in the unread-context ledger.
+		client.send({ v: "0.1", type: "request", id, verb: "chat.send", params: { origin, text, engagement: { mentioned: false, group: false, authorId: "owner" } } });
+		await Bun.sleep(10);
+	}
+	for (let attempt = 0; attempt < 400 && turns.length === 0; attempt++) await Bun.sleep(10);
+	expect(turns).toHaveLength(1);
+	expect(turns[0]).toContain("fragment one");
+	expect(turns[0]).toContain("fragment two");
+	expect(turns[0]).toContain("fragment three");
+	client.close();
+});
+
 test("group turns carry silence guidance: listeners are told to default to [SILENT]", async () => {
 	directory = await mkdtemp(join(tmpdir(), "gajaeway-server-"));
 	const config: GatewayConfig = {
