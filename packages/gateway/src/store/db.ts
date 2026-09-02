@@ -955,12 +955,13 @@ export class GatewayDatabase {
 	 * (consumed or not) plus the persona's own confirmed replies, oldest first.
 	 * Gives a new epoch the thread it is joining instead of only the unread diff.
 	 */
-	recentConversation(originKey: string, conversationId: string, limit: number): Array<{ id?: string; at: string; author: string; body: string }> {
+	recentConversation(originKey: string, conversationId: string, limit: number, sinceIso: string): Array<{ id?: string; at: string; author: string; body: string }> {
 		// /new sets a floor: nothing from before the reset is ever shown again.
 		const state = this.#database
 			.query<{ floor_at: string | null; floor_row_id: number | null }, [string]>("SELECT floor_at, floor_row_id FROM conversation_context_state WHERE origin_key = ?")
 			.get(originKey);
-		const floorAt = state?.floor_at ?? "";
+		// Everyone in the window: humans, other bots, and the persona itself.
+		const floorAt = [state?.floor_at ?? "", sinceIso].sort().at(-1) ?? sinceIso;
 		const floorRowId = state?.floor_row_id ?? 0;
 		const inbound = this.#database
 			.query<{ message_id: string; received_at: string; author_name: string | null; author_id: string | null; body: string }, [string, string, number, number]>(

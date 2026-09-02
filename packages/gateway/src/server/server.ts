@@ -170,8 +170,9 @@ async function loadOrCreateLaneJob(
 const DEFAULT_STALL_CHECK_INTERVAL_MS = 5_000;
 /** /restart: hard-exit budget after the ordered stop begins. */
 const RESTART_HARD_EXIT_MS = 15_000;
-/** Messages of recent thread history shown to a freshly started session. */
-const RECENT_HISTORY_MESSAGES = 30;
+/** Thread history shown to a freshly started session: everything (humans, bots, self) in the last 24h, capped. */
+const RECENT_HISTORY_WINDOW_MS = 24 * 60 * 60_000;
+const RECENT_HISTORY_MAX = 300;
 const RESTART_EXIT_CODE = 75;
 interface Connection {
 	readonly decoder: FrameDecoder;
@@ -1549,13 +1550,15 @@ async function createInboundTurnLifecycle(
 		// not only the unread diff: without it the persona answers as if the
 		// conversation had just started.
 		const isFreshSession = !bootstrapState || bootstrapState.lastBootstrappedEpoch < input.epoch;
-		const recent = isFreshSession ? options.database.recentConversation(key, origin.conversationId, RECENT_HISTORY_MESSAGES) : [];
+		const recent = isFreshSession
+			? options.database.recentConversation(key, origin.conversationId, RECENT_HISTORY_MAX, new Date(Date.now() - RECENT_HISTORY_WINDOW_MS).toISOString())
+			: [];
 		const inWindowIds = new Set(prepared.selectedMessageIds);
 		const recentLines = recent
 			.filter((entry) => entry.id === undefined || (!inWindowIds.has(entry.id) && entry.id !== row.message_id))
 			.map((entry) => `- [${entry.at}] ${entry.author}: ${entry.body.slice(0, 500)}`);
 		const recentBlock = recentLines.length
-			? `[Recent conversation history (this session just started; already answered unless listed as unread below)]\n${recentLines.join("\n")}\n\n`
+			? `[Recent conversation history, last 24h (this session just started; already answered unless listed as unread below)]\n${recentLines.join("\n")}\n\n`
 			: "";
 		const header = `${recentBlock}${
 			lines.length
