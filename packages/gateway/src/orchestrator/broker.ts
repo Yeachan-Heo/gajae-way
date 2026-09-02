@@ -38,6 +38,14 @@ export interface BrokerSupervisorOptions {
 	readonly personaHostId?: string;
 	/** The persona workspace is the working directory for agent-dir-bound gjc commands. */
 	readonly cwd?: string;
+	/**
+	 * Explicit agent directory. Defaults to the instance-private
+	 * `<home>/broker/<instanceId>/agent`. Deployments that predate the persistent
+	 * turn model bound their sessions under the operator's `GJC_AGENT_DIR`; the
+	 * boot path passes that value here so those sessions are adopted, not
+	 * abandoned in an empty private store.
+	 */
+	readonly agentDir?: string;
 	/** Process seam for gjc command execution; production uses Bun.spawn bound to Bun. */
 	readonly spawn?: SpawnFn;
 	/** Command seam used by preflight and CliRunner; production spawns gjc commands directly. */
@@ -202,7 +210,7 @@ export class BrokerSupervisor implements PersonaBroker {
 			throw new Error("broker persona host id must contain only letters, numbers, dots, underscores, or hyphens");
 		}
 		this.stateDir = join(options.home, "broker", options.instanceId);
-		this.agentDir = join(this.stateDir, "agent");
+		this.agentDir = options.agentDir ?? join(this.stateDir, "agent");
 		this.discoveryPath = join(this.agentDir, "sdk", "broker.json");
 		this.lockPath = join(this.stateDir, "broker.lock");
 		this.#cwd = options.cwd ?? options.home;

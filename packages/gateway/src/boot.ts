@@ -28,11 +28,16 @@ export async function bootGateway(options: BootGatewayOptions = {}): Promise<Gat
 	const database = await GatewayDatabase.open(config.dbPath);
 	let broker: BrokerSupervisor | undefined;
 	try {
+		// A pre-cutover deployment bound its persona sessions under the operator's
+		// GJC_AGENT_DIR; supervising that store adopts them (session.resume) instead
+		// of starting an empty private one and holding every recorded binding.
+		const inheritedAgentDir = process.env.GJC_AGENT_DIR?.trim();
 		broker = new BrokerSupervisor({
 			...options.broker,
 			home: config.home,
 			instanceId: database.instanceId,
 			cwd: join(config.home, "workspace"),
+			...(inheritedAgentDir && !options.broker?.agentDir ? { agentDir: inheritedAgentDir } : {}),
 		});
 		// F92-C-P1-005: the Stage 0 floor is a boot gate, never an offline config check.
 		await broker.preflight();

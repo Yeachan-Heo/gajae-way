@@ -321,3 +321,60 @@ test("Unix shutdown drains runtime work before stopping the broker and closing t
 	expect(events).toEqual(["broker", "database"]);
 	expect(await Bun.file(config.socketPath).exists()).toBe(false);
 });
+
+test("an explicit agent dir is supervised in place so pre-cutover sessions are adopted, not abandoned", async () => {
+	const home = await temporaryHome("gajaeway-broker-adopt-");
+	const inherited = join(home, "operator-agent");
+	await mkdir(inherited, { recursive: true });
+	const commands: string[][] = [];
+	const broker = new BrokerSupervisor({
+		home,
+		instanceId: "instance-adopt",
+		agentDir: inherited,
+		command: async (args) => {
+			commands.push([...args]);
+			return HEALTHY;
+		},
+		healthIntervalMs: 60_000,
+	});
+	try {
+		await broker.start();
+		expect(broker.agentDir).toBe(inherited);
+		expect(commands[0]).toContain(inherited);
+		// Ownership/lock state stays instance-private even when the agent dir is shared.
+		expect(broker.lockPath).toBe(join(home, "broker", "instance-adopt", "broker.lock"));
+	} finally {
+		await broker.stop();
+	}
+});
+
+test("boot adopts GJC_AGENT_DIR from the environment as the supervised agent dir", async () => {
+	const home = await temporaryHome("gajaeway-broker-adopt-boot-");
+	const inherited = join(home, "operator-agent");
+	await mkdir(inherited, { recursive: true });
+	const previous = process.env.GJC_AGENT_DIR;
+	process.env.GJC_AGENT_DIR = inherited;
+	const commands: string[][] = [];
+	try {
+		const server = await bootGateway({
+			home,
+			broker: {
+				command: async (args) => {
+					commands.push([...args]);
+					return args[0] === "--version" ? { exitCode: 0, stdout: `gjc/${MIN_GJC_VERSION}\n`, stderr: "" } : HEALTHY;
+				},
+				healthProbe: async () => true,
+				healthIntervalMs: 60_000,
+				log: () => {},
+			},
+		});
+		try {
+			expect(commands.some((args) => args.includes(inherited))).toBe(true);
+		} finally {
+			await server.stop("test shutdown");
+		}
+	} finally {
+		if (previous === undefined) delete process.env.GJC_AGENT_DIR;
+		else process.env.GJC_AGENT_DIR = previous;
+	}
+});
