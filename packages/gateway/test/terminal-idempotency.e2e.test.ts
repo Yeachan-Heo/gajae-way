@@ -1,3 +1,4 @@
+import { Database } from "bun:sqlite";
 import { afterEach, expect, test } from "bun:test";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -387,6 +388,166 @@ test("a tail-less reconcile never reposts a previous turn's answer as the curren
 			{ trigger: "m-a1", text: "첫 답" },
 			{ trigger: "m-a2", text: "" },
 		]);
+	} finally {
+		await manager.stop();
+	}
+});
+
+test("red-team G3-B1: a same-session fresh-turn retry gets its own dispatch floor and cannot inherit the failed attempt's row", async () => {
+	const port = new ScriptedSessionPort();
+	port.omitStartedAt = true;
+	port.fetchLastAssistant = async ({ sessionId }) => {
+		const last = [...port.transcript(sessionId)].reverse().find((text) => text.length > 0);
+		if (last === undefined) throw new Error("no assistant row");
+		return { text: last, pages: 1, complete: true };
+	};
+	directory = await mkdtemp(join(tmpdir(), "gajaeway-terminal-requeue-"));
+	database = await GatewayDatabase.open(join(directory, "gateway.db"));
+	const terminals: Array<{ trigger: string; text: string }> = [];
+	const logs: string[] = [];
+	const make = () =>
+		new PersonaSessionManager({
+			database: database!,
+			port,
+			instanceId: "requeue",
+			repo: join(directory, "workspace"),
+			settleWindowMs: 0,
+			onTurnStart: ({ rows, batch }) => ({
+				text: rows.map((row) => row.body).join("\n"),
+				onTerminal: ({ text }) => {
+					terminals.push({ trigger: batch.triggerMessageId, text });
+				},
+			}),
+			log: (line) => {
+				logs.push(line);
+			},
+		});
+	const manager = make();
+	let recovered: PersonaSessionManager | undefined;
+	try {
+		expect(
+			database.inboundEnqueue({
+				messageId: "m-q1",
+				originKey: "discord/channel/chan-1",
+				originRefJson: JSON.stringify({ platform: "discord", kind: "channel", conversationId: "chan-1" }),
+				body: "재시도",
+				receivedAt: new Date().toISOString(),
+			}),
+		).toBe(true);
+		await manager.notifyInbound("discord/channel/chan-1");
+		await eventually(() => port.sends.length === 1, "first attempt was not sent");
+		const first = port.sends[0]!;
+		const firstBatch = database.inboundNonterminalBatches("discord/channel/chan-1")[0]!;
+		const firstFloor = database.inboundBatchDispatchedAt(firstBatch.batchKey);
+		expect(firstFloor).toBeDefined();
+		// The gateway dies mid-turn. The daemon writes an assistant row for the
+		// attempt and then the attempt FAILS.
+		await manager.stop();
+		port.emitAssistant(first.sessionId, "실패한 시도의 잔여 텍스트", null, first.opRef);
+		port.seedOperation(first.opRef, first.sessionId, "failed", "");
+		await Bun.sleep(20);
+		// Recovery adopts the failed batch and releases it for one same-session
+		// fresh turn (replaceAfterTerminal).
+		recovered = make();
+		await recovered.recover();
+		await Bun.sleep(400);
+		await recovered.reconcile("discord/channel/chan-1");
+		await eventually(
+			() => logs.some((line) => line.startsWith("recovery_fresh_turn")),
+			"failed batch was not released",
+		);
+		await eventually(() => port.sends.length === 2, "fresh-turn retry was not sent");
+		const second = port.sends[1]!;
+		expect(second.opRef).not.toBe(first.opRef);
+		const secondBatch = database.inboundNonterminalBatches("discord/channel/chan-1")[0]!;
+		const secondFloor = database.inboundBatchDispatchedAt(secondBatch.batchKey);
+		expect(secondFloor).toBeDefined();
+		expect(Date.parse(secondFloor!)).toBeGreaterThan(Date.parse(firstFloor!));
+		// The retry's op ends with NO assistant row of its own; the stale row from
+		// the failed attempt predates the retry's own floor and is never reposted.
+		port.seedOperation(second.opRef, second.sessionId, "terminal_ok", "");
+		await recovered.reconcile("discord/channel/chan-1");
+		await Bun.sleep(400);
+		await recovered.reconcile("discord/channel/chan-1");
+		await eventually(() => terminals.length >= 1, "retry never completed");
+		expect(terminals).toEqual([{ trigger: "m-q1", text: "" }]);
+	} finally {
+		await recovered?.stop();
+		await manager.stop();
+	}
+});
+
+test("red-team G3-B2: a batch bound before the upgrade, on a runtime without startedAt, is held - never completed empty, never given a prior answer", async () => {
+	const port = new ScriptedSessionPort();
+	port.omitStartedAt = true;
+	directory = await mkdtemp(join(tmpdir(), "gajaeway-terminal-legacy-"));
+	database = await GatewayDatabase.open(join(directory, "gateway.db"));
+	const terminals: string[] = [];
+	const logs: string[] = [];
+	const manager = new PersonaSessionManager({
+		database,
+		port,
+		instanceId: "legacy",
+		repo: join(directory, "workspace"),
+		settleWindowMs: 0,
+		onTurnStart: ({ rows }) => ({
+			text: rows.map((row) => row.body).join("\n"),
+			onTerminal: ({ text }) => {
+				terminals.push(text);
+			},
+		}),
+		log: (line) => {
+			logs.push(line);
+		},
+	});
+	try {
+		expect(
+			database.inboundEnqueue({
+				messageId: "m-l1",
+				originKey: "discord/channel/chan-1",
+				originRefJson: JSON.stringify({ platform: "discord", kind: "channel", conversationId: "chan-1" }),
+				body: "업그레이드 전 질문",
+				receivedAt: new Date().toISOString(),
+			}),
+		).toBe(true);
+		await manager.notifyInbound("discord/channel/chan-1");
+		await eventually(() => port.sends.length === 1, "turn was not sent");
+		const send = port.sends[0]!;
+		const batch = database.inboundNonterminalBatches("discord/channel/chan-1")[0]!;
+		await manager.stop();
+		// Model the schema-17 row: bound, but no dispatch floor was ever recorded.
+		new Database(join(directory, "gateway.db")).exec(
+			`UPDATE inbound_messages SET dispatched_at = NULL WHERE batch_key = '${batch.batchKey}'`,
+		);
+		// The old daemon finished with a real answer, then the gateway restarted.
+		port.seedOperation(send.opRef, send.sessionId, "terminal_ok", "진짜 답");
+		const recovered = new PersonaSessionManager({
+			database,
+			port,
+			instanceId: "legacy",
+			repo: join(directory, "workspace"),
+			settleWindowMs: 0,
+			onTurnStart: ({ rows }) => ({
+				text: rows.map((row) => row.body).join("\n"),
+				onTerminal: ({ text }) => {
+					terminals.push(text);
+				},
+			}),
+			log: (line) => {
+				logs.push(line);
+			},
+		});
+		try {
+			await recovered.recover();
+			await Bun.sleep(400);
+			await recovered.reconcile("discord/channel/chan-1");
+			await Bun.sleep(100);
+			expect(terminals).toEqual([]);
+			expect(logs.some((line) => line.includes("reason=no_turn_floor"))).toBe(true);
+			expect(database.inboundNonterminalBatches("discord/channel/chan-1")).toHaveLength(1);
+		} finally {
+			await recovered.stop();
+		}
 	} finally {
 		await manager.stop();
 	}

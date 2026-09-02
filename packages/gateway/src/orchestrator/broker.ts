@@ -672,9 +672,11 @@ export class BrokerSupervisor implements PersonaBroker {
 		// A daemon that keeps publishing a fresh heartbeat but fails the
 		// application probe (session Router wedged) would otherwise be probed
 		// forever: readiness refuses to launch while discovery looks live. After
-		// this many consecutive live-but-unhealthy attempts the daemon is retired
-		// and the next attempt launches a replacement.
+		// this many consecutive live-but-unhealthy attempts AGAINST THE SAME
+		// daemon (pid+url) it is retired and the next attempt launches a
+		// replacement. A newly published daemon starts from zero strikes.
 		let liveButUnhealthy = 0;
+		let struckIdentity: string | undefined;
 		for (let attempt = 0; attempt < this.#readinessAttempts; attempt++) {
 			if (this.#stopping) throw new Error("broker observation stopped during readiness");
 			if (this.#active !== active) throw new Error("broker observation was replaced before readiness completed");
@@ -685,12 +687,18 @@ export class BrokerSupervisor implements PersonaBroker {
 				}
 				if (this.#spawnsDaemon) {
 					const discovery = await readBrokerDiscovery(this.discoveryPath, this.#isPidAlive);
+					const identity = discovery ? `${discovery.pid}|${discovery.url}` : undefined;
+					if (identity !== struckIdentity) {
+						liveButUnhealthy = 0;
+						struckIdentity = identity;
+					}
 					if (discovery && ++liveButUnhealthy >= WEDGED_DAEMON_STRIKES) {
 						this.#log(
 							`broker_daemon_retired pid=${discovery.pid} reason=live_endpoint_failed_application_probe strikes=${liveButUnhealthy}`,
 						);
 						await this.#retireDaemon(discovery.pid);
 						liveButUnhealthy = 0;
+						struckIdentity = undefined;
 					} else if (!discovery) {
 						// The endpoint probe never spawns. gjc auto-starts its daemon on
 						// the first agent-dir-scoped sdk command, so when no live discovery

@@ -313,12 +313,28 @@ UPDATE inbound_messages SET batch_key = 'b18', batch_role = 'trigger', batch_epo
 		expect(upgraded.schemaVersion).toBe(18);
 		const row = upgraded.inboundBatchRows("b18")[0];
 		expect(row).toMatchObject({ bound_session_id: "s-old", dispatched_at: null, terminal_delivery_id: null });
-		// A pre-migration batch that is re-bound during recovery gets a floor now,
-		// and a later re-bind never moves it.
+		// A pre-migration batch that was ALREADY bound never gets a recovery-time
+		// floor: that stamp could postdate the answer the old daemon wrote.
 		expect(upgraded.inboundBatchBindSession("b18", "s-old", "2026-09-02T00:00:05.000Z")).toBe(true);
-		expect(upgraded.inboundBatchDispatchedAt("b18")).toBe("2026-09-02T00:00:05.000Z");
-		expect(upgraded.inboundBatchBindSession("b18", "s-old", "2026-09-02T00:01:00.000Z")).toBe(true);
-		expect(upgraded.inboundBatchDispatchedAt("b18")).toBe("2026-09-02T00:00:05.000Z");
+		expect(upgraded.inboundBatchDispatchedAt("b18")).toBeUndefined();
+		// A never-bound batch is stamped on its first bind only; a re-bind keeps it.
+		const v18 = new Database(path);
+		v18.exec(`
+INSERT INTO inbound_messages (message_id, origin_key, origin_ref_json, body, engagement_json, state, received_at)
+VALUES ('v18-fresh', 'discord:dm:2', '{}', 'body', NULL, 'pending', '2026-09-02T00:00:00.000Z');
+UPDATE inbound_messages SET batch_key = 'b18f', batch_role = 'trigger', batch_epoch = 0, batch_state = 'settled', attributed_op_ref = 'gw-p-0123456789abcdef0123456789abcdee' WHERE message_id = 'v18-fresh';
+`);
+		v18.close();
+		expect(upgraded.inboundBatchBindSession("b18f", "s-new", "2026-09-02T00:00:05.000Z")).toBe(true);
+		expect(upgraded.inboundBatchDispatchedAt("b18f")).toBe("2026-09-02T00:00:05.000Z");
+		expect(upgraded.inboundBatchBindSession("b18f", "s-new", "2026-09-02T00:01:00.000Z")).toBe(true);
+		expect(upgraded.inboundBatchDispatchedAt("b18f")).toBe("2026-09-02T00:00:05.000Z");
+		// A fresh-turn requeue releases the floor and the terminal claims with the rows.
+		expect(upgraded.inboundBatchClaimTerminal("b18f", 0, "gw-t-x")).toBe("gw-t-x");
+		expect(upgraded.inboundBatchRequeueFreshTurn("b18f")).toBe(1);
+		expect(upgraded.inboundBatchDispatchedAt("b18f")).toBeUndefined();
+		const released = upgraded.inboundBatchRows("b18f");
+		expect(released).toEqual([]);
 		// Terminal slots are per part and first-claim wins.
 		expect(upgraded.inboundBatchClaimTerminal("b18", 0, "gw-t-a")).toBe("gw-t-a");
 		expect(upgraded.inboundBatchClaimTerminal("b18", 0, "gw-t-b")).toBe("gw-t-a");

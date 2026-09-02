@@ -660,8 +660,11 @@ export class GatewayDatabase {
 
 	/**
 	 * Persists the owning SDK session before send, including for settled crash
-	 * recovery, and stamps `dispatched_at` on the FIRST bind only: a re-bind
-	 * during recovery must not move the floor past an answer already written.
+	 * recovery. `dispatched_at` is stamped only when NO row of the batch was
+	 * bound before: that is the one moment provably ahead of the send. A batch
+	 * that was already bound (recovery adoption, a schema-17 row migrated with
+	 * bound_session_id but no floor) keeps whatever floor it has - possibly
+	 * none - because a recovery-time stamp could postdate the real answer.
 	 */
 	inboundBatchBindSession(batchKey: string, sessionId: string, dispatchedAt = new Date().toISOString()): boolean {
 		if (!sessionId) throw new Error("batch session id must not be empty");
@@ -670,12 +673,13 @@ export class GatewayDatabase {
 			if (rows.length === 0) return false;
 			if (rows.some((row) => row.bound_session_id !== null && row.bound_session_id !== sessionId))
 				throw new Error(`batch ${batchKey} is already bound to another session`);
+			const firstBind = rows.every((row) => row.bound_session_id === null);
 			return (
 				this.#database
 					.query(
-						"UPDATE inbound_messages SET bound_session_id = ?, dispatched_at = COALESCE(dispatched_at, ?) WHERE batch_key = ? AND state = 'pending' AND batch_state IN ('settled', 'accepted')",
+						"UPDATE inbound_messages SET bound_session_id = ?, dispatched_at = CASE WHEN ? THEN COALESCE(dispatched_at, ?) ELSE dispatched_at END WHERE batch_key = ? AND state = 'pending' AND batch_state IN ('settled', 'accepted')",
 					)
-					.run(sessionId, dispatchedAt, batchKey).changes > 0
+					.run(sessionId, firstBind ? 1 : 0, dispatchedAt, batchKey).changes > 0
 			);
 		});
 	}
@@ -758,7 +762,7 @@ export class GatewayDatabase {
 			this.metaSet(key, String(attempt));
 			this.#database
 				.query(
-					"UPDATE inbound_messages SET batch_key = NULL, batch_role = NULL, batch_epoch = NULL, batch_state = NULL, attributed_op_ref = NULL, accepted_at = NULL, bound_session_id = NULL WHERE batch_key = ? AND state = 'pending' AND batch_state IN ('settled', 'accepted')",
+					"UPDATE inbound_messages SET batch_key = NULL, batch_role = NULL, batch_epoch = NULL, batch_state = NULL, attributed_op_ref = NULL, accepted_at = NULL, bound_session_id = NULL, dispatched_at = NULL, terminal_delivery_id = NULL WHERE batch_key = ? AND state = 'pending' AND batch_state IN ('settled', 'accepted')",
 				)
 				.run(batchKey);
 			return attempt;
