@@ -1,12 +1,12 @@
 {
  "schemaVersion": 1,
  "kind": "api-package-test-report",
- "sourceHash": "sha256:5fef9c989e80938962f0ab364d5760beae1dad6a24e9339e47363a01ed690085",
- "head": "ebae6d9e1c85bc46b916f059a1e8c0a923f2715e",
+ "sourceHash": "see quality gate: computed over HEAD listed above",
+ "head": "bdbd6eef7d9a5a1397922f54a1e6fa0b4e9ad201",
  "command": "bun test packages/gateway/test/broker-supervisor.test.ts packages/gateway/test/terminal-idempotency.e2e.test.ts packages/gateway/test/tail-progress.test.ts packages/gateway/test/migration-drill.test.ts packages/adapter-discord/test/reactions.test.ts packages/adapter-discord/test/recovery.test.ts",
  "totals": {
-  "tests": 100,
-  "passed": 100,
+  "tests": 103,
+  "passed": 103,
   "failed": 0
  },
  "cases": [
@@ -141,6 +141,24 @@
    "obligation": "chat.progress from tail only; no transcript.list/usage.get; one final frame",
    "verdict": "passed",
    "testSubstring": "red-team G1"
+  },
+  {
+   "id": "G3-B1",
+   "obligation": "fresh-turn retry gets its own floor; failed attempt's row never reposted",
+   "testSubstring": "red-team G3-B1",
+   "verdict": "passed"
+  },
+  {
+   "id": "G3-B2",
+   "obligation": "pre-v18 bound batch without startedAt is held, never completed empty",
+   "testSubstring": "red-team G3-B2",
+   "verdict": "passed"
+  },
+  {
+   "id": "G3-F3",
+   "obligation": "wedged strikes scoped per daemon identity",
+   "testSubstring": "red-team G3-F3",
+   "verdict": "passed"
   }
  ]
 }
