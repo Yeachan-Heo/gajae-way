@@ -673,7 +673,8 @@ class OriginActor {
 				// ACCEPTED op on a live session is held until its terminal arrives: the
 				// runtime answering "unknown" while a host boots is not proof the send
 				// was lost, and re-firing it double-posts (layofflabs-2, 2026-09-02).
-				const liveIdle = status.status.status === "unknown" && raw?.live === true && !retired && batch.state === "settled";
+				const liveIdle =
+					status.status.status === "unknown" && raw?.live === true && !retired && batch.state === "settled";
 				if (liveIdle && count >= HOLD_RELEASE_SWEEPS && (await this.#queueIsEmpty(sessionId))) {
 					this.#holdSweeps.delete(batch.opRef);
 					const attempt = this.#manager.database.inboundBatchRequeueFreshTurn(batch.batchKey);
@@ -1319,9 +1320,15 @@ class OriginActor {
 					const startedAt = report.status.startedAt;
 					const port = this.#manager.port;
 					if (typeof startedAt === "number" && port.fetchAssistantSince) {
-						const since = await port.fetchAssistantSince({ sessionId: bound.sessionId, repo: this.#manager.repo, notBeforeMs: startedAt });
+						const since = await port.fetchAssistantSince({
+							sessionId: bound.sessionId,
+							repo: this.#manager.repo,
+							notBeforeMs: startedAt,
+						});
 						if (since === undefined)
-							this.#manager.log(`terminal_text_unavailable origin=${this.originKey} epoch=${bound.epoch} opRef=${bound.batch.opRef} reason=no_assistant_row_since_start`);
+							this.#manager.log(
+								`terminal_text_unavailable origin=${this.originKey} epoch=${bound.epoch} opRef=${bound.batch.opRef} reason=no_assistant_row_since_start`,
+							);
 						text = since?.text ?? "";
 					} else {
 						text = (await port.fetchLastAssistant({ sessionId: bound.sessionId, repo: this.#manager.repo })).text;
