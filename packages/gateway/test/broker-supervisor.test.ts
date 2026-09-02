@@ -314,6 +314,71 @@ test("endpoint probe costs milliseconds: 20 sequential probes finish well under 
 	}
 });
 
+test("the CLI health probe has its own lane: saturating the shared cap with slow observation calls never delays it", async () => {
+	const home = await temporaryHome("gajaeway-broker-probe-lane-");
+	const transport = fakeBrokerTransport("secret-token");
+	const releases: Array<() => void> = [];
+	const spawnedArgs: string[][] = [];
+	const child = (args: string[]) => {
+		const isProbe = args.includes("list") && args.includes("--scope");
+		spawnedArgs.push(args);
+		const stdout = isProbe
+			? Promise.resolve(HEALTHY.stdout)
+			: new Promise<string>((resolve) => releases.push(() => resolve(JSON.stringify({ ok: true, result: {} }))));
+		const body = (text: Promise<string>) =>
+			new ReadableStream<Uint8Array>({
+				async start(controller) {
+					controller.enqueue(new TextEncoder().encode(await text));
+					controller.close();
+				},
+			});
+		return {
+			stdout: body(stdout),
+			stderr: body(Promise.resolve("")),
+			exited: stdout.then(() => 0),
+			kill: () => {},
+		} as unknown as ReturnType<typeof Bun.spawn>;
+	};
+	const broker = new BrokerSupervisor({
+		ssotAgentDir: null,
+		home,
+		instanceId: "instance-probe-lane",
+		spawn: ((options: { cmd: string[] }) => child(options.cmd.slice(1))) as unknown as typeof Bun.spawn,
+		healthIntervalMs: 60_000,
+		readinessDelayMs: 0,
+		healthProbeTimeoutMs: 1_000,
+	});
+	try {
+		// Readiness: the launch command runs once, then the endpoint probe judges health.
+		await writeDiscovery(broker.agentDir, discoveryBody(transport.url, "secret-token"));
+		await broker.start();
+		// Saturate every shared slot (MAX_CONCURRENT_CLI = 4) plus a queued fifth with slow status calls.
+		const observation = Array.from({ length: 5 }, (_, index) =>
+			broker.cli(["sdk", "session", "status", `s-${index}`, "--repo", home], { timeoutMs: 30_000 }),
+		);
+		await eventually(
+			() => spawnedArgs.filter((args) => args.includes("status")).length === 4,
+			"shared slots did not fill",
+		);
+		const started = performance.now();
+		const probe = await broker.cli(["sdk", "session", "list", "--scope", "cwd"], { timeoutMs: 1_000 });
+		expect(performance.now() - started).toBeLessThan(500);
+		expect(JSON.parse(probe.stdout)).toMatchObject({ ok: true });
+		expect(spawnedArgs.filter((args) => args.includes("status")).length).toBe(4);
+		// The queued fifth call only spawns after a slot frees, so drain until all five settled.
+		let settled = 0;
+		for (const task of observation) void task.then(() => settled++);
+		while (settled < observation.length) {
+			for (const release of releases.splice(0)) release();
+			await Bun.sleep(5);
+		}
+	} finally {
+		for (const release of releases.splice(0)) release();
+		await broker.stop();
+		transport.stop();
+	}
+});
+
 test("reclaims only stale process remnants while preserving persistent session authority and transcript evidence", async () => {
 	const home = await temporaryHome("gajaeway-broker-stale-");
 	const instanceId = "instance-stale";

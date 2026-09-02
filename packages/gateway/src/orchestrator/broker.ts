@@ -779,32 +779,44 @@ export class BrokerSupervisor implements PersonaBroker {
 	 */
 	#inflight = 0;
 	readonly #cliQueue: Array<() => void> = [];
+	/** The probe lane is separate: observation traffic saturating the shared cap must never delay a health verdict. */
+	#probeInflight = false;
+	readonly #probeQueue: Array<() => void> = [];
 
-	async #acquireCliSlot(args: readonly string[]): Promise<void> {
+	async #acquireCliSlot(args: readonly string[]): Promise<boolean> {
 		const isProbe = args.includes("list") && args.includes("--scope");
-		if (!isProbe) {
-			const deadline = Date.now() + BROKER_WAIT_MS;
-			while (!this.#active && !this.#stopping && this.#generation > 0) {
-				if (Date.now() >= deadline)
-					throw new GjcCliUnavailableError("broker generation fenced; daemon has not recovered");
-				await new Promise<void>((resolve) => setTimeout(resolve, 250));
-			}
+		if (isProbe) {
+			if (this.#probeInflight) await new Promise<void>((resolve) => this.#probeQueue.push(resolve));
+			this.#probeInflight = true;
+			return true;
+		}
+		const deadline = Date.now() + BROKER_WAIT_MS;
+		while (!this.#active && !this.#stopping && this.#generation > 0) {
+			if (Date.now() >= deadline)
+				throw new GjcCliUnavailableError("broker generation fenced; daemon has not recovered");
+			await new Promise<void>((resolve) => setTimeout(resolve, 250));
 		}
 		if (this.#inflight >= MAX_CONCURRENT_CLI) await new Promise<void>((resolve) => this.#cliQueue.push(resolve));
 		this.#inflight++;
+		return false;
 	}
 
-	#releaseCliSlot(): void {
+	#releaseCliSlot(probe: boolean): void {
+		if (probe) {
+			this.#probeInflight = false;
+			this.#probeQueue.shift()?.();
+			return;
+		}
 		this.#inflight--;
 		this.#cliQueue.shift()?.();
 	}
 
 	async #runCommand(args: readonly string[], options?: { readonly timeoutMs?: number }): Promise<CliResult> {
-		await this.#acquireCliSlot(args);
+		const probe = await this.#acquireCliSlot(args);
 		try {
 			return await this.#runCommandUnfenced(args, options);
 		} finally {
-			this.#releaseCliSlot();
+			this.#releaseCliSlot(probe);
 		}
 	}
 
