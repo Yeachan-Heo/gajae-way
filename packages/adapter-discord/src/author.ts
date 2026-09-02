@@ -16,6 +16,17 @@ export type AuthorLike = {
 	readonly username?: string;
 	/** Account-wide display name; `global_name` on the raw API. */
 	readonly globalName?: string | null;
+	/**
+	 * Server tag badge the account wears, `primary_guild` on the raw API and
+	 * `User#primaryGuild` in discord.js. `identityEnabled` false means the
+	 * account has a tag configured but is not displaying it, so nobody in the
+	 * room sees it either.
+	 */
+	readonly primaryGuild?: {
+		readonly tag?: string | null;
+		readonly identityEnabled?: boolean | null;
+		readonly identityGuildId?: string | null;
+	} | null;
 };
 
 export type MemberLike = {
@@ -65,4 +76,17 @@ export function resolveAuthorNames(author: AuthorLike | undefined, member?: Memb
 		...(displayName ? { displayName } : {}),
 		...(handle ? { handle } : {}),
 	};
+}
+
+/**
+ * The server tag a reader sees next to this author's name, or undefined when the
+ * account has none or has it switched off.
+ *
+ * Every human in the room reads this badge; the persona could not, so it had no
+ * way to tell which server an unfamiliar account belongs to.
+ */
+export function resolveServerTag(author: AuthorLike | undefined): string | undefined {
+	const primary = author?.primaryGuild;
+	if (!primary || primary.identityEnabled === false) return undefined;
+	return firstNonBlank([primary.tag]);
 }

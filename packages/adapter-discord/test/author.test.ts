@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { resolveAuthorNames, resolveDisplayName } from "../src/author";
+import { resolveAuthorNames, resolveDisplayName, resolveServerTag } from "../src/author";
 
 const author = { id: "u1", username: "yeachanheo", globalName: "Yeachan Heo" };
 
@@ -75,5 +75,30 @@ describe("raw-API member shape", () => {
 
 	test("a blank raw nick falls through to the next candidate", () => {
 		expect(resolveDisplayName(author, { nick: "", nickname: "kept" })).toBe("kept");
+	});
+});
+
+describe("resolveServerTag", () => {
+	test("reads the server tag badge a reader sees next to the name", () => {
+		expect(resolveServerTag({ id: "u1", primaryGuild: { tag: "GJC", identityEnabled: true } })).toBe("GJC");
+	});
+
+	test("an author with no primary guild has no tag", () => {
+		expect(resolveServerTag({ id: "u1" })).toBeUndefined();
+		expect(resolveServerTag({ id: "u1", primaryGuild: null })).toBeUndefined();
+		expect(resolveServerTag(undefined)).toBeUndefined();
+	});
+
+	test("a tag the account switched off is invisible to the room, so it is not reported", () => {
+		expect(resolveServerTag({ id: "u1", primaryGuild: { tag: "GJC", identityEnabled: false } })).toBeUndefined();
+	});
+
+	test("an unset or blank tag never propagates", () => {
+		expect(resolveServerTag({ id: "u1", primaryGuild: { tag: null, identityEnabled: true } })).toBeUndefined();
+		expect(resolveServerTag({ id: "u1", primaryGuild: { tag: "   ", identityEnabled: true } })).toBeUndefined();
+	});
+
+	test("identityEnabled left unreported still yields the tag Discord sent", () => {
+		expect(resolveServerTag({ id: "u1", primaryGuild: { tag: "OMX" } })).toBe("OMX");
 	});
 });

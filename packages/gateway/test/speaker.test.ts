@@ -33,6 +33,23 @@ describe("composeSpeakerLabel", () => {
 	test("undefined engagement yields no speaker", () => {
 		expect(composeSpeakerLabel(undefined)).toBeUndefined();
 	});
+
+	test("renders the server tag every reader in the room can see", () => {
+		expect(
+			composeSpeakerLabel({ authorId: "1", authorName: "형님", authorHandle: "yeachanheo", authorServerTag: "GJC" }),
+		).toBe("형님 (@yeachanheo) [GJC]");
+	});
+
+	test("the server tag survives the handle-only and id-only fallbacks", () => {
+		expect(composeSpeakerLabel({ authorId: "1", authorHandle: "leesayah", authorServerTag: "GJC" })).toBe(
+			"leesayah [GJC]",
+		);
+		expect(composeSpeakerLabel({ authorId: "1", authorServerTag: "GJC" })).toBe("1 [GJC]");
+	});
+
+	test("a blank server tag never reaches the header", () => {
+		expect(composeSpeakerLabel({ authorId: "1", authorName: "형님", authorServerTag: "   " })).toBe("형님");
+	});
 });
 
 describe("composeReplyLabel", () => {

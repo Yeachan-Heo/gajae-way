@@ -1,5 +1,5 @@
 import type { ChatMessagePayload, EngagementContext, OriginRef, ReactionAction } from "@gajaeway/protocol";
-import { resolveDisplayName } from "./author";
+import { resolveDisplayName, resolveServerTag } from "./author";
 import { type DiscordClientLike, deliveryFailureIsAmbiguous, type GatewayClientLike } from "./main";
 import { type DiscordMessageOriginShape, discordMessageOrigin } from "./origin";
 
@@ -266,6 +266,12 @@ export interface DiscordReactingUser {
 	/** Nullable because an uncached partial user carries no resolved handle. */
 	readonly username?: string | null;
 	readonly globalName?: string | null;
+	/** Server tag badge (`primary_guild`); absent on an uncached partial user. */
+	readonly primaryGuild?: {
+		readonly tag?: string | null;
+		readonly identityEnabled?: boolean | null;
+		readonly identityGuildId?: string | null;
+	} | null;
 }
 
 /** What an inbound reaction contributes to conversation context. Never a turn. */
@@ -304,11 +310,14 @@ export function describeInboundReaction(
 	const emoji = describeReactionEmoji(reaction.emoji);
 	if (!emoji) return undefined;
 	const origin = discordMessageOrigin({ author: { id: user.id }, channel });
-	const displayName = resolveDisplayName({
+	const authorLike = {
 		id: user.id,
 		...(user.username ? { username: user.username } : {}),
 		...(user.globalName ? { globalName: user.globalName } : {}),
-	});
+		...(user.primaryGuild ? { primaryGuild: user.primaryGuild } : {}),
+	};
+	const displayName = resolveDisplayName(authorLike);
+	const serverTag = resolveServerTag(authorLike);
 	return {
 		origin,
 		action,
@@ -320,6 +329,7 @@ export function describeInboundReaction(
 			authorId: user.id,
 			...(displayName ? { authorName: displayName } : {}),
 			...(user.username ? { authorHandle: user.username } : {}),
+			...(serverTag ? { authorServerTag: serverTag } : {}),
 			...(channel.name ? { channelLabel: `#${channel.name}` } : {}),
 			...(reaction.message?.guild?.name ? { serverLabel: reaction.message.guild.name } : {}),
 		},

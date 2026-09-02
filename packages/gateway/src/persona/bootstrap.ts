@@ -15,6 +15,7 @@ export interface BootstrapEngagement {
 	readonly authorId?: string;
 	readonly authorName?: string;
 	readonly authorHandle?: string;
+	readonly authorServerTag?: string;
 	readonly channelLabel?: string;
 	readonly serverLabel?: string;
 }
@@ -342,6 +343,9 @@ export async function buildSessionBootstrap(input: {
 		...(input.engagement?.authorId ? [`trigger-author-id: ${boundedLine(input.engagement.authorId, 80)}`] : []),
 		...(input.engagement?.authorName ? [`trigger-author-name: ${boundedLine(input.engagement.authorName)}`] : []),
 		...(input.engagement?.authorHandle ? [`trigger-author-handle: ${boundedLine(input.engagement.authorHandle)}`] : []),
+		...(input.engagement?.authorServerTag
+			? [`trigger-author-server-tag: ${boundedLine(input.engagement.authorServerTag, 40)}`]
+			: []),
 		`known-participant-ids: ${knownParticipantIds.slice(0, 32).join(", ") || "none configured"}`,
 		"idempotency: This section has a stable identity for this origin epoch. If the same bootstrap-id appears again after a failed attempt, do not restate or re-apply it; continue the current request normally.",
 	];
