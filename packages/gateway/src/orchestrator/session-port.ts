@@ -143,6 +143,8 @@ const DEFAULT_REQUEST_WAIT_MS = 30 * 60_000;
 const DEFAULT_STATUS_POLL_MS = 500;
 const SESSION_CREATE_ATTEMPTS = 5;
 const SESSION_CREATE_READINESS_MS = 60_000;
+const SESSION_READY_TIMEOUT_MS = 60_000;
+const SESSION_READY_POLL_MS = 250;
 const SESSION_CREATE_RETRY_MS = 1_000;
 
 /**
@@ -212,10 +214,39 @@ export class BrokerSessionPort implements SessionPort {
 		if (!this.#database.putSessionAtEpoch(input.originKey, created.sessionId, input.epoch)) {
 			throw new Error(`session bind for ${input.originKey} epoch ${input.epoch} lost to a concurrent durable epoch change`);
 		}
+		// session.create returns once the host is admitted; the Router indexes it
+		// a moment later. A tail/send before that answers session_unavailable, so
+		// wait until the broker reports the id live before handing the binding out.
+		await this.#awaitIndexed(created.sessionId, input.repo);
 		return { sessionId: created.sessionId, originKey: input.originKey, epoch: input.epoch, repo: input.repo };
 	}
 
 	#createChain: Promise<unknown> = Promise.resolve();
+
+	/** Judged on the raw inspect envelope (gjc >= 0.16.0 omits locator.repo, which the subsession normalizer requires). */
+	async #awaitIndexed(sessionId: string, repo: string): Promise<void> {
+		const deadline = Date.now() + SESSION_READY_TIMEOUT_MS;
+		let lastCode: string | undefined;
+		for (;;) {
+			try {
+				const result = await this.#cli(["sdk", "session", "inspect", sessionId, "--repo", repo], { timeoutMs: 10_000 });
+				const envelope = JSON.parse(result.stdout) as { ok?: unknown; result?: { session?: { live?: unknown } }; error?: { code?: unknown } };
+				// Only a broker that explicitly reports the id as not indexed / not
+				// live keeps us waiting; anything else is treated as ready (the send
+				// path still has its own recovery if that turns out to be wrong).
+				const disowned = envelope.ok === false && envelope.error?.code === "session_unavailable";
+				const notLive = envelope.ok === true && envelope.result?.session !== undefined && envelope.result.session.live === false;
+				if (!disowned && !notLive) return;
+				lastCode = disowned ? "session_unavailable" : "not_live";
+			} catch (error) {
+				const code = sdkErrorCode(error);
+				if (code !== "session_unavailable") return;
+				lastCode = code;
+			}
+			if (Date.now() >= deadline) throw new Error(`session ${sessionId} was created but never became live (${lastCode})`);
+			await this.#sleep(SESSION_READY_POLL_MS);
+		}
+	}
 
 	/** Cold creates are serialized per agent dir: parallel launches starve gjc's lifecycle launcher. */
 	#createSession(repo: string, idempotencyKey: string): Promise<{ readonly sessionId?: unknown }> {
