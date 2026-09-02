@@ -13,6 +13,7 @@ export const OBSERVED_TAIL_KINDS = [
 	"agent_failed",
 	"activity",
 	"query_response",
+	"tool_activity",
 ] as const;
 
 const OBSERVED_TAIL_KIND_SET = new Set<string>(OBSERVED_TAIL_KINDS);
@@ -704,6 +705,7 @@ function normalizeTailFrame(value: unknown): readonly TailFrame[] {
 	const text = rawKind === "transcript" && payload.role === "assistant" ? contentText(payload.content) : undefined;
 	const clientRef = typeof payload.clientRef === "string" ? payload.clientRef : typeof item.clientRef === "string" ? item.clientRef : undefined;
 	const idle = rawKind === "activity" && [payload.state, payload.status, payload.activity].some((value) => value === "idle");
+	if (rawKind === "tool_activity" && (payload.phase === "started" || payload.phase === "start")) payload.toolCallStarted = true;
 	return [
 		{
 			kind,
