@@ -43,6 +43,7 @@ else
 	printf '[SKIP] set GAJAEWAY_E2E_GJC=1 with inherited provider credentials to run the scratch broker check\n'
 fi
 run "bench gate" env GAJAEWAY_BENCH=1 bun test packages/gateway/bench
+run "build + binary smoke" scripts/smoke-binary.sh
 
 printf '\n=== summary ===\n'
 if [ "$fail" -eq 0 ]; then
