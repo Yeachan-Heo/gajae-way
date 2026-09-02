@@ -660,7 +660,8 @@ export class BrokerSupervisor implements PersonaBroker {
 		if (!isProbe) {
 			const deadline = Date.now() + BROKER_WAIT_MS;
 			while (!this.#active && !this.#stopping && this.#generation > 0) {
-				if (Date.now() >= deadline) throw new GjcCliUnavailableError("broker generation fenced; daemon has not recovered");
+				if (Date.now() >= deadline)
+					throw new GjcCliUnavailableError("broker generation fenced; daemon has not recovered");
 				await new Promise<void>((resolve) => setTimeout(resolve, 250));
 			}
 		}
