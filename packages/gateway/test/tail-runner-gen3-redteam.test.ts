@@ -215,3 +215,55 @@ test("red-team: an empty terminal poll never checkpoints past buffered frames st
 		await tail.close();
 	}
 });
+
+test("a cursorless attach polls non-strict, treats the runtime's pre-attach gap as diagnostic, and still delivers live frames", async () => {
+	const argv: string[][] = [];
+	const delivered: string[] = [];
+	const diagnostics: string[] = [];
+	const gapHolds: unknown[] = [];
+	let calls = 0;
+	const run: CliRunner = async (args) => {
+		argv.push([...args]);
+		calls++;
+		// gjc 0.16.0 (measured): a cursorless tail answers ok:true with BOTH a
+		// diagnostic retention gap and the frames after the resync point.
+		return {
+			exitCode: 0,
+			stdout: JSON.stringify({
+				ok: true,
+				result: {
+					checkpoint: { revision: 4, generation: 1, seq: 0 },
+					gap: { code: "retention_gap", resync: { revision: 4, generation: 1, seq: 0 } },
+					items: calls === 1 ? [{ kind: "transcript", id: "live-1", payload: { role: "assistant", content: [{ text: "live" }] } }] : [],
+					terminal: calls > 1,
+				},
+			}),
+			stderr: "",
+		};
+	};
+	const runner = new TailRunner({ run, repo: "/tmp/gajaeway-tail-cursorless", pollIntervalMs: 1, sleep: (ms) => Bun.sleep(ms) });
+	const tail = await runner.attach({
+		sessionId: "tail-cursorless",
+		brokerGeneration: 1,
+		repo: "/tmp/gajaeway-tail-cursorless",
+		onFrame: async (frame) => {
+			delivered.push(frame.assistantText ?? "");
+		},
+		onRetentionGap: async (gap) => {
+			gapHolds.push(gap);
+		},
+		onDiagnostic: (line) => {
+			diagnostics.push(line);
+		},
+	});
+	try {
+		await tail.markAccepted("turn-cursorless");
+		await eventually(() => delivered.includes("live"), "live frame after the diagnostic gap was not delivered");
+		expect(argv[0]).not.toContain("--strict");
+		expect(argv[0]).not.toContain("--cursor");
+		expect(gapHolds).toEqual([]);
+		expect(diagnostics.some((line) => line.startsWith("tail_gap_nonstrict session=tail-cursorless"))).toBe(true);
+	} finally {
+		await tail.close();
+	}
+});
