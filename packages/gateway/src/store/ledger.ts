@@ -62,6 +62,20 @@ export class DeliveryLedger {
 		this.#database.withTransaction(() => this.#database.deliveryUpdate(deliveryId, state, attempts));
 		return "transitioned";
 	}
+	hasRecentConfirmed(originKey: string, text: string, windowMs: number, now = Date.now()): boolean {
+		const key = text.trim();
+		const cutoff = now - windowMs;
+		for (const row of this.rows()) {
+			if (row.originKey !== originKey) continue;
+			if (row.state !== "confirmed") continue;
+			const at = Date.parse(row.createdAt);
+			if (!Number.isFinite(at) || at < cutoff) continue;
+			let payload: { text?: string } | undefined;
+			try { payload = JSON.parse(row.payloadJson) as { text?: string }; } catch { continue; }
+			if (payload?.text?.trim() === key) return true;
+		}
+		return false;
+	}
 	listUndelivered(freshnessMs: number, now = Date.now()): DeliveryRow[] {
 		return this.rows().filter(
 			(row) =>

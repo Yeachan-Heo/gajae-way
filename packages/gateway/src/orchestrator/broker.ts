@@ -88,7 +88,7 @@ type LockRecord = {
 };
 
 const DEFAULT_HEALTH_INTERVAL_MS = 5_000;
-const DEFAULT_HEALTH_PROBE_TIMEOUT_MS = 2_000;
+const DEFAULT_HEALTH_PROBE_TIMEOUT_MS = 10_000;
 const DEFAULT_COMMAND_TIMEOUT_MS = 30_000;
 // The first agent-dir-scoped command auto-starts gjc's own broker daemon; give
 // its lifecycle launcher a moment to converge after the first successful probe.

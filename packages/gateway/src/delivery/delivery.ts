@@ -93,6 +93,9 @@ export class DeliveryService {
 			...(row.state === "inflight" || row.state === "failed_ambiguous" ? { duplicateWarning: true } : {}),
 		}));
 	}
+	hasRecentConfirmed(originKey: string, text: string, windowMs: number): boolean {
+		return this.#ledger.hasRecentConfirmed(originKey, text, windowMs);
+	}
 	prune(): number {
 		return this.#ledger.prune(7 * 24 * 60 * 60 * 1000);
 	}

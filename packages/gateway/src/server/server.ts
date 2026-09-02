@@ -1603,10 +1603,11 @@ async function createInboundTurnLifecycle(
 			.filter((part) => part.length > 0 && !isSilenceToken(part))
 			.slice(0, 5);
 		const planned: Array<{ readonly body: string; readonly replyTo?: string }> = [];
-		// A: skip bodies already delivered in this turn (onFrame vs onTerminal dupe, or retry storm)
+		// A(global): per-turn set + origin-global 60m body dedup (Discord origin, not session)
 		const dedupedParts = parts.filter((body) => {
-			const key = body.trim();
-			if (deliveredBodySet.has(key)) return false;
+			const bkey = body.trim();
+			if (deliveredBodySet.has(bkey)) return false;
+			if (runtime.delivery.hasRecentConfirmed(row.origin_key, body, 60 * 60 * 1000)) return false;
 			return true;
 		});
 		for (const part of dedupedParts) {
