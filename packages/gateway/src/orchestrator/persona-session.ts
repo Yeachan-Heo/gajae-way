@@ -487,14 +487,8 @@ class OriginActor {
 		// holding, so releasing its rows back to pending is exactly-once-safe:
 		// the next settle binds a live session. A reachable runtime, even with an
 		// unknown status, keeps the hold: it may have accepted the send.
-		if (
-			batch.state === "settled" &&
-			!retired &&
-			first.failed &&
-			second.failed &&
-			status.status.status === "unknown" &&
-			status.unreachable === true
-		) {
+		const disownedByBroker = status.unreachable === true && (status.unreachableCode === "session_unavailable" || (first.failed && second.failed));
+		if (batch.state === "settled" && !retired && status.status.status === "unknown" && disownedByBroker) {
 			const attempt = this.#manager.database.inboundBatchRequeueFreshTurn(batch.batchKey);
 			// The binding itself is unusable: recreate through the existing rebind
 			// primitive (epoch bump) so the next settle binds a fresh live session.
@@ -652,13 +646,23 @@ class OriginActor {
 		}
 	}
 
-	async #statusForRecovery(sessionId: string, opRef: string): Promise<StatusReport & { unreachable?: boolean }> {
+	async #statusForRecovery(
+		sessionId: string,
+		opRef: string,
+	): Promise<StatusReport & { unreachable?: boolean; unreachableCode?: string }> {
 		try {
 			return await this.#manager.port.status({ sessionId, repo: this.#manager.repo, opRef });
-		} catch {
+		} catch (error) {
 			// Transport/session-unreachable, as opposed to a reachable runtime that
-			// reported an undecidable operation state.
-			return { operationRef: opRef, status: { status: "unknown" }, summaryCompleted: false, unreachable: true };
+			// reported an undecidable operation state. `session_unavailable` is the
+			// broker itself disowning the id: nothing can be in flight there.
+			return {
+				operationRef: opRef,
+				status: { status: "unknown" },
+				summaryCompleted: false,
+				unreachable: true,
+				...(sdkStatusErrorCode(error) ? { unreachableCode: sdkStatusErrorCode(error) } : {}),
+			};
 		}
 	}
 
@@ -1197,6 +1201,13 @@ function safeDiagnostic(error: unknown): string {
 
 function isTerminalTailFrame(frame: TailFrame): boolean {
 	return frame.rawKind === "agent_end" || frame.rawKind === "agent_failed" || frame.idle;
+}
+
+function sdkStatusErrorCode(error: unknown): string | undefined {
+	const code = (error as { code?: unknown } | undefined)?.code;
+	if (typeof code === "string" && /^[a-z0-9_.-]{1,64}$/i.test(code)) return code;
+	const message = error instanceof Error ? error.message : "";
+	return /session_unavailable/.test(message) ? "session_unavailable" : undefined;
 }
 
 function resyncCoordinate(value: unknown): string {

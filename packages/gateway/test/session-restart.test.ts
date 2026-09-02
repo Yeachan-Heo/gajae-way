@@ -361,3 +361,40 @@ test("a settle whose bind fails releases the rows and retries the bind with back
 	expect(port.bindAttempts).toBe(2);
 	await eventually(() => terminal.length === 1, "retried turn did not complete");
 });
+
+class DisownedButInspectablePort extends ScriptedSessionPort {
+	// gjc >= 0.16.0 on a rebooted host: inspect still answers (live=false) but the
+	// Router disowns the id on status/send.
+	async inspect(input: { sessionId: string; repo: string }): Promise<BrokerSession | undefined> {
+		const s = await super.inspect(input);
+		return s ? { ...s, live: false } : s;
+	}
+	async status(input: { sessionId: string; repo: string; opRef: string }): Promise<StatusReport> {
+		if (this.sends.length === 0) throw new Error("gjc sdk request failed: session_unavailable");
+		return await super.status(input);
+	}
+}
+
+test("a settled batch whose id the Router disowns is released and re-fired even when inspect still answers", async () => {
+	home = await mkdtemp(join(tmpdir(), "gajaeway-session-restart-"));
+	database = await GatewayDatabase.open(join(home, "gateway.db"));
+	const port = new DisownedButInspectablePort();
+	const logs: string[] = [];
+	// Bind once through the fake so "stale-session" is a known scripted session,
+	// then leave its durable record pointing at it as a pre-reboot binding.
+	const first = await port.bind({ originKey: KEY, epoch: 0, repo: join(home, "workspace") });
+	const staleId = first.sessionId;
+	database.putSession(KEY, staleId);
+	enqueue("m-1", "hello");
+	const cutoff = new Date().toISOString();
+	const batchKey = `${KEY}|0|m-1|${cutoff}|0`;
+	database.inboundSettleBatch({ originKey: KEY, epoch: 0, cutoff, batchKey, opRef: "gw-p-00000000000000000000000000000002" });
+	database.inboundBatchBindSession(batchKey, staleId);
+	manager = makeManager(port, logs);
+	await manager.recover();
+	expect(logs.some((line) => line.startsWith(`recovery_requeue_unaccepted origin=${KEY}`))).toBe(true);
+	await eventually(() => port.sends.length === 1, "disowned batch was not re-fired");
+	// The origin was rebound (epoch bumped) and the release re-fired under a fresh ref.
+	expect(database.getSessionRecord(KEY)?.epoch).toBe(1);
+	expect(port.sends[0]!.opRef).not.toBe("gw-p-00000000000000000000000000000002");
+});
