@@ -7,12 +7,10 @@
 		".": "./src/main.ts"
 	},
 	"scripts": {
-		"start": "bun run src/main.ts",
 		"test": "bun test"
 	},
 	"dependencies": {
 		"@gajaeway/protocol": "workspace:*",
-		"@gajaeway/sdk": "workspace:*",
 		"discord.js": "^14.25.1"
 	}
 }

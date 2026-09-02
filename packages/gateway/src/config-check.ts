@@ -84,7 +84,7 @@ export function renderConfigCheck(result: ConfigCheckResult): string[] {
 		`OK ${result.path}`,
 		`  adapters: ${result.adapters.length === 0 ? "none" : result.adapters.join(", ")}`,
 		`  channels: ${result.channels.length} (open ${result.openChannels.length}, mention-only ${mentionOnly}; ${perPlatform})`,
-		"  channel policy applies at gateway start only: restart, then confirm the new pid started after this file's mtime.",
+		"  channels reload live (SIGHUP or gateway.reloadConfig); adapters and credentials apply at daemon start only.",
 	];
 }
 

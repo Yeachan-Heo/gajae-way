@@ -187,3 +187,46 @@ test("a stuck adapter stop times out after its bounded deadline and still closes
 	expect(logs).toContain("adapter_stop_timeout adapter=discord");
 	expect(server.ports[0]?.closed).toBeGreaterThan(0);
 });
+
+test("stopAdapters joins a factory that resolves after stop so the late handle is torn down before it returns", async () => {
+	const server = new FakeServer();
+	const late = deferred<AdapterHandle>();
+	const produced = handle();
+	const logs: string[] = [];
+	const supervisor = new AdapterSupervisor({
+		server,
+		escalate: () => {},
+		log: (line) => logs.push(line),
+		stopTimeoutMs: 2_000,
+	});
+	await supervisor.start("discord", async () => await late.promise);
+	await until(() => server.ports.length === 1);
+	const stopping = supervisor.stopAdapters();
+	let settled = false;
+	void stopping.then(() => {
+		settled = true;
+	});
+	await Bun.sleep(20);
+	expect(settled).toBe(false);
+	late.resolve(produced.handle);
+	await stopping;
+	expect(produced.stops()).toBe(1);
+	expect(logs).toContain("adapter_disposed_after_stop adapter=discord generation=1");
+	expect(logs).toContain("adapter_stopped adapter=discord generation=1");
+});
+
+test("stopAdapters gives up on a factory that never resolves after the adapter deadline", async () => {
+	const server = new FakeServer();
+	const logs: string[] = [];
+	const supervisor = new AdapterSupervisor({
+		server,
+		escalate: () => {},
+		log: (line) => logs.push(line),
+		stopTimeoutMs: 50,
+	});
+	await supervisor.start("telegram", () => new Promise<AdapterHandle>(() => {}));
+	await until(() => server.ports.length === 1);
+	await supervisor.stopAdapters();
+	expect(logs).toContain("adapter_stop_timeout adapter=telegram");
+	expect(server.ports[0]?.closed).toBeGreaterThan(0);
+});

@@ -19,6 +19,8 @@ export interface BootGatewayRuntimeOptions {
 	readonly broker?: BrokerSupervisorDependencies;
 	/** Composite daemon shutdown owner for the gateway.shutdown verb. */
 	readonly shutdown?: (reason: string) => Promise<void>;
+	/** Composite daemon owner for the owner `/restart` command (teardown + exit status). */
+	readonly restart?: (reason: string) => Promise<void>;
 }
 
 export interface BootGatewayOptions extends BootGatewayRuntimeOptions {
@@ -91,6 +93,7 @@ export async function bootGatewayFromConfig(
 					onStop: close,
 					overrides: options.overrides,
 					shutdown: options.shutdown,
+					restart: options.restart,
 				})
 			: await startUnixServer({
 					config,
@@ -102,6 +105,7 @@ export async function bootGatewayFromConfig(
 					onStop: close,
 					overrides: options.overrides,
 					shutdown: options.shutdown,
+					restart: options.restart,
 				});
 		console.error(JSON.stringify({ recovery: { recovered: pending, pending, pruned } }));
 		return server;

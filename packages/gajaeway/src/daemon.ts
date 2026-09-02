@@ -9,6 +9,7 @@ import {
 	gatewayHome,
 	type LocalGatewayPort,
 	loadConfig,
+	RESTART_EXIT_CODE,
 	sanitizeDiagnostic,
 } from "@gajaeway/gateway";
 import { adapterInputs, adminEvents, requestAfterOpen } from "./adapters";
@@ -211,6 +212,12 @@ export async function runDaemon(options: RunDaemonOptions = {}): Promise<Daemon>
 		const gateway = await bootGatewayFromConfig(config, {
 			broker: options.broker,
 			shutdown: async (reason) => await daemon.stop(reason),
+			// Owner /restart: the composite owner tears everything down and exits
+			// non-zero (RESTART_EXIT_CODE) so launchd KeepAlive / systemd relaunch it.
+			restart: async (reason) => {
+				daemon.requestExit(RESTART_EXIT_CODE);
+				await daemon.stop(reason);
+			},
 		});
 		if (daemon.signal.aborted) {
 			await gateway.stop("boot aborted");

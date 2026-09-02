@@ -1,4 +1,4 @@
-import { mkdir, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdir, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 
 export type PidLiveness = "alive" | "dead" | "unknown";
@@ -68,24 +68,52 @@ export class DaemonLock {
 				break;
 		}
 
+		// Replacement-safe reclaim. Two starters can both prove the same holder
+		// dead; without serialisation the loser would unlink the WINNER's fresh
+		// lock. The reclaim token is itself O_EXCL, so exactly one starter may
+		// reclaim a given stale file; it then re-verifies the file still holds the
+		// dead pid it observed (same inode, same content) before unlinking.
+		const token = `${path}.reclaim`;
+		if (!(await claim(token, ports.pid))) {
+			throw new DaemonLockRefusalError(`daemon lock ${path} is being reclaimed by another process; retry shortly`);
+		}
 		try {
-			await rm(path);
-		} catch {
-			throw new DaemonLockRefusalError(
-				`daemon lock ${path} could not be reclaimed; remove it by hand only after confirming no gajaeway daemon is running`,
-			);
+			const before = await identity(path);
+			if (before === undefined || before.holder !== holder) {
+				throw new DaemonLockRefusalError(
+					`daemon lock ${path} changed while reclaiming; another process may be starting`,
+				);
+			}
+			const again = await identity(path);
+			if (again === undefined || again.ino !== before.ino || again.holder !== holder) {
+				throw new DaemonLockRefusalError(
+					`daemon lock ${path} changed while reclaiming; another process may be starting`,
+				);
+			}
+			try {
+				await rm(path);
+			} catch {
+				throw new DaemonLockRefusalError(
+					`daemon lock ${path} could not be reclaimed; remove it by hand only after confirming no gajaeway daemon is running`,
+				);
+			}
+			if (!(await claim(path, ports.pid))) {
+				throw new DaemonLockRefusalError(
+					`daemon lock ${path} could not be re-claimed; another process may be starting`,
+				);
+			}
+			ports.log?.(`daemon_lock_reclaimed stale_pid=${holder}`);
+			return new DaemonLock(path, ports.pid);
+		} finally {
+			await rm(token, { force: true });
 		}
-		if (!(await claim(path, ports.pid))) {
-			throw new DaemonLockRefusalError(`daemon lock ${path} could not be re-claimed; another process may be starting`);
-		}
-		ports.log?.(`daemon_lock_reclaimed stale_pid=${holder}`);
-		return new DaemonLock(path, ports.pid);
 	}
 
 	/** Drops the file only while it still names this lock's owner PID. */
 	async release(): Promise<void> {
 		try {
-			if ((await readHolder(this.path)) !== this.pid) return;
+			const mine = await identity(this.path);
+			if (mine === undefined || mine.holder !== this.pid) return;
 			await rm(this.path);
 		} catch {
 			// An unreadable or replaced lock is not ours to remove.
@@ -100,6 +128,17 @@ function safeLiveness(ports: DaemonLockPorts, pid: number, path: string): PidLiv
 		throw new DaemonLockRefusalError(
 			`daemon lock ${path} cannot prove whether pid ${pid} is running; remove it by hand only after confirming no gajaeway daemon is running`,
 		);
+	}
+}
+
+/** Inode + parsed holder, or undefined when the file is gone. */
+async function identity(path: string): Promise<{ ino: number; holder: number } | undefined> {
+	try {
+		const [info, holder] = await Promise.all([stat(path), readHolder(path)]);
+		return { ino: Number(info.ino), holder };
+	} catch (error) {
+		if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined;
+		throw error;
 	}
 }
 

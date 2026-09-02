@@ -214,3 +214,44 @@ test("close() rejects callers but admitted server work still drains on stop()", 
 	release();
 	await stopping;
 });
+
+test("owner /restart routes through the injected composite restart owner instead of exiting the process", async () => {
+	directory = await mkdtemp(join(tmpdir(), "gajaeway-local-port-"));
+	const config: GatewayConfig = {
+		schemaVersion: 1,
+		home: directory,
+		configPath: join(directory, "config.json"),
+		socketPath: join(directory, "gateway.sock"),
+		dbPath: join(directory, "gateway.db"),
+		logVerbosity: "info",
+		dmPolicy: "open",
+		ownerTarget: { origin: { platform: "discord", kind: "dm", conversationId: "d-owner", peerId: "owner" } },
+	};
+	const db = await GatewayDatabase.open(config.dbPath);
+	database = db;
+	const restarts: string[] = [];
+	const exits: number[] = [];
+	server = await startUnixServer({
+		config,
+		database: db,
+		sessionPort: sessionPortFromResponder({ respond: async () => "unused" }),
+		onStop: () => db.close(),
+		exitProcess: (code) => exits.push(code),
+		restart: async (reason) => {
+			restarts.push(reason);
+		},
+	});
+	const port = server.attach("owner");
+	await port.open();
+	const sent = await port.request<{ engaged: boolean }>("chat.send", {
+		origin: { platform: "discord", kind: "dm", conversationId: "d-owner", peerId: "owner" },
+		text: "/restart",
+		engagement: { mentioned: false, group: false, authorId: "owner" },
+	});
+	expect(sent.engaged).toBe(true);
+	for (let i = 0; i < 300 && restarts.length === 0; i++) await Bun.sleep(10);
+	expect(restarts).toEqual(["owner /restart"]);
+	// The gateway did not stop itself and did not exit: the composite owner decides.
+	expect(exits).toEqual([]);
+	expect((await port.request<{ pid: number }>("gateway.status")).pid).toBe(process.pid);
+});

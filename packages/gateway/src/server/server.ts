@@ -173,7 +173,7 @@ const RESTART_HARD_EXIT_MS = 15_000;
 /** Thread history shown to a freshly started session: everything (humans, bots, self) in the last 24h, capped. */
 const RECENT_HISTORY_WINDOW_MS = 24 * 60 * 60_000;
 const RECENT_HISTORY_MAX = 300;
-const RESTART_EXIT_CODE = 75;
+export const RESTART_EXIT_CODE = 75;
 interface Connection {
 	readonly decoder: FrameDecoder;
 	negotiated: boolean;
@@ -231,6 +231,12 @@ export interface GatewayServerOptions {
 	readonly progress?: { readonly firstAfterMs?: number; readonly intervalMs?: number };
 	/** Test seam: how /restart ends the process after the ordered stop (default process.exit). */
 	readonly exitProcess?: (code: number) => void;
+	/**
+	 * Composite owner for the owner `/restart` command. When present it owns the
+	 * ordered teardown AND the exit status; the gateway never calls exit itself.
+	 * Absent (standalone gateway), the gateway stops and exits RESTART_EXIT_CODE.
+	 */
+	readonly restart?: (reason: string) => Promise<void>;
 	/** Test seam for the persona tail stall heartbeat; production uses the 5s default. */
 	readonly stallCheckIntervalMs?: number;
 	/** Mid-work speech pacing (issue #71). */
@@ -1523,8 +1529,14 @@ async function sendChat(
 			}
 		}
 		console.error(`gateway restart requested by owner via ${key}`);
-		// Let the ack leave the socket, then exit cleanly; the supervisor restarts us.
+		// Let the ack leave the socket, then hand off. A composite owner tears the
+		// whole daemon down and exits with its own status; a bare gateway exits
+		// itself.
 		setTimeout(() => {
+			if (options.restart) {
+				void options.restart("owner /restart");
+				return;
+			}
 			// Exit non-zero on purpose: launchd KeepAlive=true and systemd
 			// Restart=on-failure only relaunch after an unsuccessful exit. A wedged
 			// ordered stop still exits within the hard budget. Durable inbound and
