@@ -5,7 +5,13 @@ import { join } from "node:path";
 import type { CliRunner } from "@gajaeway/subsession";
 import { bootGateway } from "../src/boot";
 import type { GatewayConfig } from "../src/config";
-import { BrokerSupervisor, MIN_GJC_VERSION } from "../src/orchestrator/broker";
+import {
+	BrokerSupervisor,
+	MIN_GJC_VERSION,
+	probeBrokerDiscovery,
+	probeBrokerEndpoint,
+	readBrokerDiscovery,
+} from "../src/orchestrator/broker";
 import { startUnixServer } from "../src/server/server";
 import { GatewayDatabase } from "../src/store/db";
 import { sessionPortFromResponder } from "./session-port.fake";
@@ -147,39 +153,165 @@ test("red-team: an unhealthy health flip-flop never consumes or double-publishes
 	}
 });
 
-test("default readiness probes cwd scope so the non-Git persona workspace never fails the daemon probe", async () => {
-	const home = await temporaryHome("gajaeway-broker-readiness-scope-");
+/** A stand-in for gjc's broker transport: token-gated upgrade, unsolicited broker_hello on open. */
+function fakeBrokerTransport(token: string, options: { hello?: boolean } = {}) {
+	const server = Bun.serve({
+		hostname: "127.0.0.1",
+		port: 0,
+		fetch(request, srv) {
+			const url = new URL(request.url);
+			if (request.headers.get("upgrade")?.toLowerCase() !== "websocket")
+				return new Response("Upgrade Required", { status: 426 });
+			if (url.searchParams.get("token") !== token) return new Response("Unauthorized", { status: 401 });
+			return srv.upgrade(request) ? undefined : new Response("upgrade failed", { status: 400 });
+		},
+		websocket: {
+			open(socket) {
+				if (options.hello !== false) socket.send(JSON.stringify({ type: "broker_hello", protocolVersion: 3 }));
+			},
+			message() {},
+		},
+	});
+	return { url: `ws://127.0.0.1:${server.port}`, stop: () => server.stop(true) };
+}
+
+async function writeDiscovery(agentDir: string, body: Record<string, unknown>): Promise<string> {
+	await mkdir(join(agentDir, "sdk"), { recursive: true });
+	const path = join(agentDir, "sdk", "broker.json");
+	await writeFile(path, JSON.stringify(body));
+	return path;
+}
+
+function discoveryBody(url: string, token: string, extra: Record<string, unknown> = {}): Record<string, unknown> {
+	return {
+		version: 1,
+		protocolVersion: 3,
+		pid: process.pid,
+		incarnation: "darwin:1:1",
+		host: "127.0.0.1",
+		port: Number(new URL(url).port),
+		url,
+		token,
+		startedAt: Date.now() - 1_000,
+		heartbeatAt: Date.now(),
+		...extra,
+	};
+}
+
+test("default readiness spawns gjc once to launch the daemon, then judges health only by the published endpoint", async () => {
+	const home = await temporaryHome("gajaeway-broker-readiness-endpoint-");
 	const commands: string[][] = [];
+	const transport = fakeBrokerTransport("secret-token");
+	let agentDir = "";
 	const broker = new BrokerSupervisor({
 		ssotAgentDir: null,
 		home,
-		instanceId: "instance-readiness-scope",
+		instanceId: "instance-readiness-endpoint",
 		command: async (args) => {
 			commands.push([...args]);
+			// gjc's first agent-dir command auto-starts its daemon, which then publishes discovery.
+			await writeDiscovery(agentDir, discoveryBody(transport.url, "secret-token"));
 			return HEALTHY;
 		},
 		healthIntervalMs: 60_000,
+		readinessDelayMs: 0,
 	});
+	agentDir = broker.agentDir;
 	try {
 		await broker.start();
 		expect(commands).toEqual([["sdk", "session", "--agent-dir", broker.agentDir, "list", "--scope", "cwd"]]);
 	} finally {
 		await broker.stop();
+		transport.stop();
 	}
 });
 
-test("readiness rejects a zero-exit generic help reply: only a structural session-list envelope is healthy", async () => {
-	const home = await temporaryHome("gajaeway-broker-generic-help-");
+test("readiness fails closed when the daemon never publishes a live endpoint, even if the CLI answers", async () => {
+	const home = await temporaryHome("gajaeway-broker-no-endpoint-");
+	let commands = 0;
 	const broker = new BrokerSupervisor({
 		ssotAgentDir: null,
 		home,
-		instanceId: "instance-generic",
-		command: async () => GENERIC_HELP,
+		instanceId: "instance-no-endpoint",
+		command: async () => {
+			commands++;
+			return HEALTHY;
+		},
 		readinessAttempts: 2,
 		readinessDelayMs: 0,
 		log: () => {},
 	});
 	await expect(broker.start()).rejects.toThrow("did not become healthy");
+	expect(commands).toBe(2);
+});
+
+test("endpoint probe: discovery is rejected for a stale heartbeat, a dead pid, a bad token, or a silent daemon", async () => {
+	const home = await temporaryHome("gajaeway-broker-endpoint-probe-");
+	const transport = fakeBrokerTransport("secret-token");
+	const silent = fakeBrokerTransport("secret-token", { hello: false });
+	const alive = async () => true;
+	const dead = async () => false;
+	try {
+		const fresh = await writeDiscovery(join(home, "fresh"), discoveryBody(transport.url, "secret-token"));
+		expect(await readBrokerDiscovery(fresh, alive)).toMatchObject({ pid: process.pid, url: transport.url });
+		expect(await readBrokerDiscovery(fresh, dead)).toBeUndefined();
+
+		const stale = await writeDiscovery(
+			join(home, "stale"),
+			discoveryBody(transport.url, "secret-token", { heartbeatAt: Date.now() - 16_000 }),
+		);
+		expect(await readBrokerDiscovery(stale, alive)).toBeUndefined();
+
+		const context = (discoveryPath: string) => ({
+			agentDir: home,
+			cli: async () => HEALTHY,
+			discoveryPath,
+			isPidAlive: alive,
+			timeoutMs: 500,
+		});
+		expect(await probeBrokerDiscovery(context(fresh))).toBe(true);
+		expect(await probeBrokerDiscovery(context(join(home, "missing", "broker.json")))).toBe(false);
+		expect(
+			await probeBrokerEndpoint({ pid: process.pid, url: transport.url, token: "wrong", heartbeatAt: Date.now() }, 500),
+		).toBe(false);
+		expect(
+			await probeBrokerEndpoint(
+				{ pid: process.pid, url: silent.url, token: "secret-token", heartbeatAt: Date.now() },
+				100,
+			),
+		).toBe(false);
+		const closed = fakeBrokerTransport("secret-token");
+		closed.stop();
+		expect(
+			await probeBrokerEndpoint(
+				{ pid: process.pid, url: closed.url, token: "secret-token", heartbeatAt: Date.now() },
+				500,
+			),
+		).toBe(false);
+	} finally {
+		transport.stop();
+		silent.stop();
+	}
+});
+
+test("endpoint probe costs milliseconds: 20 sequential probes finish well under one CLI cold start", async () => {
+	const home = await temporaryHome("gajaeway-broker-endpoint-cost-");
+	const transport = fakeBrokerTransport("secret-token");
+	try {
+		const path = await writeDiscovery(home, discoveryBody(transport.url, "secret-token"));
+		const context = {
+			agentDir: home,
+			cli: async () => HEALTHY,
+			discoveryPath: path,
+			isPidAlive: async () => true,
+			timeoutMs: 500,
+		};
+		const started = performance.now();
+		for (let index = 0; index < 20; index++) expect(await probeBrokerDiscovery(context)).toBe(true);
+		expect(performance.now() - started).toBeLessThan(500);
+	} finally {
+		transport.stop();
+	}
 });
 
 test("reclaims only stale process remnants while preserving persistent session authority and transcript evidence", async () => {
@@ -350,6 +482,11 @@ test("an explicit agent dir is supervised in place so pre-cutover sessions are a
 			commands.push([...args]);
 			return HEALTHY;
 		},
+		// The launch command must bind the adopted dir; health itself is stubbed.
+		healthProbe: async ({ cli }) => {
+			await cli(["sdk", "session", "list", "--scope", "cwd"]);
+			return true;
+		},
 		healthIntervalMs: 60_000,
 	});
 	try {
@@ -370,6 +507,7 @@ test("start pins steeringMode=all and interruptMode=wait in the private agent di
 		instanceId: "instance-steer",
 		ssotAgentDir: null,
 		command: async () => HEALTHY,
+		healthProbe: async () => true,
 		healthIntervalMs: 60_000,
 	});
 	await mkdir(broker.agentDir, { recursive: true });
@@ -403,6 +541,7 @@ test("start seeds the private agent dir from the operator SSOT and fails loudly 
 		instanceId: "instance-ssot",
 		ssotAgentDir: ssot,
 		command: async () => HEALTHY,
+		healthProbe: async () => true,
 		healthIntervalMs: 60_000,
 		log: (line) => logs.push(line),
 	});
@@ -426,6 +565,7 @@ test("start seeds the private agent dir from the operator SSOT and fails loudly 
 		instanceId: "instance-ssot-missing",
 		ssotAgentDir: empty,
 		command: async () => HEALTHY,
+		healthProbe: async () => true,
 	});
 	await expect(missing.start()).rejects.toThrow("operator SSOT");
 });
@@ -437,6 +577,7 @@ test("boot reap removes lock tombstones and spawn residue from the private agent
 		instanceId: "instance-reap",
 		ssotAgentDir: null,
 		command: async () => HEALTHY,
+		healthProbe: async () => true,
 		healthIntervalMs: 60_000,
 		isPidAlive: () => false,
 	});

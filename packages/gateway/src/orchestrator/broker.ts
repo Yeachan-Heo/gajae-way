@@ -24,6 +24,10 @@ export interface BrokerRestartBackoff {
 export interface BrokerHealthContext {
 	readonly agentDir: string;
 	readonly cli: CliRunner;
+	/** Endpoint discovery the gjc daemon publishes at `<agentDir>/sdk/broker.json`. */
+	readonly discoveryPath: string;
+	readonly isPidAlive: PidAliveProbe;
+	readonly timeoutMs: number;
 }
 
 export type BrokerHealthProbe = (context: BrokerHealthContext) => boolean | Promise<boolean>;
@@ -129,6 +133,107 @@ export function brokerHealthArgs(): readonly string[] {
 	return ["sdk", "session", "list", "--scope", "cwd"];
 }
 
+/** gjc's own discovery TTL: a heartbeat older than this means the daemon is gone even if the file remains. */
+export const BROKER_HEARTBEAT_TTL_MS = 15_000;
+
+export type BrokerDiscovery = {
+	readonly pid: number;
+	readonly url: string;
+	readonly token: string;
+	readonly heartbeatAt: number;
+};
+
+/**
+ * Parses `<agentDir>/sdk/broker.json` with the same structural rules gjc's own
+ * client applies (discovery.ts readBrokerDiscovery): loopback host, protocol 3,
+ * live pid, fresh heartbeat. Anything else is "no daemon", never an exception.
+ */
+export async function readBrokerDiscovery(
+	discoveryPath: string,
+	isPidAlive: PidAliveProbe,
+	now = Date.now(),
+	ttlMs = BROKER_HEARTBEAT_TTL_MS,
+): Promise<BrokerDiscovery | undefined> {
+	let raw: unknown;
+	try {
+		raw = JSON.parse(await readFile(discoveryPath, "utf8"));
+	} catch {
+		return undefined;
+	}
+	if (typeof raw !== "object" || raw === null) return undefined;
+	const d = raw as Record<string, unknown>;
+	if (
+		d.protocolVersion !== 3 ||
+		d.host !== "127.0.0.1" ||
+		typeof d.url !== "string" ||
+		!d.url.startsWith("ws://127.0.0.1:") ||
+		typeof d.token !== "string" ||
+		d.token.length === 0 ||
+		typeof d.pid !== "number" ||
+		!Number.isSafeInteger(d.pid) ||
+		d.pid <= 0 ||
+		typeof d.heartbeatAt !== "number" ||
+		!Number.isFinite(d.heartbeatAt)
+	)
+		return undefined;
+	if (now - d.heartbeatAt > ttlMs) return undefined;
+	if (!(await isPidAlive(d.pid))) return undefined;
+	return { pid: d.pid, url: d.url, token: d.token, heartbeatAt: d.heartbeatAt };
+}
+
+/**
+ * Credential-bound liveness without a process spawn: connect to the published
+ * endpoint and wait for the daemon's unsolicited `broker_hello`. The transport
+ * rejects a bad token at upgrade (401), so a hello proves the SAME daemon the
+ * discovery file names is accepting authenticated clients. Costs ~1ms; a
+ * `gjc sdk session list` spawn costs ~1s of CPU and stalls under host load.
+ */
+export function probeBrokerEndpoint(discovery: BrokerDiscovery, timeoutMs: number): Promise<boolean> {
+	return new Promise<boolean>((resolve) => {
+		let socket: WebSocket;
+		try {
+			socket = new WebSocket(`${discovery.url}/?token=${encodeURIComponent(discovery.token)}`);
+		} catch {
+			resolve(false);
+			return;
+		}
+		let settled = false;
+		const settle = (value: boolean) => {
+			if (settled) return;
+			settled = true;
+			clearTimeout(timer);
+			resolve(value);
+			try {
+				socket.close();
+			} catch {
+				// best effort: the daemon drops the socket on its own
+			}
+		};
+		const timer = setTimeout(() => settle(false), timeoutMs);
+		socket.addEventListener("message", (event) => {
+			try {
+				const frame = JSON.parse(String(event.data)) as { type?: unknown };
+				if (frame?.type === "broker_hello") settle(true);
+			} catch {
+				// non-JSON noise is not a hello
+			}
+		});
+		socket.addEventListener("error", () => settle(false));
+		socket.addEventListener("close", () => settle(false));
+	});
+}
+
+/**
+ * Default health probe: discovery file + live pid + fresh heartbeat + hello
+ * handshake. No `gjc` process is spawned, so the probe's wall time does not
+ * scale with host load the way a Bun cold start does.
+ */
+export async function probeBrokerDiscovery(context: BrokerHealthContext): Promise<boolean> {
+	const discovery = await readBrokerDiscovery(context.discoveryPath, context.isPidAlive);
+	if (!discovery) return false;
+	return await probeBrokerEndpoint(discovery, context.timeoutMs);
+}
+
 /** A session-list envelope is healthy only when it is a structurally valid `ok` reply. */
 export function isHealthySessionList(result: CliResult): boolean {
 	if (result.exitCode !== 0) return false;
@@ -206,6 +311,8 @@ export class BrokerSupervisor implements PersonaBroker {
 	readonly #restartInitialMs: number;
 	readonly #restartMaxMs: number;
 	readonly #startupStabilizationMs: number;
+	/** Only the default endpoint probe relies on a CLI call to auto-start gjc's daemon. */
+	readonly #spawnsDaemon: boolean;
 	readonly #log: (line: string) => void;
 	readonly #listeners = new Set<BrokerGenerationListener>();
 
@@ -239,11 +346,9 @@ export class BrokerSupervisor implements PersonaBroker {
 		this.#spawn = options.spawn ?? Bun.spawn.bind(Bun);
 		this.#command = options.command ?? ((args, commandOptions) => this.#runCommand(args, commandOptions));
 		this.cli = (args, commandOptions) => this.#command(bindAgentDir(args, this.agentDir), commandOptions);
-		this.#healthProbe =
-			options.healthProbe ??
-			(async ({ cli }) =>
-				isHealthySessionList(await cli([...brokerHealthArgs()], { timeoutMs: this.#healthProbeTimeoutMs })));
+		this.#healthProbe = options.healthProbe ?? probeBrokerDiscovery;
 		this.#startupStabilizationMs = options.healthProbe ? 0 : DEFAULT_STARTUP_STABILIZATION_MS;
+		this.#spawnsDaemon = options.healthProbe === undefined;
 		this.#isPidAlive = options.isPidAlive ?? defaultPidAlive;
 		this.#healthIntervalMs = positiveInteger(options.healthIntervalMs, DEFAULT_HEALTH_INTERVAL_MS, "healthIntervalMs");
 		this.#healthProbeTimeoutMs = positiveInteger(
@@ -490,14 +595,33 @@ export class BrokerSupervisor implements PersonaBroker {
 		}
 	}
 
+	#probeContext(): BrokerHealthContext {
+		return {
+			agentDir: this.agentDir,
+			cli: this.cli,
+			discoveryPath: this.discoveryPath,
+			isPidAlive: this.#isPidAlive,
+			timeoutMs: this.#healthProbeTimeoutMs,
+		};
+	}
+
 	async #awaitHealthy(active: ActiveBroker): Promise<void> {
 		for (let attempt = 0; attempt < this.#readinessAttempts; attempt++) {
 			if (this.#stopping) throw new Error("broker observation stopped during readiness");
 			if (this.#active !== active) throw new Error("broker observation was replaced before readiness completed");
 			try {
-				if (await this.#healthProbe({ agentDir: this.agentDir, cli: this.cli })) {
+				if (await this.#healthProbe(this.#probeContext())) {
 					if (this.#startupStabilizationMs > 0) await sleep(this.#startupStabilizationMs);
 					return;
+				}
+				// The endpoint probe never spawns. gjc auto-starts its daemon on the
+				// first agent-dir-scoped sdk command, so when no live discovery exists
+				// one CLI call is the launch trigger; its envelope is not the health
+				// verdict, the next endpoint probe is.
+				if (this.#spawnsDaemon && !(await readBrokerDiscovery(this.discoveryPath, this.#isPidAlive))) {
+					const launch = await this.cli([...brokerHealthArgs()], { timeoutMs: DEFAULT_COMMAND_TIMEOUT_MS });
+					if (!isHealthySessionList(launch))
+						this.#log(`broker daemon launch command exited ${launch.exitCode} without a session-list envelope`);
 				}
 			} catch (error) {
 				this.#log(`broker health probe during startup failed: ${diagnostic(error)}`);
@@ -525,7 +649,7 @@ export class BrokerSupervisor implements PersonaBroker {
 		this.#healthCheckInFlight = true;
 		let healthy = false;
 		try {
-			healthy = await this.#healthProbe({ agentDir: this.agentDir, cli: this.cli });
+			healthy = await this.#healthProbe(this.#probeContext());
 		} catch (error) {
 			this.#log(`broker health probe failed: ${diagnostic(error)}`);
 		} finally {
