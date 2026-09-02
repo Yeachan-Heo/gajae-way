@@ -336,6 +336,8 @@ type BoundTurn = PersonaTurnIdentity & {
 	tailEvidenceUnavailable: boolean;
 	/** Reconcile passes that saw decidable-terminal status while tail terminal evidence was still absent. */
 	statusTerminalHolds: number;
+	/** Last assistant text observed on the live tail; avoids a transcript round trip at terminal. */
+	lastAssistantText?: string;
 	replaceAfterTerminal: boolean;
 	nonSteerable: boolean;
 };
@@ -351,6 +353,7 @@ class OriginActor {
 	readonly #retired = new Map<string, BoundTurn>();
 	readonly #retiredReattachTimers = new Map<string, unknown>();
 	readonly #graceTimers = new Set<unknown>();
+	readonly #appliedModel = new Map<string, string>();
 	#stopped = false;
 	readonly #deliveredEvents = new Set<string>();
 	#recoveryScanned = false;
@@ -431,6 +434,7 @@ class OriginActor {
 	async rebindModel(selection: GjcModelSelection): Promise<void> {
 		const binding = await this.#ensureSession(this.#epoch());
 		const receipt = await this.#manager.port.setModel({ sessionId: binding.sessionId, repo: this.#manager.repo, selection });
+		this.#appliedModel.set(binding.sessionId, describeModel(selection));
 		this.#manager.log(
 			`persona_model origin=${this.originKey} epoch=${binding.epoch} session=${binding.sessionId} effective=${describeModel(selection)} changed=${receipt.changed} source=/model`,
 		);
@@ -769,13 +773,18 @@ class OriginActor {
 			// Session state, rather than a per-send selector, is authoritative for persona
 			// turns. The optional fallback exists only for an explicitly unsupported SDK
 			// control path and is deliberately absent from normal lifecycle construction.
-			const modelReceipt = lifecycle.effectiveModel
-				? await this.#manager.port.setModel({
-					sessionId: binding.sessionId,
-					repo: this.#manager.repo,
-					selection: lifecycle.effectiveModel,
-				})
-				: undefined;
+			// model.set is a live session property: apply it once per (session,
+			// selection), not on every turn. /model rebinds through rebindModel.
+			const modelKey = describeModel(lifecycle.effectiveModel);
+			const modelReceipt =
+				lifecycle.effectiveModel && this.#appliedModel.get(binding.sessionId) !== modelKey
+					? await this.#manager.port.setModel({
+							sessionId: binding.sessionId,
+							repo: this.#manager.repo,
+							selection: lifecycle.effectiveModel,
+						})
+					: undefined;
+			if (lifecycle.effectiveModel) this.#appliedModel.set(binding.sessionId, modelKey);
 			this.#manager.log(
 				`persona_model origin=${this.originKey} epoch=${epoch} session=${binding.sessionId} effective=${describeModel(lifecycle.effectiveModel)} changed=${modelReceipt?.changed ?? false} source=turn`,
 			);
@@ -933,6 +942,7 @@ class OriginActor {
 		if (bound.retired || retired) {
 			if (frame.assistantText) this.#manager.log(`stale_output origin=${this.originKey} epoch=${epoch} session=${sessionId}`);
 		} else {
+			if (frame.assistantText && !frame.steerEcho) bound.lastAssistantText = frame.assistantText;
 			await bound.lifecycle.onFrame?.({ ...bound, frame });
 			if (!bound.lifecycle.onFrame && frame.assistantText && frame.eventId && !frame.steerEcho) {
 				const key = `${sessionId}:${frame.eventId}`;
@@ -1050,8 +1060,13 @@ class OriginActor {
 		}
 		try {
 			if (!bound.retired && report.status.status === "terminal_ok") {
-				const assistant = await this.#manager.port.fetchLastAssistant({ sessionId: bound.sessionId, repo: this.#manager.repo });
-				await bound.lifecycle.onTerminal?.({ ...bound, text: assistant.text, status: report });
+				// The live tail already carried the finalized answer; only a tail-less
+				// reconcile (post-crash) needs the transcript round trip.
+				const text =
+					bound.tailTerminalObserved && bound.lastAssistantText !== undefined
+						? bound.lastAssistantText
+						: (await this.#manager.port.fetchLastAssistant({ sessionId: bound.sessionId, repo: this.#manager.repo })).text;
+				await bound.lifecycle.onTerminal?.({ ...bound, text, status: report });
 			} else if (!bound.retired) {
 				await bound.lifecycle.onFailure?.({ ...bound, error: terminalError(report), status: report });
 			}
