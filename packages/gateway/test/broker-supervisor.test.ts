@@ -429,3 +429,25 @@ test("start seeds the private agent dir from the operator SSOT and fails loudly 
 	});
 	await expect(missing.start()).rejects.toThrow("operator SSOT");
 });
+
+test("boot reap removes lock tombstones and spawn residue from the private agent dir only", async () => {
+	const home = await temporaryHome("gajaeway-broker-reap-");
+	const broker = new BrokerSupervisor({ home, instanceId: "instance-reap", ssotAgentDir: null, command: async () => HEALTHY, healthIntervalMs: 60_000, isPidAlive: () => false });
+	const sdk = join(broker.agentDir, "sdk");
+	await mkdir(join(sdk, "sessions"), { recursive: true });
+	await mkdir(join(sdk, ".broker.lock.stale-deadbeef"), { recursive: true });
+	await mkdir(join(sdk, "sessions", "index.jsonl.lock.pending.1.x"), { recursive: true });
+	await writeFile(join(sdk, "broker.startup-failure.json"), "{}");
+	await writeFile(join(sdk, "sessions", "index.jsonl"), "");
+	await writeFile(join(sdk, "broker.json"), "{}");
+	try {
+		await broker.start();
+		const names = await readdir(sdk);
+		expect(names).not.toContain(".broker.lock.stale-deadbeef");
+		expect(names).not.toContain("broker.startup-failure.json");
+		expect(names).toContain("broker.json");
+		expect(await readdir(join(sdk, "sessions"))).toEqual(["index.jsonl"]);
+	} finally {
+		await broker.stop();
+	}
+});

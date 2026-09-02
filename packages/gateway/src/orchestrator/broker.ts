@@ -1,4 +1,4 @@
-import { chmod, cp, mkdir, open, readFile, rename, unlink, writeFile } from "node:fs/promises";
+import { chmod, cp, mkdir, open, readdir, readFile, rename, rm, unlink, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import type { CliResult, CliRunner } from "@gajaeway/subsession";
@@ -339,6 +339,7 @@ export class BrokerSupervisor implements PersonaBroker {
 		try {
 			await mkdir(this.agentDir, { recursive: true, mode: 0o700 });
 			await chmod(this.agentDir, 0o700);
+			await reapAgentDir(this.agentDir, this.#log, this.#isPidAlive);
 			if (this.#ssotAgentDir) await seedAgentDirFromSsot(this.#ssotAgentDir, this.agentDir, this.#log);
 			await ensureSteeringDefaults(this.agentDir);
 			await this.#launchGeneration();
@@ -707,6 +708,71 @@ export class BrokerSupervisor implements PersonaBroker {
  * config.yml are left untouched.
  */
 export const STEERING_DEFAULTS: Readonly<Record<string, string>> = { steeringMode: "all", interruptMode: "wait" };
+
+/**
+ * Boot-time reap of everything the previous gateway incarnation left behind in
+ * ITS OWN private agent dir: gjc daemon/host/relay processes bound to that dir
+ * and the lock tombstones a spawn stampede leaves (gajae-code#5198). Nothing
+ * outside the private dir is touched, so the operator's own ~/.gjc/agent
+ * daemon and sessions are never affected. Safe on every restart: sessions are
+ * durable and resume through recovery.
+ */
+export async function reapAgentDir(agentDir: string, log: (line: string) => void, isPidAlive: (pid: number) => boolean | Promise<boolean>): Promise<void> {
+	let killed = 0;
+	try {
+		const ps = Bun.spawnSync(["ps", "-Ao", "pid=,ppid=,args="]);
+		const rows = ps.stdout
+			.toString()
+			.split("\n")
+			.map((line) => line.trim().match(/^(\d+)\s+(\d+)\s+(.*)$/))
+			.filter((m): m is RegExpMatchArray => m !== null)
+			.map((m) => ({ pid: Number(m[1]), ppid: Number(m[2]), args: m[3] ?? "" }));
+		const owned = new Set<number>();
+		for (const row of rows) if (/gjc sdk broker-internal/.test(row.args) && row.args.includes(`--agent-dir ${agentDir}`)) owned.add(row.pid);
+		for (const row of rows)
+			if (/gjc sdk (session-host-internal|serve --stdio|session tail)/.test(row.args) && owned.has(row.ppid)) owned.add(row.pid);
+		for (const pid of owned) {
+			if (pid === process.pid || !(await isPidAlive(pid))) continue;
+			try {
+				process.kill(pid, "SIGTERM");
+				killed++;
+			} catch {
+				// already gone
+			}
+		}
+		if (killed > 0) {
+			await new Promise((resolve) => setTimeout(resolve, 2_000));
+			for (const pid of owned)
+				if (await isPidAlive(pid))
+					try {
+						process.kill(pid, "SIGKILL");
+					} catch {
+						// already gone
+					}
+		}
+	} catch (error) {
+		log(`broker_reap_processes_failed detail=${sanitizeDiagnostic(error instanceof Error ? error.message : String(error))}`);
+	}
+	let tombstones = 0;
+	const sdk = join(agentDir, "sdk");
+	for (const [dir, pattern] of [
+		[sdk, /^\.broker\.lock\.stale-|^broker-spawn\..*\.log$|^broker\.startup-failure\.json$|^broker\.lock$/],
+		[join(sdk, "sessions"), /^index\.jsonl\.lock/],
+	] as const) {
+		let names: string[] = [];
+		try {
+			names = await readdir(dir);
+		} catch {
+			continue;
+		}
+		for (const name of names)
+			if (pattern.test(name)) {
+				await rm(join(dir, name), { recursive: true, force: true });
+				tombstones++;
+			}
+	}
+	if (killed > 0 || tombstones > 0) log(`broker_reaped agentDir=${agentDir} processes=${killed} tombstones=${tombstones}`);
+}
 
 export function defaultSsotAgentDir(): string {
 	const home = process.env.HOME ?? homedir();
