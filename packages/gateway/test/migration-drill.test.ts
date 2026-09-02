@@ -294,27 +294,57 @@ UPDATE inbound_messages SET batch_key = 'batch', batch_role = 'trigger', batch_e
 	}
 });
 
-test("migration 18 adds the pre-send dispatch stamp and the terminal reply slot without touching existing rows", async () => {
+test("migration 18 adds the pre-send dispatch stamp and the terminal reply slot to a genuine schema-17 table", async () => {
 	const directory = await mkdtemp(join(tmpdir(), "gw-migrate-18-"));
 	const path = join(directory, "gateway.db");
 	try {
 		const latest = await GatewayDatabase.open(path);
 		latest.close();
-		// Recreate a deployed schema-17 database: batch columns present, no dispatch/terminal columns.
+		// Rebuild a deployed schema-17 database: the two v18 columns do not exist,
+		// and one accepted batch is live and bound (the shape an upgrade meets).
 		const v17 = new Database(path);
 		v17.exec(`
+ALTER TABLE inbound_messages DROP COLUMN dispatched_at;
+ALTER TABLE inbound_messages DROP COLUMN terminal_delivery_id;
 DELETE FROM schema_migrations WHERE version > 17;
 INSERT INTO inbound_messages (message_id, origin_key, origin_ref_json, body, engagement_json, state, received_at)
 VALUES ('v18-live', 'discord:dm:1', '{}', 'body', NULL, 'pending', '2026-09-02T00:00:00.000Z');
-UPDATE inbound_messages SET batch_key = 'b18', batch_role = 'trigger', batch_epoch = 0, batch_state = 'accepted', attributed_op_ref = 'gw-p-0123456789abcdef0123456789abcdef', bound_session_id = 's-old' WHERE message_id = 'v18-live';
+UPDATE inbound_messages SET batch_key = 'b18', batch_role = 'trigger', batch_epoch = 0, batch_state = 'accepted', attributed_op_ref = 'gw-p-0123456789abcdef0123456789abcdef', accepted_at = '2026-09-02T00:00:01.000Z', bound_session_id = 's-old' WHERE message_id = 'v18-live';
 `);
+		const before = v17
+			.query<{ name: string }, []>("PRAGMA table_info(inbound_messages)")
+			.all()
+			.map((column) => column.name);
+		expect(before).not.toContain("dispatched_at");
+		expect(before).not.toContain("terminal_delivery_id");
+		expect(
+			v17.query<{ version: number }, []>("SELECT MAX(version) AS version FROM schema_migrations").get()?.version,
+		).toBe(17);
 		v17.close();
+
 		const upgraded = await GatewayDatabase.open(path);
 		expect(upgraded.schemaVersion).toBe(18);
+		const after = new Database(path, { readonly: true });
+		const columns = after
+			.query<{ name: string }, []>("PRAGMA table_info(inbound_messages)")
+			.all()
+			.map((column) => column.name);
+		after.close();
+		expect(columns).toContain("dispatched_at");
+		expect(columns).toContain("terminal_delivery_id");
+		// The pre-existing bound row is untouched by the migration.
 		const row = upgraded.inboundBatchRows("b18")[0];
-		expect(row).toMatchObject({ bound_session_id: "s-old", dispatched_at: null, terminal_delivery_id: null });
-		// A pre-migration batch that was ALREADY bound never gets a recovery-time
-		// floor: that stamp could postdate the answer the old daemon wrote.
+		expect(row).toMatchObject({
+			message_id: "v18-live",
+			state: "pending",
+			batch_state: "accepted",
+			accepted_at: "2026-09-02T00:00:01.000Z",
+			bound_session_id: "s-old",
+			dispatched_at: null,
+			terminal_delivery_id: null,
+		});
+		// An already-bound legacy batch never gets a recovery-time floor: that
+		// stamp could postdate the answer the old daemon wrote.
 		expect(upgraded.inboundBatchBindSession("b18", "s-old", "2026-09-02T00:00:05.000Z")).toBe(true);
 		expect(upgraded.inboundBatchDispatchedAt("b18")).toBeUndefined();
 		// A never-bound batch is stamped on its first bind only; a re-bind keeps it.
@@ -329,16 +359,14 @@ UPDATE inbound_messages SET batch_key = 'b18f', batch_role = 'trigger', batch_ep
 		expect(upgraded.inboundBatchDispatchedAt("b18f")).toBe("2026-09-02T00:00:05.000Z");
 		expect(upgraded.inboundBatchBindSession("b18f", "s-new", "2026-09-02T00:01:00.000Z")).toBe(true);
 		expect(upgraded.inboundBatchDispatchedAt("b18f")).toBe("2026-09-02T00:00:05.000Z");
+		// Terminal slots are per part and first-claim wins.
+		expect(upgraded.inboundBatchClaimTerminal("b18f", 0, "gw-t-a")).toBe("gw-t-a");
+		expect(upgraded.inboundBatchClaimTerminal("b18f", 0, "gw-t-b")).toBe("gw-t-a");
+		expect(upgraded.inboundBatchClaimTerminal("b18f", 1, "gw-t-c")).toBe("gw-t-c");
 		// A fresh-turn requeue releases the floor and the terminal claims with the rows.
-		expect(upgraded.inboundBatchClaimTerminal("b18f", 0, "gw-t-x")).toBe("gw-t-x");
 		expect(upgraded.inboundBatchRequeueFreshTurn("b18f")).toBe(1);
 		expect(upgraded.inboundBatchDispatchedAt("b18f")).toBeUndefined();
-		const released = upgraded.inboundBatchRows("b18f");
-		expect(released).toEqual([]);
-		// Terminal slots are per part and first-claim wins.
-		expect(upgraded.inboundBatchClaimTerminal("b18", 0, "gw-t-a")).toBe("gw-t-a");
-		expect(upgraded.inboundBatchClaimTerminal("b18", 0, "gw-t-b")).toBe("gw-t-a");
-		expect(upgraded.inboundBatchClaimTerminal("b18", 1, "gw-t-c")).toBe("gw-t-c");
+		expect(upgraded.inboundBatchRows("b18f")).toEqual([]);
 		upgraded.close();
 	} finally {
 		await rm(directory, { recursive: true, force: true });
