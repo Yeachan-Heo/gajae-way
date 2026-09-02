@@ -50,9 +50,11 @@ export interface SessionPort {
 	status(input: { sessionId: string; repo: string; opRef: string }): Promise<StatusReport>;
 	fetchLastAssistant(input: { sessionId: string; repo: string }): Promise<LastAssistantResult>;
 	/**
-	 * Last assistant row NOT older than `notBeforeMs` (the op's own startedAt).
-	 * Turn-scoped by wall clock, independent of gjc ring coordinates
-	 * (gajae-code#5200); undefined when the newest row predates the turn.
+	 * Last assistant row NOT older than `notBeforeMs`. Callers pass the earlier
+	 * of the batch's durable pre-dispatch settle cutoff and the op's reported
+	 * startedAt, so the floor can never postdate the answer. Turn-scoped by wall
+	 * clock, independent of gjc ring coordinates (gajae-code#5200); undefined
+	 * when the newest row predates the turn.
 	 */
 	fetchAssistantSince?(input: {
 		sessionId: string;

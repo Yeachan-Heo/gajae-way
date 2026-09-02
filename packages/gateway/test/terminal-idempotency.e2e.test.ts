@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { GatewayConfig } from "../src/config";
 import { PersonaSessionManager } from "../src/orchestrator/persona-session";
+import { deterministicTriggerDeliveryId } from "../src/orchestrator/tail-runner";
 import { type GatewayServer, startUnixServer } from "../src/server/server";
 import { GatewayDatabase } from "../src/store/db";
 import { ScriptedSessionPort } from "./session-port.fake";
@@ -150,27 +151,112 @@ test("a batch whose tail was fenced and then reconciled from status invokes onTe
 	}
 });
 
-test("the terminal delivery id is derived from the inbound trigger, so two onTerminal calls collide in the ledger", async () => {
+test("red-team B2: the answer ships on the tail, the gateway restarts, status reconcile re-delivers it -> one ledger row", async () => {
 	const port = new ScriptedSessionPort();
 	const { client } = await startGateway(port);
-	sendChannelMessage(client, "t2", "한 번만");
+	sendChannelMessage(client, "r1", "재시작 전에 답해");
 	await eventually(() => port.sends.length === 1, "turn was not sent");
 	const send = port.sends[0]!;
-	port.complete(send.opRef, "네 한 번만");
-	await eventually(() => messages(client).length === 1, "terminal reply was not delivered");
-	const first = database!.deliveryRows().find((row) => row.origin_key === "discord/channel/chan-1")!;
-	// Same trigger, same text, second attempt: INSERT OR IGNORE keeps one row.
-	const again = runtime_delivery_prepare(first);
-	expect(again).toBe(false);
+	// Finalized answer arrives as a tail transcript row after a tool call and
+	// passes the interim gate: it is delivered NOW under the trigger identity.
+	port.emitTool(send.sessionId);
+	port.emitAssistant(send.sessionId, "재시작해도 한 번만", "evt-final-1", send.opRef);
+	await eventually(() => messages(client).length === 1, "tail answer was not delivered");
+	const before = database!.deliveryRows().filter((row) => row.origin_key === "discord/channel/chan-1");
+	expect(before).toHaveLength(1);
+	expect(before[0]!.delivery_id.startsWith("gw-t-")).toBe(true);
+	// The gateway dies before the batch completes; the daemon finishes the op.
+	const dbPath = join(directory, "gateway.db");
+	await server!.stop();
+	server = undefined;
+	port.seedOperation(send.opRef, send.sessionId, "terminal_ok", "재시작해도 한 번만");
+	// A fresh gateway on the same database recovers the accepted batch with no
+	// lifecycle memory and reconciles it from status + transcript.
+	database = await GatewayDatabase.open(dbPath);
+	const config: GatewayConfig = {
+		schemaVersion: 1,
+		home: directory,
+		configPath: join(directory, "config.json"),
+		socketPath: join(directory, "gateway.sock"),
+		dbPath,
+		logVerbosity: "info",
+		channels: { "chan-1": { engagement: "open" } },
+		settleWindowMs: 0,
+	};
+	server = await startUnixServer({ config, database, sessionPort: port, onStop: () => database?.close() });
+	await eventually(
+		() => database!.inboundNonterminalBatches("discord/channel/chan-1").length === 0,
+		"recovered batch never completed",
+		2_000,
+	);
+	const after = database!.deliveryRows().filter((row) => row.origin_key === "discord/channel/chan-1");
+	expect(after.map((row) => row.delivery_id)).toEqual(before.map((row) => row.delivery_id));
+}, 20_000);
 
-	function runtime_delivery_prepare(row: { delivery_id: string; turn_id: string }): boolean {
-		return database!.deliveryCreate({
-			id: row.delivery_id,
-			turnId: `${row.turn_id}-replay`,
-			originKey: "discord/channel/chan-1",
-			payloadJson: "{}",
-		});
-	}
+test("red-team I2/I5: [BREAK] parts are keyed per part; a regenerated different answer for the same trigger still adds no row", async () => {
+	const port = new ScriptedSessionPort();
+	const { client } = await startGateway(port);
+	sendChannelMessage(client, "b1", "세 조각으로");
+	await eventually(() => port.sends.length === 1, "turn was not sent");
+	const send = port.sends[0]!;
+	port.complete(send.opRef, "하나\n[BREAK]\n둘\n[BREAK]\n셋");
+	await eventually(() => messages(client).length === 3, "three parts were not delivered");
+	const rows = () => database!.deliveryRows().filter((row) => row.origin_key === "discord/channel/chan-1");
+	expect(rows().map((row) => JSON.parse(row.payload_json).text)).toEqual(["하나", "둘", "셋"]);
+	expect(new Set(rows().map((row) => row.delivery_id)).size).toBe(3);
+	// A second terminal for the same trigger with different text: identity is
+	// trigger+text+part, so genuinely new text WOULD get a new id. That is the
+	// documented tradeoff: the ledger guards against replaying the same answer,
+	// not against the model producing a different one for a retried op.
+	const regenerated = deterministicTriggerDeliveryId("discord/channel/chan-1", "m-b1", "다른 답", 0);
+	expect(rows().some((row) => row.delivery_id === regenerated)).toBe(false);
+	// Same text, same part, replayed: no new row.
+	const replay = deterministicTriggerDeliveryId("discord/channel/chan-1", "m-b1", "둘", 1);
+	expect(rows().some((row) => row.delivery_id === replay)).toBe(true);
+	expect(
+		database!.deliveryCreate({ id: replay, turnId: "replay", originKey: "discord/channel/chan-1", payloadJson: "{}" }),
+	).toBe(false);
+});
+
+test("red-team I4: two different id-less interim texts get distinct ids; the same interim text replayed collides", async () => {
+	const port = new ScriptedSessionPort();
+	directory = await mkdtemp(join(tmpdir(), "gajaeway-terminal-interim-"));
+	const config: GatewayConfig = {
+		schemaVersion: 1,
+		home: directory,
+		configPath: join(directory, "config.json"),
+		socketPath: join(directory, "gateway.sock"),
+		dbPath: join(directory, "gateway.db"),
+		logVerbosity: "info",
+		channels: { "chan-1": { engagement: "open" } },
+		settleWindowMs: 0,
+	};
+	database = await GatewayDatabase.open(config.dbPath);
+	server = await startUnixServer({
+		config,
+		database,
+		sessionPort: port,
+		interimSpeech: { minGapMs: 0, maxPerTurn: 5 },
+		onStop: () => database?.close(),
+	});
+	const client = await connect(config.socketPath);
+	client.send({ v: "0.1", type: "hello", payload: { supportedVersions: ["0.1"] } });
+	for (let attempt = 0; attempt < 60 && client.frames.length < 1; attempt++) await Bun.sleep(5);
+	sendChannelMessage(client, "i1", "중간 보고 두 개");
+	await eventually(() => port.sends.length === 1, "turn was not sent");
+	const send = port.sends[0]!;
+	port.emitTool(send.sessionId);
+	// gjc 0.16 synthesizes ids the runner treats as absent; model that with none.
+	port.emitAssistant(send.sessionId, "첫 번째 발견: 500이 3분마다 찍힘", null, send.opRef);
+	port.emitAssistant(send.sessionId, "두 번째 발견: 토큰 갱신이 실패함", null, send.opRef);
+	await eventually(() => messages(client).length === 2, "two interim findings were not delivered");
+	const rows = database!.deliveryRows().filter((row) => row.origin_key === "discord/channel/chan-1");
+	expect(new Set(rows.map((row) => row.delivery_id)).size).toBe(2);
+	// Replaying the first interim text (e.g. after a stream reopen backfill) is a ledger no-op.
+	port.emitAssistant(send.sessionId, "첫 번째 발견: 500이 3분마다 찍힘", null, send.opRef);
+	await Bun.sleep(100);
+	expect(database!.deliveryRows().filter((row) => row.origin_key === "discord/channel/chan-1")).toHaveLength(2);
+	port.complete(send.opRef, "끝");
 });
 
 test("a tail-less reconcile never reposts a previous turn's answer as the current turn's reply", async () => {

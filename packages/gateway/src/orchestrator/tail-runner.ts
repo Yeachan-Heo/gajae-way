@@ -839,16 +839,19 @@ function nonNegativeInteger(value: number | undefined, fallback: number, name: s
 	return result;
 }
 
-/** A stable ledger/delivery identity only when the runtime supplied a stable tail event identity. */
-export function deterministicTailDeliveryId(sessionId: string, eventId: string): string {
-	return `gw-d-${createHash("sha256").update(`${sessionId}|${eventId}`).digest("hex").slice(0, 32)}`;
-}
-
 /**
- * The terminal reply's identity is the durable inbound trigger, never the tail
- * event or the session: one (origin, trigger message, part) posts at most once
- * no matter how many times the batch is reconciled, re-adopted, or replayed.
+ * The durable identity of one delivered part of a persona batch: the inbound
+ * trigger, the part's exact text, and its index. Never the tail event id or the
+ * session: a finalized transcript row that arrives on the tail and the same
+ * answer surfaced later by status reconcile (or by a rebuilt lifecycle after a
+ * gateway restart) must hash to one ledger row.
  */
-export function deterministicTriggerDeliveryId(originKey: string, triggerMessageId: string, part: number): string {
-	return `gw-t-${createHash("sha256").update(`${originKey}|${triggerMessageId}|${part}`).digest("hex").slice(0, 32)}`;
+export function deterministicTriggerDeliveryId(
+	originKey: string,
+	triggerMessageId: string,
+	text: string,
+	part: number,
+): string {
+	const digest = createHash("sha256").update(`${originKey}|${triggerMessageId}|${part}|`).update(text).digest("hex");
+	return `gw-t-${digest.slice(0, 32)}`;
 }

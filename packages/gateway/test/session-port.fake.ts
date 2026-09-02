@@ -222,14 +222,20 @@ export class ScriptedSessionPort implements SessionPort {
 		throw new Error("scripted request did not settle");
 	}
 
-	emitAssistant(sessionId: string, text: string, eventId = `event-${crypto.randomUUID()}`, opRef?: string): void {
+	/** `eventId: null` emits a frame with NO id, as gjc 0.16 does for synthesized/idless rows. */
+	emitAssistant(
+		sessionId: string,
+		text: string,
+		eventId: string | null = `event-${crypto.randomUUID()}`,
+		opRef?: string,
+	): void {
 		const transcript = this.#transcripts.get(sessionId) ?? [];
 		transcript.push(text);
 		this.#transcripts.set(sessionId, transcript);
 		this.#emit(sessionId, {
 			kind: "transcript",
 			rawKind: "transcript",
-			eventId,
+			...(eventId === null ? {} : { eventId }),
 			payload: { role: "assistant", content: [{ text }], ...(opRef ? { opRef } : {}) },
 			assistantText: text,
 			steerEcho: false,

@@ -153,8 +153,17 @@ test("red-team: an unhealthy health flip-flop never consumes or double-publishes
 	}
 });
 
-/** A stand-in for gjc's broker transport: token-gated upgrade, unsolicited broker_hello on open. */
-function fakeBrokerTransport(token: string, options: { hello?: boolean } = {}) {
+/**
+ * A stand-in for gjc's broker transport: token-gated upgrade, unsolicited
+ * broker_hello on open, and a `broker_response` to `session.list`. `router`
+ * models the daemon's session Router: "ok" answers, "error" answers ok:false,
+ * "stall" never answers (accept loop alive, routing wedged).
+ */
+function fakeBrokerTransport(
+	token: string,
+	options: { hello?: boolean; protocolVersion?: number; router?: "ok" | "error" | "stall" } = {},
+) {
+	const requests: unknown[] = [];
 	const server = Bun.serve({
 		hostname: "127.0.0.1",
 		port: 0,
@@ -167,12 +176,27 @@ function fakeBrokerTransport(token: string, options: { hello?: boolean } = {}) {
 		},
 		websocket: {
 			open(socket) {
-				if (options.hello !== false) socket.send(JSON.stringify({ type: "broker_hello", protocolVersion: 3 }));
+				if (options.hello !== false)
+					socket.send(JSON.stringify({ type: "broker_hello", protocolVersion: options.protocolVersion ?? 3 }));
 			},
-			message() {},
+			message(socket, raw) {
+				const frame = JSON.parse(String(raw)) as { id?: string; operation?: string };
+				requests.push(frame);
+				if ((options.router ?? "ok") === "stall") return;
+				if (options.router === "error")
+					socket.send(
+						JSON.stringify({ type: "broker_response", id: frame.id, ok: false, error: { code: "unavailable" } }),
+					);
+				else if (frame.operation === "session.list")
+					socket.send(JSON.stringify({ type: "broker_response", id: frame.id, ok: true, result: { sessions: [] } }));
+				else
+					socket.send(
+						JSON.stringify({ type: "broker_response", id: frame.id, ok: false, error: { code: "unknown_operation" } }),
+					);
+			},
 		},
 	});
-	return { url: `ws://127.0.0.1:${server.port}`, stop: () => server.stop(true) };
+	return { url: `ws://127.0.0.1:${server.port}`, requests, stop: () => server.stop(true) };
 }
 
 async function writeDiscovery(agentDir: string, body: Record<string, unknown>): Promise<string> {
@@ -310,6 +334,168 @@ test("endpoint probe costs milliseconds: 20 sequential probes finish well under 
 		for (let index = 0; index < 20; index++) expect(await probeBrokerDiscovery(context)).toBe(true);
 		expect(performance.now() - started).toBeLessThan(500);
 	} finally {
+		transport.stop();
+	}
+});
+
+test("red-team B1: a daemon that greets but cannot route session.list is unhealthy; one that routes is healthy", async () => {
+	const stalled = fakeBrokerTransport("secret-token", { router: "stall" });
+	const erroring = fakeBrokerTransport("secret-token", { router: "error" });
+	const healthy = fakeBrokerTransport("secret-token");
+	const at = (url: string) => ({ pid: process.pid, url, token: "secret-token", heartbeatAt: Date.now() });
+	try {
+		const started = performance.now();
+		expect(await probeBrokerEndpoint(at(stalled.url), 300)).toBe(false);
+		// A stalled router is detected at the timeout, never earlier and never by hanging.
+		expect(performance.now() - started).toBeGreaterThanOrEqual(290);
+		expect(performance.now() - started).toBeLessThan(1_000);
+		expect(await probeBrokerEndpoint(at(erroring.url), 500)).toBe(false);
+		expect(await probeBrokerEndpoint(at(healthy.url), 500)).toBe(true);
+		// The probe issued a real read-only operation, not just a hello.
+		expect(healthy.requests).toEqual([expect.objectContaining({ type: "broker_request", operation: "session.list" })]);
+		// A hello with the wrong protocol version is not a broker we know how to talk to.
+		const wrongVersion = fakeBrokerTransport("secret-token", { protocolVersion: 2 });
+		try {
+			expect(await probeBrokerEndpoint(at(wrongVersion.url), 500)).toBe(false);
+		} finally {
+			wrongVersion.stop();
+		}
+	} finally {
+		stalled.stop();
+		erroring.stop();
+		healthy.stop();
+	}
+});
+
+test("red-team F4: discovery URL is validated structurally, never by string prefix", async () => {
+	const home = await temporaryHome("gajaeway-broker-url-");
+	const alive = async () => true;
+	const cases: Array<[string, boolean]> = [
+		["ws://127.0.0.1:60232", true],
+		["ws://127.0.0.1:60232/", true],
+		["ws://127.0.0.1:80@evil.example", false],
+		["ws://127.0.0.1:60232/path", false],
+		["ws://127.0.0.1:60232?x=1", false],
+		["ws://127.0.0.1:60232#frag", false],
+		["ws://localhost:60232", false],
+		["wss://127.0.0.1:60232", false],
+		["ws://127.0.0.1", false],
+		["not a url", false],
+	];
+	for (const [url, ok] of cases) {
+		const path = await writeDiscovery(
+			join(home, Bun.hash(url).toString(16)),
+			discoveryBody("ws://127.0.0.1:1", "t", { url }),
+		);
+		expect(await readBrokerDiscovery(path, alive), url).toEqual(ok ? expect.objectContaining({ url }) : undefined);
+	}
+});
+
+test("red-team P2/P5: heartbeat TTL boundary and malformed discovery never throw", async () => {
+	const home = await temporaryHome("gajaeway-broker-ttl-");
+	const alive = async () => true;
+	const now = Date.now();
+	const fresh = await writeDiscovery(
+		join(home, "a"),
+		discoveryBody("ws://127.0.0.1:1", "t", { heartbeatAt: now - 14_999 }),
+	);
+	const stale = await writeDiscovery(
+		join(home, "b"),
+		discoveryBody("ws://127.0.0.1:1", "t", { heartbeatAt: now - 15_001 }),
+	);
+	expect(await readBrokerDiscovery(fresh, alive, now)).toBeDefined();
+	expect(await readBrokerDiscovery(stale, alive, now)).toBeUndefined();
+	await mkdir(join(home, "c", "sdk"), { recursive: true });
+	await writeFile(join(home, "c", "sdk", "broker.json"), "{not json");
+	expect(await readBrokerDiscovery(join(home, "c", "sdk", "broker.json"), alive)).toBeUndefined();
+	await writeFile(join(home, "c", "sdk", "broker.json"), "null");
+	expect(await readBrokerDiscovery(join(home, "c", "sdk", "broker.json"), alive)).toBeUndefined();
+	await writeFile(join(home, "c", "sdk", "broker.json"), JSON.stringify([1, 2]));
+	expect(await readBrokerDiscovery(join(home, "c", "sdk", "broker.json"), alive)).toBeUndefined();
+});
+
+test("red-team P3/P7: a non-hello first frame is rejected, and a live endpoint means zero gjc spawns at readiness", async () => {
+	const home = await temporaryHome("gajaeway-broker-nohello-");
+	// A daemon that speaks first but not with a hello.
+	const rogue = Bun.serve({
+		hostname: "127.0.0.1",
+		port: 0,
+		fetch: (request, srv) => (srv.upgrade(request) ? undefined : new Response("no", { status: 400 })),
+		websocket: {
+			open(socket) {
+				socket.send(JSON.stringify({ type: "broker_response", id: "x", ok: true }));
+				socket.close();
+			},
+			message() {},
+		},
+	});
+	const transport = fakeBrokerTransport("secret-token");
+	let spawned = 0;
+	const broker = new BrokerSupervisor({
+		ssotAgentDir: null,
+		home,
+		instanceId: "instance-no-spawn",
+		command: async () => {
+			spawned++;
+			return HEALTHY;
+		},
+		healthIntervalMs: 60_000,
+		readinessDelayMs: 0,
+	});
+	try {
+		expect(
+			await probeBrokerEndpoint(
+				{ pid: process.pid, url: `ws://127.0.0.1:${rogue.port}`, token: "t", heartbeatAt: Date.now() },
+				500,
+			),
+		).toBe(false);
+		await writeDiscovery(broker.agentDir, discoveryBody(transport.url, "secret-token"));
+		await broker.start();
+		expect(spawned).toBe(0);
+	} finally {
+		await broker.stop();
+		transport.stop();
+		rogue.stop(true);
+	}
+});
+
+test("red-team F6: a timed-out CLI child holds its slot until it has actually exited", async () => {
+	const home = await temporaryHome("gajaeway-broker-timeout-child-");
+	const transport = fakeBrokerTransport("secret-token");
+	let exitChild: (() => void) | undefined;
+	let live = 0;
+	const broker = new BrokerSupervisor({
+		ssotAgentDir: null,
+		home,
+		instanceId: "instance-timeout-child",
+		spawn: (() => {
+			live++;
+			const exited = new Promise<number>((resolve) => {
+				exitChild = () => {
+					live--;
+					resolve(143);
+				};
+			});
+			const never = () => new ReadableStream<Uint8Array>({ start() {} });
+			return { stdout: never(), stderr: never(), exited, kill: () => exitChild?.() } as unknown as ReturnType<
+				typeof Bun.spawn
+			>;
+		}) as unknown as typeof Bun.spawn,
+		healthIntervalMs: 60_000,
+		readinessDelayMs: 0,
+	});
+	try {
+		await writeDiscovery(broker.agentDir, discoveryBody(transport.url, "secret-token"));
+		await broker.start();
+		const started = performance.now();
+		await expect(broker.cli(["sdk", "session", "status", "s", "--repo", home], { timeoutMs: 50 })).rejects.toThrow(
+			"timed out",
+		);
+		// kill() resolved `exited`, so the slot was released only once the child was gone.
+		expect(live).toBe(0);
+		expect(performance.now() - started).toBeGreaterThanOrEqual(45);
+	} finally {
+		await broker.stop();
 		transport.stop();
 	}
 });

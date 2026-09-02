@@ -63,7 +63,7 @@ import {
 } from "../orchestrator/persona-session";
 import { formatFailureNotice, sanitizeDiagnostic } from "../orchestrator/rebind";
 import { type SessionPort, SessionRequestTimeoutError } from "../orchestrator/session-port";
-import { deterministicTailDeliveryId, deterministicTriggerDeliveryId } from "../orchestrator/tail-runner";
+import { deterministicTriggerDeliveryId } from "../orchestrator/tail-runner";
 import { buildSessionBootstrap } from "../persona/bootstrap";
 import { PersonaLoader } from "../persona/persona";
 import type { GatewayDatabase, InboundMessageRow, MonitorEventStage } from "../store/db";
@@ -1612,13 +1612,7 @@ async function createInboundTurnLifecycle(
 	const maxTurnParts = 10;
 	const interimSpeech = new InterimSpeechGate(options.interimSpeech);
 	let lastDeliveredRaw: string | undefined;
-	let interimSequence = 0;
-	const deliverAssistantText = (
-		rawMessage: string,
-		source:
-			| { readonly kind: "tail"; readonly sessionId: string; readonly eventId: string }
-			| { readonly kind: "terminal" },
-	) => {
+	const deliverAssistantText = (rawMessage: string) => {
 		if (!nonLoopback) return;
 		lastDeliveredRaw = rawMessage;
 		let message = rawMessage;
@@ -1670,15 +1664,14 @@ async function createInboundTurnLifecycle(
 		for (let index = 0; index < planned.length; index++) {
 			if (deliveredParts.length >= maxTurnParts) return;
 			const step = planned[index] as { body: string; replyTo?: string };
-			// Interim parts are keyed by the tail event that produced them; the
-			// terminal reply is keyed by the durable inbound trigger, so a second
-			// onTerminal for the same batch (fence -> status reconcile fallback,
-			// recovery re-adoption, retired-turn replay) collides in the ledger
-			// via INSERT OR IGNORE instead of posting the answer twice.
-			const deliveryId =
-				source.kind === "terminal"
-					? deterministicTriggerDeliveryId(key, input.batch.triggerMessageId, index)
-					: deterministicTailDeliveryId(source.sessionId, index === 0 ? source.eventId : `${source.eventId}:${index}`);
+			// Every delivery of this batch is keyed on the durable inbound trigger
+			// and the exact text of the part. A tail frame that carries the
+			// finalized answer and a later onTerminal for the same batch (fence ->
+			// status reconcile, recovery re-adoption, retired replay, gateway
+			// restart) therefore produce the SAME id and collide in the ledger via
+			// INSERT OR IGNORE. Two genuinely different interim texts get two ids;
+			// a replayed id-less interim frame after restart gets its old id back.
+			const deliveryId = deterministicTriggerDeliveryId(key, input.batch.triggerMessageId, step.body, index);
 			const payload = runtime.delivery.prepare(crypto.randomUUID(), origin, step.body, step.replyTo, deliveryId);
 			if (!payload) continue;
 			deliveredParts.push(step.body);
@@ -1741,15 +1734,7 @@ async function createInboundTurnLifecycle(
 			try {
 				const decision = interimSpeech.admit(frame.assistantText, Date.now(), { toolCallsSoFar: lastKnown.toolCalls });
 				if (!decision.deliver) console.error(`gateway mid-work speech suppressed (${turnId}, ${decision.reason}).`);
-				else
-					deliverAssistantText(frame.assistantText, {
-						kind: "tail",
-						sessionId,
-						// gjc 0.16 omits ids on some frames; key those on this turn's own
-						// interim counter so they stay unique within the turn without
-						// ever colliding with another turn's terminal reply.
-						eventId: frame.eventId ?? `${turnId}:interim:${interimSequence++}`,
-					});
+				else deliverAssistantText(frame.assistantText);
 			} catch (error) {
 				console.error(`gateway intermediate delivery failed (${turnId}): ${diagnostic(error)}`);
 			}
@@ -1809,7 +1794,7 @@ async function createInboundTurnLifecycle(
 				return;
 			}
 			const capturedUser = speaker ? `${speaker} @ ${place}: ${userText}` : userText;
-			if (lastDeliveredRaw !== text) deliverAssistantText(text, { kind: "terminal" });
+			if (lastDeliveredRaw !== text) deliverAssistantText(text);
 			if (deliveredParts.length === 0) {
 				if (reactionTokensSeen)
 					runtime.memory.enqueue({

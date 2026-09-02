@@ -41,6 +41,7 @@ export class DeliveryService {
 		return payload;
 	}
 	/**
+	/**
 	 * A reaction is a LEDGER DELIVERY, not a separate class of work.
 	 *
 	 * Justification from this repo's actual delivery path: `delivery.confirm` /

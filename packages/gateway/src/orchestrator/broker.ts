@@ -60,7 +60,7 @@ export interface BrokerSupervisorOptions {
 	readonly spawn?: SpawnFn;
 	/** Command seam used by preflight and CliRunner; production spawns gjc commands directly. */
 	readonly command?: GjcCommandRunner;
-	/** Health seam; production issues an agent-dir-scoped session-list envelope probe. */
+	/** Health seam; production probes the daemon's published WebSocket endpoint (no process spawn). */
 	readonly healthProbe?: BrokerHealthProbe;
 	/** Stale-lock proof seam. */
 	readonly isPidAlive?: PidAliveProbe;
@@ -166,7 +166,7 @@ export async function readBrokerDiscovery(
 		d.protocolVersion !== 3 ||
 		d.host !== "127.0.0.1" ||
 		typeof d.url !== "string" ||
-		!d.url.startsWith("ws://127.0.0.1:") ||
+		!isLoopbackWebSocketUrl(d.url) ||
 		typeof d.token !== "string" ||
 		d.token.length === 0 ||
 		typeof d.pid !== "number" ||
@@ -182,22 +182,55 @@ export async function readBrokerDiscovery(
 }
 
 /**
- * Credential-bound liveness without a process spawn: connect to the published
- * endpoint and wait for the daemon's unsolicited `broker_hello`. The transport
- * rejects a bad token at upgrade (401), so a hello proves the SAME daemon the
- * discovery file names is accepting authenticated clients. Costs ~1ms; a
- * `gjc sdk session list` spawn costs ~1s of CPU and stalls under host load.
+ * Structural loopback check. A string prefix test would accept
+ * `ws://127.0.0.1:80@evil.example` (hostname evil.example) and ship the token
+ * off-host; only a parsed URL with the exact loopback hostname, an explicit
+ * port, no credentials, and no path/query/fragment is a broker endpoint.
+ */
+export function isLoopbackWebSocketUrl(value: string): boolean {
+	let url: URL;
+	try {
+		url = new URL(value);
+	} catch {
+		return false;
+	}
+	return (
+		url.protocol === "ws:" &&
+		url.hostname === "127.0.0.1" &&
+		url.port !== "" &&
+		url.username === "" &&
+		url.password === "" &&
+		(url.pathname === "" || url.pathname === "/") &&
+		url.search === "" &&
+		url.hash === ""
+	);
+}
+
+/** The request the probe sends over the authenticated socket; a real read-only broker operation, not just a hello. */
+const PROBE_REQUEST_ID = "gajaeway-health";
+
+/**
+ * Credential-bound liveness AND request-path readiness without a process
+ * spawn: connect to the published endpoint, require the daemon's protocol-3
+ * `broker_hello`, then issue `session.list` (the same read-only operation the
+ * CLI probe used) and require a well-formed `broker_response` for it. A
+ * daemon whose accept/auth loop is alive but whose session Router is wedged
+ * answers the hello and then fails or stalls the request; that is unhealthy.
+ * Costs ~1ms end to end; a `gjc sdk session list` spawn costs ~1s of CPU.
  */
 export function probeBrokerEndpoint(discovery: BrokerDiscovery, timeoutMs: number): Promise<boolean> {
 	return new Promise<boolean>((resolve) => {
 		let socket: WebSocket;
 		try {
-			socket = new WebSocket(`${discovery.url}/?token=${encodeURIComponent(discovery.token)}`);
+			const url = new URL(discovery.url);
+			url.searchParams.set("token", discovery.token);
+			socket = new WebSocket(url);
 		} catch {
 			resolve(false);
 			return;
 		}
 		let settled = false;
+		let greeted = false;
 		const settle = (value: boolean) => {
 			if (settled) return;
 			settled = true;
@@ -211,12 +244,40 @@ export function probeBrokerEndpoint(discovery: BrokerDiscovery, timeoutMs: numbe
 		};
 		const timer = setTimeout(() => settle(false), timeoutMs);
 		socket.addEventListener("message", (event) => {
+			let frame: Record<string, unknown>;
 			try {
-				const frame = JSON.parse(String(event.data)) as { type?: unknown };
-				if (frame?.type === "broker_hello") settle(true);
+				const parsed: unknown = JSON.parse(String(event.data));
+				if (typeof parsed !== "object" || parsed === null) return settle(false);
+				frame = parsed as Record<string, unknown>;
 			} catch {
-				// non-JSON noise is not a hello
+				return settle(false);
 			}
+			if (!greeted) {
+				if (frame.type !== "broker_hello" || frame.protocolVersion !== 3) return settle(false);
+				greeted = true;
+				try {
+					socket.send(
+						JSON.stringify({
+							type: "broker_request",
+							id: PROBE_REQUEST_ID,
+							operation: "session.list",
+							input: { limit: 1 },
+						}),
+					);
+				} catch {
+					settle(false);
+				}
+				return;
+			}
+			if (frame.type !== "broker_response" || frame.id !== PROBE_REQUEST_ID) return settle(false);
+			// The same structural rule the CLI probe applied: a session-list result carries `sessions[]`.
+			const result = frame.result;
+			settle(
+				frame.ok === true &&
+					typeof result === "object" &&
+					result !== null &&
+					Array.isArray((result as Record<string, unknown>)[SESSION_LIST_MARKER]),
+			);
 		});
 		socket.addEventListener("error", () => settle(false));
 		socket.addEventListener("close", () => settle(false));
@@ -225,8 +286,8 @@ export function probeBrokerEndpoint(discovery: BrokerDiscovery, timeoutMs: numbe
 
 /**
  * Default health probe: discovery file + live pid + fresh heartbeat + hello
- * handshake. No `gjc` process is spawned, so the probe's wall time does not
- * scale with host load the way a Bun cold start does.
+ * + a real read-only broker request. No `gjc` process is spawned, so the
+ * probe's wall time does not scale with host load the way a Bun cold start does.
  */
 export async function probeBrokerDiscovery(context: BrokerHealthContext): Promise<boolean> {
 	const discovery = await readBrokerDiscovery(context.discoveryPath, context.isPidAlive);
@@ -573,7 +634,7 @@ export class BrokerSupervisor implements PersonaBroker {
 		}
 	}
 
-	/** A generation begins when the agent-dir daemon is observed healthy; the first probe auto-starts it. */
+	/** A generation begins when the agent-dir daemon is observed healthy; readiness launches it via one CLI call only when no live endpoint is published. */
 	async #launchGeneration(): Promise<void> {
 		this.#launching = true;
 		const active: ActiveBroker = { generation: this.#generation + 1 };
@@ -727,7 +788,9 @@ export class BrokerSupervisor implements PersonaBroker {
 		});
 		// The host gates tool_activity frames behind a client-declared capability
 		// (CAP_GATED_FRAME_KINDS); without this the live stream only carries
-		// activity/agent_* and chat.progress tool/token counters go stale.
+		// activity/agent_* and chat.progress tool counts go stale. Measured on gjc
+		// 0.16.0: the stream carries no token counters at all, so output-token
+		// figures in chat.progress are estimated from finalized text length.
 		try {
 			const stdin = child.stdin as { write(chunk: string): unknown; flush?(): void } | undefined;
 			stdin?.write(`${JSON.stringify({ type: "event_replay", capabilities: ["tool_activity_v2"] })}\n`);
@@ -1011,6 +1074,9 @@ function brokerEnvironment(agentDir: string): Record<string, string> {
 		GJC_CODING_AGENT_DIR: agentDir,
 	} as Record<string, string>;
 }
+/** Bounded wait for a killed child so a released CLI slot never overlaps a still-running process. */
+const KILL_GRACE_MS = 2_000;
+
 async function collectCommand(child: ReturnType<typeof Bun.spawn>, timeoutMs: number): Promise<CliResult> {
 	let timer: ReturnType<typeof setTimeout> | undefined;
 	try {
@@ -1021,13 +1087,21 @@ async function collectCommand(child: ReturnType<typeof Bun.spawn>, timeoutMs: nu
 				child.exited,
 			]),
 			new Promise<never>((_, reject) => {
-				timer = setTimeout(() => {
-					child.kill();
-					reject(new Error(`gjc command timed out after ${timeoutMs}ms`));
-				}, timeoutMs);
+				timer = setTimeout(() => reject(new Error(`gjc command timed out after ${timeoutMs}ms`)), timeoutMs);
 			}),
 		]);
 		return { stdout: result[0], stderr: result[1], exitCode: result[2] };
+	} catch (error) {
+		// The slot is released only after the child is gone: TERM, then KILL if it
+		// lingers. Otherwise a probe/launch that timed out under load keeps running
+		// beside its replacement and the single-flight lane means nothing.
+		child.kill();
+		const exited = await Promise.race([child.exited.then(() => true), sleep(KILL_GRACE_MS).then(() => false)]);
+		if (!exited) {
+			child.kill("SIGKILL");
+			await Promise.race([child.exited, sleep(KILL_GRACE_MS)]);
+		}
+		throw error;
 	} finally {
 		if (timer) clearTimeout(timer);
 	}
