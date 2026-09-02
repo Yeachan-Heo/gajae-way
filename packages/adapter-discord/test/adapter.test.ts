@@ -2,7 +2,7 @@ import { expect, test } from "bun:test";
 import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import type { ChatMessagePayload } from "@gajaeway/protocol";
+import type { ChatMessagePayload, ChatProgressPayload } from "@gajaeway/protocol";
 import { DiscordAdapterStartupError, loadDiscordAdapterConfig } from "../src/config";
 import {
 	chunkDiscordMessage,
@@ -13,6 +13,7 @@ import {
 	LruSet,
 	settleDiscordDelivery,
 	subscribeDiscordDeliveries,
+	subscribeDiscordProgress,
 	TypingIndicator,
 	WorkingStatus,
 } from "../src/main";
@@ -206,6 +207,39 @@ test("typing indicator pulses while a turn runs and stops when the delivery sett
 	const settled = typingCount;
 	await Bun.sleep(25);
 	expect(typingCount).toBe(settled);
+});
+
+test("a final progress event ends the typing hint even when the turn delivered nothing", async () => {
+	let typingCount = 0;
+	const discord: DiscordClientLike = {
+		channels: { fetch: async () => ({ send: async () => {}, sendTyping: async () => void typingCount++ }) },
+	};
+	const typing = new TypingIndicator(discord, 5, 10_000, { error: () => {} });
+	let emit: ((progress: ChatProgressPayload) => void) | undefined;
+	const gateway: GatewayClientLike = {
+		request: async <T>() => ({}) as T,
+		onChatMessage: () => () => {},
+		onChatProgress: (handler) => {
+			emit = handler;
+			return () => {};
+		},
+	};
+	const cleared: string[] = [];
+	subscribeDiscordProgress(
+		gateway,
+		{ update: async () => {}, clear: async (conversationId) => void cleared.push(conversationId) },
+		{ error: () => {} },
+		typing,
+	);
+	typing.begin("channel-1");
+	await Bun.sleep(20);
+	expect(typingCount).toBeGreaterThanOrEqual(2);
+	// Silent turn: no delivery ever arrives, only the final progress frame.
+	emit?.({ turnId: "turn-1", origin: { platform: "discord", kind: "channel", conversationId: "channel-1" }, final: true, elapsedMs: 1, toolCalls: 0, outputTokens: 0 });
+	const settled = typingCount;
+	await Bun.sleep(25);
+	expect(typingCount).toBe(settled);
+	expect(cleared).toEqual(["channel-1"]);
 });
 
 test("typing indicator stops at its deadline and on channels without sendTyping", async () => {

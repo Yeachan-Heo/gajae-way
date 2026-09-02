@@ -573,13 +573,17 @@ export function subscribeDiscordProgress(
 	// testing without a Discord client, and the private message cache is irrelevant here.
 	status: Pick<WorkingStatus, "update" | "clear">,
 	log: Pick<Console, "error"> = console,
+	typing?: TypingPort,
 ): () => void {
 	if (!gateway.onChatProgress) return () => {};
 	return gateway.onChatProgress((progress) => {
 		// `final` means the turn stopped working. It arrives even when the turn
 		// delivered nothing - a silence token in an open channel - which is the only
 		// signal that the temporary status must go. Clearing on delivery alone left
-		// one orphaned "working" message per suppressed turn.
+		// one orphaned "working" message per suppressed turn, and the typing hint
+		// (begun on engagement, ended only by a delivery) "typing…" for its full
+		// 330s cap after every silent turn (집가재, 2026-09-02).
+		if (progress.final) typing?.end(progress.origin.conversationId);
 		const action = progress.final ? status.clear(progress.origin.conversationId) : status.update(progress);
 		void action.catch((error) =>
 			log.error(
@@ -838,7 +842,7 @@ export class ReconnectingGateway {
 				this.speech,
 			);
 			this.#progressOff?.();
-			this.#progressOff = this.status ? subscribeDiscordProgress(client, this.status) : undefined;
+			this.#progressOff = this.status ? subscribeDiscordProgress(client, this.status, console, this.typing) : undefined;
 			console.log("Discord adapter connected to gateway.");
 			this.monitor(client);
 			void this.recoverMissedMessages();
