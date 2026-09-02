@@ -569,6 +569,16 @@ export class BrokerSupervisor implements PersonaBroker {
 			stderr: "ignore",
 			env: brokerEnvironment(this.agentDir),
 		});
+		// The host gates tool_activity frames behind a client-declared capability
+		// (CAP_GATED_FRAME_KINDS); without this the live stream only carries
+		// activity/agent_* and chat.progress tool/token counters go stale.
+		try {
+			const stdin = child.stdin as { write(chunk: string): unknown; flush?(): void } | undefined;
+			stdin?.write(`${JSON.stringify({ type: "event_replay", capabilities: ["tool_activity_v2"] })}\n`);
+			stdin?.flush?.();
+		} catch {
+			// best effort: the stream still carries lifecycle frames
+		}
 		let closed = false;
 		const close = () => {
 			if (closed) return;

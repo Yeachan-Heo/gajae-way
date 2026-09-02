@@ -3,7 +3,7 @@ import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { DiscordInboundMessage } from "../src/main";
-import { decideInbound, LruSet, ReconnectingGateway } from "../src/main";
+import { decideInbound, LruSet, monitorFailureDecision, ReconnectingGateway } from "../src/main";
 import {
 	classifyRecoveryFailure,
 	loadRecoveryCursors,
@@ -1098,4 +1098,10 @@ test("a channel that lost access marks the pass incomplete and leaves its cursor
 	expect(state.recoveredThrough["channel-gone"]).toBeUndefined();
 	expect(state.quarantined["channel-gone"]).toBeUndefined();
 	expect(gateway.recoveryRetryPending).toBe(true);
+});
+
+test("gateway liveness monitor reconnects only after three consecutive status failures", () => {
+	expect(monitorFailureDecision(0)).toEqual({ action: "retry", strikes: 1 });
+	expect(monitorFailureDecision(1)).toEqual({ action: "retry", strikes: 2 });
+	expect(monitorFailureDecision(2)).toEqual({ action: "reconnect" });
 });

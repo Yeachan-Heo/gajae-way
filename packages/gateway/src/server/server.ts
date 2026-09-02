@@ -1647,7 +1647,7 @@ async function createInboundTurnLifecycle(
 			toolCalls:
 				typeof reportedTools === "number" && Number.isFinite(reportedTools)
 					? Math.max(lastKnown.toolCalls, reportedTools)
-					: /tool/i.test(frame.rawKind)
+					: frame.payload.toolCallStarted === true || (/tool/i.test(frame.rawKind) && frame.rawKind !== "tool_activity")
 						? lastKnown.toolCalls + 1
 						: lastKnown.toolCalls,
 			outputTokens:

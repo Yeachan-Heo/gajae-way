@@ -76,6 +76,20 @@ export function createReactionPorts(): DiscordReactionPorts {
 	return { resolver: new GuildEmojiResolver(), limiter: new ReactionRateLimiter() };
 }
 
+/** Gateway liveness probe cadence; three consecutive failures reconnect. */
+const MONITOR_INTERVAL_MS = 30_000;
+const MONITOR_RETRY_MS = 5_000;
+const MONITOR_STRIKES = 3;
+
+/**
+ * A single slow/failed status probe (gateway busy under load) must not tear
+ * down a healthy link and its delivery subscription: only a sustained failure
+ * (MONITOR_STRIKES consecutive) reconnects. A closed socket is still detected
+ * immediately through the client's own close path.
+ */
+export function monitorFailureDecision(strikes: number): { action: "retry"; strikes: number } | { action: "reconnect" } {
+	return strikes + 1 >= MONITOR_STRIKES ? { action: "reconnect" } : { action: "retry", strikes: strikes + 1 };
+}
 const DISCORD_MESSAGE_LIMIT = 2_000;
 // Discord clears the typing hint after ~10s, so refresh inside that window while a turn is running.
 const TYPING_REFRESH_MS = 7_000;
@@ -1282,14 +1296,18 @@ export class ReconnectingGateway {
 		};
 	}
 
-	private monitor(client: GajaewayClient): void {
+	private monitor(client: GajaewayClient, strikes = 0): void {
 		setTimeout(() => {
 			if (this.#client !== client) return;
 			void client.request("gateway.status").then(
-				() => this.monitor(client),
-				() => this.scheduleReconnect(),
+				() => this.monitor(client, 0),
+				() => {
+					const next = monitorFailureDecision(strikes);
+					if (next.action === "reconnect") this.scheduleReconnect();
+					else this.monitor(client, next.strikes);
+				},
 			);
-		}, 30_000);
+		}, strikes === 0 ? MONITOR_INTERVAL_MS : MONITOR_RETRY_MS);
 	}
 
 	private scheduleReconnect(): void {
