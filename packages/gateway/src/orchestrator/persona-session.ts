@@ -484,7 +484,12 @@ class OriginActor {
 		this.#recoveryScanned = true;
 		for (const batch of this.#manager.database.inboundNonterminalBatches(this.originKey)) {
 			if (this.#current?.batch.batchKey === batch.batchKey || this.#retired.has(retiredKey({ epoch: batch.epoch, batch }))) continue;
-			await this.#recoverBatch(batch);
+			try {
+				await this.#recoverBatch(batch);
+			} catch (error) {
+				// One unrecoverable batch must not abort recovery of the others.
+				this.#manager.log(`recovery_batch_failed origin=${this.originKey} epoch=${batch.epoch} opRef=${batch.opRef} detail=${safeDiagnostic(error)}`);
+			}
 		}
 		if (!this.#current) await this.#armSettle();
 	}

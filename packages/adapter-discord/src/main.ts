@@ -80,6 +80,8 @@ export function createReactionPorts(): DiscordReactionPorts {
 const MONITOR_INTERVAL_MS = 30_000;
 const MONITOR_RETRY_MS = 5_000;
 const MONITOR_STRIKES = 3;
+/** Working-status without a progress tick for this long is stale (gateway ticks every 15s). */
+const WORKING_STATUS_STALE_MS = 90_000;
 
 /**
  * A single slow/failed status probe (gateway busy under load) must not tear
@@ -432,15 +434,33 @@ export class WorkingStatus {
 	readonly #discord: DiscordClientLike;
 	readonly #log: Pick<Console, "error">;
 	readonly #messages = new Map<string, EditableDiscordMessage | "pending">();
+	readonly #staleTimers = new Map<string, ReturnType<typeof setTimeout>>();
 
 	constructor(discord: DiscordClientLike, log: Pick<Console, "error"> = console) {
 		this.#discord = discord;
 		this.#log = log;
 	}
 
+	/**
+	 * A status that stops receiving progress (the turn wedged into a recovery
+	 * hold, or the gateway died) must not outlive the turn: after
+	 * WORKING_STATUS_STALE_MS without a tick it is removed.
+	 */
+	#armStale(conversationId: string): void {
+		const prior = this.#staleTimers.get(conversationId);
+		if (prior) clearTimeout(prior);
+		const timer = setTimeout(() => {
+			this.#staleTimers.delete(conversationId);
+			void this.clear(conversationId);
+		}, WORKING_STATUS_STALE_MS);
+		timer.unref?.();
+		this.#staleTimers.set(conversationId, timer);
+	}
+
 	async update(progress: ChatProgressPayload): Promise<void> {
 		if (progress.origin.platform !== "discord") return;
 		const conversationId = progress.origin.conversationId;
+		this.#armStale(conversationId);
 		const text = `⏳ working… (${formatElapsed(progress.elapsedMs)}, ${progress.toolCalls} tool${progress.toolCalls === 1 ? "" : "s"}, ${formatTokens(progress.outputTokens)})`;
 		const existing = this.#messages.get(conversationId);
 		if (existing === "pending") return; // a send is already in flight; next tick edits
@@ -473,6 +493,9 @@ export class WorkingStatus {
 	}
 
 	async clear(conversationId: string): Promise<void> {
+		const timer = this.#staleTimers.get(conversationId);
+		if (timer) clearTimeout(timer);
+		this.#staleTimers.delete(conversationId);
 		const existing = this.#messages.get(conversationId);
 		this.#messages.delete(conversationId);
 		if (!existing || existing === "pending") return;

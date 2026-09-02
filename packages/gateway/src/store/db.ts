@@ -692,7 +692,11 @@ export class GatewayDatabase {
 			const rows = this.inboundBatchRows(batchKey);
 			const trigger = rows.find((row) => row.batch_role === "trigger");
 			if (!trigger || trigger.batch_epoch === null) throw new Error(`batch ${batchKey} has no retryable trigger`);
-			if (rows.some((row) => row.state !== "pending" || !["settled", "accepted"].includes(row.batch_state ?? "")))
+			// Steer rows complete the moment they are delivered into the running turn;
+			// a released batch re-fires its trigger/members only, so delivered steers
+			// (state done) never block the release.
+			const live = rows.filter((row) => row.batch_role !== "steer");
+			if (live.some((row) => row.state !== "pending" || !["settled", "accepted"].includes(row.batch_state ?? "")))
 				throw new Error(`batch ${batchKey} cannot be requeued from its current lifecycle state`);
 			const key = freshTurnMetaKey(trigger.origin_key, trigger.batch_epoch, trigger.message_id);
 			const prior = Number.parseInt(this.metaGet(key) ?? "0", 10);
