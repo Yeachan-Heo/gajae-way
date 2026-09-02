@@ -26,9 +26,10 @@ const rows = db
 
 const byChannel = new Map<string, Array<{ text: string; at: string; turnId: string }>>();
 for (const row of rows) {
-	const payload = JSON.parse(row.payload_json) as { origin?: { conversationId?: string }; text?: string };
+	const payload = JSON.parse(row.payload_json) as { origin?: { conversationId?: string }; text?: string; reaction?: unknown };
 	const conversationId = payload.origin?.conversationId;
-	if (!conversationId || typeof payload.text !== "string") continue;
+	// Reactions are emoji on an existing message, not a message; skip them.
+	if (!conversationId || typeof payload.text !== "string" || payload.reaction !== undefined) continue;
 	const list = byChannel.get(conversationId) ?? [];
 	list.push({ text: payload.text, at: row.created_at, turnId: row.turn_id });
 	byChannel.set(conversationId, list);
