@@ -539,7 +539,8 @@ test("/restart is owner-only and triggers an ordered gateway stop after acknowle
 	const database = await GatewayDatabase.open(config.dbPath);
 	const sessionPort = sessionPortFromResponder({ respond: async () => "unused" });
 	const stops: string[] = [];
-	server = await startUnixServer({ config, database, sessionPort, onStop: () => { stops.push("stopped"); database.close(); } });
+	const exits: number[] = [];
+	server = await startUnixServer({ config, database, sessionPort, exitProcess: (code) => exits.push(code), onStop: () => { stops.push("stopped"); database.close(); } });
 	const client = await connect(config.socketPath);
 	client.send({ v: "0.1", type: "hello", payload: { supportedVersions: ["0.1"] } });
 	await waitFor(client.frames, 1);
@@ -555,6 +556,8 @@ test("/restart is owner-only and triggers an ordered gateway stop after acknowle
 	expect(client.frames.find((f: any) => f.id === "r2")?.result.engaged).toBe(true);
 	for (let attempt = 0; attempt < 400 && stops.length === 0; attempt++) await Bun.sleep(10);
 	expect(stops).toEqual(["stopped"]);
+	for (let attempt = 0; attempt < 100 && exits.length === 0; attempt++) await Bun.sleep(10);
+	expect(exits).toEqual([75]);
 	client.close();
 	server = undefined;
 });
