@@ -275,6 +275,8 @@ interface Runtime {
 	readonly persona: PersonaLoader;
 	readonly sessionPort: SessionPort;
 	readonly personaSessions: PersonaSessionManager;
+	/** Ordered shutdown, wired after construction; owner `/restart` uses it. */
+	stop?: (reason?: string) => Promise<void>;
 	readonly connections: Set<Connection>;
 	readonly memory: MemoryClosureQueue;
 	readonly registry: MonitorRegistry;
@@ -348,6 +350,7 @@ export async function startUnixServer(options: GatewayServerOptions): Promise<Ga
 		})();
 		return stopPromise;
 	};
+	runtime.stop = stop;
 	listener = Bun.listen<{ connection: Connection; writer: OrderedFrameWriter }>({
 		unix: options.config.socketPath,
 		socket: {
@@ -446,6 +449,7 @@ export function startStdioServer(options: GatewayServerOptions): GatewayServer {
 		})();
 		return stopPromise;
 	};
+	runtime.stop = stop;
 	process.stdin.on("data", (data: Buffer) => {
 		try {
 			for (const frame of connection.decoder.feed(data.toString())) {
@@ -1314,6 +1318,32 @@ async function sendChat(
 		}
 		return;
 	}
+	if (params.text === "/restart") {
+		// Owner-only: restarts the gateway process. The supervisor (launchd
+		// KeepAlive / systemd Restart=always) brings it back; sessions are durable
+		// and resume through recovery, so the persona keeps its transcript.
+		const owner = ownerPeerIdOf(runtime.config);
+		const authorId = (params.engagement as { authorId?: string } | undefined)?.authorId;
+		if (!commandAuthorised(origin, runtime.config, params.engagement) || owner === undefined || authorId !== owner) {
+			connection.write({ v: PROFILE_VERSION, type: "response", id: request.id, result: { turnId: null, engaged: false } });
+			return;
+		}
+		const payload = { turnId: crypto.randomUUID(), origin, role: "assistant" as const, text: "Restarting the gateway; back in a few seconds.", final: true };
+		connection.write({ v: PROFILE_VERSION, type: "response", id: request.id, result: { turnId: payload.turnId, engaged: true } });
+		if (origin.platform === "loopback") connection.write({ v: PROFILE_VERSION, type: "event", event: "chat.message", id: request.id, payload });
+		else {
+			const delivery = runtime.delivery.prepare(payload.turnId, origin, payload.text);
+			if (delivery) {
+				runtime.delivery.markInflight(delivery.deliveryId as string);
+				for (const recipient of runtime.connections)
+					if (recipient.negotiated) recipient.write({ v: PROFILE_VERSION, type: "event", event: "chat.message", payload: delivery });
+			}
+		}
+		console.error(`gateway restart requested by owner via ${key}`);
+		// Let the ack leave the socket, then exit cleanly; the supervisor restarts us.
+		setTimeout(() => void runtime.stop?.("owner /restart"), 1_500);
+		return;
+	}
 	if (params.text === "/new" || params.text === "/reset") {
 		// Session resets are privileged control paths: an unauthorized DM must not
 		// erase the caller's session merely because commands bypass normal dispatch.
@@ -1612,8 +1642,29 @@ async function createInboundTurnLifecycle(
 		for (const recipient of runtime.connections)
 			if (recipient.negotiated) recipient.write({ v: PROFILE_VERSION, type: "event", event: "chat.progress", payload });
 	};
+	// Session-cumulative counters at turn start; progress reports the delta for THIS turn.
+	let baseline: { toolCalls: number; outputTokens: number } | undefined;
+	let polling = false;
+	const pollProgress = async () => {
+		if (polling || !options.sessionPort.progress) return;
+		polling = true;
+		try {
+			const snapshot = await options.sessionPort.progress({ sessionId: input.sessionId, repo: join(options.config.home, "workspace") });
+			if (!snapshot) return;
+			baseline ??= snapshot;
+			lastKnown = {
+				toolCalls: Math.max(lastKnown.toolCalls, snapshot.toolCalls - baseline.toolCalls),
+				outputTokens: Math.max(lastKnown.outputTokens, snapshot.outputTokens - baseline.outputTokens),
+			};
+		} finally {
+			polling = false;
+		}
+	};
+	void pollProgress();
 	const heartbeat = setInterval(() => {
-		if (tailActivitySeen) emitProgress(lastKnown);
+		void pollProgress().then(() => {
+			if (tailActivitySeen) emitProgress(lastKnown);
+		});
 	}, intervalMs);
 	const endProgress = () => {
 		if (ended) return;
@@ -1883,6 +1934,11 @@ function writeError(connection: Connection, error: unknown, id?: string): void {
  * DM policy, owner identity, allowlist, and group gates apply before `/new`,
  * `/reset`, or `/model` can mutate persistent session state.
  */
+function ownerPeerIdOf(config: GatewayConfig): string | undefined {
+	const owner = config.ownerTarget?.origin;
+	return owner && "peerId" in owner ? (owner as { peerId?: string }).peerId : undefined;
+}
+
 function commandAuthorised(
 	origin: { readonly platform: string; readonly kind: string; readonly conversationId: string },
 	config: GatewayConfig,

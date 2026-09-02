@@ -524,6 +524,41 @@ test("a backlog older than maxInboundAgeMs is expired on boot recovery instead o
 	}
 });
 
+test("/restart is owner-only and triggers an ordered gateway stop after acknowledging", async () => {
+	directory = await mkdtemp(join(tmpdir(), "gajaeway-server-"));
+	const config: GatewayConfig = {
+		schemaVersion: 1,
+		home: directory,
+		configPath: join(directory, "config.json"),
+		socketPath: join(directory, "gateway.sock"),
+		dbPath: join(directory, "gateway.db"),
+		logVerbosity: "info",
+		dmPolicy: "open" as const,
+		ownerTarget: { origin: { platform: "discord", kind: "dm", conversationId: "d-owner", peerId: "owner" } },
+	};
+	const database = await GatewayDatabase.open(config.dbPath);
+	const sessionPort = sessionPortFromResponder({ respond: async () => "unused" });
+	const stops: string[] = [];
+	server = await startUnixServer({ config, database, sessionPort, onStop: () => { stops.push("stopped"); database.close(); } });
+	const client = await connect(config.socketPath);
+	client.send({ v: "0.1", type: "hello", payload: { supportedVersions: ["0.1"] } });
+	await waitFor(client.frames, 1);
+	const origin = { platform: "discord", kind: "dm", conversationId: "d-owner", peerId: "owner" };
+	// A non-owner is refused.
+	client.send({ v: "0.1", type: "request", id: "r1", verb: "chat.send", params: { origin, text: "/restart", engagement: { mentioned: false, group: false, authorId: "stranger" } } });
+	await waitFor(client.frames, 2);
+	expect(client.frames.find((f: any) => f.id === "r1")?.result).toEqual({ turnId: null, engaged: false });
+	expect(stops).toEqual([]);
+	// The owner gets an ack and the gateway stops shortly after.
+	client.send({ v: "0.1", type: "request", id: "r2", verb: "chat.send", params: { origin, text: "/restart", engagement: { mentioned: false, group: false, authorId: "owner" } } });
+	await waitFor(client.frames, 3);
+	expect(client.frames.find((f: any) => f.id === "r2")?.result.engaged).toBe(true);
+	for (let attempt = 0; attempt < 400 && stops.length === 0; attempt++) await Bun.sleep(10);
+	expect(stops).toEqual(["stopped"]);
+	client.close();
+	server = undefined;
+});
+
 test("group turns carry silence guidance: listeners are told to default to [SILENT]", async () => {
 	directory = await mkdtemp(join(tmpdir(), "gajaeway-server-"));
 	const config: GatewayConfig = {

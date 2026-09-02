@@ -737,6 +737,7 @@ export async function startDiscordAdapter(config: LoadedDiscordAdapterConfig): P
 			.set([
 				{ name: "new", description: "Start a fresh persona session in this conversation" },
 				{ name: "reset", description: "Reset this conversation's persona session" },
+				{ name: "restart", description: "Restart the gateway process (owner only)" },
 			])
 			.catch((error: unknown) =>
 				console.error(
