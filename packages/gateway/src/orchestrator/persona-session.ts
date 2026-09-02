@@ -669,7 +669,11 @@ class OriginActor {
 				// transient index lag never triggers a duplicate.
 				const count = (this.#holdSweeps.get(batch.opRef) ?? 0) + 1;
 				this.#holdSweeps.set(batch.opRef, count);
-				const liveIdle = status.status.status === "unknown" && raw?.live === true && !retired;
+				// Only a SETTLED (never sent) batch may be released on a live session. An
+				// ACCEPTED op on a live session is held until its terminal arrives: the
+				// runtime answering "unknown" while a host boots is not proof the send
+				// was lost, and re-firing it double-posts (layofflabs-2, 2026-09-02).
+				const liveIdle = status.status.status === "unknown" && raw?.live === true && !retired && batch.state === "settled";
 				if (liveIdle && count >= HOLD_RELEASE_SWEEPS && (await this.#queueIsEmpty(sessionId))) {
 					this.#holdSweeps.delete(batch.opRef);
 					const attempt = this.#manager.database.inboundBatchRequeueFreshTurn(batch.batchKey);
@@ -1013,7 +1017,7 @@ class OriginActor {
 				await this.#manager.port.steer({
 					sessionId: current.sessionId,
 					repo: this.#manager.repo,
-					text: row.body,
+					text: renderSteer(row.body),
 					clientRef,
 				});
 			} catch (error) {
@@ -1423,6 +1427,15 @@ function safeDiagnostic(error: unknown): string {
 
 function isTerminalTailFrame(frame: TailFrame): boolean {
 	return frame.rawKind === "agent_end" || frame.rawKind === "agent_failed" || frame.idle;
+}
+
+/**
+ * A steer is injected into a turn that is already reasoning about the trigger.
+ * Without framing the model treats the newest text as the whole task and drops
+ * the original request (live: answered "답하셈", ignored the question).
+ */
+export function renderSteer(body: string): string {
+	return `[Additional message from the user, received while you were still working on their previous request. Finish that request, then also address this. Do not restart or repeat what you already said.]\n${body}`;
 }
 
 function sdkStatusErrorCode(error: unknown): string | undefined {
