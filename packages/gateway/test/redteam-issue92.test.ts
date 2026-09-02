@@ -313,7 +313,7 @@ test("red-team: fixed-from-first settling fires at two seconds under 500ms fragm
 		enqueue(target, "fragment-after-fire", "fragment-after-fire", new Date(now).toISOString());
 		await target.manager.notifyInbound(ORIGIN_KEY);
 		expect(port.sends).toHaveLength(1);
-		expect(port.steers).toEqual([expect.objectContaining({ text: "fragment-after-fire" })]);
+		expect(port.steers).toEqual([expect.objectContaining({ text: expect.stringMatching(/\nfragment-after-fire$/) })]);
 		port.complete(required(port.sends[0], "coalesced send missing").opRef, "one coalesced response");
 		await eventually(() => target.database.inboundPendingCount(ORIGIN_KEY) === 0, "coalesced fragments did not settle");
 		expect(target.terminal).toEqual(["one coalesced response"]);

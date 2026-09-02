@@ -176,7 +176,7 @@ test("coverage audit preserves attribution when a broker generation changes mid-
 		expect(fixtureState.port.sends).toHaveLength(1);
 		expect(fixtureState.port.steers[0]).toMatchObject({
 			sessionId: running.sessionId,
-			text: "arrived after broker replacement",
+			text: expect.stringMatching(/\narrived after broker replacement$/),
 		});
 
 		fixtureState.port.complete(running.opRef, "restarted done");
