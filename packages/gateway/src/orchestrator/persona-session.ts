@@ -1315,15 +1315,28 @@ class OriginActor {
 					bound.tailTerminalObserved && bound.lastAssistantText !== undefined ? bound.lastAssistantText : undefined;
 				if (text === undefined) {
 					// Tail-less reconcile: only accept an assistant row produced by THIS
-					// op (>= its startedAt). A row older than the turn is the previous
-					// answer; re-posting it is worse than posting nothing.
-					const startedAt = report.status.startedAt;
+					// batch. The floor is the op's startedAt when the runtime reports it,
+					// otherwise the batch's durable acceptedAt. A row older than the turn
+					// is the previous answer; re-posting it is worse than posting nothing,
+					// so an unbounded last-assistant read is never used here.
+					// bound.batch is the settle-time snapshot; acceptance is stamped later.
+					const acceptedAtRow = this.#manager.database
+						.inboundBatchRows(bound.batch.batchKey)
+						.map((row) => row.accepted_at)
+						.find((value): value is string => typeof value === "string" && value.length > 0);
+					const acceptedAt = acceptedAtRow ? Date.parse(acceptedAtRow) : Number.NaN;
+					const notBeforeMs =
+						typeof report.status.startedAt === "number"
+							? report.status.startedAt
+							: Number.isFinite(acceptedAt)
+								? acceptedAt
+								: undefined;
 					const port = this.#manager.port;
-					if (typeof startedAt === "number" && port.fetchAssistantSince) {
+					if (notBeforeMs !== undefined && port.fetchAssistantSince) {
 						const since = await port.fetchAssistantSince({
 							sessionId: bound.sessionId,
 							repo: this.#manager.repo,
-							notBeforeMs: startedAt,
+							notBeforeMs,
 						});
 						if (since === undefined)
 							this.#manager.log(
@@ -1331,7 +1344,10 @@ class OriginActor {
 							);
 						text = since?.text ?? "";
 					} else {
-						text = (await port.fetchLastAssistant({ sessionId: bound.sessionId, repo: this.#manager.repo })).text;
+						this.#manager.log(
+							`terminal_text_unavailable origin=${this.originKey} epoch=${bound.epoch} opRef=${bound.batch.opRef} reason=no_turn_floor`,
+						);
+						text = "";
 					}
 				}
 				await bound.lifecycle.onTerminal?.({ ...bound, text, status: report });

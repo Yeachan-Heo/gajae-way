@@ -89,7 +89,12 @@ export class ScriptedSessionPort implements SessionPort {
 		if (this.#operations.has(input.opRef))
 			throw new OpRefRejectedError(input.opRef, "client_ref_conflict", { code: "client_ref_conflict" });
 		this.sends.push(input);
-		this.#operations.set(input.opRef, { sessionId: input.sessionId, state: "in_flight", text: "" });
+		this.#operations.set(input.opRef, {
+			sessionId: input.sessionId,
+			state: "in_flight",
+			text: "",
+			startedAt: Date.now(),
+		});
 		await this.onSend?.(input, this);
 		return { sessionId: input.sessionId, operationRef: input.opRef } as SendReceipt;
 	}
@@ -107,20 +112,34 @@ export class ScriptedSessionPort implements SessionPort {
 		return { changed: true };
 	}
 
+	/** When set, status omits startedAt (older gjc reports), exercising the batch acceptedAt floor. */
+	omitStartedAt = false;
+
 	async status(input: { sessionId: string; repo: string; opRef: string }): Promise<StatusReport> {
 		const operation = this.#operations.get(input.opRef);
 		if (!operation || operation.sessionId !== input.sessionId)
 			return { operationRef: input.opRef, status: { status: "unknown" }, summaryCompleted: false };
+		const startedAt = this.omitStartedAt ? {} : { startedAt: operation.startedAt };
 		return {
 			operationRef: input.opRef,
 			status:
 				operation.state === "terminal_ok"
-					? { status: "terminal_ok" }
+					? { status: "terminal_ok", ...startedAt }
 					: operation.state === "failed"
-						? { status: "failed", error: { message: operation.error ?? "scripted failure" } }
-						: { status: "in_flight" },
+						? { status: "failed", ...startedAt, error: { message: operation.error ?? "scripted failure" } }
+						: { status: "in_flight", ...startedAt },
 			summaryCompleted: operation.state !== "in_flight",
 		};
+	}
+
+	/** Same turn-floor rule as the broker port: only an assistant row produced at/after `notBeforeMs` counts. */
+	async fetchAssistantSince(input: { sessionId: string; repo: string; notBeforeMs: number }) {
+		const operation = [...this.#operations.values()]
+			.reverse()
+			.find((entry) => entry.sessionId === input.sessionId && entry.state === "terminal_ok");
+		if (!operation || operation.terminalAt === undefined || operation.terminalAt + 2_000 < input.notBeforeMs)
+			return undefined;
+		return { text: operation.text, pages: 1, complete: true };
 	}
 
 	async fetchLastAssistant(input: { sessionId: string; repo: string }) {
@@ -254,6 +273,7 @@ export class ScriptedSessionPort implements SessionPort {
 		if (!operation) throw new Error(`unknown scripted operation ${opRef}`);
 		operation.state = "terminal_ok";
 		operation.text = text;
+		operation.terminalAt = Date.now();
 		this.emitAssistant(operation.sessionId, text, `final-${opRef}`, opRef);
 		this.#emit(operation.sessionId, {
 			kind: "agent_end",
@@ -293,13 +313,28 @@ export class ScriptedSessionPort implements SessionPort {
 	}
 
 	seedOperation(opRef: string, sessionId: string, state: Operation["state"] = "in_flight", text = ""): void {
-		this.#operations.set(opRef, { sessionId, state, text });
+		const existing = this.#operations.get(opRef);
+		const now = Date.now();
+		this.#operations.set(opRef, {
+			sessionId,
+			state,
+			text,
+			startedAt: existing?.startedAt ?? now,
+			...(state === "terminal_ok" ? { terminalAt: now } : {}),
+		});
 	}
 
 	seedAcceptedSend(input: SessionSendInput, state: Operation["state"] = "in_flight", text = ""): void {
 		this.sendAttempts.push(input);
 		this.sends.push(input);
-		this.#operations.set(input.opRef, { sessionId: input.sessionId, state, text });
+		const now = Date.now();
+		this.#operations.set(input.opRef, {
+			sessionId: input.sessionId,
+			state,
+			text,
+			startedAt: now,
+			...(state === "terminal_ok" ? { terminalAt: now } : {}),
+		});
 	}
 
 	transcript(sessionId: string): readonly string[] {
@@ -411,6 +446,8 @@ type Operation = {
 	state: "in_flight" | "terminal_ok" | "failed";
 	text: string;
 	error?: string;
+	readonly startedAt: number;
+	terminalAt?: number;
 };
 
 class ScriptedTailHandle implements TailHandle {

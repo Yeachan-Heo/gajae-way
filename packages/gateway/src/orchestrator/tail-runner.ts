@@ -843,3 +843,12 @@ function nonNegativeInteger(value: number | undefined, fallback: number, name: s
 export function deterministicTailDeliveryId(sessionId: string, eventId: string): string {
 	return `gw-d-${createHash("sha256").update(`${sessionId}|${eventId}`).digest("hex").slice(0, 32)}`;
 }
+
+/**
+ * The terminal reply's identity is the durable inbound trigger, never the tail
+ * event or the session: one (origin, trigger message, part) posts at most once
+ * no matter how many times the batch is reconciled, re-adopted, or replayed.
+ */
+export function deterministicTriggerDeliveryId(originKey: string, triggerMessageId: string, part: number): string {
+	return `gw-t-${createHash("sha256").update(`${originKey}|${triggerMessageId}|${part}`).digest("hex").slice(0, 32)}`;
+}
