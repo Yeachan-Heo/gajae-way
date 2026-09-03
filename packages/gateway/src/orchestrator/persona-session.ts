@@ -472,6 +472,10 @@ class OriginActor {
 	}
 
 	async tick(): Promise<void> {
+		// A steer held on a turn that has already ended is only ever resolved
+		// by a clientRef replay; the periodic tick is that retry when nothing
+		// else is admitted.
+		await this.#resolveStaleHolds();
 		if (this.#current) await this.#reconcileBound(this.#current);
 		for (const retired of [...this.#retired.values()]) await this.#reconcileBound(retired);
 	}
