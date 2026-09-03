@@ -270,6 +270,17 @@ export function decideInbound(
 }
 
 /**
+ * True when the persona was addressed: a DM, or a group message that mentions
+ * it (an `open` channel promotes every human message to a mention, so it is
+ * covered here too). Only addressed turns show presence - typing, the
+ * "working…" post - before the reply lands; an overheard public-channel turn
+ * stays invisible until it actually says something.
+ */
+export function addressedTurn(engagement: Pick<EngagementContext, "group" | "mentioned">): boolean {
+	return !engagement.group || engagement.mentioned;
+}
+
+/**
  * Preserves arrival order per conversation across asynchronous ingress work.
  *
  * Transcribing a voice message takes a network round-trip, so a short text
@@ -439,10 +450,23 @@ export class WorkingStatus {
 	readonly #log: Pick<Console, "error">;
 	readonly #messages = new Map<string, EditableDiscordMessage | "pending">();
 	readonly #staleTimers = new Map<string, ReturnType<typeof setTimeout>>();
+	/**
+	 * Conversations where the persona was ADDRESSED (a DM, an explicit mention,
+	 * or an `open` channel's promotion). Only these get the "working…" post.
+	 * In a public channel that merely *might* draw a reply, nothing is shown
+	 * until the reply itself lands: a spinner there is noise for everyone
+	 * present, most of the time for a turn that ends in silence.
+	 */
+	readonly #addressed = new Set<string>();
 
 	constructor(discord: DiscordClientLike, log: Pick<Console, "error"> = console) {
 		this.#discord = discord;
 		this.#log = log;
+	}
+
+	/** Marks a conversation as one the persona was addressed in for the turn that just started. */
+	arm(conversationId: string): void {
+		this.#addressed.add(conversationId);
 	}
 
 	/**
@@ -464,6 +488,7 @@ export class WorkingStatus {
 	async update(progress: ChatProgressPayload): Promise<void> {
 		if (progress.origin.platform !== "discord") return;
 		const conversationId = progress.origin.conversationId;
+		if (!this.#addressed.has(conversationId)) return;
 		this.#armStale(conversationId);
 		const text = `⏳ working… (${formatElapsed(progress.elapsedMs)}, ${progress.toolCalls} tool${progress.toolCalls === 1 ? "" : "s"}, ${formatTokens(progress.outputTokens)})`;
 		const existing = this.#messages.get(conversationId);
@@ -497,6 +522,7 @@ export class WorkingStatus {
 	}
 
 	async clear(conversationId: string): Promise<void> {
+		this.#addressed.delete(conversationId);
 		const timer = this.#staleTimers.get(conversationId);
 		if (timer) clearTimeout(timer);
 		this.#staleTimers.delete(conversationId);
@@ -1296,7 +1322,14 @@ export class ReconnectingGateway {
 				});
 				// No recovery-watermark write here on purpose: a live message is no evidence that
 				// the older messages behind it were ever backfilled (issue #33).
-				if (result?.engaged) this.typing?.begin(origin.conversationId);
+				// Presence hints are shown only where the persona was ADDRESSED: a DM,
+				// an explicit mention, or an `open` channel's promotion (all three are
+				// `mentioned` by the time engagement is built). A public channel the
+				// persona merely overhears shows nothing until the reply itself lands.
+				if (result?.engaged && addressedTurn(engagement)) {
+					this.status?.arm(origin.conversationId);
+					this.typing?.begin(origin.conversationId);
+				}
 				return "acked";
 			} catch {
 				this.scheduleReconnect();
