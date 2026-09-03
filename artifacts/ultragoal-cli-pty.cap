@@ -1,0 +1,13 @@
+^D[1;36mgajaeway-gateway config check - CLI surface, ultragoal boundary (schema 19 build)[0m
+[33m# removed key must be rejected with a migration hint[0m
+FAIL /var/folders/yl/ndsjfsl95t781x9qyjrqyqc80000gn/T/tmp.ZWlo6ApWR9/config.json
+  config_invalid: settleWindowMs was removed: every message is steered into the running turn or sent as the next one, and nothing expires while queued; delete it from the configuration
+[32mexit=1[0m
+FAIL /var/folders/yl/ndsjfsl95t781x9qyjrqyqc80000gn/T/tmp.ZWlo6ApWR9/config.json
+  config_invalid: maxInboundAgeMs was removed: every message is steered into the running turn or sent as the next one, and nothing expires while queued; delete it from the configuration
+[32mexit=1[0m
+[33m# valid config passes[0m
+OK /var/folders/yl/ndsjfsl95t781x9qyjrqyqc80000gn/T/tmp.ZWlo6ApWR9/config.json
+  channels: 2 (open 1, mention-only 1)
+  channel policy applies at gateway start only: restart, then confirm the new pid started after this file's mtime.
+[32mexit=0[0m
