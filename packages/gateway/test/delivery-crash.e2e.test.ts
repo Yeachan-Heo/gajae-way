@@ -29,8 +29,22 @@ async function start(): Promise<string> {
 		stdout: "ignore",
 		stderr: "inherit",
 	});
-	await Bun.sleep(100);
-	return socket;
+	// The daemon listens ~200ms after spawn (db open + recovery), and after a
+	// SIGKILL the previous socket FILE survives until the new daemon replaces
+	// it. A fixed sleep made this fixture "load-flaky"; a stat would pass on
+	// the stale file. Only a successful connect proves the daemon is up.
+	for (let attempt = 0; attempt < 300; attempt++) {
+		const listening = await Bun.connect({ unix: socket, socket: { data() {} } }).then(
+			(probe) => {
+				probe.end();
+				return true;
+			},
+			() => false,
+		);
+		if (listening) return socket;
+		await Bun.sleep(10);
+	}
+	throw new Error("daemon never started listening");
 }
 async function client(socketPath: string) {
 	const frames: any[] = [];
