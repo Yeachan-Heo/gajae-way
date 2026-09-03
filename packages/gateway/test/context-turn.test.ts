@@ -30,7 +30,7 @@ async function config(): Promise<GatewayConfig> {
 		socketPath: join(directory, "gateway.sock"),
 		dbPath: join(directory, "gateway.db"),
 		logVerbosity: "info",
-		channels: { "context-turn": { engagement: "open-mention-only", settleWindowMs: 0 } },
+		channels: { "context-turn": { engagement: "open-mention-only" } },
 	};
 }
 

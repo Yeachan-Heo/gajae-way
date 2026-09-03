@@ -100,7 +100,6 @@ test("the partition is honest and exhaustive: live, restart-only, or unconsumed"
 	// they are read per request by the dispatch path.
 	expect(RELOADABLE_FIELDS).toContain("mentionAllowlist");
 	expect(RELOADABLE_FIELDS).toContain("channels");
-	expect(RELOADABLE_FIELDS).toContain("settleWindowMs");
 	expect(RELOADABLE_FIELDS).toContain("stallTimeoutMs");
 	// Anything bound to a listener, an open database, or the constructed gjc
 	// client is restart-only, and the sets never overlap.
@@ -222,12 +221,11 @@ test("over the socket, a vanished config cannot widen a mention-gated room", asy
 
 test("a reloadable policy edit is applied while obsolete turnTimeoutMs is rejected", async () => {
 	directory = await mkdtemp(join(tmpdir(), "gajaeway-reload-"));
-	await writeConfig(directory, { schemaVersion: 1, mentionAllowlist: ["owner"], settleWindowMs: 300 });
+	await writeConfig(directory, { schemaVersion: 1, mentionAllowlist: ["owner"] });
 	const current = await loadConfig({ home: directory });
 	await writeConfig(directory, {
 		schemaVersion: 1,
 		mentionAllowlist: ["owner", "second"],
-		settleWindowMs: 900,
 		turnTimeoutMs: 900_000,
 	});
 	const result = await reloadConfig(current);
@@ -349,13 +347,18 @@ test("SIGHUP triggers the same reload as the verb", async () => {
 	await writeConfig(home, { schemaVersion: 1, mentionAllowlist: ["owner", "newcomer"], channels: {} });
 	// What an operator actually reaches for.
 	process.kill(process.pid, "SIGHUP");
-	for (let attempt = 0; attempt < 200; attempt++) {
+	// Turns now start the moment a message is admitted, so event frames
+	// (chat.progress) interleave with responses: match the probe by its id.
+	const responseTo = (id: string) => client.frames.find((frame) => frame.type === "response" && frame.id === id);
+	let engaged = false;
+	for (let attempt = 0; attempt < 200 && !engaged; attempt++) {
 		await Bun.sleep(5);
-		groupSend(`probe-${attempt}`, "newcomer");
-		await waitFor(client.frames, client.frames.length + 1);
-		if (resultOf(client.frames, -1).engaged === true) break;
+		const id = `probe-${attempt}`;
+		groupSend(id, "newcomer");
+		for (let wait = 0; wait < 600 && !responseTo(id); wait++) await Bun.sleep(5);
+		engaged = responseTo(id)?.result?.engaged === true;
 	}
-	expect(resultOf(client.frames, -1).engaged).toBe(true);
+	expect(engaged).toBe(true);
 	client.close();
 });
 

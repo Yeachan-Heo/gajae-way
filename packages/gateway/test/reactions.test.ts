@@ -65,8 +65,8 @@ async function gateway(reply: string): Promise<Harness> {
 		logVerbosity: "info",
 		// Both keys: a bare id only resolves for discord, so telegram needs the prefixed form.
 		channels: {
-			"chan-1": { engagement: "open", settleWindowMs: 0 },
-			"telegram:chan-1": { engagement: "open", settleWindowMs: 0 },
+			"chan-1": { engagement: "open" },
+			"telegram:chan-1": { engagement: "open" },
 		},
 	};
 	const database = await GatewayDatabase.open(config.dbPath);

@@ -3,7 +3,7 @@ import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { GjcClient } from "../src/orchestrator/gjc-client";
-import { PersonaSessionManager, personaBatchKey, personaBatchOpRef } from "../src/orchestrator/persona-session";
+import { PersonaSessionManager, personaTurnOpRef } from "../src/orchestrator/persona-session";
 import {
 	extractRuntimeError,
 	formatFailureNotice,
@@ -165,7 +165,7 @@ test("concurrent bind callers share one in-flight session.create", async () => {
 	]);
 });
 
-test("missing recovery evidence holds a settled batch instead of replaying a turn", async () => {
+test("missing recovery evidence holds a bound turn instead of replaying it", async () => {
 	const db = await openDatabase();
 	const port = new ScriptedSessionPort();
 	const originKey = "loopback/loopback/tail-evidence";
@@ -173,10 +173,8 @@ test("missing recovery evidence holds a settled batch instead of replaying a tur
 	const repo = join(home, "workspace");
 	const binding = await port.bind({ originKey, epoch: 0, repo });
 	expect(db.putSessionAtEpoch(originKey, binding.sessionId, 0)).toBe(true);
-	const receivedAt = "2026-09-03T00:00:00.000Z";
-	const cutoff = receivedAt;
-	const batchKey = personaBatchKey(originKey, 0, "m-1", cutoff);
-	const opRef = personaBatchOpRef("bind-test", originKey, 0, "m-1", cutoff);
+	const receivedAt = new Date().toISOString();
+	const opRef = personaTurnOpRef("bind-test", originKey, 0, "m-1");
 	expect(
 		db.inboundEnqueue({
 			messageId: "m-1",
@@ -186,21 +184,19 @@ test("missing recovery evidence holds a settled batch instead of replaying a tur
 			receivedAt,
 		}),
 	).toBe(true);
-	db.inboundSettleBatch({ originKey, epoch: 0, cutoff, batchKey, opRef });
-	db.inboundBatchBindSession(batchKey, binding.sessionId);
+	db.inboundBindTurn({ messageId: "m-1", originKey, epoch: 0, opRef, sessionId: binding.sessionId });
 	const manager = new PersonaSessionManager({
 		database: db,
 		port,
 		instanceId: "bind-test",
 		repo,
-		settleWindowMs: 0,
-		onTurnStart: ({ rows }) => ({ text: rows.map((row) => row.body).join("\n") }),
+		onTurnStart: ({ trigger }) => ({ text: trigger.body }),
 	});
 	try {
 		await manager.recover();
 		expect(port.sendAttempts).toEqual([]);
-		expect(db.inboundBatchRows(batchKey)[0]).toMatchObject({
-			batch_state: "settled",
+		expect(db.inboundTurnRow(opRef)).toMatchObject({
+			turn_state: "bound",
 			bound_session_id: binding.sessionId,
 		});
 	} finally {

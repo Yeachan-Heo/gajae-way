@@ -102,7 +102,7 @@ describe("conversation model override", () => {
 		expect(reopened.conversationModelGet("discord:c1")?.selection).toEqual({ preset: "lunamaxxing-local" });
 		const raw = new Database(path);
 		const row = raw.query<{ v: number }, []>("SELECT MAX(version) AS v FROM schema_migrations").get();
-		expect(row?.v).toBe(18);
+		expect(row?.v).toBe(19);
 		raw.close();
 		reopened.close();
 	});

@@ -2,7 +2,9 @@ import { afterEach, expect, test } from "bun:test";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { GatewayDatabase, InboundBatchConflictError } from "../src/store/db";
+import { GatewayDatabase, InboundTurnConflictError } from "../src/store/db";
+
+const ORIGIN_KEY = "discord:dm:1";
 
 let home = "";
 let database: GatewayDatabase | undefined;
@@ -21,141 +23,309 @@ async function open(): Promise<GatewayDatabase> {
 
 const message = (id: string, body: string) => ({
 	messageId: id,
-	originKey: "discord:dm:1",
+	originKey: ORIGIN_KEY,
 	originRefJson: '{"platform":"discord"}',
 	body,
 });
+
+const timestamp = (now: number, offsetMs: number) => new Date(now + offsetMs).toISOString();
 
 test("the same platform message id is accepted exactly once", async () => {
 	const db = await open();
 	expect(db.inboundEnqueue(message("m1", "hello"))).toBe(true);
 	expect(db.inboundEnqueue(message("m1", "hello"))).toBe(false);
-	expect(db.inboundPendingCount("discord:dm:1")).toBe(1);
+	expect(db.inboundPendingCount(ORIGIN_KEY)).toBe(1);
 });
 
-test("messages arriving while a turn is in flight are all retained in arrival order", async () => {
+test("rows received in the same millisecond are served in insertion order, not platform-id order", async () => {
 	const db = await open();
-	// Simulate a turn holding the origin: the first message is claimed and still processing.
-	db.inboundEnqueue(message("m1", "런타임으로 다시 반영하고 체크해봐."));
-	const claimed = db.inboundClaimNext("discord:dm:1");
-	expect(claimed?.message_id).toBe("m1");
-
-	for (const [id, body] of [
-		["m2", "어이"],
-		["m3", "ㅇㅑ"],
-		["m4", "야"],
-		["m5", "가재야?"],
-	])
-		db.inboundEnqueue(message(id!, body!));
-
-	expect(db.inboundPendingCount("discord:dm:1")).toBe(4);
-	db.inboundComplete("m1");
-
-	const drained: string[] = [];
-	for (;;) {
-		const next = db.inboundClaimNext("discord:dm:1");
-		if (!next) break;
-		drained.push(next.body);
-		db.inboundComplete(next.message_id);
+	const at = new Date().toISOString();
+	// Discord snowflakes are not monotonic across shards; a burst can even land
+	// with ids that sort backwards. Arrival order is the only order that matters.
+	for (const id of ["z-first", "m-second", "a-third"])
+		expect(db.inboundEnqueue({ ...message(id, id), receivedAt: at })).toBe(true);
+	const served: string[] = [];
+	for (let i = 0; i < 3; i++) {
+		const row = db.inboundPendingOldest(ORIGIN_KEY);
+		if (!row) break;
+		served.push(row.message_id);
+		expect(db.inboundSteerAccepted({ messageId: row.message_id, epoch: 0, opRef: "gw-p-x" })).toBe(true);
 	}
-	expect(drained).toEqual(["어이", "ㅇㅑ", "야", "가재야?"]);
+	expect(served).toEqual(["z-first", "m-second", "a-third"]);
+	expect(db.inboundTurnRows("gw-p-x").map((row) => row.message_id)).toEqual(["z-first", "m-second", "a-third"]);
 });
 
-test("a claimed message stranded by a killed turn is recovered and reclaimable", async () => {
+test("messages arriving while a turn is running become steers in arrival order", async () => {
 	const db = await open();
-	db.inboundEnqueue(message("m1", "hello"));
-	expect(db.inboundClaimNext("discord:dm:1")?.message_id).toBe("m1");
-	expect(db.inboundClaimNext("discord:dm:1")).toBeUndefined();
+	const now = Date.now();
+	const opRef = "gw-p-running";
+	db.inboundEnqueue({ ...message("m1", "런타임으로 다시 반영하고 체크해봐."), receivedAt: timestamp(now, 0) });
 
-	expect(db.inboundRecoverProcessing()).toBe(1);
-	expect(db.inboundClaimNext("discord:dm:1")?.message_id).toBe("m1");
-});
-
-test("completed messages are never recovered or reclaimed", async () => {
-	const db = await open();
-	db.inboundEnqueue(message("m1", "hello"));
-	const claimed = db.inboundClaimNext("discord:dm:1");
-	db.inboundComplete(claimed!.message_id);
-
-	expect(db.inboundRecoverProcessing()).toBe(0);
-	expect(db.inboundClaimNext("discord:dm:1")).toBeUndefined();
-	expect(db.inboundPendingCount("discord:dm:1")).toBe(0);
-});
-
-test("claims are scoped per origin", async () => {
-	const db = await open();
-	db.inboundEnqueue(message("m1", "a"));
-	db.inboundEnqueue({ ...message("m2", "b"), originKey: "discord:dm:2" });
-
-	expect(db.inboundClaimNext("discord:dm:1")?.body).toBe("a");
-	expect(db.inboundClaimNext("discord:dm:1")).toBeUndefined();
-	expect(db.inboundClaimNext("discord:dm:2")?.body).toBe("b");
-});
-
-test("discarding at /new touches only unbatched pending rows and terminal completion moves both lifecycle columns", async () => {
-	const db = await open();
-	const cutoff = "2026-09-01T00:00:02.000Z";
-	db.inboundEnqueue({ ...message("trigger", "start"), receivedAt: "2026-09-01T00:00:00.000Z" });
-	db.inboundEnqueue({ ...message("member", "follow"), receivedAt: "2026-09-01T00:00:01.000Z" });
-	const settled = db.inboundSettleBatch({
-		originKey: "discord:dm:1",
-		epoch: 0,
-		cutoff,
-		batchKey: "discord:dm:1|0|trigger|2026-09-01T00:00:02.000Z",
-		opRef: "gw-p-0123456789abcdef0123456789abcdef",
+	expect(
+		db.inboundBindTurn({
+			messageId: "m1",
+			originKey: ORIGIN_KEY,
+			epoch: 0,
+			opRef,
+			sessionId: "session-1",
+			dispatchedAt: timestamp(now, 1),
+		}),
+	).toMatchObject({
+		message_id: "m1",
+		state: "pending",
+		turn_role: "trigger",
+		turn_epoch: 0,
+		turn_state: "bound",
+		turn_op_ref: opRef,
+		bound_session_id: "session-1",
+		dispatched_at: timestamp(now, 1),
 	});
-	expect(settled.map((item) => item.batch_role)).toEqual(["trigger", "member"]);
-	expect(db.inboundBatchAccept(settled[0]!.batch_key!)).toBe(true);
-	db.inboundEnqueue({ ...message("unbatched", "discard"), receivedAt: "2026-09-01T00:00:01.500Z" });
+	expect(db.inboundTurnAccept(opRef)).toBe(true);
 
-	expect(db.inboundDiscardBefore("discord:dm:1", cutoff)).toEqual(["unbatched"]);
-	const accepted = db.inboundBatchRows(settled[0]!.batch_key!);
-	expect(accepted).toEqual(
+	for (const [id, body, offset] of [
+		["m2", "어이", 2],
+		["m3", "ㅇㅑ", 3],
+		["m4", "야", 4],
+		["m5", "가재야?", 5],
+	] as const) {
+		db.inboundEnqueue({ ...message(id, body), receivedAt: timestamp(now, offset) });
+		expect(db.inboundSteerAccepted({ messageId: id, epoch: 0, opRef })).toBe(true);
+	}
+
+	expect(
+		db.inboundTurnRows(opRef).map((row) => [row.message_id, row.body, row.state, row.turn_role, row.turn_state]),
+	).toEqual([
+		["m1", "런타임으로 다시 반영하고 체크해봐.", "pending", "trigger", "accepted"],
+		["m2", "어이", "done", "steer", "done"],
+		["m3", "ㅇㅑ", "done", "steer", "done"],
+		["m4", "야", "done", "steer", "done"],
+		["m5", "가재야?", "done", "steer", "done"],
+	]);
+	expect(db.inboundPendingOldest(ORIGIN_KEY)).toBeUndefined();
+});
+
+test("an old pending message remains eligible for a turn", async () => {
+	const db = await open();
+	const now = Date.now();
+	db.inboundEnqueue({ ...message("m1", "hello"), receivedAt: timestamp(now, -24 * 60 * 60 * 1_000) });
+
+	expect(db.inboundPendingOldest(ORIGIN_KEY)).toMatchObject({
+		message_id: "m1",
+		state: "pending",
+		turn_role: null,
+		turn_state: null,
+	});
+});
+
+test("completed turns are never pending or nonterminal", async () => {
+	const db = await open();
+	const opRef = "gw-p-completed";
+	db.inboundEnqueue(message("m1", "hello"));
+	db.inboundBindTurn({ messageId: "m1", originKey: ORIGIN_KEY, epoch: 0, opRef, sessionId: "session-1" });
+	expect(db.inboundTurnAccept(opRef)).toBe(true);
+	expect(db.inboundTurnComplete(opRef)).toBe(1);
+
+	expect(db.inboundTurnRow(opRef)).toMatchObject({ state: "done", turn_role: "trigger", turn_state: "done" });
+	expect(db.inboundPendingOldest(ORIGIN_KEY)).toBeUndefined();
+	expect(db.inboundNonterminalTurns(ORIGIN_KEY)).toEqual([]);
+	expect(db.inboundPendingCount(ORIGIN_KEY)).toBe(0);
+});
+
+test("turn bindings are scoped per origin", async () => {
+	const db = await open();
+	const secondOrigin = "discord:dm:2";
+	db.inboundEnqueue(message("m1", "a"));
+	db.inboundEnqueue({ ...message("m2", "b"), originKey: secondOrigin });
+
+	expect(db.inboundPendingOldest(ORIGIN_KEY)?.body).toBe("a");
+	expect(db.inboundPendingOldest(secondOrigin)?.body).toBe("b");
+	db.inboundBindTurn({
+		messageId: "m1",
+		originKey: ORIGIN_KEY,
+		epoch: 0,
+		opRef: "gw-p-origin-one",
+		sessionId: "session-1",
+	});
+	db.inboundBindTurn({
+		messageId: "m2",
+		originKey: secondOrigin,
+		epoch: 0,
+		opRef: "gw-p-origin-two",
+		sessionId: "session-2",
+	});
+
+	expect(db.inboundNonterminalTurns(ORIGIN_KEY)).toEqual([
+		{
+			originKey: ORIGIN_KEY,
+			epoch: 0,
+			state: "bound",
+			opRef: "gw-p-origin-one",
+			sessionId: "session-1",
+			triggerMessageId: "m1",
+		},
+	]);
+	expect(db.inboundNonterminalTurns(secondOrigin)).toEqual([
+		{
+			originKey: secondOrigin,
+			epoch: 0,
+			state: "bound",
+			opRef: "gw-p-origin-two",
+			sessionId: "session-2",
+			triggerMessageId: "m2",
+		},
+	]);
+});
+
+test("discarding at /new touches only unbound pending rows and terminal completion moves both lifecycle columns", async () => {
+	const db = await open();
+	const now = Date.now();
+	const cutoff = timestamp(now, 3);
+	const opRef = "gw-p-discard";
+	db.inboundEnqueue({ ...message("trigger", "start"), receivedAt: timestamp(now, 0) });
+	db.inboundBindTurn({
+		messageId: "trigger",
+		originKey: ORIGIN_KEY,
+		epoch: 0,
+		opRef,
+		sessionId: "session-1",
+		dispatchedAt: timestamp(now, 0),
+	});
+	expect(db.inboundTurnAccept(opRef)).toBe(true);
+	db.inboundEnqueue({ ...message("steer", "follow"), receivedAt: timestamp(now, 1) });
+	expect(db.inboundSteerAccepted({ messageId: "steer", epoch: 0, opRef })).toBe(true);
+	db.inboundEnqueue({ ...message("unbound", "discard"), receivedAt: timestamp(now, 2) });
+
+	expect(db.inboundDiscardBefore(ORIGIN_KEY, cutoff)).toEqual(["unbound"]);
+	expect(db.inboundTurnRows(opRef)).toEqual(
 		expect.arrayContaining([
-			expect.objectContaining({ message_id: "trigger", state: "pending", batch_state: "accepted" }),
-			expect.objectContaining({ message_id: "member", state: "pending", batch_state: "accepted" }),
+			expect.objectContaining({ message_id: "trigger", state: "pending", turn_state: "accepted" }),
+			expect.objectContaining({ message_id: "steer", state: "done", turn_role: "steer", turn_state: "done" }),
 		]),
 	);
-	expect(db.inboundBatchComplete(settled[0]!.batch_key!)).toBe(2);
-	expect(db.inboundBatchRows(settled[0]!.batch_key!)).toEqual(
-		expect.arrayContaining([expect.objectContaining({ state: "done", batch_state: "done" })]),
-	);
+	expect(db.inboundTurnComplete(opRef)).toBe(1);
+	expect(db.inboundTurnRow(opRef)).toMatchObject({ state: "done", turn_state: "done" });
 });
 
-test("trigger-only uniqueness permits members and retired epochs but rejects a second current trigger", async () => {
+test("one nonterminal trigger per epoch permits steers and retired epochs", async () => {
 	const db = await open();
-	const settle = (id: string, epoch: number) =>
-		db.inboundSettleBatch({
-			originKey: "discord:dm:1",
-			epoch,
-			cutoff: "2026-09-01T00:00:02.000Z",
-			batchKey: `discord:dm:1|${epoch}|${id}|cutoff`,
-			opRef: `gw-p-${id.padEnd(32, "0")}`,
-		});
-	db.inboundEnqueue({ ...message("a", "a"), receivedAt: "2026-09-01T00:00:00.000Z" });
-	db.inboundEnqueue({ ...message("b", "b"), receivedAt: "2026-09-01T00:00:01.000Z" });
-	const old = settle("a", 0);
-	db.inboundBatchAccept(old[0]!.batch_key!);
-	db.inboundEnqueue({ ...message("c", "c"), receivedAt: "2026-09-01T00:00:02.000Z" });
-	const current = settle("c", 1);
-	expect(current).toHaveLength(1);
-	db.inboundEnqueue({ ...message("d", "d"), receivedAt: "2026-09-01T00:00:02.000Z" });
-	expect(() => settle("d", 1)).toThrow(InboundBatchConflictError);
+	const now = Date.now();
+	const oldOpRef = "gw-p-old";
+	const currentOpRef = "gw-p-current";
+	db.inboundEnqueue({ ...message("a", "a"), receivedAt: timestamp(now, 0) });
+	db.inboundBindTurn({
+		messageId: "a",
+		originKey: ORIGIN_KEY,
+		epoch: 0,
+		opRef: oldOpRef,
+		sessionId: "session-old",
+	});
+	expect(db.inboundTurnAccept(oldOpRef)).toBe(true);
+	db.inboundEnqueue({ ...message("steer", "mid-turn"), receivedAt: timestamp(now, 1) });
+	expect(db.inboundSteerAccepted({ messageId: "steer", epoch: 0, opRef: oldOpRef })).toBe(true);
+	db.inboundEnqueue({ ...message("c", "c"), receivedAt: timestamp(now, 2) });
+	expect(
+		db.inboundBindTurn({
+			messageId: "c",
+			originKey: ORIGIN_KEY,
+			epoch: 1,
+			opRef: currentOpRef,
+			sessionId: "session-current",
+		}),
+	).toMatchObject({ message_id: "c", turn_role: "trigger", turn_epoch: 1, turn_state: "bound" });
+	db.inboundEnqueue({ ...message("d", "d"), receivedAt: timestamp(now, 3) });
+
+	expect(() =>
+		db.inboundBindTurn({
+			messageId: "d",
+			originKey: ORIGIN_KEY,
+			epoch: 1,
+			opRef: "gw-p-conflict",
+			sessionId: "session-conflict",
+		}),
+	).toThrow(InboundTurnConflictError);
+	expect(db.inboundNonterminalTurns(ORIGIN_KEY)).toEqual([
+		{
+			originKey: ORIGIN_KEY,
+			epoch: 0,
+			state: "accepted",
+			opRef: oldOpRef,
+			sessionId: "session-old",
+			triggerMessageId: "a",
+		},
+		{
+			originKey: ORIGIN_KEY,
+			epoch: 1,
+			state: "bound",
+			opRef: currentOpRef,
+			sessionId: "session-current",
+			triggerMessageId: "c",
+		},
+	]);
 });
 
-test("an accepted batch with a delivered steer can still be released for a fresh turn (steer rows never block requeue)", async () => {
+test("terminal delivery claims are per-part and first claimant wins", async () => {
 	const db = await open();
-	const cutoff = "2026-09-01T00:00:02.000Z";
-	db.inboundEnqueue({ ...message("trigger", "start"), receivedAt: "2026-09-01T00:00:00.000Z" });
-	const batchKey = "discord:dm:1|0|trigger|2026-09-01T00:00:02.000Z";
-	const opRef = "gw-p-0123456789abcdef0123456789abcdef";
-	db.inboundSettleBatch({ originKey: "discord:dm:1", epoch: 0, cutoff, batchKey, opRef });
-	expect(db.inboundBatchAccept(batchKey)).toBe(true);
-	db.inboundEnqueue({ ...message("steer-1", "mid-turn"), receivedAt: "2026-09-01T00:00:05.000Z" });
-	expect(db.inboundSteerAccepted({ messageId: "steer-1", batchKey, epoch: 0, opRef })).toBe(true);
-	// Live finding (layofflabs-2): this threw "cannot be requeued" because the
-	// delivered steer row is already done, and recovery stranded the origin.
-	expect(db.inboundBatchRequeueFreshTurn(batchKey)).toBe(1);
-	expect(db.inboundPendingCount("discord:dm:1")).toBe(1);
-	expect(db.inboundNonterminalBatches("discord:dm:1")).toEqual([]);
+	const opRef = "gw-p-terminal";
+	db.inboundEnqueue(message("m1", "hello"));
+	db.inboundBindTurn({ messageId: "m1", originKey: ORIGIN_KEY, epoch: 0, opRef, sessionId: "session-1" });
+	expect(db.inboundTurnAccept(opRef)).toBe(true);
+
+	expect(db.inboundTurnClaimTerminal(opRef, 0, "gw-t-a")).toBe("gw-t-a");
+	expect(db.inboundTurnClaimTerminal(opRef, 0, "gw-t-b")).toBe("gw-t-a");
+	expect(db.inboundTurnClaimTerminal(opRef, 1, "gw-t-c")).toBe("gw-t-c");
+	expect(JSON.parse(db.inboundTurnRow(opRef)?.terminal_delivery_id ?? "{}")).toEqual({
+		0: "gw-t-a",
+		1: "gw-t-c",
+	});
+});
+
+test("an accepted turn with a delivered steer requeues its trigger for fresh attempts", async () => {
+	const db = await open();
+	const now = Date.now();
+	const opRef = "gw-p-requeue";
+	const retryOpRef = "gw-p-requeue-retry";
+	db.inboundEnqueue({ ...message("trigger", "start"), receivedAt: timestamp(now, 0) });
+	db.inboundBindTurn({
+		messageId: "trigger",
+		originKey: ORIGIN_KEY,
+		epoch: 0,
+		opRef,
+		sessionId: "session-1",
+		dispatchedAt: timestamp(now, 0),
+	});
+	expect(db.inboundTurnAccept(opRef)).toBe(true);
+	db.inboundEnqueue({ ...message("steer-1", "mid-turn"), receivedAt: timestamp(now, 1) });
+	expect(db.inboundSteerAccepted({ messageId: "steer-1", epoch: 0, opRef })).toBe(true);
+	expect(db.inboundTurnClaimTerminal(opRef, 0, "gw-t-requeue")).toBe("gw-t-requeue");
+
+	expect(db.inboundTurnRequeue(opRef)).toBe(1);
+	expect(db.freshTurnAttempt(ORIGIN_KEY, 0, "trigger")).toBe(1);
+	expect(db.inboundTurnRow(opRef)).toBeUndefined();
+	expect(db.inboundPendingOldest(ORIGIN_KEY)).toMatchObject({
+		message_id: "trigger",
+		state: "pending",
+		turn_role: null,
+		turn_epoch: null,
+		turn_state: null,
+		turn_op_ref: null,
+		bound_session_id: null,
+		dispatched_at: null,
+		terminal_delivery_id: null,
+	});
+	expect(db.inboundPendingCount(ORIGIN_KEY)).toBe(1);
+	expect(db.inboundTurnRows(opRef)).toEqual([
+		expect.objectContaining({ message_id: "steer-1", state: "done", turn_role: "steer", turn_state: "done" }),
+	]);
+	expect(db.inboundNonterminalTurns(ORIGIN_KEY)).toEqual([]);
+
+	db.inboundBindTurn({
+		messageId: "trigger",
+		originKey: ORIGIN_KEY,
+		epoch: 0,
+		opRef: retryOpRef,
+		sessionId: "session-2",
+		dispatchedAt: timestamp(now, 2),
+	});
+	expect(db.inboundTurnRequeue(retryOpRef)).toBe(2);
+	expect(db.freshTurnAttempt(ORIGIN_KEY, 0, "trigger")).toBe(2);
 });

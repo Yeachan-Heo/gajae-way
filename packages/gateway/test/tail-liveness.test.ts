@@ -30,8 +30,7 @@ test("persona state stays running until a terminal tail event is injected", asyn
 		port,
 		instanceId: "tail-state",
 		repo: join(home, "workspace"),
-		settleWindowMs: 0,
-		onTurnStart: ({ rows }) => ({ text: rows.map((row) => row.body).join("\n") }),
+		onTurnStart: ({ trigger }) => ({ text: trigger.body }),
 	});
 	try {
 		expect(
@@ -45,21 +44,21 @@ test("persona state stays running until a terminal tail event is injected", asyn
 		await manager.notifyInbound(ORIGIN_KEY);
 		await eventually(() => port.sends.length === 1, "persistent send did not start");
 		const send = port.sends[0]!;
-		const batch = database.inboundNonterminalBatches(ORIGIN_KEY)[0]!;
+		const batch = database.inboundNonterminalTurns(ORIGIN_KEY)[0]!;
 
 		// Status can become terminal before a tail arrives, but that fact alone is
 		// intentionally not a persona state transition.
 		port.seedOperation(send.opRef, send.sessionId, "terminal_ok", "unobserved terminal");
 		await manager.tick(ORIGIN_KEY);
 		expect(manager.state(ORIGIN_KEY)).toBe("turn-running");
-		expect(database.inboundBatchRows(batch.batchKey)[0]).toMatchObject({ state: "pending", batch_state: "accepted" });
+		expect(database.inboundTurnRows(batch.opRef)[0]).toMatchObject({ state: "pending", turn_state: "accepted" });
 
 		port.emitActivity(send.sessionId, { toolCalls: 1, outputTokens: 9 });
 		await Bun.sleep(0);
 		expect(manager.state(ORIGIN_KEY)).toBe("turn-running");
 		port.complete(send.opRef, "terminal tail evidence");
 		await eventually(() => manager.state(ORIGIN_KEY) === "idle", "agent_end tail frame did not end the actor turn");
-		expect(database.inboundBatchRows(batch.batchKey)[0]).toMatchObject({ state: "done", batch_state: "done" });
+		expect(database.inboundTurnRows(batch.opRef)[0]).toMatchObject({ state: "done", turn_state: "done" });
 	} finally {
 		await manager.stop();
 		database.close();

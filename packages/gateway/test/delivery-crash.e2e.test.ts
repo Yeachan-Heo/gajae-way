@@ -20,7 +20,7 @@ async function start(): Promise<string> {
 		join(home, "config.json"),
 		// A short settle window keeps this fixture inside its 2s frame waits; the
 		// subject here is crash recovery, not fixed-window coalescing.
-		JSON.stringify({ schemaVersion: 1, settleWindowMs: 50, channels: { channel: { engagement: "open" } } }),
+		JSON.stringify({ schemaVersion: 1, channels: { channel: { engagement: "open" } } }),
 	);
 	child = Bun.spawn({
 		cmd: ["bun", "packages/gateway/test/daemon-entry.ts"],

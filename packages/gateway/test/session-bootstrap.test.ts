@@ -23,7 +23,7 @@ async function setup(): Promise<GatewayConfig> {
 		configPath: join(home, "config.json"),
 		socketPath: join(home, "gateway.sock"),
 		dbPath: join(home, "gateway.db"),
-		channels: { c1: { engagement: "open", settleWindowMs: 25 } },
+		channels: { c1: { engagement: "open" } },
 		mentionAllowlist: ["owner-2", "owner-1"],
 		ownerTarget: { origin: { platform: "discord", kind: "dm", conversationId: "owner", peerId: "owner" } },
 	};

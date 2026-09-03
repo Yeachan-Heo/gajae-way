@@ -59,9 +59,8 @@ test("a mid-turn message issues one steer, keeps one send, and is attributed in 
 		port,
 		instanceId: "steering-test",
 		repo: join(home, "workspace"),
-		settleWindowMs: 0,
-		onTurnStart: ({ rows }) => ({
-			text: rows.map((row) => `[trigger:${row.message_id}] ${row.body}`).join("\n"),
+		onTurnStart: ({ trigger }) => ({
+			text: `[trigger:${trigger.message_id}] ${trigger.body}`,
 			onFrame: ({ frame }) => {
 				const content = frame.payload.content;
 				if (Array.isArray(content))
@@ -76,7 +75,7 @@ test("a mid-turn message issues one steer, keeps one send, and is attributed in 
 	await manager.notifyInbound(ORIGIN_KEY);
 	await eventually(() => port.sends.length === 1, "initial send did not become accepted");
 	const running = port.sends[0]!;
-	const batch = database.inboundNonterminalBatches(ORIGIN_KEY)[0]!;
+	const batch = database.inboundNonterminalTurns(ORIGIN_KEY)[0]!;
 
 	enqueue("correction", "mention the rollback caveat");
 	await manager.notifyInbound(ORIGIN_KEY);
@@ -100,13 +99,13 @@ test("a mid-turn message issues one steer, keeps one send, and is attributed in 
 			}),
 		]),
 	);
-	expect(database.inboundBatchRows(batch.batchKey)).toEqual(
+	expect(database.inboundTurnRows(batch.opRef)).toEqual(
 		expect.arrayContaining([
 			expect.objectContaining({
 				message_id: "correction",
-				batch_role: "steer",
-				batch_state: "done",
-				attributed_op_ref: running.opRef,
+				turn_role: "steer",
+				turn_state: "done",
+				turn_op_ref: running.opRef,
 			}),
 		]),
 	);
@@ -114,8 +113,7 @@ test("a mid-turn message issues one steer, keeps one send, and is attributed in 
 	port.complete(running.opRef, "done");
 	await eventually(
 		() =>
-			database?.inboundBatchRows(batch.batchKey).every((row) => row.state === "done" && row.batch_state === "done") ===
-			true,
+			database?.inboundTurnRows(batch.opRef).every((row) => row.state === "done" && row.turn_state === "done") === true,
 		"running batch did not complete after its tail terminal event",
 	);
 });

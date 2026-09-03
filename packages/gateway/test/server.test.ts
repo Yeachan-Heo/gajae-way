@@ -7,7 +7,7 @@ import type { GatewayConfig } from "../src/config";
 import { memoryRoot } from "../src/memory/doctrine";
 import { type GatewayServer, startUnixServer } from "../src/server/server";
 import { GatewayDatabase } from "../src/store/db";
-import { ScriptedSessionPort, sessionPortFromResponder } from "./session-port.fake";
+import { ScriptedSessionPort, sessionPortFromResponder, sessionPortFromScript } from "./session-port.fake";
 
 let directory = "";
 let server: GatewayServer | undefined;
@@ -80,7 +80,7 @@ test("requires negotiation then serves status, shutdown, and validates chat para
 	expect(client.frames[1].type).toBe("negotiated");
 	client.send({ v: "0.1", type: "request", id: "status", verb: "gateway.status" });
 	await waitFor(client.frames, 3);
-	expect(client.frames[2].result.schemaVersion).toBe(18);
+	expect(client.frames[2].result.schemaVersion).toBe(19);
 	expect(client.frames[2].result.startedAt).toBe("2026-01-01T00:00:00.000Z");
 	expect(client.frames[2].result.contextDiff).toEqual({
 		unread: 0,
@@ -400,7 +400,7 @@ test("shutdown quiesces an in-flight turn before final stopping frame", async ()
 	client.close();
 });
 
-test("a settled burst becomes one turn carrying the unread diff with speaker attribution", async () => {
+test("unengaged messages before a mention arrive as the unread diff with speaker attribution; the mention is the trigger", async () => {
 	directory = await mkdtemp(join(tmpdir(), "gajaeway-server-"));
 	const config: GatewayConfig = {
 		schemaVersion: 1,
@@ -411,8 +411,7 @@ test("a settled burst becomes one turn carrying the unread diff with speaker att
 		logVerbosity: "info",
 		// This harness drives DM turns; DMs are authorisation-gated now.
 		dmPolicy: "open" as const,
-		settleWindowMs: 80,
-		channels: { c1: { engagement: "open" } },
+		channels: { c1: { engagement: "open-mention-only" } },
 	};
 	const database = await GatewayDatabase.open(config.dbPath);
 	const turns: Array<{ text: string; preamble: string }> = [];
@@ -439,6 +438,8 @@ test("a settled burst becomes one turn carrying the unread diff with speaker att
 	await Bun.sleep(10);
 	say("m2", "second message", "u2", "bob", false);
 	await Bun.sleep(10);
+	// m1/m2 are not engaged (no mention in a mention-only channel): they never
+	// become turns of their own, only unread context for the one that does.
 	say("m3", "@bot do the thing", "owner", "bellman", true);
 	for (let attempt = 0; attempt < 400 && turns.length === 0; attempt++) await Bun.sleep(10);
 	expect(turns).toHaveLength(1);
@@ -458,7 +459,7 @@ test("a settled burst becomes one turn carrying the unread diff with speaker att
 	client.close();
 });
 
-test("a settled burst without platform message ids still carries every fragment in the one turn (AC2)", async () => {
+test("a DM burst is never coalesced: the first fragment is the turn and the rest are steered into it, none lost", async () => {
 	directory = await mkdtemp(join(tmpdir(), "gajaeway-server-"));
 	const config: GatewayConfig = {
 		schemaVersion: 1,
@@ -468,13 +469,19 @@ test("a settled burst without platform message ids still carries every fragment 
 		dbPath: join(directory, "gateway.db"),
 		logVerbosity: "info",
 		dmPolicy: "open" as const,
-		settleWindowMs: 80,
 	};
 	const database = await GatewayDatabase.open(config.dbPath);
 	const turns: string[] = [];
-	const sessionPort = sessionPortFromResponder({
+	let release!: () => void;
+	const running = new Promise<void>((resolve) => {
+		release = resolve;
+	});
+	// sessionPortFromScript completes the op off the send path, so the turn is
+	// genuinely running (send acknowledged, no terminal) while later fragments arrive.
+	const sessionPort = sessionPortFromScript({
 		respond: async (_session, text) => {
 			turns.push(text);
+			await running;
 			return "ok";
 		},
 	});
@@ -496,17 +503,24 @@ test("a settled burst without platform message ids still carries every fragment 
 			verb: "chat.send",
 			params: { origin, text, engagement: { mentioned: false, group: false, authorId: "owner" } },
 		});
-		await Bun.sleep(10);
+		for (let attempt = 0; attempt < 400 && turns.length === 0; attempt++) await Bun.sleep(5);
 	}
-	for (let attempt = 0; attempt < 400 && turns.length === 0; attempt++) await Bun.sleep(10);
-	expect(turns).toHaveLength(1);
-	expect(turns[0]).toContain("fragment one");
-	expect(turns[0]).toContain("fragment two");
-	expect(turns[0]).toContain("fragment three");
-	client.close();
+	for (let attempt = 0; attempt < 400 && sessionPort.steers.length < 2; attempt++) await Bun.sleep(5);
+	try {
+		expect(turns).toHaveLength(1);
+		expect(turns[0]).toContain("fragment one");
+		// Fragments can land in the same millisecond; steer order is arrival order.
+		expect(sessionPort.steers.map((steer) => steer.text.split("\n").at(-1))).toEqual([
+			"fragment two",
+			"fragment three",
+		]);
+	} finally {
+		release();
+		client.close();
+	}
 });
 
-test("a backlog older than maxInboundAgeMs is expired on boot recovery instead of answered late", async () => {
+test("a backlog left pending across an outage is answered on boot, never expired", async () => {
 	directory = await mkdtemp(join(tmpdir(), "gajaeway-server-"));
 	const config: GatewayConfig = {
 		schemaVersion: 1,
@@ -516,14 +530,14 @@ test("a backlog older than maxInboundAgeMs is expired on boot recovery instead o
 		dbPath: join(directory, "gateway.db"),
 		logVerbosity: "info",
 		dmPolicy: "open" as const,
-		settleWindowMs: 0,
-		maxInboundAgeMs: 60_000,
 	};
 	const database = await GatewayDatabase.open(config.dbPath);
 	const origin = { platform: "discord", kind: "dm", conversationId: "d-stale", peerId: "owner" };
 	const key = "discord/dm/d-stale/peer=owner";
 	const old = new Date(Date.now() - 30 * 60_000).toISOString();
-	// Left behind by an outage: pending for 30 minutes before this boot.
+	// Left behind by an outage: pending for 30 minutes before this boot. It was
+	// never seen by the model, so it must reach the session now (live: four DMs
+	// were deleted behind an 85-minute wedge by the old 10-minute floor).
 	expect(
 		database.inboundEnqueue({
 			messageId: "stale-1",
@@ -559,11 +573,13 @@ test("a backlog older than maxInboundAgeMs is expired on boot recovery instead o
 				engagement: { mentioned: false, group: false, authorId: "owner" },
 			},
 		});
-		for (let attempt = 0; attempt < 400 && turns.length === 0; attempt++) await Bun.sleep(10);
-		expect(turns).toHaveLength(1);
-		expect(turns[0]).toContain("fresh after the outage");
-		expect(turns[0]).not.toContain("from before the outage");
-		expect(logs.some((line) => line.startsWith(`inbound_expired origin=${key} count=1`))).toBe(true);
+		for (let attempt = 0; attempt < 400 && turns.length < 2; attempt++) await Bun.sleep(10);
+		expect(turns).toEqual([
+			expect.stringContaining("from before the outage"),
+			expect.stringContaining("fresh after the outage"),
+		]);
+		expect(logs.some((line) => line.includes("inbound_expired"))).toBe(false);
+		expect(database.inboundPendingCount(key)).toBe(0);
 		client.close();
 	} finally {
 		console.error = original;
@@ -640,7 +656,7 @@ test("group turns carry silence guidance: listeners are told to default to [SILE
 		logVerbosity: "info",
 		// This harness drives DM turns; DMs are authorisation-gated now.
 		dmPolicy: "open" as const,
-		channels: { c1: { engagement: "open", settleWindowMs: 0 } },
+		channels: { c1: { engagement: "open" } },
 	};
 	const database = await GatewayDatabase.open(config.dbPath);
 	const preambles: string[] = [];
@@ -1063,7 +1079,6 @@ test("every turn preamble carries the attachment-scope rule", async () => {
 		dbPath: join(directory, "gateway.db"),
 		logVerbosity: "info",
 		dmPolicy: "open" as const,
-		settleWindowMs: 0,
 	};
 	const database = await GatewayDatabase.open(config.dbPath);
 	const preambles: string[] = [];
@@ -1103,7 +1118,6 @@ test("a fresh session's first turn carries recent conversation history, a later 
 		dbPath: join(directory, "gateway.db"),
 		logVerbosity: "info",
 		dmPolicy: "open" as const,
-		settleWindowMs: 0,
 	};
 	const database = await GatewayDatabase.open(config.dbPath);
 	const key = "discord/dm/d-hist/peer=owner";
@@ -1162,7 +1176,7 @@ test("control tokens never leak: a silence token inside a preamble silences, and
 		dbPath: join(directory, "gateway.db"),
 		logVerbosity: "info",
 		dmPolicy: "open" as const,
-		channels: { c1: { engagement: "open", settleWindowMs: 0 } },
+		channels: { c1: { engagement: "open" } },
 	};
 	const database = await GatewayDatabase.open(config.dbPath);
 	const replies = [

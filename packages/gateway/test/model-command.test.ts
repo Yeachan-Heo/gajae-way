@@ -152,7 +152,6 @@ test("/model live-rebind keeps the session transcript and applies the new model 
 		socketPath: join(home, "gateway.sock"),
 		dbPath: join(home, "gateway.db"),
 		logVerbosity: "info",
-		settleWindowMs: 0,
 		model: { preset: "base" },
 	};
 	const database = await GatewayDatabase.open(config.dbPath);

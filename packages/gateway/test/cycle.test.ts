@@ -197,9 +197,9 @@ describe("runtime cycle projection", () => {
 			sources({
 				deliveryCounts: new Map([
 					["pending", 1],
-					["settled", 1],
+					["bound", 1],
 				]),
-				unknownDeliveryStates: ["settled"],
+				unknownDeliveryStates: ["bound"],
 			}),
 			generatedAt,
 		);

@@ -3,7 +3,7 @@ import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { PersonaSessionManager } from "../src/orchestrator/persona-session";
-import type { InboundBatch } from "../src/store/db";
+import type { InboundTurn } from "../src/store/db";
 import { GatewayDatabase } from "../src/store/db";
 import { ScriptedSessionPort } from "./session-port.fake";
 
@@ -22,14 +22,13 @@ type Fixture = {
 	readonly database: GatewayDatabase;
 	readonly manager: PersonaSessionManager;
 	readonly port: ScriptedSessionPort;
-	readonly batches: Map<string, InboundBatch>;
+	readonly turns: Map<string, InboundTurn>;
 	close(): Promise<void>;
 };
 
 async function fixture(
 	options: {
 		readonly port?: ScriptedSessionPort;
-		readonly settleWindowMs?: number;
 		readonly now?: () => number;
 		readonly setTimeout?: (work: () => void, delayMs: number) => unknown;
 		readonly clearTimeout?: (timer: unknown) => void;
@@ -38,27 +37,26 @@ async function fixture(
 ): Promise<Fixture> {
 	const home = await mkdtemp(join(tmpdir(), "gajaeway-coverage-audit-"));
 	const database = await GatewayDatabase.open(join(home, "gateway.db"));
-	const batches = new Map<string, InboundBatch>();
+	const turns = new Map<string, InboundTurn>();
 	const manager = new PersonaSessionManager({
 		database,
 		port: options.port ?? new ScriptedSessionPort(),
 		instanceId: "coverage-audit",
 		repo: join(home, "workspace"),
-		settleWindowMs: options.settleWindowMs ?? 0,
 		...(options.now ? { now: options.now } : {}),
 		...(options.setTimeout ? { setTimeout: options.setTimeout } : {}),
 		...(options.clearTimeout ? { clearTimeout: options.clearTimeout } : {}),
 		...(options.brokerGeneration ? { brokerGeneration: options.brokerGeneration } : {}),
-		onTurnStart: ({ batch, rows }) => {
-			batches.set(batch.batchKey, batch);
-			return { text: rows.map((row) => row.body).join("\n") };
+		onTurnStart: ({ turn, trigger }) => {
+			turns.set(turn.opRef, turn);
+			return { text: trigger.body };
 		},
 	});
 	return {
 		database,
 		manager,
 		port: options.port ?? (manager.port as ScriptedSessionPort),
-		batches,
+		turns,
 		async close() {
 			await manager.stop();
 			database.close();
@@ -85,11 +83,11 @@ function enqueue(
 }
 
 function assertCoverage(fixture: Fixture, messageIds: readonly string[]): void {
-	const rows = [...fixture.batches.values()].flatMap((batch) => fixture.database.inboundBatchRows(batch.batchKey));
+	const rows = [...fixture.turns.values()].flatMap((turn) => fixture.database.inboundTurnRows(turn.opRef));
 	expect(rows.map((row) => row.message_id).sort()).toEqual([...messageIds].sort());
 	for (const row of rows) {
-		expect(row.batch_role === "trigger" || row.batch_role === "member" || row.batch_role === "steer").toBe(true);
-		expect(row).toMatchObject({ state: "done", batch_state: "done", attributed_op_ref: expect.any(String) });
+		expect(row.turn_role === "trigger" || row.turn_role === "steer").toBe(true);
+		expect(row).toMatchObject({ state: "done", turn_state: "done", turn_op_ref: expect.any(String) });
 	}
 	expect(fixture.database.inboundPendingCount(ORIGIN_KEY)).toBe(0);
 }
@@ -98,7 +96,6 @@ test("coverage audit attributes a message arriving exactly at the settle fire bo
 	const base = Date.parse("2026-09-02T00:00:00.000Z");
 	let now = base;
 	const fixtureState = await fixture({
-		settleWindowMs: 100,
 		now: () => now,
 		setTimeout: () => 0,
 		clearTimeout: () => {},
@@ -154,7 +151,7 @@ test("coverage audit: a steer the session refuses is sent once on the replacemen
 		const second = port.sends[1]!;
 		expect(second.text).toBe("must not disappear");
 		expect(second.sessionId).not.toBe(first.sessionId);
-		expect(fixtureState.database.inboundNonterminalBatches(ORIGIN_KEY)).toHaveLength(2);
+		expect(fixtureState.database.inboundNonterminalTurns(ORIGIN_KEY)).toHaveLength(2);
 
 		port.complete(first.opRef, "first done");
 		port.complete(second.opRef, "second done");

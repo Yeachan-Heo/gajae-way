@@ -16,7 +16,7 @@ test("migrates a migration-001 database to the latest schema", async () => {
 		legacy.close();
 
 		const database = await GatewayDatabase.open(path);
-		expect(database.schemaVersion).toBe(18);
+		expect(database.schemaVersion).toBe(19);
 		database.close();
 
 		const migrated = new Database(path, { readonly: true });
@@ -69,7 +69,7 @@ DELETE FROM schema_migrations WHERE version > 10;
 		v10.close();
 
 		const upgraded = await GatewayDatabase.open(path);
-		expect(upgraded.schemaVersion).toBe(18);
+		expect(upgraded.schemaVersion).toBe(19);
 		expect(upgraded.laneJobJson("lanejob-test")).toBe('{"schemaVersion":1}');
 		const tables = new Set(
 			new Database(path, { readonly: true })
@@ -114,7 +114,7 @@ DELETE FROM schema_migrations WHERE version = 13;
 		v12.close();
 
 		const upgraded = await GatewayDatabase.open(path);
-		expect(upgraded.schemaVersion).toBe(18);
+		expect(upgraded.schemaVersion).toBe(19);
 		expect(upgraded.laneJobJson("lanejob-v12")).toBe('{"schemaVersion":1}');
 		expect(upgraded.metaGet("rebind_budget:discord/channel/c1")).toBe('{"used":2,"lifetime":7}');
 		expect(upgraded.monitorSlotExists("monitor-v12", "2026-08-28T00:00:00.000Z")).toBe(true);
@@ -158,7 +158,7 @@ DELETE FROM schema_migrations WHERE version > 14;
 		v14.close();
 
 		const upgraded = await GatewayDatabase.open(path);
-		expect(upgraded.schemaVersion).toBe(18);
+		expect(upgraded.schemaVersion).toBe(19);
 		const rows = upgraded.monitorRows();
 		expect(rows).toHaveLength(1);
 		// The pre-existing monitor survives and reads back with no instruction.
@@ -209,164 +209,121 @@ DELETE FROM schema_migrations WHERE version > 15;
 	v15.close();
 
 	const upgraded = await GatewayDatabase.open(path);
-	expect(upgraded.schemaVersion).toBe(18);
+	expect(upgraded.schemaVersion).toBe(19);
 	upgraded.conversationModelSet("discord:c1", { preset: "gpt-heavy" }, "owner");
 	expect(upgraded.conversationModelGet("discord:c1")?.selection).toEqual({ preset: "gpt-heavy" });
 	upgraded.close();
 });
 
-test("migration 17 adds the durable batch binding and the rollback drill refuses live work before allowing a verified-zero down-marker", async () => {
-	const directory = await mkdtemp(join(tmpdir(), "gw-migrate-17-"));
-	const path = join(directory, "gateway.db");
-	const backupPath = join(directory, "gateway-before-downmark.db");
-	try {
-		const database = await GatewayDatabase.open(path);
-		expect(database.schemaVersion).toBe(18);
-		expect(database.putSessionAtEpoch("discord:dm:1", "session-v17", 0)).toBe(true);
-		database.backupInto(backupPath);
-		database.close();
-
-		const raw = new Database(path);
-		const columns = raw
-			.query<{ name: string }, []>("PRAGMA table_info(inbound_messages)")
-			.all()
-			.map((column) => column.name);
-		for (const column of [
-			"batch_key",
-			"batch_role",
-			"batch_epoch",
-			"batch_state",
-			"attributed_op_ref",
-			"accepted_at",
-			"bound_session_id",
-		])
-			expect(columns).toContain(column);
-		const tableSql = raw
-			.query<{ sql: string }, []>("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'inbound_messages'")
-			.get()?.sql;
-		expect(tableSql).toContain("state IN ('pending','processing','done')");
-		raw.exec(`
-INSERT INTO inbound_messages (message_id, origin_key, origin_ref_json, body, engagement_json, state, received_at)
-VALUES ('v17-batch', 'discord:dm:1', '{}', 'body', NULL, 'pending', '2026-09-01T00:00:00.000Z');
-UPDATE inbound_messages SET batch_key = 'batch', batch_role = 'trigger', batch_epoch = 0, batch_state = 'accepted', attributed_op_ref = 'gw-p-0123456789abcdef0123456789abcdef' WHERE message_id = 'v17-batch';
-`);
-		const live = raw
-			.query<{ n: number }, []>(
-				"SELECT COUNT(*) AS n FROM inbound_messages WHERE batch_role = 'trigger' AND batch_state IN ('settled', 'accepted')",
-			)
-			.get()?.n;
-		expect(live).toBe(1);
-		expect(() => {
-			if (live !== 0) throw new Error("refusing schema down-marker while nonterminal batches remain");
-			raw.exec("DELETE FROM schema_migrations WHERE version >= 17");
-		}).toThrow("refusing schema down-marker");
-		expect(
-			raw.query<{ n: number }, []>("SELECT COUNT(*) AS n FROM schema_migrations WHERE version = 17").get()?.n,
-		).toBe(1);
-
-		raw.exec("UPDATE inbound_messages SET state = 'done', batch_state = 'done' WHERE message_id = 'v17-batch'");
-		const drained = raw
-			.query<{ n: number }, []>(
-				"SELECT COUNT(*) AS n FROM inbound_messages WHERE batch_role = 'trigger' AND batch_state IN ('settled', 'accepted')",
-			)
-			.get()?.n;
-		expect(drained).toBe(0);
-		raw.exec("DELETE FROM schema_migrations WHERE version >= 17");
-		raw.close();
-
-		const v16Guard = new Database(path, { readonly: true });
-		expect(
-			v16Guard.query<{ version: number }, []>("SELECT MAX(version) AS version FROM schema_migrations").get()?.version,
-		).toBe(16);
-		v16Guard.close();
-		const backup = new Database(backupPath, { readonly: true });
-		expect(
-			backup.query<{ version: number }, []>("SELECT MAX(version) AS version FROM schema_migrations").get()?.version,
-		).toBe(18);
-		backup.close();
-
-		const reopened = await GatewayDatabase.open(path);
-		expect(reopened.schemaVersion).toBe(18);
-		expect(reopened.inboundBatchRows("batch")[0]).toMatchObject({ state: "done", batch_state: "done" });
-		reopened.close();
-	} finally {
-		await rm(directory, { recursive: true, force: true });
-	}
-});
-
-test("migration 18 adds the pre-send dispatch stamp and the terminal reply slot to a genuine schema-17 table", async () => {
-	const directory = await mkdtemp(join(tmpdir(), "gw-migrate-18-"));
+test("migration 19 rebuilds a genuine schema-18 batch table as turns: bound/accepted triggers survive with their floor and terminal claims, unsent members return to pending, steers stay attributed, nothing is deleted", async () => {
+	const directory = await mkdtemp(join(tmpdir(), "gw-migrate-19-"));
 	const path = join(directory, "gateway.db");
 	try {
 		const latest = await GatewayDatabase.open(path);
+		expect(latest.schemaVersion).toBe(19);
 		latest.close();
-		// Rebuild a deployed schema-17 database: the two v18 columns do not exist,
-		// and one accepted batch is live and bound (the shape an upgrade meets).
-		const v17 = new Database(path);
-		v17.exec(`
-ALTER TABLE inbound_messages DROP COLUMN dispatched_at;
-ALTER TABLE inbound_messages DROP COLUMN terminal_delivery_id;
-DELETE FROM schema_migrations WHERE version > 17;
-INSERT INTO inbound_messages (message_id, origin_key, origin_ref_json, body, engagement_json, state, received_at)
-VALUES ('v18-live', 'discord:dm:1', '{}', 'body', NULL, 'pending', '2026-09-02T00:00:00.000Z');
-UPDATE inbound_messages SET batch_key = 'b18', batch_role = 'trigger', batch_epoch = 0, batch_state = 'accepted', attributed_op_ref = 'gw-p-0123456789abcdef0123456789abcdef', accepted_at = '2026-09-02T00:00:01.000Z', bound_session_id = 's-old' WHERE message_id = 'v18-live';
+		// Rebuild a deployed schema-18 database from its real DDL (v16 base + the
+		// v17 ALTERs + the v18 ALTERs), then seed the shapes an upgrade meets.
+		const raw = new Database(path);
+		raw.exec(`
+DROP TABLE inbound_messages;
+CREATE TABLE inbound_messages (message_id TEXT PRIMARY KEY, origin_key TEXT NOT NULL, origin_ref_json TEXT NOT NULL, body TEXT NOT NULL, engagement_json TEXT, state TEXT NOT NULL CHECK(state IN ('pending','processing','done')), received_at TEXT NOT NULL);
+CREATE INDEX inbound_messages_claim ON inbound_messages (origin_key, state, received_at);
+ALTER TABLE inbound_messages ADD COLUMN batch_key TEXT;
+ALTER TABLE inbound_messages ADD COLUMN batch_role TEXT CHECK(batch_role IS NULL OR batch_role IN ('trigger', 'member', 'steer'));
+ALTER TABLE inbound_messages ADD COLUMN batch_epoch INTEGER;
+ALTER TABLE inbound_messages ADD COLUMN batch_state TEXT CHECK(batch_state IS NULL OR batch_state IN ('settled', 'accepted', 'done'));
+ALTER TABLE inbound_messages ADD COLUMN attributed_op_ref TEXT;
+ALTER TABLE inbound_messages ADD COLUMN accepted_at TEXT;
+ALTER TABLE inbound_messages ADD COLUMN bound_session_id TEXT;
+CREATE UNIQUE INDEX inbound_messages_nonterminal_trigger ON inbound_messages (origin_key, batch_epoch) WHERE batch_role = 'trigger' AND batch_state IN ('settled', 'accepted');
+ALTER TABLE inbound_messages ADD COLUMN dispatched_at TEXT;
+ALTER TABLE inbound_messages ADD COLUMN terminal_delivery_id TEXT;
+DELETE FROM schema_migrations WHERE version > 18;
+INSERT INTO inbound_messages (message_id, origin_key, origin_ref_json, body, engagement_json, state, received_at, batch_key, batch_role, batch_epoch, batch_state, attributed_op_ref, accepted_at, bound_session_id, dispatched_at, terminal_delivery_id) VALUES
+ ('live-trigger', 'o1', '{}', 'q1', NULL, 'pending', '2026-09-02T00:00:00.000Z', 'b1', 'trigger', 3, 'accepted', 'gw-p-live', '2026-09-02T00:00:02.000Z', 's-live', '2026-09-02T00:00:01.000Z', '{"0":"gw-t-x"}'),
+ ('live-member', 'o1', '{}', 'q1b', NULL, 'pending', '2026-09-02T00:00:00.500Z', 'b1', 'member', 3, 'accepted', 'gw-p-live', '2026-09-02T00:00:02.000Z', 's-live', '2026-09-02T00:00:01.000Z', NULL),
+ ('live-steer', 'o1', '{}', 'more', NULL, 'done', '2026-09-02T00:00:03.000Z', 'b1', 'steer', 3, 'done', 'gw-p-live', '2026-09-02T00:00:03.500Z', NULL, NULL, NULL),
+ ('settled-bound', 'o2', '{}', 'q2', NULL, 'pending', '2026-09-02T00:01:00.000Z', 'b2', 'trigger', 0, 'settled', 'gw-p-sb', NULL, 's-2', '2026-09-02T00:01:00.100Z', NULL),
+ ('settled-unbound', 'o3', '{}', 'q3', NULL, 'pending', '2026-09-02T00:02:00.000Z', 'b3', 'trigger', 0, 'settled', 'gw-p-su', NULL, NULL, NULL, NULL),
+ ('finished', 'o4', '{}', 'q4', NULL, 'done', '2026-09-02T00:03:00.000Z', 'b4', 'trigger', 1, 'done', 'gw-p-done', '2026-09-02T00:03:01.000Z', 's-4', '2026-09-02T00:03:00.500Z', '{"0":"gw-t-y"}'),
+ ('wedged-unbatched', 'o1', '{}', 'stuck behind the wedge for 85 minutes', NULL, 'pending', '2026-09-01T22:00:00.000Z', NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL);
 `);
-		const before = v17
-			.query<{ name: string }, []>("PRAGMA table_info(inbound_messages)")
-			.all()
-			.map((column) => column.name);
-		expect(before).not.toContain("dispatched_at");
-		expect(before).not.toContain("terminal_delivery_id");
 		expect(
-			v17.query<{ version: number }, []>("SELECT MAX(version) AS version FROM schema_migrations").get()?.version,
-		).toBe(17);
-		v17.close();
+			raw.query<{ version: number }, []>("SELECT MAX(version) AS version FROM schema_migrations").get()?.version,
+		).toBe(18);
+		raw.close();
 
 		const upgraded = await GatewayDatabase.open(path);
-		expect(upgraded.schemaVersion).toBe(18);
+		expect(upgraded.schemaVersion).toBe(19);
 		const after = new Database(path, { readonly: true });
 		const columns = after
 			.query<{ name: string }, []>("PRAGMA table_info(inbound_messages)")
 			.all()
 			.map((column) => column.name);
+		const total = after.query<{ n: number }, []>("SELECT COUNT(*) AS n FROM inbound_messages").get()?.n;
 		after.close();
-		expect(columns).toContain("dispatched_at");
-		expect(columns).toContain("terminal_delivery_id");
-		// The pre-existing bound row is untouched by the migration.
-		const row = upgraded.inboundBatchRows("b18")[0];
-		expect(row).toMatchObject({
-			message_id: "v18-live",
+		for (const gone of ["batch_key", "batch_role", "batch_epoch", "batch_state", "attributed_op_ref", "accepted_at"])
+			expect(columns).not.toContain(gone);
+		for (const kept of [
+			"turn_role",
+			"turn_epoch",
+			"turn_state",
+			"turn_op_ref",
+			"bound_session_id",
+			"dispatched_at",
+			"terminal_delivery_id",
+		])
+			expect(columns).toContain(kept);
+		expect(total).toBe(7);
+
+		// Accepted trigger: turn intact, floor and terminal claim preserved.
+		expect(upgraded.inboundTurnRow("gw-p-live")).toMatchObject({
+			message_id: "live-trigger",
 			state: "pending",
-			batch_state: "accepted",
-			accepted_at: "2026-09-02T00:00:01.000Z",
-			bound_session_id: "s-old",
-			dispatched_at: null,
-			terminal_delivery_id: null,
+			turn_role: "trigger",
+			turn_epoch: 3,
+			turn_state: "accepted",
+			bound_session_id: "s-live",
+			dispatched_at: "2026-09-02T00:00:01.000Z",
+			terminal_delivery_id: '{"0":"gw-t-x"}',
 		});
-		// An already-bound legacy batch never gets a recovery-time floor: that
-		// stamp could postdate the answer the old daemon wrote.
-		expect(upgraded.inboundBatchBindSession("b18", "s-old", "2026-09-02T00:00:05.000Z")).toBe(true);
-		expect(upgraded.inboundBatchDispatchedAt("b18")).toBeUndefined();
-		// A never-bound batch is stamped on its first bind only; a re-bind keeps it.
-		const v18 = new Database(path);
-		v18.exec(`
-INSERT INTO inbound_messages (message_id, origin_key, origin_ref_json, body, engagement_json, state, received_at)
-VALUES ('v18-fresh', 'discord:dm:2', '{}', 'body', NULL, 'pending', '2026-09-02T00:00:00.000Z');
-UPDATE inbound_messages SET batch_key = 'b18f', batch_role = 'trigger', batch_epoch = 0, batch_state = 'settled', attributed_op_ref = 'gw-p-0123456789abcdef0123456789abcdee' WHERE message_id = 'v18-fresh';
-`);
-		v18.close();
-		expect(upgraded.inboundBatchBindSession("b18f", "s-new", "2026-09-02T00:00:05.000Z")).toBe(true);
-		expect(upgraded.inboundBatchDispatchedAt("b18f")).toBe("2026-09-02T00:00:05.000Z");
-		expect(upgraded.inboundBatchBindSession("b18f", "s-new", "2026-09-02T00:01:00.000Z")).toBe(true);
-		expect(upgraded.inboundBatchDispatchedAt("b18f")).toBe("2026-09-02T00:00:05.000Z");
-		// Terminal slots are per part and first-claim wins.
-		expect(upgraded.inboundBatchClaimTerminal("b18f", 0, "gw-t-a")).toBe("gw-t-a");
-		expect(upgraded.inboundBatchClaimTerminal("b18f", 0, "gw-t-b")).toBe("gw-t-a");
-		expect(upgraded.inboundBatchClaimTerminal("b18f", 1, "gw-t-c")).toBe("gw-t-c");
-		// A fresh-turn requeue releases the floor and the terminal claims with the rows.
-		expect(upgraded.inboundBatchRequeueFreshTurn("b18f")).toBe(1);
-		expect(upgraded.inboundBatchDispatchedAt("b18f")).toBeUndefined();
-		expect(upgraded.inboundBatchRows("b18f")).toEqual([]);
+		expect(upgraded.inboundTurnDispatchedAt("gw-p-live")).toBe("2026-09-02T00:00:01.000Z");
+		expect(upgraded.inboundTurnClaimTerminal("gw-p-live", 0, "gw-t-late")).toBe("gw-t-x");
+		// The steer stays attributed to that turn; the unanswered member is no
+		// longer part of it and waits, pending, for the next turn.
+		expect(upgraded.inboundTurnRows("gw-p-live").map((row) => [row.message_id, row.turn_role])).toEqual([
+			["live-trigger", "trigger"],
+			["live-steer", "steer"],
+		]);
+		expect(upgraded.inboundPendingOldest("o1")).toMatchObject({ message_id: "wedged-unbatched", turn_state: null });
+		expect(upgraded.inboundPendingCount("o1")).toBe(3);
+		// Settled + bound -> bound turn; settled + never bound -> plain pending.
+		expect(upgraded.inboundNonterminalTurns("o2")).toEqual([
+			{
+				originKey: "o2",
+				epoch: 0,
+				state: "bound",
+				opRef: "gw-p-sb",
+				sessionId: "s-2",
+				triggerMessageId: "settled-bound",
+			},
+		]);
+		expect(upgraded.inboundNonterminalTurns("o3")).toEqual([]);
+		expect(upgraded.inboundPendingOldest("o3")).toMatchObject({ message_id: "settled-unbound", turn_op_ref: null });
+		// A finished turn is history and stays done.
+		expect(upgraded.inboundTurnRow("gw-p-done")).toMatchObject({ state: "done", turn_state: "done" });
+		expect(upgraded.inboundNonterminalTurnCount()).toBe(2);
+		// The uniqueness the actor relies on survives the rebuild.
+		expect(() =>
+			upgraded.inboundBindTurn({
+				messageId: "wedged-unbatched",
+				originKey: "o1",
+				epoch: 3,
+				opRef: "gw-p-dup",
+				sessionId: "s-live",
+			}),
+		).toThrow("already has a nonterminal turn");
 		upgraded.close();
 	} finally {
 		await rm(directory, { recursive: true, force: true });

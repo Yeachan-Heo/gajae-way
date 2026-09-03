@@ -141,7 +141,6 @@ async function startGateway(
 		dbPath: join(directory, "gateway.db"),
 		logVerbosity: "info",
 		channels: { "chan-1": { engagement: "open" } },
-		settleWindowMs: 0,
 	};
 	const database = await GatewayDatabase.open(config.dbPath);
 	server = await startUnixServer({

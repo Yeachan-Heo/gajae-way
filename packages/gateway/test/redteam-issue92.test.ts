@@ -6,10 +6,10 @@ import { join } from "node:path";
 import type { BrokerSession } from "@gajaeway/subsession";
 import { OpRefRejectedError } from "@gajaeway/subsession";
 import { parseConfigFile } from "../src/config";
-import { PersonaSessionManager, personaBatchKey, personaBatchOpRef } from "../src/orchestrator/persona-session";
+import { PersonaSessionManager, personaTurnOpRef } from "../src/orchestrator/persona-session";
 import type { SessionSendInput, SessionSteerInput } from "../src/orchestrator/session-port";
 import type { TailAttachInput } from "../src/orchestrator/tail-runner";
-import { GatewayDatabase, type InboundBatch } from "../src/store/db";
+import { GatewayDatabase, type InboundTurn } from "../src/store/db";
 import { ScriptedSessionPort } from "./session-port.fake";
 
 const ORIGIN = { platform: "loopback", kind: "loopback", conversationId: "issue92-redteam" } as const;
@@ -21,7 +21,7 @@ type Fixture = {
 	readonly database: GatewayDatabase;
 	readonly manager: PersonaSessionManager;
 	readonly port: ScriptedSessionPort;
-	readonly batches: Map<string, InboundBatch>;
+	readonly turns: Map<string, InboundTurn>;
 	readonly discarded: string[];
 	readonly logs: string[];
 	readonly terminal: string[];
@@ -30,7 +30,6 @@ type Fixture = {
 
 type FixtureOptions = {
 	readonly port?: ScriptedSessionPort;
-	readonly settleWindowMs?: number;
 	readonly now?: () => number;
 	readonly setTimeout?: (work: () => void, delayMs: number) => unknown;
 	readonly clearTimeout?: (timer: unknown) => void;
@@ -54,7 +53,7 @@ async function fixture(options: FixtureOptions = {}): Promise<Fixture> {
 	const home = await mkdtemp(join(tmpdir(), "gajaeway-issue92-redteam-"));
 	const database = await GatewayDatabase.open(join(home, "gateway.db"));
 	const port = options.port ?? new ScriptedSessionPort();
-	const batches = new Map<string, InboundBatch>();
+	const turns = new Map<string, InboundTurn>();
 	const discarded: string[] = [];
 	const logs: string[] = [];
 	const terminal: string[] = [];
@@ -63,15 +62,14 @@ async function fixture(options: FixtureOptions = {}): Promise<Fixture> {
 		port,
 		instanceId: "issue92-redteam",
 		repo: join(home, "workspace"),
-		settleWindowMs: options.settleWindowMs ?? 0,
 		...(options.now ? { now: options.now } : {}),
 		...(options.setTimeout ? { setTimeout: options.setTimeout } : {}),
 		...(options.clearTimeout ? { clearTimeout: options.clearTimeout } : {}),
 		...(options.brokerGeneration ? { brokerGeneration: options.brokerGeneration } : {}),
-		onTurnStart: ({ batch, rows }) => {
-			batches.set(batch.batchKey, batch);
+		onTurnStart: ({ turn, trigger }) => {
+			turns.set(turn.opRef, turn);
 			return {
-				text: rows.map((row) => row.body).join("\n"),
+				text: trigger.body,
 				onTerminal: ({ text }) => {
 					terminal.push(text);
 				},
@@ -89,7 +87,7 @@ async function fixture(options: FixtureOptions = {}): Promise<Fixture> {
 		database,
 		manager,
 		port,
-		batches,
+		turns,
 		discarded,
 		logs,
 		terminal,
@@ -114,14 +112,14 @@ function enqueue(target: Fixture, messageId: string, body: string, receivedAt = 
 }
 
 function assertCoverage(target: Fixture, messageIds: readonly string[]): void {
-	const rows = [...target.batches.values()].flatMap((batch) => target.database.inboundBatchRows(batch.batchKey));
+	const rows = [...target.turns.values()].flatMap((turn) => target.database.inboundTurnRows(turn.opRef));
 	expect(rows.map((row) => row.message_id).sort()).toEqual([...messageIds].sort());
 	expect(new Set(rows.map((row) => row.message_id)).size).toBe(messageIds.length);
 	for (const row of rows)
 		expect(row).toMatchObject({
 			state: "done",
-			batch_state: "done",
-			attributed_op_ref: expect.any(String),
+			turn_state: "done",
+			turn_op_ref: expect.any(String),
 		});
 	expect(target.database.inboundPendingCount(ORIGIN_KEY)).toBe(0);
 }
@@ -220,7 +218,7 @@ test("red-team: a strict tail retention gap does not infer terminal or create an
 		await target.manager.notifyInbound(ORIGIN_KEY);
 		await eventually(() => port.sends.length === 1, "initial batch did not start");
 		const send = required(port.sends[0], "initial gap send missing");
-		const batch = target.batches.values().next().value as InboundBatch;
+		const batch = target.turns.values().next().value as InboundTurn;
 
 		await port.emitRetentionGap(send.sessionId);
 		await eventually(
@@ -229,8 +227,8 @@ test("red-team: a strict tail retention gap does not infer terminal or create an
 		);
 		expect(target.manager.state(ORIGIN_KEY)).toBe("turn-running");
 		expect(port.sends).toHaveLength(1);
-		expect(target.database.inboundBatchRows(batch.batchKey)).toEqual(
-			expect.arrayContaining([expect.objectContaining({ state: "pending", batch_state: "accepted" })]),
+		expect(target.database.inboundTurnRows(batch.opRef)).toEqual(
+			expect.arrayContaining([expect.objectContaining({ state: "pending", turn_state: "accepted" })]),
 		);
 
 		port.complete(send.opRef, "terminal tail evidence");
@@ -252,7 +250,7 @@ test("canonical: a steer the running session refuses replaces the session; the m
 		await target.manager.notifyInbound(ORIGIN_KEY);
 		await eventually(() => port.sends.length === 1, "initial batch did not start");
 		const first = required(port.sends[0], "initial steer send missing");
-		const firstEpoch = required(target.batches.values().next().value, "first batch missing").epoch;
+		const firstEpoch = required(target.turns.values().next().value, "first batch missing").epoch;
 
 		enqueue(target, "steer-after-death", "must remain durable");
 		await target.manager.notifyInbound(ORIGIN_KEY);
@@ -263,11 +261,6 @@ test("canonical: a steer the running session refuses replaces the session; the m
 		// the old batch, never expired) and the epoch moves on.
 		expect(target.logs.filter((line) => line.startsWith("steer_failed"))).toHaveLength(1);
 		expect(target.logs.filter((line) => line.startsWith("session_rebound_after_steer_failure"))).toHaveLength(1);
-		expect(target.database.inboundPendingOldest(ORIGIN_KEY)).toMatchObject({
-			message_id: "steer-after-death",
-			batch_role: null,
-			batch_state: null,
-		});
 		await eventually(() => port.sends.length === 2, "refused steer row was not sent on the replacement session");
 		const second = required(port.sends[1], "replacement send missing");
 		expect(second.text).toBe("must remain durable");
@@ -292,60 +285,34 @@ test("canonical: a steer the running session refuses replaces the session; the m
 	}
 });
 
-test("red-team: fixed-from-first settling fires at two seconds under 500ms fragments and includes the exact boundary", async () => {
-	const base = Date.parse("2026-09-02T00:00:00.000Z");
-	let now = base;
-	const delays: number[] = [];
+test("canonical: a stream of 500ms fragments never waits - the first is the turn, each later one is steered in arrival order, and all are attributed", async () => {
 	const port = new ScriptedSessionPort();
-	const target = await fixture({
-		port,
-		settleWindowMs: 2_000,
-		now: () => now,
-		setTimeout: (_work, delayMs) => {
-			delays.push(delayMs);
-			return delays.length;
-		},
-		clearTimeout: () => {},
-	});
+	const target = await fixture({ port });
 	try {
+		const base = Date.now();
 		for (const [offset, id] of [
 			[0, "fragment-0"],
 			[500, "fragment-1"],
 			[1_000, "fragment-2"],
 			[1_500, "fragment-3"],
-			[2_000, "fragment-at-boundary"],
+			[2_000, "fragment-4"],
 		] as const) {
-			now = base + offset;
-			enqueue(target, id, id, new Date(now).toISOString());
+			enqueue(target, id, id, new Date(base + offset).toISOString());
 			await target.manager.notifyInbound(ORIGIN_KEY);
+			await eventually(() => port.sends.length === 1, `fragment ${id} left the origin without a running turn`);
 		}
-		expect(delays).toEqual([2_000]);
-		await target.manager.tick(ORIGIN_KEY);
-		await eventually(() => port.sends.length === 1, "continuous fragments starved the fixed settle window");
-		expect(required(port.sends[0], "coalesced send missing").text.split("\n")).toEqual([
-			"fragment-0",
+		expect(required(port.sends[0], "first send missing").text).toBe("fragment-0");
+		expect(port.steers.map((steer) => steer.text.split("\n").at(-1))).toEqual([
 			"fragment-1",
 			"fragment-2",
 			"fragment-3",
-			"fragment-at-boundary",
+			"fragment-4",
 		]);
-
-		now = base + 2_500;
-		enqueue(target, "fragment-after-fire", "fragment-after-fire", new Date(now).toISOString());
-		await target.manager.notifyInbound(ORIGIN_KEY);
+		port.complete(required(port.sends[0], "first send missing").opRef, "one response");
+		await eventually(() => target.database.inboundPendingCount(ORIGIN_KEY) === 0, "fragments did not complete");
 		expect(port.sends).toHaveLength(1);
-		expect(port.steers).toEqual([expect.objectContaining({ text: expect.stringMatching(/\nfragment-after-fire$/) })]);
-		port.complete(required(port.sends[0], "coalesced send missing").opRef, "one coalesced response");
-		await eventually(() => target.database.inboundPendingCount(ORIGIN_KEY) === 0, "coalesced fragments did not settle");
-		expect(target.terminal).toEqual(["one coalesced response"]);
-		assertCoverage(target, [
-			"fragment-0",
-			"fragment-1",
-			"fragment-2",
-			"fragment-3",
-			"fragment-at-boundary",
-			"fragment-after-fire",
-		]);
+		expect(target.terminal).toEqual(["one response"]);
+		assertCoverage(target, ["fragment-0", "fragment-1", "fragment-2", "fragment-3", "fragment-4"]);
 	} finally {
 		await target.close();
 	}
@@ -355,23 +322,26 @@ test("red-team: restart after broker acceptance but before durable acceptance re
 	const port = new ScriptedSessionPort();
 	const target = await fixture({ port });
 	try {
-		const receivedAt = "2026-09-02T00:00:00.000Z";
-		const cutoff = receivedAt;
+		const receivedAt = new Date().toISOString();
 		const repo = join(target.home, "workspace");
 		const binding = await port.bind({ originKey: ORIGIN_KEY, epoch: 0, repo });
 		expect(target.database.putSessionAtEpoch(ORIGIN_KEY, binding.sessionId, 0)).toBe(true);
 		enqueue(target, "crash-window", "accepted before attribution", receivedAt);
-		const batchKey = personaBatchKey(ORIGIN_KEY, 0, "crash-window", cutoff);
-		const opRef = personaBatchOpRef("issue92-redteam", ORIGIN_KEY, 0, "crash-window", cutoff);
-		target.database.inboundSettleBatch({ originKey: ORIGIN_KEY, epoch: 0, cutoff, batchKey, opRef });
-		expect(target.database.inboundBatchBindSession(batchKey, binding.sessionId)).toBe(true);
+		const opRef = personaTurnOpRef("issue92-redteam", ORIGIN_KEY, 0, "crash-window");
+		target.database.inboundBindTurn({
+			messageId: "crash-window",
+			originKey: ORIGIN_KEY,
+			epoch: 0,
+			opRef,
+			sessionId: binding.sessionId,
+		});
 		port.seedAcceptedSend({ sessionId: binding.sessionId, repo, text: "accepted before attribution", opRef });
 
 		await target.manager.recover();
 		expect(port.sendAttempts).toHaveLength(1);
-		expect(target.database.inboundBatchRows(batchKey)).toEqual(
+		expect(target.database.inboundTurnRows(opRef)).toEqual(
 			expect.arrayContaining([
-				expect.objectContaining({ state: "pending", batch_state: "accepted", attributed_op_ref: opRef }),
+				expect.objectContaining({ state: "pending", turn_state: "accepted", turn_op_ref: opRef }),
 			]),
 		);
 		port.complete(opRef, "reconciled terminal");
@@ -395,15 +365,15 @@ test("red-team: /new preserves an accepted batch, discards only unbatched pre-fl
 		await target.manager.notifyInbound(ORIGIN_KEY);
 		await eventually(() => port.sends.length === 1, "old batch did not start");
 		const old = required(port.sends[0], "old epoch send missing");
-		const oldBatch = target.batches.values().next().value as InboundBatch;
+		const oldBatch = target.turns.values().next().value as InboundTurn;
 
 		enqueue(target, "discard-before-new", "must be discarded", new Date(base + 1).toISOString());
 		now = base + 2;
 		await target.manager.reset(ORIGIN_KEY, JSON.stringify(ORIGIN), new Date(now).toISOString());
 		expect(target.discarded).toEqual(["discard-before-new"]);
-		expect(target.database.inboundBatchRows(oldBatch.batchKey)).toEqual(
+		expect(target.database.inboundTurnRows(oldBatch.opRef)).toEqual(
 			expect.arrayContaining([
-				expect.objectContaining({ message_id: "old-trigger", state: "pending", batch_state: "accepted" }),
+				expect.objectContaining({ message_id: "old-trigger", state: "pending", turn_state: "accepted" }),
 			]),
 		);
 
@@ -419,8 +389,8 @@ test("red-team: /new preserves an accepted batch, discards only unbatched pre-fl
 			"/new sequence did not reconcile both batches",
 		);
 		expect(target.terminal).toEqual(["fresh output"]);
-		expect(target.database.inboundBatchRows(oldBatch.batchKey)).toEqual(
-			expect.arrayContaining([expect.objectContaining({ state: "done", batch_state: "done" })]),
+		expect(target.database.inboundTurnRows(oldBatch.opRef)).toEqual(
+			expect.arrayContaining([expect.objectContaining({ state: "done", turn_state: "done" })]),
 		);
 		assertCoverage(target, ["old-trigger", "new-trigger"]);
 	} finally {
@@ -462,7 +432,7 @@ test("red-team: a stall on a retired hold does not abort it, block the next epoc
 	}
 });
 
-test("red-team: unknown send outcomes are non-steerable holds that retain subsequent rows", async () => {
+test("red-team: an unknown send outcome is an operator hold that is never resent, and later messages still reach the session as steers", async () => {
 	const port = new ConflictUnknownPort();
 	const target = await fixture({ port });
 	try {
@@ -472,21 +442,21 @@ test("red-team: unknown send outcomes are non-steerable holds that retain subseq
 			() => target.logs.some((line) => line.startsWith(`recovery_client_ref_conflict origin=${ORIGIN_KEY}`)),
 			"client_ref_conflict was not reconciled",
 		);
-		const batch = target.batches.values().next().value as InboundBatch;
-		expect(target.database.inboundBatchRows(batch.batchKey)).toEqual(
-			expect.arrayContaining([expect.objectContaining({ message_id: "conflict-trigger", batch_state: "settled" })]),
+		const batch = target.turns.values().next().value as InboundTurn;
+		expect(target.database.inboundTurnRows(batch.opRef)).toEqual(
+			expect.arrayContaining([expect.objectContaining({ message_id: "conflict-trigger", turn_state: "bound" })]),
 		);
 		expect(target.logs.some((line) => line.includes("reason=operation_state_unknown"))).toBe(true);
 		expect(port.sends).toEqual([]);
 
-		enqueue(target, "steered-while-unknown", "this must not mutate an operator hold");
+		enqueue(target, "steered-while-unknown", "the user may still speak");
 		await target.manager.notifyInbound(ORIGIN_KEY);
-		expect(port.steers).toEqual([]);
-		expect(target.database.inboundPendingOldest(ORIGIN_KEY)).toMatchObject({
-			message_id: "steered-while-unknown",
-			batch_role: null,
-			batch_state: null,
-		});
+		// The undecidable OPERATION never gags the user: the message is steered
+		// into the session. The held trigger itself is untouched and unsent.
+		expect(port.steers).toHaveLength(1);
+		expect(port.sends).toEqual([]);
+		expect(target.database.inboundTurnRow(batch.opRef)).toMatchObject({ state: "pending", turn_state: "bound" });
+		expect(target.database.inboundPendingOldest(ORIGIN_KEY)).toBeUndefined();
 	} finally {
 		await target.close();
 	}
@@ -499,7 +469,6 @@ test("red-team: a terminal tail frame arriving during the status grace wins once
 	const port = new ScriptedSessionPort();
 	const target = await fixture({
 		port,
-		settleWindowMs: 0,
 		now: () => now,
 		setTimeout: (work, delayMs) => {
 			timers.push({ work, delayMs });
@@ -513,7 +482,7 @@ test("red-team: a terminal tail frame arriving during the status grace wins once
 		await target.manager.tick(ORIGIN_KEY);
 		await eventually(() => port.sends.length === 1, "grace test did not start its first turn");
 		const send = required(port.sends[0], "grace test send missing");
-		const batch = required(target.batches.values().next().value, "grace test batch missing");
+		const batch = required(target.turns.values().next().value, "grace test batch missing");
 
 		port.seedOperation(send.opRef, send.sessionId, "terminal_ok", "status reported terminal first");
 		await target.manager.tick(ORIGIN_KEY);
@@ -524,16 +493,16 @@ test("red-team: a terminal tail frame arriving during the status grace wins once
 		expect(target.manager.state(ORIGIN_KEY)).toBe("turn-running");
 		expect(target.terminal).toEqual([]);
 		expect(target.logs.some((line) => line.includes("reason=tail_terminal_evidence_unavailable"))).toBe(true);
-		expect(target.database.inboundBatchRows(batch.batchKey)[0]).toMatchObject({
+		expect(target.database.inboundTurnRows(batch.opRef)[0]).toMatchObject({
 			state: "pending",
-			batch_state: "accepted",
+			turn_state: "accepted",
 		});
 
 		port.complete(send.opRef, "tail terminal arrived during grace");
 		await eventually(() => target.terminal.length === 1, "terminal tail did not settle the held batch");
 		expect(target.terminal).toEqual(["tail terminal arrived during grace"]);
 		expect(target.logs.some((line) => line.startsWith("terminal_status_reconciled"))).toBe(false);
-		expect(target.database.inboundBatchRows(batch.batchKey)[0]).toMatchObject({ state: "done", batch_state: "done" });
+		expect(target.database.inboundTurnRows(batch.opRef)[0]).toMatchObject({ state: "done", turn_state: "done" });
 
 		grace.work();
 		await Bun.sleep(20);
@@ -563,7 +532,6 @@ test("canonical: a message arriving while the ended turn's tail is late is steer
 	const port = new EndedTurnRejectsSteerPort();
 	const target = await fixture({
 		port,
-		settleWindowMs: 0,
 		now: () => now,
 		setTimeout: (work, delayMs) => {
 			timers.push({ work, delayMs });
@@ -577,7 +545,7 @@ test("canonical: a message arriving while the ended turn's tail is late is steer
 		await target.manager.tick(ORIGIN_KEY);
 		await eventually(() => port.sends.length === 1, "slow-tail test did not start its first turn");
 		const first = required(port.sends[0], "slow-tail first send missing");
-		const firstBatch = required(target.batches.values().next().value, "slow-tail first batch missing");
+		const firstBatch = required(target.turns.values().next().value, "slow-tail first batch missing");
 
 		port.seedOperation(first.opRef, first.sessionId, "terminal_ok", "status-only terminal");
 		port.turnEnded = true;
@@ -588,9 +556,9 @@ test("canonical: a message arriving while the ended turn's tail is late is steer
 		);
 		expect(target.terminal).toEqual([]);
 		expect(target.manager.state(ORIGIN_KEY)).toBe("turn-running");
-		expect(target.database.inboundBatchRows(firstBatch.batchKey)[0]).toMatchObject({
+		expect(target.database.inboundTurnRows(firstBatch.opRef)[0]).toMatchObject({
 			state: "pending",
-			batch_state: "accepted",
+			turn_state: "accepted",
 		});
 
 		now++;
@@ -607,9 +575,9 @@ test("canonical: a message arriving while the ended turn's tail is late is steer
 		expect(target.logs.some((line) => line.startsWith("session_rebound_after_steer_failure"))).toBe(false);
 		expect(target.terminal).toEqual(["status-only terminal"]);
 		expect(target.logs.filter((line) => line.startsWith("terminal_status_reconciled"))).toHaveLength(1);
-		expect(target.database.inboundBatchRows(firstBatch.batchKey)[0]).toMatchObject({
+		expect(target.database.inboundTurnRows(firstBatch.opRef)[0]).toMatchObject({
 			state: "done",
-			batch_state: "done",
+			turn_state: "done",
 		});
 		// The grace timer that was armed for the hold is now a no-op.
 		grace.work();
@@ -639,7 +607,7 @@ test("canonical: a message arriving while the ended turn's tail is late is steer
 
 test("red-team: stopping during terminal-status grace cancels the grace callback so nothing touches a closed database", async () => {
 	const port = new ScriptedSessionPort();
-	const target = await fixture({ port, settleWindowMs: 0 });
+	const target = await fixture({ port });
 	let closed = false;
 	try {
 		enqueue(target, "shutdown-grace-trigger", "do not touch storage after stop");
@@ -670,7 +638,6 @@ test("red-team coverage fuzz: exact-boundary fragments plus steer-failure and br
 		const port = new IntermittentSteerPort(new Set([1 + (seed % 2), 3 + (seed % 3)]));
 		const target = await fixture({
 			port,
-			settleWindowMs: 100,
 			now: () => now,
 			setTimeout: () => 0,
 			clearTimeout: () => {},
@@ -684,8 +651,7 @@ test("red-team coverage fuzz: exact-boundary fragments plus steer-failure and br
 				enqueue(target, id, id, new Date(now).toISOString());
 				await target.manager.notifyInbound(ORIGIN_KEY);
 			}
-			await target.manager.tick(ORIGIN_KEY);
-			await eventually(() => port.sends.length === 1, `seed ${seed} did not fire at the first fixed cutoff`);
+			await eventually(() => port.sends.length >= 1, `seed ${seed} did not dispatch its first row`);
 
 			for (let index = 5; index < ids.length; index++) {
 				if ((seed + index) % 2 === 0) {
@@ -698,26 +664,23 @@ test("red-team coverage fuzz: exact-boundary fragments plus steer-failure and br
 				await target.manager.notifyInbound(ORIGIN_KEY);
 			}
 
+			// Drain: complete every send in order. A steer failure replaces the
+			// session, so several turns (retired + current) can be live at once;
+			// each one's terminal must close its own trigger, and every row must end
+			// up attributed to exactly one turn with nothing pending.
 			let completedSends = 0;
-			while (target.database.inboundPendingCount(ORIGIN_KEY) > 0) {
-				if (completedSends < port.sends.length) {
-					const send = required(port.sends[completedSends], `seed ${seed} send ${completedSends} missing`);
-					port.complete(send.opRef, `terminal-${seed}-${completedSends}`);
-					completedSends++;
-					await eventually(
-						() =>
-							target.manager.state(ORIGIN_KEY) !== "turn-running" ||
-							target.database.inboundPendingCount(ORIGIN_KEY) === 0,
-						`seed ${seed} did not reconcile terminal send ${completedSends}`,
-					);
-				}
-				if (target.database.inboundPendingCount(ORIGIN_KEY) === 0) break;
+			for (let round = 0; target.database.inboundPendingCount(ORIGIN_KEY) > 0; round++) {
+				if (round > 32) throw new Error(`seed ${seed} did not drain`);
+				await eventually(() => port.sends.length > completedSends, `seed ${seed} left pending rows without a turn`);
+				const send = required(port.sends[completedSends], `seed ${seed} send ${completedSends} missing`);
+				port.complete(send.opRef, `terminal-${seed}-${completedSends}`);
+				completedSends++;
+				await eventually(
+					() => target.database.inboundTurnRow(send.opRef)?.turn_state === "done",
+					`seed ${seed} did not reconcile terminal send ${completedSends}`,
+				);
 				now += 100;
 				await target.manager.tick(ORIGIN_KEY);
-				await eventually(
-					() => port.sends.length > completedSends,
-					`seed ${seed} did not dispatch its remaining pending rows`,
-				);
 			}
 			assertCoverage(target, ids);
 		} finally {
@@ -726,7 +689,7 @@ test("red-team coverage fuzz: exact-boundary fragments plus steer-failure and br
 	}
 });
 
-test("red-team non-goal probes: no running-turn abort or coexistence control remains, and inbound persistence has only ratified batch metadata", async () => {
+test("red-team non-goal probes: no running-turn abort or coexistence control remains, and inbound persistence has only ratified turn metadata", async () => {
 	const source = (await Promise.all((await sourceFiles(SOURCE_ROOT)).map((path) => readFile(path, "utf8")))).join("\n");
 	for (const forbidden of ["turn.abort", "turn.replace", "--resume", "keyed-queue"])
 		expect(source).not.toContain(forbidden);
@@ -749,13 +712,13 @@ test("red-team non-goal probes: no running-turn abort or coexistence control rem
 		expect(columns.filter((column) => /transcript|receipt|pending_op_ref/i.test(column))).toEqual([]);
 		expect(columns).toEqual(
 			expect.arrayContaining([
-				"batch_key",
-				"batch_role",
-				"batch_epoch",
-				"batch_state",
-				"attributed_op_ref",
-				"accepted_at",
+				"turn_role",
+				"turn_epoch",
+				"turn_state",
+				"turn_op_ref",
 				"bound_session_id",
+				"dispatched_at",
+				"terminal_delivery_id",
 			]),
 		);
 	} finally {
@@ -785,7 +748,7 @@ test("red-team evidence: compaction observation is wired from production monitor
 
 test("red-team: an idle binding whose session died is resumed exactly once before the next send", async () => {
 	const port = new IdleRecoveryPort({ onSend: (input, scripted) => scripted.complete(input.opRef, "reply") });
-	const target = await fixture({ port, settleWindowMs: 0 });
+	const target = await fixture({ port });
 	try {
 		enqueue(target, "idle-1", "first turn");
 		await target.manager.notifyInbound(ORIGIN_KEY);
@@ -810,7 +773,7 @@ test("red-team: an inspect outage on an idle binding never blocks the send and n
 	const port = new InspectUnavailableIdleRecoveryPort({
 		onSend: (input, scripted) => scripted.complete(input.opRef, "reply"),
 	});
-	const target = await fixture({ port, settleWindowMs: 0 });
+	const target = await fixture({ port });
 	try {
 		enqueue(target, "outage-1", "first turn");
 		await target.manager.notifyInbound(ORIGIN_KEY);

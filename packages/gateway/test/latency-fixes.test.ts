@@ -81,7 +81,6 @@ async function startGateway(options: {
 		dbPath: join(directory, "gateway.db"),
 		logVerbosity: "info",
 		channels: { "chan-1": { engagement: "open" } },
-		settleWindowMs: 0,
 	};
 	const database = await GatewayDatabase.open(config.dbPath);
 	server = await startUnixServer({ config, database, ...options, onStop: () => database.close() });
@@ -150,7 +149,7 @@ test("a message arriving during an active persistent turn is steered without a s
 		socketPath: join(directory, "gateway.sock"),
 		dbPath: join(directory, "gateway.db"),
 		logVerbosity: "info",
-		channels: { "chan-1": { engagement: "open", settleWindowMs: 500 } },
+		channels: { "chan-1": { engagement: "open" } },
 	};
 	const database = await GatewayDatabase.open(config.dbPath);
 	server = await startUnixServer({ config, database, sessionPort, onStop: () => database.close() });
@@ -158,9 +157,10 @@ test("a message arriving during an active persistent turn is steered without a s
 	client.send({ v: "0.1", type: "hello", payload: { supportedVersions: ["0.1"] } });
 	for (let attempt = 0; attempt < 60 && client.frames.length < 1; attempt++) await Bun.sleep(5);
 	sendChannelMessage(client, "d1", "first");
-	// It arrives while the first turn is active, so persistent-session admission
-	// steers it into the accepted operation instead of creating another turn.
-	await Bun.sleep(700);
+	for (let attempt = 0; attempt < 400 && turnStarts.length < 1; attempt++) await Bun.sleep(5);
+	// It arrives while the first turn is active (the scripted response takes
+	// 600ms), so admission steers it into the accepted operation instead of
+	// creating another turn.
 	sendChannelMessage(client, "d2", "second");
 	for (let attempt = 0; attempt < 400 && sessionPort.steers.length < 1; attempt++) await Bun.sleep(5);
 	expect(turnStarts.length).toBe(1);

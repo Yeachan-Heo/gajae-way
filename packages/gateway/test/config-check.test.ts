@@ -15,8 +15,8 @@ async function configFile(body: string): Promise<string> {
 const VALID = JSON.stringify({
 	schemaVersion: 1,
 	channels: {
-		"1469222606497648690": { engagement: "open", settleWindowMs: 10_000 },
-		"1508664765415690340": { settleWindowMs: 10_000 },
+		"1469222606497648690": { engagement: "open" },
+		"1508664765415690340": {},
 	},
 });
 
@@ -57,9 +57,9 @@ test("every defined engagement gate passes the offline preflight", async () => {
 	}
 });
 
-test("an out-of-range settle window is rejected", async () => {
+test("a removed per-channel settle window is rejected with a migration hint", async () => {
 	const path = await configFile(
-		JSON.stringify({ schemaVersion: 1, channels: { "1": { engagement: "open", settleWindowMs: 90_000 } } }),
+		JSON.stringify({ schemaVersion: 1, channels: { "1": { engagement: "open", settleWindowMs: 500 } } }),
 	);
 	const result = await checkConfigFile(path);
 	expect(result.ok).toBe(false);

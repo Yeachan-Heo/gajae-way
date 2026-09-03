@@ -20,12 +20,8 @@ export interface GatewayConfigFile {
 	readonly model?: GjcModelSelection;
 	readonly credentials?: Readonly<Record<string, CredentialFileReference>>;
 	readonly channels?: Readonly<Record<string, ChannelPolicy>>;
-	/** Fixed-from-first inbound settle window in milliseconds; per-channel `settleWindowMs` overrides it. */
-	readonly settleWindowMs?: number;
 	/** Tail liveness alarm threshold in milliseconds. It never kills a running turn. */
 	readonly stallTimeoutMs?: number;
-	/** Pending inbound older than this is expired instead of answered after an outage (0 disables). */
-	readonly maxInboundAgeMs?: number;
 	/** Author ids allowed to trigger mention-gated group turns; absent/empty = anyone. */
 	readonly mentionAllowlist?: readonly string[];
 	/**
@@ -82,8 +78,6 @@ export interface ChannelPolicy {
 	 * - `closed`: mention required AND the author must be allowlisted
 	 */
 	readonly engagement?: EngagementGate;
-	/** Per-channel fixed-from-first inbound settle window override in milliseconds. */
-	readonly settleWindowMs?: number;
 }
 
 export interface ConfigOverrides {
@@ -192,35 +186,19 @@ function parseChannels(value: unknown): Readonly<Record<string, ChannelPolicy>> 
 				"config_invalid",
 				`channels.${conversationId}.engagement must be one of ${ENGAGEMENT_GATES.join(", ")}`,
 			);
-		if (item.debounceMs !== undefined) {
-			throw new ConfigError(
-				"config_invalid",
-				`channels.${conversationId}.debounceMs was renamed to channels.${conversationId}.settleWindowMs; update the configuration`,
-			);
-		}
-		if (item.settleWindowMs !== undefined)
-			parseSettleWindow(item.settleWindowMs, `channels.${conversationId}.settleWindowMs`);
-		if (Object.keys(item).some((key) => !["engagement", "settleWindowMs"].includes(key)))
+		for (const removed of ["debounceMs", "settleWindowMs"] as const)
+			if (item[removed] !== undefined)
+				throw new ConfigError(
+					"config_invalid",
+					`channels.${conversationId}.${removed} was removed: every message is steered or sent immediately; delete it from the configuration`,
+				);
+		if (Object.keys(item).some((key) => key !== "engagement"))
 			throw new ConfigError("config_invalid", `channels.${conversationId} contains an unknown field`);
 		channels[conversationId] = {
 			...(item.engagement === undefined ? {} : { engagement: item.engagement as EngagementGate }),
-			...(item.settleWindowMs === undefined ? {} : { settleWindowMs: item.settleWindowMs as number }),
 		};
 	}
 	return channels;
-}
-
-function parseSettleWindow(value: unknown, field: string): number {
-	// 0 is valid for an explicit immediate loopback-like policy; the fixed window remains first-fragment anchored.
-	if (!Number.isInteger(value) || (value as number) < 0 || (value as number) > 60_000)
-		throw new ConfigError("config_invalid", `${field} must be an integer between 0 and 60000`);
-	return value as number;
-}
-
-function parseMaxInboundAge(value: unknown): number {
-	if (!Number.isInteger(value) || (value as number) < 0 || (value as number) > 86_400_000)
-		throw new ConfigError("config_invalid", "maxInboundAgeMs must be an integer between 0 and 86400000");
-	return value as number;
 }
 
 function parseStallTimeout(value: unknown): number {
@@ -294,12 +272,12 @@ export function parseConfigFile(value: unknown): GatewayConfigFile {
 	if (logVerbosity !== undefined && !["debug", "info", "warn", "error"].includes(logVerbosity)) {
 		throw new ConfigError("config_invalid", "logVerbosity must be debug, info, warn, or error");
 	}
-	if (input.debounceMs !== undefined) {
-		throw new ConfigError(
-			"config_invalid",
-			"debounceMs was renamed to settleWindowMs; update the configuration (and channels.*.debounceMs to channels.*.settleWindowMs)",
-		);
-	}
+	for (const removed of ["debounceMs", "settleWindowMs", "maxInboundAgeMs"] as const)
+		if (input[removed] !== undefined)
+			throw new ConfigError(
+				"config_invalid",
+				`${removed} was removed: every message is steered into the running turn or sent as the next one, and nothing expires while queued; delete it from the configuration`,
+			);
 	if (input.turnTimeoutMs !== undefined) {
 		throw new ConfigError(
 			"config_invalid",
@@ -322,11 +300,7 @@ export function parseConfigFile(value: unknown): GatewayConfigFile {
 		...(input.mentionAllowlist === undefined
 			? {}
 			: { mentionAllowlist: parseStringArray(input.mentionAllowlist, "mentionAllowlist") }),
-		...(input.settleWindowMs === undefined
-			? {}
-			: { settleWindowMs: parseSettleWindow(input.settleWindowMs, "settleWindowMs") }),
 		...(input.stallTimeoutMs === undefined ? {} : { stallTimeoutMs: parseStallTimeout(input.stallTimeoutMs) }),
-		...(input.maxInboundAgeMs === undefined ? {} : { maxInboundAgeMs: parseMaxInboundAge(input.maxInboundAgeMs) }),
 		...(model ? { model } : {}),
 		...(input.dmPolicy === undefined ? {} : { dmPolicy: parseDmPolicy(input.dmPolicy) }),
 		...(input.ownerTarget === undefined ? {} : { ownerTarget: parseOwnerTarget(input.ownerTarget) }),
@@ -399,9 +373,7 @@ export async function loadConfig(
 		socketPath: overrides.socketPath ?? fileConfig.socketPath ?? join(home, "gateway.sock"),
 		dbPath: overrides.dbPath ?? fileConfig.dbPath ?? join(home, "gateway.db"),
 		logVerbosity: overrides.logVerbosity ?? fileConfig.logVerbosity ?? "info",
-		settleWindowMs: fileConfig.settleWindowMs ?? 2_000,
 		stallTimeoutMs: fileConfig.stallTimeoutMs ?? 120_000,
-		maxInboundAgeMs: fileConfig.maxInboundAgeMs ?? 600_000,
 	};
 }
 
@@ -435,17 +407,10 @@ export async function reloadConfig(current: GatewayConfig, overrides: ConfigOver
 
 /**
  * Fields genuinely re-read at runtime: `mentionAllowlist` (server.ts chat dispatch +
- * engagement/policy.ts), channels and `settleWindowMs` (fixed-window admission),
- * and `stallTimeoutMs` (tail liveness alarms). Each applies to the next actor event.
+ * engagement/policy.ts), channels (engagement gates) and `stallTimeoutMs` (tail
+ * liveness alarms). Each applies to the next actor event.
  */
-export const RELOADABLE_FIELDS = [
-	"mentionAllowlist",
-	"channels",
-	"settleWindowMs",
-	"stallTimeoutMs",
-	"maxInboundAgeMs",
-	"dmPolicy",
-] as const;
+export const RELOADABLE_FIELDS = ["mentionAllowlist", "channels", "stallTimeoutMs", "dmPolicy"] as const;
 
 /** Fields bound to live startup resources and therefore changeable only by restart. */
 export const RESTART_REQUIRED_FIELDS = [

@@ -57,7 +57,6 @@ async function startGateway(port: ScriptedSessionPort) {
 		dbPath: join(directory, "gateway.db"),
 		logVerbosity: "info",
 		channels: { "chan-1": { engagement: "open" } },
-		settleWindowMs: 0,
 	};
 	database = await GatewayDatabase.open(config.dbPath);
 	const runtime = await startUnixServer({ config, database, sessionPort: port, onStop: () => database?.close() });
@@ -108,11 +107,10 @@ test("a batch whose tail was fenced and then reconciled from status invokes onTe
 		port,
 		instanceId: "fence",
 		repo: join(directory, "workspace"),
-		settleWindowMs: 0,
-		onTurnStart: ({ rows, batch }) => ({
-			text: rows.map((row) => row.body).join("\n"),
+		onTurnStart: ({ trigger, turn }) => ({
+			text: trigger.body,
 			onTerminal: ({ text }) => {
-				terminals.push({ trigger: batch.triggerMessageId, text });
+				terminals.push({ trigger: turn.triggerMessageId, text });
 			},
 		}),
 		log: (line) => {
@@ -145,7 +143,7 @@ test("a batch whose tail was fenced and then reconciled from status invokes onTe
 		await Bun.sleep(50);
 		expect(terminals).toEqual([{ trigger: "m-fence", text: "한 번만 말할게" }]);
 		expect(
-			database.inboundBatchRows(database.inboundNonterminalBatches("discord/channel/chan-1")[0]?.batchKey ?? ""),
+			database.inboundTurnRows(database.inboundNonterminalTurns("discord/channel/chan-1")[0]?.opRef ?? ""),
 		).toEqual([]);
 	} finally {
 		await manager.stop();
@@ -182,11 +180,10 @@ test("red-team B2: the answer ships on the tail, the gateway restarts, status re
 		dbPath,
 		logVerbosity: "info",
 		channels: { "chan-1": { engagement: "open" } },
-		settleWindowMs: 0,
 	};
 	server = await startUnixServer({ config, database, sessionPort: port, onStop: () => database?.close() });
 	await eventually(
-		() => database!.inboundNonterminalBatches("discord/channel/chan-1").length === 0,
+		() => database!.inboundNonterminalTurns("discord/channel/chan-1").length === 0,
 		"recovered batch never completed",
 		2_000,
 	);
@@ -238,11 +235,10 @@ test("red-team G2-B3: a message that arrived mid-turn and dispatched later never
 		port,
 		instanceId: "backlog",
 		repo: join(directory, "workspace"),
-		settleWindowMs: 0,
-		onTurnStart: ({ rows, batch }) => ({
-			text: rows.map((row) => row.body).join("\n"),
+		onTurnStart: ({ trigger, turn }) => ({
+			text: trigger.body,
 			onTerminal: ({ text }) => {
-				terminals.push({ trigger: batch.triggerMessageId, text });
+				terminals.push({ trigger: turn.triggerMessageId, text });
 			},
 		}),
 		log: () => {},
@@ -297,7 +293,6 @@ test("red-team I4: two different id-less interim texts get distinct ids; the sam
 		dbPath: join(directory, "gateway.db"),
 		logVerbosity: "info",
 		channels: { "chan-1": { engagement: "open" } },
-		settleWindowMs: 0,
 	};
 	database = await GatewayDatabase.open(config.dbPath);
 	server = await startUnixServer({
@@ -347,11 +342,10 @@ test("a tail-less reconcile never reposts a previous turn's answer as the curren
 		port,
 		instanceId: "repost",
 		repo: join(directory, "workspace"),
-		settleWindowMs: 0,
-		onTurnStart: ({ rows, batch }) => ({
-			text: rows.map((row) => row.body).join("\n"),
+		onTurnStart: ({ trigger, turn }) => ({
+			text: trigger.body,
 			onTerminal: ({ text }) => {
-				terminals.push({ trigger: batch.triggerMessageId, text });
+				terminals.push({ trigger: turn.triggerMessageId, text });
 			},
 		}),
 		log: () => {},
@@ -411,11 +405,10 @@ test("red-team G3-B1: a same-session fresh-turn retry gets its own dispatch floo
 			port,
 			instanceId: "requeue",
 			repo: join(directory, "workspace"),
-			settleWindowMs: 0,
-			onTurnStart: ({ rows, batch }) => ({
-				text: rows.map((row) => row.body).join("\n"),
+			onTurnStart: ({ trigger, turn }) => ({
+				text: trigger.body,
 				onTerminal: ({ text }) => {
-					terminals.push({ trigger: batch.triggerMessageId, text });
+					terminals.push({ trigger: turn.triggerMessageId, text });
 				},
 			}),
 			log: (line) => {
@@ -437,8 +430,8 @@ test("red-team G3-B1: a same-session fresh-turn retry gets its own dispatch floo
 		await manager.notifyInbound("discord/channel/chan-1");
 		await eventually(() => port.sends.length === 1, "first attempt was not sent");
 		const first = port.sends[0]!;
-		const firstBatch = database.inboundNonterminalBatches("discord/channel/chan-1")[0]!;
-		const firstFloor = database.inboundBatchDispatchedAt(firstBatch.batchKey);
+		const firstBatch = database.inboundNonterminalTurns("discord/channel/chan-1")[0]!;
+		const firstFloor = database.inboundTurnDispatchedAt(firstBatch.opRef);
 		expect(firstFloor).toBeDefined();
 		// The gateway dies mid-turn. The daemon writes an assistant row for the
 		// attempt and then the attempt FAILS.
@@ -459,8 +452,8 @@ test("red-team G3-B1: a same-session fresh-turn retry gets its own dispatch floo
 		await eventually(() => port.sends.length === 2, "fresh-turn retry was not sent");
 		const second = port.sends[1]!;
 		expect(second.opRef).not.toBe(first.opRef);
-		const secondBatch = database.inboundNonterminalBatches("discord/channel/chan-1")[0]!;
-		const secondFloor = database.inboundBatchDispatchedAt(secondBatch.batchKey);
+		const secondBatch = database.inboundNonterminalTurns("discord/channel/chan-1")[0]!;
+		const secondFloor = database.inboundTurnDispatchedAt(secondBatch.opRef);
 		expect(secondFloor).toBeDefined();
 		expect(Date.parse(secondFloor!)).toBeGreaterThan(Date.parse(firstFloor!));
 		// The retry's op ends with NO assistant row of its own; the stale row from
@@ -489,9 +482,8 @@ test("red-team G3-B2: a batch bound before the upgrade, on a runtime without sta
 		port,
 		instanceId: "legacy",
 		repo: join(directory, "workspace"),
-		settleWindowMs: 0,
-		onTurnStart: ({ rows }) => ({
-			text: rows.map((row) => row.body).join("\n"),
+		onTurnStart: ({ trigger }) => ({
+			text: trigger.body,
 			onTerminal: ({ text }) => {
 				terminals.push(text);
 			},
@@ -513,12 +505,13 @@ test("red-team G3-B2: a batch bound before the upgrade, on a runtime without sta
 		await manager.notifyInbound("discord/channel/chan-1");
 		await eventually(() => port.sends.length === 1, "turn was not sent");
 		const send = port.sends[0]!;
-		const batch = database.inboundNonterminalBatches("discord/channel/chan-1")[0]!;
+		const batch = database.inboundNonterminalTurns("discord/channel/chan-1")[0]!;
 		await manager.stop();
-		// Model the schema-17 row: bound, but no dispatch floor was ever recorded.
+		// Model a row whose dispatch floor was lost (hand-edited / corrupt): no
+		// floor was ever recorded.
 		const raw = new Database(join(directory, "gateway.db"));
 		try {
-			raw.exec(`UPDATE inbound_messages SET dispatched_at = NULL WHERE batch_key = '${batch.batchKey}'`);
+			raw.exec(`UPDATE inbound_messages SET dispatched_at = NULL WHERE turn_op_ref = '${batch.opRef}'`);
 		} finally {
 			raw.close();
 		}
@@ -529,9 +522,8 @@ test("red-team G3-B2: a batch bound before the upgrade, on a runtime without sta
 			port,
 			instanceId: "legacy",
 			repo: join(directory, "workspace"),
-			settleWindowMs: 0,
-			onTurnStart: ({ rows }) => ({
-				text: rows.map((row) => row.body).join("\n"),
+			onTurnStart: ({ trigger }) => ({
+				text: trigger.body,
 				onTerminal: ({ text }) => {
 					terminals.push(text);
 				},
@@ -547,7 +539,7 @@ test("red-team G3-B2: a batch bound before the upgrade, on a runtime without sta
 			await Bun.sleep(100);
 			expect(terminals).toEqual([]);
 			expect(logs.some((line) => line.includes("reason=no_turn_floor"))).toBe(true);
-			expect(database.inboundNonterminalBatches("discord/channel/chan-1")).toHaveLength(1);
+			expect(database.inboundNonterminalTurns("discord/channel/chan-1")).toHaveLength(1);
 		} finally {
 			await recovered.stop();
 		}
@@ -575,11 +567,10 @@ test("a cursorless resync replaying the previous turn's transcript row never bec
 		port,
 		instanceId: "offbyone",
 		repo: join(directory, "workspace"),
-		settleWindowMs: 0,
-		onTurnStart: ({ rows, batch }) => ({
-			text: rows.map((row) => row.body).join("\n"),
+		onTurnStart: ({ trigger, turn }) => ({
+			text: trigger.body,
 			onTerminal: ({ text }) => {
-				terminals.push({ trigger: batch.triggerMessageId, text });
+				terminals.push({ trigger: turn.triggerMessageId, text });
 			},
 		}),
 		log: (line) => {
@@ -643,11 +634,10 @@ test("a frame attributed to the accepted op passes the turn floor even with an o
 		port,
 		instanceId: "attributed",
 		repo: join(directory, "workspace"),
-		settleWindowMs: 0,
-		onTurnStart: ({ rows, batch }) => ({
-			text: rows.map((row) => row.body).join("\n"),
+		onTurnStart: ({ trigger, turn }) => ({
+			text: trigger.body,
 			onTerminal: ({ text }) => {
-				terminals.push({ trigger: batch.triggerMessageId, text });
+				terminals.push({ trigger: turn.triggerMessageId, text });
 			},
 		}),
 		log: (line) => {

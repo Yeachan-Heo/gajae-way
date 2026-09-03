@@ -1,0 +1,14 @@
+{
+  "deferredToBatch": {
+    "ranLanes": ["targetedVerification"],
+    "targetedVerification": {
+      "status": "passed",
+      "commands": [
+        "bunx tsc --noEmit -p tsconfig.json",
+        "bun test packages/gateway/test/coverage-audit.test.ts packages/gateway/test/redteam-issue92.test.ts",
+        "bun test packages/gateway"
+      ],
+      "evidence": "Commit 3b94032 lands b917425 (nonSteerable gag removed from #steerPending; failed steer escalates) on top of the G001 fix. Refinements over the WIP: the write-only nonSteerable field is deleted; #recoverFromSteerFailure first reconciles (turn already over -> row becomes next send on the same session) and only replaces the session when the turn is genuinely still running; the replaced turn keeps its tail and delivers its own answer (BoundTurn.answerWanted) instead of being treated as a /new discard; the terminal-grace callback no-ops when an earlier reconcile already closed the turn. The three old-contract tests were rewritten (not patched) to the canonical contract: 'canonical: a steer the running session refuses replaces the session...' (redteam-issue92), 'canonical: a message arriving while the ended turn's tail is late is steered at once...' (redteam-issue92), 'coverage audit: a steer the session refuses is sent once on the replacement session...' (coverage-audit); the fuzz interleaving test caught a regression (retired turn's terminal dropped) during development and now passes. Full gateway suite: 659 pass / 0 fail across 71 files, including both formerly load-flaky tests. tsc clean."
+    }
+  }
+}

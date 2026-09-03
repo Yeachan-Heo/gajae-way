@@ -34,8 +34,7 @@ test("persistent-session control-plane logs use grep-stable fields", async () =>
 			port,
 			instanceId: "observability",
 			repo: join(home, "workspace"),
-			settleWindowMs: 0,
-			onTurnStart: ({ rows }) => ({ text: rows.map((row) => row.body).join("\n") }),
+			onTurnStart: ({ trigger }) => ({ text: trigger.body }),
 		});
 		expect(
 			database.inboundEnqueue({
@@ -70,8 +69,8 @@ test("persistent-session control-plane logs use grep-stable fields", async () =>
 		);
 		await manager.reset(originKey, JSON.stringify(origin));
 		await eventually(
-			() => lines.some((line) => line.includes(`retired_hold originKey=${originKey} batchKey=`)),
-			"retired batch hold was not logged",
+			() => lines.some((line) => line.includes(`retired_hold originKey=${originKey} epoch=`)),
+			"retired turn hold was not logged",
 		);
 		expect(
 			lines.some((line) =>

@@ -12,7 +12,7 @@ import {
 	type StatusReport,
 } from "@gajaeway/subsession";
 import type { GjcModelSelection } from "../config";
-import type { GatewayDatabase, InboundBatch, InboundMessageRow } from "../store/db";
+import type { GatewayDatabase, InboundMessageRow, InboundTurn } from "../store/db";
 import { sanitizeDiagnostic } from "./rebind";
 import type { SessionBinding, SessionPort } from "./session-port";
 import {
@@ -24,7 +24,6 @@ import {
 	tailOperationRef,
 } from "./tail-runner";
 
-export const DEFAULT_SETTLE_WINDOW_MS = 2_000;
 export const DEFAULT_STALL_TIMEOUT_MS = 120_000;
 /**
  * How many times a turn may replace its session after the Router disowns it.
@@ -34,7 +33,6 @@ export const DEFAULT_STALL_TIMEOUT_MS = 120_000;
 const MAX_SEND_REBIND_ATTEMPTS = 3;
 const RETIRED_REATTACH_DELAY_MS = 25;
 const RETIRED_REATTACH_MAX_ATTEMPTS = 3;
-const DEFAULT_MAX_INBOUND_AGE_MS = 10 * 60_000;
 /**
  * Grace before a decidable-terminal status may complete a batch whose tail has
  * not produced terminal evidence. One bounded hold keeps the tail the live
@@ -49,14 +47,14 @@ const STATUS_TERMINAL_GRACE_MS = 250;
  * clocks. Same tolerance as SessionPort.fetchAssistantSince.
  */
 const TURN_FLOOR_SKEW_MS = 2_000;
-const SETTLE_FAILURE_RETRY_MS = 2_000;
+const DISPATCH_FAILURE_RETRY_MS = 2_000;
 /** Consecutive recovery sweeps (60s apart) an unknown op on a live idle session is held before release. */
 const HOLD_RELEASE_SWEEPS = 2;
 
-export type PersonaActorState = "idle" | "settling" | "turn-running";
+export type PersonaActorState = "idle" | "turn-running";
 
 /**
- * Server-owned chat behavior attached to one durable persona batch. The actor
+ * Server-owned chat behavior attached to one durable persona turn. The actor
  * owns session/recovery ordering; this lifecycle owns only presentation,
  * bootstrap, context/memory, and delivery side effects.
  */
@@ -78,11 +76,12 @@ export interface PersonaTurnIdentity {
 	readonly originKey: string;
 	readonly epoch: number;
 	readonly sessionId: string;
-	readonly batch: InboundBatch;
+	readonly turn: InboundTurn;
 }
 
 export interface PersonaTurnStartInput extends PersonaTurnIdentity {
-	readonly rows: readonly InboundMessageRow[];
+	/** The trigger row; the one prompt body of this turn. */
+	readonly trigger: InboundMessageRow;
 }
 
 export interface PersonaTailFrameInput extends PersonaTurnIdentity {
@@ -104,11 +103,6 @@ export interface PersonaSessionManagerOptions {
 	readonly port: SessionPort;
 	readonly instanceId: string;
 	readonly repo: string;
-	readonly settleWindowMs?: number;
-	/** Resolves the live global/per-channel settle window from the first row. */
-	readonly settleWindowFor?: (row: InboundMessageRow) => number;
-	/** Pending rows older than this are expired instead of answered (0 disables). Default 10 minutes. */
-	readonly maxInboundAgeMs?: number;
 	readonly stallTimeoutMs?: number;
 	readonly brokerGeneration?: () => number;
 	readonly now?: () => number;
@@ -116,7 +110,7 @@ export interface PersonaSessionManagerOptions {
 	readonly clearTimeout?: (timer: unknown) => void;
 	/** Builds the server delivery/bootstrap lifecycle before an accepted SDK send. */
 	readonly onTurnStart?: (input: PersonaTurnStartInput) => PersonaTurnLifecycle | Promise<PersonaTurnLifecycle>;
-	/** Removes ephemeral request ownership after /new discarded unbatched rows. */
+	/** Removes ephemeral request ownership after /new discarded not-yet-dispatched rows. */
 	readonly onInboundDiscard?: (messageIds: readonly string[]) => void | Promise<void>;
 	/** Compatibility observer for direct actor tests; product delivery belongs in onTurnStart. */
 	readonly onAssistantText?: (input: {
@@ -140,10 +134,7 @@ export class PersonaSessionManager {
 	readonly #port: SessionPort;
 	readonly #instanceId: string;
 	readonly #repo: string;
-	readonly #settleWindowMs: number;
-	readonly #settleWindowFor: (row: InboundMessageRow) => number;
 	#stallTimeoutMs: number;
-	#maxInboundAgeMs: number;
 	readonly #brokerGeneration: () => number;
 	readonly #now: () => number;
 	readonly #setTimeout: (work: () => void, delayMs: number) => unknown;
@@ -161,10 +152,7 @@ export class PersonaSessionManager {
 		this.#port = options.port;
 		this.#instanceId = options.instanceId;
 		this.#repo = options.repo;
-		this.#settleWindowMs = nonNegativeInteger(options.settleWindowMs, DEFAULT_SETTLE_WINDOW_MS, "settleWindowMs");
 		this.#stallTimeoutMs = positiveInteger(options.stallTimeoutMs, DEFAULT_STALL_TIMEOUT_MS, "stallTimeoutMs");
-		this.#maxInboundAgeMs = nonNegativeInteger(options.maxInboundAgeMs, DEFAULT_MAX_INBOUND_AGE_MS, "maxInboundAgeMs");
-		this.#settleWindowFor = options.settleWindowFor ?? (() => this.#settleWindowMs);
 		this.#brokerGeneration = options.brokerGeneration ?? (() => 0);
 		this.#now = options.now ?? (() => Date.now());
 		this.#setTimeout = options.setTimeout ?? ((work: () => void, delayMs: number) => setTimeout(work, delayMs));
@@ -200,37 +188,15 @@ export class PersonaSessionManager {
 		return Promise.all(actors.map((actor) => actor.enqueue(async () => await actor.tick()))).then(() => undefined);
 	}
 
-	get maxInboundAgeMs(): number {
-		return this.#maxInboundAgeMs;
-	}
-
-	setMaxInboundAgeMs(ageMs: number | undefined): void {
-		this.#maxInboundAgeMs = nonNegativeInteger(ageMs, DEFAULT_MAX_INBOUND_AGE_MS, "maxInboundAgeMs");
-	}
-
-	/** Expires unbatched pending rows older than the stale floor; returns the expired count. */
-	expireStale(originKey: string): number {
-		if (this.#maxInboundAgeMs === 0) return 0;
-		const floorAt = new Date(this.#now() - this.#maxInboundAgeMs).toISOString();
-		const expired = this.#database.inboundExpireStale(originKey, floorAt);
-		if (expired.length > 0) {
-			this.#log(
-				`inbound_expired origin=${originKey} count=${expired.length} floor=${floorAt} ids=${expired.slice(0, 5).join(",")}${expired.length > 5 ? ",…" : ""}`,
-			);
-			void this.#onInboundDiscard?.(expired);
-		}
-		return expired.length;
-	}
-
 	setStallTimeoutMs(timeoutMs: number | undefined): void {
 		this.#stallTimeoutMs = positiveInteger(timeoutMs, DEFAULT_STALL_TIMEOUT_MS, "stallTimeoutMs");
 		this.#port.setStallTimeoutMs(this.#stallTimeoutMs);
 	}
 
 	/**
-	 * `/new` is a mailbox transition: idle/settling work bumps immediately; a
-	 * running turn is first accepted, then retired and permanently fenced. The
-	 * new epoch returns to idle while the old batch remains a terminal-only hold.
+	 * `/new` is a mailbox transition: idle work bumps immediately; a running turn
+	 * is first accepted, then retired and permanently fenced. The new epoch
+	 * returns to idle while the old turn remains a terminal-only hold.
 	 */
 	reset(originKey: string, originRefJson: string, floorAt = new Date(this.#now()).toISOString()): Promise<void> {
 		return this.#actor(originKey).enqueue(async () => await this.#actor(originKey).reset(originRefJson, floorAt));
@@ -245,7 +211,7 @@ export class PersonaSessionManager {
 		return this.#actor(originKey).enqueue(async () => await this.#actor(originKey).rebindModel(selection));
 	}
 
-	/** Reconstructs durable accepted/settled batches after a gateway restart. */
+	/** Reconstructs durable bound/accepted turns after a gateway restart. */
 	recover(): Promise<void> {
 		if (this.#stopped) return Promise.resolve();
 		const origins = new Set<string>([
@@ -255,13 +221,10 @@ export class PersonaSessionManager {
 		return Promise.all(
 			[...origins].map((originKey) =>
 				this.#actor(originKey).enqueue(async () => {
-					// Outage backlog: anything older than the stale floor is expired
-					// before recovery so it is never answered late.
-					this.expireStale(originKey);
 					await this.#actor(originKey).recover();
 					await this.#actor(originKey).reconcile();
-					// Unbatched pending rows (released before the restart, or arrived
-					// while down) have no timer: arm the settle so they drain now.
+					// Pending rows outside a turn (released before the restart, or
+					// arrived while down) are dispatched now; nothing is expired.
 					await this.#actor(originKey).admit();
 				}),
 			),
@@ -335,10 +298,6 @@ export class PersonaSessionManager {
 		return this.#repo;
 	}
 
-	get settleWindowMs(): number {
-		return this.#settleWindowMs;
-	}
-
 	get stallTimeoutMs(): number {
 		return this.#stallTimeoutMs;
 	}
@@ -351,10 +310,6 @@ export class PersonaSessionManager {
 		return this.#now();
 	}
 
-	settleWindowFor(row: InboundMessageRow): number {
-		return nonNegativeInteger(this.#settleWindowFor(row), this.#settleWindowMs, "settleWindowMs");
-	}
-
 	schedule(work: () => void, delayMs: number): unknown {
 		return this.#setTimeout(work, delayMs);
 	}
@@ -365,7 +320,7 @@ export class PersonaSessionManager {
 
 	async startTurn(input: PersonaTurnStartInput): Promise<PersonaTurnLifecycle> {
 		if (this.#onTurnStart) return await this.#onTurnStart(input);
-		return { text: composeBatchText(input.rows) };
+		return { text: input.trigger.body };
 	}
 
 	async discardInbound(messageIds: readonly string[]): Promise<void> {
@@ -410,7 +365,7 @@ type BoundTurn = PersonaTurnIdentity & {
 	 * (no opRef) and those must never become this turn's answer.
 	 */
 	lastAssistantText?: string;
-	/** `dispatched_at` of the batch: stamped at first bind, before the send. Absent for a pre-v18 adopted batch. */
+	/** `dispatched_at` of the turn: stamped at bind, before the send. Absent only for a corrupt row. */
 	dispatchedAtMs?: number;
 	replaceAfterTerminal: boolean;
 };
@@ -420,8 +375,6 @@ class OriginActor {
 	readonly originKey: string;
 	#queue: Promise<void> = Promise.resolve();
 	#state: PersonaActorState = "idle";
-	#deadline: number | undefined;
-	#timer: unknown;
 	#current: BoundTurn | undefined;
 	readonly #retired = new Map<string, BoundTurn>();
 	readonly #retiredReattachTimers = new Map<string, unknown>();
@@ -451,24 +404,25 @@ class OriginActor {
 		return task;
 	}
 
+	/**
+	 * The canonical rule: a running turn takes the message as a steer; an idle
+	 * origin sends it as the next turn. No window, no coalescing.
+	 */
 	async admit(): Promise<void> {
 		if (!this.#recoveryScanned) await this.recover();
 		if (this.#state === "turn-running") {
 			await this.#steerPending();
 			return;
 		}
-		await this.#armSettle();
+		await this.#dispatchNext();
 	}
 
 	async tick(): Promise<void> {
-		if (this.#state === "settling" && this.#deadline !== undefined && this.#manager.now() >= this.#deadline)
-			await this.#settle();
 		if (this.#current) await this.#reconcileBound(this.#current);
 		for (const retired of [...this.#retired.values()]) await this.#reconcileBound(retired);
 	}
 
 	async reset(originRefJson: string, floorAt: string): Promise<void> {
-		this.#clearTimer();
 		const previous = this.#current;
 		let nextEpoch = 0;
 		let discarded: string[] = [];
@@ -487,23 +441,20 @@ class OriginActor {
 			this.#current = undefined;
 			await previous.lifecycle.onRetired?.(previous);
 			this.#manager.log(
-				`retired_hold originKey=${this.originKey} batchKey=${previous.batch.batchKey} epoch=${previous.epoch} opRef=${previous.batch.opRef} reason=/new`,
+				`retired_hold originKey=${this.originKey} epoch=${previous.epoch} opRef=${previous.turn.opRef} reason=/new`,
 			);
 			this.#scheduleRetiredReattach(previous);
 		}
-		for (const batch of this.#manager.database.inboundNonterminalBatches(this.originKey)) {
-			if (batch.epoch < nextEpoch && !this.#retired.has(`${batch.epoch}:${batch.batchKey}`)) {
+		for (const turn of this.#manager.database.inboundNonterminalTurns(this.originKey)) {
+			if (turn.epoch < nextEpoch && !this.#retired.has(`${turn.epoch}:${turn.opRef}`)) {
 				this.#manager.log(
-					`retired_hold originKey=${this.originKey} batchKey=${batch.batchKey} epoch=${batch.epoch} opRef=${batch.opRef} reason=/new`,
+					`retired_hold originKey=${this.originKey} epoch=${turn.epoch} opRef=${turn.opRef} reason=/new`,
 				);
 			}
 		}
 		this.#state = "idle";
-		this.#deadline = undefined;
-		this.#manager.log(
-			`persona_new origin=${this.originKey} epoch=${nextEpoch} discarded_unbatched=${discarded.length}`,
-		);
-		await this.#armSettle();
+		this.#manager.log(`persona_new origin=${this.originKey} epoch=${nextEpoch} discarded_pending=${discarded.length}`);
+		await this.#dispatchNext();
 	}
 
 	/** Mailbox-serialized live rebind. The caller supplies a verified concrete selection. */
@@ -527,42 +478,30 @@ class OriginActor {
 
 	async recover(): Promise<void> {
 		this.#recoveryScanned = true;
-		for (const batch of this.#manager.database.inboundNonterminalBatches(this.originKey)) {
-			if (
-				this.#current?.batch.batchKey === batch.batchKey ||
-				this.#retired.has(retiredKey({ epoch: batch.epoch, batch }))
-			)
+		for (const turn of this.#manager.database.inboundNonterminalTurns(this.originKey)) {
+			if (this.#current?.turn.opRef === turn.opRef || this.#retired.has(retiredKey({ epoch: turn.epoch, turn })))
 				continue;
 			try {
-				await this.#recoverBatch(batch);
+				await this.#recoverTurn(turn);
 			} catch (error) {
-				// One unrecoverable batch must not abort recovery of the others.
+				// One unrecoverable turn must not abort recovery of the others.
 				this.#manager.log(
-					`recovery_batch_failed origin=${this.originKey} epoch=${batch.epoch} opRef=${batch.opRef} detail=${safeDiagnostic(error)}`,
+					`recovery_turn_failed origin=${this.originKey} epoch=${turn.epoch} opRef=${turn.opRef} detail=${safeDiagnostic(error)}`,
 				);
 			}
 		}
-		if (!this.#current) await this.#armSettle();
+		if (!this.#current) await this.#dispatchNext();
 	}
 
-	async #recoverBatch(batch: InboundBatch): Promise<void> {
+	async #recoverTurn(turn: InboundTurn): Promise<void> {
 		const currentEpoch = this.#epoch();
-		const retired = batch.epoch < currentEpoch;
-		const record = this.#manager.database.getSessionRecord(this.originKey);
-		const sessionId = batch.sessionId ?? (record?.epoch === batch.epoch ? record.sessionId : undefined);
+		const retired = turn.epoch < currentEpoch;
+		const sessionId = turn.sessionId;
 		if (!sessionId) {
-			if (batch.state === "settled" && !retired) {
-				// Settled but never bound/sent: no operation exists anywhere, so the
-				// rows go back to pending and the next settle binds (exactly-once-safe).
-				const attempt = this.#manager.database.inboundBatchRequeueFreshTurn(batch.batchKey);
-				this.#manager.expireStale(this.originKey);
-				this.#manager.log(
-					`recovery_requeue_unbound origin=${this.originKey} epoch=${batch.epoch} opRef=${batch.opRef} attempt=${attempt}`,
-				);
-				return;
-			}
+			// A turn is bound with its session in one statement; a null session
+			// can only be a hand-edited or corrupt row. Hold it for the operator.
 			this.#manager.log(
-				`recovery_hold origin=${this.originKey} epoch=${batch.epoch} opRef=${batch.opRef} reason=${retired ? "retired_session_binding_unavailable" : "session_binding_unavailable"}`,
+				`recovery_hold origin=${this.originKey} epoch=${turn.epoch} opRef=${turn.opRef} reason=${retired ? "retired_session_binding_unavailable" : "session_binding_unavailable"}`,
 			);
 			return;
 		}
@@ -571,14 +510,15 @@ class OriginActor {
 		// A broker replacement between either inspect is an authority shift, never a
 		// reason to resend an accepted operation.
 		const first = await this.#inspectForRecovery(sessionId);
-		const status = await this.#statusForRecovery(sessionId, batch.opRef);
+		const status = await this.#statusForRecovery(sessionId, turn.opRef);
 		const second = await this.#inspectForRecovery(sessionId);
-		// A settled batch whose session the runtime cannot answer for at all (both
-		// inspects failed AND status is unreachable) — e.g. a pre-cutover store the
-		// current gjc no longer reads — has no operation the runtime could be
-		// holding, so releasing its rows back to pending is exactly-once-safe:
-		// the next settle binds a live session. A reachable runtime, even with an
-		// unknown status, keeps the hold: it may have accepted the send.
+		// A bound (never acknowledged) turn whose session the runtime cannot answer
+		// for at all (both inspects failed AND status is unreachable) — e.g. a
+		// pre-cutover store the current gjc no longer reads — has no operation the
+		// runtime could be holding, so releasing its trigger back to pending is
+		// exactly-once-safe: the next dispatch binds a live session. A reachable
+		// runtime, even with an unknown status, keeps the hold: it may have
+		// accepted the send.
 		const disownedByBroker =
 			status.unreachable === true &&
 			(status.unreachableCode === "session_unavailable" || (first.failed && second.failed));
@@ -594,22 +534,21 @@ class OriginActor {
 			(first.failed && second.failed) ||
 			raw?.live === false ||
 			raw?.disowned === true;
-		const releasable = batch.state === "settled" || (batch.state === "accepted" && sessionDead);
+		const releasable = turn.state === "bound" || (turn.state === "accepted" && sessionDead);
 		if (releasable && !retired && status.status.status === "unknown" && disownedByBroker) {
-			const attempt = this.#manager.database.inboundBatchRequeueFreshTurn(batch.batchKey);
-			this.#manager.expireStale(this.originKey);
+			const attempt = this.#manager.database.inboundTurnRequeue(turn.opRef);
 			// The binding itself is unusable: recreate through the existing rebind
-			// primitive (epoch bump) so the next settle binds a fresh live session.
+			// primitive (epoch bump) so the next dispatch binds a fresh live session.
 			const nextEpoch = this.#manager.database.rebindEpoch(this.originKey);
 			this.#manager.log(
-				`recovery_requeue_unaccepted origin=${this.originKey} epoch=${batch.epoch} nextEpoch=${nextEpoch} opRef=${batch.opRef} session=${sessionId} attempt=${attempt}`,
+				`recovery_requeue_unaccepted origin=${this.originKey} epoch=${turn.epoch} nextEpoch=${nextEpoch} opRef=${turn.opRef} session=${sessionId} attempt=${attempt}`,
 			);
 			return;
 		}
 		const authorityShifted =
 			first.failed ||
 			second.failed ||
-			status.operationRef !== batch.opRef ||
+			status.operationRef !== turn.opRef ||
 			!sameRecoveryAuthority(first.session, second.session);
 		const session = second.session;
 
@@ -650,18 +589,18 @@ class OriginActor {
 		const decision = decideRecovery(recoveryInput);
 		switch (decision.action) {
 			case "observe": {
-				if (batch.state === "settled") this.#manager.database.inboundBatchAccept(batch.batchKey);
-				const bound = await this.#adoptRecoveredBatch(batch, sessionId, retired, true);
+				if (turn.state === "bound") this.#manager.database.inboundTurnAccept(turn.opRef);
+				const bound = await this.#adoptRecoveredTurn(turn, sessionId, retired, true);
 				await this.#reconcileBound(bound);
 				if (!bound.retired && this.#current === bound) await this.#steerPending();
 				return;
 			}
 			case "fresh_turn": {
-				if (batch.state === "settled") this.#manager.database.inboundBatchAccept(batch.batchKey);
-				const bound = await this.#adoptRecoveredBatch(batch, sessionId, retired, true);
+				if (turn.state === "bound") this.#manager.database.inboundTurnAccept(turn.opRef);
+				const bound = await this.#adoptRecoveredTurn(turn, sessionId, retired, true);
 				// A successful terminal only needs evidence/delivery reconciliation. A
-				// failed or interrupted terminal releases the durable inbound rows once,
-				// then settles a deterministic replacement on the same live session.
+				// failed or interrupted terminal releases the trigger once, then
+				// dispatches a deterministic replacement on the same live session.
 				bound.replaceAfterTerminal = status.status.status === "failed" && !retired;
 				await this.#reconcileBound(bound);
 				return;
@@ -672,24 +611,24 @@ class OriginActor {
 						sessionId,
 						repo: this.#manager.repo,
 						originKey: this.originKey,
-						epoch: batch.epoch,
+						epoch: turn.epoch,
 					});
-					await this.#recoverBatch(batch);
+					await this.#recoverTurn(turn);
 				} catch (error) {
 					const afterResumeFailure = decideRecovery({
 						...recoveryInput,
 						lane: { ...recoveryInput.lane, resumeImpossible: true },
 					});
-					if (afterResumeFailure.action === "recreate") await this.#recreateAfterResumeFailure(batch, retired);
+					if (afterResumeFailure.action === "recreate") await this.#recreateAfterResumeFailure(turn, retired);
 					else
 						this.#manager.log(
-							`recovery_hold origin=${this.originKey} epoch=${batch.epoch} opRef=${batch.opRef} reason=session_resume_failed detail=${safeDiagnostic(error)}`,
+							`recovery_hold origin=${this.originKey} epoch=${turn.epoch} opRef=${turn.opRef} reason=session_resume_failed detail=${safeDiagnostic(error)}`,
 						);
 				}
 				return;
 			}
 			case "recreate":
-				await this.#recreateAfterResumeFailure(batch, retired);
+				await this.#recreateAfterResumeFailure(turn, retired);
 				return;
 			case "operator_hold": {
 				// A live session whose runtime has NO record of this op-ref and whose
@@ -697,65 +636,65 @@ class OriginActor {
 				// (gateway restarted between send and ack). Release + rebind after the
 				// hold has persisted across HOLD_RELEASE_SWEEPS consecutive sweeps so a
 				// transient index lag never triggers a duplicate.
-				const count = (this.#holdSweeps.get(batch.opRef) ?? 0) + 1;
-				this.#holdSweeps.set(batch.opRef, count);
-				// Only a SETTLED (never sent) batch may be released on a live session. An
-				// ACCEPTED op on a live session is held until its terminal arrives: the
-				// runtime answering "unknown" while a host boots is not proof the send
-				// was lost, and re-firing it double-posts (layofflabs-2, 2026-09-02).
-				const liveIdle =
-					status.status.status === "unknown" && raw?.live === true && !retired && batch.state === "settled";
+				const count = (this.#holdSweeps.get(turn.opRef) ?? 0) + 1;
+				this.#holdSweeps.set(turn.opRef, count);
+				// Only a BOUND (never acknowledged) turn may be released on a live
+				// session. An ACCEPTED op on a live session is held until its terminal
+				// arrives: the runtime answering "unknown" while a host boots is not
+				// proof the send was lost, and re-firing it double-posts
+				// (layofflabs-2, 2026-09-02).
+				const liveIdle = status.status.status === "unknown" && raw?.live === true && !retired && turn.state === "bound";
 				if (liveIdle && count >= HOLD_RELEASE_SWEEPS && (await this.#queueIsEmpty(sessionId))) {
-					this.#holdSweeps.delete(batch.opRef);
-					const attempt = this.#manager.database.inboundBatchRequeueFreshTurn(batch.batchKey);
-					this.#manager.expireStale(this.originKey);
+					this.#holdSweeps.delete(turn.opRef);
+					const attempt = this.#manager.database.inboundTurnRequeue(turn.opRef);
 					const nextEpoch = this.#manager.database.rebindEpoch(this.originKey);
 					this.#manager.log(
-						`recovery_requeue_unaccepted origin=${this.originKey} epoch=${batch.epoch} nextEpoch=${nextEpoch} opRef=${batch.opRef} session=${sessionId} attempt=${attempt} reason=unknown_op_on_live_idle_session sweeps=${count}`,
+						`recovery_requeue_unaccepted origin=${this.originKey} epoch=${turn.epoch} nextEpoch=${nextEpoch} opRef=${turn.opRef} session=${sessionId} attempt=${attempt} reason=unknown_op_on_live_idle_session sweeps=${count}`,
 					);
-					await this.#armSettle();
+					await this.#dispatchNext();
 					return;
 				}
 				this.#manager.log(
-					`recovery_hold origin=${this.originKey} epoch=${batch.epoch} opRef=${batch.opRef} reason=${decision.reason} sweeps=${count}`,
+					`recovery_hold origin=${this.originKey} epoch=${turn.epoch} opRef=${turn.opRef} reason=${decision.reason} sweeps=${count}`,
 				);
 				return;
 			}
 		}
 	}
 
-	async #adoptRecoveredBatch(
-		batch: InboundBatch,
+	async #adoptRecoveredTurn(
+		turn: InboundTurn,
 		sessionId: string,
 		retired: boolean,
 		accepted: boolean,
 	): Promise<BoundTurn> {
-		this.#manager.database.inboundBatchBindSession(batch.batchKey, sessionId);
+		const trigger = this.#manager.database.inboundTurnRow(turn.opRef);
+		if (!trigger) throw new Error(`turn ${turn.opRef} disappeared during recovery`);
 		const lifecycle = await this.#manager.startTurn({
 			originKey: this.originKey,
-			epoch: batch.epoch,
+			epoch: turn.epoch,
 			sessionId,
-			batch,
-			rows: this.#manager.database.inboundBatchRows(batch.batchKey),
+			turn,
+			trigger,
 		});
 		let tail: TailHandle | undefined;
 		let detached = false;
 		try {
-			tail = await this.#attachTail(sessionId, batch.epoch, retired);
+			tail = await this.#attachTail(sessionId, turn.epoch, retired);
 		} catch (error) {
 			if (!retired || !(error instanceof TailCapacityError)) throw error;
 			detached = true;
 			this.#manager.log(
-				`retired_hold originKey=${this.originKey} batchKey=${batch.batchKey} epoch=${batch.epoch} opRef=${batch.opRef} reason=tail_capacity`,
+				`retired_hold originKey=${this.originKey} epoch=${turn.epoch} opRef=${turn.opRef} reason=tail_capacity`,
 			);
 		}
-		const dispatchedAtMs = this.#dispatchFloorMs(batch.batchKey);
+		const dispatchedAtMs = this.#dispatchFloorMs(turn.opRef);
 		const bound: BoundTurn = {
 			originKey: this.originKey,
-			epoch: batch.epoch,
+			epoch: turn.epoch,
 			sessionId,
 			brokerGeneration: this.#manager.brokerGeneration,
-			batch,
+			turn,
 			...(tail ? { tail } : {}),
 			lifecycle,
 			retired,
@@ -768,7 +707,7 @@ class OriginActor {
 			replaceAfterTerminal: false,
 		};
 		tail?.setTurnRunning(true);
-		if (accepted && tail) await tail.markAccepted(batch.opRef);
+		if (accepted && tail) await tail.markAccepted(turn.opRef);
 		if (retired) {
 			this.#retired.set(retiredKey(bound), bound);
 			if (detached) this.#scheduleRetiredReattach(bound);
@@ -779,14 +718,14 @@ class OriginActor {
 		return bound;
 	}
 
-	async #recreateAfterResumeFailure(batch: InboundBatch, retired: boolean): Promise<void> {
+	async #recreateAfterResumeFailure(turn: InboundTurn, retired: boolean): Promise<void> {
 		const reason = retired ? "resume_impossible" : "tail_terminal_evidence_unavailable";
 		this.#manager.log(
-			`recovery_hold origin=${this.originKey} epoch=${batch.epoch} opRef=${batch.opRef} reason=${reason}`,
+			`recovery_hold origin=${this.originKey} epoch=${turn.epoch} opRef=${turn.opRef} reason=${reason}`,
 		);
 		if (retired)
 			this.#manager.log(
-				`retired_hold originKey=${this.originKey} batchKey=${batch.batchKey} epoch=${batch.epoch} opRef=${batch.opRef} reason=resume_impossible`,
+				`retired_hold originKey=${this.originKey} epoch=${turn.epoch} opRef=${turn.opRef} reason=resume_impossible`,
 			);
 	}
 
@@ -798,7 +737,7 @@ class OriginActor {
 	 *    session - the canonical `idle -> send` rule.
 	 * 2. The turn is still running but the session refuses the steer: the
 	 *    session is broken. Retire the turn and bump the epoch so the next
-	 *    settle binds a NEW session (a fresh one is bootstrapped with the last
+	 *    dispatch binds a NEW session (a fresh one is bootstrapped with the last
 	 *    24h of channel context) and the still-pending row becomes that turn's
 	 *    prompt. Unlike a `/new` retire, the user never asked to discard this
 	 *    turn: its tail stays attached and its answer is still delivered.
@@ -808,7 +747,7 @@ class OriginActor {
 		if (this.#current !== current) return;
 		if (current.statusTerminalHolds > 0 && !current.tailEvidenceUnavailable) {
 			// Status is terminal and the bounded tail grace is pending; when it
-			// fires the batch completes and the settle picks the row up.
+			// fires the turn completes and the row is dispatched.
 			return;
 		}
 		current.retired = true;
@@ -817,11 +756,10 @@ class OriginActor {
 		this.#current = undefined;
 		const nextEpoch = this.#manager.database.rebindEpoch(this.originKey);
 		this.#state = "idle";
-		this.#deadline = undefined;
 		this.#manager.log(
-			`session_rebound_after_steer_failure origin=${this.originKey} epoch=${current.epoch} nextEpoch=${nextEpoch} opRef=${current.batch.opRef}`,
+			`session_rebound_after_steer_failure origin=${this.originKey} epoch=${current.epoch} nextEpoch=${nextEpoch} opRef=${current.turn.opRef}`,
 		);
-		await this.#armSettle();
+		await this.#dispatchNext();
 	}
 
 	readonly #holdSweeps = new Map<string, number>();
@@ -881,7 +819,6 @@ class OriginActor {
 
 	async stop(): Promise<void> {
 		this.#stopped = true;
-		this.#clearTimer();
 		for (const timer of this.#retiredReattachTimers.values()) this.#manager.cancel(timer);
 		this.#retiredReattachTimers.clear();
 		for (const timer of this.#graceTimers) this.#manager.cancel(timer);
@@ -902,117 +839,62 @@ class OriginActor {
 	async logShutdownHold(): Promise<void> {
 		if (this.#current)
 			this.#manager.log(
-				`shutdown_hold origin=${this.originKey} epoch=${this.#current.epoch} opRef=${this.#current.batch.opRef}`,
+				`shutdown_hold origin=${this.originKey} epoch=${this.#current.epoch} opRef=${this.#current.turn.opRef}`,
 			);
 	}
 
-	async #armSettle(): Promise<void> {
-		const first = this.#manager.database.inboundPendingOldest(this.originKey);
-		if (!first) {
-			this.#state = "idle";
-			this.#deadline = undefined;
-			return;
-		}
-		if (this.#state === "settling") return;
-		const arrivedAt = Date.parse(first.received_at);
-		if (!Number.isFinite(arrivedAt)) throw new Error(`inbound ${first.message_id} has invalid received_at`);
-		this.#state = "settling";
-		this.#deadline = arrivedAt + this.#manager.settleWindowFor(first);
-		const delay = Math.max(0, this.#deadline - this.#manager.now());
-		this.#timer = this.#manager.schedule(() => {
-			void this.enqueue(async () => await this.tick()).catch((error: unknown) => {
-				this.#manager.log(`persona_settle_failed origin=${this.originKey} detail=${safeDiagnostic(error)}`);
-				// A failed settle must not strand the origin in "settling" with no
-				// timer: reset and re-arm with a short delay so pending rows drain.
-				this.#state = "idle";
-				this.#deadline = undefined;
-				const retry = this.#manager.schedule(() => {
-					this.#graceTimers.delete(retry);
-					if (this.#stopped || this.#manager.stopped) return;
-					void this.enqueue(async () => await this.#armSettle()).catch(() => {});
-				}, SETTLE_FAILURE_RETRY_MS);
-				this.#graceTimers.add(retry);
-			});
-		}, delay);
-	}
-
-	async #settle(): Promise<void> {
-		if (this.#state !== "settling" || this.#deadline === undefined) return;
-		this.#clearTimer();
-		this.#manager.expireStale(this.originKey);
-		const first = this.#manager.database.inboundPendingOldest(this.originKey);
-		if (!first) {
-			this.#state = "idle";
-			this.#deadline = undefined;
-			return;
-		}
+	/**
+	 * Sends the oldest pending row as the next turn, immediately. A dispatch
+	 * that cannot even bind a session is retried with backoff; the row stays
+	 * pending throughout and is never expired.
+	 */
+	async #dispatchNext(): Promise<void> {
+		if (this.#state !== "idle" || this.#current) return;
+		const trigger = this.#manager.database.inboundPendingOldest(this.originKey);
+		if (!trigger) return;
 		const epoch = this.#epoch();
-		const cutoff = new Date(this.#deadline).toISOString();
-		const retryAttempt = this.#manager.database.freshTurnAttempt(this.originKey, epoch, first.message_id);
-		const batchKey = personaBatchKey(this.originKey, epoch, first.message_id, cutoff, retryAttempt);
-		const opRef = personaBatchOpRef(
-			this.#manager.instanceId,
-			this.originKey,
-			epoch,
-			first.message_id,
-			cutoff,
-			retryAttempt,
-		);
-		const rows = this.#manager.database.inboundSettleBatch({
-			originKey: this.originKey,
-			epoch,
-			cutoff,
-			batchKey,
-			opRef,
-		});
-		if (rows.length === 0) {
-			this.#state = "idle";
-			this.#deadline = undefined;
-			await this.#armSettle();
-			return;
-		}
-		const batch = this.#manager.database
-			.inboundNonterminalBatches(this.originKey, epoch)
-			.find((candidate) => candidate.batchKey === batchKey);
-		if (!batch) throw new Error(`settled batch ${batchKey} disappeared before send`);
+		const retryAttempt = this.#manager.database.freshTurnAttempt(this.originKey, epoch, trigger.message_id);
+		const opRef = personaTurnOpRef(this.#manager.instanceId, this.originKey, epoch, trigger.message_id, retryAttempt);
 		let binding: SessionBinding;
 		try {
 			binding = await this.#ensureSession(epoch);
 		} catch (error) {
-			// Nothing was sent: release the rows and retry the settle with backoff
-			// instead of leaving a settled-but-unbound batch for the recovery sweep.
-			const attempt = this.#manager.database.inboundBatchRequeueFreshTurn(batchKey);
-			this.#manager.expireStale(this.originKey);
-			this.#state = "idle";
-			this.#deadline = undefined;
 			this.#manager.log(
-				`persona_bind_failed origin=${this.originKey} epoch=${epoch} attempt=${attempt} detail=${safeDiagnostic(error)}`,
+				`persona_bind_failed origin=${this.originKey} epoch=${epoch} message=${trigger.message_id} detail=${safeDiagnostic(error)}`,
 			);
-			const delay = Math.min(30_000, 1_000 * 2 ** Math.min(attempt, 5));
-			const timer = this.#manager.schedule(() => {
-				this.#graceTimers.delete(timer);
-				if (this.#stopped || this.#manager.stopped) return;
-				void this.enqueue(async () => await this.#armSettle()).catch(() => {});
-			}, delay);
-			this.#graceTimers.add(timer);
+			this.#scheduleDispatchRetry(DISPATCH_FAILURE_RETRY_MS);
 			return;
 		}
-		this.#manager.database.inboundBatchBindSession(batchKey, binding.sessionId);
+		const bound = this.#manager.database.inboundBindTurn({
+			messageId: trigger.message_id,
+			originKey: this.originKey,
+			epoch,
+			opRef,
+			sessionId: binding.sessionId,
+		});
+		const turn: InboundTurn = {
+			originKey: this.originKey,
+			epoch,
+			state: "bound",
+			opRef,
+			sessionId: binding.sessionId,
+			triggerMessageId: trigger.message_id,
+		};
 		const lifecycle = await this.#manager.startTurn({
 			originKey: this.originKey,
 			epoch,
 			sessionId: binding.sessionId,
-			batch,
-			rows,
+			turn,
+			trigger: bound,
 		});
 		const tail = await this.#attachTail(binding.sessionId, epoch, false);
-		const dispatchedAtMs = this.#dispatchFloorMs(batchKey);
+		const dispatchedAtMs = this.#dispatchFloorMs(opRef);
 		const current: BoundTurn = {
 			originKey: this.originKey,
 			epoch,
 			sessionId: binding.sessionId,
 			brokerGeneration: this.#manager.brokerGeneration,
-			batch,
+			turn,
 			tail,
 			lifecycle,
 			retired: false,
@@ -1054,7 +936,7 @@ class OriginActor {
 				...(lifecycle.systemPreamble ? { systemPreamble: lifecycle.systemPreamble } : {}),
 				...(lifecycle.sendModelFallback ? { model: lifecycle.sendModelFallback } : {}),
 			});
-			this.#manager.database.inboundBatchAccept(batchKey);
+			this.#manager.database.inboundTurnAccept(opRef);
 			await tail.markAccepted(opRef);
 		} catch (error) {
 			// The Router disowning the session id is NOT ambiguous: it is proof the
@@ -1064,7 +946,8 @@ class OriginActor {
 			// an empty gjc_session_id and no retry, until a human restarted the
 			// daemon (live: epoch 41, session_unavailable, 2026-09-03).
 			if (sdkStatusErrorCode(error) === "session_unavailable") {
-				const attempt = this.#manager.database.inboundBatchRequeueFreshTurn(batchKey);
+				await tail.close();
+				const attempt = this.#manager.database.inboundTurnRequeue(opRef);
 				const nextEpoch = this.#manager.database.rebindEpoch(this.originKey);
 				this.#current = undefined;
 				this.#state = "idle";
@@ -1073,7 +956,7 @@ class OriginActor {
 				);
 				// Bounded: a new session per attempt, and a fresh session is bootstrapped
 				// with the last 24h of channel context, so the retry keeps the thread.
-				if (attempt <= MAX_SEND_REBIND_ATTEMPTS) await this.#armSettle();
+				if (attempt <= MAX_SEND_REBIND_ATTEMPTS) await this.#dispatchNext();
 				else
 					this.#manager.log(
 						`persona_send_unrecoverable origin=${this.originKey} opRef=${opRef} attempts=${attempt} reason=session_unavailable`,
@@ -1081,7 +964,8 @@ class OriginActor {
 				return;
 			}
 			// A command failure can occur after broker acceptance. Reconcile its exact
-			// durable op-ref; an unknown status remains held and is never resent.
+			// durable op-ref; an unknown status is an operator hold that the periodic
+			// reconcile keeps sweeping, and it is never resent.
 			if ((error instanceof OpRefRejectedError && error.code === CLIENT_REF_CONFLICT_CODE) || isOpRefRejection(error))
 				this.#manager.log(`recovery_client_ref_conflict origin=${this.originKey} epoch=${epoch} opRef=${opRef}`);
 			else
@@ -1089,12 +973,18 @@ class OriginActor {
 					`persona_send_ambiguous origin=${this.originKey} opRef=${opRef} detail=${safeDiagnostic(error)}`,
 				);
 			await this.#reconcileBound(current);
-			if (this.#manager.database.inboundBatchRows(batchKey)[0]?.batch_state !== "settled") return;
-			throw error;
-		} finally {
-			this.#deadline = undefined;
+			return;
 		}
 		await this.#steerPending();
+	}
+
+	#scheduleDispatchRetry(delayMs: number): void {
+		const timer = this.#manager.schedule(() => {
+			this.#graceTimers.delete(timer);
+			if (this.#stopped || this.#manager.stopped) return;
+			void this.enqueue(async () => await this.#dispatchNext()).catch(() => {});
+		}, delayMs);
+		this.#graceTimers.add(timer);
 	}
 
 	/**
@@ -1141,18 +1031,17 @@ class OriginActor {
 			if (
 				this.#manager.database.inboundSteerAccepted({
 					messageId: row.message_id,
-					batchKey: current.batch.batchKey,
 					epoch: current.epoch,
-					opRef: current.batch.opRef,
+					opRef: current.turn.opRef,
 				})
 			) {
 				await this.#manager.emitSteer({
 					originKey: this.originKey,
 					messageId: row.message_id,
-					opRef: current.batch.opRef,
+					opRef: current.turn.opRef,
 				});
 				this.#manager.log(
-					`steer_delivered originKey=${this.originKey} opRef=${current.batch.opRef} messageId=${row.message_id}`,
+					`steer_delivered originKey=${this.originKey} opRef=${current.turn.opRef} messageId=${row.message_id}`,
 				);
 			}
 		}
@@ -1243,11 +1132,11 @@ class OriginActor {
 		bound.detached = true;
 		this.#manager.log(`retention_gap origin=${this.originKey} epoch=${epoch} session=${sessionId}`);
 		this.#manager.log(
-			`recovery_hold origin=${this.originKey} epoch=${epoch} opRef=${bound.batch.opRef} reason=tail_retention_gap resync=${resyncCoordinate(resync)}`,
+			`recovery_hold origin=${this.originKey} epoch=${epoch} opRef=${bound.turn.opRef} reason=tail_retention_gap resync=${resyncCoordinate(resync)}`,
 		);
 		if (retired || bound.retired)
 			this.#manager.log(
-				`retired_hold originKey=${this.originKey} batchKey=${bound.batch.batchKey} epoch=${epoch} opRef=${bound.batch.opRef} reason=tail_retention_gap`,
+				`retired_hold originKey=${this.originKey} epoch=${epoch} opRef=${bound.turn.opRef} reason=tail_retention_gap`,
 			);
 	}
 
@@ -1287,7 +1176,7 @@ class OriginActor {
 						eventId: frame.eventId,
 						deliveryId: deterministicInterimDeliveryId(
 							this.originKey,
-							bound.batch.triggerMessageId,
+							bound.turn.triggerMessageId,
 							frame.assistantText,
 							0,
 						),
@@ -1318,7 +1207,7 @@ class OriginActor {
 			await bound.tail?.close();
 			bound.detached = true;
 			this.#manager.log(
-				`retired_hold originKey=${this.originKey} batchKey=${bound.batch.batchKey} epoch=${epoch} opRef=${bound.batch.opRef} reason=stall`,
+				`retired_hold originKey=${this.originKey} epoch=${epoch} opRef=${bound.turn.opRef} reason=stall`,
 			);
 			this.#scheduleRetiredReattach(bound);
 		}
@@ -1335,7 +1224,7 @@ class OriginActor {
 			report = await this.#manager.port.status({
 				sessionId: bound.sessionId,
 				repo: this.#manager.repo,
-				opRef: bound.batch.opRef,
+				opRef: bound.turn.opRef,
 			});
 		} catch (error) {
 			// The broker disowning the id (session_unavailable) with the session
@@ -1347,35 +1236,33 @@ class OriginActor {
 					: undefined;
 				if (raw?.live !== true) {
 					await bound.tail?.close();
-					const attempt = this.#manager.database.inboundBatchRequeueFreshTurn(bound.batch.batchKey);
-					this.#manager.expireStale(this.originKey);
+					const attempt = this.#manager.database.inboundTurnRequeue(bound.turn.opRef);
 					const nextEpoch = this.#manager.database.rebindEpoch(this.originKey);
 					if (this.#current === bound) {
 						this.#current = undefined;
 						this.#state = "idle";
 					}
 					this.#manager.log(
-						`recovery_requeue_unaccepted origin=${this.originKey} epoch=${bound.epoch} nextEpoch=${nextEpoch} opRef=${bound.batch.opRef} session=${bound.sessionId} attempt=${attempt} reason=router_disowned`,
+						`recovery_requeue_unaccepted origin=${this.originKey} epoch=${bound.epoch} nextEpoch=${nextEpoch} opRef=${bound.turn.opRef} session=${bound.sessionId} attempt=${attempt} reason=router_disowned`,
 					);
-					await this.#armSettle();
+					await this.#dispatchNext();
 					return;
 				}
 			}
 			this.#manager.log(
-				`recovery_hold origin=${this.originKey} epoch=${bound.epoch} opRef=${bound.batch.opRef} reason=status_unavailable detail=${safeDiagnostic(error)}`,
+				`recovery_hold origin=${this.originKey} epoch=${bound.epoch} opRef=${bound.turn.opRef} reason=status_unavailable detail=${safeDiagnostic(error)}`,
 			);
 			return;
 		}
 		if (report.status.status === "unknown") {
 			this.#manager.log(
-				`recovery_hold origin=${this.originKey} epoch=${bound.epoch} opRef=${bound.batch.opRef} reason=operation_state_unknown`,
+				`recovery_hold origin=${this.originKey} epoch=${bound.epoch} opRef=${bound.turn.opRef} reason=operation_state_unknown`,
 			);
 			return;
 		}
-		const rows = this.#manager.database.inboundBatchRows(bound.batch.batchKey);
-		if (rows.length > 0 && rows.every((row) => row.batch_state === "settled")) {
-			this.#manager.database.inboundBatchAccept(bound.batch.batchKey);
-			if (bound.tail) await bound.tail.markAccepted(bound.batch.opRef);
+		if (this.#manager.database.inboundTurnRow(bound.turn.opRef)?.turn_state === "bound") {
+			this.#manager.database.inboundTurnAccept(bound.turn.opRef);
+			if (bound.tail) await bound.tail.markAccepted(bound.turn.opRef);
 		}
 		if (!isTerminalStatus(report.status.status)) {
 			if (bound.detached && !bound.tailEvidenceUnavailable) {
@@ -1396,7 +1283,7 @@ class OriginActor {
 			// explicit log line instead of a silent shortcut.
 			bound.statusTerminalHolds += 1;
 			this.#manager.log(
-				`recovery_hold origin=${this.originKey} epoch=${bound.epoch} opRef=${bound.batch.opRef} reason=tail_terminal_evidence_unavailable`,
+				`recovery_hold origin=${this.originKey} epoch=${bound.epoch} opRef=${bound.turn.opRef} reason=tail_terminal_evidence_unavailable`,
 			);
 			const timer = this.#manager.schedule(() => {
 				this.#graceTimers.delete(timer);
@@ -1417,20 +1304,20 @@ class OriginActor {
 		}
 		if (!bound.tailTerminalObserved) {
 			this.#manager.log(
-				`terminal_status_reconciled origin=${this.originKey} epoch=${bound.epoch} opRef=${bound.batch.opRef} tail_evidence=unavailable`,
+				`terminal_status_reconciled origin=${this.originKey} epoch=${bound.epoch} opRef=${bound.turn.opRef} tail_evidence=unavailable`,
 			);
 		}
 		if (bound.replaceAfterTerminal) {
-			this.#manager.database.inboundBatchRequeueFreshTurn(bound.batch.batchKey);
+			this.#manager.database.inboundTurnRequeue(bound.turn.opRef);
 			bound.tail?.setTurnRunning(false);
 			await bound.tail?.close();
 			if (this.#current === bound) {
 				this.#current = undefined;
 				this.#state = "idle";
 				this.#manager.log(
-					`recovery_fresh_turn origin=${this.originKey} epoch=${bound.epoch} opRef=${bound.batch.opRef}`,
+					`recovery_fresh_turn origin=${this.originKey} epoch=${bound.epoch} opRef=${bound.turn.opRef}`,
 				);
-				await this.#armSettle();
+				await this.#dispatchNext();
 			}
 			return;
 		}
@@ -1460,7 +1347,7 @@ class OriginActor {
 						text = since?.text;
 					} catch (error) {
 						this.#manager.log(
-							`terminal_text_unavailable origin=${this.originKey} epoch=${bound.epoch} opRef=${bound.batch.opRef} reason=transcript_read_failed detail=${safeDiagnostic(error)}`,
+							`terminal_text_unavailable origin=${this.originKey} epoch=${bound.epoch} opRef=${bound.turn.opRef} reason=transcript_read_failed detail=${safeDiagnostic(error)}`,
 						);
 					}
 				}
@@ -1477,12 +1364,12 @@ class OriginActor {
 						// unbounded last row could repost the previous turn. Hold for
 						// the operator instead.
 						this.#manager.log(
-							`recovery_hold origin=${this.originKey} epoch=${bound.epoch} opRef=${bound.batch.opRef} reason=no_turn_floor`,
+							`recovery_hold origin=${this.originKey} epoch=${bound.epoch} opRef=${bound.turn.opRef} reason=no_turn_floor`,
 						);
 						return;
 					}
 					this.#manager.log(
-						`terminal_text_unavailable origin=${this.originKey} epoch=${bound.epoch} opRef=${bound.batch.opRef} reason=no_assistant_row_since_start`,
+						`terminal_text_unavailable origin=${this.originKey} epoch=${bound.epoch} opRef=${bound.turn.opRef} reason=no_assistant_row_since_start`,
 					);
 					text = "";
 				}
@@ -1492,11 +1379,11 @@ class OriginActor {
 			}
 		} catch (error) {
 			this.#manager.log(
-				`persona_terminal_delivery_failed origin=${this.originKey} opRef=${bound.batch.opRef} detail=${safeDiagnostic(error)}`,
+				`persona_terminal_delivery_failed origin=${this.originKey} opRef=${bound.turn.opRef} detail=${safeDiagnostic(error)}`,
 			);
 			throw error;
 		}
-		const completed = this.#manager.database.inboundBatchComplete(bound.batch.batchKey);
+		const completed = this.#manager.database.inboundTurnComplete(bound.turn.opRef);
 		if (completed === 0) return;
 		bound.tail?.setTurnRunning(false);
 		await bound.tail?.close();
@@ -1508,7 +1395,7 @@ class OriginActor {
 		if (this.#current === bound) {
 			this.#current = undefined;
 			this.#state = "idle";
-			await this.#armSettle();
+			await this.#dispatchNext();
 		}
 	}
 
@@ -1518,7 +1405,7 @@ class OriginActor {
 		bound.brokerGeneration = this.#manager.brokerGeneration;
 		bound.detached = false;
 		tail.setTurnRunning(true);
-		await tail.markAccepted(bound.batch.opRef);
+		await tail.markAccepted(bound.turn.opRef);
 	}
 
 	#scheduleRetiredReattach(bound: BoundTurn, attempt = 0): void {
@@ -1539,14 +1426,14 @@ class OriginActor {
 					bound.brokerGeneration = this.#manager.brokerGeneration;
 					bound.detached = false;
 					tail.setTurnRunning(true);
-					await tail.markAccepted(bound.batch.opRef);
+					await tail.markAccepted(bound.turn.opRef);
 				} catch (error) {
 					if (error instanceof TailCapacityError) {
 						this.#scheduleRetiredReattach(bound, attempt + 1);
 						return;
 					}
 					this.#manager.log(
-						`recovery_hold origin=${this.originKey} epoch=${bound.epoch} opRef=${bound.batch.opRef} reason=retired_tail_reattach_failed detail=${safeDiagnostic(error)}`,
+						`recovery_hold origin=${this.originKey} epoch=${bound.epoch} opRef=${bound.turn.opRef} reason=retired_tail_reattach_failed detail=${safeDiagnostic(error)}`,
 					);
 				}
 			}).catch(() => {});
@@ -1561,8 +1448,8 @@ class OriginActor {
 		this.#retiredReattachTimers.delete(key);
 	}
 
-	#dispatchFloorMs(batchKey: string): number | undefined {
-		const dispatchedAt = this.#manager.database.inboundBatchDispatchedAt(batchKey);
+	#dispatchFloorMs(opRef: string): number | undefined {
+		const dispatchedAt = this.#manager.database.inboundTurnDispatchedAt(opRef);
 		const at = dispatchedAt ? Date.parse(dispatchedAt) : Number.NaN;
 		return Number.isFinite(at) ? at : undefined;
 	}
@@ -1575,7 +1462,7 @@ class OriginActor {
 	 */
 	#predatesTurn(bound: BoundTurn, frame: TailFrame): boolean {
 		if (bound.dispatchedAtMs === undefined) return false;
-		if (tailOperationRef(frame) === bound.batch.opRef) return false;
+		if (tailOperationRef(frame) === bound.turn.opRef) return false;
 		const at = tailFrameTimestampMs(frame);
 		return at !== undefined && at + TURN_FLOOR_SKEW_MS < bound.dispatchedAtMs;
 	}
@@ -1595,11 +1482,6 @@ class OriginActor {
 
 	#epoch(): number {
 		return this.#manager.database.getSessionRecord(this.originKey)?.epoch ?? 0;
-	}
-
-	#clearTimer(): void {
-		if (this.#timer !== undefined) this.#manager.cancel(this.#timer);
-		this.#timer = undefined;
 	}
 }
 
@@ -1646,21 +1528,18 @@ function resyncCoordinate(value: unknown): string {
 }
 
 /** Keeps raw platform identifiers in SQLite and derives a safe, fixed-length SDK client reference. */
-export function personaBatchOpRef(
+export function personaTurnOpRef(
 	instanceId: string,
 	originKey: string,
 	epoch: number,
-	oldestMessageId: string,
-	cutoff: string,
+	triggerMessageId: string,
 	retryAttempt = 0,
 ): string {
 	const digest = createHash("sha256")
-		.update(`${instanceId}|${originKey}|${epoch}|${oldestMessageId}|${cutoff}|${retryAttempt}`)
+		.update(`${instanceId}|${originKey}|${epoch}|${triggerMessageId}|${retryAttempt}`)
 		.digest("hex")
 		.slice(0, 32);
-	const opRef = `gw-p-${digest}`;
-	assertValidOpRef(opRef);
-	return opRef;
+	return `gw-p-${digest}`;
 }
 
 function describeModel(selection: GjcModelSelection | undefined): string {
@@ -1683,27 +1562,12 @@ function sameRecoveryAuthority(left: BrokerSession | undefined, right: BrokerSes
 	);
 }
 
-export function personaBatchKey(
-	originKey: string,
-	epoch: number,
-	oldestMessageId: string,
-	cutoff: string,
-	retryAttempt = 0,
-): string {
-	return `${originKey}|${epoch}|${oldestMessageId}|${cutoff}|${retryAttempt}`;
-}
-
-/** The actor's one prompt body is fixed at the durable boundary; later rows route through steering or the next batch. */
-export function composeBatchText(rows: readonly InboundMessageRow[]): string {
-	return rows.map((row) => row.body).join("\n");
-}
-
 function steerClientRef(instanceId: string, originKey: string, epoch: number, messageId: string): string {
 	return `gw-s-${createHash("sha256").update(`${instanceId}|${originKey}|${epoch}|${messageId}`).digest("hex").slice(0, 32)}`;
 }
 
-function retiredKey(bound: Pick<BoundTurn, "epoch" | "batch">): string {
-	return `${bound.epoch}:${bound.batch.batchKey}`;
+function retiredKey(bound: Pick<BoundTurn, "epoch" | "turn">): string {
+	return `${bound.epoch}:${bound.turn.opRef}`;
 }
 
 function positiveInteger(value: number | undefined, fallback: number, name: string): number {

@@ -62,13 +62,11 @@ test("projector reads durable rows through the database and stays fail-closed", 
 		expect(dispatching.phase).toBe("dispatching");
 		expect(dispatching.sessions[0].pendingInbound).toBe(1);
 
-		// Claiming moves it to in-flight; completion returns to idle.
-		const claimed = database.inboundClaimNext(key);
-		expect(claimed?.message_id).toBe("m1");
-		const claimedCycle = new RuntimeCycleProjector(database, { queueDepth: 0 }).project();
-		expect(claimedCycle.phase).toBe("dispatching");
-		expect(claimedCycle.inFlightInbound).toBe(1);
-		database.inboundComplete("m1");
+		// Binding it as a turn keeps it dispatching; terminal completion returns to idle.
+		database.inboundBindTurn({ messageId: "m1", originKey: key, epoch: 0, opRef: "gw-p-m1", sessionId: "s1" });
+		const boundCycle = new RuntimeCycleProjector(database, { queueDepth: 0 }).project();
+		expect(boundCycle.phase).toBe("dispatching");
+		expect(database.inboundTurnComplete("gw-p-m1")).toBe(1);
 		expect(new RuntimeCycleProjector(database, { queueDepth: 0 }).project().phase).toBe("idle");
 
 		// A quarantined memory intent is a gate, not silence.

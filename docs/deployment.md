@@ -59,12 +59,11 @@ Use `config.json` schema version 1. Every configured secret is a credential-file
   "webhook": { "bind": "127.0.0.1", "port": 8080, "exposeNonLoopback": false },
   "watcherRoots": ["/Users/me/automations"],
   "scriptRoot": "/Users/me/automations",
-  "settleWindowMs": 2000,
   "stallTimeoutMs": 120000
 }
 ```
 
-`socketPath`, `dbPath`, `logVerbosity`, credentials, channels, webhook, watcher roots, script root, `settleWindowMs`, and `stallTimeoutMs` are optional. Socket and database paths default inside the home directory, `settleWindowMs` defaults to 2000 ms, `stallTimeoutMs` defaults to 120000 ms, and log verbosity defaults to `info`. `turnTimeoutMs` is rejected because persistent-session liveness is alert-only.
+`socketPath`, `dbPath`, `logVerbosity`, credentials, channels, webhook, watcher roots, script root, and `stallTimeoutMs` are optional. Socket and database paths default inside the home directory, `stallTimeoutMs` defaults to 120000 ms, and log verbosity defaults to `info`. `turnTimeoutMs` is rejected because persistent-session liveness is alert-only; `settleWindowMs`, `channels.*.settleWindowMs` and `maxInboundAgeMs` are rejected because every message is steered or sent immediately and nothing expires while queued.
 
 ## Reloading configuration without a restart
 
@@ -72,7 +71,7 @@ A running gateway re-reads `config.json` on `SIGHUP` (`kill -HUP <pid>`) or on t
 
 The reload is fail-safe and reports exactly what it did:
 
-- `changed` — fields applied live. `mentionAllowlist`, `channels`, `settleWindowMs`, and `stallTimeoutMs` are re-read at runtime; a change takes effect on the next actor event.
+- `changed` — fields applied live. `mentionAllowlist`, `channels`, and `stallTimeoutMs` are re-read at runtime; a change takes effect on the next actor event.
 - `restartRequired` — fields you edited that are bound to a startup resource (`socketPath`, `dbPath`, `model`, `credentials`, `webhook`, `watcherRoots`, `scriptRoot`, `ownerTarget`, `monitorContextFailureRollThreshold`). They are reported and deliberately NOT applied; restart to pick them up.
 - `ignored` — fields you edited that no code reads at all. `logVerbosity` is currently parsed but unconsumed, so editing it has no effect and no restart would give it one.
 - On a parse or validation error, or when `config.json` is missing or unreadable, the reload fails, keeps the previous configuration untouched, and returns a diagnostic. A missing file never publishes defaults over live policy, because that would drop the mention allowlist and open a mention-gated room.

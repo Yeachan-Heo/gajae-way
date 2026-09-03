@@ -2,14 +2,13 @@ import { afterEach, expect, test } from "bun:test";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { PersonaSessionManager, personaBatchOpRef } from "../src/orchestrator/persona-session";
-import { GatewayDatabase, type InboundMessageRow } from "../src/store/db";
+import { PersonaSessionManager, personaTurnOpRef } from "../src/orchestrator/persona-session";
+import { GatewayDatabase } from "../src/store/db";
 import { ScriptedSessionPort } from "./session-port.fake";
 
 let home = "";
 let database: GatewayDatabase | undefined;
 let manager: PersonaSessionManager | undefined;
-let latestBatchKey = "";
 let latestOpRef = "";
 
 afterEach(async () => {
@@ -19,7 +18,6 @@ afterEach(async () => {
 	database = undefined;
 	if (home) await rm(home, { recursive: true, force: true });
 	home = "";
-	latestBatchKey = "";
 	latestOpRef = "";
 });
 
@@ -55,12 +53,10 @@ async function harness(
 		port,
 		instanceId: "instance-test",
 		repo: join(home, "workspace"),
-		settleWindowMs: 0,
-		onTurnStart: ({ rows, batch }) => {
-			latestBatchKey = batch.batchKey;
-			latestOpRef = batch.opRef;
+		onTurnStart: ({ trigger, turn }) => {
+			latestOpRef = turn.opRef;
 			return {
-				text: rows.map((row) => row.body).join("\n"),
+				text: trigger.body,
 				onTerminal: ({ text }) => hooks.terminal?.(text),
 				onRetired: () => hooks.retired?.(),
 			};
@@ -68,7 +64,7 @@ async function harness(
 	});
 }
 
-test("actor settles durable inbound, sends one deterministic caller op-ref, then completes on tail terminal", async () => {
+test("actor immediately dispatches durable inbound with one deterministic caller op-ref, then completes on tail terminal", async () => {
 	const port = new ScriptedSessionPort({
 		onSend: (input, scripted) => scripted.complete(input.opRef, "persona reply"),
 	});
@@ -85,7 +81,7 @@ test("actor settles durable inbound, sends one deterministic caller op-ref, then
 	expect(send.opRef).toMatch(/^gw-p-[0-9a-f]{32}$/);
 	expect(terminal).toEqual(["persona reply"]);
 	expect(database?.inboundPendingCount(KEY)).toBe(0);
-	expect(database?.inboundBatchRows(latestBatchKey)[0]).toMatchObject({ state: "done", batch_state: "done" });
+	expect(database?.inboundTurnRow(latestOpRef)).toMatchObject({ state: "done", turn_state: "done" });
 });
 
 test("a message admitted while a persistent turn is running becomes an operator-gated steer", async () => {
@@ -101,42 +97,52 @@ test("a message admitted while a persistent turn is running becomes an operator-
 	expect(port.steers).toHaveLength(1);
 	expect(port.steers[0]).toMatchObject({ sessionId: port.sends[0]!.sessionId });
 	expect(port.steers[0]!.text.endsWith("\ncorrection")).toBe(true);
+	expect(database?.inboundTurnRows(latestOpRef)).toEqual(
+		expect.arrayContaining([
+			expect.objectContaining({
+				message_id: "m-2",
+				turn_role: "steer",
+				turn_state: "done",
+				turn_op_ref: latestOpRef,
+			}),
+		]),
+	);
 	port.complete(port.sends[0]!.opRef, "done");
 	await eventually(
-		() => database?.inboundBatchRows(latestBatchKey)[0]?.batch_state === "done",
-		"accepted batch did not reconcile terminal",
+		() => database?.inboundTurnRow(latestOpRef)?.turn_state === "done",
+		"accepted turn did not reconcile terminal",
 	);
 });
 
-test("bounded shutdown reconciliation leaves a nonterminal accepted batch durable", async () => {
+test("bounded shutdown reconciliation leaves a nonterminal accepted turn durable", async () => {
 	const port = new ScriptedSessionPort();
 	await harness(port);
 	enqueue("m-1", "still running");
 	await manager?.notifyInbound(KEY);
-	await eventually(() => port.sends.length === 1, "accepted batch did not start before shutdown");
+	await eventually(() => port.sends.length === 1, "accepted turn did not start before shutdown");
 	await manager?.drain(0);
 	expect(manager?.state(KEY)).toBe("turn-running");
-	expect(database?.inboundBatchRows(latestBatchKey)[0]).toMatchObject({ state: "pending", batch_state: "accepted" });
+	expect(database?.inboundTurnRow(latestOpRef)).toMatchObject({ state: "pending", turn_state: "accepted" });
 });
 
-test("/new retires an accepted turn, fences its late output, and preserves batch recovery until terminal", async () => {
+test("/new retires an accepted turn, fences its late output, and preserves turn recovery until terminal", async () => {
 	const port = new ScriptedSessionPort();
 	let retired = 0;
 	const terminal: string[] = [];
 	await harness(port, { retired: () => retired++, terminal: (text) => terminal.push(text) });
 	enqueue("m-1", "old turn");
 	await manager?.notifyInbound(KEY);
-	await eventually(() => port.sends.length === 1, "accepted batch did not start before reset");
+	await eventually(() => port.sends.length === 1, "accepted turn did not start before reset");
 	const first = port.sends[0]!;
 	await manager?.reset(KEY, JSON.stringify(ORIGIN));
 
 	expect(retired).toBe(1);
 	expect(database?.getSessionRecord(KEY)?.epoch).toBe(1);
-	expect(database?.inboundBatchRows(latestBatchKey)[0]).toMatchObject({ state: "pending", batch_state: "accepted" });
+	expect(database?.inboundTurnRow(latestOpRef)).toMatchObject({ state: "pending", turn_state: "accepted" });
 	port.complete(first.opRef, "stale output");
 	await eventually(
-		() => database?.inboundBatchRows(latestBatchKey)[0]?.batch_state === "done",
-		"retired batch did not reconcile",
+		() => database?.inboundTurnRow(latestOpRef)?.turn_state === "done",
+		"retired turn did not reconcile",
 	);
 	expect(terminal).toEqual([]);
 });
@@ -147,29 +153,28 @@ test("a retired stalled turn detaches into a durable hold and reconciles termina
 	await harness(port, { terminal: (text) => terminal.push(text) });
 	enqueue("m-1", "old turn");
 	await manager?.notifyInbound(KEY);
-	await eventually(() => port.sends.length === 1, "accepted batch did not start before retired stall");
+	await eventually(() => port.sends.length === 1, "accepted turn did not start before retired stall");
 	const send = port.sends[0]!;
-	const batchKey = latestBatchKey;
+	const opRef = latestOpRef;
 	await manager?.reset(KEY, JSON.stringify(ORIGIN));
 	port.emitStall(send.sessionId);
 	await manager?.recover();
 	port.complete(send.opRef, "must remain fenced");
 	await eventually(
-		() => database?.inboundBatchRows(batchKey)[0]?.batch_state === "done",
+		() => database?.inboundTurnRow(opRef)?.turn_state === "done",
 		"retired hold did not reconcile terminal",
 	);
 	expect(terminal).toEqual([]);
 });
 
-test("startup recovery reconstructs an accepted durable batch and reconciles its terminal tail", async () => {
+test("startup recovery reconstructs an accepted durable turn and reconciles its terminal tail", async () => {
 	const port = new ScriptedSessionPort();
 	await harness(port);
 	enqueue("m-1", "recover me");
 	await manager?.notifyInbound(KEY);
-	await eventually(() => port.sends.length === 1, "accepted batch did not start before restart");
+	await eventually(() => port.sends.length === 1, "accepted turn did not start before restart");
 	const oldManager = manager!;
 	const opRef = port.sends[0]!.opRef;
-	const batchKey = latestBatchKey;
 	await oldManager.stop();
 	const terminal: string[] = [];
 	manager = new PersonaSessionManager({
@@ -177,9 +182,8 @@ test("startup recovery reconstructs an accepted durable batch and reconciles its
 		port,
 		instanceId: "instance-test",
 		repo: join(home, "workspace"),
-		settleWindowMs: 0,
-		onTurnStart: ({ rows }) => ({
-			text: rows[0]!.body,
+		onTurnStart: ({ trigger }) => ({
+			text: trigger.body,
 			onTerminal: ({ text }) => {
 				terminal.push(text);
 			},
@@ -189,84 +193,77 @@ test("startup recovery reconstructs an accepted durable batch and reconciles its
 	port.complete(opRef, "recovered reply");
 	await eventually(() => terminal.length === 1, "recovered actor did not deliver terminal output");
 	expect(terminal).toEqual(["recovered reply"]);
-	expect(database?.inboundBatchRows(batchKey)[0]).toMatchObject({ state: "done", batch_state: "done" });
+	expect(database?.inboundTurnRow(opRef)).toMatchObject({ state: "done", turn_state: "done" });
 });
 
-test("the immutable first-row settle cutoff yields a safe op-ref even when platform ids contain SDK-unsafe bytes", async () => {
-	const opRef = personaBatchOpRef(
-		"instance",
-		"discord/channel/room",
-		4,
-		"message id / with spaces",
-		"2026-09-01T00:00:00.000Z",
-	);
+test("turn op-refs are SDK-safe even when platform ids contain unsafe bytes", async () => {
+	const opRef = personaTurnOpRef("instance", "discord/channel/room", 4, "message id / with spaces");
 	expect(opRef).toMatch(/^gw-p-[0-9a-f]{32}$/);
 });
 
-test("live per-channel settle resolution is evaluated from the durable first row", async () => {
-	const port = new ScriptedSessionPort({ onSend: (input, scripted) => scripted.complete(input.opRef, "done") });
+test("notifyInbound immediately starts a turn while idle", async () => {
+	const port = new ScriptedSessionPort();
 	await harness(port);
-	let rowsSeen: readonly InboundMessageRow[] = [];
-	manager = new PersonaSessionManager({
-		database: database!,
-		port,
-		instanceId: "instance-test",
-		repo: join(home, "workspace"),
-		settleWindowMs: 2_000,
-		settleWindowFor: () => 0,
-		onTurnStart: ({ rows }) => {
-			rowsSeen = rows;
-			return { text: rows[0]!.body };
-		},
-	});
 	enqueue("m-1", "live policy");
-	await manager.notifyInbound(KEY);
-	await eventually(() => rowsSeen.length === 1, "live settle resolver did not dispatch immediately");
-	expect(port.sends).toHaveLength(1);
+	await manager?.notifyInbound(KEY);
+
+	expect(manager?.state(KEY)).toBe("turn-running");
+	expect(port.sends).toEqual([expect.objectContaining({ text: "live policy", opRef: latestOpRef })]);
 });
 
-test("pending rows older than maxInboundAgeMs are expired instead of answered (stale floor)", async () => {
-	const port = new ScriptedSessionPort({ onSend: (input, scripted) => scripted.complete(input.opRef, "reply") });
-	const sent: string[] = [];
-	const logs: string[] = [];
-	home = await mkdtemp(join(tmpdir(), "gajaeway-persona-session-"));
-	database = await GatewayDatabase.open(join(home, "gateway.db"));
-	manager = new PersonaSessionManager({
-		database,
-		port,
-		instanceId: "instance-test",
-		repo: join(home, "workspace"),
-		settleWindowMs: 0,
-		maxInboundAgeMs: 60_000,
-		log: (line) => logs.push(line),
-		onTurnStart: ({ rows }) => {
-			sent.push(rows.map((row) => row.body).join("|"));
-			return { text: rows.map((row) => row.body).join("\n") };
-		},
-	});
-	const old = new Date(Date.now() - 5 * 60_000).toISOString();
+test("two messages 50ms apart start one turn and steer the second", async () => {
+	const port = new ScriptedSessionPort();
+	await harness(port);
+	const now = Date.now();
 	expect(
-		database.inboundEnqueue({
-			messageId: "old-1",
+		database?.inboundEnqueue({
+			messageId: "m-1",
 			originKey: KEY,
 			originRefJson: JSON.stringify(ORIGIN),
-			body: "stale question",
-			receivedAt: old,
+			body: "first fragment",
+			receivedAt: new Date(now).toISOString(),
 		}),
 	).toBe(true);
 	expect(
-		database.inboundEnqueue({
-			messageId: "old-2",
+		database?.inboundEnqueue({
+			messageId: "m-2",
 			originKey: KEY,
 			originRefJson: JSON.stringify(ORIGIN),
-			body: "stale follow-up",
-			receivedAt: old,
+			body: "second fragment",
+			receivedAt: new Date(now + 50).toISOString(),
 		}),
 	).toBe(true);
-	enqueue("fresh-1", "fresh question");
-	await manager.notifyInbound(KEY);
-	await eventually(() => sent.length === 1, "fresh row was not answered");
-	expect(sent).toEqual(["fresh question"]);
-	expect(logs.some((line) => line.startsWith(`inbound_expired origin=${KEY} count=2`))).toBe(true);
-	expect(database.inboundPendingCount(KEY)).toBe(0);
+
+	await manager?.notifyInbound(KEY);
+
+	expect(manager?.state(KEY)).toBe("turn-running");
+	expect(port.sends).toEqual([expect.objectContaining({ text: "first fragment", opRef: latestOpRef })]);
+	expect(port.steers).toEqual([
+		expect.objectContaining({
+			sessionId: port.sends[0]!.sessionId,
+			text: expect.stringMatching(/^\[Additional message[^\n]*\]\nsecond fragment$/),
+		}),
+	]);
+	expect(database?.inboundTurnRows(latestOpRef)).toEqual([
+		expect.objectContaining({
+			message_id: "m-1",
+			state: "pending",
+			turn_role: "trigger",
+			turn_state: "accepted",
+		}),
+		expect.objectContaining({
+			message_id: "m-2",
+			state: "done",
+			turn_role: "steer",
+			turn_state: "done",
+			turn_op_ref: latestOpRef,
+		}),
+	]);
+
+	port.complete(latestOpRef, "done");
+	await eventually(
+		() =>
+			database?.inboundTurnRows(latestOpRef).every((row) => row.state === "done" && row.turn_state === "done") === true,
+		"turn rows did not complete after terminal tail evidence",
+	);
 });

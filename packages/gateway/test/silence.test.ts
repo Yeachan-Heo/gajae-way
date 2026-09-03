@@ -48,7 +48,7 @@ async function openChannelGateway(reply: string): Promise<{ frames: any[]; datab
 		socketPath: join(directory, "gateway.sock"),
 		dbPath: join(directory, "gateway.db"),
 		logVerbosity: "info",
-		channels: { "chan-1": { engagement: "open", settleWindowMs: 0 } },
+		channels: { "chan-1": { engagement: "open" } },
 	};
 	const database = await GatewayDatabase.open(config.dbPath);
 	const sessionPort = sessionPortFromResponder({ respond: async () => reply });

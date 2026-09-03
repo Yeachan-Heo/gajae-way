@@ -267,7 +267,6 @@ async function applyConfigReload(
 	}
 	runtime.config = result.config;
 	runtime.personaSessions.setStallTimeoutMs(result.config.stallTimeoutMs);
-	runtime.personaSessions.setMaxInboundAgeMs(result.config.maxInboundAgeMs);
 	console.error(
 		`gateway config reload (${trigger}) ok; applied=[${result.changed.join(",")}] restart-required=[${result.restartRequired.join(",")}] ignored=[${result.ignored.join(",")}]`,
 	);
@@ -497,10 +496,6 @@ function createRuntime(options: GatewayServerOptions): Runtime {
 	const sessionPort = options.sessionPort;
 	const connections = new Set<Connection>();
 	const inbound = new Map<string, InboundContext>();
-	// Legacy v16 processing rows can exist before the additive actor cutover. Batch
-	// rows stay visible for the actor and are never reset by this recovery pass.
-	const recovered = options.database.inboundRecoverProcessing();
-	console.error(`gateway recovered ${recovered} inbound message(s) stranded in processing.`);
 	const delivery = new DeliveryService(new DeliveryLedger(options.database));
 	const registry = new MonitorRegistry(options.database);
 	const memory = new MemoryClosureQueue(options.database, options.config.home);
@@ -510,10 +505,7 @@ function createRuntime(options: GatewayServerOptions): Runtime {
 		port: sessionPort,
 		instanceId: options.database.instanceId,
 		repo: join(options.config.home, "workspace"),
-		settleWindowMs: options.config.settleWindowMs,
-		settleWindowFor: (row) => settleWindowFor(row, runtime.config),
 		stallTimeoutMs: options.config.stallTimeoutMs,
-		maxInboundAgeMs: options.config.maxInboundAgeMs,
 		brokerGeneration: () => options.broker?.generation ?? 0,
 		onTurnStart: async (input) => await createInboundTurnLifecycle(input, options, runtime),
 		onInboundDiscard: (messageIds) => {
@@ -1495,10 +1487,8 @@ async function createInboundTurnLifecycle(
 	options: GatewayServerOptions,
 	runtime: Runtime,
 ): Promise<PersonaTurnLifecycle> {
-	// The newest message carries the live requester/voice context. Earlier members
-	// remain in the durable context window and are included in the composed prompt.
-	const row = input.rows[input.rows.length - 1] as InboundMessageRow;
-	for (const member of input.rows) if (member !== row) runtime.inbound.delete(member.message_id);
+	// One inbound message is one turn; it carries the live requester/voice context.
+	const row = input.trigger;
 	const context = runtime.inbound.get(row.message_id);
 	runtime.inbound.delete(row.message_id);
 	const connection = context?.connection ?? [...runtime.connections][0];
@@ -1572,18 +1562,7 @@ async function createInboundTurnLifecycle(
 					? `${droppedNote}\n`
 					: ""
 		}`;
-		// AC2: every coalesced batch member is part of THIS turn's text, whether or
-		// not the adapter recorded it in the unread-context ledger (a member without
-		// a platform messageId never reaches that ledger). Members already present
-		// in the ledger window are not repeated.
-		const inWindow = new Set(prepared.selectedMessageIds);
-		const members = input.rows
-			.filter((member) => member !== row && !inWindow.has(member.message_id))
-			.map((member) => `- [${member.received_at}] (msg:${member.message_id}): ${member.body.slice(0, 1000)}`);
-		const memberBlock = members.length ? `[Earlier messages in this same turn]\n${members.join("\n")}\n\n` : "";
-		turnText = `${header}${memberBlock}${speaker ? `${composeTurnHeader({ speaker, place, authorId: engagement?.authorId, messageId: row.message_id, engagement })}\n` : ""}${userText}`;
-	} else if (input.rows.length > 1) {
-		turnText = input.rows.map((member) => member.body).join("\n");
+		turnText = `${header}${speaker ? `${composeTurnHeader({ speaker, place, authorId: engagement?.authorId, messageId: row.message_id, engagement })}\n` : ""}${userText}`;
 	}
 
 	const bootstrap =
@@ -1681,15 +1660,15 @@ async function createInboundTurnLifecycle(
 			// the same inbound message can never post, whatever its text.
 			const deliveryId =
 				source === "terminal"
-					? deterministicTerminalDeliveryId(key, input.batch.triggerMessageId, index)
-					: deterministicInterimDeliveryId(key, input.batch.triggerMessageId, step.body, index);
+					? deterministicTerminalDeliveryId(key, input.turn.triggerMessageId, index)
+					: deterministicInterimDeliveryId(key, input.turn.triggerMessageId, step.body, index);
 			if (source === "terminal") {
 				// A finalized answer that already shipped on the tail satisfied the
 				// slot; the durable claim makes that survive a gateway restart.
-				const interimId = deterministicInterimDeliveryId(key, input.batch.triggerMessageId, step.body, index);
+				const interimId = deterministicInterimDeliveryId(key, input.turn.triggerMessageId, step.body, index);
 				const priorRow = runtime.delivery.get(interimId);
-				const owner = options.database.inboundBatchClaimTerminal(
-					input.batch.batchKey,
+				const owner = options.database.inboundTurnClaimTerminal(
+					input.turn.opRef,
 					index,
 					priorRow ? interimId : deliveryId,
 				);
@@ -1869,15 +1848,6 @@ async function createInboundTurnLifecycle(
 		onStall: ({ elapsedMs }) =>
 			console.error(`gateway persona turn stalled (${turnId}) after ${elapsedMs}ms; retaining status reconciliation.`),
 	};
-}
-
-function settleWindowFor(row: InboundMessageRow, config: GatewayConfig): number {
-	const origin = JSON.parse(row.origin_ref_json) as { platform?: string; conversationId?: string };
-	if (origin.platform === "loopback") return 0;
-	const channel =
-		config.channels?.[`${origin.platform}:${origin.conversationId}`] ??
-		(origin.platform === "discord" ? config.channels?.[origin.conversationId ?? ""] : undefined);
-	return channel?.settleWindowMs ?? config.settleWindowMs ?? 2_000;
 }
 
 function parseReceivedAt(value: unknown): string | undefined {
