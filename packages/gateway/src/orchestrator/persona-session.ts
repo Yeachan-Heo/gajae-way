@@ -138,6 +138,17 @@ export interface PersonaSessionManagerOptions {
 		text: string;
 	}) => void | Promise<void>;
 	readonly onSteerAccepted?: (input: { originKey: string; messageId: string; opRef: string }) => void | Promise<void>;
+	/**
+	 * Finalizes a steer the runtime recorded when NO lifecycle object exists
+	 * for its turn any more (a hold resolved after the turn ended or after a
+	 * restart). Must do what the lifecycle's onSteerAccepted would have done:
+	 * consume the message's context row and release transient ownership.
+	 */
+	readonly onHeldSteerAccepted?: (input: {
+		originKey: string;
+		row: InboundMessageRow;
+		opRef: string;
+	}) => void | Promise<void>;
 	readonly log?: (line: string) => void;
 }
 
@@ -160,6 +171,7 @@ export class PersonaSessionManager {
 	readonly #onInboundDiscard: PersonaSessionManagerOptions["onInboundDiscard"];
 	readonly #onAssistantText: PersonaSessionManagerOptions["onAssistantText"];
 	readonly #onSteerAccepted: PersonaSessionManagerOptions["onSteerAccepted"];
+	readonly #onHeldSteerAccepted: PersonaSessionManagerOptions["onHeldSteerAccepted"];
 	readonly #log: (line: string) => void;
 	readonly #actors = new Map<string, OriginActor>();
 	#stopped = false;
@@ -179,6 +191,7 @@ export class PersonaSessionManager {
 		this.#onInboundDiscard = options.onInboundDiscard;
 		this.#onAssistantText = options.onAssistantText;
 		this.#onSteerAccepted = options.onSteerAccepted;
+		this.#onHeldSteerAccepted = options.onHeldSteerAccepted;
 		this.#log = options.log ?? ((line: string) => console.error(line));
 	}
 
@@ -352,6 +365,12 @@ export class PersonaSessionManager {
 
 	async emitSteer(input: Parameters<NonNullable<PersonaSessionManagerOptions["onSteerAccepted"]>>[0]): Promise<void> {
 		await this.#onSteerAccepted?.(input);
+	}
+
+	async emitHeldSteerAccepted(
+		input: Parameters<NonNullable<PersonaSessionManagerOptions["onHeldSteerAccepted"]>>[0],
+	): Promise<void> {
+		await this.#onHeldSteerAccepted?.(input);
 	}
 
 	log(line: string): void {
@@ -1012,6 +1031,28 @@ class OriginActor {
 	}
 
 	/**
+	 * The ONE place a recorded steer acceptance is finalized: durable state,
+	 * then the lifecycle's own acceptance hook (context consumed, transient
+	 * ownership released) - or, when the turn's lifecycle is gone (resolved
+	 * after terminal or after a restart), the manager-level equivalent - then
+	 * the external observer. Every path that learns of an acceptance (live,
+	 * replay, terminal, stale hold) goes through here exactly once.
+	 */
+	async #finalizeSteerAcceptance(
+		row: InboundMessageRow,
+		epoch: number,
+		opRef: string,
+		bound: BoundTurn | undefined,
+	): Promise<boolean> {
+		if (!this.#manager.database.inboundSteerAccepted({ messageId: row.message_id, epoch, opRef })) return false;
+		if (bound) await bound.lifecycle.onSteerAccepted?.({ ...bound, row });
+		else await this.#manager.emitHeldSteerAccepted({ originKey: this.originKey, row, opRef });
+		await this.#manager.emitSteer({ originKey: this.originKey, messageId: row.message_id, opRef });
+		this.#manager.log(`steer_delivered originKey=${this.originKey} opRef=${opRef} messageId=${row.message_id}`);
+		return true;
+	}
+
+	/**
 	 * A steer held on a turn that has since ended can only be resolved by
 	 * replaying its clientRef: the runtime answers with the recorded outcome.
 	 * Accepted -> done input of that old turn; refused -> an ordinary pending
@@ -1032,7 +1073,7 @@ class OriginActor {
 					text: renderSteer(held.body),
 					clientRef,
 				});
-				this.#manager.database.inboundSteerAccepted({ messageId: held.message_id, epoch, opRef });
+				await this.#finalizeSteerAcceptance(held, epoch, opRef, undefined);
 			} catch (error) {
 				if (isDefinitiveSteerRejection(error)) this.#manager.database.inboundSteerRefused(held.message_id, opRef);
 				else
@@ -1176,23 +1217,7 @@ class OriginActor {
 				await this.#recoverFromSteerFailure(current);
 				return false;
 			}
-			if (
-				this.#manager.database.inboundSteerAccepted({
-					messageId: row.message_id,
-					epoch: current.epoch,
-					opRef: current.turn.opRef,
-				})
-			) {
-				await current.lifecycle.onSteerAccepted?.({ ...current, row });
-				await this.#manager.emitSteer({
-					originKey: this.originKey,
-					messageId: row.message_id,
-					opRef: current.turn.opRef,
-				});
-				this.#manager.log(
-					`steer_delivered originKey=${this.originKey} opRef=${current.turn.opRef} messageId=${row.message_id}`,
-				);
-			}
+			await this.#finalizeSteerAcceptance(row, current.epoch, current.turn.opRef, current);
 		}
 		return true;
 	}
@@ -1550,11 +1575,7 @@ class OriginActor {
 					text: renderSteer(bound.lifecycle.renderSteer?.(held) ?? held.body),
 					clientRef,
 				});
-				this.#manager.database.inboundSteerAccepted({
-					messageId: held.message_id,
-					epoch: bound.epoch,
-					opRef: bound.turn.opRef,
-				});
+				await this.#finalizeSteerAcceptance(held, bound.epoch, bound.turn.opRef, bound);
 			} catch (error) {
 				if (isDefinitiveSteerRejection(error)) {
 					// Never reached the turn: an ordinary pending message for the next one.

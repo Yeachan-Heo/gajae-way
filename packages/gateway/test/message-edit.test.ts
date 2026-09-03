@@ -2,10 +2,11 @@ import { afterEach, expect, test } from "bun:test";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { GjcCliError } from "@gajaeway/subsession";
 import type { GatewayConfig } from "../src/config";
 import { type GatewayServer, messageEditId, renderMessageEdit, startUnixServer } from "../src/server/server";
 import { GatewayDatabase } from "../src/store/db";
-import { sessionPortFromScript } from "./session-port.fake";
+import { ScriptedSessionPort, sessionPortFromScript } from "./session-port.fake";
 
 /**
  * A message the user edits after the gateway ingested it is streamed into the
@@ -244,5 +245,105 @@ test("a steered edit of a context-only message consumes the ORIGINAL message's c
 	expect(turns[1]).not.toContain("right ping");
 	expect(turns[1]).not.toContain("wrong ping");
 	expect(turns[1]).toContain("@bot next");
+	client.close();
+});
+
+/**
+ * A steer the runtime recorded but whose transport tore is finalized like a
+ * live one once its acceptance is learnt - at the old turn's terminal, or
+ * after a gateway restart - so the next turn never sees it as unread.
+ */
+class TornUntilTerminalPort extends ScriptedSessionPort {
+	torn = true;
+	attempts = 0;
+	async steer(input: Parameters<ScriptedSessionPort["steer"]>[0]): Promise<void> {
+		this.attempts++;
+		if (this.torn) throw new GjcCliError("gjc sdk turn.steer exited 1", 1, "socket reset");
+		await super.steer(input);
+	}
+}
+
+async function startWith(port: ScriptedSessionPort, dir?: string) {
+	directory = dir ?? (await mkdtemp(join(tmpdir(), "gajaeway-message-edit-")));
+	const config: GatewayConfig = {
+		schemaVersion: 1,
+		home: directory,
+		configPath: join(directory, "config.json"),
+		socketPath: join(directory, "gateway.sock"),
+		dbPath: join(directory, "gateway.db"),
+		logVerbosity: "info",
+		dmPolicy: "open",
+	};
+	database = await GatewayDatabase.open(config.dbPath);
+	server = await startUnixServer({ config, database, sessionPort: port, onStop: () => database?.close() });
+	const client = await connect(config.socketPath);
+	client.send({ v: "0.1", type: "hello", payload: { supportedVersions: ["0.1"] } });
+	await eventually(() => client.frames.length >= 1, "negotiation did not complete");
+	return client;
+}
+
+const dm = (client: Awaited<ReturnType<typeof connect>>, id: string, messageId: string, text: string) =>
+	client.send({
+		v: "0.1",
+		type: "request",
+		id,
+		verb: "chat.send",
+		params: { origin: ORIGIN, text, messageId, engagement: ENGAGEMENT },
+	});
+
+test("a held steer accepted at the old turn's terminal consumes its context row: the next turn does not replay it", async () => {
+	const port = new TornUntilTerminalPort();
+	const client = await startWith(port);
+	dm(client, "s1", "m-1", "first");
+	await eventually(() => port.sends.length === 1, "first turn was not sent");
+	dm(client, "s2", "m-2", "torn follow-up");
+	await eventually(() => port.attempts >= 3, "steer was not replayed and held");
+	expect(database!.inboundSteersHeld(port.sends[0]!.opRef).map((r) => r.message_id)).toEqual(["m-2"]);
+	// The runtime had recorded it: the replay at terminal returns acceptance.
+	port.torn = false;
+	port.complete(port.sends[0]!.opRef, "answer one");
+	await eventually(
+		() => database!.inboundTurnRow(port.sends[0]!.opRef)?.turn_state === "done",
+		"turn did not complete",
+	);
+	expect(database!.inboundSteersHeld(port.sends[0]!.opRef)).toEqual([]);
+	dm(client, "s3", "m-3", "next");
+	await eventually(() => port.sends.length === 2, "next turn was not sent");
+	expect(port.sends[1]!.text).not.toContain("torn follow-up");
+	expect(port.sends[1]!.text).toContain("next");
+	port.complete(port.sends[1]!.opRef, "answer two");
+	await eventually(() => database!.inboundPendingCount(ORIGIN_KEY) === 0, "next turn did not complete");
+	client.close();
+});
+
+test("a held steer accepted after a gateway restart consumes its context row: the next turn does not replay it", async () => {
+	const port = new TornUntilTerminalPort();
+	let client = await startWith(port);
+	dm(client, "s1", "m-1", "first");
+	await eventually(() => port.sends.length === 1, "first turn was not sent");
+	const opRef = port.sends[0]!.opRef;
+	dm(client, "s2", "m-2", "torn follow-up");
+	await eventually(() => port.attempts >= 3, "steer was not replayed and held");
+	port.complete(opRef, "answer one");
+	await eventually(() => database!.inboundTurnRow(opRef)?.turn_state === "done", "turn did not complete");
+	expect(database!.inboundSteersHeld(opRef).map((r) => r.message_id)).toEqual(["m-2"]);
+	// Restart the gateway on the same home; the transport is healthy again and
+	// the runtime reports the recorded acceptance on the same clientRef.
+	client.close();
+	await server?.stop();
+	server = undefined;
+	port.torn = false;
+	client = await startWith(port, directory);
+	dm(client, "s3", "m-3", "next");
+	await eventually(() => port.sends.length === 2, "next turn was not sent after restart");
+	expect(database!.inboundSteersHeld(opRef)).toEqual([]);
+	expect(database!.inboundTurnRows(opRef).map((r) => [r.message_id, r.turn_state])).toEqual([
+		["m-1", "done"],
+		["m-2", "done"],
+	]);
+	expect(port.sends[1]!.text).not.toContain("torn follow-up");
+	expect(port.sends[1]!.text).toContain("next");
+	port.complete(port.sends[1]!.opRef, "answer two");
+	await eventually(() => database!.inboundPendingCount(ORIGIN_KEY) === 0, "next turn did not complete");
 	client.close();
 });

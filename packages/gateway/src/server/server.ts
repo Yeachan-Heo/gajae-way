@@ -510,6 +510,14 @@ function createRuntime(options: GatewayServerOptions): Runtime {
 		stallTimeoutMs: options.config.stallTimeoutMs,
 		brokerGeneration: () => options.broker?.generation ?? 0,
 		onTurnStart: async (input) => await createInboundTurnLifecycle(input, options, runtime),
+		// A steer whose acceptance was learnt after its turn's lifecycle is gone
+		// (resolved at terminal or after a restart) is finalized exactly like a
+		// live one: read context, ownership released.
+		onHeldSteerAccepted: ({ row }) => {
+			if ((JSON.parse(row.origin_ref_json) as { platform?: string }).platform !== "loopback")
+				options.database.contextConsume([editedMessageId(row.message_id) ?? row.message_id]);
+			runtime.inbound.delete(row.message_id);
+		},
 		onInboundDiscard: (messageIds) => {
 			for (const messageId of messageIds) inbound.delete(messageId);
 		},
