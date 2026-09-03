@@ -1022,7 +1022,9 @@ export class ReconnectingGateway {
 			this.#progressOff = this.status ? subscribeDiscordProgress(client, this.status, console, this.typing) : undefined;
 			console.log("Discord adapter connected to gateway.");
 			this.monitor(client);
-			void this.#flushEdits();
+			// Queued edits first: a backfilled message must not overtake an edit
+			// the user made before the link came back.
+			await this.#flushEdits();
 			void this.recoverMissedMessages();
 		} catch {
 			this.scheduleReconnect();
@@ -1401,7 +1403,13 @@ export class ReconnectingGateway {
 	async #flushEdits(): Promise<void> {
 		if (this.#editFlush) return await this.#editFlush;
 		this.#editFlush = (async () => {
-			for (const edit of [...this.#editOutbox.values()]) {
+			// Drain the LIVE map, oldest first, until it is empty: an edit queued
+			// while an earlier request is in flight (a superseding edit of the
+			// same message, or another message in the same tick) must go out in
+			// this pass, not wait for the next unrelated trigger.
+			for (;;) {
+				const edit = this.#editOutbox.values().next().value as PendingEdit | undefined;
+				if (!edit) return;
 				const client = this.#client;
 				if (!client) {
 					this.scheduleReconnect();

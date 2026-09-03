@@ -3,12 +3,12 @@
  "kind": "api-package-test-report",
  "sourceHash": "sha256:a3203a646329e97ca299ad90da73768a9773b45fefc9e7b617680e0eeb6384f5",
  "head": "c1dc1a5d56817dc552ac190859d3d99ab5f05255",
- "generatedAt": "2026-09-03T17:04:37.425026+00:00",
+ "generatedAt": "2026-09-03T17:13:03.224514+00:00",
  "command": "bun test packages/gateway packages/adapter-discord packages/adapter-telegram packages/protocol packages/subsession packages/conformance --reporter=junit --reporter-outfile=artifacts/ultragoal-test-report.junit.xml",
  "junit": "artifacts/ultragoal-test-report.junit.xml",
  "totals": {
-  "tests": 1216,
-  "passed": 1213,
+  "tests": 1220,
+  "passed": 1217,
   "failed": 0,
   "skipped": 3
  },
@@ -213,10 +213,31 @@
    "id": "A2",
    "obligation": "edit failing to reach the gateway is queued (newest per message wins) and replayed in order on reconnect",
    "verdict": "passed"
+  },
+  {
+   "id": "H1",
+   "obligation": "outbox overflow: 256 kept, first dropped, logged",
+   "verdict": "passed"
+  },
+  {
+   "id": "H2",
+   "obligation": "superseding edit arriving mid-flush is sent next; outbox drains",
+   "verdict": "passed"
+  },
+  {
+   "id": "H3",
+   "obligation": "partial failure stops at the failed edit; adoptClient replays the tail",
+   "verdict": "passed"
+  },
+  {
+   "id": "H4",
+   "obligation": "same-tick edits: one serial flush, each sent once",
+   "verdict": "passed"
   }
  ],
  "redTeamSuites": [
   "packages/gateway/test/redteam-canonical.test.ts",
-  "packages/gateway/test/redteam-generation5.test.ts"
+  "packages/gateway/test/redteam-generation5.test.ts",
+  "packages/adapter-discord/test/edit-outbox-redteam.test.ts"
  ]
 }
