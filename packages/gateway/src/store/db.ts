@@ -51,7 +51,13 @@ export interface InboundMessageRow {
 	readonly received_at: string;
 	readonly turn_role: InboundTurnRole | null;
 	readonly turn_epoch: number | null;
-	/** bound: session chosen, send not yet acknowledged; accepted: the runtime holds the op; done: terminal. */
+	/**
+	 * trigger: bound (session chosen, send not acknowledged) -> accepted (the
+	 * runtime holds the op) -> done. steer: bound (the steer was ISSUED but the
+	 * transport tore before an answer; the message may be inside the turn) ->
+	 * done (recorded acceptance), or back to NULL (definitive refusal). A
+	 * `bound` steer is never dispatched as a turn of its own.
+	 */
 	readonly turn_state: InboundTurnState | null;
 	readonly turn_op_ref: string | null;
 	/** Bound before send so an accepted retired turn can reattach after restart. */
@@ -698,25 +704,19 @@ export class GatewayDatabase {
 
 	/**
 	 * Terminal reconciliation: legacy state and turn state become done in one
-	 * statement, for the trigger and for any member still riding with it (a
-	 * v18 settled+bound member whose send the runtime proved it holds). Returns
-	 * how many TRIGGER rows closed, so a repeat call is a no-op.
+	 * statement for the trigger. A steer still `bound` at this point was issued
+	 * into the turn but never answered (torn transport): whether the model saw
+	 * it is unknowable now that the turn is over, so it is NOT closed and NOT
+	 * dispatched - it stays attributed to this op-ref as an operator-visible
+	 * hold (`inboundSteersHeld`). Returns how many TRIGGER rows closed, so a
+	 * repeat call is a no-op.
 	 */
 	inboundTurnComplete(opRef: string): number {
-		return this.withTransaction(() => {
-			const closed = this.#database
-				.query(
-					"UPDATE inbound_messages SET state = 'done', turn_state = 'done' WHERE turn_op_ref = ? AND turn_role = 'trigger' AND state = 'pending' AND turn_state IN ('bound', 'accepted')",
-				)
-				.run(opRef).changes;
-			if (closed > 0)
-				this.#database
-					.query(
-						"UPDATE inbound_messages SET state = 'done', turn_state = 'done' WHERE turn_op_ref = ? AND turn_role = 'steer' AND state = 'pending' AND turn_state = 'bound'",
-					)
-					.run(opRef);
-			return closed;
-		});
+		return this.#database
+			.query(
+				"UPDATE inbound_messages SET state = 'done', turn_state = 'done' WHERE turn_op_ref = ? AND turn_role = 'trigger' AND state = 'pending' AND turn_state IN ('bound', 'accepted')",
+			)
+			.run(opRef).changes;
 	}
 
 	/**
@@ -750,14 +750,58 @@ export class GatewayDatabase {
 		return Number.isSafeInteger(value) && value >= 0 ? value : 0;
 	}
 
-	/** A steering receipt consumes just that row; a refused steer stays pending. */
+	/**
+	 * Marks a pending row as a steer ISSUED into the running turn, before the
+	 * transport answers. It is attributed to the turn from this moment: no
+	 * dispatch path can take it as a trigger, and a restart finds it here.
+	 */
+	inboundSteerIssued(input: { messageId: string; epoch: number; opRef: string }): boolean {
+		return (
+			this.#database
+				.query(
+					"UPDATE inbound_messages SET turn_role = 'steer', turn_epoch = ?, turn_state = 'bound', turn_op_ref = ? WHERE message_id = ? AND state = 'pending' AND (turn_state IS NULL OR (turn_role = 'steer' AND turn_state = 'bound' AND turn_op_ref = ?))",
+				)
+				.run(input.epoch, input.opRef, input.messageId, input.opRef).changes === 1
+		);
+	}
+
+	/** The runtime recorded the steer: the row is done input of the turn. */
 	inboundSteerAccepted(input: { messageId: string; epoch: number; opRef: string }): boolean {
 		const result = this.#database
 			.query(
-				"UPDATE inbound_messages SET state = 'done', turn_role = 'steer', turn_epoch = ?, turn_state = 'done', turn_op_ref = ? WHERE message_id = ? AND state = 'pending' AND turn_state IS NULL",
+				"UPDATE inbound_messages SET state = 'done', turn_role = 'steer', turn_epoch = ?, turn_state = 'done', turn_op_ref = ? WHERE message_id = ? AND state = 'pending' AND (turn_state IS NULL OR (turn_role = 'steer' AND turn_state = 'bound' AND turn_op_ref = ?))",
 			)
-			.run(input.epoch, input.opRef, input.messageId);
+			.run(input.epoch, input.opRef, input.messageId, input.opRef);
 		return result.changes === 1;
+	}
+
+	/** The runtime definitively refused the steer: the row is an ordinary pending message again. */
+	inboundSteerRefused(messageId: string, opRef: string): boolean {
+		return (
+			this.#database
+				.query(
+					"UPDATE inbound_messages SET turn_role = NULL, turn_epoch = NULL, turn_state = NULL, turn_op_ref = NULL WHERE message_id = ? AND state = 'pending' AND turn_role = 'steer' AND turn_state = 'bound' AND turn_op_ref = ?",
+				)
+				.run(messageId, opRef).changes === 1
+		);
+	}
+
+	/** Held steers of this origin whose turn is already terminal: unresolvable by the turn, only by a clientRef replay. */
+	inboundSteersHeldAfterTerminal(originKey: string): readonly InboundMessageRow[] {
+		return this.#database
+			.query<InboundMessageRow, [string]>(
+				`SELECT ${this.inboundColumns()} FROM inbound_messages WHERE origin_key = ? AND turn_role = 'steer' AND state = 'pending' AND turn_state = 'bound' AND turn_op_ref IN (SELECT turn_op_ref FROM inbound_messages WHERE turn_role = 'trigger' AND turn_state = 'done') ORDER BY received_at, rowid`,
+			)
+			.all(originKey);
+	}
+
+	/** Steers issued into `opRef` whose outcome is still unknown, oldest first. */
+	inboundSteersHeld(opRef: string): readonly InboundMessageRow[] {
+		return this.#database
+			.query<InboundMessageRow, [string]>(
+				`SELECT ${this.inboundColumns()} FROM inbound_messages WHERE turn_op_ref = ? AND turn_role = 'steer' AND state = 'pending' AND turn_state = 'bound' ORDER BY received_at, rowid`,
+			)
+			.all(opRef);
 	}
 
 	/** The trigger row of a turn. */

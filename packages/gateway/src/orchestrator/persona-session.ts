@@ -872,6 +872,7 @@ class OriginActor {
 	 */
 	async #dispatchNext(): Promise<void> {
 		if (this.#state !== "idle" || this.#current || this.#dispatchRetry) return;
+		await this.#resolveStaleHolds();
 		const trigger = this.#manager.database.inboundPendingOldest(this.originKey);
 		if (!trigger) return;
 		const epoch = this.#epoch();
@@ -1010,6 +1011,38 @@ class OriginActor {
 		await this.#steerPending();
 	}
 
+	/**
+	 * A steer held on a turn that has since ended can only be resolved by
+	 * replaying its clientRef: the runtime answers with the recorded outcome.
+	 * Accepted -> done input of that old turn; refused -> an ordinary pending
+	 * row that the dispatch below will send; still torn -> keeps waiting, and
+	 * newer rows are NOT blocked behind it.
+	 */
+	async #resolveStaleHolds(): Promise<void> {
+		for (const held of this.#manager.database.inboundSteersHeldAfterTerminal(this.originKey)) {
+			const opRef = held.turn_op_ref;
+			const epoch = held.turn_epoch;
+			const sessionId = held.bound_session_id ?? this.#manager.database.inboundTurnRow(opRef ?? "")?.bound_session_id;
+			if (!opRef || epoch === null || !sessionId) continue;
+			const clientRef = steerClientRef(this.#manager.instanceId, this.originKey, epoch, held.message_id);
+			try {
+				await this.#manager.port.steer({
+					sessionId,
+					repo: this.#manager.repo,
+					text: renderSteer(held.body),
+					clientRef,
+				});
+				this.#manager.database.inboundSteerAccepted({ messageId: held.message_id, epoch, opRef });
+			} catch (error) {
+				if (isDefinitiveSteerRejection(error)) this.#manager.database.inboundSteerRefused(held.message_id, opRef);
+				else
+					this.#manager.log(
+						`steer_hold origin=${this.originKey} message=${held.message_id} opRef=${opRef} reason=unresolved_after_terminal detail=${safeDiagnostic(error)}`,
+					);
+			}
+		}
+	}
+
 	#bindFailures = 0;
 
 	/**
@@ -1062,11 +1095,35 @@ class OriginActor {
 	async #steerPending(): Promise<void> {
 		const current = this.#current;
 		if (!current || current.retired || this.#state !== "turn-running") return;
+		// Steers whose transport tore before an answer are resolved first, on
+		// the same clientRef, before any new row is issued behind them.
+		for (const held of this.#manager.database.inboundSteersHeld(current.turn.opRef))
+			if (!(await this.#steerRow(current, held))) return;
 		for (;;) {
 			const row = this.#manager.database.inboundPendingOldest(this.originKey);
 			if (!row) return;
+			if (!(await this.#steerRow(current, row))) return;
+		}
+	}
+
+	/**
+	 * Issues one row into the running turn. Returns false when the loop must
+	 * stop: the outcome is still unknown (row held, durably attributed to this
+	 * turn) or the session refused and is being recovered.
+	 */
+	async #steerRow(current: BoundTurn, row: InboundMessageRow): Promise<boolean> {
+		{
 			assertControlAllowed("turn.steer", { operatorApproval: true });
 			const clientRef = steerClientRef(this.#manager.instanceId, this.originKey, current.epoch, row.message_id);
+			// Durable BEFORE the first attempt: from here the row belongs to this
+			// turn. A torn transport leaves it `steer/bound` - never dispatched as
+			// a trigger, retried on this clientRef by the next admission, tick or
+			// restart - until the runtime records acceptance or refuses.
+			this.#manager.database.inboundSteerIssued({
+				messageId: row.message_id,
+				epoch: current.epoch,
+				opRef: current.turn.opRef,
+			});
 			const steer = {
 				sessionId: current.sessionId,
 				repo: this.#manager.repo,
@@ -1105,18 +1162,19 @@ class OriginActor {
 				this.#manager.log(
 					`steer_hold origin=${this.originKey} message=${row.message_id} opRef=${current.turn.opRef} reason=transport_torn detail=${safeDiagnostic(failure)}`,
 				);
-				return;
+				return false;
 			}
 			if (outcome === "refused") {
 				// The session answered and said no: the message could not reach it,
-				// but it is not disposable. Either the turn is over (send it when
-				// idle) or the session is broken (replace it); the row stays
-				// pending for the turn that follows either way.
+				// but it is not disposable. It is an ordinary pending row again;
+				// either the turn is over (send it when idle) or the session is
+				// broken (replace it) - the row stays for the turn that follows.
+				this.#manager.database.inboundSteerRefused(row.message_id, current.turn.opRef);
 				this.#manager.log(
 					`steer_failed origin=${this.originKey} message=${row.message_id} action=recover detail=${safeDiagnostic(failure)}`,
 				);
 				await this.#recoverFromSteerFailure(current);
-				return;
+				return false;
 			}
 			if (
 				this.#manager.database.inboundSteerAccepted({
@@ -1136,6 +1194,7 @@ class OriginActor {
 				);
 			}
 		}
+		return true;
 	}
 
 	async #ensureSession(epoch: number): Promise<SessionBinding> {
@@ -1478,6 +1537,35 @@ class OriginActor {
 		}
 		const completed = this.#manager.database.inboundTurnComplete(bound.turn.opRef);
 		if (completed === 0) return;
+		// A steer issued into this turn whose answer tore: try the clientRef one
+		// more time now that the turn is over (the runtime still holds the
+		// recorded outcome). What stays unresolved is held on this op-ref for
+		// the operator - never dispatched as a new turn, never silently dropped.
+		for (const held of this.#manager.database.inboundSteersHeld(bound.turn.opRef)) {
+			const clientRef = steerClientRef(this.#manager.instanceId, this.originKey, bound.epoch, held.message_id);
+			try {
+				await this.#manager.port.steer({
+					sessionId: bound.sessionId,
+					repo: this.#manager.repo,
+					text: renderSteer(bound.lifecycle.renderSteer?.(held) ?? held.body),
+					clientRef,
+				});
+				this.#manager.database.inboundSteerAccepted({
+					messageId: held.message_id,
+					epoch: bound.epoch,
+					opRef: bound.turn.opRef,
+				});
+			} catch (error) {
+				if (isDefinitiveSteerRejection(error)) {
+					// Never reached the turn: an ordinary pending message for the next one.
+					this.#manager.database.inboundSteerRefused(held.message_id, bound.turn.opRef);
+				} else {
+					this.#manager.log(
+						`steer_hold origin=${this.originKey} message=${held.message_id} opRef=${bound.turn.opRef} reason=unresolved_at_terminal detail=${safeDiagnostic(error)}`,
+					);
+				}
+			}
+		}
 		bound.tail?.setTurnRunning(false);
 		await bound.tail?.close();
 		if (bound.retired) {
