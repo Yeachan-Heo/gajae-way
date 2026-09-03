@@ -28,6 +28,8 @@ export interface BrokerHealthContext {
 	readonly discoveryPath: string;
 	readonly isPidAlive: PidAliveProbe;
 	readonly timeoutMs: number;
+	/** Reports a routed-but-rejected probe answer; liveness is unaffected. */
+	readonly onApplicationError?: (code: string) => void;
 }
 
 export type BrokerHealthProbe = (context: BrokerHealthContext) => boolean | Promise<boolean>;
@@ -220,7 +222,12 @@ const PROBE_REQUEST_ID = "gajaeway-health";
  * answers the hello and then fails or stalls the request; that is unhealthy.
  * Costs ~1ms end to end; a `gjc sdk session list` spawn costs ~1s of CPU.
  */
-export function probeBrokerEndpoint(discovery: BrokerDiscovery, timeoutMs: number): Promise<boolean> {
+export function probeBrokerEndpoint(
+	discovery: BrokerDiscovery,
+	timeoutMs: number,
+	/** Reports a routed-but-rejected answer. Liveness is unaffected; the code is worth logging. */
+	onApplicationError?: (code: string) => void,
+): Promise<boolean> {
 	return new Promise<boolean>((resolve) => {
 		let socket: WebSocket;
 		try {
@@ -263,7 +270,13 @@ export function probeBrokerEndpoint(discovery: BrokerDiscovery, timeoutMs: numbe
 							type: "broker_request",
 							id: PROBE_REQUEST_ID,
 							operation: "session.list",
-							input: { limit: 1 },
+							// NO `limit`. A page smaller than the session list makes the
+							// daemon store a continuation cursor with a 15-minute TTL, and
+							// its pool is 32: probing every 5s exhausted it in under three
+							// minutes, after which every session.list answered
+							// `invalid_input`. The default page covers the whole list, so
+							// the request allocates nothing and any prior cursor is dropped.
+							input: {},
 						}),
 					);
 				} catch {
@@ -272,14 +285,20 @@ export function probeBrokerEndpoint(discovery: BrokerDiscovery, timeoutMs: numbe
 				return;
 			}
 			if (frame.type !== "broker_response" || frame.id !== PROBE_REQUEST_ID) return settle(false);
-			// The same structural rule the CLI probe applied: a session-list result carries `sessions[]`.
-			const result = frame.result;
-			settle(
-				frame.ok === true &&
-					typeof result === "object" &&
-					result !== null &&
-					Array.isArray((result as Record<string, unknown>)[SESSION_LIST_MARKER]),
-			);
+			// ANY answer to a routed request proves what this probe exists to prove:
+			// the daemon accepted the connection, authenticated it, parsed the frame,
+			// reached the session Router, and replied. `ok:false` means it rejected
+			// OUR INPUT - that is a live daemon disagreeing, not a dead one. Treating
+			// it as death is what let a self-inflicted cursor leak escalate into
+			// killing a healthy broker mid-turn (live, 2026-09-03). Only silence
+			// (timeout), a transport failure, or a malformed/unmatched frame is a
+			// failure; a wedged Router never answers and still trips the timeout.
+			if (frame.ok !== true) {
+				const detail = frame.error;
+				const code = typeof detail === "object" && detail !== null ? (detail as { code?: unknown }).code : undefined;
+				onApplicationError?.(typeof code === "string" ? code : "unknown");
+			}
+			settle(true);
 		});
 		socket.addEventListener("error", () => settle(false));
 		socket.addEventListener("close", () => settle(false));
@@ -294,7 +313,7 @@ export function probeBrokerEndpoint(discovery: BrokerDiscovery, timeoutMs: numbe
 export async function probeBrokerDiscovery(context: BrokerHealthContext): Promise<boolean> {
 	const discovery = await readBrokerDiscovery(context.discoveryPath, context.isPidAlive);
 	if (!discovery) return false;
-	return await probeBrokerEndpoint(discovery, context.timeoutMs);
+	return await probeBrokerEndpoint(discovery, context.timeoutMs, context.onApplicationError);
 }
 
 /** A session-list envelope is healthy only when it is a structurally valid `ok` reply. */
@@ -692,7 +711,12 @@ export class BrokerSupervisor implements PersonaBroker {
 					// daemon replaced mid-probe must not inherit its predecessor's
 					// failures).
 					const discovery = await readBrokerDiscovery(this.discoveryPath, this.#isPidAlive);
-					if (discovery && (await probeBrokerEndpoint(discovery, this.#healthProbeTimeoutMs))) {
+					if (
+						discovery &&
+						(await probeBrokerEndpoint(discovery, this.#healthProbeTimeoutMs, (code) =>
+							this.#log(`broker_probe_application_error code=${code} (daemon is answering; not a liveness failure)`),
+						))
+					) {
 						if (this.#startupStabilizationMs > 0) await sleep(this.#startupStabilizationMs);
 						return;
 					}

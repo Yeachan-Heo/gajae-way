@@ -338,7 +338,7 @@ test("endpoint probe costs milliseconds: 20 sequential probes finish well under 
 	}
 });
 
-test("red-team B1: a daemon that greets but cannot route session.list is unhealthy; one that routes is healthy", async () => {
+test("red-team B1: a daemon that never answers is unhealthy; one that answers - even with an error - is alive", async () => {
 	const stalled = fakeBrokerTransport("secret-token", { router: "stall" });
 	const erroring = fakeBrokerTransport("secret-token", { router: "error" });
 	const healthy = fakeBrokerTransport("secret-token");
@@ -349,10 +349,19 @@ test("red-team B1: a daemon that greets but cannot route session.list is unhealt
 		// A stalled router is detected at the timeout, never earlier and never by hanging.
 		expect(performance.now() - started).toBeGreaterThanOrEqual(290);
 		expect(performance.now() - started).toBeLessThan(1_000);
-		expect(await probeBrokerEndpoint(at(erroring.url), 500)).toBe(false);
+		// An error response is a LIVE daemon rejecting our input, not a dead one:
+		// treating it as death let a cursor leak escalate into killing a healthy
+		// broker mid-turn (live, 2026-09-03). The code is reported, not fatal.
+		const codes: string[] = [];
+		expect(await probeBrokerEndpoint(at(erroring.url), 500, (code) => void codes.push(code))).toBe(true);
+		expect(codes).toEqual(["unavailable"]);
 		expect(await probeBrokerEndpoint(at(healthy.url), 500)).toBe(true);
-		// The probe issued a real read-only operation, not just a hello.
+		// The probe issued a real read-only operation, not just a hello, and it
+		// must NOT paginate: a page smaller than the session list makes the daemon
+		// pin a continuation cursor for 15 minutes out of a pool of 32, which a
+		// 5s probe exhausts in under three minutes.
 		expect(healthy.requests).toEqual([expect.objectContaining({ type: "broker_request", operation: "session.list" })]);
+		expect((healthy.requests[0] as { input?: Record<string, unknown> }).input ?? {}).not.toHaveProperty("limit");
 		// A hello with the wrong protocol version is not a broker we know how to talk to.
 		const wrongVersion = fakeBrokerTransport("secret-token", { protocolVersion: 2 });
 		try {
@@ -654,6 +663,49 @@ test("red-team G4-F1: a strike is charged to the discovery record that was probe
 		await broker.stop();
 		stalled.stop();
 		bServer.stop(true);
+	}
+});
+
+test("live regression: a daemon whose session.list keeps failing is never killed - it is answering", async () => {
+	const home = await temporaryHome("gajaeway-broker-app-error-");
+	// Exactly the 2026-09-03 outage: the probe's own paginated session.list
+	// pinned a 15-minute continuation cursor every 5s until the daemon's pool of
+	// 32 was exhausted, after which every call answered `invalid_input`. The
+	// supervisor read that as death and killed a healthy broker mid-turn.
+	const erroring = fakeBrokerTransport("secret-token", { router: "error" });
+	const killed: number[] = [];
+	const logs: string[] = [];
+	const broker = new BrokerSupervisor({
+		ssotAgentDir: null,
+		home,
+		instanceId: "instance-app-error",
+		command: async () => HEALTHY,
+		isPidAlive: (pid) => pid === process.pid || (pid === 7007 && !killed.includes(pid)),
+		healthIntervalMs: 20,
+		healthProbeTimeoutMs: 200,
+		readinessDelayMs: 0,
+		log: (line) => void logs.push(line),
+	});
+	const originalKill = process.kill;
+	(process as { kill: typeof process.kill }).kill = ((pid: number, signal?: string | number) => {
+		if (pid === 7007) {
+			killed.push(pid);
+			return true;
+		}
+		return originalKill(pid, signal as NodeJS.Signals);
+	}) as typeof process.kill;
+	try {
+		await writeDiscovery(broker.agentDir, discoveryBody(erroring.url, "secret-token", { pid: 7007 }));
+		await broker.start();
+		// Let the periodic health timer run well past the three-strike threshold.
+		await Bun.sleep(300);
+		expect(killed).toEqual([]);
+		expect(logs.filter((line) => line.includes("strike"))).toEqual([]);
+		expect(logs.some((line) => line.includes("broker_probe_application_error code=unavailable"))).toBe(true);
+	} finally {
+		(process as { kill: typeof process.kill }).kill = originalKill;
+		await broker.stop();
+		erroring.stop();
 	}
 });
 
