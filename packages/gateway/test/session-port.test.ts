@@ -275,3 +275,41 @@ test("bind rebinds a persisted session the broker no longer indexes instead of h
 		await rm(home, { recursive: true, force: true });
 	}
 });
+
+test("a recovered answer is the full body, never the 500-character summary", async () => {
+	const home = await mkdtemp(join(tmpdir(), "gajaeway-session-port-body-"));
+	const database = await GatewayDatabase.open(join(home, "gateway.db"));
+	const body = `${"가".repeat(700)} 끝.`;
+	const run: CliRunner = async (args) => {
+		if (args.includes("transcript.list"))
+			return {
+				exitCode: 0,
+				stdout: JSON.stringify({
+					page: {
+						items: [
+							// The host ships both: textSummary is body.slice(0, 500).
+							{ role: "assistant", ts: new Date().toISOString(), textSummary: body.slice(0, 500), body },
+						],
+					},
+				}),
+				stderr: "",
+			};
+		throw new Error(`unexpected command ${args.join(" ")}`);
+	};
+	const tailRunner = new TailRunner({ run, repo: join(home, "workspace"), stallTimeoutMs: 1_000 });
+	const port = new BrokerSessionPort({ database, cli: run, instanceId: "instance-body", tailRunner });
+	try {
+		const recovered = await port.fetchAssistantSince({
+			sessionId: "11111111-2222-3333-4444-555555555555",
+			repo: join(home, "workspace"),
+			notBeforeMs: Date.now() - 60_000,
+		});
+		// Preferring the summary cut every recovered reply mid-sentence at 500.
+		expect(recovered?.text).toBe(body);
+		expect(recovered?.text.length).toBeGreaterThan(500);
+		expect(recovered?.text.endsWith("끝.")).toBe(true);
+	} finally {
+		database.close();
+		await rm(home, { recursive: true, force: true });
+	}
+});
