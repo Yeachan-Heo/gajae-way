@@ -1,4 +1,10 @@
-import { type BrokerSession, OpRefRejectedError, type SendReceipt, type StatusReport } from "@gajaeway/subsession";
+import {
+	type BrokerSession,
+	GjcCliError,
+	OpRefRejectedError,
+	type SendReceipt,
+	type StatusReport,
+} from "@gajaeway/subsession";
 import type { GjcModelSelection } from "../src/config";
 import type {
 	SessionBindInput,
@@ -10,6 +16,14 @@ import type {
 	SessionSteerInput,
 } from "../src/orchestrator/session-port";
 import type { TailAttachInput, TailFrame, TailHandle } from "../src/orchestrator/tail-runner";
+
+/** What gjc answers when the session itself refuses a steer (`ok:false` envelope): a decision, not a transport failure. */
+export function steerRefused(message = "no running turn"): GjcCliError {
+	return new GjcCliError(`gjc sdk turn.steer reported failure: ${JSON.stringify({ code: "busy", message })}`, 0, "", {
+		code: "busy",
+		message,
+	});
+}
 
 export class ScriptedSessionPort implements SessionPort {
 	readonly sends: SessionSendInput[] = [];

@@ -5,6 +5,7 @@ import {
 	type BrokerSession,
 	CLIENT_REF_CONFLICT_CODE,
 	decideRecovery,
+	GjcCliError,
 	isOpRefRejection,
 	isTerminalStatus,
 	OpRefRejectedError,
@@ -48,6 +49,8 @@ const STATUS_TERMINAL_GRACE_MS = 250;
  */
 const TURN_FLOOR_SKEW_MS = 2_000;
 const DISPATCH_FAILURE_RETRY_MS = 2_000;
+/** Bind failures back off exponentially from DISPATCH_FAILURE_RETRY_MS up to this ceiling. */
+const DISPATCH_FAILURE_RETRY_MAX_MS = 60_000;
 /** Consecutive recovery sweeps (60s apart) an unknown op on a live idle session is held before release. */
 const HOLD_RELEASE_SWEEPS = 2;
 
@@ -65,6 +68,14 @@ export interface PersonaTurnLifecycle {
 	readonly effectiveModel?: GjcModelSelection;
 	/** Legacy/send-time fallback only; persistent persona turns leave this unset. */
 	readonly sendModelFallback?: GjcModelSelection;
+	/**
+	 * Renders a message that arrives while this turn runs into the steer text.
+	 * Owns the same speaker/place/reply header as the trigger so the model can
+	 * tell who spoke; the actor wraps the result with the steer framing.
+	 */
+	renderSteer?(row: InboundMessageRow): string;
+	/** The steer landed in the session: its row is attributed to this turn. */
+	onSteerAccepted?(input: PersonaSteerInput): void | Promise<void>;
 	onFrame?(input: PersonaTailFrameInput): void | Promise<void>;
 	onTerminal?(input: PersonaTerminalInput): void | Promise<void>;
 	onFailure?(input: PersonaFailureInput): void | Promise<void>;
@@ -86,6 +97,10 @@ export interface PersonaTurnStartInput extends PersonaTurnIdentity {
 
 export interface PersonaTailFrameInput extends PersonaTurnIdentity {
 	readonly frame: TailFrame;
+}
+
+export interface PersonaSteerInput extends PersonaTurnIdentity {
+	readonly row: InboundMessageRow;
 }
 
 export interface PersonaTerminalInput extends PersonaTurnIdentity {
@@ -376,6 +391,8 @@ class OriginActor {
 	#queue: Promise<void> = Promise.resolve();
 	#state: PersonaActorState = "idle";
 	#current: BoundTurn | undefined;
+	/** A dispatch retry timer is armed; admissions wait for it instead of re-binding at once. */
+	#dispatchRetry: unknown;
 	readonly #retired = new Map<string, BoundTurn>();
 	readonly #retiredReattachTimers = new Map<string, unknown>();
 	readonly #graceTimers = new Set<unknown>();
@@ -823,6 +840,7 @@ class OriginActor {
 		this.#retiredReattachTimers.clear();
 		for (const timer of this.#graceTimers) this.#manager.cancel(timer);
 		this.#graceTimers.clear();
+		this.#dispatchRetry = undefined;
 		await Promise.all([
 			...(this.#current?.tail ? [this.#current.tail.close()] : []),
 			...[...this.#retired.values()].flatMap((bound) => (bound.tail ? [bound.tail.close()] : [])),
@@ -845,11 +863,13 @@ class OriginActor {
 
 	/**
 	 * Sends the oldest pending row as the next turn, immediately. A dispatch
-	 * that cannot even bind a session is retried with backoff; the row stays
-	 * pending throughout and is never expired.
+	 * that cannot even bind a session is retried with exponential backoff
+	 * (bounded by DISPATCH_FAILURE_RETRY_MAX_MS, never abandoned); while a retry
+	 * is armed, new admissions wait for it instead of hammering the broker. The
+	 * row stays pending throughout and is never expired.
 	 */
 	async #dispatchNext(): Promise<void> {
-		if (this.#state !== "idle" || this.#current) return;
+		if (this.#state !== "idle" || this.#current || this.#dispatchRetry) return;
 		const trigger = this.#manager.database.inboundPendingOldest(this.originKey);
 		if (!trigger) return;
 		const epoch = this.#epoch();
@@ -859,12 +879,10 @@ class OriginActor {
 		try {
 			binding = await this.#ensureSession(epoch);
 		} catch (error) {
-			this.#manager.log(
-				`persona_bind_failed origin=${this.originKey} epoch=${epoch} message=${trigger.message_id} detail=${safeDiagnostic(error)}`,
-			);
-			this.#scheduleDispatchRetry(DISPATCH_FAILURE_RETRY_MS);
+			this.#noteBindFailure(trigger.message_id, epoch, error);
 			return;
 		}
+		this.#bindFailures = 0;
 		const bound = this.#manager.database.inboundBindTurn({
 			messageId: trigger.message_id,
 			originKey: this.originKey,
@@ -954,13 +972,17 @@ class OriginActor {
 				this.#manager.log(
 					`persona_send_session_gone origin=${this.originKey} epoch=${epoch} nextEpoch=${nextEpoch} opRef=${opRef} attempt=${attempt}`,
 				);
-				// Bounded: a new session per attempt, and a fresh session is bootstrapped
-				// with the last 24h of channel context, so the retry keeps the thread.
+				// Bounded burst: a new session per attempt, each bootstrapped with the
+				// last 24h of channel context, so the retry keeps the thread. Past
+				// the bound the condition is logged as unrecoverable for the operator
+				// and retried with backoff - the message is never dropped.
 				if (attempt <= MAX_SEND_REBIND_ATTEMPTS) await this.#dispatchNext();
-				else
+				else {
 					this.#manager.log(
 						`persona_send_unrecoverable origin=${this.originKey} opRef=${opRef} attempts=${attempt} reason=session_unavailable`,
 					);
+					this.#scheduleDispatchRetry(DISPATCH_FAILURE_RETRY_MAX_MS);
+				}
 				return;
 			}
 			// A command failure can occur after broker acceptance. Reconcile its exact
@@ -978,13 +1000,39 @@ class OriginActor {
 		await this.#steerPending();
 	}
 
+	#bindFailures = 0;
+
+	/**
+	 * A session could not be bound for the next turn (broker down, Router
+	 * disowning every candidate). The message is never dropped; the retry backs
+	 * off, and once MAX_SEND_REBIND_ATTEMPTS consecutive attempts have failed
+	 * the condition is logged as unrecoverable so an operator sees it - retries
+	 * continue at the ceiling because the broker may come back.
+	 */
+	#noteBindFailure(messageId: string, epoch: number, error: unknown): void {
+		this.#bindFailures += 1;
+		const attempts = this.#bindFailures;
+		this.#manager.log(
+			`persona_bind_failed origin=${this.originKey} epoch=${epoch} message=${messageId} attempts=${attempts} detail=${safeDiagnostic(error)}`,
+		);
+		if (attempts === MAX_SEND_REBIND_ATTEMPTS)
+			this.#manager.log(
+				`persona_send_unrecoverable origin=${this.originKey} message=${messageId} attempts=${attempts} reason=bind_failed`,
+			);
+		const delay = Math.min(DISPATCH_FAILURE_RETRY_MAX_MS, DISPATCH_FAILURE_RETRY_MS * 2 ** Math.min(attempts - 1, 10));
+		this.#scheduleDispatchRetry(delay);
+	}
+
 	#scheduleDispatchRetry(delayMs: number): void {
+		if (this.#dispatchRetry) return;
 		const timer = this.#manager.schedule(() => {
 			this.#graceTimers.delete(timer);
+			this.#dispatchRetry = undefined;
 			if (this.#stopped || this.#manager.stopped) return;
 			void this.enqueue(async () => await this.#dispatchNext()).catch(() => {});
 		}, delayMs);
 		this.#graceTimers.add(timer);
+		this.#dispatchRetry = timer;
 	}
 
 	/**
@@ -1009,24 +1057,44 @@ class OriginActor {
 			if (!row) return;
 			assertControlAllowed("turn.steer", { operatorApproval: true });
 			const clientRef = steerClientRef(this.#manager.instanceId, this.originKey, current.epoch, row.message_id);
+			const steer = {
+				sessionId: current.sessionId,
+				repo: this.#manager.repo,
+				text: renderSteer(current.lifecycle.renderSteer?.(row) ?? row.body),
+				clientRef,
+			};
 			try {
-				await this.#manager.port.steer({
-					sessionId: current.sessionId,
-					repo: this.#manager.repo,
-					text: renderSteer(row.body),
-					clientRef,
-				});
+				await this.#manager.port.steer(steer);
 			} catch (error) {
-				// A failed steer means the message could not reach the session, not
-				// that it is disposable: leaving the row pending is what let the
-				// stale floor eat it. Either the turn is over (send it when idle) or
-				// the session is broken (replace it); the row stays pending for the
-				// turn that follows either way.
-				this.#manager.log(
-					`steer_failed origin=${this.originKey} message=${row.message_id} action=recover detail=${safeDiagnostic(error)}`,
-				);
-				await this.#recoverFromSteerFailure(current);
-				return;
+				if (!isDefinitiveSteerRejection(error)) {
+					// The transport failed AFTER the request may have landed (CLI
+					// killed mid-print, socket reset). The clientRef is durable on the
+					// gjc side: replaying it returns the recorded outcome instead of
+					// delivering twice. One replay decides; a second failure is a
+					// broken session.
+					this.#manager.log(
+						`steer_ambiguous origin=${this.originKey} message=${row.message_id} action=replay detail=${safeDiagnostic(error)}`,
+					);
+					try {
+						await this.#manager.port.steer(steer);
+					} catch (replayError) {
+						this.#manager.log(
+							`steer_failed origin=${this.originKey} message=${row.message_id} action=recover detail=${safeDiagnostic(replayError)}`,
+						);
+						await this.#recoverFromSteerFailure(current);
+						return;
+					}
+				} else {
+					// The session answered and said no: the message could not reach it,
+					// but it is not disposable. Either the turn is over (send it when
+					// idle) or the session is broken (replace it); the row stays
+					// pending for the turn that follows either way.
+					this.#manager.log(
+						`steer_failed origin=${this.originKey} message=${row.message_id} action=recover detail=${safeDiagnostic(error)}`,
+					);
+					await this.#recoverFromSteerFailure(current);
+					return;
+				}
 			}
 			if (
 				this.#manager.database.inboundSteerAccepted({
@@ -1035,6 +1103,7 @@ class OriginActor {
 					opRef: current.turn.opRef,
 				})
 			) {
+				await current.lifecycle.onSteerAccepted?.({ ...current, row });
 				await this.#manager.emitSteer({
 					originKey: this.originKey,
 					messageId: row.message_id,
@@ -1322,13 +1391,21 @@ class OriginActor {
 				// lastAssistantText is turn-scoped too (see #predatesTurn) but it is
 				// an observation of a stream that can be re-attached, replayed and
 				// fenced; the durable row produced at/after this turn's floor is what
-				// the model actually said for THIS trigger. The runtime's own
-				// startedAt is exact; when it is absent the fallback is dispatched_at,
-				// stamped at the turn's bind BEFORE the send and cleared on
-				// requeue, so it can neither postdate the answer
-				// nor predate the previous turn's answer.
+				// the model actually said for THIS trigger. Two floors are known:
+				// the runtime's own startedAt and our dispatched_at (stamped at
+				// bind, BEFORE the send, cleared on requeue). The answer cannot
+				// predate either, so the LATER one is the floor: a host clock that
+				// runs behind ours must not reopen the previous turn's row
+				// (red-team C1d), and a host clock ahead of ours cannot hide a
+				// real answer because the transcript rows it reads are stamped by
+				// that same host.
 				const startedAt = report.status.startedAt;
-				const notBeforeMs = typeof startedAt === "number" ? startedAt : bound.dispatchedAtMs;
+				const notBeforeMs =
+					typeof startedAt === "number" && bound.dispatchedAtMs !== undefined
+						? Math.max(startedAt, bound.dispatchedAtMs)
+						: typeof startedAt === "number"
+							? startedAt
+							: bound.dispatchedAtMs;
 				const port = this.#manager.port;
 				let text: string | undefined;
 				if (notBeforeMs !== undefined && port.fetchAssistantSince) {
@@ -1502,6 +1579,16 @@ function isTerminalTailFrame(frame: TailFrame): boolean {
  */
 export function renderSteer(body: string): string {
 	return `[Additional message from the user, received while you were still working on their previous request. Finish that request, then also address this. Do not restart or repeat what you already said.]\n${body}`;
+}
+
+/**
+ * A `turn.steer` the runtime itself answered with `ok:false` (no running turn,
+ * rejected text, unknown session) is a decision. A non-zero exit, a torn
+ * envelope or a thrown transport error is not: the steer may or may not have
+ * been recorded, and only a clientRef replay can tell.
+ */
+function isDefinitiveSteerRejection(error: unknown): boolean {
+	return error instanceof GjcCliError && error.exitCode === 0 && error.details !== undefined;
 }
 
 function sdkStatusErrorCode(error: unknown): string | undefined {

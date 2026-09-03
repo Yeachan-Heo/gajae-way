@@ -5,7 +5,7 @@ import { join } from "node:path";
 import { PersonaSessionManager } from "../src/orchestrator/persona-session";
 import type { InboundTurn } from "../src/store/db";
 import { GatewayDatabase } from "../src/store/db";
-import { ScriptedSessionPort } from "./session-port.fake";
+import { ScriptedSessionPort, steerRefused } from "./session-port.fake";
 
 const ORIGIN = { platform: "loopback", kind: "loopback", conversationId: "coverage" } as const;
 const ORIGIN_KEY = "loopback/loopback/coverage";
@@ -129,7 +129,7 @@ class FailFirstSteerPort extends ScriptedSessionPort {
 
 	async steer(input: Parameters<ScriptedSessionPort["steer"]>[0]): Promise<void> {
 		this.steerAttempts++;
-		if (this.steerAttempts === 1) throw new Error("scripted ambiguous steer transport failure");
+		if (this.steerAttempts === 1) throw steerRefused();
 		await super.steer(input);
 	}
 }

@@ -2,6 +2,7 @@ import { afterEach, expect, test } from "bun:test";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { GjcCliError } from "@gajaeway/subsession";
 import { PersonaSessionManager } from "../src/orchestrator/persona-session";
 import { GatewayDatabase } from "../src/store/db";
 import { ScriptedSessionPort } from "./session-port.fake";
@@ -116,4 +117,93 @@ test("a mid-turn message issues one steer, keeps one send, and is attributed in 
 			database?.inboundTurnRows(batch.opRef).every((row) => row.state === "done" && row.turn_state === "done") === true,
 		"running batch did not complete after its tail terminal event",
 	);
+});
+
+/**
+ * A steer whose CLI died after the request landed (torn envelope, non-zero
+ * exit) is NOT a refusal: gjc keeps the clientRef, so a replay returns the
+ * recorded outcome. Treating it as a refusal would rebind the session and send
+ * the same message again as a new turn on the replacement.
+ */
+class TornSteerPort extends ScriptedSessionPort {
+	readonly attempts: string[] = [];
+	async steer(input: Parameters<ScriptedSessionPort["steer"]>[0]): Promise<void> {
+		this.attempts.push(input.clientRef);
+		// First attempt: the request is recorded, then the transport tears.
+		if (this.attempts.length === 1) {
+			await super.steer(input);
+			throw new GjcCliError("gjc sdk turn.steer exited 137", 137, "killed");
+		}
+		// Replay of the same clientRef: gjc reports the recorded acceptance.
+		if (this.attempts.length === 2) return;
+		await super.steer(input);
+	}
+}
+
+test("a torn steer transport is replayed on the same clientRef, never rebinds the session, and the message is steered once", async () => {
+	home = await mkdtemp(join(tmpdir(), "gajaeway-steering-"));
+	database = await GatewayDatabase.open(join(home, "gateway.db"));
+	const port = new TornSteerPort();
+	const logs: string[] = [];
+	manager = new PersonaSessionManager({
+		database,
+		port,
+		instanceId: "steering-test",
+		repo: join(home, "workspace"),
+		onTurnStart: ({ trigger }) => ({ text: trigger.body }),
+		log: (line) => {
+			logs.push(line);
+		},
+	});
+	enqueue("trigger", "first");
+	await manager.notifyInbound(ORIGIN_KEY);
+	await eventually(() => port.sends.length === 1, "initial send missing");
+	enqueue("torn", "second");
+	await manager.notifyInbound(ORIGIN_KEY);
+	await eventually(() => port.attempts.length === 2, "torn steer was not replayed");
+	expect(port.attempts[0]).toBe(port.attempts[1]);
+	expect(logs.some((line) => line.startsWith("steer_ambiguous") && line.includes("action=replay"))).toBe(true);
+	expect(logs.some((line) => line.startsWith("session_rebound_after_steer_failure"))).toBe(false);
+	expect(port.sends).toHaveLength(1);
+	expect(
+		database.inboundTurnRows(database.inboundNonterminalTurns(ORIGIN_KEY)[0]!.opRef).map((r) => r.message_id),
+	).toEqual(["trigger", "torn"]);
+	expect(database.inboundPendingOldest(ORIGIN_KEY)).toBeUndefined();
+});
+
+test("a torn steer whose replay also fails is treated as a broken session", async () => {
+	home = await mkdtemp(join(tmpdir(), "gajaeway-steering-"));
+	database = await GatewayDatabase.open(join(home, "gateway.db"));
+	class DeadPort extends ScriptedSessionPort {
+		attempts = 0;
+		constructor() {
+			super({ onBind: (input) => `session-${input.epoch}` });
+		}
+		async steer(): Promise<void> {
+			this.attempts++;
+			throw new GjcCliError("gjc sdk turn.steer exited 1", 1, "socket reset");
+		}
+	}
+	const port = new DeadPort();
+	const logs: string[] = [];
+	manager = new PersonaSessionManager({
+		database,
+		port,
+		instanceId: "steering-test",
+		repo: join(home, "workspace"),
+		onTurnStart: ({ trigger }) => ({ text: trigger.body }),
+		log: (line) => {
+			logs.push(line);
+		},
+	});
+	enqueue("trigger", "first");
+	await manager.notifyInbound(ORIGIN_KEY);
+	await eventually(() => port.sends.length === 1, "initial send missing");
+	enqueue("lost", "second");
+	await manager.notifyInbound(ORIGIN_KEY);
+	await eventually(() => port.sends.length === 2, "message was not sent on the replacement session");
+	expect(port.attempts).toBe(2);
+	expect(logs.some((line) => line.startsWith("session_rebound_after_steer_failure"))).toBe(true);
+	expect(port.sends[1]!.text).toBe("second");
+	expect(port.sends[1]!.sessionId).not.toBe(port.sends[0]!.sessionId);
 });

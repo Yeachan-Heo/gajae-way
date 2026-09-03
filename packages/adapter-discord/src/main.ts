@@ -275,7 +275,7 @@ export interface DescribedMessageEdit {
 	readonly origin: OriginRef;
 	readonly text: string;
 	readonly engagement: EngagementContext;
-	readonly receivedAt?: string;
+	readonly receivedAt: string;
 }
 
 /**
@@ -283,23 +283,33 @@ export interface DescribedMessageEdit {
  * dropped; open channels promote humans to a mention), on the message's NEW
  * content. Whether the original was ever ingested is the gateway's call: it
  * ignores edits of messages it never saw.
+ *
+ * discord.js fires `messageUpdate` for far more than user edits: a link
+ * preview resolving, an embed being attached, a pin, a flag change. None of
+ * those changed what the user said. Only a change in the RENDERED body is an
+ * edit; when the previous body is known (cached `before`) and equal, or the
+ * message carries no `editedTimestamp` at all, nothing is forwarded.
  */
 export function describeMessageEdit(
 	message: DiscordInboundMessage & AttachmentCarrier & { readonly editedTimestamp?: number | null },
 	botUser: unknown,
 	channels: Readonly<Record<string, { readonly engagement?: "open" }>> | undefined,
+	before?: (AttachmentCarrier & { readonly content?: string | null; readonly partial?: boolean }) | null,
 ): DescribedMessageEdit | undefined {
+	const editedAt = message.editedTimestamp;
+	if (typeof editedAt !== "number") return undefined;
 	const engagement = decideInbound(message, botUser, channels);
 	if (!engagement) return undefined;
 	const text = describeInboundBody(message);
 	if (text === "") return undefined;
-	const editedAt = message.editedTimestamp;
+	if (before && !before.partial && describeInboundBody({ ...before, content: before.content ?? "" }) === text)
+		return undefined;
 	return {
 		messageId: message.id as string,
 		origin: discordMessageOrigin(message),
 		text,
 		engagement,
-		...(typeof editedAt === "number" ? { receivedAt: new Date(editedAt).toISOString() } : {}),
+		receivedAt: new Date(editedAt).toISOString(),
 	};
 }
 
@@ -826,11 +836,11 @@ export async function startDiscordAdapter(config: LoadedDiscordAdapterConfig): P
 	// new message: it goes out as chat.edit and reaches the session as a
 	// [MESSAGE POINTER] update. Partial (uncached) messages carry no author or
 	// content until fetched; fetching is what makes the edit describable.
-	discord.on("messageUpdate", (_before, after) => {
+	discord.on("messageUpdate", (before, after) => {
 		void (async () => {
 			const message = after.partial ? await after.fetch().catch(() => undefined) : after;
 			if (!message) return;
-			const edit = describeMessageEdit(message, discord.user, config.channels);
+			const edit = describeMessageEdit(message, discord.user, config.channels, before);
 			if (!edit) return;
 			ingress.run(edit.origin.conversationId, async () => {
 				gateway.sendEdit(edit.messageId, edit.origin, edit.text, edit.engagement, edit.receivedAt);

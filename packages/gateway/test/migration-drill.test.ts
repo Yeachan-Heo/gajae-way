@@ -247,6 +247,8 @@ INSERT INTO inbound_messages (message_id, origin_key, origin_ref_json, body, eng
  ('settled-bound', 'o2', '{}', 'q2', NULL, 'pending', '2026-09-02T00:01:00.000Z', 'b2', 'trigger', 0, 'settled', 'gw-p-sb', NULL, 's-2', '2026-09-02T00:01:00.100Z', NULL),
  ('settled-unbound', 'o3', '{}', 'q3', NULL, 'pending', '2026-09-02T00:02:00.000Z', 'b3', 'trigger', 0, 'settled', 'gw-p-su', NULL, NULL, NULL, NULL),
  ('finished', 'o4', '{}', 'q4', NULL, 'done', '2026-09-02T00:03:00.000Z', 'b4', 'trigger', 1, 'done', 'gw-p-done', '2026-09-02T00:03:01.000Z', 's-4', '2026-09-02T00:03:00.500Z', '{"0":"gw-t-y"}'),
+ ('settled-member', 'o2', '{}', 'q2b', NULL, 'pending', '2026-09-02T00:01:00.200Z', 'b2', 'member', 0, 'settled', 'gw-p-sb', NULL, 's-2', '2026-09-02T00:01:00.100Z', NULL),
+ ('legacy-processing', 'o5', '{}', 'claimed by the pre-actor path', NULL, 'processing', '2026-09-02T00:04:00.000Z', NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL),
  ('wedged-unbatched', 'o1', '{}', 'stuck behind the wedge for 85 minutes', NULL, 'pending', '2026-09-01T22:00:00.000Z', NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL);
 `);
 		expect(
@@ -275,7 +277,7 @@ INSERT INTO inbound_messages (message_id, origin_key, origin_ref_json, body, eng
 			"terminal_delivery_id",
 		])
 			expect(columns).toContain(kept);
-		expect(total).toBe(7);
+		expect(total).toBe(9);
 
 		// Accepted trigger: turn intact, floor and terminal claim preserved.
 		expect(upgraded.inboundTurnRow("gw-p-live")).toMatchObject({
@@ -290,15 +292,18 @@ INSERT INTO inbound_messages (message_id, origin_key, origin_ref_json, body, eng
 		});
 		expect(upgraded.inboundTurnDispatchedAt("gw-p-live")).toBe("2026-09-02T00:00:01.000Z");
 		expect(upgraded.inboundTurnClaimTerminal("gw-p-live", 0, "gw-t-late")).toBe("gw-t-x");
-		// The steer stays attributed to that turn; the unanswered member is no
-		// longer part of it and waits, pending, for the next turn.
-		expect(upgraded.inboundTurnRows("gw-p-live").map((row) => [row.message_id, row.turn_role])).toEqual([
-			["live-trigger", "trigger"],
-			["live-steer", "steer"],
+		// The steer AND the accepted member stay attributed to that turn as done
+		// input: both were in the prompt the runtime holds, so neither is ever
+		// sent again.
+		expect(upgraded.inboundTurnRows("gw-p-live").map((row) => [row.message_id, row.turn_role, row.state])).toEqual([
+			["live-trigger", "trigger", "pending"],
+			["live-member", "steer", "done"],
+			["live-steer", "steer", "done"],
 		]);
 		expect(upgraded.inboundPendingOldest("o1")).toMatchObject({ message_id: "wedged-unbatched", turn_state: null });
-		expect(upgraded.inboundPendingCount("o1")).toBe(3);
-		// Settled + bound -> bound turn; settled + never bound -> plain pending.
+		expect(upgraded.inboundPendingCount("o1")).toBe(2);
+		// Settled + bound -> bound turn; its never-sent member returns to plain
+		// pending (the model never saw it); settled + never bound -> plain pending.
 		expect(upgraded.inboundNonterminalTurns("o2")).toEqual([
 			{
 				originKey: "o2",
@@ -309,6 +314,9 @@ INSERT INTO inbound_messages (message_id, origin_key, origin_ref_json, body, eng
 				triggerMessageId: "settled-bound",
 			},
 		]);
+		expect(upgraded.inboundPendingOldest("o2")).toMatchObject({ message_id: "settled-member", turn_state: null });
+		// A legacy processing row is pending again, not stranded.
+		expect(upgraded.inboundPendingOldest("o5")).toMatchObject({ message_id: "legacy-processing", state: "pending" });
 		expect(upgraded.inboundNonterminalTurns("o3")).toEqual([]);
 		expect(upgraded.inboundPendingOldest("o3")).toMatchObject({ message_id: "settled-unbound", turn_op_ref: null });
 		// A finished turn is history and stays done.

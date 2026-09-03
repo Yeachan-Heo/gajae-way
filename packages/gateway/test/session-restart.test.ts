@@ -30,8 +30,8 @@ class AuthorityShiftingPort extends ScriptedSessionPort {
 	}
 }
 
-async function eventually(predicate: () => boolean, message: string): Promise<void> {
-	for (let attempt = 0; attempt < 200; attempt++) {
+async function eventually(predicate: () => boolean, message: string, attempts = 200): Promise<void> {
+	for (let attempt = 0; attempt < attempts; attempt++) {
 		if (predicate()) return;
 		await Bun.sleep(5);
 	}
@@ -364,7 +364,7 @@ class ColdBindFlakyPort extends ScriptedSessionPort {
 	}
 }
 
-test("a dispatch whose bind initially fails retries on the same admission without stranding the pending row", async () => {
+test("a dispatch whose bind initially fails is retried after a backoff without stranding the pending row", async () => {
 	home = await mkdtemp(join(tmpdir(), "gajaeway-session-restart-"));
 	database = await GatewayDatabase.open(join(home, "gateway.db"));
 	const port = new ColdBindFlakyPort({ onSend: (input, scripted) => scripted.complete(input.opRef, "bound later") });
@@ -377,7 +377,10 @@ test("a dispatch whose bind initially fails retries on the same admission withou
 		() => logs.some((line) => line.startsWith(`persona_bind_failed origin=${KEY}`)),
 		"bind failure was not recorded",
 	);
-	await eventually(() => port.sends.length === 1, "turn was not dispatched after the bind retry");
+	// The retry is a real DISPATCH_FAILURE_RETRY_MS (2s) backoff timer, not a
+	// synchronous re-bind on the same admission.
+	expect(port.sends).toEqual([]);
+	await eventually(() => port.sends.length === 1, "turn was not dispatched after the bind retry", 1_000);
 	expect(port.bindAttempts).toBe(2);
 	await eventually(() => terminal.length === 1, "retried turn did not complete");
 	expect(database.inboundPendingCount(KEY)).toBe(0);

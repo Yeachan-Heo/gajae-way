@@ -2273,14 +2273,19 @@ ALTER TABLE monitor_slots ADD COLUMN event_id TEXT;`,
 				// columns in place. Preserved per row: bound_session_id (reattach
 				// after restart), dispatched_at (the attribution floor) and
 				// terminal_delivery_id (restart-safe per-part terminal claim).
-				// A v18 nonterminal batch maps to a nonterminal turn on its trigger;
-				// its unanswered `member` rows go back to plain pending so the next
-				// turn takes them - nothing is deleted.
+				// A v18 nonterminal batch maps to a nonterminal turn on its trigger.
+				// Its `member` rows were part of that batch's ONE prompt: members of
+				// an accepted batch (the runtime holds the op, they were sent) become
+				// done input attributed to the turn, like steers; members of a
+				// settled (never sent) batch were never seen by the model and go
+				// back to plain pending so the next turn takes them. Nothing is
+				// deleted. Legacy `processing` rows (the pre-actor claim path, whose
+				// startup normalisation is gone) return to pending.
 				this.#database.exec(
 					"CREATE TABLE inbound_messages_v19 (message_id TEXT PRIMARY KEY, origin_key TEXT NOT NULL, origin_ref_json TEXT NOT NULL, body TEXT NOT NULL, engagement_json TEXT, state TEXT NOT NULL CHECK(state IN ('pending','processing','done')), received_at TEXT NOT NULL, turn_role TEXT CHECK(turn_role IS NULL OR turn_role IN ('trigger', 'steer')), turn_epoch INTEGER, turn_state TEXT CHECK(turn_state IS NULL OR turn_state IN ('bound', 'accepted', 'done')), turn_op_ref TEXT, bound_session_id TEXT, dispatched_at TEXT, terminal_delivery_id TEXT)",
 				);
 				this.#database.exec(
-					"INSERT INTO inbound_messages_v19 (message_id, origin_key, origin_ref_json, body, engagement_json, state, received_at) SELECT message_id, origin_key, origin_ref_json, body, engagement_json, state, received_at FROM inbound_messages",
+					"INSERT INTO inbound_messages_v19 (message_id, origin_key, origin_ref_json, body, engagement_json, state, received_at) SELECT message_id, origin_key, origin_ref_json, body, engagement_json, CASE state WHEN 'processing' THEN 'pending' ELSE state END, received_at FROM inbound_messages",
 				);
 				// Triggers that were bound (session chosen) keep their turn; an unbound
 				// settled trigger never had an operation and returns to plain pending.
@@ -2289,6 +2294,9 @@ ALTER TABLE monitor_slots ADD COLUMN event_id TEXT;`,
 				);
 				this.#database.exec(
 					"UPDATE inbound_messages_v19 SET turn_role = 'steer', turn_epoch = src.batch_epoch, turn_state = 'done', turn_op_ref = src.attributed_op_ref FROM inbound_messages AS src WHERE src.message_id = inbound_messages_v19.message_id AND src.batch_role = 'steer'",
+				);
+				this.#database.exec(
+					"UPDATE inbound_messages_v19 SET state = 'done', turn_role = 'steer', turn_epoch = src.batch_epoch, turn_state = 'done', turn_op_ref = src.attributed_op_ref FROM inbound_messages AS src WHERE src.message_id = inbound_messages_v19.message_id AND src.batch_role = 'member' AND src.batch_state IN ('accepted', 'done')",
 				);
 				this.#database.exec("DROP TABLE inbound_messages");
 				this.#database.exec("ALTER TABLE inbound_messages_v19 RENAME TO inbound_messages");

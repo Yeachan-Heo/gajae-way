@@ -37,8 +37,15 @@ test("our own edited messages and edits to an empty body are not forwarded", () 
 	expect(describeMessageEdit(edited({ content: "" }), SELF, OPEN)).toBeUndefined();
 });
 
-test("an edit without an edit timestamp carries no receivedAt rather than inventing one", () => {
-	expect(describeMessageEdit(edited({ editedTimestamp: null }), SELF, OPEN)?.receivedAt).toBeUndefined();
+test("a messageUpdate that is not a user edit is not forwarded: no edit timestamp, or an unchanged rendered body (embed/link-preview/pin updates)", () => {
+	expect(describeMessageEdit(edited({ editedTimestamp: null }), SELF, OPEN)).toBeUndefined();
+	expect(describeMessageEdit(edited({ editedTimestamp: undefined }), SELF, OPEN)).toBeUndefined();
+	const before = { content: "hello, edited", partial: false };
+	expect(describeMessageEdit(edited(), SELF, OPEN, before)).toBeUndefined();
+	// A partial `before` (uncached) cannot prove the body was unchanged: forward.
+	expect(describeMessageEdit(edited(), SELF, OPEN, { content: "", partial: true })).toBeDefined();
+	// A real content change with a cached before: forward.
+	expect(describeMessageEdit(edited(), SELF, OPEN, { content: "hello", partial: false })?.text).toBe("hello, edited");
 });
 
 function gateway(client: { request: (verb: string, params?: unknown) => Promise<unknown> }) {

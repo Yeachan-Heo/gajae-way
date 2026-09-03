@@ -520,6 +520,75 @@ test("a DM burst is never coalesced: the first fragment is the turn and the rest
 	}
 });
 
+test("an open-channel burst from several authors: the first is the turn, later ones are steered with their speaker labels, and the next turn does not replay them as unread", async () => {
+	directory = await mkdtemp(join(tmpdir(), "gajaeway-server-"));
+	const config: GatewayConfig = {
+		schemaVersion: 1,
+		home: directory,
+		configPath: join(directory, "config.json"),
+		socketPath: join(directory, "gateway.sock"),
+		dbPath: join(directory, "gateway.db"),
+		logVerbosity: "info",
+		dmPolicy: "open" as const,
+		channels: { c1: { engagement: "open" } },
+	};
+	const database = await GatewayDatabase.open(config.dbPath);
+	const turns: string[] = [];
+	let release!: () => void;
+	let running = new Promise<void>((resolve) => {
+		release = resolve;
+	});
+	const sessionPort = sessionPortFromScript({
+		respond: async (_session, text) => {
+			turns.push(text);
+			await running;
+			return "ok";
+		},
+	});
+	server = await startUnixServer({ config, database, sessionPort, onStop: () => database.close() });
+	const client = await connect(config.socketPath);
+	client.send({ v: "0.1", type: "hello", payload: { supportedVersions: ["0.1"] } });
+	await waitFor(client.frames, 1);
+	const origin = { platform: "discord", kind: "channel", conversationId: "c1" };
+	const say = (id: string, text: string, authorId: string, authorName: string) =>
+		client.send({
+			v: "0.1",
+			type: "request",
+			id,
+			verb: "chat.send",
+			params: { origin, text, messageId: id, engagement: { mentioned: false, group: true, authorId, authorName } },
+		});
+	say("m1", "first message", "u1", "alice");
+	for (let attempt = 0; attempt < 400 && turns.length === 0; attempt++) await Bun.sleep(5);
+	say("m2", "second message", "u2", "bob");
+	say("m3", "third message", "u3", "carol");
+	for (let attempt = 0; attempt < 400 && sessionPort.steers.length < 2; attempt++) await Bun.sleep(5);
+	expect(turns).toHaveLength(1);
+	expect(turns[0]).toContain("[alice | discord channel c1 (author:u1, msg:m1)]");
+	try {
+		// Each steer names its speaker and message, like a trigger would.
+		expect(sessionPort.steers[0]!.text).toContain("bob");
+		expect(sessionPort.steers[0]!.text).toContain("msg:m2");
+		expect(sessionPort.steers[0]!.text).toContain("second message");
+		expect(sessionPort.steers[1]!.text).toContain("carol");
+		expect(sessionPort.steers[1]!.text).toContain("msg:m3");
+	} finally {
+		release();
+	}
+	for (let attempt = 0; attempt < 400 && database.inboundPendingCount("discord/channel/c1") > 0; attempt++)
+		await Bun.sleep(5);
+	// The steered messages were read inside turn 1: the next turn must not get
+	// them again as "unread".
+	running = Promise.resolve();
+	say("m4", "fourth message", "u1", "alice");
+	for (let attempt = 0; attempt < 400 && turns.length < 2; attempt++) await Bun.sleep(5);
+	expect(turns).toHaveLength(2);
+	expect(turns[1]).not.toContain("second message");
+	expect(turns[1]).not.toContain("third message");
+	expect(turns[1]).toContain("fourth message");
+	client.close();
+});
+
 test("a backlog left pending across an outage is answered on boot, never expired", async () => {
 	directory = await mkdtemp(join(tmpdir(), "gajaeway-server-"));
 	const config: GatewayConfig = {

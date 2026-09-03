@@ -10,7 +10,7 @@ import { PersonaSessionManager, personaTurnOpRef } from "../src/orchestrator/per
 import type { SessionSendInput, SessionSteerInput } from "../src/orchestrator/session-port";
 import type { TailAttachInput } from "../src/orchestrator/tail-runner";
 import { GatewayDatabase, type InboundTurn } from "../src/store/db";
-import { ScriptedSessionPort } from "./session-port.fake";
+import { ScriptedSessionPort, steerRefused } from "./session-port.fake";
 
 const ORIGIN = { platform: "loopback", kind: "loopback", conversationId: "issue92-redteam" } as const;
 const ORIGIN_KEY = "loopback/loopback/issue92-redteam";
@@ -150,7 +150,7 @@ class FailFirstSteerPort extends ScriptedSessionPort {
 
 	async steer(input: SessionSteerInput): Promise<void> {
 		this.steerAttempts++;
-		if (this.steerAttempts === 1) throw new Error("broker socket disappeared after steer dispatch");
+		if (this.steerAttempts === 1) throw steerRefused("session rejected the steer");
 		await super.steer(input);
 	}
 }
@@ -166,7 +166,7 @@ class IntermittentSteerPort extends ScriptedSessionPort {
 
 	async steer(input: SessionSteerInput): Promise<void> {
 		this.steerAttempts++;
-		if (this.#failAttempts.has(this.steerAttempts)) throw new Error(`scripted steer disconnect ${this.steerAttempts}`);
+		if (this.#failAttempts.has(this.steerAttempts)) throw steerRefused(`scripted refusal ${this.steerAttempts}`);
 		await super.steer(input);
 	}
 }
@@ -520,7 +520,7 @@ class EndedTurnRejectsSteerPort extends ScriptedSessionPort {
 
 	async steer(input: SessionSteerInput): Promise<void> {
 		this.steerAttempts++;
-		if (this.turnEnded) throw new Error("turn.steer: no running turn");
+		if (this.turnEnded) throw steerRefused("no running turn");
 		await super.steer(input);
 	}
 }

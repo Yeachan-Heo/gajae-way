@@ -57,6 +57,7 @@ import type { BrokerSupervisor } from "../orchestrator/broker";
 import {
 	type PersonaFailureInput,
 	PersonaSessionManager,
+	type PersonaSteerInput,
 	type PersonaTailFrameInput,
 	type PersonaTerminalInput,
 	type PersonaTurnLifecycle,
@@ -1858,6 +1859,22 @@ async function createInboundTurnLifecycle(
 		emitProgress(lastKnown);
 	};
 
+	const renderSteer = (steered: InboundMessageRow): string => {
+		const steerEngagement = steered.engagement_json
+			? (JSON.parse(steered.engagement_json) as NonNullable<typeof engagement>)
+			: undefined;
+		const steerSpeaker = composeSpeakerLabel(steerEngagement);
+		return steerSpeaker
+			? `${composeTurnHeader({ speaker: steerSpeaker, place, authorId: steerEngagement?.authorId, messageId: steered.message_id, engagement: steerEngagement })}\n${steered.body}`
+			: steered.body;
+	};
+	const onSteerAccepted = ({ row: steered }: PersonaSteerInput) => {
+		// The steered message reached the model inside THIS turn: it is read
+		// context now, not unread for the next turn, and its transient request
+		// ownership is over.
+		if (nonLoopback) options.database.contextConsume([steered.message_id]);
+		runtime.inbound.delete(steered.message_id);
+	};
 	const onTerminal = async ({ text }: PersonaTerminalInput) => {
 		try {
 			if (nonLoopback) options.database.contextCommitWindow(key, contextMessageIds, contextOmissionRevision);
@@ -1940,6 +1957,8 @@ async function createInboundTurnLifecycle(
 		text: turnText,
 		systemPreamble,
 		...(effectiveModel ? { effectiveModel } : {}),
+		renderSteer,
+		onSteerAccepted,
 		onFrame,
 		onTerminal,
 		onFailure,
