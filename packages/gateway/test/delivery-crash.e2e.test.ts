@@ -18,8 +18,6 @@ async function start(): Promise<string> {
 	// is testing: the subject here is crash recovery, not engagement.
 	await Bun.write(
 		join(home, "config.json"),
-		// A short settle window keeps this fixture inside its 2s frame waits; the
-		// subject here is crash recovery, not fixed-window coalescing.
 		JSON.stringify({ schemaVersion: 1, channels: { channel: { engagement: "open" } } }),
 	);
 	child = Bun.spawn({

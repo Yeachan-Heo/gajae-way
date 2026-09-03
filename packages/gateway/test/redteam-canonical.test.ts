@@ -204,11 +204,15 @@ class UnavailableReplacementBindPort extends ScriptedSessionPort {
 	}
 }
 
-class EarlyStartedAtPort extends ScriptedSessionPort {
+/**
+ * Models the runtime's own clock: `startedAt` and transcript row stamps come
+ * from the SAME host, which may be offset from the gateway's clock. The rows
+ * the port "has" are (hostStamp, text); fetchAssistantSince returns the newest
+ * row stamped at/after the floor, with the same 2s slack as the real port.
+ */
+class HostClockPort extends ScriptedSessionPort {
 	forceStartedAt: number | undefined;
-	dispatchFloor = 0;
-	staleText = "previous durable body";
-	freshText = "current durable body";
+	readonly rows: Array<{ at: number; text: string }> = [];
 	readonly transcriptFloors: number[] = [];
 
 	async status(input: { sessionId: string; repo: string; opRef: string }): Promise<StatusReport> {
@@ -219,11 +223,9 @@ class EarlyStartedAtPort extends ScriptedSessionPort {
 
 	async fetchAssistantSince(input: { sessionId: string; repo: string; notBeforeMs: number }) {
 		this.transcriptFloors.push(input.notBeforeMs);
-		return {
-			text: input.notBeforeMs < this.dispatchFloor ? this.staleText : this.freshText,
-			pages: 1,
-			complete: true,
-		};
+		const last = this.rows.at(-1);
+		if (!last || last.at + 2_000 < input.notBeforeMs) return undefined;
+		return { text: last.text, pages: 1, complete: true };
 	}
 }
 
@@ -310,34 +312,40 @@ test("C1c: three cursorless replays of prior answers cannot move a reply onto th
 	}
 }, 15_000);
 
-test("C1d: a host-clock-ahead startedAt must not let a pre-dispatch transcript row win the terminal read", async () => {
-	const port = new EarlyStartedAtPort();
+test("C1d: startedAt is the floor on the host's own clock - a host clock BEHIND the gateway never reopens the previous turn's row, and a host clock AHEAD never hides the real answer", async () => {
+	const port = new HostClockPort();
 	const fixture = await directFixture({ port });
 	try {
-		port.dispatchFloor = 0;
-		port.freshText = "previous durable body";
-		await admit(fixture, "started-at-prior", "prior prompt");
-		const first = required(port.sends[0], "prior turn was not sent");
-		port.completeWithoutAnswerFrame(first.opRef, "previous durable body");
-		await eventually(() => fixture.terminals.length === 1, "prior turn did not complete");
+		for (const skewMs of [-3_000, +3_000]) {
+			const tag = skewMs < 0 ? "behind" : "ahead";
+			await admit(fixture, `prior-${tag}`, "prior prompt");
+			const first = required(port.sends.at(-1), "prior turn was not sent");
+			// The host stamps everything on ITS clock (gateway now + skew): the
+			// op's startedAt and the answer row it writes 1ms later.
+			const priorHostAt = Date.now() + skewMs;
+			port.forceStartedAt = priorHostAt - 1;
+			port.rows.push({ at: priorHostAt, text: `previous durable body ${tag}` });
+			port.completeWithoutAnswerFrame(first.opRef, `previous durable body ${tag}`);
+			await eventually(() => fixture.terminals.length === (skewMs < 0 ? 1 : 3), "prior turn did not complete");
 
-		port.freshText = "current durable body";
-		await admit(fixture, "started-at-current", "current prompt");
-		const second = required(port.sends[1], "current turn was not sent");
-		const dispatchFloor = Date.parse(
-			required(fixture.database.inboundTurnDispatchedAt(second.opRef), "dispatch floor missing"),
-		);
-		port.dispatchFloor = dispatchFloor;
-		port.forceStartedAt = dispatchFloor - 3_000;
-		port.completeWithoutAnswerFrame(second.opRef, "current durable body");
-		await eventually(() => fixture.terminals.length === 2, "current turn did not complete");
-		// The later of the two floors wins: a runtime clock behind ours must not
-		// reopen the previous turn's row (this was the red-team C1d finding).
-		expect(port.transcriptFloors.at(-1)).toBe(dispatchFloor);
+			await admit(fixture, `current-${tag}`, "current prompt");
+			const second = required(port.sends.at(-1), "current turn was not sent");
+			// The runtime starts the op 5s (host clock) after the prior answer and
+			// writes the current answer 1ms after starting.
+			const startedAt = priorHostAt + 5_000;
+			port.forceStartedAt = startedAt;
+			port.rows.push({ at: startedAt + 1, text: `current durable body ${tag}` });
+			port.completeWithoutAnswerFrame(second.opRef, `current durable body ${tag}`);
+			await eventually(() => fixture.terminals.length === (skewMs < 0 ? 2 : 4), "current turn did not complete");
+			expect(port.transcriptFloors.at(-1)).toBe(startedAt);
+		}
 		expect(fixture.terminals).toEqual([
-			{ trigger: "started-at-prior", text: "previous durable body" },
-			{ trigger: "started-at-current", text: "current durable body" },
+			{ trigger: "prior-behind", text: "previous durable body behind" },
+			{ trigger: "current-behind", text: "current durable body behind" },
+			{ trigger: "prior-ahead", text: "previous durable body ahead" },
+			{ trigger: "current-ahead", text: "current durable body ahead" },
 		]);
+		expect(fixture.logs.some((line) => line.startsWith("terminal_text_unavailable"))).toBe(false);
 	} finally {
 		await fixture.close();
 	}

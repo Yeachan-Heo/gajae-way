@@ -70,6 +70,7 @@ async function start(respond: (text: string) => Promise<string>) {
 		dbPath: join(directory, "gateway.db"),
 		logVerbosity: "info",
 		dmPolicy: "open",
+		channels: { c1: { engagement: "open-mention-only" } },
 	};
 	database = await GatewayDatabase.open(config.dbPath);
 	const port = sessionPortFromScript({ respond: (_session, text) => respond(text) });
@@ -182,5 +183,66 @@ test("the same edit event delivered twice is one update; a further edit is a sec
 	await eventually(() => turns.length === 3, "second edit was not sent");
 	expect(turns[2]).toContain("v3");
 	expect(messageEditId("m-1", "v2")).not.toBe(messageEditId("m-1", "v3"));
+	client.close();
+});
+
+test("a steered edit of a context-only message consumes the ORIGINAL message's context row, so the next turn does not replay it as unread", async () => {
+	let release!: () => void;
+	const running = new Promise<void>((resolve) => {
+		release = resolve;
+	});
+	const turns: string[] = [];
+	const { client, port } = await start(async (text) => {
+		turns.push(text);
+		if (turns.length === 1) await running;
+		return "ok";
+	});
+	// Mention-only channel: while alice's mention runs, bob posts WITHOUT a
+	// mention (context only, never a turn or a steer), then edits that post
+	// into a mention. Only the edit is steered.
+	const channel = { platform: "discord", kind: "channel", conversationId: "c1" } as const;
+	const post = (id: string, messageId: string, text: string, authorId: string, mentioned: boolean) =>
+		client.send({
+			v: "0.1",
+			type: "request",
+			id,
+			verb: "chat.send",
+			params: {
+				origin: channel,
+				text,
+				messageId,
+				engagement: { mentioned, group: true, authorId, authorName: authorId },
+			},
+		});
+	const editIn = (id: string, messageId: string, text: string, authorId: string) =>
+		client.send({
+			v: "0.1",
+			type: "request",
+			id,
+			verb: "chat.edit",
+			params: {
+				origin: channel,
+				messageId,
+				text,
+				engagement: { mentioned: true, group: true, authorId, authorName: authorId },
+			},
+		});
+	post("s1", "m-1", "@bot start", "alice", true);
+	await eventually(() => turns.length === 1, "first turn was not sent");
+	post("s2", "m-2", "bot, wrong ping", "bob", false);
+	await eventually(() => client.response("s2")?.result?.engaged === false, "bob's post was not recorded as context");
+	editIn("e1", "m-2", "@bot right ping", "bob");
+	await eventually(() => port.steers.length === 1, "bob's edit was not steered");
+	expect(port.steers[0]!.text).toContain("[MESSAGE POINTER: m-2]");
+	expect(port.steers[0]!.text).toContain("@bot right ping");
+	release();
+	await eventually(() => database!.inboundPendingCount("discord/channel/c1") === 0, "first turn did not complete");
+	post("s3", "m-3", "@bot next", "alice", true);
+	await eventually(() => turns.length === 2, "next turn was not sent");
+	// m-2 was read inside turn 1 (as the pointer update): the next turn must
+	// not get it again as unread context, in either body.
+	expect(turns[1]).not.toContain("right ping");
+	expect(turns[1]).not.toContain("wrong ping");
+	expect(turns[1]).toContain("@bot next");
 	client.close();
 });

@@ -1505,6 +1505,12 @@ export function messageEditId(messageId: string, text: string): string {
 	return `edit:${messageId}:${createHash("sha256").update(text).digest("hex").slice(0, 16)}`;
 }
 
+/** The platform message an edit row points at, or undefined for an ordinary inbound row. */
+export function editedMessageId(inboundMessageId: string): string | undefined {
+	const match = /^edit:(.+):[0-9a-f]{16}$/.exec(inboundMessageId);
+	return match?.[1];
+}
+
 async function editChat(
 	connection: Connection,
 	request: RequestFrame,
@@ -1620,7 +1626,9 @@ async function createInboundTurnLifecycle(
 	let contextOmissionRevision = 0;
 	if (nonLoopback) {
 		const prepared = options.database.contextWindow(key, row.message_id);
-		contextMessageIds = [...prepared.selectedMessageIds, row.message_id];
+		// A pointer-update turn reads its ORIGINAL message's row (the edited body
+		// lives there); commit that id, not the synthetic edit row.
+		contextMessageIds = [...prepared.selectedMessageIds, editedMessageId(row.message_id) ?? row.message_id];
 		contextOmissionRevision = prepared.omissionRevision;
 		const lines = prepared.rows.map(
 			(entry) =>
@@ -1871,8 +1879,9 @@ async function createInboundTurnLifecycle(
 	const onSteerAccepted = ({ row: steered }: PersonaSteerInput) => {
 		// The steered message reached the model inside THIS turn: it is read
 		// context now, not unread for the next turn, and its transient request
-		// ownership is over.
-		if (nonLoopback) options.database.contextConsume([steered.message_id]);
+		// ownership is over. A pointer update consumes the ORIGINAL message's
+		// context row (that is where the edited body now lives).
+		if (nonLoopback) options.database.contextConsume([editedMessageId(steered.message_id) ?? steered.message_id]);
 		runtime.inbound.delete(steered.message_id);
 	};
 	const onTerminal = async ({ text }: PersonaTerminalInput) => {

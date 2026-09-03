@@ -628,15 +628,27 @@ export class GatewayDatabase {
 		});
 	}
 
-	/** Records the accepted receipt boundary: the runtime now holds the operation. */
+	/**
+	 * Records the accepted receipt boundary: the runtime now holds the
+	 * operation. A member still riding with the trigger (v18 settled+bound
+	 * batch) was in that prompt, so it is done input from here on.
+	 */
 	inboundTurnAccept(opRef: string): boolean {
-		return (
-			this.#database
-				.query(
-					"UPDATE inbound_messages SET turn_state = 'accepted' WHERE turn_op_ref = ? AND turn_role = 'trigger' AND state = 'pending' AND turn_state = 'bound'",
-				)
-				.run(opRef).changes > 0
-		);
+		return this.withTransaction(() => {
+			const accepted =
+				this.#database
+					.query(
+						"UPDATE inbound_messages SET turn_state = 'accepted' WHERE turn_op_ref = ? AND turn_role = 'trigger' AND state = 'pending' AND turn_state = 'bound'",
+					)
+					.run(opRef).changes > 0;
+			if (accepted)
+				this.#database
+					.query(
+						"UPDATE inbound_messages SET state = 'done', turn_state = 'done' WHERE turn_op_ref = ? AND turn_role = 'steer' AND state = 'pending' AND turn_state = 'bound'",
+					)
+					.run(opRef);
+			return accepted;
+		});
 	}
 
 	/** The turn's pre-send dispatch stamp. */
@@ -684,13 +696,27 @@ export class GatewayDatabase {
 		});
 	}
 
-	/** Terminal reconciliation: legacy state and turn state become done in one statement. */
+	/**
+	 * Terminal reconciliation: legacy state and turn state become done in one
+	 * statement, for the trigger and for any member still riding with it (a
+	 * v18 settled+bound member whose send the runtime proved it holds). Returns
+	 * how many TRIGGER rows closed, so a repeat call is a no-op.
+	 */
 	inboundTurnComplete(opRef: string): number {
-		return this.#database
-			.query(
-				"UPDATE inbound_messages SET state = 'done', turn_state = 'done' WHERE turn_op_ref = ? AND turn_role = 'trigger' AND state = 'pending' AND turn_state IN ('bound', 'accepted')",
-			)
-			.run(opRef).changes;
+		return this.withTransaction(() => {
+			const closed = this.#database
+				.query(
+					"UPDATE inbound_messages SET state = 'done', turn_state = 'done' WHERE turn_op_ref = ? AND turn_role = 'trigger' AND state = 'pending' AND turn_state IN ('bound', 'accepted')",
+				)
+				.run(opRef).changes;
+			if (closed > 0)
+				this.#database
+					.query(
+						"UPDATE inbound_messages SET state = 'done', turn_state = 'done' WHERE turn_op_ref = ? AND turn_role = 'steer' AND state = 'pending' AND turn_state = 'bound'",
+					)
+					.run(opRef);
+			return closed;
+		});
 	}
 
 	/**
@@ -708,9 +734,11 @@ export class GatewayDatabase {
 			const prior = Number.parseInt(this.metaGet(key) ?? "0", 10);
 			const attempt = Number.isSafeInteger(prior) && prior >= 0 ? prior + 1 : 1;
 			this.metaSet(key, String(attempt));
+			// The trigger and any member still riding with it (a v18 settled+bound
+			// batch whose send was proven absent) go back to plain pending together.
 			this.#database
 				.query(
-					"UPDATE inbound_messages SET turn_role = NULL, turn_epoch = NULL, turn_state = NULL, turn_op_ref = NULL, bound_session_id = NULL, dispatched_at = NULL, terminal_delivery_id = NULL WHERE turn_op_ref = ? AND turn_role = 'trigger' AND state = 'pending'",
+					"UPDATE inbound_messages SET turn_role = NULL, turn_epoch = NULL, turn_state = NULL, turn_op_ref = NULL, bound_session_id = NULL, dispatched_at = NULL, terminal_delivery_id = NULL WHERE turn_op_ref = ? AND state = 'pending' AND (turn_role = 'trigger' OR (turn_role = 'steer' AND turn_state = 'bound'))",
 				)
 				.run(opRef);
 			return attempt;
@@ -2276,11 +2304,15 @@ ALTER TABLE monitor_slots ADD COLUMN event_id TEXT;`,
 				// A v18 nonterminal batch maps to a nonterminal turn on its trigger.
 				// Its `member` rows were part of that batch's ONE prompt: members of
 				// an accepted batch (the runtime holds the op, they were sent) become
-				// done input attributed to the turn, like steers; members of a
-				// settled (never sent) batch were never seen by the model and go
-				// back to plain pending so the next turn takes them. Nothing is
-				// deleted. Legacy `processing` rows (the pre-actor claim path, whose
-				// startup normalisation is gone) return to pending.
+				// done input attributed to the turn, like steers. Members of a
+				// settled+bound batch sit in the send/ack crash window - the prompt
+				// may or may not have reached the runtime - so they ride with the
+				// trigger as pending `steer`/`bound` rows and are decided WITH it by
+				// recovery (accepted -> done input; send proven absent -> released
+				// to plain pending together). Members of a settled+unbound batch
+				// were never sent and go back to plain pending. Nothing is deleted.
+				// Legacy `processing` rows (the pre-actor claim path, whose startup
+				// normalisation is gone) return to pending.
 				this.#database.exec(
 					"CREATE TABLE inbound_messages_v19 (message_id TEXT PRIMARY KEY, origin_key TEXT NOT NULL, origin_ref_json TEXT NOT NULL, body TEXT NOT NULL, engagement_json TEXT, state TEXT NOT NULL CHECK(state IN ('pending','processing','done')), received_at TEXT NOT NULL, turn_role TEXT CHECK(turn_role IS NULL OR turn_role IN ('trigger', 'steer')), turn_epoch INTEGER, turn_state TEXT CHECK(turn_state IS NULL OR turn_state IN ('bound', 'accepted', 'done')), turn_op_ref TEXT, bound_session_id TEXT, dispatched_at TEXT, terminal_delivery_id TEXT)",
 				);
@@ -2297,6 +2329,9 @@ ALTER TABLE monitor_slots ADD COLUMN event_id TEXT;`,
 				);
 				this.#database.exec(
 					"UPDATE inbound_messages_v19 SET state = 'done', turn_role = 'steer', turn_epoch = src.batch_epoch, turn_state = 'done', turn_op_ref = src.attributed_op_ref FROM inbound_messages AS src WHERE src.message_id = inbound_messages_v19.message_id AND src.batch_role = 'member' AND src.batch_state IN ('accepted', 'done')",
+				);
+				this.#database.exec(
+					"UPDATE inbound_messages_v19 SET turn_role = 'steer', turn_epoch = src.batch_epoch, turn_state = 'bound', turn_op_ref = src.attributed_op_ref FROM inbound_messages AS src WHERE src.message_id = inbound_messages_v19.message_id AND src.batch_role = 'member' AND src.batch_state = 'settled' AND src.bound_session_id IS NOT NULL AND src.state = 'pending'",
 				);
 				this.#database.exec("DROP TABLE inbound_messages");
 				this.#database.exec("ALTER TABLE inbound_messages_v19 RENAME TO inbound_messages");

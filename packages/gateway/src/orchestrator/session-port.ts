@@ -51,11 +51,9 @@ export interface SessionPort {
 	fetchLastAssistant(input: { sessionId: string; repo: string }): Promise<LastAssistantResult>;
 	/**
 	 * Last assistant row NOT older than `notBeforeMs`. Callers pass the op's
-	 * reported startedAt when present, otherwise the batch's `dispatched_at`
-	 * (stamped at its first bind, before the send, never moved by a re-bind
-	 * and cleared on requeue). The settle/inclusion cutoff is deliberately not
-	 * a floor source: on the failed-steer backlog path it predates the previous
-	 * turn's answer. Turn-scoped by wall clock, independent of gjc ring
+	 * reported startedAt when present, otherwise the turn's `dispatched_at`
+	 * (stamped at bind, before the send, and cleared on requeue). Turn-scoped
+	 * by wall clock, independent of gjc ring
 	 * coordinates (gajae-code#5200); undefined when the newest row predates
 	 * the turn.
 	 */

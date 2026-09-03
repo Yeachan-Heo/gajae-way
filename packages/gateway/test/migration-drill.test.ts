@@ -314,14 +314,30 @@ INSERT INTO inbound_messages (message_id, origin_key, origin_ref_json, body, eng
 				triggerMessageId: "settled-bound",
 			},
 		]);
-		expect(upgraded.inboundPendingOldest("o2")).toMatchObject({ message_id: "settled-member", turn_state: null });
+		// The settled+bound member rides with its trigger (pending, attributed) and
+		// is decided with it: never sent again on its own, never lost.
+		expect(upgraded.inboundPendingOldest("o2")).toBeUndefined();
+		expect(
+			upgraded.inboundTurnRows("gw-p-sb").map((row) => [row.message_id, row.turn_role, row.state, row.turn_state]),
+		).toEqual([
+			["settled-bound", "trigger", "pending", "bound"],
+			["settled-member", "steer", "pending", "bound"],
+		]);
+		// Recovery proves the send landed: both become done input together.
+		expect(upgraded.inboundTurnAccept("gw-p-sb")).toBe(true);
+		expect(upgraded.inboundTurnRows("gw-p-sb").map((row) => [row.message_id, row.state, row.turn_state])).toEqual([
+			["settled-bound", "pending", "accepted"],
+			["settled-member", "done", "done"],
+		]);
+		expect(upgraded.inboundTurnComplete("gw-p-sb")).toBe(1);
+		expect(upgraded.inboundPendingCount("o2")).toBe(0);
 		// A legacy processing row is pending again, not stranded.
 		expect(upgraded.inboundPendingOldest("o5")).toMatchObject({ message_id: "legacy-processing", state: "pending" });
 		expect(upgraded.inboundNonterminalTurns("o3")).toEqual([]);
 		expect(upgraded.inboundPendingOldest("o3")).toMatchObject({ message_id: "settled-unbound", turn_op_ref: null });
 		// A finished turn is history and stays done.
 		expect(upgraded.inboundTurnRow("gw-p-done")).toMatchObject({ state: "done", turn_state: "done" });
-		expect(upgraded.inboundNonterminalTurnCount()).toBe(2);
+		expect(upgraded.inboundNonterminalTurnCount()).toBe(1);
 		// The uniqueness the actor relies on survives the rebuild.
 		expect(() =>
 			upgraded.inboundBindTurn({

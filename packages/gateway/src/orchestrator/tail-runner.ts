@@ -190,7 +190,7 @@ export class TailRunner {
 
 	/**
 	 * Attaches before a prompt is sent. When all slots are running, this waits
-	 * without changing durable inbound state; callers retain their settled batch.
+	 * without changing durable inbound state; callers retain their bound turn.
 	 */
 	async attach(input: TailAttachInput): Promise<TailHandle> {
 		await this.#acquireSlot(input.priority ?? "current");
@@ -391,7 +391,7 @@ class ManagedTailHandle implements TailHandle {
 		this.#accepted = true;
 		this.#acceptedOpRef = opRef;
 		// The flush is deliberately NOT awaited by the caller: markAccepted is
-		// invoked from inside the origin mailbox (settle/recovery), and onFrame
+		// invoked from inside the origin mailbox (dispatch/recovery), and onFrame
 		// re-enters that same mailbox. Delivering synchronously here would
 		// self-deadlock; delivering in the poll loop's turn keeps frame side
 		// effects ordered (later frames wait on #flush) and ahead of the cursor
@@ -852,7 +852,7 @@ function nonNegativeInteger(value: number | undefined, fallback: number, name: s
 }
 
 /**
- * Identity of one INTERIM delivery of a persona batch: the inbound trigger,
+ * Identity of one INTERIM delivery of a persona turn: the inbound trigger,
  * the part's exact text, and its index. Two different mid-turn findings get two
  * ids; the same finding replayed (stream reopen backfill, gateway restart with
  * an id-less frame) hashes to the row that already exists.
@@ -868,7 +868,7 @@ export function deterministicInterimDeliveryId(
 }
 
 /**
- * Identity of the batch's ONE terminal reply slot per part: the inbound trigger
+ * Identity of the turn's ONE terminal reply slot per part: the inbound trigger
  * and the part index, never the text. A regenerated or reconciled second answer
  * for the same trigger hashes to the same row and is dropped by the ledger.
  */
