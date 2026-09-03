@@ -440,6 +440,23 @@ function formatTokens(outputTokens: number): string {
 }
 
 /**
+ * The status shows only what the runtime actually reported. Counters come from
+ * the live tail, and gjc 0.16.0 filters `tool_activity` for stdio clients (its
+ * stdio transport cannot negotiate the capability), so on that path they stay
+ * zero for the whole turn - "working… (4m 40s, 0 tools, 0 tok)" was two fields
+ * of noise claiming the turn did nothing (live, 2026-09-03). Zero counters are
+ * therefore omitted rather than displayed as facts.
+ */
+export function workingStatusText(
+	progress: Pick<ChatProgressPayload, "elapsedMs" | "toolCalls" | "outputTokens">,
+): string {
+	const parts = [formatElapsed(progress.elapsedMs)];
+	if (progress.toolCalls > 0) parts.push(`${progress.toolCalls} tool${progress.toolCalls === 1 ? "" : "s"}`);
+	if (progress.outputTokens > 0) parts.push(formatTokens(progress.outputTokens));
+	return `⏳ working… (${parts.join(", ")})`;
+}
+
+/**
  * Renders a long-running turn as one temporary, amended status message per
  * conversation ("working… (2m 05s, 3 tools)") driven by gateway chat.progress
  * events, and removes it when the real reply is delivered. Best-effort only:
@@ -490,7 +507,7 @@ export class WorkingStatus {
 		const conversationId = progress.origin.conversationId;
 		if (!this.#addressed.has(conversationId)) return;
 		this.#armStale(conversationId);
-		const text = `⏳ working… (${formatElapsed(progress.elapsedMs)}, ${progress.toolCalls} tool${progress.toolCalls === 1 ? "" : "s"}, ${formatTokens(progress.outputTokens)})`;
+		const text = workingStatusText(progress);
 		const existing = this.#messages.get(conversationId);
 		if (existing === "pending") return; // a send is already in flight; next tick edits
 		try {

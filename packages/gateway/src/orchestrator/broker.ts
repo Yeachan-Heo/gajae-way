@@ -841,18 +841,16 @@ export class BrokerSupervisor implements PersonaBroker {
 			stderr: "ignore",
 			env: brokerEnvironment(this.agentDir),
 		});
-		// The host gates tool_activity frames behind a client-declared capability
-		// (CAP_GATED_FRAME_KINDS); without this the live stream only carries
-		// activity/agent_* and chat.progress tool counts go stale. Measured on gjc
-		// 0.16.0: the stream carries no token counters at all, so output-token
-		// figures in chat.progress are estimated from finalized text length.
-		try {
-			const stdin = child.stdin as { write(chunk: string): unknown; flush?(): void } | undefined;
-			stdin?.write(`${JSON.stringify({ type: "event_replay", capabilities: ["tool_activity_v2"] })}\n`);
-			stdin?.flush?.();
-		} catch {
-			// best effort: the stream still carries lifecycle frames
-		}
+		// No capability handshake here: gjc 0.16.0 gates tool_activity and
+		// reasoning_summary behind a NEGOTIATED capability, and only its
+		// websocket transport implements that negotiation - a `sdk serve --stdio`
+		// client cannot declare one, so the host filters those frames for us
+		// whatever we write to stdin (verified: zero tool_activity frames in a
+		// full day of live traffic). The stream therefore carries lifecycle and
+		// turn_stream frames only; chat.progress reports elapsed time, and any
+		// counters it does have are estimated from finalized assistant text.
+		// Real tool/token counters would require streaming over the broker
+		// WebSocket instead of the stdio relay.
 		let closed = false;
 		const close = () => {
 			if (closed) return;

@@ -17,6 +17,7 @@ import {
 	subscribeDiscordProgress,
 	TypingIndicator,
 	WorkingStatus,
+	workingStatusText,
 } from "../src/main";
 import { discordMessageOrigin } from "../src/origin";
 
@@ -471,4 +472,16 @@ test("an unaddressed public-channel turn posts no working status until it is arm
 	// Disarmed: the next turn's ticks are silent again until re-armed.
 	await status.update(tick);
 	expect(sent).toHaveLength(1);
+});
+
+test("the working status never claims counters the runtime did not report", () => {
+	// gjc 0.16.0's stdio relay cannot negotiate the tool_activity capability, so
+	// both counters stay zero for the whole turn: showing them read as "this turn
+	// did nothing" for minutes (live, 2026-09-03).
+	expect(workingStatusText({ elapsedMs: 280_000, toolCalls: 0, outputTokens: 0 })).toBe("⏳ working… (4m 40s)");
+	expect(workingStatusText({ elapsedMs: 16_000, toolCalls: 1, outputTokens: 0 })).toBe("⏳ working… (16s, 1 tool)");
+	expect(workingStatusText({ elapsedMs: 16_000, toolCalls: 0, outputTokens: 210 })).toBe("⏳ working… (16s, 210 tok)");
+	expect(workingStatusText({ elapsedMs: 125_000, toolCalls: 3, outputTokens: 1250 })).toBe(
+		"⏳ working… (2m 05s, 3 tools, 1.3k tok)",
+	);
 });
