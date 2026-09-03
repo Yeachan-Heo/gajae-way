@@ -74,6 +74,7 @@ test("sendEdit sends chat.edit, not chat.send, and is not swallowed by the messa
 	const engagement = { mentioned: true, group: true, authorId: "human-1" };
 	await gw.requestInbound("m1", origin, "hello", engagement);
 	gw.sendEdit("m1", origin, "hello, edited", engagement, "2026-09-03T00:00:00.000Z");
+	await new Promise((resolve) => setTimeout(resolve, 10));
 	gw.sendEdit("m1", origin, "hello, edited again", engagement);
 	await new Promise((resolve) => setTimeout(resolve, 10));
 	expect(requests.map((request) => request.verb)).toEqual(["chat.send", "chat.edit", "chat.edit"]);
@@ -85,27 +86,54 @@ test("sendEdit sends chat.edit, not chat.send, and is not swallowed by the messa
 		receivedAt: "2026-09-03T00:00:00.000Z",
 	});
 	expect(requests[2]?.params).toEqual({ origin, messageId: "m1", text: "hello, edited again", engagement });
+	expect(gw.pendingEdits).toEqual([]);
 });
 
-test("a failed chat.edit is logged and never throws out of the event handler", async () => {
+test("an edit that fails to reach the gateway is kept and replayed on the next connect; a newer edit of the same message supersedes it", async () => {
 	const errors: string[] = [];
 	const original = console.error;
 	console.error = (line: unknown) => {
 		errors.push(String(line));
 	};
+	const requests: Array<{ verb: string; params: { messageId?: string; text?: string } }> = [];
+	let linkUp = false;
+	const client = {
+		request: async (verb: string, params: unknown) => {
+			if (!linkUp) throw new Error("gateway down");
+			requests.push({ verb, params: params as { messageId?: string; text?: string } });
+			return { engaged: true };
+		},
+	};
 	try {
-		const gw = gateway({
-			request: async () => {
-				throw new Error("gateway down");
-			},
-		});
-		gw.sendEdit("m1", { platform: "discord", kind: "channel", conversationId: "chan-1" }, "edited", {
-			mentioned: true,
-			group: true,
-			authorId: "human-1",
-		});
+		const gw = gateway(client);
+		const origin = { platform: "discord", kind: "channel", conversationId: "chan-1" } as const;
+		const engagement = { mentioned: true, group: true, authorId: "human-1" };
+		gw.sendEdit("m1", origin, "v1", engagement);
 		await new Promise((resolve) => setTimeout(resolve, 10));
-		expect(errors.some((line) => line.includes("Discord chat.edit failed: gateway down"))).toBe(true);
+		expect(errors.some((line) => line.includes("kept for replay"))).toBe(true);
+		expect(gw.pendingEdits.map((edit) => [edit.messageId, edit.text])).toEqual([["m1", "v1"]]);
+		// A newer edit of the same message while the link is down replaces the
+		// queued one; another message queues alongside.
+		gw.sendEdit("m1", origin, "v2", engagement);
+		gw.sendEdit("m2", origin, "other", engagement);
+		await new Promise((resolve) => setTimeout(resolve, 10));
+		expect(gw.pendingEdits.map((edit) => [edit.messageId, edit.text])).toEqual([
+			["m1", "v2"],
+			["m2", "other"],
+		]);
+		expect(requests).toEqual([]);
+		// The link comes back: the queue is replayed in order and drained.
+		linkUp = true;
+		gw.adoptClient({ ...client, onChatMessage: () => () => {} } as never);
+		await new Promise((resolve) => setTimeout(resolve, 20));
+		gw.sendEdit("m3", origin, "third", engagement);
+		await new Promise((resolve) => setTimeout(resolve, 20));
+		expect(requests.map((r) => [r.verb, r.params.messageId, r.params.text])).toEqual([
+			["chat.edit", "m1", "v2"],
+			["chat.edit", "m2", "other"],
+			["chat.edit", "m3", "third"],
+		]);
+		expect(gw.pendingEdits).toEqual([]);
 	} finally {
 		console.error = original;
 	}

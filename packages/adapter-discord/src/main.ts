@@ -269,6 +269,17 @@ export function decideInbound(
 	return open && !message.author.bot ? { ...base, mentioned: true } : base;
 }
 
+/** Queued edits survive a gateway-link outage up to this many messages (oldest dropped with a log line). */
+const EDIT_OUTBOX_LIMIT = 256;
+
+export interface PendingEdit {
+	readonly messageId: string;
+	readonly origin: OriginRef;
+	readonly text: string;
+	readonly engagement: EngagementContext;
+	readonly receivedAt?: string;
+}
+
 /** The chat.edit request an edited Discord message becomes, or undefined when it is not ours to forward. */
 export interface DescribedMessageEdit {
 	readonly messageId: string;
@@ -986,6 +997,13 @@ export class ReconnectingGateway {
 		void this.ensureCursors();
 	}
 
+	/** Test seam: the link came back with this client (what connect() does after a successful socket open). */
+	adoptClient(client: GajaewayClient): void {
+		this.#client = client;
+		this.#attempt = 0;
+		void this.#flushEdits();
+	}
+
 	async connect(): Promise<void> {
 		try {
 			const client = await GajaewayClient.connectSocket(this.socketPath);
@@ -1004,6 +1022,7 @@ export class ReconnectingGateway {
 			this.#progressOff = this.status ? subscribeDiscordProgress(client, this.status, console, this.typing) : undefined;
 			console.log("Discord adapter connected to gateway.");
 			this.monitor(client);
+			void this.#flushEdits();
 			void this.recoverMissedMessages();
 		} catch {
 			this.scheduleReconnect();
@@ -1343,6 +1362,17 @@ export class ReconnectingGateway {
 	}
 
 	/**
+	 * Edits that could not reach the gateway (link down, request failed). Unlike
+	 * a missed message, history recovery cannot reconstruct an edit - the
+	 * original id is already known - so the edit itself is kept and replayed on
+	 * the next connect. Bounded and keyed by message: a later edit of the same
+	 * message supersedes an older queued one, and the gateway dedupes a replay
+	 * by content.
+	 */
+	readonly #editOutbox = new Map<string, PendingEdit>();
+	#editFlush: Promise<void> | undefined;
+
+	/**
 	 * Edited message -> chat.edit. Not routed through requestInbound: its dedupe
 	 * key is the platform message id, which the ORIGINAL already consumed, and
 	 * the gateway owns edit idempotency (one row per message + content).
@@ -1354,29 +1384,56 @@ export class ReconnectingGateway {
 		engagement: EngagementContext,
 		receivedAt?: string,
 	): void {
-		const client = this.#client;
-		if (!client) {
-			this.scheduleReconnect();
-			return;
+		this.#editOutbox.set(messageId, { messageId, origin, text, engagement, ...(receivedAt ? { receivedAt } : {}) });
+		if (this.#editOutbox.size > EDIT_OUTBOX_LIMIT) {
+			const oldest = this.#editOutbox.keys().next().value as string;
+			this.#editOutbox.delete(oldest);
+			console.error(`Discord edit outbox full; dropped the oldest queued edit (message ${oldest}).`);
 		}
-		void client
-			.request<{ engaged?: boolean }>("chat.edit", {
-				origin,
-				messageId,
-				text,
-				engagement,
-				...(receivedAt ? { receivedAt } : {}),
-			})
-			.then((result) => {
-				if (result?.engaged && addressedTurn(engagement)) {
-					this.status?.arm(origin.conversationId);
-					this.typing?.begin(origin.conversationId);
+		void this.#flushEdits();
+	}
+
+	/** Test seam: queued edits not yet acknowledged by the gateway. */
+	get pendingEdits(): readonly PendingEdit[] {
+		return [...this.#editOutbox.values()];
+	}
+
+	async #flushEdits(): Promise<void> {
+		if (this.#editFlush) return await this.#editFlush;
+		this.#editFlush = (async () => {
+			for (const edit of [...this.#editOutbox.values()]) {
+				const client = this.#client;
+				if (!client) {
+					this.scheduleReconnect();
+					return;
 				}
-			})
-			.catch((error) => {
-				console.error(`Discord chat.edit failed: ${error instanceof Error ? error.message : String(error)}`);
-				this.scheduleReconnect();
-			});
+				try {
+					const result = await client.request<{ engaged?: boolean }>("chat.edit", {
+						origin: edit.origin,
+						messageId: edit.messageId,
+						text: edit.text,
+						engagement: edit.engagement,
+						...(edit.receivedAt ? { receivedAt: edit.receivedAt } : {}),
+					});
+					// Acknowledged: drop it unless a newer edit of the same message
+					// was queued behind this one meanwhile.
+					if (this.#editOutbox.get(edit.messageId) === edit) this.#editOutbox.delete(edit.messageId);
+					if (result?.engaged && addressedTurn(edit.engagement)) {
+						this.status?.arm(edit.origin.conversationId);
+						this.typing?.begin(edit.origin.conversationId);
+					}
+				} catch (error) {
+					console.error(
+						`Discord chat.edit failed; edit of ${edit.messageId} kept for replay: ${error instanceof Error ? error.message : String(error)}`,
+					);
+					this.scheduleReconnect();
+					return;
+				}
+			}
+		})().finally(() => {
+			this.#editFlush = undefined;
+		});
+		return await this.#editFlush;
 	}
 
 	/**
