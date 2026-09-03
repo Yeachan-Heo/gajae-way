@@ -1711,14 +1711,16 @@ async function createInboundTurnLifecycle(
 	let lastKnown = { toolCalls: 0, outputTokens: 0 };
 	/** Heartbeats present the most recent tail observation; they never invent progress. */
 	let tailActivitySeen = false;
-	let progressAnnounced = false;
 	let ended = false;
 	const emitProgress = (progress: { toolCalls: number; outputTokens: number }, final = false) => {
 		lastKnown = progress;
 		const now = Date.now();
 		if (!final && (!tailActivitySeen || now - startedAt < firstAfterMs || now - lastProgressAt < intervalMs)) return;
-		if (final && !progressAnnounced) return;
-		if (!final) progressAnnounced = true;
+		// `final` is UNCONDITIONAL. It is the adapter's only signal that the turn
+		// stopped (typing hint, "working" status), and a turn that answered fast,
+		// stayed silent, or failed before its first tail frame never announced
+		// progress - gating final on a prior announcement left Discord "typing…"
+		// for the full 330s cap after every such turn (2026-09-03, local).
 		lastProgressAt = now;
 		const payload = {
 			turnId,

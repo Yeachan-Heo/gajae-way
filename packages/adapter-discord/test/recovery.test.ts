@@ -1139,3 +1139,38 @@ test("a rejected engagement.reaction is logged, never a reconnect (live: 313 rec
 		console.log = originalLog;
 	}
 });
+
+test("typing begins only for addressed turns: an overheard public-channel turn stays invisible until it replies", async () => {
+	const cursorPath = join(home, "typing-addressed", "recovery-cursor.json");
+	const began: string[] = [];
+	const typing = { begin: (id: string) => void began.push(id), end: () => {} };
+	const client = { request: async () => ({ engaged: true }) };
+	const gateway = new ReconnectingGateway(
+		"socket",
+		{ channels: { fetch: async () => fakeChannel([]) } },
+		{ tokenFile: "token", token: "redacted", configPath: "config", channels: { "channel-1": {} } } as never,
+		typing,
+		undefined,
+		cursorPath,
+		() => bot,
+		{ ...client, onChatMessage: () => () => {} } as never,
+		async () => {},
+	);
+	const channelOrigin = { platform: "discord", kind: "channel", conversationId: "channel-1" } as const;
+	const dmOrigin = { platform: "discord", kind: "dm", conversationId: "dm-1" } as const;
+	// Overheard: engaged (a closed channel where the gateway still ran a turn), not mentioned.
+	await gateway.requestInbound("m-1", channelOrigin, "just chatting", {
+		group: true,
+		mentioned: false,
+		authorId: "u",
+	} as never);
+	expect(began).toEqual([]);
+	// Mentioned in a group, and a DM: both addressed.
+	await gateway.requestInbound("m-2", channelOrigin, "@bot hey", {
+		group: true,
+		mentioned: true,
+		authorId: "u",
+	} as never);
+	await gateway.requestInbound("m-3", dmOrigin, "hi", { group: false, mentioned: false, authorId: "u" } as never);
+	expect(began).toEqual(["channel-1", "dm-1"]);
+});

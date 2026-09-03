@@ -187,3 +187,67 @@ test("red-team G1: chat.progress runs on tail frames only; a turn never issues t
 		await rm(home, { recursive: true, force: true });
 	}
 });
+
+test("a turn that never announced progress still emits exactly one final chat.progress (adapter's only typing-end signal)", async () => {
+	const home = await mkdtemp(join(tmpdir(), "gajaeway-final-progress-"));
+	const config: GatewayConfig = {
+		schemaVersion: 1,
+		home,
+		configPath: join(home, "config.json"),
+		socketPath: join(home, "gateway.sock"),
+		dbPath: join(home, "gateway.db"),
+		logVerbosity: "info",
+		dmPolicy: "open",
+	};
+	const database = await GatewayDatabase.open(config.dbPath);
+	const port = new ScriptedSessionPort();
+	const server = await startUnixServer({
+		config,
+		database,
+		sessionPort: port,
+		// A long first-progress delay: no non-final frame can ever be announced.
+		progress: { firstAfterMs: 60_000, intervalMs: 60_000 },
+		onStop: () => database.close(),
+	});
+	let socket: Awaited<ReturnType<typeof Bun.connect>> | undefined;
+	const frames: any[] = [];
+	try {
+		let buffered = "";
+		socket = await Bun.connect({
+			unix: config.socketPath,
+			socket: {
+				data(_socket, data) {
+					buffered += Buffer.from(data).toString();
+					const lines = buffered.split("\n");
+					buffered = lines.pop() ?? "";
+					for (const line of lines) if (line) frames.push(JSON.parse(line));
+				},
+			},
+		});
+		socket.write(`${JSON.stringify({ v: "0.1", type: "hello", payload: { supportedVersions: ["0.1"] } })}\n`);
+		await eventually(() => frames.length >= 1, "negotiation did not complete");
+		socket.write(
+			`${JSON.stringify({
+				v: "0.1",
+				type: "request",
+				id: "turn",
+				verb: "chat.send",
+				params: { origin: { platform: "loopback", kind: "loopback", conversationId: "silent" }, text: "hush" },
+			})}\n`,
+		);
+		await eventually(() => port.sends.length === 1, "turn was not sent");
+		// The model answers with silence: no delivery, no progress ever announced.
+		port.complete(port.sends[0]!.opRef, "[SILENT]");
+		await eventually(
+			() => frames.filter((frame) => frame.event === "chat.progress").length === 1,
+			"no final chat.progress after a silent turn",
+		);
+		const [only] = frames.filter((frame) => frame.event === "chat.progress");
+		expect(only.payload.final).toBe(true);
+		expect(only.payload.origin.conversationId).toBe("silent");
+	} finally {
+		socket?.end();
+		await server.stop();
+		await rm(home, { recursive: true, force: true });
+	}
+});

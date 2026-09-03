@@ -27,7 +27,7 @@ Chat frontends are easy. What is hard is everything that happens when a real bot
 - Send a DM and talk normally. Your bot responds in that conversation’s own ongoing context.
 - In a group, it stays out of the way until you mention it. You can explicitly open a configured channel for normal conversation.
 - Send `/new` when you want a fresh start in that conversation. It confirms that a fresh session has started.
-- On Discord, it shows a typing indicator while it is working.
+- On Discord, it shows a typing indicator and a "working…" status while it works on a message that addressed it (a DM, a mention, or an `open` channel). In a channel it merely overhears, nothing is shown until it actually replies.
 - Replies are protected by a durable delivery record. After a crash, an unsettled reply may be sent again; when the earlier send was uncertain, it is visibly labeled as a duplicate rather than silently pretending it was not.
 - Conversations and useful monitor output are captured under your own `$GAJAEWAY_HOME/memory` directory as readable Markdown, not hidden in a proprietary store.
 

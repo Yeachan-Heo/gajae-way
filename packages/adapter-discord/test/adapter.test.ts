@@ -5,6 +5,7 @@ import { join } from "node:path";
 import type { ChatMessagePayload, ChatProgressPayload } from "@gajaeway/protocol";
 import { DiscordAdapterStartupError, loadDiscordAdapterConfig } from "../src/config";
 import {
+	addressedTurn,
 	chunkDiscordMessage,
 	type DiscordClientLike,
 	engagementForMessage,
@@ -264,7 +265,14 @@ test("a final progress event ends the typing hint even when the turn delivered n
 	await Bun.sleep(20);
 	expect(typingCount).toBeGreaterThanOrEqual(2);
 	// Silent turn: no delivery ever arrives, only the final progress frame.
-	emit?.({ turnId: "turn-1", origin: { platform: "discord", kind: "channel", conversationId: "channel-1" }, final: true, elapsedMs: 1, toolCalls: 0, outputTokens: 0 });
+	emit?.({
+		turnId: "turn-1",
+		origin: { platform: "discord", kind: "channel", conversationId: "channel-1" },
+		final: true,
+		elapsedMs: 1,
+		toolCalls: 0,
+		outputTokens: 0,
+	});
 	const settled = typingCount;
 	await Bun.sleep(25);
 	expect(typingCount).toBe(settled);
@@ -334,6 +342,7 @@ test("working status posts one amended message per conversation and clears on de
 	};
 	const status = new WorkingStatus(discord, { error: () => {} });
 	const origin = { platform: "discord", kind: "channel", conversationId: "channel-1" } as const;
+	status.arm("channel-1");
 	await status.update({ turnId: "t", origin, elapsedMs: 16_000, toolCalls: 1, outputTokens: 210 });
 	await status.update({ turnId: "t", origin, elapsedMs: 125_000, toolCalls: 3, outputTokens: 1250 });
 	expect(sent).toEqual(["⏳ working… (16s, 1 tool, 210 tok)"]);
@@ -355,6 +364,8 @@ test("working status ignores non-discord progress and survives channel failures"
 		},
 	};
 	const status = new WorkingStatus(failing, { error: () => {} });
+	status.arm("tg");
+	status.arm("c");
 	await status.update({
 		turnId: "t",
 		origin: { platform: "telegram", kind: "channel", conversationId: "tg" },
@@ -425,4 +436,39 @@ test("a declined slash command answers not-authorized instead of claiming a rese
 		{ error: () => {} },
 	);
 	expect(replied).toContain("not authorized");
+});
+
+test("presence is shown only where the persona was addressed: DM, mention, or open-channel promotion", () => {
+	expect(addressedTurn({ group: false, mentioned: false })).toBe(true); // DM
+	expect(addressedTurn({ group: true, mentioned: true })).toBe(true); // mention, or open promotion
+	expect(addressedTurn({ group: true, mentioned: false })).toBe(false); // overheard public channel
+});
+
+test("an unaddressed public-channel turn posts no working status until it is armed; clear disarms", async () => {
+	const sent: string[] = [];
+	let deleted = 0;
+	const discord: DiscordClientLike = {
+		channels: {
+			fetch: async () => ({
+				send: async (text: string) => {
+					sent.push(text);
+					return { edit: async () => {}, delete: async () => void deleted++ };
+				},
+			}),
+		},
+	};
+	const status = new WorkingStatus(discord, { error: () => {} });
+	const origin = { platform: "discord", kind: "channel", conversationId: "public-1" } as const;
+	const tick = { turnId: "t", origin, elapsedMs: 16_000, toolCalls: 1, outputTokens: 210 };
+	await status.update(tick);
+	await status.update(tick);
+	expect(sent).toEqual([]);
+	status.arm("public-1");
+	await status.update(tick);
+	expect(sent).toHaveLength(1);
+	await status.clear("public-1");
+	expect(deleted).toBe(1);
+	// Disarmed: the next turn's ticks are silent again until re-armed.
+	await status.update(tick);
+	expect(sent).toHaveLength(1);
 });

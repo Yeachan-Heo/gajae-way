@@ -109,10 +109,16 @@ test("requires negotiation then serves status, shutdown, and validates chat para
 	await waitFor(client.frames, 6);
 	expect(client.frames[4].result.turnId).toBeString();
 	expect(client.frames[5].payload).toMatchObject({ text: "mock reply", final: true });
+	// The turn also emits its final chat.progress; frames after the reply are
+	// matched by identity, not position.
 	client.send({ v: "0.1", type: "request", id: "shutdown", verb: "gateway.shutdown" });
 	await waitFor(client.frames, 8);
-	expect(client.frames[6]).toMatchObject({ type: "response", id: "shutdown", result: { stopping: true } });
-	expect(client.frames[7]).toMatchObject({ type: "event", event: "gateway.stopping" });
+	expect(client.frames.some((frame) => frame.event === "chat.progress" && frame.payload?.final === true)).toBe(true);
+	expect(client.frames.find((frame) => frame.id === "shutdown")).toMatchObject({
+		type: "response",
+		result: { stopping: true },
+	});
+	expect(client.frames.some((frame) => frame.event === "gateway.stopping")).toBe(true);
 	client.close();
 });
 
