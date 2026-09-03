@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { GjcCliError } from "@gajaeway/subsession";
 import type { GatewayConfig } from "../src/config";
+import { PersonaSessionManager } from "../src/orchestrator/persona-session";
 import { type GatewayServer, messageEditId, renderMessageEdit, startUnixServer } from "../src/server/server";
 import { GatewayDatabase } from "../src/store/db";
 import { ScriptedSessionPort, sessionPortFromScript } from "./session-port.fake";
@@ -346,4 +347,56 @@ test("a held steer accepted after a gateway restart consumes its context row: th
 	port.complete(port.sends[1]!.opRef, "answer two");
 	await eventually(() => database!.inboundPendingCount(ORIGIN_KEY) === 0, "next turn did not complete");
 	client.close();
+});
+
+test("a crash between steer acceptance and the lifecycle hook cannot leave the message unread: acceptance and context consumption are one transaction", async () => {
+	// Direct actor surface with a lifecycle whose onSteerAccepted "crashes":
+	// the durable acceptance (steer done + context consumed) has already
+	// committed, nothing after it runs, and a fresh manager on the same
+	// database must see the context row consumed.
+	directory = await mkdtemp(join(tmpdir(), "gajaeway-message-edit-"));
+	database = await GatewayDatabase.open(join(directory, "gateway.db"));
+	const port = new ScriptedSessionPort();
+	const logs: string[] = [];
+	const manager = new PersonaSessionManager({
+		database,
+		port,
+		instanceId: "crash",
+		repo: join(directory, "workspace"),
+		onTurnStart: ({ trigger }) => ({
+			text: trigger.body,
+			steerContextMessageId: (row) => row.message_id,
+			onSteerAccepted: () => {
+				throw new Error("simulated crash after durable acceptance");
+			},
+		}),
+		log: (line) => {
+			logs.push(line);
+		},
+	});
+	const record = (messageId: string, body: string) => {
+		database!.contextRecord({ messageId, originKey: ORIGIN_KEY, authorId: "owner", body });
+		expect(
+			database!.inboundEnqueue({ messageId, originKey: ORIGIN_KEY, originRefJson: JSON.stringify(ORIGIN), body }),
+		).toBe(true);
+	};
+	try {
+		record("m-1", "first");
+		await manager.notifyInbound(ORIGIN_KEY);
+		await eventually(() => port.sends.length === 1, "first turn was not sent");
+		const opRef = port.sends[0]!.opRef;
+		record("m-2", "steered then crash");
+		await manager.notifyInbound(ORIGIN_KEY).catch(() => {});
+		await eventually(() => logs.some((line) => line.includes("simulated crash")), "crash hook did not fire");
+		expect(database.inboundTurnRows(opRef).map((r) => [r.message_id, r.turn_state])).toEqual([
+			["m-1", "accepted"],
+			["m-2", "done"],
+		]);
+		// The unread window no longer contains m-2: consumed in the same
+		// transaction as the acceptance, before the crash.
+		// (m-1 is the running turn's own trigger; it is committed at that turn's terminal.)
+		expect(database.contextWindow(ORIGIN_KEY, "probe").rows.map((r) => r.message_id)).toEqual(["m-1"]);
+	} finally {
+		await manager.stop();
+	}
 });

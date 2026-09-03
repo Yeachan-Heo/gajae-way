@@ -765,14 +765,27 @@ export class GatewayDatabase {
 		);
 	}
 
-	/** The runtime recorded the steer: the row is done input of the turn. */
-	inboundSteerAccepted(input: { messageId: string; epoch: number; opRef: string }): boolean {
-		const result = this.#database
-			.query(
-				"UPDATE inbound_messages SET state = 'done', turn_role = 'steer', turn_epoch = ?, turn_state = 'done', turn_op_ref = ? WHERE message_id = ? AND state = 'pending' AND (turn_state IS NULL OR (turn_role = 'steer' AND turn_state = 'bound' AND turn_op_ref = ?))",
-			)
-			.run(input.epoch, input.opRef, input.messageId, input.opRef);
-		return result.changes === 1;
+	/**
+	 * The runtime recorded the steer: the row is done input of the turn, and
+	 * - in the SAME transaction - the platform message it carries is consumed
+	 * from the unread context window. A crash between the two would otherwise
+	 * leave a done steer whose message still reads as unread for the next
+	 * turn, with no pending/held state left to drive a retry.
+	 */
+	inboundSteerAccepted(input: { messageId: string; epoch: number; opRef: string; contextMessageId?: string }): boolean {
+		return this.withTransaction(() => {
+			const accepted =
+				this.#database
+					.query(
+						"UPDATE inbound_messages SET state = 'done', turn_role = 'steer', turn_epoch = ?, turn_state = 'done', turn_op_ref = ? WHERE message_id = ? AND state = 'pending' AND (turn_state IS NULL OR (turn_role = 'steer' AND turn_state = 'bound' AND turn_op_ref = ?))",
+					)
+					.run(input.epoch, input.opRef, input.messageId, input.opRef).changes === 1;
+			if (accepted && input.contextMessageId)
+				this.#database
+					.query("UPDATE conversation_context SET consumed_at = ? WHERE message_id = ? AND consumed_at IS NULL")
+					.run(new Date().toISOString(), input.contextMessageId);
+			return accepted;
+		});
 	}
 
 	/** The runtime definitively refused the steer: the row is an ordinary pending message again. */

@@ -76,7 +76,13 @@ export interface PersonaTurnLifecycle {
 	 * tell who spoke; the actor wraps the result with the steer framing.
 	 */
 	renderSteer?(row: InboundMessageRow): string;
-	/** The steer landed in the session: its row is attributed to this turn. */
+	/**
+	 * The platform message a steer row carries, when the unread context window
+	 * must be told it was read (undefined for loopback). Consumed in the SAME
+	 * transaction as the steer acceptance, so a crash cannot separate them.
+	 */
+	steerContextMessageId?(row: InboundMessageRow): string | undefined;
+	/** The steer landed in the session (durably, context consumed): release transient ownership. */
 	onSteerAccepted?(input: PersonaSteerInput): void | Promise<void>;
 	onFrame?(input: PersonaTailFrameInput): void | Promise<void>;
 	onTerminal?(input: PersonaTerminalInput): void | Promise<void>;
@@ -139,10 +145,14 @@ export interface PersonaSessionManagerOptions {
 	}) => void | Promise<void>;
 	readonly onSteerAccepted?: (input: { originKey: string; messageId: string; opRef: string }) => void | Promise<void>;
 	/**
-	 * Finalizes a steer the runtime recorded when NO lifecycle object exists
-	 * for its turn any more (a hold resolved after the turn ended or after a
-	 * restart). Must do what the lifecycle's onSteerAccepted would have done:
-	 * consume the message's context row and release transient ownership.
+	 * Lifecycle-less counterpart of `steerContextMessageId` for a hold resolved
+	 * after its turn ended or after a restart.
+	 */
+	readonly heldSteerContextMessageId?: (row: InboundMessageRow) => string | undefined;
+	/**
+	 * Lifecycle-less counterpart of `onSteerAccepted`: release transient
+	 * ownership of a steer whose acceptance was learnt after the turn's
+	 * lifecycle was gone. Context is already consumed durably by then.
 	 */
 	readonly onHeldSteerAccepted?: (input: {
 		originKey: string;
@@ -172,6 +182,7 @@ export class PersonaSessionManager {
 	readonly #onAssistantText: PersonaSessionManagerOptions["onAssistantText"];
 	readonly #onSteerAccepted: PersonaSessionManagerOptions["onSteerAccepted"];
 	readonly #onHeldSteerAccepted: PersonaSessionManagerOptions["onHeldSteerAccepted"];
+	readonly #heldSteerContextMessageId: PersonaSessionManagerOptions["heldSteerContextMessageId"];
 	readonly #log: (line: string) => void;
 	readonly #actors = new Map<string, OriginActor>();
 	#stopped = false;
@@ -192,6 +203,7 @@ export class PersonaSessionManager {
 		this.#onAssistantText = options.onAssistantText;
 		this.#onSteerAccepted = options.onSteerAccepted;
 		this.#onHeldSteerAccepted = options.onHeldSteerAccepted;
+		this.#heldSteerContextMessageId = options.heldSteerContextMessageId;
 		this.#log = options.log ?? ((line: string) => console.error(line));
 	}
 
@@ -365,6 +377,10 @@ export class PersonaSessionManager {
 
 	async emitSteer(input: Parameters<NonNullable<PersonaSessionManagerOptions["onSteerAccepted"]>>[0]): Promise<void> {
 		await this.#onSteerAccepted?.(input);
+	}
+
+	heldSteerContextMessageId(row: InboundMessageRow): string | undefined {
+		return this.#heldSteerContextMessageId?.(row);
 	}
 
 	async emitHeldSteerAccepted(
@@ -1031,12 +1047,13 @@ class OriginActor {
 	}
 
 	/**
-	 * The ONE place a recorded steer acceptance is finalized: durable state,
-	 * then the lifecycle's own acceptance hook (context consumed, transient
-	 * ownership released) - or, when the turn's lifecycle is gone (resolved
-	 * after terminal or after a restart), the manager-level equivalent - then
-	 * the external observer. Every path that learns of an acceptance (live,
-	 * replay, terminal, stale hold) goes through here exactly once.
+	 * The ONE place a recorded steer acceptance is finalized: durable state
+	 * (steer done AND its platform message consumed from the unread window, in
+	 * one transaction - a crash cannot leave the message unread), then the
+	 * lifecycle's ownership release - or, when the turn's lifecycle is gone
+	 * (resolved after terminal or after a restart), the manager-level
+	 * equivalent - then the external observer. Every path that learns of an
+	 * acceptance (live, replay, terminal, stale hold) goes through here.
 	 */
 	async #finalizeSteerAcceptance(
 		row: InboundMessageRow,
@@ -1044,7 +1061,11 @@ class OriginActor {
 		opRef: string,
 		bound: BoundTurn | undefined,
 	): Promise<boolean> {
-		if (!this.#manager.database.inboundSteerAccepted({ messageId: row.message_id, epoch, opRef })) return false;
+		const contextMessageId = bound
+			? bound.lifecycle.steerContextMessageId?.(row)
+			: this.#manager.heldSteerContextMessageId(row);
+		if (!this.#manager.database.inboundSteerAccepted({ messageId: row.message_id, epoch, opRef, contextMessageId }))
+			return false;
 		if (bound) await bound.lifecycle.onSteerAccepted?.({ ...bound, row });
 		else await this.#manager.emitHeldSteerAccepted({ originKey: this.originKey, row, opRef });
 		await this.#manager.emitSteer({ originKey: this.originKey, messageId: row.message_id, opRef });

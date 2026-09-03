@@ -513,9 +513,11 @@ function createRuntime(options: GatewayServerOptions): Runtime {
 		// A steer whose acceptance was learnt after its turn's lifecycle is gone
 		// (resolved at terminal or after a restart) is finalized exactly like a
 		// live one: read context, ownership released.
+		heldSteerContextMessageId: (row) =>
+			(JSON.parse(row.origin_ref_json) as { platform?: string }).platform === "loopback"
+				? undefined
+				: (editedMessageId(row.message_id) ?? row.message_id),
 		onHeldSteerAccepted: ({ row }) => {
-			if ((JSON.parse(row.origin_ref_json) as { platform?: string }).platform !== "loopback")
-				options.database.contextConsume([editedMessageId(row.message_id) ?? row.message_id]);
 			runtime.inbound.delete(row.message_id);
 		},
 		onInboundDiscard: (messageIds) => {
@@ -1884,12 +1886,13 @@ async function createInboundTurnLifecycle(
 			? `${composeTurnHeader({ speaker: steerSpeaker, place, authorId: steerEngagement?.authorId, messageId: steered.message_id, engagement: steerEngagement })}\n${steered.body}`
 			: steered.body;
 	};
+	// The steered message reached the model inside THIS turn: it is read context
+	// now, not unread for the next turn. A pointer update names the ORIGINAL
+	// message (that is where the edited body now lives). Consumed in the same
+	// transaction as the acceptance; only transient ownership is released here.
+	const steerContextMessageId = (steered: InboundMessageRow): string | undefined =>
+		nonLoopback ? (editedMessageId(steered.message_id) ?? steered.message_id) : undefined;
 	const onSteerAccepted = ({ row: steered }: PersonaSteerInput) => {
-		// The steered message reached the model inside THIS turn: it is read
-		// context now, not unread for the next turn, and its transient request
-		// ownership is over. A pointer update consumes the ORIGINAL message's
-		// context row (that is where the edited body now lives).
-		if (nonLoopback) options.database.contextConsume([editedMessageId(steered.message_id) ?? steered.message_id]);
 		runtime.inbound.delete(steered.message_id);
 	};
 	const onTerminal = async ({ text }: PersonaTerminalInput) => {
@@ -1975,6 +1978,7 @@ async function createInboundTurnLifecycle(
 		systemPreamble,
 		...(effectiveModel ? { effectiveModel } : {}),
 		renderSteer,
+		steerContextMessageId,
 		onSteerAccepted,
 		onFrame,
 		onTerminal,
