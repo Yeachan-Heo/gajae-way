@@ -493,8 +493,13 @@ export class BrokerSessionPort implements SessionPort {
 		const at = typeof last.ts === "string" ? Date.parse(last.ts) : Number.NaN;
 		// Clock skew tolerance: the host stamps rows; the status startedAt comes from the same host.
 		if (!Number.isFinite(at) || at + 2_000 < input.notBeforeMs) return undefined;
+		// `textSummary` is `body.slice(0, 500)`. Preferring it truncated every
+		// recovered answer at exactly 500 characters - the reply stopped
+		// mid-sentence and the rest was never sent (live: two of four replies cut
+		// at 500/499 chars, 2026-09-03). The body is the answer; the summary is
+		// only a fallback for a row that carries no body.
 		const text =
-			(typeof last.textSummary === "string" && last.textSummary) || (typeof last.body === "string" ? last.body : "");
+			(typeof last.body === "string" && last.body) || (typeof last.textSummary === "string" ? last.textSummary : "");
 		return { text, pages: 1, complete: true };
 	}
 
