@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { unlink } from "node:fs/promises";
 import { join } from "node:path";
 import {
@@ -1246,6 +1247,9 @@ async function handleRequest(
 		case "chat.send":
 			await sendChat(connection, request, options, runtime);
 			return;
+		case "chat.edit":
+			await editChat(connection, request, options, runtime);
+			return;
 		default:
 			throw new ProtocolError("unknown_verb", `unknown verb: ${request.verb}`);
 	}
@@ -1482,6 +1486,100 @@ async function sendChat(
 	connection.write({ v: PROFILE_VERSION, type: "response", id: request.id, result: { turnId, engaged: true } });
 	await runtime.personaSessions.notifyInbound(key);
 }
+/**
+ * A message the user edited after the gateway ingested it. The edit is not a
+ * new message: it is streamed into the same session as an update of a
+ * `[MESSAGE POINTER: <id>]`, steered into the running turn or sent as the next
+ * one by the same actor rule as any other inbound row. Edits of messages the
+ * gateway never saw are ignored; the same edit event twice is one row.
+ */
+export const MESSAGE_POINTER_PREFIX = "[MESSAGE POINTER: ";
+
+export function renderMessageEdit(messageId: string, text: string): string {
+	return `${MESSAGE_POINTER_PREFIX}${messageId}] (the user edited this earlier message; this is its new content)\n${text}`;
+}
+
+/** One durable row per (message, edit content): a replayed edit event collides, a further edit does not. */
+export function messageEditId(messageId: string, text: string): string {
+	return `edit:${messageId}:${createHash("sha256").update(text).digest("hex").slice(0, 16)}`;
+}
+
+async function editChat(
+	connection: Connection,
+	request: RequestFrame,
+	options: GatewayServerOptions,
+	runtime: Runtime,
+): Promise<void> {
+	const params = request.params as
+		| {
+				origin?: unknown;
+				messageId?: unknown;
+				text?: unknown;
+				receivedAt?: unknown;
+				engagement?: { mentioned?: unknown; group?: unknown; authorId?: unknown };
+		  }
+		| undefined;
+	if (!params || typeof params.text !== "string" || !params.text)
+		throw new ProtocolError("invalid_params", "chat.edit requires non-empty text");
+	if (typeof params.messageId !== "string" || !params.messageId)
+		throw new ProtocolError("invalid_params", "chat.edit requires the edited messageId");
+	let origin: ReturnType<typeof validateOriginRef>;
+	try {
+		origin = validateOriginRef(params.origin as typeof LOOPBACK_ORIGIN);
+	} catch {
+		throw new ProtocolError("invalid_params", "chat.edit requires a valid origin");
+	}
+	if (origin.platform !== "loopback" && origin.platform !== "discord" && origin.platform !== "telegram")
+		throw new ProtocolError("invalid_params", "unsupported origin platform");
+	const nonLoopback = origin.platform !== "loopback";
+	if (
+		nonLoopback &&
+		(!params.engagement ||
+			typeof params.engagement.mentioned !== "boolean" ||
+			typeof params.engagement.group !== "boolean" ||
+			typeof params.engagement.authorId !== "string")
+	)
+		throw new ProtocolError("invalid_params", "non-loopback chat.edit requires engagement");
+	const key = originKey(origin);
+	const declined = () =>
+		connection.write({
+			v: PROFILE_VERSION,
+			type: "response",
+			id: request.id,
+			result: { turnId: null, engaged: false },
+		});
+	if (!options.database.inboundKnownMessage(key, params.messageId)) {
+		// Never ingested: nothing to point at. Not context either - a message the
+		// gateway never saw must not appear by way of its edit.
+		declined();
+		return;
+	}
+	// The recorded body now says what the message says now.
+	options.database.contextUpdateBody(key, params.messageId, params.text);
+	if (!decideEngagement(origin, params.engagement as never, runtime.config).engaged) {
+		declined();
+		return;
+	}
+	const messageId = messageEditId(params.messageId, params.text);
+	const turnId = crypto.randomUUID();
+	const accepted = options.database.inboundEnqueue({
+		messageId,
+		originKey: key,
+		originRefJson: JSON.stringify(origin),
+		body: renderMessageEdit(params.messageId, params.text),
+		engagementJson: params.engagement ? JSON.stringify(params.engagement) : undefined,
+		...(parseReceivedAt(params.receivedAt) ? { receivedAt: parseReceivedAt(params.receivedAt) } : {}),
+	});
+	if (!accepted) {
+		// The same edit event delivered twice: acknowledged once, dispatched once.
+		connection.write({ v: PROFILE_VERSION, type: "response", id: request.id, result: { turnId: null, engaged: true } });
+		return;
+	}
+	runtime.inbound.set(messageId, { turnId, requestId: request.id, connection });
+	connection.write({ v: PROFILE_VERSION, type: "response", id: request.id, result: { turnId, engaged: true } });
+	await runtime.personaSessions.notifyInbound(key);
+}
+
 async function createInboundTurnLifecycle(
 	input: PersonaTurnStartInput,
 	options: GatewayServerOptions,

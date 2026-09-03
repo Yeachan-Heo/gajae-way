@@ -269,6 +269,40 @@ export function decideInbound(
 	return open && !message.author.bot ? { ...base, mentioned: true } : base;
 }
 
+/** The chat.edit request an edited Discord message becomes, or undefined when it is not ours to forward. */
+export interface DescribedMessageEdit {
+	readonly messageId: string;
+	readonly origin: OriginRef;
+	readonly text: string;
+	readonly engagement: EngagementContext;
+	readonly receivedAt?: string;
+}
+
+/**
+ * Same admission as a new message (our own messages and empty bodies are
+ * dropped; open channels promote humans to a mention), on the message's NEW
+ * content. Whether the original was ever ingested is the gateway's call: it
+ * ignores edits of messages it never saw.
+ */
+export function describeMessageEdit(
+	message: DiscordInboundMessage & AttachmentCarrier & { readonly editedTimestamp?: number | null },
+	botUser: unknown,
+	channels: Readonly<Record<string, { readonly engagement?: "open" }>> | undefined,
+): DescribedMessageEdit | undefined {
+	const engagement = decideInbound(message, botUser, channels);
+	if (!engagement) return undefined;
+	const text = describeInboundBody(message);
+	if (text === "") return undefined;
+	const editedAt = message.editedTimestamp;
+	return {
+		messageId: message.id as string,
+		origin: discordMessageOrigin(message),
+		text,
+		engagement,
+		...(typeof editedAt === "number" ? { receivedAt: new Date(editedAt).toISOString() } : {}),
+	};
+}
+
 /**
  * True when the persona was addressed: a DM, or a group message that mentions
  * it (an `open` channel promotes every human message to a mention, so it is
@@ -788,6 +822,21 @@ export async function startDiscordAdapter(config: LoadedDiscordAdapterConfig): P
 			gateway.sendInbound(message.id as string, origin, body, engagement, receivedAt, spoken);
 		});
 	});
+	// An edit is an update of a message the persona may already have read, not a
+	// new message: it goes out as chat.edit and reaches the session as a
+	// [MESSAGE POINTER] update. Partial (uncached) messages carry no author or
+	// content until fetched; fetching is what makes the edit describable.
+	discord.on("messageUpdate", (_before, after) => {
+		void (async () => {
+			const message = after.partial ? await after.fetch().catch(() => undefined) : after;
+			if (!message) return;
+			const edit = describeMessageEdit(message, discord.user, config.channels);
+			if (!edit) return;
+			ingress.run(edit.origin.conversationId, async () => {
+				gateway.sendEdit(edit.messageId, edit.origin, edit.text, edit.engagement, edit.receivedAt);
+			});
+		})();
+	});
 	// A reaction is engagement metadata, never a turn: it goes out on its own verb.
 	discord.on("messageReactionAdd", (reaction, user) => {
 		gateway.sendReaction(reaction, user, "add", discord.user);
@@ -1281,6 +1330,43 @@ export class ReconnectingGateway {
 		voice?: boolean,
 	): void {
 		void this.requestInbound(messageId, origin, text, engagement, receivedAt, voice);
+	}
+
+	/**
+	 * Edited message -> chat.edit. Not routed through requestInbound: its dedupe
+	 * key is the platform message id, which the ORIGINAL already consumed, and
+	 * the gateway owns edit idempotency (one row per message + content).
+	 */
+	sendEdit(
+		messageId: string,
+		origin: OriginRef,
+		text: string,
+		engagement: EngagementContext,
+		receivedAt?: string,
+	): void {
+		const client = this.#client;
+		if (!client) {
+			this.scheduleReconnect();
+			return;
+		}
+		void client
+			.request<{ engaged?: boolean }>("chat.edit", {
+				origin,
+				messageId,
+				text,
+				engagement,
+				...(receivedAt ? { receivedAt } : {}),
+			})
+			.then((result) => {
+				if (result?.engaged && addressedTurn(engagement)) {
+					this.status?.arm(origin.conversationId);
+					this.typing?.begin(origin.conversationId);
+				}
+			})
+			.catch((error) => {
+				console.error(`Discord chat.edit failed: ${error instanceof Error ? error.message : String(error)}`);
+				this.scheduleReconnect();
+			});
 	}
 
 	/**

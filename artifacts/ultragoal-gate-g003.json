@@ -1,0 +1,15 @@
+{
+  "deferredToBatch": {
+    "ranLanes": ["targetedVerification"],
+    "targetedVerification": {
+      "status": "passed",
+      "commands": [
+        "bunx tsc --noEmit -p tsconfig.json",
+        "bun test packages/gateway/test/migration-drill.test.ts",
+        "bun test packages/gateway/test/server.test.ts (x6 for the burst/outage pair)",
+        "bun test packages/gateway packages/adapter-discord packages/adapter-telegram packages/protocol packages/subsession"
+      ],
+      "evidence": "Commit fb3b34d. Batch layer removed: settle window, settling state, expireStale/maxInboundAgeMs, batch members, inboundBatch* API, batch_* columns. Schema 19 rebuilds inbound_messages with turn_role/turn_epoch/turn_state/turn_op_ref and preserves bound_session_id, dispatched_at (§1 floor) and terminal_delivery_id (per-part terminal claim). Migration drill rebuilds a genuine v18 table from its real DDL and covers accepted trigger + member + steer, settled-bound, settled-unbound, done, and a wedged unbatched row: nothing deleted, members return to pending, floor and claims preserved, uniqueness index survives. Actor: #dispatchNext replaces settle; a message arriving during a running turn is steered, otherwise sent immediately. Found and fixed a real ordering bug during verification: same-millisecond rows were ordered by platform id, so a burst could steer out of order; now rowid-ordered with a store test. Config rejects settleWindowMs/maxInboundAgeMs with a migration hint. 26 test files ported; settle-coalesce renamed to rapid-fragments; three server tests reframed to the canonical contract (no coalescing, backlog never expired). docs/architecture.md, docs/deployment.md, docs/runbooks/gajaeway-v1.md updated. tsc: 0 errors. Full suite (gateway, adapter-discord, adapter-telegram, protocol, subsession): 1158 pass / 0 fail across 97 files, including the two formerly load-flaky tests."
+    }
+  }
+}

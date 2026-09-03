@@ -113,6 +113,30 @@ export interface ChatSendParams {
 	readonly engagement?: EngagementContext;
 }
 
+/**
+ * A platform message the gateway already ingested was edited. The edit is not
+ * a new message: the gateway streams it into the same session as an update of
+ * a `[MESSAGE POINTER: <messageId>]`, steered into the running turn or sent
+ * as the next one. An edit of a message the gateway never saw is ignored.
+ */
+export interface ChatEditParams {
+	readonly origin: OriginRef;
+	/** Platform id of the message that was edited (the original `chat.send` messageId). */
+	readonly messageId: string;
+	/** The full new body. */
+	readonly text: string;
+	/** Platform edit time, when available. */
+	readonly receivedAt?: string;
+	/** Required for non-loopback origins; the gateway applies engagement policy. */
+	readonly engagement?: EngagementContext;
+}
+
+export interface ChatEditResult {
+	/** Gateway-assigned turn id for the update, or null when it was declined or the message is unknown. */
+	readonly turnId: string | null;
+	readonly engaged: boolean;
+}
+
 /** Periodic liveness for a long-running turn: the persona is working, not gone. */
 export interface ChatProgressPayload {
 	readonly turnId: string;
@@ -529,6 +553,7 @@ export interface VerbCatalogV01 {
 	"gateway.shutdown": { params: undefined; result: { readonly stopping: true } };
 	"gateway.reloadConfig": { params: undefined; result: ConfigReloadResult };
 	"chat.send": { params: ChatSendParams; result: ChatSendResult };
+	"chat.edit": { params: ChatEditParams; result: ChatEditResult };
 	"delivery.confirm": { params: DeliveryConfirmParams; result: { readonly settled: true } };
 	"delivery.fail": { params: DeliveryFailParams; result: { readonly recorded: true } };
 	"session.recall": { params: SessionRecallParams; result: SessionRecallResult };
@@ -571,6 +596,7 @@ export const VERBS_V01 = [
 	"gateway.status",
 	"gateway.shutdown",
 	"chat.send",
+	"chat.edit",
 	"delivery.confirm",
 	"delivery.fail",
 	"session.recall",

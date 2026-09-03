@@ -1271,6 +1271,30 @@ export class GatewayDatabase {
 		});
 	}
 
+	/** Whether this origin ever ingested `messageId` (as a turn trigger/steer, or as conversation context). */
+	inboundKnownMessage(originKey: string, messageId: string): boolean {
+		return (
+			(this.#database
+				.query<{ n: number }, [string, string, string, string]>(
+					"SELECT (SELECT COUNT(*) FROM inbound_messages WHERE origin_key = ? AND message_id = ?) + (SELECT COUNT(*) FROM conversation_context WHERE origin_key = ? AND message_id = ?) AS n",
+				)
+				.get(originKey, messageId, originKey, messageId)?.n ?? 0) > 0
+		);
+	}
+
+	/**
+	 * Rewrites the recorded body of an already-ingested platform message after
+	 * the user edited it, so a later unread diff shows what the message says
+	 * now. The edit itself is streamed as its own inbound row.
+	 */
+	contextUpdateBody(originKey: string, messageId: string, body: string): boolean {
+		return (
+			this.#database
+				.query("UPDATE conversation_context SET body = ? WHERE origin_key = ? AND message_id = ?")
+				.run(body, originKey, messageId).changes > 0
+		);
+	}
+
 	inboundPendingCount(originKey: string): number {
 		return (
 			this.#database
