@@ -127,6 +127,16 @@ launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/dev.gajaeway.gateway.pli
 
 Run the Discord and Telegram binaries as separate managed services after the gateway. The CLI is an on-demand client; it does not start the daemon.
 
+### One gateway per home, owned by the service manager
+
+The gateway daemon is always started and stopped by launchd or systemd; never start a second copy by hand while a managed one runs. On boot the daemon settles ownership of `$GAJAEWAY_HOME` **before** touching the socket, the database, or the broker lock, using `$GAJAEWAY_HOME/daemon.pid`:
+
+- If the record names a live `gajaeway-gateway daemon` for the same home, the newcomer **waits** (up to 20s) for it to finish its ordered shutdown. It never signals that process - the service manager owns its lifecycle. If the predecessor is still alive at the deadline the newcomer exits 1 and the service manager retries under its own throttle.
+- `daemon --only-new` skips the wait: any live same-home gateway is an immediate refusal (exit 1). Use it in scripts that must not disturb a running instance.
+- A record whose process is dead, is not a gateway, or belongs to a different home is stale and is replaced.
+
+Restart with the service manager's own verbs - `launchctl kickstart -k gui/$(id -u)/dev.gajaeway.gateway` or `systemctl --user restart gajaeway-gateway` - and give the ordered shutdown time to complete: set launchd `ExitTimeOut` (or systemd `TimeoutStopSec`) to at least 30s. Two gateways on one home is the failure mode this guards against: both supervise the same private gjc daemon and take turns retiring it.
+
 ## Troubleshooting
 
 - **Socket missing:** verify the gateway service, configured socket path, parent permissions, and service log.
