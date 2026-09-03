@@ -10,14 +10,14 @@ if (command === "config" && args[0] === "check") {
 	for (const line of renderConfigCheck(result)) console.log(line);
 	process.exitCode = configCheckExitCode(result);
 } else if (command !== "daemon") {
-	console.error("usage: gajaeway-gateway daemon [--stdio] | config check [path]");
+	console.error("usage: gajaeway-gateway daemon [--stdio] [--only-new] | config check [path]");
 	process.exitCode = 2;
 } else {
 	// A refused config must exit with the reason, not an unhandled rejection
 	// stack: under a launchd KeepAlive an unreadable config would otherwise be a
 	// silent crash-loop.
 	try {
-		const server = await bootGateway({ stdio: args.includes("--stdio") });
+		const server = await bootGateway({ stdio: args.includes("--stdio"), onlyNew: args.includes("--only-new") });
 		const shutdown = () => void server.stop("signal received");
 		process.once("SIGINT", shutdown);
 		process.once("SIGTERM", shutdown);
