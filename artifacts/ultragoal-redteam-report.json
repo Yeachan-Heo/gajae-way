@@ -1,169 +1,162 @@
 {
  "schemaVersion": 1,
  "kind": "api-package-test-report",
- "sourceHash": "see quality gate: computed over HEAD listed above",
- "head": "329aa34d4f27f90e8f55f82b1ee32788dfbeabfb",
- "command": "bun test packages/gateway/test/broker-supervisor.test.ts packages/gateway/test/terminal-idempotency.e2e.test.ts packages/gateway/test/tail-progress.test.ts packages/gateway/test/migration-drill.test.ts packages/adapter-discord/test/reactions.test.ts packages/adapter-discord/test/recovery.test.ts",
+ "sourceHash": "sha256:a3203a646329e97ca299ad90da73768a9773b45fefc9e7b617680e0eeb6384f5",
+ "head": "98c70e90a989ae27225da67a464585d39d29a73d",
+ "generatedAt": "2026-09-03T16:23:20.240352+00:00",
+ "command": "bun test packages/gateway packages/adapter-discord packages/adapter-telegram packages/protocol packages/subsession packages/conformance --reporter=junit --reporter-outfile=artifacts/ultragoal-test-report.junit.xml",
+ "junit": "artifacts/ultragoal-test-report.junit.xml",
  "totals": {
-  "tests": 104,
-  "passed": 104,
-  "failed": 0
+  "tests": 1205,
+  "passed": 1202,
+  "failed": 0,
+  "skipped": 3
  },
+ "redTeamSuite": "packages/gateway/test/redteam-canonical.test.ts",
  "cases": [
   {
-   "id": "P1",
-   "obligation": "token mismatch -> probe false",
-   "verdict": "passed",
-   "testSubstring": "bad token, or a silent daemon"
+   "id": "C1a",
+   "obligation": "replay inside 2s skew tolerated; terminal uses current durable answer",
+   "verdict": "passed"
   },
   {
-   "id": "P2",
-   "obligation": "heartbeat 15001 rejected / 14999 accepted",
-   "verdict": "passed",
-   "testSubstring": "red-team P2/P5"
+   "id": "C1b",
+   "obligation": "foreign-session/foreign-op frames never reach the current turn",
+   "verdict": "passed"
   },
   {
-   "id": "P3",
-   "obligation": "non-hello first frame -> false",
-   "verdict": "passed",
-   "testSubstring": "red-team P3/P7"
+   "id": "C1c",
+   "obligation": "three turns each with cursorless replay -> each trigger its own text",
+   "verdict": "passed"
   },
   {
-   "id": "P4",
-   "obligation": "stalled daemon resolves false at timeout, not before, not hanging",
-   "verdict": "passed",
-   "testSubstring": "red-team B1"
+   "id": "C1d",
+   "obligation": "startedAt floor on host clock: behind never reopens prior row, ahead never hides answer",
+   "verdict": "passed"
   },
   {
-   "id": "P5",
-   "obligation": "malformed/missing/dead-pid discovery -> false, no throw",
-   "verdict": "passed",
-   "testSubstring": "red-team P2/P5"
+   "id": "C2a",
+   "obligation": "20-message burst: 1 send, 19 ordered steers, none pending",
+   "verdict": "passed"
   },
   {
-   "id": "P6",
-   "obligation": "probe lane not starved by 4+1 observation spawns",
-   "verdict": "passed",
-   "testSubstring": "has its own lane"
+   "id": "C2b",
+   "obligation": "message in terminal->dispatch window sent once",
+   "verdict": "passed"
   },
   {
-   "id": "P6b",
-   "obligation": "timed-out child holds slot until exit",
-   "verdict": "passed",
-   "testSubstring": "red-team F6"
+   "id": "C2c",
+   "obligation": "bind failure waits for the retry seam; no synchronous re-bind",
+   "verdict": "passed"
   },
   {
-   "id": "P7",
-   "obligation": "live discovery -> zero gjc spawns at readiness",
-   "verdict": "passed",
-   "testSubstring": "red-team P3/P7"
+   "id": "C2d",
+   "obligation": "/new discards undispatched row, fences retired output, nothing stranded",
+   "verdict": "passed"
   },
   {
-   "id": "B1",
-   "obligation": "hello-OK but routing stalled/erroring -> unhealthy; routing OK -> healthy; wrong protocolVersion -> false",
-   "verdict": "passed",
-   "testSubstring": "red-team B1"
+   "id": "C3a",
+   "obligation": "refused steer: old answer + refused message once each on separate sessions",
+   "verdict": "passed"
   },
   {
-   "id": "G2-B1",
-   "obligation": "live-heartbeat but wedged router is retired and relaunched",
-   "verdict": "passed",
-   "testSubstring": "red-team G2-B1"
+   "id": "C3b",
+   "obligation": "two refusals: epoch 0->1->2, each message sent once",
+   "verdict": "passed"
   },
   {
-   "id": "F4",
-   "obligation": "structural URL validation incl. userinfo attack",
-   "verdict": "passed",
-   "testSubstring": "red-team F4"
+   "id": "C3c",
+   "obligation": "bind failures 2s/4s/8s, unrecoverable logged at bound, row pending",
+   "verdict": "passed"
   },
   {
-   "id": "I1",
-   "obligation": "fenced tail then status reconcile -> one onTerminal per batch",
-   "verdict": "passed",
-   "testSubstring": "invokes onTerminal for one batch at most once"
+   "id": "C4",
+   "obligation": "3h-old row across restart dispatched; never inbound_expired",
+   "verdict": "passed"
   },
   {
-   "id": "B2",
-   "obligation": "answer shipped on tail (gw-i-), gateway restart, reconcile -> no new ledger row",
-   "verdict": "passed",
-   "testSubstring": "red-team B2"
+   "id": "C5a",
+   "obligation": "send+edit in one packet: original sent, edit steered once",
+   "verdict": "passed"
   },
   {
-   "id": "I2/I5",
-   "obligation": "[BREAK] per-part terminal slots; regenerated DIFFERENT text posts nothing (real deliveryCreate)",
-   "verdict": "passed",
-   "testSubstring": "red-team I2/I5"
+   "id": "C5b",
+   "obligation": "two edits during a turn steered in order",
+   "verdict": "passed"
   },
   {
-   "id": "I4",
-   "obligation": "id-less interim frames: distinct texts distinct ids, replayed text collides",
-   "verdict": "passed",
-   "testSubstring": "red-team I4"
+   "id": "C5c",
+   "obligation": "edit of context-only message becomes a pointer turn",
+   "verdict": "passed"
   },
   {
-   "id": "I6",
-   "obligation": "tail-less reconcile never reposts previous turn (omitStartedAt, session-wide last_assistant)",
-   "verdict": "passed",
-   "testSubstring": "never reposts a previous turn"
+   "id": "C5d",
+   "obligation": "empty text / missing messageId -> invalid_params; loopback edit accepted",
+   "verdict": "passed"
   },
   {
-   "id": "G2-B3",
-   "obligation": "failed-steer backlog: late-dispatched batch never inherits previous answer",
-   "verdict": "passed",
-   "testSubstring": "red-team G2-B3"
+   "id": "C6a",
+   "obligation": "restart after accept: one onTerminal, no resend",
+   "verdict": "passed"
   },
   {
-   "id": "M18",
-   "obligation": "schema 18 migration from a genuine v17 table: columns added, existing bound row untouched, first-bind floor, per-part claim, requeue clears",
-   "verdict": "passed",
-   "testSubstring": "migration 18 adds"
+   "id": "C6b",
+   "obligation": "restart, unknown status + disowned dead session: one resend with new opRef",
+   "verdict": "passed"
+  },
+  {
+   "id": "D4",
+   "obligation": "bind backoff 2/4/8/16s, one unrecoverable log, counter reset",
+   "verdict": "passed"
+  },
+  {
+   "id": "D5",
+   "obligation": "admission while retry armed waits; retry dispatches oldest, steers newer",
+   "verdict": "passed"
+  },
+  {
+   "id": "D7",
+   "obligation": "steer headers for DM/channel(reply); loopback raw body",
+   "verdict": "passed"
+  },
+  {
+   "id": "D8",
+   "obligation": "migration 19 under corrupt attributed_op_ref collision maps each row once",
+   "verdict": "passed"
+  },
+  {
+   "id": "S1",
+   "obligation": "torn steer replayed on same clientRef, no rebind (steering.test)",
+   "verdict": "passed"
+  },
+  {
+   "id": "S2",
+   "obligation": "persistently torn steer held; later acceptance attributes without duplicate",
+   "verdict": "passed"
+  },
+  {
+   "id": "S3",
+   "obligation": "torn then definitive refusal rebinds once, sends once",
+   "verdict": "passed"
+  },
+  {
+   "id": "S4",
+   "obligation": "held steer survives terminal + restart; released exactly once on refusal",
+   "verdict": "passed"
+  },
+  {
+   "id": "E1",
+   "obligation": "steered edit consumes ORIGINAL context row; next turn does not replay (mutation-checked)",
+   "verdict": "passed"
+  },
+  {
+   "id": "M19",
+   "obligation": "v18->v19 drill: accepted/settled-bound/settled-unbound/done/processing/wedged rows",
+   "verdict": "passed"
   },
   {
    "id": "A1",
-   "obligation": "50035 from messages.fetch and from react -> ambiguous:false",
-   "verdict": "passed",
-   "testSubstring": "50035"
-  },
-  {
-   "id": "A2",
-   "obligation": "non-permanent failure (429 exhausting retries) stays ambiguous:true",
-   "verdict": "passed",
-   "testSubstring": "outlives the attempt bound"
-  },
-  {
-   "id": "A3",
-   "obligation": "engagement.reaction rejection logs, never reconnects",
-   "verdict": "passed",
-   "testSubstring": "never a reconnect"
-  },
-  {
-   "id": "G1",
-   "obligation": "chat.progress from tail only; no transcript.list/usage.get; one final frame",
-   "verdict": "passed",
-   "testSubstring": "red-team G1"
-  },
-  {
-   "id": "G3-B1",
-   "obligation": "fresh-turn retry gets its own floor; failed attempt's row never reposted",
-   "testSubstring": "red-team G3-B1",
-   "verdict": "passed"
-  },
-  {
-   "id": "G3-B2",
-   "obligation": "pre-v18 bound batch without startedAt is held, never completed empty",
-   "testSubstring": "red-team G3-B2",
-   "verdict": "passed"
-  },
-  {
-   "id": "G3-F3",
-   "obligation": "wedged strikes scoped per daemon identity",
-   "testSubstring": "red-team G3-F3",
-   "verdict": "passed"
-  },
-  {
-   "id": "G4-F1",
-   "obligation": "strike attributed to the probed discovery record; mid-probe flip never charges the successor",
-   "testSubstring": "red-team G4-F1",
+   "obligation": "messageUpdate: no editedTimestamp or unchanged cached body -> not forwarded",
    "verdict": "passed"
   }
  ]
