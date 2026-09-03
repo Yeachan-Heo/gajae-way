@@ -758,6 +758,29 @@ class OriginActor {
 			);
 	}
 
+	/**
+	 * A steer that fails means the session is broken, so the session is replaced
+	 * rather than the message dropped.
+	 *
+	 * Bumping the epoch retires the current binding; the next settle binds a NEW
+	 * session (resuming where the runtime still can, recreating where it cannot)
+	 * and the pending rows - which are never expired while they are unanswered -
+	 * become that turn's prompt. A freshly created session is bootstrapped with
+	 * the last 24h of channel context, so the replacement does not lose the
+	 * thread.
+	 */
+	async #rebindAfterSteerFailure(current: BoundTurn): Promise<void> {
+		current.retired = true;
+		current.tail?.setTurnRunning(false);
+		const nextEpoch = this.#manager.database.rebindEpoch(this.originKey);
+		this.#current = undefined;
+		this.#state = "idle";
+		this.#manager.log(
+			`session_rebound_after_steer_failure origin=${this.originKey} epoch=${current.epoch} nextEpoch=${nextEpoch}`,
+		);
+		await this.#armSettle();
+	}
+
 	readonly #holdSweeps = new Map<string, number>();
 
 	async #queueIsEmpty(sessionId: string): Promise<boolean> {
@@ -1006,9 +1029,21 @@ class OriginActor {
 		await this.#steerPending();
 	}
 
+	/**
+	 * Every message the user sends goes into the live session, immediately.
+	 *
+	 * `nonSteerable` used to gate this. It is set by seven reconcile paths that
+	 * cannot decide what happened to the OPERATION - and that is a statement
+	 * about completing the batch, never about whether the user may speak. Gating
+	 * ingestion on it meant one undecidable turn silenced the conversation: the
+	 * rows stayed unbatched, the stale floor deleted them ten minutes later, and
+	 * the user's messages were gone without ever reaching the model (live: four
+	 * DMs eaten behind an 85-minute wedge, 2026-09-03). A retired turn is still
+	 * excluded - it no longer exists to steer into.
+	 */
 	async #steerPending(): Promise<void> {
 		const current = this.#current;
-		if (!current || current.retired || current.nonSteerable || this.#state !== "turn-running") return;
+		if (!current || current.retired || this.#state !== "turn-running") return;
 		for (;;) {
 			const row = this.#manager.database.inboundPendingOldest(this.originKey);
 			if (!row) return;
@@ -1022,9 +1057,16 @@ class OriginActor {
 					clientRef,
 				});
 			} catch (error) {
+				// A failed steer means the SESSION is broken, not that the message is
+				// disposable: leaving the row pending is what let the stale floor eat
+				// it. Mark the session for rebind (new session + resume, then a fresh
+				// session seeded with the last 24h of channel context) and keep the
+				// row pending for the retry that follows.
 				this.#manager.log(
-					`steer_ambiguous origin=${this.originKey} message=${row.message_id} detail=${safeDiagnostic(error)}`,
+					`steer_failed origin=${this.originKey} message=${row.message_id} action=rebind_session detail=${safeDiagnostic(error)}`,
 				);
+				current.nonSteerable = true;
+				await this.#rebindAfterSteerFailure(current);
 				return;
 			}
 			if (
