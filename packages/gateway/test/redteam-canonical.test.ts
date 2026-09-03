@@ -946,3 +946,186 @@ test("C6b: an unknown operation on a broker-disowned session is re-sent once wit
 		await fixture.close();
 	}
 });
+
+// --- Generation-2 delta cases ------------------------------------------------
+
+class BindFailsNTimesPort extends ScriptedSessionPort {
+	bindAttempts = 0;
+	failUntil = 0;
+
+	async bind(input: SessionBindInput) {
+		this.bindAttempts++;
+		if (this.bindAttempts <= this.failUntil) throw new Error(`scripted bind failure ${this.bindAttempts}`);
+		return await super.bind(input);
+	}
+}
+
+test("D4: bind failures back off 2s,4s,8s,16s with one unrecoverable log at the bound, and a success resets the counter", async () => {
+	const timers: ScheduledTimer[] = [];
+	const port = new BindFailsNTimesPort();
+	port.failUntil = 4;
+	const fixture = await directFixture({ port, ...timerSeam(timers) });
+	try {
+		await admit(fixture, "backoff-1", "first");
+		const fired = new Set<ScheduledTimer>();
+		const fire = async () => {
+			const timer = required(
+				timers.find((candidate) => !fired.has(candidate) && candidate.delayMs >= 2_000),
+				"bind retry not armed",
+			);
+			fired.add(timer);
+			timer.work();
+			await eventually(
+				() =>
+					fired.size === timers.filter((t) => t.delayMs >= 2_000).length - (port.sends.length ? 0 : 1) ||
+					port.sends.length === 1,
+				"retry did not run",
+			);
+		};
+		await fire();
+		await fire();
+		await fire();
+		await fire();
+		await eventually(() => port.sends.length === 1, "fifth bind did not dispatch");
+		console.log(
+			"D4>>>",
+			JSON.stringify(timers.map((t) => t.delayMs)),
+			port.bindAttempts,
+			JSON.stringify(fixture.logs.filter((l) => l.startsWith("persona_bind"))),
+		);
+		expect(timers.filter((t) => t.delayMs >= 2_000).map((t) => t.delayMs)).toEqual([2_000, 4_000, 8_000, 16_000]);
+		expect(fixture.logs.filter((line) => line.startsWith("persona_send_unrecoverable"))).toHaveLength(1);
+		port.complete(required(port.sends[0], "send missing").opRef, "ok");
+		await eventually(() => fixture.database.inboundPendingCount(DIRECT_ORIGIN_KEY) === 0, "turn did not complete");
+		// Counter reset: after /new (which forces a fresh bind) the next failure
+		// starts the ladder again at 2s, not 32s.
+		await fixture.manager.reset(DIRECT_ORIGIN_KEY, JSON.stringify(DIRECT_ORIGIN));
+		port.failUntil = port.bindAttempts + 1;
+		await admit(fixture, "backoff-2", "second");
+		expect(timers.filter((t) => t.delayMs >= 2_000).map((t) => t.delayMs)).toEqual([
+			2_000, 4_000, 8_000, 16_000, 2_000,
+		]);
+	} finally {
+		await fixture.close();
+	}
+});
+
+test("D5: a message admitted while a bind retry is armed waits for the retry; the retry dispatches the oldest and steers the newer", async () => {
+	const timers: ScheduledTimer[] = [];
+	const port = new BindFailsNTimesPort();
+	port.failUntil = 1;
+	const fixture = await directFixture({ port, ...timerSeam(timers) });
+	try {
+		await admit(fixture, "armed-1", "first");
+		expect(port.bindAttempts).toBe(1);
+		await admit(fixture, "armed-2", "second");
+		expect(port.bindAttempts).toBe(1);
+		expect(port.sends).toEqual([]);
+		const retry = required(
+			timers.find((t) => t.delayMs === 2_000),
+			"retry not armed",
+		);
+		retry.work();
+		await eventually(() => port.sends.length === 1 && port.steers.length === 1, "retry did not dispatch and steer");
+		expect(port.sends[0]?.text).toBe("first");
+		expect(steerBodies(port)).toEqual(["second"]);
+		expect(port.bindAttempts).toBe(2);
+	} finally {
+		await fixture.close();
+	}
+});
+
+test("D7: steers carry the same speaker/place/reply header as a trigger; a loopback steer without engagement is the raw body", async () => {
+	// Sends are acknowledged and never completed: every turn stays running,
+	// so the follow-ups are steers.
+	const port = new ScriptedSessionPort();
+	const fixture = await serverFixture({ port, dmPolicy: "open", channels: { "d7-chan": { engagement: "open" } } });
+	try {
+		const channel = { platform: "discord", kind: "channel", conversationId: "d7-chan" } as const;
+		fixture.client.sendMany([
+			request("dm-trigger", "chat.send", {
+				origin: DM_ORIGIN,
+				messageId: "dm-trigger",
+				text: "dm start",
+				engagement: DM_ENGAGEMENT,
+			}),
+			request("dm-steer", "chat.send", {
+				origin: DM_ORIGIN,
+				messageId: "dm-steer",
+				text: "dm follow-up",
+				engagement: { ...DM_ENGAGEMENT, authorName: "bellman" },
+			}),
+			request("ch-trigger", "chat.send", {
+				origin: channel,
+				messageId: "ch-trigger",
+				text: "channel start",
+				engagement: { mentioned: true, group: true, authorId: "u1", authorName: "alice" },
+			}),
+			request("ch-steer", "chat.send", {
+				origin: channel,
+				messageId: "ch-steer",
+				text: "channel follow-up",
+				engagement: {
+					mentioned: true,
+					group: true,
+					authorId: "u2",
+					authorName: "bob",
+					replyTo: { messageId: "ch-trigger", authorName: "alice", fromSelf: false, excerpt: "channel start" },
+				},
+			}),
+			request("lb-trigger", "chat.send", { origin: DIRECT_ORIGIN, text: "loopback start" }),
+			request("lb-steer", "chat.send", { origin: DIRECT_ORIGIN, text: "loopback follow-up" }),
+		]);
+		await eventually(() => port.steers.length === 3, "not every follow-up was steered");
+		const steerFor = (body: string) =>
+			required(
+				port.steers.find((s) => s.text.endsWith(body)),
+				`${body} steer missing`,
+			).text;
+		expect(steerFor("dm follow-up")).toContain("bellman");
+		expect(steerFor("dm follow-up")).toContain("msg:dm-steer");
+		expect(steerFor("channel follow-up")).toContain("bob");
+		expect(steerFor("channel follow-up")).toContain("msg:ch-steer");
+		expect(steerFor("channel follow-up")).toMatch(/reply/i);
+		expect(steerFor("loopback follow-up")).not.toContain("msg:");
+		expect(steerFor("loopback follow-up").split("\n").at(-1)).toBe("loopback follow-up");
+	} finally {
+		for (const send of port.sends) port.complete(send.opRef, "done");
+		await fixture.close();
+	}
+});
+
+test("D8: migration 19 maps every v18 row exactly once even when a corrupt attributed_op_ref collides across batches", async () => {
+	const home = await mkdtemp(join(tmpdir(), "gajaeway-redteam-migrate-"));
+	const path = join(home, "gateway.db");
+	try {
+		(await GatewayDatabase.open(path)).close();
+		const raw = new (await import("bun:sqlite")).Database(path);
+		raw.exec(`
+DROP TABLE inbound_messages;
+CREATE TABLE inbound_messages (message_id TEXT PRIMARY KEY, origin_key TEXT NOT NULL, origin_ref_json TEXT NOT NULL, body TEXT NOT NULL, engagement_json TEXT, state TEXT NOT NULL CHECK(state IN ('pending','processing','done')), received_at TEXT NOT NULL, batch_key TEXT, batch_role TEXT, batch_epoch INTEGER, batch_state TEXT, attributed_op_ref TEXT, accepted_at TEXT, bound_session_id TEXT, dispatched_at TEXT, terminal_delivery_id TEXT);
+DELETE FROM schema_migrations WHERE version > 18;
+INSERT INTO inbound_messages (message_id, origin_key, origin_ref_json, body, engagement_json, state, received_at, batch_key, batch_role, batch_epoch, batch_state, attributed_op_ref, accepted_at, bound_session_id, dispatched_at, terminal_delivery_id) VALUES
+ ('live-trigger', 'o', '{}', 'a', NULL, 'pending', '2026-09-02T00:00:00.000Z', 'b1', 'trigger', 2, 'accepted', 'gw-p-live', NULL, 's', '2026-09-02T00:00:00.500Z', NULL),
+ ('collision-member', 'o', '{}', 'b', NULL, 'pending', '2026-09-02T00:00:00.100Z', 'b1', 'member', 2, 'accepted', 'gw-p-old', NULL, 's', '2026-09-02T00:00:00.500Z', NULL),
+ ('old-trigger', 'o', '{}', 'c', NULL, 'done', '2026-09-01T00:00:00.000Z', 'b0', 'trigger', 1, 'done', 'gw-p-old', NULL, 's', '2026-09-01T00:00:00.500Z', NULL),
+ ('old-steer', 'o', '{}', 'd', NULL, 'done', '2026-09-01T00:00:01.000Z', 'b0', 'steer', 1, 'done', 'gw-p-old', NULL, NULL, NULL, NULL);
+`);
+		raw.close();
+		const upgraded = await GatewayDatabase.open(path);
+		const count = new (await import("bun:sqlite")).Database(path, { readonly: true })
+			.query<{ n: number }, []>("SELECT COUNT(*) AS n FROM inbound_messages")
+			.get()?.n;
+		expect(count).toBe(4);
+		expect(upgraded.inboundNonterminalTurns("o").map((turn) => turn.opRef)).toEqual(["gw-p-live"]);
+		expect(upgraded.inboundTurnRows("gw-p-old").map((row) => [row.message_id, row.turn_role, row.state])).toEqual([
+			["old-trigger", "trigger", "done"],
+			["old-steer", "steer", "done"],
+			["collision-member", "steer", "done"],
+		]);
+		expect(upgraded.inboundPendingCount("o")).toBe(1);
+		upgraded.close();
+	} finally {
+		await rm(home, { recursive: true, force: true });
+	}
+});
