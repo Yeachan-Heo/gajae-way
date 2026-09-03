@@ -19,6 +19,12 @@ import { deterministicInterimDeliveryId, TailCapacityError, type TailFrame, type
 
 export const DEFAULT_SETTLE_WINDOW_MS = 2_000;
 export const DEFAULT_STALL_TIMEOUT_MS = 120_000;
+/**
+ * How many times a turn may replace its session after the Router disowns it.
+ * Each attempt binds a NEW session (bootstrapped with the last 24h of channel
+ * context), so this is bounded work, not a resend of an accepted operation.
+ */
+const MAX_SEND_REBIND_ATTEMPTS = 3;
 const RETIRED_REATTACH_DELAY_MS = 25;
 const RETIRED_REATTACH_MAX_ATTEMPTS = 3;
 const DEFAULT_MAX_INBOUND_AGE_MS = 10 * 60_000;
@@ -989,6 +995,29 @@ class OriginActor {
 			this.#manager.database.inboundBatchAccept(batchKey);
 			await tail.markAccepted(opRef);
 		} catch (error) {
+			// The Router disowning the session id is NOT ambiguous: it is proof the
+			// send never landed, so there is nothing to protect by holding. gjc is
+			// allowed to be unreliable here - surviving that is this gateway's job.
+			// Holding instead left the conversation dead with one message pending,
+			// an empty gjc_session_id and no retry, until a human restarted the
+			// daemon (live: epoch 41, session_unavailable, 2026-09-03).
+			if (sdkStatusErrorCode(error) === "session_unavailable") {
+				const attempt = this.#manager.database.inboundBatchRequeueFreshTurn(batchKey);
+				const nextEpoch = this.#manager.database.rebindEpoch(this.originKey);
+				this.#current = undefined;
+				this.#state = "idle";
+				this.#manager.log(
+					`persona_send_session_gone origin=${this.originKey} epoch=${epoch} nextEpoch=${nextEpoch} opRef=${opRef} attempt=${attempt}`,
+				);
+				// Bounded: a new session per attempt, and a fresh session is bootstrapped
+				// with the last 24h of channel context, so the retry keeps the thread.
+				if (attempt <= MAX_SEND_REBIND_ATTEMPTS) await this.#armSettle();
+				else
+					this.#manager.log(
+						`persona_send_unrecoverable origin=${this.originKey} opRef=${opRef} attempts=${attempt} reason=session_unavailable`,
+					);
+				return;
+			}
 			// A command failure can occur after broker acceptance. Reconcile its exact
 			// durable op-ref; an unknown status remains held and is never resent.
 			if ((error instanceof OpRefRejectedError && error.code === CLIENT_REF_CONFLICT_CODE) || isOpRefRejection(error))
