@@ -145,6 +145,11 @@ class RetentionGapPort extends ScriptedSessionPort {
 class FailFirstSteerPort extends ScriptedSessionPort {
 	steerAttempts = 0;
 
+	constructor() {
+		// Epoch-keyed binds: a rebound epoch gets a NEW session, as the broker does.
+		super({ onBind: (input) => `session-${input.epoch}` });
+	}
+
 	async steer(input: SessionSteerInput): Promise<void> {
 		this.steerAttempts++;
 		if (this.steerAttempts === 1) throw new Error("broker socket disappeared after steer dispatch");
@@ -239,7 +244,7 @@ test("red-team: a strict tail retention gap does not infer terminal or create an
 	}
 });
 
-test("red-team: broker death during a steer leaves the row unconsumed and sends it once after terminal recovery", async () => {
+test("canonical: a steer the running session refuses replaces the session; the message is never consumed by the old turn and is sent exactly once on the new one", async () => {
 	const port = new FailFirstSteerPort();
 	const target = await fixture({ port });
 	try {
@@ -247,24 +252,40 @@ test("red-team: broker death during a steer leaves the row unconsumed and sends 
 		await target.manager.notifyInbound(ORIGIN_KEY);
 		await eventually(() => port.sends.length === 1, "initial batch did not start");
 		const first = required(port.sends[0], "initial steer send missing");
+		const firstEpoch = required(target.batches.values().next().value, "first batch missing").epoch;
 
 		enqueue(target, "steer-after-death", "must remain durable");
 		await target.manager.notifyInbound(ORIGIN_KEY);
 		expect(port.steerAttempts).toBe(1);
 		expect(port.steers).toEqual([]);
-		expect(target.database.inboundPendingOldest(ORIGIN_KEY)?.message_id).toBe("steer-after-death");
+		// The running turn refused the steer while still in flight: the SESSION
+		// is broken, so it is replaced. The row stays pending (never consumed by
+		// the old batch, never expired) and the epoch moves on.
+		expect(target.logs.filter((line) => line.startsWith("steer_failed"))).toHaveLength(1);
+		expect(target.logs.filter((line) => line.startsWith("session_rebound_after_steer_failure"))).toHaveLength(1);
+		expect(target.database.inboundPendingOldest(ORIGIN_KEY)).toMatchObject({
+			message_id: "steer-after-death",
+			batch_role: null,
+			batch_state: null,
+		});
+		await eventually(() => port.sends.length === 2, "refused steer row was not sent on the replacement session");
+		const second = required(port.sends[1], "replacement send missing");
+		expect(second.text).toBe("must remain durable");
+		expect(second.sessionId).not.toBe(first.sessionId);
+		expect(port.binds.at(-1)?.epoch).toBe(firstEpoch + 1);
+		expect(port.sendAttempts.map((input) => input.opRef)).toHaveLength(2);
 
+		// The old turn still answers its own trigger: the user never discarded
+		// it, so its terminal is delivered and its batch closes.
 		await target.manager.onBrokerGeneration(2);
 		port.complete(first.opRef, "first terminal");
-		await eventually(() => port.sends.length === 2, "failed steer row was not re-fired as one later batch");
-		const second = required(port.sends[1], "recovered steer send missing");
-		expect(second.text).toBe("must remain durable");
-		expect(port.sendAttempts.map((input) => input.opRef)).toHaveLength(2);
+		await eventually(() => target.terminal.includes("first terminal"), "replaced turn's own answer was dropped");
 		port.complete(second.opRef, "second terminal");
 		await eventually(
 			() => target.database.inboundPendingCount(ORIGIN_KEY) === 0,
-			"broker-death sequence left pending rows",
+			"steer-failure sequence left pending rows",
 		);
+		expect(target.terminal).toEqual(["first terminal", "second terminal"]);
 		assertCoverage(target, ["steer-trigger", "steer-after-death"]);
 	} finally {
 		await target.close();
@@ -523,11 +544,23 @@ test("red-team: a terminal tail frame arriving during the status grace wins once
 	}
 });
 
-test("red-team: slow tail keeps a status-terminal turn non-steerable until the bounded grace, then status settles it once", async () => {
+class EndedTurnRejectsSteerPort extends ScriptedSessionPort {
+	/** gjc refuses turn.steer once the turn has ended; the test flips this when it seeds the terminal status. */
+	turnEnded = false;
+	steerAttempts = 0;
+
+	async steer(input: SessionSteerInput): Promise<void> {
+		this.steerAttempts++;
+		if (this.turnEnded) throw new Error("turn.steer: no running turn");
+		await super.steer(input);
+	}
+}
+
+test("canonical: a message arriving while the ended turn's tail is late is steered at once; the refusal settles the ended turn from status and the message is sent next", async () => {
 	const base = Date.parse("2026-09-02T00:01:00.000Z");
 	let now = base;
 	const timers: Array<{ readonly work: () => void; readonly delayMs: number }> = [];
-	const port = new ScriptedSessionPort();
+	const port = new EndedTurnRejectsSteerPort();
 	const target = await fixture({
 		port,
 		settleWindowMs: 0,
@@ -547,6 +580,7 @@ test("red-team: slow tail keeps a status-terminal turn non-steerable until the b
 		const firstBatch = required(target.batches.values().next().value, "slow-tail first batch missing");
 
 		port.seedOperation(first.opRef, first.sessionId, "terminal_ok", "status-only terminal");
+		port.turnEnded = true;
 		await target.manager.tick(ORIGIN_KEY);
 		const grace = required(
 			timers.find((timer) => timer.delayMs === 250),
@@ -560,36 +594,38 @@ test("red-team: slow tail keeps a status-terminal turn non-steerable until the b
 		});
 
 		now++;
-		enqueue(
-			target,
-			"arrived-during-grace",
-			"must remain pending until original status settles",
-			new Date(now).toISOString(),
-		);
+		enqueue(target, "arrived-during-grace", "reaches the model as the next send", new Date(now).toISOString());
 		await target.manager.notifyInbound(ORIGIN_KEY);
+		// The undecided turn never gags ingestion: the steer is attempted at
+		// once. The session refuses it (turn over), so the row is NOT consumed
+		// by the old batch. The refusal is a second reconcile after the bounded
+		// hold: status - the reconcile authority - completes the ended turn on
+		// the spot instead of waiting out the grace, and the row is sent next.
+		expect(port.steerAttempts).toBe(1);
 		expect(port.steers).toEqual([]);
-		expect(target.database.inboundPendingOldest(ORIGIN_KEY)).toMatchObject({
-			message_id: "arrived-during-grace",
-			batch_role: null,
-			batch_state: null,
-		});
-		expect(target.terminal).toEqual([]);
-
-		grace.work();
-		await eventually(() => target.terminal.length === 1, "status fallback did not settle after bounded grace");
+		expect(target.logs.filter((line) => line.startsWith("steer_failed"))).toHaveLength(1);
+		expect(target.logs.some((line) => line.startsWith("session_rebound_after_steer_failure"))).toBe(false);
 		expect(target.terminal).toEqual(["status-only terminal"]);
 		expect(target.logs.filter((line) => line.startsWith("terminal_status_reconciled"))).toHaveLength(1);
 		expect(target.database.inboundBatchRows(firstBatch.batchKey)[0]).toMatchObject({
 			state: "done",
 			batch_state: "done",
 		});
+		// The grace timer that was armed for the hold is now a no-op.
+		grace.work();
+		await Bun.sleep(20);
+		expect(target.terminal).toEqual(["status-only terminal"]);
+		expect(target.logs.filter((line) => line.startsWith("terminal_status_reconciled"))).toHaveLength(1);
 
 		port.complete(first.opRef, "late tail must not deliver twice");
 		await Bun.sleep(20);
 		expect(target.terminal).toEqual(["status-only terminal"]);
 		await target.manager.tick(ORIGIN_KEY);
-		await eventually(() => port.sends.length === 2, "pending grace-period row did not start its next batch");
+		await eventually(() => port.sends.length === 2, "row refused by the ended turn did not become the next send");
 		const second = required(port.sends[1], "slow-tail second send missing");
+		expect(second.sessionId).toBe(first.sessionId);
+		expect(second.text).toBe("reaches the model as the next send");
+		port.turnEnded = false;
 		port.complete(second.opRef, "next turn terminal");
 		await eventually(
 			() => target.database.inboundPendingCount(ORIGIN_KEY) === 0,

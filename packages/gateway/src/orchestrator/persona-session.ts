@@ -394,6 +394,12 @@ type BoundTurn = PersonaTurnIdentity & {
 	retired: boolean;
 	detached: boolean;
 	tailTerminalObserved: boolean;
+	/**
+	 * A retired turn whose answer the user still wants: the session was replaced
+	 * under it (steer failure), not reset by the user (`/new`). Its output is
+	 * delivered and its terminal completes the batch like a current turn.
+	 */
+	answerWanted: boolean;
 	tailEvidenceUnavailable: boolean;
 	/** Reconcile passes that saw decidable-terminal status while tail terminal evidence was still absent. */
 	statusTerminalHolds: number;
@@ -407,7 +413,6 @@ type BoundTurn = PersonaTurnIdentity & {
 	/** `dispatched_at` of the batch: stamped at first bind, before the send. Absent for a pre-v18 adopted batch. */
 	dispatchedAtMs?: number;
 	replaceAfterTerminal: boolean;
-	nonSteerable: boolean;
 };
 
 class OriginActor {
@@ -475,7 +480,6 @@ class OriginActor {
 		await this.#manager.discardInbound(discarded);
 		if (previous) {
 			previous.retired = true;
-			previous.nonSteerable = true;
 			previous.tail?.setTurnRunning(false);
 			await previous.tail?.close();
 			previous.detached = true;
@@ -757,11 +761,11 @@ class OriginActor {
 			retired,
 			detached,
 			tailTerminalObserved: false,
+			answerWanted: false,
 			tailEvidenceUnavailable: false,
 			statusTerminalHolds: 0,
 			...(dispatchedAtMs === undefined ? {} : { dispatchedAtMs }),
 			replaceAfterTerminal: false,
-			nonSteerable: false,
 		};
 		tail?.setTurnRunning(true);
 		if (accepted && tail) await tail.markAccepted(batch.opRef);
@@ -784,6 +788,40 @@ class OriginActor {
 			this.#manager.log(
 				`retired_hold originKey=${this.originKey} batchKey=${batch.batchKey} epoch=${batch.epoch} opRef=${batch.opRef} reason=resume_impossible`,
 			);
+	}
+
+	/**
+	 * A steer that fails never makes the message disposable. Two causes:
+	 *
+	 * 1. The turn already ended (nothing to steer into). Reconciling completes
+	 *    it and the pending row becomes the next turn's prompt in the SAME
+	 *    session - the canonical `idle -> send` rule.
+	 * 2. The turn is still running but the session refuses the steer: the
+	 *    session is broken. Retire the turn and bump the epoch so the next
+	 *    settle binds a NEW session (a fresh one is bootstrapped with the last
+	 *    24h of channel context) and the still-pending row becomes that turn's
+	 *    prompt. Unlike a `/new` retire, the user never asked to discard this
+	 *    turn: its tail stays attached and its answer is still delivered.
+	 */
+	async #recoverFromSteerFailure(current: BoundTurn): Promise<void> {
+		await this.#reconcileBound(current);
+		if (this.#current !== current) return;
+		if (current.statusTerminalHolds > 0 && !current.tailEvidenceUnavailable) {
+			// Status is terminal and the bounded tail grace is pending; when it
+			// fires the batch completes and the settle picks the row up.
+			return;
+		}
+		current.retired = true;
+		current.answerWanted = true;
+		this.#retired.set(retiredKey(current), current);
+		this.#current = undefined;
+		const nextEpoch = this.#manager.database.rebindEpoch(this.originKey);
+		this.#state = "idle";
+		this.#deadline = undefined;
+		this.#manager.log(
+			`session_rebound_after_steer_failure origin=${this.originKey} epoch=${current.epoch} nextEpoch=${nextEpoch} opRef=${current.batch.opRef}`,
+		);
+		await this.#armSettle();
 	}
 
 	readonly #holdSweeps = new Map<string, number>();
@@ -980,11 +1018,11 @@ class OriginActor {
 			retired: false,
 			detached: false,
 			tailTerminalObserved: false,
+			answerWanted: false,
 			tailEvidenceUnavailable: false,
 			statusTerminalHolds: 0,
 			...(dispatchedAtMs === undefined ? {} : { dispatchedAtMs }),
 			replaceAfterTerminal: false,
-			nonSteerable: false,
 		};
 		this.#current = current;
 		this.#state = "turn-running";
@@ -1059,9 +1097,23 @@ class OriginActor {
 		await this.#steerPending();
 	}
 
+	/**
+	 * Every message the user sends goes into the live session, immediately.
+	 *
+	 * A `nonSteerable` flag used to gate this. It was set by seven reconcile
+	 * paths that could not decide what happened to the OPERATION - a statement
+	 * about completing the batch, never about whether the user may speak. Gating
+	 * ingestion on it meant one undecidable turn silenced the conversation: the
+	 * rows stayed unbatched, the stale floor deleted them ten minutes later, and
+	 * the user's messages were gone without ever reaching the model (live: four
+	 * DMs eaten behind an 85-minute wedge, 2026-09-03). A retired turn is still
+	 * excluded - it no longer exists to steer into. If the session has in fact
+	 * already finished the turn, the steer fails and #recoverFromSteerFailure
+	 * turns the row into the next send.
+	 */
 	async #steerPending(): Promise<void> {
 		const current = this.#current;
-		if (!current || current.retired || current.nonSteerable || this.#state !== "turn-running") return;
+		if (!current || current.retired || this.#state !== "turn-running") return;
 		for (;;) {
 			const row = this.#manager.database.inboundPendingOldest(this.originKey);
 			if (!row) return;
@@ -1075,9 +1127,15 @@ class OriginActor {
 					clientRef,
 				});
 			} catch (error) {
+				// A failed steer means the message could not reach the session, not
+				// that it is disposable: leaving the row pending is what let the
+				// stale floor eat it. Either the turn is over (send it when idle) or
+				// the session is broken (replace it); the row stays pending for the
+				// turn that follows either way.
 				this.#manager.log(
-					`steer_ambiguous origin=${this.originKey} message=${row.message_id} detail=${safeDiagnostic(error)}`,
+					`steer_failed origin=${this.originKey} message=${row.message_id} action=recover detail=${safeDiagnostic(error)}`,
 				);
+				await this.#recoverFromSteerFailure(current);
 				return;
 			}
 			if (
@@ -1182,7 +1240,6 @@ class OriginActor {
 		const bound = this.#findBound(sessionId, epoch, brokerGeneration);
 		if (!bound) return;
 		bound.tailEvidenceUnavailable = true;
-		bound.nonSteerable = true;
 		bound.detached = true;
 		this.#manager.log(`retention_gap origin=${this.originKey} epoch=${epoch} session=${sessionId}`);
 		this.#manager.log(
@@ -1214,7 +1271,7 @@ class OriginActor {
 			);
 			return;
 		}
-		if (bound.retired || retired) {
+		if ((bound.retired || retired) && !bound.answerWanted) {
 			if (frame.assistantText)
 				this.#manager.log(`stale_output origin=${this.originKey} epoch=${epoch} session=${sessionId}`);
 		} else {
@@ -1281,7 +1338,6 @@ class OriginActor {
 				opRef: bound.batch.opRef,
 			});
 		} catch (error) {
-			bound.nonSteerable = true;
 			// The broker disowning the id (session_unavailable) with the session
 			// provably not live means nothing is running there: release the batch
 			// and rebind instead of holding an adopted turn forever.
@@ -1311,7 +1367,6 @@ class OriginActor {
 			return;
 		}
 		if (report.status.status === "unknown") {
-			bound.nonSteerable = true;
 			this.#manager.log(
 				`recovery_hold origin=${this.originKey} epoch=${bound.epoch} opRef=${bound.batch.opRef} reason=operation_state_unknown`,
 			);
@@ -1322,10 +1377,11 @@ class OriginActor {
 			this.#manager.database.inboundBatchAccept(bound.batch.batchKey);
 			if (bound.tail) await bound.tail.markAccepted(bound.batch.opRef);
 		}
-		bound.nonSteerable = false;
 		if (!isTerminalStatus(report.status.status)) {
 			if (bound.detached && !bound.tailEvidenceUnavailable) {
-				if (bound.retired) this.#scheduleRetiredReattach(bound);
+				// A turn the user still wants answered is re-attached like the
+				// current one; only a discarded (`/new`) hold is deferred.
+				if (bound.retired && !bound.answerWanted) this.#scheduleRetiredReattach(bound);
 				else await this.#reattachCurrentTail(bound);
 			}
 			return;
@@ -1339,7 +1395,6 @@ class OriginActor {
 			// reconcile authority — completes the batch below, corroborated by an
 			// explicit log line instead of a silent shortcut.
 			bound.statusTerminalHolds += 1;
-			bound.nonSteerable = true;
 			this.#manager.log(
 				`recovery_hold origin=${this.originKey} epoch=${bound.epoch} opRef=${bound.batch.opRef} reason=tail_terminal_evidence_unavailable`,
 			);
@@ -1348,6 +1403,9 @@ class OriginActor {
 				if (this.#stopped || this.#manager.stopped) return;
 				void this.enqueue(async () => {
 					if (this.#stopped || this.#manager.stopped || bound.tailTerminalObserved) return;
+					// An earlier reconcile (e.g. a refused steer) may already have
+					// completed this turn from status; it is no longer tracked then.
+					if (this.#current !== bound && !this.#retired.has(retiredKey(bound))) return;
 					bound.tailEvidenceUnavailable = true;
 					await this.#reconcileBound(bound);
 				}).catch((error: unknown) =>
@@ -1377,7 +1435,7 @@ class OriginActor {
 			return;
 		}
 		try {
-			if (!bound.retired && report.status.status === "terminal_ok") {
+			if ((!bound.retired || bound.answerWanted) && report.status.status === "terminal_ok") {
 				// The transcript is the authority for the answer text. The live tail's
 				// lastAssistantText is turn-scoped too (see #predatesTurn) but it is
 				// an observation of a stream that can be re-attached, replayed and
@@ -1418,7 +1476,6 @@ class OriginActor {
 						// Completing with "" would discard a real answer; posting the
 						// unbounded last row could repost the previous turn. Hold for
 						// the operator instead.
-						bound.nonSteerable = true;
 						this.#manager.log(
 							`recovery_hold origin=${this.originKey} epoch=${bound.epoch} opRef=${bound.batch.opRef} reason=no_turn_floor`,
 						);
@@ -1430,7 +1487,7 @@ class OriginActor {
 					text = "";
 				}
 				await bound.lifecycle.onTerminal?.({ ...bound, text, status: report });
-			} else if (!bound.retired) {
+			} else if (!bound.retired || bound.answerWanted) {
 				await bound.lifecycle.onFailure?.({ ...bound, error: terminalError(report), status: report });
 			}
 		} catch (error) {

@@ -1,0 +1,15 @@
+{
+  "deferredToBatch": {
+    "ranLanes": ["targetedVerification"],
+    "targetedVerification": {
+      "status": "passed",
+      "commands": [
+        "bunx tsc --noEmit -p tsconfig.json",
+        "bun test packages/gateway/test/terminal-idempotency.e2e.test.ts",
+        "bun test packages/gateway",
+        "bun test packages/gateway/test/delivery-crash.e2e.test.ts (x5)"
+      ],
+      "evidence": "Commit 0ab6fe7: #onTailFrame fences un-attributed transcript frames whose host ts precedes dispatched_at-2s (tail_frame_pre_turn); terminal text prefers fetchAssistantSince({notBeforeMs: startedAt ?? dispatched_at}) with turn-scoped tail text as fallback; dispatched_at cached on BoundTurn. Two new regression tests in terminal-idempotency.e2e reproduce the cursorless-resync replay and the attributed-old-stamp case; both fail with persona-session.ts stashed (mutation check) and pass with the fix. Full gateway suite: 658 pass / 1 fail, the one failure being delivery-crash.e2e which also fails on clean origin/main e200425 in isolation (ECONNREFUSED: 100ms fixed sleep vs ~200ms daemon listen, stale socket file after SIGKILL). Commit 7210a2c fixes that fixture to probe with a real connect; 5/5 consecutive passes. tsc clean."
+    }
+  }
+}

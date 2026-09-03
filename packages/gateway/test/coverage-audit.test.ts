@@ -124,6 +124,12 @@ test("coverage audit attributes a message arriving exactly at the settle fire bo
 
 class FailFirstSteerPort extends ScriptedSessionPort {
 	steerAttempts = 0;
+
+	constructor() {
+		// Epoch-keyed binds: a rebound epoch gets a NEW session, as the broker does.
+		super({ onBind: (input) => `session-${input.epoch}` });
+	}
+
 	async steer(input: Parameters<ScriptedSessionPort["steer"]>[0]): Promise<void> {
 		this.steerAttempts++;
 		if (this.steerAttempts === 1) throw new Error("scripted ambiguous steer transport failure");
@@ -131,27 +137,30 @@ class FailFirstSteerPort extends ScriptedSessionPort {
 	}
 }
 
-test("coverage audit leaves a failed steer pending only until the next durable batch", async () => {
+test("coverage audit: a steer the session refuses is sent once on the replacement session, and both turns are attributed", async () => {
 	const port = new FailFirstSteerPort();
 	const fixtureState = await fixture({ port });
 	try {
 		enqueue(fixtureState.database, "steer-trigger", "first");
 		await fixtureState.manager.notifyInbound(ORIGIN_KEY);
 		await eventually(() => port.sends.length === 1, "trigger did not start");
+		const first = port.sends[0]!;
 		enqueue(fixtureState.database, "steer-failure", "must not disappear");
 		await fixtureState.manager.notifyInbound(ORIGIN_KEY);
 		expect(port.steerAttempts).toBe(1);
-		// The accepted trigger still has legacy `pending` state; the failed steer
-		// is the only unbatched row and must wait for the next settle boundary.
-		expect(fixtureState.database.inboundPendingCount(ORIGIN_KEY)).toBe(2);
-		expect(fixtureState.database.inboundNonterminalBatches(ORIGIN_KEY)).toHaveLength(1);
+		// The refused steer replaces the session immediately; the row is never
+		// held behind the undecided turn and never expired.
+		await eventually(() => port.sends.length === 2, "refused steer was not sent on a replacement session");
+		const second = port.sends[1]!;
+		expect(second.text).toBe("must not disappear");
+		expect(second.sessionId).not.toBe(first.sessionId);
+		expect(fixtureState.database.inboundNonterminalBatches(ORIGIN_KEY)).toHaveLength(2);
 
-		port.complete(port.sends[0]!.opRef, "first done");
-		await eventually(() => port.sends.length === 2, "failed steer was not admitted as the next batch");
-		port.complete(port.sends[1]!.opRef, "second done");
+		port.complete(first.opRef, "first done");
+		port.complete(second.opRef, "second done");
 		await eventually(
 			() => fixtureState.database.inboundPendingCount(ORIGIN_KEY) === 0,
-			"failed-steer message remained pending past settle plus grace",
+			"a turn remained pending after both terminals",
 		);
 		assertCoverage(fixtureState, ["steer-trigger", "steer-failure"]);
 	} finally {
