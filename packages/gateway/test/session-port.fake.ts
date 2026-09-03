@@ -243,6 +243,42 @@ export class ScriptedSessionPort implements SessionPort {
 		});
 	}
 
+	/**
+	 * A durable transcript row as replayed by a cursorless tail re-attach:
+	 * host `ts` stamp, and no opRef unless the test attributes it explicitly.
+	 */
+	emitReplayedTranscriptRow(sessionId: string, text: string, tsMs: number, opRef?: string): void {
+		this.#emit(sessionId, {
+			kind: "transcript",
+			rawKind: "transcript",
+			payload: {
+				role: "assistant",
+				content: [{ text }],
+				ts: new Date(tsMs).toISOString(),
+				...(opRef ? { opRef } : {}),
+			},
+			assistantText: text,
+			steerEcho: false,
+			idle: false,
+		});
+	}
+
+	/** Marks the operation terminal_ok with `text` as its durable answer, then emits only the lifecycle end frame. */
+	completeWithoutAnswerFrame(opRef: string, text: string): void {
+		const operation = this.#operations.get(opRef);
+		if (!operation) throw new Error(`unknown scripted operation ${opRef}`);
+		operation.state = "terminal_ok";
+		operation.text = text;
+		operation.terminalAt = Date.now();
+		this.#emit(operation.sessionId, {
+			kind: "agent_end",
+			rawKind: "agent_end",
+			payload: { opRef },
+			steerEcho: false,
+			idle: true,
+		});
+	}
+
 	emitSteerEcho(sessionId: string, text: string, eventId = `steer-${crypto.randomUUID()}`): void {
 		this.#emit(sessionId, {
 			kind: "transcript",

@@ -804,10 +804,22 @@ function contentText(content: unknown): string | undefined {
 	return parts.join("");
 }
 
-function tailOperationRef(frame: TailFrame): string | undefined {
+export function tailOperationRef(frame: TailFrame): string | undefined {
 	for (const value of [frame.payload.opRef, frame.payload.operationRef, frame.payload.clientRef])
 		if (typeof value === "string" && value.length > 0) return value;
 	return undefined;
+}
+
+/**
+ * Host-stamped time of a transcript row (`ts`, ISO-8601 from the session's
+ * entry timestamp). Live lifecycle frames carry none; only durable rows do,
+ * and those are exactly the frames a cursorless resync can replay.
+ */
+export function tailFrameTimestampMs(frame: TailFrame): number | undefined {
+	const ts = frame.payload.ts;
+	if (typeof ts !== "string") return undefined;
+	const at = Date.parse(ts);
+	return Number.isFinite(at) ? at : undefined;
 }
 
 function validResyncCoordinate(value: TailResyncCoordinate): boolean {

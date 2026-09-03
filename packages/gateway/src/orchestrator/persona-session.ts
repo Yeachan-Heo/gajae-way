@@ -15,7 +15,14 @@ import type { GjcModelSelection } from "../config";
 import type { GatewayDatabase, InboundBatch, InboundMessageRow } from "../store/db";
 import { sanitizeDiagnostic } from "./rebind";
 import type { SessionBinding, SessionPort } from "./session-port";
-import { deterministicInterimDeliveryId, TailCapacityError, type TailFrame, type TailHandle } from "./tail-runner";
+import {
+	deterministicInterimDeliveryId,
+	TailCapacityError,
+	type TailFrame,
+	type TailHandle,
+	tailFrameTimestampMs,
+	tailOperationRef,
+} from "./tail-runner";
 
 export const DEFAULT_SETTLE_WINDOW_MS = 2_000;
 export const DEFAULT_STALL_TIMEOUT_MS = 120_000;
@@ -36,6 +43,12 @@ const DEFAULT_MAX_INBOUND_AGE_MS = 10 * 60_000;
  * completes with an explicit corroboration log.
  */
 const STATUS_TERMINAL_GRACE_MS = 250;
+/**
+ * A transcript row is judged against the turn's dispatch floor with this much
+ * slack: the host stamps rows and the gateway stamps dispatched_at on two
+ * clocks. Same tolerance as SessionPort.fetchAssistantSince.
+ */
+const TURN_FLOOR_SKEW_MS = 2_000;
 const SETTLE_FAILURE_RETRY_MS = 2_000;
 /** Consecutive recovery sweeps (60s apart) an unknown op on a live idle session is held before release. */
 const HOLD_RELEASE_SWEEPS = 2;
@@ -384,8 +397,15 @@ type BoundTurn = PersonaTurnIdentity & {
 	tailEvidenceUnavailable: boolean;
 	/** Reconcile passes that saw decidable-terminal status while tail terminal evidence was still absent. */
 	statusTerminalHolds: number;
-	/** Last assistant text observed on the live tail; avoids a transcript round trip at terminal. */
+	/**
+	 * Last assistant text observed on the live tail for THIS turn. Only frames
+	 * attributed to the op, or un-attributed rows stamped at/after the dispatch
+	 * floor, may set it; a cursorless resync replays pre-turn transcript rows
+	 * (no opRef) and those must never become this turn's answer.
+	 */
 	lastAssistantText?: string;
+	/** `dispatched_at` of the batch: stamped at first bind, before the send. Absent for a pre-v18 adopted batch. */
+	dispatchedAtMs?: number;
 	replaceAfterTerminal: boolean;
 	nonSteerable: boolean;
 };
@@ -725,6 +745,7 @@ class OriginActor {
 				`retired_hold originKey=${this.originKey} batchKey=${batch.batchKey} epoch=${batch.epoch} opRef=${batch.opRef} reason=tail_capacity`,
 			);
 		}
+		const dispatchedAtMs = this.#dispatchFloorMs(batch.batchKey);
 		const bound: BoundTurn = {
 			originKey: this.originKey,
 			epoch: batch.epoch,
@@ -738,6 +759,7 @@ class OriginActor {
 			tailTerminalObserved: false,
 			tailEvidenceUnavailable: false,
 			statusTerminalHolds: 0,
+			...(dispatchedAtMs === undefined ? {} : { dispatchedAtMs }),
 			replaceAfterTerminal: false,
 			nonSteerable: false,
 		};
@@ -946,6 +968,7 @@ class OriginActor {
 			rows,
 		});
 		const tail = await this.#attachTail(binding.sessionId, epoch, false);
+		const dispatchedAtMs = this.#dispatchFloorMs(batchKey);
 		const current: BoundTurn = {
 			originKey: this.originKey,
 			epoch,
@@ -959,6 +982,7 @@ class OriginActor {
 			tailTerminalObserved: false,
 			tailEvidenceUnavailable: false,
 			statusTerminalHolds: 0,
+			...(dispatchedAtMs === undefined ? {} : { dispatchedAtMs }),
 			replaceAfterTerminal: false,
 			nonSteerable: false,
 		};
@@ -1179,6 +1203,17 @@ class OriginActor {
 	): Promise<void> {
 		const bound = this.#findBound(sessionId, epoch, brokerGeneration);
 		if (!bound) return;
+		if (this.#predatesTurn(bound, frame)) {
+			// A cursorless tail re-attach (tail_gap_nonstrict resync=null) replays
+			// transcript rows from BEFORE this turn. They carry no opRef, so the
+			// runner's attribution fence cannot catch them; their host `ts` can.
+			// Letting one through made the previous turn's answer ship under the
+			// current trigger (live, 2026-09-03: every reply one turn late).
+			this.#manager.log(
+				`tail_frame_pre_turn origin=${this.originKey} epoch=${epoch} session=${sessionId} event=${frame.eventId ?? "unidentified"}`,
+			);
+			return;
+		}
 		if (bound.retired || retired) {
 			if (frame.assistantText)
 				this.#manager.log(`stale_output origin=${this.originKey} epoch=${epoch} session=${sessionId}`);
@@ -1343,44 +1378,56 @@ class OriginActor {
 		}
 		try {
 			if (!bound.retired && report.status.status === "terminal_ok") {
-				// The live tail already carried the finalized answer; only a tail-less
-				// reconcile (post-crash) needs the transcript round trip.
-				let text: string | undefined =
-					bound.tailTerminalObserved && bound.lastAssistantText !== undefined ? bound.lastAssistantText : undefined;
+				// The transcript is the authority for the answer text. The live tail's
+				// lastAssistantText is turn-scoped too (see #predatesTurn) but it is
+				// an observation of a stream that can be re-attached, replayed and
+				// fenced; the durable row produced at/after this turn's floor is what
+				// the model actually said for THIS trigger. The runtime's own
+				// startedAt is exact; when it is absent the fallback is dispatched_at,
+				// stamped at the batch's first bind BEFORE the send and cleared on
+				// requeue, so it can neither postdate the answer (accepted_at could)
+				// nor predate the previous turn's answer (the settle cutoff could, on
+				// the failed-steer backlog path).
+				const startedAt = report.status.startedAt;
+				const notBeforeMs = typeof startedAt === "number" ? startedAt : bound.dispatchedAtMs;
+				const port = this.#manager.port;
+				let text: string | undefined;
+				if (notBeforeMs !== undefined && port.fetchAssistantSince) {
+					try {
+						const since = await port.fetchAssistantSince({
+							sessionId: bound.sessionId,
+							repo: this.#manager.repo,
+							notBeforeMs,
+						});
+						text = since?.text;
+					} catch (error) {
+						this.#manager.log(
+							`terminal_text_unavailable origin=${this.originKey} epoch=${bound.epoch} opRef=${bound.batch.opRef} reason=transcript_read_failed detail=${safeDiagnostic(error)}`,
+						);
+					}
+				}
+				if (text === undefined && bound.tailTerminalObserved && bound.lastAssistantText !== undefined) {
+					// The transcript had no row at/after the floor (or could not be
+					// read) but the live tail carried a turn-scoped answer.
+					text = bound.lastAssistantText;
+				}
 				if (text === undefined) {
-					// Tail-less reconcile: only accept an assistant row produced by THIS
-					// operation. The runtime's own startedAt is exact; when it is absent
-					// the fallback is dispatched_at, stamped at the batch's first bind
-					// BEFORE the send and cleared on requeue, so it can neither postdate
-					// the answer (accepted_at could) nor predate the previous turn's
-					// answer (the settle cutoff could, on the failed-steer backlog path).
-					const startedAt = report.status.startedAt;
-					const dispatchedAt = this.#manager.database.inboundBatchDispatchedAt(bound.batch.batchKey);
-					const dispatchedMs = dispatchedAt ? Date.parse(dispatchedAt) : Number.NaN;
-					const notBeforeMs =
-						typeof startedAt === "number" ? startedAt : Number.isFinite(dispatchedMs) ? dispatchedMs : undefined;
-					const port = this.#manager.port;
-					if (notBeforeMs === undefined || !port.fetchAssistantSince) {
+					if (notBeforeMs === undefined) {
 						// No trustworthy floor (a pre-v18 batch already bound before the
-						// upgrade, on a runtime that omits startedAt). Completing with ""
-						// would discard a real answer; posting the unbounded last row
-						// could repost the previous turn. Hold for the operator instead.
+						// upgrade, on a runtime that omits startedAt) and no tail text.
+						// Completing with "" would discard a real answer; posting the
+						// unbounded last row could repost the previous turn. Hold for
+						// the operator instead.
 						bound.nonSteerable = true;
 						this.#manager.log(
 							`recovery_hold origin=${this.originKey} epoch=${bound.epoch} opRef=${bound.batch.opRef} reason=no_turn_floor`,
 						);
 						return;
 					}
-					const since = await port.fetchAssistantSince({
-						sessionId: bound.sessionId,
-						repo: this.#manager.repo,
-						notBeforeMs,
-					});
-					if (since === undefined)
-						this.#manager.log(
-							`terminal_text_unavailable origin=${this.originKey} epoch=${bound.epoch} opRef=${bound.batch.opRef} reason=no_assistant_row_since_start`,
-						);
-					text = since?.text ?? "";
+					this.#manager.log(
+						`terminal_text_unavailable origin=${this.originKey} epoch=${bound.epoch} opRef=${bound.batch.opRef} reason=no_assistant_row_since_start`,
+					);
+					text = "";
 				}
 				await bound.lifecycle.onTerminal?.({ ...bound, text, status: report });
 			} else if (!bound.retired) {
@@ -1455,6 +1502,25 @@ class OriginActor {
 		const timer = this.#retiredReattachTimers.get(key);
 		if (timer !== undefined) this.#manager.cancel(timer);
 		this.#retiredReattachTimers.delete(key);
+	}
+
+	#dispatchFloorMs(batchKey: string): number | undefined {
+		const dispatchedAt = this.#manager.database.inboundBatchDispatchedAt(batchKey);
+		const at = dispatchedAt ? Date.parse(dispatchedAt) : Number.NaN;
+		return Number.isFinite(at) ? at : undefined;
+	}
+
+	/**
+	 * An un-attributed transcript row stamped before this turn's dispatch floor
+	 * is history replayed by a cursorless resync, not this turn's output. A
+	 * frame attributed to the accepted op is always this turn's, and a frame
+	 * with no host timestamp (live lifecycle frames) cannot be judged and passes.
+	 */
+	#predatesTurn(bound: BoundTurn, frame: TailFrame): boolean {
+		if (bound.dispatchedAtMs === undefined) return false;
+		if (tailOperationRef(frame) === bound.batch.opRef) return false;
+		const at = tailFrameTimestampMs(frame);
+		return at !== undefined && at + TURN_FLOOR_SKEW_MS < bound.dispatchedAtMs;
 	}
 
 	#findBound(sessionId: string, epoch: number, brokerGeneration: number): BoundTurn | undefined {
