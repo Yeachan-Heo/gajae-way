@@ -639,18 +639,6 @@ export class GatewayDatabase {
 		);
 	}
 
-	/** Re-points a bound-but-unsent turn at a replacement session; never for an accepted op. */
-	inboundTurnRebindSession(opRef: string, sessionId: string): boolean {
-		if (!sessionId) throw new Error("turn session id must not be empty");
-		return (
-			this.#database
-				.query(
-					"UPDATE inbound_messages SET bound_session_id = ? WHERE turn_op_ref = ? AND turn_role = 'trigger' AND state = 'pending' AND turn_state = 'bound'",
-				)
-				.run(sessionId, opRef).changes > 0
-		);
-	}
-
 	/** The turn's pre-send dispatch stamp. */
 	inboundTurnDispatchedAt(opRef: string): string | undefined {
 		return (

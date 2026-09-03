@@ -34,7 +34,7 @@ const MAX_SEND_REBIND_ATTEMPTS = 3;
 const RETIRED_REATTACH_DELAY_MS = 25;
 const RETIRED_REATTACH_MAX_ATTEMPTS = 3;
 /**
- * Grace before a decidable-terminal status may complete a batch whose tail has
+ * Grace before a decidable-terminal status may complete a turn whose tail has
  * not produced terminal evidence. One bounded hold keeps the tail the live
  * authority; after the grace the evidence is treated as genuinely unavailable
  * (post-crash ring loss) and status — the subsession reconcile authority —
@@ -352,7 +352,7 @@ type BoundTurn = PersonaTurnIdentity & {
 	/**
 	 * A retired turn whose answer the user still wants: the session was replaced
 	 * under it (steer failure), not reset by the user (`/new`). Its output is
-	 * delivered and its terminal completes the batch like a current turn.
+	 * delivered and its terminal completes the turn like a current one.
 	 */
 	answerWanted: boolean;
 	tailEvidenceUnavailable: boolean;
@@ -992,7 +992,7 @@ class OriginActor {
 	 *
 	 * A `nonSteerable` flag used to gate this. It was set by seven reconcile
 	 * paths that could not decide what happened to the OPERATION - a statement
-	 * about completing the batch, never about whether the user may speak. Gating
+	 * about completing the turn, never about whether the user may speak. Gating
 	 * ingestion on it meant one undecidable turn silenced the conversation: the
 	 * rows stayed unbatched, the stale floor deleted them ten minutes later, and
 	 * the user's messages were gone without ever reaching the model (live: four
@@ -1213,11 +1213,6 @@ class OriginActor {
 		}
 	}
 
-	async #reconcileByTuple(sessionId: string, epoch: number, generation: number): Promise<void> {
-		const bound = this.#findBound(sessionId, epoch, generation);
-		if (bound) await this.#reconcileBound(bound);
-	}
-
 	async #reconcileBound(bound: BoundTurn): Promise<void> {
 		let report: StatusReport;
 		try {
@@ -1228,7 +1223,7 @@ class OriginActor {
 			});
 		} catch (error) {
 			// The broker disowning the id (session_unavailable) with the session
-			// provably not live means nothing is running there: release the batch
+			// provably not live means nothing is running there: release the turn
 			// and rebind instead of holding an adopted turn forever.
 			if (sdkStatusErrorCode(error) === "session_unavailable" && !bound.retired) {
 				const raw = this.#manager.port.liveness
@@ -1279,7 +1274,7 @@ class OriginActor {
 			// attached tail a bounded grace to deliver the evidence. If it still
 			// has not by the next reconcile, the tail evidence is genuinely
 			// unavailable (post-crash ring loss) and status — the subsession
-			// reconcile authority — completes the batch below, corroborated by an
+			// reconcile authority — completes the turn below, corroborated by an
 			// explicit log line instead of a silent shortcut.
 			bound.statusTerminalHolds += 1;
 			this.#manager.log(
@@ -1329,10 +1324,9 @@ class OriginActor {
 				// fenced; the durable row produced at/after this turn's floor is what
 				// the model actually said for THIS trigger. The runtime's own
 				// startedAt is exact; when it is absent the fallback is dispatched_at,
-				// stamped at the batch's first bind BEFORE the send and cleared on
-				// requeue, so it can neither postdate the answer (accepted_at could)
-				// nor predate the previous turn's answer (the settle cutoff could, on
-				// the failed-steer backlog path).
+				// stamped at the turn's bind BEFORE the send and cleared on
+				// requeue, so it can neither postdate the answer
+				// nor predate the previous turn's answer.
 				const startedAt = report.status.startedAt;
 				const notBeforeMs = typeof startedAt === "number" ? startedAt : bound.dispatchedAtMs;
 				const port = this.#manager.port;
@@ -1539,7 +1533,9 @@ export function personaTurnOpRef(
 		.update(`${instanceId}|${originKey}|${epoch}|${triggerMessageId}|${retryAttempt}`)
 		.digest("hex")
 		.slice(0, 32);
-	return `gw-p-${digest}`;
+	const opRef = `gw-p-${digest}`;
+	assertValidOpRef(opRef);
+	return opRef;
 }
 
 function describeModel(selection: GjcModelSelection | undefined): string {
@@ -1573,11 +1569,5 @@ function retiredKey(bound: Pick<BoundTurn, "epoch" | "turn">): string {
 function positiveInteger(value: number | undefined, fallback: number, name: string): number {
 	const result = value ?? fallback;
 	if (!Number.isSafeInteger(result) || result <= 0) throw new Error(`${name} must be a positive integer`);
-	return result;
-}
-
-function nonNegativeInteger(value: number | undefined, fallback: number, name: string): number {
-	const result = value ?? fallback;
-	if (!Number.isSafeInteger(result) || result < 0) throw new Error(`${name} must be a non-negative integer`);
 	return result;
 }
