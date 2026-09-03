@@ -7,8 +7,8 @@
  "command": "bun test packages/gateway packages/adapter-discord packages/adapter-telegram packages/protocol packages/subsession packages/conformance --reporter=junit --reporter-outfile=artifacts/ultragoal-test-report.junit.xml",
  "junit": "artifacts/ultragoal-test-report.junit.xml",
  "totals": {
-  "tests": 1217,
-  "passed": 1214,
+  "tests": 1216,
+  "passed": 1213,
   "failed": 0,
   "skipped": 3
  },
