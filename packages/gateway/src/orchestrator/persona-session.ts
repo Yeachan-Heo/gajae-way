@@ -996,11 +996,16 @@ class OriginActor {
 			this.#state = "idle";
 			this.#preSendFailures += 1;
 			const failures = this.#preSendFailures;
+			const sessionGone = sdkStatusErrorCode(error) === "session_unavailable";
+			const nextEpoch = sessionGone ? this.#manager.database.rebindEpoch(this.originKey) : undefined;
 			this.#manager.log(
-				`persona_model_failed origin=${this.originKey} epoch=${epoch} session=${binding.sessionId} message=${trigger.message_id} attempt=${attempt} failures=${failures} selection=${modelKey} detail=${safeDiagnostic(error)}`,
+				`persona_model_failed origin=${this.originKey} epoch=${epoch}${nextEpoch === undefined ? "" : ` nextEpoch=${nextEpoch}`} session=${binding.sessionId} message=${trigger.message_id} attempt=${attempt} failures=${failures} selection=${modelKey} detail=${safeDiagnostic(error)}`,
 			);
+			if (sessionGone) this.#preSendFailures = 0;
 			this.#scheduleDispatchRetry(
-				Math.min(DISPATCH_FAILURE_RETRY_MAX_MS, DISPATCH_FAILURE_RETRY_MS * 2 ** Math.min(failures - 1, 10)),
+				sessionGone
+					? DISPATCH_FAILURE_RETRY_MS
+					: Math.min(DISPATCH_FAILURE_RETRY_MAX_MS, DISPATCH_FAILURE_RETRY_MS * 2 ** Math.min(failures - 1, 10)),
 			);
 			return;
 		}

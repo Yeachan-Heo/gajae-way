@@ -2,7 +2,7 @@ import { afterEach, expect, test } from "bun:test";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import type { BrokerSession, StatusReport } from "@gajaeway/subsession";
+import { type BrokerSession, GjcCliError, type StatusReport } from "@gajaeway/subsession";
 import { PersonaSessionManager, personaTurnOpRef } from "../src/orchestrator/persona-session";
 import { GatewayDatabase } from "../src/store/db";
 import { ScriptedSessionPort } from "./session-port.fake";
@@ -567,5 +567,76 @@ test("model.set failure happens before send: the row returns to pending and retr
 	expect(port.modelAttempts).toBe(2);
 	expect(port.sends[0]!.text).toBe("do not strand me behind model.set");
 	await eventually(() => terminal.length === 1, "model-recovered turn did not complete");
+	expect(database.inboundPendingCount(KEY)).toBe(0);
+});
+
+class ModelSetSessionGonePort extends ScriptedSessionPort {
+	modelAttempts = 0;
+
+	constructor() {
+		super({
+			onBind: (input) => `session-${input.epoch}`,
+			onSend: (input, scripted) => scripted.complete(input.opRef, "fresh session model recovered"),
+		});
+	}
+
+	async setModel(input: Parameters<ScriptedSessionPort["setModel"]>[0]) {
+		this.modelAttempts++;
+		if (this.modelAttempts === 1)
+			throw new GjcCliError("gjc sdk model.set reported failure: session_unavailable", 0, "", {
+				code: "session_unavailable",
+				message: `SDK session ${input.sessionId} is unavailable through the session Router.`,
+			});
+		return await super.setModel(input);
+	}
+}
+
+test("model.set session_unavailable rotates the epoch immediately before retrying the still-pending row", async () => {
+	home = await mkdtemp(join(tmpdir(), "gajaeway-session-restart-"));
+	database = await GatewayDatabase.open(join(home, "gateway.db"));
+	const port = new ModelSetSessionGonePort();
+	const logs: string[] = [];
+	const terminal: string[] = [];
+	const timers: Array<{ readonly work: () => void; readonly delayMs: number }> = [];
+	manager = new PersonaSessionManager({
+		database,
+		port,
+		instanceId: "restart-test",
+		repo: join(home, "workspace"),
+		setTimeout: (work, delayMs) => {
+			const timer = { work, delayMs };
+			timers.push(timer);
+			return timer;
+		},
+		clearTimeout: () => {},
+		onTurnStart: ({ trigger }) => ({
+			text: trigger.body,
+			effectiveModel: "openai/gpt-5.6-sol",
+			onTerminal: ({ text }) => {
+				terminal.push(text);
+			},
+		}),
+		log: (line) => logs.push(line),
+	});
+	enqueue("model-session-gone", "retry me on a fresh session");
+	await manager.notifyInbound(KEY);
+	expect(port.binds.map((bind) => bind.epoch)).toEqual([0]);
+	expect(port.sendAttempts).toEqual([]);
+	expect(database.getSessionRecord(KEY)?.epoch).toBe(1);
+	expect(database.inboundPendingOldest(KEY)).toMatchObject({ message_id: "model-session-gone", turn_state: null });
+	expect(timers.map((timer) => timer.delayMs)).toEqual([2_000]);
+	expect(
+		logs.some(
+			(line) =>
+				line.startsWith(`persona_model_failed origin=${KEY} epoch=0 nextEpoch=1`) &&
+				line.includes("session_unavailable"),
+		),
+	).toBe(true);
+
+	timers[0]!.work();
+	await eventually(() => port.sends.length === 1, "fresh session did not receive the prompt");
+	expect(port.binds.map((bind) => bind.epoch)).toEqual([0, 1]);
+	expect(port.sends[0]!.text).toBe("retry me on a fresh session");
+	await eventually(() => terminal.length === 1, "fresh session turn did not complete");
 	expect(database.inboundPendingCount(KEY)).toBe(0);
 });
