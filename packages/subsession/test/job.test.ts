@@ -98,6 +98,14 @@ describe("op projection: error.code surfaces and deadline kills are attempt_ende
 		).toBe("failed");
 	});
 
+	test("an ordinary failed op holds the job instead of entering the deadline continuation path", () => {
+		for (const status of [
+			{ status: "failed" as const },
+			{ status: "failed" as const, error: { code: "provider_overloaded" } },
+		])
+			expect(projectAttemptOutcome({ status }).state).toBe("awaiting_operator");
+	});
+
 	test("terminal_uncertain still lands in awaiting_operator - no papering over", () => {
 		const uncertain = projectAttemptOutcome({ status: { status: "unknown", receiptState: "unknown" } });
 		expect(uncertain.state).toBe("awaiting_operator");
@@ -324,6 +332,22 @@ describe("attempts: duplicate prevention and one deterministic continuation path
 		expect(current.attempts[0].errorCode).toBe("prompt_deadline_exceeded");
 		expect(current.attempts[0].endedAt).toBeDefined();
 		expect(current.state).toBe("attempt_ended");
+	});
+
+	test("closeAttempt keeps an ordinary failure on operator hold and continuation cannot resume it", () => {
+		let current = appendAttempt(record(), attempt());
+		current = closeAttempt({
+			record: current,
+			opRef: attempt().opRef,
+			endState: "failed",
+			errorCode: "provider_overloaded",
+			endedAt: NOW.toISOString(),
+		});
+		expect(current.state).toBe("awaiting_operator");
+		expect(current.attempts[0]?.endState).toBe("failed");
+		expect(planContinuation(planInput({ record: current, latestAttempt: current.attempts[0] })).action).toBe(
+			"hold_for_operator",
+		);
 	});
 
 	test("closeAttempt rejects double-close and unknown attempts", () => {
