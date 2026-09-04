@@ -728,11 +728,28 @@ export class BrokerSessionPort implements SessionPort {
 					});
 		tail?.setTurnRunning(true);
 		try {
-			const receipt = await this.send(input);
-			tail?.markAccepted(input.opRef);
+			let receipt: SendReceipt;
+			let status: StatusReport | undefined;
+			try {
+				receipt = await this.send(input);
+				tail?.markAccepted(input.opRef);
+			} catch (sendError) {
+				// A transport/control failure may occur after the runtime accepted the
+				// prompt. Query the SAME clientRef before retrying; monitor authoring
+				// otherwise ran the event, produced a final answer, then executed it
+				// again because the torn send was treated as definitive failure.
+				try {
+					status = await this.status({ sessionId: input.sessionId, repo: input.repo, opRef: input.opRef });
+				} catch {
+					throw sendError;
+				}
+				if (status.status.status === "unknown") throw sendError;
+				receipt = { sessionId: input.sessionId, operationRef: input.opRef } as SendReceipt;
+				tail?.markAccepted(input.opRef);
+			}
 			const deadline = this.#now() + (input.waitTimeoutMs ?? DEFAULT_REQUEST_WAIT_MS);
 			const pollMs = input.pollMs ?? DEFAULT_STATUS_POLL_MS;
-			let status = await this.status({ sessionId: input.sessionId, repo: input.repo, opRef: input.opRef });
+			status ??= await this.status({ sessionId: input.sessionId, repo: input.repo, opRef: input.opRef });
 			while (!isTerminalStatus(status.status.status) && this.#now() < deadline) {
 				this.checkStalls();
 				await this.#sleep(pollMs);
