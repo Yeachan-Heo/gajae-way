@@ -51,7 +51,7 @@ export interface SessionPort {
 		sessionId: string;
 		repo: string;
 		tier: GjcServiceTier;
-	}): Promise<{ readonly tier: GjcServiceTier }>;
+	}): Promise<{ readonly changed: boolean }>;
 	status(input: { sessionId: string; repo: string; opRef: string }): Promise<StatusReport>;
 	fetchLastAssistant(input: { sessionId: string; repo: string }): Promise<LastAssistantResult>;
 	/**
@@ -464,8 +464,8 @@ export class BrokerSessionPort implements SessionPort {
 		sessionId: string;
 		repo: string;
 		tier: GjcServiceTier;
-	}): Promise<{ readonly tier: GjcServiceTier }> {
-		const result = parseEnvelope<{ tier?: unknown }>(
+	}): Promise<{ readonly changed: boolean }> {
+		const result = parseEnvelope<{ changed?: unknown }>(
 			await this.#cli([
 				"sdk",
 				"session",
@@ -479,8 +479,8 @@ export class BrokerSessionPort implements SessionPort {
 			]),
 			"service_tier.set",
 		);
-		if (result.tier !== input.tier) throw new Error("service_tier.set succeeded without the requested tier receipt");
-		return { tier: input.tier };
+		if (typeof result.changed !== "boolean") throw new Error("service_tier.set succeeded without a changed receipt");
+		return { changed: result.changed };
 	}
 
 	async status(input: { sessionId: string; repo: string; opRef: string }): Promise<StatusReport> {

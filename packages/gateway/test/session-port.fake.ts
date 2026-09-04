@@ -138,9 +138,9 @@ export class ScriptedSessionPort implements SessionPort {
 		sessionId: string;
 		repo: string;
 		tier: GjcServiceTier;
-	}): Promise<{ readonly tier: GjcServiceTier }> {
+	}): Promise<{ readonly changed: boolean }> {
 		this.serviceTiers.push(input);
-		return { tier: input.tier };
+		return { changed: true };
 	}
 
 	/** When set, status omits startedAt (older gjc reports), exercising the batch acceptedAt floor. */
