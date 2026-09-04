@@ -5,7 +5,7 @@ import {
 	type SendReceipt,
 	type StatusReport,
 } from "@gajaeway/subsession";
-import type { GjcModelSelection } from "../src/config";
+import type { GjcModelSelection, GjcServiceTier } from "../src/config";
 import type {
 	SessionBindInput,
 	SessionBinding,
@@ -33,6 +33,7 @@ export class ScriptedSessionPort implements SessionPort {
 	readonly resumes: Array<{ sessionId: string; repo: string; originKey: string; epoch: number }> = [];
 	readonly inspections: Array<{ sessionId: string; repo: string }> = [];
 	readonly models: Array<{ sessionId: string; repo: string; selection: GjcModelSelection }> = [];
+	readonly serviceTiers: Array<{ sessionId: string; repo: string; tier: GjcServiceTier }> = [];
 	readonly #sessions = new Map<string, string>();
 	readonly #sessionStates = new Map<string, BrokerSession>();
 	readonly #resumeFailures = new Map<string, Error>();
@@ -124,6 +125,15 @@ export class ScriptedSessionPort implements SessionPort {
 	}): Promise<{ readonly changed: boolean }> {
 		this.models.push(input);
 		return { changed: true };
+	}
+
+	async setServiceTier(input: {
+		sessionId: string;
+		repo: string;
+		tier: GjcServiceTier;
+	}): Promise<{ readonly tier: GjcServiceTier }> {
+		this.serviceTiers.push(input);
+		return { tier: input.tier };
 	}
 
 	/** When set, status omits startedAt (older gjc reports), exercising the batch acceptedAt floor. */

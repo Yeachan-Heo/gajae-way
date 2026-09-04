@@ -19,7 +19,7 @@ import {
 	sendPrompt,
 	TranscriptIncompleteError,
 } from "@gajaeway/subsession";
-import type { GjcModelSelection } from "../config";
+import type { GjcModelSelection, GjcServiceTier } from "../config";
 import type { GatewayDatabase } from "../store/db";
 import { sanitizeDiagnostic } from "./rebind";
 import type { TailAttachInput, TailHandle, TailRunner } from "./tail-runner";
@@ -47,6 +47,11 @@ export interface SessionPort {
 		repo: string;
 		selection: GjcModelSelection;
 	}): Promise<{ readonly changed: boolean }>;
+	setServiceTier(input: {
+		sessionId: string;
+		repo: string;
+		tier: GjcServiceTier;
+	}): Promise<{ readonly tier: GjcServiceTier }>;
 	status(input: { sessionId: string; repo: string; opRef: string }): Promise<StatusReport>;
 	fetchLastAssistant(input: { sessionId: string; repo: string }): Promise<LastAssistantResult>;
 	/**
@@ -432,6 +437,29 @@ export class BrokerSessionPort implements SessionPort {
 		);
 		if (typeof result.changed !== "boolean") throw new Error("model.set succeeded without a changed receipt");
 		return { changed: result.changed };
+	}
+
+	async setServiceTier(input: {
+		sessionId: string;
+		repo: string;
+		tier: GjcServiceTier;
+	}): Promise<{ readonly tier: GjcServiceTier }> {
+		const result = parseEnvelope<{ tier?: unknown }>(
+			await this.#cli([
+				"sdk",
+				"session",
+				"raw",
+				"control",
+				input.sessionId,
+				"--op",
+				"service_tier.set",
+				"--json-input",
+				JSON.stringify({ tier: input.tier }),
+			]),
+			"service_tier.set",
+		);
+		if (result.tier !== input.tier) throw new Error("service_tier.set succeeded without the requested tier receipt");
+		return { tier: input.tier };
 	}
 
 	async status(input: { sessionId: string; repo: string; opRef: string }): Promise<StatusReport> {

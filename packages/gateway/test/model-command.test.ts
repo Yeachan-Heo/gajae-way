@@ -153,6 +153,7 @@ test("/model live-rebind keeps the session transcript and applies the new model 
 		dbPath: join(home, "gateway.db"),
 		logVerbosity: "info",
 		model: { preset: "base" },
+		serviceTier: "priority",
 	};
 	const database = await GatewayDatabase.open(config.dbPath);
 	const port = new ScriptedSessionPort();
@@ -176,6 +177,9 @@ test("/model live-rebind keeps the session transcript and applies the new model 
 		});
 		await waitFor(() => port.sends.length === 1, "first persistent turn did not start");
 		const first = port.sends[0]!;
+		expect(port.serviceTiers).toEqual([
+			{ sessionId: first.sessionId, repo: join(home, "workspace"), tier: "priority" },
+		]);
 		port.complete(first.opRef, "first transcript");
 		await waitFor(
 			() => port.transcript(first.sessionId).includes("first transcript"),
@@ -221,6 +225,7 @@ test("/model live-rebind keeps the session transcript and applies the new model 
 		expect(second.sessionId).toBe(first.sessionId);
 		expect(second.model).toBeUndefined();
 		expect(port.models.at(-1)).toMatchObject({ sessionId: first.sessionId, selection: { preset: "next" } });
+		expect(port.serviceTiers).toHaveLength(1);
 		port.complete(second.opRef, "second transcript");
 		client.send({
 			v: "0.1",

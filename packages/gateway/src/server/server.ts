@@ -1977,6 +1977,7 @@ async function createInboundTurnLifecycle(
 		text: turnText,
 		systemPreamble,
 		...(effectiveModel ? { effectiveModel } : {}),
+		...(runtime.config.serviceTier ? { effectiveServiceTier: runtime.config.serviceTier } : {}),
 		renderSteer,
 		steerContextMessageId,
 		onSteerAccepted,

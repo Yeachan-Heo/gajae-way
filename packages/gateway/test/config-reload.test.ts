@@ -87,6 +87,8 @@ test("model accepts an explicit selector or a preset", () => {
 	expect(() => parseConfigFile({ schemaVersion: 1, model: { preset: "reliable", extra: true } })).toThrow(
 		"contain only preset",
 	);
+	expect(parseConfigFile({ schemaVersion: 1, serviceTier: "priority" }).serviceTier).toBe("priority");
+	expect(() => parseConfigFile({ schemaVersion: 1, serviceTier: "fast" })).toThrow("serviceTier must be one of");
 	expect(() => parseConfigFile({ schemaVersion: 1, model: ["one", "two"] })).toThrow("model must be an object");
 });
 

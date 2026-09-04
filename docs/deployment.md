@@ -72,7 +72,7 @@ A running gateway re-reads `config.json` on `SIGHUP` (`kill -HUP <pid>`) or on t
 The reload is fail-safe and reports exactly what it did:
 
 - `changed` — fields applied live. `mentionAllowlist`, `channels`, and `stallTimeoutMs` are re-read at runtime; a change takes effect on the next actor event.
-- `restartRequired` — fields you edited that are bound to a startup resource (`socketPath`, `dbPath`, `model`, `credentials`, `webhook`, `watcherRoots`, `scriptRoot`, `ownerTarget`, `monitorContextFailureRollThreshold`). They are reported and deliberately NOT applied; restart to pick them up.
+- `restartRequired` — fields you edited that are bound to a startup resource (`socketPath`, `dbPath`, `model`, `serviceTier`, `credentials`, `webhook`, `watcherRoots`, `scriptRoot`, `ownerTarget`, `monitorContextFailureRollThreshold`). They are reported and deliberately NOT applied; restart to pick them up.
 - `ignored` — fields you edited that no code reads at all. `logVerbosity` is currently parsed but unconsumed, so editing it has no effect and no restart would give it one.
 - On a parse or validation error, or when `config.json` is missing or unreadable, the reload fails, keeps the previous configuration untouched, and returns a diagnostic. A missing file never publishes defaults over live policy, because that would drop the mention allowlist and open a mention-gated room.
 
@@ -140,6 +140,7 @@ Restart with the service manager's own verbs - `launchctl kickstart -k gui/$(id 
 
 - **Socket missing:** verify the gateway service, configured socket path, parent permissions, and service log.
 - **Every turn fails with an API error:** confirm `gjc` is on the service `PATH` and its model-key environment variables are present. If the log says a model was not found, use an explicit selector (`"model": "provider/model"`) or activate a gjc profile (`"model": { "preset": "profile-name" }`); profile default-role arrays retain gjc's native fallback-chain handling. A poisoned conversation session can be rebound with `/new`.
+  Fast/priority processing is independent of the model selector: set `"serviceTier": "priority"` in gateway `config.json`. The gateway applies GJC `service_tier.set` once per persona session before its first prompt (OpenAI `service_tier=priority`; Anthropic fast speed where supported). Use `"model": { "preset": "gpt-heavy" }` to pin the model profile separately.
 - **launchd hangs:** move the working directory, state, `gjc`, and symlink targets out of TCC-protected paths; then send `/new` to sessions created under the old location.
 - **Webhook or monitor failure:** verify the gateway configuration and use `gajaeway monitors inspect <monitor-id>`.
 - **Recovery or restore:** use the [operator runbook](runbooks/gajaeway-v1.md), especially its backup, restore, crash-recovery, and schema guidance.

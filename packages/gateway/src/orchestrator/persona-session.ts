@@ -12,7 +12,7 @@ import {
 	projectOpState,
 	type StatusReport,
 } from "@gajaeway/subsession";
-import type { GjcModelSelection } from "../config";
+import type { GjcModelSelection, GjcServiceTier } from "../config";
 import type { GatewayDatabase, InboundMessageRow, InboundTurn } from "../store/db";
 import { sanitizeDiagnostic } from "./rebind";
 import type { SessionBinding, SessionPort } from "./session-port";
@@ -68,6 +68,8 @@ export interface PersonaTurnLifecycle {
 	readonly systemPreamble?: string;
 	/** The selection applied by `model.set` before this session's first send. */
 	readonly effectiveModel?: GjcModelSelection;
+	/** GJC request tier; `priority` enables provider fast mode where supported. */
+	readonly effectiveServiceTier?: GjcServiceTier;
 	/** Legacy/send-time fallback only; persistent persona turns leave this unset. */
 	readonly sendModelFallback?: GjcModelSelection;
 	/**
@@ -434,6 +436,7 @@ class OriginActor {
 	readonly #retiredReattachTimers = new Map<string, unknown>();
 	readonly #graceTimers = new Set<unknown>();
 	readonly #appliedModel = new Map<string, string>();
+	readonly #appliedServiceTier = new Map<string, GjcServiceTier>();
 	#stopped = false;
 	readonly #deliveredEvents = new Set<string>();
 	#recoveryScanned = false;
@@ -985,10 +988,25 @@ class OriginActor {
 						})
 					: undefined;
 			if (lifecycle.effectiveModel) this.#appliedModel.set(binding.sessionId, modelKey);
+			if (
+				lifecycle.effectiveServiceTier &&
+				this.#appliedServiceTier.get(binding.sessionId) !== lifecycle.effectiveServiceTier
+			) {
+				await this.#manager.port.setServiceTier({
+					sessionId: binding.sessionId,
+					repo: this.#manager.repo,
+					tier: lifecycle.effectiveServiceTier,
+				});
+				this.#appliedServiceTier.set(binding.sessionId, lifecycle.effectiveServiceTier);
+			}
 			this.#preSendFailures = 0;
 			this.#manager.log(
 				`persona_model origin=${this.originKey} epoch=${epoch} session=${binding.sessionId} effective=${modelKey} changed=${modelReceipt?.changed ?? false} source=turn`,
 			);
+			if (lifecycle.effectiveServiceTier)
+				this.#manager.log(
+					`persona_service_tier origin=${this.originKey} epoch=${epoch} session=${binding.sessionId} tier=${lifecycle.effectiveServiceTier} source=turn`,
+				);
 		} catch (error) {
 			await tail.close();
 			const attempt = this.#manager.database.inboundTurnRequeue(opRef);

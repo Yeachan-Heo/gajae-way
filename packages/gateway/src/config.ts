@@ -10,6 +10,26 @@ export interface CredentialFileReference {
 }
 
 export type GjcModelSelection = string | { readonly preset: string };
+export type GjcServiceTier =
+	| "none"
+	| "auto"
+	| "default"
+	| "flex"
+	| "scale"
+	| "priority"
+	| "openai-only"
+	| "claude-only";
+
+const GJC_SERVICE_TIERS: readonly GjcServiceTier[] = [
+	"none",
+	"auto",
+	"default",
+	"flex",
+	"scale",
+	"priority",
+	"openai-only",
+	"claude-only",
+];
 
 export interface GatewayConfigFile {
 	readonly schemaVersion: typeof CONFIG_SCHEMA_VERSION;
@@ -18,6 +38,8 @@ export interface GatewayConfigFile {
 	readonly dbPath?: string;
 	/** Explicit gjc model selector, or a model profile preset whose default role may contain a fallback chain. */
 	readonly model?: GjcModelSelection;
+	/** Processing tier applied to every gateway persona session; `priority` is GJC fast mode. */
+	readonly serviceTier?: GjcServiceTier;
 	readonly credentials?: Readonly<Record<string, CredentialFileReference>>;
 	readonly channels?: Readonly<Record<string, ChannelPolicy>>;
 	/** Tail liveness alarm threshold in milliseconds. It never kills a running turn. */
@@ -150,6 +172,13 @@ function parseModel(value: unknown): GjcModelSelection | undefined {
 		throw new ConfigError("config_invalid", "model must be a non-empty string or contain only preset");
 	}
 	return { preset };
+}
+
+function parseServiceTier(value: unknown): GjcServiceTier | undefined {
+	if (value === undefined) return undefined;
+	if (typeof value !== "string" || !GJC_SERVICE_TIERS.includes(value as GjcServiceTier))
+		throw new ConfigError("config_invalid", `serviceTier must be one of ${GJC_SERVICE_TIERS.join(", ")}`);
+	return value as GjcServiceTier;
 }
 
 function parseCredentials(value: unknown): Readonly<Record<string, CredentialFileReference>> | undefined {
@@ -285,6 +314,7 @@ export function parseConfigFile(value: unknown): GatewayConfigFile {
 		);
 	}
 	const model = parseModel(input.model);
+	const serviceTier = parseServiceTier(input.serviceTier);
 	return {
 		schemaVersion: CONFIG_SCHEMA_VERSION,
 		...(logVerbosity ? { logVerbosity: logVerbosity as GatewayConfigFile["logVerbosity"] } : {}),
@@ -302,6 +332,7 @@ export function parseConfigFile(value: unknown): GatewayConfigFile {
 			: { mentionAllowlist: parseStringArray(input.mentionAllowlist, "mentionAllowlist") }),
 		...(input.stallTimeoutMs === undefined ? {} : { stallTimeoutMs: parseStallTimeout(input.stallTimeoutMs) }),
 		...(model ? { model } : {}),
+		...(serviceTier ? { serviceTier } : {}),
 		...(input.dmPolicy === undefined ? {} : { dmPolicy: parseDmPolicy(input.dmPolicy) }),
 		...(input.ownerTarget === undefined ? {} : { ownerTarget: parseOwnerTarget(input.ownerTarget) }),
 		...(input.monitorContextFailureRollThreshold === undefined
@@ -417,6 +448,7 @@ export const RESTART_REQUIRED_FIELDS = [
 	"socketPath",
 	"dbPath",
 	"model",
+	"serviceTier",
 	"credentials",
 	"webhook",
 	"watcherRoots",
