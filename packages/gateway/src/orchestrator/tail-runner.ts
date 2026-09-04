@@ -14,6 +14,7 @@ export const OBSERVED_TAIL_KINDS = [
 	"activity",
 	"query_response",
 	"tool_activity",
+	"turn_stream",
 ] as const;
 
 const OBSERVED_TAIL_KIND_SET = new Set<string>(OBSERVED_TAIL_KINDS);
@@ -767,7 +768,16 @@ function normalizeTailFrame(value: unknown): readonly TailFrame[] {
 			: generation !== undefined && seq !== undefined
 				? `${generation}:${seq}`
 				: undefined;
-	const text = rawKind === "transcript" && payload.role === "assistant" ? contentText(payload.content) : undefined;
+	const transcriptText =
+		rawKind === "transcript" && payload.role === "assistant" ? contentText(payload.content) : undefined;
+	// Current GJC hosts emit the live/final assistant channel as turn_stream.
+	// Only the explicit finalized final-answer frame is chat output: live drafts
+	// and reasoning summaries are progress, never deliverable text.
+	const finalizedTurnText =
+		rawKind === "turn_stream" && payload.phase === "finalized" && payload.finalAnswer === true
+			? contentText(payload.text)
+			: undefined;
+	const text = transcriptText ?? finalizedTurnText;
 	const clientRef =
 		typeof payload.clientRef === "string"
 			? payload.clientRef
