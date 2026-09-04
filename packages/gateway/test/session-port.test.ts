@@ -26,7 +26,7 @@ test("broker SessionPort preserves caller op-ref, model choice, bootstrap prompt
 		if (args.includes("session.create"))
 			return { exitCode: 0, stdout: JSON.stringify({ ok: true, result: { sessionId: "sdk-1" } }), stderr: "" };
 		if (args.includes("model.profile.set"))
-			return { exitCode: 0, stdout: JSON.stringify({ ok: true, result: true }), stderr: "" };
+			return { exitCode: 0, stdout: JSON.stringify({ ok: true, result: false }), stderr: "" };
 		if (args.includes("model.set"))
 			return { exitCode: 0, stdout: JSON.stringify({ ok: true, result: { changed: true } }), stderr: "" };
 		if (args.includes("send"))
@@ -74,7 +74,12 @@ test("broker SessionPort preserves caller op-ref, model choice, bootstrap prompt
 		codingRegister: true,
 		model: { preset: "gpt-heavy" },
 	});
-	await port.setModel({ sessionId: binding.sessionId, repo: "/tmp/repo", selection: { preset: "gpt-heavy" } });
+	const profileReceipt = await port.setModel({
+		sessionId: binding.sessionId,
+		repo: "/tmp/repo",
+		selection: { preset: "gpt-heavy" },
+	});
+	expect(profileReceipt).toEqual({ changed: false });
 	const result = await port.request({
 		sessionId: binding.sessionId,
 		repo: "/tmp/repo",

@@ -462,8 +462,8 @@ export class BrokerSessionPort implements SessionPort {
 				]),
 				"model.profile.set",
 			);
-			if (activated !== true) throw new Error("model.profile.set succeeded without activating the requested preset");
-			return { changed: true };
+			if (typeof activated !== "boolean") throw new Error("model.profile.set succeeded without an activation receipt");
+			return { changed: activated };
 		}
 		const result = parseEnvelope<{ changed?: unknown }>(
 			await this.#cli([
