@@ -446,4 +446,28 @@ describe("session bootstrap builder", () => {
 		).toBe(true);
 		expect(result.text).not.toContain("�");
 	});
+
+	test("recent memory outranks larger recoverable sections within the fixed byte budget", async () => {
+		const config = await setup();
+		await writeFile(
+			join(home, "memory", "channels", "current.md"),
+			`origin: discord/channel/c1\nbootstrap-safe: public\nCHANNEL BULK ${"x".repeat(6_000)}`,
+		);
+		await mkdir(join(home, "memory", "daily", "2026-08"), { recursive: true });
+		await writeFile(
+			join(home, "memory", "daily", "2026-08", "2026-08-28.md"),
+			Array.from(
+				{ length: 100 },
+				(_, index) => `## entry-${index}\n- origin: discord/channel/c1\n- user: RECENT ${index} ${"y".repeat(80)}`,
+			).join("\n\n"),
+		);
+
+		const result = await build(config);
+
+		expect(result.byteCount).toBeLessThanOrEqual(SESSION_BOOTSTRAP_MAX_BYTES);
+		expect(result.includedSections).toContain("Today daily entries");
+		expect(result.text).toContain("RECENT 99");
+		expect(result.includedSections).not.toContain("Current channel record");
+		expect(result.diagnostics).toContain("omitted sections (1): Current channel record");
+	});
 });
