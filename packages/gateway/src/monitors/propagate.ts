@@ -69,6 +69,8 @@ type DispatchFailureCode =
 	// is neither the aside worker nor an orphaned external run.
 	| "executor_failed"
 	| "delivery_prepare_failed"
+	| "event_type_invalid"
+	| "monitor_invalid"
 	| "internal_error";
 
 export interface MonitorDispatchFailure {
@@ -444,7 +446,18 @@ export class MonitorPropagator {
 		const rows = this.#database.monitorEventRows().filter((row) => eventIds.includes(row.event_id));
 		if (!rows.length) return;
 		const monitor = this.#registry.get(rows[0]?.monitor_id);
-		if (!monitor) return;
+		if (!monitor) {
+			for (const row of rows)
+				this.#database.monitorEventTerminalFail(
+					row.event_id,
+					"monitor_invalid",
+					"dispatch setup failed (monitor_invalid)",
+				);
+			console.error(
+				`monitor dispatch rejected missing or invalid monitor: events ${rows.map((row) => row.event_id).join(",")}`,
+			);
+			return;
+		}
 		const batchId = crypto.randomUUID();
 		// Red-team blocker 1: acquire a durable lease per event BEFORE claiming the
 		// batch. The lease survives this process (owner token + expiry), so a new
@@ -475,6 +488,33 @@ export class MonitorPropagator {
 			for (const row of leased) this.#database.monitorEventReleaseLease(row.event_id, leaseId);
 			return;
 		}
+		const declared = new Set(monitor.eventTypes);
+		const claimedEventType = claimed[0]?.event_type;
+		let sessionOrigin: OriginRef;
+		let sessionOriginKey: string;
+		try {
+			if (!claimedEventType) throw new Error("missing event type");
+			originKey(eventTypeOrigin(claimedEventType));
+			sessionOrigin = declared.has(claimedEventType) ? eventTypeOrigin(claimedEventType) : CATCH_ALL_EVENT_ORIGIN;
+			sessionOriginKey = originKey(sessionOrigin);
+		} catch {
+			for (const row of claimed) {
+				this.#database.monitorEventFencedFail(
+					row.event_id,
+					leaseId,
+					batchId,
+					"event_type_invalid",
+					"dispatch setup failed (event_type_invalid)",
+					now(),
+					true,
+				);
+			}
+			for (const row of leased) this.#database.monitorEventReleaseLease(row.event_id, leaseId);
+			console.error(
+				`monitor dispatch rejected invalid event type: events ${claimed.map((row) => row.event_id).join(",")}`,
+			);
+			return;
+		}
 		// Heartbeat: renew the lease while the authoring turn is in flight so long
 		// turns (observed 14m+ canonicalizations) never expire mid-flight, while a
 		// dead owner's lease still times out (bounded expiry = TTL after the last
@@ -484,11 +524,6 @@ export class MonitorPropagator {
 			leaseId,
 			leaseTtlMs,
 		);
-		const declared = new Set(monitor.eventTypes);
-		const sessionOrigin = declared.has(claimed[0]?.event_type)
-			? eventTypeOrigin(claimed[0]!.event_type)
-			: CATCH_ALL_EVENT_ORIGIN;
-		const sessionOriginKey = originKey(sessionOrigin);
 		// One generic port owns all same-origin authoring serialization; monitor
 		// leases remain active while a prior call is awaiting a terminal receipt.
 		await this.#sessionPort.runExclusive(sessionOriginKey, async () => {

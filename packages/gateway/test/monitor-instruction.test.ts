@@ -131,6 +131,9 @@ test("instruction validation rejects non-strings and over-long text", async () =
 		expect(() => registry.add({ ...base, instruction: "x".repeat(MONITOR_INSTRUCTION_MAX_LENGTH + 1) })).toThrow(
 			/at most 4000 characters/,
 		);
+		expect(() => registry.add({ ...base, eventTypes: ["broken/type"] })).toThrow(
+			"monitor eventType cannot form an event session origin",
+		);
 		// Exactly at the bound is accepted, and a blank instruction normalises away.
 		expect(registry.add({ ...base, instruction: "x".repeat(MONITOR_INSTRUCTION_MAX_LENGTH) }).instruction).toHaveLength(
 			MONITOR_INSTRUCTION_MAX_LENGTH,
