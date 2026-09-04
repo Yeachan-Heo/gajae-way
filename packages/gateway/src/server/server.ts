@@ -343,8 +343,8 @@ export async function startUnixServer(options: GatewayServerOptions): Promise<Ga
 			await runtime.personaSessions.stop();
 			runtime.stopBrokerGenerationListener?.();
 			await runtime.monitorRuntime.stop();
-			// Cancels pending monitor burst timers so a closed database is never touched.
-			runtime.monitors.dispose();
+			// Drain claimed monitor writers before broker/database teardown (#64).
+			await runtime.monitors.drain();
 			// The broker has no recovery policy; it is only stopped after all current
 			// producers and monitor/tail-like runtime work have drained.
 			await options.broker?.stop();
@@ -447,8 +447,8 @@ export function startStdioServer(options: GatewayServerOptions): GatewayServer {
 			await runtime.personaSessions.stop();
 			runtime.stopBrokerGenerationListener?.();
 			await runtime.monitorRuntime.stop();
-			// Cancels pending monitor burst timers so a closed database is never touched.
-			runtime.monitors.dispose();
+			// Drain claimed monitor writers before broker/database teardown (#64).
+			await runtime.monitors.drain();
 			await options.broker?.stop();
 			connection.close();
 			await settleMemory(runtime);

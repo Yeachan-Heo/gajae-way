@@ -148,6 +148,7 @@ export class MonitorPropagator {
 	#reconciling = false;
 	/** In-flight dispatch promises per event, for awaitable submission. */
 	#inFlightPromises = new Map<string, Promise<void>>();
+	#closing = false;
 	/** Per-origin serialization lives in SessionPort, shared with all SDK callers. */
 	readonly #repo: string;
 	readonly #model: GjcModelSelection | undefined;
@@ -232,12 +233,23 @@ export class MonitorPropagator {
 			options.protocolFailureRollThreshold ?? MONITOR_PROTOCOL_FAILURE_ROLL_THRESHOLD;
 		this.#repo = options.repo ?? process.cwd();
 	}
-	/** Cancels pending burst timers so a closed database is never touched after shutdown. */
+	/** Cancels pending burst timers so no new dispatch starts during shutdown. */
 	dispose(): void {
+		this.#closing = true;
 		for (const batch of this.#batches.values()) clearTimeout(batch.timer);
 		this.#batches.clear();
 	}
+	/** Waits for every live dispatch and reconcile writer before the database closes. */
+	async drain(): Promise<void> {
+		this.dispose();
+		while (this.#reconciling || this.#inFlightPromises.size > 0) {
+			const active = [...new Set(this.#inFlightPromises.values())];
+			if (active.length > 0) await Promise.all(active);
+			else await Bun.sleep(1);
+		}
+	}
 	submit(monitorId: string, eventType: string, payload: unknown): string {
+		if (this.#closing) throw new Error("monitor propagator is closing");
 		const monitor = this.#registry.get(monitorId);
 		if (!monitor?.enabled) throw new Error("unknown or disabled monitor");
 		if (typeof eventType !== "string" || !eventType) throw new Error("event type is required");
@@ -1029,18 +1041,21 @@ export function parseAuthoredArray(response: string): unknown {
  * persisted — SDK error bodies can carry prompt content.
  */
 function failureDetail(error: unknown): string {
-	const name = error instanceof Error ? error.constructor.name : typeof error;
-	const code = (error as { code?: unknown } | undefined)?.code;
-	const stableCode = typeof code === "string" && /^[a-z0-9_.-]{1,64}$/i.test(code) ? code : undefined;
+	const knownNames = new Set(["Error", "TypeError", "RangeError", "AggregateError", "TimeoutError", "GjcRuntimeError"]);
+	const rawName = error instanceof Error ? error.constructor.name : typeof error;
+	const name = knownNames.has(rawName) ? rawName : error instanceof Error ? "Error" : "unknown";
+	const message = error instanceof Error ? error.message : "";
+	const cause = /Database has closed|closed database/i.test(message)
+		? "database_closed"
+		: /SQLITE_BUSY|database is locked/i.test(message)
+			? "database_busy"
+			: /timed out|timeout/i.test(message)
+				? "timeout"
+				: undefined;
+	const frameNames = ["withTransaction", "#dispatchBatch", "monitorEventFencedFail", "request", "bind"];
 	const frame =
 		error instanceof Error && error.stack
-			? (error.stack.split("\n").find((line) => /^\s+at .*(packages|src)\//.test(line)) ?? "")
-					.trim()
-					.replace(/^at\s+/, "")
-					.replace(/.*\/(packages\/[^)]+)\)?$/, "$1")
-			: "";
-	return [name, stableCode ? `code=${stableCode}` : "", frame ? `at ${frame}` : ""]
-		.filter(Boolean)
-		.join(" ")
-		.slice(0, 300);
+			? frameNames.find((candidate) => error.stack?.split("\n").some((line) => line.includes(candidate)))
+			: undefined;
+	return [`class=${name}`, cause ? `cause=${cause}` : "", frame ? `frame=${frame}` : ""].filter(Boolean).join(" ");
 }
