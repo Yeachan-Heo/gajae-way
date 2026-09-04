@@ -445,6 +445,7 @@ describe("session bootstrap builder", () => {
 			),
 		).toBe(true);
 		expect(result.text).not.toContain("�");
+		expect(result.diagnostics).not.toContain("today daily entries: no matching safe entries");
 	});
 
 	test("recent memory outranks larger recoverable sections within the fixed byte budget", async () => {
@@ -469,5 +470,52 @@ describe("session bootstrap builder", () => {
 		expect(result.text).toContain("RECENT 99");
 		expect(result.includedSections).not.toContain("Current channel record");
 		expect(result.diagnostics).toContain("omitted sections (1): Current channel record");
+	});
+
+	test("both recent days receive bounded shares before a large channel record", async () => {
+		const config = await setup();
+		await writeFile(
+			join(home, "memory", "channels", "current.md"),
+			`origin: discord/channel/c1\nbootstrap-safe: public\n${"c".repeat(6_000)}`,
+		);
+		await mkdir(join(home, "memory", "daily", "2026-08"), { recursive: true });
+		for (const [day, marker] of [
+			["2026-08-28", "TODAY NEWEST"],
+			["2026-08-27", "YESTERDAY NEWEST"],
+		] as const)
+			await writeFile(
+				join(home, "memory", "daily", "2026-08", `${day}.md`),
+				Array.from(
+					{ length: 80 },
+					(_, index) =>
+						`## ${index}\n- origin: discord/channel/c1\n- user: ${"z".repeat(70)} ${index === 79 ? marker : "old"}`,
+				).join("\n\n"),
+			);
+
+		const result = await build(config);
+
+		expect(result.includedSections).toContain("Today daily entries");
+		expect(result.includedSections).toContain("Yesterday daily entries");
+		expect(result.text).toContain("TODAY NEWEST");
+		expect(result.text).toContain("YESTERDAY NEWEST");
+		expect(result.includedSections).not.toContain("Current channel record");
+		expect(result.byteCount).toBeLessThanOrEqual(SESSION_BOOTSTRAP_MAX_BYTES);
+	});
+
+	test("one oversized newest daily line keeps its heading and UTF-8-safe tail", async () => {
+		const config = await setup();
+		await mkdir(join(home, "memory", "daily", "2026-08"), { recursive: true });
+		await writeFile(
+			join(home, "memory", "daily", "2026-08", "2026-08-28.md"),
+			`## newest\n- origin: discord/channel/c1\n- user: ${"🦞".repeat(1_000)} TAIL MARKER`,
+		);
+
+		const result = await build(config);
+
+		expect(result.text).toContain("## newest");
+		expect(result.text).toContain("TAIL MARKER");
+		expect(result.text).toContain("older content in this entry omitted");
+		expect(result.text).not.toContain("�");
+		expect(result.byteCount).toBeLessThanOrEqual(SESSION_BOOTSTRAP_MAX_BYTES);
 	});
 });

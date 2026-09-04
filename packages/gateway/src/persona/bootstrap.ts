@@ -1,5 +1,5 @@
 import type { Dirent } from "node:fs";
-import { lstat, readdir, readFile, realpath, stat } from "node:fs/promises";
+import { lstat, open, readdir, readFile, realpath, stat } from "node:fs/promises";
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { type OriginRef, originKey, validateOriginRef } from "@gajaeway/protocol";
 import type { GatewayConfig } from "../config";
@@ -19,24 +19,11 @@ export const SESSION_BOOTSTRAP_MAX_BYTES = 8 * 1024;
  * (issue #70).
  */
 const MAX_SOURCE_BYTES = 24 * 1024;
-/**
- * Hard read ceiling. Above this a source is genuinely refused, so a pathological
- * file cannot be pulled into memory just to excerpt its tail.
- */
-const MAX_SOURCE_READ_BYTES = 4 * 1024 * 1024;
-/**
- * Excerpt cap for the dated daily sources specifically, kept well under
- * SESSION_BOOTSTRAP_MAX_BYTES so an excerpt can actually survive the
- * total-budget pass. A 24KiB excerpt cannot: measured bootstraps spend
- * ~1915-1941B on metadata, navigation map and rules index, leaving roughly
- * 6277B, and there are at most two daily candidates (today and yesterday).
- * 2.5KiB each fits both with headroom; a larger excerpt is simply evicted whole
- * again, which is the failure #70 is about.
- *
- * Note this does NOT establish a budget-allocation policy between sections —
- * that is deliberately left to #85.
- */
-const DAILY_EXCERPT_BYTES = 2560;
+/** Daily files may be large, but bootstrap never reads more than this bounded window. */
+const MAX_DAILY_SOURCE_READ_BYTES = 4 * 1024 * 1024;
+/** Rendered daily bodies reserve predictable shares of the fixed 8 KiB envelope. */
+const TODAY_EXCERPT_BYTES = 2300;
+const YESTERDAY_EXCERPT_BYTES = 1700;
 const MAX_SCAN_FILES = 256;
 
 export interface BootstrapEngagement {
@@ -138,8 +125,13 @@ function cleanLine(value: string): string {
 	return normalizeUnsafeSeparators(value).trim();
 }
 
-function boundedLine(value: string, max = 160): string {
-	return [...cleanLine(value)].slice(0, max).join("");
+function boundedLine(value: string, maxBytes = 160): string {
+	let result = "";
+	for (const character of cleanLine(value)) {
+		if (Buffer.byteLength(result + character, "utf8") > maxBytes) break;
+		result += character;
+	}
+	return result;
 }
 
 function diagnosticCode(error: unknown): string {
@@ -231,28 +223,47 @@ function links(text: string): string[] {
 	return [...new Set(result)].sort();
 }
 
-/**
- * Keeps the tail of `body` within `cap` bytes, cut on a line boundary so no
- * line is emitted half-written. If the retained tail starts mid-section, the
- * leading partial block is dropped so the excerpt begins at a real heading.
- */
+/** Keeps newest complete daily entries, with a labelled UTF-8-safe tail for one oversized newest entry. */
 function tailExcerpt(body: string, cap: number): string {
 	if (Buffer.byteLength(body, "utf8") <= cap) return body;
-	const lines = body.split("\n");
+	const entries = body.split(/(?=^##\s+)/m).filter(Boolean);
 	const kept: string[] = [];
 	let size = 0;
-	for (let index = lines.length - 1; index >= 0; index--) {
-		const line = lines[index] ?? "";
-		const cost = Buffer.byteLength(line, "utf8") + 1;
+	for (let index = entries.length - 1; index >= 0; index--) {
+		const entry = entries[index] ?? "";
+		const cost = Buffer.byteLength(entry, "utf8") + (kept.length > 0 ? 2 : 0);
 		if (size + cost > cap) break;
-		kept.unshift(line);
+		kept.unshift(entry);
 		size += cost;
 	}
-	// Prefer starting at a heading: a dated entry without its `##` header reads
-	// as if it belonged to the previous one.
-	const firstHeading = kept.findIndex((line) => /^##\s/.test(line));
-	const aligned = firstHeading > 0 ? kept.slice(firstHeading) : kept;
-	return (aligned.length > 0 ? aligned : kept).join("\n").trim();
+	if (kept.length > 0) return kept.join("\n\n").trim();
+	const newest = entries.at(-1) ?? body;
+	const [heading = "## Recent entry", ...rest] = newest.split("\n");
+	const prefix = `${heading}\n[older content in this entry omitted]\n`;
+	const remaining = Math.max(0, cap - Buffer.byteLength(prefix, "utf8"));
+	let suffix = "";
+	for (const character of [...rest.join("\n")].reverse()) {
+		if (Buffer.byteLength(character + suffix, "utf8") > remaining) break;
+		suffix = character + suffix;
+	}
+	return `${prefix}${suffix}`.trim();
+}
+
+async function readUtf8Bounded(target: string, limit: number, reportedSize: number): Promise<string> {
+	const handle = await open(target, "r");
+	try {
+		const buffer = Buffer.alloc(limit + 1);
+		let offset = 0;
+		while (offset < buffer.length) {
+			const { bytesRead } = await handle.read(buffer, offset, buffer.length - offset, offset);
+			if (bytesRead === 0) break;
+			offset += bytesRead;
+		}
+		if (offset > limit) throw new SourceTooLargeError(Math.max(reportedSize, offset));
+		return buffer.subarray(0, offset).toString("utf8");
+	} finally {
+		await handle.close();
+	}
 }
 
 async function readSection(
@@ -261,22 +272,32 @@ async function readSection(
 	name: string,
 	allowed: readonly string[],
 	transform: (text: string) => string,
-	excerptCap = MAX_SOURCE_BYTES,
 ): Promise<SourceSection> {
 	const target = await confinedFile(root, relativePath, allowed);
 	const info = await stat(target);
-	// Only a pathological file is refused outright now. Anything between the
-	// excerpt cap and this ceiling is read and excerpted rather than dropped,
-	// which is the #70 fix: dropping it discarded the newest memory entirely.
-	if (info.size > MAX_SOURCE_READ_BYTES) throw new SourceTooLargeError(info.size);
-	const full = transform(await readFile(target, "utf8")).trim();
+	if (info.size > MAX_SOURCE_BYTES) throw new SourceTooLargeError(info.size);
+	const body = transform(await readUtf8Bounded(target, MAX_SOURCE_BYTES, info.size)).trim();
+	if (!body) throw new Error("no_safe_content");
+	return { name, path: relativePath.replaceAll("\\", "/"), freshness: info.mtime.toISOString(), body };
+}
+
+async function readDailySection(
+	root: string,
+	relativePath: string,
+	name: string,
+	allowed: readonly string[],
+	key: string,
+	excerptCap: number,
+): Promise<SourceSection> {
+	const target = await confinedFile(root, relativePath, allowed);
+	const info = await stat(target);
+	if (info.size > MAX_DAILY_SOURCE_READ_BYTES) throw new SourceTooLargeError(info.size);
+	const full = dailyEntries(await readUtf8Bounded(target, MAX_DAILY_SOURCE_READ_BYTES, info.size), key).trim();
 	if (!full) throw new Error("no_safe_content");
 	const totalBytes = Buffer.byteLength(full, "utf8");
-	if (totalBytes <= excerptCap) {
+	if (totalBytes <= excerptCap)
 		return { name, path: relativePath.replaceAll("\\", "/"), freshness: info.mtime.toISOString(), body: full };
-	}
 	const body = tailExcerpt(full, excerptCap);
-	if (!body) throw new Error("no_safe_content");
 	return {
 		name,
 		path: relativePath.replaceAll("\\", "/"),
@@ -542,38 +563,31 @@ export async function buildSessionBootstrap(input: {
 	// The capture axis is wherever the registry says it is: a re-rooted daily axis
 	// must still reach the session, not silently drop out of every bootstrap.
 	const capture = await captureRoot(resolved.memory);
-	for (const [label, date] of [
-		["Today daily entries", now],
-		["Yesterday daily entries", new Date(now.getTime() - 86_400_000)],
+	for (const [label, date, excerptCap] of [
+		["Today daily entries", now, TODAY_EXCERPT_BYTES],
+		["Yesterday daily entries", new Date(now.getTime() - 86_400_000), YESTERDAY_EXCERPT_BYTES],
 	] as const) {
 		let included = false;
+		let dropped = false;
 		for (const path of datePaths(date, capture)) {
 			try {
-				candidates.push(
-					await readSection(
-						resolved.memory,
-						path,
-						label,
-						resolved.allowed,
-						(text) => dailyEntries(text, key),
-						DAILY_EXCERPT_BYTES,
-					),
-				);
+				candidates.push(await readDailySection(resolved.memory, path, label, resolved.allowed, key, excerptCap));
 				included = true;
 				break;
 			} catch (error) {
 				const code = diagnosticCode(error);
 				if (code !== "enoent" && code !== "no_safe_content") {
 					if (error instanceof SourceTooLargeError) {
+						dropped = true;
 						sourceDropped = true;
 						diagnostics.push(
-							`${path}: source_too_large (${error.totalBytes}B exceeds ${MAX_SOURCE_READ_BYTES}B read ceiling)`,
+							`${path}: source_too_large (${error.totalBytes}B exceeds ${MAX_DAILY_SOURCE_READ_BYTES}B read ceiling)`,
 						);
 					} else diagnostics.push(`${path}: ${code}`);
 				}
 			}
 		}
-		if (!included) diagnostics.push(`${label.toLowerCase()}: no matching safe entries`);
+		if (!included && !dropped) diagnostics.push(`${label.toLowerCase()}: no matching safe entries`);
 	}
 
 	try {
