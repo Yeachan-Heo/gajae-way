@@ -48,7 +48,15 @@ export class MonitorRegistry {
 		return record;
 	}
 	list(): MonitorRecord[] {
-		return this.#database.monitorRows().map(rowToRecord);
+		const records: MonitorRecord[] = [];
+		for (const row of this.#database.monitorRows()) {
+			try {
+				records.push(rowToRecord(row));
+			} catch {
+				console.error(`monitor registry ignored invalid persisted record: monitor ${row.monitor_id}`);
+			}
+		}
+		return records;
 	}
 	get(monitorId: string): MonitorRecord | undefined {
 		return this.list().find((monitor) => monitor.monitorId === monitorId);
@@ -59,7 +67,7 @@ export class MonitorRegistry {
 }
 
 function rowToRecord(row: ReturnType<GatewayDatabase["monitorRows"]>[number]): MonitorRecord {
-	return {
+	const record: MonitorRecord = {
 		monitorId: row.monitor_id,
 		name: row.name,
 		trigger: JSON.parse(row.trigger_json),
@@ -72,6 +80,8 @@ function rowToRecord(row: ReturnType<GatewayDatabase["monitorRows"]>[number]): M
 		serviceTier: (row.service_tier as MonitorRecord["serviceTier"]) ?? undefined,
 		createdAt: row.created_at,
 	};
+	validateSpec(record);
+	return record;
 }
 
 export function validateSpec(spec: MonitorSpec): void {
