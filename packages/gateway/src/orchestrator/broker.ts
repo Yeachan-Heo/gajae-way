@@ -95,7 +95,7 @@ type LockRecord = {
 };
 
 const DEFAULT_HEALTH_INTERVAL_MS = 5_000;
-const DEFAULT_HEALTH_PROBE_TIMEOUT_MS = 10_000;
+const DEFAULT_HEALTH_PROBE_TIMEOUT_MS = 30_000;
 /** Consecutive failed periodic probes before a generation is fenced. A single slow probe under load must not retire every live turn. */
 const HEALTH_FAILURE_STRIKES = 3;
 /** Consecutive readiness attempts that find a live-looking endpoint failing the application probe before the daemon is retired. */
