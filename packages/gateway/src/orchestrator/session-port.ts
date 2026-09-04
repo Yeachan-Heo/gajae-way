@@ -95,6 +95,8 @@ export interface SessionBindInput {
 	readonly model?: GjcModelSelection;
 	/** The SDK host's default coding register is retained when true. */
 	readonly codingRegister?: boolean;
+	/** Internal recursion fence: one poisoned create key may advance to one fresh epoch per bind call. */
+	readonly epochRecovery?: boolean;
 }
 
 export interface SessionBinding {
@@ -260,7 +262,20 @@ export class BrokerSessionPort implements SessionPort {
 			return await this.bind({ ...input, epoch: rebound });
 		}
 		const idempotencyKey = sessionCreateRef(this.#instanceId, input.originKey, input.epoch, input.repo);
-		const created = await this.#createSession(input.repo, idempotencyKey, input.model);
+		let created: { readonly sessionId?: unknown };
+		try {
+			created = await this.#createSession(input.repo, idempotencyKey, input.model);
+		} catch (error) {
+			if (input.epochRecovery === false) throw error;
+			const detail = error instanceof Error ? error.message : String(error);
+			if (!/terminal_uncertain|endpoint_stale|readiness|startup did not complete|spawn_failed/i.test(detail))
+				throw error;
+			const nextEpoch = this.#database.rebindEpoch(input.originKey);
+			console.error(
+				`session_create_epoch_rotated origin=${input.originKey} epoch=${input.epoch} nextEpoch=${nextEpoch} reason=poisoned_create_key`,
+			);
+			return await this.bind({ ...input, epoch: nextEpoch, epochRecovery: false });
+		}
 		if (typeof created.sessionId !== "string" || created.sessionId.length === 0) {
 			throw new Error("session.create succeeded without a sessionId");
 		}
