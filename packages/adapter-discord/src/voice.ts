@@ -15,13 +15,16 @@
  *
  * Everything here fails open. Speech-to-text is an outbound network call to a
  * third party with its own quota and outages; a voice message must still arrive
- * — with its url and nothing else — when transcription is unconfigured, denied,
- * slow, or broken. Losing the message would be a worse bug than losing the
- * transcript, and losing the message is exactly what this subsystem replaced.
+ * with its url when transcription is unconfigured, denied, slow, or broken.
+ * Configured provider failures add a safe unavailability marker so degradation
+ * is not mistaken for silence. Losing the message would be a worse bug than
+ * losing the transcript, and losing the message is exactly what this subsystem replaced.
  *
  * The CDN url is signed and expires in roughly a day, so transcription has to
  * happen on ingress. There is no later.
  */
+
+import { classifyProviderError } from "./provider-error";
 
 /** ElevenLabs Scribe endpoint. Overridable so tests never touch the network. */
 const DEFAULT_STT_ENDPOINT = "https://api.elevenlabs.io/v1/speech-to-text";
@@ -57,10 +60,9 @@ export interface TranscriptionPorts {
 /**
  * Fetches and transcribes one voice-message attachment.
  *
- * Returns undefined on every failure path rather than throwing, so the caller
- * can forward the message unchanged. A returned string is always non-empty:
- * silence transcribes to `""`, which carries no information and would render as
- * a stray blank line.
+ * Provider failures return an explicit unavailable outcome; local/network
+ * failures return undefined. Neither throws, so the caller always forwards the
+ * original voice message. Speech and non-speech results are always non-empty.
  */
 export async function transcribeVoiceMessage(
 	url: string,
@@ -92,8 +94,9 @@ export async function transcribeVoiceMessage(
 			}),
 		);
 		if (!response.ok) {
-			ports.log?.(`voice transcription failed: speech-to-text returned ${response.status}`);
-			return undefined;
+			const failure = await classifyProviderError(response);
+			ports.log?.(`voice transcription failed: speech-to-text ${failure.diagnostic}`);
+			return { kind: "unavailable", reason: failure.code };
 		}
 		return readTranscript(await response.json());
 	} catch (error) {
@@ -125,10 +128,10 @@ const NON_SPEECH_TAG = /^(?:\s*(?:\[[^\]]*\]|\([^)]*\)))+\s*$/;
 /**
  * What a transcription attempt actually produced.
  *
- * Three outcomes rather than `string | undefined`, because "the speaker said X",
- * "the clip held no speech" and "transcription did not happen" are different
- * facts and the persona acts differently on each. Collapsing the middle case
- * into either neighbour is what made the first version of this wrong.
+ * Four outcomes rather than `string | undefined`, because "the speaker said X",
+ * "the clip held no speech", "the provider was unavailable", and "no usable
+ * transcription exists" are different facts. The persona acts differently on
+ * each, so collapsing them would make stored history lie by omission.
  */
 export type TranscriptResult =
 	| { readonly kind: "speech"; readonly text: string }
@@ -138,6 +141,11 @@ export type TranscriptResult =
 			readonly label: string;
 			readonly language?: string;
 			readonly languageProbability?: number;
+	  }
+	| {
+			readonly kind: "unavailable";
+			/** Safe provider code only; the detailed diagnostic stays in operator logs. */
+			readonly reason: string;
 	  };
 
 /**
@@ -178,10 +186,9 @@ function stripTags(tagged: string): string {
 /**
  * Appends the transcription outcome to an inbound body.
  *
- * Speech is appended bare, as the speaker's words. A non-speech result is
- * appended in the adapter's own bracketed style, the same shape as the
- * attachment line above it, so it reads unambiguously as the runtime reporting
- * on the recording rather than as anything the author said.
+ * Speech is appended bare, as the speaker's words. Non-speech and provider
+ * unavailability are appended in the adapter's own bracketed style, so they read
+ * unambiguously as runtime observations rather than anything the author said.
  */
 export function withTranscript(body: string, result: TranscriptResult | undefined): string {
 	const line = renderTranscript(result);
@@ -193,6 +200,7 @@ export function withTranscript(body: string, result: TranscriptResult | undefine
 export function renderTranscript(result: TranscriptResult | undefined): string | undefined {
 	if (!result) return undefined;
 	if (result.kind === "speech") return result.text;
+	if (result.kind === "unavailable") return `[transcription unavailable · ${result.reason}]`;
 	const parts = ["no speech", result.label];
 	if (result.language !== undefined && result.languageProbability !== undefined)
 		parts.push(`detected ${result.language} p=${round2(result.languageProbability)}`);
