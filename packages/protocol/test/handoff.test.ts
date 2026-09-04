@@ -167,4 +167,9 @@ test("byte clamping cuts on a character boundary and never exceeds the budget", 
 	expect(clamped.endsWith("…[truncated]")).toBe(true);
 	// No mangled half-character survives the cut.
 	expect(clamped.includes("\uFFFD")).toBe(false);
+	for (const budget of [0, 1, 2, 3, 4, 8]) {
+		const tiny = clampToBytes("long body", budget);
+		expect(byteLength(tiny)).toBeLessThanOrEqual(budget);
+		expect(tiny.includes("\uFFFD")).toBe(false);
+	}
 });

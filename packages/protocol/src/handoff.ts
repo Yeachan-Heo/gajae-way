@@ -210,14 +210,20 @@ export function byteLength(text: string): number {
 
 /** Truncates to a byte budget on a character boundary, and says that it did. */
 export function clampToBytes(text: string, maxBytes: number, marker = " …[truncated]"): string {
+	if (!Number.isFinite(maxBytes) || maxBytes <= 0) return "";
 	if (byteLength(text) <= maxBytes) return text;
-	const budget = Math.max(0, maxBytes - byteLength(marker));
+	const suffix = bytePrefix(marker, maxBytes);
+	const budget = Math.max(0, maxBytes - byteLength(suffix));
+	return `${bytePrefix(text, budget)}${suffix}`;
+}
+
+function bytePrefix(text: string, maxBytes: number): string {
 	let low = 0;
 	let high = text.length;
 	while (low < high) {
 		const mid = Math.ceil((low + high) / 2);
-		if (byteLength(text.slice(0, mid)) <= budget) low = mid;
+		if (byteLength(text.slice(0, mid)) <= maxBytes) low = mid;
 		else high = mid - 1;
 	}
-	return `${text.slice(0, low)}${marker}`;
+	return text.slice(0, low);
 }
