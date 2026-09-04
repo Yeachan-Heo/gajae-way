@@ -1848,7 +1848,7 @@ async function createInboundTurnLifecycle(
 	};
 
 	const onFrame = async ({ frame, sessionId }: PersonaTailFrameInput) => {
-		if (ended) return;
+		if (ended) return false;
 		tailActivitySeen = true;
 		if (frame.assistantText && !frame.steerEcho) {
 			lastKnown = {
@@ -1878,6 +1878,7 @@ async function createInboundTurnLifecycle(
 					: lastKnown.outputTokens,
 		};
 		emitProgress(lastKnown);
+		return assistantDeliveryStarted;
 	};
 
 	const renderSteer = (steered: InboundMessageRow): string => {

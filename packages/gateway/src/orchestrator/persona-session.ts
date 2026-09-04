@@ -86,7 +86,7 @@ export interface PersonaTurnLifecycle {
 	steerContextMessageId?(row: InboundMessageRow): string | undefined;
 	/** The steer landed in the session (durably, context consumed): release transient ownership. */
 	onSteerAccepted?(input: PersonaSteerInput): void | Promise<void>;
-	onFrame?(input: PersonaTailFrameInput): void | Promise<void>;
+	onFrame?(input: PersonaTailFrameInput): boolean | void | Promise<boolean | void>;
 	onTerminal?(input: PersonaTerminalInput): void | Promise<void>;
 	onFailure?(input: PersonaFailureInput): void | Promise<void>;
 	onRetired?(input: PersonaTurnIdentity): void | Promise<void>;
@@ -411,6 +411,8 @@ type BoundTurn = PersonaTurnIdentity & {
 	retired: boolean;
 	detached: boolean;
 	tailTerminalObserved: boolean;
+	/** A consumer-visible reply closed this turn's steer window, even if terminal settlement is still arriving. */
+	replyVisible: boolean;
 	/**
 	 * A retired turn whose answer the user still wants: the session was replaced
 	 * under it (steer failure), not reset by the user (`/new`). Its output is
@@ -773,6 +775,7 @@ class OriginActor {
 			retired,
 			detached,
 			tailTerminalObserved: false,
+			replyVisible: false,
 			answerWanted: false,
 			tailEvidenceUnavailable: false,
 			statusTerminalHolds: 0,
@@ -975,6 +978,7 @@ class OriginActor {
 			retired: false,
 			detached: false,
 			tailTerminalObserved: false,
+			replyVisible: false,
 			answerWanted: false,
 			tailEvidenceUnavailable: false,
 			statusTerminalHolds: 0,
@@ -1238,7 +1242,7 @@ class OriginActor {
 	 */
 	async #steerPending(): Promise<void> {
 		const current = this.#current;
-		if (!current || current.retired || this.#state !== "turn-running") return;
+		if (!current || current.retired || current.replyVisible || this.#state !== "turn-running") return;
 		// Steers whose transport tore before an answer are resolved first, on
 		// the same clientRef, before any new row is issued behind them.
 		for (const held of this.#manager.database.inboundSteersHeld(current.turn.opRef))
@@ -1454,7 +1458,8 @@ class OriginActor {
 				bound.lastAssistantOpAttributed = tailOperationRef(frame) === bound.turn.opRef;
 				bound.lastAssistantAtMs = tailFrameTimestampMs(frame);
 			}
-			await bound.lifecycle.onFrame?.({ ...bound, frame });
+			const replyVisible = await bound.lifecycle.onFrame?.({ ...bound, frame });
+			if (replyVisible === true) bound.replyVisible = true;
 			if (!bound.lifecycle.onFrame && frame.assistantText && frame.eventId && !frame.steerEcho) {
 				const key = `${sessionId}:${frame.eventId}`;
 				if (!this.#deliveredEvents.has(key)) {
@@ -1471,6 +1476,7 @@ class OriginActor {
 						),
 						text: frame.assistantText,
 					});
+					bound.replyVisible = true;
 				}
 			}
 		}

@@ -119,6 +119,45 @@ test("a mid-turn message issues one steer, keeps one send, and is attributed in 
 	);
 });
 
+test("a message arriving after a consumer-visible reply waits for the next turn instead of steering the answered turn", async () => {
+	home = await mkdtemp(join(tmpdir(), "gajaeway-post-reply-boundary-"));
+	database = await GatewayDatabase.open(join(home, "gateway.db"));
+	const port = new ScriptedSessionPort();
+	const visible: string[] = [];
+	manager = new PersonaSessionManager({
+		database,
+		port,
+		instanceId: "post-reply-boundary-test",
+		repo: join(home, "workspace"),
+		onTurnStart: ({ trigger }) => ({
+			text: trigger.body,
+			onFrame: ({ frame }) => {
+				if (!frame.assistantText) return false;
+				visible.push(frame.assistantText);
+				return true;
+			},
+		}),
+	});
+
+	enqueue("first", "first request");
+	await manager.notifyInbound(ORIGIN_KEY);
+	await eventually(() => port.sends.length === 1, "first turn did not start");
+	const first = port.sends[0]!;
+	port.emitAssistant(first.sessionId, "first visible reply", "visible-first", first.opRef);
+	await eventually(() => visible.length === 1, "reply did not become consumer-visible");
+
+	enqueue("follow-up", "sent after the reply");
+	await manager.notifyInbound(ORIGIN_KEY);
+	expect(port.steers).toHaveLength(0);
+	expect(port.sends).toHaveLength(1);
+	expect(database.inboundPendingOldest(ORIGIN_KEY)?.message_id).toBe("follow-up");
+
+	port.complete(first.opRef, "first visible reply");
+	await eventually(() => port.sends.length === 2, "follow-up did not start as a fresh turn after settlement");
+	expect(port.sends[1]?.text).toBe("sent after the reply");
+	expect(port.steers).toHaveLength(0);
+});
+
 /**
  * A steer whose CLI died after the request landed (torn envelope, non-zero
  * exit) is NOT a refusal: gjc keeps the clientRef, so a replay returns the
