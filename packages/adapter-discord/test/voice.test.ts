@@ -143,11 +143,29 @@ test("a failed attachment download fails open instead of losing the message", as
 	expect(logged[0]).toContain("404");
 });
 
-test("a speech-to-text error fails open and is reported, not thrown", async () => {
+test("a quota failure is classified, safely logged, and marked in stored history", async () => {
 	const logged: string[] = [];
-	const { fetch } = stubFetch([audio(), new Response("quota", { status: 429 })]);
-	expect(await transcribeVoiceMessage(URL, KEY, { fetch, log: (l) => logged.push(l) })).toBeUndefined();
-	expect(logged[0]).toContain("429");
+	const message =
+		"This request exceeds your quota of 10000. You have 0 credits remaining, while 3 credits are required.\nBearer sk-live-secret-value";
+	const { fetch } = stubFetch([
+		audio(),
+		Response.json(
+			{ detail: { type: "invalid_request", code: "quota_exceeded", status: "quota_exceeded", message } },
+			{ status: 401 },
+		),
+	]);
+	const result = await transcribeVoiceMessage(URL, KEY, { fetch, log: (line) => logged.push(line) });
+	expect(result).toEqual({ kind: "unavailable", reason: "quota_exceeded" });
+	expect(withTranscript("[voice message · 3.2s · url]", result)).toBe(
+		"[voice message · 3.2s · url]\n[transcription unavailable · quota_exceeded]",
+	);
+	expect(logged[0]).toContain("status=401 category=quota_exceeded code=quota_exceeded");
+	expect(logged[0]).toContain("quota of 10000");
+	expect(logged[0]).toContain("0 credits remaining");
+	expect(logged[0]).toContain("3 credits are required");
+	expect(logged[0]).not.toContain("sk-live-secret-value");
+	expect(logged[0]).not.toContain("\n");
+	expect(withTranscript("[voice message · 3.2s · url]", result)).not.toContain("10000");
 });
 
 test("a thrown network error fails open", async () => {

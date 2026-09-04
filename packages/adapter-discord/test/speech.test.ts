@@ -104,11 +104,31 @@ test("a decoder that throws costs the bar, never the voice message", async () =>
 	expect(logged[0]).toContain("ffmpeg not found");
 });
 
-test("synthesis fails open on a provider error", async () => {
+test("a bare 401 is an authentication failure and synthesis still fails open", async () => {
 	const logged: string[] = [];
-	const { fetch } = stubFetch([new Response("quota", { status: 429 })]);
-	expect(await synthesizeVoice("안녕", KEY, { fetch, log: (l) => logged.push(l) })).toBeUndefined();
-	expect(logged[0]).toContain("429");
+	const { fetch } = stubFetch([new Response("not-json", { status: 401 })]);
+	expect(await synthesizeVoice("안녕", KEY, { fetch, log: (line) => logged.push(line) })).toBeUndefined();
+	expect(logged).toEqual([
+		"voice synthesis failed: text-to-speech status=401 category=authentication code=authentication",
+	]);
+});
+
+test("a bare 429 is classified separately from quota exhaustion", async () => {
+	const logged: string[] = [];
+	const { fetch } = stubFetch([new Response("", { status: 429 })]);
+	expect(await synthesizeVoice("안녕", KEY, { fetch, log: (line) => logged.push(line) })).toBeUndefined();
+	expect(logged[0]).toContain("status=429 category=rate_limited code=rate_limited");
+});
+
+test("a malformed provider error body is not copied into logs", async () => {
+	const logged: string[] = [];
+	const { fetch } = stubFetch([new Response("Bearer sk-live-do-not-log\nsecond line", { status: 503 })]);
+	expect(await synthesizeVoice("안녕", KEY, { fetch, log: (line) => logged.push(line) })).toBeUndefined();
+	expect(logged).toEqual([
+		"voice synthesis failed: text-to-speech status=503 category=provider_error code=provider_error",
+	]);
+	expect(logged[0]).not.toContain("sk-live-do-not-log");
+	expect(logged[0]).not.toContain("second line");
 });
 
 test("synthesis fails open on a thrown network error and on empty audio", async () => {
