@@ -450,7 +450,7 @@ export class BrokerSessionPort implements SessionPort {
 		selection: GjcModelSelection;
 	}): Promise<{ readonly changed: boolean }> {
 		if (typeof input.selection !== "string") {
-			const activated = parseEnvelope<boolean>(
+			const activation = parseEnvelope<boolean | { changed?: unknown; id?: unknown }>(
 				await this.#cli([
 					"sdk",
 					"session",
@@ -464,8 +464,9 @@ export class BrokerSessionPort implements SessionPort {
 				]),
 				"model.profile.set",
 			);
-			if (typeof activated !== "boolean") throw new Error("model.profile.set succeeded without an activation receipt");
-			return { changed: activated };
+			const changed = typeof activation === "boolean" ? activation : activation.changed;
+			if (typeof changed !== "boolean") throw new Error("model.profile.set succeeded without a changed receipt");
+			return { changed };
 		}
 		const result = parseEnvelope<{ changed?: unknown }>(
 			await this.#cli([

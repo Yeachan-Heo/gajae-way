@@ -26,7 +26,11 @@ test("broker SessionPort preserves caller op-ref, model choice, bootstrap prompt
 		if (args.includes("session.create"))
 			return { exitCode: 0, stdout: JSON.stringify({ ok: true, result: { sessionId: "sdk-1" } }), stderr: "" };
 		if (args.includes("model.profile.set"))
-			return { exitCode: 0, stdout: JSON.stringify({ ok: true, result: false }), stderr: "" };
+			return {
+				exitCode: 0,
+				stdout: JSON.stringify({ ok: true, result: { changed: false, id: "gpt-heavy" } }),
+				stderr: "",
+			};
 		if (args.includes("model.set"))
 			return { exitCode: 0, stdout: JSON.stringify({ ok: true, result: { changed: true } }), stderr: "" };
 		if (args.includes("send"))
