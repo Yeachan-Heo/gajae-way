@@ -220,12 +220,18 @@ export class BrokerSessionPort implements SessionPort {
 			// outage) keeps the binding: that is not evidence the session is gone.
 			let indexed = true;
 			try {
-				// Judged on the raw envelope: gjc >= 0.16.0 reports a live session with a
-				// locator that lacks `repo`, which the subsession normalizer treats as
-				// absent. "Not indexed" is the broker disowning the id, nothing else.
+				// Judge the raw envelope: a persisted id is reusable only when the
+				// broker explicitly still owns a live endpoint. `ok:true, live:false`
+				// is just as unusable as session_unavailable (monitor authoring bypasses
+				// PersonaActor's resume path and otherwise reuses the dead id forever).
 				const result = await this.#cli(["sdk", "session", "inspect", existing.sessionId, "--repo", input.repo]);
-				const envelope = JSON.parse(result.stdout) as { ok?: unknown; error?: { code?: unknown } };
+				const envelope = JSON.parse(result.stdout) as {
+					ok?: unknown;
+					result?: { session?: { live?: unknown } };
+					error?: { code?: unknown };
+				};
 				if (envelope.ok === false) indexed = envelope.error?.code !== "session_unavailable";
+				if (envelope.ok === true && envelope.result?.session?.live === false) indexed = false;
 			} catch {
 				indexed = true;
 			}
@@ -233,7 +239,7 @@ export class BrokerSessionPort implements SessionPort {
 				return { sessionId: existing.sessionId, originKey: input.originKey, epoch: input.epoch, repo: input.repo };
 			const rebound = this.#database.rebindEpoch(input.originKey);
 			console.error(
-				`session_rebound origin=${input.originKey} epoch=${input.epoch} nextEpoch=${rebound} session=${existing.sessionId} reason=not_indexed_by_broker`,
+				`session_rebound origin=${input.originKey} epoch=${input.epoch} nextEpoch=${rebound} session=${existing.sessionId} reason=not_live_or_disowned_by_broker`,
 			);
 			return await this.bind({ ...input, epoch: rebound });
 		}

@@ -244,7 +244,7 @@ test("broker SessionPort retries a terminal-uncertain lifecycle create with the 
 	expect(sleeps).toEqual([1_000]);
 });
 
-test("bind rebinds a persisted session the broker no longer indexes instead of handing it to a send", async () => {
+test("bind rebinds a persisted live-false session instead of handing a dead monitor endpoint to request", async () => {
 	const { mkdtemp, rm } = await import("node:fs/promises");
 	const { tmpdir } = await import("node:os");
 	const { join } = await import("node:path");
@@ -261,8 +261,11 @@ test("bind rebinds a persisted session the broker no longer indexes instead of h
 			commands.push([...args]);
 			if (args.includes("inspect") && args.includes("dead-session"))
 				return {
-					exitCode: 1,
-					stdout: JSON.stringify({ ok: false, error: { code: "session_unavailable", message: "not indexed" } }),
+					exitCode: 0,
+					stdout: JSON.stringify({
+						ok: true,
+						result: { session: { sessionId: "dead-session", repo, live: false, deleted: false } },
+					}),
 					stderr: "",
 				};
 			if (args.includes("session.create"))
