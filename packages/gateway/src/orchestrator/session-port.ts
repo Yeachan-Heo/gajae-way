@@ -267,9 +267,6 @@ export class BrokerSessionPort implements SessionPort {
 			created = await this.#createSession(input.repo, idempotencyKey, input.model);
 		} catch (error) {
 			if (input.epochRecovery === false) throw error;
-			const detail = error instanceof Error ? error.message : String(error);
-			if (!/terminal_uncertain|endpoint_stale|readiness|startup did not complete|spawn_failed/i.test(detail))
-				throw error;
 			const nextEpoch = this.#database.rebindEpoch(input.originKey);
 			console.error(
 				`session_create_epoch_rotated origin=${input.originKey} epoch=${input.epoch} nextEpoch=${nextEpoch} reason=poisoned_create_key`,
