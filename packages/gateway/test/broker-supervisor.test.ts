@@ -901,12 +901,12 @@ test("boot aborts before accepting connections when the Stage 0 version floor is
 	expect(await Bun.file(join(home, "gateway.sock")).exists()).toBe(false);
 });
 
-test("boot aborts when the sdk surface answers generic help instead of a session-list envelope", async () => {
+test("boot aborts when the broker endpoint never provides application health", async () => {
 	const home = await temporaryHome("gajaeway-broker-preflight-marker-");
 	const command: CliRunner = async (args) =>
 		args[0] === "--version" ? { exitCode: 0, stdout: `gjc/${MIN_GJC_VERSION}\n`, stderr: "" } : GENERIC_HELP;
 	await expect(bootGateway({ home, broker: { ssotAgentDir: null, command } })).rejects.toThrow(
-		"did not answer a valid session-list envelope",
+		"broker daemon did not become healthy",
 	);
 	expect(await Bun.file(join(home, "gateway.sock")).exists()).toBe(false);
 });
@@ -936,8 +936,7 @@ test("boot starts the broker before the Unix server and routes ordered shutdown 
 
 	try {
 		expect(commands[0]).toEqual(["--version"]);
-		expect(commands[1]?.slice(0, 2)).toEqual(["sdk", "session"]);
-		expect(commands[1]).toContain("--agent-dir");
+		expect(commands).toEqual([["--version"]]);
 		expect(spawned).toBe(0);
 		expect((await lstat(join(home, "gateway.sock"))).isSocket()).toBe(true);
 	} finally {

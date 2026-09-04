@@ -348,7 +348,7 @@ export function isHealthySessionList(result: CliResult): boolean {
 export async function preflightGjcRuntime(
 	run: GjcCommandRunner,
 	minimumVersion = MIN_GJC_VERSION,
-	sdk: GjcCommandRunner = run,
+	sdk?: GjcCommandRunner,
 ): Promise<void> {
 	const version = await run(["--version"], { timeoutMs: DEFAULT_HEALTH_PROBE_TIMEOUT_MS });
 	if (version.exitCode !== 0) {
@@ -363,11 +363,13 @@ export async function preflightGjcRuntime(
 	if (compareVersions(found, minimum) < 0) {
 		throw new Error(`gjc runtime preflight failed: requires gjc >= ${minimumVersion}; found ${formatVersion(found)}`);
 	}
-	const capability = await sdk([...brokerHealthArgs()], { timeoutMs: DEFAULT_COMMAND_TIMEOUT_MS });
-	if (!isHealthySessionList(capability)) {
-		throw new Error(
-			`gjc runtime preflight failed: \`gjc sdk session list\` did not answer a valid session-list envelope (exit ${capability.exitCode})`,
-		);
+	if (sdk) {
+		const capability = await sdk([...brokerHealthArgs()], { timeoutMs: DEFAULT_COMMAND_TIMEOUT_MS });
+		if (!isHealthySessionList(capability)) {
+			throw new Error(
+				`gjc runtime preflight failed: \`gjc sdk session list\` did not answer a valid session-list envelope (exit ${capability.exitCode})`,
+			);
+		}
 	}
 }
 
@@ -489,8 +491,11 @@ export class BrokerSupervisor implements PersonaBroker {
 
 	/** Runs the boot-time capability gate against the private agent dir. */
 	async preflight(): Promise<void> {
-		// The sdk probe is agent-dir-bound so it exercises (and auto-starts) the private daemon.
-		await preflightGjcRuntime(this.#command, MIN_GJC_VERSION, this.cli);
+		// Version is the only CLI preflight. #start immediately performs the real
+		// application-level session.list probe against the private broker endpoint;
+		// spawning another SDK CLI here duplicated that check and could time out
+		// before an already-healthy daemon was observed.
+		await preflightGjcRuntime(this.#command, MIN_GJC_VERSION);
 	}
 
 	/** The current daemon generation; it starts at 1 and increases every time the daemon is observed to recover. */
