@@ -968,14 +968,15 @@ class OriginActor {
 		this.#current = current;
 		this.#state = "turn-running";
 		tail.setTurnRunning(true);
+		// Session state, rather than a per-send selector, is authoritative for
+		// persona turns. Model selection happens BEFORE send; if it fails, no
+		// prompt can have landed, so holding the BOUND row as an ambiguous send
+		// would brick the origin. Release it to plain pending and retry with
+		// backoff instead.
+		const modelKey = describeModel(lifecycle.effectiveModel);
+		let modelReceipt: { readonly changed: boolean } | undefined;
 		try {
-			// Session state, rather than a per-send selector, is authoritative for persona
-			// turns. The optional fallback exists only for an explicitly unsupported SDK
-			// control path and is deliberately absent from normal lifecycle construction.
-			// model.set is a live session property: apply it once per (session,
-			// selection), not on every turn. /model rebinds through rebindModel.
-			const modelKey = describeModel(lifecycle.effectiveModel);
-			const modelReceipt =
+			modelReceipt =
 				lifecycle.effectiveModel && this.#appliedModel.get(binding.sessionId) !== modelKey
 					? await this.#manager.port.setModel({
 							sessionId: binding.sessionId,
@@ -984,9 +985,26 @@ class OriginActor {
 						})
 					: undefined;
 			if (lifecycle.effectiveModel) this.#appliedModel.set(binding.sessionId, modelKey);
+			this.#preSendFailures = 0;
 			this.#manager.log(
-				`persona_model origin=${this.originKey} epoch=${epoch} session=${binding.sessionId} effective=${describeModel(lifecycle.effectiveModel)} changed=${modelReceipt?.changed ?? false} source=turn`,
+				`persona_model origin=${this.originKey} epoch=${epoch} session=${binding.sessionId} effective=${modelKey} changed=${modelReceipt?.changed ?? false} source=turn`,
 			);
+		} catch (error) {
+			await tail.close();
+			const attempt = this.#manager.database.inboundTurnRequeue(opRef);
+			this.#current = undefined;
+			this.#state = "idle";
+			this.#preSendFailures += 1;
+			const failures = this.#preSendFailures;
+			this.#manager.log(
+				`persona_model_failed origin=${this.originKey} epoch=${epoch} session=${binding.sessionId} message=${trigger.message_id} attempt=${attempt} failures=${failures} selection=${modelKey} detail=${safeDiagnostic(error)}`,
+			);
+			this.#scheduleDispatchRetry(
+				Math.min(DISPATCH_FAILURE_RETRY_MAX_MS, DISPATCH_FAILURE_RETRY_MS * 2 ** Math.min(failures - 1, 10)),
+			);
+			return;
+		}
+		try {
 			await this.#manager.port.send({
 				sessionId: binding.sessionId,
 				repo: this.#manager.repo,
@@ -1111,6 +1129,7 @@ class OriginActor {
 	}
 
 	#bindFailures = 0;
+	#preSendFailures = 0;
 	/** A terminal_uncertain bind poisons this epoch's idempotency key; retries cannot make that key decidable. */
 	#bindEpochPoisoned = false;
 
@@ -1477,11 +1496,55 @@ class OriginActor {
 			return;
 		}
 		if (report.status.status === "unknown") {
+			const count = (this.#holdSweeps.get(bound.turn.opRef) ?? 0) + 1;
+			this.#holdSweeps.set(bound.turn.opRef, count);
+			const state = this.#manager.database.inboundTurnRow(bound.turn.opRef)?.turn_state;
+			// This is the live counterpart of startup's operator_hold recovery.
+			// A BOUND turn has no broker acknowledgement. When the live session
+			// reports no such operation and its prompt queue remains empty across
+			// two sweeps, the send did not land; holding it forever bricks the
+			// origin. ACCEPTED work is different and remains protected from replay.
+			if (state === "bound" && !bound.retired && count >= HOLD_RELEASE_SWEEPS) {
+				let live: boolean | undefined;
+				let disowned = false;
+				try {
+					if (this.#manager.port.liveness) {
+						const liveness = await this.#manager.port.liveness({
+							sessionId: bound.sessionId,
+							repo: this.#manager.repo,
+						});
+						live = liveness.live;
+						disowned = liveness.disowned === true;
+					} else {
+						live = (await this.#manager.port.inspect({ sessionId: bound.sessionId, repo: this.#manager.repo }))?.live;
+					}
+				} catch {
+					// An indeterminate liveness probe is not release evidence.
+				}
+				const dead = live === false || disowned;
+				const liveIdle = live === true && (await this.#queueIsEmpty(bound.sessionId));
+				if (dead || liveIdle) {
+					this.#holdSweeps.delete(bound.turn.opRef);
+					await bound.tail?.close();
+					const attempt = this.#manager.database.inboundTurnRequeue(bound.turn.opRef);
+					const nextEpoch = this.#manager.database.rebindEpoch(this.originKey);
+					if (this.#current === bound) {
+						this.#current = undefined;
+						this.#state = "idle";
+					}
+					this.#manager.log(
+						`recovery_requeue_unaccepted origin=${this.originKey} epoch=${bound.epoch} nextEpoch=${nextEpoch} opRef=${bound.turn.opRef} session=${bound.sessionId} attempt=${attempt} reason=${dead ? "unknown_op_on_dead_session" : "unknown_op_on_live_idle_session"} sweeps=${count}`,
+					);
+					await this.#dispatchNext();
+					return;
+				}
+			}
 			this.#manager.log(
-				`recovery_hold origin=${this.originKey} epoch=${bound.epoch} opRef=${bound.turn.opRef} reason=operation_state_unknown`,
+				`recovery_hold origin=${this.originKey} epoch=${bound.epoch} opRef=${bound.turn.opRef} reason=operation_state_unknown sweeps=${count}`,
 			);
 			return;
 		}
+		this.#holdSweeps.delete(bound.turn.opRef);
 		if (this.#manager.database.inboundTurnRow(bound.turn.opRef)?.turn_state === "bound") {
 			this.#manager.database.inboundTurnAccept(bound.turn.opRef);
 			if (bound.tail) await bound.tail.markAccepted(bound.turn.opRef);

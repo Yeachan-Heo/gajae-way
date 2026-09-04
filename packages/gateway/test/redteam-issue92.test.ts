@@ -172,9 +172,19 @@ class IntermittentSteerPort extends ScriptedSessionPort {
 }
 
 class ConflictUnknownPort extends ScriptedSessionPort {
-	async send(input: SessionSendInput): Promise<never> {
-		this.sendAttempts.push(input);
-		throw new OpRefRejectedError(input.opRef, "client_ref_conflict", { code: "client_ref_conflict" });
+	attempts = 0;
+
+	async send(input: SessionSendInput) {
+		this.attempts++;
+		if (this.attempts === 1) {
+			this.sendAttempts.push(input);
+			throw new OpRefRejectedError(input.opRef, "client_ref_conflict", { code: "client_ref_conflict" });
+		}
+		return await super.send(input);
+	}
+
+	async queueEmpty(): Promise<boolean> {
+		return true;
 	}
 }
 
@@ -432,7 +442,7 @@ test("red-team: a stall on a retired hold does not abort it, block the next epoc
 	}
 });
 
-test("red-team: an unknown send outcome is an operator hold that is never resent, and later messages still reach the session as steers", async () => {
+test("red-team: an unknown unaccepted send is held once, then a live-idle session releases it onto a fresh epoch instead of bricking the origin", async () => {
 	const port = new ConflictUnknownPort();
 	const target = await fixture({ port });
 	try {
@@ -442,21 +452,26 @@ test("red-team: an unknown send outcome is an operator hold that is never resent
 			() => target.logs.some((line) => line.startsWith(`recovery_client_ref_conflict origin=${ORIGIN_KEY}`)),
 			"client_ref_conflict was not reconciled",
 		);
-		const batch = target.turns.values().next().value as InboundTurn;
-		expect(target.database.inboundTurnRows(batch.opRef)).toEqual(
+		const first = target.database.inboundNonterminalTurns(ORIGIN_KEY)[0]!;
+		expect(target.database.inboundTurnRows(first.opRef)).toEqual(
 			expect.arrayContaining([expect.objectContaining({ message_id: "conflict-trigger", turn_state: "bound" })]),
 		);
-		expect(target.logs.some((line) => line.includes("reason=operation_state_unknown"))).toBe(true);
+		expect(target.logs.some((line) => line.includes("reason=operation_state_unknown sweeps=1"))).toBe(true);
 		expect(port.sends).toEqual([]);
 
-		enqueue(target, "steered-while-unknown", "the user may still speak");
-		await target.manager.notifyInbound(ORIGIN_KEY);
-		// The undecidable OPERATION never gags the user: the message is steered
-		// into the session. The held trigger itself is untouched and unsent.
-		expect(port.steers).toHaveLength(1);
-		expect(port.sends).toEqual([]);
-		expect(target.database.inboundTurnRow(batch.opRef)).toMatchObject({ state: "pending", turn_state: "bound" });
-		expect(target.database.inboundPendingOldest(ORIGIN_KEY)).toBeUndefined();
+		// Second sweep: status still says unknown, but liveness says the session
+		// is live and its prompt queue is empty. Since the row is only BOUND (not
+		// acknowledged), the send did not land and is safe to release once.
+		await target.manager.tick(ORIGIN_KEY);
+		await eventually(() => port.sends.length === 1, "live-idle unknown operation did not re-dispatch");
+		const replacement = port.sends[0]!;
+		expect(replacement.opRef).not.toBe(first.opRef);
+		expect(replacement.text).toBe("operation identity is unknown");
+		expect(target.logs.some((line) => line.includes("reason=unknown_op_on_live_idle_session sweeps=2"))).toBe(true);
+		port.complete(replacement.opRef, "recovered without an operator");
+		await eventually(() => target.terminal.length === 1, "replacement did not complete");
+		expect(target.terminal).toEqual(["recovered without an operator"]);
+		expect(target.database.inboundPendingCount(ORIGIN_KEY)).toBe(0);
 	} finally {
 		await target.close();
 	}

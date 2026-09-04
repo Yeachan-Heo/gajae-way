@@ -511,3 +511,61 @@ test("a poisoned terminal_uncertain bind epoch is rotated after the bounded burs
 	expect(terminal).toEqual(["recovered after epoch rotation"]);
 	expect(database.inboundPendingCount(KEY)).toBe(0);
 });
+
+class ModelSetFlakyPort extends ScriptedSessionPort {
+	modelAttempts = 0;
+
+	constructor() {
+		super({ onSend: (input, scripted) => scripted.complete(input.opRef, "model recovered") });
+	}
+
+	async setModel(input: Parameters<ScriptedSessionPort["setModel"]>[0]) {
+		this.modelAttempts++;
+		if (this.modelAttempts === 1) throw new Error('model "removed/model" not found');
+		return await super.setModel(input);
+	}
+}
+
+test("model.set failure happens before send: the row returns to pending and retries instead of becoming an ambiguous bound hold", async () => {
+	home = await mkdtemp(join(tmpdir(), "gajaeway-session-restart-"));
+	database = await GatewayDatabase.open(join(home, "gateway.db"));
+	const port = new ModelSetFlakyPort();
+	const logs: string[] = [];
+	const terminal: string[] = [];
+	const timers: Array<{ readonly work: () => void; readonly delayMs: number }> = [];
+	manager = new PersonaSessionManager({
+		database,
+		port,
+		instanceId: "restart-test",
+		repo: join(home, "workspace"),
+		setTimeout: (work, delayMs) => {
+			const timer = { work, delayMs };
+			timers.push(timer);
+			return timer;
+		},
+		clearTimeout: () => {},
+		onTurnStart: ({ trigger }) => ({
+			text: trigger.body,
+			effectiveModel: "removed/model",
+			onTerminal: ({ text }) => {
+				terminal.push(text);
+			},
+		}),
+		log: (line) => logs.push(line),
+	});
+	enqueue("model-failure", "do not strand me behind model.set");
+	await manager.notifyInbound(KEY);
+	expect(port.modelAttempts).toBe(1);
+	expect(port.sendAttempts).toEqual([]);
+	expect(database.inboundPendingOldest(KEY)).toMatchObject({ message_id: "model-failure", turn_state: null });
+	expect(database.inboundNonterminalTurns(KEY)).toEqual([]);
+	expect(timers.map((timer) => timer.delayMs)).toEqual([2_000]);
+	expect(logs.some((line) => line.startsWith(`persona_model_failed origin=${KEY}`))).toBe(true);
+
+	timers[0]!.work();
+	await eventually(() => port.sends.length === 1, "model retry did not dispatch");
+	expect(port.modelAttempts).toBe(2);
+	expect(port.sends[0]!.text).toBe("do not strand me behind model.set");
+	await eventually(() => terminal.length === 1, "model-recovered turn did not complete");
+	expect(database.inboundPendingCount(KEY)).toBe(0);
+});
