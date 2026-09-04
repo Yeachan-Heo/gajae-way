@@ -91,6 +91,8 @@ export interface SessionBindInput {
 	readonly originKey: string;
 	readonly epoch: number;
 	readonly repo: string;
+	/** Startup selection; presets must be activated by session.create, not model.set. */
+	readonly model?: GjcModelSelection;
 	/** The SDK host's default coding register is retained when true. */
 	readonly codingRegister?: boolean;
 }
@@ -100,6 +102,7 @@ export interface SessionBinding {
 	readonly originKey: string;
 	readonly epoch: number;
 	readonly repo: string;
+	readonly startupModelApplied?: boolean;
 }
 
 export interface SessionSendInput {
@@ -235,7 +238,7 @@ export class BrokerSessionPort implements SessionPort {
 			return await this.bind({ ...input, epoch: rebound });
 		}
 		const idempotencyKey = sessionCreateRef(this.#instanceId, input.originKey, input.epoch, input.repo);
-		const created = await this.#createSession(input.repo, idempotencyKey);
+		const created = await this.#createSession(input.repo, idempotencyKey, input.model);
 		if (typeof created.sessionId !== "string" || created.sessionId.length === 0) {
 			throw new Error("session.create succeeded without a sessionId");
 		}
@@ -252,7 +255,13 @@ export class BrokerSessionPort implements SessionPort {
 		// a moment later. A tail/send before that answers session_unavailable, so
 		// wait until the broker reports the id live before handing the binding out.
 		await this.#awaitIndexed(created.sessionId, input.repo);
-		return { sessionId: created.sessionId, originKey: input.originKey, epoch: input.epoch, repo: input.repo };
+		return {
+			sessionId: created.sessionId,
+			originKey: input.originKey,
+			epoch: input.epoch,
+			repo: input.repo,
+			...(input.model ? { startupModelApplied: true } : {}),
+		};
 	}
 
 	#createChain: Promise<unknown> = Promise.resolve();
@@ -289,8 +298,12 @@ export class BrokerSessionPort implements SessionPort {
 	}
 
 	/** Cold creates are serialized per agent dir: parallel launches starve gjc's lifecycle launcher. */
-	#createSession(repo: string, idempotencyKey: string): Promise<{ readonly sessionId?: unknown }> {
-		const run = this.#createChain.then(async () => await this.#createSessionUnserialized(repo, idempotencyKey));
+	#createSession(
+		repo: string,
+		idempotencyKey: string,
+		model: GjcModelSelection | undefined,
+	): Promise<{ readonly sessionId?: unknown }> {
+		const run = this.#createChain.then(async () => await this.#createSessionUnserialized(repo, idempotencyKey, model));
 		this.#createChain = run.then(
 			() => undefined,
 			() => undefined,
@@ -298,7 +311,11 @@ export class BrokerSessionPort implements SessionPort {
 		return run;
 	}
 
-	async #createSessionUnserialized(repo: string, idempotencyKey: string): Promise<{ readonly sessionId?: unknown }> {
+	async #createSessionUnserialized(
+		repo: string,
+		idempotencyKey: string,
+		model: GjcModelSelection | undefined,
+	): Promise<{ readonly sessionId?: unknown }> {
 		let lastFailure: unknown;
 		for (let attempt = 1; attempt <= SESSION_CREATE_ATTEMPTS; attempt++) {
 			try {
@@ -317,7 +334,11 @@ export class BrokerSessionPort implements SessionPort {
 						// persona host); the runtime's 10s default readiness cutoff turns a
 						// slow-but-healthy cold start into spawn_failed. Use the maximum
 						// budget: create is idempotent under this key either way.
-						JSON.stringify({ cwd: repo, readinessTimeoutMs: SESSION_CREATE_READINESS_MS }),
+						JSON.stringify({
+							cwd: repo,
+							readinessTimeoutMs: SESSION_CREATE_READINESS_MS,
+							...(typeof model === "string" ? { modelId: model } : model ? { modelPreset: model.preset } : {}),
+						}),
 					]),
 					"session.create",
 				);

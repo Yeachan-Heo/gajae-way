@@ -507,6 +507,7 @@ function createRuntime(options: GatewayServerOptions): Runtime {
 		port: sessionPort,
 		instanceId: options.database.instanceId,
 		repo: join(options.config.home, "workspace"),
+		sessionModel: options.config.model,
 		stallTimeoutMs: options.config.stallTimeoutMs,
 		brokerGeneration: () => options.broker?.generation ?? 0,
 		onTurnStart: async (input) => await createInboundTurnLifecycle(input, options, runtime),

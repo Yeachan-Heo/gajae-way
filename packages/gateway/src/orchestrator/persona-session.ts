@@ -128,6 +128,8 @@ export interface PersonaSessionManagerOptions {
 	readonly port: SessionPort;
 	readonly instanceId: string;
 	readonly repo: string;
+	/** Startup model/preset passed to session.create; conversation overrides may replace it later. */
+	readonly sessionModel?: GjcModelSelection;
 	readonly stallTimeoutMs?: number;
 	readonly brokerGeneration?: () => number;
 	readonly now?: () => number;
@@ -174,6 +176,7 @@ export class PersonaSessionManager {
 	readonly #port: SessionPort;
 	readonly #instanceId: string;
 	readonly #repo: string;
+	readonly #sessionModel: GjcModelSelection | undefined;
 	#stallTimeoutMs: number;
 	readonly #brokerGeneration: () => number;
 	readonly #now: () => number;
@@ -194,6 +197,7 @@ export class PersonaSessionManager {
 		this.#port = options.port;
 		this.#instanceId = options.instanceId;
 		this.#repo = options.repo;
+		this.#sessionModel = options.sessionModel;
 		this.#stallTimeoutMs = positiveInteger(options.stallTimeoutMs, DEFAULT_STALL_TIMEOUT_MS, "stallTimeoutMs");
 		this.#brokerGeneration = options.brokerGeneration ?? (() => 0);
 		this.#now = options.now ?? (() => Date.now());
@@ -344,6 +348,10 @@ export class PersonaSessionManager {
 
 	get stallTimeoutMs(): number {
 		return this.#stallTimeoutMs;
+	}
+
+	get sessionModel(): GjcModelSelection | undefined {
+		return this.#sessionModel;
 	}
 
 	get brokerGeneration(): number {
@@ -1341,8 +1349,15 @@ class OriginActor {
 			// Deleted or unresumable: fall through to the epoch-scoped idempotent bind,
 			// whose rebind policy owns condemnation (SessionRebinder), not this actor.
 		}
-		const binding = await this.#manager.port.bind({ originKey: this.originKey, epoch, repo: this.#manager.repo });
+		const binding = await this.#manager.port.bind({
+			originKey: this.originKey,
+			epoch,
+			repo: this.#manager.repo,
+			...(this.#manager.sessionModel ? { model: this.#manager.sessionModel } : {}),
+		});
 		this.#manager.database.putSession(this.originKey, binding.sessionId);
+		if (binding.startupModelApplied && this.#manager.sessionModel)
+			this.#appliedModel.set(binding.sessionId, describeModel(this.#manager.sessionModel));
 		return binding;
 	}
 

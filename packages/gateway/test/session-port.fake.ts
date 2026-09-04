@@ -80,7 +80,14 @@ export class ScriptedSessionPort implements SessionPort {
 			live: true,
 			deleted: false,
 		});
-		return { sessionId, originKey: input.originKey, epoch: input.epoch, repo: input.repo };
+		if (input.model) this.models.push({ sessionId, repo: input.repo, selection: input.model });
+		return {
+			sessionId,
+			originKey: input.originKey,
+			epoch: input.epoch,
+			repo: input.repo,
+			...(input.model ? { startupModelApplied: true } : {}),
+		};
 	}
 
 	async inspect(input: { sessionId: string; repo: string }): Promise<BrokerSession | undefined> {

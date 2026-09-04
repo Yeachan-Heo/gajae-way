@@ -65,7 +65,13 @@ test("broker SessionPort preserves caller op-ref, model choice, bootstrap prompt
 	});
 	port.setStallTimeoutMs(5_000);
 	expect(tailRunner.stallTimeoutMs).toBe(5_000);
-	const binding = await port.bind({ originKey: "work/task/a", epoch: 0, repo: "/tmp/repo", codingRegister: true });
+	const binding = await port.bind({
+		originKey: "work/task/a",
+		epoch: 0,
+		repo: "/tmp/repo",
+		codingRegister: true,
+		model: { preset: "gpt-heavy" },
+	});
 	const result = await port.request({
 		sessionId: binding.sessionId,
 		repo: "/tmp/repo",
@@ -81,6 +87,10 @@ test("broker SessionPort preserves caller op-ref, model choice, bootstrap prompt
 	expect(calls[0]).toEqual(
 		expect.arrayContaining(["sdk", "session", "raw", "global", "--op", "session.create", "--idempotency-key"]),
 	);
+	const create = calls.find((args) => args.includes("session.create"))!;
+	const createInput = JSON.parse(create[create.indexOf("--json-input") + 1]!) as Record<string, unknown>;
+	expect(createInput).toMatchObject({ cwd: "/tmp/repo", modelPreset: "gpt-heavy" });
+	expect(binding.startupModelApplied).toBe(true);
 	const send = calls.find((args) => args.includes("send"))!;
 	expect(send).toEqual(
 		expect.arrayContaining(["--op-ref", "gw-work-1", "--text", "trusted bootstrap\n\nimplement it"]),
