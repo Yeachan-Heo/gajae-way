@@ -2,6 +2,7 @@ import { type MonitorRecord, type MonitorSpec, type TriggerSpec, validateOriginR
 import type { GatewayDatabase } from "../store/db";
 
 const BURST_POLICIES = new Set(["coalesce", "dedupe", "serialize", "drop"]);
+const SERVICE_TIERS = new Set(["none", "auto", "default", "flex", "scale", "priority", "openai-only", "claude-only"]);
 /** Upper bound on a per-monitor authoring instruction, in characters. */
 export const MONITOR_INSTRUCTION_MAX_LENGTH = 4000;
 
@@ -33,6 +34,8 @@ export class MonitorRegistry {
 				channelTargetJson: record.channelTarget ? JSON.stringify(record.channelTarget) : null,
 				enabled: record.enabled,
 				instruction: instruction ?? null,
+				modelJson: record.model ? JSON.stringify(record.model) : null,
+				serviceTier: record.serviceTier ?? null,
 			}),
 		);
 		return record;
@@ -58,6 +61,8 @@ function rowToRecord(row: ReturnType<GatewayDatabase["monitorRows"]>[number]): M
 		channelTarget: row.channel_target_json ? JSON.parse(row.channel_target_json) : null,
 		enabled: Boolean(row.enabled),
 		instruction: row.instruction ?? undefined,
+		model: row.model_json ? JSON.parse(row.model_json) : undefined,
+		serviceTier: (row.service_tier as MonitorRecord["serviceTier"]) ?? undefined,
 		createdAt: row.created_at,
 	};
 }
@@ -73,6 +78,19 @@ export function validateSpec(spec: MonitorSpec): void {
 	if (spec.burstPolicy && !BURST_POLICIES.has(spec.burstPolicy)) throw new Error("invalid monitor burstPolicy");
 	validateTrigger(spec.trigger);
 	if (spec.channelTarget) validateOriginRef(spec.channelTarget.origin);
+	if (spec.model !== undefined) {
+		const valid =
+			(typeof spec.model === "string" && spec.model.trim() !== "") ||
+			(typeof spec.model === "object" &&
+				spec.model !== null &&
+				!Array.isArray(spec.model) &&
+				Object.keys(spec.model).length === 1 &&
+				typeof spec.model.preset === "string" &&
+				spec.model.preset.trim() !== "");
+		if (!valid) throw new Error("monitor model must be a non-empty selector or contain only preset");
+	}
+	if (spec.serviceTier !== undefined && !SERVICE_TIERS.has(spec.serviceTier))
+		throw new Error("monitor serviceTier is invalid");
 	if (spec.instruction !== undefined) {
 		if (typeof spec.instruction !== "string") throw new Error("monitor instruction must be a string");
 		if (spec.instruction.length > MONITOR_INSTRUCTION_MAX_LENGTH)

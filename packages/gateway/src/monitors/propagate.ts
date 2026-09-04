@@ -8,6 +8,7 @@ import {
 	type OriginRef,
 	originKey,
 } from "@gajaeway/protocol";
+import type { GjcModelSelection, GjcServiceTier } from "../config";
 import type { DeliveryService } from "../delivery/delivery";
 import type { MemoryClosureQueue } from "../memory/closure";
 import type { SessionPort } from "../orchestrator/session-port";
@@ -149,6 +150,10 @@ export class MonitorPropagator {
 	#inFlightPromises = new Map<string, Promise<void>>();
 	/** Per-origin serialization lives in SessionPort, shared with all SDK callers. */
 	readonly #repo: string;
+	readonly #model: GjcModelSelection | undefined;
+	readonly #serviceTier: GjcServiceTier | undefined;
+	readonly #appliedModels = new Map<string, string>();
+	readonly #appliedServiceTiers = new Map<string, GjcServiceTier>();
 	/**
 	 * Per-session-origin safety-net state (issue #68). Process-local on purpose:
 	 * it is evidence about the CURRENT live session, and a restart mints a fresh
@@ -174,6 +179,9 @@ export class MonitorPropagator {
 		deliver?: (payload: ChatMessagePayload) => void;
 		/** Workspace used for broker-session creation and all SDK queries. */
 		repo?: string;
+		/** Model/preset and request tier applied to dedicated monitor authoring sessions. */
+		model?: GjcModelSelection;
+		serviceTier?: GjcServiceTier;
 		/** Injectable clock for deterministic lease expiry/renewal in tests. */
 		now?: () => number;
 		/**
@@ -201,6 +209,8 @@ export class MonitorPropagator {
 		protocolFailureRollThreshold?: number;
 	}) {
 		this.#database = options.database;
+		this.#model = options.model;
+		this.#serviceTier = options.serviceTier;
 		this.#registry = options.registry;
 		this.#sessionPort = options.sessionPort;
 		this.#memory = options.memory;
@@ -504,13 +514,32 @@ export class MonitorPropagator {
 				// new epoch's session. Leases and fencing are untouched.
 				const digest = this.#rollSessionIfArmed(sessionOriginKey, JSON.stringify(sessionOrigin), monitor);
 				const boundEpoch = this.#database.getSessionRecord(sessionOriginKey)?.epoch ?? 0;
-				const { sessionId } = await this.#sessionPort.bind({
+				const effectiveModel = (monitor.model as GjcModelSelection | undefined) ?? this.#model;
+				const effectiveServiceTier = (monitor.serviceTier as GjcServiceTier | undefined) ?? this.#serviceTier;
+				const binding = await this.#sessionPort.bind({
 					originKey: sessionOriginKey,
 					epoch: boundEpoch,
 					repo: this.#repo,
+					...(effectiveModel ? { model: effectiveModel } : {}),
 				});
+				const { sessionId } = binding;
 				boundSessionId = sessionId;
-				boundSessionEpoch = boundEpoch;
+				boundSessionEpoch = binding.epoch;
+				const modelKey = effectiveModel
+					? typeof effectiveModel === "string"
+						? effectiveModel
+						: `preset:${effectiveModel.preset}`
+					: undefined;
+				if (effectiveModel && !binding.startupModelApplied && this.#appliedModels.get(sessionId) !== modelKey) {
+					await this.#sessionPort.setModel({ sessionId, repo: this.#repo, selection: effectiveModel });
+					this.#appliedModels.set(sessionId, modelKey!);
+				} else if (effectiveModel && binding.startupModelApplied) {
+					this.#appliedModels.set(sessionId, modelKey!);
+				}
+				if (effectiveServiceTier && this.#appliedServiceTiers.get(sessionId) !== effectiveServiceTier) {
+					await this.#sessionPort.setServiceTier({ sessionId, repo: this.#repo, tier: effectiveServiceTier });
+					this.#appliedServiceTiers.set(sessionId, effectiveServiceTier);
+				}
 				// Guidance order: the monitor's own instruction first (it is what the
 				// owner actually asked this monitor to do), then any built-in
 				// maintenance semantics for the claimed event types. Without either,

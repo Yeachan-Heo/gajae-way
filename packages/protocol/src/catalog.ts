@@ -313,6 +313,16 @@ export type TriggerSpec =
 	| { readonly kind: "script"; readonly command: readonly string[]; readonly intervalMs: number };
 
 export type BurstPolicyKind = "coalesce" | "dedupe" | "serialize" | "drop";
+export type MonitorModelSelection = string | { readonly preset: string };
+export type MonitorServiceTier =
+	| "none"
+	| "auto"
+	| "default"
+	| "flex"
+	| "scale"
+	| "priority"
+	| "openai-only"
+	| "claude-only";
 
 export interface MonitorSpec {
 	readonly name: string;
@@ -330,6 +340,10 @@ export interface MonitorSpec {
 	 * response contract is unaffected.
 	 */
 	readonly instruction?: string;
+	/** Absent means inherit the gateway default; present overrides this monitor's authoring session. */
+	readonly model?: MonitorModelSelection;
+	/** Absent means inherit the gateway default; present overrides this monitor's request tier. */
+	readonly serviceTier?: MonitorServiceTier;
 	readonly enabled?: boolean;
 }
 

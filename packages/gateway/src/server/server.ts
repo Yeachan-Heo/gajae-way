@@ -533,6 +533,8 @@ function createRuntime(options: GatewayServerOptions): Runtime {
 		delivery,
 		ownerTarget: options.config.ownerTarget,
 		contextFailureRollThreshold: options.config.monitorContextFailureRollThreshold,
+		model: options.config.model,
+		serviceTier: options.config.serviceTier,
 		repo: join(options.config.home, "workspace"),
 		// AC7: the ONE production compaction seam. Native compaction runs through the
 		// broker-bound SessionPort, whose authenticated control receipt is the only

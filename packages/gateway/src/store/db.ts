@@ -86,7 +86,7 @@ export class InboundTurnConflictError extends Error {
 	}
 }
 
-const LATEST_SCHEMA_VERSION = 19;
+const LATEST_SCHEMA_VERSION = 20;
 /** Maximum number of prior messages supplied to one engaged conversation turn. */
 export const CONVERSATION_DIFF_MAX_ROWS = 60;
 /** Maximum age of prior messages supplied to one engaged conversation turn. */
@@ -1480,10 +1480,12 @@ export class GatewayDatabase {
 		channelTargetJson: string | null;
 		enabled: boolean;
 		instruction: string | null;
+		modelJson: string | null;
+		serviceTier: string | null;
 	}): void {
 		this.#database
 			.query(
-				"INSERT INTO monitors (monitor_id, name, trigger_json, event_types_json, burst_policy, channel_target_json, enabled, created_at, instruction) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+				"INSERT INTO monitors (monitor_id, name, trigger_json, event_types_json, burst_policy, channel_target_json, enabled, created_at, instruction, model_json, service_tier) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
 			)
 			.run(
 				row.id,
@@ -1495,6 +1497,8 @@ export class GatewayDatabase {
 				row.enabled ? 1 : 0,
 				new Date().toISOString(),
 				row.instruction,
+				row.modelJson,
+				row.serviceTier,
 			);
 	}
 	monitorRows(): Array<{
@@ -1507,10 +1511,12 @@ export class GatewayDatabase {
 		enabled: number;
 		created_at: string;
 		instruction: string | null;
+		model_json: string | null;
+		service_tier: string | null;
 	}> {
 		return this.#database
 			.query(
-				"SELECT monitor_id, name, trigger_json, event_types_json, burst_policy, channel_target_json, enabled, created_at, instruction FROM monitors ORDER BY created_at",
+				"SELECT monitor_id, name, trigger_json, event_types_json, burst_policy, channel_target_json, enabled, created_at, instruction, model_json, service_tier FROM monitors ORDER BY created_at",
 			)
 			.all() as Array<{
 			monitor_id: string;
@@ -1522,6 +1528,8 @@ export class GatewayDatabase {
 			enabled: number;
 			created_at: string;
 			instruction: string | null;
+			model_json: string | null;
+			service_tier: string | null;
 		}>;
 	}
 	monitorDelete(id: string): boolean {
@@ -2402,6 +2410,21 @@ ALTER TABLE monitor_slots ADD COLUMN event_id TEXT;`,
 				this.#database
 					.query("INSERT INTO schema_migrations (version, applied_at) VALUES (?, ?)")
 					.run(19, new Date().toISOString());
+			});
+		}
+		if (current < 20) {
+			this.withTransaction(() => {
+				const columns = new Set(
+					this.#database
+						.query<{ name: string }, []>("PRAGMA table_info(monitors)")
+						.all()
+						.map((row) => row.name),
+				);
+				if (!columns.has("model_json")) this.#database.exec("ALTER TABLE monitors ADD COLUMN model_json TEXT");
+				if (!columns.has("service_tier")) this.#database.exec("ALTER TABLE monitors ADD COLUMN service_tier TEXT");
+				this.#database
+					.query("INSERT INTO schema_migrations (version, applied_at) VALUES (?, ?)")
+					.run(20, new Date().toISOString());
 			});
 		}
 	}
