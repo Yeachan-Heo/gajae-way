@@ -97,7 +97,8 @@ export interface EngagementContext {
 	/**
 	 * The message this one replies to, when the platform reports a reply. Absent
 	 * for every message that is not a reply, so existing payloads are unchanged.
-	 * Metadata only: a reply never decides engagement by itself.
+	 * A platform adapter may treat `fromSelf` as an addressed signal alongside a
+	 * real mention; the gateway still applies the configured mode and audience.
 	 */
 	readonly replyTo?: ReplyContext;
 }

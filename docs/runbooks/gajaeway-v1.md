@@ -30,7 +30,7 @@ The CLI does not start the daemon: `gajaeway daemon run` prints the launcher com
   "socketPath": "/absolute/path/gateway.sock",
   "dbPath": "/absolute/path/gateway.db",
   "credentials": { "discord": { "credentialFile": "/absolute/path/discord-token" } },
-  "channels": { "channel-id": { "engagement": "open" } },
+  "channels": { "channel-id": { "engagement": "open", "audience": "human-only" } },
   "model": { "preset": "codex-medium" },
   "stallTimeoutMs": 120000,
   "mentionAllowlist": ["owner-author-id"],
@@ -51,7 +51,7 @@ Use schema version 1 only. Each credential is a file reference, never an inline 
 
 ## Adapters and engagement
 
-Create separate credential files for Discord and Telegram tokens, then reference them as `credentials.discord` and `credentials.telegram`. Configure group/channel engagement with `channels.<conversation-id>.engagement: "open"`; unconfigured group traffic remains mention-gated. Direct messages engage normally. Verify adapter connectivity from its service logs and use `gajaeway sessions list` to confirm accepted traffic.
+Create separate credential files for Discord and Telegram tokens, then reference them as `credentials.discord` and `credentials.telegram`. Discord channel engagement is exactly `open`, `mention-open`, or `closed`; select `all`, `human-only`, or `bot-only` independently with `audience`. Omitted audience is safely `human-only`. `mention-open` wakes only for a real mention or a native reply to this bot, while `closed` also requires owner/allowlist authorization. Parent channel policy applies to Discord threads unless a thread entry overrides it. Verify adapter connectivity from its service logs and use `gajaeway sessions list` to confirm accepted traffic.
 
 ### Emoji reactions
 

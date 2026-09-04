@@ -27,7 +27,7 @@ test("an edited human message in an open channel becomes a chat.edit with the ne
 		messageId: "m1",
 		text: "hello, edited",
 		origin: { platform: "discord", kind: "channel", conversationId: "chan-1" },
-		engagement: { mentioned: true, group: true, authorId: "human-1" },
+		engagement: { mentioned: false, group: true, authorId: "human-1", authorName: "human", authorHandle: "human" },
 		receivedAt: new Date(1_756_900_000_000).toISOString(),
 	});
 });

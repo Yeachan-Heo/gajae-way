@@ -41,6 +41,41 @@ test("loads and trims the token credential file without exposing its value", asy
 	}
 });
 
+test("accepts exact engagement modes and audiences while preserving omitted audience", async () => {
+	const home = await mkdtemp(join(tmpdir(), "gajaeway-discord-policy-"));
+	try {
+		await writeFile(join(home, "token"), "secret-token");
+		await writeFile(
+			join(home, "adapter-discord.json"),
+			JSON.stringify({
+				tokenFile: "token",
+				channels: {
+					legacy: { engagement: "open" },
+					collab: { engagement: "mention-open", audience: "all" },
+					locked: { engagement: "closed", audience: "bot-only" },
+				},
+			}),
+		);
+		const config = await loadDiscordAdapterConfig({ GAJAEWAY_HOME: home });
+		expect(config.channels?.legacy).toEqual({ engagement: "open" });
+		expect(config.channels?.collab).toEqual({ engagement: "mention-open", audience: "all" });
+		expect(config.channels?.locked).toEqual({ engagement: "closed", audience: "bot-only" });
+
+		for (const channels of [
+			{ c: { engagement: "open-mention-only" } },
+			{ c: { engagement: "open", audience: "sometimes" } },
+			{ c: { engagement: "open", extra: true } },
+		]) {
+			await writeFile(join(home, "adapter-discord.json"), JSON.stringify({ tokenFile: "token", channels }));
+			await expect(loadDiscordAdapterConfig({ GAJAEWAY_HOME: home })).rejects.toBeInstanceOf(
+				DiscordAdapterStartupError,
+			);
+		}
+	} finally {
+		await rm(home, { recursive: true, force: true });
+	}
+});
+
 test("maps guild channels, threads, and DMs to canonical Discord origins", () => {
 	expect(discordMessageOrigin({ author, channel: { id: "channel-1" } })).toEqual({
 		platform: "discord",

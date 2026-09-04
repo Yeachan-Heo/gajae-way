@@ -411,7 +411,7 @@ test("unengaged messages before a mention arrive as the unread diff with speaker
 		logVerbosity: "info",
 		// This harness drives DM turns; DMs are authorisation-gated now.
 		dmPolicy: "open" as const,
-		channels: { c1: { engagement: "open-mention-only" } },
+		channels: { c1: { engagement: "mention-open" } },
 	};
 	const database = await GatewayDatabase.open(config.dbPath);
 	const turns: Array<{ text: string; preamble: string }> = [];

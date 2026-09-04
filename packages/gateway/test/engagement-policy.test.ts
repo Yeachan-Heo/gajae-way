@@ -16,13 +16,14 @@ test("loopback engages while unmentioned groups and unauthorised DMs decline", (
 	// no allowlist configured, the DM path fails closed.
 	expect(decideEngagement({ platform: "discord", kind: "dm", conversationId: "dm" }, undefined, config)).toEqual({
 		engaged: false,
+		botAudienceAdmission: false,
 	});
 	expect(
 		decideEngagement({ platform: "loopback", kind: "loopback", conversationId: "loopback" }, undefined, config),
-	).toEqual({ engaged: true });
+	).toEqual({ engaged: true, botAudienceAdmission: false });
 	expect(
 		decideEngagement({ platform: "discord", kind: "channel", conversationId: "channel" }, engagement, config),
-	).toEqual({ engaged: false });
+	).toEqual({ engaged: false, botAudienceAdmission: false });
 });
 test("per-channel open override engages group messages", () => {
 	expect(
@@ -30,7 +31,7 @@ test("per-channel open override engages group messages", () => {
 			...config,
 			channels: { channel: { engagement: "open" } },
 		}),
-	).toEqual({ engaged: true });
+	).toEqual({ engaged: true, botAudienceAdmission: false });
 });
 
 test("mention allowlist gates group mention commands and DMs but never open channels", () => {

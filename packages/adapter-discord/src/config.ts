@@ -1,6 +1,7 @@
 import { readFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { dirname, isAbsolute, join, resolve } from "node:path";
+import { type ChannelEngagementPolicy, ENGAGEMENT_AUDIENCES, ENGAGEMENT_MODES } from "@gajaeway/protocol";
 
 /**
  * Inbound voice-message transcription.
@@ -57,7 +58,7 @@ export interface DiscordAdapterConfig {
 	readonly tokenFile: string;
 	readonly gatewaySocket?: string;
 	readonly intents?: readonly number[];
-	readonly channels?: Readonly<Record<string, { readonly engagement?: "open" }>>;
+	readonly channels?: Readonly<Record<string, ChannelEngagementPolicy>>;
 	readonly voice?: DiscordVoiceConfig;
 }
 
@@ -105,7 +106,9 @@ export async function loadDiscordAdapterConfig(
 		throw new DiscordAdapterStartupError("Discord adapter intents must be an array of integer intent values.");
 	}
 	if (raw.channels !== undefined && !validChannels(raw.channels)) {
-		throw new DiscordAdapterStartupError('Discord adapter channels entries may only set engagement to "open".');
+		throw new DiscordAdapterStartupError(
+			`Discord adapter channels entries may only set engagement to ${ENGAGEMENT_MODES.join(", ")} and audience to ${ENGAGEMENT_AUDIENCES.join(", ")}.`,
+		);
 	}
 	const tokenFile = isAbsolute(raw.tokenFile) ? raw.tokenFile : resolve(dirname(configPath), raw.tokenFile);
 	let token: string;
@@ -175,11 +178,15 @@ function isObject(value: unknown): value is Record<string, unknown> {
 	return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
-function validChannels(value: unknown): value is Record<string, { readonly engagement?: "open" }> {
+function validChannels(value: unknown): value is Record<string, ChannelEngagementPolicy> {
 	return (
 		isObject(value) &&
 		Object.values(value).every(
-			(entry) => isObject(entry) && (entry.engagement === undefined || entry.engagement === "open"),
+			(entry) =>
+				isObject(entry) &&
+				Object.keys(entry).every((key) => key === "engagement" || key === "audience") &&
+				(entry.engagement === undefined || ENGAGEMENT_MODES.includes(entry.engagement as never)) &&
+				(entry.audience === undefined || ENGAGEMENT_AUDIENCES.includes(entry.audience as never)),
 		)
 	);
 }

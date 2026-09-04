@@ -44,6 +44,16 @@ export {
 	type WorkRunResult,
 } from "./catalog";
 export {
+	type ChannelEngagementDecision,
+	type ChannelEngagementInput,
+	type ChannelEngagementPolicy,
+	ENGAGEMENT_AUDIENCES,
+	ENGAGEMENT_MODES,
+	type EngagementAudience,
+	type EngagementMode,
+	evaluateChannelEngagement,
+} from "./engagement";
+export {
 	ERROR_CODES,
 	type ErrorCode,
 	isErrorCode,
