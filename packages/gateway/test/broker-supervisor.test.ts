@@ -243,7 +243,20 @@ test("default readiness spawns gjc once to launch the daemon, then judges health
 	agentDir = broker.agentDir;
 	try {
 		await broker.start();
-		expect(commands).toEqual([["sdk", "session", "--agent-dir", broker.agentDir, "list", "--scope", "cwd"]]);
+		expect(commands).toEqual([
+			[
+				"sdk",
+				"session",
+				"--agent-dir",
+				broker.agentDir,
+				"raw",
+				"global",
+				"--op",
+				"session.list",
+				"--json-input",
+				'{"resolveSessionId":"00000000-0000-4000-8000-000000000000"}',
+			],
+		]);
 	} finally {
 		await broker.stop();
 		transport.stop();
@@ -356,12 +369,15 @@ test("red-team B1: a daemon that never answers is unhealthy; one that answers - 
 		expect(await probeBrokerEndpoint(at(erroring.url), 500, (code) => void codes.push(code))).toBe(true);
 		expect(codes).toEqual(["unavailable"]);
 		expect(await probeBrokerEndpoint(at(healthy.url), 500)).toBe(true);
-		// The probe issued a real read-only operation, not just a hello, and it
-		// must NOT paginate: a page smaller than the session list makes the daemon
-		// pin a continuation cursor for 15 minutes out of a pool of 32, which a
-		// 5s probe exhausts in under three minutes.
-		expect(healthy.requests).toEqual([expect.objectContaining({ type: "broker_request", operation: "session.list" })]);
-		expect((healthy.requests[0] as { input?: Record<string, unknown> }).input ?? {}).not.toHaveProperty("limit");
+		// The probe is an exact-empty lookup: no session count can make it
+		// paginate or allocate a cursor, so a process can run indefinitely.
+		expect(healthy.requests).toEqual([
+			expect.objectContaining({
+				type: "broker_request",
+				operation: "session.list",
+				input: { resolveSessionId: "00000000-0000-4000-8000-000000000000" },
+			}),
+		]);
 		// A hello with the wrong protocol version is not a broker we know how to talk to.
 		const wrongVersion = fakeBrokerTransport("secret-token", { protocolVersion: 2 });
 		try {
