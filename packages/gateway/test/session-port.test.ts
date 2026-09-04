@@ -303,6 +303,7 @@ test("a recovered answer is the full body, never the 500-character summary", asy
 							// The host ships both: textSummary is body.slice(0, 500).
 							{ role: "assistant", ts: new Date().toISOString(), textSummary: body.slice(0, 500), body },
 						],
+						complete: true,
 					},
 				}),
 				stderr: "",
@@ -321,6 +322,57 @@ test("a recovered answer is the full body, never the 500-character summary", asy
 		expect(recovered?.text).toBe(body);
 		expect(recovered?.text.length).toBeGreaterThan(500);
 		expect(recovered?.text.endsWith("끝.")).toBe(true);
+	} finally {
+		database.close();
+		await rm(home, { recursive: true, force: true });
+	}
+});
+
+test("fetchAssistantSince follows transcript continuation pages and returns the newest turn-scoped assistant", async () => {
+	const home = await mkdtemp(join(tmpdir(), "gajaeway-session-port-pages-"));
+	const database = await GatewayDatabase.open(join(home, "gateway.db"));
+	const floor = Date.now();
+	const cursors: Array<string | undefined> = [];
+	const run: CliRunner = async (args) => {
+		if (!args.includes("transcript.list")) throw new Error(`unexpected command ${args.join(" ")}`);
+		const cursorIndex = args.indexOf("--cursor");
+		const cursor = cursorIndex < 0 ? undefined : args[cursorIndex + 1];
+		cursors.push(cursor);
+		return {
+			exitCode: 0,
+			stdout: JSON.stringify(
+				cursor === undefined
+					? {
+							page: {
+								items: [{ role: "assistant", ts: new Date(floor - 60_000).toISOString(), body: "old answer" }],
+								complete: false,
+								continuationCursor: "page-2",
+							},
+						}
+					: {
+							page: {
+								items: [{ role: "assistant", ts: new Date(floor + 1_000).toISOString(), body: "current answer" }],
+								complete: true,
+							},
+						},
+			),
+			stderr: "",
+		};
+	};
+	const port = new BrokerSessionPort({
+		database,
+		cli: run,
+		instanceId: "instance-pages",
+		tailRunner: new TailRunner({ run, repo: join(home, "workspace"), stallTimeoutMs: 1_000 }),
+	});
+	try {
+		const recovered = await port.fetchAssistantSince({
+			sessionId: "11111111-2222-3333-4444-555555555555",
+			repo: join(home, "workspace"),
+			notBeforeMs: floor,
+		});
+		expect(cursors).toEqual([undefined, "page-2"]);
+		expect(recovered).toEqual({ text: "current answer", pages: 2, complete: true });
 	} finally {
 		database.close();
 		await rm(home, { recursive: true, force: true });

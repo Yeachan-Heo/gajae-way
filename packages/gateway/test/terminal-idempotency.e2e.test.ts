@@ -660,7 +660,11 @@ test("a frame attributed to the accepted op passes the turn floor even with an o
 		// fetchAssistantSince can't see it (no terminal op yet); the tail frame is
 		// the only evidence: attributed to the op, but stamped an hour ago by a
 		// skewed host clock. Attribution wins over the timestamp floor.
-		port.fetchAssistantSince = async () => undefined;
+		let transcriptReads = 0;
+		port.fetchAssistantSince = async () => {
+			transcriptReads++;
+			return undefined;
+		};
 		port.emitReplayedTranscriptRow(send.sessionId, "답", Date.now() - 3_600_000, send.opRef);
 		// An un-attributed row with the same old stamp is fenced.
 		port.emitReplayedTranscriptRow(send.sessionId, "낡은 답", Date.now() - 3_600_000);
@@ -668,6 +672,7 @@ test("a frame attributed to the accepted op passes the turn floor even with an o
 		port.completeWithoutAnswerFrame(send.opRef, "답");
 		await eventually(() => terminals.length === 1, "reply missing");
 		expect(terminals).toEqual([{ trigger: "m-t1", text: "답" }]);
+		expect(transcriptReads).toBe(0);
 	} finally {
 		await manager.stop();
 	}

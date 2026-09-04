@@ -427,6 +427,10 @@ type BoundTurn = PersonaTurnIdentity & {
 	 * (no opRef) and those must never become this turn's answer.
 	 */
 	lastAssistantText?: string;
+	/** True only when lastAssistantText came from a frame explicitly attributed to this turn's opRef. */
+	lastAssistantOpAttributed: boolean;
+	/** Host timestamp of lastAssistantText, for legacy frames without an opRef. */
+	lastAssistantAtMs?: number;
 	/** `dispatched_at` of the turn: stamped at bind, before the send. Absent only for a corrupt row. */
 	dispatchedAtMs?: number;
 	replaceAfterTerminal: boolean;
@@ -772,6 +776,7 @@ class OriginActor {
 			answerWanted: false,
 			tailEvidenceUnavailable: false,
 			statusTerminalHolds: 0,
+			lastAssistantOpAttributed: false,
 			...(dispatchedAtMs === undefined ? {} : { dispatchedAtMs }),
 			replaceAfterTerminal: false,
 		};
@@ -973,6 +978,7 @@ class OriginActor {
 			answerWanted: false,
 			tailEvidenceUnavailable: false,
 			statusTerminalHolds: 0,
+			lastAssistantOpAttributed: false,
 			...(dispatchedAtMs === undefined ? {} : { dispatchedAtMs }),
 			replaceAfterTerminal: false,
 		};
@@ -1442,7 +1448,11 @@ class OriginActor {
 			if (frame.assistantText)
 				this.#manager.log(`stale_output origin=${this.originKey} epoch=${epoch} session=${sessionId}`);
 		} else {
-			if (frame.assistantText && !frame.steerEcho) bound.lastAssistantText = frame.assistantText;
+			if (frame.assistantText && !frame.steerEcho) {
+				bound.lastAssistantText = frame.assistantText;
+				bound.lastAssistantOpAttributed = tailOperationRef(frame) === bound.turn.opRef;
+				bound.lastAssistantAtMs = tailFrameTimestampMs(frame);
+			}
 			await bound.lifecycle.onFrame?.({ ...bound, frame });
 			if (!bound.lifecycle.onFrame && frame.assistantText && frame.eventId && !frame.steerEcho) {
 				const key = `${sessionId}:${frame.eventId}`;
@@ -1646,22 +1656,20 @@ class OriginActor {
 		}
 		try {
 			if ((!bound.retired || bound.answerWanted) && report.status.status === "terminal_ok") {
-				// The transcript is the authority for the answer text. The live tail's
-				// lastAssistantText is turn-scoped too (see #predatesTurn) but it is
-				// an observation of a stream that can be re-attached, replayed and
-				// fenced; the durable row produced at/after this turn's floor is what
-				// the model actually said for THIS trigger. The runtime's startedAt
-				// is stamped by the SAME host clock as the transcript rows, so it is
-				// the exact floor whenever it is present; our dispatched_at (stamped
-				// at bind, BEFORE the send, cleared on requeue) is the fallback for
-				// a runtime that omits startedAt. Mixing the two clocks (a max) was
-				// tried and rejected: a gateway clock ahead of the host would hide
-				// the real answer.
+				// Normal delivery is deliberately simple: the current turn's tail is
+				// the live authority. #predatesTurn already fences cursorless replay,
+				// and op-attributed frames win over skewed timestamps. Transcript lookup
+				// is recovery-only for a restart/retention gap where no terminal tail
+				// answer survived.
 				const startedAt = report.status.startedAt;
 				const notBeforeMs = typeof startedAt === "number" ? startedAt : bound.dispatchedAtMs;
 				const port = this.#manager.port;
-				let text: string | undefined;
-				if (notBeforeMs !== undefined && port.fetchAssistantSince) {
+				const tailTextIsCurrent =
+					bound.lastAssistantOpAttributed ||
+					bound.lastAssistantAtMs === undefined ||
+					(bound.dispatchedAtMs !== undefined && bound.lastAssistantAtMs >= bound.dispatchedAtMs);
+				let text = bound.tailTerminalObserved && tailTextIsCurrent ? bound.lastAssistantText : undefined;
+				if (text === undefined && notBeforeMs !== undefined && port.fetchAssistantSince) {
 					try {
 						const since = await port.fetchAssistantSince({
 							sessionId: bound.sessionId,
@@ -1674,11 +1682,6 @@ class OriginActor {
 							`terminal_text_unavailable origin=${this.originKey} epoch=${bound.epoch} opRef=${bound.turn.opRef} reason=transcript_read_failed detail=${safeDiagnostic(error)}`,
 						);
 					}
-				}
-				if (text === undefined && bound.tailTerminalObserved && bound.lastAssistantText !== undefined) {
-					// The transcript had no row at/after the floor (or could not be
-					// read) but the live tail carried a turn-scoped answer.
-					text = bound.lastAssistantText;
 				}
 				if (text === undefined) {
 					if (notBeforeMs === undefined) {
