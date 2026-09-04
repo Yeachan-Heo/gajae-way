@@ -91,8 +91,9 @@ function firstText(...values: unknown[]): string | undefined {
 
 function safeCode(value: string | undefined): string | undefined {
 	if (value === undefined) return undefined;
-	const normalized = value
-		.trim()
+	const trimmed = value.trim();
+	if (redactSecrets(trimmed) !== trimmed) return undefined;
+	const normalized = trimmed
 		.toLowerCase()
 		.replace(/[^a-z0-9._-]+/g, "_")
 		.replace(/^_+|_+$/g, "");

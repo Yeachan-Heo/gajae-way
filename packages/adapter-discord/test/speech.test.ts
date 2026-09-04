@@ -131,6 +131,16 @@ test("a malformed provider error body is not copied into logs", async () => {
 	expect(logged[0]).not.toContain("second line");
 });
 
+test("secret-like provider codes are replaced rather than logged", async () => {
+	const logged: string[] = [];
+	const { fetch } = stubFetch([
+		Response.json({ detail: { code: "sk-live-code-secret", message: "provider failed" } }, { status: 503 }),
+	]);
+	expect(await synthesizeVoice("안녕", KEY, { fetch, log: (line) => logged.push(line) })).toBeUndefined();
+	expect(logged[0]).toContain("category=provider_error code=provider_error");
+	expect(logged[0]).not.toContain("sk-live-code-secret");
+});
+
 test("synthesis fails open on a thrown network error and on empty audio", async () => {
 	const a = stubFetch([new Error("econnreset")]);
 	expect(await synthesizeVoice("안녕", KEY, { fetch: a.fetch })).toBeUndefined();
