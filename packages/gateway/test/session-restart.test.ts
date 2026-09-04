@@ -427,3 +427,87 @@ test("a bound turn whose id the Router disowns is released and re-fired even whe
 	expect(database.getSessionRecord(KEY)?.epoch).toBe(1);
 	expect(port.sends[0]!.opRef).not.toBe(opRef);
 });
+
+class PoisonedBindEpochPort extends ScriptedSessionPort {
+	bindAttempts = 0;
+	readonly bindEpochs: number[] = [];
+
+	constructor() {
+		super({
+			onBind: (input) => `session-${input.epoch}`,
+			onSend: (input, scripted) => scripted.complete(input.opRef, "recovered after epoch rotation"),
+		});
+	}
+
+	async bind(input: Parameters<ScriptedSessionPort["bind"]>[0]) {
+		this.bindAttempts++;
+		this.bindEpochs.push(input.epoch);
+		if (this.bindAttempts === 1 || this.bindAttempts === 3)
+			throw new Error("gjc sdk request failed: terminal_uncertain");
+		if (this.bindAttempts === 2) throw new Error("gjc command timed out after 30000ms");
+		return await super.bind(input);
+	}
+}
+
+test("a poisoned terminal_uncertain bind epoch is rotated after the bounded burst; the pending row is sent once on the new epoch", async () => {
+	home = await mkdtemp(join(tmpdir(), "gajaeway-session-restart-"));
+	database = await GatewayDatabase.open(join(home, "gateway.db"));
+	const port = new PoisonedBindEpochPort();
+	const logs: string[] = [];
+	const terminal: string[] = [];
+	const timers: Array<{ readonly work: () => void; readonly delayMs: number }> = [];
+	manager = new PersonaSessionManager({
+		database,
+		port,
+		instanceId: "restart-test",
+		repo: join(home, "workspace"),
+		setTimeout: (work, delayMs) => {
+			const timer = { work, delayMs };
+			timers.push(timer);
+			return timer;
+		},
+		clearTimeout: () => {},
+		onTurnStart: ({ trigger }) => ({
+			text: trigger.body,
+			onTerminal: ({ text }) => {
+				terminal.push(text);
+			},
+		}),
+		log: (line) => logs.push(line),
+	});
+	enqueue("poisoned", "must survive the poisoned session-create key");
+	await manager.notifyInbound(KEY);
+	expect(port.bindEpochs).toEqual([0]);
+	expect(timers.map((timer) => timer.delayMs)).toEqual([2_000]);
+
+	// Attempt 2: ordinary timeout on the same epoch -> exponential backoff.
+	timers[0]!.work();
+	await eventually(() => port.bindAttempts === 2, "second bind did not run");
+	expect(port.bindEpochs).toEqual([0, 0]);
+	expect(timers.map((timer) => timer.delayMs)).toEqual([2_000, 4_000]);
+
+	// Attempt 3: terminal_uncertain again. Nothing was ever sent, so the actor
+	// advances epoch 0 -> 1, leaves the row pending, and returns to the base delay.
+	timers[1]!.work();
+	await eventually(() => port.bindAttempts === 3, "third bind did not run");
+	expect(database.getSessionRecord(KEY)?.epoch).toBe(1);
+	expect(database.inboundPendingOldest(KEY)).toMatchObject({ message_id: "poisoned", turn_state: null });
+	expect(port.sends).toEqual([]);
+	expect(timers.map((timer) => timer.delayMs)).toEqual([2_000, 4_000, 2_000]);
+	expect(
+		logs.some(
+			(line) =>
+				line.startsWith(`persona_bind_epoch_rotated origin=${KEY} epoch=0 nextEpoch=1`) &&
+				line.includes("reason=terminal_uncertain"),
+		),
+	).toBe(true);
+
+	// Attempt 4 uses the fresh epoch/idempotency key and succeeds exactly once.
+	timers[2]!.work();
+	await eventually(() => port.sends.length === 1, "fresh epoch did not dispatch");
+	expect(port.bindEpochs).toEqual([0, 0, 0, 1]);
+	expect(port.sends[0]!.text).toBe("must survive the poisoned session-create key");
+	await eventually(() => terminal.length === 1, "recovered turn did not complete");
+	expect(terminal).toEqual(["recovered after epoch rotation"]);
+	expect(database.inboundPendingCount(KEY)).toBe(0);
+});

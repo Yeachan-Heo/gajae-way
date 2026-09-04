@@ -998,6 +998,7 @@ class OriginActor {
 			this.#manager.database.inboundTurnAccept(opRef);
 			await tail.markAccepted(opRef);
 			this.#bindFailures = 0;
+			this.#bindEpochPoisoned = false;
 		} catch (error) {
 			// The Router disowning the session id is NOT ambiguous: it is proof the
 			// send never landed, so there is nothing to protect by holding. gjc is
@@ -1110,6 +1111,8 @@ class OriginActor {
 	}
 
 	#bindFailures = 0;
+	/** A terminal_uncertain bind poisons this epoch's idempotency key; retries cannot make that key decidable. */
+	#bindEpochPoisoned = false;
 
 	/**
 	 * A session could not be bound for the next turn (broker down, Router
@@ -1121,13 +1124,31 @@ class OriginActor {
 	#noteBindFailure(messageId: string, epoch: number, error: unknown): void {
 		this.#bindFailures += 1;
 		const attempts = this.#bindFailures;
+		const detail = safeDiagnostic(error);
+		if (detail.includes("terminal_uncertain")) this.#bindEpochPoisoned = true;
 		this.#manager.log(
-			`persona_bind_failed origin=${this.originKey} epoch=${epoch} message=${messageId} attempts=${attempts} detail=${safeDiagnostic(error)}`,
+			`persona_bind_failed origin=${this.originKey} epoch=${epoch} message=${messageId} attempts=${attempts} detail=${detail}`,
 		);
 		if (attempts === MAX_SEND_REBIND_ATTEMPTS)
 			this.#manager.log(
 				`persona_send_unrecoverable origin=${this.originKey} message=${messageId} attempts=${attempts} reason=bind_failed`,
 			);
+		if (this.#bindEpochPoisoned && attempts >= MAX_SEND_REBIND_ATTEMPTS) {
+			// bind() failed BEFORE inboundBindTurn, so no prompt was sent and no
+			// operation belongs to this row. terminal_uncertain is attached to the
+			// epoch-scoped session-create idempotency key; retrying that same key
+			// forever cannot recover it (live: one channel repeated it 335 times).
+			// Advance the epoch to derive a new key while leaving every inbound row
+			// pending and intact, then retry with the normal base delay.
+			const nextEpoch = this.#manager.database.rebindEpoch(this.originKey);
+			this.#manager.log(
+				`persona_bind_epoch_rotated origin=${this.originKey} epoch=${epoch} nextEpoch=${nextEpoch} message=${messageId} attempts=${attempts} reason=terminal_uncertain`,
+			);
+			this.#bindFailures = 0;
+			this.#bindEpochPoisoned = false;
+			this.#scheduleDispatchRetry(DISPATCH_FAILURE_RETRY_MS);
+			return;
+		}
 		const delay = Math.min(DISPATCH_FAILURE_RETRY_MAX_MS, DISPATCH_FAILURE_RETRY_MS * 2 ** Math.min(attempts - 1, 10));
 		this.#scheduleDispatchRetry(delay);
 	}
