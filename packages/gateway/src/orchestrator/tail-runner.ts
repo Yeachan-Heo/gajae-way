@@ -75,6 +75,12 @@ export interface TailHandle {
 	/** Resolves only after the first broker-bound tail exchange completed safely. */
 	readonly ready: Promise<void>;
 	readonly cursor: string | undefined;
+	/**
+	 * Fresh-send boundary after initial attach/backfill and before the prompt.
+	 * Historical buffered frames are intentionally fenced; the cursor is safe
+	 * to commit because none belongs to the not-yet-started turn.
+	 */
+	beginTurn(opRef: string): Promise<void>;
 	markAccepted(opRef: string): Promise<void>;
 	setTurnRunning(running: boolean): void;
 	close(): Promise<void>;
@@ -386,6 +392,12 @@ class ManagedTailHandle implements TailHandle {
 		void this.#run();
 	}
 
+	async beginTurn(opRef: string): Promise<void> {
+		if (this.#closed || this.#accepted) return;
+		this.#acceptedOpRef = opRef;
+		this.#preReceipt.splice(0);
+		await this.#commitPendingCursor();
+	}
 	async markAccepted(opRef: string): Promise<void> {
 		this.#deliveredIds.clear();
 		if (this.#closed || this.#accepted) return;

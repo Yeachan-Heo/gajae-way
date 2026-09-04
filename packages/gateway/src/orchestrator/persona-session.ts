@@ -982,6 +982,7 @@ class OriginActor {
 			...(dispatchedAtMs === undefined ? {} : { dispatchedAtMs }),
 			replaceAfterTerminal: false,
 		};
+		await tail.beginTurn(opRef);
 		this.#current = current;
 		this.#state = "turn-running";
 		tail.setTurnRunning(true);

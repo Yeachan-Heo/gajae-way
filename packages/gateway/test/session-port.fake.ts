@@ -545,6 +545,12 @@ class ScriptedTailHandle implements TailHandle {
 		this.#buffer.push(...historical);
 	}
 
+	async beginTurn(opRef: string): Promise<void> {
+		if (this.#closed) return;
+		this.#acceptedOpRef = opRef;
+		this.#buffer.splice(0);
+	}
+
 	async markAccepted(opRef: string): Promise<void> {
 		if (this.#closed) return;
 		this.#accepted = true;
