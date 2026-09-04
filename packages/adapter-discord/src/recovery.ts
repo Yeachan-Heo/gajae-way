@@ -68,6 +68,12 @@ export interface RecoveryAttemptRecord {
 	readonly summary: string;
 }
 
+/** A DM conversation observed live and eligible for bounded restart recovery. */
+export interface KnownDmConversation {
+	readonly lastSeenAt: string;
+	readonly seq: number;
+}
+
 export interface RecoveryCursorState {
 	/** Highest message id a recovery pass walked past, per recoverable conversation. */
 	readonly recoveredThrough: Readonly<Record<string, string>>;
@@ -78,6 +84,8 @@ export interface RecoveryCursorState {
 	 * bounded to RECOVERY_QUARANTINE_CAP entries, lowest `seq` (oldest) pruned first.
 	 */
 	readonly quarantined: Readonly<Record<string, QuarantinedWatermark>>;
+	/** DMs cannot be enumerated from Discord, so live inbound records a bounded recovery set. */
+	readonly knownDms: Readonly<Record<string, KnownDmConversation>>;
 	/**
 	 * Cross-pass per-message attempt ledger, so a message that alternates terminal and
 	 * transient failures still reaches its discard threshold instead of blocking its
@@ -97,6 +105,7 @@ export type RecoveryGateResult = "acked" | "duplicate" | "unavailable";
 const EMPTY_STATE: RecoveryCursorState = {
 	recoveredThrough: {},
 	quarantined: {},
+	knownDms: {},
 	attempts: {},
 	deadLetters: [],
 	deadLetterDigest: {},
@@ -172,15 +181,18 @@ export async function loadRecoveryCursors(path: string): Promise<RecoveryCursorS
 	if (typeof raw !== "object" || raw === null || Array.isArray(raw)) return EMPTY_STATE;
 	const record = raw as Record<string, unknown>;
 	const quarantined = readQuarantined(record.quarantined);
+	const knownDms = readKnownDms(record.knownDms);
 	const attempts = readAttempts(record.attempts);
 	const seqs = [
 		...Object.values(quarantined).map((entry) => entry.seq),
+		...Object.values(knownDms).map((entry) => entry.seq),
 		...Object.values(attempts).map((entry) => entry.seq),
 	];
 	const stored = typeof record.sequence === "number" && Number.isSafeInteger(record.sequence) ? record.sequence : 0;
 	return {
 		recoveredThrough: readWatermarks(record.recoveredThrough),
 		quarantined,
+		knownDms,
 		attempts,
 		deadLetters: readDeadLetters(record.deadLetters),
 		deadLetterDigest: readDigest(record.deadLetterDigest),
@@ -214,6 +226,63 @@ function readQuarantined(entries: unknown): Record<string, QuarantinedWatermark>
 		}
 	}
 	return parked;
+}
+
+function readKnownDms(entries: unknown): Record<string, KnownDmConversation> {
+	const known: Record<string, KnownDmConversation> = {};
+	if (typeof entries === "object" && entries !== null && !Array.isArray(entries)) {
+		for (const [id, value] of Object.entries(entries)) {
+			if (typeof value !== "object" || value === null) continue;
+			const entry = value as Record<string, unknown>;
+			if (typeof entry.lastSeenAt !== "string" || !Number.isFinite(Date.parse(entry.lastSeenAt))) continue;
+			known[id] = {
+				lastSeenAt: entry.lastSeenAt,
+				seq: typeof entry.seq === "number" && Number.isSafeInteger(entry.seq) ? entry.seq : 0,
+			};
+		}
+	}
+	return known;
+}
+
+/** Prunes expired and oldest known DMs without observing a new conversation. */
+export function pruneKnownDms(
+	state: RecoveryCursorState,
+	nowMs: number,
+	cap = RECOVERY_KNOWN_DM_CAP,
+	ttlMs = RECOVERY_KNOWN_DM_TTL_MS,
+): RecoveryCursorState {
+	const cutoff = nowMs - ttlMs;
+	const retained = Object.entries(state.knownDms)
+		.filter(([, entry]) => Date.parse(entry.lastSeenAt) >= cutoff)
+		.sort((a, b) => b[1].seq - a[1].seq)
+		.slice(0, cap);
+	const knownDms = Object.fromEntries(retained);
+	if (Object.keys(knownDms).length === Object.keys(state.knownDms).length) return state;
+	return { ...state, knownDms };
+}
+
+/** Records a live DM and prunes stale/oldest entries so Discord's non-enumerable DM set stays bounded. */
+export function rememberKnownDm(
+	state: RecoveryCursorState,
+	conversationId: string,
+	nowMs: number,
+	cap = RECOVERY_KNOWN_DM_CAP,
+	ttlMs = RECOVERY_KNOWN_DM_TTL_MS,
+): RecoveryCursorState {
+	const sequence = state.sequence + 1;
+	return pruneKnownDms(
+		{
+			...state,
+			knownDms: {
+				...state.knownDms,
+				[conversationId]: { lastSeenAt: new Date(nowMs).toISOString(), seq: sequence },
+			},
+			sequence,
+		},
+		nowMs,
+		cap,
+		ttlMs,
+	);
 }
 
 function readAttempts(entries: unknown): Record<string, RecoveryAttemptRecord> {
@@ -541,6 +610,10 @@ export const RECOVERY_ATTEMPT_LEDGER_CAP = 200;
 export const RECOVERY_UNIFORM_FAILURE_LIMIT = 3;
 
 /** The slice of a discord.js text-based channel recovery needs: forward paged history. */
+/** Maximum non-enumerable DM conversations retained for restart recovery. */
+export const RECOVERY_KNOWN_DM_CAP = 100;
+/** DMs with no live inbound for this long leave the restart-recovery set. */
+export const RECOVERY_KNOWN_DM_TTL_MS = 30 * 24 * 60 * 60 * 1000;
 export interface RecoverableChannel {
 	readonly messages: {
 		/**

@@ -8,6 +8,8 @@ import {
 	classifyRecoveryFailure,
 	loadRecoveryCursors,
 	RECOVERY_DEAD_LETTER_CAP,
+	RECOVERY_KNOWN_DM_CAP,
+	RECOVERY_KNOWN_DM_TTL_MS,
 	RECOVERY_MAX_ATTEMPTS,
 	RECOVERY_MAX_PAGES,
 	RECOVERY_PAGE_LIMIT,
@@ -20,6 +22,7 @@ import {
 	recordDeadLetter,
 	recoverConversation,
 	recoveryCursorPath,
+	rememberKnownDm,
 	retainRecoveryCursors,
 	saveRecoveryCursors,
 	snowflakeFromTimestamp,
@@ -30,7 +33,15 @@ const bot = { id: "bot-9" };
 
 /** Full cursor-store state from just its watermarks. */
 function cursorState(recoveredThrough: Record<string, string>): RecoveryCursorState {
-	return { recoveredThrough, quarantined: {}, attempts: {}, deadLetters: [], deadLetterDigest: {}, sequence: 0 };
+	return {
+		recoveredThrough,
+		quarantined: {},
+		knownDms: {},
+		attempts: {},
+		deadLetters: [],
+		deadLetterDigest: {},
+		sequence: 0,
+	};
 }
 
 /** Quarantined watermarks without their ordering metadata, for readable assertions. */
@@ -120,6 +131,17 @@ test("cursor store round-trips and ignores malformed state", async () => {
 	expect(state.recoveredThrough.bad).toBeUndefined();
 	await writeFile(path, "not json{", "utf8");
 	expect(await loadRecoveryCursors(path)).toEqual(cursorState({}));
+});
+
+test("known DM recovery origins are capped, refreshed, and expired", () => {
+	const now = Date.UTC(2026, 8, 4, 0, 0, 0);
+	let state = cursorState({});
+	state = rememberKnownDm(state, "dm-old", now - RECOVERY_KNOWN_DM_TTL_MS - 1, 2);
+	state = rememberKnownDm(state, "dm-1", now - 1_000, 2);
+	state = rememberKnownDm(state, "dm-2", now, 2);
+	expect(Object.keys(state.knownDms).sort()).toEqual(["dm-1", "dm-2"]);
+	state = rememberKnownDm(state, "dm-1", now + 1_000, RECOVERY_KNOWN_DM_CAP);
+	expect(state.knownDms["dm-1"].seq).toBeGreaterThan(state.knownDms["dm-2"].seq);
 });
 
 test("snowflake ordering and bootstrap cursor are time-correct", () => {
@@ -309,6 +331,110 @@ test("cold-start recovery waits for both gateway client and Discord user", async
 	botUser = bot;
 	await Promise.all([gateway.recoverMissedMessages(), gateway.recoverMissedMessages()]);
 	expect(fetches).toBe(1);
+});
+
+test("an active thread gap is recovered once through its configured parent", async () => {
+	const cursorPath = join(home, "thread-gap", "recovery-cursor.json");
+	const missed = message(snowflakeFromTimestamp(Date.now() - 60_000), {
+		channel: { id: "thread-1", parentId: "channel-1", isThread: () => true, name: "monitor" },
+	});
+	const thread = Object.assign(fakeChannel([missed]), { id: "thread-1", parentId: "channel-1" });
+	const parent = Object.assign(fakeChannel([]), {
+		threads: {
+			fetchActive: async () => ({ threads: [thread] }),
+			fetchArchived: async () => ({ threads: [], hasMore: false }),
+		},
+	});
+	const sent: string[] = [];
+	const gateway = new ReconnectingGateway(
+		"socket",
+		{ channels: { fetch: async (id: string) => (id === "thread-1" ? thread : parent) } },
+		{ tokenFile: "token", token: "redacted", configPath: "config", channels: { "channel-1": {} } } as never,
+		undefined,
+		undefined,
+		cursorPath,
+		() => bot,
+		{
+			request: async (_verb: string, params?: unknown) => void sent.push((params as { messageId: string }).messageId),
+			onChatMessage: () => () => {},
+		} as never,
+		async () => {},
+	);
+	await gateway.recoverMissedMessages();
+	expect(sent).toEqual([missed.id]);
+	expect((await loadRecoveryCursors(cursorPath)).recoveredThrough["thread-1"]).toBe(missed.id);
+	await gateway.recoverMissedMessages();
+	expect(sent).toEqual([missed.id]);
+});
+
+test("a permission-dead thread keeps its gap and does not block sibling recovery", async () => {
+	const cursorPath = join(home, "thread-permission", "recovery-cursor.json");
+	const healthyMessage = message(snowflakeFromTimestamp(Date.now() - 60_000), {
+		channel: { id: "thread-good", parentId: "channel-1", isThread: () => true },
+	});
+	const blocked = Object.assign(fakeChannel([]), { id: "thread-blocked", parentId: "channel-1" });
+	const healthy = Object.assign(fakeChannel([healthyMessage]), { id: "thread-good", parentId: "channel-1" });
+	const parent = Object.assign(fakeChannel([]), {
+		threads: {
+			fetchActive: async () => ({ threads: [blocked, healthy] }),
+			fetchArchived: async () => ({ threads: [], hasMore: false }),
+		},
+	});
+	const permission = Object.assign(new Error("Missing Access"), { code: 50_001 });
+	const gateway = new ReconnectingGateway(
+		"socket",
+		{
+			channels: {
+				fetch: async (id: string) => {
+					if (id === "thread-blocked") throw permission;
+					return id === "thread-good" ? healthy : parent;
+				},
+			},
+		},
+		{ tokenFile: "token", token: "redacted", configPath: "config", channels: { "channel-1": {} } } as never,
+		undefined,
+		undefined,
+		cursorPath,
+		() => bot,
+		{ request: async () => ({}), onChatMessage: () => () => {} } as never,
+		async () => {},
+	);
+	await gateway.recoverMissedMessages();
+	await gateway.recoverMissedMessages();
+	await gateway.recoverMissedMessages();
+	const state = await loadRecoveryCursors(cursorPath);
+	expect(state.recoveredThrough["thread-good"]).toBe(healthyMessage.id);
+	expect(state.recoveredThrough["thread-blocked"]).toBeUndefined();
+	expect(gateway.recoveryRetryPending).toBe(false);
+});
+
+test("a known DM gap survives restart without a configured channel", async () => {
+	const cursorPath = join(home, "dm-gap", "recovery-cursor.json");
+	const liveId = snowflakeFromTimestamp(Date.now());
+	const dmOrigin = { platform: "discord", kind: "dm", conversationId: "dm-1", peerId: "author-live" } as const;
+	const seen = new Set<string>();
+	const sent: string[] = [];
+	const client = {
+		request: async (_verb: string, params?: unknown) => {
+			const id = (params as { messageId: string }).messageId;
+			if (!seen.has(id)) sent.push(id);
+			seen.add(id);
+			return {};
+		},
+		onChatMessage: () => () => {},
+	};
+	const first = wiredGateway(fakeChannel([]), client, cursorPath, {});
+	await first.requestInbound(liveId, dmOrigin, "live", { mentioned: false, group: false, authorId: "author-live" });
+	await first.cursorsFlushed;
+	expect((await loadRecoveryCursors(cursorPath)).knownDms["dm-1"]).toBeDefined();
+	const missed = message(snowflakeFromTimestamp(Date.now() - 60_000), {
+		author: { id: "author-live" },
+		channel: { id: "dm-1", isDMBased: () => true },
+	});
+	const restarted = wiredGateway(fakeChannel([missed]), client, cursorPath, {});
+	await restarted.recoverMissedMessages();
+	expect(sent).toEqual([liveId, missed.id]);
+	expect((await loadRecoveryCursors(cursorPath)).recoveredThrough["dm-1"]).toBe(missed.id);
 });
 
 test("long gaps paginate forward and report truncation at the page bound", async () => {
@@ -1055,7 +1181,14 @@ test("a repeated page never retries held candidates inside the same pass", async
 	expect(fetches).toBe(2);
 	expect(attempts).toEqual(["100", "200"]);
 	expect(discards).toEqual([]);
-	expect(outcome).toMatchObject({ advancedTo: "10", delivered: 0, duplicates: 0, held: 2, truncated: true, failed: true });
+	expect(outcome).toMatchObject({
+		advancedTo: "10",
+		delivered: 0,
+		duplicates: 0,
+		held: 2,
+		truncated: true,
+		failed: true,
+	});
 });
 
 test("ledger cap eviction preserves the active head-of-line entry", () => {
@@ -1089,7 +1222,7 @@ test("ledger cap eviction preserves the active head-of-line entry", () => {
 	expect(errors.some((line) => line.includes("over its 1-entry cap"))).toBe(true);
 });
 
-test("a channel that lost access marks the pass incomplete and leaves its cursor alone", async () => {
+test("a channel that lost access is quarantined without blocking healthy recovery", async () => {
 	const cursorPath = join(home, "lost-access", "recovery-cursor.json");
 	const inbound = message(snowflakeFromTimestamp(Date.now() - 60_000));
 	const gateway = new ReconnectingGateway(
@@ -1116,6 +1249,12 @@ test("a channel that lost access marks the pass incomplete and leaves its cursor
 	expect(state.recoveredThrough["channel-gone"]).toBeUndefined();
 	expect(state.quarantined["channel-gone"]).toBeUndefined();
 	expect(gateway.recoveryRetryPending).toBe(true);
+	await gateway.recoverMissedMessages();
+	expect(gateway.recoveryRetryPending).toBe(true);
+	await gateway.recoverMissedMessages();
+	expect(gateway.recoveryRetryPending).toBe(false);
+	const retained = await loadRecoveryCursors(cursorPath);
+	expect(retained.recoveredThrough["channel-1"]).toBe(inbound.id);
 });
 
 test("gateway liveness monitor reconnects only after three consecutive status failures", () => {
