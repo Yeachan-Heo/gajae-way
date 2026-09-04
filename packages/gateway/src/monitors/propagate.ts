@@ -557,6 +557,7 @@ export class MonitorPropagator {
 						originKey: sessionOriginKey,
 						text: prompt,
 						opRef,
+						observeTail: false,
 					})
 				).assistant.text;
 				// The authoring turn is now part of the session transcript whatever its
