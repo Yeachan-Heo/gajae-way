@@ -574,6 +574,8 @@ export interface RecoveryOutcome {
 	/** Highest message id this run walked past (delivered, duplicate, skipped or discarded). */
 	readonly advancedTo: string;
 	readonly delivered: number;
+	/** Messages already acknowledged by an earlier live or recovery attempt. */
+	readonly duplicates: number;
 	/** Messages the run walked past without a send (empty content or caller `skip`). */
 	readonly skipped: number;
 	/** Discards committed this run (candidate + a later FRESH acked in the same pass). */
@@ -620,7 +622,12 @@ export async function recoverConversation(
 	const uniformLimit = options.uniformFailureLimit ?? RECOVERY_UNIFORM_FAILURE_LIMIT;
 	const skipEmpty = options.skipEmptyContent ?? true;
 	let cursor = options.cursor ?? snowflakeFromTimestamp(options.nowMs - RECOVERY_BOOTSTRAP_LOOKBACK_MS);
+	// The durable cursor stays behind held candidates. The scan cursor still advances through
+	// the fetched window so one blocked tail message cannot make every later page refetch the
+	// already-processed prefix in the same pass.
+	let scanCursor = cursor;
 	let delivered = 0;
+	let duplicates = 0;
 	let skipped = 0;
 	let discarded = 0;
 	// Candidates whose discard is not yet justified, keyed by message id so a refetched page
@@ -638,11 +645,12 @@ export async function recoverConversation(
 	for (let page = 0; page < maxPages; page++) {
 		let fetched: Awaited<ReturnType<RecoverableChannel["messages"]["fetch"]>>;
 		try {
-			fetched = await channel.messages.fetch({ after: cursor, limit: pageLimit });
+			fetched = await channel.messages.fetch({ after: scanCursor, limit: pageLimit });
 		} catch (error) {
 			return {
 				advancedTo: cursor,
 				delivered,
+				duplicates,
 				skipped,
 				discarded,
 				held: held.size,
@@ -658,11 +666,20 @@ export async function recoverConversation(
 				? fetched
 				: (fetched as { entries(): Iterable<[string, DiscordInboundMessage]> }).entries()),
 		].map((entry) => (Array.isArray(entry) ? (entry[1] as DiscordInboundMessage) : (entry as DiscordInboundMessage)));
-		const batch = rawBatch.filter((message) => snowflakeIsAfter(message.id, cursor));
+		const batch = rawBatch.filter((message) => snowflakeIsAfter(message.id, scanCursor));
 		if (rawBatch.length >= pageLimit && batch.length === 0) {
 			// A broken/repeated page must not spin until the bound while pretending to
 			// make progress. Leave the cursor unchanged so the next reconnect retries it.
-			return { advancedTo: cursor, delivered, skipped, discarded, held: held.size, truncated: true, failed: false };
+			return {
+				advancedTo: cursor,
+				delivered,
+				duplicates,
+				skipped,
+				discarded,
+				held: held.size,
+				truncated: true,
+				failed: held.size > 0,
+			};
 		}
 		batch.sort((a, b) => {
 			const ai = BigInt(a.id);
@@ -673,6 +690,7 @@ export async function recoverConversation(
 			return {
 				advancedTo: cursor,
 				delivered,
+				duplicates,
 				skipped,
 				discarded,
 				held: held.size,
@@ -685,15 +703,26 @@ export async function recoverConversation(
 				// Thread starters / system entries carry no text: skip without a send. This is
 				// not delivery evidence, so it cannot justify a held discard: keep holding.
 				if (held.size === 0) cursor = message.id;
+				scanCursor = message.id;
 				skipped++;
 				continue;
 			}
 			const verdict = await options.deliver(message);
 			if (verdict === "unavailable") {
-				return { advancedTo: cursor, delivered, skipped, discarded, held: held.size, truncated: false, failed: true };
+				return {
+					advancedTo: cursor,
+					delivered,
+					duplicates,
+					skipped,
+					discarded,
+					held: held.size,
+					truncated: false,
+					failed: true,
+				};
 			}
 			if (verdict === "discard-candidate") {
 				held.set(message.id, message);
+				scanCursor = message.id;
 				if (held.size >= uniformLimit) {
 					// The same terminal-looking failure on `uniformLimit` DISTINCT ids with no
 					// fresh ack in between: that is a write-path problem, not a payload problem.
@@ -701,6 +730,7 @@ export async function recoverConversation(
 					return {
 						advancedTo: cursor,
 						delivered,
+						duplicates,
 						skipped,
 						discarded,
 						held: held.size,
@@ -714,9 +744,11 @@ export async function recoverConversation(
 				// Neither is proof that the write path works right now. `skip` sent nothing at
 				// all, and `duplicate` only says some earlier attempt — possibly in a previous
 				// pass, possibly just the in-process gate's acked cache — already covered this
-				// id. Held candidates keep being held and the cursor stays behind them.
+				// id. Held candidates keep being held and the durable cursor stays behind them,
+				// but the in-pass scan moves forward so later pages do not refetch this prefix.
+				scanCursor = message.id;
 				if (held.size === 0) cursor = message.id;
-				if (verdict === "duplicate") delivered++;
+				if (verdict === "duplicate") duplicates++;
 				else skipped++;
 				continue;
 			}
@@ -728,12 +760,14 @@ export async function recoverConversation(
 			held.delete(message.id);
 			commitHeld();
 			cursor = message.id;
+			scanCursor = message.id;
 			delivered++;
 		}
 		if (batch.length < pageLimit) {
 			return {
 				advancedTo: cursor,
 				delivered,
+				duplicates,
 				skipped,
 				discarded,
 				held: held.size,
@@ -742,5 +776,14 @@ export async function recoverConversation(
 			};
 		}
 	}
-	return { advancedTo: cursor, delivered, skipped, discarded, held: held.size, truncated: true, failed: held.size > 0 };
+	return {
+		advancedTo: cursor,
+		delivered,
+		duplicates,
+		skipped,
+		discarded,
+		held: held.size,
+		truncated: true,
+		failed: held.size > 0,
+	};
 }

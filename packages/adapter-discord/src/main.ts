@@ -1239,13 +1239,13 @@ export class ReconnectingGateway {
 					? `cursor unchanged at ${before}`
 					: `cursor advanced to ${outcome.advancedTo}`;
 			console.error(
-				`Discord recovery hit the ${RECOVERY_MAX_PAGES}-page bound for channel ${channelId} after ${outcome.delivered} message(s) and ${outcome.skipped} skip(s); ${progress}.`,
+				`Discord recovery hit the ${RECOVERY_MAX_PAGES}-page bound for channel ${channelId} after ${outcome.delivered} fresh message(s), ${outcome.duplicates} duplicate(s), and ${outcome.skipped} skip(s); ${progress}.`,
 			);
 			return true;
 		}
-		if (outcome.delivered > 0 || outcome.skipped > 0 || outcome.discarded > 0) {
+		if (outcome.delivered > 0 || outcome.duplicates > 0 || outcome.skipped > 0 || outcome.discarded > 0) {
 			console.log(
-				`Discord recovery backfilled ${outcome.delivered} message(s), skipped ${outcome.skipped} and discarded ${outcome.discarded} for channel ${channelId}.`,
+				`Discord recovery backfilled ${outcome.delivered} fresh message(s), found ${outcome.duplicates} duplicate(s), skipped ${outcome.skipped}, and discarded ${outcome.discarded} for channel ${channelId}.`,
 			);
 		}
 		return false;

@@ -141,6 +141,7 @@ test("non-engaged missed message is delivered exactly once and advances the curs
 	expect(first).toEqual({
 		advancedTo: "100",
 		delivered: 1,
+		duplicates: 0,
 		skipped: 0,
 		discarded: 0,
 		held: 0,
@@ -183,7 +184,8 @@ test("live/backfill race delivers exactly once by message id", async () => {
 	const engagement = decideInbound(message("400"), bot, { "channel-1": { engagement: "open" } });
 	expect(gateway.send("400", engagement)).toBe("acked");
 	const outcome = await recoverConversation(channel, { cursor: "0", nowMs: 0, deliver });
-	expect(outcome.delivered).toBe(1);
+	expect(outcome.delivered).toBe(0);
+	expect(outcome.duplicates).toBe(1);
 	expect(gateway.sent).toHaveLength(1);
 });
 
@@ -222,6 +224,7 @@ test("interrupted recovery before ack leaves the message retryable", async () =>
 	expect(outcome).toEqual({
 		advancedTo: "501",
 		delivered: 1,
+		duplicates: 0,
 		skipped: 0,
 		discarded: 0,
 		held: 0,
@@ -329,6 +332,28 @@ test("long gaps paginate forward and report truncation at the page bound", async
 	// Defaults stay bounded.
 	expect(RECOVERY_PAGE_LIMIT).toBe(100);
 	expect(RECOVERY_MAX_PAGES).toBeLessThanOrEqual(10);
+});
+
+test("a held tail candidate does not refetch the processed page prefix", async () => {
+	const channel = fakeChannel([message("10"), message("20"), message("30"), message("40")]);
+	const delivered: string[] = [];
+	const outcome = await recoverConversation(channel, {
+		cursor: "0",
+		nowMs: 0,
+		pageLimit: 2,
+		maxPages: 2,
+		uniformFailureLimit: 3,
+		deliver: async (item) => {
+			delivered.push(item.id);
+			return item.id === "20" ? "discard-candidate" : "duplicate";
+		},
+	});
+	expect(channel.fetches).toEqual([
+		{ after: "0", limit: 2 },
+		{ after: "20", limit: 2 },
+	]);
+	expect(delivered).toEqual(["10", "20", "30", "40"]);
+	expect(outcome).toMatchObject({ advancedTo: "10", delivered: 0, duplicates: 3, held: 1, failed: true });
 });
 
 test("normalizes Discord Collections and delivers every page in ascending snowflake order", async () => {
@@ -1000,29 +1025,21 @@ test("a success from a previous pass does not authorize a discard in this pass",
 	expect(gateway.recoveryRetryPending).toBe(true);
 });
 
-test("a refetched page neither double-fires onDiscard nor inflates the uniform limit", async () => {
-	// A channel that ignores `after`: every page is the same two ids.
+test("a repeated page never retries held candidates inside the same pass", async () => {
+	// A channel that ignores `after`: every fetch is the same two ids. Recovery scans each
+	// candidate once, then detects the non-progressing page instead of multiplying send attempts.
 	const page = [message("100"), message("200")];
-	const channel: RecoverableChannel = { messages: { fetch: async () => page } };
+	let fetches = 0;
+	const channel: RecoverableChannel = {
+		messages: {
+			fetch: async () => {
+				fetches++;
+				return page;
+			},
+		},
+	};
+	const attempts: string[] = [];
 	const discards: string[] = [];
-	const held = await recoverConversation(channel, {
-		cursor: "10",
-		nowMs: 0,
-		pageLimit: 2,
-		maxPages: 3,
-		uniformFailureLimit: 3,
-		deliver: async () => "discard-candidate",
-		onDiscard: (item) => discards.push(item.id),
-	});
-	// Two DISTINCT ids seen three times: the uniform limit of 3 must not fire.
-	expect(held.held).toBe(2);
-	expect(held.discarded).toBe(0);
-	expect(discards).toEqual([]);
-	expect(held.truncated).toBe(true);
-	expect(held.failed).toBe(true);
-	// Same refetch, but the second id finally lands: exactly one discard, for the other id.
-	let calls = 0;
-	const commits: string[] = [];
 	const outcome = await recoverConversation(channel, {
 		cursor: "10",
 		nowMs: 0,
@@ -1030,14 +1047,15 @@ test("a refetched page neither double-fires onDiscard nor inflates the uniform l
 		maxPages: 3,
 		uniformFailureLimit: 3,
 		deliver: async (item) => {
-			calls++;
-			return item.id === "200" && calls > 2 ? "acked" : "discard-candidate";
+			attempts.push(item.id);
+			return "discard-candidate";
 		},
-		onDiscard: (item) => commits.push(item.id),
+		onDiscard: (item) => discards.push(item.id),
 	});
-	expect(commits).toEqual(["100"]);
-	expect(outcome.discarded).toBe(1);
-	expect(outcome.advancedTo).toBe("200");
+	expect(fetches).toBe(2);
+	expect(attempts).toEqual(["100", "200"]);
+	expect(discards).toEqual([]);
+	expect(outcome).toMatchObject({ advancedTo: "10", delivered: 0, duplicates: 0, held: 2, truncated: true, failed: true });
 });
 
 test("ledger cap eviction preserves the active head-of-line entry", () => {
