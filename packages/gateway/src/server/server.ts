@@ -1,13 +1,14 @@
 import { unlink } from "node:fs/promises";
 import {
+	breakParts,
 	CAPABILITIES,
 	type ChatMessagePayload,
+	containsSilenceToken,
 	encodeFrame,
 	type Frame,
 	FrameDecoder,
 	type HelloPayload,
 	isPlatformMessageId,
-	isSilenceToken,
 	LOOPBACK_ORIGIN,
 	negotiate,
 	type OriginRef,
@@ -21,7 +22,10 @@ import {
 	type ReactionRef,
 	type RequestFrame,
 	reactionAllowlistDescription,
+	replyTarget,
 	resolveReactionEmoji,
+	stripBrokenTokens,
+	stripControlTokens,
 	validateOriginRef,
 } from "@gajaeway/protocol";
 import {
@@ -1547,15 +1551,24 @@ async function runInboundTurn(
 		lastDeliveredRaw = rawMessage;
 		let message = rawMessage;
 		// Reaction reply mode (third mode next to text and silence, parsed per delivered
-		// assistant message so streamed intermediates carry it too): a message may open
-		// with [REACT:<emoji-or-name>] tokens, optionally targeting one message with
+		// assistant message so streamed intermediates carry it too): a message may carry
+		// [REACT:<emoji-or-name>] tokens, optionally targeting one message with
 		// `@<platform message id>`. With nothing left after the tokens the message
-		// acknowledges with a reaction and ships no text. Parsing is all-or-nothing: a
-		// malformed or non-allowlisted token yields undefined here, and the message is
-		// delivered verbatim as text — a bad token can cost the reaction, never the reply.
+		// acknowledges with a reaction and ships no text. A token that cannot be honoured
+		// is logged and stripped, so a bad token costs the reaction and never the reply —
+		// and never reaches the room as raw syntax.
 		const reactionReply = parseReactionReply(message);
 		if (reactionReply) {
 			reactionTokensSeen = true;
+			// Never a silent no-op: the persona asked for an acknowledgement that cannot
+			// be delivered, and the daemon log is the only place that is visible.
+			// The argument is model-authored, so it is bounded and stripped of control
+			// characters before it reaches the log: a raw CR or ANSI run would let a reply
+			// forge log lines, and RT-TOKEN-07 proves an argument can be 10000 characters.
+			for (const argument of reactionReply.skipped)
+				console.error(
+					`gateway reaction token unusable for ${key}: [REACT:${stripControlCharacters(argument).slice(0, 80)}]`,
+				);
 			for (const wanted of reactionReply.reactions) {
 				// Untargeted tokens react to the message that triggered this turn; that id is
 				// the platform's own message id whenever the adapter supplied one.
@@ -1591,12 +1604,15 @@ async function runInboundTurn(
 		// Control tokens are internal protocol, never user-visible. Models routinely
 		// wrap them in a "reasoning" preamble ("...nothing to add.\n\n[SILENT]"), so a
 		// part is judged by whether it CONTAINS the token, not whether it equals it:
-		// any part carrying a silence token is dropped whole, and [REPLY:id] is
+		// any part carrying a silence token is dropped whole, and every routing token is
 		// honoured wherever it appears and always stripped from the delivered text.
-		const parts = message
-			.split(/\n\s*\[BREAK\]\s*\n?/)
+		//
+		// Broken fragments are swept BEFORE the split, not after. A fragment can contain
+		// a line-owned [BREAK] (`[REACT:bad\n[BREAK]\nargument]`); splitting first cut it
+		// in half, so neither part held a whole fragment and both halves were posted raw.
+		const parts = breakParts(stripBrokenTokens(message))
 			.map((part) => part.trim())
-			.filter((part) => part.length > 0 && !isSilenceToken(part) && !containsSilenceToken(part))
+			.filter((part) => part.length > 0 && !containsSilenceToken(part))
 			.slice(0, 5);
 		// Which deliveries actually happen is decided BEFORE the loop, because the
 		// audio has to ride the last one. Deciding inside the loop cannot: a part
@@ -1605,12 +1621,12 @@ async function runInboundTurn(
 		const planned: Array<{ readonly body: string; readonly replyTo?: string }> = [];
 		for (const part of parts) {
 			if (planned.length >= maxTurnParts) break;
-			// Reply-threading: a part may open with [REPLY:<platform message id>] to
-			// answer a specific message; mentions are plain <@author id> in the text.
-			const replyMatch = part.match(/\[REPLY:([^\]\s]+)\]/);
-			const body = (replyMatch ? part.replace(/\s*\[REPLY:[^\]\s]+\]\s*/g, " ") : part).replace(/\s*\[BREAK\]\s*/g, " ").trim();
+			// Reply-threading: a part may carry [REPLY:<platform message id>] to answer a
+			// specific message; mentions are plain <@author id> in the text.
+			const replyTo = replyTarget(part);
+			const body = stripControlTokens(part);
 			if (!body) continue;
-			planned.push({ body, ...(replyMatch?.[1] ? { replyTo: replyMatch[1] } : {}) });
+			planned.push({ body, ...(replyTo ? { replyTo } : {}) });
 		}
 		// A spoken turn is answered in both modalities, and the whole reply is spoken
 		// ONCE rather than once per part. Built from the PLANNED bodies so the audio
@@ -1790,11 +1806,16 @@ async function runInboundTurn(
 			console.error(`gateway rotated session epoch for ${key} after ${SESSION_TURN_LIMIT} turns.`);
 		}
 	});
-	// Spec fact 22: a reply that is exactly a silence token means the persona chose not to
-	// speak. The observation is already recorded above, so nothing is delivered and no daily
-	// capture is written. This is what makes an `open` channel usable: the persona can read
-	// every message in the room without answering all of them.
-	if (deliveredParts.length === 0 && isSilenceToken(text)) return;
+	// Spec fact 22: a reply carrying a silence token means the persona chose not to
+	// speak. The observation is already recorded above, so nothing is delivered and no
+	// daily capture is written. This is what makes an `open` channel usable: the persona
+	// can read every message in the room without answering all of them.
+	//
+	// Loopback is judged here because it has no splitter and no reaction mode. A
+	// non-loopback turn is judged inside deliverAssistantText instead, which drops the
+	// silent part but still honours a reaction token written next to it — deciding it
+	// here would throw the acknowledgement away with the text.
+	if (!nonLoopback && deliveredParts.length === 0 && containsSilenceToken(text)) return;
 	if (!nonLoopback) {
 		connection.write({
 			v: PROFILE_VERSION,
@@ -1863,13 +1884,13 @@ function stripControlCharacters(value: string): string {
  * than one voice message per `[BREAK]`, which would talk over itself and bill
  * per part.
  *
- * `[REPLY:...]` prefixes are stripped: the token is routing metadata, and
- * reading a platform message id aloud is noise the listener cannot use.
+ * Control tokens are stripped: routing metadata is not speech, and reading a
+ * platform message id or a reaction token aloud is noise the listener cannot use.
  */
 export function spokenReply(parts: readonly string[], voiceTurn: boolean): string {
 	if (!voiceTurn) return "";
 	return parts
-		.map((part) => part.replace(/^\[REPLY:[^\]\s]+\]\s*/, "").trim())
+		.map((part) => stripControlTokens(part))
 		.filter((body) => body.length > 0)
 		.join("\n\n");
 }
@@ -1908,7 +1929,7 @@ function currentConversationNotice(origin: OriginRef, engagement?: { mentioned?:
 		// guidance because the persona chooses between exactly these three shapes.
 		...(origin.platform === "discord" || origin.platform === "telegram"
 			? [
-					`Reaction replies: start your reply with [REACT:<emoji>] to react to the message that triggered this turn, or [REACT:<emoji>@<message id>] to react to a specific message. With nothing after the token you acknowledge with a reaction and say nothing; text after the token is sent as well. Emoji ${origin.platform} can actually deliver: ${reactionAllowlistDescription(origin.platform)}. At most ${REACTIONS_PER_TURN_CAP} reactions per turn and ${REACTIONS_PER_MESSAGE_CAP} per message.`,
+					`Reaction replies: put [REACT:<emoji>] in your reply to react to the message that triggered this turn, or [REACT:<emoji>@<message id>] to react to a specific message. The token is consumed wherever it appears, so write it on its own when a reaction is the whole reply and the rest of the text is still sent. Emoji ${origin.platform} can actually deliver: ${reactionAllowlistDescription(origin.platform)}. At most ${REACTIONS_PER_TURN_CAP} reactions per turn and ${REACTIONS_PER_MESSAGE_CAP} per message.`,
 				]
 			: []),
 	].join("\n");
@@ -1923,11 +1944,6 @@ function writeError(connection: Connection, error: unknown, id?: string): void {
  * surfaces a populated allowlist gates them, or any room member could wipe or
  * repoint the persona's conversation state.
  */
-/** True when a part carries a silence token anywhere (a leaked reasoning preamble around it is still silence). */
-function containsSilenceToken(part: string): boolean {
-	return /\[(SILENT|silent)\]/.test(part);
-}
-
 function commandAuthorised(
 	origin: { readonly platform: string; readonly kind: string },
 	allowlist: readonly string[] | undefined,

@@ -66,6 +66,7 @@ describe("reaction reply token", () => {
 		expect(parseReactionReply("[REACT:👍]")).toEqual({
 			reactions: [{ emoji: "👍", emojiName: "thumbsup" }],
 			body: "",
+			skipped: [],
 		});
 	});
 
@@ -73,6 +74,7 @@ describe("reaction reply token", () => {
 		expect(parseReactionReply("[REACT:👀] 보고 있습니다")).toEqual({
 			reactions: [{ emoji: "👀", emojiName: "eyes" }],
 			body: "보고 있습니다",
+			skipped: [],
 		});
 	});
 
@@ -80,6 +82,7 @@ describe("reaction reply token", () => {
 		expect(parseReactionReply("[REACT:thumbsup@1418812345678]")).toEqual({
 			reactions: [{ emoji: "👍", emojiName: "thumbsup", targetMessageId: "1418812345678" }],
 			body: "",
+			skipped: [],
 		});
 	});
 
@@ -92,23 +95,77 @@ describe("reaction reply token", () => {
 		expect(parsed?.body).toBe("done");
 	});
 
-	test("a malformed or disallowed token is not a reaction at all, so the text ships verbatim", () => {
-		// undefined here means "deliver the text as-is"; the reply is never dropped.
-		for (const text of [
-			"[REACT:🚀] launch",
-			"[REACT:]",
-			"[REACT: ]",
-			"[REACT:👍@]",
-			"[REACT:👍",
-			"react [REACT:👍]",
-			"plain text",
-			"",
-			// A target that cannot be a platform message id: oversized, spaced, control char.
-			`[REACT:👍@${"9".repeat(65)}]`,
-			"[REACT:👍@msg 1]",
-			"[REACT:👍@msg\u00001]",
-		])
-			expect(parseReactionReply(text)).toBeUndefined();
+	test("a token is honoured and stripped wherever it appears, not only at the start", () => {
+		// The leak this closes: a model writes its reasoning above the token, and a
+		// leading-anchored parser posted `[REACT:👍]` into the room as text.
+		const preamble = parseReactionReply("형님이 부르셨으니 반응은 해야지.\n\n[REACT:👍]");
+		expect(preamble?.reactions).toEqual([{ emoji: "👍", emojiName: "thumbsup" }]);
+		expect(preamble?.body).toBe("형님이 부르셨으니 반응은 해야지.");
+		for (const text of ["확인 [REACT:👍] 했습니다", "react [REACT:👍]", "본문 [REACT:🔥@9] 끝"])
+			expect(parseReactionReply(text)?.body).not.toContain("[REACT");
+		expect(parseReactionReply("확인 [REACT:👍] 했습니다")).toEqual({
+			reactions: [{ emoji: "👍", emojiName: "thumbsup" }],
+			body: "확인 했습니다",
+			skipped: [],
+		});
+	});
+
+	test("token spelling is case-insensitive, like the silence tokens", () => {
+		expect(parseReactionReply("[react:👍] 넵")).toEqual({
+			reactions: [{ emoji: "👍", emojiName: "thumbsup" }],
+			body: "넵",
+			skipped: [],
+		});
+	});
+
+	test("a token that cannot be honoured is reported and stripped, and the reply still ships", () => {
+		// A bad token costs the reaction, never the reply — and never leaks its syntax.
+		for (const [text, body, skipped] of [
+			["[REACT:🚀] launch", "launch", "🚀"],
+			["[REACT:nonsense] 발사합니다", "발사합니다", "nonsense"],
+			["[REACT:] 발사합니다", "발사합니다", ""],
+			["[REACT: ] 발사합니다", "발사합니다", " "],
+			["[REACT:👍@] 발사합니다", "발사합니다", "👍@"],
+			[`[REACT:👍@${"9".repeat(65)}]`, "", `👍@${"9".repeat(65)}`],
+			["[REACT:👍@msg 1]", "", "👍@msg 1"],
+			["[REACT:👍@msg\u00001]", "", "👍@msg\u00001"],
+		] as const) {
+			const parsed = parseReactionReply(text);
+			expect(parsed?.reactions).toEqual([]);
+			expect(parsed?.body).toBe(body);
+			expect(parsed?.skipped).toEqual([skipped]);
+		}
+	});
+
+	test("text with no closed token at all is left completely alone", () => {
+		// undefined means "deliver the text as it stands"; the reply is never dropped.
+		for (const text of ["[REACT:👍", "plain text", ""]) expect(parseReactionReply(text)).toBeUndefined();
+	});
+
+	test("a hostile argument is inert: nothing is executed, nothing is eaten", () => {
+		// The argument is resolved by allowlist lookup, never by pattern matching, so
+		// regex metacharacters are ordinary unknown emoji.
+		for (const text of ["[REACT:.*] hi", "[REACT:(?:👍)] hi", "[REACT:^$|\\d] hi"]) {
+			const parsed = parseReactionReply(text);
+			expect(parsed?.reactions).toEqual([]);
+			expect(parsed?.body).toBe("hi");
+		}
+		// Stray brackets around a token survive as ordinary text: they are not control
+		// syntax, and widening the match to swallow them would start eating prose.
+		expect(parseReactionReply("[REACT:👍]]] hi")?.body).toBe("]] hi");
+		expect(parseReactionReply("[REACT:[REACT:👍]]")?.body).toBe("]");
+		// A newline inside the argument means no token: it cannot be a reaction, and a
+		// reply that merely mentions the word survives untouched.
+		expect(parseReactionReply("[REACT:👍\n형님]")).toBeUndefined();
+	});
+
+	test("a long reply with scattered tokens stays linear", () => {
+		const huge = `${"가".repeat(50_000)}\n[REACT:👍]\n${"나".repeat(50_000)}`;
+		const started = performance.now();
+		const parsed = parseReactionReply(huge);
+		expect(performance.now() - started).toBeLessThan(250);
+		expect(parsed?.reactions).toEqual([{ emoji: "👍", emojiName: "thumbsup" }]);
+		expect(parsed?.body).not.toContain("[REACT");
 	});
 
 	test("platform message ids are bounded to what a platform actually issues", () => {

@@ -4,6 +4,7 @@ import {
 	type OriginRef,
 	originKey,
 	type ReactionRef,
+	stripControlTokens,
 } from "@gajaeway/protocol";
 import type { DeliveryLedger, LedgerOutcome } from "../store/ledger";
 
@@ -12,14 +13,34 @@ export class DeliveryService {
 	constructor(ledger: DeliveryLedger) {
 		this.#ledger = ledger;
 	}
+	/**
+	 * The ledger write is the last boundary before text becomes a platform message,
+	 * so it sanitizes rather than trusting its caller. Callers already strip, but a
+	 * path that forgets — a runtime failure notice quoting a model reply, a future
+	 * verb — would otherwise persist raw control syntax into the ledger, where a
+	 * reconnect replays it verbatim.
+	 *
+	 * Silence is matched EXACTLY here, unlike on the turn path. Containment belongs
+	 * where parts are judged; applying it this far down suppressed a runtime failure
+	 * notice whose diagnostic text merely quoted `[SILENT]`, and a failed turn must
+	 * always leave the owner something visible.
+	 *
+	 * The guarantee is PROSPECTIVE. Rows written before this sanitation existed still
+	 * hold whatever text they were given, and `redeliveries()` replays a stored
+	 * payload verbatim on reconnect — deliberately, because rewriting a recorded
+	 * delivery would make the ledger lie about what was sent. Any leak surviving an
+	 * upgrade therefore drains with the in-flight rows rather than being edited away.
+	 */
 	prepare(turnId: string, origin: OriginRef, text: string, replyToMessageId?: string): ChatMessagePayload | undefined {
 		if (isSilenceToken(text)) return undefined;
+		const sanitized = stripControlTokens(text);
+		if (!sanitized || isSilenceToken(sanitized)) return undefined;
 		const deliveryId = crypto.randomUUID();
 		const payload: ChatMessagePayload = {
 			turnId,
 			origin,
 			role: "assistant",
-			text,
+			text: sanitized,
 			final: true,
 			deliveryId,
 			...(replyToMessageId ? { replyToMessageId } : {}),

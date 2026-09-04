@@ -20,7 +20,6 @@ export {
 	type EventCatalogV01,
 	type EventName,
 	type GatewayStatusResult,
-	isSilenceToken,
 	type MemoryAuditResult,
 	type MemorySearchParams,
 	type MemorySearchResult,
@@ -35,7 +34,6 @@ export {
 	type SessionListResult,
 	type SessionRecallParams,
 	type SessionRecallResult,
-	SILENCE_TOKENS,
 	type TriggerSpec,
 	VERBS_V01,
 	type VerbCatalogV01,
@@ -43,6 +41,18 @@ export {
 	type WorkRunParams,
 	type WorkRunResult,
 } from "./catalog";
+export {
+	breakParts,
+	containsSilenceToken,
+	isPlatformMessageId,
+	isSilenceToken,
+	reactionTokens,
+	replyTarget,
+	SILENCE_TOKENS,
+	stripBrokenTokens,
+	stripControlTokens,
+	stripReactionTokens,
+} from "./control-tokens";
 export {
 	ERROR_CODES,
 	type ErrorCode,
@@ -78,7 +88,6 @@ export {
 	validateOriginRef,
 } from "./origin";
 export {
-	isPlatformMessageId,
 	parseReactionReply,
 	platformSupportsReaction,
 	REACTION_ALLOWLIST,

@@ -20,6 +20,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
 	type ChatMessagePayload,
+	containsSilenceToken,
 	isSilenceToken,
 	parseReactionReply,
 	REACTION_ALLOWLIST,
@@ -659,7 +660,8 @@ test("RT-WIRE-01 a 12000-character targetMessageId is rejected before it can bec
 });
 
 // ---------------------------------------------------------------------------
-// Requirement 4: reply tokens, byte-identical silence, malformed = verbatim.
+// Requirement 4: reply tokens, byte-identical silence, and the never-leak rule
+// — a token is honoured wherever it appears and never reaches the room as text.
 // ---------------------------------------------------------------------------
 
 test("RT-TOKEN-01 fifty repeated tokens emit at most the per-turn cap and lose no reply", async () => {
@@ -680,46 +682,131 @@ test("RT-TOKEN-01 fifty repeated tokens emit at most the per-turn cap and lose n
 	});
 });
 
-test("RT-TOKEN-02 a token in the middle of a reply is plain text", async () => {
+test("RT-TOKEN-02 a token in the middle of a reply is honoured, not delivered as text", async () => {
 	const { client, database } = await gateway(["확인 [REACT:👍] 했습니다", "본문 [REACT:🔥@9] 끝"]);
 	await humanMessage(client, "c1", "m1");
 	await settle();
 	await humanMessage(client, "c2", "m2");
 	await settle();
-	expect(reactionEvents(client.frames)).toHaveLength(0);
-	expect(textEvents(client.frames).map((frame) => frame.payload.text)).toEqual([
-		"확인 [REACT:👍] 했습니다",
-		"본문 [REACT:🔥@9] 끝",
-	]);
-	expect(database.deliveryRows()).toHaveLength(2);
+	expect(reactionEvents(client.frames).map((frame) => frame.payload.reaction.emoji)).toEqual(["👍", "🔥"]);
+	expect(textEvents(client.frames).map((frame) => frame.payload.text)).toEqual(["확인 했습니다", "본문 끝"]);
+	expect(database.deliveryRows()).toHaveLength(4);
 });
 
-test("RT-TOKEN-03 every malformed token sends the reply verbatim exactly once", async () => {
-	const malformed = [
+test("RT-TOKEN-03 an unusable token is stripped and logged, and the reply still ships once", async () => {
+	const unusable = [
 		"[REACT:] 발사합니다",
 		"[REACT:👍@] 발사합니다",
-		"[REACT:👍 발사합니다",
 		"[REACT:🚀] 발사합니다",
 		"[REACT:nonsense] 발사합니다",
 		"[REACT:👍@ ] 발사합니다",
-		"[react:👍] 발사합니다",
-		"[REACT:👍]@1 발사합니다",
 	];
-	const { client, database } = await gateway(malformed);
-	for (const [index] of malformed.entries()) {
-		await humanMessage(client, `c${index}`, `m${index}`);
-		await Bun.sleep(120);
+	// Honoured, not unusable: lowercase is a spelling drift, and `]@1` is a
+	// well-formed token followed by text.
+	const honoured = ["[react:👍] 발사합니다", "[REACT:👍]@1 발사합니다"];
+	// No closed bracket at all, so there is no token to find and nothing to strip:
+	// a fragment like this is indistinguishable from prose and ships as written.
+	const prose = "[REACT:👍 발사합니다";
+	const replies = [...unusable, ...honoured, prose];
+	await withCapturedLog(async (lines) => {
+		const { client, database } = await gateway(replies);
+		for (const [index] of replies.entries()) {
+			await humanMessage(client, `c${index}`, `m${index}`);
+			await Bun.sleep(120);
+		}
+		await settle();
+		const texts = textEvents(client.frames).map((frame) => frame.payload.text);
+		expect(texts).toEqual([...unusable.map(() => "발사합니다"), "발사합니다", "@1 발사합니다", prose]);
+		expect(reactionEvents(client.frames)).toHaveLength(honoured.length);
+		expect(database.deliveryRows()).toHaveLength(replies.length + honoured.length);
+		// A stripped token is never a silent nothing: every one of the five is named in
+		// the daemon log, which is the owner's only record of the lost acknowledgement.
+		expect(lines.filter((line) => line.includes("reaction token unusable"))).toHaveLength(unusable.length);
+	});
+	// Pure-parser cross-check: the same inputs at protocol level.
+	for (const reply of unusable) {
+		const parsed = parseReactionReply(reply);
+		expect(parsed?.reactions).toEqual([]);
+		expect(parsed?.body).toBe("발사합니다");
 	}
+	expect(parseReactionReply("[REACT:👍]@1 발사합니다")?.body).toBe("@1 발사합니다");
+	expect(parseReactionReply(prose)).toBeUndefined();
+});
+
+test("RT-TOKEN-08 a hostile token argument cannot forge or flood the daemon log", async () => {
+	await withCapturedLog(async (lines) => {
+		const { client } = await gateway([`[REACT:x\rGATEWAY FORGED\u001b[31m${"9".repeat(500)}] 본문`]);
+		await humanMessage(client, "c1", "m1");
+		await settle();
+		expect(textEvents(client.frames).map((frame) => frame.payload.text)).toEqual(["본문"]);
+		const logged = lines.filter((line) => line.includes("reaction token unusable"));
+		expect(logged).toHaveLength(1);
+		// Bounded and control-character free, so a reply cannot inject a second log line.
+		expect(logged[0]).not.toContain("\r");
+		expect(logged[0]).not.toContain("\u001b");
+		expect(logged[0].length).toBeLessThan(200);
+	});
+});
+
+test("RT-TOKEN-09 stripping a reaction never destroys a [BREAK] boundary", async () => {
+	// The blocker generation 1 shipped: the whitespace around the token was collapsed
+	// to a single space, so the newline that made [BREAK] own its line disappeared and
+	// two intentional messages arrived fused into one.
+	const { client, database } = await gateway(["첫째\n[REACT:👍]\n[BREAK]\n둘째"]);
+	await humanMessage(client, "c1", "m1");
+	await settle();
+	expect(reactionEvents(client.frames).map((frame) => frame.payload.reaction.emoji)).toEqual(["👍"]);
+	expect(textEvents(client.frames).map((frame) => frame.payload.text)).toEqual(["첫째", "둘째"]);
+	expect(database.deliveryRows()).toHaveLength(3);
+});
+
+test("RT-TOKEN-10 a closed fragment that breaks the single-line grammar never reaches the room", async () => {
+	// The second generation-1 blocker: the token grammar is single-line, so a closed
+	// fragment with a newline in its argument matched nothing and was posted verbatim
+	// into the channel and into the delivery ledger.
+	const { client, database } = await gateway(["[REACT:bad\nargument] 본문", "[REPLY:bad\nargument] 본문"]);
+	await humanMessage(client, "c1", "m1");
+	await settle();
+	await humanMessage(client, "c2", "m2");
+	await settle();
+	expect(reactionEvents(client.frames)).toHaveLength(0);
+	expect(textEvents(client.frames).map((frame) => frame.payload.text)).toEqual(["본문", "본문"]);
+	for (const row of database.deliveryRows()) {
+		expect(row.payload_json).not.toContain("[REACT:");
+		expect(row.payload_json).not.toContain("[REPLY:");
+	}
+});
+
+test("RT-TOKEN-11 a broken fragment hiding a [BREAK] cannot smuggle syntax past the splitter", async () => {
+	// The generation-2 ordering bug: the sweep ran per part, so a fragment carrying a
+	// line-owned [BREAK] was cut in half first and both halves shipped raw as
+	// `[REACT:bad` and `argument] 본문`.
+	const { client, database } = await gateway(["[REACT:bad\n[BREAK]\nargument] 본문"]);
+	await humanMessage(client, "c1", "m1");
+	await settle();
+	expect(reactionEvents(client.frames)).toHaveLength(0);
+	for (const frame of textEvents(client.frames)) expect(frame.payload.text).not.toContain("[REACT");
+	expect(textEvents(client.frames).map((frame) => frame.payload.text)).toEqual(["argument] 본문"]);
+	for (const row of database.deliveryRows()) expect(row.payload_json).not.toContain("[REACT:");
+});
+
+test("RT-TOKEN-12 a broken fragment cannot smuggle silence and delete the whole reply", async () => {
+	// The worst case the red-team lane found: the fragment closed early on its own
+	// inner [BREAK], leaving a bare [SILENT] in the part, so the turn delivered
+	// NOTHING — the text either side of the garbage went with it.
+	const { client, database } = await gateway([
+		"앞 문장\n[REACT:bad\n[BREAK]\n[SILENT]\nargument] 뒤 문장",
+		"앞 문장\n[REPLY:bad\t[BREAK]\t[NO_REPLY]\targument] 뒤 문장",
+	]);
+	await humanMessage(client, "c1", "m1");
+	await settle();
+	await humanMessage(client, "c2", "m2");
 	await settle();
 	const texts = textEvents(client.frames).map((frame) => frame.payload.text);
-	// `[REACT:👍]@1 ...` is a WELL-FORMED token followed by text, so it reacts and
-	// speaks the remainder; the other seven are verbatim.
-	expect(texts).toEqual([...malformed.slice(0, 7), "@1 발사합니다"]);
-	expect(reactionEvents(client.frames)).toHaveLength(1);
-	expect(database.deliveryRows()).toHaveLength(malformed.length + 1);
-	// Pure-parser cross-check: the same inputs at protocol level.
-	for (const reply of malformed.slice(0, 7)) expect(parseReactionReply(reply)).toBeUndefined();
-	expect(parseReactionReply("[REACT:👍]@1 발사합니다")?.body).toBe("@1 발사합니다");
+	expect(texts).toEqual(["앞 문장\nargument] 뒤 문장", "앞 문장\nargument] 뒤 문장"]);
+	for (const text of texts)
+		for (const token of ["[REACT:", "[REPLY:", "[BREAK", "[SILENT", "[NO_REPLY"]) expect(text).not.toContain(token);
+	for (const row of database.deliveryRows()) expect(row.payload_json).not.toContain("[SILENT");
 });
 
 test("RT-TOKEN-04 the silence-token contract is byte-identical next to reaction tokens", async () => {
@@ -737,13 +824,18 @@ test("RT-TOKEN-04 the silence-token contract is byte-identical next to reaction 
 		"[REACT:👍] [SILENT]",
 	])
 		expect(isSilenceToken(text)).toBe(false);
+	// Exact match is not the delivery rule: containment is, and it covers every
+	// spelling in the list rather than only `[SILENT]`.
+	for (const text of ["형님 [SILENT]", "[REACT:👍] [SILENT]", "판단 끝.\n\n[NO_REPLY]", "말 없음 [no_reply]"])
+		expect(containsSilenceToken(text)).toBe(true);
 	const { client, database } = await gateway([
 		"[REACT:👍] [SILENT]",
 		"[SILENT][REACT:🔥]",
 		"[SILENT]",
 		"[REACT:🔥@m3]\n[SILENT]",
+		"할 말은 없다.\n\n[NO_REPLY]",
 	]);
-	for (let index = 0; index < 4; index++) {
+	for (let index = 0; index < 5; index++) {
 		await humanMessage(client, `c${index}`, `m${index}`);
 		await Bun.sleep(150);
 	}
@@ -753,12 +845,12 @@ test("RT-TOKEN-04 the silence-token contract is byte-identical next to reaction 
 			? `R:${frame.payload.reaction.emoji}@${frame.payload.reaction.targetMessageId}`
 			: `T:${frame.payload.text}`,
 	);
-	// Turn 1: token consumed, the remaining body is a silence token, so nothing is
-	// spoken. Turn 2: a silence token ANYWHERE in the text silences the part —
-	// control tokens are never delivered verbatim (live leak, 2026-09-02).
-	// Turn 3: silence suppresses everything. Turn 4: reaction only.
-	expect(observed).toEqual(["R:👍@m0", "R:🔥@m3"]);
-	expect(database.deliveryRows()).toHaveLength(2);
+	// Silence suppresses the TEXT, and it does so wherever the token sits, so a
+	// reaction next to it still lands and order does not matter (turns 1, 2, 4).
+	// Turn 3 says nothing at all, and turn 5 is the live leak this closes: a
+	// reasoning line in front of `[NO_REPLY]` used to be posted verbatim.
+	expect(observed).toEqual(["R:👍@m0", "R:🔥@m1", "R:🔥@m3"]);
+	expect(database.deliveryRows()).toHaveLength(3);
 });
 
 test("RT-TOKEN-05 reaction tokens on a loopback origin are never parsed", async () => {
@@ -780,32 +872,29 @@ test("RT-TOKEN-06 a reaction plus [BREAK] parts keeps every part of the reply", 
 	const { client, database } = await gateway(["[REACT:👍]\n첫째 문장\n[BREAK]\n둘째 문장\n[BREAK]\n[REACT:🔥] 셋째"]);
 	await humanMessage(client, "c1", "m1");
 	await settle();
+	// Both tokens are honoured, but both are untargeted and therefore land on the
+	// trigger message, where the per-message cap allows exactly one.
 	expect(reactionEvents(client.frames).map((frame) => frame.payload.reaction.emoji)).toEqual(["👍"]);
-	// The token is only a token at the very start of the reply; inside a later part
-	// it is text, and no part is dropped.
-	expect(textEvents(client.frames).map((frame) => frame.payload.text)).toEqual([
-		"첫째 문장",
-		"둘째 문장",
-		"[REACT:🔥] 셋째",
-	]);
+	// A token inside a later part is still a token: it is consumed there too, and
+	// no part is dropped or delivered with the syntax showing.
+	expect(textEvents(client.frames).map((frame) => frame.payload.text)).toEqual(["첫째 문장", "둘째 문장", "셋째"]);
 	expect(database.deliveryRows()).toHaveLength(4);
 });
 
-test("RT-TOKEN-07 a 10000-character @id is a malformed token, so the reply ships verbatim", async () => {
+test("RT-TOKEN-07 a 10000-character @id is an unusable token, so only the reply ships", async () => {
 	const huge = "9".repeat(10_000);
 	const reply = `[REACT:👍@${huge}] 확인했습니다`;
 	const { client, database } = await gateway([reply]);
 	await humanMessage(client, "c1", "m1");
 	await settle();
-	// RT-TOKEN-07 (was pinned to blocker RT-WIRE-01, now fixed): a target that cannot
-	// be a platform message id makes the whole token malformed, and requirement 4 says
-	// a malformed token sends the text VERBATIM rather than dropping the reply. So no
-	// reaction is emitted and the one delivery carries the original text, token and all.
+	// A target that cannot be a platform message id makes the token unusable, so the
+	// reaction is dropped and logged — but the token never rides along as text, or a
+	// 10000-character id would be posted into the room.
 	const rows = database.deliveryRows();
 	expect(rows).toHaveLength(1);
 	const payloads = rows.map((row) => JSON.parse(row.payload_json) as ChatMessagePayload);
 	expect(payloads[0]?.reaction).toBeUndefined();
-	expect(payloads[0]?.text).toBe(reply);
+	expect(payloads[0]?.text).toBe("확인했습니다");
 	expect(reactionEvents(client.frames)).toHaveLength(0);
 });
 

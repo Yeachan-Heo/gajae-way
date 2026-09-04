@@ -101,11 +101,14 @@ export class TelegramBotApi {
 		});
 	}
 
-	sendMessage(chatId: string, text: string, messageThreadId?: number): Promise<unknown> {
+	sendMessage(chatId: string, text: string, messageThreadId?: number, replyToMessageId?: string): Promise<unknown> {
 		return this.call("sendMessage", {
 			chat_id: chatId,
 			text,
 			...(messageThreadId === undefined ? {} : { message_thread_id: messageThreadId }),
+			// reply_parameters replaced the deprecated reply_to_message_id.
+			// https://core.telegram.org/bots/api#replyparameters (fetched 2026-09-03)
+			...(replyToMessageId === undefined ? {} : { reply_parameters: { message_id: Number(replyToMessageId) } }),
 		});
 	}
 
@@ -147,7 +150,18 @@ export async function settleTelegramDelivery(
 		if (!route)
 			throw new TelegramApiError(400, `No persisted Telegram reply route for ${message.origin.conversationId}`);
 		const text = message.duplicateWarning ? `[recovered - may be a duplicate] ${message.text}` : message.text;
-		for (const chunk of chunkTelegramMessage(text)) await bot.sendMessage(route.chatId, chunk, route.messageThreadId);
+		// A `[REPLY:<id>]` token was stripped from the text and honoured as routing
+		// metadata, so it has to be USED here or the persona's reply-threading is a
+		// promise the guidance makes and this platform silently breaks. Only the first
+		// chunk threads: the rest are continuations of that same answer.
+		const chunks = chunkTelegramMessage(text);
+		for (const [index, chunk] of chunks.entries())
+			await bot.sendMessage(
+				route.chatId,
+				chunk,
+				route.messageThreadId,
+				index === 0 ? message.replyToMessageId : undefined,
+			);
 		await gateway.request("delivery.confirm", { deliveryId });
 	} catch (error) {
 		await gateway.request("delivery.fail", {

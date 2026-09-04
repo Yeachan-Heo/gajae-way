@@ -277,14 +277,16 @@ test("a token may target a specific message instead of the trigger", async () =>
 	});
 });
 
-test("a malformed reaction token sends the text verbatim instead of dropping the reply", async () => {
+test("an unusable reaction token is stripped instead of leaking into the room", async () => {
 	const { client } = await gateway("[REACT:🚀] 발사합니다");
 	sendMessage(client, "c1");
 	await settle();
 	expect(reactionEvents(client.frames)).toHaveLength(0);
 	const texts = textEvents(client.frames);
 	expect(texts).toHaveLength(1);
-	expect(texts[0].payload.text).toBe("[REACT:🚀] 발사합니다");
+	// The emoji is off the allowlist, so the reaction is lost and logged — the reply
+	// survives, without the control syntax the room should never see.
+	expect(texts[0].payload.text).toBe("발사합니다");
 });
 
 test("the silence token still suppresses everything, with no reaction leaking out", async () => {

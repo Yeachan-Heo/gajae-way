@@ -1,12 +1,16 @@
 import {
+	breakParts,
 	CATCH_ALL_EVENT_ORIGIN,
 	type ChatMessagePayload,
+	containsSilenceToken,
 	eventTypeOrigin,
-	isSilenceToken,
 	type MonitorEventRecord,
 	type MonitorRecord,
 	type OriginRef,
 	originKey,
+	replyTarget,
+	stripBrokenTokens,
+	stripControlTokens,
 } from "@gajaeway/protocol";
 import type { DeliveryService } from "../delivery/delivery";
 import type { MemoryClosureQueue } from "../memory/closure";
@@ -612,16 +616,47 @@ export class MonitorPropagator {
 			// fenced event still holding its lease (same transaction). A stale
 			// attempt therefore cannot emit a second delivery.
 			const deliveryId = crypto.randomUUID();
-			const deliveryText = authored
+			// A monitor note is model-authored, so it carries the same control tokens a
+			// chat reply does and gets the same treatment here: silence suppresses,
+			// `[REPLY:<id>]` threads the delivery, `[BREAK]` separates what the persona
+			// meant as two messages, and nothing ships with the syntax visible.
+			//
+			// This path used to only look for an EXACT silence token and strip nothing,
+			// which is how a live owner-DM note went out reading
+			// `[REPLY:1544933092823928892] ... [BREAK] [REPLY:...] ...` verbatim.
+			//
+			// SWEEP FIRST, then interpret — the same order the chat path uses. A closed
+			// fragment can hide a `[SILENT]` or a second `[REPLY:...]` inside its
+			// argument, so judging silence or reading a routing target off the raw note
+			// let malformed syntax delete a real note or repoint where it was sent.
+			//
+			// Silence is judged PER NOTE, before the join. The authoring contract is one
+			// note per event, so folding the batch into a single string first let one
+			// event's `[SILENT]` throw away a visible sibling note.
+			const notes = authored
 				.filter(
 					(entry): entry is { eventId: string; note: string } =>
 						typeof entry.eventId === "string" &&
 						typeof entry.note === "string" &&
 						fenced.some((row) => row.event_id === entry.eventId),
 				)
-				.map((entry) => entry.note)
-				.join("\n");
-			if (!isSilenceToken(deliveryText)) {
+				.map((entry) => stripBrokenTokens(entry.note))
+				.filter((note) => !containsSilenceToken(note));
+			// A reply target is honoured, not discarded: the persona names an ABSOLUTE
+			// platform message id, which needs no trigger message to be threadable.
+			// The first target wins, because one delivery can only answer one message.
+			const replyToMessageId = notes.map((note) => replyTarget(note)).find((target) => target !== undefined);
+			// `[BREAK]` asked for separate messages. The fenced ledger admits exactly one
+			// delivery per batch, so the parts are kept as separate paragraphs inside it
+			// rather than fused onto one line; splitting a batch into several ledger rows
+			// would change monitor settlement granularity, which is recorded as a
+			// follow-up rather than smuggled in here.
+			const deliveryText = notes
+				.flatMap((note) => breakParts(note))
+				.map((part) => stripControlTokens(part))
+				.filter((part) => part.length > 0)
+				.join("\n\n");
+			if (deliveryText) {
 				const origin = target.origin;
 				const payload: ChatMessagePayload = {
 					turnId: batchId,
@@ -630,6 +665,7 @@ export class MonitorPropagator {
 					text: deliveryText,
 					final: true,
 					deliveryId,
+					...(replyToMessageId ? { replyToMessageId } : {}),
 				};
 				const admitted = this.#database.monitorDeliveryPrepareFenced(
 					deliveryId,
@@ -653,7 +689,13 @@ export class MonitorPropagator {
 			const code: DispatchFailureCode = failureCode(error, failureClass);
 			for (const row of leased) {
 				// #64: the detail must carry the actual cause (sanitized), not echo the code.
-				this.#database.monitorEventFencedFail(row.event_id, leaseId, batchId, code, `dispatch phase failed (${code}): ${failureDetail(error)}`);
+				this.#database.monitorEventFencedFail(
+					row.event_id,
+					leaseId,
+					batchId,
+					code,
+					`dispatch phase failed (${code}): ${failureDetail(error)}`,
+				);
 			}
 			console.error(`monitor dispatch failed (${code}): events ${claimed.map((row) => row.event_id).join(",")}`);
 			await this.#recordAuthoringFailure({
@@ -973,7 +1015,9 @@ export function parseAuthoredArray(response: string): unknown {
 			lastError = error;
 		}
 	}
-	throw new Error(`authoring response is not a JSON array (${lastError instanceof Error ? lastError.message : "no array found"})`);
+	throw new Error(
+		`authoring response is not a JSON array (${lastError instanceof Error ? lastError.message : "no array found"})`,
+	);
 }
 
 /**
@@ -988,7 +1032,13 @@ function failureDetail(error: unknown): string {
 	const stableCode = typeof code === "string" && /^[a-z0-9_.-]{1,64}$/i.test(code) ? code : undefined;
 	const frame =
 		error instanceof Error && error.stack
-			? (error.stack.split("\n").find((line) => /^\s+at .*(packages|src)\//.test(line)) ?? "").trim().replace(/^at\s+/, "").replace(/.*\/(packages\/[^)]+)\)?$/, "$1")
+			? (error.stack.split("\n").find((line) => /^\s+at .*(packages|src)\//.test(line)) ?? "")
+					.trim()
+					.replace(/^at\s+/, "")
+					.replace(/.*\/(packages\/[^)]+)\)?$/, "$1")
 			: "";
-	return [name, stableCode ? `code=${stableCode}` : "", frame ? `at ${frame}` : ""].filter(Boolean).join(" ").slice(0, 300);
+	return [name, stableCode ? `code=${stableCode}` : "", frame ? `at ${frame}` : ""]
+		.filter(Boolean)
+		.join(" ")
+		.slice(0, 300);
 }

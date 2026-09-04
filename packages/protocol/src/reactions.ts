@@ -1,3 +1,4 @@
+import { isPlatformMessageId, reactionTokens, stripReactionTokens } from "./control-tokens";
 import type { OriginPlatform } from "./origin";
 
 /**
@@ -127,17 +128,23 @@ export function reactionAllowlistDescription(platform: OriginPlatform): string {
 /**
  * The reaction reply mode (third mode next to text and the silence token).
  *
- * A reply may open with one or more `[REACT:<emoji-or-name>]` tokens, optionally
+ * A reply may carry one or more `[REACT:<emoji-or-name>]` tokens, optionally
  * targeting a specific message with `@<message id>`:
  *
  *   [REACT:👍]                      react to the message that triggered the turn
  *   [REACT:thumbsup@123456789]      react to one named message
  *   [REACT:👀] still looking into it  react AND say something
  *
+ * A token is honoured wherever it appears and is ALWAYS removed from `body`:
+ * anchoring it at the start of the message is what posted `[REACT:👍]` into the
+ * room verbatim whenever the persona wrote a reasoning line above it, exactly as
+ * a leading-anchored `[SILENT]` once did.
+ *
  * With nothing left after the tokens, the turn acknowledges with a reaction and
- * sends no message at all. Parsing is all-or-nothing: a malformed or
- * non-allowlisted token makes the whole reply plain text, so a bad token can
- * only ever cost the reaction, never the reply.
+ * sends no message at all. A token that cannot be honoured — unknown emoji,
+ * `@` with no usable target — is reported in `skipped` and stripped anyway: a
+ * bad token costs the reaction, never the reply, and never leaks its own syntax
+ * into the room.
  */
 export interface ReactionReply {
 	readonly reactions: readonly {
@@ -145,48 +152,41 @@ export interface ReactionReply {
 		readonly emojiName: string;
 		readonly targetMessageId?: string;
 	}[];
-	/** Reply text after the tokens; empty means reaction-only (no message). */
+	/** Reply text with every REACTION token removed; empty means reaction-only (no message). */
 	readonly body: string;
+	/** Raw arguments of tokens that could not be resolved, for the caller to log. */
+	readonly skipped: readonly string[];
 }
 
 /**
- * Platform message ids are opaque to us, but they are not arbitrary strings:
- * Discord snowflakes and Telegram message ids are short and alphanumeric. Bounding
- * them here keeps a hostile or hallucinated id from becoming an oversized frame or
- * from smuggling newlines into anything that renders an id.
- */
-const PLATFORM_MESSAGE_ID = /^[A-Za-z0-9._:-]{1,64}$/;
-
-export function isPlatformMessageId(value: string): boolean {
-	return PLATFORM_MESSAGE_ID.test(value);
-}
-
-const REACT_TOKEN = /^\s*\[REACT:([^\]\n]*)\]/;
-
-/**
- * Parses leading reaction tokens. Returns undefined when the reply carries no
- * token at all OR when a token is malformed/not allowlisted — both cases mean
- * "deliver the text verbatim".
+ * Parses every reaction token in a reply. Returns undefined only when the reply
+ * carries no token at all, which means "deliver the text as it stands".
+ *
+ * A token that cannot be honoured lands in `skipped` instead of forcing the raw
+ * text out: the caller logs it and delivers `body`, so the reply survives and
+ * the control syntax stays internal.
  */
 export function parseReactionReply(text: string): ReactionReply | undefined {
-	let rest = text;
+	const arguments_ = reactionTokens(text);
+	if (arguments_.length === 0) return undefined;
 	const reactions: { emoji: string; emojiName: string; targetMessageId?: string }[] = [];
-	for (let match = rest.match(REACT_TOKEN); match; match = rest.match(REACT_TOKEN)) {
-		const [token, argument = ""] = match;
+	const skipped: string[] = [];
+	for (const argument of arguments_) {
 		const at = argument.lastIndexOf("@");
 		const emojiPart = at === -1 ? argument : argument.slice(0, at);
 		const targetMessageId = at === -1 ? undefined : argument.slice(at + 1).trim();
 		const resolved = resolveReactionEmoji(emojiPart);
-		// Malformed: unknown emoji, an explicit `@` with no target id after it, or a
-		// target that cannot be a platform message id.
-		if (!resolved || (at !== -1 && !isPlatformMessageId(targetMessageId ?? ""))) return undefined;
+		// Unhonourable: unknown emoji, an explicit `@` with no target id after it,
+		// or a target that cannot be a platform message id.
+		if (!resolved || (at !== -1 && !isPlatformMessageId(targetMessageId ?? ""))) {
+			skipped.push(argument);
+			continue;
+		}
 		reactions.push({
 			emoji: resolved.unicode,
 			emojiName: resolved.name,
 			...(targetMessageId ? { targetMessageId } : {}),
 		});
-		rest = rest.slice(token.length);
 	}
-	if (reactions.length === 0) return undefined;
-	return { reactions, body: rest.trim() };
+	return { reactions, body: stripReactionTokens(text), skipped };
 }

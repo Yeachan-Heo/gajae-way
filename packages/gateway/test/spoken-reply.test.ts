@@ -20,6 +20,17 @@ test("a part that is only a reply token contributes nothing", () => {
 	expect(spokenReply(["[REPLY:99]", "본문"], true)).toBe("본문");
 });
 
+test("no control token is ever read aloud, wherever it sits in the part", () => {
+	// A leading-anchored stripper let a token that survived the splitter be spoken:
+	// a platform message id or a reaction token is noise the listener cannot use.
+	expect(spokenReply(["확인 [REACT:👍] 했습니다"], true)).toBe("확인 했습니다");
+	expect(spokenReply(["판단 끝.\n\n[REPLY:1544305635179495434] 혼난거 아니고"], true)).toBe(
+		"판단 끝.\n\n혼난거 아니고",
+	);
+	expect(spokenReply(["[react:🔥] 좋다", "[break] 계속"], true)).toBe("좋다\n\n계속");
+	expect(spokenReply(["[REACT:👍]"], true)).toBe("");
+});
+
 test("an empty reply stays empty so nothing is synthesized", () => {
 	expect(spokenReply([], true)).toBe("");
 	expect(spokenReply(["   "], true)).toBe("");

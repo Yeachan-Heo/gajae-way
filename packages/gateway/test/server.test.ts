@@ -871,9 +871,21 @@ test("responses larger than one socket buffer arrive intact (backpressure outbox
 
 test("control tokens never leak: a silence token inside a preamble silences, and [REPLY:id] mid-text is stripped", async () => {
 	directory = await mkdtemp(join(tmpdir(), "gajaeway-server-"));
-	const config: GatewayConfig = { schemaVersion: 1, home: directory, configPath: join(directory, "config.json"), socketPath: join(directory, "gateway.sock"), dbPath: join(directory, "gateway.db"), logVerbosity: "info", dmPolicy: "open" as const, channels: { c1: { engagement: "open", debounceMs: 0 } } };
+	const config: GatewayConfig = {
+		schemaVersion: 1,
+		home: directory,
+		configPath: join(directory, "config.json"),
+		socketPath: join(directory, "gateway.sock"),
+		dbPath: join(directory, "gateway.db"),
+		logVerbosity: "info",
+		dmPolicy: "open" as const,
+		channels: { c1: { engagement: "open", debounceMs: 0 } },
+	};
 	const database = await GatewayDatabase.open(config.dbPath);
-	const replies = ["Pure geopolitics chat, not addressed to me, nothing to add.\n\n[SILENT]", "This is a real bug report.\n\n[REPLY:1544704223634260038] 알겠고 인정"];
+	const replies = [
+		"Pure geopolitics chat, not addressed to me, nothing to add.\n\n[SILENT]",
+		"This is a real bug report.\n\n[REPLY:1544704223634260038] 알겠고 인정",
+	];
 	const gjc: GjcPort = {
 		ensureSession: async () => ({ sessionId: "0f1e2d3c-4b5a-4678-8796-a5b4c3d2e1f0" }),
 		sendTurn: async () => replies.shift() ?? "[SILENT]",
@@ -884,13 +896,30 @@ test("control tokens never leak: a silence token inside a preamble silences, and
 	client.send({ v: "0.1", type: "hello", payload: { supportedVersions: ["0.1"] } });
 	await waitFor(client.frames, 1);
 	const origin = { platform: "discord", kind: "channel", conversationId: "c1" };
-	const say = (id: string, text: string) => client.send({ v: "0.1", type: "request", id, verb: "chat.send", params: { origin, text, messageId: id, engagement: { mentioned: true, group: true, authorId: "owner", authorName: "bellman" } } });
+	const say = (id: string, text: string) =>
+		client.send({
+			v: "0.1",
+			type: "request",
+			id,
+			verb: "chat.send",
+			params: {
+				origin,
+				text,
+				messageId: id,
+				engagement: { mentioned: true, group: true, authorId: "owner", authorName: "bellman" },
+			},
+		});
 	say("m1", "first");
 	await Bun.sleep(400);
 	say("m2", "second");
 	await Bun.sleep(600);
-	const messages = client.frames.filter((f: any) => f.type === "event" && f.event === "chat.message" && f.payload?.text).map((f: any) => f.payload);
-	expect(messages.map((m: any) => m.text)).toEqual(["This is a real bug report. 알겠고 인정"]);
+	const messages = client.frames
+		.filter((f: any) => f.type === "event" && f.event === "chat.message" && f.payload?.text)
+		.map((f: any) => f.payload);
+	// The persona's own paragraph break survives: the stripper puts back the line
+	// structure the token consumed, which is what keeps a following [BREAK] on its
+	// own line. Collapsing it to a space also rewrote text nobody asked it to touch.
+	expect(messages.map((m: any) => m.text)).toEqual(["This is a real bug report.\n\n알겠고 인정"]);
 	expect(messages[0].replyToMessageId).toBe("1544704223634260038");
 	client.close();
 });

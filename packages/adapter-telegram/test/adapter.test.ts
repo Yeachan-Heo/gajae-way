@@ -87,6 +87,55 @@ test("persists a forum topic route across restart and sends replies to its topic
 	}
 });
 
+test("a reply target stripped from the text is honoured on the first chunk only", async () => {
+	// The gateway strips `[REPLY:<id>]` and hands the target over as metadata. This
+	// adapter used to drop it, so reply-threading worked on Discord and silently did
+	// nothing on Telegram while the persona guidance promised it everywhere.
+	const home = await temporaryHome();
+	try {
+		const state = await TelegramAdapterState.load(home);
+		const origin = telegramMessageOrigin(topicMessage);
+		await state.rememberOrigin(origin, 99);
+		const sent: Array<{ chatId: string; text: string; thread?: number; replyTo?: string }> = [];
+		const requests: Array<{ verb: string; params: unknown }> = [];
+		await settleTelegramDelivery(
+			mockGateway(requests),
+			{
+				sendMessage: async (chatId, text, thread, replyTo) => void sent.push({ chatId, text, thread, replyTo }),
+			},
+			state,
+			{ ...delivery(origin, "확인했습니다"), replyToMessageId: "1544704223634260038" },
+		);
+		expect(sent).toEqual([{ chatId: "-100123", text: "확인했습니다", thread: 99, replyTo: "1544704223634260038" }]);
+		expect(requests).toEqual([{ verb: "delivery.confirm", params: { deliveryId: "delivery-1" } }]);
+	} finally {
+		await rm(home, { recursive: true, force: true });
+	}
+});
+
+test("a long threaded reply threads once and continues unthreaded", async () => {
+	const home = await temporaryHome();
+	try {
+		const state = await TelegramAdapterState.load(home);
+		const origin = telegramMessageOrigin(topicMessage);
+		await state.rememberOrigin(origin, 99);
+		const sent: Array<{ text: string; replyTo?: string }> = [];
+		await settleTelegramDelivery(
+			mockGateway([]),
+			{ sendMessage: async (_chatId, text, _thread, replyTo) => void sent.push({ text, replyTo }) },
+			state,
+			{ ...delivery(origin, "가".repeat(5000)), replyToMessageId: "42" },
+		);
+		expect(sent).toHaveLength(2);
+		expect(sent[0]?.replyTo).toBe("42");
+		// The continuation is part of the same answer, not a second reply to the same
+		// message, so it must not thread again.
+		expect(sent[1]?.replyTo).toBeUndefined();
+	} finally {
+		await rm(home, { recursive: true, force: true });
+	}
+});
+
 test("deduplicates update ids durably before sending an inbound turn", async () => {
 	const home = await temporaryHome();
 	try {

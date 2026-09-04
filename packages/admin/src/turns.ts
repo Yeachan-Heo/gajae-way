@@ -13,7 +13,12 @@
  *   away from the desk.
  */
 
-import { type ChatMessagePayload, type ChatProgressPayload, isSilenceToken, type OriginRef } from "@gajaeway/protocol";
+import {
+	type ChatMessagePayload,
+	type ChatProgressPayload,
+	containsSilenceToken,
+	type OriginRef,
+} from "@gajaeway/protocol";
 
 /** Per-turn ceiling the gateway enforces on every `gjc` child. */
 export const TURN_CEILING_MS = 300_000;
@@ -47,7 +52,7 @@ export type TrackedTurn = {
 /** A turn's terminal shape, derived once so the panel and the SSE delta agree. */
 function outcomeOf(message: ChatMessagePayload): TrackedTurn["outcome"] {
 	if (message.text.trim().startsWith("[turn failed]")) return "failed";
-	return isSilenceToken(message.text) ? "silent" : "replied";
+	return containsSilenceToken(message.text) ? "silent" : "replied";
 }
 
 export class TurnTracker {

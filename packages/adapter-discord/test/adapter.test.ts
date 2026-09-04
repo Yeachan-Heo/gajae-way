@@ -235,7 +235,14 @@ test("a final progress event ends the typing hint even when the turn delivered n
 	await Bun.sleep(20);
 	expect(typingCount).toBeGreaterThanOrEqual(2);
 	// Silent turn: no delivery ever arrives, only the final progress frame.
-	emit?.({ turnId: "turn-1", origin: { platform: "discord", kind: "channel", conversationId: "channel-1" }, final: true, elapsedMs: 1, toolCalls: 0, outputTokens: 0 });
+	emit?.({
+		turnId: "turn-1",
+		origin: { platform: "discord", kind: "channel", conversationId: "channel-1" },
+		final: true,
+		elapsedMs: 1,
+		toolCalls: 0,
+		outputTokens: 0,
+	});
 	const settled = typingCount;
 	await Bun.sleep(25);
 	expect(typingCount).toBe(settled);

@@ -151,7 +151,7 @@ function turnRow(turn: TrackedTurn, state: "running" | "stalled" | "finished", n
 	const stateLabel =
 		state === "finished"
 			? turn.outcome === "silent"
-				? "◐ replied [SILENT] — nothing sent"
+				? "◐ stayed silent — nothing sent"
 				: turn.outcome === "failed"
 					? "✕ turn failed"
 					: turn.deliveryId
