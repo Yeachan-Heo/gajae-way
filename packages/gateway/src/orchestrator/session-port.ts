@@ -223,17 +223,31 @@ export class BrokerSessionPort implements SessionPort {
 			let indexed = true;
 			try {
 				// Judge the raw envelope: a persisted id is reusable only when the
-				// broker explicitly still owns a live endpoint. `ok:true, live:false`
-				// is just as unusable as session_unavailable (monitor authoring bypasses
-				// PersonaActor's resume path and otherwise reuses the dead id forever).
+				// A persisted id is reusable if live, and resumable if it still has
+				// saved authority. Monitor authoring reaches SessionPort directly, so
+				// resume here before paying for a cold replacement session.
 				const result = await this.#cli(["sdk", "session", "inspect", existing.sessionId, "--repo", input.repo]);
 				const envelope = JSON.parse(result.stdout) as {
 					ok?: unknown;
-					result?: { session?: { live?: unknown } };
+					result?: { session?: { live?: unknown; deleted?: unknown } };
 					error?: { code?: unknown };
 				};
 				if (envelope.ok === false) indexed = envelope.error?.code !== "session_unavailable";
-				if (envelope.ok === true && envelope.result?.session?.live === false) indexed = false;
+				if (envelope.ok === true && envelope.result?.session?.live === false) {
+					if (envelope.result.session.deleted !== true) {
+						try {
+							return await this.resume({
+								sessionId: existing.sessionId,
+								repo: input.repo,
+								originKey: input.originKey,
+								epoch: input.epoch,
+							});
+						} catch {
+							// Saved authority cannot be resumed: replace it below.
+						}
+					}
+					indexed = false;
+				}
 			} catch {
 				indexed = true;
 			}
