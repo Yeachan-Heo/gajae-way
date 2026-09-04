@@ -68,6 +68,12 @@ interface SourceSection {
 	readonly excerpt?: { readonly keptBytes: number; readonly totalBytes: number };
 }
 
+class SourceTooLargeError extends Error {
+	constructor(readonly totalBytes: number) {
+		super("source_too_large");
+	}
+}
+
 interface Roots {
 	readonly memory: string;
 	readonly allowed: readonly string[];
@@ -262,7 +268,7 @@ async function readSection(
 	// Only a pathological file is refused outright now. Anything between the
 	// excerpt cap and this ceiling is read and excerpted rather than dropped,
 	// which is the #70 fix: dropping it discarded the newest memory entirely.
-	if (info.size > MAX_SOURCE_READ_BYTES) throw new Error("source_too_large");
+	if (info.size > MAX_SOURCE_READ_BYTES) throw new SourceTooLargeError(info.size);
 	const full = transform(await readFile(target, "utf8")).trim();
 	if (!full) throw new Error("no_safe_content");
 	const totalBytes = Buffer.byteLength(full, "utf8");
@@ -383,6 +389,7 @@ export async function buildSessionBootstrap(input: {
 	const key = originKey(input.origin);
 	const marker = markerFor(key, input.epoch);
 	const diagnostics: string[] = [];
+	let sourceDropped = false;
 	const candidates: SourceSection[] = [];
 	const resolved = await roots(input.home);
 	const group = input.origin.kind !== "dm" && input.origin.kind !== "loopback";
@@ -532,7 +539,14 @@ export async function buildSessionBootstrap(input: {
 				break;
 			} catch (error) {
 				const code = diagnosticCode(error);
-				if (code !== "enoent" && code !== "no_safe_content") diagnostics.push(`${path}: ${code}`);
+				if (code !== "enoent" && code !== "no_safe_content") {
+					if (error instanceof SourceTooLargeError) {
+						sourceDropped = true;
+						diagnostics.push(
+							`${path}: source_too_large (${error.totalBytes}B exceeds ${MAX_SOURCE_READ_BYTES}B read ceiling)`,
+						);
+					} else diagnostics.push(`${path}: ${code}`);
+				}
 			}
 		}
 		if (!included) diagnostics.push(`${label.toLowerCase()}: no matching safe entries`);
@@ -605,7 +619,7 @@ export async function buildSessionBootstrap(input: {
 		text,
 		includedSections: included.map((section) => section.name),
 		byteCount: Buffer.byteLength(text, "utf8"),
-		truncated: omitted.length > 0 || excerpted.length > 0,
+		truncated: omitted.length > 0 || excerpted.length > 0 || sourceDropped,
 		diagnostics: [
 			...diagnostics,
 			...(omitted.length > 0 ? [`omitted sections (${omitted.length}): ${omitted.join(", ")}`] : []),

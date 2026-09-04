@@ -426,4 +426,24 @@ describe("session bootstrap builder", () => {
 		expect(result.text).not.toContain("excerpt: tail only,");
 		expect(result.diagnostics.some((line) => line.startsWith("excerpted "))).toBe(false);
 	});
+
+	test("a daily source above the hard read ceiling is bounded and reported as dropped", async () => {
+		const config = await setup();
+		await mkdir(join(home, "memory", "daily", "2026-08"), { recursive: true });
+		await writeFile(
+			join(home, "memory", "daily", "2026-08", "2026-08-28.md"),
+			`## oversized\n- origin: discord/channel/c1\n- user: ${"한".repeat(1_400_000)}`,
+		);
+
+		const result = await build(config);
+
+		expect(result.byteCount).toBeLessThanOrEqual(SESSION_BOOTSTRAP_MAX_BYTES);
+		expect(result.truncated).toBe(true);
+		expect(
+			result.diagnostics.some((line) =>
+				/^daily\/2026-08\/2026-08-28\.md: source_too_large \(\d+B exceeds 4194304B read ceiling\)$/.test(line),
+			),
+		).toBe(true);
+		expect(result.text).not.toContain("�");
+	});
 });
