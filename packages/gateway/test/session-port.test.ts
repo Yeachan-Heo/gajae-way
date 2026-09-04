@@ -25,6 +25,8 @@ test("broker SessionPort preserves caller op-ref, model choice, bootstrap prompt
 		calls.push([...args]);
 		if (args.includes("session.create"))
 			return { exitCode: 0, stdout: JSON.stringify({ ok: true, result: { sessionId: "sdk-1" } }), stderr: "" };
+		if (args.includes("model.profile.set"))
+			return { exitCode: 0, stdout: JSON.stringify({ ok: true, result: true }), stderr: "" };
 		if (args.includes("model.set"))
 			return { exitCode: 0, stdout: JSON.stringify({ ok: true, result: { changed: true } }), stderr: "" };
 		if (args.includes("send"))
@@ -72,6 +74,7 @@ test("broker SessionPort preserves caller op-ref, model choice, bootstrap prompt
 		codingRegister: true,
 		model: { preset: "gpt-heavy" },
 	});
+	await port.setModel({ sessionId: binding.sessionId, repo: "/tmp/repo", selection: { preset: "gpt-heavy" } });
 	const result = await port.request({
 		sessionId: binding.sessionId,
 		repo: "/tmp/repo",
@@ -95,8 +98,8 @@ test("broker SessionPort preserves caller op-ref, model choice, bootstrap prompt
 	expect(send).toEqual(
 		expect.arrayContaining(["--op-ref", "gw-work-1", "--text", "trusted bootstrap\n\nimplement it"]),
 	);
-	expect(calls.find((args) => args.includes("model.set"))).toEqual(
-		expect.arrayContaining(["raw", "control", "sdk-1", "--op", "model.set"]),
+	expect(calls.find((args) => args.includes("model.profile.set"))).toEqual(
+		expect.arrayContaining(["raw", "control", "sdk-1", "--op", "model.profile.set"]),
 	);
 	expect(calls.find((args) => args.includes("session.last_assistant"))).toEqual(
 		expect.arrayContaining(["raw", "query", "sdk-1", "--query", "session.last_assistant"]),

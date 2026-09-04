@@ -441,7 +441,24 @@ export class BrokerSessionPort implements SessionPort {
 		repo: string;
 		selection: GjcModelSelection;
 	}): Promise<{ readonly changed: boolean }> {
-		const payload = typeof input.selection === "string" ? { id: input.selection } : { preset: input.selection.preset };
+		if (typeof input.selection !== "string") {
+			const activated = parseEnvelope<boolean>(
+				await this.#cli([
+					"sdk",
+					"session",
+					"raw",
+					"control",
+					input.sessionId,
+					"--op",
+					"model.profile.set",
+					"--json-input",
+					JSON.stringify({ id: input.selection.preset }),
+				]),
+				"model.profile.set",
+			);
+			if (activated !== true) throw new Error("model.profile.set succeeded without activating the requested preset");
+			return { changed: true };
+		}
 		const result = parseEnvelope<{ changed?: unknown }>(
 			await this.#cli([
 				"sdk",
@@ -452,7 +469,7 @@ export class BrokerSessionPort implements SessionPort {
 				"--op",
 				"model.set",
 				"--json-input",
-				JSON.stringify(payload),
+				JSON.stringify({ id: input.selection }),
 			]),
 			"model.set",
 		);
