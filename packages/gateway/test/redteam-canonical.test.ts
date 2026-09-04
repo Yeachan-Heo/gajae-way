@@ -227,6 +227,10 @@ class HostClockPort extends ScriptedSessionPort {
 		if (!last || last.at + 2_000 < input.notBeforeMs) return undefined;
 		return { text: last.text, pages: 1, complete: true };
 	}
+
+	async fetchLastAssistant(): Promise<never> {
+		throw new Error("host-clock fixture exercises turn-floored transcript recovery");
+	}
 }
 
 class DisownedStatusPort extends ScriptedSessionPort {
@@ -345,7 +349,7 @@ test("C1d: startedAt is the floor on the host's own clock - a host clock BEHIND 
 			{ trigger: "prior-ahead", text: "previous durable body ahead" },
 			{ trigger: "current-ahead", text: "current durable body ahead" },
 		]);
-		expect(fixture.logs.some((line) => line.startsWith("terminal_text_unavailable"))).toBe(false);
+		expect(fixture.logs.some((line) => line.includes("reason=no_assistant_text_for_terminal"))).toBe(false);
 	} finally {
 		await fixture.close();
 	}

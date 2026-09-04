@@ -1669,6 +1669,18 @@ class OriginActor {
 					bound.lastAssistantAtMs === undefined ||
 					(bound.dispatchedAtMs !== undefined && bound.lastAssistantAtMs >= bound.dispatchedAtMs);
 				let text = bound.tailTerminalObserved && tailTextIsCurrent ? bound.lastAssistantText : undefined;
+				if (text === undefined && !bound.retired && bound.tailTerminalObserved) {
+					try {
+						text = (await port.fetchLastAssistant({ sessionId: bound.sessionId, repo: this.#manager.repo })).text;
+						this.#manager.log(
+							`terminal_text_fallback origin=${this.originKey} epoch=${bound.epoch} opRef=${bound.turn.opRef} source=session.last_assistant`,
+						);
+					} catch (error) {
+						this.#manager.log(
+							`terminal_text_unavailable origin=${this.originKey} epoch=${bound.epoch} opRef=${bound.turn.opRef} reason=last_assistant_read_failed detail=${safeDiagnostic(error)}`,
+						);
+					}
+				}
 				if (text === undefined && notBeforeMs !== undefined && port.fetchAssistantSince) {
 					try {
 						const since = await port.fetchAssistantSince({
@@ -1684,21 +1696,10 @@ class OriginActor {
 					}
 				}
 				if (text === undefined) {
-					if (notBeforeMs === undefined) {
-						// No trustworthy floor (a pre-v18 batch already bound before the
-						// upgrade, on a runtime that omits startedAt) and no tail text.
-						// Completing with "" would discard a real answer; posting the
-						// unbounded last row could repost the previous turn. Hold for
-						// the operator instead.
-						this.#manager.log(
-							`recovery_hold origin=${this.originKey} epoch=${bound.epoch} opRef=${bound.turn.opRef} reason=no_turn_floor`,
-						);
-						return;
-					}
 					this.#manager.log(
-						`terminal_text_unavailable origin=${this.originKey} epoch=${bound.epoch} opRef=${bound.turn.opRef} reason=no_assistant_row_since_start`,
+						`recovery_hold origin=${this.originKey} epoch=${bound.epoch} opRef=${bound.turn.opRef} reason=${notBeforeMs === undefined ? "no_turn_floor" : "no_assistant_text_for_terminal"}`,
 					);
-					text = "";
+					return;
 				}
 				await bound.lifecycle.onTerminal?.({ ...bound, text, status: report });
 			} else if (!bound.retired || bound.answerWanted) {
