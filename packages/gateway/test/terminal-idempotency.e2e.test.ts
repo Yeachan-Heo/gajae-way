@@ -470,7 +470,7 @@ test("red-team G3-B1: a same-session fresh-turn retry gets its own dispatch floo
 	}
 });
 
-test("red-team G3-B2: a batch bound before the upgrade, on a runtime without startedAt, is held - never completed empty, never given a prior answer", async () => {
+test("red-team G3-B2: a batch bound before the upgrade, on a runtime without startedAt, completes from its own witness - never empty, never a prior answer", async () => {
 	const port = new ScriptedSessionPort();
 	port.omitStartedAt = true;
 	directory = await mkdtemp(join(tmpdir(), "gajaeway-terminal-legacy-"));
@@ -537,9 +537,13 @@ test("red-team G3-B2: a batch bound before the upgrade, on a runtime without sta
 			await Bun.sleep(400);
 			await recovered.reconcile("discord/channel/chan-1");
 			await Bun.sleep(100);
-			expect(terminals).toEqual([]);
-			expect(logs.some((line) => line.includes("reason=no_turn_floor"))).toBe(true);
-			expect(database.inboundNonterminalTurns("discord/channel/chan-1")).toHaveLength(1);
+			// I4b: the text comes from THIS op's turn.result witness, so a missing
+			// dispatch floor / startedAt no longer forces a hold, and there is no
+			// timestamp search that could pick up a prior answer.
+			expect(terminals).toEqual(["진짜 답"]);
+			expect(logs.some((line) => line.includes("reason=no_turn_floor"))).toBe(false);
+			expect(logs).toContain("terminal_text_source=turn_result");
+			expect(database.inboundNonterminalTurns("discord/channel/chan-1")).toHaveLength(0);
 		} finally {
 			await recovered.stop();
 		}
@@ -657,14 +661,8 @@ test("a frame attributed to the accepted op passes the turn floor even with an o
 		await manager.notifyInbound("discord/channel/chan-1");
 		await eventually(() => port.sends.length === 1, "turn was not sent");
 		const send = port.sends[0]!;
-		// fetchAssistantSince can't see it (no terminal op yet); the tail frame is
-		// the only evidence: attributed to the op, but stamped an hour ago by a
+		// The tail frame is attributed to the op but stamped an hour ago by a
 		// skewed host clock. Attribution wins over the timestamp floor.
-		let transcriptReads = 0;
-		port.fetchAssistantSince = async () => {
-			transcriptReads++;
-			return undefined;
-		};
 		port.emitReplayedTranscriptRow(send.sessionId, "답", Date.now() - 3_600_000, send.opRef);
 		// An un-attributed row with the same old stamp is fenced.
 		port.emitReplayedTranscriptRow(send.sessionId, "낡은 답", Date.now() - 3_600_000);
@@ -672,7 +670,6 @@ test("a frame attributed to the accepted op passes the turn floor even with an o
 		port.completeWithoutAnswerFrame(send.opRef, "답");
 		await eventually(() => terminals.length === 1, "reply missing");
 		expect(terminals).toEqual([{ trigger: "m-t1", text: "답" }]);
-		expect(transcriptReads).toBe(0);
 	} finally {
 		await manager.stop();
 	}

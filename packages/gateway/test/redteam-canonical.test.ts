@@ -221,13 +221,6 @@ class HostClockPort extends ScriptedSessionPort {
 		return { ...report, status: { ...report.status, startedAt: this.forceStartedAt } };
 	}
 
-	async fetchAssistantSince(input: { sessionId: string; repo: string; notBeforeMs: number }) {
-		this.transcriptFloors.push(input.notBeforeMs);
-		const last = this.rows.at(-1);
-		if (!last || last.at + 2_000 < input.notBeforeMs) return undefined;
-		return { text: last.text, pages: 1, complete: true };
-	}
-
 	async fetchLastAssistant(): Promise<never> {
 		throw new Error("host-clock fixture exercises turn-floored transcript recovery");
 	}
@@ -341,7 +334,10 @@ test("C1d: startedAt is the floor on the host's own clock - a host clock BEHIND 
 			port.rows.push({ at: startedAt + 1, text: `current durable body ${tag}` });
 			port.completeWithoutAnswerFrame(second.opRef, `current durable body ${tag}`);
 			await eventually(() => fixture.terminals.length === (skewMs < 0 ? 2 : 4), "current turn did not complete");
-			expect(port.transcriptFloors.at(-1)).toBe(startedAt);
+			// I4b: the witness (`turn.result.content`) is the text authority, so no
+			// timestamp-floored transcript read happens at all - host clock skew in
+			// either direction cannot reopen a prior row or hide the real answer.
+			expect(port.transcriptFloors).toEqual([]);
 		}
 		expect(fixture.terminals).toEqual([
 			{ trigger: "prior-behind", text: "previous durable body behind" },
@@ -897,11 +893,9 @@ test("C6a: terminal recovery after a stop invokes the reconstructed lifecycle on
 			log: (line) => fixture.logs.push(line),
 		});
 		await recovered.recover();
-		const grace = required(
-			timers.find((timer) => timer.delayMs === 250),
-			"terminal recovery grace was not scheduled",
-		);
-		grace.work();
+		// I4b removed the 250 ms tail grace: a terminal witness completes the
+		// recovered turn on the first reconcile, without waiting for tail evidence.
+		expect(timers.find((timer) => timer.delayMs === 250)).toBeUndefined();
 		await eventually(() => fixture.terminals.length === 1, "recovered terminal did not invoke onTerminal");
 		expect(fixture.terminals).toEqual([{ trigger: "recover-terminal", text: "recovered answer" }]);
 		expect(fixture.port.sends).toHaveLength(1);

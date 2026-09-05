@@ -63,11 +63,6 @@ export interface SessionPort {
 	 * coordinates (gajae-code#5200); undefined when the newest row predates
 	 * the turn.
 	 */
-	fetchAssistantSince?(input: {
-		sessionId: string;
-		repo: string;
-		notBeforeMs: number;
-	}): Promise<LastAssistantResult | undefined>;
 	attachTail(input: TailAttachInput): Promise<TailHandle>;
 	runCompaction(input: SessionCompactionInput): Promise<{ readonly status: SessionCompactionStatus }>;
 	/** Presentation/recovery tick; it never kills a running SDK turn. */
@@ -566,66 +561,6 @@ export class BrokerSessionPort implements SessionPort {
 		return page !== undefined && Array.isArray(page.items) && page.items.length === 0 && page.complete === true;
 	}
 
-	async fetchAssistantSince(input: {
-		sessionId: string;
-		repo: string;
-		notBeforeMs: number;
-	}): Promise<LastAssistantResult | undefined> {
-		let cursor: string | undefined;
-		let latest: { role?: string; ts?: string; textSummary?: string; body?: string } | undefined;
-		const seenCursors = new Set<string>();
-		for (let pages = 1; pages <= 1_000; pages++) {
-			const result = await this.#cli(
-				[
-					"sdk",
-					"session",
-					"raw",
-					"query",
-					input.sessionId,
-					"--query",
-					"transcript.list",
-					"--repo",
-					input.repo,
-					"--json-input",
-					"{}",
-					...(cursor ? ["--cursor", cursor] : []),
-				],
-				{ timeoutMs: 15_000 },
-			);
-			const page = (
-				JSON.parse(result.stdout) as {
-					page?: {
-						items?: Array<{ role?: string; ts?: string; textSummary?: string; body?: string }>;
-						complete?: unknown;
-						continuationCursor?: unknown;
-					};
-				}
-			).page;
-			if (!page || !Array.isArray(page.items)) throw new Error("transcript.list returned no page items");
-			for (const row of page.items) {
-				if (row.role !== "assistant") continue;
-				const at = typeof row.ts === "string" ? Date.parse(row.ts) : Number.NaN;
-				if (Number.isFinite(at) && at + 2_000 >= input.notBeforeMs) latest = row;
-			}
-			if (page.complete === true) {
-				if (!latest) return undefined;
-				const text =
-					(typeof latest.body === "string" && latest.body) ||
-					(typeof latest.textSummary === "string" ? latest.textSummary : "");
-				return { text, pages, complete: true };
-			}
-			const next = typeof page.continuationCursor === "string" ? page.continuationCursor : undefined;
-			if (!next || seenCursors.has(next))
-				throw new TranscriptIncompleteError(
-					"transcript.list returned an incomplete page without a fresh continuation cursor",
-					pages,
-				);
-			seenCursors.add(next);
-			cursor = next;
-		}
-		throw new TranscriptIncompleteError("transcript.list exceeded 1000 recovery pages", 1_000);
-	}
-
 	async fetchLastAssistant(input: { sessionId: string; repo: string }): Promise<LastAssistantResult> {
 		const maxPages = 50;
 		const chunks: string[] = [];
@@ -792,7 +727,7 @@ export class BrokerSessionPort implements SessionPort {
 	}
 }
 
-function renderPrompt(systemPreamble: string | undefined, text: string): string {
+export function renderPrompt(systemPreamble: string | undefined, text: string): string {
 	if (!systemPreamble) return text;
 	// SDK `session send` has no unproven system-prompt flag. Keep the trusted
 	// bootstrap in the same accepted turn instead of inventing a raw control API.

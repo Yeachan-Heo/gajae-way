@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+import { SessionChannel } from "./session-channel";
 import type { CliResult, CliRunner } from "@gajaeway/subsession";
 import { sanitizeDiagnostic } from "./rebind";
 
@@ -85,11 +86,19 @@ export interface TailHandle {
 	markAccepted(opRef: string): Promise<void>;
 	setTurnRunning(running: boolean): void;
 	close(): Promise<void>;
+	/**
+	 * Query multiplexer over this handle's resident relay (I4a). Undefined on the
+	 * poll transport and while no stream is open; a complete read over it spawns
+	 * nothing because the connection already exists.
+	 */
+	readonly channel: SessionChannel | undefined;
 }
 
 /** A resident event stream for one session (`gjc sdk serve --stdio --session <id>`). */
 export interface TailStream {
 	readonly lines: AsyncIterable<string>;
+	/** Present on the resident relay: lets the session channel send query frames on this connection. */
+	write?(line: string): void;
 	close(): void;
 }
 export type TailStreamSpawner = (sessionId: string) => TailStream;
@@ -586,7 +595,12 @@ class ManagedTailHandle implements TailHandle {
 	}
 
 	#stream: TailStream | undefined;
+	#channel: SessionChannel | undefined;
 	#reopenFailures = 0;
+
+	get channel(): SessionChannel | undefined {
+		return this.#channel;
+	}
 
 	async #run(): Promise<void> {
 		const spawner = this.#runner.streamSpawner;
@@ -652,9 +666,31 @@ class ManagedTailHandle implements TailHandle {
 			const stream = spawner(this.sessionId);
 			this.#stream = stream;
 			const openedAt = this.#runner.now();
+			// The channel shares this connection: it writes query frames to the
+			// relay's stdin and claims only the responses carrying its own ids; every
+			// other line stays a tail frame.
+			const listeners = new Set<(line: string) => void>();
+			const channel = stream.write
+				? new SessionChannel({
+						sessionId: this.sessionId,
+						transport: {
+							write: (line) => stream.write?.(line),
+							onLine: (listener) => {
+								listeners.add(listener);
+								return () => listeners.delete(listener);
+							},
+						},
+						log: (line) => this.#input.onDiagnostic?.(line),
+					})
+				: undefined;
+			this.#channel = channel;
 			try {
 				for await (const line of stream.lines) {
 					if (this.#closed) break;
+					if (channel?.consumes(line)) {
+						for (const listener of listeners) listener(line);
+						continue;
+					}
 					const frames = decodeStreamLine(line);
 					for (const frame of frames) await this.receive(frame);
 				}
@@ -663,6 +699,8 @@ class ManagedTailHandle implements TailHandle {
 					`tail_stream_error session=${this.sessionId} detail=${sanitizeDiagnostic(error instanceof Error ? error.message : String(error)) || "sdk_error"}`,
 				);
 			} finally {
+				this.#channel = undefined;
+				channel?.close();
 				this.#stream = undefined;
 				stream.close();
 			}

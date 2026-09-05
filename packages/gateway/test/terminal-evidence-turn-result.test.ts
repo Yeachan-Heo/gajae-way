@@ -3,11 +3,11 @@
  * HEAD: OTHER; post-fix: AUTHORITATIVE. Matched logs: tail_terminal_evidence_unavailable; terminal_status_reconciled.
  */
 import { expect, test } from "bun:test";
-import { ScriptedSessionPort } from "../../packages/gateway/test/session-port.fake";
-import { createFakeGjc } from "../../packages/gateway/test/fixtures/fake-gjc.mjs";
-import { BrokerSessionPort } from "../../packages/gateway/src/orchestrator/session-port";
-import { TailRunner } from "../../packages/gateway/src/orchestrator/tail-runner";
-import { eventually, harness, KEY } from "./harness";
+import { ScriptedSessionPort } from "./session-port.fake";
+import { createFakeGjc } from "./fixtures/fake-gjc.mjs";
+import { BrokerSessionPort } from "../src/orchestrator/session-port";
+import { TailRunner } from "../src/orchestrator/tail-runner";
+import { eventually, harness, KEY } from "./red-first-harness";
 
 test("red 8: turn.result is authoritative even when the attached tail stays silent", async () => {
 	const port = new ScriptedSessionPort();
@@ -19,10 +19,9 @@ test("red 8: turn.result is authoritative even when the attached tail stays sile
 		database: h.database,
 		cli: run,
 		instanceId: "red-terminal",
-		tailRunner: new TailRunner({ run }),
+		tailRunner: new TailRunner({ run, repo: h.repo }),
 	});
 	port.status = real.status.bind(real);
-	port.fetchAssistantSince = real.fetchAssistantSince.bind(real);
 	try {
 		h.enqueue("terminal-result");
 		await h.manager.notifyInbound(KEY);

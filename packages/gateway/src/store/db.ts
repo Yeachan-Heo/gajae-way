@@ -81,6 +81,19 @@ export interface InboundTurn {
 }
 
 /** A second nonterminal trigger in one epoch would violate at-most-one running turn. */
+export type TranscriptWatermarkRow = {
+	readonly session_id: string;
+	readonly op_ref: string;
+	readonly snapshot_revision: string;
+	readonly snapshot_generation: number | null;
+	readonly trigger_seq: number;
+	readonly last_steer_seq: number | null;
+	readonly terminal_seq: number;
+	readonly terminal_entry_id: string;
+	readonly terminal_ts: string;
+	readonly written_at: string;
+};
+
 export class InboundTurnConflictError extends Error {
 	constructor(originKey: string, epoch: number) {
 		super(`origin ${originKey} already has a nonterminal turn in epoch ${epoch}`);
@@ -853,6 +866,102 @@ export class GatewayDatabase {
 			)
 			.run(new Date().toISOString(), opRef);
 		if (result.changes !== 1) throw new Error(`turn ${opRef} has no pending attempt`);
+	}
+
+	// --- I4b terminal authority ---------------------------------------------
+
+	/** Records the byte hash of the rendered prompt on the attempt that sent it. */
+	turnAttemptRecordPromptHash(opRef: string, promptHash: string): void {
+		this.#database
+			.query("UPDATE turn_attempts SET prompt_hash = ? WHERE op_ref = ? AND prompt_hash IS NULL")
+			.run(promptHash, opRef);
+	}
+
+	turnAttemptPromptHash(opRef: string): string | undefined {
+		return (
+			this.#database
+				.query<{ prompt_hash: string | null }, [string]>(
+					"SELECT prompt_hash FROM turn_attempts WHERE op_ref = ? ORDER BY attempt DESC LIMIT 1",
+				)
+				.get(opRef)?.prompt_hash ?? undefined
+		);
+	}
+
+	/** Records the byte hash of a steer as rendered into the turn (durable beside the steer row). */
+	steerRecordHash(opRef: string, messageId: string, bodyHash: string): void {
+		this.#database
+			.query("INSERT OR IGNORE INTO turn_steer_hashes (op_ref, message_id, body_hash, recorded_at) VALUES (?, ?, ?, ?)")
+			.run(opRef, messageId, bodyHash, new Date().toISOString());
+	}
+
+	steerHashes(opRef: string): readonly string[] {
+		return this.#database
+			.query<{ body_hash: string }, [string]>("SELECT body_hash FROM turn_steer_hashes WHERE op_ref = ?")
+			.all(opRef)
+			.map((row) => row.body_hash);
+	}
+
+	transcriptWatermark(sessionId: string): TranscriptWatermarkRow | undefined {
+		return (
+			this.#database
+				.query<TranscriptWatermarkRow, [string]>(
+					"SELECT session_id, op_ref, snapshot_revision, snapshot_generation, trigger_seq, last_steer_seq, terminal_seq, terminal_entry_id, terminal_ts, written_at FROM session_transcript_watermarks WHERE session_id = ? ORDER BY written_at DESC, rowid DESC LIMIT 1",
+				)
+				.get(sessionId) ?? undefined
+		);
+	}
+
+	/**
+	 * The terminalization transaction (I4b): one watermark row per terminalized op,
+	 * the attempt's terminal fields, and the trigger's terminal disposition, all
+	 * or nothing. Never updated afterwards.
+	 */
+	terminalizeTurn(input: {
+		opRef: string;
+		sessionId: string;
+		textSource: "turn_result" | "transcript" | "none";
+		disposition: "delivered" | "silent" | "failed";
+		failureCode?: string;
+		terminalAt: string;
+		watermark?: {
+			snapshotRevision: string;
+			snapshotGeneration: number | undefined;
+			triggerSeq: number;
+			lastSteerSeq: number | undefined;
+			terminalSeq: number | undefined;
+			terminalEntryId: string | undefined;
+			terminalTs: string;
+		};
+	}): void {
+		this.withTransaction(() => {
+			this.#database
+				.query(
+					"UPDATE turn_attempts SET terminal_at = COALESCE(terminal_at, ?), terminal_disposition = COALESCE(terminal_disposition, ?), text_source = COALESCE(text_source, ?) WHERE op_ref = ?",
+				)
+				.run(input.terminalAt, input.disposition, input.textSource, input.opRef);
+			this.#database
+				.query(
+					"UPDATE inbound_messages SET terminal_disposition = COALESCE(terminal_disposition, ?), terminal_failure_code = COALESCE(terminal_failure_code, ?) WHERE turn_op_ref = ? AND turn_role = 'trigger'",
+				)
+				.run(input.disposition, input.failureCode ?? null, input.opRef);
+			if (input.watermark)
+				this.#database
+					.query(
+						"INSERT OR IGNORE INTO session_transcript_watermarks (session_id, op_ref, snapshot_revision, snapshot_generation, trigger_seq, last_steer_seq, terminal_seq, terminal_entry_id, terminal_ts, written_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+					)
+					.run(
+						input.sessionId,
+						input.opRef,
+						input.watermark.snapshotRevision,
+						input.watermark.snapshotGeneration ?? null,
+						input.watermark.triggerSeq,
+						input.watermark.lastSteerSeq ?? null,
+						input.watermark.terminalSeq ?? -1,
+						input.watermark.terminalEntryId ?? "",
+						input.watermark.terminalTs,
+						new Date().toISOString(),
+					);
+		});
 	}
 
 	freshTurnAttempt(originKey: string, epoch: number, triggerMessageId: string): number {
@@ -2591,6 +2700,10 @@ CREATE TABLE session_transcript_watermarks (
  trigger_seq INTEGER NOT NULL, last_steer_seq INTEGER, terminal_seq INTEGER NOT NULL,
  terminal_entry_id TEXT NOT NULL, terminal_ts TEXT NOT NULL, written_at TEXT NOT NULL,
  PRIMARY KEY(session_id, op_ref)
+);
+CREATE TABLE turn_steer_hashes (
+ op_ref TEXT NOT NULL, message_id TEXT NOT NULL, body_hash TEXT NOT NULL, recorded_at TEXT NOT NULL,
+ PRIMARY KEY(op_ref, message_id)
 );
 INSERT INTO turn_attempts (trigger_message_id, attempt, origin_key, scope, epoch, op_ref, session_id, bound_at, send_state, admission, legacy)
  SELECT message_id, 0, origin_key, 'persona', turn_epoch, turn_op_ref, bound_session_id, COALESCE(dispatched_at, received_at), 'written_unconfirmed', 'unknown', 1

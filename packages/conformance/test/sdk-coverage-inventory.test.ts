@@ -21,7 +21,16 @@ const VERB_LITERAL_RE =
 	/["'`]((?:gateway|chat|session|memory|monitor|delivery|engagement|ops|work)\.[a-zA-Z0-9_.]+)["'`]/g;
 const NON_VERB_SUFFIX_RE = /\.(sock|db|json|jsonl|sqlite|md|ts|js|log|lock|pid)$/;
 /** gjc SDK ops that appear in comments and remaining adapter call sites. */
-const GJC_VENDOR_OPS = new Set(["session.create", "session.resume", "session.last_assistant", "session.close"]);
+const GJC_VENDOR_OPS = new Set([
+	"session.create",
+	"session.resume",
+	"session.last_assistant",
+	"session.close",
+	// I4a channel queries (gjc query_request over the resident relay).
+	"session.checkpoint",
+	"transcript.list",
+	"turn.result",
+]);
 
 function collectSourceFiles(dir: string, out: string[] = []): string[] {
 	let entries: string[];

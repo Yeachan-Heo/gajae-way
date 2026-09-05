@@ -133,6 +133,7 @@ export {
 	type OperationJudgement,
 	type PromptOutcomeBody,
 	type PromptStatus,
+	type PromptContentBody,
 	type PromptStatusBody,
 	parseStatusReport,
 	projectOpState,

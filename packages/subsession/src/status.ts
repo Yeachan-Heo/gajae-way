@@ -33,6 +33,13 @@ export type PromptOutcomeBody = {
 	readonly provenance?: string;
 };
 
+/** Terminal text carried by `turn.result` (gjc >= 0.16.3). `truncated` means a byte prefix of the answer. */
+export type PromptContentBody = {
+	readonly text: string;
+	readonly truncated: boolean;
+	readonly byteLength?: number;
+};
+
 export type PromptStatusBody = {
 	readonly status: PromptStatus;
 	readonly commandId?: string;
@@ -45,6 +52,8 @@ export type PromptStatusBody = {
 	readonly outcome?: PromptOutcomeBody;
 	/** Failure detail. A lease/deadline kill is distinctly resumable, not a work-verdict. */
 	readonly error?: FailureBody;
+	/** Retained verbatim: the I4b terminal witness text (complete when `truncated` is false). */
+	readonly content?: PromptContentBody;
 };
 
 export type StatusReport = {
@@ -113,8 +122,22 @@ export function parseStatusReport(result: Parameters<typeof parseEnvelope>[0]): 
 				: {}),
 			...(outcome && typeof outcome === "object" ? { outcome } : {}),
 			...pickFailure(payload.status?.error),
+			...pickContent(payload.status?.content),
 		},
 		summaryCompleted: payload.summary?.completed === true,
+	};
+}
+
+function pickContent(source: unknown): { content?: PromptContentBody } {
+	if (typeof source !== "object" || source === null) return {};
+	const record = source as Record<string, unknown>;
+	if (typeof record.text !== "string") return {};
+	return {
+		content: {
+			text: record.text,
+			truncated: record.truncated === true,
+			...(typeof record.byteLength === "number" ? { byteLength: record.byteLength } : {}),
+		},
 	};
 }
 

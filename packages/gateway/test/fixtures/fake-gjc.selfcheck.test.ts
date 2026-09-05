@@ -47,12 +47,13 @@ test("fake unknown forever and failed turn", async () => {
 	for (let i = 0; i < 3; i++)
 		expect(JSON.parse((await command(session("status")))!.stdout).result.status.status).toBe("unknown");
 	const failed = await subprocess("status:failed:provider_rejected", session("status"));
-	expect(failed.result.turn.result.error).toEqual({ code: "provider_rejected" });
+	expect(failed.result.status.error).toEqual({ code: "provider_rejected" });
 	expect(failed.result.status.status).toBe("failed");
 });
 for (const mode of ["status:content", "status:content:truncated"]) {
 	test(`fake ${mode}`, async () => {
-		expect((await subprocess(mode, session("status"))).result.turn.result.content).toEqual({
+		// Real `session status` returns the turn.result object AS `status` (gjc 0.16.3 runStatus).
+		expect((await subprocess(mode, session("status"))).result.status.content).toEqual({
 			text: "AUTHORITATIVE",
 			truncated: mode.endsWith(":truncated"),
 		});
@@ -76,7 +77,11 @@ test("fake transcript preserves rows and binds continuation to connection", asyn
 	const first = JSON.parse((await command(args))!.stdout);
 	expect(first.page.items).toEqual([rows[0]]);
 	const continued = [...args, "--cursor", first.page.continuationCursor];
-	expect(JSON.parse((await command(continued))!.stdout).page).toEqual({ items: [rows[1]], complete: true });
+	expect(JSON.parse((await command(continued))!.stdout).page).toEqual({
+		items: [rows[1]],
+		complete: true,
+		revision: "fixture-revision-1",
+	});
 	expect(JSON.parse((await createFakeGjc({ modes })(continued))!.stdout).error.code).toBe("invalid_cursor");
 });
 

@@ -46,18 +46,18 @@ test("persona state stays running until a terminal tail event is injected", asyn
 		const send = port.sends[0]!;
 		const batch = database.inboundNonterminalTurns(ORIGIN_KEY)[0]!;
 
-		// Status can become terminal before a tail arrives, but that fact alone is
-		// intentionally not a persona state transition.
-		port.seedOperation(send.opRef, send.sessionId, "terminal_ok", "unobserved terminal");
-		await manager.tick(ORIGIN_KEY);
-		expect(manager.state(ORIGIN_KEY)).toBe("turn-running");
-		expect(database.inboundTurnRows(batch.opRef)[0]).toMatchObject({ state: "pending", turn_state: "accepted" });
-
+		// While the op is in flight, tail activity keeps the actor running and no
+		// terminal fires: the tail is the progress source.
 		port.emitActivity(send.sessionId, { toolCalls: 1, outputTokens: 9 });
 		await Bun.sleep(0);
 		expect(manager.state(ORIGIN_KEY)).toBe("turn-running");
-		port.complete(send.opRef, "terminal tail evidence");
-		await eventually(() => manager.state(ORIGIN_KEY) === "idle", "agent_end tail frame did not end the actor turn");
+		expect(database.inboundTurnRows(batch.opRef)[0]).toMatchObject({ state: "pending", turn_state: "accepted" });
+
+		// I4b: a decidable-terminal `turn.result` witness with content completes the
+		// turn on the reconcile that observes it - the tail no longer gates completion.
+		port.seedOperation(send.opRef, send.sessionId, "terminal_ok", "witness terminal");
+		await manager.tick(ORIGIN_KEY);
+		await eventually(() => manager.state(ORIGIN_KEY) === "idle", "terminal witness did not end the actor turn");
 		expect(database.inboundTurnRows(batch.opRef)[0]).toMatchObject({ state: "done", turn_state: "done" });
 	} finally {
 		await manager.stop();

@@ -499,30 +499,21 @@ test("red-team: a terminal tail frame arriving during the status grace wins once
 		const send = required(port.sends[0], "grace test send missing");
 		const batch = required(target.turns.values().next().value, "grace test batch missing");
 
+		// I4b: the `turn.result` witness completes the turn on the reconcile that
+		// observes it; no 250 ms grace is armed and no hold is logged.
 		port.seedOperation(send.opRef, send.sessionId, "terminal_ok", "status reported terminal first");
 		await target.manager.tick(ORIGIN_KEY);
-		const grace = required(
-			timers.find((timer) => timer.delayMs === 250),
-			"terminal grace was not scheduled",
-		);
-		expect(target.manager.state(ORIGIN_KEY)).toBe("turn-running");
-		expect(target.terminal).toEqual([]);
-		expect(target.logs.some((line) => line.includes("reason=tail_terminal_evidence_unavailable"))).toBe(true);
-		expect(target.database.inboundTurnRows(batch.opRef)[0]).toMatchObject({
-			state: "pending",
-			turn_state: "accepted",
-		});
-
-		port.complete(send.opRef, "tail terminal arrived during grace");
-		await eventually(() => target.terminal.length === 1, "terminal tail did not settle the held batch");
-		expect(target.terminal).toEqual(["tail terminal arrived during grace"]);
-		expect(target.logs.some((line) => line.startsWith("terminal_status_reconciled"))).toBe(false);
+		expect(timers.find((timer) => timer.delayMs === 250)).toBeUndefined();
+		expect(target.logs.some((line) => line.includes("reason=tail_terminal_evidence_unavailable"))).toBe(false);
+		await eventually(() => target.terminal.length === 1, "terminal witness did not settle the batch");
+		expect(target.terminal).toEqual(["status reported terminal first"]);
+		expect(target.logs).toContain("terminal_text_source=turn_result");
 		expect(target.database.inboundTurnRows(batch.opRef)[0]).toMatchObject({ state: "done", turn_state: "done" });
 
-		grace.work();
+		// A tail terminal arriving afterwards is inert: exactly one delivery.
+		port.complete(send.opRef, "tail terminal arrived later");
 		await Bun.sleep(20);
-		expect(target.terminal).toEqual(["tail terminal arrived during grace"]);
-		expect(target.logs.some((line) => line.startsWith("terminal_status_reconciled"))).toBe(false);
+		expect(target.terminal).toEqual(["status reported terminal first"]);
 	} finally {
 		await target.close();
 	}
@@ -540,7 +531,7 @@ class EndedTurnRejectsSteerPort extends ScriptedSessionPort {
 	}
 }
 
-test("canonical: a message arriving while the ended turn's tail is late is steered at once; the refusal settles the ended turn from status and the message is sent next", async () => {
+test("canonical: a message arriving after the ended turn's witness completed it is simply the next send; a late tail never delivers twice", async () => {
 	const base = Date.parse("2026-09-02T00:01:00.000Z");
 	let now = base;
 	const timers: Array<{ readonly work: () => void; readonly delayMs: number }> = [];
@@ -562,43 +553,28 @@ test("canonical: a message arriving while the ended turn's tail is late is steer
 		const first = required(port.sends[0], "slow-tail first send missing");
 		const firstBatch = required(target.turns.values().next().value, "slow-tail first batch missing");
 
+		// I4b: the witness completes the ended turn on the reconcile that observes
+		// it, so a message arriving afterwards is simply the next send - there is
+		// no held turn to steer into and no grace to wait out.
 		port.seedOperation(first.opRef, first.sessionId, "terminal_ok", "status-only terminal");
 		port.turnEnded = true;
 		await target.manager.tick(ORIGIN_KEY);
-		const grace = required(
-			timers.find((timer) => timer.delayMs === 250),
-			"slow-tail terminal grace was not scheduled",
-		);
-		expect(target.terminal).toEqual([]);
-		expect(target.manager.state(ORIGIN_KEY)).toBe("turn-running");
+		expect(timers.find((timer) => timer.delayMs === 250)).toBeUndefined();
+		await eventually(() => target.terminal.length === 1, "witness did not complete the ended turn");
+		expect(target.terminal).toEqual(["status-only terminal"]);
 		expect(target.database.inboundTurnRows(firstBatch.opRef)[0]).toMatchObject({
-			state: "pending",
-			turn_state: "accepted",
+			state: "done",
+			turn_state: "done",
 		});
 
 		now++;
 		enqueue(target, "arrived-during-grace", "reaches the model as the next send", new Date(now).toISOString());
 		await target.manager.notifyInbound(ORIGIN_KEY);
-		// The undecided turn never gags ingestion: the steer is attempted at
-		// once. The session refuses it (turn over), so the row is NOT consumed
-		// by the old batch. The refusal is a second reconcile after the bounded
-		// hold: status - the reconcile authority - completes the ended turn on
-		// the spot instead of waiting out the grace, and the row is sent next.
-		expect(port.steerAttempts).toBe(1);
+		expect(port.steerAttempts).toBe(0);
 		expect(port.steers).toEqual([]);
-		expect(target.logs.filter((line) => line.startsWith("steer_failed"))).toHaveLength(1);
 		expect(target.logs.some((line) => line.startsWith("session_rebound_after_steer_failure"))).toBe(false);
 		expect(target.terminal).toEqual(["status-only terminal"]);
-		expect(target.logs.filter((line) => line.startsWith("terminal_status_reconciled"))).toHaveLength(1);
-		expect(target.database.inboundTurnRows(firstBatch.opRef)[0]).toMatchObject({
-			state: "done",
-			turn_state: "done",
-		});
-		// The grace timer that was armed for the hold is now a no-op.
-		grace.work();
-		await Bun.sleep(20);
-		expect(target.terminal).toEqual(["status-only terminal"]);
-		expect(target.logs.filter((line) => line.startsWith("terminal_status_reconciled"))).toHaveLength(1);
+		expect(target.logs.filter((line) => line === "terminal_text_source=turn_result")).toHaveLength(1);
 
 		port.complete(first.opRef, "late tail must not deliver twice");
 		await Bun.sleep(20);
@@ -631,7 +607,10 @@ test("red-team: stopping during terminal-status grace cancels the grace callback
 		const send = required(port.sends[0], "shutdown-grace send missing");
 		port.seedOperation(send.opRef, send.sessionId, "terminal_ok", "status terminal before shutdown");
 		await target.manager.tick(ORIGIN_KEY);
-		expect(target.logs.some((line) => line.includes("reason=tail_terminal_evidence_unavailable"))).toBe(true);
+		// I4b: no grace timer exists; the witness completed the turn synchronously
+		// with the tick, so stop() has no pending reconcile to cancel.
+		expect(target.logs.some((line) => line.includes("reason=tail_terminal_evidence_unavailable"))).toBe(false);
+		expect(target.logs).toContain("terminal_text_source=turn_result");
 
 		await target.close();
 		closed = true;

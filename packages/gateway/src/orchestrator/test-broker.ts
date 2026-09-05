@@ -57,7 +57,17 @@ export function testOnlyBrokerDependencies(): BrokerSupervisorDependencies {
 			const opRef = args[4];
 			const operation = typeof opRef === "string" ? operations.get(opRef) : undefined;
 			const status = operation && operation.sessionId === sessionId ? operation.state : "unknown";
-			return success({ operationRef: opRef, status: { status }, summary: { completed: status === "terminal_ok" } });
+			// Like gjc 0.16.3 `session status`: the terminal witness carries the
+			// answer as complete `content`, which is what I4b delivers from.
+			const witness =
+				status === "terminal_ok" && operation
+					? { terminalAt: Date.now(), content: { text: stubReply(operation.text), truncated: false } }
+					: {};
+			return success({
+				operationRef: opRef,
+				status: { status, ...witness },
+				summary: { completed: status === "terminal_ok" },
+			});
 		}
 		if (args[2] === "tail") {
 			const sessionId = args[3];

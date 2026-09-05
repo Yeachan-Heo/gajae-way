@@ -146,6 +146,9 @@ export class ScriptedSessionPort implements SessionPort {
 	/** When set, status omits startedAt (older gjc reports), exercising the batch acceptedAt floor. */
 	omitStartedAt = false;
 
+	/** When true, `status` reports the terminal text as a truncated byte prefix so the I4b snapshot path runs. */
+	truncateStatusContent = false;
+
 	async status(input: { sessionId: string; repo: string; opRef: string }): Promise<StatusReport> {
 		const operation = this.#operations.get(input.opRef);
 		if (!operation || operation.sessionId !== input.sessionId)
@@ -155,7 +158,16 @@ export class ScriptedSessionPort implements SessionPort {
 			operationRef: input.opRef,
 			status:
 				operation.state === "terminal_ok"
-					? { status: "terminal_ok", ...startedAt }
+					? {
+							status: "terminal_ok",
+							...startedAt,
+							...(operation.terminalAt !== undefined ? { terminalAt: operation.terminalAt } : {}),
+							// The real runtime's turn.result carries the answer; complete unless
+							// a test opts into the truncated (snapshot-read) path.
+							...(operation.text !== undefined
+								? { content: { text: operation.text, truncated: this.truncateStatusContent } }
+								: {}),
+						}
 					: operation.state === "failed"
 						? { status: "failed", ...startedAt, error: { message: operation.error ?? "scripted failure" } }
 						: { status: "in_flight", ...startedAt },
@@ -164,15 +176,6 @@ export class ScriptedSessionPort implements SessionPort {
 	}
 
 	/** Same turn-floor rule as the broker port: only an assistant row produced at/after `notBeforeMs` counts. */
-	async fetchAssistantSince(input: { sessionId: string; repo: string; notBeforeMs: number }) {
-		const operation = [...this.#operations.values()]
-			.reverse()
-			.find((entry) => entry.sessionId === input.sessionId && entry.state === "terminal_ok");
-		if (!operation || operation.terminalAt === undefined || operation.terminalAt + 2_000 < input.notBeforeMs)
-			return undefined;
-		return { text: operation.text, pages: 1, complete: true };
-	}
-
 	async fetchLastAssistant(input: { sessionId: string; repo: string }) {
 		const operation = [...this.#operations.values()].reverse().find((entry) => entry.sessionId === input.sessionId);
 		if (!operation || operation.state !== "terminal_ok")
@@ -180,10 +183,18 @@ export class ScriptedSessionPort implements SessionPort {
 		return { text: operation.text, pages: 1, complete: true };
 	}
 
+	/** Optional I4b seam: a per-session query channel the scripted tail handle exposes as `channel`. */
+	channelFor: ((sessionId: string) => TailHandle["channel"]) | undefined;
+
 	async attachTail(input: TailAttachInput): Promise<TailHandle> {
 		const handles = this.#tails.get(input.sessionId) ?? new Set<ScriptedTailHandle>();
 		let handle!: ScriptedTailHandle;
-		handle = new ScriptedTailHandle(input, () => handles.delete(handle), this.#tailFrames.get(input.sessionId) ?? []);
+		handle = new ScriptedTailHandle(
+			input,
+			() => handles.delete(handle),
+			this.#tailFrames.get(input.sessionId) ?? [],
+			this.channelFor?.(input.sessionId),
+		);
 		handles.add(handle);
 		this.#tails.set(input.sessionId, handles);
 		return handle;
@@ -528,6 +539,8 @@ class ScriptedTailHandle implements TailHandle {
 	readonly brokerGeneration: number;
 	readonly ready = Promise.resolve();
 	readonly cursor = undefined;
+	/** Scripted ports have no resident relay; tests that need a channel inject one on the port (`channelFor`). */
+	readonly channel: TailHandle["channel"];
 	readonly #input: TailAttachInput;
 	readonly #remove: () => void;
 	readonly #buffer: TailFrame[] = [];
@@ -537,11 +550,17 @@ class ScriptedTailHandle implements TailHandle {
 	#acceptedOpRef: string | undefined;
 	#closed = false;
 
-	constructor(input: TailAttachInput, remove: () => void, historical: readonly TailFrame[]) {
+	constructor(
+		input: TailAttachInput,
+		remove: () => void,
+		historical: readonly TailFrame[],
+		channel: TailHandle["channel"] = undefined,
+	) {
 		this.#input = input;
 		this.#remove = remove;
 		this.sessionId = input.sessionId;
 		this.brokerGeneration = input.brokerGeneration;
+		this.channel = channel;
 		this.#buffer.push(...historical);
 	}
 

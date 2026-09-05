@@ -80,15 +80,17 @@ export function createFakeGjc({ modes, connectionId = randomUUID(), env = proces
 			if (has("status:unknown-forever"))
 				return ok({ operationRef: args[4], status: { status: "unknown" }, summary: { completed: false } });
 			if (failure || has("status:content") || has("status:content:truncated")) {
+				// Real `session status` (gjc 0.16.3 runStatus) returns the turn.result
+				// object AS `status`, so content/error live inside it.
 				const result = turnResult();
 				return ok({
 					operationRef: args[4],
 					status: {
-						status: result.status,
-						...(failure ? { error: result.error } : { outcome: { reason: "end_turn" } }),
+						...result,
+						terminalAt: Date.parse(env.GAJAEWAY_FAKE_GJC_TERMINAL_AT ?? "2026-09-05T00:10:00.000Z"),
+						...(failure ? {} : { outcome: { reason: "end_turn" } }),
 					},
 					summary: { completed: true },
-					turn: { result },
 				});
 			}
 			if (has("status:hang-30s"))
@@ -101,6 +103,54 @@ export function createFakeGjc({ modes, connectionId = randomUUID(), env = proces
 				ok: true,
 				result: { checkpointToken: "fixture-checkpoint", revisionId: "fixture-revision-1" },
 			});
+		if (query === "Q23" && prefixed("transcript:rows=")) {
+			const rows = JSON.parse(prefixed("transcript:rows=").slice("transcript:rows=".length));
+			const input = JSON.parse(arg(args, "--json-input"));
+			const row = rows.find((candidate) => candidate.id === input.itemId);
+			if (!row) return fail("invalid_input");
+			const value = String(row[input.field] ?? "");
+			const CHUNK = 64 * 1024;
+			let byteOffset = 0;
+			if (args.includes("--cursor")) {
+				try {
+					const cursor = JSON.parse(Buffer.from(arg(args, "--cursor"), "base64url").toString());
+					if (cursor.connectionId !== connectionId || cursor.itemId !== input.itemId || cursor.field !== input.field)
+						return fail("invalid_cursor");
+					byteOffset = cursor.byteOffset;
+				} catch {
+					return fail("invalid_cursor");
+				}
+			}
+			// Like the pinned runtime: byteOffset counts UTF-8 bytes and every chunk
+			// ends on a code-point boundary (the live 262143-byte chunk was 87381 x 3).
+			const bytes = Buffer.from(value, "utf8");
+			let end = Math.min(bytes.length, byteOffset + CHUNK);
+			while (end < bytes.length && end > byteOffset && (bytes[end] & 0xc0) === 0x80) end--;
+			const safe = bytes.subarray(byteOffset, end);
+			const body = safe.toString("utf8");
+			const done = end >= bytes.length;
+			return cli({
+				type: "query_response",
+				ok: true,
+				page: {
+					revision: "fixture-revision-1",
+					items: [{ field: input.field, itemId: input.itemId, byteOffset, body, complete: done }],
+					complete: done,
+					...(!done
+						? {
+								continuationCursor: Buffer.from(
+									JSON.stringify({
+										connectionId,
+										itemId: input.itemId,
+										field: input.field,
+										byteOffset: byteOffset + safe.length,
+									}),
+								).toString("base64url"),
+							}
+						: {}),
+				},
+			});
+		}
 		if (query === "transcript.list" && prefixed("transcript:rows=")) {
 			const rows = JSON.parse(prefixed("transcript:rows=").slice("transcript:rows=".length));
 			if (!Array.isArray(rows)) throw new Error("transcript rows must be an array");
@@ -116,11 +166,29 @@ export function createFakeGjc({ modes, connectionId = randomUUID(), env = proces
 				}
 			}
 			const complete = offset + 1 >= rows.length;
+			// `oversized:true` rows arrive as item_too_large placeholders with Q23
+			// continuations per field, exactly like the pinned runtime (recordings).
+			const project = (row) =>
+				row.oversized
+					? {
+							id: row.id,
+							error: { code: "item_too_large" },
+							continuations: ["id", "role", "textSummary", "ts", "body"].map((field) => ({
+								query: "Q23",
+								resourceKind: "transcript",
+								resourceId: "default",
+								revision: "fixture-revision-1",
+								itemId: row.id,
+								field,
+							})),
+						}
+					: row;
 			return cli({
 				type: "query_response",
 				ok: true,
 				page: {
-					items: rows.slice(offset, offset + 1),
+					revision: "fixture-revision-1",
+					items: rows.slice(offset, offset + 1).map(project),
 					complete,
 					...(!complete
 						? {

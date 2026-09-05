@@ -207,7 +207,7 @@ test("an inspect authority shift holds the turn rather than trusting a stale act
 	expect(logs.some((line) => line.includes("reason=broker authority is ambiguous"))).toBe(true);
 });
 
-test("dead terminal saved authority resumes, holds once, then reconciles from status when tail evidence is unavailable", async () => {
+test("dead terminal saved authority resumes and completes from its turn.result witness on the first reconcile", async () => {
 	home = await mkdtemp(join(tmpdir(), "gajaeway-session-restart-"));
 	database = await GatewayDatabase.open(join(home, "gateway.db"));
 	const port = new ScriptedSessionPort();
@@ -225,17 +225,15 @@ test("dead terminal saved authority resumes, holds once, then reconciles from st
 	]);
 	// Exactly one send ever: the recovered terminal turn is reconciled, never resent.
 	expect(port.sends).toHaveLength(1);
-	// The tail is the live authority, so the first decidable-terminal reconcile
-	// holds; the bounded grace then treats post-crash tail evidence as genuinely
-	// unavailable and completes from status with an explicit corroboration log.
+	// I4b: the recovered `turn.result` witness completes the saved turn on the
+	// first reconcile; post-crash tail evidence is not required and no hold or
+	// grace is involved.
 	await eventually(
 		() => database?.inboundTurnRows(accepted.opRef)[0]?.turn_state === "done",
-		"saved terminal turn did not reconcile after tail evidence grace",
+		"saved terminal turn did not reconcile from its witness",
 	);
-	expect(logs.some((line) => line.includes("reason=tail_terminal_evidence_unavailable"))).toBe(true);
-	expect(
-		logs.some((line) => line.includes("terminal_status_reconciled") && line.includes("tail_evidence=unavailable")),
-	).toBe(true);
+	expect(logs.some((line) => line.includes("reason=tail_terminal_evidence_unavailable"))).toBe(false);
+	expect(logs).toContain("terminal_text_source=turn_result");
 	expect(database.inboundTurnRows(accepted.opRef)[0]).toMatchObject({ state: "done", turn_state: "done" });
 	expect(terminal).toEqual(["saved transcript"]);
 });

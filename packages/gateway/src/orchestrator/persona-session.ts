@@ -15,7 +15,8 @@ import {
 import type { GjcModelSelection, GjcServiceTier } from "../config";
 import type { GatewayDatabase, InboundMessageRow, InboundTurn } from "../store/db";
 import { rebindableCodeOf, sanitizeDiagnostic } from "./rebind";
-import type { SessionBinding, SessionPort } from "./session-port";
+import { type TranscriptSnapshot, TranscriptIncompleteError } from "./session-channel";
+import { renderPrompt, type SessionBinding, type SessionPort } from "./session-port";
 import {
 	deterministicInterimDeliveryId,
 	TailCapacityError,
@@ -41,13 +42,14 @@ const RETIRED_REATTACH_MAX_ATTEMPTS = 3;
  * (post-crash ring loss) and status — the subsession reconcile authority —
  * completes with an explicit corroboration log.
  */
-const STATUS_TERMINAL_GRACE_MS = 250;
 /**
  * A transcript row is judged against the turn's dispatch floor with this much
  * slack: the host stamps rows and the gateway stamps dispatched_at on two
- * clocks. Same tolerance as SessionPort.fetchAssistantSince.
+ * clocks.
  */
 const TURN_FLOOR_SKEW_MS = 2_000;
+type TerminalWatermark = NonNullable<Parameters<GatewayDatabase["terminalizeTurn"]>[0]["watermark"]>;
+
 const DISPATCH_FAILURE_RETRY_MS = 2_000;
 /** Torn steer transports are replayed on the same clientRef this many times before the row is held. */
 const STEER_REPLAY_ATTEMPTS = 2;
@@ -852,11 +854,6 @@ class OriginActor {
 	async #recoverFromSteerFailure(current: BoundTurn): Promise<void> {
 		await this.#reconcileBound(current);
 		if (this.#current !== current) return;
-		if (current.statusTerminalHolds > 0 && !current.tailEvidenceUnavailable) {
-			// Status is terminal and the bounded tail grace is pending; when it
-			// fires the turn completes and the row is dispatched.
-			return;
-		}
 		current.retired = true;
 		current.answerWanted = true;
 		this.#retired.set(retiredKey(current), current);
@@ -1116,6 +1113,12 @@ class OriginActor {
 				}),
 			);
 			this.#manager.database.inboundTurnAccept(opRef);
+			// I4b: the rendered prompt's byte hash is how pos_trigger is resolved
+			// inside a transcript snapshot; it is recorded once, next to the attempt.
+			this.#manager.database.turnAttemptRecordPromptHash(
+				opRef,
+				bodyHash(renderPrompt(lifecycle.systemPreamble, lifecycle.text)),
+			);
 			await tail.markAccepted(opRef);
 			this.#bindFailures = 0;
 			this.#bindEpochPoisoned = false;
@@ -1167,6 +1170,93 @@ class OriginActor {
 			return;
 		}
 		await this.#steerPending();
+	}
+
+	/**
+	 * I4b terminal text precedence for a `terminal_ok` witness:
+	 * 1. `content.text` when the witness says it is complete.
+	 * 2. Truncated: one complete snapshot; boundaries (trigger, last steer, previous
+	 *    watermark) resolved as positions inside that snapshot; exactly one assistant
+	 *    row after all boundaries, at or before terminalAt + 2 s, whose body starts
+	 *    with the witness bytes. Zero or many candidates refuse.
+	 * 3. No usable witness text -> hold `no_terminal_text` (never a guess, never a
+	 *    read by timestamp/id spelling/next user row, never a re-prompt).
+	 */
+	async #selectTerminalText(
+		bound: BoundTurn,
+		report: StatusReport,
+	): Promise<
+		| { kind: "text"; text: string; source: "turn_result" | "transcript"; watermark?: TerminalWatermark }
+		| { kind: "hold"; reason: string }
+	> {
+		const content = report.status.content;
+		if (!content) return { kind: "hold", reason: "witness_without_content" };
+		if (!content.truncated) return { kind: "text", text: content.text, source: "turn_result" };
+		const channel = bound.tail?.channel;
+		if (!channel) return { kind: "hold", reason: "no_channel_for_complete_read" };
+		let snapshot: TranscriptSnapshot;
+		try {
+			snapshot = await channel.readTranscript();
+		} catch (error) {
+			return {
+				kind: "hold",
+				reason:
+					error instanceof TranscriptIncompleteError
+						? "snapshot_incomplete"
+						: `snapshot_read_failed:${safeDiagnostic(error)}`,
+			};
+		}
+		const promptHash = this.#manager.database.turnAttemptPromptHash(bound.turn.opRef);
+		if (!promptHash) return { kind: "hold", reason: "prompt_hash_unrecorded" };
+		const steerHashes = new Set(this.#manager.database.steerHashes(bound.turn.opRef));
+		const rows = snapshot.rows;
+		const triggerPositions: number[] = [];
+		let lastSteer = -1;
+		rows.forEach((row, position) => {
+			if (row.role !== "user") return;
+			const hash = bodyHash(row.body);
+			if (hash === promptHash) triggerPositions.push(position);
+			if (steerHashes.has(hash)) lastSteer = Math.max(lastSteer, position);
+		});
+		if (triggerPositions.length !== 1) return { kind: "hold", reason: `trigger_rows=${triggerPositions.length}` };
+		const posTrigger = triggerPositions[0]!;
+		const posLastSteer = lastSteer >= 0 ? lastSteer : posTrigger;
+		const previous = this.#manager.database.transcriptWatermark(bound.sessionId);
+		let posPrev = -1;
+		if (previous && previous.terminal_entry_id) {
+			posPrev = rows.findIndex((row) => row.id === previous.terminal_entry_id);
+			if (posPrev < 0) return { kind: "hold", reason: "previous_watermark_absent_from_snapshot" };
+		}
+		const floor = Math.max(posTrigger, posLastSteer, posPrev);
+		const terminalAt = report.status.terminalAt;
+		const cutoffMs = typeof terminalAt === "number" ? terminalAt + 2_000 : undefined;
+		const prefix = Buffer.from(content.text, "utf8");
+		const candidates: number[] = [];
+		rows.forEach((row, position) => {
+			if (position <= floor || row.role !== "assistant") return;
+			if (cutoffMs !== undefined && row.ts !== undefined) {
+				const tsMs = Date.parse(row.ts);
+				if (Number.isFinite(tsMs) && tsMs > cutoffMs) return;
+			}
+			const body = Buffer.from(row.body, "utf8");
+			if (body.length >= prefix.length && body.subarray(0, prefix.length).equals(prefix)) candidates.push(position);
+		});
+		if (candidates.length !== 1) return { kind: "hold", reason: `candidates=${candidates.length}` };
+		const selected = rows[candidates[0]!]!;
+		return {
+			kind: "text",
+			text: selected.body,
+			source: "transcript",
+			watermark: {
+				snapshotRevision: snapshot.revision,
+				snapshotGeneration: snapshot.generation,
+				triggerSeq: posTrigger,
+				lastSteerSeq: lastSteer >= 0 ? lastSteer : undefined,
+				terminalSeq: candidates[0]!,
+				terminalEntryId: selected.id,
+				terminalTs: selected.ts ?? new Date(terminalAt ?? Date.now()).toISOString(),
+			},
+		};
 	}
 
 	async #resumeUnavailable<T>(binding: SessionBinding, command: () => Promise<T>): Promise<T> {
@@ -1243,6 +1333,7 @@ class OriginActor {
 			if (!opRef || epoch === null || !sessionId) continue;
 			const clientRef = steerClientRef(this.#manager.instanceId, this.originKey, epoch, held.message_id);
 			try {
+				this.#manager.database.steerRecordHash(opRef, held.message_id, bodyHash(renderSteer(held.body)));
 				await this.#manager.port.steer({
 					sessionId,
 					repo: this.#manager.repo,
@@ -1375,6 +1466,7 @@ class OriginActor {
 				text: renderSteer(current.lifecycle.renderSteer?.(row) ?? row.body),
 				clientRef,
 			};
+			this.#manager.database.steerRecordHash(current.turn.opRef, row.message_id, bodyHash(steer.text));
 			let outcome: "accepted" | "refused" | "ambiguous" = "accepted";
 			let failure: unknown;
 			// The transport can fail AFTER the request landed (CLI killed mid-print,
@@ -1704,40 +1796,6 @@ class OriginActor {
 			}
 			return;
 		}
-		if (!bound.tailTerminalObserved && !bound.tailEvidenceUnavailable && bound.statusTerminalHolds < 1) {
-			// Status is decidable-terminal but the tail has not shown its terminal
-			// frame yet. Tail stays the live authority: hold ONCE and give the
-			// attached tail a bounded grace to deliver the evidence. If it still
-			// has not by the next reconcile, the tail evidence is genuinely
-			// unavailable (post-crash ring loss) and status — the subsession
-			// reconcile authority — completes the turn below, corroborated by an
-			// explicit log line instead of a silent shortcut.
-			bound.statusTerminalHolds += 1;
-			this.#manager.log(
-				`recovery_hold origin=${this.originKey} epoch=${bound.epoch} opRef=${bound.turn.opRef} reason=tail_terminal_evidence_unavailable`,
-			);
-			const timer = this.#manager.schedule(() => {
-				this.#graceTimers.delete(timer);
-				if (this.#stopped || this.#manager.stopped) return;
-				void this.enqueue(async () => {
-					if (this.#stopped || this.#manager.stopped || bound.tailTerminalObserved) return;
-					// An earlier reconcile (e.g. a refused steer) may already have
-					// completed this turn from status; it is no longer tracked then.
-					if (this.#current !== bound && !this.#retired.has(retiredKey(bound))) return;
-					bound.tailEvidenceUnavailable = true;
-					await this.#reconcileBound(bound);
-				}).catch((error: unknown) =>
-					this.#manager.log(`persona_reconcile_grace_failed origin=${this.originKey} detail=${safeDiagnostic(error)}`),
-				);
-			}, STATUS_TERMINAL_GRACE_MS);
-			this.#graceTimers.add(timer);
-			return;
-		}
-		if (!bound.tailTerminalObserved) {
-			this.#manager.log(
-				`terminal_status_reconciled origin=${this.originKey} epoch=${bound.epoch} opRef=${bound.turn.opRef} tail_evidence=unavailable`,
-			);
-		}
 		if (bound.replaceAfterTerminal) {
 			this.#manager.database.inboundTurnRequeue(bound.turn.opRef);
 			bound.tail?.setTurnRunning(false);
@@ -1754,53 +1812,41 @@ class OriginActor {
 		}
 		try {
 			if ((!bound.retired || bound.answerWanted) && report.status.status === "terminal_ok") {
-				// Normal delivery is deliberately simple: the current turn's tail is
-				// the live authority. #predatesTurn already fences cursorless replay,
-				// and op-attributed frames win over skewed timestamps. Transcript lookup
-				// is recovery-only for a restart/retention gap where no terminal tail
-				// answer survived.
-				const startedAt = report.status.startedAt;
-				const notBeforeMs = typeof startedAt === "number" ? startedAt : bound.dispatchedAtMs;
-				const port = this.#manager.port;
-				const tailTextIsCurrent =
-					bound.lastAssistantOpAttributed ||
-					bound.lastAssistantAtMs === undefined ||
-					(bound.dispatchedAtMs !== undefined && bound.lastAssistantAtMs >= bound.dispatchedAtMs);
-				let text = bound.tailTerminalObserved && tailTextIsCurrent ? bound.lastAssistantText : undefined;
-				if (text === undefined && !bound.retired && bound.tailTerminalObserved) {
-					try {
-						text = (await port.fetchLastAssistant({ sessionId: bound.sessionId, repo: this.#manager.repo })).text;
-						this.#manager.log(
-							`terminal_text_fallback origin=${this.originKey} epoch=${bound.epoch} opRef=${bound.turn.opRef} source=session.last_assistant`,
-						);
-					} catch (error) {
-						this.#manager.log(
-							`terminal_text_unavailable origin=${this.originKey} epoch=${bound.epoch} opRef=${bound.turn.opRef} reason=last_assistant_read_failed detail=${safeDiagnostic(error)}`,
-						);
-					}
-				}
-				if (text === undefined && notBeforeMs !== undefined && port.fetchAssistantSince) {
-					try {
-						const since = await port.fetchAssistantSince({
-							sessionId: bound.sessionId,
-							repo: this.#manager.repo,
-							notBeforeMs,
-						});
-						text = since?.text;
-					} catch (error) {
-						this.#manager.log(
-							`terminal_text_unavailable origin=${this.originKey} epoch=${bound.epoch} opRef=${bound.turn.opRef} reason=transcript_read_failed detail=${safeDiagnostic(error)}`,
-						);
-					}
-				}
-				if (text === undefined) {
+				// I4b: `turn.result` for this op is the terminal witness. Its text is
+				// authoritative when complete; when truncated it is a byte prefix that
+				// selects exactly one assistant row inside ONE complete snapshot, with
+				// every boundary resolved as a snapshot-local position. The tail is the
+				// interim/progress/steer-echo source only and never completes a turn.
+				const selection = await this.#selectTerminalText(bound, report);
+				if (selection.kind === "hold") {
 					this.#manager.log(
-						`recovery_hold origin=${this.originKey} epoch=${bound.epoch} opRef=${bound.turn.opRef} reason=${notBeforeMs === undefined ? "no_turn_floor" : "no_assistant_text_for_terminal"}`,
+						`recovery_hold origin=${this.originKey} epoch=${bound.epoch} opRef=${bound.turn.opRef} reason=no_terminal_text detail=${selection.reason}`,
 					);
 					return;
 				}
-				await bound.lifecycle.onTerminal?.({ ...bound, text, status: report });
+				// Grammar pinned by red 8: the source token is the whole line.
+				this.#manager.log(`terminal_text_source=${selection.source}`);
+				this.#manager.log(
+					`terminal_text_selected origin=${this.originKey} epoch=${bound.epoch} opRef=${bound.turn.opRef} source=${selection.source}`,
+				);
+				this.#manager.database.terminalizeTurn({
+					opRef: bound.turn.opRef,
+					sessionId: bound.sessionId,
+					textSource: selection.source,
+					disposition: "delivered",
+					terminalAt: new Date(report.status.terminalAt ?? Date.now()).toISOString(),
+					...(selection.watermark ? { watermark: selection.watermark } : {}),
+				});
+				await bound.lifecycle.onTerminal?.({ ...bound, text: selection.text, status: report });
 			} else if (!bound.retired || bound.answerWanted) {
+				this.#manager.database.terminalizeTurn({
+					opRef: bound.turn.opRef,
+					sessionId: bound.sessionId,
+					textSource: "none",
+					disposition: "failed",
+					failureCode: report.status.error?.code ?? report.status.status,
+					terminalAt: new Date(report.status.terminalAt ?? Date.now()).toISOString(),
+				});
 				await bound.lifecycle.onFailure?.({ ...bound, error: terminalError(report), status: report });
 			}
 		} catch (error) {
@@ -1818,6 +1864,11 @@ class OriginActor {
 		for (const held of this.#manager.database.inboundSteersHeld(bound.turn.opRef)) {
 			const clientRef = steerClientRef(this.#manager.instanceId, this.originKey, bound.epoch, held.message_id);
 			try {
+				this.#manager.database.steerRecordHash(
+					bound.turn.opRef,
+					held.message_id,
+					bodyHash(renderSteer(bound.lifecycle.renderSteer?.(held) ?? held.body)),
+				);
 				await this.#manager.port.steer({
 					sessionId: bound.sessionId,
 					repo: this.#manager.repo,
@@ -2002,6 +2053,11 @@ function isTerminalTailFrame(frame: TailFrame): boolean {
  * Without framing the model treats the newest text as the whole task and drops
  * the original request (live: answered "답하셈", ignored the question).
  */
+/** sha256 over the UTF-8 bytes of a rendered prompt/steer: the snapshot-local identity of a user row. */
+export function bodyHash(text: string): string {
+	return createHash("sha256").update(text, "utf8").digest("hex");
+}
+
 export function renderSteer(body: string): string {
 	return `[Additional message from the user, received while you were still working on their previous request. Finish that request, then also address this. Do not restart or repeat what you already said.]\n${body}`;
 }

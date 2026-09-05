@@ -866,10 +866,13 @@ export class BrokerSupervisor implements PersonaBroker {
 	/**
 	 * Event-driven observation transport: one resident `gjc sdk serve --stdio
 	 * --session <id>` relay per attached session. The relay forwards the host's
-	 * live WebSocket frames to stdout the instant they are emitted; the gateway
-	 * holds stdin open (the relay exits on stdin EOF) and never writes to it.
+	 * live WebSocket frames to stdout the instant they are emitted. The gateway
+	 * holds stdin open (the relay exits on stdin EOF); `write` lets the session
+	 * channel (I4a) send `query_request` frames on the same connection, so
+	 * connection-bound continuation cursors stay valid and no second process is
+	 * spawned for a read.
 	 */
-	openStream(sessionId: string): { readonly lines: AsyncIterable<string>; close(): void } {
+	openStream(sessionId: string): { readonly lines: AsyncIterable<string>; write(line: string): void; close(): void } {
 		const child = this.#spawn({
 			cmd: ["gjc", "sdk", "serve", "--stdio", "--session", sessionId],
 			cwd: this.#cwd,
@@ -898,6 +901,12 @@ export class BrokerSupervisor implements PersonaBroker {
 				// best effort: the relay also exits on stdin close
 			}
 		};
+		const write = (line: string) => {
+			if (closed) throw new Error(`stream for ${sessionId} is closed`);
+			const stdin = child.stdin as { write(chunk: string): unknown; flush?(): unknown };
+			stdin.write(line);
+			stdin.flush?.();
+		};
 		const lines = (async function* () {
 			const reader = (child.stdout as ReadableStream<Uint8Array>).getReader();
 			const decoder = new TextDecoder();
@@ -919,7 +928,7 @@ export class BrokerSupervisor implements PersonaBroker {
 				reader.releaseLock();
 			}
 		})();
-		return { lines, close };
+		return { lines, write, close };
 	}
 
 	/**

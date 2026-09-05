@@ -3,11 +3,11 @@
  * HEAD: 1; post-fix: 0. Matched log: terminal_text_fallback ... source=session.last_assistant.
  */
 import { expect, test } from "bun:test";
-import { ScriptedSessionPort } from "../../packages/gateway/test/session-port.fake";
-import { eventually, harness, KEY } from "./harness";
-import { createFakeGjc } from "../../packages/gateway/test/fixtures/fake-gjc.mjs";
-import { BrokerSessionPort } from "../../packages/gateway/src/orchestrator/session-port";
-import { TailRunner } from "../../packages/gateway/src/orchestrator/tail-runner";
+import { ScriptedSessionPort } from "./session-port.fake";
+import { eventually, harness, KEY } from "./red-first-harness";
+import { createFakeGjc } from "./fixtures/fake-gjc.mjs";
+import { BrokerSessionPort } from "../src/orchestrator/session-port";
+import { TailRunner } from "../src/orchestrator/tail-runner";
 
 test("red 8b: terminal turn.result does not silently use session.last_assistant", async () => {
 	const port = new ScriptedSessionPort({
@@ -20,7 +20,7 @@ test("red 8b: terminal turn.result does not silently use session.last_assistant"
 		database: h.database,
 		cli: run,
 		instanceId: "red-fallback",
-		tailRunner: new TailRunner({ run }),
+		tailRunner: new TailRunner({ run, repo: h.repo }),
 	});
 	port.status = real.status.bind(real);
 	try {
@@ -29,7 +29,7 @@ test("red 8b: terminal turn.result does not silently use session.last_assistant"
 		await eventually(() => h.deliveries.length > 0, "terminal frame never reconciled");
 		const logs = h.logs;
 		console.info("red8b", logs);
-		expect(logs.filter((l) => l.includes("terminal_text_fallback"))).toHaveLength(0);
+		expect(logs.filter((l: string) => l.includes("terminal_text_fallback"))).toHaveLength(0);
 	} finally {
 		await h.close();
 	}
