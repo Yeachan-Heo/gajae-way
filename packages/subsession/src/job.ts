@@ -435,7 +435,7 @@ export type AttemptOutcomeInput = {
  */
 export function projectAttemptOutcome(input: AttemptOutcomeInput): { readonly state: LaneJobState } {
 	const projected = projectOpState(input.status);
-	if (projected === "terminal_uncertain" || projected === "terminal_missing_receipt") {
+	if (projected === "failed" || projected === "terminal_uncertain" || projected === "terminal_missing_receipt") {
 		return { state: "awaiting_operator" };
 	}
 	return { state: "attempt_ended" };
@@ -643,13 +643,16 @@ export function closeAttempt(input: CloseAttemptInput): LaneJobRecord {
 		...(input.errorCode !== undefined ? { errorCode: input.errorCode } : {}),
 	});
 	const attempts = Object.freeze(input.record.attempts.map((attempt, at) => (at === index ? updatedAttempt : attempt)));
-	const uncertain = input.endState === "terminal_uncertain" || input.endState === "terminal_missing_receipt";
-	const state: LaneJobState = uncertain ? "awaiting_operator" : "attempt_ended";
+	const held =
+		input.endState === "failed" ||
+		input.endState === "terminal_uncertain" ||
+		input.endState === "terminal_missing_receipt";
+	const state: LaneJobState = held ? "awaiting_operator" : "attempt_ended";
 	return Object.freeze({
 		...input.record,
 		attempts,
 		state,
-		escalations: uncertain
+		escalations: held
 			? Object.freeze([
 					...input.record.escalations,
 					`${input.endedAt} operator hold: attempt ${input.opRef} ended ${input.endState}`,
