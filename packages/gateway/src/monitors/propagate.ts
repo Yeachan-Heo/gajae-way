@@ -497,6 +497,7 @@ export class MonitorPropagator {
 			// session is still the live one.
 			let boundSessionId: string | undefined;
 			let boundSessionEpoch: number | undefined;
+			let dispatchPhase = "bind";
 			// A replayed batch: reconcile bumps dispatch_attempts before re-dispatching
 			// a stranded or failed event, so a non-zero count means these events are
 			// not this session's own fresh work. Their context failure says nothing
@@ -525,6 +526,7 @@ export class MonitorPropagator {
 				const { sessionId } = binding;
 				boundSessionId = sessionId;
 				boundSessionEpoch = binding.epoch;
+				dispatchPhase = "configure";
 				const modelKey = effectiveModel
 					? typeof effectiveModel === "string"
 						? effectiveModel
@@ -550,6 +552,7 @@ export class MonitorPropagator {
 				const guidance = [monitor.instruction?.trim() || undefined, ...maintenance].filter(Boolean).join(" ");
 				const prompt = `Author monitor events.${guidance ? ` ${guidance}` : ""}${digest ? `\n${digest}\n` : ""} Respond ONLY with a JSON array containing exactly one {"eventId","note"} entry per event: ${JSON.stringify(claimed.map((row) => ({ eventId: row.event_id, eventType: row.event_type, payload: JSON.parse(row.payload_json) })))}`;
 				const opRef = `gw-m-${batchId.replaceAll("-", "")}`;
+				dispatchPhase = "request";
 				const response = (
 					await this.#sessionPort.request({
 						sessionId,
@@ -560,6 +563,7 @@ export class MonitorPropagator {
 						observeTail: false,
 					})
 				).assistant.text;
+				dispatchPhase = "validate";
 				// The authoring turn is now part of the session transcript whatever its
 				// content, so it is counted here rather than after the response is
 				// validated. The count is OBSERVATIONAL: it is reported, and it never
@@ -635,6 +639,7 @@ export class MonitorPropagator {
 							stage: "authored",
 						});
 					}
+				dispatchPhase = "delivery";
 				// A monitor without its own channel target reports to the configured owner
 				// target when one exists: a personal agent's maintenance and event notes go
 				// to the owner by default rather than vanishing into the logs. With no
@@ -698,7 +703,7 @@ export class MonitorPropagator {
 						batchId,
 						code,
 						// #64: the detail must carry the actual cause (sanitized), not echo the code.
-						`dispatch phase failed (${code}): ${failureDetail(error)}`,
+						`dispatch phase failed (${code}): ${failureDetail(error)} ${JSON.stringify({ phase: dispatchPhase, sessionId: boundSessionId ?? null, origin: sessionOriginKey, attempt: row.dispatch_attempts + 1 })}`,
 					);
 				}
 				console.error(`monitor dispatch failed (${code}): events ${claimed.map((row) => row.event_id).join(",")}`);
@@ -1023,25 +1028,50 @@ export function parseAuthoredArray(response: string): unknown {
 	);
 }
 
-/**
- * Actionable but public-safe failure detail (#64 vs. the raw-body ban): the
- * error class, a stable error code when the error carries one, and the first
- * in-repo stack frame (file:line). The raw message is deliberately NOT
- * persisted — SDK error bodies can carry prompt content.
- */
+/** Only explicit diagnostic vocabulary crosses the durable boundary, never raw error text. */
 function failureDetail(error: unknown): string {
-	const name = error instanceof Error ? error.constructor.name : typeof error;
-	const code = (error as { code?: unknown } | undefined)?.code;
-	const stableCode = typeof code === "string" && /^[a-z0-9_.-]{1,64}$/i.test(code) ? code : undefined;
-	const frame =
-		error instanceof Error && error.stack
-			? (error.stack.split("\n").find((line) => /^\s+at .*(packages|src)\//.test(line)) ?? "")
-					.trim()
-					.replace(/^at\s+/, "")
-					.replace(/.*\/(packages\/[^)]+)\)?$/, "$1")
-			: "";
-	return [name, stableCode ? `code=${stableCode}` : "", frame ? `at ${frame}` : ""]
-		.filter(Boolean)
-		.join(" ")
-		.slice(0, 300);
+	const object = (value: unknown): Record<string, unknown> =>
+		value !== null && typeof value === "object" ? (value as Record<string, unknown>) : {};
+	const fields = object(error);
+	const report = object(fields.status);
+	const terminal = object(report.status);
+	const terminalError = object(terminal.error);
+	const allowedClasses = new Set([
+		"Error",
+		"GjcCliError",
+		"GjcRuntimeError",
+		"SessionTerminalError",
+		"SessionRequestTimeoutError",
+		"RebindCapExceededError",
+	]);
+	const allowedCodes = new Set([
+		"session_not_found",
+		"session_closed",
+		"session_expired",
+		"session_terminal",
+		"operation_not_found",
+		"timeout",
+		"deadline_exceeded",
+		"internal_error",
+		"context_length_exceeded",
+		"rebind_cap_exceeded",
+	]);
+	const name = error instanceof Error ? error.constructor.name : "unknown";
+	const code = fields.code ?? terminalError.code;
+	const exitCode = fields.exitCode;
+	const signal = fields.signal;
+	const status = terminal.status;
+	return JSON.stringify({
+		class: allowedClasses.has(name) ? name : "unknown",
+		...(typeof code === "string" && allowedCodes.has(code) ? { code } : {}),
+		...(typeof exitCode === "number" && Number.isInteger(exitCode) && exitCode >= 0 && exitCode <= 255
+			? { exitCode }
+			: {}),
+		...(typeof signal === "string" && ["SIGTERM", "SIGKILL", "SIGABRT", "SIGSEGV", "SIGINT"].includes(signal)
+			? { signal }
+			: {}),
+		...(typeof status === "string" && ["failed", "cancelled", "completed", "aborted"].includes(status)
+			? { terminal: status }
+			: {}),
+	});
 }

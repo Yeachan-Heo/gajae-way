@@ -2,6 +2,7 @@ import { afterEach, describe, expect, test } from "bun:test";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { GjcCliError } from "@gajaeway/subsession";
 import { DeliveryService } from "../src/delivery/delivery";
 import { MemoryClosureQueue } from "../src/memory/closure";
 import { initializeMemory } from "../src/memory/doctrine";
@@ -9,6 +10,8 @@ import { MonitorPropagator } from "../src/monitors/propagate";
 import { MonitorRegistry } from "../src/monitors/registry";
 import { MonitorRuntime } from "../src/monitors/runtime";
 import { cronSlotsBetween, startCron } from "../src/monitors/triggers/cron";
+import { GjcRuntimeError } from "../src/orchestrator/rebind";
+import { SessionTerminalError } from "../src/orchestrator/session-port";
 import { GatewayDatabase, MONITOR_EVENT_MAX_DISPATCH_ATTEMPTS } from "../src/store/db";
 import { DeliveryLedger } from "../src/store/ledger";
 import type { SessionPortResponder } from "./session-port.fake";
@@ -44,17 +47,18 @@ async function harness(
 		burstPolicy: "dedupe",
 		enabled: true,
 	});
+	const sessionPort = fakeSessionPort(respond);
 	const propagator = new MonitorPropagator({
 		database,
 		registry,
-		sessionPort: fakeSessionPort(respond),
+		sessionPort,
 		memory: { enqueue: () => crypto.randomUUID(), enqueueExistingId: () => {} } as never,
 		delivery: new DeliveryService(new DeliveryLedger(database)),
 		emit: () => {},
 		...(options.ownerTarget ? { ownerTarget: options.ownerTarget } : {}),
 	});
 	propagators.push(propagator);
-	return { propagator, monitor, database, registry };
+	return { propagator, monitor, database, registry, sessionPort };
 }
 
 function eventsFromPrompt(text: string): Array<{ eventId: string }> {
@@ -186,6 +190,54 @@ describe("monitor crash-boundary state machine", () => {
 		expect(stage(db, eventId)).toBe("authored_no_delivery");
 	});
 
+	for (const [label, error, expected] of [
+		["CLI exit", new GjcCliError("SECRET_RAW", 42, "SECRET_STDERR"), '"exitCode":42'],
+		[
+			"runtime code",
+			new GjcRuntimeError("SECRET_RAW", { code: "deadline_exceeded", message: "SECRET_RUNTIME" }),
+			'"code":"deadline_exceeded"',
+		],
+		[
+			"terminal status",
+			new SessionTerminalError({
+				operationRef: "SECRET_OP",
+				status: { status: "failed", error: { code: "internal_error", message: "SECRET_TERMINAL" } },
+			} as never),
+			'"terminal":"failed"',
+		],
+		[
+			"untrusted fields",
+			Object.assign(new Error("SECRET_RAW"), {
+				code: "SECRET_CODE",
+				signal: "SECRET_SIGNAL",
+				exitCode: -1,
+				stack: "at packages/SECRET_PATH.ts:1",
+			}),
+			'"class":"Error"',
+		],
+		["missing fields", null, '"class":"unknown"'],
+	] as const) {
+		test(`injected ${label} persists safe diagnostics and request context`, async () => {
+			const { propagator, monitor, database: db, sessionPort } = await harness(async () => "unused");
+			sessionPort.request = async () => {
+				throw error;
+			};
+			const eventId = seedEvent(db, monitor.monitorId, "failed");
+			await propagator.reconcile();
+			const detail = db.monitorFailure(eventId)?.detail ?? "";
+			expect(detail).toContain(expected);
+			expect(detail).toContain('"phase":"request"');
+			expect(detail).toContain('"sessionId":"s1"');
+			expect(detail).toContain('"origin":"monitor/eventtype/memory.canonicalize"');
+			expect(detail).toContain('"attempt":2');
+			expect(detail).not.toContain("SECRET");
+			if (label === "untrusted fields" || label === "missing fields") {
+				expect(detail).not.toContain('"exitCode"');
+				expect(detail).not.toContain('"signal"');
+			}
+			expect(stage(db, eventId)).toBe("failed");
+		});
+	}
 	test("reconcile reclaim budget: an always-failing event lands on failed_no_retry", async () => {
 		let turns = 0;
 		const {
