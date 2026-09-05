@@ -1988,6 +1988,12 @@ async function createInboundTurnLifecycle(
 		onFrame,
 		onTerminal,
 		onFailure,
+		// Neither path ever reaches onTerminal/onFailure for THIS lifecycle: a
+		// `/new` retire fences the answer, a release re-dispatches the trigger
+		// under a new lifecycle. Without the final tick the 10s heartbeat kept
+		// the adapter's "working…" status alive for hours (live: 286m, 2026-09-05).
+		onRetired: endProgress,
+		onReleased: endProgress,
 		onStall: ({ elapsedMs }) =>
 			console.error(`gateway persona turn stalled (${turnId}) after ${elapsedMs}ms; retaining status reconciliation.`),
 	};
