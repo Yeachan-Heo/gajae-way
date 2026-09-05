@@ -1,4 +1,11 @@
-import { type MonitorRecord, type MonitorSpec, type TriggerSpec, validateOriginRef } from "@gajaeway/protocol";
+import {
+	eventTypeOrigin,
+	type MonitorRecord,
+	type MonitorSpec,
+	OriginRefError,
+	type TriggerSpec,
+	validateOriginRef,
+} from "@gajaeway/protocol";
 import type { GatewayDatabase } from "../store/db";
 
 const BURST_POLICIES = new Set(["coalesce", "dedupe", "serialize", "drop"]);
@@ -75,6 +82,21 @@ export function validateSpec(spec: MonitorSpec): void {
 		spec.eventTypes.some((type) => typeof type !== "string" || !type)
 	)
 		throw new Error("monitor eventTypes must be a non-empty string list");
+	// An event type becomes the conversationId of its executing session's origin.
+	// Admit only what that origin can carry, or the monitor is registered but
+	// every event dies at dispatch with OriginRefError (live: a 469-character
+	// "event type" that was really the whole instruction, gaebal, 2026-09-05).
+	for (const type of spec.eventTypes) {
+		try {
+			validateOriginRef(eventTypeOrigin(type));
+		} catch (error) {
+			if (error instanceof OriginRefError)
+				throw new Error(
+					`monitor eventType ${JSON.stringify(type.slice(0, 64))}${type.length > 64 ? "…" : ""} is not a valid origin segment (1-256 chars of A-Z a-z 0-9 _ . : @ + -); put instructions in "instruction", not the event type`,
+				);
+			throw error;
+		}
+	}
 	if (spec.burstPolicy && !BURST_POLICIES.has(spec.burstPolicy)) throw new Error("invalid monitor burstPolicy");
 	validateTrigger(spec.trigger);
 	if (spec.channelTarget) validateOriginRef(spec.channelTarget.origin);
