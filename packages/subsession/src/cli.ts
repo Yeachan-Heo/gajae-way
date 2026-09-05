@@ -12,6 +12,17 @@
  * live broker, and so the trusted binary path stays a deployment decision.
  */
 
+import { realpathSync } from "node:fs";
+import { resolve } from "node:path";
+
+export function canonicalSessionPath(path: string): string {
+	try {
+		return realpathSync(path);
+	} catch {
+		return resolve(path);
+	}
+}
+
 export type CliResult = {
 	readonly exitCode: number;
 	readonly stdout: string;
@@ -22,9 +33,10 @@ export type CliRunner = (args: readonly string[], options?: { readonly timeoutMs
 
 export type BrokerSession = {
 	readonly sessionId: string;
-	/** `locator.repo`: the workspace the session was launched in. */
+	/** Canonical workspace cwd, projected from locator.cwd. */
 	readonly repo: string;
 	readonly stateRoot?: string;
+	readonly worktreeRoot?: string;
 	readonly pid?: number;
 	readonly live: boolean;
 	readonly deleted: boolean;
@@ -81,7 +93,7 @@ export function parseEnvelope<T>(result: CliResult, command: string): T {
 
 type RawSession = {
 	sessionId?: unknown;
-	locator?: { repo?: unknown; stateRoot?: unknown };
+	locator?: { cwd?: unknown; repo?: unknown; worktreeRoot?: unknown; stateRoot?: unknown };
 	pid?: unknown;
 	live?: unknown;
 	deleted?: unknown;
@@ -89,17 +101,21 @@ type RawSession = {
 	lastHeartbeatAt?: unknown;
 };
 
-function normalizeSession(raw: RawSession): BrokerSession | undefined {
+export function normalizeSession(raw: RawSession): BrokerSession | undefined {
 	if (typeof raw.sessionId !== "string" || raw.sessionId.length === 0) {
 		return undefined;
 	}
-	if (typeof raw.locator?.repo !== "string") {
+	const cwd = raw.locator?.cwd ?? raw.locator?.repo;
+	if (typeof cwd !== "string" || cwd.length === 0) {
 		return undefined;
 	}
 	return {
 		sessionId: raw.sessionId,
-		repo: raw.locator.repo,
-		...(typeof raw.locator.stateRoot === "string" ? { stateRoot: raw.locator.stateRoot } : {}),
+		repo: canonicalSessionPath(cwd),
+		...(typeof raw.locator?.stateRoot === "string" ? { stateRoot: canonicalSessionPath(raw.locator.stateRoot) } : {}),
+		...(typeof raw.locator?.worktreeRoot === "string"
+			? { worktreeRoot: canonicalSessionPath(raw.locator.worktreeRoot) }
+			: {}),
 		...(typeof raw.pid === "number" ? { pid: raw.pid } : {}),
 		live: raw.live === true,
 		deleted: raw.deleted === true,
@@ -131,9 +147,19 @@ export async function inspectSession(
 	options: ControllerOptions,
 	sessionId: string,
 ): Promise<BrokerSession | undefined> {
+	return (await inspectSessionRecord(options, sessionId)).session;
+}
+
+export async function inspectSessionRecord(
+	options: ControllerOptions,
+	sessionId: string,
+): Promise<{
+	readonly session: BrokerSession | undefined;
+	readonly raw: { session?: RawSession };
+}> {
 	const result = await options.run([...baseArgs(options), "inspect", sessionId, "--repo", options.repo]);
-	const payload = parseEnvelope<{ session?: RawSession }>(result, "session inspect");
-	return payload.session ? normalizeSession(payload.session) : undefined;
+	const raw = parseEnvelope<{ session?: RawSession }>(result, "session inspect");
+	return { raw, session: raw.session ? normalizeSession(raw.session) : undefined };
 }
 
 export type NotReadyReason = "not-found" | "deleted" | "not-live" | "identity-mismatch" | "cwd-mismatch";
@@ -185,7 +211,7 @@ export async function verifyReady(
 			session,
 		};
 	}
-	if (session.repo !== expected.worktreePath) {
+	if (session.repo !== canonicalSessionPath(expected.worktreePath)) {
 		return {
 			ready: false,
 			reason: "cwd-mismatch",

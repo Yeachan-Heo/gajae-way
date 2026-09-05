@@ -273,7 +273,7 @@ test("bind rebinds a persisted live-false session instead of handing a dead moni
 					exitCode: 0,
 					stdout: JSON.stringify({
 						ok: true,
-						result: { session: { sessionId: "dead-session", repo, live: false, deleted: false } },
+						result: { session: { sessionId: "dead-session", locator: { cwd: repo }, live: false, deleted: true } },
 					}),
 					stderr: "",
 				};

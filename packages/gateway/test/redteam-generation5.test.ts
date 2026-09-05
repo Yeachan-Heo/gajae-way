@@ -433,9 +433,14 @@ test("G5: accepted turns need positive death evidence, while bound turns release
 });
 
 test("G6: session-unavailable send failures are bounded per actor and reset after a successful send", async () => {
+	// I3 resume-first: each disowned send earns exactly one inspect + resume + retry
+	// on the SAME session before the actor rotates with `session_disowned_dead`.
+	// Six scripted refusals therefore cost three rotations (attempt=1,2,3); the
+	// third is logged unrecoverable and the retry is armed with backoff. Two more
+	// refusals after recovery are one rotation whose counter restarted at 1.
 	const timers: ScheduledTimer[] = [];
 	const port = new SendUnavailablePort();
-	port.remainingFailures = 3;
+	port.remainingFailures = 6;
 	const fixture = await directFixture({ port, ...timerSeam(timers) });
 	try {
 		enqueue(fixture, "first", "first request");
@@ -444,6 +449,12 @@ test("G6: session-unavailable send failures are bounded per actor and reset afte
 			.filter((line) => line.startsWith("persona_send_session_gone"))
 			.map((line) => /attempt=(\d+)/.exec(line)?.[1]);
 		expect(goneAttempts).toEqual(["1", "2", "3"]);
+		expect(port.sendAttempts).toHaveLength(6);
+		expect(fixture.database.listEpochMutations({ sinceMs: 0 }).map((row) => row.reason)).toEqual([
+			"session_disowned_dead",
+			"session_disowned_dead",
+			"session_disowned_dead",
+		]);
 		expect(
 			fixture.logs.filter(
 				(line) => line.startsWith("persona_send_unrecoverable") && line.includes("reason=session_unavailable"),
@@ -453,17 +464,15 @@ test("G6: session-unavailable send failures are bounded per actor and reset afte
 			timers.find((timer) => timer.delayMs === 8_000),
 			"8s send retry was not armed",
 		);
-
 		retry.work();
 		await eventually(() => port.sends.length === 1, "armed retry did not send after recovery");
 		const recovered = required(port.sends[0], "recovered send missing");
 		port.complete(recovered.opRef, "first answer");
 		await eventually(() => fixture.database.inboundPendingCount(ORIGIN_KEY) === 0, "recovered turn did not complete");
-
-		port.remainingFailures = 1;
+		port.remainingFailures = 2;
 		enqueue(fixture, "second", "second request");
 		await fixture.manager.notifyInbound(ORIGIN_KEY);
-		await eventually(() => port.sends.length === 2, "second request did not recover after one unavailable send");
+		await eventually(() => port.sends.length === 2, "second request did not recover after one rotation");
 		expect(
 			fixture.logs
 				.filter((line) => line.startsWith("persona_send_session_gone"))

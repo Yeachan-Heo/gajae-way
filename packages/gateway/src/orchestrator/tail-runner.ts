@@ -59,6 +59,7 @@ export interface TailAttachInput {
 	priority?: "current" | "retired";
 	/** Durable callback invoked only after preceding frames were delivered successfully. */
 	onCursorCommitted?: (cursor: string) => void | Promise<void>;
+	onCursorDiscarded?: () => void | Promise<void>;
 	/** `false` is permitted only through attachResync after explicit operator approval. */
 	strict?: boolean;
 	/** Authenticated diagnostic coordinate retained for an explicit non-strict resync. */
@@ -301,7 +302,14 @@ export class TailRunner {
 			String(this.#pollTimeoutMs),
 		];
 		const result = await this.#run(args, { timeoutMs: this.#pollTimeoutMs + 5_000 });
-		const decoded = decodeTailResult(result);
+		let decoded = decodeTailResult(result, handle.cursor !== undefined);
+		if (decoded.cursorUnusable && handle.cursor) {
+			await handle.discardCursor(decoded.cursorUnusable);
+			const cursorless = args.filter(
+				(arg, index) => arg !== "--strict" && arg !== "--cursor" && args[index - 1] !== "--cursor",
+			);
+			decoded = decodeTailResult(await this.#run(cursorless, { timeoutMs: this.#pollTimeoutMs + 5_000 }));
+		}
 		if (decoded.gap && handle.strict && handle.cursor) {
 			await handle.retentionGap(decoded.gap);
 			return;
@@ -497,6 +505,13 @@ class ManagedTailHandle implements TailHandle {
 		);
 	}
 
+	async discardCursor(code: string): Promise<void> {
+		await this.#input.onCursorDiscarded?.();
+		this.#cursor = undefined;
+		this.#pendingCursor = undefined;
+		this.#input.onDiagnostic?.(`tail_cursor_discarded session=${this.sessionId} code=${code}`);
+	}
+
 	async retentionGap(gap: { cursor?: string; resync?: unknown }): Promise<void> {
 		if (this.#closed) return;
 		// A strict gap is not a terminal event. It never falls through into a
@@ -676,9 +691,10 @@ type DecodedTail = {
 	readonly terminal: boolean;
 	readonly gap?: { readonly cursor?: string; readonly resync?: unknown };
 	readonly error?: Error;
+	readonly cursorUnusable?: string;
 };
 
-function decodeTailResult(result: CliResult): DecodedTail {
+export function decodeTailResult(result: CliResult, hasCursor = false): DecodedTail {
 	let envelope: Record<string, unknown>;
 	try {
 		envelope = JSON.parse(result.stdout) as Record<string, unknown>;
@@ -692,6 +708,18 @@ function decodeTailResult(result: CliResult): DecodedTail {
 	const error = recordOf(envelope.error);
 	const errorCode = typeof error?.code === "string" ? error.code : undefined;
 	if (result.exitCode !== 0 || envelope.ok !== true) {
+		if (
+			errorCode &&
+			(["invalid_cursor", "cursor_expired", "snapshot_capacity_exceeded"].includes(errorCode) ||
+				(hasCursor && errorCode === "invalid_input"))
+		) {
+			return {
+				frames: [],
+				terminal: false,
+				cursorUnusable: errorCode,
+				error: new Error(`session tail failed: ${errorCode}`),
+			};
+		}
 		if (errorCode === "retention_gap") {
 			return { frames: [], terminal: false, gap: { resync: recordOf(error?.details)?.resync ?? error?.resync } };
 		}

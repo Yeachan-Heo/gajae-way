@@ -10,11 +10,18 @@ import { BrokerSessionPort } from "../../packages/gateway/src/orchestrator/sessi
 import { TailRunner } from "../../packages/gateway/src/orchestrator/tail-runner";
 
 test("red 8b: terminal turn.result does not silently use session.last_assistant", async () => {
-	const port = new ScriptedSessionPort({ onSend: (input, scripted) => scripted.completeWithoutAnswerFrame(input.opRef, "AUTHORITATIVE") });
+	const port = new ScriptedSessionPort({
+		onSend: (input, scripted) => scripted.completeWithoutAnswerFrame(input.opRef, "AUTHORITATIVE"),
+	});
 	const h = await harness(port);
 	const fake = createFakeGjc({ modes: "status:content" });
 	const run = async (args: readonly string[]) => (await fake(args))!;
-	const real = new BrokerSessionPort({ database: h.database, cli: run, instanceId: "red-fallback", tailRunner: new TailRunner({ run }) });
+	const real = new BrokerSessionPort({
+		database: h.database,
+		cli: run,
+		instanceId: "red-fallback",
+		tailRunner: new TailRunner({ run }),
+	});
 	port.status = real.status.bind(real);
 	try {
 		h.enqueue("fallback");
@@ -22,6 +29,8 @@ test("red 8b: terminal turn.result does not silently use session.last_assistant"
 		await eventually(() => h.deliveries.length > 0, "terminal frame never reconciled");
 		const logs = h.logs;
 		console.info("red8b", logs);
-		expect(logs.filter(l => l.includes("terminal_text_fallback"))).toHaveLength(0);
-	} finally { await h.close(); }
+		expect(logs.filter((l) => l.includes("terminal_text_fallback"))).toHaveLength(0);
+	} finally {
+		await h.close();
+	}
 });

@@ -14,7 +14,7 @@ import {
 } from "@gajaeway/subsession";
 import type { GjcModelSelection, GjcServiceTier } from "../config";
 import type { GatewayDatabase, InboundMessageRow, InboundTurn } from "../store/db";
-import { sanitizeDiagnostic } from "./rebind";
+import { rebindableCodeOf, sanitizeDiagnostic } from "./rebind";
 import type { SessionBinding, SessionPort } from "./session-port";
 import {
 	deterministicInterimDeliveryId,
@@ -547,11 +547,13 @@ class OriginActor {
 	/** Mailbox-serialized live rebind. The caller supplies a verified concrete selection. */
 	async rebindModel(selection: GjcModelSelection): Promise<void> {
 		const binding = await this.#ensureSession(this.#epoch());
-		const receipt = await this.#manager.port.setModel({
-			sessionId: binding.sessionId,
-			repo: this.#manager.repo,
-			selection,
-		});
+		const receipt = await this.#resumeUnavailable(binding, () =>
+			this.#manager.port.setModel({
+				sessionId: binding.sessionId,
+				repo: this.#manager.repo,
+				selection,
+			}),
+		);
 		this.#appliedModel.set(binding.sessionId, describeModel(selection));
 		this.#manager.log(
 			`persona_model origin=${this.originKey} epoch=${binding.epoch} session=${binding.sessionId} effective=${describeModel(selection)} changed=${receipt.changed} source=/model`,
@@ -783,7 +785,9 @@ class OriginActor {
 		try {
 			tail = await this.#attachTail(sessionId, turn.epoch, retired);
 		} catch (error) {
-			if (!retired || !(error instanceof TailCapacityError)) throw error;
+			this.#manager.log(
+				`tail_attach_failed origin=${this.originKey} session=${sessionId} detail=${safeDiagnostic(error)}`,
+			);
 			detached = true;
 			this.#manager.log(
 				`retired_hold originKey=${this.originKey} epoch=${turn.epoch} opRef=${turn.opRef} reason=tail_capacity`,
@@ -995,7 +999,29 @@ class OriginActor {
 			turn,
 			trigger: bound,
 		});
-		const tail = await this.#attachTail(binding.sessionId, epoch, false);
+		let tail: TailHandle;
+		try {
+			tail = await this.#attachTail(binding.sessionId, epoch, false);
+			try {
+				await tail.beginTurn(opRef);
+			} catch (error) {
+				await tail.close();
+				throw error;
+			}
+		} catch (error) {
+			this.#manager.database.inboundTurnUnbindPreSend(opRef);
+			this.#preSendFailures += 1;
+			this.#manager.log(
+				`persona_presend_failed origin=${this.originKey} opRef=${opRef} detail=${safeDiagnostic(error)}`,
+			);
+			this.#scheduleDispatchRetry(
+				Math.min(
+					DISPATCH_FAILURE_RETRY_MAX_MS,
+					DISPATCH_FAILURE_RETRY_MS * 2 ** Math.min(this.#preSendFailures - 1, 10),
+				),
+			);
+			return;
+		}
 		const dispatchedAtMs = this.#dispatchFloorMs(opRef);
 		const current: BoundTurn = {
 			originKey: this.originKey,
@@ -1016,7 +1042,6 @@ class OriginActor {
 			...(dispatchedAtMs === undefined ? {} : { dispatchedAtMs }),
 			replaceAfterTerminal: false,
 		};
-		await tail.beginTurn(opRef);
 		this.#current = current;
 		this.#state = "turn-running";
 		tail.setTurnRunning(true);
@@ -1026,27 +1051,22 @@ class OriginActor {
 		// would brick the origin. Release it to plain pending and retry with
 		// backoff instead.
 		const modelKey = describeModel(lifecycle.effectiveModel);
+		const selection = lifecycle.effectiveModel;
+		const tier = lifecycle.effectiveServiceTier;
 		let modelReceipt: { readonly changed: boolean } | undefined;
 		try {
 			modelReceipt =
-				lifecycle.effectiveModel && this.#appliedModel.get(binding.sessionId) !== modelKey
-					? await this.#manager.port.setModel({
-							sessionId: binding.sessionId,
-							repo: this.#manager.repo,
-							selection: lifecycle.effectiveModel,
-						})
+				selection && this.#appliedModel.get(binding.sessionId) !== modelKey
+					? await this.#resumeUnavailable(binding, () =>
+							this.#manager.port.setModel({ sessionId: binding.sessionId, repo: this.#manager.repo, selection }),
+						)
 					: undefined;
-			if (lifecycle.effectiveModel) this.#appliedModel.set(binding.sessionId, modelKey);
-			if (
-				lifecycle.effectiveServiceTier &&
-				this.#appliedServiceTier.get(binding.sessionId) !== lifecycle.effectiveServiceTier
-			) {
-				await this.#manager.port.setServiceTier({
-					sessionId: binding.sessionId,
-					repo: this.#manager.repo,
-					tier: lifecycle.effectiveServiceTier,
-				});
-				this.#appliedServiceTier.set(binding.sessionId, lifecycle.effectiveServiceTier);
+			if (selection) this.#appliedModel.set(binding.sessionId, modelKey);
+			if (tier && this.#appliedServiceTier.get(binding.sessionId) !== tier) {
+				await this.#resumeUnavailable(binding, () =>
+					this.#manager.port.setServiceTier({ sessionId: binding.sessionId, repo: this.#manager.repo, tier }),
+				);
+				this.#appliedServiceTier.set(binding.sessionId, tier);
 			}
 			this.#preSendFailures = 0;
 			this.#manager.log(
@@ -1058,13 +1078,14 @@ class OriginActor {
 				);
 		} catch (error) {
 			await tail.close();
-			const attempt = this.#manager.database.inboundTurnRequeue(opRef);
+			this.#manager.database.inboundTurnUnbindPreSend(opRef);
+			const attempt = retryAttempt;
 			this.#current = undefined;
 			this.#state = "idle";
 			await this.#notifyReleased(current);
 			this.#preSendFailures += 1;
 			const failures = this.#preSendFailures;
-			const sessionGone = sdkStatusErrorCode(error) === "session_unavailable";
+			const sessionGone = sdkStatusErrorCode(error) === "session_disowned_dead";
 			const nextEpoch = sessionGone
 				? this.#manager.database.mutateEpoch(this.originKey, {
 						scope: "persona",
@@ -1084,28 +1105,30 @@ class OriginActor {
 			return;
 		}
 		try {
-			await this.#manager.port.send({
-				sessionId: binding.sessionId,
-				repo: this.#manager.repo,
-				text: lifecycle.text,
-				opRef,
-				...(lifecycle.systemPreamble ? { systemPreamble: lifecycle.systemPreamble } : {}),
-				...(lifecycle.sendModelFallback ? { model: lifecycle.sendModelFallback } : {}),
-			});
+			await this.#resumeUnavailable(binding, () =>
+				this.#manager.port.send({
+					sessionId: binding.sessionId,
+					repo: this.#manager.repo,
+					text: lifecycle.text,
+					opRef,
+					...(lifecycle.systemPreamble ? { systemPreamble: lifecycle.systemPreamble } : {}),
+					...(lifecycle.sendModelFallback ? { model: lifecycle.sendModelFallback } : {}),
+				}),
+			);
 			this.#manager.database.inboundTurnAccept(opRef);
 			await tail.markAccepted(opRef);
 			this.#bindFailures = 0;
 			this.#bindEpochPoisoned = false;
 		} catch (error) {
-			// The Router disowning the session id is NOT ambiguous: it is proof the
-			// send never landed, so there is nothing to protect by holding. gjc is
-			// allowed to be unreliable here - surviving that is this gateway's job.
-			// Holding instead left the conversation dead with one message pending,
-			// an empty gjc_session_id and no retry, until a human restarted the
-			// daemon (live: epoch 41, session_unavailable, 2026-09-03).
-			if (sdkStatusErrorCode(error) === "session_unavailable") {
+			// `session_disowned_dead` is produced only after #resumeUnavailable proved
+			// the saved session deleted or unresumable (I3): the Router never owned
+			// this request, so the prompt provably never landed and nothing is
+			// protected by holding. The row goes back to pending WITHOUT a new attempt
+			// ordinal, the epoch rotates once with its reason, and the burst is
+			// bounded per actor before backing off. The message is never dropped.
+			if (sdkStatusErrorCode(error) === "session_disowned_dead") {
 				await tail.close();
-				this.#manager.database.inboundTurnRequeue(opRef);
+				this.#manager.database.inboundTurnUnbindPreSend(opRef);
 				const nextEpoch = this.#manager.database.mutateEpoch(this.originKey, {
 					scope: "persona",
 					reason: "session_disowned_dead",
@@ -1114,13 +1137,6 @@ class OriginActor {
 				this.#current = undefined;
 				this.#state = "idle";
 				await this.#notifyReleased(current);
-				// The per-trigger fresh-turn ordinal restarts with the epoch, so the
-				// burst is counted at the actor: consecutive "no usable session"
-				// failures (bind OR send) until one dispatch succeeds. Bounded burst
-				// of immediate replacements - each a new session bootstrapped with
-				// the last 24h of channel context - then the condition is logged as
-				// unrecoverable for the operator and retried with backoff. The
-				// message is never dropped.
 				this.#bindFailures += 1;
 				const attempts = this.#bindFailures;
 				this.#manager.log(
@@ -1138,9 +1154,9 @@ class OriginActor {
 				}
 				return;
 			}
-			// A command failure can occur after broker acceptance. Reconcile its exact
-			// durable op-ref; an unknown status is an operator hold that the periodic
-			// reconcile keeps sweeping, and it is never resent.
+			// Any other command failure can have occurred after broker acceptance.
+			// Reconcile its exact durable op-ref; an unknown status is an operator
+			// hold that the periodic reconcile keeps sweeping, and it is never resent.
 			if ((error instanceof OpRefRejectedError && error.code === CLIENT_REF_CONFLICT_CODE) || isOpRefRejection(error))
 				this.#manager.log(`recovery_client_ref_conflict origin=${this.originKey} epoch=${epoch} opRef=${opRef}`);
 			else
@@ -1151,6 +1167,38 @@ class OriginActor {
 			return;
 		}
 		await this.#steerPending();
+	}
+
+	async #resumeUnavailable<T>(binding: SessionBinding, command: () => Promise<T>): Promise<T> {
+		try {
+			return await command();
+		} catch (error) {
+			if (sdkStatusErrorCode(error) !== "session_unavailable") throw error;
+			const session = await this.#manager.port.inspect(binding);
+			if (!session || session.repo !== this.#manager.repo)
+				throw new Error("session recovery has no matching cwd authority");
+			if (session.deleted)
+				throw Object.assign(new Error("saved session is deleted"), { code: "session_disowned_dead" });
+			try {
+				await this.#manager.port.resume(binding);
+			} catch (resumeError) {
+				if (sdkStatusErrorCode(resumeError))
+					throw Object.assign(new Error("saved session resume refused"), { code: "session_disowned_dead" });
+				throw resumeError;
+			}
+			try {
+				return await command();
+			} catch (retryError) {
+				// The Router still disowns the id after a proven resume: the saved
+				// authority is unusable, which is the plan's `session_disowned_dead`.
+				if (sdkStatusErrorCode(retryError) === "session_unavailable")
+					throw Object.assign(new Error("session disowned after resume"), {
+						code: "session_disowned_dead",
+						cause: retryError,
+					});
+				throw retryError;
+			}
+		}
 	}
 
 	/**
@@ -1228,7 +1276,10 @@ class OriginActor {
 		this.#bindFailures += 1;
 		const attempts = this.#bindFailures;
 		const detail = safeDiagnostic(error);
-		if (detail.includes("terminal_uncertain")) this.#bindEpochPoisoned = true;
+		// Only the runtime's structured code poisons the epoch-scoped create key;
+		// message text is diagnostic, never classification (rebind.ts contract).
+		if (sdkStatusErrorCode(error) === "terminal_uncertain" || rebindableCodeOf(error) === "terminal_uncertain")
+			this.#bindEpochPoisoned = true;
 		this.#manager.log(
 			`persona_bind_failed origin=${this.originKey} epoch=${epoch} message=${messageId} attempts=${attempts} detail=${detail}`,
 		);
@@ -1384,7 +1435,14 @@ class OriginActor {
 			// the unchanged decision table's `session.resume` branch BEFORE any send;
 			// a dead binding is never handed to a send as if it were live.
 			const { session, failed } = await this.#inspectForRecovery(existing.sessionId);
-			if (failed || session === undefined || session.live) return binding;
+			if (failed) {
+				// Keep the binding: a transport outage on inspect is not evidence about
+				// the session. The send path carries its own bounded session_unavailable
+				// recovery, so dispatch proceeds instead of stalling the origin.
+				this.#manager.log(`session_inspect_transient origin=${this.originKey} session=${existing.sessionId}`);
+				return binding;
+			}
+			if (session === undefined || session.live) return binding;
 			if (!session.deleted && session.repo === this.#manager.repo) {
 				try {
 					await this.#manager.port.resume({
@@ -1431,6 +1489,7 @@ class OriginActor {
 			onCursorCommitted: async (nextCursor) => {
 				this.#manager.database.tailCursorCommit(sessionId, nextCursor);
 			},
+			onCursorDiscarded: () => this.#manager.database.tailCursorClear(sessionId),
 			// Awaited on purpose: the TailRunner commits the durable cursor only after
 			// this resolves, so ledger/delivery/terminal side effects precede the
 			// cursor. Mailbox re-entrancy is safe because TailHandle.markAccepted
@@ -1960,6 +2019,10 @@ function isDefinitiveSteerRejection(error: unknown): boolean {
 function sdkStatusErrorCode(error: unknown): string | undefined {
 	const code = (error as { code?: unknown } | undefined)?.code;
 	if (typeof code === "string" && /^[a-z0-9_.-]{1,64}$/i.test(code)) return code;
+	if (error instanceof GjcCliError) {
+		const detail = error.details as { code?: unknown } | undefined;
+		if (typeof detail?.code === "string") return detail.code;
+	}
 	const message = error instanceof Error ? error.message : "";
 	return /session_unavailable/.test(message) ? "session_unavailable" : undefined;
 }

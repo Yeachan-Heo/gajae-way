@@ -19,13 +19,19 @@ async function characterize(usableAt: number, random: number) {
 	const logs: string[] = [];
 	const clock = (work: () => void, ms: number) => {
 		delaysMs.push(ms);
-		timers.push(() => { now += ms; work(); });
+		timers.push(() => {
+			now += ms;
+			work();
+		});
 	};
 	const math = Object.create(Math) as Math;
 	math.random = () => random;
 	const schedule = new Function("setTimeout", "Math", "console", body.replaceAll("this.#", "this._"));
 	const client = {
-		_reconnecting: false, _client: undefined, _deliveryOff: undefined, _attempt: 0,
+		_reconnecting: false,
+		_client: undefined,
+		_deliveryOff: undefined,
+		_attempt: 0,
 		connect() {
 			attemptsAt.push(now);
 			if (now >= usableAt) firstConnectAt = now;

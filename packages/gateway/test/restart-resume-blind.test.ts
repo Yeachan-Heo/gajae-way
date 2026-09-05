@@ -4,24 +4,35 @@
  * Matched log: model.profile.set ... session_unavailable; persona_model_failed ... nextEpoch=.
  */
 import { expect, test } from "bun:test";
-import { GjcCliError } from "../../packages/subsession/src/index";
-import { BrokerSessionPort } from "../../packages/gateway/src/orchestrator/session-port";
-import { TailRunner } from "../../packages/gateway/src/orchestrator/tail-runner";
-import { createFakeGjc } from "../../packages/gateway/test/fixtures/fake-gjc.mjs";
-import { ScriptedSessionPort } from "../../packages/gateway/test/session-port.fake";
-import { harness, KEY } from "./harness";
+import { GjcCliError } from "@gajaeway/subsession";
+import { BrokerSessionPort } from "../src/orchestrator/session-port";
+import { TailRunner } from "../src/orchestrator/tail-runner";
+import { createFakeGjc } from "./fixtures/fake-gjc.mjs";
+import { ScriptedSessionPort } from "./session-port.fake";
+import { harness, KEY } from "./red-first-harness";
 
 async function scenario(mode: string) {
 	const port = new ScriptedSessionPort();
-	const h = await harness(port, { onTurnStart: ({ trigger }) => ({ text: trigger.body, effectiveModel: "fixture/model" }) });
+	const h = await harness(port, {
+		onTurnStart: ({ trigger }) => ({ text: trigger.body, effectiveModel: "fixture/model" }),
+	});
 	const fake = createFakeGjc({ modes: mode });
 	const run = async (args: readonly string[]) => (await fake(args))!;
-	const real = new BrokerSessionPort({ database: h.database, cli: run, instanceId: "red-resume", tailRunner: new TailRunner({ run }) });
+	const real = new BrokerSessionPort({
+		database: h.database,
+		cli: run,
+		instanceId: "red-resume",
+		tailRunner: new TailRunner({ run, repo: h.repo }),
+	});
 	port.inspect = real.inspect.bind(real);
 	const resumeCalls: unknown[] = [];
-	port.resume = async (input) => { resumeCalls.push(input); return await real.resume(input); };
+	port.resume = async (input) => {
+		resumeCalls.push(input);
+		return await real.resume(input);
+	};
 	port.setModel = async () => {
-		if (!resumeCalls.length) throw new GjcCliError("model.profile.set failed: session_unavailable", 0, "", { code: "session_unavailable" });
+		if (!resumeCalls.length)
+			throw new GjcCliError("model.profile.set failed: session_unavailable", 0, "", { code: "session_unavailable" });
 		return { changed: true };
 	};
 	h.database.putSession(KEY, "saved-session");
@@ -31,12 +42,21 @@ async function scenario(mode: string) {
 		await h.manager.notifyInbound(KEY);
 		const after = h.database.getSessionRecord(KEY)!;
 		console.info("red5", { mode, resumeCalls: resumeCalls.length, before, after, logs: h.logs });
-		return { resumeCalls, sessionIdBefore: before.sessionId, sessionIdAfter: after.sessionId, epochBefore: before.epoch, epochAfter: after.epoch };
-	} finally { await h.close(); }
+		return {
+			resumeCalls,
+			sessionIdBefore: before.sessionId,
+			sessionIdAfter: after.sessionId,
+			epochBefore: before.epoch,
+			epochAfter: after.epoch,
+		};
+	} finally {
+		await h.close();
+	}
 }
 
 test("red 5: resume saved cwd-locator authority without changing identity", async () => {
-	const { resumeCalls, sessionIdAfter, sessionIdBefore, epochAfter, epochBefore } = await scenario("inspect:cwd-locator");
+	const { resumeCalls, sessionIdAfter, sessionIdBefore, epochAfter, epochBefore } =
+		await scenario("inspect:cwd-locator");
 	expect(resumeCalls).toHaveLength(1);
 	expect(sessionIdAfter).toBe(sessionIdBefore);
 	expect(epochAfter).toBe(epochBefore);

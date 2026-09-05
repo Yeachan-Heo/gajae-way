@@ -696,6 +696,18 @@ export class GatewayDatabase {
 					input.originKey,
 				).changes;
 			if (changes !== 1) throw new Error(`inbound ${input.messageId} is not a pending unbound row`);
+			this.#database
+				.query(`INSERT INTO turn_attempts (trigger_message_id, attempt, origin_key, scope, epoch, op_ref, session_id, transport, cold, bound_at, send_state, admission, legacy)
+				SELECT ?, COALESCE(MAX(attempt), -1) + 1, ?, 'persona', ?, ?, ?, 'cli', 0, ?, 'pending_write', 'unknown', 0 FROM turn_attempts WHERE trigger_message_id = ?`)
+				.run(
+					input.messageId,
+					input.originKey,
+					input.epoch,
+					input.opRef,
+					input.sessionId,
+					input.dispatchedAt ?? new Date().toISOString(),
+					input.messageId,
+				);
 			return this.inboundTurnRow(input.opRef) as InboundMessageRow;
 		});
 	}
@@ -809,6 +821,38 @@ export class GatewayDatabase {
 				.run(opRef);
 			return attempt;
 		});
+	}
+
+	/** Releases only a turn for which no prompt write was attempted; the opRef stays stable. */
+	inboundTurnUnbindPreSend(opRef: string): void {
+		this.withTransaction(() => {
+			const trigger = this.inboundTurnRow(opRef);
+			if (!trigger || trigger.turn_state !== "bound") throw new Error(`turn ${opRef} is not pre-send bound`);
+			this.turnAttemptMarkPreWriteFailure(opRef);
+			this.#database
+				.query(
+					"UPDATE inbound_messages SET turn_role = NULL, turn_epoch = NULL, turn_state = NULL, turn_op_ref = NULL, bound_session_id = NULL, dispatched_at = NULL, terminal_delivery_id = NULL WHERE turn_op_ref = ? AND state = 'pending'",
+				)
+				.run(opRef);
+		});
+	}
+
+	turnAttemptMarkPreWriteFailure(opRef: string): void {
+		const result = this.#database
+			.query(
+				"UPDATE turn_attempts SET send_state = 'pre_write_failure', send_decided_at = ?, send_decided_by = 'runner' WHERE op_ref = ? AND send_state = 'pending_write' AND spawn_gate_at IS NULL",
+			)
+			.run(new Date().toISOString(), opRef);
+		if (result.changes !== 1) throw new Error(`turn ${opRef} has no pre-write attempt`);
+	}
+
+	turnAttemptSetSpawnGate(opRef: string): void {
+		const result = this.#database
+			.query(
+				"UPDATE turn_attempts SET spawn_gate_at = ? WHERE op_ref = ? AND send_state = 'pending_write' AND spawn_gate_at IS NULL",
+			)
+			.run(new Date().toISOString(), opRef);
+		if (result.changes !== 1) throw new Error(`turn ${opRef} has no pending attempt`);
 	}
 
 	freshTurnAttempt(originKey: string, epoch: number, triggerMessageId: string): number {

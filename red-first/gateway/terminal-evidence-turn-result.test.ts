@@ -15,7 +15,12 @@ test("red 8: turn.result is authoritative even when the attached tail stays sile
 	const rows = [{ id: "assistant-other", ts: new Date().toISOString(), revision: 1, role: "assistant", body: "OTHER" }];
 	const fake = createFakeGjc({ modes: `status:content,transcript:rows=${JSON.stringify(rows)}` });
 	const run = async (args: readonly string[]) => (await fake(args))!;
-	const real = new BrokerSessionPort({ database: h.database, cli: run, instanceId: "red-terminal", tailRunner: new TailRunner({ run }) });
+	const real = new BrokerSessionPort({
+		database: h.database,
+		cli: run,
+		instanceId: "red-terminal",
+		tailRunner: new TailRunner({ run }),
+	});
 	port.status = real.status.bind(real);
 	port.fetchAssistantSince = real.fetchAssistantSince.bind(real);
 	try {
@@ -28,5 +33,7 @@ test("red 8: turn.result is authoritative even when the attached tail stays sile
 		console.info("red8", { deliveredText, logs });
 		expect(deliveredText).toBe("AUTHORITATIVE");
 		expect(logs).toContain("terminal_text_source=turn_result");
-	} finally { await h.close(); }
+	} finally {
+		await h.close();
+	}
 });

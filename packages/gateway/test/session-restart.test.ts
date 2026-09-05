@@ -443,7 +443,7 @@ class PoisonedBindEpochPort extends ScriptedSessionPort {
 		this.bindAttempts++;
 		this.bindEpochs.push(input.epoch);
 		if (this.bindAttempts === 1 || this.bindAttempts === 3)
-			throw new Error("gjc sdk request failed: terminal_uncertain");
+			throw Object.assign(new Error("gjc sdk request failed: terminal_uncertain"), { code: "terminal_uncertain" });
 		if (this.bindAttempts === 2) throw new Error("gjc command timed out after 30000ms");
 		return await super.bind(input);
 	}
@@ -591,7 +591,7 @@ class ModelSetSessionGonePort extends ScriptedSessionPort {
 	}
 }
 
-test("model.set session_unavailable rotates the epoch immediately before retrying the still-pending row", async () => {
+test("model.set session_unavailable resumes the same saved session before retrying control", async () => {
 	home = await mkdtemp(join(tmpdir(), "gajaeway-session-restart-"));
 	database = await GatewayDatabase.open(join(home, "gateway.db"));
 	const port = new ModelSetSessionGonePort();
@@ -621,22 +621,12 @@ test("model.set session_unavailable rotates the epoch immediately before retryin
 	enqueue("model-session-gone", "retry me on a fresh session");
 	await manager.notifyInbound(KEY);
 	expect(port.binds.map((bind) => bind.epoch)).toEqual([0]);
-	expect(port.sendAttempts).toEqual([]);
-	expect(database.getSessionRecord(KEY)?.epoch).toBe(1);
-	expect(database.inboundPendingOldest(KEY)).toMatchObject({ message_id: "model-session-gone", turn_state: null });
-	expect(timers.map((timer) => timer.delayMs)).toEqual([2_000]);
-	expect(
-		logs.some(
-			(line) =>
-				line.startsWith(`persona_model_failed origin=${KEY} epoch=0 nextEpoch=1`) &&
-				line.includes("session_unavailable"),
-		),
-	).toBe(true);
-
-	timers[0]!.work();
-	await eventually(() => port.sends.length === 1, "fresh session did not receive the prompt");
-	expect(port.binds.map((bind) => bind.epoch)).toEqual([0, 1]);
-	expect(port.sends[0]!.text).toBe("retry me on a fresh session");
-	await eventually(() => terminal.length === 1, "fresh session turn did not complete");
+	await eventually(() => terminal.length === 1, "resumed session turn did not complete");
+	expect(port.sendAttempts).toHaveLength(1);
+	expect(port.modelAttempts).toBe(2);
+	expect(database.getSessionRecord(KEY)?.epoch).toBe(0);
+	expect(port.binds.map((bind) => bind.epoch)).toEqual([0]);
+	expect(database.listEpochMutations({ sinceMs: 0 })).toEqual([]);
+	expect(timers).toEqual([]);
 	expect(database.inboundPendingCount(KEY)).toBe(0);
 });

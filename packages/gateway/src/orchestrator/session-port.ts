@@ -9,7 +9,8 @@ import {
 	envelopeErrorCode,
 	fetchOpState,
 	GjcCliError,
-	inspectSession,
+	inspectSessionRecord,
+	canonicalSessionPath,
 	isTerminalStatus,
 	type LastAssistantResult,
 	OpRefRejectedError,
@@ -217,41 +218,35 @@ export class BrokerSessionPort implements SessionPort {
 			throw new Error("session epoch must be a non-negative integer");
 		const existing = this.#database.getSessionRecord(input.originKey);
 		if (existing?.epoch === input.epoch && existing.sessionId) {
-			// A persisted binding is only reusable if the broker still indexes it. A
-			// binding written against a store the current runtime cannot read
-			// (pre-cutover session ids) must be rebound, not handed to a send that
-			// will fail with session_unavailable forever. Inspect failure (transport
-			// outage) keeps the binding: that is not evidence the session is gone.
 			let indexed = true;
+			let session: Awaited<ReturnType<BrokerSessionPort["inspect"]>>;
 			try {
-				// Judge the raw envelope: a persisted id is reusable only when the
-				// A persisted id is reusable if live, and resumable if it still has
-				// saved authority. Monitor authoring reaches SessionPort directly, so
-				// resume here before paying for a cold replacement session.
-				const result = await this.#cli(["sdk", "session", "inspect", existing.sessionId, "--repo", input.repo]);
-				const envelope = JSON.parse(result.stdout) as {
-					ok?: unknown;
-					result?: { session?: { live?: unknown; deleted?: unknown } };
-					error?: { code?: unknown };
-				};
-				if (envelope.ok === false) indexed = envelope.error?.code !== "session_unavailable";
-				if (envelope.ok === true && envelope.result?.session?.live === false) {
-					if (envelope.result.session.deleted !== true) {
-						try {
-							return await this.resume({
-								sessionId: existing.sessionId,
-								repo: input.repo,
-								originKey: input.originKey,
-								epoch: input.epoch,
-							});
-						} catch {
-							// Saved authority cannot be resumed: replace it below.
-						}
-					}
-					indexed = false;
+				session = await this.inspect({ sessionId: existing.sessionId, repo: input.repo });
+			} catch (error) {
+				// A transient inspect failure keeps the binding; it is never a rotation.
+				console.error(`session_inspect_transient origin=${input.originKey} session=${existing.sessionId}`);
+				throw error;
+			}
+			// Fail closed on location authority: a row without a canonical cwd, or one
+			// bound elsewhere, must never be resumed or rotated from this workspace.
+			if (!session || session.repo !== canonicalSessionPath(input.repo)) {
+				console.error(
+					`session_cwd_mismatch origin=${input.originKey} session=${existing.sessionId} expected=${canonicalSessionPath(input.repo)} actual=${session?.repo ?? "unknown"}`,
+				);
+				throw new Error("saved session cwd authority unavailable");
+			}
+			if (session.deleted) indexed = false;
+			else if (!session.live) {
+				try {
+					const binding = await this.resume({ ...input, sessionId: existing.sessionId });
+					console.error(
+						`session_resumed reason=idle_dead_binding origin=${input.originKey} session=${existing.sessionId}`,
+					);
+					return binding;
+				} catch (error) {
+					if (sdkErrorCode(error)) indexed = false;
+					else throw error;
 				}
-			} catch {
-				indexed = true;
 			}
 			if (indexed)
 				return { sessionId: existing.sessionId, originKey: input.originKey, epoch: input.epoch, repo: input.repo };
@@ -265,7 +260,7 @@ export class BrokerSessionPort implements SessionPort {
 				cause: { kind: "retirement" },
 			}).toEpoch;
 			console.error(
-				`session_rebound origin=${input.originKey} epoch=${input.epoch} nextEpoch=${rebound} session=${existing.sessionId} reason=not_live_or_disowned_by_broker`,
+				`session_rebound origin=${input.originKey} epoch=${input.epoch} nextEpoch=${rebound} session=${existing.sessionId} reason=session_disowned_dead`,
 			);
 			return await this.bind({ ...input, epoch: rebound });
 		}
@@ -401,26 +396,16 @@ export class BrokerSessionPort implements SessionPort {
 		throw sanitizeSdkFailure(lastFailure ?? new Error("session.create did not produce a result"));
 	}
 
-	/**
-	 * Raw liveness judged on the broker envelope: gjc >= 0.16.0 omits
-	 * `locator.repo`, which makes the subsession normalizer return undefined for a
-	 * perfectly well-known session. `disowned` = the broker rejects the id.
-	 */
+	readonly #inspections = new Map<string, Awaited<ReturnType<typeof inspectSessionRecord>>>();
 	async liveness(input: {
 		sessionId: string;
 		repo: string;
 	}): Promise<{ readonly live: boolean | undefined; readonly disowned: boolean }> {
 		try {
-			const result = await this.#cli(["sdk", "session", "inspect", input.sessionId, "--repo", input.repo], {
-				timeoutMs: 10_000,
-			});
-			const envelope = JSON.parse(result.stdout) as {
-				ok?: unknown;
-				result?: { session?: { live?: unknown } };
-				error?: { code?: unknown };
-			};
-			if (envelope.ok === false) return { live: undefined, disowned: envelope.error?.code === "session_unavailable" };
-			const live = envelope.result?.session?.live;
+			const snapshot =
+				this.#inspections.get(input.sessionId) ??
+				(await inspectSessionRecord(this.#controller(input.repo), input.sessionId));
+			const live = snapshot.raw.session?.live;
 			return { live: typeof live === "boolean" ? live : undefined, disowned: false };
 		} catch (error) {
 			return { live: undefined, disowned: sdkErrorCode(error) === "session_unavailable" };
@@ -428,12 +413,17 @@ export class BrokerSessionPort implements SessionPort {
 	}
 
 	async inspect(input: { sessionId: string; repo: string }): Promise<BrokerSession | undefined> {
-		return await this.#safe(async () => await inspectSession(this.#controller(input.repo), input.sessionId));
+		return await this.#safe(async () => {
+			this.#inspections.delete(input.sessionId);
+			const snapshot = await inspectSessionRecord(this.#controller(input.repo), input.sessionId);
+			this.#inspections.set(input.sessionId, snapshot);
+			return snapshot.session;
+		});
 	}
 
 	async resume(input: { sessionId: string; repo: string; originKey: string; epoch: number }): Promise<SessionBinding> {
-		const existing = await this.inspect(input);
-		if (!existing || existing.deleted || existing.repo !== input.repo)
+		const existing = this.#inspections.get(input.sessionId)?.session ?? (await this.inspect(input));
+		if (!existing || existing.deleted || existing.repo !== canonicalSessionPath(input.repo))
 			throw new Error(`cannot resume session ${input.sessionId}: saved authority is unavailable`);
 		if (!existing.live) {
 			parseEnvelope(
@@ -451,7 +441,7 @@ export class BrokerSessionPort implements SessionPort {
 				"session.resume",
 			);
 			const resumed = await this.inspect(input);
-			if (!resumed || resumed.deleted || !resumed.live || resumed.repo !== input.repo)
+			if (!resumed || resumed.deleted || !resumed.live || resumed.repo !== canonicalSessionPath(input.repo))
 				throw new Error(`session.resume did not restore live authority for ${input.sessionId}`);
 		}
 		return { sessionId: input.sessionId, originKey: input.originKey, epoch: input.epoch, repo: input.repo };
