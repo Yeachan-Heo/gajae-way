@@ -99,3 +99,40 @@ test("bot authors never get the open-channel free pass; a bot mention still enga
 		true,
 	);
 });
+
+test("bot engagement modes widen messages only for allowlisted bots", () => {
+	const channel = { platform: "discord", kind: "channel", conversationId: "c1" };
+	const trusted = { mentioned: false, group: true, authorId: "sibling-bot", authorIsBot: true } as const;
+	const open: GatewayConfig = {
+		...config,
+		mentionAllowlist: ["sibling-bot"],
+		channels: { c1: { engagement: "open", botEngagement: "open" } },
+	};
+	expect(decideEngagement(channel, trusted, open).engaged).toBe(true);
+	expect(decideEngagement(channel, { ...trusted, authorId: "rogue-bot" }, open).engaged).toBe(false);
+	const replies: GatewayConfig = {
+		...config,
+		mentionAllowlist: ["sibling-bot"],
+		channels: { c1: { engagement: "open", botEngagement: "reply-or-mention" } },
+	};
+	expect(decideEngagement(channel, trusted, replies).engaged).toBe(false);
+	expect(
+		decideEngagement(channel, { ...trusted, replyTo: { messageId: "ours", fromSelf: true } }, replies).engaged,
+	).toBe(true);
+});
+
+test("Discord threads inherit each parent policy field unless directly overridden", () => {
+	const thread = { platform: "discord", kind: "thread", conversationId: "t1", parentId: "c1" };
+	const trusted = { mentioned: false, group: true, authorId: "sibling-bot", authorIsBot: true } as const;
+	const inherited: GatewayConfig = {
+		...config,
+		mentionAllowlist: ["sibling-bot"],
+		channels: { c1: { engagement: "open", botEngagement: "open" }, t1: { engagement: "closed" } },
+	};
+	expect(decideEngagement(thread, trusted, inherited).engaged).toBe(true);
+	const overridden: GatewayConfig = {
+		...inherited,
+		channels: { ...inherited.channels, t1: { botEngagement: "reply-or-mention" } },
+	};
+	expect(decideEngagement(thread, trusted, overridden).engaged).toBe(false);
+});

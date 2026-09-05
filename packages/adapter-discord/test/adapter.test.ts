@@ -29,11 +29,20 @@ test("loads and trims the token credential file without exposing its value", asy
 		await writeFile(join(home, "token"), " secret-token \n");
 		await writeFile(
 			join(home, "adapter-discord.json"),
-			JSON.stringify({ tokenFile: "token", channels: { c: { engagement: "open" } } }),
+			JSON.stringify({
+				tokenFile: "token",
+				channels: { c: { engagement: "open", botEngagement: "reply-or-mention" } },
+			}),
 		);
 		const config = await loadDiscordAdapterConfig({ GAJAEWAY_HOME: home });
 		expect(config.token).toBe("secret-token");
 		expect(config.tokenFile).toBe(join(home, "token"));
+		expect(config.channels?.c?.botEngagement).toBe("reply-or-mention");
+		await writeFile(
+			join(home, "adapter-discord.json"),
+			JSON.stringify({ tokenFile: "token", channels: { c: { botEngagement: "everyone" } } }),
+		);
+		await expect(loadDiscordAdapterConfig({ GAJAEWAY_HOME: home })).rejects.toThrow(/botEngagement/);
 		await writeFile(join(home, "adapter-discord.json"), "{}");
 		await expect(loadDiscordAdapterConfig({ GAJAEWAY_HOME: home })).rejects.toBeInstanceOf(DiscordAdapterStartupError);
 	} finally {

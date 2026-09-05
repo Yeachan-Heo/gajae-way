@@ -2,6 +2,7 @@ import { afterAll, beforeAll, expect, test } from "bun:test";
 import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import type { DiscordChannelPolicy } from "../src/config";
 import type { DiscordInboundMessage } from "../src/main";
 import { decideInbound, LruSet, monitorFailureDecision, ReconnectingGateway } from "../src/main";
 import {
@@ -89,7 +90,7 @@ function fakeGateway() {
 function wiredDeliver(
 	gateway: ReturnType<typeof fakeGateway>,
 	lru: LruSet,
-	channels?: Record<string, { engagement?: "open" }>,
+	channels?: Record<string, DiscordChannelPolicy>,
 ) {
 	return async (m: ReturnType<typeof message>) => {
 		if (!lru.addIfAbsent(m.id)) return "duplicate";
@@ -172,6 +173,18 @@ test("other-bot mention stays context-only and never triggers engagement", async
 	const channel = fakeChannel([message("300", { content: "hey <@999> do a thing", mentions: { has: () => false } })]);
 	await recoverConversation(channel, { nowMs: 0, deliver: wiredDeliver(gateway, lru) });
 	expect((gateway.sent[0].engagement as { mentioned: boolean }).mentioned).toBe(false);
+});
+
+test("recovery applies the same explicit bot engagement policy as live ingress", async () => {
+	const gateway = fakeGateway();
+	const lru = new LruSet();
+	const otherBot = message("350", { author: { id: "other-bot", bot: true }, mentions: { has: () => false } });
+	await recoverConversation(fakeChannel([otherBot]), {
+		nowMs: 0,
+		deliver: wiredDeliver(gateway, lru, { "channel-1": { engagement: "open", botEngagement: "open" } }),
+	});
+	expect(gateway.sent).toHaveLength(1);
+	expect((gateway.sent[0].engagement as { mentioned: boolean }).mentioned).toBe(true);
 });
 
 test("live/backfill race delivers exactly once by message id", async () => {

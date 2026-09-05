@@ -55,7 +55,7 @@ Use `config.json` schema version 1. Every configured secret is a credential-file
     "discord": { "credentialFile": "/Users/me/gajaeway/secrets/discord-token" },
     "telegram": { "credentialFile": "/Users/me/gajaeway/secrets/telegram-token" }
   },
-  "channels": { "discord-channel-id": { "engagement": "open" } },
+  "channels": { "discord-channel-id": { "engagement": "open", "botEngagement": "reply-or-mention" } },
   "webhook": { "bind": "127.0.0.1", "port": 8080, "exposeNonLoopback": false },
   "watcherRoots": ["/Users/me/automations"],
   "scriptRoot": "/Users/me/automations",
@@ -84,9 +84,11 @@ The Discord adapter has a separate `$GAJAEWAY_HOME/adapter-discord.json` because
 {
   "tokenFile": "/Users/me/gajaeway/secrets/discord-token",
   "gatewaySocket": "/Users/me/gajaeway/gateway.sock",
-  "channels": { "discord-channel-id": { "engagement": "open" } }
+  "channels": { "discord-channel-id": { "engagement": "open", "botEngagement": "reply-or-mention" } }
 }
 ```
+
+`botEngagement` is opt-in and must match in the gateway and Discord adapter channel maps. `reply-or-mention` admits an allowlisted bot only when it mentions this bot or sends a native Discord reply to this bot; `open` admits every message from an allowlisted bot in that channel. Threads inherit each field from their configured parent and may override individual fields by thread id. The sending bot must still appear in the gateway `mentionAllowlist`; own-bot messages are always dropped. This keeps collaboration bounded by channel, author, and message-id dedupe rather than globally opening bot-to-bot turns.
 
 Keep token files out of version control and restrict their permissions. Replace a token file and restart the relevant service to rotate it.
 

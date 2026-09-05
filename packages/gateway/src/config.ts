@@ -89,6 +89,9 @@ export type EngagementGate = (typeof ENGAGEMENT_GATES)[number];
 export const DM_POLICIES = ["owner-only", "allowlist", "open"] as const;
 export type DmPolicy = (typeof DM_POLICIES)[number];
 
+export const BOT_ENGAGEMENT_MODES = ["reply-or-mention", "open"] as const;
+export type BotEngagementMode = (typeof BOT_ENGAGEMENT_MODES)[number];
+
 export interface ChannelPolicy {
 	/**
 	 * Which gate this channel is on. Explicit, because the previous two-state
@@ -100,6 +103,8 @@ export interface ChannelPolicy {
 	 * - `closed`: mention required AND the author must be allowlisted
 	 */
 	readonly engagement?: EngagementGate;
+	/** Bot turns remain allowlisted; this only widens which allowlisted bot messages engage. */
+	readonly botEngagement?: BotEngagementMode;
 }
 
 export interface ConfigOverrides {
@@ -215,16 +220,22 @@ function parseChannels(value: unknown): Readonly<Record<string, ChannelPolicy>> 
 				"config_invalid",
 				`channels.${conversationId}.engagement must be one of ${ENGAGEMENT_GATES.join(", ")}`,
 			);
+		if (item.botEngagement !== undefined && !BOT_ENGAGEMENT_MODES.includes(item.botEngagement as BotEngagementMode))
+			throw new ConfigError(
+				"config_invalid",
+				`channels.${conversationId}.botEngagement must be one of ${BOT_ENGAGEMENT_MODES.join(", ")}`,
+			);
 		for (const removed of ["debounceMs", "settleWindowMs"] as const)
 			if (item[removed] !== undefined)
 				throw new ConfigError(
 					"config_invalid",
 					`channels.${conversationId}.${removed} was removed: every message is steered or sent immediately; delete it from the configuration`,
 				);
-		if (Object.keys(item).some((key) => key !== "engagement"))
+		if (Object.keys(item).some((key) => key !== "engagement" && key !== "botEngagement"))
 			throw new ConfigError("config_invalid", `channels.${conversationId} contains an unknown field`);
 		channels[conversationId] = {
 			...(item.engagement === undefined ? {} : { engagement: item.engagement as EngagementGate }),
+			...(item.botEngagement === undefined ? {} : { botEngagement: item.botEngagement as BotEngagementMode }),
 		};
 	}
 	return channels;

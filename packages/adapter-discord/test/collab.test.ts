@@ -3,6 +3,8 @@ import { decideInbound } from "../src/main";
 
 const SELF = { id: "self-bot" };
 const OPEN = { "chan-1": { engagement: "open" as const } };
+const BOT_OPEN = { "chan-1": { engagement: "open" as const, botEngagement: "open" as const } };
+const BOT_REPLY = { "chan-1": { engagement: "open" as const, botEngagement: "reply-or-mention" as const } };
 const channel = (id = "chan-1") => ({ id, type: 0 });
 const dmChannel = { id: "dm-1", type: 1 };
 
@@ -41,6 +43,44 @@ test("a bot that explicitly mentions us still earns a turn", () => {
 		OPEN,
 	);
 	expect(decision?.mentioned).toBe(true);
+});
+
+test("bot open explicitly promotes other bots but never our own bot", () => {
+	expect(decideInbound(message({ author: { id: "other-bot", bot: true } }), SELF, BOT_OPEN)?.mentioned).toBe(true);
+	expect(decideInbound(message({ author: { id: "self-bot", bot: true } }), SELF, BOT_OPEN)).toBeUndefined();
+});
+
+test("reply-or-mention promotes only a resolved native reply to us", () => {
+	const reply = {
+		author: { id: "other-bot", bot: true },
+		reference: { messageId: "parent" },
+		mentions: { repliedUser: { id: "self-bot" } },
+	};
+	expect(decideInbound(message(reply), SELF, BOT_REPLY)?.mentioned).toBe(true);
+	expect(
+		decideInbound(message({ ...reply, mentions: { repliedUser: { id: "someone-else" } } }), SELF, BOT_REPLY)?.mentioned,
+	).toBe(false);
+	expect(
+		decideInbound(
+			message({ author: { id: "other-bot", bot: true }, reference: { messageId: "unknown" } }),
+			SELF,
+			BOT_REPLY,
+		)?.mentioned,
+	).toBe(false);
+});
+
+test("threads inherit parent bot policy and may override it field-by-field", () => {
+	const inThread = message({
+		author: { id: "other-bot", bot: true },
+		channel: { id: "thread-1", parentId: "chan-1", isThread: () => true },
+	});
+	expect(decideInbound(inThread, SELF, BOT_OPEN)?.mentioned).toBe(true);
+	expect(
+		decideInbound(inThread, SELF, {
+			...BOT_OPEN,
+			"thread-1": { botEngagement: "reply-or-mention" },
+		})?.mentioned,
+	).toBe(false);
 });
 
 test("outside an open channel a human still needs to mention us", () => {

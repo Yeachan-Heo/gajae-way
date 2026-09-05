@@ -2,7 +2,12 @@ import type { EngagementContext } from "@gajaeway/protocol";
 import type { GatewayConfig } from "../config";
 
 export function decideEngagement(
-	origin: { readonly platform: string; readonly kind: string; readonly conversationId: string },
+	origin: {
+		readonly platform: string;
+		readonly kind: string;
+		readonly conversationId: string;
+		readonly parentId?: string;
+	},
 	engagement: EngagementContext | undefined,
 	config: GatewayConfig,
 ): { readonly engaged: boolean } {
@@ -14,34 +19,46 @@ export function decideEngagement(
 	// bot could reach a full persona turn, with its tool authority, unseen.
 	if (origin.kind === "dm") return { engaged: dmEngaged(engagement, config) };
 	if (!engagement?.group) return { engaged: false };
-	const configured =
-		config.channels?.[`${origin.platform}:${origin.conversationId}`] ??
-		(origin.platform === "discord" ? config.channels?.[origin.conversationId] : undefined);
-	// Three explicit gates. The previous shape had two states and the second one
-	// silently changed meaning depending on whether `mentionAllowlist` happened to
-	// be populated - a security-relevant setting flipping on the presence of an
-	// unrelated field. Unset now means `closed`, the safe default.
-	//
-	// Bot authors never get the free pass an `open` channel gives humans: every bot
-	// status/progress/chatter message was burning a full serialized gjc turn, which
-	// queued real owner messages behind minutes of noise (live finding: 67% of
-	// inbound was sibling-bot chatter). A bot must mention us to get a turn; its
-	// message stays recorded as unread context either way.
+	const configured = channelPolicy(origin, config);
 	const gate = configured?.engagement ?? "closed";
-	if (gate === "open" && !engagement.authorIsBot) return { engaged: true };
+	if (engagement.authorIsBot) {
+		// Bot collaboration is always bounded by the existing author allowlist. Per-channel
+		// botEngagement widens WHICH messages from trusted bots engage, never WHICH bots.
+		if (!authorAllowed(engagement.authorId, config)) return { engaged: false };
+		if (configured?.botEngagement === "open") return { engaged: true };
+		if (
+			configured?.botEngagement === "reply-or-mention" &&
+			(engagement.mentioned || engagement.replyTo?.fromSelf === true)
+		)
+			return { engaged: true };
+		return { engaged: engagement.mentioned };
+	}
+	if (gate === "open") return { engaged: true };
 	if (!engagement.mentioned) return { engaged: false };
-	// `open-mention-only`: anyone may address the persona, but only by addressing it.
+	// `open-mention-only`: any human may address the persona explicitly.
 	if (gate === "open-mention-only") return { engaged: true };
-	// `closed` (and `open` for a bot author): addressed AND authorised. An empty
-	// allowlist means owner-only rather than everyone - the previous code fell
-	// through to "anyone who mentions us", which is the opposite of failing closed.
+	return { engaged: authorAllowed(engagement.authorId, config) };
+}
+
+function channelPolicy(
+	origin: { readonly platform: string; readonly conversationId: string; readonly parentId?: string },
+	config: GatewayConfig,
+) {
+	const byId = (conversationId: string) =>
+		config.channels?.[`${origin.platform}:${conversationId}`] ??
+		(origin.platform === "discord" ? config.channels?.[conversationId] : undefined);
+	const direct = byId(origin.conversationId);
+	const parent = origin.platform === "discord" && origin.parentId ? byId(origin.parentId) : undefined;
+	return parent || direct ? { ...parent, ...direct } : undefined;
+}
+
+function authorAllowed(authorId: string, config: GatewayConfig): boolean {
 	const allowlist = config.mentionAllowlist;
 	if (!allowlist || allowlist.length === 0) {
 		const ownerId = ownerPeerId(config);
-		return { engaged: ownerId !== undefined && engagement.authorId === ownerId };
+		return ownerId !== undefined && authorId === ownerId;
 	}
-	if (!allowlist.includes(engagement.authorId)) return { engaged: false };
-	return { engaged: true };
+	return allowlist.includes(authorId);
 }
 
 function ownerPeerId(config: GatewayConfig): string | undefined {

@@ -53,11 +53,19 @@ export interface LoadedDiscordVoiceConfig extends DiscordVoiceConfig {
 	readonly apiKey: string;
 }
 
+export const DISCORD_BOT_ENGAGEMENT_MODES = ["reply-or-mention", "open"] as const;
+export type DiscordBotEngagement = (typeof DISCORD_BOT_ENGAGEMENT_MODES)[number];
+
+export interface DiscordChannelPolicy {
+	readonly engagement?: "open";
+	readonly botEngagement?: DiscordBotEngagement;
+}
+
 export interface DiscordAdapterConfig {
 	readonly tokenFile: string;
 	readonly gatewaySocket?: string;
 	readonly intents?: readonly number[];
-	readonly channels?: Readonly<Record<string, { readonly engagement?: "open" }>>;
+	readonly channels?: Readonly<Record<string, DiscordChannelPolicy>>;
 	readonly voice?: DiscordVoiceConfig;
 }
 
@@ -105,7 +113,9 @@ export async function loadDiscordAdapterConfig(
 		throw new DiscordAdapterStartupError("Discord adapter intents must be an array of integer intent values.");
 	}
 	if (raw.channels !== undefined && !validChannels(raw.channels)) {
-		throw new DiscordAdapterStartupError('Discord adapter channels entries may only set engagement to "open".');
+		throw new DiscordAdapterStartupError(
+			'Discord adapter channels entries may only set engagement to "open" and botEngagement to "reply-or-mention" or "open".',
+		);
 	}
 	const tokenFile = isAbsolute(raw.tokenFile) ? raw.tokenFile : resolve(dirname(configPath), raw.tokenFile);
 	let token: string;
@@ -175,11 +185,16 @@ function isObject(value: unknown): value is Record<string, unknown> {
 	return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
-function validChannels(value: unknown): value is Record<string, { readonly engagement?: "open" }> {
+function validChannels(value: unknown): value is Record<string, DiscordChannelPolicy> {
 	return (
 		isObject(value) &&
 		Object.values(value).every(
-			(entry) => isObject(entry) && (entry.engagement === undefined || entry.engagement === "open"),
+			(entry) =>
+				isObject(entry) &&
+				Object.keys(entry).every((key) => key === "engagement" || key === "botEngagement") &&
+				(entry.engagement === undefined || entry.engagement === "open") &&
+				(entry.botEngagement === undefined ||
+					DISCORD_BOT_ENGAGEMENT_MODES.includes(entry.botEngagement as DiscordBotEngagement)),
 		)
 	);
 }

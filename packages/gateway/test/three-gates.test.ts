@@ -179,3 +179,14 @@ describe("config validation", () => {
 		}
 	});
 });
+
+test("botEngagement accepts only explicit safe modes", async () => {
+	const { BOT_ENGAGEMENT_MODES, parseConfigFile } = await import("../src/config");
+	for (const mode of BOT_ENGAGEMENT_MODES) {
+		const parsed = parseConfigFile({ schemaVersion: SCHEMA, channels: { c1: { botEngagement: mode } } });
+		expect(parsed.channels?.c1?.botEngagement).toBe(mode);
+	}
+	expect(() => parseConfigFile({ schemaVersion: SCHEMA, channels: { c1: { botEngagement: "everyone" } } })).toThrow(
+		/botEngagement must be one of reply-or-mention, open/,
+	);
+});
