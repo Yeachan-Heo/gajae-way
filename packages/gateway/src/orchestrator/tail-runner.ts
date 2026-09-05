@@ -24,9 +24,11 @@ export type TailEventKind = (typeof OBSERVED_TAIL_KINDS)[number] | "unknown";
 export interface TailFrame {
 	readonly kind: TailEventKind;
 	readonly rawKind: string;
+	/** Authoritative runtime revision; generation/seq are revision-local. */
+	readonly revision?: number;
 	readonly generation?: number;
 	readonly seq?: number;
-	/** Stable only when the runtime supplied id or generation+seq. Never invent an identity for delivery. */
+	/** Stable provider IDs are preserved; runtime coordinates require revision qualification. */
 	readonly eventId?: string;
 	readonly payload: Record<string, unknown>;
 	readonly assistantText?: string;
@@ -343,7 +345,7 @@ class ManagedTailHandle implements TailHandle {
 	#flush: Promise<void> = Promise.resolve();
 	#closed = false;
 	#pausedForGap = false;
-	/** Set once a frame's side effect failed: no later checkpoint may commit past the lost frame. */
+	/** Set once a frame fails delivery or identity validation; no later checkpoint may commit past it. */
 	#deliveryFailed = false;
 	#running = false;
 	#polling = false;
@@ -539,11 +541,18 @@ class ManagedTailHandle implements TailHandle {
 	readonly #deliveredIds = new Set<string>();
 
 	async #deliver(frame: TailFrame): Promise<void> {
+		if (frame.assistantText && !frame.steerEcho && !hasDeliveryIdentity(frame)) {
+			this.#deliveryFailed = true;
+			this.#input.onDiagnostic?.(
+				`tail_frame_rejected session=${this.sessionId} code=missing_revision_qualified_identity kind=${frame.kind} revision=${frame.revision ?? "missing"}`,
+			);
+			return;
+		}
 		// Finalized answers are also keyed by messageRef so a backfill transcript row
 		// and the live turn_stream frame for the same answer never both deliver.
-		// gjc 0.16 synthesizes `generation:seq` ids that restart per revision, so
-		// every turn's first answer is "1:1": never a dedupe key. Only a real id
-		// or the answer text counts, and only within the current accepted turn.
+		// Runtime coordinates are revision-qualified because generation:seq restarts
+		// for every revision. Only a stable provider id, a revision-qualified
+		// coordinate, or the answer text counts within the current accepted turn.
 		const synthetic = frame.eventId !== undefined && /^\d+:\d+$/.test(frame.eventId);
 		const key =
 			frame.eventId && !synthetic
@@ -739,19 +748,30 @@ export function decodeStreamLine(line: string): readonly TailFrame[] {
 	const frame = recordOf(parsed);
 	if (!frame || typeof frame.type !== "string") return [];
 	if (frame.type === "hello" || frame.type === "pong") return [];
-	const { type, generation, seq, id, ...payload } = frame;
+	const { type, revision, generation, seq, id, ...payload } = frame;
 	if (type === "event" && typeof frame.kind === "string") {
-		// Ring-projected events carry kind/payload/generation/seq already.
-		return normalizeTailFrame({ kind: frame.kind, payload: recordOf(frame.payload) ?? payload, generation, seq, id });
+		// Ring-projected events carry kind/payload/revision/generation/seq already.
+		return normalizeTailFrame({
+			kind: frame.kind,
+			payload: recordOf(frame.payload) ?? payload,
+			revision,
+			generation,
+			seq,
+			id,
+		});
 	}
 	if (type === "turn_stream") {
 		// A finalized assistant answer is the live equivalent of an assistant
 		// transcript row; partial phases are progress only.
 		if (payload.phase === "finalized" && typeof payload.text === "string" && payload.text.length > 0) {
 			const ref = typeof payload.messageRef === "string" ? payload.messageRef : undefined;
+			const stableId = ref ? `turn_stream:${ref}` : typeof id === "string" ? id : undefined;
 			return normalizeTailFrame({
 				kind: "transcript",
-				...(ref ? { id: `turn_stream:${ref}` } : {}),
+				...(stableId ? { id: stableId } : {}),
+				revision,
+				generation,
+				seq,
 				payload: {
 					role: "assistant",
 					content: [{ type: "text", text: payload.text }],
@@ -759,11 +779,18 @@ export function decodeStreamLine(line: string): readonly TailFrame[] {
 				},
 			});
 		}
-		return normalizeTailFrame({ kind: "turn_stream", payload });
+		return normalizeTailFrame({ kind: "turn_stream", payload, revision, generation, seq, id });
 	}
 	const turnId = typeof payload.turnId === "string" ? payload.turnId : undefined;
 	const stableId = typeof id === "string" ? id : turnId ? `${type}:${turnId}` : undefined;
-	return normalizeTailFrame({ kind: type, payload, ...(stableId ? { id: stableId } : {}), generation, seq });
+	return normalizeTailFrame({
+		kind: type,
+		payload,
+		...(stableId ? { id: stableId } : {}),
+		revision,
+		generation,
+		seq,
+	});
 }
 
 function normalizeTailFrame(value: unknown): readonly TailFrame[] {
@@ -772,14 +799,24 @@ function normalizeTailFrame(value: unknown): readonly TailFrame[] {
 	const payload = recordOf(item.payload) ?? {};
 	const rawKind = item.kind;
 	const kind: TailEventKind = OBSERVED_TAIL_KIND_SET.has(rawKind) ? (rawKind as TailEventKind) : "unknown";
-	const generation = typeof item.generation === "number" ? item.generation : undefined;
-	const seq = typeof item.seq === "number" ? item.seq : undefined;
+	const revision = nonNegativeSafeInteger(item.revision) ? item.revision : undefined;
+	const generation = nonNegativeSafeInteger(item.generation) ? item.generation : undefined;
+	const seq = nonNegativeSafeInteger(item.seq) ? item.seq : undefined;
+	const suppliedId = typeof item.id === "string" && item.id.length > 0 ? item.id : undefined;
+	const syntheticMatch = suppliedId?.match(/^(\d+):(\d+)$/);
+	const coordinateGeneration = generation ?? (syntheticMatch ? Number(syntheticMatch[1]) : undefined);
+	const coordinateSeq = seq ?? (syntheticMatch ? Number(syntheticMatch[2]) : undefined);
+	const synthetic =
+		syntheticMatch !== undefined || (suppliedId === undefined && generation !== undefined && seq !== undefined);
 	const id =
-		typeof item.id === "string" && item.id.length > 0
-			? item.id
-			: generation !== undefined && seq !== undefined
-				? `${generation}:${seq}`
-				: undefined;
+		synthetic &&
+		revision !== undefined &&
+		nonNegativeSafeInteger(coordinateGeneration) &&
+		nonNegativeSafeInteger(coordinateSeq)
+			? `${revision}:${coordinateGeneration}:${coordinateSeq}`
+			: synthetic
+				? undefined
+				: suppliedId;
 	const transcriptText =
 		rawKind === "transcript" && payload.role === "assistant" ? contentText(payload.content) : undefined;
 	// Current GJC hosts emit the live/final assistant channel as turn_stream.
@@ -804,6 +841,7 @@ function normalizeTailFrame(value: unknown): readonly TailFrame[] {
 		{
 			kind,
 			rawKind,
+			...(revision === undefined ? {} : { revision }),
 			...(generation === undefined ? {} : { generation }),
 			...(seq === undefined ? {} : { seq }),
 			...(id === undefined ? {} : { eventId: id }),
@@ -826,6 +864,14 @@ function contentText(content: unknown): string | undefined {
 	return parts.join("");
 }
 
+function hasDeliveryIdentity(frame: TailFrame): boolean {
+	const id = frame.eventId;
+	if (!id) return false;
+	if (/^\d+:\d+$/.test(id)) return false;
+	if (/^\d+:\d+:\d+$/.test(id)) return frame.revision !== undefined;
+	return true;
+}
+
 export function tailOperationRef(frame: TailFrame): string | undefined {
 	for (const value of [frame.payload.opRef, frame.payload.operationRef, frame.payload.clientRef])
 		if (typeof value === "string" && value.length > 0) return value;
@@ -846,6 +892,10 @@ export function tailFrameTimestampMs(frame: TailFrame): number | undefined {
 
 function validResyncCoordinate(value: TailResyncCoordinate): boolean {
 	return [value.revision, value.generation, value.seq].every((part) => Number.isSafeInteger(part) && part >= 0);
+}
+
+function nonNegativeSafeInteger(value: unknown): value is number {
+	return typeof value === "number" && Number.isSafeInteger(value) && value >= 0;
 }
 
 function opaqueCursorOf(payload: Record<string, unknown>): string | undefined {

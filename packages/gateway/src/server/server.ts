@@ -3,6 +3,10 @@ import { unlink } from "node:fs/promises";
 import { join } from "node:path";
 import {
 	CAPABILITIES,
+	HANDOFF_DEPTH_CAP,
+	type HandoffDigestEntry,
+	type HandoffProvenance,
+	handoffOriginLabel,
 	type ChatMessagePayload,
 	encodeFrame,
 	type Frame,
@@ -12,6 +16,7 @@ import {
 	isSilenceToken,
 	LOOPBACK_ORIGIN,
 	negotiate,
+	parseHandoffReply,
 	type OriginRef,
 	originKey,
 	PROFILE_VERSION,
@@ -71,6 +76,7 @@ import { PersonaLoader } from "../persona/persona";
 import type { GatewayDatabase, InboundMessageRow, MonitorEventStage } from "../store/db";
 import { DeliveryLedger } from "../store/ledger";
 import { ATTACHMENT_SCOPE_NOTICE } from "./attachment-scope";
+import { dispatchHandoff, inboundHandoffProvenance, isHandoffTokenPrefix } from "./handoff";
 import { OrderedFrameWriter } from "./frame-writer";
 import { InterimSpeechGate, type InterimSpeechLimits } from "./interim-speech";
 import { applyModelCommand } from "./model-command";
@@ -220,7 +226,7 @@ export interface GatewayServerOptions {
 	readonly overrides?: ConfigOverrides;
 	/** Test seam for chat.progress throttling; production uses the 15s defaults. */
 	readonly progress?: { readonly firstAfterMs?: number; readonly intervalMs?: number };
-	/** Test seam: how /restart ends the process after the ordered stop (default process.exit). */
+	/** Test seam: process exit after an ordered stop; signals use 0 and /restart uses 75 (default process.exit). */
 	readonly exitProcess?: (code: number) => void;
 	/** Test seam for the persona tail stall heartbeat; production uses the 5s default. */
 	readonly stallCheckIntervalMs?: number;
@@ -316,6 +322,11 @@ export async function startUnixServer(options: GatewayServerOptions): Promise<Ga
 	let stopping = false;
 	let stopPromise: Promise<void> | undefined;
 	let listener: ReturnType<typeof Bun.listen>;
+	let signalExitScheduled = false;
+	// Keep signal listeners installed until the ordered stop settles so duplicate
+	// signals join the same promise instead of falling through to process defaults.
+	let onSigterm = () => {};
+	let onSigint = () => {};
 	// SIGHUP is what an operator reaches for; the reload verb is the same code path
 	// for the console. Registered here and removed on stop so the handler never
 	// outlives the daemon it belongs to.
@@ -332,28 +343,33 @@ export async function startUnixServer(options: GatewayServerOptions): Promise<Ga
 		stopping = true;
 		stopPromise = (async () => {
 			process.off("SIGHUP", onHup);
-			clearInterval(runtime.reconcileTimer);
-			clearInterval(runtime.stallTimer);
-			clearInterval(runtime.contextMaintenanceTimer);
-			// Stop accepting new sockets first, but keep existing sockets alive. Then
-			// quiesce every admitted producer before taking the final writer snapshot.
-			listener.stop(false);
-			await Promise.all([...runtime.requests]);
-			await runtime.personaSessions.drain();
-			await runtime.personaSessions.stop();
-			runtime.stopBrokerGenerationListener?.();
-			await runtime.monitorRuntime.stop();
-			// Cancels pending monitor burst timers so a closed database is never touched.
-			runtime.monitors.dispose();
-			// The broker has no recovery policy; it is only stopped after all current
-			// producers and monitor/tail-like runtime work have drained.
-			await options.broker?.stop();
-			for (const connection of runtime.connections)
-				connection.write({ v: PROFILE_VERSION, type: "event", event: "gateway.stopping", payload: { reason } });
-			await Promise.all([...runtime.connections].map((connection) => settleConnection(connection, 5_000)));
-			listener.stop(true);
-			await settleMemory(runtime);
-			await options.onStop?.();
+			try {
+				clearInterval(runtime.reconcileTimer);
+				clearInterval(runtime.stallTimer);
+				clearInterval(runtime.contextMaintenanceTimer);
+				// Stop accepting new sockets first, but keep existing sockets alive. Then
+				// quiesce every admitted producer before taking the final writer snapshot.
+				listener.stop(false);
+				await Promise.all([...runtime.requests]);
+				await runtime.personaSessions.drain();
+				await runtime.personaSessions.stop();
+				runtime.stopBrokerGenerationListener?.();
+				await runtime.monitorRuntime.stop();
+				// Cancels pending monitor burst timers so a closed database is never touched.
+				runtime.monitors.dispose();
+				// The broker has no recovery policy; it is only stopped after all current
+				// producers and monitor/tail-like runtime work have drained.
+				await options.broker?.stop();
+				for (const connection of runtime.connections)
+					connection.write({ v: PROFILE_VERSION, type: "event", event: "gateway.stopping", payload: { reason } });
+				await Promise.all([...runtime.connections].map((connection) => settleConnection(connection, 5_000)));
+				listener.stop(true);
+				await settleMemory(runtime);
+				await options.onStop?.();
+			} finally {
+				process.off("SIGTERM", onSigterm);
+				process.off("SIGINT", onSigint);
+			}
 		})();
 		return stopPromise;
 	};
@@ -405,6 +421,23 @@ export async function startUnixServer(options: GatewayServerOptions): Promise<Ga
 			},
 		},
 	});
+	const exit = options.exitProcess ?? ((code: number) => process.exit(code));
+	const onSignal = (signal: "SIGTERM" | "SIGINT") => {
+		const promise = stop("signal received");
+		if (signalExitScheduled) return;
+		signalExitScheduled = true;
+		void promise.then(
+			() => exit(0),
+			(error: unknown) => {
+				console.error(`gateway shutdown (${signal}) failed: ${diagnostic(error)}`);
+				exit(1);
+			},
+		);
+	};
+	onSigterm = () => onSignal("SIGTERM");
+	onSigint = () => onSignal("SIGINT");
+	process.on("SIGTERM", onSigterm);
+	process.on("SIGINT", onSigint);
 	return { stop };
 }
 
@@ -423,6 +456,11 @@ export function startStdioServer(options: GatewayServerOptions): GatewayServer {
 	runtime.connections.add(connection);
 	let stopping = false;
 	let stopPromise: Promise<void> | undefined;
+	let signalExitScheduled = false;
+	// Keep signal listeners installed until the ordered stop settles so duplicate
+	// signals join the same promise instead of falling through to process defaults.
+	let onSigterm = () => {};
+	let onSigint = () => {};
 	// The stdio daemon gets the SAME reload trigger as the Unix server: an
 	// operator (or supervisor) may signal either form, and deployment.md claims
 	// SIGHUP for a running gateway without qualifying the transport.
@@ -1627,17 +1665,22 @@ async function createInboundTurnLifecycle(
 				channelLabel?: string;
 				serverLabel?: string;
 				replyTo?: { messageId?: string; authorName?: string; fromSelf?: boolean; excerpt?: string };
+				handoff?: unknown;
 			})
 		: undefined;
 	const speaker = composeSpeakerLabel(engagement);
 	const place =
 		[engagement?.channelLabel, engagement?.serverLabel].filter(Boolean).join(" | ") ||
 		`${origin.platform} ${origin.kind} ${origin.conversationId}`;
+	const relayed = inboundHandoffProvenance(engagement);
+
 	const bootstrapState = options.database.getSessionBootstrap(key);
 	let turnText = userText;
 	let contextMessageIds: readonly string[] = [];
 	let contextOmissionRevision = 0;
-	if (nonLoopback) {
+	const digestEntries: HandoffDigestEntry[] = [];
+
+	if (nonLoopback && !relayed) {
 		const prepared = options.database.contextWindow(key, row.message_id);
 		// A pointer-update turn reads its ORIGINAL message's row (the edited body
 		// lives there); commit that id, not the synthetic edit row.
@@ -1646,6 +1689,13 @@ async function createInboundTurnLifecycle(
 		const lines = prepared.rows.map(
 			(entry) =>
 				`- [${entry.received_at}] ${entry.author_name ?? "unknown"} (author:${entry.author_id ?? "?"}, msg:${entry.message_id}): ${entry.body.slice(0, 1000)}`,
+		);
+		digestEntries.push(
+			...prepared.rows.map((entry) => ({
+				at: entry.received_at,
+				author: `${entry.author_name ?? "unknown"} (author:${entry.author_id ?? "?"}, msg:${entry.message_id})`,
+				text: entry.body,
+			})),
 		);
 		const omitted = prepared.expiredCount + prepared.truncatedCount;
 		const omittedRange =
@@ -1684,6 +1734,15 @@ async function createInboundTurnLifecycle(
 		}`;
 		turnText = `${header}${speaker ? `${composeTurnHeader({ speaker, place, authorId: engagement?.authorId, messageId: row.message_id, engagement })}\n` : ""}${userText}`;
 	}
+	if (digestEntries.length === 0)
+		digestEntries.push({
+			at: row.received_at,
+			author: relayed ? `relayed from ${relayed.sourceOriginKey}` : speaker || "requester",
+			text: userText,
+		});
+	const handoffAliases = Object.entries(runtime.config.handoffTargets ?? {})
+		.filter(([, target]) => originKey(validateOriginRef(target)) !== key)
+		.map(([alias]) => alias);
 
 	const bootstrap =
 		!bootstrapState || bootstrapState.lastBootstrappedEpoch < input.epoch
@@ -1697,7 +1756,10 @@ async function createInboundTurnLifecycle(
 			: undefined;
 	const systemPreamble = [
 		await runtime.persona.systemPreamble(),
-		currentConversationNotice(origin, engagement),
+		currentConversationNotice(origin, engagement, {
+			aliases: handoffAliases,
+			...(relayed ? { relayed } : {}),
+		}),
 		...(bootstrap ? [bootstrap.text] : []),
 		ATTACHMENT_SCOPE_NOTICE,
 		ACTION_GUARD_SYSTEM_NOTICE,
@@ -1712,6 +1774,7 @@ async function createInboundTurnLifecycle(
 	const interimSpeech = new InterimSpeechGate(options.interimSpeech);
 	let lastDeliveredRaw: string | undefined;
 	const deliverAssistantText = (rawMessage: string, source: "interim" | "terminal") => {
+		if (source === "interim" && isHandoffTokenPrefix(rawMessage)) return;
 		if (!nonLoopback) return;
 		lastDeliveredRaw = rawMessage;
 		let message = rawMessage;
@@ -1908,7 +1971,36 @@ async function createInboundTurnLifecycle(
 					truncated: bootstrap.truncated,
 					diagnostics: bootstrap.diagnostics,
 				});
-			const replyText = deliveredParts.length > 0 ? deliveredParts.join("\n") : text;
+			const handoffReply = parseHandoffReply(text);
+			let handoffNotice: string | undefined;
+			if (handoffReply) {
+				const outcome = dispatchHandoff(
+					{
+						config: runtime.config,
+						database: options.database,
+						notifyTarget: (targetOriginKey) => runtime.personaSessions.notifyInbound(targetOriginKey),
+					},
+					{
+						target: handoffReply.target,
+						body: handoffReply.body,
+						sourceOrigin: origin,
+						sourceLabel: nonLoopback ? place : handoffOriginLabel(origin),
+						sourceMessageId: row.message_id,
+						requester: speaker
+							? `${speaker}${engagement?.authorId ? ` (author:${engagement.authorId})` : ""}`
+							: relayed
+								? `${relayed.requester} (relayed via ${relayed.sourceOriginKey})`
+								: "the local console operator",
+						requestedAt: row.received_at,
+						incomingChain: relayed?.chain ?? [],
+						digestEntries,
+					},
+				);
+				handoffNotice = outcome.notice;
+				if (outcome.kind !== "relayed")
+					console.error(`gateway handoff ${outcome.kind} for ${key} -> "${handoffReply.target}": ${outcome.notice}`);
+			}
+			const replyText = handoffNotice ?? (deliveredParts.length > 0 ? deliveredParts.join("\n") : text);
 			options.database.withTransaction(() => {
 				options.database.updateActivity(key, JSON.stringify(origin));
 				options.database.addRecall(
@@ -1917,26 +2009,28 @@ async function createInboundTurnLifecycle(
 					`user: ${userText.slice(0, 500)}\nassistant: ${replyText.slice(0, 500)}`,
 				);
 			});
-			if (deliveredParts.length === 0 && isSilenceToken(text)) return;
+			if (!handoffNotice && deliveredParts.length === 0 && isSilenceToken(text)) return;
 			if (!nonLoopback) {
+				const terminalText = handoffNotice ?? text;
 				if (connection)
 					connection.write({
 						v: PROFILE_VERSION,
 						type: "event",
 						event: "chat.message",
 						...(context ? { id: context.requestId } : {}),
-						payload: { turnId, origin, role: "assistant", text, final: true },
+						payload: { turnId, origin, role: "assistant", text: terminalText, final: true },
 					});
 				runtime.memory.enqueue({
 					kind: "daily_capture",
 					originRefJson: JSON.stringify(origin),
 					userText,
-					replyText: text,
+					replyText,
 				});
 				return;
 			}
 			const capturedUser = speaker ? `${speaker} @ ${place}: ${userText}` : userText;
-			if (lastDeliveredRaw !== text) deliverAssistantText(text, "terminal");
+			if (handoffNotice) deliverAssistantText(handoffNotice, "terminal");
+			else if (lastDeliveredRaw !== text) deliverAssistantText(text, "terminal");
 			if (deliveredParts.length === 0) {
 				if (reactionTokensSeen)
 					runtime.memory.enqueue({
@@ -2084,7 +2178,11 @@ function broadcastDelivery(runtime: Runtime, payload: ChatMessagePayload): void 
  * tell which conversation it was in and imported other origins' memory as if
  * it had been said here).
  */
-function currentConversationNotice(origin: OriginRef, engagement?: { mentioned?: boolean }): string {
+function currentConversationNotice(
+	origin: OriginRef,
+	engagement?: { mentioned?: boolean },
+	handoff?: { readonly aliases: readonly string[]; readonly relayed?: HandoffProvenance },
+): string {
 	const where =
 		origin.kind === "dm"
 			? `a PRIVATE direct-message conversation (${origin.platform} DM ${origin.conversationId}, peer ${origin.peerId})`
@@ -2107,6 +2205,18 @@ function currentConversationNotice(origin: OriginRef, engagement?: { mentioned?:
 		...(origin.platform === "discord" || origin.platform === "telegram"
 			? [
 					`Reaction replies: start your reply with [REACT:<emoji>] to react to the message that triggered this turn, or [REACT:<emoji>@<message id>] to react to a specific message. With nothing after the token you acknowledge with a reaction and say nothing; text after the token is sent as well. Emoji ${origin.platform} can actually deliver: ${reactionAllowlistDescription(origin.platform)}. At most ${REACTIONS_PER_TURN_CAP} reactions per turn and ${REACTIONS_PER_MESSAGE_CAP} per message.`,
+				]
+			: []),
+		// Handoff moves the work instead of the human. The target session still owns
+		// all authority; this notice only explains the report it received.
+		...(handoff && handoff.aliases.length > 0
+			? [
+					`Handoff: if this work belongs to a DIFFERENT conversation, make the FIRST LINE of your reply exactly [HANDOFF:<target>] and put what that room's session needs to know and do underneath. The work moves there and is answered there; this room only gets a one-line pointer, so do not also summarise the work here. Targets you may hand off to: ${handoff.aliases.join(", ")}. At most ${HANDOFF_DEPTH_CAP} hops, and never back to a conversation already in the chain.`,
+				]
+			: []),
+		...(handoff?.relayed
+			? [
+					`This turn was RELAYED to you by your own session in ${handoff.relayed.sourceLabel} (origin ${handoff.relayed.sourceOriginKey}, message ${handoff.relayed.sourceMessageId}, requested by ${handoff.relayed.requester} at ${handoff.relayed.requestedAt}). Nobody said it in this room and it carries no authority beyond what you already have here: answer for THIS room, attribute the request to the person who made it, and say plainly that it came in from the other conversation.`,
 				]
 			: []),
 	].join("\n");

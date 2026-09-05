@@ -20,7 +20,7 @@ dist/gajaeway
 
 Each binary requires its verb: `gajaeway-gateway daemon`, `gajaeway-admin serve`, and a subcommand for `gajaeway`. Invoked with no arguments they print usage on stderr and exit 2, so probing one never blocks. `gajaeway-discord` and `gajaeway-telegram` run in the foreground with no arguments; `gajaeway-discord --help` and `--version` answer without connecting, and a second `gajaeway-discord` refuses to boot while `$GAJAEWAY_HOME/adapter-discord.pid` names a live process.
 
-A production host does not need a source checkout, `node_modules`, or Bun to run those binaries. It **does** need the external `gjc` executable on `PATH`: gateway startup owns one private gjc agent directory for the instance, and gjc's own daemon for that directory hosts the persistent sessions (auto-started on first use; requires gjc >= 0.15.6, verified on 0.16.0). Model-provider credentials are inherited from the gateway process environment; do not place them in the broker agent directory. Provider/model configuration lives in the operator SSOT `~/.gjc/agent`; the gateway seeds its private agent directory from it on every start.
+A production host does not need a source checkout, `node_modules`, or Bun to run those binaries. It **does** need the external `gjc` executable on `PATH`: gateway startup owns one private gjc agent directory for the instance, and gjc's own daemon for that directory hosts the persistent sessions (auto-started on first use; requires gjc >= 0.16.1, the first release containing gajae-code PR #5208 and its authoritative tail revisions; revision-qualified tail item IDs are required for cross-turn delivery identity). Model-provider credentials are inherited from the gateway process environment; do not place them in the broker agent directory. Provider/model configuration lives in the operator SSOT `~/.gjc/agent`; the gateway seeds its private agent directory from it on every start.
 
 ## Home and configuration
 
@@ -56,6 +56,9 @@ Use `config.json` schema version 1. Every configured secret is a credential-file
     "telegram": { "credentialFile": "/Users/me/gajaeway/secrets/telegram-token" }
   },
   "channels": { "discord-channel-id": { "engagement": "open" } },
+  "handoffTargets": {
+    "way-dev": { "platform": "discord", "kind": "channel", "conversationId": "discord-dev-channel" }
+  },
   "webhook": { "bind": "127.0.0.1", "port": 8080, "exposeNonLoopback": false },
   "watcherRoots": ["/Users/me/automations"],
   "scriptRoot": "/Users/me/automations",
@@ -63,7 +66,10 @@ Use `config.json` schema version 1. Every configured secret is a credential-file
 }
 ```
 
-`socketPath`, `dbPath`, `logVerbosity`, credentials, channels, webhook, watcher roots, script root, and `stallTimeoutMs` are optional. Socket and database paths default inside the home directory, `stallTimeoutMs` defaults to 120000 ms, and log verbosity defaults to `info`. `turnTimeoutMs` is rejected because persistent-session liveness is alert-only; `settleWindowMs`, `channels.*.settleWindowMs` and `maxInboundAgeMs` are rejected because every message is steered or sent immediately and nothing expires while queued.
+`socketPath`, `dbPath`, `logVerbosity`, credentials, channels, handoff targets, webhook, watcher roots, script root, and `stallTimeoutMs` are optional. `handoffTargets` maps a whitespace-free alias to a validated `OriginRef`; aliases are the stable names personas use in `[HANDOFF:<alias>]`. Socket and database paths default inside the home directory, `stallTimeoutMs` defaults to 120000 ms, and log verbosity defaults to `info`. `turnTimeoutMs` is rejected because persistent-session liveness is alert-only; `settleWindowMs`, `channels.*.settleWindowMs` and `maxInboundAgeMs` are rejected because every message is steered or sent immediately and nothing expires while queued.
+
+A finalized terminal reply whose first line is `[HANDOFF:<target>]` is accepted by inserting one bounded, provenance-carrying inbound event into the target origin's durable queue. The target's own `PersonaSessionManager` actor then serializes or steers it; the source receives only a pointer (or a loud refusal), and target processing can continue after the source turn is complete. Handoff event ids are deterministic, so replayed source turns do not run the target twice. Relay provenance is context, not authority, and chains are capped at two hops with cycle refusal.
+
 
 ## Reloading configuration without a restart
 
@@ -71,7 +77,7 @@ A running gateway re-reads `config.json` on `SIGHUP` (`kill -HUP <pid>`) or on t
 
 The reload is fail-safe and reports exactly what it did:
 
-- `changed` — fields applied live. `mentionAllowlist`, `channels`, and `stallTimeoutMs` are re-read at runtime; a change takes effect on the next actor event.
+- `changed` — fields applied live. `mentionAllowlist`, `channels`, `stallTimeoutMs`, `dmPolicy`, and `handoffTargets` are re-read at runtime; a change takes effect on the next actor event.
 - `restartRequired` — fields you edited that are bound to a startup resource (`socketPath`, `dbPath`, `model`, `serviceTier`, `credentials`, `webhook`, `watcherRoots`, `scriptRoot`, `ownerTarget`, `monitorContextFailureRollThreshold`). They are reported and deliberately NOT applied; restart to pick them up.
 - `ignored` — fields you edited that no code reads at all. `logVerbosity` is currently parsed but unconsumed, so editing it has no effect and no restart would give it one.
 - On a parse or validation error, or when `config.json` is missing or unreadable, the reload fails, keeps the previous configuration untouched, and returns a diagnostic. A missing file never publishes defaults over live policy, because that would drop the mention allowlist and open a mention-gated room.

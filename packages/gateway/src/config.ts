@@ -55,6 +55,13 @@ export interface GatewayConfigFile {
 	/** Default recipient origin for monitor/maintenance notes without their own channel target. */
 	readonly ownerTarget?: { readonly origin: OriginRef };
 	/**
+	 * Named handoff targets (issue #72): alias -> the origin that owns that work.
+	 * A persona writes `[HANDOFF:<alias>]`, not a raw conversation id, so moving
+	 * work between rooms is an operator-auditable binding rather than a string the
+	 * model invented. Reloadable: retargeting a room must not need a daemon restart.
+	 */
+	readonly handoffTargets?: Readonly<Record<string, OriginRef>>;
+	/**
 	 * Consecutive context-class authoring failures (empty response,
 	 * context-length rejection, zero-token completion) before the monitor
 	 * safety net rolls that session — and only when a native-compaction request
@@ -230,6 +237,28 @@ function parseChannels(value: unknown): Readonly<Record<string, ChannelPolicy>> 
 	return channels;
 }
 
+function parseHandoffTargets(value: unknown): Readonly<Record<string, OriginRef>> | undefined {
+	if (value === undefined) return undefined;
+	const input = requireObject(value, "handoffTargets");
+	const targets: Record<string, OriginRef> = {};
+	for (const [alias, origin] of Object.entries(input)) {
+		if (!alias || /\s|\]/.test(alias))
+			throw new ConfigError(
+				"config_invalid",
+				`handoffTargets alias "${alias}" must be non-empty and free of whitespace and "]"`,
+			);
+		try {
+			targets[alias] = validateOriginRef(origin as OriginRef);
+		} catch (error) {
+			throw new ConfigError(
+				"config_invalid",
+				`handoffTargets.${alias} is invalid: ${error instanceof Error ? error.message : String(error)}`,
+			);
+		}
+	}
+	return targets;
+}
+
 function parseStallTimeout(value: unknown): number {
 	if (!Number.isInteger(value) || (value as number) < 1_000 || (value as number) > 3_600_000)
 		throw new ConfigError("config_invalid", "stallTimeoutMs must be an integer between 1000 and 3600000");
@@ -335,6 +364,7 @@ export function parseConfigFile(value: unknown): GatewayConfigFile {
 		...(serviceTier ? { serviceTier } : {}),
 		...(input.dmPolicy === undefined ? {} : { dmPolicy: parseDmPolicy(input.dmPolicy) }),
 		...(input.ownerTarget === undefined ? {} : { ownerTarget: parseOwnerTarget(input.ownerTarget) }),
+		...(input.handoffTargets === undefined ? {} : { handoffTargets: parseHandoffTargets(input.handoffTargets) }),
 		...(input.monitorContextFailureRollThreshold === undefined
 			? {}
 			: {
@@ -437,11 +467,9 @@ export async function reloadConfig(current: GatewayConfig, overrides: ConfigOver
 }
 
 /**
- * Fields genuinely re-read at runtime: `mentionAllowlist` (server.ts chat dispatch +
- * engagement/policy.ts), channels (engagement gates) and `stallTimeoutMs` (tail
- * liveness alarms). Each applies to the next actor event.
+ * Fields genuinely re-read at runtime: `mentionAllowlist` (server.ts chat dispatch + engagement/policy.ts), channels (engagement gates), `stallTimeoutMs` (tail liveness alarms), and `handoffTargets` (server/handoff.ts target binding + handoff guidance in the turn's conversation notice). Each applies to the next actor event.
  */
-export const RELOADABLE_FIELDS = ["mentionAllowlist", "channels", "stallTimeoutMs", "dmPolicy"] as const;
+export const RELOADABLE_FIELDS = ["mentionAllowlist", "channels", "stallTimeoutMs", "dmPolicy", "handoffTargets"] as const;
 
 /** Fields bound to live startup resources and therefore changeable only by restart. */
 export const RESTART_REQUIRED_FIELDS = [

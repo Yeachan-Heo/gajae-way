@@ -875,11 +875,11 @@ test("boot aborts before accepting connections when the Stage 0 version floor is
 	const commands: string[][] = [];
 	const command: CliRunner = async (args) => {
 		commands.push([...args]);
-		return { exitCode: 0, stdout: "gjc/0.15.5\n", stderr: "" };
+		return { exitCode: 0, stdout: "gjc/0.16.0\n", stderr: "" };
 	};
 
 	await expect(bootGateway({ home, broker: { ssotAgentDir: null, command } })).rejects.toThrow(
-		`requires gjc >= ${MIN_GJC_VERSION}; found 0.15.5`,
+		`requires gjc >= ${MIN_GJC_VERSION}; revision-qualified tail item IDs are required; found 0.16.0`,
 	);
 	expect(commands).toEqual([["--version"]]);
 	expect(await Bun.file(join(home, "gateway.sock")).exists()).toBe(false);

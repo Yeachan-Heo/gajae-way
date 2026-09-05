@@ -4,8 +4,9 @@ import { join } from "node:path";
 import type { CliResult, CliRunner } from "@gajaeway/subsession";
 import { sanitizeDiagnostic } from "./rebind";
 
-/** The Stage 0 capability report was run successfully on this runtime floor. */
-export const MIN_GJC_VERSION = "0.15.6";
+/** The verified runtime floor carries authoritative revisions on tail items. */
+export const MIN_GJC_VERSION = "0.16.1";
+
 /** Structural marker the health/capability probe requires from `sdk session list`. */
 const SESSION_LIST_MARKER = "sessions";
 export const DEFAULT_PERSONA_HOST_ID = "persona";
@@ -353,7 +354,9 @@ export async function preflightGjcRuntime(
 	}
 	if (!minimum) throw new Error(`invalid configured gjc minimum version ${minimumVersion}`);
 	if (compareVersions(found, minimum) < 0) {
-		throw new Error(`gjc runtime preflight failed: requires gjc >= ${minimumVersion}; found ${formatVersion(found)}`);
+		throw new Error(
+			`gjc runtime preflight failed: requires gjc >= ${minimumVersion}; revision-qualified tail item IDs are required; found ${formatVersion(found)}`,
+		);
 	}
 	const capability = await sdk([...brokerHealthArgs()], { timeoutMs: DEFAULT_COMMAND_TIMEOUT_MS });
 	if (!isHealthySessionList(capability)) {
