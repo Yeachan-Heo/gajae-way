@@ -7,8 +7,8 @@ import { expect, test } from "bun:test";
 import { chmod, mkdir, mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
-import { GatewayDatabase } from "../../packages/gateway/src/store/db";
-import { eventually, KEY, ORIGIN } from "./harness";
+import { GatewayDatabase } from "../src/store/db";
+import { eventually, KEY, ORIGIN } from "./red-first-harness";
 
 test("red 2: SIGTERM exits an accepted-turn daemon within 15 seconds", async () => {
 	const home = await mkdtemp(join(tmpdir(), "gajaeway-red-shutdown-"));
@@ -19,8 +19,8 @@ test("red 2: SIGTERM exits an accepted-turn daemon within 15 seconds", async () 
 	await mkdir(join(home, "workspace"));
 	await mkdir(join(home, ".gjc", "agent"), { recursive: true });
 	await writeFile(join(home, ".gjc", "agent", "models.yml"), "providers: {}\n");
-	await symlink(resolve("red-first/gateway/subprocess-gjc.mjs"), join(home, "bin", "gjc"));
-	await chmod(resolve("red-first/gateway/subprocess-gjc.mjs"), 0o755);
+	await symlink(resolve("packages/gateway/test/fixtures/subprocess-gjc.mjs"), join(home, "bin", "gjc"));
+	await chmod(resolve("packages/gateway/test/fixtures/subprocess-gjc.mjs"), 0o755);
 	await writeFile(join(home, "config.json"), JSON.stringify({ schemaVersion: 1 }));
 	const transport = Bun.serve({
 		hostname: "127.0.0.1",

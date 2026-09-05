@@ -1,6 +1,6 @@
 #!/usr/bin/env bun
 import { appendFile } from "node:fs/promises";
-import { createFakeGjc, runFakeGjc } from "../../packages/gateway/test/fixtures/fake-gjc.mjs";
+import { createFakeGjc, runFakeGjc } from "./fake-gjc.mjs";
 const args = process.argv.slice(2).filter((_, i, raw) => raw[i] !== "--agent-dir" && raw[i - 1] !== "--agent-dir");
 await appendFile(process.env.RED_FIRST_CHILD_PIDS, `${process.pid}\n`);
 if (args[2] === "status") await appendFile(process.env.RED_FIRST_STATUS_MARKER, "status entered\n");

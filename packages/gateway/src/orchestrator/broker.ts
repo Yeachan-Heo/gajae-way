@@ -1,4 +1,12 @@
 import { chmod, cp, mkdir, open, readdir, readFile, rename, rm, unlink, writeFile } from "node:fs/promises";
+import { type BrokerOutcome, classifyFailure, ServiceabilityTracker } from "./broker-outcomes";
+import {
+	auditHost,
+	type AuditEvidence,
+	type BrokerReapPolicy,
+	type HostCandidate,
+	type IndexSnapshot,
+} from "./host-audit";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import type { CliResult, CliRunner } from "@gajaeway/subsession";
@@ -65,6 +73,14 @@ export interface BrokerSupervisorOptions {
 	readonly command?: GjcCommandRunner;
 	/** Health seam; production probes the daemon's published WebSocket endpoint (no process spawn). */
 	readonly healthProbe?: BrokerHealthProbe;
+	/** I6c / Q4: `index-dead-only` (default) or the explicit operator flag `all`. */
+	readonly brokerReap?: BrokerReapPolicy;
+	/** I6c: durable admission evidence for the host audit (turn_attempts, fences, nonterminal work, backfill flag). */
+	readonly auditEvidence?: () => AuditEvidence;
+	/** Process-table seam (env-tagged); production reads `ps -E` on macOS / /proc on Linux. */
+	readonly listHosts?: (privateAgentDir: string) => Promise<readonly HostCandidate[]>;
+	/** Index snapshot seam; production traverses the broker endpoint. */
+	readonly indexSnapshot?: () => Promise<IndexSnapshot | undefined>;
 	/** Stale-lock proof seam. */
 	readonly isPidAlive?: PidAliveProbe;
 	readonly healthIntervalMs?: number;
@@ -340,6 +356,98 @@ export function isHealthySessionList(result: CliResult): boolean {
 }
 
 /**
+ * I6c index snapshot: one authenticated WebSocket connection, full `session.list`
+ * traversal following the broker's own continuation cursors (consumed at the end
+ * of the traversal). A capacity error is a broker-scope outcome and is reported
+ * as `undefined` so the caller can retire + relaunch and re-traverse.
+ */
+export function traverseSessionIndex(
+	discovery: BrokerDiscovery,
+	timeoutMs: number,
+): Promise<IndexSnapshot | undefined> {
+	return new Promise<IndexSnapshot | undefined>((resolve) => {
+		let socket: WebSocket;
+		try {
+			const url = new URL(discovery.url);
+			url.searchParams.set("token", discovery.token);
+			socket = new WebSocket(url);
+		} catch {
+			resolve(undefined);
+			return;
+		}
+		const rows: IndexSnapshot["rows"][number][] = [];
+		let settled = false;
+		let greeted = false;
+		let requestId = 0;
+		const settle = (value: IndexSnapshot | undefined) => {
+			if (settled) return;
+			settled = true;
+			clearTimeout(timer);
+			resolve(value);
+			try {
+				socket.close();
+			} catch {
+				// closing a dead socket is fine
+			}
+		};
+		const timer = setTimeout(() => settle(undefined), timeoutMs);
+		const request = (cursor?: string) => {
+			requestId += 1;
+			socket.send(
+				JSON.stringify({
+					type: "broker_request",
+					id: `index-${requestId}`,
+					operation: "session.list",
+					input: { scope: "all", ...(cursor ? { cursor } : {}) },
+				}),
+			);
+		};
+		socket.addEventListener("message", (event) => {
+			let frame: Record<string, unknown>;
+			try {
+				frame = JSON.parse(String(event.data)) as Record<string, unknown>;
+			} catch {
+				return settle(undefined);
+			}
+			if (!greeted) {
+				if (frame.type !== "broker_hello" || frame.protocolVersion !== 3) return settle(undefined);
+				greeted = true;
+				request();
+				return;
+			}
+			if (frame.type !== "broker_response" || frame.ok !== true) return settle(undefined);
+			const result = (frame.result ?? {}) as { sessions?: unknown[]; continuationCursor?: unknown; cursor?: unknown };
+			for (const raw of result.sessions ?? []) {
+				const row = raw as Record<string, unknown>;
+				const heartbeat = row.lastHeartbeatAt;
+				rows.push({
+					sessionId: String(row.sessionId ?? ""),
+					pid: typeof row.pid === "number" ? row.pid : undefined,
+					live: row.live === true,
+					lastHeartbeatAt: typeof heartbeat === "number" ? heartbeat : undefined,
+					incarnation:
+						typeof row.hostIncarnation === "string"
+							? row.hostIncarnation
+							: typeof row.processIncarnation === "string"
+								? row.processIncarnation
+								: undefined,
+				});
+			}
+			const next =
+				typeof result.continuationCursor === "string"
+					? result.continuationCursor
+					: typeof result.cursor === "string"
+						? result.cursor
+						: undefined;
+			if (next) request(next);
+			else settle({ observedAt: Date.now(), rows, stalenessMs: BROKER_HEARTBEAT_TTL_MS });
+		});
+		socket.addEventListener("error", () => settle(undefined));
+		socket.addEventListener("close", () => settle(undefined));
+	});
+}
+
+/**
  * Enforces the Stage 0 runtime floor before the gateway accepts any connection:
  * a semantic version at or above the verified floor, plus proof that the `sdk`
  * surface answers a structurally valid session-list envelope (never trusting a
@@ -437,7 +545,14 @@ export class BrokerSupervisor implements PersonaBroker {
 		this.#ssotAgentDir = options.ssotAgentDir === null ? undefined : (options.ssotAgentDir ?? defaultSsotAgentDir());
 		this.#spawn = options.spawn ?? Bun.spawn.bind(Bun);
 		this.#command = options.command ?? ((args, commandOptions) => this.#runCommand(args, commandOptions));
-		this.cli = (args, commandOptions) => this.#command(bindAgentDir(args, this.agentDir), commandOptions);
+		this.cli = async (args, commandOptions) => {
+			const bound = bindAgentDir(args, this.agentDir);
+			const daemon = await this.#daemonIdentity();
+			const generation = this.#generation;
+			const result = await this.#command(bound, commandOptions);
+			this.#observeOutcome(bound, result, daemon, generation);
+			return result;
+		};
 		this.#healthProbe = options.healthProbe ?? probeBrokerDiscovery;
 		this.#startupStabilizationMs = options.healthProbe ? 0 : DEFAULT_STARTUP_STABILIZATION_MS;
 		this.#spawnsDaemon = options.healthProbe === undefined;
@@ -448,6 +563,10 @@ export class BrokerSupervisor implements PersonaBroker {
 			DEFAULT_HEALTH_PROBE_TIMEOUT_MS,
 			"healthProbeTimeoutMs",
 		);
+		this.#brokerReap = options.brokerReap ?? "index-dead-only";
+		this.#auditEvidence = options.auditEvidence;
+		this.#listHosts = options.listHosts ?? listPrivateHosts;
+		this.#indexSnapshot = options.indexSnapshot;
 		this.#readinessAttempts = positiveInteger(
 			options.readinessAttempts,
 			DEFAULT_READINESS_ATTEMPTS,
@@ -539,10 +658,14 @@ export class BrokerSupervisor implements PersonaBroker {
 		try {
 			await mkdir(this.agentDir, { recursive: true, mode: 0o700 });
 			await chmod(this.agentDir, 0o700);
-			await reapAgentDir(this.agentDir, this.#log, this.#isPidAlive);
+			// I6c boot order: stale-lock cleanup (dead-pid locks only) -> seed SSOT ->
+			// steering defaults -> launch/observe daemon -> index snapshot -> host
+			// audit under the Q4 predicate. Live indexed hosts are never touched.
+			await reapStaleLocks(this.agentDir, this.#log, this.#isPidAlive);
 			if (this.#ssotAgentDir) await seedAgentDirFromSsot(this.#ssotAgentDir, this.agentDir, this.#log);
 			await ensureSteeringDefaults(this.agentDir);
 			await this.#launchGeneration();
+			await this.#auditHosts("boot");
 		} catch (error) {
 			this.#stopping = true;
 			if (!this.#active) await this.#releaseLock();
@@ -690,6 +813,216 @@ export class BrokerSupervisor implements PersonaBroker {
 		}
 	}
 
+	readonly #brokerReap: BrokerReapPolicy;
+	readonly #auditEvidence: (() => AuditEvidence) | undefined;
+	readonly #listHosts: (privateAgentDir: string) => Promise<readonly HostCandidate[]>;
+	readonly #indexSnapshot: (() => Promise<IndexSnapshot | undefined>) | undefined;
+	#lastAudit: {
+		skipped: { pid: number; reason: string }[];
+		reaped: number[];
+		observed: { pid: number; reason: string }[];
+	} = {
+		skipped: [],
+		reaped: [],
+		observed: [],
+	};
+	readonly #serviceability = new ServiceabilityTracker();
+	#retireInFlight = false;
+	/** Sessions the last index snapshot reported live (I6c fills it; I6a uses it for session_unavailable corroboration). */
+	#liveSessions = new Set<string>();
+
+	get serviceabilityStrikes(): number {
+		return this.#serviceability.strikes;
+	}
+
+	async #daemonIdentity(): Promise<{ pid: number; url: string } | undefined> {
+		if (!this.#spawnsDaemon) return { pid: 0, url: "fixture" };
+		try {
+			const discovery = await readBrokerDiscovery(this.discoveryPath, this.#isPidAlive);
+			return discovery ? { pid: discovery.pid, url: discovery.url } : undefined;
+		} catch {
+			return undefined;
+		}
+	}
+
+	/**
+	 * I6a: classify one CLI envelope at the boundary and charge broker-scope
+	 * daemon-resource failures to the daemon identity that produced them.
+	 */
+	#observeOutcome(
+		args: readonly string[],
+		result: CliResult,
+		daemon: { pid: number; url: string } | undefined,
+		generation: number,
+	): void {
+		if (args[0] !== "sdk") return;
+		const op = describeOp(args);
+		let envelope: { ok?: unknown; error?: { code?: unknown; message?: unknown } } | undefined;
+		try {
+			envelope = JSON.parse(result.stdout) as typeof envelope;
+		} catch {
+			envelope = undefined;
+		}
+		const ok = result.exitCode === 0 && envelope?.ok === true;
+		const code = typeof envelope?.error?.code === "string" ? envelope.error.code : undefined;
+		const message = typeof envelope?.error?.message === "string" ? envelope.error.message : undefined;
+		const classified = ok
+			? { scope: "session" as const, messageClass: "other" as const }
+			: classifyFailure({ op, code, message, hasCursor: args.includes("--cursor") });
+		const sessionId = sessionIdOf(args);
+		const outcome: BrokerOutcome = {
+			scope: op === "session.list" ? "broker" : classified.scope,
+			op,
+			code,
+			messageClass: classified.messageClass,
+			...(sessionId ? { sessionId } : {}),
+			daemon,
+			generation,
+			at: Date.now(),
+			ok,
+		};
+		const verdict = this.#serviceability.observe(outcome, this.#generation, this.#liveSessions);
+		if (!verdict.retire || this.#retireInFlight || this.#stopping) return;
+		this.#retireInFlight = true;
+		void (async () => {
+			try {
+				this.#log(
+					`broker_daemon_retired pid=${daemon?.pid ?? "unknown"} reason=serviceability class=${verdict.reason} strikes=${verdict.strikes} generation=${generation}`,
+				);
+				const active = this.#active;
+				this.#clearHealthTimer();
+				this.#active = undefined;
+				if (daemon && this.#spawnsDaemon) await this.#retireDaemon(daemon.pid);
+				if (active) this.#scheduleRestart("serviceability retirement");
+				else await this.#launchGeneration();
+				if (this.#spawnsDaemon) await this.#auditHosts("runtime");
+			} catch (error) {
+				this.#log(`broker serviceability retirement failed: ${diagnostic(error)}`);
+			} finally {
+				this.#retireInFlight = false;
+			}
+		})();
+	}
+
+	get lastHostAudit(): {
+		skipped: readonly { pid: number; reason: string }[];
+		reaped: readonly number[];
+		observed: readonly { pid: number; reason: string }[];
+	} {
+		return this.#lastAudit;
+	}
+
+	/** I6c: the Q4 host audit; also invoked after a serviceability retirement for the retired daemon's children. */
+	async #auditHosts(phase: "boot" | "runtime"): Promise<void> {
+		const result = {
+			skipped: [] as { pid: number; reason: string }[],
+			reaped: [] as number[],
+			observed: [] as { pid: number; reason: string }[],
+		};
+		this.#lastAudit = result;
+		let snapshot: IndexSnapshot | undefined;
+		try {
+			snapshot = this.#indexSnapshot
+				? await this.#indexSnapshot()
+				: this.#spawnsDaemon
+					? await (async () => {
+							const discovery = await readBrokerDiscovery(this.discoveryPath, this.#isPidAlive);
+							return discovery ? await traverseSessionIndex(discovery, this.#healthProbeTimeoutMs * 5) : undefined;
+						})()
+					: undefined;
+		} catch (error) {
+			this.#log(`host_audit_index_failed detail=${diagnostic(error)}`);
+			snapshot = undefined;
+		}
+		if (snapshot) this.#liveSessions = new Set(snapshot.rows.filter((row) => row.live).map((row) => row.sessionId));
+		else if (this.#brokerReap !== "all") {
+			this.#log(`host_audit_skipped reason=index_unavailable phase=${phase}`);
+			return;
+		}
+		const evidence: AuditEvidence = this.#auditEvidence?.() ?? {
+			protectedSessions: new Set(),
+			activeHostPids: new Set(),
+			backfillDone: false,
+		};
+		let daemonPid: number | undefined;
+		try {
+			daemonPid = (await readBrokerDiscovery(this.discoveryPath, this.#isPidAlive))?.pid;
+		} catch {
+			daemonPid = undefined;
+		}
+		const candidates = await this.#listHosts(this.agentDir);
+		for (const candidate of candidates) {
+			const verdict = auditHost({
+				candidate,
+				privateAgentDir: this.agentDir,
+				daemonPid,
+				snapshot,
+				evidence,
+				policy: this.#brokerReap,
+				nowMs: Date.now(),
+			});
+			if (verdict.kind === "skip") {
+				if (verdict.reason !== "not_a_host" && verdict.reason !== "ownership_unproven") {
+					result.skipped.push({ pid: verdict.pid, reason: verdict.reason });
+					this.#log(`host_audit_skipped pid=${verdict.pid} reason=${verdict.reason}`);
+				}
+				continue;
+			}
+			if (verdict.kind === "observe") {
+				result.observed.push({ pid: verdict.pid, reason: verdict.reason });
+				this.#log(
+					`host_audit_observe pid=${verdict.pid} reason=${verdict.reason} (first boot after upgrade: unknown => protect)`,
+				);
+				continue;
+			}
+			// (e) revalidate immediately before SIGTERM and again before SIGKILL.
+			const fresh = this.#auditEvidence?.() ?? evidence;
+			const again = auditHost({
+				candidate,
+				privateAgentDir: this.agentDir,
+				daemonPid,
+				snapshot,
+				evidence: fresh,
+				policy: this.#brokerReap,
+				nowMs: Date.now(),
+			});
+			if (again.kind !== "reap") {
+				result.skipped.push({
+					pid: verdict.pid,
+					reason: `revalidation:${again.kind === "skip" ? again.reason : again.reason}`,
+				});
+				continue;
+			}
+			if (!(await this.#isPidAlive(candidate.pid))) continue;
+			try {
+				process.kill(candidate.pid, "SIGTERM");
+			} catch {
+				continue;
+			}
+			const deadline = Date.now() + 2_000;
+			while ((await this.#isPidAlive(candidate.pid)) && Date.now() < deadline) await sleep(50);
+			if (await this.#isPidAlive(candidate.pid)) {
+				const last = auditHost({
+					candidate,
+					privateAgentDir: this.agentDir,
+					daemonPid,
+					snapshot,
+					evidence: this.#auditEvidence?.() ?? evidence,
+					policy: this.#brokerReap,
+					nowMs: Date.now(),
+				});
+				if (last.kind === "reap")
+					try {
+						process.kill(candidate.pid, "SIGKILL");
+					} catch {
+						// gone
+					}
+			}
+			result.reaped.push(candidate.pid);
+			this.#log(`host_reaped pid=${candidate.pid} basis=${verdict.basis} phase=${phase}`);
+		}
+	}
+
 	#probeContext(): BrokerHealthContext {
 		return {
 			agentDir: this.agentDir,
@@ -768,11 +1101,29 @@ export class BrokerSupervisor implements PersonaBroker {
 	 * one, and removes its stale discovery so readiness stops trusting it. The
 	 * agent directory itself is never touched: sessions are durable and resume.
 	 */
+	/**
+	 * I6b: daemon retirement only. Re-reads discovery and signals the daemon
+	 * ONLY when the published pid still matches the identity being retired; no
+	 * host reap and no lock cleanup happen on this path (I6c owns those under
+	 * its own ownership predicate).
+	 */
 	async #retireDaemon(pid: number): Promise<void> {
-		await reapAgentDir(this.agentDir, this.#log, this.#isPidAlive);
+		let published: number | undefined;
+		try {
+			published = (await readBrokerDiscovery(this.discoveryPath, this.#isPidAlive))?.pid;
+		} catch {
+			published = undefined;
+		}
+		if (published !== undefined && published !== pid) {
+			this.#log(`broker_retire_skipped pid=${pid} reason=discovery_pid_changed published=${published}`);
+			return;
+		}
 		if (await this.#isPidAlive(pid)) {
 			try {
-				process.kill(pid, "SIGKILL");
+				process.kill(pid, "SIGTERM");
+				const deadline = Date.now() + 2_000;
+				while ((await this.#isPidAlive(pid)) && Date.now() < deadline) await sleep(50);
+				if (await this.#isPidAlive(pid)) process.kill(pid, "SIGKILL");
 			} catch {
 				// already gone
 			}
@@ -908,7 +1259,9 @@ export class BrokerSupervisor implements PersonaBroker {
 			stdin.flush?.();
 		};
 		const lines = (async function* () {
-			const reader = (child.stdout as ReadableStream<Uint8Array>).getReader();
+			const stdout = child.stdout as ReadableStream<Uint8Array> | undefined;
+			if (!stdout || typeof stdout.getReader !== "function") return;
+			const reader = stdout.getReader();
 			const decoder = new TextDecoder();
 			let buffer = "";
 			try {
@@ -945,7 +1298,7 @@ export class BrokerSupervisor implements PersonaBroker {
 	#probeInflight = false;
 	readonly #probeQueue: Array<() => void> = [];
 
-	async #acquireCliSlot(args: readonly string[]): Promise<boolean> {
+	async #acquireCliSlot(args: readonly string[], budgetMs?: number): Promise<boolean> {
 		const isProbe = args.includes("list") && args.includes("--scope");
 		if (isProbe) {
 			if (this.#probeInflight) await new Promise<void>((resolve) => this.#probeQueue.push(resolve));
@@ -958,7 +1311,16 @@ export class BrokerSupervisor implements PersonaBroker {
 				throw new GjcCliUnavailableError("broker generation fenced; daemon has not recovered");
 			await new Promise<void>((resolve) => setTimeout(resolve, 250));
 		}
-		if (this.#inflight >= MAX_CONCURRENT_CLI) await new Promise<void>((resolve) => this.#cliQueue.push(resolve));
+		if (this.#inflight >= MAX_CONCURRENT_CLI) {
+			const waited = await new Promise<boolean>((resolve) => {
+				const timer = budgetMs === undefined ? undefined : setTimeout(() => resolve(false), budgetMs);
+				this.#cliQueue.push(() => {
+					if (timer) clearTimeout(timer);
+					resolve(true);
+				});
+			});
+			if (!waited) throw new GjcCliUnavailableError("shutdown deadline reached while waiting for a CLI slot");
+		}
 		this.#inflight++;
 		return false;
 	}
@@ -973,10 +1335,24 @@ export class BrokerSupervisor implements PersonaBroker {
 		this.#cliQueue.shift()?.();
 	}
 
+	#deadlineAt: number | undefined;
+
+	/** I6d: bounds every subsequent slot wait and child timeout by the remaining shutdown budget. */
+	setDeadline(deadlineAt: number | undefined): void {
+		this.#deadlineAt = deadlineAt;
+	}
+
 	async #runCommand(args: readonly string[], options?: { readonly timeoutMs?: number }): Promise<CliResult> {
-		const probe = await this.#acquireCliSlot(args);
+		const remaining = this.#deadlineAt === undefined ? undefined : Math.max(0, this.#deadlineAt - Date.now());
+		if (remaining !== undefined && remaining <= 0)
+			throw new GjcCliUnavailableError("shutdown deadline reached; no new CLI work is admitted");
+		const probe = await this.#acquireCliSlot(args, remaining);
 		try {
-			return await this.#runCommandUnfenced(args, options);
+			const timeoutMs = options?.timeoutMs ?? DEFAULT_COMMAND_TIMEOUT_MS;
+			return await this.#runCommandUnfenced(args, {
+				...options,
+				timeoutMs: remaining === undefined ? timeoutMs : Math.min(timeoutMs, remaining),
+			});
 		} finally {
 			this.#releaseCliSlot(probe);
 		}
@@ -1016,6 +1392,87 @@ export const STEERING_DEFAULTS: Readonly<Record<string, string>> = { steeringMod
  * daemon and sessions are never affected. Safe on every restart: sessions are
  * durable and resume through recovery.
  */
+/** I6c: removes only lock/tombstone files whose recorded pid is dead (or that record no pid at all). */
+export async function reapStaleLocks(
+	agentDir: string,
+	log: (line: string) => void,
+	isPidAlive: (pid: number) => boolean | Promise<boolean>,
+): Promise<void> {
+	let tombstones = 0;
+	const sdk = join(agentDir, "sdk");
+	for (const [dir, pattern] of [
+		[sdk, /^\.broker\.lock\.stale-|^broker-spawn\..*\.log$|^broker\.startup-failure\.json$|^broker\.lock$/],
+		[join(sdk, "sessions"), /^index\.jsonl\.lock/],
+	] as const) {
+		let names: string[] = [];
+		try {
+			names = await readdir(dir);
+		} catch {
+			continue;
+		}
+		for (const name of names) {
+			if (!pattern.test(name)) continue;
+			const path = join(dir, name);
+			let owner: number | undefined;
+			try {
+				const text = await Bun.file(path).text();
+				const match = text.match(/"pid"\s*:\s*(\d+)|^(\d+)\s*$/m);
+				owner = match ? Number(match[1] ?? match[2]) : undefined;
+			} catch {
+				owner = undefined;
+			}
+			if (owner !== undefined && Number.isFinite(owner) && (await isPidAlive(owner))) continue;
+			await rm(path, { recursive: true, force: true });
+			tombstones++;
+		}
+	}
+	if (tombstones > 0) log(`broker_stale_locks_removed agentDir=${agentDir} tombstones=${tombstones}`);
+}
+
+/** Env-proven session hosts of one private agent dir (macOS `ps -E`, Linux /proc/<pid>/environ). */
+export async function listPrivateHosts(privateAgentDir: string): Promise<readonly HostCandidate[]> {
+	const out: HostCandidate[] = [];
+	try {
+		const ps = Bun.spawnSync(["ps", "-Ao", "pid=,ppid=,lstart=,args="]);
+		for (const line of ps.stdout.toString().split("\n")) {
+			const match = line.trim().match(/^(\d+)\s+(\d+)\s+(\w{3}\s+\w{3}\s+\d+\s+\d\d:\d\d:\d\d\s+\d{4})\s+(.*)$/);
+			if (!match) continue;
+			const [, pidText, ppidText, started, args] = match;
+			if (!/gjc sdk (session-host-internal|serve --stdio|broker-internal)/.test(args ?? "")) continue;
+			const pid = Number(pidText);
+			let agentDirEnv: string | undefined;
+			if (process.platform === "darwin") {
+				const env = Bun.spawnSync(["ps", "-E", "-o", "command=", "-p", String(pid)]).stdout.toString();
+				agentDirEnv = env.match(/GJC_CODING_AGENT_DIR=(\S+)/)?.[1];
+			} else {
+				try {
+					const environ = await Bun.file(`/proc/${pid}/environ`).text();
+					agentDirEnv = environ
+						.split("\0")
+						.find((entry) => entry.startsWith("GJC_CODING_AGENT_DIR="))
+						?.slice("GJC_CODING_AGENT_DIR=".length);
+				} catch {
+					agentDirEnv = undefined;
+				}
+			}
+			const startedAtMs = started ? Date.parse(started) : Number.NaN;
+			out.push({
+				pid,
+				ppid: Number(ppidText),
+				args: args ?? "",
+				agentDirEnv,
+				startedAtMs: Number.isFinite(startedAtMs) ? startedAtMs : undefined,
+				// The pinned runtime exposes hostIncarnation derived from process start seconds/microseconds
+				// (I0a); without the microsecond part the OS value is not derivable from ps alone.
+				incarnation: undefined,
+			});
+		}
+	} catch {
+		return out;
+	}
+	return out.filter((candidate) => candidate.agentDirEnv === privateAgentDir);
+}
+
 export async function reapAgentDir(
 	agentDir: string,
 	log: (line: string) => void,
@@ -1253,4 +1710,25 @@ function nonNegativeInteger(value: number | undefined, fallback: number, name: s
 
 function sleep(ms: number): Promise<void> {
 	return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+/** Human op name for an `sdk` argv (probe lane detector uses the real launch argv, `raw global --op session.list`). */
+function describeOp(args: readonly string[]): string {
+	const op = args.indexOf("--op");
+	if (op >= 0 && typeof args[op + 1] === "string") return args[op + 1] as string;
+	const query = args.indexOf("--query");
+	if (query >= 0 && typeof args[query + 1] === "string") return `query:${args[query + 1]}`;
+	if (args[1] === "session" && args[2] === "list") return "session.list";
+	if (args[1] === "session" && typeof args[2] === "string") return `session.${args[2]}`;
+	return args.slice(1, 3).join(".");
+}
+
+function sessionIdOf(args: readonly string[]): string | undefined {
+	if (args[1] !== "session") return undefined;
+	const verb = args[2];
+	if (verb === "list" || verb === "raw") {
+		const raw = args.indexOf("raw");
+		return raw >= 0 && args[raw + 1] !== "global" ? args[raw + 2] : undefined;
+	}
+	return typeof args[3] === "string" && !args[3].startsWith("--") ? args[3] : undefined;
 }

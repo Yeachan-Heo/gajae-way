@@ -18,9 +18,19 @@ if (command === "config" && args[0] === "check") {
 	// silent crash-loop.
 	try {
 		const server = await bootGateway({ stdio: args.includes("--stdio"), onlyNew: args.includes("--only-new") });
-		const shutdown = () => void server.stop("signal received");
-		process.once("SIGINT", shutdown);
-		process.once("SIGTERM", shutdown);
+		// I6d two-stage handler: the first signal starts the bounded ordered stop;
+		// a second signal forces an immediate exit instead of being ignored.
+		let signalled = false;
+		const shutdown = (signal: string) => {
+			if (signalled) {
+				console.error(`shutdown_forced reason=second_${signal}`);
+				process.exit(0);
+			}
+			signalled = true;
+			void server.stop(`signal received (${signal})`);
+		};
+		process.on("SIGINT", () => shutdown("SIGINT"));
+		process.on("SIGTERM", () => shutdown("SIGTERM"));
 	} catch (error) {
 		console.error(
 			`gajaeway-gateway failed to start: ${sanitizeDiagnostic(error instanceof Error ? error.message : String(error)) || "unknown_error"}`,

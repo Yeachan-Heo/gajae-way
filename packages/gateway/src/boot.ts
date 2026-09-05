@@ -46,6 +46,10 @@ export async function bootGateway(options: BootGatewayOptions = {}): Promise<Gat
 		database.reclassifyPendingWrites();
 		database.pruneTurnAttempts(30 * 24 * 60 * 60 * 1000);
 		broker = new BrokerSupervisor({
+			brokerReap: config.brokerReap,
+			// I6c: durable admission evidence drives the host audit; the first boot
+			// after the schema-21 upgrade is observe-only until this flag is set.
+			auditEvidence: () => database.hostAuditEvidence(),
 			...options.broker,
 			home: config.home,
 			instanceId: database.instanceId,

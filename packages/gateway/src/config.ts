@@ -44,6 +44,12 @@ export interface GatewayConfigFile {
 	readonly channels?: Readonly<Record<string, ChannelPolicy>>;
 	/** Tail liveness alarm threshold in milliseconds. It never kills a running turn. */
 	readonly stallTimeoutMs?: number;
+	/** I6c / Q4: `index-dead-only` (default) or the explicit operator flag `all`. Env `GAJAEWAY_BROKER_REAP` overrides. */
+	readonly brokerReap?: "index-dead-only" | "all";
+	/** I6d: absolute shutdown budget in ms (default 15000, below launchd ExitTimeOut 30 s). */
+	readonly shutdownDeadlineMs?: number;
+	/** I5a / Q1: hold TTL in ms before an undecidable held turn is closed as operation_lost (default 30 min). */
+	readonly holdTtlMs?: number;
 	/** Author ids allowed to trigger mention-gated group turns; absent/empty = anyone. */
 	readonly mentionAllowlist?: readonly string[];
 	/**
@@ -331,6 +337,13 @@ export function parseConfigFile(value: unknown): GatewayConfigFile {
 			? {}
 			: { mentionAllowlist: parseStringArray(input.mentionAllowlist, "mentionAllowlist") }),
 		...(input.stallTimeoutMs === undefined ? {} : { stallTimeoutMs: parseStallTimeout(input.stallTimeoutMs) }),
+		...(input.brokerReap === undefined ? {} : { brokerReap: parseBrokerReap(input.brokerReap) }),
+		...(input.shutdownDeadlineMs === undefined
+			? {}
+			: { shutdownDeadlineMs: parseBoundedInteger(input.shutdownDeadlineMs, "shutdownDeadlineMs", 1_000, 29_000) }),
+		...(input.holdTtlMs === undefined
+			? {}
+			: { holdTtlMs: parseBoundedInteger(input.holdTtlMs, "holdTtlMs", 60_000, 24 * 60 * 60_000) }),
 		...(model ? { model } : {}),
 		...(serviceTier ? { serviceTier } : {}),
 		...(input.dmPolicy === undefined ? {} : { dmPolicy: parseDmPolicy(input.dmPolicy) }),
@@ -405,6 +418,9 @@ export async function loadConfig(
 		dbPath: overrides.dbPath ?? fileConfig.dbPath ?? join(home, "gateway.db"),
 		logVerbosity: overrides.logVerbosity ?? fileConfig.logVerbosity ?? "info",
 		stallTimeoutMs: fileConfig.stallTimeoutMs ?? 120_000,
+		brokerReap: parseBrokerReap(process.env.GAJAEWAY_BROKER_REAP ?? fileConfig.brokerReap),
+		shutdownDeadlineMs: fileConfig.shutdownDeadlineMs ?? 15_000,
+		holdTtlMs: fileConfig.holdTtlMs ?? 30 * 60_000,
 	};
 }
 
@@ -455,6 +471,9 @@ export const RESTART_REQUIRED_FIELDS = [
 	"scriptRoot",
 	"ownerTarget",
 	"monitorContextFailureRollThreshold",
+	"brokerReap",
+	"shutdownDeadlineMs",
+	"holdTtlMs",
 ] as const;
 
 /**
@@ -481,4 +500,16 @@ export const CONFIG_PARTITION_IS_EXHAUSTIVE: UnclassifiedConfigField extends nev
 
 export function configDirectory(config: GatewayConfig): string {
 	return dirname(config.configPath);
+}
+
+function parseBrokerReap(value: unknown): "index-dead-only" | "all" {
+	if (value === undefined || value === null || value === "") return "index-dead-only";
+	if (value === "index-dead-only" || value === "all") return value;
+	throw new ConfigError("config_invalid", 'brokerReap must be "index-dead-only" or "all"');
+}
+
+function parseBoundedInteger(value: unknown, field: string, min: number, max: number): number {
+	if (typeof value !== "number" || !Number.isInteger(value) || value < min || value > max)
+		throw new ConfigError("config_invalid", `${field} must be an integer between ${min} and ${max}`);
+	return value;
 }

@@ -868,6 +868,55 @@ export class GatewayDatabase {
 		if (result.changes !== 1) throw new Error(`turn ${opRef} has no pending attempt`);
 	}
 
+	// --- I6c host audit evidence ---------------------------------------------
+
+	/** Sessions and host pids the audit must protect (direct legacy-table guard, independent of the backfill). */
+	hostAuditEvidence(nowIso = new Date().toISOString()): {
+		protectedSessions: Set<string>;
+		activeHostPids: Set<number>;
+		backfillDone: boolean;
+	} {
+		const protectedSessions = new Set<string>();
+		const activeHostPids = new Set<number>();
+		for (const row of this.#database
+			.query<{ session_id: string | null; host_pid: number | null }, []>(
+				"SELECT session_id, host_pid FROM turn_attempts WHERE send_state IN ('pending_write','written_unconfirmed','accepted') AND admission <> 'refused' AND terminal_at IS NULL",
+			)
+			.all()) {
+			if (row.session_id) protectedSessions.add(row.session_id);
+			if (row.host_pid !== null) activeHostPids.add(row.host_pid);
+		}
+		for (const row of this.#database
+			.query<{ gjc_session_id: string }, [string]>(
+				"SELECT gjc_session_id FROM sessions WHERE fence_op_ref IS NOT NULL AND fence_deadline_at > ? AND gjc_session_id <> ''",
+			)
+			.all(nowIso))
+			protectedSessions.add(row.gjc_session_id);
+		for (const row of this.#database
+			.query<{ bound_session_id: string | null }, []>(
+				"SELECT bound_session_id FROM inbound_messages WHERE turn_role = 'trigger' AND turn_state IN ('bound','accepted') AND bound_session_id IS NOT NULL",
+			)
+			.all())
+			if (row.bound_session_id) protectedSessions.add(row.bound_session_id);
+		for (const row of this.#database
+			.query<{ session_id: string | null }, []>(
+				"SELECT json_extract(a.value, '$.sessionId') AS session_id FROM lane_jobs j, json_each(j.record_json, '$.attempts') a WHERE json_extract(a.value, '$.endedAt') IS NULL",
+			)
+			.all())
+			if (row.session_id) protectedSessions.add(row.session_id);
+		for (const row of this.#database
+			.query<{ session_id: string | null }, []>(
+				"SELECT DISTINCT s.gjc_session_id AS session_id FROM monitor_events e JOIN sessions s ON s.origin_key LIKE 'monitor/%' WHERE e.stage = 'dispatched' AND s.gjc_session_id <> ''",
+			)
+			.all())
+			if (row.session_id) protectedSessions.add(row.session_id);
+		return { protectedSessions, activeHostPids, backfillDone: this.metaGet("audit_backfill_done") === "1" };
+	}
+
+	markAuditBackfillDone(): void {
+		this.metaSet("audit_backfill_done", "1");
+	}
+
 	// --- I5a holds and the execution-uncertainty fence ----------------------
 
 	/**

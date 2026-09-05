@@ -28,6 +28,7 @@ const GJC_VENDOR_OPS = new Set([
 	"session.close",
 	// I4a channel queries (gjc query_request over the resident relay).
 	"session.checkpoint",
+	"session.inspect",
 	"transcript.list",
 	"turn.result",
 ]);

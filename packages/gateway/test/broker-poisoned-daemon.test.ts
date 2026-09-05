@@ -3,11 +3,11 @@
  * HEAD: 1; post-fix: 2 and stays 2. Matched log: session.list cursor capacity is exhausted.
  */
 import { expect, test } from "bun:test";
-import { BrokerSupervisor } from "../../packages/gateway/src/orchestrator/broker";
-import { BrokerSessionPort } from "../../packages/gateway/src/orchestrator/session-port";
-import { TailRunner } from "../../packages/gateway/src/orchestrator/tail-runner";
-import { createFakeGjc } from "../../packages/gateway/test/fixtures/fake-gjc.mjs";
-import { harness, eventually } from "./harness";
+import { BrokerSupervisor } from "../src/orchestrator/broker";
+import { BrokerSessionPort } from "../src/orchestrator/session-port";
+import { TailRunner } from "../src/orchestrator/tail-runner";
+import { createFakeGjc } from "./fixtures/fake-gjc.mjs";
+import { harness, eventually } from "./red-first-harness";
 
 test("red 4: routed capacity failures retire a hello-healthy poisoned daemon exactly once", async () => {
 	const h = await harness();
@@ -24,7 +24,7 @@ test("red 4: routed capacity failures retire a hello-healthy poisoned daemon exa
 		},
 		healthIntervalMs: 1,
 	});
-	const tailRunner = new TailRunner({ run: broker.cli });
+	const tailRunner = new TailRunner({ run: broker.cli, repo: h.repo });
 	const port = new BrokerSessionPort({ database: h.database, cli: broker.cli, instanceId: "red-capacity", tailRunner });
 	try {
 		await broker.start();

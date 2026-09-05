@@ -340,7 +340,7 @@ test("large memory.audit and concurrent progress remain independently parseable 
 	client.close();
 });
 
-test("shutdown quiesces an in-flight turn before final stopping frame", async () => {
+test("shutdown announces stopping first, then quiesces the in-flight turn and delivers its reply before settling", async () => {
 	directory = await mkdtemp(join(tmpdir(), "gajaeway-server-shutdown-writer-"));
 	const config: GatewayConfig = {
 		schemaVersion: 1,
@@ -390,12 +390,20 @@ test("shutdown quiesces an in-flight turn before final stopping frame", async ()
 		if (client.frames.some((frame) => frame.type === "event" && frame.event === "gateway.stopping")) break;
 		await Bun.sleep(5);
 	}
+	// I6d: `gateway.stopping` is announced FIRST (step 1) so adapters open their
+	// reconnect window immediately; the in-flight turn still quiesces and its
+	// reply is delivered before the connection settles.
+	for (let attempt = 0; attempt < 400; attempt++) {
+		if (client.frames.some((frame) => frame.type === "event" && frame.event === "chat.message")) break;
+		await Bun.sleep(5);
+	}
 	const replyIndex = client.frames.findIndex((frame) => frame.type === "event" && frame.event === "chat.message");
 	const stoppingIndex = client.frames.findIndex(
 		(frame) => frame.type === "event" && frame.event === "gateway.stopping",
 	);
-	expect(replyIndex).toBeGreaterThan(1);
-	expect(stoppingIndex).toBeGreaterThan(replyIndex);
+	expect(stoppingIndex).toBeGreaterThan(-1);
+	expect(replyIndex).toBeGreaterThan(stoppingIndex);
+	expect(client.frames[stoppingIndex]?.payload).toMatchObject({ expectedRestart: true });
 	expect(client.frames[replyIndex]?.payload.text).toBe("late reply");
 	client.close();
 });

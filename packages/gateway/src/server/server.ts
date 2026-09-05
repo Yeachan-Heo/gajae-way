@@ -330,31 +330,30 @@ export async function startUnixServer(options: GatewayServerOptions): Promise<Ga
 	const stop = (reason = "shutdown requested") => {
 		if (stopPromise) return stopPromise;
 		stopping = true;
-		stopPromise = (async () => {
-			process.off("SIGHUP", onHup);
-			clearInterval(runtime.reconcileTimer);
-			clearInterval(runtime.stallTimer);
-			clearInterval(runtime.contextMaintenanceTimer);
-			// Stop accepting new sockets first, but keep existing sockets alive. Then
-			// quiesce every admitted producer before taking the final writer snapshot.
-			listener.stop(false);
-			await Promise.all([...runtime.requests]);
-			await runtime.personaSessions.drain();
-			await runtime.personaSessions.stop();
-			runtime.stopBrokerGenerationListener?.();
-			await runtime.monitorRuntime.stop();
-			// Cancels pending monitor burst timers so a closed database is never touched.
-			runtime.monitors.dispose();
-			// The broker has no recovery policy; it is only stopped after all current
-			// producers and monitor/tail-like runtime work have drained.
-			await options.broker?.stop();
-			for (const connection of runtime.connections)
-				connection.write({ v: PROFILE_VERSION, type: "event", event: "gateway.stopping", payload: { reason } });
-			await Promise.all([...runtime.connections].map((connection) => settleConnection(connection, 5_000)));
-			listener.stop(true);
-			await settleMemory(runtime);
-			await options.onStop?.();
-		})();
+		stopPromise = orderedStop(runtime, options, {
+			reason,
+			announce: () => {
+				// (1) every connection learns first, so adapters open their reconnect window now.
+				for (const connection of runtime.connections)
+					connection.write({
+						v: PROFILE_VERSION,
+						type: "event",
+						event: "gateway.stopping",
+						payload: { reason, expectedRestart: true },
+					});
+			},
+			closeAdmission: () => {
+				process.off("SIGHUP", onHup);
+				// (2) stop accepting new sockets; existing sockets stay alive for the settle.
+				listener.stop(false);
+			},
+			settleConnections: async (remainingMs) => {
+				await Promise.all(
+					[...runtime.connections].map((connection) => settleConnection(connection, Math.min(5_000, remainingMs))),
+				);
+				listener.stop(true);
+			},
+		});
 		return stopPromise;
 	};
 	runtime.stop = stop;
@@ -434,26 +433,23 @@ export function startStdioServer(options: GatewayServerOptions): GatewayServer {
 	const stop = (reason = "shutdown requested") => {
 		if (stopPromise) return stopPromise;
 		stopping = true;
-		stopPromise = (async () => {
-			process.off("SIGHUP", onHup);
-			connection.write({ v: PROFILE_VERSION, type: "event", event: "gateway.stopping", payload: { reason } });
-			// Same producer quiescence as the Unix server: in-flight stdio requests are
-			// tracked and awaited before persona/tail/broker teardown.
-			await Promise.all([...runtime.requests]);
-			clearInterval(runtime.reconcileTimer);
-			clearInterval(runtime.stallTimer);
-			clearInterval(runtime.contextMaintenanceTimer);
-			await runtime.personaSessions.drain();
-			await runtime.personaSessions.stop();
-			runtime.stopBrokerGenerationListener?.();
-			await runtime.monitorRuntime.stop();
-			// Cancels pending monitor burst timers so a closed database is never touched.
-			runtime.monitors.dispose();
-			await options.broker?.stop();
-			connection.close();
-			await settleMemory(runtime);
-			await options.onStop?.();
-		})();
+		stopPromise = orderedStop(runtime, options, {
+			reason,
+			announce: () =>
+				connection.write({
+					v: PROFILE_VERSION,
+					type: "event",
+					event: "gateway.stopping",
+					payload: { reason, expectedRestart: true },
+				}),
+			closeAdmission: () => process.off("SIGHUP", onHup),
+			settleConnections: async () => {
+				connection.close();
+				// A piped stdin that never reaches EOF keeps the event loop referenced
+				// after the ordered stop; the daemon has said goodbye, so release it.
+				process.stdin.unref?.();
+			},
+		});
 		return stopPromise;
 	};
 	runtime.stop = stop;
@@ -483,6 +479,93 @@ export function startStdioServer(options: GatewayServerOptions): GatewayServer {
  * throws mid-teardown. Intents are durable SQLite rows recovered on the next boot, so a failed
  * settle is logged and teardown continues.
  */
+/**
+ * I6d: ONE ordered, bounded shutdown for both transports. The whole sequence
+ * runs under a single absolute deadline (`shutdownDeadlineMs`, default 15 s,
+ * below launchd's 30 s ExitTimeOut): (1) announce, (2) close admission,
+ * (3) stop timers/monitors/producers, (4) flip actor mailboxes to stopping and
+ * bound the CLI runner by the remaining budget, (5) observe-only drain,
+ * (6) tails/broker/connections/memory/DB teardown, (7) watchdog at the
+ * deadline: `shutdown_forced pending=[opRefs]` then a forced exit. Nothing in
+ * this path prompts, resumes, steers or transitions a hold.
+ */
+const SHUTDOWN_EXIT_HEADROOM_MS = 1_500;
+
+async function orderedStop(
+	runtime: Runtime,
+	options: GatewayServerOptions,
+	hooks: {
+		reason: string;
+		announce: () => void;
+		closeAdmission: () => void;
+		settleConnections: (remainingMs: number) => Promise<void> | void;
+	},
+): Promise<void> {
+	const startedAt = Date.now();
+	const budgetMs = options.config.shutdownDeadlineMs ?? 15_000;
+	// The budget is the p100 PROCESS EXIT bound, so the watchdog fires with
+	// headroom for the forced exit itself (DB close + process.exit + reaping).
+	const watchdogAt = Math.max(1_000, budgetMs - SHUTDOWN_EXIT_HEADROOM_MS);
+	const deadlineAt = startedAt + watchdogAt;
+	const remaining = () => Math.max(0, deadlineAt - Date.now());
+	const exit = options.exitProcess ?? ((code: number) => process.exit(code));
+	let forced = false;
+	const watchdog = setTimeout(() => {
+		forced = true;
+		const pending = runtime.personaSessions.pendingOpRefs();
+		console.error(`shutdown_forced pending=[${pending.join(",")}] budgetMs=${budgetMs} reason=${hooks.reason}`);
+		try {
+			runtime.monitors.dispose();
+		} catch {
+			// best effort
+		}
+		try {
+			options.database.close();
+		} catch {
+			// already closed
+		}
+		exit(0);
+	}, watchdogAt);
+	try {
+		hooks.announce();
+		hooks.closeAdmission();
+		clearInterval(runtime.reconcileTimer);
+		clearInterval(runtime.stallTimer);
+		clearInterval(runtime.contextMaintenanceTimer);
+		// (4) mailboxes stop admitting new work; the broker's CLI slot wait and child
+		// timeout are bounded by what is left of the budget.
+		runtime.personaSessions.beginStopping();
+		(options.broker as { setDeadline?: (at: number) => void } | undefined)?.setDeadline?.(deadlineAt);
+		await withinBudget(Promise.all([...runtime.requests]), remaining());
+		// (5) observe-only: one bounded status per bound turn, never a mutation.
+		await runtime.personaSessions.drain(Math.min(5_000, remaining()));
+		await withinBudget(runtime.personaSessions.stop(), remaining());
+		runtime.stopBrokerGenerationListener?.();
+		await withinBudget(runtime.monitorRuntime.stop(), remaining());
+		runtime.monitors.dispose();
+		await withinBudget(Promise.resolve(options.broker?.stop()), remaining());
+		await withinBudget(Promise.resolve(hooks.settleConnections(remaining())), remaining());
+		await withinBudget(settleMemory(runtime), remaining());
+		await options.onStop?.();
+		console.error(`shutdown_complete elapsedMs=${Date.now() - startedAt} reason=${hooks.reason}`);
+	} finally {
+		if (!forced) clearTimeout(watchdog);
+	}
+}
+
+async function withinBudget<T>(work: Promise<T>, budgetMs: number): Promise<T | undefined> {
+	if (budgetMs <= 0) return undefined;
+	let timer: ReturnType<typeof setTimeout> | undefined;
+	const timeout = new Promise<undefined>((resolve) => {
+		timer = setTimeout(() => resolve(undefined), budgetMs);
+	});
+	try {
+		return await Promise.race([work, timeout]);
+	} finally {
+		if (timer) clearTimeout(timer);
+	}
+}
+
 async function settleMemory(runtime: Runtime): Promise<void> {
 	try {
 		await runtime.memory.initialize();
@@ -509,6 +592,7 @@ function createRuntime(options: GatewayServerOptions): Runtime {
 		repo: join(options.config.home, "workspace"),
 		sessionModel: options.config.model,
 		stallTimeoutMs: options.config.stallTimeoutMs,
+		...(options.config.holdTtlMs === undefined ? {} : { holdTtlMs: options.config.holdTtlMs }),
 		brokerGeneration: () => options.broker?.generation ?? 0,
 		onTurnStart: async (input) => await createInboundTurnLifecycle(input, options, runtime),
 		// A steer whose acceptance was learnt after its turn's lifecycle is gone
@@ -622,6 +706,11 @@ function createRuntime(options: GatewayServerOptions): Runtime {
 	};
 	void personaSessions
 		.recover()
+		.then(() => {
+			// I6c: the host audit leaves observe-only mode once the schema-21
+			// backfill AND the first actor recovery have completed.
+			options.database.markAuditBackfillDone();
+		})
 		.catch((error: unknown) => console.error(`persona startup recovery failed: ${diagnostic(error)}`));
 	return runtime;
 }

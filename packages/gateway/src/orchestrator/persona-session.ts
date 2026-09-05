@@ -347,21 +347,46 @@ export class PersonaSessionManager {
 	 * operation stays durable for the next broker generation rather than blocking
 	 * shutdown forever or being aborted.
 	 */
+	#stoppingMode = false;
+
+	/** I6d step (4): mailboxes reject new work except observation; every actor sees it. */
+	beginStopping(): void {
+		this.#stoppingMode = true;
+		for (const actor of this.#actors.values()) actor.beginStopping();
+	}
+
+	get stoppingMode(): boolean {
+		return this.#stoppingMode;
+	}
+
+	/** Op-refs still bound/accepted at the moment of a forced shutdown (for `shutdown_forced pending=[...]`). */
+	pendingOpRefs(): readonly string[] {
+		const refs: string[] = [];
+		for (const actor of this.#actors.values()) refs.push(...actor.pendingOpRefs());
+		return refs;
+	}
+
+	/**
+	 * I6d step (5): observe-only drain. ONE bounded status observation per
+	 * current bound turn; whatever is still bound afterwards is logged as a
+	 * `shutdown_hold` and stays durable for the next boot's recovery. No polling
+	 * loop: a turn that cannot be observed within the budget is not waited for.
+	 */
 	async drain(timeoutMs = 5_000): Promise<void> {
-		const deadline = this.#now() + Math.max(0, timeoutMs);
-		for (;;) {
-			const unresolved = await Promise.all(
-				[...this.#actors.values()].map((actor) => actor.enqueue(async () => await actor.drain())),
-			);
-			if (!unresolved.some(Boolean)) return;
-			if (this.#now() >= deadline) {
-				await Promise.all(
-					[...this.#actors.values()].map((actor) => actor.enqueue(async () => await actor.logShutdownHold())),
-				);
-				return;
-			}
-			await Bun.sleep(10);
-		}
+		const budget = Math.max(0, timeoutMs);
+		const pass = Promise.all([...this.#actors.values()].map((actor) => actor.enqueue(async () => await actor.drain())));
+		let timer: ReturnType<typeof setTimeout> | undefined;
+		const unresolved = await Promise.race([
+			pass,
+			new Promise<undefined>((resolve) => {
+				timer = setTimeout(() => resolve(undefined), budget);
+			}),
+		]);
+		if (timer) clearTimeout(timer);
+		if (unresolved && !unresolved.some(Boolean)) return;
+		await Promise.all(
+			[...this.#actors.values()].map((actor) => actor.enqueue(async () => await actor.logShutdownHold())),
+		);
 	}
 
 	#actor(originKey: string): OriginActor {
@@ -951,6 +976,8 @@ class OriginActor {
 		this.#retiredReattachTimers.clear();
 		for (const timer of this.#graceTimers) this.#manager.cancel(timer);
 		this.#graceTimers.clear();
+		for (const timer of this.#holdTimers.values()) this.#manager.cancel(timer);
+		this.#holdTimers.clear();
 		this.#dispatchRetry = undefined;
 		await Promise.all([
 			...(this.#current?.tail ? [this.#current.tail.close()] : []),
@@ -959,10 +986,50 @@ class OriginActor {
 	}
 
 	/** Shutdown reconciliation covers the current turn AND retired holds; both stay durable if unresolved. */
+	#stoppingMode = false;
+
+	beginStopping(): void {
+		this.#stoppingMode = true;
+	}
+
+	pendingOpRefs(): readonly string[] {
+		const refs: string[] = [];
+		if (this.#current) refs.push(this.#current.turn.opRef);
+		for (const retired of this.#retired.values()) refs.push(retired.turn.opRef);
+		return refs;
+	}
+
+	/**
+	 * I6d step (5): observe-only. One bounded `status` per current bound turn;
+	 * a decidable terminal is recorded through the normal reconcile, but no
+	 * prompt/resume/steer/transcript work and no hold transition happens here
+	 * (the drain path is read-only in the hold evaluator). Retired holds are
+	 * skipped; they carry their own durable deadline.
+	 */
 	async drain(): Promise<boolean> {
-		if (this.#current) await this.#reconcileBound(this.#current);
-		for (const retired of [...this.#retired.values()]) await this.#reconcileBound(retired);
-		return this.#current !== undefined || this.#retired.size > 0;
+		if (this.#current) await this.#observeForDrain(this.#current);
+		return this.#current !== undefined;
+	}
+
+	async #observeForDrain(bound: BoundTurn): Promise<void> {
+		if (this.#manager.database.holdState(bound.turn.opRef)?.terminalDisposition) {
+			await this.#forgetTerminalized(bound);
+			return;
+		}
+		let report: StatusReport;
+		try {
+			report = await this.#manager.port.status({
+				sessionId: bound.sessionId,
+				repo: this.#manager.repo,
+				opRef: bound.turn.opRef,
+			});
+		} catch {
+			return;
+		}
+		if (!isTerminalStatus(report.status.status)) return;
+		// A terminal witness observed during drain is recorded exactly like a tick
+		// would record it; the hold evaluator is never entered from here.
+		await this.#reconcileBound(bound);
 	}
 
 	async logShutdownHold(): Promise<void> {
@@ -980,7 +1047,7 @@ class OriginActor {
 	 * row stays pending throughout and is never expired.
 	 */
 	async #dispatchNext(): Promise<void> {
-		if (this.#state !== "idle" || this.#current || this.#dispatchRetry) return;
+		if (this.#stoppingMode || this.#state !== "idle" || this.#current || this.#dispatchRetry) return;
 		await this.#resolveStaleHolds();
 		// I5a durable execution-uncertainty fence: while an `operation_lost` op may
 		// still be executing on this session, no new trigger is bound for the origin
@@ -1982,7 +2049,7 @@ class OriginActor {
 		const state = database.holdState(bound.turn.opRef);
 		if (!row || (row.turn_state !== "bound" && row.turn_state !== "accepted")) return;
 		const transition = evaluateHold({
-			path,
+			path: this.#stoppingMode ? "drain" : path,
 			nowMs: this.#manager.now(),
 			evidence,
 			subject: {
