@@ -45,7 +45,12 @@ test("turn_count survives increments and resets on epoch bump", async () => {
 		database.putSession(key, "session-1");
 		expect(database.incrementTurnCount(key)).toBe(1);
 		expect(database.incrementTurnCount(key)).toBe(2);
-		database.bumpEpoch(key, origin);
+		database.mutateEpoch(key, {
+			scope: "persona",
+			reason: "operator_new",
+			cause: { kind: "operator" },
+			originRefJson: origin,
+		});
 		expect(database.incrementTurnCount(key)).toBe(1);
 	} finally {
 		database.close();

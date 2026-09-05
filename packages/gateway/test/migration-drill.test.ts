@@ -1,9 +1,10 @@
 import { Database } from "bun:sqlite";
 import { expect, test } from "bun:test";
-import { mkdtemp, rm } from "node:fs/promises";
+import { copyFile, mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { GatewayDatabase } from "../src/store/db";
+import { openSchema20 } from "./fixtures/schema20-db";
 
 test("migrates a migration-001 database to the latest schema", async () => {
 	const directory = await mkdtemp(join(tmpdir(), "gajaeway-migration-drill-"));
@@ -16,7 +17,7 @@ test("migrates a migration-001 database to the latest schema", async () => {
 		legacy.close();
 
 		const database = await GatewayDatabase.open(path);
-		expect(database.schemaVersion).toBe(20);
+		expect(database.schemaVersion).toBe(21);
 		database.close();
 
 		const migrated = new Database(path, { readonly: true });
@@ -41,7 +42,7 @@ test("upgrades a deployed lane-jobs schema 10 database to combined schema 12 wit
 	const directory = await mkdtemp(join(tmpdir(), "gajaeway-migration-v10-"));
 	const path = join(directory, "gateway.db");
 	try {
-		const latest = await GatewayDatabase.open(path);
+		const latest = await openSchema20(path);
 		latest.putLaneJob({
 			jobId: "lanejob-test",
 			laneKey: "work/task/test",
@@ -69,7 +70,7 @@ DELETE FROM schema_migrations WHERE version > 10;
 		v10.close();
 
 		const upgraded = await GatewayDatabase.open(path);
-		expect(upgraded.schemaVersion).toBe(20);
+		expect(upgraded.schemaVersion).toBe(21);
 		expect(upgraded.laneJobJson("lanejob-test")).toBe('{"schemaVersion":1}');
 		const tables = new Set(
 			new Database(path, { readonly: true })
@@ -89,7 +90,7 @@ test("upgrades live schema 12 through bootstrap schema 14 without losing current
 	const directory = await mkdtemp(join(tmpdir(), "gajaeway-migration-v12-"));
 	const path = join(directory, "gateway.db");
 	try {
-		const latest = await GatewayDatabase.open(path);
+		const latest = await openSchema20(path);
 		latest.putLaneJob({
 			jobId: "lanejob-v12",
 			laneKey: "work/task/v12",
@@ -114,7 +115,7 @@ DELETE FROM schema_migrations WHERE version = 13;
 		v12.close();
 
 		const upgraded = await GatewayDatabase.open(path);
-		expect(upgraded.schemaVersion).toBe(20);
+		expect(upgraded.schemaVersion).toBe(21);
 		expect(upgraded.laneJobJson("lanejob-v12")).toBe('{"schemaVersion":1}');
 		expect(upgraded.metaGet("rebind_budget:discord/channel/c1")).toBe('{"used":2,"lifetime":7}');
 		expect(upgraded.monitorSlotExists("monitor-v12", "2026-08-28T00:00:00.000Z")).toBe(true);
@@ -143,7 +144,7 @@ test("upgrades a schema 14 monitors table to 15 without losing existing monitors
 	const directory = await mkdtemp(join(tmpdir(), "gajaeway-migration-v14-"));
 	const path = join(directory, "gateway.db");
 	try {
-		const latest = await GatewayDatabase.open(path);
+		const latest = await openSchema20(path);
 		latest.close();
 
 		// Recreate the deployed schema-14 monitors table: no `instruction` column,
@@ -158,7 +159,7 @@ DELETE FROM schema_migrations WHERE version > 14;
 		v14.close();
 
 		const upgraded = await GatewayDatabase.open(path);
-		expect(upgraded.schemaVersion).toBe(20);
+		expect(upgraded.schemaVersion).toBe(21);
 		const rows = upgraded.monitorRows();
 		expect(rows).toHaveLength(1);
 		// The pre-existing monitor survives and reads back with no instruction.
@@ -175,10 +176,21 @@ test("online backup copy retains a session row", async () => {
 	const path = join(directory, "gateway.db");
 	const backupPath = join(directory, "gateway-backup.db");
 	try {
-		const database = await GatewayDatabase.open(path);
+		const database = await openSchema20(path);
 		database.withTransaction(() => database.putSession("loopback/loopback/loopback", "session-1"));
 		database.backupInto(backupPath);
 		database.close();
+		const upgraded = await GatewayDatabase.open(path);
+		expect(upgraded.schemaVersion).toBe(21);
+		expect(upgraded.activeSessionCount).toBe(1);
+		upgraded.close();
+		const restoredPath = join(directory, "restored.db");
+		await copyFile(backupPath, restoredPath);
+		const restored = await openSchema20(restoredPath);
+		expect(restored.schemaVersion).toBe(20);
+		expect(restored.activeSessionCount).toBe(1);
+		expect(restored.getSession("loopback/loopback/loopback")).toBe("session-1");
+		restored.close();
 
 		const backup = new Database(backupPath, { readonly: true });
 		expect(
@@ -197,7 +209,7 @@ test("online backup copy retains a session row", async () => {
 test("upgrades a schema 15 database to 16 and keeps a per-conversation model override usable", async () => {
 	const directory = await mkdtemp(join(tmpdir(), "gw-migrate-16-"));
 	const path = join(directory, "gateway.db");
-	const latest = await GatewayDatabase.open(path);
+	const latest = await openSchema20(path);
 	latest.close();
 
 	// Recreate a deployed schema-15 database: no conversation_model table.
@@ -209,7 +221,7 @@ DELETE FROM schema_migrations WHERE version > 15;
 	v15.close();
 
 	const upgraded = await GatewayDatabase.open(path);
-	expect(upgraded.schemaVersion).toBe(20);
+	expect(upgraded.schemaVersion).toBe(21);
 	upgraded.conversationModelSet("discord:c1", { preset: "gpt-heavy" }, "owner");
 	expect(upgraded.conversationModelGet("discord:c1")?.selection).toEqual({ preset: "gpt-heavy" });
 	upgraded.close();
@@ -219,7 +231,7 @@ test("migration 19 rebuilds a genuine schema-18 batch table as turns: bound/acce
 	const directory = await mkdtemp(join(tmpdir(), "gw-migrate-19-"));
 	const path = join(directory, "gateway.db");
 	try {
-		const latest = await GatewayDatabase.open(path);
+		const latest = await openSchema20(path);
 		expect(latest.schemaVersion).toBe(20);
 		latest.close();
 		// Rebuild a deployed schema-18 database from its real DDL (v16 base + the
@@ -257,7 +269,7 @@ INSERT INTO inbound_messages (message_id, origin_key, origin_ref_json, body, eng
 		raw.close();
 
 		const upgraded = await GatewayDatabase.open(path);
-		expect(upgraded.schemaVersion).toBe(20);
+		expect(upgraded.schemaVersion).toBe(21);
 		const after = new Database(path, { readonly: true });
 		const columns = after
 			.query<{ name: string }, []>("PRAGMA table_info(inbound_messages)")

@@ -509,7 +509,12 @@ class OriginActor {
 		let nextEpoch = 0;
 		let discarded: string[] = [];
 		this.#manager.database.withTransaction(() => {
-			nextEpoch = this.#manager.database.bumpEpoch(this.originKey, originRefJson);
+			nextEpoch = this.#manager.database.mutateEpoch(this.originKey, {
+				scope: "persona",
+				reason: "operator_new",
+				cause: { kind: "operator" },
+				originRefJson,
+			}).toEpoch;
 			this.#manager.database.contextSetFloor(this.originKey, floorAt);
 			discarded = this.#manager.database.inboundDiscardBefore(this.originKey, floorAt);
 		});
@@ -624,7 +629,13 @@ class OriginActor {
 			// A retired turn's epoch was already rotated away from; it simply
 			// re-enters the queue under the current one (its send never ran, so
 			// the message is owed a turn, not a permanent hold).
-			const nextEpoch = retired ? currentEpoch : this.#manager.database.rebindEpoch(this.originKey);
+			const nextEpoch = retired
+				? currentEpoch
+				: this.#manager.database.mutateEpoch(this.originKey, {
+						scope: "persona",
+						reason: "session_disowned_dead",
+						cause: { kind: "retirement" },
+					}).toEpoch;
 			this.#manager.log(
 				`recovery_requeue_unaccepted origin=${this.originKey} epoch=${turn.epoch} nextEpoch=${nextEpoch} opRef=${turn.opRef} session=${sessionId} attempt=${attempt}${retired ? " reason=retired_router_disowned" : ""}`,
 			);
@@ -732,7 +743,12 @@ class OriginActor {
 				if (liveIdle && count >= HOLD_RELEASE_SWEEPS && (await this.#queueIsEmpty(sessionId))) {
 					this.#holdSweeps.delete(turn.opRef);
 					const attempt = this.#manager.database.inboundTurnRequeue(turn.opRef);
-					const nextEpoch = this.#manager.database.rebindEpoch(this.originKey);
+					// I5a deletes this call site.
+					const nextEpoch = this.#manager.database.mutateEpoch(this.originKey, {
+						scope: "persona",
+						reason: "session_disowned_dead",
+						cause: { kind: "retirement" },
+					}).toEpoch;
 					this.#manager.log(
 						`recovery_requeue_unaccepted origin=${this.originKey} epoch=${turn.epoch} nextEpoch=${nextEpoch} opRef=${turn.opRef} session=${sessionId} attempt=${attempt} reason=unknown_op_on_live_idle_session sweeps=${count}`,
 					);
@@ -841,7 +857,11 @@ class OriginActor {
 		current.answerWanted = true;
 		this.#retired.set(retiredKey(current), current);
 		this.#current = undefined;
-		const nextEpoch = this.#manager.database.rebindEpoch(this.originKey);
+		const nextEpoch = this.#manager.database.mutateEpoch(this.originKey, {
+			scope: "persona",
+			reason: "steer_refused_session_broken",
+			cause: { kind: "retirement" },
+		}).toEpoch;
 		this.#state = "idle";
 		this.#manager.log(
 			`session_rebound_after_steer_failure origin=${this.originKey} epoch=${current.epoch} nextEpoch=${nextEpoch} opRef=${current.turn.opRef}`,
@@ -1045,7 +1065,13 @@ class OriginActor {
 			this.#preSendFailures += 1;
 			const failures = this.#preSendFailures;
 			const sessionGone = sdkStatusErrorCode(error) === "session_unavailable";
-			const nextEpoch = sessionGone ? this.#manager.database.rebindEpoch(this.originKey) : undefined;
+			const nextEpoch = sessionGone
+				? this.#manager.database.mutateEpoch(this.originKey, {
+						scope: "persona",
+						reason: "session_disowned_dead",
+						cause: { kind: "retirement" },
+					}).toEpoch
+				: undefined;
 			this.#manager.log(
 				`persona_model_failed origin=${this.originKey} epoch=${epoch}${nextEpoch === undefined ? "" : ` nextEpoch=${nextEpoch}`} session=${binding.sessionId} message=${trigger.message_id} attempt=${attempt} failures=${failures} selection=${modelKey} detail=${safeDiagnostic(error)}`,
 			);
@@ -1080,7 +1106,11 @@ class OriginActor {
 			if (sdkStatusErrorCode(error) === "session_unavailable") {
 				await tail.close();
 				this.#manager.database.inboundTurnRequeue(opRef);
-				const nextEpoch = this.#manager.database.rebindEpoch(this.originKey);
+				const nextEpoch = this.#manager.database.mutateEpoch(this.originKey, {
+					scope: "persona",
+					reason: "session_disowned_dead",
+					cause: { kind: "retirement" },
+				}).toEpoch;
 				this.#current = undefined;
 				this.#state = "idle";
 				await this.#notifyReleased(current);
@@ -1213,7 +1243,11 @@ class OriginActor {
 			// forever cannot recover it (live: one channel repeated it 335 times).
 			// Advance the epoch to derive a new key while leaving every inbound row
 			// pending and intact, then retry with the normal base delay.
-			const nextEpoch = this.#manager.database.rebindEpoch(this.originKey);
+			const nextEpoch = this.#manager.database.mutateEpoch(this.originKey, {
+				scope: "persona",
+				reason: "create_key_poisoned",
+				cause: { kind: "retirement" },
+			}).toEpoch;
 			this.#manager.log(
 				`persona_bind_epoch_rotated origin=${this.originKey} epoch=${epoch} nextEpoch=${nextEpoch} message=${messageId} attempts=${attempts} reason=terminal_uncertain`,
 			);
@@ -1584,6 +1618,7 @@ class OriginActor {
 				const dead = live === false || disowned;
 				const liveIdle = live === true && (await this.#queueIsEmpty(bound.sessionId));
 				if (dead || liveIdle) {
+					// I5a deletes the live-idle release path; preserve it during schema-only I1a.
 					await this.#releaseUnlanded(
 						bound,
 						`${dead ? "unknown_op_on_dead_session" : "unknown_op_on_live_idle_session"} sweeps=${count}`,
@@ -1768,7 +1803,13 @@ class OriginActor {
 		bound.tail?.setTurnRunning(false);
 		await bound.tail?.close();
 		const attempt = this.#manager.database.inboundTurnRequeue(bound.turn.opRef);
-		const nextEpoch = bound.retired ? this.#epoch() : this.#manager.database.rebindEpoch(this.originKey);
+		const nextEpoch = bound.retired
+			? this.#epoch()
+			: this.#manager.database.mutateEpoch(this.originKey, {
+					scope: "persona",
+					reason: "session_disowned_dead",
+					cause: { kind: "retirement" },
+				}).toEpoch;
 		if (bound.retired) {
 			this.#retired.delete(retiredKey(bound));
 			this.#clearRetiredReattach(bound);

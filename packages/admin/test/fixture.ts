@@ -20,6 +20,8 @@ export const STATUS: GatewayStatusResult = {
 		omittedNewestAt: "2026-08-27T10:00:00.000Z",
 		floorAt: null,
 	},
+	holds: [],
+	rotations: { last24h: 0, byReason: {}, byScope: {} },
 };
 
 export const MONITOR: MonitorRecord = {

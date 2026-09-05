@@ -18,6 +18,26 @@ export interface GatewayStatusResult {
 	readonly schemaVersion: number;
 	/** Session census (grows in later phases). */
 	readonly sessions: { readonly active: number };
+	readonly holds: readonly {
+		readonly opRef: string;
+		readonly originKey: string;
+		readonly epoch: number;
+		readonly state: "bound" | "accepted" | "done";
+		readonly reason: string | null;
+		readonly since: string | null;
+		readonly deadline: string | null;
+		readonly sweeps: number;
+		readonly fence: {
+			readonly opRef: string;
+			readonly since: string | null;
+			readonly deadline: string | null;
+		} | null;
+	}[];
+	readonly rotations: {
+		readonly last24h: number;
+		readonly byReason: Readonly<Record<string, number>>;
+		readonly byScope: Readonly<Record<string, number>>;
+	};
 	/** Delivery ledger health (P1+). */
 	readonly delivery?: { readonly pending: number; readonly oldestPendingAgeMs: number | null };
 	/** Aggregate-only conversation diff health; never includes message bodies. */

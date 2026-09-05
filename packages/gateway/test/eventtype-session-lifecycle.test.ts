@@ -49,7 +49,12 @@ test("event-type sessions persist until their explicit epoch is bumped", async (
 		]);
 		expect(calls.map((call) => call.epoch)).toEqual([0, 0]);
 		database.withTransaction(() =>
-			database.bumpEpoch(originKey(eventTypeOrigin("build")), JSON.stringify(eventTypeOrigin("build"))),
+			database.mutateEpoch(originKey(eventTypeOrigin("build")), {
+				scope: "monitor",
+				reason: "monitor_context_roll",
+				cause: { kind: "policy" },
+				originRefJson: JSON.stringify(eventTypeOrigin("build")),
+			}),
 		);
 		pipeline.submit(monitor.monitorId, "build", {});
 		await Bun.sleep(20);

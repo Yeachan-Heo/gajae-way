@@ -475,7 +475,10 @@ export function formatFailureNotice(error: unknown): string {
  */
 export interface RebindStore {
 	withTransaction<T>(run: () => T): T;
-	rebindEpoch(originKey: string): number;
+	mutateEpoch(
+		originKey: string,
+		input: import("../store/epoch-mutation").EpochMutationInput,
+	): { fromEpoch: number; toEpoch: number };
 	metaGet?(key: string): string | undefined;
 	metaSet?(key: string, value: string): void;
 }
@@ -589,7 +592,11 @@ export class SessionRebinder {
 		// so a crash can never spend an epoch whose counter was not incremented
 		// (that split would let a restart allocate another rebind past the cap).
 		const toEpoch = this.#store.withTransaction(() => {
-			const epoch = this.#store.rebindEpoch(originKey);
+			const epoch = this.#store.mutateEpoch(originKey, {
+				scope: originKey.startsWith("monitor/") ? "monitor" : originKey.startsWith("work/") ? "work" : "persona",
+				reason: "create_key_poisoned",
+				cause: { kind: "retirement" },
+			}).toEpoch;
 			this.#durable(originKey, used, lifetime);
 			return epoch;
 		});

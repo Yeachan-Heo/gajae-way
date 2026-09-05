@@ -37,7 +37,12 @@ test("projector reads durable rows through the database and stays fail-closed", 
 	try {
 		const key = "discord/dm/c1/peer=p1";
 		// Mid-rebind state: /new bumped the epoch and cleared the session binding.
-		database.bumpEpoch(key, JSON.stringify(discordDm));
+		database.mutateEpoch(key, {
+			scope: "persona",
+			reason: "operator_new",
+			cause: { kind: "operator" },
+			originRefJson: JSON.stringify(discordDm),
+		});
 		const projector = new RuntimeCycleProjector(database, { queueDepth: 0 });
 		const afterBump = projector.project();
 		expect(afterBump.gates).toContain("stale_session_identity");
@@ -104,7 +109,12 @@ test("ops.cycle verb serves a fresh fail-closed snapshot over the socket", async
 	const database = await GatewayDatabase.open(config.dbPath);
 	const key = "discord/dm/c1/peer=p1";
 	// Leave the session mid-rebind so the served projection must gate.
-	database.bumpEpoch(key, JSON.stringify(discordDm));
+	database.mutateEpoch(key, {
+		scope: "persona",
+		reason: "operator_new",
+		cause: { kind: "operator" },
+		originRefJson: JSON.stringify(discordDm),
+	});
 	const ledger = new DeliveryLedger(database);
 	ledger.createPending({
 		deliveryId: "d1",

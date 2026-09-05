@@ -875,10 +875,17 @@ export class MonitorPropagator {
 			instruction: monitor.instruction,
 			notes: this.#recentAuthoredNotes(monitor.monitorId),
 		});
-		// bumpEpoch is the existing rotation primitive: epoch + 1 and turn_count 0.
+		// Epoch rotation clears the binding and turn count without changing dispatch.
 		// The next broker-backed SessionPort bind mints a fresh session and
 		// idempotency key for this monitor origin.
-		this.#database.withTransaction(() => this.#database.bumpEpoch(sessionOriginKey, originRefJson));
+		this.#database.withTransaction(() =>
+			this.#database.mutateEpoch(sessionOriginKey, {
+				scope: "monitor",
+				reason: "monitor_context_roll",
+				cause: { kind: "policy" },
+				originRefJson,
+			}),
+		);
 		state.pendingRoll = undefined;
 		state.lastRoll = reason;
 		// The new epoch starts with a clean slate: the previous session's failure

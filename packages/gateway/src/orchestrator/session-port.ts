@@ -255,7 +255,15 @@ export class BrokerSessionPort implements SessionPort {
 			}
 			if (indexed)
 				return { sessionId: existing.sessionId, originKey: input.originKey, epoch: input.epoch, repo: input.repo };
-			const rebound = this.#database.rebindEpoch(input.originKey);
+			const rebound = this.#database.mutateEpoch(input.originKey, {
+				scope: input.originKey.startsWith("monitor/")
+					? "monitor"
+					: input.originKey.startsWith("work/")
+						? "work"
+						: "persona",
+				reason: "session_disowned_dead",
+				cause: { kind: "retirement" },
+			}).toEpoch;
 			console.error(
 				`session_rebound origin=${input.originKey} epoch=${input.epoch} nextEpoch=${rebound} session=${existing.sessionId} reason=not_live_or_disowned_by_broker`,
 			);
@@ -267,7 +275,15 @@ export class BrokerSessionPort implements SessionPort {
 			created = await this.#createSession(input.repo, idempotencyKey, input.model);
 		} catch (error) {
 			if (input.epochRecovery === false) throw error;
-			const nextEpoch = this.#database.rebindEpoch(input.originKey);
+			const nextEpoch = this.#database.mutateEpoch(input.originKey, {
+				scope: input.originKey.startsWith("monitor/")
+					? "monitor"
+					: input.originKey.startsWith("work/")
+						? "work"
+						: "persona",
+				reason: "create_key_poisoned",
+				cause: { kind: "retirement" },
+			}).toEpoch;
 			console.error(
 				`session_create_epoch_rotated origin=${input.originKey} epoch=${input.epoch} nextEpoch=${nextEpoch} reason=poisoned_create_key`,
 			);

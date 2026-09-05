@@ -1,8 +1,8 @@
-import type { MonitorRecord } from "@gajaeway/protocol";
+import type { GatewayStatusResult, MonitorRecord } from "@gajaeway/protocol";
 import { originKey } from "@gajaeway/protocol";
 
 /**
- * Presentation layer for `gajaeway monitors list` / `sessions list`.
+ * Presentation layer for `gajaeway monitors list` / `sessions list` / `holds list`.
  *
  * Rendering contract:
  * - Default output is a padded column table, one record per line, so agent
@@ -88,7 +88,13 @@ export function headerLabel(name: string): string {
 
 export function formatCell(value: unknown): string {
 	if (value === null || value === undefined) return "-";
-	const text = Array.isArray(value) ? (value.length === 0 ? "-" : value.join(",")) : String(value);
+	const text = Array.isArray(value)
+		? value.length === 0
+			? "-"
+			: value.join(",")
+		: typeof value === "object"
+			? JSON.stringify(value)
+			: String(value);
 	if (text === "") return "-";
 	return text.length > MAX_CELL_WIDTH ? `${text.slice(0, MAX_CELL_WIDTH - 1)}…` : text;
 }
@@ -165,6 +171,18 @@ export const SESSION_COLUMNS: readonly Column<SessionListRow>[] = [
 	},
 	{ name: "createdAt", value: (session) => session.createdAt },
 	{ name: "lastActivityAt", value: (session) => session.lastActivityAt },
+];
+
+export const HOLD_COLUMNS: readonly Column<GatewayStatusResult["holds"][number]>[] = [
+	{ name: "opRef", value: (hold) => hold.opRef },
+	{ name: "origin", value: (hold) => hold.originKey },
+	{ name: "epoch", value: (hold) => hold.epoch },
+	{ name: "state", value: (hold) => hold.state },
+	{ name: "reason", value: (hold) => hold.reason },
+	{ name: "since", value: (hold) => hold.since },
+	{ name: "deadline", value: (hold) => hold.deadline },
+	{ name: "sweeps", value: (hold) => hold.sweeps },
+	{ name: "fence", value: (hold) => hold.fence },
 ];
 
 /**

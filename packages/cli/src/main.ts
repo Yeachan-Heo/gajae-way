@@ -5,6 +5,7 @@ import { LOOPBACK_ORIGIN, originKey } from "@gajaeway/protocol";
 import { GajaewayClient } from "@gajaeway/sdk";
 import {
 	columnNames,
+	HOLD_COLUMNS,
 	type ListOptions,
 	MONITOR_COLUMNS,
 	parseListOptions,
@@ -29,6 +30,7 @@ export const COMMANDS = [
 	"chat",
 	"daemon",
 	"sessions",
+	"holds",
 	"ops",
 	"memory",
 	"monitors",
@@ -36,7 +38,7 @@ export const COMMANDS = [
 ] as const;
 
 export const CLI_USAGE =
-	"usage: gajaeway [--socket PATH] status|shutdown|chat|daemon run|sessions list [--json] [--fields a,b,c] [--limit N] [--offset N]|sessions inspect <originKey-or-index>|memory audit|memory search <query>|monitors ...|work run <name> [--cwd DIR] <text>|ops backup <path>|ops cycle [--json]|ops integrity|ops restore <backupPath>";
+	"usage: gajaeway [--socket PATH] status|shutdown|chat|daemon run|holds list [--json] [--fields a,b,c] [--limit N] [--offset N]|sessions list [--json] [--fields a,b,c] [--limit N] [--offset N]|sessions inspect <originKey-or-index>|memory audit|memory search <query>|monitors ...|work run <name> [--cwd DIR] <text>|ops backup <path>|ops cycle [--json]|ops integrity|ops restore <backupPath>";
 
 /** Usage errors exit 2, as `gajaeway-gateway` does; 1 stays a runtime failure. */
 export const USAGE_EXIT_CODE = 2;
@@ -231,6 +233,22 @@ export async function main(args = process.argv.slice(2)): Promise<void> {
 					console.log("Launch the gateway out-of-band with: bun packages/gateway/src/main.ts daemon");
 				else throw new Error("usage: gajaeway daemon run");
 				break;
+			case "holds": {
+				if (parsed.rest[0] !== "list")
+					throw new Error(
+						`usage: gajaeway holds list [--json] [--fields ${columnNames(HOLD_COLUMNS).join(",")}] [--limit N] [--offset N]`,
+					);
+				const options = parseListOptions(parsed.rest.slice(1), HOLD_COLUMNS);
+				const client = await GajaewayClient.connectSocket(parsed.socket);
+				try {
+					const { holds } = await client.status();
+					for (const line of renderList(HOLD_COLUMNS, holds, options, { key: "holds", result: { holds } }))
+						console.log(line);
+				} finally {
+					await client.close();
+				}
+				break;
+			}
 			// Flag validation happens before the socket connect so a bad
 			// `--fields`/`--limit` fails fast without a running gateway.
 			case "sessions": {

@@ -1,6 +1,8 @@
 import { Database } from "bun:sqlite";
 import { mkdir } from "node:fs/promises";
 import { dirname } from "node:path";
+import { CATCH_ALL_EVENT_ORIGIN, eventTypeOrigin, originKey } from "@gajaeway/protocol";
+import { EPOCH_MUTATION_REASONS, type EpochMutationInput, type EpochMutationRow, type HoldRow } from "./epoch-mutation";
 
 /**
  * A gjc model selection: either an explicit selector string or a model profile
@@ -86,7 +88,7 @@ export class InboundTurnConflictError extends Error {
 	}
 }
 
-const LATEST_SCHEMA_VERSION = 20;
+const LATEST_SCHEMA_VERSION = 21;
 /** Maximum number of prior messages supplied to one engaged conversation turn. */
 export const CONVERSATION_DIFF_MAX_ROWS = 60;
 /** Maximum age of prior messages supplied to one engaged conversation turn. */
@@ -307,39 +309,103 @@ export class GatewayDatabase {
 		);
 	}
 
-	bumpEpoch(originKey: string, originRefJson: string): number {
-		const now = new Date().toISOString();
-		this.#database
-			.query(
-				"INSERT INTO sessions (origin_key, origin_ref_json, gjc_session_id, epoch, created_at, last_activity_at) VALUES (?, ?, '', 1, ?, ?) ON CONFLICT(origin_key) DO UPDATE SET epoch = epoch + 1, gjc_session_id = '', turn_count = 0, origin_ref_json = excluded.origin_ref_json, last_activity_at = excluded.last_activity_at",
-			)
-			.run(originKey, originRefJson, now, now);
-		return this.#database
-			.query<{ epoch: number }, [string]>("SELECT epoch FROM sessions WHERE origin_key = ?")
-			.get(originKey)!.epoch;
+	/** The sole epoch rotation writer; joins an existing caller transaction. */
+	mutateEpoch(originKey: string, input: EpochMutationInput): { fromEpoch: number; toEpoch: number } {
+		if (!EPOCH_MUTATION_REASONS.includes(input.reason))
+			throw new Error(`unknown epoch mutation reason: ${input.reason}`);
+		const mutate = () => {
+			const previous = this.getSessionRecord(originKey);
+			const fromEpoch = previous?.epoch ?? 0;
+			const now = new Date().toISOString();
+			this.#database
+				.query(
+					"INSERT INTO sessions (origin_key, origin_ref_json, gjc_session_id, epoch, turn_count, created_at, last_activity_at) VALUES (?, ?, '', 1, 0, ?, ?) ON CONFLICT(origin_key) DO UPDATE SET epoch = epoch + 1, gjc_session_id = '', turn_count = 0, origin_ref_json = COALESCE(excluded.origin_ref_json, sessions.origin_ref_json), last_activity_at = excluded.last_activity_at",
+				)
+				.run(originKey, input.originRefJson ?? null, now, now);
+			const toEpoch = fromEpoch + 1;
+			this.#database
+				.query(
+					"INSERT INTO epoch_mutations (origin_key, scope, from_epoch, to_epoch, from_session_id, broker_generation, reason, op_ref, cause_kind, cause_ref, actor, at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+				)
+				.run(
+					originKey,
+					input.scope,
+					fromEpoch,
+					toEpoch,
+					previous?.sessionId || null,
+					this.metaGet("broker_generation") ?? null,
+					input.reason,
+					input.opRef ?? null,
+					input.cause.kind,
+					input.cause.ref ?? null,
+					input.actor ?? null,
+					now,
+				);
+			return { fromEpoch, toEpoch };
+		};
+		return this.#inTransaction ? mutate() : this.withTransaction(mutate);
 	}
 
-	/**
-	 * Rebind reset for a poisoned gjc session key (#13): the same semantics as
-	 * the `/new` reset path — epoch + 1, turn_count back to 0, and the gjc
-	 * binding cleared, so the next session.create op derives a fresh idempotency
-	 * key and a recovery near the rotation boundary cannot instantly discard its
-	 * fresh binding on an inherited count — but the stored origin ref is kept,
-	 * because a rebind is a runtime recovery rather than a user command and
-	 * carries no origin payload of its own.
-	 */
-	rebindEpoch(originKey: string): number {
-		const now = new Date().toISOString();
-		this.#database
-			.query(
-				"INSERT INTO sessions (origin_key, gjc_session_id, epoch, turn_count, created_at, last_activity_at) VALUES (?, '', 1, 0, ?, ?) ON CONFLICT(origin_key) DO UPDATE SET epoch = epoch + 1, gjc_session_id = '', turn_count = 0, last_activity_at = excluded.last_activity_at",
+	listEpochMutations({ sinceMs }: { sinceMs: number }): EpochMutationRow[] {
+		return this.#database
+			.query<EpochMutationRow, [string]>(
+				"SELECT id, origin_key AS originKey, scope, from_epoch AS fromEpoch, to_epoch AS toEpoch, from_session_id AS fromSessionId, broker_generation AS brokerGeneration, reason, op_ref AS opRef, cause_kind AS causeKind, cause_ref AS causeRef, actor, at FROM epoch_mutations WHERE at >= ? ORDER BY at, id",
 			)
-			.run(originKey, now, now);
-		const row = this.#database
-			.query<{ epoch: number }, [string]>("SELECT epoch FROM sessions WHERE origin_key = ?")
-			.get(originKey);
-		if (!row) throw new Error(`session row for ${originKey} disappeared during rebind`);
-		return row.epoch;
+			.all(new Date(sinceMs).toISOString());
+	}
+
+	epochRotationSummary(sinceMs: number): {
+		last24h: number;
+		byReason: Record<string, number>;
+		byScope: Record<string, number>;
+	} {
+		const rows = this.listEpochMutations({ sinceMs });
+		const byReason: Record<string, number> = {};
+		const byScope: Record<string, number> = {};
+		for (const row of rows) {
+			byReason[row.reason] = (byReason[row.reason] ?? 0) + 1;
+			byScope[row.scope] = (byScope[row.scope] ?? 0) + 1;
+		}
+		return { last24h: rows.length, byReason, byScope };
+	}
+
+	listHolds(): HoldRow[] {
+		const rows = this.#database
+			.query<
+				Omit<HoldRow, "fence"> & { fenceOpRef: string | null; fenceSince: string | null; fenceDeadline: string | null },
+				[]
+			>(
+				"SELECT i.turn_op_ref AS opRef, i.origin_key AS originKey, i.turn_epoch AS epoch, i.turn_state AS state, i.hold_reason AS reason, i.hold_since AS since, i.hold_deadline_at AS deadline, i.hold_sweeps AS sweeps, s.fence_op_ref AS fenceOpRef, s.fence_since AS fenceSince, s.fence_deadline_at AS fenceDeadline FROM inbound_messages i LEFT JOIN sessions s ON s.origin_key = i.origin_key AND s.epoch = i.turn_epoch WHERE i.turn_role = 'trigger' AND i.turn_state IN ('bound','accepted') AND i.hold_reason IS NOT NULL ORDER BY i.hold_since, i.message_id",
+			)
+			.all();
+		return rows.map(({ fenceOpRef, fenceSince, fenceDeadline, ...row }) => ({
+			...row,
+			fence: fenceOpRef === null ? null : { opRef: fenceOpRef, since: fenceSince, deadline: fenceDeadline },
+		}));
+	}
+
+	reclassifyPendingWrites(): { preWriteFailure: number; writtenUnconfirmed: number } {
+		return this.withTransaction(() => {
+			const now = new Date().toISOString();
+			const preWriteFailure = this.#database
+				.query(
+					"UPDATE turn_attempts SET send_state = 'pre_write_failure', send_decided_at = ?, send_decided_by = 'boot' WHERE send_state = 'pending_write' AND spawn_gate_at IS NULL",
+				)
+				.run(now).changes;
+			const writtenUnconfirmed = this.#database
+				.query(
+					"UPDATE turn_attempts SET send_state = 'written_unconfirmed', send_decided_at = ?, send_decided_by = 'boot' WHERE send_state = 'pending_write' AND spawn_gate_at IS NOT NULL",
+				)
+				.run(now).changes;
+			return { preWriteFailure, writtenUnconfirmed };
+		});
+	}
+
+	pruneTurnAttempts(maxAgeMs: number): number {
+		if (!Number.isFinite(maxAgeMs) || maxAgeMs < 0) throw new Error("invalid turn attempt retention");
+		return this.#database
+			.query("DELETE FROM turn_attempts WHERE terminal_at IS NOT NULL AND terminal_at < ?")
+			.run(new Date(Date.now() - maxAgeMs).toISOString()).changes;
 	}
 
 	updateActivity(originKey: string, originRefJson: string): void {
@@ -2425,6 +2491,118 @@ ALTER TABLE monitor_slots ADD COLUMN event_id TEXT;`,
 				this.#database
 					.query("INSERT INTO schema_migrations (version, applied_at) VALUES (?, ?)")
 					.run(20, new Date().toISOString());
+			});
+		}
+		if (current < 21) {
+			this.withTransaction(() => {
+				this.#database.exec(`
+CREATE TABLE epoch_mutations (
+ id INTEGER PRIMARY KEY AUTOINCREMENT, origin_key TEXT NOT NULL,
+ scope TEXT NOT NULL CHECK(scope IN ('persona','monitor','work')),
+ from_epoch INTEGER NOT NULL, to_epoch INTEGER NOT NULL CHECK(to_epoch = from_epoch + 1),
+ from_session_id TEXT, broker_generation TEXT,
+ reason TEXT NOT NULL CHECK(reason IN (${EPOCH_MUTATION_REASONS.map((reason) => `'${reason}'`).join(",")})),
+ op_ref TEXT, cause_kind TEXT NOT NULL CHECK(cause_kind IN ('retirement','audit','operator','policy')),
+ cause_ref TEXT, actor TEXT, at TEXT NOT NULL
+);
+CREATE INDEX epoch_mutations_at ON epoch_mutations(at);
+CREATE TABLE turn_attempts (
+ trigger_message_id TEXT NOT NULL, attempt INTEGER NOT NULL CHECK(attempt >= 0),
+ origin_key TEXT NOT NULL, scope TEXT NOT NULL DEFAULT 'persona' CHECK(scope IN ('persona','monitor','work')),
+ epoch INTEGER, op_ref TEXT, session_id TEXT, host_pid INTEGER, host_incarnation TEXT,
+ transport TEXT CHECK(transport IN ('cli','channel')), cold INTEGER CHECK(cold IN (0,1)),
+ bound_at TEXT NOT NULL, send_started_at TEXT, spawn_gate_at TEXT,
+ send_state TEXT NOT NULL CHECK(send_state IN ('pending_write','pre_write_failure','written_unconfirmed','accepted')),
+ send_decided_at TEXT, send_decided_by TEXT CHECK(send_decided_by IN ('runner','boot')),
+ admission TEXT NOT NULL CHECK(admission IN ('unknown','refused','accepted')),
+ admission_code TEXT, admission_decided_at TEXT, accepted_at TEXT, terminal_at TEXT,
+ terminal_disposition TEXT CHECK(terminal_disposition IN ('delivered','silent','failed','operation_lost','abandoned')),
+ text_source TEXT, prompt_hash TEXT, legacy INTEGER NOT NULL DEFAULT 0 CHECK(legacy IN (0,1)),
+ binding_reconstructed INTEGER NOT NULL DEFAULT 0 CHECK(binding_reconstructed IN (0,1)),
+ PRIMARY KEY(trigger_message_id, attempt)
+);
+CREATE INDEX turn_attempts_terminal ON turn_attempts(terminal_at);
+CREATE TRIGGER turn_attempts_monotonic BEFORE UPDATE OF send_state, admission ON turn_attempts
+WHEN (NEW.send_state <> OLD.send_state AND NOT (
+ (OLD.send_state = 'pending_write' AND NEW.send_state IN ('pre_write_failure','written_unconfirmed')) OR
+ (OLD.send_state = 'written_unconfirmed' AND NEW.send_state = 'accepted')
+)) OR (NEW.admission <> OLD.admission AND NOT (OLD.admission = 'unknown' AND NEW.admission IN ('refused','accepted')))
+BEGIN SELECT RAISE(ABORT, 'turn_attempts_non_monotonic'); END;
+CREATE TRIGGER turn_attempts_spawn_gate BEFORE UPDATE OF spawn_gate_at ON turn_attempts
+WHEN NEW.spawn_gate_at IS NOT OLD.spawn_gate_at AND NOT (OLD.spawn_gate_at IS NULL AND NEW.spawn_gate_at IS NOT NULL AND OLD.send_state = 'pending_write' AND NEW.send_state = 'pending_write')
+BEGIN SELECT RAISE(ABORT, 'turn_attempts_spawn_gate_immutable'); END;
+ALTER TABLE inbound_messages ADD COLUMN hold_reason TEXT;
+ALTER TABLE inbound_messages ADD COLUMN hold_since TEXT;
+ALTER TABLE inbound_messages ADD COLUMN hold_deadline_at TEXT;
+ALTER TABLE inbound_messages ADD COLUMN hold_sweeps INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE inbound_messages ADD COLUMN next_sweep_at TEXT;
+ALTER TABLE inbound_messages ADD COLUMN terminal_disposition TEXT CHECK(terminal_disposition IN ('delivered','silent','failed','operation_lost','abandoned'));
+ALTER TABLE inbound_messages ADD COLUMN terminal_failure_code TEXT;
+ALTER TABLE inbound_messages ADD COLUMN interim_delivered INTEGER NOT NULL DEFAULT 0 CHECK(interim_delivered IN (0,1));
+ALTER TABLE sessions ADD COLUMN fence_op_ref TEXT;
+ALTER TABLE sessions ADD COLUMN fence_since TEXT;
+ALTER TABLE sessions ADD COLUMN fence_deadline_at TEXT;
+CREATE TABLE session_transcript_watermarks (
+ session_id TEXT NOT NULL, op_ref TEXT NOT NULL, snapshot_revision TEXT NOT NULL, snapshot_generation INTEGER,
+ trigger_seq INTEGER NOT NULL, last_steer_seq INTEGER, terminal_seq INTEGER NOT NULL,
+ terminal_entry_id TEXT NOT NULL, terminal_ts TEXT NOT NULL, written_at TEXT NOT NULL,
+ PRIMARY KEY(session_id, op_ref)
+);
+INSERT INTO turn_attempts (trigger_message_id, attempt, origin_key, scope, epoch, op_ref, session_id, bound_at, send_state, admission, legacy)
+ SELECT message_id, 0, origin_key, 'persona', turn_epoch, turn_op_ref, bound_session_id, COALESCE(dispatched_at, received_at), 'written_unconfirmed', 'unknown', 1
+ FROM inbound_messages WHERE turn_role = 'trigger' AND turn_state IN ('bound','accepted');
+INSERT INTO turn_attempts (trigger_message_id, attempt, origin_key, scope, epoch, op_ref, session_id, bound_at, send_state, admission, legacy)
+ SELECT 'work:' || j.job_id || ':' || a.key, 0, 'work:' || j.lane_key, 'work', NULL,
+ json_extract(a.value, '$.opRef'), json_extract(a.value, '$.sessionId'), json_extract(a.value, '$.startedAt'), 'written_unconfirmed', 'unknown', 1
+ FROM lane_jobs j, json_each(j.record_json, '$.attempts') a WHERE json_extract(a.value, '$.endedAt') IS NULL;
+`);
+				// Schema-plan gateway_meta keys belong to the existing meta table.
+				this.#database.exec(
+					"INSERT OR IGNORE INTO meta (key, value) VALUES ('credential_generation', '0'), ('audit_backfill_done', '0')",
+				);
+				// v20 stored no historical monitor binding; reconstruct the runtime routing rule.
+				const dispatched = this.#database
+					.query<
+						{
+							event_id: string;
+							event_type: string;
+							batch_id: string | null;
+							updated_at: string;
+							event_types_json: string;
+						},
+						[]
+					>(
+						"SELECT e.event_id, e.event_type, e.batch_id, e.updated_at, m.event_types_json FROM monitor_events e JOIN monitors m ON m.monitor_id = e.monitor_id WHERE e.stage = 'dispatched'",
+					)
+					.all();
+				let unbound = 0;
+				for (const event of dispatched) {
+					const declared = parseStringList(event.event_types_json);
+					const key = originKey(
+						declared.includes(event.event_type) ? eventTypeOrigin(event.event_type) : CATCH_ALL_EVENT_ORIGIN,
+					);
+					const session = this.getSessionRecord(key);
+					if (!session?.sessionId) {
+						unbound++;
+						continue;
+					}
+					this.#database
+						.query(
+							"INSERT INTO turn_attempts (trigger_message_id, attempt, origin_key, scope, epoch, op_ref, session_id, bound_at, send_state, admission, legacy, binding_reconstructed) VALUES (?, 0, ?, 'monitor', ?, ?, ?, ?, 'written_unconfirmed', 'unknown', 1, 1)",
+						)
+						.run(
+							`monitor:${event.event_id}`,
+							key,
+							session.epoch,
+							event.batch_id ? `gw-m-${event.batch_id.replaceAll("-", "")}` : null,
+							session.sessionId,
+							event.updated_at,
+						);
+				}
+				if (unbound > 0) console.error(`schema21_backfill monitor_dispatched_without_session=${unbound}`);
+				this.#database
+					.query("INSERT INTO schema_migrations (version, applied_at) VALUES (?, ?)")
+					.run(21, new Date().toISOString());
 			});
 		}
 	}

@@ -709,6 +709,8 @@ async function handleRequest(
 					sessions: { active: options.database.activeSessionCount },
 					delivery: runtime.delivery.status(),
 					contextDiff: options.database.contextDiagnostics(),
+					holds: options.database.listHolds(),
+					rotations: options.database.epochRotationSummary(Date.now() - 24 * 60 * 60 * 1_000),
 				},
 			});
 			return;

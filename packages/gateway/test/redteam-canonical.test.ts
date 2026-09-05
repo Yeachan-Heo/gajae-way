@@ -1103,7 +1103,9 @@ test("D8: migration 19 maps every v18 row exactly once even when a corrupt attri
 	const home = await mkdtemp(join(tmpdir(), "gajaeway-redteam-migrate-"));
 	const path = join(home, "gateway.db");
 	try {
-		(await GatewayDatabase.open(path)).close();
+		// Build the pre-21 shape from the real historical migrations so the v18
+		// rewind below never has to undo schema-21 objects by hand.
+		(await (await import("./fixtures/schema20-db")).openSchema20(path)).close();
 		const raw = new (await import("bun:sqlite")).Database(path);
 		raw.exec(`
 DROP TABLE inbound_messages;

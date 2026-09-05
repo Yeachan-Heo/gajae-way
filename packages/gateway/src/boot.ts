@@ -40,13 +40,20 @@ export async function bootGateway(options: BootGatewayOptions = {}): Promise<Gat
 	);
 	const database = await GatewayDatabase.open(config.dbPath);
 	let broker: BrokerSupervisor | undefined;
+	let pruneTimer: ReturnType<typeof setInterval> | undefined;
+	let unsubscribeGeneration: (() => void) | undefined;
 	try {
+		database.reclassifyPendingWrites();
+		database.pruneTurnAttempts(30 * 24 * 60 * 60 * 1000);
 		broker = new BrokerSupervisor({
 			...options.broker,
 			home: config.home,
 			instanceId: database.instanceId,
 			cwd: join(config.home, "workspace"),
 		});
+		unsubscribeGeneration = broker.onGeneration((generation) =>
+			database.metaSet("broker_generation", String(generation)),
+		);
 		// F92-C-P1-005: the Stage 0 floor is a boot gate, never an offline config check.
 		await broker.preflight();
 		const persona = new PersonaLoader(config.home);
@@ -56,6 +63,14 @@ export async function bootGateway(options: BootGatewayOptions = {}): Promise<Gat
 		seedDefaultMonitors(new MonitorRegistry(database), database);
 		const ledger = new DeliveryLedger(database);
 		const pruned = ledger.prune(7 * 24 * 60 * 60 * 1000);
+		pruneTimer = setInterval(
+			() => {
+				ledger.prune(7 * 24 * 60 * 60 * 1000);
+				database.pruneTurnAttempts(30 * 24 * 60 * 60 * 1000);
+			},
+			24 * 60 * 60 * 1000,
+		);
+		pruneTimer.unref();
 		const pending = ledger.listUndelivered(24 * 60 * 60 * 1000).length;
 		// The persona lives in its own dedicated workspace, never in the gateway's
 		// process cwd (which is typically the product source checkout): a session
@@ -78,6 +93,8 @@ export async function bootGateway(options: BootGatewayOptions = {}): Promise<Gat
 			tailRunner,
 		});
 		const close = async () => {
+			clearInterval(pruneTimer);
+			unsubscribeGeneration?.();
 			database.close();
 			await releaseGatewayHome(config.home);
 		};
@@ -105,6 +122,8 @@ export async function bootGateway(options: BootGatewayOptions = {}): Promise<Gat
 		console.error(JSON.stringify({ recovery: { recovered: pending, pending, pruned } }));
 		return server;
 	} catch (error) {
+		clearInterval(pruneTimer);
+		unsubscribeGeneration?.();
 		try {
 			await broker?.stop();
 		} catch (stopError) {
