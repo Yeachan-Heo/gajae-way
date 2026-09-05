@@ -1,0 +1,175 @@
+[
+  {
+    "sha256": "da02c94b639ceee2bb93cdc9041323c422be2194da008b7f1deda3ae7f20cea8",
+    "temporaryRoot": "/var/folders/yl/ndsjfsl95t781x9qyjrqyqc80000gn/T/gajaeway-recordings-9abp6v9o",
+    "retry": "disabled in throwaway config for failed-turn probe"
+  },
+  {
+    "argv": [
+      "sdk",
+      "session",
+      "list",
+      "--scope",
+      "cwd"
+    ],
+    "exitCode": 0,
+    "stdout": "{\"ok\":true,\"result\":{\"version\":2,\"source\":\"broker\",\"scope\":\"cwd\",\"selection\":{\"scope\":\"cwd\",\"path\":\"/private/var/folders/yl/ndsjfsl95t781x9qyjrqyqc80000gn/T/gajaeway-recordings-9abp6v9o/workspace\"},\"indexSeq\":0,\"sessions\":[],\"warnings\":[]}}\n",
+    "stderr": "",
+    "elapsedMs": 5269
+  },
+  {
+    "argv": [
+      "sdk",
+      "session",
+      "raw",
+      "global",
+      "--op",
+      "session.create",
+      "--idempotency-key",
+      "recordings-create",
+      "--json-input",
+      "{\"cwd\": \"/var/folders/yl/ndsjfsl95t781x9qyjrqyqc80000gn/T/gajaeway-recordings-9abp6v9o/workspace\"}"
+    ],
+    "exitCode": 0,
+    "stdout": "{\"ok\":true,\"operation\":\"session.create\",\"result\":{\"sessionId\":\"9625dbb8-b9e9-49ac-9ff1-b6b4c9f5b5bc\",\"cwd\":\"/var/folders/yl/ndsjfsl95t781x9qyjrqyqc80000gn/T/gajaeway-recordings-9abp6v9o/workspace\",\"endpointGeneration\":1}}\n",
+    "stderr": "",
+    "elapsedMs": 5767
+  },
+  {
+    "channelRequest": {
+      "type": "control_request",
+      "id": "e658ab54-036b-47a2-a78e-bb1d695b9621",
+      "input": {
+        "id": "gpt-default"
+      },
+      "operation": "model.profile.set"
+    },
+    "channelResponse": {
+      "type": "control_response",
+      "id": "e658ab54-036b-47a2-a78e-bb1d695b9621",
+      "ok": true,
+      "result": {
+        "changed": true,
+        "id": "gpt-default"
+      }
+    }
+  },
+  {
+    "channelRequest": {
+      "type": "control_request",
+      "id": "5dd7719a-3064-4ca7-a060-1478faa25b87",
+      "input": {
+        "id": "layofflabs/gpt-image-2"
+      },
+      "operation": "model.set"
+    },
+    "channelResponse": {
+      "type": "control_response",
+      "id": "5dd7719a-3064-4ca7-a060-1478faa25b87",
+      "ok": true,
+      "result": {
+        "changed": true
+      }
+    }
+  },
+  {
+    "argv": [
+      "sdk",
+      "session",
+      "send",
+      "9625dbb8-b9e9-49ac-9ff1-b6b4c9f5b5bc",
+      "--text",
+      "Reply FAIL_PROBE.",
+      "--op-ref",
+      "failed",
+      "--wait",
+      "--timeout-ms",
+      "180000"
+    ],
+    "exitCode": 0,
+    "stdout": "{\"ok\":true,\"result\":{\"version\":2,\"operationRef\":\"failed\",\"status\":\"failed\",\"receipt\":{\"commandId\":\"a2563531-551f-4f64-8eeb-2563304bc13e\",\"turnId\":\"50792938-1ea1-463e-b9f9-32074ee08e10\",\"accepted\":true,\"clientRef\":\"failed\"},\"statusDetail\":{\"status\":\"failed\",\"kind\":\"prompt\",\"commandId\":\"a2563531-551f-4f64-8eeb-2563304bc13e\",\"turnId\":\"50792938-1ea1-463e-b9f9-32074ee08e10\",\"clientRef\":\"failed\",\"acceptedAt\":1788627289702,\"startedAt\":1788627289717,\"terminalAt\":1788627289911,\"receiptState\":\"missing\",\"outcome\":{\"kind\":\"failed\",\"code\":\"prompt_failed\",\"message\":\"Prompt submission failed.\",\"provenance\":\"agent_failed\"},\"error\":{\"code\":\"agent_error\",\"message\":\"Prompt submission failed.\"}}}}\n",
+    "stderr": "",
+    "elapsedMs": 1869
+  },
+  {
+    "argv": [
+      "sdk",
+      "session",
+      "status",
+      "9625dbb8-b9e9-49ac-9ff1-b6b4c9f5b5bc",
+      "failed"
+    ],
+    "exitCode": 0,
+    "stdout": "{\"ok\":true,\"result\":{\"version\":2,\"operationRef\":\"failed\",\"status\":{\"status\":\"failed\",\"kind\":\"prompt\",\"commandId\":\"a2563531-551f-4f64-8eeb-2563304bc13e\",\"turnId\":\"50792938-1ea1-463e-b9f9-32074ee08e10\",\"clientRef\":\"failed\",\"acceptedAt\":1788627289702,\"startedAt\":1788627289717,\"terminalAt\":1788627289911,\"receiptState\":\"missing\",\"outcome\":{\"kind\":\"failed\",\"code\":\"prompt_failed\",\"message\":\"Prompt submission failed.\",\"provenance\":\"agent_failed\"},\"error\":{\"code\":\"agent_error\",\"message\":\"Prompt submission failed.\"}},\"summary\":{\"completed\":true}}}\n",
+    "stderr": "",
+    "elapsedMs": 1537
+  },
+  {
+    "channelRequest": {
+      "type": "query_request",
+      "id": "0ea9d738-0b81-491d-bdb0-e1bc47c474c5",
+      "input": {},
+      "query": "session.checkpoint"
+    },
+    "channelResponse": {
+      "type": "query_response",
+      "id": "0ea9d738-0b81-491d-bdb0-e1bc47c474c5",
+      "ok": true,
+      "result": {
+        "checkpointToken": "{\"envelope\":{\"cursorVersion\":1,\"protocolMajor\":3,\"sessionId\":\"9625dbb8-b9e9-49ac-9ff1-b6b4c9f5b5bc\",\"resource\":\"transcript\",\"revision\":\"1\",\"highWatermark\":{\"revision\":2,\"generation\":1,\"seq\":6,\"idle\":true},\"nonce\":\"9337d5b4-0cbe-4707-bfc1-0c6f91d62874\",\"position\":{\"offset\":0,\"selector\":{\"queryId\":\"Q01\"}},\"purpose\":\"checkpoint\",\"direction\":\"forward\",\"pageShape\":{\"targetBytes\":262144},\"issuedAt\":1788627291546,\"expiresAt\":1788628191546},\"mac\":\"d56c0c373029729f8d931b3a409656682bdb6265c0bf15c2323294cd9a464ee6\"}",
+        "checkpoint": {
+          "revision": 2,
+          "generation": 1,
+          "seq": 6,
+          "idle": true
+        },
+        "revisionId": "1",
+        "issuedAt": 1788627291546,
+        "expiresAt": 1788628191546
+      }
+    }
+  },
+  {
+    "argv": [
+      "sdk",
+      "session",
+      "raw",
+      "query",
+      "9625dbb8-b9e9-49ac-9ff1-b6b4c9f5b5bc",
+      "--query",
+      "session.checkpoint",
+      "--json-input-file",
+      "/var/folders/yl/ndsjfsl95t781x9qyjrqyqc80000gn/T/gajaeway-recordings-9abp6v9o/checkpoint.json"
+    ],
+    "exitCode": 0,
+    "stdout": "{\"type\":\"query_response\",\"id\":\"9dd9b849-f262-46a1-b441-90996e48e0ff\",\"ok\":true,\"result\":{\"checkpoint\":{\"revision\":2,\"generation\":1,\"seq\":6,\"idle\":true},\"revisionId\":\"1\",\"issuedAt\":1788627293711,\"expiresAt\":1788628193711}}\n",
+    "stderr": "",
+    "elapsedMs": 2185
+  },
+  {
+    "channelRequest": {
+      "type": "query_request",
+      "id": "f8fac6ee-7bd2-4dd7-98ee-4f5646a6a8cc",
+      "input": {
+        "checkpointToken": "{\"envelope\": {\"cursorVersion\": 0}, \"mac\": \"foreign\"}"
+      },
+      "query": "session.checkpoint"
+    },
+    "channelResponse": {
+      "type": "query_response",
+      "id": "f8fac6ee-7bd2-4dd7-98ee-4f5646a6a8cc",
+      "ok": false,
+      "error": {
+        "code": "invalid_cursor",
+        "message": "invalid_cursor",
+        "restartQuery": true
+      }
+    }
+  },
+  {
+    "cleanupSignalledPids": [
+      85430,
+      85733
+    ]
+  }
+]

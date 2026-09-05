@@ -1,0 +1,24 @@
+{
+  "unicodeContentBytes": 16384,
+  "unicodeAssistantBytes": 29522,
+  "exactBytePrefix": true,
+  "projectionMatchesAppendAndParentAncestry": true,
+  "ancestryRows": [
+    {
+      "id": "cc68bec2",
+      "parentId": "d1d1dbdb",
+      "timestamp": "2026-09-05T16:36:59.597Z"
+    },
+    {
+      "id": "67aa83c4",
+      "parentId": "cc68bec2",
+      "timestamp": "2026-09-05T16:38:45.526Z"
+    }
+  ],
+  "paginationPages": 60,
+  "paginationItems": 520,
+  "oversizedBodyBytes": 300000,
+  "oversizedBodySha256": "de951af6536636b09b5cbfef6935484883c1d4474fad93d584266a2afdda7305",
+  "all520IdsInAppendOrder": true,
+  "all30EconomicsTurnsTerminalOk": true
+}

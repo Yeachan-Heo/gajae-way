@@ -1,4 +1,5 @@
 import type { CliResult, CliRunner } from "@gajaeway/subsession";
+import { createFakeGjc } from "../../test/fixtures/fake-gjc.mjs";
 import type { BrokerSupervisorDependencies, SpawnFn } from "./broker";
 
 type StubOperation = {
@@ -17,11 +18,16 @@ type StubOperation = {
  * stub never talks to a model provider.
  */
 export function testOnlyBrokerDependencies(): BrokerSupervisorDependencies {
+	const modeCommand = process.env.GAJAEWAY_FAKE_GJC_MODES ? createFakeGjc() : undefined;
 	const sessions = new Map<string, string>();
 	const operations = new Map<string, StubOperation>();
 	let sessionCount = 0;
 	const command: CliRunner = async (rawArgs) => {
 		const args = withoutAgentDir(rawArgs);
+		if (modeCommand) {
+			const overridden = await modeCommand(args);
+			if (overridden) return overridden;
+		}
 		if (args[0] === "--version") return success("gjc/0.15.6\n");
 		if (args[0] !== "sdk" || args[1] !== "session") return failure("stub_unsupported");
 
