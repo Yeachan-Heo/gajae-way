@@ -5,12 +5,12 @@
  * The local HTTP probe is independent evidence only: HEAD exposes no provider-probe integration seam.
  */
 import { expect, test } from "bun:test";
-import { startUnixServer } from "../../packages/gateway/src/server/server";
-import { ScriptedSessionPort } from "../../packages/gateway/test/session-port.fake";
-import { createFakeGjc } from "../../packages/gateway/test/fixtures/fake-gjc.mjs";
-import { BrokerSessionPort } from "../../packages/gateway/src/orchestrator/session-port";
-import { TailRunner } from "../../packages/gateway/src/orchestrator/tail-runner";
-import { eventually, harness } from "./harness";
+import { startUnixServer } from "../src/server/server";
+import { ScriptedSessionPort } from "./session-port.fake";
+import { createFakeGjc } from "./fixtures/fake-gjc.mjs";
+import { BrokerSessionPort } from "../src/orchestrator/session-port";
+import { TailRunner } from "../src/orchestrator/tail-runner";
+import { eventually, harness } from "./red-first-harness";
 
 test("red 6: repeated provider failures remain visible when an active probe disagrees", async () => {
 	const port = new ScriptedSessionPort({
@@ -23,7 +23,7 @@ test("red 6: repeated provider failures remain visible when an active probe disa
 		database: h.database,
 		cli: run,
 		instanceId: "red-provider",
-		tailRunner: new TailRunner({ run }),
+		tailRunner: new TailRunner({ run, repo: h.repo }),
 	});
 	port.status = real.status.bind(real);
 	let probeStatus = 403;

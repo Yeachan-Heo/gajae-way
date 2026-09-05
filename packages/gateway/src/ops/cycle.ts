@@ -65,15 +65,31 @@ export class RuntimeCycleProjector {
 	readonly #database: GatewayDatabase;
 	readonly #memory: { readonly queueDepth: number };
 
-	constructor(database: GatewayDatabase, memory: { readonly queueDepth: number }) {
+	readonly #extraGates: () => readonly CycleGateReason[];
+
+	constructor(
+		database: GatewayDatabase,
+		memory: { readonly queueDepth: number },
+		/** I7a: runtime-only gate sources (provider health, broker supervision, channel) that are not durable rows. */
+		extraGates: () => readonly CycleGateReason[] = () => [],
+	) {
 		this.#database = database;
 		this.#memory = memory;
+		this.#extraGates = extraGates;
 	}
 
 	/** Snapshots durable state and projects the runtime cycle. Read-only; no writes. */
 	project(now = new Date()): OpsCycleResult {
 		const sources = this.#sources(now.getTime());
-		return projectRuntimeCycle(sources, now.toISOString());
+		const projected = projectRuntimeCycle(sources, now.toISOString());
+		const held = this.#database
+			.listHolds()
+			.filter((hold) => hold.deadline !== null && Date.parse(hold.deadline) <= now.getTime());
+		const extra = new Set<CycleGateReason>(this.#extraGates());
+		if (held.length > 0) extra.add("turn_held_over_deadline");
+		if (extra.size === 0) return projected;
+		const gates = [...new Set<CycleGateReason>([...projected.gates, ...extra])];
+		return { ...projected, gates, phase: gates.length > 0 ? "degraded" : projected.phase };
 	}
 
 	#sources(nowMs: number): RuntimeCycleSources {

@@ -16,7 +16,7 @@ import {
 } from "@gajaeway/subsession";
 import type { GjcModelSelection, GjcServiceTier } from "../config";
 import type { GatewayDatabase, InboundMessageRow, InboundTurn } from "../store/db";
-import { rebindableCodeOf, sanitizeDiagnostic } from "./rebind";
+import { GjcRuntimeError, rebindableCodeOf, sanitizeDiagnostic } from "./rebind";
 import {
 	evaluateHold,
 	type HoldEvidence,
@@ -2365,12 +2365,13 @@ function witnessOf(status: PromptStatus, receipt: ReceiptState | undefined): Hol
 	return status === "accepted" ? "accepted" : "in_flight";
 }
 
+/** I7a: the notice carries the runtime's structured code (`code: message`), never only the folded text. */
 function terminalError(status: StatusReport): Error {
-	return new Error(
-		sanitizeDiagnostic(
-			status.status.error?.message ?? status.status.error?.code ?? `session status ${status.status.status}`,
-		),
+	const message = sanitizeDiagnostic(
+		status.status.error?.message ?? status.status.error?.code ?? `session status ${status.status.status}`,
 	);
+	const code = status.status.error?.code;
+	return new GjcRuntimeError(message, { ...(code ? { code } : {}), message });
 }
 
 function safeDiagnostic(error: unknown): string {

@@ -1,6 +1,6 @@
 import { chmod, mkdir } from "node:fs/promises";
 import { join } from "node:path";
-import { type ConfigOverrides, loadConfig } from "./config";
+import { type ConfigOverrides, loadConfig, type GatewayConfig } from "./config";
 import { seedDefaultMonitors } from "./monitors/defaults";
 import { MonitorRegistry } from "./monitors/registry";
 import { BrokerSupervisor, type BrokerSupervisorDependencies } from "./orchestrator/broker";
@@ -45,6 +45,10 @@ export async function bootGateway(options: BootGatewayOptions = {}): Promise<Gat
 	try {
 		database.reclassifyPendingWrites();
 		database.pruneTurnAttempts(30 * 24 * 60 * 60 * 1000);
+		// I7c: the process env is the credential SSOT read at boot (SIGHUP reloads
+		// config, never launchd env). A changed generation rotates only IDLE origins
+		// whose host predates this boot; held/accepted turns never rotate.
+		await applyCredentialGeneration(database, options);
 		broker = new BrokerSupervisor({
 			brokerReap: config.brokerReap,
 			// I6c: durable admission evidence drives the host audit; the first boot
@@ -141,4 +145,55 @@ export async function bootGateway(options: BootGatewayOptions = {}): Promise<Gat
 
 function diagnostic(error: unknown): string {
 	return sanitizeDiagnostic(error instanceof Error ? error.message : String(error)) || "unknown_error";
+}
+
+/** sha256(OPENAI_API_KEY || OPENAI_BASE_URL || sha256(~/.gjc/agent/models.yml)); the key never leaves the digest. */
+export async function computeCredentialGeneration(
+	env: NodeJS.ProcessEnv = process.env,
+	ssotAgentDir?: string,
+): Promise<string> {
+	const { createHash } = await import("node:crypto");
+	const { join } = await import("node:path");
+	const { homedir } = await import("node:os");
+	const modelsPath = join(ssotAgentDir ?? join(env.HOME ?? homedir(), ".gjc", "agent"), "models.yml");
+	let modelsDigest = "absent";
+	try {
+		modelsDigest = createHash("sha256")
+			.update(await Bun.file(modelsPath).text(), "utf8")
+			.digest("hex");
+	} catch {
+		modelsDigest = "absent";
+	}
+	return createHash("sha256")
+		.update(`${env.OPENAI_API_KEY ?? ""}\u0000${env.OPENAI_BASE_URL ?? ""}\u0000${modelsDigest}`, "utf8")
+		.digest("hex");
+}
+
+async function applyCredentialGeneration(database: GatewayDatabase, options: BootGatewayOptions): Promise<void> {
+	const generation = await computeCredentialGeneration(process.env, options.broker?.ssotAgentDir ?? undefined);
+	const previous = database.metaGet("credential_generation");
+	const bootIncarnation = new Date().toISOString();
+	database.metaSet("credential_generation_boot", bootIncarnation);
+	if (previous === undefined || previous === "0") {
+		database.metaSet("credential_generation", generation);
+		return;
+	}
+	if (previous === generation) return;
+	database.metaSet("credential_generation", generation);
+	let rotated = 0;
+	for (const row of database.idleOriginsForCredentialRotation()) {
+		database.mutateEpoch(row.origin_key, {
+			scope: row.origin_key.startsWith("monitor/")
+				? "monitor"
+				: row.origin_key.startsWith("work/")
+					? "work"
+					: "persona",
+			reason: "credential_stale",
+			cause: { kind: "policy", ref: `credential_generation:${generation.slice(0, 12)}` },
+		});
+		rotated += 1;
+	}
+	console.error(
+		`credential_generation_changed previous=${previous.slice(0, 12)} current=${generation.slice(0, 12)} rotated_idle_origins=${rotated}`,
+	);
 }

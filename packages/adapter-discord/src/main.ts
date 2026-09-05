@@ -78,6 +78,10 @@ export function createReactionPorts(): DiscordReactionPorts {
 
 /** Gateway liveness probe cadence; three consecutive failures reconnect. */
 const MONITOR_INTERVAL_MS = 30_000;
+/** I8 reconnect window: after `gateway.stopping` or a vanished socket, retry 250 ms -> 2 s cap for 120 s. */
+const FAST_RECONNECT_WINDOW_MS = 120_000;
+const FAST_RECONNECT_BASE_MS = 250;
+const FAST_RECONNECT_CAP_MS = 2_000;
 const MONITOR_RETRY_MS = 5_000;
 const MONITOR_STRIKES = 3;
 /** Working-status without a progress tick for this long is stale (gateway ticks every 15s). */
@@ -965,7 +969,17 @@ export type RecoveredSendResult =
 	| { readonly verdict: "acked" | "duplicate" }
 	| { readonly verdict: "unavailable"; readonly failure: RecoveryFailureClass; readonly summary: string };
 
+/** Test seams for the reconnect window (virtual clock, scripted socket); production uses the real ones. */
+export interface ReconnectClockSeams {
+	readonly now?: () => number;
+	readonly setTimeout?: (work: () => void, delayMs: number) => unknown;
+	readonly clearTimeout?: (timer: unknown) => void;
+	readonly connectSocket?: (path: string) => Promise<GajaewayClient>;
+}
+
 export class ReconnectingGateway {
+	/** Injected by tests only; see `ReconnectClockSeams`. */
+	seams: ReconnectClockSeams = {};
 	#client: GajaewayClient | undefined;
 	#reconnecting = false;
 	#attempt = 0;
@@ -1006,9 +1020,16 @@ export class ReconnectingGateway {
 
 	async connect(): Promise<void> {
 		try {
-			const client = await GajaewayClient.connectSocket(this.socketPath);
+			const client = await (this.seams.connectSocket ?? GajaewayClient.connectSocket)(this.socketPath);
 			this.#client = client;
 			this.#attempt = 0;
+			this.#windowSpent = false;
+			// I8: the gateway announces its stop before tearing down; open the fast
+			// window immediately instead of discovering the loss via the 30 s monitor.
+			// Registered first so a partially wired link still hears the announcement.
+			client.on("gateway.stopping", () => {
+				if (this.#client === client) this.openReconnectWindow("gateway.stopping");
+			});
 			this.#deliveryOff?.();
 			this.#deliveryOff = subscribeDiscordDeliveries(
 				client,
@@ -1026,7 +1047,14 @@ export class ReconnectingGateway {
 			// the user made before the link came back.
 			await this.#flushEdits();
 			void this.recoverMissedMessages();
-		} catch {
+		} catch (error) {
+			const code = (error as { code?: unknown } | undefined)?.code;
+			if ((code === "ENOENT" || code === "ECONNREFUSED") && !this.#windowSpent) {
+				// The socket is gone: a restart is in progress. Same fast window as an
+				// announced stop, opened once per outage (never re-armed on every miss).
+				this.openReconnectWindow(String(code));
+				return;
+			}
 			this.scheduleReconnect();
 		}
 	}
@@ -1576,15 +1604,46 @@ export class ReconnectingGateway {
 		);
 	}
 
+	/** I8: an announced stop / socket-gone window during which retries are fast (250 ms -> 2 s cap). */
+	#fastWindowUntil = 0;
+	/** One window per outage: it re-arms only after a successful connect, never on every refused attempt. */
+	#windowSpent = false;
+	#reconnectTimer: unknown;
+
+	/**
+	 * I8: the gateway said it is stopping, or its socket vanished (ENOENT /
+	 * ECONNREFUSED). Cancel any armed long delay, reset the attempt counter and
+	 * open a 120 s fast window; after it, the ordinary curve resumes.
+	 */
+	openReconnectWindow(reason: string): void {
+		if (this.#windowSpent) return;
+		this.#windowSpent = true;
+		this.#fastWindowUntil = (this.seams.now ?? Date.now)() + FAST_RECONNECT_WINDOW_MS;
+		this.#attempt = 0;
+		if (this.#reconnectTimer !== undefined) {
+			(this.seams.clearTimeout ?? ((timer: unknown) => clearTimeout(timer as ReturnType<typeof setTimeout>)))(
+				this.#reconnectTimer,
+			);
+			this.#reconnectTimer = undefined;
+			this.#reconnecting = false;
+		}
+		console.log(`Discord adapter reconnect window opened (${reason}).`);
+		this.scheduleReconnect();
+	}
+
 	private scheduleReconnect(): void {
 		if (this.#reconnecting) return;
 		this.#reconnecting = true;
 		this.#client = undefined;
 		this.#deliveryOff?.();
-		const delay = Math.min(30_000, 500 * 2 ** Math.min(this.#attempt++, 6));
-		const jitter = Math.floor(Math.random() * Math.max(1, delay / 4));
+		const fast = (this.seams.now ?? Date.now)() < this.#fastWindowUntil;
+		const delay = fast
+			? Math.min(FAST_RECONNECT_CAP_MS, FAST_RECONNECT_BASE_MS * 2 ** Math.min(this.#attempt++, 3))
+			: Math.min(30_000, 500 * 2 ** Math.min(this.#attempt++, 6));
+		const jitter = fast ? 0 : Math.floor(Math.random() * Math.max(1, delay / 4));
 		console.log(`Discord adapter gateway reconnecting in ${delay + jitter}ms.`);
-		setTimeout(() => {
+		this.#reconnectTimer = (this.seams.setTimeout ?? setTimeout)(() => {
+			this.#reconnectTimer = undefined;
 			this.#reconnecting = false;
 			void this.connect();
 		}, delay + jitter);

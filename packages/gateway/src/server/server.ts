@@ -66,6 +66,7 @@ import {
 import { formatFailureNotice, sanitizeDiagnostic } from "../orchestrator/rebind";
 import { type SessionPort, SessionRequestTimeoutError } from "../orchestrator/session-port";
 import { deterministicInterimDeliveryId, deterministicTerminalDeliveryId } from "../orchestrator/tail-runner";
+import { type ActiveProbeResult, ProviderHealth, probeProvider } from "../provider/probe";
 import { buildSessionBootstrap } from "../persona/bootstrap";
 import { PersonaLoader } from "../persona/persona";
 import type { GatewayDatabase, InboundMessageRow, MonitorEventStage } from "../store/db";
@@ -222,6 +223,9 @@ export interface GatewayServerOptions {
 	readonly progress?: { readonly firstAfterMs?: number; readonly intervalMs?: number };
 	/** Test seam: how /restart ends the process after the ordered stop (default process.exit). */
 	readonly exitProcess?: (code: number) => void;
+	/** I7b seam: replace the real `GET $OPENAI_BASE_URL/models` in tests. */
+	readonly providerProbe?: typeof probeProvider;
+	readonly providerProbeInitialDelayMs?: number;
 	/** Test seam for the persona tail stall heartbeat; production uses the 5s default. */
 	readonly stallCheckIntervalMs?: number;
 	/** Mid-work speech pacing (issue #71). */
@@ -301,6 +305,11 @@ interface Runtime {
 	readonly requests: Set<Promise<void>>;
 	/** Read-only runtime-cycle projection (ops.cycle); owns no writes. */
 	readonly cycle: RuntimeCycleProjector;
+	/** I7: passive + active provider health. */
+	readonly provider: ProviderHealth;
+	/** I7: last-hour terminal outcomes. */
+	readonly turnOutcomes: Array<{ at: number; ok: boolean; code?: string }>;
+	providerProbeTimer?: ReturnType<typeof setTimeout>;
 }
 
 export async function startUnixServer(options: GatewayServerOptions): Promise<GatewayServer> {
@@ -310,6 +319,7 @@ export async function startUnixServer(options: GatewayServerOptions): Promise<Ga
 		if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
 	}
 	const runtime = createRuntime(options);
+	startProviderProbe(runtime, options);
 	void runtime.memory.initialize();
 	void runtime.monitors.reconcile();
 	await runtime.monitorRuntime.start();
@@ -409,6 +419,7 @@ export async function startUnixServer(options: GatewayServerOptions): Promise<Ga
 
 export function startStdioServer(options: GatewayServerOptions): GatewayServer {
 	const runtime = createRuntime(options);
+	startProviderProbe(runtime, options);
 	void runtime.memory.initialize();
 	void runtime.monitors.reconcile();
 	void runtime.monitorRuntime.start();
@@ -491,6 +502,69 @@ export function startStdioServer(options: GatewayServerOptions): GatewayServer {
  */
 const SHUTDOWN_EXIT_HEADROOM_MS = 1_500;
 
+/** I7a: supervision view for status; tolerant of partial broker doubles in tests. */
+function brokerStatus(broker: GatewayServerOptions["broker"]) {
+	const view = broker as
+		| {
+				generation?: number;
+				serviceabilityStrikes?: number;
+				lastHostAudit?: unknown;
+				residentChannels?: number;
+				cliSpawnsTotal?: number;
+		  }
+		| undefined;
+	return {
+		generation: view?.generation ?? 0,
+		healthy: (view?.generation ?? 0) > 0,
+		liveStrikes: 0,
+		serviceabilityStrikes: view?.serviceabilityStrikes ?? 0,
+		lastRetireReason: undefined,
+		cliSpawnsTotal: view?.cliSpawnsTotal ?? 0,
+		residentChannels: view?.residentChannels ?? 0,
+	};
+}
+
+function summarizeTurns(outcomes: readonly { at: number; ok: boolean; code?: string }[]) {
+	const floor = Date.now() - 60 * 60_000;
+	const recent = outcomes.filter((entry) => entry.at >= floor);
+	const byCode: Record<string, number> = {};
+	for (const entry of recent)
+		if (!entry.ok) byCode[entry.code ?? "unknown"] = (byCode[entry.code ?? "unknown"] ?? 0) + 1;
+	return {
+		completed: recent.filter((entry) => entry.ok).length,
+		failed: recent.filter((entry) => !entry.ok).length,
+		byCode,
+	};
+}
+
+/**
+ * I7b (Q2): the active credential probe on its own timer. Cadence follows the
+ * gate (60 s while failing, 5 min otherwise). Uses the same bearer env gjc
+ * inherits; never follows redirects; logs class + status + Location host only.
+ */
+function startProviderProbe(runtime: Runtime, options: GatewayServerOptions): void {
+	const probeOnce = async () => {
+		const result: ActiveProbeResult = await (options.providerProbe ?? probeProvider)({
+			baseUrl: process.env.OPENAI_BASE_URL,
+			apiKey: process.env.OPENAI_API_KEY,
+		});
+		runtime.provider.recordActive(result);
+		if (result.class !== "ok")
+			console.error(
+				`provider_probe class=${result.class} status=${result.httpStatus ?? "none"}${result.locationHost ? ` location_host=${result.locationHost}` : ""}${result.detail ? ` detail=${result.detail}` : ""}`,
+			);
+	};
+	const schedule = (delayMs: number) => {
+		runtime.providerProbeTimer = setTimeout(() => {
+			void probeOnce()
+				.catch((error: unknown) => console.error(`provider_probe_failed detail=${diagnostic(error)}`))
+				.finally(() => schedule(runtime.provider.nextProbeDelayMs()));
+		}, delayMs);
+		runtime.providerProbeTimer.unref?.();
+	};
+	schedule(options.providerProbeInitialDelayMs ?? 5_000);
+}
+
 async function orderedStop(
 	runtime: Runtime,
 	options: GatewayServerOptions,
@@ -532,6 +606,7 @@ async function orderedStop(
 		clearInterval(runtime.reconcileTimer);
 		clearInterval(runtime.stallTimer);
 		clearInterval(runtime.contextMaintenanceTimer);
+		if (runtime.providerProbeTimer) clearTimeout(runtime.providerProbeTimer);
 		// (4) mailboxes stop admitting new work; the broker's CLI slot wait and child
 		// timeout are bounded by what is left of the budget.
 		runtime.personaSessions.beginStopping();
@@ -684,6 +759,7 @@ function createRuntime(options: GatewayServerOptions): Runtime {
 						);
 				})
 			: undefined;
+	const provider = new ProviderHealth();
 	runtime = {
 		config: options.config,
 		delivery,
@@ -700,7 +776,15 @@ function createRuntime(options: GatewayServerOptions): Runtime {
 		contextMaintenanceTimer,
 		...(stopBrokerGenerationListener ? { stopBrokerGenerationListener } : {}),
 		reactions: new ReactionBudget(),
-		cycle: new RuntimeCycleProjector(options.database, memory),
+		cycle: new RuntimeCycleProjector(options.database, memory, () => {
+			const gates: Array<"provider_failing" | "broker_degraded"> = [];
+			if (provider.gated) gates.push("provider_failing");
+			const brokerView = options.broker as { serviceabilityStrikes?: number; generation?: number } | undefined;
+			if (brokerView && (brokerView.serviceabilityStrikes ?? 0) > 0) gates.push("broker_degraded");
+			return gates;
+		}),
+		provider,
+		turnOutcomes: [],
 		inbound,
 		requests: new Set(),
 	};
@@ -800,6 +884,10 @@ async function handleRequest(
 					contextDiff: options.database.contextDiagnostics(),
 					holds: options.database.listHolds(),
 					rotations: options.database.epochRotationSummary(Date.now() - 24 * 60 * 60 * 1_000),
+					broker: brokerStatus(options.broker),
+					turns: { last1h: summarizeTurns(runtime.turnOutcomes) },
+					provider: runtime.provider.status(),
+					transport: "cli" as const,
 				},
 			});
 			return;
@@ -2023,7 +2111,14 @@ async function createInboundTurnLifecycle(
 	const onSteerAccepted = ({ row: steered }: PersonaSteerInput) => {
 		runtime.inbound.delete(steered.message_id);
 	};
+	const recordOutcome = (ok: boolean, code?: string) => {
+		runtime.turnOutcomes.push({ at: Date.now(), ok, ...(code ? { code } : {}) });
+		const floor = Date.now() - 60 * 60_000;
+		while (runtime.turnOutcomes.length > 0 && runtime.turnOutcomes[0]!.at < floor) runtime.turnOutcomes.shift();
+		runtime.provider.recordTurn({ ok, ...(code ? { code } : {}) });
+	};
 	const onTerminal = async ({ text }: PersonaTerminalInput) => {
+		recordOutcome(true);
 		try {
 			if (nonLoopback) options.database.contextCommitWindow(key, contextMessageIds, contextOmissionRevision);
 			if (bootstrap)
@@ -2084,6 +2179,7 @@ async function createInboundTurnLifecycle(
 	};
 
 	const onFailure = async ({ error }: PersonaFailureInput) => {
+		recordOutcome(false, (error as { code?: unknown }).code as string | undefined);
 		try {
 			const failureNotice = formatFailureNotice(error);
 			console.error(failureNotice);

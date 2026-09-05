@@ -868,6 +868,21 @@ export class GatewayDatabase {
 		if (result.changes !== 1) throw new Error(`turn ${opRef} has no pending attempt`);
 	}
 
+	// --- I7c credential generation ------------------------------------------
+
+	/** Idle persona/monitor origins with a bound host: no bound/accepted trigger, no open lane attempt. Held work never rotates. */
+	idleOriginsForCredentialRotation(): readonly { origin_key: string; gjc_session_id: string }[] {
+		return this.#database
+			.query<{ origin_key: string; gjc_session_id: string }, []>(
+				`SELECT s.origin_key, s.gjc_session_id FROM sessions s
+				 WHERE s.gjc_session_id <> ''
+				   AND NOT EXISTS (SELECT 1 FROM inbound_messages i WHERE i.origin_key = s.origin_key AND i.turn_role = 'trigger' AND i.turn_state IN ('bound','accepted'))
+				   AND NOT EXISTS (SELECT 1 FROM turn_attempts a WHERE a.origin_key = s.origin_key AND a.terminal_at IS NULL AND a.send_state IN ('pending_write','written_unconfirmed','accepted') AND a.admission <> 'refused')
+				   AND s.fence_op_ref IS NULL`,
+			)
+			.all();
+	}
+
 	// --- I6c host audit evidence ---------------------------------------------
 
 	/** Sessions and host pids the audit must protect (direct legacy-table guard, independent of the backfill). */

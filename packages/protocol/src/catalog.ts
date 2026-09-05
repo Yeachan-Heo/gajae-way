@@ -42,6 +42,46 @@ export interface GatewayStatusResult {
 	readonly delivery?: { readonly pending: number; readonly oldestPendingAgeMs: number | null };
 	/** Aggregate-only conversation diff health; never includes message bodies. */
 	readonly contextDiff?: ConversationContextDiagnostics;
+	/** I7a: private broker supervision view. */
+	readonly broker?: {
+		readonly generation: number;
+		readonly healthy: boolean;
+		readonly liveStrikes: number;
+		readonly serviceabilityStrikes: number;
+		readonly lastRetireReason: string | undefined;
+		readonly cliSpawnsTotal: number;
+		readonly residentChannels: number;
+	};
+	/** I7a: last-hour terminal turn outcomes. */
+	readonly turns?: {
+		readonly last1h: { readonly completed: number; readonly failed: number; readonly byCode: Record<string, number> };
+	};
+	/** I7a/I7b (Q2): passive + active provider health with the gate and its provenance. */
+	readonly provider?: {
+		readonly passive: {
+			readonly lastCode: string | undefined;
+			readonly consecutiveFailures: number;
+			readonly lastFailureAt: number | undefined;
+			readonly lastSuccessAt: number | undefined;
+		};
+		readonly active:
+			| {
+					readonly at: number;
+					readonly httpStatus: number | undefined;
+					readonly class: string;
+					readonly locationHost?: string;
+					readonly detail?: string;
+			  }
+			| undefined;
+		readonly gate: "ok" | "provider_failing";
+		readonly provenance: {
+			readonly setBy: string | undefined;
+			readonly clearedBy: string | undefined;
+			readonly changedAt: number | undefined;
+		};
+	};
+	/** Session transport in use for persona turns. */
+	readonly transport?: "cli" | "channel";
 }
 
 export interface ConversationContextDiagnostics {
@@ -513,7 +553,11 @@ export type CycleGateReason =
 	| "delivery_settlement_unknown"
 	| "memory_closure_blocked"
 	| "monitor_settlement_failed"
-	| "monitor_settlement_stuck";
+	| "monitor_settlement_stuck"
+	| "provider_failing"
+	| "broker_degraded"
+	| "turn_held_over_deadline"
+	| "channel_degraded";
 
 export interface CycleSessionView {
 	/** Canonical, opaque origin key (protocol originKey; never reparsed). */

@@ -129,6 +129,9 @@ export interface MonitorSessionSafetyState {
 	lastRoll: SessionRollReason | undefined;
 }
 
+/** I7c: last time a `monitor dispatch failed` line was emitted per event-id set. */
+const dispatchFailureLog = new Map<string, number>();
+
 export class MonitorPropagator {
 	readonly #database: GatewayDatabase;
 	readonly #registry: MonitorRegistry;
@@ -701,7 +704,13 @@ export class MonitorPropagator {
 						`dispatch phase failed (${code}): ${failureDetail(error)}`,
 					);
 				}
-				console.error(`monitor dispatch failed (${code}): events ${claimed.map((row) => row.event_id).join(",")}`);
+				// I7c noise budget: one line per event-id set per 10 minutes.
+				const noiseKey = claimed.map((row) => row.event_id).join(",");
+				const lastLogged = dispatchFailureLog.get(noiseKey) ?? 0;
+				if (Date.now() - lastLogged >= 10 * 60_000) {
+					dispatchFailureLog.set(noiseKey, Date.now());
+					console.error(`monitor dispatch failed (${code}): events ${noiseKey}`);
+				}
 				await this.#recordAuthoringFailure({
 					sessionOriginKey,
 					failureClass,
