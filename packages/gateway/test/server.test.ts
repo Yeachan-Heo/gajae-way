@@ -893,6 +893,14 @@ test("work.run records a durable lane job and work.jobs projects it (issue #10)"
 	// No commit was made, so the pre-existing HEAD must NOT appear as a
 	// worker checkpoint: progress is measured against the creation baseline.
 	expect(jobs.result.jobs[0].checkpoints).toBe(0);
+	const currentHead = Bun.spawnSync(["git", "rev-parse", "HEAD"]).stdout.toString().trim();
+	const currentSubject = Bun.spawnSync(["git", "log", "-1", "--format=%s"]).stdout.toString().trim();
+	expect(jobs.result.jobs[0].last_commit).toMatchObject({
+		sha: currentHead,
+		subject: currentSubject,
+	});
+	expect(Date.parse(jobs.result.jobs[0].last_commit.committed_at)).not.toBeNaN();
+	expect(jobs.result.jobs[0].last_commit.age_ms).toBeGreaterThanOrEqual(0);
 
 	// The stored authority carries the closed attempt; the record is restart-safe.
 	const raw = database.laneJobJson(jobId);

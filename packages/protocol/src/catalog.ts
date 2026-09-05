@@ -406,6 +406,17 @@ export interface WorkJobsResult {
 		readonly branch: string;
 		readonly worktree_path: string;
 		readonly updated_at: string;
+		readonly attempts?: number;
+		readonly checkpoints?: number;
+		readonly escalations?: number;
+		readonly last_commit: {
+			readonly sha: string;
+			readonly subject: string;
+			readonly committed_at: string;
+			readonly age_ms: number;
+		} | null;
+		readonly corrupt?: true;
+		readonly error?: string;
 	}>;
 }
 

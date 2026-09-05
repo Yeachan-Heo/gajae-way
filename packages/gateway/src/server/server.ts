@@ -107,9 +107,12 @@ function persistLaneJob(database: GatewayDatabase, record: LaneJobRecord, laneKe
 }
 
 /** Reads the actual branch HEAD and dirtiness of the worktree (read-only git). */
-async function collectRepoFacts(
-	worktreePath: string,
-): Promise<{ headSha?: string; dirtyFiles: number; branch?: string } | undefined> {
+async function collectRepoFacts(worktreePath: string): Promise<{
+	headSha?: string;
+	dirtyFiles: number;
+	branch?: string;
+	lastCommit?: { sha: string; subject: string; committedAt: string };
+} | undefined> {
 	try {
 		const head = Bun.spawnSync(["git", "-C", worktreePath, "rev-parse", "HEAD"], { stdout: "pipe", stderr: "pipe" });
 		const branch = Bun.spawnSync(["git", "-C", worktreePath, "rev-parse", "--abbrev-ref", "HEAD"], {
@@ -120,6 +123,10 @@ async function collectRepoFacts(
 			stdout: "pipe",
 			stderr: "pipe",
 		});
+		const log = Bun.spawnSync(["git", "-C", worktreePath, "log", "-1", "--format=%H%x00%s%x00%cI"], {
+			stdout: "pipe",
+			stderr: "pipe",
+		});
 		const headSha = head.stdout.toString().trim();
 		if (!/^[0-9a-f]{40}$/.test(headSha)) return undefined;
 		const dirtyFiles = status.stdout
@@ -127,7 +134,17 @@ async function collectRepoFacts(
 			.split("\n")
 			.filter((line) => line.trim()).length;
 		const branchName = branch.stdout.toString().trim();
-		return { headSha, dirtyFiles, ...(branchName ? { branch: branchName } : {}) };
+		const [commitSha, subject, committedAt] = log.stdout.toString().trim().split("\0");
+		const lastCommit =
+			commitSha === headSha && subject && committedAt && Number.isFinite(Date.parse(committedAt))
+				? { sha: commitSha, subject, committedAt }
+				: undefined;
+		return {
+			headSha,
+			dirtyFiles,
+			...(branchName ? { branch: branchName } : {}),
+			...(lastCommit ? { lastCommit } : {}),
+		};
 	} catch {
 		return undefined;
 	}
@@ -967,24 +984,37 @@ async function handleRequest(
 			// Each row is re-validated against the authoritative record JSON: a
 			// corrupt row is flagged as corrupt for the operator, never shown as
 			// healthy and never silently dropped.
-			const jobs = options.database.laneJobRows().map((row) => {
-				try {
-					const record = parseLaneJobRecord(options.database.laneJobJson(row.job_id) ?? "");
-					return {
-						...row,
-						attempts: record.attempts.length,
-						checkpoints: record.checkpoints.length,
-						escalations: record.escalations.length,
-					};
-				} catch (error) {
-					return {
-						...row,
-						state: "corrupt" as const,
-						corrupt: true as const,
-						error: diagnostic(error),
-					};
-				}
-			});
+			const now = Date.now();
+			const jobs = await Promise.all(
+				options.database.laneJobRows().map(async (row) => {
+					try {
+						const record = parseLaneJobRecord(options.database.laneJobJson(row.job_id) ?? "");
+						const repository = await collectRepoFacts(record.lane.worktreePath);
+						return {
+							...row,
+							attempts: record.attempts.length,
+							checkpoints: record.checkpoints.length,
+							escalations: record.escalations.length,
+							last_commit: repository?.lastCommit
+								? {
+									sha: repository.lastCommit.sha,
+									subject: repository.lastCommit.subject,
+									committed_at: repository.lastCommit.committedAt,
+									age_ms: Math.max(0, now - Date.parse(repository.lastCommit.committedAt)),
+								}
+								: null,
+						};
+					} catch (error) {
+						return {
+							...row,
+							state: "corrupt" as const,
+							corrupt: true as const,
+							error: diagnostic(error),
+							last_commit: null,
+						};
+					}
+				}),
+			);
 			connection.write({
 				v: PROFILE_VERSION,
 				type: "response",
