@@ -868,6 +868,264 @@ export class GatewayDatabase {
 		if (result.changes !== 1) throw new Error(`turn ${opRef} has no pending attempt`);
 	}
 
+	// --- I5a holds and the execution-uncertainty fence ----------------------
+
+	/**
+	 * Records one hold evaluation. The deadline is set exactly once (first hold)
+	 * and never reset by later reasons, restarts or inspect errors; the reason and
+	 * the next sweep are refreshed every evaluation.
+	 */
+	holdRecord(input: { opRef: string; reason: string; nowMs: number; ttlMs: number; nextSweepDelayMs: number }): {
+		sweeps: number;
+		deadlineAt: number;
+	} {
+		return this.withTransaction(() => {
+			const row = this.#database
+				.query<{ hold_since: string | null; hold_deadline_at: string | null; hold_sweeps: number }, [string]>(
+					"SELECT hold_since, hold_deadline_at, hold_sweeps FROM inbound_messages WHERE turn_op_ref = ? AND turn_role = 'trigger'",
+				)
+				.get(input.opRef);
+			if (!row) throw new Error(`turn ${input.opRef} has no trigger row to hold`);
+			const since = row.hold_since ?? new Date(input.nowMs).toISOString();
+			const deadline = row.hold_deadline_at ?? new Date(input.nowMs + input.ttlMs).toISOString();
+			const sweeps = row.hold_sweeps + 1;
+			this.#database
+				.query(
+					"UPDATE inbound_messages SET hold_reason = ?, hold_since = ?, hold_deadline_at = ?, hold_sweeps = ?, next_sweep_at = ? WHERE turn_op_ref = ? AND turn_role = 'trigger'",
+				)
+				.run(
+					input.reason,
+					since,
+					deadline,
+					sweeps,
+					new Date(input.nowMs + input.nextSweepDelayMs).toISOString(),
+					input.opRef,
+				);
+			return { sweeps, deadlineAt: Date.parse(deadline) };
+		});
+	}
+
+	holdState(opRef: string):
+		| {
+				reason: string | null;
+				sinceMs: number | undefined;
+				deadlineAt: number | undefined;
+				sweeps: number;
+				nextSweepAt: number | undefined;
+				terminalDisposition: string | null;
+				interimDelivered: boolean;
+		  }
+		| undefined {
+		const row = this.#database
+			.query<
+				{
+					hold_reason: string | null;
+					hold_since: string | null;
+					hold_deadline_at: string | null;
+					hold_sweeps: number;
+					next_sweep_at: string | null;
+					terminal_disposition: string | null;
+					interim_delivered: number;
+				},
+				[string]
+			>(
+				"SELECT hold_reason, hold_since, hold_deadline_at, hold_sweeps, next_sweep_at, terminal_disposition, interim_delivered FROM inbound_messages WHERE turn_op_ref = ? AND turn_role = 'trigger'",
+			)
+			.get(opRef);
+		if (!row) return undefined;
+		const ms = (value: string | null) => (value ? Date.parse(value) : undefined);
+		return {
+			reason: row.hold_reason,
+			sinceMs: ms(row.hold_since),
+			deadlineAt: ms(row.hold_deadline_at),
+			sweeps: row.hold_sweeps,
+			nextSweepAt: ms(row.next_sweep_at),
+			terminalDisposition: row.terminal_disposition,
+			interimDelivered: row.interim_delivered === 1,
+		};
+	}
+
+	/** Interim output reached the platform for this trigger (changes only the loss notice wording). */
+	inboundMarkInterimDelivered(opRef: string): void {
+		this.#database
+			.query("UPDATE inbound_messages SET interim_delivered = 1 WHERE turn_op_ref = ? AND turn_role = 'trigger'")
+			.run(opRef);
+	}
+
+	/**
+	 * Q1: the deadline passed with no decidable outcome. CAS the terminal
+	 * disposition to `operation_lost` (or `abandoned` for the operator verb),
+	 * mark the attempt terminal, close the trigger, and - when execution may
+	 * have happened (U1-U6) - raise the durable fence in the same transaction.
+	 * Returns false when a disposition was already set (late/duplicate path).
+	 */
+	inboundTurnLose(input: {
+		opRef: string;
+		originKey: string;
+		epoch: number;
+		disposition: "operation_lost" | "abandoned";
+		failureCode: string;
+		nowMs: number;
+		fence: boolean;
+		fenceTtlMs: number;
+	}): { lost: true; interimDelivered: boolean } | { lost: false } {
+		return this.withTransaction(() => {
+			const cas = this.#database
+				.query(
+					"UPDATE inbound_messages SET terminal_disposition = ?, terminal_failure_code = ? WHERE turn_op_ref = ? AND turn_role = 'trigger' AND terminal_disposition IS NULL",
+				)
+				.run(input.disposition, input.failureCode, input.opRef);
+			if (cas.changes !== 1) return { lost: false };
+			const interim = this.#database
+				.query<{ interim_delivered: number }, [string]>(
+					"SELECT interim_delivered FROM inbound_messages WHERE turn_op_ref = ? AND turn_role = 'trigger'",
+				)
+				.get(input.opRef);
+			this.#database
+				.query(
+					"UPDATE turn_attempts SET terminal_at = COALESCE(terminal_at, ?), terminal_disposition = COALESCE(terminal_disposition, ?), text_source = COALESCE(text_source, 'none') WHERE op_ref = ?",
+				)
+				.run(new Date(input.nowMs).toISOString(), input.disposition, input.opRef);
+			this.inboundTurnComplete(input.opRef);
+			if (input.fence)
+				this.#database
+					.query(
+						"UPDATE sessions SET fence_op_ref = ?, fence_since = ?, fence_deadline_at = ? WHERE origin_key = ? AND epoch = ? AND fence_op_ref IS NULL",
+					)
+					.run(
+						input.opRef,
+						new Date(input.nowMs).toISOString(),
+						new Date(input.nowMs + input.fenceTtlMs).toISOString(),
+						input.originKey,
+						input.epoch,
+					);
+			return { lost: true, interimDelivered: interim?.interim_delivered === 1 };
+		});
+	}
+
+	/**
+	 * I5b operator verbs on top of the evaluator. `delivered` / `abandon` CAS the
+	 * disposition (refused once set); `requeue` is refused without NA1-NA3 and
+	 * otherwise releases the trigger to pending without a new attempt ordinal.
+	 * Every accepted verb writes an audit row.
+	 */
+	holdResolve(input: {
+		opRef: string;
+		outcome: "delivered" | "abandon" | "requeue";
+		platformMessageId?: string;
+		actor: string;
+		nowMs: number;
+	}): { ok: true; disposition: string } | { ok: false; reason: string } {
+		return this.withTransaction(() => {
+			const trigger = this.inboundTurnRow(input.opRef);
+			if (!trigger) return { ok: false, reason: `unknown opRef ${input.opRef}` };
+			const state = this.holdState(input.opRef);
+			if (state?.terminalDisposition)
+				return {
+					ok: false,
+					reason: `refusing ${input.outcome}: ${input.opRef} already has disposition ${state.terminalDisposition}`,
+				};
+			if (trigger.turn_state !== "bound" && trigger.turn_state !== "accepted")
+				return { ok: false, reason: `refusing ${input.outcome}: ${input.opRef} is not a held turn` };
+			const now = new Date(input.nowMs).toISOString();
+			const audit = (disposition: string) =>
+				this.#database
+					.query(
+						"INSERT INTO hold_resolutions (op_ref, origin_key, outcome, disposition, platform_message_id, actor, resolved_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+					)
+					.run(
+						input.opRef,
+						trigger.origin_key,
+						input.outcome,
+						disposition,
+						input.platformMessageId ?? null,
+						input.actor,
+						now,
+					);
+			if (input.outcome === "requeue") {
+				const attempt = this.turnAttemptState(input.opRef);
+				const proof =
+					attempt?.sendState === "pre_write_failure" ? "NA1" : attempt?.admission === "refused" ? "NA2" : undefined;
+				if (!proof)
+					return {
+						ok: false,
+						reason: `refusing requeue: ${input.opRef} has no positive non-admission proof (send_state=${attempt?.sendState ?? "none"}, admission=${attempt?.admission ?? "none"}); use delivered or abandon`,
+					};
+				// Back to pending on the same opRef lineage; the attempt ordinal is the
+				// durable fresh-turn counter, untouched here.
+				this.#database
+					.query(
+						"UPDATE inbound_messages SET turn_role = NULL, turn_epoch = NULL, turn_state = NULL, turn_op_ref = NULL, bound_session_id = NULL, dispatched_at = NULL, terminal_delivery_id = NULL, hold_reason = NULL, hold_since = NULL, hold_deadline_at = NULL, hold_sweeps = 0, next_sweep_at = NULL WHERE turn_op_ref = ? AND state = 'pending'",
+					)
+					.run(input.opRef);
+				audit(`requeued_${proof}`);
+				return { ok: true, disposition: `requeued (${proof})` };
+			}
+			const disposition = input.outcome === "delivered" ? "delivered" : "abandoned";
+			this.#database
+				.query(
+					"UPDATE inbound_messages SET terminal_disposition = ?, terminal_failure_code = ? WHERE turn_op_ref = ? AND turn_role = 'trigger' AND terminal_disposition IS NULL",
+				)
+				.run(disposition, input.outcome === "abandon" ? "abandoned_by_operator" : null, input.opRef);
+			this.#database
+				.query(
+					"UPDATE turn_attempts SET terminal_at = COALESCE(terminal_at, ?), terminal_disposition = COALESCE(terminal_disposition, ?), text_source = COALESCE(text_source, ?) WHERE op_ref = ?",
+				)
+				.run(
+					now,
+					disposition === "delivered" ? "delivered" : "abandoned",
+					disposition === "delivered" ? "operator_attested" : "none",
+					input.opRef,
+				);
+			this.inboundTurnComplete(input.opRef);
+			audit(disposition);
+			return { ok: true, disposition };
+		});
+	}
+
+	holdResolutions(
+		opRef: string,
+	): readonly { outcome: string; disposition: string; actor: string; resolved_at: string }[] {
+		return this.#database
+			.query<{ outcome: string; disposition: string; actor: string; resolved_at: string }, [string]>(
+				"SELECT outcome, disposition, actor, resolved_at FROM hold_resolutions WHERE op_ref = ? ORDER BY rowid",
+			)
+			.all(opRef);
+	}
+
+	sessionFence(originKey: string): { opRef: string; sinceMs: number; deadlineAt: number } | undefined {
+		const row = this.#database
+			.query<{ fence_op_ref: string | null; fence_since: string | null; fence_deadline_at: string | null }, [string]>(
+				"SELECT fence_op_ref, fence_since, fence_deadline_at FROM sessions WHERE origin_key = ?",
+			)
+			.get(originKey);
+		if (!row?.fence_op_ref || !row.fence_since || !row.fence_deadline_at) return undefined;
+		return {
+			opRef: row.fence_op_ref,
+			sinceMs: Date.parse(row.fence_since),
+			deadlineAt: Date.parse(row.fence_deadline_at),
+		};
+	}
+
+	sessionFenceClear(originKey: string, opRef: string): boolean {
+		return (
+			this.#database
+				.query(
+					"UPDATE sessions SET fence_op_ref = NULL, fence_since = NULL, fence_deadline_at = NULL WHERE origin_key = ? AND fence_op_ref = ?",
+				)
+				.run(originKey, opRef).changes === 1
+		);
+	}
+
+	turnAttemptState(opRef: string): { sendState: string; admission: string } | undefined {
+		const row = this.#database
+			.query<{ send_state: string; admission: string }, [string]>(
+				"SELECT send_state, admission FROM turn_attempts WHERE op_ref = ? ORDER BY attempt DESC LIMIT 1",
+			)
+			.get(opRef);
+		return row ? { sendState: row.send_state, admission: row.admission } : undefined;
+	}
+
 	// --- I4b terminal authority ---------------------------------------------
 
 	/** Records the byte hash of the rendered prompt on the attempt that sent it. */
@@ -2704,6 +2962,11 @@ CREATE TABLE session_transcript_watermarks (
 CREATE TABLE turn_steer_hashes (
  op_ref TEXT NOT NULL, message_id TEXT NOT NULL, body_hash TEXT NOT NULL, recorded_at TEXT NOT NULL,
  PRIMARY KEY(op_ref, message_id)
+);
+CREATE TABLE hold_resolutions (
+ id INTEGER PRIMARY KEY AUTOINCREMENT, op_ref TEXT NOT NULL, origin_key TEXT NOT NULL,
+ outcome TEXT NOT NULL CHECK(outcome IN ('delivered','abandon','requeue')), disposition TEXT NOT NULL,
+ platform_message_id TEXT, actor TEXT NOT NULL, resolved_at TEXT NOT NULL
 );
 INSERT INTO turn_attempts (trigger_message_id, attempt, origin_key, scope, epoch, op_ref, session_id, bound_at, send_state, admission, legacy)
  SELECT message_id, 0, origin_key, 'persona', turn_epoch, turn_op_ref, bound_session_id, COALESCE(dispatched_at, received_at), 'written_unconfirmed', 'unknown', 1

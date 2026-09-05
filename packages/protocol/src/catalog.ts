@@ -581,6 +581,19 @@ export interface OpsCycleResult {
 	readonly contextDiff: ConversationContextDiagnostics;
 }
 
+/** I5b operator verb: resolves one held turn. `requeue` is refused without positive non-admission proof. */
+export interface HoldResolveParams {
+	readonly opRef: string;
+	readonly outcome: "delivered" | "abandon" | "requeue";
+	readonly platformMessageId?: string;
+	/** `abandon` only: also emit the deterministic abandonment notice to the conversation. */
+	readonly notify?: boolean;
+}
+export interface HoldResolveResult {
+	readonly opRef: string;
+	readonly disposition: string;
+}
+
 /** Verb catalog: verb name -> { params, result } (documentation-level typing). */
 export interface VerbCatalogV01 {
 	"gateway.status": { params: undefined; result: GatewayStatusResult };
@@ -590,6 +603,7 @@ export interface VerbCatalogV01 {
 	"chat.edit": { params: ChatEditParams; result: ChatEditResult };
 	"delivery.confirm": { params: DeliveryConfirmParams; result: { readonly settled: true } };
 	"delivery.fail": { params: DeliveryFailParams; result: { readonly recorded: true } };
+	"holds.resolve": { params: HoldResolveParams; result: HoldResolveResult };
 	"session.recall": { params: SessionRecallParams; result: SessionRecallResult };
 	"session.list": { params: undefined; result: SessionListResult };
 	"memory.audit": { params: undefined; result: MemoryAuditResult };
@@ -633,6 +647,7 @@ export const VERBS_V01 = [
 	"chat.edit",
 	"delivery.confirm",
 	"delivery.fail",
+	"holds.resolve",
 	"session.recall",
 	"session.list",
 	"memory.audit",

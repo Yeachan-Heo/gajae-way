@@ -30,6 +30,10 @@ export async function harness(port = new ScriptedSessionPort(), options: Partial
 			onTerminal: ({ text }) => {
 				deliveries.push({ text });
 			},
+			// Failure notices are deliveries too (Q1: operation_lost is always visible).
+			onFailure: ({ error }) => {
+				deliveries.push({ text: `[turn failed] ${error.message}` });
+			},
 		}),
 		...options,
 	});

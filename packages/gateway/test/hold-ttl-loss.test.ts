@@ -4,11 +4,11 @@
  * Matched logs: recovery_hold ... not decidable ... sweeps=N; reason=operation_state_unknown.
  */
 import { expect, test } from "bun:test";
-import { ScriptedSessionPort } from "../../packages/gateway/test/session-port.fake";
-import { harness, KEY, ORIGIN } from "./harness";
-import { createFakeGjc } from "../../packages/gateway/test/fixtures/fake-gjc.mjs";
-import { BrokerSessionPort } from "../../packages/gateway/src/orchestrator/session-port";
-import { TailRunner } from "../../packages/gateway/src/orchestrator/tail-runner";
+import { ScriptedSessionPort } from "./session-port.fake";
+import { harness, KEY, ORIGIN } from "./red-first-harness";
+import { createFakeGjc } from "./fixtures/fake-gjc.mjs";
+import { BrokerSessionPort } from "../src/orchestrator/session-port";
+import { TailRunner } from "../src/orchestrator/tail-runner";
 
 test("red 3: an accepted unknown operation becomes lost after 31 minutes without replay", async () => {
 	let now = Date.now();
@@ -20,7 +20,7 @@ test("red 3: an accepted unknown operation becomes lost after 31 minutes without
 		database: h.database,
 		cli: run,
 		instanceId: "red-hold",
-		tailRunner: new TailRunner({ run }),
+		tailRunner: new TailRunner({ run, repo: h.repo }),
 	});
 	port.status = real.status.bind(real);
 	try {

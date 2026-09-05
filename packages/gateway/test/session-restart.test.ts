@@ -204,7 +204,7 @@ test("an inspect authority shift holds the turn rather than trusting a stale act
 	expect(port.sends).toHaveLength(1);
 	expect(port.resumes).toEqual([]);
 	expect(database.inboundTurnRows(accepted.opRef)[0]).toMatchObject({ state: "pending", turn_state: "accepted" });
-	expect(logs.some((line) => line.includes("reason=broker authority is ambiguous"))).toBe(true);
+	expect(logs.some((line) => line.includes("reason=authority_disagreement") && line.includes("cell=U4"))).toBe(true);
 });
 
 test("dead terminal saved authority resumes and completes from its turn.result witness on the first reconcile", async () => {

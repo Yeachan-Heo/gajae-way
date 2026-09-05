@@ -388,7 +388,7 @@ test("G4: finalizing a terminal-time held-steer acceptance is exactly once", asy
 	}
 });
 
-test("G5: accepted turns need positive death evidence, while bound turns release on an unknown liveness result", async () => {
+test("G5: neither accepted turns on a dead session nor torn bound sends are released by sweeps; both hold under a deadline", async () => {
 	const acceptedPort = new AcceptedLivenessPort();
 	const accepted = await directFixture({ port: acceptedPort });
 	try {
@@ -403,13 +403,18 @@ test("G5: accepted turns need positive death evidence, while bound turns release
 		expect(accepted.database.inboundTurnRow(first.opRef)).toMatchObject({ turn_state: "accepted" });
 		expect(acceptedPort.sends).toHaveLength(1);
 
+		// I5a (U3): a dead session is not proof the accepted op never ran its
+		// side effects. The turn stays held (operation_state_unknown) until the
+		// deadline closes it as operation_lost or an operator resolves it.
 		acceptedPort.live = false;
 		await accepted.manager.tick(ORIGIN_KEY);
-		await eventually(() => acceptedPort.sends.length === 2, "positive dead evidence did not release the accepted turn");
-		const released = required(acceptedPort.sends[1], "released replacement missing");
-		expect(released.opRef).not.toBe(first.opRef);
 		await accepted.manager.tick(ORIGIN_KEY);
-		expect(acceptedPort.sends).toHaveLength(2);
+		expect(acceptedPort.sends).toHaveLength(1);
+		expect(accepted.database.inboundTurnRow(first.opRef)).toMatchObject({ turn_state: "accepted" });
+		expect(
+			accepted.logs.some((line) => line.includes("reason=operation_state_unknown") && line.includes("cell=U3")),
+		).toBe(true);
+		expect(accepted.database.listEpochMutations({ sinceMs: 0 })).toEqual([]);
 	} finally {
 		await accepted.close();
 	}
@@ -417,16 +422,18 @@ test("G5: accepted turns need positive death evidence, while bound turns release
 	const boundPort = new BoundLivenessPort();
 	const bound = await directFixture({ port: boundPort });
 	try {
+		// I5a: a torn send (bytes may have been written, no receipt, no NA1-NA3
+		// proof) is held as unacknowledged_send with an indeterminate liveness
+		// probe; it is never released onto a fresh op-ref by sweeps.
 		enqueue(bound, "bound", "bound request");
 		await bound.manager.notifyInbound(ORIGIN_KEY);
-		await eventually(() => boundPort.sends.length === 1, "bound turn did not release after unknown liveness");
-		const released = required(boundPort.sends[0], "bound replacement missing");
-		expect(boundPort.failedOpRef).not.toBe("");
-		expect(released.opRef).not.toBe(boundPort.failedOpRef);
-		expect(boundPort.sendAttempts).toHaveLength(2);
-		expect(bound.database.inboundTurnRow(boundPort.failedOpRef)).toBeUndefined();
 		await bound.manager.tick(ORIGIN_KEY);
-		expect(boundPort.sends).toHaveLength(1);
+		await bound.manager.tick(ORIGIN_KEY);
+		expect(boundPort.failedOpRef).not.toBe("");
+		expect(boundPort.sends).toHaveLength(0);
+		expect(boundPort.sendAttempts).toHaveLength(1);
+		expect(bound.database.inboundTurnRow(boundPort.failedOpRef)).toMatchObject({ turn_state: "bound" });
+		expect(bound.database.holdState(boundPort.failedOpRef)?.deadlineAt).toBeDefined();
 	} finally {
 		await bound.close();
 	}

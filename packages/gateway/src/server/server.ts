@@ -747,6 +747,39 @@ async function handleRequest(
 			connection.write({ v: PROFILE_VERSION, type: "response", id: request.id, result: { settled: true } });
 			return;
 		}
+		case "holds.resolve": {
+			const params = request.params as
+				| { opRef?: unknown; outcome?: unknown; platformMessageId?: unknown; notify?: unknown }
+				| undefined;
+			if (
+				!params ||
+				typeof params.opRef !== "string" ||
+				(params.outcome !== "delivered" && params.outcome !== "abandon" && params.outcome !== "requeue") ||
+				(params.platformMessageId !== undefined && typeof params.platformMessageId !== "string") ||
+				(params.notify !== undefined && typeof params.notify !== "boolean")
+			)
+				throw new ProtocolError("invalid_params", "invalid holds.resolve params");
+			if (params.outcome === "delivered" && !params.platformMessageId)
+				throw new ProtocolError("invalid_params", "delivered requires --platform-message-id");
+			const resolved = await runtime.personaSessions.resolveHold({
+				opRef: params.opRef,
+				outcome: params.outcome,
+				...(params.platformMessageId ? { platformMessageId: params.platformMessageId } : {}),
+				notify: params.notify === true,
+				actor: "operator",
+			});
+			if (!resolved.ok) throw new ProtocolError("invalid_params", resolved.reason);
+			console.error(
+				`hold_resolved opRef=${params.opRef} outcome=${params.outcome} disposition=${resolved.disposition}`,
+			);
+			connection.write({
+				v: PROFILE_VERSION,
+				type: "response",
+				id: request.id,
+				result: { opRef: params.opRef, disposition: resolved.disposition },
+			});
+			return;
+		}
 		case "delivery.fail": {
 			const params = request.params as { deliveryId?: unknown; reason?: unknown; ambiguous?: unknown } | undefined;
 			if (
@@ -1967,7 +2000,11 @@ async function createInboundTurnLifecycle(
 			console.error(failureNotice);
 			if (nonLoopback && assistantDeliveryStarted)
 				options.database.contextCommitWindow(key, contextMessageIds, contextOmissionRevision);
-			if (nonLoopback && !assistantDeliveryStarted) {
+			// I5a/Q1: a terminal disposition (operation_lost, abandon) is ALWAYS
+			// notified, even after interim output landed; only ordinary failures
+			// stay silent once the assistant already started speaking.
+			const terminalDisposition = (error as { terminalDisposition?: unknown }).terminalDisposition === true;
+			if (nonLoopback && (!assistantDeliveryStarted || terminalDisposition)) {
 				const notice = runtime.delivery.prepare(turnId, origin, failureNotice);
 				if (notice) {
 					runtime.delivery.markInflight(notice.deliveryId as string);

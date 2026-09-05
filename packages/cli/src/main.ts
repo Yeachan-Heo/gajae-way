@@ -38,7 +38,7 @@ export const COMMANDS = [
 ] as const;
 
 export const CLI_USAGE =
-	"usage: gajaeway [--socket PATH] status|shutdown|chat|daemon run|holds list [--json] [--fields a,b,c] [--limit N] [--offset N]|sessions list [--json] [--fields a,b,c] [--limit N] [--offset N]|sessions inspect <originKey-or-index>|memory audit|memory search <query>|monitors ...|work run <name> [--cwd DIR] <text>|ops backup <path>|ops cycle [--json]|ops integrity|ops restore <backupPath>";
+	"usage: gajaeway [--socket PATH] status|shutdown|chat|daemon run|holds list [--json] [--fields a,b,c] [--limit N] [--offset N]|holds resolve <opRef> --outcome delivered --platform-message-id <id>|abandon [--notify]|requeue|sessions list [--json] [--fields a,b,c] [--limit N] [--offset N]|sessions inspect <originKey-or-index>|memory audit|memory search <query>|monitors ...|work run <name> [--cwd DIR] <text>|ops backup <path>|ops cycle [--json]|ops integrity|ops restore <backupPath>";
 
 /** Usage errors exit 2, as `gajaeway-gateway` does; 1 stays a runtime failure. */
 export const USAGE_EXIT_CODE = 2;
@@ -234,6 +234,32 @@ export async function main(args = process.argv.slice(2)): Promise<void> {
 				else throw new Error("usage: gajaeway daemon run");
 				break;
 			case "holds": {
+				if (parsed.rest[0] === "resolve") {
+					const [, opRef, ...flags] = parsed.rest;
+					const flag = (name: string) => (flags.includes(name) ? flags[flags.indexOf(name) + 1] : undefined);
+					const outcome = flag("--outcome");
+					if (!opRef || (outcome !== "delivered" && outcome !== "abandon" && outcome !== "requeue"))
+						throw new Error(
+							"usage: gajaeway holds resolve <opRef> --outcome delivered --platform-message-id <id> | --outcome abandon [--notify] | --outcome requeue",
+						);
+					if (flags.includes("--force")) throw new Error("holds resolve has no --force; use delivered or abandon");
+					const platformMessageId = flag("--platform-message-id");
+					if (outcome === "delivered" && !platformMessageId)
+						throw new Error("holds resolve --outcome delivered requires --platform-message-id <id>");
+					const client = await GajaewayClient.connectSocket(parsed.socket);
+					try {
+						const result = await client.request<{ opRef: string; disposition: string }>("holds.resolve", {
+							opRef,
+							outcome,
+							...(platformMessageId ? { platformMessageId } : {}),
+							...(flags.includes("--notify") ? { notify: true } : {}),
+						});
+						console.log(`${result.opRef}: ${result.disposition}`);
+					} finally {
+						await client.close();
+					}
+					break;
+				}
 				if (parsed.rest[0] !== "list")
 					throw new Error(
 						`usage: gajaeway holds list [--json] [--fields ${columnNames(HOLD_COLUMNS).join(",")}] [--limit N] [--offset N]`,

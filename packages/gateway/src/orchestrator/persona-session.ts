@@ -10,11 +10,21 @@ import {
 	isTerminalStatus,
 	OpRefRejectedError,
 	projectOpState,
+	type PromptStatus,
+	type ReceiptState,
 	type StatusReport,
 } from "@gajaeway/subsession";
 import type { GjcModelSelection, GjcServiceTier } from "../config";
 import type { GatewayDatabase, InboundMessageRow, InboundTurn } from "../store/db";
 import { rebindableCodeOf, sanitizeDiagnostic } from "./rebind";
+import {
+	evaluateHold,
+	type HoldEvidence,
+	type HoldPath,
+	nextSweepDelayMs,
+	nonAdmissionProof,
+	operationLostNotice,
+} from "./hold-policy";
 import { type TranscriptSnapshot, TranscriptIncompleteError } from "./session-channel";
 import { renderPrompt, type SessionBinding, type SessionPort } from "./session-port";
 import {
@@ -56,7 +66,9 @@ const STEER_REPLAY_ATTEMPTS = 2;
 /** Bind failures back off exponentially from DISPATCH_FAILURE_RETRY_MS up to this ceiling. */
 const DISPATCH_FAILURE_RETRY_MAX_MS = 60_000;
 /** Consecutive recovery sweeps (60s apart) an unknown op on a live idle session is held before release. */
-const HOLD_RELEASE_SWEEPS = 2;
+const DEFAULT_HOLD_TTL_MS = 30 * 60_000;
+/** Scheduler grace on top of `min(next_sweep_at, hold_deadline_at)`. */
+const HOLD_SCHEDULE_GRACE_MS = 1_000;
 
 export type PersonaActorState = "idle" | "turn-running";
 
@@ -140,6 +152,8 @@ export interface PersonaSessionManagerOptions {
 	/** Startup model/preset passed to session.create; conversation overrides may replace it later. */
 	readonly sessionModel?: GjcModelSelection;
 	readonly stallTimeoutMs?: number;
+	/** Q1: how long an undecidable held turn survives before it is closed as `operation_lost` (default 30 min). */
+	readonly holdTtlMs?: number;
 	readonly brokerGeneration?: () => number;
 	readonly now?: () => number;
 	readonly setTimeout?: (work: () => void, delayMs: number) => unknown;
@@ -187,6 +201,7 @@ export class PersonaSessionManager {
 	readonly #repo: string;
 	readonly #sessionModel: GjcModelSelection | undefined;
 	#stallTimeoutMs: number;
+	readonly #holdTtlMs: number;
 	readonly #brokerGeneration: () => number;
 	readonly #now: () => number;
 	readonly #setTimeout: (work: () => void, delayMs: number) => unknown;
@@ -208,6 +223,7 @@ export class PersonaSessionManager {
 		this.#repo = options.repo;
 		this.#sessionModel = options.sessionModel;
 		this.#stallTimeoutMs = positiveInteger(options.stallTimeoutMs, DEFAULT_STALL_TIMEOUT_MS, "stallTimeoutMs");
+		this.#holdTtlMs = positiveInteger(options.holdTtlMs, DEFAULT_HOLD_TTL_MS, "holdTtlMs");
 		this.#brokerGeneration = options.brokerGeneration ?? (() => 0);
 		this.#now = options.now ?? (() => Date.now());
 		this.#setTimeout = options.setTimeout ?? ((work: () => void, delayMs: number) => setTimeout(work, delayMs));
@@ -299,6 +315,24 @@ export class PersonaSessionManager {
 		).then(() => undefined);
 	}
 
+	/**
+	 * I5b: one operator verb on top of the evaluator, serialized on the origin's
+	 * mailbox so it cannot race a sweep. `requeue` is refused without NA1-NA3.
+	 */
+	async resolveHold(input: {
+		opRef: string;
+		outcome: "delivered" | "abandon" | "requeue";
+		platformMessageId?: string;
+		notify?: boolean;
+		actor: string;
+	}): Promise<{ ok: true; disposition: string } | { ok: false; reason: string }> {
+		const trigger = this.database.inboundTurnRow(input.opRef);
+		if (!trigger) return { ok: false, reason: `unknown opRef ${input.opRef}` };
+		return await this.#actor(trigger.origin_key).enqueue(
+			async () => await this.#actor(trigger.origin_key).resolveHold(input),
+		);
+	}
+
 	state(originKey: string): PersonaActorState {
 		return this.#actors.get(originKey)?.state ?? "idle";
 	}
@@ -357,6 +391,10 @@ export class PersonaSessionManager {
 
 	get stallTimeoutMs(): number {
 		return this.#stallTimeoutMs;
+	}
+
+	get holdTtlMs(): number {
+		return this.#holdTtlMs;
 	}
 
 	get sessionModel(): GjcModelSelection | undefined {
@@ -731,37 +769,21 @@ class OriginActor {
 				await this.#recreateAfterResumeFailure(turn, retired);
 				return;
 			case "operator_hold": {
-				// A live session whose runtime has NO record of this op-ref and whose
-				// prompt queue is empty cannot be running it: the send never landed
-				// (gateway restarted between send and ack). Release + rebind after the
-				// hold has persisted across HOLD_RELEASE_SWEEPS consecutive sweeps so a
-				// transient index lag never triggers a duplicate.
-				const count = (this.#holdSweeps.get(turn.opRef) ?? 0) + 1;
-				this.#holdSweeps.set(turn.opRef, count);
-				// Only a BOUND (never acknowledged) turn may be released on a live
-				// session. An ACCEPTED op on a live session is held until its terminal
-				// arrives: the runtime answering "unknown" while a host boots is not
-				// proof the send was lost, and re-firing it double-posts
-				// (layofflabs-2, 2026-09-02).
-				const liveIdle = status.status.status === "unknown" && raw?.live === true && !retired && turn.state === "bound";
-				if (liveIdle && count >= HOLD_RELEASE_SWEEPS && (await this.#queueIsEmpty(sessionId))) {
-					this.#holdSweeps.delete(turn.opRef);
-					const attempt = this.#manager.database.inboundTurnRequeue(turn.opRef);
-					// I5a deletes this call site.
-					const nextEpoch = this.#manager.database.mutateEpoch(this.originKey, {
-						scope: "persona",
-						reason: "session_disowned_dead",
-						cause: { kind: "retirement" },
-					}).toEpoch;
-					this.#manager.log(
-						`recovery_requeue_unaccepted origin=${this.originKey} epoch=${turn.epoch} nextEpoch=${nextEpoch} opRef=${turn.opRef} session=${sessionId} attempt=${attempt} reason=unknown_op_on_live_idle_session sweeps=${count}`,
-					);
-					await this.#dispatchNext();
-					return;
-				}
-				this.#manager.log(
-					`recovery_hold origin=${this.originKey} epoch=${turn.epoch} opRef=${turn.opRef} reason=${decision.reason} sweeps=${count}`,
-				);
+				// I5a: one evaluator for every path. Boot has the two inspects, the raw
+				// liveness and the status in hand; adopt the turn so ticks keep sweeping
+				// it with the same evidence cells and the same durable deadline.
+				const bound = await this.#adoptRecoveredTurn(turn, sessionId, retired, turn.state === "accepted");
+				await this.#holdOrLose(bound, "boot", {
+					witness: status.unreachable ? "unreachable" : witnessOf(status.status.status, status.status.receiptState),
+					inspect: {
+						firstFailed: first.failed,
+						secondFailed: second.failed,
+						agree: !authorityShifted,
+						live: session?.live ?? rawLive,
+						deletedOrDisowned: session?.deleted === true || raw?.disowned === true,
+					},
+					queueEmpty: rawLive === true ? await this.#queueIsEmpty(sessionId) : undefined,
+				});
 				return;
 			}
 		}
@@ -870,8 +892,6 @@ class OriginActor {
 		await this.#dispatchNext();
 	}
 
-	readonly #holdSweeps = new Map<string, number>();
-
 	async #queueIsEmpty(sessionId: string): Promise<boolean> {
 		const port = this.#manager.port;
 		if (!port.queueEmpty) return false;
@@ -962,6 +982,10 @@ class OriginActor {
 	async #dispatchNext(): Promise<void> {
 		if (this.#state !== "idle" || this.#current || this.#dispatchRetry) return;
 		await this.#resolveStaleHolds();
+		// I5a durable execution-uncertainty fence: while an `operation_lost` op may
+		// still be executing on this session, no new trigger is bound for the origin
+		// (rows stay pending). The fence is cleared only by F1-F4, never by dispatch.
+		if (await this.#fenced()) return;
 		const trigger = this.#manager.database.inboundPendingOldest(this.originKey);
 		if (!trigger) return;
 		const epoch = this.#epoch();
@@ -1706,6 +1730,13 @@ class OriginActor {
 	}
 
 	async #reconcileBound(bound: BoundTurn): Promise<void> {
+		// Every path reads the disposition first: a terminalized turn is never
+		// touched again (late results/parts are suppressed by the set disposition).
+		if (this.#manager.database.holdState(bound.turn.opRef)?.terminalDisposition) {
+			this.#manager.log(`late_terminal_suppressed origin=${this.originKey} opRef=${bound.turn.opRef}`);
+			await this.#forgetTerminalized(bound);
+			return;
+		}
 		let report: StatusReport;
 		try {
 			report = await this.#manager.port.status({
@@ -1714,75 +1745,13 @@ class OriginActor {
 				opRef: bound.turn.opRef,
 			});
 		} catch (error) {
-			// The broker disowning the id (session_unavailable) with the session
-			// provably not live means nothing is running there: release the turn
-			// and rebind instead of holding an adopted turn forever. A retired turn
-			// whose answer is still wanted (session replaced under it after a steer
-			// refusal) is judged the same way: held forever, its lifecycle kept
-			// announcing a turn that never ran (live: "working… (286m)", 2026-09-05).
-			if (sdkStatusErrorCode(error) === "session_unavailable" && (!bound.retired || bound.answerWanted)) {
-				const raw = this.#manager.port.liveness
-					? await this.#manager.port.liveness({ sessionId: bound.sessionId, repo: this.#manager.repo })
-					: undefined;
-				// A BOUND (never acknowledged) turn is safe to re-fire on the broker's
-				// word alone. An ACCEPTED turn may have run side effects: it is
-				// released only on positive evidence that the session is dead
-				// (live=false or disowned); an unanswerable liveness probe holds it.
-				const state = this.#manager.database.inboundTurnRow(bound.turn.opRef)?.turn_state;
-				const dead = raw?.live === false || raw?.disowned === true;
-				if (state === "bound" ? raw?.live !== true : dead) {
-					await this.#releaseUnlanded(bound, "router_disowned");
-					return;
-				}
-			}
-			this.#manager.log(
-				`recovery_hold origin=${this.originKey} epoch=${bound.epoch} opRef=${bound.turn.opRef} reason=status_unavailable detail=${safeDiagnostic(error)}`,
-			);
+			await this.#holdOrLose(bound, "tick", await this.#gatherHoldEvidence(bound, "unreachable"));
 			return;
 		}
 		if (report.status.status === "unknown") {
-			const count = (this.#holdSweeps.get(bound.turn.opRef) ?? 0) + 1;
-			this.#holdSweeps.set(bound.turn.opRef, count);
-			const state = this.#manager.database.inboundTurnRow(bound.turn.opRef)?.turn_state;
-			// This is the live counterpart of startup's operator_hold recovery.
-			// A BOUND turn has no broker acknowledgement. When the live session
-			// reports no such operation and its prompt queue remains empty across
-			// two sweeps, the send did not land; holding it forever bricks the
-			// origin. ACCEPTED work is different and remains protected from replay.
-			if (state === "bound" && (!bound.retired || bound.answerWanted) && count >= HOLD_RELEASE_SWEEPS) {
-				let live: boolean | undefined;
-				let disowned = false;
-				try {
-					if (this.#manager.port.liveness) {
-						const liveness = await this.#manager.port.liveness({
-							sessionId: bound.sessionId,
-							repo: this.#manager.repo,
-						});
-						live = liveness.live;
-						disowned = liveness.disowned === true;
-					} else {
-						live = (await this.#manager.port.inspect({ sessionId: bound.sessionId, repo: this.#manager.repo }))?.live;
-					}
-				} catch {
-					// An indeterminate liveness probe is not release evidence.
-				}
-				const dead = live === false || disowned;
-				const liveIdle = live === true && (await this.#queueIsEmpty(bound.sessionId));
-				if (dead || liveIdle) {
-					// I5a deletes the live-idle release path; preserve it during schema-only I1a.
-					await this.#releaseUnlanded(
-						bound,
-						`${dead ? "unknown_op_on_dead_session" : "unknown_op_on_live_idle_session"} sweeps=${count}`,
-					);
-					return;
-				}
-			}
-			this.#manager.log(
-				`recovery_hold origin=${this.originKey} epoch=${bound.epoch} opRef=${bound.turn.opRef} reason=operation_state_unknown sweeps=${count}`,
-			);
+			await this.#holdOrLose(bound, "tick", await this.#gatherHoldEvidence(bound, "unknown"));
 			return;
 		}
-		this.#holdSweeps.delete(bound.turn.opRef);
 		if (this.#manager.database.inboundTurnRow(bound.turn.opRef)?.turn_state === "bound") {
 			this.#manager.database.inboundTurnAccept(bound.turn.opRef);
 			if (bound.tail) await bound.tail.markAccepted(bound.turn.opRef);
@@ -1908,8 +1877,298 @@ class OriginActor {
 	 * one was already rotated away from and must not tear down the live
 	 * replacement session under the current epoch.
 	 */
+	/** Operator resolution of the held turn this actor owns (I5b). */
+	async resolveHold(input: {
+		opRef: string;
+		outcome: "delivered" | "abandon" | "requeue";
+		platformMessageId?: string;
+		notify?: boolean;
+		actor: string;
+	}): Promise<{ ok: true; disposition: string } | { ok: false; reason: string }> {
+		const database = this.#manager.database;
+		const result = database.holdResolve({
+			opRef: input.opRef,
+			outcome: input.outcome,
+			...(input.platformMessageId ? { platformMessageId: input.platformMessageId } : {}),
+			actor: input.actor,
+			nowMs: this.#manager.now(),
+		});
+		if (!result.ok) return result;
+		this.#manager.log(
+			`hold_resolved origin=${this.originKey} opRef=${input.opRef} outcome=${input.outcome} disposition=${result.disposition} actor=${input.actor}`,
+		);
+		const bound =
+			this.#current?.turn.opRef === input.opRef
+				? this.#current
+				: [...this.#retired.values()].find((entry) => entry.turn.opRef === input.opRef);
+		if (input.outcome === "requeue") {
+			if (bound) {
+				bound.tail?.setTurnRunning(false);
+				await bound.tail?.close();
+				if (bound.retired) {
+					this.#retired.delete(retiredKey(bound));
+					this.#clearRetiredReattach(bound);
+				} else if (this.#current === bound) {
+					this.#current = undefined;
+					this.#state = "idle";
+				}
+				await this.#notifyReleased(bound);
+			}
+			await this.#dispatchNext();
+			return result;
+		}
+		if (bound) {
+			if (input.outcome === "abandon" && input.notify) {
+				try {
+					await bound.lifecycle.onFailure?.({
+						...bound,
+						error: Object.assign(new Error("operation abandoned by the operator. It was not resent."), {
+							code: "abandoned",
+							terminalDisposition: true,
+						}),
+					});
+				} catch (error) {
+					this.#manager.log(
+						`persona_terminal_delivery_failed origin=${this.originKey} opRef=${input.opRef} detail=${safeDiagnostic(error)}`,
+					);
+				}
+			}
+			await this.#forgetTerminalized(bound);
+		}
+		await this.#dispatchNext();
+		return result;
+	}
+
+	/** Two inspects + raw liveness + queue emptiness for one held turn (the sweep's evidence). */
+	async #gatherHoldEvidence(bound: BoundTurn, witness: HoldEvidence["witness"]): Promise<HoldEvidence> {
+		const first = await this.#inspectForRecovery(bound.sessionId);
+		const second = await this.#inspectForRecovery(bound.sessionId);
+		let raw: { live?: boolean; disowned?: boolean } | undefined;
+		try {
+			raw = this.#manager.port.liveness
+				? await this.#manager.port.liveness({ sessionId: bound.sessionId, repo: this.#manager.repo })
+				: undefined;
+		} catch {
+			raw = undefined;
+		}
+		// Raw liveness is read from the inspect envelope (no extra CLI call); a
+		// positive `live:false` from either source is death evidence for the cell.
+		const inspected = second.session?.live ?? first.session?.live;
+		const live = raw?.live === false ? false : (inspected ?? raw?.live);
+		return {
+			witness,
+			inspect: {
+				firstFailed: first.failed,
+				secondFailed: second.failed,
+				agree: sameRecoveryAuthority(first.session, second.session),
+				live,
+				deletedOrDisowned:
+					first.session?.deleted === true || second.session?.deleted === true || raw?.disowned === true,
+			},
+			queueEmpty: live === true ? await this.#queueIsEmpty(bound.sessionId) : undefined,
+		};
+	}
+
+	/**
+	 * The one transition for a held turn on any path. Hold -> durable record with a
+	 * set-once deadline and the next sweep; requeue only with NA1-NA3; deadline ->
+	 * `operation_lost` (visible, never resent) with the fence when execution may
+	 * have happened.
+	 */
+	async #holdOrLose(bound: BoundTurn, path: HoldPath, evidence: HoldEvidence): Promise<void> {
+		const database = this.#manager.database;
+		const row = database.inboundTurnRow(bound.turn.opRef);
+		const attempt = database.turnAttemptState(bound.turn.opRef);
+		const state = database.holdState(bound.turn.opRef);
+		if (!row || (row.turn_state !== "bound" && row.turn_state !== "accepted")) return;
+		const transition = evaluateHold({
+			path,
+			nowMs: this.#manager.now(),
+			evidence,
+			subject: {
+				turnState: row.turn_state,
+				sendState: attempt?.sendState as never,
+				admission: attempt?.admission as never,
+				terminalDisposition: state?.terminalDisposition,
+				holdDeadlineAt: state?.deadlineAt,
+			},
+		});
+		switch (transition.kind) {
+			case "noop":
+				return;
+			case "terminalize":
+			case "fail":
+				// Decidable outcomes are the reconcile path's business; the caller
+				// only reaches here with unknown/unreachable evidence.
+				return;
+			case "requeue": {
+				this.#manager.log(
+					`recovery_requeue_proven origin=${this.originKey} epoch=${bound.epoch} opRef=${bound.turn.opRef} proof=${transition.proof} cell=${transition.cell}`,
+				);
+				await this.#releaseUnlanded(bound, `non_admission_${transition.proof}`);
+				return;
+			}
+			case "hold": {
+				const recorded = database.holdRecord({
+					opRef: bound.turn.opRef,
+					reason: transition.reason,
+					nowMs: this.#manager.now(),
+					ttlMs: this.#manager.holdTtlMs,
+					nextSweepDelayMs: nextSweepDelayMs(state?.sweeps ?? 0),
+				});
+				this.#manager.log(
+					`recovery_hold origin=${this.originKey} epoch=${bound.epoch} opRef=${bound.turn.opRef} reason=${transition.reason} cell=${transition.cell} sweeps=${recorded.sweeps} deadline=${new Date(recorded.deadlineAt).toISOString()}`,
+				);
+				this.#scheduleHoldEvaluation(bound, recorded.deadlineAt);
+				return;
+			}
+			case "operation_lost": {
+				await this.#loseOperation(bound, transition.cell, transition.fence);
+				return;
+			}
+		}
+	}
+
+	#holdTimers = new Map<string, unknown>();
+
+	/** Next evaluation at min(next_sweep_at, hold_deadline_at) + scheduler grace. */
+	#scheduleHoldEvaluation(bound: BoundTurn, deadlineAt: number): void {
+		const state = this.#manager.database.holdState(bound.turn.opRef);
+		const nextSweepAt = state?.nextSweepAt ?? deadlineAt;
+		const at = Math.min(nextSweepAt, deadlineAt) + HOLD_SCHEDULE_GRACE_MS;
+		const delay = Math.max(0, at - this.#manager.now());
+		const existing = this.#holdTimers.get(bound.turn.opRef);
+		if (existing !== undefined) this.#manager.cancel(existing);
+		const timer = this.#manager.schedule(() => {
+			this.#holdTimers.delete(bound.turn.opRef);
+			if (this.#stopped || this.#manager.stopped) return;
+			void this.enqueue(async () => {
+				if (this.#current !== bound && !this.#retired.has(retiredKey(bound))) return;
+				await this.#reconcileBound(bound);
+			}).catch((error: unknown) =>
+				this.#manager.log(`persona_hold_sweep_failed origin=${this.originKey} detail=${safeDiagnostic(error)}`),
+			);
+		}, delay);
+		this.#holdTimers.set(bound.turn.opRef, timer);
+	}
+
+	/** Q1: close the turn as lost, exactly once, with the visible notice; raise the fence when execution may have happened. */
+	async #loseOperation(bound: BoundTurn, cell: string, fence: boolean): Promise<void> {
+		const database = this.#manager.database;
+		const minutes = Math.round(this.#manager.holdTtlMs / 60_000);
+		const outcome = database.inboundTurnLose({
+			opRef: bound.turn.opRef,
+			originKey: this.originKey,
+			epoch: bound.epoch,
+			disposition: "operation_lost",
+			failureCode: "operation_lost",
+			nowMs: this.#manager.now(),
+			fence,
+			fenceTtlMs: this.#manager.holdTtlMs,
+		});
+		if (!outcome.lost) {
+			this.#manager.log(`late_terminal_suppressed origin=${this.originKey} opRef=${bound.turn.opRef}`);
+			await this.#forgetTerminalized(bound);
+			return;
+		}
+		this.#manager.log(
+			`operation_lost origin=${this.originKey} epoch=${bound.epoch} opRef=${bound.turn.opRef} cell=${cell} fence=${fence} interim_delivered=${outcome.interimDelivered}`,
+		);
+		try {
+			await bound.lifecycle.onFailure?.({
+				...bound,
+				error: Object.assign(new Error(operationLostNotice(minutes, outcome.interimDelivered)), {
+					code: "operation_lost",
+					terminalDisposition: true,
+				}),
+			});
+		} catch (error) {
+			this.#manager.log(
+				`persona_terminal_delivery_failed origin=${this.originKey} opRef=${bound.turn.opRef} detail=${safeDiagnostic(error)}`,
+			);
+		}
+		await this.#forgetTerminalized(bound);
+		await this.#dispatchNext();
+	}
+
+	/** Drops the in-memory tracking of a turn whose durable disposition is set. */
+	async #forgetTerminalized(bound: BoundTurn): Promise<void> {
+		const timer = this.#holdTimers.get(bound.turn.opRef);
+		if (timer !== undefined) {
+			this.#manager.cancel(timer);
+			this.#holdTimers.delete(bound.turn.opRef);
+		}
+		bound.tail?.setTurnRunning(false);
+		await bound.tail?.close();
+		if (bound.retired) {
+			this.#retired.delete(retiredKey(bound));
+			this.#clearRetiredReattach(bound);
+		} else if (this.#current === bound) {
+			this.#current = undefined;
+			this.#state = "idle";
+		}
+	}
+
+	/**
+	 * F1-F4 fence evaluation on the dispatch path. Returns true while the origin
+	 * must not bind a new trigger.
+	 */
+	async #fenced(): Promise<boolean> {
+		const database = this.#manager.database;
+		const fence = database.sessionFence(this.originKey);
+		if (!fence) return false;
+		const now = this.#manager.now();
+		const record = database.getSessionRecord(this.originKey);
+		const clear = (rule: string) => {
+			database.sessionFenceClear(this.originKey, fence.opRef);
+			this.#fenceQuiet = undefined;
+			this.#manager.log(`fence_cleared origin=${this.originKey} opRef=${fence.opRef} rule=${rule}`);
+			return false;
+		};
+		// F4: deadline reached -> rotate with the reason and clear.
+		if (now >= fence.deadlineAt) {
+			database.mutateEpoch(this.originKey, {
+				scope: "persona",
+				reason: "execution_uncertain_fence_expired",
+				opRef: fence.opRef,
+				cause: { kind: "policy", ref: fence.opRef },
+			});
+			return clear("F4");
+		}
+		if (record?.sessionId) {
+			// F1: the lost op reached a terminal outcome after all.
+			try {
+				const report = await this.#manager.port.status({
+					sessionId: record.sessionId,
+					repo: this.#manager.repo,
+					opRef: fence.opRef,
+				});
+				if (isTerminalStatus(report.status.status)) return clear("F1");
+			} catch {
+				// unreachable status is not evidence either way
+			}
+			// F2: session dead/disowned.
+			const inspect = await this.#inspectForRecovery(record.sessionId);
+			if (
+				!inspect.failed &&
+				(inspect.session === undefined || inspect.session.deleted || inspect.session.live === false)
+			)
+				return clear("F2");
+			// F3: live + idle + empty queue on two evaluations >= 60 s apart.
+			if (inspect.session?.live === true && (await this.#queueIsEmpty(record.sessionId))) {
+				if (this.#fenceQuiet !== undefined && now - this.#fenceQuiet >= 60_000) return clear("F3");
+				this.#fenceQuiet ??= now;
+			} else this.#fenceQuiet = undefined;
+		}
+		this.#manager.log(
+			`fence_active origin=${this.originKey} opRef=${fence.opRef} until=${new Date(fence.deadlineAt).toISOString()}`,
+		);
+		return true;
+	}
+
+	#fenceQuiet: number | undefined;
+
 	async #releaseUnlanded(bound: BoundTurn, reason: string): Promise<void> {
-		this.#holdSweeps.delete(bound.turn.opRef);
 		bound.tail?.setTurnRunning(false);
 		await bound.tail?.close();
 		const attempt = this.#manager.database.inboundTurnRequeue(bound.turn.opRef);
@@ -2030,6 +2289,13 @@ class OriginActor {
 	#epoch(): number {
 		return this.#manager.database.getSessionRecord(this.originKey)?.epoch ?? 0;
 	}
+}
+
+function witnessOf(status: PromptStatus, receipt: ReceiptState | undefined): HoldEvidence["witness"] {
+	if (status === "unknown") return "unknown";
+	if (status === "failed") return receipt === "missing" ? "terminal_missing_receipt" : "failed";
+	if (status === "terminal_ok") return "terminal_ok";
+	return status === "accepted" ? "accepted" : "in_flight";
 }
 
 function terminalError(status: StatusReport): Error {

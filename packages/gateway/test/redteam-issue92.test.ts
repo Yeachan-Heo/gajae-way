@@ -442,7 +442,7 @@ test("red-team: a stall on a retired hold does not abort it, block the next epoc
 	}
 });
 
-test("red-team: an unknown unaccepted send is held once, then a live-idle session releases it onto a fresh epoch instead of bricking the origin", async () => {
+test("red-team: a client_ref_conflict is admission evidence: the bound row is held, never released onto a fresh epoch, until the deadline or an operator", async () => {
 	const port = new ConflictUnknownPort();
 	const target = await fixture({ port });
 	try {
@@ -456,27 +456,23 @@ test("red-team: an unknown unaccepted send is held once, then a live-idle sessio
 		expect(target.database.inboundTurnRows(first.opRef)).toEqual(
 			expect.arrayContaining([expect.objectContaining({ message_id: "conflict-trigger", turn_state: "bound" })]),
 		);
-		expect(target.logs.some((line) => line.includes("reason=operation_state_unknown sweeps=1"))).toBe(true);
+		expect(target.logs.some((line) => line.includes("reason=unacknowledged_send") && line.includes("sweeps=1"))).toBe(
+			true,
+		);
 		expect(port.sends).toEqual([]);
-
-		// Second sweep: status still says unknown, but liveness says the session
-		// is live and its prompt queue is empty. Since the row is only BOUND (not
-		// acknowledged), the send did not land and is safe to release once.
-		await target.manager.tick(ORIGIN_KEY);
-		await eventually(() => port.sends.length === 1, "live-idle unknown operation did not re-dispatch");
-		const replacement = port.sends[0]!;
-		expect(replacement.opRef).not.toBe(first.opRef);
-		expect(replacement.text).toBe("operation identity is unknown");
-		expect(target.logs.some((line) => line.includes("reason=unknown_op_on_live_idle_session sweeps=2"))).toBe(true);
-		port.complete(replacement.opRef, "recovered without an operator");
-		await eventually(() => target.terminal.length === 1, "replacement did not complete");
-		expect(target.terminal).toEqual(["recovered without an operator"]);
-		expect(target.database.inboundPendingCount(ORIGIN_KEY)).toBe(0);
+		// I5a: status still unknown on a live-idle session is ABSENCE of evidence,
+		// not proof the send never landed (the runtime already reported the
+		// clientRef as known). No sweep count turns that into a resend.
+		for (let sweep = 0; sweep < 3; sweep++) await target.manager.tick(ORIGIN_KEY);
+		expect(port.sends).toEqual([]);
+		expect(target.database.inboundTurnRow(first.opRef)?.turn_state).toBe("bound");
+		expect(target.logs.some((line) => line.includes("unknown_op_on_live_idle_session"))).toBe(false);
+		expect(target.database.listEpochMutations({ sinceMs: 0 })).toEqual([]);
+		expect(target.database.holdState(first.opRef)?.deadlineAt).toBeDefined();
 	} finally {
 		await target.close();
 	}
 });
-
 test("red-team: a terminal tail frame arriving during the status grace wins once without status-fallback delivery", async () => {
 	const base = Date.parse("2026-09-02T00:00:00.000Z");
 	const now = base;

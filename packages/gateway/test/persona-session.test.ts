@@ -217,7 +217,7 @@ class GhostSendPort extends ScriptedSessionPort {
 	}
 }
 
-test("a retired turn whose send never landed is released once its session dies, ends its lifecycle, and rides the replacement turn", async () => {
+test("a retired turn whose send tore is held under its own deadline when its session dies; the replacement turn is unaffected", async () => {
 	const port = new GhostSendPort();
 	const released: string[] = [];
 	const logs: string[] = [];
@@ -241,30 +241,25 @@ test("a retired turn whose send never landed is released once its session dies, 
 	expect(replacement.sessionId).not.toBe(port.ghostSessionId);
 	expect(released).toEqual([]);
 
-	// The ghost session dies. The retired hold must release: trigger back to
-	// pending, lifecycle told, and — since a turn is running — steered into it.
+	// The ghost session dies. I5a (U3): the torn send is ABSENCE of evidence, not
+	// proof it never landed; the retired hold stays held under its own durable
+	// deadline instead of being replayed into the replacement turn.
 	port.ghostDead = true;
 	await manager?.tick(KEY);
-	expect(released).toEqual([ghostOpRef]);
+	expect(released).toEqual([]);
+	expect(logs.some((line) => line.startsWith(`recovery_requeue_unaccepted origin=${KEY}`))).toBe(false);
 	expect(
-		logs.some((line) =>
-			line.startsWith(`recovery_requeue_unaccepted origin=${KEY} epoch=0 nextEpoch=1 opRef=${ghostOpRef}`),
-		),
+		logs.some((line) => line.includes(`opRef=${ghostOpRef}`) && line.includes("reason=operation_state_unknown")),
 	).toBe(true);
-	expect(database?.getSessionRecord(KEY)?.epoch).toBe(1);
-	expect(port.steers).toEqual([
-		expect.objectContaining({ sessionId: replacement.sessionId, text: expect.stringContaining("torn send") }),
-	]);
-	expect(database?.inboundTurnRow(ghostOpRef)).toBeUndefined();
-	expect(database?.inboundTurnRows(replacement.opRef)).toEqual(
-		expect.arrayContaining([expect.objectContaining({ message_id: "m-1", turn_role: "steer", turn_state: "done" })]),
+	expect(database?.inboundTurnRow(ghostOpRef)).toMatchObject({ turn_state: "bound" });
+	expect(port.steers).toEqual([]);
+	expect(database?.holdState(ghostOpRef)?.deadlineAt).toBeDefined();
+	// The replacement turn is unaffected and completes normally.
+	port.complete(replacement.opRef, "answered the second message");
+	await eventually(
+		() => database?.inboundTurnRow(replacement.opRef)?.turn_state === "done",
+		"replacement turn did not complete",
 	);
-
-	// A later sweep is a no-op: nothing is held on the ghost any more.
-	await manager?.tick(KEY);
-	expect(released).toEqual([ghostOpRef]);
-	port.complete(replacement.opRef, "answered both");
-	await eventually(() => database?.inboundPendingCount(KEY) === 0, "replacement turn did not complete");
 });
 
 test("startup recovery releases a retired bound turn the broker disowns instead of holding it forever", async () => {
