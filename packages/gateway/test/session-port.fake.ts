@@ -375,9 +375,9 @@ export class ScriptedSessionPort implements SessionPort {
 		for (const tail of this.#tails.get(sessionId) ?? []) tail.stall(elapsedMs);
 	}
 
+	/** Patches a bound session's state, or seeds one the port never bound (a session left on disk by an earlier runtime). */
 	setSessionState(sessionId: string, patch: Partial<Pick<BrokerSession, "repo" | "live" | "deleted">>): void {
-		const current = this.#sessionStates.get(sessionId);
-		if (!current) throw new Error(`unknown scripted session ${sessionId}`);
+		const current = this.#sessionStates.get(sessionId) ?? { sessionId, repo: "", live: false, deleted: false };
 		this.#sessionStates.set(sessionId, { ...current, ...patch });
 	}
 
