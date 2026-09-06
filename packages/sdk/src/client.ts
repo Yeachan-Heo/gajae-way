@@ -30,6 +30,10 @@ export interface GajaewayClientOptions {
 	requestTimeoutMs?: number;
 }
 
+export interface RequestOptions {
+	timeoutMs?: number;
+}
+
 interface Transport {
 	write(data: string): Promise<void>;
 	close(): void | Promise<void>;
@@ -122,14 +126,18 @@ export class GajaewayClient {
 		return this.on("chat.progress", (payload) => handler(payload as ChatProgressPayload));
 	}
 
-	async request<T = unknown>(verb: string, params?: unknown): Promise<T> {
+	async request<T = unknown>(verb: string, params?: unknown, options?: RequestOptions): Promise<T> {
 		if (!this.#transport) throw new Error("client is not connected");
 		const id = `${++this.#id}`;
+		const timeoutMs = options?.timeoutMs ?? this.#requestTimeoutMs;
+		if (!Number.isFinite(timeoutMs) || timeoutMs <= 0) throw new Error("request timeout must be a positive number");
 		const promise = new Promise<T>((resolve, reject) => {
 			const timer = setTimeout(() => {
 				this.#pending.delete(id);
-				reject(new ProtocolError("verb_failed", `request timed out after ${this.#requestTimeoutMs}ms`));
-			}, this.#requestTimeoutMs);
+				reject(
+					new ProtocolError("verb_failed", `${verb} timed out after ${timeoutMs}ms; server completion is unknown`),
+				);
+			}, timeoutMs);
 			this.#pending.set(id, { resolve: resolve as (value: unknown) => void, reject, timer });
 		});
 		await this.#transport.write(encodeFrame({ v: PROFILE_VERSION, type: "request", id, verb, params }));

@@ -7,10 +7,12 @@ import {
 	CLI_USAGE,
 	COMMANDS,
 	cycleExitCode,
+	MEMORY_AUTOLINK_TIMEOUT_MS,
 	main,
 	parseArgs,
 	renderCycle,
 	restoreDatabase,
+	runMemoryAutolink,
 	socketPath,
 	USAGE_EXIT_CODE,
 	usageFor,
@@ -39,6 +41,36 @@ describe("cli arguments", () => {
 			console.error = console_error;
 			process.exitCode = previousExit ?? 0;
 		}
+	});
+});
+
+describe("memory autolink receipt", () => {
+	test("uses the bounded long-operation timeout and returns a validated receipt", async () => {
+		const receipt = {
+			runId: "run-1",
+			startedAt: "2026-09-06T00:00:00.000Z",
+			completedAt: "2026-09-06T00:00:02.000Z",
+			durationMs: 2_000,
+			filesScanned: 2_400,
+			filesChanged: 4,
+			filesSkippedDirty: 1,
+			linksAdded: 8,
+			aliases: 1_200,
+		};
+		const calls: unknown[][] = [];
+		const client = {
+			request: async (...args: unknown[]) => {
+				calls.push(args);
+				return receipt;
+			},
+		};
+		expect(await runMemoryAutolink(client)).toEqual(receipt);
+		expect(calls).toEqual([["memory.autolink", undefined, { timeoutMs: MEMORY_AUTOLINK_TIMEOUT_MS }]]);
+	});
+
+	test("rejects a malformed response instead of printing fake success", async () => {
+		const client = { request: async () => ({ filesChanged: 1 }) };
+		await expect(runMemoryAutolink(client)).rejects.toThrow("memory.autolink returned an invalid receipt");
 	});
 });
 

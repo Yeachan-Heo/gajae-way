@@ -22,6 +22,7 @@ export {
 	type GatewayStatusResult,
 	isSilenceToken,
 	type MemoryAuditResult,
+	type MemoryAutolinkResult,
 	type MemorySearchParams,
 	type MemorySearchResult,
 	type MonitorEventRecord,

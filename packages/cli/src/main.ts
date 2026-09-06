@@ -1,6 +1,6 @@
 import { copyFile, stat } from "node:fs/promises";
 import { isAbsolute, join } from "node:path";
-import type { MonitorRecord, OpsCycleResult } from "@gajaeway/protocol";
+import type { MemoryAutolinkResult, MonitorRecord, OpsCycleResult } from "@gajaeway/protocol";
 import { LOOPBACK_ORIGIN, originKey } from "@gajaeway/protocol";
 import { GajaewayClient } from "@gajaeway/sdk";
 import {
@@ -36,10 +36,45 @@ export const COMMANDS = [
 ] as const;
 
 export const CLI_USAGE =
-	"usage: gajaeway [--socket PATH] status|shutdown|chat|daemon run|sessions list [--json] [--fields a,b,c] [--limit N] [--offset N]|sessions inspect <originKey-or-index>|memory audit|memory search <query>|monitors ...|work run <name> [--cwd DIR] <text>|ops backup <path>|ops cycle [--json]|ops integrity|ops restore <backupPath>";
+	"usage: gajaeway [--socket PATH] status|shutdown|chat|daemon run|sessions list [--json] [--fields a,b,c] [--limit N] [--offset N]|sessions inspect <originKey-or-index>|memory audit|memory autolink|memory search <query>|monitors ...|work run <name> [--cwd DIR] <text>|ops backup <path>|ops cycle [--json]|ops integrity|ops restore <backupPath>";
 
 /** Usage errors exit 2, as `gajaeway-gateway` does; 1 stays a runtime failure. */
 export const USAGE_EXIT_CODE = 2;
+
+export const MEMORY_AUTOLINK_TIMEOUT_MS = 5 * 60_000;
+
+export type MemoryAutolinkReceipt = MemoryAutolinkResult;
+
+interface MemoryAutolinkClient {
+	request(verb: string, params?: unknown, options?: { timeoutMs?: number }): Promise<unknown>;
+}
+
+function isNonNegativeInteger(value: unknown): value is number {
+	return typeof value === "number" && Number.isInteger(value) && value >= 0;
+}
+
+export async function runMemoryAutolink(client: MemoryAutolinkClient): Promise<MemoryAutolinkReceipt> {
+	const result = await client.request("memory.autolink", undefined, {
+		timeoutMs: MEMORY_AUTOLINK_TIMEOUT_MS,
+	});
+	if (!result || typeof result !== "object") throw new Error("memory.autolink returned an invalid receipt");
+	const receipt = result as Record<string, unknown>;
+	if (
+		typeof receipt.runId !== "string" ||
+		typeof receipt.startedAt !== "string" ||
+		typeof receipt.completedAt !== "string" ||
+		![
+			receipt.durationMs,
+			receipt.filesScanned,
+			receipt.filesChanged,
+			receipt.filesSkippedDirty,
+			receipt.linksAdded,
+			receipt.aliases,
+		].every(isNonNegativeInteger)
+	)
+		throw new Error("memory.autolink returned an invalid receipt");
+	return receipt as unknown as MemoryAutolinkReceipt;
+}
 
 /** The usage text when `command` cannot be dispatched, undefined when it can. */
 export function usageFor(command: string | undefined): string | undefined {
@@ -327,7 +362,7 @@ export async function main(args = process.argv.slice(2)): Promise<void> {
 						console.log(JSON.stringify(result.issues));
 						if (!result.ok) process.exitCode = 1;
 					} else if (parsed.rest[0] === "autolink") {
-						console.log(JSON.stringify(await client.request("memory.autolink")));
+						console.log(JSON.stringify(await runMemoryAutolink(client)));
 					} else if (parsed.rest[0] === "search" && parsed.rest.slice(1).join(" ")) {
 						console.log(
 							JSON.stringify(await client.request("memory.search", { query: parsed.rest.slice(1).join(" ") })),

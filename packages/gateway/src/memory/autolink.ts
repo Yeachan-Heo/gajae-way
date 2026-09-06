@@ -1,6 +1,7 @@
 import { readFile, writeFile } from "node:fs/promises";
 import { basename, dirname, join, relative } from "node:path";
-import { corpusEntries, memoryGit, regenerateMap } from "./doctrine";
+import type { MemoryAutolinkResult } from "@gajaeway/protocol";
+import { corpusEntries, memoryGit } from "./doctrine";
 import { loadRegistry } from "./registry";
 
 /**
@@ -27,11 +28,7 @@ export interface AliasEntry {
 	readonly path: string;
 }
 
-export interface AutolinkReport {
-	readonly filesChanged: number;
-	readonly linksAdded: number;
-	readonly aliases: number;
-}
+export type AutolinkReport = MemoryAutolinkResult;
 
 const MIN_ALIAS_LENGTH = 3;
 
@@ -80,7 +77,7 @@ function normalizeAlias(alias: string): string {
 }
 
 export async function buildAliasIndex(
-	root: string,
+	_root: string,
 	files: readonly string[],
 	texts: ReadonlyMap<string, string>,
 ): Promise<AliasEntry[]> {
@@ -126,42 +123,54 @@ function inRanges(ranges: ReadonlyArray<[number, number]>, start: number, end: n
 	return ranges.some(([from, to]) => start < to && end > from);
 }
 
+function escapePattern(value: string): string {
+	return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
 export function autolinkText(
 	text: string,
 	selfPath: string,
 	index: readonly AliasEntry[],
 ): { text: string; added: number } {
-	// Single pass over the file: protected ranges are computed ONCE and edits are
-	// collected first, then applied back-to-front so offsets stay valid. The
-	// original per-alias rescan was O(aliases x text) and blocked the gateway
-	// event loop for minutes on a 2,400-file corpus (live gaebal-gajae incident:
-	// 90%+ CPU, status/audit timeouts while the sweep ran).
 	const ranges = protectedRanges(text);
-	const edits: Array<{ start: number; end: number; target: string }> = [];
-	const taken: Array<[number, number]> = [];
+	const eligible: Array<AliasEntry & { target: string }> = [];
+	const byAlias = new Map<string, AliasEntry & { target: string }>();
 	for (const entry of index) {
 		if (entry.path === selfPath) continue;
-		const target = relative(join(selfPath, ".."), entry.path).replaceAll("\\", "/");
-		// One link per target per file, ever: a file that already links this
-		// canonical note (by hand or by an earlier sweep) is left alone. This is
-		// what makes the sweep idempotent and keeps prose from turning blue.
-		if (text.includes(`](${target})`) || edits.some((edit) => edit.target === target)) continue;
-		const pattern = new RegExp(entry.alias.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), "giu");
-		for (const match of text.matchAll(pattern)) {
-			const start = match.index;
-			const end = start + match[0].length;
-			if (inRanges(ranges, start, end) || inRanges(taken, start, end)) continue;
-			// Boundaries: prefix-strict (no letter/digit before, so "가재" never
-			// matches inside "웨이가재"), suffix Latin-strict only — Korean particles
-			// attach directly to the noun ("개발가재를"), so a CJK suffix is a valid
-			// mention edge while a Latin/digit suffix is a longer identifier.
-			const before = text[start - 1] ?? " ";
-			const after = text[end] ?? " ";
-			if (/[\p{L}\p{N}_]/u.test(before) || /[A-Za-z0-9_]/.test(after)) continue;
-			edits.push({ start, end, target });
-			taken.push([start, end]);
-			break; // first occurrence per alias per file
-		}
+		const target = relative(dirname(selfPath), entry.path).replaceAll("\\", "/");
+		if (text.includes(`](${target})`)) continue;
+		const candidate = { ...entry, target };
+		eligible.push(candidate);
+		byAlias.set(entry.alias, candidate);
+	}
+	if (eligible.length === 0) return { text, added: 0 };
+
+	// One alternation scans the body once. The former alias-by-alias regex loop
+	// was O(aliases × file bytes), monopolising the gateway event loop on the
+	// production corpus even though the surrounding file loop yielded.
+	const pattern = new RegExp(eligible.map((entry) => escapePattern(entry.alias)).join("|"), "giu");
+	const first = new Map<string, { start: number; end: number }>();
+	for (const match of text.matchAll(pattern)) {
+		const alias = normalizeAlias(match[0]);
+		if (first.has(alias) || !byAlias.has(alias)) continue;
+		const start = match.index;
+		const end = start + match[0].length;
+		if (inRanges(ranges, start, end)) continue;
+		const before = text[start - 1] ?? " ";
+		const after = text[end] ?? " ";
+		if (/[\p{L}\p{N}_]/u.test(before) || /[A-Za-z0-9_]/.test(after)) continue;
+		first.set(alias, { start, end });
+	}
+
+	const edits: Array<{ start: number; end: number; target: string }> = [];
+	const taken: Array<[number, number]> = [];
+	const targets = new Set<string>();
+	for (const entry of eligible) {
+		const match = first.get(entry.alias);
+		if (!match || targets.has(entry.target) || inRanges(taken, match.start, match.end)) continue;
+		edits.push({ ...match, target: entry.target });
+		taken.push([match.start, match.end]);
+		targets.add(entry.target);
 	}
 	let out = text;
 	for (const edit of edits.sort((a, b) => b.start - a.start))
@@ -169,11 +178,34 @@ export function autolinkText(
 	return { text: out, added: edits.length };
 }
 
-export async function autolinkCorpus(root: string): Promise<AutolinkReport> {
+const sweeps = new Map<string, Promise<AutolinkReport>>();
+
+function dirtyCorpusPaths(status: string): Set<string> {
+	const dirty = new Set<string>();
+	const records = status.split("\0");
+	for (let index = 0; index < records.length; index++) {
+		const record = records[index];
+		if (!record) continue;
+		const state = record.slice(0, 2);
+		dirty.add(record.slice(3));
+		if (state.includes("R") || state.includes("C")) {
+			const source = records[++index];
+			if (source) dirty.add(source);
+		}
+	}
+	return dirty;
+}
+
+async function runAutolinkCorpus(root: string): Promise<AutolinkReport> {
+	const started = Date.now();
+	const runId = crypto.randomUUID();
 	const registry = await loadRegistry(root);
-	const raw = new Set(registry.byPriority.filter((axis) => axis.id === "daily").map((axis) => axis.root));
+	const raw = new Set(registry.byPriority.filter((axis) => axis.appendOnly).map((axis) => axis.root));
 	const files = (await corpusEntries(root)).filter(
 		(path) => path !== "MEMORY.md" && ![...raw].some((prefix) => path.startsWith(`${prefix}/`)),
+	);
+	const dirty = dirtyCorpusPaths(
+		await memoryGit(root, ["status", "--porcelain=v1", "-z", "--untracked-files=all", "--", "."]),
 	);
 	const texts = new Map<string, string>();
 	for (const path of files) {
@@ -185,28 +217,78 @@ export async function autolinkCorpus(root: string): Promise<AutolinkReport> {
 	}
 	const index = await buildAliasIndex(root, files, texts);
 	let filesChanged = 0;
+	let filesSkippedDirty = files.filter((path) => dirty.has(path)).length;
+	let filesScanned = 0;
 	let linksAdded = 0;
+	const changed: Array<{ path: string; rewritten: string; added: number }> = [];
 	for (let position = 0; position < files.length; position++) {
 		const path = files[position] as string;
+		if (dirty.has(path)) continue;
 		const text = texts.get(path);
 		if (text === undefined) continue;
+		filesScanned++;
 		const { text: rewritten, added } = autolinkText(text, path, index);
 		if (added > 0) {
+			// Do not overwrite a capture/closure/user edit that landed after the
+			// snapshot. A later sweep can reconsider the now-current file.
+			if ((await readFile(join(root, path), "utf8")) !== text) {
+				filesSkippedDirty++;
+				continue;
+			}
 			await writeFile(join(root, path), rewritten);
 			filesChanged++;
 			linksAdded += added;
+			changed.push({ path, rewritten, added });
 		}
 		// Yield the event loop regularly: the sweep must never freeze live turns.
 		if (position % 20 === 19) await Bun.sleep(0);
 	}
-	if (filesChanged > 0) {
-		await regenerateMap(root, registry);
-		try {
-			await memoryGit(root, ["add", "-A"]);
-			await memoryGit(root, ["commit", "-m", `Memory autolink sweep: ${linksAdded} links in ${filesChanged} files`]);
-		} catch {
-			// A bare tree without prior commits still gets the file changes.
+	if (changed.length > 0) {
+		const committable: string[] = [];
+		for (const change of changed) {
+			if ((await readFile(join(root, change.path), "utf8")) === change.rewritten) committable.push(change.path);
+			else {
+				filesChanged--;
+				linksAdded -= change.added;
+				filesSkippedDirty++;
+			}
 		}
+		if (committable.length > 0)
+			// A path-limited commit neither sweeps unrelated untracked files nor
+			// consumes another writer's staged work. All changed paths were clean at
+			// snapshot time, so an existing user edit is never folded into this commit.
+			await memoryGit(root, [
+				"commit",
+				"--only",
+				"-m",
+				`Memory autolink sweep: ${linksAdded} links in ${filesChanged} files`,
+				"--",
+				...committable,
+			]);
 	}
-	return { filesChanged, linksAdded, aliases: index.length };
+	const completed = Date.now();
+	return {
+		runId,
+		startedAt: new Date(started).toISOString(),
+		completedAt: new Date(completed).toISOString(),
+		durationMs: completed - started,
+		filesScanned,
+		filesChanged,
+		filesSkippedDirty,
+		linksAdded,
+		aliases: index.length,
+	};
+}
+
+/** Concurrent requests for one corpus attach to the same sweep and receipt. */
+export function autolinkCorpus(root: string): Promise<AutolinkReport> {
+	const active = sweeps.get(root);
+	if (active) return active;
+	const sweep = runAutolinkCorpus(root);
+	sweeps.set(root, sweep);
+	const clear = () => {
+		if (sweeps.get(root) === sweep) sweeps.delete(root);
+	};
+	void sweep.then(clear, clear);
+	return sweep;
 }

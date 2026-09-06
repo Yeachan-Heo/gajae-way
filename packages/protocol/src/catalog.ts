@@ -277,7 +277,8 @@ export interface SessionBootstrapProjection {
 /**
  * Memory system surface (P3, spec fact 8): filesystem-first Markdown memory.
  * memory.audit runs the structural validator; memory.search is map-then-BM25
- * retrieval over the canonical tree. Both are read-only verbs.
+ * retrieval over the canonical tree. memory.autolink is a guarded mutating
+ * sweep and returns an auditable completion receipt.
  */
 export interface MemoryAuditResult {
 	readonly ok: boolean;
@@ -286,6 +287,19 @@ export interface MemoryAuditResult {
 		readonly path: string;
 		readonly message: string;
 	}[];
+}
+
+export interface MemoryAutolinkResult {
+	/** Identifies one server-side sweep; concurrent retries receive the same id. */
+	readonly runId: string;
+	readonly startedAt: string;
+	readonly completedAt: string;
+	readonly durationMs: number;
+	readonly filesScanned: number;
+	readonly filesChanged: number;
+	readonly filesSkippedDirty: number;
+	readonly linksAdded: number;
+	readonly aliases: number;
 }
 
 export interface MemorySearchParams {
@@ -573,10 +587,7 @@ export interface VerbCatalogV01 {
 	"session.recall": { params: SessionRecallParams; result: SessionRecallResult };
 	"session.list": { params: undefined; result: SessionListResult };
 	"memory.audit": { params: undefined; result: MemoryAuditResult };
-	"memory.autolink": {
-		params: undefined;
-		result: { readonly filesChanged: number; readonly linksAdded: number; readonly aliases: number };
-	};
+	"memory.autolink": { params: undefined; result: MemoryAutolinkResult };
 	"memory.search": { params: MemorySearchParams; result: MemorySearchResult };
 	"monitor.add": { params: MonitorSpec; result: { readonly monitorId: string } };
 	"monitor.list": { params: undefined; result: { readonly monitors: readonly MonitorRecord[] } };
