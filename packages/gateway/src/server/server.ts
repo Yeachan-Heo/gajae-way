@@ -2161,7 +2161,7 @@ function containsSilenceToken(part: string): boolean {
 }
 
 function commandAuthorised(
-	origin: { readonly platform: string; readonly kind: string; readonly conversationId: string },
+	origin: Parameters<typeof decideEngagement>[0],
 	config: GatewayConfig,
 	engagement: unknown,
 ): boolean {
