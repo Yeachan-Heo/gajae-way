@@ -147,7 +147,21 @@ test("persona workspace refuses a memory symlink that escapes the canonical corp
 		await mkdir(join(home, "workspace"), { recursive: true });
 		await mkdir(join(home, "outside"), { recursive: true });
 		await symlink(join(home, "outside"), join(home, "workspace", "memory"), "dir");
-		await expect(new PersonaLoader(home).ensureWorkspace()).rejects.toThrow("workspace_memory_path_escape");
+		await expect(new PersonaLoader(home).ensureWorkspace()).rejects.toThrow("workspace_memory_path_conflict");
+	} finally {
+		await rm(home, { recursive: true, force: true });
+	}
+});
+
+test("persona workspace accepts a workspace that itself links to the corpus's parent", async () => {
+	// Live shape on jip: workspace -> ~/clawd and memory -> ~/clawd/memory, so
+	// workspace/memory is a real directory that IS the canonical corpus.
+	const home = await mkdtemp(join(tmpdir(), "gajaeway-persona-memory-parent-link-"));
+	try {
+		await mkdir(join(home, "clawd", "memory"), { recursive: true });
+		await symlink(join(home, "clawd"), join(home, "workspace"), "dir");
+		await symlink(join(home, "clawd", "memory"), join(home, "memory"), "dir");
+		await new PersonaLoader(home).ensureWorkspace();
 	} finally {
 		await rm(home, { recursive: true, force: true });
 	}

@@ -1,4 +1,4 @@
-import { lstat, mkdir, realpath, stat, symlink, writeFile } from "node:fs/promises";
+import { mkdir, realpath, stat, symlink, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import selfOpsConfig from "./self-ops/config-and-restarts.md" with { type: "text" };
 import selfOpsSkill from "./self-ops/SKILL.md" with { type: "text" };
@@ -47,14 +47,17 @@ export class PersonaLoader {
 		} catch (error) {
 			if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
 		}
-		const entry = await lstat(workspaceMemory);
-		if (!entry.isSymbolicLink())
-			throw new Error(
-				`workspace_memory_path_conflict: ${workspaceMemory} must be a symlink to the canonical memory corpus`,
-			);
+		// The invariant is that the persona's workspace/memory IS the canonical
+		// corpus - one tree, one git history - not that it is spelled as a symlink.
+		// A deployment where `workspace` itself links to the corpus's parent (live:
+		// jip, workspace -> ~/clawd, memory -> ~/clawd/memory) has a real
+		// `workspace/memory` directory that resolves to exactly the same place;
+		// refusing it as "not a symlink" bricked the box on the 2026-09-06 rollout.
 		const [actual, expected] = await Promise.all([realpath(workspaceMemory), realpath(this.#memory)]);
 		if (actual !== expected)
-			throw new Error(`workspace_memory_path_escape: ${workspaceMemory} resolves outside the canonical memory corpus`);
+			throw new Error(
+				`workspace_memory_path_conflict: ${workspaceMemory} resolves to ${actual}, not the canonical memory corpus ${expected}`,
+			);
 		const skillDirectory = join(this.#workspace, ".gjc", "skills", "self-ops");
 		await mkdir(skillDirectory, { recursive: true, mode: 0o700 });
 		await Promise.all(
