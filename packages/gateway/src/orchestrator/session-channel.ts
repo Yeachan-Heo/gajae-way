@@ -245,7 +245,9 @@ export class SessionChannel {
 		opts?: { timeoutMs?: number },
 	): Promise<Record<string, unknown>> {
 		return this.#request(
-			{ type: "control_request", op, input },
+			// The pinned 0.16.3 host keys control requests by `operation` (recorded C1/C5);
+			// the fixture accepts either. Emit both so one codec fits both peers.
+			{ type: "control_request", op, operation: op, input },
 			op,
 			opts?.timeoutMs ?? (op === "turn.prompt" ? 30_000 : this.#timeoutMs),
 		);
@@ -269,6 +271,9 @@ export class SessionChannel {
 				this.#pending.delete(id);
 				reject(
 					new ChannelQueryError(`${operation} timed out after ${timeoutMs}ms`, "channel_timeout", pending.bytesWritten),
+				);
+				this.#log(
+					`channel_timeout session=${this.sessionId} op=${operation} timeoutMs=${timeoutMs} inFlight=${this.#pending.size} bytesWritten=${pending.bytesWritten ?? "unknown"} lastFrameAgeMs=${this.#now() - this.#lastFrameAt} streak=${this.#timeouts + 1}`,
 				);
 				if (++this.#timeouts >= 2) this.fault("timeouts");
 			}, timeoutMs);

@@ -132,6 +132,8 @@ const DEFAULT_STALL_TIMEOUT_MS = 120_000;
 const DEFAULT_POLL_TIMEOUT_MS = 30_000;
 const DEFAULT_POLL_INTERVAL_MS = 250;
 const UNKNOWN_KIND_DIAGNOSTIC_CAP = 20;
+/** Tail frames may queue behind the actor mailbox while the channel keeps answering; beyond this the reader waits. */
+const TAIL_DELIVERY_BACKLOG = 64;
 const STREAM_REOPEN_GIVE_UP = 6;
 const DELIVERED_ID_CAP = 2_000;
 
@@ -246,6 +248,14 @@ export class TailRunner {
 	 * without changing durable inbound state; callers retain their bound turn.
 	 */
 	async attach(input: TailAttachInput): Promise<TailHandle> {
+		// I9b residency: a parked resident relay for the same session under the
+		// same owner is adopted instead of spawned; the warm turn costs no launch.
+		for (const parked of this.#handles) {
+			if (parked.adopt({ ...input, repo: input.repo || this.#repo })) {
+				this.#log(`tail_resident_adopted session=${input.sessionId} restarts=${parked.channel?.stats().restarts ?? 0}`);
+				return parked;
+			}
+		}
 		await this.#acquireSlot(input.priority ?? "current");
 		const handle = new ManagedTailHandle(this, { ...input, repo: input.repo || this.#repo });
 		this.#handles.add(handle);
@@ -254,7 +264,7 @@ export class TailRunner {
 			await handle.ready;
 			return handle;
 		} catch (error) {
-			await handle.close();
+			await handle.terminate();
 			throw error;
 		}
 	}
@@ -282,12 +292,17 @@ export class TailRunner {
 		for (const handle of this.#handles) handle.checkStall(now);
 	}
 
+	/** Shutdown: terminates every handle, parked residents included. */
+	async terminateAll(): Promise<void> {
+		for (const handle of [...this.#handles]) await handle.terminate();
+	}
+
 	/** Reaps only idle handles; an active turn is never evicted for capacity. */
 	async reapIdle(now = this.#now()): Promise<number> {
 		const idle = [...this.#handles].filter(
 			(handle) => handle.idleSince !== undefined && now - handle.idleSince >= this.#idleTtlMs,
 		);
-		for (const handle of idle) await handle.close();
+		for (const handle of idle) await handle.terminate();
 		return idle.length;
 	}
 
@@ -313,7 +328,7 @@ export class TailRunner {
 					(left, right) => (left.idleSince ?? Number.POSITIVE_INFINITY) - (right.idleSince ?? Number.POSITIVE_INFINITY),
 				)[0];
 			if (evictable) {
-				await evictable.close();
+				await evictable.terminate();
 				continue;
 			}
 			this.#logSaturation();
@@ -382,7 +397,7 @@ class ManagedTailHandle implements TailHandle {
 	readonly brokerGeneration: number;
 	readonly repo: string;
 	readonly #runner: TailRunner;
-	readonly #input: TailAttachInput;
+	#input: TailAttachInput;
 	readonly #readyResolve: () => void;
 	readonly #readyReject: (error: unknown) => void;
 	readonly ready: Promise<void>;
@@ -576,8 +591,59 @@ class ManagedTailHandle implements TailHandle {
 		await this.close();
 	}
 
+	/** Parked: the owner released the turn but the resident relay (and its channel) stays alive for the next attach. */
+	#parked = false;
+
+	get parked(): boolean {
+		return this.#parked;
+	}
+
+	/**
+	 * Adopts this parked handle for a new attach of the same session and owner.
+	 * Returns false when the handle is not parked, belongs to another owner, or
+	 * has no healthy resident channel (then the caller spawns as before).
+	 */
+	adopt(input: TailAttachInput): boolean {
+		if (!this.#parked || this.#closed) return false;
+		if (input.sessionId !== this.sessionId || input.originKey !== this.#input.originKey) return false;
+		if (!this.#channel || !this.#channel.health().healthy) return false;
+		if (input.brokerGeneration !== this.brokerGeneration) return false;
+		this.#parked = false;
+		this.#input = input;
+		this.#accepted = false;
+		this.#acceptedOpRef = undefined;
+		this.#preReceipt.splice(0);
+		this.#deliveredIds.clear();
+		this.#deliveryFailed = false;
+		this.#stallReported = false;
+		this.#lastEventAt = this.#runner.now();
+		this.#idleSince = undefined;
+		return true;
+	}
+
+	/** Force-closes even a resident handle (idle eviction, capacity, shutdown, fault). */
+	async terminate(): Promise<void> {
+		this.#parked = false;
+		this.#resident = false;
+		await this.close();
+	}
+
+	#resident = false;
+
 	async close(): Promise<void> {
 		if (this.#closed) return;
+		// A resident relay with a healthy channel is parked, not torn down: the
+		// child keeps streaming, the channel keeps probing, and the next attach
+		// for the same session/owner adopts it (I9b warm-turn zero-spawn).
+		if (this.#resident && this.#channel?.health().healthy && !this.#parked) {
+			this.#parked = true;
+			this.#running = false;
+			this.#idleSince ??= this.#runner.now();
+			this.#accepted = false;
+			this.#acceptedOpRef = undefined;
+			this.#input = { ...this.#input, onFrame: undefined, onStall: undefined, onRetentionGap: undefined };
+			return;
+		}
 		this.#closed = true;
 		this.#channel?.close();
 		this.#channel = undefined;
@@ -659,7 +725,7 @@ class ManagedTailHandle implements TailHandle {
 				if (!this.#ready) {
 					this.#ready = true;
 					this.#readyReject(error);
-					await this.close();
+					await this.terminate();
 					return;
 				}
 				this.#input.onDiagnostic?.(
@@ -692,7 +758,7 @@ class ManagedTailHandle implements TailHandle {
 				if (!this.#ready) {
 					this.#ready = true;
 					this.#readyReject(error);
-					await this.close();
+					await this.terminate();
 					return;
 				}
 				this.#input.onDiagnostic?.(
@@ -740,21 +806,46 @@ class ManagedTailHandle implements TailHandle {
 					})
 				: undefined;
 			this.#channel = channel;
+			this.#resident = channel !== undefined;
 			channel?.onFault(() => {
 				this.#runner.recordChannelFault();
 				stream.close();
 			});
 			channel?.startIdleProbe();
 			try {
+				// Channel responses are settled the moment they are read; only tail
+				// frames go through the awaited delivery path. Otherwise a mailbox task
+				// that awaits a channel query (e.g. reconcile -> turn.result) while the
+				// reader awaits that same mailbox for a tail frame deadlocks until the
+				// query times out (live soak 2026-09-06: channel_degraded reason=timeouts).
+				const pendingFrames: string[] = [];
+				let deliverChain: Promise<void> = Promise.resolve();
+				const deliver = (line: string) => {
+					pendingFrames.push(line);
+					deliverChain = deliverChain.then(async () => {
+						const next = pendingFrames.shift();
+						if (next === undefined || this.#closed) return;
+						for (const frame of decodeStreamLine(next)) await this.receive(frame);
+					});
+					return deliverChain;
+				};
+				let delivered: Promise<void> = Promise.resolve();
 				for await (const line of stream.lines) {
 					if (this.#closed) break;
 					const consumed = channel?.consumes(line);
 					for (const listener of listeners) listener(line);
 					if (channel && !channel.health().healthy) break;
 					if (consumed) continue;
-					const frames = decodeStreamLine(line);
-					for (const frame of frames) await this.receive(frame);
+					delivered = deliver(line).catch((error: unknown) => {
+						this.#input.onDiagnostic?.(
+							`tail_frame_delivery_failed session=${this.sessionId} detail=${sanitizeDiagnostic(error instanceof Error ? error.message : String(error)) || "sdk_error"}`,
+						);
+					});
+					// Bounded backpressure: never let undelivered tail frames pile up
+					// unboundedly, but allow the channel to keep answering meanwhile.
+					if (pendingFrames.length >= TAIL_DELIVERY_BACKLOG) await delivered;
 				}
+				await delivered;
 			} catch (error) {
 				this.#input.onDiagnostic?.(
 					`tail_stream_error session=${this.sessionId} detail=${sanitizeDiagnostic(error instanceof Error ? error.message : String(error)) || "sdk_error"}`,

@@ -108,7 +108,8 @@ test("capacity refusal preserves residency ceiling and does not launch CLI work"
 		expect(cliCalls).toBe(calls);
 		expect(brokerStatus(broker, tails).residentChannels).toBe(1);
 	} finally {
-		await handle.close();
+		// I9b residency: close() parks a healthy resident relay; terminateAll tears it down.
+		await tails.terminateAll();
 		await rm(home, { recursive: true, force: true });
 	}
 	expect(tails.residentChannels).toBe(0);

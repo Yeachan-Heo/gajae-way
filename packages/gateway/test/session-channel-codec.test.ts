@@ -139,7 +139,13 @@ test("outbound limit measures UTF-8 NDJSON bytes and includes the exact boundary
 	const mem = memory();
 	const channel = new SessionChannel({ sessionId: "s", transport: mem.transport, newId: () => "fixed" });
 	const overhead = Buffer.byteLength(
-		JSON.stringify({ type: "control_request", op: "turn.prompt", input: { text: "" }, id: "fixed" }) + "\n",
+		JSON.stringify({
+			type: "control_request",
+			op: "turn.prompt",
+			operation: "turn.prompt",
+			input: { text: "" },
+			id: "fixed",
+		}) + "\n",
 	);
 	await expect(channel.control("turn.prompt", { text: "x".repeat(256 * 1024 - overhead + 1) })).rejects.toMatchObject({
 		code: "channel_frame_too_large",
@@ -365,7 +371,11 @@ test("tail channel kill/diagnostic/blackhole faults reopen at bounded delays and
 	expect(await result).toEqual({ status: "completed" });
 	expect(delivered).toEqual(["settled"]);
 	expect(handle.channel!.orphanFrames).toBe(1);
+	// close() parks the healthy resident relay (warm reuse); terminateAll tears it down.
 	await handle.close();
+	await flush();
+	expect(runner.residentChannels).toBe(1);
+	await runner.terminateAll();
 	await flush();
 	expect(runner.residentChannels).toBe(0);
 	expect(runner.channelFaults).toBe(7);
@@ -425,7 +435,50 @@ test("failed resident spawn is bounded and reattachment discards an unusable cur
 	expect(runner.residentChannels).toBe(1);
 	expect(runner.channelRestarts).toBe(1);
 	expect(spawns).toBe(2);
-	await handle.close();
+	await runner.terminateAll();
 	await flush();
 	expect(clock.timers.size).toBe(0);
+});
+
+test("resident reuse: a parked healthy relay is adopted by the next attach for the same session/owner and evicted after idleTtlMs", async () => {
+	const clock = new Clock();
+	let spawns = 0;
+	const streams: ReturnType<typeof streamDouble>[] = [];
+	const runner = new TailRunner({
+		repo: "/tmp",
+		now: clock.now,
+		setTimeout: clock.setTimeout,
+		clearTimeout: clock.clearTimeout,
+		run: async () => ({ stdout: JSON.stringify({ ok: true, result: { items: [] } }), stderr: "", exitCode: 0 }),
+		stream: () => {
+			spawns++;
+			const double = streamDouble();
+			streams.push(double);
+			return double.stream;
+		},
+		idleTtlMs: 60_000,
+	});
+	const attach = (originKey: string) => runner.attach({ sessionId: "s", originKey, brokerGeneration: 1, repo: "/tmp" });
+	const first = await attach("o");
+	await flush();
+	expect(spawns).toBe(1);
+	expect(first.channel?.health().healthy).toBe(true);
+	await first.close();
+	await flush();
+	expect(runner.residentChannels).toBe(1);
+	const second = await attach("o");
+	expect(second).toBe(first);
+	expect(spawns).toBe(1);
+	await second.close();
+	await flush();
+	// A different owner never adopts someone else's relay.
+	const other = await attach("other");
+	expect(other).not.toBe(first);
+	expect(spawns).toBe(2);
+	await other.close();
+	await flush();
+	await clock.advance(61_000);
+	expect(await runner.reapIdle()).toBe(2);
+	await flush();
+	expect(runner.residentChannels).toBe(0);
 });

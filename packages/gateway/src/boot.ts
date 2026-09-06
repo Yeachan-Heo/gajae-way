@@ -113,6 +113,7 @@ export async function bootGateway(options: BootGatewayOptions = {}): Promise<Gat
 			? startStdioServer({
 					config,
 					transport: config.transport,
+					tailRunner,
 					database,
 					sessionPort,
 					persona,
@@ -124,6 +125,7 @@ export async function bootGateway(options: BootGatewayOptions = {}): Promise<Gat
 			: await startUnixServer({
 					config,
 					transport: config.transport,
+					tailRunner,
 					database,
 					sessionPort,
 					persona,

@@ -222,6 +222,8 @@ export interface GatewayServerOptions {
 		readonly residentChannels: number;
 		readonly channelRestarts: number;
 		readonly channelFaults: number;
+		reapIdle?(): Promise<number>;
+		terminateAll?(): Promise<void>;
 		readonly lastChannelFaultAt: number | undefined;
 	};
 	/** Per-process CLI overrides, reapplied on every live reload so they survive it. */
@@ -635,6 +637,7 @@ async function orderedStop(
 		// (5) observe-only: one bounded status per bound turn, never a mutation.
 		await runtime.personaSessions.drain(Math.min(5_000, remaining()));
 		await withinBudget(runtime.personaSessions.stop(), remaining());
+		await withinBudget(Promise.resolve(options.tailRunner?.terminateAll?.()), remaining());
 		runtime.stopBrokerGenerationListener?.();
 		await withinBudget(runtime.monitorRuntime.stop(), remaining());
 		runtime.monitors.dispose();
@@ -741,6 +744,8 @@ function createRuntime(options: GatewayServerOptions): Runtime {
 	const monitorRuntime = new MonitorRuntime(options.config, registry, monitors);
 	const reconcileTimer = setInterval(() => {
 		void monitors.reconcile();
+		// I9b residency: idle resident relays are evicted after idleTtlMs.
+		void options.tailRunner?.reapIdle?.().catch(() => {});
 		void personaSessions
 			.recover()
 			.catch((error: unknown) => console.error(`persona recovery sweep failed: ${diagnostic(error)}`));
