@@ -838,8 +838,13 @@ class OriginActor {
 				`tail_attach_failed origin=${this.originKey} session=${sessionId} detail=${safeDiagnostic(error)}`,
 			);
 			detached = true;
+			// The turn stays adopted without a tail: reconcile sweeps drive it to a
+			// terminal witness (turn.result) and the retired-reattach timer retries the
+			// tail. `tail_capacity` names the saturation case; anything else is the
+			// transport being unavailable at recovery time (e.g. the daemon still booting).
+			const reason = /saturat|capacity/i.test(safeDiagnostic(error)) ? "tail_capacity" : "tail_unavailable";
 			this.#manager.log(
-				`retired_hold originKey=${this.originKey} epoch=${turn.epoch} opRef=${turn.opRef} reason=tail_capacity`,
+				`retired_hold originKey=${this.originKey} epoch=${turn.epoch} opRef=${turn.opRef} reason=${reason}`,
 			);
 		}
 		const dispatchedAtMs = this.#dispatchFloorMs(turn.opRef);
@@ -1198,6 +1203,10 @@ class OriginActor {
 			return;
 		}
 		try {
+			// T0b: the spawn gate is the durable marker that a runner call is about
+			// to happen; a crash after it reclassifies the attempt as
+			// written_unconfirmed at boot (never as proof of non-admission).
+			this.#manager.database.turnAttemptSetSpawnGate(opRef);
 			await this.#resumeUnavailable(binding, () =>
 				this.#manager.port.send({
 					sessionId: binding.sessionId,
@@ -1208,6 +1217,7 @@ class OriginActor {
 					...(lifecycle.sendModelFallback ? { model: lifecycle.sendModelFallback } : {}),
 				}),
 			);
+			this.#manager.database.turnAttemptMarkAccepted(opRef);
 			this.#manager.database.inboundTurnAccept(opRef);
 			// I4b: the rendered prompt's byte hash is how pos_trigger is resolved
 			// inside a transcript snapshot; it is recorded once, next to the attempt.
@@ -1226,8 +1236,8 @@ class OriginActor {
 			// Never a CLI fallback spawn.
 			if (error instanceof ChannelUnavailableError) {
 				await tail.close();
-				this.#manager.database.turnAttemptMarkPreWriteFailure(opRef);
-				this.#manager.database.inboundTurnUnbindPreSend(opRef);
+				// bytesWritten=0 is attested by the port: NA1 despite the spawn gate.
+				this.#manager.database.inboundTurnUnbindPreSend(opRef, { provenZeroBytes: true });
 				this.#current = undefined;
 				this.#state = "idle";
 				await this.#notifyReleased(current);
@@ -1251,7 +1261,9 @@ class OriginActor {
 			// bounded per actor before backing off. The message is never dropped.
 			if (sdkStatusErrorCode(error) === "session_disowned_dead") {
 				await tail.close();
-				this.#manager.database.inboundTurnUnbindPreSend(opRef);
+				// The Router disowned the id before the prompt could be written (I3
+				// resume-first proved it): zero bytes, NA1 despite the spawn gate.
+				this.#manager.database.inboundTurnUnbindPreSend(opRef, { provenZeroBytes: true });
 				const nextEpoch = this.#manager.database.mutateEpoch(this.originKey, {
 					scope: "persona",
 					reason: "session_disowned_dead",
@@ -1282,7 +1294,11 @@ class OriginActor {
 			// hold that the periodic reconcile keeps sweeping, and it is never resent.
 			if ((error instanceof OpRefRejectedError && error.code === CLIENT_REF_CONFLICT_CODE) || isOpRefRejection(error))
 				this.#manager.log(`recovery_client_ref_conflict origin=${this.originKey} epoch=${epoch} opRef=${opRef}`);
-			else
+			else if (error instanceof OpRefRejectedError) {
+				// NA2: a structured refusal correlated to this request, before admission.
+				this.#manager.database.turnAttemptMarkRefused(opRef, error.code);
+				this.#manager.log(`persona_send_refused origin=${this.originKey} opRef=${opRef} code=${error.code}`);
+			} else
 				this.#manager.log(
 					`persona_send_ambiguous origin=${this.originKey} opRef=${opRef} detail=${safeDiagnostic(error)}`,
 				);

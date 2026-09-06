@@ -837,11 +837,11 @@ export class GatewayDatabase {
 	}
 
 	/** Releases only a turn for which no prompt write was attempted; the opRef stays stable. */
-	inboundTurnUnbindPreSend(opRef: string): void {
+	inboundTurnUnbindPreSend(opRef: string, options: { provenZeroBytes?: boolean } = {}): void {
 		this.withTransaction(() => {
 			const trigger = this.inboundTurnRow(opRef);
 			if (!trigger || trigger.turn_state !== "bound") throw new Error(`turn ${opRef} is not pre-send bound`);
-			this.turnAttemptMarkPreWriteFailure(opRef);
+			this.turnAttemptMarkPreWriteFailure(opRef, options);
 			this.#database
 				.query(
 					"UPDATE inbound_messages SET turn_role = NULL, turn_epoch = NULL, turn_state = NULL, turn_op_ref = NULL, bound_session_id = NULL, dispatched_at = NULL, terminal_delivery_id = NULL WHERE turn_op_ref = ? AND state = 'pending'",
@@ -850,13 +850,62 @@ export class GatewayDatabase {
 		});
 	}
 
-	turnAttemptMarkPreWriteFailure(opRef: string): void {
+	/**
+	 * NA1. Without `provenZeroBytes` only an attempt that never reached the spawn
+	 * gate qualifies (boot classifies gated rows as written_unconfirmed). With it,
+	 * the RUNNER is attesting `bytesWritten = 0` for a gated attempt: the runtime
+	 * refused before any prompt bytes left (session disowned before send, zero-byte
+	 * channel refusal) - the plan's NA1 as written by the runner.
+	 */
+	turnAttemptMarkPreWriteFailure(opRef: string, options: { provenZeroBytes?: boolean } = {}): void {
 		const result = this.#database
 			.query(
-				"UPDATE turn_attempts SET send_state = 'pre_write_failure', send_decided_at = ?, send_decided_by = 'runner' WHERE op_ref = ? AND send_state = 'pending_write' AND spawn_gate_at IS NULL",
+				options.provenZeroBytes
+					? "UPDATE turn_attempts SET send_state = 'pre_write_failure', send_decided_at = ?, send_decided_by = 'runner' WHERE op_ref = ? AND send_state = 'pending_write'"
+					: "UPDATE turn_attempts SET send_state = 'pre_write_failure', send_decided_at = ?, send_decided_by = 'runner' WHERE op_ref = ? AND send_state = 'pending_write' AND spawn_gate_at IS NULL",
 			)
 			.run(new Date().toISOString(), opRef);
 		if (result.changes !== 1) throw new Error(`turn ${opRef} has no pre-write attempt`);
+	}
+
+	/** Runner: bytes left the process (channel write or CLI child spawned); the outcome is not yet known. */
+	turnAttemptMarkWritten(opRef: string): void {
+		this.#database
+			.query(
+				"UPDATE turn_attempts SET send_state = 'written_unconfirmed', send_decided_at = ?, send_decided_by = 'runner', send_started_at = COALESCE(send_started_at, ?) WHERE op_ref = ? AND send_state = 'pending_write' AND spawn_gate_at IS NOT NULL",
+			)
+			.run(new Date().toISOString(), new Date().toISOString(), opRef);
+	}
+
+	/** Runner: the runtime acknowledged the prompt (receipt correlated to this clientRef). */
+	turnAttemptMarkAccepted(opRef: string): void {
+		const now = new Date().toISOString();
+		this.withTransaction(() => {
+			this.#database
+				.query(
+					"UPDATE turn_attempts SET send_state = 'written_unconfirmed', send_decided_at = COALESCE(send_decided_at, ?), send_decided_by = COALESCE(send_decided_by, 'runner') WHERE op_ref = ? AND send_state = 'pending_write'",
+				)
+				.run(now, opRef);
+			this.#database
+				.query(
+					"UPDATE turn_attempts SET send_state = 'accepted', accepted_at = COALESCE(accepted_at, ?) WHERE op_ref = ? AND send_state = 'written_unconfirmed'",
+				)
+				.run(now, opRef);
+			this.#database
+				.query(
+					"UPDATE turn_attempts SET admission = 'accepted', admission_decided_at = ? WHERE op_ref = ? AND admission = 'unknown'",
+				)
+				.run(now, opRef);
+		});
+	}
+
+	/** Runner: a structured refuse-before-admission response correlated to this request (NA2). Write history is kept. */
+	turnAttemptMarkRefused(opRef: string, code: string): void {
+		this.#database
+			.query(
+				"UPDATE turn_attempts SET admission = 'refused', admission_code = ?, admission_decided_at = ? WHERE op_ref = ? AND admission = 'unknown'",
+			)
+			.run(code, new Date().toISOString(), opRef);
 	}
 
 	turnAttemptSetSpawnGate(opRef: string): void {
