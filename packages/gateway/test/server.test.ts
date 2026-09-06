@@ -714,7 +714,7 @@ test("/restart is owner-only and triggers an ordered gateway stop after acknowle
 	server = undefined;
 });
 
-test("group turns carry silence guidance: listeners are told to default to [SILENT]", async () => {
+test("group turns name the [SILENT] mechanism but never rule on whether the persona was addressed", async () => {
 	directory = await mkdtemp(join(tmpdir(), "gajaeway-server-"));
 	const config: GatewayConfig = {
 		schemaVersion: 1,
@@ -752,7 +752,11 @@ test("group turns carry silence guidance: listeners are told to default to [SILE
 		},
 	});
 	for (let attempt = 0; attempt < 400 && preambles.length === 0; attempt++) await Bun.sleep(5);
-	expect(preambles[0]).toContain("You were NOT addressed");
+	// Speaking or not is the persona's call from its own rules/memory; the runtime
+	// only tells it how to stay quiet (live: the old "NOT addressed" stamp silenced
+	// the persona on people talking to it in an open room).
+	expect(preambles[0]).not.toContain("NOT addressed");
+	expect(preambles[0]).not.toContain("explicitly addressed");
 	expect(preambles[0]).toContain("[SILENT]");
 	// The silence-token reply suppresses delivery: no chat.message event arrives.
 	await Bun.sleep(50);

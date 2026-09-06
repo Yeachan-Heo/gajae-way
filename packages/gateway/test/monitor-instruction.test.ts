@@ -131,12 +131,38 @@ test("instruction validation rejects non-strings and over-long text", async () =
 		expect(() => registry.add({ ...base, instruction: "x".repeat(MONITOR_INSTRUCTION_MAX_LENGTH + 1) })).toThrow(
 			/at most 4000 characters/,
 		);
+		expect(() => registry.add({ ...base, eventTypes: ["broken/type"] })).toThrow(
+			"is not a valid origin segment",
+		);
 		// Exactly at the bound is accepted, and a blank instruction normalises away.
 		expect(registry.add({ ...base, instruction: "x".repeat(MONITOR_INSTRUCTION_MAX_LENGTH) }).instruction).toHaveLength(
 			MONITOR_INSTRUCTION_MAX_LENGTH,
 		);
 		expect(registry.add({ ...base, instruction: "   " }).instruction).toBeUndefined();
 		database.close();
+	} finally {
+		await rm(directory, { recursive: true, force: true });
+	}
+});
+
+test("monitor.add refuses an event type that cannot be an executing-session origin", async () => {
+	const directory = await mkdtemp(join(tmpdir(), "gajaeway-monitor-eventtype-"));
+	try {
+		const { registry } = await harness(directory);
+		const base = { trigger: { kind: "cron", schedule: "0 6 * * *" } as const };
+		// Live: a 469-character "event type" that was really the whole instruction
+		// registered fine and then every event died at dispatch with OriginRefError.
+		const instruction = `gajaeway.runtime-feedback.daily.gaebal.channel-1470204268933022023.${"review-last-24h-runtime-operation.".repeat(14)}`;
+		expect(instruction.length).toBeGreaterThan(256);
+		expect(() => registry.add({ name: "too-long", eventTypes: [instruction], ...base })).toThrow(
+			/not a valid origin segment/,
+		);
+		expect(() => registry.add({ name: "bad-chars", eventTypes: ["daily report/v2"], ...base })).toThrow(
+			/not a valid origin segment/,
+		);
+		expect(registry.add({ name: "ok", eventTypes: ["townhall.report.8h+mention-1"], ...base }).eventTypes).toEqual([
+			"townhall.report.8h+mention-1",
+		]);
 	} finally {
 		await rm(directory, { recursive: true, force: true });
 	}

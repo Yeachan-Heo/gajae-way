@@ -1,4 +1,4 @@
-import { mkdir, stat } from "node:fs/promises";
+import { lstat, mkdir, realpath, stat, symlink } from "node:fs/promises";
 import { join } from "node:path";
 
 const PERSONA_FILES = ["SOUL.md", "AGENTS.md", "USER.md"] as const;
@@ -11,14 +11,33 @@ interface CachedSection {
 /** Loads workspace persona documents once per turn, re-reading only changed files. */
 export class PersonaLoader {
 	readonly #workspace: string;
+	readonly #memory: string;
 	readonly #sections = new Map<string, CachedSection>();
 
 	constructor(home: string) {
 		this.#workspace = join(home, "workspace");
+		this.#memory = join(home, "memory");
 	}
 
 	async ensureWorkspace(): Promise<void> {
-		await mkdir(this.#workspace, { recursive: true, mode: 0o700 });
+		await Promise.all([
+			mkdir(this.#workspace, { recursive: true, mode: 0o700 }),
+			mkdir(this.#memory, { recursive: true, mode: 0o700 }),
+		]);
+		const workspaceMemory = join(this.#workspace, "memory");
+		try {
+			await symlink("../memory", workspaceMemory, "dir");
+		} catch (error) {
+			if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+		}
+		const entry = await lstat(workspaceMemory);
+		if (!entry.isSymbolicLink())
+			throw new Error(
+				`workspace_memory_path_conflict: ${workspaceMemory} must be a symlink to the canonical memory corpus`,
+			);
+		const [actual, expected] = await Promise.all([realpath(workspaceMemory), realpath(this.#memory)]);
+		if (actual !== expected)
+			throw new Error(`workspace_memory_path_escape: ${workspaceMemory} resolves outside the canonical memory corpus`);
 	}
 
 	async systemPreamble(): Promise<string> {

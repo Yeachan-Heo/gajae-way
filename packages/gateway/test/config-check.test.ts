@@ -2,7 +2,7 @@ import { expect, test } from "bun:test";
 import { mkdtemp, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { ENGAGEMENT_GATES } from "../src/config";
+import { CONFIG_SCHEMA_VERSION, ENGAGEMENT_GATES, parseConfigFile, RESTART_REQUIRED_FIELDS } from "../src/config";
 import { checkConfigFile, configCheckExitCode, defaultConfigPath, renderConfigCheck } from "../src/config-check";
 
 async function configFile(body: string): Promise<string> {
@@ -66,6 +66,33 @@ test("a removed per-channel settle window is rejected with a migration hint", as
 	expect(result.ok).toBe(false);
 	if (result.ok) return;
 	expect(result.code).toBe("config_invalid");
+});
+
+test("runtime PATH settings are validated and classified as restart-required", () => {
+	const config = parseConfigFile({
+		schemaVersion: CONFIG_SCHEMA_VERSION,
+		runtime: { path: ["~/bin", "/opt/bin"], inheritLoginPath: false },
+	});
+	expect(config.runtime).toEqual({ path: ["~/bin", "/opt/bin"], inheritLoginPath: false });
+	expect(RESTART_REQUIRED_FIELDS).toContain("runtime");
+});
+
+test("invalid runtime PATH settings fail the offline config check", async () => {
+	for (const runtime of [
+		{ path: [] },
+		{ path: ["/ok", ""] },
+		{ path: ["/ok", 1] },
+		{ path: "/not-an-array" },
+		{ inheritLoginPath: "yes" },
+		{ path: ["/ok"], inheritLoginPath: true },
+		{ unexpected: true },
+	]) {
+		const result = await checkConfigFile(
+			await configFile(JSON.stringify({ schemaVersion: CONFIG_SCHEMA_VERSION, runtime })),
+		);
+		expect(result.ok, JSON.stringify(runtime)).toBe(false);
+		if (!result.ok) expect(result.code).toBe("config_invalid");
+	}
 });
 
 test("malformed JSON is reported as not_json rather than crashing", async () => {

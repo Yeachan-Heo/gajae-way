@@ -2,6 +2,7 @@ import { afterEach, describe, expect, test } from "bun:test";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { GjcCliError } from "@gajaeway/subsession";
 import { DeliveryService } from "../src/delivery/delivery";
 import { MemoryClosureQueue } from "../src/memory/closure";
 import { initializeMemory } from "../src/memory/doctrine";
@@ -9,6 +10,8 @@ import { MonitorPropagator } from "../src/monitors/propagate";
 import { MonitorRegistry } from "../src/monitors/registry";
 import { MonitorRuntime } from "../src/monitors/runtime";
 import { cronSlotsBetween, startCron } from "../src/monitors/triggers/cron";
+import { GjcRuntimeError } from "../src/orchestrator/rebind";
+import { SessionTerminalError } from "../src/orchestrator/session-port";
 import { GatewayDatabase, MONITOR_EVENT_MAX_DISPATCH_ATTEMPTS } from "../src/store/db";
 import { DeliveryLedger } from "../src/store/ledger";
 import type { SessionPortResponder } from "./session-port.fake";
@@ -44,17 +47,18 @@ async function harness(
 		burstPolicy: "dedupe",
 		enabled: true,
 	});
+	const sessionPort = fakeSessionPort(respond);
 	const propagator = new MonitorPropagator({
 		database,
 		registry,
-		sessionPort: fakeSessionPort(respond),
+		sessionPort,
 		memory: { enqueue: () => crypto.randomUUID(), enqueueExistingId: () => {} } as never,
 		delivery: new DeliveryService(new DeliveryLedger(database)),
 		emit: () => {},
 		...(options.ownerTarget ? { ownerTarget: options.ownerTarget } : {}),
 	});
 	propagators.push(propagator);
-	return { propagator, monitor, database, registry };
+	return { propagator, monitor, database, registry, sessionPort };
 }
 
 function eventsFromPrompt(text: string): Array<{ eventId: string }> {
@@ -131,6 +135,111 @@ describe("monitor crash-boundary state machine", () => {
 		expect(stage(db, stranded)).toBe("authored_no_delivery");
 	});
 
+	test("legacy origin-invalid event types terminalize without invoking the session port", async () => {
+		home = await mkdtemp(join(tmpdir(), "gajaeway-monitor-invalid-event-"));
+		database = await GatewayDatabase.open(join(home, "gateway.db"));
+		const db = database;
+		const registry = new MonitorRegistry(db);
+		const monitor = registry.add({
+			name: "valid-monitor",
+			trigger: { kind: "cron", schedule: "* * * * *" },
+			eventTypes: ["valid.event"],
+			burstPolicy: "serialize",
+		});
+		let turns = 0;
+		const propagator = new MonitorPropagator({
+			database: db,
+			registry,
+			sessionPort: fakeSessionPort(async () => {
+				turns++;
+				return "[]";
+			}),
+			memory: { enqueue: () => crypto.randomUUID(), enqueueExistingId: () => {} } as never,
+			delivery: new DeliveryService(new DeliveryLedger(db)),
+			emit: () => {},
+		});
+		propagators.push(propagator);
+		const eventId = crypto.randomUUID();
+		db.monitorEventCreate({
+			eventId,
+			monitorId: monitor.monitorId,
+			eventType: "broken/type",
+			payloadJson: "{}",
+			firedAt: new Date().toISOString(),
+		});
+
+		await propagator.reconcile();
+
+		expect(stage(db, eventId)).toBe("failed_no_retry");
+		expect(db.monitorFailure(eventId)).toMatchObject({
+			code: "event_type_invalid",
+			detail: "dispatch setup failed (event_type_invalid)",
+		});
+		expect(turns).toBe(0);
+		await propagator.reconcile();
+		expect(turns).toBe(0);
+	});
+
+	test("malformed persisted monitors are isolated and their events terminalize once", async () => {
+		home = await mkdtemp(join(tmpdir(), "gajaeway-monitor-invalid-record-"));
+		database = await GatewayDatabase.open(join(home, "gateway.db"));
+		const db = database;
+		const validRegistry = new MonitorRegistry(db);
+		const valid = validRegistry.add({
+			name: "healthy",
+			trigger: { kind: "cron", schedule: "* * * * *" },
+			eventTypes: ["healthy.event"],
+		});
+		const invalidId = crypto.randomUUID();
+		db.monitorCreate({
+			id: invalidId,
+			name: "legacy-invalid",
+			triggerJson: "{not-json",
+			eventTypesJson: JSON.stringify(["broken/type"]),
+			burstPolicy: "serialize",
+			channelTargetJson: null,
+			enabled: true,
+			instruction: null,
+			modelJson: null,
+			serviceTier: null,
+		});
+		const registry = new MonitorRegistry(db);
+		expect(registry.list().map((record) => record.monitorId)).toEqual([valid.monitorId]);
+		const eventId = crypto.randomUUID();
+		db.monitorEventCreate({
+			eventId,
+			monitorId: invalidId,
+			eventType: "broken/type",
+			payloadJson: "{}",
+			firedAt: new Date().toISOString(),
+		});
+		let turns = 0;
+		const propagator = new MonitorPropagator({
+			database: db,
+			registry,
+			sessionPort: fakeSessionPort(async () => {
+				turns++;
+				return "[]";
+			}),
+			memory: { enqueue: () => crypto.randomUUID(), enqueueExistingId: () => {} } as never,
+			delivery: new DeliveryService(new DeliveryLedger(db)),
+			emit: () => {},
+		});
+		propagators.push(propagator);
+
+		await propagator.reconcile();
+
+		expect(stage(db, eventId)).toBe("failed_no_retry");
+		expect(db.monitorFailure(eventId)).toMatchObject({
+			code: "monitor_invalid",
+			detail: "dispatch setup failed (monitor_invalid)",
+		});
+		expect(turns).toBe(0);
+		await propagator.reconcile();
+		expect(db.monitorEventRows().filter((row) => row.event_id === eventId)).toHaveLength(1);
+		expect(turns).toBe(0);
+	});
+
 	test("authored + confirmed delivery → delivered; failure keeps it authored", async () => {
 		const { monitor, database: db } = await harness(async (_id, text) =>
 			JSON.stringify(eventsFromPrompt(text).map(({ eventId }) => ({ eventId, note: "note" }))),
@@ -186,6 +295,54 @@ describe("monitor crash-boundary state machine", () => {
 		expect(stage(db, eventId)).toBe("authored_no_delivery");
 	});
 
+	for (const [label, error, expected] of [
+		["CLI exit", new GjcCliError("SECRET_RAW", 42, "SECRET_STDERR"), '"exitCode":42'],
+		[
+			"runtime code",
+			new GjcRuntimeError("SECRET_RAW", { code: "deadline_exceeded", message: "SECRET_RUNTIME" }),
+			'"code":"deadline_exceeded"',
+		],
+		[
+			"terminal status",
+			new SessionTerminalError({
+				operationRef: "SECRET_OP",
+				status: { status: "failed", error: { code: "internal_error", message: "SECRET_TERMINAL" } },
+			} as never),
+			'"terminal":"failed"',
+		],
+		[
+			"untrusted fields",
+			Object.assign(new Error("SECRET_RAW"), {
+				code: "SECRET_CODE",
+				signal: "SECRET_SIGNAL",
+				exitCode: -1,
+				stack: "at packages/SECRET_PATH.ts:1",
+			}),
+			'"class":"Error"',
+		],
+		["missing fields", null, '"class":"unknown"'],
+	] as const) {
+		test(`injected ${label} persists safe diagnostics and request context`, async () => {
+			const { propagator, monitor, database: db, sessionPort } = await harness(async () => "unused");
+			sessionPort.request = async () => {
+				throw error;
+			};
+			const eventId = seedEvent(db, monitor.monitorId, "failed");
+			await propagator.reconcile();
+			const detail = db.monitorFailure(eventId)?.detail ?? "";
+			expect(detail).toContain(expected);
+			expect(detail).toContain('"phase":"request"');
+			expect(detail).toContain('"sessionId":"s1"');
+			expect(detail).toContain('"origin":"monitor/eventtype/memory.canonicalize"');
+			expect(detail).toContain('"attempt":2');
+			expect(detail).not.toContain("SECRET");
+			if (label === "untrusted fields" || label === "missing fields") {
+				expect(detail).not.toContain('"exitCode"');
+				expect(detail).not.toContain('"signal"');
+			}
+			expect(stage(db, eventId)).toBe("failed");
+		});
+	}
 	test("reconcile reclaim budget: an always-failing event lands on failed_no_retry", async () => {
 		let turns = 0;
 		const {
@@ -235,6 +392,74 @@ describe("monitor crash-boundary state machine", () => {
 		release?.();
 		await first;
 		expect(stage(db, stranded)).toBe("authored_no_delivery");
+	});
+
+	test("drain waits for a claimed monitor dispatch before teardown", async () => {
+		let release: (() => void) | undefined;
+		const parked = new Promise<void>((resolve) => {
+			release = resolve;
+		});
+		let turns = 0;
+		const {
+			propagator,
+			monitor,
+			database: db,
+		} = await harness(async (_id, text) => {
+			turns++;
+			await parked;
+			return JSON.stringify(eventsFromPrompt(text).map(({ eventId }) => ({ eventId, note: "drained" })));
+		});
+		const eventId = seedEvent(db, monitor.monitorId, "batched", crypto.randomUUID());
+		const reconcile = propagator.reconcile();
+		for (let attempt = 0; attempt < 100 && turns === 0; attempt++) await Bun.sleep(5);
+		expect(turns).toBe(1);
+		let drained = false;
+		const drain = propagator.drain().then(() => {
+			drained = true;
+		});
+		await Bun.sleep(20);
+		expect(drained).toBe(false);
+		release?.();
+		await Promise.all([reconcile, drain]);
+		expect(drained).toBe(true);
+		expect(stage(db, eventId)).toBe("authored_no_delivery");
+		expect(() => propagator.submit(monitor.monitorId, "memory.canonicalize", {})).toThrow(
+			"monitor propagator is closing",
+		);
+	});
+
+	test("durable failure detail keeps only allowlisted classes causes and frames", async () => {
+		class SecretVendorTokenGhp123 extends Error {}
+		const hostile = new SecretVendorTokenGhp123("ghp_attacker-secret prompt=https://secret.example/token");
+		(hostile as Error & { code: string }).code = "ghp_attacker_secret";
+		hostile.stack = "SecretVendorTokenGhp123: ghp_attacker-secret\n    at steal (/Users/private/token.ts:99:1)";
+		let thrown: Error = hostile;
+		const {
+			propagator,
+			monitor,
+			database: db,
+		} = await harness(async () => {
+			throw thrown;
+		});
+		const hostileId = seedEvent(db, monitor.monitorId, "admitted");
+		await propagator.reconcile();
+		const hostileDetail = db.monitorFailure(hostileId)?.detail ?? "";
+		expect(hostileDetail).toContain('"class":"Error"');
+		expect(hostileDetail).toContain('"frame":"#dispatchBatch"');
+		expect(hostileDetail).not.toContain("ghp_");
+		expect(hostileDetail).not.toContain("/Users/");
+
+		const closed = new Error("Database has closed: ghp_attacker-secret");
+		closed.stack = "Error: Database has closed\n    at withTransaction (/Users/private/gateway.db:3:4)";
+		thrown = closed;
+		const closedId = seedEvent(db, monitor.monitorId, "admitted");
+		await propagator.reconcile();
+		const detail = db.monitorFailure(closedId)?.detail ?? "";
+		expect(detail).toContain('"class":"Error"');
+		expect(detail).toContain('"cause":"database_closed"');
+		expect(detail).toContain('"frame":"#dispatchBatch"');
+		expect(detail).not.toContain("ghp_");
+		expect(detail).not.toContain("/Users/");
 	});
 
 	test("unknown stage writes are rejected fail-closed", async () => {

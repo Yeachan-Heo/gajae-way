@@ -17,9 +17,9 @@ test("tail-free monitor request reaches terminal status and last_assistant even 
 		if (args.includes("tail")) throw new Error("Cannot key a positioned tail item without its authoritative revision.");
 		if (args.includes("send"))
 			return {
-				exitCode: 0,
-				stdout: JSON.stringify({ ok: true, result: { sessionId: "monitor-session", operationRef: "gw-m-test" } }),
-				stderr: "",
+				exitCode: 1,
+				stdout: "",
+				stderr: "transport tore after prompt acceptance",
 			};
 		if (args.includes("status")) {
 			statuses++;
@@ -61,6 +61,7 @@ test("tail-free monitor request reaches terminal status and last_assistant even 
 			pollMs: 0,
 		});
 		expect(result.assistant.text).toContain('"note":"ok"');
+		expect(result.receipt).toMatchObject({ sessionId: "monitor-session", operationRef: "gw-m-test" });
 		expect(statuses).toBe(1);
 		expect(calls.some((args) => args.includes("tail"))).toBe(false);
 	} finally {
