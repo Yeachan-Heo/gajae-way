@@ -44731,5 +44731,13 @@
     "coldStartP95DeltaMsMax": 1000,
     "residentChannelsMax": "<= maxTailProcesses (K)",
     "turnsOk": 10
-  }
+  },
+  "history": [
+    {
+      "run": 1,
+      "artifact": "/tmp/ralplan-gajaeway/economics-run1.json (not retained in repo)",
+      "pass": false,
+      "note": "K=2 coldStartP95 6300.6 ms (+4055.5 ms) breached the +1000 ms rule; K=1/K=4 passed; no raw per-child cold samples retained. Run 2 (this artifact) was a full re-measurement under the identical procedure; the K=2 excursion did not reproduce."
+    }
+  ]
 }
