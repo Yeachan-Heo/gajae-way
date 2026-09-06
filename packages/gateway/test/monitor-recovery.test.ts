@@ -131,6 +131,111 @@ describe("monitor crash-boundary state machine", () => {
 		expect(stage(db, stranded)).toBe("authored_no_delivery");
 	});
 
+	test("legacy origin-invalid event types terminalize without invoking the session port", async () => {
+		home = await mkdtemp(join(tmpdir(), "gajaeway-monitor-invalid-event-"));
+		database = await GatewayDatabase.open(join(home, "gateway.db"));
+		const db = database;
+		const registry = new MonitorRegistry(db);
+		const monitor = registry.add({
+			name: "valid-monitor",
+			trigger: { kind: "cron", schedule: "* * * * *" },
+			eventTypes: ["valid.event"],
+			burstPolicy: "serialize",
+		});
+		let turns = 0;
+		const propagator = new MonitorPropagator({
+			database: db,
+			registry,
+			sessionPort: fakeSessionPort(async () => {
+				turns++;
+				return "[]";
+			}),
+			memory: { enqueue: () => crypto.randomUUID(), enqueueExistingId: () => {} } as never,
+			delivery: new DeliveryService(new DeliveryLedger(db)),
+			emit: () => {},
+		});
+		propagators.push(propagator);
+		const eventId = crypto.randomUUID();
+		db.monitorEventCreate({
+			eventId,
+			monitorId: monitor.monitorId,
+			eventType: "broken/type",
+			payloadJson: "{}",
+			firedAt: new Date().toISOString(),
+		});
+
+		await propagator.reconcile();
+
+		expect(stage(db, eventId)).toBe("failed_no_retry");
+		expect(db.monitorFailure(eventId)).toMatchObject({
+			code: "event_type_invalid",
+			detail: "dispatch setup failed (event_type_invalid)",
+		});
+		expect(turns).toBe(0);
+		await propagator.reconcile();
+		expect(turns).toBe(0);
+	});
+
+	test("malformed persisted monitors are isolated and their events terminalize once", async () => {
+		home = await mkdtemp(join(tmpdir(), "gajaeway-monitor-invalid-record-"));
+		database = await GatewayDatabase.open(join(home, "gateway.db"));
+		const db = database;
+		const validRegistry = new MonitorRegistry(db);
+		const valid = validRegistry.add({
+			name: "healthy",
+			trigger: { kind: "cron", schedule: "* * * * *" },
+			eventTypes: ["healthy.event"],
+		});
+		const invalidId = crypto.randomUUID();
+		db.monitorCreate({
+			id: invalidId,
+			name: "legacy-invalid",
+			triggerJson: "{not-json",
+			eventTypesJson: JSON.stringify(["broken/type"]),
+			burstPolicy: "serialize",
+			channelTargetJson: null,
+			enabled: true,
+			instruction: null,
+			modelJson: null,
+			serviceTier: null,
+		});
+		const registry = new MonitorRegistry(db);
+		expect(registry.list().map((record) => record.monitorId)).toEqual([valid.monitorId]);
+		const eventId = crypto.randomUUID();
+		db.monitorEventCreate({
+			eventId,
+			monitorId: invalidId,
+			eventType: "broken/type",
+			payloadJson: "{}",
+			firedAt: new Date().toISOString(),
+		});
+		let turns = 0;
+		const propagator = new MonitorPropagator({
+			database: db,
+			registry,
+			sessionPort: fakeSessionPort(async () => {
+				turns++;
+				return "[]";
+			}),
+			memory: { enqueue: () => crypto.randomUUID(), enqueueExistingId: () => {} } as never,
+			delivery: new DeliveryService(new DeliveryLedger(db)),
+			emit: () => {},
+		});
+		propagators.push(propagator);
+
+		await propagator.reconcile();
+
+		expect(stage(db, eventId)).toBe("failed_no_retry");
+		expect(db.monitorFailure(eventId)).toMatchObject({
+			code: "monitor_invalid",
+			detail: "dispatch setup failed (monitor_invalid)",
+		});
+		expect(turns).toBe(0);
+		await propagator.reconcile();
+		expect(db.monitorEventRows().filter((row) => row.event_id === eventId)).toHaveLength(1);
+		expect(turns).toBe(0);
+	});
+
 	test("authored + confirmed delivery → delivered; failure keeps it authored", async () => {
 		const { monitor, database: db } = await harness(async (_id, text) =>
 			JSON.stringify(eventsFromPrompt(text).map(({ eventId }) => ({ eventId, note: "note" }))),
