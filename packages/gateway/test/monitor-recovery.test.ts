@@ -342,6 +342,72 @@ describe("monitor crash-boundary state machine", () => {
 		expect(stage(db, stranded)).toBe("authored_no_delivery");
 	});
 
+	test("drain waits for a claimed monitor dispatch before teardown", async () => {
+		let release: (() => void) | undefined;
+		const parked = new Promise<void>((resolve) => {
+			release = resolve;
+		});
+		let turns = 0;
+		const {
+			propagator,
+			monitor,
+			database: db,
+		} = await harness(async (_id, text) => {
+			turns++;
+			await parked;
+			return JSON.stringify(eventsFromPrompt(text).map(({ eventId }) => ({ eventId, note: "drained" })));
+		});
+		const eventId = seedEvent(db, monitor.monitorId, "batched", crypto.randomUUID());
+		const reconcile = propagator.reconcile();
+		for (let attempt = 0; attempt < 100 && turns === 0; attempt++) await Bun.sleep(5);
+		expect(turns).toBe(1);
+		let drained = false;
+		const drain = propagator.drain().then(() => {
+			drained = true;
+		});
+		await Bun.sleep(20);
+		expect(drained).toBe(false);
+		release?.();
+		await Promise.all([reconcile, drain]);
+		expect(drained).toBe(true);
+		expect(stage(db, eventId)).toBe("authored_no_delivery");
+		expect(() => propagator.submit(monitor.monitorId, "memory.canonicalize", {})).toThrow(
+			"monitor propagator is closing",
+		);
+	});
+
+	test("durable failure detail keeps only allowlisted classes causes and frames", async () => {
+		class SecretVendorTokenGhp123 extends Error {}
+		const hostile = new SecretVendorTokenGhp123("ghp_attacker-secret prompt=https://secret.example/token");
+		(hostile as Error & { code: string }).code = "ghp_attacker_secret";
+		hostile.stack = "SecretVendorTokenGhp123: ghp_attacker-secret\n    at steal (/Users/private/token.ts:99:1)";
+		let thrown: Error = hostile;
+		const {
+			propagator,
+			monitor,
+			database: db,
+		} = await harness(async () => {
+			throw thrown;
+		});
+		const hostileId = seedEvent(db, monitor.monitorId, "admitted");
+		await propagator.reconcile();
+		expect(db.monitorFailure(hostileId)?.detail).toBe(
+			"dispatch phase failed (internal_error): class=Error frame=#dispatchBatch",
+		);
+
+		const closed = new Error("Database has closed: ghp_attacker-secret");
+		closed.stack = "Error: Database has closed\n    at withTransaction (/Users/private/gateway.db:3:4)";
+		thrown = closed;
+		const closedId = seedEvent(db, monitor.monitorId, "admitted");
+		await propagator.reconcile();
+		const detail = db.monitorFailure(closedId)?.detail ?? "";
+		expect(detail).toBe(
+			"dispatch phase failed (internal_error): class=Error cause=database_closed frame=#dispatchBatch",
+		);
+		expect(detail).not.toContain("ghp_");
+		expect(detail).not.toContain("/Users/");
+	});
+
 	test("unknown stage writes are rejected fail-closed", async () => {
 		const { monitor, database: db } = await harness(async () => "[]");
 		const eventId = seedEvent(db, monitor.monitorId, "admitted");
