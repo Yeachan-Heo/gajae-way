@@ -9,12 +9,14 @@ import {
 	cycleExitCode,
 	main,
 	parseArgs,
+	parseServicesArgs,
 	renderCycle,
 	restoreDatabase,
 	socketPath,
 	USAGE_EXIT_CODE,
 	usageFor,
 } from "../src/main";
+import { installServices, resolvePath } from "../src/services";
 
 describe("cli arguments", () => {
 	test("resolves home and socket override", () => {
@@ -39,6 +41,153 @@ describe("cli arguments", () => {
 			console.error = console_error;
 			process.exitCode = previousExit ?? 0;
 		}
+	});
+});
+
+describe("service installation", () => {
+	test("install and repair select the same idempotent writer contract", () => {
+		expect(parseServicesArgs(["install", "--bin-dir", "/opt/gajaeway/bin"]).action).toBe("install");
+		expect(parseServicesArgs(["repair", "--bin-dir", "/opt/gajaeway/bin"]).action).toBe("repair");
+	});
+	test("managed, login, and fallback PATH entries are ordered and deduplicated", async () => {
+		const commands: string[][] = [];
+		const path = await resolvePath({
+			binDir: "/opt/gajaeway/bin",
+			home: "/Users/operator",
+			env: { SHELL: "/bin/fish" },
+			runtime: {},
+			loginPathRunner: async (command) => {
+				commands.push([...command]);
+				return "~/bin:/opt/gajaeway/bin::/usr/bin:/usr/local/bin";
+			},
+		});
+		expect(commands).toEqual([["/bin/fish", "-lc", 'printf %s "$PATH"']]);
+		expect(path.split(":")).toEqual([
+			"/opt/gajaeway/bin",
+			"/Users/operator/bin",
+			"/Users/operator/.local/bin",
+			"/Users/operator/.bun/bin",
+			"/usr/bin",
+			"/usr/local/bin",
+			"/bin",
+			"/usr/sbin",
+			"/sbin",
+		]);
+	});
+
+	test("explicit PATH and disabled inheritance never invoke login discovery", async () => {
+		let calls = 0;
+		const runner = async (): Promise<string> => {
+			calls++;
+			throw new Error("login discovery must not run");
+		};
+		const explicit = await resolvePath({
+			binDir: "/opt/bin",
+			home: "/Users/operator",
+			runtime: { path: ["~/custom", "/usr/bin"] },
+			loginPathRunner: runner,
+		});
+		const disabled = await resolvePath({
+			binDir: "/opt/bin",
+			home: "/Users/operator",
+			runtime: { inheritLoginPath: false },
+			loginPathRunner: runner,
+		});
+		expect(calls).toBe(0);
+		expect(explicit.split(":")).toEqual([
+			"/opt/bin",
+			"/Users/operator/bin",
+			"/Users/operator/.local/bin",
+			"/Users/operator/.bun/bin",
+			"/Users/operator/custom",
+			"/usr/bin",
+			"/usr/local/bin",
+			"/bin",
+			"/usr/sbin",
+			"/sbin",
+		]);
+		expect(disabled.split(":")).toEqual([
+			"/opt/bin",
+			"/Users/operator/bin",
+			"/Users/operator/.local/bin",
+			"/Users/operator/.bun/bin",
+			"/usr/local/bin",
+			"/usr/bin",
+			"/bin",
+			"/usr/sbin",
+			"/sbin",
+		]);
+	});
+
+	test("install and repair each rewrite exactly three safe LaunchAgent plists", async () => {
+		const home = await mkdtemp(join(tmpdir(), "gajaeway-services-"));
+		try {
+			await writeFile(
+				join(home, "config.json"),
+				JSON.stringify({
+					schemaVersion: 1,
+					credentials: { provider: { credentialFile: "TOP_SECRET" } },
+					runtime: { path: ["~/custom", "/usr/bin"] },
+				}),
+			);
+			const env = { HOME: "/Users/operator", GAJAEWAY_HOME: home };
+			const writes: Array<{ path: string; contents: string }> = [];
+			const writer = async (path: string, contents: string): Promise<void> => {
+				writes.push({ path, contents });
+			};
+			const options = {
+				binDir: "~/gaja&<bin>",
+				launchAgentsDir: join(home, "LaunchAgents"),
+				env,
+				loginPathRunner: async (): Promise<string> => "/should-not-be-read",
+				writeFile: writer,
+			};
+			const installed = await installServices(options);
+			expect(installed).toHaveLength(3);
+			expect(writes).toHaveLength(3);
+			expect(writes.map(({ path }) => path)).toEqual([...installed]);
+			for (const { contents } of writes) {
+				expect(contents).not.toContain("TOP_SECRET");
+				expect(contents).toContain("&amp;");
+				expect(contents).toContain("&lt;");
+				expect(contents).toContain("&gt;");
+				expect(contents).toContain("<key>GAJAEWAY_HOME</key>");
+				expect(contents).toContain("<key>PATH</key>");
+				expect(contents).toContain("StandardOutPath");
+				expect(contents).toContain("StandardErrorPath");
+			}
+			const gateway = writes.find(({ path }) => path.endsWith("dev.gajaeway.gateway.plist"))?.contents ?? "";
+			expect(gateway).toContain("<string>daemon</string>");
+			expect(gateway).toContain("gateway.stdout.log");
+			expect(gateway).toContain("gateway.stderr.log");
+			writes.length = 0;
+			await installServices(options);
+			expect(writes).toHaveLength(3);
+		} finally {
+			await rm(home, { recursive: true, force: true });
+		}
+	});
+
+	test("invalid service selection fails before any plist write", async () => {
+		const writes: string[] = [];
+		const errors: string[] = [];
+		const originalError = console.error;
+		const previousExitCode = process.exitCode;
+		console.error = (line: unknown) => errors.push(String(line));
+		try {
+			await main(["services", "unknown", "--bin-dir", "/tmp/bin"], {
+				services: {
+					writeFile: async (path) => {
+						writes.push(path);
+					},
+				},
+			});
+		} finally {
+			console.error = originalError;
+			process.exitCode = previousExitCode;
+		}
+		expect(writes).toHaveLength(0);
+		expect(errors[0]).toContain("usage: gajaeway services install|repair");
 	});
 });
 

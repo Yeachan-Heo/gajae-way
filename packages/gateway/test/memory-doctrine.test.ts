@@ -1,8 +1,8 @@
 import { afterEach, expect, test } from "bun:test";
-import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, stat, utimes, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { appendDaily, initializeMemory } from "../src/memory/doctrine";
+import { appendDaily, initializeMemory, memoryGit } from "../src/memory/doctrine";
 
 let home = "";
 afterEach(async () => {
@@ -91,3 +91,36 @@ test("the regenerated map reaches nested axis subdirectories", async () => {
 	expect(map).toContain("daily/2026-08/2026-08-26.md");
 	expect(map).toContain("daily/2026-08-26.md");
 });
+
+test("concurrent add+commit pairs on one corpus serialize instead of colliding on index.lock", async () => {
+	home = await mkdtemp(join(tmpdir(), "gajaeway-memory-git-"));
+	await initializeMemory(home);
+	const root = join(home, "memory");
+	// Two writers (closure queue + autolink sweep) racing on the same repo: without
+	// per-root serialization one of them hits the other's .git/index.lock (live:
+	// 100 failures on gaebal, 2026-09-05).
+	const writers = Array.from({ length: 6 }, async (_, index) => {
+		await writeFile(join(root, `w${index}.md`), `writer ${index}\n`);
+		await memoryGit(root, ["add", "--all", "."]);
+		await memoryGit(root, ["commit", "-m", `writer ${index}`, "--allow-empty"]);
+	});
+	await Promise.all(writers);
+	const log = await memoryGit(root, ["log", "--format=%s"]);
+	for (let index = 0; index < 6; index++) expect(log).toContain(`writer ${index}`);
+});
+
+test("an orphaned index.lock older than the grace is removed once and the operation retried", async () => {
+	home = await mkdtemp(join(tmpdir(), "gajaeway-memory-lock-"));
+	await initializeMemory(home);
+	const root = join(home, "memory");
+	const lock = join(root, ".git", "index.lock");
+	await writeFile(lock, "");
+	// Backdate well past the grace so the retry treats it as orphaned.
+	const old = new Date(Date.now() - 60_000);
+	await utimes(lock, old, old);
+	await writeFile(join(root, "note.md"), "hello\n");
+	await memoryGit(root, ["add", "--all", "."]);
+	await memoryGit(root, ["commit", "-m", "after orphaned lock"]);
+	expect(await memoryGit(root, ["log", "--format=%s", "-1"])).toBe("after orphaned lock");
+	await expect(stat(lock)).rejects.toThrow();
+}, 20_000);

@@ -95,6 +95,8 @@ export interface SessionBindInput {
 	readonly model?: GjcModelSelection;
 	/** The SDK host's default coding register is retained when true. */
 	readonly codingRegister?: boolean;
+	/** Internal recursion fence: one poisoned create key may advance to one fresh epoch per bind call. */
+	readonly epochRecovery?: boolean;
 }
 
 export interface SessionBinding {
@@ -128,6 +130,8 @@ export interface SessionRequestInput extends SessionSendInput {
 	readonly originKey?: string;
 	readonly waitTimeoutMs?: number;
 	readonly pollMs?: number;
+	/** Monitor/batch authoring needs only terminal status + final answer, not live tail replay. */
+	readonly observeTail?: boolean;
 }
 
 export interface SessionRequestResult {
@@ -221,17 +225,31 @@ export class BrokerSessionPort implements SessionPort {
 			let indexed = true;
 			try {
 				// Judge the raw envelope: a persisted id is reusable only when the
-				// broker explicitly still owns a live endpoint. `ok:true, live:false`
-				// is just as unusable as session_unavailable (monitor authoring bypasses
-				// PersonaActor's resume path and otherwise reuses the dead id forever).
+				// A persisted id is reusable if live, and resumable if it still has
+				// saved authority. Monitor authoring reaches SessionPort directly, so
+				// resume here before paying for a cold replacement session.
 				const result = await this.#cli(["sdk", "session", "inspect", existing.sessionId, "--repo", input.repo]);
 				const envelope = JSON.parse(result.stdout) as {
 					ok?: unknown;
-					result?: { session?: { live?: unknown } };
+					result?: { session?: { live?: unknown; deleted?: unknown } };
 					error?: { code?: unknown };
 				};
 				if (envelope.ok === false) indexed = envelope.error?.code !== "session_unavailable";
-				if (envelope.ok === true && envelope.result?.session?.live === false) indexed = false;
+				if (envelope.ok === true && envelope.result?.session?.live === false) {
+					if (envelope.result.session.deleted !== true) {
+						try {
+							return await this.resume({
+								sessionId: existing.sessionId,
+								repo: input.repo,
+								originKey: input.originKey,
+								epoch: input.epoch,
+							});
+						} catch {
+							// Saved authority cannot be resumed: replace it below.
+						}
+					}
+					indexed = false;
+				}
 			} catch {
 				indexed = true;
 			}
@@ -244,7 +262,17 @@ export class BrokerSessionPort implements SessionPort {
 			return await this.bind({ ...input, epoch: rebound });
 		}
 		const idempotencyKey = sessionCreateRef(this.#instanceId, input.originKey, input.epoch, input.repo);
-		const created = await this.#createSession(input.repo, idempotencyKey, input.model);
+		let created: { readonly sessionId?: unknown };
+		try {
+			created = await this.#createSession(input.repo, idempotencyKey, input.model);
+		} catch (error) {
+			if (input.epochRecovery === false) throw error;
+			const nextEpoch = this.#database.rebindEpoch(input.originKey);
+			console.error(
+				`session_create_epoch_rotated origin=${input.originKey} epoch=${input.epoch} nextEpoch=${nextEpoch} reason=poisoned_create_key`,
+			);
+			return await this.bind({ ...input, epoch: nextEpoch, epochRecovery: false });
+		}
 		if (typeof created.sessionId !== "string" || created.sessionId.length === 0) {
 			throw new Error("session.create succeeded without a sessionId");
 		}
@@ -448,7 +476,7 @@ export class BrokerSessionPort implements SessionPort {
 		selection: GjcModelSelection;
 	}): Promise<{ readonly changed: boolean }> {
 		if (typeof input.selection !== "string") {
-			const activated = parseEnvelope<boolean>(
+			const activation = parseEnvelope<boolean | { changed?: unknown; id?: unknown }>(
 				await this.#cli([
 					"sdk",
 					"session",
@@ -462,8 +490,9 @@ export class BrokerSessionPort implements SessionPort {
 				]),
 				"model.profile.set",
 			);
-			if (activated !== true) throw new Error("model.profile.set succeeded without activating the requested preset");
-			return { changed: true };
+			const changed = typeof activation === "boolean" ? activation : activation.changed;
+			if (typeof changed !== "boolean") throw new Error("model.profile.set succeeded without a changed receipt");
+			return { changed };
 		}
 		const result = parseEnvelope<{ changed?: unknown }>(
 			await this.#cli([
@@ -694,23 +723,45 @@ export class BrokerSessionPort implements SessionPort {
 	}
 
 	async request(input: SessionRequestInput): Promise<SessionRequestResult> {
-		// Attach before the send receipt. Status remains terminal authority, while the
-		// logical tail owns liveness/cursor observation for every generic caller.
-		const tail = await this.attachTail({
-			sessionId: input.sessionId,
-			brokerGeneration: 0,
-			repo: input.repo,
-			...(input.originKey ? { originKey: input.originKey } : {}),
-			onStall: ({ elapsedMs }) =>
-				console.error(`session stall sessionId=${input.sessionId} opRef=${input.opRef} silentMs=${elapsedMs}`),
-		});
-		tail.setTurnRunning(true);
+		// Chat-like callers attach before send for live output. Monitor authoring
+		// sets observeTail=false: it consumes no intermediate frames, and old
+		// session history must not be able to fail an otherwise valid final-result
+		// request merely because its tail revision metadata predates the provider.
+		const tail =
+			input.observeTail === false
+				? undefined
+				: await this.attachTail({
+						sessionId: input.sessionId,
+						brokerGeneration: 0,
+						repo: input.repo,
+						...(input.originKey ? { originKey: input.originKey } : {}),
+						onStall: ({ elapsedMs }) =>
+							console.error(`session stall sessionId=${input.sessionId} opRef=${input.opRef} silentMs=${elapsedMs}`),
+					});
+		tail?.setTurnRunning(true);
 		try {
-			const receipt = await this.send(input);
-			tail.markAccepted(input.opRef);
+			let receipt: SendReceipt;
+			let status: StatusReport | undefined;
+			try {
+				receipt = await this.send(input);
+				tail?.markAccepted(input.opRef);
+			} catch (sendError) {
+				// A transport/control failure may occur after the runtime accepted the
+				// prompt. Query the SAME clientRef before retrying; monitor authoring
+				// otherwise ran the event, produced a final answer, then executed it
+				// again because the torn send was treated as definitive failure.
+				try {
+					status = await this.status({ sessionId: input.sessionId, repo: input.repo, opRef: input.opRef });
+				} catch {
+					throw sendError;
+				}
+				if (status.status.status === "unknown") throw sendError;
+				receipt = { sessionId: input.sessionId, operationRef: input.opRef } as SendReceipt;
+				tail?.markAccepted(input.opRef);
+			}
 			const deadline = this.#now() + (input.waitTimeoutMs ?? DEFAULT_REQUEST_WAIT_MS);
 			const pollMs = input.pollMs ?? DEFAULT_STATUS_POLL_MS;
-			let status = await this.status({ sessionId: input.sessionId, repo: input.repo, opRef: input.opRef });
+			status ??= await this.status({ sessionId: input.sessionId, repo: input.repo, opRef: input.opRef });
 			while (!isTerminalStatus(status.status.status) && this.#now() < deadline) {
 				this.checkStalls();
 				await this.#sleep(pollMs);
@@ -725,8 +776,8 @@ export class BrokerSessionPort implements SessionPort {
 				assistant: await this.fetchLastAssistant({ sessionId: input.sessionId, repo: input.repo }),
 			};
 		} finally {
-			tail.setTurnRunning(false);
-			await tail.close();
+			tail?.setTurnRunning(false);
+			await tail?.close();
 		}
 	}
 

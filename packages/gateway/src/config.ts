@@ -1,8 +1,20 @@
 import { lstat } from "node:fs/promises";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
-import { type OriginRef, validateOriginRef } from "@gajaeway/protocol";
+import {
+	type ChannelEngagementPolicy,
+	ENGAGEMENT_AUDIENCES,
+	ENGAGEMENT_MODES,
+	type EngagementAudience,
+	type EngagementMode,
+	type OriginRef,
+	parseRuntimeConfig as parseSharedRuntimeConfig,
+	type RuntimeConfig,
+	RuntimeConfigError,
+	validateOriginRef,
+} from "@gajaeway/protocol";
 
+export type { RuntimeConfig } from "@gajaeway/protocol";
 export const CONFIG_SCHEMA_VERSION = 1;
 
 export interface CredentialFileReference {
@@ -66,6 +78,7 @@ export interface GatewayConfigFile {
 	readonly webhook?: { readonly bind?: string; readonly port: number; readonly exposeNonLoopback?: boolean };
 	readonly watcherRoots?: readonly string[];
 	readonly scriptRoot?: string;
+	readonly runtime?: RuntimeConfig;
 }
 
 export interface GatewayConfig extends GatewayConfigFile {
@@ -78,8 +91,9 @@ export interface GatewayConfig extends GatewayConfigFile {
  * The three gates. Unset means `closed`: the safe default under the
  * prompt-injection posture this runtime states elsewhere.
  */
-export const ENGAGEMENT_GATES = ["open", "open-mention-only", "closed"] as const;
-export type EngagementGate = (typeof ENGAGEMENT_GATES)[number];
+export const ENGAGEMENT_GATES = ENGAGEMENT_MODES;
+export type EngagementGate = EngagementMode;
+export { ENGAGEMENT_AUDIENCES };
 
 /**
  * Direct-message gates. Unset means `allowlist`: the owner plus explicitly
@@ -89,17 +103,19 @@ export type EngagementGate = (typeof ENGAGEMENT_GATES)[number];
 export const DM_POLICIES = ["owner-only", "allowlist", "open"] as const;
 export type DmPolicy = (typeof DM_POLICIES)[number];
 
-export interface ChannelPolicy {
+export interface ChannelPolicy extends ChannelEngagementPolicy {
 	/**
 	 * Which gate this channel is on. Explicit, because the previous two-state
 	 * shape ("open" or unset) silently changed meaning depending on whether
 	 * `mentionAllowlist` happened to be populated.
 	 *
-	 * - `open`: every human message is a turn; bots still need a mention
-	 * - `open-mention-only`: anyone may address the persona, but only by mention
-	 * - `closed`: mention required AND the author must be allowlisted
+	 * - `open`: matching-audience messages are turns without addressing
+	 * - `mention-open`: matching-audience messages require a mention or native reply
+	 * - `closed`: every author requires addressing and allowlist authorization
 	 */
 	readonly engagement?: EngagementGate;
+	/** Authors who receive the open/mention-open behavior. Unset is `human-only`. */
+	readonly audience?: EngagementAudience;
 }
 
 export interface ConfigOverrides {
@@ -181,6 +197,15 @@ function parseServiceTier(value: unknown): GjcServiceTier | undefined {
 	return value as GjcServiceTier;
 }
 
+export function parseRuntimeConfig(value: unknown): RuntimeConfig | undefined {
+	try {
+		return parseSharedRuntimeConfig(value);
+	} catch (error) {
+		if (error instanceof RuntimeConfigError) throw new ConfigError("config_invalid", error.message);
+		throw error;
+	}
+}
+
 function parseCredentials(value: unknown): Readonly<Record<string, CredentialFileReference>> | undefined {
 	if (value === undefined) return undefined;
 	const input = requireObject(value, "credentials");
@@ -215,16 +240,22 @@ function parseChannels(value: unknown): Readonly<Record<string, ChannelPolicy>> 
 				"config_invalid",
 				`channels.${conversationId}.engagement must be one of ${ENGAGEMENT_GATES.join(", ")}`,
 			);
+		if (item.audience !== undefined && !ENGAGEMENT_AUDIENCES.includes(item.audience as EngagementAudience))
+			throw new ConfigError(
+				"config_invalid",
+				`channels.${conversationId}.audience must be one of ${ENGAGEMENT_AUDIENCES.join(", ")}`,
+			);
 		for (const removed of ["debounceMs", "settleWindowMs"] as const)
 			if (item[removed] !== undefined)
 				throw new ConfigError(
 					"config_invalid",
 					`channels.${conversationId}.${removed} was removed: every message is steered or sent immediately; delete it from the configuration`,
 				);
-		if (Object.keys(item).some((key) => key !== "engagement"))
+		if (Object.keys(item).some((key) => key !== "engagement" && key !== "audience"))
 			throw new ConfigError("config_invalid", `channels.${conversationId} contains an unknown field`);
 		channels[conversationId] = {
 			...(item.engagement === undefined ? {} : { engagement: item.engagement as EngagementGate }),
+			...(item.audience === undefined ? {} : { audience: item.audience as EngagementAudience }),
 		};
 	}
 	return channels;
@@ -315,6 +346,7 @@ export function parseConfigFile(value: unknown): GatewayConfigFile {
 	}
 	const model = parseModel(input.model);
 	const serviceTier = parseServiceTier(input.serviceTier);
+	const runtime = parseRuntimeConfig(input.runtime);
 	return {
 		schemaVersion: CONFIG_SCHEMA_VERSION,
 		...(logVerbosity ? { logVerbosity: logVerbosity as GatewayConfigFile["logVerbosity"] } : {}),
@@ -327,6 +359,7 @@ export function parseConfigFile(value: unknown): GatewayConfigFile {
 		...(input.webhook === undefined ? {} : { webhook: parseWebhook(input.webhook) }),
 		...(input.watcherRoots === undefined ? {} : { watcherRoots: parseStringArray(input.watcherRoots, "watcherRoots") }),
 		...(input.scriptRoot === undefined ? {} : { scriptRoot: optionalString(input.scriptRoot, "scriptRoot") }),
+		...(runtime === undefined ? {} : { runtime }),
 		...(input.mentionAllowlist === undefined
 			? {}
 			: { mentionAllowlist: parseStringArray(input.mentionAllowlist, "mentionAllowlist") }),
@@ -453,6 +486,7 @@ export const RESTART_REQUIRED_FIELDS = [
 	"webhook",
 	"watcherRoots",
 	"scriptRoot",
+	"runtime",
 	"ownerTarget",
 	"monitorContextFailureRollThreshold",
 ] as const;

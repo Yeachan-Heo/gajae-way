@@ -1,5 +1,5 @@
 import { expect, test } from "bun:test";
-import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { lstat, mkdir, mkdtemp, readFile, realpath, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { GatewayConfig } from "../src/config";
@@ -100,6 +100,21 @@ test("fresh persona workspace discovers the bundled self-ops skill without pream
 	}
 });
 
+test("persona workspace maps relative memory writes to the canonical corpus", async () => {
+	const home = await mkdtemp(join(tmpdir(), "gajaeway-persona-memory-"));
+	try {
+		const persona = new PersonaLoader(home);
+		await Promise.all([persona.ensureWorkspace(), persona.ensureWorkspace()]);
+		const workspaceMemory = join(home, "workspace", "memory");
+		expect((await lstat(workspaceMemory)).isSymbolicLink()).toBe(true);
+		expect(await realpath(workspaceMemory)).toBe(await realpath(join(home, "memory")));
+		await writeFile(join(workspaceMemory, "relative-write.md"), "canonical");
+		expect(await readFile(join(home, "memory", "relative-write.md"), "utf8")).toBe("canonical");
+	} finally {
+		await rm(home, { recursive: true, force: true });
+	}
+});
+
 test("self-ops workspace amendments survive later seeding", async () => {
 	const home = await mkdtemp(join(tmpdir(), "gajaeway-self-ops-amendment-"));
 	try {
@@ -109,6 +124,30 @@ test("self-ops workspace amendments survive later seeding", async () => {
 		await writeFile(skill, "host-local self-ops amendment\n");
 		await persona.ensureWorkspace();
 		expect(await readFile(skill, "utf8")).toBe("host-local self-ops amendment\n");
+	} finally {
+		await rm(home, { recursive: true, force: true });
+	}
+});
+
+test("persona workspace refuses a pre-existing memory directory without modifying it", async () => {
+	const home = await mkdtemp(join(tmpdir(), "gajaeway-persona-memory-conflict-"));
+	try {
+		await mkdir(join(home, "workspace", "memory"), { recursive: true });
+		await writeFile(join(home, "workspace", "memory", "stray.md"), "preserve me");
+		await expect(new PersonaLoader(home).ensureWorkspace()).rejects.toThrow("workspace_memory_path_conflict");
+		expect(await readFile(join(home, "workspace", "memory", "stray.md"), "utf8")).toBe("preserve me");
+	} finally {
+		await rm(home, { recursive: true, force: true });
+	}
+});
+
+test("persona workspace refuses a memory symlink that escapes the canonical corpus", async () => {
+	const home = await mkdtemp(join(tmpdir(), "gajaeway-persona-memory-escape-"));
+	try {
+		await mkdir(join(home, "workspace"), { recursive: true });
+		await mkdir(join(home, "outside"), { recursive: true });
+		await symlink(join(home, "outside"), join(home, "workspace", "memory"), "dir");
+		await expect(new PersonaLoader(home).ensureWorkspace()).rejects.toThrow("workspace_memory_path_escape");
 	} finally {
 		await rm(home, { recursive: true, force: true });
 	}

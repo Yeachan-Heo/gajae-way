@@ -2,7 +2,7 @@ import { describe, expect, test } from "bun:test";
 import type { EngagementContext } from "@gajaeway/protocol";
 import type { GatewayConfig } from "../src/config";
 import { ENGAGEMENT_GATES, CONFIG_SCHEMA_VERSION as SCHEMA } from "../src/config";
-import { decideEngagement } from "../src/engagement/policy";
+import { BotAudienceTurnGuard, decideEngagement } from "../src/engagement/policy";
 
 const OWNER = "660473980301344768";
 const STRANGER = "999999999999999999";
@@ -24,25 +24,41 @@ function ctx(overrides: Partial<EngagementContext> = {}): EngagementContext {
 	return { mentioned: false, group: true, authorId: STRANGER, ...overrides } as EngagementContext;
 }
 
-const gate = (engagement: string) =>
-	({ channels: { "discord:c1": { engagement } } }) as unknown as Partial<GatewayConfig>;
+const gate = (engagement: string, audience?: string) =>
+	({
+		channels: { "discord:c1": { engagement, ...(audience ? { audience } : {}) } },
+	}) as unknown as Partial<GatewayConfig>;
 
 describe("open", () => {
-	test("every human message is a turn, mention or not", () => {
-		expect(decideEngagement(CHANNEL, ctx(), config(gate("open"))).engaged).toBe(true);
-	});
-
-	test("a bot still needs a mention", () => {
-		const c = config(gate("open"));
+	test("omitted audience preserves human-open and bot closed-gate behavior", () => {
+		const c = config({ ...gate("open"), mentionAllowlist: [OWNER] });
+		expect(decideEngagement(CHANNEL, ctx(), c)).toEqual({ engaged: true, botAudienceAdmission: false });
 		expect(decideEngagement(CHANNEL, ctx({ authorIsBot: true }), c).engaged).toBe(false);
+		expect(decideEngagement(CHANNEL, ctx({ authorIsBot: true, mentioned: true }), c).engaged).toBe(false);
 		expect(decideEngagement(CHANNEL, ctx({ authorIsBot: true, mentioned: true, authorId: OWNER }), c).engaged).toBe(
 			true,
 		);
 	});
+
+	test("all opens both humans and bots without addressing", () => {
+		const c = config(gate("open", "all"));
+		expect(decideEngagement(CHANNEL, ctx(), c).engaged).toBe(true);
+		expect(decideEngagement(CHANNEL, ctx({ authorIsBot: true }), c)).toEqual({
+			engaged: true,
+			botAudienceAdmission: true,
+		});
+	});
+
+	test("bot-only opens bots while explicitly excluding humans", () => {
+		const c = config({ ...gate("open", "bot-only"), mentionAllowlist: [OWNER] });
+		expect(decideEngagement(CHANNEL, ctx({ authorIsBot: true }), c).engaged).toBe(true);
+		expect(decideEngagement(CHANNEL, ctx(), c).engaged).toBe(false);
+		expect(decideEngagement(CHANNEL, ctx({ mentioned: true, authorId: OWNER }), c).engaged).toBe(false);
+	});
 });
 
-describe("open-mention-only", () => {
-	const c = config(gate("open-mention-only"));
+describe("mention-open", () => {
+	const c = config(gate("mention-open"));
 
 	test("an unlisted stranger may address the persona", () => {
 		expect(decideEngagement(CHANNEL, ctx({ mentioned: true }), c).engaged).toBe(true);
@@ -53,13 +69,29 @@ describe("open-mention-only", () => {
 	});
 
 	test("the allowlist does not gate it", () => {
-		const gated = config({ ...gate("open-mention-only"), mentionAllowlist: [OWNER] });
+		const gated = config({ ...gate("mention-open"), mentionAllowlist: [OWNER] });
 		expect(decideEngagement(CHANNEL, ctx({ mentioned: true }), gated).engaged).toBe(true);
+	});
+
+	test("all permits an addressed bot but not ordinary bot chatter", () => {
+		const all = config(gate("mention-open", "all"));
+		expect(decideEngagement(CHANNEL, ctx({ authorIsBot: true }), all).engaged).toBe(false);
+		expect(decideEngagement(CHANNEL, ctx({ authorIsBot: true, mentioned: true }), all)).toEqual({
+			engaged: true,
+			botAudienceAdmission: true,
+		});
+	});
+
+	test("bot-only excludes humans, even addressed or allowlisted", () => {
+		const bots = config({ ...gate("mention-open", "bot-only"), mentionAllowlist: [OWNER] });
+		expect(decideEngagement(CHANNEL, ctx({ mentioned: true }), bots).engaged).toBe(false);
+		expect(decideEngagement(CHANNEL, ctx({ mentioned: true, authorId: OWNER }), bots).engaged).toBe(false);
+		expect(decideEngagement(CHANNEL, ctx({ authorIsBot: true, mentioned: true }), bots).engaged).toBe(true);
 	});
 });
 
 describe("closed", () => {
-	test("refuses the same stranger that open-mention-only admits", () => {
+	test("refuses the same stranger that mention-open admits", () => {
 		const c = config({ ...gate("closed"), mentionAllowlist: [OWNER] });
 		expect(decideEngagement(CHANNEL, ctx({ mentioned: true }), c).engaged).toBe(false);
 		expect(decideEngagement(CHANNEL, ctx({ mentioned: true, authorId: OWNER }), c).engaged).toBe(true);
@@ -70,6 +102,37 @@ describe("closed", () => {
 		expect(decideEngagement(CHANNEL, ctx({ mentioned: true }), c).engaged).toBe(false);
 		expect(decideEngagement(CHANNEL, ctx({ mentioned: true, authorId: OWNER }), c).engaged).toBe(true);
 	});
+
+	test("audience is irrelevant for both human and bot authors", () => {
+		const c = config({ ...gate("closed", "bot-only"), mentionAllowlist: [OWNER] });
+		for (const authorIsBot of [false, true]) {
+			expect(decideEngagement(CHANNEL, ctx({ authorIsBot, mentioned: true }), c).engaged).toBe(false);
+			expect(decideEngagement(CHANNEL, ctx({ authorIsBot, mentioned: true, authorId: OWNER }), c).engaged).toBe(true);
+		}
+	});
+});
+
+test("a Discord thread inherits its parent channel policy unless explicitly overridden", () => {
+	const thread = { ...CHANNEL, kind: "thread", conversationId: "t1", parentId: "c1" };
+	const inherited = config(gate("open", "all"));
+	expect(decideEngagement(thread, ctx({ authorIsBot: true }), inherited).engaged).toBe(true);
+	const overridden = config({
+		channels: {
+			"discord:c1": { engagement: "open", audience: "all" },
+			"discord:t1": { engagement: "closed" },
+		},
+		mentionAllowlist: [OWNER],
+	});
+	expect(decideEngagement(thread, ctx({ authorIsBot: true }), overridden).engaged).toBe(false);
+});
+
+test("bot audience turns are capped until a human message resets the conversation", () => {
+	const guard = new BotAudienceTurnGuard();
+	expect(guard.canAdmit("discord:channel:c1")).toBe(true);
+	guard.recordBotAdmission("discord:channel:c1");
+	expect(guard.canAdmit("discord:channel:c1")).toBe(false);
+	guard.recordHumanMessage("discord:channel:c1");
+	expect(guard.canAdmit("discord:channel:c1")).toBe(true);
 });
 
 describe("default", () => {
@@ -145,8 +208,29 @@ describe("config validation", () => {
 	test("an unknown gate is rejected rather than treated as unset", async () => {
 		const { parseConfigFile } = await import("../src/config");
 		expect(() => parseConfigFile({ schemaVersion: SCHEMA, channels: { c1: { engagement: "kinda-open" } } })).toThrow(
-			/must be one of open, open-mention-only, closed/,
+			/must be one of open, mention-open, closed/,
 		);
+	});
+
+	test("the removed open-mention-only spelling is rejected", async () => {
+		const { parseConfigFile } = await import("../src/config");
+		expect(() =>
+			parseConfigFile({ schemaVersion: SCHEMA, channels: { c1: { engagement: "open-mention-only" } } }),
+		).toThrow(/must be one of open, mention-open, closed/);
+	});
+
+	test("each valid audience parses and unknown values fail", async () => {
+		const { ENGAGEMENT_AUDIENCES, parseConfigFile } = await import("../src/config");
+		for (const audience of ENGAGEMENT_AUDIENCES) {
+			const parsed = parseConfigFile({
+				schemaVersion: SCHEMA,
+				channels: { c1: { engagement: "open", audience } },
+			});
+			expect(parsed.channels?.c1?.audience).toBe(audience);
+		}
+		expect(() =>
+			parseConfigFile({ schemaVersion: SCHEMA, channels: { c1: { engagement: "open", audience: "sometimes" } } }),
+		).toThrow(/audience must be one of all, human-only, bot-only/);
 	});
 
 	test("an unknown dmPolicy is rejected", async () => {

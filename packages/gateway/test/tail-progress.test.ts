@@ -251,3 +251,78 @@ test("a turn that never announced progress still emits exactly one final chat.pr
 		await rm(home, { recursive: true, force: true });
 	}
 });
+
+test("a turn retired by /new emits its final chat.progress and stops heartbeating (live: 'working…' for hours)", async () => {
+	const home = await mkdtemp(join(tmpdir(), "gajaeway-retired-progress-"));
+	const config: GatewayConfig = {
+		schemaVersion: 1,
+		home,
+		configPath: join(home, "config.json"),
+		socketPath: join(home, "gateway.sock"),
+		dbPath: join(home, "gateway.db"),
+		logVerbosity: "info",
+		dmPolicy: "open",
+	};
+	const database = await GatewayDatabase.open(config.dbPath);
+	const port = new ScriptedSessionPort();
+	const server = await startUnixServer({
+		config,
+		database,
+		sessionPort: port,
+		progress: { firstAfterMs: 0, intervalMs: 5 },
+		onStop: () => database.close(),
+	});
+	let socket: Awaited<ReturnType<typeof Bun.connect>> | undefined;
+	const frames: any[] = [];
+	try {
+		let buffered = "";
+		socket = await Bun.connect({
+			unix: config.socketPath,
+			socket: {
+				data(_socket, data) {
+					buffered += Buffer.from(data).toString();
+					const lines = buffered.split("\n");
+					buffered = lines.pop() ?? "";
+					for (const line of lines) if (line) frames.push(JSON.parse(line));
+				},
+			},
+		});
+		socket.write(`${JSON.stringify({ v: "0.1", type: "hello", payload: { supportedVersions: ["0.1"] } })}\n`);
+		await eventually(() => frames.length >= 1, "negotiation did not complete");
+		const origin = { platform: "loopback", kind: "loopback", conversationId: "retired" };
+		socket.write(
+			`${JSON.stringify({ v: "0.1", type: "request", id: "turn", verb: "chat.send", params: { origin, text: "long job" } })}\n`,
+		);
+		await eventually(() => port.sends.length === 1, "turn was not sent");
+		const send = port.sends[0]!;
+		port.emitActivity(send.sessionId, { toolCalls: 1, outputTokens: 10 });
+		const progressOf = (turnId: string) =>
+			frames.filter((frame) => frame.event === "chat.progress" && frame.payload.turnId === turnId);
+		await eventually(
+			() => frames.some((frame) => frame.event === "chat.progress" && !frame.payload.final),
+			"no heartbeat",
+		);
+		const turnId = frames.find((frame) => frame.event === "chat.progress").payload.turnId as string;
+
+		socket.write(
+			`${JSON.stringify({ v: "0.1", type: "request", id: "new", verb: "chat.send", params: { origin, text: "/new" } })}\n`,
+		);
+		await eventually(
+			() => progressOf(turnId).some((frame) => frame.payload.final === true),
+			"retired turn never finalised progress",
+		);
+		const finals = progressOf(turnId).filter((frame) => frame.payload.final === true);
+		expect(finals).toHaveLength(1);
+		const count = progressOf(turnId).length;
+		await Bun.sleep(40);
+		expect(progressOf(turnId).length).toBe(count);
+		// The retired turn's late output is fenced; its terminal must not re-announce.
+		port.complete(send.opRef, "stale");
+		await Bun.sleep(40);
+		expect(progressOf(turnId).filter((frame) => frame.payload.final === true)).toHaveLength(1);
+	} finally {
+		socket?.end();
+		await server.stop();
+		await rm(home, { recursive: true, force: true });
+	}
+});

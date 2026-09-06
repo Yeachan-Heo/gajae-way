@@ -2,7 +2,7 @@ import { expect, test } from "bun:test";
 import { mkdtemp, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { ENGAGEMENT_GATES } from "../src/config";
+import { CONFIG_SCHEMA_VERSION, ENGAGEMENT_GATES, parseConfigFile, RESTART_REQUIRED_FIELDS } from "../src/config";
 import { checkConfigFile, configCheckExitCode, defaultConfigPath, renderConfigCheck } from "../src/config-check";
 
 async function configFile(body: string): Promise<string> {
@@ -20,20 +20,21 @@ const VALID = JSON.stringify({
 	},
 });
 
-test("a bootable config reports open and mention-only channel counts", async () => {
+test("a bootable config reports open, mention-open, and closed/default channel counts", async () => {
 	const result = await checkConfigFile(await configFile(VALID));
 	expect(result.ok).toBe(true);
 	if (!result.ok) return;
 	expect(result.channels).toHaveLength(2);
 	expect(result.openChannels).toEqual(["1469222606497648690"]);
+	expect(result.mentionOpenChannels).toEqual([]);
 	expect(configCheckExitCode(result)).toBe(0);
-	expect(renderConfigCheck(result)[1]).toContain("open 1, mention-only 1");
+	expect(renderConfigCheck(result)[1]).toContain("open 1, mention-open 0, closed/default 1");
 });
 
 test("an unknown engagement gate is rejected before a restart can strand the host", async () => {
 	// The exact live break: an invalid gate value must fail the offline preflight
 	// instead of the gateway exiting 1 on boot while the adapter stayed up.
-	// (#31 made "closed" and "open-mention-only" valid gates; only unknown
+	// (#31 made explicit closed and mention-gated modes valid; only unknown
 	// values are rejected.)
 	const path = await configFile(
 		JSON.stringify({ schemaVersion: 1, channels: { "1508664765415690340": { engagement: "mention-only" } } }),
@@ -65,6 +66,33 @@ test("a removed per-channel settle window is rejected with a migration hint", as
 	expect(result.ok).toBe(false);
 	if (result.ok) return;
 	expect(result.code).toBe("config_invalid");
+});
+
+test("runtime PATH settings are validated and classified as restart-required", () => {
+	const config = parseConfigFile({
+		schemaVersion: CONFIG_SCHEMA_VERSION,
+		runtime: { path: ["~/bin", "/opt/bin"], inheritLoginPath: false },
+	});
+	expect(config.runtime).toEqual({ path: ["~/bin", "/opt/bin"], inheritLoginPath: false });
+	expect(RESTART_REQUIRED_FIELDS).toContain("runtime");
+});
+
+test("invalid runtime PATH settings fail the offline config check", async () => {
+	for (const runtime of [
+		{ path: [] },
+		{ path: ["/ok", ""] },
+		{ path: ["/ok", 1] },
+		{ path: "/not-an-array" },
+		{ inheritLoginPath: "yes" },
+		{ path: ["/ok"], inheritLoginPath: true },
+		{ unexpected: true },
+	]) {
+		const result = await checkConfigFile(
+			await configFile(JSON.stringify({ schemaVersion: CONFIG_SCHEMA_VERSION, runtime })),
+		);
+		expect(result.ok, JSON.stringify(runtime)).toBe(false);
+		if (!result.ok) expect(result.code).toBe("config_invalid");
+	}
 });
 
 test("malformed JSON is reported as not_json rather than crashing", async () => {

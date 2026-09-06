@@ -86,10 +86,17 @@ export interface PersonaTurnLifecycle {
 	steerContextMessageId?(row: InboundMessageRow): string | undefined;
 	/** The steer landed in the session (durably, context consumed): release transient ownership. */
 	onSteerAccepted?(input: PersonaSteerInput): void | Promise<void>;
-	onFrame?(input: PersonaTailFrameInput): void | Promise<void>;
+	onFrame?(input: PersonaTailFrameInput): boolean | void | Promise<boolean | void>;
 	onTerminal?(input: PersonaTerminalInput): void | Promise<void>;
 	onFailure?(input: PersonaFailureInput): void | Promise<void>;
 	onRetired?(input: PersonaTurnIdentity): void | Promise<void>;
+	/**
+	 * The turn was dropped WITHOUT a terminal: its send provably never landed
+	 * (or its session is provably dead) and the trigger went back to plain
+	 * pending for a fresh dispatch. Nothing will ever call onTerminal/onFailure
+	 * for this lifecycle; a heartbeat left running here outlives the turn.
+	 */
+	onReleased?(input: PersonaTurnIdentity): void | Promise<void>;
 	onStall?(input: PersonaTurnIdentity & { elapsedMs: number }): void | Promise<void>;
 }
 
@@ -411,6 +418,8 @@ type BoundTurn = PersonaTurnIdentity & {
 	retired: boolean;
 	detached: boolean;
 	tailTerminalObserved: boolean;
+	/** A consumer-visible reply closed this turn's steer window, even if terminal settlement is still arriving. */
+	replyVisible: boolean;
 	/**
 	 * A retired turn whose answer the user still wants: the session was replaced
 	 * under it (steer failure), not reset by the user (`/new`). Its output is
@@ -557,6 +566,20 @@ class OriginActor {
 			try {
 				await this.#recoverTurn(turn);
 			} catch (error) {
+				// A BOUND (never acknowledged) turn whose session the broker disowns
+				// when the tail is attached has no operation anywhere: release it
+				// like the other disowned paths instead of crashing the actor. Every
+				// main cutover from a schema-16 home hit this (three boxes, 2026-09-05)
+				// and each needed the row hand-edited before the origin worked again.
+				if (turn.state === "bound" && sdkStatusErrorCode(error) === "session_unavailable") {
+					const attempt = this.#manager.database.inboundTurnRequeue(turn.opRef);
+					const retired = turn.epoch < this.#epoch();
+					const nextEpoch = retired ? this.#epoch() : this.#manager.database.rebindEpoch(this.originKey);
+					this.#manager.log(
+						`recovery_requeue_unaccepted origin=${this.originKey} epoch=${turn.epoch} nextEpoch=${nextEpoch} opRef=${turn.opRef} session=${turn.sessionId} attempt=${attempt} reason=tail_attach_disowned`,
+					);
+					continue;
+				}
 				// One unrecoverable turn must not abort recovery of the others.
 				this.#manager.log(
 					`recovery_turn_failed origin=${this.originKey} epoch=${turn.epoch} opRef=${turn.opRef} detail=${safeDiagnostic(error)}`,
@@ -608,13 +631,16 @@ class OriginActor {
 			raw?.live === false ||
 			raw?.disowned === true;
 		const releasable = turn.state === "bound" || (turn.state === "accepted" && sessionDead);
-		if (releasable && !retired && status.status.status === "unknown" && disownedByBroker) {
+		if (releasable && status.status.status === "unknown" && disownedByBroker) {
 			const attempt = this.#manager.database.inboundTurnRequeue(turn.opRef);
 			// The binding itself is unusable: recreate through the existing rebind
 			// primitive (epoch bump) so the next dispatch binds a fresh live session.
-			const nextEpoch = this.#manager.database.rebindEpoch(this.originKey);
+			// A retired turn's epoch was already rotated away from; it simply
+			// re-enters the queue under the current one (its send never ran, so
+			// the message is owed a turn, not a permanent hold).
+			const nextEpoch = retired ? currentEpoch : this.#manager.database.rebindEpoch(this.originKey);
 			this.#manager.log(
-				`recovery_requeue_unaccepted origin=${this.originKey} epoch=${turn.epoch} nextEpoch=${nextEpoch} opRef=${turn.opRef} session=${sessionId} attempt=${attempt}`,
+				`recovery_requeue_unaccepted origin=${this.originKey} epoch=${turn.epoch} nextEpoch=${nextEpoch} opRef=${turn.opRef} session=${sessionId} attempt=${attempt}${retired ? " reason=retired_router_disowned" : ""}`,
 			);
 			return;
 		}
@@ -773,6 +799,7 @@ class OriginActor {
 			retired,
 			detached,
 			tailTerminalObserved: false,
+			replyVisible: false,
 			answerWanted: false,
 			tailEvidenceUnavailable: false,
 			statusTerminalHolds: 0,
@@ -975,6 +1002,7 @@ class OriginActor {
 			retired: false,
 			detached: false,
 			tailTerminalObserved: false,
+			replyVisible: false,
 			answerWanted: false,
 			tailEvidenceUnavailable: false,
 			statusTerminalHolds: 0,
@@ -1027,6 +1055,7 @@ class OriginActor {
 			const attempt = this.#manager.database.inboundTurnRequeue(opRef);
 			this.#current = undefined;
 			this.#state = "idle";
+			await this.#notifyReleased(current);
 			this.#preSendFailures += 1;
 			const failures = this.#preSendFailures;
 			const sessionGone = sdkStatusErrorCode(error) === "session_unavailable";
@@ -1068,6 +1097,7 @@ class OriginActor {
 				const nextEpoch = this.#manager.database.rebindEpoch(this.originKey);
 				this.#current = undefined;
 				this.#state = "idle";
+				await this.#notifyReleased(current);
 				// The per-trigger fresh-turn ordinal restarts with the epoch, so the
 				// burst is counted at the actor: consecutive "no usable session"
 				// failures (bind OR send) until one dispatch succeeds. Bounded burst
@@ -1238,7 +1268,7 @@ class OriginActor {
 	 */
 	async #steerPending(): Promise<void> {
 		const current = this.#current;
-		if (!current || current.retired || this.#state !== "turn-running") return;
+		if (!current || current.retired || current.replyVisible || this.#state !== "turn-running") return;
 		// Steers whose transport tore before an answer are resolved first, on
 		// the same clientRef, before any new row is issued behind them.
 		for (const held of this.#manager.database.inboundSteersHeld(current.turn.opRef))
@@ -1454,7 +1484,8 @@ class OriginActor {
 				bound.lastAssistantOpAttributed = tailOperationRef(frame) === bound.turn.opRef;
 				bound.lastAssistantAtMs = tailFrameTimestampMs(frame);
 			}
-			await bound.lifecycle.onFrame?.({ ...bound, frame });
+			const replyVisible = await bound.lifecycle.onFrame?.({ ...bound, frame });
+			if (replyVisible === true) bound.replyVisible = true;
 			if (!bound.lifecycle.onFrame && frame.assistantText && frame.eventId && !frame.steerEcho) {
 				const key = `${sessionId}:${frame.eventId}`;
 				if (!this.#deliveredEvents.has(key)) {
@@ -1471,6 +1502,7 @@ class OriginActor {
 						),
 						text: frame.assistantText,
 					});
+					bound.replyVisible = true;
 				}
 			}
 		}
@@ -1513,8 +1545,11 @@ class OriginActor {
 		} catch (error) {
 			// The broker disowning the id (session_unavailable) with the session
 			// provably not live means nothing is running there: release the turn
-			// and rebind instead of holding an adopted turn forever.
-			if (sdkStatusErrorCode(error) === "session_unavailable" && !bound.retired) {
+			// and rebind instead of holding an adopted turn forever. A retired turn
+			// whose answer is still wanted (session replaced under it after a steer
+			// refusal) is judged the same way: held forever, its lifecycle kept
+			// announcing a turn that never ran (live: "working… (286m)", 2026-09-05).
+			if (sdkStatusErrorCode(error) === "session_unavailable" && (!bound.retired || bound.answerWanted)) {
 				const raw = this.#manager.port.liveness
 					? await this.#manager.port.liveness({ sessionId: bound.sessionId, repo: this.#manager.repo })
 					: undefined;
@@ -1525,17 +1560,7 @@ class OriginActor {
 				const state = this.#manager.database.inboundTurnRow(bound.turn.opRef)?.turn_state;
 				const dead = raw?.live === false || raw?.disowned === true;
 				if (state === "bound" ? raw?.live !== true : dead) {
-					await bound.tail?.close();
-					const attempt = this.#manager.database.inboundTurnRequeue(bound.turn.opRef);
-					const nextEpoch = this.#manager.database.rebindEpoch(this.originKey);
-					if (this.#current === bound) {
-						this.#current = undefined;
-						this.#state = "idle";
-					}
-					this.#manager.log(
-						`recovery_requeue_unaccepted origin=${this.originKey} epoch=${bound.epoch} nextEpoch=${nextEpoch} opRef=${bound.turn.opRef} session=${bound.sessionId} attempt=${attempt} reason=router_disowned`,
-					);
-					await this.#dispatchNext();
+					await this.#releaseUnlanded(bound, "router_disowned");
 					return;
 				}
 			}
@@ -1553,7 +1578,7 @@ class OriginActor {
 			// reports no such operation and its prompt queue remains empty across
 			// two sweeps, the send did not land; holding it forever bricks the
 			// origin. ACCEPTED work is different and remains protected from replay.
-			if (state === "bound" && !bound.retired && count >= HOLD_RELEASE_SWEEPS) {
+			if (state === "bound" && (!bound.retired || bound.answerWanted) && count >= HOLD_RELEASE_SWEEPS) {
 				let live: boolean | undefined;
 				let disowned = false;
 				try {
@@ -1573,18 +1598,10 @@ class OriginActor {
 				const dead = live === false || disowned;
 				const liveIdle = live === true && (await this.#queueIsEmpty(bound.sessionId));
 				if (dead || liveIdle) {
-					this.#holdSweeps.delete(bound.turn.opRef);
-					await bound.tail?.close();
-					const attempt = this.#manager.database.inboundTurnRequeue(bound.turn.opRef);
-					const nextEpoch = this.#manager.database.rebindEpoch(this.originKey);
-					if (this.#current === bound) {
-						this.#current = undefined;
-						this.#state = "idle";
-					}
-					this.#manager.log(
-						`recovery_requeue_unaccepted origin=${this.originKey} epoch=${bound.epoch} nextEpoch=${nextEpoch} opRef=${bound.turn.opRef} session=${bound.sessionId} attempt=${attempt} reason=${dead ? "unknown_op_on_dead_session" : "unknown_op_on_live_idle_session"} sweeps=${count}`,
+					await this.#releaseUnlanded(
+						bound,
+						`${dead ? "unknown_op_on_dead_session" : "unknown_op_on_live_idle_session"} sweeps=${count}`,
 					);
-					await this.#dispatchNext();
 					return;
 				}
 			}
@@ -1750,6 +1767,45 @@ class OriginActor {
 			this.#current = undefined;
 			this.#state = "idle";
 			await this.#dispatchNext();
+		}
+	}
+
+	/**
+	 * Drops a turn whose send provably never ran: trigger back to plain pending,
+	 * lifecycle told it will never see a terminal, and a fresh dispatch. A
+	 * current turn also rotates the epoch (its binding is unusable); a retired
+	 * one was already rotated away from and must not tear down the live
+	 * replacement session under the current epoch.
+	 */
+	async #releaseUnlanded(bound: BoundTurn, reason: string): Promise<void> {
+		this.#holdSweeps.delete(bound.turn.opRef);
+		bound.tail?.setTurnRunning(false);
+		await bound.tail?.close();
+		const attempt = this.#manager.database.inboundTurnRequeue(bound.turn.opRef);
+		const nextEpoch = bound.retired ? this.#epoch() : this.#manager.database.rebindEpoch(this.originKey);
+		if (bound.retired) {
+			this.#retired.delete(retiredKey(bound));
+			this.#clearRetiredReattach(bound);
+		} else if (this.#current === bound) {
+			this.#current = undefined;
+			this.#state = "idle";
+		}
+		this.#manager.log(
+			`recovery_requeue_unaccepted origin=${this.originKey} epoch=${bound.epoch} nextEpoch=${nextEpoch} opRef=${bound.turn.opRef} session=${bound.sessionId} attempt=${attempt} reason=${reason}`,
+		);
+		await this.#notifyReleased(bound);
+		// The canonical admission rule applies to the released row: a running
+		// replacement turn takes it as a steer, an idle origin sends it next.
+		if (this.#state === "turn-running") await this.#steerPending();
+		else await this.#dispatchNext();
+	}
+
+	/** Best-effort: a presentation hook failing must never keep the origin from re-dispatching. */
+	async #notifyReleased(bound: BoundTurn): Promise<void> {
+		try {
+			await bound.lifecycle.onReleased?.(bound);
+		} catch (error) {
+			this.#manager.log(`persona_release_hook_failed origin=${this.originKey} detail=${safeDiagnostic(error)}`);
 		}
 	}
 

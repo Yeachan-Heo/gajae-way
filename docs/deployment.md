@@ -55,7 +55,7 @@ Use `config.json` schema version 1. Every configured secret is a credential-file
     "discord": { "credentialFile": "/Users/me/gajaeway/secrets/discord-token" },
     "telegram": { "credentialFile": "/Users/me/gajaeway/secrets/telegram-token" }
   },
-  "channels": { "discord-channel-id": { "engagement": "open" } },
+  "channels": { "discord-channel-id": { "engagement": "open", "audience": "human-only" } },
   "webhook": { "bind": "127.0.0.1", "port": 8080, "exposeNonLoopback": false },
   "watcherRoots": ["/Users/me/automations"],
   "scriptRoot": "/Users/me/automations",
@@ -84,9 +84,13 @@ The Discord adapter has a separate `$GAJAEWAY_HOME/adapter-discord.json` because
 {
   "tokenFile": "/Users/me/gajaeway/secrets/discord-token",
   "gatewaySocket": "/Users/me/gajaeway/gateway.sock",
-  "channels": { "discord-channel-id": { "engagement": "open" } }
+  "channels": { "discord-channel-id": { "engagement": "open", "audience": "human-only" } }
 }
 ```
+
+`engagement` selects how messages become turns: `open` admits them without addressing, `mention-open` requires a real mention or native reply to this bot, and `closed` requires both addressing and owner/allowlist authorization. `audience` independently restricts authors to `all`, `human-only`, or `bot-only`; `closed` ignores it. Omitting `audience` keeps the safe `human-only` default (humans follow the mode; bots stay on the closed gate).
+
+On startup and gateway reconnect, the adapter backfills each configured Discord channel, its active threads, and recent archived threads whose last activity is within 30 days. DMs cannot be enumerated through Discord, so live DM ingress records a bounded recovery set before `chat.send`; the adapter retains at most 100 DM conversations and expires entries after 30 days. Progress is stored atomically in `$GAJAEWAY_HOME/adapters/discord/recovery-cursor.json`. A missing-access or deleted conversation keeps its watermark and is retried twice, then quarantined on the third unreadable result so healthy conversations can finish; a later reconnect probes it and re-admits it when history is readable again. Message-id dedupe in the gateway makes live/recovery races and restart resumes exactly-once.
 
 Keep token files out of version control and restrict their permissions. Replace a token file and restart the relevant service to rotate it.
 

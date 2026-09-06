@@ -20,6 +20,8 @@
  * the gateway client's dependency tree.
  */
 
+import { classifyProviderError } from "./provider-error";
+
 /** ElevenLabs returns Ogg/Opus directly at this format — no transcoding step. */
 const DEFAULT_OUTPUT_FORMAT = "opus_48000_64";
 const DEFAULT_VOICE_ID = "pNInz6obpgDQGcFmaJgB";
@@ -159,7 +161,8 @@ export async function synthesizeVoice(
 			signal: controller.signal,
 		});
 		if (!response.ok) {
-			ports.log?.(`voice synthesis failed: text-to-speech returned ${response.status}`);
+			const failure = await classifyProviderError(response);
+			ports.log?.(`voice synthesis failed: text-to-speech ${failure.diagnostic}`);
 			return undefined;
 		}
 		const ogg = new Uint8Array(await response.arrayBuffer());

@@ -69,6 +69,8 @@ type DispatchFailureCode =
 	// is neither the aside worker nor an orphaned external run.
 	| "executor_failed"
 	| "delivery_prepare_failed"
+	| "event_type_invalid"
+	| "monitor_invalid"
 	| "internal_error";
 
 export interface MonitorDispatchFailure {
@@ -148,6 +150,7 @@ export class MonitorPropagator {
 	#reconciling = false;
 	/** In-flight dispatch promises per event, for awaitable submission. */
 	#inFlightPromises = new Map<string, Promise<void>>();
+	#closing = false;
 	/** Per-origin serialization lives in SessionPort, shared with all SDK callers. */
 	readonly #repo: string;
 	readonly #model: GjcModelSelection | undefined;
@@ -232,12 +235,23 @@ export class MonitorPropagator {
 			options.protocolFailureRollThreshold ?? MONITOR_PROTOCOL_FAILURE_ROLL_THRESHOLD;
 		this.#repo = options.repo ?? process.cwd();
 	}
-	/** Cancels pending burst timers so a closed database is never touched after shutdown. */
+	/** Cancels pending burst timers so no new dispatch starts during shutdown. */
 	dispose(): void {
+		this.#closing = true;
 		for (const batch of this.#batches.values()) clearTimeout(batch.timer);
 		this.#batches.clear();
 	}
+	/** Waits for every live dispatch and reconcile writer before the database closes. */
+	async drain(): Promise<void> {
+		this.dispose();
+		while (this.#reconciling || this.#inFlightPromises.size > 0) {
+			const active = [...new Set(this.#inFlightPromises.values())];
+			if (active.length > 0) await Promise.all(active);
+			else await Bun.sleep(1);
+		}
+	}
 	submit(monitorId: string, eventType: string, payload: unknown): string {
+		if (this.#closing) throw new Error("monitor propagator is closing");
 		const monitor = this.#registry.get(monitorId);
 		if (!monitor?.enabled) throw new Error("unknown or disabled monitor");
 		if (typeof eventType !== "string" || !eventType) throw new Error("event type is required");
@@ -444,7 +458,18 @@ export class MonitorPropagator {
 		const rows = this.#database.monitorEventRows().filter((row) => eventIds.includes(row.event_id));
 		if (!rows.length) return;
 		const monitor = this.#registry.get(rows[0]?.monitor_id);
-		if (!monitor) return;
+		if (!monitor) {
+			for (const row of rows)
+				this.#database.monitorEventTerminalFail(
+					row.event_id,
+					"monitor_invalid",
+					"dispatch setup failed (monitor_invalid)",
+				);
+			console.error(
+				`monitor dispatch rejected missing or invalid monitor: events ${rows.map((row) => row.event_id).join(",")}`,
+			);
+			return;
+		}
 		const batchId = crypto.randomUUID();
 		// Red-team blocker 1: acquire a durable lease per event BEFORE claiming the
 		// batch. The lease survives this process (owner token + expiry), so a new
@@ -475,6 +500,33 @@ export class MonitorPropagator {
 			for (const row of leased) this.#database.monitorEventReleaseLease(row.event_id, leaseId);
 			return;
 		}
+		const declared = new Set(monitor.eventTypes);
+		const claimedEventType = claimed[0]?.event_type;
+		let sessionOrigin: OriginRef;
+		let sessionOriginKey: string;
+		try {
+			if (!claimedEventType) throw new Error("missing event type");
+			originKey(eventTypeOrigin(claimedEventType));
+			sessionOrigin = declared.has(claimedEventType) ? eventTypeOrigin(claimedEventType) : CATCH_ALL_EVENT_ORIGIN;
+			sessionOriginKey = originKey(sessionOrigin);
+		} catch {
+			for (const row of claimed) {
+				this.#database.monitorEventFencedFail(
+					row.event_id,
+					leaseId,
+					batchId,
+					"event_type_invalid",
+					"dispatch setup failed (event_type_invalid)",
+					now(),
+					true,
+				);
+			}
+			for (const row of leased) this.#database.monitorEventReleaseLease(row.event_id, leaseId);
+			console.error(
+				`monitor dispatch rejected invalid event type: events ${claimed.map((row) => row.event_id).join(",")}`,
+			);
+			return;
+		}
 		// Heartbeat: renew the lease while the authoring turn is in flight so long
 		// turns (observed 14m+ canonicalizations) never expire mid-flight, while a
 		// dead owner's lease still times out (bounded expiry = TTL after the last
@@ -484,11 +536,6 @@ export class MonitorPropagator {
 			leaseId,
 			leaseTtlMs,
 		);
-		const declared = new Set(monitor.eventTypes);
-		const sessionOrigin = declared.has(claimed[0]?.event_type)
-			? eventTypeOrigin(claimed[0]!.event_type)
-			: CATCH_ALL_EVENT_ORIGIN;
-		const sessionOriginKey = originKey(sessionOrigin);
 		// One generic port owns all same-origin authoring serialization; monitor
 		// leases remain active while a prior call is awaiting a terminal receipt.
 		await this.#sessionPort.runExclusive(sessionOriginKey, async () => {
@@ -497,6 +544,7 @@ export class MonitorPropagator {
 			// session is still the live one.
 			let boundSessionId: string | undefined;
 			let boundSessionEpoch: number | undefined;
+			let dispatchPhase = "bind";
 			// A replayed batch: reconcile bumps dispatch_attempts before re-dispatching
 			// a stranded or failed event, so a non-zero count means these events are
 			// not this session's own fresh work. Their context failure says nothing
@@ -525,6 +573,7 @@ export class MonitorPropagator {
 				const { sessionId } = binding;
 				boundSessionId = sessionId;
 				boundSessionEpoch = binding.epoch;
+				dispatchPhase = "configure";
 				const modelKey = effectiveModel
 					? typeof effectiveModel === "string"
 						? effectiveModel
@@ -550,6 +599,7 @@ export class MonitorPropagator {
 				const guidance = [monitor.instruction?.trim() || undefined, ...maintenance].filter(Boolean).join(" ");
 				const prompt = `Author monitor events.${guidance ? ` ${guidance}` : ""}${digest ? `\n${digest}\n` : ""} Respond ONLY with a JSON array containing exactly one {"eventId","note"} entry per event: ${JSON.stringify(claimed.map((row) => ({ eventId: row.event_id, eventType: row.event_type, payload: JSON.parse(row.payload_json) })))}`;
 				const opRef = `gw-m-${batchId.replaceAll("-", "")}`;
+				dispatchPhase = "request";
 				const response = (
 					await this.#sessionPort.request({
 						sessionId,
@@ -557,8 +607,10 @@ export class MonitorPropagator {
 						originKey: sessionOriginKey,
 						text: prompt,
 						opRef,
+						observeTail: false,
 					})
 				).assistant.text;
+				dispatchPhase = "validate";
 				// The authoring turn is now part of the session transcript whatever its
 				// content, so it is counted here rather than after the response is
 				// validated. The count is OBSERVATIONAL: it is reported, and it never
@@ -634,6 +686,7 @@ export class MonitorPropagator {
 							stage: "authored",
 						});
 					}
+				dispatchPhase = "delivery";
 				// A monitor without its own channel target reports to the configured owner
 				// target when one exists: a personal agent's maintenance and event notes go
 				// to the owner by default rather than vanishing into the logs. With no
@@ -697,7 +750,7 @@ export class MonitorPropagator {
 						batchId,
 						code,
 						// #64: the detail must carry the actual cause (sanitized), not echo the code.
-						`dispatch phase failed (${code}): ${failureDetail(error)}`,
+						`dispatch phase failed (${code}): ${failureDetail(error)} ${JSON.stringify({ phase: dispatchPhase, sessionId: boundSessionId ?? null, origin: sessionOriginKey, attempt: row.dispatch_attempts + 1 })}`,
 					);
 				}
 				console.error(`monitor dispatch failed (${code}): events ${claimed.map((row) => row.event_id).join(",")}`);
@@ -1022,25 +1075,70 @@ export function parseAuthoredArray(response: string): unknown {
 	);
 }
 
-/**
- * Actionable but public-safe failure detail (#64 vs. the raw-body ban): the
- * error class, a stable error code when the error carries one, and the first
- * in-repo stack frame (file:line). The raw message is deliberately NOT
- * persisted — SDK error bodies can carry prompt content.
- */
+/** Only explicit diagnostic vocabulary crosses the durable boundary, never raw error text. */
 function failureDetail(error: unknown): string {
-	const name = error instanceof Error ? error.constructor.name : typeof error;
-	const code = (error as { code?: unknown } | undefined)?.code;
-	const stableCode = typeof code === "string" && /^[a-z0-9_.-]{1,64}$/i.test(code) ? code : undefined;
+	const object = (value: unknown): Record<string, unknown> =>
+		value !== null && typeof value === "object" ? (value as Record<string, unknown>) : {};
+	const fields = object(error);
+	const report = object(fields.status);
+	const terminal = object(report.status);
+	const terminalError = object(terminal.error);
+	const allowedClasses = new Set([
+		"Error",
+		"TypeError",
+		"RangeError",
+		"AggregateError",
+		"TimeoutError",
+		"GjcCliError",
+		"GjcRuntimeError",
+		"SessionTerminalError",
+		"SessionRequestTimeoutError",
+		"RebindCapExceededError",
+	]);
+	const allowedCodes = new Set([
+		"session_not_found",
+		"session_closed",
+		"session_expired",
+		"session_terminal",
+		"operation_not_found",
+		"timeout",
+		"deadline_exceeded",
+		"internal_error",
+		"context_length_exceeded",
+		"rebind_cap_exceeded",
+	]);
+	const rawName = error instanceof Error ? error.constructor.name : typeof error;
+	const name = allowedClasses.has(rawName) ? rawName : error instanceof Error ? "Error" : "unknown";
+	const code = fields.code ?? terminalError.code;
+	const exitCode = fields.exitCode;
+	const signal = fields.signal;
+	const status = terminal.status;
+	const message = error instanceof Error ? error.message : "";
+	const cause = /Database has closed|closed database/i.test(message)
+		? "database_closed"
+		: /SQLITE_BUSY|database is locked/i.test(message)
+			? "database_busy"
+			: /timed out|timeout/i.test(message)
+				? "timeout"
+				: undefined;
+	const frameNames = ["withTransaction", "#dispatchBatch", "monitorEventFencedFail", "request", "bind"];
 	const frame =
 		error instanceof Error && error.stack
-			? (error.stack.split("\n").find((line) => /^\s+at .*(packages|src)\//.test(line)) ?? "")
-					.trim()
-					.replace(/^at\s+/, "")
-					.replace(/.*\/(packages\/[^)]+)\)?$/, "$1")
-			: "";
-	return [name, stableCode ? `code=${stableCode}` : "", frame ? `at ${frame}` : ""]
-		.filter(Boolean)
-		.join(" ")
-		.slice(0, 300);
+			? frameNames.find((candidate) => error.stack?.split("\n").some((line) => line.includes(candidate)))
+			: undefined;
+	return JSON.stringify({
+		class: name,
+		...(typeof code === "string" && allowedCodes.has(code) ? { code } : {}),
+		...(typeof exitCode === "number" && Number.isInteger(exitCode) && exitCode >= 0 && exitCode <= 255
+			? { exitCode }
+			: {}),
+		...(typeof signal === "string" && ["SIGTERM", "SIGKILL", "SIGABRT", "SIGSEGV", "SIGINT"].includes(signal)
+			? { signal }
+			: {}),
+		...(typeof status === "string" && ["failed", "cancelled", "completed", "aborted"].includes(status)
+			? { terminal: status }
+			: {}),
+		...(cause ? { cause } : {}),
+		...(frame ? { frame } : {}),
+	});
 }

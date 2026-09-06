@@ -7,6 +7,7 @@ import { sanitizeDiagnostic } from "./rebind";
 /** The Stage 0 capability report was run successfully on this runtime floor. */
 export const MIN_GJC_VERSION = "0.15.6";
 /** Structural marker the health/capability probe requires from `sdk session list`. */
+const HEALTH_PROBE_SESSION_ID = "00000000-0000-4000-8000-000000000000";
 const SESSION_LIST_MARKER = "sessions";
 export const DEFAULT_PERSONA_HOST_ID = "persona";
 
@@ -94,7 +95,7 @@ type LockRecord = {
 };
 
 const DEFAULT_HEALTH_INTERVAL_MS = 5_000;
-const DEFAULT_HEALTH_PROBE_TIMEOUT_MS = 10_000;
+const DEFAULT_HEALTH_PROBE_TIMEOUT_MS = 30_000;
 /** Consecutive failed periodic probes before a generation is fenced. A single slow probe under load must not retire every live turn. */
 const HEALTH_FAILURE_STRIKES = 3;
 /** Consecutive readiness attempts that find a live-looking endpoint failing the application probe before the daemon is retired. */
@@ -131,10 +132,21 @@ const DEFAULT_RESTART_MAX_MS = 10_000;
  * on the CLI surface, which is why observation is the only portable contract.
  */
 export function brokerHealthArgs(): readonly string[] {
-	// `cwd` scope: the persona workspace is not a Git checkout, and gjc >= 0.16.0
-	// refuses `--scope all` outside one. A cwd-scoped listing still proves the
-	// agent-dir daemon answers a structural session-list envelope.
-	return ["sdk", "session", "list", "--scope", "cwd"];
+	// Exact-empty lookup: proves the broker can execute session.list while
+	// guaranteeing a one-row-or-empty result, so it can NEVER allocate a
+	// continuation cursor regardless of how many sessions exist. The old `{}`
+	// probe leaked one cursor every 5s after the index exceeded 100 sessions and
+	// exhausted the 32-slot pool in under three minutes.
+	return [
+		"sdk",
+		"session",
+		"raw",
+		"global",
+		"--op",
+		"session.list",
+		"--json-input",
+		JSON.stringify({ resolveSessionId: HEALTH_PROBE_SESSION_ID }),
+	];
 }
 
 /** gjc's own discovery TTL: a heartbeat older than this means the daemon is gone even if the file remains. */
@@ -270,13 +282,9 @@ export function probeBrokerEndpoint(
 							type: "broker_request",
 							id: PROBE_REQUEST_ID,
 							operation: "session.list",
-							// NO `limit`. A page smaller than the session list makes the
-							// daemon store a continuation cursor with a 15-minute TTL, and
-							// its pool is 32: probing every 5s exhausted it in under three
-							// minutes, after which every session.list answered
-							// `invalid_input`. The default page covers the whole list, so
-							// the request allocates nothing and any prior cursor is dropped.
-							input: {},
+							// Exact-empty lookup is structural health evidence without ever
+							// allocating a continuation cursor, even with millions of sessions.
+							input: { resolveSessionId: HEALTH_PROBE_SESSION_ID },
 						}),
 					);
 				} catch {
@@ -340,7 +348,7 @@ export function isHealthySessionList(result: CliResult): boolean {
 export async function preflightGjcRuntime(
 	run: GjcCommandRunner,
 	minimumVersion = MIN_GJC_VERSION,
-	sdk: GjcCommandRunner = run,
+	sdk?: GjcCommandRunner,
 ): Promise<void> {
 	const version = await run(["--version"], { timeoutMs: DEFAULT_HEALTH_PROBE_TIMEOUT_MS });
 	if (version.exitCode !== 0) {
@@ -355,11 +363,13 @@ export async function preflightGjcRuntime(
 	if (compareVersions(found, minimum) < 0) {
 		throw new Error(`gjc runtime preflight failed: requires gjc >= ${minimumVersion}; found ${formatVersion(found)}`);
 	}
-	const capability = await sdk([...brokerHealthArgs()], { timeoutMs: DEFAULT_COMMAND_TIMEOUT_MS });
-	if (!isHealthySessionList(capability)) {
-		throw new Error(
-			`gjc runtime preflight failed: \`gjc sdk session list\` did not answer a valid session-list envelope (exit ${capability.exitCode})`,
-		);
+	if (sdk) {
+		const capability = await sdk([...brokerHealthArgs()], { timeoutMs: DEFAULT_COMMAND_TIMEOUT_MS });
+		if (!isHealthySessionList(capability)) {
+			throw new Error(
+				`gjc runtime preflight failed: \`gjc sdk session list\` did not answer a valid session-list envelope (exit ${capability.exitCode})`,
+			);
+		}
 	}
 }
 
@@ -481,8 +491,11 @@ export class BrokerSupervisor implements PersonaBroker {
 
 	/** Runs the boot-time capability gate against the private agent dir. */
 	async preflight(): Promise<void> {
-		// The sdk probe is agent-dir-bound so it exercises (and auto-starts) the private daemon.
-		await preflightGjcRuntime(this.#command, MIN_GJC_VERSION, this.cli);
+		// Version is the only CLI preflight. #start immediately performs the real
+		// application-level session.list probe against the private broker endpoint;
+		// spawning another SDK CLI here duplicated that check and could time out
+		// before an already-healthy daemon was observed.
+		await preflightGjcRuntime(this.#command, MIN_GJC_VERSION);
 	}
 
 	/** The current daemon generation; it starts at 1 and increases every time the daemon is observed to recover. */

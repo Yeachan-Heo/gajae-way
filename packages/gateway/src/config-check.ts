@@ -7,8 +7,7 @@ import { ConfigError, gatewayHome, parseConfigFile } from "./config";
  * Channel policy is read only at boot, so an invalid value never degrades a
  * running gateway — it stops the *next* one from starting. Observed twice in one
  * day on the resident host: a hand-edited `config.json` carried
- * `engagement: "closed"` (the schema accepts only `"open"`; mention-only is
- * expressed by omitting the field), `parseChannels` threw `config_invalid`, and
+ * an invalid engagement spelling, `parseChannels` threw `config_invalid`, and
  * launchd respawned a process that exited 1 while the Discord adapter stayed up.
  * Messages kept arriving with nothing behind them, so the bot looked slow rather
  * than dead, and it went unnoticed for hours.
@@ -21,6 +20,7 @@ export interface ConfigCheckOk {
 	readonly path: string;
 	readonly channels: readonly string[];
 	readonly openChannels: readonly string[];
+	readonly mentionOpenChannels: readonly string[];
 }
 
 export interface ConfigCheckFailure {
@@ -59,6 +59,7 @@ export async function checkConfigFile(path: string): Promise<ConfigCheckResult> 
 			path,
 			channels,
 			openChannels: channels.filter((id) => config.channels?.[id]?.engagement === "open"),
+			mentionOpenChannels: channels.filter((id) => config.channels?.[id]?.engagement === "mention-open"),
 		};
 	} catch (error) {
 		return {
@@ -72,10 +73,10 @@ export async function checkConfigFile(path: string): Promise<ConfigCheckResult> 
 
 export function renderConfigCheck(result: ConfigCheckResult): string[] {
 	if (!result.ok) return [`FAIL ${result.path}`, `  ${result.code}: ${result.message}`];
-	const mentionOnly = result.channels.length - result.openChannels.length;
+	const closed = result.channels.length - result.openChannels.length - result.mentionOpenChannels.length;
 	return [
 		`OK ${result.path}`,
-		`  channels: ${result.channels.length} (open ${result.openChannels.length}, mention-only ${mentionOnly})`,
+		`  channels: ${result.channels.length} (open ${result.openChannels.length}, mention-open ${result.mentionOpenChannels.length}, closed/default ${closed})`,
 		"  channel policy applies at gateway start only: restart, then confirm the new pid started after this file's mtime.",
 	];
 }

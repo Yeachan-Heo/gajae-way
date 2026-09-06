@@ -1,5 +1,5 @@
 import type { Dirent } from "node:fs";
-import { appendFile, mkdir, readdir, readFile, realpath, rename, stat, writeFile } from "node:fs/promises";
+import { appendFile, mkdir, readdir, readFile, realpath, rename, stat, unlink, writeFile } from "node:fs/promises";
 import { isAbsolute, join, normalize, relative } from "node:path";
 import { type AxisDescriptor, type AxisRegistry, loadRegistry, RECENT_INDEX_CAP, TREE_INDEX_CAP } from "./registry";
 
@@ -18,10 +18,41 @@ function gitEnv(): Record<string, string> {
 	};
 }
 
+/**
+ * One git operation per corpus at a time. The closure queue (intent commits),
+ * the autolink sweep and any other in-process writer each run `add` then
+ * `commit` as separate commands on the SAME repository; interleaved, one of
+ * them finds the other's `.git/index.lock` and fails (live: 100 `memory git add
+ * failed: index.lock exists`, gaebal, 2026-09-05). Git's lock is per-process,
+ * not per-caller, so the serialization has to be ours.
+ */
+const rootChains = new Map<string, Promise<void>>();
+
 export async function memoryGit(root: string, args: readonly string[]): Promise<string> {
+	const previous = rootChains.get(root) ?? Promise.resolve();
+	let release!: () => void;
+	const gate = new Promise<void>((resolve) => {
+		release = resolve;
+	});
+	const chain = previous.then(() => gate);
+	rootChains.set(root, chain);
+	await previous;
+	try {
+		return await memoryGitUnserialized(root, args);
+	} finally {
+		release();
+		if (rootChains.get(root) === chain) rootChains.delete(root);
+	}
+}
+
+/** git's lock file; an orphan (no live git on this repo) blocks every later write until removed by hand. */
+const INDEX_LOCK_RE = /Unable to create '(.+?\/\.git\/index\.lock)': File exists/;
+
+async function memoryGitUnserialized(root: string, args: readonly string[]): Promise<string> {
 	// posix_spawn can transiently fail with ENOENT/EAGAIN on a busy host even
 	// though git exists (observed under parallel test load); one bounded retry
 	// keeps a durable closure from failing on a scheduler hiccup.
+	let lockCleared = false;
 	for (let attempt = 0; ; attempt++) {
 		let child: ReturnType<typeof Bun.spawn>;
 		try {
@@ -38,10 +69,33 @@ export async function memoryGit(root: string, args: readonly string[]): Promise<
 			new Response(child.stderr as ReadableStream).text(),
 			child.exited,
 		]);
-		if (code !== 0) throw new Error(`memory git ${args[0]} failed: ${stderr.trim()}`);
-		return stdout.trim();
+		if (code === 0) return stdout.trim();
+		// Serialized above, so a lock we run into was left by a git that died
+		// (killed mid-commit on a restart, or a persona tool call). Wait long
+		// enough for a legitimately running git to finish, then treat a lock
+		// that is still there and older than that wait as orphaned. Once.
+		const lockPath = INDEX_LOCK_RE.exec(stderr)?.[1];
+		if (lockPath && !lockCleared) {
+			lockCleared = true;
+			await Bun.sleep(ORPHANED_LOCK_GRACE_MS);
+			try {
+				const age = Date.now() - (await stat(lockPath)).mtimeMs;
+				if (age >= ORPHANED_LOCK_GRACE_MS) {
+					await unlink(lockPath);
+					console.error(`memory git: removed orphaned ${lockPath} (age ${Math.round(age / 1000)}s)`);
+					continue;
+				}
+			} catch {
+				// Gone meanwhile: the retry below decides.
+				continue;
+			}
+		}
+		throw new Error(`memory git ${args[0]} failed: ${stderr.trim()}`);
 	}
 }
+
+/** Longer than any git op on a memory corpus should take; shorter than a monitor tick. */
+const ORPHANED_LOCK_GRACE_MS = 5_000;
 
 /**
  * Bring a corpus up to the current axis set, creating only what is missing.

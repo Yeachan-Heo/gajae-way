@@ -44,6 +44,16 @@ export {
 	type WorkRunResult,
 } from "./catalog";
 export {
+	type ChannelEngagementDecision,
+	type ChannelEngagementInput,
+	type ChannelEngagementPolicy,
+	ENGAGEMENT_AUDIENCES,
+	ENGAGEMENT_MODES,
+	type EngagementAudience,
+	type EngagementMode,
+	evaluateChannelEngagement,
+} from "./engagement";
+export {
 	ERROR_CODES,
 	type ErrorCode,
 	isErrorCode,
@@ -92,6 +102,7 @@ export {
 	reactionAllowlistFor,
 	resolveReactionEmoji,
 } from "./reactions";
+export { parseRuntimeConfig, type RuntimeConfig, RuntimeConfigError } from "./runtime-config";
 export {
 	CAPABILITIES,
 	type Capability,
