@@ -44,7 +44,7 @@ test("mention allowlist gates group mention commands and DMs but never open chan
 		logVerbosity: "info" as const,
 		mentionAllowlist: ["owner-1"],
 	};
-	const channel = { platform: "discord", kind: "channel", conversationId: "c1" };
+	const channel = { platform: "discord", kind: "channel", conversationId: "c1" } as const;
 	const allowed = { mentioned: true, group: true, authorId: "owner-1" };
 	const stranger = { mentioned: true, group: true, authorId: "intruder-9" };
 	expect(decideEngagement(channel, allowed, base as never).engaged).toBe(true);
@@ -55,7 +55,7 @@ test("mention allowlist gates group mention commands and DMs but never open chan
 		decideEngagement(channel, { mentioned: false, group: true, authorId: "intruder-9" }, open as never).engaged,
 	).toBe(true);
 	// DMs are authorised like anything else: allowlisted in, stranger out.
-	const dm = { platform: "discord", kind: "dm", conversationId: "d1", peerId: "p" };
+	const dm = { platform: "discord", kind: "dm", conversationId: "d1", peerId: "p" } as const;
 	expect(decideEngagement(dm, stranger, base as never).engaged).toBe(false);
 	expect(decideEngagement(dm, { mentioned: false, group: false, authorId: "owner-1" }, base as never).engaged).toBe(
 		true,
@@ -72,7 +72,7 @@ test("bot authors never get the open-channel free pass; a bot mention still enga
 		logVerbosity: "info" as const,
 		mentionAllowlist: ["owner-1", "sibling-bot"],
 	};
-	const channel = { platform: "discord", kind: "channel", conversationId: "c1" };
+	const channel = { platform: "discord", kind: "channel", conversationId: "c1" } as const;
 	const open = { ...base, channels: { c1: { engagement: "open" as const } } };
 	// Sibling-bot chatter (progress spam, replies to each other) must not burn turns.
 	expect(

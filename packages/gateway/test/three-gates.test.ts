@@ -6,7 +6,7 @@ import { BotAudienceTurnGuard, decideEngagement } from "../src/engagement/policy
 
 const OWNER = "660473980301344768";
 const STRANGER = "999999999999999999";
-const CHANNEL = { platform: "discord", kind: "channel", conversationId: "c1" };
+const CHANNEL = { platform: "discord", kind: "channel", conversationId: "c1" } as const;
 
 function config(overrides: Partial<GatewayConfig> = {}): GatewayConfig {
 	return {
@@ -113,7 +113,7 @@ describe("closed", () => {
 });
 
 test("a Discord thread inherits its parent channel policy unless explicitly overridden", () => {
-	const thread = { ...CHANNEL, kind: "thread", conversationId: "t1", parentId: "c1" };
+	const thread = { ...CHANNEL, kind: "thread", conversationId: "t1", parentId: "c1" } as const;
 	const inherited = config(gate("open", "all"));
 	expect(decideEngagement(thread, ctx({ authorIsBot: true }), inherited).engaged).toBe(true);
 	const overridden = config({
@@ -152,7 +152,7 @@ describe("default", () => {
 });
 
 describe("direct messages", () => {
-	const DM = { platform: "discord", kind: "dm", conversationId: "d1" };
+	const DM = { platform: "discord", kind: "dm", conversationId: "d1" } as const;
 	const ALLOWED = "111111111111111111";
 
 	test("a stranger gets no turn under the default policy", () => {
