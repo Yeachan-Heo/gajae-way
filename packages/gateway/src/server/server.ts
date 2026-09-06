@@ -410,6 +410,7 @@ async function settleMemory(runtime: Runtime): Promise<void> {
 
 function createRuntime(options: GatewayServerOptions): Runtime {
 	const sessionPort = options.sessionPort;
+	const broker = options.broker;
 	const connections = new Set<Connection>();
 	const inbound = new Map<string, InboundContext>();
 	const delivery = new DeliveryService(new DeliveryLedger(options.database));
@@ -424,6 +425,15 @@ function createRuntime(options: GatewayServerOptions): Runtime {
 		sessionModel: options.config.model,
 		stallTimeoutMs: options.config.stallTimeoutMs,
 		brokerGeneration: () => options.broker?.generation ?? 0,
+		brokerGeneration: () => broker?.generation ?? 0,
+		// Session-index deletes stay OFF on every gjc so far. 0.16.6 (gajae-code
+		// #5382) was expected to scope a refused delete's uncertain marker to its
+		// own session, but on the first sweep with deletes enabled (local,
+		// 2026-09-08: 95 deleted, 179 refused as terminal_uncertain/cleanup_pending)
+		// the broker again refused EVERY session.create with terminal_uncertain
+		// until the lifecycle ledger was archived by hand. Until a gjc proves the
+		// fence is session-scoped under a real sweep, the GC only measures.
+		gcDeletes: false,
 		onTurnStart: async (input) => await createInboundTurnLifecycle(input, options, runtime),
 		// A steer whose acceptance was learnt after its turn's lifecycle is gone
 		// (resolved at terminal or after a restart) is finalized exactly like a
@@ -437,6 +447,25 @@ function createRuntime(options: GatewayServerOptions): Runtime {
 		},
 		onInboundDiscard: (messageIds) => {
 			for (const messageId of messageIds) inbound.delete(messageId);
+		},
+		brokerLiveness: broker ? () => broker.judgeLiveness() : undefined,
+		// The trigger is still pending; the conversation is told the real cause
+		// (wedged daemon since <ts>, or plain sdk unavailable) instead of silence
+		// or a bare "Prompt submission failed" (#174). Loopback callers read the
+		// operator log. The delivery id is derived from the trigger so a restart
+		// replaying the same streak cannot post the notice twice.
+		onBindHold: ({ trigger, notice }) => {
+			const origin = validateOriginRef(JSON.parse(trigger.origin_ref_json) as typeof LOOPBACK_ORIGIN);
+			if (origin.platform === "loopback") return;
+			const context = runtime.inbound.get(trigger.message_id);
+			const payload = runtime.delivery.prepare(
+				context?.turnId ?? crypto.randomUUID(),
+				origin,
+				notice,
+				undefined,
+				deterministicBindHoldDeliveryId(trigger.origin_key, trigger.message_id),
+			);
+			if (payload) broadcastDelivery(runtime, payload);
 		},
 	});
 	const monitors = new MonitorPropagator({
@@ -1904,6 +1933,11 @@ function broadcastDelivery(runtime: Runtime, payload: ChatMessagePayload): void 
 	runtime.delivery.markInflight(payload.deliveryId as string);
 	for (const recipient of runtime.connections)
 		if (recipient.negotiated) recipient.write({ v: PROFILE_VERSION, type: "event", event: "chat.message", payload });
+}
+
+/** One bind-hold notice per pending trigger, stable across gateway restarts (ledger dedupes by id). */
+function deterministicBindHoldDeliveryId(originKey: string, triggerMessageId: string): string {
+	return `gw-h-${createHash("sha256").update(`${originKey}|${triggerMessageId}|bind_hold`).digest("hex").slice(0, 32)}`;
 }
 
 /**

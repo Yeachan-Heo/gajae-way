@@ -3,6 +3,12 @@ import { readFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { basename, dirname, isAbsolute, join, normalize, resolve } from "node:path";
 import type { CliResult, CliRunner } from "@gajaeway/subsession";
+import {
+	BROKER_HEARTBEAT_TTL_MS,
+	type BrokerLivenessVerdict,
+	judgeBrokerLiveness,
+	type PidAliveProbe,
+} from "./broker-liveness";
 import { sanitizeDiagnostic } from "./rebind";
 
 export const MIN_GJC_VERSION = "0.15.6";
@@ -13,6 +19,138 @@ export type SpawnFn = typeof Bun.spawn;
 export type GjcCommandRunner = CliRunner;
 export type PidAliveProbe = (pid: number) => boolean | Promise<boolean>;
 export type BrokerGenerationListener = (generation: number) => void;
+
+export interface BrokerRestartBackoff {
+	readonly initialMs?: number;
+	readonly maxMs?: number;
+}
+
+export interface BrokerHealthContext {
+	readonly agentDir: string;
+	readonly cli: CliRunner;
+	/** Endpoint discovery the gjc daemon publishes at `<agentDir>/sdk/broker.json`. */
+	readonly discoveryPath: string;
+	readonly isPidAlive: PidAliveProbe;
+	readonly timeoutMs: number;
+	/** Reports a routed-but-rejected probe answer; liveness is unaffected. */
+	readonly onApplicationError?: (code: string) => void;
+}
+
+export type BrokerHealthProbe = (context: BrokerHealthContext) => boolean | Promise<boolean>;
+export type BrokerGenerationListener = (generation: number) => void;
+
+export interface BrokerSupervisorOptions {
+	/** Gateway-private root; state is nested beneath broker/<instanceId>. */
+	readonly home: string;
+	/** Durable database meta.instance_id, never an origin or a mutable display name. */
+	readonly instanceId: string;
+	/** One explicit persona host today; the lookup API keeps this boundary ready for more hosts. */
+	readonly personaHostId?: string;
+	/** The persona workspace is the working directory for agent-dir-bound gjc commands. */
+	readonly cwd?: string;
+	/**
+	 * Explicit agent directory (tests/tooling). Production always uses the
+	 * instance-private `<home>/broker/<instanceId>/agent`: pre-cutover stores
+	 * written by older gjc are not readable by the current runtime, so they are
+	 * never adopted; every origin binds a fresh session on first use.
+	 */
+	readonly agentDir?: string;
+	/**
+	 * Operator SSOT for provider/model configuration (`models.yml`,
+	 * `model-presets/`, `config.yml`). Defaults to `~/.gjc/agent`. Seeded into the
+	 * private agent dir on every start; set to `null` to disable seeding (tests).
+	 */
+	readonly ssotAgentDir?: string | null;
+	/** Process seam for gjc command execution; production uses Bun.spawn bound to Bun. */
+	readonly spawn?: SpawnFn;
+	/** Command seam used by preflight and CliRunner; production spawns gjc commands directly. */
+	readonly command?: GjcCommandRunner;
+	/** Health seam; production probes the daemon's published WebSocket endpoint (no process spawn). */
+	readonly healthProbe?: BrokerHealthProbe;
+	/** Stale-lock proof seam. */
+	readonly isPidAlive?: PidAliveProbe;
+	readonly healthIntervalMs?: number;
+	readonly healthProbeTimeoutMs?: number;
+	readonly readinessAttempts?: number;
+	readonly readinessDelayMs?: number;
+	readonly restartBackoff?: BrokerRestartBackoff;
+	readonly log?: (line: string) => void;
+}
+
+/** Dependencies accepted by boot; home, instance identity, and cwd are gateway-owned facts. */
+export type BrokerSupervisorDependencies = Omit<BrokerSupervisorOptions, "home" | "instanceId" | "cwd">;
+
+export interface PersonaBroker {
+	readonly personaHostId: string;
+	readonly agentDir: string;
+	readonly generation: number;
+	readonly cli: CliRunner;
+}
+
+type ActiveBroker = {
+	readonly generation: number;
+};
+
+type LockRecord = {
+	readonly pid: number;
+	readonly generation: number;
+};
+
+const DEFAULT_HEALTH_INTERVAL_MS = 5_000;
+const DEFAULT_HEALTH_PROBE_TIMEOUT_MS = 30_000;
+/** Consecutive failed periodic probes before a generation is fenced. A single slow probe under load must not retire every live turn. */
+const HEALTH_FAILURE_STRIKES = 3;
+/** Consecutive readiness attempts that find a live-looking endpoint failing the application probe before the daemon is retired. */
+const WEDGED_DAEMON_STRIKES = 3;
+/** Concurrent `gjc sdk` invocations per gateway; more only multiplies daemon spawn races. */
+const MAX_CONCURRENT_CLI = 4;
+/** How long a non-probe invocation waits for a fenced generation to recover before failing. */
+const BROKER_WAIT_MS = 60_000;
+
+export class GjcCliUnavailableError extends Error {
+	readonly code = "broker_unavailable";
+	constructor(message: string) {
+		super(`gjc sdk request failed: broker_unavailable (${message})`);
+	}
+}
+const DEFAULT_COMMAND_TIMEOUT_MS = 30_000;
+// The first agent-dir-scoped command auto-starts gjc's own broker daemon; give
+// its lifecycle launcher a moment to converge after the first successful probe.
+// Injected test probes define readiness themselves and skip this grace.
+const DEFAULT_STARTUP_STABILIZATION_MS = 500;
+const DEFAULT_READINESS_ATTEMPTS = 20;
+const DEFAULT_READINESS_DELAY_MS = 100;
+const DEFAULT_RESTART_INITIAL_MS = 250;
+const DEFAULT_RESTART_MAX_MS = 10_000;
+
+/**
+ * Session hosting is gjc's own concern: the first agent-dir-scoped `gjc sdk`
+ * command auto-starts a per-agent-dir broker daemon that owns session host
+ * children. The gateway therefore never spawns a host process; it isolates the
+ * persona broker by owning a PRIVATE agent dir and supervises that daemon by
+ * observing it (health, generation fencing), not by owning its process. Stage 0
+ * (artifacts/p2b-issue92-capability-report.md) reached this daemon through its
+ * then-public `broker-internal` entrypoint; gjc >= 0.16.0 no longer exposes it
+ * on the CLI surface, which is why observation is the only portable contract.
+ */
+export function brokerHealthArgs(): readonly string[] {
+	// Exact-empty lookup: proves the broker can execute session.list while
+	// guaranteeing a one-row-or-empty result, so it can NEVER allocate a
+	// continuation cursor regardless of how many sessions exist. The old `{}`
+	// probe leaked one cursor every 5s after the index exceeded 100 sessions and
+	// exhausted the 32-slot pool in under three minutes.
+	return [
+		"sdk",
+		"session",
+		"raw",
+		"global",
+		"--op",
+		"session.list",
+		"--json-input",
+		JSON.stringify({ resolveSessionId: HEALTH_PROBE_SESSION_ID }),
+	];
+}
+
 export type BrokerDiscovery = {
 	readonly pid: number;
 	readonly url: string;
@@ -282,6 +420,22 @@ export class GlobalGjcClient {
 	}
 	get gjcVersion(): string | undefined {
 		return this.#gjcVersion;
+
+	/**
+	 * Judges the daemon from its own discovery file, bypassing the SDK CLI.
+	 * Used by the persona actor to tell a wedged daemon (dead pid, frozen
+	 * heartbeat, lock tree gjc cannot quarantine) from a transient outage.
+	 */
+	judgeLiveness(): Promise<BrokerLivenessVerdict> {
+		return judgeBrokerLiveness(this.discoveryPath, this.#isPidAlive);
+	}
+
+	/** Explicit one-host lookup; callers cannot accidentally select a per-origin broker. */
+	brokerFor(personaHostId: string): PersonaBroker {
+		if (personaHostId !== this.personaHostId) {
+			throw new Error(`no broker is registered for persona host ${personaHostId}`);
+		}
+		return this;
 	}
 	onGeneration(listener: BrokerGenerationListener): () => void {
 		this.#listeners.add(listener);

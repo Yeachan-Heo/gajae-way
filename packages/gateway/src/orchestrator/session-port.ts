@@ -231,6 +231,12 @@ const SESSION_CREATE_READINESS_MS = 60_000;
 const SESSION_READY_TIMEOUT_MS = 60_000;
 const SESSION_READY_POLL_MS = 250;
 const SESSION_CREATE_RETRY_MS = 1_000;
+/** Maximum poisoned-create-key epoch rotations permitted per origin. */
+export const MAX_POISONED_CREATE_ROTATIONS = 3;
+
+function createRotationMetaKey(originKey: string): string {
+	return `create_rotation:${originKey}`;
+}
 
 /**
  * Production SessionPort implementation. The broker-bound CliRunner is the sole
@@ -303,12 +309,19 @@ export class BrokerSessionPort implements SessionPort {
 				if (envelope.ok === true && envelope.result?.session?.live === false) {
 					if (envelope.result.session.deleted !== true) {
 						try {
-							return await this.resume({
+							const resumed = await this.resume({
 								sessionId: existing.sessionId,
 								repo: input.repo,
 								originKey: input.originKey,
 								epoch: input.epoch,
 							});
+						} catch (error) {
+							if (error instanceof BrokerAuthorityError) throw error;
+							this.#database.metaSet(createRotationMetaKey(input.originKey), "0");
+							return resumed;
+						} catch {
+							this.#database.metaSet(createRotationMetaKey(input.originKey), "0");
+							return resumed;
 						} catch (error) {
 							if (error instanceof BrokerAuthorityError) throw error;
 							// Saved authority cannot be resumed: replace it below.
@@ -320,8 +333,10 @@ export class BrokerSessionPort implements SessionPort {
 				if (error instanceof BrokerAuthorityError) throw error;
 				indexed = true;
 			}
-			if (indexed)
+			if (indexed) {
+				this.#database.metaSet(createRotationMetaKey(input.originKey), "0");
 				return { sessionId: existing.sessionId, originKey: input.originKey, epoch: input.epoch, repo: input.repo };
+			}
 			const rebound = this.#database.rebindEpoch(input.originKey);
 			console.error(
 				`session_rebound origin=${input.originKey} epoch=${input.epoch} nextEpoch=${rebound} session=${existing.sessionId} reason=not_live_or_disowned_by_broker`,
@@ -335,6 +350,14 @@ export class BrokerSessionPort implements SessionPort {
 		} catch (error) {
 			if (error instanceof BrokerAuthorityError) throw error;
 			if (input.epochRecovery === false) throw error;
+			const rotations = this.#createRotations(input.originKey);
+			if (rotations >= MAX_POISONED_CREATE_ROTATIONS) {
+				console.error(
+					`session_create_rotation_capped origin=${input.originKey} epoch=${input.epoch} rotations=${rotations} reason=poisoned_create_key_capped`,
+				);
+				throw error;
+			}
+			this.#database.metaSet(createRotationMetaKey(input.originKey), String(rotations + 1));
 			const nextEpoch = this.#database.rebindEpoch(input.originKey);
 			console.error(
 				`session_create_epoch_rotated origin=${input.originKey} epoch=${input.epoch} nextEpoch=${nextEpoch} reason=poisoned_create_key`,
@@ -365,6 +388,7 @@ export class BrokerSessionPort implements SessionPort {
 		// a moment later. A tail/send before that answers session_unavailable, so
 		// wait until the broker reports the id live before handing the binding out.
 		await this.#awaitIndexed(created.sessionId, input.repo);
+		this.#database.metaSet(createRotationMetaKey(input.originKey), "0");
 		return {
 			sessionId: created.sessionId,
 			originKey: input.originKey,
@@ -372,6 +396,11 @@ export class BrokerSessionPort implements SessionPort {
 			repo: input.repo,
 			...(input.model ? { startupModelApplied: true } : {}),
 		};
+	}
+
+	#createRotations(originKey: string): number {
+		const value = Number.parseInt(this.#database.metaGet(createRotationMetaKey(originKey)) ?? "0", 10);
+		return Number.isSafeInteger(value) && value > 0 ? value : 0;
 	}
 
 	#createChain: Promise<unknown> = Promise.resolve();
