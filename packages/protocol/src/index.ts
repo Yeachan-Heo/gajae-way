@@ -92,6 +92,7 @@ export {
 	reactionAllowlistFor,
 	resolveReactionEmoji,
 } from "./reactions";
+export { parseRuntimeConfig, type RuntimeConfig, RuntimeConfigError } from "./runtime-config";
 export {
 	CAPABILITIES,
 	type Capability,

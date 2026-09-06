@@ -1771,16 +1771,37 @@ WHERE event_id = ? AND ${leasePredicate}`,
 		code: string,
 		detail: string,
 		now = Date.now(),
+		terminal = false,
 	): boolean {
 		return this.withTransaction(() => {
 			const changes = this.#database
 				.query(
-					`UPDATE monitor_events SET stage = 'failed', batch_id = ?, updated_at = ?
+					`UPDATE monitor_events SET stage = ?, batch_id = ?, updated_at = ?
 WHERE event_id = ? AND EXISTS (
 SELECT 1 FROM dispatch_leases l WHERE l.event_id = monitor_events.event_id AND l.lease_id = ? AND l.expires_at > ?
 )`,
 				)
-				.run(batchId, new Date(now).toISOString(), eventId, leaseId, new Date(now).toISOString()).changes;
+				.run(
+					terminal ? "failed_no_retry" : "failed",
+					batchId,
+					new Date(now).toISOString(),
+					eventId,
+					leaseId,
+					new Date(now).toISOString(),
+				).changes;
+			if (changes === 0) return false;
+			this.monitorFailureRecord(eventId, code, detail);
+			return true;
+		});
+	}
+	/** Terminalizes an event that cannot safely enter dispatch, with bounded public-safe evidence. */
+	monitorEventTerminalFail(eventId: string, code: string, detail: string): boolean {
+		return this.withTransaction(() => {
+			const changes = this.#database
+				.query(
+					"UPDATE monitor_events SET stage = 'failed_no_retry', updated_at = ? WHERE event_id = ? AND stage NOT IN ('delivered', 'authored_no_delivery', 'failed_no_retry')",
+				)
+				.run(new Date().toISOString(), eventId).changes;
 			if (changes === 0) return false;
 			this.monitorFailureRecord(eventId, code, detail);
 			return true;

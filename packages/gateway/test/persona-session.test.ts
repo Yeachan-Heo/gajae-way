@@ -267,6 +267,60 @@ test("a retired turn whose send never landed is released once its session dies, 
 	await eventually(() => database?.inboundPendingCount(KEY) === 0, "replacement turn did not complete");
 });
 
+/**
+ * Live 2026-09-05 (every main cutover from a schema-16 home): a BOUND trigger
+ * on disk pointed at a session the new broker has never heard of. Status came
+ * back adoptable, and the tail attach then threw
+ * `session tail failed: session_unavailable`, which crashed the actor's recovery
+ * and wedged the origin ("already has a nonterminal turn") until the row was
+ * hand-edited.
+ */
+test("startup recovery releases a bound turn whose tail attach is disowned instead of wedging the origin", async () => {
+	const port = new ScriptedSessionPort();
+	await harness(port);
+	enqueue("m-1", "orphaned by cutover");
+	await manager?.notifyInbound(KEY);
+	await eventually(() => port.sends.length === 1, "turn did not start");
+	const orphan = port.sends[0]!;
+	const opRef = latestOpRef;
+	await manager?.stop();
+	// The row as the old runtime left it: bound, never acknowledged.
+	database?.inboundTurnRequeue(opRef);
+	database?.inboundBindTurn({ messageId: "m-1", originKey: KEY, epoch: 0, opRef, sessionId: orphan.sessionId });
+	expect(database?.inboundTurnRow(opRef)).toMatchObject({ turn_state: "bound" });
+
+	const logs: string[] = [];
+	class DisowningTailPort extends ScriptedSessionPort {
+		override async attachTail(input: Parameters<ScriptedSessionPort["attachTail"]>[0]) {
+			if (input.sessionId === orphan.sessionId) throw new Error("session tail failed: session_unavailable");
+			return await super.attachTail(input);
+		}
+	}
+	const disowning = new DisowningTailPort({ onBind: (input) => `fresh-e${input.epoch}` });
+	disowning.seedOperation(opRef, orphan.sessionId, "in_flight");
+	// inspect/status still describe the session as live and the op as running
+	// (live shape: the id is indexed but the tail router disowns it).
+	disowning.setSessionState(orphan.sessionId, { repo: join(home, "workspace"), live: true, deleted: false });
+	manager = new PersonaSessionManager({
+		database: database!,
+		port: disowning,
+		instanceId: "instance-test",
+		repo: join(home, "workspace"),
+		log: (line) => logs.push(line),
+		onTurnStart: ({ trigger }) => ({ text: trigger.body }),
+	});
+	await manager.recover();
+	expect(logs.filter((line) => line.startsWith("recovery_turn_failed"))).toEqual([]);
+	expect(logs.some((line) => line.includes(`opRef=${opRef}`) && line.includes("reason=tail_attach_disowned"))).toBe(
+		true,
+	);
+	await eventually(() => disowning.sends.length === 1, "released trigger was not re-dispatched");
+	expect(disowning.sends[0]!.text).toBe("orphaned by cutover");
+	expect(disowning.sends[0]!.sessionId).not.toBe(orphan.sessionId);
+	expect(database?.getSessionRecord(KEY)?.epoch).toBe(1);
+	expect(manager.state(KEY)).toBe("turn-running");
+});
+
 test("startup recovery releases a retired bound turn the broker disowns instead of holding it forever", async () => {
 	const port = new GhostSendPort();
 	await harness(port);

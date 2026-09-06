@@ -566,6 +566,20 @@ class OriginActor {
 			try {
 				await this.#recoverTurn(turn);
 			} catch (error) {
+				// A BOUND (never acknowledged) turn whose session the broker disowns
+				// when the tail is attached has no operation anywhere: release it
+				// like the other disowned paths instead of crashing the actor. Every
+				// main cutover from a schema-16 home hit this (three boxes, 2026-09-05)
+				// and each needed the row hand-edited before the origin worked again.
+				if (turn.state === "bound" && sdkStatusErrorCode(error) === "session_unavailable") {
+					const attempt = this.#manager.database.inboundTurnRequeue(turn.opRef);
+					const retired = turn.epoch < this.#epoch();
+					const nextEpoch = retired ? this.#epoch() : this.#manager.database.rebindEpoch(this.originKey);
+					this.#manager.log(
+						`recovery_requeue_unaccepted origin=${this.originKey} epoch=${turn.epoch} nextEpoch=${nextEpoch} opRef=${turn.opRef} session=${turn.sessionId} attempt=${attempt} reason=tail_attach_disowned`,
+					);
+					continue;
+				}
 				// One unrecoverable turn must not abort recovery of the others.
 				this.#manager.log(
 					`recovery_turn_failed origin=${this.originKey} epoch=${turn.epoch} opRef=${turn.opRef} detail=${safeDiagnostic(error)}`,

@@ -343,8 +343,8 @@ export async function startUnixServer(options: GatewayServerOptions): Promise<Ga
 			await runtime.personaSessions.stop();
 			runtime.stopBrokerGenerationListener?.();
 			await runtime.monitorRuntime.stop();
-			// Cancels pending monitor burst timers so a closed database is never touched.
-			runtime.monitors.dispose();
+			// Drain claimed monitor writers before broker/database teardown (#64).
+			await runtime.monitors.drain();
 			// The broker has no recovery policy; it is only stopped after all current
 			// producers and monitor/tail-like runtime work have drained.
 			await options.broker?.stop();
@@ -447,8 +447,8 @@ export function startStdioServer(options: GatewayServerOptions): GatewayServer {
 			await runtime.personaSessions.stop();
 			runtime.stopBrokerGenerationListener?.();
 			await runtime.monitorRuntime.stop();
-			// Cancels pending monitor burst timers so a closed database is never touched.
-			runtime.monitors.dispose();
+			// Drain claimed monitor writers before broker/database teardown (#64).
+			await runtime.monitors.drain();
 			await options.broker?.stop();
 			connection.close();
 			await settleMemory(runtime);
@@ -1697,7 +1697,7 @@ async function createInboundTurnLifecycle(
 			: undefined;
 	const systemPreamble = [
 		await runtime.persona.systemPreamble(),
-		currentConversationNotice(origin, engagement),
+		currentConversationNotice(origin),
 		...(bootstrap ? [bootstrap.text] : []),
 		ATTACHMENT_SCOPE_NOTICE,
 		ACTION_GUARD_SYSTEM_NOTICE,
@@ -2091,7 +2091,7 @@ function broadcastDelivery(runtime: Runtime, payload: ChatMessagePayload): void 
  * tell which conversation it was in and imported other origins' memory as if
  * it had been said here).
  */
-function currentConversationNotice(origin: OriginRef, engagement?: { mentioned?: boolean }): string {
+function currentConversationNotice(origin: OriginRef): string {
 	const where =
 		origin.kind === "dm"
 			? `a PRIVATE direct-message conversation (${origin.platform} DM ${origin.conversationId}, peer ${origin.peerId})`
@@ -2102,11 +2102,14 @@ function currentConversationNotice(origin: OriginRef, engagement?: { mentioned?:
 		"## Current conversation",
 		`You are replying inside ${where}. This session is bound to exactly this one conversation.`,
 		`Shared memory (memory/daily and canonical axes) records EVERY conversation, each entry tagged with its origin. Entries whose canonical origin key differs from ${originKey(origin)} happened elsewhere: treat them as background knowledge only, never as something said here, and do not import their topics or in-flight work into this conversation unprompted.`,
+		// No per-turn "you were / were not addressed" verdict. Stamping every
+		// untagged message in an `open` room as "NOT addressed: default to [SILENT]"
+		// made the persona treat people talking to it as none of its business and go
+		// quiet on them (live, playground-ko, 2026-09-06). Whether to speak is the
+		// persona's judgement from the conversation; the runtime only names the tool.
 		...(origin.kind !== "dm" && origin.kind !== "loopback"
 			? [
-					engagement?.mentioned
-						? "You were explicitly addressed here: reply."
-						: "You were NOT addressed: you are listening in on a room. Unless this message clearly needs you or adds real value for you to answer, reply with exactly [SILENT] and nothing else — that suppresses delivery while the message stays recorded. Do not respond to every message.",
+					"To stay quiet on a message that is not for you, reply with exactly [SILENT] and nothing else — that suppresses delivery while the message stays recorded.",
 				]
 			: []),
 		// The third reply mode: acknowledge without speaking. Kept next to the silence

@@ -1,8 +1,15 @@
 import { lstat } from "node:fs/promises";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
-import { type OriginRef, validateOriginRef } from "@gajaeway/protocol";
+import {
+	type OriginRef,
+	parseRuntimeConfig as parseSharedRuntimeConfig,
+	type RuntimeConfig,
+	RuntimeConfigError,
+	validateOriginRef,
+} from "@gajaeway/protocol";
 
+export type { RuntimeConfig } from "@gajaeway/protocol";
 export const CONFIG_SCHEMA_VERSION = 1;
 
 export interface CredentialFileReference {
@@ -66,6 +73,7 @@ export interface GatewayConfigFile {
 	readonly webhook?: { readonly bind?: string; readonly port: number; readonly exposeNonLoopback?: boolean };
 	readonly watcherRoots?: readonly string[];
 	readonly scriptRoot?: string;
+	readonly runtime?: RuntimeConfig;
 }
 
 export interface GatewayConfig extends GatewayConfigFile {
@@ -179,6 +187,15 @@ function parseServiceTier(value: unknown): GjcServiceTier | undefined {
 	if (typeof value !== "string" || !GJC_SERVICE_TIERS.includes(value as GjcServiceTier))
 		throw new ConfigError("config_invalid", `serviceTier must be one of ${GJC_SERVICE_TIERS.join(", ")}`);
 	return value as GjcServiceTier;
+}
+
+export function parseRuntimeConfig(value: unknown): RuntimeConfig | undefined {
+	try {
+		return parseSharedRuntimeConfig(value);
+	} catch (error) {
+		if (error instanceof RuntimeConfigError) throw new ConfigError("config_invalid", error.message);
+		throw error;
+	}
 }
 
 function parseCredentials(value: unknown): Readonly<Record<string, CredentialFileReference>> | undefined {
@@ -315,6 +332,7 @@ export function parseConfigFile(value: unknown): GatewayConfigFile {
 	}
 	const model = parseModel(input.model);
 	const serviceTier = parseServiceTier(input.serviceTier);
+	const runtime = parseRuntimeConfig(input.runtime);
 	return {
 		schemaVersion: CONFIG_SCHEMA_VERSION,
 		...(logVerbosity ? { logVerbosity: logVerbosity as GatewayConfigFile["logVerbosity"] } : {}),
@@ -327,6 +345,7 @@ export function parseConfigFile(value: unknown): GatewayConfigFile {
 		...(input.webhook === undefined ? {} : { webhook: parseWebhook(input.webhook) }),
 		...(input.watcherRoots === undefined ? {} : { watcherRoots: parseStringArray(input.watcherRoots, "watcherRoots") }),
 		...(input.scriptRoot === undefined ? {} : { scriptRoot: optionalString(input.scriptRoot, "scriptRoot") }),
+		...(runtime === undefined ? {} : { runtime }),
 		...(input.mentionAllowlist === undefined
 			? {}
 			: { mentionAllowlist: parseStringArray(input.mentionAllowlist, "mentionAllowlist") }),
@@ -453,6 +472,7 @@ export const RESTART_REQUIRED_FIELDS = [
 	"webhook",
 	"watcherRoots",
 	"scriptRoot",
+	"runtime",
 	"ownerTarget",
 	"monitorContextFailureRollThreshold",
 ] as const;

@@ -88,6 +88,8 @@ The Discord adapter has a separate `$GAJAEWAY_HOME/adapter-discord.json` because
 }
 ```
 
+On startup and gateway reconnect, the adapter backfills each configured Discord channel, its active threads, and recent archived threads whose last activity is within 30 days. DMs cannot be enumerated through Discord, so live DM ingress records a bounded recovery set before `chat.send`; the adapter retains at most 100 DM conversations and expires entries after 30 days. Progress is stored atomically in `$GAJAEWAY_HOME/adapters/discord/recovery-cursor.json`. A missing-access or deleted conversation keeps its watermark and is retried twice, then quarantined on the third unreadable result so healthy conversations can finish; a later reconnect probes it and re-admits it when history is readable again. Message-id dedupe in the gateway makes live/recovery races and restart resumes exactly-once.
+
 Keep token files out of version control and restrict their permissions. Replace a token file and restart the relevant service to rotate it.
 
 ## Service manager: launchd example
