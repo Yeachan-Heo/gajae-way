@@ -147,8 +147,12 @@ export function autolinkText(
 
 	// One alternation scans the body once. The former alias-by-alias regex loop
 	// was O(aliases × file bytes), monopolising the gateway event loop on the
-	// production corpus even though the surrounding file loop yielded.
-	const pattern = new RegExp(eligible.map((entry) => escapePattern(entry.alias)).join("|"), "giu");
+	// production corpus even though the surrounding file loop yielded. Keeping
+	// the boundaries in the regex is significant: when a longer alternative has
+	// an invalid suffix, the engine can backtrack to a shorter valid alias at the
+	// same offset instead of consuming and rejecting the longer text afterward.
+	const alternatives = eligible.map((entry) => escapePattern(entry.alias)).join("|");
+	const pattern = new RegExp(`(?<![\\p{L}\\p{N}_])(?:${alternatives})(?![A-Za-z0-9_])`, "giu");
 	const first = new Map<string, { start: number; end: number }>();
 	for (const match of text.matchAll(pattern)) {
 		const alias = normalizeAlias(match[0]);
@@ -156,9 +160,6 @@ export function autolinkText(
 		const start = match.index;
 		const end = start + match[0].length;
 		if (inRanges(ranges, start, end)) continue;
-		const before = text[start - 1] ?? " ";
-		const after = text[end] ?? " ";
-		if (/[\p{L}\p{N}_]/u.test(before) || /[A-Za-z0-9_]/.test(after)) continue;
 		first.set(alias, { start, end });
 	}
 

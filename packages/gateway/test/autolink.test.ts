@@ -45,6 +45,27 @@ test("autolinkText wraps first plain mention only and respects protected regions
 	expect(autolinkText(out, "ops/rules/some.md", index).added).toBe(0);
 });
 
+test("autolinkText falls back to a shorter alias when a longer alternative has an invalid suffix", () => {
+	const index = [
+		{ alias: "foo bar", path: "projects/long.md" },
+		{ alias: "foo", path: "projects/short.md" },
+	];
+	const fallback = autolinkText("foo barx", "notes/source.md", index);
+	expect(fallback.added).toBe(1);
+	expect(fallback.text).toBe("[foo](../projects/short.md) barx");
+
+	const longest = autolinkText("foo bar.", "notes/source.md", index);
+	expect(longest.added).toBe(1);
+	expect(longest.text).toBe("[foo bar](../projects/long.md).");
+});
+
+test("autolinkText case-folds aliases while preserving unicode prefix and CJK suffix boundaries", () => {
+	const index = [{ alias: "foo", path: "projects/foo.md" }];
+	const result = autolinkText("αFOO is embedded; FoO를 link.", "notes/source.md", index);
+	expect(result.added).toBe(1);
+	expect(result.text).toBe("αFOO is embedded; [FoO](../projects/foo.md)를 link.");
+});
+
 test("autolinkCorpus sweeps the corpus, skips raw daily, and reports counts", async () => {
 	const home = await mkdtemp(join(tmpdir(), "gajaeway-autolink-"));
 	try {
