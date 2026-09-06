@@ -26,7 +26,7 @@ import {
 	operationLostNotice,
 } from "./hold-policy";
 import { type TranscriptSnapshot, TranscriptIncompleteError } from "./session-channel";
-import { renderPrompt, type SessionBinding, type SessionPort } from "./session-port";
+import { renderPrompt, type SessionBinding, type SessionPort, ChannelUnavailableError } from "./session-port";
 import {
 	deterministicInterimDeliveryId,
 	TailCapacityError,
@@ -931,7 +931,10 @@ class OriginActor {
 		sessionId: string,
 	): Promise<{ readonly session: BrokerSession | undefined; readonly failed: boolean }> {
 		try {
-			return { session: await this.#manager.port.inspect({ sessionId, repo: this.#manager.repo }), failed: false };
+			return {
+				session: await this.#manager.port.inspect({ sessionId, repo: this.#manager.repo, recovery: true }),
+				failed: false,
+			};
 		} catch {
 			return { session: undefined, failed: true };
 		}
@@ -942,7 +945,7 @@ class OriginActor {
 		opRef: string,
 	): Promise<StatusReport & { unreachable?: boolean; unreachableCode?: string }> {
 		try {
-			return await this.#manager.port.status({ sessionId, repo: this.#manager.repo, opRef });
+			return await this.#manager.port.status({ sessionId, repo: this.#manager.repo, opRef, recovery: true });
 		} catch (error) {
 			// Transport/session-unreachable, as opposed to a reachable runtime that
 			// reported an undecidable operation state. `session_unavailable` is the
@@ -1072,6 +1075,8 @@ class OriginActor {
 			opRef,
 			sessionId: binding.sessionId,
 		});
+		const stamp = this.#manager.port.transportStamp?.(binding.sessionId) ?? { transport: "cli" as const, cold: true };
+		this.#manager.database.turnAttemptStampTransport(opRef, stamp.transport, stamp.cold);
 		const turn: InboundTurn = {
 			originKey: this.originKey,
 			epoch,
@@ -1214,6 +1219,30 @@ class OriginActor {
 			this.#bindFailures = 0;
 			this.#bindEpochPoisoned = false;
 		} catch (error) {
+			// I9b: a zero-byte channel refusal (`channel_capacity_exhausted` /
+			// `channel_unavailable` with bytesWritten=0) is positive non-admission
+			// proof (NA1): the attempt is marked pre_write_failure, the row returns to
+			// pending without a new inbound ordinal, and dispatch retries with backoff.
+			// Never a CLI fallback spawn.
+			if (error instanceof ChannelUnavailableError) {
+				await tail.close();
+				this.#manager.database.turnAttemptMarkPreWriteFailure(opRef);
+				this.#manager.database.inboundTurnUnbindPreSend(opRef);
+				this.#current = undefined;
+				this.#state = "idle";
+				await this.#notifyReleased(current);
+				this.#bindFailures += 1;
+				this.#manager.log(
+					`persona_send_channel_refused origin=${this.originKey} epoch=${epoch} opRef=${opRef} code=${error.code} attempt=${this.#bindFailures}`,
+				);
+				this.#scheduleDispatchRetry(
+					Math.min(
+						DISPATCH_FAILURE_RETRY_MAX_MS,
+						DISPATCH_FAILURE_RETRY_MS * 2 ** Math.min(this.#bindFailures - 1, 10),
+					),
+				);
+				return;
+			}
 			// `session_disowned_dead` is produced only after #resumeUnavailable proved
 			// the saved session deleted or unresumable (I3): the Router never owned
 			// this request, so the prompt provably never landed and nothing is
@@ -1613,6 +1642,7 @@ class OriginActor {
 		const existing = this.#manager.database.getSessionRecord(this.originKey);
 		if (existing?.epoch === epoch && existing.sessionId) {
 			const binding = { sessionId: existing.sessionId, originKey: this.originKey, epoch, repo: this.#manager.repo };
+			if (this.#manager.port.residentHealthy?.(existing.sessionId)) return binding;
 			// An idle binding may point at a session the broker no longer hosts
 			// (broker restart while idle). Dead + saved authority is resumed through
 			// the unchanged decision table's `session.resume` branch BEFORE any send;

@@ -51,6 +51,8 @@ export interface GatewayStatusResult {
 		readonly lastRetireReason: string | undefined;
 		readonly cliSpawnsTotal: number;
 		readonly residentChannels: number;
+		readonly channelRestarts?: number;
+		readonly channelFaults?: number;
 	};
 	/** I7a: last-hour terminal turn outcomes. */
 	readonly turns?: {

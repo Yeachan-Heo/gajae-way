@@ -65,13 +65,13 @@ export class RuntimeCycleProjector {
 	readonly #database: GatewayDatabase;
 	readonly #memory: { readonly queueDepth: number };
 
-	readonly #extraGates: () => readonly CycleGateReason[];
+	readonly #extraGates: (now: Date) => readonly CycleGateReason[];
 
 	constructor(
 		database: GatewayDatabase,
 		memory: { readonly queueDepth: number },
 		/** I7a: runtime-only gate sources (provider health, broker supervision, channel) that are not durable rows. */
-		extraGates: () => readonly CycleGateReason[] = () => [],
+		extraGates: (now: Date) => readonly CycleGateReason[] = () => [],
 	) {
 		this.#database = database;
 		this.#memory = memory;
@@ -85,7 +85,7 @@ export class RuntimeCycleProjector {
 		const held = this.#database
 			.listHolds()
 			.filter((hold) => hold.deadline !== null && Date.parse(hold.deadline) <= now.getTime());
-		const extra = new Set<CycleGateReason>(this.#extraGates());
+		const extra = new Set<CycleGateReason>(this.#extraGates(now));
 		if (held.length > 0) extra.add("turn_held_over_deadline");
 		if (extra.size === 0) return projected;
 		const gates = [...new Set<CycleGateReason>([...projected.gates, ...extra])];

@@ -1181,6 +1181,12 @@ export class GatewayDatabase {
 		);
 	}
 
+	turnAttemptStampTransport(opRef: string, transport: "cli" | "channel", cold: boolean): void {
+		this.#database
+			.query("UPDATE turn_attempts SET transport = ?, cold = ? WHERE op_ref = ? AND send_state = 'pending_write'")
+			.run(transport, cold ? 1 : 0, opRef);
+	}
+
 	turnAttemptState(opRef: string): { sendState: string; admission: string } | undefined {
 		const row = this.#database
 			.query<{ send_state: string; admission: string }, [string]>(

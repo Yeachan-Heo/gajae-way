@@ -230,7 +230,9 @@ export async function main(args = process.argv.slice(2)): Promise<void> {
 				break;
 			case "daemon":
 				if (parsed.rest[0] === "run")
-					console.log("Launch the gateway out-of-band with: bun packages/gateway/src/main.ts daemon");
+					console.log(
+						`Launch the gateway out-of-band with: bun packages/gateway/src/main.ts daemon --transport ${(await import("../../gateway/src/config").then(({ loadConfig, transportFlag }) => loadConfig({ overrides: { transport: transportFlag(parsed.rest) } }))).transport}`,
+					);
 				else throw new Error("usage: gajaeway daemon run");
 				break;
 			case "holds": {

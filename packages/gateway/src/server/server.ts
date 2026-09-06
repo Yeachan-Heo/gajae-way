@@ -208,6 +208,7 @@ async function settleConnection(connection: Connection, timeoutMs: number): Prom
 }
 
 export interface GatewayServerOptions {
+	readonly transport?: "cli" | "channel";
 	readonly config: GatewayConfig;
 	readonly database: GatewayDatabase;
 	/** Production and tests both inject the sole broker-backed turn transport. */
@@ -217,6 +218,12 @@ export interface GatewayServerOptions {
 	readonly persona?: PersonaLoader;
 	/** Broker ownership is released after request/turn/tail-like runtime work has drained. */
 	readonly broker?: BrokerSupervisor;
+	readonly tailRunner?: {
+		readonly residentChannels: number;
+		readonly channelRestarts: number;
+		readonly channelFaults: number;
+		readonly lastChannelFaultAt: number | undefined;
+	};
 	/** Per-process CLI overrides, reapplied on every live reload so they survive it. */
 	readonly overrides?: ConfigOverrides;
 	/** Test seam for chat.progress throttling; production uses the 15s defaults. */
@@ -503,7 +510,7 @@ export function startStdioServer(options: GatewayServerOptions): GatewayServer {
 const SHUTDOWN_EXIT_HEADROOM_MS = 1_500;
 
 /** I7a: supervision view for status; tolerant of partial broker doubles in tests. */
-function brokerStatus(broker: GatewayServerOptions["broker"]) {
+export function brokerStatus(broker: GatewayServerOptions["broker"], tailRunner?: GatewayServerOptions["tailRunner"]) {
 	const view = broker as
 		| {
 				generation?: number;
@@ -511,6 +518,9 @@ function brokerStatus(broker: GatewayServerOptions["broker"]) {
 				lastHostAudit?: unknown;
 				residentChannels?: number;
 				cliSpawnsTotal?: number;
+				lastRetireReason?: string;
+				channelRestarts?: number;
+				channelFaults?: number;
 		  }
 		| undefined;
 	return {
@@ -518,10 +528,20 @@ function brokerStatus(broker: GatewayServerOptions["broker"]) {
 		healthy: (view?.generation ?? 0) > 0,
 		liveStrikes: 0,
 		serviceabilityStrikes: view?.serviceabilityStrikes ?? 0,
-		lastRetireReason: undefined,
+		lastRetireReason: view?.lastRetireReason,
 		cliSpawnsTotal: view?.cliSpawnsTotal ?? 0,
-		residentChannels: view?.residentChannels ?? 0,
+		residentChannels: tailRunner?.residentChannels ?? view?.residentChannels ?? 0,
+		channelRestarts: tailRunner?.channelRestarts ?? view?.channelRestarts ?? 0,
+		channelFaults: tailRunner?.channelFaults ?? view?.channelFaults ?? 0,
 	};
+}
+
+export function channelCycleGates(
+	tailRunner: GatewayServerOptions["tailRunner"],
+	now: Date,
+): Array<"channel_degraded"> {
+	const faultAt = tailRunner?.lastChannelFaultAt;
+	return faultAt !== undefined && now.getTime() - faultAt < 10 * 60_000 ? ["channel_degraded"] : [];
 }
 
 function summarizeTurns(outcomes: readonly { at: number; ok: boolean; code?: string }[]) {
@@ -776,8 +796,11 @@ function createRuntime(options: GatewayServerOptions): Runtime {
 		contextMaintenanceTimer,
 		...(stopBrokerGenerationListener ? { stopBrokerGenerationListener } : {}),
 		reactions: new ReactionBudget(),
-		cycle: new RuntimeCycleProjector(options.database, memory, () => {
-			const gates: Array<"provider_failing" | "broker_degraded"> = [];
+		cycle: new RuntimeCycleProjector(options.database, memory, (now) => {
+			const gates: Array<"provider_failing" | "broker_degraded" | "channel_degraded"> = channelCycleGates(
+				options.tailRunner,
+				now,
+			);
 			if (provider.gated) gates.push("provider_failing");
 			const brokerView = options.broker as { serviceabilityStrikes?: number; generation?: number } | undefined;
 			if (brokerView && (brokerView.serviceabilityStrikes ?? 0) > 0) gates.push("broker_degraded");
@@ -884,10 +907,10 @@ async function handleRequest(
 					contextDiff: options.database.contextDiagnostics(),
 					holds: options.database.listHolds(),
 					rotations: options.database.epochRotationSummary(Date.now() - 24 * 60 * 60 * 1_000),
-					broker: brokerStatus(options.broker),
+					broker: brokerStatus(options.broker, options.tailRunner),
 					turns: { last1h: summarizeTurns(runtime.turnOutcomes) },
 					provider: runtime.provider.status(),
-					transport: "cli" as const,
+					transport: options.transport ?? options.config.transport ?? "cli",
 				},
 			});
 			return;

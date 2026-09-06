@@ -171,7 +171,7 @@ function summarizeTail(result: CommandResult): Record<string, unknown> {
 		checkpoint: payload?.checkpoint,
 		gap: payload?.gap,
 		terminal: payload?.terminal,
-		items: items.map(item => {
+		items: items.map((item) => {
 			const record = asRecord(item);
 			return {
 				kind: record?.kind,
@@ -188,12 +188,12 @@ function summarizeTailVocabulary(result: CommandResult): Record<string, unknown>
 	const response = jsonOutput(result);
 	const payload = asRecord(response.result);
 	const items = Array.isArray(payload?.items) ? payload.items : [];
-	const records = items.map(item => asRecord(item));
-	const assistantText = records.flatMap(record => {
+	const records = items.map((item) => asRecord(item));
+	const assistantText = records.flatMap((record) => {
 		const itemPayload = asRecord(record?.payload);
 		return itemPayload?.role === "assistant" ? textBlocks(itemPayload.content) : [];
 	});
-	const kindSequence = records.map(record => record?.kind).filter((kind): kind is string => typeof kind === "string");
+	const kindSequence = records.map((record) => record?.kind).filter((kind): kind is string => typeof kind === "string");
 	const nestedEventTerms = (value: unknown, depth = 0): string[] => {
 		if (depth >= 4) return [];
 		const eventPayload = asRecord(value);
@@ -203,7 +203,9 @@ function summarizeTailVocabulary(result: CommandResult): Record<string, unknown>
 		);
 		return [...terms, ...nestedEventTerms(eventPayload.payload, depth + 1)];
 	};
-	const eventTypeSequence = records.flatMap(record => (record?.kind === "event" ? nestedEventTerms(record.payload) : []));
+	const eventTypeSequence = records.flatMap((record) =>
+		record?.kind === "event" ? nestedEventTerms(record.payload) : [],
+	);
 	return {
 		exitCode: result.exitCode,
 		ok: response.ok,
@@ -213,7 +215,7 @@ function summarizeTailVocabulary(result: CommandResult): Record<string, unknown>
 		kinds: [...new Set(kindSequence)],
 		eventTypeSequence,
 		eventTypes: [...new Set(eventTypeSequence)],
-		assistantText: [...new Set(assistantText)].map(text => text.slice(0, 500)),
+		assistantText: [...new Set(assistantText)].map((text) => text.slice(0, 500)),
 	};
 }
 type ScratchCheckpointCursor = {
@@ -240,7 +242,7 @@ async function requestScratchEndpoint(sessionId: string, frame: JsonRecord): Pro
 				clearTimeout(timeout);
 				callback();
 			};
-			socket.addEventListener("message", event => {
+			socket.addEventListener("message", (event) => {
 				let incoming: JsonRecord | undefined;
 				try {
 					incoming = asRecord(JSON.parse(String(event.data)) as unknown);
@@ -255,7 +257,9 @@ async function requestScratchEndpoint(sessionId: string, frame: JsonRecord): Pro
 				}
 				if (incoming.id === id) finish(() => resolve(incoming!));
 			});
-			socket.addEventListener("error", () => finish(() => reject(new Error("Scratch SDK endpoint connection failed."))));
+			socket.addEventListener("error", () =>
+				finish(() => reject(new Error("Scratch SDK endpoint connection failed."))),
+			);
 		});
 	} finally {
 		socket.close();
@@ -294,7 +298,7 @@ function summarizeEndpointReplay(response: JsonRecord): Record<string, unknown> 
 		gap: response.gap,
 		generation: response.generation,
 		lastSeq: response.lastSeq,
-		events: events.map(event => {
+		events: events.map((event) => {
 			const record = asRecord(event);
 			return { kind: record?.kind, generation: record?.generation, seq: record?.seq };
 		}),
@@ -304,43 +308,40 @@ function summarizeEndpointReplay(response: JsonRecord): Record<string, unknown> 
 function textBlocks(value: unknown): string[] {
 	if (typeof value === "string") return [value];
 	if (!Array.isArray(value)) return [];
-	return value.flatMap(content => {
+	return value.flatMap((content) => {
 		const item = asRecord(content);
 		return typeof item?.text === "string" ? [item.text] : [];
 	});
 }
 
 function summarizeCredentialedTurn(result: CommandResult): Record<string, unknown> {
-	const frames = result.stdout
-		.split("\n")
-		.flatMap(line => {
-			if (line.trim() === "") return [];
-			try {
-				const parsed = asRecord(JSON.parse(line) as unknown);
-				return parsed ? [parsed] : [];
-			} catch {
-				return [];
-			}
-		});
-	const assistantMessages = frames.flatMap(frame => {
+	const frames = result.stdout.split("\n").flatMap((line) => {
+		if (line.trim() === "") return [];
+		try {
+			const parsed = asRecord(JSON.parse(line) as unknown);
+			return parsed ? [parsed] : [];
+		} catch {
+			return [];
+		}
+	});
+	const assistantMessages = frames.flatMap((frame) => {
 		if (frame.type === "message_end") {
 			const message = asRecord(frame.message);
 			return message?.role === "assistant" ? textBlocks(message.content) : [];
 		}
 		if (frame.type !== "agent_end" || !Array.isArray(frame.messages)) return [];
-		return frame.messages.flatMap(messageValue => {
+		return frame.messages.flatMap((messageValue) => {
 			const message = asRecord(messageValue);
 			return message?.role === "assistant" ? textBlocks(message.content) : [];
 		});
 	});
 	return {
 		exitCode: result.exitCode,
-		types: frames.map(frame => frame.type).filter((type): type is string => typeof type === "string"),
+		types: frames.map((frame) => frame.type).filter((type): type is string => typeof type === "string"),
 		assistantText: [...new Set(assistantMessages)],
 		stderr: result.stderr.slice(0, 700),
 	};
 }
-
 
 async function waitForBroker(): Promise<JsonRecord> {
 	const discoveryPath = join(sdkAgent, "sdk", "broker.json");
@@ -406,12 +407,12 @@ async function probeSocketConnection(path: string): Promise<string> {
 		}, 1_000);
 		socket.setEncoding("utf8");
 		socket.once("connect", () => socket.write("gjc-sdk-transport/1 token=invalid\n"));
-		socket.on("data", chunk => {
+		socket.on("data", (chunk) => {
 			received += String(chunk);
 		});
 		socket.once("end", complete);
 		socket.once("close", complete);
-		socket.once("error", error => finish(() => reject(error)));
+		socket.once("error", (error) => finish(() => reject(error)));
 	});
 }
 
@@ -511,7 +512,8 @@ async function runStage0cProfileProbe(): Promise<Record<string, unknown>> {
 		if (sent.exitCode !== 0 || sentPayload?.status !== "terminal_ok") {
 			stageEvidence.compaction = {
 				status: "inconclusive",
-				reason: "The fresh SDK-hosted turn did not terminally succeed; compaction was not sent to an unavailable session.",
+				reason:
+					"The fresh SDK-hosted turn did not terminally succeed; compaction was not sent to an unavailable session.",
 			};
 			return stageEvidence;
 		}
@@ -543,7 +545,7 @@ async function runStage0cProfileProbe(): Promise<Record<string, unknown>> {
 			if (fill.exitCode !== 0 || fillPayload?.status !== "terminal_ok") break;
 		}
 		stageEvidence.compactionFills = fills.map(compact);
-		if (fills.length !== 4 || fills.some(fill => asRecord(jsonOutput(fill).result)?.status !== "terminal_ok")) {
+		if (fills.length !== 4 || fills.some((fill) => asRecord(jsonOutput(fill).result)?.status !== "terminal_ok")) {
 			stageEvidence.compaction = {
 				status: "inconclusive",
 				reason: "A bounded filler turn did not terminally succeed; compaction was not sent after partial history.",
@@ -659,17 +661,7 @@ async function runStage0dProfileServeProbe(): Promise<Record<string, unknown>> {
 		const deadline = Date.now() + timeoutMs;
 		while (Date.now() < deadline) {
 			const status = await run(
-				[
-					"sdk",
-					"session",
-					"status",
-					stageSessionId!,
-					opRef,
-					"--agent-dir",
-					profileAgent,
-					"--timeout-ms",
-					"3000",
-				],
+				["sdk", "session", "status", stageSessionId!, opRef, "--agent-dir", profileAgent, "--timeout-ms", "3000"],
 				stageRepo,
 				profileEnvironment,
 			);
@@ -728,10 +720,10 @@ async function runStage0dProfileServeProbe(): Promise<Record<string, unknown>> {
 		stageServeStderr = pipedText(stageServe.stderr);
 		const readiness = await Promise.race([
 			waitForSocket(stageSocket).then(
-				socket => ({ kind: "socket" as const, socket }),
-				error => ({ kind: "socket_error" as const, error: error instanceof Error ? error.message : String(error) }),
+				(socket) => ({ kind: "socket" as const, socket }),
+				(error) => ({ kind: "socket_error" as const, error: error instanceof Error ? error.message : String(error) }),
 			),
-			stageServe.exited.then(exitCode => ({ kind: "exited" as const, exitCode })),
+			stageServe.exited.then((exitCode) => ({ kind: "exited" as const, exitCode })),
 		]);
 		serveEvidence.readiness = readiness;
 		if (readiness.kind !== "socket") {
@@ -772,7 +764,8 @@ async function runStage0dProfileServeProbe(): Promise<Record<string, unknown>> {
 				supported: false,
 				reason: "gjc sdk session exposes no --socket flag; the installed CLI has no socket-context send verb.",
 			};
-			stageEvidence.result = "The send did not terminally succeed with the owned relay ready; no additional operation was submitted.";
+			stageEvidence.result =
+				"The send did not terminally succeed with the owned relay ready; no additional operation was submitted.";
 			return stageEvidence;
 		}
 
@@ -858,7 +851,9 @@ async function runStage0dProfileServeProbe(): Promise<Record<string, unknown>> {
 		}
 		steerEvidence.terminalStatus = terminalStatus;
 		if (terminalStatus?.outcome !== "terminal") {
-			stageEvidence.compaction = { skipped: "The mid-turn probe did not reach a terminal status inside its bounded wait." };
+			stageEvidence.compaction = {
+				skipped: "The mid-turn probe did not reach a terminal status inside its bounded wait.",
+			};
 			return stageEvidence;
 		}
 
@@ -889,7 +884,7 @@ async function runStage0dProfileServeProbe(): Promise<Record<string, unknown>> {
 			if (fill.exitCode !== 0 || fillPayload?.status !== "terminal_ok") break;
 		}
 		stageEvidence.compactionFills = fills.map(compact);
-		if (fills.length !== 4 || fills.some(fill => asRecord(jsonOutput(fill).result)?.status !== "terminal_ok")) {
+		if (fills.length !== 4 || fills.some((fill) => asRecord(jsonOutput(fill).result)?.status !== "terminal_ok")) {
 			stageEvidence.compaction = { skipped: "A bounded filler turn did not terminally succeed." };
 			return stageEvidence;
 		}
@@ -992,7 +987,9 @@ async function runStage0dProfileServeProbe(): Promise<Record<string, unknown>> {
  */
 async function runStage0eInheritedEnvironmentProbe(): Promise<Record<string, unknown>> {
 	const modelId = "layofflabs-anthropic/claude-opus-5";
-	const providerKeys = ["OPENAI_API_KEY"].filter(key => typeof process.env[key] === "string" && process.env[key] !== "");
+	const providerKeys = ["OPENAI_API_KEY"].filter(
+		(key) => typeof process.env[key] === "string" && process.env[key] !== "",
+	);
 	const stageEvidence: Record<string, unknown> = {
 		mode: "scratch broker and session state with inherited provider environment",
 		stateRoot: "<temporary>/sdk-agent",
@@ -1006,7 +1003,8 @@ async function runStage0eInheritedEnvironmentProbe(): Promise<Record<string, unk
 		},
 	};
 	if (providerKeys.length === 0) {
-		stageEvidence.skipped = "No supported parent provider API-key variable was present; no credential source was guessed.";
+		stageEvidence.skipped =
+			"No supported parent provider API-key variable was present; no credential source was guessed.";
 		return stageEvidence;
 	}
 
@@ -1059,17 +1057,7 @@ async function runStage0eInheritedEnvironmentProbe(): Promise<Record<string, unk
 		const deadline = Date.now() + timeoutMs;
 		while (Date.now() < deadline) {
 			const status = await run(
-				[
-					"sdk",
-					"session",
-					"status",
-					stageSessionId!,
-					opRef,
-					"--agent-dir",
-					sdkAgent,
-					"--timeout-ms",
-					"3000",
-				],
+				["sdk", "session", "status", stageSessionId!, opRef, "--agent-dir", sdkAgent, "--timeout-ms", "3000"],
 				sdkRepo,
 				sdkInheritedEnvironment,
 			);
@@ -1151,7 +1139,8 @@ async function runStage0eInheritedEnvironmentProbe(): Promise<Record<string, unk
 		stageEvidence.create = { attempts: createdRun.attempts.map(compact), final: compact(created) };
 		const createPayload = asRecord(jsonOutput(created).result);
 		if (typeof createPayload?.sessionId !== "string") {
-			stageEvidence.result = "No scratch lifecycle session ID was issued after five idempotent attempts; no model or turn operation was attempted.";
+			stageEvidence.result =
+				"No scratch lifecycle session ID was issued after five idempotent attempts; no model or turn operation was attempted.";
 			return stageEvidence;
 		}
 		stageSessionId = createPayload.sessionId;
@@ -1159,7 +1148,8 @@ async function runStage0eInheritedEnvironmentProbe(): Promise<Record<string, unk
 		const modelSet = await control("model.set", { id: modelId, thinkingLevel: "medium" });
 		stageEvidence.modelSet = compact(modelSet);
 		if (modelSet.exitCode !== 0 || jsonOutput(modelSet).ok !== true) {
-			stageEvidence.result = "The configured parent-default provider model was not accepted by the scratch session; no prompt was submitted.";
+			stageEvidence.result =
+				"The configured parent-default provider model was not accepted by the scratch session; no prompt was submitted.";
 			return stageEvidence;
 		}
 
@@ -1192,8 +1182,13 @@ async function runStage0eInheritedEnvironmentProbe(): Promise<Record<string, unk
 			assistantMarkerObserved: simpleTail.stdout.includes(successfulMarker),
 		};
 		const simplePayload = asRecord(jsonOutput(simple).result);
-		if (simple.exitCode !== 0 || simplePayload?.status !== "terminal_ok" || !simpleTail.stdout.includes(successfulMarker)) {
-			stageEvidence.result = "The inherited-environment scratch turn did not produce a terminal successful assistant marker.";
+		if (
+			simple.exitCode !== 0 ||
+			simplePayload?.status !== "terminal_ok" ||
+			!simpleTail.stdout.includes(successfulMarker)
+		) {
+			stageEvidence.result =
+				"The inherited-environment scratch turn did not produce a terminal successful assistant marker.";
 			return stageEvidence;
 		}
 
@@ -1285,7 +1280,9 @@ async function runStage0eInheritedEnvironmentProbe(): Promise<Record<string, unk
 		const compactionVocabulary = compactionTail ? summarizeTailVocabulary(compactionTail) : undefined;
 		const kindSequence = (compactionVocabulary?.kindSequence as string[] | undefined) ?? [];
 		const eventTypeSequence = (compactionVocabulary?.eventTypeSequence as string[] | undefined) ?? [];
-		const compactionEventKinds = [...new Set([...kindSequence, ...eventTypeSequence].filter(kind => /compact/i.test(kind)))];
+		const compactionEventKinds = [
+			...new Set([...kindSequence, ...eventTypeSequence].filter((kind) => /compact/i.test(kind))),
+		];
 		stageEvidence.compaction = {
 			attempts: compactionAttempts,
 			succeeded: compactionSucceeded,
@@ -1331,7 +1328,6 @@ async function runStage0eInheritedEnvironmentProbe(): Promise<Record<string, unk
 	}
 	return stageEvidence;
 }
-
 
 if (Bun.argv.includes("--stage0e")) {
 	let stageEvidence: Record<string, unknown>;
@@ -1428,7 +1424,6 @@ try {
 	);
 	const credentialedTurnSummary = summarizeCredentialedTurn(credentialedTurn);
 
-
 	// Own the broker foreground process so the probe never leaves a detached broker.
 	brokerProcess = Bun.spawn([gjc, "sdk", "broker-internal", "--agent-dir", sdkAgent], {
 		cwd: sdkRepo,
@@ -1458,9 +1453,9 @@ try {
 	const oneShots = await Promise.all(
 		Array.from({ length: 5 }, (_, index) => run([...turnArgs, `say exactly: parallel-${index + 1}`])),
 	);
-	const oneShotIds = oneShots.map(result => sessionId(result.stdout));
+	const oneShotIds = oneShots.map((result) => sessionId(result.stdout));
 
-	const socketEntriesBefore = (await readdir(root)).filter(entry => entry.endsWith(".sock"));
+	const socketEntriesBefore = (await readdir(root)).filter((entry) => entry.endsWith(".sock"));
 	serveProcess = Bun.spawn([gjc, "sdk", "serve", "--socket", socketPath, "--session", createdId], {
 		cwd: sdkRepo,
 		env: sdkEnvironment,
@@ -1471,7 +1466,7 @@ try {
 	serveStderr = pipedText(serveProcess.stderr);
 	const socket = await waitForSocket(socketPath);
 	const socketReadinessFrame = await probeSocketConnection(socketPath);
-	const socketEntriesWhileServing = (await readdir(root)).filter(entry => entry.endsWith(".sock"));
+	const socketEntriesWhileServing = (await readdir(root)).filter((entry) => entry.endsWith(".sock"));
 	serveProcess.kill("SIGTERM");
 	const [serveExitCode, servedStdout, servedStderr] = await Promise.all([
 		serveProcess.exited,
@@ -1489,9 +1484,20 @@ try {
 		await requestScratchEndpoint(createdId, { type: "query_request", query: "session.checkpoint", input: {} }),
 	);
 
-
 	const checkpoint = await run(
-		["sdk", "session", "raw", "query", createdId, "--agent-dir", sdkAgent, "--query", "session.checkpoint", "--json-input", "{}"],
+		[
+			"sdk",
+			"session",
+			"raw",
+			"query",
+			createdId,
+			"--agent-dir",
+			sdkAgent,
+			"--query",
+			"session.checkpoint",
+			"--json-input",
+			"{}",
+		],
 		sdkRepo,
 		sdkEnvironment,
 	);
@@ -1826,12 +1832,12 @@ try {
 		},
 		sdkRepeatedCreate: {
 			mode: "sequential",
-			exitCodes: concurrent.map(result => result.exitCode),
+			exitCodes: concurrent.map((result) => result.exitCode),
 			sessionIds: sdkIds,
 			uniqueSessionIds: [...new Set(sdkIds)].length,
 		},
 		parallelOneShots: {
-			exitCodes: oneShots.map(result => result.exitCode),
+			exitCodes: oneShots.map((result) => result.exitCode),
 			sessionIds: oneShotIds,
 			uniqueSessionIds: [...new Set(oneShotIds)].length,
 		},
@@ -1889,9 +1895,9 @@ try {
 	};
 	if (id !== resumedId || id !== continuedId) throw new Error("resume or --continue forked the session");
 	if (bogus.exitCode === 0) throw new Error("bogus resume silently succeeded");
-	if (new Set(sdkIds).size !== 1 || concurrent.some(result => result.exitCode !== 0))
+	if (new Set(sdkIds).size !== 1 || concurrent.some((result) => result.exitCode !== 0))
 		throw new Error("SDK repeated create was not idempotent");
-	if (new Set(oneShotIds).size !== 5 || oneShots.some(result => result.exitCode !== 0))
+	if (new Set(oneShotIds).size !== 5 || oneShots.some((result) => result.exitCode !== 0))
 		throw new Error("parallel one-shots did not complete cleanly");
 } finally {
 	if (serveProcess) {

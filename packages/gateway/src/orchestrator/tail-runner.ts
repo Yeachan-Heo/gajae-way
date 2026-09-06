@@ -121,6 +121,8 @@ export interface TailRunnerOptions {
 	readonly pollIntervalMs?: number;
 	readonly now?: () => number;
 	readonly sleep?: (ms: number) => Promise<void>;
+	readonly setTimeout?: (work: () => void, delayMs: number) => unknown;
+	readonly clearTimeout?: (timer: unknown) => void;
 	readonly log?: (line: string) => void;
 }
 
@@ -161,6 +163,9 @@ export class TailRunner {
 	readonly #handles = new Set<ManagedTailHandle>();
 	readonly #waiters: Array<() => void> = [];
 	#lastSaturationAlertAt: number | undefined;
+	readonly channelTimers: Pick<TailRunnerOptions, "setTimeout" | "clearTimeout">;
+	#channelRestarts = 0;
+	#channelFaults = 0;
 
 	constructor(options: TailRunnerOptions) {
 		this.#run = options.run;
@@ -174,10 +179,41 @@ export class TailRunner {
 		this.#now = options.now ?? (() => Date.now());
 		this.#sleep = options.sleep ?? ((ms: number) => Bun.sleep(ms));
 		this.#log = options.log ?? ((line: string) => console.error(line));
+		this.channelTimers = { setTimeout: options.setTimeout, clearTimeout: options.clearTimeout };
 	}
 
 	get activeCount(): number {
 		return this.#handles.size;
+	}
+
+	/** Resident relays currently attached (healthy or degraded); the residency ceiling counts all of them. */
+	get residentChannels(): number {
+		return [...this.#handles].filter((handle) => handle.channel !== undefined).length;
+	}
+
+	#lastChannelFaultAt: number | undefined;
+	get lastChannelFaultAt(): number | undefined {
+		return this.#lastChannelFaultAt;
+	}
+
+	/** I9b: the resident channel for a session, when one is attached (healthy or not; callers check `health()`). */
+	channel(sessionId: string): SessionChannel | undefined {
+		for (const handle of this.#handles) if (handle.sessionId === sessionId && handle.channel) return handle.channel;
+		return undefined;
+	}
+
+	get channelRestarts(): number {
+		return this.#channelRestarts;
+	}
+	get channelFaults(): number {
+		return this.#channelFaults;
+	}
+	recordChannelRestart(): void {
+		this.#channelRestarts++;
+	}
+	recordChannelFault(): void {
+		this.#channelFaults++;
+		this.#lastChannelFaultAt = this.#now();
 	}
 
 	/** Internal clock boundary exposed to managed handles and deterministic tests. */
@@ -543,6 +579,8 @@ class ManagedTailHandle implements TailHandle {
 	async close(): Promise<void> {
 		if (this.#closed) return;
 		this.#closed = true;
+		this.#channel?.close();
+		this.#channel = undefined;
 		this.#stream?.close();
 		this.#stream = undefined;
 		if (!this.#ready) this.#readyReject(new Error(`tail ${this.sessionId} was closed before readiness`));
@@ -597,6 +635,7 @@ class ManagedTailHandle implements TailHandle {
 	#stream: TailStream | undefined;
 	#channel: SessionChannel | undefined;
 	#reopenFailures = 0;
+	#channelRestartCount = 0;
 
 	get channel(): SessionChannel | undefined {
 		return this.#channel;
@@ -663,7 +702,21 @@ class ManagedTailHandle implements TailHandle {
 				this.#polling = false;
 			}
 			if (this.#closed || this.#pausedForGap) return;
-			const stream = spawner(this.sessionId);
+			let stream: TailStream;
+			try {
+				stream = spawner(this.sessionId);
+			} catch (error) {
+				this.#runner.recordChannelFault();
+				this.#input.onDiagnostic?.(
+					`channel_degraded session=${this.sessionId} reason=spawn_error detail=${sanitizeDiagnostic(error instanceof Error ? error.message : String(error))}`,
+				);
+				await this.#runner.sleep(Math.min(5_000, 250 * 2 ** Math.min(this.#reopenFailures++, 5)));
+				if (!this.#closed) {
+					this.#channelRestartCount++;
+					this.#runner.recordChannelRestart();
+				}
+				continue;
+			}
 			this.#stream = stream;
 			const openedAt = this.#runner.now();
 			// The channel shares this connection: it writes query frames to the
@@ -673,6 +726,9 @@ class ManagedTailHandle implements TailHandle {
 			const channel = stream.write
 				? new SessionChannel({
 						sessionId: this.sessionId,
+						now: () => this.#runner.now(),
+						...this.#runner.channelTimers,
+						restarts: this.#channelRestartCount,
 						transport: {
 							write: (line) => stream.write?.(line),
 							onLine: (listener) => {
@@ -684,13 +740,18 @@ class ManagedTailHandle implements TailHandle {
 					})
 				: undefined;
 			this.#channel = channel;
+			channel?.onFault(() => {
+				this.#runner.recordChannelFault();
+				stream.close();
+			});
+			channel?.startIdleProbe();
 			try {
 				for await (const line of stream.lines) {
 					if (this.#closed) break;
-					if (channel?.consumes(line)) {
-						for (const listener of listeners) listener(line);
-						continue;
-					}
+					const consumed = channel?.consumes(line);
+					for (const listener of listeners) listener(line);
+					if (channel && !channel.health().healthy) break;
+					if (consumed) continue;
 					const frames = decodeStreamLine(line);
 					for (const frame of frames) await this.receive(frame);
 				}
@@ -699,26 +760,32 @@ class ManagedTailHandle implements TailHandle {
 					`tail_stream_error session=${this.sessionId} detail=${sanitizeDiagnostic(error instanceof Error ? error.message : String(error)) || "sdk_error"}`,
 				);
 			} finally {
+				if (!this.#closed) channel?.fault("child_exit");
 				this.#channel = undefined;
 				channel?.close();
 				this.#stream = undefined;
 				stream.close();
 			}
 			if (this.#closed || this.#pausedForGap) return;
-			// A relay that ends immediately (endpoint_stale: the host died) must not
-			// spin. Back off exponentially; after the cap, surface a retention gap
-			// so the actor reconciles via status and rebinds instead of waiting on
-			// a dead endpoint forever.
 			const sinceOpen = this.#runner.now() - openedAt;
-			this.#reopenFailures = sinceOpen < 5_000 ? this.#reopenFailures + 1 : 0;
-			if (this.#reopenFailures >= STREAM_REOPEN_GIVE_UP) {
-				this.#input.onDiagnostic?.(`tail_stream_dead session=${this.sessionId} reopens=${this.#reopenFailures}`);
-				await this.retentionGap({ resync: { revision: 0, generation: 0, seq: 0 } });
-				return;
+			if (channel) {
+				if (sinceOpen >= 5_000 && channel.health().lastFrameAt > openedAt) this.#reopenFailures = 0;
+			} else {
+				this.#reopenFailures = sinceOpen < 5_000 ? this.#reopenFailures + 1 : 0;
+				if (this.#reopenFailures >= STREAM_REOPEN_GIVE_UP) {
+					await this.retentionGap({ resync: { revision: 0, generation: 0, seq: 0 } });
+					return;
+				}
 			}
-			const backoff = Math.min(30_000, this.#runner.pollIntervalMs * 2 ** this.#reopenFailures);
+			const backoff = channel
+				? Math.min(5_000, 250 * 2 ** Math.min(this.#reopenFailures++, 5))
+				: Math.min(30_000, this.#runner.pollIntervalMs * 2 ** this.#reopenFailures);
 			this.#input.onDiagnostic?.(`tail_stream_reopen session=${this.sessionId} backoffMs=${backoff}`);
 			await this.#runner.sleep(backoff);
+			if (channel && !this.#closed) {
+				this.#channelRestartCount++;
+				this.#runner.recordChannelRestart();
+			}
 		}
 	}
 }

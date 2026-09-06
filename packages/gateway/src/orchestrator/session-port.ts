@@ -23,6 +23,7 @@ import {
 import type { GjcModelSelection, GjcServiceTier } from "../config";
 import type { GatewayDatabase } from "../store/db";
 import { sanitizeDiagnostic } from "./rebind";
+import { ChannelQueryError, type SessionChannel } from "./session-channel";
 import type { TailAttachInput, TailHandle, TailRunner } from "./tail-runner";
 
 /**
@@ -31,8 +32,11 @@ import type { TailAttachInput, TailHandle, TailRunner } from "./tail-runner";
  * sends, observes, and reads terminal output through the SDK CLI.
  */
 export interface SessionPort {
+	readonly transport?: "cli" | "channel";
+	residentHealthy?(sessionId: string): boolean;
+	transportStamp?(sessionId: string): { transport: "cli" | "channel"; cold: boolean };
 	bind(input: SessionBindInput): Promise<SessionBinding>;
-	inspect(input: { sessionId: string; repo: string }): Promise<BrokerSession | undefined>;
+	inspect(input: { sessionId: string; repo: string; recovery?: boolean }): Promise<BrokerSession | undefined>;
 	liveness?(input: {
 		sessionId: string;
 		repo: string;
@@ -53,7 +57,7 @@ export interface SessionPort {
 		repo: string;
 		tier: GjcServiceTier;
 	}): Promise<{ readonly changed: boolean }>;
-	status(input: { sessionId: string; repo: string; opRef: string }): Promise<StatusReport>;
+	status(input: { sessionId: string; repo: string; opRef: string; recovery?: boolean }): Promise<StatusReport>;
 	fetchLastAssistant(input: { sessionId: string; repo: string }): Promise<LastAssistantResult>;
 	/**
 	 * Last assistant row NOT older than `notBeforeMs`. Callers pass the op's
@@ -166,6 +170,10 @@ export interface BrokerSessionPortOptions {
 	readonly cli: CliRunner;
 	readonly instanceId: string;
 	readonly tailRunner: TailRunner;
+	readonly transport?: "cli" | "channel";
+	readonly channels?: (sessionId: string) => SessionChannel | undefined;
+	readonly bootIncarnation?: string;
+	readonly log?: (line: string) => void;
 	readonly now?: () => number;
 	readonly sleep?: (ms: number) => Promise<void>;
 }
@@ -179,8 +187,8 @@ const SESSION_READY_POLL_MS = 250;
 const SESSION_CREATE_RETRY_MS = 1_000;
 
 /**
- * Production SessionPort implementation. The broker-bound CliRunner is the sole
- * transport: it neither discovers an endpoint nor opens an authenticated socket.
+ * Production transport boundary. The existing CLI-shaped subsession parsers are
+ * shared by both transports; resident requests never invoke the CLI runner.
  */
 export class BrokerSessionPort implements SessionPort {
 	readonly #database: GatewayDatabase;
@@ -190,14 +198,115 @@ export class BrokerSessionPort implements SessionPort {
 	readonly #now: () => number;
 	readonly #sleep: (ms: number) => Promise<void>;
 	readonly #chains = new Map<string, Promise<void>>();
+	readonly transport: "cli" | "channel";
+	readonly #channels: (sessionId: string) => SessionChannel | undefined;
+	readonly #launch: (
+		args: Parameters<CliRunner>[0],
+		options?: Parameters<CliRunner>[1],
+		classification?: string,
+	) => ReturnType<CliRunner>;
 
 	constructor(options: BrokerSessionPortOptions) {
 		this.#database = options.database;
-		this.#cli = async (args, commandOptions) => normalizeSdkEnvelopeFailure(await options.cli(args, commandOptions));
+		this.transport = options.transport ?? "cli";
+		this.#channels = options.channels ?? ((sessionId) => options.tailRunner.channel(sessionId));
+		const log = options.log ?? ((line: string) => console.error(line));
+		this.#launch = async (args, commandOptions, classification) => {
+			const flag = (name: string) => (args.includes(name) ? args[args.indexOf(name) + 1] : undefined);
+			const op = flag("--op") ?? flag("--query") ?? `session.${args[2]}`;
+			const sessionId = args[2] === "raw" ? (args[3] === "global" ? undefined : args[4]) : args[3];
+			const rawInput = flag("--json-input");
+			const input = rawInput ? (JSON.parse(rawInput) as Record<string, unknown>) : {};
+			const opRef = flag("--op-ref") ?? (args[2] === "status" ? args[4] : input.clientRef);
+			const channel = sessionId ? this.#healthyChannel(sessionId) : undefined;
+			if (channel && args[2] === "send") {
+				let response: Record<string, unknown>;
+				try {
+					response = await channelEnvelope(
+						channel.control("turn.prompt", { text: flag("--text"), taskKey: "gateway", clientRef: opRef }),
+					);
+				} catch (error) {
+					if (
+						!(error instanceof ChannelQueryError) ||
+						!["channel_write_failed", "channel_timeout", "channel_closed"].includes(error.code) ||
+						error.bytesWritten === 0
+					)
+						throw error;
+					// A failed recovery query must not replace an ambiguous send with its own zero-byte error.
+					let result: Record<string, unknown> | undefined;
+					try {
+						result = await (this.#channels(channel.sessionId) ?? channel).turnResult(String(opRef));
+					} catch {
+						throw error;
+					}
+					if (!result || !["accepted", "in_flight", "terminal_ok", "failed"].includes(String(result.status)))
+						throw error;
+					response = { ok: true, result: { ...result, sessionId } };
+				}
+				return channelResult(response);
+			}
+			if (this.transport === "channel" && args[2] === "send") throw new ChannelUnavailableError();
+			if (channel && args[2] === "status") {
+				const response = await channelEnvelope(
+					channel.turnResult(String(opRef)).then((result) => ({ ok: true, result })),
+				);
+				if (response.ok !== true) return channelResult(response);
+				const result = response.result as Record<string, unknown> | undefined;
+				return channelResult({
+					ok: true,
+					result: {
+						operationRef: opRef,
+						status: result ?? { status: "unknown" },
+						summary: { completed: isTerminalStatus(result?.status as StatusReport["status"]["status"]) },
+					},
+				});
+			}
+			if (
+				channel &&
+				args[2] === "raw" &&
+				args[3] === "control" &&
+				["turn.steer", "model.profile.set", "model.set", "service_tier.set"].includes(op)
+			)
+				return channelResult(await channelEnvelope(channel.control(op, input)));
+			if (
+				channel &&
+				args[2] === "raw" &&
+				args[3] === "query" &&
+				["queue.messages.list", "session.last_assistant"].includes(op)
+			)
+				return channelResult(await channelEnvelope(channel.query(op, input, flag("--cursor"))));
+			const kind =
+				classification ??
+				(op === "session.create" || op === "session.launch"
+					? "boot"
+					: op === "session.inspect" || op === "session.resume"
+						? "cold"
+						: "warm");
+			log(
+				`cli_launch op=${op} class=${kind} session=${sessionId ?? "-"} opRef=${opRef ?? "-"} boot=${options.bootIncarnation ?? "-"}`,
+			);
+			return normalizeSdkEnvelopeFailure(await options.cli(args, commandOptions));
+		};
+		this.#cli = (args, commandOptions) => this.#launch(args, commandOptions);
 		this.#instanceId = options.instanceId;
 		this.#tailRunner = options.tailRunner;
 		this.#now = options.now ?? (() => Date.now());
 		this.#sleep = options.sleep ?? ((ms: number) => Bun.sleep(ms));
+	}
+
+	#healthyChannel(sessionId: string): SessionChannel | undefined {
+		if (this.transport !== "channel") return undefined;
+		const channel = this.#channels(sessionId);
+		return channel?.health().healthy ? channel : undefined;
+	}
+
+	residentHealthy(sessionId: string): boolean {
+		const health = this.#healthyChannel(sessionId)?.health();
+		return health !== undefined && this.#now() - Math.max(health.lastFrameAt, health.lastProbeAt) < 10_000;
+	}
+
+	transportStamp(sessionId: string): { transport: "cli" | "channel"; cold: boolean } {
+		return { transport: this.transport, cold: this.#channels(sessionId) === undefined };
 	}
 
 	async #safe<T>(work: () => Promise<T>): Promise<T> {
@@ -399,7 +508,7 @@ export class BrokerSessionPort implements SessionPort {
 		try {
 			const snapshot =
 				this.#inspections.get(input.sessionId) ??
-				(await inspectSessionRecord(this.#controller(input.repo), input.sessionId));
+				(await inspectSessionRecord(this.#controller(input.repo, "probe"), input.sessionId));
 			const live = snapshot.raw.session?.live;
 			return { live: typeof live === "boolean" ? live : undefined, disowned: false };
 		} catch (error) {
@@ -407,10 +516,13 @@ export class BrokerSessionPort implements SessionPort {
 		}
 	}
 
-	async inspect(input: { sessionId: string; repo: string }): Promise<BrokerSession | undefined> {
+	async inspect(input: { sessionId: string; repo: string; recovery?: boolean }): Promise<BrokerSession | undefined> {
 		return await this.#safe(async () => {
 			this.#inspections.delete(input.sessionId);
-			const snapshot = await inspectSessionRecord(this.#controller(input.repo), input.sessionId);
+			const snapshot = await inspectSessionRecord(
+				this.#controller(input.repo, input.recovery ? "recovery" : "cold"),
+				input.sessionId,
+			);
 			this.#inspections.set(input.sessionId, snapshot);
 			return snapshot.session;
 		});
@@ -444,6 +556,7 @@ export class BrokerSessionPort implements SessionPort {
 
 	async send(input: SessionSendInput): Promise<SendReceipt> {
 		assertValidOpRef(input.opRef);
+		if (this.transport === "channel" && !this.#healthyChannel(input.sessionId)) throw new ChannelUnavailableError();
 		if (input.model) await this.setModel({ sessionId: input.sessionId, repo: input.repo, selection: input.model });
 		return await sendPrompt(this.#controller(input.repo), {
 			sessionId: input.sessionId,
@@ -536,8 +649,12 @@ export class BrokerSessionPort implements SessionPort {
 		return { changed: result.changed };
 	}
 
-	async status(input: { sessionId: string; repo: string; opRef: string }): Promise<StatusReport> {
-		return await fetchOpState(this.#controller(input.repo), input.sessionId, input.opRef);
+	async status(input: { sessionId: string; repo: string; opRef: string; recovery?: boolean }): Promise<StatusReport> {
+		return await fetchOpState(
+			this.#controller(input.repo, input.recovery ? "recovery" : "warm"),
+			input.sessionId,
+			input.opRef,
+		);
 	}
 
 	async queueEmpty(input: { sessionId: string; repo: string }): Promise<boolean> {
@@ -687,6 +804,7 @@ export class BrokerSessionPort implements SessionPort {
 				receipt = await this.send(input);
 				tail?.markAccepted(input.opRef);
 			} catch (sendError) {
+				if (sendError instanceof ChannelQueryError && sendError.bytesWritten === 0) throw sendError;
 				// A transport/control failure may occur after the runtime accepted the
 				// prompt. Query the SAME clientRef before retrying; monitor authoring
 				// otherwise ran the event, produced a final answer, then executed it
@@ -722,8 +840,8 @@ export class BrokerSessionPort implements SessionPort {
 		}
 	}
 
-	#controller(repo: string): ControllerOptions {
-		return { run: this.#cli, repo };
+	#controller(repo: string, classification?: string): ControllerOptions {
+		return { run: (args, options) => this.#launch(args, options, classification), repo };
 	}
 }
 
@@ -776,6 +894,26 @@ function parseLastAssistantPage(result: CliResult): LastAssistantPage {
 	};
 }
 
+export class ChannelUnavailableError extends ChannelQueryError {
+	readonly retryable = true;
+	constructor() {
+		super("no healthy resident channel is available", "channel_unavailable", 0);
+	}
+}
+
+function channelResult(response: Record<string, unknown>): CliResult {
+	return { stdout: JSON.stringify(response), stderr: "", exitCode: 0 };
+}
+
+/** Keep application refusals on the same parser path as CLI envelopes; transport ambiguity stays typed. */
+async function channelEnvelope(work: Promise<Record<string, unknown>>): Promise<Record<string, unknown>> {
+	try {
+		return await work;
+	} catch (error) {
+		if (!(error instanceof ChannelQueryError) || error.code.startsWith("channel_")) throw error;
+		return { ok: false, error: { code: error.code } };
+	}
+}
 /**
  * Current `gjc sdk session` commands return a declared `{ ok: false, error }`
  * envelope with a non-zero process status. Subsession's parser receives the

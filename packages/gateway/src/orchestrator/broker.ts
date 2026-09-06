@@ -496,6 +496,21 @@ export class BrokerSupervisor implements PersonaBroker {
 	readonly discoveryPath: string;
 	readonly lockPath: string;
 	readonly cli: CliRunner;
+	readonly cliSpawnsAtBoot = 0;
+	#cliSpawnsTotal = 0;
+	#lastRetireReason: string | undefined;
+
+	get cliSpawnsTotal(): number {
+		return this.#cliSpawnsTotal;
+	}
+
+	get lastRetireReason(): string | undefined {
+		return this.#lastRetireReason;
+	}
+
+	spawnsSince(mark: number): number {
+		return this.#cliSpawnsTotal - mark;
+	}
 
 	readonly #spawn: SpawnFn;
 	readonly #command: GjcCommandRunner;
@@ -884,6 +899,7 @@ export class BrokerSupervisor implements PersonaBroker {
 		const verdict = this.#serviceability.observe(outcome, this.#generation, this.#liveSessions);
 		if (!verdict.retire || this.#retireInFlight || this.#stopping) return;
 		this.#retireInFlight = true;
+		this.#lastRetireReason = `serviceability:${verdict.reason}`;
 		void (async () => {
 			try {
 				this.#log(
@@ -1076,6 +1092,7 @@ export class BrokerSupervisor implements PersonaBroker {
 							`broker_daemon_retired pid=${discovery.pid} reason=live_endpoint_failed_application_probe strikes=${liveButUnhealthy}`,
 						);
 						await this.#retireDaemon(discovery.pid);
+						this.#lastRetireReason = "live_endpoint_failed_application_probe";
 						liveButUnhealthy = 0;
 						struckIdentity = undefined;
 					} else if (!discovery) {
@@ -1369,6 +1386,7 @@ export class BrokerSupervisor implements PersonaBroker {
 			// Broker-bound commands share the same private state while retaining provider variables.
 			env: agentDir ? brokerEnvironment(agentDir) : (process.env as Record<string, string>),
 		});
+		this.#cliSpawnsTotal += 1;
 		return await collectCommand(child, options?.timeoutMs ?? DEFAULT_COMMAND_TIMEOUT_MS);
 	}
 }

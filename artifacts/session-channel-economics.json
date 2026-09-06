@@ -1,0 +1,29 @@
+{
+  "executable": {
+    "realpath": "/Users/bellman/gajaeway-play/bin/gjc",
+    "sha256": "da02c94b639ceee2bb93cdc9041323c422be2194da008b7f1deda3ae7f20cea8",
+    "temporaryRoot": "/var/folders/yl/ndsjfsl95t781x9qyjrqyqc80000gn/T/gajaeway-channel-economics-ls7lak0o"
+  },
+  "procedure": {
+    "idleSeconds": 600,
+    "sampleIntervalSeconds": 1,
+    "turns": 10,
+    "cohorts": "sequential isolated K=1,2,4",
+    "readerChildren": "bidirectional serve --stdio children attached to one session; prompts owned by channel",
+    "sampling": "libproc proc_pidinfo TASKINFO=4 and LISTFDS=1, identical to I0a",
+    "deviation": null
+  },
+  "baselineRef": "artifacts/session-channel-economics-baseline.json",
+  "K": {},
+  "ratios": {},
+  "pass": false,
+  "rules": {
+    "perChildRssP95RatioMax": 1.25,
+    "aggregateRssP95RatioMax": 1.25,
+    "fdsPerChildDeltaMax": 4,
+    "threadsDeltaMax": 2,
+    "coldStartP95DeltaMsMax": 1000,
+    "residentChannelsMax": "<= maxTailProcesses (K)",
+    "turnsOk": 10
+  }
+}

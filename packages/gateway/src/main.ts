@@ -1,4 +1,5 @@
 import { bootGateway } from "./boot";
+import { transportFlag } from "./config";
 import { checkConfigFile, configCheckExitCode, defaultConfigPath, renderConfigCheck } from "./config-check";
 import { sanitizeDiagnostic } from "./orchestrator/rebind";
 
@@ -10,14 +11,21 @@ if (command === "config" && args[0] === "check") {
 	for (const line of renderConfigCheck(result)) console.log(line);
 	process.exitCode = configCheckExitCode(result);
 } else if (command !== "daemon") {
-	console.error("usage: gajaeway-gateway daemon [--stdio] [--only-new] | config check [path]");
+	console.error(
+		"usage: gajaeway-gateway daemon [--stdio] [--only-new] [--transport cli|channel] | config check [path]",
+	);
 	process.exitCode = 2;
 } else {
 	// A refused config must exit with the reason, not an unhandled rejection
 	// stack: under a launchd KeepAlive an unreadable config would otherwise be a
 	// silent crash-loop.
 	try {
-		const server = await bootGateway({ stdio: args.includes("--stdio"), onlyNew: args.includes("--only-new") });
+		const transport = transportFlag(args);
+		const server = await bootGateway({
+			stdio: args.includes("--stdio"),
+			onlyNew: args.includes("--only-new"),
+			overrides: transport ? { transport } : {},
+		});
 		// I6d two-stage handler: the first signal starts the bounded ordered stop;
 		// a second signal forces an immediate exit instead of being ignored.
 		let signalled = false;

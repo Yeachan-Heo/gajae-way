@@ -33,6 +33,7 @@ const GJC_SERVICE_TIERS: readonly GjcServiceTier[] = [
 
 export interface GatewayConfigFile {
 	readonly schemaVersion: typeof CONFIG_SCHEMA_VERSION;
+	readonly transport?: "cli" | "channel";
 	readonly logVerbosity?: "debug" | "info" | "warn" | "error";
 	readonly socketPath?: string;
 	readonly dbPath?: string;
@@ -109,6 +110,7 @@ export interface ChannelPolicy {
 }
 
 export interface ConfigOverrides {
+	readonly transport?: "cli" | "channel";
 	readonly logVerbosity?: GatewayConfigFile["logVerbosity"];
 	readonly socketPath?: string;
 	readonly dbPath?: string;
@@ -323,6 +325,7 @@ export function parseConfigFile(value: unknown): GatewayConfigFile {
 	const serviceTier = parseServiceTier(input.serviceTier);
 	return {
 		schemaVersion: CONFIG_SCHEMA_VERSION,
+		...(input.transport === undefined ? {} : { transport: parseTransport(input.transport) }),
 		...(logVerbosity ? { logVerbosity: logVerbosity as GatewayConfigFile["logVerbosity"] } : {}),
 		...(optionalString(input.socketPath, "socketPath")
 			? { socketPath: optionalString(input.socketPath, "socketPath") }
@@ -419,6 +422,11 @@ export async function loadConfig(
 		logVerbosity: overrides.logVerbosity ?? fileConfig.logVerbosity ?? "info",
 		stallTimeoutMs: fileConfig.stallTimeoutMs ?? 120_000,
 		brokerReap: parseBrokerReap(process.env.GAJAEWAY_BROKER_REAP ?? fileConfig.brokerReap),
+		transport: resolveTransport(
+			overrides.transport,
+			(options.env ?? process.env).GAJAEWAY_TRANSPORT,
+			fileConfig.transport,
+		),
 		shutdownDeadlineMs: fileConfig.shutdownDeadlineMs ?? 15_000,
 		holdTtlMs: fileConfig.holdTtlMs ?? 30 * 60_000,
 	};
@@ -461,6 +469,7 @@ export const RELOADABLE_FIELDS = ["mentionAllowlist", "channels", "stallTimeoutM
 
 /** Fields bound to live startup resources and therefore changeable only by restart. */
 export const RESTART_REQUIRED_FIELDS = [
+	"transport",
 	"socketPath",
 	"dbPath",
 	"model",
@@ -496,6 +505,20 @@ type ClassifiedField =
 	| (typeof UNCONSUMED_FIELDS)[number]
 	| "schemaVersion";
 export type UnclassifiedConfigField = Exclude<keyof GatewayConfigFile, ClassifiedField>;
+
+export function parseTransport(value: unknown): "cli" | "channel" {
+	if (value === "cli" || value === "channel") return value;
+	throw new ConfigError("config_invalid", 'transport must be "cli" or "channel"');
+}
+
+export function resolveTransport(flag: unknown, env: unknown, config: unknown): "cli" | "channel" {
+	return parseTransport(flag ?? env ?? config ?? "cli");
+}
+
+export function transportFlag(args: readonly string[]): "cli" | "channel" | undefined {
+	const index = args.indexOf("--transport");
+	return index < 0 ? undefined : parseTransport(args[index + 1]);
+}
 export const CONFIG_PARTITION_IS_EXHAUSTIVE: UnclassifiedConfigField extends never ? true : false = true;
 
 export function configDirectory(config: GatewayConfig): string {

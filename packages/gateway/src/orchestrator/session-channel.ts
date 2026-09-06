@@ -7,9 +7,7 @@
  * tail consumes. This class owns the writer and the `id` correlation; the tail
  * keeps every frame that is not a response to one of its requests.
  *
- * Scope is deliberately minimal: `session.checkpoint`, `transcript.list` with its
- * same-connection continuation, `Q23` oversized-item chunks and `turn.result`.
- * No prompt or control routing lives here (that is I9); nothing is spawned here.
+ * Query and control correlation share one bounded writer; nothing is spawned here.
  *
  * Verified protocol (gjc 0.16.3, artifacts/pinned-runtime-pagination-0.16.3.json):
  * - `session.checkpoint` -> `{ok, result:{checkpointToken, revisionId}}`.
@@ -24,10 +22,12 @@
 
 export class ChannelQueryError extends Error {
 	readonly code: string;
-	constructor(message: string, code: string) {
+	readonly bytesWritten: number | undefined;
+	constructor(message: string, code: string, bytesWritten?: number) {
 		super(message);
 		this.name = "ChannelQueryError";
 		this.code = code;
+		this.bytesWritten = bytesWritten;
 	}
 }
 
@@ -58,7 +58,7 @@ export interface TranscriptSnapshot {
 
 export interface ChannelTransport {
 	/** Writes one NDJSON frame to the relay's stdin. */
-	write(line: string): void | Promise<void>;
+	write(line: string): void | number | Promise<void | number>;
 	/** Registers the frame sink; the transport calls it for every stdout line. */
 	onLine(listener: (line: string) => void): () => void;
 }
@@ -73,9 +73,16 @@ export interface SessionChannelOptions {
 	readonly clearTimeout?: (timer: unknown) => void;
 	readonly log?: (line: string) => void;
 	readonly newId?: () => string;
+	readonly restarts?: number;
 }
 
-type Pending = { resolve(frame: Record<string, unknown>): void; reject(error: Error): void; timer: unknown };
+type Pending = {
+	resolve(frame: Record<string, unknown>): void;
+	reject(error: Error): void;
+	timer: unknown;
+	responseType: string;
+	bytesWritten: number;
+};
 
 const DEFAULT_REQUEST_TIMEOUT_MS = 10_000;
 const DEFAULT_MAX_PAGES = 5_000;
@@ -93,6 +100,18 @@ export class SessionChannel {
 	readonly #detach: () => void;
 	#orphanFrames = 0;
 	#closed = false;
+	readonly #now: () => number;
+	readonly #restarts: number;
+	readonly #faultListeners = new Set<(reason: string) => void>();
+	#writer: Promise<void> = Promise.resolve();
+	#faults = 0;
+	#timeouts = 0;
+	#lastFrameAt: number;
+	#lastProbeAt = 0;
+	#lastActivityAt: number;
+	#probeTimer: unknown;
+	#probing = false;
+	#lastWrite: { id: string; bytesWritten: number } | undefined;
 
 	constructor(options: SessionChannelOptions) {
 		this.sessionId = options.sessionId;
@@ -103,12 +122,81 @@ export class SessionChannel {
 		this.#clearTimeout = options.clearTimeout ?? ((timer) => clearTimeout(timer as ReturnType<typeof setTimeout>));
 		this.#log = options.log ?? (() => {});
 		this.#newId = options.newId ?? (() => crypto.randomUUID());
+		this.#now = options.now ?? Date.now;
+		this.#restarts = options.restarts ?? 0;
+		this.#lastFrameAt = this.#lastActivityAt = this.#now();
 		this.#detach = this.#transport.onLine((line) => this.#receive(line));
 	}
 
 	/** Frames that were responses to nobody; the tail still sees them. */
 	get orphanFrames(): number {
 		return this.#orphanFrames;
+	}
+
+	get lastWrite(): { id: string; bytesWritten: number } | undefined {
+		return this.#lastWrite;
+	}
+
+	health(): { healthy: boolean; lastFrameAt: number; lastProbeAt: number } {
+		return {
+			healthy: !this.#closed && this.#faults === 0,
+			lastFrameAt: this.#lastFrameAt,
+			lastProbeAt: this.#lastProbeAt,
+		};
+	}
+
+	stats(): { restarts: number; faults: number; orphanFrames: number; inFlight: number } {
+		return {
+			restarts: this.#restarts,
+			faults: this.#faults,
+			orphanFrames: this.#orphanFrames,
+			inFlight: this.#pending.size,
+		};
+	}
+
+	onFault(listener: (reason: string) => void): () => void {
+		this.#faultListeners.add(listener);
+		return () => this.#faultListeners.delete(listener);
+	}
+
+	fault(reason: string): void {
+		if (this.#closed || this.#faults > 0) return;
+		this.#faults++;
+		this.#log(`channel_degraded session=${this.sessionId} reason=${reason}`);
+		this.close();
+		for (const listener of this.#faultListeners) listener(reason);
+	}
+
+	startIdleProbe(): void {
+		if (this.#probing || this.#closed) return;
+		this.#probing = true;
+		this.#scheduleProbe();
+	}
+
+	stopIdleProbe(): void {
+		this.#probing = false;
+		if (this.#probeTimer !== undefined) this.#clearTimeout(this.#probeTimer);
+		this.#probeTimer = undefined;
+	}
+
+	#scheduleProbe(): void {
+		if (!this.#probing || this.#closed) return;
+		if (this.#probeTimer !== undefined) this.#clearTimeout(this.#probeTimer);
+		this.#probeTimer = this.#setTimeout(
+			() => {
+				this.#probeTimer = undefined;
+				this.#lastProbeAt = this.#now();
+				this.#lastActivityAt = this.#now();
+				this.#scheduleProbe();
+				void this.checkpoint().catch(() => {});
+			},
+			Math.max(1, 10_000 - (this.#now() - this.#lastActivityAt)),
+		);
+	}
+
+	#activity(): void {
+		this.#lastActivityAt = this.#now();
+		if (this.#probing) this.#scheduleProbe();
 	}
 
 	/**
@@ -119,42 +207,110 @@ export class SessionChannel {
 		const frame = parseFrame(line);
 		if (!frame) return false;
 		return (
-			(frame.type === "query_response" || frame.type === "control_response") && this.#pending.has(String(frame.id))
+			(frame.type === "query_response" || frame.type === "control_response") &&
+			this.#pending.get(String(frame.id))?.responseType === frame.type
 		);
 	}
 
 	close(): void {
 		if (this.#closed) return;
 		this.#closed = true;
+		this.stopIdleProbe();
 		this.#detach();
 		for (const [id, pending] of this.#pending) {
 			this.#clearTimeout(pending.timer);
-			pending.reject(new ChannelQueryError(`channel closed before ${id} was answered`, "channel_closed"));
+			pending.reject(
+				new ChannelQueryError(`channel closed before ${id} was answered`, "channel_closed", pending.bytesWritten),
+			);
 		}
 		this.#pending.clear();
 	}
 
-	async query(query: string, input: Record<string, unknown> = {}, cursor?: string): Promise<Record<string, unknown>> {
-		if (this.#closed) throw new ChannelQueryError("channel is closed", "channel_closed");
+	async query(
+		query: string,
+		input: Record<string, unknown> = {},
+		cursor?: string,
+		opts?: { timeoutMs?: number },
+	): Promise<Record<string, unknown>> {
+		return this.#request(
+			{ type: "query_request", query, input, ...(cursor === undefined ? {} : { cursor }) },
+			query,
+			opts?.timeoutMs ?? this.#timeoutMs,
+		);
+	}
+
+	async control(
+		op: string,
+		input: Record<string, unknown>,
+		opts?: { timeoutMs?: number },
+	): Promise<Record<string, unknown>> {
+		return this.#request(
+			{ type: "control_request", op, input },
+			op,
+			opts?.timeoutMs ?? (op === "turn.prompt" ? 30_000 : this.#timeoutMs),
+		);
+	}
+
+	async #request(
+		frame: Record<string, unknown>,
+		operation: string,
+		timeoutMs: number,
+	): Promise<Record<string, unknown>> {
+		if (this.#closed) throw new ChannelQueryError("channel is closed", "channel_closed", 0);
+		if (this.#pending.size >= 8) throw new ChannelQueryError("channel has eight in-flight requests", "channel_busy", 0);
 		const id = this.#newId();
-		const frame: Record<string, unknown> = { type: "query_request", id, query, input };
-		if (cursor !== undefined) frame.cursor = cursor;
+		const line = `${JSON.stringify({ ...frame, id })}\n`;
+		const size = Buffer.byteLength(line);
+		if (size > 256 * 1024) throw new ChannelQueryError("channel frame exceeds 256 KiB", "channel_frame_too_large", 0);
 		const response = await new Promise<Record<string, unknown>>((resolve, reject) => {
 			const timer = this.#setTimeout(() => {
+				const pending = this.#pending.get(id);
+				if (!pending) return;
 				this.#pending.delete(id);
-				reject(new ChannelQueryError(`${query} timed out after ${this.#timeoutMs}ms`, "channel_timeout"));
-			}, this.#timeoutMs);
-			this.#pending.set(id, { resolve, reject, timer });
-			Promise.resolve(this.#transport.write(`${JSON.stringify(frame)}\n`)).catch((error: unknown) => {
-				this.#pending.delete(id);
-				this.#clearTimeout(timer);
-				reject(new ChannelQueryError(`${query} could not be written: ${message(error)}`, "channel_write_failed"));
+				reject(
+					new ChannelQueryError(`${operation} timed out after ${timeoutMs}ms`, "channel_timeout", pending.bytesWritten),
+				);
+				if (++this.#timeouts >= 2) this.fault("timeouts");
+			}, timeoutMs);
+			const pending: Pending = {
+				resolve,
+				reject,
+				timer,
+				responseType: frame.type === "control_request" ? "control_response" : "query_response",
+				bytesWritten: 0,
+			};
+			this.#pending.set(id, pending);
+			this.#writer = this.#writer.then(async () => {
+				if (!this.#pending.has(id) || this.#closed) return;
+				// A void writer cannot prove zero bytes after an exception. Conservatively
+				// report the attempted size unless the transport supplies an exact count.
+				pending.bytesWritten = size;
+				this.#lastWrite = { id, bytesWritten: size };
+				this.#activity();
+				try {
+					const written = await this.#transport.write(line);
+					if (typeof written === "number") pending.bytesWritten = written;
+					this.#lastWrite = { id, bytesWritten: pending.bytesWritten };
+				} catch (error) {
+					const written = recordOf(error)?.bytesWritten;
+					if (typeof written === "number") pending.bytesWritten = written;
+					this.#lastWrite = { id, bytesWritten: pending.bytesWritten };
+					this.#pending.delete(id);
+					this.#clearTimeout(timer);
+					reject(
+						new ChannelQueryError(
+							`${operation} could not be written: ${message(error)}`,
+							"channel_write_failed",
+							pending.bytesWritten,
+						),
+					);
+				}
 			});
 		});
 		if (response.ok !== true) {
 			const error = recordOf(response.error);
 			const code = typeof error?.code === "string" ? error.code : "query_failed";
-			throw new ChannelQueryError(`${query} failed: ${code}`, code);
+			throw new ChannelQueryError(`${operation} failed: ${code}`, code);
 		}
 		return response;
 	}
@@ -284,17 +440,25 @@ export class SessionChannel {
 	}
 
 	#receive(line: string): void {
+		if (this.#closed) return;
 		const frame = parseFrame(line);
+		if (frame?.type === "transport_error" || (!frame && /\btransport_error\b/.test(line))) {
+			this.fault("transport_error");
+			return;
+		}
 		if (!frame) return;
+		this.#lastFrameAt = this.#now();
+		this.#activity();
 		if (frame.type !== "query_response" && frame.type !== "control_response") return;
 		const pending = this.#pending.get(String(frame.id));
-		if (!pending) {
+		if (!pending || pending.responseType !== frame.type) {
 			this.#orphanFrames += 1;
 			this.#log(`channel_orphan_frame session=${this.sessionId} type=${String(frame.type)}`);
 			return;
 		}
 		this.#pending.delete(String(frame.id));
 		this.#clearTimeout(pending.timer);
+		this.#timeouts = 0;
 		pending.resolve(frame);
 	}
 }

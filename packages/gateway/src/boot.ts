@@ -99,6 +99,9 @@ export async function bootGateway(options: BootGatewayOptions = {}): Promise<Gat
 			cli: broker.cli,
 			instanceId: database.instanceId,
 			tailRunner,
+			transport: config.transport,
+			channels: (sessionId) => tailRunner.channel(sessionId),
+			bootIncarnation: database.metaGet("credential_generation_boot"),
 		});
 		const close = async () => {
 			clearInterval(pruneTimer);
@@ -109,6 +112,7 @@ export async function bootGateway(options: BootGatewayOptions = {}): Promise<Gat
 		const server = options.stdio
 			? startStdioServer({
 					config,
+					transport: config.transport,
 					database,
 					sessionPort,
 					persona,
@@ -119,6 +123,7 @@ export async function bootGateway(options: BootGatewayOptions = {}): Promise<Gat
 				})
 			: await startUnixServer({
 					config,
+					transport: config.transport,
 					database,
 					sessionPort,
 					persona,

@@ -95,7 +95,37 @@ gajaeway ops cycle --json   # typed OpsCycleResult for scripting; same exit cont
 
 Phases are `idle`, `dispatching` (turn work accepted or claimed from the durable queue), `delivering` (unsettled ledger deliveries), `draining` (memory closure in flight or durable unsettled intents), and `degraded`. A session shown as `(rebinding)` has a bumped epoch with no bound session yet — the next turn rebinds it.
 
-The command is fail-closed by contract. `gates:` names every reason the cycle is not healthy — `stale_session_identity`, `delivery_settlement_unknown`, `memory_closure_blocked`, `monitor_settlement_failed` — and any gate forces exit code 1, so automation can never read a degraded runtime as idle. An unavailable daemon is a connection error, not a healthy report. The projection is read-only; durable SQLite rows and the delivery ledger remain the authority.
+The command is fail-closed by contract. `gates:` names every reason the cycle is not healthy — `stale_session_identity`, `delivery_settlement_unknown`, `memory_closure_blocked`, `monitor_settlement_failed`, `monitor_settlement_stuck`, `provider_failing`, `broker_degraded`, `turn_held_over_deadline`, `channel_degraded` — and any gate forces exit code 1, so automation can never read a degraded runtime as idle. An unavailable daemon is a connection error, not a healthy report. The projection is read-only; durable SQLite rows and the delivery ledger remain the authority.
+
+## Holds, fences and operator verbs
+
+`gajaeway status` lists `holds[]` (opRef, origin, epoch, state, reason, since, deadline, sweeps, fence) and `rotations {last24h, byReason, byScope}`; `gajaeway holds list [--json]` prints the same rows. A hold is a turn whose outcome is undecidable; the gateway never resends it. Reasons: `unacknowledged_send`, `operation_state_unknown`, `authority_disagreement`, `authority_unreachable`, `status_unavailable`, `no_terminal_text`. At `deadline` (`holdTtlMs`, default 30 min) the turn is closed as `operation_lost` with a visible notice, and a fence may block the origin's new triggers until it clears (F1-F4, see architecture.md). Log grammar: `recovery_hold … reason=… cell=U1..T2 sweeps=N deadline=…`, `operation_lost … cell=… fence=true|false`, `fence_active` / `fence_cleared … rule=F1..F4`, `late_terminal_suppressed`, `hold_resolved`.
+
+Resolve a hold only with evidence:
+
+```sh
+gajaeway holds resolve <opRef> --outcome delivered --platform-message-id <id>   # the answer is visibly on the platform
+gajaeway holds resolve <opRef> --outcome abandon [--notify]                     # give it up; optional notice to the conversation
+gajaeway holds resolve <opRef> --outcome requeue                                # refused unless NA1-NA3 proof exists
+```
+
+There is no `--force`; a verb on a set disposition is refused. Every accepted verb writes a `hold_resolutions` audit row.
+
+## Transport selector and rollback
+
+The daemon prints its launcher with the resolved transport (`gajaeway daemon run`). Cut over by restarting with `--transport channel` (or `GAJAEWAY_TRANSPORT=channel` in the service environment); roll back by restarting the same binary with `--transport cli`. Session ids, epochs, accepted opRefs and the database are shared by both transports. Verify `gateway.status.transport`, then watch `cli_launch class=warm` (must be 0 on channel) and `broker.residentChannels <= maxTailProcesses`.
+
+## Broker and provider triage
+
+- `broker_daemon_retired pid=… reason=serviceability class=capacity strikes=3` — the private daemon refused session ops with daemon-resource errors; the gateway retired it and relaunched. One retirement per 10 minutes per identity; check `gateway.status.broker.serviceabilityStrikes`.
+- `host_audit_skipped pid=… reason=…` — a session host was left alone because ownership, index verdict, incarnation or admission could not be proven (Q4). `host_audit_skipped reason=index_unavailable` means the daemon could not serve a snapshot; nothing was reaped.
+- `provider_probe class=auth|redirect|server|unreachable status=…` and `provider_failing set_by=passive|active` / `cleared_by=active` — the active `/models` probe and passive turn outcomes. A `redirect` on an `http://` base URL is the incident class the probe exists for: fix `OPENAI_BASE_URL` to `https://` and restart (env is read at boot; SIGHUP reloads config only).
+- `credential_generation_changed … rotated_idle_origins=N` — the key/base-url/models.yml digest changed at boot; only idle origins rotated.
+- `shutdown_forced pending=[opRefs]` — the ordered stop hit `shutdownDeadlineMs`; the listed turns are recovered as holds on the next boot. A second SIGTERM forces immediately.
+
+## Soak sampling and the cutover report
+
+`scripts/status-sampler.sh <gajaeway-bin> <socket> <out-dir> [seconds]` writes `status-<ISO>.json` snapshots (status + ops cycle). `bun scripts/cutover-report.ts --db … --daemon-log … --adapter-log … --status-dir … --restarts … --probe-log … --economics … --baseline … --junit … --typecheck … --rollback … --start <ISO> --end <ISO> --out report.json` evaluates the S12 cutover criteria over the window and refuses on any missing input.
 
 ## Backup and restore drill
 

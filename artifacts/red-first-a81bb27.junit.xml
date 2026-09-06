@@ -1,13 +1,13 @@
 <?xml version="1.0" encoding="UTF-8"?>
-<testsuites name="bun test" tests="3" assertions="14" failures="2" skipped="0" time="0.013431">
-  <testsuite name="red-first/runner-scope.guard.test.ts" file="red-first/runner-scope.guard.test.ts" tests="1" assertions="14" failures="0" skipped="0" time="0.002003" hostname="MacBook-Pro-3.local">
-    <testcase name="normal package, local CI and build runners exclude red-first" classname="" time="0.001134" file="red-first/runner-scope.guard.test.ts" line="4" assertions="14" />
+<testsuites name="bun test" tests="3" assertions="14" failures="2" skipped="0" time="0.014561">
+  <testsuite name="red-first/runner-scope.guard.test.ts" file="red-first/runner-scope.guard.test.ts" tests="1" assertions="14" failures="0" skipped="0" time="0.002895" hostname="MacBook-Pro-3.local">
+    <testcase name="normal package, local CI and build runners exclude red-first" classname="" time="0.001901" file="red-first/runner-scope.guard.test.ts" line="4" assertions="14" />
   </testsuite>
-  <testsuite name="red-first/adapter-discord/adapter-reconnect-window.head.test.ts" file="red-first/adapter-discord/adapter-reconnect-window.head.test.ts" tests="2" assertions="0" failures="2" skipped="0" time="0.001574" hostname="MacBook-Pro-3.local">
-    <testcase name="red 7 A: HEAD max-jitter socket-down:45s reconnect window" classname="" time="0.000905" file="red-first/adapter-discord/adapter-reconnect-window.head.test.ts" line="47" assertions="0">
+  <testsuite name="red-first/adapter-discord/adapter-reconnect-window.head.test.ts" file="red-first/adapter-discord/adapter-reconnect-window.head.test.ts" tests="2" assertions="0" failures="2" skipped="0" time="0.00174" hostname="MacBook-Pro-3.local">
+    <testcase name="red 7 A: HEAD max-jitter socket-down:45s reconnect window" classname="" time="0.000961" file="red-first/adapter-discord/adapter-reconnect-window.head.test.ts" line="47" assertions="0">
       <failure type="TypeError" message="undefined is not an object (evaluating &apos;this.seams.now&apos;)">TypeError: undefined is not an object (evaluating &apos;this.seams.now&apos;)&#10;      at anonymous (file:/Users/bellman/Documents/Workspace/gajae-way/.worktrees/cutover-readiness/red-first/adapter-discord/adapter-reconnect-window.head.test.ts:8:27)&#10;      at characterize (red-first/adapter-discord/adapter-reconnect-window.head.test.ts:42:2)&#10;      at red-first/adapter-discord/adapter-reconnect-window.head.test.ts:48:63&#10;</failure>
     </testcase>
-    <testcase name="red 7 B: HEAD zero-jitter socket-down:8s reconnect window" classname="" time="0.000263" file="red-first/adapter-discord/adapter-reconnect-window.head.test.ts" line="57" assertions="0">
+    <testcase name="red 7 B: HEAD zero-jitter socket-down:8s reconnect window" classname="" time="0.000269" file="red-first/adapter-discord/adapter-reconnect-window.head.test.ts" line="57" assertions="0">
       <failure type="TypeError" message="undefined is not an object (evaluating &apos;this.seams.now&apos;)">TypeError: undefined is not an object (evaluating &apos;this.seams.now&apos;)&#10;      at anonymous (file:/Users/bellman/Documents/Workspace/gajae-way/.worktrees/cutover-readiness/red-first/adapter-discord/adapter-reconnect-window.head.test.ts:8:27)&#10;      at characterize (red-first/adapter-discord/adapter-reconnect-window.head.test.ts:42:2)&#10;      at red-first/adapter-discord/adapter-reconnect-window.head.test.ts:58:57&#10;</failure>
     </testcase>
   </testsuite>
