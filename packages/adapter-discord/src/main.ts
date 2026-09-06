@@ -1,5 +1,6 @@
 import { join } from "node:path";
 import type {
+	ChannelEngagementPolicy,
 	ChatMessagePayload,
 	ChatProgressPayload,
 	EngagementContext,
@@ -240,7 +241,7 @@ export function engagementForMessage(message: DiscordInboundMessage, botUser: un
 	const serverTag = resolveServerTag(message.author);
 	const replyTo = resolveReplyContext(message, botId);
 	return {
-		mentioned: Boolean(message.mentions?.has(botUser) || contentMention),
+		mentioned: Boolean(message.mentions?.has(botUser) || contentMention || replyTo?.fromSelf),
 		group: origin.kind !== "dm",
 		authorId: message.author.id,
 		...(message.author.bot ? { authorIsBot: true } : {}),
@@ -249,7 +250,6 @@ export function engagementForMessage(message: DiscordInboundMessage, botUser: un
 		...(serverTag ? { authorServerTag: serverTag } : {}),
 		...(message.channel.name ? { channelLabel: `#${message.channel.name}` } : {}),
 		...(message.guild?.name ? { serverLabel: message.guild.name } : {}),
-		// Metadata only: a reply — even a reply to us — never promotes engagement.
 		...(replyTo ? { replyTo } : {}),
 	};
 }
@@ -258,23 +258,19 @@ export function engagementForMessage(message: DiscordInboundMessage, botUser: un
  * Decides whether an incoming Discord message becomes a turn, and with what engagement.
  * Returns undefined when the message must be ignored outright.
  *
- * Collaboration means hearing other bots, so only our own messages are dropped. An `open`
- * channel promotes a human message to a mention so the persona joins the room without being
- * called; bot authors never get that promotion, because two open-channel bots would answer each
- * other forever. A bot has to address us explicitly to get a turn.
+ * Only transport-level rejection happens here: malformed events and our own
+ * messages are dropped. The gateway is the single authority for channel mode,
+ * audience, allowlist, and bounded bot-collaboration decisions.
  */
 export function decideInbound(
 	message: DiscordInboundMessage,
 	botUser: unknown,
-	channels: Readonly<Record<string, { readonly engagement?: "open" }>> | undefined,
+	_channels: Readonly<Record<string, ChannelEngagementPolicy>> | undefined,
 ): EngagementContext | undefined {
 	if (message.id === undefined) return undefined;
 	const botId = typeof botUser === "object" && botUser !== null && "id" in botUser ? String(botUser.id) : "";
 	if (botId !== "" && message.author.id === botId) return undefined;
-	const origin = discordMessageOrigin(message);
-	const base = engagementForMessage(message, botUser);
-	const open = origin.kind !== "dm" && channels?.[origin.conversationId]?.engagement === "open";
-	return open && !message.author.bot ? { ...base, mentioned: true } : base;
+	return engagementForMessage(message, botUser);
 }
 
 /** Queued edits survive a gateway-link outage up to this many messages (oldest dropped with a log line). */
@@ -312,7 +308,7 @@ export interface DescribedMessageEdit {
 export function describeMessageEdit(
 	message: DiscordInboundMessage & AttachmentCarrier & { readonly editedTimestamp?: number | null },
 	botUser: unknown,
-	channels: Readonly<Record<string, { readonly engagement?: "open" }>> | undefined,
+	channels: Readonly<Record<string, ChannelEngagementPolicy>> | undefined,
 	before?: (AttachmentCarrier & { readonly content?: string | null; readonly partial?: boolean }) | null,
 ): DescribedMessageEdit | undefined {
 	const editedAt = message.editedTimestamp;

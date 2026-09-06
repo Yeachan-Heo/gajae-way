@@ -59,7 +59,9 @@ At negotiated connection time, adapters receive unsettled deliveries created wit
 
 ## Engagement and safety floors
 
-Loopback and DMs engage automatically. Group traffic engages only when the adapter reports a mention, or the configured channel is explicitly `engagement: "open"`. Unconfigured group traffic therefore remains mention-gated.
+Loopback is trusted locally, while DMs use `dmPolicy`. Group traffic uses one gateway-owned channel policy: `engagement` is exactly `open`, `mention-open`, or `closed`, and `audience` is independently `all`, `human-only`, or `bot-only`. `open` admits matching-audience chatter; `mention-open` requires a real mention or native reply to this bot; `closed` ignores audience and requires both addressing and the existing owner/allowlist authorization. Omitted engagement remains closed. Omitted audience remains `human-only`, preserving historical `engagement: "open"` behavior: humans are open while bots fall back to the closed gate. Discord threads inherit a configured parent channel policy unless the thread has its own entry.
+
+Discord drops self-authored messages before forwarding and the gateway durably deduplicates platform message IDs. Bot turns admitted through an explicitly widened audience are additionally capped at one consecutive turn per conversation; a human message resets that budget. This permits deliberate bot collaboration without an unbounded bot-to-bot reply loop.
 
 The gateway gives `gjc` unoverridable ActionGuard guidance. It forbids unrecoverable commands such as recursive removal of `/`, filesystem formatting, raw device writes, and fork bombs. It also refuses recursive deletion of `$HOME` itself or absolute paths outside `$HOME` and `$GAJAEWAY_HOME`. These are floors, not a configurable permission bypass.
 

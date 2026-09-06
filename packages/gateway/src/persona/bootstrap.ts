@@ -3,6 +3,7 @@ import { lstat, open, readdir, readFile, realpath, stat } from "node:fs/promises
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { type OriginRef, originKey, validateOriginRef } from "@gajaeway/protocol";
 import type { GatewayConfig } from "../config";
+import { resolveChannelPolicy } from "../engagement/policy";
 import { captureRoot } from "../memory/doctrine";
 import { redactSecrets } from "../orchestrator/rebind";
 
@@ -438,9 +439,7 @@ export async function buildSessionBootstrap(input: {
 	const candidates: SourceSection[] = [];
 	const resolved = await roots(input.home);
 	const group = input.origin.kind !== "dm" && input.origin.kind !== "loopback";
-	const channelPolicy =
-		input.config.channels?.[`${input.origin.platform}:${input.origin.conversationId}`] ??
-		(input.origin.platform === "discord" ? input.config.channels?.[input.origin.conversationId] : undefined);
+	const channelPolicy = resolveChannelPolicy(input.origin, input.config);
 	const gate =
 		input.origin.kind === "dm" || input.origin.kind === "loopback" ? "direct" : (channelPolicy?.engagement ?? "closed");
 	const owner = input.config.ownerTarget?.origin;
@@ -462,6 +461,7 @@ export async function buildSessionBootstrap(input: {
 		...(input.engagement?.channelLabel ? [`channel-label: ${boundedLine(input.engagement.channelLabel)}`] : []),
 		...(input.engagement?.serverLabel ? [`server-label: ${boundedLine(input.engagement.serverLabel)}`] : []),
 		`engagement-gate: ${gate}`,
+		...(group ? [`engagement-audience: ${channelPolicy?.audience ?? "human-only"}`] : []),
 		...(owner
 			? group
 				? [`owner-target: configured ${owner.platform}/${owner.kind}; same-origin=${originKey(owner) === key}`]

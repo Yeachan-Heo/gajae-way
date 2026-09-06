@@ -20,20 +20,21 @@ const VALID = JSON.stringify({
 	},
 });
 
-test("a bootable config reports open and mention-only channel counts", async () => {
+test("a bootable config reports open, mention-open, and closed/default channel counts", async () => {
 	const result = await checkConfigFile(await configFile(VALID));
 	expect(result.ok).toBe(true);
 	if (!result.ok) return;
 	expect(result.channels).toHaveLength(2);
 	expect(result.openChannels).toEqual(["1469222606497648690"]);
+	expect(result.mentionOpenChannels).toEqual([]);
 	expect(configCheckExitCode(result)).toBe(0);
-	expect(renderConfigCheck(result)[1]).toContain("open 1, mention-only 1");
+	expect(renderConfigCheck(result)[1]).toContain("open 1, mention-open 0, closed/default 1");
 });
 
 test("an unknown engagement gate is rejected before a restart can strand the host", async () => {
 	// The exact live break: an invalid gate value must fail the offline preflight
 	// instead of the gateway exiting 1 on boot while the adapter stayed up.
-	// (#31 made "closed" and "open-mention-only" valid gates; only unknown
+	// (#31 made explicit closed and mention-gated modes valid; only unknown
 	// values are rejected.)
 	const path = await configFile(
 		JSON.stringify({ schemaVersion: 1, channels: { "1508664765415690340": { engagement: "mention-only" } } }),

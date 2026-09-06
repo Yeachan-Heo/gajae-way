@@ -41,7 +41,7 @@ import {
 import { type ConfigOverrides, type GatewayConfig, type ReloadResult, reloadConfig } from "../config";
 import { DeliveryService } from "../delivery/delivery";
 import { ReactionBudget } from "../delivery/reaction-budget";
-import { decideEngagement } from "../engagement/policy";
+import { BotAudienceTurnGuard, decideEngagement } from "../engagement/policy";
 import { ACTION_GUARD_SYSTEM_NOTICE } from "../guard/action-guard";
 import { autolinkCorpus } from "../memory/autolink";
 import { MemoryClosureQueue } from "../memory/closure";
@@ -295,6 +295,8 @@ interface Runtime {
 	readonly stopBrokerGenerationListener?: () => void;
 	/** Per-turn / per-message reaction caps shared by chat.react and the reply-token path. */
 	readonly reactions: ReactionBudget;
+	/** Fixed one-turn budget for bot authors admitted by an open audience. */
+	readonly botAudienceTurns: BotAudienceTurnGuard;
 	/** Accepted-but-not-yet-dispatched inbound messages, keyed by message id. */
 	readonly inbound: Map<string, InboundContext>;
 	/** Every admitted request except the shutdown request itself, so stop() can quiesce all writers. */
@@ -616,6 +618,7 @@ function createRuntime(options: GatewayServerOptions): Runtime {
 		contextMaintenanceTimer,
 		...(stopBrokerGenerationListener ? { stopBrokerGenerationListener } : {}),
 		reactions: new ReactionBudget(),
+		botAudienceTurns: new BotAudienceTurnGuard(),
 		cycle: new RuntimeCycleProjector(options.database, memory),
 		inbound,
 		requests: new Set(),
@@ -1444,7 +1447,11 @@ async function sendChat(
 			typeof params.engagement.authorId !== "string")
 	)
 		throw new ProtocolError("invalid_params", "non-loopback chat.send requires engagement");
-	const engaged = decideEngagement(origin, params.engagement as never, runtime.config).engaged;
+	const engagementDecision = decideEngagement(origin, params.engagement as never, runtime.config);
+	const authorIsBot = (params.engagement as { authorIsBot?: unknown } | undefined)?.authorIsBot === true;
+	if (!authorIsBot) runtime.botAudienceTurns.recordHumanMessage(key);
+	const engaged =
+		engagementDecision.engaged && (!engagementDecision.botAudienceAdmission || runtime.botAudienceTurns.canAdmit(key));
 	const inboundMessageId = typeof params.messageId === "string" && params.messageId ? params.messageId : undefined;
 	const receivedAt = parseReceivedAt(params.receivedAt);
 	// Declined messages are still context, never commands (protocol contract): every
@@ -1491,6 +1498,7 @@ async function sendChat(
 		});
 		return;
 	}
+	if (engagementDecision.botAudienceAdmission) runtime.botAudienceTurns.recordBotAdmission(key);
 	runtime.inbound.set(messageId, {
 		turnId,
 		requestId: request.id,
@@ -1576,7 +1584,13 @@ async function editChat(
 	}
 	// The recorded body now says what the message says now.
 	options.database.contextUpdateBody(key, params.messageId, params.text);
-	if (!decideEngagement(origin, params.engagement as never, runtime.config).engaged) {
+	const engagementDecision = decideEngagement(origin, params.engagement as never, runtime.config);
+	const authorIsBot = (params.engagement as { authorIsBot?: unknown } | undefined)?.authorIsBot === true;
+	if (!authorIsBot) runtime.botAudienceTurns.recordHumanMessage(key);
+	if (
+		!engagementDecision.engaged ||
+		(engagementDecision.botAudienceAdmission && !runtime.botAudienceTurns.canAdmit(key))
+	) {
 		declined();
 		return;
 	}
@@ -1595,6 +1609,7 @@ async function editChat(
 		connection.write({ v: PROFILE_VERSION, type: "response", id: request.id, result: { turnId: null, engaged: true } });
 		return;
 	}
+	if (engagementDecision.botAudienceAdmission) runtime.botAudienceTurns.recordBotAdmission(key);
 	runtime.inbound.set(messageId, { turnId, requestId: request.id, connection });
 	connection.write({ v: PROFILE_VERSION, type: "response", id: request.id, result: { turnId, engaged: true } });
 	await runtime.personaSessions.notifyInbound(key);

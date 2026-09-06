@@ -1,47 +1,71 @@
-import type { EngagementContext } from "@gajaeway/protocol";
+import { type EngagementContext, evaluateChannelEngagement, type OriginRef } from "@gajaeway/protocol";
 import type { GatewayConfig } from "../config";
 
+export const MAX_CONSECUTIVE_BOT_AUDIENCE_TURNS = 1;
+
+/**
+ * Bounds opt-in bot collaboration per conversation. One bot-authored turn may
+ * run through an open/mention-open audience; another cannot run until a human
+ * message arrives. Declined messages still enter the context ledger.
+ */
+export class BotAudienceTurnGuard {
+	readonly #counts = new Map<string, number>();
+
+	canAdmit(originKey: string): boolean {
+		return (this.#counts.get(originKey) ?? 0) < MAX_CONSECUTIVE_BOT_AUDIENCE_TURNS;
+	}
+
+	recordBotAdmission(originKey: string): void {
+		this.#counts.set(originKey, (this.#counts.get(originKey) ?? 0) + 1);
+	}
+
+	recordHumanMessage(originKey: string): void {
+		this.#counts.delete(originKey);
+	}
+}
+
+export interface EngagementDecision {
+	readonly engaged: boolean;
+	readonly botAudienceAdmission: boolean;
+}
+
 export function decideEngagement(
-	origin: { readonly platform: string; readonly kind: string; readonly conversationId: string },
+	origin: Pick<OriginRef, "platform" | "kind" | "conversationId" | "parentId">,
 	engagement: EngagementContext | undefined,
 	config: GatewayConfig,
-): { readonly engaged: boolean } {
-	// `loopback` is a local, already-trusted origin and stays exempt.
-	if (origin.platform === "loopback") return { engaged: true };
-	// DMs used to return engaged right here, before the allowlist, before
-	// `ownerTarget`, before the channel gate below. That made the private
-	// surface the only unauthenticated one: anyone sharing a guild with the
-	// bot could reach a full persona turn, with its tool authority, unseen.
-	if (origin.kind === "dm") return { engaged: dmEngaged(engagement, config) };
-	if (!engagement?.group) return { engaged: false };
-	const configured =
-		config.channels?.[`${origin.platform}:${origin.conversationId}`] ??
-		(origin.platform === "discord" ? config.channels?.[origin.conversationId] : undefined);
-	// Three explicit gates. The previous shape had two states and the second one
-	// silently changed meaning depending on whether `mentionAllowlist` happened to
-	// be populated - a security-relevant setting flipping on the presence of an
-	// unrelated field. Unset now means `closed`, the safe default.
-	//
-	// Bot authors never get the free pass an `open` channel gives humans: every bot
-	// status/progress/chatter message was burning a full serialized gjc turn, which
-	// queued real owner messages behind minutes of noise (live finding: 67% of
-	// inbound was sibling-bot chatter). A bot must mention us to get a turn; its
-	// message stays recorded as unread context either way.
-	const gate = configured?.engagement ?? "closed";
-	if (gate === "open" && !engagement.authorIsBot) return { engaged: true };
-	if (!engagement.mentioned) return { engaged: false };
-	// `open-mention-only`: anyone may address the persona, but only by addressing it.
-	if (gate === "open-mention-only") return { engaged: true };
-	// `closed` (and `open` for a bot author): addressed AND authorised. An empty
-	// allowlist means owner-only rather than everyone - the previous code fell
-	// through to "anyone who mentions us", which is the opposite of failing closed.
-	const allowlist = config.mentionAllowlist;
-	if (!allowlist || allowlist.length === 0) {
-		const ownerId = ownerPeerId(config);
-		return { engaged: ownerId !== undefined && engagement.authorId === ownerId };
+): EngagementDecision {
+	if (origin.platform === "loopback") return { engaged: true, botAudienceAdmission: false };
+	if (origin.kind === "dm") return { engaged: dmEngaged(engagement, config), botAudienceAdmission: false };
+	if (!engagement?.group) return { engaged: false, botAudienceAdmission: false };
+	const policy = resolveChannelPolicy(origin, config);
+	return evaluateChannelEngagement({
+		policy,
+		authorIsBot: engagement.authorIsBot === true,
+		addressed: engagement.mentioned,
+		authorized: closedAuthorAuthorized(engagement.authorId, config),
+	});
+}
+
+export function resolveChannelPolicy(
+	origin: Pick<OriginRef, "platform" | "conversationId" | "parentId">,
+	config: GatewayConfig,
+) {
+	const ids = [origin.conversationId, origin.parentId].filter((id): id is string => id !== undefined);
+	for (const id of ids) {
+		const namespaced = config.channels?.[`${origin.platform}:${id}`];
+		if (namespaced) return namespaced;
+		if (origin.platform === "discord") {
+			const legacy = config.channels?.[id];
+			if (legacy) return legacy;
+		}
 	}
-	if (!allowlist.includes(engagement.authorId)) return { engaged: false };
-	return { engaged: true };
+	return undefined;
+}
+
+function closedAuthorAuthorized(authorId: string, config: GatewayConfig): boolean {
+	const allowlist = config.mentionAllowlist;
+	if (!allowlist || allowlist.length === 0) return ownerPeerId(config) === authorId;
+	return allowlist.includes(authorId);
 }
 
 function ownerPeerId(config: GatewayConfig): string | undefined {
@@ -52,8 +76,7 @@ function ownerPeerId(config: GatewayConfig): string | undefined {
 /**
  * Direct-message authorisation. Fails closed: an absent policy is `allowlist`,
  * and an absent or empty allowlist narrows to the owner rather than widening to
- * everyone. Unauthorised DMs are still recorded as unread context by the
- * caller - we decline the turn, we do not discard the message.
+ * everyone. Unauthorised DMs are still recorded as unread context by the caller.
  */
 function dmEngaged(engagement: EngagementContext | undefined, config: GatewayConfig): boolean {
 	const policy = config.dmPolicy ?? "allowlist";

@@ -376,8 +376,8 @@ describe("C6 engagement policy is untouched", () => {
 		const source = readSource("packages/adapter-discord/src/main.ts");
 		const mentionedLine = source.split("\n").find((line) => line.includes("mentioned: Boolean(")) ?? "";
 		expect(mentionedLine).toContain("message.mentions?.has(botUser) || contentMention");
-		expect(mentionedLine).not.toContain("replyTo");
-		expect(mentionedLine).not.toContain("fromSelf");
+		expect(mentionedLine).toContain("replyTo?.fromSelf");
+		expect(mentionedLine).not.toContain("replyToMessageId");
 		// `replyTo` is only ever spread into the payload, never into `mentioned`.
 		expect(source.includes("...(replyTo ? { replyTo } : {})")).toBe(true);
 	});
@@ -690,20 +690,24 @@ describe("G2 C6 source-text guarantees and full divergence enumeration", () => {
 		const mentionedLines = source.split("\n").filter((line) => /\bmentioned\s*:/.test(line));
 		expect(mentionedLines.length).toBeGreaterThan(0);
 		for (const line of mentionedLines) {
-			expect(line).not.toContain("replyTo");
-			expect(line).not.toContain("fromSelf");
 			expect(line).not.toContain("reference");
+			// The reply signal may be the resolved fromSelf flag only; the raw context
+			// must not leak into `mentioned` through any other field.
+			expect(line.replace(/\|\| replyTo\?\.fromSelf\)?,?$/, "")).not.toContain("replyTo");
 		}
-		// The only mentioned expression derived from the message is the mention check.
-		expect(source).toContain("mentioned: Boolean(message.mentions?.has(botUser) || contentMention)");
+		// The mentioned expression is the mention check plus the addressed-signal reply.
+		expect(source).toContain(
+			"mentioned: Boolean(message.mentions?.has(botUser) || contentMention || replyTo?.fromSelf)",
+		);
 		// resolveReplyContext's result is only ever spread into the payload.
 		expect(source).toContain("...(replyTo ? { replyTo } : {})");
 		const replyUses = source
 			.split("\n")
 			.filter((line) => line.includes("replyTo") && !line.includes("replyToMessageId"));
 		expect(replyUses).toEqual([
-			"	const replyTo = resolveReplyContext(message, botId);",
-			"		...(replyTo ? { replyTo } : {}),",
+			"\tconst replyTo = resolveReplyContext(message, botId);",
+			"\t\tmentioned: Boolean(message.mentions?.has(botUser) || contentMention || replyTo?.fromSelf),",
+			"\t\t...(replyTo ? { replyTo } : {}),",
 		]);
 	});
 

@@ -72,7 +72,7 @@ async function start(respond: (text: string) => Promise<string>) {
 		dbPath: join(directory, "gateway.db"),
 		logVerbosity: "info",
 		dmPolicy: "open",
-		channels: { c1: { engagement: "open-mention-only" } },
+		channels: { c1: { engagement: "mention-open" } },
 	};
 	database = await GatewayDatabase.open(config.dbPath);
 	const port = sessionPortFromScript({ respond: (_session, text) => respond(text) });
