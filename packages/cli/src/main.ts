@@ -12,6 +12,7 @@ import {
 	SESSION_COLUMNS,
 	type SessionListRow,
 } from "./list";
+import { type InstallServicesOptions, installServices, serviceUsage } from "./services";
 
 export function socketPath(home = process.env.GAJAEWAY_HOME): string {
 	return `${home ?? `${process.env.HOME ?? "~"}/.gajaeway`}/gateway.sock`;
@@ -33,10 +34,11 @@ export const COMMANDS = [
 	"memory",
 	"monitors",
 	"work",
+	"services",
 ] as const;
 
 export const CLI_USAGE =
-	"usage: gajaeway [--socket PATH] status|shutdown|chat|daemon run|sessions list [--json] [--fields a,b,c] [--limit N] [--offset N]|sessions inspect <originKey-or-index>|memory audit|memory search <query>|monitors ...|work run <name> [--cwd DIR] <text>|ops backup <path>|ops cycle [--json]|ops integrity|ops restore <backupPath>";
+	"usage: gajaeway [--socket PATH] status|shutdown|chat|daemon run|sessions list [--json] [--fields a,b,c] [--limit N] [--offset N]|sessions inspect <originKey-or-index>|memory audit|memory search <query>|monitors ...|work run <name> [--cwd DIR] <text>|ops backup <path>|ops cycle [--json]|ops integrity|ops restore <backupPath>|services install|repair --bin-dir DIR [--launch-agents-dir DIR]";
 
 /** Usage errors exit 2, as `gajaeway-gateway` does; 1 stays a runtime failure. */
 export const USAGE_EXIT_CODE = 2;
@@ -58,6 +60,37 @@ export function parseArgs(args: string[]): { command?: string; rest: string[]; s
 
 function gatewayHome(): string {
 	return process.env.GAJAEWAY_HOME ?? `${process.env.HOME ?? "~"}/.gajaeway`;
+}
+
+export interface MainOptions {
+	readonly services?: Pick<InstallServicesOptions, "loginPathRunner" | "writeFile">;
+}
+
+export type ServicesAction = "install" | "repair";
+
+export interface ParsedServicesArgs {
+	readonly action: ServicesAction;
+	readonly binDir: string;
+	readonly launchAgentsDir?: string;
+}
+
+export function parseServicesArgs(args: readonly string[]): ParsedServicesArgs {
+	const action = args[0];
+	if (action !== "install" && action !== "repair") throw new Error(serviceUsage());
+	let binDir: string | undefined;
+	let launchAgentsDir: string | undefined;
+	for (let i = 1; i < args.length; i++) {
+		const flag = args[i];
+		if (flag === "--bin-dir" || flag === "--launch-agents-dir") {
+			const value = args[++i];
+			if (value === undefined || value.length === 0 || value.startsWith("--"))
+				throw new Error(`${flag} expects a non-empty DIR`);
+			if (flag === "--bin-dir") binDir = value;
+			else launchAgentsDir = value;
+		} else throw new Error(`unknown option: ${flag}`);
+	}
+	if (binDir === undefined) throw new Error("services requires --bin-dir DIR");
+	return { action, binDir, ...(launchAgentsDir === undefined ? {} : { launchAgentsDir }) };
 }
 
 /**
@@ -196,7 +229,7 @@ async function chat(socket: string): Promise<void> {
 	}
 }
 
-export async function main(args = process.argv.slice(2)): Promise<void> {
+export async function main(args = process.argv.slice(2), options: MainOptions = {}): Promise<void> {
 	const parsed = parseArgs(args);
 	const usage = usageFor(parsed.command);
 	if (usage !== undefined) {
@@ -418,6 +451,17 @@ export async function main(args = process.argv.slice(2)): Promise<void> {
 				} finally {
 					await client.close();
 				}
+				break;
+			}
+			case "services": {
+				const service = parseServicesArgs(parsed.rest);
+				const written = await installServices({
+					binDir: service.binDir,
+					...(service.launchAgentsDir === undefined ? {} : { launchAgentsDir: service.launchAgentsDir }),
+					env: process.env,
+					...options.services,
+				});
+				console.log(`services ${service.action}: wrote ${written.length} LaunchAgent plists`);
 				break;
 			}
 			default:
