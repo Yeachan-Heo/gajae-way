@@ -711,9 +711,23 @@ export class BrokerSessionPort implements SessionPort {
 
 	async close(input: { sessionId: string; repo: string }): Promise<void> {
 		assertControlAllowed("session.close", { operatorApproval: true });
+		// Lifecycle op: the per-session `control` route prohibits it for the
+		// daemon CLI (adapter_operation_prohibited on gjc 0.16.x); only the
+		// `global` route carries it, like session.create and session.delete.
 		parseEnvelope(
 			await this.#cli(
-				["sdk", "session", "raw", "control", input.sessionId, "--op", "session.close", "--json-input", "{}"],
+				[
+					"sdk",
+					"session",
+					"raw",
+					"global",
+					"--op",
+					"session.close",
+					"--idempotency-key",
+					`gw-close-${this.#instanceId}-${input.sessionId}-${this.#now()}`,
+					"--json-input",
+					JSON.stringify({ sessionId: input.sessionId }),
+				],
 				{ timeoutMs: 30_000 },
 			),
 			"session.close",

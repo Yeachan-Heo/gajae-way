@@ -390,3 +390,40 @@ test("fetchAssistantSince follows transcript continuation pages and returns the 
 		await rm(home, { recursive: true, force: true });
 	}
 });
+
+test("close uses the global lifecycle route: the per-session control route prohibits session.close for the daemon CLI", async () => {
+	home = await mkdtemp(join(tmpdir(), "gajaeway-session-port-"));
+	database = await GatewayDatabase.open(join(home, "gateway.db"));
+	const calls: string[][] = [];
+	const run: CliRunner = async (args) => {
+		calls.push([...args]);
+		if (args.includes("session.close") && args.includes("control"))
+			return {
+				exitCode: 0,
+				stdout: JSON.stringify({
+					ok: false,
+					error: {
+						code: "adapter_operation_prohibited",
+						message: "session.close is unavailable through the SDK session CLI.",
+					},
+				}),
+				stderr: "",
+			};
+		if (args.includes("session.close"))
+			return { exitCode: 0, stdout: JSON.stringify({ ok: true, result: { sessionId: "sdk-1" } }), stderr: "" };
+		throw new Error(`unexpected command ${args.join(" ")}`);
+	};
+	const port = new BrokerSessionPort({
+		database,
+		cli: run,
+		instanceId: "instance-1",
+		tailRunner: new TailRunner({ run, repo: join(home, "workspace"), stallTimeoutMs: 1_000 }),
+	});
+	await port.close({ sessionId: "sdk-1", repo: "/tmp/repo" });
+	expect(calls).toHaveLength(1);
+	const args = calls[0]!;
+	expect(args.slice(0, 4)).toEqual(["sdk", "session", "raw", "global"]);
+	expect(args).toContain("session.close");
+	expect(args[args.indexOf("--idempotency-key") + 1]).toMatch(/^gw-close-instance-1-sdk-1-\d+$/);
+	expect(JSON.parse(args[args.indexOf("--json-input") + 1]!)).toEqual({ sessionId: "sdk-1" });
+});
