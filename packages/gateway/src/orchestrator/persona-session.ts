@@ -336,6 +336,7 @@ export class PersonaSessionManager {
 		const now = this.#now();
 		let deleted = 0;
 		let refused = 0;
+		const refusals = new Map<string, number>();
 		for (const session of indexed) {
 			if (this.#stopped) break;
 			if (session.live || referenced.has(session.sessionId)) continue;
@@ -353,16 +354,24 @@ export class PersonaSessionManager {
 				if (outcome.deleted) deleted++;
 				else {
 					refused++;
-					this.#log(`session_gc_refused session=${session.sessionId} code=${outcome.code}`);
+					refusals.set(outcome.code, (refusals.get(outcome.code) ?? 0) + 1);
 				}
 			} catch (error) {
 				refused++;
-				this.#log(`session_gc_refused session=${session.sessionId} detail=${safeDiagnostic(error)}`);
+				const code = safeDiagnostic(error);
+				refusals.set(code, (refusals.get(code) ?? 0) + 1);
 			}
 		}
+		// One line per sweep, refusals folded by code. A broker whose cleanup
+		// ledger holds an unbounded terminal_uncertain row fences EVERY delete
+		// (gjc lifecycle-ledger hasUncertainCleanupForSession; live: 212/213
+		// refusals on one box) - a broker-side condition to report once, not
+		// two hundred lines every ten minutes.
 		if (deleted > 0 || refused > 0)
 			this.#log(
-				`session_gc indexed=${indexed.length} referenced=${referenced.size} deleted=${deleted} refused=${refused}`,
+				`session_gc indexed=${indexed.length} referenced=${referenced.size} deleted=${deleted} refused=${refused}${
+					refusals.size ? ` refusals=${[...refusals].map(([code, n]) => `${code}:${n}`).join(",")}` : ""
+				}`,
 			);
 		return { indexed: indexed.length, deleted, refused };
 	}

@@ -525,10 +525,9 @@ test("session GC deletes indexed sessions no origin or pending turn references, 
 	expect(port.index.map((row) => row.sessionId).sort()).toEqual(
 		["broker-refuses", "just-rotated", "still-live-elsewhere", current].sort(),
 	);
-	expect(logs.some((line) => line.startsWith("session_gc_refused session=broker-refuses code=cleanup_pending"))).toBe(
-		true,
-	);
-	expect(logs.some((line) => line.startsWith("session_gc indexed=6 referenced=1 deleted=2 refused=1"))).toBe(true);
+	expect(logs.filter((line) => line.startsWith("session_gc"))).toEqual([
+		"session_gc indexed=6 referenced=1 deleted=2 refused=1 refusals=cleanup_pending:1",
+	]);
 
 	// Idempotent: a second sweep with nothing collectable is silent.
 	const again = await manager!.collectSessions();
