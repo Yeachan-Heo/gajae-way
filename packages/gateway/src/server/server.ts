@@ -70,7 +70,7 @@ import { buildSessionBootstrap } from "../persona/bootstrap";
 import { PersonaLoader } from "../persona/persona";
 import type { GatewayDatabase, InboundMessageRow, MonitorEventStage } from "../store/db";
 import { DeliveryLedger } from "../store/ledger";
-import { ATTACHMENT_SCOPE_NOTICE } from "./attachment-scope";
+import { ATTACHMENT_SCOPE_NOTICE, redactHistoricalAttachments } from "./attachment-scope";
 import { OrderedFrameWriter } from "./frame-writer";
 import { InterimSpeechGate, type InterimSpeechLimits } from "./interim-speech";
 import { applyModelCommand } from "./model-command";
@@ -1706,7 +1706,7 @@ async function createInboundTurnLifecycle(
 		const inWindowIds = new Set(prepared.selectedMessageIds);
 		const recentLines = recent
 			.filter((entry) => entry.id === undefined || (!inWindowIds.has(entry.id) && entry.id !== row.message_id))
-			.map((entry) => `- [${entry.at}] ${entry.author}: ${entry.body.slice(0, 500)}`);
+			.map((entry) => `- [${entry.at}] ${entry.author}: ${redactHistoricalAttachments(entry.body).slice(0, 500)}`);
 		const recentBlock = recentLines.length
 			? `[Recent conversation history, last 24h (this session just started; already answered unless listed as unread below)]\n${recentLines.join("\n")}\n\n`
 			: "";

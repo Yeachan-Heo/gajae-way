@@ -1203,7 +1203,15 @@ test("a fresh session's first turn carries recent conversation history, a later 
 			body: `earlier message ${i}`,
 			receivedAt: new Date(Date.now() - 60_000 * (4 - i)).toISOString(),
 		});
-	database.contextCommitWindow(key, ["old-1", "old-2", "old-3"], 0);
+	database.contextRecord({
+		messageId: "old-img",
+		originKey: key,
+		authorId: "owner",
+		authorName: "bellman",
+		body: "[image · shot.png · 20.1 KB · https://cdn.discordapp.com/attachments/1/2/shot.png]",
+		receivedAt: new Date(Date.now() - 30_000).toISOString(),
+	});
+	database.contextCommitWindow(key, ["old-1", "old-2", "old-3", "old-img"], 0);
 	const turns: string[] = [];
 	const sessionPort = sessionPortFromResponder({
 		respond: async (_s, text) => {
@@ -1233,6 +1241,10 @@ test("a fresh session's first turn carries recent conversation history, a later 
 	for (let attempt = 0; attempt < 400 && turns.length === 0; attempt++) await Bun.sleep(10);
 	expect(turns[0]).toContain("[Recent conversation history");
 	expect(turns[0]).toContain("earlier message 2");
+	// A replayed attachment keeps its label but never its url: the model must not
+	// re-fetch a days-old screenshot and treat it as the current message.
+	expect(turns[0]).toContain("[image · shot.png · 20.1 KB · past attachment; not part of this message, do not fetch]");
+	expect(turns[0]).not.toContain("cdn.discordapp.com");
 	say("n2", "follow-up");
 	for (let attempt = 0; attempt < 400 && turns.length < 2; attempt++) await Bun.sleep(10);
 	expect(turns[1]).not.toContain("[Recent conversation history");
