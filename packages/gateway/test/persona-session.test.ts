@@ -47,6 +47,7 @@ async function harness(
 	port: ScriptedSessionPort,
 	hooks: { terminal?: (text: string) => void; retired?: () => void; released?: (opRef: string) => void } = {},
 	log?: (line: string) => void,
+	extra: { gcDeletes?: boolean } = {},
 ) {
 	home = await mkdtemp(join(tmpdir(), "gajaeway-persona-session-"));
 	database = await GatewayDatabase.open(join(home, "gateway.db"));
@@ -56,6 +57,7 @@ async function harness(
 		instanceId: "instance-test",
 		repo: join(home, "workspace"),
 		...(log ? { log } : {}),
+		...extra,
 		onTurnStart: ({ trigger, turn }) => {
 			latestOpRef = turn.opRef;
 			return {
@@ -503,7 +505,7 @@ test("session GC deletes indexed sessions no origin or pending turn references, 
 	}
 	const port = new IndexedPort();
 	const logs: string[] = [];
-	await harness(port, {}, (line) => logs.push(line));
+	await harness(port, {}, (line) => logs.push(line), { gcDeletes: true });
 	enqueue("m-1", "bind me");
 	await manager?.notifyInbound(KEY);
 	await eventually(() => port.sends.length === 1, "turn did not start");
@@ -532,4 +534,23 @@ test("session GC deletes indexed sessions no origin or pending turn references, 
 	// Idempotent: a second sweep with nothing collectable is silent.
 	const again = await manager!.collectSessions();
 	expect(again).toEqual({ indexed: 4, deleted: 0, refused: 1 });
+});
+
+test("session GC only measures by default: no deletes until the gjc cleanup fence is session-scoped", async () => {
+	class IndexedPort extends ScriptedSessionPort {
+		deletes = 0;
+		async listSessions() {
+			return [{ sessionId: "orphan", live: false, cwd: "/c", sessionPath: "/p", lastActivityMs: undefined }];
+		}
+		async deleteSession() {
+			this.deletes++;
+			return { deleted: true as const };
+		}
+	}
+	const port = new IndexedPort();
+	const logs: string[] = [];
+	await harness(port, {}, (line) => logs.push(line));
+	expect(await manager!.collectSessions()).toEqual({ indexed: 1, deleted: 0, refused: 0 });
+	expect(port.deletes).toBe(0);
+	expect(logs).toContain("session_gc indexed=1 referenced=0 orphans=1 deletes=off");
 });

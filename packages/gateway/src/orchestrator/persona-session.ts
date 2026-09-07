@@ -173,6 +173,8 @@ export interface PersonaSessionManagerOptions {
 		opRef: string;
 	}) => void | Promise<void>;
 	readonly log?: (line: string) => void;
+	/** Enables session-index deletes (tests); production keeps them off until gjc scopes its cleanup fence. */
+	readonly gcDeletes?: boolean;
 }
 
 /**
@@ -198,6 +200,8 @@ export class PersonaSessionManager {
 	readonly #onHeldSteerAccepted: PersonaSessionManagerOptions["onHeldSteerAccepted"];
 	readonly #heldSteerContextMessageId: PersonaSessionManagerOptions["heldSteerContextMessageId"];
 	readonly #log: (line: string) => void;
+	/** Session-index deletes; off until the gjc ledger fence is session-scoped (see collectSessions). */
+	readonly #gcDeletes: boolean;
 	readonly #actors = new Map<string, OriginActor>();
 	#stopped = false;
 
@@ -220,6 +224,7 @@ export class PersonaSessionManager {
 		this.#onHeldSteerAccepted = options.onHeldSteerAccepted;
 		this.#heldSteerContextMessageId = options.heldSteerContextMessageId;
 		this.#log = options.log ?? ((line: string) => console.error(line));
+		this.#gcDeletes = options.gcDeletes ?? false;
 	}
 
 	/** Call only after inboundEnqueue's durable acceptance boundary. */
@@ -325,6 +330,25 @@ export class PersonaSessionManager {
 	async collectSessions(): Promise<{ readonly indexed: number; readonly deleted: number; readonly refused: number }> {
 		const port = this.#port;
 		if (this.#stopped || !port.listSessions || !port.deleteSession) return { indexed: 0, deleted: 0, refused: 0 };
+		// DELETES ARE OFF. A refused session.delete is itself recorded by gjc as a
+		// terminal_uncertain lifecycle row, and one such row makes the broker
+		// refuse EVERY later lifecycle op - session.create included - until the
+		// ledger is replaced by hand (gjc lifecycle-ledger hasUncertainCleanupForSession
+		// with no bound session ids; live: gaebal, 127 GC refusals then 31
+		// session.create refusals, origins unable to bind, 2026-09-07). Until gjc
+		// scopes that fence to the session it names, this sweep only measures.
+		if (!this.#gcDeletes) {
+			const indexed = await port.listSessions().catch(() => undefined);
+			if (indexed) {
+				const referenced = this.#database.referencedSessionIds();
+				const orphans = indexed.filter((s) => !s.live && !referenced.has(s.sessionId)).length;
+				if (orphans > 0)
+					this.#log(
+						`session_gc indexed=${indexed.length} referenced=${referenced.size} orphans=${orphans} deletes=off`,
+					);
+			}
+			return { indexed: indexed?.length ?? 0, deleted: 0, refused: 0 };
+		}
 		let indexed: readonly IndexedSession[];
 		try {
 			indexed = await port.listSessions();
