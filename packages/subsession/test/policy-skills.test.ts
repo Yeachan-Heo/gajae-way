@@ -130,10 +130,16 @@ describe("control policy", () => {
 		expect(() => assertControlAllowed("turn.prompt", { frozen: true })).toThrow(/frozen/);
 	});
 
-	test("merge, release, tag, deploy and session.delete are all denied", () => {
-		for (const operation of ["repo.merge", "release.publish", "release.tag", "deploy", "session.delete"]) {
+	test("merge, release, tag and deploy are all denied", () => {
+		for (const operation of ["repo.merge", "release.publish", "release.tag", "deploy"]) {
 			expect(classifyOperation(operation).class).toBe("denied");
 		}
+	});
+
+	test("session.delete is operator-gated: refused without approval, never from a worker", () => {
+		expect(classifyOperation("session.delete").class).toBe("operator_gated");
+		expect(() => assertControlAllowed("session.delete")).toThrow(/operator approval/);
+		expect(() => assertControlAllowed("session.delete", { operatorApproval: true })).not.toThrow();
 	});
 
 	test("credentials and permissions are denied", () => {

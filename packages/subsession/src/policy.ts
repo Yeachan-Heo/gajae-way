@@ -40,10 +40,16 @@ export const OPERATOR_GATED_OPERATIONS: readonly string[] = [
 	"turn.abort",
 	"turn.replace",
 	"workflow.gate_answer",
+	// Destructive on the broker index, so never reachable from a worker turn
+	// (no worker path passes approval). The gateway's own session-index GC is
+	// runtime code acting on sessions it provably no longer references and
+	// passes explicit approval; without a way to delete, a rotating persona
+	// origin grows the index without bound and the broker's session.list
+	// cursor budget drains until every id-resolving call fails (jip, 2026-09-06).
+	"session.delete",
 ];
 
 export const DENIED_OPERATIONS: readonly string[] = [
-	"session.delete",
 	"repo.merge",
 	"release.publish",
 	"release.tag",
