@@ -163,6 +163,16 @@ export class ScriptedSessionPort implements SessionPort {
 	/** When set, status omits startedAt (older gjc reports), exercising the batch acceptedAt floor. */
 	omitStartedAt = false;
 
+	/** Scripted `context.get` occupancy per session; absent means the runtime cannot say. */
+	readonly contextPercent = new Map<string, number>();
+	readonly contextProbes: string[] = [];
+
+	async contextUsage(input: { sessionId: string; repo: string }) {
+		this.contextProbes.push(input.sessionId);
+		const percent = this.contextPercent.get(input.sessionId);
+		return percent === undefined ? undefined : { percent };
+	}
+
 	async status(input: { sessionId: string; repo: string; opRef: string }): Promise<StatusReport> {
 		const operation = this.#operations.get(input.opRef);
 		if (!operation || operation.sessionId !== input.sessionId)

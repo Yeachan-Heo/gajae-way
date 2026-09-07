@@ -45,7 +45,12 @@ function enqueue(messageId: string, body: string): void {
 
 async function harness(
 	port: ScriptedSessionPort,
-	hooks: { terminal?: (text: string) => void; retired?: () => void; released?: (opRef: string) => void } = {},
+	hooks: {
+		terminal?: (text: string) => void;
+		retired?: () => void;
+		released?: (opRef: string) => void;
+		failure?: (message: string) => void;
+	} = {},
 	log?: (line: string) => void,
 	extra: { gcDeletes?: boolean } = {},
 ) {
@@ -63,6 +68,7 @@ async function harness(
 			return {
 				text: trigger.body,
 				onTerminal: ({ text }) => hooks.terminal?.(text),
+				onFailure: ({ error }) => hooks.failure?.(error.message),
 				onRetired: () => hooks.retired?.(),
 				onReleased: ({ turn: released }) => hooks.released?.(released.opRef),
 			};
@@ -118,6 +124,87 @@ test("a message admitted while a persistent turn is running becomes an operator-
 		() => database?.inboundTurnRow(latestOpRef)?.turn_state === "done",
 		"accepted turn did not reconcile terminal",
 	);
+});
+
+/**
+ * Live 2026-09-07 (playground-ko on three hosts at once): native compaction
+ * did not keep the window bounded, the provider rejected every prompt with
+ * `prompt is too long: 1042682 tokens > 1000000`, and the gateway delivered
+ * `[turn failed] Prompt submission failed.` for each message until an operator
+ * sent `/new`. A failed turn on an exhausted session is rotated instead.
+ */
+test("a failed turn on a session at the context ceiling rotates the epoch and re-dispatches on a fresh session", async () => {
+	const port = new ScriptedSessionPort({ onBind: (input) => `session-e${input.epoch}` });
+	const terminal: string[] = [];
+	const failures: string[] = [];
+	const released: string[] = [];
+	const logs: string[] = [];
+	await harness(
+		port,
+		{
+			terminal: (text) => terminal.push(text),
+			failure: (message) => failures.push(message),
+			released: (opRef) => released.push(opRef),
+		},
+		(line) => logs.push(line),
+	);
+	enqueue("m-1", "hello at the ceiling");
+	await manager?.notifyInbound(KEY);
+	await eventually(() => port.sends.length === 1, "first turn did not start");
+	const first = port.sends[0]!;
+	expect(first.sessionId).toBe("session-e0");
+	port.contextPercent.set("session-e0", 102.7);
+	port.fail(first.opRef, "Prompt submission failed.");
+
+	await eventually(() => port.sends.length === 2, "the trigger was not re-dispatched on a fresh session");
+	const second = port.sends[1]!;
+	expect(second.text).toBe("hello at the ceiling");
+	expect(second.sessionId).toBe("session-e1");
+	expect(second.opRef).not.toBe(first.opRef);
+	expect(database?.getSessionRecord(KEY)?.epoch).toBe(1);
+	expect(released).toEqual([first.opRef]);
+	// The user never saw a failure notice: the rotation is the remedy.
+	expect(failures).toEqual([]);
+	expect(
+		logs.some((line) =>
+			line.startsWith(`session_rotated_context_exhausted origin=${KEY} epoch=0 nextEpoch=1 opRef=${first.opRef}`),
+		),
+	).toBe(true);
+
+	port.complete(second.opRef, "answered on the fresh session");
+	await eventually(() => terminal.length === 1, "replacement turn did not complete");
+	expect(terminal).toEqual(["answered on the fresh session"]);
+	expect(database?.inboundPendingCount(KEY)).toBe(0);
+});
+
+test("a failed turn on a session with room left is reported as a failure, not rotated", async () => {
+	const port = new ScriptedSessionPort();
+	const failures: string[] = [];
+	await harness(port, { failure: (message) => failures.push(message) });
+	enqueue("m-1", "ordinary failure");
+	await manager?.notifyInbound(KEY);
+	await eventually(() => port.sends.length === 1, "turn did not start");
+	const first = port.sends[0]!;
+	port.contextPercent.set(first.sessionId, 41);
+	port.fail(first.opRef, "provider hiccup");
+	await eventually(() => failures.length === 1, "failure did not reach the lifecycle");
+	expect(failures).toEqual(["provider hiccup"]);
+	expect(port.sends).toHaveLength(1);
+	expect(database?.getSessionRecord(KEY)?.epoch).toBe(0);
+	expect(port.contextProbes).toEqual([first.sessionId]);
+});
+
+test("a failed turn whose context occupancy is unknown is reported as a failure, never rotated on a guess", async () => {
+	const port = new ScriptedSessionPort();
+	const failures: string[] = [];
+	await harness(port, { failure: (message) => failures.push(message) });
+	enqueue("m-1", "unknown occupancy");
+	await manager?.notifyInbound(KEY);
+	await eventually(() => port.sends.length === 1, "turn did not start");
+	port.fail(port.sends[0]!.opRef, "Prompt submission failed.");
+	await eventually(() => failures.length === 1, "failure did not reach the lifecycle");
+	expect(port.sends).toHaveLength(1);
+	expect(database?.getSessionRecord(KEY)?.epoch).toBe(0);
 });
 
 test("bounded shutdown reconciliation leaves a nonterminal accepted turn durable", async () => {
