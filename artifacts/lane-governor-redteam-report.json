@@ -1,0 +1,643 @@
+{
+  "kind": "api-test-report",
+  "generation": 3,
+  "sourceHash": "sha256:8b9ad59035b8f41996e34ed739440211fa5b535ffb3a6f7d04c0a57de04463c5",
+  "sourceHashScope": "Parent-supplied frozen generation-3 implementation identity; not independently recalculated. This QA lane changed only tests and artifacts.",
+  "command": "bun test packages/gateway/test/lane-governor-redteam.test.ts --reporter=junit --reporter-outfile=artifacts/lane-governor-gen3.junit.xml",
+  "pass": 23,
+  "fail": 0,
+  "expectations": 169,
+  "generation3": {
+    "pass": 7,
+    "fail": 0
+  },
+  "verificationRuns": [
+    {
+      "phase": "initial fixture validation",
+      "pass": 20,
+      "fail": 3,
+      "expectations": 157,
+      "finding": "Test fixture errors only: failed is an attempt endState, not a job state; attempt session ids must be UUIDs; appendAttempt preserves terminal job state. Corrected fixtures without source edits."
+    },
+    {
+      "command": "bun test packages/gateway/test/lane-governor-redteam.test.ts --reporter=junit --reporter-outfile=artifacts/lane-governor-gen3.junit.xml",
+      "pass": 23,
+      "fail": 0,
+      "expectations": 169,
+      "artifactPath": "artifacts/lane-governor-gen3.junit.xml"
+    }
+  ],
+  "evidenceScope": "R1-R7, G5-G8, H5-H6 exercise the real Unix-socket gateway API with ScriptedSessionPort at the broker boundary. G1-G4, H1-H4 and H7 directly exercise LaneGovernor with real SQLite. R8 inspects source. H3/H4 hold the lane lock, start actual sweep nomination, mutate durable state, then release. H4 captures the actual retirement refusal from sweep.",
+  "limitations": [
+    "No live broker or CLI exercised; no project-wide build, lint, typecheck or formatter run.",
+    "G1/G2 retain the authorized hand-built attempt_ended fallback because work.run does not forward waitTimeoutMs and ScriptedSessionPort.request has no configurable timeout; these verify the durable timeout boundary, not timeout production.",
+    "H1/H2 ledger failed means attempt.endState=failed with job.state=awaiting_operator, matching closeAttempt semantics.",
+    "H6 uses a bound row without an activity timestamp, which the governor treats as infinitely idle.",
+    "G6 uses persisted completion activity and exact idle threshold boundaries rather than socket response receipt."
+  ],
+  "defects": "none",
+  "sourceFixes": [],
+  "previousGeneration": {
+    "generation": 2,
+    "sourceHash": "sha256:91fca8cea77f6ef4bc33103872da4d2ff4e4af8d9f9ecf849c9bb64e4894b288",
+    "pass": 16,
+    "fail": 0,
+    "expectations": 131,
+    "artifactPath": "artifacts/lane-governor-gen2.junit.xml"
+  },
+  "cases": [
+    {
+      "id": "R1",
+      "scenario": "Concurrent final-slot admission",
+      "expected": "One capacity refusal; no overbooking",
+      "verdict": "pass"
+    },
+    {
+      "id": "R2",
+      "scenario": "Retire during live turn",
+      "expected": "Immediate open-attempt refusal without close",
+      "verdict": "pass"
+    },
+    {
+      "id": "R3",
+      "scenario": "Retire and reuse name",
+      "expected": "New epoch/session; old reference gone",
+      "verdict": "pass"
+    },
+    {
+      "id": "R4",
+      "scenario": "Model and name validation",
+      "expected": "Invalid input rejected before bind; valid model forwarded",
+      "verdict": "pass"
+    },
+    {
+      "id": "R5",
+      "scenario": "Full capacity and same-name reuse",
+      "expected": "Idlest-first complete candidates; existing lane admitted",
+      "verdict": "pass"
+    },
+    {
+      "id": "R6",
+      "scenario": "Repeated sweep with open attempt",
+      "expected": "One retirement then zero; open attempt retained",
+      "verdict": "pass"
+    },
+    {
+      "id": "R7",
+      "scenario": "Socket cycle before/after retire",
+      "expected": "Saturation clears without stale identity",
+      "verdict": "pass"
+    },
+    {
+      "id": "R8",
+      "scenario": "Retirement source inspection",
+      "expected": "No session.delete/deleteSession",
+      "verdict": "pass"
+    },
+    {
+      "id": "G1",
+      "scenario": "Ended ledger versus in_flight broker",
+      "expected": "Retire refused, sweep zero, binding/epoch retained",
+      "verdict": "pass"
+    },
+    {
+      "id": "G2",
+      "scenario": "Ended ledger versus unavailable status",
+      "expected": "Fail closed without close/epoch change",
+      "verdict": "pass"
+    },
+    {
+      "id": "G3",
+      "scenario": "Ambiguous close then explicit disownership",
+      "expected": "Retain on unknown; release on disowned with one epoch bump",
+      "verdict": "pass"
+    },
+    {
+      "id": "G4",
+      "scenario": "Sweep waits behind rebind",
+      "expected": "Replacement retained without close",
+      "verdict": "pass"
+    },
+    {
+      "id": "G5",
+      "scenario": "Distinct name during blocked turn",
+      "expected": "Second response arrives before first is released",
+      "verdict": "pass"
+    },
+    {
+      "id": "G6",
+      "scenario": "Turn longer than idle interval",
+      "expected": "Completion activity updated; zero at threshold-1, one at threshold",
+      "verdict": "pass"
+    },
+    {
+      "id": "G7",
+      "scenario": "Corrupt bound job at capacity",
+      "expected": "Socket capacity detail identifies corrupt; no bind/close",
+      "verdict": "pass"
+    },
+    {
+      "id": "G8",
+      "scenario": "Unbound unsettled then done job",
+      "expected": "Stale identity only while unsettled; zero active lanes",
+      "verdict": "pass"
+    },
+    {
+      "id": "H1",
+      "scenario": "Failed attempt plus terminal_ok broker and live session",
+      "expected": "Retire succeeds, closes once and increments epoch once",
+      "verdict": "pass"
+    },
+    {
+      "id": "H2",
+      "scenario": "Failed attempt plus unknown operation on live then dead sessions",
+      "expected": "Live refused unchanged; dead retires with one close and epoch bump",
+      "verdict": "pass"
+    },
+    {
+      "id": "H3",
+      "scenario": "Done job becomes running with a fresh open attempt behind sweep lock",
+      "expected": "Sweep zero; no close; binding and epoch unchanged",
+      "verdict": "pass"
+    },
+    {
+      "id": "H4",
+      "scenario": "Done job remains done but session rebounds behind sweep lock",
+      "expected": "Sweep zero; refusal contains rebound; replacement epoch/session unchanged",
+      "verdict": "pass"
+    },
+    {
+      "id": "H5",
+      "scenario": "Empty record_json over socket",
+      "expected": "Counts toward cap as corrupt; work.retire returns retired:false mentioning corrupt",
+      "verdict": "pass"
+    },
+    {
+      "id": "H6",
+      "scenario": "Operator socket retirement of idle done lane without nomination",
+      "expected": "Success with one close and epoch bump",
+      "verdict": "pass"
+    },
+    {
+      "id": "H7",
+      "scenario": "Two concurrent sweeps of one idle lane",
+      "expected": "Results [0,1]; exactly one close and epoch bump",
+      "verdict": "pass"
+    },
+    {
+      "id": "R7b",
+      "scenario": "failed first bind leaves unbound work row with no lane job",
+      "expected": "ops.cycle gates stale_session_identity, phase degraded, lanes.active 0",
+      "verdict": "passed"
+    }
+  ],
+  "contractCoverage": [
+    {
+      "id": "coverage-regressions",
+      "contractRef": "worker-lane-governor/R1-R8-G1-G8",
+      "obligation": "Preserve all sixteen generation-1 and generation-2 regressions",
+      "status": "covered",
+      "surfaceEvidenceRefs": [
+        "surface-regressions"
+      ],
+      "adversarialCaseRefs": [
+        "R1",
+        "R2",
+        "R3",
+        "R4",
+        "R5",
+        "R6",
+        "R7",
+        "R8",
+        "G1",
+        "G2",
+        "G3",
+        "G4",
+        "G5",
+        "G6",
+        "G7",
+        "G8"
+      ]
+    },
+    {
+      "id": "coverage-H1",
+      "contractRef": "worker-lane-governor/H1",
+      "obligation": "Failed ledger is gated on proof, not permanently stuck",
+      "status": "covered",
+      "surfaceEvidenceRefs": [
+        "surface-H1"
+      ],
+      "adversarialCaseRefs": [
+        "H1"
+      ]
+    },
+    {
+      "id": "coverage-H2",
+      "contractRef": "worker-lane-governor/H2",
+      "obligation": "Unknown failed operation requires dead-session proof",
+      "status": "covered",
+      "surfaceEvidenceRefs": [
+        "surface-H2"
+      ],
+      "adversarialCaseRefs": [
+        "H2"
+      ]
+    },
+    {
+      "id": "coverage-H3",
+      "contractRef": "worker-lane-governor/H3",
+      "obligation": "Recheck open attempts after acquiring sweep lock",
+      "status": "covered",
+      "surfaceEvidenceRefs": [
+        "surface-H3"
+      ],
+      "adversarialCaseRefs": [
+        "H3"
+      ]
+    },
+    {
+      "id": "coverage-H4",
+      "contractRef": "worker-lane-governor/H4",
+      "obligation": "Terminal job state cannot authorize closing a replacement session",
+      "status": "covered",
+      "surfaceEvidenceRefs": [
+        "surface-H4"
+      ],
+      "adversarialCaseRefs": [
+        "H4"
+      ]
+    },
+    {
+      "id": "coverage-H5",
+      "contractRef": "worker-lane-governor/H5",
+      "obligation": "Empty persisted JSON fails closed and consumes capacity",
+      "status": "covered",
+      "surfaceEvidenceRefs": [
+        "surface-H5"
+      ],
+      "adversarialCaseRefs": [
+        "H5"
+      ]
+    },
+    {
+      "id": "coverage-H6",
+      "contractRef": "worker-lane-governor/H6",
+      "obligation": "Operator retirement does not require sweep nomination",
+      "status": "covered",
+      "surfaceEvidenceRefs": [
+        "surface-H6"
+      ],
+      "adversarialCaseRefs": [
+        "H6"
+      ]
+    },
+    {
+      "id": "coverage-H7",
+      "contractRef": "worker-lane-governor/H7",
+      "obligation": "Concurrent sweeps retire exactly once",
+      "status": "covered",
+      "surfaceEvidenceRefs": [
+        "surface-H7"
+      ],
+      "adversarialCaseRefs": [
+        "H7"
+      ]
+    }
+  ],
+  "surfaceEvidence": [
+    {
+      "id": "surface-regressions",
+      "contractRef": "worker-lane-governor/R1-R8-G1-G8",
+      "surface": "api",
+      "invocation": "Focused Bun test: R1-R8 and G1-G8, socket/direct API plus R8 source inspection",
+      "verdict": "passed",
+      "artifactRefs": [
+        "gen3-junit",
+        "gen3-report"
+      ]
+    },
+    {
+      "id": "surface-H1",
+      "contractRef": "worker-lane-governor/H1",
+      "surface": "api",
+      "invocation": "H1 direct retire with failed attempt and scripted terminal_ok",
+      "verdict": "passed",
+      "artifactRefs": [
+        "gen3-junit"
+      ]
+    },
+    {
+      "id": "surface-H2",
+      "contractRef": "worker-lane-governor/H2",
+      "surface": "api",
+      "invocation": "H2 direct retire for both live=true and live=false with unknown op",
+      "verdict": "passed",
+      "artifactRefs": [
+        "gen3-junit"
+      ]
+    },
+    {
+      "id": "surface-H3",
+      "contractRef": "worker-lane-governor/H3",
+      "surface": "api",
+      "invocation": "H3 actual sweep queues behind runExclusive mutation done to running/open",
+      "verdict": "passed",
+      "artifactRefs": [
+        "gen3-junit"
+      ]
+    },
+    {
+      "id": "surface-H4",
+      "contractRef": "worker-lane-governor/H4",
+      "surface": "api",
+      "invocation": "H4 actual sweep queues behind runExclusive rebind; capture super.retire outcome",
+      "verdict": "passed",
+      "artifactRefs": [
+        "gen3-junit"
+      ]
+    },
+    {
+      "id": "surface-H5",
+      "contractRef": "worker-lane-governor/H5",
+      "surface": "api",
+      "invocation": "H5 Unix-socket work.run then work.retire with empty persisted job JSON",
+      "verdict": "passed",
+      "artifactRefs": [
+        "gen3-junit"
+      ]
+    },
+    {
+      "id": "surface-H6",
+      "contractRef": "worker-lane-governor/H6",
+      "surface": "api",
+      "invocation": "H6 Unix-socket work.retire on idle done lane",
+      "verdict": "passed",
+      "artifactRefs": [
+        "gen3-junit"
+      ]
+    },
+    {
+      "id": "surface-H7",
+      "contractRef": "worker-lane-governor/H7",
+      "surface": "api",
+      "invocation": "H7 Promise.all([governor.sweep(), governor.sweep()])",
+      "verdict": "passed",
+      "artifactRefs": [
+        "gen3-junit"
+      ]
+    }
+  ],
+  "adversarialCases": [
+    {
+      "id": "R1",
+      "contractRef": "worker-lane-governor/R1-R8-G1-G8",
+      "scenario": "Final-slot race",
+      "expectedBehavior": "No overbooking",
+      "verdict": "passed",
+      "artifactRefs": [
+        "gen3-junit"
+      ]
+    },
+    {
+      "id": "R2",
+      "contractRef": "worker-lane-governor/R1-R8-G1-G8",
+      "scenario": "Retire live turn",
+      "expectedBehavior": "Immediate refusal",
+      "verdict": "passed",
+      "artifactRefs": [
+        "gen3-junit"
+      ]
+    },
+    {
+      "id": "R3",
+      "contractRef": "worker-lane-governor/R1-R8-G1-G8",
+      "scenario": "Reuse name",
+      "expectedBehavior": "Fresh session and epoch",
+      "verdict": "passed",
+      "artifactRefs": [
+        "gen3-junit"
+      ]
+    },
+    {
+      "id": "R4",
+      "contractRef": "worker-lane-governor/R1-R8-G1-G8",
+      "scenario": "Malformed parameters",
+      "expectedBehavior": "Validate before binding",
+      "verdict": "passed",
+      "artifactRefs": [
+        "gen3-junit"
+      ]
+    },
+    {
+      "id": "R5",
+      "contractRef": "worker-lane-governor/R1-R8-G1-G8",
+      "scenario": "Capacity candidates",
+      "expectedBehavior": "Complete ordered detail",
+      "verdict": "passed",
+      "artifactRefs": [
+        "gen3-junit"
+      ]
+    },
+    {
+      "id": "R6",
+      "contractRef": "worker-lane-governor/R1-R8-G1-G8",
+      "scenario": "Repeat sweep with open attempt",
+      "expectedBehavior": "Idempotent and protects open attempt",
+      "verdict": "passed",
+      "artifactRefs": [
+        "gen3-junit"
+      ]
+    },
+    {
+      "id": "R7",
+      "contractRef": "worker-lane-governor/R1-R8-G1-G8",
+      "scenario": "Cycle saturation",
+      "expectedBehavior": "Gate clears after retire",
+      "verdict": "passed",
+      "artifactRefs": [
+        "gen3-junit"
+      ]
+    },
+    {
+      "id": "R8",
+      "contractRef": "worker-lane-governor/R1-R8-G1-G8",
+      "scenario": "Deletion source scan",
+      "expectedBehavior": "No deletion calls",
+      "verdict": "passed",
+      "artifactRefs": [
+        "gen3-junit"
+      ]
+    },
+    {
+      "id": "G1",
+      "contractRef": "worker-lane-governor/R1-R8-G1-G8",
+      "scenario": "Broker in_flight",
+      "expectedBehavior": "Retain ended ledger lane",
+      "verdict": "passed",
+      "artifactRefs": [
+        "gen3-junit"
+      ]
+    },
+    {
+      "id": "G2",
+      "contractRef": "worker-lane-governor/R1-R8-G1-G8",
+      "scenario": "Status unavailable",
+      "expectedBehavior": "Fail closed",
+      "verdict": "passed",
+      "artifactRefs": [
+        "gen3-junit"
+      ]
+    },
+    {
+      "id": "G3",
+      "contractRef": "worker-lane-governor/R1-R8-G1-G8",
+      "scenario": "Ambiguous close",
+      "expectedBehavior": "Release only with gone proof",
+      "verdict": "passed",
+      "artifactRefs": [
+        "gen3-junit"
+      ]
+    },
+    {
+      "id": "G4",
+      "contractRef": "worker-lane-governor/R1-R8-G1-G8",
+      "scenario": "Sweep rebind race",
+      "expectedBehavior": "Retain replacement",
+      "verdict": "passed",
+      "artifactRefs": [
+        "gen3-junit"
+      ]
+    },
+    {
+      "id": "G5",
+      "contractRef": "worker-lane-governor/R1-R8-G1-G8",
+      "scenario": "Blocked distinct lane",
+      "expectedBehavior": "Admission remains concurrent",
+      "verdict": "passed",
+      "artifactRefs": [
+        "gen3-junit"
+      ]
+    },
+    {
+      "id": "G6",
+      "contractRef": "worker-lane-governor/R1-R8-G1-G8",
+      "scenario": "Long turn idle boundary",
+      "expectedBehavior": "Idle starts at completion",
+      "verdict": "passed",
+      "artifactRefs": [
+        "gen3-junit"
+      ]
+    },
+    {
+      "id": "G7",
+      "contractRef": "worker-lane-governor/R1-R8-G1-G8",
+      "scenario": "Corrupt job at cap",
+      "expectedBehavior": "Count corrupt lane",
+      "verdict": "passed",
+      "artifactRefs": [
+        "gen3-junit"
+      ]
+    },
+    {
+      "id": "G8",
+      "contractRef": "worker-lane-governor/R1-R8-G1-G8",
+      "scenario": "Unbound terminal job",
+      "expectedBehavior": "No stale gate after done",
+      "verdict": "passed",
+      "artifactRefs": [
+        "gen3-junit"
+      ]
+    },
+    {
+      "id": "H1",
+      "contractRef": "worker-lane-governor/H1",
+      "scenario": "Failed ledger with terminal broker",
+      "expectedBehavior": "Retire succeeds",
+      "verdict": "passed",
+      "artifactRefs": [
+        "gen3-junit"
+      ]
+    },
+    {
+      "id": "H2",
+      "contractRef": "worker-lane-governor/H2",
+      "scenario": "Unknown failed op on live/dead sessions",
+      "expectedBehavior": "Live refuses; dead retires",
+      "verdict": "passed",
+      "artifactRefs": [
+        "gen3-junit"
+      ]
+    },
+    {
+      "id": "H3",
+      "contractRef": "worker-lane-governor/H3",
+      "scenario": "Fresh running attempt after nomination",
+      "expectedBehavior": "Zero retired, no close or epoch change",
+      "verdict": "passed",
+      "artifactRefs": [
+        "gen3-junit"
+      ]
+    },
+    {
+      "id": "H4",
+      "contractRef": "worker-lane-governor/H4",
+      "scenario": "Done-to-done session rebind",
+      "expectedBehavior": "Rebound refusal protects replacement",
+      "verdict": "passed",
+      "artifactRefs": [
+        "gen3-junit"
+      ]
+    },
+    {
+      "id": "H5",
+      "contractRef": "worker-lane-governor/H5",
+      "scenario": "Empty JSON rather than absent row",
+      "expectedBehavior": "Capacity consumed, corrupt retirement refused",
+      "verdict": "passed",
+      "artifactRefs": [
+        "gen3-junit"
+      ]
+    },
+    {
+      "id": "H6",
+      "contractRef": "worker-lane-governor/H6",
+      "scenario": "Operator retire without nomination",
+      "expectedBehavior": "Idle done lane retires",
+      "verdict": "passed",
+      "artifactRefs": [
+        "gen3-junit"
+      ]
+    },
+    {
+      "id": "H7",
+      "contractRef": "worker-lane-governor/H7",
+      "scenario": "Concurrent sweep snapshots",
+      "expectedBehavior": "One close and one epoch bump total",
+      "verdict": "passed",
+      "artifactRefs": [
+        "gen3-junit"
+      ]
+    }
+  ],
+  "artifactRefs": [
+    {
+      "id": "gen3-report",
+      "kind": "api-test-report",
+      "path": "artifacts/lane-governor-redteam-report.json",
+      "description": "Generation-3 cases, coverage, limitations and observed results"
+    },
+    {
+      "id": "gen3-junit",
+      "kind": "api-test-report",
+      "path": "artifacts/lane-governor-gen3.junit.xml",
+      "description": "Machine-generated focused replay receipt: 23 pass, 0 fail"
+    }
+  ],
+  "blockers": [],
+  "finalSourceHash": "sha256:b0a14f6aeddd1e04a8d552a82045d4d9f2437cc4b7d3c14336b2a6afe19743c2",
+  "finalRun": {
+    "command": "bun test packages/gateway/test/lane-governor-redteam.test.ts packages/gateway/test/lane-governor.test.ts packages/gateway/test/cycle.test.ts",
+    "junit": "artifacts/lane-governor-final.junit.xml",
+    "fullSuite": "bun test packages: all pass"
+  }
+}

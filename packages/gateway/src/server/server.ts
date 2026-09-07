@@ -38,6 +38,7 @@ import {
 	newOpRef,
 	parseLaneJobRecord,
 } from "@gajaeway/subsession";
+import type { GjcModelSelection } from "../config";
 import { type ConfigOverrides, type GatewayConfig, type ReloadResult, reloadConfig } from "../config";
 import { DeliveryService } from "../delivery/delivery";
 import { ReactionBudget } from "../delivery/reaction-budget";
@@ -54,6 +55,7 @@ import { MonitorRuntime } from "../monitors/runtime";
 import { backupDatabase, integrityDatabase } from "../ops/backup";
 import { RuntimeCycleProjector } from "../ops/cycle";
 import type { BrokerSupervisor } from "../orchestrator/broker";
+import { LaneGovernor, laneJobIdentity, workSessionKey } from "../orchestrator/lane-governor";
 import {
 	type PersonaFailureInput,
 	PersonaSessionManager,
@@ -84,15 +86,6 @@ import { composeSpeakerLabel, composeTurnHeader } from "./speaker";
  * terminal transition persist through the broker-backed SessionPort, so a
  * gateway restart leaves an auditable record instead of an orphaned operation.
  */
-function laneJobIdentity(workName: string): { jobId: string; laneKey: string } {
-	const laneKey = `work-${workName}`;
-	// The jobId is INJECTIVE: each UTF-8 byte of the exact name becomes two hex
-	// digits, so distinct names (Foo/foo, a.b/a_b) always map to distinct ids
-	// while staying within the [a-z0-9-] jobId alphabet. 64-byte names cap at
-	// 128 hex chars + the prefix, inside the schema's id length bound.
-	const hex = Buffer.from(workName, "utf8").toString("hex");
-	return { jobId: `lanejob-${hex}`, laneKey };
-}
 
 function persistLaneJob(database: GatewayDatabase, record: LaneJobRecord, laneKey: string): void {
 	database.putLaneJob({
@@ -104,6 +97,25 @@ function persistLaneJob(database: GatewayDatabase, record: LaneJobRecord, laneKe
 		lane: record.lane,
 		json: JSON.stringify(record),
 	});
+}
+
+/** `work.run` model: a non-empty model id or exactly `{ preset }`, matching the config `model` shape. */
+function parseWorkModel(value: unknown): GjcModelSelection | undefined {
+	if (value === undefined) return undefined;
+	if (typeof value === "string") {
+		if (!value) throw new ProtocolError("invalid_params", "work.run model must be a non-empty string");
+		return value;
+	}
+	if (
+		typeof value === "object" &&
+		value !== null &&
+		!Array.isArray(value) &&
+		Object.keys(value).length === 1 &&
+		typeof (value as { preset?: unknown }).preset === "string" &&
+		(value as { preset: string }).preset
+	)
+		return { preset: (value as { preset: string }).preset };
+	throw new ProtocolError("invalid_params", "work.run model must be a non-empty string or { preset }");
 }
 
 /** Reads the actual branch HEAD and dirtiness of the worktree (read-only git). */
@@ -308,6 +320,8 @@ interface Runtime {
 	readonly requests: Set<Promise<void>>;
 	/** Read-only runtime-cycle projection (ops.cycle); owns no writes. */
 	readonly cycle: RuntimeCycleProjector;
+	/** Admission cap and retirement for `work.run` lanes. */
+	readonly lanes: LaneGovernor;
 }
 
 export async function startUnixServer(options: GatewayServerOptions): Promise<GatewayServer> {
@@ -569,11 +583,18 @@ function createRuntime(options: GatewayServerOptions): Runtime {
 		},
 	});
 	const monitorRuntime = new MonitorRuntime(options.config, registry, monitors);
+	const lanes = new LaneGovernor({
+		database: options.database,
+		sessionPort,
+		maxLanes: options.config.work?.maxLanes,
+		idleRetireMs: options.config.work?.idleRetireMs,
+	});
 	const reconcileTimer = setInterval(() => {
 		void monitors.reconcile();
 		void personaSessions
 			.recover()
 			.catch((error: unknown) => console.error(`persona recovery sweep failed: ${diagnostic(error)}`));
+		void lanes.sweep().catch((error: unknown) => console.error(`lane sweep failed: ${diagnostic(error)}`));
 	}, 60_000);
 	// Broker session-index GC. Once per interval, after recovery has re-bound
 	// whatever it is going to: anything the broker still indexes that no origin
@@ -639,7 +660,8 @@ function createRuntime(options: GatewayServerOptions): Runtime {
 		...(stopBrokerGenerationListener ? { stopBrokerGenerationListener } : {}),
 		reactions: new ReactionBudget(),
 		botAudienceTurns: new BotAudienceTurnGuard(),
-		cycle: new RuntimeCycleProjector(options.database, memory),
+		cycle: new RuntimeCycleProjector(options.database, memory, { maxLanes: lanes.maxLanes }),
+		lanes,
 		inbound,
 		requests: new Set(),
 	};
@@ -810,25 +832,33 @@ async function handleRequest(
 			// register, bound to a caller-chosen cwd and serialized per worker name.
 			// Its broker-backed request/response operation returns the terminal body
 			// directly without spawning a one-off child.
-			const params = request.params as { name?: unknown; text?: unknown; cwd?: unknown; resume?: unknown } | undefined;
+			const params = request.params as
+				| { name?: unknown; text?: unknown; cwd?: unknown; resume?: unknown; model?: unknown }
+				| undefined;
 			if (typeof params?.name !== "string" || !/^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/.test(params.name))
 				throw new ProtocolError("invalid_params", "work.run requires name matching [A-Za-z0-9][A-Za-z0-9._-]{0,63}");
 			if (typeof params.text !== "string" || !params.text)
 				throw new ProtocolError("invalid_params", "work.run requires non-empty text");
 			if (params.cwd !== undefined && (typeof params.cwd !== "string" || !params.cwd.startsWith("/")))
 				throw new ProtocolError("invalid_params", "work.run cwd must be an absolute path");
+			const workModel = parseWorkModel(params.model);
 			const workName = params.name;
 			const workText = params.text;
 			const workCwd = params.cwd as string | undefined;
-			const sessionKey = `work/task/${workName}`;
+			const sessionKey = workSessionKey(workName);
 			const effectiveCwd = workCwd ?? process.cwd();
 			const result = await runtime.sessionPort.runExclusive(sessionKey, async () => {
-				const epoch = options.database.getSessionRecord(sessionKey)?.epoch ?? 0;
-				const { sessionId } = await runtime.sessionPort.bind({
-					originKey: sessionKey,
-					epoch,
-					repo: effectiveCwd,
-					codingRegister: true,
+				// Different names share admission until bind publishes the durable row.
+				const { sessionId } = await runtime.sessionPort.runExclusive("work/admission", async () => {
+					runtime.lanes.assertAdmission(workName);
+					const epoch = options.database.getSessionRecord(sessionKey)?.epoch ?? 0;
+					return runtime.sessionPort.bind({
+						originKey: sessionKey,
+						epoch,
+						repo: effectiveCwd,
+						codingRegister: true,
+						...(workModel ? { model: workModel } : {}),
+					});
 				});
 				options.database.updateActivity(
 					sessionKey,
@@ -907,6 +937,7 @@ async function handleRequest(
 							text: workText,
 							opRef,
 							codingRegister: true,
+							...(workModel ? { model: workModel } : {}),
 						})
 					).assistant.text;
 					job = closeAttempt({
@@ -915,6 +946,12 @@ async function handleRequest(
 						endState: "completed",
 						endedAt: new Date().toISOString(),
 					});
+					// Idle is measured from the last turn's END, not its start: a long
+					// turn must still earn a full idle interval before the sweep retires it.
+					options.database.updateActivity(
+						sessionKey,
+						JSON.stringify({ platform: "work", kind: "task", conversationId: workName }),
+					);
 					// Repository first: whatever the reply said, a HEAD move on the
 					// worktree is the authoritative checkpoint.
 					const facts = await collectRepoFacts(effectiveCwd);
@@ -950,6 +987,10 @@ async function handleRequest(
 						errorCode: reaped ? "gateway_turn_reaped" : undefined,
 						endedAt: new Date().toISOString(),
 					});
+					options.database.updateActivity(
+						sessionKey,
+						JSON.stringify({ platform: "work", kind: "task", conversationId: workName }),
+					);
 					// Repository first HERE TOO: the measured #9 shape is commits
 					// landing right up to (or past) the kill; the repo, not the
 					// failure, decides whether progress happened.
@@ -990,18 +1031,27 @@ async function handleRequest(
 			// Each row is re-validated against the authoritative record JSON: a
 			// corrupt row is flagged as corrupt for the operator, never shown as
 			// healthy and never silently dropped.
+			const laneByKey = new Map(
+				options.database.workLaneRows().map((lane) => [`work-${lane.origin_key.slice("work/task/".length)}`, lane]),
+			);
 			const jobs = options.database.laneJobRows().map((row) => {
+				const lane = laneByKey.get(row.lane_key);
+				const bound = {
+					...row,
+					session_id: lane?.gjc_session_id ?? "",
+					last_activity_at: lane?.last_activity_at ?? null,
+				};
 				try {
 					const record = parseLaneJobRecord(options.database.laneJobJson(row.job_id) ?? "");
 					return {
-						...row,
+						...bound,
 						attempts: record.attempts.length,
 						checkpoints: record.checkpoints.length,
 						escalations: record.escalations.length,
 					};
 				} catch (error) {
 					return {
-						...row,
+						...bound,
 						state: "corrupt" as const,
 						corrupt: true as const,
 						error: diagnostic(error),
@@ -1014,6 +1064,14 @@ async function handleRequest(
 				id: request.id,
 				result: { jobs },
 			});
+			return;
+		}
+		case "work.retire": {
+			const params = request.params as { name?: unknown } | undefined;
+			if (typeof params?.name !== "string" || !/^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/.test(params.name))
+				throw new ProtocolError("invalid_params", "work.retire requires name matching [A-Za-z0-9][A-Za-z0-9._-]{0,63}");
+			const outcome = await runtime.lanes.retire(params.name, "operator");
+			connection.write({ v: PROFILE_VERSION, type: "response", id: request.id, result: outcome });
 			return;
 		}
 		case "ops.cycle":

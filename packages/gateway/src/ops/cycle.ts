@@ -6,6 +6,8 @@ import {
 	type OpsCycleResult,
 	validateOriginRef,
 } from "@gajaeway/protocol";
+import { DEFAULT_WORK_MAX_LANES } from "../config";
+import { WORK_LANE_PREFIX } from "../orchestrator/lane-governor";
 import type { GatewayDatabase } from "../store/db";
 
 /**
@@ -29,6 +31,8 @@ import type { GatewayDatabase } from "../store/db";
 const KNOWN_DELIVERY_STATES = new Set(["pending", "inflight", "confirmed", "failed_ambiguous", "expired"]);
 /** Inbound queue states defined by the durable queue itself. */
 const KNOWN_INBOUND_STATES = new Set(["pending", "processing", "done"]);
+/** Lane-job states after which the worker owns no unresolved work; only these may vouch for a retired lane. */
+const SETTLED_JOB_STATES = new Set(["attempt_ended", "done", "aborted"]);
 
 export interface RuntimeCycleSources {
 	readonly sessionRows: Array<{
@@ -59,15 +63,32 @@ export interface RuntimeCycleSources {
 	readonly monitorStages: ReadonlyMap<string, number>;
 	readonly memoryClosing: boolean;
 	readonly instanceId: string;
+	/** Bound `work.run` lanes and the configured admission cap. */
+	readonly activeLanes: number;
+	readonly maxLanes: number;
+	/**
+	 * Worker origins whose durable lane job is settled (`attempt_ended`,
+	 * `done`, `aborted`). An unbound worker row is a deliberate retirement only
+	 * with this positive evidence: no job row at all is a failed first bind
+	 * (`rebindEpoch` runs before the job is created), and a `running`,
+	 * `awaiting_operator`, or `stalled` job is a crash-left or held worker.
+	 */
+	readonly settledWorkOrigins: ReadonlySet<string>;
 }
 
 export class RuntimeCycleProjector {
 	readonly #database: GatewayDatabase;
 	readonly #memory: { readonly queueDepth: number };
+	readonly #maxLanes: number;
 
-	constructor(database: GatewayDatabase, memory: { readonly queueDepth: number }) {
+	constructor(
+		database: GatewayDatabase,
+		memory: { readonly queueDepth: number },
+		options: { readonly maxLanes?: number } = {},
+	) {
 		this.#database = database;
 		this.#memory = memory;
+		this.#maxLanes = options.maxLanes ?? DEFAULT_WORK_MAX_LANES;
 	}
 
 	/** Snapshots durable state and projects the runtime cycle. Read-only; no writes. */
@@ -106,6 +127,14 @@ export class RuntimeCycleProjector {
 			contextDiff: this.#database.contextDiagnostics(),
 			memoryClosing: this.#memory.queueDepth > 0,
 			instanceId: this.#database.instanceId,
+			activeLanes: this.#database.workLaneRows().length,
+			maxLanes: this.#maxLanes,
+			settledWorkOrigins: new Set(
+				this.#database
+					.laneJobRows()
+					.filter((row) => SETTLED_JOB_STATES.has(row.state))
+					.map((row) => `${WORK_LANE_PREFIX}${row.lane_key.slice("work-".length)}`),
+			),
 		};
 	}
 }
@@ -116,7 +145,16 @@ export function projectRuntimeCycle(sources: RuntimeCycleSources, generatedAt: s
 
 	const sessions: CycleSessionView[] = sources.sessionRows.map((row) => {
 		const origin = parseOriginRef(row.origin_ref_json);
-		if (row.gjc_session_id === "" || row.epoch < 0) gates.add("stale_session_identity");
+		// A retired worker lane keeps its row (the epoch derives the next create
+		// key) with no bound session; that is the designed idle state, not a
+		// persona origin stuck mid-rebind. Retirement is proven only by a
+		// settled lane job: a failed first bind leaves the same unbound row with
+		// no job, and a crash leaves one with an unsettled job. Both stay gated.
+		const retiredLane =
+			row.origin_key.startsWith(WORK_LANE_PREFIX) &&
+			row.gjc_session_id === "" &&
+			sources.settledWorkOrigins.has(row.origin_key);
+		if ((row.gjc_session_id === "" && !retiredLane) || row.epoch < 0) gates.add("stale_session_identity");
 		return {
 			originKey: row.origin_key,
 			origin,
@@ -162,6 +200,9 @@ export function projectRuntimeCycle(sources: RuntimeCycleSources, generatedAt: s
 	// `batched` rows used to strand forever while the projection stayed green).
 	if (sources.monitorStages.get("batched") || sources.monitorStages.get("dispatched"))
 		gates.add("monitor_settlement_stuck");
+	// Lane saturation is an operator condition: every further work.run is
+	// refused until a lane is retired, so it must not read as a healthy idle.
+	if (sources.activeLanes >= sources.maxLanes) gates.add("lane_capacity_exhausted");
 
 	const pendingInbound = sources.pendingInbound;
 	const unsettled = totalUnsettled(sources);
@@ -202,6 +243,7 @@ export function projectRuntimeCycle(sources: RuntimeCycleSources, generatedAt: s
 		inFlightInbound: sources.inFlightInbound,
 		pendingInbound,
 		contextDiff: sources.contextDiff,
+		lanes: { active: sources.activeLanes, max: sources.maxLanes },
 	};
 }
 

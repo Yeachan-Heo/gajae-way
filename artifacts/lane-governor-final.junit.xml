@@ -1,0 +1,67 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<testsuites name="bun test" tests="56" assertions="300" failures="0" skipped="0" time="1.593136">
+  <testsuite name="packages/gateway/test/cycle.test.ts" file="packages/gateway/test/cycle.test.ts" tests="20" assertions="60" failures="0" skipped="0" time="0.006221" hostname="MacBook-Pro-3.local">
+    <testsuite name="runtime cycle projection" file="packages/gateway/test/cycle.test.ts" line="54" tests="20" assertions="60" failures="0" skipped="0" time="0" hostname="MacBook-Pro-3.local">
+      <testcase name="empty durable state projects idle with no gates" classname="runtime cycle projection" time="0.000158" file="packages/gateway/test/cycle.test.ts" line="55" assertions="5" />
+      <testcase name="a saturated lane cap gates lane_capacity_exhausted and reports the census" classname="runtime cycle projection" time="0.000058" file="packages/gateway/test/cycle.test.ts" line="64" assertions="5" />
+      <testcase name="an unbound worker lane is retired only on positive settled-job evidence" classname="runtime cycle projection" time="0.000168" file="packages/gateway/test/cycle.test.ts" line="74" assertions="4" />
+      <testcase name="healthy bound session with no work projects idle and carries identity/provenance" classname="runtime cycle projection" time="0.00005" file="packages/gateway/test/cycle.test.ts" line="96" assertions="5" />
+      <testcase name="mid-rebind session (empty gjc session id) gates as stale identity, never healthy" classname="runtime cycle projection" time="0.000014" file="packages/gateway/test/cycle.test.ts" line="112" assertions="4" />
+      <testcase name="claimed inbound message projects dispatching" classname="runtime cycle projection" time="0.000009" file="packages/gateway/test/cycle.test.ts" line="124" assertions="2" />
+      <testcase name="pending (unclaimed) inbound also projects dispatching" classname="runtime cycle projection" time="0.000009" file="packages/gateway/test/cycle.test.ts" line="130" assertions="2" />
+      <testcase name="unsettled delivery projects delivering; settled alone does not" classname="runtime cycle projection" time="0.000016" file="packages/gateway/test/cycle.test.ts" line="136" assertions="3" />
+      <testcase name="pending inbound for an origin with no session row still counts in the census" classname="runtime cycle projection" time="0.000008" file="packages/gateway/test/cycle.test.ts" line="161" assertions="3" />
+      <testcase name="in-flight memory closure projects draining" classname="runtime cycle projection" time="0.000006" file="packages/gateway/test/cycle.test.ts" line="170" assertions="2" />
+      <testcase name="durable unsettled memory intents also project draining across a restart" classname="runtime cycle projection" time="0.000022" file="packages/gateway/test/cycle.test.ts" line="176" assertions="3" />
+      <testcase name="quarantined memory intent gates memory_closure_blocked and degrades" classname="runtime cycle projection" time="0.000008" file="packages/gateway/test/cycle.test.ts" line="192" assertions="2" />
+      <testcase name="failed monitor event gates monitor_settlement_failed and degrades" classname="runtime cycle projection" time="0.000276" file="packages/gateway/test/cycle.test.ts" line="198" assertions="3" />
+      <testcase name="failed_ambiguous deliveries are unsettled work but not a gate by themselves" classname="runtime cycle projection" time="0.000037" file="packages/gateway/test/cycle.test.ts" line="216" assertions="3" />
+      <testcase name="unknown delivery state gates delivery_settlement_unknown — never silently healthy" classname="runtime cycle projection" time="0.000016" file="packages/gateway/test/cycle.test.ts" line="230" assertions="2" />
+      <testcase name="unknown inbound queue state also gates delivery_settlement_unknown" classname="runtime cycle projection" time="0.00001" file="packages/gateway/test/cycle.test.ts" line="245" assertions="2" />
+      <testcase name="degraded dominates concurrent busy work — never reported as merely dispatching" classname="runtime cycle projection" time="0.000015" file="packages/gateway/test/cycle.test.ts" line="251" assertions="2" />
+      <testcase name="per-origin pending inbound and unsettled delivery ages attach to the right session" classname="runtime cycle projection" time="0.000028" file="packages/gateway/test/cycle.test.ts" line="264" assertions="3" />
+      <testcase name="aggregate and per-origin context drift project without exposing message bodies" classname="runtime cycle projection" time="0.000067" file="packages/gateway/test/cycle.test.ts" line="278" assertions="3" />
+      <testcase name="an unparseable stored origin ref still surfaces the session instead of hiding it" classname="runtime cycle projection" time="0.00002" file="packages/gateway/test/cycle.test.ts" line="300" assertions="2" />
+    </testsuite>
+  </testsuite>
+  <testsuite name="packages/gateway/test/lane-governor-redteam.test.ts" file="packages/gateway/test/lane-governor-redteam.test.ts" tests="24" assertions="178" failures="0" skipped="0" time="1.555466" hostname="MacBook-Pro-3.local">
+    <testcase name="R1 concurrent new names cannot overbook the final slot" classname="" time="0.171587" file="packages/gateway/test/lane-governor-redteam.test.ts" line="105" assertions="6" />
+    <testcase name="R2 retire refuses an open live turn without waiting for it to finish" classname="" time="0.077453" file="packages/gateway/test/lane-governor-redteam.test.ts" line="130" assertions="6" />
+    <testcase name="R3 retirement advances epoch and rerun never references the old session" classname="" time="0.114825" file="packages/gateway/test/lane-governor-redteam.test.ts" line="156" assertions="10" />
+    <testcase name="R4 invalid models and name boundaries fail closed; valid model reaches bind and request" classname="" time="0.165895" file="packages/gateway/test/lane-governor-redteam.test.ts" line="174" assertions="30" />
+    <testcase name="R5 capacity details include every candidate sorted idlest first" classname="" time="0.302088" file="packages/gateway/test/lane-governor-redteam.test.ts" line="190" assertions="13" />
+    <testcase name="R6 sweep is idempotent and protects an idle lane with an open attempt" classname="" time="0.13098" file="packages/gateway/test/lane-governor-redteam.test.ts" line="206" assertions="6" />
+    <testcase name="R7 socket ops.cycle saturation gate clears after retirement without stale identity" classname="" time="0.144674" file="packages/gateway/test/lane-governor-redteam.test.ts" line="237" assertions="11" />
+    <testcase name="R7b a failed first bind leaves an unbound worker row with no job and stays a stale-identity gate" classname="" time="0.025054" file="packages/gateway/test/lane-governor-redteam.test.ts" line="251" assertions="9" />
+    <testcase name="R8 retirement source never calls session.delete or deleteSession" classname="" time="0.000387" file="packages/gateway/test/lane-governor-redteam.test.ts" line="270" assertions="3" />
+    <testcase name="G1 ended gateway wait does not prove broker terminality (in_flight)" classname="" time="0.00302" file="packages/gateway/test/lane-governor-redteam.test.ts" line="306" assertions="4" />
+    <testcase name="G2 ended gateway wait does not prove broker terminality (status unavailable)" classname="" time="0.0028" file="packages/gateway/test/lane-governor-redteam.test.ts" line="306" assertions="4" />
+    <testcase name="G3 ambiguous close retains identity until broker explicitly disowns session" classname="" time="0.002726" file="packages/gateway/test/lane-governor-redteam.test.ts" line="336" assertions="6" />
+    <testcase name="G4 sweep snapshot cannot retire a replacement bound before lock acquisition" classname="" time="0.002371" file="packages/gateway/test/lane-governor-redteam.test.ts" line="368" assertions="3" />
+    <testcase name="G5 admission lock is released while first distinct lane turn is still running" classname="" time="0.130935" file="packages/gateway/test/lane-governor-redteam.test.ts" line="398" assertions="7" />
+    <testcase name="G6 idle retirement interval starts at turn end, including the exact boundary" classname="" time="0.159951" file="packages/gateway/test/lane-governor-redteam.test.ts" line="426" assertions="9" />
+    <testcase name="G7 corrupt bound job consumes socket capacity and identifies corrupt candidate" classname="" time="0.023412" file="packages/gateway/test/lane-governor-redteam.test.ts" line="449" assertions="5" />
+    <testcase name="G8 socket cycle gates unbound unsettled work but not done work" classname="" time="0.025639" file="packages/gateway/test/lane-governor-redteam.test.ts" line="463" assertions="8" />
+    <testcase name="H1 failed ledger retires when broker proves terminal_ok" classname="" time="0.002627" file="packages/gateway/test/lane-governor-redteam.test.ts" line="477" assertions="3" />
+    <testcase name="H2 failed ledger with unknown broker operation needs a dead session" classname="" time="0.004397" file="packages/gateway/test/lane-governor-redteam.test.ts" line="496" assertions="6" />
+    <testcase name="H3 sweep nomination cannot retire a done job replaced by a fresh open attempt" classname="" time="0.002662" file="packages/gateway/test/lane-governor-redteam.test.ts" line="522" assertions="5" />
+    <testcase name="H4 sweep refuses rebound even when the replacement job is also done" classname="" time="0.002603" file="packages/gateway/test/lane-governor-redteam.test.ts" line="556" assertions="5" />
+    <testcase name="H5 empty job JSON consumes capacity and socket retirement refuses corrupt record" classname="" time="0.026734" file="packages/gateway/test/lane-governor-redteam.test.ts" line="600" assertions="9" />
+    <testcase name="H6 operator socket retirement of an idle done job needs no sweep nomination" classname="" time="0.022968" file="packages/gateway/test/lane-governor-redteam.test.ts" line="620" assertions="6" />
+    <testcase name="H7 concurrent sweeps close once and bump the epoch exactly once" classname="" time="0.002487" file="packages/gateway/test/lane-governor-redteam.test.ts" line="636" assertions="4" />
+  </testsuite>
+  <testsuite name="packages/gateway/test/lane-governor.test.ts" file="packages/gateway/test/lane-governor.test.ts" tests="12" assertions="62" failures="0" skipped="0" time="0.028281" hostname="MacBook-Pro-3.local">
+    <testcase name="activeLanes includes only bound work origins and derives idle time from activity" classname="" time="0.002265" file="packages/gateway/test/lane-governor.test.ts" line="45" assertions="4" />
+    <testcase name="admission admits existing lanes at capacity and reports new-name candidates idlest first" classname="" time="0.002255" file="packages/gateway/test/lane-governor.test.ts" line="68" assertions="4" />
+    <testcase name="retire closes the session in its job repo, clears the binding, bumps epoch, and logs" classname="" time="0.00223" file="packages/gateway/test/lane-governor.test.ts" line="95" assertions="5" />
+    <testcase name="retire refuses unknown names and open attempts without closing or changing epochs" classname="" time="0.002336" file="packages/gateway/test/lane-governor.test.ts" line="115" assertions="5" />
+    <testcase name="a failed close keeps the lane bound unless the broker proves the session gone" classname="" time="0.002438" file="packages/gateway/test/lane-governor.test.ts" line="136" assertions="11" />
+    <testcase name="a corrupt lane-job record fails closed: counted, never retired" classname="" time="0.002403" file="packages/gateway/test/lane-governor.test.ts" line="174" assertions="7" />
+    <testcase name="an attempt the ledger ended without broker proof is retired only once the broker reports it terminal" classname="" time="0.002498" file="packages/gateway/test/lane-governor.test.ts" line="200" assertions="5" />
+    <testcase name="sweep leaves a lane alone when it was rebound between nomination and the lock" classname="" time="0.002173" file="packages/gateway/test/lane-governor.test.ts" line="234" assertions="4" />
+    <testcase name="sweep retires idle and terminal jobs but preserves fresh lanes and open attempts" classname="" time="0.002404" file="packages/gateway/test/lane-governor.test.ts" line="247" assertions="6" />
+    <testcase name="a ledger `failed` attempt is local evidence only: retirement waits for broker terminality" classname="" time="0.002395" file="packages/gateway/test/lane-governor.test.ts" line="285" assertions="4" />
+    <testcase name="an existing lane-job row with an empty body is corrupt, not absent" classname="" time="0.002104" file="packages/gateway/test/lane-governor.test.ts" line="316" assertions="4" />
+    <testcase name="sweep leaves a lane alone when it was reused on the same session between nomination and the lock" classname="" time="0.002449" file="packages/gateway/test/lane-governor.test.ts" line="337" assertions="3" />
+  </testsuite>
+</testsuites>

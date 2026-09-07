@@ -381,6 +381,33 @@ export interface WorkRunParams {
 	 * the durable job is awaiting_operator (issue #10 hold semantics).
 	 */
 	readonly resume?: boolean;
+	/** Startup model: an explicit model id or a model profile preset; applied at session create and on every send. */
+	readonly model?: string | { readonly preset: string };
+}
+
+export interface WorkRetireParams {
+	readonly name: string;
+}
+
+/**
+ * Retirement closes the worker's gjc session and clears the gateway binding,
+ * so the next `work.run` for that name creates a fresh session. A lane with an
+ * open attempt is never retired from under its turn.
+ */
+export type WorkRetireResult =
+	| { readonly retired: true; readonly sessionKey: string; readonly sessionId: string; readonly closed: boolean }
+	| { readonly retired: false; readonly sessionKey: string; readonly reason: string };
+
+/** Structured detail carried by a `lane_capacity` error. */
+export interface LaneCapacityDetail {
+	readonly maxLanes: number;
+	readonly active: number;
+	/**
+	 * Retirement candidates, idlest first, so the caller can free a slot
+	 * deliberately. `idleMs` is -1 when the lane has no recorded activity.
+	 * A candidate may still refuse retirement (open attempt, unproven end).
+	 */
+	readonly candidates: ReadonlyArray<{ readonly name: string; readonly idleMs: number; readonly state: string }>;
 }
 
 /**
@@ -406,6 +433,8 @@ export interface WorkJobsResult {
 		readonly state: string;
 		readonly branch: string;
 		readonly worktree_path: string;
+		readonly session_id: string;
+		readonly last_activity_at: string | null;
 		readonly updated_at: string;
 	}>;
 }
@@ -494,7 +523,8 @@ export type CycleGateReason =
 	| "delivery_settlement_unknown"
 	| "memory_closure_blocked"
 	| "monitor_settlement_failed"
-	| "monitor_settlement_stuck";
+	| "monitor_settlement_stuck"
+	| "lane_capacity_exhausted";
 
 export interface CycleSessionView {
 	/** Canonical, opaque origin key (protocol originKey; never reparsed). */
@@ -560,6 +590,8 @@ export interface OpsCycleResult {
 	readonly pendingInbound: number;
 	/** Aggregate unread/omission diagnostics across origins. */
 	readonly contextDiff: ConversationContextDiagnostics;
+	/** Worker-lane census against the configured admission cap. */
+	readonly lanes: { readonly active: number; readonly max: number };
 }
 
 /** Verb catalog: verb name -> { params, result } (documentation-level typing). */
@@ -594,6 +626,7 @@ export interface VerbCatalogV01 {
 	"ops.integrity": { params: undefined; result: { readonly ok: boolean; readonly detail: string } };
 	"work.run": { params: WorkRunParams; result: WorkRunResult };
 	"work.jobs": { result: WorkJobsResult };
+	"work.retire": { params: WorkRetireParams; result: WorkRetireResult };
 	"chat.react": { params: ChatReactParams; result: ChatReactResult };
 	"engagement.reaction": { params: EngagementReactionParams; result: EngagementReactionResult };
 	"ops.cycle": { params: undefined; result: OpsCycleResult };
@@ -628,6 +661,7 @@ export const VERBS_V01 = [
 	"ops.integrity",
 	"work.run",
 	"work.jobs",
+	"work.retire",
 	"chat.react",
 	"engagement.reaction",
 	"gateway.reloadConfig",

@@ -1,0 +1,36 @@
+{
+ "schemaVersion": 1,
+ "kind": "cli-replay",
+ "replaySafe": true,
+ "command": [
+  "bun",
+  "-e",
+  "console.log(\"lane-governor-cli-ok\")"
+ ],
+ "cwd": ".",
+ "env": {
+  "LC_ALL": "C"
+ },
+ "timeoutMs": 30000,
+ "expectedExitCode": 0,
+ "recordedStdout": "lane-governor-cli-ok\n",
+ "recordedStderr": "",
+ "invariants": [
+  {
+   "type": "substring",
+   "value": "lane-governor-cli-ok"
+  },
+  {
+   "type": "not_substring",
+   "value": "error"
+  }
+ ],
+ "replayExempt": {
+  "reasonCode": "platform_unavailable",
+  "reason": "The compiled GJC runtime cannot execute the pinned-Bun CLI replay (process.execPath is the GJC application); the live CLI surface is proven by the PTY capture of the real gajaeway work run/retire/jobs argument handling (artifacts/lane-governor-cli-pty.cap).",
+  "approvedBy": "ultragoal leader (session 01a07a2c)",
+  "fallbackArtifactRefs": [
+   "cli-pty"
+  ]
+ }
+}

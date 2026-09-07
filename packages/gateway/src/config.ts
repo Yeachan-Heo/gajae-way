@@ -22,6 +22,18 @@ export interface CredentialFileReference {
 }
 
 export type GjcModelSelection = string | { readonly preset: string };
+
+/** Upper bound on concurrently bound `work.run` lanes; more are refused with `lane_capacity`. */
+export const DEFAULT_WORK_MAX_LANES = 8;
+/** A bound worker lane quiet for this long is closed by the sweep and rebound on its next run. */
+export const DEFAULT_WORK_IDLE_RETIRE_MS = 6 * 60 * 60_000;
+const WORK_IDLE_RETIRE_MIN_MS = 60_000;
+const WORK_IDLE_RETIRE_MAX_MS = 7 * 24 * 60 * 60_000;
+
+export interface WorkLaneConfig {
+	readonly maxLanes?: number;
+	readonly idleRetireMs?: number;
+}
 export type GjcServiceTier =
 	| "none"
 	| "auto"
@@ -79,6 +91,8 @@ export interface GatewayConfigFile {
 	readonly watcherRoots?: readonly string[];
 	readonly scriptRoot?: string;
 	readonly runtime?: RuntimeConfig;
+	/** Worker-lane governance: admission cap and idle retirement for `work.run` sessions. */
+	readonly work?: WorkLaneConfig;
 }
 
 export interface GatewayConfig extends GatewayConfigFile {
@@ -317,6 +331,31 @@ function parseMonitorContextFailureRollThreshold(value: unknown): number {
 	return value as number;
 }
 
+function parseWork(value: unknown): WorkLaneConfig {
+	const input = requireObject(value, "work");
+	if (Object.keys(input).some((key) => key !== "maxLanes" && key !== "idleRetireMs"))
+		throw new ConfigError("config_invalid", "work may only contain maxLanes and idleRetireMs");
+	if (
+		input.maxLanes !== undefined &&
+		(!Number.isInteger(input.maxLanes) || (input.maxLanes as number) < 1 || (input.maxLanes as number) > 256)
+	)
+		throw new ConfigError("config_invalid", "work.maxLanes must be an integer between 1 and 256");
+	if (
+		input.idleRetireMs !== undefined &&
+		(!Number.isInteger(input.idleRetireMs) ||
+			(input.idleRetireMs as number) < WORK_IDLE_RETIRE_MIN_MS ||
+			(input.idleRetireMs as number) > WORK_IDLE_RETIRE_MAX_MS)
+	)
+		throw new ConfigError(
+			"config_invalid",
+			`work.idleRetireMs must be an integer between ${WORK_IDLE_RETIRE_MIN_MS} and ${WORK_IDLE_RETIRE_MAX_MS}`,
+		);
+	return {
+		...(input.maxLanes === undefined ? {} : { maxLanes: input.maxLanes as number }),
+		...(input.idleRetireMs === undefined ? {} : { idleRetireMs: input.idleRetireMs as number }),
+	};
+}
+
 function parseDmPolicy(value: unknown): DmPolicy {
 	if (typeof value !== "string" || !DM_POLICIES.includes(value as DmPolicy))
 		throw new ConfigError("config_invalid", `dmPolicy must be one of ${DM_POLICIES.join(", ")}`);
@@ -368,6 +407,7 @@ export function parseConfigFile(value: unknown): GatewayConfigFile {
 		...(serviceTier ? { serviceTier } : {}),
 		...(input.dmPolicy === undefined ? {} : { dmPolicy: parseDmPolicy(input.dmPolicy) }),
 		...(input.ownerTarget === undefined ? {} : { ownerTarget: parseOwnerTarget(input.ownerTarget) }),
+		...(input.work === undefined ? {} : { work: parseWork(input.work) }),
 		...(input.monitorContextFailureRollThreshold === undefined
 			? {}
 			: {
@@ -489,6 +529,7 @@ export const RESTART_REQUIRED_FIELDS = [
 	"runtime",
 	"ownerTarget",
 	"monitorContextFailureRollThreshold",
+	"work",
 ] as const;
 
 /**

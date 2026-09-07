@@ -35,7 +35,7 @@ export class ActionGuard {
 }
 
 export const ACTION_GUARD_SYSTEM_NOTICE =
-	"Never execute unrecoverable commands or recursively delete $HOME itself or absolute paths outside $HOME and $GAJAEWAY_HOME. These safety floors are unoverridable.";
+	"Never execute unrecoverable commands or recursively delete $HOME itself or absolute paths outside $HOME and $GAJAEWAY_HOME. These safety floors are unoverridable. Never launch gjc sessions directly from a turn (tmux/nohup/setsid gjc, gjc -p, gjc sdk session create): delegated coding work runs through the gateway work.run verb (optionally with a model preset) and is retired with work.retire, because only gateway-owned lanes are counted against the lane cap, indexed, and retired.";
 
 function isUnrecoverable(command: string): boolean {
 	return (

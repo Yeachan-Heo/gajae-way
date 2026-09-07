@@ -1107,6 +1107,154 @@ test("resuming a stalled job clears the hold durably: the next ordinary call is 
 	client.close();
 });
 
+test("work.run forwards a model preset to bind and send and rejects invalid models", async () => {
+	directory = await mkdtemp(join(tmpdir(), "gajaeway-server-"));
+	const config: GatewayConfig = {
+		schemaVersion: 1,
+		home: directory,
+		configPath: join(directory, "config.json"),
+		socketPath: join(directory, "gateway.sock"),
+		dbPath: join(directory, "gateway.db"),
+		logVerbosity: "info",
+	};
+	const database = await GatewayDatabase.open(config.dbPath);
+	const sessionPort = new ScriptedSessionPort({
+		onSend: (input, scripted) => scripted.complete(input.opRef, "model result"),
+	});
+	server = await startUnixServer({ config, database, sessionPort, onStop: () => database.close() });
+	const client = await connect(config.socketPath);
+	client.send({ v: "0.1", type: "hello", payload: { supportedVersions: ["0.1"] } });
+	await waitFor(client.frames, 1);
+	client.send({
+		v: "0.1",
+		type: "request",
+		id: "model",
+		verb: "work.run",
+		params: { name: "model", text: "work", cwd: directory, model: { preset: "muse-gpt" } },
+	});
+	await waitFor(client.frames, 2);
+	expect(client.frames.find((frame) => frame.id === "model")).toMatchObject({
+		type: "response",
+		result: { text: "model result", held: false },
+	});
+	expect(sessionPort.binds[0].model).toEqual({ preset: "muse-gpt" });
+	expect(sessionPort.sends[0].model).toEqual({ preset: "muse-gpt" });
+	for (const [index, model] of [{ preset: "" }, 42].entries()) {
+		const id = `invalid-model-${index}`;
+		client.send({
+			v: "0.1",
+			type: "request",
+			id,
+			verb: "work.run",
+			params: { name: "model", text: "work", model },
+		});
+		await waitFor(client.frames, 3 + index);
+		expect(client.frames.find((frame) => frame.id === id)).toMatchObject({
+			type: "error",
+			error: { code: "invalid_params" },
+		});
+	}
+	expect(sessionPort.binds).toHaveLength(1);
+	expect(sessionPort.sends).toHaveLength(1);
+	client.close();
+});
+
+test("work capacity rejects new lanes, permits reuse, and work.retire frees the slot with jobs activity visible", async () => {
+	directory = await mkdtemp(join(tmpdir(), "gajaeway-server-"));
+	const config: GatewayConfig = {
+		schemaVersion: 1,
+		home: directory,
+		configPath: join(directory, "config.json"),
+		socketPath: join(directory, "gateway.sock"),
+		dbPath: join(directory, "gateway.db"),
+		logVerbosity: "info",
+		work: { maxLanes: 1 },
+	};
+	const database = await GatewayDatabase.open(config.dbPath);
+	const sessionPort = new ScriptedSessionPort({
+		onBind: (input) => {
+			const sessionId = database.getSessionRecord(input.originKey)?.sessionId || crypto.randomUUID();
+			database.putSession(input.originKey, sessionId);
+			return sessionId;
+		},
+		onSend: (input, scripted) => scripted.complete(input.opRef, "worker result"),
+	});
+	server = await startUnixServer({ config, database, sessionPort, onStop: () => database.close() });
+	const client = await connect(config.socketPath);
+	client.send({ v: "0.1", type: "hello", payload: { supportedVersions: ["0.1"] } });
+	await waitFor(client.frames, 1);
+	client.send({
+		v: "0.1",
+		type: "request",
+		id: "first",
+		verb: "work.run",
+		params: { name: "a", text: "work", cwd: directory },
+	});
+	await waitFor(client.frames, 2);
+	const first = client.frames.find((frame) => frame.id === "first");
+	expect(first).toMatchObject({ type: "response", result: { held: false, sessionKey: "work/task/a" } });
+	const sessionId = database.getSessionRecord("work/task/a")!.sessionId;
+	client.send({
+		v: "0.1",
+		type: "request",
+		id: "full",
+		verb: "work.run",
+		params: { name: "b", text: "work", cwd: directory },
+	});
+	await waitFor(client.frames, 3);
+	expect(client.frames.find((frame) => frame.id === "full")).toMatchObject({
+		type: "error",
+		error: { code: "lane_capacity", detail: { active: 1, maxLanes: 1, candidates: [{ name: "a" }] } },
+	});
+	expect(sessionPort.binds).toHaveLength(1);
+	expect(sessionPort.sends).toHaveLength(1);
+	client.send({
+		v: "0.1",
+		type: "request",
+		id: "reuse",
+		verb: "work.run",
+		params: { name: "a", text: "again", cwd: directory },
+	});
+	await waitFor(client.frames, 4);
+	expect(client.frames.find((frame) => frame.id === "reuse")).toMatchObject({
+		type: "response",
+		result: { held: false, sessionKey: "work/task/a" },
+	});
+	expect(sessionPort.sends).toHaveLength(2);
+	expect(sessionPort.sends[1].sessionId).toBe(sessionId);
+	client.send({ v: "0.1", type: "request", id: "jobs-active", verb: "work.jobs" });
+	await waitFor(client.frames, 5);
+	const jobs = client.frames.find((frame) => frame.id === "jobs-active");
+	expect(jobs.result.jobs).toHaveLength(1);
+	expect(Number.isFinite(Date.parse(jobs.result.jobs[0].last_activity_at))).toBe(true);
+	expect(jobs.result.jobs[0]).toMatchObject({
+		session_id: sessionId,
+		last_activity_at: expect.any(String),
+	});
+	client.send({ v: "0.1", type: "request", id: "retire", verb: "work.retire", params: { name: "a" } });
+	await waitFor(client.frames, 6);
+	expect(client.frames.find((frame) => frame.id === "retire")).toMatchObject({
+		type: "response",
+		result: { retired: true, sessionKey: "work/task/a", sessionId, closed: true },
+	});
+	expect(sessionPort.closes).toEqual([{ sessionId, repo: directory }]);
+	expect(database.getSessionRecord("work/task/a")).toEqual({ sessionId: "", epoch: 1 });
+	client.send({
+		v: "0.1",
+		type: "request",
+		id: "freed",
+		verb: "work.run",
+		params: { name: "b", text: "work", cwd: directory },
+	});
+	await waitFor(client.frames, 7);
+	expect(client.frames.find((frame) => frame.id === "freed")).toMatchObject({
+		type: "response",
+		result: { held: false, sessionKey: "work/task/b", text: "worker result" },
+	});
+	expect(sessionPort.sends).toHaveLength(3);
+	client.close();
+});
+
 test("responses larger than one socket buffer arrive intact (backpressure outbox)", async () => {
 	directory = await mkdtemp(join(tmpdir(), "gajaeway-server-"));
 	const config: GatewayConfig = {
