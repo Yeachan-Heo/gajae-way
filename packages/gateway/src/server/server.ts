@@ -578,11 +578,15 @@ function createRuntime(options: GatewayServerOptions): Runtime {
 	// Broker session-index GC. Once per interval, after recovery has re-bound
 	// whatever it is going to: anything the broker still indexes that no origin
 	// or pending turn references is a rotated-away session and is deleted.
-	const sessionGcTimer = setInterval(() => {
+	const sweepSessions = () =>
 		void personaSessions
 			.collectSessions()
 			.catch((error: unknown) => console.error(`session gc sweep failed: ${diagnostic(error)}`));
-	}, options.sessionGcIntervalMs ?? DEFAULT_SESSION_GC_INTERVAL_MS);
+	const sessionGcTimer = setInterval(sweepSessions, options.sessionGcIntervalMs ?? DEFAULT_SESSION_GC_INTERVAL_MS);
+	// Sweep once right after boot: a freshly started broker has its full cursor
+	// budget, which is the only time an over-sized index can be listed at all.
+	// Recovery has already rebound the origins that are going to be rebound.
+	setTimeout(sweepSessions, options.sessionGcIntervalMs === undefined ? 15_000 : 0).unref?.();
 	// AC6: the 120s stall alarm is a running-server obligation, not only a
 	// generic-request polling side effect. This heartbeat drives every persona
 	// tail's threshold check; it never aborts a turn (alarm overlay only).

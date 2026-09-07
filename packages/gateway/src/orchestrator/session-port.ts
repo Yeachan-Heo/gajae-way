@@ -604,7 +604,9 @@ export class BrokerSessionPort implements SessionPort {
 		const seen = new Set<string>();
 		for (let pages = 0; pages < 100; pages++) {
 			const result = await this.#cli(
-				["sdk", "session", "list", "--scope", "all", ...(cursor ? ["--cursor", cursor] : [])],
+				// Largest page the broker allows: fewer cursors per traversal, and a
+				// traversal that drains to the end is the only one that frees its cursor.
+				["sdk", "session", "list", "--scope", "all", "--limit", "100", ...(cursor ? ["--cursor", cursor] : [])],
 				{ timeoutMs: 30_000 },
 			);
 			const page = parseEnvelope<{ sessions?: unknown[]; continuationCursor?: unknown }>(result, "session.list");
