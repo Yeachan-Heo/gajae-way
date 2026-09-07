@@ -1384,6 +1384,21 @@ export class GatewayDatabase {
 			.get(originKey)?.gjc_session_id;
 	}
 
+	/**
+	 * Every gjc session id this database still points at: the current binding of
+	 * each origin, and the session of any inbound turn that has not terminated.
+	 * Anything the broker indexes outside this set is a leftover of a rotated
+	 * epoch and owes nothing to this gateway.
+	 */
+	referencedSessionIds(): ReadonlySet<string> {
+		const rows = this.#database
+			.query<{ id: string }, []>(
+				"SELECT gjc_session_id AS id FROM sessions WHERE gjc_session_id <> '' UNION SELECT bound_session_id AS id FROM inbound_messages WHERE bound_session_id IS NOT NULL AND state = 'pending'",
+			)
+			.all();
+		return new Set(rows.map((row) => row.id));
+	}
+
 	putSession(originKey: string, sessionId: string): void {
 		this.#database
 			.query(

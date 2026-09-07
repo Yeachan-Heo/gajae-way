@@ -170,6 +170,8 @@ async function loadOrCreateLaneJob(
 
 /** Persona tail stall heartbeat; well under the 120s stallTimeoutMs so alarms land within one interval of the threshold. */
 const DEFAULT_STALL_CHECK_INTERVAL_MS = 5_000;
+/** Broker session-index GC cadence; the broker's cursor budget leaks per traversal, so keep the index under one page. */
+const DEFAULT_SESSION_GC_INTERVAL_MS = 10 * 60_000;
 /** /restart: hard-exit budget after the ordered stop begins. */
 const RESTART_HARD_EXIT_MS = 15_000;
 /** Thread history shown to a freshly started session: everything (humans, bots, self) in the last 24h, capped. */
@@ -224,6 +226,8 @@ export interface GatewayServerOptions {
 	readonly exitProcess?: (code: number) => void;
 	/** Test seam for the persona tail stall heartbeat; production uses the 5s default. */
 	readonly stallCheckIntervalMs?: number;
+	/** Test seam for the broker session-index GC; production uses the 10m default. */
+	readonly sessionGcIntervalMs?: number;
 	/** Mid-work speech pacing (issue #71). */
 	readonly interimSpeech?: Partial<InterimSpeechLimits>;
 }
@@ -290,6 +294,7 @@ interface Runtime {
 	readonly monitors: MonitorPropagator;
 	readonly monitorRuntime: MonitorRuntime;
 	readonly reconcileTimer: ReturnType<typeof setInterval>;
+	readonly sessionGcTimer: ReturnType<typeof setInterval>;
 	readonly stallTimer: ReturnType<typeof setInterval>;
 	readonly contextMaintenanceTimer: ReturnType<typeof setInterval>;
 	readonly stopBrokerGenerationListener?: () => void;
@@ -335,6 +340,7 @@ export async function startUnixServer(options: GatewayServerOptions): Promise<Ga
 		stopPromise = (async () => {
 			process.off("SIGHUP", onHup);
 			clearInterval(runtime.reconcileTimer);
+			clearInterval(runtime.sessionGcTimer);
 			clearInterval(runtime.stallTimer);
 			clearInterval(runtime.contextMaintenanceTimer);
 			// Stop accepting new sockets first, but keep existing sockets alive. Then
@@ -443,6 +449,7 @@ export function startStdioServer(options: GatewayServerOptions): GatewayServer {
 			// tracked and awaited before persona/tail/broker teardown.
 			await Promise.all([...runtime.requests]);
 			clearInterval(runtime.reconcileTimer);
+			clearInterval(runtime.sessionGcTimer);
 			clearInterval(runtime.stallTimer);
 			clearInterval(runtime.contextMaintenanceTimer);
 			await runtime.personaSessions.drain();
@@ -568,6 +575,14 @@ function createRuntime(options: GatewayServerOptions): Runtime {
 			.recover()
 			.catch((error: unknown) => console.error(`persona recovery sweep failed: ${diagnostic(error)}`));
 	}, 60_000);
+	// Broker session-index GC. Once per interval, after recovery has re-bound
+	// whatever it is going to: anything the broker still indexes that no origin
+	// or pending turn references is a rotated-away session and is deleted.
+	const sessionGcTimer = setInterval(() => {
+		void personaSessions
+			.collectSessions()
+			.catch((error: unknown) => console.error(`session gc sweep failed: ${diagnostic(error)}`));
+	}, options.sessionGcIntervalMs ?? DEFAULT_SESSION_GC_INTERVAL_MS);
 	// AC6: the 120s stall alarm is a running-server obligation, not only a
 	// generic-request polling side effect. This heartbeat drives every persona
 	// tail's threshold check; it never aborts a turn (alarm overlay only).
@@ -614,6 +629,7 @@ function createRuntime(options: GatewayServerOptions): Runtime {
 		monitors,
 		monitorRuntime,
 		reconcileTimer,
+		sessionGcTimer,
 		stallTimer,
 		contextMaintenanceTimer,
 		...(stopBrokerGenerationListener ? { stopBrokerGenerationListener } : {}),

@@ -15,7 +15,7 @@ import {
 import type { GjcModelSelection, GjcServiceTier } from "../config";
 import type { GatewayDatabase, InboundMessageRow, InboundTurn } from "../store/db";
 import { sanitizeDiagnostic } from "./rebind";
-import type { SessionBinding, SessionPort } from "./session-port";
+import type { IndexedSession, SessionBinding, SessionPort } from "./session-port";
 import {
 	deterministicInterimDeliveryId,
 	TailCapacityError,
@@ -55,6 +55,8 @@ const STEER_REPLAY_ATTEMPTS = 2;
 const DISPATCH_FAILURE_RETRY_MAX_MS = 60_000;
 /** Consecutive recovery sweeps (60s apart) an unknown op on a live idle session is held before release. */
 const HOLD_RELEASE_SWEEPS = 2;
+/** A saved session younger than this may still be resumed by a recovery path; leave it. */
+const GC_MIN_IDLE_MS = 60 * 60_000;
 
 export type PersonaActorState = "idle" | "turn-running";
 
@@ -304,6 +306,65 @@ export class PersonaSessionManager {
 	async stop(): Promise<void> {
 		this.#stopped = true;
 		await Promise.all([...this.#actors.values()].map((actor) => actor.stop()));
+	}
+
+	/**
+	 * Removes broker-indexed sessions this gateway no longer references. Every
+	 * epoch rotation (`/new`, steer refusal, disowned recovery) binds a fresh
+	 * session and leaves the old one saved in the broker's index; nothing ever
+	 * took them out. The index then outgrows one `session.list` page, every
+	 * id-resolving CLI call starts paging, the broker's 32-cursor budget leaks
+	 * away, and the origin goes dark with `cursor capacity is exhausted` (live:
+	 * jip, 149 indexed for 55 referenced, 2026-09-06).
+	 *
+	 * Deletion is conservative: only sessions that are not live, not referenced
+	 * by any origin binding or pending turn, and quiet for GC_MIN_IDLE_MS. The
+	 * broker's own guards (cleanup pending, terminal uncertain) still refuse, and
+	 * a refusal is logged, not retried in the same sweep.
+	 */
+	async collectSessions(): Promise<{ readonly indexed: number; readonly deleted: number; readonly refused: number }> {
+		const port = this.#port;
+		if (this.#stopped || !port.listSessions || !port.deleteSession) return { indexed: 0, deleted: 0, refused: 0 };
+		let indexed: readonly IndexedSession[];
+		try {
+			indexed = await port.listSessions();
+		} catch (error) {
+			this.#log(`session_gc_list_failed detail=${safeDiagnostic(error)}`);
+			return { indexed: 0, deleted: 0, refused: 0 };
+		}
+		const referenced = this.#database.referencedSessionIds();
+		const now = this.#now();
+		let deleted = 0;
+		let refused = 0;
+		for (const session of indexed) {
+			if (this.#stopped) break;
+			if (session.live || referenced.has(session.sessionId)) continue;
+			if (session.lastActivityMs !== undefined && now - session.lastActivityMs < GC_MIN_IDLE_MS) continue;
+			if (!session.cwd || !session.sessionPath) {
+				refused++;
+				continue;
+			}
+			try {
+				const outcome = await port.deleteSession({
+					sessionId: session.sessionId,
+					cwd: session.cwd,
+					sessionPath: session.sessionPath,
+				});
+				if (outcome.deleted) deleted++;
+				else {
+					refused++;
+					this.#log(`session_gc_refused session=${session.sessionId} code=${outcome.code}`);
+				}
+			} catch (error) {
+				refused++;
+				this.#log(`session_gc_refused session=${session.sessionId} detail=${safeDiagnostic(error)}`);
+			}
+		}
+		if (deleted > 0 || refused > 0)
+			this.#log(
+				`session_gc indexed=${indexed.length} referenced=${referenced.size} deleted=${deleted} refused=${refused}`,
+			);
+		return { indexed: indexed.length, deleted, refused };
 	}
 
 	/**

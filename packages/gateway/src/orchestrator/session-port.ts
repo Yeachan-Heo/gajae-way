@@ -1,4 +1,6 @@
 import { createHash } from "node:crypto";
+import { readdir } from "node:fs/promises";
+import { join } from "node:path";
 import {
 	assertControlAllowed,
 	assertValidOpRef,
@@ -77,8 +79,32 @@ export interface SessionPort {
 	runExclusive<T>(key: string, work: () => Promise<T>): Promise<T>;
 	/** Request/response helper for callers that already own their op-ref and serialization. */
 	request(input: SessionRequestInput): Promise<SessionRequestResult>;
+	/**
+	 * Every session the broker indexes for this agent directory, live or saved.
+	 * Recovery-only surface: the persona actor never lists, it inspects by id.
+	 */
+	listSessions?(): Promise<readonly IndexedSession[]>;
+	/**
+	 * Removes a saved (non-live) session from the broker's index and disk. The
+	 * broker's own guards still apply: a live session or one with pending
+	 * cleanup is refused, and the refusal is returned, never thrown.
+	 */
+	deleteSession?(input: { sessionId: string; cwd: string; sessionPath: string }): Promise<SessionDeleteOutcome>;
 }
 
+export interface IndexedSession {
+	readonly sessionId: string;
+	readonly live: boolean;
+	readonly cwd: string | undefined;
+	/** Absolute path of the saved session file, when the broker reports one. */
+	readonly sessionPath: string | undefined;
+	/** Broker-reported last activity, epoch ms; undefined when it reports none. */
+	readonly lastActivityMs: number | undefined;
+}
+
+export type SessionDeleteOutcome =
+	| { readonly deleted: true }
+	| { readonly deleted: false; readonly code: string; readonly message: string };
 export type SessionCompactionStatus = "succeeded" | "failed" | "skipped" | "unavailable";
 
 export interface SessionCompactionInput {
@@ -170,6 +196,8 @@ export interface BrokerSessionPortOptions {
 	readonly cli: CliRunner;
 	readonly instanceId: string;
 	readonly tailRunner: TailRunner;
+	/** The private gjc agent directory; needed to locate saved session files for deletion. */
+	readonly agentDir?: string;
 	readonly now?: () => number;
 	readonly sleep?: (ms: number) => Promise<void>;
 }
@@ -194,9 +222,11 @@ export class BrokerSessionPort implements SessionPort {
 	readonly #now: () => number;
 	readonly #sleep: (ms: number) => Promise<void>;
 	readonly #chains = new Map<string, Promise<void>>();
+	readonly #agentDir: string | undefined;
 
 	constructor(options: BrokerSessionPortOptions) {
 		this.#database = options.database;
+		this.#agentDir = options.agentDir;
 		this.#cli = async (args, commandOptions) => normalizeSdkEnvelopeFailure(await options.cli(args, commandOptions));
 		this.#instanceId = options.instanceId;
 		this.#tailRunner = options.tailRunner;
@@ -558,6 +588,105 @@ export class BrokerSessionPort implements SessionPort {
 		);
 		const page = (JSON.parse(result.stdout) as { ok?: unknown; page?: { items?: unknown[]; complete?: unknown } }).page;
 		return page !== undefined && Array.isArray(page.items) && page.items.length === 0 && page.complete === true;
+	}
+
+	/**
+	 * One `session.list --scope all` per page. The broker caps continuation
+	 * cursors at 32 per 15 minutes and leaks one per traversal that stops early,
+	 * so a large index makes every id-resolving CLI call fail with
+	 * `session.list cursor capacity is exhausted` (live: jip, 149 sessions,
+	 * 2026-09-06). This listing exists so the GC can shrink the index below one
+	 * page; it drains every page so the broker releases its own cursor.
+	 */
+	async listSessions(): Promise<readonly IndexedSession[]> {
+		const sessions: IndexedSession[] = [];
+		let cursor: string | undefined;
+		const seen = new Set<string>();
+		for (let pages = 0; pages < 100; pages++) {
+			const result = await this.#cli(
+				["sdk", "session", "list", "--scope", "all", ...(cursor ? ["--cursor", cursor] : [])],
+				{ timeoutMs: 30_000 },
+			);
+			const page = parseEnvelope<{ sessions?: unknown[]; continuationCursor?: unknown }>(result, "session.list");
+			for (const raw of Array.isArray(page.sessions) ? page.sessions : []) {
+				const row = raw as {
+					sessionId?: unknown;
+					live?: unknown;
+					deleted?: unknown;
+					locator?: { cwd?: unknown };
+					lastHeartbeatAt?: unknown;
+					activity?: { at?: unknown; updatedAt?: unknown };
+				};
+				if (typeof row.sessionId !== "string" || row.deleted === true) continue;
+				const heartbeat = typeof row.lastHeartbeatAt === "number" ? row.lastHeartbeatAt : undefined;
+				sessions.push({
+					sessionId: row.sessionId,
+					live: row.live === true,
+					cwd: typeof row.locator?.cwd === "string" ? row.locator.cwd : undefined,
+					sessionPath: await this.#savedSessionPath(row.sessionId),
+					lastActivityMs: heartbeat,
+				});
+			}
+			const next = typeof page.continuationCursor === "string" ? page.continuationCursor : undefined;
+			if (!next || seen.has(next)) return sessions;
+			seen.add(next);
+			cursor = next;
+		}
+		return sessions;
+	}
+
+	/** `<agentDir>/sessions/<bucket>/<timestamp>_<sessionId>.jsonl`, the file the broker's delete wants named. */
+	async #savedSessionPath(sessionId: string): Promise<string | undefined> {
+		if (!this.#agentDir) return undefined;
+		const root = join(this.#agentDir, "sessions");
+		let buckets: string[];
+		try {
+			buckets = await readdir(root);
+		} catch {
+			return undefined;
+		}
+		for (const bucket of buckets) {
+			let names: string[];
+			try {
+				names = await readdir(join(root, bucket));
+			} catch {
+				continue;
+			}
+			const hit = names.find((name) => name.endsWith(`_${sessionId}.jsonl`));
+			if (hit) return join(root, bucket, hit);
+		}
+		return undefined;
+	}
+
+	async deleteSession(input: { sessionId: string; cwd: string; sessionPath: string }): Promise<SessionDeleteOutcome> {
+		assertControlAllowed("session.delete", { operatorApproval: true });
+		const result = await this.#cli(
+			[
+				"sdk",
+				"session",
+				"raw",
+				"global",
+				"--op",
+				"session.delete",
+				"--idempotency-key",
+				`gw-gc-${this.#instanceId}-${input.sessionId}-${this.#now()}`,
+				"--json-input",
+				JSON.stringify({ sessionId: input.sessionId, cwd: input.cwd, sessionPath: input.sessionPath }),
+			],
+			{ timeoutMs: 30_000 },
+		);
+		let envelope: { ok?: unknown; error?: { code?: unknown; message?: unknown } };
+		try {
+			envelope = JSON.parse(result.stdout) as typeof envelope;
+		} catch {
+			return { deleted: false, code: "malformed_envelope", message: `exit ${result.exitCode}` };
+		}
+		if (envelope.ok === true) return { deleted: true };
+		return {
+			deleted: false,
+			code: typeof envelope.error?.code === "string" ? envelope.error.code : "unknown",
+			message: sanitizeDiagnostic(typeof envelope.error?.message === "string" ? envelope.error.message : ""),
+		};
 	}
 
 	async fetchAssistantSince(input: {

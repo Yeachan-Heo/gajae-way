@@ -76,6 +76,7 @@ export async function bootGateway(options: BootGatewayOptions = {}): Promise<Gat
 			cli: broker.cli,
 			instanceId: database.instanceId,
 			tailRunner,
+			agentDir: broker.agentDir,
 		});
 		const close = async () => {
 			database.close();

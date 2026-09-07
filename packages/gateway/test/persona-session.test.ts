@@ -470,3 +470,67 @@ test("two messages 50ms apart start one turn and steer the second", async () => 
 		"turn rows did not complete after terminal tail evidence",
 	);
 });
+
+/**
+ * Live 2026-09-06 (jip): every epoch rotation leaves the previous session saved
+ * in the broker index and nothing removed them. 149 indexed for 55 referenced
+ * pushed `session.list` past one page; the broker's 32-cursor budget leaked one
+ * per early-stopped traversal and every id-resolving CLI call then failed with
+ * `cursor capacity is exhausted`.
+ */
+test("session GC deletes indexed sessions no origin or pending turn references, and nothing else", async () => {
+	class IndexedPort extends ScriptedSessionPort {
+		readonly index: Array<{ sessionId: string; live: boolean; lastActivityMs: number | undefined }> = [];
+		readonly deleted: string[] = [];
+		refuse = new Set<string>();
+		async listSessions() {
+			return this.index.map((row) => ({
+				...row,
+				cwd: "/corpus",
+				sessionPath: `/agent/sessions/b/2026_${row.sessionId}.jsonl`,
+			}));
+		}
+		async deleteSession(input: { sessionId: string }) {
+			if (this.refuse.has(input.sessionId))
+				return { deleted: false as const, code: "cleanup_pending", message: "cleanup pending" };
+			this.deleted.push(input.sessionId);
+			this.index.splice(
+				this.index.findIndex((row) => row.sessionId === input.sessionId),
+				1,
+			);
+			return { deleted: true as const };
+		}
+	}
+	const port = new IndexedPort();
+	const logs: string[] = [];
+	await harness(port, {}, (line) => logs.push(line));
+	enqueue("m-1", "bind me");
+	await manager?.notifyInbound(KEY);
+	await eventually(() => port.sends.length === 1, "turn did not start");
+	const current = port.sends[0]!.sessionId;
+	const old = Date.now() - 2 * 60 * 60_000;
+	port.index.push(
+		{ sessionId: current, live: true, lastActivityMs: old }, // referenced: keep
+		{ sessionId: "rotated-away", live: false, lastActivityMs: old }, // orphan: delete
+		{ sessionId: "still-live-elsewhere", live: true, lastActivityMs: old }, // live: keep
+		{ sessionId: "just-rotated", live: false, lastActivityMs: Date.now() - 60_000 }, // too fresh: keep
+		{ sessionId: "no-heartbeat", live: false, lastActivityMs: undefined }, // orphan, unknown age: delete
+		{ sessionId: "broker-refuses", live: false, lastActivityMs: old }, // refused by broker: logged, kept
+	);
+	port.refuse.add("broker-refuses");
+
+	const result = await manager!.collectSessions();
+	expect(port.deleted.sort()).toEqual(["no-heartbeat", "rotated-away"]);
+	expect(result).toEqual({ indexed: 6, deleted: 2, refused: 1 });
+	expect(port.index.map((row) => row.sessionId).sort()).toEqual(
+		["broker-refuses", "just-rotated", "still-live-elsewhere", current].sort(),
+	);
+	expect(logs.some((line) => line.startsWith("session_gc_refused session=broker-refuses code=cleanup_pending"))).toBe(
+		true,
+	);
+	expect(logs.some((line) => line.startsWith("session_gc indexed=6 referenced=1 deleted=2 refused=1"))).toBe(true);
+
+	// Idempotent: a second sweep with nothing collectable is silent.
+	const again = await manager!.collectSessions();
+	expect(again).toEqual({ indexed: 4, deleted: 0, refused: 1 });
+});
