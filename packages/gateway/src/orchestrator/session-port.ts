@@ -603,10 +603,22 @@ export class BrokerSessionPort implements SessionPort {
 		let cursor: string | undefined;
 		const seen = new Set<string>();
 		for (let pages = 0; pages < 100; pages++) {
+			// Raw global op, not `session list --scope all`: the scoped form needs a
+			// git repository at the cwd (p25's workspace is none) and the health probe
+			// already established `raw global session.list` as the portable path.
+			// Largest page the broker allows: fewer cursors per traversal, and a
+			// traversal that drains to the end is the only one that frees its cursor.
 			const result = await this.#cli(
-				// Largest page the broker allows: fewer cursors per traversal, and a
-				// traversal that drains to the end is the only one that frees its cursor.
-				["sdk", "session", "list", "--scope", "all", "--limit", "100", ...(cursor ? ["--cursor", cursor] : [])],
+				[
+					"sdk",
+					"session",
+					"raw",
+					"global",
+					"--op",
+					"session.list",
+					"--json-input",
+					JSON.stringify({ limit: 100, ...(cursor ? { cursor } : {}) }),
+				],
 				{ timeoutMs: 30_000 },
 			);
 			const page = parseEnvelope<{ sessions?: unknown[]; continuationCursor?: unknown }>(result, "session.list");
