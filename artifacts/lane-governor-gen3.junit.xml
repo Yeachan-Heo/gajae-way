@@ -1,0 +1,28 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<testsuites name="bun test" tests="23" assertions="169" failures="0" skipped="0" time="1.684064">
+  <testsuite name="packages/gateway/test/lane-governor-redteam.test.ts" file="packages/gateway/test/lane-governor-redteam.test.ts" tests="23" assertions="169" failures="0" skipped="0" time="1.680986" hostname="MacBook-Pro-3.local">
+    <testcase name="R1 concurrent new names cannot overbook the final slot" classname="" time="0.190984" file="packages/gateway/test/lane-governor-redteam.test.ts" line="102" assertions="6" />
+    <testcase name="R2 retire refuses an open live turn without waiting for it to finish" classname="" time="0.091943" file="packages/gateway/test/lane-governor-redteam.test.ts" line="127" assertions="6" />
+    <testcase name="R3 retirement advances epoch and rerun never references the old session" classname="" time="0.125625" file="packages/gateway/test/lane-governor-redteam.test.ts" line="153" assertions="10" />
+    <testcase name="R4 invalid models and name boundaries fail closed; valid model reaches bind and request" classname="" time="0.17658" file="packages/gateway/test/lane-governor-redteam.test.ts" line="171" assertions="30" />
+    <testcase name="R5 capacity details include every candidate sorted idlest first" classname="" time="0.317701" file="packages/gateway/test/lane-governor-redteam.test.ts" line="187" assertions="13" />
+    <testcase name="R6 sweep is idempotent and protects an idle lane with an open attempt" classname="" time="0.150783" file="packages/gateway/test/lane-governor-redteam.test.ts" line="203" assertions="6" />
+    <testcase name="R7 socket ops.cycle saturation gate clears after retirement without stale identity" classname="" time="0.16182" file="packages/gateway/test/lane-governor-redteam.test.ts" line="234" assertions="11" />
+    <testcase name="R8 retirement source never calls session.delete or deleteSession" classname="" time="0.000442" file="packages/gateway/test/lane-governor-redteam.test.ts" line="248" assertions="3" />
+    <testcase name="G1 ended gateway wait does not prove broker terminality (in_flight)" classname="" time="0.003129" file="packages/gateway/test/lane-governor-redteam.test.ts" line="284" assertions="4" />
+    <testcase name="G2 ended gateway wait does not prove broker terminality (status unavailable)" classname="" time="0.002972" file="packages/gateway/test/lane-governor-redteam.test.ts" line="284" assertions="4" />
+    <testcase name="G3 ambiguous close retains identity until broker explicitly disowns session" classname="" time="0.00301" file="packages/gateway/test/lane-governor-redteam.test.ts" line="314" assertions="6" />
+    <testcase name="G4 sweep snapshot cannot retire a replacement bound before lock acquisition" classname="" time="0.002592" file="packages/gateway/test/lane-governor-redteam.test.ts" line="346" assertions="3" />
+    <testcase name="G5 admission lock is released while first distinct lane turn is still running" classname="" time="0.149174" file="packages/gateway/test/lane-governor-redteam.test.ts" line="373" assertions="7" />
+    <testcase name="G6 idle retirement interval starts at turn end, including the exact boundary" classname="" time="0.172028" file="packages/gateway/test/lane-governor-redteam.test.ts" line="401" assertions="9" />
+    <testcase name="G7 corrupt bound job consumes socket capacity and identifies corrupt candidate" classname="" time="0.025421" file="packages/gateway/test/lane-governor-redteam.test.ts" line="424" assertions="5" />
+    <testcase name="G8 socket cycle gates unbound unsettled work but not done work" classname="" time="0.02587" file="packages/gateway/test/lane-governor-redteam.test.ts" line="438" assertions="8" />
+    <testcase name="H1 failed ledger retires when broker proves terminal_ok" classname="" time="0.002803" file="packages/gateway/test/lane-governor-redteam.test.ts" line="452" assertions="3" />
+    <testcase name="H2 failed ledger with unknown broker operation needs a dead session" classname="" time="0.004911" file="packages/gateway/test/lane-governor-redteam.test.ts" line="471" assertions="6" />
+    <testcase name="H3 sweep nomination cannot retire a done job replaced by a fresh open attempt" classname="" time="0.002814" file="packages/gateway/test/lane-governor-redteam.test.ts" line="495" assertions="5" />
+    <testcase name="H4 sweep refuses rebound even when the replacement job is also done" classname="" time="0.002734" file="packages/gateway/test/lane-governor-redteam.test.ts" line="526" assertions="5" />
+    <testcase name="H5 empty job JSON consumes capacity and socket retirement refuses corrupt record" classname="" time="0.02761" file="packages/gateway/test/lane-governor-redteam.test.ts" line="565" assertions="9" />
+    <testcase name="H6 operator socket retirement of an idle done job needs no sweep nomination" classname="" time="0.024392" file="packages/gateway/test/lane-governor-redteam.test.ts" line="582" assertions="6" />
+    <testcase name="H7 concurrent sweeps close once and bump the epoch exactly once" classname="" time="0.002541" file="packages/gateway/test/lane-governor-redteam.test.ts" line="594" assertions="4" />
+  </testsuite>
+</testsuites>

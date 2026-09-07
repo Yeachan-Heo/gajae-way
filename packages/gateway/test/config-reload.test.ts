@@ -2,7 +2,7 @@ import { afterEach, expect, test } from "bun:test";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { type ConfigError, loadConfig, parseConfigFile, reloadConfig } from "../src/config";
+import { ConfigError, loadConfig, parseConfigFile, reloadConfig } from "../src/config";
 
 const homes: string[] = [];
 afterEach(async () => {
@@ -115,4 +115,42 @@ test("stallTimeoutMs reloads as live actor policy", async () => {
 	if (!result.ok) return;
 	expect(result.changed).toEqual(["stallTimeoutMs"]);
 	expect(result.config.stallTimeoutMs).toBe(240_000);
+});
+
+test("work lane limits parse without materializing omitted configuration", () => {
+	const work = { maxLanes: 4, idleRetireMs: 3_600_000 };
+	expect(parseConfigFile({ schemaVersion: 1, work }).work).toEqual(work);
+	expect(parseConfigFile({ schemaVersion: 1 })).not.toHaveProperty("work");
+});
+
+for (const [work, field] of [
+	[{ maxLanes: 0 }, "work.maxLanes"],
+	[{ maxLanes: 257 }, "work.maxLanes"],
+	[{ maxLanes: 1.5 }, "work.maxLanes"],
+	[{ idleRetireMs: 1_000 }, "work.idleRetireMs"],
+	[{ foo: 1 }, "work"],
+] as const) {
+	test(`rejects invalid work configuration ${JSON.stringify(work)}`, () => {
+		const parse = () => parseConfigFile({ schemaVersion: 1, work });
+		expect(parse).toThrow(ConfigError);
+		expect(parse).toThrow(field);
+		try {
+			parse();
+		} catch (error) {
+			expect(error).toMatchObject({ code: "config_invalid" });
+		}
+	});
+}
+
+test("work lane limit changes require restart and retain the live limits", async () => {
+	const path = await home();
+	await Bun.write(join(path, "config.json"), JSON.stringify({ schemaVersion: 1, work: { maxLanes: 4 } }));
+	const current = await loadConfig({ home: path });
+	await Bun.write(join(path, "config.json"), JSON.stringify({ schemaVersion: 1, work: { maxLanes: 8 } }));
+	const result = await reloadConfig(current);
+	expect(result.ok).toBe(true);
+	if (!result.ok) return;
+	expect(result.restartRequired).toContain("work");
+	expect(result.changed).not.toContain("work");
+	expect(result.config.work).toEqual({ maxLanes: 4 });
 });

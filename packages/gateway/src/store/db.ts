@@ -1399,6 +1399,15 @@ export class GatewayDatabase {
 		return new Set(rows.map((row) => row.id));
 	}
 
+	/** Bound `work.run` lanes: the sessions the lane governor counts against the admission cap. */
+	workLaneRows(): Array<{ origin_key: string; gjc_session_id: string; last_activity_at: string | null }> {
+		return this.#database
+			.query<{ origin_key: string; gjc_session_id: string; last_activity_at: string | null }, []>(
+				"SELECT origin_key, gjc_session_id, last_activity_at FROM sessions WHERE origin_key LIKE 'work/task/%' AND gjc_session_id <> '' ORDER BY last_activity_at",
+			)
+			.all();
+	}
+
 	putSession(originKey: string, sessionId: string): void {
 		this.#database
 			.query(

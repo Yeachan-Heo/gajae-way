@@ -34,6 +34,7 @@ export class ScriptedSessionPort implements SessionPort {
 	readonly inspections: Array<{ sessionId: string; repo: string }> = [];
 	readonly models: Array<{ sessionId: string; repo: string; selection: GjcModelSelection }> = [];
 	readonly serviceTiers: Array<{ sessionId: string; repo: string; tier: GjcServiceTier }> = [];
+	readonly closes: Array<{ sessionId: string; repo: string }> = [];
 	readonly #sessions = new Map<string, string>();
 	readonly #sessionStates = new Map<string, BrokerSession>();
 	readonly #resumeFailures = new Map<string, Error>();
@@ -93,6 +94,22 @@ export class ScriptedSessionPort implements SessionPort {
 	async inspect(input: { sessionId: string; repo: string }): Promise<BrokerSession | undefined> {
 		this.inspections.push(input);
 		return this.#sessionStates.get(input.sessionId);
+	}
+
+	async close(input: { sessionId: string; repo: string }): Promise<void> {
+		this.closes.push(input);
+		const state = this.#sessionStates.get(input.sessionId);
+		if (state) this.#sessionStates.set(input.sessionId, { ...state, live: false });
+	}
+
+	/** Broker liveness from the scripted state table; an unseeded id is disowned, like an id the broker never indexed. */
+	async liveness(input: {
+		sessionId: string;
+		repo: string;
+	}): Promise<{ live: boolean | undefined; disowned: boolean }> {
+		const state = this.#sessionStates.get(input.sessionId);
+		if (!state) return { live: undefined, disowned: true };
+		return { live: state.live, disowned: false };
 	}
 
 	async resume(input: { sessionId: string; repo: string; originKey: string; epoch: number }): Promise<SessionBinding> {

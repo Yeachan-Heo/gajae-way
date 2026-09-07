@@ -1,0 +1,11 @@
+^D[1;36mgajaeway work CLI - lane governor boundary[0m
+[33m# --model and --preset are mutually exclusive[0m
+usage: gajaeway work run <name> [--cwd DIR] [--resume] [--model ID|--preset NAME] "<task text>"|retire <name>|jobs
+--model and --preset are mutually exclusive
+exit=1
+[33m# retire requires exactly one name[0m
+usage: gajaeway work run <name> [--cwd DIR] [--resume] [--model ID|--preset NAME] "<task text>"|retire <name>|jobs
+exit=1
+[33m# jobs takes no arguments[0m
+usage: gajaeway work run <name> [--cwd DIR] [--resume] [--model ID|--preset NAME] "<task text>"|retire <name>|jobs
+exit=1

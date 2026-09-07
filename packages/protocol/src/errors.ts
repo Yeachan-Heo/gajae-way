@@ -19,6 +19,8 @@ export const ERROR_CODES = [
 	"gateway_shutting_down",
 	"unauthorized",
 	"action_execution_disabled",
+	// worker lanes
+	"lane_capacity",
 ] as const;
 
 export type ErrorCode = (typeof ERROR_CODES)[number];

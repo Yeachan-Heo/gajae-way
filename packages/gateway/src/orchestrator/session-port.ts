@@ -90,6 +90,12 @@ export interface SessionPort {
 	 * cleanup is refused, and the refusal is returned, never thrown.
 	 */
 	deleteSession?(input: { sessionId: string; cwd: string; sessionPath: string }): Promise<SessionDeleteOutcome>;
+	/**
+	 * Closes a live session (`session.close`). Recoverable on the broker side and
+	 * never `session.delete`: gjc fences every later lifecycle op on one refused
+	 * delete, so the gateway retires lanes by closing and rebinding instead.
+	 */
+	close(input: { sessionId: string; repo: string }): Promise<void>;
 }
 
 export interface IndexedSession {
@@ -701,6 +707,17 @@ export class BrokerSessionPort implements SessionPort {
 			code: typeof envelope.error?.code === "string" ? envelope.error.code : "unknown",
 			message: sanitizeDiagnostic(typeof envelope.error?.message === "string" ? envelope.error.message : ""),
 		};
+	}
+
+	async close(input: { sessionId: string; repo: string }): Promise<void> {
+		assertControlAllowed("session.close", { operatorApproval: true });
+		parseEnvelope(
+			await this.#cli(
+				["sdk", "session", "raw", "control", input.sessionId, "--op", "session.close", "--json-input", "{}"],
+				{ timeoutMs: 30_000 },
+			),
+			"session.close",
+		);
 	}
 
 	async fetchAssistantSince(input: {

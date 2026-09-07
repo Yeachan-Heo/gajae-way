@@ -27,6 +27,9 @@ function sources(overrides: Partial<RuntimeCycleSources> = {}): RuntimeCycleSour
 		monitorStages: new Map(),
 		memoryClosing: false,
 		instanceId: "test-instance",
+		activeLanes: 0,
+		maxLanes: 8,
+		settledWorkOrigins: new Set(),
 	};
 	const merged = { ...defaults, ...overrides };
 	// Mirror the DB snapshot seam: the census total derives from the counts.
@@ -56,6 +59,38 @@ describe("runtime cycle projection", () => {
 		expect(result.sessions).toEqual([]);
 		expect(result.generatedAt).toBe(generatedAt);
 		expect(result.instanceId).toBe("test-instance");
+	});
+
+	test("a saturated lane cap gates lane_capacity_exhausted and reports the census", () => {
+		const result = projectRuntimeCycle(sources({ activeLanes: 8, maxLanes: 8 }), generatedAt);
+		expect(result.gates).toContain("lane_capacity_exhausted");
+		expect(result.phase).toBe("degraded");
+		expect(result.lanes).toEqual({ active: 8, max: 8 });
+		const below = projectRuntimeCycle(sources({ activeLanes: 7, maxLanes: 8 }), generatedAt);
+		expect(below.gates).toEqual([]);
+		expect(below.lanes).toEqual({ active: 7, max: 8 });
+	});
+
+	test("an unbound worker lane is retired only on positive settled-job evidence", () => {
+		const unbound = {
+			...boundSession,
+			origin_key: "work/task/repo-fix",
+			origin_ref_json: JSON.stringify({ platform: "work", kind: "task", conversationId: "repo-fix" }),
+			gjc_session_id: "",
+			epoch: 2,
+		};
+		// Retired: the lane job settled (done/aborted/attempt_ended) and the binding was cleared.
+		const retired = projectRuntimeCycle(
+			sources({ sessionRows: [unbound], settledWorkOrigins: new Set(["work/task/repo-fix"]) }),
+			generatedAt,
+		);
+		expect(retired.gates).toEqual([]);
+		expect(retired.phase).toBe("idle");
+		// No lane job at all: a failed first bind (rebindEpoch runs before the job
+		// row exists). Same row shape, but nothing vouches for it: stays gated.
+		const failedBind = projectRuntimeCycle(sources({ sessionRows: [unbound] }), generatedAt);
+		expect(failedBind.gates).toContain("stale_session_identity");
+		expect(failedBind.phase).toBe("degraded");
 	});
 
 	test("healthy bound session with no work projects idle and carries identity/provenance", () => {

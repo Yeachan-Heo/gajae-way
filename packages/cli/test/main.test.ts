@@ -1,8 +1,9 @@
-import { describe, expect, test } from "bun:test";
+import { describe, expect, spyOn, test } from "bun:test";
 import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { OpsCycleResult } from "@gajaeway/protocol";
+import { GajaewayClient } from "@gajaeway/sdk";
 import {
 	CLI_USAGE,
 	COMMANDS,
@@ -256,6 +257,7 @@ function cycleResult(overrides: Partial<OpsCycleResult> = {}): OpsCycleResult {
 			omittedNewestAt: null,
 			floorAt: null,
 		},
+		lanes: { active: 0, max: 8 },
 		...overrides,
 	};
 }
@@ -383,4 +385,122 @@ describe("usage exits the process instead of blocking", () => {
 		expect(result.code).toBe(USAGE_EXIT_CODE);
 		expect(result.stderr).toContain(CLI_USAGE);
 	}, 30_000);
+});
+
+describe("work operator commands", () => {
+	async function run(args: string[], result: unknown) {
+		const requests: Array<{ verb: string; params: unknown }> = [];
+		const lines: string[] = [];
+		const errors: string[] = [];
+		let closed = false;
+		const client: GajaewayClient = Object.create(GajaewayClient.prototype);
+		client.request = async <T>(verb: string, params?: unknown): Promise<T> => {
+			requests.push({ verb, params });
+			return result as T;
+		};
+		client.close = async () => {
+			closed = true;
+		};
+		const connect = spyOn(GajaewayClient, "connectSocket").mockResolvedValue(client);
+		const log = spyOn(console, "log").mockImplementation((line) => {
+			lines.push(String(line));
+		});
+		const error = spyOn(console, "error").mockImplementation((line) => {
+			errors.push(String(line));
+		});
+		const previousExit = process.exitCode;
+		try {
+			await main(["--socket", "/test/work.sock", "work", ...args]);
+			return { requests, lines, errors, closed, connections: connect.mock.calls.length };
+		} finally {
+			connect.mockRestore();
+			log.mockRestore();
+			error.mockRestore();
+			process.exitCode = previousExit;
+		}
+	}
+
+	for (const [flag, value, model] of [
+		["--preset", "reliable", { preset: "reliable" }],
+		["--model", "openai/gpt-5.2", "openai/gpt-5.2"],
+	] as const) {
+		test(`work run forwards ${flag} with cwd and resume`, async () => {
+			const output = await run(["run", "fix", "--cwd", "/repo", "--resume", flag, value, "fix", "tests"], {
+				held: false,
+				text: "done",
+			});
+			expect(output.requests).toEqual([
+				{
+					verb: "work.run",
+					params: { name: "fix", cwd: "/repo", resume: true, model, text: "fix tests" },
+				},
+			]);
+			expect(output.lines).toEqual(["done"]);
+			expect(output.errors).toEqual([]);
+			expect(output.closed).toBe(true);
+		});
+	}
+
+	for (const closed of [true, false]) {
+		test(`work retire prints a successful retirement with closed=${closed}`, async () => {
+			const output = await run(["retire", "fix"], {
+				retired: true,
+				sessionKey: "work/task/fix",
+				sessionId: "session-1",
+				closed,
+			});
+			expect(output.requests).toEqual([{ verb: "work.retire", params: { name: "fix" } }]);
+			expect(output.lines).toEqual([`retired: work/task/fix session=session-1 closed=${closed}`]);
+			expect(output.closed).toBe(true);
+		});
+	}
+
+	test("work retire prints refusal without inventing a session", async () => {
+		const output = await run(["retire", "fix"], {
+			retired: false,
+			sessionKey: "work/task/fix",
+			reason: "active attempt",
+		});
+		expect(output.lines).toEqual(["not retired: active attempt"]);
+		expect(output.closed).toBe(true);
+	});
+
+	test("work jobs renders bound and unbound lanes", async () => {
+		const output = await run(["jobs"], {
+			jobs: [
+				{
+					lane_key: "fix",
+					state: "running",
+					session_id: "session-1",
+					last_activity_at: "2026-09-07T00:00:00Z",
+					worktree_path: "/repo/fix",
+				},
+				{ lane_key: "done", state: "done", session_id: "", last_activity_at: null, worktree_path: "/repo/done" },
+			],
+		});
+		expect(output.requests).toEqual([{ verb: "work.jobs", params: undefined }]);
+		expect(output.lines).toEqual([
+			"fix running session=session-1 last=2026-09-07T00:00:00Z /repo/fix",
+			"done done session=- last=- /repo/done",
+		]);
+		expect(output.closed).toBe(true);
+	});
+
+	for (const args of [
+		["run", "fix", "--model", "model", "--preset", "preset", "task"],
+		["run", "fix", "--preset", "preset", "--model", "model", "task"],
+		["run", "fix", "task", "--model"],
+		["run", "fix", "task", "--preset"],
+		["run", "fix", "task", "--preset", "--resume"],
+		["retire"],
+		["retire", "fix", "extra"],
+		["jobs", "extra"],
+	]) {
+		test(`invalid work arguments fail before connecting: ${args.join(" ")}`, async () => {
+			const output = await run(args, {});
+			expect(output.connections).toBe(0);
+			expect(output.requests).toEqual([]);
+			expect(output.errors[0]).toContain("usage: gajaeway work");
+		});
+	}
 });

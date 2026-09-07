@@ -1,6 +1,6 @@
 import { copyFile, stat } from "node:fs/promises";
 import { isAbsolute, join } from "node:path";
-import type { MonitorRecord, OpsCycleResult } from "@gajaeway/protocol";
+import type { MonitorRecord, OpsCycleResult, WorkJobsResult, WorkRetireResult } from "@gajaeway/protocol";
 import { LOOPBACK_ORIGIN, originKey } from "@gajaeway/protocol";
 import { GajaewayClient } from "@gajaeway/sdk";
 import {
@@ -38,7 +38,7 @@ export const COMMANDS = [
 ] as const;
 
 export const CLI_USAGE =
-	"usage: gajaeway [--socket PATH] status|shutdown|chat|daemon run|sessions list [--json] [--fields a,b,c] [--limit N] [--offset N]|sessions inspect <originKey-or-index>|memory audit|memory search <query>|monitors ...|work run <name> [--cwd DIR] <text>|ops backup <path>|ops cycle [--json]|ops integrity|ops restore <backupPath>|services install|repair --bin-dir DIR [--launch-agents-dir DIR]";
+	"usage: gajaeway [--socket PATH] status|shutdown|chat|daemon run|sessions list [--json] [--fields a,b,c] [--limit N] [--offset N]|sessions inspect <originKey-or-index>|memory audit|memory search <query>|monitors ...|work run <name> [--cwd DIR] [--resume] [--model ID|--preset NAME] <text>|work retire <name>|work jobs|ops backup <path>|ops cycle [--json]|ops integrity|ops restore <backupPath>|services install|repair --bin-dir DIR [--launch-agents-dir DIR]";
 
 /** Usage errors exit 2, as `gajaeway-gateway` does; 1 stays a runtime failure. */
 export const USAGE_EXIT_CODE = 2;
@@ -418,18 +418,57 @@ export async function main(args = process.argv.slice(2), options: MainOptions = 
 			}
 			case "work": {
 				const [command, ...args] = parsed.rest;
-				if (command !== "run") throw new Error('usage: gajaeway work run <name> [--cwd DIR] [--resume] "<task text>"');
+				const usage =
+					'usage: gajaeway work run <name> [--cwd DIR] [--resume] [--model ID|--preset NAME] "<task text>"|retire <name>|jobs';
+				if (command === "retire" || command === "jobs") {
+					if (command === "retire" ? args.length !== 1 || !args[0] || args[0].startsWith("--") : args.length !== 0)
+						throw new Error(usage);
+					const client = await GajaewayClient.connectSocket(parsed.socket);
+					try {
+						if (command === "retire") {
+							const result = await client.request<WorkRetireResult>("work.retire", { name: args[0] });
+							console.log(
+								result.retired
+									? `retired: ${result.sessionKey} session=${result.sessionId} closed=${result.closed}`
+									: `not retired: ${result.reason}`,
+							);
+						} else {
+							const result = await client.request<WorkJobsResult>("work.jobs");
+							for (const job of result.jobs) {
+								// lane_key is the stored `work-<name>`; print the name work.retire accepts.
+								const name = job.lane_key.startsWith("work-") ? job.lane_key.slice("work-".length) : job.lane_key;
+								console.log(
+									`${name} ${job.state} session=${job.session_id || "-"} last=${job.last_activity_at || "-"} ${job.worktree_path}`,
+								);
+							}
+						}
+					} finally {
+						await client.close();
+					}
+					break;
+				}
+				if (command !== "run") throw new Error(usage);
 				const name = args[0];
 				let cwd: string | undefined;
 				let resume = false;
+				let model: string | { preset: string } | undefined;
 				const textParts: string[] = [];
 				for (let i = 1; i < args.length; i++) {
-					if (args[i] === "--cwd") cwd = args[++i];
-					else if (args[i] === "--resume") resume = true;
-					else textParts.push(args[i] as string);
+					const arg = args[i];
+					if (arg === "--cwd" || arg === "--model" || arg === "--preset") {
+						const value = args[++i];
+						if (!value?.trim() || value.startsWith("--")) throw new Error(usage);
+						if (arg === "--cwd") cwd = value;
+						else {
+							if (model !== undefined) throw new Error(`${usage}\n--model and --preset are mutually exclusive`);
+							model = arg === "--preset" ? { preset: value } : value;
+						}
+					} else if (arg === "--resume") resume = true;
+					else if (arg?.startsWith("--")) throw new Error(usage);
+					else textParts.push(arg as string);
 				}
 				const text = textParts.join(" ").trim();
-				if (!name || !text) throw new Error('usage: gajaeway work run <name> [--cwd DIR] "<task text>"');
+				if (!name || name.startsWith("--") || !text) throw new Error(usage);
 				// Worker turns are long agentic runs: the request waits as long as the
 				// gateway's own inactivity ceiling allows, not the default 30s.
 				const client = await GajaewayClient.connectSocket(parsed.socket, { requestTimeoutMs: 3_600_000 });
@@ -442,6 +481,7 @@ export async function main(args = process.argv.slice(2), options: MainOptions = 
 						text,
 						...(cwd ? { cwd } : {}),
 						...(resume ? { resume: true } : {}),
+						...(model === undefined ? {} : { model }),
 					});
 					if (result.held) {
 						console.log(`HELD: ${result.reason}\njob: ${result.jobId} state: ${result.state}`);

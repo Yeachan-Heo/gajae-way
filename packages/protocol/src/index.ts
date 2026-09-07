@@ -21,6 +21,7 @@ export {
 	type EventName,
 	type GatewayStatusResult,
 	isSilenceToken,
+	type LaneCapacityDetail,
 	type MemoryAuditResult,
 	type MemorySearchParams,
 	type MemorySearchResult,
@@ -40,6 +41,9 @@ export {
 	VERBS_V01,
 	type VerbCatalogV01,
 	type VerbName,
+	type WorkJobsResult,
+	type WorkRetireParams,
+	type WorkRetireResult,
 	type WorkRunParams,
 	type WorkRunResult,
 } from "./catalog";
