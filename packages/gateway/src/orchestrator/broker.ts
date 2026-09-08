@@ -548,7 +548,7 @@ export class BrokerSupervisor implements PersonaBroker {
 		try {
 			await mkdir(this.agentDir, { recursive: true, mode: 0o700 });
 			await chmod(this.agentDir, 0o700);
-			await reapAgentDir(this.agentDir, this.#log, this.#isPidAlive);
+			// Adopt a healthy daemon before considering retirement; its hosts may have live SDK turns.
 			if (this.#ssotAgentDir) await seedAgentDirFromSsot(this.#ssotAgentDir, this.agentDir, this.#log);
 			await ensureSteeringDefaults(this.agentDir);
 			await this.#launchGeneration();
@@ -1009,12 +1009,11 @@ export class BrokerSupervisor implements PersonaBroker {
 export const STEERING_DEFAULTS: Readonly<Record<string, string>> = { steeringMode: "all", interruptMode: "wait" };
 
 /**
- * Boot-time reap of everything the previous gateway incarnation left behind in
- * ITS OWN private agent dir: gjc daemon/host/relay processes bound to that dir
- * and the lock tombstones a spawn stampede leaves (gajae-code#5198). Nothing
- * outside the private dir is touched, so the operator's own ~/.gjc/agent
- * daemon and sessions are never affected. Safe on every restart: sessions are
- * durable and resume through recovery.
+ * Explicit unhealthy-daemon retirement within ITS OWN private agent dir:
+ * gjc daemon/host/relay processes bound to that dir and lock tombstones a
+ * spawn stampede leaves (gajae-code#5198). Nothing outside the private dir
+ * is touched. Never run on normal startup: durable session files do not
+ * preserve in-flight SDK turns when their live hosts are killed.
  */
 export async function reapAgentDir(
 	agentDir: string,

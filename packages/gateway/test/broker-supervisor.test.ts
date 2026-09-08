@@ -1,4 +1,4 @@
-import { afterEach, expect, test } from "bun:test";
+import { afterEach, expect, spyOn, test } from "bun:test";
 import { lstat, mkdir, mkdtemp, readdir, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -547,12 +547,42 @@ test("red-team G3-F3: wedged-daemon strikes are scoped to one daemon; a self-rep
 	// Daemon A (pid 1001) is wedged. After two failed probes it self-replaces
 	// with daemon B (pid 1002) on a transport that fails ONE probe and then
 	// routes. B must never be retired: it only ever accrued one strike of its own.
-	const wedged = fakeBrokerTransport("secret-token", { router: "stall" });
-	let bAnswers = false;
-	const flaky = fakeBrokerTransport("secret-token", { router: "stall" });
-	const healthy = fakeBrokerTransport("secret-token");
+	let aFailures = 0;
+	let bProbes = 0;
 	const killed: number[] = [];
 	let agentDir = "";
+	const server = Bun.serve({
+		hostname: "127.0.0.1",
+		port: 0,
+		fetch(request, srv) {
+			if (new URL(request.url).searchParams.get("token") !== "secret-token")
+				return new Response("Unauthorized", { status: 401 });
+			return srv.upgrade(request) ? undefined : new Response("no", { status: 400 });
+		},
+		websocket: {
+			open(socket) {
+				socket.send(JSON.stringify({ type: "broker_hello", protocolVersion: 3 }));
+			},
+			async message(socket, raw) {
+				const frame = JSON.parse(String(raw)) as { id?: string };
+				if (aFailures < 2) {
+					aFailures++;
+					if (aFailures === 2) await writeDiscovery(agentDir, discoveryBody(url, "secret-token", { pid: 1002 }));
+					// Publish B before ending A's second failed probe. The next
+					// attempt observes B, with the same endpoint but a new PID.
+					socket.close();
+					return;
+				}
+				bProbes++;
+				if (bProbes === 1) {
+					socket.close();
+					return;
+				}
+				socket.send(JSON.stringify({ type: "broker_response", id: frame.id, ok: true, result: { sessions: [] } }));
+			},
+		},
+	});
+	const url = `ws://127.0.0.1:${server.port}`;
 	const broker = new BrokerSupervisor({
 		ssotAgentDir: null,
 		home,
@@ -574,30 +604,16 @@ test("red-team G3-F3: wedged-daemon strikes are scoped to one daemon; a self-rep
 		}
 		return originalKill(pid, signal as NodeJS.Signals);
 	}) as typeof process.kill;
-	// Discovery script: A twice, then B (flaky) once, then B (healthy).
-	let phase = 0;
-	const refresher = setInterval(() => {
-		phase++;
-		const body =
-			phase <= 4
-				? discoveryBody(wedged.url, "secret-token", { pid: 1001 })
-				: !bAnswers
-					? discoveryBody(flaky.url, "secret-token", { pid: 1002 })
-					: discoveryBody(healthy.url, "secret-token", { pid: 1002 });
-		if (phase >= 7) bAnswers = true;
-		void writeDiscovery(agentDir, body);
-	}, 30);
 	try {
-		await writeDiscovery(agentDir, discoveryBody(wedged.url, "secret-token", { pid: 1001 }));
+		await writeDiscovery(agentDir, discoveryBody(url, "secret-token", { pid: 1001 }));
 		await broker.start();
-		expect(killed).not.toContain(1002);
+		expect(aFailures).toBe(2);
+		expect(bProbes).toBe(2);
+		expect(killed).toEqual([]);
 	} finally {
-		clearInterval(refresher);
 		(process as { kill: typeof process.kill }).kill = originalKill;
 		await broker.stop();
-		wedged.stop();
-		flaky.stop();
-		healthy.stop();
+		server.stop(true);
 	}
 });
 
@@ -1095,32 +1111,63 @@ test("start seeds the private agent dir from the operator SSOT and fails loudly 
 	await expect(missing.start()).rejects.toThrow("operator SSOT");
 });
 
-test("boot reap removes lock tombstones and spawn residue from the private agent dir only", async () => {
-	const home = await temporaryHome("gajaeway-broker-reap-");
-	const broker = new BrokerSupervisor({
+test("successive supervisors adopt a healthy existing broker without reaping live hosts or session state", async () => {
+	const home = await temporaryHome("gajaeway-broker-adopt-restart-");
+	const transport = fakeBrokerTransport("secret-token");
+	const commands: string[][] = [];
+	const options = {
 		home,
-		instanceId: "instance-reap",
+		instanceId: "instance-adopt-restart",
 		ssotAgentDir: null,
-		command: async () => HEALTHY,
-		healthProbe: async () => true,
+		command: async (args: readonly string[]) => {
+			commands.push([...args]);
+			return HEALTHY;
+		},
 		healthIntervalMs: 60_000,
-		isPidAlive: () => false,
-	});
-	const sdk = join(broker.agentDir, "sdk");
+	};
+	const first = new BrokerSupervisor(options);
+	const second = new BrokerSupervisor(options);
+	const sdk = join(first.agentDir, "sdk");
 	await mkdir(join(sdk, "sessions"), { recursive: true });
 	await mkdir(join(sdk, ".broker.lock.stale-deadbeef"), { recursive: true });
 	await mkdir(join(sdk, "sessions", "index.jsonl.lock.pending.1.x"), { recursive: true });
-	await writeFile(join(sdk, "broker.startup-failure.json"), "{}");
-	await writeFile(join(sdk, "sessions", "index.jsonl"), "");
-	await writeFile(join(sdk, "broker.json"), "{}");
+	const files = new Map([
+		[join(sdk, "broker.lock"), "live broker ownership"],
+		[join(sdk, "broker.startup-failure.json"), "{}"],
+		[join(sdk, "sessions", "index.jsonl"), '{"sessionId":"live-session"}\n'],
+		[join(sdk, "sessions", "live-session.jsonl"), '{"turn":"in-flight"}\n'],
+	]);
+	const discovery = JSON.stringify(discoveryBody(transport.url, "secret-token"));
+	files.set(first.discoveryPath, discovery);
+	for (const [path, content] of files) await writeFile(path, content);
+	// Reaping enumerates private live hosts through spawnSync. Fail the assertion
+	// even if the reaper catches this injected failure and readiness still succeeds.
+	const reaperScan = spyOn(Bun, "spawnSync").mockImplementation(() => {
+		throw new Error("normal restart must not enumerate hosts for reaping");
+	});
 	try {
-		await broker.start();
-		const names = await readdir(sdk);
-		expect(names).not.toContain(".broker.lock.stale-deadbeef");
-		expect(names).not.toContain("broker.startup-failure.json");
-		expect(names).toContain("broker.json");
-		expect(await readdir(join(sdk, "sessions"))).toEqual(["index.jsonl"]);
+		expect(second.agentDir).toBe(first.agentDir);
+		for (const broker of [first, second]) {
+			await broker.start();
+			expect(broker.generation).toBe(1);
+			expect(await readBrokerDiscovery(broker.discoveryPath, (pid) => pid === process.pid)).toMatchObject({
+				pid: process.pid,
+				url: transport.url,
+				token: "secret-token",
+			});
+			await broker.stop();
+			expect(await Bun.file(broker.lockPath).exists()).toBe(false);
+			for (const [path, content] of files) expect(await readFile(path, "utf8")).toBe(content);
+			expect(await readdir(sdk)).toContain(".broker.lock.stale-deadbeef");
+			expect(await readdir(join(sdk, "sessions"))).toContain("index.jsonl.lock.pending.1.x");
+			expect(reaperScan).not.toHaveBeenCalled();
+		}
+		expect(transport.requests).toHaveLength(2);
+		expect(commands).toEqual([]);
 	} finally {
-		await broker.stop();
+		reaperScan.mockRestore();
+		await first.stop();
+		await second.stop();
+		transport.stop();
 	}
 });

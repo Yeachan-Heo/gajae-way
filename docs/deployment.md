@@ -140,6 +140,20 @@ The gateway daemon is always started and stopped by launchd or systemd; never st
 
 Restart with the service manager's own verbs - `launchctl kickstart -k gui/$(id -u)/dev.gajaeway.gateway` or `systemctl --user restart gajaeway-gateway` - and give the ordered shutdown time to complete: set launchd `ExitTimeOut` (or systemd `TimeoutStopSec`) to at least 30s. Two gateways on one home is the failure mode this guards against: both supervise the same private gjc daemon and take turns retiring it.
 
+### systemd: preserve private GJC hosts across gateway restarts
+
+Where the private GJC daemon and SDK session hosts share the gateway's systemd cgroup, the gateway unit **must** use:
+
+```ini
+[Service]
+KillMode=process
+TimeoutStopSec=30s
+```
+
+`TimeoutStopSec` must be at least 30 seconds. `KillMode=process` limits service-manager termination to the gateway main process: SDK turns must outlive the gateway. `KillMode=control-group` and `KillMode=mixed` can kill the private daemon and session hosts during a restart, destroying in-flight turns even though session files remain durable. Do not automatically restore cgroup-wide killing after cutover; this setting is required for as long as those hosts share the gateway cgroup.
+
+Normal gateway stop/start releases and reacquires gateway ownership, preserves the private broker's identity, discovery and session files, and adopts the existing broker through its application-level health probe. Only the existing bounded, explicit unhealthy-daemon retirement path may reap private hosts. Do not use global process cleanup as part of deployment or restart.
+
 ## Troubleshooting
 
 - **Socket missing:** verify the gateway service, configured socket path, parent permissions, and service log.
