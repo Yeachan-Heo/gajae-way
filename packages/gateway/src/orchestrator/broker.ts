@@ -349,7 +349,7 @@ export async function preflightGjcRuntime(
 	run: GjcCommandRunner,
 	minimumVersion = MIN_GJC_VERSION,
 	sdk?: GjcCommandRunner,
-): Promise<void> {
+): Promise<{ readonly version: string }> {
 	const version = await run(["--version"], { timeoutMs: DEFAULT_HEALTH_PROBE_TIMEOUT_MS });
 	if (version.exitCode !== 0) {
 		throw new Error(`gjc runtime preflight failed: gjc --version exited ${version.exitCode}`);
@@ -371,6 +371,7 @@ export async function preflightGjcRuntime(
 			);
 		}
 	}
+	return { version: formatVersion(found) };
 }
 
 /**
@@ -418,6 +419,8 @@ export class BrokerSupervisor implements PersonaBroker {
 	#launching = false;
 	#started = false;
 	#stopping = false;
+	/** As reported by `gjc --version` at preflight; undefined until preflight has run. */
+	#gjcVersion: string | undefined;
 	#startPromise: Promise<void> | undefined;
 	#stopPromise: Promise<void> | undefined;
 
@@ -495,7 +498,13 @@ export class BrokerSupervisor implements PersonaBroker {
 		// application-level session.list probe against the private broker endpoint;
 		// spawning another SDK CLI here duplicated that check and could time out
 		// before an already-healthy daemon was observed.
-		await preflightGjcRuntime(this.#command, MIN_GJC_VERSION);
+		const { version } = await preflightGjcRuntime(this.#command, MIN_GJC_VERSION);
+		this.#gjcVersion = version;
+	}
+
+	/** The gjc version preflight observed, or undefined before preflight. */
+	get gjcVersion(): string | undefined {
+		return this.#gjcVersion;
 	}
 
 	/** The current daemon generation; it starts at 1 and increases every time the daemon is observed to recover. */

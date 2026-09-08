@@ -57,6 +57,13 @@ const DISPATCH_FAILURE_RETRY_MAX_MS = 60_000;
 const HOLD_RELEASE_SWEEPS = 2;
 /** A saved session younger than this may still be resumed by a recovery path; leave it. */
 const GC_MIN_IDLE_MS = 60 * 60_000;
+/**
+ * Context occupancy at or above which a failed turn is read as context
+ * exhaustion. The provider rejects the prompt only past 100%, but a session
+ * sitting this close has no room for the next reply either; rotating one turn
+ * early costs one bootstrap, rotating late costs an unanswered message.
+ */
+const CONTEXT_EXHAUSTED_PERCENT = 95;
 
 export type PersonaActorState = "idle" | "turn-running";
 
@@ -173,7 +180,7 @@ export interface PersonaSessionManagerOptions {
 		opRef: string;
 	}) => void | Promise<void>;
 	readonly log?: (line: string) => void;
-	/** Enables session-index deletes (tests); production keeps them off until gjc scopes its cleanup fence. */
+	/** Enables session-index deletes (tests); production keeps them off, see server.ts. */
 	readonly gcDeletes?: boolean;
 }
 
@@ -330,13 +337,12 @@ export class PersonaSessionManager {
 	async collectSessions(): Promise<{ readonly indexed: number; readonly deleted: number; readonly refused: number }> {
 		const port = this.#port;
 		if (this.#stopped || !port.listSessions || !port.deleteSession) return { indexed: 0, deleted: 0, refused: 0 };
-		// DELETES ARE OFF. A refused session.delete is itself recorded by gjc as a
-		// terminal_uncertain lifecycle row, and one such row makes the broker
-		// refuse EVERY later lifecycle op - session.create included - until the
-		// ledger is replaced by hand (gjc lifecycle-ledger hasUncertainCleanupForSession
-		// with no bound session ids; live: gaebal, 127 GC refusals then 31
-		// session.create refusals, origins unable to bind, 2026-09-07). Until gjc
-		// scopes that fence to the session it names, this sweep only measures.
+		// Deletes are off in production. A refused session.delete is recorded as
+		// a terminal_uncertain lifecycle row, and the broker then refuses EVERY
+		// later lifecycle op - session.create included - until the ledger is
+		// archived by hand (live: gaebal 2026-09-07 on 0.16.3; local 2026-09-08
+		// on 0.16.6 despite gajae-code#5382). Until a gjc survives a real sweep
+		// with the fence session-scoped, this sweep only measures.
 		if (!this.#gcDeletes) {
 			const indexed = await port.listSessions().catch(() => undefined);
 			if (indexed) {
@@ -1766,6 +1772,32 @@ class OriginActor {
 			}
 			return;
 		}
+		if (
+			report.status.status === "failed" &&
+			!bound.retired &&
+			this.#current === bound &&
+			(await this.#contextExhausted(bound))
+		) {
+			// Native compaction did not keep the window bounded (live: playground-ko
+			// on three hosts at once, 2026-09-07, `prompt is too long: 1042682
+			// tokens > 1000000`); every later turn on this session fails the same
+			// way, so failing loudly is not a remedy. Rotate: the trigger goes back
+			// to pending and the next dispatch binds a fresh session under a new
+			// epoch, bootstrapped like `/new`. The turn itself is never re-sent on
+			// the exhausted session.
+			this.#manager.database.inboundTurnRequeue(bound.turn.opRef);
+			bound.tail?.setTurnRunning(false);
+			await bound.tail?.close();
+			const nextEpoch = this.#manager.database.rebindEpoch(this.originKey);
+			this.#current = undefined;
+			this.#state = "idle";
+			this.#manager.log(
+				`session_rotated_context_exhausted origin=${this.originKey} epoch=${bound.epoch} nextEpoch=${nextEpoch} opRef=${bound.turn.opRef} session=${bound.sessionId}`,
+			);
+			await this.#notifyReleased(bound);
+			await this.#dispatchNext();
+			return;
+		}
 		try {
 			if ((!bound.retired || bound.answerWanted) && report.status.status === "terminal_ok") {
 				// Normal delivery is deliberately simple: the current turn's tail is
@@ -1986,6 +2018,30 @@ class OriginActor {
 
 	#epoch(): number {
 		return this.#manager.database.getSessionRecord(this.originKey)?.epoch ?? 0;
+	}
+
+	/**
+	 * Whether a failed turn is explained by a full context window. The runtime's
+	 * failure body is generic (`agent_error: Prompt submission failed.`), so the
+	 * evidence is its own occupancy report. An unanswerable probe is not
+	 * evidence: the failure then surfaces as an ordinary turn failure.
+	 */
+	async #contextExhausted(bound: BoundTurn): Promise<boolean> {
+		const probe = this.#manager.port.contextUsage;
+		if (!probe) return false;
+		try {
+			const usage = await probe.call(this.#manager.port, { sessionId: bound.sessionId, repo: this.#manager.repo });
+			if (!usage) return false;
+			this.#manager.log(
+				`context_usage origin=${this.originKey} epoch=${bound.epoch} session=${bound.sessionId} percent=${usage.percent.toFixed(1)}`,
+			);
+			return usage.percent >= CONTEXT_EXHAUSTED_PERCENT;
+		} catch (error) {
+			this.#manager.log(
+				`context_usage_unavailable origin=${this.originKey} session=${bound.sessionId} detail=${safeDiagnostic(error)}`,
+			);
+			return false;
+		}
 	}
 }
 

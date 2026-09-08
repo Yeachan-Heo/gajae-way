@@ -901,6 +901,15 @@ test("boot aborts before accepting connections when the Stage 0 version floor is
 	expect(await Bun.file(join(home, "gateway.sock")).exists()).toBe(false);
 });
 
+test("preflight records the observed gjc version on the supervisor", async () => {
+	const home = await temporaryHome("gajaeway-broker-version-");
+	const command: CliRunner = async () => ({ exitCode: 0, stdout: "gjc/0.16.6\n", stderr: "" });
+	const broker = new BrokerSupervisor({ home, instanceId: "t", cwd: home, ssotAgentDir: null, command });
+	expect(broker.gjcVersion).toBeUndefined();
+	await broker.preflight();
+	expect(broker.gjcVersion).toBe("0.16.6");
+});
+
 test("boot aborts when the broker endpoint never provides application health", async () => {
 	const home = await temporaryHome("gajaeway-broker-preflight-marker-");
 	const command: CliRunner = async (args) =>

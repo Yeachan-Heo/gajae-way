@@ -62,7 +62,7 @@ import { buildSessionBootstrap } from "../persona/bootstrap";
 import { PersonaLoader } from "../persona/persona";
 import type { GatewayDatabase, InboundMessageRow, MonitorEventStage } from "../store/db";
 import { DeliveryLedger } from "../store/ledger";
-import { ATTACHMENT_SCOPE_NOTICE } from "./attachment-scope";
+import { ATTACHMENT_SCOPE_NOTICE, redactHistoricalAttachments } from "./attachment-scope";
 import { OrderedFrameWriter } from "./frame-writer";
 import { InterimSpeechGate, type InterimSpeechLimits } from "./interim-speech";
 import { applyModelCommand } from "./model-command";
@@ -431,6 +431,14 @@ function createRuntime(options: GatewayServerOptions): Runtime {
 		sessionModel: options.config.model,
 		stallTimeoutMs: options.config.stallTimeoutMs,
 		brokerGeneration: () => options.broker?.generation ?? 0,
+		// Session-index deletes stay OFF on every gjc so far. 0.16.6 (gajae-code
+		// #5382) was expected to scope a refused delete's uncertain marker to its
+		// own session, but on the first sweep with deletes enabled (local,
+		// 2026-09-08: 95 deleted, 179 refused as terminal_uncertain/cleanup_pending)
+		// the broker again refused EVERY session.create with terminal_uncertain
+		// until the lifecycle ledger was archived by hand. Until a gjc proves the
+		// fence is session-scoped under a real sweep, the GC only measures.
+		gcDeletes: false,
 		onTurnStart: async (input) => await createInboundTurnLifecycle(input, options, runtime),
 		// A steer whose acceptance was learnt after its turn's lifecycle is gone
 		// (resolved at terminal or after a restart) is finalized exactly like a
@@ -1496,7 +1504,7 @@ async function createInboundTurnLifecycle(
 		const inWindowIds = new Set(prepared.selectedMessageIds);
 		const recentLines = recent
 			.filter((entry) => entry.id === undefined || (!inWindowIds.has(entry.id) && entry.id !== row.message_id))
-			.map((entry) => `- [${entry.at}] ${entry.author}: ${entry.body.slice(0, 500)}`);
+			.map((entry) => `- [${entry.at}] ${entry.author}: ${redactHistoricalAttachments(entry.body).slice(0, 500)}`);
 		const recentBlock = recentLines.length
 			? `[Recent conversation history, last 24h (this session just started; already answered unless listed as unread below)]\n${recentLines.join("\n")}\n\n`
 			: "";
