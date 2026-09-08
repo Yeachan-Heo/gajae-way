@@ -11,6 +11,7 @@ export {
 	type CycleGateReason,
 	type CyclePhase,
 	type CycleSessionView,
+	containsSilenceToken,
 	type DeliveryConfirmParams,
 	type DeliveryFailParams,
 	type EngagementContext,
@@ -30,6 +31,7 @@ export {
 	type MonitorSpec,
 	type MonitorTestParams,
 	type OpsCycleResult,
+	type PromptStatusBody,
 	type RecallSnippet,
 	type ReplyContext,
 	type SessionBootstrapProjection,
@@ -46,6 +48,12 @@ export {
 	type WorkRetireResult,
 	type WorkRunParams,
 	type WorkRunResult,
+	type WorkStartParams,
+	type WorkStartResult,
+	type WorkStatusParams,
+	type WorkStatusResult,
+	type WorkSteerParams,
+	type WorkSteerResult,
 } from "./catalog";
 export {
 	type ChannelEngagementDecision,
@@ -89,6 +97,7 @@ export {
 	type OriginRef,
 	OriginRefError,
 	originKey,
+	parseOriginKey,
 	validateOriginRef,
 } from "./origin";
 export {

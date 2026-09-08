@@ -1,5 +1,6 @@
 import {
 	type BrokerSession,
+	type CliResult,
 	GjcCliError,
 	OpRefRejectedError,
 	type SendReceipt,
@@ -14,13 +15,17 @@ import type {
 	SessionRequestResult,
 	SessionSendInput,
 	SessionSteerInput,
+	WorkerOutputInput,
+	WorkerOutputResult,
 } from "../src/orchestrator/session-port";
+import { parseWorkerOutputResponse } from "../src/orchestrator/session-port";
 import type { TailAttachInput, TailFrame, TailHandle } from "../src/orchestrator/tail-runner";
 
 /** What gjc answers when the session itself refuses a steer (`ok:false` envelope): a decision, not a transport failure. */
 export function steerRefused(message = "no running turn"): GjcCliError {
 	return new GjcCliError(`gjc sdk turn.steer reported failure: ${JSON.stringify({ code: "busy", message })}`, 0, "", {
 		code: "busy",
+		refused: true,
 		message,
 	});
 }
@@ -29,6 +34,8 @@ export class ScriptedSessionPort implements SessionPort {
 	readonly sends: SessionSendInput[] = [];
 	readonly sendAttempts: SessionSendInput[] = [];
 	readonly steers: SessionSteerInput[] = [];
+	readonly workerOutputReads: WorkerOutputInput[] = [];
+	readonly #workerOutputFixtures = new Map<string, CliResult>();
 	readonly binds: SessionBindInput[] = [];
 	readonly resumes: Array<{ sessionId: string; repo: string; originKey: string; epoch: number }> = [];
 	readonly inspections: Array<{ sessionId: string; repo: string }> = [];
@@ -44,6 +51,7 @@ export class ScriptedSessionPort implements SessionPort {
 	readonly #tailFrames = new Map<string, TailFrame[]>();
 	readonly #chains = new Map<string, Promise<void>>();
 	readonly onSend?: (input: SessionSendInput, port: ScriptedSessionPort) => void | Promise<void>;
+	readonly onSteer?: (input: SessionSteerInput, port: ScriptedSessionPort) => void | Promise<void>;
 	readonly #onBind:
 		| ((
 				input: SessionBindInput,
@@ -54,6 +62,7 @@ export class ScriptedSessionPort implements SessionPort {
 	constructor(
 		options: {
 			onSend?: (input: SessionSendInput, port: ScriptedSessionPort) => void | Promise<void>;
+			onSteer?: (input: SessionSteerInput, port: ScriptedSessionPort) => void | Promise<void>;
 			onBind?: (
 				input: SessionBindInput,
 			) => string | { readonly sessionId: string } | Promise<string | { readonly sessionId: string }>;
@@ -61,6 +70,7 @@ export class ScriptedSessionPort implements SessionPort {
 		} = {},
 	) {
 		this.onSend = options.onSend;
+		this.onSteer = options.onSteer;
 		this.#onBind = options.onBind;
 		this.#sessionIdForBind = options.sessionIdForBind;
 	}
@@ -134,12 +144,20 @@ export class ScriptedSessionPort implements SessionPort {
 			text: "",
 			startedAt: Date.now(),
 		});
-		await this.onSend?.(input, this);
+		// Acceptance is independent of terminal completion, just like SDK send.
+		// A response-script failure after acceptance is a failed operation, not a
+		// fabricated send refusal that invites a duplicate prompt.
+		void Promise.resolve()
+			.then(() => this.onSend?.(input, this))
+			.catch((error: unknown) => {
+				this.fail(input.opRef, error instanceof Error ? error.message : String(error));
+			});
 		return { sessionId: input.sessionId, operationRef: input.opRef } as SendReceipt;
 	}
 
 	async steer(input: SessionSteerInput): Promise<void> {
 		this.steers.push(input);
+		await this.onSteer?.(input, this);
 	}
 
 	async setModel(input: {
@@ -172,12 +190,62 @@ export class ScriptedSessionPort implements SessionPort {
 			operationRef: input.opRef,
 			status:
 				operation.state === "terminal_ok"
-					? { status: "terminal_ok", ...startedAt }
+					? {
+							status: "terminal_ok",
+							...startedAt,
+							clientRef: input.opRef,
+							terminalAt: operation.terminalAt,
+							receiptState: "present",
+							outcome: { reason: "end_turn" },
+						}
 					: operation.state === "failed"
 						? { status: "failed", ...startedAt, error: { message: operation.error ?? "scripted failure" } }
 						: { status: "in_flight", ...startedAt },
 			summaryCompleted: operation.state !== "in_flight",
 		};
+	}
+
+	/** Raw query envelopes run through the same evidence parser as production. */
+	setWorkerOutputFixture(opRef: string, response: CliResult): void {
+		this.#workerOutputFixtures.set(opRef, response);
+	}
+
+	async fetchWorkerOutput(input: WorkerOutputInput): Promise<WorkerOutputResult> {
+		this.workerOutputReads.push(input);
+		const fixture = this.#workerOutputFixtures.get(input.opRef);
+		if (fixture) return parseWorkerOutputResponse(input, fixture, Date.now());
+		const operation = this.#operations.get(input.opRef);
+		const result =
+			!operation || operation.sessionId !== input.sessionId
+				? { status: "unknown" }
+				: {
+						kind: "prompt",
+						clientRef: input.opRef,
+						status: operation.state,
+						startedAt: operation.startedAt,
+						...(operation.terminalAt === undefined ? {} : { terminalAt: operation.terminalAt }),
+						...(operation.state === "terminal_ok"
+							? {
+									receiptState: "present",
+									content: {
+										version: 1,
+										type: "text",
+										text: operation.text,
+										byteLength: new TextEncoder().encode(operation.text).length,
+										truncated: false,
+									},
+								}
+							: {}),
+					};
+		return parseWorkerOutputResponse(
+			input,
+			{
+				exitCode: 0,
+				stdout: JSON.stringify({ ok: true, result }),
+				stderr: "",
+			},
+			Date.now(),
+		);
 	}
 
 	/** Same turn-floor rule as the broker port: only an assistant row produced at/after `notBeforeMs` counts. */

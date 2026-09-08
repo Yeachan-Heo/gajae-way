@@ -4,6 +4,7 @@ import { join } from "node:path";
 import {
 	CAPABILITIES,
 	type ChatMessagePayload,
+	containsSilenceToken,
 	encodeFrame,
 	type Frame,
 	FrameDecoder,
@@ -26,19 +27,7 @@ import {
 	resolveReactionEmoji,
 	validateOriginRef,
 } from "@gajaeway/protocol";
-import {
-	acknowledgeHold,
-	appendAttempt,
-	applyReconciliation,
-	closeAttempt,
-	createLaneJobRecord,
-	hasNewCommit,
-	LaneJobError,
-	type LaneJobRecord,
-	newOpRef,
-	parseLaneJobRecord,
-} from "@gajaeway/subsession";
-import type { GjcModelSelection } from "../config";
+import { parseLaneJobRecord } from "@gajaeway/subsession";
 import { type ConfigOverrides, type GatewayConfig, type ReloadResult, reloadConfig } from "../config";
 import { DeliveryService } from "../delivery/delivery";
 import { ReactionBudget } from "../delivery/reaction-budget";
@@ -55,7 +44,7 @@ import { MonitorRuntime } from "../monitors/runtime";
 import { backupDatabase, integrityDatabase } from "../ops/backup";
 import { RuntimeCycleProjector } from "../ops/cycle";
 import type { BrokerSupervisor } from "../orchestrator/broker";
-import { LaneGovernor, laneJobIdentity, workSessionKey } from "../orchestrator/lane-governor";
+import { LaneGovernor } from "../orchestrator/lane-governor";
 import {
 	type PersonaFailureInput,
 	PersonaSessionManager,
@@ -66,8 +55,9 @@ import {
 	type PersonaTurnStartInput,
 } from "../orchestrator/persona-session";
 import { formatFailureNotice, sanitizeDiagnostic } from "../orchestrator/rebind";
-import { type SessionPort, SessionRequestTimeoutError } from "../orchestrator/session-port";
+import type { SessionPort } from "../orchestrator/session-port";
 import { deterministicInterimDeliveryId, deterministicTerminalDeliveryId } from "../orchestrator/tail-runner";
+import { WorkLaneManager } from "../orchestrator/work-lane";
 import { buildSessionBootstrap } from "../persona/bootstrap";
 import { PersonaLoader } from "../persona/persona";
 import type { GatewayDatabase, InboundMessageRow, MonitorEventStage } from "../store/db";
@@ -77,108 +67,6 @@ import { OrderedFrameWriter } from "./frame-writer";
 import { InterimSpeechGate, type InterimSpeechLimits } from "./interim-speech";
 import { applyModelCommand } from "./model-command";
 import { composeSpeakerLabel, composeTurnHeader } from "./speaker";
-
-/**
- * Durable lane-job persistence for delegated work (issue #10).
- *
- * Every `work.run` call is one attempt against a job whose identity outlives
- * the turn. Its caller-supplied operation reference, accepted receipt, and
- * terminal transition persist through the broker-backed SessionPort, so a
- * gateway restart leaves an auditable record instead of an orphaned operation.
- */
-
-function persistLaneJob(database: GatewayDatabase, record: LaneJobRecord, laneKey: string): void {
-	database.putLaneJob({
-		jobId: record.jobId,
-		laneKey,
-		state: record.state,
-		createdAt: record.createdAt,
-		updatedAt: record.updatedAt,
-		lane: record.lane,
-		json: JSON.stringify(record),
-	});
-}
-
-/** `work.run` model: a non-empty model id or exactly `{ preset }`, matching the config `model` shape. */
-function parseWorkModel(value: unknown): GjcModelSelection | undefined {
-	if (value === undefined) return undefined;
-	if (typeof value === "string") {
-		if (!value) throw new ProtocolError("invalid_params", "work.run model must be a non-empty string");
-		return value;
-	}
-	if (
-		typeof value === "object" &&
-		value !== null &&
-		!Array.isArray(value) &&
-		Object.keys(value).length === 1 &&
-		typeof (value as { preset?: unknown }).preset === "string" &&
-		(value as { preset: string }).preset
-	)
-		return { preset: (value as { preset: string }).preset };
-	throw new ProtocolError("invalid_params", "work.run model must be a non-empty string or { preset }");
-}
-
-/** Reads the actual branch HEAD and dirtiness of the worktree (read-only git). */
-async function collectRepoFacts(
-	worktreePath: string,
-): Promise<{ headSha?: string; dirtyFiles: number; branch?: string } | undefined> {
-	try {
-		const head = Bun.spawnSync(["git", "-C", worktreePath, "rev-parse", "HEAD"], { stdout: "pipe", stderr: "pipe" });
-		const branch = Bun.spawnSync(["git", "-C", worktreePath, "rev-parse", "--abbrev-ref", "HEAD"], {
-			stdout: "pipe",
-			stderr: "pipe",
-		});
-		const status = Bun.spawnSync(["git", "-C", worktreePath, "status", "--porcelain"], {
-			stdout: "pipe",
-			stderr: "pipe",
-		});
-		const headSha = head.stdout.toString().trim();
-		if (!/^[0-9a-f]{40}$/.test(headSha)) return undefined;
-		const dirtyFiles = status.stdout
-			.toString()
-			.split("\n")
-			.filter((line) => line.trim()).length;
-		const branchName = branch.stdout.toString().trim();
-		return { headSha, dirtyFiles, ...(branchName ? { branch: branchName } : {}) };
-	} catch {
-		return undefined;
-	}
-}
-
-async function loadOrCreateLaneJob(
-	database: GatewayDatabase,
-	workName: string,
-	workCwd: string,
-): Promise<LaneJobRecord> {
-	const { jobId, laneKey } = laneJobIdentity(workName);
-	// The exact lane key (original name, case- and dot-faithful) is the
-	// authoritative lookup; the derived jobId is only a storage id.
-	const stored = database.laneJobJsonByLaneKey(laneKey) ?? database.laneJobJson(jobId);
-	if (stored !== undefined) {
-		const existing = parseLaneJobRecord(stored);
-		if (existing.lane.worktreePath !== workCwd) {
-			// Same worker name re-pointed at a different worktree is a lane
-			// mismatch: fail closed instead of reconciling one lane's commits
-			// into another lane's history.
-			throw new LaneJobError(
-				`worker ${workName} is bound to worktree ${existing.lane.worktreePath}, not ${workCwd}; use a different name or restore the original cwd`,
-			);
-		}
-		return existing;
-	}
-	// The lane block describes the REAL lane: actual worktree, actual branch
-	// when git can tell us, deterministic fallback otherwise. The starting
-	// HEAD is stored as the BASELINE - it is context, never worker progress.
-	const facts = await collectRepoFacts(workCwd);
-	const created = createLaneJobRecord({
-		jobId,
-		branch: facts?.branch ?? `work/${workName.toLowerCase().replace(/[^a-z0-9._/-]+/g, "-")}`,
-		worktreePath: workCwd,
-		baselineSha: facts?.headSha,
-	});
-	persistLaneJob(database, created, laneKey);
-	return created;
-}
 
 /** Persona tail stall heartbeat; well under the 120s stallTimeoutMs so alarms land within one interval of the threshold. */
 const DEFAULT_STALL_CHECK_INTERVAL_MS = 5_000;
@@ -322,6 +210,7 @@ interface Runtime {
 	readonly cycle: RuntimeCycleProjector;
 	/** Admission cap and retirement for `work.run` lanes. */
 	readonly lanes: LaneGovernor;
+	readonly work: WorkLaneManager;
 }
 
 export async function startUnixServer(options: GatewayServerOptions): Promise<GatewayServer> {
@@ -360,6 +249,7 @@ export async function startUnixServer(options: GatewayServerOptions): Promise<Ga
 			// Stop accepting new sockets first, but keep existing sockets alive. Then
 			// quiesce every admitted producer before taking the final writer snapshot.
 			listener.stop(false);
+			await runtime.work.stop();
 			await Promise.all([...runtime.requests]);
 			await runtime.personaSessions.drain();
 			await runtime.personaSessions.stop();
@@ -418,10 +308,12 @@ export async function startUnixServer(options: GatewayServerOptions): Promise<Ga
 				socket.data.writer.drain();
 			},
 			close(socket) {
+				runtime.work.detachWaiters(socket.data.connection);
 				socket.data.writer.close();
 				runtime.connections.delete(socket.data.connection);
 			},
 			error(socket, error) {
+				runtime.work.detachWaiters(socket.data.connection);
 				socket.data.writer.fail(error);
 				console.error(`gateway socket error: ${error.message}`);
 			},
@@ -458,14 +350,17 @@ export function startStdioServer(options: GatewayServerOptions): GatewayServer {
 		stopping = true;
 		stopPromise = (async () => {
 			process.off("SIGHUP", onHup);
-			connection.write({ v: PROFILE_VERSION, type: "event", event: "gateway.stopping", payload: { reason } });
-			// Same producer quiescence as the Unix server: in-flight stdio requests are
-			// tracked and awaited before persona/tail/broker teardown.
-			await Promise.all([...runtime.requests]);
+			process.stdin.off("data", onData);
+			process.stdin.off("end", onEnd);
 			clearInterval(runtime.reconcileTimer);
 			clearInterval(runtime.sessionGcTimer);
 			clearInterval(runtime.stallTimer);
 			clearInterval(runtime.contextMaintenanceTimer);
+			connection.write({ v: PROFILE_VERSION, type: "event", event: "gateway.stopping", payload: { reason } });
+			await runtime.work.stop();
+			// Same producer quiescence as the Unix server: in-flight stdio requests are
+			// tracked and awaited before persona/tail/broker teardown.
+			await Promise.all([...runtime.requests]);
 			await runtime.personaSessions.drain();
 			await runtime.personaSessions.stop();
 			runtime.stopBrokerGenerationListener?.();
@@ -480,7 +375,8 @@ export function startStdioServer(options: GatewayServerOptions): GatewayServer {
 		return stopPromise;
 	};
 	runtime.stop = stop;
-	process.stdin.on("data", (data: Buffer) => {
+	const onEnd = () => runtime.work.detachWaiters(connection);
+	const onData = (data: Buffer) => {
 		try {
 			for (const frame of connection.decoder.feed(data.toString())) {
 				const task = handleFrame(connection, frame, options, runtime, stop, () => stopping);
@@ -496,7 +392,9 @@ export function startStdioServer(options: GatewayServerOptions): GatewayServer {
 		} catch (error) {
 			writeError(connection, error);
 		}
-	});
+	};
+	process.stdin.on("data", onData);
+	process.stdin.on("end", onEnd);
 	return { stop };
 }
 
@@ -589,12 +487,23 @@ function createRuntime(options: GatewayServerOptions): Runtime {
 		maxLanes: options.config.work?.maxLanes,
 		idleRetireMs: options.config.work?.idleRetireMs,
 	});
+	const work = new WorkLaneManager({
+		database: options.database,
+		port: sessionPort,
+		lanes,
+		ownerTarget: () => runtime.config.ownerTarget?.origin,
+		brokerGeneration: () => options.broker?.generation ?? 0,
+		deliver: (payload) => broadcastDelivery(runtime, payload),
+	});
 	const reconcileTimer = setInterval(() => {
 		void monitors.reconcile();
 		void personaSessions
 			.recover()
 			.catch((error: unknown) => console.error(`persona recovery sweep failed: ${diagnostic(error)}`));
-		void lanes.sweep().catch((error: unknown) => console.error(`lane sweep failed: ${diagnostic(error)}`));
+		void work
+			.recover()
+			.then(() => lanes.sweep())
+			.catch((error: unknown) => console.error(`lane recovery/sweep failed: ${diagnostic(error)}`));
 	}, 60_000);
 	// Broker session-index GC. Once per interval, after recovery has re-bound
 	// whatever it is going to: anything the broker still indexes that no origin
@@ -635,6 +544,9 @@ function createRuntime(options: GatewayServerOptions): Runtime {
 	const stopBrokerGenerationListener =
 		typeof brokerWithGeneration?.onGeneration === "function"
 			? brokerWithGeneration.onGeneration((generation) => {
+					void work
+						.onBrokerGeneration()
+						.catch((error: unknown) => console.error(`work broker-generation recovery failed: ${diagnostic(error)}`));
 					void personaSessions
 						.onBrokerGeneration(generation)
 						.catch((error: unknown) =>
@@ -662,9 +574,11 @@ function createRuntime(options: GatewayServerOptions): Runtime {
 		botAudienceTurns: new BotAudienceTurnGuard(),
 		cycle: new RuntimeCycleProjector(options.database, memory, { maxLanes: lanes.maxLanes }),
 		lanes,
+		work,
 		inbound,
 		requests: new Set(),
 	};
+	void work.recover().catch((error: unknown) => console.error(`work startup recovery failed: ${diagnostic(error)}`));
 	void personaSessions
 		.recover()
 		.catch((error: unknown) => console.error(`persona startup recovery failed: ${diagnostic(error)}`));
@@ -827,202 +741,19 @@ async function handleRequest(
 			}
 			return;
 		}
-		case "work.run": {
-			// First-class delegated work: a named worker SDK session in the coding
-			// register, bound to a caller-chosen cwd and serialized per worker name.
-			// Its broker-backed request/response operation returns the terminal body
-			// directly without spawning a one-off child.
-			const params = request.params as
-				| { name?: unknown; text?: unknown; cwd?: unknown; resume?: unknown; model?: unknown }
-				| undefined;
-			if (typeof params?.name !== "string" || !/^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/.test(params.name))
-				throw new ProtocolError("invalid_params", "work.run requires name matching [A-Za-z0-9][A-Za-z0-9._-]{0,63}");
-			if (typeof params.text !== "string" || !params.text)
-				throw new ProtocolError("invalid_params", "work.run requires non-empty text");
-			if (params.cwd !== undefined && (typeof params.cwd !== "string" || !params.cwd.startsWith("/")))
-				throw new ProtocolError("invalid_params", "work.run cwd must be an absolute path");
-			const workModel = parseWorkModel(params.model);
-			const workName = params.name;
-			const workText = params.text;
-			const workCwd = params.cwd as string | undefined;
-			const sessionKey = workSessionKey(workName);
-			const effectiveCwd = workCwd ?? process.cwd();
-			const result = await runtime.sessionPort.runExclusive(sessionKey, async () => {
-				// Different names share admission until bind publishes the durable row.
-				const { sessionId } = await runtime.sessionPort.runExclusive("work/admission", async () => {
-					runtime.lanes.assertAdmission(workName);
-					const epoch = options.database.getSessionRecord(sessionKey)?.epoch ?? 0;
-					return runtime.sessionPort.bind({
-						originKey: sessionKey,
-						epoch,
-						repo: effectiveCwd,
-						codingRegister: true,
-						...(workModel ? { model: workModel } : {}),
-					});
-				});
-				options.database.updateActivity(
-					sessionKey,
-					JSON.stringify({ platform: "work", kind: "task", conversationId: workName }),
-				);
-				// Issue #10: this delegated call is one ATTEMPT against a durable
-				// job. The receipt and its terminal transition persist even when
-				// this process dies mid-turn, so nothing depends on a reply body.
-				const { jobId, laneKey } = laneJobIdentity(workName);
-				const prior = await loadOrCreateLaneJob(options.database, workName, effectiveCwd);
-				// A serialized worker cannot have two live turns, so an attempt still
-				// open at call time belongs to a crashed predecessor: record it as
-				// exactly what we know - terminally uncertain - and then HOLD. The
-				// predecessor's session may still be running after a restart; the
-				// deterministic planner path for an uncertain attempt is an operator
-				// hold, not an automatic continuation. `resume: true` is the explicit
-				// operator acknowledgement that lets the next attempt start.
-				// The awaiting_operator/stalled holds are STICKY: they survive
-				// restarts and every subsequent call until an operator explicitly
-				// resumes, so a genuinely uncertain or repeatedly stalling job can
-				// never be silently re-driven.
-				if ((prior.state === "awaiting_operator" || prior.state === "stalled") && params.resume !== true) {
-					return {
-						held: true as const,
-						jobId,
-						state: prior.state,
-						reason: `the job is ${prior.state} (uncertain attempt or stalled continuations); reconcile, then re-run with resume: true`,
-					};
-				}
-				const openPrior = prior.attempts.find((attempt) => attempt.endedAt === undefined);
-				let uncertain: LaneJobRecord | undefined;
-				if (openPrior) {
-					uncertain = closeAttempt({
-						record: prior,
-						opRef: openPrior.opRef,
-						endState: "terminal_uncertain",
-						endedAt: new Date().toISOString(),
-					});
-					persistLaneJob(options.database, uncertain, laneKey);
-					if (params.resume !== true) {
-						return {
-							held: true as const,
-							jobId,
-							state: uncertain.state,
-							reason: `attempt ${openPrior.opRef} is terminally uncertain after a crash/restart; reconcile, then re-run with resume: true`,
-						};
-					}
-				}
-				// resume:true is an explicit operator acknowledgement: the sticky
-				// hold (stalled budget or uncertain predecessor) is CLEARED and
-				// the acknowledgement is audited in the escalation trail BEFORE
-				// the new attempt starts. Without this, a successfully resumed
-				// job would stay sticky-stalled and be held forever.
-				let acknowledged = uncertain ?? prior;
-				if (acknowledged.state === "stalled" || acknowledged.state === "awaiting_operator") {
-					acknowledged = acknowledgeHold({
-						record: acknowledged,
-						note: "operator resumed the lane via work.run resume:true",
-						at: new Date().toISOString(),
-					});
-					persistLaneJob(options.database, acknowledged, laneKey);
-				}
-				const opRef = newOpRef(`work-${workName.toLowerCase().replace(/[^a-z0-9]+/g, "-")}`);
-				let job = appendAttempt(acknowledged, {
-					opRef,
-					sessionId,
-					startedAt: new Date().toISOString(),
-				});
-				persistLaneJob(options.database, job, laneKey);
-				try {
-					const reply = (
-						await runtime.sessionPort.request({
-							sessionId,
-							repo: effectiveCwd,
-							originKey: sessionKey,
-							text: workText,
-							opRef,
-							codingRegister: true,
-							...(workModel ? { model: workModel } : {}),
-						})
-					).assistant.text;
-					job = closeAttempt({
-						record: job,
-						opRef,
-						endState: "completed",
-						endedAt: new Date().toISOString(),
-					});
-					// Idle is measured from the last turn's END, not its start: a long
-					// turn must still earn a full idle interval before the sweep retires it.
-					options.database.updateActivity(
-						sessionKey,
-						JSON.stringify({ platform: "work", kind: "task", conversationId: workName }),
-					);
-					// Repository first: whatever the reply said, a HEAD move on the
-					// worktree is the authoritative checkpoint.
-					const facts = await collectRepoFacts(effectiveCwd);
-					if (facts) {
-						const progressed = hasNewCommit({
-							headSha: facts.headSha,
-							dirtyFiles: facts.dirtyFiles,
-							observedAt: new Date().toISOString(),
-							knownCheckpoints: job.checkpoints,
-							baselineSha: job.baselineSha,
-						});
-						job = applyReconciliation({
-							record: job,
-							repository: {
-								...(facts.headSha ? { headSha: facts.headSha } : {}),
-								dirtyFiles: facts.dirtyFiles,
-								observedAt: new Date().toISOString(),
-							},
-							classification: progressed ? "progressed" : "held",
-						});
-					}
-					persistLaneJob(options.database, job, laneKey);
-					return { held: false as const, text: reply, jobId, opRef };
-				} catch (error) {
-					const failureMessage = diagnostic(error);
-					// A bounded response wait never aborts the SDK turn. It records an
-					// attempt-ended durable boundary so the lane remains reconcilable.
-					const reaped = error instanceof SessionRequestTimeoutError;
-					job = closeAttempt({
-						record: job,
-						opRef,
-						endState: reaped ? "attempt_ended" : "failed",
-						errorCode: reaped ? "gateway_turn_reaped" : undefined,
-						endedAt: new Date().toISOString(),
-					});
-					options.database.updateActivity(
-						sessionKey,
-						JSON.stringify({ platform: "work", kind: "task", conversationId: workName }),
-					);
-					// Repository first HERE TOO: the measured #9 shape is commits
-					// landing right up to (or past) the kill; the repo, not the
-					// failure, decides whether progress happened.
-					const facts = await collectRepoFacts(effectiveCwd);
-					if (facts) {
-						const progressed = hasNewCommit({
-							headSha: facts.headSha,
-							dirtyFiles: facts.dirtyFiles,
-							observedAt: new Date().toISOString(),
-							knownCheckpoints: job.checkpoints,
-							baselineSha: job.baselineSha,
-						});
-						job = applyReconciliation({
-							record: job,
-							repository: {
-								...(facts.headSha ? { headSha: facts.headSha } : {}),
-								dirtyFiles: facts.dirtyFiles,
-								observedAt: new Date().toISOString(),
-							},
-							classification: progressed ? "progressed" : "stalled",
-						});
-					}
-					persistLaneJob(options.database, job, laneKey);
-					throw new Error(failureMessage);
-				}
-			});
-			connection.write({
-				v: PROFILE_VERSION,
-				type: "response",
-				id: request.id,
-				result: result.held ? result : { ...result, sessionKey },
-			});
+		case "work.start":
+		case "work.run":
+		case "work.status":
+		case "work.steer": {
+			const result =
+				request.verb === "work.start"
+					? await runtime.work.start(request.params)
+					: request.verb === "work.run"
+						? await runtime.work.run(request.params, connection)
+						: request.verb === "work.status"
+							? await runtime.work.status(request.params)
+							: await runtime.work.steer(request.params);
+			connection.write({ v: PROFILE_VERSION, type: "response", id: request.id, result });
 			return;
 		}
 		case "work.jobs": {
@@ -1070,6 +801,7 @@ async function handleRequest(
 			const params = request.params as { name?: unknown } | undefined;
 			if (typeof params?.name !== "string" || !/^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/.test(params.name))
 				throw new ProtocolError("invalid_params", "work.retire requires name matching [A-Za-z0-9][A-Za-z0-9._-]{0,63}");
+			await runtime.work.recover();
 			const outcome = await runtime.lanes.retire(params.name, "operator");
 			connection.write({ v: PROFILE_VERSION, type: "response", id: request.id, result: outcome });
 			return;
@@ -2231,11 +1963,6 @@ function writeError(connection: Connection, error: unknown, id?: string): void {
 function ownerPeerIdOf(config: GatewayConfig): string | undefined {
 	const owner = config.ownerTarget?.origin;
 	return owner && "peerId" in owner ? (owner as { peerId?: string }).peerId : undefined;
-}
-
-/** True when a part carries a silence token anywhere (a leaked reasoning preamble around it is still silence). */
-function containsSilenceToken(part: string): boolean {
-	return /\[(SILENT|silent)\]/.test(part);
 }
 
 function commandAuthorised(

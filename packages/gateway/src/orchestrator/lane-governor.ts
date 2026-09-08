@@ -19,7 +19,7 @@ const TERMINAL_JOB_STATES = new Set(["done", "aborted"]);
 const UNPROVEN_END_STATES = new Set(["attempt_ended", "terminal_uncertain", "terminal_missing_receipt", "failed"]);
 
 /**
- * Durable identity of one `work.run` lane job. The jobId is INJECTIVE: each
+ * Durable identity of one work lane job. The jobId is INJECTIVE: each
  * UTF-8 byte of the exact name becomes two hex digits, so distinct names
  * (Foo/foo, a.b/a_b) always map to distinct ids while staying within the
  * [a-z0-9-] jobId alphabet. 64-byte names cap at 128 hex chars + the prefix,
@@ -73,12 +73,12 @@ export interface LaneGovernorOptions {
 }
 
 /**
- * Gateway-owned admission and retirement for `work.run` lanes.
+ * Gateway-owned admission and retirement for asynchronous work lanes.
  *
  * Every lane is a bound `work/task/<name>` origin hosted by the private broker,
  * so the gateway can count, cap, and close them. Retirement is `session.close`
  * plus an epoch bump: the saved session stays in the broker index (deleting it
- * would trip gjc's global cleanup fence) while the next `work.run` for that
+ * would trip gjc's global cleanup fence) while the next start/run for that
  * name creates a fresh session instead of resuming a stale one.
  */
 export class LaneGovernor {
@@ -88,6 +88,9 @@ export class LaneGovernor {
 	readonly idleRetireMs: number;
 	readonly #now: () => number;
 	readonly #log: (line: string) => void;
+	#recoveryGate?: () => Promise<void>;
+	#stopped = false;
+	readonly #mutations = new Set<Promise<LaneRetireOutcome>>();
 
 	constructor(options: LaneGovernorOptions) {
 		this.#database = options.database;
@@ -96,6 +99,17 @@ export class LaneGovernor {
 		this.idleRetireMs = positiveInteger(options.idleRetireMs, DEFAULT_WORK_IDLE_RETIRE_MS, "idleRetireMs");
 		this.#now = options.now ?? (() => Date.now());
 		this.#log = options.log ?? ((line) => console.error(line));
+	}
+
+	/** Installed by the sole attempt owner; recovery registration precedes retirement. */
+	setRecoveryGate(gate: () => Promise<void>): void {
+		this.#recoveryGate = gate;
+		this.#stopped = false;
+	}
+
+	async stop(): Promise<void> {
+		this.#stopped = true;
+		await Promise.allSettled([...this.#mutations]);
 	}
 
 	activeLanes(now = this.#now()): ActiveLane[] {
@@ -143,7 +157,8 @@ export class LaneGovernor {
 	}
 
 	/**
-	 * Serialized with the lane's own `work.run`. The binding identity observed
+	 * Serialized with the lane's short mutation lock, never its response wait.
+	 * The binding identity observed
 	 * by the caller (sweep snapshot, operator view) is re-proven under the lock:
 	 * a lane that was reused or rebound meanwhile is left alone.
 	 *
@@ -153,6 +168,23 @@ export class LaneGovernor {
 	 * rebound to a new one is left alone.
 	 */
 	retire(name: string, reason: string, expected?: SweepNomination): Promise<LaneRetireOutcome> {
+		if (this.#stopped)
+			return Promise.resolve({ retired: false, sessionKey: workSessionKey(name), reason: "gateway is stopping" });
+		const task = (async () => {
+			await this.#recoveryGate?.();
+			if (this.#stopped)
+				return { retired: false as const, sessionKey: workSessionKey(name), reason: "gateway is stopping" };
+			return this.#retire(name, reason, expected);
+		})();
+		this.#mutations.add(task);
+		void task.then(
+			() => this.#mutations.delete(task),
+			() => this.#mutations.delete(task),
+		);
+		return task;
+	}
+
+	#retire(name: string, reason: string, expected?: SweepNomination): Promise<LaneRetireOutcome> {
 		const sessionKey = workSessionKey(name);
 		// Refuse an unsettled lane now rather than queuing retirement behind its
 		// turn; the same check repeats under the lock because a run may start
@@ -160,6 +192,7 @@ export class LaneGovernor {
 		const preflight = this.activeLanes().find((candidate) => candidate.name === name);
 		if (preflight?.attemptOpen) return Promise.resolve(unsettled(sessionKey, preflight));
 		return this.#port.runExclusive(sessionKey, async () => {
+			if (this.#stopped) return { retired: false, sessionKey, reason: "gateway is stopping" };
 			const lane = this.activeLanes(expected ? Math.max(expected.now, this.#now()) : undefined).find(
 				(candidate) => candidate.name === name,
 			);
@@ -210,6 +243,7 @@ export class LaneGovernor {
 	 * identity and eligibility under the lane lock before closing anything.
 	 */
 	async sweep(now = this.#now()): Promise<number> {
+		if (this.#stopped) return 0;
 		let retired = 0;
 		for (const lane of this.activeLanes(now)) {
 			const reason = this.#sweepReason(lane);

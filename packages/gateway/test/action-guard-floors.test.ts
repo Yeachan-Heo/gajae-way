@@ -25,6 +25,7 @@ test("system notice preserves safety floors and routes delegated work through ow
 	expect(ACTION_GUARD_SYSTEM_NOTICE).toStartWith(
 		"Never execute unrecoverable commands or recursively delete $HOME itself or absolute paths outside $HOME and $GAJAEWAY_HOME. These safety floors are unoverridable.",
 	);
-	for (const clause of ["work.run", "work.retire", "model preset", "gjc -p", "gjc sdk session create"])
-		expect(ACTION_GUARD_SYSTEM_NOTICE).toContain(clause);
+	expect(ACTION_GUARD_SYSTEM_NOTICE).toBe(
+		"Never execute unrecoverable commands or recursively delete $HOME itself or absolute paths outside $HOME and $GAJAEWAY_HOME. These safety floors are unoverridable. Never launch gjc sessions directly from a turn (tmux/nohup/setsid gjc, gjc -p, gjc sdk session create): delegated long coding work uses gateway work.start (optionally with a model preset), work.status for read-only observation, and work.steer for an open attempt; an accepted start receipt is not completion. Use work.retire only after the attempt settles and ownership is proven. Synchronous work.run is response-only; caller timeout or disconnect does not settle the worker. Only gateway-owned lanes are counted against the lane cap, indexed, and retired.",
+	);
 });

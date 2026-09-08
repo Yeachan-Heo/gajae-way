@@ -21,7 +21,7 @@ let home = "";
 let database: GatewayDatabase | undefined;
 let propagators: MonitorPropagator[] = [];
 afterEach(async () => {
-	for (const propagator of propagators) propagator.dispose();
+	for (const propagator of propagators) await propagator.drain();
 	propagators = [];
 	database?.close();
 	database = undefined;
@@ -600,6 +600,7 @@ describe("cron slot catch-up", () => {
 			await runtimeNew.stop();
 			await closure.drain();
 			expect(db.monitorSlotExists(monitorNew.monitorId, new Date(2026, 7, 27, 6, 30).toISOString())).toBe(false);
+			await propagator.drain();
 			await closure.drain();
 			db.close();
 		} finally {

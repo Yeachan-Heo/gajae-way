@@ -487,6 +487,7 @@ test("G7: migration 19 requeues a settled-bound trigger and ride-along member to
 		(await GatewayDatabase.open(path)).close();
 		const raw = new Database(path);
 		raw.exec(`
+DROP TABLE work_attempt_runtime;
 DROP TABLE inbound_messages;
 CREATE TABLE inbound_messages (message_id TEXT PRIMARY KEY, origin_key TEXT NOT NULL, origin_ref_json TEXT NOT NULL, body TEXT NOT NULL, engagement_json TEXT, state TEXT NOT NULL CHECK(state IN ('pending','processing','done')), received_at TEXT NOT NULL);
 CREATE INDEX inbound_messages_claim ON inbound_messages (origin_key, state, received_at);
@@ -507,7 +508,7 @@ INSERT INTO inbound_messages (message_id, origin_key, origin_ref_json, body, eng
 		raw.close();
 
 		upgraded = await GatewayDatabase.open(path);
-		expect(upgraded.schemaVersion).toBe(20);
+		expect(upgraded.schemaVersion).toBe(21);
 		expect(upgraded.inboundTurnRows("gw-p-ride").map((row) => [row.message_id, row.turn_role, row.turn_state])).toEqual(
 			[
 				["ride-trigger", "trigger", "bound"],

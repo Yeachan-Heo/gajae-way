@@ -1,6 +1,203 @@
 import { Database } from "bun:sqlite";
+import { createHash } from "node:crypto";
 import { mkdir } from "node:fs/promises";
 import { dirname } from "node:path";
+import {
+	type ChatMessagePayload,
+	isSilenceToken,
+	type OriginRef,
+	originKey,
+	validateOriginRef,
+} from "@gajaeway/protocol";
+import { assertValidOpRef, type LaneJobRecord, type PromptStatusBody, parseLaneJobRecord } from "@gajaeway/subsession";
+
+export type WorkAttemptMode = "start" | "run" | "historical";
+export type WorkAttemptDecision = "undecided" | "enqueued" | "suppressed" | "no_target";
+export interface WorkAttemptOutputProof {
+	readonly opRef: string;
+	readonly sessionId: string;
+	readonly epoch: number;
+	readonly observedAtMs: number;
+	readonly source: "turn.result";
+	readonly attribution: "operation_ref";
+	readonly fullness: "original";
+	readonly clientRef: string;
+	readonly repo: string;
+	readonly terminalAt: number;
+	readonly contentVersion: 1;
+	readonly byteLength: number;
+	readonly turnId?: string;
+	readonly commandId?: string;
+}
+export interface WorkAttemptOutput {
+	readonly disposition: "pending" | "available" | "unavailable" | "silent";
+	readonly reads: number;
+	readonly nextReadAt: string | null;
+	readonly excerpt: string | null;
+	readonly proof: WorkAttemptOutputProof | null;
+	/** Proven original attempt-final silence survives output loss and ledger pruning. */
+	readonly knownSilence: WorkAttemptOutputProof | null;
+}
+export interface WorkAttemptTerminalEvidence {
+	readonly kind: "broker" | "local";
+	readonly observedAt: string;
+	readonly reasonCode: string;
+	readonly status?: PromptStatusBody;
+}
+export interface WorkAttemptRuntime {
+	readonly opRef: string;
+	readonly jobId: string;
+	readonly laneKey: string;
+	readonly sessionKey: string;
+	readonly sessionId: string;
+	readonly epoch: number;
+	readonly cwd: string;
+	readonly startedAt: string;
+	readonly mode: WorkAttemptMode;
+	readonly sendPhase: "prepared" | "accepted" | "uncertain";
+	readonly sendEvidence: { readonly source: "receipt" | "status"; readonly observedAt: string } | null;
+	readonly terminal: WorkAttemptTerminalEvidence | null;
+	readonly output: WorkAttemptOutput;
+	readonly target: OriginRef | null;
+	readonly deliveryId: string;
+	readonly decision: WorkAttemptDecision;
+	readonly settledAt: string | null;
+	readonly version: number;
+}
+export type WorkAttemptPatch = Partial<Pick<WorkAttemptRuntime, "sendPhase" | "sendEvidence" | "terminal" | "output">>;
+export interface WorkAttemptSettlement extends WorkAttemptPatch {
+	readonly decision: Exclude<WorkAttemptDecision, "undecided">;
+	readonly settledAt: string;
+}
+export class WorkAttemptStateError extends Error {
+	constructor() {
+		super("work lane state unavailable");
+		this.name = "WorkAttemptStateError";
+	}
+}
+
+/** Length-delimited identity hashing; independent of target, output and recovery time. */
+export function workAttemptDeliveryId(instanceId: string, jobId: string, opRef: string): string {
+	return `work-${createHash("sha256")
+		.update(JSON.stringify([instanceId, jobId, opRef]))
+		.digest("hex")}`;
+}
+
+const WORK_REASON_CODES = new Set([
+	"end_turn",
+	"prompt_deadline_exceeded",
+	"cancelled",
+	"max_tokens",
+	"max_turn_requests",
+	"refusal",
+	"stopped_incomplete",
+	"sdk_failed",
+	"send_rejected",
+	"terminal_missing_receipt",
+	"terminal_uncertain",
+	"session_dead",
+	"session_disowned",
+	"recovery_indeterminate",
+	"output_unavailable",
+]);
+function workAssert(condition: unknown): asserts condition {
+	if (!condition) throw new WorkAttemptStateError();
+}
+function workTime(value: unknown): boolean {
+	return typeof value === "string" && value.length <= 40 && Number.isFinite(Date.parse(value));
+}
+function workString(value: unknown, max = 512): value is string {
+	if (typeof value !== "string" || value.length === 0 || value.length > max) return false;
+	for (let index = 0; index < value.length; index++) {
+		if (value.charCodeAt(index) < 32) return false;
+	}
+	return true;
+}
+function validateWorkRuntime(value: WorkAttemptRuntime, instanceId: string): void {
+	workAssert(value && typeof value === "object");
+	workAssert(workString(value.opRef));
+	assertValidOpRef(value.opRef);
+	workAssert(/^lanejob-[a-z0-9-]{1,128}$/.test(value.jobId));
+	workAssert(workString(value.laneKey) && /^work\/task\/[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/.test(value.sessionKey));
+	workAssert(value.laneKey === `work-${value.sessionKey.slice("work/task/".length)}`);
+	workAssert(/^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/.test(value.sessionId));
+	workAssert(Number.isSafeInteger(value.epoch) && value.epoch >= 0);
+	workAssert(workString(value.cwd, 4096) && value.cwd.startsWith("/") && workTime(value.startedAt));
+	workAssert(["start", "run", "historical"].includes(value.mode));
+	workAssert(["prepared", "accepted", "uncertain"].includes(value.sendPhase));
+	workAssert(Number.isSafeInteger(value.version) && value.version >= 0);
+	workAssert(value.deliveryId === workAttemptDeliveryId(instanceId, value.jobId, value.opRef));
+	if (value.target !== null) {
+		workAssert(value.mode === "start");
+		validateOriginRef(value.target);
+	}
+	if (value.sendEvidence !== null) {
+		workAssert(["receipt", "status"].includes(value.sendEvidence.source) && workTime(value.sendEvidence.observedAt));
+	}
+	workAssert(value.sendPhase !== "accepted" || value.sendEvidence !== null);
+	if (value.terminal !== null) {
+		const terminal = value.terminal;
+		workAssert(["broker", "local"].includes(terminal.kind) && workTime(terminal.observedAt));
+		workAssert(WORK_REASON_CODES.has(terminal.reasonCode));
+		if (terminal.kind === "broker") workAssert(terminal.status !== undefined);
+		if (terminal.status !== undefined) {
+			const status = terminal.status;
+			workAssert(["terminal_ok", "failed"].includes(status.status));
+			for (const id of [status.turnId, status.commandId, status.clientRef])
+				workAssert(id === undefined || workString(id));
+			for (const at of [status.acceptedAt, status.startedAt, status.terminalAt])
+				workAssert(at === undefined || Number.isFinite(at));
+			workAssert(
+				status.receiptState === undefined || ["absent", "present", "missing", "unknown"].includes(status.receiptState),
+			);
+			workAssert(
+				status.error === undefined ||
+					(status.error.message === undefined && WORK_REASON_CODES.has(status.error.code ?? "")),
+			);
+			if (status.outcome) {
+				workAssert(status.outcome.reason === undefined || WORK_REASON_CODES.has(status.outcome.reason));
+				workAssert(status.outcome.kind === undefined || workString(status.outcome.kind, 64));
+				workAssert(status.outcome.provenance === undefined || workString(status.outcome.provenance, 64));
+			}
+		}
+	}
+	const output = value.output;
+	workAssert(output && ["pending", "available", "unavailable", "silent"].includes(output.disposition));
+	workAssert(Number.isSafeInteger(output.reads) && output.reads >= 0 && output.reads <= 3);
+	workAssert(output.nextReadAt === null || workTime(output.nextReadAt));
+	workAssert(
+		output.excerpt === null ||
+			(typeof output.excerpt === "string" && Buffer.byteLength(output.excerpt, "utf8") <= 2048),
+	);
+	for (const proof of [output.proof, output.knownSilence]) {
+		if (proof === null) continue;
+		workAssert(
+			proof && proof.opRef === value.opRef && proof.sessionId === value.sessionId && proof.epoch === value.epoch,
+		);
+		workAssert(Number.isFinite(proof.observedAtMs) && proof.observedAtMs >= Date.parse(value.startedAt));
+		workAssert(
+			proof.source === "turn.result" && proof.attribution === "operation_ref" && proof.fullness === "original",
+		);
+		workAssert(proof.clientRef === value.opRef && proof.repo === value.cwd && proof.contentVersion === 1);
+		workAssert(Number.isFinite(proof.terminalAt) && proof.terminalAt >= Date.parse(value.startedAt));
+		workAssert(Number.isSafeInteger(proof.byteLength) && proof.byteLength >= 0);
+		for (const id of [proof.turnId, proof.commandId]) workAssert(id === undefined || workString(id));
+	}
+	workAssert(output.disposition !== "available" || (output.proof !== null && output.excerpt !== null));
+	workAssert(output.disposition !== "silent" || output.knownSilence !== null);
+	workAssert(["undecided", "enqueued", "suppressed", "no_target"].includes(value.decision));
+	workAssert(value.decision === "undecided" ? value.settledAt === null : workTime(value.settledAt));
+	if (value.decision !== "undecided") {
+		workAssert(value.terminal !== null && output.disposition !== "pending");
+		workAssert(
+			value.decision !== "enqueued" ||
+				(value.mode === "start" && value.target !== null && output.knownSilence === null),
+		);
+		workAssert(value.decision !== "suppressed" || output.knownSilence !== null);
+		workAssert(value.decision !== "no_target" || value.target === null);
+	}
+	workAssert(Buffer.byteLength(JSON.stringify(value), "utf8") <= 16384);
+}
 
 /**
  * A gjc model selection: either an explicit selector string or a model profile
@@ -86,7 +283,7 @@ export class InboundTurnConflictError extends Error {
 	}
 }
 
-const LATEST_SCHEMA_VERSION = 20;
+const LATEST_SCHEMA_VERSION = 21;
 /** Maximum number of prior messages supplied to one engaged conversation turn. */
 export const CONVERSATION_DIFF_MAX_ROWS = 60;
 /** Maximum age of prior messages supplied to one engaged conversation turn. */
@@ -199,6 +396,250 @@ export const MONITOR_EVENT_MAX_DISPATCH_ATTEMPTS = 5;
 export class GatewayDatabase {
 	readonly #database: Database;
 	#inTransaction = false;
+
+	/** Explicit seam for operations that must participate in a caller-owned commit. */
+	requireTransaction(): void {
+		if (!this.#inTransaction) throw new Error("operation requires a database transaction");
+	}
+
+	workAttemptGet(opRef: string): WorkAttemptRuntime | undefined {
+		const row = this.#database
+			.query<
+				{
+					op_ref: string;
+					job_id: string;
+					lane_key: string;
+					session_id: string;
+					version: number;
+					settled_at: string | null;
+					delivery_id: string;
+					record_json: string;
+				},
+				[string]
+			>("SELECT * FROM work_attempt_runtime WHERE op_ref = ?")
+			.get(opRef);
+		if (!row) return undefined;
+		try {
+			const runtime = JSON.parse(row.record_json) as WorkAttemptRuntime;
+			validateWorkRuntime(runtime, this.instanceId);
+			workAssert(runtime.opRef === row.op_ref && runtime.jobId === row.job_id && runtime.laneKey === row.lane_key);
+			workAssert(runtime.sessionId === row.session_id && runtime.version === row.version);
+			workAssert(runtime.settledAt === row.settled_at && runtime.deliveryId === row.delivery_id);
+			this.#workHistory(runtime);
+			return runtime;
+		} catch {
+			throw new WorkAttemptStateError();
+		}
+	}
+
+	/** Keyset pagination: callers can recover arbitrarily many lanes in bounded reads. */
+	workAttemptOpen(limit = 100, afterOpRef = ""): readonly WorkAttemptRuntime[] {
+		workAssert(Number.isSafeInteger(limit) && limit >= 1 && limit <= 1000);
+		return this.#database
+			.query<{ op_ref: string }, [string, number]>(
+				"SELECT op_ref FROM work_attempt_runtime WHERE settled_at IS NULL AND op_ref > ? ORDER BY op_ref LIMIT ?",
+			)
+			.all(afterOpRef, limit)
+			.map((row) => this.workAttemptGet(row.op_ref)!);
+	}
+
+	workAttemptOpenByLane(laneKey: string): WorkAttemptRuntime | undefined {
+		const row = this.#database
+			.query<{ op_ref: string }, [string]>(
+				"SELECT op_ref FROM work_attempt_runtime WHERE lane_key = ? AND settled_at IS NULL",
+			)
+			.get(laneKey);
+		return row ? this.workAttemptGet(row.op_ref) : undefined;
+	}
+
+	/** Atomically append history, freeze notification intent and refresh activity before send. */
+	workAttemptPrepare(runtime: WorkAttemptRuntime, record: LaneJobRecord): void {
+		this.withTransaction(() => {
+			validateWorkRuntime(runtime, this.instanceId);
+			workAssert(runtime.version === 0 && runtime.decision === "undecided" && runtime.terminal === null);
+			workAssert(runtime.output.reads === 0 && runtime.output.disposition === "pending");
+			workAssert(
+				runtime.output.proof === null &&
+					runtime.output.knownSilence === null &&
+					runtime.output.excerpt === null &&
+					runtime.output.nextReadAt === null,
+			);
+			workAssert(runtime.sendEvidence === null);
+			workAssert(runtime.sendPhase === (runtime.mode === "historical" ? "uncertain" : "prepared"));
+			this.#workValidateHistory(runtime, record);
+			const previousJson = this.laneJobJson(runtime.jobId);
+			const previous = previousJson === undefined ? undefined : parseLaneJobRecord(previousJson);
+			if (runtime.mode === "historical") {
+				workAssert(previous && JSON.stringify(previous) === JSON.stringify(parseLaneJobRecord(JSON.stringify(record))));
+			} else {
+				workAssert(!previous?.attempts.some((attempt) => attempt.endedAt === undefined));
+				workAssert(record.attempts.length === (previous?.attempts.length ?? 0) + 1);
+				workAssert(JSON.stringify(record.attempts.slice(0, -1)) === JSON.stringify(previous?.attempts ?? []));
+				const binding = this.getSessionRecord(runtime.sessionKey);
+				workAssert(binding?.sessionId === runtime.sessionId && binding.epoch === runtime.epoch);
+			}
+			this.#workPutHistory(runtime, record);
+			this.#database
+				.query(
+					"INSERT INTO work_attempt_runtime (op_ref, job_id, lane_key, session_id, version, settled_at, delivery_id, record_json) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+				)
+				.run(
+					runtime.opRef,
+					runtime.jobId,
+					runtime.laneKey,
+					runtime.sessionId,
+					runtime.version,
+					null,
+					runtime.deliveryId,
+					JSON.stringify(runtime),
+				);
+			this.#workActivity(runtime, runtime.startedAt);
+		});
+	}
+
+	/** CAS staging, including output-read claims and proof-before-checkpoint commits. */
+	workAttemptUpdate(
+		opRef: string,
+		expectedVersion: number,
+		patch: WorkAttemptPatch,
+		tailCursor?: string,
+	): WorkAttemptRuntime | undefined {
+		return this.withTransaction(() => {
+			const current = this.workAttemptGet(opRef);
+			if (!current || current.version !== expectedVersion || current.settledAt !== null) return undefined;
+			const next = this.#workPatched(current, patch);
+			workAssert(next.decision === "undecided" && next.settledAt === null);
+			if (!this.#workCas(current, next)) return undefined;
+			if (tailCursor !== undefined) {
+				workAssert(next.output.proof !== null || next.output.knownSilence !== null);
+				this.tailCursorCommit(next.sessionId, tailCursor);
+			}
+			return next;
+		});
+	}
+
+	/** Winning settlement is the only notification admission; retained runtime is its tombstone. */
+	workAttemptSettle(
+		opRef: string,
+		expectedVersion: number,
+		record: LaneJobRecord,
+		patch: WorkAttemptSettlement,
+		payload?: ChatMessagePayload,
+	): WorkAttemptRuntime | undefined {
+		return this.withTransaction(() => {
+			const current = this.workAttemptGet(opRef);
+			if (!current || current.version !== expectedVersion || current.settledAt !== null) return undefined;
+			const next = this.#workPatched(current, patch);
+			workAssert(next.decision !== "undecided" && next.settledAt !== null);
+			this.#workValidateHistory(next, record);
+			const previous = this.#workHistory(current);
+			workAssert(record.attempts.length === previous.attempts.length);
+			workAssert(JSON.stringify(record.attempts.slice(0, -1)) === JSON.stringify(previous.attempts.slice(0, -1)));
+			if (next.decision === "enqueued") {
+				workAssert(payload && payload.deliveryId === next.deliveryId && payload.turnId === opRef);
+				workAssert(next.target && originKey(payload.origin) === originKey(next.target));
+				workAssert(
+					payload.role === "assistant" && payload.final === true && !payload.reaction && !isSilenceToken(payload.text),
+				);
+			} else workAssert(payload === undefined);
+			if (!this.#workCas(current, next)) return undefined;
+			this.#workPutHistory(next, record);
+			this.#workActivity(next, next.settledAt!);
+			if (payload)
+				this.deliveryCreateInTransaction({
+					id: next.deliveryId,
+					turnId: opRef,
+					originKey: originKey(payload.origin),
+					payloadJson: JSON.stringify(payload),
+				});
+			return next;
+		});
+	}
+
+	#workPatched(current: WorkAttemptRuntime, patch: WorkAttemptPatch | WorkAttemptSettlement): WorkAttemptRuntime {
+		const allowed = new Set(["sendPhase", "sendEvidence", "terminal", "output", "decision", "settledAt"]);
+		workAssert(Object.keys(patch).every((key) => allowed.has(key)));
+		const next = { ...current, ...patch, version: current.version + 1 };
+		validateWorkRuntime(next, this.instanceId);
+		workAssert(current.sendPhase !== "accepted" || next.sendPhase === "accepted");
+		workAssert(current.sendPhase === "prepared" || next.sendPhase !== "prepared");
+		workAssert(current.terminal === null || JSON.stringify(current.terminal) === JSON.stringify(next.terminal));
+		workAssert(
+			current.output.knownSilence === null ||
+				JSON.stringify(current.output.knownSilence) === JSON.stringify(next.output.knownSilence),
+		);
+		workAssert(next.output.reads >= current.output.reads && next.output.reads <= current.output.reads + 1);
+		workAssert(next.output.reads === current.output.reads || next.terminal !== null);
+		return next;
+	}
+
+	#workCas(current: WorkAttemptRuntime, next: WorkAttemptRuntime): boolean {
+		return (
+			this.#database
+				.query(
+					"UPDATE work_attempt_runtime SET record_json = ?, version = ?, settled_at = ? WHERE op_ref = ? AND version = ? AND settled_at IS NULL",
+				)
+				.run(JSON.stringify(next), next.version, next.settledAt, current.opRef, current.version).changes === 1
+		);
+	}
+
+	#workValidateHistory(runtime: WorkAttemptRuntime, input: LaneJobRecord): void {
+		const record = parseLaneJobRecord(JSON.stringify(input));
+		workAssert(record.jobId === runtime.jobId && record.lane.worktreePath === runtime.cwd);
+		const attempt = record.attempts.find((item) => item.opRef === runtime.opRef);
+		workAssert(attempt && attempt.sessionId === runtime.sessionId && attempt.startedAt === runtime.startedAt);
+		workAssert(runtime.settledAt === null ? attempt.endedAt === undefined : attempt.endedAt === runtime.settledAt);
+		if (runtime.settledAt === null) workAssert(record.attempts.at(-1)?.opRef === runtime.opRef);
+	}
+
+	#workHistory(runtime: WorkAttemptRuntime): LaneJobRecord {
+		const json = this.laneJobJson(runtime.jobId);
+		workAssert(json !== undefined && this.laneJobJsonByLaneKey(runtime.laneKey) === json);
+		const record = parseLaneJobRecord(json);
+		this.#workValidateHistory(runtime, record);
+		return record;
+	}
+
+	#workPutHistory(runtime: WorkAttemptRuntime, record: LaneJobRecord): void {
+		this.putLaneJob({ ...record, laneKey: runtime.laneKey, json: JSON.stringify(record) });
+	}
+
+	#workActivity(runtime: WorkAttemptRuntime, at: string): void {
+		this.#database
+			.query(
+				"UPDATE sessions SET last_activity_at = ?, origin_ref_json = ? WHERE origin_key = ? AND gjc_session_id = ? AND epoch = ?",
+			)
+			.run(
+				at,
+				JSON.stringify({
+					platform: "work",
+					kind: "task",
+					conversationId: runtime.sessionKey.slice("work/task/".length),
+				}),
+				runtime.sessionKey,
+				runtime.sessionId,
+				runtime.epoch,
+			);
+	}
+
+	/** No transaction ownership and no INSERT OR IGNORE: conflicting obligations fail closed. */
+	deliveryCreateInTransaction(row: { id: string; turnId: string; originKey: string; payloadJson: string }): boolean {
+		this.requireTransaction();
+		const existing = this.#database
+			.query<{ turn_id: string; origin_key: string; payload_json: string }, [string]>(
+				"SELECT turn_id, origin_key, payload_json FROM deliveries WHERE delivery_id = ?",
+			)
+			.get(row.id);
+		if (existing) {
+			workAssert(
+				existing.turn_id === row.turnId &&
+					existing.origin_key === row.originKey &&
+					existing.payload_json === row.payloadJson,
+			);
+			return false;
+		}
+		return this.deliveryCreate(row);
+	}
 
 	private constructor(database: Database) {
 		this.#database = database;
@@ -1393,7 +1834,7 @@ export class GatewayDatabase {
 	referencedSessionIds(): ReadonlySet<string> {
 		const rows = this.#database
 			.query<{ id: string }, []>(
-				"SELECT gjc_session_id AS id FROM sessions WHERE gjc_session_id <> '' UNION SELECT bound_session_id AS id FROM inbound_messages WHERE bound_session_id IS NOT NULL AND state = 'pending'",
+				"SELECT gjc_session_id AS id FROM sessions WHERE gjc_session_id <> '' UNION SELECT bound_session_id AS id FROM inbound_messages WHERE bound_session_id IS NOT NULL AND state = 'pending' UNION SELECT session_id AS id FROM work_attempt_runtime WHERE settled_at IS NULL",
 			)
 			.all();
 		return new Set(rows.map((row) => row.id));
@@ -2470,6 +2911,21 @@ ALTER TABLE monitor_slots ADD COLUMN event_id TEXT;`,
 				this.#database
 					.query("INSERT INTO schema_migrations (version, applied_at) VALUES (?, ?)")
 					.run(20, new Date().toISOString());
+			});
+		}
+		if (current < 21) {
+			this.withTransaction(() => {
+				// Existing lane history is preserved verbatim. Recovery explicitly adopts
+				// historical open attempts without inventing a target or dispatch proof.
+				this.#database.exec(`CREATE TABLE work_attempt_runtime (
+					op_ref TEXT PRIMARY KEY, job_id TEXT NOT NULL, lane_key TEXT NOT NULL,
+					session_id TEXT NOT NULL, version INTEGER NOT NULL CHECK(version >= 0),
+					settled_at TEXT, delivery_id TEXT NOT NULL UNIQUE,
+					record_json TEXT NOT NULL CHECK(length(record_json) <= 16384));
+					CREATE UNIQUE INDEX work_attempt_open_lane ON work_attempt_runtime(lane_key) WHERE settled_at IS NULL;`);
+				this.#database
+					.query("INSERT INTO schema_migrations (version, applied_at) VALUES (?, ?)")
+					.run(21, new Date().toISOString());
 			});
 		}
 	}

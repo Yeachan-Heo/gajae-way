@@ -55,6 +55,8 @@ export interface SessionPort {
 		tier: GjcServiceTier;
 	}): Promise<{ readonly changed: boolean }>;
 	status(input: { sessionId: string; repo: string; opRef: string }): Promise<StatusReport>;
+	/** Exact invocation-owned original output; never falls back to a latest-assistant heuristic. */
+	fetchWorkerOutput(input: WorkerOutputInput): Promise<WorkerOutputResult>;
 	fetchLastAssistant(input: { sessionId: string; repo: string }): Promise<LastAssistantResult>;
 	/**
 	 * Last assistant row NOT older than `notBeforeMs`. Callers pass the op's
@@ -156,6 +158,44 @@ export interface SessionSteerInput {
 	readonly text: string;
 	readonly clientRef: string;
 }
+
+export interface WorkerOutputInput {
+	readonly sessionId: string;
+	readonly repo: string;
+	readonly opRef: string;
+	/** Exact pre-send floor, optionally tightened by the broker's startedAt. No clock tolerance. */
+	readonly notBeforeMs: number;
+	/** Only actual receipt/status identities, never locally synthesized identifiers. */
+	readonly terminalIdentity?: { readonly commandId?: string; readonly turnId?: string };
+	readonly signal?: AbortSignal;
+	/** Generation/attempt fence, checked before and after transport I/O. */
+	readonly isCurrent?: () => boolean;
+}
+
+export type WorkerOutputResult =
+	| {
+			readonly status: "proven";
+			readonly text: string;
+			readonly observedAtMs: number;
+			readonly provenance: {
+				readonly source: "turn.result";
+				readonly fullness: "original";
+				readonly sessionId: string;
+				readonly repo: string;
+				readonly opRef: string;
+				readonly clientRef: string;
+				readonly commandId?: string;
+				readonly turnId?: string;
+				readonly terminalAt: number;
+				readonly contentVersion: 1;
+				readonly byteLength: number;
+			};
+	  }
+	| { readonly status: "absent"; readonly code: "output_pending" | "transport_error" }
+	| {
+			readonly status: "unavailable";
+			readonly code: "output_unavailable" | "invalid_evidence" | "identity_mismatch" | "incomplete_body" | "cancelled";
+	  };
 
 export interface SessionRequestInput extends SessionSendInput {
 	/** Stable caller identity carried into tail observability. */
@@ -490,20 +530,54 @@ export class BrokerSessionPort implements SessionPort {
 
 	async steer(input: SessionSteerInput): Promise<void> {
 		assertControlAllowed("turn.steer", { operatorApproval: true });
-		parseEnvelope(
-			await this.#cli([
-				"sdk",
-				"session",
-				"raw",
-				"control",
-				input.sessionId,
-				"--op",
-				"turn.steer",
-				"--json-input",
-				JSON.stringify({ text: input.text, clientRef: input.clientRef }),
-			]),
+		const raw = await this.#cli([
+			"sdk",
+			"session",
+			"raw",
+			"control",
+			input.sessionId,
+			"--op",
 			"turn.steer",
-		);
+			"--json-input",
+			JSON.stringify({ text: input.text, clientRef: input.clientRef }),
+		]);
+		let receipt: unknown;
+		try {
+			receipt = parseEnvelope<unknown>(raw, "turn.steer");
+		} catch (error) {
+			// Recognized outer control refusals are decisions; malformed output and
+			// transport/authority failures retain their uncertain error contract.
+			const code = sdkErrorCode(error);
+			if (
+				error instanceof GjcCliError &&
+				code &&
+				[
+					"busy",
+					"steer_refused",
+					"invalid_params",
+					"not_running",
+					"no_active_turn",
+					"client_ref_conflict",
+					"session_not_found",
+				].includes(code)
+			)
+				throw new GjcCliError("gjc sdk turn.steer refused acceptance", 0, "", { code, refused: true });
+			throw error;
+		}
+		const body = workerRecord(receipt);
+		// A successful control envelope can contain a durable rejected steer receipt.
+		// The SDK returns { accepted:false, status:"rejected", error } in that case.
+		if (body?.clientRef !== undefined && body.clientRef !== input.clientRef)
+			throw new GjcCliError("gjc sdk turn.steer identity mismatch", 0, "", { code: "receipt_identity_mismatch" });
+		if (body?.accepted === false || body?.status === "rejected" || body?.ok === false) {
+			const error = workerRecord(body.error);
+			throw new GjcCliError("gjc sdk turn.steer refused acceptance", 0, "", {
+				code: stableErrorCode(error?.code) ?? "steer_refused",
+				refused: true,
+			});
+		}
+		if (body?.accepted !== true || (body.status !== undefined && body.status !== "accepted"))
+			throw new GjcCliError("gjc sdk turn.steer acceptance unavailable", 0, "", { code: "receipt_identity_mismatch" });
 	}
 
 	async setModel(input: {
@@ -573,6 +647,56 @@ export class BrokerSessionPort implements SessionPort {
 
 	async status(input: { sessionId: string; repo: string; opRef: string }): Promise<StatusReport> {
 		return await fetchOpState(this.#controller(input.repo), input.sessionId, input.opRef);
+	}
+
+	async fetchWorkerOutput(input: WorkerOutputInput): Promise<WorkerOutputResult> {
+		if (workerOutputCancelled(input)) return { status: "unavailable", code: "cancelled" };
+		if (!Number.isFinite(input.notBeforeMs) || !input.opRef) return { status: "unavailable", code: "invalid_evidence" };
+		// Verified SDK Q26: turn.result carries invocation-owned content, not a
+		// transcript summary. It is capped at 16 KiB and explicitly disallows
+		// cursors. One bounded query replaces an unbounded transcript traversal;
+		// truncated results are NOT silently promoted to complete original text.
+		const read = async (): Promise<WorkerOutputResult> => {
+			if (workerOutputCancelled(input)) return { status: "unavailable", code: "cancelled" };
+			try {
+				const raw = await this.#cli(
+					[
+						"sdk",
+						"session",
+						"raw",
+						"query",
+						input.sessionId,
+						"--query",
+						"turn.result",
+						"--repo",
+						input.repo,
+						"--json-input",
+						JSON.stringify({ kind: "prompt", clientRef: input.opRef }),
+					],
+					{ timeoutMs: 15_000 },
+				);
+				return parseWorkerOutputResponse(input, raw, this.#now());
+			} catch {
+				return workerOutputCancelled(input)
+					? { status: "unavailable", code: "cancelled" }
+					: { status: "absent", code: "transport_error" };
+			}
+		};
+		// CliRunner has no AbortSignal transport contract. Cancel the consumer
+		// immediately; the read-only subprocess retains its finite timeout and
+		// its late result has no effects. Never invent an SDK cancellation flag.
+		if (!input.signal) return await read();
+		let onAbort!: () => void;
+		const cancelled = new Promise<WorkerOutputResult>((resolve) => {
+			onAbort = () => resolve({ status: "unavailable", code: "cancelled" });
+			input.signal!.addEventListener("abort", onAbort, { once: true });
+			if (input.signal!.aborted) onAbort();
+		});
+		try {
+			return await Promise.race([read(), cancelled]);
+		} finally {
+			input.signal.removeEventListener("abort", onAbort);
+		}
 	}
 
 	async queueEmpty(input: { sessionId: string; repo: string }): Promise<boolean> {
@@ -960,6 +1084,131 @@ export class BrokerSessionPort implements SessionPort {
 	}
 }
 
+/**
+ * Parse the installed SDK's canonical TurnResultPage/TurnResultContent DTOs.
+ * Kept at the transport boundary so raw fixtures exercise exactly production
+ * attribution/fullness checks. Neither a transcript row nor page.complete is
+ * invocation-owned final-body evidence.
+ */
+export function parseWorkerOutputResponse(
+	input: WorkerOutputInput,
+	response: CliResult,
+	observedAtMs: number,
+): WorkerOutputResult {
+	if (workerOutputCancelled(input)) return { status: "unavailable", code: "cancelled" };
+	if (!Number.isFinite(input.notBeforeMs) || !Number.isFinite(observedAtMs) || !input.opRef)
+		return { status: "unavailable", code: "invalid_evidence" };
+	let envelope: Record<string, unknown> | undefined;
+	try {
+		envelope = workerRecord(JSON.parse(response.stdout));
+	} catch {
+		return response.exitCode === 0
+			? { status: "unavailable", code: "invalid_evidence" }
+			: { status: "absent", code: "transport_error" };
+	}
+	if (envelope?.ok === false) {
+		const code = workerRecord(envelope.error)?.code;
+		if (
+			typeof code === "string" &&
+			[
+				"session_unavailable",
+				"resource_gone",
+				"unavailable",
+				"unsupported_operation",
+				"unknown_operation",
+				"unknown_query",
+				"unsupported_query",
+				"not_supported",
+				"operation_not_session_owned",
+			].includes(code)
+		)
+			return { status: "unavailable", code: "output_unavailable" };
+		return { status: "absent", code: "transport_error" };
+	}
+	if (response.exitCode !== 0) return { status: "absent", code: "transport_error" };
+	const result = workerRecord(envelope?.result);
+	if (envelope?.ok !== true || !result) return { status: "unavailable", code: "invalid_evidence" };
+	if (result.status === "unknown") return { status: "absent", code: "output_pending" };
+	if (result.kind !== "prompt" || result.clientRef !== input.opRef)
+		return { status: "unavailable", code: "identity_mismatch" };
+	for (const key of ["commandId", "turnId"] as const) {
+		const expected = input.terminalIdentity?.[key];
+		if (
+			(expected !== undefined && result[key] !== expected) ||
+			(result[key] !== undefined && (typeof result[key] !== "string" || result[key] === ""))
+		)
+			return { status: "unavailable", code: "identity_mismatch" };
+	}
+	if (result.status === "accepted" || result.status === "in_flight")
+		return { status: "absent", code: "output_pending" };
+	if (
+		result.status !== "terminal_ok" ||
+		typeof result.terminalAt !== "number" ||
+		!Number.isFinite(result.terminalAt) ||
+		result.terminalAt < input.notBeforeMs
+	)
+		return { status: "unavailable", code: "invalid_evidence" };
+	if (
+		result.startedAt !== undefined &&
+		(typeof result.startedAt !== "number" ||
+			!Number.isFinite(result.startedAt) ||
+			result.startedAt < input.notBeforeMs ||
+			result.startedAt > result.terminalAt)
+	)
+		return { status: "unavailable", code: "invalid_evidence" };
+	const content = workerRecord(result.content);
+	if (!content) {
+		if (result.content !== undefined || result.textSummary !== undefined)
+			return { status: "unavailable", code: "invalid_evidence" };
+		return result.receiptState === "missing" || result.receiptState === "absent"
+			? { status: "unavailable", code: "output_unavailable" }
+			: { status: "absent", code: "output_pending" };
+	}
+	if (content.truncated === true) return { status: "unavailable", code: "incomplete_body" };
+	if (
+		content.version !== 1 ||
+		content.type !== "text" ||
+		typeof content.text !== "string" ||
+		content.truncated !== false ||
+		content.byteLength !== new TextEncoder().encode(content.text).length ||
+		(result.receiptState !== undefined && result.receiptState !== "present")
+	)
+		return { status: "unavailable", code: "invalid_evidence" };
+	return {
+		status: "proven",
+		text: content.text,
+		observedAtMs,
+		provenance: {
+			source: "turn.result",
+			fullness: "original",
+			sessionId: input.sessionId,
+			repo: input.repo,
+			opRef: input.opRef,
+			clientRef: result.clientRef,
+			...(typeof result.commandId === "string" ? { commandId: result.commandId } : {}),
+			...(typeof result.turnId === "string" ? { turnId: result.turnId } : {}),
+			terminalAt: result.terminalAt,
+			contentVersion: 1,
+			byteLength: content.byteLength as number,
+		},
+	};
+}
+
+function workerRecord(value: unknown): Record<string, unknown> | undefined {
+	return typeof value === "object" && value !== null && !Array.isArray(value)
+		? (value as Record<string, unknown>)
+		: undefined;
+}
+
+function workerOutputCancelled(input: WorkerOutputInput): boolean {
+	try {
+		return input.signal?.aborted === true || input.isCurrent?.() === false;
+	} catch {
+		// An unreadable fence is not authority to publish a late answer.
+		return true;
+	}
+}
+
 function renderPrompt(systemPreamble: string | undefined, text: string): string {
 	if (!systemPreamble) return text;
 	// SDK `session send` has no unproven system-prompt flag. Keep the trusted
@@ -1071,20 +1320,6 @@ function sanitizeSdkFailure(error: unknown): Error {
 		);
 	}
 	return new Error(sanitizeDiagnostic(error instanceof Error ? error.message : String(error)) || "sdk_error");
-}
-
-function sanitizeStatusReport(report: StatusReport): StatusReport {
-	const failure = report.status.error;
-	if (!failure) return report;
-	const code = stableErrorCode(failure.code);
-	const message = typeof failure.message === "string" ? sanitizeDiagnostic(failure.message) : undefined;
-	return {
-		...report,
-		status: {
-			...report.status,
-			error: { ...(code ? { code } : {}), ...(message ? { message } : {}) },
-		},
-	};
 }
 
 /**

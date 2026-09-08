@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<testsuites name="bun test" tests="2" assertions="5" failures="0" skipped="0" time="120.837138">
+  <testsuite name="packages/gateway/bench/retrieval-golden.bench.test.ts" file="packages/gateway/bench/retrieval-golden.bench.test.ts" tests="1" assertions="2" failures="0" skipped="0" time="0.032302" hostname="MacBook-Pro-3.local">
+    <testcase name="frozen golden retrieval corpus has Hit@3 of 100%" classname="" time="0.028815" file="packages/gateway/bench/retrieval-golden.bench.test.ts" line="13" assertions="2" />
+  </testsuite>
+  <testsuite name="packages/gateway/test/stress/burst-stress.test.ts" file="packages/gateway/test/stress/burst-stress.test.ts" tests="1" assertions="3" failures="0" skipped="0" time="120.801651" hostname="MacBook-Pro-3.local">
+    <testcase name="processes 200 monitor events and receipts each memory closure within the contractual burst bounds" classname="" time="120.796932" file="packages/gateway/test/stress/burst-stress.test.ts" line="18" assertions="3" />
+  </testsuite>
+</testsuites>

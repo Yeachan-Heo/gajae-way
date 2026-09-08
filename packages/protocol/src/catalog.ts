@@ -385,6 +385,70 @@ export interface WorkRunParams {
 	readonly model?: string | { readonly preset: string };
 }
 
+/** Only asynchronous starts snapshot a completion notification target. */
+export interface WorkStartParams extends WorkRunParams {
+	readonly notify?: OriginRef;
+}
+
+export type WorkStartResult =
+	| {
+			readonly started: true;
+			readonly jobId: string;
+			readonly opRef: string;
+			readonly sessionKey: string;
+			readonly sessionId: string;
+	  }
+	| {
+			readonly started: false;
+			readonly held: true;
+			readonly jobId: string;
+			readonly state: string;
+			readonly reason: string;
+	  };
+
+/** Public structural projection; protocol must not depend on subsession. */
+export interface PromptStatusBody {
+	readonly status: "accepted" | "in_flight" | "terminal_ok" | "failed" | "unknown";
+	readonly commandId?: string;
+	readonly turnId?: string;
+	readonly clientRef?: string;
+	readonly acceptedAt?: number;
+	readonly startedAt?: number;
+	readonly terminalAt?: number;
+	readonly receiptState?: "absent" | "present" | "missing" | "unknown";
+	readonly outcome?: { readonly kind?: string; readonly reason?: string; readonly provenance?: string };
+	/** Gateway-filtered safe failure codes/messages, never raw SDK exceptions. */
+	readonly error?: { readonly code?: string; readonly message?: string };
+}
+
+export interface WorkStatusParams {
+	readonly name: string;
+}
+
+/** Read-only durable snapshot plus a matching-binding live operation query. */
+export interface WorkStatusResult {
+	readonly jobId: string;
+	readonly state: string;
+	readonly sessionId: string;
+	readonly lastActivityAt: string | null;
+	readonly attempt: {
+		readonly opRef: string;
+		readonly startedAt: string;
+		readonly endedAt?: string;
+		readonly endState?: string;
+	} | null;
+	readonly op: PromptStatusBody | null;
+}
+
+export interface WorkSteerParams {
+	readonly name: string;
+	readonly text: string;
+}
+
+export type WorkSteerResult =
+	| { readonly steered: true; readonly clientRef: string }
+	| { readonly steered: false; readonly reason: string };
+
 export interface WorkRetireParams {
 	readonly name: string;
 }
@@ -625,6 +689,9 @@ export interface VerbCatalogV01 {
 	};
 	"ops.integrity": { params: undefined; result: { readonly ok: boolean; readonly detail: string } };
 	"work.run": { params: WorkRunParams; result: WorkRunResult };
+	"work.start": { params: WorkStartParams; result: WorkStartResult };
+	"work.status": { params: WorkStatusParams; result: WorkStatusResult };
+	"work.steer": { params: WorkSteerParams; result: WorkSteerResult };
 	"work.jobs": { result: WorkJobsResult };
 	"work.retire": { params: WorkRetireParams; result: WorkRetireResult };
 	"chat.react": { params: ChatReactParams; result: ChatReactResult };
@@ -660,6 +727,9 @@ export const VERBS_V01 = [
 	"ops.backup",
 	"ops.integrity",
 	"work.run",
+	"work.start",
+	"work.status",
+	"work.steer",
 	"work.jobs",
 	"work.retire",
 	"chat.react",
@@ -688,6 +758,11 @@ export const SILENCE_TOKENS = ["[SILENT]", "SILENT", "NO_REPLY", "NO REPLY"] as 
 export function isSilenceToken(text: string): boolean {
 	const normalized = unbracket(text.trim()).toUpperCase();
 	return (SILENCE_TOKENS as readonly string[]).some((t) => unbracket(t).toUpperCase() === normalized);
+}
+
+/** Existing embedded marker grammar; inspect original content before clipping. */
+export function containsSilenceToken(text: string): boolean {
+	return /\[(SILENT|silent)\]/.test(text);
 }
 
 function unbracket(text: string): string {

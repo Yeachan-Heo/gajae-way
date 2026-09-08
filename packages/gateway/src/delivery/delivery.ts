@@ -7,6 +7,27 @@ import {
 } from "@gajaeway/protocol";
 import type { DeliveryLedger, LedgerOutcome } from "../store/ledger";
 
+/** Pure construction shared by ordinary dispatch and atomic work settlement. */
+export function buildDeliveryPayload(
+	turnId: string,
+	origin: OriginRef,
+	text: string,
+	deliveryId: string,
+	replyToMessageId?: string,
+): ChatMessagePayload | undefined {
+	if (isSilenceToken(text)) return undefined;
+	originKey(origin);
+	return {
+		turnId,
+		origin,
+		role: "assistant",
+		text,
+		final: true,
+		deliveryId,
+		...(replyToMessageId ? { replyToMessageId } : {}),
+	};
+}
+
 export class DeliveryService {
 	readonly #ledger: DeliveryLedger;
 	constructor(ledger: DeliveryLedger) {
@@ -19,16 +40,8 @@ export class DeliveryService {
 		replyToMessageId?: string,
 		deliveryId: string = crypto.randomUUID(),
 	): ChatMessagePayload | undefined {
-		if (isSilenceToken(text)) return undefined;
-		const payload: ChatMessagePayload = {
-			turnId,
-			origin,
-			role: "assistant",
-			text,
-			final: true,
-			deliveryId,
-			...(replyToMessageId ? { replyToMessageId } : {}),
-		};
+		const payload = buildDeliveryPayload(turnId, origin, text, deliveryId, replyToMessageId);
+		if (!payload) return undefined;
 		if (
 			!this.#ledger.createPending({
 				deliveryId,
@@ -39,6 +52,17 @@ export class DeliveryService {
 		)
 			return undefined;
 		return payload;
+	}
+	/** Caller owns the transaction; never opens a nested createPending transaction. */
+	persistInTransaction(payload: ChatMessagePayload): boolean {
+		if (isSilenceToken(payload.text)) throw new Error("silent payload cannot be persisted");
+		if (!payload.deliveryId) throw new Error("delivery id is required");
+		return this.#ledger.createPendingInTransaction({
+			deliveryId: payload.deliveryId,
+			turnId: payload.turnId,
+			originKey: originKey(payload.origin),
+			payloadJson: JSON.stringify(payload),
+		});
 	}
 	/** A ledger row by id; used to recognise a terminal reply that already shipped under its interim id. */
 	get(deliveryId: string) {

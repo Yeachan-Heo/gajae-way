@@ -16,7 +16,7 @@ test("migrates a migration-001 database to the latest schema", async () => {
 		legacy.close();
 
 		const database = await GatewayDatabase.open(path);
-		expect(database.schemaVersion).toBe(20);
+		expect(database.schemaVersion).toBe(21);
 		database.close();
 
 		const migrated = new Database(path, { readonly: true });
@@ -57,6 +57,7 @@ test("upgrades a deployed lane-jobs schema 10 database to combined schema 12 wit
 		// lane_jobs, while monitor_events still uses the legacy stage contract.
 		const v10 = new Database(path);
 		v10.exec(`
+DROP TABLE work_attempt_runtime;
 DROP TABLE dispatch_leases;
 DROP TABLE monitor_failures;
 DROP TABLE monitor_slots;
@@ -69,7 +70,7 @@ DELETE FROM schema_migrations WHERE version > 10;
 		v10.close();
 
 		const upgraded = await GatewayDatabase.open(path);
-		expect(upgraded.schemaVersion).toBe(20);
+		expect(upgraded.schemaVersion).toBe(21);
 		expect(upgraded.laneJobJson("lanejob-test")).toBe('{"schemaVersion":1}');
 		const tables = new Set(
 			new Database(path, { readonly: true })
@@ -109,12 +110,13 @@ INSERT INTO monitors (monitor_id, name, trigger_json, event_types_json, burst_po
 INSERT INTO monitor_events (event_id, monitor_id, event_type, payload_json, fired_at, stage, batch_id, dispatch_attempts, updated_at) VALUES ('event-v12', 'monitor-v12', 'v12.event', '{}', '2026-08-28T00:00:00.000Z', 'admitted', NULL, 0, '2026-08-28T00:00:00.000Z');
 INSERT INTO monitor_slots (monitor_id, slot_at, created_at, event_id) VALUES ('monitor-v12', '2026-08-28T00:00:00.000Z', '2026-08-28T00:00:00.000Z', 'event-v12');
 DROP TABLE conversation_context_state;
-DELETE FROM schema_migrations WHERE version = 13;
+DROP TABLE work_attempt_runtime;
+DELETE FROM schema_migrations WHERE version > 12;
 `);
 		v12.close();
 
 		const upgraded = await GatewayDatabase.open(path);
-		expect(upgraded.schemaVersion).toBe(20);
+		expect(upgraded.schemaVersion).toBe(21);
 		expect(upgraded.laneJobJson("lanejob-v12")).toBe('{"schemaVersion":1}');
 		expect(upgraded.metaGet("rebind_budget:discord/channel/c1")).toBe('{"used":2,"lifetime":7}');
 		expect(upgraded.monitorSlotExists("monitor-v12", "2026-08-28T00:00:00.000Z")).toBe(true);
@@ -150,6 +152,7 @@ test("upgrades a schema 14 monitors table to 15 without losing existing monitors
 		// one live monitor row.
 		const v14 = new Database(path);
 		v14.exec(`
+DROP TABLE work_attempt_runtime;
 DROP TABLE monitors;
 CREATE TABLE monitors (monitor_id TEXT PRIMARY KEY, name TEXT NOT NULL, trigger_json TEXT NOT NULL, event_types_json TEXT NOT NULL, burst_policy TEXT NOT NULL, channel_target_json TEXT, enabled INTEGER NOT NULL DEFAULT 1, created_at TEXT NOT NULL);
 INSERT INTO monitors (monitor_id, name, trigger_json, event_types_json, burst_policy, channel_target_json, enabled, created_at) VALUES ('monitor-v14', 'v14', '{"kind":"cron","schedule":"0 * * * *"}', '["v14.event"]', 'coalesce', NULL, 1, '2026-08-28T00:00:00.000Z');
@@ -158,7 +161,7 @@ DELETE FROM schema_migrations WHERE version > 14;
 		v14.close();
 
 		const upgraded = await GatewayDatabase.open(path);
-		expect(upgraded.schemaVersion).toBe(20);
+		expect(upgraded.schemaVersion).toBe(21);
 		const rows = upgraded.monitorRows();
 		expect(rows).toHaveLength(1);
 		// The pre-existing monitor survives and reads back with no instruction.
@@ -203,13 +206,14 @@ test("upgrades a schema 15 database to 16 and keeps a per-conversation model ove
 	// Recreate a deployed schema-15 database: no conversation_model table.
 	const v15 = new Database(path);
 	v15.exec(`
+DROP TABLE work_attempt_runtime;
 DROP TABLE IF EXISTS conversation_model;
 DELETE FROM schema_migrations WHERE version > 15;
 `);
 	v15.close();
 
 	const upgraded = await GatewayDatabase.open(path);
-	expect(upgraded.schemaVersion).toBe(20);
+	expect(upgraded.schemaVersion).toBe(21);
 	upgraded.conversationModelSet("discord:c1", { preset: "gpt-heavy" }, "owner");
 	expect(upgraded.conversationModelGet("discord:c1")?.selection).toEqual({ preset: "gpt-heavy" });
 	upgraded.close();
@@ -220,12 +224,13 @@ test("migration 19 rebuilds a genuine schema-18 batch table as turns: bound/acce
 	const path = join(directory, "gateway.db");
 	try {
 		const latest = await GatewayDatabase.open(path);
-		expect(latest.schemaVersion).toBe(20);
+		expect(latest.schemaVersion).toBe(21);
 		latest.close();
 		// Rebuild a deployed schema-18 database from its real DDL (v16 base + the
 		// v17 ALTERs + the v18 ALTERs), then seed the shapes an upgrade meets.
 		const raw = new Database(path);
 		raw.exec(`
+DROP TABLE work_attempt_runtime;
 DROP TABLE inbound_messages;
 CREATE TABLE inbound_messages (message_id TEXT PRIMARY KEY, origin_key TEXT NOT NULL, origin_ref_json TEXT NOT NULL, body TEXT NOT NULL, engagement_json TEXT, state TEXT NOT NULL CHECK(state IN ('pending','processing','done')), received_at TEXT NOT NULL);
 CREATE INDEX inbound_messages_claim ON inbound_messages (origin_key, state, received_at);
@@ -257,7 +262,7 @@ INSERT INTO inbound_messages (message_id, origin_key, origin_ref_json, body, eng
 		raw.close();
 
 		const upgraded = await GatewayDatabase.open(path);
-		expect(upgraded.schemaVersion).toBe(20);
+		expect(upgraded.schemaVersion).toBe(21);
 		const after = new Database(path, { readonly: true });
 		const columns = after
 			.query<{ name: string }, []>("PRAGMA table_info(inbound_messages)")

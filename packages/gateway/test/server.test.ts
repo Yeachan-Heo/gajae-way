@@ -50,6 +50,17 @@ async function waitFor(frames: any[], count: number): Promise<void> {
 	expect(frames.length).toBeGreaterThanOrEqual(count);
 }
 
+function bindWorkFixture(database: GatewayDatabase, key: string, preferred?: string): string {
+	const sessionId = database.getSessionRecord(key)?.sessionId || preferred || crypto.randomUUID();
+	database.putSession(key, sessionId);
+	return sessionId;
+}
+
+async function waitFrame(frames: any[], id: string): Promise<void> {
+	for (let attempt = 0; attempt < 600 && !frames.some((frame) => frame.id === id); attempt++) await Bun.sleep(5);
+	expect(frames.some((frame) => frame.id === id)).toBe(true);
+}
+
 test("requires negotiation then serves status, shutdown, and validates chat params", async () => {
 	directory = await mkdtemp(join(tmpdir(), "gajaeway-server-"));
 	const config: GatewayConfig = {
@@ -80,7 +91,7 @@ test("requires negotiation then serves status, shutdown, and validates chat para
 	expect(client.frames[1].type).toBe("negotiated");
 	client.send({ v: "0.1", type: "request", id: "status", verb: "gateway.status" });
 	await waitFor(client.frames, 3);
-	expect(client.frames[2].result.schemaVersion).toBe(20);
+	expect(client.frames[2].result.schemaVersion).toBe(21);
 	expect(client.frames[2].result.startedAt).toBe("2026-01-01T00:00:00.000Z");
 	expect(client.frames[2].result.contextDiff).toEqual({
 		unread: 0,
@@ -822,6 +833,7 @@ test("work.run runs a named worker session in the requested cwd and returns the 
 	};
 	const database = await GatewayDatabase.open(config.dbPath);
 	const sessionPort = new ScriptedSessionPort({
+		onBind: (input) => bindWorkFixture(database, input.originKey),
 		onSend: (input, scripted) => scripted.complete(input.opRef, "worker result"),
 	});
 	server = await startUnixServer({ config, database, sessionPort, onStop: () => database.close() });
@@ -865,7 +877,7 @@ test("work.run records a durable lane job and work.jobs projects it (issue #10)"
 	};
 	const database = await GatewayDatabase.open(config.dbPath);
 	const sessionPort = sessionPortFromResponder({
-		bind: async () => ({ sessionId: "0f1e2d3c-4b5a-4678-8796-a5b4c3d2e1f0" }),
+		bind: async (key) => ({ sessionId: bindWorkFixture(database, key, "0f1e2d3c-4b5a-4678-8796-a5b4c3d2e1f0") }),
 		respond: async () => "worker result",
 	});
 	server = await startUnixServer({ config, database, sessionPort, onStop: () => database.close() });
@@ -907,8 +919,8 @@ test("work.run records a durable lane job and work.jobs projects it (issue #10)"
 	expect(parsed.attempts[0].sessionId).toBe("0f1e2d3c-4b5a-4678-8796-a5b4c3d2e1f0");
 	expect(parsed.lane.worktreePath).toBe(process.cwd());
 
-	// A crashed predecessor's open attempt holds the job: the next work.run
-	// records the uncertainty and REFUSES to continue without an operator ack.
+	// Reopening a settled tombstone by editing history is corruption, not a
+	// crash predecessor. Neither an ordinary request nor resume may repair it.
 	database.putLaneJob({
 		jobId: parsed.jobId,
 		laneKey: "work-Repo.Fix-2",
@@ -916,45 +928,26 @@ test("work.run records a durable lane job and work.jobs projects it (issue #10)"
 		createdAt: parsed.createdAt,
 		updatedAt: new Date().toISOString(),
 		lane: parsed.lane,
-		json: JSON.stringify({
-			...parsed,
-			attempts: [{ ...parsed.attempts[0], endState: undefined, endedAt: undefined }],
-		}),
+		json: JSON.stringify({ ...parsed, attempts: [{ ...parsed.attempts[0], endState: undefined, endedAt: undefined }] }),
 	});
-	const manipulated = JSON.parse(database.laneJobJson(jobId) as string);
-	client.send({ v: "0.1", type: "request", id: "w2", verb: "work.run", params: { name: "Repo.Fix-2", text: "again" } });
-	async function waitId(id: string): Promise<void> {
-		for (let attempt = 0; attempt < 400 && !client.frames.some((f) => f.id === id); attempt++) await Bun.sleep(5);
+	const damaged = database.laneJobJson(jobId);
+	for (const resume of [false, true]) {
+		const id = `corrupt-${resume}`;
+		client.send({
+			v: "0.1",
+			type: "request",
+			id,
+			verb: "work.run",
+			params: { name: "Repo.Fix-2", text: "again", resume },
+		});
+		await waitFrame(client.frames, id);
+		expect(client.frames.find((frame) => frame.id === id)).toMatchObject({
+			type: "error",
+			error: { code: "verb_failed", detail: { reasonCode: "lane_state_corrupt", name: "Repo.Fix-2" } },
+		});
 	}
-	await waitId("w2");
-	const held = client.frames.find((frame) => frame.id === "w2" && frame.type !== undefined);
-	expect(held.type).toBe("response");
-	expect(held.result).toMatchObject({ held: true, state: "awaiting_operator" });
-	expect(held.result.reason).toMatch(/terminally uncertain/);
-
-	// resume: true is the explicit operator acknowledgement.
-	client.send({
-		v: "0.1",
-		type: "request",
-		id: "w3",
-		verb: "work.run",
-		params: { name: "Repo.Fix-2", text: "again", resume: true },
-	});
-	await waitId("w3");
-	const resumed = client.frames.find((frame) => frame.type === "response" && frame.id === "w3");
-	expect(resumed.result).toMatchObject({ held: false, text: "worker result" });
-	const revived = parseLaneJobRecord(database.laneJobJson(jobId) as string);
-	// Uncertain predecessor closed + resumed attempt: the crash case writes
-	// exactly one hold, one continuation.
-	expect(revived.attempts).toHaveLength(2);
-	expect(revived.attempts[0].endState).toBe("terminal_uncertain");
-	expect(revived.escalations.some((entry) => entry.includes("terminal_uncertain"))).toBe(true);
-	// Only the LAST attempt is open, and it closed completed.
-	expect(revived.attempts.at(-1)?.endState).toBe("completed");
-	client.send({ v: "0.1", type: "request", id: "jobs2", verb: "work.jobs" });
-	await waitId("jobs2");
-	const jobs2 = client.frames.find((frame) => frame.type === "response" && frame.id === "jobs2");
-	expect(jobs2.result.jobs[0].state).toBe("attempt_ended");
+	expect(database.laneJobJson(jobId)).toBe(damaged);
+	expect(sessionPort.sends).toHaveLength(1);
 	client.close();
 });
 
@@ -973,7 +966,7 @@ test("a stalled durable job holds the next work.run until resume (production pat
 	const database = await GatewayDatabase.open(config.dbPath);
 	let turns = 0;
 	const sessionPort = sessionPortFromResponder({
-		bind: async () => ({ sessionId: "0f1e2d3c-4b5a-4678-8796-a5b4c3d2e1f0" }),
+		bind: async (key) => ({ sessionId: bindWorkFixture(database, key, "0f1e2d3c-4b5a-4678-8796-a5b4c3d2e1f0") }),
 		respond: async () => {
 			turns += 1;
 			return "worker result";
@@ -1039,7 +1032,7 @@ test("resuming a stalled job clears the hold durably: the next ordinary call is 
 	const database = await GatewayDatabase.open(config.dbPath);
 	let turns = 0;
 	const sessionPort = sessionPortFromResponder({
-		bind: async () => ({ sessionId: "0f1e2d3c-4b5a-4678-8796-a5b4c3d2e1f0" }),
+		bind: async (key) => ({ sessionId: bindWorkFixture(database, key, "0f1e2d3c-4b5a-4678-8796-a5b4c3d2e1f0") }),
 		respond: async () => {
 			turns += 1;
 			return "worker result";
@@ -1119,6 +1112,7 @@ test("work.run forwards a model preset to bind and send and rejects invalid mode
 	};
 	const database = await GatewayDatabase.open(config.dbPath);
 	const sessionPort = new ScriptedSessionPort({
+		onBind: (input) => bindWorkFixture(database, input.originKey),
 		onSend: (input, scripted) => scripted.complete(input.opRef, "model result"),
 	});
 	server = await startUnixServer({ config, database, sessionPort, onStop: () => database.close() });
@@ -1433,3 +1427,263 @@ test("control tokens never leak: a silence token inside a preamble silences, and
 	expect(messages.map((m: any) => m.text)).toEqual(["This is a real bug report. 알겠고 인정"]);
 	expect(messages[0].replyToMessageId).toBe("1544704223634260038");
 });
+async function workSocketFixture() {
+	directory = await mkdtemp(join(tmpdir(), "gajaeway-async-socket-"));
+	const config: GatewayConfig = {
+		schemaVersion: 1,
+		home: directory,
+		configPath: join(directory, "config.json"),
+		socketPath: join(directory, "gateway.sock"),
+		dbPath: join(directory, "gateway.db"),
+		logVerbosity: "info",
+		work: { maxLanes: 2 },
+	};
+	const database = await GatewayDatabase.open(config.dbPath);
+	const port = new ScriptedSessionPort({ onBind: (input) => bindWorkFixture(database, input.originKey) });
+	let openAtShutdown = -1;
+	server = await startUnixServer({
+		config,
+		database,
+		sessionPort: port,
+		onStop: () => {
+			openAtShutdown = database.workAttemptOpen().length;
+			database.close();
+		},
+	});
+	const client = await connect(config.socketPath);
+	client.send({ v: "0.1", type: "hello", payload: { supportedVersions: ["0.1"] } });
+	await waitFor(client.frames, 1);
+	return {
+		config,
+		database,
+		port,
+		client,
+		get openAtShutdown() {
+			return openAtShutdown;
+		},
+	};
+}
+
+test("socket work.start accepts before terminal, status/steer stay available, one completion notice", async () => {
+	const f = await workSocketFixture();
+	const target = { platform: "discord", kind: "channel", conversationId: "results" };
+	f.client.send({
+		v: "0.1",
+		type: "request",
+		id: "start",
+		verb: "work.start",
+		params: { name: "a", text: "work", cwd: directory, notify: target },
+	});
+	await waitFrame(f.client.frames, "start");
+	const receipt = f.client.frames.find((frame) => frame.id === "start").result;
+	expect(receipt.started).toBe(true);
+	expect(f.database.workAttemptGet(receipt.opRef)?.settledAt).toBeNull();
+	f.client.send({ v: "0.1", type: "request", id: "status", verb: "work.status", params: { name: "a" } });
+	f.client.send({
+		v: "0.1",
+		type: "request",
+		id: "steer",
+		verb: "work.steer",
+		params: { name: "a", text: "correction" },
+	});
+	f.client.send({
+		v: "0.1",
+		type: "request",
+		id: "overlap",
+		verb: "work.start",
+		params: { name: "a", text: "again", cwd: directory, resume: true },
+	});
+	await waitFrame(f.client.frames, "status");
+	await waitFrame(f.client.frames, "steer");
+	await waitFrame(f.client.frames, "overlap");
+	expect(f.client.frames.find((frame) => frame.id === "status").result.op.status).toBe("in_flight");
+	expect(f.client.frames.find((frame) => frame.id === "steer").result.clientRef).toBe(f.port.steers[0]?.clientRef);
+	expect(f.client.frames.find((frame) => frame.id === "overlap").error.detail.reasonCode).toBe("attempt_open");
+	f.port.complete(receipt.opRef, "socket result");
+	for (let i = 0; i < 600 && !f.client.frames.some((frame) => frame.event === "chat.message"); i++) await Bun.sleep(5);
+	const notices = f.client.frames.filter((frame) => frame.event === "chat.message");
+	expect(notices).toHaveLength(1);
+	expect(notices[0].payload).toMatchObject({
+		turnId: receipt.opRef,
+		origin: target,
+		text: "[lane a] completed: socket result",
+	});
+	expect(f.port.sends).toHaveLength(1);
+	f.client.close();
+});
+
+test("one socket disconnect leaves its work observable while another run waits independently", async () => {
+	const f = await workSocketFixture();
+	const second = await connect(f.config.socketPath);
+	second.send({ v: "0.1", type: "hello", payload: { supportedVersions: ["0.1"] } });
+	await waitFor(second.frames, 1);
+	f.client.send({
+		v: "0.1",
+		type: "request",
+		id: "run-a",
+		verb: "work.run",
+		params: { name: "a", text: "work", cwd: directory },
+	});
+	second.send({
+		v: "0.1",
+		type: "request",
+		id: "run-b",
+		verb: "work.run",
+		params: { name: "b", text: "work", cwd: directory },
+	});
+	for (let i = 0; i < 600 && f.port.sends.length < 2; i++) await Bun.sleep(5);
+	expect(f.port.sends).toHaveLength(2);
+	f.client.close();
+	second.send({ v: "0.1", type: "request", id: "observe-a", verb: "work.status", params: { name: "a" } });
+	await waitFrame(second.frames, "observe-a");
+	expect(second.frames.find((frame) => frame.id === "observe-a").result.attempt.endedAt).toBeUndefined();
+	expect(second.frames.some((frame) => frame.id === "run-b")).toBe(false);
+	for (const send of f.port.sends) f.port.complete(send.opRef, "continued");
+	await waitFrame(second.frames, "run-b");
+	expect(second.frames.find((frame) => frame.id === "run-b").result.text).toBe("continued");
+	for (let i = 0; i < 600 && f.database.workAttemptOpen().length; i++) await Bun.sleep(5);
+	expect(f.database.workAttemptOpen()).toHaveLength(0);
+	expect(second.frames.filter((frame) => frame.event === "chat.message")).toHaveLength(0);
+	second.close();
+});
+
+test("Unix stop detaches a long run before request drain and leaves the attempt durable", async () => {
+	const f = await workSocketFixture();
+	f.client.send({
+		v: "0.1",
+		type: "request",
+		id: "run",
+		verb: "work.run",
+		params: { name: "a", text: "long work", cwd: directory },
+	});
+	for (let i = 0; i < 600 && f.port.sends.length === 0; i++) await Bun.sleep(5);
+	expect(f.port.sends).toHaveLength(1);
+	let stopped = false;
+	const stop = server!.stop().then(() => {
+		stopped = true;
+	});
+	for (let i = 0; i < 600 && !stopped; i++) await Bun.sleep(5);
+	expect(stopped).toBe(true);
+	await stop;
+	expect(f.openAtShutdown).toBe(1);
+	expect(f.client.frames.find((frame) => frame.id === "run")).toMatchObject({
+		type: "error",
+		error: { code: "gateway_shutting_down" },
+	});
+	f.client.close();
+});
+
+test("stdio stop detaches work.run before runtime request drain in an actual child process", async () => {
+	directory = await mkdtemp(join(tmpdir(), "gajaeway-work-stdio-"));
+	const code = `
+		import { join } from "node:path";
+		import { startStdioServer } from "./packages/gateway/src/server/server.ts";
+		import { GatewayDatabase } from "./packages/gateway/src/store/db.ts";
+		import { ScriptedSessionPort } from "./packages/gateway/test/session-port.fake.ts";
+		const home = process.env.WORK_TEST_HOME;
+		const config = { schemaVersion: 1, home, configPath: join(home, "config.json"), socketPath: join(home, "gateway.sock"), dbPath: join(home, "gateway.db"), logVerbosity: "info" };
+		const database = await GatewayDatabase.open(config.dbPath);
+		const port = new ScriptedSessionPort({ onBind: (input) => { const id = crypto.randomUUID(); database.putSession(input.originKey, id); return id; } });
+		startStdioServer({ config, database, sessionPort: port, onStop: () => { database.close(); process.exit(0); } });
+	`;
+	const child = Bun.spawn([process.execPath, "-e", code], {
+		cwd: process.cwd(),
+		env: { ...process.env, WORK_TEST_HOME: directory },
+		stdin: "pipe",
+		stdout: "pipe",
+		stderr: "pipe",
+	});
+	const frames: any[] = [];
+	let buffer = "";
+	const reading = (async () => {
+		for await (const chunk of child.stdout) {
+			buffer += Buffer.from(chunk).toString();
+			let newline = buffer.indexOf("\n");
+			while (newline >= 0) {
+				const line = buffer.slice(0, newline);
+				buffer = buffer.slice(newline + 1);
+				if (line) frames.push(JSON.parse(line));
+				newline = buffer.indexOf("\n");
+			}
+		}
+	})();
+	const stderr = new Response(child.stderr).text();
+	const send = (frame: unknown) => {
+		child.stdin.write(`${JSON.stringify(frame)}\n`);
+		child.stdin.flush();
+	};
+	try {
+		send({ v: "0.1", type: "hello", payload: { supportedVersions: ["0.1"] } });
+		await waitFor(frames, 1);
+		send({
+			v: "0.1",
+			type: "request",
+			id: "run",
+			verb: "work.run",
+			params: { name: "a", text: "long work", cwd: directory },
+		});
+		let observable = false;
+		for (let i = 0; i < 100 && !observable; i++) {
+			const id = `status-${i}`;
+			send({ v: "0.1", type: "request", id, verb: "work.status", params: { name: "a" } });
+			await waitFrame(frames, id);
+			observable = frames.find((frame) => frame.id === id)?.result?.op?.status === "in_flight";
+			if (!observable) await Bun.sleep(5);
+		}
+		expect(observable).toBe(true);
+		send({ v: "0.1", type: "request", id: "shutdown", verb: "gateway.shutdown" });
+		let exitCode: number | undefined;
+		void child.exited.then((code) => {
+			exitCode = code;
+		});
+		for (let i = 0; i < 600 && exitCode === undefined; i++) await Bun.sleep(5);
+		expect(exitCode).toBe(0);
+		await reading;
+		await stderr;
+		expect(frames.find((frame) => frame.id === "run")).toMatchObject({
+			type: "error",
+			error: { code: "gateway_shutting_down" },
+		});
+		const reopened = await GatewayDatabase.open(join(directory, "gateway.db"));
+		try {
+			expect(reopened.workAttemptOpen()).toHaveLength(1);
+			expect(
+				parseLaneJobRecord(reopened.laneJobJson(reopened.workAttemptOpen()[0]!.jobId)!).attempts[0]?.endedAt,
+			).toBeUndefined();
+		} finally {
+			reopened.close();
+		}
+	} finally {
+		child.kill();
+		await child.exited;
+		await reading;
+		await stderr;
+	}
+});
+for (const verb of ["work.start", "work.run"] as const) {
+	test(`session.list preserves fresh ${verb} worker identity before and after settlement`, async () => {
+		const f = await workSocketFixture();
+		const name = "identity-worker";
+		f.client.send({ v: "0.1", type: "request", id: "worker", verb, params: { name, text: "work", cwd: directory } });
+		for (let i = 0; i < 600 && f.port.sends.length === 0; i++) await Bun.sleep(5);
+		expect(f.port.sends).toHaveLength(1);
+		const opRef = f.port.sends[0]!.opRef;
+		const expectedOrigin = { platform: "work", kind: "task", conversationId: name };
+		for (const phase of ["open", "settled"] as const) {
+			if (phase === "settled") {
+				f.port.complete(opRef, "identity retained");
+				for (let i = 0; i < 600 && f.database.workAttemptGet(opRef)?.settledAt === null; i++) await Bun.sleep(5);
+				expect(f.database.workAttemptGet(opRef)?.settledAt).not.toBeNull();
+				await waitFrame(f.client.frames, "worker");
+			} else expect(f.database.workAttemptGet(opRef)?.settledAt).toBeNull();
+			const id = `sessions-${phase}`;
+			f.client.send({ v: "0.1", type: "request", id, verb: "session.list" });
+			await waitFrame(f.client.frames, id);
+			const sessions = f.client.frames.find((frame) => frame.id === id).result.sessions;
+			expect(sessions).toHaveLength(1);
+			expect(sessions[0].origin).toEqual(expectedOrigin);
+			expect(sessions[0].lastActivityAt).toBeString();
+		}
+		f.client.close();
+	});
+}

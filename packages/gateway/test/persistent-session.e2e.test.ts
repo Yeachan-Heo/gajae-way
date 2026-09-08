@@ -1,17 +1,16 @@
 import { expect, test } from "bun:test";
-import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { isTerminalStatus } from "@gajaeway/subsession";
-import { BrokerSupervisor } from "../src/orchestrator/broker";
-import { BrokerSessionPort } from "../src/orchestrator/session-port";
+import { BrokerSupervisor, reapAgentDir } from "../src/orchestrator/broker";
+import { BrokerSessionPort, SessionTerminalError } from "../src/orchestrator/session-port";
 import { TailRunner } from "../src/orchestrator/tail-runner";
 import { GatewayDatabase } from "../src/store/db";
 
 const enabled =
 	process.env.GAJAEWAY_E2E_GJC === "1" &&
-	typeof process.env.OPENAI_API_KEY === "string" &&
-	process.env.OPENAI_API_KEY.length > 0 &&
+	(Boolean(process.env.GAJAEWAY_E2E_MODELS_FILE) || Boolean(process.env.OPENAI_API_KEY)) &&
 	Bun.which("gjc") !== null;
 const liveTest = enabled ? test : test.skip;
 
@@ -48,7 +47,7 @@ async function waitForTerminal(
 	while (Date.now() < deadline) {
 		const status = await port.status({ sessionId, repo, opRef });
 		if (isTerminalStatus(status.status.status)) {
-			expect(status.status.status).toBe("terminal_ok");
+			if (status.status.status !== "terminal_ok") throw new SessionTerminalError(status);
 			return;
 		}
 		await Bun.sleep(250);
@@ -115,7 +114,13 @@ liveTest(
 			// the latter is only a relay. The supervisor inherits provider variables while
 			// forcing all GJC state into this disposable agent directory.
 			await mkdir(broker.agentDir, { recursive: true, mode: 0o700 });
-			await writeFile(join(broker.agentDir, "models.yml"), scratchModels, { mode: 0o600 });
+			await writeFile(
+				join(broker.agentDir, "models.yml"),
+				process.env.GAJAEWAY_E2E_MODELS_FILE
+					? await readFile(process.env.GAJAEWAY_E2E_MODELS_FILE, "utf8")
+					: scratchModels,
+				{ mode: 0o600 },
+			);
 			await broker.preflight();
 			await broker.start();
 			expect(broker.generation).toBe(1);
@@ -133,7 +138,11 @@ liveTest(
 			});
 			const binding = await port.bind({ originKey: "loopback/loopback/persistent-e2e", epoch: 0, repo });
 			sessionId = binding.sessionId;
-			await port.setModel({ sessionId, repo, selection: "layofflabs-anthropic/claude-opus-5" });
+			await port.setModel({
+				sessionId,
+				repo,
+				selection: process.env.GAJAEWAY_E2E_MODEL ?? "layofflabs-anthropic/claude-opus-5",
+			});
 
 			const firstRef = `gw-e2e-first-${crypto.randomUUID()}`;
 			const first = await port.request({
@@ -196,6 +205,45 @@ liveTest(
 			]);
 			expect(tailResult.exitCode).toBe(0);
 			expect(assistantTextsFromTail(tailResult.stdout).some((text) => text.includes(steerMarker))).toBe(true);
+		} catch (error) {
+			if (error instanceof SessionTerminalError) {
+				const status = error.status.status;
+				// The SDK deliberately hides provider prose. Preserve its diagnostic code,
+				// never the raw error, prompt, transcript, endpoint or environment.
+				const code = status.error?.code;
+				const safeCode =
+					code &&
+					[
+						"provider_http_402",
+						"provider_http_429",
+						"provider_rejected",
+						"prompt_failed",
+						"agent_failed",
+						"provider_down",
+						"provider_unavailable",
+						"upstream_stream_interrupted",
+						"argument_validation",
+						"execution",
+						"upstream_error",
+						"transport_reset",
+						"internal",
+						"prompt_deadline_exceeded",
+						"cancelled",
+						"internal_error",
+					].includes(code)
+						? code
+						: "other_sdk_error";
+				throw new Error(
+					`persistent live terminal ${JSON.stringify({
+						status: status.status,
+						code: safeCode,
+						receiptState: status.receiptState,
+					})}`,
+				);
+			}
+			throw new Error(
+				"persistent live test failed outside terminal status; raw exception omitted for credential safety",
+			);
 		} finally {
 			if (sessionId) {
 				try {
@@ -212,12 +260,23 @@ liveTest(
 						JSON.stringify({ sessionId, cwd: repo }),
 					]);
 				} catch {
-					// The scratch host is still stopped below; close uncertainty must not hide
-					// the original assertion failure or retain a broker owned by this test.
+					// Cleanup continues against this test's private agent directory only.
 				}
 			}
 			try {
 				await broker.stop();
+				await reapAgentDir(
+					broker.agentDir,
+					() => {},
+					(pid) => {
+						try {
+							process.kill(pid, 0);
+							return true;
+						} catch {
+							return false;
+						}
+					},
+				);
 			} finally {
 				database.close();
 				await rm(home, { recursive: true, force: true });

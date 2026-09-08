@@ -3,6 +3,7 @@ import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { OpsCycleResult } from "@gajaeway/protocol";
+import { originKey, parseOriginKey } from "@gajaeway/protocol";
 import { GajaewayClient } from "@gajaeway/sdk";
 import {
 	CLI_USAGE,
@@ -396,6 +397,7 @@ describe("work operator commands", () => {
 		const client: GajaewayClient = Object.create(GajaewayClient.prototype);
 		client.request = async <T>(verb: string, params?: unknown): Promise<T> => {
 			requests.push({ verb, params });
+			if (result instanceof Error) throw result;
 			return result as T;
 		};
 		client.close = async () => {
@@ -411,7 +413,15 @@ describe("work operator commands", () => {
 		const previousExit = process.exitCode;
 		try {
 			await main(["--socket", "/test/work.sock", "work", ...args]);
-			return { requests, lines, errors, closed, connections: connect.mock.calls.length };
+			return {
+				requests,
+				lines,
+				errors,
+				closed,
+				connections: connect.mock.calls.length,
+				exitCode: process.exitCode,
+				connectOptions: connect.mock.calls[0]?.[1],
+			};
 		} finally {
 			connect.mockRestore();
 			log.mockRestore();
@@ -437,6 +447,150 @@ describe("work operator commands", () => {
 			]);
 			expect(output.lines).toEqual(["done"]);
 			expect(output.errors).toEqual([]);
+			expect(output.closed).toBe(true);
+		});
+	}
+
+	for (const [flag, value, model] of [
+		["--preset", "reliable", { preset: "reliable" }],
+		["--model", "openai/gpt-5.2", "openai/gpt-5.2"],
+	] as const) {
+		test(`work start forwards ${flag} and canonical notification target`, async () => {
+			const output = await run(
+				[
+					"start",
+					"fix",
+					"--cwd",
+					"/repo",
+					"--resume",
+					flag,
+					value,
+					"--notify",
+					"telegram/topic/-100/parent=-200",
+					"fix",
+					"tests",
+				],
+				{
+					started: true,
+					jobId: "job-1",
+					opRef: "op-1",
+					sessionKey: "work/task/fix",
+					sessionId: "session-1",
+				},
+			);
+			expect(output.requests).toEqual([
+				{
+					verb: "work.start",
+					params: {
+						name: "fix",
+						cwd: "/repo",
+						resume: true,
+						model,
+						text: "fix tests",
+						notify: { platform: "telegram", kind: "topic", conversationId: "-100", parentId: "-200" },
+					},
+				},
+			]);
+			expect(output.lines).toEqual(["started: work/task/fix session=session-1 job=job-1 op=op-1"]);
+			expect(output.connectOptions).toBeUndefined();
+			expect(output.closed).toBe(true);
+		});
+	}
+
+	for (const key of [
+		"loopback/loopback/loopback",
+		"discord/channel/123",
+		"discord/dm/123/peer=456",
+		"discord/thread/123/parent=456",
+		"monitor/eventtype/build.done",
+	]) {
+		test(`work start accepts canonical origin ${key}`, async () => {
+			expect(originKey(parseOriginKey(key))).toBe(key);
+			const output = await run(["start", "fix", "--notify", key, "task"], {
+				started: true,
+				jobId: "job-1",
+				opRef: "op-1",
+				sessionKey: "work/task/fix",
+				sessionId: "session-1",
+			});
+			expect(output.errors).toEqual([]);
+			expect(output.requests).toHaveLength(1);
+		});
+	}
+
+	test("work start without notify leaves target selection to the gateway", async () => {
+		const output = await run(["start", "fix", "task"], {
+			started: true,
+			jobId: "j",
+			opRef: "o",
+			sessionKey: "k",
+			sessionId: "s",
+		});
+		expect(output.requests).toEqual([{ verb: "work.start", params: { name: "fix", text: "task" } }]);
+	});
+
+	for (const command of ["run", "start"]) {
+		test(`work ${command} prints held without claiming acceptance`, async () => {
+			const output = await run([command, "fix", "task"], {
+				...(command === "start" ? { started: false } : {}),
+				held: true,
+				jobId: "job-1",
+				state: "awaiting_operator",
+				reason: "terminal_uncertain",
+			});
+			expect(output.lines).toEqual(["HELD: terminal_uncertain\njob: job-1 state: awaiting_operator"]);
+			expect(output.exitCode).toBe(1);
+			expect(output.closed).toBe(true);
+		});
+	}
+
+	test("work run remains response-only with a caller wait budget", async () => {
+		const output = await run(["run", "fix", "task"], { held: false, text: "answer" });
+		expect(output.requests).toEqual([{ verb: "work.run", params: { name: "fix", text: "task" } }]);
+		expect(output.connectOptions).toEqual({ requestTimeoutMs: 3_600_000 });
+		expect(output.lines).toEqual(["answer"]);
+	});
+
+	for (const op of [null, { status: "unknown" }, { status: "terminal_ok", outcome: { reason: "cancelled" } }]) {
+		test(`work status prints exact snapshot for ${JSON.stringify(op)}`, async () => {
+			const result = {
+				jobId: "job-1",
+				state: "awaiting_operator",
+				sessionId: "",
+				lastActivityAt: null,
+				attempt: null,
+				op,
+			};
+			const output = await run(["status", "fix"], result);
+			expect(output.requests).toEqual([{ verb: "work.status", params: { name: "fix" } }]);
+			expect(output.lines).toEqual([JSON.stringify(result)]);
+			expect(output.closed).toBe(true);
+		});
+	}
+
+	test("work steer returns the accepted correlation ref", async () => {
+		const output = await run(["steer", "fix", "focus", "tests"], { steered: true, clientRef: "client-exact" });
+		expect(output.requests).toEqual([{ verb: "work.steer", params: { name: "fix", text: "focus tests" } }]);
+		expect(output.lines).toEqual(["steered: client-exact"]);
+		expect(output.closed).toBe(true);
+	});
+
+	test("work steer refusal is not acceptance", async () => {
+		const output = await run(["steer", "fix", "focus"], { steered: false, reason: "steer_refused:sdk_refused" });
+		expect(output.lines).toEqual(["not steered: steer_refused:sdk_refused"]);
+		expect(output.exitCode).toBe(1);
+	});
+
+	for (const command of ["run", "start", "status", "steer"]) {
+		test(`work ${command} reports gateway errors and closes without retry`, async () => {
+			const output = await run(
+				[command, "fix", ...(command === "status" ? [] : ["task"])],
+				new Error("work status unavailable"),
+			);
+			expect(output.lines).toEqual([]);
+			expect(output.errors).toEqual(["work status unavailable"]);
+			expect(output.requests).toHaveLength(1);
+			expect(output.exitCode).toBe(1);
 			expect(output.closed).toBe(true);
 		});
 	}
@@ -487,6 +641,39 @@ describe("work operator commands", () => {
 	});
 
 	for (const args of [
+		...[
+			"discord/dm/c",
+			"discord/channel/c/peer=p",
+			"discord/thread/t",
+			"discord/thread/t/peer=p",
+			"discord/dm/c/peer=p/peer=q",
+			"discord/dm/c/peer=",
+			"discord/channel/c/",
+			"discord/channel/c/extra",
+			"discord/channel/a%2Fb",
+			" discord/channel/c",
+			"discord/channel/c ",
+			"unknown/channel/c",
+			"discord/channel/c//",
+			"loopback/channel/c",
+			"monitor/channel/c",
+			"discord/dm/c/peer=p=extra",
+		].map((key) => ["start", "fix", "--notify", key, "task"]),
+		["run", "fix", "--notify", "discord/channel/c", "task"],
+		["start", "fix", "--notify"],
+		["start", "fix", "--notify", "discord/channel/c", "--notify", "discord/channel/d", "task"],
+		["start", "fix", "--model", "model", "--preset", "preset", "task"],
+		["start", "fix", "--preset", "preset", "--model", "model", "task"],
+		["start", "fix", "--model"],
+		["start", "fix", "--preset", "--resume", "task"],
+		["start", "fix", "--cwd", "relative", "task"],
+		["run", "fix", "--cwd", "relative", "task"],
+		["start", "bad/name", "task"],
+		["start", "fix", "   "],
+		["status"],
+		["status", "fix", "extra"],
+		["steer", "fix"],
+		["steer", "fix", "--resume", "task"],
 		["run", "fix", "--model", "model", "--preset", "preset", "task"],
 		["run", "fix", "--preset", "preset", "--model", "model", "task"],
 		["run", "fix", "task", "--model"],

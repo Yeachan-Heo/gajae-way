@@ -78,8 +78,8 @@ export function validateOriginRef(ref: OriginRef): OriginRef {
 
 /**
  * THE single canonical origin key. Deterministic pure function of the origin
- * (spec/plan: surface-routing single-source lesson). Never parse this string
- * back into parts; it is an opaque identity.
+ * (spec/plan: surface-routing single-source lesson). Treat it as opaque outside
+ * the canonical protocol-boundary parser below.
  */
 export function originKey(ref: OriginRef): string {
 	validateOriginRef(ref);
@@ -87,6 +87,24 @@ export function originKey(ref: OriginRef): string {
 	if (ref.parentId) parts.push(`parent=${ref.parentId}`);
 	if (ref.peerId) parts.push(`peer=${ref.peerId}`);
 	return parts.join("/");
+}
+
+/** Parse only the exact originKey grammar; never decode, normalize or guess. */
+export function parseOriginKey(key: string): OriginRef {
+	const parts = key.split("/");
+	const [platform, kind, conversationId, qualifier] = parts;
+	if (parts.length < 3 || parts.length > 4 || !platform || !kind || !conversationId)
+		throw new OriginRefError("invalid canonical origin key");
+	const ref: OriginRef = {
+		platform: platform as OriginPlatform,
+		kind: kind as OriginKind,
+		conversationId,
+		...(qualifier?.startsWith("parent=") ? { parentId: qualifier.slice(7) } : {}),
+		...(qualifier?.startsWith("peer=") ? { peerId: qualifier.slice(5) } : {}),
+	};
+	validateOriginRef(ref);
+	if (originKey(ref) !== key) throw new OriginRefError("noncanonical origin key");
+	return ref;
 }
 
 /** The single loopback origin used by the P0 `gajaeway chat` REPL. */

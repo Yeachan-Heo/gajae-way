@@ -1,8 +1,10 @@
 import { describe, expect, test } from "bun:test";
 import {
+	containsSilenceToken,
 	decodeFrame,
 	encodeFrame,
 	FrameDecoder,
+	isSilenceToken,
 	LOOPBACK_ORIGIN,
 	MAX_FRAME_BYTES,
 	negotiate,
@@ -145,4 +147,43 @@ describe("origin normalization", () => {
 			}),
 		).toThrow();
 	});
+});
+
+describe("silence tokens", () => {
+	for (const text of [
+		"preamble [SILENT]",
+		"preamble\n[SILENT]\npostscript",
+		"preamble [silent]",
+		"preamble\n[silent]\npostscript",
+	]) {
+		test(`recognizes embedded marker ${JSON.stringify(text)}`, () => {
+			expect(containsSilenceToken(text)).toBe(true);
+			expect(isSilenceToken(text)).toBe(false);
+		});
+	}
+
+	test("recognizes an original-body marker beyond a 2 KiB excerpt", () => {
+		const text = `${"x".repeat(2049)}\n[SILENT]`;
+		expect(containsSilenceToken(text)).toBe(true);
+		expect(containsSilenceToken(text.slice(0, 2048))).toBe(false);
+	});
+
+	for (const text of [
+		"ordinary text",
+		"preamble SILENT",
+		"preamble [Silent]",
+		"preamble [NO_REPLY]",
+		"preamble [ SILENT ]",
+	]) {
+		test(`does not broaden embedded grammar for ${JSON.stringify(text)}`, () => {
+			expect(containsSilenceToken(text)).toBe(false);
+		});
+	}
+
+	for (const text of ["SILENT", "[SILENT]", "silent", "NO_REPLY", "NO REPLY", "[NO_REPLY]", "[NO REPLY]"]) {
+		test(`preserves exact-body alias ${text}`, () => {
+			expect(isSilenceToken(text)).toBe(true);
+			expect(isSilenceToken(`  ${text}\n`)).toBe(true);
+		});
+	}
 });

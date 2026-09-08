@@ -1,7 +1,18 @@
 import { copyFile, stat } from "node:fs/promises";
 import { isAbsolute, join } from "node:path";
-import type { MonitorRecord, OpsCycleResult, WorkJobsResult, WorkRetireResult } from "@gajaeway/protocol";
-import { LOOPBACK_ORIGIN, originKey } from "@gajaeway/protocol";
+import type {
+	MonitorRecord,
+	OpsCycleResult,
+	OriginRef,
+	WorkJobsResult,
+	WorkRetireResult,
+	WorkRunResult,
+	WorkStartParams,
+	WorkStartResult,
+	WorkStatusResult,
+	WorkSteerResult,
+} from "@gajaeway/protocol";
+import { LOOPBACK_ORIGIN, originKey, parseOriginKey } from "@gajaeway/protocol";
 import { GajaewayClient } from "@gajaeway/sdk";
 import {
 	columnNames,
@@ -38,7 +49,7 @@ export const COMMANDS = [
 ] as const;
 
 export const CLI_USAGE =
-	"usage: gajaeway [--socket PATH] status|shutdown|chat|daemon run|sessions list [--json] [--fields a,b,c] [--limit N] [--offset N]|sessions inspect <originKey-or-index>|memory audit|memory search <query>|monitors ...|work run <name> [--cwd DIR] [--resume] [--model ID|--preset NAME] <text>|work retire <name>|work jobs|ops backup <path>|ops cycle [--json]|ops integrity|ops restore <backupPath>|services install|repair --bin-dir DIR [--launch-agents-dir DIR]";
+	"usage: gajaeway [--socket PATH] status|shutdown|chat|daemon run|sessions list [--json] [--fields a,b,c] [--limit N] [--offset N]|sessions inspect <originKey-or-index>|memory audit|memory search <query>|monitors ...|work run|start <name> [--cwd DIR] [--resume] [--model ID|--preset NAME] [--notify originKey (start only)] <text>|work status <name>|work steer <name> <text>|work retire <name>|work jobs|ops backup <path>|ops cycle [--json]|ops integrity|ops restore <backupPath>|services install|repair --bin-dir DIR [--launch-agents-dir DIR] (work run waits for a response; caller timeout does not end the attempt)";
 
 /** Usage errors exit 2, as `gajaeway-gateway` does; 1 stays a runtime failure. */
 export const USAGE_EXIT_CODE = 2;
@@ -419,7 +430,30 @@ export async function main(args = process.argv.slice(2), options: MainOptions = 
 			case "work": {
 				const [command, ...args] = parsed.rest;
 				const usage =
-					'usage: gajaeway work run <name> [--cwd DIR] [--resume] [--model ID|--preset NAME] "<task text>"|retire <name>|jobs';
+					'usage: gajaeway work run|start <name> [--cwd DIR] [--resume] [--model ID|--preset NAME] [--notify originKey (start only)] "<task text>"|status <name>|steer <name> <text>|retire <name>|jobs';
+				if (command === "status" || command === "steer") {
+					const name = args[0];
+					const text = args.slice(1).join(" ").trim();
+					if (
+						!name ||
+						!/^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/.test(name) ||
+						(command === "status" ? args.length !== 1 : !text || args.slice(1).some((arg) => arg.startsWith("--")))
+					)
+						throw new Error(usage);
+					const client = await GajaewayClient.connectSocket(parsed.socket);
+					try {
+						if (command === "status") {
+							console.log(JSON.stringify(await client.request<WorkStatusResult>("work.status", { name })));
+						} else {
+							const result = await client.request<WorkSteerResult>("work.steer", { name, text });
+							console.log(result.steered ? `steered: ${result.clientRef}` : `not steered: ${result.reason}`);
+							if (!result.steered) process.exitCode = 1;
+						}
+					} finally {
+						await client.close();
+					}
+					break;
+				}
 				if (command === "retire" || command === "jobs") {
 					if (command === "retire" ? args.length !== 1 || !args[0] || args[0].startsWith("--") : args.length !== 0)
 						throw new Error(usage);
@@ -447,19 +481,29 @@ export async function main(args = process.argv.slice(2), options: MainOptions = 
 					}
 					break;
 				}
-				if (command !== "run") throw new Error(usage);
+				if (command !== "run" && command !== "start") throw new Error(usage);
 				const name = args[0];
 				let cwd: string | undefined;
 				let resume = false;
 				let model: string | { preset: string } | undefined;
+				let notify: OriginRef | undefined;
 				const textParts: string[] = [];
 				for (let i = 1; i < args.length; i++) {
 					const arg = args[i];
-					if (arg === "--cwd" || arg === "--model" || arg === "--preset") {
+					if (arg === "--cwd" || arg === "--model" || arg === "--preset" || arg === "--notify") {
 						const value = args[++i];
 						if (!value?.trim() || value.startsWith("--")) throw new Error(usage);
-						if (arg === "--cwd") cwd = value;
-						else {
+						if (arg === "--cwd") {
+							if (cwd !== undefined || !isAbsolute(value)) throw new Error(usage);
+							cwd = value;
+						} else if (arg === "--notify") {
+							if (command !== "start" || notify !== undefined) throw new Error(usage);
+							try {
+								notify = parseOriginKey(value);
+							} catch {
+								throw new Error(`${usage}\ninvalid --notify originKey`);
+							}
+						} else {
 							if (model !== undefined) throw new Error(`${usage}\n--model and --preset are mutually exclusive`);
 							model = arg === "--preset" ? { preset: value } : value;
 						}
@@ -468,25 +512,38 @@ export async function main(args = process.argv.slice(2), options: MainOptions = 
 					else textParts.push(arg as string);
 				}
 				const text = textParts.join(" ").trim();
-				if (!name || name.startsWith("--") || !text) throw new Error(usage);
-				// Worker turns are long agentic runs: the request waits as long as the
-				// gateway's own inactivity ceiling allows, not the default 30s.
-				const client = await GajaewayClient.connectSocket(parsed.socket, { requestTimeoutMs: 3_600_000 });
+				if (!name || !/^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/.test(name) || !text) throw new Error(usage);
+				// This is a caller response-wait budget, never an attempt deadline.
+				// Timeout/disconnect leaves the attempt observable via work.status.
+				const client = await GajaewayClient.connectSocket(
+					parsed.socket,
+					command === "run" ? { requestTimeoutMs: 3_600_000 } : undefined,
+				);
 				try {
-					const result = await client.request<
-						| { held: true; jobId: string; state: string; reason: string }
-						| { held: false; text: string; sessionKey: string; jobId: string; opRef: string }
-					>("work.run", {
+					const params: WorkStartParams = {
 						name,
 						text,
 						...(cwd ? { cwd } : {}),
 						...(resume ? { resume: true } : {}),
 						...(model === undefined ? {} : { model }),
-					});
-					if (result.held) {
-						console.log(`HELD: ${result.reason}\njob: ${result.jobId} state: ${result.state}`);
+						...(notify === undefined ? {} : { notify }),
+					};
+					if (command === "start") {
+						const result = await client.request<WorkStartResult>("work.start", params);
+						if (result.started) {
+							console.log(
+								`started: ${result.sessionKey} session=${result.sessionId} job=${result.jobId} op=${result.opRef}`,
+							);
+						} else {
+							console.log(`HELD: ${result.reason}\njob: ${result.jobId} state: ${result.state}`);
+							process.exitCode = 1;
+						}
 					} else {
-						console.log(result.text);
+						const result = await client.request<WorkRunResult>("work.run", params);
+						if (result.held) {
+							console.log(`HELD: ${result.reason}\njob: ${result.jobId} state: ${result.state}`);
+							process.exitCode = 1;
+						} else console.log(result.text);
 					}
 				} finally {
 					await client.close();

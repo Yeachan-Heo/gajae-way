@@ -29,6 +29,20 @@ export class DeliveryLedger {
 			}),
 		);
 	}
+	/** Explicit participation in the same database's caller-owned transaction. */
+	createPendingInTransaction(row: {
+		deliveryId: string;
+		turnId: string;
+		originKey: string;
+		payloadJson: string;
+	}): boolean {
+		return this.#database.deliveryCreateInTransaction({
+			id: row.deliveryId,
+			turnId: row.turnId,
+			originKey: row.originKey,
+			payloadJson: row.payloadJson,
+		});
+	}
 	markInflight(deliveryId: string): void {
 		const row = this.get(deliveryId);
 		if (!row || row.state === "confirmed" || row.state === "expired") return;

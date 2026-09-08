@@ -1,0 +1,57 @@
+{
+  "schemaVersion": 1,
+  "kind": "api-package-test-report",
+  "status": "passed",
+  "verificationGeneration": 3,
+  "runtime": "Bun 1.4.0, macOS arm64",
+  "approvedPlan": ".gjc/_session-01a07a2c-d1c0-700e-9109-979ae486fbe0/plans/ralplan/01a07a2c-d1c0-700e-9109-979ae486fbe0/pending-approval.md",
+  "commands": [
+    {
+      "command": "bun test packages --reporter=junit --reporter-outfile=artifacts/async-work-final.junit.xml",
+      "exitCode": 0,
+      "passed": 1821,
+      "failed": 0,
+      "skipped": 3,
+      "assertions": 8739,
+      "files": 132,
+      "artifact": "artifacts/async-work-final.junit.xml"
+    },
+    {
+      "command": "GAJAEWAY_BENCH=1 GAJAEWAY_STRESS=1 bun test packages/gateway/bench packages/gateway/test/stress/burst-stress.test.ts --reporter=junit --reporter-outfile=artifacts/async-work-adversarial.junit.xml",
+      "exitCode": 0,
+      "passed": 2,
+      "failed": 0,
+      "artifact": "artifacts/async-work-adversarial.junit.xml",
+      "observed": {"monitorEvents": 200, "receipted": 200, "turns": 20, "goldenRetrievalQueriesAtRankOne": 7}
+    },
+    {"command": "bunx tsc --noEmit -p tsconfig.json", "exitCode": 0},
+    {"command": "bunx biome ci packages/", "exitCode": 0, "warnings": 362, "infos": 19, "note": "Warnings were not suppressed; includes existing and changed-file warnings."},
+    {"command": "bun run build", "exitCode": 0, "outputs": ["dist/gajaeway-gateway", "dist/gajaeway-discord", "dist/gajaeway-telegram", "dist/gajaeway-admin", "dist/gajaeway"]},
+    {"command": "script -q artifacts/async-work-cli-pty.cap bun /tmp/gjc-async-work-pty.ts", "exitCode": 0, "artifact": "artifacts/async-work-cli-pty.cap", "structuredReceipts": "artifacts/async-work-cli-proof.json", "note": "Actual CLI subprocesses used a real fixture-owned gateway, SQLite and Unix socket; assertions checked responses and persisted effects."}
+  ],
+  "coverage": [
+    "Atomic attempt preparation/settlement rollback and stale CAS",
+    "Start accepted before terminal, status purity, steering and capacity/open-attempt refusals",
+    "20-case positive-versus-unproven terminal accounting matrix in torn-send and observer paths; no false acceptance or replay",
+    "Leading rather than trailing UTF-8 excerpt with HEAD/TAIL markers and astral scalar boundaries",
+    "Atomic worker origin metadata for fresh start/run session.list, rollback and stale-epoch successor protection",
+    "Deterministic queued steer captured for attempt A cannot target successor B",
+    "Caller timeout/disconnect and both Unix/stdio shutdown preserve underlying work",
+    "Start-only notification snapshots, response-only run, original output/silence and bounded Unicode content",
+    "Shared established embedded [SILENT]/[silent] handling on proven original content before clipping, including beyond-2KiB marker and unavailable/dead-authority crash recovery; actual CLI verifies suppressed decision and no extra delivery",
+    "Operation-owned turn.result proof rejects neighboring, summary-only and identity-mismatched output",
+    "Real process crashes across send acceptance, terminal evidence, output claims and settlement statements",
+    "Live/dead/disowned/indeterminate restart authority without bind/send replay",
+    "Three output claims persist across crashes; known silence survives unavailable content",
+    "One logical delivery across replay/ack; ledger pruning does not recreate completion",
+    "Retirement permits broker-proven dead/disowned unknown ops but refuses indeterminate authority",
+    "Schema upgrade fixtures, existing monitor/persona behavior, protocol and CLI regression coverage"
+  ],
+  "limitations": [
+    "The full-suite benchmark and burst-stress skips were separately executed and passed with opt-in flags.",
+    "The real provider-backed gjc scratch-session E2E remains opt-in and was not run; no live-host migration, deployment, process cleanup or foreign broker operation occurred.",
+    "Bun 1.4.0 is the installed verification runtime; package metadata names Bun 1.3.14.",
+    "Safe cli-replay artifact probes runtime version only; feature evidence is the actual PTY and structured subprocess receipts.",
+    "No boundary review approval is claimed by this test report; cleaner, architect, QA and terminal critic are separate gates."
+  ]
+}

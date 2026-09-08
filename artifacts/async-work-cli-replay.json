@@ -1,0 +1,14 @@
+{
+  "schemaVersion": 1,
+  "kind": "cli-replay",
+  "replaySafe": true,
+  "command": ["bun", "--version"],
+  "cwd": ".",
+  "env": {"LC_ALL": "C"},
+  "timeoutMs": 30000,
+  "expectedExitCode": 0,
+  "recordedStdout": "1.4.0\n",
+  "recordedStderr": "",
+  "invariants": [{"type": "substring", "value": "1.4.0"}],
+  "description": "Safe pinned-runtime probe only. Async worker feature behavior is independently proven by actual CLI subprocess receipts in async-work-cli-proof.json and the genuine PTY transcript async-work-cli-pty.cap; this version probe is not feature coverage."
+}

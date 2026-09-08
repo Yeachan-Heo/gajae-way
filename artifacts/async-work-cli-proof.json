@@ -1,0 +1,259 @@
+{
+  "schemaVersion": 1,
+  "kind": "black-box-cli-api-receipt",
+  "environment": "fixture-owned gateway process, real SQLite and Unix socket, persistent scripted private broker",
+  "status": "passed",
+  "receipts": [
+    {
+      "argv": [
+        "/opt/homebrew/lib/node_modules/bun/bin/bun.exe",
+        "/Users/bellman/Documents/Workspace/gajae-way/.worktrees/feat-broker-cursor-limit-b0797ee6/packages/cli/src/main.ts",
+        "--socket",
+        "/var/folders/yl/ndsjfsl95t781x9qyjrqyqc80000gn/T/work-crash-ZBvQlS/gateway.sock",
+        "work",
+        "start",
+        "pty",
+        "--cwd",
+        "/var/folders/yl/ndsjfsl95t781x9qyjrqyqc80000gn/T/work-crash-ZBvQlS",
+        "--notify",
+        "discord/channel/fixture",
+        "Verify asynchronous CLI"
+      ],
+      "stdout": "started: work/task/pty session=e0482f8a-c729-46a2-8763-d5cff7aed65b job=lanejob-707479 op=gw-work-pty-01m1zp98s95ssv7sb2np5k4h9t\n",
+      "stderr": "",
+      "exitCode": 0,
+      "expectedExitCode": 0
+    },
+    {
+      "argv": [
+        "/opt/homebrew/lib/node_modules/bun/bin/bun.exe",
+        "/Users/bellman/Documents/Workspace/gajae-way/.worktrees/feat-broker-cursor-limit-b0797ee6/packages/cli/src/main.ts",
+        "--socket",
+        "/var/folders/yl/ndsjfsl95t781x9qyjrqyqc80000gn/T/work-crash-ZBvQlS/gateway.sock",
+        "work",
+        "status",
+        "pty"
+      ],
+      "stdout": "{\"jobId\":\"lanejob-707479\",\"state\":\"running\",\"sessionId\":\"e0482f8a-c729-46a2-8763-d5cff7aed65b\",\"lastActivityAt\":\"2026-09-08T05:01:36.937Z\",\"attempt\":{\"opRef\":\"gw-work-pty-01m1zp98s95ssv7sb2np5k4h9t\",\"startedAt\":\"2026-09-08T05:01:36.937Z\"},\"op\":{\"status\":\"in_flight\",\"startedAt\":1788843696938}}\n",
+      "stderr": "",
+      "exitCode": 0,
+      "expectedExitCode": 0
+    },
+    {
+      "argv": [
+        "/opt/homebrew/lib/node_modules/bun/bin/bun.exe",
+        "/Users/bellman/Documents/Workspace/gajae-way/.worktrees/feat-broker-cursor-limit-b0797ee6/packages/cli/src/main.ts",
+        "--socket",
+        "/var/folders/yl/ndsjfsl95t781x9qyjrqyqc80000gn/T/work-crash-ZBvQlS/gateway.sock",
+        "work",
+        "steer",
+        "pty",
+        "Keep the same attempt"
+      ],
+      "stdout": "steered: gw-work-steer-01m1zp98taddwbygxejwpc9aba\n",
+      "stderr": "",
+      "exitCode": 0,
+      "expectedExitCode": 0
+    },
+    {
+      "argv": [
+        "/opt/homebrew/lib/node_modules/bun/bin/bun.exe",
+        "/Users/bellman/Documents/Workspace/gajae-way/.worktrees/feat-broker-cursor-limit-b0797ee6/packages/cli/src/main.ts",
+        "--socket",
+        "/var/folders/yl/ndsjfsl95t781x9qyjrqyqc80000gn/T/work-crash-ZBvQlS/gateway.sock",
+        "work",
+        "start",
+        "pty",
+        "--cwd",
+        "/var/folders/yl/ndsjfsl95t781x9qyjrqyqc80000gn/T/work-crash-ZBvQlS",
+        "Reject overlap"
+      ],
+      "stdout": "",
+      "stderr": "attempt already open; use work.steer or wait\n",
+      "exitCode": 1,
+      "expectedExitCode": 1
+    },
+    {
+      "argv": [
+        "/opt/homebrew/lib/node_modules/bun/bin/bun.exe",
+        "/Users/bellman/Documents/Workspace/gajae-way/.worktrees/feat-broker-cursor-limit-b0797ee6/packages/cli/src/main.ts",
+        "--socket",
+        "/var/folders/yl/ndsjfsl95t781x9qyjrqyqc80000gn/T/work-crash-ZBvQlS/gateway.sock",
+        "work",
+        "retire",
+        "pty"
+      ],
+      "stdout": "not retired: attempt still open on work/task/pty; let it end first\n",
+      "stderr": "",
+      "exitCode": 0,
+      "expectedExitCode": 0
+    },
+    {
+      "argv": [
+        "/opt/homebrew/lib/node_modules/bun/bin/bun.exe",
+        "/Users/bellman/Documents/Workspace/gajae-way/.worktrees/feat-broker-cursor-limit-b0797ee6/packages/cli/src/main.ts",
+        "--socket",
+        "/var/folders/yl/ndsjfsl95t781x9qyjrqyqc80000gn/T/work-crash-ZBvQlS/gateway.sock",
+        "work",
+        "status",
+        "pty"
+      ],
+      "stdout": "{\"jobId\":\"lanejob-707479\",\"state\":\"attempt_ended\",\"sessionId\":\"e0482f8a-c729-46a2-8763-d5cff7aed65b\",\"lastActivityAt\":\"2026-09-08T05:01:37.221Z\",\"attempt\":{\"opRef\":\"gw-work-pty-01m1zp98s95ssv7sb2np5k4h9t\",\"startedAt\":\"2026-09-08T05:01:36.937Z\",\"endedAt\":\"2026-09-08T05:01:37.221Z\",\"endState\":\"completed\"},\"op\":{\"status\":\"terminal_ok\",\"clientRef\":\"gw-work-pty-01m1zp98s95ssv7sb2np5k4h9t\",\"startedAt\":1788843696938,\"terminalAt\":1788843697247,\"receiptState\":\"present\",\"outcome\":{\"reason\":\"end_turn\"}}}\n",
+      "stderr": "",
+      "exitCode": 0,
+      "expectedExitCode": 0
+    },
+    {
+      "argv": [
+        "/opt/homebrew/lib/node_modules/bun/bin/bun.exe",
+        "/Users/bellman/Documents/Workspace/gajae-way/.worktrees/feat-broker-cursor-limit-b0797ee6/packages/cli/src/main.ts",
+        "--socket",
+        "/var/folders/yl/ndsjfsl95t781x9qyjrqyqc80000gn/T/work-crash-ZBvQlS/gateway.sock",
+        "work",
+        "jobs"
+      ],
+      "stdout": "pty attempt_ended session=e0482f8a-c729-46a2-8763-d5cff7aed65b last=2026-09-08T05:01:37.221Z /var/folders/yl/ndsjfsl95t781x9qyjrqyqc80000gn/T/work-crash-ZBvQlS\n",
+      "stderr": "",
+      "exitCode": 0,
+      "expectedExitCode": 0
+    },
+    {
+      "argv": [
+        "/opt/homebrew/lib/node_modules/bun/bin/bun.exe",
+        "/Users/bellman/Documents/Workspace/gajae-way/.worktrees/feat-broker-cursor-limit-b0797ee6/packages/cli/src/main.ts",
+        "--socket",
+        "/var/folders/yl/ndsjfsl95t781x9qyjrqyqc80000gn/T/work-crash-ZBvQlS/gateway.sock",
+        "work",
+        "status",
+        "response-only"
+      ],
+      "stdout": "{\"jobId\":\"lanejob-726573706f6e73652d6f6e6c79\",\"state\":\"running\",\"sessionId\":\"1c322694-2904-4a15-941d-058ba3c021bd\",\"lastActivityAt\":\"2026-09-08T05:01:37.300Z\",\"attempt\":{\"opRef\":\"gw-work-response-only-01m1zp994mcnsdnrytc3crjsmp\",\"startedAt\":\"2026-09-08T05:01:37.300Z\"},\"op\":{\"status\":\"in_flight\",\"startedAt\":1788843697301}}\n",
+      "stderr": "",
+      "exitCode": 0,
+      "expectedExitCode": 0
+    },
+    {
+      "argv": [
+        "/opt/homebrew/lib/node_modules/bun/bin/bun.exe",
+        "/Users/bellman/Documents/Workspace/gajae-way/.worktrees/feat-broker-cursor-limit-b0797ee6/packages/cli/src/main.ts",
+        "--socket",
+        "/var/folders/yl/ndsjfsl95t781x9qyjrqyqc80000gn/T/work-crash-ZBvQlS/gateway.sock",
+        "work",
+        "steer",
+        "response-only",
+        "Preserve response-only delivery"
+      ],
+      "stdout": "steered: gw-work-steer-01m1zp995hekfttke7waajn1wv\n",
+      "stderr": "",
+      "exitCode": 0,
+      "expectedExitCode": 0
+    },
+    {
+      "argv": [
+        "/opt/homebrew/lib/node_modules/bun/bin/bun.exe",
+        "/Users/bellman/Documents/Workspace/gajae-way/.worktrees/feat-broker-cursor-limit-b0797ee6/packages/cli/src/main.ts",
+        "--socket",
+        "/var/folders/yl/ndsjfsl95t781x9qyjrqyqc80000gn/T/work-crash-ZBvQlS/gateway.sock",
+        "work",
+        "run",
+        "response-only",
+        "--cwd",
+        "/var/folders/yl/ndsjfsl95t781x9qyjrqyqc80000gn/T/work-crash-ZBvQlS",
+        "Return original output"
+      ],
+      "stdout": "PTY response-only verified\n",
+      "stderr": "",
+      "exitCode": 0,
+      "expectedExitCode": 0
+    },
+    {
+      "argv": [
+        "/opt/homebrew/lib/node_modules/bun/bin/bun.exe",
+        "/Users/bellman/Documents/Workspace/gajae-way/.worktrees/feat-broker-cursor-limit-b0797ee6/packages/cli/src/main.ts",
+        "--socket",
+        "/var/folders/yl/ndsjfsl95t781x9qyjrqyqc80000gn/T/work-crash-ZBvQlS/gateway.sock",
+        "work",
+        "start",
+        "pty-silent",
+        "--cwd",
+        "/var/folders/yl/ndsjfsl95t781x9qyjrqyqc80000gn/T/work-crash-ZBvQlS",
+        "--notify",
+        "discord/channel/fixture",
+        "Verify embedded silence"
+      ],
+      "stdout": "started: work/task/pty-silent session=4ae62db2-152b-4651-9861-0a0cd59b9134 job=lanejob-7074792d73696c656e74 op=gw-work-pty-silent-01m1zp99f32hcvxhvtt82re7ea\n",
+      "stderr": "",
+      "exitCode": 0,
+      "expectedExitCode": 0
+    },
+    {
+      "argv": [
+        "/opt/homebrew/lib/node_modules/bun/bin/bun.exe",
+        "/Users/bellman/Documents/Workspace/gajae-way/.worktrees/feat-broker-cursor-limit-b0797ee6/packages/cli/src/main.ts",
+        "--socket",
+        "/var/folders/yl/ndsjfsl95t781x9qyjrqyqc80000gn/T/work-crash-ZBvQlS/gateway.sock",
+        "work",
+        "status",
+        "pty-silent"
+      ],
+      "stdout": "{\"jobId\":\"lanejob-7074792d73696c656e74\",\"state\":\"attempt_ended\",\"sessionId\":\"4ae62db2-152b-4651-9861-0a0cd59b9134\",\"lastActivityAt\":\"2026-09-08T05:01:37.924Z\",\"attempt\":{\"opRef\":\"gw-work-pty-silent-01m1zp99f32hcvxhvtt82re7ea\",\"startedAt\":\"2026-09-08T05:01:37.635Z\",\"endedAt\":\"2026-09-08T05:01:37.924Z\",\"endState\":\"completed\"},\"op\":{\"status\":\"terminal_ok\",\"clientRef\":\"gw-work-pty-silent-01m1zp99f32hcvxhvtt82re7ea\",\"startedAt\":1788843697635,\"terminalAt\":1788843697949,\"receiptState\":\"present\",\"outcome\":{\"reason\":\"end_turn\"}}}\n",
+      "stderr": "",
+      "exitCode": 0,
+      "expectedExitCode": 0
+    },
+    {
+      "argv": [
+        "/opt/homebrew/lib/node_modules/bun/bin/bun.exe",
+        "/Users/bellman/Documents/Workspace/gajae-way/.worktrees/feat-broker-cursor-limit-b0797ee6/packages/cli/src/main.ts",
+        "--socket",
+        "/var/folders/yl/ndsjfsl95t781x9qyjrqyqc80000gn/T/work-crash-ZBvQlS/gateway.sock",
+        "work",
+        "retire",
+        "pty-silent"
+      ],
+      "stdout": "retired: work/task/pty-silent session=4ae62db2-152b-4651-9861-0a0cd59b9134 closed=true\n",
+      "stderr": "",
+      "exitCode": 0,
+      "expectedExitCode": 0
+    },
+    {
+      "argv": [
+        "/opt/homebrew/lib/node_modules/bun/bin/bun.exe",
+        "/Users/bellman/Documents/Workspace/gajae-way/.worktrees/feat-broker-cursor-limit-b0797ee6/packages/cli/src/main.ts",
+        "--socket",
+        "/var/folders/yl/ndsjfsl95t781x9qyjrqyqc80000gn/T/work-crash-ZBvQlS/gateway.sock",
+        "work",
+        "retire",
+        "pty"
+      ],
+      "stdout": "retired: work/task/pty session=e0482f8a-c729-46a2-8763-d5cff7aed65b closed=true\n",
+      "stderr": "",
+      "exitCode": 0,
+      "expectedExitCode": 0
+    },
+    {
+      "argv": [
+        "/opt/homebrew/lib/node_modules/bun/bin/bun.exe",
+        "/Users/bellman/Documents/Workspace/gajae-way/.worktrees/feat-broker-cursor-limit-b0797ee6/packages/cli/src/main.ts",
+        "--socket",
+        "/var/folders/yl/ndsjfsl95t781x9qyjrqyqc80000gn/T/work-crash-ZBvQlS/gateway.sock",
+        "work",
+        "retire",
+        "response-only"
+      ],
+      "stdout": "retired: work/task/response-only session=1c322694-2904-4a15-941d-058ba3c021bd closed=true\n",
+      "stderr": "",
+      "exitCode": 0,
+      "expectedExitCode": 0
+    }
+  ],
+  "assertions": [
+    "accepted before terminal",
+    "status and steer while open",
+    "overlap and open retirement refusal",
+    "same-op completion and one logical notice",
+    "run response-only with concurrent status and steer",
+    "embedded original silence beyond excerpt suppresses completion notice",
+    "terminal retirement"
+  ]
+}
