@@ -180,10 +180,7 @@ export interface PersonaSessionManagerOptions {
 		opRef: string;
 	}) => void | Promise<void>;
 	readonly log?: (line: string) => void;
-	/**
-	 * Enables session-index deletes. Production sets this from the observed gjc
-	 * version (MIN_GJC_VERSION_FOR_SESSION_GC in broker.ts); tests set it directly.
-	 */
+	/** Enables session-index deletes (tests); production keeps them off, see server.ts. */
 	readonly gcDeletes?: boolean;
 }
 
@@ -340,13 +337,12 @@ export class PersonaSessionManager {
 	async collectSessions(): Promise<{ readonly indexed: number; readonly deleted: number; readonly refused: number }> {
 		const port = this.#port;
 		if (this.#stopped || !port.listSessions || !port.deleteSession) return { indexed: 0, deleted: 0, refused: 0 };
-		// Deletes are gated on the gjc version. A refused session.delete used to
-		// be recorded as a terminal_uncertain lifecycle row with no bound session
-		// id, and one such row made the broker refuse EVERY later lifecycle op -
-		// session.create included - until the ledger was replaced by hand (live:
-		// gaebal, 127 GC refusals then 31 session.create refusals, 2026-09-07;
-		// gajae-code#5364). gjc >= 0.16.6 scopes that fence to the named session
-		// and evicts list cursors instead of exhausting them; below it, measure.
+		// Deletes are off in production. A refused session.delete is recorded as
+		// a terminal_uncertain lifecycle row, and the broker then refuses EVERY
+		// later lifecycle op - session.create included - until the ledger is
+		// archived by hand (live: gaebal 2026-09-07 on 0.16.3; local 2026-09-08
+		// on 0.16.6 despite gajae-code#5382). Until a gjc survives a real sweep
+		// with the fence session-scoped, this sweep only measures.
 		if (!this.#gcDeletes) {
 			const indexed = await port.listSessions().catch(() => undefined);
 			if (indexed) {
@@ -354,7 +350,7 @@ export class PersonaSessionManager {
 				const orphans = indexed.filter((s) => !s.live && !referenced.has(s.sessionId)).length;
 				if (orphans > 0)
 					this.#log(
-						`session_gc indexed=${indexed.length} referenced=${referenced.size} orphans=${orphans} deletes=off reason=gjc_below_session_gc_floor`,
+						`session_gc indexed=${indexed.length} referenced=${referenced.size} orphans=${orphans} deletes=off`,
 					);
 			}
 			return { indexed: indexed?.length ?? 0, deleted: 0, refused: 0 };
