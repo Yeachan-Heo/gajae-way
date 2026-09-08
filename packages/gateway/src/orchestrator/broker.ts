@@ -6,6 +6,16 @@ import { sanitizeDiagnostic } from "./rebind";
 
 /** The Stage 0 capability report was run successfully on this runtime floor. */
 export const MIN_GJC_VERSION = "0.15.6";
+/**
+ * The first gjc whose broker (a) scopes an uncertain `session.delete` refusal
+ * to the session it names instead of fencing every later lifecycle op
+ * (gajae-code#5364) and (b) evicts the oldest `session.list` cursor instead of
+ * exhausting the budget (gajae-code#5370). Below this, the session-index GC
+ * must only measure: on 0.16.3 the first sweep's refusals blanket-fenced
+ * session.create (gaebal, 2026-09-07), and the ungoverned index then starved
+ * the cursor budget until every id-resolving call failed (jip, 2026-09-08).
+ */
+export const MIN_GJC_VERSION_FOR_SESSION_GC = "0.16.6";
 /** Structural marker the health/capability probe requires from `sdk session list`. */
 const HEALTH_PROBE_SESSION_ID = "00000000-0000-4000-8000-000000000000";
 const SESSION_LIST_MARKER = "sessions";
@@ -349,7 +359,7 @@ export async function preflightGjcRuntime(
 	run: GjcCommandRunner,
 	minimumVersion = MIN_GJC_VERSION,
 	sdk?: GjcCommandRunner,
-): Promise<void> {
+): Promise<{ readonly version: string }> {
 	const version = await run(["--version"], { timeoutMs: DEFAULT_HEALTH_PROBE_TIMEOUT_MS });
 	if (version.exitCode !== 0) {
 		throw new Error(`gjc runtime preflight failed: gjc --version exited ${version.exitCode}`);
@@ -371,6 +381,14 @@ export async function preflightGjcRuntime(
 			);
 		}
 	}
+	return { version: formatVersion(found) };
+}
+
+/** True when `version` (as reported by `gjc --version`) is at least `minimum`. Unparseable versions never satisfy. */
+export function gjcVersionAtLeast(version: string | undefined, minimum: string): boolean {
+	const found = version === undefined ? undefined : parseGjcVersion(version);
+	const floor = parseGjcVersion(minimum);
+	return found !== undefined && floor !== undefined && compareVersions(found, floor) >= 0;
 }
 
 /**
@@ -418,6 +436,8 @@ export class BrokerSupervisor implements PersonaBroker {
 	#launching = false;
 	#started = false;
 	#stopping = false;
+	/** As reported by `gjc --version` at preflight; undefined until preflight has run. */
+	#gjcVersion: string | undefined;
 	#startPromise: Promise<void> | undefined;
 	#stopPromise: Promise<void> | undefined;
 
@@ -495,7 +515,13 @@ export class BrokerSupervisor implements PersonaBroker {
 		// application-level session.list probe against the private broker endpoint;
 		// spawning another SDK CLI here duplicated that check and could time out
 		// before an already-healthy daemon was observed.
-		await preflightGjcRuntime(this.#command, MIN_GJC_VERSION);
+		const { version } = await preflightGjcRuntime(this.#command, MIN_GJC_VERSION);
+		this.#gjcVersion = version;
+	}
+
+	/** The gjc version preflight observed, or undefined before preflight. */
+	get gjcVersion(): string | undefined {
+		return this.#gjcVersion;
 	}
 
 	/** The current daemon generation; it starts at 1 and increases every time the daemon is observed to recover. */

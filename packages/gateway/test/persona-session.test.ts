@@ -639,5 +639,5 @@ test("session GC only measures by default: no deletes until the gjc cleanup fenc
 	await harness(port, {}, (line) => logs.push(line));
 	expect(await manager!.collectSessions()).toEqual({ indexed: 1, deleted: 0, refused: 0 });
 	expect(port.deletes).toBe(0);
-	expect(logs).toContain("session_gc indexed=1 referenced=0 orphans=1 deletes=off");
+	expect(logs).toContain("session_gc indexed=1 referenced=0 orphans=1 deletes=off reason=gjc_below_session_gc_floor");
 });

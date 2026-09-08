@@ -54,7 +54,7 @@ import { MonitorRegistry } from "../monitors/registry";
 import { MonitorRuntime } from "../monitors/runtime";
 import { backupDatabase, integrityDatabase } from "../ops/backup";
 import { RuntimeCycleProjector } from "../ops/cycle";
-import type { BrokerSupervisor } from "../orchestrator/broker";
+import { type BrokerSupervisor, gjcVersionAtLeast, MIN_GJC_VERSION_FOR_SESSION_GC } from "../orchestrator/broker";
 import { LaneGovernor, laneJobIdentity, workSessionKey } from "../orchestrator/lane-governor";
 import {
 	type PersonaFailureInput,
@@ -533,6 +533,10 @@ function createRuntime(options: GatewayServerOptions): Runtime {
 		sessionModel: options.config.model,
 		stallTimeoutMs: options.config.stallTimeoutMs,
 		brokerGeneration: () => options.broker?.generation ?? 0,
+		// Session-index deletes need a broker that scopes delete refusals and
+		// evicts list cursors (see MIN_GJC_VERSION_FOR_SESSION_GC); below that
+		// floor the sweep only measures.
+		gcDeletes: gjcVersionAtLeast(options.broker?.gjcVersion, MIN_GJC_VERSION_FOR_SESSION_GC),
 		onTurnStart: async (input) => await createInboundTurnLifecycle(input, options, runtime),
 		// A steer whose acceptance was learnt after its turn's lifecycle is gone
 		// (resolved at terminal or after a restart) is finalized exactly like a

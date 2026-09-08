@@ -7,7 +7,9 @@ import { bootGateway } from "../src/boot";
 import type { GatewayConfig } from "../src/config";
 import {
 	BrokerSupervisor,
+	gjcVersionAtLeast,
 	MIN_GJC_VERSION,
+	MIN_GJC_VERSION_FOR_SESSION_GC,
 	probeBrokerDiscovery,
 	probeBrokerEndpoint,
 	readBrokerDiscovery,
@@ -899,6 +901,24 @@ test("boot aborts before accepting connections when the Stage 0 version floor is
 	);
 	expect(commands).toEqual([["--version"]]);
 	expect(await Bun.file(join(home, "gateway.sock")).exists()).toBe(false);
+});
+
+test("preflight reports the observed gjc version, and the session-GC floor gates deletes on it", async () => {
+	const home = await temporaryHome("gajaeway-broker-version-");
+	const command: CliRunner = async () => ({ exitCode: 0, stdout: "gjc/0.16.6\n", stderr: "" });
+	const broker = new BrokerSupervisor({ home, instanceId: "t", cwd: home, ssotAgentDir: null, command });
+	expect(broker.gjcVersion).toBeUndefined();
+	await broker.preflight();
+	expect(broker.gjcVersion).toBe("0.16.6");
+
+	// gajae-code#5364 (delete fence scoped) and #5370 (cursor eviction) both
+	// landed in 0.16.6; anything older must keep the index GC measure-only.
+	expect(gjcVersionAtLeast("0.16.6", MIN_GJC_VERSION_FOR_SESSION_GC)).toBe(true);
+	expect(gjcVersionAtLeast("gjc/0.17.0", MIN_GJC_VERSION_FOR_SESSION_GC)).toBe(true);
+	expect(gjcVersionAtLeast("0.16.5", MIN_GJC_VERSION_FOR_SESSION_GC)).toBe(false);
+	expect(gjcVersionAtLeast("0.16.3", MIN_GJC_VERSION_FOR_SESSION_GC)).toBe(false);
+	expect(gjcVersionAtLeast(undefined, MIN_GJC_VERSION_FOR_SESSION_GC)).toBe(false);
+	expect(gjcVersionAtLeast("not a version", MIN_GJC_VERSION_FOR_SESSION_GC)).toBe(false);
 });
 
 test("boot aborts when the broker endpoint never provides application health", async () => {
