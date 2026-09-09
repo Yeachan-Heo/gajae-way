@@ -276,7 +276,12 @@ export class BrokerSessionPort implements SessionPort {
 	constructor(options: BrokerSessionPortOptions) {
 		this.#database = options.database;
 		this.#agentDir = options.agentDir;
-		this.#cli = async (args, commandOptions) => normalizeSdkEnvelopeFailure(await options.cli(args, commandOptions));
+		this.#cli = async (args, commandOptions) => {
+			const result = await options.cli(args, commandOptions);
+			// Steering requires an unambiguous control receipt: do not promote a
+			// failed transport to a definitive rejection merely because stdout is JSON.
+			return args.includes("turn.steer") ? result : normalizeSdkEnvelopeFailure(result);
+		};
 		this.#instanceId = options.instanceId;
 		this.#tailRunner = options.tailRunner;
 		this.#now = options.now ?? (() => Date.now());
@@ -555,8 +560,16 @@ export class BrokerSessionPort implements SessionPort {
 			// Recognized outer control refusals are decisions; malformed output and
 			// transport/authority failures retain their uncertain error contract.
 			const code = sdkErrorCode(error);
+			let envelope: { ok?: unknown };
+			try {
+				envelope = JSON.parse(raw.stdout);
+			} catch {
+				throw error;
+			}
 			if (
 				error instanceof GjcCliError &&
+				error.exitCode === 0 &&
+				envelope?.ok === false &&
 				code &&
 				[
 					"busy",
@@ -572,18 +585,13 @@ export class BrokerSessionPort implements SessionPort {
 			throw error;
 		}
 		const body = workerRecord(receipt);
-		// A successful control envelope can contain a durable rejected steer receipt.
-		// The SDK returns { accepted:false, status:"rejected", error } in that case.
-		if (body?.clientRef !== undefined && body.clientRef !== input.clientRef)
+		// Synthetic negative receipts are not authoritative control rejections.
+		if (body?.clientRef !== input.clientRef)
 			throw new GjcCliError("gjc sdk turn.steer identity mismatch", 0, "", { code: "receipt_identity_mismatch" });
-		if (body?.accepted === false || body?.status === "rejected" || body?.ok === false) {
-			const error = workerRecord(body.error);
-			throw new GjcCliError("gjc sdk turn.steer refused acceptance", 0, "", {
-				code: stableErrorCode(error?.code) ?? "steer_refused",
-				refused: true,
-			});
+		if (body?.clientRef === input.clientRef && body.accepted === false && body.status === "rejected") {
+			throw new GjcCliError("gjc sdk turn.steer rejected acceptance", 0, "", { code: "steer_refused", refused: true });
 		}
-		if (body?.accepted !== true || (body.status !== undefined && body.status !== "accepted"))
+		if (body?.accepted !== true || body.ok === false || (body.status !== undefined && body.status !== "accepted"))
 			throw new GjcCliError("gjc sdk turn.steer acceptance unavailable", 0, "", { code: "receipt_identity_mismatch" });
 	}
 

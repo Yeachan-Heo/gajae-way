@@ -2,7 +2,7 @@ import { afterEach, expect, test } from "bun:test";
 import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import type { CliRunner } from "@gajaeway/subsession";
+import { type CliRunner, GjcCliError } from "@gajaeway/subsession";
 import { BrokerSessionPort } from "../src/orchestrator/session-port";
 import { TailRunner } from "../src/orchestrator/tail-runner";
 import { GatewayDatabase } from "../src/store/db";
@@ -472,3 +472,70 @@ test("close uses the global lifecycle route: the per-session control route prohi
 	expect(args[args.indexOf("--idempotency-key") + 1]).toMatch(/^gw-close-instance-1-sdk-1-\d+$/);
 	expect(JSON.parse(args[args.indexOf("--json-input") + 1]!)).toEqual({ sessionId: "sdk-1" });
 });
+
+for (const fixture of [
+	{ envelope: { ok: false, error: { code: "busy" } }, exitCode: 0, refused: true },
+	{ envelope: { ok: false, error: { code: "session_unavailable" } }, exitCode: 0, refused: false },
+	{ envelope: { error: { code: "busy" } }, exitCode: 0, refused: false },
+	{ envelope: { ok: false, error: { code: "busy" } }, exitCode: 1, refused: false },
+	{
+		envelope: { ok: true, result: { accepted: false, status: "rejected", error: { code: "busy" } } },
+		exitCode: 0,
+		refused: false,
+	},
+	{
+		envelope: {
+			ok: true,
+			result: { accepted: false, status: "rejected", clientRef: "expected-ref", error: { code: "busy" } },
+		},
+		exitCode: 0,
+		refused: true,
+	},
+	{
+		envelope: {
+			ok: true,
+			result: { accepted: false, status: "rejected", clientRef: "wrong-ref", error: { code: "busy" } },
+		},
+		exitCode: 0,
+		refused: false,
+	},
+	{ envelope: { ok: true, result: { accepted: true, clientRef: "wrong-ref" } }, exitCode: 0, refused: false },
+	{ envelope: { ok: true, result: { accepted: true } }, exitCode: 0, refused: false },
+	{
+		envelope: { ok: true, result: { accepted: true, status: "rejected", clientRef: "expected-ref" } },
+		exitCode: 0,
+		refused: false,
+	},
+	{
+		envelope: { ok: true, result: { accepted: true, status: "accepted", clientRef: "expected-ref", ok: false } },
+		exitCode: 0,
+		refused: false,
+	},
+	{ envelope: { ok: true, result: {} }, exitCode: 0, refused: false },
+])
+	test(`steer preserves authoritative rejection versus ambiguity: ${JSON.stringify(fixture)}`, async () => {
+		home = await mkdtemp(join(tmpdir(), "gajaeway-session-port-"));
+		database = await GatewayDatabase.open(join(home, "gateway.db"));
+		const run: CliRunner = async () => ({
+			exitCode: fixture.exitCode,
+			stdout: JSON.stringify(fixture.envelope),
+			stderr: "",
+		});
+		const port = new BrokerSessionPort({
+			database,
+			cli: run,
+			instanceId: "instance-1",
+			tailRunner: new TailRunner({ run, repo: join(home, "workspace"), stallTimeoutMs: 1_000 }),
+		});
+		let failure: unknown;
+		try {
+			await port.steer({ sessionId: "sdk-1", repo: "/tmp/repo", text: "input", clientRef: "expected-ref" });
+		} catch (error) {
+			failure = error;
+		}
+		expect(failure).toBeInstanceOf(GjcCliError);
+		expect((failure as GjcCliError).exitCode).toBe(fixture.exitCode);
+		expect(((failure as GjcCliError).details as { refused?: boolean } | undefined)?.refused === true).toBe(
+			fixture.refused,
+		);
+	});

@@ -553,13 +553,7 @@ test("a retired stalled turn detaches into a durable hold and reconciles termina
 	expect(terminal).toEqual([]);
 });
 
-/**
- * Live 2026-09-05: a send that tore on Router startup left a BOUND turn with an
- * unknown op. The next message's steer was refused, so the session was replaced
- * under the turn (retired, answerWanted). The old session then died, but a
- * retired turn was exempt from every release rule: held forever, its lifecycle
- * never told the turn was over, and the trigger never re-dispatched.
- */
+/** A torn initial send used to exercise recovery of persisted unaccepted turns. */
 class GhostSendPort extends ScriptedSessionPort {
 	ghostOpRef: string | undefined;
 	ghostSessionId: string | undefined;
@@ -599,55 +593,76 @@ class GhostSendPort extends ScriptedSessionPort {
 	}
 }
 
-test("a retired turn whose send never landed is released once its session dies, ends its lifecycle, and rides the replacement turn", async () => {
-	const port = new GhostSendPort();
-	const released: string[] = [];
-	const logs: string[] = [];
-	await harness(port, { released: (opRef) => released.push(opRef) }, (line) => logs.push(line));
-	enqueue("m-1", "torn send");
-	await manager?.notifyInbound(KEY);
-	const ghostOpRef = port.ghostOpRef!;
-	expect(logs.some((line) => line.startsWith(`persona_send_ambiguous origin=${KEY} opRef=${ghostOpRef}`))).toBe(true);
-	expect(database?.inboundTurnRow(ghostOpRef)).toMatchObject({ state: "pending", turn_state: "bound" });
-
-	// A second message: the ghost session refuses the steer, the epoch rotates
-	// and the new row becomes the replacement turn on a fresh session.
-	enqueue("m-2", "replacement turn");
-	await manager?.notifyInbound(KEY);
-	await eventually(() => port.sends.length === 1, "replacement turn did not start on the new epoch");
-	expect(
-		logs.some((line) => line.startsWith(`session_rebound_after_steer_failure origin=${KEY} epoch=0 nextEpoch=1`)),
-	).toBe(true);
-	const replacement = port.sends[0]!;
-	expect(replacement.text).toBe("replacement turn");
-	expect(replacement.sessionId).not.toBe(port.ghostSessionId);
-	expect(released).toEqual([]);
-
-	// The ghost session dies. The retired hold must release: trigger back to
-	// pending, lifecycle told, and — since a turn is running — steered into it.
-	port.ghostDead = true;
-	await manager?.tick(KEY);
-	expect(released).toEqual([ghostOpRef]);
-	expect(
-		logs.some((line) =>
-			line.startsWith(`recovery_requeue_unaccepted origin=${KEY} epoch=0 nextEpoch=1 opRef=${ghostOpRef}`),
-		),
-	).toBe(true);
-	expect(database?.getSessionRecord(KEY)?.epoch).toBe(1);
-	expect(port.steers).toEqual([
-		expect.objectContaining({ sessionId: replacement.sessionId, text: expect.stringContaining("torn send") }),
-	]);
-	expect(database?.inboundTurnRow(ghostOpRef)).toBeUndefined();
-	expect(database?.inboundTurnRows(replacement.opRef)).toEqual(
-		expect.arrayContaining([expect.objectContaining({ message_id: "m-1", turn_role: "steer", turn_state: "done" })]),
-	);
-
-	// A later sweep is a no-op: nothing is held on the ghost any more.
-	await manager?.tick(KEY);
-	expect(released).toEqual([ghostOpRef]);
-	port.complete(replacement.opRef, "answered both");
-	await eventually(() => database?.inboundPendingCount(KEY) === 0, "replacement turn did not complete");
+test("a refused running steer waits without rotating or retrying, then sends on the same session", async () => {
+	const port = new ScriptedSessionPort({
+		onSteer: () => {
+			throw steerRefused();
+		},
+	});
+	await harness(port);
+	enqueue("m-1", "first");
+	await manager!.notifyInbound(KEY);
+	const first = port.sends[0]!;
+	enqueue("m-2", "next turn");
+	await manager!.notifyInbound(KEY);
+	for (let tick = 0; tick < 3; tick++) await manager!.tick(KEY);
+	expect(port.steers).toHaveLength(1);
+	expect(port.binds).toHaveLength(1);
+	expect(port.sends).toHaveLength(1);
+	expect(database!.getSessionRecord(KEY)?.epoch).toBe(0);
+	expect(database!.inboundPendingOldest(KEY)?.message_id).toBe("m-2");
+	port.complete(first.opRef, "first answer");
+	await eventually(() => port.sends.length === 2, "pending message did not dispatch after terminal");
+	expect(port.sends[1]).toMatchObject({ sessionId: first.sessionId, text: "next turn" });
+	expect(port.binds).toHaveLength(1);
+	expect(database!.getSessionRecord(KEY)?.epoch).toBe(0);
+	port.complete(port.sends[1]!.opRef, "second answer");
+	await eventually(() => database!.inboundPendingCount(KEY) === 0, "input was lost or left pending");
 });
+
+for (const details of [{ code: "receipt_identity_mismatch" }, { code: "unknown_receipt", refused: true }])
+	test(`ambiguous ${details.code} stays attributed across restart and terminal without a new operation`, async () => {
+		let accepted = false;
+		const port = new ScriptedSessionPort({
+			onSteer: () => {
+				if (!accepted) throw new GjcCliError("uncertain receipt", 0, "", details);
+			},
+		});
+		await harness(port);
+		enqueue("m-1", "first");
+		await manager!.notifyInbound(KEY);
+		const first = port.sends[0]!;
+		enqueue("m-2", "held input");
+		await manager!.notifyInbound(KEY);
+		const clientRef = port.steers[0]!.clientRef;
+		expect(database!.inboundSteersHeld(first.opRef).map((row) => row.message_id)).toEqual(["m-2"]);
+		await manager!.stop();
+		manager = new PersonaSessionManager({
+			database: database!,
+			port,
+			instanceId: "instance-test",
+			repo: join(home, "workspace"),
+			onTurnStart: ({ trigger }) => ({ text: trigger.body }),
+		});
+		await manager.recover();
+		await manager.tick(KEY);
+		port.complete(first.opRef, "first answer");
+		await eventually(() => database!.inboundTurnRow(first.opRef)?.turn_state === "done", "terminal not recovered");
+		await manager.tick(KEY);
+		expect(database!.inboundSteersHeld(first.opRef).map((row) => row.message_id)).toEqual(["m-2"]);
+		expect(database!.inboundPendingOldest(KEY)).toBeUndefined();
+		expect(port.sends).toHaveLength(1);
+		expect(port.binds).toHaveLength(1);
+		expect(database!.getSessionRecord(KEY)?.epoch).toBe(0);
+		expect(new Set(port.steers.map((steer) => steer.clientRef))).toEqual(new Set([clientRef]));
+		accepted = true;
+		await manager.tick(KEY);
+		expect(database!.inboundTurnRows(first.opRef).find((row) => row.message_id === "m-2")).toMatchObject({
+			turn_state: "done",
+			turn_role: "steer",
+		});
+		expect(port.sends).toHaveLength(1);
+	});
 
 /**
  * Live 2026-09-05 (every main cutover from a schema-16 home): a BOUND trigger
@@ -709,6 +724,8 @@ test("startup recovery releases a retired bound turn the broker disowns instead 
 	enqueue("m-1", "torn send");
 	await manager?.notifyInbound(KEY);
 	const ghostOpRef = port.ghostOpRef!;
+	// Only an explicit operator reset retires this still-unresolved turn.
+	await manager?.reset(KEY, JSON.stringify(ORIGIN));
 	enqueue("m-2", "replacement turn");
 	await manager?.notifyInbound(KEY);
 	await eventually(() => port.sends.length === 1, "replacement turn did not start");

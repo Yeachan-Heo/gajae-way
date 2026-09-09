@@ -1388,6 +1388,16 @@ export class GatewayDatabase {
 			.map((row) => row.origin_key);
 	}
 
+	/** Origins with held steers whose terminal trigger no longer reconstructs an actor. */
+	inboundHeldSteerOrigins(): readonly string[] {
+		return this.#database
+			.query<{ origin_key: string }, []>(
+				"SELECT DISTINCT origin_key FROM inbound_messages WHERE turn_role = 'steer' AND state = 'pending' AND turn_state = 'bound' AND turn_op_ref IN (SELECT turn_op_ref FROM inbound_messages WHERE turn_role = 'trigger' AND turn_state = 'done') ORDER BY origin_key",
+			)
+			.all()
+			.map((row) => row.origin_key);
+	}
+
 	inboundNonterminalTurnCount(): number {
 		return (
 			this.#database

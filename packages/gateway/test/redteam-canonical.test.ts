@@ -475,9 +475,7 @@ test("C2d: /new discards only an undispatched row; the already-running turn stil
 			"retired running turn did not reconcile terminal state",
 		);
 		expect(port.sends).toHaveLength(1);
-		// Unlike a steer-failure rebind (answerWanted), /new is the user's explicit
-		// discard: the retired turn's output is stale and is not delivered, while
-		// its row is still closed so nothing is stranded.
+		// /new explicitly discards stale output while still closing its trigger.
 		expect(fixture.terminals).toEqual([]);
 		expect(fixture.database.inboundPendingCount(DIRECT_ORIGIN_KEY)).toBe(0);
 	} finally {
@@ -485,18 +483,24 @@ test("C2d: /new discards only an undispatched row; the already-running turn stil
 	}
 });
 
-test("C3a: a refused steer preserves the old trigger's answer and sends the refused message once on a new session", async () => {
+test("C3a: a refused steer preserves the current turn and sends the pending message once after terminal on the same session", async () => {
 	const port = new FailSteerPort(new Set([1]));
 	const fixture = await directFixture({ port });
 	try {
 		await admit(fixture, "steer-old", "old prompt");
 		const old = required(port.sends[0], "old turn was not sent");
 		await admit(fixture, "steer-refused", "refused prompt");
-		await eventually(() => port.sends.length === 2, "refused steer was not sent on the replacement session");
-		const replacement = required(port.sends[1], "replacement turn missing");
-		expect(replacement.sessionId).not.toBe(old.sessionId);
-		expect(replacement.text).toBe("refused prompt");
+		expect(port.sends).toHaveLength(1);
+		expect(port.binds).toHaveLength(1);
+		expect(fixture.database.inboundTurnRow(old.opRef)?.turn_state).toBe("accepted");
+		expect(fixture.database.inboundPendingOldest(DIRECT_ORIGIN_KEY)).toMatchObject({ message_id: "steer-refused" });
 		port.complete(old.opRef, "old answer");
+		await eventually(() => port.sends.length === 2, "refused steer was not sent after terminal");
+		const replacement = required(port.sends[1], "pending turn missing");
+		expect(fixture.terminals).toEqual([{ trigger: "steer-old", text: "old answer" }]);
+		expect(replacement.sessionId).toBe(old.sessionId);
+		expect(port.binds).toHaveLength(1);
+		expect(replacement.text).toBe("refused prompt");
 		port.complete(replacement.opRef, "replacement answer");
 		await eventually(() => fixture.terminals.length === 2, "both old and replacement answers were not delivered");
 		expect(fixture.terminals).toEqual([
@@ -509,19 +513,33 @@ test("C3a: a refused steer preserves the old trigger's answer and sends the refu
 	}
 });
 
-test("C3b: two consecutive steer refusals bump the epoch twice and each refused message is sent once", async () => {
+test("C3b: consecutive refusals each wait for the current terminal without rotating the session or losing new rows", async () => {
 	const port = new FailSteerPort(new Set([1, 2]));
 	const fixture = await directFixture({ port });
 	try {
 		await admit(fixture, "twice-old", "old");
 		await admit(fixture, "twice-first", "first refusal");
-		await eventually(() => port.sends.length === 2, "first refused message was not sent");
+		expect(port.sends).toHaveLength(1);
+		expect(fixture.database.inboundPendingOldest(DIRECT_ORIGIN_KEY)).toMatchObject({ message_id: "twice-first" });
+		port.complete(required(port.sends[0], "old send missing").opRef, "answer 0");
+		await eventually(() => port.sends.length === 2, "first refused message was not sent after terminal");
 		await admit(fixture, "twice-second", "second refusal");
-		await eventually(() => port.sends.length === 3, "second refused message was not sent");
-		expect(port.binds.map((bind) => bind.epoch)).toEqual([0, 1, 2]);
+		await admit(fixture, "twice-new", "new row behind refusal");
+		expect(port.sends).toHaveLength(2);
+		expect(port.steerAttempts).toBe(2);
+		expect(fixture.database.inboundNonterminalTurns(DIRECT_ORIGIN_KEY)).toHaveLength(1);
+		expect(fixture.database.inboundTurnRow(port.sends[1]!.opRef)?.turn_state).toBe("accepted");
+		port.complete(port.sends[1]!.opRef, "answer 1");
+		await eventually(
+			() => port.sends.length === 3 && port.steers.length === 1,
+			"pending rows did not dispatch after terminal",
+		);
+		expect(port.binds.map((bind) => bind.epoch)).toEqual([0]);
+		expect(new Set(port.sends.map((send) => send.sessionId)).size).toBe(1);
 		expect(port.sends.map((send) => send.text)).toEqual(["old", "first refusal", "second refusal"]);
+		expect(steerBodies(port)).toEqual(["new row behind refusal"]);
 		expect(new Set(port.sends.map((send) => send.opRef)).size).toBe(3);
-		for (const [index, send] of port.sends.entries()) port.complete(send.opRef, `answer ${index}`);
+		port.complete(port.sends[2]!.opRef, "answer 2");
 		await eventually(
 			() => fixture.database.inboundPendingCount(DIRECT_ORIGIN_KEY) === 0,
 			"consecutive-refusal turns did not drain",
@@ -536,7 +554,7 @@ test("C3b: two consecutive steer refusals bump the epoch twice and each refused 
 	}
 });
 
-test("C3c: repeated session_unavailable replacement binds remain pending but must report a bounded unrecoverable outcome", async () => {
+test("C3c: steer refusal never attempts unavailable replacement binds; explicit /new still retries binds without abandoning rows", async () => {
 	const timers: ScheduledTimer[] = [];
 	const seam = timerSeam(timers);
 	const port = new UnavailableReplacementBindPort();
@@ -544,7 +562,25 @@ test("C3c: repeated session_unavailable replacement binds remain pending but mus
 	try {
 		await admit(fixture, "unavailable-old", "old");
 		await admit(fixture, "unavailable-pending", "must remain pending");
-		// Bind failures back off: 2s, 4s, 8s ... never abandoning the row.
+		const old = required(port.sends[0], "old turn missing");
+		expect(port.bindAttempts).toBe(1);
+		expect(port.sends).toHaveLength(1);
+		expect(fixture.database.inboundTurnRow(old.opRef)?.turn_state).toBe("accepted");
+		expect(fixture.database.inboundPendingOldest(DIRECT_ORIGIN_KEY)).toMatchObject({
+			message_id: "unavailable-pending",
+		});
+		port.complete(old.opRef, "old answer");
+		await eventually(() => port.sends.length === 2, "pending row did not reuse the available session");
+		expect(port.sends[1]?.sessionId).toBe(old.sessionId);
+		expect(port.bindAttempts).toBe(1);
+		port.complete(port.sends[1]!.opRef, "pending answer");
+		await eventually(
+			() => fixture.database.inboundPendingCount(DIRECT_ORIGIN_KEY) === 0,
+			"refusal sequence did not drain",
+		);
+		await fixture.manager.reset(DIRECT_ORIGIN_KEY, JSON.stringify(DIRECT_ORIGIN));
+		await admit(fixture, "unavailable-new", "explicit reset requires a new binding");
+		// Explicit reset bind failures back off: 2s, 4s, 8s, without abandoning the row.
 		await eventually(
 			() => timers.some((timer) => timer.delayMs === 2_000),
 			"first replacement bind retry was not scheduled",
@@ -566,11 +602,9 @@ test("C3c: repeated session_unavailable replacement binds remain pending but mus
 			2_000, 4_000, 8_000,
 		]);
 		expect(fixture.database.inboundPendingOldest(DIRECT_ORIGIN_KEY)).toMatchObject({
-			message_id: "unavailable-pending",
+			message_id: "unavailable-new",
 		});
-		expect(fixture.database.inboundTurnRow(required(port.sends[0], "old turn missing").opRef)?.turn_state).toBe(
-			"accepted",
-		);
+		expect(fixture.database.inboundTurnRow(old.opRef)?.turn_state).toBe("done");
 		// The bound is an operator signal, not an abandonment: the row is still
 		// pending and a retry is still armed (this was the red-team C3c finding).
 		expect(

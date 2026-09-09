@@ -274,12 +274,13 @@ export class PersonaSessionManager {
 		return this.#actor(originKey).enqueue(async () => await this.#actor(originKey).rebindModel(selection));
 	}
 
-	/** Reconstructs durable bound/accepted turns after a gateway restart. */
+	/** Recovers nonterminal turns, pending inputs, and terminal turns' unresolved held steers after restart. */
 	recover(): Promise<void> {
 		if (this.#stopped) return Promise.resolve();
 		const origins = new Set<string>([
 			...this.#database.inboundNonterminalOrigins(),
 			...this.#database.inboundPendingOrigins(),
+			...this.#database.inboundHeldSteerOrigins(),
 		]);
 		return Promise.all(
 			[...origins].map((originKey) =>
@@ -544,6 +545,8 @@ class OriginActor {
 	#queue: Promise<void> = Promise.resolve();
 	#state: PersonaActorState = "idle";
 	#current: BoundTurn | undefined;
+	/** A rejected steer closes this turn's steer window, not its session. */
+	#deferredSteerOpRef: string | undefined;
 	/** A dispatch retry timer is armed; admissions wait for it instead of re-binding at once. */
 	#dispatchRetry: unknown;
 	readonly #retired = new Map<string, BoundTurn>();
@@ -921,37 +924,9 @@ class OriginActor {
 			);
 	}
 
-	/**
-	 * A steer that fails never makes the message disposable. Two causes:
-	 *
-	 * 1. The turn already ended (nothing to steer into). Reconciling completes
-	 *    it and the pending row becomes the next turn's prompt in the SAME
-	 *    session - the canonical `idle -> send` rule.
-	 * 2. The turn is still running but the session refuses the steer: the
-	 *    session is broken. Retire the turn and bump the epoch so the next
-	 *    dispatch binds a NEW session (a fresh one is bootstrapped with the last
-	 *    24h of channel context) and the still-pending row becomes that turn's
-	 *    prompt. Unlike a `/new` retire, the user never asked to discard this
-	 *    turn: its tail stays attached and its answer is still delivered.
-	 */
+	/** A refused steer waits for terminal evidence; it never authorizes replacement. */
 	async #recoverFromSteerFailure(current: BoundTurn): Promise<void> {
 		await this.#reconcileBound(current);
-		if (this.#current !== current) return;
-		if (current.statusTerminalHolds > 0 && !current.tailEvidenceUnavailable) {
-			// Status is terminal and the bounded tail grace is pending; when it
-			// fires the turn completes and the row is dispatched.
-			return;
-		}
-		current.retired = true;
-		current.answerWanted = true;
-		this.#retired.set(retiredKey(current), current);
-		this.#current = undefined;
-		const nextEpoch = this.#manager.database.rebindEpoch(this.originKey);
-		this.#state = "idle";
-		this.#manager.log(
-			`session_rebound_after_steer_failure origin=${this.originKey} epoch=${current.epoch} nextEpoch=${nextEpoch} opRef=${current.turn.opRef}`,
-		);
-		await this.#dispatchNext();
 	}
 
 	readonly #holdSweeps = new Map<string, number>();
@@ -1359,6 +1334,7 @@ class OriginActor {
 	async #steerPending(): Promise<void> {
 		const current = this.#current;
 		if (!current || current.retired || current.replyVisible || this.#state !== "turn-running") return;
+		if (this.#deferredSteerOpRef === current.turn.opRef) return;
 		// Steers whose transport tore before an answer are resolved first, on
 		// the same clientRef, before any new row is issued behind them.
 		for (const held of this.#manager.database.inboundSteersHeld(current.turn.opRef))
@@ -1429,10 +1405,9 @@ class OriginActor {
 				return false;
 			}
 			if (outcome === "refused") {
-				// The session answered and said no: the message could not reach it,
-				// but it is not disposable. It is an ordinary pending row again;
-				// either the turn is over (send it when idle) or the session is
-				// broken (replace it) - the row stays for the turn that follows.
+				// Keep the row pending for the next turn in this session. Do not
+				// repeatedly offer a refused row on each running-turn tick.
+				this.#deferredSteerOpRef = current.turn.opRef;
 				this.#manager.database.inboundSteerRefused(row.message_id, current.turn.opRef);
 				this.#manager.log(
 					`steer_failed origin=${this.originKey} message=${row.message_id} action=recover detail=${safeDiagnostic(failure)}`,
@@ -2101,7 +2076,21 @@ export function renderSteer(body: string): string {
  * been recorded, and only a clientRef replay can tell.
  */
 function isDefinitiveSteerRejection(error: unknown): boolean {
-	return error instanceof GjcCliError && error.exitCode === 0 && error.details !== undefined;
+	if (!(error instanceof GjcCliError) || error.exitCode !== 0) return false;
+	const details = error.details as { code?: unknown; refused?: unknown } | undefined;
+	return (
+		details?.refused === true &&
+		typeof details.code === "string" &&
+		[
+			"busy",
+			"steer_refused",
+			"invalid_params",
+			"not_running",
+			"no_active_turn",
+			"client_ref_conflict",
+			"session_not_found",
+		].includes(details.code)
+	);
 }
 
 function sdkStatusErrorCode(error: unknown): string | undefined {
