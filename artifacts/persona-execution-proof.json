@@ -1,0 +1,22 @@
+{
+  "messageId": "persona-execution-dc5eb425adc847c0b3d30524a955f984",
+  "origin": {
+    "platform": "loopback",
+    "kind": "loopback",
+    "conversationId": "execution-proof-dc5eb425adc847c0b3d30524a955f984"
+  },
+  "temporaryProof": "/tmp/gajaeway-persona-execution-dc5eb425adc847c0b3d30524a955f984",
+  "toolExecuted": true,
+  "chatMessageObserved": true,
+  "inbound": {
+    "state": "done",
+    "turn_state": "done",
+    "turn_op_ref": "gw-p-934d64955519420158a4a8491e1702dc",
+    "bound_session_id": "4a21094a-36f7-4624-9998-3c792fb7231c",
+    "terminal_delivery_id": null
+  },
+  "responseErrors": [],
+  "originalResult": {"status":"terminal_ok","clientRef":"gw-p-934d64955519420158a4a8491e1702dc","text":"PERSONA_EXECUTION_OK","byteLength":20,"truncated":false},
+  "repositoryVerification": {"passed":1965,"failed":0,"skipped":4,"assertions":9999,"files":138,"typecheck":"passed"},
+  "status": "passed"
+}
