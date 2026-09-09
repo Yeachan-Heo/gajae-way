@@ -60,6 +60,14 @@ The ActionGuard notice is prompt guidance to use owned start/status/steer lanes 
 
 `turnTimeoutMs` was removed with the persistent-session cutover. Configuration containing it is rejected; use `stallTimeoutMs` for an alert-only tail silence threshold. It never kills or replaces a running SDK operation.
 
+### Automatic reset after a recognized provider failure
+
+A persona turn rejected with the exact provider HTTP 400 `Unknown parameter: 'input[N].status'.` or a recognized context-exhaustion rejection can retire its session for **the next message**. The gateway corroborates the failure against bounded, private, current-session transcript evidence; a generic `Prompt submission failed`, high context occupancy alone, authentication/rate-limit error, or quoted error in chat/tool output is not reset authority. Missing, malformed, ambiguous, or stale evidence leaves the ordinary failure path unchanged.
+
+The failed trigger is settled once and **never automatically re-executed**: the installed SDK does not attest that the whole operation had no external effects. This remains true when the turn already executed tools, sent partial output, or accepted steers. Pending messages and uncertain steer attribution are preserved; automatic reset does not use `/new`'s pending-message discard behavior. Only the currently owned failed session may advance its epoch; retired failures cannot reset a replacement session.
+
+The reset budget is durable: one consecutive automatic reset per origin, with per-trigger deduplication across restarts. Another failure on the fresh session does not start a reset loop. A healthy completed reply or explicit operator `/new` permits a later automatic reset. This is recovery from an unusable conversation, not a serializer fix: repeated `input[N].status` rejection requires correcting the upstream gjc provider request format, not repeated session creation. No preset change, deployment, or GC deletion is part of automatic reset.
+
 ## Adapters and engagement
 
 Create separate credential files for Discord and Telegram tokens, then reference them as `credentials.discord` and `credentials.telegram`. Discord channel engagement is exactly `open`, `mention-open`, or `closed`; select `all`, `human-only`, or `bot-only` independently with `audience`. Omitted audience is safely `human-only`. `mention-open` wakes only for a real mention or a native reply to this bot, while `closed` also requires owner/allowlist authorization. Parent channel policy applies to Discord threads unless a thread entry overrides it. Verify adapter connectivity from its service logs and use `gajaeway sessions list` to confirm accepted traffic.

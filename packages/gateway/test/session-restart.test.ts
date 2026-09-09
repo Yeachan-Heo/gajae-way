@@ -286,34 +286,34 @@ test("a retired hold reattaches after restart and does not block the new epoch",
 	);
 });
 
-test("a recovered failed operation on a live saved session re-fires exactly one deterministic replacement (fresh_turn)", async () => {
+test("a recovered failed operation settles without replay and accepts genuinely new input", async () => {
 	home = await mkdtemp(join(tmpdir(), "gajaeway-session-restart-"));
 	database = await GatewayDatabase.open(join(home, "gateway.db"));
 	const port = new ScriptedSessionPort();
 	const logs: string[] = [];
 	const terminal: string[] = [];
 	const accepted = await startAccepted(port, logs);
-	// The gateway dies while the turn is in flight; the runtime later records it as failed.
 	await manager!.stop();
 	port.seedOperation(accepted.opRef, accepted.sessionId, "failed", "interrupted");
 	manager = makeManager(port, logs, terminal);
 
 	await manager.recover();
-	await eventually(() => port.sends.length === 2, "recovery did not dispatch a replacement turn");
-	port.complete(port.sends[1]!.opRef, "replacement reply");
-	// live+terminal(failed) => fresh_turn: requeue once, one replacement send, never a resend of the failed ref.
-	expect(
-		logs.some((line) => line.startsWith(`recovery_fresh_turn origin=${KEY} epoch=0 opRef=${accepted.opRef}`)),
-	).toBe(true);
-	const replacement = port.sends[1]!;
-	expect(replacement.opRef).not.toBe(accepted.opRef);
-	expect(replacement.opRef).toMatch(/^gw-p-[0-9a-f]{32}$/);
-	expect(replacement.text).toBe("restart me");
-	expect(port.sends.filter((send) => send.opRef === accepted.opRef)).toHaveLength(1);
-	await eventually(() => terminal.length === 1, "replacement turn did not reach terminal");
-	expect(terminal).toEqual(["replacement reply"]);
+	await eventually(() => database!.inboundNonterminalTurns(KEY).length === 0, "failed turn did not settle");
+	expect(port.sends).toHaveLength(1);
 	expect(database.inboundPendingCount(KEY)).toBe(0);
-	expect(database.inboundNonterminalTurns(KEY)).toEqual([]);
+	expect(database.inboundTurnRow(accepted.opRef)?.turn_state).toBe("done");
+	expect(terminal).toEqual([]);
+
+	enqueue("new-input", "new work after the failed turn");
+	await manager.notifyInbound(KEY);
+	await eventually(() => port.sends.length === 2, "new user input did not dispatch");
+	const next = port.sends[1]!;
+	expect(next.opRef).not.toBe(accepted.opRef);
+	expect(next.text).toBe("new work after the failed turn");
+	port.complete(next.opRef, "new reply");
+	await eventually(() => terminal.length === 1, "new input did not complete");
+	expect(terminal).toEqual(["new reply"]);
+	expect(port.sends.filter((send) => send.text === "restart me")).toHaveLength(1);
 });
 
 class UnreadableStorePort extends ScriptedSessionPort {

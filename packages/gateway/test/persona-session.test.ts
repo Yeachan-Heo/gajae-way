@@ -1,4 +1,5 @@
 import { afterEach, expect, test } from "bun:test";
+import { createHash } from "node:crypto";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -52,7 +53,7 @@ async function harness(
 		failure?: (message: string) => void;
 	} = {},
 	log?: (line: string) => void,
-	extra: { gcDeletes?: boolean } = {},
+	extra: { gcDeletes?: boolean; brokerGeneration?: () => number } = {},
 ) {
 	home = await mkdtemp(join(tmpdir(), "gajaeway-persona-session-"));
 	database = await GatewayDatabase.open(join(home, "gateway.db"));
@@ -126,85 +127,377 @@ test("a message admitted while a persistent turn is running becomes an operator-
 	);
 });
 
-/**
- * Live 2026-09-07 (playground-ko on three hosts at once): native compaction
- * did not keep the window bounded, the provider rejected every prompt with
- * `prompt is too long: 1042682 tokens > 1000000`, and the gateway delivered
- * `[turn failed] Prompt submission failed.` for each message until an operator
- * sent `/new`. A failed turn on an exhausted session is rotated instead.
- */
-test("a failed turn on a session at the context ceiling rotates the epoch and re-dispatches on a fresh session", async () => {
+test("failed notice must persist before reset completion and may retry without replaying the prompt", async () => {
 	const port = new ScriptedSessionPort({ onBind: (input) => `session-e${input.epoch}` });
-	const terminal: string[] = [];
-	const failures: string[] = [];
-	const released: string[] = [];
-	const logs: string[] = [];
-	await harness(
-		port,
-		{
-			terminal: (text) => terminal.push(text),
-			failure: (message) => failures.push(message),
-			released: (opRef) => released.push(opRef),
+	let notices = 0;
+	await harness(port, {
+		failure: () => {
+			notices++;
+			if (notices === 1) throw new Error("notice persistence interrupted");
 		},
-		(line) => logs.push(line),
-	);
-	enqueue("m-1", "hello at the ceiling");
-	await manager?.notifyInbound(KEY);
-	await eventually(() => port.sends.length === 1, "first turn did not start");
+	});
+	enqueue("failed-notice", "work that must not run twice");
+	await manager!.notifyInbound(KEY);
 	const first = port.sends[0]!;
-	expect(first.sessionId).toBe("session-e0");
-	port.contextPercent.set("session-e0", 102.7);
-	port.fail(first.opRef, "Prompt submission failed.");
-
-	await eventually(() => port.sends.length === 2, "the trigger was not re-dispatched on a fresh session");
-	const second = port.sends[1]!;
-	expect(second.text).toBe("hello at the ceiling");
-	expect(second.sessionId).toBe("session-e1");
-	expect(second.opRef).not.toBe(first.opRef);
-	expect(database?.getSessionRecord(KEY)?.epoch).toBe(1);
-	expect(released).toEqual([first.opRef]);
-	// The user never saw a failure notice: the rotation is the remedy.
-	expect(failures).toEqual([]);
-	expect(
-		logs.some((line) =>
-			line.startsWith(`session_rotated_context_exhausted origin=${KEY} epoch=0 nextEpoch=1 opRef=${first.opRef}`),
-		),
-	).toBe(true);
-
-	port.complete(second.opRef, "answered on the fresh session");
-	await eventually(() => terminal.length === 1, "replacement turn did not complete");
-	expect(terminal).toEqual(["answered on the fresh session"]);
-	expect(database?.inboundPendingCount(KEY)).toBe(0);
+	port.setFailedTurnEvidence(first.sessionId, "unsupported_input_status");
+	port.fail(first.opRef);
+	await eventually(() => notices === 1, "notice callback did not run");
+	expect(database!.inboundTurnRow(first.opRef)?.turn_state).toBe("accepted");
+	expect(database!.getSessionRecord(KEY)?.epoch).toBe(0);
+	await manager!.tick(KEY);
+	await eventually(() => manager!.state(KEY) === "idle", "retrying notice did not settle failure");
+	expect(notices).toBe(2);
+	expect(port.sends).toHaveLength(1);
+	expect(database!.inboundTurnRow(first.opRef)?.turn_state).toBe("done");
+	expect(database!.getSessionRecord(KEY)?.epoch).toBe(1);
 });
 
-test("a failed turn on a session with room left is reported as a failure, not rotated", async () => {
+test("reset consumes only the failed trigger context, preserving unrelated unread input", async () => {
 	const port = new ScriptedSessionPort();
-	const failures: string[] = [];
-	await harness(port, { failure: (message) => failures.push(message) });
-	enqueue("m-1", "ordinary failure");
-	await manager?.notifyInbound(KEY);
-	await eventually(() => port.sends.length === 1, "turn did not start");
+	await harness(port);
+	for (const messageId of ["failed-context", "unrelated-context"]) {
+		database!.contextRecord({ messageId, originKey: KEY, body: messageId, receivedAt: new Date().toISOString() });
+	}
+	enqueue("failed-context", "failed-context");
+	await manager!.notifyInbound(KEY);
 	const first = port.sends[0]!;
-	port.contextPercent.set(first.sessionId, 41);
-	port.fail(first.opRef, "provider hiccup");
-	await eventually(() => failures.length === 1, "failure did not reach the lifecycle");
-	expect(failures).toEqual(["provider hiccup"]);
-	expect(port.sends).toHaveLength(1);
-	expect(database?.getSessionRecord(KEY)?.epoch).toBe(0);
-	expect(port.contextProbes).toEqual([first.sessionId]);
+	port.setFailedTurnEvidence(first.sessionId, "unsupported_input_status");
+	port.fail(first.opRef);
+	await eventually(() => manager!.state(KEY) === "idle", "failed trigger did not settle");
+	expect(database!.contextDiagnostics(KEY).unread).toBe(1);
+	expect(database!.contextWindow(KEY, "later-message").rows.map((row) => row.message_id)).toEqual([
+		"unrelated-context",
+	]);
 });
 
-test("a failed turn whose context occupancy is unknown is reported as a failure, never rotated on a guess", async () => {
+// Exact failure recovery completes the trigger and resets only the NEXT session.
+for (const reason of ["unsupported_input_status", "context_exhausted"] as const)
+	test(`${reason} resets next without replay, including tools and visible output`, async () => {
+		const port = new ScriptedSessionPort({ onBind: (input) => `session-e${input.epoch}` });
+		const failures: string[] = [];
+		const released: string[] = [];
+		await harness(port, {
+			failure: (message) => {
+				expect(database!.getSessionRecord(KEY)?.epoch).toBe(0);
+				failures.push(message);
+			},
+			released: (opRef) => released.push(opRef),
+		});
+		enqueue("failed", "original work");
+		await manager!.notifyInbound(KEY);
+		const first = port.sends[0]!;
+		port.emitTool(first.sessionId);
+		port.emitAssistant(first.sessionId, "partial answer", "partial", first.opRef);
+		port.setFailedTurnEvidence(first.sessionId, reason);
+		port.fail(first.opRef, "failed once");
+		await eventually(() => manager!.state(KEY) === "idle", "failed turn did not settle");
+		expect(port.sends).toHaveLength(1);
+		expect(database!.inboundTurnRow(first.opRef)).toMatchObject({ state: "done", turn_state: "done" });
+		expect(failures).toEqual(["failed once"]);
+		expect(database!.getSessionRecord(KEY)?.epoch).toBe(1);
+		expect(released).toEqual([]);
+		port.fail(first.opRef, "duplicate callback");
+		await manager!.tick(KEY);
+		expect(failures).toHaveLength(1);
+		enqueue("next", "new user message");
+		await manager!.notifyInbound(KEY);
+		expect(port.sends.map((send) => send.text)).toEqual(["original work", "new user message"]);
+		expect(port.sends[1]!.sessionId).toBe("session-e1");
+		expect(port.sends[1]!.opRef).toBe(personaTurnOpRef("instance-test", KEY, 1, "next"));
+	});
+
+for (const restart of [false, true])
+	test(`origin reset cap stops repeated fresh-session failures (restart=${restart})`, async () => {
+		const port = new ScriptedSessionPort({ onBind: (input) => `session-e${input.epoch}` });
+		const failures: string[] = [];
+		await harness(port, { failure: (message) => failures.push(message) });
+		enqueue("first", "first failed message");
+		await manager!.notifyInbound(KEY);
+		const first = port.sends[0]!;
+		port.setFailedTurnEvidence(first.sessionId, "unsupported_input_status");
+		port.fail(first.opRef);
+		await eventually(() => manager!.state(KEY) === "idle", "first reset did not settle");
+		if (restart) {
+			await manager!.stop();
+			database!.close();
+			database = await GatewayDatabase.open(join(home, "gateway.db"));
+			manager = new PersonaSessionManager({
+				database,
+				port,
+				instanceId: "instance-test",
+				repo: join(home, "workspace"),
+				onTurnStart: ({ trigger }) => ({
+					text: trigger.body,
+					onFailure: ({ error }) => {
+						failures.push(error.message);
+					},
+				}),
+			});
+			await manager.recover();
+			expect(port.sends).toHaveLength(1);
+		}
+		enqueue("second", "different failed message");
+		await manager!.notifyInbound(KEY);
+		const second = port.sends[1]!;
+		port.setFailedTurnEvidence(second.sessionId, "unsupported_input_status");
+		port.fail(second.opRef, "second failure");
+		await eventually(() => manager!.state(KEY) === "idle", "capped failure did not settle");
+		expect(database!.getSessionRecord(KEY)?.epoch).toBe(1);
+		expect(port.sends).toHaveLength(2);
+		expect(failures[1]).toBe("second failure");
+		expect(database!.inboundTurnRow(second.opRef)?.turn_state).toBe("done");
+	});
+
+for (const held of [false, true])
+	test(`reset preserves steer attribution and unrelated pending input (held=${held})`, async () => {
+		const port = new ScriptedSessionPort({
+			onBind: (input) => `session-e${input.epoch}`,
+			onSteer: () => {
+				if (held) throw new Error("unknown transport outcome");
+			},
+		});
+		await harness(port);
+		enqueue("failed", "original");
+		await manager!.notifyInbound(KEY);
+		const first = port.sends[0]!;
+		enqueue("steer", "additional accepted or uncertain work");
+		await manager!.notifyInbound(KEY);
+		enqueue("pending", "unrelated next input");
+		port.setFailedTurnEvidence(first.sessionId, "unsupported_input_status");
+		port.fail(first.opRef);
+		await eventually(() => port.sends.length === 2, "pending input was not dispatched after reset");
+		await manager!.tick(KEY);
+		expect(port.sends.map((send) => send.text)).toEqual(["original", "unrelated next input"]);
+		expect(port.sends[1]!.sessionId).toBe("session-e1");
+		expect(database!.inboundTurnRows(first.opRef).find((row) => row.message_id === "steer")).toMatchObject({
+			turn_role: "steer",
+			turn_op_ref: first.opRef,
+			turn_state: held ? "bound" : "done",
+		});
+		if (held) expect(database!.inboundSteersHeld(first.opRef).map((row) => row.message_id)).toEqual(["steer"]);
+	});
+
+for (const evidence of ["missing", "throws"] as const)
+	test(`429 never resets with ${evidence} evidence`, async () => {
+		class MissingEvidencePort extends ScriptedSessionPort {
+			override async failedTurnEvidence(input: Parameters<ScriptedSessionPort["failedTurnEvidence"]>[0]) {
+				if (evidence === "throws") throw new Error("unavailable diagnostics");
+				return super.failedTurnEvidence(input);
+			}
+		}
+		const port = new MissingEvidencePort();
+		const failures: string[] = [];
+		await harness(port, { failure: (message) => failures.push(message) });
+		enqueue("rate-limit", "original");
+		await manager!.notifyInbound(KEY);
+		const first = port.sends[0]!;
+		port.fail(first.opRef, "429 rate limited");
+		await eventually(() => manager!.state(KEY) === "idle", "ordinary failure did not settle");
+		expect(database!.getSessionRecord(KEY)?.epoch).toBe(0);
+		expect(port.sends).toHaveLength(1);
+		expect(failures).toEqual(["429 rate limited"]);
+	});
+
+for (const missing of ["start", "terminal", "nan", "reversed", "future", "op-ref"] as const)
+	test(`reset rejects untrustworthy ${missing} status coordinates`, async () => {
+		class InvalidStatusPort extends ScriptedSessionPort {
+			override async status(input: Parameters<ScriptedSessionPort["status"]>[0]) {
+				const report = await super.status(input);
+				if (report.status.status !== "failed") return report;
+				return {
+					...report,
+					operationRef: missing === "op-ref" ? "other-op" : report.operationRef,
+					status: {
+						...report.status,
+						startedAt: missing === "start" ? undefined : missing === "nan" ? Number.NaN : report.status.startedAt,
+						terminalAt:
+							missing === "terminal"
+								? undefined
+								: missing === "reversed"
+									? 1
+									: missing === "future"
+										? Date.now() + 60_000
+										: report.status.terminalAt,
+					},
+				};
+			}
+		}
+		const port = new InvalidStatusPort();
+		await harness(port);
+		enqueue("invalid-status", "fail closed");
+		await manager!.notifyInbound(KEY);
+		const first = port.sends[0]!;
+		port.setFailedTurnEvidence(first.sessionId, "unsupported_input_status");
+		port.fail(first.opRef);
+		await eventually(() => manager!.state(KEY) === "idle", "failure did not settle");
+		expect(port.failureEvidenceProbes).toEqual([]);
+		expect(database!.getSessionRecord(KEY)?.epoch).toBe(0);
+	});
+
+test("retired exact failure never resets the replacement binding", async () => {
+	const port = new ScriptedSessionPort({ onBind: (input) => `session-e${input.epoch}` });
+	await harness(port);
+	enqueue("old", "old");
+	await manager!.notifyInbound(KEY);
+	const first = port.sends[0]!;
+	await manager!.reset(KEY, JSON.stringify(ORIGIN));
+	enqueue("current", "current");
+	await manager!.notifyInbound(KEY);
+	port.setFailedTurnEvidence(first.sessionId, "unsupported_input_status");
+	port.fail(first.opRef);
+	await manager!.tick(KEY);
+	expect(port.failureEvidenceProbes).toEqual([]);
+	expect(port.sends.map((send) => send.text)).toEqual(["old", "current"]);
+	expect(database!.getSessionRecord(KEY)?.epoch).toBe(1);
+});
+
+for (const exact of [false, true])
+	test(`recovered failed terminal grace never resends its trigger (exact=${exact})`, async () => {
+		const port = new ScriptedSessionPort({ onBind: (input) => `session-e${input.epoch}` });
+		await harness(port);
+		enqueue("recover", "original");
+		await manager!.notifyInbound(KEY);
+		const first = port.sends[0]!;
+		await manager!.stop();
+		port.seedOperation(first.opRef, first.sessionId, "failed");
+		if (exact) port.setFailedTurnEvidence(first.sessionId, "unsupported_input_status");
+		manager = new PersonaSessionManager({
+			database: database!,
+			port,
+			instanceId: "instance-test",
+			repo: join(home, "workspace"),
+		});
+		await manager.recover();
+		await manager.tick(KEY);
+		await eventually(() => manager!.state(KEY) === "idle", "recovered terminal did not settle");
+		expect(port.sends).toHaveLength(1);
+		expect(database!.inboundTurnRow(first.opRef)?.turn_state).toBe("done");
+		expect(database!.getSessionRecord(KEY)?.epoch).toBe(exact ? 1 : 0);
+	});
+
+for (const resetBy of ["healthy", "new"] as const)
+	test(`${resetBy} clears the consecutive origin cap`, async () => {
+		const port = new ScriptedSessionPort({ onBind: (input) => `session-e${input.epoch}` });
+		await harness(port);
+		enqueue("failed-1", "first");
+		await manager!.notifyInbound(KEY);
+		port.setFailedTurnEvidence(port.sends[0]!.sessionId, "unsupported_input_status");
+		port.fail(port.sends[0]!.opRef);
+		await eventually(() => manager!.state(KEY) === "idle", "first reset incomplete");
+		if (resetBy === "healthy") {
+			enqueue("healthy", "healthy");
+			await manager!.notifyInbound(KEY);
+			port.complete(port.sends[1]!.opRef, "healthy answer");
+			await eventually(() => manager!.state(KEY) === "idle", "healthy completion incomplete");
+		} else await manager!.reset(KEY, JSON.stringify(ORIGIN));
+		const before = database!.getSessionRecord(KEY)!.epoch;
+		enqueue("failed-2", "second");
+		await manager!.notifyInbound(KEY);
+		const last = port.sends.at(-1)!;
+		port.setFailedTurnEvidence(last.sessionId, "unsupported_input_status");
+		port.fail(last.opRef);
+		await eventually(() => manager!.state(KEY) === "idle", "second failure incomplete");
+		expect(database!.getSessionRecord(KEY)?.epoch).toBe(before + 1);
+	});
+
+for (const stop of ["cancelled", "refusal"] as const)
+	test(`${stop} terminal does not clear the origin reset cap`, async () => {
+		class StopPort extends ScriptedSessionPort {
+			override async status(input: Parameters<ScriptedSessionPort["status"]>[0]) {
+				const report = await super.status(input);
+				return report.status.status === "terminal_ok"
+					? { ...report, status: { ...report.status, outcome: { reason: stop } } }
+					: report;
+			}
+		}
+		const port = new StopPort({ onBind: (input) => `session-e${input.epoch}` });
+		await harness(port);
+		enqueue("first", "first");
+		await manager!.notifyInbound(KEY);
+		port.setFailedTurnEvidence(port.sends[0]!.sessionId, "unsupported_input_status");
+		port.fail(port.sends[0]!.opRef);
+		await eventually(() => manager!.state(KEY) === "idle", "initial failure incomplete");
+		enqueue("stopped", "stopped");
+		await manager!.notifyInbound(KEY);
+		port.complete(port.sends[1]!.opRef, "stopped output");
+		await eventually(() => manager!.state(KEY) === "idle", "stopped completion incomplete");
+		enqueue("third", "third");
+		await manager!.notifyInbound(KEY);
+		port.setFailedTurnEvidence(port.sends[2]!.sessionId, "unsupported_input_status");
+		port.fail(port.sends[2]!.opRef);
+		await eventually(() => manager!.state(KEY) === "idle", "capped failure incomplete");
+		expect(database!.getSessionRecord(KEY)?.epoch).toBe(1);
+	});
+
+test("broker generation change during evidence lookup fences reset", async () => {
+	let generation = 0;
+	class GenerationPort extends ScriptedSessionPort {
+		override async failedTurnEvidence(input: Parameters<ScriptedSessionPort["failedTurnEvidence"]>[0]) {
+			const evidence = await super.failedTurnEvidence(input);
+			generation++;
+			return evidence;
+		}
+	}
+	const port = new GenerationPort();
+	await harness(port, {}, undefined, { brokerGeneration: () => generation });
+	enqueue("generation", "fenced");
+	await manager!.notifyInbound(KEY);
+	port.setFailedTurnEvidence(port.sends[0]!.sessionId, "unsupported_input_status");
+	port.fail(port.sends[0]!.opRef);
+	await eventually(() => manager!.state(KEY) === "idle", "failure incomplete");
+	expect(database!.getSessionRecord(KEY)?.epoch).toBe(0);
+});
+
+for (const value of ["1", "garbage", "-1", ""])
+	test(`malformed or spent origin cap ${JSON.stringify(value)} denies atomic reset`, async () => {
+		const port = new ScriptedSessionPort();
+		await harness(port);
+		enqueue("cap", "original");
+		await manager!.notifyInbound(KEY);
+		const first = port.sends[0]!;
+		const key = `failed-turn-reset-cap:${createHash("sha256")
+			.update(JSON.stringify([KEY]))
+			.digest("hex")}`;
+		database!.metaSet(key, value);
+		const before = database!.inboundTurnRow(first.opRef);
+		expect(
+			database!.inboundFailedTurnReset({
+				originKey: KEY,
+				epoch: 0,
+				sessionId: first.sessionId,
+				opRef: first.opRef,
+				triggerMessageId: "cap",
+			}),
+		).toBeUndefined();
+		expect(database!.inboundTurnRow(first.opRef)).toEqual(before);
+		expect(database!.getSessionRecord(KEY)?.epoch).toBe(0);
+	});
+
+test("atomic reset rolls completion and markers back when epoch advancement fails", async () => {
 	const port = new ScriptedSessionPort();
-	const failures: string[] = [];
-	await harness(port, { failure: (message) => failures.push(message) });
-	enqueue("m-1", "unknown occupancy");
-	await manager?.notifyInbound(KEY);
-	await eventually(() => port.sends.length === 1, "turn did not start");
-	port.fail(port.sends[0]!.opRef, "Prompt submission failed.");
-	await eventually(() => failures.length === 1, "failure did not reach the lifecycle");
-	expect(port.sends).toHaveLength(1);
-	expect(database?.getSessionRecord(KEY)?.epoch).toBe(0);
+	await harness(port);
+	enqueue("rollback", "original");
+	await manager!.notifyInbound(KEY);
+	const first = port.sends[0]!;
+	const input = {
+		originKey: KEY,
+		epoch: 0,
+		sessionId: first.sessionId,
+		opRef: first.opRef,
+		triggerMessageId: "rollback",
+	};
+	const before = database!.inboundTurnRow(first.opRef);
+	const original = database!.rebindEpoch.bind(database!);
+	database!.rebindEpoch = () => {
+		throw new Error("injected transaction failure");
+	};
+	expect(() => database!.inboundFailedTurnReset(input)).toThrow("injected transaction failure");
+	expect(database!.inboundTurnRow(first.opRef)).toEqual(before);
+	expect(database!.getSessionRecord(KEY)?.epoch).toBe(0);
+	database!.rebindEpoch = original;
+	expect(database!.inboundFailedTurnReset(input)).toBe(1);
+	expect(database!.inboundTurnRow(first.opRef)?.turn_state).toBe("done");
+	expect(database!.inboundFailedTurnReset(input)).toBeUndefined();
 });
 
 test("bounded shutdown reconciliation leaves a nonterminal accepted turn durable", async () => {

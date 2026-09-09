@@ -1,5 +1,5 @@
 import { afterEach, expect, test } from "bun:test";
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { CliRunner } from "@gajaeway/subsession";
@@ -15,6 +15,51 @@ afterEach(async () => {
 	database = undefined;
 	if (home) await rm(home, { recursive: true, force: true });
 	home = "";
+});
+
+test("failed-turn evidence comes from the private session file without exposing provider text", async () => {
+	home = await mkdtemp(join(tmpdir(), "gajaeway-session-failure-"));
+	database = await GatewayDatabase.open(join(home, "gateway.db"));
+	const repo = join(home, "workspace");
+	const agentDir = join(home, "agent");
+	const bucket = join(agentDir, "sessions", "bucket");
+	await mkdir(repo);
+	await mkdir(bucket, { recursive: true });
+	const sessionId = "failed-session";
+	const startedAtMs = Date.now();
+	const rows = [
+		{ type: "session", version: 5, id: sessionId, cwd: repo, timestamp: new Date(startedAtMs - 100).toISOString() },
+		{
+			type: "message",
+			id: "user",
+			parentId: null,
+			timestamp: new Date(startedAtMs).toISOString(),
+			message: { role: "user", timestamp: startedAtMs, content: [{ type: "text", text: "hello" }] },
+		},
+		{
+			type: "message",
+			id: "error",
+			parentId: "user",
+			timestamp: new Date(startedAtMs + 20).toISOString(),
+			message: {
+				role: "assistant",
+				timestamp: startedAtMs + 1,
+				content: [],
+				stopReason: "error",
+				errorStatus: 400,
+				errorMessage: "400 Unknown parameter: 'input[1].status'.\nraw-http-request=/private/request.json",
+			},
+		},
+	];
+	await writeFile(join(bucket, `now_${sessionId}.jsonl`), `${rows.map((row) => JSON.stringify(row)).join("\n")}\n`);
+	const run: CliRunner = async () => {
+		throw new Error("Failure evidence must not start an SDK operation");
+	};
+	const options = { database, cli: run, instanceId: "evidence", tailRunner: new TailRunner({ run, repo }) };
+	const port = new BrokerSessionPort({ ...options, agentDir });
+	const input = { sessionId, repo, startedAtMs, terminalAtMs: startedAtMs + 30 };
+	expect(await port.failedTurnEvidence(input)).toEqual({ reason: "unsupported_input_status" });
+	expect(await new BrokerSessionPort(options).failedTurnEvidence(input)).toBeUndefined();
 });
 
 test("broker SessionPort preserves caller op-ref, model choice, bootstrap prompt, terminal status, and transcript body", async () => {

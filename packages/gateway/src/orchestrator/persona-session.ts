@@ -14,6 +14,7 @@ import {
 } from "@gajaeway/subsession";
 import type { GjcModelSelection, GjcServiceTier } from "../config";
 import type { GatewayDatabase, InboundMessageRow, InboundTurn } from "../store/db";
+import type { FailedTurnEvidence } from "./failed-turn-evidence";
 import { sanitizeDiagnostic } from "./rebind";
 import type { IndexedSession, SessionBinding, SessionPort } from "./session-port";
 import {
@@ -57,13 +58,6 @@ const DISPATCH_FAILURE_RETRY_MAX_MS = 60_000;
 const HOLD_RELEASE_SWEEPS = 2;
 /** A saved session younger than this may still be resumed by a recovery path; leave it. */
 const GC_MIN_IDLE_MS = 60 * 60_000;
-/**
- * Context occupancy at or above which a failed turn is read as context
- * exhaustion. The provider rejects the prompt only past 100%, but a session
- * sitting this close has no room for the next reply either; rotating one turn
- * early costs one bootstrap, rotating late costs an unanswered message.
- */
-const CONTEXT_EXHAUSTED_PERCENT = 95;
 
 export type PersonaActorState = "idle" | "turn-running";
 
@@ -542,7 +536,6 @@ type BoundTurn = PersonaTurnIdentity & {
 	lastAssistantAtMs?: number;
 	/** `dispatched_at` of the turn: stamped at bind, before the send. Absent only for a corrupt row. */
 	dispatchedAtMs?: number;
-	replaceAfterTerminal: boolean;
 };
 
 class OriginActor {
@@ -612,6 +605,7 @@ class OriginActor {
 			nextEpoch = this.#manager.database.bumpEpoch(this.originKey, originRefJson);
 			this.#manager.database.contextSetFloor(this.originKey, floorAt);
 			discarded = this.#manager.database.inboundDiscardBefore(this.originKey, floorAt);
+			this.#manager.database.clearFailedTurnResetCap(this.originKey);
 		});
 		await this.#manager.discardInbound(discarded);
 		if (previous) {
@@ -797,10 +791,8 @@ class OriginActor {
 			case "fresh_turn": {
 				if (turn.state === "bound") this.#manager.database.inboundTurnAccept(turn.opRef);
 				const bound = await this.#adoptRecoveredTurn(turn, sessionId, retired, true);
-				// A successful terminal only needs evidence/delivery reconciliation. A
-				// failed or interrupted terminal releases the trigger once, then
-				// dispatches a deterministic replacement on the same live session.
-				bound.replaceAfterTerminal = status.status.status === "failed" && !retired;
+				// Recovered failures use the same exact evidence and reset-next cap.
+				// The original trigger is completed, never dispatched again.
 				await this.#reconcileBound(bound);
 				return;
 			}
@@ -905,7 +897,6 @@ class OriginActor {
 			statusTerminalHolds: 0,
 			lastAssistantOpAttributed: false,
 			...(dispatchedAtMs === undefined ? {} : { dispatchedAtMs }),
-			replaceAfterTerminal: false,
 		};
 		tail?.setTurnRunning(true);
 		if (accepted && tail) await tail.markAccepted(turn.opRef);
@@ -1108,7 +1099,6 @@ class OriginActor {
 			statusTerminalHolds: 0,
 			lastAssistantOpAttributed: false,
 			...(dispatchedAtMs === undefined ? {} : { dispatchedAtMs }),
-			replaceAfterTerminal: false,
 		};
 		await tail.beginTurn(opRef);
 		this.#current = current;
@@ -1758,46 +1748,6 @@ class OriginActor {
 				`terminal_status_reconciled origin=${this.originKey} epoch=${bound.epoch} opRef=${bound.turn.opRef} tail_evidence=unavailable`,
 			);
 		}
-		if (bound.replaceAfterTerminal) {
-			this.#manager.database.inboundTurnRequeue(bound.turn.opRef);
-			bound.tail?.setTurnRunning(false);
-			await bound.tail?.close();
-			if (this.#current === bound) {
-				this.#current = undefined;
-				this.#state = "idle";
-				this.#manager.log(
-					`recovery_fresh_turn origin=${this.originKey} epoch=${bound.epoch} opRef=${bound.turn.opRef}`,
-				);
-				await this.#dispatchNext();
-			}
-			return;
-		}
-		if (
-			report.status.status === "failed" &&
-			!bound.retired &&
-			this.#current === bound &&
-			(await this.#contextExhausted(bound))
-		) {
-			// Native compaction did not keep the window bounded (live: playground-ko
-			// on three hosts at once, 2026-09-07, `prompt is too long: 1042682
-			// tokens > 1000000`); every later turn on this session fails the same
-			// way, so failing loudly is not a remedy. Rotate: the trigger goes back
-			// to pending and the next dispatch binds a fresh session under a new
-			// epoch, bootstrapped like `/new`. The turn itself is never re-sent on
-			// the exhausted session.
-			this.#manager.database.inboundTurnRequeue(bound.turn.opRef);
-			bound.tail?.setTurnRunning(false);
-			await bound.tail?.close();
-			const nextEpoch = this.#manager.database.rebindEpoch(this.originKey);
-			this.#current = undefined;
-			this.#state = "idle";
-			this.#manager.log(
-				`session_rotated_context_exhausted origin=${this.originKey} epoch=${bound.epoch} nextEpoch=${nextEpoch} opRef=${bound.turn.opRef} session=${bound.sessionId}`,
-			);
-			await this.#notifyReleased(bound);
-			await this.#dispatchNext();
-			return;
-		}
 		try {
 			if ((!bound.retired || bound.answerWanted) && report.status.status === "terminal_ok") {
 				// Normal delivery is deliberately simple: the current turn's tail is
@@ -1855,7 +1805,37 @@ class OriginActor {
 			);
 			throw error;
 		}
-		const completed = this.#manager.database.inboundTurnComplete(bound.turn.opRef);
+		// Persist the failure notice before settling its trigger. If delivery fails,
+		// recovery can retry the same deterministic notice without losing it. Reset
+		// completion and its budget are then committed atomically below.
+		const resetApplied = await this.#resetFailedTurn(bound, report);
+		const completed = resetApplied
+			? 1
+			: this.#manager.database.withTransaction(() => {
+					const changed = this.#manager.database.inboundTurnComplete(bound.turn.opRef);
+					if (
+						changed === 1 &&
+						!bound.retired &&
+						this.#current === bound &&
+						bound.epoch === this.#epoch() &&
+						bound.brokerGeneration === this.#manager.brokerGeneration &&
+						report.operationRef === bound.turn.opRef &&
+						report.status.status === "terminal_ok" &&
+						report.status.outcome?.reason === "end_turn" &&
+						report.status.receiptState === "present" &&
+						report.summaryCompleted &&
+						typeof report.status.startedAt === "number" &&
+						Number.isFinite(report.status.startedAt) &&
+						report.status.startedAt > 0 &&
+						typeof report.status.terminalAt === "number" &&
+						Number.isFinite(report.status.terminalAt) &&
+						report.status.terminalAt >= report.status.startedAt &&
+						report.status.terminalAt <= this.#manager.now() &&
+						this.#manager.database.getSessionRecord(this.originKey)?.sessionId === bound.sessionId
+					)
+						this.#manager.database.clearFailedTurnResetCap(this.originKey);
+					return changed;
+				});
 		if (completed === 0) return;
 		// A steer issued into this turn whose answer tore: try the clientRef one
 		// more time now that the turn is over (the runtime still holds the
@@ -1883,7 +1863,12 @@ class OriginActor {
 			}
 		}
 		bound.tail?.setTurnRunning(false);
-		await bound.tail?.close();
+		try {
+			await bound.tail?.close();
+		} catch (error) {
+			if (!resetApplied) throw error;
+			this.#manager.log(`failed_turn_tail_close_failed origin=${this.originKey} opRef=${bound.turn.opRef}`);
+		}
 		if (bound.retired) {
 			this.#retired.delete(retiredKey(bound));
 			this.#clearRetiredReattach(bound);
@@ -2020,28 +2005,67 @@ class OriginActor {
 		return this.#manager.database.getSessionRecord(this.originKey)?.epoch ?? 0;
 	}
 
-	/**
-	 * Whether a failed turn is explained by a full context window. The runtime's
-	 * failure body is generic (`agent_error: Prompt submission failed.`), so the
-	 * evidence is its own occupancy report. An unanswerable probe is not
-	 * evidence: the failure then surfaces as an ordinary turn failure.
-	 */
-	async #contextExhausted(bound: BoundTurn): Promise<boolean> {
-		const probe = this.#manager.port.contextUsage;
-		if (!probe) return false;
+	/** Exact failure resets only the binding for subsequent input; the failed trigger is completed, never resent. */
+	async #resetFailedTurn(bound: BoundTurn, report: StatusReport): Promise<boolean> {
+		const port = this.#manager.port;
+		const startedAt = report.status.startedAt;
+		const terminalAt = report.status.terminalAt;
+		if (
+			report.status.status !== "failed" ||
+			report.operationRef !== bound.turn.opRef ||
+			bound.retired ||
+			this.#current !== bound ||
+			bound.epoch !== this.#epoch() ||
+			bound.brokerGeneration !== this.#manager.brokerGeneration ||
+			!port.failedTurnEvidence ||
+			typeof startedAt !== "number" ||
+			!Number.isFinite(startedAt) ||
+			startedAt <= 0 ||
+			typeof terminalAt !== "number" ||
+			!Number.isFinite(terminalAt) ||
+			terminalAt < startedAt ||
+			terminalAt > this.#manager.now() ||
+			bound.dispatchedAtMs === undefined ||
+			startedAt + TURN_FLOOR_SKEW_MS < bound.dispatchedAtMs
+		)
+			return false;
+		let evidence: FailedTurnEvidence | undefined;
 		try {
-			const usage = await probe.call(this.#manager.port, { sessionId: bound.sessionId, repo: this.#manager.repo });
-			if (!usage) return false;
-			this.#manager.log(
-				`context_usage origin=${this.originKey} epoch=${bound.epoch} session=${bound.sessionId} percent=${usage.percent.toFixed(1)}`,
-			);
-			return usage.percent >= CONTEXT_EXHAUSTED_PERCENT;
-		} catch (error) {
-			this.#manager.log(
-				`context_usage_unavailable origin=${this.originKey} session=${bound.sessionId} detail=${safeDiagnostic(error)}`,
-			);
+			evidence = await port.failedTurnEvidence({
+				sessionId: bound.sessionId,
+				repo: this.#manager.repo,
+				startedAtMs: startedAt,
+				terminalAtMs: terminalAt,
+			});
+		} catch {
+			this.#manager.log(`failed_turn_evidence_unavailable origin=${this.originKey} opRef=${bound.turn.opRef}`);
 			return false;
 		}
+		if (!evidence || !["unsupported_input_status", "context_exhausted"].includes(evidence.reason)) return false;
+		this.#manager.log(
+			`failed_turn_classified origin=${this.originKey} opRef=${bound.turn.opRef} reason=${evidence.reason}`,
+		);
+		if (
+			this.#current !== bound ||
+			bound.retired ||
+			bound.epoch !== this.#epoch() ||
+			bound.brokerGeneration !== this.#manager.brokerGeneration ||
+			this.#stopped ||
+			this.#manager.stopped
+		)
+			return false;
+		const nextEpoch = this.#manager.database.inboundFailedTurnReset({
+			originKey: this.originKey,
+			epoch: bound.epoch,
+			sessionId: bound.sessionId,
+			opRef: bound.turn.opRef,
+			triggerMessageId: bound.turn.triggerMessageId,
+		});
+		if (nextEpoch === undefined) return false;
+		this.#manager.log(
+			`session_reset_after_failed_turn origin=${this.originKey} epoch=${bound.epoch} nextEpoch=${nextEpoch} opRef=${bound.turn.opRef} reason=${evidence.reason}`,
+		);
+		return true;
 	}
 }
 

@@ -387,7 +387,7 @@ test("a tail-less reconcile never reposts a previous turn's answer as the curren
 	}
 });
 
-test("red-team G3-B1: a same-session fresh-turn retry gets its own dispatch floor and cannot inherit the failed attempt's row", async () => {
+test("red-team G3-B1: new input after a recovered failure cannot inherit the failed attempt's row", async () => {
 	const port = new ScriptedSessionPort();
 	port.omitStartedAt = true;
 	port.fetchLastAssistant = async ({ sessionId }) => {
@@ -439,31 +439,42 @@ test("red-team G3-B1: a same-session fresh-turn retry gets its own dispatch floo
 		port.emitAssistant(first.sessionId, "실패한 시도의 잔여 텍스트", null, first.opRef);
 		port.seedOperation(first.opRef, first.sessionId, "failed", "");
 		await Bun.sleep(20);
-		// Recovery adopts the failed batch and releases it for one same-session
-		// fresh turn (replaceAfterTerminal).
+		// Recovery settles the failed turn without re-executing its work.
 		recovered = make();
 		await recovered.recover();
 		await Bun.sleep(400);
 		await recovered.reconcile("discord/channel/chan-1");
 		await eventually(
-			() => logs.some((line) => line.startsWith("recovery_fresh_turn")),
-			"failed batch was not released",
+			() => database!.inboundNonterminalTurns("discord/channel/chan-1").length === 0,
+			"failed turn did not settle",
 		);
-		await eventually(() => port.sends.length === 2, "fresh-turn retry was not sent");
+		expect(port.sends).toHaveLength(1);
+		expect(terminals).toEqual([]);
+		expect(
+			database.inboundEnqueue({
+				messageId: "m-q2",
+				originKey: "discord/channel/chan-1",
+				originRefJson: JSON.stringify({ platform: "discord", kind: "channel", conversationId: "chan-1" }),
+				body: "new input after failure",
+				receivedAt: new Date().toISOString(),
+			}),
+		).toBe(true);
+		await recovered.notifyInbound("discord/channel/chan-1");
+		await eventually(() => port.sends.length === 2, "new input was not sent");
 		const second = port.sends[1]!;
 		expect(second.opRef).not.toBe(first.opRef);
 		const secondBatch = database.inboundNonterminalTurns("discord/channel/chan-1")[0]!;
 		const secondFloor = database.inboundTurnDispatchedAt(secondBatch.opRef);
 		expect(secondFloor).toBeDefined();
 		expect(Date.parse(secondFloor!)).toBeGreaterThan(Date.parse(firstFloor!));
-		// The retry's op ends with NO assistant row of its own; the stale row from
-		// the failed attempt predates the retry's own floor and is never reposted.
+		// New input has its own dispatch floor: the failed attempt's stale row
+		// must not become this turn's answer.
 		port.seedOperation(second.opRef, second.sessionId, "terminal_ok", "");
 		await recovered.reconcile("discord/channel/chan-1");
 		await Bun.sleep(400);
 		await recovered.reconcile("discord/channel/chan-1");
-		await eventually(() => terminals.length >= 1, "retry never completed");
-		expect(terminals).toEqual([{ trigger: "m-q1", text: "" }]);
+		await eventually(() => terminals.length >= 1, "new input never completed");
+		expect(terminals).toEqual([{ trigger: "m-q2", text: "" }]);
 	} finally {
 		await recovered?.stop();
 		await manager.stop();

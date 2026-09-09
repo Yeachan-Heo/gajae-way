@@ -5,6 +5,7 @@ import { join } from "node:path";
 import { MAX_STALLED_CONTINUATIONS, parseLaneJobRecord } from "@gajaeway/subsession";
 import type { GatewayConfig } from "../src/config";
 import { memoryRoot } from "../src/memory/doctrine";
+import { deterministicTerminalDeliveryId } from "../src/orchestrator/tail-runner";
 import { type GatewayServer, startUnixServer } from "../src/server/server";
 import { GatewayDatabase } from "../src/store/db";
 import { ScriptedSessionPort, sessionPortFromResponder, sessionPortFromScript } from "./session-port.fake";
@@ -204,6 +205,7 @@ test("a failed platform turn still delivers a visible ledgered failure notice", 
 		params: {
 			origin: { platform: "discord", kind: "dm", conversationId: "c1", peerId: "p1" },
 			text: "hello",
+			messageId: "failed-message",
 			engagement: { mentioned: false, group: false, authorId: "p1" },
 		},
 	});
@@ -211,7 +213,7 @@ test("a failed platform turn still delivers a visible ledgered failure notice", 
 	expect(client.frames[1].result.engaged).toBe(true);
 	const notice = client.frames.find((frame) => frame.type === "event" && frame.event === "chat.message");
 	expect(notice.payload.text).toStartWith("[turn failed]");
-	expect(notice.payload.deliveryId).toBeString();
+	expect(notice.payload.deliveryId).toBe(deterministicTerminalDeliveryId("discord/dm/c1/peer=p1", "failed-message", 0));
 	expect(client.frames.find((frame) => frame.type === "error" && frame.id === "dm")).toBeUndefined();
 	client.close();
 });

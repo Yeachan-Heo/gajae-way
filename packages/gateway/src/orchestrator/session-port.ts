@@ -23,6 +23,7 @@ import {
 } from "@gajaeway/subsession";
 import type { GjcModelSelection, GjcServiceTier } from "../config";
 import type { GatewayDatabase } from "../store/db";
+import { type FailedTurnEvidence, type FailedTurnEvidenceInput, readFailedTurnEvidence } from "./failed-turn-evidence";
 import { sanitizeDiagnostic } from "./rebind";
 import type { TailAttachInput, TailHandle, TailRunner } from "./tail-runner";
 
@@ -40,11 +41,8 @@ export interface SessionPort {
 	}): Promise<{ readonly live: boolean | undefined; readonly disowned: boolean }>;
 	/** True when the session's prompt queue has no pending messages (queue.messages.list empty). */
 	queueEmpty?(input: { sessionId: string; repo: string }): Promise<boolean>;
-	/**
-	 * Context-window occupancy as the runtime reports it (`context.get`), in
-	 * percent of the provider window. Undefined when the runtime cannot say.
-	 */
-	contextUsage?(input: { sessionId: string; repo: string }): Promise<ContextUsage | undefined>;
+	/** Recognized current-session provider failure, never authorization to replay an operation. */
+	failedTurnEvidence?(input: FailedTurnEvidenceInput): Promise<FailedTurnEvidence | undefined>;
 	/** Restores a saved, non-deleted session through `session.resume`; it never creates a replacement. */
 	resume(input: { sessionId: string; repo: string; originKey: string; epoch: number }): Promise<SessionBinding>;
 	send(input: SessionSendInput): Promise<SendReceipt>;
@@ -119,10 +117,6 @@ export type SessionDeleteOutcome =
 	| { readonly deleted: true }
 	| { readonly deleted: false; readonly code: string; readonly message: string };
 export type SessionCompactionStatus = "succeeded" | "failed" | "skipped" | "unavailable";
-export interface ContextUsage {
-	readonly percent: number;
-	readonly contextWindow?: number;
-}
 
 export interface SessionCompactionInput {
 	readonly sessionId: string;
@@ -287,6 +281,10 @@ export class BrokerSessionPort implements SessionPort {
 		this.#tailRunner = options.tailRunner;
 		this.#now = options.now ?? (() => Date.now());
 		this.#sleep = options.sleep ?? ((ms: number) => Bun.sleep(ms));
+	}
+
+	failedTurnEvidence(input: FailedTurnEvidenceInput): Promise<FailedTurnEvidence | undefined> {
+		return readFailedTurnEvidence(this.#agentDir, input);
 	}
 
 	async #safe<T>(work: () => Promise<T>): Promise<T> {
@@ -727,36 +725,6 @@ export class BrokerSessionPort implements SessionPort {
 		);
 		const page = (JSON.parse(result.stdout) as { ok?: unknown; page?: { items?: unknown[]; complete?: unknown } }).page;
 		return page !== undefined && Array.isArray(page.items) && page.items.length === 0 && page.complete === true;
-	}
-
-	async contextUsage(input: { sessionId: string; repo: string }): Promise<ContextUsage | undefined> {
-		const result = await this.#cli(
-			[
-				"sdk",
-				"session",
-				"raw",
-				"query",
-				input.sessionId,
-				"--query",
-				"context.get",
-				"--repo",
-				input.repo,
-				"--json-input",
-				"{}",
-			],
-			{ timeoutMs: 10_000 },
-		);
-		const page = (
-			JSON.parse(result.stdout) as {
-				page?: { items?: Array<{ usage?: { percent?: unknown; contextWindow?: unknown } }> };
-			}
-		).page;
-		const usage = page?.items?.[0]?.usage;
-		if (!usage || typeof usage.percent !== "number" || !Number.isFinite(usage.percent)) return undefined;
-		return {
-			percent: usage.percent,
-			...(typeof usage.contextWindow === "number" ? { contextWindow: usage.contextWindow } : {}),
-		};
 	}
 
 	/**
