@@ -94,6 +94,8 @@ liveTest(
 		const home = await mkdtemp(join(tmpdir(), "gajaeway-persistent-e2e-"));
 		const repo = join(home, "workspace");
 		await mkdir(repo, { mode: 0o700 });
+		const initialized = Bun.spawn(["git", "init", "--quiet", repo], { stdout: "ignore", stderr: "pipe" });
+		expect(await initialized.exited).toBe(0);
 		const database = await GatewayDatabase.open(join(home, "gateway.db"));
 		const broker = new GlobalGjcClient({ executable, agentDir, cwd: repo, healthIntervalMs: 60_000 });
 		const canonicalAgentDir = await realpath(agentDir);
