@@ -320,7 +320,7 @@ liveTest(
 				name: "live-smoke",
 				cwd: repo,
 				model,
-				text: "Do not use tools. Write a detailed 1,800-word explanation of persistent-session recovery, with multiple sections. Do not finish early. Include WORK_LANE_LIVE_OK at the beginning.",
+				text: "Verification only: use the bash tool to run sleep 15 exactly once, without reading or modifying any files or running other commands. After that wait, reply briefly with WORK_LANE_LIVE_OK and honor any steering message received during the wait.",
 			});
 			if (!started.started) throw new Error("fresh work lane unexpectedly held");
 			expect(database.workAttemptGet(started.opRef)?.sendPhase).toBe("accepted");
