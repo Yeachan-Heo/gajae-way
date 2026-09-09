@@ -191,7 +191,7 @@ liveTest(
 		};
 		const beforeConfig = await configSnapshot();
 		const independent = async (args: string[]) => {
-			const child = Bun.spawn([executable, "sdk", "session", "--agent-dir", agentDir, ...args], {
+			const child = Bun.spawn([executable, "sdk", "session", ...args, "--agent-dir", agentDir], {
 				cwd: repo,
 				env: {
 					...process.env,
@@ -349,6 +349,8 @@ liveTest(
 				activeSessionId,
 				"--op",
 				"turn.steer",
+				"--repo",
+				repo,
 				"--json-input",
 				JSON.stringify({
 					text: `Replace the remaining answer with exactly WORK_LANE_LIVE_OK ${steerMarker}.`,
