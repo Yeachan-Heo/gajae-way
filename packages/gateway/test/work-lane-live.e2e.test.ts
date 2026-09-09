@@ -1,10 +1,11 @@
 import { expect, test } from "bun:test";
+import { AsyncLocalStorage } from "node:async_hooks";
 import { createHash } from "node:crypto";
 import { mkdir, mkdtemp, readFile, realpath, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { isAbsolute, join } from "node:path";
-import type { CliRunner } from "@gajaeway/subsession";
-import { GlobalGjcClient, readBrokerDiscovery } from "../src/orchestrator/broker";
+import { type CliRunner, GjcCliError } from "@gajaeway/subsession";
+import { GjcCliUnavailableError, GlobalGjcClient, readBrokerDiscovery } from "../src/orchestrator/broker";
 import { LaneGovernor } from "../src/orchestrator/lane-governor";
 import { BrokerSessionPort, isSteerAccepted } from "../src/orchestrator/session-port";
 import { TailRunner } from "../src/orchestrator/tail-runner";
@@ -14,6 +15,53 @@ import { GatewayDatabase } from "../src/store/db";
 const liveTest = process.env.GAJAEWAY_E2E_WORK === "1" ? test : test.skip;
 const diagnosticCode = /^[a-z][a-z_]{1,63}$/;
 
+export async function observeStatus<T>(input: {
+	query: () => Promise<T>;
+	deadline: number;
+	method: string;
+	onRetry: (diagnostic: { method: string; retryCount: number; lastCode: string }) => void;
+}): Promise<T> {
+	let retryCount = 0;
+	let lastCode = "none";
+	const expired = () =>
+		new Error(`status observation deadline: ${input.method}; retries=${retryCount}; lastCode=${lastCode}`);
+	while (Date.now() < input.deadline) {
+		let timer: ReturnType<typeof setTimeout> | undefined;
+		try {
+			const result = await Promise.race([
+				input.query(),
+				new Promise<never>((_, reject) => {
+					timer = setTimeout(() => reject(expired()), Math.max(1, input.deadline - Date.now()));
+				}),
+			]);
+			if (Date.now() >= input.deadline) throw expired();
+			return result;
+		} catch (error) {
+			const code =
+				error instanceof GjcCliError && error.details && typeof error.details === "object"
+					? (error.details as { code?: unknown }).code
+					: undefined;
+			if (code === "session_unavailable" || code === "endpoint_stale") lastCode = code;
+			else if (
+				error instanceof GjcCliUnavailableError &&
+				/^gjc sdk request failed: broker_unavailable \((?:command queue timed out|request timed out after [0-9]+ms)\)$/.test(
+					error.message,
+				)
+			)
+				lastCode = "transport_timeout";
+			else throw error;
+			input.onRetry({ method: input.method, retryCount: ++retryCount, lastCode });
+		} finally {
+			clearTimeout(timer);
+		}
+		await Bun.sleep(Math.min(250, Math.max(0, input.deadline - Date.now())));
+	}
+	throw expired();
+}
+
+// Scope retries to canary reads, before manager.status erases typed SDK errors.
+// The manager's concurrent worker observer keeps its original polling behavior.
+const statusObservation = new AsyncLocalStorage<{ deadline: number; method: string }>();
 // Select only protocol metadata; never serialize errors, argv, stderr, provider
 // prose, textSummary, content, environment, discovery tokens or model config.
 function diagnostic(value: unknown, depth = 0): Record<string, unknown> {
@@ -199,14 +247,27 @@ liveTest(
 		let manager: WorkLaneManager | undefined;
 		let port: BrokerSessionPort | undefined;
 		const cli: CliRunner = async (args, options) => {
-			const result = await broker.cli(args, options);
+			const observation = statusObservation.getStore();
+			const result = await broker.cli(
+				args,
+				observation
+					? {
+							...options,
+							timeoutMs: Math.max(1, Math.min(options?.timeoutMs ?? 30_000, observation.deadline - Date.now())),
+						}
+					: options,
+			);
 			try {
 				const summary = diagnostic(JSON.parse(result.stdout));
 				// A fixed-size ring survives generic WorkLaneManager error mapping.
-				evidence.push({ exitCode: result.exitCode, ...summary });
+				evidence.push({ method: observation?.method ?? "sdk.session", exitCode: result.exitCode, ...summary });
 				if (evidence.length > 16) evidence.shift();
 			} catch {
-				evidence.push({ exitCode: result.exitCode, malformedEnvelope: true });
+				evidence.push({
+					method: observation?.method ?? "sdk.session",
+					exitCode: result.exitCode,
+					malformedEnvelope: true,
+				});
 				if (evidence.length > 16) evidence.shift();
 			}
 			return result;
@@ -229,6 +290,23 @@ liveTest(
 				authority: brokerAuthority,
 				tailRunner: new TailRunner({ run: cli, stream: (id) => broker.openStream(id), repo, pollIntervalMs: 250 }),
 			});
+			// Retry the same read-only tuple; never bind, resume or submit another turn.
+			const rawStatus = port.status.bind(port);
+			port.status = async (input) => {
+				const observation = statusObservation.getStore();
+				if (!observation) return rawStatus(input);
+				const report = await observeStatus({
+					query: () => rawStatus(input),
+					...observation,
+					onRetry: (retry) => {
+						evidence.push(retry);
+						if (evidence.length > 16) evidence.shift();
+					},
+				});
+				expect(report.operationRef).toBe(input.opRef);
+				if (report.status.clientRef !== undefined) expect(report.status.clientRef).toBe(input.opRef);
+				return report;
+			};
 			manager = new WorkLaneManager({
 				database,
 				port,
@@ -252,13 +330,15 @@ liveTest(
 			const activeDeadline = Date.now() + 15_000;
 			let active = false;
 			while (Date.now() < activeDeadline) {
-				const status = await port.status({ sessionId: activeSessionId, repo, opRef: started.opRef });
+				const status = await statusObservation.run({ deadline: activeDeadline, method: "port.status.active" }, () =>
+					port!.status({ sessionId: activeSessionId, repo, opRef: started.opRef }),
+				);
 				if (status.status.status === "in_flight") {
 					active = true;
 					break;
 				}
 				if (["terminal_ok", "failed", "rejected"].includes(status.status.status)) break;
-				await Bun.sleep(250);
+				await Bun.sleep(Math.min(250, Math.max(0, activeDeadline - Date.now())));
 			}
 			expect(active).toBe(true);
 			const steerMarker = `WORK_SHARED_STEER_${crypto.randomUUID().replaceAll("-", "")}`;
@@ -281,13 +361,18 @@ liveTest(
 			stage = "manager-status-and-settlement";
 			const deadline = Date.now() + 120_000;
 			while (Date.now() < deadline) {
-				const status = await manager.status({ name: "live-smoke" });
+				const status = await statusObservation.run({ deadline, method: "manager.status -> port.status" }, () =>
+					manager!.status({ name: "live-smoke" }),
+				);
+				expect(status.sessionId).toBe(activeSessionId);
+				expect(status.attempt?.opRef).toBe(started.opRef);
+				if (status.op?.status === "failed") throw new Error("original operation failed");
 				if (database.workAttemptGet(started.opRef)?.settledAt) {
 					expect(status.op?.status).toBe("terminal_ok");
 					expect(status.attempt?.endState).toBe("completed");
 					break;
 				}
-				await Bun.sleep(500);
+				await Bun.sleep(Math.min(500, Math.max(0, deadline - Date.now())));
 			}
 			const runtime = database.workAttemptGet(started.opRef)!;
 			expect(runtime.settledAt).not.toBeNull();
@@ -300,7 +385,9 @@ liveTest(
 			expect(runtime.decision).toBe("no_target");
 			stage = "same-operation-steer-output";
 			expect(runtime.sessionId).toBe(activeSessionId);
-			const terminal = await port.status({ sessionId: activeSessionId, repo, opRef: started.opRef });
+			const terminal = await statusObservation.run({ deadline, method: "port.status.terminal" }, () =>
+				port!.status({ sessionId: activeSessionId, repo, opRef: started.opRef }),
+			);
 			const output = await port.fetchWorkerOutput({
 				sessionId: activeSessionId,
 				repo,
