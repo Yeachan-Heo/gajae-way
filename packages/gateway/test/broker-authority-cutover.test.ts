@@ -1,10 +1,10 @@
 import { Database } from "bun:sqlite";
 import { afterEach, describe, expect, test } from "bun:test";
-import { lstat, mkdir, mkdtemp, readdir, readFile, realpath, rm, writeFile } from "node:fs/promises";
+import { copyFile, lstat, mkdir, mkdtemp, readdir, readFile, realpath, rm, writeFile } from "node:fs/promises";
 import { createServer } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { main } from "../../../scripts/gjc-authority-cutover";
+import { inspectSnapshot, main } from "../../../scripts/gjc-authority-cutover";
 import { GatewayDatabase } from "../src/store/db";
 import { acquireGatewayHome } from "../src/takeover";
 
@@ -183,6 +183,64 @@ describe("offline authority command with kernel-exclusive gateway ownership", ()
 			);
 		} finally {
 			database.close();
+		}
+	});
+
+	test("inspection creates no source sidecars when a WAL-mode database has none", async () => {
+		const f = await fixture();
+		// A standalone copy of the orderly closed database has its WAL-mode header
+		// but no adjacent sidecars. Inspection must leave this exact layout intact.
+		const standalone = join(f.home, "standalone.db");
+		await copyFile(f.path, standalone);
+		await writeFile(join(f.home, "config.json"), JSON.stringify({ schemaVersion: 1, dbPath: standalone }));
+		const bytes = await readFile(standalone);
+		const before = await readdir(f.home);
+		expect((await main(["inspect", ...f.args])).census.rowCounts.sessions).toBe(1);
+		expect(await readdir(f.home)).toEqual(before);
+		expect(await readFile(standalone)).toEqual(bytes);
+		for (const suffix of ["-wal", "-shm"]) expect(await Bun.file(`${standalone}${suffix}`).exists()).toBe(false);
+	});
+
+	test("inspection includes committed live WAL data without changing source sidecars", async () => {
+		const f = await fixture();
+		const writer = new Database(f.path);
+		try {
+			writer.exec(
+				"PRAGMA wal_autocheckpoint = 0; INSERT INTO sessions (origin_key, gjc_session_id, created_at) VALUES ('wal-only', 'wal-session', '2026-01-01')",
+			);
+			expect((await lstat(`${f.path}-wal`)).size).toBeGreaterThan(0);
+			const before = await Promise.all(["", "-wal", "-shm"].map((suffix) => readFile(`${f.path}${suffix}`)));
+			const report = await main(["inspect", ...f.args]);
+			expect(report.census.rowCounts.sessions).toBe(2);
+			const after = await Promise.all(["", "-wal", "-shm"].map((suffix) => readFile(`${f.path}${suffix}`)));
+			expect(after).toEqual(before);
+		} finally {
+			writer.close();
+		}
+	});
+
+	test("inspection rejects a source changed during snapshot copying and cleans its private copy", async () => {
+		const f = await fixture();
+		const writer = new Database(f.path);
+		let snapshotDirectory: string | undefined;
+		try {
+			writer.exec(
+				"PRAGMA wal_autocheckpoint = 0; INSERT INTO sessions (origin_key, gjc_session_id, created_at) VALUES ('wal-first', 'first', '2026-01-01')",
+			);
+			await expect(
+				inspectSnapshot(f.path, async (source, destination, flags) => {
+					await copyFile(source, destination, flags);
+					snapshotDirectory = String(destination).slice(0, String(destination).lastIndexOf("/"));
+					if (String(source) === f.path)
+						writer.exec(
+							"INSERT INTO sessions (origin_key, gjc_session_id, created_at) VALUES ('during-copy', 'changed', '2026-01-01')",
+						);
+				}),
+			).rejects.toThrow("inspection_source_changed");
+			expect(snapshotDirectory).toBeDefined();
+			await expect(lstat(snapshotDirectory!)).rejects.toMatchObject({ code: "ENOENT" });
+		} finally {
+			writer.close();
 		}
 	});
 

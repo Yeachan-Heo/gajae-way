@@ -1,7 +1,8 @@
 import { Database } from "bun:sqlite";
 import { constants } from "node:fs";
-import { link, lstat, mkdtemp, open, readFile, realpath, rmdir, stat, unlink } from "node:fs/promises";
+import { copyFile, link, lstat, mkdtemp, open, readFile, realpath, rm, rmdir, stat, unlink } from "node:fs/promises";
 import { createConnection } from "node:net";
+import { tmpdir } from "node:os";
 import { dirname, isAbsolute, join, normalize, resolve } from "node:path";
 import { loadConfig } from "../packages/gateway/src/config";
 import { type BrokerAuthority, GatewayDatabase } from "../packages/gateway/src/store/db";
@@ -129,10 +130,54 @@ async function checkSocket(path: string): Promise<void> {
 	});
 }
 
+/** SQLite may create sidecars even for a readonly connection. Never open the source. */
+export async function inspectSnapshot(path: string, copy: typeof copyFile = copyFile) {
+	const suffixes = ["", "-wal", "-shm", "-journal"] as const;
+	const witness = async () =>
+		Promise.all(
+			suffixes.map(async (suffix) => {
+				try {
+					const info = await lstat(`${path}${suffix}`, { bigint: true });
+					if (!info.isFile()) return refuse("inspection_source_indeterminate");
+					return [info.dev, info.ino, info.size, info.mtimeNs, info.ctimeNs].map(String).join(":");
+				} catch (error) {
+					if (suffix && (error as NodeJS.ErrnoException).code === "ENOENT") return null;
+					throw error;
+				}
+			}),
+		);
+	const before = await witness();
+	const directory = await mkdtemp(join(tmpdir(), "gjc-inspection-"));
+	const destination = join(directory, "snapshot.db");
+	let result: ReturnType<typeof inspect> | undefined;
+	const errors: unknown[] = [];
+	try {
+		for (const [index, suffix] of suffixes.entries()) {
+			if (before[index] !== null) await copy(`${path}${suffix}`, `${destination}${suffix}`, constants.COPYFILE_EXCL);
+		}
+		const after = await witness();
+		if (before.some((value, index) => value !== after[index])) return refuse("inspection_source_changed");
+		result = inspect(destination);
+	} catch (error) {
+		errors.push(error);
+	}
+	try {
+		await rm(directory, { recursive: true });
+	} catch (error) {
+		errors.push(error);
+	}
+	if (errors.length === 1) throw errors[0];
+	if (errors.length > 1)
+		throw new AggregateError(errors, "Inspection and snapshot cleanup failed", { cause: errors[0] });
+	if (!result) return refuse("inspection_snapshot_failed");
+	return result;
+}
+
 /** Read-only, point-in-time table census; deliberately not a claim of replay quiescence. */
 function inspect(path: string) {
-	const database = new Database(path, { readonly: true, create: false });
+	const database = new Database(path, { readwrite: true, create: false });
 	try {
+		database.exec("PRAGMA query_only = ON");
 		database.exec("BEGIN");
 		const tables = database
 			.query<{ name: string }, []>(
@@ -187,7 +232,7 @@ export async function main(args: readonly string[]) {
 	const databasePath = await realpath(resolve(home, config.dbPath));
 	if (options.mode === "inspect") {
 		await assertGatewayStopped(home, resolve(home, config.socketPath));
-		const before = inspect(databasePath);
+		const before = await inspectSnapshot(databasePath);
 		return {
 			mode: "inspect" as const,
 			oldAuthority: before.authority,
@@ -206,7 +251,7 @@ export async function main(args: readonly string[]) {
 			return refuse("canonical_backup_required");
 		if ([databasePath, `${databasePath}-wal`, `${databasePath}-shm`, `${databasePath}-journal`].includes(backup))
 			return refuse("backup_conflicts_with_database");
-		const before = inspect(databasePath);
+		const before = await inspectSnapshot(databasePath);
 		if (
 			JSON.stringify(before.authority) !== JSON.stringify(options.expected) ||
 			JSON.stringify(before.authority) === JSON.stringify(targetAuthority)
