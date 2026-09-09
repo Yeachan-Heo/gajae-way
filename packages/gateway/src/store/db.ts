@@ -370,6 +370,12 @@ function freshTurnMetaKey(originKey: string, epoch: number, triggerMessageId: st
 	return `fresh_turn_attempt:${originKey}:${epoch}:${triggerMessageId}`;
 }
 
+function failedTurnResetCapKey(originKey: string): string {
+	return `failed-turn-reset-cap:${createHash("sha256")
+		.update(JSON.stringify([originKey]))
+		.digest("hex")}`;
+}
+
 export interface ConversationContextRow {
 	readonly message_id: string;
 	readonly author_id: string | null;
@@ -1535,6 +1541,56 @@ export class GatewayDatabase {
 		});
 	}
 
+	/** Complete only this failed trigger and reset the next binding, atomically. Never replay input. */
+	inboundFailedTurnReset(input: {
+		originKey: string;
+		epoch: number;
+		sessionId: string;
+		opRef: string;
+		triggerMessageId: string;
+	}): number | undefined {
+		return this.withTransaction(() => {
+			const trigger = this.inboundTurnRow(input.opRef);
+			const session = this.getSessionRecord(input.originKey);
+			const dedupeKey = `failed-turn-reset:${createHash("sha256")
+				.update(JSON.stringify([input.originKey, input.triggerMessageId]))
+				.digest("hex")}`;
+			const capKey = failedTurnResetCapKey(input.originKey);
+			const cap = this.metaGet(capKey);
+			if (
+				!trigger ||
+				trigger.origin_key !== input.originKey ||
+				trigger.message_id !== input.triggerMessageId ||
+				trigger.turn_epoch !== input.epoch ||
+				trigger.bound_session_id !== input.sessionId ||
+				trigger.state !== "pending" ||
+				trigger.turn_state !== "accepted" ||
+				session?.epoch !== input.epoch ||
+				session.sessionId !== input.sessionId ||
+				this.metaGet(dedupeKey) !== undefined ||
+				(cap !== undefined && cap !== "0")
+			)
+				return undefined;
+			if (this.inboundTurnComplete(input.opRef) !== 1) throw new Error("failed turn completion lost its fence");
+			this.metaSet(dedupeKey, "1");
+			this.metaSet(capKey, "1");
+			// Do not present the already-failed trigger as new unread work when the
+			// next message bootstraps its session. Keep unrelated pending context intact.
+			this.#database
+				.query("UPDATE conversation_context SET consumed_at = ? WHERE origin_key = ? AND message_id = ?")
+				.run(new Date().toISOString(), input.originKey, input.triggerMessageId);
+			// Steers remain attributed to their original op, including uncertain
+			// held rows. Unrelated pending messages and context floors are untouched.
+			return this.rebindEpoch(input.originKey);
+		});
+	}
+
+	/** Caller owns the healthy-completion or explicit-/new transaction. */
+	clearFailedTurnResetCap(originKey: string): void {
+		this.requireTransaction();
+		this.metaSet(failedTurnResetCapKey(originKey), "0");
+	}
+
 	freshTurnAttempt(originKey: string, epoch: number, triggerMessageId: string): number {
 		const value = Number.parseInt(this.metaGet(freshTurnMetaKey(originKey, epoch, triggerMessageId)) ?? "0", 10);
 		return Number.isSafeInteger(value) && value >= 0 ? value : 0;
@@ -1678,6 +1734,16 @@ export class GatewayDatabase {
 		return this.#database
 			.query<{ origin_key: string }, []>(
 				`SELECT DISTINCT origin_key FROM inbound_messages WHERE turn_role = 'trigger' AND turn_state IN ('bound', 'accepted') AND ${REPLAYABLE_INBOUND} ORDER BY origin_key`,
+			)
+			.all()
+			.map((row) => row.origin_key);
+	}
+
+	/** Origins with held steers whose terminal trigger no longer reconstructs an actor. */
+	inboundHeldSteerOrigins(): readonly string[] {
+		return this.#database
+			.query<{ origin_key: string }, []>(
+				"SELECT DISTINCT origin_key FROM inbound_messages WHERE turn_role = 'steer' AND state = 'pending' AND turn_state = 'bound' AND turn_op_ref IN (SELECT turn_op_ref FROM inbound_messages WHERE turn_role = 'trigger' AND turn_state = 'done') ORDER BY origin_key",
 			)
 			.all()
 			.map((row) => row.origin_key);

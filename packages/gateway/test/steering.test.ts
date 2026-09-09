@@ -343,9 +343,92 @@ test("a held steer survives the old turn's terminal and a restart: it is never d
 	await manager.notifyInbound(ORIGIN_KEY);
 	await eventually(() => port.sends.length >= 2, "held steer was not released");
 	expect(port.sends[1]!.text).toBe("second");
+	expect(port.sends[1]!.sessionId).toBe(port.sends[0]!.sessionId);
+	expect(port.binds).toHaveLength(1);
 });
 
-test("a torn steer whose replay returns a definitive refusal rebinds once and sends the message once", async () => {
+for (const outcome of ["accepted", "refused"] as const) {
+	test(`recovery alone resolves a terminal turn's only held steer as ${outcome} on the original clientRef`, async () => {
+		home = await mkdtemp(join(tmpdir(), "gajaeway-held-only-recovery-"));
+		const dbPath = join(home, "gateway.db");
+		database = await GatewayDatabase.open(dbPath);
+		class HeldPort extends ScriptedSessionPort {
+			decidable = false;
+			readonly attempts: Parameters<ScriptedSessionPort["steer"]>[0][] = [];
+			async steer(input: Parameters<ScriptedSessionPort["steer"]>[0]): Promise<void> {
+				this.attempts.push(input);
+				if (!this.decidable) throw new GjcCliError("gjc sdk turn.steer exited 1", 1, "socket reset");
+				if (outcome === "refused") throw steerRefused("no running turn");
+			}
+		}
+		const port = new HeldPort({ onBind: (input) => `session-${input.originKey}-${input.epoch}` });
+		const bind = port.bind.bind(port);
+		const resume = port.resume.bind(port);
+		attachTestBrokerOwnership(database, port, join(home, "agent"));
+		const make = () =>
+			new PersonaSessionManager({
+				database: database!,
+				port,
+				instanceId: "held-only-recovery-test",
+				repo: join(home, "workspace"),
+				onTurnStart: ({ trigger }) => ({ text: trigger.body }),
+				log: () => {},
+			});
+		manager = make();
+		enqueue("trigger", "first");
+		await manager.notifyInbound(ORIGIN_KEY);
+		await eventually(() => port.sends.length === 1, "initial send missing");
+		const running = port.sends[0]!;
+		enqueue("held-only", "second");
+		await manager.notifyInbound(ORIGIN_KEY);
+		expect(database.inboundSteersHeld(running.opRef).map((row) => row.message_id)).toEqual(["held-only"]);
+		port.complete(running.opRef, "first answer");
+		await eventually(() => database?.inboundTurnRow(running.opRef)?.turn_state === "done", "trigger did not settle");
+		await manager.stop();
+		const epoch = database.getSessionRecord(ORIGIN_KEY)?.epoch;
+		database.close();
+		database = await GatewayDatabase.open(dbPath);
+		port.bind = bind;
+		port.resume = resume;
+		attachTestBrokerOwnership(database, port, join(home, "agent"));
+		expect(database.inboundNonterminalOrigins()).toEqual([]);
+		expect(database.inboundPendingOrigins()).toEqual([]);
+		expect(database.inboundHeldSteerOrigins()).toEqual([ORIGIN_KEY]);
+		const attemptsBeforeRecovery = port.attempts.length;
+		const originalAttempt = port.attempts[0]!;
+		port.decidable = true;
+		manager = make();
+		// No new message or keyed tick: the held-only origin must be enumerated at boot.
+		await manager.recover();
+		expect(port.attempts).toHaveLength(attemptsBeforeRecovery + 1);
+		expect(port.attempts.at(-1)).toEqual(originalAttempt);
+		expect(originalAttempt.sessionId).toBe(running.sessionId);
+		expect(database.inboundSteersHeld(running.opRef)).toEqual([]);
+		expect(database.inboundHeldSteerOrigins()).toEqual([]);
+		if (outcome === "accepted") {
+			expect(database.inboundTurnRows(running.opRef)).toEqual(
+				expect.arrayContaining([
+					expect.objectContaining({
+						message_id: "held-only",
+						state: "done",
+						turn_state: "done",
+						turn_op_ref: running.opRef,
+					}),
+				]),
+			);
+			expect(port.sends).toHaveLength(1);
+		} else {
+			await eventually(() => port.sends.length === 2, "confirmed refusal did not dispatch the deferred message");
+			expect(port.sends[1]?.text).toBe("second");
+			expect(port.sends[1]?.sessionId).toBe(running.sessionId);
+		}
+		expect(port.binds).toHaveLength(1);
+		expect(database.getSessionRecord(ORIGIN_KEY)?.epoch).toBe(epoch);
+		expect(database.inboundPendingOldest(ORIGIN_KEY)).toBeUndefined();
+	});
+}
+
+test("a torn steer whose replay returns a definitive refusal waits for terminal then sends once on the same session", async () => {
 	home = await mkdtemp(join(tmpdir(), "gajaeway-steering-"));
 	database = await GatewayDatabase.open(join(home, "gateway.db"));
 	class TornThenRefusedPort extends ScriptedSessionPort {
@@ -353,7 +436,8 @@ test("a torn steer whose replay returns a definitive refusal rebinds once and se
 		constructor() {
 			super({ onBind: (input) => `session-${input.originKey}-${input.epoch}` });
 		}
-		async steer(): Promise<void> {
+		async steer(input: Parameters<ScriptedSessionPort["steer"]>[0]): Promise<void> {
+			this.steers.push(input);
 			this.attempts++;
 			if (this.attempts === 1) throw new GjcCliError("gjc sdk turn.steer exited 137", 137, "killed");
 			throw steerRefused("no running turn");
@@ -375,11 +459,25 @@ test("a torn steer whose replay returns a definitive refusal rebinds once and se
 	enqueue("trigger", "first");
 	await manager.notifyInbound(ORIGIN_KEY);
 	await eventually(() => port.sends.length === 1, "initial send missing");
+	const running = port.sends[0]!;
 	enqueue("refused", "second");
 	await manager.notifyInbound(ORIGIN_KEY);
-	await eventually(() => port.sends.length === 2, "refused message was not sent on the replacement session");
+	await eventually(
+		() => port.attempts === 2 && database?.inboundPendingOldest(ORIGIN_KEY)?.message_id === "refused",
+		"refused message was not returned to pending",
+	);
 	expect(port.attempts).toBe(2);
-	expect(logs.filter((line) => line.startsWith("session_rebound_after_steer_failure"))).toHaveLength(1);
+	expect(port.steers[0]!.clientRef).toBe(port.steers[1]!.clientRef);
+	expect(port.steers.every((steer) => steer.sessionId === running.sessionId)).toBe(true);
+	expect(port.binds).toHaveLength(1);
+	expect(port.sends).toHaveLength(1);
+	expect(database.inboundTurnRow(running.opRef)?.turn_state).toBe("accepted");
+	expect(logs.filter((line) => line.startsWith("session_rebound_after_steer_failure"))).toHaveLength(0);
+	port.complete(running.opRef, "first answer");
+	await eventually(() => port.sends.length === 2, "refused message did not start after current terminal");
 	expect(port.sends[1]!.text).toBe("second");
-	expect(port.sends[1]!.sessionId).not.toBe(port.sends[0]!.sessionId);
+	expect(port.sends[1]!.sessionId).toBe(running.sessionId);
+	expect(port.sends[1]!.opRef).not.toBe(running.opRef);
+	expect(port.binds).toHaveLength(1);
+	expect(database.inboundPendingOldest(ORIGIN_KEY)).toBeUndefined();
 });

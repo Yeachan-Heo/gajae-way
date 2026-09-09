@@ -1777,7 +1777,16 @@ async function createInboundTurnLifecycle(
 			if (nonLoopback && assistantDeliveryStarted)
 				options.database.contextCommitWindow(key, contextMessageIds, contextOmissionRevision);
 			if (nonLoopback && !assistantDeliveryStarted) {
-				const notice = runtime.delivery.prepare(turnId, origin, failureNotice);
+				// Recovery can observe the same failed terminal after the notice was
+				// persisted but before the trigger was settled. Reuse the trigger's
+				// terminal delivery identity instead of emitting another failure.
+				const notice = runtime.delivery.prepare(
+					turnId,
+					origin,
+					failureNotice,
+					undefined,
+					deterministicTerminalDeliveryId(key, input.turn.triggerMessageId, 0),
+				);
 				if (notice) {
 					runtime.delivery.markInflight(notice.deliveryId as string);
 					broadcastDelivery(runtime, notice);

@@ -139,7 +139,7 @@ class FailFirstSteerPort extends ScriptedSessionPort {
 	}
 }
 
-test("coverage audit: a steer the session refuses is sent once on the replacement session, and both turns are attributed", async () => {
+test("coverage audit: a refused steer waits for terminal and is sent once on the same session, with both turns attributed", async () => {
 	const port = new FailFirstSteerPort();
 	const fixtureState = await fixture({ port });
 	try {
@@ -150,15 +150,18 @@ test("coverage audit: a steer the session refuses is sent once on the replacemen
 		enqueue(fixtureState.database, "steer-failure", "must not disappear");
 		await fixtureState.manager.notifyInbound(ORIGIN_KEY);
 		expect(port.steerAttempts).toBe(1);
-		// The refused steer replaces the session immediately; the row is never
-		// held behind the undecided turn and never expired.
-		await eventually(() => port.sends.length === 2, "refused steer was not sent on a replacement session");
+		expect(port.sends).toHaveLength(1);
+		expect(port.binds).toHaveLength(1);
+		expect(fixtureState.database.inboundNonterminalTurns(ORIGIN_KEY)).toHaveLength(1);
+		expect(fixtureState.database.inboundTurnRow(first.opRef)?.turn_state).toBe("accepted");
+		expect(fixtureState.database.inboundPendingOldest(ORIGIN_KEY)).toMatchObject({ message_id: "steer-failure" });
+		port.complete(first.opRef, "first done");
+		await eventually(() => port.sends.length === 2, "refused steer was not sent after terminal");
 		const second = port.sends[1]!;
 		expect(second.text).toBe("must not disappear");
-		expect(second.sessionId).not.toBe(first.sessionId);
-		expect(fixtureState.database.inboundNonterminalTurns(ORIGIN_KEY)).toHaveLength(2);
-
-		port.complete(first.opRef, "first done");
+		expect(second.sessionId).toBe(first.sessionId);
+		expect(port.binds).toHaveLength(1);
+		expect(fixtureState.database.inboundTurnRow(first.opRef)?.turn_state).toBe("done");
 		port.complete(second.opRef, "second done");
 		await eventually(
 			() => fixtureState.database.inboundPendingCount(ORIGIN_KEY) === 0,

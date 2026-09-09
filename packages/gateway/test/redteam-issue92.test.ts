@@ -254,7 +254,7 @@ test("red-team: a strict tail retention gap does not infer terminal or create an
 	}
 });
 
-test("canonical: a steer the running session refuses replaces the session; the message is never consumed by the old turn and is sent exactly once on the new one", async () => {
+test("canonical: a refused steer stays pending until the running turn terminates, then sends exactly once on the same session", async () => {
 	const port = new FailFirstSteerPort();
 	const target = await fixture({ port });
 	try {
@@ -268,23 +268,22 @@ test("canonical: a steer the running session refuses replaces the session; the m
 		await target.manager.notifyInbound(ORIGIN_KEY);
 		expect(port.steerAttempts).toBe(1);
 		expect(port.steers).toEqual([]);
-		// The running turn refused the steer while still in flight: the SESSION
-		// is broken, so it is replaced. The row stays pending (never consumed by
-		// the old batch, never expired) and the epoch moves on.
 		expect(target.logs.filter((line) => line.startsWith("steer_failed"))).toHaveLength(1);
-		expect(target.logs.filter((line) => line.startsWith("session_rebound_after_steer_failure"))).toHaveLength(1);
-		await eventually(() => port.sends.length === 2, "refused steer row was not sent on the replacement session");
-		const second = required(port.sends[1], "replacement send missing");
-		expect(second.text).toBe("must remain durable");
-		expect(second.sessionId).not.toBe(first.sessionId);
-		expect(port.binds.at(-1)?.epoch).toBe(firstEpoch + 1);
-		expect(port.sendAttempts.map((input) => input.opRef)).toHaveLength(2);
-
-		// The old turn still answers its own trigger: the user never discarded
-		// it, so its terminal is delivered and its batch closes.
+		expect(target.logs.filter((line) => line.startsWith("session_rebound_after_steer_failure"))).toHaveLength(0);
+		expect(port.sends).toHaveLength(1);
+		expect(port.binds.map((bind) => bind.epoch)).toEqual([firstEpoch]);
+		expect(target.database.inboundTurnRow(first.opRef)?.turn_state).toBe("accepted");
+		expect(target.database.inboundPendingOldest(ORIGIN_KEY)).toMatchObject({ message_id: "steer-after-death" });
 		await target.manager.onBrokerGeneration(2);
+		expect(port.sends).toHaveLength(1);
 		port.complete(first.opRef, "first terminal");
-		await eventually(() => target.terminal.includes("first terminal"), "replaced turn's own answer was dropped");
+		await eventually(() => target.terminal.includes("first terminal"), "current turn's answer was dropped");
+		await eventually(() => port.sends.length === 2, "refused steer row was not sent after terminal");
+		const second = required(port.sends[1], "pending send missing");
+		expect(second.text).toBe("must remain durable");
+		expect(second.sessionId).toBe(first.sessionId);
+		expect(port.binds.map((bind) => bind.epoch)).toEqual([firstEpoch]);
+		expect(port.sendAttempts.map((input) => input.opRef)).toHaveLength(2);
 		port.complete(second.opRef, "second terminal");
 		await eventually(
 			() => target.database.inboundPendingCount(ORIGIN_KEY) === 0,
@@ -681,14 +680,15 @@ test("red-team coverage fuzz: exact-boundary fragments plus steer-failure and br
 				await target.manager.notifyInbound(ORIGIN_KEY);
 			}
 
-			// Drain: complete every send in order. A steer failure replaces the
-			// session, so several turns (retired + current) can be live at once;
-			// each one's terminal must close its own trigger, and every row must end
-			// up attributed to exactly one turn with nothing pending.
+			// Drain sequentially: refusal leaves the current turn intact and later
+			// rows pending until its terminal. Every row must retain attribution.
 			let completedSends = 0;
 			for (let round = 0; target.database.inboundPendingCount(ORIGIN_KEY) > 0; round++) {
 				if (round > 32) throw new Error(`seed ${seed} did not drain`);
 				await eventually(() => port.sends.length > completedSends, `seed ${seed} left pending rows without a turn`);
+				expect(port.sends).toHaveLength(completedSends + 1);
+				expect(target.database.inboundNonterminalTurns(ORIGIN_KEY)).toHaveLength(1);
+				expect(new Set(port.sends.map((send) => send.sessionId)).size).toBe(1);
 				const send = required(port.sends[completedSends], `seed ${seed} send ${completedSends} missing`);
 				port.complete(send.opRef, `terminal-${seed}-${completedSends}`);
 				completedSends++;

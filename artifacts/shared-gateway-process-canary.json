@@ -1,0 +1,15 @@
+{
+  "status": "passed",
+  "home": "/tmp/gajaeway-shared-process-u0n3zz55",
+  "sessionId": "e1afa339-e173-4d92-9da2-fba4ba8a7eab",
+  "opRef": "gw-work-process-proof-01m22db3k8h26fv3g1qecjv8m7",
+  "sharedBroker": {
+    "pid": 1213073,
+    "ownerId": "ffabdb564e39c55cc5997b99",
+    "incarnation": "linux:432228496"
+  },
+  "unrelatedLivePreserved": 65,
+  "sameSessionAfterGatewayRestart": true,
+  "configUnchanged": true,
+  "originalResult": "SHARED_PROCESS_OK"
+}

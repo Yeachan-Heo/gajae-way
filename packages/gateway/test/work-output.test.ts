@@ -354,14 +354,12 @@ test("completed fake status reflects original operation evidence without inventi
 	expect((await failed.status(input)).status.outcome).toBeUndefined();
 });
 
-test("steer affirmative refusal is marked while missing or malformed acceptance stays uncertain", async () => {
+test("steer authoritative refusal or matching rejection is marked while malformed acceptance stays uncertain", async () => {
 	let envelope: unknown;
 	const port = await broker(async () => response(envelope));
 	const steer = { sessionId: input.sessionId, repo: input.repo, text: "steer", clientRef: "caller-ref" };
 	for (const rejected of [
-		{ ok: true, result: { accepted: false, error: { code: "new_sdk_rejection" } } },
-		{ ok: true, result: { accepted: false, status: "accepted", clientRef: "caller-ref" } },
-		{ ok: true, result: { status: "rejected" } },
+		{ ok: true, result: { accepted: false, status: "rejected", clientRef: "caller-ref" } },
 		{ ok: false, error: { code: "busy" } },
 	]) {
 		envelope = rejected;
@@ -381,6 +379,15 @@ test("steer affirmative refusal is marked while missing or malformed acceptance 
 		{ accepted: "true", status: "accepted" },
 		{ status: "accepted", clientRef: "other-operation" },
 		{ accepted: false, clientRef: "other-operation" },
+		{ accepted: false, error: { code: "new_sdk_rejection" } },
+		{ accepted: false, error: { code: "busy" } },
+		{ status: "rejected" },
+		{ accepted: false, status: "rejected" },
+		{ accepted: false, clientRef: "caller-ref" },
+		{ status: "rejected", clientRef: "caller-ref" },
+		{ accepted: false, status: "rejected", clientRef: "other-operation" },
+		{ accepted: true, status: "rejected", clientRef: "caller-ref" },
+		{ accepted: false, status: "accepted", clientRef: "caller-ref" },
 	]) {
 		envelope = { ok: true, result };
 		const error = await port.steer(steer).then(

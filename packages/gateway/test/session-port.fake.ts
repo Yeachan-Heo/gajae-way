@@ -260,14 +260,21 @@ export class ScriptedSessionPort implements SessionPort {
 	/** When set, status omits startedAt (older gjc reports), exercising the batch acceptedAt floor. */
 	omitStartedAt = false;
 
-	/** Scripted `context.get` occupancy per session; absent means the runtime cannot say. */
-	readonly contextPercent = new Map<string, number>();
-	readonly contextProbes: string[] = [];
+	readonly failureEvidence = new Map<string, { reason: "unsupported_input_status" | "context_exhausted" }>();
+	readonly failureEvidenceProbes: Array<{
+		sessionId: string;
+		repo: string;
+		startedAtMs: number;
+		terminalAtMs: number;
+	}> = [];
 
-	async contextUsage(input: { sessionId: string; repo: string }) {
-		this.contextProbes.push(input.sessionId);
-		const percent = this.contextPercent.get(input.sessionId);
-		return percent === undefined ? undefined : { percent };
+	setFailedTurnEvidence(sessionId: string, reason: "unsupported_input_status" | "context_exhausted"): void {
+		this.failureEvidence.set(sessionId, { reason });
+	}
+
+	async failedTurnEvidence(input: { sessionId: string; repo: string; startedAtMs: number; terminalAtMs: number }) {
+		this.failureEvidenceProbes.push(input);
+		return this.failureEvidence.get(input.sessionId);
 	}
 
 	async status(input: { sessionId: string; repo: string; opRef: string }): Promise<StatusReport> {
@@ -288,7 +295,12 @@ export class ScriptedSessionPort implements SessionPort {
 							outcome: { reason: "end_turn" },
 						}
 					: operation.state === "failed"
-						? { status: "failed", ...startedAt, error: { message: operation.error ?? "scripted failure" } }
+						? {
+								status: "failed",
+								...startedAt,
+								terminalAt: operation.terminalAt,
+								error: { message: operation.error ?? "scripted failure" },
+							}
 						: { status: "in_flight", ...startedAt },
 			summaryCompleted: operation.state !== "in_flight",
 		};
@@ -536,10 +548,11 @@ export class ScriptedSessionPort implements SessionPort {
 		if (!operation) throw new Error(`unknown scripted operation ${opRef}`);
 		operation.state = "failed";
 		operation.error = error;
+		operation.terminalAt = Date.now();
 		this.#emit(operation.sessionId, {
 			kind: "agent_failed",
 			rawKind: "agent_failed",
-			payload: {},
+			payload: { opRef },
 			steerEcho: false,
 			idle: true,
 		});
@@ -567,7 +580,7 @@ export class ScriptedSessionPort implements SessionPort {
 			state,
 			text,
 			startedAt: existing?.startedAt ?? now,
-			...(state === "terminal_ok" ? { terminalAt: now } : {}),
+			...(state !== "in_flight" ? { terminalAt: now } : {}),
 		});
 	}
 
@@ -580,7 +593,7 @@ export class ScriptedSessionPort implements SessionPort {
 			state,
 			text,
 			startedAt: now,
-			...(state === "terminal_ok" ? { terminalAt: now } : {}),
+			...(state !== "in_flight" ? { terminalAt: now } : {}),
 		});
 	}
 

@@ -1,9 +1,9 @@
 import { Database } from "bun:sqlite";
 import { afterEach, expect, test } from "bun:test";
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import type { CliRunner } from "@gajaeway/subsession";
+import { type CliRunner, GjcCliError } from "@gajaeway/subsession";
 import { BrokerSessionPort } from "../src/orchestrator/session-port";
 import { TailRunner } from "../src/orchestrator/tail-runner";
 import { BrokerAuthorityError, GatewayDatabase } from "../src/store/db";
@@ -56,6 +56,58 @@ afterEach(async () => {
 	database = undefined;
 	if (home) await rm(home, { recursive: true, force: true });
 	home = "";
+});
+
+test("failed-turn evidence comes from the owned shared session file without exposing provider text", async () => {
+	home = await mkdtemp(join(tmpdir(), "gajaeway-session-failure-"));
+	database = await GatewayDatabase.open(join(home, "gateway.db"));
+	const repo = join(home, "workspace");
+	const agentDir = join(home, "agent");
+	const authority = initializeTestBrokerAuthority(database, agentDir);
+	const bucket = join(agentDir, "sessions", "bucket");
+	await mkdir(repo);
+	await mkdir(bucket, { recursive: true });
+	const sessionId = "failed-session";
+	await createOwnedSessionFixture(database, authority, { sessionId, originKey: "failure-evidence", epoch: 0, repo });
+	const startedAtMs = Date.now();
+	const rows = [
+		{ type: "session", version: 5, id: sessionId, cwd: repo, timestamp: new Date(startedAtMs - 100).toISOString() },
+		{
+			type: "message",
+			id: "user",
+			parentId: null,
+			timestamp: new Date(startedAtMs).toISOString(),
+			message: { role: "user", timestamp: startedAtMs, content: [{ type: "text", text: "hello" }] },
+		},
+		{
+			type: "message",
+			id: "error",
+			parentId: "user",
+			timestamp: new Date(startedAtMs + 20).toISOString(),
+			message: {
+				role: "assistant",
+				timestamp: startedAtMs + 1,
+				content: [],
+				stopReason: "error",
+				errorStatus: 400,
+				errorMessage: "400 Unknown parameter: 'input[1].status'.\nraw-http-request=/private/request.json",
+			},
+		},
+	];
+	await writeFile(join(bucket, `now_${sessionId}.jsonl`), `${rows.map((row) => JSON.stringify(row)).join("\n")}\n`);
+	const run: CliRunner = async () => {
+		throw new Error("Failure evidence must not start an SDK operation");
+	};
+	const options = { database, authority, cli: run, instanceId: "evidence", tailRunner: new TailRunner({ run, repo }) };
+	const port = new BrokerSessionPort(options);
+	const input = { sessionId, repo, startedAtMs, terminalAtMs: startedAtMs + 30 };
+	expect(await port.failedTurnEvidence(input)).toEqual({ reason: "unsupported_input_status" });
+	await expect(port.failedTurnEvidence({ ...input, sessionId: "foreign-session" })).rejects.toBeInstanceOf(
+		BrokerAuthorityError,
+	);
+	await expect(port.failedTurnEvidence({ ...input, repo: join(home, "other-repo") })).rejects.toBeInstanceOf(
+		BrokerAuthorityError,
+	);
 });
 
 test("broker SessionPort preserves caller op-ref, model choice, bootstrap prompt, terminal status, and transcript body", async () => {
@@ -554,7 +606,6 @@ test("foreign live and saved sessions and wrong-repo owned UUIDs never reach any
 			() => port.inspect(target),
 			() => port.liveness(target),
 			() => port.queueEmpty(target),
-			() => port.contextUsage(target),
 			() => port.resume({ ...target, originKey: "foreign", epoch: 0 }),
 			() => port.send({ ...target, text: "must not send", opRef: "gw-foreign" }),
 			() => port.steer({ ...target, text: "must not steer", clientRef: "gw-steer" }),
@@ -562,6 +613,7 @@ test("foreign live and saved sessions and wrong-repo owned UUIDs never reach any
 			() => port.setModel({ ...target, selection: { preset: "profile" } }),
 			() => port.setServiceTier({ ...target, tier: "default" }),
 			() => port.status({ ...target, opRef: "gw-foreign" }),
+			() => port.failedTurnEvidence({ ...target, startedAtMs: 0, terminalAtMs: 1 }),
 			() => port.fetchWorkerOutput({ ...target, opRef: "gw-foreign", notBeforeMs: 0 }),
 			() => port.fetchLastAssistant(target),
 			() => port.fetchAssistantSince({ ...target, notBeforeMs: 0 }),
@@ -789,3 +841,77 @@ test("owned SDK reads and controls ignore unrelated corrupt lane history without
 	);
 	expect(calls).toHaveLength(2);
 });
+for (const fixture of [
+	{ envelope: { ok: false, error: { code: "busy" } }, exitCode: 0, refused: true },
+	{ envelope: { ok: false, error: { code: "session_unavailable" } }, exitCode: 0, refused: false },
+	{ envelope: { error: { code: "busy" } }, exitCode: 0, refused: false },
+	{ envelope: { ok: false, error: { code: "busy" } }, exitCode: 1, refused: false },
+	{
+		envelope: { ok: true, result: { accepted: false, status: "rejected", error: { code: "busy" } } },
+		exitCode: 0,
+		refused: false,
+	},
+	{
+		envelope: {
+			ok: true,
+			result: { accepted: false, status: "rejected", clientRef: "expected-ref", error: { code: "busy" } },
+		},
+		exitCode: 0,
+		refused: true,
+	},
+	{
+		envelope: {
+			ok: true,
+			result: { accepted: false, status: "rejected", clientRef: "wrong-ref", error: { code: "busy" } },
+		},
+		exitCode: 0,
+		refused: false,
+	},
+	{ envelope: { ok: true, result: { accepted: true, clientRef: "wrong-ref" } }, exitCode: 0, refused: false },
+	{ envelope: { ok: true, result: { accepted: true } }, exitCode: 0, refused: false },
+	{
+		envelope: { ok: true, result: { accepted: true, status: "rejected", clientRef: "expected-ref" } },
+		exitCode: 0,
+		refused: false,
+	},
+	{
+		envelope: { ok: true, result: { accepted: true, status: "accepted", clientRef: "expected-ref", ok: false } },
+		exitCode: 0,
+		refused: false,
+	},
+	{ envelope: { ok: true, result: {} }, exitCode: 0, refused: false },
+])
+	test(`steer preserves authoritative rejection versus ambiguity: ${JSON.stringify(fixture)}`, async () => {
+		home = await mkdtemp(join(tmpdir(), "gajaeway-session-port-"));
+		database = await GatewayDatabase.open(join(home, "gateway.db"));
+		const authority = initializeTestBrokerAuthority(database, join(home, "agent"));
+		await createOwnedSessionFixture(database, authority, {
+			sessionId: "sdk-1",
+			repo: "/tmp/repo",
+			originKey: "steer-receipt",
+			epoch: 0,
+		});
+		const run: CliRunner = async () => ({
+			exitCode: fixture.exitCode,
+			stdout: JSON.stringify(fixture.envelope),
+			stderr: "",
+		});
+		const port = new BrokerSessionPort({
+			database,
+			authority,
+			cli: run,
+			instanceId: "instance-1",
+			tailRunner: new TailRunner({ run, repo: join(home, "workspace"), stallTimeoutMs: 1_000 }),
+		});
+		let failure: unknown;
+		try {
+			await port.steer({ sessionId: "sdk-1", repo: "/tmp/repo", text: "input", clientRef: "expected-ref" });
+		} catch (error) {
+			failure = error;
+		}
+		expect(failure).toBeInstanceOf(GjcCliError);
+		expect((failure as GjcCliError).exitCode).toBe(fixture.exitCode);
+		expect(((failure as GjcCliError).details as { refused?: boolean } | undefined)?.refused === true).toBe(
+			fixture.refused,
+		);
+	});

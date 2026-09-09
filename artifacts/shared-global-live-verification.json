@@ -1,0 +1,16 @@
+{
+  "kind": "api-cli-e2e-test-report",
+  "target": "gaebal-gajae SSH port 24",
+  "sdkCommit": "d45fec0a0ab621e84c2ca0032767c29dfc8c928b",
+  "globalExecutable": "/mnt/offloading/.bun/bin/gjc",
+  "globalAgentDir": "/home/bellman/.gjc/agent",
+  "sdkPromotion": {"report":"artifacts/shared-sdk-promotion.json","oldBrokerPid":951920,"newBrokerPid":1213073,"originalLiveHostsPreserved":51,"originalSessionCount":504,"configUnchanged":true,"controlPlaneSeconds":5.079},
+  "independentSteerCanary": {
+    "command": "GJC_EXECUTABLE=/mnt/offloading/.bun/bin/gjc GJC_CODING_AGENT_DIR=/home/bellman/.gjc/agent GAJAEWAY_E2E_MODEL=layofflabs/gpt-6-astra GAJAEWAY_E2E_WORK=1 GAJAEWAY_E2E_SHARED_STEER=1 GAJAEWAY_E2E_REPO=/home/bellman/Workspace/gajae-way bun test packages/gateway/test/work-lane-live.e2e.test.ts",
+    "passed":1,"failed":0,"assertions":585,"exitCode":0,
+    "repoCommit":"d18715a",
+    "assertionsProven":["WorkLaneManager accepted the worker before terminal", "Independent same-user SDK steer accepted", "Original opRef turn.result contained independent steer marker", "Same session visible via independent SDK", "Shared broker survives client stop/reconnect", "Config/model/auth bytes preserved after all SDK operations", "Unrelated session identity/locator/PID/liveness preserved"]
+  },
+  "gatewayProcessRestart": {"report":"artifacts/shared-gateway-process-canary.json","status":"passed","sameSessionAfterGatewayRestart":true,"sharedBrokerPidUnchanged":1213073,"unrelatedLivePreserved":65,"configUnchanged":true,"originalResult":"SHARED_PROCESS_OK"},
+  "limitations":["The full production gateway authority cutover and publication are separate deliverables and not claimed by these canaries.","Intermittent existing SDK router session_unavailable responses were observed; read-only verification retries were bounded, and no prompt was rebound or resent.","The shared-profile canary ran in the explicitly selected actual user repository; scratch-workspace canaries exposed routing/time-budget and fixture snapshot issues and were not counted as passing.","Concurrent main provider-recovery fixes are being integrated and require fresh final repository tests before production rollout."]
+}
