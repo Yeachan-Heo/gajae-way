@@ -1673,40 +1673,48 @@ class OriginActor {
 			if ((!bound.retired || bound.answerWanted) && report.status.status === "terminal_ok") {
 				// Normal delivery is deliberately simple: the current turn's tail is
 				// the live authority. #predatesTurn already fences cursorless replay,
-				// and op-attributed frames win over skewed timestamps. Transcript lookup
-				// is recovery-only for a restart/retention gap where no terminal tail
-				// answer survived.
+				// and op-attributed frames win over skewed timestamps. Original operation
+				// output is recovery-only when no actual tail answer survived.
 				const startedAt = report.status.startedAt;
-				const notBeforeMs = typeof startedAt === "number" ? startedAt : bound.dispatchedAtMs;
+				const notBeforeMs =
+					typeof startedAt === "number" && Number.isFinite(startedAt) ? startedAt : bound.dispatchedAtMs;
 				const port = this.#manager.port;
 				const tailTextIsCurrent =
 					bound.lastAssistantOpAttributed ||
 					bound.lastAssistantAtMs === undefined ||
 					(bound.dispatchedAtMs !== undefined && bound.lastAssistantAtMs >= bound.dispatchedAtMs);
 				let text = bound.tailTerminalObserved && tailTextIsCurrent ? bound.lastAssistantText : undefined;
-				if (text === undefined && !bound.retired && bound.tailTerminalObserved) {
+				if (text === undefined && notBeforeMs !== undefined) {
+					const epoch = this.#epoch();
+					const generation = this.#manager.brokerGeneration;
+					const retired = bound.retired;
+					const isCurrent = () =>
+						!this.#stopped &&
+						!this.#manager.stopped &&
+						this.#manager.brokerGeneration === generation &&
+						this.#epoch() === epoch &&
+						bound.retired === retired &&
+						(retired ? this.#retired.get(retiredKey(bound)) === bound : this.#current === bound) &&
+						!this.#quarantinedTurn(bound.turn.opRef);
 					try {
-						text = (await port.fetchLastAssistant({ sessionId: bound.sessionId, repo: this.#manager.repo })).text;
-						this.#manager.log(
-							`terminal_text_fallback origin=${this.originKey} epoch=${bound.epoch} opRef=${bound.turn.opRef} source=session.last_assistant`,
-						);
-					} catch (error) {
-						this.#manager.log(
-							`terminal_text_unavailable origin=${this.originKey} epoch=${bound.epoch} opRef=${bound.turn.opRef} reason=last_assistant_read_failed detail=${safeDiagnostic(error)}`,
-						);
-					}
-				}
-				if (text === undefined && notBeforeMs !== undefined && port.fetchAssistantSince) {
-					try {
-						const since = await port.fetchAssistantSince({
+						const output = await port.fetchWorkerOutput({
 							sessionId: bound.sessionId,
 							repo: this.#manager.repo,
+							opRef: bound.turn.opRef,
 							notBeforeMs,
+							terminalIdentity: report.status,
+							isCurrent,
 						});
-						text = since?.text;
+						if (!isCurrent()) return;
+						if (output.status === "proven") text = output.text;
+						else
+							this.#manager.log(
+								`terminal_text_unavailable origin=${this.originKey} epoch=${bound.epoch} opRef=${bound.turn.opRef} reason=${output.code}`,
+							);
 					} catch (error) {
+						if (!isCurrent()) return;
 						this.#manager.log(
-							`terminal_text_unavailable origin=${this.originKey} epoch=${bound.epoch} opRef=${bound.turn.opRef} reason=transcript_read_failed detail=${safeDiagnostic(error)}`,
+							`terminal_text_unavailable origin=${this.originKey} epoch=${bound.epoch} opRef=${bound.turn.opRef} reason=original_result_read_failed detail=${safeDiagnostic(error)}`,
 						);
 					}
 				}

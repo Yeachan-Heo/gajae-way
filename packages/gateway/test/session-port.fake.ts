@@ -323,7 +323,7 @@ export class ScriptedSessionPort implements SessionPort {
 						kind: "prompt",
 						clientRef: input.opRef,
 						status: operation.state,
-						startedAt: operation.startedAt,
+						...(this.omitStartedAt ? {} : { startedAt: operation.startedAt }),
 						...(operation.terminalAt === undefined ? {} : { terminalAt: operation.terminalAt }),
 						...(operation.state === "terminal_ok"
 							? {

@@ -110,6 +110,122 @@ test("actor immediately dispatches durable inbound with one deterministic caller
 	expect(database?.inboundTurnRow(latestOpRef)).toMatchObject({ state: "done", turn_state: "done" });
 });
 
+for (const answer of ["owned original answer", ""])
+	test(`terminal recovery reads only the accepted original operation (empty=${answer === ""})`, async () => {
+		const port = new ScriptedSessionPort();
+		const terminal: string[] = [];
+		await harness(port, { terminal: (text) => terminal.push(text) });
+		enqueue("original", "execute once");
+		await manager!.notifyInbound(KEY);
+		const send = port.sends[0]!;
+		port.fetchAssistantSince = async () => {
+			throw new Error("transcript.list returned no page items");
+		};
+		let latestReads = 0;
+		port.fetchLastAssistant = async () => {
+			latestReads++;
+			return { text: "WRONG_LATEST_OPERATION", pages: 1, complete: true };
+		};
+		port.seedOperation(send.opRef, send.sessionId, "terminal_ok", answer);
+		port.seedOperation("unrelated-newer-op", send.sessionId, "terminal_ok", "WRONG_LATEST_OPERATION");
+		await manager!.reconcile(KEY);
+		await eventually(() => terminal.length === 1, "original output was not recovered");
+		await manager!.reconcile(KEY);
+		expect(terminal).toEqual([answer]);
+		expect(latestReads).toBe(0);
+		expect(port.workerOutputReads).toHaveLength(1);
+		expect(port.workerOutputReads[0]).toMatchObject({ sessionId: send.sessionId, opRef: send.opRef });
+		expect(port.workerOutputReads[0]!.notBeforeMs).toBeGreaterThanOrEqual(
+			Date.parse(database!.inboundTurnDispatchedAt(send.opRef)!),
+		);
+		expect(database!.inboundTurnRow(send.opRef)?.turn_state).toBe("done");
+		expect(port.sends).toHaveLength(1);
+	});
+
+for (const evidence of ["missing", "truncated", "mismatch"] as const)
+	test(`terminal recovery holds ${evidence} original content without substituting the latest answer`, async () => {
+		const port = new ScriptedSessionPort();
+		const terminal: string[] = [];
+		const logs: string[] = [];
+		await harness(port, { terminal: (text) => terminal.push(text) }, (line) => logs.push(line));
+		enqueue("held-original", "execute once");
+		await manager!.notifyInbound(KEY);
+		const send = port.sends[0]!;
+		port.seedOperation(send.opRef, send.sessionId, "terminal_ok", "owned answer");
+		const status = (await port.status(send)).status;
+		port.setWorkerOutputFixture(send.opRef, {
+			exitCode: 0,
+			stderr: "",
+			stdout: JSON.stringify({
+				ok: true,
+				result: {
+					...status,
+					kind: "prompt",
+					clientRef: evidence === "mismatch" ? "wrong-operation" : send.opRef,
+					...(evidence === "missing"
+						? {}
+						: {
+								content: {
+									version: 1,
+									type: "text",
+									text: "WRONG_LATEST_OPERATION",
+									byteLength: new TextEncoder().encode("WRONG_LATEST_OPERATION").length,
+									truncated: evidence === "truncated",
+								},
+							}),
+				},
+			}),
+		});
+		let alternateReads = 0;
+		port.fetchLastAssistant = async () => {
+			alternateReads++;
+			return { text: "WRONG_LATEST_OPERATION", pages: 1, complete: true };
+		};
+		port.fetchAssistantSince = port.fetchLastAssistant;
+		await manager!.reconcile(KEY);
+		await eventually(() => port.workerOutputReads.length > 0, "original result was not queried");
+		await manager!.reconcile(KEY);
+		expect(terminal).toEqual([]);
+		expect(alternateReads).toBe(0);
+		const reason =
+			evidence === "missing" ? "output_pending" : evidence === "truncated" ? "incomplete_body" : "identity_mismatch";
+		expect(logs.some((line) => line.includes(`reason=${reason}`))).toBe(true);
+		expect(database!.inboundTurnRow(send.opRef)?.turn_state).toBe("accepted");
+		expect(port.sends).toHaveLength(1);
+	});
+
+test("stop fences a pending original-result callback before delivery or database mutation", async () => {
+	const port = new ScriptedSessionPort();
+	const terminal: string[] = [];
+	await harness(port, { terminal: (text) => terminal.push(text) });
+	enqueue("stop-original", "execute once");
+	await manager!.notifyInbound(KEY);
+	const send = port.sends[0]!;
+	const fetch = port.fetchWorkerOutput.bind(port);
+	let release!: () => void;
+	const blocked = new Promise<void>((resolve) => {
+		release = resolve;
+	});
+	let entered = false;
+	port.fetchWorkerOutput = async (input) => {
+		// Capture proven evidence before stop, so the actor must perform its own fence.
+		const result = await fetch(input);
+		entered = true;
+		await blocked;
+		return result;
+	};
+	port.seedOperation(send.opRef, send.sessionId, "terminal_ok", "late original answer");
+	await manager!.reconcile(KEY);
+	await eventually(() => entered, "original result read did not begin");
+	const before = database!.inboundTurnRow(send.opRef);
+	const stopping = manager!.stop();
+	release();
+	await stopping;
+	expect(terminal).toEqual([]);
+	expect(database!.inboundTurnRow(send.opRef)).toEqual(before);
+	expect(port.sends).toHaveLength(1);
+});
+
 test("a message admitted while a persistent turn is running becomes an operator-gated steer", async () => {
 	const port = new ScriptedSessionPort();
 	await harness(port);

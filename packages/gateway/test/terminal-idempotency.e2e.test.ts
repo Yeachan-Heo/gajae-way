@@ -134,7 +134,7 @@ test("a batch whose tail was fenced and then reconciled from status invokes onTe
 		const send = port.sends[0]!;
 		// The fence closes the tail BEFORE the terminal frame arrives, exactly as
 		// broker_generation_fenced did live; status then reports terminal_ok and the
-		// actor reconciles from the transcript instead of the tail.
+		// actor reconciles from the original operation result instead of the tail.
 		await manager.onBrokerGeneration(2);
 		port.seedOperation(send.opRef, send.sessionId, "terminal_ok", "한 번만 말할게");
 		await manager.reconcile("discord/channel/chan-1");
@@ -174,7 +174,7 @@ test("red-team B2: the answer ships on the tail, the gateway restarts, status re
 	server = undefined;
 	port.seedOperation(send.opRef, send.sessionId, "terminal_ok", "재시작해도 한 번만");
 	// A fresh gateway on the same database recovers the accepted batch with no
-	// lifecycle memory and reconciles it from status + transcript.
+	// lifecycle memory and reconciles it from status + original operation result.
 	database = await GatewayDatabase.open(dbPath);
 	port.bind = bind;
 	port.resume = resume;
@@ -682,7 +682,7 @@ test("a frame attributed to the accepted op passes the turn floor even with an o
 		await manager.notifyInbound("discord/channel/chan-1");
 		await eventually(() => port.sends.length === 1, "turn was not sent");
 		const send = port.sends[0]!;
-		// fetchAssistantSince can't see it (no terminal op yet); the tail frame is
+		// Recovery lookup is unnecessary here; the tail frame is
 		// the only evidence: attributed to the op, but stamped an hour ago by a
 		// skewed host clock. Attribution wins over the timestamp floor.
 		let transcriptReads = 0;
@@ -698,6 +698,7 @@ test("a frame attributed to the accepted op passes the turn floor even with an o
 		await eventually(() => terminals.length === 1, "reply missing");
 		expect(terminals).toEqual([{ trigger: "m-t1", text: "답" }]);
 		expect(transcriptReads).toBe(0);
+		expect(port.workerOutputReads).toHaveLength(0);
 	} finally {
 		await manager.stop();
 	}

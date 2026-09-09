@@ -207,31 +207,51 @@ class UnavailableReplacementBindPort extends ScriptedSessionPort {
 }
 
 /**
- * Models the runtime's own clock: `startedAt` and transcript row stamps come
- * from the SAME host, which may be offset from the gateway's clock. The rows
- * the port "has" are (hostStamp, text); fetchAssistantSince returns the newest
- * row stamped at/after the floor, with the same 2s slack as the real port.
+ * Models original operation content and status on the same runtime clock,
+ * which may be offset from the gateway clock. Exact operation identity, not
+ * a session-wide newest row, determines which answer can be recovered.
  */
 class HostClockPort extends ScriptedSessionPort {
-	forceStartedAt: number | undefined;
-	readonly rows: Array<{ at: number; text: string }> = [];
-	readonly transcriptFloors: number[] = [];
+	readonly operations = new Map<string, { startedAt: number; terminalAt: number; text: string }>();
+
+	seedHostOutput(opRef: string, startedAt: number, terminalAt: number, text: string): void {
+		this.operations.set(opRef, { startedAt, terminalAt, text });
+		this.setWorkerOutputFixture(opRef, {
+			exitCode: 0,
+			stderr: "",
+			stdout: JSON.stringify({
+				ok: true,
+				result: {
+					kind: "prompt",
+					clientRef: opRef,
+					status: "terminal_ok",
+					startedAt,
+					terminalAt,
+					receiptState: "present",
+					content: {
+						version: 1,
+						type: "text",
+						text,
+						byteLength: new TextEncoder().encode(text).length,
+						truncated: false,
+					},
+				},
+			}),
+		});
+	}
 
 	async status(input: { sessionId: string; repo: string; opRef: string }): Promise<StatusReport> {
 		const report = await super.status(input);
-		if (report.status.status !== "terminal_ok" || this.forceStartedAt === undefined) return report;
-		return { ...report, status: { ...report.status, startedAt: this.forceStartedAt } };
-	}
-
-	async fetchAssistantSince(input: { sessionId: string; repo: string; notBeforeMs: number }) {
-		this.transcriptFloors.push(input.notBeforeMs);
-		const last = this.rows.at(-1);
-		if (!last || last.at + 2_000 < input.notBeforeMs) return undefined;
-		return { text: last.text, pages: 1, complete: true };
+		const operation = this.operations.get(input.opRef);
+		if (report.status.status !== "terminal_ok" || !operation) return report;
+		return {
+			...report,
+			status: { ...report.status, startedAt: operation.startedAt, terminalAt: operation.terminalAt },
+		};
 	}
 
 	async fetchLastAssistant(): Promise<never> {
-		throw new Error("host-clock fixture exercises turn-floored transcript recovery");
+		throw new Error("host-clock fixture requires original-operation recovery");
 	}
 }
 
@@ -329,8 +349,7 @@ test("C1d: startedAt is the floor on the host's own clock - a host clock BEHIND 
 			// The host stamps everything on ITS clock (gateway now + skew): the
 			// op's startedAt and the answer row it writes 1ms later.
 			const priorHostAt = Date.now() + skewMs;
-			port.forceStartedAt = priorHostAt - 1;
-			port.rows.push({ at: priorHostAt, text: `previous durable body ${tag}` });
+			port.seedHostOutput(first.opRef, priorHostAt - 1, priorHostAt, `previous durable body ${tag}`);
 			port.completeWithoutAnswerFrame(first.opRef, `previous durable body ${tag}`);
 			await eventually(() => fixture.terminals.length === (skewMs < 0 ? 1 : 3), "prior turn did not complete");
 
@@ -339,11 +358,12 @@ test("C1d: startedAt is the floor on the host's own clock - a host clock BEHIND 
 			// The runtime starts the op 5s (host clock) after the prior answer and
 			// writes the current answer 1ms after starting.
 			const startedAt = priorHostAt + 5_000;
-			port.forceStartedAt = startedAt;
-			port.rows.push({ at: startedAt + 1, text: `current durable body ${tag}` });
+			port.seedHostOutput(second.opRef, startedAt, startedAt + 1, `current durable body ${tag}`);
 			port.completeWithoutAnswerFrame(second.opRef, `current durable body ${tag}`);
 			await eventually(() => fixture.terminals.length === (skewMs < 0 ? 2 : 4), "current turn did not complete");
-			expect(port.transcriptFloors.at(-1)).toBe(startedAt);
+			expect(second.opRef).not.toBe(first.opRef);
+			expect(port.workerOutputReads.at(-1)).toMatchObject({ opRef: second.opRef, notBeforeMs: startedAt });
+			expect(port.workerOutputReads.find((read) => read.opRef === first.opRef)?.notBeforeMs).toBe(priorHostAt - 1);
 		}
 		expect(fixture.terminals).toEqual([
 			{ trigger: "prior-behind", text: "previous durable body behind" },
