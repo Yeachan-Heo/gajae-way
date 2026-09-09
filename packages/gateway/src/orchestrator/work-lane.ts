@@ -312,8 +312,18 @@ export class WorkLaneManager {
 				accepted = receipt.operationRef === opRef && receipt.sessionId === runtime.sessionId;
 			} catch (error) {
 				rejected = definitiveRefusal(error);
+				const code =
+					typeof error === "object" && error !== null && "details" in error
+						? (error.details as { code?: unknown } | undefined)?.code
+						: undefined;
+				console.error(
+					`work_send_error opRef=${opRef} code=${typeof code === "string" && /^[a-z_]{1,64}$/.test(code) ? code : "transport_unavailable"}`,
+				);
 			}
 			if (!this.#writeCurrent(observer)) {
+				console.error(
+					`work_send_fenced opRef=${opRef} generation=${observer.generation} currentGeneration=${this.#options.brokerGeneration?.() ?? 0} binding=${this.#binding(runtime)}`,
+				);
 				this.#live();
 				throw workError("work send acceptance uncertain", "send_acceptance_uncertain", runtime);
 			}
@@ -327,6 +337,9 @@ export class WorkLaneManager {
 				}
 			}
 			if (!this.#writeCurrent(observer)) {
+				console.error(
+					`work_send_reconcile_fenced opRef=${opRef} generation=${observer.generation} currentGeneration=${this.#options.brokerGeneration?.() ?? 0} binding=${this.#binding(runtime)}`,
+				);
 				this.#live();
 				throw workError("work send acceptance uncertain", "send_acceptance_uncertain", runtime);
 			}
