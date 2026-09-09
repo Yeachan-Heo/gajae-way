@@ -236,14 +236,12 @@ test("dead terminal saved authority resumes, holds once, then reconciles from st
 	]);
 	// Exactly one send ever: the recovered terminal turn is reconciled, never resent.
 	expect(port.sends).toHaveLength(1);
-	// The tail is the live authority, so the first decidable-terminal reconcile
-	// holds; the bounded grace then treats post-crash tail evidence as genuinely
-	// unavailable and completes from status with an explicit corroboration log.
+	// A verified terminal operation no longer waits for a live tail connection.
 	await eventually(
 		() => database?.inboundTurnRows(accepted.opRef)[0]?.turn_state === "done",
-		"saved terminal turn did not reconcile after tail evidence grace",
+		"saved terminal turn did not reconcile from its original operation result",
 	);
-	expect(logs.some((line) => line.includes("reason=tail_terminal_evidence_unavailable"))).toBe(true);
+	expect(port.workerOutputReads.some((read) => read.opRef === accepted.opRef)).toBe(true);
 	expect(
 		logs.some((line) => line.includes("terminal_status_reconciled") && line.includes("tail_evidence=unavailable")),
 	).toBe(true);

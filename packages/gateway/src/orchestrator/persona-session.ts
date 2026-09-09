@@ -709,17 +709,21 @@ class OriginActor {
 			},
 		};
 		const decision = decideRecovery(recoveryInput);
+		const knownTerminal =
+			!authorityShifted &&
+			status.operationRef === turn.opRef &&
+			(status.status.status === "terminal_ok" || status.status.status === "failed");
 		switch (decision.action) {
 			case "observe": {
 				if (turn.state === "bound") this.#manager.database.inboundTurnAccept(turn.opRef);
-				const bound = await this.#adoptRecoveredTurn(turn, sessionId, retired, true);
+				const bound = await this.#adoptRecoveredTurn(turn, sessionId, retired, true, knownTerminal);
 				await this.#reconcileBound(bound);
 				if (!bound.retired && this.#current === bound) await this.#steerPending();
 				return;
 			}
 			case "fresh_turn": {
 				if (turn.state === "bound") this.#manager.database.inboundTurnAccept(turn.opRef);
-				const bound = await this.#adoptRecoveredTurn(turn, sessionId, retired, true);
+				const bound = await this.#adoptRecoveredTurn(turn, sessionId, retired, true, knownTerminal);
 				// Recovered failures use the same exact evidence and reset-next cap.
 				// The original trigger is completed, never dispatched again.
 				await this.#reconcileBound(bound);
@@ -787,6 +791,7 @@ class OriginActor {
 		sessionId: string,
 		retired: boolean,
 		accepted: boolean,
+		knownTerminal: boolean,
 	): Promise<BoundTurn> {
 		const trigger = this.#manager.database.inboundTurnRow(turn.opRef);
 		if (!trigger) throw new Error(`turn ${turn.opRef} disappeared during recovery`);
@@ -801,7 +806,9 @@ class OriginActor {
 		let tail: TailHandle | undefined;
 		let detached = false;
 		try {
-			tail = await this.#attachTail(sessionId, turn.epoch, retired);
+			// Terminal recovery still rechecks status and original output below; a
+			// retained tail is not a prerequisite for those authoritative reads.
+			if (!knownTerminal) tail = await this.#attachTail(sessionId, turn.epoch, retired);
 		} catch (error) {
 			if (!retired || !(error instanceof TailCapacityError)) throw error;
 			detached = true;
@@ -823,7 +830,7 @@ class OriginActor {
 			tailTerminalObserved: false,
 			replyVisible: false,
 			answerWanted: false,
-			tailEvidenceUnavailable: false,
+			tailEvidenceUnavailable: knownTerminal,
 			statusTerminalHolds: 0,
 			lastAssistantOpAttributed: false,
 			...(dispatchedAtMs === undefined ? {} : { dispatchedAtMs }),

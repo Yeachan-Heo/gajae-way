@@ -110,6 +110,76 @@ test("actor immediately dispatches durable inbound with one deterministic caller
 	expect(database?.inboundTurnRow(latestOpRef)).toMatchObject({ state: "done", turn_state: "done" });
 });
 
+for (const outcome of ["complete", "incomplete", "in_flight"] as const)
+	test(`recovery does not require a tail for proven terminal status (${outcome})`, async () => {
+		const port = new ScriptedSessionPort();
+		await harness(port);
+		enqueue("recover-without-tail", "execute only once");
+		await manager!.notifyInbound(KEY);
+		const send = port.sends[0]!;
+		await manager!.stop();
+		if (outcome !== "in_flight") port.seedOperation(send.opRef, send.sessionId, "terminal_ok", "original result");
+		if (outcome === "incomplete") {
+			const report = await port.status(send);
+			port.setWorkerOutputFixture(send.opRef, {
+				exitCode: 0,
+				stderr: "",
+				stdout: JSON.stringify({
+					ok: true,
+					result: {
+						...report.status,
+						kind: "prompt",
+						clientRef: send.opRef,
+						content: {
+							version: 1,
+							type: "text",
+							text: "partial",
+							byteLength: 7,
+							truncated: true,
+						},
+					},
+				}),
+			});
+		}
+		let attaches = 0;
+		port.attachTail = async () => {
+			attaches++;
+			throw new Error("protocol_error: broker tail timeout");
+		};
+		const terminals: string[] = [];
+		const logs: string[] = [];
+		manager = new PersonaSessionManager({
+			database: database!,
+			port,
+			instanceId: "instance-test",
+			repo: join(home, "workspace"),
+			log: (line) => logs.push(line),
+			onTurnStart: ({ trigger }) => ({
+				text: trigger.body,
+				onTerminal: ({ text }) => {
+					terminals.push(text);
+				},
+			}),
+		});
+		await manager.recover();
+		await manager.reconcile(KEY);
+		expect(port.sends).toHaveLength(1);
+		if (outcome === "in_flight") {
+			expect(attaches).toBeGreaterThan(0);
+			expect(port.workerOutputReads).toHaveLength(0);
+			expect(logs.some((line) => line.includes("protocol_error"))).toBe(true);
+		} else {
+			expect(attaches).toBe(0);
+			expect(port.workerOutputReads.length).toBeGreaterThan(0);
+			expect(
+				port.workerOutputReads.every((read) => read.opRef === send.opRef && read.sessionId === send.sessionId),
+			).toBe(true);
+		}
+		expect(terminals).toEqual(outcome === "complete" ? ["original result"] : []);
+		expect(database!.inboundTurnRow(send.opRef)?.turn_state).toBe(outcome === "complete" ? "done" : "accepted");
+		if (outcome === "incomplete") expect(logs.some((line) => line.includes("reason=incomplete_body"))).toBe(true);
+	});
+
 for (const answer of ["owned original answer", ""])
 	test(`terminal recovery reads only the accepted original operation (empty=${answer === ""})`, async () => {
 		const port = new ScriptedSessionPort();
@@ -490,6 +560,11 @@ for (const exact of [false, true])
 		const first = port.sends[0]!;
 		await manager!.stop();
 		port.seedOperation(first.opRef, first.sessionId, "failed");
+		let attaches = 0;
+		port.attachTail = async () => {
+			attaches++;
+			throw new Error("protocol_error: terminal recovery must not attach");
+		};
 		if (exact) port.setFailedTurnEvidence(first.sessionId, "unsupported_input_status");
 		manager = new PersonaSessionManager({
 			database: database!,
@@ -501,6 +576,7 @@ for (const exact of [false, true])
 		await manager.tick(KEY);
 		await eventually(() => manager!.state(KEY) === "idle", "recovered terminal did not settle");
 		expect(port.sends).toHaveLength(1);
+		expect(attaches).toBe(0);
 		expect(database!.inboundTurnRow(first.opRef)?.turn_state).toBe("done");
 		expect(database!.getSessionRecord(KEY)?.epoch).toBe(exact ? 1 : 0);
 	});
