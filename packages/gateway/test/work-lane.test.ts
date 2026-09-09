@@ -89,6 +89,68 @@ async function started(f: Awaited<ReturnType<typeof fixture>>, name = "a", notif
 	return result;
 }
 
+for (const model of ["startup-model", { preset: "startup-preset" }]) {
+	test(`proven startup model skips only the newly bound session's duplicate send model: ${JSON.stringify(model)}`, async () => {
+		const f = await fixture();
+		const first = await f.manager.start({ name: "a", text: "work", cwd: f.directory, model });
+		if (!first.started) throw new Error("unexpected hold");
+		expect(f.port.binds[0]?.model).toEqual(model);
+		expect(f.port.sends).toHaveLength(1);
+		expect(Object.hasOwn(f.port.sends[0]!, "model")).toBe(false);
+		f.port.complete(first.opRef, "done");
+		await until(() => f.db.workAttemptGet(first.opRef)?.settledAt !== null);
+
+		const bind = f.port.bind.bind(f.port);
+		f.port.bind = async (input) => ({ ...(await bind(input)), startupModelApplied: false });
+		const nextModel = "later-turn-model";
+		const second = await f.manager.start({ name: "a", text: "again", cwd: f.directory, model: nextModel });
+		if (!second.started) throw new Error("unexpected hold");
+		expect(second.sessionId).toBe(first.sessionId);
+		expect(f.port.binds[1]?.model).toBe(nextModel);
+		expect(f.port.sends).toHaveLength(2);
+		expect(f.port.sends[1]?.model).toBe(nextModel);
+	});
+}
+
+for (const startupModelApplied of [false, undefined]) {
+	test(`binding without startup proof forwards the requested model: ${startupModelApplied}`, async () => {
+		const f = await fixture();
+		const bind = f.port.bind.bind(f.port);
+		f.port.bind = async (input) => {
+			const { startupModelApplied: _, ...binding } = await bind(input);
+			return startupModelApplied === undefined ? binding : { ...binding, startupModelApplied };
+		};
+		const model = { preset: "requested-preset" };
+		await f.manager.start({ name: "a", text: "work", cwd: f.directory, model });
+		expect(f.port.binds[0]?.model).toEqual(model);
+		expect(f.port.sends).toHaveLength(1);
+		expect(f.port.sends[0]?.model).toEqual(model);
+	});
+}
+
+test("failed send after proven startup model remains uncertain without retry or resend", async () => {
+	const f = await fixture();
+	let attempts = 0;
+	f.port.send = async (input) => {
+		attempts++;
+		f.port.sendAttempts.push(input);
+		throw new Error("session_unavailable");
+	};
+	await expect(
+		f.manager.start({ name: "a", text: "work", cwd: f.directory, model: "startup-model" }),
+	).rejects.toMatchObject({ detail: { reasonCode: "send_acceptance_uncertain" } });
+	const opRef = f.job().attempts[0]!.opRef;
+	expect(f.db.workAttemptGet(opRef)?.sendPhase).toBe("uncertain");
+	await f.manager.recover();
+	await f.restart();
+	expect(attempts).toBe(1);
+	expect(Object.hasOwn(f.port.sendAttempts[0]!, "model")).toBe(false);
+	expect(f.port.binds).toHaveLength(1);
+	expect(f.port.resumes).toHaveLength(0);
+	expect(f.db.workAttemptGet(opRef)?.sendEvidence).toBeNull();
+	expect(f.job().attempts[0]?.endedAt).toBeUndefined();
+});
+
 test("start acknowledges before terminal, one observer survives caller-free completion and refreshes activity", async () => {
 	const f = await fixture();
 	let attaches = 0;

@@ -306,7 +306,8 @@ export class WorkLaneManager {
 					opRef,
 					text: input.text,
 					codingRegister: true,
-					...(input.model ? { model: input.model } : {}),
+					// Only this bind receipt can prove the requested model was applied at startup.
+					...(input.model && binding.startupModelApplied !== true ? { model: input.model } : {}),
 				});
 				accepted = receipt.operationRef === opRef && receipt.sessionId === runtime.sessionId;
 			} catch (error) {
