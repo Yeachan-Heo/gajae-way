@@ -1,5 +1,112 @@
-import { open, readFile, rename, unlink } from "node:fs/promises";
+import { dlopen, FFIType } from "bun:ffi";
+import { constants } from "node:fs";
+import { lstat, open, readFile, rename, unlink } from "node:fs/promises";
 import { join } from "node:path";
+
+export const HOME_LOCK_FILE = "gateway-home.lock";
+
+// The inode is permanent. Only the kernel may release this lock (close/exit),
+// never a PID check followed by unlink, which admits two simultaneous holders.
+let advisoryLock: { readonly symbols: { readonly flock: (fd: number, operation: number) => number } } | undefined;
+function flock(fd: number, operation: number): number {
+	if (!advisoryLock) {
+		const library =
+			process.platform === "darwin"
+				? "/usr/lib/libSystem.B.dylib"
+				: process.platform === "linux"
+					? "libc.so.6"
+					: undefined;
+		if (!library) throw new Error("gateway_home_lock_platform_unsupported");
+		advisoryLock = dlopen(library, { flock: { args: [FFIType.i32, FFIType.i32], returns: FFIType.i32 } });
+	}
+	return advisoryLock.symbols.flock(fd, operation);
+}
+
+export interface GatewayHomeLease {
+	readonly token: string;
+	release(): Promise<void>;
+}
+
+/** Shared by boot and offline administration; does not touch daemon.pid or SDK files. */
+export async function acquireGatewayHome(home: string): Promise<GatewayHomeLease> {
+	const path = join(home, HOME_LOCK_FILE);
+	let created = false;
+	const handle = await open(
+		path,
+		constants.O_RDWR | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW,
+		0o600,
+	).then(
+		(file) => {
+			created = true;
+			return file;
+		},
+		(error: NodeJS.ErrnoException) => {
+			if (error.code !== "EEXIST") throw error;
+			return open(path, constants.O_RDWR | constants.O_NOFOLLOW);
+		},
+	);
+	try {
+		const info = await handle.stat();
+		if (!info.isFile() || info.nlink !== 1 || info.size > 4096) throw new Error("gateway_home_owner_indeterminate");
+		if (flock(handle.fd, 2 | 4) !== 0) throw new Error("gateway_home_owned"); // LOCK_EX | LOCK_NB
+		const raw = await handle.readFile("utf8");
+		if (raw.length > 4096) throw new Error("gateway_home_owner_indeterminate");
+		if (!created || raw.length) {
+			let owner: Record<string, unknown>;
+			try {
+				owner = JSON.parse(raw);
+			} catch {
+				throw new Error("gateway_home_owner_indeterminate");
+			}
+			if (
+				!owner ||
+				!Number.isSafeInteger(owner.pid) ||
+				(owner.pid as number) <= 0 ||
+				typeof owner.token !== "string" ||
+				!owner.token ||
+				typeof owner.startedAt !== "string" ||
+				!Number.isFinite(Date.parse(owner.startedAt)) ||
+				!["held", "released"].includes(owner.state as string)
+			)
+				throw new Error("gateway_home_owner_indeterminate");
+			// A valid abandoned record is recoverable only after kernel ownership is
+			// acquired AND its old process is proven gone. PID reuse fails closed.
+			if (owner.state === "held" && defaultTakeoverPorts().isPidAlive(owner.pid as number))
+				throw new Error("gateway_home_owner_live");
+		}
+		const token = crypto.randomUUID();
+		const owner = { pid: process.pid, token, startedAt: new Date().toISOString(), state: "held" };
+		const persist = async () => {
+			const bytes = Buffer.from(`${JSON.stringify(owner)}\n`);
+			let offset = 0;
+			while (offset < bytes.length) {
+				const result = await handle.write(bytes, offset, bytes.length - offset, offset);
+				if (!result.bytesWritten) throw new Error("gateway_home_owner_write_failed");
+				offset += result.bytesWritten;
+			}
+			await handle.truncate(bytes.length);
+			await handle.sync();
+		};
+		await persist();
+		let released = false;
+		return {
+			token,
+			release: async () => {
+				if (released) return;
+				released = true;
+				try {
+					owner.state = "released";
+					await persist();
+				} finally {
+					await handle.close();
+				}
+			},
+		};
+	} catch (error) {
+		await handle.close();
+		throw error;
+	}
+}
 
 /**
  * One gateway per GAJAEWAY_HOME. The daemon's lifecycle belongs to the service
@@ -15,13 +122,12 @@ import { join } from "node:path";
  * touched, and it must be settled without the gateway becoming a process
  * manager.
  *
- * Policy: when a live same-home gateway holds the pid record, the newcomer
- * WAITS (bounded) for it to exit - the service manager already sent it the
- * stop signal, or is about to. If it is still alive at the deadline the
- * newcomer exits non-zero and lets the service manager retry under its own
- * throttle. With `--only-new` there is no wait: any live predecessor is an
- * immediate refusal. A pid record whose process is dead, or is not a gateway
- * for THIS home, is stale and is replaced.
+ * The kernel lease above is the ownership authority for both boot and admin;
+ * a contending lease refuses immediately so the service manager can retry.
+ * The PID record below remains service presentation and a conservative guard
+ * against pre-lock daemons. Proven same-home legacy daemons are waited out
+ * (bounded), unless --only-new is requested. Only dead PID records are stale;
+ * malformed records and live unrelated processes are never silently replaced.
  */
 
 export const PID_FILE = "daemon.pid";
@@ -92,9 +198,9 @@ export function isSameHomeGateway(record: PidRecord, home: string, ports: Takeov
 }
 
 /**
- * Settles ownership of `home` for this process and records it. Returns the
- * pid of the predecessor this process waited out, or undefined when there was
- * none. Never signals another process.
+ * Publishes the service PID after the caller acquires an exclusive home lease.
+ * Returns the pid of a legacy predecessor waited out, or undefined. This PID
+ * presentation alone is not an exclusive lock. Never signals another process.
  */
 export async function claimGatewayHome(
 	home: string,
@@ -102,6 +208,14 @@ export async function claimGatewayHome(
 	ports: TakeoverPorts,
 ): Promise<number | undefined> {
 	const existing = await readPidRecord(home);
+	if (!existing) {
+		try {
+			await lstat(pidFilePath(home));
+			throw new Error("gateway_pid_indeterminate");
+		} catch (error) {
+			if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+		}
+	}
 	let predecessor: number | undefined;
 	if (existing && isSameHomeGateway(existing, home, ports)) {
 		if (options.onlyNew) throw new GatewayAlreadyRunningError(existing.pid, home, "--only-new refuses to wait for it");
@@ -118,6 +232,12 @@ export async function claimGatewayHome(
 		ports.log(`gateway_predecessor_exited pid=${existing.pid}`);
 		predecessor = existing.pid;
 	} else if (existing) {
+		if (ports.isPidAlive(existing.pid))
+			throw new GatewayAlreadyRunningError(
+				existing.pid,
+				home,
+				"live process identity is not a proven same-home gateway",
+			);
 		ports.log(`gateway_pid_stale pid=${existing.pid} home=${existing.home} reason=not_a_live_gateway_for_this_home`);
 	}
 	await writePidRecord(home, { pid: process.pid, home, startedAt: new Date().toISOString() });
@@ -163,7 +283,7 @@ export function defaultTakeoverPorts(log: (line: string) => void = (line) => con
 				process.kill(pid, 0);
 				return true;
 			} catch (error) {
-				return (error as NodeJS.ErrnoException).code === "EPERM";
+				return (error as NodeJS.ErrnoException).code !== "ESRCH";
 			}
 		},
 		commandOf: (pid) => {

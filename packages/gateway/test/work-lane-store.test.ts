@@ -31,6 +31,12 @@ async function fixture() {
 	const path = join(directory, "gateway.db");
 	const database = await GatewayDatabase.open(path);
 	handles.push(database);
+	const canonicalAgentDir = join(directory, "agent");
+	const authority = { canonicalAgentDir, identity: `gjc:${canonicalAgentDir}` };
+	database.assertBrokerAuthority(authority, { initializeEmpty: true });
+	expect(
+		database.recordOwnedBinding({ authority, sessionId: SESSION, originKey: "work/task/a", epoch: 0, repo: "/work" }),
+	).toBe(true);
 	const raw = new Database(path);
 	handles.push(raw);
 	const record = appendAttempt(
@@ -63,7 +69,6 @@ async function fixture() {
 		settledAt: null,
 		version: 0,
 	};
-	database.putSession(runtime.sessionKey, SESSION);
 	const closed = closeAttempt({ record, opRef: runtime.opRef, endState: "completed", endedAt: END });
 	const settlement: WorkAttemptSettlement = {
 		terminal: {
@@ -82,7 +87,7 @@ async function fixture() {
 		"[lane a] completed: output_unavailable",
 		runtime.deliveryId,
 	)!;
-	return { path, database, raw, record, runtime, closed, settlement, payload };
+	return { path, database, raw, authority, record, runtime, closed, settlement, payload };
 }
 
 describe("work attempt durable transactions", () => {
@@ -272,7 +277,7 @@ describe("work attempt durable transactions", () => {
 			byteLength: 8,
 		};
 		const output = { ...f.runtime.output, disposition: "silent" as const, knownSilence: proof, proof, excerpt: null };
-		f.raw.exec("CREATE TRIGGER fault BEFORE INSERT ON session_tail_cursors BEGIN SELECT RAISE(ABORT, 'fault'); END");
+		f.raw.exec("CREATE TRIGGER fault BEFORE INSERT ON broker_tail_cursors BEGIN SELECT RAISE(ABORT, 'fault'); END");
 		expect(() => f.database.workAttemptUpdate(f.runtime.opRef, 0, { output }, "cursor-final")).toThrow();
 		expect(f.database.workAttemptGet(f.runtime.opRef)?.output.knownSilence).toBeNull();
 		expect(f.database.tailCursorGet(SESSION)).toBeUndefined();
@@ -367,10 +372,36 @@ describe("work attempt durable transactions", () => {
 	test("v21 migration preserves historical open history and adopts without target", async () => {
 		const f = await fixture();
 		f.database.putLaneJob({ ...f.record, laneKey: f.runtime.laneKey, json: JSON.stringify(f.record) });
-		f.raw.exec("DROP TABLE work_attempt_runtime; DELETE FROM schema_migrations WHERE version = 21");
+		// Preserve the fixture's explicit provenance while replaying v21 and v22.
+		// Restoring a snapshot is not initialization/adoption of a populated database.
+		f.raw.exec(`CREATE TEMP TABLE saved_authority AS SELECT * FROM broker_authority;
+			CREATE TEMP TABLE saved_bindings AS SELECT * FROM broker_owned_bindings;`);
+		for (const table of ["inbound_messages", "lane_jobs", "work_attempt_runtime", "monitor_events", "authored_outputs"])
+			for (const action of ["update", "delete"]) f.raw.exec(`DROP TRIGGER ${table}_quarantine_${action}`);
+		for (const table of ["broker_owned_bindings", "broker_cutovers", "broker_quarantine", "broker_retired_sessions"])
+			for (const action of ["update", "delete"]) f.raw.exec(`DROP TRIGGER ${table}_immutable_${action}`);
+		for (const table of [
+			"broker_authority",
+			"broker_owned_bindings",
+			"broker_tail_cursors",
+			"broker_cutovers",
+			"broker_quarantine",
+			"broker_retired_sessions",
+		])
+			f.raw.exec(`DROP TABLE ${table}`);
+		f.raw.exec("DROP TABLE work_attempt_runtime; DELETE FROM schema_migrations WHERE version >= 21");
 		const migrated = await GatewayDatabase.open(f.path);
 		handles.push(migrated);
-		expect(migrated.schemaVersion).toBe(21);
+		f.raw.exec(`INSERT INTO broker_authority SELECT * FROM saved_authority;
+			INSERT INTO broker_owned_bindings SELECT * FROM saved_bindings;
+			DROP TABLE saved_authority;
+			DROP TABLE saved_bindings;`);
+		migrated.assertBrokerAuthority(f.authority);
+		expect(migrated.assertOwnedSession(SESSION, f.runtime.cwd, f.authority)).toMatchObject({
+			originKey: f.runtime.sessionKey,
+			epoch: f.runtime.epoch,
+		});
+		expect(migrated.schemaVersion).toBe(22);
 		expect(migrated.laneJobJson(f.runtime.jobId)).toBe(JSON.stringify(f.record));
 		const historical = { ...f.runtime, mode: "historical" as const, sendPhase: "uncertain" as const, target: null };
 		migrated.workAttemptPrepare(historical, f.record);

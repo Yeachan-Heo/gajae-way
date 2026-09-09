@@ -5,7 +5,7 @@ import { join } from "node:path";
 import type { GatewayConfig } from "../src/config";
 import { type GatewayServer, startUnixServer } from "../src/server/server";
 import { GatewayDatabase } from "../src/store/db";
-import { sessionPortFromResponder } from "./session-port.fake";
+import { attachTestBrokerOwnership, sessionPortFromResponder } from "./session-port.fake";
 
 const ORIGIN = { platform: "discord", kind: "channel", conversationId: "chan-1" } as const;
 const ORIGIN_KEY = "discord/channel/chan-1";
@@ -72,11 +72,13 @@ async function gateway(reply: string): Promise<Harness> {
 	const database = await GatewayDatabase.open(config.dbPath);
 	const turns: string[] = [];
 	const sessionPort = sessionPortFromResponder({
+		bind: async (originKey, epoch) => `session-${originKey}-${epoch}`,
 		respond: async (_sessionId, text) => {
 			turns.push(text);
 			return reply;
 		},
 	});
+	attachTestBrokerOwnership(database, sessionPort, join(directory, "agent"));
 	server = await startUnixServer({ config, database, sessionPort, onStop: () => database.close() });
 	const client = await connect(config.socketPath);
 	client.send({ v: "0.1", type: "hello", payload: { supportedVersions: ["0.1"] } });

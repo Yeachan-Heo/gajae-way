@@ -2,6 +2,7 @@ import { expect, test } from "bun:test";
 import { readdir, readFile } from "node:fs/promises";
 import { join, relative } from "node:path";
 import { parseConfigFile } from "../src/config";
+import { GlobalGjcClient } from "../src/orchestrator/broker";
 
 const SOURCE_ROOT = join(import.meta.dir, "../src");
 
@@ -53,8 +54,60 @@ test("persistent-session lifecycle logs retain their grep-stable formats", async
 		"steer_delivered originKey=",
 		"stall_alert originKey=",
 		"compaction_event sessionId=",
-		"broker_restart generation=",
 		"retired_hold originKey=",
 	])
 		expect(text).toContain(format);
+});
+
+test("global client observes availability and identity changes without private broker lifecycle commands", async () => {
+	const brokerSource = await readFile(join(SOURCE_ROOT, "orchestrator/broker.ts"), "utf8");
+	expect(brokerSource).not.toMatch(/\b(?:BrokerManager|startBroker|stopBroker|restartBroker|ensureBroker)\b/);
+	expect(brokerSource).not.toContain("broker_restart generation=");
+	const commands: string[][] = [];
+	const logs: string[] = [];
+	const generations: number[] = [];
+	let healthy = true;
+	let pid = 100;
+	let spawned = 0;
+	const client = new GlobalGjcClient({
+		executable: process.execPath,
+		agentDir: SOURCE_ROOT,
+		spawn: () => {
+			spawned++;
+			throw new Error("global observation must not spawn a broker or relay");
+		},
+		command: async (args) => {
+			commands.push([...args]);
+			throw new Error(`unexpected SDK command: ${args.join(" ")}`);
+		},
+		discovery: async () => ({ pid, url: "ws://127.0.0.1:4567", token: "fixture-token", heartbeatAt: Date.now() }),
+		healthProbe: async () => healthy,
+		healthIntervalMs: 5,
+		reconnectBackoff: { initialMs: 5, maxMs: 5 },
+		log: (line) => logs.push(line),
+	});
+	const unsubscribe = client.onGeneration((generation) => generations.push(generation));
+	const waitUntil = async (predicate: () => boolean) => {
+		for (let attempt = 0; attempt < 200 && !predicate(); attempt++) await Bun.sleep(5);
+		expect(predicate()).toBe(true);
+	};
+	try {
+		await client.start();
+		expect(generations).toEqual([1]);
+		healthy = false;
+		await waitUntil(() => logs.some((line) => line.includes("global broker unavailable; observing without repair")));
+		expect(client.generation).toBe(1);
+		expect(generations).toEqual([1]);
+		healthy = true;
+		pid = 101;
+		await waitUntil(() => client.generation === 2);
+		expect(generations).toEqual([1, 2]);
+		expect(logs.every((line) => !line.includes("broker_restart"))).toBe(true);
+	} finally {
+		unsubscribe();
+		await client.stop();
+	}
+	// Discovery-backed start, outage observation, reconnection and stop never launch or repair the daemon.
+	expect(commands).toEqual([]);
+	expect(spawned).toBe(0);
 });

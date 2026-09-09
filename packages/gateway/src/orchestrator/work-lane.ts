@@ -142,6 +142,7 @@ export class WorkLaneManager {
 	#current(observer: Observer): boolean {
 		return (
 			!this.#stopped &&
+			!this.#db.isBrokerQuarantined("work", observer.runtime.jobId) &&
 			!observer.abort.signal.aborted &&
 			this.#observers.get(observer.runtime.opRef) === observer &&
 			observer.generation === (this.#options.brokerGeneration?.() ?? 0)
@@ -157,6 +158,8 @@ export class WorkLaneManager {
 		);
 	}
 	#job(name: string, required = false): LaneJobRecord | undefined {
+		const { jobId } = laneJobIdentity(name);
+		this.#assertNotQuarantined(jobId, name);
 		try {
 			const { jobId, laneKey } = laneJobIdentity(name);
 			const byId = this.#db.laneJobJson(jobId);
@@ -190,6 +193,14 @@ export class WorkLaneManager {
 			if (error instanceof ProtocolError) throw error;
 			throw new ProtocolError("verb_failed", "work lane state unavailable", { reasonCode: "lane_state_corrupt", name });
 		}
+	}
+	#assertNotQuarantined(jobId: string, name?: string): void {
+		if (this.#db.isBrokerQuarantined("work", jobId))
+			throw new ProtocolError("verb_failed", "work lane belongs to a quarantined broker authority", {
+				reasonCode: "broker_authority_quarantined",
+				jobId,
+				...(name === undefined ? {} : { name }),
+			});
 	}
 	async start(params: unknown): Promise<WorkStartResult> {
 		return this.#start(parseInput(params, "start", this.#options.ownerTarget?.()), "start");
@@ -346,7 +357,12 @@ export class WorkLaneManager {
 		let op: PromptStatusBody | null = null;
 		if (attempt && binding?.sessionId === attempt.sessionId) {
 			try {
-				op = await this.#query({ opRef: attempt.opRef, sessionId: attempt.sessionId, cwd: job.lane.worktreePath });
+				op = await this.#query({
+					jobId: job.jobId,
+					opRef: attempt.opRef,
+					sessionId: attempt.sessionId,
+					cwd: job.lane.worktreePath,
+				});
 			} catch {
 				throw workError("work status unavailable", "status_unavailable", { ...attempt, jobId: job.jobId });
 			}
@@ -410,7 +426,8 @@ export class WorkLaneManager {
 			return { steered: true, clientRef };
 		});
 	}
-	async #query(runtime: { sessionId: string; cwd: string; opRef: string }): Promise<PromptStatusBody> {
+	async #query(runtime: { jobId: string; sessionId: string; cwd: string; opRef: string }): Promise<PromptStatusBody> {
+		this.#assertNotQuarantined(runtime.jobId);
 		const report = await this.#port.status({ sessionId: runtime.sessionId, repo: runtime.cwd, opRef: runtime.opRef });
 		if (
 			report.operationRef !== runtime.opRef ||

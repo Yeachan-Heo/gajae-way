@@ -10,6 +10,8 @@ import { GatewayDatabase } from "../src/store/db";
 test("a poisoned session-create key advances one epoch and retries with a fresh key", async () => {
 	const home = await mkdtemp(join(tmpdir(), "gajaeway-create-epoch-"));
 	const database = await GatewayDatabase.open(join(home, "gateway.db"));
+	const authority = { canonicalAgentDir: home, identity: `gjc:${home}` };
+	database.assertBrokerAuthority(authority, { initializeEmpty: true });
 	let creates = 0;
 	const inputs: Array<Record<string, unknown>> = [];
 	const run: CliRunner = async (args) => {
@@ -41,6 +43,7 @@ test("a poisoned session-create key advances one epoch and retries with a fresh 
 	};
 	const port = new BrokerSessionPort({
 		database,
+		authority,
 		cli: run,
 		instanceId: "create-epoch",
 		tailRunner: new TailRunner({ run, repo: join(home, "workspace") }),

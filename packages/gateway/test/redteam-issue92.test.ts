@@ -10,7 +10,7 @@ import { PersonaSessionManager, personaTurnOpRef } from "../src/orchestrator/per
 import type { SessionSendInput, SessionSteerInput } from "../src/orchestrator/session-port";
 import type { TailAttachInput } from "../src/orchestrator/tail-runner";
 import { GatewayDatabase, type InboundTurn } from "../src/store/db";
-import { ScriptedSessionPort, steerRefused } from "./session-port.fake";
+import { attachTestBrokerOwnership, ScriptedSessionPort, steerRefused } from "./session-port.fake";
 
 const ORIGIN = { platform: "loopback", kind: "loopback", conversationId: "issue92-redteam" } as const;
 const ORIGIN_KEY = "loopback/loopback/issue92-redteam";
@@ -52,7 +52,9 @@ function required<T>(value: T | undefined, message: string): T {
 async function fixture(options: FixtureOptions = {}): Promise<Fixture> {
 	const home = await mkdtemp(join(tmpdir(), "gajaeway-issue92-redteam-"));
 	const database = await GatewayDatabase.open(join(home, "gateway.db"));
-	const port = options.port ?? new ScriptedSessionPort();
+	const port =
+		options.port ?? new ScriptedSessionPort({ onBind: (input) => `${input.originKey}-session-${input.epoch}` });
+	attachTestBrokerOwnership(database, port, join(home, "canonical-agent"));
 	const turns = new Map<string, InboundTurn>();
 	const discarded: string[] = [];
 	const logs: string[] = [];
@@ -145,7 +147,7 @@ class FailFirstSteerPort extends ScriptedSessionPort {
 
 	constructor() {
 		// Epoch-keyed binds: a rebound epoch gets a NEW session, as the broker does.
-		super({ onBind: (input) => `session-${input.epoch}` });
+		super({ onBind: (input) => `${input.originKey}-session-${input.epoch}` });
 	}
 
 	async steer(input: SessionSteerInput): Promise<void> {
@@ -160,7 +162,7 @@ class IntermittentSteerPort extends ScriptedSessionPort {
 	steerAttempts = 0;
 
 	constructor(failAttempts: ReadonlySet<number>) {
-		super();
+		super({ onBind: (input) => `${input.originKey}-session-${input.epoch}` });
 		this.#failAttempts = failAttempts;
 	}
 
@@ -221,7 +223,7 @@ async function sourceFiles(directory: string): Promise<string[]> {
 }
 
 test("red-team: a strict tail retention gap does not infer terminal or create another turn", async () => {
-	const port = new RetentionGapPort();
+	const port = new RetentionGapPort({ onBind: (input) => `${input.originKey}-session-${input.epoch}` });
 	const target = await fixture({ port });
 	try {
 		enqueue(target, "gap-trigger", "keep the turn open");
@@ -296,7 +298,7 @@ test("canonical: a steer the running session refuses replaces the session; the m
 });
 
 test("canonical: a stream of 500ms fragments never waits - the first is the turn, each later one is steered in arrival order, and all are attributed", async () => {
-	const port = new ScriptedSessionPort();
+	const port = new ScriptedSessionPort({ onBind: (input) => `${input.originKey}-session-${input.epoch}` });
 	const target = await fixture({ port });
 	try {
 		const base = Date.now();
@@ -329,13 +331,13 @@ test("canonical: a stream of 500ms fragments never waits - the first is the turn
 });
 
 test("red-team: restart after broker acceptance but before durable acceptance reconciles the same op-ref without another send", async () => {
-	const port = new ScriptedSessionPort();
+	const port = new ScriptedSessionPort({ onBind: (input) => `${input.originKey}-session-${input.epoch}` });
 	const target = await fixture({ port });
 	try {
 		const receivedAt = new Date().toISOString();
 		const repo = join(target.home, "workspace");
 		const binding = await port.bind({ originKey: ORIGIN_KEY, epoch: 0, repo });
-		expect(target.database.putSessionAtEpoch(ORIGIN_KEY, binding.sessionId, 0)).toBe(true);
+		expect(target.database.getSessionRecord(ORIGIN_KEY)).toEqual({ sessionId: binding.sessionId, epoch: 0 });
 		enqueue(target, "crash-window", "accepted before attribution", receivedAt);
 		const opRef = personaTurnOpRef("issue92-redteam", ORIGIN_KEY, 0, "crash-window");
 		target.database.inboundBindTurn({
@@ -368,7 +370,7 @@ test("red-team: restart after broker acceptance but before durable acceptance re
 test("red-team: /new preserves an accepted batch, discards only unbatched pre-floor work, and fences stale output", async () => {
 	const base = Date.parse("2026-09-02T00:00:00.000Z");
 	let now = base;
-	const port = new ScriptedSessionPort();
+	const port = new ScriptedSessionPort({ onBind: (input) => `${input.originKey}-session-${input.epoch}` });
 	const target = await fixture({ port, now: () => now });
 	try {
 		enqueue(target, "old-trigger", "old accepted", new Date(base).toISOString());
@@ -409,7 +411,7 @@ test("red-team: /new preserves an accepted batch, discards only unbatched pre-fl
 });
 
 test("red-team: a stall on a retired hold does not abort it, block the next epoch, or deliver stale output", async () => {
-	const port = new ScriptedSessionPort();
+	const port = new ScriptedSessionPort({ onBind: (input) => `${input.originKey}-session-${input.epoch}` });
 	const target = await fixture({ port });
 	try {
 		enqueue(target, "retired-trigger", "old generation");
@@ -443,7 +445,7 @@ test("red-team: a stall on a retired hold does not abort it, block the next epoc
 });
 
 test("red-team: an unknown unaccepted send is held once, then a live-idle session releases it onto a fresh epoch instead of bricking the origin", async () => {
-	const port = new ConflictUnknownPort();
+	const port = new ConflictUnknownPort({ onBind: (input) => `${input.originKey}-session-${input.epoch}` });
 	const target = await fixture({ port });
 	try {
 		enqueue(target, "conflict-trigger", "operation identity is unknown");
@@ -481,7 +483,7 @@ test("red-team: a terminal tail frame arriving during the status grace wins once
 	const base = Date.parse("2026-09-02T00:00:00.000Z");
 	const now = base;
 	const timers: Array<{ readonly work: () => void; readonly delayMs: number }> = [];
-	const port = new ScriptedSessionPort();
+	const port = new ScriptedSessionPort({ onBind: (input) => `${input.originKey}-session-${input.epoch}` });
 	const target = await fixture({
 		port,
 		now: () => now,
@@ -544,7 +546,7 @@ test("canonical: a message arriving while the ended turn's tail is late is steer
 	const base = Date.parse("2026-09-02T00:01:00.000Z");
 	let now = base;
 	const timers: Array<{ readonly work: () => void; readonly delayMs: number }> = [];
-	const port = new EndedTurnRejectsSteerPort();
+	const port = new EndedTurnRejectsSteerPort({ onBind: (input) => `${input.originKey}-session-${input.epoch}` });
 	const target = await fixture({
 		port,
 		now: () => now,
@@ -621,7 +623,7 @@ test("canonical: a message arriving while the ended turn's tail is late is steer
 });
 
 test("red-team: stopping during terminal-status grace cancels the grace callback so nothing touches a closed database", async () => {
-	const port = new ScriptedSessionPort();
+	const port = new ScriptedSessionPort({ onBind: (input) => `${input.originKey}-session-${input.epoch}` });
 	const target = await fixture({ port });
 	let closed = false;
 	try {
@@ -762,7 +764,10 @@ test("red-team evidence: compaction observation is wired from production monitor
 });
 
 test("red-team: an idle binding whose session died is resumed exactly once before the next send", async () => {
-	const port = new IdleRecoveryPort({ onSend: (input, scripted) => scripted.complete(input.opRef, "reply") });
+	const port = new IdleRecoveryPort({
+		onBind: (input) => `${input.originKey}-session-${input.epoch}`,
+		onSend: (input, scripted) => scripted.complete(input.opRef, "reply"),
+	});
 	const target = await fixture({ port });
 	try {
 		enqueue(target, "idle-1", "first turn");
@@ -786,6 +791,7 @@ test("red-team: an idle binding whose session died is resumed exactly once befor
 
 test("red-team: an inspect outage on an idle binding never blocks the send and never fabricates a resume", async () => {
 	const port = new InspectUnavailableIdleRecoveryPort({
+		onBind: (input) => `${input.originKey}-session-${input.epoch}`,
 		onSend: (input, scripted) => scripted.complete(input.opRef, "reply"),
 	});
 	const target = await fixture({ port });

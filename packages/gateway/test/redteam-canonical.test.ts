@@ -13,7 +13,7 @@ import type { SessionBindInput, SessionSteerInput } from "../src/orchestrator/se
 import type { TailAttachInput } from "../src/orchestrator/tail-runner";
 import { type GatewayServer, startUnixServer } from "../src/server/server";
 import { GatewayDatabase } from "../src/store/db";
-import { ScriptedSessionPort, steerRefused } from "./session-port.fake";
+import { attachTestBrokerOwnership, ScriptedSessionPort, steerRefused } from "./session-port.fake";
 
 const DIRECT_ORIGIN = { platform: "loopback", kind: "loopback", conversationId: "canonical-redteam" } as const;
 const DIRECT_ORIGIN_KEY = "loopback/loopback/canonical-redteam";
@@ -60,7 +60,9 @@ type DirectFixture = LifecycleCapture & {
 async function directFixture(options: DirectFixtureOptions = {}): Promise<DirectFixture> {
 	const home = await mkdtemp(join(tmpdir(), "gajaeway-redteam-canonical-"));
 	const database = await GatewayDatabase.open(join(home, "gateway.db"));
-	const port = options.port ?? new ScriptedSessionPort();
+	const port =
+		options.port ?? new ScriptedSessionPort({ onBind: (input) => `${input.originKey}-session-${input.epoch}` });
+	attachTestBrokerOwnership(database, port, join(home, "canonical-agent"));
 	const terminals: Array<{ trigger: string; text: string }> = [];
 	const frames: Array<{ trigger: string; text: string }> = [];
 	const logs: string[] = [];
@@ -163,7 +165,7 @@ class FailSteerPort extends ScriptedSessionPort {
 	steerAttempts = 0;
 
 	constructor(failedAttempts: ReadonlySet<number>) {
-		super({ onBind: (input) => `session-${input.epoch}` });
+		super({ onBind: (input) => `${input.originKey}-session-${input.epoch}` });
 		this.failedAttempts = failedAttempts;
 	}
 
@@ -189,7 +191,7 @@ class UnavailableReplacementBindPort extends ScriptedSessionPort {
 	steerAttempts = 0;
 
 	constructor() {
-		super({ onBind: (input) => `session-${input.epoch}` });
+		super({ onBind: (input) => `${input.originKey}-session-${input.epoch}` });
 	}
 
 	async bind(input: SessionBindInput) {
@@ -237,7 +239,7 @@ class DisownedStatusPort extends ScriptedSessionPort {
 	readonly disownedOps = new Set<string>();
 
 	constructor() {
-		super({ onBind: (input) => `session-${input.epoch}` });
+		super({ onBind: (input) => `${input.originKey}-session-${input.epoch}` });
 	}
 
 	async status(input: { sessionId: string; repo: string; opRef: string }): Promise<StatusReport> {
@@ -317,7 +319,7 @@ test("C1c: three cursorless replays of prior answers cannot move a reply onto th
 }, 15_000);
 
 test("C1d: startedAt is the floor on the host's own clock - a host clock BEHIND the gateway never reopens the previous turn's row, and a host clock AHEAD never hides the real answer", async () => {
-	const port = new HostClockPort();
+	const port = new HostClockPort({ onBind: (input) => `${input.originKey}-session-${input.epoch}` });
 	const fixture = await directFixture({ port });
 	try {
 		for (const skewMs of [-3_000, +3_000]) {
@@ -426,7 +428,7 @@ test("C2b: a message accepted after terminal observation but before dispatchNext
 test("C2c: a bind failure preserves the row and dispatches it exactly once through the 2s retry seam", async () => {
 	const timers: ScheduledTimer[] = [];
 	const seam = timerSeam(timers);
-	const port = new FailFirstBindPort();
+	const port = new FailFirstBindPort({ onBind: (input) => `${input.originKey}-session-${input.epoch}` });
 	const fixture = await directFixture({ port, ...seam });
 	try {
 		await admit(fixture, "bind-retry", "retry me");
@@ -452,7 +454,7 @@ test("C2c: a bind failure preserves the row and dispatches it exactly once throu
 });
 
 test("C2d: /new discards only an undispatched row; the already-running turn still closes its trigger but its output is fenced as stale (the user asked for a fresh start)", async () => {
-	const port = new TrackingTailPort();
+	const port = new TrackingTailPort({ onBind: (input) => `${input.originKey}-session-${input.epoch}` });
 	const fixture = await directFixture({ port });
 	try {
 		await admit(fixture, "reset-running", "running prompt");
@@ -676,7 +678,9 @@ async function serverFixture(
 		...(options.dmPolicy ? { dmPolicy: options.dmPolicy } : {}),
 	};
 	const database = await GatewayDatabase.open(config.dbPath);
-	const port = options.port ?? new ScriptedSessionPort();
+	const port =
+		options.port ?? new ScriptedSessionPort({ onBind: (input) => `${input.originKey}-session-${input.epoch}` });
+	attachTestBrokerOwnership(database, port, join(home, "canonical-agent"));
 	const server = await startUnixServer({ config, database, sessionPort: port, onStop: () => database.close() });
 	const client = await connect(config.socketPath);
 	client.send({ v: "0.1", type: "hello", payload: { supportedVersions: ["0.1"] } });
@@ -966,7 +970,7 @@ class BindFailsNTimesPort extends ScriptedSessionPort {
 
 test("D4: bind failures back off 2s,4s,8s,16s with one unrecoverable log at the bound, and a success resets the counter", async () => {
 	const timers: ScheduledTimer[] = [];
-	const port = new BindFailsNTimesPort();
+	const port = new BindFailsNTimesPort({ onBind: (input) => `${input.originKey}-session-${input.epoch}` });
 	port.failUntil = 4;
 	const fixture = await directFixture({ port, ...timerSeam(timers) });
 	try {
@@ -1016,7 +1020,7 @@ test("D4: bind failures back off 2s,4s,8s,16s with one unrecoverable log at the 
 
 test("D5: a message admitted while a bind retry is armed waits for the retry; the retry dispatches the oldest and steers the newer", async () => {
 	const timers: ScheduledTimer[] = [];
-	const port = new BindFailsNTimesPort();
+	const port = new BindFailsNTimesPort({ onBind: (input) => `${input.originKey}-session-${input.epoch}` });
 	port.failUntil = 1;
 	const fixture = await directFixture({ port, ...timerSeam(timers) });
 	try {
@@ -1042,7 +1046,7 @@ test("D5: a message admitted while a bind retry is armed waits for the retry; th
 test("D7: steers carry the same speaker/place/reply header as a trigger; a loopback steer without engagement is the raw body", async () => {
 	// Sends are acknowledged and never completed: every turn stays running,
 	// so the follow-ups are steers.
-	const port = new ScriptedSessionPort();
+	const port = new ScriptedSessionPort({ onBind: (input) => `${input.originKey}-session-${input.epoch}` });
 	const fixture = await serverFixture({ port, dmPolicy: "open", channels: { "d7-chan": { engagement: "open" } } });
 	try {
 		const channel = { platform: "discord", kind: "channel", conversationId: "d7-chan" } as const;
@@ -1105,6 +1109,20 @@ test("D8: migration 19 maps every v18 row exactly once even when a corrupt attri
 	try {
 		(await GatewayDatabase.open(path)).close();
 		const raw = new (await import("bun:sqlite")).Database(path);
+		// Remove v22 completely before replaying historical DDL; missing objects are fixture errors.
+		for (const table of ["inbound_messages", "lane_jobs", "work_attempt_runtime", "monitor_events", "authored_outputs"])
+			for (const action of ["update", "delete"]) raw.exec(`DROP TRIGGER ${table}_quarantine_${action}`);
+		for (const table of ["broker_owned_bindings", "broker_cutovers", "broker_quarantine", "broker_retired_sessions"])
+			for (const action of ["update", "delete"]) raw.exec(`DROP TRIGGER ${table}_immutable_${action}`);
+		for (const table of [
+			"broker_authority",
+			"broker_owned_bindings",
+			"broker_tail_cursors",
+			"broker_cutovers",
+			"broker_quarantine",
+			"broker_retired_sessions",
+		])
+			raw.exec(`DROP TABLE ${table}`);
 		raw.exec(`
 DROP TABLE work_attempt_runtime;
 DROP TABLE inbound_messages;
@@ -1118,6 +1136,7 @@ INSERT INTO inbound_messages (message_id, origin_key, origin_ref_json, body, eng
 `);
 		raw.close();
 		const upgraded = await GatewayDatabase.open(path);
+		expect(upgraded.schemaVersion).toBe(22);
 		const count = new (await import("bun:sqlite")).Database(path, { readonly: true })
 			.query<{ n: number }, []>("SELECT COUNT(*) AS n FROM inbound_messages")
 			.get()?.n;

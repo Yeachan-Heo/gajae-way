@@ -6,7 +6,12 @@ import { appendAttempt, closeAttempt, createLaneJobRecord, newOpRef } from "@gaj
 import { LaneGovernor, laneJobIdentity } from "../src/orchestrator/lane-governor";
 import { type GatewayServer, startUnixServer } from "../src/server/server";
 import { GatewayDatabase } from "../src/store/db";
-import { ScriptedSessionPort } from "./session-port.fake";
+import {
+	attachTestBrokerOwnership,
+	createOwnedSessionFixture,
+	initializeTestBrokerAuthority,
+	ScriptedSessionPort,
+} from "./session-port.fake";
 
 let server: GatewayServer | undefined;
 let directory = "";
@@ -27,6 +32,19 @@ function deferred() {
 	return { promise, resolve };
 }
 
+function sessionIdsByEpoch() {
+	const ids = new Map<string, string>();
+	return (input: { originKey: string; epoch: number }): string => {
+		const key = JSON.stringify([input.originKey, input.epoch]);
+		let id = ids.get(key);
+		if (!id) {
+			id = crypto.randomUUID();
+			ids.set(key, id);
+		}
+		return id;
+	};
+}
+
 async function harness(
 	maxLanes = 3,
 	hooks: {
@@ -37,17 +55,17 @@ async function harness(
 ) {
 	directory = await mkdtemp(join(tmpdir(), "lane-redteam-"));
 	const database = await GatewayDatabase.open(join(directory, "gateway.db"));
+	const sessionIdForBind = sessionIdsByEpoch();
 	const port = new ScriptedSessionPort({
 		onBind:
 			hooks.onBind ??
 			(async (input) => {
 				await hooks.beforeBind?.();
-				const id = database.getSessionRecord(input.originKey)?.sessionId || crypto.randomUUID();
-				database.putSession(input.originKey, id);
-				return id;
+				return sessionIdForBind(input);
 			}),
 		onSend: hooks.onSend ?? ((input, scripted) => scripted.complete(input.opRef, "done")),
 	});
+	attachTestBrokerOwnership(database, port, join(directory, "canonical-agent"));
 	const socketPath = join(directory, "gateway.sock");
 	server = await startUnixServer({
 		config: {
@@ -280,7 +298,7 @@ function seedJob(
 	database: GatewayDatabase,
 	name: string,
 	state: "awaiting_operator" | "done" | "attempt_ended" | "failed",
-	sessionId = crypto.randomUUID(),
+	sessionId: string = crypto.randomUUID(),
 ) {
 	const identity = laneJobIdentity(name);
 	let record = createLaneJobRecord({ jobId: identity.jobId, branch: `work/${name}`, worktreePath: process.cwd() });
@@ -306,16 +324,19 @@ for (const unavailable of [false, true]) {
 	test(`${unavailable ? "G2" : "G1"} ended gateway wait does not prove broker terminality (${unavailable ? "status unavailable" : "in_flight"})`, async () => {
 		const database = await GatewayDatabase.open(":memory:");
 		try {
-			const sessionId = crypto.randomUUID();
-			database.putSession("work/task/a", sessionId);
-			const { opRef } = seedJob(database, "a", "attempt_ended", sessionId);
 			class UnsettledPort extends ScriptedSessionPort {
 				override async status(input: Parameters<ScriptedSessionPort["status"]>[0]) {
 					if (unavailable) throw new Error("broker transport unavailable");
 					return { operationRef: input.opRef, status: { status: "in_flight" as const }, summaryCompleted: false };
 				}
 			}
-			const port = new UnsettledPort({ onSend: () => new Promise<void>(() => {}) });
+			const port = new UnsettledPort({
+				onBind: sessionIdsByEpoch(),
+				onSend: () => new Promise<void>(() => {}),
+			});
+			attachTestBrokerOwnership(database, port, join(import.meta.dir, "canonical-agent"));
+			const { sessionId } = await port.bind({ originKey: "work/task/a", epoch: 0, repo: process.cwd() });
+			const { opRef } = seedJob(database, "a", "attempt_ended", sessionId);
 			port.seedOperation(opRef, sessionId);
 			port.setSessionState(sessionId, { live: true });
 			const before = database.getSessionRecord("work/task/a");
@@ -336,7 +357,6 @@ for (const unavailable of [false, true]) {
 test("G3 ambiguous close retains identity until broker explicitly disowns session", async () => {
 	const database = await GatewayDatabase.open(":memory:");
 	try {
-		database.putSession("work/task/a", "0000aaaa-0000-4000-8000-00000000a001");
 		class AmbiguousPort extends ScriptedSessionPort {
 			disowned = false;
 			override async close(input: { sessionId: string; repo: string }) {
@@ -347,7 +367,9 @@ test("G3 ambiguous close retains identity until broker explicitly disowns sessio
 				return { live: undefined, disowned: this.disowned };
 			}
 		}
-		const port = new AmbiguousPort();
+		const port = new AmbiguousPort({ onBind: sessionIdsByEpoch() });
+		attachTestBrokerOwnership(database, port, join(import.meta.dir, "canonical-agent"));
+		await port.bind({ originKey: "work/task/a", epoch: 0, repo: process.cwd() });
 		const governor = new LaneGovernor({ database, sessionPort: port });
 		const before = database.getSessionRecord("work/task/a")!;
 		expect(await governor.retire("a", "operator")).toMatchObject({
@@ -368,15 +390,16 @@ test("G3 ambiguous close retains identity until broker explicitly disowns sessio
 test("G4 sweep snapshot cannot retire a replacement bound before lock acquisition", async () => {
 	const database = await GatewayDatabase.open(":memory:");
 	const release = deferred();
-	const port = new ScriptedSessionPort();
+	const port = new ScriptedSessionPort({ onBind: (input) => `0000aaaa-0000-4000-8000-00000000a00${input.epoch + 1}` });
+	attachTestBrokerOwnership(database, port, join(import.meta.dir, "canonical-agent"));
 	let rebinding: Promise<void> | undefined;
 	try {
-		database.putSession("work/task/a", "0000aaaa-0000-4000-8000-00000000a001");
+		await port.bind({ originKey: "work/task/a", epoch: 0, repo: process.cwd() });
 		const before = database.getSessionRecord("work/task/a")!;
 		rebinding = port.runExclusive("work/task/a", async () => {
 			await release.promise;
 			database.rebindEpoch("work/task/a");
-			database.putSession("work/task/a", "0000aaaa-0000-4000-8000-00000000a002");
+			await port.bind({ originKey: "work/task/a", epoch: before.epoch + 1, repo: process.cwd() });
 		});
 		const governor = new LaneGovernor({ database, sessionPort: port, idleRetireMs: 1 });
 		const sweeping = governor.sweep();
@@ -448,7 +471,16 @@ test("G6 idle retirement interval starts at turn end, including the exact bounda
 
 test("G7 corrupt bound job consumes socket capacity and identifies corrupt candidate", async () => {
 	const h = await harness(1);
-	h.database.putSession("work/task/a", crypto.randomUUID());
+	await createOwnedSessionFixture(
+		h.database,
+		initializeTestBrokerAuthority(h.database, join(directory, "canonical-agent")),
+		{
+			originKey: "work/task/a",
+			epoch: 0,
+			repo: process.cwd(),
+			sessionId: crypto.randomUUID(),
+		},
+	);
 	const { record, identity } = seedJob(h.database, "a", "awaiting_operator");
 	h.database.putLaneJob({ ...record, laneKey: identity.laneKey, json: "{invalid json" });
 	const result = await h.run("b");
@@ -462,7 +494,7 @@ test("G7 corrupt bound job consumes socket capacity and identifies corrupt candi
 
 test("G8 socket cycle gates unbound unsettled work but not done work", async () => {
 	const h = await harness();
-	h.database.putSession("work/task/x", "");
+	h.database.rebindEpoch("work/task/x");
 	seedJob(h.database, "x", "awaiting_operator");
 	const unsettled = (await h.request("ops.cycle")).result;
 	expect(unsettled.gates).toContain("stale_session_identity");
@@ -477,10 +509,10 @@ test("G8 socket cycle gates unbound unsettled work but not done work", async () 
 test("H1 failed ledger retires when broker proves terminal_ok", async () => {
 	const database = await GatewayDatabase.open(":memory:");
 	try {
-		const sessionId = crypto.randomUUID();
-		database.putSession("work/task/a", sessionId);
+		const port = new ScriptedSessionPort({ onBind: sessionIdsByEpoch() });
+		attachTestBrokerOwnership(database, port, join(import.meta.dir, "canonical-agent"));
+		const { sessionId } = await port.bind({ originKey: "work/task/a", epoch: 0, repo: process.cwd() });
 		const { opRef } = seedJob(database, "a", "failed", sessionId);
-		const port = new ScriptedSessionPort();
 		port.seedOperation(opRef, sessionId, "terminal_ok", "finished");
 		port.setSessionState(sessionId, { live: true });
 		const before = database.getSessionRecord("work/task/a")!;
@@ -497,10 +529,10 @@ test("H2 failed ledger with unknown broker operation needs a dead session", asyn
 	for (const live of [true, false]) {
 		const database = await GatewayDatabase.open(":memory:");
 		try {
-			const sessionId = crypto.randomUUID();
-			database.putSession("work/task/a", sessionId);
+			const port = new ScriptedSessionPort({ onBind: sessionIdsByEpoch() });
+			attachTestBrokerOwnership(database, port, join(import.meta.dir, "canonical-agent"));
+			const { sessionId } = await port.bind({ originKey: "work/task/a", epoch: 0, repo: process.cwd() });
 			seedJob(database, "a", "failed", sessionId);
-			const port = new ScriptedSessionPort();
 			port.setSessionState(sessionId, { live });
 			const before = database.getSessionRecord("work/task/a")!;
 			const governor = new LaneGovernor({ database, sessionPort: port });
@@ -522,11 +554,11 @@ test("H2 failed ledger with unknown broker operation needs a dead session", asyn
 test("H3 sweep nomination cannot retire a done job replaced by a fresh open attempt", async () => {
 	const database = await GatewayDatabase.open(":memory:");
 	const release = deferred();
-	const port = new ScriptedSessionPort();
+	const port = new ScriptedSessionPort({ onBind: sessionIdsByEpoch() });
+	attachTestBrokerOwnership(database, port, join(import.meta.dir, "canonical-agent"));
 	let updating: Promise<void> | undefined;
 	try {
-		const sessionId = crypto.randomUUID();
-		database.putSession("work/task/a", sessionId);
+		const { sessionId } = await port.bind({ originKey: "work/task/a", epoch: 0, repo: process.cwd() });
 		const { record, identity } = seedJob(database, "a", "done", sessionId);
 		const before = database.getSessionRecord("work/task/a");
 		updating = port.runExclusive("work/task/a", async () => {
@@ -556,16 +588,17 @@ test("H3 sweep nomination cannot retire a done job replaced by a fresh open atte
 test("H4 sweep refuses rebound even when the replacement job is also done", async () => {
 	const database = await GatewayDatabase.open(":memory:");
 	const release = deferred();
-	const port = new ScriptedSessionPort();
+	const port = new ScriptedSessionPort({ onBind: (input) => `0000aaaa-0000-4000-8000-00000000a00${input.epoch + 1}` });
+	attachTestBrokerOwnership(database, port, join(import.meta.dir, "canonical-agent"));
 	let updating: Promise<void> | undefined;
 	try {
-		database.putSession("work/task/a", "0000aaaa-0000-4000-8000-00000000a001");
+		await port.bind({ originKey: "work/task/a", epoch: 0, repo: process.cwd() });
 		seedJob(database, "a", "done", "0000aaaa-0000-4000-8000-00000000a001");
 		const before = database.getSessionRecord("work/task/a")!;
 		updating = port.runExclusive("work/task/a", async () => {
 			await release.promise;
 			database.rebindEpoch("work/task/a");
-			database.putSession("work/task/a", "0000aaaa-0000-4000-8000-00000000a002");
+			await port.bind({ originKey: "work/task/a", epoch: before.epoch + 1, repo: process.cwd() });
 			seedJob(database, "a", "done", "0000aaaa-0000-4000-8000-00000000a002");
 		});
 		const outcomes: Awaited<ReturnType<LaneGovernor["retire"]>>[] = [];
@@ -599,7 +632,16 @@ test("H4 sweep refuses rebound even when the replacement job is also done", asyn
 
 test("H5 empty job JSON consumes capacity and socket retirement refuses corrupt record", async () => {
 	const h = await harness(1);
-	h.database.putSession("work/task/a", "empty-record-session");
+	await createOwnedSessionFixture(
+		h.database,
+		initializeTestBrokerAuthority(h.database, join(directory, "canonical-agent")),
+		{
+			originKey: "work/task/a",
+			epoch: 0,
+			repo: process.cwd(),
+			sessionId: crypto.randomUUID(),
+		},
+	);
 	const { record, identity } = seedJob(h.database, "a", "done");
 	h.database.putLaneJob({ ...record, laneKey: identity.laneKey, json: "" });
 	const before = h.database.getSessionRecord("work/task/a");
@@ -619,7 +661,16 @@ test("H5 empty job JSON consumes capacity and socket retirement refuses corrupt 
 
 test("H6 operator socket retirement of an idle done job needs no sweep nomination", async () => {
 	const h = await harness();
-	h.database.putSession("work/task/a", "0000aaaa-0000-4000-8000-00000000a003");
+	await createOwnedSessionFixture(
+		h.database,
+		initializeTestBrokerAuthority(h.database, join(directory, "canonical-agent")),
+		{
+			originKey: "work/task/a",
+			epoch: 0,
+			repo: process.cwd(),
+			sessionId: "0000aaaa-0000-4000-8000-00000000a003",
+		},
+	);
 	seedJob(h.database, "a", "done", "0000aaaa-0000-4000-8000-00000000a003");
 	const before = h.database.getSessionRecord("work/task/a")!;
 	const governor = new LaneGovernor({ database: h.database, sessionPort: h.port });
@@ -636,9 +687,10 @@ test("H6 operator socket retirement of an idle done job needs no sweep nominatio
 test("H7 concurrent sweeps close once and bump the epoch exactly once", async () => {
 	const database = await GatewayDatabase.open(":memory:");
 	try {
-		database.putSession("work/task/a", "idle-session");
+		const port = new ScriptedSessionPort({ onBind: sessionIdsByEpoch() });
+		attachTestBrokerOwnership(database, port, join(import.meta.dir, "canonical-agent"));
+		await port.bind({ originKey: "work/task/a", epoch: 0, repo: process.cwd() });
 		const before = database.getSessionRecord("work/task/a")!;
-		const port = new ScriptedSessionPort();
 		const governor = new LaneGovernor({ database, sessionPort: port, idleRetireMs: 1 });
 		expect((await Promise.all([governor.sweep(), governor.sweep()])).sort()).toEqual([0, 1]);
 		expect(port.closes).toEqual([{ sessionId: before.sessionId, repo: process.cwd() }]);

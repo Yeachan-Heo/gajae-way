@@ -48,7 +48,7 @@ describe("lane_jobs store (migration v10)", () => {
 	test("fresh database opens at the current schema with the lane_jobs table", async () => {
 		const database = await openDatabase();
 		try {
-			expect(database.schemaVersion).toBe(21);
+			expect(database.schemaVersion).toBe(22);
 			expect(database.laneJobRows()).toEqual([]);
 			expect(database.laneJobJson("lanejob-none")).toBeUndefined();
 		} finally {

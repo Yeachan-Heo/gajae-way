@@ -20,7 +20,7 @@ dist/gajaeway
 
 Each binary requires its verb: `gajaeway-gateway daemon`, `gajaeway-admin serve`, and a subcommand for `gajaeway`. Invoked with no arguments they print usage on stderr and exit 2, so probing one never blocks. `gajaeway-discord` and `gajaeway-telegram` run in the foreground with no arguments; `gajaeway-discord --help` and `--version` answer without connecting, and a second `gajaeway-discord` refuses to boot while `$GAJAEWAY_HOME/adapter-discord.pid` names a live process.
 
-A production host does not need a source checkout, `node_modules`, or Bun to run those binaries. It **does** need the external `gjc` executable on `PATH`: gateway startup owns one private gjc agent directory for the instance, and gjc's own daemon for that directory hosts the persistent sessions (auto-started on first use; requires gjc >= 0.15.6, verified on 0.16.0). Model-provider credentials are inherited from the gateway process environment; do not place them in the broker agent directory. Provider/model configuration lives in the operator SSOT `~/.gjc/agent`; the gateway seeds its private agent directory from it on every start.
+A production host does not need a source checkout, `node_modules`, or Bun to run those binaries. It does need the same global-user `gjc` executable and canonical agent directory/broker used by the operator's interactive SDK. Verify `command -v gjc` in that user's normal shell and set the service's `GJC_EXECUTABLE` explicitly to the verified absolute executable path. Run the service as that same user with the same canonical profile environment (`HOME`, and any intentional `GJC_CONFIG_DIR`/`PI_CONFIG_DIR` or `GJC_CODING_AGENT_DIR`/`PI_CODING_AGENT_DIR` selection). Do not introduce gateway-private overrides, copy model/provider configuration, or seed settings. The default profile is `~/.gjc/agent`; using the same executable with a different agent directory is not the same runtime. GJC owns its daemon; the gateway is an SDK client only. Credentials belong in the user's established protected environment, not in copied broker settings.
 
 ## Home and configuration
 
@@ -36,7 +36,6 @@ $GAJAEWAY_HOME/
   gateway.db
   workspace/                 # SOUL.md, AGENTS.md, USER.md; gjc working directory
   memory/                    # Markdown files and private Git repository
-  broker/<instance-id>/agent/ # private broker-owned GJC state; not a credential store
   memory-receipts.jsonl
   secrets/
     discord-token
@@ -71,8 +70,8 @@ A running gateway re-reads `config.json` on `SIGHUP` (`kill -HUP <pid>`) or on t
 
 The reload is fail-safe and reports exactly what it did:
 
-- `changed` — fields applied live. `mentionAllowlist`, `channels`, and `stallTimeoutMs` are re-read at runtime; a change takes effect on the next actor event.
-- `restartRequired` — fields you edited that are bound to a startup resource (`socketPath`, `dbPath`, `model`, `serviceTier`, `credentials`, `webhook`, `watcherRoots`, `scriptRoot`, `ownerTarget`, `monitorContextFailureRollThreshold`). They are reported and deliberately NOT applied; restart to pick them up.
+- `changed` — fields applied live: `mentionAllowlist`, `channels`, `stallTimeoutMs`, and `dmPolicy`. Verify the next event through the path consuming the changed policy.
+- `restartRequired` — fields bound to startup resources: `socketPath`, `dbPath`, `model`, `serviceTier`, `credentials`, `webhook`, `watcherRoots`, `scriptRoot`, `runtime`, `ownerTarget`, `monitorContextFailureRollThreshold`, and `work`. They are reported and deliberately NOT applied; restart to pick them up.
 - `ignored` — fields you edited that no code reads at all. `logVerbosity` is currently parsed but unconsumed, so editing it has no effect and no restart would give it one.
 - On a parse or validation error, or when `config.json` is missing or unreadable, the reload fails, keeps the previous configuration untouched, and returns a diagnostic. A missing file never publishes defaults over live policy, because that would drop the mention allowlist and open a mention-gated room.
 
@@ -112,16 +111,18 @@ A user agent can launch the gateway:
   <key>EnvironmentVariables</key><dict>
     <key>GAJAEWAY_HOME</key><string>/Users/me/gajaeway/state</string>
     <key>PATH</key><string>/Users/me/gajaeway/bin:/usr/local/bin:/usr/bin:/bin</string>
-    <key>YOUR_MODEL_KEY</key><string>replace-with-provider-key</string>
+    <key>GJC_EXECUTABLE</key><string>/Users/me/gajaeway/bin/gjc</string>
+    <key>HOME</key><string>/Users/me</string>
   </dict>
   <key>RunAtLoad</key><true/>
   <key>KeepAlive</key><true/>
+  <key>ExitTimeOut</key><integer>30</integer>
   <key>StandardOutPath</key><string>/Users/me/gajaeway/gateway.log</string>
   <key>StandardErrorPath</key><string>/Users/me/gajaeway/gateway.log</string>
 </dict></plist>
 ```
 
-Model keys used by `gjc` are inherited from the gateway environment. A launchd job does not inherit your shell, so provide the required model-key variables in `EnvironmentVariables` (or an equivalent protected secret mechanism) and protect the plist:
+This launchd example is macOS-specific, not a deployment command for the systemd host reached on SSH port 24. Before installing it, set its executable and profile paths to the verified interactive user's values. A launchd job does not inherit your shell: supply the same canonical profile environment and required model-key variables through a protected mechanism. An already-running shared GJC daemon retains its own environment; restarting the gateway does not rotate that daemon's credentials. Protect the plist:
 
 ```sh
 chmod 600 ~/Library/LaunchAgents/dev.gajaeway.gateway.plist
@@ -132,17 +133,17 @@ Run the Discord and Telegram binaries as separate managed services after the gat
 
 ### One gateway per home, owned by the service manager
 
-The gateway daemon is always started and stopped by launchd or systemd; never start a second copy by hand while a managed one runs. On boot the daemon settles ownership of `$GAJAEWAY_HOME` **before** touching the socket, the database, or the broker lock, using `$GAJAEWAY_HOME/daemon.pid`:
+The gateway daemon is always started and stopped by launchd or systemd; never start a second copy by hand while a managed one runs. On boot the daemon settles ownership of `$GAJAEWAY_HOME` before touching its socket or database, using `$GAJAEWAY_HOME/daemon.pid`. This is gateway-home ownership, not ownership of the shared GJC broker:
 
 - If the record names a live `gajaeway-gateway daemon` for the same home, the newcomer **waits** (up to 20s) for it to finish its ordered shutdown. It never signals that process - the service manager owns its lifecycle. If the predecessor is still alive at the deadline the newcomer exits 1 and the service manager retries under its own throttle.
 - `daemon --only-new` skips the wait: any live same-home gateway is an immediate refusal (exit 1). Use it in scripts that must not disturb a running instance.
 - A record whose process is dead, is not a gateway, or belongs to a different home is stale and is replaced.
 
-Restart with the service manager's own verbs - `launchctl kickstart -k gui/$(id -u)/dev.gajaeway.gateway` or `systemctl --user restart gajaeway-gateway` - and give the ordered shutdown time to complete: set launchd `ExitTimeOut` (or systemd `TimeoutStopSec`) to at least 30s. Two gateways on one home is the failure mode this guards against: both supervise the same private gjc daemon and take turns retiring it.
+Restart with the host's service manager: on the systemd deployment reached on SSH port 24, use `systemctl --user restart gajaeway-gateway`; on macOS launchd, use `launchctl kickstart -k gui/$(id -u)/dev.gajaeway.gateway`. These are alternatives, not consecutive steps. Give ordered shutdown at least 30 seconds with systemd `TimeoutStopSec` or launchd `ExitTimeOut`. Two gateways on one home can race over the database and delivery state even though neither owns the user broker.
 
-### systemd: preserve private GJC hosts across gateway restarts
+### systemd: preserve shared GJC hosts across gateway restarts
 
-Where the private GJC daemon and SDK session hosts share the gateway's systemd cgroup, the gateway unit **must** use:
+Where the shared GJC daemon or SDK session hosts share the gateway's systemd cgroup, the gateway unit must use:
 
 ```ini
 [Service]
@@ -150,9 +151,20 @@ KillMode=process
 TimeoutStopSec=30s
 ```
 
-`TimeoutStopSec` must be at least 30 seconds. `KillMode=process` limits service-manager termination to the gateway main process: SDK turns must outlive the gateway. `KillMode=control-group` and `KillMode=mixed` can kill the private daemon and session hosts during a restart, destroying in-flight turns even though session files remain durable. Do not automatically restore cgroup-wide killing after cutover; this setting is required for as long as those hosts share the gateway cgroup.
+`TimeoutStopSec` must be at least 30 seconds. `KillMode=process` limits service-manager termination to the gateway main process: SDK turns must outlive the gateway. `KillMode=control-group` and `KillMode=mixed` can kill the shared user daemon and session hosts during a restart, destroying in-flight turns even though session files remain durable. Do not restore cgroup-wide killing merely because an authority cutover completed; process-only termination remains required while those hosts share the gateway cgroup.
 
-Normal gateway stop/start releases and reacquires gateway ownership, preserves the private broker's identity, discovery and session files, and adopts the existing broker through its application-level health probe. Only the existing bounded, explicit unhealthy-daemon retirement path may reap private hosts. Do not use global process cleanup as part of deployment or restart.
+Normal gateway stop/start closes its own SDK calls and relays and reconnects as a client. It never kills the shared user broker, reaps old hosts, deletes discovery files, copies settings, or runs global session GC. A readiness failure is not permission to repair or replace the user's daemon. For a database changing broker authority, complete the explicit cutover in the runbook before starting recovery; changing service environment alone does not migrate old work.
+
+The implemented administrative entry point requires the checkout and Bun. Stop the managed gateway and disable automatic restart throughout inspection and apply; keep the shared GJC daemon running. Use the verified absolute gateway home (`ABS`) and canonical absolute user agent directory (`CANONICAL`):
+
+```sh
+bun scripts/gjc-authority-cutover.ts inspect --home ABS --agent-dir CANONICAL
+bun scripts/gjc-authority-cutover.ts apply --home ABS --agent-dir CANONICAL --expected-authority 'null' --quarantine --evidence 'operatorreference' --backup UNIQUEABS
+```
+
+Use `'null'` only when inspection reports `oldAuthority: null`; otherwise supply the exact inspected `oldAuthority` JSON as one shell-quoted argument. Supply an actual operator evidence reference and a unique, nonexistent absolute backup destination (`UNIQUEABS`) under an existing canonical parent. Both modes refuse a live gateway PID/socket. Apply holds the same kernel-backed home lease as gateway boot, revalidates authority, and creates an integrity-checked, non-overwriting backup before database migration. The runbook details the receipt and census to retain. Immutable old history stays quarantined without replay; old worker names remain reserved, so new work requires new names. Re-enable managed startup only after successful apply and executable/profile verification. Do not globally restore configuration, reap hosts, or delete sessions as part of cutover.
+
+Deployment acceptance requires a newly gateway-created session to be visible through the normal user's SDK and the gateway with the exact same session ID. Record unrelated user session IDs and configuration fingerprints before deployment; verify they remain unchanged afterward. The current blocker is that SDK global model controls can modify user configuration: verify configuration invariance through session creation and model controls, not just executable/profile parity or a successful cutover. Do not mask a failure with automatic global configuration restore. Verify the existing user daemon survives a gateway restart and owned work remains observable without resend. These are required observations, not a claim that production is deployed or healthy.
 
 ## Troubleshooting
 

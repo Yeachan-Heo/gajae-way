@@ -2,7 +2,7 @@ import { expect, test } from "bun:test";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { BrokerSupervisor } from "../src/orchestrator/broker";
+import { GlobalGjcClient } from "../src/orchestrator/broker";
 import { PersonaSessionManager } from "../src/orchestrator/persona-session";
 import { TailRunner } from "../src/orchestrator/tail-runner";
 import { GatewayDatabase } from "../src/store/db";
@@ -23,10 +23,20 @@ test("persistent-session control-plane logs use grep-stable fields", async () =>
 	console.error = (...parts: unknown[]) => lines.push(parts.map(String).join(" "));
 	let database: GatewayDatabase | undefined;
 	let manager: PersonaSessionManager | undefined;
-	let broker: BrokerSupervisor | undefined;
+	let broker: GlobalGjcClient | undefined;
 	try {
 		database = await GatewayDatabase.open(join(home, "gateway.db"));
+		const ownedDatabase = database;
+		const canonicalAgentDir = join(home, "fake-user-agent");
+		const authority = { canonicalAgentDir, identity: `gjc:${canonicalAgentDir}` };
+		ownedDatabase.assertBrokerAuthority(authority, { initializeEmpty: true });
 		const port = new ScriptedSessionPort();
+		const bind = port.bind.bind(port);
+		port.bind = async (input) => {
+			const binding = await bind(input);
+			expect(ownedDatabase.recordOwnedBinding({ ...binding, authority })).toBe(true);
+			return binding;
+		};
 		const originKey = "loopback/loopback/observability";
 		const origin = { platform: "loopback", kind: "loopback", conversationId: "observability" };
 		manager = new PersonaSessionManager({
@@ -96,20 +106,41 @@ test("persistent-session control-plane logs use grep-stable fields", async () =>
 		).toBe(true);
 
 		let healthy = true;
-		broker = new BrokerSupervisor({
-			ssotAgentDir: null,
-			home,
-			instanceId: "observability",
-			healthProbe: async () => healthy,
+		let probes = 0;
+		let commands = 0;
+		const generations: number[] = [];
+		broker = new GlobalGjcClient({
+			executable: "/fake/gjc",
+			agentDir: join(home, "fake-user-agent"),
+			cwd: home,
+			discovery: async () => ({ pid: 1234, url: "ws://127.0.0.1:12345", token: "fake-token", heartbeatAt: Date.now() }),
+			command: async () => {
+				commands++;
+				return { exitCode: 0, stdout: JSON.stringify({ ok: true, result: { sessions: [] } }), stderr: "" };
+			},
+			healthProbe: async () => {
+				probes++;
+				return healthy;
+			},
 			healthIntervalMs: 5,
-			restartBackoff: { initialMs: 1, maxMs: 1 },
+			reconnectBackoff: { initialMs: 1, maxMs: 1 },
 		});
+		broker.onGeneration((generation) => generations.push(generation));
 		await broker.start();
 		healthy = false;
 		await eventually(
-			() => lines.some((line) => line.startsWith("broker_restart generation=2 backoffMs=1 reason=")),
-			"broker restart was not logged",
+			() => lines.some((line) => line.includes("global broker unavailable; observing without repair")),
+			"read-only global broker outage observation was not logged",
 		);
+		const outageProbes = probes;
+		healthy = true;
+		await eventually(() => probes > outageProbes, "same-incarnation recovery was not observed");
+		await broker.stop();
+		await broker.start();
+		expect(broker.generation).toBe(1);
+		expect(generations).toEqual([1]);
+		expect(commands).toBe(0);
+		expect(lines.some((line) => line.startsWith("broker_restart"))).toBe(false);
 	} finally {
 		await manager?.stop();
 		await broker?.stop();

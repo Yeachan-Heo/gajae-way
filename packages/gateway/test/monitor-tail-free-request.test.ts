@@ -10,6 +10,17 @@ import { GatewayDatabase } from "../src/store/db";
 test("tail-free monitor request reaches terminal status and last_assistant even when tail history is malformed", async () => {
 	const home = await mkdtemp(join(tmpdir(), "gajaeway-monitor-tail-free-"));
 	const database = await GatewayDatabase.open(join(home, "gateway.db"));
+	const authority = { canonicalAgentDir: home, identity: `gjc:${home}` };
+	database.assertBrokerAuthority(authority, { initializeEmpty: true });
+	expect(
+		database.recordOwnedBinding({
+			authority,
+			sessionId: "monitor-session",
+			originKey: "monitor/eventtype/memory.canonicalize",
+			epoch: 0,
+			repo: join(home, "workspace"),
+		}),
+	).toBe(true);
 	const calls: string[][] = [];
 	let statuses = 0;
 	const run: CliRunner = async (args) => {
@@ -46,6 +57,7 @@ test("tail-free monitor request reaches terminal status and last_assistant even 
 	};
 	const port = new BrokerSessionPort({
 		database,
+		authority,
 		cli: run,
 		instanceId: "monitor-tail-free",
 		tailRunner: new TailRunner({ run, repo: join(home, "workspace") }),

@@ -135,6 +135,13 @@ export class LaneGovernor {
 	 * retirement candidates, so the caller frees a slot deliberately.
 	 */
 	assertAdmission(name: string): void {
+		const { jobId } = laneJobIdentity(name);
+		if (this.#database.isBrokerQuarantined("work", jobId))
+			throw new ProtocolError("verb_failed", "work lane belongs to a quarantined broker authority", {
+				reasonCode: "broker_authority_quarantined",
+				jobId,
+				name,
+			});
 		const lanes = this.activeLanes();
 		if (lanes.some((lane) => lane.name === name)) return;
 		if (lanes.length < this.maxLanes) return;
@@ -168,6 +175,12 @@ export class LaneGovernor {
 	 * rebound to a new one is left alone.
 	 */
 	retire(name: string, reason: string, expected?: SweepNomination): Promise<LaneRetireOutcome> {
+		if (this.#database.isBrokerQuarantined("work", laneJobIdentity(name).jobId))
+			return Promise.resolve({
+				retired: false,
+				sessionKey: workSessionKey(name),
+				reason: "broker_authority_quarantined",
+			});
 		if (this.#stopped)
 			return Promise.resolve({ retired: false, sessionKey: workSessionKey(name), reason: "gateway is stopping" });
 		const task = (async () => {
@@ -186,12 +199,16 @@ export class LaneGovernor {
 
 	#retire(name: string, reason: string, expected?: SweepNomination): Promise<LaneRetireOutcome> {
 		const sessionKey = workSessionKey(name);
+		if (this.#database.isBrokerQuarantined("work", laneJobIdentity(name).jobId))
+			return Promise.resolve({ retired: false, sessionKey, reason: "broker_authority_quarantined" });
 		// Refuse an unsettled lane now rather than queuing retirement behind its
 		// turn; the same check repeats under the lock because a run may start
 		// before we acquire it.
 		const preflight = this.activeLanes().find((candidate) => candidate.name === name);
 		if (preflight?.attemptOpen) return Promise.resolve(unsettled(sessionKey, preflight));
 		return this.#port.runExclusive(sessionKey, async () => {
+			if (this.#database.isBrokerQuarantined("work", laneJobIdentity(name).jobId))
+				return { retired: false, sessionKey, reason: "broker_authority_quarantined" };
 			if (this.#stopped) return { retired: false, sessionKey, reason: "gateway is stopping" };
 			const lane = this.activeLanes(expected ? Math.max(expected.now, this.#now()) : undefined).find(
 				(candidate) => candidate.name === name,

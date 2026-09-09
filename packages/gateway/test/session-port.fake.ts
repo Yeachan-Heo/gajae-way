@@ -18,8 +18,87 @@ import type {
 	WorkerOutputInput,
 	WorkerOutputResult,
 } from "../src/orchestrator/session-port";
-import { parseWorkerOutputResponse } from "../src/orchestrator/session-port";
-import type { TailAttachInput, TailFrame, TailHandle } from "../src/orchestrator/tail-runner";
+import { BrokerSessionPort, parseWorkerOutputResponse } from "../src/orchestrator/session-port";
+import { type TailAttachInput, type TailFrame, type TailHandle, TailRunner } from "../src/orchestrator/tail-runner";
+import type { BrokerAuthority, GatewayDatabase } from "../src/store/db";
+
+/** Initializes only a fresh test DB; never adopts legacy bindings or writes a GJC profile. */
+export function initializeTestBrokerAuthority(database: GatewayDatabase, canonicalAgentDir: string): BrokerAuthority {
+	const authority = { canonicalAgentDir, identity: `gjc:${canonicalAgentDir}` };
+	database.assertBrokerAuthority(authority, { initializeEmpty: true });
+	return authority;
+}
+
+/** Opt-in durable ownership for fake-backed harnesses; call before inserting app data. */
+export function attachTestBrokerOwnership<T extends SessionPort>(
+	database: GatewayDatabase,
+	port: T,
+	canonicalAgentDir: string,
+): T {
+	const authority = initializeTestBrokerAuthority(database, canonicalAgentDir);
+	const bind = port.bind.bind(port);
+	const resume = port.resume.bind(port);
+	port.bind = async (input) => {
+		database.assertBrokerAuthority(authority);
+		const binding = await bind(input);
+		if (binding.originKey !== input.originKey || binding.repo !== input.repo || binding.epoch !== input.epoch)
+			throw new Error("test session binding does not match its creation request");
+		if (!database.recordOwnedBinding({ ...binding, authority }))
+			throw new Error("test session binding lost to a durable epoch change");
+		return binding;
+	};
+	port.resume = async (input) => {
+		// Resume is not creation: seeded unknown IDs must never acquire provenance.
+		database.assertOwnedSession(input.sessionId, input.repo, authority);
+		const binding = await resume(input);
+		if (
+			binding.sessionId !== input.sessionId ||
+			binding.repo !== input.repo ||
+			binding.originKey !== input.originKey ||
+			binding.epoch !== input.epoch
+		)
+			throw new Error("test session resume changed its binding identity");
+		database.assertOwnedSession(binding.sessionId, binding.repo, authority);
+		return binding;
+	};
+	return port;
+}
+
+/** Explicit successful gateway creation fixture, separate from the command spy under test. */
+export async function createOwnedSessionFixture(
+	database: GatewayDatabase,
+	authority: BrokerAuthority,
+	binding: { sessionId: string; originKey: string; epoch: number; repo: string },
+): Promise<SessionBinding> {
+	const run = async (args: readonly string[]): Promise<CliResult> => {
+		if (args.includes("session.create"))
+			return {
+				exitCode: 0,
+				stdout: JSON.stringify({ ok: true, result: { sessionId: binding.sessionId } }),
+				stderr: "",
+			};
+		if (args.includes("inspect"))
+			return {
+				exitCode: 0,
+				stdout: JSON.stringify({
+					ok: true,
+					result: {
+						session: { sessionId: binding.sessionId, live: true, deleted: false, locator: { repo: binding.repo } },
+					},
+				}),
+				stderr: "",
+			};
+		throw new Error(`unexpected creation fixture command ${args.join(" ")}`);
+	};
+	const port = new BrokerSessionPort({
+		database,
+		authority,
+		cli: run,
+		instanceId: "creation-fixture",
+		tailRunner: new TailRunner({ run, repo: binding.repo }),
+	});
+	return await port.bind(binding);
+}
 
 /** What gjc answers when the session itself refuses a steer (`ok:false` envelope): a decision, not a transport failure. */
 export function steerRefused(message = "no running turn"): GjcCliError {

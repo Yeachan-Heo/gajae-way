@@ -43,7 +43,7 @@ import { TelegramAdapterState } from "../../adapter-telegram/src/state";
 import type { GatewayConfig } from "../src/config";
 import { type GatewayServer, startUnixServer } from "../src/server/server";
 import { GatewayDatabase } from "../src/store/db";
-import { sessionPortFromScript } from "./session-port.fake";
+import { attachTestBrokerOwnership, sessionPortFromScript } from "./session-port.fake";
 
 const ORIGIN = { platform: "discord", kind: "channel", conversationId: "chan-1" } as const;
 const ORIGIN_KEY = "discord/channel/chan-1";
@@ -168,9 +168,9 @@ async function gateway(reply: string[] | ((text: string) => string | Promise<str
 	const calls = { bind: 0, respond: 0 };
 	let index = 0;
 	const sessionPort = sessionPortFromScript({
-		bind: async () => {
+		bind: async (originKey, epoch) => {
 			calls.bind += 1;
-			return { sessionId: "mock-session" };
+			return { sessionId: `session-${originKey}-${epoch}` };
 		},
 		respond: async (_sessionId, text) => {
 			calls.respond += 1;
@@ -179,6 +179,7 @@ async function gateway(reply: string[] | ((text: string) => string | Promise<str
 			return reply[index++] ?? "unused";
 		},
 	});
+	attachTestBrokerOwnership(database, sessionPort, join(directory, "agent"));
 	server = await startUnixServer({ config, database, sessionPort, onStop: () => database.close() });
 	const client = await connect(config.socketPath);
 	await client.send({ v: "0.1", type: "hello", payload: { supportedVersions: ["0.1"] } });
@@ -1520,12 +1521,13 @@ async function preambleGateway(): Promise<{ client: Client; preambles: string[] 
 	const database = await GatewayDatabase.open(config.dbPath);
 	const preambles: string[] = [];
 	const sessionPort = sessionPortFromScript({
-		bind: async () => ({ sessionId: "mock-session" }),
+		bind: async (originKey, epoch) => ({ sessionId: `session-${originKey}-${epoch}` }),
 		respond: async (_sessionId, _text, systemPreamble) => {
 			preambles.push(systemPreamble ?? "");
 			return "[SILENT]";
 		},
 	});
+	attachTestBrokerOwnership(database, sessionPort, join(directory, "agent"));
 	server = await startUnixServer({ config, database, sessionPort, onStop: () => database.close() });
 	const client = await connect(config.socketPath);
 	await client.send({ v: "0.1", type: "hello", payload: { supportedVersions: ["0.1"] } });

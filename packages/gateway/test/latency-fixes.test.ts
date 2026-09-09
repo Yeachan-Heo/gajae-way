@@ -6,7 +6,7 @@ import type { GatewayConfig } from "../src/config";
 import type { SessionPort } from "../src/orchestrator/session-port";
 import { type GatewayServer, startUnixServer } from "../src/server/server";
 import { GatewayDatabase } from "../src/store/db";
-import { ScriptedSessionPort, sessionPortFromScript } from "./session-port.fake";
+import { attachTestBrokerOwnership, ScriptedSessionPort, sessionPortFromScript } from "./session-port.fake";
 
 let directory = "";
 let server: GatewayServer | undefined;
@@ -39,10 +39,11 @@ test("SessionPort.runExclusive serializes same-origin work and releases after re
 test("turn_count survives increments and resets on epoch bump", async () => {
 	directory = await mkdtemp(join(tmpdir(), "gajaeway-turncount-"));
 	const database = await GatewayDatabase.open(join(directory, "gateway.db"));
+	const port = attachTestBrokerOwnership(database, new ScriptedSessionPort(), join(directory, "agent"));
 	try {
 		const key = "discord/channel/rot-1";
 		const origin = JSON.stringify({ platform: "discord", kind: "channel", conversationId: "rot-1" });
-		database.putSession(key, "session-1");
+		await port.bind({ originKey: key, epoch: 0, repo: join(directory, "workspace") });
 		expect(database.incrementTurnCount(key)).toBe(1);
 		expect(database.incrementTurnCount(key)).toBe(2);
 		database.bumpEpoch(key, origin);
@@ -83,6 +84,7 @@ async function startGateway(options: {
 		channels: { "chan-1": { engagement: "open" } },
 	};
 	const database = await GatewayDatabase.open(config.dbPath);
+	attachTestBrokerOwnership(database, options.sessionPort, join(directory, "agent"));
 	server = await startUnixServer({ config, database, ...options, onStop: () => database.close() });
 	const client = await connect(config.socketPath);
 	client.send({ v: "0.1", type: "hello", payload: { supportedVersions: ["0.1"] } });
@@ -152,6 +154,7 @@ test("a message arriving during an active persistent turn is steered without a s
 		channels: { "chan-1": { engagement: "open" } },
 	};
 	const database = await GatewayDatabase.open(config.dbPath);
+	attachTestBrokerOwnership(database, sessionPort, join(directory, "agent"));
 	server = await startUnixServer({ config, database, sessionPort, onStop: () => database.close() });
 	const client = await connect(config.socketPath);
 	client.send({ v: "0.1", type: "hello", payload: { supportedVersions: ["0.1"] } });

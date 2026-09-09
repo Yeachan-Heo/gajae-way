@@ -5,7 +5,7 @@ import { join } from "node:path";
 import { GjcCliError } from "@gajaeway/subsession";
 import { PersonaSessionManager } from "../src/orchestrator/persona-session";
 import { GatewayDatabase } from "../src/store/db";
-import { ScriptedSessionPort, steerRefused } from "./session-port.fake";
+import { attachTestBrokerOwnership, ScriptedSessionPort, steerRefused } from "./session-port.fake";
 
 const ORIGIN = { platform: "loopback", kind: "loopback", conversationId: "steering" } as const;
 const ORIGIN_KEY = "loopback/loopback/steering";
@@ -53,7 +53,13 @@ afterEach(async () => {
 test("a mid-turn message issues one steer, keeps one send, and is attributed in the running tail transcript", async () => {
 	home = await mkdtemp(join(tmpdir(), "gajaeway-steering-"));
 	database = await GatewayDatabase.open(join(home, "gateway.db"));
-	const port = new SteeringTranscriptPort();
+	const port = attachTestBrokerOwnership(
+		database,
+		new SteeringTranscriptPort({
+			onBind: (input) => `session-${input.originKey}-${input.epoch}`,
+		}),
+		join(home, "agent"),
+	);
 	const observedTailText: string[] = [];
 	manager = new PersonaSessionManager({
 		database,
@@ -122,7 +128,13 @@ test("a mid-turn message issues one steer, keeps one send, and is attributed in 
 test("a message arriving after a consumer-visible reply waits for the next turn instead of steering the answered turn", async () => {
 	home = await mkdtemp(join(tmpdir(), "gajaeway-post-reply-boundary-"));
 	database = await GatewayDatabase.open(join(home, "gateway.db"));
-	const port = new ScriptedSessionPort();
+	const port = attachTestBrokerOwnership(
+		database,
+		new ScriptedSessionPort({
+			onBind: (input) => `session-${input.originKey}-${input.epoch}`,
+		}),
+		join(home, "agent"),
+	);
 	const visible: string[] = [];
 	manager = new PersonaSessionManager({
 		database,
@@ -182,7 +194,13 @@ class TornSteerPort extends ScriptedSessionPort {
 test("a torn steer transport is replayed on the same clientRef, never rebinds the session, and the message is steered once", async () => {
 	home = await mkdtemp(join(tmpdir(), "gajaeway-steering-"));
 	database = await GatewayDatabase.open(join(home, "gateway.db"));
-	const port = new TornSteerPort();
+	const port = attachTestBrokerOwnership(
+		database,
+		new TornSteerPort({
+			onBind: (input) => `session-${input.originKey}-${input.epoch}`,
+		}),
+		join(home, "agent"),
+	);
 	const logs: string[] = [];
 	manager = new PersonaSessionManager({
 		database,
@@ -216,7 +234,7 @@ test("a steer transport that stays torn HOLDS the row - the message may already 
 	class DeadTransportPort extends ScriptedSessionPort {
 		attempts = 0;
 		constructor() {
-			super({ onBind: (input) => `session-${input.epoch}` });
+			super({ onBind: (input) => `session-${input.originKey}-${input.epoch}` });
 		}
 		async steer(): Promise<void> {
 			this.attempts++;
@@ -224,6 +242,7 @@ test("a steer transport that stays torn HOLDS the row - the message may already 
 		}
 	}
 	const port = new DeadTransportPort();
+	attachTestBrokerOwnership(database, port, join(home, "agent"));
 	const logs: string[] = [];
 	manager = new PersonaSessionManager({
 		database,
@@ -269,7 +288,7 @@ test("a held steer survives the old turn's terminal and a restart: it is never d
 		torn = true;
 		attempts = 0;
 		constructor() {
-			super({ onBind: (input) => `session-${input.epoch}` });
+			super({ onBind: (input) => `session-${input.originKey}-${input.epoch}` });
 		}
 		async steer(input: Parameters<ScriptedSessionPort["steer"]>[0]): Promise<void> {
 			this.attempts++;
@@ -278,6 +297,7 @@ test("a held steer survives the old turn's terminal and a restart: it is never d
 		}
 	}
 	const port = new TornPort();
+	attachTestBrokerOwnership(database, port, join(home, "agent"));
 	const logs: string[] = [];
 	const make = () =>
 		new PersonaSessionManager({
@@ -331,7 +351,7 @@ test("a torn steer whose replay returns a definitive refusal rebinds once and se
 	class TornThenRefusedPort extends ScriptedSessionPort {
 		attempts = 0;
 		constructor() {
-			super({ onBind: (input) => `session-${input.epoch}` });
+			super({ onBind: (input) => `session-${input.originKey}-${input.epoch}` });
 		}
 		async steer(): Promise<void> {
 			this.attempts++;
@@ -340,6 +360,7 @@ test("a torn steer whose replay returns a definitive refusal rebinds once and se
 		}
 	}
 	const port = new TornThenRefusedPort();
+	attachTestBrokerOwnership(database, port, join(home, "agent"));
 	const logs: string[] = [];
 	manager = new PersonaSessionManager({
 		database,

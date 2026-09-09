@@ -7,7 +7,7 @@ import type { GatewayConfig } from "../src/config";
 import { PersonaSessionManager } from "../src/orchestrator/persona-session";
 import { type GatewayServer, messageEditId, renderMessageEdit, startUnixServer } from "../src/server/server";
 import { GatewayDatabase } from "../src/store/db";
-import { ScriptedSessionPort, sessionPortFromScript } from "./session-port.fake";
+import { attachTestBrokerOwnership, ScriptedSessionPort, sessionPortFromScript } from "./session-port.fake";
 
 /**
  * A message the user edits after the gateway ingested it is streamed into the
@@ -75,7 +75,11 @@ async function start(respond: (text: string) => Promise<string>) {
 		channels: { c1: { engagement: "mention-open" } },
 	};
 	database = await GatewayDatabase.open(config.dbPath);
-	const port = sessionPortFromScript({ respond: (_session, text) => respond(text) });
+	const port = sessionPortFromScript({
+		bind: (key, epoch) => `${key}#${epoch}`,
+		respond: (_session, text) => respond(text),
+	});
+	attachTestBrokerOwnership(database, port, join(directory, "agent"));
 	server = await startUnixServer({ config, database, sessionPort: port, onStop: () => database?.close() });
 	const client = await connect(config.socketPath);
 	client.send({ v: "0.1", type: "hello", payload: { supportedVersions: ["0.1"] } });
@@ -255,6 +259,9 @@ test("a steered edit of a context-only message consumes the ORIGINAL message's c
  * after a gateway restart - so the next turn never sees it as unread.
  */
 class TornUntilTerminalPort extends ScriptedSessionPort {
+	constructor() {
+		super({ onBind: (input) => `${input.originKey}#${input.epoch}` });
+	}
 	torn = true;
 	attempts = 0;
 	async steer(input: Parameters<ScriptedSessionPort["steer"]>[0]): Promise<void> {
@@ -276,6 +283,10 @@ async function startWith(port: ScriptedSessionPort, dir?: string) {
 		dmPolicy: "open",
 	};
 	database = await GatewayDatabase.open(config.dbPath);
+	// Reuse broker state across restart, but never a wrapper tied to the closed DB.
+	port.bind = ScriptedSessionPort.prototype.bind.bind(port);
+	port.resume = ScriptedSessionPort.prototype.resume.bind(port);
+	attachTestBrokerOwnership(database, port, join(directory, "agent"));
 	server = await startUnixServer({ config, database, sessionPort: port, onStop: () => database?.close() });
 	const client = await connect(config.socketPath);
 	client.send({ v: "0.1", type: "hello", payload: { supportedVersions: ["0.1"] } });
@@ -356,7 +367,8 @@ test("a crash between steer acceptance and the lifecycle hook cannot leave the m
 	// database must see the context row consumed.
 	directory = await mkdtemp(join(tmpdir(), "gajaeway-message-edit-"));
 	database = await GatewayDatabase.open(join(directory, "gateway.db"));
-	const port = new ScriptedSessionPort();
+	const port = new ScriptedSessionPort({ onBind: (input) => `${input.originKey}#${input.epoch}` });
+	attachTestBrokerOwnership(database, port, join(directory, "agent"));
 	const logs: string[] = [];
 	const manager = new PersonaSessionManager({
 		database,

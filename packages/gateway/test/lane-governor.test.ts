@@ -358,3 +358,50 @@ test("sweep leaves a lane alone when it was reused on the same session between n
 	expect(port.closes).toEqual([]);
 	expect(database.getSessionRecord("work/task/a")?.sessionId).toBe("sess-a");
 });
+
+test("quarantined historical names refuse admission and retirement before recovery or SDK controls", async () => {
+	database = await GatewayDatabase.open(":memory:");
+	bind("old", NOW, SESSION_ID);
+	persistJob("old", "running", true);
+	const history = database.laneJobJson(laneJobIdentity("old").jobId);
+	database.cutoverBrokerAuthority({
+		expectedAuthority: null,
+		targetAuthority: { canonicalAgentDir: "/tmp/global-agent", identity: "shared-broker" },
+		evidence: "test operator quarantined old work",
+		disposition: "quarantine",
+	});
+	const port = new ScriptedSessionPort();
+	let recoveryCalls = 0;
+	let lockCalls = 0;
+	port.runExclusive = async (_key, work) => {
+		lockCalls++;
+		return work();
+	};
+	const governor = new LaneGovernor({ database, sessionPort: port });
+	governor.setRecoveryGate(async () => {
+		recoveryCalls++;
+	});
+	expect(() => governor.assertAdmission("old")).toThrow(ProtocolError);
+	try {
+		governor.assertAdmission("old");
+	} catch (error) {
+		expect(error).toMatchObject({
+			code: "verb_failed",
+			detail: {
+				reasonCode: "broker_authority_quarantined",
+				jobId: laneJobIdentity("old").jobId,
+				name: "old",
+			},
+		});
+	}
+	expect(await governor.retire("old", "operator")).toEqual({
+		retired: false,
+		sessionKey: "work/task/old",
+		reason: "broker_authority_quarantined",
+	});
+	expect(recoveryCalls).toBe(0);
+	expect(lockCalls).toBe(0);
+	expect(port.closes).toEqual([]);
+	expect(database.laneJobJson(laneJobIdentity("old").jobId)).toBe(history);
+	expect(() => governor.assertAdmission("fresh")).not.toThrow();
+});

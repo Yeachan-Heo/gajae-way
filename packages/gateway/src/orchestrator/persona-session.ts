@@ -15,7 +15,7 @@ import {
 import type { GjcModelSelection, GjcServiceTier } from "../config";
 import type { GatewayDatabase, InboundMessageRow, InboundTurn } from "../store/db";
 import { sanitizeDiagnostic } from "./rebind";
-import type { IndexedSession, SessionBinding, SessionPort } from "./session-port";
+import type { SessionBinding, SessionPort } from "./session-port";
 import {
 	deterministicInterimDeliveryId,
 	TailCapacityError,
@@ -55,8 +55,6 @@ const STEER_REPLAY_ATTEMPTS = 2;
 const DISPATCH_FAILURE_RETRY_MAX_MS = 60_000;
 /** Consecutive recovery sweeps (60s apart) an unknown op on a live idle session is held before release. */
 const HOLD_RELEASE_SWEEPS = 2;
-/** A saved session younger than this may still be resumed by a recovery path; leave it. */
-const GC_MIN_IDLE_MS = 60 * 60_000;
 /**
  * Context occupancy at or above which a failed turn is read as context
  * exhaustion. The provider rejects the prompt only past 100%, but a session
@@ -180,8 +178,6 @@ export interface PersonaSessionManagerOptions {
 		opRef: string;
 	}) => void | Promise<void>;
 	readonly log?: (line: string) => void;
-	/** Enables session-index deletes (tests); production keeps them off, see server.ts. */
-	readonly gcDeletes?: boolean;
 }
 
 /**
@@ -207,8 +203,6 @@ export class PersonaSessionManager {
 	readonly #onHeldSteerAccepted: PersonaSessionManagerOptions["onHeldSteerAccepted"];
 	readonly #heldSteerContextMessageId: PersonaSessionManagerOptions["heldSteerContextMessageId"];
 	readonly #log: (line: string) => void;
-	/** Session-index deletes; off until the gjc ledger fence is session-scoped (see collectSessions). */
-	readonly #gcDeletes: boolean;
 	readonly #actors = new Map<string, OriginActor>();
 	#stopped = false;
 
@@ -231,7 +225,6 @@ export class PersonaSessionManager {
 		this.#onHeldSteerAccepted = options.onHeldSteerAccepted;
 		this.#heldSteerContextMessageId = options.heldSteerContextMessageId;
 		this.#log = options.log ?? ((line: string) => console.error(line));
-		this.#gcDeletes = options.gcDeletes ?? false;
 	}
 
 	/** Call only after inboundEnqueue's durable acceptance boundary. */
@@ -252,12 +245,14 @@ export class PersonaSessionManager {
 
 	/** Presentation/recovery tick; the port's stall check never sends an abort. */
 	tick(originKey?: string): Promise<void> {
+		if (this.#stopped) return Promise.resolve();
 		this.#port.checkStalls(this.#now());
 		const actors = originKey ? [this.#actor(originKey)] : [...this.#actors.values()];
 		return Promise.all(actors.map((actor) => actor.enqueue(async () => await actor.tick()))).then(() => undefined);
 	}
 
 	setStallTimeoutMs(timeoutMs: number | undefined): void {
+		if (this.#stopped) return;
 		this.#stallTimeoutMs = positiveInteger(timeoutMs, DEFAULT_STALL_TIMEOUT_MS, "stallTimeoutMs");
 		this.#port.setStallTimeoutMs(this.#stallTimeoutMs);
 	}
@@ -268,6 +263,7 @@ export class PersonaSessionManager {
 	 * returns to idle while the old turn remains a terminal-only hold.
 	 */
 	reset(originKey: string, originRefJson: string, floorAt = new Date(this.#now()).toISOString()): Promise<void> {
+		if (this.#stopped) return Promise.resolve();
 		return this.#actor(originKey).enqueue(async () => await this.#actor(originKey).reset(originRefJson, floorAt));
 	}
 
@@ -277,6 +273,7 @@ export class PersonaSessionManager {
 	 * aborts, retires, or changes that in-flight operation.
 	 */
 	rebindModel(originKey: string, selection: GjcModelSelection): Promise<void> {
+		if (this.#stopped) return Promise.resolve();
 		return this.#actor(originKey).enqueue(async () => await this.#actor(originKey).rebindModel(selection));
 	}
 
@@ -302,10 +299,12 @@ export class PersonaSessionManager {
 
 	/** Tail gaps and broker replacements reconcile status; tail is never terminal authority. */
 	reconcile(originKey: string): Promise<void> {
+		if (this.#stopped) return Promise.resolve();
 		return this.#actor(originKey).enqueue(async () => await this.#actor(originKey).reconcile());
 	}
 
 	onBrokerGeneration(generation: number): Promise<void> {
+		if (this.#stopped) return Promise.resolve();
 		return Promise.all(
 			[...this.#actors.values()].map((actor) => actor.enqueue(async () => await actor.onBrokerGeneration(generation))),
 		).then(() => undefined);
@@ -321,97 +320,12 @@ export class PersonaSessionManager {
 	}
 
 	/**
-	 * Removes broker-indexed sessions this gateway no longer references. Every
-	 * epoch rotation (`/new`, steer refusal, disowned recovery) binds a fresh
-	 * session and leaves the old one saved in the broker's index; nothing ever
-	 * took them out. The index then outgrows one `session.list` page, every
-	 * id-resolving CLI call starts paging, the broker's 32-cursor budget leaks
-	 * away, and the origin goes dark with `cursor capacity is exhausted` (live:
-	 * jip, 149 indexed for 55 referenced, 2026-09-06).
-	 *
-	 * Deletion is conservative: only sessions that are not live, not referenced
-	 * by any origin binding or pending turn, and quiet for GC_MIN_IDLE_MS. The
-	 * broker's own guards (cleanup pending, terminal uncertain) still refuse, and
-	 * a refusal is logged, not retried in the same sweep.
-	 */
-	async collectSessions(): Promise<{ readonly indexed: number; readonly deleted: number; readonly refused: number }> {
-		const port = this.#port;
-		if (this.#stopped || !port.listSessions || !port.deleteSession) return { indexed: 0, deleted: 0, refused: 0 };
-		// Deletes are off in production. A refused session.delete is recorded as
-		// a terminal_uncertain lifecycle row, and the broker then refuses EVERY
-		// later lifecycle op - session.create included - until the ledger is
-		// archived by hand (live: gaebal 2026-09-07 on 0.16.3; local 2026-09-08
-		// on 0.16.6 despite gajae-code#5382). Until a gjc survives a real sweep
-		// with the fence session-scoped, this sweep only measures.
-		if (!this.#gcDeletes) {
-			const indexed = await port.listSessions().catch(() => undefined);
-			if (indexed) {
-				const referenced = this.#database.referencedSessionIds();
-				const orphans = indexed.filter((s) => !s.live && !referenced.has(s.sessionId)).length;
-				if (orphans > 0)
-					this.#log(
-						`session_gc indexed=${indexed.length} referenced=${referenced.size} orphans=${orphans} deletes=off`,
-					);
-			}
-			return { indexed: indexed?.length ?? 0, deleted: 0, refused: 0 };
-		}
-		let indexed: readonly IndexedSession[];
-		try {
-			indexed = await port.listSessions();
-		} catch (error) {
-			this.#log(`session_gc_list_failed detail=${safeDiagnostic(error)}`);
-			return { indexed: 0, deleted: 0, refused: 0 };
-		}
-		const referenced = this.#database.referencedSessionIds();
-		const now = this.#now();
-		let deleted = 0;
-		let refused = 0;
-		const refusals = new Map<string, number>();
-		for (const session of indexed) {
-			if (this.#stopped) break;
-			if (session.live || referenced.has(session.sessionId)) continue;
-			if (session.lastActivityMs !== undefined && now - session.lastActivityMs < GC_MIN_IDLE_MS) continue;
-			if (!session.cwd || !session.sessionPath) {
-				refused++;
-				continue;
-			}
-			try {
-				const outcome = await port.deleteSession({
-					sessionId: session.sessionId,
-					cwd: session.cwd,
-					sessionPath: session.sessionPath,
-				});
-				if (outcome.deleted) deleted++;
-				else {
-					refused++;
-					refusals.set(outcome.code, (refusals.get(outcome.code) ?? 0) + 1);
-				}
-			} catch (error) {
-				refused++;
-				const code = safeDiagnostic(error);
-				refusals.set(code, (refusals.get(code) ?? 0) + 1);
-			}
-		}
-		// One line per sweep, refusals folded by code. A broker whose cleanup
-		// ledger holds an unbounded terminal_uncertain row fences EVERY delete
-		// (gjc lifecycle-ledger hasUncertainCleanupForSession; live: 212/213
-		// refusals on one box) - a broker-side condition to report once, not
-		// two hundred lines every ten minutes.
-		if (deleted > 0 || refused > 0)
-			this.#log(
-				`session_gc indexed=${indexed.length} referenced=${referenced.size} deleted=${deleted} refused=${refused}${
-					refusals.size ? ` refusals=${[...refusals].map(([code, n]) => `${code}:${n}`).join(",")}` : ""
-				}`,
-			);
-		return { indexed: indexed.length, deleted, refused };
-	}
-
-	/**
 	 * Reconcile accepted work for a bounded shutdown window; an unresolved SDK
 	 * operation stays durable for the next broker generation rather than blocking
 	 * shutdown forever or being aborted.
 	 */
 	async drain(timeoutMs = 5_000): Promise<void> {
+		if (this.#stopped) return;
 		const deadline = this.#now() + Math.max(0, timeoutMs);
 		for (;;) {
 			const unresolved = await Promise.all(
@@ -571,8 +485,12 @@ class OriginActor {
 		return this.#state;
 	}
 
-	enqueue<T>(work: () => Promise<T>): Promise<T> {
-		const task = this.#queue.then(work);
+	enqueue<T>(work: () => Promise<T>): Promise<T | undefined> {
+		if (this.#stopped || this.#manager.stopped) return Promise.resolve(undefined);
+		const task = this.#queue.then(() => {
+			if (this.#stopped || this.#manager.stopped) return undefined;
+			return work();
+		});
 		this.#queue = task.then(
 			() => undefined,
 			(error) => {
@@ -689,7 +607,15 @@ class OriginActor {
 		if (!this.#current) await this.#dispatchNext();
 	}
 
+	#quarantinedTurn(opRef: string): boolean {
+		const row = this.#manager.database.inboundTurnRow(opRef);
+		if (!row || !this.#manager.database.isBrokerQuarantined("inbound", row.message_id)) return false;
+		this.#manager.log(`recovery_hold origin=${this.originKey} opRef=${opRef} reason=broker_authority_quarantined`);
+		return true;
+	}
+
 	async #recoverTurn(turn: InboundTurn): Promise<void> {
+		if (this.#quarantinedTurn(turn.opRef)) return;
 		const currentEpoch = this.#epoch();
 		const retired = turn.epoch < currentEpoch;
 		const sessionId = turn.sessionId;
@@ -869,6 +795,7 @@ class OriginActor {
 	): Promise<BoundTurn> {
 		const trigger = this.#manager.database.inboundTurnRow(turn.opRef);
 		if (!trigger) throw new Error(`turn ${turn.opRef} disappeared during recovery`);
+		if (this.#quarantinedTurn(turn.opRef)) throw new Error("broker_authority_quarantined");
 		const lifecycle = await this.#manager.startTurn({
 			originKey: this.originKey,
 			epoch: turn.epoch,
@@ -944,6 +871,7 @@ class OriginActor {
 	 *    turn: its tail stays attached and its answer is still delivered.
 	 */
 	async #recoverFromSteerFailure(current: BoundTurn): Promise<void> {
+		if (this.#quarantinedTurn(current.turn.opRef)) return;
 		await this.#reconcileBound(current);
 		if (this.#current !== current) return;
 		if (current.statusTerminalHolds > 0 && !current.tailEvidenceUnavailable) {
@@ -1010,6 +938,7 @@ class OriginActor {
 		for (const bound of [this.#current, ...this.#retired.values()]) {
 			if (!bound || bound.brokerGeneration === generation) continue;
 			await bound.tail?.close();
+			if (this.#stopped || this.#manager.stopped) return;
 			bound.detached = true;
 			this.#manager.log(
 				`broker_generation_fenced originKey=${this.originKey} epoch=${bound.epoch} oldGeneration=${bound.brokerGeneration} generation=${generation}`,
@@ -1020,6 +949,9 @@ class OriginActor {
 
 	async stop(): Promise<void> {
 		this.#stopped = true;
+		// Stop is called outside the mailbox: wait for admitted work, never enqueue
+		// a shutdown task that would await its own queue entry.
+		await this.#queue;
 		for (const timer of this.#retiredReattachTimers.values()) this.#manager.cancel(timer);
 		this.#retiredReattachTimers.clear();
 		for (const timer of this.#graceTimers) this.#manager.cancel(timer);
@@ -1274,6 +1206,11 @@ class OriginActor {
 	async #resolveStaleHolds(): Promise<void> {
 		for (const held of this.#manager.database.inboundSteersHeldAfterTerminal(this.originKey)) {
 			const opRef = held.turn_op_ref;
+			if (
+				this.#manager.database.isBrokerQuarantined("inbound", held.message_id) ||
+				(opRef && this.#quarantinedTurn(opRef))
+			)
+				continue;
 			const epoch = held.turn_epoch;
 			const sessionId = held.bound_session_id ?? this.#manager.database.inboundTurnRow(opRef ?? "")?.bound_session_id;
 			if (!opRef || epoch === null || !sessionId) continue;
@@ -1386,6 +1323,11 @@ class OriginActor {
 	 * turn) or the session refused and is being recovered.
 	 */
 	async #steerRow(current: BoundTurn, row: InboundMessageRow): Promise<boolean> {
+		if (
+			this.#manager.database.isBrokerQuarantined("inbound", row.message_id) ||
+			this.#quarantinedTurn(current.turn.opRef)
+		)
+			return false;
 		{
 			assertControlAllowed("turn.steer", { operatorApproval: true });
 			const clientRef = steerClientRef(this.#manager.instanceId, this.originKey, current.epoch, row.message_id);
@@ -1492,7 +1434,6 @@ class OriginActor {
 			repo: this.#manager.repo,
 			...(this.#manager.sessionModel ? { model: this.#manager.sessionModel } : {}),
 		});
-		this.#manager.database.putSession(this.originKey, binding.sessionId);
 		if (binding.startupModelApplied && this.#manager.sessionModel)
 			this.#appliedModel.set(binding.sessionId, describeModel(this.#manager.sessionModel));
 		return binding;
@@ -1509,6 +1450,7 @@ class OriginActor {
 			...(cursor ? { cursor } : {}),
 			priority: retired ? "retired" : "current",
 			onCursorCommitted: async (nextCursor) => {
+				if (this.#stopped || this.#manager.stopped) return;
 				this.#manager.database.tailCursorCommit(sessionId, nextCursor);
 			},
 			// Awaited on purpose: the TailRunner commits the durable cursor only after
@@ -1635,6 +1577,8 @@ class OriginActor {
 	}
 
 	async #reconcileBound(bound: BoundTurn): Promise<void> {
+		if (this.#stopped || this.#manager.stopped) return;
+		if (this.#quarantinedTurn(bound.turn.opRef)) return;
 		let report: StatusReport;
 		try {
 			report = await this.#manager.port.status({
@@ -1643,6 +1587,7 @@ class OriginActor {
 				opRef: bound.turn.opRef,
 			});
 		} catch (error) {
+			if (this.#stopped || this.#manager.stopped) return;
 			// The broker disowning the id (session_unavailable) with the session
 			// provably not live means nothing is running there: release the turn
 			// and rebind instead of holding an adopted turn forever. A retired turn
@@ -1669,6 +1614,7 @@ class OriginActor {
 			);
 			return;
 		}
+		if (this.#stopped || this.#manager.stopped) return;
 		if (report.status.status === "unknown") {
 			const count = (this.#holdSweeps.get(bound.turn.opRef) ?? 0) + 1;
 			this.#holdSweeps.set(bound.turn.opRef, count);
@@ -1956,6 +1902,7 @@ class OriginActor {
 			this.#retiredReattachTimers.delete(key);
 			void this.enqueue(async () => {
 				if (this.#retired.get(key) !== bound || !bound.detached || bound.tailEvidenceUnavailable) return;
+				if (this.#quarantinedTurn(bound.turn.opRef)) return;
 				try {
 					const tail = await this.#attachTail(bound.sessionId, bound.epoch, true);
 					bound.tail = tail;

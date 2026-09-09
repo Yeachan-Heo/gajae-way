@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { PersonaSessionManager } from "../src/orchestrator/persona-session";
 import { GatewayDatabase } from "../src/store/db";
-import { ScriptedSessionPort } from "./session-port.fake";
+import { attachTestBrokerOwnership, ScriptedSessionPort } from "./session-port.fake";
 
 const ORIGIN = { platform: "loopback", kind: "loopback", conversationId: "coalesce" } as const;
 const ORIGIN_KEY = "loopback/loopback/coalesce";
@@ -47,6 +47,7 @@ test("rapid fragments are never coalesced: the first is sent at once and every l
 	home = await mkdtemp(join(tmpdir(), "gajaeway-rapid-fragments-"));
 	database = await GatewayDatabase.open(join(home, "gateway.db"));
 	const port = new ScriptedSessionPort();
+	attachTestBrokerOwnership(database, port, join(home, "agent"));
 	const base = Date.now();
 	const label = (row: { engagement_json: string | null; message_id: string; body: string }) => {
 		const engagement = JSON.parse(row.engagement_json ?? "{}") as { authorName?: string };

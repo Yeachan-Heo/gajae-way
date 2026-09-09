@@ -43,7 +43,7 @@ import { MonitorRegistry } from "../monitors/registry";
 import { MonitorRuntime } from "../monitors/runtime";
 import { backupDatabase, integrityDatabase } from "../ops/backup";
 import { RuntimeCycleProjector } from "../ops/cycle";
-import type { BrokerSupervisor } from "../orchestrator/broker";
+import type { GlobalGjcClient } from "../orchestrator/broker";
 import { LaneGovernor } from "../orchestrator/lane-governor";
 import {
 	type PersonaFailureInput,
@@ -70,8 +70,6 @@ import { composeSpeakerLabel, composeTurnHeader } from "./speaker";
 
 /** Persona tail stall heartbeat; well under the 120s stallTimeoutMs so alarms land within one interval of the threshold. */
 const DEFAULT_STALL_CHECK_INTERVAL_MS = 5_000;
-/** Broker session-index GC cadence; the broker's cursor budget leaks per traversal, so keep the index under one page. */
-const DEFAULT_SESSION_GC_INTERVAL_MS = 10 * 60_000;
 /** /restart: hard-exit budget after the ordered stop begins. */
 const RESTART_HARD_EXIT_MS = 15_000;
 /** Thread history shown to a freshly started session: everything (humans, bots, self) in the last 24h, capped. */
@@ -116,8 +114,8 @@ export interface GatewayServerOptions {
 	readonly startedAt?: string;
 	readonly onStop?: () => void | Promise<void>;
 	readonly persona?: PersonaLoader;
-	/** Broker ownership is released after request/turn/tail-like runtime work has drained. */
-	readonly broker?: BrokerSupervisor;
+	/** Only gateway-owned SDK commands and relays are closed after runtime work drains. */
+	readonly broker?: GlobalGjcClient;
 	/** Per-process CLI overrides, reapplied on every live reload so they survive it. */
 	readonly overrides?: ConfigOverrides;
 	/** Test seam for chat.progress throttling; production uses the 15s defaults. */
@@ -126,8 +124,6 @@ export interface GatewayServerOptions {
 	readonly exitProcess?: (code: number) => void;
 	/** Test seam for the persona tail stall heartbeat; production uses the 5s default. */
 	readonly stallCheckIntervalMs?: number;
-	/** Test seam for the broker session-index GC; production uses the 10m default. */
-	readonly sessionGcIntervalMs?: number;
 	/** Mid-work speech pacing (issue #71). */
 	readonly interimSpeech?: Partial<InterimSpeechLimits>;
 }
@@ -194,7 +190,6 @@ interface Runtime {
 	readonly monitors: MonitorPropagator;
 	readonly monitorRuntime: MonitorRuntime;
 	readonly reconcileTimer: ReturnType<typeof setInterval>;
-	readonly sessionGcTimer: ReturnType<typeof setInterval>;
 	readonly stallTimer: ReturnType<typeof setInterval>;
 	readonly contextMaintenanceTimer: ReturnType<typeof setInterval>;
 	readonly stopBrokerGenerationListener?: () => void;
@@ -243,17 +238,16 @@ export async function startUnixServer(options: GatewayServerOptions): Promise<Ga
 		stopPromise = (async () => {
 			process.off("SIGHUP", onHup);
 			clearInterval(runtime.reconcileTimer);
-			clearInterval(runtime.sessionGcTimer);
 			clearInterval(runtime.stallTimer);
 			clearInterval(runtime.contextMaintenanceTimer);
 			// Stop accepting new sockets first, but keep existing sockets alive. Then
 			// quiesce every admitted producer before taking the final writer snapshot.
 			listener.stop(false);
+			runtime.stopBrokerGenerationListener?.();
 			await runtime.work.stop();
 			await Promise.all([...runtime.requests]);
 			await runtime.personaSessions.drain();
 			await runtime.personaSessions.stop();
-			runtime.stopBrokerGenerationListener?.();
 			await runtime.monitorRuntime.stop();
 			// Drain claimed monitor writers before broker/database teardown (#64).
 			await runtime.monitors.drain();
@@ -353,17 +347,16 @@ export function startStdioServer(options: GatewayServerOptions): GatewayServer {
 			process.stdin.off("data", onData);
 			process.stdin.off("end", onEnd);
 			clearInterval(runtime.reconcileTimer);
-			clearInterval(runtime.sessionGcTimer);
 			clearInterval(runtime.stallTimer);
 			clearInterval(runtime.contextMaintenanceTimer);
 			connection.write({ v: PROFILE_VERSION, type: "event", event: "gateway.stopping", payload: { reason } });
+			runtime.stopBrokerGenerationListener?.();
 			await runtime.work.stop();
 			// Same producer quiescence as the Unix server: in-flight stdio requests are
 			// tracked and awaited before persona/tail/broker teardown.
 			await Promise.all([...runtime.requests]);
 			await runtime.personaSessions.drain();
 			await runtime.personaSessions.stop();
-			runtime.stopBrokerGenerationListener?.();
 			await runtime.monitorRuntime.stop();
 			// Drain claimed monitor writers before broker/database teardown (#64).
 			await runtime.monitors.drain();
@@ -431,14 +424,6 @@ function createRuntime(options: GatewayServerOptions): Runtime {
 		sessionModel: options.config.model,
 		stallTimeoutMs: options.config.stallTimeoutMs,
 		brokerGeneration: () => options.broker?.generation ?? 0,
-		// Session-index deletes stay OFF on every gjc so far. 0.16.6 (gajae-code
-		// #5382) was expected to scope a refused delete's uncertain marker to its
-		// own session, but on the first sweep with deletes enabled (local,
-		// 2026-09-08: 95 deleted, 179 refused as terminal_uncertain/cleanup_pending)
-		// the broker again refused EVERY session.create with terminal_uncertain
-		// until the lifecycle ledger was archived by hand. Until a gjc proves the
-		// fence is session-scoped under a real sweep, the GC only measures.
-		gcDeletes: false,
 		onTurnStart: async (input) => await createInboundTurnLifecycle(input, options, runtime),
 		// A steer whose acceptance was learnt after its turn's lifecycle is gone
 		// (resolved at terminal or after a restart) is finalized exactly like a
@@ -513,18 +498,6 @@ function createRuntime(options: GatewayServerOptions): Runtime {
 			.then(() => lanes.sweep())
 			.catch((error: unknown) => console.error(`lane recovery/sweep failed: ${diagnostic(error)}`));
 	}, 60_000);
-	// Broker session-index GC. Once per interval, after recovery has re-bound
-	// whatever it is going to: anything the broker still indexes that no origin
-	// or pending turn references is a rotated-away session and is deleted.
-	const sweepSessions = () =>
-		void personaSessions
-			.collectSessions()
-			.catch((error: unknown) => console.error(`session gc sweep failed: ${diagnostic(error)}`));
-	const sessionGcTimer = setInterval(sweepSessions, options.sessionGcIntervalMs ?? DEFAULT_SESSION_GC_INTERVAL_MS);
-	// Sweep once right after boot: a freshly started broker has its full cursor
-	// budget, which is the only time an over-sized index can be listed at all.
-	// Recovery has already rebound the origins that are going to be rebound.
-	setTimeout(sweepSessions, options.sessionGcIntervalMs === undefined ? 15_000 : 0).unref?.();
 	// AC6: the 120s stall alarm is a running-server obligation, not only a
 	// generic-request polling side effect. This heartbeat drives every persona
 	// tail's threshold check; it never aborts a turn (alarm overlay only).
@@ -547,7 +520,7 @@ function createRuntime(options: GatewayServerOptions): Runtime {
 		60 * 60 * 1000,
 	);
 	const brokerWithGeneration = options.broker as
-		| (BrokerSupervisor & { onGeneration?: BrokerSupervisor["onGeneration"] })
+		| (GlobalGjcClient & { onGeneration?: GlobalGjcClient["onGeneration"] })
 		| undefined;
 	const stopBrokerGenerationListener =
 		typeof brokerWithGeneration?.onGeneration === "function"
@@ -574,7 +547,6 @@ function createRuntime(options: GatewayServerOptions): Runtime {
 		monitors,
 		monitorRuntime,
 		reconcileTimer,
-		sessionGcTimer,
 		stallTimer,
 		contextMaintenanceTimer,
 		...(stopBrokerGenerationListener ? { stopBrokerGenerationListener } : {}),
@@ -773,12 +745,15 @@ async function handleRequest(
 			const laneByKey = new Map(
 				options.database.workLaneRows().map((lane) => [`work-${lane.origin_key.slice("work/task/".length)}`, lane]),
 			);
-			const jobs = options.database.laneJobRows().map((row) => {
+			const jobs = options.database.laneJobRows(true).map((row) => {
 				const lane = laneByKey.get(row.lane_key);
 				const bound = {
 					...row,
 					session_id: lane?.gjc_session_id ?? "",
 					last_activity_at: lane?.last_activity_at ?? null,
+					...(options.database.isBrokerQuarantined("work", row.job_id)
+						? { quarantined: true, reason: "broker_authority_quarantined" }
+						: {}),
 				};
 				try {
 					const record = parseLaneJobRecord(options.database.laneJobJson(row.job_id) ?? "");
@@ -920,7 +895,7 @@ async function handleRequest(
 			const monitor = runtime.registry.get(monitorId);
 			if (!monitor) throw new ProtocolError("invalid_params", "unknown monitorId");
 			const recentEvents = options.database
-				.monitorEventRows(monitorId)
+				.monitorEventRows(monitorId, "newest", true)
 				.slice(0, 100)
 				.map((row) => ({
 					eventId: row.event_id,
@@ -928,6 +903,9 @@ async function handleRequest(
 					eventType: row.event_type,
 					firedAt: row.fired_at,
 					stage: row.stage,
+					...(options.database.isBrokerQuarantined("monitor", row.event_id)
+						? { quarantined: true, reason: "broker_authority_quarantined" }
+						: {}),
 				}));
 			connection.write({ v: PROFILE_VERSION, type: "response", id: request.id, result: { monitor, recentEvents } });
 			return;

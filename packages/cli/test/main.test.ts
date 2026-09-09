@@ -640,6 +640,36 @@ describe("work operator commands", () => {
 		expect(output.closed).toBe(true);
 	});
 
+	test("work jobs distinguishes quarantined history from current running lanes", async () => {
+		const output = await run(["jobs"], {
+			jobs: [
+				{
+					lane_key: "work-current",
+					state: "running",
+					session_id: "global-session",
+					last_activity_at: "2026-09-09T00:00:00Z",
+					worktree_path: "/repo/current",
+				},
+				{
+					lane_key: "work-legacy",
+					state: "running",
+					session_id: "private-session",
+					last_activity_at: "2026-09-07T00:00:00Z",
+					worktree_path: "/repo/legacy",
+					quarantined: true,
+					reason: "broker_authority_quarantined",
+				},
+			],
+		});
+		expect(output.requests).toEqual([{ verb: "work.jobs", params: undefined }]);
+		expect(output.lines).toEqual([
+			"current running session=global-session last=2026-09-09T00:00:00Z /repo/current",
+			"legacy HELD: quarantined reason=broker_authority_quarantined historical_state=running session=private-session last=2026-09-07T00:00:00Z /repo/legacy",
+		]);
+		expect(output.errors).toEqual([]);
+		expect(output.closed).toBe(true);
+	});
+
 	for (const args of [
 		...[
 			"discord/dm/c",

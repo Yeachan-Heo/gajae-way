@@ -471,8 +471,11 @@ export async function main(args = process.argv.slice(2), options: MainOptions = 
 							for (const job of result.jobs) {
 								// lane_key is the stored `work-<name>`; print the name work.retire accepts.
 								const name = job.lane_key.startsWith("work-") ? job.lane_key.slice("work-".length) : job.lane_key;
+								const state = job.quarantined
+									? `HELD: quarantined reason=${job.reason} historical_state=${job.state}`
+									: job.state;
 								console.log(
-									`${name} ${job.state} session=${job.session_id || "-"} last=${job.last_activity_at || "-"} ${job.worktree_path}`,
+									`${name} ${state} session=${job.session_id || "-"} last=${job.last_activity_at || "-"} ${job.worktree_path}`,
 								);
 							}
 						}

@@ -367,6 +367,9 @@ export interface MonitorEventRecord {
 	readonly eventType: string;
 	readonly firedAt: string;
 	readonly stage: string;
+	/** Historical authority hold; stage remains the recorded historical stage. */
+	readonly quarantined?: boolean;
+	readonly reason?: string;
 }
 
 /** A worker gjc session run: an isolated coding-register session doing delegated work. */
@@ -495,6 +498,9 @@ export interface WorkJobsResult {
 		readonly job_id: string;
 		readonly lane_key: string;
 		readonly state: string;
+		/** Historical authority hold; state remains the recorded historical state. */
+		readonly quarantined?: boolean;
+		readonly reason?: string;
 		readonly branch: string;
 		readonly worktree_path: string;
 		readonly session_id: string;

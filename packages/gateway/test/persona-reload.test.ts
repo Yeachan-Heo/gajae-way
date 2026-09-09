@@ -6,7 +6,7 @@ import type { GatewayConfig } from "../src/config";
 import { PersonaLoader, SELF_OPS_PREAMBLE_POINTER } from "../src/persona/persona";
 import { startUnixServer } from "../src/server/server";
 import { GatewayDatabase } from "../src/store/db";
-import { sessionPortFromResponder } from "./session-port.fake";
+import { attachTestBrokerOwnership, sessionPortFromResponder } from "./session-port.fake";
 
 test("persona USER.md edits are included on the next turn", async () => {
 	const home = await mkdtemp(join(tmpdir(), "gajaeway-persona-"));
@@ -21,11 +21,13 @@ test("persona USER.md edits are included on the next turn", async () => {
 	const seen: string[] = [];
 	const database = await GatewayDatabase.open(config.dbPath);
 	const sessionPort = sessionPortFromResponder({
+		bind: (key, epoch) => `${key}#${epoch}`,
 		respond: async (_id, _text, preamble) => {
 			seen.push(preamble ?? "");
 			return "reply";
 		},
 	});
+	attachTestBrokerOwnership(database, sessionPort, join(home, "agent"));
 	const server = await startUnixServer({ config, database, sessionPort, onStop: () => database.close() });
 	try {
 		await mkdir(join(home, "workspace"), { recursive: true });

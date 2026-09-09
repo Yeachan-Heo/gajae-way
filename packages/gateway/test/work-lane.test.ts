@@ -866,3 +866,79 @@ test("a queued steer captured for A refuses after A settles and B starts", async
 		f.manager.recover = recover;
 	}
 });
+
+test("quarantined accepted work reserves its name without querying the shared broker", async () => {
+	const f = await fixture();
+	const old = await started(f, "old", origin);
+	await f.manager.stop();
+	const history = f.db.laneJobJson(old.jobId);
+	const runtime = f.db.workAttemptGet(old.opRef);
+	const authority = { canonicalAgentDir: "/tmp/global-agent", identity: "shared-broker" };
+	f.db.cutoverBrokerAuthority({
+		expectedAuthority: null,
+		targetAuthority: authority,
+		evidence: "test operator quarantined private broker work",
+		disposition: "quarantine",
+	});
+	// The shared broker may answer the same old ID; it must never be asked.
+	f.port.setSessionState(old.sessionId, { repo: f.directory, live: true });
+	const calls: string[] = [];
+	for (const method of [
+		"status",
+		"liveness",
+		"inspect",
+		"resume",
+		"steer",
+		"close",
+		"attachTail",
+		"fetchWorkerOutput",
+	] as const) {
+		const original = f.port[method];
+		Object.assign(f.port, {
+			[method]: (...args: unknown[]) => {
+				calls.push(method);
+				return Reflect.apply(original, f.port, args);
+			},
+		});
+	}
+	const binds = f.port.binds.length;
+	const sends = f.port.sends.length;
+	await f.restart();
+	const failure = {
+		code: "verb_failed",
+		message: "work lane belongs to a quarantined broker authority",
+		detail: { reasonCode: "broker_authority_quarantined", jobId: old.jobId, name: "old" },
+	};
+	await expect(f.manager.status({ name: "old" })).rejects.toMatchObject(failure);
+	for (const resume of [false, true]) {
+		await expect(f.manager.start({ name: "old", text: "again", cwd: f.directory, resume })).rejects.toMatchObject(
+			failure,
+		);
+		await expect(f.manager.run({ name: "old", text: "again", cwd: f.directory, resume }, {})).rejects.toMatchObject(
+			failure,
+		);
+	}
+	await expect(f.manager.steer({ name: "old", text: "change" })).rejects.toMatchObject(failure);
+	expect(await f.lanes.retire("old", "operator")).toEqual({
+		retired: false,
+		sessionKey: workSessionKey("old"),
+		reason: "broker_authority_quarantined",
+	});
+	expect(calls).toEqual([]);
+	expect(f.port.binds).toHaveLength(binds);
+	expect(f.port.sends).toHaveLength(sends);
+	expect(f.db.laneJobJson(old.jobId)).toBe(history);
+	expect(f.db.workAttemptGet(old.opRef)).toEqual(runtime);
+	expect(f.db.laneJobRows()).toEqual([]);
+	expect(f.db.laneJobRows(true).map((row) => row.job_id)).toEqual([old.jobId]);
+	// Explicit test-only provenance models a successful shared SDK bind.
+	f.port.bind = async (input) => {
+		const binding = { ...input, sessionId: crypto.randomUUID() };
+		f.db.recordOwnedBinding({ ...binding, authority });
+		return binding;
+	};
+	const fresh = await started(f, "fresh");
+	expect(fresh.jobId).not.toBe(old.jobId);
+	expect(f.port.sends).toHaveLength(sends + 1);
+	expect(f.notices).toHaveLength(0);
+});

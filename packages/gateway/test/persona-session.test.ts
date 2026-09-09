@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { GjcCliError } from "@gajaeway/subsession";
 import { PersonaSessionManager, personaTurnOpRef } from "../src/orchestrator/persona-session";
+import type { TailAttachInput } from "../src/orchestrator/tail-runner";
 import { GatewayDatabase } from "../src/store/db";
 import { ScriptedSessionPort, steerRefused } from "./session-port.fake";
 
@@ -43,6 +44,19 @@ function enqueue(messageId: string, body: string): void {
 	expect(accepted).toBe(true);
 }
 
+/** Only successful scripted creation grants ownership; unknown seeded ids stay unowned. */
+function registerFixtureBindings(port: ScriptedSessionPort): void {
+	const fixtureDatabase = database!;
+	const canonicalAgentDir = join(home, "agent");
+	const authority = { canonicalAgentDir, identity: `gjc:${canonicalAgentDir}` };
+	const bind = port.bind.bind(port);
+	port.bind = async (input) => {
+		const binding = await bind(input);
+		expect(fixtureDatabase.recordOwnedBinding({ ...binding, authority })).toBe(true);
+		return binding;
+	};
+}
+
 async function harness(
 	port: ScriptedSessionPort,
 	hooks: {
@@ -52,17 +66,21 @@ async function harness(
 		failure?: (message: string) => void;
 	} = {},
 	log?: (line: string) => void,
-	extra: { gcDeletes?: boolean } = {},
 ) {
 	home = await mkdtemp(join(tmpdir(), "gajaeway-persona-session-"));
 	database = await GatewayDatabase.open(join(home, "gateway.db"));
+	const canonicalAgentDir = join(home, "agent");
+	database.assertBrokerAuthority(
+		{ canonicalAgentDir, identity: `gjc:${canonicalAgentDir}` },
+		{ initializeEmpty: true },
+	);
+	registerFixtureBindings(port);
 	manager = new PersonaSessionManager({
 		database,
 		port,
 		instanceId: "instance-test",
 		repo: join(home, "workspace"),
 		...(log ? { log } : {}),
-		...extra,
 		onTurnStart: ({ trigger, turn }) => {
 			latestOpRef = turn.opRef;
 			return {
@@ -216,6 +234,83 @@ test("bounded shutdown reconciliation leaves a nonterminal accepted turn durable
 	await manager?.drain(0);
 	expect(manager?.state(KEY)).toBe("turn-running");
 	expect(database?.inboundTurnRow(latestOpRef)).toMatchObject({ state: "pending", turn_state: "accepted" });
+});
+
+test("stop drains an admitted generation callback and fences queued and delayed tail callbacks", async () => {
+	const port = new ScriptedSessionPort();
+	let tailInput: TailAttachInput | undefined;
+	const attach = port.attachTail.bind(port);
+	port.attachTail = async (input) => {
+		tailInput = input;
+		return attach(input);
+	};
+	const terminal: string[] = [];
+	const logs: string[] = [];
+	await harness(port, { terminal: (text) => terminal.push(text) }, (line) => logs.push(line));
+	enqueue("stop-generation", "keep accepted work durable");
+	await manager!.notifyInbound(KEY);
+	await manager!.drain(0);
+	expect(logs.some((line) => line.startsWith("shutdown_hold "))).toBe(true);
+	const before = database!.inboundTurnRow(latestOpRef);
+	let release!: () => void;
+	const blocked = new Promise<void>((resolve) => {
+		release = resolve;
+	});
+	let entered!: () => void;
+	const started = new Promise<void>((resolve) => {
+		entered = resolve;
+	});
+	let statusCalls = 0;
+	const status = port.status.bind(port);
+	port.status = async (input) => {
+		statusCalls++;
+		entered();
+		await blocked;
+		return status(input);
+	};
+	const generation = manager!.onBrokerGeneration(1);
+	await started;
+	const queuedGeneration = manager!.onBrokerGeneration(2);
+	const queuedTail = tailInput!.onStall?.({
+		sessionId: port.sends[0]!.sessionId,
+		brokerGeneration: 0,
+		elapsedMs: 100_000,
+	});
+	let stopped = false;
+	const stopping = manager!.stop().then(() => {
+		stopped = true;
+	});
+	await Promise.resolve();
+	expect(stopped).toBe(false);
+	release();
+	await Promise.all([generation, queuedGeneration, queuedTail, stopping]);
+	expect(statusCalls).toBe(1);
+	expect(database!.inboundTurnRow(latestOpRef)).toEqual(before);
+	database!.close();
+	database = undefined;
+	const callbacks = tailInput!;
+	await manager!.onBrokerGeneration(3);
+	await manager!.tick(KEY);
+	await manager!.reconcile(KEY);
+	await callbacks.onCursorCommitted?.("late-cursor");
+	await callbacks.onStall?.({ sessionId: port.sends[0]!.sessionId, brokerGeneration: 0, elapsedMs: 100_000 });
+	// A saved callback can outlive the tail handle and database.
+	await callbacks.onFrame?.({
+		kind: "transcript",
+		rawKind: "transcript",
+		payload: { role: "assistant", opRef: latestOpRef },
+		assistantText: "late answer",
+		steerEcho: false,
+		idle: false,
+	});
+	await callbacks.onRetentionGap?.({
+		sessionId: port.sends[0]!.sessionId,
+		resync: { revision: 1, generation: 0, seq: 1 },
+	});
+	expect(statusCalls).toBe(1);
+	expect(port.sends).toHaveLength(1);
+	expect(port.steers).toHaveLength(0);
+	expect(terminal).toEqual([]);
 });
 
 test("/new retires an accepted turn, fences its late output, and preserves turn recovery until terminal", async () => {
@@ -386,6 +481,7 @@ test("startup recovery releases a bound turn whose tail attach is disowned inste
 		}
 	}
 	const disowning = new DisowningTailPort({ onBind: (input) => `fresh-e${input.epoch}` });
+	registerFixtureBindings(disowning);
 	disowning.seedOperation(opRef, orphan.sessionId, "in_flight");
 	// inspect/status still describe the session as live and the op as running
 	// (live shape: the id is indexed but the tail router disowns it).
@@ -560,84 +656,58 @@ test("two messages 50ms apart start one turn and steer the second", async () => 
 	);
 });
 
-/**
- * Live 2026-09-06 (jip): every epoch rotation leaves the previous session saved
- * in the broker index and nothing removed them. 149 indexed for 55 referenced
- * pushed `session.list` past one page; the broker's 32-cursor budget leaked one
- * per early-stopped traversal and every id-resolving CLI call then failed with
- * `cursor capacity is exhausted`.
- */
-test("session GC deletes indexed sessions no origin or pending turn references, and nothing else", async () => {
-	class IndexedPort extends ScriptedSessionPort {
-		readonly index: Array<{ sessionId: string; live: boolean; lastActivityMs: number | undefined }> = [];
+test("recovery and stop never scan or delete unrelated shared broker sessions", async () => {
+	class SharedPort extends ScriptedSessionPort {
+		readonly index = [
+			{ sessionId: "unrelated-saved", live: false, lastActivityMs: 0 },
+			{ sessionId: "unrelated-live", live: true, lastActivityMs: 0 },
+			{ sessionId: "unrelated-unknown-age", live: false, lastActivityMs: undefined },
+		];
+		indexScans = 0;
 		readonly deleted: string[] = [];
-		refuse = new Set<string>();
 		async listSessions() {
+			this.indexScans++;
 			return this.index.map((row) => ({
 				...row,
-				cwd: "/corpus",
-				sessionPath: `/agent/sessions/b/2026_${row.sessionId}.jsonl`,
+				cwd: "/shared-workspace",
+				sessionPath: `/shared-sessions/${row.sessionId}.jsonl`,
 			}));
 		}
 		async deleteSession(input: { sessionId: string }) {
-			if (this.refuse.has(input.sessionId))
-				return { deleted: false as const, code: "cleanup_pending", message: "cleanup pending" };
 			this.deleted.push(input.sessionId);
-			this.index.splice(
-				this.index.findIndex((row) => row.sessionId === input.sessionId),
-				1,
-			);
 			return { deleted: true as const };
 		}
 	}
-	const port = new IndexedPort();
-	const logs: string[] = [];
-	await harness(port, {}, (line) => logs.push(line), { gcDeletes: true });
-	enqueue("m-1", "bind me");
-	await manager?.notifyInbound(KEY);
-	await eventually(() => port.sends.length === 1, "turn did not start");
-	const current = port.sends[0]!.sessionId;
-	const old = Date.now() - 2 * 60 * 60_000;
-	port.index.push(
-		{ sessionId: current, live: true, lastActivityMs: old }, // referenced: keep
-		{ sessionId: "rotated-away", live: false, lastActivityMs: old }, // orphan: delete
-		{ sessionId: "still-live-elsewhere", live: true, lastActivityMs: old }, // live: keep
-		{ sessionId: "just-rotated", live: false, lastActivityMs: Date.now() - 60_000 }, // too fresh: keep
-		{ sessionId: "no-heartbeat", live: false, lastActivityMs: undefined }, // orphan, unknown age: delete
-		{ sessionId: "broker-refuses", live: false, lastActivityMs: old }, // refused by broker: logged, kept
-	);
-	port.refuse.add("broker-refuses");
-
-	const result = await manager!.collectSessions();
-	expect(port.deleted.sort()).toEqual(["no-heartbeat", "rotated-away"]);
-	expect(result).toEqual({ indexed: 6, deleted: 2, refused: 1 });
-	expect(port.index.map((row) => row.sessionId).sort()).toEqual(
-		["broker-refuses", "just-rotated", "still-live-elsewhere", current].sort(),
-	);
-	expect(logs.filter((line) => line.startsWith("session_gc"))).toEqual([
-		"session_gc indexed=6 referenced=1 deleted=2 refused=1 refusals=cleanup_pending:1",
-	]);
-
-	// Idempotent: a second sweep with nothing collectable is silent.
-	const again = await manager!.collectSessions();
-	expect(again).toEqual({ indexed: 4, deleted: 0, refused: 1 });
-});
-
-test("session GC only measures by default: no deletes until the gjc cleanup fence is session-scoped", async () => {
-	class IndexedPort extends ScriptedSessionPort {
-		deletes = 0;
-		async listSessions() {
-			return [{ sessionId: "orphan", live: false, cwd: "/c", sessionPath: "/p", lastActivityMs: undefined }];
-		}
-		async deleteSession() {
-			this.deletes++;
-			return { deleted: true as const };
-		}
-	}
-	const port = new IndexedPort();
+	const port = new SharedPort();
 	const logs: string[] = [];
 	await harness(port, {}, (line) => logs.push(line));
-	expect(await manager!.collectSessions()).toEqual({ indexed: 1, deleted: 0, refused: 0 });
-	expect(port.deletes).toBe(0);
-	expect(logs).toContain("session_gc indexed=1 referenced=0 orphans=1 deletes=off");
+	enqueue("m-1", "recover my pending message");
+	await manager!.recover();
+	await eventually(() => port.sends.length === 1, "pending recovery did not dispatch");
+	const send = port.sends[0]!;
+	expect(port.indexScans).toBe(0);
+	expect(port.deleted).toEqual([]);
+	await manager!.stop();
+	expect(port.indexScans).toBe(0);
+	expect(port.deleted).toEqual([]);
+
+	manager = new PersonaSessionManager({
+		database: database!,
+		port,
+		instanceId: "instance-test",
+		repo: join(home, "workspace"),
+		log: (line) => logs.push(line),
+	});
+	await manager.recover();
+	expect(manager.state(KEY)).toBe("turn-running");
+	expect(port.sends).toHaveLength(1);
+	port.complete(send.opRef, "recovered reply");
+	await eventually(
+		() => database?.inboundTurnRow(send.opRef)?.turn_state === "done",
+		"recovered turn did not complete",
+	);
+	await manager.stop();
+	expect(port.indexScans).toBe(0);
+	expect(port.deleted).toEqual([]);
+	expect(logs.some((line) => line.startsWith("session_gc"))).toBe(false);
 });

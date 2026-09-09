@@ -7,7 +7,7 @@ import type { SessionPort } from "../src/orchestrator/session-port";
 import { InterimSpeechGate, isNearDuplicate, isProceduralNarration } from "../src/server/interim-speech";
 import { type GatewayServer, startUnixServer } from "../src/server/server";
 import { GatewayDatabase } from "../src/store/db";
-import { ScriptedSessionPort } from "./session-port.fake";
+import { attachTestBrokerOwnership, ScriptedSessionPort } from "./session-port.fake";
 
 // ---------------------------------------------------------------------------
 // Pure content gate
@@ -143,6 +143,7 @@ async function startGateway(
 		channels: { "chan-1": { engagement: "open" } },
 	};
 	const database = await GatewayDatabase.open(config.dbPath);
+	attachTestBrokerOwnership(database, sessionPort, join(directory, "agent"));
 	server = await startUnixServer({
 		config,
 		database,
@@ -191,7 +192,7 @@ async function waitForSend(port: ScriptedSessionPort) {
 }
 
 test("a turn that narrates four steps delivers only its final answer", async () => {
-	const port = new ScriptedSessionPort();
+	const port = new ScriptedSessionPort({ onBind: (input) => `${input.originKey}#${input.epoch}` });
 	const client = await startGateway(port);
 	sendChannelMessage(client, "n1", "무슨 일이야?");
 	const send = await waitForSend(port);
@@ -207,7 +208,7 @@ test("a turn that narrates four steps delivers only its final answer", async () 
 });
 
 test("a real mid-work finding is delivered while the turn is still running", async () => {
-	const port = new ScriptedSessionPort();
+	const port = new ScriptedSessionPort({ onBind: (input) => `${input.originKey}#${input.epoch}` });
 	const client = await startGateway(port, { minGapMs: 0 });
 	sendChannelMessage(client, "f1", "무슨 일이야?");
 	const send = await waitForSend(port);
@@ -223,7 +224,7 @@ test("a real mid-work finding is delivered while the turn is still running", asy
 });
 
 test("a mid-work message inside the minimum gap is dropped, and the final answer still arrives", async () => {
-	const port = new ScriptedSessionPort();
+	const port = new ScriptedSessionPort({ onBind: (input) => `${input.originKey}#${input.epoch}` });
 	const client = await startGateway(port, { minGapMs: 45_000 });
 	sendChannelMessage(client, "g1", "무슨 일이야?");
 	const send = await waitForSend(port);
@@ -238,7 +239,7 @@ test("a mid-work message inside the minimum gap is dropped, and the final answer
 });
 
 test("the working indicator still announces and clears around a gated turn", async () => {
-	const port = new ScriptedSessionPort();
+	const port = new ScriptedSessionPort({ onBind: (input) => `${input.originKey}#${input.epoch}` });
 	const client = await startGateway(port, undefined, { firstAfterMs: 0, intervalMs: 0 });
 	sendChannelMessage(client, "p1", "상태 어때?");
 	const send = await waitForSend(port);
@@ -297,7 +298,7 @@ test("pre-tool suppression does not spend the turn budget", () => {
 });
 
 test("a pre-tool narration turn delivers only its final answer", async () => {
-	const port = new ScriptedSessionPort();
+	const port = new ScriptedSessionPort({ onBind: (input) => `${input.originKey}#${input.epoch}` });
 	const client = await startGateway(port, { minGapMs: 0 });
 	sendChannelMessage(client, "p1", "생각 새는거 원인이 뭐야?");
 	const send = await waitForSend(port);

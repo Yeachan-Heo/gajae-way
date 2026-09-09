@@ -1,6 +1,4 @@
 import { createHash } from "node:crypto";
-import { readdir } from "node:fs/promises";
-import { join } from "node:path";
 import {
 	assertControlAllowed,
 	assertValidOpRef,
@@ -22,7 +20,7 @@ import {
 	TranscriptIncompleteError,
 } from "@gajaeway/subsession";
 import type { GjcModelSelection, GjcServiceTier } from "../config";
-import type { GatewayDatabase } from "../store/db";
+import { type BrokerAuthority, BrokerAuthorityError, type GatewayDatabase } from "../store/db";
 import { sanitizeDiagnostic } from "./rebind";
 import type { TailAttachInput, TailHandle, TailRunner } from "./tail-runner";
 
@@ -87,17 +85,6 @@ export interface SessionPort {
 	/** Request/response helper for callers that already own their op-ref and serialization. */
 	request(input: SessionRequestInput): Promise<SessionRequestResult>;
 	/**
-	 * Every session the broker indexes for this agent directory, live or saved.
-	 * Recovery-only surface: the persona actor never lists, it inspects by id.
-	 */
-	listSessions?(): Promise<readonly IndexedSession[]>;
-	/**
-	 * Removes a saved (non-live) session from the broker's index and disk. The
-	 * broker's own guards still apply: a live session or one with pending
-	 * cleanup is refused, and the refusal is returned, never thrown.
-	 */
-	deleteSession?(input: { sessionId: string; cwd: string; sessionPath: string }): Promise<SessionDeleteOutcome>;
-	/**
 	 * Closes a live session (`session.close`). Recoverable on the broker side and
 	 * never `session.delete`: gjc fences every later lifecycle op on one refused
 	 * delete, so the gateway retires lanes by closing and rebinding instead.
@@ -105,19 +92,6 @@ export interface SessionPort {
 	close(input: { sessionId: string; repo: string }): Promise<void>;
 }
 
-export interface IndexedSession {
-	readonly sessionId: string;
-	readonly live: boolean;
-	readonly cwd: string | undefined;
-	/** Absolute path of the saved session file, when the broker reports one. */
-	readonly sessionPath: string | undefined;
-	/** Broker-reported last activity, epoch ms; undefined when it reports none. */
-	readonly lastActivityMs: number | undefined;
-}
-
-export type SessionDeleteOutcome =
-	| { readonly deleted: true }
-	| { readonly deleted: false; readonly code: string; readonly message: string };
 export type SessionCompactionStatus = "succeeded" | "failed" | "skipped" | "unavailable";
 export interface ContextUsage {
 	readonly percent: number;
@@ -251,8 +225,7 @@ export interface BrokerSessionPortOptions {
 	readonly cli: CliRunner;
 	readonly instanceId: string;
 	readonly tailRunner: TailRunner;
-	/** The private gjc agent directory; needed to locate saved session files for deletion. */
-	readonly agentDir?: string;
+	readonly authority: BrokerAuthority;
 	readonly now?: () => number;
 	readonly sleep?: (ms: number) => Promise<void>;
 }
@@ -277,12 +250,18 @@ export class BrokerSessionPort implements SessionPort {
 	readonly #now: () => number;
 	readonly #sleep: (ms: number) => Promise<void>;
 	readonly #chains = new Map<string, Promise<void>>();
-	readonly #agentDir: string | undefined;
+	readonly #authority: BrokerAuthority;
 
 	constructor(options: BrokerSessionPortOptions) {
 		this.#database = options.database;
-		this.#agentDir = options.agentDir;
-		this.#cli = async (args, commandOptions) => normalizeSdkEnvelopeFailure(await options.cli(args, commandOptions));
+		this.#authority = { ...options.authority };
+		this.#database.assertBrokerAuthority(this.#authority);
+		this.#cli = async (args, commandOptions) => {
+			this.#database.assertBrokerAuthority(this.#authority);
+			const result = await options.cli(args, commandOptions);
+			this.#database.assertBrokerAuthority(this.#authority);
+			return normalizeSdkEnvelopeFailure(result);
+		};
 		this.#instanceId = options.instanceId;
 		this.#tailRunner = options.tailRunner;
 		this.#now = options.now ?? (() => Date.now());
@@ -298,15 +277,13 @@ export class BrokerSessionPort implements SessionPort {
 	}
 
 	async bind(input: SessionBindInput): Promise<SessionBinding> {
+		this.#database.assertBrokerAuthority(this.#authority);
 		if (!Number.isSafeInteger(input.epoch) || input.epoch < 0)
 			throw new Error("session epoch must be a non-negative integer");
 		const existing = this.#database.getSessionRecord(input.originKey);
 		if (existing?.epoch === input.epoch && existing.sessionId) {
-			// A persisted binding is only reusable if the broker still indexes it. A
-			// binding written against a store the current runtime cannot read
-			// (pre-cutover session ids) must be rebound, not handed to a send that
-			// will fail with session_unavailable forever. Inspect failure (transport
-			// outage) keeps the binding: that is not evidence the session is gone.
+			this.#assertOwned({ sessionId: existing.sessionId, repo: input.repo });
+			// Only owned bindings may be inspected, resumed, or replaced.
 			let indexed = true;
 			try {
 				// Judge the raw envelope: a persisted id is reusable only when the
@@ -329,13 +306,15 @@ export class BrokerSessionPort implements SessionPort {
 								originKey: input.originKey,
 								epoch: input.epoch,
 							});
-						} catch {
+						} catch (error) {
+							if (error instanceof BrokerAuthorityError) throw error;
 							// Saved authority cannot be resumed: replace it below.
 						}
 					}
 					indexed = false;
 				}
-			} catch {
+			} catch (error) {
+				if (error instanceof BrokerAuthorityError) throw error;
 				indexed = true;
 			}
 			if (indexed)
@@ -351,6 +330,7 @@ export class BrokerSessionPort implements SessionPort {
 		try {
 			created = await this.#createSession(input.repo, idempotencyKey, input.model);
 		} catch (error) {
+			if (error instanceof BrokerAuthorityError) throw error;
 			if (input.epochRecovery === false) throw error;
 			const nextEpoch = this.#database.rebindEpoch(input.originKey);
 			console.error(
@@ -365,7 +345,15 @@ export class BrokerSessionPort implements SessionPort {
 		if (persistedEpoch !== undefined && persistedEpoch > input.epoch) {
 			throw new Error(`session bind for ${input.originKey} epoch ${input.epoch} lost to epoch ${persistedEpoch}`);
 		}
-		if (!this.#database.putSessionAtEpoch(input.originKey, created.sessionId, input.epoch)) {
+		if (
+			!this.#database.recordOwnedBinding({
+				authority: this.#authority,
+				sessionId: created.sessionId,
+				originKey: input.originKey,
+				epoch: input.epoch,
+				repo: input.repo,
+			})
+		) {
 			throw new Error(
 				`session bind for ${input.originKey} epoch ${input.epoch} lost to a concurrent durable epoch change`,
 			);
@@ -387,6 +375,7 @@ export class BrokerSessionPort implements SessionPort {
 
 	/** Judged on the raw inspect envelope (gjc >= 0.16.0 omits locator.repo, which the subsession normalizer requires). */
 	async #awaitIndexed(sessionId: string, repo: string): Promise<void> {
+		this.#assertOwned({ sessionId, repo });
 		const deadline = Date.now() + SESSION_READY_TIMEOUT_MS;
 		let lastCode: string | undefined;
 		for (;;) {
@@ -406,6 +395,7 @@ export class BrokerSessionPort implements SessionPort {
 				if (!disowned && !notLive) return;
 				lastCode = disowned ? "session_unavailable" : "not_live";
 			} catch (error) {
+				if (error instanceof BrokerAuthorityError) throw error;
 				const code = sdkErrorCode(error);
 				if (code !== "session_unavailable") return;
 				lastCode = code;
@@ -479,6 +469,7 @@ export class BrokerSessionPort implements SessionPort {
 		sessionId: string;
 		repo: string;
 	}): Promise<{ readonly live: boolean | undefined; readonly disowned: boolean }> {
+		this.#assertOwned(input);
 		try {
 			const result = await this.#cli(["sdk", "session", "inspect", input.sessionId, "--repo", input.repo], {
 				timeoutMs: 10_000,
@@ -492,15 +483,18 @@ export class BrokerSessionPort implements SessionPort {
 			const live = envelope.result?.session?.live;
 			return { live: typeof live === "boolean" ? live : undefined, disowned: false };
 		} catch (error) {
+			if (error instanceof BrokerAuthorityError) throw error;
 			return { live: undefined, disowned: sdkErrorCode(error) === "session_unavailable" };
 		}
 	}
 
 	async inspect(input: { sessionId: string; repo: string }): Promise<BrokerSession | undefined> {
+		this.#assertOwned(input);
 		return await this.#safe(async () => await inspectSession(this.#controller(input.repo), input.sessionId));
 	}
 
 	async resume(input: { sessionId: string; repo: string; originKey: string; epoch: number }): Promise<SessionBinding> {
+		this.#assertOwned(input);
 		const existing = await this.inspect(input);
 		if (!existing || existing.deleted || existing.repo !== input.repo)
 			throw new Error(`cannot resume session ${input.sessionId}: saved authority is unavailable`);
@@ -527,6 +521,7 @@ export class BrokerSessionPort implements SessionPort {
 	}
 
 	async send(input: SessionSendInput): Promise<SendReceipt> {
+		this.#assertOwned(input);
 		assertValidOpRef(input.opRef);
 		if (input.model) await this.setModel({ sessionId: input.sessionId, repo: input.repo, selection: input.model });
 		return await sendPrompt(this.#controller(input.repo), {
@@ -538,6 +533,7 @@ export class BrokerSessionPort implements SessionPort {
 	}
 
 	async steer(input: SessionSteerInput): Promise<void> {
+		this.#assertOwned(input);
 		assertControlAllowed("turn.steer", { operatorApproval: true });
 		const raw = await this.#cli([
 			"sdk",
@@ -594,6 +590,7 @@ export class BrokerSessionPort implements SessionPort {
 		repo: string;
 		selection: GjcModelSelection;
 	}): Promise<{ readonly changed: boolean }> {
+		this.#assertOwned(input);
 		if (typeof input.selection !== "string") {
 			const activation = parseEnvelope<boolean | { changed?: unknown; id?: unknown }>(
 				await this.#cli([
@@ -636,6 +633,7 @@ export class BrokerSessionPort implements SessionPort {
 		repo: string;
 		tier: GjcServiceTier;
 	}): Promise<{ readonly changed: boolean }> {
+		this.#assertOwned(input);
 		const result = parseEnvelope<{ changed?: unknown }>(
 			await this.#cli([
 				"sdk",
@@ -655,10 +653,12 @@ export class BrokerSessionPort implements SessionPort {
 	}
 
 	async status(input: { sessionId: string; repo: string; opRef: string }): Promise<StatusReport> {
+		this.#assertOwned(input);
 		return await fetchOpState(this.#controller(input.repo), input.sessionId, input.opRef);
 	}
 
 	async fetchWorkerOutput(input: WorkerOutputInput): Promise<WorkerOutputResult> {
+		this.#assertOwned(input);
 		if (workerOutputCancelled(input)) return { status: "unavailable", code: "cancelled" };
 		if (!Number.isFinite(input.notBeforeMs) || !input.opRef) return { status: "unavailable", code: "invalid_evidence" };
 		// Verified SDK Q26: turn.result carries invocation-owned content, not a
@@ -685,7 +685,8 @@ export class BrokerSessionPort implements SessionPort {
 					{ timeoutMs: 15_000 },
 				);
 				return parseWorkerOutputResponse(input, raw, this.#now());
-			} catch {
+			} catch (error) {
+				if (error instanceof BrokerAuthorityError) throw error;
 				return workerOutputCancelled(input)
 					? { status: "unavailable", code: "cancelled" }
 					: { status: "absent", code: "transport_error" };
@@ -709,6 +710,7 @@ export class BrokerSessionPort implements SessionPort {
 	}
 
 	async queueEmpty(input: { sessionId: string; repo: string }): Promise<boolean> {
+		this.#assertOwned(input);
 		const result = await this.#cli(
 			[
 				"sdk",
@@ -730,6 +732,7 @@ export class BrokerSessionPort implements SessionPort {
 	}
 
 	async contextUsage(input: { sessionId: string; repo: string }): Promise<ContextUsage | undefined> {
+		this.#assertOwned(input);
 		const result = await this.#cli(
 			[
 				"sdk",
@@ -759,120 +762,8 @@ export class BrokerSessionPort implements SessionPort {
 		};
 	}
 
-	/**
-	 * One `session.list --scope all` per page. The broker caps continuation
-	 * cursors at 32 per 15 minutes and leaks one per traversal that stops early,
-	 * so a large index makes every id-resolving CLI call fail with
-	 * `session.list cursor capacity is exhausted` (live: jip, 149 sessions,
-	 * 2026-09-06). This listing exists so the GC can shrink the index below one
-	 * page; it drains every page so the broker releases its own cursor.
-	 */
-	async listSessions(): Promise<readonly IndexedSession[]> {
-		const sessions: IndexedSession[] = [];
-		let cursor: string | undefined;
-		const seen = new Set<string>();
-		for (let pages = 0; pages < 100; pages++) {
-			// Raw global op, not `session list --scope all`: the scoped form needs a
-			// git repository at the cwd (p25's workspace is none) and the health probe
-			// already established `raw global session.list` as the portable path.
-			// Largest page the broker allows: fewer cursors per traversal, and a
-			// traversal that drains to the end is the only one that frees its cursor.
-			const result = await this.#cli(
-				[
-					"sdk",
-					"session",
-					"raw",
-					"global",
-					"--op",
-					"session.list",
-					"--json-input",
-					JSON.stringify({ limit: 100, ...(cursor ? { cursor } : {}) }),
-				],
-				{ timeoutMs: 30_000 },
-			);
-			const page = parseEnvelope<{ sessions?: unknown[]; continuationCursor?: unknown }>(result, "session.list");
-			for (const raw of Array.isArray(page.sessions) ? page.sessions : []) {
-				const row = raw as {
-					sessionId?: unknown;
-					live?: unknown;
-					deleted?: unknown;
-					locator?: { cwd?: unknown };
-					lastHeartbeatAt?: unknown;
-					activity?: { at?: unknown; updatedAt?: unknown };
-				};
-				if (typeof row.sessionId !== "string" || row.deleted === true) continue;
-				const heartbeat = typeof row.lastHeartbeatAt === "number" ? row.lastHeartbeatAt : undefined;
-				sessions.push({
-					sessionId: row.sessionId,
-					live: row.live === true,
-					cwd: typeof row.locator?.cwd === "string" ? row.locator.cwd : undefined,
-					sessionPath: await this.#savedSessionPath(row.sessionId),
-					lastActivityMs: heartbeat,
-				});
-			}
-			const next = typeof page.continuationCursor === "string" ? page.continuationCursor : undefined;
-			if (!next || seen.has(next)) return sessions;
-			seen.add(next);
-			cursor = next;
-		}
-		return sessions;
-	}
-
-	/** `<agentDir>/sessions/<bucket>/<timestamp>_<sessionId>.jsonl`, the file the broker's delete wants named. */
-	async #savedSessionPath(sessionId: string): Promise<string | undefined> {
-		if (!this.#agentDir) return undefined;
-		const root = join(this.#agentDir, "sessions");
-		let buckets: string[];
-		try {
-			buckets = await readdir(root);
-		} catch {
-			return undefined;
-		}
-		for (const bucket of buckets) {
-			let names: string[];
-			try {
-				names = await readdir(join(root, bucket));
-			} catch {
-				continue;
-			}
-			const hit = names.find((name) => name.endsWith(`_${sessionId}.jsonl`));
-			if (hit) return join(root, bucket, hit);
-		}
-		return undefined;
-	}
-
-	async deleteSession(input: { sessionId: string; cwd: string; sessionPath: string }): Promise<SessionDeleteOutcome> {
-		assertControlAllowed("session.delete", { operatorApproval: true });
-		const result = await this.#cli(
-			[
-				"sdk",
-				"session",
-				"raw",
-				"global",
-				"--op",
-				"session.delete",
-				"--idempotency-key",
-				`gw-gc-${this.#instanceId}-${input.sessionId}-${this.#now()}`,
-				"--json-input",
-				JSON.stringify({ sessionId: input.sessionId, cwd: input.cwd, sessionPath: input.sessionPath }),
-			],
-			{ timeoutMs: 30_000 },
-		);
-		let envelope: { ok?: unknown; error?: { code?: unknown; message?: unknown } };
-		try {
-			envelope = JSON.parse(result.stdout) as typeof envelope;
-		} catch {
-			return { deleted: false, code: "malformed_envelope", message: `exit ${result.exitCode}` };
-		}
-		if (envelope.ok === true) return { deleted: true };
-		return {
-			deleted: false,
-			code: typeof envelope.error?.code === "string" ? envelope.error.code : "unknown",
-			message: sanitizeDiagnostic(typeof envelope.error?.message === "string" ? envelope.error.message : ""),
-		};
-	}
-
 	async close(input: { sessionId: string; repo: string }): Promise<void> {
+		this.#assertOwned(input);
 		assertControlAllowed("session.close", { operatorApproval: true });
 		// Lifecycle op: the per-session `control` route prohibits it for the
 		// daemon CLI (adapter_operation_prohibited on gjc 0.16.x); only the
@@ -902,6 +793,7 @@ export class BrokerSessionPort implements SessionPort {
 		repo: string;
 		notBeforeMs: number;
 	}): Promise<LastAssistantResult | undefined> {
+		this.#assertOwned(input);
 		let cursor: string | undefined;
 		let latest: { role?: string; ts?: string; textSummary?: string; body?: string } | undefined;
 		const seenCursors = new Set<string>();
@@ -958,6 +850,7 @@ export class BrokerSessionPort implements SessionPort {
 	}
 
 	async fetchLastAssistant(input: { sessionId: string; repo: string }): Promise<LastAssistantResult> {
+		this.#assertOwned(input);
 		const maxPages = 50;
 		const chunks: string[] = [];
 		let cursor: string | undefined;
@@ -989,10 +882,12 @@ export class BrokerSessionPort implements SessionPort {
 	}
 
 	async attachTail(input: TailAttachInput): Promise<TailHandle> {
+		this.#assertOwned(input);
 		return await this.#tailRunner.attach(input);
 	}
 
 	async runCompaction(input: SessionCompactionInput): Promise<{ readonly status: SessionCompactionStatus }> {
+		this.#assertOwned(input);
 		try {
 			const result = parseEnvelope<Record<string, unknown>>(
 				await this.#cli([
@@ -1014,6 +909,7 @@ export class BrokerSessionPort implements SessionPort {
 			if (result.skipped === true || result.status === "skipped") return { status: "skipped" };
 			return { status: "failed" };
 		} catch (error) {
+			if (error instanceof BrokerAuthorityError) throw error;
 			const code = sdkErrorCode(error);
 			if (code === "unsupported_operation" || code === "not_supported" || code === "unknown_operation")
 				return { status: "unavailable" };
@@ -1060,6 +956,7 @@ export class BrokerSessionPort implements SessionPort {
 	}
 
 	async request(input: SessionRequestInput): Promise<SessionRequestResult> {
+		this.#assertOwned(input);
 		// Chat-like callers attach before send for live output. Monitor authoring
 		// sets observeTail=false: it consumes no intermediate frames, and old
 		// session history must not be able to fail an otherwise valid final-result
@@ -1083,13 +980,15 @@ export class BrokerSessionPort implements SessionPort {
 				receipt = await this.send(input);
 				tail?.markAccepted(input.opRef);
 			} catch (sendError) {
+				if (sendError instanceof BrokerAuthorityError) throw sendError;
 				// A transport/control failure may occur after the runtime accepted the
 				// prompt. Query the SAME clientRef before retrying; monitor authoring
 				// otherwise ran the event, produced a final answer, then executed it
 				// again because the torn send was treated as definitive failure.
 				try {
 					status = await this.status({ sessionId: input.sessionId, repo: input.repo, opRef: input.opRef });
-				} catch {
+				} catch (error) {
+					if (error instanceof BrokerAuthorityError) throw error;
 					throw sendError;
 				}
 				if (status.status.status === "unknown") throw sendError;
@@ -1116,6 +1015,10 @@ export class BrokerSessionPort implements SessionPort {
 			tail?.setTurnRunning(false);
 			await tail?.close();
 		}
+	}
+
+	#assertOwned(input: { sessionId: string; repo: string }): void {
+		this.#database.assertOwnedSession(input.sessionId, input.repo, this.#authority);
 	}
 
 	#controller(repo: string): ControllerOptions {
@@ -1343,6 +1246,7 @@ function sanitizedDetails(details: unknown): unknown {
 }
 
 function sanitizeSdkFailure(error: unknown): Error {
+	if (error instanceof BrokerAuthorityError) return error;
 	if (error instanceof OpRefRejectedError)
 		return new OpRefRejectedError(
 			error.opRef,

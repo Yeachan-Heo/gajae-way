@@ -1,13 +1,13 @@
 import { Database } from "bun:sqlite";
 import { afterEach, expect, test } from "bun:test";
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdtemp, realpath, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { GatewayConfig } from "../src/config";
 import type { SessionPort } from "../src/orchestrator/session-port";
 import { type GatewayServer, startUnixServer } from "../src/server/server";
 import { GatewayDatabase } from "../src/store/db";
-import { sessionPortFromScript } from "./session-port.fake";
+import { attachTestBrokerOwnership, sessionPortFromScript } from "./session-port.fake";
 
 const ORIGIN = { platform: "discord", kind: "channel", conversationId: "context-turn" } as const;
 const ORIGIN_KEY = "discord/channel/context-turn";
@@ -22,7 +22,7 @@ afterEach(async () => {
 });
 
 async function config(): Promise<GatewayConfig> {
-	directory = await mkdtemp(join(tmpdir(), "gajaeway-context-turn-"));
+	directory = await realpath(await mkdtemp(join(tmpdir(), "gajaeway-context-turn-")));
 	return {
 		schemaVersion: 1,
 		home: directory,
@@ -76,8 +76,22 @@ async function start(
 	gatewayConfig: GatewayConfig,
 	database: GatewayDatabase,
 	sessionPort: SessionPort,
+	seed?: () => void,
 ): Promise<{ client: Awaited<ReturnType<typeof connect>> }> {
-	server = await startUnixServer({ config: gatewayConfig, database, sessionPort, onStop: () => database.close() });
+	const { bind, resume } = sessionPort;
+	attachTestBrokerOwnership(database, sessionPort, join(gatewayConfig.home, "agent"));
+	seed?.();
+	server = await startUnixServer({
+		config: gatewayConfig,
+		database,
+		sessionPort,
+		onStop: () => {
+			// A restart reuses the fake runtime, not wrappers bound to a closed DB.
+			sessionPort.bind = bind;
+			sessionPort.resume = resume;
+			database.close();
+		},
+	});
 	const client = await connect(gatewayConfig.socketPath);
 	client.send({ v: "0.1", type: "hello", payload: { supportedVersions: ["0.1"] } });
 	await waitUntil(() => client.frames.length >= 1);
@@ -87,24 +101,25 @@ async function start(
 test("failed turn preserves selected context; later successful text consumes it with trigger attribution once", async () => {
 	const gatewayConfig = await config();
 	const database = await GatewayDatabase.open(gatewayConfig.dbPath);
-	database.contextRecord({
-		messageId: "context-bot",
-		originKey: ORIGIN_KEY,
-		authorId: "bot-2",
-		authorName: "helper-bot",
-		body: "current bounded bot context",
-	});
 	const turns: string[] = [];
 	let attempts = 0;
 	const sessionPort = sessionPortFromScript({
-		bind: async () => ({ sessionId: "session" }),
+		bind: async (key, epoch) => ({ sessionId: `session-${key}-${epoch}` }),
 		respond: async (_session, text) => {
 			turns.push(text);
 			if (attempts++ === 0) throw new Error("runtime failed before reply");
 			return "success";
 		},
 	});
-	const { client } = await start(gatewayConfig, database, sessionPort);
+	const { client } = await start(gatewayConfig, database, sessionPort, () => {
+		database.contextRecord({
+			messageId: "context-bot",
+			originKey: ORIGIN_KEY,
+			authorId: "bot-2",
+			authorName: "helper-bot",
+			body: "current bounded bot context",
+		});
+	});
 
 	send(client, "trigger-failed", "first owner request");
 	await waitUntil(() =>
@@ -130,7 +145,7 @@ test("successful intentional silence advances the context cursor", async () => {
 	const gatewayConfig = await config();
 	const database = await GatewayDatabase.open(gatewayConfig.dbPath);
 	const sessionPort = sessionPortFromScript({
-		bind: async () => ({ sessionId: "session" }),
+		bind: async (key, epoch) => ({ sessionId: `session-${key}-${epoch}` }),
 		respond: async () => "[SILENT]",
 	});
 	const { client } = await start(gatewayConfig, database, sessionPort);
@@ -143,15 +158,16 @@ test("successful intentional silence advances the context cursor", async () => {
 test("suppressed pre-tool assistant text followed by failure keeps the selected context unread", async () => {
 	const gatewayConfig = await config();
 	const database = await GatewayDatabase.open(gatewayConfig.dbPath);
-	database.contextRecord({ messageId: "context-human", originKey: ORIGIN_KEY, body: "relevant context" });
 	const sessionPort = sessionPortFromScript({
-		bind: async () => ({ sessionId: "session" }),
+		bind: async (key, epoch) => ({ sessionId: `session-${key}-${epoch}` }),
 		respond: async (_session, _text, _preamble, _progress, options) => {
 			options?.onAssistantText?.("delivered intermediate reply");
 			throw new Error("runtime failed after visible reply");
 		},
 	});
-	const { client } = await start(gatewayConfig, database, sessionPort);
+	const { client } = await start(gatewayConfig, database, sessionPort, () => {
+		database.contextRecord({ messageId: "context-human", originKey: ORIGIN_KEY, body: "relevant context" });
+	});
 	send(client, "intermediate-trigger", "owner request");
 	await waitUntil(() =>
 		client.frames.some((frame) => frame.event === "chat.message" && frame.payload.text.startsWith("[turn failed]")),
@@ -171,7 +187,7 @@ test("suppressed pre-tool reaction text followed by failure keeps the selected c
 	const gatewayConfig = await config();
 	const database = await GatewayDatabase.open(gatewayConfig.dbPath);
 	const sessionPort = sessionPortFromScript({
-		bind: async () => ({ sessionId: "session" }),
+		bind: async (key, epoch) => ({ sessionId: `session-${key}-${epoch}` }),
 		respond: async (_session, _text, _preamble, _progress, options) => {
 			options?.onAssistantText?.("[REACT:👍]");
 			throw new Error("runtime failed after visible reaction");
@@ -197,7 +213,7 @@ test("/new retires a pre-reset trigger queued behind an in-flight turn", async (
 	});
 	const turns: string[] = [];
 	const sessionPort = sessionPortFromScript({
-		bind: async () => ({ sessionId: "session" }),
+		bind: async (key, epoch) => ({ sessionId: `session-${key}-${epoch}` }),
 		respond: async (_session, text) => {
 			turns.push(text);
 			if (turns.length === 1) await gate;
@@ -221,16 +237,17 @@ test("/new retires a pre-reset trigger queued behind an in-flight turn", async (
 test("/new persists a floor that excludes pre-reset context after gateway restart", async () => {
 	const gatewayConfig = await config();
 	let database = await GatewayDatabase.open(gatewayConfig.dbPath);
-	database.contextRecord({ messageId: "pre-reset", originKey: ORIGIN_KEY, body: "old command" });
 	const turns: string[] = [];
 	const sessionPort = sessionPortFromScript({
-		bind: async () => ({ sessionId: "session" }),
+		bind: async (key, epoch) => ({ sessionId: `session-${key}-${epoch}` }),
 		respond: async (_session, text) => {
 			turns.push(text);
 			return "ok";
 		},
 	});
-	let { client } = await start(gatewayConfig, database, sessionPort);
+	let { client } = await start(gatewayConfig, database, sessionPort, () => {
+		database.contextRecord({ messageId: "pre-reset", originKey: ORIGIN_KEY, body: "old command" });
+	});
 	send(client, "reset-command", "/new");
 	await waitUntil(() => client.frames.some((frame) => frame.type === "response" && frame.id === "reset-command"));
 	client.close();
@@ -251,10 +268,7 @@ test("epoch bootstrap commits on first terminal success and is not repeated afte
 	let database = await GatewayDatabase.open(gatewayConfig.dbPath);
 	const preambles: string[] = [];
 	const sessionPort = sessionPortFromScript({
-		bind: async () => {
-			database.putSession(ORIGIN_KEY, "session");
-			return { sessionId: "session" };
-		},
+		bind: async (key, epoch) => ({ sessionId: `session-${key}-${epoch}` }),
 		respond: async (_session, _text, preamble) => {
 			preambles.push(preamble ?? "");
 			return "ok";
@@ -287,11 +301,10 @@ test("epoch bootstrap commits on first terminal success and is not repeated afte
 test("pre-success failure retries the same stable bootstrap and intentional silence commits it", async () => {
 	const gatewayConfig = await config();
 	let database = await GatewayDatabase.open(gatewayConfig.dbPath);
-	database.putSession(ORIGIN_KEY, "session");
 	const preambles: string[] = [];
 	let attempt = 0;
 	const sessionPort = sessionPortFromScript({
-		bind: async () => ({ sessionId: "session" }),
+		bind: async (key, epoch) => ({ sessionId: `session-${key}-${epoch}` }),
 		respond: async (_session, _text, preamble) => {
 			preambles.push(preamble ?? "");
 			if (attempt++ === 0) throw new Error("failed before delivery");
@@ -324,11 +337,10 @@ test("pre-success failure retries the same stable bootstrap and intentional sile
 test("intermediate delivery failure keeps bootstrap pending but consumes the body before stable-marker retry", async () => {
 	const gatewayConfig = await config();
 	const database = await GatewayDatabase.open(gatewayConfig.dbPath);
-	database.putSession(ORIGIN_KEY, "session");
 	const attempts: Array<{ text: string; preamble: string }> = [];
 	let first = true;
 	const sessionPort = sessionPortFromScript({
-		bind: async () => ({ sessionId: "session" }),
+		bind: async (key, epoch) => ({ sessionId: `session-${key}-${epoch}` }),
 		respond: async (_session, text, preamble, _progress, options) => {
 			attempts.push({ text, preamble: preamble ?? "" });
 			if (first) {
@@ -357,10 +369,9 @@ test("intermediate delivery failure keeps bootstrap pending but consumes the bod
 test("/new atomically establishes a fresh floor and pending epoch bootstrap", async () => {
 	const gatewayConfig = await config();
 	const database = await GatewayDatabase.open(gatewayConfig.dbPath);
-	database.putSession(ORIGIN_KEY, "session-0");
 	const preambles: string[] = [];
 	const sessionPort = sessionPortFromScript({
-		bind: async (_key, epoch) => ({ sessionId: `session-${epoch}` }),
+		bind: async (key, epoch) => ({ sessionId: `session-${key}-${epoch}` }),
 		respond: async (_session, _text, preamble) => {
 			preambles.push(preamble ?? "");
 			return "ok";
@@ -383,10 +394,9 @@ test("/new atomically establishes a fresh floor and pending epoch bootstrap", as
 test("persistent sessions do not auto-rotate on a turn count", async () => {
 	const gatewayConfig = await config();
 	const database = await GatewayDatabase.open(gatewayConfig.dbPath);
-	database.putSession(ORIGIN_KEY, "session-0");
 	const preambles: string[] = [];
 	const sessionPort = sessionPortFromScript({
-		bind: async (_key, epoch = 0) => ({ sessionId: `session-${epoch}` }),
+		bind: async (key, epoch) => ({ sessionId: `session-${key}-${epoch}` }),
 		respond: async (_session, _text, preamble) => {
 			preambles.push(preamble ?? "");
 			return "ok";
@@ -404,28 +414,26 @@ test("persistent sessions do not auto-rotate on a turn count", async () => {
 
 test("gateway startup prunes old consumed context even when the database was quiet", async () => {
 	const gatewayConfig = await config();
-	const initial = await GatewayDatabase.open(gatewayConfig.dbPath);
-	initial.close();
-	const raw = new Database(gatewayConfig.dbPath);
-	raw
-		.query(
-			"INSERT INTO conversation_context (message_id, origin_key, body, received_at, consumed_at) VALUES (?, ?, ?, ?, ?)",
-		)
-		.run(
-			"quiet-old",
-			ORIGIN_KEY,
-			"old private body",
-			new Date(Date.now() - 8 * 24 * 60 * 60 * 1000).toISOString(),
-			new Date().toISOString(),
-		);
-	raw.close();
-
 	const database = await GatewayDatabase.open(gatewayConfig.dbPath);
 	const sessionPort = sessionPortFromScript({
-		bind: async () => ({ sessionId: "session" }),
+		bind: async (key, epoch) => ({ sessionId: `session-${key}-${epoch}` }),
 		respond: async () => "ok",
 	});
-	const { client } = await start(gatewayConfig, database, sessionPort);
+	const { client } = await start(gatewayConfig, database, sessionPort, () => {
+		const raw = new Database(gatewayConfig.dbPath);
+		raw
+			.query(
+				"INSERT INTO conversation_context (message_id, origin_key, body, received_at, consumed_at) VALUES (?, ?, ?, ?, ?)",
+			)
+			.run(
+				"quiet-old",
+				ORIGIN_KEY,
+				"old private body",
+				new Date(Date.now() - 8 * 24 * 60 * 60 * 1000).toISOString(),
+				new Date().toISOString(),
+			);
+		raw.close();
+	});
 	const inspected = new Database(gatewayConfig.dbPath, { readonly: true });
 	expect(inspected.query<{ n: number }, []>("SELECT COUNT(*) AS n FROM conversation_context").get()?.n).toBe(0);
 	inspected.close();

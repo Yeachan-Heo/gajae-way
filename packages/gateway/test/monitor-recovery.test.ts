@@ -12,6 +12,7 @@ import { MonitorRuntime } from "../src/monitors/runtime";
 import { cronSlotsBetween, startCron } from "../src/monitors/triggers/cron";
 import { GjcRuntimeError } from "../src/orchestrator/rebind";
 import { SessionTerminalError } from "../src/orchestrator/session-port";
+import { startUnixServer } from "../src/server/server";
 import { GatewayDatabase, MONITOR_EVENT_MAX_DISPATCH_ATTEMPTS } from "../src/store/db";
 import { DeliveryLedger } from "../src/store/ledger";
 import type { SessionPortResponder } from "./session-port.fake";
@@ -86,6 +87,113 @@ function backdateMonitor(db: GatewayDatabase, monitorId: string, createdAt: Date
 	db.monitorSetCreatedAt(monitorId, createdAt.toISOString());
 }
 
+test("monitor.inspect exposes quarantined accepted and failed history without recovery sends", async () => {
+	let sends = 0;
+	const {
+		database: db,
+		monitor,
+		propagator,
+		sessionPort,
+	} = await harness(async () => {
+		sends++;
+		throw new Error("quarantined history must not send");
+	});
+	// Dispatched is the durable monitor stage for an accepted authoring turn.
+	const accepted = seedEvent(db, monitor.monitorId, "dispatched", "old-accepted-batch");
+	const failed = seedEvent(db, monitor.monitorId, "failed", "old-failed-batch");
+	db.cutoverBrokerAuthority({
+		expectedAuthority: null,
+		targetAuthority: { canonicalAgentDir: "/tmp/monitor-inspection-global", identity: "shared-broker" },
+		evidence: "Test operator authorized historical monitor quarantine",
+		disposition: "quarantine",
+	});
+	const history = db.monitorEventRows(monitor.monitorId, "newest", true);
+	expect(history).toHaveLength(2);
+	expect(db.monitorEventRows()).toEqual([]);
+	expect(db.monitorEventRows(undefined, "oldest")).toEqual([]);
+	expect(db.monitorEventRows(monitor.monitorId, "oldest")).toEqual([]);
+	await propagator.reconcile();
+	expect(sends).toBe(0);
+	const socketPath = join(home, "inspect.sock");
+	const server = await startUnixServer({
+		config: {
+			schemaVersion: 1,
+			home,
+			configPath: join(home, "config.json"),
+			socketPath,
+			dbPath: join(home, "gateway.db"),
+			logVerbosity: "info",
+		},
+		database: db,
+		sessionPort,
+		onStop: () => {},
+	});
+	let socket: Awaited<ReturnType<typeof Bun.connect>> | undefined;
+	try {
+		const frames: Array<Record<string, unknown>> = [];
+		let buffered = "";
+		socket = await Bun.connect({
+			unix: socketPath,
+			socket: {
+				data(_socket, data) {
+					buffered += Buffer.from(data).toString();
+					const lines = buffered.split("\n");
+					buffered = lines.pop() ?? "";
+					for (const line of lines) if (line) frames.push(JSON.parse(line));
+				},
+			},
+		});
+		const inspect = async (id: string) => {
+			socket!.write(
+				`${JSON.stringify({ v: "0.1", type: "request", id, verb: "monitor.inspect", params: { monitorId: monitor.monitorId } })}\n`,
+			);
+			for (let attempt = 0; attempt < 400; attempt++) {
+				const frame = frames.find((entry) => entry.id === id);
+				if (frame) {
+					expect(frame.type).toBe("response");
+					return (frame.result as { recentEvents: Array<Record<string, unknown>> }).recentEvents;
+				}
+				await Bun.sleep(5);
+			}
+			throw new Error(`no monitor.inspect response for ${id}`);
+		};
+		socket.write(`${JSON.stringify({ v: "0.1", type: "hello", payload: { supportedVersions: ["0.1"] } })}\n`);
+		const rows = await inspect("history");
+		expect(rows).toHaveLength(2);
+		for (const [eventId, stage] of [
+			[accepted, "dispatched"],
+			[failed, "failed"],
+		]) {
+			expect(rows.find((row) => row.eventId === eventId)).toMatchObject({
+				stage,
+				quarantined: true,
+				reason: "broker_authority_quarantined",
+			});
+		}
+		// Terminal current-authority events exercise the existing history bound without dispatch.
+		for (let index = 0; index < 101; index++) seedEvent(db, monitor.monitorId, "authored_no_delivery");
+		const bounded = await inspect("bounded");
+		expect(bounded).toHaveLength(100);
+		expect(bounded.map((row) => row.eventId)).toEqual(
+			db
+				.monitorEventRows(monitor.monitorId, "newest", true)
+				.slice(0, 100)
+				.map((row) => row.event_id),
+		);
+		for (const row of bounded.filter((row) => row.eventId !== accepted && row.eventId !== failed)) {
+			expect(row.quarantined).toBeUndefined();
+			expect(row.reason).toBeUndefined();
+		}
+		await propagator.reconcile();
+		expect(sends).toBe(0);
+		expect(
+			db.monitorEventRows(monitor.monitorId, "newest", true).filter((row) => [accepted, failed].includes(row.event_id)),
+		).toEqual(history);
+	} finally {
+		await server.stop();
+		socket?.end();
+	}
+});
 describe("monitor crash-boundary state machine", () => {
 	test("admitted→batched→dispatched→authored via a live dispatch", async () => {
 		const {

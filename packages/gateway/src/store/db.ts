@@ -1,7 +1,7 @@
 import { Database } from "bun:sqlite";
 import { createHash } from "node:crypto";
 import { mkdir } from "node:fs/promises";
-import { dirname } from "node:path";
+import { dirname, isAbsolute, normalize } from "node:path";
 import {
 	type ChatMessagePayload,
 	isSilenceToken,
@@ -10,6 +10,81 @@ import {
 	validateOriginRef,
 } from "@gajaeway/protocol";
 import { assertValidOpRef, type LaneJobRecord, type PromptStatusBody, parseLaneJobRecord } from "@gajaeway/subsession";
+
+export interface BrokerAuthority {
+	readonly canonicalAgentDir: string;
+	readonly identity: string;
+}
+
+export interface OwnedBrokerBinding {
+	readonly sessionId: string;
+	readonly originKey: string;
+	readonly epoch: number;
+	readonly repo: string;
+	readonly authority: BrokerAuthority;
+}
+
+export type BrokerQuarantineKind = "inbound" | "work" | "monitor";
+
+export class BrokerAuthorityError extends Error {
+	constructor(
+		readonly code:
+			| "cutover_required"
+			| "authority_mismatch"
+			| "unowned_session"
+			| "old_work_open"
+			| "quarantined"
+			| "invalid_authority",
+	) {
+		super(`broker authority: ${code}`);
+		this.name = "BrokerAuthorityError";
+	}
+}
+
+function brokerAuthorityKey(authority: BrokerAuthority): string {
+	if (
+		!authority ||
+		typeof authority.identity !== "string" ||
+		!authority.identity.trim() ||
+		typeof authority.canonicalAgentDir !== "string" ||
+		!isAbsolute(authority.canonicalAgentDir) ||
+		normalize(authority.canonicalAgentDir) !== authority.canonicalAgentDir ||
+		authority.identity.includes("\0") ||
+		authority.canonicalAgentDir.includes("\0")
+	)
+		throw new BrokerAuthorityError("invalid_authority");
+	return JSON.stringify([authority.canonicalAgentDir, authority.identity]);
+}
+
+const BROKER_SNAPSHOT_TABLES = [
+	"sessions",
+	"deliveries",
+	"recall_snippets",
+	"meta",
+	"memory_intents",
+	"monitors",
+	"monitor_events",
+	"authored_outputs",
+	"inbound_messages",
+	"conversation_context",
+	"lane_jobs",
+	"monitor_failures",
+	"monitor_slots",
+	"dispatch_leases",
+	"conversation_context_state",
+	"conversation_model",
+	"session_tail_cursors",
+	"work_attempt_runtime",
+	"broker_owned_bindings",
+	"broker_tail_cursors",
+	"broker_retired_sessions",
+	"broker_quarantine",
+] as const;
+
+const REPLAYABLE_INBOUND =
+	"NOT EXISTS (SELECT 1 FROM broker_quarantine q WHERE q.kind = 'inbound' AND q.subject_id = inbound_messages.message_id)";
+const REPLAYABLE_MONITOR =
+	"NOT EXISTS (SELECT 1 FROM broker_quarantine q WHERE q.kind = 'monitor' AND q.subject_id = monitor_events.event_id)";
 
 export type WorkAttemptMode = "start" | "run" | "historical";
 export type WorkAttemptDecision = "undecided" | "enqueued" | "suppressed" | "no_target";
@@ -283,7 +358,7 @@ export class InboundTurnConflictError extends Error {
 	}
 }
 
-const LATEST_SCHEMA_VERSION = 21;
+const LATEST_SCHEMA_VERSION = 22;
 /** Maximum number of prior messages supplied to one engaged conversation turn. */
 export const CONVERSATION_DIFF_MAX_ROWS = 60;
 /** Maximum age of prior messages supplied to one engaged conversation turn. */
@@ -397,6 +472,267 @@ export class GatewayDatabase {
 	readonly #database: Database;
 	#inTransaction = false;
 
+	/** Read-only census; JSON corruption is an error, never evidence of quiescence. */
+	inspectBrokerAuthority(): {
+		authority: BrokerAuthority | null;
+		populated: boolean;
+		openInbound: number;
+		openWork: number;
+		openMonitors: number;
+	} {
+		const authority = this.#brokerAuthority();
+		let populated = false;
+		for (const table of BROKER_SNAPSHOT_TABLES) {
+			const where = table === "meta" ? " WHERE key <> 'instance_id'" : "";
+			if (this.#database.query(`SELECT 1 FROM ${table}${where} LIMIT 1`).get()) populated = true;
+		}
+		if (this.#database.query("SELECT 1 FROM broker_cutovers LIMIT 1").get()) populated = true;
+		for (const row of this.#database.query<{ epoch: number }, []>("SELECT epoch FROM sessions").all()) {
+			if (!Number.isSafeInteger(row.epoch) || row.epoch < 0 || row.epoch >= Number.MAX_SAFE_INTEGER)
+				throw new Error("invalid session epoch");
+		}
+		let openWork = 0;
+		for (const row of this.#database
+			.query<{ job_id: string; record_json: string }, []>("SELECT job_id, record_json FROM lane_jobs")
+			.all()) {
+			const job = parseLaneJobRecord(row.record_json);
+			if (job.jobId !== row.job_id) throw new WorkAttemptStateError();
+			if (
+				!this.isBrokerQuarantined("work", job.jobId) &&
+				(job.attempts.some((attempt) => attempt.endedAt === undefined) || !["done", "aborted"].includes(job.state))
+			)
+				openWork++;
+		}
+		for (const row of this.#database.query<{ op_ref: string }, []>("SELECT op_ref FROM work_attempt_runtime").all()) {
+			const runtime = this.workAttemptGet(row.op_ref)!;
+			if (runtime.settledAt === null && !this.isBrokerQuarantined("work", runtime.jobId)) openWork++;
+		}
+		const openInbound = this.#database
+			.query<{ n: number }, []>(
+				`SELECT COUNT(*) AS n FROM inbound_messages WHERE (state <> 'done' OR turn_state IN ('bound','accepted')) AND ${REPLAYABLE_INBOUND}`,
+			)
+			.get()!.n;
+		const openMonitors = this.#database
+			.query<{ n: number }, []>(
+				"SELECT COUNT(*) AS n FROM monitor_events WHERE stage NOT IN ('delivered','authored_no_delivery','failed_no_retry') AND NOT EXISTS (SELECT 1 FROM broker_quarantine q WHERE q.kind = 'monitor' AND q.subject_id = monitor_events.event_id)",
+			)
+			.get()!.n;
+		return { authority, populated, openInbound, openWork, openMonitors };
+	}
+
+	/** Established authority checks are constant-size; initialization alone requires the full census. */
+	assertBrokerAuthority(authority: BrokerAuthority, options: { initializeEmpty?: boolean } = {}): void {
+		const key = brokerAuthorityKey(authority);
+		const matchesEstablished = () => {
+			const current = this.#brokerAuthority();
+			if (current === null) return false;
+			if (brokerAuthorityKey(current) !== key) throw new BrokerAuthorityError("authority_mismatch");
+			return true;
+		};
+		if (matchesEstablished()) return;
+		if (!options.initializeEmpty) throw new BrokerAuthorityError("cutover_required");
+		const initialize = () => {
+			if (matchesEstablished()) return;
+			if (this.inspectBrokerAuthority().populated) throw new BrokerAuthorityError("cutover_required");
+			this.#database.query("INSERT INTO broker_authority(singleton, authority_key) VALUES (1, ?)").run(key);
+		};
+		if (this.#inTransaction) initialize();
+		else this.withTransaction(initialize);
+	}
+
+	#brokerAuthority(): BrokerAuthority | null {
+		const stored = this.#database
+			.query<{ authority_key: string }, []>("SELECT authority_key FROM broker_authority WHERE singleton = 1")
+			.get();
+		if (!stored) return null;
+		const value: unknown = JSON.parse(stored.authority_key);
+		if (!Array.isArray(value) || value.length !== 2) throw new BrokerAuthorityError("invalid_authority");
+		const authority = { canonicalAgentDir: value[0], identity: value[1] };
+		if (brokerAuthorityKey(authority) !== stored.authority_key) throw new BrokerAuthorityError("invalid_authority");
+		return authority;
+	}
+
+	/** Only a successful gateway session.create response may supply this provenance. */
+	recordOwnedBinding(binding: OwnedBrokerBinding): boolean {
+		return this.withTransaction(() => {
+			this.#assertActiveAuthority(binding.authority);
+			if (
+				!binding.sessionId ||
+				!binding.originKey ||
+				!isAbsolute(binding.repo) ||
+				normalize(binding.repo) !== binding.repo ||
+				!Number.isSafeInteger(binding.epoch) ||
+				binding.epoch < 0
+			)
+				throw new BrokerAuthorityError("unowned_session");
+			if (this.#database.query("SELECT 1 FROM broker_retired_sessions WHERE session_id = ?").get(binding.sessionId))
+				throw new BrokerAuthorityError("unowned_session");
+			const key = brokerAuthorityKey(binding.authority);
+			const previous = this.#database
+				.query<{ origin_key: string; epoch: number; repo: string }, [string, string]>(
+					"SELECT origin_key, epoch, repo FROM broker_owned_bindings WHERE authority_key = ? AND session_id = ?",
+				)
+				.get(key, binding.sessionId);
+			if (
+				previous &&
+				(previous.origin_key !== binding.originKey ||
+					previous.epoch !== binding.epoch ||
+					previous.repo !== binding.repo)
+			)
+				throw new BrokerAuthorityError("unowned_session");
+			const current = this.getSessionRecord(binding.originKey);
+			if (current && current.epoch !== binding.epoch) return false;
+			this.#database
+				.query(
+					"INSERT INTO broker_owned_bindings(authority_key, session_id, origin_key, epoch, repo, created_at) VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT(authority_key, session_id) DO NOTHING",
+				)
+				.run(key, binding.sessionId, binding.originKey, binding.epoch, binding.repo, new Date().toISOString());
+			this.#database
+				.query(
+					"INSERT INTO sessions(origin_key, gjc_session_id, epoch, created_at) VALUES (?, ?, ?, ?) ON CONFLICT(origin_key) DO UPDATE SET gjc_session_id = excluded.gjc_session_id",
+				)
+				.run(binding.originKey, binding.sessionId, binding.epoch, new Date().toISOString());
+			return true;
+		});
+	}
+
+	/** Historical provenance permits retired-turn recovery, but only under the active authority. */
+	assertOwnedSession(sessionId: string, repo: string, authority: BrokerAuthority): OwnedBrokerBinding {
+		this.#assertActiveAuthority(authority);
+		const row = this.#database
+			.query<{ origin_key: string; epoch: number; repo: string }, [string, string]>(
+				"SELECT origin_key, epoch, repo FROM broker_owned_bindings WHERE authority_key = ? AND session_id = ?",
+			)
+			.get(brokerAuthorityKey(authority), sessionId);
+		if (!row || row.repo !== repo) throw new BrokerAuthorityError("unowned_session");
+		return { sessionId, originKey: row.origin_key, epoch: row.epoch, repo: row.repo, authority };
+	}
+
+	#assertActiveAuthority(authority: BrokerAuthority): void {
+		const row = this.#database
+			.query<{ authority_key: string }, []>("SELECT authority_key FROM broker_authority WHERE singleton = 1")
+			.get();
+		if (!row) throw new BrokerAuthorityError("cutover_required");
+		if (row.authority_key !== brokerAuthorityKey(authority)) throw new BrokerAuthorityError("authority_mismatch");
+	}
+
+	#ownedCursorAuthority(sessionId: string): string {
+		const row = this.#database
+			.query<{ authority_key: string }, [string]>(
+				"SELECT a.authority_key FROM broker_authority a JOIN broker_owned_bindings b ON b.authority_key = a.authority_key WHERE a.singleton = 1 AND b.session_id = ?",
+			)
+			.get(sessionId);
+		if (!row) throw new BrokerAuthorityError("unowned_session");
+		return row.authority_key;
+	}
+
+	isBrokerQuarantined(kind: BrokerQuarantineKind, id: string): boolean {
+		return (
+			this.#database.query("SELECT 1 FROM broker_quarantine WHERE kind = ? AND subject_id = ?").get(kind, id) !== null
+		);
+	}
+
+	#assertNotQuarantined(kind: BrokerQuarantineKind, id: string): void {
+		if (this.isBrokerQuarantined(kind, id)) throw new BrokerAuthorityError("quarantined");
+	}
+
+	#assertReplayableTurn(opRef: string): void {
+		if (
+			this.#database
+				.query(
+					"SELECT 1 FROM inbound_messages i JOIN broker_quarantine q ON q.kind = 'inbound' AND q.subject_id = i.message_id WHERE i.turn_op_ref = ? LIMIT 1",
+				)
+				.get(opRef)
+		)
+			throw new BrokerAuthorityError("quarantined");
+	}
+
+	/** Administrative transaction only: no broker controls, replay, or historical settlement. */
+	cutoverBrokerAuthority(input: {
+		expectedAuthority: BrokerAuthority | null;
+		targetAuthority: BrokerAuthority;
+		evidence: string;
+		disposition?: "quarantine";
+	}): string {
+		return this.withTransaction(() => {
+			const target = brokerAuthorityKey(input.targetAuthority);
+			const expected = input.expectedAuthority === null ? null : brokerAuthorityKey(input.expectedAuthority);
+			const before = this.inspectBrokerAuthority();
+			if ((before.authority === null ? null : brokerAuthorityKey(before.authority)) !== expected || expected === target)
+				throw new BrokerAuthorityError("authority_mismatch");
+			if (
+				this.#database
+					.query("SELECT 1 FROM broker_cutovers WHERE old_authority = ? OR target_authority = ? LIMIT 1")
+					.get(target, target)
+			)
+				throw new BrokerAuthorityError("authority_mismatch");
+			if (typeof input.evidence !== "string" || !input.evidence.trim()) throw new Error("cutover evidence is required");
+			if (input.disposition !== undefined && input.disposition !== "quarantine")
+				throw new Error("invalid cutover disposition");
+			if ((before.openInbound || before.openWork || before.openMonitors) && input.disposition !== "quarantine")
+				throw new BrokerAuthorityError("old_work_open");
+			const snapshot = Object.fromEntries(
+				BROKER_SNAPSHOT_TABLES.map((table) => [table, this.#database.query(`SELECT * FROM ${table}`).all()]),
+			);
+			const id = crypto.randomUUID();
+			this.#database
+				.query(
+					"INSERT INTO broker_cutovers(id, old_authority, target_authority, evidence, disposition, snapshot_json, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+				)
+				.run(
+					id,
+					expected,
+					target,
+					input.evidence,
+					input.disposition ?? "quiescent",
+					JSON.stringify(snapshot),
+					new Date().toISOString(),
+				);
+			// All old identities become permanent non-replayable holds, even terminal history.
+			for (const [kind, table, column] of [
+				["inbound", "inbound_messages", "message_id"],
+				["work", "lane_jobs", "job_id"],
+				["monitor", "monitor_events", "event_id"],
+			] as const) {
+				this.#database
+					.query(
+						`INSERT INTO broker_quarantine(kind, subject_id, cutover_id) SELECT ?, ${column}, ? FROM ${table} WHERE true ON CONFLICT(kind, subject_id) DO NOTHING`,
+					)
+					.run(kind, id);
+			}
+			this.#database
+				.query(`INSERT INTO broker_retired_sessions(session_id, cutover_id)
+				SELECT session_id, ? FROM (
+					SELECT gjc_session_id AS session_id FROM sessions WHERE gjc_session_id <> ''
+					UNION SELECT bound_session_id FROM inbound_messages WHERE bound_session_id IS NOT NULL
+					UNION SELECT session_id FROM work_attempt_runtime
+					UNION SELECT session_id FROM session_tail_cursors
+					UNION SELECT session_id FROM broker_owned_bindings
+				) WHERE true ON CONFLICT(session_id) DO NOTHING`)
+				.run(id);
+			for (const row of this.#database.query<{ record_json: string }, []>("SELECT record_json FROM lane_jobs").all()) {
+				for (const sessionId of parseLaneJobRecord(row.record_json).sessions)
+					this.#database
+						.query(
+							"INSERT INTO broker_retired_sessions(session_id, cutover_id) VALUES (?, ?) ON CONFLICT(session_id) DO NOTHING",
+						)
+						.run(sessionId, id);
+			}
+			this.#database.exec("UPDATE sessions SET epoch = epoch + 1, gjc_session_id = '', turn_count = 0");
+			this.#database
+				.query(
+					"INSERT INTO broker_authority(singleton, authority_key) VALUES (1, ?) ON CONFLICT(singleton) DO UPDATE SET authority_key = excluded.authority_key",
+				)
+				.run(target);
+			return id;
+		});
+	}
+
+	brokerCutoverSnapshot(id: string): string | undefined {
+		return this.#database
+			.query<{ snapshot_json: string }, [string]>("SELECT snapshot_json FROM broker_cutovers WHERE id = ?")
+			.get(id)?.snapshot_json;
+	}
 	/** Explicit seam for operations that must participate in a caller-owned commit. */
 	requireTransaction(): void {
 		if (!this.#inTransaction) throw new Error("operation requires a database transaction");
@@ -437,7 +773,7 @@ export class GatewayDatabase {
 		workAssert(Number.isSafeInteger(limit) && limit >= 1 && limit <= 1000);
 		return this.#database
 			.query<{ op_ref: string }, [string, number]>(
-				"SELECT op_ref FROM work_attempt_runtime WHERE settled_at IS NULL AND op_ref > ? ORDER BY op_ref LIMIT ?",
+				"SELECT op_ref FROM work_attempt_runtime WHERE settled_at IS NULL AND op_ref > ? AND NOT EXISTS (SELECT 1 FROM broker_quarantine q WHERE q.kind = 'work' AND q.subject_id = work_attempt_runtime.job_id) ORDER BY op_ref LIMIT ?",
 			)
 			.all(afterOpRef, limit)
 			.map((row) => this.workAttemptGet(row.op_ref)!);
@@ -446,7 +782,7 @@ export class GatewayDatabase {
 	workAttemptOpenByLane(laneKey: string): WorkAttemptRuntime | undefined {
 		const row = this.#database
 			.query<{ op_ref: string }, [string]>(
-				"SELECT op_ref FROM work_attempt_runtime WHERE lane_key = ? AND settled_at IS NULL",
+				"SELECT op_ref FROM work_attempt_runtime WHERE lane_key = ? AND settled_at IS NULL AND NOT EXISTS (SELECT 1 FROM broker_quarantine q WHERE q.kind = 'work' AND q.subject_id = work_attempt_runtime.job_id)",
 			)
 			.get(laneKey);
 		return row ? this.workAttemptGet(row.op_ref) : undefined;
@@ -455,6 +791,7 @@ export class GatewayDatabase {
 	/** Atomically append history, freeze notification intent and refresh activity before send. */
 	workAttemptPrepare(runtime: WorkAttemptRuntime, record: LaneJobRecord): void {
 		this.withTransaction(() => {
+			this.#assertNotQuarantined("work", runtime.jobId);
 			validateWorkRuntime(runtime, this.instanceId);
 			workAssert(runtime.version === 0 && runtime.decision === "undecided" && runtime.terminal === null);
 			workAssert(runtime.output.reads === 0 && runtime.output.disposition === "pending");
@@ -507,6 +844,7 @@ export class GatewayDatabase {
 		return this.withTransaction(() => {
 			const current = this.workAttemptGet(opRef);
 			if (!current || current.version !== expectedVersion || current.settledAt !== null) return undefined;
+			this.#assertNotQuarantined("work", current.jobId);
 			const next = this.#workPatched(current, patch);
 			workAssert(next.decision === "undecided" && next.settledAt === null);
 			if (!this.#workCas(current, next)) return undefined;
@@ -529,6 +867,7 @@ export class GatewayDatabase {
 		return this.withTransaction(() => {
 			const current = this.workAttemptGet(opRef);
 			if (!current || current.version !== expectedVersion || current.settledAt !== null) return undefined;
+			this.#assertNotQuarantined("work", current.jobId);
 			const next = this.#workPatched(current, patch);
 			workAssert(next.decision !== "undecided" && next.settledAt !== null);
 			this.#workValidateHistory(next, record);
@@ -648,11 +987,16 @@ export class GatewayDatabase {
 	static async open(path: string): Promise<GatewayDatabase> {
 		await mkdir(dirname(path), { recursive: true, mode: 0o700 });
 		const database = new Database(path);
-		database.exec("PRAGMA journal_mode = WAL; PRAGMA busy_timeout = 5000; PRAGMA synchronous = NORMAL;");
-		const instance = new GatewayDatabase(database);
-		instance.migrate();
-		instance.integrityCheck();
-		return instance;
+		try {
+			database.exec("PRAGMA journal_mode = WAL; PRAGMA busy_timeout = 5000; PRAGMA synchronous = NORMAL;");
+			const instance = new GatewayDatabase(database);
+			instance.migrate();
+			instance.integrityCheck();
+			return instance;
+		} catch (error) {
+			database.close();
+			throw error;
+		}
 	}
 
 	get schemaVersion(): number {
@@ -901,7 +1245,9 @@ export class GatewayDatabase {
 	/** Cycle projection source: pending inbound count per origin key. */
 	inboundPendingByOrigin(): Array<{ origin_key: string; n: number }> {
 		return this.#database
-			.query("SELECT origin_key, COUNT(*) AS n FROM inbound_messages WHERE state = 'pending' GROUP BY origin_key")
+			.query(
+				`SELECT origin_key, COUNT(*) AS n FROM inbound_messages WHERE state = 'pending' AND ${REPLAYABLE_INBOUND} GROUP BY origin_key`,
+			)
 			.all() as Array<{ origin_key: string; n: number }>;
 	}
 
@@ -1028,7 +1374,7 @@ export class GatewayDatabase {
 		return (
 			this.#database
 				.query<InboundMessageRow, [string]>(
-					`SELECT ${this.inboundColumns()} FROM inbound_messages WHERE origin_key = ? AND state = 'pending' AND turn_state IS NULL ORDER BY received_at, rowid LIMIT 1`,
+					`SELECT ${this.inboundColumns()} FROM inbound_messages WHERE origin_key = ? AND state = 'pending' AND turn_state IS NULL AND ${REPLAYABLE_INBOUND} ORDER BY received_at, rowid LIMIT 1`,
 				)
 				.get(originKey) ?? undefined
 		);
@@ -1052,6 +1398,8 @@ export class GatewayDatabase {
 			throw new Error("turn epoch must be a non-negative integer");
 		if (!input.sessionId) throw new Error("turn session id must not be empty");
 		return this.withTransaction(() => {
+			this.#assertNotQuarantined("inbound", input.messageId);
+			this.#assertReplayableTurn(input.opRef);
 			const existing = this.#database
 				.query<{ n: number }, [string, number]>(
 					"SELECT COUNT(*) AS n FROM inbound_messages WHERE origin_key = ? AND turn_epoch = ? AND turn_role = 'trigger' AND turn_state IN ('bound', 'accepted')",
@@ -1169,6 +1517,7 @@ export class GatewayDatabase {
 		return this.withTransaction(() => {
 			const trigger = this.inboundTurnRow(opRef);
 			if (!trigger || trigger.turn_epoch === null) throw new Error(`turn ${opRef} has no retryable trigger`);
+			this.#assertNotQuarantined("inbound", trigger.message_id);
 			if (trigger.state !== "pending" || !["bound", "accepted"].includes(trigger.turn_state ?? ""))
 				throw new Error(`turn ${opRef} cannot be requeued from its current lifecycle state`);
 			const key = freshTurnMetaKey(trigger.origin_key, trigger.turn_epoch, trigger.message_id);
@@ -1197,6 +1546,8 @@ export class GatewayDatabase {
 	 * dispatch path can take it as a trigger, and a restart finds it here.
 	 */
 	inboundSteerIssued(input: { messageId: string; epoch: number; opRef: string }): boolean {
+		this.#assertNotQuarantined("inbound", input.messageId);
+		this.#assertReplayableTurn(input.opRef);
 		return (
 			this.#database
 				.query(
@@ -1244,7 +1595,7 @@ export class GatewayDatabase {
 	inboundSteersHeldAfterTerminal(originKey: string): readonly InboundMessageRow[] {
 		return this.#database
 			.query<InboundMessageRow, [string]>(
-				`SELECT ${this.inboundColumns()} FROM inbound_messages WHERE origin_key = ? AND turn_role = 'steer' AND state = 'pending' AND turn_state = 'bound' AND turn_op_ref IN (SELECT turn_op_ref FROM inbound_messages WHERE turn_role = 'trigger' AND turn_state = 'done') ORDER BY received_at, rowid`,
+				`SELECT ${this.inboundColumns()} FROM inbound_messages WHERE origin_key = ? AND turn_role = 'steer' AND state = 'pending' AND turn_state = 'bound' AND ${REPLAYABLE_INBOUND} AND turn_op_ref IN (SELECT turn_op_ref FROM inbound_messages WHERE turn_role = 'trigger' AND turn_state = 'done') ORDER BY received_at, rowid`,
 			)
 			.all(originKey);
 	}
@@ -1253,12 +1604,12 @@ export class GatewayDatabase {
 	inboundSteersHeld(opRef: string): readonly InboundMessageRow[] {
 		return this.#database
 			.query<InboundMessageRow, [string]>(
-				`SELECT ${this.inboundColumns()} FROM inbound_messages WHERE turn_op_ref = ? AND turn_role = 'steer' AND state = 'pending' AND turn_state = 'bound' ORDER BY received_at, rowid`,
+				`SELECT ${this.inboundColumns()} FROM inbound_messages WHERE turn_op_ref = ? AND turn_role = 'steer' AND state = 'pending' AND turn_state = 'bound' AND ${REPLAYABLE_INBOUND} ORDER BY received_at, rowid`,
 			)
 			.all(opRef);
 	}
 
-	/** The trigger row of a turn. */
+	/** Historical inspection, including quarantined triggers; not an execution authorization. */
 	inboundTurnRow(opRef: string): InboundMessageRow | undefined {
 		return (
 			this.#database
@@ -1269,7 +1620,7 @@ export class GatewayDatabase {
 		);
 	}
 
-	/** Every row attributed to a turn: its trigger and the steers it absorbed. */
+	/** Historical inspection, including quarantined steers; not an execution authorization. */
 	inboundTurnRows(opRef: string): readonly InboundMessageRow[] {
 		return this.#database
 			.query<InboundMessageRow, [string]>(
@@ -1294,12 +1645,12 @@ export class GatewayDatabase {
 			epoch === undefined
 				? this.#database
 						.query<Row, [string]>(
-							`${select} WHERE origin_key = ? AND turn_role = 'trigger' AND turn_state IN ('bound', 'accepted') ORDER BY turn_epoch, received_at, message_id`,
+							`${select} WHERE origin_key = ? AND turn_role = 'trigger' AND turn_state IN ('bound', 'accepted') AND ${REPLAYABLE_INBOUND} ORDER BY turn_epoch, received_at, message_id`,
 						)
 						.all(originKey)
 				: this.#database
 						.query<Row, [string, number]>(
-							`${select} WHERE origin_key = ? AND turn_epoch = ? AND turn_role = 'trigger' AND turn_state IN ('bound', 'accepted') ORDER BY received_at, message_id`,
+							`${select} WHERE origin_key = ? AND turn_epoch = ? AND turn_role = 'trigger' AND turn_state IN ('bound', 'accepted') AND ${REPLAYABLE_INBOUND} ORDER BY received_at, message_id`,
 						)
 						.all(originKey, epoch);
 		return rows.map((row) => ({
@@ -1316,7 +1667,7 @@ export class GatewayDatabase {
 	inboundPendingOrigins(): readonly string[] {
 		return this.#database
 			.query<{ origin_key: string }, []>(
-				"SELECT DISTINCT origin_key FROM inbound_messages WHERE state = 'pending' AND turn_state IS NULL",
+				`SELECT DISTINCT origin_key FROM inbound_messages WHERE state = 'pending' AND turn_state IS NULL AND ${REPLAYABLE_INBOUND}`,
 			)
 			.all()
 			.map((row) => row.origin_key);
@@ -1326,7 +1677,7 @@ export class GatewayDatabase {
 	inboundNonterminalOrigins(): readonly string[] {
 		return this.#database
 			.query<{ origin_key: string }, []>(
-				"SELECT DISTINCT origin_key FROM inbound_messages WHERE turn_role = 'trigger' AND turn_state IN ('bound', 'accepted') ORDER BY origin_key",
+				`SELECT DISTINCT origin_key FROM inbound_messages WHERE turn_role = 'trigger' AND turn_state IN ('bound', 'accepted') AND ${REPLAYABLE_INBOUND} ORDER BY origin_key`,
 			)
 			.all()
 			.map((row) => row.origin_key);
@@ -1336,7 +1687,7 @@ export class GatewayDatabase {
 		return (
 			this.#database
 				.query<{ n: number }, []>(
-					"SELECT COUNT(*) AS n FROM inbound_messages WHERE turn_role = 'trigger' AND turn_state IN ('bound', 'accepted')",
+					`SELECT COUNT(*) AS n FROM inbound_messages WHERE turn_role = 'trigger' AND turn_state IN ('bound', 'accepted') AND ${REPLAYABLE_INBOUND}`,
 				)
 				.get()?.n ?? 0
 		);
@@ -1351,13 +1702,13 @@ export class GatewayDatabase {
 		const discard = () => {
 			const ids = this.#database
 				.query<{ message_id: string }, [string, string]>(
-					"SELECT message_id FROM inbound_messages WHERE origin_key = ? AND state = 'pending' AND turn_state IS NULL AND received_at <= ?",
+					`SELECT message_id FROM inbound_messages WHERE origin_key = ? AND state = 'pending' AND turn_state IS NULL AND received_at <= ? AND ${REPLAYABLE_INBOUND}`,
 				)
 				.all(originKey, floorAt)
 				.map((row) => row.message_id);
 			this.#database
 				.query(
-					"UPDATE inbound_messages SET state = 'done' WHERE origin_key = ? AND state = 'pending' AND turn_state IS NULL AND received_at <= ?",
+					`UPDATE inbound_messages SET state = 'done' WHERE origin_key = ? AND state = 'pending' AND turn_state IS NULL AND received_at <= ? AND ${REPLAYABLE_INBOUND}`,
 				)
 				.run(originKey, floorAt);
 			return ids;
@@ -1813,7 +2164,7 @@ export class GatewayDatabase {
 		return (
 			this.#database
 				.query<{ n: number }, [string]>(
-					"SELECT COUNT(*) AS n FROM inbound_messages WHERE origin_key = ? AND state = 'pending'",
+					`SELECT COUNT(*) AS n FROM inbound_messages WHERE origin_key = ? AND state = 'pending' AND ${REPLAYABLE_INBOUND}`,
 				)
 				.get(originKey)?.n ?? 0
 		);
@@ -1825,16 +2176,20 @@ export class GatewayDatabase {
 			.get(originKey)?.gjc_session_id;
 	}
 
-	/**
-	 * Every gjc session id this database still points at: the current binding of
-	 * each origin, and the session of any inbound turn that has not terminated.
-	 * Anything the broker indexes outside this set is a leftover of a rotated
-	 * epoch and owes nothing to this gateway.
-	 */
+	/** Currently referenced sessions, restricted to gateway ownership under the active authority. */
 	referencedSessionIds(): ReadonlySet<string> {
 		const rows = this.#database
 			.query<{ id: string }, []>(
-				"SELECT gjc_session_id AS id FROM sessions WHERE gjc_session_id <> '' UNION SELECT bound_session_id AS id FROM inbound_messages WHERE bound_session_id IS NOT NULL AND state = 'pending' UNION SELECT session_id AS id FROM work_attempt_runtime WHERE settled_at IS NULL",
+				`SELECT b.session_id AS id FROM broker_owned_bindings b
+				JOIN broker_authority a ON a.authority_key = b.authority_key
+				WHERE a.singleton = 1 AND b.session_id IN (
+					SELECT gjc_session_id FROM sessions WHERE gjc_session_id <> ''
+					UNION SELECT bound_session_id FROM inbound_messages
+					WHERE bound_session_id IS NOT NULL AND state = 'pending'
+					AND message_id NOT IN (SELECT subject_id FROM broker_quarantine WHERE kind = 'inbound')
+					UNION SELECT session_id FROM work_attempt_runtime WHERE settled_at IS NULL
+					AND job_id NOT IN (SELECT subject_id FROM broker_quarantine WHERE kind = 'work')
+				)`,
 			)
 			.all();
 		return new Set(rows.map((row) => row.id));
@@ -1850,6 +2205,7 @@ export class GatewayDatabase {
 	}
 
 	putSession(originKey: string, sessionId: string): void {
+		if (this.#database.query("SELECT 1 FROM broker_authority").get()) throw new BrokerAuthorityError("unowned_session");
 		this.#database
 			.query(
 				"INSERT INTO sessions (origin_key, gjc_session_id, created_at) VALUES (?, ?, ?) ON CONFLICT(origin_key) DO UPDATE SET gjc_session_id = excluded.gjc_session_id",
@@ -1862,6 +2218,7 @@ export class GatewayDatabase {
 	 * binding must never overwrite a newer durable epoch with an old session id.
 	 */
 	putSessionAtEpoch(originKey: string, sessionId: string, epoch: number): boolean {
+		if (this.#database.query("SELECT 1 FROM broker_authority").get()) throw new BrokerAuthorityError("unowned_session");
 		if (!Number.isSafeInteger(epoch) || epoch < 0) throw new Error("session epoch must be a non-negative integer");
 		return (
 			this.#database
@@ -1874,23 +2231,38 @@ export class GatewayDatabase {
 
 	/** Opaque runtime-issued tail checkpoint for a bound SDK session. */
 	tailCursorGet(sessionId: string): string | undefined {
+		const authority = this.#ownedCursorAuthority(sessionId);
 		return this.#database
-			.query<{ cursor: string }, [string]>("SELECT cursor FROM session_tail_cursors WHERE session_id = ?")
-			.get(sessionId)?.cursor;
+			.query<{ cursor: string }, [string, string]>(
+				"SELECT cursor FROM broker_tail_cursors WHERE authority_key = ? AND session_id = ?",
+			)
+			.get(authority, sessionId)?.cursor;
 	}
 
 	/** Commits a cursor only after the caller has applied all preceding tail effects. */
 	tailCursorCommit(sessionId: string, cursor: string): void {
 		if (cursor.length === 0) throw new Error("tail cursor must not be empty");
-		this.#database
-			.query(
-				"INSERT INTO session_tail_cursors (session_id, cursor, updated_at) VALUES (?, ?, ?) ON CONFLICT(session_id) DO UPDATE SET cursor = excluded.cursor, updated_at = excluded.updated_at",
-			)
-			.run(sessionId, cursor, new Date().toISOString());
+		const commit = () => {
+			const authority = this.#ownedCursorAuthority(sessionId);
+			this.#database
+				.query(
+					"INSERT INTO broker_tail_cursors(authority_key, session_id, cursor, updated_at) VALUES (?, ?, ?, ?) ON CONFLICT(authority_key, session_id) DO UPDATE SET cursor = excluded.cursor, updated_at = excluded.updated_at",
+				)
+				.run(authority, sessionId, cursor, new Date().toISOString());
+		};
+		if (this.#inTransaction) commit();
+		else this.withTransaction(commit);
 	}
 
 	tailCursorClear(sessionId: string): void {
-		this.#database.query("DELETE FROM session_tail_cursors WHERE session_id = ?").run(sessionId);
+		const clear = () => {
+			const authority = this.#ownedCursorAuthority(sessionId);
+			this.#database
+				.query("DELETE FROM broker_tail_cursors WHERE authority_key = ? AND session_id = ?")
+				.run(authority, sessionId);
+		};
+		if (this.#inTransaction) clear();
+		else this.withTransaction(clear);
 	}
 
 	deliveryCreate(row: { id: string; turnId: string; originKey: string; payloadJson: string }): boolean {
@@ -2028,6 +2400,7 @@ export class GatewayDatabase {
 	 *   expired and was stolen can never release the newer owner's claim.
 	 */
 	monitorEventAcquireLease(eventId: string, owner: string, leaseId: string, ttlMs: number, now = Date.now()): boolean {
+		this.#assertNotQuarantined("monitor", eventId);
 		const nowIso = new Date(now).toISOString();
 		const expiresIso = new Date(now + ttlMs).toISOString();
 		const claim = this.#database
@@ -2063,6 +2436,7 @@ WHERE excluded.acquired_at IS NOT NULL AND (SELECT expires_at FROM dispatch_leas
 	}
 	/** Extends a live lease only when the caller still owns it (stale attempts are no-ops). */
 	monitorEventRenewLease(eventId: string, leaseId: string, ttlMs: number, now = Date.now()): boolean {
+		this.#assertNotQuarantined("monitor", eventId);
 		const row = this.#database
 			.query<{ lease_id: string }, [string, string, string]>(
 				"SELECT lease_id FROM dispatch_leases WHERE event_id = ? AND lease_id = ? AND expires_at > ?",
@@ -2148,6 +2522,7 @@ SELECT 1 FROM dispatch_leases l WHERE l.event_id = monitor_events.event_id AND l
 	): boolean {
 		return this.withTransaction(() => {
 			for (const eventId of eventIds) {
+				this.#assertNotQuarantined("monitor", eventId);
 				const lease = this.#database
 					.query<{ lease_id: string; expires_at: string }, [string]>(
 						"SELECT lease_id, expires_at FROM dispatch_leases WHERE event_id = ?",
@@ -2339,6 +2714,8 @@ SELECT 1 FROM dispatch_leases l WHERE l.event_id = monitor_events.event_id AND l
 		for (const event of events) this.monitorEventSettle(event.event_id, stage);
 	}
 	monitorEventSettle(eventId: string, stage: "delivered" | "authored"): boolean {
+		// Delivery acknowledgements still commit; old monitor history is not rewritten.
+		if (this.isBrokerQuarantined("monitor", eventId)) return false;
 		const row = this.#database
 			.query<{ stage: string }, [string]>("SELECT stage FROM monitor_events WHERE event_id = ?")
 			.get(eventId);
@@ -2394,6 +2771,7 @@ SELECT 1 FROM dispatch_leases l WHERE l.event_id = monitor_events.event_id AND l
 	monitorEventRows(
 		monitorId?: string,
 		order: "newest" | "oldest" = "newest",
+		includeQuarantined = false,
 	): Array<{
 		event_id: string;
 		monitor_id: string;
@@ -2409,8 +2787,8 @@ SELECT 1 FROM dispatch_leases l WHERE l.event_id = monitor_events.event_id AND l
 		return this.#database
 			.query(
 				monitorId
-					? `SELECT * FROM monitor_events WHERE monitor_id = ? ORDER BY fired_at ${direction}, rowid ${direction}`
-					: `SELECT * FROM monitor_events ORDER BY fired_at ${direction}, rowid ${direction}`,
+					? `SELECT * FROM monitor_events WHERE monitor_id = ? AND ${includeQuarantined ? "1=1" : REPLAYABLE_MONITOR} ORDER BY fired_at ${direction}, rowid ${direction}`
+					: `SELECT * FROM monitor_events WHERE ${includeQuarantined ? "1=1" : REPLAYABLE_MONITOR} ORDER BY fired_at ${direction}, rowid ${direction}`,
 			)
 			.all(...(monitorId ? [monitorId] : [])) as Array<{
 			event_id: string;
@@ -2425,6 +2803,7 @@ SELECT 1 FROM dispatch_leases l WHERE l.event_id = monitor_events.event_id AND l
 		}>;
 	}
 	authoredOutputCreate(eventId: string, outputText: string): void {
+		this.#assertNotQuarantined("monitor", eventId);
 		this.#database
 			.query(
 				"INSERT INTO authored_outputs (event_id, output_text, authored_at) VALUES (?, ?, ?) ON CONFLICT(event_id) DO UPDATE SET output_text = excluded.output_text, authored_at = excluded.authored_at",
@@ -2928,6 +3307,53 @@ ALTER TABLE monitor_slots ADD COLUMN event_id TEXT;`,
 					.run(21, new Date().toISOString());
 			});
 		}
+		if (current < 22) {
+			this.withTransaction(() => {
+				this.#database.exec(`CREATE TABLE broker_authority (
+					singleton INTEGER PRIMARY KEY CHECK(singleton = 1), authority_key TEXT NOT NULL);
+					CREATE TABLE broker_owned_bindings (
+						authority_key TEXT NOT NULL, session_id TEXT NOT NULL, origin_key TEXT NOT NULL,
+						epoch INTEGER NOT NULL CHECK(epoch >= 0), repo TEXT NOT NULL, created_at TEXT NOT NULL,
+						PRIMARY KEY(authority_key, session_id), UNIQUE(authority_key, origin_key, epoch));
+					CREATE TABLE broker_tail_cursors (
+						authority_key TEXT NOT NULL, session_id TEXT NOT NULL, cursor TEXT NOT NULL, updated_at TEXT NOT NULL,
+						PRIMARY KEY(authority_key, session_id));
+					CREATE TABLE broker_cutovers (
+						id TEXT PRIMARY KEY, old_authority TEXT, target_authority TEXT NOT NULL UNIQUE,
+						evidence TEXT NOT NULL, disposition TEXT NOT NULL CHECK(disposition IN ('quiescent','quarantine')),
+						snapshot_json TEXT NOT NULL, created_at TEXT NOT NULL);
+					CREATE TABLE broker_quarantine (
+						kind TEXT NOT NULL CHECK(kind IN ('inbound','work','monitor')), subject_id TEXT NOT NULL,
+						cutover_id TEXT NOT NULL, PRIMARY KEY(kind, subject_id));
+					CREATE TABLE broker_retired_sessions (session_id TEXT PRIMARY KEY, cutover_id TEXT NOT NULL);`);
+				for (const table of [
+					"broker_owned_bindings",
+					"broker_cutovers",
+					"broker_quarantine",
+					"broker_retired_sessions",
+				]) {
+					for (const action of ["UPDATE", "DELETE"])
+						this.#database.exec(
+							`CREATE TRIGGER ${table}_immutable_${action.toLowerCase()} BEFORE ${action} ON ${table} BEGIN SELECT RAISE(ABORT, 'immutable broker provenance'); END`,
+						);
+				}
+				for (const [kind, table, column] of [
+					["inbound", "inbound_messages", "message_id"],
+					["work", "lane_jobs", "job_id"],
+					["work", "work_attempt_runtime", "job_id"],
+					["monitor", "monitor_events", "event_id"],
+					["monitor", "authored_outputs", "event_id"],
+				] as const) {
+					for (const action of ["UPDATE", "DELETE"])
+						this.#database.exec(`CREATE TRIGGER ${table}_quarantine_${action.toLowerCase()} BEFORE ${action} ON ${table}
+						WHEN EXISTS (SELECT 1 FROM broker_quarantine WHERE kind = '${kind}' AND subject_id = OLD.${column})
+						BEGIN SELECT RAISE(ABORT, 'broker authority: quarantined'); END`);
+				}
+				this.#database
+					.query("INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)")
+					.run(22, new Date().toISOString());
+			});
+		}
 	}
 
 	// --- Issue #20: per-conversation model override -------------------------
@@ -2993,6 +3419,7 @@ ALTER TABLE monitor_slots ADD COLUMN event_id TEXT;`,
 		readonly lane: { readonly branch: string; readonly worktreePath: string };
 		readonly json: string;
 	}): void {
+		this.#assertNotQuarantined("work", job.jobId);
 		this.#database
 			.query(
 				"INSERT INTO lane_jobs (job_id, lane_key, branch, worktree_path, state, record_json, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(job_id) DO UPDATE SET lane_key = excluded.lane_key, branch = excluded.branch, worktree_path = excluded.worktree_path, state = excluded.state, record_json = excluded.record_json, updated_at = excluded.updated_at",
@@ -3021,7 +3448,7 @@ ALTER TABLE monitor_slots ADD COLUMN event_id TEXT;`,
 			.get(laneKey)?.record_json;
 	}
 
-	laneJobRows(): Array<{
+	laneJobRows(includeQuarantined = false): Array<{
 		job_id: string;
 		lane_key: string;
 		state: string;
@@ -3031,7 +3458,7 @@ ALTER TABLE monitor_slots ADD COLUMN event_id TEXT;`,
 	}> {
 		return this.#database
 			.query(
-				"SELECT job_id, lane_key, state, branch, worktree_path, updated_at FROM lane_jobs ORDER BY updated_at DESC",
+				`SELECT job_id, lane_key, state, branch, worktree_path, updated_at FROM lane_jobs WHERE ${includeQuarantined ? "1=1" : "NOT EXISTS (SELECT 1 FROM broker_quarantine q WHERE q.kind = 'work' AND q.subject_id = lane_jobs.job_id)"} ORDER BY updated_at DESC`,
 			)
 			.all() as Array<{
 			job_id: string;

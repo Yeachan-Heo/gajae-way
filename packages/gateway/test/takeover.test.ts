@@ -6,8 +6,10 @@ import type { CliRunner } from "@gajaeway/subsession";
 import { bootGateway } from "../src/boot";
 import { MIN_GJC_VERSION } from "../src/orchestrator/broker";
 import {
+	acquireGatewayHome,
 	claimGatewayHome,
 	GatewayAlreadyRunningError,
+	HOME_LOCK_FILE,
 	pidFilePath,
 	readPidRecord,
 	releaseGatewayHome,
@@ -97,28 +99,20 @@ test("--only-new refuses immediately when a live same-home gateway exists, witho
 	expect(await readPidRecord(home)).toMatchObject({ pid: 4244 });
 });
 
-test("stale records are replaced: dead pid, a live pid that is not a gateway, or a gateway for another home", async () => {
+test("only dead PID records are replaced; malformed and unrelated live ownership fail closed", async () => {
 	const home = await temporaryHome("gajaeway-takeover-stale-");
-	const otherHome = await temporaryHome("gajaeway-takeover-other-");
-	const table = new Map([
-		[1, { alive: false, command: "" }],
-		[2, { alive: true, command: "/usr/bin/vim daemon.pid" }],
-		[3, { alive: true, command: "/x/gajaeway-gateway daemon" }],
-	]);
-	const { ports, logs } = fakePorts(table);
-	for (const [pid, recordHome] of [
-		[1, home],
-		[2, home],
-		[3, otherHome],
-	] as const) {
-		await seedRecord(home, pid, recordHome);
-		expect(await claimGatewayHome(home, { onlyNew: true }, ports)).toBeUndefined();
-		expect(await readPidRecord(home)).toMatchObject({ pid: process.pid, home });
-	}
-	expect(logs.filter((line) => line.startsWith("gateway_pid_stale"))).toHaveLength(3);
-	// A malformed record is stale too.
-	await writeFile(pidFilePath(home), "{not json");
+	const { ports } = fakePorts(
+		new Map([
+			[1, { alive: false, command: "" }],
+			[2, { alive: true, command: "/usr/bin/vim daemon.pid" }],
+		]),
+	);
+	await seedRecord(home, 1);
 	expect(await claimGatewayHome(home, { onlyNew: true }, ports)).toBeUndefined();
+	await seedRecord(home, 2);
+	await expect(claimGatewayHome(home, { onlyNew: true }, ports)).rejects.toBeInstanceOf(GatewayAlreadyRunningError);
+	await writeFile(pidFilePath(home), "{not json");
+	await expect(claimGatewayHome(home, { onlyNew: true }, ports)).rejects.toThrow("gateway_pid_indeterminate");
 });
 
 test("release removes only this process's own record; a successor's record survives", async () => {
@@ -138,6 +132,15 @@ test("boot settles home ownership before the socket or database exist, and relea
 		args[0] === "--version"
 			? { exitCode: 0, stdout: `gjc/${MIN_GJC_VERSION}\n`, stderr: "" }
 			: { exitCode: 0, stdout: JSON.stringify({ ok: true, result: { sessions: [] } }), stderr: "" };
+	const broker = {
+		executable: "/test-only/gjc",
+		agentDir: home,
+		command,
+		healthProbe: async () => true,
+		discovery: async () => ({ pid: 1, url: "ws://127.0.0.1:1", token: "test-only", heartbeatAt: Date.now() }),
+		healthIntervalMs: 60_000,
+		log: () => {},
+	};
 	const table = new Map([[5151, { alive: true, command: "/x/gajaeway-gateway daemon" }]]);
 	const { ports } = fakePorts(table);
 	await seedRecord(home, 5151);
@@ -147,7 +150,7 @@ test("boot settles home ownership before the socket or database exist, and relea
 			home,
 			onlyNew: true,
 			takeover: ports,
-			broker: { ssotAgentDir: null, command, healthProbe: async () => true, log: () => {} },
+			broker,
 		}),
 	).rejects.toBeInstanceOf(GatewayAlreadyRunningError);
 	await expect(lstat(join(home, "gateway.sock"))).rejects.toMatchObject({ code: "ENOENT" });
@@ -159,7 +162,7 @@ test("boot settles home ownership before the socket or database exist, and relea
 	const server = await bootGateway({
 		home,
 		takeover: ports,
-		broker: { ssotAgentDir: null, command, healthProbe: async () => true, healthIntervalMs: 60_000, log: () => {} },
+		broker,
 	});
 	try {
 		expect(await readPidRecord(home)).toMatchObject({ pid: process.pid, home });
@@ -168,4 +171,84 @@ test("boot settles home ownership before the socket or database exist, and relea
 		await server.stop("test shutdown");
 	}
 	await expect(lstat(pidFilePath(home))).rejects.toMatchObject({ code: "ENOENT" });
+});
+
+test("exclusive leases refuse both boot and admin contenders and release only their own descriptor", async () => {
+	const home = await temporaryHome("gajaeway-exclusive-");
+	const first = await acquireGatewayHome(home);
+	try {
+		await expect(acquireGatewayHome(home)).rejects.toThrow("gateway_home_owned");
+		await expect(bootGateway({ home })).rejects.toThrow("gateway_home_owned");
+		await expect(lstat(join(home, "gateway.db"))).rejects.toMatchObject({ code: "ENOENT" });
+	} finally {
+		await first.release();
+	}
+	const second = await acquireGatewayHome(home);
+	try {
+		expect(second.token).not.toBe(first.token);
+		await first.release();
+		await expect(acquireGatewayHome(home)).rejects.toThrow("gateway_home_owned");
+	} finally {
+		await second.release();
+	}
+});
+
+test("malformed, incomplete and live owner metadata are never stolen", async () => {
+	const home = await temporaryHome("gajaeway-exclusive-malformed-");
+	for (const raw of [
+		"",
+		"{bad",
+		JSON.stringify({ pid: process.pid }),
+		JSON.stringify({
+			pid: process.pid,
+			token: "other-owner",
+			startedAt: new Date().toISOString(),
+			state: "held",
+		}),
+	]) {
+		await writeFile(join(home, HOME_LOCK_FILE), raw);
+		await expect(acquireGatewayHome(home)).rejects.toThrow(
+			raw.includes("other-owner") ? "gateway_home_owner_live" : "gateway_home_owner_indeterminate",
+		);
+		expect(await readFile(join(home, HOME_LOCK_FILE), "utf8")).toBe(raw);
+	}
+});
+
+test("kernel releases a crashed holder without unlinking the lock inode; stale recovery has one winner", async () => {
+	const home = await temporaryHome("gajaeway-exclusive-crash-");
+	const modulePath = new URL("../src/takeover.ts", import.meta.url).pathname;
+	const child = Bun.spawn(
+		[
+			process.execPath,
+			"--eval",
+			`
+		import { acquireGatewayHome } from ${JSON.stringify(modulePath)};
+		const lease = await acquireGatewayHome(${JSON.stringify(home)});
+		console.log("held");
+		await Bun.stdin.text();
+		process.exit(lease.token ? 23 : 24);
+	`,
+		],
+		{ stdin: "pipe", stdout: "pipe", stderr: "pipe" },
+	);
+	let inode: number | undefined;
+	try {
+		const reader = child.stdout.getReader();
+		const ready = await reader.read();
+		reader.releaseLock();
+		expect(new TextDecoder().decode(ready.value)).toContain("held");
+		inode = (await lstat(join(home, HOME_LOCK_FILE))).ino;
+		await expect(acquireGatewayHome(home)).rejects.toThrow("gateway_home_owned");
+	} finally {
+		child.stdin.end();
+		await child.exited;
+	}
+	expect(child.exitCode).toBe(23);
+	const recovered = await acquireGatewayHome(home);
+	try {
+		expect((await lstat(join(home, HOME_LOCK_FILE))).ino).toBe(inode);
+		await expect(acquireGatewayHome(home)).rejects.toThrow("gateway_home_owned");
+	} finally {
+		await recovered.release();
+	}
 });

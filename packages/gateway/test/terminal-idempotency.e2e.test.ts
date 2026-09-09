@@ -8,7 +8,7 @@ import { PersonaSessionManager } from "../src/orchestrator/persona-session";
 import { deterministicTerminalDeliveryId } from "../src/orchestrator/tail-runner";
 import { type GatewayServer, startUnixServer } from "../src/server/server";
 import { GatewayDatabase } from "../src/store/db";
-import { ScriptedSessionPort } from "./session-port.fake";
+import { attachTestBrokerOwnership, ScriptedSessionPort } from "./session-port.fake";
 
 /**
  * The live double-reply (2026-09-02 DM 1468535438498336923): a turn's tail was
@@ -59,6 +59,7 @@ async function startGateway(port: ScriptedSessionPort) {
 		channels: { "chan-1": { engagement: "open" } },
 	};
 	database = await GatewayDatabase.open(config.dbPath);
+	attachTestBrokerOwnership(database, port, join(directory, "agent"));
 	const runtime = await startUnixServer({ config, database, sessionPort: port, onStop: () => database?.close() });
 	server = runtime;
 	const client = await connect(config.socketPath);
@@ -97,9 +98,10 @@ async function eventually(predicate: () => boolean, message: string, attempts = 
 test("a batch whose tail was fenced and then reconciled from status invokes onTerminal for one batch at most once", async () => {
 	// Drives PersonaSessionManager directly: the server wires onTerminal to the
 	// ledger, and the ledger id is the trigger, so one onTerminal == one post.
-	const port = new ScriptedSessionPort();
+	const port = new ScriptedSessionPort({ onBind: (input) => `session-${input.originKey}-${input.epoch}` });
 	directory = await mkdtemp(join(tmpdir(), "gajaeway-terminal-fence-"));
 	database = await GatewayDatabase.open(join(directory, "gateway.db"));
+	attachTestBrokerOwnership(database, port, join(directory, "agent"));
 	const terminals: Array<{ trigger: string; text: string }> = [];
 	const logs: string[] = [];
 	const manager = new PersonaSessionManager({
@@ -151,7 +153,7 @@ test("a batch whose tail was fenced and then reconciled from status invokes onTe
 });
 
 test("red-team B2: the answer ships on the tail, the gateway restarts, status reconcile re-delivers it -> one ledger row", async () => {
-	const port = new ScriptedSessionPort();
+	const port = new ScriptedSessionPort({ onBind: (input) => `session-${input.originKey}-${input.epoch}` });
 	const { client } = await startGateway(port);
 	sendChannelMessage(client, "r1", "재시작 전에 답해");
 	await eventually(() => port.sends.length === 1, "turn was not sent");
@@ -172,6 +174,7 @@ test("red-team B2: the answer ships on the tail, the gateway restarts, status re
 	// A fresh gateway on the same database recovers the accepted batch with no
 	// lifecycle memory and reconciles it from status + transcript.
 	database = await GatewayDatabase.open(dbPath);
+	attachTestBrokerOwnership(database, port, join(directory, "agent"));
 	const config: GatewayConfig = {
 		schemaVersion: 1,
 		home: directory,
@@ -192,7 +195,7 @@ test("red-team B2: the answer ships on the tail, the gateway restarts, status re
 }, 20_000);
 
 test("red-team I2/I5: [BREAK] parts own per-part terminal slots; a regenerated DIFFERENT answer for the same trigger posts nothing", async () => {
-	const port = new ScriptedSessionPort();
+	const port = new ScriptedSessionPort({ onBind: (input) => `session-${input.originKey}-${input.epoch}` });
 	const { client } = await startGateway(port);
 	sendChannelMessage(client, "b1", "세 조각으로");
 	await eventually(() => port.sends.length === 1, "turn was not sent");
@@ -220,7 +223,7 @@ test("red-team I2/I5: [BREAK] parts own per-part terminal slots; a regenerated D
 });
 
 test("red-team G2-B3: a message that arrived mid-turn and dispatched later never inherits the previous answer", async () => {
-	const port = new ScriptedSessionPort();
+	const port = new ScriptedSessionPort({ onBind: (input) => `session-${input.originKey}-${input.epoch}` });
 	port.omitStartedAt = true;
 	port.fetchLastAssistant = async ({ sessionId }) => {
 		const last = [...port.transcript(sessionId)].reverse().find((text) => text.length > 0);
@@ -229,6 +232,7 @@ test("red-team G2-B3: a message that arrived mid-turn and dispatched later never
 	};
 	directory = await mkdtemp(join(tmpdir(), "gajaeway-terminal-backlog-"));
 	database = await GatewayDatabase.open(join(directory, "gateway.db"));
+	attachTestBrokerOwnership(database, port, join(directory, "agent"));
 	const terminals: Array<{ trigger: string; text: string }> = [];
 	const manager = new PersonaSessionManager({
 		database,
@@ -283,7 +287,7 @@ test("red-team G2-B3: a message that arrived mid-turn and dispatched later never
 });
 
 test("red-team I4: two different id-less interim texts get distinct ids; the same interim text replayed collides", async () => {
-	const port = new ScriptedSessionPort();
+	const port = new ScriptedSessionPort({ onBind: (input) => `session-${input.originKey}-${input.epoch}` });
 	directory = await mkdtemp(join(tmpdir(), "gajaeway-terminal-interim-"));
 	const config: GatewayConfig = {
 		schemaVersion: 1,
@@ -295,6 +299,7 @@ test("red-team I4: two different id-less interim texts get distinct ids; the sam
 		channels: { "chan-1": { engagement: "open" } },
 	};
 	database = await GatewayDatabase.open(config.dbPath);
+	attachTestBrokerOwnership(database, port, join(directory, "agent"));
 	server = await startUnixServer({
 		config,
 		database,
@@ -323,7 +328,7 @@ test("red-team I4: two different id-less interim texts get distinct ids; the sam
 });
 
 test("a tail-less reconcile never reposts a previous turn's answer as the current turn's reply", async () => {
-	const port = new ScriptedSessionPort();
+	const port = new ScriptedSessionPort({ onBind: (input) => `session-${input.originKey}-${input.epoch}` });
 	// A runtime that reports no startedAt used to fall back to an unbounded
 	// last-assistant read, which is how the previous turn's text got reposted.
 	port.omitStartedAt = true;
@@ -336,6 +341,7 @@ test("a tail-less reconcile never reposts a previous turn's answer as the curren
 	};
 	directory = await mkdtemp(join(tmpdir(), "gajaeway-terminal-repost-"));
 	database = await GatewayDatabase.open(join(directory, "gateway.db"));
+	attachTestBrokerOwnership(database, port, join(directory, "agent"));
 	const terminals: Array<{ trigger: string; text: string }> = [];
 	const manager = new PersonaSessionManager({
 		database,
@@ -388,7 +394,7 @@ test("a tail-less reconcile never reposts a previous turn's answer as the curren
 });
 
 test("red-team G3-B1: a same-session fresh-turn retry gets its own dispatch floor and cannot inherit the failed attempt's row", async () => {
-	const port = new ScriptedSessionPort();
+	const port = new ScriptedSessionPort({ onBind: (input) => `session-${input.originKey}-${input.epoch}` });
 	port.omitStartedAt = true;
 	port.fetchLastAssistant = async ({ sessionId }) => {
 		const last = [...port.transcript(sessionId)].reverse().find((text) => text.length > 0);
@@ -397,6 +403,7 @@ test("red-team G3-B1: a same-session fresh-turn retry gets its own dispatch floo
 	};
 	directory = await mkdtemp(join(tmpdir(), "gajaeway-terminal-requeue-"));
 	database = await GatewayDatabase.open(join(directory, "gateway.db"));
+	attachTestBrokerOwnership(database, port, join(directory, "agent"));
 	const terminals: Array<{ trigger: string; text: string }> = [];
 	const logs: string[] = [];
 	const make = () =>
@@ -471,10 +478,11 @@ test("red-team G3-B1: a same-session fresh-turn retry gets its own dispatch floo
 });
 
 test("red-team G3-B2: a batch bound before the upgrade, on a runtime without startedAt, is held - never completed empty, never given a prior answer", async () => {
-	const port = new ScriptedSessionPort();
+	const port = new ScriptedSessionPort({ onBind: (input) => `session-${input.originKey}-${input.epoch}` });
 	port.omitStartedAt = true;
 	directory = await mkdtemp(join(tmpdir(), "gajaeway-terminal-legacy-"));
 	database = await GatewayDatabase.open(join(directory, "gateway.db"));
+	attachTestBrokerOwnership(database, port, join(directory, "agent"));
 	const terminals: string[] = [];
 	const logs: string[] = [];
 	const manager = new PersonaSessionManager({
@@ -557,9 +565,10 @@ test("red-team G3-B2: a batch bound before the upgrade, on a runtime without sta
  * the current trigger.
  */
 test("a cursorless resync replaying the previous turn's transcript row never becomes the current turn's reply", async () => {
-	const port = new ScriptedSessionPort();
+	const port = new ScriptedSessionPort({ onBind: (input) => `session-${input.originKey}-${input.epoch}` });
 	directory = await mkdtemp(join(tmpdir(), "gajaeway-terminal-offbyone-"));
 	database = await GatewayDatabase.open(join(directory, "gateway.db"));
+	attachTestBrokerOwnership(database, port, join(directory, "agent"));
 	const terminals: Array<{ trigger: string; text: string }> = [];
 	const logs: string[] = [];
 	const manager = new PersonaSessionManager({
@@ -624,9 +633,10 @@ test("a cursorless resync replaying the previous turn's transcript row never bec
 });
 
 test("a frame attributed to the accepted op passes the turn floor even with an old host timestamp", async () => {
-	const port = new ScriptedSessionPort();
+	const port = new ScriptedSessionPort({ onBind: (input) => `session-${input.originKey}-${input.epoch}` });
 	directory = await mkdtemp(join(tmpdir(), "gajaeway-terminal-attributed-"));
 	database = await GatewayDatabase.open(join(directory, "gateway.db"));
+	attachTestBrokerOwnership(database, port, join(directory, "agent"));
 	const terminals: Array<{ trigger: string; text: string }> = [];
 	const logs: string[] = [];
 	const manager = new PersonaSessionManager({

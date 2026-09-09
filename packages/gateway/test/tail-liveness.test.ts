@@ -8,7 +8,7 @@ import { PersonaSessionManager } from "../src/orchestrator/persona-session";
 import { TailRunner } from "../src/orchestrator/tail-runner";
 import { startUnixServer } from "../src/server/server";
 import { GatewayDatabase } from "../src/store/db";
-import { ScriptedSessionPort } from "./session-port.fake";
+import { attachTestBrokerOwnership, ScriptedSessionPort } from "./session-port.fake";
 
 const ORIGIN = { platform: "loopback", kind: "loopback", conversationId: "tail-liveness" } as const;
 const ORIGIN_KEY = "loopback/loopback/tail-liveness";
@@ -25,6 +25,7 @@ test("persona state stays running until a terminal tail event is injected", asyn
 	const home = await mkdtemp(join(tmpdir(), "gajaeway-tail-state-"));
 	const database = await GatewayDatabase.open(join(home, "gateway.db"));
 	const port = new ScriptedSessionPort();
+	attachTestBrokerOwnership(database, port, join(home, "agent"));
 	const manager = new PersonaSessionManager({
 		database,
 		port,
@@ -134,6 +135,7 @@ test("chat.progress is emitted only from observed tail activity and preserves ta
 	};
 	const database = await GatewayDatabase.open(config.dbPath);
 	const port = new ScriptedSessionPort();
+	attachTestBrokerOwnership(database, port, join(home, "agent"));
 	const server = await startUnixServer({
 		config,
 		database,

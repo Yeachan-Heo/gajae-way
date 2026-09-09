@@ -7,7 +7,7 @@ import { applyModelCommand, parseModelArgument } from "../src/server/model-comma
 import { type GatewayServer, startUnixServer } from "../src/server/server";
 import type { GjcModelSelection } from "../src/store/db";
 import { GatewayDatabase } from "../src/store/db";
-import { ScriptedSessionPort } from "./session-port.fake";
+import { attachTestBrokerOwnership, ScriptedSessionPort } from "./session-port.fake";
 
 function store(initial?: GjcModelSelection) {
 	let current = initial;
@@ -157,6 +157,7 @@ test("/model live-rebind keeps the session transcript and applies the new model 
 	};
 	const database = await GatewayDatabase.open(config.dbPath);
 	const port = new ScriptedSessionPort();
+	attachTestBrokerOwnership(database, port, join(home, "agent"));
 	let server: GatewayServer | undefined;
 	let client: { send(value: unknown): void; close(): void } | undefined;
 	const logs: string[] = [];

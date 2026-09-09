@@ -9,7 +9,7 @@ import { PersonaSessionManager, type PersonaSessionManagerOptions } from "../src
 import type { SessionSendInput, SessionSteerInput } from "../src/orchestrator/session-port";
 import { type GatewayServer, messageEditId, renderMessageEdit, startUnixServer } from "../src/server/server";
 import { GatewayDatabase } from "../src/store/db";
-import { ScriptedSessionPort, steerRefused } from "./session-port.fake";
+import { attachTestBrokerOwnership, ScriptedSessionPort, steerRefused } from "./session-port.fake";
 
 const ORIGIN = { platform: "loopback", kind: "loopback", conversationId: "generation-5" } as const;
 const ORIGIN_KEY = "loopback/loopback/generation-5";
@@ -89,7 +89,9 @@ async function directFixture(options: DirectFixtureOptions = {}): Promise<Direct
 	const home = await mkdtemp(join(tmpdir(), "gajaeway-generation5-"));
 	const database = await GatewayDatabase.open(join(home, "gateway.db"));
 	const clock = options.clock ?? new FixtureClock();
-	const port = options.port ?? new ScriptedSessionPort();
+	const port =
+		options.port ?? new ScriptedSessionPort({ onBind: (input) => `${input.originKey}-session-${input.epoch}` });
+	attachTestBrokerOwnership(database, port, join(home, "canonical-agent"));
 	const logs: string[] = [];
 	const discarded: string[] = [];
 	const manager = new PersonaSessionManager({
@@ -167,7 +169,7 @@ class AcceptedLivenessPort extends ScriptedSessionPort {
 	live: boolean | undefined = undefined;
 
 	constructor() {
-		super({ onBind: (input) => `accepted-liveness-${input.epoch}` });
+		super({ onBind: (input) => `${input.originKey}-accepted-liveness-${input.epoch}` });
 	}
 
 	async status(input: Parameters<ScriptedSessionPort["status"]>[0]) {
@@ -187,7 +189,7 @@ class BoundLivenessPort extends ScriptedSessionPort {
 	#failFirstSend = true;
 
 	constructor() {
-		super({ onBind: (input) => `bound-liveness-${input.epoch}` });
+		super({ onBind: (input) => `${input.originKey}-bound-liveness-${input.epoch}` });
 	}
 
 	async send(input: SessionSendInput) {
@@ -216,7 +218,7 @@ class SendUnavailablePort extends ScriptedSessionPort {
 	remainingFailures = 0;
 
 	constructor() {
-		super({ onBind: (input) => `send-unavailable-${input.epoch}` });
+		super({ onBind: (input) => `${input.originKey}-send-unavailable-${input.epoch}` });
 	}
 
 	async send(input: SessionSendInput) {
@@ -230,7 +232,7 @@ class SendUnavailablePort extends ScriptedSessionPort {
 }
 
 test("G1: a held steer blocks later pending steers until its clientRef resolves", async () => {
-	const port = new TornReplayPort();
+	const port = new TornReplayPort({ onBind: (input) => `${input.originKey}-session-${input.epoch}` });
 	const fixture = await directFixture({ port });
 	try {
 		enqueue(fixture, "trigger", "first request");
@@ -274,7 +276,7 @@ test("G1: a held steer blocks later pending steers until its clientRef resolves"
 });
 
 test("G2: /new retains a held steer on its retired turn instead of discarding or re-dispatching it", async () => {
-	const port = new TornReplayPort();
+	const port = new TornReplayPort({ onBind: (input) => `${input.originKey}-session-${input.epoch}` });
 	const fixture = await directFixture({ port });
 	try {
 		enqueue(fixture, "trigger", "old request");
@@ -317,7 +319,7 @@ test("G2: /new retains a held steer on its retired turn instead of discarding or
 });
 
 test("G3: a terminal-time definitive steer refusal releases the original body for exactly one next turn", async () => {
-	const port = new TornThenRefusedPort();
+	const port = new TornThenRefusedPort({ onBind: (input) => `${input.originKey}-session-${input.epoch}` });
 	const fixture = await directFixture({ port });
 	try {
 		enqueue(fixture, "trigger", "old request");
@@ -346,7 +348,7 @@ test("G3: a terminal-time definitive steer refusal releases the original body fo
 });
 
 test("G4: finalizing a terminal-time held-steer acceptance is exactly once", async () => {
-	const port = new TornReplayPort();
+	const port = new TornReplayPort({ onBind: (input) => `${input.originKey}-session-${input.epoch}` });
 	const observed: string[] = [];
 	const fixture = await directFixture({
 		port,
@@ -486,6 +488,20 @@ test("G7: migration 19 requeues a settled-bound trigger and ride-along member to
 	try {
 		(await GatewayDatabase.open(path)).close();
 		const raw = new Database(path);
+		// Remove v22 completely before replaying historical DDL; missing objects are fixture errors.
+		for (const table of ["inbound_messages", "lane_jobs", "work_attempt_runtime", "monitor_events", "authored_outputs"])
+			for (const action of ["update", "delete"]) raw.exec(`DROP TRIGGER ${table}_quarantine_${action}`);
+		for (const table of ["broker_owned_bindings", "broker_cutovers", "broker_quarantine", "broker_retired_sessions"])
+			for (const action of ["update", "delete"]) raw.exec(`DROP TRIGGER ${table}_immutable_${action}`);
+		for (const table of [
+			"broker_authority",
+			"broker_owned_bindings",
+			"broker_tail_cursors",
+			"broker_cutovers",
+			"broker_quarantine",
+			"broker_retired_sessions",
+		])
+			raw.exec(`DROP TABLE ${table}`);
 		raw.exec(`
 DROP TABLE work_attempt_runtime;
 DROP TABLE inbound_messages;
@@ -508,7 +524,7 @@ INSERT INTO inbound_messages (message_id, origin_key, origin_ref_json, body, eng
 		raw.close();
 
 		upgraded = await GatewayDatabase.open(path);
-		expect(upgraded.schemaVersion).toBe(21);
+		expect(upgraded.schemaVersion).toBe(22);
 		expect(upgraded.inboundTurnRows("gw-p-ride").map((row) => [row.message_id, row.turn_role, row.turn_state])).toEqual(
 			[
 				["ride-trigger", "trigger", "bound"],
@@ -624,6 +640,7 @@ async function serverFixture(port: TornReplayPort): Promise<ServerFixture> {
 		dmPolicy: "open",
 	};
 	const database = await GatewayDatabase.open(config.dbPath);
+	attachTestBrokerOwnership(database, port, join(home, "canonical-agent"));
 	const server = await startUnixServer({ config, database, sessionPort: port, onStop: () => database.close() });
 	const client = await connect(config.socketPath);
 	client.send({ v: "0.1", type: "hello", payload: { supportedVersions: ["0.1"] } });
@@ -663,7 +680,7 @@ function chatEdit(client: SocketClient, id: string, messageId: string, text: str
 }
 
 test("G8: a server-side edit of a held steer remains a pointer row and cannot duplicate the old turn", async () => {
-	const port = new TornReplayPort();
+	const port = new TornReplayPort({ onBind: (input) => `${input.originKey}-session-${input.epoch}` });
 	const fixture = await serverFixture(port);
 	try {
 		chatSend(fixture.client, "trigger", "m-1", "original request");

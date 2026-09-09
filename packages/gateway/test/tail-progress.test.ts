@@ -5,7 +5,7 @@ import { join } from "node:path";
 import type { GatewayConfig } from "../src/config";
 import { startUnixServer } from "../src/server/server";
 import { GatewayDatabase } from "../src/store/db";
-import { ScriptedSessionPort } from "./session-port.fake";
+import { attachTestBrokerOwnership, ScriptedSessionPort } from "./session-port.fake";
 
 async function eventually(predicate: () => boolean, message: string): Promise<void> {
 	for (let attempt = 0; attempt < 100; attempt++) {
@@ -28,6 +28,7 @@ test("chat.progress is silent until a tail observation supplies its counters", a
 	};
 	const database = await GatewayDatabase.open(config.dbPath);
 	const port = new ScriptedSessionPort();
+	attachTestBrokerOwnership(database, port, join(home, "agent"));
 	const server = await startUnixServer({
 		config,
 		database,
@@ -99,6 +100,7 @@ test("a started server drives the persona tail stall heartbeat and stops it on s
 	};
 	const database = await GatewayDatabase.open(config.dbPath);
 	const port = new ScriptedSessionPort();
+	attachTestBrokerOwnership(database, port, join(home, "agent"));
 	const server = await startUnixServer({
 		config,
 		database,
@@ -132,6 +134,7 @@ test("red-team G1: chat.progress runs on tail frames only; a turn never issues t
 	};
 	const database = await GatewayDatabase.open(config.dbPath);
 	const port = new ScriptedSessionPort();
+	attachTestBrokerOwnership(database, port, join(home, "agent"));
 	// SessionPort no longer has a progress() member at all; a compile-time
 	// guarantee the query path is gone, not merely unused.
 	const hasProgress = "progress" in port;
@@ -201,6 +204,7 @@ test("a turn that never announced progress still emits exactly one final chat.pr
 	};
 	const database = await GatewayDatabase.open(config.dbPath);
 	const port = new ScriptedSessionPort();
+	attachTestBrokerOwnership(database, port, join(home, "agent"));
 	const server = await startUnixServer({
 		config,
 		database,
@@ -264,7 +268,8 @@ test("a turn retired by /new emits its final chat.progress and stops heartbeatin
 		dmPolicy: "open",
 	};
 	const database = await GatewayDatabase.open(config.dbPath);
-	const port = new ScriptedSessionPort();
+	const port = new ScriptedSessionPort({ onBind: ({ epoch }) => `session-${epoch}` });
+	attachTestBrokerOwnership(database, port, join(home, "agent"));
 	const server = await startUnixServer({
 		config,
 		database,

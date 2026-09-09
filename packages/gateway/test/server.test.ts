@@ -7,13 +7,20 @@ import type { GatewayConfig } from "../src/config";
 import { memoryRoot } from "../src/memory/doctrine";
 import { type GatewayServer, startUnixServer } from "../src/server/server";
 import { GatewayDatabase } from "../src/store/db";
-import { ScriptedSessionPort, sessionPortFromResponder, sessionPortFromScript } from "./session-port.fake";
+import {
+	attachTestBrokerOwnership,
+	ScriptedSessionPort,
+	sessionPortFromResponder,
+	sessionPortFromScript,
+} from "./session-port.fake";
 
 let directory = "";
 let server: GatewayServer | undefined;
+const workSessionIds = new Map<string, string>();
 afterEach(async () => {
 	await server?.stop();
 	server = undefined;
+	workSessionIds.clear();
 	if (directory) await rm(directory, { recursive: true, force: true });
 	directory = "";
 });
@@ -50,9 +57,13 @@ async function waitFor(frames: any[], count: number): Promise<void> {
 	expect(frames.length).toBeGreaterThanOrEqual(count);
 }
 
-function bindWorkFixture(database: GatewayDatabase, key: string, preferred?: string): string {
-	const sessionId = database.getSessionRecord(key)?.sessionId || preferred || crypto.randomUUID();
-	database.putSession(key, sessionId);
+function bindWorkFixture(key: string, epoch: number, preferred?: string): string {
+	const cacheKey = `${key}#${epoch}`;
+	let sessionId = workSessionIds.get(cacheKey);
+	if (!sessionId) {
+		sessionId = preferred && epoch === 0 ? preferred : crypto.randomUUID();
+		workSessionIds.set(cacheKey, sessionId);
+	}
 	return sessionId;
 }
 
@@ -74,7 +85,11 @@ test("requires negotiation then serves status, shutdown, and validates chat para
 		dmPolicy: "open" as const,
 	};
 	const database = await GatewayDatabase.open(config.dbPath);
-	const sessionPort = sessionPortFromResponder({ respond: async () => "mock reply" });
+	const sessionPort = sessionPortFromResponder({
+		bind: (key, epoch) => bindWorkFixture(key, epoch),
+		respond: async () => "mock reply",
+	});
+	attachTestBrokerOwnership(database, sessionPort, join(directory, "agent"));
 	server = await startUnixServer({
 		config,
 		database,
@@ -91,7 +106,7 @@ test("requires negotiation then serves status, shutdown, and validates chat para
 	expect(client.frames[1].type).toBe("negotiated");
 	client.send({ v: "0.1", type: "request", id: "status", verb: "gateway.status" });
 	await waitFor(client.frames, 3);
-	expect(client.frames[2].result.schemaVersion).toBe(21);
+	expect(client.frames[2].result.schemaVersion).toBe(22);
 	expect(client.frames[2].result.startedAt).toBe("2026-01-01T00:00:00.000Z");
 	expect(client.frames[2].result.contextDiff).toEqual({
 		unread: 0,
@@ -147,7 +162,8 @@ test("unauthorized direct messages cannot invoke /new or /model", async () => {
 		ownerTarget: { origin: { platform: "discord", kind: "dm", conversationId: "owner", peerId: "owner" } },
 	};
 	const database = await GatewayDatabase.open(config.dbPath);
-	const sessionPort = new ScriptedSessionPort();
+	const sessionPort = new ScriptedSessionPort({ onBind: (input) => bindWorkFixture(input.originKey, input.epoch) });
+	attachTestBrokerOwnership(database, sessionPort, join(directory, "agent"));
 	server = await startUnixServer({ config, database, sessionPort, onStop: () => database.close() });
 	const client = await connect(config.socketPath);
 	const origin = { platform: "discord", kind: "dm", conversationId: "private", peerId: "intruder" };
@@ -190,8 +206,10 @@ test("a failed platform turn still delivers a visible ledgered failure notice", 
 	};
 	const database = await GatewayDatabase.open(config.dbPath);
 	const sessionPort = new ScriptedSessionPort({
+		onBind: (input) => bindWorkFixture(input.originKey, input.epoch),
 		onSend: (input, scripted) => scripted.fail(input.opRef, "session operation stalled without terminal evidence"),
 	});
+	attachTestBrokerOwnership(database, sessionPort, join(directory, "agent"));
 	server = await startUnixServer({ config, database, sessionPort, onStop: () => database.close() });
 	const client = await connect(config.socketPath);
 	client.send({ v: "0.1", type: "hello", payload: { supportedVersions: ["0.1"] } });
@@ -230,6 +248,7 @@ test("long turns broadcast throttled chat.progress liveness events", async () =>
 	};
 	const database = await GatewayDatabase.open(config.dbPath);
 	const sessionPort = sessionPortFromResponder({
+		bind: (key, epoch) => bindWorkFixture(key, epoch),
 		respond: async (_session, _text, _preamble, onProgress) => {
 			for (let call = 1; call <= 3; call++) {
 				await Bun.sleep(5);
@@ -238,6 +257,7 @@ test("long turns broadcast throttled chat.progress liveness events", async () =>
 			return "done";
 		},
 	});
+	attachTestBrokerOwnership(database, sessionPort, join(directory, "agent"));
 	server = await startUnixServer({
 		config,
 		database,
@@ -298,12 +318,14 @@ test("large memory.audit and concurrent progress remain independently parseable 
 		);
 	const database = await GatewayDatabase.open(config.dbPath);
 	const sessionPort = sessionPortFromResponder({
+		bind: (key, epoch) => bindWorkFixture(key, epoch),
 		respond: async (_session, _text, _preamble, onProgress) => {
 			onProgress?.({ toolCalls: 1, outputTokens: 100 });
 			await Bun.sleep(5);
 			return "done";
 		},
 	});
+	attachTestBrokerOwnership(database, sessionPort, join(directory, "agent"));
 	server = await startUnixServer({
 		config,
 		database,
@@ -368,12 +390,14 @@ test("shutdown quiesces an in-flight turn before final stopping frame", async ()
 	const turnRelease = new Promise<void>((resolve) => (release = resolve));
 	const database = await GatewayDatabase.open(config.dbPath);
 	const sessionPort = sessionPortFromResponder({
+		bind: (key, epoch) => bindWorkFixture(key, epoch),
 		respond: async () => {
 			entered();
 			await turnRelease;
 			return "late reply";
 		},
 	});
+	attachTestBrokerOwnership(database, sessionPort, join(directory, "agent"));
 	server = await startUnixServer({ config, database, sessionPort, onStop: () => database.close() });
 	const client = await connect(config.socketPath);
 	client.send({ v: "0.1", type: "hello", payload: { supportedVersions: ["0.1"] } });
@@ -427,11 +451,13 @@ test("unengaged messages before a mention arrive as the unread diff with speaker
 	const database = await GatewayDatabase.open(config.dbPath);
 	const turns: Array<{ text: string; preamble: string }> = [];
 	const sessionPort = sessionPortFromResponder({
+		bind: (key, epoch) => bindWorkFixture(key, epoch),
 		respond: async (_session, text, preamble) => {
 			turns.push({ text, preamble: preamble ?? "" });
 			return "batched reply";
 		},
 	});
+	attachTestBrokerOwnership(database, sessionPort, join(directory, "agent"));
 	server = await startUnixServer({ config, database, sessionPort, onStop: () => database.close() });
 	const client = await connect(config.socketPath);
 	client.send({ v: "0.1", type: "hello", payload: { supportedVersions: ["0.1"] } });
@@ -490,12 +516,14 @@ test("a DM burst is never coalesced: the first fragment is the turn and the rest
 	// sessionPortFromScript completes the op off the send path, so the turn is
 	// genuinely running (send acknowledged, no terminal) while later fragments arrive.
 	const sessionPort = sessionPortFromScript({
+		bind: (key, epoch) => bindWorkFixture(key, epoch),
 		respond: async (_session, text) => {
 			turns.push(text);
 			await running;
 			return "ok";
 		},
 	});
+	attachTestBrokerOwnership(database, sessionPort, join(directory, "agent"));
 	server = await startUnixServer({ config, database, sessionPort, onStop: () => database.close() });
 	const client = await connect(config.socketPath);
 	client.send({ v: "0.1", type: "hello", payload: { supportedVersions: ["0.1"] } });
@@ -550,12 +578,14 @@ test("an open-channel burst from several authors: the first is the turn, later o
 		release = resolve;
 	});
 	const sessionPort = sessionPortFromScript({
+		bind: (key, epoch) => bindWorkFixture(key, epoch),
 		respond: async (_session, text) => {
 			turns.push(text);
 			await running;
 			return "ok";
 		},
 	});
+	attachTestBrokerOwnership(database, sessionPort, join(directory, "agent"));
 	server = await startUnixServer({ config, database, sessionPort, onStop: () => database.close() });
 	const client = await connect(config.socketPath);
 	client.send({ v: "0.1", type: "hello", payload: { supportedVersions: ["0.1"] } });
@@ -612,6 +642,15 @@ test("a backlog left pending across an outage is answered on boot, never expired
 		dmPolicy: "open" as const,
 	};
 	const database = await GatewayDatabase.open(config.dbPath);
+	const turns: string[] = [];
+	const sessionPort = sessionPortFromResponder({
+		bind: (key, epoch) => bindWorkFixture(key, epoch),
+		respond: async (_session, text) => {
+			turns.push(text);
+			return "ok";
+		},
+	});
+	attachTestBrokerOwnership(database, sessionPort, join(directory, "agent"));
 	const origin = { platform: "discord", kind: "dm", conversationId: "d-stale", peerId: "owner" };
 	const key = "discord/dm/d-stale/peer=owner";
 	const old = new Date(Date.now() - 30 * 60_000).toISOString();
@@ -627,13 +666,6 @@ test("a backlog left pending across an outage is answered on boot, never expired
 			receivedAt: old,
 		}),
 	).toBe(true);
-	const turns: string[] = [];
-	const sessionPort = sessionPortFromResponder({
-		respond: async (_session, text) => {
-			turns.push(text);
-			return "ok";
-		},
-	});
 	const logs: string[] = [];
 	const original = console.error;
 	console.error = (...args: unknown[]) => logs.push(args.map(String).join(" "));
@@ -679,9 +711,13 @@ test("/restart is owner-only and triggers an ordered gateway stop after acknowle
 		ownerTarget: { origin: { platform: "discord", kind: "dm", conversationId: "d-owner", peerId: "owner" } },
 	};
 	const database = await GatewayDatabase.open(config.dbPath);
-	const sessionPort = sessionPortFromResponder({ respond: async () => "unused" });
+	const sessionPort = sessionPortFromResponder({
+		bind: (key, epoch) => bindWorkFixture(key, epoch),
+		respond: async () => "unused",
+	});
 	const stops: string[] = [];
 	const exits: number[] = [];
+	attachTestBrokerOwnership(database, sessionPort, join(directory, "agent"));
 	server = await startUnixServer({
 		config,
 		database,
@@ -741,11 +777,13 @@ test("group turns name the [SILENT] mechanism but never rule on whether the pers
 	const database = await GatewayDatabase.open(config.dbPath);
 	const preambles: string[] = [];
 	const sessionPort = sessionPortFromResponder({
+		bind: (key, epoch) => bindWorkFixture(key, epoch),
 		respond: async (_session, _text, preamble) => {
 			preambles.push(preamble ?? "");
 			return "[SILENT]";
 		},
 	});
+	attachTestBrokerOwnership(database, sessionPort, join(directory, "agent"));
 	server = await startUnixServer({ config, database, sessionPort, onStop: () => database.close() });
 	const client = await connect(config.socketPath);
 	client.send({ v: "0.1", type: "hello", payload: { supportedVersions: ["0.1"] } });
@@ -789,8 +827,10 @@ test("[REPLY:id] parts thread to the referenced message and strip the directive"
 	};
 	const database = await GatewayDatabase.open(config.dbPath);
 	const sessionPort = sessionPortFromResponder({
+		bind: (key, epoch) => bindWorkFixture(key, epoch),
 		respond: async () => "[REPLY:msg-42] threaded answer\n[BREAK]\nplain follow-up",
 	});
+	attachTestBrokerOwnership(database, sessionPort, join(directory, "agent"));
 	server = await startUnixServer({ config, database, sessionPort, onStop: () => database.close() });
 	const client = await connect(config.socketPath);
 	client.send({ v: "0.1", type: "hello", payload: { supportedVersions: ["0.1"] } });
@@ -833,9 +873,10 @@ test("work.run runs a named worker session in the requested cwd and returns the 
 	};
 	const database = await GatewayDatabase.open(config.dbPath);
 	const sessionPort = new ScriptedSessionPort({
-		onBind: (input) => bindWorkFixture(database, input.originKey),
+		onBind: (input) => bindWorkFixture(input.originKey, input.epoch),
 		onSend: (input, scripted) => scripted.complete(input.opRef, "worker result"),
 	});
+	attachTestBrokerOwnership(database, sessionPort, join(directory, "agent"));
 	server = await startUnixServer({ config, database, sessionPort, onStop: () => database.close() });
 	const client = await connect(config.socketPath);
 	client.send({ v: "0.1", type: "hello", payload: { supportedVersions: ["0.1"] } });
@@ -877,9 +918,10 @@ test("work.run records a durable lane job and work.jobs projects it (issue #10)"
 	};
 	const database = await GatewayDatabase.open(config.dbPath);
 	const sessionPort = sessionPortFromResponder({
-		bind: async (key) => ({ sessionId: bindWorkFixture(database, key, "0f1e2d3c-4b5a-4678-8796-a5b4c3d2e1f0") }),
+		bind: async (key, epoch) => ({ sessionId: bindWorkFixture(key, epoch, "0f1e2d3c-4b5a-4678-8796-a5b4c3d2e1f0") }),
 		respond: async () => "worker result",
 	});
+	attachTestBrokerOwnership(database, sessionPort, join(directory, "agent"));
 	server = await startUnixServer({ config, database, sessionPort, onStop: () => database.close() });
 	const client = await connect(config.socketPath);
 	client.send({ v: "0.1", type: "hello", payload: { supportedVersions: ["0.1"] } });
@@ -966,12 +1008,13 @@ test("a stalled durable job holds the next work.run until resume (production pat
 	const database = await GatewayDatabase.open(config.dbPath);
 	let turns = 0;
 	const sessionPort = sessionPortFromResponder({
-		bind: async (key) => ({ sessionId: bindWorkFixture(database, key, "0f1e2d3c-4b5a-4678-8796-a5b4c3d2e1f0") }),
+		bind: async (key, epoch) => ({ sessionId: bindWorkFixture(key, epoch, "0f1e2d3c-4b5a-4678-8796-a5b4c3d2e1f0") }),
 		respond: async () => {
 			turns += 1;
 			return "worker result";
 		},
 	});
+	attachTestBrokerOwnership(database, sessionPort, join(directory, "agent"));
 	server = await startUnixServer({ config, database, sessionPort, onStop: () => database.close() });
 	const client = await connect(config.socketPath);
 	client.send({ v: "0.1", type: "hello", payload: { supportedVersions: ["0.1"] } });
@@ -1032,12 +1075,13 @@ test("resuming a stalled job clears the hold durably: the next ordinary call is 
 	const database = await GatewayDatabase.open(config.dbPath);
 	let turns = 0;
 	const sessionPort = sessionPortFromResponder({
-		bind: async (key) => ({ sessionId: bindWorkFixture(database, key, "0f1e2d3c-4b5a-4678-8796-a5b4c3d2e1f0") }),
+		bind: async (key, epoch) => ({ sessionId: bindWorkFixture(key, epoch, "0f1e2d3c-4b5a-4678-8796-a5b4c3d2e1f0") }),
 		respond: async () => {
 			turns += 1;
 			return "worker result";
 		},
 	});
+	attachTestBrokerOwnership(database, sessionPort, join(directory, "agent"));
 	server = await startUnixServer({ config, database, sessionPort, onStop: () => database.close() });
 	const client = await connect(config.socketPath);
 	client.send({ v: "0.1", type: "hello", payload: { supportedVersions: ["0.1"] } });
@@ -1112,9 +1156,10 @@ test("work.run forwards a model preset to bind and send and rejects invalid mode
 	};
 	const database = await GatewayDatabase.open(config.dbPath);
 	const sessionPort = new ScriptedSessionPort({
-		onBind: (input) => bindWorkFixture(database, input.originKey),
+		onBind: (input) => bindWorkFixture(input.originKey, input.epoch),
 		onSend: (input, scripted) => scripted.complete(input.opRef, "model result"),
 	});
+	attachTestBrokerOwnership(database, sessionPort, join(directory, "agent"));
 	server = await startUnixServer({ config, database, sessionPort, onStop: () => database.close() });
 	const client = await connect(config.socketPath);
 	client.send({ v: "0.1", type: "hello", payload: { supportedVersions: ["0.1"] } });
@@ -1166,13 +1211,10 @@ test("work capacity rejects new lanes, permits reuse, and work.retire frees the 
 	};
 	const database = await GatewayDatabase.open(config.dbPath);
 	const sessionPort = new ScriptedSessionPort({
-		onBind: (input) => {
-			const sessionId = database.getSessionRecord(input.originKey)?.sessionId || crypto.randomUUID();
-			database.putSession(input.originKey, sessionId);
-			return sessionId;
-		},
+		onBind: (input) => bindWorkFixture(input.originKey, input.epoch),
 		onSend: (input, scripted) => scripted.complete(input.opRef, "worker result"),
 	});
+	attachTestBrokerOwnership(database, sessionPort, join(directory, "agent"));
 	server = await startUnixServer({ config, database, sessionPort, onStop: () => database.close() });
 	const client = await connect(config.socketPath);
 	client.send({ v: "0.1", type: "hello", payload: { supportedVersions: ["0.1"] } });
@@ -1262,7 +1304,11 @@ test("responses larger than one socket buffer arrive intact (backpressure outbox
 	const database = await GatewayDatabase.open(config.dbPath);
 	// A ~700KB reply forces multiple kernel-buffer writes on the unix socket.
 	const bigReply = `big:${"x".repeat(700_000)}:end`;
-	const sessionPort = sessionPortFromResponder({ respond: async () => bigReply });
+	const sessionPort = sessionPortFromResponder({
+		bind: (key, epoch) => bindWorkFixture(key, epoch),
+		respond: async () => bigReply,
+	});
+	attachTestBrokerOwnership(database, sessionPort, join(directory, "agent"));
 	server = await startUnixServer({ config, database, sessionPort, onStop: () => database.close() });
 	const client = await connect(config.socketPath);
 	client.send({ v: "0.1", type: "hello", payload: { supportedVersions: ["0.1"] } });
@@ -1298,11 +1344,13 @@ test("every turn preamble carries the attachment-scope rule", async () => {
 	const database = await GatewayDatabase.open(config.dbPath);
 	const preambles: string[] = [];
 	const sessionPort = sessionPortFromResponder({
+		bind: (key, epoch) => bindWorkFixture(key, epoch),
 		respond: async (_s, _t, preamble) => {
 			preambles.push(preamble ?? "");
 			return "ok";
 		},
 	});
+	attachTestBrokerOwnership(database, sessionPort, join(directory, "agent"));
 	server = await startUnixServer({ config, database, sessionPort, onStop: () => database.close() });
 	const client = await connect(config.socketPath);
 	client.send({ v: "0.1", type: "hello", payload: { supportedVersions: ["0.1"] } });
@@ -1335,6 +1383,15 @@ test("a fresh session's first turn carries recent conversation history, a later 
 		dmPolicy: "open" as const,
 	};
 	const database = await GatewayDatabase.open(config.dbPath);
+	const turns: string[] = [];
+	const sessionPort = sessionPortFromResponder({
+		bind: (key, epoch) => bindWorkFixture(key, epoch),
+		respond: async (_s, text) => {
+			turns.push(text);
+			return "ok";
+		},
+	});
+	attachTestBrokerOwnership(database, sessionPort, join(directory, "agent"));
 	const key = "discord/dm/d-hist/peer=owner";
 	for (let i = 1; i <= 3; i++)
 		database.contextRecord({
@@ -1354,13 +1411,6 @@ test("a fresh session's first turn carries recent conversation history, a later 
 		receivedAt: new Date(Date.now() - 30_000).toISOString(),
 	});
 	database.contextCommitWindow(key, ["old-1", "old-2", "old-3", "old-img"], 0);
-	const turns: string[] = [];
-	const sessionPort = sessionPortFromResponder({
-		respond: async (_s, text) => {
-			turns.push(text);
-			return "ok";
-		},
-	});
 	server = await startUnixServer({ config, database, sessionPort, onStop: () => database.close() });
 	const client = await connect(config.socketPath);
 	client.send({ v: "0.1", type: "hello", payload: { supportedVersions: ["0.1"] } });
@@ -1410,7 +1460,11 @@ test("control tokens never leak: a silence token inside a preamble silences, and
 		"Pure geopolitics chat, not addressed to me, nothing to add.\n\n[SILENT]",
 		"This is a real bug report.\n\n[REPLY:1544704223634260038] 알겠고 인정",
 	];
-	const sessionPort = sessionPortFromResponder({ respond: async () => replies.shift() ?? "[SILENT]" });
+	const sessionPort = sessionPortFromResponder({
+		bind: (key, epoch) => bindWorkFixture(key, epoch),
+		respond: async () => replies.shift() ?? "[SILENT]",
+	});
+	attachTestBrokerOwnership(database, sessionPort, join(directory, "agent"));
 	server = await startUnixServer({ config, database, sessionPort, onStop: () => database.close() });
 	const client = await connect(config.socketPath);
 	client.send({ v: "0.1", type: "hello", payload: { supportedVersions: ["0.1"] } });
@@ -1451,7 +1505,8 @@ async function workSocketFixture() {
 		work: { maxLanes: 2 },
 	};
 	const database = await GatewayDatabase.open(config.dbPath);
-	const port = new ScriptedSessionPort({ onBind: (input) => bindWorkFixture(database, input.originKey) });
+	const port = new ScriptedSessionPort({ onBind: (input) => bindWorkFixture(input.originKey, input.epoch) });
+	attachTestBrokerOwnership(database, port, join(directory, "agent"));
 	let openAtShutdown = -1;
 	server = await startUnixServer({
 		config,
@@ -1591,11 +1646,21 @@ test("stdio stop detaches work.run before runtime request drain in an actual chi
 		import { join } from "node:path";
 		import { startStdioServer } from "./packages/gateway/src/server/server.ts";
 		import { GatewayDatabase } from "./packages/gateway/src/store/db.ts";
-		import { ScriptedSessionPort } from "./packages/gateway/test/session-port.fake.ts";
+		import { attachTestBrokerOwnership, ScriptedSessionPort } from "./packages/gateway/test/session-port.fake.ts";
 		const home = process.env.WORK_TEST_HOME;
 		const config = { schemaVersion: 1, home, configPath: join(home, "config.json"), socketPath: join(home, "gateway.sock"), dbPath: join(home, "gateway.db"), logVerbosity: "info" };
 		const database = await GatewayDatabase.open(config.dbPath);
-		const port = new ScriptedSessionPort({ onBind: (input) => { const id = crypto.randomUUID(); database.putSession(input.originKey, id); return id; } });
+		const sessionIds = new Map();
+		const port = new ScriptedSessionPort({ onBind: (input) => {
+			const key = input.originKey + "#" + input.epoch;
+			let sessionId = sessionIds.get(key);
+			if (!sessionId) {
+				sessionId = crypto.randomUUID();
+				sessionIds.set(key, sessionId);
+			}
+			return sessionId;
+		} });
+		attachTestBrokerOwnership(database, port, join(home, "agent"));
 		startStdioServer({ config, database, sessionPort: port, onStop: () => { database.close(); process.exit(0); } });
 	`;
 	const child = Bun.spawn([process.execPath, "-e", code], {

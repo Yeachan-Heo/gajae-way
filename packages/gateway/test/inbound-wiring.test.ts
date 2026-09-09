@@ -5,7 +5,7 @@ import { join } from "node:path";
 import type { GatewayConfig } from "../src/config";
 import { type GatewayServer, startUnixServer } from "../src/server/server";
 import { GatewayDatabase } from "../src/store/db";
-import { ScriptedSessionPort } from "./session-port.fake";
+import { attachTestBrokerOwnership, ScriptedSessionPort } from "./session-port.fake";
 
 let directory = "";
 let server: GatewayServer | undefined;
@@ -62,11 +62,13 @@ test("a duplicate message id is acknowledged but never dispatched twice", async 
 	const database = await GatewayDatabase.open(config.dbPath);
 	const turns: string[] = [];
 	const sessionPort = new ScriptedSessionPort({
+		onBind: (input) => `${input.originKey}#${input.epoch}`,
 		onSend: (input, scripted) => {
 			turns.push(input.text);
 			scripted.complete(input.opRef, "mock reply");
 		},
 	});
+	attachTestBrokerOwnership(database, sessionPort, join(directory, "agent"));
 	server = await startUnixServer({ config, database, sessionPort, onStop: () => database.close() });
 	const client = await connect(config.socketPath);
 	client.send({ v: "0.1", type: "hello", payload: { supportedVersions: ["0.1"] } });
@@ -89,7 +91,8 @@ test("a duplicate message id is acknowledged but never dispatched twice", async 
 test("a message arriving while a persistent turn is in flight is steered into that turn", async () => {
 	const config = await makeConfig();
 	const database = await GatewayDatabase.open(config.dbPath);
-	const sessionPort = new ScriptedSessionPort();
+	const sessionPort = new ScriptedSessionPort({ onBind: (input) => `${input.originKey}#${input.epoch}` });
+	attachTestBrokerOwnership(database, sessionPort, join(directory, "agent"));
 	server = await startUnixServer({ config, database, sessionPort, onStop: () => database.close() });
 	const client = await connect(config.socketPath);
 	client.send({ v: "0.1", type: "hello", payload: { supportedVersions: ["0.1"] } });

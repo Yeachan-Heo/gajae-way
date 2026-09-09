@@ -6,7 +6,12 @@ import { type CliResult, type CliRunner, GjcCliError } from "@gajaeway/subsessio
 import { BrokerSessionPort, parseWorkerOutputResponse, type WorkerOutputInput } from "../src/orchestrator/session-port";
 import { TailRunner } from "../src/orchestrator/tail-runner";
 import { GatewayDatabase } from "../src/store/db";
-import { ScriptedSessionPort, steerRefused } from "./session-port.fake";
+import {
+	createOwnedSessionFixture,
+	initializeTestBrokerAuthority,
+	ScriptedSessionPort,
+	steerRefused,
+} from "./session-port.fake";
 
 const floor = 1_800_000_000_000;
 const input: WorkerOutputInput = {
@@ -54,7 +59,15 @@ async function broker(run: CliRunner): Promise<BrokerSessionPort> {
 		database.close();
 		await rm(home, { recursive: true, force: true });
 	});
+	const authority = initializeTestBrokerAuthority(database, join(home, "agent"));
+	await createOwnedSessionFixture(database, authority, {
+		sessionId: input.sessionId,
+		repo: input.repo,
+		originKey: "work/output",
+		epoch: 0,
+	});
 	return new BrokerSessionPort({
+		authority,
 		database,
 		cli: run,
 		instanceId: "output-test",

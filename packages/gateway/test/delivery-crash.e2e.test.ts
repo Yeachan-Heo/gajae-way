@@ -2,6 +2,9 @@ import { afterEach, expect, test } from "bun:test";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { testOnlyBrokerDependencies } from "../src/orchestrator/test-broker";
+import { GatewayDatabase } from "../src/store/db";
+import { DeliveryLedger } from "../src/store/ledger";
 
 let home = "";
 let child: ReturnType<typeof Bun.spawn> | undefined;
@@ -90,6 +93,25 @@ test("inflight platform delivery is duplicate-labeled after a process crash", as
 	if (child) await child.exited;
 	child = undefined;
 	first.close();
+	// The child must have obtained ownership through the real SessionPort create
+	// path. Reopening here only inspects; it never initializes or adopts authority.
+	const database = await GatewayDatabase.open(join(home, "gateway.db"));
+	try {
+		const authority = database.inspectBrokerAuthority().authority;
+		expect(authority?.canonicalAgentDir).toBe(testOnlyBrokerDependencies().agentDir);
+		if (!authority) throw new Error("child did not initialize broker authority");
+		const delivery = new DeliveryLedger(database).get(deliveryId);
+		expect(delivery?.state).toBe("inflight");
+		if (!delivery) throw new Error("child did not persist the delivery");
+		const binding = database.getSessionRecord(delivery.originKey);
+		if (!binding?.sessionId) throw new Error("child did not persist the created session");
+		expect(database.assertOwnedSession(binding.sessionId, join(home, "workspace"), authority)).toMatchObject({
+			originKey: delivery.originKey,
+			epoch: binding.epoch,
+		});
+	} finally {
+		database.close();
+	}
 	const second = await client(await start());
 	const redelivery = await waitFor(second.frames, (frame) => frame.type === "event" && frame.event === "chat.message");
 	expect(redelivery.payload).toMatchObject({ deliveryId, redelivered: true, duplicateWarning: true });

@@ -6,7 +6,7 @@ import { isSilenceToken } from "@gajaeway/protocol";
 import type { GatewayConfig } from "../src/config";
 import { type GatewayServer, startUnixServer } from "../src/server/server";
 import { GatewayDatabase } from "../src/store/db";
-import { sessionPortFromResponder } from "./session-port.fake";
+import { attachTestBrokerOwnership, sessionPortFromResponder } from "./session-port.fake";
 
 let directory = "";
 let server: GatewayServer | undefined;
@@ -51,7 +51,11 @@ async function openChannelGateway(reply: string): Promise<{ frames: any[]; datab
 		channels: { "chan-1": { engagement: "open" } },
 	};
 	const database = await GatewayDatabase.open(config.dbPath);
-	const sessionPort = sessionPortFromResponder({ respond: async () => reply });
+	const sessionPort = sessionPortFromResponder({
+		bind: async (originKey, epoch) => `session-${originKey}-${epoch}`,
+		respond: async () => reply,
+	});
+	attachTestBrokerOwnership(database, sessionPort, join(directory, "agent"));
 	server = await startUnixServer({ config, database, sessionPort, onStop: () => database.close() });
 	const client = await connect(config.socketPath);
 	client.send({ v: "0.1", type: "hello", payload: { supportedVersions: ["0.1"] } });

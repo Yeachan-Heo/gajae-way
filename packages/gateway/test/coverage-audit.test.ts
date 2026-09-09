@@ -1,11 +1,11 @@
 import { expect, test } from "bun:test";
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdtemp, realpath, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { PersonaSessionManager } from "../src/orchestrator/persona-session";
 import type { InboundTurn } from "../src/store/db";
 import { GatewayDatabase } from "../src/store/db";
-import { ScriptedSessionPort, steerRefused } from "./session-port.fake";
+import { attachTestBrokerOwnership, ScriptedSessionPort, steerRefused } from "./session-port.fake";
 
 const ORIGIN = { platform: "loopback", kind: "loopback", conversationId: "coverage" } as const;
 const ORIGIN_KEY = "loopback/loopback/coverage";
@@ -35,12 +35,17 @@ async function fixture(
 		readonly brokerGeneration?: () => number;
 	} = {},
 ): Promise<Fixture> {
-	const home = await mkdtemp(join(tmpdir(), "gajaeway-coverage-audit-"));
+	const home = await realpath(await mkdtemp(join(tmpdir(), "gajaeway-coverage-audit-")));
 	const database = await GatewayDatabase.open(join(home, "gateway.db"));
+	const port = attachTestBrokerOwnership(
+		database,
+		options.port ?? new ScriptedSessionPort({ onBind: (input) => `session-${input.originKey}-${input.epoch}` }),
+		join(home, "agent"),
+	);
 	const turns = new Map<string, InboundTurn>();
 	const manager = new PersonaSessionManager({
 		database,
-		port: options.port ?? new ScriptedSessionPort(),
+		port,
 		instanceId: "coverage-audit",
 		repo: join(home, "workspace"),
 		...(options.now ? { now: options.now } : {}),
@@ -55,7 +60,7 @@ async function fixture(
 	return {
 		database,
 		manager,
-		port: options.port ?? (manager.port as ScriptedSessionPort),
+		port,
 		turns,
 		async close() {
 			await manager.stop();
@@ -124,7 +129,7 @@ class FailFirstSteerPort extends ScriptedSessionPort {
 
 	constructor() {
 		// Epoch-keyed binds: a rebound epoch gets a NEW session, as the broker does.
-		super({ onBind: (input) => `session-${input.epoch}` });
+		super({ onBind: (input) => `session-${input.originKey}-${input.epoch}` });
 	}
 
 	async steer(input: Parameters<ScriptedSessionPort["steer"]>[0]): Promise<void> {
