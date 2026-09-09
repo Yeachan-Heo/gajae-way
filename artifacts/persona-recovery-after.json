@@ -1,0 +1,56 @@
+[
+  {
+    "message_id": "1547146870936043530",
+    "origin_key": "discord/channel/1508831529856663612",
+    "state": "done",
+    "turn_state": "done",
+    "turn_op_ref": "gw-p-e3c6016462c87653888b1618878e2837",
+    "bound_session_id": "1f29238d-8a3b-48d7-ae66-1cc287665d8f",
+    "terminal_delivery_id": "{\"0\":\"gw-t-9b3391b14d7eb7628be9c00c059f7f8f\"}",
+    "sameOpRef": true,
+    "sameSession": true,
+    "deliveries": [
+      {
+        "delivery_id": "gw-t-9b3391b14d7eb7628be9c00c059f7f8f",
+        "state": "confirmed",
+        "attempts": 0
+      }
+    ]
+  },
+  {
+    "message_id": "1547150753314115625",
+    "origin_key": "discord/channel/1480171106324189335",
+    "state": "done",
+    "turn_state": "done",
+    "turn_op_ref": "gw-p-f2f13836f2982ee7c6780cb92028b3d6",
+    "bound_session_id": "537c556e-dc59-4d11-a629-a65f0f280975",
+    "terminal_delivery_id": "{\"0\":\"gw-t-e31f084e69e6f8b07802b40848b46b8f\"}",
+    "sameOpRef": true,
+    "sameSession": true,
+    "deliveries": [
+      {
+        "delivery_id": "gw-t-e31f084e69e6f8b07802b40848b46b8f",
+        "state": "confirmed",
+        "attempts": 0
+      }
+    ]
+  },
+  {
+    "message_id": "1547153372178685992",
+    "origin_key": "discord/channel/1480171104348930221",
+    "state": "done",
+    "turn_state": "done",
+    "turn_op_ref": "gw-p-5583f72505793cb4d22ae573085ad8dd",
+    "bound_session_id": "6a38ecca-1393-4a76-8f24-a8279bf242a3",
+    "terminal_delivery_id": "{\"0\":\"gw-t-cb41008d7b7472012d31a8ce478b0add\"}",
+    "sameOpRef": true,
+    "sameSession": true,
+    "deliveries": [
+      {
+        "delivery_id": "gw-t-cb41008d7b7472012d31a8ce478b0add",
+        "state": "confirmed",
+        "attempts": 0
+      }
+    ]
+  }
+]

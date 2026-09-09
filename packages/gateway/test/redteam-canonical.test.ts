@@ -955,11 +955,7 @@ test("C6a: terminal recovery after a stop invokes the reconstructed lifecycle on
 			log: (line) => fixture.logs.push(line),
 		});
 		await recovered.recover();
-		const grace = required(
-			timers.find((timer) => timer.delayMs === 250),
-			"terminal recovery grace was not scheduled",
-		);
-		grace.work();
+		expect(timers.some((timer) => timer.delayMs === 250)).toBe(false);
 		await eventually(() => fixture.terminals.length === 1, "recovered terminal did not invoke onTerminal");
 		expect(fixture.terminals).toEqual([{ trigger: "recover-terminal", text: "recovered answer" }]);
 		expect(fixture.port.sends).toHaveLength(1);
