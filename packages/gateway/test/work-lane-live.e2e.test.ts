@@ -369,7 +369,7 @@ liveTest(
 				expect(status.sessionId).toBe(activeSessionId);
 				expect(status.attempt?.opRef).toBe(started.opRef);
 				if (status.op?.status === "failed") throw new Error("original operation failed");
-				if (database.workAttemptGet(started.opRef)?.settledAt) {
+				if (status.attempt?.endedAt) {
 					expect(status.op?.status).toBe("terminal_ok");
 					expect(status.attempt?.endState).toBe("completed");
 					break;

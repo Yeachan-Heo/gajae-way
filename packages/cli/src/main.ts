@@ -518,10 +518,9 @@ export async function main(args = process.argv.slice(2), options: MainOptions = 
 				if (!name || !/^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/.test(name) || !text) throw new Error(usage);
 				// This is a caller response-wait budget, never an attempt deadline.
 				// Timeout/disconnect leaves the attempt observable via work.status.
-				const client = await GajaewayClient.connectSocket(
-					parsed.socket,
-					command === "run" ? { requestTimeoutMs: 3_600_000 } : undefined,
-				);
+				const client = await GajaewayClient.connectSocket(parsed.socket, {
+					requestTimeoutMs: command === "run" ? 3_600_000 : 120_000,
+				});
 				try {
 					const params: WorkStartParams = {
 						name,

@@ -492,7 +492,7 @@ describe("work operator commands", () => {
 				},
 			]);
 			expect(output.lines).toEqual(["started: work/task/fix session=session-1 job=job-1 op=op-1"]);
-			expect(output.connectOptions).toBeUndefined();
+			expect(output.connectOptions).toEqual({ requestTimeoutMs: 120_000 });
 			expect(output.closed).toBe(true);
 		});
 	}
