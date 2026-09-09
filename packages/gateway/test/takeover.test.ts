@@ -128,10 +128,12 @@ test("release removes only this process's own record; a successor's record survi
 
 test("boot settles home ownership before the socket or database exist, and releases it on ordered shutdown", async () => {
 	const home = await temporaryHome("gajaeway-takeover-boot-");
-	const command: CliRunner = async (args) =>
-		args[0] === "--version"
+	const command: CliRunner = async (args) => {
+		expect((await lstat(join(home, "workspace"))).isDirectory()).toBe(true);
+		return args[0] === "--version"
 			? { exitCode: 0, stdout: `gjc/${MIN_GJC_VERSION}\n`, stderr: "" }
 			: { exitCode: 0, stdout: JSON.stringify({ ok: true, result: { sessions: [] } }), stderr: "" };
+	};
 	const broker = {
 		executable: "/test-only/gjc",
 		agentDir: home,

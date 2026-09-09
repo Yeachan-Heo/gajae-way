@@ -50,6 +50,7 @@ export async function bootGateway(options: BootGatewayOptions = {}): Promise<Gat
 		const database = await GatewayDatabase.open(config.dbPath);
 		let broker: GlobalGjcClient | undefined;
 		try {
+			await mkdir(join(config.home, "workspace"), { recursive: true, mode: 0o700 });
 			broker = new GlobalGjcClient({
 				...options.broker,
 				cwd: join(config.home, "workspace"),
