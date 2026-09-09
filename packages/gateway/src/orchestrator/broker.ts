@@ -153,8 +153,8 @@ export function probeBrokerEndpoint(
 						JSON.stringify({
 							type: "broker_request",
 							id: "gajaeway-health",
-							operation: "session.list",
-							input: { resolveSessionId: HEALTH_PROBE_SESSION_ID },
+							operation: "session.get_endpoint",
+							input: { sessionId: HEALTH_PROBE_SESSION_ID },
 						}),
 					);
 				} catch {

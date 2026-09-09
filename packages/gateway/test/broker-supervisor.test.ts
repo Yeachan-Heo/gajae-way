@@ -412,8 +412,8 @@ test("global client preserves user broker running beyond gateway stop", async ()
 			message(socket, data) {
 				const request = JSON.parse(String(data));
 				requests++;
-				expect(request.operation).toBe("session.list");
-				expect(request.input.resolveSessionId).toBe("00000000-0000-4000-8000-000000000000");
+				expect(request.operation).toBe("session.get_endpoint");
+				expect(request.input).toEqual({ sessionId: "00000000-0000-4000-8000-000000000000" });
 				socket.send(JSON.stringify({ type: "broker_response", id: request.id, ok: true, result: { sessions: [] } }));
 			},
 		},
