@@ -430,7 +430,23 @@ liveTest(
 			expect((await independent(["inspect", sessionId, "--repo", repo])).session.live).toBe(true);
 		} catch {
 			// Freeze primary evidence before cleanup can issue more SDK requests.
-			failures.push({ stage, evidence: [...evidence] });
+			failures.push({
+				stage,
+				evidence: [...evidence],
+				work: database.laneJobRows(true).map((row) => {
+					const parsed = JSON.parse(database.laneJobJson(row.job_id) ?? "{}");
+					const attempt = parsed.attempts?.at(-1);
+					const runtime = attempt ? database.workAttemptGet(attempt.opRef) : undefined;
+					return {
+						state: row.state,
+						endState: attempt?.endState,
+						reasonCode: runtime?.terminal?.reasonCode,
+						settled: !!runtime?.settledAt,
+						outputDisposition: runtime?.output.disposition,
+						outputReads: runtime?.output.reads,
+					};
+				}),
+			});
 		} finally {
 			primaryEvidence = [...evidence];
 			try {
