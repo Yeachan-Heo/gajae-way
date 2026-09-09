@@ -1,38 +1,12 @@
 {
-  "schemaVersion": 1,
-  "kind": "api-package-test-report",
-  "status": "source_verified_pending_shared_runtime_promotion_and_canary",
-  "target": "gaebal-gajae SSH port 24",
-  "userRuntimeObserved": {"executable":"/mnt/offloading/.bun/bin/gjc","version":"0.16.3","agentDir":"/home/bellman/.gjc/agent","brokerPid":951920},
-  "priorGatewayRuntimeObserved": {"executable":"/home/bellman/.local/bin/gjc","version":"0.16.6","privateAgentDir":"/home/bellman/.gajaeway/broker/b1942e24-9b89-44ea-9b91-d9a1a475b579/agent","brokerPid":3020935},
-  "repositoryVerification": {
-    "command":"bun test packages --reporter=junit --reporter-outfile=artifacts/global-sdk-test-report.junit.xml",
-    "passed":1871,"failed":0,"skipped":4,"assertions":9431,"files":137,
-    "typecheck":"passed","build":"passed","biomeCi":"passed","warnings":402,"infos":22,
-    "cutoverLockTests":{"passed":23,"failed":0,"scope":"kernel-exclusive boot/admin coordination, pre-migration backup, explicit quarantine and rollback"}
-  },
-  "implemented": [
-    "GlobalGjcClient replaces private supervisor; same resolved executable/profile for commands and streams, no seed/reap/shared-daemon restart or configuration copying",
-    "Positive gateway session ownership and active broker authority before SDK reads/controls; removed global orphan GC and session deletion",
-    "Immutable authority-qualified provenance and cursors; explicit offline archival/quarantine cutover preserving old accepted history and preventing replay",
-    "Kernel flock shared by gateway boot and administrative cutover, pre-migration consistent backup with no overwrite",
-    "Quarantined worker history remains visible with a stable reason; no old private session ID is adopted into the shared broker",
-    "Established authority guard is constant-size; unrelated corrupt history remains separately visible without fencing valid owned SDK traffic",
-    "Bounded own-child termination reports uncertainty; persona callback admission is fenced and mailboxes drained before shutdown",
-    "Monitor inspection includes quarantined history without replay; cutover schema receipt uses migration ledger and real process-death boundaries are tested",
-    "Updated protocol/CLI, recovery, tests and operational guidance"
-  ],
-  "realSharedTest": {
-    "command":"GAJAEWAY_E2E_WORK=1 GJC_EXECUTABLE=/Users/bellman/.local/bin/gjc GJC_CODING_AGENT_DIR=/Users/bellman/.gjc/agent GAJAEWAY_E2E_MODEL=layofflabs/gpt-6-astra bun test packages/gateway/test/work-lane-live.e2e.test.ts",
-    "status":"failed",
-    "failure":"user config changed: config.yml",
-    "limits":"Original before/after bytes were held only in memory; no whole-config restoration attempted. Test instrumentation now reports bounded changed key paths and file hashes, never values. No further live user-profile run performed after identifying the mutation."
-  },
-  "sdkDependency": {
-    "repository":"gajae-code (separate repository; existing unrelated user work present)",
-    "sourceEvidence":"Read-only assessment 26-GlobalGjcBoundary: session.create(modelId) and model.set reach persistAsSessionDefault -> global profile materialization/unset; lifecycle Settings.loadForScope can migrate and flush user config. Selected remote 0.16.3 source contains these same paths.",
-    "required":"Session-local nonpersistent SDK repair implemented in clean exact-installed-base worktree /private/tmp/gjc-global-sdk-session-settings: 208 synthetic/API/wire compatibility tests pass, typecheck and source reviewers pass. Global runtime promotion, broker-only replacement continuity proof and actual shared-profile canary remain pending."
-  },
-  "deployment": {"sharedAuthorityCutoverPerformed":false,"newReleasePublished":false,"userConfigurationRestored":false,"sharedDaemonKilled":false},
-  "limitations":["This is not a final completion receipt or successful production deployment claim.","Repository and isolated SDK test success do not supersede actual repaired shared-profile verification.","No further real user-profile runs or whole-config restoration after the original mutation; no new global runtime installation or shared broker signal has occurred."]
+ "schemaVersion":1,"kind":"api-package-test-report","status":"deployed_and_verified",
+ "gatewaySourceCommit":"fee70264d54b552d9e9a7282878ba5fa0702ce7b","sdkCliCommit":"d92266de8a781aec91ed447398a7fad7c6c29a50",
+ "target":"gaebal-gajae SSH port 24","executable":"/mnt/offloading/.bun/bin/gjc","agentDir":"/home/bellman/.gjc/agent",
+ "tests":{"command":"bun test packages --reporter=junit --reporter-outfile=artifacts/global-sdk-test-report.junit.xml","passed":1956,"failed":0,"skipped":4,"assertions":9934,"files":138},
+ "typecheck":"passed","build":"passed","sdkTests":{"passed":230,"failed":0,"assertions":1004,"files":12},
+ "live":{"independentSteer":"passed with original-opRef turn.result marker; 635 assertions on actual user repository","fullGatewayProcessRestart":"passed; same session/op and shared broker,79 unrelated live identities preserved","production":"completed original output [SILENT] SHARED_PRODUCTION_OK.; persisted proof and notification suppression; same worker after production service restart","configPreservation":"passed"},
+ "cutover":{"schemaBefore":21,"schemaAfter":22,"snapshotId":"ca58db5c-6b66-47dc-9ea0-ffb7a0d388cc","quarantined":{"inbound":4163,"work":23,"monitor":467},"backup":"/home/bellman/.local/state/gajaeway/shared-gateway-deploy-20260909T072417Z/gateway-pre-cutover.db","integrity":"ok"},
+ "resolvedActualRuntimeDefects":["SDK session-model changes wrote global default profile; repaired session-local settings/journal ownership","SDK targeted CLI commands attached unrelated fleet hosts; repaired exact session filters","Actual steer receipt uses status accepted, not required invented accepted boolean","Broker session.list exact-lookup health allocated pagination cursors; replaced with session.get_endpoint","Fresh gateway SDK cwd absent before preflight; created gateway-owned workspace first","Read-only SQLite inspection created Linux source sidecars; inspect stable disposable copy including WAL"],
+ "evidence":["shared-production-deployment.json","shared-production-verification.json","shared-deployment-summary.json","shared-sdk-promotion.json","shared-sdk-router-promotion.json","shared-global-live-verification.json","shared-gateway-process-canary.json"],
+ "limitations":["Four original user hosts were absent at a later multi-hour audit; immediate SDK promotion preserved all51, and no causal claim is made about later exits","One non-original-shared process disappeared across gateway deployment; exact PID retained in deployment receipt","Quarantined historical work remains held, not falsely completed or replayed","Unrelated pre-existing memory-closure/stale-session gates are not claimed resolved"]
 }

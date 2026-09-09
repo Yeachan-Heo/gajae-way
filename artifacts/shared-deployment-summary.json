@@ -1,0 +1,31 @@
+{
+  "schemaVersion":1,
+  "kind":"api-package-cli-automation-transcript",
+  "status":"deployed_and_runtime_verified",
+  "gatewayCommit":"fee70264d54b552d9e9a7282878ba5fa0702ce7b",
+  "sdkCliCommit":"d92266de8a781aec91ed447398a7fad7c6c29a50",
+  "host":"gaebal-gajae","sshPort":24,
+  "globalExecutable":"/mnt/offloading/.bun/bin/gjc",
+  "agentDir":"/home/bellman/.gjc/agent",
+  "authoritySnapshotId":"ca58db5c-6b66-47dc-9ea0-ffb7a0d388cc",
+  "backup":"/home/bellman/.local/state/gajaeway/shared-gateway-deploy-20260909T072417Z/gateway-pre-cutover.db",
+  "schema":{"backup":21,"active":22,"integrity":"ok"},
+  "quarantinedHistory":{"inbound":4163,"work":23,"monitor":467},
+  "verification":[
+    "SDK initial broker-only promotion preserved all 51 then-live user hosts and configuration; original installation retained",
+    "Target-only SDK CLI routing repaired unrelated-host fan-out; 22 CLI tests passed on Darwin and Linux",
+    "Real shared-user WorkLaneManager independent steer and original-opRef turn.result test passed, 635 assertions",
+    "Full gateway-process restart canary passed after Router correction; 79 unrelated live sessions preserved and shared broker/config unchanged",
+    "Production worker completed with original output [SILENT] SHARED_PRODUCTION_OK.; notification suppression and original output proof persisted",
+    "Production gateway restart retained same worker session/opRef and host PID; DB authority matches ordinary user profile",
+    "Health checks changed to cursor-free session.get_endpoint after actual selected SDK allocated pagination cursors for resolveSessionId session.list probes",
+    "Final production broker-only cursor recovery preserved all 24 then-running SDK session-host processes; no host kill escalation or profile restoration"
+  ],
+  "limitations":[
+    "Session-list visibility is not a claim that every unrelated historical session remains forever alive: 47 of the original 51 OS identities remained at the later audit; four had exited during the multi-hour interval, with no proven cause attributed. Immediate cutover snapshots preserved all then-live hosts.",
+    "One process present before gateway cutover was absent afterward; it was not identified as one of the original shared user hosts. Deployment receipt retains its PID rather than hiding it.",
+    "Existing private histories are deliberately HELD/non-replayable, not completed or adopted as shared sessions.",
+    "Prior external memory closure/stale-session operational gates are not claimed globally resolved by this runtime-path correction."
+  ],
+  "artifacts":["shared-production-deployment.json","shared-production-verification.json","shared-sdk-promotion.json","shared-sdk-router-promotion.json","shared-gateway-process-canary.json","shared-global-live-verification.json"]
+}

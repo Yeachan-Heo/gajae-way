@@ -1,0 +1,8 @@
+{
+  "status": "promoted",
+  "sdkCommit": "d92266de8a781aec91ed447398a7fad7c6c29a50",
+  "oldTarget": "/home/bellman/.local/share/gjc/releases/d45fec0a0ab621e84c2ca0032767c29dfc8c928b/packages/coding-agent/bin/gjc.js",
+  "newTarget": "/home/bellman/.local/share/gjc/releases/d92266de8a781aec91ed447398a7fad7c6c29a50/packages/coding-agent/bin/gjc.js",
+  "brokerPidUnchanged": 1213073,
+  "noDaemonSignal": true
+}

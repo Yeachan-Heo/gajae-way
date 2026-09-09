@@ -1,0 +1,68 @@
+{
+  "status": "deployed",
+  "oldHead": "06f3cf5266229e80aa8ff3f70753327d0eac1a35",
+  "mainHead": "a97d2f6432b58af76f4e0e0d9f8fe2adab970949",
+  "backup": "/home/bellman/.local/state/gajaeway/shared-gateway-deploy-20260909T072417Z",
+  "cutover": {
+    "mode": "apply",
+    "oldAuthority": null,
+    "targetAuthority": {
+      "canonicalAgentDir": "/home/bellman/.gjc/agent",
+      "identity": "gjc:/home/bellman/.gjc/agent"
+    },
+    "backup": {
+      "path": "/home/bellman/.local/state/gajaeway/shared-gateway-deploy-20260909T072417Z/gateway-pre-cutover.db",
+      "integrity": "ok",
+      "premigration": true,
+      "schema": 21
+    },
+    "snapshotId": "ca58db5c-6b66-47dc-9ea0-ffb7a0d388cc",
+    "targetSchema": 22,
+    "census": {
+      "schema": 21,
+      "rowCounts": {
+        "authored_outputs": 322,
+        "conversation_context": 9810,
+        "conversation_context_state": 24,
+        "conversation_model": 0,
+        "deliveries": 2570,
+        "dispatch_leases": 36,
+        "inbound_messages": 4163,
+        "lane_jobs": 23,
+        "memory_intents": 2843,
+        "meta": 218,
+        "monitor_events": 467,
+        "monitor_failures": 702,
+        "monitor_slots": 442,
+        "monitors": 5,
+        "recall_snippets": 250,
+        "schema_migrations": 21,
+        "session_tail_cursors": 0,
+        "sessions": 50,
+        "work_attempt_runtime": 47
+      },
+      "semanticOpenWorkCensus": "not_evaluated"
+    },
+    "semanticCensus": {
+      "authority": null,
+      "populated": true,
+      "openInbound": 1,
+      "openWork": 23,
+      "openMonitors": 43
+    },
+    "consistentRead": true,
+    "exclusiveOwnership": true,
+    "applyAvailable": true
+  },
+  "sharedBroker": {
+    "pid": 1213073,
+    "ownerId": "ffabdb564e39c55cc5997b99",
+    "incarnation": "linux:432228496"
+  },
+  "sdkProcessesPreserved": 86,
+  "sdkProcessesMissing": [
+    "351929"
+  ],
+  "globalConfigUnchanged": true,
+  "integrity": "{\"ok\":true,\"detail\":\"ok\"}"
+}

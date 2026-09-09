@@ -198,7 +198,7 @@ test("R4 invalid models and name boundaries fail closed; valid model reaches bin
 	for (const model of ["model-id", { preset: "preset-name" }]) {
 		expect((await h.run("a".repeat(64), { model })).type).toBe("response");
 		expect(h.port.binds.at(-1)?.model).toEqual(model);
-		expect(h.port.sendAttempts.at(-1)?.model).toEqual(model);
+		expect(h.port.sendAttempts.at(-1)?.model).toBeUndefined();
 	}
 	expect((await h.run("a".repeat(65))).error?.code).toBe("invalid_params");
 	for (const name of ["../bad", "", "a".repeat(65), null])

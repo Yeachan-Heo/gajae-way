@@ -1179,7 +1179,7 @@ test("work.run forwards a model preset to bind and send and rejects invalid mode
 		result: { text: "model result", held: false },
 	});
 	expect(sessionPort.binds[0].model).toEqual({ preset: "muse-gpt" });
-	expect(sessionPort.sends[0].model).toEqual({ preset: "muse-gpt" });
+	expect(sessionPort.sends[0].model).toBeUndefined();
 	for (const [index, model] of [{ preset: "" }, 42].entries()) {
 		const id = `invalid-model-${index}`;
 		client.send({

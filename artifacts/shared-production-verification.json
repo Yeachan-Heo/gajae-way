@@ -1,0 +1,35 @@
+{
+  "status": "passed",
+  "mainHead": "fee70264d54b552d9e9a7282878ba5fa0702ce7b",
+  "sdkCli": "/home/bellman/.local/share/gjc/releases/d92266de8a781aec91ed447398a7fad7c6c29a50/packages/coding-agent/bin/gjc.js",
+  "globalAgentDir": "/home/bellman/.gjc/agent",
+  "authority": "[\"/home/bellman/.gjc/agent\",\"gjc:/home/bellman/.gjc/agent\"]",
+  "broker": {
+    "pid": 702595,
+    "ownerId": "70c98d2291e32e71b5872bdc",
+    "incarnation": "linux:432983052"
+  },
+  "productionWorker": {
+    "sessionId": "63b12af8-5e5c-4215-9eec-0a53ab7ab820",
+    "opRef": "gw-work-shared-prod-proof-20260909-01m22gxp9r3akeyz8c33hdte7s",
+    "endState": "completed",
+    "originalOutput": "[SILENT] SHARED_PRODUCTION_OK.",
+    "notification": "suppressed",
+    "gatewayRestartSameSession": true,
+    "hostPid": 385312
+  },
+  "originalUserHostsPreserved": 47,
+  "originalUserHostsMissing": [
+    "01a06bde-db0e-7683-bb5a-4943bbf1b15d",
+    "01a07e58-6cb5-7558-83bd-a4d070fdf9ae",
+    "01a0842e-6a52-7582-b81c-8b2c5e23bd7d",
+    "01a08430-8da2-72a6-a35b-c0a11f58193e"
+  ],
+  "quarantineCounts": {
+    "inbound": 4163,
+    "monitor": 467,
+    "work": 23
+  },
+  "globalConfigUnchanged": true,
+  "integrity": "ok"
+}
