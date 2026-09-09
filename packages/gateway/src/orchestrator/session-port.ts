@@ -581,7 +581,7 @@ export class BrokerSessionPort implements SessionPort {
 				refused: true,
 			});
 		}
-		if (body?.accepted !== true || (body.status !== undefined && body.status !== "accepted"))
+		if (!isSteerAccepted(body))
 			throw new GjcCliError("gjc sdk turn.steer acceptance unavailable", 0, "", { code: "receipt_identity_mismatch" });
 	}
 
@@ -1136,6 +1136,17 @@ export function parseWorkerOutputResponse(
 	};
 }
 
+/** Affirmative SDK steer evidence, excluding contradictory or malformed acceptance. */
+export function isSteerAccepted(value: unknown): boolean {
+	const receipt = workerRecord(value);
+	return (
+		receipt !== undefined &&
+		receipt.ok !== false &&
+		(receipt.accepted === undefined || receipt.accepted === true) &&
+		(receipt.status === undefined || receipt.status === "accepted") &&
+		(receipt.accepted === true || receipt.status === "accepted")
+	);
+}
 function workerRecord(value: unknown): Record<string, unknown> | undefined {
 	return typeof value === "object" && value !== null && !Array.isArray(value)
 		? (value as Record<string, unknown>)

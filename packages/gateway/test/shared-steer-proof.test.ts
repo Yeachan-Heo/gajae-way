@@ -24,7 +24,7 @@ const proof = {
 	opRef: "original-op",
 	marker: "UNIQUE_STEER_MARKER",
 	clientRef: "steer-ref",
-	receipt: { accepted: true, clientRef: "steer-ref", status: "accepted" },
+	receipt: { clientRef: "steer-ref", status: "accepted" },
 	terminal: { operationRef: "original-op", status: { status: "terminal_ok" } },
 };
 
@@ -38,6 +38,18 @@ test("shared steer proof rejects latest-row marker when original operation lacks
 test("shared steer proof accepts only correlated original proven output", () => {
 	const output = { ...original, text: proof.marker };
 	expect(provesSharedSteer({ ...proof, output })).toBe(true);
+	expect(provesSharedSteer({ ...proof, output, receipt: { accepted: true, clientRef: "steer-ref" } })).toBe(true);
+	for (const receipt of [
+		{ accepted: false, status: "accepted", clientRef: "steer-ref" },
+		{ accepted: true, status: "rejected", clientRef: "steer-ref" },
+		{ status: "accepted", ok: false, clientRef: "steer-ref" },
+		{ accepted: "true", status: "accepted", clientRef: "steer-ref" },
+		{ clientRef: "steer-ref" },
+		{ status: "accepted", clientRef: "other-steer" },
+		{ status: "accepted" },
+	]) {
+		expect(provesSharedSteer({ ...proof, output, receipt })).toBe(false);
+	}
 	expect(provesSharedSteer({ ...proof, output, receipt: { accepted: true, clientRef: "other-steer" } })).toBe(false);
 	expect(
 		provesSharedSteer({ ...proof, output, terminal: { operationRef: "later-op", status: { status: "terminal_ok" } } }),

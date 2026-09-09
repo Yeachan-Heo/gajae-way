@@ -270,6 +270,26 @@ test("fake accepts send while response is delayed and supports production raw ou
 	expect(await port.fetchWorkerOutput(input)).toEqual({ status: "unavailable", code: "invalid_evidence" });
 });
 
+test("production steer accepts the observed SDK 0.16.3 raw control response without an accepted boolean", async () => {
+	const clientRef = "probe-terminal-steer-20260909";
+	const observed = {
+		type: "control_response",
+		ok: true,
+		result: {
+			sessionId: input.sessionId,
+			commandId: "command-1",
+			turnId: "turn-1",
+			clientRef,
+			status: "accepted",
+			acceptedAt: 1788932429645,
+		},
+	};
+	const port = await broker(async () => response(observed));
+	await expect(
+		port.steer({ sessionId: input.sessionId, repo: input.repo, text: "steer", clientRef }),
+	).resolves.toBeUndefined();
+});
+
 test("production steer requires structured acceptance, preserves caller clientRef, and rejects nested refusal", async () => {
 	let envelope: unknown = { ok: true, result: { accepted: true, status: "accepted", clientRef: "caller-steer-ref" } };
 	const port = await broker(async (args) => {
@@ -340,6 +360,7 @@ test("steer affirmative refusal is marked while missing or malformed acceptance 
 	const steer = { sessionId: input.sessionId, repo: input.repo, text: "steer", clientRef: "caller-ref" };
 	for (const rejected of [
 		{ ok: true, result: { accepted: false, error: { code: "new_sdk_rejection" } } },
+		{ ok: true, result: { accepted: false, status: "accepted", clientRef: "caller-ref" } },
 		{ ok: true, result: { status: "rejected" } },
 		{ ok: false, error: { code: "busy" } },
 	]) {
@@ -357,6 +378,8 @@ test("steer affirmative refusal is marked while missing or malformed acceptance 
 		{},
 		{ accepted: "true" },
 		{ accepted: true, status: "unknown" },
+		{ accepted: "true", status: "accepted" },
+		{ status: "accepted", clientRef: "other-operation" },
 		{ accepted: false, clientRef: "other-operation" },
 	]) {
 		envelope = { ok: true, result };

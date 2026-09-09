@@ -6,7 +6,7 @@ import { isAbsolute, join } from "node:path";
 import type { CliRunner } from "@gajaeway/subsession";
 import { GlobalGjcClient, readBrokerDiscovery } from "../src/orchestrator/broker";
 import { LaneGovernor } from "../src/orchestrator/lane-governor";
-import { BrokerSessionPort } from "../src/orchestrator/session-port";
+import { BrokerSessionPort, isSteerAccepted } from "../src/orchestrator/session-port";
 import { TailRunner } from "../src/orchestrator/tail-runner";
 import { WorkLaneManager } from "../src/orchestrator/work-lane";
 import { GatewayDatabase } from "../src/store/db";
@@ -86,13 +86,12 @@ export function provesSharedSteer(input: {
 	opRef: string;
 	marker: string;
 	clientRef: string;
-	receipt: { accepted?: unknown; clientRef?: unknown; status?: unknown };
+	receipt: { accepted?: unknown; clientRef?: unknown; status?: unknown; ok?: unknown };
 	terminal: { operationRef: string; status: { status: string } };
 }): boolean {
 	return (
-		input.receipt.accepted === true &&
+		isSteerAccepted(input.receipt) &&
 		input.receipt.clientRef === input.clientRef &&
-		(input.receipt.status === undefined || input.receipt.status === "accepted") &&
 		input.terminal.operationRef === input.opRef &&
 		input.terminal.status.status === "terminal_ok" &&
 		input.output.status === "proven" &&
@@ -160,8 +159,14 @@ liveTest(
 			const timer = setTimeout(() => child.kill(), 30_000);
 			try {
 				const [text, code] = await Promise.all([new Response(child.stdout).text(), child.exited]);
-				expect(code).toBe(0);
 				const envelope = JSON.parse(text);
+				evidence.push({
+					independentCommand: args.slice(0, 2),
+					exitCode: code,
+					...diagnostic(envelope),
+					resultKeys: envelope.result && typeof envelope.result === "object" ? Object.keys(envelope.result) : [],
+				});
+				expect(code).toBe(0);
 				expect(envelope.ok).toBe(true);
 				return envelope.result;
 			} finally {
@@ -270,8 +275,7 @@ liveTest(
 					clientRef,
 				}),
 			]);
-			expect(steer.accepted).toBe(true);
-			if (steer.status !== undefined) expect(steer.status === "accepted").toBe(true);
+			expect(isSteerAccepted(steer)).toBe(true);
 			expect(steer.clientRef === clientRef).toBe(true);
 			evidence.push({ independentSteerAccepted: true });
 			stage = "manager-status-and-settlement";
