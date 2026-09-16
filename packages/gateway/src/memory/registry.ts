@@ -61,6 +61,8 @@ export const DATED_ENTRY = new RegExp(`^(?:\\d{4}-${MONTH}/)?\\d{4}-${MONTH}-(?:
 export const TREE_INDEX_CAP = 200;
 /** A `recent` index lists this many newest entries per axis. */
 export const RECENT_INDEX_CAP = 20;
+/** Hard UTF-8 byte ceiling shared by generated navigation and session bootstrap reads. */
+export const NAVIGATION_SOURCE_MAX_BYTES = 24 * 1024;
 
 const ID = /^[a-z][a-z0-9-]*$/;
 // Lowercase only: a case-insensitive filesystem would happily let `Ops` and `ops`

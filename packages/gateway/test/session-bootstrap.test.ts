@@ -3,6 +3,7 @@ import { mkdir, mkdtemp, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { GatewayConfig } from "../src/config";
+import { NAVIGATION_SOURCE_MAX_BYTES } from "../src/memory/registry";
 import { buildSessionBootstrap, SESSION_BOOTSTRAP_MAX_BYTES } from "../src/persona/bootstrap";
 
 const ORIGIN = { platform: "discord", kind: "channel", conversationId: "c1" } as const;
@@ -338,6 +339,17 @@ describe("session bootstrap builder", () => {
 		expect(first.truncated).toBe(true);
 		expect(first.text).toMatch(/omitted sections \(\d+\):/);
 		expect(first.text).not.toContain("�");
+	});
+
+	test("accepts a navigation source exactly at the shared byte ceiling", async () => {
+		const config = await setup();
+		const prefix = "# Navigation\n";
+		await writeFile(
+			join(home, "memory", "MEMORY.md"),
+			`${prefix}${"x".repeat(NAVIGATION_SOURCE_MAX_BYTES - Buffer.byteLength(prefix, "utf8"))}`,
+		);
+		const result = await build(config);
+		expect(result.diagnostics).not.toContain("MEMORY.md: source_too_large");
 	});
 
 	test("re-reads source edits for a later epoch", async () => {
