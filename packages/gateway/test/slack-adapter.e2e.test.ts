@@ -69,6 +69,7 @@ async function gateway(respond: (text: string) => string): Promise<{
 		dbPath: join(directory, "gateway.db"),
 		logVerbosity: "info",
 		channels: { "slack:C1": { engagement: "open" } },
+		dmPolicy: "open",
 	};
 	const database = await GatewayDatabase.open(config.dbPath);
 	const turns: string[] = [];
@@ -218,4 +219,55 @@ test("a delivery the adapter cannot settle is a failed ledger row, not a silent 
 			params: { deliveryId: "d-malformed", reason: expect.stringContaining("malformed"), ambiguous: false },
 		},
 	]);
+});
+
+test("a delivery pending in the ledger before the adapter connects is replayed and settled, not dropped", async () => {
+	// ARCH-08: the gateway writes `negotiated` and the pending replay in one burst,
+	// which the SDK dispatches before `connectSocket` resolves - before the adapter
+	// could subscribe. The SDK now holds pre-subscription events for the first
+	// subscriber, so the row is settled instead of stranded until the next reconnect.
+	const { config, database } = await gateway(() => "answer");
+	// Seed an undelivered Slack row with nobody connected to settle it.
+	const seedApi = fakeSlackApi();
+	const seedAdapter = new ReconnectingGateway(config.socketPath, {
+		postMessage: async () => {
+			throw new TypeError("link died mid-post");
+		},
+		addReaction: seedApi.api.addReaction,
+	});
+	await seedAdapter.connect();
+	await seedAdapter.requestInbound(slackMessageId("C1", "1726543210.000600"), CHANNEL_ORIGIN, "hello?", {
+		mentioned: true,
+		group: true,
+		authorId: "U1",
+	});
+	await settle();
+	expect(database.deliveryRows().map((row) => row.state)).not.toEqual(["confirmed"]);
+	// A fresh adapter connects; the replay arrives with negotiation.
+	const slack = fakeSlackApi();
+	const adapter = new ReconnectingGateway(config.socketPath, slack.api);
+	await adapter.connect();
+	await settle();
+	expect(slack.posts).toEqual([{ channel: "C1", text: "[recovered - may be a duplicate] answer" }]);
+	expect(database.deliveryRows().map((row) => row.state)).toEqual(["confirmed"]);
+});
+
+test("a plain answer to a threaded DM stays in that DM thread without a [REPLY] token", async () => {
+	// ARCH-05: a threaded DM keeps its DM session identity, so the thread root only
+	// survives in engagement.replyTo. The gateway uses it as the default reply target.
+	const { config, database } = await gateway(() => "in your thread");
+	const slack = fakeSlackApi();
+	const adapter = new ReconnectingGateway(config.socketPath, slack.api);
+	await adapter.connect();
+	const dm = slackMessageOrigin({ channel: "D1", channel_type: "im", user: "U1", ts: "1726543210.000700" });
+	expect(dm.kind).toBe("dm");
+	await adapter.requestInbound(slackMessageId("D1", "1726543210.000700"), dm, "question in a thread", {
+		mentioned: true,
+		group: false,
+		authorId: "U1",
+		replyTo: { messageId: slackMessageId("D1", "1726543200.000001"), authorId: "UBOT", fromSelf: true },
+	});
+	await settle();
+	expect(slack.posts).toEqual([{ channel: "D1", text: "in your thread", threadTs: "1726543200.000001" }]);
+	expect(database.deliveryRows().map((row) => row.state)).toEqual(["confirmed"]);
 });

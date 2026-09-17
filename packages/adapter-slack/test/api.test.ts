@@ -1,5 +1,5 @@
 import { expect, test } from "bun:test";
-import { deliveryFailureIsAmbiguous, SlackApiError, SlackWebApi } from "../src/api";
+import { deliveryFailureIsAmbiguous, SlackApiError, SlackUnreadableResponseError, SlackWebApi } from "../src/api";
 
 function fixture() {
 	const requests: { url: string; headers: Headers; body: Record<string, unknown>; method?: string }[] = [];
@@ -52,9 +52,14 @@ test("Slack errors preserve HTTP status and platform code", async () => {
 		expect((error as SlackApiError).status).toBe(status);
 		expect((error as SlackApiError).code).toBe(code);
 	}
-	for (const text of ["not JSON", "null", "[]"]) {
+	// A body Slack sent but we cannot read is NOT a definitive refusal: the write
+	// may well have happened, so it stays ambiguous (not a SlackApiError).
+	for (const text of ["not JSON", "null", "[]", "{}", '{"value":1}']) {
 		f.respond(() => new Response(text));
-		await expect(f.api.call("test")).rejects.toMatchObject({ code: "invalid_response" });
+		const error = await f.api.call("test").catch((caught: unknown) => caught);
+		expect(error).toBeInstanceOf(SlackUnreadableResponseError);
+		expect(error).not.toBeInstanceOf(SlackApiError);
+		expect(deliveryFailureIsAmbiguous(error)).toBe(true);
 	}
 });
 

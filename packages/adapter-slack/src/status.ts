@@ -1,4 +1,4 @@
-import type { ChatProgressPayload } from "@gajaeway/protocol";
+import type { ChatProgressPayload, OriginRef } from "@gajaeway/protocol";
 import type { SlackWebApi } from "./api";
 import { parseSlackMessageId } from "./origin";
 
@@ -40,14 +40,27 @@ export class WorkingStatus {
 		readonly clearTimer: (timer: unknown) => void = (timer) => clearTimeout(timer as ReturnType<typeof setTimeout>),
 	) {}
 
-	arm(conversationId: string): void {
-		this.#addressed.add(conversationId);
+	/**
+	 * An addressed turn was accepted. Slack has no typing indicator, so the hint
+	 * is posted right here rather than on the first progress tick: the gateway
+	 * withholds progress for the first seconds of a turn, and a queued or stalled
+	 * turn might never tick at all, which left the room with no sign anything
+	 * was happening. Best-effort and never awaited by the caller.
+	 */
+	arm(origin: OriginRef): void {
+		if (origin.platform !== "slack") return;
+		this.#addressed.add(origin.conversationId);
+		void this.#render(origin, "⏳ working…");
 	}
 
 	async update(progress: ChatProgressPayload): Promise<void> {
 		if (progress.origin.platform !== "slack") return;
-		const { conversationId } = progress.origin;
-		if (!this.#addressed.has(conversationId)) return;
+		if (!this.#addressed.has(progress.origin.conversationId)) return;
+		await this.#render(progress.origin, workingStatusText(progress));
+	}
+
+	async #render(origin: OriginRef, text: string): Promise<void> {
+		const { conversationId } = origin;
 		// A wedged turn or dead gateway must not leave a status behind forever.
 		const prior = this.#staleTimers.get(conversationId);
 		if (prior) this.clearTimer(prior);
@@ -61,14 +74,12 @@ export class WorkingStatus {
 		if (existing && !existing.message) return; // a post is in flight; the next tick edits
 		const entry = existing ?? {};
 		try {
-			const text = workingStatusText(progress);
 			if (entry.message) {
 				await this.api.updateMessage(entry.message.channel, entry.message.ts, text);
 				return;
 			}
-			const thread = progress.origin.kind === "thread" ? parseSlackMessageId(conversationId) : undefined;
-			if (progress.origin.kind === "thread" && !thread)
-				throw new Error("Slack status thread has an invalid message id");
+			const thread = origin.kind === "thread" ? parseSlackMessageId(conversationId) : undefined;
+			if (origin.kind === "thread" && !thread) throw new Error("Slack status thread has an invalid message id");
 			this.#messages.set(conversationId, entry);
 			const posted = await this.api.postMessage(thread?.channel ?? conversationId, text, thread?.ts);
 			if (this.#messages.get(conversationId) === entry) {

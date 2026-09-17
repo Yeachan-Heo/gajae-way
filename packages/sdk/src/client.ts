@@ -20,6 +20,8 @@ import {
 } from "@gajaeway/protocol";
 
 type EventHandler = (payload: unknown, frame: Frame) => void;
+/** Held pre-subscription events per event name; a delivery replay is bounded by the ledger anyway. */
+const UNDELIVERED_EVENT_LIMIT = 1_000;
 
 export interface StdioTransport {
 	readable: ReadableStream<Uint8Array> | AsyncIterable<Uint8Array>;
@@ -98,6 +100,17 @@ export class GajaewayClient {
 	#decoder = new FrameDecoder();
 	#pending = new Map<string, Pending>();
 	#events = new Map<string, Set<EventHandler>>();
+	/**
+	 * Events that arrived before anyone subscribed to them. The gateway writes
+	 * `negotiated` and the pending-delivery replay back to back, and one socket
+	 * read can carry both, so replayed `chat.message` frames are dispatched
+	 * before `connectSocket` even resolves - before an adapter has had any
+	 * chance to call `onChatMessage`. Dropping them would strand those ledger
+	 * rows until the next reconnect. They are held per event and handed to the
+	 * first subscriber, bounded so a client that never subscribes cannot grow
+	 * without limit.
+	 */
+	readonly #undelivered = new Map<string, Array<{ payload: unknown; frame: Frame }>>();
 	#negotiated?: Promise<void>;
 	#requestTimeoutMs: number;
 	#id = 0;
@@ -111,6 +124,11 @@ export class GajaewayClient {
 		const handlers = this.#events.get(event) ?? new Set<EventHandler>();
 		handlers.add(handler);
 		this.#events.set(event, handlers);
+		const held = this.#undelivered.get(event);
+		if (held) {
+			this.#undelivered.delete(event);
+			for (const entry of held) handler(entry.payload, entry.frame);
+		}
 		return () => handlers.delete(handler);
 	}
 
@@ -233,7 +251,18 @@ export class GajaewayClient {
 	}
 
 	#emit(event: string, payload: unknown, frame: Frame): void {
-		for (const handler of this.#events.get(event) ?? []) handler(payload, frame);
+		const handlers = this.#events.get(event);
+		if (!handlers || handlers.size === 0) {
+			// Internal negotiation signals are awaited by a subscriber that is
+			// installed before the hello is written; only protocol events are held.
+			if (event.startsWith("__")) return;
+			const held = this.#undelivered.get(event) ?? [];
+			held.push({ payload, frame });
+			if (held.length > UNDELIVERED_EVENT_LIMIT) held.shift();
+			this.#undelivered.set(event, held);
+			return;
+		}
+		for (const handler of handlers) handler(payload, frame);
 	}
 	#fail(error: Error): void {
 		for (const pending of this.#pending.values()) {

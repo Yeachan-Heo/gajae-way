@@ -101,7 +101,7 @@ Origins are `slack/dm/D…/peer=U…` for direct messages, `slack/channel/C…` 
 
 Slack bots have no typing indicator, so an addressed turn shows one temporary `⏳ working…` message per conversation that is amended from `chat.progress` and deleted when the reply lands. Reactions are mapped by Slack emoji name (`👍` → `+1`, `🦞` → `lobster`); the whole allowlist is deliverable. Inbound text is normalised (`<@U…>` mentions, `<#C…|name>`, links, `&amp;`) before it reaches the persona, and outbound Markdown is converted to Slack mrkdwn. Files and images arrive as `[image · name · size · url]` lines; the persona needs the bot token to fetch `url_private`. There is no voice transcription or spoken reply on Slack.
 
-After every socket connect and gateway reconnect the adapter backfills missed messages from `conversations.history` for configured channels and recently seen DMs, keyed by `channel:ts`, so a restart never drops a message the gateway has not acknowledged.
+After every socket connect and gateway reconnect the adapter backfills missed messages from `conversations.history`, keyed by `channel:ts`, so the gateway's durable dedupe makes overlap with live traffic safe. Coverage is bounded on purpose: only channels listed in `adapter-slack.json` `channels`, the 100 most recently active DMs seen live within 30 days, and threads the persona replied in during the last 7 days are revisited; a channel with no watermark is backfilled 24 hours deep, and an oversized gap drains across passes in bounded slices. Channels the bot cannot read are quarantined after three consecutive failures and probed again on the next connect. A message the gateway refuses three times for its own content is dead-lettered into `adapters/slack/recovery-cursor.json` (with a per-channel digest) rather than pinning the channel; a gateway outage never discards anything.
 
 ## Reloading configuration without a restart
 
@@ -168,7 +168,7 @@ chmod 600 ~/Library/LaunchAgents/dev.gajaeway.gateway.plist
 launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/dev.gajaeway.gateway.plist
 ```
 
-Run the Discord, Telegram, and Slack binaries as separate managed services after the gateway (`gajaeway services install` writes a plist for each). The CLI is an on-demand client; it does not start the daemon.
+Run the Discord, Telegram, and Slack binaries as separate managed services after the gateway. `gajaeway services install` writes plists for the gateway, the Discord and Slack adapters, and the admin console; Telegram is run under your own service definition. The CLI is an on-demand client; it does not start the daemon.
 
 ### One gateway per home, owned by the service manager
 

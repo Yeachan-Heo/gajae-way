@@ -2,6 +2,20 @@ import type { SlackConversationLike, SlackUserLike } from "./author";
 
 export type FetchLike = (input: string | URL | Request, init?: RequestInit) => Promise<Response>;
 
+/**
+ * A response Slack sent but this client could not interpret. Deliberately NOT a
+ * SlackApiError: `deliveryFailureIsAmbiguous` treats it as an unknown outcome.
+ */
+export class SlackUnreadableResponseError extends Error {
+	constructor(
+		readonly status: number,
+		cause?: unknown,
+	) {
+		super(`Slack returned an unreadable response (HTTP ${status})`, cause === undefined ? undefined : { cause });
+		this.name = "SlackUnreadableResponseError";
+	}
+}
+
 export class SlackApiError extends Error {
 	constructor(
 		readonly status: number,
@@ -51,19 +65,23 @@ export class SlackWebApi {
 			if (!response.ok) throw new SlackApiError(response.status, `http_${response.status}`);
 			return undefined as T;
 		}
+		// Delivery ambiguity is decided by the error class: a SlackApiError is Slack
+		// saying no, everything else is "we do not know". An unreadable or truncated
+		// body is the second kind - Slack may well have accepted the write - so it
+		// must NOT become a SlackApiError, or the ledger would record a definitive
+		// non-delivery for a message the room can already see.
 		let body: unknown;
 		try {
 			body = await response.json();
-		} catch {
-			throw new SlackApiError(response.status, "invalid_response");
+		} catch (error) {
+			throw new SlackUnreadableResponseError(response.status, error);
 		}
-		if (!response.ok || (isObject(body) && body.ok === false)) {
-			throw new SlackApiError(
-				response.status,
-				isObject(body) && typeof body.error === "string" ? body.error : `http_${response.status}`,
-			);
+		if (isObject(body) && body.ok === false) {
+			throw new SlackApiError(response.status, typeof body.error === "string" ? body.error : `http_${response.status}`);
 		}
-		if (!isObject(body)) throw new SlackApiError(response.status, "invalid_response");
+		if (!response.ok) throw new SlackApiError(response.status, `http_${response.status}`);
+		// Success needs an affirmative `ok: true`; `{}` is not evidence that anything happened.
+		if (!isObject(body) || body.ok !== true) throw new SlackUnreadableResponseError(response.status);
 		return body as T;
 	}
 

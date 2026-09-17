@@ -1,4 +1,5 @@
 import { type EngagementContext, type OriginRef, REACTION_ALLOWLIST, type ReactionRef } from "@gajaeway/protocol";
+import { SlackApiError } from "./api";
 import { slackMessageId, slackMessageOrigin } from "./origin";
 
 export const SLACK_REACTION_NAMES: Readonly<Record<string, string>> = {
@@ -25,7 +26,9 @@ export function slackReactionFor(reaction: Pick<ReactionRef, "emojiName">): stri
 	const name = Object.hasOwn(SLACK_REACTION_NAMES, reaction.emojiName)
 		? SLACK_REACTION_NAMES[reaction.emojiName]
 		: undefined;
-	if (!name) throw new Error(`Slack has no reaction name for ${reaction.emojiName}`);
+	// Decided before any request: an unmapped name is a definitive non-delivery,
+	// never an ambiguous one, exactly like an emoji Slack itself would refuse.
+	if (!name) throw new SlackApiError(0, "invalid_name", `Slack has no reaction name for ${reaction.emojiName}`);
 	return name;
 }
 

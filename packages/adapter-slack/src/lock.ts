@@ -1,4 +1,5 @@
-import { mkdir, readFile, rm, writeFile } from "node:fs/promises";
+import { randomUUID } from "node:crypto";
+import { link, mkdir, readFile, rename, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 
 /** A single Slack bot token must not have two adapters replying to every event. */
@@ -42,15 +43,48 @@ export class AdapterLock {
 	static async acquire(home: string, ports: AdapterLockPorts = defaultLockPorts()): Promise<AdapterLock> {
 		const path = join(home, "adapter-slack.pid");
 		await mkdir(home, { recursive: true });
+		// Fast path: an exclusive create wins outright when no pidfile exists.
 		if (await claim(path, ports.pid)) return new AdapterLock(path, ports.pid);
 		const holder = await readHolder(path);
 		// A crash or truncated pidfile must not require manual cleanup to restart.
 		if (holder !== undefined && holder !== ports.pid && ports.alive(holder)) {
 			throw new AdapterAlreadyRunningError(holder, path);
 		}
-		await rm(path, { force: true });
-		if (await claim(path, ports.pid)) return new AdapterLock(path, ports.pid);
-		throw new AdapterAlreadyRunningError((await readHolder(path)) ?? 0, path);
+		// Reclaiming a stale pidfile must elect exactly ONE contender, and a
+		// liveness probe cannot arbitrate that: the winner's fresh claim belongs to
+		// a process still booting, which a probe may not see yet. So contenders
+		// serialise on an exclusive marker (`link` is atomic-exclusive, `rename` is
+		// not), and whoever holds it replaces the pidfile only if it still names
+		// the dead holder read above. Any other pid there is a claim made moments
+		// ago by an earlier winner and is authoritative regardless of liveness.
+		const election = `${path}.reclaim`;
+		const temporary = `${path}.${ports.pid}.${randomUUID()}.tmp`;
+		await writeFile(temporary, `${ports.pid}\n`, { flag: "wx", mode: 0o600 });
+		let elected = false;
+		try {
+			for (let attempt = 0; !elected; attempt++) {
+				try {
+					await link(temporary, election);
+					elected = true;
+				} catch (error) {
+					if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+					// Someone else is mid-reclaim. Wait for the marker to go, bounded so a
+					// marker orphaned by a crash cannot block restarts forever.
+					if (attempt >= 200) {
+						await rm(election, { force: true });
+						continue;
+					}
+					await new Promise((resolve) => setTimeout(resolve, 5));
+				}
+			}
+			const current = await readHolder(path);
+			if (current !== holder && current !== ports.pid) throw new AdapterAlreadyRunningError(current ?? 0, path);
+			await rename(temporary, path);
+			return new AdapterLock(path, ports.pid);
+		} finally {
+			if (elected) await rm(election, { force: true });
+			await rm(temporary, { force: true });
+		}
 	}
 
 	async release(): Promise<void> {

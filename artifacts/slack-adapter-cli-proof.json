@@ -1,0 +1,76 @@
+{
+  "schemaVersion": 1,
+  "kind": "black-box-cli-api-receipt",
+  "sourceHash": "sha256:a25e067e990803eb95171864c9574a6a48df0211eabba6852b4cecfd0c3c4582",
+  "probes": [
+    {
+      "id": "RT-SLACK-26",
+      "command": [
+        "dist/gajaeway-slack",
+        "--help"
+      ],
+      "cwd": ".",
+      "env": {
+        "GAJAEWAY_HOME": "/var/folders/yl/ndsjfsl95t781x9qyjrqyqc80000gn/T/slack-cli-redteam-eEsGbG",
+        "LC_ALL": "C"
+      },
+      "expectedExitCode": 0,
+      "exitCode": 0,
+      "stdout": "usage: gajaeway-slack [--help] [--version]\n\nRuns the Slack adapter in the foreground. Configuration is read from\n$GAJAEWAY_HOME/adapter-slack.json; one instance at a time per home.\n",
+      "stderr": "",
+      "verdict": "passed"
+    },
+    {
+      "id": "RT-SLACK-27",
+      "command": [
+        "dist/gajaeway-slack",
+        "--version"
+      ],
+      "cwd": ".",
+      "env": {
+        "GAJAEWAY_HOME": "/var/folders/yl/ndsjfsl95t781x9qyjrqyqc80000gn/T/slack-cli-redteam-eEsGbG",
+        "LC_ALL": "C"
+      },
+      "expectedExitCode": 0,
+      "exitCode": 0,
+      "stdout": "0.1.0\n",
+      "stderr": "",
+      "verdict": "passed"
+    },
+    {
+      "id": "RT-SLACK-28",
+      "command": [
+        "dist/gajaeway-slack",
+        "--nope"
+      ],
+      "cwd": ".",
+      "env": {
+        "GAJAEWAY_HOME": "/var/folders/yl/ndsjfsl95t781x9qyjrqyqc80000gn/T/slack-cli-redteam-eEsGbG",
+        "LC_ALL": "C"
+      },
+      "expectedExitCode": 2,
+      "exitCode": 2,
+      "stdout": "",
+      "stderr": "gajaeway-slack: unexpected argument --nope\nusage: gajaeway-slack [--help] [--version]\n\nRuns the Slack adapter in the foreground. Configuration is read from\n$GAJAEWAY_HOME/adapter-slack.json; one instance at a time per home.\n",
+      "verdict": "passed"
+    },
+    {
+      "id": "RT-SLACK-29",
+      "command": [
+        "dist/gajaeway-slack"
+      ],
+      "cwd": ".",
+      "env": {
+        "GAJAEWAY_HOME": "/var/folders/yl/ndsjfsl95t781x9qyjrqyqc80000gn/T/slack-cli-redteam-eEsGbG",
+        "LC_ALL": "C"
+      },
+      "expectedExitCode": 2,
+      "exitCode": 2,
+      "stdout": "",
+      "stderr": "Slack adapter startup failed: Another Slack adapter is already running (pid 8118, lock /var/folders/yl/ndsjfsl95t781x9qyjrqyqc80000gn/T/slack-cli-redteam-eEsGbG/adapter-slack.pid). Stop it before starting a second one.\n",
+      "pidfileUnchanged": true,
+      "liveHolderPid": 8118,
+      "verdict": "passed"
+    }
+  ]
+}
