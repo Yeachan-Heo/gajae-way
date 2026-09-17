@@ -515,6 +515,23 @@ test("the working status never claims counters the runtime did not report", () =
 	// did nothing" for minutes (live, 2026-09-03).
 	expect(workingStatusText({ elapsedMs: 280_000, toolCalls: 0, outputTokens: 0 })).toBe("⏳ working… (4m 40s)");
 	expect(workingStatusText({ elapsedMs: 16_000, toolCalls: 1, outputTokens: 0 })).toBe("⏳ working… (16s, 1 tool)");
+	// The current activity rides after the counters; model-authored text is markdown-neutralised.
+	expect(
+		workingStatusText({
+			elapsedMs: 16_000,
+			toolCalls: 1,
+			outputTokens: 0,
+			activity: { kind: "tool", label: "bash", detail: "Running *the* tests" },
+		}),
+	).toBe("⏳ working… (16s, 1 tool) · `bash` — Running \\*the\\* tests");
+	expect(
+		workingStatusText({
+			elapsedMs: 16_000,
+			toolCalls: 1,
+			outputTokens: 0,
+			activity: { kind: "writing", label: "writing" },
+		}),
+	).toBe("⏳ working… (16s, 1 tool) · writing…");
 	expect(workingStatusText({ elapsedMs: 16_000, toolCalls: 0, outputTokens: 210 })).toBe("⏳ working… (16s, 210 tok)");
 	expect(workingStatusText({ elapsedMs: 125_000, toolCalls: 3, outputTokens: 1250 })).toBe(
 		"⏳ working… (2m 05s, 3 tools, 1.3k tok)",

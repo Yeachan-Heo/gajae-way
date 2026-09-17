@@ -507,11 +507,24 @@ export class ScriptedSessionPort implements SessionPort {
 		});
 	}
 
-	emitTool(sessionId: string): void {
+	emitTool(
+		sessionId: string,
+		tool?: { readonly toolName: string; readonly intent?: string; readonly args?: unknown },
+	): void {
 		this.#emit(sessionId, {
 			kind: "event",
 			rawKind: "tool_execution_start",
-			payload: {},
+			payload: tool ? { ...tool, toolCallStarted: true } : {},
+			steerEcho: false,
+			idle: false,
+		});
+	}
+
+	emitToolEnd(sessionId: string, toolName: string): void {
+		this.#emit(sessionId, {
+			kind: "event",
+			rawKind: "tool_execution_end",
+			payload: { toolName },
 			steerEcho: false,
 			idle: false,
 		});

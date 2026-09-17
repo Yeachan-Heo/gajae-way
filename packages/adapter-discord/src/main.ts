@@ -507,12 +507,28 @@ function formatTokens(outputTokens: number): string {
  * therefore omitted rather than displayed as facts.
  */
 export function workingStatusText(
-	progress: Pick<ChatProgressPayload, "elapsedMs" | "toolCalls" | "outputTokens">,
+	progress: Pick<ChatProgressPayload, "elapsedMs" | "toolCalls" | "outputTokens" | "activity">,
 ): string {
 	const parts = [formatElapsed(progress.elapsedMs)];
 	if (progress.toolCalls > 0) parts.push(`${progress.toolCalls} tool${progress.toolCalls === 1 ? "" : "s"}`);
 	if (progress.outputTokens > 0) parts.push(formatTokens(progress.outputTokens));
-	return `⏳ working… (${parts.join(", ")})`;
+	return `⏳ working… (${parts.join(", ")})${activitySuffix(progress.activity)}`;
+}
+
+/**
+ * The "what" next to the "how long": `· bash — running the tests`. Label and
+ * detail arrive bounded and single-line from the gateway; Discord markdown is
+ * neutralised here because the text is posted verbatim.
+ */
+export function activitySuffix(activity: ChatProgressPayload["activity"]): string {
+	if (!activity) return "";
+	const label = escapeMarkdown(activity.label);
+	if (activity.kind !== "tool") return ` · ${label}…`;
+	return activity.detail ? ` · \`${label}\` — ${escapeMarkdown(activity.detail)}` : ` · \`${label}\``;
+}
+
+function escapeMarkdown(text: string): string {
+	return text.replace(/([*_~`|>\\])/g, "\\$1");
 }
 
 /**

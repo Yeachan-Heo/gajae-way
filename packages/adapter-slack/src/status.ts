@@ -19,7 +19,7 @@ type Entry = { message?: StatusMessage; text?: string; editedAt?: number };
 
 /** Show only reported activity: zero counters are noise, not proof the turn did nothing. */
 export function workingStatusText(
-	progress: Pick<ChatProgressPayload, "elapsedMs" | "toolCalls" | "outputTokens">,
+	progress: Pick<ChatProgressPayload, "elapsedMs" | "toolCalls" | "outputTokens" | "activity">,
 ): string {
 	const total = Math.floor(progress.elapsedMs / 1000);
 	const minutes = Math.floor(total / 60);
@@ -33,7 +33,23 @@ export function workingStatusText(
 				? `${(progress.outputTokens / 1000).toFixed(1)}k tok`
 				: `${progress.outputTokens} tok`,
 		);
-	return `⏳ working… (${parts.join(", ")})`;
+	return `⏳ working… (${parts.join(", ")})${activitySuffix(progress.activity)}`;
+}
+
+/**
+ * The "what" next to the "how long": `· bash — running the tests`. The label
+ * and detail arrive bounded and single-line from the gateway; mrkdwn control
+ * characters are escaped here because this text is posted as-is.
+ */
+export function activitySuffix(activity: ChatProgressPayload["activity"]): string {
+	if (!activity) return "";
+	const label = escapeMrkdwn(activity.label);
+	if (activity.kind !== "tool") return ` · ${label}…`;
+	return activity.detail ? ` · \`${label}\` — ${escapeMrkdwn(activity.detail)}` : ` · \`${label}\``;
+}
+
+function escapeMrkdwn(text: string): string {
+	return text.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/`/g, "'");
 }
 
 /** One temporary, amended Slack message per addressed conversation; never compete with delivery. */

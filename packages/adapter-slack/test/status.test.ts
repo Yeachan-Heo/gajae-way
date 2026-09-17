@@ -1,7 +1,13 @@
 import { expect, test } from "bun:test";
 import type { ChatMessagePayload, ChatProgressPayload, OriginRef } from "@gajaeway/protocol";
 import { type GatewayClientLike, ReconnectingGateway, settleSlackDelivery, subscribeSlackProgress } from "../src/main";
-import { WORKING_STATUS_MIN_EDIT_MS, WORKING_STATUS_STALE_MS, WorkingStatus, workingStatusText } from "../src/status";
+import {
+	activitySuffix,
+	WORKING_STATUS_MIN_EDIT_MS,
+	WORKING_STATUS_STALE_MS,
+	WorkingStatus,
+	workingStatusText,
+} from "../src/status";
 
 const origin: OriginRef = { platform: "slack", kind: "channel", conversationId: "C1" };
 const progress = (extra: Partial<ChatProgressPayload> = {}): ChatProgressPayload => ({
@@ -332,4 +338,21 @@ test("Slack inbound arms only engaged addressed turns; edits and adopted progres
 			await f.status.clear("C1");
 		}
 	}
+});
+
+test("Slack working status renders the current activity after the counters", () => {
+	expect(workingStatusText(progress({ activity: { kind: "tool", label: "bash", detail: "Running the tests" } }))).toBe(
+		"⏳ working… (2m, 3 tools, 1.2k tok) · `bash` — Running the tests",
+	);
+	expect(workingStatusText(progress({ activity: { kind: "tool", label: "read" } }))).toBe(
+		"⏳ working… (2m, 3 tools, 1.2k tok) · `read`",
+	);
+	expect(workingStatusText(progress({ activity: { kind: "thinking", label: "thinking" } }))).toBe(
+		"⏳ working… (2m, 3 tools, 1.2k tok) · thinking…",
+	);
+	// Model-authored text is escaped for mrkdwn and cannot break out of the code span.
+	expect(activitySuffix({ kind: "tool", label: "we`ird", detail: "<@U1> & <!channel>" })).toBe(
+		" · `we'ird` — &lt;@U1&gt; &amp; &lt;!channel&gt;",
+	);
+	expect(activitySuffix(undefined)).toBe("");
 });

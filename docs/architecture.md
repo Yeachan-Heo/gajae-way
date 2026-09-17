@@ -9,7 +9,7 @@ The Bun workspace is divided into small packages:
 | `@gajaeway/protocol` | Versioned NDJSON frames, negotiation, verb/event catalogues, and canonical origins. |
 | `@gajaeway/sdk` | Client for the gateway’s Unix-domain socket or stdio transport. |
 | `@gajaeway/gateway` | Daemon: configuration, SQLite state, sessions, delivery, memory, monitors, and the `gjc` boundary. |
-| `@gajaeway/adapter-discord` | Discord ingress and outbound delivery, including typing hints. |
+| `@gajaeway/adapter-discord` | Discord ingress and outbound delivery, including typing hints and the activity-aware working status. |
 | `@gajaeway/adapter-telegram` | Telegram ingress and outbound delivery. |
 | `@gajaeway/adapter-slack` | Slack ingress over Socket Mode, mrkdwn delivery, reactions, working-status presence, and missed-message recovery. |
 | `@gajaeway/cli` | Owner commands over the gateway socket. |
