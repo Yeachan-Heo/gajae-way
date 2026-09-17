@@ -79,6 +79,25 @@ test("chat.progress is silent until a tail observation supplies its counters", a
 				),
 			"tail activity did not feed chat.progress",
 		);
+		// A tool starting is announced promptly with what it is, so a reader can
+		// tell "alive and running the tests" from "alive".
+		port.emitTool(send.sessionId, { toolName: "bash", intent: "Running the tests" });
+		await eventually(
+			() =>
+				frames.some(
+					(frame) =>
+						frame.event === "chat.progress" &&
+						frame.payload.activity?.kind === "tool" &&
+						frame.payload.activity?.label === "bash" &&
+						frame.payload.activity?.detail === "Running the tests",
+				),
+			"tool start did not surface as progress activity",
+		);
+		port.emitToolEnd(send.sessionId, "bash");
+		await eventually(
+			() => frames.some((frame) => frame.event === "chat.progress" && frame.payload.activity?.kind === "thinking"),
+			"tool end did not surface as thinking",
+		);
 		port.complete(send.opRef, "done");
 	} finally {
 		socket?.end();

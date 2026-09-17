@@ -4,6 +4,7 @@ import { join } from "node:path";
 import {
 	CAPABILITIES,
 	type ChatMessagePayload,
+	type ChatProgressActivity,
 	containsSilenceToken,
 	describeChatPlatforms,
 	encodeFrame,
@@ -64,6 +65,7 @@ import { buildSessionBootstrap } from "../persona/bootstrap";
 import { PersonaLoader } from "../persona/persona";
 import type { GatewayDatabase, InboundMessageRow, MonitorEventStage } from "../store/db";
 import { DeliveryLedger } from "../store/ledger";
+import { deriveActivity } from "./activity";
 import { ATTACHMENT_SCOPE_NOTICE, redactHistoricalAttachments } from "./attachment-scope";
 import { OrderedFrameWriter } from "./frame-writer";
 import { InterimSpeechGate, type InterimSpeechLimits } from "./interim-speech";
@@ -1640,13 +1642,20 @@ async function createInboundTurnLifecycle(
 	const intervalMs = options.progress?.intervalMs ?? 10_000;
 	let lastProgressAt = 0;
 	let lastKnown = { toolCalls: 0, outputTokens: 0 };
+	let activity: ChatProgressActivity | undefined;
 	/** Heartbeats present the most recent tail observation; they never invent progress. */
 	let tailActivitySeen = false;
 	let ended = false;
-	const emitProgress = (progress: { toolCalls: number; outputTokens: number }, final = false) => {
+	const emitProgress = (progress: { toolCalls: number; outputTokens: number }, final = false, prompt = false) => {
 		lastKnown = progress;
 		const now = Date.now();
-		if (!final && (!tailActivitySeen || now - startedAt < firstAfterMs || now - lastProgressAt < intervalMs)) return;
+		// A change of activity (the first tool starting, a new tool) is worth
+		// announcing as soon as the turn is old enough to show a hint at all -
+		// that is the "what is it doing" signal - but never more often than half
+		// the interval, so a tool-per-second turn cannot become a request storm.
+		const minGap = prompt ? intervalMs / 2 : intervalMs;
+		const due = now - startedAt >= firstAfterMs && now - lastProgressAt >= minGap;
+		if (!final && (!tailActivitySeen || !due)) return;
 		// `final` is UNCONDITIONAL. It is the adapter's only signal that the turn
 		// stopped (typing hint, "working" status), and a turn that answered fast,
 		// stayed silent, or failed before its first tail frame never announced
@@ -1659,6 +1668,7 @@ async function createInboundTurnLifecycle(
 			elapsedMs: now - startedAt,
 			toolCalls: progress.toolCalls,
 			outputTokens: progress.outputTokens,
+			...(activity ? { activity } : {}),
 			...(final ? { final: true } : {}),
 		};
 		for (const recipient of runtime.connections)
@@ -1695,6 +1705,14 @@ async function createInboundTurnLifecycle(
 				console.error(`gateway intermediate delivery failed (${turnId}): ${diagnostic(error)}`);
 			}
 		}
+		const previousActivity = activity;
+		activity = deriveActivity(frame, activity);
+		const activityChanged =
+			activity !== undefined &&
+			(previousActivity === undefined ||
+				previousActivity.kind !== activity.kind ||
+				previousActivity.label !== activity.label ||
+				previousActivity.detail !== activity.detail);
 		const reportedTools = frame.payload.toolCalls;
 		const reportedTokens = frame.payload.outputTokens;
 		lastKnown = {
@@ -1709,7 +1727,7 @@ async function createInboundTurnLifecycle(
 					? Math.max(lastKnown.outputTokens, reportedTokens)
 					: lastKnown.outputTokens,
 		};
-		emitProgress(lastKnown);
+		emitProgress(lastKnown, false, activityChanged);
 		return assistantDeliveryStarted;
 	};
 

@@ -138,6 +138,19 @@ export interface ChatEditResult {
 	readonly engaged: boolean;
 }
 
+/**
+ * What a working turn is doing right now, for the presence hint. `tool` names
+ * the tool being run (with the model's stated intent or a short argument
+ * summary as `detail`); `thinking` is the model reading a tool result;
+ * `writing` is assistant text being produced. Labels are bounded, single-line
+ * and control-character free: they are rendered verbatim into chat.
+ */
+export interface ChatProgressActivity {
+	readonly kind: "tool" | "thinking" | "writing";
+	readonly label: string;
+	readonly detail?: string;
+}
+
 /** Periodic liveness for a long-running turn: the persona is working, not gone. */
 export interface ChatProgressPayload {
 	readonly turnId: string;
@@ -148,6 +161,8 @@ export interface ChatProgressPayload {
 	readonly toolCalls: number;
 	/** Output tokens produced so far (exact per completed message, estimated between). */
 	readonly outputTokens: number;
+	/** The current activity, when the tail has reported one. Absent before the first tool/text frame. */
+	readonly activity?: ChatProgressActivity;
 	/**
 	 * True on the last progress event of a turn, including a turn that ends with a
 	 * silence token and therefore delivers nothing.
