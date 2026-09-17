@@ -300,6 +300,10 @@ function statusRow(
 	const contextLabel = !context
 		? "conversation diff not reported"
 		: `${formatCount(context.unread)} unread · ${formatCount(context.expired)} expired · ${formatCount(context.truncated)} truncated`;
+	const engagement = status?.engagement;
+	const engagementLabel = !engagement
+		? "bot audience counter not reported"
+		: `${formatCount(engagement.botAudienceDeclines)} addressed bot declines`;
 
 	return {
 		key: "status",
@@ -316,6 +320,7 @@ function statusRow(
 			attention: attention.length === 0 ? "nothing needs you" : `⚠ ${pluralise(attention.length, "item")} needs you`,
 			delivery: deliveryLabel,
 			context: contextLabel,
+			botAudience: engagementLabel,
 			profile: status ? `profile ${status.profileVersion}` : (statusError ?? "no answer from the socket"),
 			stream: `data ${formatClockSeconds(now)}`,
 		},
@@ -324,6 +329,7 @@ function statusRow(
 			attention: attention.length === 0 ? "muted" : danger ? "danger" : "warn",
 			delivery: !delivery ? "muted" : delivery.pending === 0 ? "ok" : "warn",
 			context: !context ? "muted" : context.unread > 0 || context.expired > 0 || context.truncated > 0 ? "warn" : "ok",
+			botAudience: !engagement ? "muted" : engagement.botAudienceDeclines === 0 ? "ok" : "warn",
 			working: working === 0 ? "muted" : "active",
 		},
 	};

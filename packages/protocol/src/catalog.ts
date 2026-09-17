@@ -22,6 +22,8 @@ export interface GatewayStatusResult {
 	readonly delivery?: { readonly pending: number; readonly oldestPendingAgeMs: number | null };
 	/** Aggregate-only conversation diff health; never includes message bodies. */
 	readonly contextDiff?: ConversationContextDiagnostics;
+	/** Operator counter for addressed bot messages declined by the audience cap. */
+	readonly engagement?: { readonly botAudienceDeclines: number };
 }
 
 export interface ConversationContextDiagnostics {

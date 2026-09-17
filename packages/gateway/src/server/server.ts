@@ -199,7 +199,7 @@ interface Runtime {
 	readonly stopBrokerGenerationListener?: () => void;
 	/** Per-turn / per-message reaction caps shared by chat.react and the reply-token path. */
 	readonly reactions: ReactionBudget;
-	/** Fixed one-turn budget for bot authors admitted by an open audience. */
+	/** Cooldown-spaced admission budget for bot authors admitted by an open audience. */
 	readonly botAudienceTurns: BotAudienceTurnGuard;
 	/** Accepted-but-not-yet-dispatched inbound messages, keyed by message id. */
 	readonly inbound: Map<string, InboundContext>;
@@ -555,7 +555,7 @@ function createRuntime(options: GatewayServerOptions): Runtime {
 		contextMaintenanceTimer,
 		...(stopBrokerGenerationListener ? { stopBrokerGenerationListener } : {}),
 		reactions: new ReactionBudget(),
-		botAudienceTurns: new BotAudienceTurnGuard(),
+		botAudienceTurns: new BotAudienceTurnGuard(options.database),
 		cycle: new RuntimeCycleProjector(options.database, memory, { maxLanes: lanes.maxLanes }),
 		lanes,
 		work,
@@ -652,6 +652,7 @@ async function handleRequest(
 					sessions: { active: options.database.activeSessionCount },
 					delivery: runtime.delivery.status(),
 					contextDiff: options.database.contextDiagnostics(),
+					engagement: { botAudienceDeclines: runtime.botAudienceTurns.botAudienceDeclines() },
 				},
 			});
 			return;
@@ -1247,23 +1248,26 @@ async function sendChat(
 			typeof params.engagement.authorId !== "string")
 	)
 		throw new ProtocolError("invalid_params", "non-loopback chat.send requires engagement");
-	const engagementDecision = decideEngagement(
-		origin,
-		params.engagement as never,
-		runtime.config,
-		threadFollowUpEngaged(origin, key, options.database),
-	);
+	const threadFollowUp = origin.kind === "thread" && threadFollowUpEngaged(origin, key, options.database);
+	const engagementDecision = decideEngagement(origin, params.engagement as never, runtime.config, threadFollowUp);
 	const authorIsBot = (params.engagement as { authorIsBot?: unknown } | undefined)?.authorIsBot === true;
 	if (!authorIsBot) runtime.botAudienceTurns.recordHumanMessage(key);
-	const engaged =
-		engagementDecision.engaged && (!engagementDecision.botAudienceAdmission || runtime.botAudienceTurns.canAdmit(key));
 	const inboundMessageId = typeof params.messageId === "string" && params.messageId ? params.messageId : undefined;
+	const engagement = params.engagement as { mentioned?: boolean; authorId?: string; authorName?: unknown } | undefined;
+	const botAudienceGuardSpent = engagementDecision.botAudienceAdmission && !runtime.botAudienceTurns.canAdmit(key);
+	const addressedBotAudienceDecline = botAudienceGuardSpent && (engagement?.mentioned === true || threadFollowUp);
+	if (addressedBotAudienceDecline) {
+		runtime.botAudienceTurns.recordBotAudienceDecline();
+		console.error(
+			`gateway bot audience admission declined origin=${key} message=${inboundMessageId ?? "unidentified"} reason=cooldown_active declines=${runtime.botAudienceTurns.botAudienceDeclines()}`,
+		);
+	}
+	const engaged = engagementDecision.engaged && !botAudienceGuardSpent;
 	const receivedAt = parseReceivedAt(params.receivedAt);
 	// Declined messages are still context, never commands (protocol contract): every
 	// platform message lands in the conversation-context ledger so the next engaged
 	// turn reads the full unread diff since the persona's last reply.
 	if (nonLoopback && inboundMessageId) {
-		const engagement = params.engagement as { authorId?: string; authorName?: unknown } | undefined;
 		options.database.contextRecord({
 			messageId: inboundMessageId,
 			originKey: key,
@@ -1389,18 +1393,19 @@ async function editChat(
 	}
 	// The recorded body now says what the message says now.
 	options.database.contextUpdateBody(key, params.messageId, params.text);
-	const engagementDecision = decideEngagement(
-		origin,
-		params.engagement as never,
-		runtime.config,
-		threadFollowUpEngaged(origin, key, options.database),
-	);
+	const threadFollowUp = origin.kind === "thread" && threadFollowUpEngaged(origin, key, options.database);
+	const engagementDecision = decideEngagement(origin, params.engagement as never, runtime.config, threadFollowUp);
 	const authorIsBot = (params.engagement as { authorIsBot?: unknown } | undefined)?.authorIsBot === true;
 	if (!authorIsBot) runtime.botAudienceTurns.recordHumanMessage(key);
-	if (
-		!engagementDecision.engaged ||
-		(engagementDecision.botAudienceAdmission && !runtime.botAudienceTurns.canAdmit(key))
-	) {
+	const engagement = params.engagement as { mentioned?: boolean } | undefined;
+	const botAudienceGuardSpent = engagementDecision.botAudienceAdmission && !runtime.botAudienceTurns.canAdmit(key);
+	if (botAudienceGuardSpent && (engagement?.mentioned === true || threadFollowUp)) {
+		runtime.botAudienceTurns.recordBotAudienceDecline();
+		console.error(
+			`gateway bot audience admission declined origin=${key} message=${params.messageId} reason=cooldown_active declines=${runtime.botAudienceTurns.botAudienceDeclines()}`,
+		);
+	}
+	if (!engagementDecision.engaged || botAudienceGuardSpent) {
 		declined();
 		return;
 	}
@@ -1446,6 +1451,7 @@ async function createInboundTurnLifecycle(
 				mentioned?: boolean;
 				group?: boolean;
 				authorId?: string;
+				authorIsBot?: boolean;
 				authorName?: string;
 				authorHandle?: string;
 				authorServerTag?: string;
@@ -1847,6 +1853,13 @@ async function createInboundTurnLifecycle(
 			endProgress();
 		}
 	};
+	const onSettled = ({ terminalDeliveryId }: { terminalDeliveryId: string | null }) => {
+		if (engagement?.authorIsBot !== true || terminalDeliveryId !== null) return;
+		// A delivered `[turn failed]` notice is a diagnostic, not an answer: the
+		// failure path deliberately never claims the terminal reply slot, so this
+		// refund is based on durable slot state rather than delivery text.
+		runtime.botAudienceTurns.releaseBotAdmission(key);
+	};
 
 	return {
 		text: turnText,
@@ -1859,6 +1872,7 @@ async function createInboundTurnLifecycle(
 		onFrame,
 		onTerminal,
 		onFailure,
+		onSettled,
 		// Neither path ever reaches onTerminal/onFailure for THIS lifecycle: a
 		// `/new` retire fences the answer, a release re-dispatches the trigger
 		// under a new lifecycle. Without the final tick the 10s heartbeat kept

@@ -2,7 +2,7 @@ import { describe, expect, test } from "bun:test";
 import type { EngagementContext } from "@gajaeway/protocol";
 import type { GatewayConfig } from "../src/config";
 import { ENGAGEMENT_GATES, CONFIG_SCHEMA_VERSION as SCHEMA } from "../src/config";
-import { BotAudienceTurnGuard, decideEngagement } from "../src/engagement/policy";
+import { BOT_AUDIENCE_TURN_COOLDOWN_MS, BotAudienceTurnGuard, decideEngagement } from "../src/engagement/policy";
 
 const OWNER = "660473980301344768";
 const STRANGER = "999999999999999999";
@@ -126,10 +126,12 @@ test("a Discord thread inherits its parent channel policy unless explicitly over
 	expect(decideEngagement(thread, ctx({ authorIsBot: true }), overridden).engaged).toBe(false);
 });
 
-test("bot audience turns are capped until a human message resets the conversation", () => {
-	const guard = new BotAudienceTurnGuard();
+test("bot audience turns are spaced by a cooldown a human message can cut short", () => {
+	let now = 1_000_000;
+	const guard = new BotAudienceTurnGuard(undefined, () => now);
 	expect(guard.canAdmit("discord:channel:c1")).toBe(true);
 	guard.recordBotAdmission("discord:channel:c1");
+	now += BOT_AUDIENCE_TURN_COOLDOWN_MS - 1;
 	expect(guard.canAdmit("discord:channel:c1")).toBe(false);
 	guard.recordHumanMessage("discord:channel:c1");
 	expect(guard.canAdmit("discord:channel:c1")).toBe(true);
