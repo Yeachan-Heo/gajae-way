@@ -67,6 +67,15 @@ export class SlackDirectory {
 		this.set(`user:${user.id}`, { value: user, expires: Number.POSITIVE_INFINITY });
 	}
 
+	/** Every user currently cached (positive entries only), for reverse name lookup. */
+	*knownUsers(): Iterable<SlackUserLike> {
+		const now = this.now();
+		for (const [key, entry] of this.entries) {
+			if (!key.startsWith("user:") || entry.value === undefined || entry.expires <= now) continue;
+			yield entry.value as SlackUserLike;
+		}
+	}
+
 	private get(key: string): Entry | undefined {
 		const entry = this.entries.get(key);
 		if (!entry) return undefined;

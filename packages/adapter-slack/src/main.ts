@@ -13,6 +13,7 @@ import { describeInboundBody, type SlackFileCarrier } from "./attachments";
 import { SlackDirectory } from "./author";
 import { adapterHome, type LoadedSlackAdapterConfig, loadSlackAdapterConfig } from "./config";
 import { AdapterAlreadyRunningError, AdapterLock } from "./lock";
+import { type MentionDirectory, repairMentions } from "./mentions";
 import { chunkSlackMessage, markdownToMrkdwn } from "./mrkdwn";
 import {
 	isSlackDmChannel,
@@ -282,6 +283,7 @@ export async function settleSlackDelivery(
 	message: ChatMessagePayload,
 	_log: Pick<Console, "error"> = console,
 	status?: Pick<WorkingStatus, "clear">,
+	mentions?: MentionDirectory,
 ): Promise<void> {
 	if (message.origin.platform !== "slack" || !message.deliveryId) return;
 	if (message.reaction) {
@@ -297,9 +299,11 @@ export async function settleSlackDelivery(
 		const channel = deliveryChannel(message.origin);
 		// Routing is decided before any write, so a bad target never half-posts.
 		const threadTs = replyThreadTs(message);
-		const text = markdownToMrkdwn(
-			message.duplicateWarning ? `[recovered - may be a duplicate] ${message.text}` : message.text,
-		);
+		// Mentions are repaired before Markdown \u2192 mrkdwn: a `<@U\u2026>` the model wrapped
+		// in backticks, a bare `@U\u2026`, or an `@handle` the directory knows, all become
+		// a real ping instead of literal text. Unknown or ambiguous names are left alone.
+		const repaired = mentions ? repairMentions(message.text, mentions) : message.text;
+		const text = markdownToMrkdwn(message.duplicateWarning ? `[recovered - may be a duplicate] ${repaired}` : repaired);
 		// Every chunk must stay in the same Slack thread, not just the first chunk.
 		for (const chunk of chunkSlackMessage(text)) await api.postMessage(channel, chunk, threadTs);
 		// voiceText is intentionally ignored: Slack has no bot voice messages.
@@ -344,9 +348,10 @@ export function subscribeSlackDeliveries(
 	api: Pick<SlackWebApi, "postMessage" | "addReaction">,
 	log: Pick<Console, "error"> = console,
 	status?: Pick<WorkingStatus, "clear">,
+	mentions?: MentionDirectory,
 ): () => void {
 	return gateway.onChatMessage((message) => {
-		void settleSlackDelivery(gateway, api, message, log, status).catch((error) =>
+		void settleSlackDelivery(gateway, api, message, log, status, mentions).catch((error) =>
 			log.error(`Slack delivery settlement request failed: ${errorText(error)}`),
 		);
 	});
@@ -406,6 +411,7 @@ export class ReconnectingGateway implements GatewayClientLike {
 		readonly api: Pick<SlackWebApi, "postMessage" | "addReaction">,
 		initialClient?: GatewayClientLike,
 		readonly status?: WorkingStatus,
+		readonly mentions?: MentionDirectory,
 	) {
 		if (initialClient) this.adoptClient(initialClient);
 	}
@@ -423,7 +429,7 @@ export class ReconnectingGateway implements GatewayClientLike {
 		this.#client = client;
 		this.#attempt = 0;
 		this.#deliveryOff?.();
-		const off = subscribeSlackDeliveries(client, this.api, console, this.status);
+		const off = subscribeSlackDeliveries(client, this.api, console, this.status, this.mentions);
 		const progressOff = this.status ? subscribeSlackProgress(client, this.status) : undefined;
 		const handlersOff = client.onChatMessage((message) => {
 			for (const handler of this.#handlers) handler(message);
@@ -704,6 +710,7 @@ export async function startSlackAdapter(
 		api,
 		undefined,
 		status,
+		directory,
 	);
 	const ingress = new OrderedIngress();
 	const now = ports.now ?? Date.now;
