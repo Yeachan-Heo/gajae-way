@@ -1,5 +1,5 @@
 import { afterEach, expect, spyOn, test } from "bun:test";
-import { link, mkdir, mkdtemp, readFile, rm, stat, utimes, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readdir, readFile, rm, stat, utimes, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { type ChatMessagePayload, isPlatformMessageId } from "@gajaeway/protocol";
@@ -113,8 +113,6 @@ class Api extends SlackWebApi {
 	override async respond(_url: string, payload: Record<string, unknown>) {
 		this.responses.push(payload);
 	}
-	override async updateMessage() {}
-	override async deleteMessage() {}
 	override async postMessage(channel: string, text: string, threadTs?: string) {
 		const args: [string, string, string?] = [channel, text, threadTs];
 		this.posts.push(args);
@@ -839,12 +837,18 @@ test("RT-SLACK-42 orphaned reclaim marker permits acquisition within two seconds
 	cleanups.push(() => rm(home, { recursive: true, force: true }));
 	const path = join(home, "adapter-slack.pid");
 	await writeFile(path, "99999\n");
-	await writeFile(`${path}.reclaim`, "99998\n");
+	// An election directory left by a crashed reclaimer, old enough to be judged abandoned.
+	await mkdir(`${path}.reclaim.d`);
+	await writeFile(`${path}.reclaim.d/owner`, "99998\n");
+	const aged = new Date(Date.now() - 2000);
+	await utimes(`${path}.reclaim.d`, aged, aged);
 	const started = performance.now();
 	const lock = await AdapterLock.acquire(home, { pid: 42, alive: () => false });
 	expect(performance.now() - started).toBeLessThan(2000);
 	expect(await readFile(path, "utf8")).toBe("42\n");
-	await expect(readFile(`${path}.reclaim`)).rejects.toMatchObject({ code: "ENOENT" });
+	await expect(stat(`${path}.reclaim.d`)).rejects.toMatchObject({ code: "ENOENT" });
+	// No tombstones are left behind either.
+	expect((await readdir(home)).filter((entry) => entry.endsWith(".dead"))).toEqual([]);
 	await lock.release();
 });
 
@@ -853,7 +857,8 @@ test("RT-SLACK-43 live holder arriving during election is never replaced by wait
 	cleanups.push(() => rm(home, { recursive: true, force: true }));
 	const path = join(home, "adapter-slack.pid");
 	await writeFile(path, "99999\n");
-	await writeFile(`${path}.reclaim`, "99998\n");
+	await mkdir(`${path}.reclaim.d`);
+	await writeFile(`${path}.reclaim.d/owner`, "99998\n");
 	let probes = 0;
 	const pending = Promise.allSettled(
 		Array.from({ length: 20 }, (_, i) =>
@@ -910,10 +915,10 @@ for (const live of [true, false]) {
 		const home = await mkdtemp(join(tmpdir(), "slack-marker-g4-"));
 		cleanups.push(() => rm(home, { recursive: true, force: true }));
 		const path = join(home, "adapter-slack.pid");
-		const marker = `${path}.reclaim`;
+		const marker = `${path}.reclaim.d`;
 		await writeFile(path, "99999\n");
-		await writeFile(`${path}.owner`, "88888\n");
-		await link(`${path}.owner`, marker);
+		await mkdir(marker);
+		await writeFile(join(marker, "owner"), "88888\n");
 		const aged = new Date(Date.now() - (live ? 900 : 2000));
 		await utimes(marker, aged, aged);
 		const inode = (await stat(marker)).ino;
@@ -929,7 +934,7 @@ for (const live of [true, false]) {
 		const results = await pending;
 		if (live) {
 			expect((await stat(marker)).ino).toBe(inode);
-			expect(await readFile(marker, "utf8")).toBe("88888\n");
+			expect(await readFile(join(marker, "owner"), "utf8")).toBe("88888\n");
 			for (const result of results) {
 				expect(result.status).toBe("rejected");
 				if (result.status === "rejected") {

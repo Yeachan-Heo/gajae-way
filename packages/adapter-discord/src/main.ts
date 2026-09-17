@@ -492,10 +492,12 @@ type PresenceEntry = {
 	readonly conversationId: string;
 	readonly messageId: string;
 	message?: PresenceMessageLike;
+	/** Coalescing state: what the gradient should show. */
 	state: PresenceState;
-	/** Unicode markers we believe are on the message right now. */
+	/** Unicode markers the API confirmed are on the message. */
 	readonly shown: Set<string>;
-	busy: boolean;
+	wanted: boolean;
+	reconciling: boolean;
 };
 
 /**
@@ -508,6 +510,11 @@ type PresenceEntry = {
  * and at most once per coalescing window, and every marker is removed when
  * the reply lands (or the turn goes stale). Nothing is posted or edited. The
  * typing indicator still runs alongside: it is free and Discord-native.
+ *
+ * Desired state (`state`/`wanted`) and applied state (`shown`) are kept apart
+ * and reconciled by one loop per message, so a slow Discord call can delay a
+ * swap but never lose it, and a failed call leaves the marker un-shown to be
+ * retried rather than believed.
  */
 export class WorkingStatus {
 	readonly #discord: DiscordClientLike;
@@ -536,17 +543,27 @@ export class WorkingStatus {
 	 */
 	arm(conversationId: string, messageId: string): void {
 		const prior = this.#entries.get(conversationId);
-		if (prior && prior.messageId !== messageId) void this.clear(conversationId);
+		if (prior && prior.messageId === messageId) {
+			// Same message re-armed (an accepted edit): the markers on it are still
+			// ours; restart the gradient from queued without losing ownership.
+			prior.wanted = true;
+			prior.state = presenceInitial(this.#now());
+			this.#armStale(conversationId);
+			void this.#reconcile(prior);
+			return;
+		}
+		if (prior) void this.#retire(prior);
 		const entry: PresenceEntry = {
 			conversationId,
 			messageId,
 			state: presenceInitial(this.#now()),
 			shown: new Set(),
-			busy: false,
+			wanted: true,
+			reconciling: false,
 		};
 		this.#entries.set(conversationId, entry);
 		this.#armStale(conversationId);
-		void this.#apply(entry, [], presenceMarkersFor(entry.state.snapshot));
+		void this.#reconcile(entry);
 	}
 
 	#armStale(conversationId: string): void {
@@ -563,12 +580,12 @@ export class WorkingStatus {
 	async update(progress: ChatProgressPayload): Promise<void> {
 		if (progress.origin.platform !== "discord") return;
 		const entry = this.#entries.get(progress.origin.conversationId);
-		if (!entry) return;
+		if (!entry || !entry.wanted) return;
 		this.#armStale(progress.origin.conversationId);
 		const swap = presenceTransition(entry.state, progress, this.#now());
 		if (!swap) return;
 		entry.state = swap.state;
-		await this.#apply(entry, swap.remove, swap.add);
+		await this.#reconcile(entry);
 	}
 
 	async clear(conversationId: string): Promise<void> {
@@ -578,7 +595,12 @@ export class WorkingStatus {
 		const entry = this.#entries.get(conversationId);
 		if (!entry) return;
 		this.#entries.delete(conversationId);
-		await this.#removeAll(entry);
+		await this.#retire(entry);
+	}
+
+	async #retire(entry: PresenceEntry): Promise<void> {
+		entry.wanted = false;
+		await this.#reconcile(entry);
 	}
 
 	async #resolve(entry: PresenceEntry): Promise<PresenceMessageLike | undefined> {
@@ -592,45 +614,58 @@ export class WorkingStatus {
 		return fetched;
 	}
 
-	async #remove(entry: PresenceEntry, unicode: string): Promise<void> {
-		const message = entry.message;
-		const botUser = this.#getBotUser() as { id?: unknown } | undefined;
-		const botId = typeof botUser?.id === "string" ? botUser.id : undefined;
-		if (!message?.reactions || !botId) return;
-		await message.reactions.resolve(unicode)?.users.remove(botId);
-		entry.shown.delete(unicode);
-	}
-
-	async #removeAll(entry: PresenceEntry): Promise<void> {
-		for (const unicode of [...entry.shown]) await this.#remove(entry, unicode).catch(() => {});
-		entry.shown.clear();
-	}
-
-	async #apply(entry: PresenceEntry, remove: readonly PresenceMarker[], add: readonly PresenceMarker[]): Promise<void> {
-		if (entry.busy) return;
-		entry.busy = true;
+	/** Drives `shown` towards the desired set; one loop per entry, re-diffing after every pass. */
+	async #reconcile(entry: PresenceEntry): Promise<void> {
+		if (entry.reconciling) return;
+		entry.reconciling = true;
 		try {
-			const message = await this.#resolve(entry);
-			if (!message) return;
-			for (const marker of remove) {
-				if (this.#entries.get(entry.conversationId) !== entry) return;
-				await this.#remove(entry, marker.unicode);
+			const botUser = this.#getBotUser() as { id?: unknown } | undefined;
+			const botId = typeof botUser?.id === "string" ? botUser.id : undefined;
+			for (let pass = 0; pass < 8; pass++) {
+				const desired = new Set(entry.wanted ? presenceMarkersFor(entry.state.snapshot).map((m) => m.unicode) : []);
+				const remove = [...entry.shown].filter((unicode) => !desired.has(unicode));
+				const add = [...desired].filter((unicode) => !entry.shown.has(unicode));
+				if (remove.length === 0 && add.length === 0) return;
+				let message: PresenceMessageLike | undefined;
+				try {
+					message = await this.#resolve(entry);
+				} catch (error) {
+					this.#log.error(`Discord presence could not resolve ${entry.conversationId}: ${errorMessage(error)}`);
+					return;
+				}
+				if (!message) return;
+				for (const unicode of remove) {
+					try {
+						if (message.reactions && botId) await message.reactions.resolve(unicode)?.users.remove(botId);
+						entry.shown.delete(unicode);
+					} catch (error) {
+						this.#log.error(
+							`Discord presence could not remove ${unicode} on ${entry.conversationId}: ${errorMessage(error)}`,
+						);
+						entry.shown.delete(unicode);
+					}
+				}
+				for (const unicode of add) {
+					if (!entry.wanted) break;
+					try {
+						await message.react(unicode);
+						entry.shown.add(unicode);
+					} catch (error) {
+						this.#log.error(
+							`Discord presence could not add ${unicode} on ${entry.conversationId}: ${errorMessage(error)}`,
+						);
+						return;
+					}
+				}
 			}
-			for (const marker of add) {
-				if (this.#entries.get(entry.conversationId) !== entry) return;
-				await message.react(marker.unicode);
-				entry.shown.add(marker.unicode);
-			}
-		} catch (error) {
-			this.#log.error(
-				`Discord presence failed for ${entry.conversationId}: ${error instanceof Error ? error.message : String(error)}`,
-			);
 		} finally {
-			entry.busy = false;
-			// Cleared while a swap was in flight: whatever landed must come off.
-			if (this.#entries.get(entry.conversationId) !== entry && entry.shown.size > 0) await this.#removeAll(entry);
+			entry.reconciling = false;
 		}
 	}
+}
+
+function errorMessage(error: unknown): string {
+	return error instanceof Error ? error.message : String(error);
 }
 
 /** True for a unicode reaction the adapter itself puts on messages as presence. */

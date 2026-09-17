@@ -131,9 +131,22 @@ export class OutboundLimiter {
 			}
 		} finally {
 			lane.draining = false;
-			// Idle lanes are forgotten once their last slot has elapsed, so the map is bounded by activity.
-			if (lane.deliveries.length === 0 && lane.cosmetics.length === 0 && this.#channels.get(channel) === lane) {
-				if (lane.nextAt <= this.now()) this.#channels.delete(channel);
+			// An empty lane is retired once its cooldown has elapsed, so the map is
+			// bounded by activity. The cooldown is still running right here, so the
+			// retirement is scheduled and re-checks the lane is the same and still idle.
+			if (lane.deliveries.length === 0 && lane.cosmetics.length === 0) {
+				const retireAt = lane.nextAt;
+				void this.sleep(Math.max(0, retireAt - this.now())).then(() => {
+					const current = this.#channels.get(channel);
+					if (
+						current === lane &&
+						!lane.draining &&
+						lane.deliveries.length === 0 &&
+						lane.cosmetics.length === 0 &&
+						lane.nextAt <= this.now()
+					)
+						this.#channels.delete(channel);
+				});
 			}
 		}
 	}
@@ -227,16 +240,6 @@ export class SlackWebApi {
 			unfurl_links: false,
 			...(threadTs === undefined ? {} : { thread_ts: threadTs }),
 		});
-	}
-
-	async updateMessage(channel: string, ts: string, text: string): Promise<unknown> {
-		await this.limiter?.acquire(channel, "cosmetic");
-		return this.call("chat.update", { channel, ts, text });
-	}
-
-	async deleteMessage(channel: string, ts: string): Promise<unknown> {
-		await this.limiter?.acquire(channel, "cosmetic");
-		return this.call("chat.delete", { channel, ts });
 	}
 
 	async addReaction(

@@ -1,5 +1,5 @@
 import { afterEach, expect, test } from "bun:test";
-import { link, mkdtemp, readFile, rm, stat, utimes, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, stat, utimes, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { ChatProgressPayload } from "@gajaeway/protocol";
@@ -304,10 +304,10 @@ for (const live of [true, false]) {
 	test(`RT-SLACK-45 discord ${live ? "live marker survives and timeout names pidfile holder" : "dead marker elects one of two waiters"}`, async () => {
 		home = await mkdtemp(join(tmpdir(), "discord-marker-g4-"));
 		const path = join(home, "adapter-discord.pid");
-		const marker = `${path}.reclaim`;
+		const marker = `${path}.reclaim.d`;
 		await writeFile(path, "99999\n");
-		await writeFile(`${path}.owner`, "88888\n");
-		await link(`${path}.owner`, marker);
+		await mkdir(marker);
+		await writeFile(join(marker, "owner"), "88888\n");
 		const aged = new Date(Date.now() - (live ? 900 : 2000));
 		await utimes(marker, aged, aged);
 		const inode = (await stat(marker)).ino;

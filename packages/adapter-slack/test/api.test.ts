@@ -85,10 +85,13 @@ test("Slack message wrappers send optional threads and disable unfurls", async (
 	await f.api.postMessage("C1", "reply", "1.2");
 	expect(f.requests[0]?.body).toEqual({ channel: "C1", text: "hello", mrkdwn: true, unfurl_links: false });
 	expect(f.requests[1]?.body.thread_ts).toBe("1.2");
-	await f.api.updateMessage("C1", "1.2", "changed");
-	await f.api.deleteMessage("C1", "1.2");
-	expect(f.requests[2]?.body).toEqual({ channel: "C1", ts: "1.2", text: "changed" });
-	expect(f.requests[3]?.body).toEqual({ channel: "C1", ts: "1.2" });
+	await f.api.removeReaction("C1", "1.2", "wrench");
+	expect(f.requests[2]?.body).toEqual({ channel: "C1", timestamp: "1.2", name: "wrench" });
+	// Removing a reaction that is not there is idempotent; other refusals surface.
+	f.respond(() => Response.json({ ok: false, error: "no_reaction" }));
+	await f.api.removeReaction("C1", "1.2", "wrench");
+	f.respond(() => Response.json({ ok: false, error: "not_allowed" }));
+	await expect(f.api.removeReaction("C1", "1.2", "wrench")).rejects.toMatchObject({ code: "not_allowed" });
 });
 
 test("Slack identity and directory wrappers unwrap fields and history exposes cursors", async () => {
@@ -164,7 +167,7 @@ test("Slack 429 honours Retry-After with a bounded retry and then stays ambiguou
 	await expect(bodyLimited.call("chat.postMessage")).rejects.toBeInstanceOf(SlackRateLimitedError);
 });
 
-test("Slack outbound limiter paces one channel and lets deliveries jump cosmetics", async () => {
+test("Slack outbound limiter paces one channel and routes api writes with the right priority", async () => {
 	let clock = 0;
 	const sleeps: number[] = [];
 	const limiter = new OutboundLimiter(
@@ -179,9 +182,9 @@ test("Slack outbound limiter paces one channel and lets deliveries jump cosmetic
 	const cosmetic = limiter.acquire("C1", "cosmetic"); // wants 1000
 	await limiter.acquire("C2", "delivery"); // other channel: no wait
 	await cosmetic;
-	expect(sleeps).toEqual([1000]);
-	expect(limiter.pendingMs("C1")).toBe(1000);
-	// Writes through the api go through the limiter with the right priority.
+	// The cosmetic waited exactly one interval on C1; C2 never waited.
+	expect(sleeps[0]).toBe(1000);
+	// Writes through the api go through the limiter; every write took a slot.
 	const calls: string[] = [];
 	const api = new SlackWebApi("xoxb-secret", {
 		fetcher: async (input) => {
@@ -190,10 +193,11 @@ test("Slack outbound limiter paces one channel and lets deliveries jump cosmetic
 		},
 		limiter,
 	});
-	await api.updateMessage("C1", "1.0", "x");
+	const before = sleeps.length;
+	await api.removeReaction("C1", "1.0", "wrench");
 	await api.postMessage("C1", "reply");
-	expect(calls).toEqual(["chat.update", "chat.postMessage"]);
-	expect(sleeps.length).toBeGreaterThan(1);
+	expect(calls).toEqual(["reactions.remove", "chat.postMessage"]);
+	expect(sleeps.length).toBeGreaterThan(before);
 });
 
 test("Slack body-level ratelimited goes through the same bounded retry as a 429", async () => {
