@@ -108,7 +108,8 @@ class Api extends SlackWebApi {
 	}
 	override async updateMessage() {}
 	override async deleteMessage() {}
-	override async postMessage(...args: [string, string, string?]) {
+	override async postMessage(channel: string, text: string, threadTs?: string) {
+		const args: [string, string, string?] = [channel, text, threadTs];
 		this.posts.push(args);
 		return { channel: args[0], ts: "2.0" };
 	}

@@ -43,23 +43,112 @@ export interface SlackHistoryPage {
 
 type HistoryResponse = SlackHistoryPage & { readonly response_metadata?: { readonly next_cursor?: string } };
 
+/**
+ * Slack said "slow down" and kept saying it for the whole retry budget. NOT a
+ * SlackApiError: the write was never refused on its merits, so the delivery is
+ * ambiguous and stays in the ledger for a later attempt instead of being
+ * recorded as a definitive failure.
+ */
+export class SlackRateLimitedError extends Error {
+	constructor(
+		readonly retryAfterMs: number,
+		readonly attempts: number,
+	) {
+		super(`Slack rate limited after ${attempts} attempts; retry after ${retryAfterMs}ms`);
+		this.name = "SlackRateLimitedError";
+	}
+}
+
+/** Bounded, Retry-After-driven retry for HTTP 429 / `ratelimited`. */
+export const RATE_LIMIT_MAX_RETRIES = 3;
+export const RATE_LIMIT_MAX_WAIT_MS = 30_000;
+const RATE_LIMIT_DEFAULT_WAIT_MS = 1_000;
+
+export interface SlackWebApiOptions {
+	readonly fetcher?: FetchLike;
+	readonly sleep?: (ms: number) => Promise<void>;
+	/** Outbound pacing shared by every write on a channel; absent means unpaced. */
+	readonly limiter?: OutboundLimiter;
+}
+
+/**
+ * Per-channel outbound pacing. Slack's chat.postMessage tier is about one
+ * message per second per channel, and cosmetic traffic (working-status edits)
+ * must never crowd out a reply: deliveries take the next slot first, cosmetics
+ * wait, and a cosmetic that has waited longer than its usefulness is dropped
+ * by its caller rather than sent late.
+ */
+export class OutboundLimiter {
+	readonly #next = new Map<string, number>();
+	readonly #queued = new Map<string, number>();
+	constructor(
+		readonly minIntervalMs = 1_000,
+		readonly now: () => number = Date.now,
+		readonly sleep: (ms: number) => Promise<void> = (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
+	) {}
+
+	/** Waits for this channel's next slot; `priority` writes jump ahead of pending cosmetics. */
+	async acquire(channel: string, priority: "delivery" | "cosmetic" = "delivery"): Promise<void> {
+		const queued = this.#queued.get(channel) ?? 0;
+		// A cosmetic behind a queue of deliveries yields its slot to them.
+		const slotsAhead = priority === "cosmetic" ? queued : 0;
+		const at = Math.max(this.now(), this.#next.get(channel) ?? 0) + slotsAhead * this.minIntervalMs;
+		this.#next.set(channel, at + this.minIntervalMs);
+		if (priority === "delivery") this.#queued.set(channel, queued + 1);
+		try {
+			const wait = at - this.now();
+			if (wait > 0) await this.sleep(wait);
+		} finally {
+			if (priority === "delivery") this.#queued.set(channel, Math.max(0, (this.#queued.get(channel) ?? 1) - 1));
+		}
+	}
+
+	/** How long a cosmetic write would wait right now; callers skip stale cosmetics. */
+	pendingMs(channel: string): number {
+		return Math.max(0, (this.#next.get(channel) ?? 0) - this.now());
+	}
+}
+
 export class SlackWebApi {
+	readonly fetcher: FetchLike;
+	readonly #sleep: (ms: number) => Promise<void>;
+	readonly limiter: OutboundLimiter | undefined;
+
 	constructor(
 		readonly botToken: string,
-		readonly fetcher: FetchLike = fetch,
-	) {}
+		options: FetchLike | SlackWebApiOptions = {},
+	) {
+		const resolved = typeof options === "function" ? { fetcher: options } : options;
+		this.fetcher = resolved.fetcher ?? fetch;
+		this.#sleep = resolved.sleep ?? ((ms) => new Promise((resolve) => setTimeout(resolve, ms)));
+		this.limiter = resolved.limiter;
+	}
 
 	async call<T>(method: string, parameters: Record<string, unknown> = {}, token?: string): Promise<T> {
 		// Response URLs are already credentials: never forward the bot token to them.
 		const responseUrl = method.startsWith("https://");
-		const response = await this.fetcher(responseUrl ? method : `https://slack.com/api/${method}`, {
-			method: "POST",
-			headers: {
-				"content-type": "application/json",
-				...(responseUrl ? {} : { Authorization: `Bearer ${token ?? this.botToken}` }),
-			},
-			body: JSON.stringify(parameters),
-		});
+		let response: Response | undefined;
+		let retryAfterMs = 0;
+		for (let attempt = 0; ; attempt++) {
+			response = await this.fetcher(responseUrl ? method : `https://slack.com/api/${method}`, {
+				method: "POST",
+				headers: {
+					"content-type": "application/json",
+					...(responseUrl ? {} : { Authorization: `Bearer ${token ?? this.botToken}` }),
+				},
+				body: JSON.stringify(parameters),
+			});
+			// 429 carries Retry-After in seconds; honour it, bounded, then give up as
+			// ambiguous. Never a definitive refusal: Slack did not judge the payload.
+			if (response.status !== 429) break;
+			const header = Number(response.headers.get("retry-after"));
+			retryAfterMs = Math.min(
+				RATE_LIMIT_MAX_WAIT_MS,
+				Number.isFinite(header) && header > 0 ? header * 1000 : RATE_LIMIT_DEFAULT_WAIT_MS,
+			);
+			if (attempt >= RATE_LIMIT_MAX_RETRIES) throw new SlackRateLimitedError(retryAfterMs, attempt + 1);
+			await this.#sleep(retryAfterMs);
+		}
 		// Slash-command responses may return plain text rather than a Web API envelope.
 		if (responseUrl) {
 			if (!response.ok) throw new SlackApiError(response.status, `http_${response.status}`);
@@ -77,6 +166,8 @@ export class SlackWebApi {
 			throw new SlackUnreadableResponseError(response.status, error);
 		}
 		if (isObject(body) && body.ok === false) {
+			// `ratelimited` in the body without a 429 status is the same signal.
+			if (body.error === "ratelimited") throw new SlackRateLimitedError(RATE_LIMIT_DEFAULT_WAIT_MS, 1);
 			throw new SlackApiError(response.status, typeof body.error === "string" ? body.error : `http_${response.status}`);
 		}
 		if (!response.ok) throw new SlackApiError(response.status, `http_${response.status}`);
@@ -85,11 +176,13 @@ export class SlackWebApi {
 		return body as T;
 	}
 
-	postMessage(
+	async postMessage(
 		channel: string,
 		text: string,
 		threadTs?: string,
+		priority: "delivery" | "cosmetic" = "delivery",
 	): Promise<{ readonly ts: string; readonly channel: string }> {
+		await this.limiter?.acquire(channel, priority);
 		return this.call("chat.postMessage", {
 			channel,
 			text,
@@ -99,15 +192,18 @@ export class SlackWebApi {
 		});
 	}
 
-	updateMessage(channel: string, ts: string, text: string): Promise<unknown> {
+	async updateMessage(channel: string, ts: string, text: string): Promise<unknown> {
+		await this.limiter?.acquire(channel, "cosmetic");
 		return this.call("chat.update", { channel, ts, text });
 	}
 
-	deleteMessage(channel: string, ts: string): Promise<unknown> {
+	async deleteMessage(channel: string, ts: string): Promise<unknown> {
+		await this.limiter?.acquire(channel, "cosmetic");
 		return this.call("chat.delete", { channel, ts });
 	}
 
 	async addReaction(channel: string, timestamp: string, name: string): Promise<void> {
+		await this.limiter?.acquire(channel, "delivery");
 		try {
 			await this.call("reactions.add", { channel, timestamp, name });
 		} catch (error) {

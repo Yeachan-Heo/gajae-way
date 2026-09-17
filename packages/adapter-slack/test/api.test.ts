@@ -1,5 +1,13 @@
 import { expect, test } from "bun:test";
-import { deliveryFailureIsAmbiguous, SlackApiError, SlackUnreadableResponseError, SlackWebApi } from "../src/api";
+import {
+	deliveryFailureIsAmbiguous,
+	OutboundLimiter,
+	RATE_LIMIT_MAX_RETRIES,
+	SlackApiError,
+	SlackRateLimitedError,
+	SlackUnreadableResponseError,
+	SlackWebApi,
+} from "../src/api";
 
 function fixture() {
 	const requests: { url: string; headers: Headers; body: Record<string, unknown>; method?: string }[] = [];
@@ -44,7 +52,6 @@ test("Slack errors preserve HTTP status and platform code", async () => {
 	for (const [status, body, code] of [
 		[200, { ok: false, error: "invalid_auth" }, "invalid_auth"],
 		[503, { ok: false, error: "unavailable" }, "unavailable"],
-		[429, {}, "http_429"],
 	] as const) {
 		f.respond(() => Response.json(body, { status }));
 		const error = await f.api.call("test").catch((error: unknown) => error);
@@ -121,4 +128,70 @@ test("Slack response URLs receive JSON without leaking the bot credential", asyn
 test("Slack transport errors are ambiguous but API rejections are definitive", () => {
 	expect(deliveryFailureIsAmbiguous(new SlackApiError(200, "invalid_auth"))).toBe(false);
 	expect(deliveryFailureIsAmbiguous(new TypeError("network"))).toBe(true);
+});
+
+test("Slack 429 honours Retry-After with a bounded retry and then stays ambiguous", async () => {
+	const requests: string[] = [];
+	const sleeps: number[] = [];
+	let remaining = 2;
+	const api = new SlackWebApi("xoxb-secret", {
+		fetcher: async (input) => {
+			requests.push(String(input));
+			if (remaining-- > 0) return new Response("{}", { status: 429, headers: { "retry-after": "2" } });
+			return Response.json({ ok: true, done: true });
+		},
+		sleep: async (ms) => {
+			sleeps.push(ms);
+		},
+	});
+	expect(await api.call<{ done: boolean }>("chat.postMessage")).toMatchObject({ done: true });
+	expect(requests).toHaveLength(3);
+	expect(sleeps).toEqual([2000, 2000]);
+	// Still limited after the budget: not a SlackApiError, so the delivery stays ambiguous.
+	const always = new SlackWebApi("xoxb-secret", {
+		fetcher: async () => new Response("{}", { status: 429, headers: { "retry-after": "1" } }),
+		sleep: async () => {},
+	});
+	const error = await always.call("chat.postMessage").catch((caught: unknown) => caught);
+	expect(error).toBeInstanceOf(SlackRateLimitedError);
+	expect(error).not.toBeInstanceOf(SlackApiError);
+	expect(deliveryFailureIsAmbiguous(error)).toBe(true);
+	expect((error as SlackRateLimitedError).attempts).toBe(RATE_LIMIT_MAX_RETRIES + 1);
+	// A body-level `ratelimited` with HTTP 200 is the same signal.
+	const bodyLimited = new SlackWebApi("xoxb-secret", {
+		fetcher: async () => Response.json({ ok: false, error: "ratelimited" }),
+	});
+	await expect(bodyLimited.call("chat.postMessage")).rejects.toBeInstanceOf(SlackRateLimitedError);
+});
+
+test("Slack outbound limiter paces one channel and lets deliveries jump cosmetics", async () => {
+	let clock = 0;
+	const sleeps: number[] = [];
+	const limiter = new OutboundLimiter(
+		1000,
+		() => clock,
+		async (ms) => {
+			sleeps.push(ms);
+			clock += ms;
+		},
+	);
+	await limiter.acquire("C1", "delivery"); // t=0, next slot 1000
+	const cosmetic = limiter.acquire("C1", "cosmetic"); // wants 1000
+	await limiter.acquire("C2", "delivery"); // other channel: no wait
+	await cosmetic;
+	expect(sleeps).toEqual([1000]);
+	expect(limiter.pendingMs("C1")).toBe(1000);
+	// Writes through the api go through the limiter with the right priority.
+	const calls: string[] = [];
+	const api = new SlackWebApi("xoxb-secret", {
+		fetcher: async (input) => {
+			calls.push(String(input).split("/api/")[1] ?? "");
+			return Response.json({ ok: true, ts: "1.0", channel: "C1" });
+		},
+		limiter,
+	});
+	await api.updateMessage("C1", "1.0", "x");
+	await api.postMessage("C1", "reply");
+	expect(calls).toEqual(["chat.update", "chat.postMessage"]);
+	expect(sleeps.length).toBeGreaterThan(1);
 });

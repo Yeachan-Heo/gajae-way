@@ -55,7 +55,8 @@ async function fixture(channels: GatewayConfig["channels"], reply = "<script>&")
 	const posts: unknown[][] = [];
 	const reactions: unknown[][] = [];
 	const adapter = new ReconnectingGateway(config.socketPath, {
-		async postMessage(...args: [string, string, string?]) {
+		async postMessage(channel: string, text: string, threadTs?: string) {
+			const args: [string, string, string?] = [channel, text, threadTs];
 			posts.push(args);
 			return { ts: "9.0", channel: args[0] };
 		},
