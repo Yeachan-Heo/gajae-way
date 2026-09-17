@@ -1,7 +1,8 @@
 import { afterEach, expect, test } from "bun:test";
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { AdapterAlreadyRunningError, AdapterLock } from "../../adapter-discord/src/lock";
 import { ReconnectingGateway } from "../../adapter-slack/src/main";
 import { GajaewayClient } from "../../sdk/src/index";
 import type { GatewayConfig } from "../src/config";
@@ -35,6 +36,7 @@ async function fixture(channels: GatewayConfig["channels"], reply = "<script>&")
 		dbPath: join(home, "gateway.db"),
 		logVerbosity: "info",
 		channels,
+		dmPolicy: "open",
 	};
 	const database = await GatewayDatabase.open(config.dbPath);
 	const turns: string[] = [];
@@ -147,4 +149,54 @@ test("RT-SLACK-24 thread and channel isolate sessions and route replies", async 
 	expect(f.posts).toContainEqual(["C1", "answer", undefined]);
 	expect(f.posts).toContainEqual(["C1", "answer", "1.0"]);
 	expect(f.database.deliveryRows().map((row) => row.state)).toEqual(["confirmed", "confirmed"]);
+});
+
+for (const explicit of [false, true]) {
+	test(`RT-SLACK-34 real gateway threaded DM chunks ${explicit ? "explicit reply wins" : "default to inbound root"}`, async () => {
+		const text = "x".repeat(4500);
+		const f = await fixture({}, `${explicit ? "[REPLY:D1:9.0] " : ""}${text}`);
+		const dm = { platform: "slack", kind: "dm", conversationId: "D1", peerId: "U1" } as const;
+		expect(
+			(
+				await f.adapter.requestInbound("D1:2.0", dm, "threaded dm", {
+					...engagement,
+					group: false,
+					replyTo: { messageId: "D1:1.0", fromSelf: true },
+				})
+			)?.engaged,
+		).toBe(true);
+		await settle();
+		expect(f.posts).toHaveLength(2);
+		for (const post of f.posts) {
+			expect(post[0]).toBe("D1");
+			expect(post[2]).toBe(explicit ? "9.0" : "1.0");
+		}
+		expect(f.posts.map((post) => post[1]).join("")).toBe(text);
+		expect(f.database.deliveryRows().every((row) => row.state === "confirmed")).toBe(true);
+	});
+}
+
+test("RT-SLACK-34 plain channel reply does not inherit a thread", async () => {
+	const f = await fixture({ "slack:C1": { engagement: "mention-open" } }, "plain reply");
+	await f.adapter.requestInbound("C1:2.0", origin, "plain", engagement);
+	await settle();
+	expect(f.posts).toEqual([["C1", "plain reply", undefined]]);
+});
+
+test("RT-SLACK-33 discord stale lock has exactly one winner under 20 concurrent reclaims", async () => {
+	const lockHome = await mkdtemp(join(tmpdir(), "slack-discord-lock-redteam-"));
+	try {
+		const path = join(lockHome, "adapter-discord.pid");
+		await writeFile(path, "99999\n");
+		const results = await Promise.allSettled(
+			Array.from({ length: 20 }, (_, i) => AdapterLock.acquire(lockHome, { pid: i + 1, alive: () => false })),
+		);
+		const winners = results.filter((r) => r.status === "fulfilled");
+		expect(winners).toHaveLength(1);
+		for (const result of results)
+			if (result.status === "rejected") expect(result.reason).toBeInstanceOf(AdapterAlreadyRunningError);
+		expect((await readFile(path, "utf8")).trim()).toBe(String(winners[0]?.value.pid));
+	} finally {
+		await rm(lockHome, { recursive: true, force: true });
+	}
 });

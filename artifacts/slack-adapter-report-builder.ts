@@ -1,183 +1,301 @@
-const sourceHash = "sha256:bc28aafd226fc34e5fd65823450f6e58f40d78ffcd5831723193eb525a25b7ed";
+const sourceHash = "sha256:c84c9b5d85ad99dcfc4ffd219948f47742099a7c274c6f0468b66dae1ba3035f";
 const files = [
 	"packages/adapter-slack/test/redteam.test.ts",
 	"packages/gateway/test/slack-adapter-redteam.e2e.test.ts",
+	"packages/sdk/test/client-held-events.test.ts",
 ];
-const junit = await Bun.file("artifacts/slack-adapter-redteam.junit.xml").text();
-const expectations: Record<string, string> = {
-	"01": "Ack before handler; handler failure does not poison later dispatch; retry dedupes; invalid/missing-id frames do not dispatch; disconnect creates second socket.",
-	"02": "All six hostile timestamps drop before chat.send; subsequent valid message has a protocol-safe id.",
-	"03": "Foreign-channel reply target must fail definitively before postMessage, per brief line 11; it must never become thread_ts.",
-	"04": "Brief literal text-contains rule includes code-span mentions; normalize broadcasts and subteam labels; decode entities exactly once.",
-	"05": "50k fenced message produces pieces <=4000 characters with balanced fences.",
-	"06": "File-only message renders attachment body; message without files or text drops.",
-	"07": "Own user, own bot_id, hidden, all SKIPPED_SUBTYPES, unchanged/empty edits and app_mention cause no gateway requests.",
-	"08": "Bot-authored parent sets mentioned; missing parent_user_id leaves fromSelf absent.",
-	"09": "TypeError produces ambiguous:true, SlackApiError ambiguous:false.",
-	"10": "Three-chunk thread reply keeps thread_ts on every chunk, prefixes duplicate warning, confirms once.",
-	"11": "Malformed target and unknown emojiName fail definitively without reaction API calls. Already-reacted coverage independently verified by RT-SLACK-25.",
-	"12": "300 disconnected edits retain newest 256, log 44 evictions, and replay in order on adoptClient.",
-	"13": "Failed chat.edit remains pending and schedules reconnect; adopted healthy client replays it.",
-	"14": "Successful message id is not resent; unavailable message is forgotten and retried successfully.",
-	"15": "Newest-first paginated history delivers ascending; watermark stops before unavailable message.",
-	"16": "Recovered thread reply has thread origin and correct parent/channel id.",
-	"17": "Third permanent failure quarantines; later gateway reconnection/pass must re-probe restored access and clear quarantine.",
-	"18": "Twenty concurrent triggers run one pass at a time and coalesce to one follow-up.",
-	"19": "Both incorrect token prefixes rejected without secret echo; relative token paths resolve from config; unknown channel key rejected.",
-	"20": "Unconfigured unmentioned channel records no persona turn or delivery.",
-	"21": "Namespaced mention-open policy engages and literal persona <script>& is escaped at Slack postMessage.",
-	"22": "Persona check token maps to white_check_mark and confirmed Slack delivery; Telegram produces no reaction and explicit chat.react refuses it.",
-	"23": "Monitor and loopback chat.react requests fail and leave no delivery rows.",
-	"24": "Thread and channel have distinct session origin records and correctly routed confirmed replies.",
-	"25": "Actual SlackWebApi already_reacted response is treated as success and delivery.confirm is emitted.",
-	"26": "Real binary --help exits 0 and prints usage without booting.",
-	"27": "Real binary --version exits 0 and prints semver.",
-	"28": "Real binary unknown argument exits 2 and prints usage to stderr.",
-	"29": "Real binary refuses second instance with live pidfile, exits 2, does not overwrite pidfile.",
-};
-const cases: Array<Record<string, unknown>> = [];
-for (const file of files) {
-	const lines = (await Bun.file(file).text()).split("\n");
-	for (const [line, text] of lines.entries()) {
-		const match = /^test\("(RT-SLACK-(\d+)) ([^"]+)"/.exec(text);
-		if (!match) continue;
-		const testcase = [...junit.matchAll(/<testcase\b[^>]*[\s\S]*?<\/testcase>|<testcase\b[^>]*\/>/g)].find((m) =>
-			m[0].includes(match[1]!),
-		)?.[0];
-		if (!testcase) throw new Error(`Missing JUnit evidence ${match[1]}`);
-		cases.push({
-			id: match[1],
-			scenario: match[3],
-			expectedBehavior: expectations[match[2]!],
-			verdict: testcase.includes("<failure") || testcase.includes("<error") ? "failed" : "passed",
-			test: `${file}:${line + 1}`,
-		});
-	}
-}
-const cli = await Bun.file("artifacts/slack-adapter-cli-proof.json").json();
-for (const probe of cli.probes)
-	cases.push({
-		id: probe.id,
-		scenario: probe.command.join(" ") || "pidfile refusal",
-		expectedBehavior: expectations[probe.id.slice(-2)],
-		verdict: probe.verdict,
-		test: "artifacts/slack-adapter-cli-probes.ts:8",
-		artifact: "artifacts/slack-adapter-cli-proof.json",
+const junitPath = "artifacts/slack-adapter-redteam.junit.xml";
+const supportingPath = "artifacts/slack-adapter-supporting.junit.xml";
+const proofPath = "artifacts/slack-adapter-cli-proof.json";
+const reportPath = "artifacts/slack-adapter-redteam-report.json";
+const expectations = [
+	"Ack before handlers; retry dedupe; malformed frames survive; disconnect reconnects.",
+	"Reject hostile timestamps before chat.send and preserve channel-qualified valid ids.",
+	"Foreign reply targets fail definitively before any Slack post.",
+	"Literal mentions including code count; decode entities once and normalize broadcasts.",
+	"50k fenced text produces bounded, balanced chunks of at most 4000 characters.",
+	"File-only messages render attachments; empty bodies drop.",
+	"Own, hidden, skipped subtype, unchanged/empty edit and duplicate app_mention events never send.",
+	"Bot parent implies mention; absent parent metadata omits fromSelf.",
+	"Transport failure is ambiguous; SlackApiError is definitive.",
+	"All reply chunks retain thread routing and duplicate warning; delivery confirms once.",
+	"Malformed/unknown reactions fail definitively without API; already_reacted confirms.",
+	"Edit outbox keeps newest 256 of 300, records 44 evictions and replays in order.",
+	"Failed edit remains queued and replays on client adoption.",
+	"Acknowledged ids dedupe; unavailable ids remain retryable.",
+	"Newest-first recovery delivers ascending and cannot advance across unavailable sends.",
+	"Recovered thread replies retain thread origin and parent channel.",
+	"Three permanent failures quarantine; actual onConnected scheduler re-probes and clears quarantine.",
+	"Twenty recovery triggers coalesce without parallel passes.",
+	"Credential prefixes reject without exposing secrets; relative paths resolve and policy keys validate.",
+	"Unconfigured unmentioned channel is context-only with no turn/delivery.",
+	"Mention-open policy engages and persona markup is escaped at Slack boundary.",
+	"Check token maps to white_check_mark on Slack and is refused on Telegram.",
+	"Monitor and loopback cannot chat.react and create no deliveries.",
+	"Channel/thread origins isolate sessions and route confirmed replies correctly.",
+	"Actual already_reacted Web API response confirms delivery.",
+	"Compiled --help exits 0 with usage without booting.",
+	"Compiled --version exits 0 with semver.",
+	"Compiled unknown flag exits 2 with usage on stderr.",
+	"Compiled second instance exits 2 without overwriting a live pidfile.",
+	"Recovered request joins pending live outcome, reports unavailable on failure, retries then dedupes; adoption while pending preserves outcome.",
+	"200 {}, nonboolean ok and throwing body streams are unreadable/ambiguous; explicit ok:false is definitive.",
+	"Same-chunk negotiated and chat events reach first subscriber in order; second gets no replay; newest 1000 retained; internal events never held.",
+	"Exactly one of 20 concurrent stale-pidfile reclaims succeeds; all others reject with AdapterAlreadyRunningError; pidfile matches winner, for Slack and Discord.",
+	"Real gateway threaded DM defaults every chunk to inbound root; explicit REPLY target wins; plain channel has no thread_ts.",
+	"Two-page bounded pass retains continuation without advancing; next pass closes remaining gap; later arrival above through is not lost.",
+	"Engaged thread root is durably remembered and revisited when history is empty; participated-thread TTL prunes it.",
+	"Three invalid_params refusals dead-letter with terminal-message classification/digest/watermark; intervening link failure does not count; repeated unknown failures never dead-letter.",
+	"Failed cursor save makes pass incomplete; restoring isolated /tmp store allows persistence without resending acknowledged message.",
+	"Slash acks distinguish restart, unreachable gateway, duplicate trigger and unknown command.",
+	"Engaged addressed turn posts working status before progress; unmentioned group does not; thread status keeps thread_ts.",
+	"Unknown rocket emojiName fails definitively without addReaction.",
+];
+const decode = (value: string) =>
+	value
+		.replace(/&#10;/g, "\n")
+		.replace(/&quot;/g, '"')
+		.replace(/&apos;/g, "'")
+		.replace(/&lt;/g, "<")
+		.replace(/&gt;/g, ">")
+		.replace(/&amp;/g, "&");
+function parseTests(xml: string) {
+	return [...xml.matchAll(/<testcase\b([^>]*?)(?:\/>|>([\s\S]*?)<\/testcase>)/g)].map((match) => {
+		const attrs = Object.fromEntries([...match[1].matchAll(/([\w-]+)="([^"]*)"/g)].map((m) => [m[1], decode(m[2])]));
+		const body = match[2] ?? "";
+		return {
+			name: attrs.name,
+			test: `${attrs.file}:${attrs.line}`,
+			file: attrs.file,
+			verdict: /<(failure|error)\b/.test(body) ? "failed" : "passed",
+			failure: decode(body.replace(/<[^>]+>/g, "").trim()),
+		};
 	});
-cases.sort((a, b) => String(a.id).localeCompare(String(b.id)));
-const blockers = [
-	{
-		caseId: "RT-SLACK-03",
-		contractRef: "/tmp/gajaeway-slack-brief.md:11",
-		observed: "Foreign C2:1.0 reply target posts a top-level C1 reply and confirms instead of definitive failure.",
-		source: "packages/adapter-slack/src/main.ts:replyThreadTs/settleSlackDelivery",
-	},
-	{
-		caseId: "RT-SLACK-11",
-		contractRef: "User minimum adversarial case 5; definitive invalid reaction settlement",
-		observed:
-			"Unknown emojiName throws generic Error, classified ambiguous:true; no API was called, so delivery failure should be definitive.",
-		source:
-			"packages/adapter-slack/src/reactions.ts:slackReactionFor; packages/adapter-slack/src/main.ts:settleSlackReaction",
-	},
-	{
-		caseId: "RT-SLACK-17",
-		contractRef: "User minimum adversarial case 7; recoverMissedMessages reconnect re-probe promise",
-		observed:
-			"After three missing_scope failures, subsequent pass and gateway reconnect never call history again (3 calls, expected 4). failures>=3 skip occurs before clean-pass clearing; no callback resets counters. Quarantine persists indefinitely, including across restarts via cursor file.",
-		source: "packages/adapter-slack/src/main.ts:recoverMissedMessages/gateway.onConnected",
-	},
-];
-const coverage = [
-	["brief:8 Socket Mode immediate ack/retry/reconnect", ["01"]],
-	["brief:10 Slack origins, channel/thread isolation", ["08", "16", "24"]],
-	["brief:11 channel-qualified safe ids and definitive foreign-id refusal", ["02", "03"]],
-	["brief:12 inbound entities/tokens and outbound escaping/chunking", ["04", "05", "21"]],
-	["brief:14 reaction mapping and settlement", ["11", "22", "25"]],
-	["brief:15 engagement, filtering, edits and missing parent metadata", ["04", "07", "08", "12", "13", "20", "21"]],
-	["brief:16 attachment-only and empty bodies", ["06"]],
-	["brief:17 pidfile single-instance state", ["29"]],
-	["brief:18 credential loading and policy validation", ["19"]],
-	["brief:23 gateway Slack admission and platform reaction guards", ["20", "21", "22", "23", "24"]],
-	[
-		"brief:26 delivery ambiguity, bounded edit replay, inbound dedupe, CLI",
-		["09", "10", "11", "12", "13", "14", "26", "27", "28", "29"],
-	],
-	["brief:29 recovery order/watermark/thread/quarantine/single-flight", ["15", "16", "17", "18"]],
-	["brief:32 compiled binary and real gateway e2e integration", ["20", "21", "22", "24", "26", "27", "28", "29"]],
-].map(([contractRef, ids]) => ({
+}
+const tests = parseTests(await Bun.file(junitPath).text());
+const supporting = parseTests(await Bun.file(supportingPath).text());
+const proof = await Bun.file(proofPath).json();
+if (proof.sourceHash !== sourceHash) throw new Error("CLI proof source hash mismatch");
+const adversarialCases = expectations.map((expectedBehavior, index) => {
+	const id = `RT-SLACK-${String(index + 1).padStart(2, "0")}`;
+	const rows = tests.filter((t) => t.name.startsWith(`${id} `));
+	const probe = proof.probes.find((p: { id: string }) => p.id === id);
+	if (!rows.length && !probe) throw new Error(`Missing evidence for ${id}`);
+	return {
+		id,
+		sourceHash,
+		scenario: rows.length ? rows.map((t) => t.name.slice(id.length + 1)).join("; ") : probe.command.join(" "),
+		expectedBehavior,
+		expected: expectedBehavior,
+		verdict: rows.some((t) => t.verdict === "failed") || probe?.verdict === "failed" ? "failed" : "passed",
+		test: rows.map((t) => t.test).join(", ") || "artifacts/slack-adapter-cli-probes.ts:8",
+		subcases: rows,
+		artifactRefs: [rows.length ? junitPath : proofPath],
+	};
+});
+const blockers = tests
+	.filter((t) => t.verdict === "failed")
+	.map((t) => ({
+		caseId: t.name.slice(0, 11),
+		contractRef: "/tmp/gajaeway-slack-brief.md:17; RT-SLACK-33 acceptance",
+		test: t.test,
+		observed: t.failure,
+		scenario: t.name,
+		source: t.name.includes("discord")
+			? "packages/adapter-discord/src/lock.ts:AdapterLock.acquire"
+			: "packages/adapter-slack/src/lock.ts:AdapterLock.acquire",
+		explanation:
+			"tmp+rename followed by read-back is not mutual exclusion: sequential contenders can each read back their own pid and resolve before another rename overwrites it. Source deliberately left unchanged.",
+		artifactRefs: [junitPath],
+	}));
+const cover = (contractRef: string, ids: number[], detail: string, supportingEvidence: string[] = []) => ({
 	contractRef,
 	status: "covered",
-	caseIds: (ids as string[]).map((id) => `RT-SLACK-${id}`),
-}));
-const invocation = `bun test ${files.join(" ")} --reporter=junit --reporter-outfile=artifacts/slack-adapter-redteam.junit.xml`;
+	caseIds: ids.map((id) => `RT-SLACK-${String(id).padStart(2, "0")}`),
+	detail,
+	supportingEvidence,
+	artifactRefs: [...(ids.length ? [junitPath, proofPath] : []), ...(supportingEvidence.length ? [supportingPath] : [])],
+});
+const contractCoverage = [
+	cover(
+		"brief:5,20 Bun/TypeScript targeted tests and injected I/O",
+		[1, 20, 32, 34],
+		"Focused suites use Bun and fake Slack transport; gateway tests use real local SDK sockets.",
+	),
+	cover(
+		"brief:6 SDK-only adapter boundary",
+		[],
+		"Public SDK boundary conformance passes; Discord lock regression belongs in gateway test, not adapter package.",
+		["packages/conformance/test/sdk-boundary-dogfood.test.ts"],
+	),
+	cover(
+		"brief:7 existing adapter patterns",
+		[12, 13, 17, 18, 33],
+		"Existing fixture/policy, ordered ingress, outbox and lock shapes exercised; lock contention remains a blocker.",
+	),
+	cover(
+		"brief:8 hand-rolled Web API and Socket Mode",
+		[1, 9, 25, 31],
+		"Ack-before-work, retry/reconnect, response semantics and transport ambiguity.",
+		["packages/adapter-slack/test/api.test.ts", "packages/adapter-slack/test/socket.test.ts"],
+	),
+	cover(
+		"brief:10 origins including threaded DMs",
+		[8, 16, 24, 34],
+		"Real gateway DM multi-chunk routing, explicit reply precedence and plain-channel control.",
+		["packages/adapter-slack/test/origin.test.ts"],
+	),
+	cover(
+		"brief:11 channel-qualified ids and definitive invalid-target failure",
+		[2, 3, 10, 11],
+		"Foreign target fails without post; ids are channel qualified.",
+		["packages/protocol/test/reactions.test.ts"],
+	),
+	cover(
+		"brief:12 text normalization and mrkdwn",
+		[4, 5, 21],
+		"Entities, mentions, escaping and bounded fenced chunks.",
+		["packages/adapter-slack/test/text.test.ts", "packages/adapter-slack/test/mrkdwn.test.ts"],
+	),
+	cover(
+		"brief:13 presence lifecycle",
+		[40],
+		"Post on arm; existing status suite covers update, delete, final, stale, concurrent cleanup and cosmetic failure.",
+		["packages/adapter-slack/test/status.test.ts"],
+	),
+	cover(
+		"brief:14 complete reaction allowlist and settlement",
+		[11, 22, 25, 41],
+		"Unknown names fail definitively; existing suite covers reverse mapping and own reaction filtering.",
+		["packages/adapter-slack/test/reactions.test.ts", "packages/protocol/test/reactions.test.ts"],
+	),
+	cover(
+		"brief:15 engagement, metadata, cache precedence and edit replay",
+		[4, 7, 8, 12, 13, 20, 21],
+		"Filtering, parent authorship, bounded replay; cache precedence/LRU/coalescing exercised by supporting suite.",
+		["packages/adapter-slack/test/author.test.ts"],
+	),
+	cover(
+		"brief:16 attachments and no voice",
+		[6],
+		"Attachment-only delivery and empty-body filtering; supporting attachment caps; no-voice explicitly documented in deployment.md:102.",
+		["packages/adapter-slack/test/attachments.test.ts"],
+	),
+	cover(
+		"brief:17 durable configuration, cursors and single-instance lock",
+		[19, 29, 33, 38],
+		"Live-holder refusal and durable state pass; concurrent stale reclamation FAILS for both adapters.",
+	),
+	cover("brief:18 credential files, prefixes and policy", [19], "Secret-safe refusal and relative resolution.", [
+		"packages/adapter-slack/test/config.test.ts",
+	]),
+	cover(
+		"brief:19 Slack naming",
+		[19, 26, 28, 29],
+		"CLI/startup evidence says Slack. Source search finds Discord only in a recovery.ts explanatory comment.",
+	),
+	cover(
+		"brief:23 protocol/gateway Slack admission and guards",
+		[20, 21, 22, 23, 24],
+		"Slack admitted; foreign platforms guarded; protocol Slack topic/allowlist tests pass.",
+		["packages/protocol/test/protocol.test.ts", "packages/protocol/test/reactions.test.ts"],
+	),
+	cover(
+		"brief:26 core adapter, dedupe, settlement, CLI",
+		[1, 2, 3, 9, 10, 11, 12, 13, 14, 26, 27, 28, 29, 30, 31, 32, 41],
+		"Public API, SDK negotiation replay and compiled binary directly exercised.",
+	),
+	cover(
+		"brief:29 presence, slash commands and missed-message recovery",
+		[15, 16, 17, 18, 30, 35, 36, 37, 38, 39, 40],
+		"Real reconnect reprobe, continuation, participated threads, terminal-only budget and persistence failure.",
+		["packages/adapter-slack/test/status.test.ts", "packages/adapter-slack/test/recovery.test.ts"],
+	),
+	cover(
+		"brief:32 build, services, conformance, docs and gateway e2e",
+		[20, 21, 22, 24, 26, 27, 28, 29, 34],
+		"bun run build passed; service installation/boundary tests pass. Read-only doc audit found binary/config/scopes/events/commands/origins/recovery/no-voice in README.md:44-64, docs/deployment.md:76-104, docs/architecture.md:14-29, docs/runbooks/gajaeway-v1.md:79-90 and service-control.md:8.",
+		["packages/cli/test/main.test.ts", "packages/conformance/test/sdk-boundary-dogfood.test.ts"],
+	),
+	{
+		contractRef: "GUI/browser and live Slack workspace",
+		status: "not_applicable",
+		reason:
+			"This assignment requires compiled CLI, package/API and local gateway surfaces with injected Slack transport; no GUI or credentialed external workspace is in scope.",
+	},
+];
+const invocation = `bun test ${files.join(" ")} --reporter=junit --reporter-outfile=${junitPath}`;
+const artifactRefs = ["artifacts/slack-adapter-cli-replay.json", proofPath, junitPath, reportPath, supportingPath];
 const matrix = {
 	sourceHash,
-	contractCoverage: [
-		...coverage,
-		{
-			contractRef: "Computer-use / GUI / web",
-			status: "not_applicable",
-			reason: "No such product surface belongs to this Slack adapter change.",
-		},
-	],
+	contractCoverage,
 	surfaceEvidence: [
 		{
 			surface: "cli",
-			invocation: "bun artifacts/slack-adapter-cli-probes.ts",
-			verdict: "passed",
-			artifactIds: ["artifacts/slack-adapter-cli-proof.json", "artifacts/slack-adapter-cli-replay.json"],
+			invocation: "bun run build && bun artifacts/slack-adapter-cli-probes.ts",
+			verdict: proof.probes.every((p: { verdict: string }) => p.verdict === "passed") ? "passed" : "failed",
+			detail:
+				"Fresh compiled Slack binary; four probes with real stdout/stderr/exit codes. Replay receipt checked via bun -e.",
+			artifactRefs: [proofPath, artifactRefs[0]],
 		},
 		{
 			surface: "api",
 			invocation,
-			verdict: "passed",
-			detail: "All five real gateway socket cases passed.",
-			artifactIds: ["artifacts/slack-adapter-redteam.junit.xml"],
+			verdict: tests
+				.filter((t) => t.file.includes("gateway") && t.name.startsWith("RT-SLACK-34"))
+				.every((t) => t.verdict === "passed")
+				? "passed"
+				: "failed",
+			detail:
+				"All eight real gateway conversation tests pass, including three DM/channel routing cases; Discord lock package case is reported separately.",
+			artifactRefs: [junitPath],
 		},
 		{
 			surface: "package",
 			invocation,
-			verdict: "failed",
-			detail: "17 of 20 adapter tests passed; three demonstrated blockers.",
-			artifactIds: ["artifacts/slack-adapter-redteam.junit.xml", "artifacts/slack-adapter-redteam-report.json"],
+			verdict: blockers.length ? "failed" : "passed",
+			detail: `${tests.length - blockers.length}/${tests.length} tests pass; concurrent stale lock reclaims fail for Slack and Discord. SDK same-chunk replay passes.`,
+			artifactRefs: [junitPath, reportPath],
+		},
+		{
+			surface: "package",
+			invocation:
+				"bun test packages/adapter-slack/test/origin.test.ts packages/adapter-slack/test/text.test.ts packages/adapter-slack/test/mrkdwn.test.ts packages/adapter-slack/test/reactions.test.ts packages/adapter-slack/test/attachments.test.ts packages/adapter-slack/test/author.test.ts packages/adapter-slack/test/config.test.ts packages/adapter-slack/test/api.test.ts packages/adapter-slack/test/socket.test.ts packages/adapter-slack/test/status.test.ts packages/adapter-slack/test/recovery.test.ts packages/protocol/test/protocol.test.ts packages/protocol/test/reactions.test.ts packages/cli/test/main.test.ts packages/conformance/test/sdk-boundary-dogfood.test.ts --reporter=junit --reporter-outfile=artifacts/slack-adapter-supporting.junit.xml",
+			verdict: supporting.every((t) => t.verdict === "passed") ? "passed" : "failed",
+			detail: `${supporting.length} supporting tests across adapter, protocol, service installation and SDK boundary.`,
+			artifactRefs: [supportingPath],
 		},
 	],
-	adversarialCases: cases,
+	adversarialCases,
+	artifactRefs,
 	blockers,
-	artifactRefs: [
-		"artifacts/slack-adapter-cli-replay.json",
-		"artifacts/slack-adapter-cli-proof.json",
-		"artifacts/slack-adapter-redteam.junit.xml",
-		"artifacts/slack-adapter-redteam-report.json",
-	],
-	limitations: [
-		"Parent rebased the branch mid-QA. Original frozen hash run: 24 cases, 21 passed, same three defects. Latest JUnit: 25 cases, 22 passed, same three defects after adapting only new gateway fixture to upstream attachTestBrokerOwnership. Intermediate fixture-drift failures are not attributed to the frozen hash.",
-		"Coverage rows enumerate obligations exercised, not all brief obligations: working-status, slash-command authorization, cache eviction and service/doc integration were outside this new minimum red-team suite.",
-		"RT-SLACK-17 disables automatic recovery scheduling for deterministic manual passes; source inspection establishes onConnected only triggers scheduler and never resets quarantine.",
-		"Gateway teardown emits invalid socket write count: -32 warnings; these are retained, not suppressed.",
-	],
 };
 const commit = Bun.spawnSync(["git", "rev-parse", "HEAD"]);
-await Bun.write(
-	"artifacts/slack-adapter-redteam-report.json",
-	JSON.stringify(
-		{
-			schemaVersion: 1,
-			kind: "api-package-test-report",
-			...matrix,
-			latestRunCommit: new TextDecoder().decode(commit.stdout).trim(),
-			counts: { tests: 25, passed: 22, failed: 3, cliProbes: 4, cliPassed: 4 },
-			executorQa: matrix,
-		},
-		null,
-		2,
-	) + "\n",
-);
-console.log(
-	JSON.stringify({
-		cases: cases.length,
-		blockers: blockers.map((b) => b.caseId),
-		report: "artifacts/slack-adapter-redteam-report.json",
-	}),
-);
+const report = {
+	schemaVersion: 1,
+	kind: "api-package-test-report",
+	...matrix,
+	latestRunCommit: new TextDecoder().decode(commit.stdout).trim(),
+	sourceHashMethod:
+		"Parent-confirmed Ultragoal quality-gate source-hash (integration base, merge base, paths, captured diff and untracked digest), not sha256 of raw git diff.",
+	counts: {
+		tests: tests.length,
+		passed: tests.length - blockers.length,
+		failed: blockers.length,
+		cliProbes: proof.probes.length,
+		cliPassed: proof.probes.filter((p: { verdict: string }) => p.verdict === "passed").length,
+		stableCaseIds: adversarialCases.length,
+		supportingTests: supporting.length,
+		supportingPassed: supporting.filter((t) => t.verdict === "passed").length,
+	},
+	limitations: [
+		"No credentialed external Slack API calls; injected platform ports and real local gateway socket used as required.",
+		"Concurrent lock failures are intentionally retained; no source files changed.",
+		"Gateway teardown still emits invalid socket write count: -32 warnings; not suppressed.",
+		"Biome check exits 0 after import/format fixes, with 15 existing test-style diagnostics (explicit any, non-null assertions, void union and template suggestion) retained.",
+		"Coverage means an obligation was exercised/reviewed, not that it passed: RT-SLACK-33 remains a completion blocker.",
+	],
+	executorQa: matrix,
+};
+await Bun.write(reportPath, `${JSON.stringify(report, null, 2)}\n`);
+console.log(JSON.stringify({ counts: report.counts, blockers, reportPath }));

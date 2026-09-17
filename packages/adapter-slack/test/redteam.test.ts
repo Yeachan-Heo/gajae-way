@@ -1,10 +1,11 @@
 import { afterEach, expect, spyOn, test } from "bun:test";
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { type ChatMessagePayload, isPlatformMessageId } from "@gajaeway/protocol";
-import { SlackApiError, SlackWebApi } from "../src/api";
+import { deliveryFailureIsAmbiguous, SlackApiError, SlackUnreadableResponseError, SlackWebApi } from "../src/api";
 import { loadSlackAdapterConfig } from "../src/config";
+import { AdapterAlreadyRunningError, AdapterLock } from "../src/lock";
 import {
 	engagementForMessage,
 	type GatewayClientLike,
@@ -12,12 +13,20 @@ import {
 	replyThreadTs,
 	SKIPPED_SUBTYPES,
 	settleSlackDelivery,
+	settleSlackReaction,
 	startSlackAdapter,
 } from "../src/main";
 import { chunkSlackMessage } from "../src/mrkdwn";
 import { parseSlackMessageId, slackMessageOrigin } from "../src/origin";
-import { loadRecoveryCursors, RecoveryScheduler, recoverConversation } from "../src/recovery";
+import {
+	loadRecoveryCursors,
+	pruneParticipatedThreads,
+	RECOVERY_PARTICIPATED_THREAD_TTL_MS,
+	RecoveryScheduler,
+	recoverConversation,
+} from "../src/recovery";
 import { SlackSocketMode, type WebSocketLike } from "../src/socket";
+import { WorkingStatus } from "../src/status";
 import { normalizeSlackText } from "../src/text";
 
 const origin = { platform: "slack", kind: "channel", conversationId: "C1" } as const;
@@ -47,10 +56,11 @@ class Socket implements WebSocketLike {
 class Client implements GatewayClientLike {
 	calls: Array<{ verb: string; params: any }> = [];
 	failure?: Error;
+	engaged = false;
 	async request<T>(verb: string, params?: unknown): Promise<T> {
 		this.calls.push({ verb, params });
 		if (this.failure) throw this.failure;
-		return { engaged: false } as T;
+		return { engaged: this.engaged } as T;
 	}
 	onChatMessage() {
 		return () => {};
@@ -61,6 +71,9 @@ class Api extends SlackWebApi {
 	reactions: unknown[][] = [];
 	historyCalls = 0;
 	unreadable = false;
+	historyMessages: Record<string, unknown>[] = [];
+	replyMessages: Record<string, unknown>[] = [];
+	responses: unknown[] = [];
 	constructor() {
 		super("unused", async () => {
 			throw new Error("network forbidden");
@@ -81,8 +94,16 @@ class Api extends SlackWebApi {
 	override async conversationsHistory() {
 		this.historyCalls++;
 		if (this.unreadable) throw new SlackApiError(200, "missing_scope");
-		return { messages: [], has_more: false };
+		return { messages: this.historyMessages, has_more: false };
 	}
+	override async conversationsReplies() {
+		return { messages: this.replyMessages, has_more: false };
+	}
+	override async respond(_url: string, payload: Record<string, unknown>) {
+		this.responses.push(payload);
+	}
+	override async updateMessage() {}
+	override async deleteMessage() {}
 	override async postMessage(...args: [string, string, string?]) {
 		this.posts.push(args);
 		return { channel: args[0], ts: "2.0" };
@@ -91,8 +112,12 @@ class Api extends SlackWebApi {
 		this.reactions.push(args);
 	}
 }
-async function fixture(channels?: Record<string, { engagement: "open" }>) {
-	const home = await mkdtemp(join(tmpdir(), "slack-redteam-"));
+async function fixture(
+	channels?: Record<string, { engagement: "open" }>,
+	options: { nested?: boolean; keepRecovery?: boolean } = {},
+) {
+	const home = await mkdtemp("/tmp/slack-recovery-");
+	const cursorPath = options.nested ? join(home, "adapters/slack/recovery-cursor.json") : join(home, "cursor.json");
 	cleanups.push(() => rm(home, { recursive: true, force: true }));
 	const api = new Api();
 	const adapter = await startSlackAdapter(
@@ -107,7 +132,8 @@ async function fixture(channels?: Record<string, { engagement: "open" }>) {
 		},
 		{
 			api,
-			recoveryCursorPath: join(home, "cursor.json"),
+			recoveryCursorPath: cursorPath,
+			now: () => 10_000,
 			log: { log() {}, error() {} },
 			socketFactory: () => {
 				const socket = new Socket();
@@ -116,10 +142,17 @@ async function fixture(channels?: Record<string, { engagement: "open" }>) {
 			},
 		},
 	);
-	adapter.recovery.stop();
-	adapter.gateway.onConnected = undefined;
+	if (!options.keepRecovery) {
+		adapter.recovery.stop();
+		await adapter.recovery.idle();
+		adapter.gateway.onConnected = undefined;
+	}
 	const client = new Client();
 	adapter.gateway.adoptClient(client);
+	if (options.keepRecovery) {
+		await flush();
+		await adapter.recovery.idle();
+	}
 	cleanups.push(() => {
 		adapter.socket.stop();
 		adapter.recovery.stop();
@@ -129,6 +162,7 @@ async function fixture(channels?: Record<string, { engagement: "open" }>) {
 		api,
 		client,
 		home,
+		cursorPath,
 		async event(extra: Record<string, unknown>) {
 			await adapter.handleEvent({ type: "message", channel: "C1", user: "U1", ts: "1.0", text: "body", ...extra });
 			await adapter.ingress.drain();
@@ -435,20 +469,16 @@ test("RT-SLACK-16 recovered replies retain thread origin", async () => {
 });
 
 test("RT-SLACK-17 three-strike quarantine is re-probed after gateway reconnect", async () => {
-	const f = await fixture({ C1: { engagement: "open" } });
+	const f = await fixture({ C1: { engagement: "open" } }, { keepRecovery: true });
+	const before = f.api.historyCalls;
 	f.api.unreadable = true;
 	for (let i = 0; i < 3; i++) await f.recoverMissedMessages();
 	expect((await loadRecoveryCursors(join(f.home, "cursor.json"))).quarantined.C1?.failures).toBe(3);
-	// The fixture disables the connect hook for deterministic hand-driven passes;
-	// re-arm the real one so a reconnect is what resets the strike count.
-	// The fixture stopped the scheduler for hand-driven passes, so the reconnect
-	// pass is reproduced here as the scheduler runs it: reprobe, then recover.
 	f.api.unreadable = false;
 	f.gateway.adoptClient(new Client());
 	await flush();
-	await f.reprobeQuarantined();
-	await f.recoverMissedMessages();
-	expect(f.api.historyCalls).toBe(4);
+	await f.recovery.idle();
+	expect(f.api.historyCalls).toBe(before + 4);
 	expect((await loadRecoveryCursors(join(f.home, "cursor.json"))).quarantined.C1).toBeUndefined();
 });
 
@@ -522,4 +552,262 @@ test("RT-SLACK-25 already_reacted Web API response confirms delivery", async () 
 		delivery({ reaction: { targetMessageId: "C1:1.0", emoji: "✅", emojiName: "check" } }),
 	);
 	expect(client.calls).toEqual([{ verb: "delivery.confirm", params: { deliveryId: "delivery" } }]);
+});
+
+test("RT-SLACK-30 pending sends share failure and survive client adoption", async () => {
+	for (const adoptWhilePending of [false, true]) {
+		const client = new Client();
+		let reject!: (error: Error) => void;
+		const gate = new Promise<never>((_resolve, fail) => {
+			reject = fail;
+		});
+		client.request = async <T>(verb: string): Promise<T> => {
+			expect(verb).toBe("chat.send");
+			return gate;
+		};
+		const adapter = new ReconnectingGateway("/tmp/no-redteam.sock", new Api(), client);
+		const live = adapter.requestInbound("C1:1.0", origin, "body", engagement);
+		const recovered = adapter.requestRecovered("C1:1.0", origin, "body", engagement);
+		const healthy = new Client();
+		if (adoptWhilePending) adapter.adoptClient(healthy);
+		reject(new Error("gateway connection closed"));
+		expect(await live).toBeUndefined();
+		expect((await recovered).verdict).toBe("unavailable");
+		if (!adoptWhilePending) adapter.adoptClient(healthy);
+		expect((await adapter.requestRecovered("C1:1.0", origin, "body", engagement)).verdict).toBe("acked");
+		expect((await adapter.requestRecovered("C1:1.0", origin, "body", engagement)).verdict).toBe("duplicate");
+		expect(healthy.calls.filter((c) => c.verb === "chat.send")).toHaveLength(1);
+	}
+});
+
+test("RT-SLACK-31 unreadable success bodies are ambiguous but explicit refusal is definitive", async () => {
+	const responses = [
+		() => new Response("{}"),
+		() => new Response('{"ok":1}'),
+		() =>
+			new Response(
+				new ReadableStream({
+					start(controller) {
+						controller.error(new Error("broken body"));
+					},
+				}),
+			),
+	];
+	for (const response of responses) {
+		const api = new SlackWebApi("unused", async () => response());
+		let error: unknown;
+		try {
+			await api.call("chat.postMessage");
+		} catch (caught) {
+			error = caught;
+		}
+		expect(error).toBeInstanceOf(SlackUnreadableResponseError);
+		expect(error).not.toBeInstanceOf(SlackApiError);
+		expect(deliveryFailureIsAmbiguous(error)).toBe(true);
+		const client = new Client();
+		await settleSlackDelivery(client, api, delivery());
+		expect(client.calls).toEqual([
+			{ verb: "delivery.fail", params: { deliveryId: "delivery", ambiguous: true, reason: expect.any(String) } },
+		]);
+	}
+	const api = new SlackWebApi("unused", async () => new Response('{"ok":false,"error":"x"}'));
+	await expect(api.call("chat.postMessage")).rejects.toMatchObject({ name: "SlackApiError", code: "x" });
+	const client = new Client();
+	await settleSlackDelivery(client, api, delivery());
+	expect(client.calls[0]).toMatchObject({ verb: "delivery.fail", params: { ambiguous: false } });
+});
+
+test("RT-SLACK-33 slack stale lock has exactly one winner under 20 concurrent reclaims", async () => {
+	const home = await mkdtemp(join(tmpdir(), "slack-lock-redteam-"));
+	cleanups.push(() => rm(home, { recursive: true, force: true }));
+	const path = join(home, "adapter-slack.pid");
+	await writeFile(path, "99999\n");
+	const results = await Promise.allSettled(
+		Array.from({ length: 20 }, (_, i) => AdapterLock.acquire(home, { pid: i + 1, alive: () => false })),
+	);
+	const winners = results.filter((r) => r.status === "fulfilled");
+	expect(winners).toHaveLength(1);
+	for (const result of results)
+		if (result.status === "rejected") expect(result.reason).toBeInstanceOf(AdapterAlreadyRunningError);
+	expect((await readFile(path, "utf8")).trim()).toBe(String(winners[0]?.value.pid));
+});
+
+test("RT-SLACK-35 bounded continuation closes the gap without losing newer arrivals", async () => {
+	const messages = [6, 5, 4, 3, 2, 1].map((n) => ({ ts: `${n}.0`, user: "U1", text: `message ${n}` }));
+	const seen: string[] = [];
+	const port = {
+		async history(_channel: string, options: { oldest: string; latest?: string; cursor?: string; limit: number }) {
+			const filtered = messages.filter(
+				(m) => Number(m.ts) > Number(options.oldest) && (!options.latest || Number(m.ts) < Number(options.latest)),
+			);
+			const offset = Number(options.cursor ?? 0);
+			const more = offset + options.limit < filtered.length;
+			return {
+				messages: filtered.slice(offset, offset + options.limit),
+				has_more: more,
+				...(more ? { next_cursor: String(offset + options.limit) } : {}),
+			};
+		},
+		async replies() {
+			return { messages: [], has_more: false };
+		},
+	};
+	const options = {
+		nowMs: 10_000,
+		cursor: "0.0",
+		pageLimit: 2,
+		maxPages: 2,
+		botUserId: "UBOT",
+		async deliver(message: { ts: string }) {
+			seen.push(message.ts);
+			return "acked" as const;
+		},
+	};
+	const first = await recoverConversation(port, "C1", options);
+	expect(seen).toEqual(["3.0", "4.0", "5.0", "6.0"]);
+	expect(first.advancedTo).toBeUndefined();
+	expect(first.continuation).toEqual({ olderThan: "3.0", through: "6.0" });
+	if (!first.continuation) throw new Error("Expected a continuation for the bounded first pass");
+	messages.unshift({ ts: "7.0", user: "U1", text: "new arrival" });
+	const second = await recoverConversation(port, "C1", { ...options, latest: first.continuation.olderThan });
+	expect(second.continuation).toBeUndefined();
+	expect(second.failed).toBe(false);
+	expect(seen.slice(4)).toEqual(["1.0", "2.0"]);
+	const third = await recoverConversation(port, "C1", { ...options, cursor: first.continuation.through });
+	expect(third.advancedTo).toBe("7.0");
+	expect(seen).toEqual(["3.0", "4.0", "5.0", "6.0", "1.0", "2.0", "7.0"]);
+});
+
+test("RT-SLACK-36 participated threads recover without history and expire", async () => {
+	const f = await fixture({ C1: { engagement: "open" } });
+	f.client.engaged = true;
+	await f.event({ ts: "2.0", thread_ts: "1.0" });
+	await f.recoverMissedMessages();
+	let state = await loadRecoveryCursors(f.cursorPath);
+	expect(state.participatedThreads["C1:1.0"]).toBeDefined();
+	f.api.replyMessages = [{ ts: "3.0", user: "U1", text: "late thread reply" }];
+	expect(await f.recoverMissedMessages()).toBe(true);
+	expect(f.api.historyMessages).toEqual([]);
+	expect(f.client.calls.filter((c) => c.verb === "chat.send").at(-1)?.params).toMatchObject({
+		messageId: "C1:3.0",
+		origin: { kind: "thread", conversationId: "C1:1.0", parentId: "C1" },
+	});
+	state = await loadRecoveryCursors(f.cursorPath);
+	expect(pruneParticipatedThreads(state, 10_001 + RECOVERY_PARTICIPATED_THREAD_TTL_MS).participatedThreads).toEqual({});
+});
+
+test("RT-SLACK-37 only terminal refusals consume dead-letter budget", async () => {
+	const f = await fixture({ C1: { engagement: "open" } });
+	f.api.historyMessages = [{ ts: "1.0", user: "U1", text: "poison" }];
+	const terminal = Object.assign(new Error("refused"), { code: "invalid_params" });
+	for (const [error, attempts] of [
+		[terminal, 1],
+		[new Error("connection closed"), 1],
+		[terminal, 2],
+		[terminal, 3],
+	] as const) {
+		const client = new Client();
+		client.failure = error;
+		f.gateway.adoptClient(client);
+		await f.recoverMissedMessages();
+		const state = await loadRecoveryCursors(f.cursorPath);
+		if (attempts < 3) {
+			expect(state.attempts["C1:1.0"]?.attempts).toBe(attempts);
+			expect(state.deadLetters).toEqual([]);
+			expect(state.recoveredThrough.C1).toBeUndefined();
+		}
+	}
+	const state = await loadRecoveryCursors(f.cursorPath);
+	expect(state.deadLetters).toHaveLength(1);
+	expect(state.deadLetters[0]).toMatchObject({ classification: "terminal-message", attempts: 3, messageId: "C1:1.0" });
+	expect(state.deadLetterDigest.C1?.count).toBe(1);
+	expect(state.recoveredThrough.C1).toBe("1.0");
+	f.api.historyMessages = [{ ts: "2.0", user: "U1", text: "unknown" }];
+	for (let i = 0; i < 7; i++) {
+		const client = new Client();
+		client.failure = new Error("boom");
+		f.gateway.adoptClient(client);
+		expect(await f.recoverMissedMessages()).toBe(false);
+	}
+	const unknown = await loadRecoveryCursors(f.cursorPath);
+	expect(unknown.attempts["C1:2.0"]).toMatchObject({ attempts: 0, classification: "write-path-unknown" });
+	expect(unknown.deadLetters).toHaveLength(1);
+	expect(unknown.recoveredThrough.C1).toBe("1.0");
+});
+
+test("RT-SLACK-38 unsaved recovery state prevents success until disk is restored", async () => {
+	const f = await fixture({ C1: { engagement: "open" } }, { nested: true });
+	await f.recoverMissedMessages();
+	const store = join(f.home, "adapters/slack");
+	await rm(store, { recursive: true });
+	await writeFile(store, "blocked directory");
+	f.api.historyMessages = [{ ts: "1.0", user: "U1", text: "persist me" }];
+	expect(await f.recoverMissedMessages()).toBe(false);
+	await rm(store);
+	await mkdir(store);
+	expect(await f.recoverMissedMessages()).toBe(true);
+	expect((await loadRecoveryCursors(f.cursorPath)).recoveredThrough.C1).toBe("1.0");
+	expect(f.client.calls.filter((c) => c.verb === "chat.send")).toHaveLength(1);
+});
+
+test("RT-SLACK-39 slash acknowledgements reflect restart failure duplicates and unknown commands", async () => {
+	const f = await fixture();
+	f.client.engaged = true;
+	const command = {
+		command: "/restart",
+		channel_id: "C1",
+		user_id: "U1",
+		trigger_id: "one",
+		response_url: "https://invalid.test/response",
+		text: "",
+	};
+	await f.handleSlashCommand(command);
+	await f.handleSlashCommand(command);
+	f.client.failure = new Error("gateway connection closed");
+	await f.handleSlashCommand({ ...command, trigger_id: "two" });
+	await f.handleSlashCommand({ ...command, command: "/unknown", trigger_id: "three" });
+	expect(f.api.responses).toEqual(
+		[
+			"🦞 restarting the gateway",
+			"already handled",
+			"the gateway is unreachable right now; try again shortly",
+			"unknown command",
+		].map((text) => ({ response_type: "ephemeral", text })),
+	);
+});
+
+test("RT-SLACK-40 addressed accepted turns post working status before any progress", async () => {
+	const api = new Api();
+	const client = new Client();
+	client.engaged = true;
+	const status = new WorkingStatus(api);
+	const gateway = new ReconnectingGateway("/tmp/no-redteam.sock", api, client, status);
+	await gateway.requestInbound("C1:1.0", origin, "overheard", engagement);
+	await flush();
+	expect(api.posts).toEqual([]);
+	await gateway.requestInbound("C1:2.0", origin, "addressed", { ...engagement, mentioned: true });
+	await flush();
+	expect(api.posts).toEqual([["C1", "⏳ working…", undefined]]);
+	const thread = { platform: "slack", kind: "thread", conversationId: "C1:1.0", parentId: "C1" } as const;
+	await gateway.requestInbound("C1:3.0", thread, "thread", { ...engagement, mentioned: true });
+	await flush();
+	expect(api.posts[1]).toEqual(["C1", "⏳ working…", "1.0"]);
+	await status.clear("C1");
+	await status.clear("C1:1.0");
+});
+
+test("RT-SLACK-41 unknown rocket reaction fails definitively without a Slack call", async () => {
+	const api = new Api();
+	const client = new Client();
+	await settleSlackReaction(
+		client,
+		api,
+		delivery({
+			reaction: { targetMessageId: "C1:1.0", emoji: "🚀", emojiName: "rocket" },
+		} as Partial<ChatMessagePayload>),
+	);
+	expect(api.reactions).toEqual([]);
+	expect(client.calls).toEqual([
+		{ verb: "delivery.fail", params: { deliveryId: "delivery", reason: expect.any(String), ambiguous: false } },
+	]);
 });
