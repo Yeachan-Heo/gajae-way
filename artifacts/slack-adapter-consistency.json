@@ -1,0 +1,29 @@
+{
+  "kind": "artifact-consistency-receipt",
+  "sourceHash": "sha256:412c90d6ba22fb5309c14d4fa2b67d655dddd1b234d49916e2de11c36637fe0d",
+  "frozenCommit": "145fa8f",
+  "verdict": "passed",
+  "checks": [
+    "JUnit test/failure counts match report",
+    "all 63 IDs present exactly once",
+    "only RT-SLACK-54 fails",
+    "four real CLI probes pass",
+    "build passes",
+    "CLI replay byte-identical to frozen commit",
+    "all artifact refs exist",
+    "test snapshots byte-identical",
+    "product source unchanged"
+  ],
+  "counts": {
+    "tests": 81,
+    "passed": 80,
+    "failed": 1,
+    "cliProbes": 4,
+    "cliPassed": 4,
+    "stableCaseIds": 63,
+    "supportingTests": 209,
+    "supportingPassed": 209,
+    "lockLoopIterations": 10,
+    "lockLoopPassed": 10
+  }
+}

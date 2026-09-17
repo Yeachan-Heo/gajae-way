@@ -1,138 +1,177 @@
 <?xml version="1.0" encoding="UTF-8"?>
-<!-- sourceHash: sha256:042d2126b51914390a20c478dc58e04175f03d7b1d8737b7581e1556af3572b7; frozenCommit: cbd4d1a -->
-<testsuites name="bun test" tests="61" assertions="63" failures="0" skipped="55" time="4.951755">
-  <testsuite name="packages/adapter-slack/test/redteam.test.ts" file="packages/adapter-slack/test/redteam.test.ts" tests="45" assertions="32" failures="0" skipped="42" time="2.481004" hostname="MacBook-Pro-3.local">
-    <testcase name="RT-SLACK-01 throwing handlers ack first, retries dedupe, malformed frames survive and disconnect reconnects" classname="" time="0" file="packages/adapter-slack/test/redteam.test.ts" line="189" assertions="0">
+<!-- sourceHash: sha256:412c90d6ba22fb5309c14d4fa2b67d655dddd1b234d49916e2de11c36637fe0d; frozenCommit: 145fa8f -->
+<testsuites name="bun test" tests="77" assertions="63" failures="0" skipped="71" time="5.080145">
+  <testsuite name="packages/adapter-slack/test/redteam.test.ts" file="packages/adapter-slack/test/redteam.test.ts" tests="58" assertions="32" failures="0" skipped="55" time="2.455834" hostname="MacBook-Pro-3.local">
+    <testcase name="RT-SLACK-01 throwing handlers ack first, retries dedupe, malformed frames survive and disconnect reconnects" classname="" time="0" file="packages/adapter-slack/test/redteam.test.ts" line="193" assertions="0">
       <skipped />
     </testcase>
-    <testcase name="RT-SLACK-02 hostile timestamps never emit non-platform message ids" classname="" time="0" file="packages/adapter-slack/test/redteam.test.ts" line="229" assertions="0">
+    <testcase name="RT-SLACK-02 hostile timestamps never emit non-platform message ids" classname="" time="0" file="packages/adapter-slack/test/redteam.test.ts" line="233" assertions="0">
       <skipped />
     </testcase>
-    <testcase name="RT-SLACK-03 foreign reply target is a definitive delivery failure, never thread_ts" classname="" time="0" file="packages/adapter-slack/test/redteam.test.ts" line="238" assertions="0">
+    <testcase name="RT-SLACK-03 foreign reply target is a definitive delivery failure, never thread_ts" classname="" time="0" file="packages/adapter-slack/test/redteam.test.ts" line="242" assertions="0">
       <skipped />
     </testcase>
-    <testcase name="RT-SLACK-04 literal mentions in code count; entities decode once and broadcasts normalize" classname="" time="0" file="packages/adapter-slack/test/redteam.test.ts" line="250" assertions="0">
+    <testcase name="RT-SLACK-04 literal mentions in code count; entities decode once and broadcasts normalize" classname="" time="0" file="packages/adapter-slack/test/redteam.test.ts" line="254" assertions="0">
       <skipped />
     </testcase>
-    <testcase name="RT-SLACK-05 fifty-thousand-character fenced text has bounded balanced chunks" classname="" time="0" file="packages/adapter-slack/test/redteam.test.ts" line="265" assertions="0">
+    <testcase name="RT-SLACK-05 fifty-thousand-character fenced text has bounded balanced chunks" classname="" time="0" file="packages/adapter-slack/test/redteam.test.ts" line="269" assertions="0">
       <skipped />
     </testcase>
-    <testcase name="RT-SLACK-06 file-only body survives and empty body drops" classname="" time="0" file="packages/adapter-slack/test/redteam.test.ts" line="274" assertions="0">
+    <testcase name="RT-SLACK-06 file-only body survives and empty body drops" classname="" time="0" file="packages/adapter-slack/test/redteam.test.ts" line="278" assertions="0">
       <skipped />
     </testcase>
-    <testcase name="RT-SLACK-07 own, hidden, every skipped subtype, unchanged/empty edits and app_mention never send" classname="" time="0" file="packages/adapter-slack/test/redteam.test.ts" line="286" assertions="0">
+    <testcase name="RT-SLACK-07 own, hidden, every skipped subtype, unchanged/empty edits and app_mention never send" classname="" time="0" file="packages/adapter-slack/test/redteam.test.ts" line="290" assertions="0">
       <skipped />
     </testcase>
-    <testcase name="RT-SLACK-08 bot parent mentions; unknown parent omits fromSelf" classname="" time="0" file="packages/adapter-slack/test/redteam.test.ts" line="304" assertions="0">
+    <testcase name="RT-SLACK-08 bot parent mentions; unknown parent omits fromSelf" classname="" time="0" file="packages/adapter-slack/test/redteam.test.ts" line="308" assertions="0">
       <skipped />
     </testcase>
-    <testcase name="RT-SLACK-09 transport failure ambiguous, Slack API failure definitive" classname="" time="0" file="packages/adapter-slack/test/redteam.test.ts" line="313" assertions="0">
+    <testcase name="RT-SLACK-09 transport failure ambiguous, Slack API failure definitive" classname="" time="0" file="packages/adapter-slack/test/redteam.test.ts" line="317" assertions="0">
       <skipped />
     </testcase>
-    <testcase name="RT-SLACK-10 all three chunks keep thread and duplicate warning" classname="" time="0" file="packages/adapter-slack/test/redteam.test.ts" line="333" assertions="0">
+    <testcase name="RT-SLACK-10 all three chunks keep thread and duplicate warning" classname="" time="0" file="packages/adapter-slack/test/redteam.test.ts" line="337" assertions="0">
       <skipped />
     </testcase>
-    <testcase name="RT-SLACK-11 malformed and unknown reactions fail without API; already_reacted confirms" classname="" time="0" file="packages/adapter-slack/test/redteam.test.ts" line="351" assertions="0">
+    <testcase name="RT-SLACK-11 malformed and unknown reactions fail without API; already_reacted confirms" classname="" time="0" file="packages/adapter-slack/test/redteam.test.ts" line="355" assertions="0">
       <skipped />
     </testcase>
-    <testcase name="RT-SLACK-12 disconnected edit overflow retains newest 256 and replays ordered" classname="" time="0" file="packages/adapter-slack/test/redteam.test.ts" line="375" assertions="0">
+    <testcase name="RT-SLACK-12 disconnected edit overflow retains newest 256 and replays ordered" classname="" time="0" file="packages/adapter-slack/test/redteam.test.ts" line="379" assertions="0">
       <skipped />
     </testcase>
-    <testcase name="RT-SLACK-13 failed edit remains queued and reconnects for replay" classname="" time="0" file="packages/adapter-slack/test/redteam.test.ts" line="393" assertions="0">
+    <testcase name="RT-SLACK-13 failed edit remains queued and reconnects for replay" classname="" time="0" file="packages/adapter-slack/test/redteam.test.ts" line="397" assertions="0">
       <skipped />
     </testcase>
-    <testcase name="RT-SLACK-14 duplicate inbound dedupes but unavailable is forgotten" classname="" time="0" file="packages/adapter-slack/test/redteam.test.ts" line="408" assertions="0">
+    <testcase name="RT-SLACK-14 duplicate inbound dedupes but unavailable is forgotten" classname="" time="0" file="packages/adapter-slack/test/redteam.test.ts" line="412" assertions="0">
       <skipped />
     </testcase>
-    <testcase name="RT-SLACK-15 newest-first recovery delivers ascending and cannot cross unavailable" classname="" time="0" file="packages/adapter-slack/test/redteam.test.ts" line="422" assertions="0">
+    <testcase name="RT-SLACK-15 newest-first recovery delivers ascending and cannot cross unavailable" classname="" time="0" file="packages/adapter-slack/test/redteam.test.ts" line="426" assertions="0">
       <skipped />
     </testcase>
-    <testcase name="RT-SLACK-16 recovered replies retain thread origin" classname="" time="0" file="packages/adapter-slack/test/redteam.test.ts" line="458" assertions="0">
+    <testcase name="RT-SLACK-16 recovered replies retain thread origin" classname="" time="0" file="packages/adapter-slack/test/redteam.test.ts" line="462" assertions="0">
       <skipped />
     </testcase>
-    <testcase name="RT-SLACK-17 three-strike quarantine is re-probed after gateway reconnect" classname="" time="0" file="packages/adapter-slack/test/redteam.test.ts" line="483" assertions="0">
+    <testcase name="RT-SLACK-17 three-strike quarantine is re-probed after gateway reconnect" classname="" time="0" file="packages/adapter-slack/test/redteam.test.ts" line="487" assertions="0">
       <skipped />
     </testcase>
-    <testcase name="RT-SLACK-18 twenty recovery triggers remain single flight" classname="" time="0" file="packages/adapter-slack/test/redteam.test.ts" line="497" assertions="0">
+    <testcase name="RT-SLACK-18 twenty recovery triggers remain single flight" classname="" time="0" file="packages/adapter-slack/test/redteam.test.ts" line="501" assertions="0">
       <skipped />
     </testcase>
-    <testcase name="RT-SLACK-19 credential prefixes fail without secrets, relative files resolve and unknown channel keys reject" classname="" time="0" file="packages/adapter-slack/test/redteam.test.ts" line="522" assertions="0">
+    <testcase name="RT-SLACK-19 credential prefixes fail without secrets, relative files resolve and unknown channel keys reject" classname="" time="0" file="packages/adapter-slack/test/redteam.test.ts" line="526" assertions="0">
       <skipped />
     </testcase>
-    <testcase name="RT-SLACK-25 already_reacted Web API response confirms delivery" classname="" time="0" file="packages/adapter-slack/test/redteam.test.ts" line="555" assertions="0">
+    <testcase name="RT-SLACK-25 already_reacted Web API response confirms delivery" classname="" time="0" file="packages/adapter-slack/test/redteam.test.ts" line="559" assertions="0">
       <skipped />
     </testcase>
-    <testcase name="RT-SLACK-30 pending sends share failure and survive client adoption" classname="" time="0" file="packages/adapter-slack/test/redteam.test.ts" line="569" assertions="0">
+    <testcase name="RT-SLACK-30 pending sends share failure and survive client adoption" classname="" time="0" file="packages/adapter-slack/test/redteam.test.ts" line="573" assertions="0">
       <skipped />
     </testcase>
-    <testcase name="RT-SLACK-31 unreadable success bodies are ambiguous but explicit refusal is definitive" classname="" time="0" file="packages/adapter-slack/test/redteam.test.ts" line="595" assertions="0">
+    <testcase name="RT-SLACK-31 unreadable success bodies are ambiguous but explicit refusal is definitive" classname="" time="0" file="packages/adapter-slack/test/redteam.test.ts" line="599" assertions="0">
       <skipped />
     </testcase>
-    <testcase name="RT-SLACK-33 slack stale lock has exactly one winner under 20 concurrent reclaims" classname="" time="0.09386" file="packages/adapter-slack/test/redteam.test.ts" line="632" assertions="21" />
-    <testcase name="RT-SLACK-35 bounded continuation closes the gap without losing newer arrivals" classname="" time="0" file="packages/adapter-slack/test/redteam.test.ts" line="647" assertions="0">
+    <testcase name="RT-SLACK-33 slack stale lock has exactly one winner under 20 concurrent reclaims" classname="" time="0.053517" file="packages/adapter-slack/test/redteam.test.ts" line="636" assertions="21" />
+    <testcase name="RT-SLACK-35 bounded continuation closes the gap without losing newer arrivals" classname="" time="0" file="packages/adapter-slack/test/redteam.test.ts" line="651" assertions="0">
       <skipped />
     </testcase>
-    <testcase name="RT-SLACK-36 participated threads recover without history and expire" classname="" time="0" file="packages/adapter-slack/test/redteam.test.ts" line="693" assertions="0">
+    <testcase name="RT-SLACK-36 participated threads recover without history and expire" classname="" time="0" file="packages/adapter-slack/test/redteam.test.ts" line="697" assertions="0">
       <skipped />
     </testcase>
-    <testcase name="RT-SLACK-37 only terminal refusals consume dead-letter budget" classname="" time="0" file="packages/adapter-slack/test/redteam.test.ts" line="711" assertions="0">
+    <testcase name="RT-SLACK-37 only terminal refusals consume dead-letter budget" classname="" time="0" file="packages/adapter-slack/test/redteam.test.ts" line="715" assertions="0">
       <skipped />
     </testcase>
-    <testcase name="RT-SLACK-38 unsaved recovery state prevents success until disk is restored" classname="" time="0" file="packages/adapter-slack/test/redteam.test.ts" line="750" assertions="0">
+    <testcase name="RT-SLACK-38 unsaved recovery state prevents success until disk is restored" classname="" time="0" file="packages/adapter-slack/test/redteam.test.ts" line="754" assertions="0">
       <skipped />
     </testcase>
-    <testcase name="RT-SLACK-39 slash acknowledgements reflect restart failure duplicates and unknown commands" classname="" time="0" file="packages/adapter-slack/test/redteam.test.ts" line="765" assertions="0">
+    <testcase name="RT-SLACK-39 slash acknowledgements reflect restart failure duplicates and unknown commands" classname="" time="0" file="packages/adapter-slack/test/redteam.test.ts" line="769" assertions="0">
       <skipped />
     </testcase>
-    <testcase name="RT-SLACK-40 addressed accepted turns post working status before any progress" classname="" time="0" file="packages/adapter-slack/test/redteam.test.ts" line="791" assertions="0">
+    <testcase name="RT-SLACK-40 addressed accepted turns get a presence reaction on the triggering message before any progress" classname="" time="0" file="packages/adapter-slack/test/redteam.test.ts" line="795" assertions="0">
       <skipped />
     </testcase>
-    <testcase name="RT-SLACK-41 unknown rocket reaction fails definitively without a Slack call" classname="" time="0" file="packages/adapter-slack/test/redteam.test.ts" line="811" assertions="0">
+    <testcase name="RT-SLACK-41 unknown rocket reaction fails definitively without a Slack call" classname="" time="0" file="packages/adapter-slack/test/redteam.test.ts" line="822" assertions="0">
       <skipped />
     </testcase>
-    <testcase name="RT-SLACK-42 orphaned reclaim marker permits acquisition within two seconds and is removed" classname="" time="0" file="packages/adapter-slack/test/redteam.test.ts" line="826" assertions="0">
+    <testcase name="RT-SLACK-42 orphaned reclaim marker permits acquisition within two seconds and is removed" classname="" time="0" file="packages/adapter-slack/test/redteam.test.ts" line="837" assertions="0">
       <skipped />
     </testcase>
-    <testcase name="RT-SLACK-43 live holder arriving during election is never replaced by waiting contenders" classname="" time="0" file="packages/adapter-slack/test/redteam.test.ts" line="840" assertions="0">
+    <testcase name="RT-SLACK-43 live holder arriving during election is never replaced by waiting contenders" classname="" time="0" file="packages/adapter-slack/test/redteam.test.ts" line="851" assertions="0">
       <skipped />
     </testcase>
-    <testcase name="RT-SLACK-44 release by a former holder after losing election preserves the winner pidfile" classname="" time="0" file="packages/adapter-slack/test/redteam.test.ts" line="874" assertions="0">
+    <testcase name="RT-SLACK-44 release by a former holder after losing election preserves the winner pidfile" classname="" time="0" file="packages/adapter-slack/test/redteam.test.ts" line="885" assertions="0">
       <skipped />
     </testcase>
-    <testcase name="RT-SLACK-45 live 0.9s marker survives timeout naming new holder" classname="" time="1.18909" file="packages/adapter-slack/test/redteam.test.ts" line="898" assertions="8" />
-    <testcase name="RT-SLACK-45 two waiters reclaim old dead marker with one winner" classname="" time="1.190184" file="packages/adapter-slack/test/redteam.test.ts" line="898" assertions="3" />
-    <testcase name="RT-SLACK-47 rate-limit settlement 4 refusals Retry-After 2" classname="" time="0" file="packages/adapter-slack/test/redteam.test.ts" line="944" assertions="0">
+    <testcase name="RT-SLACK-45 live 0.9s marker survives timeout naming new holder" classname="" time="1.19153" file="packages/adapter-slack/test/redteam.test.ts" line="909" assertions="8" />
+    <testcase name="RT-SLACK-45 two waiters reclaim old dead marker with one winner" classname="" time="1.202923" file="packages/adapter-slack/test/redteam.test.ts" line="909" assertions="3" />
+    <testcase name="RT-SLACK-47 rate-limit settlement 4 refusals Retry-After 2" classname="" time="0" file="packages/adapter-slack/test/redteam.test.ts" line="955" assertions="0">
       <skipped />
     </testcase>
-    <testcase name="RT-SLACK-47 rate-limit settlement 2 refusals Retry-After 2" classname="" time="0" file="packages/adapter-slack/test/redteam.test.ts" line="944" assertions="0">
+    <testcase name="RT-SLACK-47 rate-limit settlement 2 refusals Retry-After 2" classname="" time="0" file="packages/adapter-slack/test/redteam.test.ts" line="955" assertions="0">
       <skipped />
     </testcase>
-    <testcase name="RT-SLACK-47 rate-limit settlement 2 refusals Retry-After 99" classname="" time="0" file="packages/adapter-slack/test/redteam.test.ts" line="944" assertions="0">
+    <testcase name="RT-SLACK-47 rate-limit settlement 2 refusals Retry-After 99" classname="" time="0" file="packages/adapter-slack/test/redteam.test.ts" line="955" assertions="0">
       <skipped />
     </testcase>
-    <testcase name="RT-SLACK-47 rate-limit settlement 2 refusals Retry-After null" classname="" time="0" file="packages/adapter-slack/test/redteam.test.ts" line="944" assertions="0">
+    <testcase name="RT-SLACK-47 rate-limit settlement 2 refusals Retry-After null" classname="" time="0" file="packages/adapter-slack/test/redteam.test.ts" line="955" assertions="0">
       <skipped />
     </testcase>
-    <testcase name="RT-SLACK-48 concurrent delivery queue drains before cosmetic without starvation across channels" classname="" time="0" file="packages/adapter-slack/test/redteam.test.ts" line="972" assertions="0">
+    <testcase name="RT-SLACK-48 concurrent delivery queue drains before cosmetic without starvation across channels" classname="" time="0" file="packages/adapter-slack/test/redteam.test.ts" line="983" assertions="0">
       <skipped />
     </testcase>
-    <testcase name="RT-SLACK-49 status coalesces thirty ticks and activity-only changes while clear bypasses window" classname="" time="0" file="packages/adapter-slack/test/redteam.test.ts" line="1006" assertions="0">
+    <testcase name="RT-SLACK-49 presence coalesces thirty ticks into a bounded number of reaction swaps and clears once" classname="" time="0" file="packages/adapter-slack/test/redteam.test.ts" line="1020" assertions="0">
       <skipped />
     </testcase>
-    <testcase name="RT-SLACK-51 unengaged truncated reply walks persist and drain pending roots without aging participation" classname="" time="0" file="packages/adapter-slack/test/redteam.test.ts" line="1053" assertions="0">
+    <testcase name="RT-SLACK-51 unengaged truncated reply walks persist and drain pending roots without aging participation" classname="" time="0" file="packages/adapter-slack/test/redteam.test.ts" line="1059" assertions="0">
       <skipped />
     </testcase>
-    <testcase name="RT-SLACK-52 recent clean recovery gate outage 2000 quarantine false" classname="" time="0" file="packages/adapter-slack/test/redteam.test.ts" line="1093" assertions="0">
+    <testcase name="RT-SLACK-52 recent clean recovery gate outage 2000 quarantine false" classname="" time="0" file="packages/adapter-slack/test/redteam.test.ts" line="1099" assertions="0">
       <skipped />
     </testcase>
-    <testcase name="RT-SLACK-52 recent clean recovery gate outage 6000 quarantine false" classname="" time="0" file="packages/adapter-slack/test/redteam.test.ts" line="1093" assertions="0">
+    <testcase name="RT-SLACK-52 recent clean recovery gate outage 6000 quarantine false" classname="" time="0" file="packages/adapter-slack/test/redteam.test.ts" line="1099" assertions="0">
       <skipped />
     </testcase>
-    <testcase name="RT-SLACK-52 recent clean recovery gate outage 2000 quarantine true" classname="" time="0" file="packages/adapter-slack/test/redteam.test.ts" line="1093" assertions="0">
+    <testcase name="RT-SLACK-52 recent clean recovery gate outage 2000 quarantine true" classname="" time="0" file="packages/adapter-slack/test/redteam.test.ts" line="1099" assertions="0">
+      <skipped />
+    </testcase>
+    <testcase name="RT-SLACK-53 gradient buckets coalescing exact cleanup and stale timeout" classname="" time="0" file="packages/adapter-slack/test/redteam.test.ts" line="1118" assertions="0">
+      <skipped />
+    </testcase>
+    <testcase name="RT-SLACK-54 clear during add removes late marker and replacement cleans old message" classname="" time="0" file="packages/adapter-slack/test/redteam.test.ts" line="1174" assertions="0">
+      <skipped />
+    </testcase>
+    <testcase name="RT-SLACK-54 cleanup errors are logged without blocking delivery confirmation" classname="" time="0" file="packages/adapter-slack/test/redteam.test.ts" line="1199" assertions="0">
+      <skipped />
+    </testcase>
+    <testcase name="RT-SLACK-57 persona allowlist is disjoint and thumbs up leaves presence alone" classname="" time="0" file="packages/adapter-slack/test/redteam.test.ts" line="1216" assertions="0">
+      <skipped />
+    </testcase>
+    <testcase name="RT-SLACK-58 orphan election tombstone cleanup live transition false" classname="" time="0" file="packages/adapter-slack/test/redteam.test.ts" line="1236" assertions="0">
+      <skipped />
+    </testcase>
+    <testcase name="RT-SLACK-58 orphan election tombstone cleanup live transition true" classname="" time="0" file="packages/adapter-slack/test/redteam.test.ts" line="1236" assertions="0">
+      <skipped />
+    </testcase>
+    <testcase name="RT-SLACK-59 dispatch prioritizes late delivery over 1 queued cosmetics" classname="" time="0" file="packages/adapter-slack/test/redteam.test.ts" line="1264" assertions="0">
+      <skipped />
+    </testcase>
+    <testcase name="RT-SLACK-59 dispatch prioritizes late delivery over 20 queued cosmetics" classname="" time="0" file="packages/adapter-slack/test/redteam.test.ts" line="1264" assertions="0">
+      <skipped />
+    </testcase>
+    <testcase name="RT-SLACK-60 body ratelimited 2 refusals retries exact Retry-After" classname="" time="0" file="packages/adapter-slack/test/redteam.test.ts" line="1299" assertions="0">
+      <skipped />
+    </testcase>
+    <testcase name="RT-SLACK-60 body ratelimited 4 refusals retries exact Retry-After" classname="" time="0" file="packages/adapter-slack/test/redteam.test.ts" line="1299" assertions="0">
+      <skipped />
+    </testcase>
+    <testcase name="RT-SLACK-61 bounded pending thread cursor drains five replies in two passes without resend" classname="" time="0" file="packages/adapter-slack/test/redteam.test.ts" line="1321" assertions="0">
+      <skipped />
+    </testcase>
+    <testcase name="RT-SLACK-62 overlapping link outages retain long socket outage despite short gateway blip" classname="" time="0" file="packages/adapter-slack/test/redteam.test.ts" line="1359" assertions="0">
+      <skipped />
+    </testcase>
+    <testcase name="RT-SLACK-61 adapter persists pending through across bounded walks and clears completed root" classname="" time="0" file="packages/adapter-slack/test/redteam.test.ts" line="1378" assertions="0">
       <skipped />
     </testcase>
   </testsuite>
-  <testsuite name="packages/gateway/test/slack-adapter-redteam.e2e.test.ts" file="packages/gateway/test/slack-adapter-redteam.e2e.test.ts" tests="16" assertions="31" failures="0" skipped="13" time="2.460769" hostname="MacBook-Pro-3.local">
+  <testsuite name="packages/gateway/test/slack-adapter-redteam.e2e.test.ts" file="packages/gateway/test/slack-adapter-redteam.e2e.test.ts" tests="19" assertions="31" failures="0" skipped="16" time="2.511403" hostname="MacBook-Pro-3.local">
     <testcase name="RT-SLACK-20 unconfigured unmentioned Slack channel is context only" classname="" time="0" file="packages/gateway/test/slack-adapter-redteam.e2e.test.ts" line="73" assertions="0">
       <skipped />
     </testcase>
@@ -157,7 +196,7 @@
     <testcase name="RT-SLACK-34 plain channel reply threads under the triggering message; an explicit target wins" classname="" time="0" file="packages/gateway/test/slack-adapter-redteam.e2e.test.ts" line="185" assertions="0">
       <skipped />
     </testcase>
-    <testcase name="RT-SLACK-33 discord stale lock has exactly one winner under 20 concurrent reclaims" classname="" time="0.075741" file="packages/gateway/test/slack-adapter-redteam.e2e.test.ts" line="196" assertions="21" />
+    <testcase name="RT-SLACK-33 discord stale lock has exactly one winner under 20 concurrent reclaims" classname="" time="0.111697" file="packages/gateway/test/slack-adapter-redteam.e2e.test.ts" line="196" assertions="21" />
     <testcase name="RT-SLACK-46 slack channel triggering root preserves platform routing on redelivery" classname="" time="0" file="packages/gateway/test/slack-adapter-redteam.e2e.test.ts" line="215" assertions="0">
       <skipped />
     </testcase>
@@ -173,7 +212,16 @@
     <testcase name="RT-SLACK-50 real socket activity bounds burst details thinking writing and exactly one final" classname="" time="0" file="packages/gateway/test/slack-adapter-redteam.e2e.test.ts" line="244" assertions="0">
       <skipped />
     </testcase>
-    <testcase name="RT-SLACK-45 discord live marker survives and timeout names pidfile holder" classname="" time="1.182705" file="packages/gateway/test/slack-adapter-redteam.e2e.test.ts" line="304" assertions="7" />
-    <testcase name="RT-SLACK-45 discord dead marker elects one of two waiters" classname="" time="1.195106" file="packages/gateway/test/slack-adapter-redteam.e2e.test.ts" line="304" assertions="3" />
+    <testcase name="RT-SLACK-45 discord live marker survives and timeout names pidfile holder" classname="" time="1.195102" file="packages/gateway/test/slack-adapter-redteam.e2e.test.ts" line="304" assertions="7" />
+    <testcase name="RT-SLACK-45 discord dead marker elects one of two waiters" classname="" time="1.195779" file="packages/gateway/test/slack-adapter-redteam.e2e.test.ts" line="304" assertions="3" />
+    <testcase name="RT-SLACK-56 real gateway presence precedes progress and clears thread delivery" classname="" time="0" file="packages/gateway/test/slack-adapter-redteam.e2e.test.ts" line="343" assertions="0">
+      <skipped />
+    </testcase>
+    <testcase name="RT-SLACK-56 real gateway presence precedes progress and clears silent final" classname="" time="0" file="packages/gateway/test/slack-adapter-redteam.e2e.test.ts" line="343" assertions="0">
+      <skipped />
+    </testcase>
+    <testcase name="RT-SLACK-63 edited channel response uses original root and slash new remains unthreaded" classname="" time="0" file="packages/gateway/test/slack-adapter-redteam.e2e.test.ts" line="398" assertions="0">
+      <skipped />
+    </testcase>
   </testsuite>
 </testsuites>
