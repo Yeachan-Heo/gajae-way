@@ -372,6 +372,7 @@ for (const silent of [false, true])
 			async removeReaction(channel: string, ts: string, name: string) {
 				removed.push([channel, ts, name]);
 			},
+			async setThreadStatus() {},
 			async postMessage(channel: string, text: string, threadTs?: string) {
 				posts.push([channel, text, threadTs]);
 				return { channel, ts: "9.0" };

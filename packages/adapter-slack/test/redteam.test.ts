@@ -130,6 +130,10 @@ class Api extends SlackWebApi {
 	override async removeReaction(channel: string, ts: string, name: string) {
 		this.removed.push([channel, ts, name]);
 	}
+	statuses: [string, string, string][] = [];
+	override async setThreadStatus(channel: string, threadTs: string, status: string) {
+		this.statuses.push([channel, threadTs, status]);
+	}
 }
 async function fixture(
 	channels?: Record<string, { engagement: "open" }>,
@@ -795,23 +799,27 @@ test("RT-SLACK-39 slash acknowledgements reflect restart failure duplicates and 
 	);
 });
 
-test("RT-SLACK-40 addressed accepted turns get a presence reaction on the triggering message before any progress", async () => {
+test("RT-SLACK-40 every engaged turn gets a presence reaction on the triggering message before any progress", async () => {
 	const api = new Api();
 	const client = new Client();
-	client.engaged = true;
 	const status = new WorkingStatus(api);
 	const gateway = new ReconnectingGateway("/tmp/no-redteam.sock", api, client, status);
-	await gateway.requestInbound("C1:1.0", origin, "overheard", engagement);
+	// Not engaged (the gateway declined it): no presence, whatever the mention says.
+	client.engaged = false;
+	await gateway.requestInbound("C1:1.0", origin, "overheard", { ...engagement, mentioned: true });
 	await flush();
 	expect(api.reactions).toEqual([]);
 	expect(api.posts).toEqual([]);
+	// Engaged: presence, and it is a reaction on the message itself, never a posted message.
+	client.engaged = true;
 	await gateway.requestInbound("C1:2.0", origin, "addressed", { ...engagement, mentioned: true });
 	await flush();
-	// Presence is a reaction on the message itself, never a posted message.
 	expect(api.reactions).toEqual([["C1", "2.0", "hourglass_flowing_sand"]]);
 	expect(api.posts).toEqual([]);
+	// An engaged thread follow-up WITHOUT a mention shows presence too: the
+	// gateway admitted it, so the room is owed the same "working" signal.
 	const thread = { platform: "slack", kind: "thread", conversationId: "C1:1.0", parentId: "C1" } as const;
-	await gateway.requestInbound("C1:3.0", thread, "thread", { ...engagement, mentioned: true });
+	await gateway.requestInbound("C1:3.0", thread, "thread follow-up", { ...engagement, mentioned: false });
 	await flush();
 	expect(api.reactions[1]).toEqual(["C1", "3.0", "hourglass_flowing_sand"]);
 	await status.clear("C1");
@@ -1183,15 +1191,20 @@ test("RT-SLACK-53 gradient buckets coalescing exact cleanup and stale timeout", 
 test("RT-SLACK-54 clear during add removes late marker and replacement cleans old message", async () => {
 	const api = new Api();
 	let release!: () => void;
+	const gate = new Promise<void>((r) => {
+		release = r;
+	});
 	const original = api.addReaction.bind(api);
+	// The reconcile sends the native status line before the first marker, so the
+	// "add in flight" window is opened by the first add whenever it happens - not
+	// by assuming add is the first call.
 	spyOn(api, "addReaction").mockImplementationOnce(async (...args) => {
-		await new Promise<void>((r) => {
-			release = r;
-		});
+		await gate;
 		await original(...args);
 	});
 	const status = new WorkingStatus(api);
 	status.arm(origin, "C1:1.0");
+	await flush();
 	await status.clear("C1");
 	release();
 	await flush();
@@ -1559,7 +1572,8 @@ test("RT-SLACK-67 fetcher flipping desired state on every add is bounded to eigh
 					activity: { kind: adds % 2 ? "tool" : "thinking", label: "flip" },
 				});
 			}
-		} else removes++;
+		} else if (String(input).endsWith("reactions.remove")) removes++;
+		// assistant.threads.setStatus also goes through here; it is neither an add nor a remove.
 		return Response.json({ ok: true });
 	});
 	status = new WorkingStatus(

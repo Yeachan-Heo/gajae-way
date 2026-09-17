@@ -2,7 +2,6 @@ import { expect, spyOn, test } from "bun:test";
 import type { ChatMessagePayload, EngagementContext, OriginRef } from "@gajaeway/protocol";
 import { SlackApiError, type SlackHistoryPage, SlackWebApi } from "../src/api";
 import {
-	addressedTurn,
 	decideInbound,
 	describeMessageEdit,
 	engagementForMessage,
@@ -296,8 +295,6 @@ test("Slack mention, open-channel and parent-bot promotion; bot authors remain m
 		channelLabel: "#general",
 		serverLabel: "Workspace",
 	});
-	expect(addressedTurn({ group: false, mentioned: false })).toBe(true);
-	expect(addressedTurn({ group: true, mentioned: false })).toBe(false);
 });
 
 test("Slack rendering preserves attachments and primes at most ten mentioned users", async () => {

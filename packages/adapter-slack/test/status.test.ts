@@ -9,7 +9,7 @@ import {
 	presenceSnapshot,
 } from "@gajaeway/protocol";
 import { type GatewayClientLike, ReconnectingGateway, settleSlackDelivery, subscribeSlackProgress } from "../src/main";
-import { isPresenceReaction, WORKING_STATUS_STALE_MS, WorkingStatus } from "../src/status";
+import { isPresenceReaction, presenceStatusText, WORKING_STATUS_STALE_MS, WorkingStatus } from "../src/status";
 
 const origin: OriginRef = { platform: "slack", kind: "channel", conversationId: "C1" };
 const progress = (extra: Partial<ChatProgressPayload> = {}): ChatProgressPayload => ({
@@ -28,14 +28,20 @@ function fixture() {
 	const adds: string[] = [];
 	const removes: string[] = [];
 	const posts: unknown[] = [];
+	const statuses: string[] = [];
 	const errors: string[] = [];
 	const timers = new Set<{ fn: () => void; ms: number }>();
+	let statusFailure: Error | undefined;
 	const api = {
 		async addReaction(channel: string, ts: string, name: string) {
 			adds.push(`${channel}:${ts}:${name}`);
 		},
 		async removeReaction(channel: string, ts: string, name: string) {
 			removes.push(`${channel}:${ts}:${name}`);
+		},
+		async setThreadStatus(channel: string, threadTs: string, status: string) {
+			if (statusFailure) throw statusFailure;
+			statuses.push(`${channel}:${threadTs}:${status}`);
 		},
 		async postMessage(channel: string, text: string, threadTs?: string) {
 			posts.push([channel, text, threadTs]);
@@ -61,10 +67,14 @@ function fixture() {
 		adds,
 		removes,
 		posts,
+		statuses,
 		errors,
 		timers,
 		tick(ms: number) {
 			clock += ms;
+		},
+		failStatus(error: Error | undefined) {
+			statusFailure = error;
 		},
 	};
 }
@@ -290,7 +300,10 @@ for (const reaction of [false, true]) {
 	}
 }
 
-test("Slack inbound arms presence only for engaged addressed turns, on the triggering message", async () => {
+test("Slack inbound arms presence for every engaged turn, on the triggering message", async () => {
+	// Engagement is the gateway's call: it admits un-mentioned thread follow-ups,
+	// and those must show presence too. The adapter no longer second-guesses it
+	// with a mention check (which left thread replies silent until the answer).
 	for (const engaged of [true, false]) {
 		for (const engagement of [
 			{ group: false, mentioned: false, authorId: "U1" },
@@ -303,7 +316,7 @@ test("Slack inbound arms presence only for engaged addressed turns, on the trigg
 			const gateway = new ReconnectingGateway("unused", f.api, client, f.status);
 			await gateway.requestInbound("C1:1.001", origin, "hello", engagement);
 			await flush();
-			const expected = engaged && (!engagement.group || engagement.mentioned);
+			const expected = engaged;
 			expect(f.adds).toEqual(expected ? ["C1:1.001:hourglass_flowing_sand"] : []);
 			expect(f.posts).toEqual([]);
 			await f.status.clear("C1");
