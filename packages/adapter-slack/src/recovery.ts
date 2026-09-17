@@ -74,6 +74,8 @@ export interface RecoveryCursorState {
 	readonly knownDms: Readonly<Record<string, { readonly lastSeenAt: string }>>;
 	/** Thread roots (`channel:ts`) the persona replied in; revisited independently of the channel watermark. */
 	readonly participatedThreads: Readonly<Record<string, { readonly lastSeenAt: string; readonly through?: string }>>;
+	/** Thread roots whose reply walk was cut short by the page bound; drained on later passes until complete. */
+	readonly pendingThreads: Readonly<Record<string, { readonly since: string }>>;
 	readonly quarantined: Readonly<
 		Record<string, { readonly reason: string; readonly failures: number; readonly since: string }>
 	>;
@@ -87,6 +89,7 @@ export const EMPTY_RECOVERY_STATE: RecoveryCursorState = {
 	continuation: {},
 	knownDms: {},
 	participatedThreads: {},
+	pendingThreads: {},
 	quarantined: {},
 	attempts: {},
 	deadLetters: [],
@@ -131,6 +134,9 @@ export async function loadRecoveryCursors(path: string): Promise<RecoveryCursorS
 							typeof entry.lastSeenAt === "string" &&
 							(entry.through === undefined || isTs(entry.through)),
 					))) ||
+			(state.pendingThreads !== undefined &&
+				(!record(state.pendingThreads) ||
+					!Object.values(state.pendingThreads).every((entry) => record(entry) && typeof entry.since === "string"))) ||
 			(state.attempts !== undefined &&
 				(!record(state.attempts) ||
 					!Object.values(state.attempts).every(
@@ -310,7 +316,7 @@ export function recordDeadLetter(state: RecoveryCursorState, entry: RecoveryDead
  */
 export function classifyRecoveryFailure(error: unknown): RecoveryFailureClass {
 	const code = (error as { code?: unknown } | null | undefined)?.code;
-	if (code === "invalid_params" || code === "frame_too_large") return "terminal-message";
+	if (code === "invalid_params" || code === "payload_too_large") return "terminal-message";
 	const message = error instanceof Error ? error.message : String(error);
 	if (/not connected|connection closed|timed out|client closed/i.test(message)) return "retryable";
 	return "write-path-unknown";
@@ -364,6 +370,12 @@ export interface RecoveryOutcome {
 	readonly advancedTo?: string;
 	/** On a truncated scan: the oldest ts walked past and the newest, so the caller can resume below/up to them. */
 	readonly continuation?: { readonly olderThan: string; readonly through: string };
+	/**
+	 * Thread roots whose reply walk hit the page bound. Their remaining replies are
+	 * not in this outcome and must be drained by a per-root walk later, whether or
+	 * not the persona engaged in anything fetched so far.
+	 */
+	readonly truncatedThreads?: readonly string[];
 	readonly delivered: number;
 	readonly duplicates: number;
 	readonly skipped: number;
@@ -395,11 +407,15 @@ export async function recoverConversation(
 	// newest is what the watermark may finally become once the gap closes.
 	let oldestFetched: string | undefined;
 	let newestFetched: string | undefined;
+	// A reply walk that hit its bound is reported per root; it never marks the
+	// channel scan itself truncated, because the channel's own pages were complete.
+	const truncatedThreads: string[] = [];
 	const outcome = (failed: boolean): RecoveryOutcome => ({
 		advancedTo: truncated ? undefined : advancedTo,
 		...(truncated && oldestFetched && newestFetched && !failed
 			? { continuation: { olderThan: oldestFetched, through: options.latest ?? newestFetched } }
 			: {}),
+		...(truncatedThreads.length > 0 ? { truncatedThreads } : {}),
 		delivered,
 		duplicates,
 		skipped,
@@ -427,7 +443,8 @@ export async function recoverConversation(
 			}
 			if (!result.has_more && !result.next_cursor) return;
 			if (!result.next_cursor || cursors.has(result.next_cursor) || page + 1 === maxPages) {
-				truncated = true;
+				if (threadTs) truncatedThreads.push(threadTs);
+				else truncated = true;
 				return;
 			}
 			cursor = result.next_cursor;
