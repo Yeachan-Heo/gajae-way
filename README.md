@@ -2,10 +2,10 @@
 
 **Your AI shouldn't live in a browser tab. It should live in your DMs.**
 
-gajae-way is a runtime that turns an AI coding agent into a *resident persona* — one that sits in your Discord and Telegram, remembers you in plain Markdown, wakes itself up on a schedule, and keeps every conversation in its own private head. No dashboard. No web app. No new place to check. You just talk to it where you already talk.
+gajae-way is a runtime that turns an AI coding agent into a *resident persona* — one that sits in your Discord, Telegram, and Slack, remembers you in plain Markdown, wakes itself up on a schedule, and keeps every conversation in its own private head. No dashboard. No web app. No new place to check. You just talk to it where you already talk.
 
 ```text
-Discord / Telegram ──> gajaeway gateway ──> your persona (gjc)
+Discord / Telegram / Slack ──> gajaeway gateway ──> your persona (gjc)
                               │
                     Markdown memory + scheduled/event monitors
 ```
@@ -41,11 +41,11 @@ For how memory, monitors, and the gateway work, see [the documentation](docs/).
    bun run build
    ```
 
-   This creates `dist/gajaeway-gateway`, `dist/gajaeway-discord`, `dist/gajaeway-telegram`, and `dist/gajaeway`.
+   This creates `dist/gajaeway-gateway`, `dist/gajaeway-discord`, `dist/gajaeway-telegram`, `dist/gajaeway-slack`, and `dist/gajaeway`.
 
 2. Choose a private home directory and create `$GAJAEWAY_HOME/config.json` plus separate credential files. The gateway configuration references credential **files**, rather than storing secret values inline. See [deployment](docs/deployment.md) for the complete layout and examples.
 
-3. Create `$GAJAEWAY_HOME/adapter-discord.json` with its own `tokenFile` reference for Discord. Create the analogous Telegram adapter configuration when using Telegram.
+3. Create `$GAJAEWAY_HOME/adapter-discord.json` with its own `tokenFile` reference for Discord. Create the analogous Telegram adapter configuration when using Telegram, or `adapter-slack.json` with `botTokenFile` and `appTokenFile` references when using Slack.
 
 4. Run the gateway as a long-lived daemon under your service manager:
 
@@ -61,7 +61,7 @@ For how memory, monitors, and the gateway work, see [the documentation](docs/).
    dist/gajaeway-discord
    ```
 
-   Start `dist/gajaeway-telegram` separately when using Telegram.
+   Start `dist/gajaeway-telegram` or `dist/gajaeway-slack` separately when using Telegram or Slack.
 
 ## Make it yours
 

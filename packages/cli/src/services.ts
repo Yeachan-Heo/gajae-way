@@ -29,7 +29,7 @@ export interface InstallServicesOptions {
 	readonly env?: NodeJS.ProcessEnv;
 	/** Test seam for the `${SHELL} -lc` invocation used by the default path. */
 	readonly loginPathRunner?: LoginPathRunner;
-	/** Test seam for counting or inspecting the three plist writes. */
+	/** Test seam for counting or inspecting the plist writes. */
 	readonly writeFile?: PlistWriter;
 }
 
@@ -46,6 +46,12 @@ const SERVICE_SPECS: readonly ServiceSpec[] = [
 		id: "adapter-discord",
 		label: "dev.gajaeway.adapter-discord",
 		binary: "gajaeway-discord",
+		args: [],
+	},
+	{
+		id: "adapter-slack",
+		label: "dev.gajaeway.adapter-slack",
+		binary: "gajaeway-slack",
 		args: [],
 	},
 	{ id: "admin", label: "dev.gajaeway.admin", binary: "gajaeway-admin", args: ["serve"] },

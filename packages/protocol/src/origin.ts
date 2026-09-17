@@ -7,8 +7,26 @@
  * One conversational origin == one strictly isolated session (spec fact 9).
  */
 
-export const ORIGIN_PLATFORMS = ["loopback", "discord", "telegram", "monitor"] as const;
+export const ORIGIN_PLATFORMS = ["loopback", "discord", "telegram", "slack", "monitor"] as const;
 export type OriginPlatform = (typeof ORIGIN_PLATFORMS)[number];
+
+/**
+ * The platforms with real messages behind them: the ones an adapter can deliver
+ * to, react on, and report reactions from. `loopback` is the owner REPL and
+ * `monitor` is event-driven work; neither has a message a persona could react to.
+ */
+export const CHAT_PLATFORMS = ["discord", "telegram", "slack"] as const;
+export type ChatPlatform = (typeof CHAT_PLATFORMS)[number];
+
+export function isChatPlatform(platform: OriginPlatform): platform is ChatPlatform {
+	return (CHAT_PLATFORMS as readonly string[]).includes(platform);
+}
+
+/** "a discord, telegram or slack origin": the wording every chat-only verb rejects with. */
+export function describeChatPlatforms(): string {
+	const [last, ...rest] = [...CHAT_PLATFORMS].reverse();
+	return `${rest.reverse().join(", ")} or ${last}`;
+}
 
 export const ORIGIN_KINDS = ["dm", "channel", "thread", "topic", "loopback", "eventtype"] as const;
 export type OriginKind = (typeof ORIGIN_KINDS)[number];
@@ -72,6 +90,11 @@ export function validateOriginRef(ref: OriginRef): OriginRef {
 	}
 	if (ref.kind === "eventtype" && ref.platform !== "monitor") {
 		throw new OriginRefError("eventtype kind only valid on monitor platform");
+	}
+	// Slack threads are identified by a channel:ts pair; Telegram forum topics are
+	// the only `topic` kind, so a slack topic would be a mis-normalized thread.
+	if (ref.platform === "slack" && ref.kind === "topic") {
+		throw new OriginRefError("slack platform does not support topic kind; use thread");
 	}
 	return ref;
 }

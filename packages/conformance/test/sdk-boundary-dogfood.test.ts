@@ -20,6 +20,8 @@ const CONSUMER_PACKAGES: Record<string, readonly string[]> = {
 	// Adapters join this table in P1/P2; listing them now costs nothing.
 	"packages/adapter-discord": ["discord.js", "@discordjs/ws", "@discordjs/rest"],
 	"packages/adapter-telegram": ["grammy", "node-telegram-bot-api"],
+	// Slack is hand-rolled over fetch + Bun's WebSocket: no platform library at all.
+	"packages/adapter-slack": [],
 };
 
 const PUBLIC_IMPORTS = ["@gajaeway/sdk", "@gajaeway/protocol"];

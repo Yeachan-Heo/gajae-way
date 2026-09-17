@@ -5,10 +5,12 @@ import {
 	CAPABILITIES,
 	type ChatMessagePayload,
 	containsSilenceToken,
+	describeChatPlatforms,
 	encodeFrame,
 	type Frame,
 	FrameDecoder,
 	type HelloPayload,
+	isChatPlatform,
 	isPlatformMessageId,
 	isSilenceToken,
 	LOOPBACK_ORIGIN,
@@ -945,8 +947,8 @@ async function handleRequest(
 			}
 			// Only the chat platforms have messages to react to; chat.send guards the same
 			// way. A monitor origin would otherwise produce a ledger row no adapter can settle.
-			if (origin.platform !== "discord" && origin.platform !== "telegram")
-				throw new ProtocolError("invalid_params", "chat.react requires a discord or telegram origin");
+			if (!isChatPlatform(origin.platform))
+				throw new ProtocolError("invalid_params", `chat.react requires a ${describeChatPlatforms()} origin`);
 			if (typeof params?.targetMessageId !== "string" || !isPlatformMessageId(params.targetMessageId.trim()))
 				throw new ProtocolError(
 					"invalid_params",
@@ -1011,8 +1013,8 @@ async function handleRequest(
 			} catch {
 				throw new ProtocolError("invalid_params", "engagement.reaction requires a valid origin");
 			}
-			if (origin.platform !== "discord" && origin.platform !== "telegram")
-				throw new ProtocolError("invalid_params", "engagement.reaction requires a discord or telegram origin");
+			if (!isChatPlatform(origin.platform))
+				throw new ProtocolError("invalid_params", `engagement.reaction requires a ${describeChatPlatforms()} origin`);
 			if (typeof params?.targetMessageId !== "string" || !isPlatformMessageId(params.targetMessageId.trim()))
 				throw new ProtocolError(
 					"invalid_params",
@@ -1232,7 +1234,7 @@ async function sendChat(
 		}
 		return;
 	}
-	if (origin.platform !== "loopback" && origin.platform !== "discord" && origin.platform !== "telegram")
+	if (origin.platform !== "loopback" && !isChatPlatform(origin.platform))
 		throw new ProtocolError("invalid_params", "unsupported origin platform");
 	const nonLoopback = origin.platform !== "loopback";
 	if (
@@ -1353,7 +1355,7 @@ async function editChat(
 	} catch {
 		throw new ProtocolError("invalid_params", "chat.edit requires a valid origin");
 	}
-	if (origin.platform !== "loopback" && origin.platform !== "discord" && origin.platform !== "telegram")
+	if (origin.platform !== "loopback" && !isChatPlatform(origin.platform))
 		throw new ProtocolError("invalid_params", "unsupported origin platform");
 	const nonLoopback = origin.platform !== "loopback";
 	if (
@@ -1934,7 +1936,7 @@ function currentConversationNotice(origin: OriginRef): string {
 			: []),
 		// The third reply mode: acknowledge without speaking. Kept next to the silence
 		// guidance because the persona chooses between exactly these three shapes.
-		...(origin.platform === "discord" || origin.platform === "telegram"
+		...(isChatPlatform(origin.platform)
 			? [
 					`Reaction replies: start your reply with [REACT:<emoji>] to react to the message that triggered this turn, or [REACT:<emoji>@<message id>] to react to a specific message. With nothing after the token you acknowledge with a reaction and say nothing; text after the token is sent as well. Emoji ${origin.platform} can actually deliver: ${reactionAllowlistDescription(origin.platform)}. At most ${REACTIONS_PER_TURN_CAP} reactions per turn and ${REACTIONS_PER_MESSAGE_CAP} per message.`,
 				]

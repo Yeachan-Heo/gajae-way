@@ -11,9 +11,10 @@ The Bun workspace is divided into small packages:
 | `@gajaeway/gateway` | Daemon: configuration, SQLite state, sessions, delivery, memory, monitors, and the `gjc` boundary. |
 | `@gajaeway/adapter-discord` | Discord ingress and outbound delivery, including typing hints. |
 | `@gajaeway/adapter-telegram` | Telegram ingress and outbound delivery. |
+| `@gajaeway/adapter-slack` | Slack ingress over Socket Mode, mrkdwn delivery, reactions, working-status presence, and missed-message recovery. |
 | `@gajaeway/cli` | Owner commands over the gateway socket. |
 
-`bun run build` compiles the gateway, Discord adapter, Telegram adapter, and CLI into standalone executables. The gateway's `GlobalGjcClient` is only a client of the same global-user GJC executable, canonical agent directory, and broker used by the operator's normal SDK. Matching the executable alone is insufficient: the service must resolve the same user profile and broker authority. GJC owns daemon startup and lifecycle; the gateway neither seeds settings nor owns, reaps, repairs, or garbage-collects the shared runtime. Every persona, worker, and monitor operation uses `SessionPort`; no per-turn `gjc --resume` process is spawned. Normal shutdown closes only the gateway's own SDK calls and relays, never the shared user daemon or its session hosts.
+`bun run build` compiles the gateway, Discord adapter, Telegram adapter, Slack adapter, and CLI into standalone executables. The gateway's `GlobalGjcClient` is only a client of the same global-user GJC executable, canonical agent directory, and broker used by the operator's normal SDK. Matching the executable alone is insufficient: the service must resolve the same user profile and broker authority. GJC owns daemon startup and lifecycle; the gateway neither seeds settings nor owns, reaps, repairs, or garbage-collects the shared runtime. Every persona, worker, and monitor operation uses `SessionPort`; no per-turn `gjc --resume` process is spawned. Normal shutdown closes only the gateway's own SDK calls and relays, never the shared user daemon or its session hosts.
 
 SQLite records one active broker authority and immutable gateway-created session bindings. Visibility in the user's SDK session list is not ownership: controls require positive creation/binding evidence under that authority, and unrelated user sessions must remain untouched. A populated database with a missing or mismatched authority requires explicit administrative cutover before recovery. Cutover preserves old history and quarantines accepted or unproven old work rather than replaying it in the new authority; old private-broker held lanes do not automatically become global-user lanes. See the operator runbook for the backup, census, and cutover boundary.
 
@@ -25,7 +26,7 @@ A client must start with `hello`, listing `supportedVersions` and optionally `re
 
 ## Conversation identity and sessions
 
-An origin is a validated, platform-neutral record: platform, kind, conversation ID, and (only where appropriate) parent or peer IDs. Platforms are `loopback`, `discord`, `telegram`, and `monitor`; kinds include DM, channel, thread, topic, loopback, and monitor event type. The only canonical identity string is `originKey`:
+An origin is a validated, platform-neutral record: platform, kind, conversation ID, and (only where appropriate) parent or peer IDs. Platforms are `loopback`, `discord`, `telegram`, `slack`, and `monitor`; kinds include DM, channel, thread, topic, loopback, and monitor event type. `discord`, `telegram`, and `slack` are the *chat platforms* (`CHAT_PLATFORMS`): the only origins the message and reaction verbs accept, because only they have an adapter that can settle a delivery. Slack thread origins carry a `channel:ts` conversation id with the channel as parent; Slack has no `topic` kind. The only canonical identity string is `originKey`:
 
 ```text
 platform/kind/conversationId[/parent=…][/peer=…]

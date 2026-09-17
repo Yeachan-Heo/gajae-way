@@ -151,8 +151,10 @@ export interface ReactionReply {
 
 /**
  * Platform message ids are opaque to us, but they are not arbitrary strings:
- * Discord snowflakes and Telegram message ids are short and alphanumeric. Bounding
- * them here keeps a hostile or hallucinated id from becoming an oversized frame or
+ * Discord snowflakes and Telegram message ids are short and alphanumeric, and a
+ * Slack id is the `channel:ts` pair (`C0123456789:1726543210.123456`) the adapter
+ * composes because a Slack `ts` is unique only within its channel. Bounding them
+ * here keeps a hostile or hallucinated id from becoming an oversized frame or
  * from smuggling newlines into anything that renders an id.
  */
 const PLATFORM_MESSAGE_ID = /^[A-Za-z0-9._:-]{1,64}$/;

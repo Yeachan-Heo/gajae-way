@@ -121,7 +121,7 @@ describe("service installation", () => {
 		]);
 	});
 
-	test("install and repair each rewrite exactly three safe LaunchAgent plists", async () => {
+	test("install and repair each rewrite exactly four safe LaunchAgent plists", async () => {
 		const home = await mkdtemp(join(tmpdir(), "gajaeway-services-"));
 		try {
 			await writeFile(
@@ -145,8 +145,8 @@ describe("service installation", () => {
 				writeFile: writer,
 			};
 			const installed = await installServices(options);
-			expect(installed).toHaveLength(3);
-			expect(writes).toHaveLength(3);
+			expect(installed).toHaveLength(4);
+			expect(writes).toHaveLength(4);
 			expect(writes.map(({ path }) => path)).toEqual([...installed]);
 			for (const { contents } of writes) {
 				expect(contents).not.toContain("TOP_SECRET");
@@ -162,9 +162,12 @@ describe("service installation", () => {
 			expect(gateway).toContain("<string>daemon</string>");
 			expect(gateway).toContain("gateway.stdout.log");
 			expect(gateway).toContain("gateway.stderr.log");
+			const slack = writes.find(({ path }) => path.endsWith("dev.gajaeway.adapter-slack.plist"))?.contents ?? "";
+			expect(slack).toContain("gajaeway-slack</string>");
+			expect(slack).toContain("adapter-slack.stdout.log");
 			writes.length = 0;
 			await installServices(options);
-			expect(writes).toHaveLength(3);
+			expect(writes).toHaveLength(4);
 		} finally {
 			await rm(home, { recursive: true, force: true });
 		}

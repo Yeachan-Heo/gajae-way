@@ -14,11 +14,12 @@ The result is:
 dist/gajaeway-gateway
 dist/gajaeway-discord
 dist/gajaeway-telegram
+dist/gajaeway-slack
 dist/gajaeway-admin
 dist/gajaeway
 ```
 
-Each binary requires its verb: `gajaeway-gateway daemon`, `gajaeway-admin serve`, and a subcommand for `gajaeway`. Invoked with no arguments they print usage on stderr and exit 2, so probing one never blocks. `gajaeway-discord` and `gajaeway-telegram` run in the foreground with no arguments; `gajaeway-discord --help` and `--version` answer without connecting, and a second `gajaeway-discord` refuses to boot while `$GAJAEWAY_HOME/adapter-discord.pid` names a live process.
+Each binary requires its verb: `gajaeway-gateway daemon`, `gajaeway-admin serve`, and a subcommand for `gajaeway`. Invoked with no arguments they print usage on stderr and exit 2, so probing one never blocks. `gajaeway-discord`, `gajaeway-telegram`, and `gajaeway-slack` run in the foreground with no arguments; `gajaeway-discord --help` / `gajaeway-slack --help` and `--version` answer without connecting, and a second `gajaeway-discord` (or `gajaeway-slack`) refuses to boot while `$GAJAEWAY_HOME/adapter-discord.pid` (`adapter-slack.pid`) names a live process.
 
 A production host does not need a source checkout, `node_modules`, or Bun to run those binaries. It does need the same global-user `gjc` executable and canonical agent directory/broker used by the operator's interactive SDK. Verify `command -v gjc` in that user's normal shell and set the service's `GJC_EXECUTABLE` explicitly to the verified absolute executable path. Run the service as that same user with the same canonical profile environment (`HOME`, and any intentional `GJC_CONFIG_DIR`/`PI_CONFIG_DIR` or `GJC_CODING_AGENT_DIR`/`PI_CODING_AGENT_DIR` selection). Do not introduce gateway-private overrides, copy model/provider configuration, or seed settings. The default profile is `~/.gjc/agent`; using the same executable with a different agent directory is not the same runtime. GJC owns its daemon; the gateway is an SDK client only. Credentials belong in the user's established protected environment, not in copied broker settings.
 
@@ -31,7 +32,10 @@ $GAJAEWAY_HOME/
   config.json
   adapter-discord.json
   adapter-telegram.json
+  adapter-slack.json
   adapter-discord.pid        # single-instance lock, held by the running Discord adapter
+  adapter-slack.pid          # same, for the Slack adapter
+  adapters/slack/recovery-cursor.json  # Slack missed-message watermarks
   gateway.sock
   gateway.db
   workspace/                 # SOUL.md, AGENTS.md, USER.md; gjc working directory
@@ -40,6 +44,8 @@ $GAJAEWAY_HOME/
   secrets/
     discord-token
     telegram-token
+    slack-bot-token          # xoxb-…
+    slack-app-token          # xapp-… (Socket Mode)
 ```
 
 Use `config.json` schema version 1. Every configured secret is a credential-file reference; a credential file may be referenced by only one configured credential.
@@ -54,7 +60,10 @@ Use `config.json` schema version 1. Every configured secret is a credential-file
     "discord": { "credentialFile": "/Users/me/gajaeway/secrets/discord-token" },
     "telegram": { "credentialFile": "/Users/me/gajaeway/secrets/telegram-token" }
   },
-  "channels": { "discord-channel-id": { "engagement": "open", "audience": "human-only" } },
+  "channels": {
+    "discord-channel-id": { "engagement": "open", "audience": "human-only" },
+    "slack:C0123456789": { "engagement": "mention-open" }
+  },
   "webhook": { "bind": "127.0.0.1", "port": 8080, "exposeNonLoopback": false },
   "watcherRoots": ["/Users/me/automations"],
   "scriptRoot": "/Users/me/automations",
@@ -63,6 +72,36 @@ Use `config.json` schema version 1. Every configured secret is a credential-file
 ```
 
 `socketPath`, `dbPath`, `logVerbosity`, credentials, channels, webhook, watcher roots, script root, and `stallTimeoutMs` are optional. Socket and database paths default inside the home directory, `stallTimeoutMs` defaults to 120000 ms, and log verbosity defaults to `info`. `turnTimeoutMs` is rejected because persistent-session liveness is alert-only; `settleWindowMs`, `channels.*.settleWindowMs` and `maxInboundAgeMs` are rejected because every message is steered or sent immediately and nothing expires while queued.
+
+## Slack adapter
+
+`gajaeway-slack` connects over **Socket Mode**, so the host needs no public URL and no inbound firewall rule. It reads `$GAJAEWAY_HOME/adapter-slack.json`:
+
+```json
+{
+  "botTokenFile": "secrets/slack-bot-token",
+  "appTokenFile": "secrets/slack-app-token",
+  "gatewaySocket": "/Users/me/gajaeway/gateway.sock",
+  "channels": { "C0123456789": { "engagement": "open" } }
+}
+```
+
+Both token files are credential-file references (relative paths resolve against the config directory) and are validated by prefix: the bot token must start with `xoxb-`, the app-level token with `xapp-`. A wrong prefix is a startup error naming the file, never the value. `gatewaySocket` defaults to `$GAJAEWAY_HOME/gateway.sock`. The adapter's own `channels` map only promotes an `open` channel's messages to a mention before they reach the gateway; the gateway's `config.json` `channels` map, keyed `slack:<channelId>`, remains the authority for mode and audience.
+
+Create the Slack app from a manifest with:
+
+- Socket Mode **enabled**, and an app-level token with the `connections:write` scope (`appTokenFile`).
+- Bot token scopes: `app_mentions:read channels:history channels:read chat:write groups:history groups:read im:history im:read im:write mpim:history mpim:read reactions:read reactions:write users:read files:read commands`.
+- Event subscriptions (bot events): `message.channels message.groups message.im message.mpim reaction_added reaction_removed`.
+- Slash commands `/new`, `/reset`, and `/restart` (any request URL; Socket Mode delivers them over the socket).
+
+Invite the bot to every channel it should read; Slack delivers no history or events for channels the bot is not a member of.
+
+Origins are `slack/dm/D…/peer=U…` for direct messages, `slack/channel/C…` for public, private, and multi-person channels, and `slack/thread/C…:<thread_ts>/parent=C…` for messages inside a thread. Platform message ids are `channel:ts` pairs because a Slack `ts` is unique only within its channel. A reply to a threaded message stays in that thread; a top-level channel message is answered at the top level unless the persona names a reply target with `[REPLY:…]`.
+
+Slack bots have no typing indicator, so an addressed turn shows one temporary `⏳ working…` message per conversation that is amended from `chat.progress` and deleted when the reply lands. Reactions are mapped by Slack emoji name (`👍` → `+1`, `🦞` → `lobster`); the whole allowlist is deliverable. Inbound text is normalised (`<@U…>` mentions, `<#C…|name>`, links, `&amp;`) before it reaches the persona, and outbound Markdown is converted to Slack mrkdwn. Files and images arrive as `[image · name · size · url]` lines; the persona needs the bot token to fetch `url_private`. There is no voice transcription or spoken reply on Slack.
+
+After every socket connect and gateway reconnect the adapter backfills missed messages from `conversations.history` for configured channels and recently seen DMs, keyed by `channel:ts`, so a restart never drops a message the gateway has not acknowledged.
 
 ## Reloading configuration without a restart
 
@@ -129,7 +168,7 @@ chmod 600 ~/Library/LaunchAgents/dev.gajaeway.gateway.plist
 launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/dev.gajaeway.gateway.plist
 ```
 
-Run the Discord and Telegram binaries as separate managed services after the gateway. The CLI is an on-demand client; it does not start the daemon.
+Run the Discord, Telegram, and Slack binaries as separate managed services after the gateway (`gajaeway services install` writes a plist for each). The CLI is an on-demand client; it does not start the daemon.
 
 ### One gateway per home, owned by the service manager
 

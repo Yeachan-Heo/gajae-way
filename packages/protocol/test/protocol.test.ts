@@ -1,9 +1,12 @@
 import { describe, expect, test } from "bun:test";
 import {
+	CHAT_PLATFORMS,
 	containsSilenceToken,
 	decodeFrame,
+	describeChatPlatforms,
 	encodeFrame,
 	FrameDecoder,
+	isChatPlatform,
 	isSilenceToken,
 	LOOPBACK_ORIGIN,
 	MAX_FRAME_BYTES,
@@ -11,6 +14,7 @@ import {
 	originKey,
 	PROFILE_VERSION,
 	ProtocolError,
+	parseOriginKey,
 	validateOriginRef,
 } from "../src/index";
 
@@ -116,6 +120,41 @@ describe("origin normalization", () => {
 
 	test("thread requires parentId", () => {
 		expect(() => validateOriginRef({ platform: "telegram", kind: "topic", conversationId: "c1" })).toThrow();
+	});
+
+	test("slack supports dm, channel and thread, and its thread ids round-trip through originKey", () => {
+		expect(originKey({ platform: "slack", kind: "dm", conversationId: "D1", peerId: "U1" })).toBe(
+			"slack/dm/D1/peer=U1",
+		);
+		expect(originKey({ platform: "slack", kind: "channel", conversationId: "C1" })).toBe("slack/channel/C1");
+		// A Slack thread is identified by its channel:ts pair; the colon and dot are
+		// legal segment characters, so the key parses back to the same origin.
+		const thread = {
+			platform: "slack",
+			kind: "thread",
+			conversationId: "C123:1726543210.123456",
+			parentId: "C123",
+		} as const;
+		const key = originKey(thread);
+		expect(key).toBe("slack/thread/C123:1726543210.123456/parent=C123");
+		expect(parseOriginKey(key)).toEqual(thread);
+	});
+
+	test("slack rejects the telegram-only topic kind", () => {
+		expect(() =>
+			validateOriginRef({ platform: "slack", kind: "topic", conversationId: "C1:1.2", parentId: "C1" }),
+		).toThrow(/topic/);
+		expect(() =>
+			validateOriginRef({ platform: "telegram", kind: "topic", conversationId: "t1", parentId: "-100" }),
+		).not.toThrow();
+	});
+
+	test("chat platforms are exactly the ones an adapter can deliver to", () => {
+		expect(CHAT_PLATFORMS).toEqual(["discord", "telegram", "slack"]);
+		for (const platform of CHAT_PLATFORMS) expect(isChatPlatform(platform)).toBe(true);
+		expect(isChatPlatform("loopback")).toBe(false);
+		expect(isChatPlatform("monitor")).toBe(false);
+		expect(describeChatPlatforms()).toBe("discord, telegram or slack");
 	});
 
 	test("loopback origin is valid and stable", () => {
