@@ -1,4 +1,4 @@
-const sourceHash = "sha256:412c90d6ba22fb5309c14d4fa2b67d655dddd1b234d49916e2de11c36637fe0d";
+const sourceHash = "sha256:afbb9a77cb5ff7da17c201a039f12fd78aa9b2660ed6ce4b1829566b98061917";
 const files = [
 	"packages/adapter-slack/test/redteam.test.ts",
 	"packages/gateway/test/slack-adapter-redteam.e2e.test.ts",
@@ -62,7 +62,7 @@ const expectations = [
 	"A stale pidfile plus a dead reclaimer marker recovers within 2000ms and removes the marker.",
 	"Twenty waiting contenders refuse a live holder that arrives mid-election without replacing its pidfile.",
 	"A former holder loses reacquisition; its release preserves the elected winner, whose own release removes the pidfile.",
-	"Live 0.9s-old linked marker survives waiter timeout; old dead-owner marker is reclaimed by exactly one of two waiters; timeout names new live pidfile holder.",
+	"Live 0.9s-old election directory survives waiter timeout; old dead-owner directory is reclaimed by exactly one of two waiters; timeout names new live pidfile holder.",
 	"Real gateway Slack channel delivery and redelivery thread under triggering ts; slash synthetic id is unthreaded; Discord and Telegram have no reply target.",
 	"429 x4 settles ambiguous without SlackApiError; 429 x2 then success confirms in three requests; Retry-After sleeps exact, capped at 30s and defaulting to 1s.",
 	"Five concurrent deliveries precede cosmetics; independent channels do not block; pendingMs reaches zero after cooldown.",
@@ -81,6 +81,12 @@ const expectations = [
 	"Five replies drain in two two-page/two-item unit walks without resend; adapter persists pending through at production page bound and clears pending on completion.",
 	"Clean recovery gates a one-second gateway blip but still runs after its overlapping nine-second socket outage.",
 	"Real gateway edited channel reply uses original message thread; slash synthetic /new has no thread target.",
+	"Twenty contenders over twenty stale-pidfile elections produce exactly one winner per iteration and leave no election directories or tombstones.",
+	"An abandoned election directory without an owner file, aged three seconds, permits acquisition within about two seconds.",
+	"Replacing an abandoned election during the wait with a fresh live-owner directory fails closed naming owner 7 and preserves the directory inode.",
+	"Failed add retries on later update; every failed remove logs without blocking delivery; a fetcher changing desired state each pass stops at eight passes.",
+	"Discord message-fetch failure logs without markers or throwing; a later update retries successfully.",
+	"Cooldown retires the idle lane; reacquisition is immediate and a waiter arriving during retirement is retained.",
 ];
 const decode = (value: string) =>
 	value
@@ -109,11 +115,11 @@ const verification = await Bun.file(verificationPath).json();
 if (verification.sourceHash !== sourceHash || verification.build.exitCode !== 0 || !verification.replayByteIdentical)
 	throw new Error("Frozen verification receipt mismatch");
 const loopPaths = Array.from({ length: 10 }, (_, index) => `artifacts/slack-adapter-lock-loop-${index + 1}.junit.xml`);
-for (const path of [junitPath, supportingPath, ...loopPaths]) {
+for (const path of [junitPath, supportingPath, "artifacts/slack-adapter-ownerless-repro.junit.xml", ...loopPaths]) {
 	const xml = (await Bun.file(path).text()).replace(/<!-- sourceHash:.*? -->\n/g, "");
 	await Bun.write(
 		path,
-		xml.replace(/(<\?xml[^>]+>\n)/, `$1<!-- sourceHash: ${sourceHash}; frozenCommit: 145fa8f -->\n`),
+		xml.replace(/(<\?xml[^>]+>\n)/, `$1<!-- sourceHash: ${sourceHash}; frozenCommit: 5001727 -->\n`),
 	);
 }
 for (const [source, snapshot] of Object.entries(sourceSnapshots))
@@ -149,14 +155,14 @@ const blockers = tests
 	.filter((t) => t.verdict === "failed")
 	.map((t) => ({
 		caseId: t.name.slice(0, 11),
-		contractRef: `Generation 5 acceptance ${t.name.slice(0, 11)}`,
+		contractRef: `Generation 6 acceptance ${t.name.slice(0, 11)}`,
 		test: t.test,
 		testSnapshot: t.testSnapshot,
 		observed: t.failure,
 		scenario: t.name,
-		source: t.name.startsWith("RT-SLACK-54") ? "packages/adapter-slack/src/status.ts:clear" : t.file,
-		explanation: "Observed assertion failure; source deliberately left unchanged.",
-		artifactRefs: [junitPath, sourceSnapshots[t.file]].filter(Boolean),
+		source: t.name.startsWith("RT-SLACK-65") ? "packages/adapter-slack/src/lock.ts:orphanedElection" : t.file,
+		explanation: "A three-second-old ownerless election is permanently treated as mid-creation, so acquisition fails closed with pid 0. Reproduced independently; source deliberately left unchanged.",
+		artifactRefs: [junitPath, "artifacts/slack-adapter-ownerless-repro.junit.xml", sourceSnapshots[t.file]].filter(Boolean),
 	}));
 const cover = (contractRef: string, ids: number[], detail: string, supportingEvidence: string[] = []) => ({
 	contractRef,
@@ -282,6 +288,8 @@ const artifactRefs = [
 	reportPath,
 	supportingPath,
 	verificationPath,
+	"artifacts/slack-adapter-consistency.json",
+	"artifacts/slack-adapter-ownerless-repro.junit.xml",
 	...Object.values(sourceSnapshots),
 ];
 const loopRuns = await Promise.all(
@@ -299,16 +307,21 @@ contractCoverage.push(
 	cover(
 		"Generation 4 final boundary acceptance RT-SLACK-45 through 52",
 		[45, 46, 47, 48, 49, 50, 51, 52],
-		"Frozen 145fa8f exercised through real gateway sockets, injected I/O, filesystem locks and compiled binary; failures retained as blockers.",
+		"Frozen 5001727 exercised through real gateway sockets, injected I/O, filesystem locks and compiled binary; failures retained as blockers.",
 	),
 );
 contractCoverage.push(
 	cover(
 		"Generation 5 presence gradient and generation-4 fix acceptance",
 		[53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63],
-		"All requested case IDs exercised with assertions; cleanup error logging failure is retained.",
+		"All requested case IDs exercised with assertions; generation 5 regressions pass on the frozen generation 6 source.",
 	),
 );
+contractCoverage.push(cover(
+	"Generation 6 directory election, reconcile loop and lane retirement acceptance",
+	[64, 65, 66, 67, 68, 69],
+	"Twenty 20-contender elections, ownerless crash, fresh directory replacement, failed presence I/O, eight-pass churn and retirement/waiter race. Ownerless crash failure retained as a blocker.",
+));
 const matrix = {
 	sourceHash,
 	contractCoverage,
@@ -351,7 +364,7 @@ const matrix = {
 			invocation:
 				"for i in {1..10}; do bun test packages/adapter-slack/test/redteam.test.ts packages/gateway/test/slack-adapter-redteam.e2e.test.ts -t 'RT-SLACK-(33|45)' --reporter=junit --reporter-outfile=artifacts/slack-adapter-lock-loop-${i}.junit.xml || exit 1; done",
 			verdict: "passed",
-			detail: `${loopPassed}/10 iterations passed; six cases per iteration: 20-contender stale elections plus live/dead linked marker cases for Slack and Discord.`,
+			detail: `${loopPassed}/10 iterations passed; six cases per iteration: 20-contender stale elections plus live/dead election directory cases for Slack and Discord.`,
 			artifactRefs: loopPaths,
 		},
 	],
@@ -367,9 +380,9 @@ const report = {
 	latestRunCommit: new TextDecoder().decode(commit.stdout).trim(),
 	executionCwd: process.cwd(),
 	sourceSnapshots,
-	frozenCommit: "145fa8f",
+	frozenCommit: "5001727",
 	isolation:
-		"Executed in the assigned worktree at 145fa8f. Product source untouched; only allowed test and artifact files changed. Snapshots preserve exact executed test lines.",
+		"Executed in the assigned worktree at 5001727. Product source untouched; only allowed test and artifact files changed. Snapshots preserve exact executed test lines.",
 	sourceHashMethod:
 		"Parent-confirmed Ultragoal quality-gate source-hash (integration base, merge base, paths, captured diff and untracked digest), not sha256 of raw git diff.",
 	counts: {
@@ -385,6 +398,8 @@ const report = {
 		lockLoopPassed: loopPassed,
 	},
 	limitations: [
+		"RT-SLACK-66 replaces the directory during the waiting window as requested; it does not deterministically pause between orphan inode inspection and rename.",
+		"The unchanged CLI replay is the pre-existing safe bun -e replay; actual Slack binary coverage is the separate four-probe receipt.",
 		"No credentialed external Slack API calls; injected platform ports and real local gateway socket used as required.",
 		"No product source changed in the frozen worktree; RT-SLACK-33 and 45 exercise both adapters.",
 		"Gateway teardown still emits invalid socket write count: -32 warnings; not suppressed.",

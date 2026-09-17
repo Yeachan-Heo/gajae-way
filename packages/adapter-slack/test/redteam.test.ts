@@ -1,5 +1,5 @@
 import { afterEach, expect, spyOn, test } from "bun:test";
-import { mkdir, mkdtemp, readdir, readFile, rm, stat, utimes, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readdir, readFile, rename, rm, stat, utimes, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { type ChatMessagePayload, isPlatformMessageId } from "@gajaeway/protocol";
@@ -1417,3 +1417,225 @@ test("RT-SLACK-61 adapter persists pending through across bounded walks and clea
 	const sent = f.client.calls.filter((c) => c.verb === "chat.send").map((c) => c.params.messageId);
 	expect(sent).toEqual(Array.from({ length: 16 }, (_, i) => `C1:${i + 1}.0`));
 });
+// Generation 6: directory-election and desired/applied-state boundary attacks.
+test("RT-SLACK-64 twenty contenders elect exactly one winner in twenty stale elections", async () => {
+	for (let iteration = 0; iteration < 20; iteration++) {
+		const home = await mkdtemp(join(tmpdir(), "slack-g6-election-"));
+		try {
+			await writeFile(join(home, "adapter-slack.pid"), "99999\n");
+			const results = await Promise.allSettled(
+				Array.from({ length: 20 }, (_, i) => AdapterLock.acquire(home, { pid: i + 1, alive: () => false })),
+			);
+			const winners = results.filter((r) => r.status === "fulfilled");
+			expect(winners).toHaveLength(1);
+			for (const result of results)
+				if (result.status === "rejected") expect(result.reason).toBeInstanceOf(AdapterAlreadyRunningError);
+			expect(await readFile(join(home, "adapter-slack.pid"), "utf8")).toBe(`${winners[0]!.value.pid}\n`);
+			expect((await readdir(home)).filter((name) => name.includes(".reclaim.d") || name.endsWith(".dead"))).toEqual([]);
+			await winners[0]!.value.release();
+		} finally {
+			await rm(home, { recursive: true, force: true });
+		}
+	}
+}, 60000);
+
+test("RT-SLACK-65 aged ownerless election recovers within two seconds", async () => {
+	const home = await mkdtemp(join(tmpdir(), "slack-g6-ownerless-"));
+	cleanups.push(() => rm(home, { recursive: true, force: true }));
+	const path = join(home, "adapter-slack.pid");
+	await writeFile(path, "99999\n");
+	await mkdir(`${path}.reclaim.d`);
+	const old = new Date(Date.now() - 3000);
+	await utimes(`${path}.reclaim.d`, old, old);
+	const started = performance.now();
+	const lock = await AdapterLock.acquire(home, { pid: 42, alive: () => false });
+	expect(performance.now() - started).toBeLessThan(2100);
+	expect(await readdir(home)).toEqual(["adapter-slack.pid"]);
+	await lock.release();
+});
+
+test("RT-SLACK-66 fresh live election replacing abandoned directory survives waiting contender", async () => {
+	const home = await mkdtemp(join(tmpdir(), "slack-g6-restore-"));
+	cleanups.push(() => rm(home, { recursive: true, force: true }));
+	const path = join(home, "adapter-slack.pid");
+	const dir = `${path}.reclaim.d`;
+	await writeFile(path, "99999\n");
+	await mkdir(dir);
+	await writeFile(join(dir, "owner"), "88888\n");
+	const old = new Date(Date.now() - 3000);
+	await utimes(dir, old, old);
+	let fresh = false;
+	const pending = AdapterLock.acquire(home, { pid: 42, alive: (pid) => fresh && pid === 7 }).then(
+		(lock) => ({ lock, error: undefined }),
+		(error) => ({ lock: undefined, error }),
+	);
+	await Bun.sleep(100);
+	// A real contender never leaves the slot empty: it prepares its election in
+	// private and swaps it in. Reproduce that (rename over the abandoned dir
+	// after moving it aside) so the waiter never sees a free slot.
+	const staging = `${dir}.staging`;
+	await mkdir(staging);
+	await writeFile(join(staging, "owner"), "7\n");
+	await rename(dir, `${dir}.old`);
+	await rename(staging, dir);
+	await rm(`${dir}.old`, { recursive: true, force: true });
+	fresh = true;
+	const inode = (await stat(dir)).ino;
+	const result = await pending;
+	expect(result.error).toBeInstanceOf(AdapterAlreadyRunningError);
+	expect(result.error.holderPid).toBe(7);
+	expect((await stat(dir)).ino).toBe(inode);
+	expect(await readFile(join(dir, "owner"), "utf8")).toBe("7\n");
+	expect(await readFile(path, "utf8")).toBe("99999\n");
+});
+
+test("RT-SLACK-67 failed add retries on later update and each failed remove logs without blocking delivery", async () => {
+	let now = 0;
+	const api = new Api();
+	const errors: unknown[] = [];
+	const status = new WorkingStatus(
+		api,
+		{
+			error: (...args) => {
+				errors.push(args);
+			},
+		},
+		() => ({}),
+		() => {},
+		() => now,
+	);
+	spyOn(api, "addReaction").mockRejectedValueOnce(new Error("add denied"));
+	const remove = spyOn(api, "removeReaction").mockRejectedValue(new Error("remove denied"));
+	status.arm(origin, "C1:1.0");
+	await flush();
+	expect(api.reactions).toEqual([]);
+	expect(errors).toHaveLength(1);
+	now = 16000;
+	await status.update({
+		turnId: "t",
+		origin,
+		elapsedMs: now,
+		toolCalls: 0,
+		outputTokens: 0,
+		final: false,
+		activity: { kind: "thinking", label: "thinking" },
+	});
+	expect(api.reactions.length).toBeGreaterThan(0);
+	now = 32000;
+	await status.update({
+		turnId: "t",
+		origin,
+		elapsedMs: now,
+		toolCalls: 1,
+		outputTokens: 0,
+		final: false,
+		activity: { kind: "tool", label: "tool" },
+	});
+	const client = new Client();
+	await settleSlackDelivery(client, api, delivery(), console, status);
+	expect(client.calls).toContainEqual({ verb: "delivery.confirm", params: { deliveryId: "delivery" } });
+	expect(remove.mock.calls.length).toBeGreaterThan(0);
+	expect(errors.length).toBe(1 + remove.mock.calls.length);
+});
+
+test("RT-SLACK-67 fetcher flipping desired state on every add is bounded to eight passes", async () => {
+	let now = 0;
+	let adds = 0;
+	let removes = 0;
+	let flipping = true;
+	let status: WorkingStatus;
+	const api = new SlackWebApi("unused", async (input) => {
+		if (String(input).endsWith("reactions.add")) {
+			adds++;
+			if (flipping) {
+				now += 16000;
+				await status.update({
+					turnId: "t",
+					origin,
+					elapsedMs: 0,
+					toolCalls: 0,
+					outputTokens: 0,
+					final: false,
+					activity: { kind: adds % 2 ? "tool" : "thinking", label: "flip" },
+				});
+			}
+		} else removes++;
+		return Response.json({ ok: true });
+	});
+	status = new WorkingStatus(
+		api,
+		console,
+		() => ({}),
+		() => {},
+		() => now,
+	);
+	status.arm(origin, "C1:1.0");
+	for (let i = 0; i < 30; i++) await flush();
+	expect(adds).toBe(8);
+	expect(removes).toBe(7);
+	flipping = false;
+	await status.clear("C1");
+});
+
+test("RT-SLACK-69 retirement frees idle lane and preserves waiter arriving during retirement sleep", async () => {
+	let now = 0;
+	const timers: Array<{ at: number; resolve: () => void }> = [];
+	const limiter = new OutboundLimiter(
+		100,
+		() => now,
+		(ms) => new Promise<void>((resolve) => timers.push({ at: now + ms, resolve })),
+	);
+	await limiter.acquire("C1");
+	expect(timers).toHaveLength(1);
+	now = 100;
+	timers.shift()!.resolve();
+	await flush();
+	expect(limiter.pendingMs("C1")).toBe(0);
+	// Rewind the injected clock: a retained old lane would wait for its old nextAt.
+	now = 0;
+	let fresh = false;
+	const first = limiter.acquire("C1").then(() => {
+		fresh = true;
+	});
+	await flush();
+	expect(fresh).toBe(true);
+	await first;
+	let arrived = false;
+	const waiter = limiter.acquire("C1").then(() => {
+		arrived = true;
+	});
+	await flush();
+	expect(arrived).toBe(false);
+	now = 100;
+	for (const timer of timers.splice(0)) timer.resolve();
+	await flush();
+	expect(arrived).toBe(true);
+	await waiter;
+	expect(limiter.pendingMs("C1")).toBe(100);
+	now = 200;
+	for (const timer of timers.splice(0)) timer.resolve();
+	await flush();
+	expect(limiter.pendingMs("C1")).toBe(0);
+});
+
+for (const adapter of ["slack", "discord"] as const)
+	test(`RT-SLACK-70 ${adapter}: a crash between election and ownership cannot lock the adapter out`, async () => {
+		// The election is prepared with its owner in private and renamed into place,
+		// so an ownerless election directory can only be a hand-made artifact - and
+		// even that must age out, not lock restarts forever.
+		const Lock = adapter === "slack" ? AdapterLock : (await import("../../adapter-discord/src/lock")).AdapterLock;
+		const file = adapter === "slack" ? "adapter-slack.pid" : "adapter-discord.pid";
+		const home = await mkdtemp(join(tmpdir(), `${adapter}-ownerless-`));
+		cleanups.push(() => rm(home, { recursive: true, force: true }));
+		const path = join(home, file);
+		await writeFile(path, "99999\n");
+		await mkdir(`${path}.reclaim.d`); // no owner file
+		const aged = new Date(Date.now() - 3000);
+		await utimes(`${path}.reclaim.d`, aged, aged);
+		const started = performance.now();
+		const lock = await Lock.acquire(home, { pid: 42, alive: () => false });
+		expect(performance.now() - started).toBeLessThan(3000);
+		expect(await readFile(path, "utf8")).toBe("42\n");
+		expect((await readdir(home)).filter((e) => e.includes("reclaim"))).toEqual([]);
+		await lock.release();
+	});

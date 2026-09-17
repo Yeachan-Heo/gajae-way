@@ -388,3 +388,62 @@ test("Slack presence: cleanup failures are logged, never thrown, and never block
 	expect(gateway.requests).toEqual(["delivery.confirm"]);
 	expect(f.errors.some((line) => line.includes("remove denied"))).toBe(true);
 });
+
+test("Slack presence: a retire during a pending add still removes what was shown, even if the add fails", async () => {
+	// G6-PRESENCE-FAILED-ADD-RETIRE.
+	const f = fixture();
+	f.status.arm(origin, "C1:1.000");
+	await flush();
+	f.tick(PRESENCE_MIN_SWAP_MS);
+	let failSecond!: (error: Error) => void;
+	const add = f.api.addReaction;
+	let calls = 0;
+	f.api.addReaction = async (channel: string, ts: string, name: string) => {
+		calls++;
+		if (calls === 3) await new Promise<void>((_, reject) => (failSecond = reject));
+		await add(channel, ts, name);
+	};
+	// Phase → tool at one minute: remove hourglass, add wrench (ok), clock1 (held, will fail), three.
+	const update = f.status.update(
+		progress({ elapsedMs: 61_000, toolCalls: 3, activity: { kind: "tool", label: "bash" } }),
+	);
+	await flush();
+	// Retire while clock1's add is pending.
+	const cleared = f.status.clear("C1");
+	failSecond(new Error("add denied"));
+	await update;
+	await cleared;
+	await flush();
+	// Everything that was ever shown is gone; the failure was logged.
+	expect(names(f.removes)).toEqual(expect.arrayContaining(["hourglass_flowing_sand", "wrench"]));
+	expect(f.errors.some((line) => line.includes("add denied"))).toBe(true);
+	const balance = new Map<string, number>();
+	for (const name of names(f.adds)) balance.set(name as string, (balance.get(name as string) ?? 0) + 1);
+	for (const name of names(f.removes)) balance.set(name as string, (balance.get(name as string) ?? 0) - 1);
+	// clock1 was never confirmed added, so it must not be counted as removed-only.
+	for (const [name, count] of balance) if (name !== "clock1") expect(count).toBe(0);
+});
+
+test("Slack presence: a change arriving during the last pass is still applied", async () => {
+	// G5-PRESENCE-BUSY-STATE-LOSS: continuation after a busy pass.
+	const f = fixture();
+	let release!: () => void;
+	const add = f.api.addReaction;
+	f.api.addReaction = async (channel: string, ts: string, name: string) => {
+		await add(channel, ts, name);
+		if (name === "hourglass_flowing_sand") await new Promise<void>((resolve) => (release = resolve));
+	};
+	f.status.arm(origin, "C1:1.000");
+	await flush();
+	f.tick(PRESENCE_MIN_SWAP_MS);
+	const change = f.status.update(
+		progress({ elapsedMs: 20_000, toolCalls: 1, outputTokens: 0, activity: { kind: "writing", label: "writing" } }),
+	);
+	release();
+	await change;
+	await flush();
+	await flush();
+	expect(names(f.adds)).toEqual(["hourglass_flowing_sand", "writing_hand", "one"]);
+	expect(names(f.removes)).toEqual(["hourglass_flowing_sand"]);
+	await f.status.clear("C1");
+});

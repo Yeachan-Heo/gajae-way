@@ -1,7 +1,7 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <!-- sourceHash: sha256:afbb9a77cb5ff7da17c201a039f12fd78aa9b2660ed6ce4b1829566b98061917; frozenCommit: 5001727 -->
-<testsuites name="bun test" tests="83" assertions="63" failures="0" skipped="77" time="5.188984">
-  <testsuite name="packages/adapter-slack/test/redteam.test.ts" file="packages/adapter-slack/test/redteam.test.ts" tests="64" assertions="32" failures="0" skipped="61" time="2.586721" hostname="MacBook-Pro-3.local">
+<testsuites name="bun test" tests="64" assertions="0" failures="1" skipped="63" time="1.339079">
+  <testsuite name="packages/adapter-slack/test/redteam.test.ts" file="packages/adapter-slack/test/redteam.test.ts" tests="64" assertions="0" failures="1" skipped="63" time="1.227552" hostname="MacBook-Pro-3.local">
     <testcase name="RT-SLACK-01 throwing handlers ack first, retries dedupe, malformed frames survive and disconnect reconnects" classname="" time="0" file="packages/adapter-slack/test/redteam.test.ts" line="196" assertions="0">
       <skipped />
     </testcase>
@@ -68,7 +68,9 @@
     <testcase name="RT-SLACK-31 unreadable success bodies are ambiguous but explicit refusal is definitive" classname="" time="0" file="packages/adapter-slack/test/redteam.test.ts" line="602" assertions="0">
       <skipped />
     </testcase>
-    <testcase name="RT-SLACK-33 slack stale lock has exactly one winner under 20 concurrent reclaims" classname="" time="0.120657" file="packages/adapter-slack/test/redteam.test.ts" line="639" assertions="21" />
+    <testcase name="RT-SLACK-33 slack stale lock has exactly one winner under 20 concurrent reclaims" classname="" time="0" file="packages/adapter-slack/test/redteam.test.ts" line="639" assertions="0">
+      <skipped />
+    </testcase>
     <testcase name="RT-SLACK-35 bounded continuation closes the gap without losing newer arrivals" classname="" time="0" file="packages/adapter-slack/test/redteam.test.ts" line="654" assertions="0">
       <skipped />
     </testcase>
@@ -99,8 +101,12 @@
     <testcase name="RT-SLACK-44 release by a former holder after losing election preserves the winner pidfile" classname="" time="0" file="packages/adapter-slack/test/redteam.test.ts" line="895" assertions="0">
       <skipped />
     </testcase>
-    <testcase name="RT-SLACK-45 live 0.9s marker survives timeout naming new holder" classname="" time="1.223716" file="packages/adapter-slack/test/redteam.test.ts" line="919" assertions="8" />
-    <testcase name="RT-SLACK-45 two waiters reclaim old dead marker with one winner" classname="" time="1.234925" file="packages/adapter-slack/test/redteam.test.ts" line="919" assertions="3" />
+    <testcase name="RT-SLACK-45 live 0.9s marker survives timeout naming new holder" classname="" time="0" file="packages/adapter-slack/test/redteam.test.ts" line="919" assertions="0">
+      <skipped />
+    </testcase>
+    <testcase name="RT-SLACK-45 two waiters reclaim old dead marker with one winner" classname="" time="0" file="packages/adapter-slack/test/redteam.test.ts" line="919" assertions="0">
+      <skipped />
+    </testcase>
     <testcase name="RT-SLACK-47 rate-limit settlement 4 refusals Retry-After 2" classname="" time="0" file="packages/adapter-slack/test/redteam.test.ts" line="965" assertions="0">
       <skipped />
     </testcase>
@@ -173,8 +179,8 @@
     <testcase name="RT-SLACK-64 twenty contenders elect exactly one winner in twenty stale elections" classname="" time="0" file="packages/adapter-slack/test/redteam.test.ts" line="1421" assertions="0">
       <skipped />
     </testcase>
-    <testcase name="RT-SLACK-65 aged ownerless election recovers within two seconds" classname="" time="0" file="packages/adapter-slack/test/redteam.test.ts" line="1442" assertions="0">
-      <skipped />
+    <testcase name="RT-SLACK-65 aged ownerless election recovers within two seconds" classname="" time="1.219667" file="packages/adapter-slack/test/redteam.test.ts" line="1442" assertions="0">
+      <failure type="AdapterAlreadyRunningError" message="Another Slack adapter is already running (pid 0, lock /var/folders/yl/ndsjfsl95t781x9qyjrqyqc80000gn/T/slack-g6-ownerless-i5SD5S/adapter-slack.pid). Stop it before starting a second one.">AdapterAlreadyRunningError: Another Slack adapter is already running (pid 0, lock /var/folders/yl/ndsjfsl95t781x9qyjrqyqc80000gn/T/slack-g6-ownerless-i5SD5S/adapter-slack.pid). Stop it before starting a second one.&#10;      at acquire (packages/adapter-slack/src/lock.ts:104:12)&#10;      at packages/adapter-slack/test/redteam.test.ts:1451:33&#10;</failure>
     </testcase>
     <testcase name="RT-SLACK-66 fresh live election replacing abandoned directory survives waiting contender" classname="" time="0" file="packages/adapter-slack/test/redteam.test.ts" line="1457" assertions="0">
       <skipped />
@@ -186,59 +192,6 @@
       <skipped />
     </testcase>
     <testcase name="RT-SLACK-69 retirement frees idle lane and preserves waiter arriving during retirement sleep" classname="" time="0" file="packages/adapter-slack/test/redteam.test.ts" line="1574" assertions="0">
-      <skipped />
-    </testcase>
-  </testsuite>
-  <testsuite name="packages/gateway/test/slack-adapter-redteam.e2e.test.ts" file="packages/gateway/test/slack-adapter-redteam.e2e.test.ts" tests="19" assertions="31" failures="0" skipped="16" time="2.58618" hostname="MacBook-Pro-3.local">
-    <testcase name="RT-SLACK-20 unconfigured unmentioned Slack channel is context only" classname="" time="0" file="packages/gateway/test/slack-adapter-redteam.e2e.test.ts" line="73" assertions="0">
-      <skipped />
-    </testcase>
-    <testcase name="RT-SLACK-21 mention-open engages and persona markup is escaped at Slack boundary" classname="" time="0" file="packages/gateway/test/slack-adapter-redteam.e2e.test.ts" line="83" assertions="0">
-      <skipped />
-    </testcase>
-    <testcase name="RT-SLACK-22 check reaction token delivers on Slack and is refused on Telegram" classname="" time="0" file="packages/gateway/test/slack-adapter-redteam.e2e.test.ts" line="93" assertions="0">
-      <skipped />
-    </testcase>
-    <testcase name="RT-SLACK-23 monitor and loopback cannot chat.react" classname="" time="0" file="packages/gateway/test/slack-adapter-redteam.e2e.test.ts" line="124" assertions="0">
-      <skipped />
-    </testcase>
-    <testcase name="RT-SLACK-24 thread and channel isolate sessions and route replies" classname="" time="0" file="packages/gateway/test/slack-adapter-redteam.e2e.test.ts" line="136" assertions="0">
-      <skipped />
-    </testcase>
-    <testcase name="RT-SLACK-34 real gateway threaded DM chunks default to inbound root" classname="" time="0" file="packages/gateway/test/slack-adapter-redteam.e2e.test.ts" line="161" assertions="0">
-      <skipped />
-    </testcase>
-    <testcase name="RT-SLACK-34 real gateway threaded DM chunks explicit reply wins" classname="" time="0" file="packages/gateway/test/slack-adapter-redteam.e2e.test.ts" line="161" assertions="0">
-      <skipped />
-    </testcase>
-    <testcase name="RT-SLACK-34 plain channel reply threads under the triggering message; an explicit target wins" classname="" time="0" file="packages/gateway/test/slack-adapter-redteam.e2e.test.ts" line="185" assertions="0">
-      <skipped />
-    </testcase>
-    <testcase name="RT-SLACK-33 discord stale lock has exactly one winner under 20 concurrent reclaims" classname="" time="0.11879" file="packages/gateway/test/slack-adapter-redteam.e2e.test.ts" line="196" assertions="21" />
-    <testcase name="RT-SLACK-46 slack channel triggering root preserves platform routing on redelivery" classname="" time="0" file="packages/gateway/test/slack-adapter-redteam.e2e.test.ts" line="215" assertions="0">
-      <skipped />
-    </testcase>
-    <testcase name="RT-SLACK-46 discord channel triggering root preserves platform routing on redelivery" classname="" time="0" file="packages/gateway/test/slack-adapter-redteam.e2e.test.ts" line="215" assertions="0">
-      <skipped />
-    </testcase>
-    <testcase name="RT-SLACK-46 telegram channel triggering root preserves platform routing on redelivery" classname="" time="0" file="packages/gateway/test/slack-adapter-redteam.e2e.test.ts" line="215" assertions="0">
-      <skipped />
-    </testcase>
-    <testcase name="RT-SLACK-46 slash synthetic message id cannot become Slack thread root" classname="" time="0" file="packages/gateway/test/slack-adapter-redteam.e2e.test.ts" line="231" assertions="0">
-      <skipped />
-    </testcase>
-    <testcase name="RT-SLACK-50 real socket activity bounds burst details thinking writing and exactly one final" classname="" time="0" file="packages/gateway/test/slack-adapter-redteam.e2e.test.ts" line="244" assertions="0">
-      <skipped />
-    </testcase>
-    <testcase name="RT-SLACK-45 discord live marker survives and timeout names pidfile holder" classname="" time="1.227708" file="packages/gateway/test/slack-adapter-redteam.e2e.test.ts" line="304" assertions="7" />
-    <testcase name="RT-SLACK-45 discord dead marker elects one of two waiters" classname="" time="1.231683" file="packages/gateway/test/slack-adapter-redteam.e2e.test.ts" line="304" assertions="3" />
-    <testcase name="RT-SLACK-56 real gateway presence precedes progress and clears thread delivery" classname="" time="0" file="packages/gateway/test/slack-adapter-redteam.e2e.test.ts" line="343" assertions="0">
-      <skipped />
-    </testcase>
-    <testcase name="RT-SLACK-56 real gateway presence precedes progress and clears silent final" classname="" time="0" file="packages/gateway/test/slack-adapter-redteam.e2e.test.ts" line="343" assertions="0">
-      <skipped />
-    </testcase>
-    <testcase name="RT-SLACK-63 edited channel response uses original root and slash new remains unthreaded" classname="" time="0" file="packages/gateway/test/slack-adapter-redteam.e2e.test.ts" line="398" assertions="0">
       <skipped />
     </testcase>
   </testsuite>
