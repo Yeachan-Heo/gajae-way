@@ -9,7 +9,7 @@ import {
 	presenceSnapshot,
 } from "@gajaeway/protocol";
 import { type GatewayClientLike, ReconnectingGateway, settleSlackDelivery, subscribeSlackProgress } from "../src/main";
-import { isPresenceReaction, PRESENCE_PHASE_NAMES, WORKING_STATUS_STALE_MS, WorkingStatus } from "../src/status";
+import { isPresenceReaction, WORKING_STATUS_STALE_MS, WorkingStatus } from "../src/status";
 
 const origin: OriginRef = { platform: "slack", kind: "channel", conversationId: "C1" };
 const progress = (extra: Partial<ChatProgressPayload> = {}): ChatProgressPayload => ({
@@ -40,12 +40,6 @@ function fixture() {
 		async postMessage(channel: string, text: string, threadTs?: string) {
 			posts.push([channel, text, threadTs]);
 			return { channel, ts: "10.001" };
-		},
-		async updateMessage() {
-			posts.push("update");
-		},
-		async deleteMessage() {
-			posts.push("delete");
 		},
 	};
 	const status = new WorkingStatus(
@@ -323,11 +317,74 @@ test("Slack inbound arms presence only for engaged addressed turns, on the trigg
 	}
 });
 
-test("PRESENCE_PHASE_NAMES covers every phase", () => {
-	expect(PRESENCE_PHASE_NAMES).toEqual({
-		queued: "hourglass_flowing_sand",
-		tool: "wrench",
-		thinking: "thought_balloon",
-		writing: "writing_hand",
+test("Slack presence: re-arming the same message keeps ownership of markers already on it", async () => {
+	// G5-PRESENCE-SAME-MESSAGE-REARM: an accepted edit re-arms the same id after a
+	// completed multi-marker swap; the old markers must still be ours to remove.
+	const f = fixture();
+	f.status.arm(origin, "C1:1.000");
+	await flush();
+	f.tick(PRESENCE_MIN_SWAP_MS);
+	await f.status.update(progress({ elapsedMs: 61_000, activity: { kind: "tool", label: "bash" } }));
+	expect(names(f.adds)).toEqual(["hourglass_flowing_sand", "wrench", "clock1", "three"]);
+	// Same message re-armed: gradient restarts from queued; nothing is orphaned.
+	f.status.arm(origin, "C1:1.000");
+	await flush();
+	expect(new Set(names(f.removes))).toEqual(new Set(["hourglass_flowing_sand", "wrench", "clock1", "three"]));
+	expect(names(f.adds).at(-1)).toBe("hourglass_flowing_sand");
+	await f.status.clear("C1");
+	// Every marker ever added was removed; the message is clean.
+	const balance = new Map<string, number>();
+	for (const name of names(f.adds)) balance.set(name as string, (balance.get(name as string) ?? 0) + 1);
+	for (const name of names(f.removes)) balance.set(name as string, (balance.get(name as string) ?? 0) - 1);
+	for (const [, count] of balance) expect(count).toBe(0);
+});
+
+test("Slack presence: a swap requested while a slow call is in flight is applied afterwards, not lost", async () => {
+	// G5-PRESENCE-BUSY-STATE-LOSS: desired state is reconciled after the in-flight
+	// operation, and identical later heartbeats do not need to re-request it.
+	const f = fixture();
+	let release!: () => void;
+	const gate = new Promise<void>((resolve) => {
+		release = resolve;
 	});
+	const add = f.api.addReaction;
+	f.api.addReaction = async (channel: string, ts: string, name: string) => {
+		await add(channel, ts, name);
+		if (name === "hourglass_flowing_sand") await gate;
+	};
+	f.status.arm(origin, "C1:1.000");
+	await flush();
+	// The queued add is still pending; a phase change arrives past the window.
+	f.tick(PRESENCE_MIN_SWAP_MS);
+	await f.status.update(
+		progress({ elapsedMs: 20_000, toolCalls: 1, outputTokens: 0, activity: { kind: "tool", label: "bash" } }),
+	);
+	expect(names(f.removes)).toEqual([]);
+	release();
+	await flush();
+	await flush();
+	// After the slow add resolved, the loop re-diffed and applied the tool phase.
+	expect(names(f.removes)).toEqual(["hourglass_flowing_sand"]);
+	expect(names(f.adds)).toEqual(["hourglass_flowing_sand", "wrench", "one"]);
+	await f.status.clear("C1");
+});
+
+test("Slack presence: cleanup failures are logged, never thrown, and never block delivery settlement", async () => {
+	// RT-SLACK-54 / CLEAN-G5-04.
+	const f = fixture();
+	f.status.arm(origin, "C1:1.000");
+	await flush();
+	f.api.removeReaction = async () => {
+		throw new Error("remove denied");
+	};
+	const gateway = new Gateway();
+	await settleSlackDelivery(
+		gateway,
+		f.api,
+		{ origin, text: "reply", deliveryId: "d" } as ChatMessagePayload,
+		console,
+		f.status,
+	);
+	expect(gateway.requests).toEqual(["delivery.confirm"]);
+	expect(f.errors.some((line) => line.includes("remove denied"))).toBe(true);
 });

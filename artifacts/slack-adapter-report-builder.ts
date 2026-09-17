@@ -1,14 +1,17 @@
-const sourceHash = "sha256:042d2126b51914390a20c478dc58e04175f03d7b1d8737b7581e1556af3572b7";
+const sourceHash = "sha256:412c90d6ba22fb5309c14d4fa2b67d655dddd1b234d49916e2de11c36637fe0d";
 const files = [
 	"packages/adapter-slack/test/redteam.test.ts",
 	"packages/gateway/test/slack-adapter-redteam.e2e.test.ts",
 	"packages/sdk/test/client-held-events.test.ts",
+	"packages/adapter-discord/test/slack-presence-redteam.test.ts",
 ];
 const sourceSnapshots: Record<string, string> = {
 	"packages/adapter-slack/test/redteam.test.ts": "artifacts/slack-adapter-redteam.test.snapshot.txt",
 	"packages/gateway/test/slack-adapter-redteam.e2e.test.ts":
 		"artifacts/slack-adapter-gateway-redteam.test.snapshot.txt",
 	"packages/sdk/test/client-held-events.test.ts": "artifacts/slack-adapter-sdk-held-events.test.snapshot.txt",
+	"packages/adapter-discord/test/slack-presence-redteam.test.ts":
+		"artifacts/slack-adapter-discord-presence.test.snapshot.txt",
 };
 const junitPath = "artifacts/slack-adapter-redteam.junit.xml";
 const supportingPath = "artifacts/slack-adapter-supporting.junit.xml";
@@ -54,7 +57,7 @@ const expectations = [
 	"Three invalid_params refusals dead-letter with terminal-message classification/digest/watermark; intervening link failure does not count; repeated unknown failures never dead-letter.",
 	"Failed cursor save makes pass incomplete; restoring isolated /tmp store allows persistence without resending acknowledged message.",
 	"Slash acks distinguish restart, unreachable gateway, duplicate trigger and unknown command.",
-	"Engaged addressed turn posts working status before progress; unmentioned group does not; thread status keeps thread_ts.",
+	"Engaged addressed turns react hourglass on the triggering message before progress; unmentioned groups do not; no status messages are posted.",
 	"Unknown rocket emojiName fails definitively without addReaction.",
 	"A stale pidfile plus a dead reclaimer marker recovers within 2000ms and removes the marker.",
 	"Twenty waiting contenders refuse a live holder that arrives mid-election without replacing its pidfile.",
@@ -62,11 +65,22 @@ const expectations = [
 	"Live 0.9s-old linked marker survives waiter timeout; old dead-owner marker is reclaimed by exactly one of two waiters; timeout names new live pidfile holder.",
 	"Real gateway Slack channel delivery and redelivery thread under triggering ts; slash synthetic id is unthreaded; Discord and Telegram have no reply target.",
 	"429 x4 settles ambiguous without SlackApiError; 429 x2 then success confirms in three requests; Retry-After sleeps exact, capped at 30s and defaulting to 1s.",
-	"Five concurrent deliveries precede cosmetic, independent channels do not block, cosmetic completes when deliveries stop, pendingMs is zero after all settle.",
-	"Thirty ticks over 20s cause at most two updates; activity-only changes wait for 15s edit window; clear deletes exactly once within window.",
+	"Five concurrent deliveries precede cosmetics; independent channels do not block; pendingMs reaches zero after cooldown.",
+	"Thirty phase-flipping ticks over 20s cause at most two removes and three adds; clear removes owned markers and second clear is a no-op.",
 	"Real gateway tool activity has kind/label/detail; ten-start burst emits at most two announcements; hostile intent single-line <=120 chars; end thinking, assistant writing, final exactly once.",
 	"Truncated unengaged reply walk durably records pending root, next pass drains and clears it; participation lastSeenAt never regresses.",
 	"Recent clean recovery skips history after 2s outage, but runs for quarantine or 6s outage.",
+	"Slack arm adds one hourglass without post/update; 30 ticks coalesce; 61s clock1, 3 tools three, 40 tools 100, 5000 tokens keycap_ten; all marker instances removed once, second clear no-op, stale timer clears.",
+	"Late add after clear is removed; new message cleans old markers; cleanup errors are logged without throwing or blocking delivery confirmation.",
+	"Discord gradient follows the same coalescing/bucket/cleanup contract, removes variation-selector writing marker, stale timer clears, own inbound presence is ignored and human presence emoji is reported.",
+	"Real addressed gateway turn adds hourglass on itself before progress, posts reply in its thread, and removes all markers after delivery or silent final.",
+	"Every persona reaction mapping is disjoint from presence; thumbs up adds +1 without touching presence markers.",
+	"Two dead-marker contenders elect one winner with no tombstones or marker left; an owner alive after the wait window keeps its marker inode.",
+	"A delivery arriving behind queued cosmetics dispatches second after D1, even with twenty cosmetics; pendingMs zero when cooldown elapses.",
+	"Body ratelimited twice retries three total requests honouring Retry-After; four refusals throw SlackRateLimitedError attempts 4.",
+	"Five replies drain in two two-page/two-item unit walks without resend; adapter persists pending through at production page bound and clears pending on completion.",
+	"Clean recovery gates a one-second gateway blip but still runs after its overlapping nine-second socket outage.",
+	"Real gateway edited channel reply uses original message thread; slash synthetic /new has no thread target.",
 ];
 const decode = (value: string) =>
 	value
@@ -99,9 +113,11 @@ for (const path of [junitPath, supportingPath, ...loopPaths]) {
 	const xml = (await Bun.file(path).text()).replace(/<!-- sourceHash:.*? -->\n/g, "");
 	await Bun.write(
 		path,
-		xml.replace(/(<\?xml[^>]+>\n)/, `$1<!-- sourceHash: ${sourceHash}; frozenCommit: cbd4d1a -->\n`),
+		xml.replace(/(<\?xml[^>]+>\n)/, `$1<!-- sourceHash: ${sourceHash}; frozenCommit: 145fa8f -->\n`),
 	);
 }
+for (const [source, snapshot] of Object.entries(sourceSnapshots))
+	await Bun.write(snapshot, await Bun.file(source).text());
 const tests = parseTests(await Bun.file(junitPath).text());
 const supporting = parseTests(await Bun.file(supportingPath).text());
 const proof = await Bun.file(proofPath).json();
@@ -133,12 +149,12 @@ const blockers = tests
 	.filter((t) => t.verdict === "failed")
 	.map((t) => ({
 		caseId: t.name.slice(0, 11),
-		contractRef: `Generation 4 acceptance ${t.name.slice(0, 11)}`,
+		contractRef: `Generation 5 acceptance ${t.name.slice(0, 11)}`,
 		test: t.test,
 		testSnapshot: t.testSnapshot,
 		observed: t.failure,
 		scenario: t.name,
-		source: t.name.startsWith("RT-SLACK-48") ? "packages/adapter-slack/src/api.ts:OutboundLimiter.pendingMs" : t.file,
+		source: t.name.startsWith("RT-SLACK-54") ? "packages/adapter-slack/src/status.ts:clear" : t.file,
 		explanation: "Observed assertion failure; source deliberately left unchanged.",
 		artifactRefs: [junitPath, sourceSnapshots[t.file]].filter(Boolean),
 	}));
@@ -193,8 +209,8 @@ const contractCoverage = [
 	),
 	cover(
 		"brief:13 presence lifecycle",
-		[40],
-		"Post on arm; existing status suite covers update, delete, final, stale, concurrent cleanup and cosmetic failure.",
+		[40, 53, 54, 55, 56, 57],
+		"Reaction-only gradient, bucket/coalescing contract, raced cleanup, error logging, stale timers and real silent/delivery final cleanup.",
 		["packages/adapter-slack/test/status.test.ts"],
 	),
 	cover(
@@ -283,7 +299,14 @@ contractCoverage.push(
 	cover(
 		"Generation 4 final boundary acceptance RT-SLACK-45 through 52",
 		[45, 46, 47, 48, 49, 50, 51, 52],
-		"Frozen cbd4d1a exercised through real gateway sockets, adapter injected I/O, filesystem locks and compiled binary; failures retained as blockers.",
+		"Frozen 145fa8f exercised through real gateway sockets, injected I/O, filesystem locks and compiled binary; failures retained as blockers.",
+	),
+);
+contractCoverage.push(
+	cover(
+		"Generation 5 presence gradient and generation-4 fix acceptance",
+		[53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63],
+		"All requested case IDs exercised with assertions; cleanup error logging failure is retained.",
 	),
 );
 const matrix = {
@@ -344,9 +367,9 @@ const report = {
 	latestRunCommit: new TextDecoder().decode(commit.stdout).trim(),
 	executionCwd: process.cwd(),
 	sourceSnapshots,
-	frozenRange: "6b29f7e..cbd4d1a",
+	frozenCommit: "145fa8f",
 	isolation:
-		"Final JUnit, supporting suites, lock repetitions and CLI build/probes ran in detached /tmp/g4-frozen at cbd4d1a. Leader G009 work later replaced shared test files; byte-identical frozen snapshots are authoritative for every reported test line. Restore each sourceSnapshots entry to its original key in a clean cbd4d1a worktree to replay; shared G009 source and tests are excluded.",
+		"Executed in the assigned worktree at 145fa8f. Product source untouched; only allowed test and artifact files changed. Snapshots preserve exact executed test lines.",
 	sourceHashMethod:
 		"Parent-confirmed Ultragoal quality-gate source-hash (integration base, merge base, paths, captured diff and untracked digest), not sha256 of raw git diff.",
 	counts: {
@@ -366,7 +389,7 @@ const report = {
 		"No product source changed in the frozen worktree; RT-SLACK-33 and 45 exercise both adapters.",
 		"Gateway teardown still emits invalid socket write count: -32 warnings; not suppressed.",
 		"RT-SLACK-44 models a former lock handle losing ownership and reacquisition; a rejected acquire itself returns no handle.",
-		"RT-SLACK-48 retains the requested zero-after-settle assertion: pendingMs reports the next reserved pacing slot and returns 100ms at the final completion with minIntervalMs=100. This is a contract mismatch; the failure is not softened into a pass.",
+		"RT-SLACK-61 separates the requested two-page/two-item unit bound from durable adapter verification at its fixed ten-page production bound.",
 	],
 	executorQa: matrix,
 };

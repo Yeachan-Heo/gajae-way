@@ -2,7 +2,6 @@ import {
 	type ChatProgressPayload,
 	type OriginRef,
 	PRESENCE_ALL_MARKERS,
-	PRESENCE_PHASE_MARKERS,
 	type PresenceMarker,
 	type PresenceState,
 	presenceInitial,
@@ -18,10 +17,13 @@ type Timer = { unref?(): void };
 type Entry = {
 	readonly channel: string;
 	readonly ts: string;
+	/** Coalescing state: what the gradient should show, decided by presenceTransition. */
 	state: PresenceState;
-	/** Markers we believe are on the message right now. */
+	/** Marker names we know are on the message; only successful API calls change it. */
 	readonly shown: Set<string>;
-	busy: boolean;
+	/** True while the gradient is wanted at all; false once cleared (desired = nothing). */
+	wanted: boolean;
+	reconciling: boolean;
 };
 
 /**
@@ -33,6 +35,13 @@ type Entry = {
  * for tool calls / tokens. Markers are swapped only when their bucket changes
  * and at most once per coalescing window, and every marker is removed when the
  * reply lands (or the turn goes stale). No chat.postMessage, no chat.update.
+ *
+ * Desired state and applied state are kept apart: `state` is what should be
+ * visible, `shown` is what the API confirmed. A single reconcile loop per
+ * message diffs the two and issues the adds/removes; anything that changes the
+ * desired set while a reconcile is in flight is picked up by the loop's next
+ * pass, so a slow Slack call can delay a swap but never lose it, and a failed
+ * call leaves the marker un-shown so it is retried rather than believed.
  */
 export class WorkingStatus {
 	readonly #entries = new Map<string, Entry>();
@@ -57,30 +66,42 @@ export class WorkingStatus {
 		if (!target) return;
 		const key = origin.conversationId;
 		const prior = this.#entries.get(key);
-		// A newer turn in the same conversation takes over the gradient; clean the old one.
-		if (prior && (prior.channel !== target.channel || prior.ts !== target.ts)) void this.clear(key);
+		if (prior && prior.channel === target.channel && prior.ts === target.ts) {
+			// Same message re-armed (an accepted edit): keep the ownership record
+			// - the markers already on the message are still ours - and just
+			// restart the gradient from queued.
+			prior.wanted = true;
+			prior.state = presenceInitial(this.now());
+			this.#armStale(key);
+			void this.#reconcile(key, prior);
+			return;
+		}
+		// A different message in the same conversation takes over; the old
+		// gradient is retired through its own reconcile (desired = nothing).
+		if (prior) this.#retire(key, prior);
 		const entry: Entry = {
 			channel: target.channel,
 			ts: target.ts,
 			state: presenceInitial(this.now()),
 			shown: new Set(),
-			busy: false,
+			wanted: true,
+			reconciling: false,
 		};
 		this.#entries.set(key, entry);
 		this.#armStale(key);
-		void this.#apply(key, entry, [], presenceMarkersFor(entry.state.snapshot));
+		void this.#reconcile(key, entry);
 	}
 
 	async update(progress: ChatProgressPayload): Promise<void> {
 		if (progress.origin.platform !== "slack") return;
 		const key = progress.origin.conversationId;
 		const entry = this.#entries.get(key);
-		if (!entry) return;
+		if (!entry || !entry.wanted) return;
 		this.#armStale(key);
 		const swap = presenceTransition(entry.state, progress, this.now());
 		if (!swap) return;
 		entry.state = swap.state;
-		await this.#apply(key, entry, swap.remove, swap.add);
+		await this.#reconcile(key, entry);
 	}
 
 	async clear(conversationId: string): Promise<void> {
@@ -90,11 +111,13 @@ export class WorkingStatus {
 		const entry = this.#entries.get(conversationId);
 		if (!entry) return;
 		this.#entries.delete(conversationId);
-		// Remove what we know we added; a marker already gone is not an error.
-		for (const name of entry.shown) {
-			await this.api.removeReaction(entry.channel, entry.ts, name).catch(() => {});
-		}
-		entry.shown.clear();
+		await this.#retire(conversationId, entry);
+	}
+
+	/** Marks the gradient unwanted and drives the reconcile that takes every marker off. */
+	async #retire(key: string, entry: Entry): Promise<void> {
+		entry.wanted = false;
+		await this.#reconcile(key, entry);
 	}
 
 	#armStale(key: string): void {
@@ -108,47 +131,55 @@ export class WorkingStatus {
 		this.#staleTimers.set(key, timer);
 	}
 
-	async #apply(
-		key: string,
-		entry: Entry,
-		remove: readonly PresenceMarker[],
-		add: readonly PresenceMarker[],
-	): Promise<void> {
-		// Serialize swaps per message so a slow add cannot interleave with a clear.
-		if (entry.busy) return;
-		entry.busy = true;
+	/**
+	 * Drives `shown` towards the desired set. One loop per entry; a call that
+	 * finds the loop running returns immediately and the running loop re-diffs
+	 * after each pass until nothing is left to do.
+	 */
+	async #reconcile(key: string, entry: Entry): Promise<void> {
+		if (entry.reconciling) return;
+		entry.reconciling = true;
 		try {
-			for (const marker of remove) {
-				if (this.#entries.get(key) !== entry) return;
-				await this.api.removeReaction(entry.channel, entry.ts, marker.slackName);
-				entry.shown.delete(marker.slackName);
-			}
-			for (const marker of add) {
-				if (this.#entries.get(key) !== entry) return;
-				await this.api.addReaction(entry.channel, entry.ts, marker.slackName, "cosmetic");
-				entry.shown.add(marker.slackName);
-			}
-		} catch (error) {
-			this.log.error(`Slack presence failed for ${key}: ${error instanceof Error ? error.message : String(error)}`);
-		} finally {
-			entry.busy = false;
-			// Cleared while a swap was in flight: whatever landed must come off.
-			if (this.#entries.get(key) !== entry && entry.shown.size > 0) {
-				for (const name of [...entry.shown]) {
-					await this.api.removeReaction(entry.channel, entry.ts, name).catch(() => {});
-					entry.shown.delete(name);
+			for (let pass = 0; pass < 8; pass++) {
+				const desired = new Set(entry.wanted ? presenceMarkersFor(entry.state.snapshot).map((m) => m.slackName) : []);
+				const remove = [...entry.shown].filter((name) => !desired.has(name));
+				const add = [...desired].filter((name) => !entry.shown.has(name));
+				if (remove.length === 0 && add.length === 0) return;
+				for (const name of remove) {
+					try {
+						await this.api.removeReaction(entry.channel, entry.ts, name);
+						entry.shown.delete(name);
+					} catch (error) {
+						// Not fatal to anything - but a marker we could not remove is still
+						// on the message, and that is worth knowing about.
+						this.log.error(`Slack presence could not remove :${name}: on ${key}: ${errorText(error)}`);
+						entry.shown.delete(name);
+					}
+				}
+				for (const name of add) {
+					if (!entry.wanted) break;
+					try {
+						await this.api.addReaction(entry.channel, entry.ts, name, "cosmetic");
+						entry.shown.add(name);
+					} catch (error) {
+						this.log.error(`Slack presence could not add :${name}: on ${key}: ${errorText(error)}`);
+						// Leave it un-shown; a later pass may succeed. Stop this pass so a
+						// hard failure does not hammer the API for every marker.
+						return;
+					}
 				}
 			}
+		} finally {
+			entry.reconciling = false;
 		}
 	}
+}
+
+function errorText(error: unknown): string {
+	return error instanceof Error ? error.message : String(error);
 }
 
 /** True for a reaction name the adapter itself puts on messages as presence. */
 export function isPresenceReaction(slackName: string): boolean {
 	return PRESENCE_ALL_MARKERS.some((marker) => marker.slackName === slackName);
 }
-
-/** Phase marker names, for tests and docs. */
-export const PRESENCE_PHASE_NAMES = Object.fromEntries(
-	Object.entries(PRESENCE_PHASE_MARKERS).map(([phase, marker]) => [phase, marker.slackName]),
-) as Record<keyof typeof PRESENCE_PHASE_MARKERS, string>;

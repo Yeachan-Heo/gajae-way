@@ -1,278 +1,277 @@
 <?xml version="1.0" encoding="UTF-8"?>
-<!-- sourceHash: sha256:042d2126b51914390a20c478dc58e04175f03d7b1d8737b7581e1556af3572b7; frozenCommit: cbd4d1a -->
-<testsuites name="bun test" tests="210" assertions="913" failures="0" skipped="0" time="0.089396">
-  <testsuite name="packages/adapter-slack/test/attachments.test.ts" file="packages/adapter-slack/test/attachments.test.ts" tests="2" assertions="14" failures="0" skipped="0" time="0.001217" hostname="MacBook-Pro-3.local">
-    <testcase name="Slack files use MIME kind, preferred name/url, and readable sizes" classname="" time="0.000288" file="packages/adapter-slack/test/attachments.test.ts" line="4" assertions="6" />
-    <testcase name="Slack inbound bodies retain captions, cap file rendering, and distinguish empty messages" classname="" time="0.000185" file="packages/adapter-slack/test/attachments.test.ts" line="22" assertions="8" />
+<!-- sourceHash: sha256:412c90d6ba22fb5309c14d4fa2b67d655dddd1b234d49916e2de11c36637fe0d; frozenCommit: 145fa8f -->
+<testsuites name="bun test" tests="209" assertions="920" failures="0" skipped="0" time="3.102466">
+  <testsuite name="packages/adapter-slack/test/attachments.test.ts" file="packages/adapter-slack/test/attachments.test.ts" tests="2" assertions="14" failures="0" skipped="0" time="0.001203" hostname="MacBook-Pro-3.local">
+    <testcase name="Slack files use MIME kind, preferred name/url, and readable sizes" classname="" time="0.000289" file="packages/adapter-slack/test/attachments.test.ts" line="4" assertions="6" />
+    <testcase name="Slack inbound bodies retain captions, cap file rendering, and distinguish empty messages" classname="" time="0.000174" file="packages/adapter-slack/test/attachments.test.ts" line="22" assertions="8" />
   </testsuite>
-  <testsuite name="packages/adapter-slack/test/author.test.ts" file="packages/adapter-slack/test/author.test.ts" tests="4" assertions="21" failures="0" skipped="0" time="0.000968" hostname="MacBook-Pro-3.local">
-    <testcase name="Slack display names skip blanks at each precedence level" classname="" time="0.00007" file="packages/adapter-slack/test/author.test.ts" line="4" assertions="5" />
-    <testcase name="Slack directory caches, updates LRU on reads, primes payloads and hides DM names" classname="" time="0.000267" file="packages/adapter-slack/test/author.test.ts" line="18" assertions="8" />
-    <testcase name="Slack negative lookups expire after 60 seconds and concurrent requests coalesce" classname="" time="0.000103" file="packages/adapter-slack/test/author.test.ts" line="46" assertions="6" />
-    <testcase name="Slack priming during a lookup preserves the fresher payload" classname="" time="0.000065" file="packages/adapter-slack/test/author.test.ts" line="73" assertions="2" />
+  <testsuite name="packages/adapter-slack/test/author.test.ts" file="packages/adapter-slack/test/author.test.ts" tests="4" assertions="21" failures="0" skipped="0" time="0.00088" hostname="MacBook-Pro-3.local">
+    <testcase name="Slack display names skip blanks at each precedence level" classname="" time="0.000071" file="packages/adapter-slack/test/author.test.ts" line="4" assertions="5" />
+    <testcase name="Slack directory caches, updates LRU on reads, primes payloads and hides DM names" classname="" time="0.000252" file="packages/adapter-slack/test/author.test.ts" line="18" assertions="8" />
+    <testcase name="Slack negative lookups expire after 60 seconds and concurrent requests coalesce" classname="" time="0.000091" file="packages/adapter-slack/test/author.test.ts" line="46" assertions="6" />
+    <testcase name="Slack priming during a lookup preserves the fresher payload" classname="" time="0.000056" file="packages/adapter-slack/test/author.test.ts" line="73" assertions="2" />
   </testsuite>
-  <testsuite name="packages/adapter-slack/test/mrkdwn.test.ts" file="packages/adapter-slack/test/mrkdwn.test.ts" tests="5" assertions="46" failures="0" skipped="0" time="0.000835" hostname="MacBook-Pro-3.local">
-    <testcase name="Slack markdown conversion handles emphasis, links, headings, lists and escaping" classname="" time="0.000202" file="packages/adapter-slack/test/mrkdwn.test.ts" line="4" assertions="5" />
-    <testcase name="Slack code retains literal markup and fence language tags" classname="" time="0.000014" file="packages/adapter-slack/test/mrkdwn.test.ts" line="15" assertions="3" />
-    <testcase name="Slack chunks respect exact boundaries, preserve text and prefer newlines" classname="" time="0.000125" file="packages/adapter-slack/test/mrkdwn.test.ts" line="22" assertions="6" />
-    <testcase name="Slack chunks avoid short fences and close/reopen oversized code blocks" classname="" time="0.000073" file="packages/adapter-slack/test/mrkdwn.test.ts" line="34" assertions="16" />
-    <testcase name="Slack chunking remains bounded with long language tags and nearby fence boundaries" classname="" time="0.000044" file="packages/adapter-slack/test/mrkdwn.test.ts" line="50" assertions="16" />
+  <testsuite name="packages/adapter-slack/test/mrkdwn.test.ts" file="packages/adapter-slack/test/mrkdwn.test.ts" tests="5" assertions="46" failures="0" skipped="0" time="0.00076" hostname="MacBook-Pro-3.local">
+    <testcase name="Slack markdown conversion handles emphasis, links, headings, lists and escaping" classname="" time="0.000189" file="packages/adapter-slack/test/mrkdwn.test.ts" line="4" assertions="5" />
+    <testcase name="Slack code retains literal markup and fence language tags" classname="" time="0.000012" file="packages/adapter-slack/test/mrkdwn.test.ts" line="15" assertions="3" />
+    <testcase name="Slack chunks respect exact boundaries, preserve text and prefer newlines" classname="" time="0.000118" file="packages/adapter-slack/test/mrkdwn.test.ts" line="22" assertions="6" />
+    <testcase name="Slack chunks avoid short fences and close/reopen oversized code blocks" classname="" time="0.000072" file="packages/adapter-slack/test/mrkdwn.test.ts" line="34" assertions="16" />
+    <testcase name="Slack chunking remains bounded with long language tags and nearby fence boundaries" classname="" time="0.000046" file="packages/adapter-slack/test/mrkdwn.test.ts" line="50" assertions="16" />
   </testsuite>
-  <testsuite name="packages/adapter-slack/test/status.test.ts" file="packages/adapter-slack/test/status.test.ts" tests="16" assertions="86" failures="0" skipped="0" time="0.009692" hostname="MacBook-Pro-3.local">
-    <testcase name="Slack working status formatting omits unknown counters and coarsens time" classname="" time="0.000078" file="packages/adapter-slack/test/status.test.ts" line="66" assertions="4" />
-    <testcase name="Slack status coalesces edits: unchanged text and edits inside the window send nothing" classname="" time="0.000336" file="packages/adapter-slack/test/status.test.ts" line="77" assertions="4" />
-    <testcase name="Slack status routes channel: posts on arm, updates one message, and disarms" classname="" time="0.000175" file="packages/adapter-slack/test/status.test.ts" line="121" assertions="8" />
-    <testcase name="Slack status routes dm: posts on arm, updates one message, and disarms" classname="" time="0.000021" file="packages/adapter-slack/test/status.test.ts" line="121" assertions="8" />
-    <testcase name="Slack status routes thread: posts on arm, updates one message, and disarms" classname="" time="0.00007" file="packages/adapter-slack/test/status.test.ts" line="121" assertions="8" />
-    <testcase name="Slack pending post is unique and a clear deletes its late result without touching a newer turn" classname="" time="0.000119" file="packages/adapter-slack/test/status.test.ts" line="148" assertions="2" />
-    <testcase name="Slack stale timer clears and disarms the status" classname="" time="0.000093" file="packages/adapter-slack/test/status.test.ts" line="170" assertions="3" />
-    <testcase name="Slack post and update failures are logged, retain an existing message, and never throw" classname="" time="0.000138" file="packages/adapter-slack/test/status.test.ts" line="183" assertions="3" />
-    <testcase name="Slack ignores foreign origins even when armed" classname="" time="0.000028" file="packages/adapter-slack/test/status.test.ts" line="211" assertions="2" />
-    <testcase name="Slack progress final clears silent turns, logs failures, and unsubscribes" classname="" time="0.00014" file="packages/adapter-slack/test/status.test.ts" line="244" assertions="3" />
-    <testcase name="Slack delivery clears status for reaction=false failure=false" classname="" time="0.000188" file="packages/adapter-slack/test/status.test.ts" line="279" assertions="3" />
-    <testcase name="Slack delivery clears status for reaction=false failure=true" classname="" time="0.000063" file="packages/adapter-slack/test/status.test.ts" line="279" assertions="3" />
-    <testcase name="Slack delivery clears status for reaction=true failure=false" classname="" time="0.000076" file="packages/adapter-slack/test/status.test.ts" line="279" assertions="3" />
-    <testcase name="Slack delivery clears status for reaction=true failure=true" classname="" time="0.000026" file="packages/adapter-slack/test/status.test.ts" line="279" assertions="3" />
-    <testcase name="Slack inbound arms only engaged addressed turns; edits and adopted progress follow the same lifecycle" classname="" time="0.000695" file="packages/adapter-slack/test/status.test.ts" line="314" assertions="24" />
-    <testcase name="Slack working status renders the current activity after the counters" classname="" time="0.000059" file="packages/adapter-slack/test/status.test.ts" line="343" assertions="5" />
+  <testsuite name="packages/adapter-slack/test/status.test.ts" file="packages/adapter-slack/test/status.test.ts" tests="13" assertions="85" failures="0" skipped="0" time="0.009137" hostname="MacBook-Pro-3.local">
+    <testcase name="presence buckets: phase from activity, clock per minute, effort from tool calls then tokens" classname="" time="0.000067" file="packages/adapter-slack/test/status.test.ts" line="79" assertions="6" />
+    <testcase name="presence markers never collide with the persona&apos;s reaction allowlist" classname="" time="0.000135" file="packages/adapter-slack/test/status.test.ts" line="101" assertions="15" />
+    <testcase name="Slack presence is reactions on the triggering message, never a posted or edited message" classname="" time="0.000465" file="packages/adapter-slack/test/status.test.ts" line="110" assertions="11" />
+    <testcase name="Slack presence swaps are coalesced to one per window even when the phase flips" classname="" time="0.000064" file="packages/adapter-slack/test/status.test.ts" line="138" assertions="4" />
+    <testcase name="Slack presence: a newer turn on the same conversation takes over, and the stale timer cleans up" classname="" time="0.000065" file="packages/adapter-slack/test/status.test.ts" line="160" assertions="5" />
+    <testcase name="Slack presence failures are logged, never thrown, and a clear during a swap still cleans up" classname="" time="0.000155" file="packages/adapter-slack/test/status.test.ts" line="179" assertions="4" />
+    <testcase name="Slack progress final clears the gradient of silent turns, logs failures, and unsubscribes" classname="" time="0.000132" file="packages/adapter-slack/test/status.test.ts" line="233" assertions="3" />
+    <testcase name="Slack delivery clears presence for reaction=false failure=false" classname="" time="0.000229" file="packages/adapter-slack/test/status.test.ts" line="268" assertions="3" />
+    <testcase name="Slack delivery clears presence for reaction=false failure=true" classname="" time="0.00006" file="packages/adapter-slack/test/status.test.ts" line="268" assertions="3" />
+    <testcase name="Slack delivery clears presence for reaction=true failure=false" classname="" time="0.00006" file="packages/adapter-slack/test/status.test.ts" line="268" assertions="3" />
+    <testcase name="Slack delivery clears presence for reaction=true failure=true" classname="" time="0.000025" file="packages/adapter-slack/test/status.test.ts" line="268" assertions="3" />
+    <testcase name="Slack inbound arms presence only for engaged addressed turns, on the triggering message" classname="" time="0.000505" file="packages/adapter-slack/test/status.test.ts" line="299" assertions="24" />
+    <testcase name="PRESENCE_PHASE_NAMES covers every phase" classname="" time="0.000006" file="packages/adapter-slack/test/status.test.ts" line="326" assertions="1" />
   </testsuite>
-  <testsuite name="packages/adapter-slack/test/text.test.ts" file="packages/adapter-slack/test/text.test.ts" tests="3" assertions="12" failures="0" skipped="0" time="0.000354" hostname="MacBook-Pro-3.local">
-    <testcase name="Slack mention extraction preserves order and deduplicates" classname="" time="0.000063" file="packages/adapter-slack/test/text.test.ts" line="4" assertions="1" />
-    <testcase name="Slack token normalization honors cached names then labels then identifiers" classname="" time="0.000111" file="packages/adapter-slack/test/text.test.ts" line="8" assertions="9" />
-    <testcase name="Slack Enterprise Grid mentions normalize and prime the directory" classname="" time="0.000016" file="packages/adapter-slack/test/text.test.ts" line="24" assertions="2" />
+  <testsuite name="packages/adapter-slack/test/text.test.ts" file="packages/adapter-slack/test/text.test.ts" tests="3" assertions="12" failures="0" skipped="0" time="0.000311" hostname="MacBook-Pro-3.local">
+    <testcase name="Slack mention extraction preserves order and deduplicates" classname="" time="0.000053" file="packages/adapter-slack/test/text.test.ts" line="4" assertions="1" />
+    <testcase name="Slack token normalization honors cached names then labels then identifiers" classname="" time="0.000093" file="packages/adapter-slack/test/text.test.ts" line="8" assertions="9" />
+    <testcase name="Slack Enterprise Grid mentions normalize and prime the directory" classname="" time="0.000014" file="packages/adapter-slack/test/text.test.ts" line="24" assertions="2" />
   </testsuite>
-  <testsuite name="packages/adapter-slack/test/origin.test.ts" file="packages/adapter-slack/test/origin.test.ts" tests="2" assertions="19" failures="0" skipped="0" time="0.000385" hostname="MacBook-Pro-3.local">
-    <testcase name="Slack origins distinguish direct messages, thread replies, and roots" classname="" time="0.000202" file="packages/adapter-slack/test/origin.test.ts" line="4" assertions="7" />
-    <testcase name="Slack message identifiers round trip and reject malformed or unsafe parts" classname="" time="0.000058" file="packages/adapter-slack/test/origin.test.ts" line="32" assertions="12" />
+  <testsuite name="packages/adapter-slack/test/origin.test.ts" file="packages/adapter-slack/test/origin.test.ts" tests="2" assertions="19" failures="0" skipped="0" time="0.000201" hostname="MacBook-Pro-3.local">
+    <testcase name="Slack origins distinguish direct messages, thread replies, and roots" classname="" time="0.000071" file="packages/adapter-slack/test/origin.test.ts" line="4" assertions="7" />
+    <testcase name="Slack message identifiers round trip and reject malformed or unsafe parts" classname="" time="0.00003" file="packages/adapter-slack/test/origin.test.ts" line="32" assertions="12" />
   </testsuite>
-  <testsuite name="packages/adapter-slack/test/socket.test.ts" file="packages/adapter-slack/test/socket.test.ts" tests="9" assertions="32" failures="0" skipped="0" time="0.013722" hostname="MacBook-Pro-3.local">
-    <testcase name="Slack ACK precedes event and slash dispatch; hello marks connected" classname="" time="0.00053" file="packages/adapter-slack/test/socket.test.ts" line="103" assertions="7" />
-    <testcase name="Slack disconnect and server close reconnect with capped exponential backoff reset by hello" classname="" time="0.000199" file="packages/adapter-slack/test/socket.test.ts" line="137" assertions="6" />
+  <testsuite name="packages/adapter-slack/test/socket.test.ts" file="packages/adapter-slack/test/socket.test.ts" tests="9" assertions="32" failures="0" skipped="0" time="0.012223" hostname="MacBook-Pro-3.local">
+    <testcase name="Slack ACK precedes event and slash dispatch; hello marks connected" classname="" time="0.000568" file="packages/adapter-slack/test/socket.test.ts" line="103" assertions="7" />
+    <testcase name="Slack disconnect and server close reconnect with capped exponential backoff reset by hello" classname="" time="0.000182" file="packages/adapter-slack/test/socket.test.ts" line="137" assertions="6" />
     <testcase name="Slack first connection failure resolves startup and retries in the background" classname="" time="0.000081" file="packages/adapter-slack/test/socket.test.ts" line="164" assertions="4" />
-    <testcase name="Slack retries deduplicate both envelope and event IDs but dispatch unseen retries" classname="" time="0.000069" file="packages/adapter-slack/test/socket.test.ts" line="182" assertions="2" />
-    <testcase name="Slack handler errors and malformed frames do not stop later envelopes" classname="" time="0.000144" file="packages/adapter-slack/test/socket.test.ts" line="201" assertions="3" />
-    <testcase name="Slack stop cancels retry and suppresses stale callbacks" classname="" time="0.000038" file="packages/adapter-slack/test/socket.test.ts" line="224" assertions="3" />
-    <testcase name="Slack stop during connection lookup does not construct a late socket" classname="" time="0.000043" file="packages/adapter-slack/test/socket.test.ts" line="238" assertions="1" />
-    <testcase name="Slack retains 1024 envelopes and refreshes retry recency before eviction" classname="" time="0.012308" file="packages/adapter-slack/test/socket.test.ts" line="255" assertions="3" />
-    <testcase name="Slack start is idempotent and can restart after stop" classname="" time="0.000126" file="packages/adapter-slack/test/socket.test.ts" line="273" assertions="3" />
+    <testcase name="Slack retries deduplicate both envelope and event IDs but dispatch unseen retries" classname="" time="0.000075" file="packages/adapter-slack/test/socket.test.ts" line="182" assertions="2" />
+    <testcase name="Slack handler errors and malformed frames do not stop later envelopes" classname="" time="0.000118" file="packages/adapter-slack/test/socket.test.ts" line="201" assertions="3" />
+    <testcase name="Slack stop cancels retry and suppresses stale callbacks" classname="" time="0.000045" file="packages/adapter-slack/test/socket.test.ts" line="224" assertions="3" />
+    <testcase name="Slack stop during connection lookup does not construct a late socket" classname="" time="0.000029" file="packages/adapter-slack/test/socket.test.ts" line="238" assertions="1" />
+    <testcase name="Slack retains 1024 envelopes and refreshes retry recency before eviction" classname="" time="0.010411" file="packages/adapter-slack/test/socket.test.ts" line="255" assertions="3" />
+    <testcase name="Slack start is idempotent and can restart after stop" classname="" time="0.000122" file="packages/adapter-slack/test/socket.test.ts" line="273" assertions="3" />
   </testsuite>
-  <testsuite name="packages/adapter-slack/test/recovery.test.ts" file="packages/adapter-slack/test/recovery.test.ts" tests="12" assertions="58" failures="0" skipped="0" time="0.007024" hostname="MacBook-Pro-3.local">
-    <testsuite name="Slack recovery state" file="packages/adapter-slack/test/recovery.test.ts" line="48" tests="3" assertions="17" failures="0" skipped="0" time="0.004" hostname="MacBook-Pro-3.local">
-      <testcase name="path, missing state, atomic private round trip, corrupt input" classname="Slack recovery state" time="0.002791" file="packages/adapter-slack/test/recovery.test.ts" line="49" assertions="7" />
-      <testcase name="DM retention is bounded and expires at the TTL boundary" classname="Slack recovery state" time="0.002315" file="packages/adapter-slack/test/recovery.test.ts" line="105" assertions="5" />
-      <testcase name="timestamps compare decimal seconds without lexical or floating point errors" classname="Slack recovery state" time="0.000088" file="packages/adapter-slack/test/recovery.test.ts" line="116" assertions="5" />
+  <testsuite name="packages/adapter-slack/test/recovery.test.ts" file="packages/adapter-slack/test/recovery.test.ts" tests="12" assertions="58" failures="0" skipped="0" time="0.0058" hostname="MacBook-Pro-3.local">
+    <testsuite name="Slack recovery state" file="packages/adapter-slack/test/recovery.test.ts" line="48" tests="3" assertions="17" failures="0" skipped="0" time="0.003" hostname="MacBook-Pro-3.local">
+      <testcase name="path, missing state, atomic private round trip, corrupt input" classname="Slack recovery state" time="0.002109" file="packages/adapter-slack/test/recovery.test.ts" line="49" assertions="7" />
+      <testcase name="DM retention is bounded and expires at the TTL boundary" classname="Slack recovery state" time="0.001766" file="packages/adapter-slack/test/recovery.test.ts" line="105" assertions="5" />
+      <testcase name="timestamps compare decimal seconds without lexical or floating point errors" classname="Slack recovery state" time="0.000059" file="packages/adapter-slack/test/recovery.test.ts" line="116" assertions="5" />
     </testsuite>
     <testsuite name="Slack conversation replay" file="packages/adapter-slack/test/recovery.test.ts" line="125" tests="5" assertions="27" failures="0" skipped="0" time="0" hostname="MacBook-Pro-3.local">
-      <testcase name="bootstrap lookback and exclusive cursor" classname="Slack conversation replay" time="0.000415" file="packages/adapter-slack/test/recovery.test.ts" line="126" assertions="4" />
-      <testcase name="newest-first pages replay globally oldest-first using next_cursor" classname="Slack conversation replay" time="0.000105" file="packages/adapter-slack/test/recovery.test.ts" line="149" assertions="8" />
-      <testcase name="thread parents fetch paged replies, never duplicate parents, and preserve origins" classname="Slack conversation replay" time="0.000099" file="packages/adapter-slack/test/recovery.test.ts" line="173" assertions="4" />
-      <testcase name="own bot skips, duplicate and skip advance, unavailable stops without crossing" classname="Slack conversation replay" time="0.000068" file="packages/adapter-slack/test/recovery.test.ts" line="198" assertions="3" />
-      <testcase name="history and reply API errors classify permanence without cursor advancement" classname="Slack conversation replay" time="0.00023" file="packages/adapter-slack/test/recovery.test.ts" line="220" assertions="8" />
+      <testcase name="bootstrap lookback and exclusive cursor" classname="Slack conversation replay" time="0.000363" file="packages/adapter-slack/test/recovery.test.ts" line="126" assertions="4" />
+      <testcase name="newest-first pages replay globally oldest-first using next_cursor" classname="Slack conversation replay" time="0.000098" file="packages/adapter-slack/test/recovery.test.ts" line="149" assertions="8" />
+      <testcase name="thread parents fetch paged replies, never duplicate parents, and preserve origins" classname="Slack conversation replay" time="0.000088" file="packages/adapter-slack/test/recovery.test.ts" line="173" assertions="4" />
+      <testcase name="own bot skips, duplicate and skip advance, unavailable stops without crossing" classname="Slack conversation replay" time="0.000065" file="packages/adapter-slack/test/recovery.test.ts" line="198" assertions="3" />
+      <testcase name="history and reply API errors classify permanence without cursor advancement" classname="Slack conversation replay" time="0.000194" file="packages/adapter-slack/test/recovery.test.ts" line="220" assertions="8" />
     </testsuite>
     <testsuite name="Slack recovery scheduler" file="packages/adapter-slack/test/recovery.test.ts" line="240" tests="4" assertions="14" failures="0" skipped="0" time="0" hostname="MacBook-Pro-3.local">
-      <testcase name="single flight and one coalesced follow-up" classname="Slack recovery scheduler" time="0.000186" file="packages/adapter-slack/test/recovery.test.ts" line="241" assertions="3" />
-      <testcase name="incomplete backoff, jitter, ceiling, reset, and cancellation use injected waits" classname="Slack recovery scheduler" time="0.000143" file="packages/adapter-slack/test/recovery.test.ts" line="260" assertions="6" />
-      <testcase name="a synchronously throwing run remains retryable" classname="Slack recovery scheduler" time="0.00012" file="packages/adapter-slack/test/recovery.test.ts" line="303" assertions="3" />
-      <testcase name="trigger wakes a pending retry, stop during a run prevents follow-up" classname="Slack recovery scheduler" time="0.000049" file="packages/adapter-slack/test/recovery.test.ts" line="324" assertions="2" />
+      <testcase name="single flight and one coalesced follow-up" classname="Slack recovery scheduler" time="0.000147" file="packages/adapter-slack/test/recovery.test.ts" line="241" assertions="3" />
+      <testcase name="incomplete backoff, jitter, ceiling, reset, and cancellation use injected waits" classname="Slack recovery scheduler" time="0.000129" file="packages/adapter-slack/test/recovery.test.ts" line="260" assertions="6" />
+      <testcase name="a synchronously throwing run remains retryable" classname="Slack recovery scheduler" time="0.000074" file="packages/adapter-slack/test/recovery.test.ts" line="303" assertions="3" />
+      <testcase name="trigger wakes a pending retry, stop during a run prevents follow-up" classname="Slack recovery scheduler" time="0.000036" file="packages/adapter-slack/test/recovery.test.ts" line="324" assertions="2" />
     </testsuite>
   </testsuite>
-  <testsuite name="packages/adapter-slack/test/reactions.test.ts" file="packages/adapter-slack/test/reactions.test.ts" tests="2" assertions="41" failures="0" skipped="0" time="0.000386" hostname="MacBook-Pro-3.local">
-    <testcase name="Every protocol reaction has a Slack mapping and round trips" classname="" time="0.000081" file="packages/adapter-slack/test/reactions.test.ts" line="11" assertions="32" />
-    <testcase name="Slack reactions describe routing, unknown emoji, engagement, and removal" classname="" time="0.000069" file="packages/adapter-slack/test/reactions.test.ts" line="31" assertions="9" />
+  <testsuite name="packages/adapter-slack/test/reactions.test.ts" file="packages/adapter-slack/test/reactions.test.ts" tests="2" assertions="41" failures="0" skipped="0" time="0.000366" hostname="MacBook-Pro-3.local">
+    <testcase name="Every protocol reaction has a Slack mapping and round trips" classname="" time="0.000079" file="packages/adapter-slack/test/reactions.test.ts" line="11" assertions="32" />
+    <testcase name="Slack reactions describe routing, unknown emoji, engagement, and removal" classname="" time="0.000063" file="packages/adapter-slack/test/reactions.test.ts" line="31" assertions="9" />
   </testsuite>
-  <testsuite name="packages/adapter-slack/test/config.test.ts" file="packages/adapter-slack/test/config.test.ts" tests="5" assertions="29" failures="0" skipped="0" time="0.00777" hostname="MacBook-Pro-3.local">
-    <testcase name="Slack missing or unreadable JSON config identifies its path" classname="" time="0.001132" file="packages/adapter-slack/test/config.test.ts" line="20" assertions="2" />
-    <testcase name="Slack requires both nonblank credential paths" classname="" time="0.002097" file="packages/adapter-slack/test/config.test.ts" line="28" assertions="8" />
-    <testcase name="Slack relative paths use config directory and tokens are trimmed" classname="" time="0.001104" file="packages/adapter-slack/test/config.test.ts" line="39" assertions="1" />
-    <testcase name="Slack rejects missing, empty, and wrong-prefix credentials without disclosing values" classname="" time="0.001529" file="packages/adapter-slack/test/config.test.ts" line="55" assertions="11" />
-    <testcase name="Slack rejects malformed channel policies and gateway socket" classname="" time="0.001675" file="packages/adapter-slack/test/config.test.ts" line="81" assertions="7" />
+  <testsuite name="packages/adapter-slack/test/config.test.ts" file="packages/adapter-slack/test/config.test.ts" tests="5" assertions="29" failures="0" skipped="0" time="0.005679" hostname="MacBook-Pro-3.local">
+    <testcase name="Slack missing or unreadable JSON config identifies its path" classname="" time="0.000907" file="packages/adapter-slack/test/config.test.ts" line="20" assertions="2" />
+    <testcase name="Slack requires both nonblank credential paths" classname="" time="0.001294" file="packages/adapter-slack/test/config.test.ts" line="28" assertions="8" />
+    <testcase name="Slack relative paths use config directory and tokens are trimmed" classname="" time="0.000783" file="packages/adapter-slack/test/config.test.ts" line="39" assertions="1" />
+    <testcase name="Slack rejects missing, empty, and wrong-prefix credentials without disclosing values" classname="" time="0.001324" file="packages/adapter-slack/test/config.test.ts" line="55" assertions="11" />
+    <testcase name="Slack rejects malformed channel policies and gateway socket" classname="" time="0.001176" file="packages/adapter-slack/test/config.test.ts" line="81" assertions="7" />
   </testsuite>
-  <testsuite name="packages/adapter-slack/test/api.test.ts" file="packages/adapter-slack/test/api.test.ts" tests="9" assertions="59" failures="0" skipped="0" time="0.001527" hostname="MacBook-Pro-3.local">
-    <testcase name="Slack calls use JSON POST and the appropriate bearer token" classname="" time="0.000298" file="packages/adapter-slack/test/api.test.ts" line="33" assertions="8" />
-    <testcase name="Slack errors preserve HTTP status and platform code" classname="" time="0.000186" file="packages/adapter-slack/test/api.test.ts" line="50" assertions="21" />
-    <testcase name="Slack reactions are idempotent only for already_reacted" classname="" time="0.000091" file="packages/adapter-slack/test/api.test.ts" line="73" assertions="2" />
-    <testcase name="Slack message wrappers send optional threads and disable unfurls" classname="" time="0.000111" file="packages/adapter-slack/test/api.test.ts" line="82" assertions="4" />
-    <testcase name="Slack identity and directory wrappers unwrap fields and history exposes cursors" classname="" time="0.000149" file="packages/adapter-slack/test/api.test.ts" line="94" assertions="6" />
-    <testcase name="Slack response URLs receive JSON without leaking the bot credential" classname="" time="0.000047" file="packages/adapter-slack/test/api.test.ts" line="114" assertions="4" />
-    <testcase name="Slack transport errors are ambiguous but API rejections are definitive" classname="" time="0.000009" file="packages/adapter-slack/test/api.test.ts" line="128" assertions="2" />
-    <testcase name="Slack 429 honours Retry-After with a bounded retry and then stays ambiguous" classname="" time="0.000134" file="packages/adapter-slack/test/api.test.ts" line="133" assertions="8" />
-    <testcase name="Slack outbound limiter paces one channel and lets deliveries jump cosmetics" classname="" time="0.000145" file="packages/adapter-slack/test/api.test.ts" line="167" assertions="4" />
+  <testsuite name="packages/adapter-slack/test/api.test.ts" file="packages/adapter-slack/test/api.test.ts" tests="11" assertions="67" failures="0" skipped="0" time="3.007157" hostname="MacBook-Pro-3.local">
+    <testcase name="Slack calls use JSON POST and the appropriate bearer token" classname="" time="0.000318" file="packages/adapter-slack/test/api.test.ts" line="33" assertions="8" />
+    <testcase name="Slack errors preserve HTTP status and platform code" classname="" time="0.00021" file="packages/adapter-slack/test/api.test.ts" line="50" assertions="21" />
+    <testcase name="Slack reactions are idempotent only for already_reacted" classname="" time="0.000104" file="packages/adapter-slack/test/api.test.ts" line="73" assertions="2" />
+    <testcase name="Slack message wrappers send optional threads and disable unfurls" classname="" time="0.000132" file="packages/adapter-slack/test/api.test.ts" line="82" assertions="4" />
+    <testcase name="Slack identity and directory wrappers unwrap fields and history exposes cursors" classname="" time="0.000152" file="packages/adapter-slack/test/api.test.ts" line="94" assertions="6" />
+    <testcase name="Slack response URLs receive JSON without leaking the bot credential" classname="" time="0.00005" file="packages/adapter-slack/test/api.test.ts" line="114" assertions="4" />
+    <testcase name="Slack transport errors are ambiguous but API rejections are definitive" classname="" time="0.000011" file="packages/adapter-slack/test/api.test.ts" line="128" assertions="2" />
+    <testcase name="Slack 429 honours Retry-After with a bounded retry and then stays ambiguous" classname="" time="3.004845" file="packages/adapter-slack/test/api.test.ts" line="133" assertions="8" />
+    <testcase name="Slack outbound limiter paces one channel and lets deliveries jump cosmetics" classname="" time="0.000413" file="packages/adapter-slack/test/api.test.ts" line="167" assertions="4" />
+    <testcase name="Slack body-level ratelimited goes through the same bounded retry as a 429" classname="" time="0.000165" file="packages/adapter-slack/test/api.test.ts" line="199" assertions="4" />
+    <testcase name="Slack outbound limiter dispatches waiting deliveries before cosmetics and drains to idle" classname="" time="0.00013" file="packages/adapter-slack/test/api.test.ts" line="228" assertions="4" />
   </testsuite>
-  <testsuite name="packages/protocol/test/protocol.test.ts" file="packages/protocol/test/protocol.test.ts" tests="35" assertions="64" failures="0" skipped="0" time="0.000961" hostname="MacBook-Pro-3.local">
+  <testsuite name="packages/protocol/test/protocol.test.ts" file="packages/protocol/test/protocol.test.ts" tests="35" assertions="64" failures="0" skipped="0" time="0.001509" hostname="MacBook-Pro-3.local">
     <testsuite name="negotiation" file="packages/protocol/test/protocol.test.ts" line="21" tests="4" assertions="7" failures="0" skipped="0" time="0" hostname="MacBook-Pro-3.local">
-      <testcase name="picks highest mutual version" classname="negotiation" time="0.000049" file="packages/protocol/test/protocol.test.ts" line="22" assertions="2" />
-      <testcase name="rejects disjoint versions with typed code" classname="negotiation" time="0.000009" file="packages/protocol/test/protocol.test.ts" line="28" assertions="2" />
-      <testcase name="rejects missing required capability" classname="negotiation" time="0.000009" file="packages/protocol/test/protocol.test.ts" line="34" assertions="2" />
-      <testcase name="unknown optional fields are ignored" classname="negotiation" time="0.000006" file="packages/protocol/test/protocol.test.ts" line="43" assertions="1" />
+      <testcase name="picks highest mutual version" classname="negotiation" time="0.000064" file="packages/protocol/test/protocol.test.ts" line="22" assertions="2" />
+      <testcase name="rejects disjoint versions with typed code" classname="negotiation" time="0.000012" file="packages/protocol/test/protocol.test.ts" line="28" assertions="2" />
+      <testcase name="rejects missing required capability" classname="negotiation" time="0.000011" file="packages/protocol/test/protocol.test.ts" line="34" assertions="2" />
+      <testcase name="unknown optional fields are ignored" classname="negotiation" time="0.000008" file="packages/protocol/test/protocol.test.ts" line="43" assertions="1" />
     </testsuite>
     <testsuite name="frames" file="packages/protocol/test/protocol.test.ts" line="52" tests="5" assertions="8" failures="0" skipped="0" time="0" hostname="MacBook-Pro-3.local">
-      <testcase name="round-trips a request frame" classname="frames" time="0.000052" file="packages/protocol/test/protocol.test.ts" line="53" assertions="1" />
-      <testcase name="rejects non-JSON with malformed_frame" classname="frames" time="0.00005" file="packages/protocol/test/protocol.test.ts" line="64" assertions="2" />
-      <testcase name="rejects unknown frame type typed" classname="frames" time="0.000013" file="packages/protocol/test/protocol.test.ts" line="73" assertions="1" />
-      <testcase name="rejects oversized frames" classname="frames" time="0.000126" file="packages/protocol/test/protocol.test.ts" line="82" assertions="1" />
-      <testcase name="decoder splits chunked NDJSON and buffers partials" classname="frames" time="0.000047" file="packages/protocol/test/protocol.test.ts" line="87" assertions="3" />
+      <testcase name="round-trips a request frame" classname="frames" time="0.000062" file="packages/protocol/test/protocol.test.ts" line="53" assertions="1" />
+      <testcase name="rejects non-JSON with malformed_frame" classname="frames" time="0.000056" file="packages/protocol/test/protocol.test.ts" line="64" assertions="2" />
+      <testcase name="rejects unknown frame type typed" classname="frames" time="0.000016" file="packages/protocol/test/protocol.test.ts" line="73" assertions="1" />
+      <testcase name="rejects oversized frames" classname="frames" time="0.000093" file="packages/protocol/test/protocol.test.ts" line="82" assertions="1" />
+      <testcase name="decoder splits chunked NDJSON and buffers partials" classname="frames" time="0.000054" file="packages/protocol/test/protocol.test.ts" line="87" assertions="3" />
     </testsuite>
     <testsuite name="origin normalization" file="packages/protocol/test/protocol.test.ts" line="98" tests="9" assertions="20" failures="0" skipped="0" time="0" hostname="MacBook-Pro-3.local">
-      <testcase name="originKey is deterministic and validated" classname="origin normalization" time="0.000105" file="packages/protocol/test/protocol.test.ts" line="99" assertions="1" />
-      <testcase name="dm requires peerId; channel forbids it" classname="origin normalization" time="0.000025" file="packages/protocol/test/protocol.test.ts" line="109" assertions="2" />
-      <testcase name="thread requires parentId" classname="origin normalization" time="0.000007" file="packages/protocol/test/protocol.test.ts" line="121" assertions="1" />
-      <testcase name="slack supports dm, channel and thread, and its thread ids round-trip through originKey" classname="origin normalization" time="0.000044" file="packages/protocol/test/protocol.test.ts" line="125" assertions="4" />
-      <testcase name="slack rejects the telegram-only topic kind" classname="origin normalization" time="0.000039" file="packages/protocol/test/protocol.test.ts" line="143" assertions="2" />
+      <testcase name="originKey is deterministic and validated" classname="origin normalization" time="0.000069" file="packages/protocol/test/protocol.test.ts" line="99" assertions="1" />
+      <testcase name="dm requires peerId; channel forbids it" classname="origin normalization" time="0.00002" file="packages/protocol/test/protocol.test.ts" line="109" assertions="2" />
+      <testcase name="thread requires parentId" classname="origin normalization" time="0.000006" file="packages/protocol/test/protocol.test.ts" line="121" assertions="1" />
+      <testcase name="slack supports dm, channel and thread, and its thread ids round-trip through originKey" classname="origin normalization" time="0.000045" file="packages/protocol/test/protocol.test.ts" line="125" assertions="4" />
+      <testcase name="slack rejects the telegram-only topic kind" classname="origin normalization" time="0.000034" file="packages/protocol/test/protocol.test.ts" line="143" assertions="2" />
       <testcase name="chat platforms are exactly the ones an adapter can deliver to" classname="origin normalization" time="0.000028" file="packages/protocol/test/protocol.test.ts" line="152" assertions="7" />
       <testcase name="loopback origin is valid and stable" classname="origin normalization" time="0.000004" file="packages/protocol/test/protocol.test.ts" line="160" assertions="1" />
-      <testcase name="two distinct origins never share a key" classname="origin normalization" time="0.000011" file="packages/protocol/test/protocol.test.ts" line="164" assertions="1" />
+      <testcase name="two distinct origins never share a key" classname="origin normalization" time="0.000009" file="packages/protocol/test/protocol.test.ts" line="164" assertions="1" />
       <testcase name="rejects segment injection attempts" classname="origin normalization" time="0.000007" file="packages/protocol/test/protocol.test.ts" line="180" assertions="1" />
     </testsuite>
     <testsuite name="silence tokens" file="packages/protocol/test/protocol.test.ts" line="191" tests="17" assertions="29" failures="0" skipped="0" time="0" hostname="MacBook-Pro-3.local">
-      <testcase name="recognizes embedded marker &quot;preamble [SILENT]&quot;" classname="silence tokens" time="0.000053" file="packages/protocol/test/protocol.test.ts" line="198" assertions="2" />
-      <testcase name="recognizes embedded marker &quot;preamble\n[SILENT]\npostscript&quot;" classname="silence tokens" time="0.000003" file="packages/protocol/test/protocol.test.ts" line="198" assertions="2" />
+      <testcase name="recognizes embedded marker &quot;preamble [SILENT]&quot;" classname="silence tokens" time="0.000037" file="packages/protocol/test/protocol.test.ts" line="198" assertions="2" />
+      <testcase name="recognizes embedded marker &quot;preamble\n[SILENT]\npostscript&quot;" classname="silence tokens" time="0.000002" file="packages/protocol/test/protocol.test.ts" line="198" assertions="2" />
       <testcase name="recognizes embedded marker &quot;preamble [silent]&quot;" classname="silence tokens" time="0.000001" file="packages/protocol/test/protocol.test.ts" line="198" assertions="2" />
-      <testcase name="recognizes embedded marker &quot;preamble\n[silent]\npostscript&quot;" classname="silence tokens" time="0.000001" file="packages/protocol/test/protocol.test.ts" line="198" assertions="2" />
-      <testcase name="recognizes an original-body marker beyond a 2 KiB excerpt" classname="silence tokens" time="0.000008" file="packages/protocol/test/protocol.test.ts" line="204" assertions="2" />
+      <testcase name="recognizes embedded marker &quot;preamble\n[silent]\npostscript&quot;" classname="silence tokens" time="0" file="packages/protocol/test/protocol.test.ts" line="198" assertions="2" />
+      <testcase name="recognizes an original-body marker beyond a 2 KiB excerpt" classname="silence tokens" time="0.000007" file="packages/protocol/test/protocol.test.ts" line="204" assertions="2" />
       <testcase name="does not broaden embedded grammar for &quot;ordinary text&quot;" classname="silence tokens" time="0.000003" file="packages/protocol/test/protocol.test.ts" line="217" assertions="1" />
-      <testcase name="does not broaden embedded grammar for &quot;preamble SILENT&quot;" classname="silence tokens" time="0.000001" file="packages/protocol/test/protocol.test.ts" line="217" assertions="1" />
+      <testcase name="does not broaden embedded grammar for &quot;preamble SILENT&quot;" classname="silence tokens" time="0" file="packages/protocol/test/protocol.test.ts" line="217" assertions="1" />
       <testcase name="does not broaden embedded grammar for &quot;preamble [Silent]&quot;" classname="silence tokens" time="0" file="packages/protocol/test/protocol.test.ts" line="217" assertions="1" />
       <testcase name="does not broaden embedded grammar for &quot;preamble [NO_REPLY]&quot;" classname="silence tokens" time="0" file="packages/protocol/test/protocol.test.ts" line="217" assertions="1" />
       <testcase name="does not broaden embedded grammar for &quot;preamble [ SILENT ]&quot;" classname="silence tokens" time="0" file="packages/protocol/test/protocol.test.ts" line="217" assertions="1" />
-      <testcase name="preserves exact-body alias SILENT" classname="silence tokens" time="0.000005" file="packages/protocol/test/protocol.test.ts" line="223" assertions="2" />
+      <testcase name="preserves exact-body alias SILENT" classname="silence tokens" time="0.000006" file="packages/protocol/test/protocol.test.ts" line="223" assertions="2" />
       <testcase name="preserves exact-body alias [SILENT]" classname="silence tokens" time="0.000001" file="packages/protocol/test/protocol.test.ts" line="223" assertions="2" />
       <testcase name="preserves exact-body alias silent" classname="silence tokens" time="0.000001" file="packages/protocol/test/protocol.test.ts" line="223" assertions="2" />
-      <testcase name="preserves exact-body alias NO_REPLY" classname="silence tokens" time="0.000004" file="packages/protocol/test/protocol.test.ts" line="223" assertions="2" />
-      <testcase name="preserves exact-body alias NO REPLY" classname="silence tokens" time="0.000003" file="packages/protocol/test/protocol.test.ts" line="223" assertions="2" />
+      <testcase name="preserves exact-body alias NO_REPLY" classname="silence tokens" time="0.000009" file="packages/protocol/test/protocol.test.ts" line="223" assertions="2" />
+      <testcase name="preserves exact-body alias NO REPLY" classname="silence tokens" time="0.000002" file="packages/protocol/test/protocol.test.ts" line="223" assertions="2" />
       <testcase name="preserves exact-body alias [NO_REPLY]" classname="silence tokens" time="0.000002" file="packages/protocol/test/protocol.test.ts" line="223" assertions="2" />
       <testcase name="preserves exact-body alias [NO REPLY]" classname="silence tokens" time="0.000002" file="packages/protocol/test/protocol.test.ts" line="223" assertions="2" />
     </testsuite>
   </testsuite>
-  <testsuite name="packages/protocol/test/reactions.test.ts" file="packages/protocol/test/reactions.test.ts" tests="13" assertions="111" failures="0" skipped="0" time="0.000483" hostname="MacBook-Pro-3.local">
+  <testsuite name="packages/protocol/test/reactions.test.ts" file="packages/protocol/test/reactions.test.ts" tests="13" assertions="111" failures="0" skipped="0" time="0.000877" hostname="MacBook-Pro-3.local">
     <testsuite name="reaction allowlist" file="packages/protocol/test/reactions.test.ts" line="15" tests="6" assertions="70" failures="0" skipped="0" time="0" hostname="MacBook-Pro-3.local">
-      <testcase name="every accepted spelling of an allowlisted emoji resolves to one canonical entry" classname="reaction allowlist" time="0.000026" file="packages/protocol/test/reactions.test.ts" line="16" assertions="4" />
-      <testcase name="the emoji presentation selector is normalized away so ❤️ and ❤ are one reaction" classname="reaction allowlist" time="0.000006" file="packages/protocol/test/reactions.test.ts" line="23" assertions="2" />
-      <testcase name="anything outside the bounded set is rejected, not coerced" classname="reaction allowlist" time="0.000014" file="packages/protocol/test/reactions.test.ts" line="30" assertions="7" />
-      <testcase name="the rejection description names what IS accepted, per platform" classname="reaction allowlist" time="0.00008" file="packages/protocol/test/reactions.test.ts" line="35" assertions="53" />
-      <testcase name="a slack channel:ts pair is a platform message id" classname="reaction allowlist" time="0.000006" file="packages/protocol/test/reactions.test.ts" line="61" assertions="2" />
-      <testcase name="caps are bounded and small" classname="reaction allowlist" time="0.000003" file="packages/protocol/test/reactions.test.ts" line="66" assertions="2" />
+      <testcase name="every accepted spelling of an allowlisted emoji resolves to one canonical entry" classname="reaction allowlist" time="0.000029" file="packages/protocol/test/reactions.test.ts" line="16" assertions="4" />
+      <testcase name="the emoji presentation selector is normalized away so ❤️ and ❤ are one reaction" classname="reaction allowlist" time="0.000005" file="packages/protocol/test/reactions.test.ts" line="23" assertions="2" />
+      <testcase name="anything outside the bounded set is rejected, not coerced" classname="reaction allowlist" time="0.000024" file="packages/protocol/test/reactions.test.ts" line="30" assertions="7" />
+      <testcase name="the rejection description names what IS accepted, per platform" classname="reaction allowlist" time="0.000085" file="packages/protocol/test/reactions.test.ts" line="35" assertions="53" />
+      <testcase name="a slack channel:ts pair is a platform message id" classname="reaction allowlist" time="0.000007" file="packages/protocol/test/reactions.test.ts" line="61" assertions="2" />
+      <testcase name="caps are bounded and small" classname="reaction allowlist" time="0.000004" file="packages/protocol/test/reactions.test.ts" line="66" assertions="2" />
     </testsuite>
     <testsuite name="reaction reply token" file="packages/protocol/test/reactions.test.ts" line="72" tests="7" assertions="41" failures="0" skipped="0" time="0" hostname="MacBook-Pro-3.local">
-      <testcase name="a reply that is only a token is a reaction with no message" classname="reaction reply token" time="0.00005" file="packages/protocol/test/reactions.test.ts" line="73" assertions="1" />
+      <testcase name="a reply that is only a token is a reaction with no message" classname="reaction reply token" time="0.000048" file="packages/protocol/test/reactions.test.ts" line="73" assertions="1" />
       <testcase name="text after the token is still delivered" classname="reaction reply token" time="0.000008" file="packages/protocol/test/reactions.test.ts" line="80" assertions="1" />
-      <testcase name="a token may target one specific message" classname="reaction reply token" time="0.000008" file="packages/protocol/test/reactions.test.ts" line="87" assertions="1" />
-      <testcase name="several leading tokens are all parsed" classname="reaction reply token" time="0.000011" file="packages/protocol/test/reactions.test.ts" line="94" assertions="2" />
-      <testcase name="a malformed or disallowed token is not a reaction at all, so the text ships verbatim" classname="reaction reply token" time="0.00002" file="packages/protocol/test/reactions.test.ts" line="103" assertions="11" />
-      <testcase name="platform message ids are bounded to what a platform actually issues" classname="reaction reply token" time="0.000017" file="packages/protocol/test/reactions.test.ts" line="122" assertions="12" />
-      <testcase name="the silence-token contract is untouched by reaction parsing" classname="reaction reply token" time="0.000025" file="packages/protocol/test/reactions.test.ts" line="129" assertions="13" />
+      <testcase name="a token may target one specific message" classname="reaction reply token" time="0.000012" file="packages/protocol/test/reactions.test.ts" line="87" assertions="1" />
+      <testcase name="several leading tokens are all parsed" classname="reaction reply token" time="0.000019" file="packages/protocol/test/reactions.test.ts" line="94" assertions="2" />
+      <testcase name="a malformed or disallowed token is not a reaction at all, so the text ships verbatim" classname="reaction reply token" time="0.000025" file="packages/protocol/test/reactions.test.ts" line="103" assertions="11" />
+      <testcase name="platform message ids are bounded to what a platform actually issues" classname="reaction reply token" time="0.000018" file="packages/protocol/test/reactions.test.ts" line="122" assertions="12" />
+      <testcase name="the silence-token contract is untouched by reaction parsing" classname="reaction reply token" time="0.000024" file="packages/protocol/test/reactions.test.ts" line="129" assertions="13" />
     </testsuite>
   </testsuite>
-  <testsuite name="packages/cli/test/main.test.ts" file="packages/cli/test/main.test.ts" tests="88" assertions="312" failures="0" skipped="0" time="0.033619" hostname="MacBook-Pro-3.local">
+  <testsuite name="packages/cli/test/main.test.ts" file="packages/cli/test/main.test.ts" tests="88" assertions="312" failures="0" skipped="0" time="0.030133" hostname="MacBook-Pro-3.local">
     <testsuite name="cli arguments" file="packages/cli/test/main.test.ts" line="23" tests="2" assertions="5" failures="0" skipped="0" time="0.001" hostname="MacBook-Pro-3.local">
-      <testcase name="resolves home and socket override" classname="cli arguments" time="0.000036" file="packages/cli/test/main.test.ts" line="24" assertions="2" />
-      <testcase name="an unknown memory-audit argument is refused instead of degrading to a plain audit" classname="cli arguments" time="0.001561" file="packages/cli/test/main.test.ts" line="29" assertions="3" />
+      <testcase name="resolves home and socket override" classname="cli arguments" time="0.000047" file="packages/cli/test/main.test.ts" line="24" assertions="2" />
+      <testcase name="an unknown memory-audit argument is refused instead of degrading to a plain audit" classname="cli arguments" time="0.001687" file="packages/cli/test/main.test.ts" line="29" assertions="3" />
     </testsuite>
-    <testsuite name="service installation" file="packages/cli/test/main.test.ts" line="49" tests="5" assertions="50" failures="0" skipped="0" time="0" hostname="MacBook-Pro-3.local">
-      <testcase name="install and repair select the same idempotent writer contract" classname="service installation" time="0.000029" file="packages/cli/test/main.test.ts" line="50" assertions="2" />
-      <testcase name="managed, login, and fallback PATH entries are ordered and deduplicated" classname="service installation" time="0.000126" file="packages/cli/test/main.test.ts" line="54" assertions="2" />
-      <testcase name="explicit PATH and disabled inheritance never invoke login discovery" classname="service installation" time="0.000049" file="packages/cli/test/main.test.ts" line="80" assertions="3" />
-      <testcase name="install and repair each rewrite exactly four safe LaunchAgent plists" classname="service installation" time="0.000954" file="packages/cli/test/main.test.ts" line="124" assertions="41" />
-      <testcase name="invalid service selection fails before any plist write" classname="service installation" time="0.000062" file="packages/cli/test/main.test.ts" line="176" assertions="2" />
+    <testsuite name="service installation" file="packages/cli/test/main.test.ts" line="49" tests="5" assertions="50" failures="0" skipped="0" time="0.001" hostname="MacBook-Pro-3.local">
+      <testcase name="install and repair select the same idempotent writer contract" classname="service installation" time="0.000032" file="packages/cli/test/main.test.ts" line="50" assertions="2" />
+      <testcase name="managed, login, and fallback PATH entries are ordered and deduplicated" classname="service installation" time="0.000153" file="packages/cli/test/main.test.ts" line="54" assertions="2" />
+      <testcase name="explicit PATH and disabled inheritance never invoke login discovery" classname="service installation" time="0.000053" file="packages/cli/test/main.test.ts" line="80" assertions="3" />
+      <testcase name="install and repair each rewrite exactly four safe LaunchAgent plists" classname="service installation" time="0.001214" file="packages/cli/test/main.test.ts" line="124" assertions="41" />
+      <testcase name="invalid service selection fails before any plist write" classname="service installation" time="0.00005" file="packages/cli/test/main.test.ts" line="176" assertions="2" />
     </testsuite>
     <testsuite name="list flag validation" file="packages/cli/test/main.test.ts" line="199" tests="3" assertions="6" failures="0" skipped="0" time="0" hostname="MacBook-Pro-3.local">
-      <testcase name="monitors list --fields bogus fails before connecting" classname="list flag validation" time="0.000114" file="packages/cli/test/main.test.ts" line="207" assertions="2" />
+      <testcase name="monitors list --fields bogus fails before connecting" classname="list flag validation" time="0.000104" file="packages/cli/test/main.test.ts" line="207" assertions="2" />
       <testcase name="sessions list --fields bogus fails before connecting" classname="list flag validation" time="0.00001" file="packages/cli/test/main.test.ts" line="207" assertions="2" />
-      <testcase name="monitors list --limit nope fails before connecting" classname="list flag validation" time="0.000016" file="packages/cli/test/main.test.ts" line="207" assertions="2" />
+      <testcase name="monitors list --limit nope fails before connecting" classname="list flag validation" time="0.000014" file="packages/cli/test/main.test.ts" line="207" assertions="2" />
     </testsuite>
-    <testcase name="offline restore preserves the current database then copies a header-validated backup" classname="" time="0.001467" file="packages/cli/test/main.test.ts" line="223" assertions="3" />
+    <testcase name="offline restore preserves the current database then copies a header-validated backup" classname="" time="0.001378" file="packages/cli/test/main.test.ts" line="223" assertions="3" />
     <testsuite name="cycle rendering" file="packages/cli/test/main.test.ts" line="269" tests="5" assertions="17" failures="0" skipped="0" time="0" hostname="MacBook-Pro-3.local">
-      <testcase name="healthy cycle renders phase and explicit none-gate, no sessions block" classname="cycle rendering" time="0.000082" file="packages/cli/test/main.test.ts" line="270" assertions="3" />
+      <testcase name="healthy cycle renders phase and explicit none-gate, no sessions block" classname="cycle rendering" time="0.000079" file="packages/cli/test/main.test.ts" line="270" assertions="3" />
       <testcase name="gates render visibly with every reason named" classname="cycle rendering" time="0.000012" file="packages/cli/test/main.test.ts" line="277" assertions="1" />
-      <testcase name="mid-rebind session renders the rebinding marker instead of a session id" classname="cycle rendering" time="0.00003" file="packages/cli/test/main.test.ts" line="284" assertions="3" />
-      <testcase name="census lines always render so an empty subsystem is distinguishable from a missing one" classname="cycle rendering" time="0.00001" file="packages/cli/test/main.test.ts" line="325" assertions="5" />
-      <testcase name="exit-code contract: gates force exit 1, healthy is exit 0" classname="cycle rendering" time="0.000018" file="packages/cli/test/main.test.ts" line="334" assertions="5" />
+      <testcase name="mid-rebind session renders the rebinding marker instead of a session id" classname="cycle rendering" time="0.000027" file="packages/cli/test/main.test.ts" line="284" assertions="3" />
+      <testcase name="census lines always render so an empty subsystem is distinguishable from a missing one" classname="cycle rendering" time="0.000011" file="packages/cli/test/main.test.ts" line="325" assertions="5" />
+      <testcase name="exit-code contract: gates force exit 1, healthy is exit 0" classname="cycle rendering" time="0.000019" file="packages/cli/test/main.test.ts" line="334" assertions="5" />
     </testsuite>
     <testsuite name="usage guard" file="packages/cli/test/main.test.ts" line="345" tests="4" assertions="19" failures="0" skipped="0" time="0" hostname="MacBook-Pro-3.local">
-      <testcase name="an empty argv is a usage error, not a dispatchable command" classname="usage guard" time="0.000012" file="packages/cli/test/main.test.ts" line="346" assertions="3" />
-      <testcase name="an unknown subcommand is a usage error" classname="usage guard" time="0.00001" file="packages/cli/test/main.test.ts" line="352" assertions="5" />
+      <testcase name="an empty argv is a usage error, not a dispatchable command" classname="usage guard" time="0.00001" file="packages/cli/test/main.test.ts" line="346" assertions="3" />
+      <testcase name="an unknown subcommand is a usage error" classname="usage guard" time="0.000008" file="packages/cli/test/main.test.ts" line="352" assertions="5" />
       <testcase name="every dispatchable command passes the guard" classname="usage guard" time="0.000006" file="packages/cli/test/main.test.ts" line="356" assertions="10" />
-      <testcase name="a socket override alone still resolves to no command" classname="usage guard" time="0.000004" file="packages/cli/test/main.test.ts" line="360" assertions="1" />
+      <testcase name="a socket override alone still resolves to no command" classname="usage guard" time="0.000011" file="packages/cli/test/main.test.ts" line="360" assertions="1" />
     </testsuite>
-    <testsuite name="usage exits the process instead of blocking" file="packages/cli/test/main.test.ts" line="365" tests="2" assertions="5" failures="0" skipped="0" time="0.026" hostname="MacBook-Pro-3.local">
-      <testcase name="no arguments prints usage on stderr and exits non-zero" classname="usage exits the process instead of blocking" time="0.013051" file="packages/cli/test/main.test.ts" line="380" assertions="3" />
-      <testcase name="an unknown subcommand prints usage on stderr and exits non-zero" classname="usage exits the process instead of blocking" time="0.013448" file="packages/cli/test/main.test.ts" line="387" assertions="2" />
+    <testsuite name="usage exits the process instead of blocking" file="packages/cli/test/main.test.ts" line="365" tests="2" assertions="5" failures="0" skipped="0" time="0.021" hostname="MacBook-Pro-3.local">
+      <testcase name="no arguments prints usage on stderr and exits non-zero" classname="usage exits the process instead of blocking" time="0.011357" file="packages/cli/test/main.test.ts" line="380" assertions="3" />
+      <testcase name="an unknown subcommand prints usage on stderr and exits non-zero" classname="usage exits the process instead of blocking" time="0.010732" file="packages/cli/test/main.test.ts" line="387" assertions="2" />
     </testsuite>
     <testsuite name="work operator commands" file="packages/cli/test/main.test.ts" line="394" tests="66" assertions="207" failures="0" skipped="0" time="0" hostname="MacBook-Pro-3.local">
-      <testcase name="work run forwards --preset with cwd and resume" classname="work operator commands" time="0.000367" file="packages/cli/test/main.test.ts" line="440" assertions="4" />
-      <testcase name="work run forwards --model with cwd and resume" classname="work operator commands" time="0.000019" file="packages/cli/test/main.test.ts" line="440" assertions="4" />
+      <testcase name="work run forwards --preset with cwd and resume" classname="work operator commands" time="0.000303" file="packages/cli/test/main.test.ts" line="440" assertions="4" />
+      <testcase name="work run forwards --model with cwd and resume" classname="work operator commands" time="0.000018" file="packages/cli/test/main.test.ts" line="440" assertions="4" />
       <testcase name="work start forwards --preset and canonical notification target" classname="work operator commands" time="0.000068" file="packages/cli/test/main.test.ts" line="461" assertions="4" />
-      <testcase name="work start forwards --model and canonical notification target" classname="work operator commands" time="0.000011" file="packages/cli/test/main.test.ts" line="461" assertions="4" />
-      <testcase name="work start accepts canonical origin loopback/loopback/loopback" classname="work operator commands" time="0.000051" file="packages/cli/test/main.test.ts" line="510" assertions="3" />
-      <testcase name="work start accepts canonical origin discord/channel/123" classname="work operator commands" time="0.000009" file="packages/cli/test/main.test.ts" line="510" assertions="3" />
-      <testcase name="work start accepts canonical origin discord/dm/123/peer=456" classname="work operator commands" time="0.000015" file="packages/cli/test/main.test.ts" line="510" assertions="3" />
-      <testcase name="work start accepts canonical origin discord/thread/123/parent=456" classname="work operator commands" time="0.000054" file="packages/cli/test/main.test.ts" line="510" assertions="3" />
-      <testcase name="work start accepts canonical origin monitor/eventtype/build.done" classname="work operator commands" time="0.000011" file="packages/cli/test/main.test.ts" line="510" assertions="3" />
-      <testcase name="work start without notify leaves target selection to the gateway" classname="work operator commands" time="0.00003" file="packages/cli/test/main.test.ts" line="524" assertions="1" />
-      <testcase name="work run prints held without claiming acceptance" classname="work operator commands" time="0.000034" file="packages/cli/test/main.test.ts" line="536" assertions="3" />
-      <testcase name="work start prints held without claiming acceptance" classname="work operator commands" time="0.000006" file="packages/cli/test/main.test.ts" line="536" assertions="3" />
-      <testcase name="work run remains response-only with a caller wait budget" classname="work operator commands" time="0.000022" file="packages/cli/test/main.test.ts" line="550" assertions="3" />
-      <testcase name="work status prints exact snapshot for null" classname="work operator commands" time="0.000033" file="packages/cli/test/main.test.ts" line="558" assertions="3" />
-      <testcase name="work status prints exact snapshot for {&quot;status&quot;:&quot;unknown&quot;}" classname="work operator commands" time="0.000014" file="packages/cli/test/main.test.ts" line="558" assertions="3" />
+      <testcase name="work start forwards --model and canonical notification target" classname="work operator commands" time="0.000013" file="packages/cli/test/main.test.ts" line="461" assertions="4" />
+      <testcase name="work start accepts canonical origin loopback/loopback/loopback" classname="work operator commands" time="0.000047" file="packages/cli/test/main.test.ts" line="510" assertions="3" />
+      <testcase name="work start accepts canonical origin discord/channel/123" classname="work operator commands" time="0.000008" file="packages/cli/test/main.test.ts" line="510" assertions="3" />
+      <testcase name="work start accepts canonical origin discord/dm/123/peer=456" classname="work operator commands" time="0.000016" file="packages/cli/test/main.test.ts" line="510" assertions="3" />
+      <testcase name="work start accepts canonical origin discord/thread/123/parent=456" classname="work operator commands" time="0.000017" file="packages/cli/test/main.test.ts" line="510" assertions="3" />
+      <testcase name="work start accepts canonical origin monitor/eventtype/build.done" classname="work operator commands" time="0.000009" file="packages/cli/test/main.test.ts" line="510" assertions="3" />
+      <testcase name="work start without notify leaves target selection to the gateway" classname="work operator commands" time="0.000029" file="packages/cli/test/main.test.ts" line="524" assertions="1" />
+      <testcase name="work run prints held without claiming acceptance" classname="work operator commands" time="0.000029" file="packages/cli/test/main.test.ts" line="536" assertions="3" />
+      <testcase name="work start prints held without claiming acceptance" classname="work operator commands" time="0.000014" file="packages/cli/test/main.test.ts" line="536" assertions="3" />
+      <testcase name="work run remains response-only with a caller wait budget" classname="work operator commands" time="0.000024" file="packages/cli/test/main.test.ts" line="550" assertions="3" />
+      <testcase name="work status prints exact snapshot for null" classname="work operator commands" time="0.000034" file="packages/cli/test/main.test.ts" line="558" assertions="3" />
+      <testcase name="work status prints exact snapshot for {&quot;status&quot;:&quot;unknown&quot;}" classname="work operator commands" time="0.00001" file="packages/cli/test/main.test.ts" line="558" assertions="3" />
       <testcase name="work status prints exact snapshot for {&quot;status&quot;:&quot;terminal_ok&quot;,&quot;outcome&quot;:{&quot;reason&quot;:&quot;cancelled&quot;}}" classname="work operator commands" time="0.000006" file="packages/cli/test/main.test.ts" line="558" assertions="3" />
-      <testcase name="work steer returns the accepted correlation ref" classname="work operator commands" time="0.000036" file="packages/cli/test/main.test.ts" line="574" assertions="3" />
-      <testcase name="work steer refusal is not acceptance" classname="work operator commands" time="0.000022" file="packages/cli/test/main.test.ts" line="581" assertions="2" />
-      <testcase name="work run reports gateway errors and closes without retry" classname="work operator commands" time="0.000049" file="packages/cli/test/main.test.ts" line="588" assertions="5" />
-      <testcase name="work start reports gateway errors and closes without retry" classname="work operator commands" time="0.00001" file="packages/cli/test/main.test.ts" line="588" assertions="5" />
-      <testcase name="work status reports gateway errors and closes without retry" classname="work operator commands" time="0.000023" file="packages/cli/test/main.test.ts" line="588" assertions="5" />
-      <testcase name="work steer reports gateway errors and closes without retry" classname="work operator commands" time="0.00001" file="packages/cli/test/main.test.ts" line="588" assertions="5" />
-      <testcase name="work retire prints a successful retirement with closed=true" classname="work operator commands" time="0.00003" file="packages/cli/test/main.test.ts" line="602" assertions="3" />
+      <testcase name="work steer returns the accepted correlation ref" classname="work operator commands" time="0.000037" file="packages/cli/test/main.test.ts" line="574" assertions="3" />
+      <testcase name="work steer refusal is not acceptance" classname="work operator commands" time="0.000024" file="packages/cli/test/main.test.ts" line="581" assertions="2" />
+      <testcase name="work run reports gateway errors and closes without retry" classname="work operator commands" time="0.000044" file="packages/cli/test/main.test.ts" line="588" assertions="5" />
+      <testcase name="work start reports gateway errors and closes without retry" classname="work operator commands" time="0.000018" file="packages/cli/test/main.test.ts" line="588" assertions="5" />
+      <testcase name="work status reports gateway errors and closes without retry" classname="work operator commands" time="0.000009" file="packages/cli/test/main.test.ts" line="588" assertions="5" />
+      <testcase name="work steer reports gateway errors and closes without retry" classname="work operator commands" time="0.000008" file="packages/cli/test/main.test.ts" line="588" assertions="5" />
+      <testcase name="work retire prints a successful retirement with closed=true" classname="work operator commands" time="0.000032" file="packages/cli/test/main.test.ts" line="602" assertions="3" />
       <testcase name="work retire prints a successful retirement with closed=false" classname="work operator commands" time="0.000006" file="packages/cli/test/main.test.ts" line="602" assertions="3" />
-      <testcase name="work retire prints refusal without inventing a session" classname="work operator commands" time="0.000021" file="packages/cli/test/main.test.ts" line="615" assertions="2" />
-      <testcase name="work jobs renders bound and unbound lanes" classname="work operator commands" time="0.000035" file="packages/cli/test/main.test.ts" line="625" assertions="3" />
-      <testcase name="work jobs distinguishes quarantined history from current running lanes" classname="work operator commands" time="0.000028" file="packages/cli/test/main.test.ts" line="646" assertions="4" />
-      <testcase name="invalid work arguments fail before connecting: start fix --notify discord/dm/c task" classname="work operator commands" time="0.00003" file="packages/cli/test/main.test.ts" line="719" assertions="3" />
-      <testcase name="invalid work arguments fail before connecting: start fix --notify discord/channel/c/peer=p task" classname="work operator commands" time="0.00001" file="packages/cli/test/main.test.ts" line="719" assertions="3" />
-      <testcase name="invalid work arguments fail before connecting: start fix --notify discord/thread/t task" classname="work operator commands" time="0.000007" file="packages/cli/test/main.test.ts" line="719" assertions="3" />
-      <testcase name="invalid work arguments fail before connecting: start fix --notify discord/thread/t/peer=p task" classname="work operator commands" time="0.000005" file="packages/cli/test/main.test.ts" line="719" assertions="3" />
-      <testcase name="invalid work arguments fail before connecting: start fix --notify discord/dm/c/peer=p/peer=q task" classname="work operator commands" time="0.000006" file="packages/cli/test/main.test.ts" line="719" assertions="3" />
+      <testcase name="work retire prints refusal without inventing a session" classname="work operator commands" time="0.000017" file="packages/cli/test/main.test.ts" line="615" assertions="2" />
+      <testcase name="work jobs renders bound and unbound lanes" classname="work operator commands" time="0.000032" file="packages/cli/test/main.test.ts" line="625" assertions="3" />
+      <testcase name="work jobs distinguishes quarantined history from current running lanes" classname="work operator commands" time="0.000027" file="packages/cli/test/main.test.ts" line="646" assertions="4" />
+      <testcase name="invalid work arguments fail before connecting: start fix --notify discord/dm/c task" classname="work operator commands" time="0.000025" file="packages/cli/test/main.test.ts" line="719" assertions="3" />
+      <testcase name="invalid work arguments fail before connecting: start fix --notify discord/channel/c/peer=p task" classname="work operator commands" time="0.000009" file="packages/cli/test/main.test.ts" line="719" assertions="3" />
+      <testcase name="invalid work arguments fail before connecting: start fix --notify discord/thread/t task" classname="work operator commands" time="0.000006" file="packages/cli/test/main.test.ts" line="719" assertions="3" />
+      <testcase name="invalid work arguments fail before connecting: start fix --notify discord/thread/t/peer=p task" classname="work operator commands" time="0.000007" file="packages/cli/test/main.test.ts" line="719" assertions="3" />
+      <testcase name="invalid work arguments fail before connecting: start fix --notify discord/dm/c/peer=p/peer=q task" classname="work operator commands" time="0.000005" file="packages/cli/test/main.test.ts" line="719" assertions="3" />
       <testcase name="invalid work arguments fail before connecting: start fix --notify discord/dm/c/peer= task" classname="work operator commands" time="0.000005" file="packages/cli/test/main.test.ts" line="719" assertions="3" />
-      <testcase name="invalid work arguments fail before connecting: start fix --notify discord/channel/c/ task" classname="work operator commands" time="0.000009" file="packages/cli/test/main.test.ts" line="719" assertions="3" />
+      <testcase name="invalid work arguments fail before connecting: start fix --notify discord/channel/c/ task" classname="work operator commands" time="0.000008" file="packages/cli/test/main.test.ts" line="719" assertions="3" />
       <testcase name="invalid work arguments fail before connecting: start fix --notify discord/channel/c/extra task" classname="work operator commands" time="0.000005" file="packages/cli/test/main.test.ts" line="719" assertions="3" />
       <testcase name="invalid work arguments fail before connecting: start fix --notify discord/channel/a%2Fb task" classname="work operator commands" time="0.000005" file="packages/cli/test/main.test.ts" line="719" assertions="3" />
       <testcase name="invalid work arguments fail before connecting: start fix --notify  discord/channel/c task" classname="work operator commands" time="0.000006" file="packages/cli/test/main.test.ts" line="719" assertions="3" />
-      <testcase name="invalid work arguments fail before connecting: start fix --notify discord/channel/c  task" classname="work operator commands" time="0.000006" file="packages/cli/test/main.test.ts" line="719" assertions="3" />
-      <testcase name="invalid work arguments fail before connecting: start fix --notify unknown/channel/c task" classname="work operator commands" time="0.000005" file="packages/cli/test/main.test.ts" line="719" assertions="3" />
-      <testcase name="invalid work arguments fail before connecting: start fix --notify discord/channel/c// task" classname="work operator commands" time="0.000004" file="packages/cli/test/main.test.ts" line="719" assertions="3" />
+      <testcase name="invalid work arguments fail before connecting: start fix --notify discord/channel/c  task" classname="work operator commands" time="0.000004" file="packages/cli/test/main.test.ts" line="719" assertions="3" />
+      <testcase name="invalid work arguments fail before connecting: start fix --notify unknown/channel/c task" classname="work operator commands" time="0.000003" file="packages/cli/test/main.test.ts" line="719" assertions="3" />
+      <testcase name="invalid work arguments fail before connecting: start fix --notify discord/channel/c// task" classname="work operator commands" time="0.000003" file="packages/cli/test/main.test.ts" line="719" assertions="3" />
       <testcase name="invalid work arguments fail before connecting: start fix --notify loopback/channel/c task" classname="work operator commands" time="0.000004" file="packages/cli/test/main.test.ts" line="719" assertions="3" />
       <testcase name="invalid work arguments fail before connecting: start fix --notify monitor/channel/c task" classname="work operator commands" time="0.000003" file="packages/cli/test/main.test.ts" line="719" assertions="3" />
-      <testcase name="invalid work arguments fail before connecting: start fix --notify discord/dm/c/peer=p=extra task" classname="work operator commands" time="0.000007" file="packages/cli/test/main.test.ts" line="719" assertions="3" />
+      <testcase name="invalid work arguments fail before connecting: start fix --notify discord/dm/c/peer=p=extra task" classname="work operator commands" time="0.000006" file="packages/cli/test/main.test.ts" line="719" assertions="3" />
       <testcase name="invalid work arguments fail before connecting: run fix --notify discord/channel/c task" classname="work operator commands" time="0.000005" file="packages/cli/test/main.test.ts" line="719" assertions="3" />
-      <testcase name="invalid work arguments fail before connecting: start fix --notify" classname="work operator commands" time="0.000004" file="packages/cli/test/main.test.ts" line="719" assertions="3" />
+      <testcase name="invalid work arguments fail before connecting: start fix --notify" classname="work operator commands" time="0.000003" file="packages/cli/test/main.test.ts" line="719" assertions="3" />
       <testcase name="invalid work arguments fail before connecting: start fix --notify discord/channel/c --notify discord/channel/d task" classname="work operator commands" time="0.000005" file="packages/cli/test/main.test.ts" line="719" assertions="3" />
       <testcase name="invalid work arguments fail before connecting: start fix --model model --preset preset task" classname="work operator commands" time="0.000003" file="packages/cli/test/main.test.ts" line="719" assertions="3" />
-      <testcase name="invalid work arguments fail before connecting: start fix --preset preset --model model task" classname="work operator commands" time="0.000003" file="packages/cli/test/main.test.ts" line="719" assertions="3" />
-      <testcase name="invalid work arguments fail before connecting: start fix --model" classname="work operator commands" time="0.000003" file="packages/cli/test/main.test.ts" line="719" assertions="3" />
-      <testcase name="invalid work arguments fail before connecting: start fix --preset --resume task" classname="work operator commands" time="0.000004" file="packages/cli/test/main.test.ts" line="719" assertions="3" />
-      <testcase name="invalid work arguments fail before connecting: start fix --cwd relative task" classname="work operator commands" time="0.000007" file="packages/cli/test/main.test.ts" line="719" assertions="3" />
-      <testcase name="invalid work arguments fail before connecting: run fix --cwd relative task" classname="work operator commands" time="0.000003" file="packages/cli/test/main.test.ts" line="719" assertions="3" />
-      <testcase name="invalid work arguments fail before connecting: start bad/name task" classname="work operator commands" time="0.000004" file="packages/cli/test/main.test.ts" line="719" assertions="3" />
-      <testcase name="invalid work arguments fail before connecting: start fix    " classname="work operator commands" time="0.000018" file="packages/cli/test/main.test.ts" line="719" assertions="3" />
-      <testcase name="invalid work arguments fail before connecting: status" classname="work operator commands" time="0.000012" file="packages/cli/test/main.test.ts" line="719" assertions="3" />
-      <testcase name="invalid work arguments fail before connecting: status fix extra" classname="work operator commands" time="0.000005" file="packages/cli/test/main.test.ts" line="719" assertions="3" />
-      <testcase name="invalid work arguments fail before connecting: steer fix" classname="work operator commands" time="0.000006" file="packages/cli/test/main.test.ts" line="719" assertions="3" />
-      <testcase name="invalid work arguments fail before connecting: steer fix --resume task" classname="work operator commands" time="0.000004" file="packages/cli/test/main.test.ts" line="719" assertions="3" />
-      <testcase name="invalid work arguments fail before connecting: run fix --model model --preset preset task" classname="work operator commands" time="0.000007" file="packages/cli/test/main.test.ts" line="719" assertions="3" />
+      <testcase name="invalid work arguments fail before connecting: start fix --preset preset --model model task" classname="work operator commands" time="0.000002" file="packages/cli/test/main.test.ts" line="719" assertions="3" />
+      <testcase name="invalid work arguments fail before connecting: start fix --model" classname="work operator commands" time="0.000006" file="packages/cli/test/main.test.ts" line="719" assertions="3" />
+      <testcase name="invalid work arguments fail before connecting: start fix --preset --resume task" classname="work operator commands" time="0.000005" file="packages/cli/test/main.test.ts" line="719" assertions="3" />
+      <testcase name="invalid work arguments fail before connecting: start fix --cwd relative task" classname="work operator commands" time="0.000003" file="packages/cli/test/main.test.ts" line="719" assertions="3" />
+      <testcase name="invalid work arguments fail before connecting: run fix --cwd relative task" classname="work operator commands" time="0.000004" file="packages/cli/test/main.test.ts" line="719" assertions="3" />
+      <testcase name="invalid work arguments fail before connecting: start bad/name task" classname="work operator commands" time="0.000003" file="packages/cli/test/main.test.ts" line="719" assertions="3" />
+      <testcase name="invalid work arguments fail before connecting: start fix    " classname="work operator commands" time="0.000003" file="packages/cli/test/main.test.ts" line="719" assertions="3" />
+      <testcase name="invalid work arguments fail before connecting: status" classname="work operator commands" time="0.000002" file="packages/cli/test/main.test.ts" line="719" assertions="3" />
+      <testcase name="invalid work arguments fail before connecting: status fix extra" classname="work operator commands" time="0.000007" file="packages/cli/test/main.test.ts" line="719" assertions="3" />
+      <testcase name="invalid work arguments fail before connecting: steer fix" classname="work operator commands" time="0.000004" file="packages/cli/test/main.test.ts" line="719" assertions="3" />
+      <testcase name="invalid work arguments fail before connecting: steer fix --resume task" classname="work operator commands" time="0.000003" file="packages/cli/test/main.test.ts" line="719" assertions="3" />
+      <testcase name="invalid work arguments fail before connecting: run fix --model model --preset preset task" classname="work operator commands" time="0.000002" file="packages/cli/test/main.test.ts" line="719" assertions="3" />
       <testcase name="invalid work arguments fail before connecting: run fix --preset preset --model model task" classname="work operator commands" time="0.000003" file="packages/cli/test/main.test.ts" line="719" assertions="3" />
-      <testcase name="invalid work arguments fail before connecting: run fix task --model" classname="work operator commands" time="0.000005" file="packages/cli/test/main.test.ts" line="719" assertions="3" />
-      <testcase name="invalid work arguments fail before connecting: run fix task --preset" classname="work operator commands" time="0.000012" file="packages/cli/test/main.test.ts" line="719" assertions="3" />
+      <testcase name="invalid work arguments fail before connecting: run fix task --model" classname="work operator commands" time="0.000006" file="packages/cli/test/main.test.ts" line="719" assertions="3" />
+      <testcase name="invalid work arguments fail before connecting: run fix task --preset" classname="work operator commands" time="0.000003" file="packages/cli/test/main.test.ts" line="719" assertions="3" />
       <testcase name="invalid work arguments fail before connecting: run fix task --preset --resume" classname="work operator commands" time="0.000003" file="packages/cli/test/main.test.ts" line="719" assertions="3" />
       <testcase name="invalid work arguments fail before connecting: retire" classname="work operator commands" time="0.000003" file="packages/cli/test/main.test.ts" line="719" assertions="3" />
-      <testcase name="invalid work arguments fail before connecting: retire fix extra" classname="work operator commands" time="0.000003" file="packages/cli/test/main.test.ts" line="719" assertions="3" />
+      <testcase name="invalid work arguments fail before connecting: retire fix extra" classname="work operator commands" time="0.000002" file="packages/cli/test/main.test.ts" line="719" assertions="3" />
       <testcase name="invalid work arguments fail before connecting: jobs extra" classname="work operator commands" time="0.000002" file="packages/cli/test/main.test.ts" line="719" assertions="3" />
     </testsuite>
   </testsuite>
-  <testsuite name="packages/conformance/test/sdk-boundary-dogfood.test.ts" file="packages/conformance/test/sdk-boundary-dogfood.test.ts" tests="5" assertions="9" failures="0" skipped="0" time="0.004757" hostname="MacBook-Pro-3.local">
+  <testsuite name="packages/conformance/test/sdk-boundary-dogfood.test.ts" file="packages/conformance/test/sdk-boundary-dogfood.test.ts" tests="5" assertions="9" failures="0" skipped="0" time="0.004749" hostname="MacBook-Pro-3.local">
     <testsuite name="sdk-boundary-dogfood" file="packages/conformance/test/sdk-boundary-dogfood.test.ts" line="76" tests="5" assertions="9" failures="0" skipped="0" time="0.002" hostname="MacBook-Pro-3.local">
-      <testcase name="packages/cli imports only the public SDK surface" classname="sdk-boundary-dogfood" time="0.000543" file="packages/conformance/test/sdk-boundary-dogfood.test.ts" line="87" assertions="2" />
-      <testcase name="packages/adapter-discord imports only the public SDK surface" classname="sdk-boundary-dogfood" time="0.001421" file="packages/conformance/test/sdk-boundary-dogfood.test.ts" line="87" assertions="2" />
-      <testcase name="packages/adapter-telegram imports only the public SDK surface" classname="sdk-boundary-dogfood" time="0.000511" file="packages/conformance/test/sdk-boundary-dogfood.test.ts" line="87" assertions="2" />
-      <testcase name="packages/adapter-slack imports only the public SDK surface" classname="sdk-boundary-dogfood" time="0.001288" file="packages/conformance/test/sdk-boundary-dogfood.test.ts" line="87" assertions="2" />
-      <testcase name="sdk package itself depends only on the protocol package" classname="sdk-boundary-dogfood" time="0.000219" file="packages/conformance/test/sdk-boundary-dogfood.test.ts" line="114" assertions="1" />
+      <testcase name="packages/cli imports only the public SDK surface" classname="sdk-boundary-dogfood" time="0.000468" file="packages/conformance/test/sdk-boundary-dogfood.test.ts" line="87" assertions="2" />
+      <testcase name="packages/adapter-discord imports only the public SDK surface" classname="sdk-boundary-dogfood" time="0.001342" file="packages/conformance/test/sdk-boundary-dogfood.test.ts" line="87" assertions="2" />
+      <testcase name="packages/adapter-telegram imports only the public SDK surface" classname="sdk-boundary-dogfood" time="0.000417" file="packages/conformance/test/sdk-boundary-dogfood.test.ts" line="87" assertions="2" />
+      <testcase name="packages/adapter-slack imports only the public SDK surface" classname="sdk-boundary-dogfood" time="0.001264" file="packages/conformance/test/sdk-boundary-dogfood.test.ts" line="87" assertions="2" />
+      <testcase name="sdk package itself depends only on the protocol package" classname="sdk-boundary-dogfood" time="0.00017" file="packages/conformance/test/sdk-boundary-dogfood.test.ts" line="114" assertions="1" />
     </testsuite>
   </testsuite>
 </testsuites>

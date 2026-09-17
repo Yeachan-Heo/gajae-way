@@ -1,0 +1,34 @@
+{
+  "sourceHash": "sha256:412c90d6ba22fb5309c14d4fa2b67d655dddd1b234d49916e2de11c36637fe0d",
+  "frozenCommit": "145fa8f",
+  "build": {
+    "command": [
+      "bun",
+      "run",
+      "build"
+    ],
+    "stdout": "   [7ms]  bundle  70 modules\n [106ms] compile  dist/gajaeway-gateway\n  [30ms]  bundle  535 modules\n  [92ms] compile  dist/gajaeway-discord\n   [3ms]  bundle  18 modules\n  [82ms] compile  dist/gajaeway-telegram\n   [4ms]  bundle  26 modules\n  [77ms] compile  dist/gajaeway-slack\n   [3ms]  bundle  24 modules\n  [78ms] compile  dist/gajaeway-admin\n   [3ms]  bundle  15 modules\n  [78ms] compile  dist/gajaeway\n",
+    "stderr": "$ bun build --compile packages/gateway/src/main.ts --outfile dist/gajaeway-gateway && bun build --compile packages/adapter-discord/src/main.ts --outfile dist/gajaeway-discord && bun build --compile packages/adapter-telegram/src/main.ts --outfile dist/gajaeway-telegram && bun build --compile packages/adapter-slack/src/main.ts --outfile dist/gajaeway-slack && bun build --compile packages/admin/src/main.ts --outfile dist/gajaeway-admin && bun build --compile packages/cli/src/main.ts --outfile dist/gajaeway\n",
+    "exitCode": 0
+  },
+  "probes": {
+    "command": [
+      "bun",
+      "artifacts/slack-adapter-cli-probes.ts"
+    ],
+    "stdout": "[{\"id\":\"RT-SLACK-26\",\"command\":[\"dist/gajaeway-slack\",\"--help\"],\"cwd\":\".\",\"env\":{\"GAJAEWAY_HOME\":\"/var/folders/yl/ndsjfsl95t781x9qyjrqyqc80000gn/T/slack-cli-redteam-ODfODf\",\"LC_ALL\":\"C\"},\"expectedExitCode\":0,\"exitCode\":0,\"stdout\":\"usage: gajaeway-slack [--help] [--version]\\n\\nRuns the Slack adapter in the foreground. Configuration is read from\\n$GAJAEWAY_HOME/adapter-slack.json; one instance at a time per home.\\n\",\"stderr\":\"\",\"verdict\":\"passed\"},{\"id\":\"RT-SLACK-27\",\"command\":[\"dist/gajaeway-slack\",\"--version\"],\"cwd\":\".\",\"env\":{\"GAJAEWAY_HOME\":\"/var/folders/yl/ndsjfsl95t781x9qyjrqyqc80000gn/T/slack-cli-redteam-ODfODf\",\"LC_ALL\":\"C\"},\"expectedExitCode\":0,\"exitCode\":0,\"stdout\":\"0.1.0\\n\",\"stderr\":\"\",\"verdict\":\"passed\"},{\"id\":\"RT-SLACK-28\",\"command\":[\"dist/gajaeway-slack\",\"--nope\"],\"cwd\":\".\",\"env\":{\"GAJAEWAY_HOME\":\"/var/folders/yl/ndsjfsl95t781x9qyjrqyqc80000gn/T/slack-cli-redteam-ODfODf\",\"LC_ALL\":\"C\"},\"expectedExitCode\":2,\"exitCode\":2,\"stdout\":\"\",\"stderr\":\"gajaeway-slack: unexpected argument --nope\\nusage: gajaeway-slack [--help] [--version]\\n\\nRuns the Slack adapter in the foreground. Configuration is read from\\n$GAJAEWAY_HOME/adapter-slack.json; one instance at a time per home.\\n\",\"verdict\":\"passed\"},{\"id\":\"RT-SLACK-29\",\"command\":[\"dist/gajaeway-slack\"],\"cwd\":\".\",\"env\":{\"GAJAEWAY_HOME\":\"/var/folders/yl/ndsjfsl95t781x9qyjrqyqc80000gn/T/slack-cli-redteam-ODfODf\",\"LC_ALL\":\"C\"},\"expectedExitCode\":2,\"exitCode\":2,\"stdout\":\"\",\"stderr\":\"Slack adapter startup failed: Another Slack adapter is already running (pid 27890, lock /var/folders/yl/ndsjfsl95t781x9qyjrqyqc80000gn/T/slack-cli-redteam-ODfODf/adapter-slack.pid). Stop it before starting a second one.\\n\",\"pidfileUnchanged\":true,\"liveHolderPid\":27890,\"verdict\":\"passed\"}]\n",
+    "stderr": "",
+    "exitCode": 0
+  },
+  "replay": {
+    "command": [
+      "bun",
+      "-e",
+      "console.log(\"ultragoal-cli-ok\")"
+    ],
+    "stdout": "ultragoal-cli-ok\n",
+    "stderr": "",
+    "exitCode": 0
+  },
+  "replayByteIdentical": true
+}
