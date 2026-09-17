@@ -76,3 +76,7 @@ Put `SOUL.md`, `AGENTS.md`, and `USER.md` in `$GAJAEWAY_HOME/workspace`. They ar
 ## Development
 
 This repository is a Bun/TypeScript workspace. Build with `bun run build`; run tests with `bun test packages`. Production hosts run the compiled binaries, not this source checkout.
+
+## License
+
+Copyright (C) 2026 Yeachan Heo. Licensed under the [GNU Affero General Public License v3.0](LICENSE).
