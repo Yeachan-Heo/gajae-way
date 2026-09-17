@@ -33,6 +33,16 @@ export function decideEngagement(
 	origin: Pick<OriginRef, "platform" | "kind" | "conversationId" | "parentId">,
 	engagement: EngagementContext | undefined,
 	config: GatewayConfig,
+	/**
+	 * True when the persona already answered a turn in THIS thread. A thread is
+	 * its own origin and its own session, so the mention that opened it is the
+	 * addressing act for the whole thread: re-mentioning on every line is noise
+	 * nobody types, and without this a reply to the persona's own answer was
+	 * dropped by the closed/mention-open gate (live, Slack, 2026-09-17).
+	 * Authorisation is NOT relaxed: a closed channel still admits only
+	 * owner/allowlist authors, and audience rules still decide bots.
+	 */
+	threadFollowUp = false,
 ): EngagementDecision {
 	if (origin.platform === "loopback") return { engaged: true, botAudienceAdmission: false };
 	if (origin.kind === "dm") return { engaged: dmEngaged(engagement, config), botAudienceAdmission: false };
@@ -41,9 +51,23 @@ export function decideEngagement(
 	return evaluateChannelEngagement({
 		policy,
 		authorIsBot: engagement.authorIsBot === true,
-		addressed: engagement.mentioned,
+		addressed: engagement.mentioned || (origin.kind === "thread" && threadFollowUp),
 		authorized: closedAuthorAuthorized(engagement.authorId, config),
 	});
+}
+
+/**
+ * The durable follow-up signal: completed turns in the thread's own session row.
+ * It is epoch-scoped, so `/new` in a thread requires a fresh mention, and it
+ * survives gateway restarts because it is read from the session store rather
+ * than in-memory adapter state.
+ */
+export function threadFollowUpEngaged(
+	origin: Pick<OriginRef, "kind">,
+	originKey: string,
+	store: { sessionTurnCount(originKey: string): number },
+): boolean {
+	return origin.kind === "thread" && store.sessionTurnCount(originKey) > 0;
 }
 
 export function resolveChannelPolicy(
