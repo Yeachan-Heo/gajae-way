@@ -675,7 +675,7 @@ test("Slack monitor tolerates two strikes and reconnects on the third", () => {
 	expect(monitorFailureDecision(2)).toEqual({ action: "reconnect" });
 });
 
-for (const command of ["/new", "/reset", "/restart", "/unknown"])
+for (const command of ["/new", "/reset", "/restart", "/model", "/unknown"])
 	test(`Slack slash ${command} delegates authorization and responds honestly`, async () => {
 		const f = await fixture();
 		try {
@@ -700,7 +700,9 @@ for (const command of ["/new", "/reset", "/restart", "/unknown"])
 								: engaged
 									? command === "/restart"
 										? "🦞 restarting the gateway"
-										: "🦞 session reset"
+										: command === "/model"
+											? "🦞 model command accepted"
+											: "🦞 session reset"
 									: "not authorized for session commands here",
 					},
 				]);
@@ -722,6 +724,32 @@ for (const command of ["/new", "/reset", "/restart", "/unknown"])
 			f.socket.stop();
 		}
 	});
+
+test("Slack slash arguments reach the gateway as one command line", async () => {
+	const f = await fixture();
+	try {
+		const send = async (text: string, trigger: string) =>
+			await f.handleSlashCommand({
+				command: "/model",
+				text,
+				user_id: "U1",
+				user_name: "alice",
+				channel_id: "D1",
+				trigger_id: trigger,
+				response_url: "https://hooks.slack.test/response",
+			});
+		// An argument must survive: a bare `/model` only READS the selection, so a
+		// dropped argument silently turns a rebind into a no-op that acks success.
+		await send("  preset frontier-default  ", "with-argument");
+		await send("", "bare");
+		expect(f.client.requests.map((request) => (request.params as { text: string }).text)).toEqual([
+			"/model preset frontier-default",
+			"/model",
+		]);
+	} finally {
+		f.socket.stop();
+	}
+});
 
 test("Slack startup awaits Socket Mode start and slow name lookup cannot reorder a conversation", async () => {
 	const api = new Api();
