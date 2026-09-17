@@ -3582,6 +3582,10 @@ ALTER TABLE monitor_slots ADD COLUMN event_id TEXT;`,
 			.run(key, value);
 	}
 
+	metaDelete(key: string): void {
+		this.#database.query("DELETE FROM meta WHERE key = ?").run(key);
+	}
+
 	private integrityCheck(): void {
 		const result = this.integrityCheckDetail();
 		if (result !== "ok")

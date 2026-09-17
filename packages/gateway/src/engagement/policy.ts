@@ -3,24 +3,123 @@ import type { GatewayConfig } from "../config";
 
 export const MAX_CONSECUTIVE_BOT_AUDIENCE_TURNS = 1;
 
+/** Durable per-origin state for the bot-audience admission guard. */
+export interface BotAudienceTurnState {
+	readonly admissions: readonly string[];
+	readonly count: number;
+}
+
+/** Minimal durable metadata surface used by the engagement guard. */
+export interface BotAudienceTurnStore {
+	metaGet(key: string): string | undefined;
+	metaSet(key: string, value: string): void;
+	metaDelete?(key: string): void;
+}
+
+const BOT_AUDIENCE_STATE_PREFIX = "bot-audience-state:";
+const BOT_AUDIENCE_DECLINES_KEY = "bot-audience-declines";
+
+function botAudienceStateKey(originKey: string): string {
+	return `${BOT_AUDIENCE_STATE_PREFIX}${originKey}`;
+}
+
+function parseState(raw: string | undefined): BotAudienceTurnState {
+	if (raw === undefined) return { admissions: [], count: 0 };
+	try {
+		const parsed: unknown = JSON.parse(raw);
+		if (!parsed || typeof parsed !== "object")
+			return { admissions: [], count: MAX_CONSECUTIVE_BOT_AUDIENCE_TURNS };
+		const value = parsed as { admissions?: unknown; count?: unknown };
+		const admissions = Array.isArray(value.admissions)
+			? value.admissions.filter((entry): entry is string => typeof entry === "string")
+			: [];
+		if (typeof value.count !== "number" || !Number.isSafeInteger(value.count))
+			return { admissions: [], count: MAX_CONSECUTIVE_BOT_AUDIENCE_TURNS };
+		const count = value.count;
+		if (count < 0)
+			return { admissions: [], count: MAX_CONSECUTIVE_BOT_AUDIENCE_TURNS };
+		return {
+			admissions: admissions.slice(0, MAX_CONSECUTIVE_BOT_AUDIENCE_TURNS),
+			count: Math.max(0, Math.min(MAX_CONSECUTIVE_BOT_AUDIENCE_TURNS, count)),
+		};
+	} catch {
+		return { admissions: [], count: MAX_CONSECUTIVE_BOT_AUDIENCE_TURNS };
+	}
+}
+
 /**
  * Bounds opt-in bot collaboration per conversation. One bot-authored turn may
  * run through an open/mention-open audience; another cannot run until a human
  * message arrives. Declined messages still enter the context ledger.
  */
 export class BotAudienceTurnGuard {
-	readonly #counts = new Map<string, number>();
+	readonly #store: BotAudienceTurnStore | undefined;
+	readonly #memory = new Map<string, BotAudienceTurnState>();
+	#declines: number | undefined;
 
-	canAdmit(originKey: string): boolean {
-		return (this.#counts.get(originKey) ?? 0) < MAX_CONSECUTIVE_BOT_AUDIENCE_TURNS;
+	constructor(store?: BotAudienceTurnStore) {
+		this.#store = store;
 	}
 
-	recordBotAdmission(originKey: string): void {
-		this.#counts.set(originKey, (this.#counts.get(originKey) ?? 0) + 1);
+	canAdmit(originKey: string): boolean {
+		return this.#state(originKey).count < MAX_CONSECUTIVE_BOT_AUDIENCE_TURNS;
+	}
+
+	recordBotAdmission(originKey: string, admissionId?: string): void {
+		const state = this.#state(originKey);
+		if (admissionId !== undefined && state.admissions.includes(admissionId)) return;
+		const admissions = admissionId === undefined ? state.admissions : [...state.admissions, admissionId];
+		this.#save(originKey, {
+			admissions: admissions.slice(-MAX_CONSECUTIVE_BOT_AUDIENCE_TURNS),
+			count: Math.min(MAX_CONSECUTIVE_BOT_AUDIENCE_TURNS, state.count + 1),
+		});
+	}
+
+	/** Refund only the admission whose terminal reply slot remained unsatisfied. */
+	releaseUnansweredAdmission(originKey: string, admissionId?: string): void {
+		const state = this.#state(originKey);
+		if (state.count === 0) return;
+		if (admissionId !== undefined && state.admissions.length > 0 && !state.admissions.includes(admissionId)) return;
+		const admissions = admissionId === undefined ? state.admissions.slice(1) : state.admissions.filter((id) => id !== admissionId);
+		const count = Math.max(0, state.count - 1);
+		if (count === 0) this.#delete(originKey);
+		else this.#save(originKey, { admissions, count });
 	}
 
 	recordHumanMessage(originKey: string): void {
-		this.#counts.delete(originKey);
+		this.#delete(originKey);
+	}
+
+	/** Count operator-visible declines; callers pass false for unaddressed bot chatter. */
+	recordBotAudienceDecline(addressed = true): void {
+		if (!addressed) return;
+		const next = this.botAudienceDeclines() + 1;
+		this.#declines = next;
+		this.#store?.metaSet(BOT_AUDIENCE_DECLINES_KEY, String(next));
+	}
+
+	botAudienceDeclines(): number {
+		if (this.#declines !== undefined) return this.#declines;
+		const parsed = Number.parseInt(this.#store?.metaGet(BOT_AUDIENCE_DECLINES_KEY) ?? "0", 10);
+		this.#declines = Number.isSafeInteger(parsed) && parsed >= 0 ? parsed : 0;
+		return this.#declines;
+	}
+
+	#state(originKey: string): BotAudienceTurnState {
+		if (this.#store) return parseState(this.#store.metaGet(botAudienceStateKey(originKey)));
+		return this.#memory.get(originKey) ?? { admissions: [], count: 0 };
+	}
+
+	#save(originKey: string, state: BotAudienceTurnState): void {
+		const value = JSON.stringify(state);
+		if (this.#store) this.#store.metaSet(botAudienceStateKey(originKey), value);
+		else this.#memory.set(originKey, state);
+	}
+
+	#delete(originKey: string): void {
+		if (this.#store?.metaDelete) this.#store.metaDelete(botAudienceStateKey(originKey));
+		else if (this.#store) this.#store.metaSet(botAudienceStateKey(originKey), JSON.stringify({ admissions: [], count: 0 }));
+		else this.#memory.delete(originKey);
 	}
 }
 

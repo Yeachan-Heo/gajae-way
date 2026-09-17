@@ -90,6 +90,7 @@ export interface PersonaTurnLifecycle {
 	onFrame?(input: PersonaTailFrameInput): boolean | void | Promise<boolean | void>;
 	onTerminal?(input: PersonaTerminalInput): void | Promise<void>;
 	onFailure?(input: PersonaFailureInput): void | Promise<void>;
+	onSettled?(input: PersonaTurnSettledInput): void | Promise<void>;
 	onRetired?(input: PersonaTurnIdentity): void | Promise<void>;
 	/**
 	 * The turn was dropped WITHOUT a terminal: its send provably never landed
@@ -129,6 +130,11 @@ export interface PersonaTerminalInput extends PersonaTurnIdentity {
 export interface PersonaFailureInput extends PersonaTurnIdentity {
 	readonly error: Error;
 	readonly status?: StatusReport;
+}
+
+export interface PersonaTurnSettledInput extends PersonaTurnIdentity {
+	/** JSON terminal-slot claims after the trigger row reached `done`; NULL means no answer. */
+	readonly terminalDeliveryId: string | null;
 }
 
 export interface PersonaSessionManagerOptions {
@@ -1772,6 +1778,22 @@ class OriginActor {
 						this.#manager.database.clearFailedTurnResetCap(this.originKey);
 					return changed;
 				});
+		// Read the terminal slot from the durable trigger row AFTER completion. A
+		// failure diagnostic may have been delivered under another turn identity;
+		// only this row's claim satisfies the trigger's answer slot.
+		const settledTrigger = this.#manager.database.inboundTurnRow(bound.turn.opRef);
+		if (settledTrigger?.turn_state === "done") {
+			try {
+				await bound.lifecycle.onSettled?.({
+					...bound,
+					terminalDeliveryId: settledTrigger.terminal_delivery_id,
+				});
+			} catch (error) {
+				this.#manager.log(
+					`persona_turn_settled_hook_failed origin=${this.originKey} opRef=${bound.turn.opRef} detail=${safeDiagnostic(error)}`,
+				);
+			}
+		}
 		if (completed === 0) return;
 		// A steer issued into this turn whose answer tore: try the clientRef one
 		// more time now that the turn is over (the runtime still holds the
