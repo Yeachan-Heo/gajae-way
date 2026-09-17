@@ -1,9 +1,15 @@
-const sourceHash = "sha256:a25e067e990803eb95171864c9574a6a48df0211eabba6852b4cecfd0c3c4582";
+const sourceHash = "sha256:042d2126b51914390a20c478dc58e04175f03d7b1d8737b7581e1556af3572b7";
 const files = [
 	"packages/adapter-slack/test/redteam.test.ts",
 	"packages/gateway/test/slack-adapter-redteam.e2e.test.ts",
 	"packages/sdk/test/client-held-events.test.ts",
 ];
+const sourceSnapshots: Record<string, string> = {
+	"packages/adapter-slack/test/redteam.test.ts": "artifacts/slack-adapter-redteam.test.snapshot.txt",
+	"packages/gateway/test/slack-adapter-redteam.e2e.test.ts":
+		"artifacts/slack-adapter-gateway-redteam.test.snapshot.txt",
+	"packages/sdk/test/client-held-events.test.ts": "artifacts/slack-adapter-sdk-held-events.test.snapshot.txt",
+};
 const junitPath = "artifacts/slack-adapter-redteam.junit.xml";
 const supportingPath = "artifacts/slack-adapter-supporting.junit.xml";
 const proofPath = "artifacts/slack-adapter-cli-proof.json";
@@ -42,7 +48,7 @@ const expectations = [
 	"200 {}, nonboolean ok and throwing body streams are unreadable/ambiguous; explicit ok:false is definitive.",
 	"Same-chunk negotiated and chat events reach first subscriber in order; second gets no replay; newest 1000 retained; internal events never held.",
 	"Exactly one of 20 concurrent stale-pidfile reclaims succeeds; all others reject with AdapterAlreadyRunningError; pidfile matches winner, for Slack and Discord.",
-	"Real gateway threaded DM defaults every chunk to inbound root; explicit REPLY target wins; plain channel has no thread_ts.",
+	"Real gateway threaded DM defaults every chunk to inbound root; explicit REPLY target wins; plain Slack channel threads under triggering message.",
 	"Two-page bounded pass retains continuation without advancing; next pass closes remaining gap; later arrival above through is not lost.",
 	"Engaged thread root is durably remembered and revisited when history is empty; participated-thread TTL prunes it.",
 	"Three invalid_params refusals dead-letter with terminal-message classification/digest/watermark; intervening link failure does not count; repeated unknown failures never dead-letter.",
@@ -53,6 +59,14 @@ const expectations = [
 	"A stale pidfile plus a dead reclaimer marker recovers within 2000ms and removes the marker.",
 	"Twenty waiting contenders refuse a live holder that arrives mid-election without replacing its pidfile.",
 	"A former holder loses reacquisition; its release preserves the elected winner, whose own release removes the pidfile.",
+	"Live 0.9s-old linked marker survives waiter timeout; old dead-owner marker is reclaimed by exactly one of two waiters; timeout names new live pidfile holder.",
+	"Real gateway Slack channel delivery and redelivery thread under triggering ts; slash synthetic id is unthreaded; Discord and Telegram have no reply target.",
+	"429 x4 settles ambiguous without SlackApiError; 429 x2 then success confirms in three requests; Retry-After sleeps exact, capped at 30s and defaulting to 1s.",
+	"Five concurrent deliveries precede cosmetic, independent channels do not block, cosmetic completes when deliveries stop, pendingMs is zero after all settle.",
+	"Thirty ticks over 20s cause at most two updates; activity-only changes wait for 15s edit window; clear deletes exactly once within window.",
+	"Real gateway tool activity has kind/label/detail; ten-start burst emits at most two announcements; hostile intent single-line <=120 chars; end thinking, assistant writing, final exactly once.",
+	"Truncated unengaged reply walk durably records pending root, next pass drains and clears it; participation lastSeenAt never regresses.",
+	"Recent clean recovery skips history after 2s outage, but runs for quarantine or 6s outage.",
 ];
 const decode = (value: string) =>
 	value
@@ -69,11 +83,24 @@ function parseTests(xml: string) {
 		return {
 			name: attrs.name,
 			test: `${attrs.file}:${attrs.line}`,
+			testSnapshot: sourceSnapshots[attrs.file] ? `${sourceSnapshots[attrs.file]}:${attrs.line}` : undefined,
 			file: attrs.file,
 			verdict: /<(failure|error)\b/.test(body) ? "failed" : /<skipped\b/.test(body) ? "skipped" : "passed",
 			failure: decode(body.replace(/<[^>]+>/g, "").trim()),
 		};
 	});
+}
+const verificationPath = "artifacts/slack-adapter-frozen-verification.json";
+const verification = await Bun.file(verificationPath).json();
+if (verification.sourceHash !== sourceHash || verification.build.exitCode !== 0 || !verification.replayByteIdentical)
+	throw new Error("Frozen verification receipt mismatch");
+const loopPaths = Array.from({ length: 10 }, (_, index) => `artifacts/slack-adapter-lock-loop-${index + 1}.junit.xml`);
+for (const path of [junitPath, supportingPath, ...loopPaths]) {
+	const xml = (await Bun.file(path).text()).replace(/<!-- sourceHash:.*? -->\n/g, "");
+	await Bun.write(
+		path,
+		xml.replace(/(<\?xml[^>]+>\n)/, `$1<!-- sourceHash: ${sourceHash}; frozenCommit: cbd4d1a -->\n`),
+	);
 }
 const tests = parseTests(await Bun.file(junitPath).text());
 const supporting = parseTests(await Bun.file(supportingPath).text());
@@ -92,27 +119,32 @@ const adversarialCases = expectations.map((expectedBehavior, index) => {
 		expected: expectedBehavior,
 		verdict: rows.some((t) => t.verdict === "failed") || probe?.verdict === "failed" ? "failed" : "passed",
 		test: rows.map((t) => t.test).join(", ") || "artifacts/slack-adapter-cli-probes.ts:8",
+		testSnapshot: rows
+			.map((t) => t.testSnapshot)
+			.filter(Boolean)
+			.join(", "),
 		subcases: rows,
-		artifactRefs: [rows.length ? junitPath : proofPath],
+		artifactRefs: [
+			...new Set([rows.length ? junitPath : proofPath, ...rows.map((t) => sourceSnapshots[t.file]).filter(Boolean)]),
+		],
 	};
 });
 const blockers = tests
 	.filter((t) => t.verdict === "failed")
 	.map((t) => ({
 		caseId: t.name.slice(0, 11),
-		contractRef: "/tmp/gajaeway-slack-brief.md:17; RT-SLACK-33 acceptance",
+		contractRef: `Generation 4 acceptance ${t.name.slice(0, 11)}`,
 		test: t.test,
+		testSnapshot: t.testSnapshot,
 		observed: t.failure,
 		scenario: t.name,
-		source: t.name.includes("discord")
-			? "packages/adapter-discord/src/lock.ts:AdapterLock.acquire"
-			: "packages/adapter-slack/src/lock.ts:AdapterLock.acquire",
+		source: t.name.startsWith("RT-SLACK-48") ? "packages/adapter-slack/src/api.ts:OutboundLimiter.pendingMs" : t.file,
 		explanation: "Observed assertion failure; source deliberately left unchanged.",
-		artifactRefs: [junitPath],
+		artifactRefs: [junitPath, sourceSnapshots[t.file]].filter(Boolean),
 	}));
 const cover = (contractRef: string, ids: number[], detail: string, supportingEvidence: string[] = []) => ({
 	contractRef,
-	status: "covered",
+	status: ids.some((id) => adversarialCases[id - 1]?.verdict === "failed") ? "blocked" : "covered",
 	caseIds: ids.map((id) => `RT-SLACK-${String(id).padStart(2, "0")}`),
 	detail,
 	supportingEvidence,
@@ -216,7 +248,7 @@ const contractCoverage = [
 	cover(
 		"brief:32 build, services, conformance, docs and gateway e2e",
 		[20, 21, 22, 24, 26, 27, 28, 29, 34],
-		"bun run build passed; service installation/boundary tests pass. Read-only doc audit found binary/config/scopes/events/commands/origins/recovery/no-voice in README.md:44-64, docs/deployment.md:76-104, docs/architecture.md:14-29, docs/runbooks/gajaeway-v1.md:79-90 and service-control.md:8.",
+		"Frozen worktree bun run build passed; service installation and SDK boundary supporting tests passed. Documentation is not re-audited by this execution lane.",
 		["packages/cli/test/main.test.ts", "packages/conformance/test/sdk-boundary-dogfood.test.ts"],
 	),
 	{
@@ -227,34 +259,53 @@ const contractCoverage = [
 	},
 ];
 const invocation = `bun test ${files.join(" ")} --reporter=junit --reporter-outfile=${junitPath}`;
-const artifactRefs = ["artifacts/slack-adapter-cli-replay.json", proofPath, junitPath, reportPath, supportingPath];
-const loopPaths = Array.from({ length: 10 }, (_, index) => `artifacts/slack-adapter-lock-loop-${index + 1}.junit.xml`);
-const loopRuns = await Promise.all(loopPaths.map(async (path) => ({ path, tests: parseTests(await Bun.file(path).text()).filter((test) => test.name.startsWith("RT-SLACK-33 ")) })));
-const loopPassed = loopRuns.filter((run) => run.tests.length === 2 && run.tests.every((test) => test.verdict === "passed")).length;
-if (loopPassed !== 10) throw new Error(`RT-SLACK-33 loop failed: ${loopPassed}/10`);
+const artifactRefs = [
+	"artifacts/slack-adapter-cli-replay.json",
+	proofPath,
+	junitPath,
+	reportPath,
+	supportingPath,
+	verificationPath,
+	...Object.values(sourceSnapshots),
+];
+const loopRuns = await Promise.all(
+	loopPaths.map(async (path) => ({
+		path,
+		tests: parseTests(await Bun.file(path).text()).filter((test) => /^RT-SLACK-(33|45) /.test(test.name)),
+	})),
+);
+const loopPassed = loopRuns.filter(
+	(run) => run.tests.length === 6 && run.tests.every((test) => test.verdict === "passed"),
+).length;
+if (loopPassed !== 10) throw new Error(`RT-SLACK-33/45 loop failed: ${loopPassed}/10`);
 artifactRefs.push(...loopPaths);
+contractCoverage.push(
+	cover(
+		"Generation 4 final boundary acceptance RT-SLACK-45 through 52",
+		[45, 46, 47, 48, 49, 50, 51, 52],
+		"Frozen cbd4d1a exercised through real gateway sockets, adapter injected I/O, filesystem locks and compiled binary; failures retained as blockers.",
+	),
+);
 const matrix = {
 	sourceHash,
 	contractCoverage,
 	surfaceEvidence: [
 		{
 			surface: "cli",
-			invocation: "bun run build && bun artifacts/slack-adapter-cli-probes.ts",
+			invocation: "bun artifacts/slack-adapter-frozen-verification.ts (runs bun run build, CLI probes and safe replay)",
 			verdict: proof.probes.every((p: { verdict: string }) => p.verdict === "passed") ? "passed" : "failed",
 			detail:
 				"Fresh compiled Slack binary; four probes with real stdout/stderr/exit codes. Replay receipt checked via bun -e.",
-			artifactRefs: [proofPath, artifactRefs[0]],
+			artifactRefs: [proofPath, artifactRefs[0], verificationPath],
 		},
 		{
 			surface: "api",
 			invocation,
-			verdict: tests
-				.filter((t) => t.file.includes("gateway") && t.name.startsWith("RT-SLACK-34"))
-				.every((t) => t.verdict === "passed")
+			verdict: tests.filter((t) => t.file.includes("gateway")).every((t) => t.verdict === "passed")
 				? "passed"
 				: "failed",
 			detail:
-				"All eight real gateway conversation tests pass, including three DM/channel routing cases; Discord lock package case is reported separately.",
+				"Real gateway channel/thread/DM routing, slash synthetic ids, platform isolation, redelivery, bounded activity and final event assertions.",
 			artifactRefs: [junitPath],
 		},
 		{
@@ -274,9 +325,10 @@ const matrix = {
 		},
 		{
 			surface: "package",
-			invocation: "for i in {1..10}; do bun test packages/adapter-slack/test/redteam.test.ts packages/gateway/test/slack-adapter-redteam.e2e.test.ts -t RT-SLACK-33 --reporter=junit --reporter-outfile=artifacts/slack-adapter-lock-loop-${i}.junit.xml; done",
+			invocation:
+				"for i in {1..10}; do bun test packages/adapter-slack/test/redteam.test.ts packages/gateway/test/slack-adapter-redteam.e2e.test.ts -t 'RT-SLACK-(33|45)' --reporter=junit --reporter-outfile=artifacts/slack-adapter-lock-loop-${i}.junit.xml || exit 1; done",
 			verdict: "passed",
-			detail: `${loopPassed}/10 iterations passed; Slack 10/10 and Discord 10/10, each with 20 simultaneous contenders.`,
+			detail: `${loopPassed}/10 iterations passed; six cases per iteration: 20-contender stale elections plus live/dead linked marker cases for Slack and Discord.`,
 			artifactRefs: loopPaths,
 		},
 	],
@@ -290,6 +342,11 @@ const report = {
 	kind: "api-package-test-report",
 	...matrix,
 	latestRunCommit: new TextDecoder().decode(commit.stdout).trim(),
+	executionCwd: process.cwd(),
+	sourceSnapshots,
+	frozenRange: "6b29f7e..cbd4d1a",
+	isolation:
+		"Final JUnit, supporting suites, lock repetitions and CLI build/probes ran in detached /tmp/g4-frozen at cbd4d1a. Leader G009 work later replaced shared test files; byte-identical frozen snapshots are authoritative for every reported test line. Restore each sourceSnapshots entry to its original key in a clean cbd4d1a worktree to replay; shared G009 source and tests are excluded.",
 	sourceHashMethod:
 		"Parent-confirmed Ultragoal quality-gate source-hash (integration base, merge base, paths, captured diff and untracked digest), not sha256 of raw git diff.",
 	counts: {
@@ -306,9 +363,10 @@ const report = {
 	},
 	limitations: [
 		"No credentialed external Slack API calls; injected platform ports and real local gateway socket used as required.",
-		"No source files changed; RT-SLACK-42 through 44 exercise Slack directly, while RT-SLACK-33 exercises both adapters.",
+		"No product source changed in the frozen worktree; RT-SLACK-33 and 45 exercise both adapters.",
 		"Gateway teardown still emits invalid socket write count: -32 warnings; not suppressed.",
 		"RT-SLACK-44 models a former lock handle losing ownership and reacquisition; a rejected acquire itself returns no handle.",
+		"RT-SLACK-48 retains the requested zero-after-settle assertion: pendingMs reports the next reserved pacing slot and returns 100ms at the final completion with minIntervalMs=100. This is a contract mismatch; the failure is not softened into a pass.",
 	],
 	executorQa: matrix,
 };

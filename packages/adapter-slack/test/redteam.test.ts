@@ -1,9 +1,16 @@
 import { afterEach, expect, spyOn, test } from "bun:test";
-import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { link, mkdir, mkdtemp, readFile, rm, stat, utimes, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { type ChatMessagePayload, isPlatformMessageId } from "@gajaeway/protocol";
-import { deliveryFailureIsAmbiguous, SlackApiError, SlackUnreadableResponseError, SlackWebApi } from "../src/api";
+import {
+	deliveryFailureIsAmbiguous,
+	OutboundLimiter,
+	SlackApiError,
+	SlackRateLimitedError,
+	SlackUnreadableResponseError,
+	SlackWebApi,
+} from "../src/api";
 import { loadSlackAdapterConfig } from "../src/config";
 import { AdapterAlreadyRunningError, AdapterLock } from "../src/lock";
 import {
@@ -123,7 +130,7 @@ class Api extends SlackWebApi {
 }
 async function fixture(
 	channels?: Record<string, { engagement: "open" }>,
-	options: { nested?: boolean; keepRecovery?: boolean } = {},
+	options: { nested?: boolean; keepRecovery?: boolean; now?: () => number } = {},
 ) {
 	const home = await mkdtemp("/tmp/slack-recovery-");
 	const cursorPath = options.nested ? join(home, "adapters/slack/recovery-cursor.json") : join(home, "cursor.json");
@@ -142,7 +149,7 @@ async function fixture(
 		{
 			api,
 			recoveryCursorPath: cursorPath,
-			now: () => 10_000,
+			now: options.now ?? (() => 10_000),
 			log: { log() {}, error() {} },
 			socketFactory: () => {
 				const socket = new Socket();
@@ -897,3 +904,213 @@ test("RT-SLACK-44 release by a former holder after losing election preserves the
 	await winners[0]?.value.release();
 	await expect(readFile(former.path)).rejects.toMatchObject({ code: "ENOENT" });
 });
+
+for (const live of [true, false]) {
+	test(`RT-SLACK-45 ${live ? "live 0.9s marker survives timeout naming new holder" : "two waiters reclaim old dead marker with one winner"}`, async () => {
+		const home = await mkdtemp(join(tmpdir(), "slack-marker-g4-"));
+		cleanups.push(() => rm(home, { recursive: true, force: true }));
+		const path = join(home, "adapter-slack.pid");
+		const marker = `${path}.reclaim`;
+		await writeFile(path, "99999\n");
+		await writeFile(`${path}.owner`, "88888\n");
+		await link(`${path}.owner`, marker);
+		const aged = new Date(Date.now() - (live ? 900 : 2000));
+		await utimes(marker, aged, aged);
+		const inode = (await stat(marker)).ino;
+		const pending = Promise.allSettled(
+			[1, 2].map((pid) =>
+				AdapterLock.acquire(home, { pid, alive: (owner) => live && (owner === 88888 || owner === 77777) }),
+			),
+		);
+		if (live) {
+			await Bun.sleep(30);
+			await writeFile(path, "77777\n");
+		}
+		const results = await pending;
+		if (live) {
+			expect((await stat(marker)).ino).toBe(inode);
+			expect(await readFile(marker, "utf8")).toBe("88888\n");
+			for (const result of results) {
+				expect(result.status).toBe("rejected");
+				if (result.status === "rejected") {
+					expect(result.reason.holderPid).toBe(77777);
+					expect(result.reason.message).toContain("77777");
+				}
+			}
+		} else {
+			const winners = results.filter((result) => result.status === "fulfilled");
+			expect(winners).toHaveLength(1);
+			expect(await readFile(path, "utf8")).toBe(`${winners[0]?.value.pid}\n`);
+			await expect(stat(marker)).rejects.toMatchObject({ code: "ENOENT" });
+		}
+	});
+}
+
+for (const [failures, header, wait] of [
+	[4, "2", 2000],
+	[2, "2", 2000],
+	[2, "99", 30000],
+	[2, null, 1000],
+] as const) {
+	test(`RT-SLACK-47 rate-limit settlement ${failures} refusals Retry-After ${header}`, async () => {
+		let requests = 0;
+		const sleeps: number[] = [];
+		const api = new SlackWebApi("unused", {
+			fetcher: async () =>
+				++requests <= failures
+					? new Response("", { status: 429, headers: header ? { "Retry-After": header } : {} })
+					: Response.json({ ok: true, channel: "C1", ts: "2.0" }),
+			sleep: async (ms) => {
+				sleeps.push(ms);
+			},
+		});
+		const client = new Client();
+		await settleSlackDelivery(client, api, delivery());
+		expect(requests).toBe(failures === 4 ? 4 : 3);
+		expect(sleeps).toEqual(Array(failures === 4 ? 3 : 2).fill(wait));
+		expect(client.calls).toHaveLength(1);
+		expect(client.calls[0]?.verb).toBe(failures === 4 ? "delivery.fail" : "delivery.confirm");
+		if (failures === 4) {
+			expect(client.calls[0]?.params.ambiguous).toBe(true);
+			requests = 0;
+			const error = await api.postMessage("C1", "again").catch((error) => error);
+			expect(error).toBeInstanceOf(SlackRateLimitedError);
+			expect(error).not.toBeInstanceOf(SlackApiError);
+		}
+	});
+}
+
+test("RT-SLACK-48 concurrent delivery queue drains before cosmetic without starvation across channels", async () => {
+	let now = 0;
+	const timers: Array<{ at: number; resolve: () => void }> = [];
+	const limiter = new OutboundLimiter(
+		100,
+		() => now,
+		(ms) => new Promise<void>((resolve) => timers.push({ at: now + ms, resolve })),
+	);
+	const order: string[] = [];
+	const work = Array.from({ length: 5 }, (_, i) =>
+		limiter.acquire("C1", "delivery").then(() => {
+			order.push(`delivery-${i}`);
+		}),
+	);
+	work.push(
+		limiter.acquire("C1", "cosmetic").then(() => {
+			order.push("cosmetic");
+		}),
+	);
+	await limiter.acquire("C2", "delivery");
+	expect(now).toBe(0);
+	await flush();
+	while (timers.length) {
+		timers.sort((a, b) => a.at - b.at);
+		const timer = timers.shift()!;
+		now = timer.at;
+		timer.resolve();
+		await flush();
+	}
+	await Promise.all(work);
+	expect(order).toEqual(["delivery-0", "delivery-1", "delivery-2", "delivery-3", "delivery-4", "cosmetic"]);
+	// Right after the last slot fires only its cooldown remains; once that elapses the lane is idle.
+	expect(limiter.pendingMs("C1")).toBeLessThanOrEqual(100);
+	now += 100;
+	expect(limiter.pendingMs("C1")).toBe(0);
+});
+
+test("RT-SLACK-49 presence coalesces thirty ticks into a bounded number of reaction swaps and clears once", async () => {
+	let now = 0;
+	const api = new Api();
+	const status = new WorkingStatus(
+		api,
+		console,
+		() => ({}),
+		() => {},
+		() => now,
+	);
+	status.arm(origin, "C1:1.0");
+	await flush();
+	expect(api.reactions).toEqual([["C1", "1.0", "hourglass_flowing_sand"]]);
+	// Thirty ticks in twenty seconds, phase flipping every tick: at most one swap
+	// per 15s window, and no swap at all while the buckets are unchanged.
+	for (let i = 1; i <= 30; i++) {
+		now = (i * 20000) / 30;
+		await status.update({
+			turnId: "turn",
+			origin,
+			elapsedMs: now,
+			toolCalls: 0,
+			outputTokens: 0,
+			final: false,
+			activity: i % 2 ? { kind: "tool", label: "bash" } : { kind: "thinking", label: "thinking" },
+		});
+	}
+	expect(api.removed.length).toBeLessThanOrEqual(2);
+	expect(api.reactions.length).toBeLessThanOrEqual(3);
+	expect(api.posts).toEqual([]);
+	// Clear removes every marker we own, exactly once, and ignores a second clear.
+	await status.clear("C1");
+	const removedAfterClear = api.removed.length;
+	await status.clear("C1");
+	expect(api.removed.length).toBe(removedAfterClear);
+	const shown = new Set(api.reactions.map((r) => r[2]));
+	for (const name of shown) expect(api.removed.some((r) => r[2] === name)).toBe(true);
+});
+
+test("RT-SLACK-51 unengaged truncated reply walks persist and drain pending roots without aging participation", async () => {
+	let now = 10000;
+	const f = await fixture({ C1: { engagement: "open" } }, { now: () => now });
+	f.api.historyMessages = [{ ts: "1.0", user: "U1", text: "root", reply_count: 100 }];
+	let truncated = true;
+	spyOn(f.api, "conversationsReplies").mockImplementation(async () => ({
+		messages: [{ ts: "2.0", user: "U1", text: "unengaged", thread_ts: "1.0" }],
+		has_more: truncated,
+		next_cursor: truncated ? "next" : undefined,
+	}));
+	expect(await f.recoverMissedMessages()).toBe(false);
+	let state = await loadRecoveryCursors(f.cursorPath);
+	expect(state.pendingThreads["C1:1.0"]).toBeDefined();
+	expect(state.participatedThreads["C1:1.0"]).toBeUndefined();
+	truncated = false;
+	f.api.historyMessages = [];
+	expect(await f.recoverMissedMessages()).toBe(true);
+	state = await loadRecoveryCursors(f.cursorPath);
+	expect(state.pendingThreads["C1:1.0"]).toBeUndefined();
+	f.client.engaged = true;
+	await f.event({ ts: "3.0", thread_ts: "1.0" });
+	await f.recoverMissedMessages();
+	const before = (await loadRecoveryCursors(f.cursorPath)).participatedThreads["C1:1.0"]!.lastSeenAt;
+	spyOn(f.api, "conversationsReplies").mockImplementationOnce(async () => {
+		now = 20000;
+		await f.event({ ts: "4.0", thread_ts: "1.0" });
+		return { messages: [{ ts: "5.0", user: "U1", text: "walked", thread_ts: "1.0" }], has_more: false };
+	});
+	await f.recoverMissedMessages();
+	expect((await loadRecoveryCursors(f.cursorPath)).participatedThreads["C1:1.0"]!.lastSeenAt >= before).toBe(true);
+	expect((await loadRecoveryCursors(f.cursorPath)).participatedThreads["C1:1.0"]!.lastSeenAt).toBe(
+		new Date(20000).toISOString(),
+	);
+});
+
+for (const [outage, quarantine] of [
+	[2000, false],
+	[6000, false],
+	[2000, true],
+] as const) {
+	test(`RT-SLACK-52 recent clean recovery gate outage ${outage} quarantine ${quarantine}`, async () => {
+		let now = 10000;
+		const f = await fixture({ C1: { engagement: "open" } }, { keepRecovery: true, now: () => now });
+		await f.recoverMissedMessages();
+		if (quarantine) {
+			f.api.unreadable = true;
+			for (let i = 0; i < 3; i++) await f.recoverMissedMessages();
+			f.api.unreadable = false;
+		}
+		now = 20000 - outage;
+		f.gateway.onDisconnected?.();
+		now = 20000;
+		const before = f.api.historyCalls;
+		f.gateway.onConnected?.();
+		await f.recovery.idle();
+		expect(f.api.historyCalls - before).toBe(outage >= 5000 || quarantine ? 1 : 0);
+	});
+}

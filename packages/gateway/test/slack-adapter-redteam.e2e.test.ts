@@ -1,14 +1,15 @@
 import { afterEach, expect, test } from "bun:test";
-import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { link, mkdtemp, readFile, rm, stat, utimes, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import type { ChatProgressPayload } from "@gajaeway/protocol";
 import { AdapterAlreadyRunningError, AdapterLock } from "../../adapter-discord/src/lock";
 import { ReconnectingGateway } from "../../adapter-slack/src/main";
 import { GajaewayClient } from "../../sdk/src/index";
 import type { GatewayConfig } from "../src/config";
 import { type GatewayServer, startUnixServer } from "../src/server/server";
 import { GatewayDatabase } from "../src/store/db";
-import { attachTestBrokerOwnership, sessionPortFromResponder } from "./session-port.fake";
+import { attachTestBrokerOwnership, ScriptedSessionPort, sessionPortFromResponder } from "./session-port.fake";
 
 let home = "";
 let server: GatewayServer | undefined;
@@ -209,3 +210,131 @@ test("RT-SLACK-33 discord stale lock has exactly one winner under 20 concurrent 
 		await rm(lockHome, { recursive: true, force: true });
 	}
 });
+
+for (const platform of ["slack", "discord", "telegram"] as const) {
+	test(`RT-SLACK-46 ${platform} channel triggering root preserves platform routing on redelivery`, async () => {
+		const f = await fixture({ [`${platform}:C1`]: { engagement: "mention-open" } }, "answer");
+		const messageId = platform === "slack" ? "C1:7.0" : "7";
+		const params = { origin: { ...origin, platform }, messageId, text: "recovered", engagement };
+		await f.client.request("chat.send", params);
+		await settle();
+		await f.client.request("chat.send", params);
+		await settle();
+		const rows = f.database.deliveryRows();
+		expect(rows).toHaveLength(1);
+		const payload = JSON.parse(rows[0]!.payload_json);
+		expect(payload.replyToMessageId).toBe(platform === "slack" ? messageId : undefined);
+		if (platform === "slack") expect(f.posts).toEqual([["C1", "answer", "7.0"]]);
+	});
+}
+
+test("RT-SLACK-46 slash synthetic message id cannot become Slack thread root", async () => {
+	const f = await fixture({ "slack:C1": { engagement: "mention-open" } }, "answer");
+	await f.adapter.requestInbound("slash-trigger", origin, "/new", engagement);
+	await settle();
+	expect(f.posts.length).toBeGreaterThan(0);
+	for (const post of f.posts) expect(post[2]).toBeUndefined();
+});
+
+async function eventually(predicate: () => boolean) {
+	for (let i = 0; i < 200 && !predicate(); i++) await Bun.sleep(5);
+	expect(predicate()).toBe(true);
+}
+
+test("RT-SLACK-50 real socket activity bounds burst details thinking writing and exactly one final", async () => {
+	home = await mkdtemp(join(tmpdir(), "slack-activity-g4-"));
+	const config: GatewayConfig = {
+		schemaVersion: 1,
+		home,
+		configPath: join(home, "config.json"),
+		socketPath: join(home, "gateway.sock"),
+		dbPath: join(home, "gateway.db"),
+		logVerbosity: "info",
+		dmPolicy: "open",
+		channels: { "slack:C1": { engagement: "mention-open" } },
+	};
+	const database = await GatewayDatabase.open(config.dbPath);
+	const port = attachTestBrokerOwnership(database, new ScriptedSessionPort(), join(home, "agent"));
+	server = await startUnixServer({
+		config,
+		database,
+		sessionPort: port,
+		progress: { firstAfterMs: 0, intervalMs: 20 },
+		onStop: () => database.close(),
+	});
+	client = await GajaewayClient.connectSocket(config.socketPath);
+	const progress: ChatProgressPayload[] = [];
+	client.onChatProgress((payload) => progress.push(payload));
+	await client.request("chat.send", { origin, messageId: "C1:1.0", text: "work", engagement });
+	await eventually(() => port.sends.length === 1);
+	const send = port.sends[0];
+	if (!send) throw new Error("Expected an accepted turn");
+	port.emitTool(send.sessionId, { toolName: "bash", intent: "Running tests" });
+	await eventually(() =>
+		progress.some(
+			(p) => p.activity?.kind === "tool" && p.activity.label === "bash" && p.activity.detail === "Running tests",
+		),
+	);
+	await Bun.sleep(25);
+	const before = progress.length;
+	// Ten starts in one synchronous burst fit inside the requested 10ms window.
+	for (let i = 0; i < 10; i++) port.emitTool(send.sessionId, { toolName: `tool-${i}`, intent: `burst-${i}` });
+	await Bun.sleep(10);
+	expect(progress.length - before).toBeLessThanOrEqual(2);
+	await Bun.sleep(25);
+	port.emitTool(send.sessionId, { toolName: "bash", intent: `line\n\u0001${"x".repeat(300)}` });
+	await eventually(() => progress.some((p) => p.activity?.detail?.startsWith("line")));
+	const detail = progress.findLast((p) => p.activity?.detail?.startsWith("line"))?.activity?.detail;
+	if (!detail) throw new Error("Expected sanitized tool detail");
+	expect(detail.length).toBeLessThanOrEqual(120);
+	expect([...detail].every((character) => character.charCodeAt(0) >= 32 && character.charCodeAt(0) !== 127)).toBe(true);
+	await Bun.sleep(25);
+	port.emitToolEnd(send.sessionId, "bash");
+	await eventually(() => progress.some((p) => p.activity?.kind === "thinking"));
+	await Bun.sleep(25);
+	port.emitAssistant(send.sessionId, "writing a response");
+	await eventually(() => progress.some((p) => p.activity?.kind === "writing"));
+	port.complete(send.opRef, "done");
+	await eventually(() => progress.some((p) => p.final));
+	await Bun.sleep(50);
+	expect(progress.filter((p) => p.final)).toHaveLength(1);
+});
+
+for (const live of [true, false]) {
+	test(`RT-SLACK-45 discord ${live ? "live marker survives and timeout names pidfile holder" : "dead marker elects one of two waiters"}`, async () => {
+		home = await mkdtemp(join(tmpdir(), "discord-marker-g4-"));
+		const path = join(home, "adapter-discord.pid");
+		const marker = `${path}.reclaim`;
+		await writeFile(path, "99999\n");
+		await writeFile(`${path}.owner`, "88888\n");
+		await link(`${path}.owner`, marker);
+		const aged = new Date(Date.now() - (live ? 900 : 2000));
+		await utimes(marker, aged, aged);
+		const inode = (await stat(marker)).ino;
+		const pending = Promise.allSettled(
+			[1, 2].map((pid) =>
+				AdapterLock.acquire(home, { pid, alive: (owner) => live && (owner === 88888 || owner === 77777) }),
+			),
+		);
+		if (live) {
+			await Bun.sleep(30);
+			await writeFile(path, "77777\n");
+		}
+		const results = await pending;
+		if (live) {
+			expect((await stat(marker)).ino).toBe(inode);
+			for (const result of results) {
+				expect(result.status).toBe("rejected");
+				if (result.status === "rejected") {
+					expect(result.reason.holderPid).toBe(77777);
+					expect(result.reason.message).toContain("77777");
+				}
+			}
+		} else {
+			const winners = results.filter((result) => result.status === "fulfilled");
+			expect(winners).toHaveLength(1);
+			expect(await readFile(path, "utf8")).toBe(`${winners[0]?.value.pid}\n`);
+			await expect(stat(marker)).rejects.toMatchObject({ code: "ENOENT" });
+		}
+	});
+}
