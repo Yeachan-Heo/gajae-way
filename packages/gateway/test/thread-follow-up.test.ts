@@ -57,12 +57,40 @@ test("audience rules still decide bots in a followed-up thread", () => {
 	});
 });
 
-test("the follow-up signal reads completed turns of the thread's own session row", () => {
-	const store = { sessionTurnCount: (key: string) => (key === "slack/thread/C1:1/parent=C1" ? 2 : 0) };
-	expect(threadFollowUpEngaged(THREAD, "slack/thread/C1:1/parent=C1", store)).toBe(true);
-	// A fresh thread (no answered turn yet) and a channel origin both stay false.
-	expect(threadFollowUpEngaged(THREAD, "slack/thread/C1:9/parent=C1", store)).toBe(false);
-	expect(threadFollowUpEngaged(CHANNEL, "slack/thread/C1:1/parent=C1", store)).toBe(false);
+const THREAD_KEY = "slack/thread/C1:1700000000.000100/parent=C1";
+
+function store(
+	options: { triggeredOrigins?: readonly string[]; triggeredMessages?: readonly [string, string][] } = {},
+) {
+	return {
+		originTriggeredTurn: (key: string) => (options.triggeredOrigins ?? []).includes(key),
+		messageTriggeredTurn: (key: string, messageId: string) =>
+			(options.triggeredMessages ?? []).some(([k, m]) => k === key && m === messageId),
+	};
+}
+
+test("a mention written inside the thread marks the thread engaged", () => {
+	expect(threadFollowUpEngaged(THREAD, THREAD_KEY, store({ triggeredOrigins: [THREAD_KEY] }))).toBe(true);
+	expect(threadFollowUpEngaged(THREAD, THREAD_KEY, store())).toBe(false);
+});
+
+test("a channel mention answered INTO a thread marks that thread engaged", () => {
+	// The trigger belongs to the channel origin and its message id is the thread
+	// root, which is exactly the thread's conversation id.
+	const opened = store({ triggeredMessages: [["slack/channel/C1", "C1:1700000000.000100"]] });
+	expect(threadFollowUpEngaged(THREAD, THREAD_KEY, opened)).toBe(true);
+	// A different thread in the same channel is not engaged by that root.
+	const otherThread = { ...THREAD, conversationId: "C1:1700000000.000999" };
+	expect(threadFollowUpEngaged(otherThread, "slack/thread/C1:1700000000.000999/parent=C1", opened)).toBe(false);
+});
+
+test("the signal never promotes a channel origin and needs a parent to look one up", () => {
+	const opened = store({
+		triggeredOrigins: ["slack/channel/C1"],
+		triggeredMessages: [["slack/channel/C1", "C1:1700000000.000100"]],
+	});
+	expect(threadFollowUpEngaged(CHANNEL, "slack/channel/C1", opened)).toBe(false);
+	expect(threadFollowUpEngaged({ ...THREAD, parentId: undefined }, THREAD_KEY, opened)).toBe(false);
 });
 
 test("defaulting the parameter keeps every existing caller mention-gated", () => {

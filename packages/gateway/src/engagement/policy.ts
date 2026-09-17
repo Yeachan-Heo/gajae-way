@@ -1,4 +1,4 @@
-import { type EngagementContext, evaluateChannelEngagement, type OriginRef } from "@gajaeway/protocol";
+import { type EngagementContext, evaluateChannelEngagement, type OriginRef, originKey } from "@gajaeway/protocol";
 import type { GatewayConfig } from "../config";
 
 export const MAX_CONSECUTIVE_BOT_AUDIENCE_TURNS = 1;
@@ -34,13 +34,13 @@ export function decideEngagement(
 	engagement: EngagementContext | undefined,
 	config: GatewayConfig,
 	/**
-	 * True when the persona already answered a turn in THIS thread. A thread is
-	 * its own origin and its own session, so the mention that opened it is the
-	 * addressing act for the whole thread: re-mentioning on every line is noise
-	 * nobody types, and without this a reply to the persona's own answer was
-	 * dropped by the closed/mention-open gate (live, Slack, 2026-09-17).
-	 * Authorisation is NOT relaxed: a closed channel still admits only
-	 * owner/allowlist authors, and audience rules still decide bots.
+	 * True when the persona is already talking in THIS thread (see
+	 * `threadFollowUpEngaged`). A thread is its own origin, so the mention that
+	 * opened it is the addressing act for the whole thread: re-mentioning on every
+	 * line is noise nobody types, and without this a reply to the persona's own
+	 * answer was dropped by the closed/mention-open gate (live, Slack,
+	 * 2026-09-17). Authorisation is NOT relaxed: a closed channel still admits
+	 * only owner/allowlist authors, and audience rules still decide bots.
 	 */
 	threadFollowUp = false,
 ): EngagementDecision {
@@ -56,18 +56,42 @@ export function decideEngagement(
 	});
 }
 
+/** The inbound-ledger surface the follow-up signal needs; narrowed so tests need no database. */
+export interface ThreadEngagementStore {
+	originTriggeredTurn(originKey: string): boolean;
+	messageTriggeredTurn(originKey: string, messageId: string): boolean;
+}
+
 /**
- * The durable follow-up signal: completed turns in the thread's own session row.
- * It is epoch-scoped, so `/new` in a thread requires a fresh mention, and it
- * survives gateway restarts because it is read from the session store rather
- * than in-memory adapter state.
+ * Durable evidence that the persona is already talking in THIS thread.
+ *
+ * Two shapes count, because a Slack thread is entered two different ways:
+ * - a mention written inside the thread binds a trigger turn to the thread
+ *   origin itself;
+ * - a channel mention is answered INTO a new thread rooted at the triggering
+ *   message, and that trigger belongs to the CHANNEL origin. A thread's
+ *   conversation id is exactly that root's platform message id (`channel:ts`),
+ *   so the root is looked up under the parent channel origin.
+ *
+ * Without the second shape the feature would miss the common case: the persona
+ * opens a thread by answering a mention, and the next line in that thread is
+ * refused because the thread origin itself had never been triggered (verified
+ * live, 2026-09-17).
  */
 export function threadFollowUpEngaged(
-	origin: Pick<OriginRef, "kind">,
-	originKey: string,
-	store: { sessionTurnCount(originKey: string): number },
+	origin: Pick<OriginRef, "platform" | "kind" | "conversationId" | "parentId">,
+	threadOriginKey: string,
+	store: ThreadEngagementStore,
 ): boolean {
-	return origin.kind === "thread" && store.sessionTurnCount(originKey) > 0;
+	if (origin.kind !== "thread") return false;
+	if (store.originTriggeredTurn(threadOriginKey)) return true;
+	if (!origin.parentId) return false;
+	const parentKey = originKey({
+		platform: origin.platform,
+		kind: "channel",
+		conversationId: origin.parentId,
+	});
+	return store.messageTriggeredTurn(parentKey, origin.conversationId);
 }
 
 export function resolveChannelPolicy(
