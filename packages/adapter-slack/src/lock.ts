@@ -1,4 +1,5 @@
-import { mkdir, readFile, rm, writeFile } from "node:fs/promises";
+import { randomUUID } from "node:crypto";
+import { mkdir, readFile, rename, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 
 /** A single Slack bot token must not have two adapters replying to every event. */
@@ -42,15 +43,34 @@ export class AdapterLock {
 	static async acquire(home: string, ports: AdapterLockPorts = defaultLockPorts()): Promise<AdapterLock> {
 		const path = join(home, "adapter-slack.pid");
 		await mkdir(home, { recursive: true });
+		// Fast path: an exclusive create wins outright when no pidfile exists.
 		if (await claim(path, ports.pid)) return new AdapterLock(path, ports.pid);
 		const holder = await readHolder(path);
 		// A crash or truncated pidfile must not require manual cleanup to restart.
 		if (holder !== undefined && holder !== ports.pid && ports.alive(holder)) {
 			throw new AdapterAlreadyRunningError(holder, path);
 		}
-		await rm(path, { force: true });
-		if (await claim(path, ports.pid)) return new AdapterLock(path, ports.pid);
-		throw new AdapterAlreadyRunningError((await readHolder(path)) ?? 0, path);
+		// Reclaim atomically. `rm` + create is a window in which a second starter can
+		// remove OUR fresh claim after reading the same stale holder; renaming a
+		// fully written private file over the stale path leaves no such window, and
+		// reading the path back afterwards tells each contender whether it won.
+		const temporary = `${path}.${ports.pid}.${randomUUID()}.tmp`;
+		await writeFile(temporary, `${ports.pid}\n`, { flag: "wx", mode: 0o600 });
+		try {
+			// Somebody else may have reclaimed (or a live holder may have appeared)
+			// between the stale read and now: never replace a pid that is not the
+			// stale one we judged dead.
+			const current = await readHolder(path);
+			if (current !== holder && current !== undefined && current !== ports.pid && ports.alive(current)) {
+				throw new AdapterAlreadyRunningError(current, path);
+			}
+			await rename(temporary, path);
+		} finally {
+			await rm(temporary, { force: true });
+		}
+		const winner = await readHolder(path);
+		if (winner === ports.pid) return new AdapterLock(path, ports.pid);
+		throw new AdapterAlreadyRunningError(winner ?? 0, path);
 	}
 
 	async release(): Promise<void> {

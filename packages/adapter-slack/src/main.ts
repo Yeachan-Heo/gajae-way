@@ -28,15 +28,23 @@ import {
 	slackReactionFor,
 } from "./reactions";
 import {
+	classifyRecoveryFailure,
+	clearAttempt,
 	loadRecoveryCursors,
 	pruneKnownDms,
+	pruneParticipatedThreads,
+	RECOVERY_MAX_ATTEMPTS,
 	RECOVERY_UNREADABLE_QUARANTINE_ATTEMPTS,
 	type RecoveryCursorState,
 	type RecoveryDelivery,
 	RecoveryScheduler,
+	recordAttempt,
+	recordDeadLetter,
 	recoverConversation,
+	recoverThread,
 	recoveryCursorPath,
 	rememberKnownDm,
+	rememberParticipatedThread,
 	saveRecoveryCursors,
 } from "./recovery";
 import { type SlackSlashCommand, SlackSocketMode, type SocketModeOptions } from "./socket";
@@ -215,9 +223,8 @@ export class LruSet {
 		return !present;
 	}
 
-	/** A send that never reached the gateway must not be remembered as seen. */
-	forget(value: string): void {
-		this.#values.delete(value);
+	has(value: string): boolean {
+		return this.#values.has(value);
 	}
 }
 
@@ -240,10 +247,33 @@ export class OrderedIngress {
 	}
 }
 
+/** The Slack channel a delivery for this origin is posted in. */
+export function deliveryChannel(origin: OriginRef): string {
+	return origin.kind === "thread" ? (origin.parentId ?? origin.conversationId) : origin.conversationId;
+}
+
+/**
+ * Resolves where a reply is posted: inside its thread, or at the top level.
+ *
+ * Throws a definitive `SlackApiError` when the routing intent cannot be honoured
+ * - a thread origin whose id is not a `channel:ts` pair, or an explicit reply
+ * target that is malformed or lives in another channel. Posting at the top level
+ * instead would silently answer in the wrong place and confirm success for it.
+ */
 export function replyThreadTs(message: Pick<ChatMessagePayload, "origin" | "replyToMessageId">): string | undefined {
-	if (message.origin.kind === "thread") return parseSlackMessageId(message.origin.conversationId)?.ts;
-	const target = message.replyToMessageId ? parseSlackMessageId(message.replyToMessageId) : undefined;
-	return target?.channel === (message.origin.parentId ?? message.origin.conversationId) ? target.ts : undefined;
+	const channel = deliveryChannel(message.origin);
+	if (message.origin.kind === "thread") {
+		const root = parseSlackMessageId(message.origin.conversationId);
+		if (!root || root.channel !== channel)
+			throw new SlackApiError(0, "invalid_target", `Slack thread origin ${message.origin.conversationId} is malformed`);
+		return root.ts;
+	}
+	if (message.replyToMessageId === undefined) return undefined;
+	const target = parseSlackMessageId(message.replyToMessageId);
+	if (!target) throw new SlackApiError(0, "invalid_target", "Slack reply target has a malformed message id");
+	if (target.channel !== channel)
+		throw new SlackApiError(0, "invalid_target", "Slack reply target belongs to a foreign channel");
+	return target.ts;
 }
 
 export async function settleSlackDelivery(
@@ -264,15 +294,14 @@ export async function settleSlackDelivery(
 	}
 	const deliveryId = message.deliveryId;
 	try {
-		const channel =
-			message.origin.kind === "thread"
-				? (message.origin.parentId ?? message.origin.conversationId)
-				: message.origin.conversationId;
+		const channel = deliveryChannel(message.origin);
+		// Routing is decided before any write, so a bad target never half-posts.
+		const threadTs = replyThreadTs(message);
 		const text = markdownToMrkdwn(
 			message.duplicateWarning ? `[recovered - may be a duplicate] ${message.text}` : message.text,
 		);
 		// Every chunk must stay in the same Slack thread, not just the first chunk.
-		for (const chunk of chunkSlackMessage(text)) await api.postMessage(channel, chunk, replyThreadTs(message));
+		for (const chunk of chunkSlackMessage(text)) await api.postMessage(channel, chunk, threadTs);
 		// voiceText is intentionally ignored: Slack has no bot voice messages.
 		await gateway.request("delivery.confirm", { deliveryId });
 	} catch (error) {
@@ -297,7 +326,7 @@ export async function settleSlackReaction(
 	try {
 		const target = parseSlackMessageId(message.reaction.targetMessageId);
 		if (!target) throw new SlackApiError(0, "invalid_target", "Slack reaction target has a malformed message id");
-		if (target.channel !== (message.origin.parentId ?? message.origin.conversationId))
+		if (target.channel !== deliveryChannel(message.origin))
 			throw new SlackApiError(0, "invalid_target", "Slack reaction target belongs to a foreign channel");
 		await api.addReaction(target.channel, target.ts, slackReactionFor(message.reaction));
 		await gateway.request("delivery.confirm", { deliveryId });
@@ -352,7 +381,15 @@ export class ReconnectingGateway implements GatewayClientLike {
 	#attempt = 0;
 	#deliveryOff: (() => void) | undefined;
 	#handlers = new Set<(message: ChatMessagePayload) => void>();
+	/** Ids the gateway has acknowledged (or reported as already known). */
 	readonly #inbound = new LruSet();
+	/**
+	 * Sends in flight, keyed by message id. A recovery pass that meets a live send
+	 * for the same id must wait for THAT outcome rather than assume it succeeded:
+	 * calling it a duplicate and advancing the watermark past it would lose the
+	 * message if the live send then fails before the gateway accepts it.
+	 */
+	readonly #pendingSends = new Map<string, Promise<RecoveredSend>>();
 	readonly #editOutbox = new Map<string, PendingEdit>();
 	#editFlush: Promise<void> | undefined;
 	#reconnectTimer: ReturnType<typeof setTimeout> | undefined;
@@ -395,8 +432,29 @@ export class ReconnectingGateway implements GatewayClientLike {
 			progressOff?.();
 		};
 		this.monitor(client);
-		void this.#flushEdits();
-		this.onConnected?.();
+		// Queued edits first: a backfilled message must not overtake an edit the
+		// user made before the link came back. Recovery starts once they drained.
+		const generation = this.#connectionGeneration;
+		void this.#drainEdits().then(() => {
+			if (this.#client === client && generation === this.#connectionGeneration) this.onConnected?.();
+		});
+	}
+
+	/**
+	 * Flushes until the outbox is empty or the link is gone. A flush that was
+	 * already running against the previous (dead) client returns as soon as it
+	 * notices, so one round is not enough right after a reconnect.
+	 */
+	async #drainEdits(): Promise<void> {
+		for (;;) {
+			await this.#flushEdits();
+			if (this.#editOutbox.size === 0 || !this.#client || this.#editFlush) return;
+			if (this.#reconnecting) return;
+			// Something was queued or a stale flush just ended: go again.
+			const before = this.#editOutbox.size;
+			await this.#flushEdits();
+			if (this.#editOutbox.size >= before) return;
+		}
 	}
 
 	async connect(): Promise<void> {
@@ -455,23 +513,36 @@ export class ReconnectingGateway implements GatewayClientLike {
 		text: string,
 		engagement: EngagementContext,
 		receivedAt?: string,
-	): Promise<{ readonly verdict: RecoveryDelivery; readonly result?: { engaged?: boolean } }> {
-		if (!this.#inbound.addIfAbsent(messageId)) return { verdict: "duplicate" };
+	): Promise<RecoveredSend> {
+		const pending = this.#pendingSends.get(messageId);
+		// Joining an in-flight send shares its verdict; a second caller never claims
+		// its own "acked" for a send it did not make.
+		if (pending)
+			return (await pending).verdict === "unavailable" ? { verdict: "unavailable" } : { verdict: "duplicate" };
+		if (this.#inbound.has(messageId)) return { verdict: "duplicate" };
+		const attempt = (async (): Promise<RecoveredSend> => {
+			try {
+				const result = await this.request<{ engaged?: boolean } | undefined>("chat.send", {
+					origin,
+					text,
+					messageId,
+					engagement,
+					...(receivedAt ? { receivedAt } : {}),
+				});
+				this.#inbound.addIfAbsent(messageId);
+				if (result?.engaged && addressedTurn(engagement)) this.status?.arm(origin);
+				return { verdict: "acked", ...(result ? { result } : {}) };
+			} catch (error) {
+				console.error(`Slack chat.send failed: ${errorText(error)}`);
+				if (!this.#client) this.scheduleReconnect();
+				return { verdict: "unavailable", failure: error };
+			}
+		})();
+		this.#pendingSends.set(messageId, attempt);
 		try {
-			const result = await this.request<{ engaged?: boolean } | undefined>("chat.send", {
-				origin,
-				text,
-				messageId,
-				engagement,
-				...(receivedAt ? { receivedAt } : {}),
-			});
-			if (result?.engaged && addressedTurn(engagement)) this.status?.arm(origin.conversationId);
-			return { verdict: "acked", ...(result ? { result } : {}) };
-		} catch (error) {
-			console.error(`Slack chat.send failed: ${errorText(error)}`);
-			this.#inbound.forget(messageId);
-			if (!this.#client) this.scheduleReconnect();
-			return { verdict: "unavailable" };
+			return await attempt;
+		} finally {
+			if (this.#pendingSends.get(messageId) === attempt) this.#pendingSends.delete(messageId);
 		}
 	}
 
@@ -520,7 +591,7 @@ export class ReconnectingGateway implements GatewayClientLike {
 					}
 					try {
 						const result = await client.request<{ engaged?: boolean } | undefined>("chat.edit", edit);
-						if (result?.engaged && addressedTurn(edit.engagement)) this.status?.arm(edit.origin.conversationId);
+						if (result?.engaged && addressedTurn(edit.engagement)) this.status?.arm(edit.origin);
 						// A superseding edit queued during the request must drain in this pass too.
 						if (this.#editOutbox.get(edit.messageId) === edit) this.#editOutbox.delete(edit.messageId);
 					} catch (error) {
@@ -602,6 +673,8 @@ export async function startSlackAdapter(
 	readonly handleSlashCommand: (command: SlackSlashCommand) => Promise<void>;
 	/** One bounded catch-up pass over configured channels and known DMs; true when it finished cleanly. */
 	readonly recoverMissedMessages: () => Promise<boolean>;
+	/** Resets quarantine strike counts so the next pass probes unreadable channels again. */
+	readonly reprobeQuarantined: () => Promise<void>;
 	readonly recovery: RecoveryScheduler;
 }> {
 	const api = ports.api ?? new SlackWebApi(config.botToken);
@@ -624,27 +697,55 @@ export async function startSlackAdapter(
 	const now = ports.now ?? Date.now;
 	const cursorPath = ports.recoveryCursorPath ?? recoveryCursorPath();
 	let cursors: RecoveryCursorState | undefined;
-	// The persist chain keeps cursor writes ordered; a pass joins it before reporting done.
+	// Single-flight load: two first-contact DMs arriving together must not each
+	// load an empty store and then overwrite one another's registration.
+	let cursorLoad: Promise<RecoveryCursorState | undefined> | undefined;
+	// The persist chain keeps cursor writes ordered. `dirty` marks state that is in
+	// memory but not yet on disk: a pass may not report completion while it is
+	// set, otherwise a disk fault silently strands a watermark or a known DM.
 	let cursorSaves: Promise<void> = Promise.resolve();
+	let dirty = false;
+	const ensureCursors = (): Promise<RecoveryCursorState | undefined> => {
+		if (cursors) return Promise.resolve(cursors);
+		cursorLoad ??= loadRecoveryCursors(cursorPath)
+			.then((loaded) => {
+				cursors = loaded;
+				return loaded;
+			})
+			.catch((error: unknown) => {
+				log.error(`Slack recovery refused: cursor store ${cursorPath} is unusable (${errorText(error)}).`);
+				return undefined;
+			})
+			.finally(() => {
+				cursorLoad = undefined;
+			});
+		return cursorLoad;
+	};
 	const persist = (next: RecoveryCursorState): void => {
 		cursors = next;
+		dirty = true;
 		cursorSaves = cursorSaves
-			.then(() => saveRecoveryCursors(cursorPath, next))
+			.then(async () => {
+				await saveRecoveryCursors(cursorPath, next);
+				if (cursors === next) dirty = false;
+			})
 			.catch((error: unknown) => log.error(`Slack recovery cursor persist failed: ${errorText(error)}`));
 	};
-	const ensureCursors = async (): Promise<RecoveryCursorState | undefined> => {
-		if (cursors) return cursors;
-		try {
-			cursors = await loadRecoveryCursors(cursorPath);
-		} catch (error) {
-			log.error(`Slack recovery refused: cursor store ${cursorPath} is unusable (${errorText(error)}).`);
-		}
-		return cursors;
-	};
-	const rememberDm = async (message: SlackInboundMessage): Promise<void> => {
-		if (!isSlackDmChannel(message.channel, message.channel_type)) return;
+	/** Applies a mutation to the CURRENT state after the load settled, never to a stale snapshot. */
+	const mutate = async (change: (state: RecoveryCursorState) => RecoveryCursorState): Promise<void> => {
 		const state = await ensureCursors();
-		if (state) persist(rememberKnownDm(state, message.channel, now()));
+		if (!state) return;
+		const next = change(cursors ?? state);
+		if (next !== (cursors ?? state)) persist(next);
+	};
+	const rememberDm = (message: SlackInboundMessage): Promise<void> => {
+		if (!isSlackDmChannel(message.channel, message.channel_type)) return Promise.resolve();
+		return mutate((state) => rememberKnownDm(state, message.channel, now()));
+	};
+	/** A thread the persona is answering in stays recoverable after its parent falls behind the watermark. */
+	const rememberThread = (origin: OriginRef): Promise<void> => {
+		if (origin.kind !== "thread") return Promise.resolve();
+		return mutate((state) => rememberParticipatedThread(state, origin.conversationId, now()));
 	};
 	const prime = async (message: SlackInboundMessage): Promise<void> => {
 		await Promise.all([
@@ -677,13 +778,15 @@ export async function startSlackAdapter(
 				}
 				const text = renderInboundText(message, directory);
 				if (text === "") return;
-				await gateway.requestInbound(
+				const engagement = engagementForMessage(message, admitted.origin, identity, directory, config.channels);
+				const result = await gateway.requestInbound(
 					slackMessageId(message.channel, message.ts),
 					admitted.origin,
 					text,
-					engagementForMessage(message, admitted.origin, identity, directory, config.channels),
+					engagement,
 					timestamp(message.ts),
 				);
+				if (result?.engaged) await rememberThread(admitted.origin);
 			});
 		} else if (event.type === "reaction_added" || event.type === "reaction_removed") {
 			const description = describeSlackReaction(event as unknown as SlackReactionEvent, identity.botUserId, directory);
@@ -692,21 +795,22 @@ export async function startSlackAdapter(
 	};
 	const handleSlashCommand = async (command: SlackSlashCommand): Promise<void> => {
 		try {
-			if (!["/new", "/reset", "/restart"].includes(command.command)) {
+			if (!SLASH_COMMANDS.has(command.command)) {
 				await api.respond(command.response_url, { response_type: "ephemeral", text: "unknown command" });
 				return;
 			}
 			const origin = slackMessageOrigin({ channel: command.channel_id, user: command.user_id });
-			const result = await gateway.requestInbound(`slash-${command.trigger_id}`, origin, command.command, {
+			const sent = await gateway.requestRecovered(`slash-${command.trigger_id}`, origin, command.command, {
 				mentioned: true,
 				group: origin.kind !== "dm",
 				authorId: command.user_id,
 				...(command.user_name ? { authorHandle: command.user_name } : {}),
 			});
-			// Honest ack: the gateway owns command authorization, not the adapter.
+			// Honest ack: the gateway owns command authorization, not the adapter, and
+			// "we could not ask" is a different answer from "it said no".
 			await api.respond(command.response_url, {
 				response_type: "ephemeral",
-				text: result?.engaged ? "🦞 session reset" : "not authorized for session commands here",
+				text: slashCommandAck(command.command, sent),
 			});
 		} catch (error) {
 			log.error(`Slack slash command failed: ${errorText(error)}`);
@@ -720,73 +824,180 @@ export async function startSlackAdapter(
 	 */
 	const recoverMissedMessages = async (): Promise<boolean> => {
 		if (!gateway.connected) return false;
-		const state = await ensureCursors();
-		if (!state) return false;
+		const loaded = await ensureCursors();
+		if (!loaded) return false;
 		const nowMs = now();
-		const pruned = pruneKnownDms(state, nowMs);
-		if (pruned !== state) persist(pruned);
-		const targets = [...new Set([...Object.keys(config.channels ?? {}), ...Object.keys(cursors?.knownDms ?? {})])];
+		const current = (): RecoveryCursorState => cursors ?? loaded;
+		await mutate((state) => pruneParticipatedThreads(pruneKnownDms(state, nowMs), nowMs));
+		const channels = [...new Set([...Object.keys(config.channels ?? {}), ...Object.keys(current().knownDms)])];
 		let completed = true;
 		const port = {
-			history: (channel: string, options: { oldest: string; cursor?: string; limit: number }) =>
+			history: (channel: string, options: { oldest: string; latest?: string; cursor?: string; limit: number }) =>
 				api.conversationsHistory(channel, options),
 			replies: (channel: string, threadTs: string, options: { oldest: string; cursor?: string; limit: number }) =>
 				api.conversationsReplies(channel, threadTs, options),
 		};
-		const current = (): RecoveryCursorState => cursors ?? state;
-		for (const channel of targets) {
+		const deliver = async (message: SlackInboundMessage): Promise<RecoveryDelivery> => {
+			const admitted = decideInbound(message, identity, directory, config.channels);
+			if (!admitted) return "skip";
+			await prime(message);
+			const text = renderInboundText(message, directory);
+			if (text === "") return "skip";
+			const messageId = slackMessageId(message.channel, message.ts);
+			const sent = await gateway.requestRecovered(
+				messageId,
+				admitted.origin,
+				text,
+				engagementForMessage(message, admitted.origin, identity, directory, config.channels),
+				timestamp(message.ts),
+			);
+			if (sent.verdict !== "unavailable") {
+				await mutate((state) => clearAttempt(state, messageId));
+				if (sent.verdict === "acked" && sent.result?.engaged) await rememberThread(admitted.origin);
+				return sent.verdict;
+			}
+			// Only a payload-specific refusal burns this message's budget; a link outage
+			// says nothing about the message and leaves the cursor exactly where it is.
+			const classification = classifyRecoveryFailure(sent.failure);
+			const reason = errorText(sent.failure);
+			let exhausted = false;
+			await mutate((state) => {
+				const recorded = recordAttempt(state, messageId, message.channel, classification, reason, nowMs);
+				exhausted = recorded.exhausted;
+				return recorded.state;
+			});
+			if (!exhausted) return "unavailable";
+			log.error(`Slack recovery discarded ${messageId} after repeated ${classification} failures: ${reason}`);
+			await mutate((state) =>
+				recordDeadLetter(state, {
+					messageId,
+					conversationId: message.channel,
+					classification,
+					attempts: RECOVERY_MAX_ATTEMPTS,
+					reason,
+					at: new Date(nowMs).toISOString(),
+				}),
+			);
+			return "discard";
+		};
+		for (const channel of channels) {
 			if ((current().quarantined[channel]?.failures ?? 0) >= RECOVERY_UNREADABLE_QUARANTINE_ATTEMPTS) continue;
+			const resume = current().continuation[channel];
 			const outcome = await recoverConversation(port, channel, {
 				cursor: current().recoveredThrough[channel],
+				...(resume ? { latest: resume.olderThan } : {}),
 				nowMs,
 				botUserId: identity.botUserId,
-				deliver: async (message) => {
-					const admitted = decideInbound(message, identity, directory, config.channels);
-					if (!admitted) return "skip";
-					await prime(message);
-					const text = renderInboundText(message, directory);
-					if (text === "") return "skip";
-					const sent = await gateway.requestRecovered(
-						slackMessageId(message.channel, message.ts),
-						admitted.origin,
-						text,
-						engagementForMessage(message, admitted.origin, identity, directory, config.channels),
-						timestamp(message.ts),
-					);
-					return sent.verdict;
-				},
+				deliver,
 			});
-			if (outcome.advancedTo)
-				persist({ ...current(), recoveredThrough: { ...current().recoveredThrough, [channel]: outcome.advancedTo } });
 			if (outcome.failed) {
 				completed = false;
 				if (outcome.permanent) {
 					// A channel the bot cannot read stops driving the retry loop after a few
-					// strikes, but is probed again on the next connect in case access returned.
-					const prior = current().quarantined[channel];
-					persist({
-						...current(),
+					// strikes; the next socket/gateway connect resets the count and probes again.
+					await mutate((state) => ({
+						...state,
 						quarantined: {
-							...current().quarantined,
+							...state.quarantined,
 							[channel]: {
 								reason: outcome.fetchError ?? "unreadable",
-								failures: (prior?.failures ?? 0) + 1,
-								since: prior?.since ?? new Date(nowMs).toISOString(),
+								failures: (state.quarantined[channel]?.failures ?? 0) + 1,
+								since: state.quarantined[channel]?.since ?? new Date(nowMs).toISOString(),
 							},
 						},
-					});
+					}));
 					log.error(`Slack recovery cannot read ${channel}: ${outcome.fetchError ?? "unreadable"}`);
 				} else log.error(`Slack recovery incomplete for ${channel}: ${outcome.fetchError ?? "gateway unavailable"}`);
-			} else if (current().quarantined[channel]) {
-				const { [channel]: _cleared, ...quarantined } = current().quarantined;
-				persist({ ...current(), quarantined });
+				continue;
 			}
+			await mutate((state) => {
+				const { [channel]: _cleared, ...quarantined } = state.quarantined;
+				const { [channel]: _done, ...continuation } = state.continuation;
+				if (outcome.truncated && outcome.continuation) {
+					// The newest suffix of the gap is delivered; resume BELOW it next pass so
+					// an oversized gap drains in bounded slices instead of refetching forever.
+					// The watermark waits until the gap closes.
+					return {
+						...state,
+						quarantined,
+						continuation: {
+							...continuation,
+							[channel]: { olderThan: outcome.continuation.olderThan, through: outcome.continuation.through },
+						},
+					};
+				}
+				// Gap closed: the watermark becomes the newest ts of the whole gap, which is
+				// the continuation's `through` when this was the last slice.
+				const through = resume?.through ?? outcome.advancedTo;
+				return {
+					...state,
+					quarantined,
+					continuation,
+					...(through ? { recoveredThrough: { ...state.recoveredThrough, [channel]: through } } : {}),
+				};
+			});
+			if (outcome.truncated) completed = false;
+		}
+		// Threads the persona took part in: their parents may be below the channel
+		// watermark by now, so each root is walked on its own bounded cursor.
+		for (const [threadKey, entry] of Object.entries(current().participatedThreads)) {
+			const root = parseSlackMessageId(threadKey);
+			if (!root) continue;
+			if ((current().quarantined[root.channel]?.failures ?? 0) >= RECOVERY_UNREADABLE_QUARANTINE_ATTEMPTS) continue;
+			const outcome = await recoverThread(port, root.channel, root.ts, {
+				cursor: entry.through,
+				nowMs,
+				botUserId: identity.botUserId,
+				deliver,
+			});
+			if (outcome.failed) {
+				completed = false;
+				if (outcome.permanent) {
+					// The thread is gone or unreadable: forget it rather than strike the channel.
+					await mutate((state) => {
+						const { [threadKey]: _gone, ...participatedThreads } = state.participatedThreads;
+						return { ...state, participatedThreads };
+					});
+				}
+				continue;
+			}
+			if (outcome.advancedTo)
+				await mutate((state) => ({
+					...state,
+					participatedThreads: {
+						...state.participatedThreads,
+						[threadKey]: {
+							...state.participatedThreads[threadKey],
+							lastSeenAt: entry.lastSeenAt,
+							through: outcome.advancedTo,
+						},
+					},
+				}));
 			if (outcome.truncated) completed = false;
 		}
 		await cursorSaves;
-		return completed;
+		// Progress that is not on disk is not progress: keep retrying until it is.
+		return completed && !dirty;
 	};
-	const recovery = new RecoveryScheduler(recoverMissedMessages);
+	/**
+	 * A fresh link is the moment to re-check channels that were unreadable: the
+	 * operator may have fixed scopes or membership since. Their strike count is
+	 * reset so the next pass actually probes them again.
+	 */
+	const reprobeQuarantined = (): Promise<void> =>
+		mutate((state) => {
+			if (Object.keys(state.quarantined).length === 0) return state;
+			const quarantined = Object.fromEntries(
+				Object.entries(state.quarantined).map(([channel, entry]) => [channel, { ...entry, failures: 0 }]),
+			);
+			return { ...state, quarantined };
+		});
+	const recovery = new RecoveryScheduler(async () => {
+		await reprobeQuarantined();
+		return recoverMissedMessages();
+	});
+	// Recovery on reconnect is the scheduler's job; the reprobe rides inside each
+	// scheduled pass so it cannot be skipped by a coalesced trigger.
 	gateway.onConnected = () => recovery.trigger();
 	await gateway.connect();
 	const socket = new SlackSocketMode(
@@ -813,6 +1024,7 @@ export async function startSlackAdapter(
 		handleEvent,
 		handleSlashCommand,
 		recoverMissedMessages,
+		reprobeQuarantined,
 		recovery,
 	};
 }
@@ -831,6 +1043,27 @@ export const SLACK_USAGE = [
 	"$GAJAEWAY_HOME/adapter-slack.json; one instance at a time per home.",
 ].join("\n");
 export const USAGE_EXIT_CODE = 2;
+const SLASH_COMMANDS: ReadonlySet<string> = new Set(["/new", "/reset", "/restart"]);
+
+/**
+ * What the invoking user is told. Wording follows what the gateway actually did:
+ * `/restart` restarts the process and keeps sessions, so it never claims a reset;
+ * a link that could not carry the command is reported as such, not as a denial.
+ */
+export function slashCommandAck(command: string, sent: Pick<RecoveredSend, "verdict" | "result">): string {
+	if (sent.verdict === "unavailable") return "the gateway is unreachable right now; try again shortly";
+	if (sent.verdict === "duplicate") return "already handled";
+	if (!sent.result?.engaged) return "not authorized for session commands here";
+	return command === "/restart" ? "🦞 restarting the gateway" : "🦞 session reset";
+}
+
+/** Outcome of one gateway send, classified for recovery; `failure` carries the raw error for classification. */
+export interface RecoveredSend {
+	readonly verdict: RecoveryDelivery;
+	readonly result?: { engaged?: boolean };
+	readonly failure?: unknown;
+}
+
 export type SlackArgv =
 	| { readonly kind: "run" }
 	| { readonly kind: "help" }

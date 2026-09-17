@@ -1567,6 +1567,15 @@ async function createInboundTurnLifecycle(
 			.map((part) => part.trim())
 			.filter((part) => part.length > 0 && !isSilenceToken(part) && !containsSilenceToken(part))
 			.slice(0, 5);
+		// A DM that arrived as a reply inside a thread keeps its DM session identity
+		// (the origin has no thread), so the thread root survives only in the
+		// trigger's engagement metadata. Answering at the DM's top level would put
+		// the reply outside the conversation the human is actually looking at, so
+		// it becomes the default reply target when the persona names none.
+		const inboundThreadRoot =
+			origin.kind === "dm" && typeof engagement?.replyTo?.messageId === "string" && engagement.replyTo.messageId
+				? engagement.replyTo.messageId
+				: undefined;
 		const planned: Array<{ readonly body: string; readonly replyTo?: string }> = [];
 		for (const part of parts) {
 			if (planned.length >= maxTurnParts) break;
@@ -1577,7 +1586,8 @@ async function createInboundTurnLifecycle(
 				.replace(/\s*\[BREAK\]\s*/g, " ")
 				.trim();
 			if (!body) continue;
-			planned.push({ body, ...(replyMatch?.[1] ? { replyTo: replyMatch[1] } : {}) });
+			const replyTo = replyMatch?.[1] || inboundThreadRoot;
+			planned.push({ body, ...(replyTo ? { replyTo } : {}) });
 		}
 		const spoken = spokenReply(
 			planned.map((step) => step.body),

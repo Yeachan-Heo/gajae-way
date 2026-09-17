@@ -1,0 +1,742 @@
+{
+	"schemaVersion": 1,
+	"kind": "api-package-test-report",
+	"sourceHash": "sha256:bc28aafd226fc34e5fd65823450f6e58f40d78ffcd5831723193eb525a25b7ed",
+	"contractCoverage": [
+		{
+			"contractRef": "brief:8 Socket Mode immediate ack/retry/reconnect",
+			"status": "covered",
+			"caseIds": ["RT-SLACK-01"]
+		},
+		{
+			"contractRef": "brief:10 Slack origins, channel/thread isolation",
+			"status": "covered",
+			"caseIds": ["RT-SLACK-08", "RT-SLACK-16", "RT-SLACK-24"]
+		},
+		{
+			"contractRef": "brief:11 channel-qualified safe ids and definitive foreign-id refusal",
+			"status": "covered",
+			"caseIds": ["RT-SLACK-02", "RT-SLACK-03"]
+		},
+		{
+			"contractRef": "brief:12 inbound entities/tokens and outbound escaping/chunking",
+			"status": "covered",
+			"caseIds": ["RT-SLACK-04", "RT-SLACK-05", "RT-SLACK-21"]
+		},
+		{
+			"contractRef": "brief:14 reaction mapping and settlement",
+			"status": "covered",
+			"caseIds": ["RT-SLACK-11", "RT-SLACK-22", "RT-SLACK-25"]
+		},
+		{
+			"contractRef": "brief:15 engagement, filtering, edits and missing parent metadata",
+			"status": "covered",
+			"caseIds": [
+				"RT-SLACK-04",
+				"RT-SLACK-07",
+				"RT-SLACK-08",
+				"RT-SLACK-12",
+				"RT-SLACK-13",
+				"RT-SLACK-20",
+				"RT-SLACK-21"
+			]
+		},
+		{
+			"contractRef": "brief:16 attachment-only and empty bodies",
+			"status": "covered",
+			"caseIds": ["RT-SLACK-06"]
+		},
+		{
+			"contractRef": "brief:17 pidfile single-instance state",
+			"status": "covered",
+			"caseIds": ["RT-SLACK-29"]
+		},
+		{
+			"contractRef": "brief:18 credential loading and policy validation",
+			"status": "covered",
+			"caseIds": ["RT-SLACK-19"]
+		},
+		{
+			"contractRef": "brief:23 gateway Slack admission and platform reaction guards",
+			"status": "covered",
+			"caseIds": ["RT-SLACK-20", "RT-SLACK-21", "RT-SLACK-22", "RT-SLACK-23", "RT-SLACK-24"]
+		},
+		{
+			"contractRef": "brief:26 delivery ambiguity, bounded edit replay, inbound dedupe, CLI",
+			"status": "covered",
+			"caseIds": [
+				"RT-SLACK-09",
+				"RT-SLACK-10",
+				"RT-SLACK-11",
+				"RT-SLACK-12",
+				"RT-SLACK-13",
+				"RT-SLACK-14",
+				"RT-SLACK-26",
+				"RT-SLACK-27",
+				"RT-SLACK-28",
+				"RT-SLACK-29"
+			]
+		},
+		{
+			"contractRef": "brief:29 recovery order/watermark/thread/quarantine/single-flight",
+			"status": "covered",
+			"caseIds": ["RT-SLACK-15", "RT-SLACK-16", "RT-SLACK-17", "RT-SLACK-18"]
+		},
+		{
+			"contractRef": "brief:32 compiled binary and real gateway e2e integration",
+			"status": "covered",
+			"caseIds": [
+				"RT-SLACK-20",
+				"RT-SLACK-21",
+				"RT-SLACK-22",
+				"RT-SLACK-24",
+				"RT-SLACK-26",
+				"RT-SLACK-27",
+				"RT-SLACK-28",
+				"RT-SLACK-29"
+			]
+		},
+		{
+			"contractRef": "Computer-use / GUI / web",
+			"status": "not_applicable",
+			"reason": "No such product surface belongs to this Slack adapter change."
+		}
+	],
+	"surfaceEvidence": [
+		{
+			"surface": "cli",
+			"invocation": "bun artifacts/slack-adapter-cli-probes.ts",
+			"verdict": "passed",
+			"artifactIds": ["artifacts/slack-adapter-cli-proof.json", "artifacts/slack-adapter-cli-replay.json"]
+		},
+		{
+			"surface": "api",
+			"invocation": "bun test packages/adapter-slack/test/redteam.test.ts packages/gateway/test/slack-adapter-redteam.e2e.test.ts --reporter=junit --reporter-outfile=artifacts/slack-adapter-redteam.junit.xml",
+			"verdict": "passed",
+			"detail": "All five real gateway socket cases passed.",
+			"artifactIds": ["artifacts/slack-adapter-redteam.junit.xml"]
+		},
+		{
+			"surface": "package",
+			"invocation": "bun test packages/adapter-slack/test/redteam.test.ts packages/gateway/test/slack-adapter-redteam.e2e.test.ts --reporter=junit --reporter-outfile=artifacts/slack-adapter-redteam.junit.xml",
+			"verdict": "failed",
+			"detail": "17 of 20 adapter tests passed; three demonstrated blockers.",
+			"artifactIds": ["artifacts/slack-adapter-redteam.junit.xml", "artifacts/slack-adapter-redteam-report.json"]
+		}
+	],
+	"adversarialCases": [
+		{
+			"id": "RT-SLACK-01",
+			"scenario": "throwing handlers ack first, retries dedupe, malformed frames survive and disconnect reconnects",
+			"expectedBehavior": "Ack before handler; handler failure does not poison later dispatch; retry dedupes; invalid/missing-id frames do not dispatch; disconnect creates second socket.",
+			"verdict": "failed",
+			"test": "packages/adapter-slack/test/redteam.test.ts:63"
+		},
+		{
+			"id": "RT-SLACK-02",
+			"scenario": "hostile timestamps never emit non-platform message ids",
+			"expectedBehavior": "All six hostile timestamps drop before chat.send; subsequent valid message has a protocol-safe id.",
+			"verdict": "failed",
+			"test": "packages/adapter-slack/test/redteam.test.ts:76"
+		},
+		{
+			"id": "RT-SLACK-03",
+			"scenario": "foreign reply target is a definitive delivery failure, never thread_ts",
+			"expectedBehavior": "Foreign-channel reply target must fail definitively before postMessage, per brief line 11; it must never become thread_ts.",
+			"verdict": "failed",
+			"test": "packages/adapter-slack/test/redteam.test.ts:84"
+		},
+		{
+			"id": "RT-SLACK-04",
+			"scenario": "literal mentions in code count; entities decode once and broadcasts normalize",
+			"expectedBehavior": "Brief literal text-contains rule includes code-span mentions; normalize broadcasts and subteam labels; decode entities exactly once.",
+			"verdict": "failed",
+			"test": "packages/adapter-slack/test/redteam.test.ts:93"
+		},
+		{
+			"id": "RT-SLACK-05",
+			"scenario": "fifty-thousand-character fenced text has bounded balanced chunks",
+			"expectedBehavior": "50k fenced message produces pieces <=4000 characters with balanced fences.",
+			"verdict": "failed",
+			"test": "packages/adapter-slack/test/redteam.test.ts:98"
+		},
+		{
+			"id": "RT-SLACK-06",
+			"scenario": "file-only body survives and empty body drops",
+			"expectedBehavior": "File-only message renders attachment body; message without files or text drops.",
+			"verdict": "failed",
+			"test": "packages/adapter-slack/test/redteam.test.ts:104"
+		},
+		{
+			"id": "RT-SLACK-07",
+			"scenario": "own, hidden, every skipped subtype, unchanged/empty edits and app_mention never send",
+			"expectedBehavior": "Own user, own bot_id, hidden, all SKIPPED_SUBTYPES, unchanged/empty edits and app_mention cause no gateway requests.",
+			"verdict": "failed",
+			"test": "packages/adapter-slack/test/redteam.test.ts:109"
+		},
+		{
+			"id": "RT-SLACK-08",
+			"scenario": "bot parent mentions; unknown parent omits fromSelf",
+			"expectedBehavior": "Bot-authored parent sets mentioned; missing parent_user_id leaves fromSelf absent.",
+			"verdict": "failed",
+			"test": "packages/adapter-slack/test/redteam.test.ts:115"
+		},
+		{
+			"id": "RT-SLACK-09",
+			"scenario": "transport failure ambiguous, Slack API failure definitive",
+			"expectedBehavior": "TypeError produces ambiguous:true, SlackApiError ambiguous:false.",
+			"verdict": "failed",
+			"test": "packages/adapter-slack/test/redteam.test.ts:120"
+		},
+		{
+			"id": "RT-SLACK-10",
+			"scenario": "all three chunks keep thread and duplicate warning",
+			"expectedBehavior": "Three-chunk thread reply keeps thread_ts on every chunk, prefixes duplicate warning, confirms once.",
+			"verdict": "failed",
+			"test": "packages/adapter-slack/test/redteam.test.ts:127"
+		},
+		{
+			"id": "RT-SLACK-11",
+			"scenario": "malformed and unknown reactions fail without API; already_reacted confirms",
+			"expectedBehavior": "Malformed target and unknown emojiName fail definitively without reaction API calls. Already-reacted coverage independently verified by RT-SLACK-25.",
+			"verdict": "failed",
+			"test": "packages/adapter-slack/test/redteam.test.ts:132"
+		},
+		{
+			"id": "RT-SLACK-12",
+			"scenario": "disconnected edit overflow retains newest 256 and replays ordered",
+			"expectedBehavior": "300 disconnected edits retain newest 256, log 44 evictions, and replay in order on adoptClient.",
+			"verdict": "failed",
+			"test": "packages/adapter-slack/test/redteam.test.ts:140"
+		},
+		{
+			"id": "RT-SLACK-13",
+			"scenario": "failed edit remains queued and reconnects for replay",
+			"expectedBehavior": "Failed chat.edit remains pending and schedules reconnect; adopted healthy client replays it.",
+			"verdict": "failed",
+			"test": "packages/adapter-slack/test/redteam.test.ts:149"
+		},
+		{
+			"id": "RT-SLACK-14",
+			"scenario": "duplicate inbound dedupes but unavailable is forgotten",
+			"expectedBehavior": "Successful message id is not resent; unavailable message is forgotten and retried successfully.",
+			"verdict": "failed",
+			"test": "packages/adapter-slack/test/redteam.test.ts:155"
+		},
+		{
+			"id": "RT-SLACK-15",
+			"scenario": "newest-first recovery delivers ascending and cannot cross unavailable",
+			"expectedBehavior": "Newest-first paginated history delivers ascending; watermark stops before unavailable message.",
+			"verdict": "failed",
+			"test": "packages/adapter-slack/test/redteam.test.ts:161"
+		},
+		{
+			"id": "RT-SLACK-16",
+			"scenario": "recovered replies retain thread origin",
+			"expectedBehavior": "Recovered thread reply has thread origin and correct parent/channel id.",
+			"verdict": "failed",
+			"test": "packages/adapter-slack/test/redteam.test.ts:166"
+		},
+		{
+			"id": "RT-SLACK-17",
+			"scenario": "three-strike quarantine is re-probed after gateway reconnect",
+			"expectedBehavior": "Third permanent failure quarantines; later gateway reconnection/pass must re-probe restored access and clear quarantine.",
+			"verdict": "failed",
+			"test": "packages/adapter-slack/test/redteam.test.ts:170"
+		},
+		{
+			"id": "RT-SLACK-18",
+			"scenario": "twenty recovery triggers remain single flight",
+			"expectedBehavior": "Twenty concurrent triggers run one pass at a time and coalesce to one follow-up.",
+			"verdict": "passed",
+			"test": "packages/adapter-slack/test/redteam.test.ts:177"
+		},
+		{
+			"id": "RT-SLACK-19",
+			"scenario": "credential prefixes fail without secrets, relative files resolve and unknown channel keys reject",
+			"expectedBehavior": "Both incorrect token prefixes rejected without secret echo; relative token paths resolve from config; unknown channel key rejected.",
+			"verdict": "passed",
+			"test": "packages/adapter-slack/test/redteam.test.ts:183"
+		},
+		{
+			"id": "RT-SLACK-20",
+			"scenario": "unconfigured unmentioned Slack channel is context only",
+			"expectedBehavior": "Unconfigured unmentioned channel records no persona turn or delivery.",
+			"verdict": "passed",
+			"test": "packages/gateway/test/slack-adapter-redteam.e2e.test.ts:31"
+		},
+		{
+			"id": "RT-SLACK-21",
+			"scenario": "mention-open engages and persona markup is escaped at Slack boundary",
+			"expectedBehavior": "Namespaced mention-open policy engages and literal persona <script>& is escaped at Slack postMessage.",
+			"verdict": "passed",
+			"test": "packages/gateway/test/slack-adapter-redteam.e2e.test.ts:35"
+		},
+		{
+			"id": "RT-SLACK-22",
+			"scenario": "check reaction token delivers on Slack and is refused on Telegram",
+			"expectedBehavior": "Persona check token maps to white_check_mark and confirmed Slack delivery; Telegram produces no reaction and explicit chat.react refuses it.",
+			"verdict": "passed",
+			"test": "packages/gateway/test/slack-adapter-redteam.e2e.test.ts:39"
+		},
+		{
+			"id": "RT-SLACK-23",
+			"scenario": "monitor and loopback cannot chat.react",
+			"expectedBehavior": "Monitor and loopback chat.react requests fail and leave no delivery rows.",
+			"verdict": "passed",
+			"test": "packages/gateway/test/slack-adapter-redteam.e2e.test.ts:47"
+		},
+		{
+			"id": "RT-SLACK-24",
+			"scenario": "thread and channel isolate sessions and route replies",
+			"expectedBehavior": "Thread and channel have distinct session origin records and correctly routed confirmed replies.",
+			"verdict": "passed",
+			"test": "packages/gateway/test/slack-adapter-redteam.e2e.test.ts:51"
+		},
+		{
+			"id": "RT-SLACK-25",
+			"scenario": "already_reacted Web API response confirms delivery",
+			"expectedBehavior": "Actual SlackWebApi already_reacted response is treated as success and delivery.confirm is emitted.",
+			"verdict": "passed",
+			"test": "packages/adapter-slack/test/redteam.test.ts:191"
+		},
+		{
+			"id": "RT-SLACK-26",
+			"scenario": "dist/gajaeway-slack --help",
+			"expectedBehavior": "Real binary --help exits 0 and prints usage without booting.",
+			"verdict": "passed",
+			"test": "artifacts/slack-adapter-cli-probes.ts:8",
+			"artifact": "artifacts/slack-adapter-cli-proof.json"
+		},
+		{
+			"id": "RT-SLACK-27",
+			"scenario": "dist/gajaeway-slack --version",
+			"expectedBehavior": "Real binary --version exits 0 and prints semver.",
+			"verdict": "passed",
+			"test": "artifacts/slack-adapter-cli-probes.ts:8",
+			"artifact": "artifacts/slack-adapter-cli-proof.json"
+		},
+		{
+			"id": "RT-SLACK-28",
+			"scenario": "dist/gajaeway-slack --nope",
+			"expectedBehavior": "Real binary unknown argument exits 2 and prints usage to stderr.",
+			"verdict": "passed",
+			"test": "artifacts/slack-adapter-cli-probes.ts:8",
+			"artifact": "artifacts/slack-adapter-cli-proof.json"
+		},
+		{
+			"id": "RT-SLACK-29",
+			"scenario": "dist/gajaeway-slack",
+			"expectedBehavior": "Real binary refuses second instance with live pidfile, exits 2, does not overwrite pidfile.",
+			"verdict": "passed",
+			"test": "artifacts/slack-adapter-cli-probes.ts:8",
+			"artifact": "artifacts/slack-adapter-cli-proof.json"
+		}
+	],
+	"blockers": [
+		{
+			"caseId": "RT-SLACK-03",
+			"contractRef": "/tmp/gajaeway-slack-brief.md:11",
+			"observed": "Foreign C2:1.0 reply target posts a top-level C1 reply and confirms instead of definitive failure.",
+			"source": "packages/adapter-slack/src/main.ts:replyThreadTs/settleSlackDelivery"
+		},
+		{
+			"caseId": "RT-SLACK-11",
+			"contractRef": "User minimum adversarial case 5; definitive invalid reaction settlement",
+			"observed": "Unknown emojiName throws generic Error, classified ambiguous:true; no API was called, so delivery failure should be definitive.",
+			"source": "packages/adapter-slack/src/reactions.ts:slackReactionFor; packages/adapter-slack/src/main.ts:settleSlackReaction"
+		},
+		{
+			"caseId": "RT-SLACK-17",
+			"contractRef": "User minimum adversarial case 7; recoverMissedMessages reconnect re-probe promise",
+			"observed": "After three missing_scope failures, subsequent pass and gateway reconnect never call history again (3 calls, expected 4). failures>=3 skip occurs before clean-pass clearing; no callback resets counters. Quarantine persists indefinitely, including across restarts via cursor file.",
+			"source": "packages/adapter-slack/src/main.ts:recoverMissedMessages/gateway.onConnected"
+		}
+	],
+	"artifactRefs": [
+		"artifacts/slack-adapter-cli-replay.json",
+		"artifacts/slack-adapter-cli-proof.json",
+		"artifacts/slack-adapter-redteam.junit.xml",
+		"artifacts/slack-adapter-redteam-report.json"
+	],
+	"limitations": [
+		"Parent rebased the branch mid-QA. Original frozen hash run: 24 cases, 21 passed, same three defects. Latest JUnit: 25 cases, 22 passed, same three defects after adapting only new gateway fixture to upstream attachTestBrokerOwnership. Intermediate fixture-drift failures are not attributed to the frozen hash.",
+		"Coverage rows enumerate obligations exercised, not all brief obligations: working-status, slash-command authorization, cache eviction and service/doc integration were outside this new minimum red-team suite.",
+		"RT-SLACK-17 disables automatic recovery scheduling for deterministic manual passes; source inspection establishes onConnected only triggers scheduler and never resets quarantine.",
+		"Gateway teardown emits invalid socket write count: -32 warnings; these are retained, not suppressed."
+	],
+	"latestRunCommit": "43a3017b53309f38af570f4922507b3eb0a8ab09",
+	"counts": {
+		"tests": 25,
+		"passed": 22,
+		"failed": 3,
+		"cliProbes": 4,
+		"cliPassed": 4
+	},
+	"executorQa": {
+		"sourceHash": "sha256:bc28aafd226fc34e5fd65823450f6e58f40d78ffcd5831723193eb525a25b7ed",
+		"contractCoverage": [
+			{
+				"contractRef": "brief:8 Socket Mode immediate ack/retry/reconnect",
+				"status": "covered",
+				"caseIds": ["RT-SLACK-01"]
+			},
+			{
+				"contractRef": "brief:10 Slack origins, channel/thread isolation",
+				"status": "covered",
+				"caseIds": ["RT-SLACK-08", "RT-SLACK-16", "RT-SLACK-24"]
+			},
+			{
+				"contractRef": "brief:11 channel-qualified safe ids and definitive foreign-id refusal",
+				"status": "covered",
+				"caseIds": ["RT-SLACK-02", "RT-SLACK-03"]
+			},
+			{
+				"contractRef": "brief:12 inbound entities/tokens and outbound escaping/chunking",
+				"status": "covered",
+				"caseIds": ["RT-SLACK-04", "RT-SLACK-05", "RT-SLACK-21"]
+			},
+			{
+				"contractRef": "brief:14 reaction mapping and settlement",
+				"status": "covered",
+				"caseIds": ["RT-SLACK-11", "RT-SLACK-22", "RT-SLACK-25"]
+			},
+			{
+				"contractRef": "brief:15 engagement, filtering, edits and missing parent metadata",
+				"status": "covered",
+				"caseIds": [
+					"RT-SLACK-04",
+					"RT-SLACK-07",
+					"RT-SLACK-08",
+					"RT-SLACK-12",
+					"RT-SLACK-13",
+					"RT-SLACK-20",
+					"RT-SLACK-21"
+				]
+			},
+			{
+				"contractRef": "brief:16 attachment-only and empty bodies",
+				"status": "covered",
+				"caseIds": ["RT-SLACK-06"]
+			},
+			{
+				"contractRef": "brief:17 pidfile single-instance state",
+				"status": "covered",
+				"caseIds": ["RT-SLACK-29"]
+			},
+			{
+				"contractRef": "brief:18 credential loading and policy validation",
+				"status": "covered",
+				"caseIds": ["RT-SLACK-19"]
+			},
+			{
+				"contractRef": "brief:23 gateway Slack admission and platform reaction guards",
+				"status": "covered",
+				"caseIds": ["RT-SLACK-20", "RT-SLACK-21", "RT-SLACK-22", "RT-SLACK-23", "RT-SLACK-24"]
+			},
+			{
+				"contractRef": "brief:26 delivery ambiguity, bounded edit replay, inbound dedupe, CLI",
+				"status": "covered",
+				"caseIds": [
+					"RT-SLACK-09",
+					"RT-SLACK-10",
+					"RT-SLACK-11",
+					"RT-SLACK-12",
+					"RT-SLACK-13",
+					"RT-SLACK-14",
+					"RT-SLACK-26",
+					"RT-SLACK-27",
+					"RT-SLACK-28",
+					"RT-SLACK-29"
+				]
+			},
+			{
+				"contractRef": "brief:29 recovery order/watermark/thread/quarantine/single-flight",
+				"status": "covered",
+				"caseIds": ["RT-SLACK-15", "RT-SLACK-16", "RT-SLACK-17", "RT-SLACK-18"]
+			},
+			{
+				"contractRef": "brief:32 compiled binary and real gateway e2e integration",
+				"status": "covered",
+				"caseIds": [
+					"RT-SLACK-20",
+					"RT-SLACK-21",
+					"RT-SLACK-22",
+					"RT-SLACK-24",
+					"RT-SLACK-26",
+					"RT-SLACK-27",
+					"RT-SLACK-28",
+					"RT-SLACK-29"
+				]
+			},
+			{
+				"contractRef": "Computer-use / GUI / web",
+				"status": "not_applicable",
+				"reason": "No such product surface belongs to this Slack adapter change."
+			}
+		],
+		"surfaceEvidence": [
+			{
+				"surface": "cli",
+				"invocation": "bun artifacts/slack-adapter-cli-probes.ts",
+				"verdict": "passed",
+				"artifactIds": ["artifacts/slack-adapter-cli-proof.json", "artifacts/slack-adapter-cli-replay.json"]
+			},
+			{
+				"surface": "api",
+				"invocation": "bun test packages/adapter-slack/test/redteam.test.ts packages/gateway/test/slack-adapter-redteam.e2e.test.ts --reporter=junit --reporter-outfile=artifacts/slack-adapter-redteam.junit.xml",
+				"verdict": "passed",
+				"detail": "All five real gateway socket cases passed.",
+				"artifactIds": ["artifacts/slack-adapter-redteam.junit.xml"]
+			},
+			{
+				"surface": "package",
+				"invocation": "bun test packages/adapter-slack/test/redteam.test.ts packages/gateway/test/slack-adapter-redteam.e2e.test.ts --reporter=junit --reporter-outfile=artifacts/slack-adapter-redteam.junit.xml",
+				"verdict": "failed",
+				"detail": "17 of 20 adapter tests passed; three demonstrated blockers.",
+				"artifactIds": ["artifacts/slack-adapter-redteam.junit.xml", "artifacts/slack-adapter-redteam-report.json"]
+			}
+		],
+		"adversarialCases": [
+			{
+				"id": "RT-SLACK-01",
+				"scenario": "throwing handlers ack first, retries dedupe, malformed frames survive and disconnect reconnects",
+				"expectedBehavior": "Ack before handler; handler failure does not poison later dispatch; retry dedupes; invalid/missing-id frames do not dispatch; disconnect creates second socket.",
+				"verdict": "failed",
+				"test": "packages/adapter-slack/test/redteam.test.ts:63"
+			},
+			{
+				"id": "RT-SLACK-02",
+				"scenario": "hostile timestamps never emit non-platform message ids",
+				"expectedBehavior": "All six hostile timestamps drop before chat.send; subsequent valid message has a protocol-safe id.",
+				"verdict": "failed",
+				"test": "packages/adapter-slack/test/redteam.test.ts:76"
+			},
+			{
+				"id": "RT-SLACK-03",
+				"scenario": "foreign reply target is a definitive delivery failure, never thread_ts",
+				"expectedBehavior": "Foreign-channel reply target must fail definitively before postMessage, per brief line 11; it must never become thread_ts.",
+				"verdict": "failed",
+				"test": "packages/adapter-slack/test/redteam.test.ts:84"
+			},
+			{
+				"id": "RT-SLACK-04",
+				"scenario": "literal mentions in code count; entities decode once and broadcasts normalize",
+				"expectedBehavior": "Brief literal text-contains rule includes code-span mentions; normalize broadcasts and subteam labels; decode entities exactly once.",
+				"verdict": "failed",
+				"test": "packages/adapter-slack/test/redteam.test.ts:93"
+			},
+			{
+				"id": "RT-SLACK-05",
+				"scenario": "fifty-thousand-character fenced text has bounded balanced chunks",
+				"expectedBehavior": "50k fenced message produces pieces <=4000 characters with balanced fences.",
+				"verdict": "failed",
+				"test": "packages/adapter-slack/test/redteam.test.ts:98"
+			},
+			{
+				"id": "RT-SLACK-06",
+				"scenario": "file-only body survives and empty body drops",
+				"expectedBehavior": "File-only message renders attachment body; message without files or text drops.",
+				"verdict": "failed",
+				"test": "packages/adapter-slack/test/redteam.test.ts:104"
+			},
+			{
+				"id": "RT-SLACK-07",
+				"scenario": "own, hidden, every skipped subtype, unchanged/empty edits and app_mention never send",
+				"expectedBehavior": "Own user, own bot_id, hidden, all SKIPPED_SUBTYPES, unchanged/empty edits and app_mention cause no gateway requests.",
+				"verdict": "failed",
+				"test": "packages/adapter-slack/test/redteam.test.ts:109"
+			},
+			{
+				"id": "RT-SLACK-08",
+				"scenario": "bot parent mentions; unknown parent omits fromSelf",
+				"expectedBehavior": "Bot-authored parent sets mentioned; missing parent_user_id leaves fromSelf absent.",
+				"verdict": "failed",
+				"test": "packages/adapter-slack/test/redteam.test.ts:115"
+			},
+			{
+				"id": "RT-SLACK-09",
+				"scenario": "transport failure ambiguous, Slack API failure definitive",
+				"expectedBehavior": "TypeError produces ambiguous:true, SlackApiError ambiguous:false.",
+				"verdict": "failed",
+				"test": "packages/adapter-slack/test/redteam.test.ts:120"
+			},
+			{
+				"id": "RT-SLACK-10",
+				"scenario": "all three chunks keep thread and duplicate warning",
+				"expectedBehavior": "Three-chunk thread reply keeps thread_ts on every chunk, prefixes duplicate warning, confirms once.",
+				"verdict": "failed",
+				"test": "packages/adapter-slack/test/redteam.test.ts:127"
+			},
+			{
+				"id": "RT-SLACK-11",
+				"scenario": "malformed and unknown reactions fail without API; already_reacted confirms",
+				"expectedBehavior": "Malformed target and unknown emojiName fail definitively without reaction API calls. Already-reacted coverage independently verified by RT-SLACK-25.",
+				"verdict": "failed",
+				"test": "packages/adapter-slack/test/redteam.test.ts:132"
+			},
+			{
+				"id": "RT-SLACK-12",
+				"scenario": "disconnected edit overflow retains newest 256 and replays ordered",
+				"expectedBehavior": "300 disconnected edits retain newest 256, log 44 evictions, and replay in order on adoptClient.",
+				"verdict": "failed",
+				"test": "packages/adapter-slack/test/redteam.test.ts:140"
+			},
+			{
+				"id": "RT-SLACK-13",
+				"scenario": "failed edit remains queued and reconnects for replay",
+				"expectedBehavior": "Failed chat.edit remains pending and schedules reconnect; adopted healthy client replays it.",
+				"verdict": "failed",
+				"test": "packages/adapter-slack/test/redteam.test.ts:149"
+			},
+			{
+				"id": "RT-SLACK-14",
+				"scenario": "duplicate inbound dedupes but unavailable is forgotten",
+				"expectedBehavior": "Successful message id is not resent; unavailable message is forgotten and retried successfully.",
+				"verdict": "failed",
+				"test": "packages/adapter-slack/test/redteam.test.ts:155"
+			},
+			{
+				"id": "RT-SLACK-15",
+				"scenario": "newest-first recovery delivers ascending and cannot cross unavailable",
+				"expectedBehavior": "Newest-first paginated history delivers ascending; watermark stops before unavailable message.",
+				"verdict": "failed",
+				"test": "packages/adapter-slack/test/redteam.test.ts:161"
+			},
+			{
+				"id": "RT-SLACK-16",
+				"scenario": "recovered replies retain thread origin",
+				"expectedBehavior": "Recovered thread reply has thread origin and correct parent/channel id.",
+				"verdict": "failed",
+				"test": "packages/adapter-slack/test/redteam.test.ts:166"
+			},
+			{
+				"id": "RT-SLACK-17",
+				"scenario": "three-strike quarantine is re-probed after gateway reconnect",
+				"expectedBehavior": "Third permanent failure quarantines; later gateway reconnection/pass must re-probe restored access and clear quarantine.",
+				"verdict": "failed",
+				"test": "packages/adapter-slack/test/redteam.test.ts:170"
+			},
+			{
+				"id": "RT-SLACK-18",
+				"scenario": "twenty recovery triggers remain single flight",
+				"expectedBehavior": "Twenty concurrent triggers run one pass at a time and coalesce to one follow-up.",
+				"verdict": "passed",
+				"test": "packages/adapter-slack/test/redteam.test.ts:177"
+			},
+			{
+				"id": "RT-SLACK-19",
+				"scenario": "credential prefixes fail without secrets, relative files resolve and unknown channel keys reject",
+				"expectedBehavior": "Both incorrect token prefixes rejected without secret echo; relative token paths resolve from config; unknown channel key rejected.",
+				"verdict": "passed",
+				"test": "packages/adapter-slack/test/redteam.test.ts:183"
+			},
+			{
+				"id": "RT-SLACK-20",
+				"scenario": "unconfigured unmentioned Slack channel is context only",
+				"expectedBehavior": "Unconfigured unmentioned channel records no persona turn or delivery.",
+				"verdict": "passed",
+				"test": "packages/gateway/test/slack-adapter-redteam.e2e.test.ts:31"
+			},
+			{
+				"id": "RT-SLACK-21",
+				"scenario": "mention-open engages and persona markup is escaped at Slack boundary",
+				"expectedBehavior": "Namespaced mention-open policy engages and literal persona <script>& is escaped at Slack postMessage.",
+				"verdict": "passed",
+				"test": "packages/gateway/test/slack-adapter-redteam.e2e.test.ts:35"
+			},
+			{
+				"id": "RT-SLACK-22",
+				"scenario": "check reaction token delivers on Slack and is refused on Telegram",
+				"expectedBehavior": "Persona check token maps to white_check_mark and confirmed Slack delivery; Telegram produces no reaction and explicit chat.react refuses it.",
+				"verdict": "passed",
+				"test": "packages/gateway/test/slack-adapter-redteam.e2e.test.ts:39"
+			},
+			{
+				"id": "RT-SLACK-23",
+				"scenario": "monitor and loopback cannot chat.react",
+				"expectedBehavior": "Monitor and loopback chat.react requests fail and leave no delivery rows.",
+				"verdict": "passed",
+				"test": "packages/gateway/test/slack-adapter-redteam.e2e.test.ts:47"
+			},
+			{
+				"id": "RT-SLACK-24",
+				"scenario": "thread and channel isolate sessions and route replies",
+				"expectedBehavior": "Thread and channel have distinct session origin records and correctly routed confirmed replies.",
+				"verdict": "passed",
+				"test": "packages/gateway/test/slack-adapter-redteam.e2e.test.ts:51"
+			},
+			{
+				"id": "RT-SLACK-25",
+				"scenario": "already_reacted Web API response confirms delivery",
+				"expectedBehavior": "Actual SlackWebApi already_reacted response is treated as success and delivery.confirm is emitted.",
+				"verdict": "passed",
+				"test": "packages/adapter-slack/test/redteam.test.ts:191"
+			},
+			{
+				"id": "RT-SLACK-26",
+				"scenario": "dist/gajaeway-slack --help",
+				"expectedBehavior": "Real binary --help exits 0 and prints usage without booting.",
+				"verdict": "passed",
+				"test": "artifacts/slack-adapter-cli-probes.ts:8",
+				"artifact": "artifacts/slack-adapter-cli-proof.json"
+			},
+			{
+				"id": "RT-SLACK-27",
+				"scenario": "dist/gajaeway-slack --version",
+				"expectedBehavior": "Real binary --version exits 0 and prints semver.",
+				"verdict": "passed",
+				"test": "artifacts/slack-adapter-cli-probes.ts:8",
+				"artifact": "artifacts/slack-adapter-cli-proof.json"
+			},
+			{
+				"id": "RT-SLACK-28",
+				"scenario": "dist/gajaeway-slack --nope",
+				"expectedBehavior": "Real binary unknown argument exits 2 and prints usage to stderr.",
+				"verdict": "passed",
+				"test": "artifacts/slack-adapter-cli-probes.ts:8",
+				"artifact": "artifacts/slack-adapter-cli-proof.json"
+			},
+			{
+				"id": "RT-SLACK-29",
+				"scenario": "dist/gajaeway-slack",
+				"expectedBehavior": "Real binary refuses second instance with live pidfile, exits 2, does not overwrite pidfile.",
+				"verdict": "passed",
+				"test": "artifacts/slack-adapter-cli-probes.ts:8",
+				"artifact": "artifacts/slack-adapter-cli-proof.json"
+			}
+		],
+		"blockers": [
+			{
+				"caseId": "RT-SLACK-03",
+				"contractRef": "/tmp/gajaeway-slack-brief.md:11",
+				"observed": "Foreign C2:1.0 reply target posts a top-level C1 reply and confirms instead of definitive failure.",
+				"source": "packages/adapter-slack/src/main.ts:replyThreadTs/settleSlackDelivery"
+			},
+			{
+				"caseId": "RT-SLACK-11",
+				"contractRef": "User minimum adversarial case 5; definitive invalid reaction settlement",
+				"observed": "Unknown emojiName throws generic Error, classified ambiguous:true; no API was called, so delivery failure should be definitive.",
+				"source": "packages/adapter-slack/src/reactions.ts:slackReactionFor; packages/adapter-slack/src/main.ts:settleSlackReaction"
+			},
+			{
+				"caseId": "RT-SLACK-17",
+				"contractRef": "User minimum adversarial case 7; recoverMissedMessages reconnect re-probe promise",
+				"observed": "After three missing_scope failures, subsequent pass and gateway reconnect never call history again (3 calls, expected 4). failures>=3 skip occurs before clean-pass clearing; no callback resets counters. Quarantine persists indefinitely, including across restarts via cursor file.",
+				"source": "packages/adapter-slack/src/main.ts:recoverMissedMessages/gateway.onConnected"
+			}
+		],
+		"artifactRefs": [
+			"artifacts/slack-adapter-cli-replay.json",
+			"artifacts/slack-adapter-cli-proof.json",
+			"artifacts/slack-adapter-redteam.junit.xml",
+			"artifacts/slack-adapter-redteam-report.json"
+		],
+		"limitations": [
+			"Parent rebased the branch mid-QA. Original frozen hash run: 24 cases, 21 passed, same three defects. Latest JUnit: 25 cases, 22 passed, same three defects after adapting only new gateway fixture to upstream attachTestBrokerOwnership. Intermediate fixture-drift failures are not attributed to the frozen hash.",
+			"Coverage rows enumerate obligations exercised, not all brief obligations: working-status, slash-command authorization, cache eviction and service/doc integration were outside this new minimum red-team suite.",
+			"RT-SLACK-17 disables automatic recovery scheduling for deterministic manual passes; source inspection establishes onConnected only triggers scheduler and never resets quarantine.",
+			"Gateway teardown emits invalid socket write count: -32 warnings; these are retained, not suppressed."
+		]
+	}
+}

@@ -1,6 +1,6 @@
 import { expect, spyOn, test } from "bun:test";
 import type { ChatMessagePayload, EngagementContext, OriginRef } from "@gajaeway/protocol";
-import { SlackApiError, SlackWebApi } from "../src/api";
+import { SlackApiError, type SlackHistoryPage, SlackWebApi } from "../src/api";
 import {
 	addressedTurn,
 	decideInbound,
@@ -114,7 +114,7 @@ class Api extends SlackWebApi {
 		if (!messages) throw new SlackApiError(200, "channel_not_found");
 		return { messages, has_more: false };
 	}
-	override async conversationsReplies() {
+	override async conversationsReplies(_channel: string, _ts: string): Promise<SlackHistoryPage> {
 		return { messages: [], has_more: false };
 	}
 	override async respond(url: string, payload: Record<string, unknown>) {
@@ -135,7 +135,7 @@ async function fixture(
 ) {
 	const api = new Api();
 	const gateway = new Gateway();
-	const recoveryCursorPath = `/tmp/slack-recovery-${crypto.randomUUID()}.json`;
+	const recoveryCursorPath = `/tmp/slack-recovery-${crypto.randomUUID()}/adapters/slack/recovery-cursor.json`;
 	const adapter = await startSlackAdapter(
 		{
 			botToken: "xoxb-test",
@@ -483,10 +483,31 @@ test("Slack threaded delivery keeps every chunk in the thread; explicit same-cha
 		expect(api.posts.map((p) => p[2])).toEqual(["1.000", "1.000", "1.000"]);
 		expect(api.posts.map((p) => p[1]).join("")).toBe("a".repeat(8001));
 	}
+	// A reply target the adapter cannot honour is a definitive failure with no
+	// post at all: answering at the top level would confirm a reply nobody saw.
+	for (const replyToMessageId of ["C2:1.000", "bad", "C1:", ":1.0"]) {
+		const api = new Api();
+		const gateway = new Gateway();
+		await settleSlackDelivery(gateway, api, delivery({ replyToMessageId }));
+		expect(api.posts).toEqual([]);
+		expect(gateway.requests).toEqual([
+			{
+				verb: "delivery.fail",
+				params: { deliveryId: "delivery", reason: expect.stringMatching(/malformed|foreign/), ambiguous: false },
+			},
+		]);
+		expect(() => replyThreadTs(delivery({ replyToMessageId }))).toThrow(SlackApiError);
+	}
+	// A thread origin whose id is not channel:ts is refused the same way.
 	const api = new Api();
-	await settleSlackDelivery(new Gateway(), api, delivery({ replyToMessageId: "C2:1.000" }));
-	expect(api.posts).toEqual([["C1", "hello", undefined]]);
-	expect(replyThreadTs(delivery({ replyToMessageId: "bad" }))).toBeUndefined();
+	const gateway = new Gateway();
+	await settleSlackDelivery(
+		gateway,
+		api,
+		delivery({ origin: { platform: "slack", kind: "thread", conversationId: "garbage", parentId: "C1" } }),
+	);
+	expect(api.posts).toEqual([]);
+	expect(gateway.requests[0]?.verb).toBe("delivery.fail");
 });
 
 for (const error of [new TypeError("Slack network lost"), new SlackApiError(403, "not_allowed")])
@@ -666,7 +687,9 @@ for (const command of ["/new", "/reset", "/restart", "/unknown"])
 							command === "/unknown"
 								? "unknown command"
 								: engaged
-									? "🦞 session reset"
+									? command === "/restart"
+										? "🦞 restarting the gateway"
+										: "🦞 session reset"
 									: "not authorized for session commands here",
 					},
 				]);
@@ -716,6 +739,8 @@ test("Slack startup awaits Socket Mode start and slow name lookup cannot reorder
 		},
 		{
 			api,
+			// Never the ambient $GAJAEWAY_HOME store: this process may be a real host.
+			recoveryCursorPath: `/tmp/slack-recovery-${crypto.randomUUID()}.json`,
 			log: { log() {}, error() {} },
 			socketFactory: () => {
 				const socket = new Socket();
@@ -745,6 +770,7 @@ test("Slack startup awaits Socket Mode start and slow name lookup cannot reorder
 		expect(client.requests.map((r) => (r.params as { text: string }).text)).toEqual(["parallel", "hello", "second"]);
 	} finally {
 		adapter.socket.stop();
+		adapter.recovery.stop();
 	}
 });
 
@@ -827,6 +853,251 @@ test("Slack recovery revisits DMs seen live and a reconnect triggers a pass", as
 		await flush();
 		expect(f.api.historyCalls.filter((channel) => channel === "D1").length).toBeGreaterThanOrEqual(2);
 		expect(f.client.requests.filter((request) => request.verb === "chat.send")).toHaveLength(0);
+	} finally {
+		f.socket.stop();
+		f.recovery.stop();
+	}
+});
+
+test("Slack recovery joins a still-pending live send instead of calling it a duplicate", async () => {
+	// ARCH-02: the id must not be marked seen until the gateway acknowledges it.
+	const f = await fixture({ C1: { engagement: "open" } }, { autoRecover: false });
+	try {
+		let release!: (error?: Error) => void;
+		const held = new Promise<void>((resolve, reject) => {
+			release = (error) => (error ? reject(error) : resolve());
+		});
+		const request = f.client.request.bind(f.client);
+		f.client.request = async <T>(verb: string, params?: unknown): Promise<T> => {
+			if (verb === "chat.send") await held;
+			return request<T>(verb, params);
+		};
+		const live = f.gateway.requestInbound("C1:1700000040.000001", origin, "live", engagement);
+		const recovered = f.gateway.requestRecovered("C1:1700000040.000001", origin, "live", engagement);
+		await flush();
+		// The live send fails before acceptance: recovery must see "unavailable", never "duplicate".
+		release(new Error("gateway connection closed"));
+		expect(await live).toBeUndefined();
+		expect((await recovered).verdict).toBe("unavailable");
+		// Now it is retried and acknowledged; a later join reports duplicate. The failed
+		// send detached the link (as a real closed socket would), so it reconnects first.
+		f.client.request = request;
+		f.client.failure = undefined;
+		f.gateway.adoptClient(f.client);
+		expect((await f.gateway.requestRecovered("C1:1700000040.000001", origin, "live", engagement)).verdict).toBe(
+			"acked",
+		);
+		expect((await f.gateway.requestRecovered("C1:1700000040.000001", origin, "live", engagement)).verdict).toBe(
+			"duplicate",
+		);
+	} finally {
+		f.socket.stop();
+		f.recovery.stop();
+	}
+});
+
+test("Slack recovery revisits a thread the persona joined after its parent fell behind the watermark", async () => {
+	// ARCH-03: history only lists parents; replies to an old parent are found per thread.
+	const f = await fixture({ C1: { engagement: "open" } }, { autoRecover: false });
+	try {
+		const replies: Record<string, Record<string, unknown>[]> = {};
+		f.api.conversationsReplies = async (channel: string, ts: string) => ({
+			messages: replies[`${channel}:${ts}`] ?? [],
+			has_more: false,
+		});
+		// The persona is engaged in a thread rooted at 1.0 (live traffic).
+		await f.event({ ...inbound({ ts: "1700000010.000001", thread_ts: "1700000001.000000", text: "in thread" }) });
+		f.api.history.C1 = [{ type: "message", user: "U1", ts: "1700000050.000001", text: "unrelated newer" }];
+		expect(await f.recoverMissedMessages()).toBe(true);
+		let cursors = await loadRecoveryCursors(f.recoveryCursorPath);
+		expect(cursors.recoveredThrough.C1).toBe("1700000050.000001");
+		expect(Object.keys(cursors.participatedThreads)).toEqual(["C1:1700000001.000000"]);
+		// A reply lands in that old thread while the adapter is down; history shows no parent.
+		replies["C1:1700000001.000000"] = [
+			{ type: "message", user: "U1", ts: "1700000001.000000", text: "root" },
+			{ type: "message", user: "U1", ts: "1700000060.000001", text: "late reply" },
+		];
+		f.api.history.C1 = [];
+		f.client.requests.length = 0;
+		expect(await f.recoverMissedMessages()).toBe(true);
+		const sent = f.client.requests.filter((request) => request.verb === "chat.send");
+		expect(sent).toHaveLength(1);
+		expect((sent[0]?.params as { origin: OriginRef; text: string }).text).toBe("late reply");
+		expect((sent[0]?.params as { origin: OriginRef }).origin).toEqual({
+			platform: "slack",
+			kind: "thread",
+			conversationId: "C1:1700000001.000000",
+			parentId: "C1",
+		});
+		cursors = await loadRecoveryCursors(f.recoveryCursorPath);
+		expect(cursors.participatedThreads["C1:1700000001.000000"]?.through).toBe("1700000060.000001");
+	} finally {
+		f.socket.stop();
+		f.recovery.stop();
+	}
+});
+
+test("Slack recovery drains an oversized gap across passes and only then moves the watermark", async () => {
+	// ARCH-04: a truncated newest-first window resumes below what it delivered.
+	const f = await fixture({ C1: { engagement: "open" } }, { autoRecover: false });
+	try {
+		const all = Array.from({ length: 6 }, (_, index) => ({
+			type: "message",
+			user: "U1",
+			ts: `17000000${10 + index}.000001`,
+			text: `m${index}`,
+		})).reverse(); // newest first, as Slack returns them
+		f.api.conversationsHistory = async (
+			_channel: string,
+			options: { oldest?: string; latest?: string; cursor?: string; limit?: number } = {},
+		) => {
+			const window = all.filter(
+				(message) =>
+					Number(message.ts) > Number(options.oldest ?? 0) &&
+					(!options.latest || Number(message.ts) < Number(options.latest)),
+			);
+			const page = options.cursor === "p2" ? window.slice(2, 4) : window.slice(0, 2);
+			const hasMore = options.cursor === "p2" ? window.length > 4 : window.length > 2;
+			return {
+				messages: page,
+				has_more: hasMore,
+				...(hasMore ? { next_cursor: options.cursor === "p2" ? "p3" : "p2" } : {}),
+			};
+		};
+		const texts = () =>
+			f.client.requests.filter((r) => r.verb === "chat.send").map((r) => (r.params as { text: string }).text);
+		// Pass 1: two pages of two, truncated; delivers the newest four, no watermark yet.
+		expect(await f.recoverMissedMessages()).toBe(false);
+		expect(texts()).toEqual(["m2", "m3", "m4", "m5"]);
+		let cursors = await loadRecoveryCursors(f.recoveryCursorPath);
+		expect(cursors.recoveredThrough.C1).toBeUndefined();
+		expect(cursors.continuation.C1).toEqual({ olderThan: "1700000012.000001", through: "1700000015.000001" });
+		// Pass 2 resumes below m2 and closes the gap: watermark becomes the newest of the whole gap.
+		expect(await f.recoverMissedMessages()).toBe(true);
+		expect(texts()).toEqual(["m2", "m3", "m4", "m5", "m0", "m1"]);
+		cursors = await loadRecoveryCursors(f.recoveryCursorPath);
+		expect(cursors.continuation.C1).toBeUndefined();
+		expect(cursors.recoveredThrough.C1).toBe("1700000015.000001");
+	} finally {
+		f.socket.stop();
+		f.recovery.stop();
+	}
+});
+
+test("Slack recovery dead-letters a payload the gateway keeps refusing but never a link outage", async () => {
+	// ARCH-12: only terminal, payload-specific refusals burn the budget.
+	const f = await fixture({ C1: { engagement: "open" } }, { autoRecover: false });
+	try {
+		f.api.history.C1 = [{ type: "message", user: "U1", ts: "1700000040.000001", text: "poison" }];
+		const refused = Object.assign(new Error("chat.send requires non-empty text"), { code: "invalid_params" });
+		// Every failed send detaches the link as a real closed socket would; each pass
+		// therefore starts by re-adopting the client, like a reconnect.
+		const pass = async (failure?: Error) => {
+			f.client.failure = failure;
+			f.gateway.adoptClient(f.client);
+			return f.recoverMissedMessages();
+		};
+		expect(await pass(refused)).toBe(false);
+		expect(await pass(refused)).toBe(false);
+		let cursors = await loadRecoveryCursors(f.recoveryCursorPath);
+		expect(cursors.attempts["C1:1700000040.000001"]?.attempts).toBe(2);
+		expect(cursors.recoveredThrough.C1).toBeUndefined();
+		// An outage in between does not count against the message.
+		expect(await pass(new Error("gateway connection closed"))).toBe(false);
+		cursors = await loadRecoveryCursors(f.recoveryCursorPath);
+		expect(cursors.attempts["C1:1700000040.000001"]?.attempts).toBe(2);
+		// Third terminal refusal: dead-lettered, digest recorded, channel moves on.
+		expect(await pass(refused)).toBe(true);
+		cursors = await loadRecoveryCursors(f.recoveryCursorPath);
+		expect(cursors.deadLetters).toHaveLength(1);
+		expect(cursors.deadLetters[0]).toMatchObject({
+			messageId: "C1:1700000040.000001",
+			classification: "terminal-message",
+			attempts: 3,
+		});
+		expect(cursors.deadLetterDigest.C1?.count).toBe(1);
+		expect(cursors.attempts["C1:1700000040.000001"]).toBeUndefined();
+		expect(cursors.recoveredThrough.C1).toBe("1700000040.000001");
+	} finally {
+		f.socket.stop();
+		f.recovery.stop();
+	}
+});
+
+test("Slack recovery keeps retrying until its cursor state is actually on disk", async () => {
+	// ARCH-14: in-memory progress that failed to persist is not completion.
+	const f = await fixture({ C1: { engagement: "open" } }, { autoRecover: false });
+	try {
+		f.api.history.C1 = [{ type: "message", user: "U1", ts: "1700000040.000001", text: "first" }];
+		const path = f.recoveryCursorPath;
+		// Make the store unwritable by putting a FILE where its directory must go.
+		const { mkdir, rm, writeFile } = await import("node:fs/promises");
+		const { dirname } = await import("node:path");
+		const storeDir = dirname(path);
+		expect(storeDir.startsWith("/tmp/slack-recovery-")).toBe(true);
+		await mkdir(dirname(storeDir), { recursive: true });
+		await writeFile(storeDir, "not a directory");
+		expect(await f.recoverMissedMessages()).toBe(false);
+		await rm(storeDir, { force: true });
+		await mkdir(storeDir, { recursive: true });
+		expect(await f.recoverMissedMessages()).toBe(true);
+		expect((await loadRecoveryCursors(path)).recoveredThrough.C1).toBe("1700000040.000001");
+	} finally {
+		f.socket.stop();
+		f.recovery.stop();
+	}
+});
+
+test("Slack first-contact DMs arriving together are all remembered for recovery", async () => {
+	// ARCH-06: concurrent first loads must not overwrite each other's registration.
+	const f = await fixture(undefined, { autoRecover: false });
+	try {
+		await Promise.all([
+			f.handleEvent({ type: "message", channel: "D1", channel_type: "im", user: "U1", ts: "1700000000.1", text: "a" }),
+			f.handleEvent({ type: "message", channel: "D2", channel_type: "im", user: "U2", ts: "1700000000.2", text: "b" }),
+			f.handleEvent({ type: "message", channel: "D3", channel_type: "im", user: "U3", ts: "1700000000.3", text: "c" }),
+		]);
+		await f.ingress.drain();
+		await flush();
+		await f.recoverMissedMessages();
+		expect(Object.keys((await loadRecoveryCursors(f.recoveryCursorPath)).knownDms).sort()).toEqual(["D1", "D2", "D3"]);
+	} finally {
+		f.socket.stop();
+		f.recovery.stop();
+	}
+});
+
+test("Slack drains queued edits before a reconnect starts recovery", async () => {
+	// ARCH-15: a backfilled message must not overtake an edit made before the outage.
+	const f = await fixture({ C1: { engagement: "open" } }, { autoRecover: false });
+	try {
+		f.api.history.C1 = [{ type: "message", user: "U1", ts: "1700000040.000001", text: "recovered" }];
+		const disconnected = new Gateway();
+		disconnected.failure = new Error("gateway connection closed");
+		f.gateway.adoptClient(disconnected);
+		f.gateway.sendEdit("C1:1700000001.000001", origin, "edited while down", engagement);
+		await flush();
+		expect(f.gateway.pendingEdits).toHaveLength(1);
+		const order: string[] = [];
+		const client = new Gateway();
+		const request = client.request.bind(client);
+		client.request = async <T>(verb: string, params?: unknown): Promise<T> => {
+			order.push(`${verb}:${(params as { text?: string }).text ?? ""}`);
+			if (verb === "chat.edit") await flush();
+			return request<T>(verb, params);
+		};
+		f.gateway.onConnected = () => f.recovery.trigger();
+		f.gateway.adoptClient(client);
+		// The edit is slow on purpose; recovery may not start until it is acknowledged.
+		while (f.gateway.pendingEdits.length > 0) await flush();
+		expect(order).toEqual(["chat.edit:edited while down"]);
+		for (let i = 0; i < 20 && !order.includes("chat.send:recovered"); i++) {
+			await flush();
+			await f.recovery.idle();
+		}
+		expect(order).toContain("chat.send:recovered");
+		expect(order.indexOf("chat.edit:edited while down")).toBeGreaterThanOrEqual(0);
+		expect(order.indexOf("chat.edit:edited while down")).toBeLessThan(order.indexOf("chat.send:recovered"));
 	} finally {
 		f.socket.stop();
 		f.recovery.stop();

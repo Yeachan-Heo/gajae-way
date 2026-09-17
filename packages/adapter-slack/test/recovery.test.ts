@@ -6,6 +6,7 @@ import { SlackApiError, type SlackHistoryPage } from "../src/api";
 import type { SlackInboundMessage } from "../src/main";
 import { slackMessageOrigin } from "../src/origin";
 import {
+	EMPTY_RECOVERY_STATE,
 	loadRecoveryCursors,
 	pruneKnownDms,
 	RECOVERY_BOOTSTRAP_LOOKBACK_MS,
@@ -21,7 +22,7 @@ import {
 	tsIsAfter,
 } from "../src/recovery";
 
-const empty = (): RecoveryCursorState => ({ recoveredThrough: {}, knownDms: {}, quarantined: {}, deadLetters: [] });
+const empty = (): RecoveryCursorState => ({ ...EMPTY_RECOVERY_STATE });
 const page = (messages: readonly Record<string, unknown>[], next_cursor?: string): SlackHistoryPage => ({
 	messages,
 	has_more: !!next_cursor,
@@ -52,10 +53,41 @@ describe("Slack recovery state", () => {
 			expect(path).toBe(join(home, "adapters/slack/recovery-cursor.json"));
 			expect(await loadRecoveryCursors(path)).toEqual(empty());
 			const state: RecoveryCursorState = {
+				...EMPTY_RECOVERY_STATE,
 				recoveredThrough: { C1: "1700000000.123456" },
+				continuation: { C3: { olderThan: "1700000000.000001", through: "1700000009.000001" } },
 				knownDms: { D1: { lastSeenAt: new Date(base.nowMs).toISOString() } },
+				participatedThreads: { "C1:1.0": { lastSeenAt: new Date(base.nowMs).toISOString(), through: "1.5" } },
 				quarantined: { C2: { reason: "missing_scope", failures: 3, since: "2026-01-01" } },
-				deadLetters: [{ messageId: "C1:1.0", conversationId: "C1", reason: "Slack rejected", at: "2026-01-01" }],
+				attempts: {
+					"C1:2.0": {
+						conversationId: "C1",
+						attempts: 1,
+						classification: "terminal-message",
+						reason: "invalid_params",
+						lastAt: "2026-01-01",
+					},
+				},
+				deadLetters: [
+					{
+						messageId: "C1:1.0",
+						conversationId: "C1",
+						classification: "terminal-message",
+						attempts: 3,
+						reason: "Slack rejected",
+						at: "2026-01-01",
+					},
+				],
+				deadLetterDigest: {
+					C1: {
+						conversationId: "C1",
+						classification: "terminal-message",
+						count: 1,
+						firstAt: "2026-01-01",
+						lastAt: "2026-01-01",
+						lastReason: "Slack rejected",
+					},
+				},
 			};
 			await saveRecoveryCursors(path, state);
 			expect(await loadRecoveryCursors(path)).toEqual(state);

@@ -1,4 +1,5 @@
-import { mkdir, readFile, rm, writeFile } from "node:fs/promises";
+import { randomUUID } from "node:crypto";
+import { mkdir, readFile, rename, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 
 /**
@@ -58,21 +59,36 @@ export class AdapterLock {
 	static async acquire(home: string, ports: AdapterLockPorts = defaultLockPorts()): Promise<AdapterLock> {
 		const path = join(home, "adapter-discord.pid");
 		await mkdir(home, { recursive: true });
+		// Fast path: an exclusive create wins outright when no pidfile exists.
 		if (await claim(path, ports.pid)) return new AdapterLock(path, ports.pid);
 		const holder = await readHolder(path);
-		// An unreadable or unparseable pidfile is treated as stale rather than as
-		// a live holder: refusing forever on a truncated file would be worse than
-		// reclaiming a lock nobody holds.
+		// A crash or truncated pidfile must not require manual cleanup to restart.
 		if (holder !== undefined && holder !== ports.pid && ports.alive(holder)) {
 			throw new AdapterAlreadyRunningError(holder, path);
 		}
-		await rm(path, { force: true });
-		if (await claim(path, ports.pid)) return new AdapterLock(path, ports.pid);
-		// Lost the reclaim race: whoever took it between the rm and the claim owns it.
-		throw new AdapterAlreadyRunningError((await readHolder(path)) ?? 0, path);
+		// Reclaim atomically. `rm` + create is a window in which a second starter can
+		// remove OUR fresh claim after reading the same stale holder; renaming a
+		// fully written private file over the stale path leaves no such window, and
+		// reading the path back afterwards tells each contender whether it won.
+		const temporary = `${path}.${ports.pid}.${randomUUID()}.tmp`;
+		await writeFile(temporary, `${ports.pid}\n`, { flag: "wx", mode: 0o600 });
+		try {
+			// Somebody else may have reclaimed (or a live holder may have appeared)
+			// between the stale read and now: never replace a pid that is not the
+			// stale one we judged dead.
+			const current = await readHolder(path);
+			if (current !== holder && current !== undefined && current !== ports.pid && ports.alive(current)) {
+				throw new AdapterAlreadyRunningError(current, path);
+			}
+			await rename(temporary, path);
+		} finally {
+			await rm(temporary, { force: true });
+		}
+		const winner = await readHolder(path);
+		if (winner === ports.pid) return new AdapterLock(path, ports.pid);
+		throw new AdapterAlreadyRunningError(winner ?? 0, path);
 	}
 
-	/** Drops the lock, but never one this process does not still hold. */
 	async release(): Promise<void> {
 		if ((await readHolder(this.path)) !== this.pid) return;
 		await rm(this.path, { force: true });

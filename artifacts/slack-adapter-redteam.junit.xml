@@ -1,0 +1,38 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<testsuites name="bun test" tests="25" assertions="110" failures="3" skipped="0" time="1.798519">
+  <testsuite name="packages/adapter-slack/test/redteam.test.ts" file="packages/adapter-slack/test/redteam.test.ts" tests="20" assertions="90" failures="3" skipped="0" time="0.017834" hostname="MacBook-Pro-3.local">
+    <testcase name="RT-SLACK-01 throwing handlers ack first, retries dedupe, malformed frames survive and disconnect reconnects" classname="" time="0.000656" file="packages/adapter-slack/test/redteam.test.ts" line="63" assertions="5" />
+    <testcase name="RT-SLACK-02 hostile timestamps never emit non-platform message ids" classname="" time="0.001806" file="packages/adapter-slack/test/redteam.test.ts" line="76" assertions="2" />
+    <testcase name="RT-SLACK-03 foreign reply target is a definitive delivery failure, never thread_ts" classname="" time="0.000512" file="packages/adapter-slack/test/redteam.test.ts" line="84" assertions="3">
+      <failure type="AssertionError" message="expect(received).toEqual(expected)&#10;&#10;- []&#10;+ [&#10;+   [&#10;+     &quot;C1&quot;,&#10;+     &quot;reply&quot;,&#10;+     undefined,&#10;+   ],&#10;+ ]&#10;&#10;- Expected  - 1&#10;+ Received  + 7&#10;">AssertionError: expect(received).toEqual(expected)&#10;&#10;- []&#10;+ [&#10;+   [&#10;+     &quot;C1&quot;,&#10;+     &quot;reply&quot;,&#10;+     undefined,&#10;+   ],&#10;+ ]&#10;&#10;- Expected  - 1&#10;+ Received  + 7&#10;&#10;      at packages/adapter-slack/test/redteam.test.ts:89:20&#10;</failure>
+    </testcase>
+    <testcase name="RT-SLACK-04 literal mentions in code count; entities decode once and broadcasts normalize" classname="" time="0.000072" file="packages/adapter-slack/test/redteam.test.ts" line="93" assertions="2" />
+    <testcase name="RT-SLACK-05 fifty-thousand-character fenced text has bounded balanced chunks" classname="" time="0.000102" file="packages/adapter-slack/test/redteam.test.ts" line="98" assertions="29" />
+    <testcase name="RT-SLACK-06 file-only body survives and empty body drops" classname="" time="0.000374" file="packages/adapter-slack/test/redteam.test.ts" line="104" assertions="2" />
+    <testcase name="RT-SLACK-07 own, hidden, every skipped subtype, unchanged/empty edits and app_mention never send" classname="" time="0.000393" file="packages/adapter-slack/test/redteam.test.ts" line="109" assertions="1" />
+    <testcase name="RT-SLACK-08 bot parent mentions; unknown parent omits fromSelf" classname="" time="0.000327" file="packages/adapter-slack/test/redteam.test.ts" line="115" assertions="2" />
+    <testcase name="RT-SLACK-09 transport failure ambiguous, Slack API failure definitive" classname="" time="0.000175" file="packages/adapter-slack/test/redteam.test.ts" line="120" assertions="2" />
+    <testcase name="RT-SLACK-10 all three chunks keep thread and duplicate warning" classname="" time="0.000092" file="packages/adapter-slack/test/redteam.test.ts" line="127" assertions="6" />
+    <testcase name="RT-SLACK-11 malformed and unknown reactions fail without API; already_reacted confirms" classname="" time="0.000222" file="packages/adapter-slack/test/redteam.test.ts" line="132" assertions="4">
+      <failure type="AssertionError" message="expect(received).toMatchObject(expected)&#10;&#10;@@ -2,3 +2,5 @@&#10;    &quot;params&quot;: {&#10;-     &quot;ambiguous&quot;: false,&#10;+     &quot;ambiguous&quot;: true,&#10;+     &quot;deliveryId&quot;: &quot;delivery&quot;,&#10;+     &quot;reason&quot;: &quot;Slack has no reaction name for unknown&quot;,&#10;    },&#10;&#10;- Expected  - 1&#10;+ Received  + 3&#10;">AssertionError: expect(received).toMatchObject(expected)&#10;&#10;@@ -2,3 +2,5 @@&#10;    &quot;params&quot;: {&#10;-     &quot;ambiguous&quot;: false,&#10;+     &quot;ambiguous&quot;: true,&#10;+     &quot;deliveryId&quot;: &quot;delivery&quot;,&#10;+     &quot;reason&quot;: &quot;Slack has no reaction name for unknown&quot;,&#10;    },&#10;&#10;- Expected  - 1&#10;+ Received  + 3&#10;&#10;      at packages/adapter-slack/test/redteam.test.ts:134:209&#10;</failure>
+    </testcase>
+    <testcase name="RT-SLACK-12 disconnected edit overflow retains newest 256 and replays ordered" classname="" time="0.000457" file="packages/adapter-slack/test/redteam.test.ts" line="140" assertions="5" />
+    <testcase name="RT-SLACK-13 failed edit remains queued and reconnects for replay" classname="" time="0.000085" file="packages/adapter-slack/test/redteam.test.ts" line="149" assertions="4" />
+    <testcase name="RT-SLACK-14 duplicate inbound dedupes but unavailable is forgotten" classname="" time="0.000078" file="packages/adapter-slack/test/redteam.test.ts" line="155" assertions="6" />
+    <testcase name="RT-SLACK-15 newest-first recovery delivers ascending and cannot cross unavailable" classname="" time="0.000295" file="packages/adapter-slack/test/redteam.test.ts" line="161" assertions="3" />
+    <testcase name="RT-SLACK-16 recovered replies retain thread origin" classname="" time="0.000055" file="packages/adapter-slack/test/redteam.test.ts" line="166" assertions="1" />
+    <testcase name="RT-SLACK-17 three-strike quarantine is re-probed after gateway reconnect" classname="" time="0.003075" file="packages/adapter-slack/test/redteam.test.ts" line="170" assertions="2">
+      <failure type="AssertionError" message="expect(received).toBe(expected)&#10;&#10;Expected: 4&#10;Received: 3&#10;">AssertionError: expect(received).toBe(expected)&#10;&#10;Expected: 4&#10;Received: 3&#10;&#10;      at packages/adapter-slack/test/redteam.test.ts:174:29&#10;</failure>
+    </testcase>
+    <testcase name="RT-SLACK-18 twenty recovery triggers remain single flight" classname="" time="0.000148" file="packages/adapter-slack/test/redteam.test.ts" line="177" assertions="3" />
+    <testcase name="RT-SLACK-19 credential prefixes fail without secrets, relative files resolve and unknown channel keys reject" classname="" time="0.001246" file="packages/adapter-slack/test/redteam.test.ts" line="183" assertions="7" />
+    <testcase name="RT-SLACK-25 already_reacted Web API response confirms delivery" classname="" time="0.000162" file="packages/adapter-slack/test/redteam.test.ts" line="191" assertions="1" />
+  </testsuite>
+  <testsuite name="packages/gateway/test/slack-adapter-redteam.e2e.test.ts" file="packages/gateway/test/slack-adapter-redteam.e2e.test.ts" tests="5" assertions="20" failures="0" skipped="0" time="1.765221" hostname="MacBook-Pro-3.local">
+    <testcase name="RT-SLACK-20 unconfigured unmentioned Slack channel is context only" classname="" time="0.35621" file="packages/gateway/test/slack-adapter-redteam.e2e.test.ts" line="31" assertions="4" />
+    <testcase name="RT-SLACK-21 mention-open engages and persona markup is escaped at Slack boundary" classname="" time="0.348302" file="packages/gateway/test/slack-adapter-redteam.e2e.test.ts" line="35" assertions="4" />
+    <testcase name="RT-SLACK-22 check reaction token delivers on Slack and is refused on Telegram" classname="" time="0.684059" file="packages/gateway/test/slack-adapter-redteam.e2e.test.ts" line="39" assertions="5" />
+    <testcase name="RT-SLACK-23 monitor and loopback cannot chat.react" classname="" time="0.024901" file="packages/gateway/test/slack-adapter-redteam.e2e.test.ts" line="47" assertions="3" />
+    <testcase name="RT-SLACK-24 thread and channel isolate sessions and route replies" classname="" time="0.345078" file="packages/gateway/test/slack-adapter-redteam.e2e.test.ts" line="51" assertions="4" />
+  </testsuite>
+</testsuites>

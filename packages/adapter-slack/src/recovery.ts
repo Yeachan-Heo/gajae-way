@@ -14,20 +14,84 @@ export const RECOVERY_KNOWN_DM_TTL_MS = 30 * 24 * 60 * 60 * 1000;
 export const RECOVERY_UNREADABLE_QUARANTINE_ATTEMPTS = 3;
 export const RECOVERY_RETRY_BASE_MS = 1_000;
 export const RECOVERY_RETRY_MAX_MS = 60_000;
+/** Threads the persona took part in that recovery keeps revisiting after their parent fell behind the watermark. */
+export const RECOVERY_PARTICIPATED_THREAD_CAP = 200;
+export const RECOVERY_PARTICIPATED_THREAD_TTL_MS = 7 * 24 * 60 * 60 * 1000;
+/**
+ * How many times one message may fail with a payload-specific (terminal)
+ * classification before it is dead-lettered so the channel can move on. Only
+ * terminal failures count; a link outage never burns this budget.
+ */
+export const RECOVERY_MAX_ATTEMPTS = 3;
+export const RECOVERY_DEAD_LETTER_CAP = 50;
+export const RECOVERY_ATTEMPT_LEDGER_CAP = 200;
+
+/**
+ * How a failed recovery send is classified, mirroring the Discord adapter.
+ * `terminal-message` is the gateway refusing THIS payload (invalid_params,
+ * an oversize body); `retryable` is the link or the gateway being unavailable;
+ * `write-path-unknown` is everything else. Only terminal failures may ever
+ * consume a message's attempt budget.
+ */
+export type RecoveryFailureClass = "retryable" | "terminal-message" | "write-path-unknown";
+
+export interface RecoveryDeadLetter {
+	readonly messageId: string;
+	readonly conversationId: string;
+	readonly classification: RecoveryFailureClass;
+	readonly attempts: number;
+	readonly reason: string;
+	readonly at: string;
+}
+
+/** Per-conversation discard aggregate; never evicted, so a long-running problem stays visible. */
+export interface RecoveryDeadLetterDigest {
+	readonly conversationId: string;
+	readonly classification: RecoveryFailureClass;
+	readonly count: number;
+	readonly firstAt: string;
+	readonly lastAt: string;
+	readonly lastReason: string;
+}
+
+export interface RecoveryAttemptRecord {
+	readonly conversationId: string;
+	readonly attempts: number;
+	readonly classification: RecoveryFailureClass;
+	readonly reason: string;
+	readonly lastAt: string;
+}
 
 export interface RecoveryCursorState {
 	readonly recoveredThrough: Readonly<Record<string, string>>;
+	/**
+	 * A scan that hit its page bound could not deliver the whole gap. The oldest ts it
+	 * DID walk past is kept here so the next pass resumes below it instead of refetching
+	 * the same newest suffix forever; the durable watermark still only moves once the
+	 * gap is closed.
+	 */
+	readonly continuation: Readonly<Record<string, { readonly olderThan: string; readonly through: string }>>;
 	readonly knownDms: Readonly<Record<string, { readonly lastSeenAt: string }>>;
+	/** Thread roots (`channel:ts`) the persona replied in; revisited independently of the channel watermark. */
+	readonly participatedThreads: Readonly<Record<string, { readonly lastSeenAt: string; readonly through?: string }>>;
 	readonly quarantined: Readonly<
 		Record<string, { readonly reason: string; readonly failures: number; readonly since: string }>
 	>;
-	readonly deadLetters: readonly {
-		readonly messageId: string;
-		readonly conversationId: string;
-		readonly reason: string;
-		readonly at: string;
-	}[];
+	readonly attempts: Readonly<Record<string, RecoveryAttemptRecord>>;
+	readonly deadLetters: readonly RecoveryDeadLetter[];
+	readonly deadLetterDigest: Readonly<Record<string, RecoveryDeadLetterDigest>>;
 }
+
+export const EMPTY_RECOVERY_STATE: RecoveryCursorState = {
+	recoveredThrough: {},
+	continuation: {},
+	knownDms: {},
+	participatedThreads: {},
+	quarantined: {},
+	attempts: {},
+	deadLetters: [],
+	deadLetterDigest: {},
+};
 
 export function recoveryCursorPath(home: string = adapterHome()): string {
 	return join(home, "adapters", "slack", "recovery-cursor.json");
@@ -38,22 +102,50 @@ export async function loadRecoveryCursors(path: string): Promise<RecoveryCursorS
 	try {
 		text = await readFile(path, "utf8");
 	} catch (error) {
-		if ((error as { code?: string }).code === "ENOENT") {
-			return { recoveredThrough: {}, knownDms: {}, quarantined: {}, deadLetters: [] };
-		}
+		if ((error as { code?: string }).code === "ENOENT") return EMPTY_RECOVERY_STATE;
 		throw error;
 	}
 	try {
 		const state = JSON.parse(text);
 		const record = (value: unknown): value is Record<string, unknown> =>
 			typeof value === "object" && value !== null && !Array.isArray(value);
+		const isTs = (value: unknown): boolean => typeof value === "string" && /^\d+\.\d+$/.test(value);
+		const isClass = (value: unknown): boolean =>
+			value === "retryable" || value === "terminal-message" || value === "write-path-unknown";
 		if (
 			!record(state) ||
 			!record(state.recoveredThrough) ||
 			!record(state.knownDms) ||
 			!record(state.quarantined) ||
 			!Array.isArray(state.deadLetters) ||
-			!Object.values(state.recoveredThrough).every((ts) => typeof ts === "string" && /^\d+\.\d+$/.test(ts)) ||
+			(state.continuation !== undefined &&
+				(!record(state.continuation) ||
+					!Object.values(state.continuation).every(
+						(entry) => record(entry) && isTs(entry.olderThan) && isTs(entry.through),
+					))) ||
+			(state.participatedThreads !== undefined &&
+				(!record(state.participatedThreads) ||
+					!Object.values(state.participatedThreads).every(
+						(entry) =>
+							record(entry) &&
+							typeof entry.lastSeenAt === "string" &&
+							(entry.through === undefined || isTs(entry.through)),
+					))) ||
+			(state.attempts !== undefined &&
+				(!record(state.attempts) ||
+					!Object.values(state.attempts).every(
+						(entry) =>
+							record(entry) &&
+							typeof entry.conversationId === "string" &&
+							Number.isInteger(entry.attempts) &&
+							isClass(entry.classification),
+					))) ||
+			(state.deadLetterDigest !== undefined &&
+				(!record(state.deadLetterDigest) ||
+					!Object.values(state.deadLetterDigest).every(
+						(entry) => record(entry) && Number.isInteger(entry.count) && isClass(entry.classification),
+					))) ||
+			!Object.values(state.recoveredThrough).every(isTs) ||
 			!Object.values(state.knownDms).every(
 				(entry) =>
 					record(entry) && typeof entry.lastSeenAt === "string" && Number.isFinite(Date.parse(entry.lastSeenAt)),
@@ -74,7 +166,7 @@ export async function loadRecoveryCursors(path: string): Promise<RecoveryCursorS
 		) {
 			throw new Error("Invalid Slack recovery cursor state");
 		}
-		return state as unknown as RecoveryCursorState;
+		return { ...EMPTY_RECOVERY_STATE, ...(state as unknown as Partial<RecoveryCursorState>) } as RecoveryCursorState;
 	} catch (error) {
 		throw new Error(`Cannot load Slack recovery cursors at ${path}`, { cause: error });
 	}
@@ -120,6 +212,110 @@ export function rememberKnownDm(state: RecoveryCursorState, channel: string, now
 	);
 }
 
+export function pruneParticipatedThreads(state: RecoveryCursorState, nowMs: number): RecoveryCursorState {
+	const entries = Object.entries(state.participatedThreads)
+		.filter(([, entry]) => Date.parse(entry.lastSeenAt) > nowMs - RECOVERY_PARTICIPATED_THREAD_TTL_MS)
+		.sort((a, b) => Date.parse(b[1].lastSeenAt) - Date.parse(a[1].lastSeenAt))
+		.slice(0, RECOVERY_PARTICIPATED_THREAD_CAP);
+	return { ...state, participatedThreads: Object.fromEntries(entries) };
+}
+
+/**
+ * Records a thread the persona is part of. History only returns a thread's PARENT,
+ * and only while that parent is above the channel watermark; once the watermark
+ * moves past it, later replies in that thread would never be discovered from the
+ * channel scan alone. These roots are therefore revisited on their own.
+ */
+export function rememberParticipatedThread(
+	state: RecoveryCursorState,
+	threadKey: string,
+	nowMs: number,
+): RecoveryCursorState {
+	const prior = state.participatedThreads[threadKey];
+	return pruneParticipatedThreads(
+		{
+			...state,
+			participatedThreads: {
+				...state.participatedThreads,
+				[threadKey]: {
+					...(prior?.through ? { through: prior.through } : {}),
+					lastSeenAt: new Date(nowMs).toISOString(),
+				},
+			},
+		},
+		nowMs,
+	);
+}
+
+/** Records one failed recovery send; returns the updated state and whether the budget is spent. */
+export function recordAttempt(
+	state: RecoveryCursorState,
+	messageId: string,
+	conversationId: string,
+	classification: RecoveryFailureClass,
+	reason: string,
+	nowMs: number,
+): { readonly state: RecoveryCursorState; readonly exhausted: boolean } {
+	const prior = state.attempts[messageId];
+	// Only payload-specific failures burn the budget: a link outage is not this message's fault.
+	const attempts = (prior?.attempts ?? 0) + (classification === "terminal-message" ? 1 : 0);
+	const entries = Object.entries({
+		...state.attempts,
+		[messageId]: {
+			conversationId,
+			attempts,
+			classification,
+			reason: reason.slice(0, 200),
+			lastAt: new Date(nowMs).toISOString(),
+		},
+	})
+		.sort((a, b) => Date.parse(a[1].lastAt) - Date.parse(b[1].lastAt))
+		.slice(-RECOVERY_ATTEMPT_LEDGER_CAP);
+	return {
+		state: { ...state, attempts: Object.fromEntries(entries) },
+		exhausted: classification === "terminal-message" && attempts >= RECOVERY_MAX_ATTEMPTS,
+	};
+}
+
+export function clearAttempt(state: RecoveryCursorState, messageId: string): RecoveryCursorState {
+	if (!state.attempts[messageId]) return state;
+	const { [messageId]: _cleared, ...attempts } = state.attempts;
+	return { ...state, attempts };
+}
+
+/** Dead-letters a message: bounded log plus a per-conversation digest that is never evicted. */
+export function recordDeadLetter(state: RecoveryCursorState, entry: RecoveryDeadLetter): RecoveryCursorState {
+	const digest = state.deadLetterDigest[entry.conversationId];
+	return {
+		...clearAttempt(state, entry.messageId),
+		deadLetters: [...state.deadLetters, entry].slice(-RECOVERY_DEAD_LETTER_CAP),
+		deadLetterDigest: {
+			...state.deadLetterDigest,
+			[entry.conversationId]: {
+				conversationId: entry.conversationId,
+				classification: entry.classification,
+				count: (digest?.count ?? 0) + 1,
+				firstAt: digest?.firstAt ?? entry.at,
+				lastAt: entry.at,
+				lastReason: entry.reason,
+			},
+		},
+	};
+}
+
+/**
+ * Classifies a failed chat.send. The gateway's typed `invalid_params` (and any
+ * frame-size refusal) is about THIS payload; a closed link or a timeout says
+ * nothing about the message. Anything else is unknown and never discardable.
+ */
+export function classifyRecoveryFailure(error: unknown): RecoveryFailureClass {
+	const code = (error as { code?: unknown } | null | undefined)?.code;
+	if (code === "invalid_params" || code === "frame_too_large") return "terminal-message";
+	const message = error instanceof Error ? error.message : String(error);
+	if (/not connected|connection closed|timed out|client closed/i.test(message)) return "retryable";
+	return "write-path-unknown";
+}
+
 export function tsIsAfter(a: string, b: string): boolean {
 	const [as = "0", af = ""] = a.split(".");
 	const [bs = "0", bf = ""] = b.split(".");
@@ -134,9 +330,20 @@ export function tsFromTimestamp(ms: number): string {
 	return `${Math.floor(ms / 1000)}.000000`;
 }
 
-export type RecoveryDelivery = "acked" | "duplicate" | "unavailable" | "skip";
+/**
+ * - `acked`: the gateway just accepted the send; the only write-path proof.
+ * - `duplicate`: the gateway (or an earlier pass) already knew the id.
+ * - `skip`: nothing to send; the cursor walks past it.
+ * - `unavailable`: the send did not happen; the cursor stops here.
+ * - `discard`: the message burned its terminal-failure budget and was dead-lettered
+ *   by the caller; the cursor walks past it so one poison message cannot pin a channel.
+ */
+export type RecoveryDelivery = "acked" | "duplicate" | "unavailable" | "skip" | "discard";
 export interface RecoveryHistoryPort {
-	history(channel: string, options: { oldest: string; cursor?: string; limit: number }): Promise<SlackHistoryPage>;
+	history(
+		channel: string,
+		options: { oldest: string; latest?: string; cursor?: string; limit: number },
+	): Promise<SlackHistoryPage>;
 	replies(
 		channel: string,
 		threadTs: string,
@@ -145,6 +352,8 @@ export interface RecoveryHistoryPort {
 }
 export interface RecoveryOptions {
 	readonly cursor?: string;
+	/** Resume a truncated scan below this ts (exclusive) instead of from the newest page. */
+	readonly latest?: string;
 	readonly nowMs: number;
 	readonly pageLimit?: number;
 	readonly maxPages?: number;
@@ -153,9 +362,12 @@ export interface RecoveryOptions {
 }
 export interface RecoveryOutcome {
 	readonly advancedTo?: string;
+	/** On a truncated scan: the oldest ts walked past and the newest, so the caller can resume below/up to them. */
+	readonly continuation?: { readonly olderThan: string; readonly through: string };
 	readonly delivered: number;
 	readonly duplicates: number;
 	readonly skipped: number;
+	readonly discarded: number;
 	readonly truncated: boolean;
 	readonly failed: boolean;
 	readonly fetchError?: string;
@@ -177,11 +389,21 @@ export async function recoverConversation(
 	let delivered = 0;
 	let duplicates = 0;
 	let skipped = 0;
+	let discarded = 0;
+	// Slack pages newest-first, so a truncated window is the newest suffix of the gap.
+	// Its oldest fetched ts is where the next pass resumes (as `latest`), and its
+	// newest is what the watermark may finally become once the gap closes.
+	let oldestFetched: string | undefined;
+	let newestFetched: string | undefined;
 	const outcome = (failed: boolean): RecoveryOutcome => ({
 		advancedTo: truncated ? undefined : advancedTo,
+		...(truncated && oldestFetched && newestFetched && !failed
+			? { continuation: { olderThan: oldestFetched, through: options.latest ?? newestFetched } }
+			: {}),
 		delivered,
 		duplicates,
 		skipped,
+		discarded,
 		truncated,
 		failed,
 	});
@@ -196,6 +418,11 @@ export async function recoverConversation(
 			for (const raw of result.messages) {
 				if (typeof raw.ts !== "string" || !/^\d+\.\d+$/.test(raw.ts)) throw new SlackApiError(200, "invalid_response");
 				if (raw.ts === threadTs || !tsIsAfter(raw.ts, oldest)) continue;
+				if (!threadTs && options.latest && !tsIsAfter(options.latest, raw.ts)) continue;
+				if (!threadTs) {
+					if (!oldestFetched || tsIsAfter(oldestFetched, raw.ts)) oldestFetched = raw.ts;
+					if (!newestFetched || tsIsAfter(raw.ts, newestFetched)) newestFetched = raw.ts;
+				}
 				messages.set(raw.ts, { ...raw, channel, ...(threadTs ? { thread_ts: threadTs } : {}) } as SlackInboundMessage);
 			}
 			if (!result.has_more && !result.next_cursor) return;
@@ -208,7 +435,9 @@ export async function recoverConversation(
 		}
 	};
 	try {
-		await collect((cursor) => port.history(channel, { oldest, cursor, limit }));
+		await collect((cursor) =>
+			port.history(channel, { oldest, ...(options.latest ? { latest: options.latest } : {}), cursor, limit }),
+		);
 		for (const message of [...messages.values()]) {
 			const raw = message as SlackInboundMessage & { reply_count?: number };
 			if ((raw.reply_count ?? 0) > 0 || message.thread_ts === message.ts) {
@@ -237,6 +466,91 @@ export async function recoverConversation(
 		if (result === "unavailable") return outcome(true);
 		if (result === "acked") delivered++;
 		else if (result === "duplicate") duplicates++;
+		else if (result === "discard") discarded++;
+		else skipped++;
+		advancedTo = message.ts;
+	}
+	return outcome(false);
+}
+
+/**
+ * Walks ONE thread's replies newer than `cursor` (or the bootstrap window), in ts
+ * order, independently of the channel scan. Used for threads the persona took
+ * part in: `conversations.history` only lists thread parents, so once the channel
+ * watermark passes a parent, later replies underneath it are invisible to the
+ * channel scan and must be found here.
+ */
+export async function recoverThread(
+	port: Pick<RecoveryHistoryPort, "replies">,
+	channel: string,
+	threadTs: string,
+	options: Omit<RecoveryOptions, "latest">,
+): Promise<RecoveryOutcome> {
+	const oldest = options.cursor ?? tsFromTimestamp(options.nowMs - RECOVERY_BOOTSTRAP_LOOKBACK_MS);
+	const limit = Math.min(RECOVERY_PAGE_LIMIT, Math.max(1, Math.floor(options.pageLimit ?? RECOVERY_PAGE_LIMIT)));
+	const maxPages = Math.max(1, Math.floor(options.maxPages ?? RECOVERY_MAX_PAGES));
+	const messages = new Map<string, SlackInboundMessage>();
+	let truncated = false;
+	let advancedTo: string | undefined;
+	let delivered = 0;
+	let duplicates = 0;
+	let skipped = 0;
+	let discarded = 0;
+	const outcome = (failed: boolean): RecoveryOutcome => ({
+		// Replies page oldest-first, so a truncated walk has delivered a contiguous
+		// prefix and the cursor may safely advance to its end.
+		advancedTo,
+		delivered,
+		duplicates,
+		skipped,
+		discarded,
+		truncated,
+		failed,
+	});
+	try {
+		let cursor: string | undefined;
+		for (let page = 0; page < maxPages; page++) {
+			const result = await port.replies(channel, threadTs, { oldest, cursor, limit });
+			for (const raw of result.messages) {
+				if (typeof raw.ts !== "string" || !/^\d+\.\d+$/.test(raw.ts)) throw new SlackApiError(200, "invalid_response");
+				if (raw.ts === threadTs || !tsIsAfter(raw.ts, oldest)) continue;
+				messages.set(raw.ts, { ...raw, channel, thread_ts: threadTs } as SlackInboundMessage);
+			}
+			if (!result.has_more && !result.next_cursor) break;
+			if (!result.next_cursor || page + 1 === maxPages) {
+				truncated = true;
+				break;
+			}
+			cursor = result.next_cursor;
+		}
+	} catch (error) {
+		return {
+			...outcome(true),
+			fetchError: error instanceof SlackApiError ? error.code : String(error),
+			permanent:
+				error instanceof SlackApiError &&
+				[
+					"channel_not_found",
+					"not_in_channel",
+					"missing_scope",
+					"is_archived",
+					"invalid_auth",
+					"thread_not_found",
+				].includes(error.code),
+		};
+	}
+	const ordered = [...messages.values()].sort((a, b) => (tsIsAfter(a.ts, b.ts) ? 1 : tsIsAfter(b.ts, a.ts) ? -1 : 0));
+	for (const message of ordered) {
+		let result: RecoveryDelivery;
+		try {
+			result = message.user === options.botUserId ? "skip" : await options.deliver(message);
+		} catch {
+			return outcome(true);
+		}
+		if (result === "unavailable") return outcome(true);
+		if (result === "acked") delivered++;
+		else if (result === "duplicate") duplicates++;
+		else if (result === "discard") discarded++;
 		else skipped++;
 		advancedTo = message.ts;
 	}
@@ -261,6 +575,11 @@ export class RecoveryScheduler {
 
 	get retryPending(): boolean {
 		return this.waiting;
+	}
+
+	/** Test seam: resolves once no pass is running and no follow-up is queued. */
+	async idle(): Promise<void> {
+		while (this.running) await new Promise((resolve) => setTimeout(resolve, 1));
 	}
 
 	trigger(): void {
