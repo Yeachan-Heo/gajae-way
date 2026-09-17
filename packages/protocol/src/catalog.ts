@@ -65,6 +65,15 @@ export interface ReplyContext {
 export interface EngagementContext {
 	/** True when the agent account was explicitly mentioned/addressed. */
 	readonly mentioned: boolean;
+	/**
+	 * The message must be recorded but must never open a turn. Set by an adapter
+	 * that backfills a message it knows the room has already moved past - e.g. a
+	 * catch-up after an outage where the message is old and the persona has since
+	 * answered in that conversation. Without it, a recovery pass answers hours-old
+	 * messages as if they were new (live, 2026-09-17: a 16:21 mention re-answered
+	 * at 18:29 after a gateway restart). Overrides every other gate.
+	 */
+	readonly contextOnly?: boolean;
 	/** True when the origin is a group surface (channel/thread/topic), false for DMs. */
 	readonly group: boolean;
 	/** Platform-scoped author id of the inbound message. */

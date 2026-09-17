@@ -17,7 +17,9 @@ import {
 	recoverConversation,
 	recoveryCursorPath,
 	rememberKnownDm,
+	STALE_BACKFILL_MS,
 	saveRecoveryCursors,
+	staleBackfillIds,
 	tsFromTimestamp,
 	tsIsAfter,
 } from "../src/recovery";
@@ -44,6 +46,64 @@ function deferred<T>() {
 	});
 	return { promise, resolve };
 }
+
+describe("stale backfill", () => {
+	// nowMs = 2_000_000_000_000 ms → 2_000_000_000 s. Slack ts are seconds.
+	const now = base.nowMs;
+	const sec = (offsetS: number) => `${now / 1000 + offsetS}.000100`;
+	const old = -(STALE_BACKFILL_MS / 1000) - 60; // just past the window
+	const fresh = -60; // one minute ago
+
+	test("old + bot answered later in the same conversation → stale", () => {
+		const human = message(sec(old));
+		const bot = message(sec(old + 30), { user: "BOT" });
+		expect([...staleBackfillIds([human, bot] as never, "BOT", now)]).toEqual([human.ts]);
+	});
+
+	test("old but the bot never answered → not stale (it is still owed an answer)", () => {
+		const human = message(sec(old));
+		expect(staleBackfillIds([human] as never, "BOT", now).size).toBe(0);
+	});
+
+	test("recent → never stale, even with a later bot post", () => {
+		const human = message(sec(fresh));
+		const bot = message(sec(fresh + 10), { user: "BOT" });
+		expect(staleBackfillIds([human, bot] as never, "BOT", now).size).toBe(0);
+	});
+
+	test("conversation is the thread: a bot post in another thread does not make this one stale", () => {
+		const inA = message(sec(old), { thread_ts: "1.0" });
+		const botInB = message(sec(old + 30), { user: "BOT", thread_ts: "2.0" });
+		expect(staleBackfillIds([inA, botInB] as never, "BOT", now).size).toBe(0);
+		const botInA = message(sec(old + 30), { user: "BOT", thread_ts: "1.0" });
+		expect([...staleBackfillIds([inA, botInA] as never, "BOT", now)]).toEqual([inA.ts]);
+	});
+
+	test("a bot post BEFORE the message is not evidence it was answered", () => {
+		const bot = message(sec(old - 30), { user: "BOT" });
+		const human = message(sec(old));
+		expect(staleBackfillIds([bot, human] as never, "BOT", now).size).toBe(0);
+	});
+
+	test("recoverConversation passes the stale verdict to deliver", async () => {
+		const human = message(sec(old));
+		const bot = message(sec(old + 30), { user: "BOT" });
+		const late = message(sec(fresh));
+		const seen: [string, boolean][] = [];
+		await recoverConversation(portFor([late, bot, human]), "C1", {
+			...base,
+			deliver: async (msg, stale) => {
+				seen.push([msg.ts, stale]);
+				return "acked";
+			},
+		});
+		// ts order; the bot's own row is skipped, not delivered.
+		expect(seen).toEqual([
+			[human.ts, true],
+			[late.ts, false],
+		]);
+	});
+});
 
 describe("Slack recovery state", () => {
 	test("path, missing state, atomic private round trip, corrupt input", async () => {

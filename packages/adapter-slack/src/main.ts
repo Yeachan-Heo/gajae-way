@@ -867,18 +867,23 @@ export async function startSlackAdapter(
 			replies: (channel: string, threadTs: string, options: { oldest: string; cursor?: string; limit: number }) =>
 				api.conversationsReplies(channel, threadTs, options),
 		};
-		const deliver = async (message: SlackInboundMessage): Promise<RecoveryDelivery> => {
+		const deliver = async (message: SlackInboundMessage, stale: boolean): Promise<RecoveryDelivery> => {
 			const admitted = decideInbound(message, identity, directory, config.channels);
 			if (!admitted) return "skip";
 			await prime(message);
 			const text = renderInboundText(message, directory);
 			if (text === "") return "skip";
 			const messageId = slackMessageId(message.channel, message.ts);
+			const engagement = engagementForMessage(message, admitted.origin, identity, directory, config.channels);
+			// A stale backfill (old, and the bot already posted after it in that
+			// conversation) is recorded so the persona's context is complete, but it
+			// never opens a turn: answering it now would re-answer something the room
+			// watched get answered hours ago (live, 2026-09-17).
 			const sent = await gateway.requestRecovered(
 				messageId,
 				admitted.origin,
 				text,
-				engagementForMessage(message, admitted.origin, identity, directory, config.channels),
+				stale ? { ...engagement, contextOnly: true } : engagement,
 				timestamp(message.ts),
 			);
 			if (sent.verdict !== "unavailable") {
