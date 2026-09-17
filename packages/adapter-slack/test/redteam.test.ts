@@ -815,3 +815,73 @@ test("RT-SLACK-41 unknown rocket reaction fails definitively without a Slack cal
 		{ verb: "delivery.fail", params: { deliveryId: "delivery", reason: expect.any(String), ambiguous: false } },
 	]);
 });
+test("RT-SLACK-42 orphaned reclaim marker permits acquisition within two seconds and is removed", async () => {
+	const home = await mkdtemp(join(tmpdir(), "slack-orphan-redteam-"));
+	cleanups.push(() => rm(home, { recursive: true, force: true }));
+	const path = join(home, "adapter-slack.pid");
+	await writeFile(path, "99999\n");
+	await writeFile(`${path}.reclaim`, "99998\n");
+	const started = performance.now();
+	const lock = await AdapterLock.acquire(home, { pid: 42, alive: () => false });
+	expect(performance.now() - started).toBeLessThan(2000);
+	expect(await readFile(path, "utf8")).toBe("42\n");
+	await expect(readFile(`${path}.reclaim`)).rejects.toMatchObject({ code: "ENOENT" });
+	await lock.release();
+});
+
+test("RT-SLACK-43 live holder arriving during election is never replaced by waiting contenders", async () => {
+	const home = await mkdtemp(join(tmpdir(), "slack-live-election-redteam-"));
+	cleanups.push(() => rm(home, { recursive: true, force: true }));
+	const path = join(home, "adapter-slack.pid");
+	await writeFile(path, "99999\n");
+	await writeFile(`${path}.reclaim`, "99998\n");
+	let probes = 0;
+	const pending = Promise.allSettled(
+		Array.from({ length: 20 }, (_, i) =>
+			AdapterLock.acquire(home, {
+				pid: i + 1,
+				alive: (pid) => {
+					if (pid === 99999) probes++;
+					return pid === process.pid;
+				},
+			}),
+		),
+	);
+	const deadline = performance.now() + 500;
+	while (probes < 20 && performance.now() < deadline) await Bun.sleep(1);
+	const waiting = probes;
+	await writeFile(path, `${process.pid}\n`);
+	const results = await pending;
+	expect(waiting).toBe(20);
+	for (const result of results) {
+		expect(result.status).toBe("rejected");
+		if (result.status === "rejected") {
+			expect(result.reason).toBeInstanceOf(AdapterAlreadyRunningError);
+			expect(result.reason.holderPid).toBe(process.pid);
+		}
+	}
+	expect(await readFile(path, "utf8")).toBe(`${process.pid}\n`);
+});
+
+test("RT-SLACK-44 release by a former holder after losing election preserves the winner pidfile", async () => {
+	const home = await mkdtemp(join(tmpdir(), "slack-release-redteam-"));
+	cleanups.push(() => rm(home, { recursive: true, force: true }));
+	const former = await AdapterLock.acquire(home, { pid: 100, alive: () => false });
+	const results = await Promise.allSettled(
+		Array.from({ length: 20 }, (_, i) =>
+			AdapterLock.acquire(home, {
+				pid: i + 1,
+				alive: () => false,
+			}),
+		),
+	);
+	const winners = results.filter((result) => result.status === "fulfilled");
+	expect(winners).toHaveLength(1);
+	await expect(AdapterLock.acquire(home, { pid: 100, alive: () => true })).rejects.toBeInstanceOf(
+		AdapterAlreadyRunningError,
+	);
+	await former.release();
+	expect(await readFile(former.path, "utf8")).toBe(`${winners[0]?.value.pid}\n`);
+	await winners[0]?.value.release();
+	await expect(readFile(former.path)).rejects.toMatchObject({ code: "ENOENT" });
+});

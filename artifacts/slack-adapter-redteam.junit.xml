@@ -1,54 +1,53 @@
 <?xml version="1.0" encoding="UTF-8"?>
-<testsuites name="bun test" tests="41" assertions="214" failures="2" skipped="0" time="3.076259">
-  <testsuite name="packages/adapter-slack/test/redteam.test.ts" file="packages/adapter-slack/test/redteam.test.ts" tests="30" assertions="166" failures="1" skipped="0" time="0.041254" hostname="MacBook-Pro-3.local">
-    <testcase name="RT-SLACK-01 throwing handlers ack first, retries dedupe, malformed frames survive and disconnect reconnects" classname="" time="0.000629" file="packages/adapter-slack/test/redteam.test.ts" line="177" assertions="5" />
-    <testcase name="RT-SLACK-02 hostile timestamps never emit non-platform message ids" classname="" time="0.001871" file="packages/adapter-slack/test/redteam.test.ts" line="217" assertions="2" />
-    <testcase name="RT-SLACK-03 foreign reply target is a definitive delivery failure, never thread_ts" classname="" time="0.000292" file="packages/adapter-slack/test/redteam.test.ts" line="226" assertions="4" />
-    <testcase name="RT-SLACK-04 literal mentions in code count; entities decode once and broadcasts normalize" classname="" time="0.000069" file="packages/adapter-slack/test/redteam.test.ts" line="238" assertions="2" />
-    <testcase name="RT-SLACK-05 fifty-thousand-character fenced text has bounded balanced chunks" classname="" time="0.000142" file="packages/adapter-slack/test/redteam.test.ts" line="253" assertions="29" />
-    <testcase name="RT-SLACK-06 file-only body survives and empty body drops" classname="" time="0.000375" file="packages/adapter-slack/test/redteam.test.ts" line="262" assertions="2" />
-    <testcase name="RT-SLACK-07 own, hidden, every skipped subtype, unchanged/empty edits and app_mention never send" classname="" time="0.000471" file="packages/adapter-slack/test/redteam.test.ts" line="274" assertions="1" />
-    <testcase name="RT-SLACK-08 bot parent mentions; unknown parent omits fromSelf" classname="" time="0.000301" file="packages/adapter-slack/test/redteam.test.ts" line="292" assertions="2" />
-    <testcase name="RT-SLACK-09 transport failure ambiguous, Slack API failure definitive" classname="" time="0.000212" file="packages/adapter-slack/test/redteam.test.ts" line="301" assertions="2" />
-    <testcase name="RT-SLACK-10 all three chunks keep thread and duplicate warning" classname="" time="0.000094" file="packages/adapter-slack/test/redteam.test.ts" line="321" assertions="6" />
-    <testcase name="RT-SLACK-11 malformed and unknown reactions fail without API; already_reacted confirms" classname="" time="0.000261" file="packages/adapter-slack/test/redteam.test.ts" line="339" assertions="5" />
-    <testcase name="RT-SLACK-12 disconnected edit overflow retains newest 256 and replays ordered" classname="" time="0.000481" file="packages/adapter-slack/test/redteam.test.ts" line="363" assertions="5" />
-    <testcase name="RT-SLACK-13 failed edit remains queued and reconnects for replay" classname="" time="0.000103" file="packages/adapter-slack/test/redteam.test.ts" line="381" assertions="4" />
-    <testcase name="RT-SLACK-14 duplicate inbound dedupes but unavailable is forgotten" classname="" time="0.000081" file="packages/adapter-slack/test/redteam.test.ts" line="396" assertions="6" />
-    <testcase name="RT-SLACK-15 newest-first recovery delivers ascending and cannot cross unavailable" classname="" time="0.000331" file="packages/adapter-slack/test/redteam.test.ts" line="410" assertions="3" />
-    <testcase name="RT-SLACK-16 recovered replies retain thread origin" classname="" time="0.000052" file="packages/adapter-slack/test/redteam.test.ts" line="446" assertions="1" />
-    <testcase name="RT-SLACK-17 three-strike quarantine is re-probed after gateway reconnect" classname="" time="0.005602" file="packages/adapter-slack/test/redteam.test.ts" line="471" assertions="3" />
-    <testcase name="RT-SLACK-18 twenty recovery triggers remain single flight" classname="" time="0.000074" file="packages/adapter-slack/test/redteam.test.ts" line="485" assertions="3" />
-    <testcase name="RT-SLACK-19 credential prefixes fail without secrets, relative files resolve and unknown channel keys reject" classname="" time="0.001309" file="packages/adapter-slack/test/redteam.test.ts" line="510" assertions="7" />
-    <testcase name="RT-SLACK-25 already_reacted Web API response confirms delivery" classname="" time="0.000063" file="packages/adapter-slack/test/redteam.test.ts" line="543" assertions="1" />
-    <testcase name="RT-SLACK-30 pending sends share failure and survive client adoption" classname="" time="0.000155" file="packages/adapter-slack/test/redteam.test.ts" line="557" assertions="12" />
-    <testcase name="RT-SLACK-31 unreadable success bodies are ambiguous but explicit refusal is definitive" classname="" time="0.0003" file="packages/adapter-slack/test/redteam.test.ts" line="583" assertions="14" />
-    <testcase name="RT-SLACK-33 slack stale lock has exactly one winner under 20 concurrent reclaims" classname="" time="0.008042" file="packages/adapter-slack/test/redteam.test.ts" line="620" assertions="1">
-      <failure type="AssertionError" message="expect(received).toHaveLength(expected)&#10;&#10;Expected length: 1&#10;Received length: 16&#10;">AssertionError: expect(received).toHaveLength(expected)&#10;&#10;Expected length: 1&#10;Received length: 16&#10;&#10;      at packages/adapter-slack/test/redteam.test.ts:629:18&#10;</failure>
-    </testcase>
-    <testcase name="RT-SLACK-35 bounded continuation closes the gap without losing newer arrivals" classname="" time="0.000178" file="packages/adapter-slack/test/redteam.test.ts" line="635" assertions="8" />
-    <testcase name="RT-SLACK-36 participated threads recover without history and expire" classname="" time="0.002754" file="packages/adapter-slack/test/redteam.test.ts" line="681" assertions="5" />
-    <testcase name="RT-SLACK-37 only terminal refusals consume dead-letter budget" classname="" time="0.006152" file="packages/adapter-slack/test/redteam.test.ts" line="699" assertions="23" />
-    <testcase name="RT-SLACK-38 unsaved recovery state prevents success until disk is restored" classname="" time="0.001548" file="packages/adapter-slack/test/redteam.test.ts" line="738" assertions="4" />
-    <testcase name="RT-SLACK-39 slash acknowledgements reflect restart failure duplicates and unknown commands" classname="" time="0.000372" file="packages/adapter-slack/test/redteam.test.ts" line="753" assertions="1" />
-    <testcase name="RT-SLACK-40 addressed accepted turns post working status before any progress" classname="" time="0.000124" file="packages/adapter-slack/test/redteam.test.ts" line="779" assertions="3" />
-    <testcase name="RT-SLACK-41 unknown rocket reaction fails definitively without a Slack call" classname="" time="0.000038" file="packages/adapter-slack/test/redteam.test.ts" line="799" assertions="2" />
+<testsuites name="bun test" tests="44" assertions="323" failures="0" skipped="0" time="6.250733">
+  <testsuite name="packages/adapter-slack/test/redteam.test.ts" file="packages/adapter-slack/test/redteam.test.ts" tests="33" assertions="255" failures="0" skipped="0" time="3.110035" hostname="MacBook-Pro-3.local">
+    <testcase name="RT-SLACK-01 throwing handlers ack first, retries dedupe, malformed frames survive and disconnect reconnects" classname="" time="0.000644" file="packages/adapter-slack/test/redteam.test.ts" line="181" assertions="5" />
+    <testcase name="RT-SLACK-02 hostile timestamps never emit non-platform message ids" classname="" time="0.001917" file="packages/adapter-slack/test/redteam.test.ts" line="221" assertions="2" />
+    <testcase name="RT-SLACK-03 foreign reply target is a definitive delivery failure, never thread_ts" classname="" time="0.000306" file="packages/adapter-slack/test/redteam.test.ts" line="230" assertions="4" />
+    <testcase name="RT-SLACK-04 literal mentions in code count; entities decode once and broadcasts normalize" classname="" time="0.000073" file="packages/adapter-slack/test/redteam.test.ts" line="242" assertions="2" />
+    <testcase name="RT-SLACK-05 fifty-thousand-character fenced text has bounded balanced chunks" classname="" time="0.000149" file="packages/adapter-slack/test/redteam.test.ts" line="257" assertions="29" />
+    <testcase name="RT-SLACK-06 file-only body survives and empty body drops" classname="" time="0.000427" file="packages/adapter-slack/test/redteam.test.ts" line="266" assertions="2" />
+    <testcase name="RT-SLACK-07 own, hidden, every skipped subtype, unchanged/empty edits and app_mention never send" classname="" time="0.000494" file="packages/adapter-slack/test/redteam.test.ts" line="278" assertions="1" />
+    <testcase name="RT-SLACK-08 bot parent mentions; unknown parent omits fromSelf" classname="" time="0.000334" file="packages/adapter-slack/test/redteam.test.ts" line="296" assertions="2" />
+    <testcase name="RT-SLACK-09 transport failure ambiguous, Slack API failure definitive" classname="" time="0.000208" file="packages/adapter-slack/test/redteam.test.ts" line="305" assertions="2" />
+    <testcase name="RT-SLACK-10 all three chunks keep thread and duplicate warning" classname="" time="0.000096" file="packages/adapter-slack/test/redteam.test.ts" line="325" assertions="6" />
+    <testcase name="RT-SLACK-11 malformed and unknown reactions fail without API; already_reacted confirms" classname="" time="0.000273" file="packages/adapter-slack/test/redteam.test.ts" line="343" assertions="5" />
+    <testcase name="RT-SLACK-12 disconnected edit overflow retains newest 256 and replays ordered" classname="" time="0.000497" file="packages/adapter-slack/test/redteam.test.ts" line="367" assertions="5" />
+    <testcase name="RT-SLACK-13 failed edit remains queued and reconnects for replay" classname="" time="0.000087" file="packages/adapter-slack/test/redteam.test.ts" line="385" assertions="4" />
+    <testcase name="RT-SLACK-14 duplicate inbound dedupes but unavailable is forgotten" classname="" time="0.000081" file="packages/adapter-slack/test/redteam.test.ts" line="400" assertions="6" />
+    <testcase name="RT-SLACK-15 newest-first recovery delivers ascending and cannot cross unavailable" classname="" time="0.000319" file="packages/adapter-slack/test/redteam.test.ts" line="414" assertions="3" />
+    <testcase name="RT-SLACK-16 recovered replies retain thread origin" classname="" time="0.00005" file="packages/adapter-slack/test/redteam.test.ts" line="450" assertions="1" />
+    <testcase name="RT-SLACK-17 three-strike quarantine is re-probed after gateway reconnect" classname="" time="0.005681" file="packages/adapter-slack/test/redteam.test.ts" line="475" assertions="3" />
+    <testcase name="RT-SLACK-18 twenty recovery triggers remain single flight" classname="" time="0.000108" file="packages/adapter-slack/test/redteam.test.ts" line="489" assertions="3" />
+    <testcase name="RT-SLACK-19 credential prefixes fail without secrets, relative files resolve and unknown channel keys reject" classname="" time="0.001348" file="packages/adapter-slack/test/redteam.test.ts" line="514" assertions="7" />
+    <testcase name="RT-SLACK-25 already_reacted Web API response confirms delivery" classname="" time="0.000074" file="packages/adapter-slack/test/redteam.test.ts" line="547" assertions="1" />
+    <testcase name="RT-SLACK-30 pending sends share failure and survive client adoption" classname="" time="0.000179" file="packages/adapter-slack/test/redteam.test.ts" line="561" assertions="12" />
+    <testcase name="RT-SLACK-31 unreadable success bodies are ambiguous but explicit refusal is definitive" classname="" time="0.000309" file="packages/adapter-slack/test/redteam.test.ts" line="587" assertions="14" />
+    <testcase name="RT-SLACK-33 slack stale lock has exactly one winner under 20 concurrent reclaims" classname="" time="0.062389" file="packages/adapter-slack/test/redteam.test.ts" line="624" assertions="21" />
+    <testcase name="RT-SLACK-35 bounded continuation closes the gap without losing newer arrivals" classname="" time="0.000251" file="packages/adapter-slack/test/redteam.test.ts" line="639" assertions="8" />
+    <testcase name="RT-SLACK-36 participated threads recover without history and expire" classname="" time="0.002756" file="packages/adapter-slack/test/redteam.test.ts" line="685" assertions="5" />
+    <testcase name="RT-SLACK-37 only terminal refusals consume dead-letter budget" classname="" time="0.006356" file="packages/adapter-slack/test/redteam.test.ts" line="703" assertions="23" />
+    <testcase name="RT-SLACK-38 unsaved recovery state prevents success until disk is restored" classname="" time="0.001609" file="packages/adapter-slack/test/redteam.test.ts" line="742" assertions="4" />
+    <testcase name="RT-SLACK-39 slash acknowledgements reflect restart failure duplicates and unknown commands" classname="" time="0.000351" file="packages/adapter-slack/test/redteam.test.ts" line="757" assertions="1" />
+    <testcase name="RT-SLACK-40 addressed accepted turns post working status before any progress" classname="" time="0.000138" file="packages/adapter-slack/test/redteam.test.ts" line="783" assertions="3" />
+    <testcase name="RT-SLACK-41 unknown rocket reaction fails definitively without a Slack call" classname="" time="0.000041" file="packages/adapter-slack/test/redteam.test.ts" line="803" assertions="2" />
+    <testcase name="RT-SLACK-42 orphaned reclaim marker permits acquisition within two seconds and is removed" classname="" time="1.261511" file="packages/adapter-slack/test/redteam.test.ts" line="818" assertions="3" />
+    <testcase name="RT-SLACK-43 live holder arriving during election is never replaced by waiting contenders" classname="" time="1.666615" file="packages/adapter-slack/test/redteam.test.ts" line="832" assertions="62" />
+    <testcase name="RT-SLACK-44 release by a former holder after losing election preserves the winner pidfile" classname="" time="0.08632" file="packages/adapter-slack/test/redteam.test.ts" line="866" assertions="4" />
   </testsuite>
-  <testsuite name="packages/sdk/test/client-held-events.test.ts" file="packages/sdk/test/client-held-events.test.ts" tests="2" assertions="10" failures="0" skipped="0" time="0.001646" hostname="MacBook-Pro-3.local">
-    <testcase name="RT-SLACK-32 first SDK subscriber receives newest held events in order (2)" classname="" time="0.00051" file="packages/sdk/test/client-held-events.test.ts" line="6" assertions="5" />
-    <testcase name="RT-SLACK-32 first SDK subscriber receives newest held events in order (1001)" classname="" time="0.000873" file="packages/sdk/test/client-held-events.test.ts" line="6" assertions="5" />
+  <testsuite name="packages/sdk/test/client-held-events.test.ts" file="packages/sdk/test/client-held-events.test.ts" tests="2" assertions="10" failures="0" skipped="0" time="0.001724" hostname="MacBook-Pro-3.local">
+    <testcase name="RT-SLACK-32 first SDK subscriber receives newest held events in order (2)" classname="" time="0.000533" file="packages/sdk/test/client-held-events.test.ts" line="6" assertions="5" />
+    <testcase name="RT-SLACK-32 first SDK subscriber receives newest held events in order (1001)" classname="" time="0.000907" file="packages/sdk/test/client-held-events.test.ts" line="6" assertions="5" />
   </testsuite>
-  <testsuite name="packages/gateway/test/slack-adapter-redteam.e2e.test.ts" file="packages/gateway/test/slack-adapter-redteam.e2e.test.ts" tests="9" assertions="38" failures="1" skipped="0" time="3.017381" hostname="MacBook-Pro-3.local">
-    <testcase name="RT-SLACK-20 unconfigured unmentioned Slack channel is context only" classname="" time="0.386984" file="packages/gateway/test/slack-adapter-redteam.e2e.test.ts" line="71" assertions="4" />
-    <testcase name="RT-SLACK-21 mention-open engages and persona markup is escaped at Slack boundary" classname="" time="0.374088" file="packages/gateway/test/slack-adapter-redteam.e2e.test.ts" line="81" assertions="4" />
-    <testcase name="RT-SLACK-22 check reaction token delivers on Slack and is refused on Telegram" classname="" time="0.733232" file="packages/gateway/test/slack-adapter-redteam.e2e.test.ts" line="90" assertions="5" />
-    <testcase name="RT-SLACK-23 monitor and loopback cannot chat.react" classname="" time="0.026106" file="packages/gateway/test/slack-adapter-redteam.e2e.test.ts" line="121" assertions="3" />
-    <testcase name="RT-SLACK-24 thread and channel isolate sessions and route replies" classname="" time="0.366331" file="packages/gateway/test/slack-adapter-redteam.e2e.test.ts" line="133" assertions="4" />
-    <testcase name="RT-SLACK-34 real gateway threaded DM chunks default to inbound root" classname="" time="0.370826" file="packages/gateway/test/slack-adapter-redteam.e2e.test.ts" line="155" assertions="8" />
-    <testcase name="RT-SLACK-34 real gateway threaded DM chunks explicit reply wins" classname="" time="0.372754" file="packages/gateway/test/slack-adapter-redteam.e2e.test.ts" line="155" assertions="8" />
-    <testcase name="RT-SLACK-34 plain channel reply does not inherit a thread" classname="" time="0.369557" file="packages/gateway/test/slack-adapter-redteam.e2e.test.ts" line="179" assertions="1" />
-    <testcase name="RT-SLACK-33 discord stale lock has exactly one winner under 20 concurrent reclaims" classname="" time="0.009496" file="packages/gateway/test/slack-adapter-redteam.e2e.test.ts" line="186" assertions="1">
-      <failure type="AssertionError" message="expect(received).toHaveLength(expected)&#10;&#10;Expected length: 1&#10;Received length: 13&#10;">AssertionError: expect(received).toHaveLength(expected)&#10;&#10;Expected length: 1&#10;Received length: 13&#10;&#10;      at packages/gateway/test/slack-adapter-redteam.e2e.test.ts:195:19&#10;</failure>
-    </testcase>
+  <testsuite name="packages/gateway/test/slack-adapter-redteam.e2e.test.ts" file="packages/gateway/test/slack-adapter-redteam.e2e.test.ts" tests="9" assertions="58" failures="0" skipped="0" time="3.122727" hostname="MacBook-Pro-3.local">
+    <testcase name="RT-SLACK-20 unconfigured unmentioned Slack channel is context only" classname="" time="0.37731" file="packages/gateway/test/slack-adapter-redteam.e2e.test.ts" line="71" assertions="4" />
+    <testcase name="RT-SLACK-21 mention-open engages and persona markup is escaped at Slack boundary" classname="" time="0.380524" file="packages/gateway/test/slack-adapter-redteam.e2e.test.ts" line="81" assertions="4" />
+    <testcase name="RT-SLACK-22 check reaction token delivers on Slack and is refused on Telegram" classname="" time="0.737094" file="packages/gateway/test/slack-adapter-redteam.e2e.test.ts" line="90" assertions="5" />
+    <testcase name="RT-SLACK-23 monitor and loopback cannot chat.react" classname="" time="0.028047" file="packages/gateway/test/slack-adapter-redteam.e2e.test.ts" line="121" assertions="3" />
+    <testcase name="RT-SLACK-24 thread and channel isolate sessions and route replies" classname="" time="0.368983" file="packages/gateway/test/slack-adapter-redteam.e2e.test.ts" line="133" assertions="4" />
+    <testcase name="RT-SLACK-34 real gateway threaded DM chunks default to inbound root" classname="" time="0.376717" file="packages/gateway/test/slack-adapter-redteam.e2e.test.ts" line="155" assertions="8" />
+    <testcase name="RT-SLACK-34 real gateway threaded DM chunks explicit reply wins" classname="" time="0.373084" file="packages/gateway/test/slack-adapter-redteam.e2e.test.ts" line="155" assertions="8" />
+    <testcase name="RT-SLACK-34 plain channel reply does not inherit a thread" classname="" time="0.378612" file="packages/gateway/test/slack-adapter-redteam.e2e.test.ts" line="179" assertions="1" />
+    <testcase name="RT-SLACK-33 discord stale lock has exactly one winner under 20 concurrent reclaims" classname="" time="0.094864" file="packages/gateway/test/slack-adapter-redteam.e2e.test.ts" line="186" assertions="21" />
   </testsuite>
 </testsuites>
