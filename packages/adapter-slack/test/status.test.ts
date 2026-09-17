@@ -1,7 +1,7 @@
 import { expect, test } from "bun:test";
 import type { ChatMessagePayload, ChatProgressPayload, OriginRef } from "@gajaeway/protocol";
 import { type GatewayClientLike, ReconnectingGateway, settleSlackDelivery, subscribeSlackProgress } from "../src/main";
-import { WORKING_STATUS_STALE_MS, WorkingStatus, workingStatusText } from "../src/status";
+import { WORKING_STATUS_MIN_EDIT_MS, WORKING_STATUS_STALE_MS, WorkingStatus, workingStatusText } from "../src/status";
 
 const origin: OriginRef = { platform: "slack", kind: "channel", conversationId: "C1" };
 const progress = (extra: Partial<ChatProgressPayload> = {}): ChatProgressPayload => ({
@@ -16,6 +16,10 @@ async function flush() {
 	for (let i = 0; i < 20; i++) await Promise.resolve();
 }
 function fixture() {
+	// Test clock: every render advances it past the edit-coalescing window, so
+	// existing expectations about "one update per tick" keep holding; the
+	// coalescing itself is proven by its own test below.
+	let clock = 0;
 	const posts: unknown[][] = [];
 	const updates: unknown[][] = [];
 	const deletes: unknown[][] = [];
@@ -45,17 +49,62 @@ function fixture() {
 		(timer) => {
 			timers.delete(timer as { fn: () => void; ms: number });
 		},
+		() => {
+			clock += WORKING_STATUS_MIN_EDIT_MS;
+			return clock;
+		},
 	);
 	return { api, status, posts, updates, deletes, errors, timers };
 }
 
-test("Slack working status formatting omits unknown counters", () => {
-	expect(workingStatusText(progress())).toBe("⏳ working… (2m 05s, 3 tools, 1.2k tok)");
+test("Slack working status formatting omits unknown counters and coarsens time", () => {
+	// Time is rendered coarsely on purpose: every distinct text is a chat.update
+	// against the reply budget, so seconds step by 5 and minutes drop seconds.
+	expect(workingStatusText(progress())).toBe("⏳ working… (2m, 3 tools, 1.2k tok)");
 	expect(workingStatusText(progress({ elapsedMs: 999, toolCalls: 0, outputTokens: 0 }))).toBe("⏳ working… (0s)");
-	expect(workingStatusText(progress({ elapsedMs: 1000, toolCalls: 1, outputTokens: 999 }))).toBe(
-		"⏳ working… (1s, 1 tool, 999 tok)",
+	expect(workingStatusText(progress({ elapsedMs: 7_000, toolCalls: 1, outputTokens: 999 }))).toBe(
+		"⏳ working… (5s, 1 tool, 999 tok)",
 	);
-	expect(workingStatusText(progress({ toolCalls: 0, outputTokens: 1000 }))).toBe("⏳ working… (2m 05s, 1.0k tok)");
+	expect(workingStatusText(progress({ toolCalls: 0, outputTokens: 1000 }))).toBe("⏳ working… (2m, 1.0k tok)");
+});
+
+test("Slack status coalesces edits: unchanged text and edits inside the window send nothing", async () => {
+	let clock = 0;
+	const updates: string[] = [];
+	const api = {
+		async postMessage() {
+			return { channel: "C1", ts: "10.001" };
+		},
+		async updateMessage(_channel: string, _ts: string, text: string) {
+			updates.push(text);
+		},
+		async deleteMessage() {},
+	};
+	const status = new WorkingStatus(
+		api,
+		{ error() {} },
+		(fn, ms) => ({ fn, ms, unref() {} }),
+		() => {},
+		() => clock,
+	);
+	status.arm(origin);
+	await flush();
+	// Same second bucket, inside the window: nothing.
+	await status.update(progress({ elapsedMs: 3_000 }));
+	expect(updates).toEqual([]);
+	// Text changed but still inside the 15s window: still nothing.
+	clock = 5_000;
+	await status.update(progress({ elapsedMs: 5_000 }));
+	expect(updates).toEqual([]);
+	// Window elapsed and text changed: one edit.
+	clock = 16_000;
+	await status.update(progress({ elapsedMs: 16_000 }));
+	expect(updates).toEqual(["⏳ working… (15s, 3 tools, 1.2k tok)"]);
+	// Window elapsed but text identical (same 5s bucket): nothing.
+	clock = 40_000;
+	await status.update(progress({ elapsedMs: 16_500 }));
+	expect(updates).toHaveLength(1);
+	await status.clear("C1");
 });
 
 for (const routed of [
@@ -75,11 +124,11 @@ for (const routed of [
 		const channel = routed.kind === "thread" ? routed.parentId : routed.conversationId;
 		expect(f.posts).toEqual([[channel, "⏳ working…", routed.kind === "thread" ? "9.001" : undefined]]);
 		await f.status.update(tick);
-		await f.status.update({ ...tick, elapsedMs: 126_000 });
+		await f.status.update({ ...tick, elapsedMs: 186_000 });
 		expect(f.posts).toHaveLength(1);
 		expect(f.updates).toEqual([
 			[channel, "10.001", workingStatusText(tick)],
-			[channel, "10.001", workingStatusText({ ...tick, elapsedMs: 126_000 })],
+			[channel, "10.001", workingStatusText({ ...tick, elapsedMs: 186_000 })],
 		]);
 		expect(f.timers.size).toBe(1);
 		await f.status.clear(routed.conversationId);
@@ -138,8 +187,9 @@ test("Slack post and update failures are logged, retain an existing message, and
 	f.api.updateMessage = async () => {
 		throw new Error("Slack update failed");
 	};
-	await f.status.update(progress());
-	await f.status.update(progress());
+	// Distinct texts, so neither is coalesced away: two failed edits, one message.
+	await f.status.update(progress({ elapsedMs: 186_000 }));
+	await f.status.update(progress({ elapsedMs: 246_000 }));
 	expect(f.posts).toHaveLength(1);
 	expect(f.errors).toHaveLength(3);
 	await f.status.clear("C1");

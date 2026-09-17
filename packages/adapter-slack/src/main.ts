@@ -8,7 +8,7 @@ import type {
 } from "@gajaeway/protocol";
 import { GajaewayClient } from "@gajaeway/sdk";
 import pkg from "../package.json";
-import { deliveryFailureIsAmbiguous, SlackApiError, SlackWebApi } from "./api";
+import { deliveryFailureIsAmbiguous, OutboundLimiter, SlackApiError, SlackWebApi } from "./api";
 import { describeInboundBody, type SlackFileCarrier } from "./attachments";
 import { SlackDirectory } from "./author";
 import { adapterHome, type LoadedSlackAdapterConfig, loadSlackAdapterConfig } from "./config";
@@ -398,6 +398,8 @@ export class ReconnectingGateway implements GatewayClientLike {
 
 	/** Runs after every successful (re)connect: recovery re-walks the gap the outage left. */
 	onConnected: (() => void) | undefined;
+	/** Runs when the link is lost, so the outage length can gate the next recovery pass. */
+	onDisconnected: (() => void) | undefined;
 
 	constructor(
 		readonly socketPath: string,
@@ -644,6 +646,7 @@ export class ReconnectingGateway implements GatewayClientLike {
 	private scheduleReconnect(): void {
 		if (this.#reconnecting) return;
 		this.#reconnecting = true;
+		this.onDisconnected?.();
 		this.#client = undefined;
 		this.#deliveryOff?.();
 		clearTimeout(this.#monitorTimer);
@@ -681,7 +684,7 @@ export async function startSlackAdapter(
 	readonly reprobeQuarantined: () => Promise<void>;
 	readonly recovery: RecoveryScheduler;
 }> {
-	const api = ports.api ?? new SlackWebApi(config.botToken);
+	const api = ports.api ?? new SlackWebApi(config.botToken, { limiter: new OutboundLimiter() });
 	const log = ports.log ?? console;
 	const auth = await api.authTest();
 	const identity: SlackIdentity = {
@@ -826,6 +829,13 @@ export async function startSlackAdapter(
 	 * the gateway dedupes durably on `channel:ts`, so overlap with live traffic is
 	 * safe. The watermark moves only past messages the gateway acked or already knew.
 	 */
+	// Recovery is a burst of history reads per configured channel. A socket
+	// blip that reconnects within seconds cannot have created a gap the gateway
+	// does not already dedupe, so a pass is skipped when the previous clean pass
+	// is recent and no outage longer than RECOVERY_OUTAGE_GATE_MS was observed.
+	let lastCleanPassAt: number | undefined;
+	let disconnectedAt: number | undefined;
+	let longOutageSeen = false;
 	const recoverMissedMessages = async (): Promise<boolean> => {
 		if (!gateway.connected) return false;
 		const loaded = await ensureCursors();
@@ -1006,7 +1016,19 @@ export async function startSlackAdapter(
 		}
 		await cursorSaves;
 		// Progress that is not on disk is not progress: keep retrying until it is.
-		return completed && !dirty;
+		const clean = completed && !dirty;
+		if (clean) {
+			lastCleanPassAt = now();
+			longOutageSeen = false;
+		}
+		return clean;
+	};
+	const noteDisconnected = (): void => {
+		disconnectedAt ??= now();
+	};
+	const noteConnected = (): void => {
+		if (disconnectedAt !== undefined && now() - disconnectedAt >= RECOVERY_OUTAGE_GATE_MS) longOutageSeen = true;
+		disconnectedAt = undefined;
 	};
 	/**
 	 * A fresh link is the moment to re-check channels that were unreadable: the
@@ -1027,6 +1049,18 @@ export async function startSlackAdapter(
 	// channel could never actually reach quarantine.
 	let reprobeRequested = false;
 	const recovery = new RecoveryScheduler(async () => {
+		// A short blip after a recent clean pass is not worth a burst of history
+		// reads - unless there are quarantined channels to re-probe, which is the
+		// one thing only a reconnect can do for them. An explicit call to
+		// recoverMissedMessages is never gated.
+		const hasQuarantine = Object.keys(cursors?.quarantined ?? {}).length > 0;
+		if (
+			!longOutageSeen &&
+			!(reprobeRequested && hasQuarantine) &&
+			lastCleanPassAt !== undefined &&
+			now() - lastCleanPassAt < RECOVERY_RECENT_PASS_MS
+		)
+			return true;
 		if (reprobeRequested) {
 			reprobeRequested = false;
 			await reprobeQuarantined();
@@ -1034,10 +1068,12 @@ export async function startSlackAdapter(
 		return recoverMissedMessages();
 	});
 	const reconnected = (): void => {
+		noteConnected();
 		reprobeRequested = true;
 		recovery.trigger();
 	};
 	gateway.onConnected = reconnected;
+	gateway.onDisconnected = noteDisconnected;
 	await gateway.connect();
 	const socket = new SlackSocketMode(
 		() => api.connectionsOpen(config.appToken),
@@ -1048,7 +1084,10 @@ export async function startSlackAdapter(
 				log.log("Slack adapter connected.");
 				reconnected();
 			},
-			onDisconnected: (reason) => log.log(`Slack socket disconnected: ${reason}`),
+			onDisconnected: (reason) => {
+				log.log(`Slack socket disconnected: ${reason}`);
+				noteDisconnected();
+			},
 		},
 		{ factory: ports.socketFactory, log },
 	);
@@ -1083,6 +1122,10 @@ export const SLACK_USAGE = [
 ].join("\n");
 export const USAGE_EXIT_CODE = 2;
 const SLASH_COMMANDS: ReadonlySet<string> = new Set(["/new", "/reset", "/restart"]);
+/** A clean recovery pass younger than this is not repeated for a short blip. */
+export const RECOVERY_RECENT_PASS_MS = 60_000;
+/** An outage at least this long always earns a fresh recovery pass. */
+export const RECOVERY_OUTAGE_GATE_MS = 5_000;
 
 /**
  * What the invoking user is told. Wording follows what the gateway actually did:

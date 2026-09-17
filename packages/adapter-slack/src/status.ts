@@ -3,10 +3,19 @@ import type { SlackWebApi } from "./api";
 import { parseSlackMessageId } from "./origin";
 
 export const WORKING_STATUS_STALE_MS = 90_000;
+/**
+ * Minimum spacing between edits of one status message. chat.update counts
+ * against the same per-channel budget as replies (Tier 3, ~50/min), so a hint
+ * that re-renders on every 10s progress tick across a few busy conversations
+ * is exactly how a workspace ends up rate-limited. Elapsed time is shown at
+ * minute granularity beyond the first minute for the same reason: a change
+ * nobody can read is not worth a request.
+ */
+export const WORKING_STATUS_MIN_EDIT_MS = 15_000;
 
 type Timer = { unref?(): void };
 type StatusMessage = { readonly channel: string; readonly ts: string };
-type Entry = { message?: StatusMessage };
+type Entry = { message?: StatusMessage; text?: string; editedAt?: number };
 
 /** Show only reported activity: zero counters are noise, not proof the turn did nothing. */
 export function workingStatusText(
@@ -15,7 +24,8 @@ export function workingStatusText(
 	const total = Math.floor(progress.elapsedMs / 1000);
 	const minutes = Math.floor(total / 60);
 	const seconds = total % 60;
-	const parts = [minutes > 0 ? `${minutes}m ${String(seconds).padStart(2, "0")}s` : `${seconds}s`];
+	// Sub-minute turns count seconds (in 5s steps); longer ones read as minutes.
+	const parts = [minutes > 0 ? `${minutes}m` : `${seconds - (seconds % 5)}s`];
 	if (progress.toolCalls > 0) parts.push(`${progress.toolCalls} tool${progress.toolCalls === 1 ? "" : "s"}`);
 	if (progress.outputTokens > 0)
 		parts.push(
@@ -38,6 +48,7 @@ export class WorkingStatus {
 		readonly log: Pick<Console, "error"> = console,
 		readonly setTimer: (fn: () => void, ms: number) => Timer = setTimeout,
 		readonly clearTimer: (timer: unknown) => void = (timer) => clearTimeout(timer as ReturnType<typeof setTimeout>),
+		readonly now: () => number = Date.now,
 	) {}
 
 	/**
@@ -75,15 +86,24 @@ export class WorkingStatus {
 		const entry = existing ?? {};
 		try {
 			if (entry.message) {
+				// Coalesce: an edit is a request against the reply budget, so only send
+				// one when the rendered text actually changed and the last edit is old
+				// enough. A skipped tick costs nothing - the next one carries the update.
+				if (entry.text === text) return;
+				if (entry.editedAt !== undefined && this.now() - entry.editedAt < WORKING_STATUS_MIN_EDIT_MS) return;
+				entry.editedAt = this.now();
+				entry.text = text;
 				await this.api.updateMessage(entry.message.channel, entry.message.ts, text);
 				return;
 			}
 			const thread = origin.kind === "thread" ? parseSlackMessageId(conversationId) : undefined;
 			if (origin.kind === "thread" && !thread) throw new Error("Slack status thread has an invalid message id");
 			this.#messages.set(conversationId, entry);
-			const posted = await this.api.postMessage(thread?.channel ?? conversationId, text, thread?.ts);
+			const posted = await this.api.postMessage(thread?.channel ?? conversationId, text, thread?.ts, "cosmetic");
 			if (this.#messages.get(conversationId) === entry) {
 				entry.message = posted;
+				entry.text = text;
+				entry.editedAt = this.now();
 				return;
 			}
 			// Clear ran while the post was in flight: remove its late result, not a newer turn's status.
