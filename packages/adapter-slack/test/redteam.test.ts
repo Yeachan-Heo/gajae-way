@@ -29,6 +29,10 @@ import { SlackSocketMode, type WebSocketLike } from "../src/socket";
 import { WorkingStatus } from "../src/status";
 import { normalizeSlackText } from "../src/text";
 
+// The adapter defaults its recovery store to $GAJAEWAY_HOME; a test must never
+// be able to reach a real operator home, whatever a fixture forgets to pass.
+process.env.GAJAEWAY_HOME = `/tmp/slack-test-home-${crypto.randomUUID()}`;
+
 const origin = { platform: "slack", kind: "channel", conversationId: "C1" } as const;
 const engagement = { mentioned: false, group: true, authorId: "U1" };
 const names = { userName: () => undefined, userHandle: () => undefined, channelName: () => undefined };

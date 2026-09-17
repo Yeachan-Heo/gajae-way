@@ -24,6 +24,10 @@ import { slackMessageOrigin } from "../src/origin";
 import { loadRecoveryCursors } from "../src/recovery";
 import type { WebSocketLike } from "../src/socket";
 
+// The adapter defaults its recovery store to $GAJAEWAY_HOME; a test must never
+// be able to reach a real operator home, whatever a fixture forgets to pass.
+process.env.GAJAEWAY_HOME = `/tmp/slack-test-home-${crypto.randomUUID()}`;
+
 const origin: OriginRef = { platform: "slack", kind: "channel", conversationId: "C1" };
 const engagement: EngagementContext = { mentioned: false, group: true, authorId: "U1" };
 const identity = { botUserId: "UBOT", botId: "B1", teamName: "Workspace" };
@@ -162,8 +166,15 @@ async function fixture(
 	// so the fixture's own adoptClient cannot race their counts.
 	if (options.autoRecover === false) adapter.gateway.onConnected = undefined;
 	adapter.gateway.adoptClient(gateway);
+	// One stop covers both background loops so no test can leak a scheduler.
+	const socket = { ...adapter.socket, stop: () => {} };
+	const stopAll = () => {
+		adapter.socket.stop();
+		adapter.recovery.stop();
+	};
 	return {
 		...adapter,
+		socket: Object.assign(socket, { stop: stopAll }) as typeof adapter.socket,
 		api,
 		client: gateway,
 		recoveryCursorPath,
