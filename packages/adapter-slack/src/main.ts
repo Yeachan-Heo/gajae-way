@@ -816,7 +816,12 @@ export async function startSlackAdapter(
 				return;
 			}
 			const origin = slackMessageOrigin({ channel: command.channel_id, user: command.user_id });
-			const sent = await gateway.requestRecovered(`slash-${command.trigger_id}`, origin, command.command, {
+			// Slack splits a slash command into name and arguments; the gateway parses one
+			// line. Dropping the argument silently turned `/model <id>` into a bare
+			// `/model` read, so a rebind looked like it was accepted and changed nothing.
+			const argument = (command.text ?? "").trim();
+			const commandLine = argument ? `${command.command} ${argument}` : command.command;
+			const sent = await gateway.requestRecovered(`slash-${command.trigger_id}`, origin, commandLine, {
 				mentioned: true,
 				group: origin.kind !== "dm",
 				authorId: command.user_id,
@@ -1143,7 +1148,8 @@ export const SLACK_USAGE = [
 	"$GAJAEWAY_HOME/adapter-slack.json; one instance at a time per home.",
 ].join("\n");
 export const USAGE_EXIT_CODE = 2;
-const SLASH_COMMANDS: ReadonlySet<string> = new Set(["/new", "/reset", "/restart"]);
+/** Every command the gateway implements as a chat command; anything else is refused here. */
+const SLASH_COMMANDS: ReadonlySet<string> = new Set(["/new", "/reset", "/restart", "/model"]);
 /** A clean recovery pass younger than this is not repeated for a short blip. */
 export const RECOVERY_RECENT_PASS_MS = 60_000;
 /** An outage at least this long always earns a fresh recovery pass. */
@@ -1158,7 +1164,11 @@ export function slashCommandAck(command: string, sent: Pick<RecoveredSend, "verd
 	if (sent.verdict === "unavailable") return "the gateway is unreachable right now; try again shortly";
 	if (sent.verdict === "duplicate") return "already handled";
 	if (!sent.result?.engaged) return "not authorized for session commands here";
-	return command === "/restart" ? "🦞 restarting the gateway" : "🦞 session reset";
+	if (command === "/restart") return "🦞 restarting the gateway";
+	// `/model` neither resets the session nor restarts anything: it reads or rebinds
+	// the model for this conversation and the gateway answers with the selection.
+	if (command === "/model") return "🦞 model command accepted";
+	return "🦞 session reset";
 }
 
 /** Outcome of one gateway send, classified for recovery; `failure` carries the raw error for classification. */
