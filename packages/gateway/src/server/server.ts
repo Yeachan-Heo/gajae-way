@@ -1582,8 +1582,10 @@ async function createInboundTurnLifecycle(
 		const inboundThreadRoot =
 			origin.platform !== "slack"
 				? undefined
-				: origin.kind === "channel" && nonLoopback && isPlatformMessageId(row.message_id)
-					? row.message_id
+				: origin.kind === "channel" &&
+						nonLoopback &&
+						isSlackMessageId(editedMessageId(row.message_id) ?? row.message_id)
+					? (editedMessageId(row.message_id) ?? row.message_id)
 					: origin.kind === "dm" && typeof engagement?.replyTo?.messageId === "string" && engagement.replyTo.messageId
 						? engagement.replyTo.messageId
 						: undefined;
@@ -1980,6 +1982,11 @@ function currentConversationNotice(origin: OriginRef): string {
 			: []),
 	].join("\n");
 }
+/** A Slack platform message id is `channel:ts`; synthetic trigger ids (`slash-…`, `edit:…`) never thread. */
+function isSlackMessageId(value: string): boolean {
+	return /^[A-Z][A-Z0-9]+:\d+\.\d+$/.test(value);
+}
+
 function diagnostic(error: unknown): string {
 	return sanitizeDiagnostic(error instanceof Error ? error.message : String(error)) || "unknown_error";
 }

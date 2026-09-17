@@ -74,8 +74,12 @@ export interface RecoveryCursorState {
 	readonly knownDms: Readonly<Record<string, { readonly lastSeenAt: string }>>;
 	/** Thread roots (`channel:ts`) the persona replied in; revisited independently of the channel watermark. */
 	readonly participatedThreads: Readonly<Record<string, { readonly lastSeenAt: string; readonly through?: string }>>;
-	/** Thread roots whose reply walk was cut short by the page bound; drained on later passes until complete. */
-	readonly pendingThreads: Readonly<Record<string, { readonly since: string }>>;
+	/**
+	 * Thread roots whose reply walk was cut short by the page bound; drained on
+	 * later passes until complete. `through` is the root's own reply cursor so
+	 * an unengaged root still makes progress instead of re-walking its prefix.
+	 */
+	readonly pendingThreads: Readonly<Record<string, { readonly since: string; readonly through?: string }>>;
 	readonly quarantined: Readonly<
 		Record<string, { readonly reason: string; readonly failures: number; readonly since: string }>
 	>;
@@ -136,7 +140,10 @@ export async function loadRecoveryCursors(path: string): Promise<RecoveryCursorS
 					))) ||
 			(state.pendingThreads !== undefined &&
 				(!record(state.pendingThreads) ||
-					!Object.values(state.pendingThreads).every((entry) => record(entry) && typeof entry.since === "string"))) ||
+					!Object.values(state.pendingThreads).every(
+						(entry) =>
+							record(entry) && typeof entry.since === "string" && (entry.through === undefined || isTs(entry.through)),
+					))) ||
 			(state.attempts !== undefined &&
 				(!record(state.attempts) ||
 					!Object.values(state.attempts).every(
