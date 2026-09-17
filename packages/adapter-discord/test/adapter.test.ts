@@ -3,6 +3,7 @@ import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { ChatMessagePayload, ChatProgressPayload } from "@gajaeway/protocol";
+import { PRESENCE_MIN_SWAP_MS } from "@gajaeway/protocol";
 import { DiscordAdapterStartupError, loadDiscordAdapterConfig } from "../src/config";
 import {
 	addressedTurn,
@@ -11,13 +12,13 @@ import {
 	engagementForMessage,
 	type GatewayClientLike,
 	handleSlashCommand,
+	isPresenceReaction,
 	LruSet,
 	settleDiscordDelivery,
 	subscribeDiscordDeliveries,
 	subscribeDiscordProgress,
 	TypingIndicator,
 	WorkingStatus,
-	workingStatusText,
 } from "../src/main";
 import { discordMessageOrigin } from "../src/origin";
 
@@ -358,37 +359,58 @@ function mockGateway(requests: Array<{ verb: string; params: unknown }>): Gatewa
 	};
 }
 
-test("working status posts one amended message per conversation and clears on delivery", async () => {
-	const sent: string[] = [];
-	const edits: string[] = [];
-	let deleted = 0;
-	const statusMessage = {
-		edit: async (text: string) => void edits.push(text),
-		delete: async () => void deleted++,
-	};
-	const discord: DiscordClientLike = {
-		channels: {
-			fetch: async () => ({
-				send: async (text: string) => {
-					sent.push(text);
-					return statusMessage;
-				},
+function presenceDiscord() {
+	const reacted: string[] = [];
+	const removed: string[] = [];
+	const message = {
+		react: async (emoji: string) => void reacted.push(emoji),
+		reactions: {
+			resolve: (emoji: string) => ({
+				users: { remove: async (userId: string) => void removed.push(`${emoji}:${userId}`) },
 			}),
 		},
 	};
-	const status = new WorkingStatus(discord, { error: () => {} });
+	const discord: DiscordClientLike = {
+		channels: { fetch: async () => ({ messages: { fetch: async () => message }, send: async () => ({}) }) },
+	};
+	return { discord, reacted, removed };
+}
+
+test("working status is a reaction gradient on the triggering message and clears on delivery", async () => {
+	const { discord, reacted, removed } = presenceDiscord();
+	let clock = 0;
+	const status = new WorkingStatus(
+		discord,
+		{ error: () => {} },
+		() => ({ id: "bot-1" }),
+		() => clock,
+	);
 	const origin = { platform: "discord", kind: "channel", conversationId: "channel-1" } as const;
-	status.arm("channel-1");
-	await status.update({ turnId: "t", origin, elapsedMs: 16_000, toolCalls: 1, outputTokens: 210 });
+	status.arm("channel-1", "m-1");
+	await Bun.sleep(1);
+	expect(reacted).toEqual(["⏳"]);
+	clock += PRESENCE_MIN_SWAP_MS;
+	await status.update({
+		turnId: "t",
+		origin,
+		elapsedMs: 61_000,
+		toolCalls: 1,
+		outputTokens: 210,
+		activity: { kind: "tool", label: "bash" },
+	});
+	// Phase ⏳→🔧, one minute, one tool: a remove and three adds; nothing posted.
+	expect(removed).toEqual(["⏳:bot-1"]);
+	expect(reacted).toEqual(["⏳", "🔧", "🕐", "1️⃣"]);
+	// Inside the window: coalesced.
 	await status.update({ turnId: "t", origin, elapsedMs: 125_000, toolCalls: 3, outputTokens: 1250 });
-	expect(sent).toEqual(["⏳ working… (16s, 1 tool, 210 tok)"]);
-	expect(edits).toEqual(["⏳ working… (2m 05s, 3 tools, 1.3k tok)"]);
+	expect(reacted).toHaveLength(4);
 	const requests: Array<{ verb: string; params: unknown }> = [];
 	await settleDiscordDelivery(mockGateway(requests), discord, delivery("real reply"), undefined, status);
-	expect(deleted).toBe(1);
-	// A later delivery without a live status message is a no-op.
+	expect(new Set(removed)).toEqual(new Set(["⏳:bot-1", "🔧:bot-1", "🕐:bot-1", "1️⃣:bot-1"]));
+	// A later delivery with no live gradient is a no-op.
+	const before = removed.length;
 	await settleDiscordDelivery(mockGateway(requests), discord, delivery("again"), undefined, status);
-	expect(deleted).toBe(1);
+	expect(removed).toHaveLength(before);
 });
 
 test("working status ignores non-discord progress and survives channel failures", async () => {
@@ -399,9 +421,9 @@ test("working status ignores non-discord progress and survives channel failures"
 			},
 		},
 	};
-	const status = new WorkingStatus(failing, { error: () => {} });
-	status.arm("tg");
-	status.arm("c");
+	const status = new WorkingStatus(failing, { error: () => {} }, () => ({ id: "bot-1" }));
+	status.arm("tg", "m-1");
+	status.arm("c", "m-2");
 	await status.update({
 		turnId: "t",
 		origin: { platform: "telegram", kind: "channel", conversationId: "tg" },
@@ -416,7 +438,7 @@ test("working status ignores non-discord progress and survives channel failures"
 		toolCalls: 1,
 		outputTokens: 0,
 	});
-	await status.clear("c"); // nothing posted; must not throw
+	await status.clear("c"); // nothing reacted; must not throw
 });
 
 test("slash commands /new and /reset map to gateway session resets with the invoker attributed", async () => {
@@ -480,60 +502,27 @@ test("presence is shown only where the persona was addressed: DM, mention, or op
 	expect(addressedTurn({ group: true, mentioned: false })).toBe(false); // overheard public channel
 });
 
-test("an unaddressed public-channel turn posts no working status until it is armed; clear disarms", async () => {
-	const sent: string[] = [];
-	let deleted = 0;
-	const discord: DiscordClientLike = {
-		channels: {
-			fetch: async () => ({
-				send: async (text: string) => {
-					sent.push(text);
-					return { edit: async () => {}, delete: async () => void deleted++ };
-				},
-			}),
-		},
-	};
-	const status = new WorkingStatus(discord, { error: () => {} });
+test("an unaddressed public-channel turn shows no presence until it is armed; clear disarms", async () => {
+	const { discord, reacted, removed } = presenceDiscord();
+	const status = new WorkingStatus(discord, { error: () => {} }, () => ({ id: "bot-1" }));
 	const origin = { platform: "discord", kind: "channel", conversationId: "public-1" } as const;
 	const tick = { turnId: "t", origin, elapsedMs: 16_000, toolCalls: 1, outputTokens: 210 };
 	await status.update(tick);
 	await status.update(tick);
-	expect(sent).toEqual([]);
-	status.arm("public-1");
-	await status.update(tick);
-	expect(sent).toHaveLength(1);
+	expect(reacted).toEqual([]);
+	status.arm("public-1", "m-9");
+	await Bun.sleep(1);
+	expect(reacted).toEqual(["⏳"]);
 	await status.clear("public-1");
-	expect(deleted).toBe(1);
+	expect(removed).toEqual(["⏳:bot-1"]);
 	// Disarmed: the next turn's ticks are silent again until re-armed.
 	await status.update(tick);
-	expect(sent).toHaveLength(1);
+	expect(reacted).toHaveLength(1);
 });
 
-test("the working status never claims counters the runtime did not report", () => {
-	// gjc 0.16.0's stdio relay cannot negotiate the tool_activity capability, so
-	// both counters stay zero for the whole turn: showing them read as "this turn
-	// did nothing" for minutes (live, 2026-09-03).
-	expect(workingStatusText({ elapsedMs: 280_000, toolCalls: 0, outputTokens: 0 })).toBe("⏳ working… (4m 40s)");
-	expect(workingStatusText({ elapsedMs: 16_000, toolCalls: 1, outputTokens: 0 })).toBe("⏳ working… (16s, 1 tool)");
-	// The current activity rides after the counters; model-authored text is markdown-neutralised.
-	expect(
-		workingStatusText({
-			elapsedMs: 16_000,
-			toolCalls: 1,
-			outputTokens: 0,
-			activity: { kind: "tool", label: "bash", detail: "Running *the* tests" },
-		}),
-	).toBe("⏳ working… (16s, 1 tool) · `bash` — Running \\*the\\* tests");
-	expect(
-		workingStatusText({
-			elapsedMs: 16_000,
-			toolCalls: 1,
-			outputTokens: 0,
-			activity: { kind: "writing", label: "writing" },
-		}),
-	).toBe("⏳ working… (16s, 1 tool) · writing…");
-	expect(workingStatusText({ elapsedMs: 16_000, toolCalls: 0, outputTokens: 210 })).toBe("⏳ working… (16s, 210 tok)");
-	expect(workingStatusText({ elapsedMs: 125_000, toolCalls: 3, outputTokens: 1250 })).toBe(
-		"⏳ working… (2m 05s, 3 tools, 1.3k tok)",
-	);
+test("our own presence markers are never reported inbound as engagement", () => {
+	expect(isPresenceReaction("🔧")).toBe(true);
+	expect(isPresenceReaction("✍️")).toBe(true);
+	expect(isPresenceReaction("✍")).toBe(true);
+	expect(isPresenceReaction("👍")).toBe(false);
 });

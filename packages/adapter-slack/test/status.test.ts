@@ -1,13 +1,15 @@
 import { expect, test } from "bun:test";
-import type { ChatMessagePayload, ChatProgressPayload, OriginRef } from "@gajaeway/protocol";
-import { type GatewayClientLike, ReconnectingGateway, settleSlackDelivery, subscribeSlackProgress } from "../src/main";
 import {
-	activitySuffix,
-	WORKING_STATUS_MIN_EDIT_MS,
-	WORKING_STATUS_STALE_MS,
-	WorkingStatus,
-	workingStatusText,
-} from "../src/status";
+	type ChatMessagePayload,
+	type ChatProgressPayload,
+	type OriginRef,
+	PRESENCE_MIN_SWAP_MS,
+	presenceEffortBucket,
+	presenceMarkersFor,
+	presenceSnapshot,
+} from "@gajaeway/protocol";
+import { type GatewayClientLike, ReconnectingGateway, settleSlackDelivery, subscribeSlackProgress } from "../src/main";
+import { isPresenceReaction, PRESENCE_PHASE_NAMES, WORKING_STATUS_STALE_MS, WorkingStatus } from "../src/status";
 
 const origin: OriginRef = { platform: "slack", kind: "channel", conversationId: "C1" };
 const progress = (extra: Partial<ChatProgressPayload> = {}): ChatProgressPayload => ({
@@ -22,27 +24,29 @@ async function flush() {
 	for (let i = 0; i < 20; i++) await Promise.resolve();
 }
 function fixture() {
-	// Test clock: every render advances it past the edit-coalescing window, so
-	// existing expectations about "one update per tick" keep holding; the
-	// coalescing itself is proven by its own test below.
 	let clock = 0;
-	const posts: unknown[][] = [];
-	const updates: unknown[][] = [];
-	const deletes: unknown[][] = [];
+	const adds: string[] = [];
+	const removes: string[] = [];
+	const posts: unknown[] = [];
 	const errors: string[] = [];
 	const timers = new Set<{ fn: () => void; ms: number }>();
 	const api = {
+		async addReaction(channel: string, ts: string, name: string) {
+			adds.push(`${channel}:${ts}:${name}`);
+		},
+		async removeReaction(channel: string, ts: string, name: string) {
+			removes.push(`${channel}:${ts}:${name}`);
+		},
 		async postMessage(channel: string, text: string, threadTs?: string) {
 			posts.push([channel, text, threadTs]);
 			return { channel, ts: "10.001" };
 		},
-		async updateMessage(channel: string, ts: string, text: string) {
-			updates.push([channel, ts, text]);
+		async updateMessage() {
+			posts.push("update");
 		},
-		async deleteMessage(channel: string, ts: string) {
-			deletes.push([channel, ts]);
+		async deleteMessage() {
+			posts.push("delete");
 		},
-		async addReaction() {},
 	};
 	const status = new WorkingStatus(
 		api,
@@ -55,168 +59,153 @@ function fixture() {
 		(timer) => {
 			timers.delete(timer as { fn: () => void; ms: number });
 		},
-		() => {
-			clock += WORKING_STATUS_MIN_EDIT_MS;
-			return clock;
-		},
-	);
-	return { api, status, posts, updates, deletes, errors, timers };
-}
-
-test("Slack working status formatting omits unknown counters and coarsens time", () => {
-	// Time is rendered coarsely on purpose: every distinct text is a chat.update
-	// against the reply budget, so seconds step by 5 and minutes drop seconds.
-	expect(workingStatusText(progress())).toBe("⏳ working… (2m, 3 tools, 1.2k tok)");
-	expect(workingStatusText(progress({ elapsedMs: 999, toolCalls: 0, outputTokens: 0 }))).toBe("⏳ working… (0s)");
-	expect(workingStatusText(progress({ elapsedMs: 7_000, toolCalls: 1, outputTokens: 999 }))).toBe(
-		"⏳ working… (5s, 1 tool, 999 tok)",
-	);
-	expect(workingStatusText(progress({ toolCalls: 0, outputTokens: 1000 }))).toBe("⏳ working… (2m, 1.0k tok)");
-});
-
-test("Slack status coalesces edits: unchanged text and edits inside the window send nothing", async () => {
-	let clock = 0;
-	const updates: string[] = [];
-	const api = {
-		async postMessage() {
-			return { channel: "C1", ts: "10.001" };
-		},
-		async updateMessage(_channel: string, _ts: string, text: string) {
-			updates.push(text);
-		},
-		async deleteMessage() {},
-	};
-	const status = new WorkingStatus(
-		api,
-		{ error() {} },
-		(fn, ms) => ({ fn, ms, unref() {} }),
-		() => {},
 		() => clock,
 	);
-	status.arm(origin);
-	await flush();
-	// Same second bucket, inside the window: nothing.
-	await status.update(progress({ elapsedMs: 3_000 }));
-	expect(updates).toEqual([]);
-	// Text changed but still inside the 15s window: still nothing.
-	clock = 5_000;
-	await status.update(progress({ elapsedMs: 5_000 }));
-	expect(updates).toEqual([]);
-	// Window elapsed and text changed: one edit.
-	clock = 16_000;
-	await status.update(progress({ elapsedMs: 16_000 }));
-	expect(updates).toEqual(["⏳ working… (15s, 3 tools, 1.2k tok)"]);
-	// Window elapsed but text identical (same 5s bucket): nothing.
-	clock = 40_000;
-	await status.update(progress({ elapsedMs: 16_500 }));
-	expect(updates).toHaveLength(1);
-	await status.clear("C1");
-});
-
-for (const routed of [
-	origin,
-	{ platform: "slack", kind: "dm", conversationId: "D1", peerId: "U1" },
-	{ platform: "slack", kind: "thread", conversationId: "C1:9.001", parentId: "C1" },
-] as const) {
-	test(`Slack status routes ${routed.kind}: posts on arm, updates one message, and disarms`, async () => {
-		const f = fixture();
-		const tick = progress({ origin: routed });
-		// Not armed: an overheard turn shows nothing.
-		await f.status.update(tick);
-		expect(f.posts).toHaveLength(0);
-		// Armed: the hint is posted immediately, before any progress tick arrives.
-		f.status.arm(routed);
-		await flush();
-		const channel = routed.kind === "thread" ? routed.parentId : routed.conversationId;
-		expect(f.posts).toEqual([[channel, "⏳ working…", routed.kind === "thread" ? "9.001" : undefined]]);
-		await f.status.update(tick);
-		await f.status.update({ ...tick, elapsedMs: 186_000 });
-		expect(f.posts).toHaveLength(1);
-		expect(f.updates).toEqual([
-			[channel, "10.001", workingStatusText(tick)],
-			[channel, "10.001", workingStatusText({ ...tick, elapsedMs: 186_000 })],
-		]);
-		expect(f.timers.size).toBe(1);
-		await f.status.clear(routed.conversationId);
-		expect(f.deletes).toEqual([[channel, "10.001"]]);
-		expect(f.timers.size).toBe(0);
-		await f.status.update(tick);
-		expect(f.posts).toHaveLength(1);
-	});
+	return {
+		api,
+		status,
+		adds,
+		removes,
+		posts,
+		errors,
+		timers,
+		tick(ms: number) {
+			clock += ms;
+		},
+	};
 }
+const names = (entries: string[]) => entries.map((entry) => entry.split(":").at(-1));
 
-test("Slack pending post is unique and a clear deletes its late result without touching a newer turn", async () => {
-	const f = fixture();
-	let finish!: (message: { channel: string; ts: string }) => void;
-	f.api.postMessage = async () =>
-		new Promise((resolve) => {
-			finish = resolve;
-		});
-	f.status.arm(origin);
-	await flush();
-	await f.status.update(progress());
-	await f.status.clear("C1");
-	f.api.postMessage = async () => ({ channel: "C1", ts: "20.001" });
-	f.status.arm(origin);
-	await flush();
-	await f.status.update(progress());
-	finish({ channel: "C1", ts: "10.001" });
-	await flush();
-	await f.status.update(progress());
-	expect(f.deletes).toEqual([["C1", "10.001"]]);
-	expect(f.updates[0]?.[1]).toBe("20.001");
+test("presence buckets: phase from activity, clock per minute, effort from tool calls then tokens", () => {
+	expect(presenceSnapshot(progress({ elapsedMs: 5_000, toolCalls: 0, outputTokens: 0 }))).toEqual({
+		phase: "queued",
+		clock: 0,
+		effort: -1,
+	});
+	expect(presenceSnapshot(progress({ activity: { kind: "tool", label: "bash" } }))).toEqual({
+		phase: "tool",
+		clock: 2,
+		effort: 2,
+	});
+	expect(presenceEffortBucket({ toolCalls: 0, outputTokens: 5_000 })).toBe(4);
+	expect(presenceEffortBucket({ toolCalls: 40, outputTokens: 0 })).toBe(5);
+	expect(presenceMarkersFor({ phase: "writing", clock: 12, effort: 5 }).map((m) => m.slackName)).toEqual([
+		"writing_hand",
+		"clock12",
+		"100",
+	]);
+	// A 20-minute turn is still capped at the twelfth clock face.
+	expect(presenceSnapshot(progress({ elapsedMs: 20 * 60_000 })).clock).toBe(12);
 });
 
-test("Slack stale timer clears and disarms the status", async () => {
+test("presence markers never collide with the persona's reaction allowlist", async () => {
+	const { REACTION_ALLOWLIST } = await import("@gajaeway/protocol");
+	const { SLACK_REACTION_NAMES } = await import("../src/reactions");
+	for (const entry of REACTION_ALLOWLIST)
+		expect(isPresenceReaction(SLACK_REACTION_NAMES[entry.name] ?? "")).toBe(false);
+	expect(isPresenceReaction("wrench")).toBe(true);
+	expect(isPresenceReaction("+1")).toBe(false);
+});
+
+test("Slack presence is reactions on the triggering message, never a posted or edited message", async () => {
 	const f = fixture();
-	f.status.arm(origin);
+	f.status.arm(origin, "C1:1.000");
 	await flush();
+	expect(f.adds).toEqual(["C1:1.000:hourglass_flowing_sand"]);
+	expect(f.posts).toEqual([]);
+	// First tick past the window: phase → tool, one minute, three tools.
+	f.tick(PRESENCE_MIN_SWAP_MS);
+	await f.status.update(progress({ elapsedMs: 61_000, activity: { kind: "tool", label: "bash" } }));
+	expect(names(f.removes)).toEqual(["hourglass_flowing_sand"]);
+	expect(names(f.adds)).toEqual(["hourglass_flowing_sand", "wrench", "clock1", "three"]);
+	// Same buckets: nothing.
+	f.tick(PRESENCE_MIN_SWAP_MS);
+	await f.status.update(progress({ elapsedMs: 90_000, activity: { kind: "tool", label: "read" } }));
+	expect(f.adds).toHaveLength(4);
+	expect(f.removes).toHaveLength(1);
+	// Only the clock advances: one remove, one add - the phase and effort stay.
+	f.tick(PRESENCE_MIN_SWAP_MS);
+	await f.status.update(progress({ elapsedMs: 125_000, activity: { kind: "tool", label: "read" } }));
+	expect(names(f.removes)).toEqual(["hourglass_flowing_sand", "clock1"]);
+	expect(names(f.adds).at(-1)).toBe("clock2");
+	// Delivery: every marker we own comes off, nothing else is touched.
+	await f.status.clear("C1");
+	expect(new Set(names(f.removes))).toEqual(new Set(["hourglass_flowing_sand", "clock1", "wrench", "clock2", "three"]));
+	expect(f.posts).toEqual([]);
+	expect(f.timers.size).toBe(0);
+});
+
+test("Slack presence swaps are coalesced to one per window even when the phase flips", async () => {
+	const f = fixture();
+	f.status.arm(origin, "C1:1.000");
+	await flush();
+	await f.status.update(
+		progress({ elapsedMs: 3_000, toolCalls: 0, outputTokens: 0, activity: { kind: "tool", label: "bash" } }),
+	);
+	f.tick(5_000);
+	await f.status.update(
+		progress({ elapsedMs: 8_000, toolCalls: 0, outputTokens: 0, activity: { kind: "thinking", label: "thinking" } }),
+	);
+	expect(f.adds).toHaveLength(1);
+	expect(f.removes).toHaveLength(0);
+	f.tick(PRESENCE_MIN_SWAP_MS);
+	await f.status.update(
+		progress({ elapsedMs: 20_000, toolCalls: 1, outputTokens: 0, activity: { kind: "writing", label: "writing" } }),
+	);
+	expect(names(f.removes)).toEqual(["hourglass_flowing_sand"]);
+	expect(names(f.adds)).toEqual(["hourglass_flowing_sand", "writing_hand", "one"]);
+	await f.status.clear("C1");
+});
+
+test("Slack presence: a newer turn on the same conversation takes over, and the stale timer cleans up", async () => {
+	const f = fixture();
+	f.status.arm(origin, "C1:1.000");
+	await flush();
+	f.status.arm(origin, "C1:2.000");
+	await flush();
+	expect(f.removes).toEqual(["C1:1.000:hourglass_flowing_sand"]);
+	expect(f.adds).toEqual(["C1:1.000:hourglass_flowing_sand", "C1:2.000:hourglass_flowing_sand"]);
 	const timer = [...f.timers][0];
 	expect(timer?.ms).toBe(WORKING_STATUS_STALE_MS);
 	timer?.fn();
 	await flush();
-	expect(f.deletes).toEqual([["C1", "10.001"]]);
+	expect(f.removes.at(-1)).toBe("C1:2.000:hourglass_flowing_sand");
+	// Cleared: later progress is ignored.
+	f.tick(PRESENCE_MIN_SWAP_MS);
 	await f.status.update(progress());
-	expect(f.posts).toHaveLength(1);
+	expect(f.adds).toHaveLength(2);
 });
 
-test("Slack post and update failures are logged, retain an existing message, and never throw", async () => {
+test("Slack presence failures are logged, never thrown, and a clear during a swap still cleans up", async () => {
 	const f = fixture();
-	const post = f.api.postMessage;
-	f.api.postMessage = async () => {
-		throw new Error("Slack post failed");
+	f.api.addReaction = async () => {
+		throw new Error("Slack reaction failed");
 	};
-	f.status.arm(origin);
+	f.status.arm(origin, "C1:1.000");
 	await flush();
-	f.api.postMessage = post;
-	await f.status.update(progress());
-	f.api.updateMessage = async () => {
-		throw new Error("Slack update failed");
+	expect(f.errors).toHaveLength(1);
+	// Slow add: clear runs while it is in flight; the late marker is removed.
+	let finish!: () => void;
+	f.api.addReaction = async (channel: string, ts: string, name: string) => {
+		f.adds.push(`${channel}:${ts}:${name}`);
+		await new Promise<void>((resolve) => {
+			finish = resolve;
+		});
 	};
-	// Distinct texts, so neither is coalesced away: two failed edits, one message.
-	await f.status.update(progress({ elapsedMs: 186_000 }));
-	await f.status.update(progress({ elapsedMs: 246_000 }));
-	expect(f.posts).toHaveLength(1);
-	expect(f.errors).toHaveLength(3);
+	f.status.arm(origin, "C1:3.000");
+	await flush();
 	await f.status.clear("C1");
-	expect(f.deletes).toHaveLength(1);
-	f.status.arm(origin);
+	finish();
 	await flush();
-	f.api.deleteMessage = async () => {
-		throw new Error("Slack already deleted");
-	};
-	await f.status.clear("C1");
-});
-
-test("Slack ignores foreign origins even when armed", async () => {
-	const f = fixture();
-	f.status.arm({ ...origin, platform: "discord" });
+	expect(f.removes.at(-1)).toBe("C1:3.000:hourglass_flowing_sand");
+	// Malformed message id: nothing is attempted.
+	f.status.arm(origin, "not-an-id");
 	await flush();
-	f.status.arm(origin);
+	expect(f.adds.filter((entry) => entry.includes("not-an-id"))).toEqual([]);
+	// Foreign platform: ignored.
+	f.status.arm({ ...origin, platform: "discord" }, "C1:4.000");
 	await flush();
-	await f.status.update(progress({ origin: { ...origin, platform: "discord" } }));
-	expect(f.posts).toHaveLength(1);
-	expect(f.updates).toHaveLength(0);
+	expect(f.adds.some((entry) => entry.includes("4.000"))).toBe(false);
 });
 
 class Gateway implements GatewayClientLike {
@@ -241,17 +230,17 @@ class Gateway implements GatewayClientLike {
 	}
 }
 
-test("Slack progress final clears silent turns, logs failures, and unsubscribes", async () => {
+test("Slack progress final clears the gradient of silent turns, logs failures, and unsubscribes", async () => {
 	const f = fixture();
 	const gateway = new Gateway();
 	const off = subscribeSlackProgress(gateway, f.status);
-	f.status.arm(origin);
+	f.status.arm(origin, "C1:1.000");
 	await flush();
 	gateway.emit(progress());
 	await flush();
 	gateway.emit(progress({ final: true }));
 	await flush();
-	expect(f.deletes).toHaveLength(1);
+	expect(names(f.removes)).toContain("hourglass_flowing_sand");
 	off();
 	expect(gateway.handlers.size).toBe(0);
 	const errors: string[] = [];
@@ -276,7 +265,7 @@ test("Slack progress final clears silent turns, logs failures, and unsubscribes"
 
 for (const reaction of [false, true]) {
 	for (const fails of [false, true]) {
-		test(`Slack delivery clears status for reaction=${reaction} failure=${fails}`, async () => {
+		test(`Slack delivery clears presence for reaction=${reaction} failure=${fails}`, async () => {
 			const f = fixture();
 			const gateway = new Gateway();
 			let cleared = 0;
@@ -292,11 +281,7 @@ for (const reaction of [false, true]) {
 				origin,
 				text: "reply",
 				deliveryId: "delivery",
-				...(reaction
-					? {
-							reaction: { targetMessageId: "C1:1.001", emoji: "👍", emojiName: "thumbsup" },
-						}
-					: {}),
+				...(reaction ? { reaction: { targetMessageId: "C1:1.001", emoji: "👍", emojiName: "thumbsup" } } : {}),
 			} as ChatMessagePayload;
 			await settleSlackDelivery(gateway, f.api, message, console, {
 				async clear(id) {
@@ -311,7 +296,7 @@ for (const reaction of [false, true]) {
 	}
 }
 
-test("Slack inbound arms only engaged addressed turns; edits and adopted progress follow the same lifecycle", async () => {
+test("Slack inbound arms presence only for engaged addressed turns, on the triggering message", async () => {
 	for (const engaged of [true, false]) {
 		for (const engagement of [
 			{ group: false, mentioned: false, authorId: "U1" },
@@ -324,15 +309,13 @@ test("Slack inbound arms only engaged addressed turns; edits and adopted progres
 			const gateway = new ReconnectingGateway("unused", f.api, client, f.status);
 			await gateway.requestInbound("C1:1.001", origin, "hello", engagement);
 			await flush();
-			// Presence appears on acceptance itself, with no progress tick needed.
-			expect(f.posts.length).toBe(engaged && (!engagement.group || engagement.mentioned) ? 1 : 0);
-			client.emit(progress());
-			await flush();
-			expect(f.posts.length).toBe(engaged && (!engagement.group || engagement.mentioned) ? 1 : 0);
+			const expected = engaged && (!engagement.group || engagement.mentioned);
+			expect(f.adds).toEqual(expected ? ["C1:1.001:hourglass_flowing_sand"] : []);
+			expect(f.posts).toEqual([]);
 			await f.status.clear("C1");
 			gateway.sendEdit("C1:1.001", origin, "edited", engagement);
 			await flush();
-			expect(f.posts.length).toBe(engaged && (!engagement.group || engagement.mentioned) ? 2 : 0);
+			expect(f.adds).toHaveLength(expected ? 2 : 0);
 			gateway.adoptClient(new Gateway());
 			expect(client.handlers.size).toBe(0);
 			await f.status.clear("C1");
@@ -340,19 +323,11 @@ test("Slack inbound arms only engaged addressed turns; edits and adopted progres
 	}
 });
 
-test("Slack working status renders the current activity after the counters", () => {
-	expect(workingStatusText(progress({ activity: { kind: "tool", label: "bash", detail: "Running the tests" } }))).toBe(
-		"⏳ working… (2m, 3 tools, 1.2k tok) · `bash` — Running the tests",
-	);
-	expect(workingStatusText(progress({ activity: { kind: "tool", label: "read" } }))).toBe(
-		"⏳ working… (2m, 3 tools, 1.2k tok) · `read`",
-	);
-	expect(workingStatusText(progress({ activity: { kind: "thinking", label: "thinking" } }))).toBe(
-		"⏳ working… (2m, 3 tools, 1.2k tok) · thinking…",
-	);
-	// Model-authored text is escaped for mrkdwn and cannot break out of the code span.
-	expect(activitySuffix({ kind: "tool", label: "we`ird", detail: "<@U1> & <!channel>" })).toBe(
-		" · `we'ird` — &lt;@U1&gt; &amp; &lt;!channel&gt;",
-	);
-	expect(activitySuffix(undefined)).toBe("");
+test("PRESENCE_PHASE_NAMES covers every phase", () => {
+	expect(PRESENCE_PHASE_NAMES).toEqual({
+		queued: "hourglass_flowing_sand",
+		tool: "wrench",
+		thinking: "thought_balloon",
+		writing: "writing_hand",
+	});
 });

@@ -195,3 +195,70 @@ test("Slack outbound limiter paces one channel and lets deliveries jump cosmetic
 	expect(calls).toEqual(["chat.update", "chat.postMessage"]);
 	expect(sleeps.length).toBeGreaterThan(1);
 });
+
+test("Slack body-level ratelimited goes through the same bounded retry as a 429", async () => {
+	let remaining = 2;
+	const sleeps: number[] = [];
+	const api = new SlackWebApi("xoxb-secret", {
+		fetcher: async () =>
+			remaining-- > 0
+				? Response.json({ ok: false, error: "ratelimited" }, { headers: { "retry-after": "3" } })
+				: Response.json({ ok: true }),
+		sleep: async (ms) => {
+			sleeps.push(ms);
+		},
+	});
+	await api.call("chat.postMessage");
+	expect(sleeps).toEqual([3000, 3000]);
+	const always = new SlackWebApi("xoxb-secret", {
+		fetcher: async () => Response.json({ ok: false, error: "ratelimited" }),
+		sleep: async () => {},
+	});
+	const error = await always.call("chat.postMessage").catch((caught: unknown) => caught);
+	expect(error).toBeInstanceOf(SlackRateLimitedError);
+	expect((error as SlackRateLimitedError).attempts).toBe(RATE_LIMIT_MAX_RETRIES + 1);
+	// Retry-After above the cap is clamped; a missing header uses the default.
+	const capped = new SlackWebApi("xoxb-secret", {
+		fetcher: async () => new Response("{}", { status: 429, headers: { "retry-after": "999" } }),
+		sleep: async () => {},
+	});
+	expect(((await capped.call("x").catch((c: unknown) => c)) as SlackRateLimitedError).retryAfterMs).toBe(30_000);
+});
+
+test("Slack outbound limiter dispatches waiting deliveries before cosmetics and drains to idle", async () => {
+	let clock = 0;
+	const sleeping: Array<() => void> = [];
+	const limiter = new OutboundLimiter(
+		100,
+		() => clock,
+		(ms) =>
+			new Promise<void>((resolve) => {
+				sleeping.push(() => {
+					clock += ms;
+					resolve();
+				});
+			}),
+	);
+	const order: string[] = [];
+	// First slot is taken immediately; the rest queue behind it.
+	await limiter.acquire("C1", "delivery");
+	const cosmetic = limiter.acquire("C1", "cosmetic").then(() => order.push("cosmetic"));
+	const deliveries = Array.from({ length: 5 }, (_, i) =>
+		limiter.acquire("C1", "delivery").then(() => order.push(`delivery-${i}`)),
+	);
+	// Another channel is independent: no wait at all.
+	await limiter.acquire("C2", "delivery");
+	expect(limiter.pendingMs("C1")).toBe(100 + 6 * 100);
+	while (sleeping.length > 0) {
+		sleeping.shift()?.();
+		await Promise.resolve();
+		await Promise.resolve();
+	}
+	await Promise.all([cosmetic, ...deliveries]);
+	// Every delivery went first, regardless of the cosmetic arriving before them.
+	expect(order).toEqual(["delivery-0", "delivery-1", "delivery-2", "delivery-3", "delivery-4", "cosmetic"]);
+	// Once the last slot has elapsed the lane is idle and forgotten.
+	clock += 1000;
+	expect(limiter.pendingMs("C1")).toBe(0);
+	expect(limiter.pendingMs("C2")).toBe(0);
+});

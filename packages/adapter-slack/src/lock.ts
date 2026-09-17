@@ -85,7 +85,12 @@ export class AdapterLock {
 					// else fails closed: a second adapter is worse than a delayed one.
 					const orphan = await orphanedMarker(election, ports);
 					if (orphan !== undefined) {
-						await unlinkIfHolder(election, orphan);
+						// Reclaim by RENAME, never unlink: a rename of the orphan into a private
+						// tombstone can succeed for exactly one contender (the inode moves once),
+						// so two contenders that both judged it dead cannot both "win" the
+						// cleanup and remove each other's fresh markers. The loser just retries
+						// against whatever marker now exists.
+						await claimOrphan(election, `${election}.${ports.pid}.${randomUUID()}.dead`, orphan);
 						attempt = 0;
 						continue;
 					}
@@ -151,12 +156,21 @@ async function orphanedMarker(path: string, ports: AdapterLockPorts): Promise<nu
 	return owner !== ports.pid && !ports.alive(owner) ? owner : undefined;
 }
 
-/** Removes the election marker only while it still records `owner`; a newer marker is someone else's. */
-async function unlinkIfHolder(path: string, owner: number): Promise<void> {
+/**
+ * Moves an orphaned election marker out of the way, atomically. Re-checks the
+ * recorded owner right before the rename so a marker that was replaced in the
+ * meantime is left alone; if the rename itself loses (ENOENT), someone else
+ * already reclaimed it.
+ */
+async function claimOrphan(path: string, tombstone: string, owner: number): Promise<void> {
 	if ((await readHolder(path)) !== owner) return;
-	await unlink(path).catch((error: NodeJS.ErrnoException) => {
-		if (error.code !== "ENOENT") throw error;
-	});
+	try {
+		await rename(path, tombstone);
+	} catch (error) {
+		if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+		return;
+	}
+	await rm(tombstone, { force: true });
 }
 
 /** Removes the election marker only while it is still the very file this contender linked. */

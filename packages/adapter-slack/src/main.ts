@@ -48,7 +48,7 @@ import {
 	saveRecoveryCursors,
 } from "./recovery";
 import { type SlackSlashCommand, SlackSocketMode, type SocketModeOptions } from "./socket";
-import { WorkingStatus } from "./status";
+import { isPresenceReaction, WorkingStatus } from "./status";
 import { mentionedUserIds, normalizeSlackText } from "./text";
 
 export interface GatewayClientLike {
@@ -536,7 +536,7 @@ export class ReconnectingGateway implements GatewayClientLike {
 					...(receivedAt ? { receivedAt } : {}),
 				});
 				this.#inbound.addIfAbsent(messageId);
-				if (result?.engaged && addressedTurn(engagement)) this.status?.arm(origin);
+				if (result?.engaged && addressedTurn(engagement)) this.status?.arm(origin, messageId);
 				return { verdict: "acked", ...(result ? { result } : {}) };
 			} catch (error) {
 				console.error(`Slack chat.send failed: ${errorText(error)}`);
@@ -597,7 +597,7 @@ export class ReconnectingGateway implements GatewayClientLike {
 					}
 					try {
 						const result = await client.request<{ engaged?: boolean } | undefined>("chat.edit", edit);
-						if (result?.engaged && addressedTurn(edit.engagement)) this.status?.arm(edit.origin);
+						if (result?.engaged && addressedTurn(edit.engagement)) this.status?.arm(edit.origin, edit.messageId);
 						// A superseding edit queued during the request must drain in this pass too.
 						if (this.#editOutbox.get(edit.messageId) === edit) this.#editOutbox.delete(edit.messageId);
 					} catch (error) {
@@ -683,6 +683,11 @@ export async function startSlackAdapter(
 	/** Resets quarantine strike counts so the next pass probes unreadable channels again. */
 	readonly reprobeQuarantined: () => Promise<void>;
 	readonly recovery: RecoveryScheduler;
+	/** Outage bookkeeping for the recovery gate; the socket and gateway handlers call these. */
+	readonly links: {
+		readonly disconnected: (link: "socket" | "gateway") => void;
+		readonly reconnected: (link: "socket" | "gateway") => void;
+	};
 }> {
 	const api = ports.api ?? new SlackWebApi(config.botToken, { limiter: new OutboundLimiter() });
 	const log = ports.log ?? console;
@@ -796,7 +801,11 @@ export async function startSlackAdapter(
 				if (result?.engaged) await rememberThread(admitted.origin);
 			});
 		} else if (event.type === "reaction_added" || event.type === "reaction_removed") {
-			const description = describeSlackReaction(event as unknown as SlackReactionEvent, identity.botUserId, directory);
+			const reaction = event as unknown as SlackReactionEvent;
+			// Our own presence markers are not engagement, even if the identity check
+			// ever misses (e.g. a legacy bot user id): never report them inbound.
+			if (reaction.user === identity.botUserId && isPresenceReaction(reaction.reaction)) return;
+			const description = describeSlackReaction(reaction, identity.botUserId, directory);
 			if (description) gateway.sendReaction(description);
 		}
 	};
@@ -834,7 +843,9 @@ export async function startSlackAdapter(
 	// does not already dedupe, so a pass is skipped when the previous clean pass
 	// is recent and no outage longer than RECOVERY_OUTAGE_GATE_MS was observed.
 	let lastCleanPassAt: number | undefined;
-	let disconnectedAt: number | undefined;
+	// Socket and gateway links drop independently; each outage is timed on its own
+	// so a long socket outage is not erased by a quick gateway reconnect.
+	const disconnectedAt: { socket?: number; gateway?: number } = {};
 	let longOutageSeen = false;
 	const recoverMissedMessages = async (): Promise<boolean> => {
 		if (!gateway.connected) return false;
@@ -976,8 +987,11 @@ export async function startSlackAdapter(
 			const root = parseSlackMessageId(threadKey);
 			if (!root) continue;
 			if ((current().quarantined[root.channel]?.failures ?? 0) >= RECOVERY_UNREADABLE_QUARANTINE_ATTEMPTS) continue;
+			// The root's cursor lives on whichever record knows it; an unengaged pending
+			// root advances its own so repeated bounded walks drain toward the tail.
+			const cursor = current().participatedThreads[threadKey]?.through ?? current().pendingThreads[threadKey]?.through;
 			const outcome = await recoverThread(port, root.channel, root.ts, {
-				cursor: current().participatedThreads[threadKey]?.through,
+				cursor,
 				nowMs,
 				botUserId: identity.botUserId,
 				deliver,
@@ -1004,12 +1018,18 @@ export async function startSlackAdapter(
 					live && outcome.advancedTo
 						? { ...state.participatedThreads, [threadKey]: { ...live, through: outcome.advancedTo } }
 						: state.participatedThreads;
-				const { [threadKey]: _drained, ...pendingThreads } = state.pendingThreads;
+				const { [threadKey]: pending, ...pendingThreads } = state.pendingThreads;
 				return {
 					...state,
 					participatedThreads,
-					// A truncated walk keeps its pending entry so the next pass continues.
-					pendingThreads: outcome.truncated ? state.pendingThreads : pendingThreads,
+					// A truncated walk keeps its pending entry, advanced to what it walked past.
+					pendingThreads:
+						outcome.truncated && pending
+							? {
+									...pendingThreads,
+									[threadKey]: { ...pending, ...(outcome.advancedTo ? { through: outcome.advancedTo } : {}) },
+								}
+							: pendingThreads,
 				};
 			});
 			if (outcome.truncated) completed = false;
@@ -1023,12 +1043,13 @@ export async function startSlackAdapter(
 		}
 		return clean;
 	};
-	const noteDisconnected = (): void => {
-		disconnectedAt ??= now();
+	const noteDisconnected = (link: "socket" | "gateway"): void => {
+		disconnectedAt[link] ??= now();
 	};
-	const noteConnected = (): void => {
-		if (disconnectedAt !== undefined && now() - disconnectedAt >= RECOVERY_OUTAGE_GATE_MS) longOutageSeen = true;
-		disconnectedAt = undefined;
+	const noteConnected = (link: "socket" | "gateway"): void => {
+		const since = disconnectedAt[link];
+		if (since !== undefined && now() - since >= RECOVERY_OUTAGE_GATE_MS) longOutageSeen = true;
+		disconnectedAt[link] = undefined;
 	};
 	/**
 	 * A fresh link is the moment to re-check channels that were unreadable: the
@@ -1067,13 +1088,13 @@ export async function startSlackAdapter(
 		}
 		return recoverMissedMessages();
 	});
-	const reconnected = (): void => {
-		noteConnected();
+	const reconnected = (link: "socket" | "gateway"): void => {
+		noteConnected(link);
 		reprobeRequested = true;
 		recovery.trigger();
 	};
-	gateway.onConnected = reconnected;
-	gateway.onDisconnected = noteDisconnected;
+	gateway.onConnected = () => reconnected("gateway");
+	gateway.onDisconnected = () => noteDisconnected("gateway");
 	await gateway.connect();
 	const socket = new SlackSocketMode(
 		() => api.connectionsOpen(config.appToken),
@@ -1082,11 +1103,11 @@ export async function startSlackAdapter(
 			onSlashCommand: handleSlashCommand,
 			onConnected: () => {
 				log.log("Slack adapter connected.");
-				reconnected();
+				reconnected("socket");
 			},
 			onDisconnected: (reason) => {
 				log.log(`Slack socket disconnected: ${reason}`);
-				noteDisconnected();
+				noteDisconnected("socket");
 			},
 		},
 		{ factory: ports.socketFactory, log },
@@ -1104,6 +1125,7 @@ export async function startSlackAdapter(
 		recoverMissedMessages,
 		reprobeQuarantined,
 		recovery,
+		links: { disconnected: noteDisconnected, reconnected },
 	};
 }
 

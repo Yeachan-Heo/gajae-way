@@ -113,8 +113,12 @@ class Api extends SlackWebApi {
 		this.posts.push(args);
 		return { channel: args[0], ts: "2.0" };
 	}
-	override async addReaction(...args: [string, string, string]) {
-		this.reactions.push(args);
+	override async addReaction(channel: string, ts: string, name: string) {
+		this.reactions.push([channel, ts, name]);
+	}
+	removed: unknown[][] = [];
+	override async removeReaction(channel: string, ts: string, name: string) {
+		this.removed.push([channel, ts, name]);
 	}
 }
 async function fixture(
@@ -781,7 +785,7 @@ test("RT-SLACK-39 slash acknowledgements reflect restart failure duplicates and 
 	);
 });
 
-test("RT-SLACK-40 addressed accepted turns post working status before any progress", async () => {
+test("RT-SLACK-40 addressed accepted turns get a presence reaction on the triggering message before any progress", async () => {
 	const api = new Api();
 	const client = new Client();
 	client.engaged = true;
@@ -789,16 +793,23 @@ test("RT-SLACK-40 addressed accepted turns post working status before any progre
 	const gateway = new ReconnectingGateway("/tmp/no-redteam.sock", api, client, status);
 	await gateway.requestInbound("C1:1.0", origin, "overheard", engagement);
 	await flush();
+	expect(api.reactions).toEqual([]);
 	expect(api.posts).toEqual([]);
 	await gateway.requestInbound("C1:2.0", origin, "addressed", { ...engagement, mentioned: true });
 	await flush();
-	expect(api.posts).toEqual([["C1", "⏳ working…", undefined]]);
+	// Presence is a reaction on the message itself, never a posted message.
+	expect(api.reactions).toEqual([["C1", "2.0", "hourglass_flowing_sand"]]);
+	expect(api.posts).toEqual([]);
 	const thread = { platform: "slack", kind: "thread", conversationId: "C1:1.0", parentId: "C1" } as const;
 	await gateway.requestInbound("C1:3.0", thread, "thread", { ...engagement, mentioned: true });
 	await flush();
-	expect(api.posts[1]).toEqual(["C1", "⏳ working…", "1.0"]);
+	expect(api.reactions[1]).toEqual(["C1", "3.0", "hourglass_flowing_sand"]);
 	await status.clear("C1");
 	await status.clear("C1:1.0");
+	expect(api.removed).toEqual([
+		["C1", "2.0", "hourglass_flowing_sand"],
+		["C1", "3.0", "hourglass_flowing_sand"],
+	]);
 });
 
 test("RT-SLACK-41 unknown rocket reaction fails definitively without a Slack call", async () => {

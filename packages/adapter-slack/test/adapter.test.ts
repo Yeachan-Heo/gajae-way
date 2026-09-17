@@ -1114,3 +1114,101 @@ test("Slack drains queued edits before a reconnect starts recovery", async () =>
 		f.recovery.stop();
 	}
 });
+
+test("Slack recovery drains an unengaged truncated thread across passes instead of re-walking its prefix", async () => {
+	// G3-THREAD-CONTINUATION: a pending root carries its own cursor.
+	const f = await fixture({ C1: { engagement: "open" } }, { autoRecover: false });
+	try {
+		f.client.engaged = false; // nobody engages: no participatedThreads entry ever appears
+		const replies = Array.from({ length: 5 }, (_, i) => ({
+			type: "message",
+			user: "U1",
+			ts: `1700000001.00000${i + 1}`,
+			text: `reply ${i + 1}`,
+		}));
+		f.api.history.C1 = [{ type: "message", user: "U1", ts: "1700000001.000000", text: "root", reply_count: 5 }];
+		f.api.conversationsReplies = async (
+			_channel: string,
+			_ts: string,
+			options: { oldest?: string; cursor?: string; limit?: number } = {},
+		) => {
+			const after = replies.filter((r) => Number(r.ts) > Number(options.oldest ?? 0));
+			const page = options.cursor === "p2" ? after.slice(2, 4) : after.slice(0, 2);
+			const more = options.cursor === "p2" ? after.length > 4 : after.length > 2;
+			return {
+				messages: page,
+				has_more: more,
+				...(more ? { next_cursor: options.cursor === "p2" ? "p3" : "p2" } : {}),
+			};
+		};
+		const sent = () =>
+			f.client.requests.filter((r) => r.verb === "chat.send").map((r) => (r.params as { text: string }).text);
+		expect(await f.recoverMissedMessages()).toBe(false);
+		let cursors = await loadRecoveryCursors(f.recoveryCursorPath);
+		expect(Object.keys(cursors.participatedThreads)).toEqual([]);
+		expect(cursors.pendingThreads["C1:1700000001.000000"]?.through).toBe("1700000001.000004");
+		expect(sent()).toEqual(["root", "reply 1", "reply 2", "reply 3", "reply 4"]);
+		// The next pass resumes after reply 4, never re-sending 1-4.
+		expect(await f.recoverMissedMessages()).toBe(true);
+		cursors = await loadRecoveryCursors(f.recoveryCursorPath);
+		expect(cursors.pendingThreads["C1:1700000001.000000"]).toBeUndefined();
+		expect(sent()).toEqual(["root", "reply 1", "reply 2", "reply 3", "reply 4", "reply 5"]);
+	} finally {
+		f.socket.stop();
+	}
+});
+
+test("Slack recovery gate times socket and gateway outages independently", async () => {
+	// G4-OVERLAPPING-OUTAGES: a quick gateway reconnect must not erase a long socket outage.
+	let clock = 1_700_000_100_000;
+	const api = new Api();
+	const gateway = new Gateway();
+	const adapter = await startSlackAdapter(
+		{
+			botToken: "xoxb-test",
+			appToken: "xapp-test",
+			botTokenFile: "bot",
+			appTokenFile: "app",
+			configPath: "test",
+			gatewaySocket: `/tmp/slack-missing-${crypto.randomUUID()}.sock`,
+			channels: { C1: { engagement: "open" } },
+		},
+		{
+			api,
+			recoveryCursorPath: `/tmp/slack-recovery-${crypto.randomUUID()}/adapters/slack/recovery-cursor.json`,
+			now: () => clock,
+			log: { log() {}, error() {} },
+			socketFactory: () => {
+				const socket = new Socket();
+				queueMicrotask(() => socket.onopen?.({}));
+				return socket;
+			},
+		},
+	);
+	try {
+		adapter.gateway.onConnected = undefined;
+		adapter.gateway.adoptClient(gateway);
+		api.history.C1 = [];
+		expect(await adapter.recoverMissedMessages()).toBe(true); // clean pass now
+		const calls = () => api.historyCalls.length;
+		const before = calls();
+		// Socket drops at t+1s; gateway drops at t+2s and is back at t+3s; socket back at t+10s.
+		clock += 1_000;
+		adapter.links.disconnected("socket");
+		clock += 1_000;
+		adapter.links.disconnected("gateway");
+		clock += 1_000;
+		adapter.links.reconnected("gateway");
+		await adapter.recovery.idle();
+		// Gateway blip of 1s after a clean pass 3s ago: gated, no history reads.
+		expect(calls()).toBe(before);
+		clock += 7_000;
+		adapter.links.reconnected("socket");
+		await adapter.recovery.idle();
+		// The socket was down 9s: that outage earns a pass even though the gateway blip did not.
+		expect(calls()).toBeGreaterThan(before);
+	} finally {
+		adapter.socket.stop();
+		adapter.recovery.stop();
+	}
+});

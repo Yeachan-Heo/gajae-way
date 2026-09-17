@@ -278,3 +278,28 @@ test("a plain answer to a threaded DM stays in that DM thread without a [REPLY] 
 	expect(slack.posts).toEqual([{ channel: "D1", text: "in your thread", threadTs: "1726543200.000001" }]);
 	expect(database.deliveryRows().map((row) => row.state)).toEqual(["confirmed"]);
 });
+
+test("an edited channel message is answered in the ORIGINAL message's thread, never at a synthetic edit id", async () => {
+	// G4-THREAD-EDIT: chat.edit rows carry a synthetic `edit:…` id that passes the
+	// generic platform-id regex but is not a Slack channel:ts. The default thread
+	// root must be the original message the edit points at.
+	const { config, database } = await gateway(() => "answer to the edit");
+	const slack = fakeSlackApi();
+	const adapter = new ReconnectingGateway(config.socketPath, slack.api);
+	await adapter.connect();
+	await adapter.requestInbound(slackMessageId("C1", "1726543210.000800"), CHANNEL_ORIGIN, "first draft", {
+		mentioned: true,
+		group: true,
+		authorId: "U1",
+	});
+	await settle();
+	slack.posts.length = 0;
+	adapter.sendEdit(slackMessageId("C1", "1726543210.000800"), CHANNEL_ORIGIN, "edited draft", {
+		mentioned: true,
+		group: true,
+		authorId: "U1",
+	});
+	await settle();
+	expect(slack.posts).toEqual([{ channel: "C1", text: "answer to the edit", threadTs: "1726543210.000800" }]);
+	expect(database.deliveryRows().every((row) => row.state === "confirmed")).toBe(true);
+});

@@ -79,34 +79,71 @@ export interface SlackWebApiOptions {
  * by its caller rather than sent late.
  */
 export class OutboundLimiter {
-	readonly #next = new Map<string, number>();
-	readonly #queued = new Map<string, number>();
+	readonly #channels = new Map<string, ChannelLane>();
 	constructor(
 		readonly minIntervalMs = 1_000,
 		readonly now: () => number = Date.now,
 		readonly sleep: (ms: number) => Promise<void> = (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
 	) {}
 
-	/** Waits for this channel's next slot; `priority` writes jump ahead of pending cosmetics. */
+	/**
+	 * Waits for this channel's next slot. Slots are handed out one at a time,
+	 * and at each hand-out every waiting delivery goes before any waiting
+	 * cosmetic - priority is decided at dispatch, not by arrival order, so a
+	 * burst of status traffic can never delay a reply that arrived after it.
+	 */
 	async acquire(channel: string, priority: "delivery" | "cosmetic" = "delivery"): Promise<void> {
-		const queued = this.#queued.get(channel) ?? 0;
-		// A cosmetic behind a queue of deliveries yields its slot to them.
-		const slotsAhead = priority === "cosmetic" ? queued : 0;
-		const at = Math.max(this.now(), this.#next.get(channel) ?? 0) + slotsAhead * this.minIntervalMs;
-		this.#next.set(channel, at + this.minIntervalMs);
-		if (priority === "delivery") this.#queued.set(channel, queued + 1);
-		try {
-			const wait = at - this.now();
-			if (wait > 0) await this.sleep(wait);
-		} finally {
-			if (priority === "delivery") this.#queued.set(channel, Math.max(0, (this.#queued.get(channel) ?? 1) - 1));
-		}
+		const lane = this.#lane(channel);
+		await new Promise<void>((resolve) => {
+			(priority === "delivery" ? lane.deliveries : lane.cosmetics).push(resolve);
+			void this.#drain(channel, lane);
+		});
 	}
 
-	/** How long a cosmetic write would wait right now; callers skip stale cosmetics. */
+	/** How long a new write on this channel would wait right now; 0 once the lane is idle. */
 	pendingMs(channel: string): number {
-		return Math.max(0, (this.#next.get(channel) ?? 0) - this.now());
+		const lane = this.#channels.get(channel);
+		if (!lane) return 0;
+		const queued = lane.deliveries.length + lane.cosmetics.length;
+		return Math.max(0, lane.nextAt - this.now()) + queued * this.minIntervalMs;
 	}
+
+	#lane(channel: string): ChannelLane {
+		let lane = this.#channels.get(channel);
+		if (!lane) {
+			lane = { nextAt: 0, deliveries: [], cosmetics: [], draining: false };
+			this.#channels.set(channel, lane);
+		}
+		return lane;
+	}
+
+	async #drain(channel: string, lane: ChannelLane): Promise<void> {
+		if (lane.draining) return;
+		lane.draining = true;
+		try {
+			while (lane.deliveries.length > 0 || lane.cosmetics.length > 0) {
+				const wait = lane.nextAt - this.now();
+				if (wait > 0) await this.sleep(wait);
+				const next = lane.deliveries.shift() ?? lane.cosmetics.shift();
+				if (!next) break;
+				lane.nextAt = Math.max(this.now(), lane.nextAt) + this.minIntervalMs;
+				next();
+			}
+		} finally {
+			lane.draining = false;
+			// Idle lanes are forgotten once their last slot has elapsed, so the map is bounded by activity.
+			if (lane.deliveries.length === 0 && lane.cosmetics.length === 0 && this.#channels.get(channel) === lane) {
+				if (lane.nextAt <= this.now()) this.#channels.delete(channel);
+			}
+		}
+	}
+}
+
+interface ChannelLane {
+	nextAt: number;
+	readonly deliveries: Array<() => void>;
+	readonly cosmetics: Array<() => void>;
+	draining: boolean;
 }
 
 export class SlackWebApi {
@@ -138,9 +175,11 @@ export class SlackWebApi {
 				},
 				body: JSON.stringify(parameters),
 			});
-			// 429 carries Retry-After in seconds; honour it, bounded, then give up as
-			// ambiguous. Never a definitive refusal: Slack did not judge the payload.
-			if (response.status !== 429) break;
+			// A 429, or a 200 whose body says `ratelimited`, both mean "slow down".
+			// Honour Retry-After (seconds), bounded, then give up as ambiguous. Never a
+			// definitive refusal: Slack did not judge the payload.
+			const limited = response.status === 429 || (await bodySaysRateLimited(response));
+			if (!limited) break;
 			const header = Number(response.headers.get("retry-after"));
 			retryAfterMs = Math.min(
 				RATE_LIMIT_MAX_WAIT_MS,
@@ -166,8 +205,6 @@ export class SlackWebApi {
 			throw new SlackUnreadableResponseError(response.status, error);
 		}
 		if (isObject(body) && body.ok === false) {
-			// `ratelimited` in the body without a 429 status is the same signal.
-			if (body.error === "ratelimited") throw new SlackRateLimitedError(RATE_LIMIT_DEFAULT_WAIT_MS, 1);
 			throw new SlackApiError(response.status, typeof body.error === "string" ? body.error : `http_${response.status}`);
 		}
 		if (!response.ok) throw new SlackApiError(response.status, `http_${response.status}`);
@@ -202,12 +239,27 @@ export class SlackWebApi {
 		return this.call("chat.delete", { channel, ts });
 	}
 
-	async addReaction(channel: string, timestamp: string, name: string): Promise<void> {
-		await this.limiter?.acquire(channel, "delivery");
+	async addReaction(
+		channel: string,
+		timestamp: string,
+		name: string,
+		priority: "delivery" | "cosmetic" = "delivery",
+	): Promise<void> {
+		await this.limiter?.acquire(channel, priority);
 		try {
 			await this.call("reactions.add", { channel, timestamp, name });
 		} catch (error) {
 			if (!(error instanceof SlackApiError) || error.code !== "already_reacted") throw error;
+		}
+	}
+
+	/** Removes our own reaction; one that is already gone counts as removed. */
+	async removeReaction(channel: string, timestamp: string, name: string): Promise<void> {
+		await this.limiter?.acquire(channel, "cosmetic");
+		try {
+			await this.call("reactions.remove", { channel, timestamp, name });
+		} catch (error) {
+			if (!(error instanceof SlackApiError) || error.code !== "no_reaction") throw error;
 		}
 	}
 
@@ -257,6 +309,21 @@ export function deliveryFailureIsAmbiguous(error: unknown): boolean {
 function historyPage(body: HistoryResponse): SlackHistoryPage {
 	const cursor = body.response_metadata?.next_cursor ?? body.next_cursor;
 	return { messages: body.messages, has_more: body.has_more, ...(cursor ? { next_cursor: cursor } : {}) };
+}
+
+/**
+ * Peeks at a cloned body for `{"ok":false,"error":"ratelimited"}` without
+ * consuming the response the caller still has to parse. Anything unreadable
+ * is "not rate limited" - the normal path will classify it.
+ */
+async function bodySaysRateLimited(response: Response): Promise<boolean> {
+	if (response.status !== 200) return false;
+	try {
+		const body = (await response.clone().json()) as unknown;
+		return isObject(body) && body.ok === false && body.error === "ratelimited";
+	} catch {
+		return false;
+	}
 }
 
 function isObject(value: unknown): value is Record<string, unknown> {

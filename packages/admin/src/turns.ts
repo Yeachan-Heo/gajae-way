@@ -32,6 +32,8 @@ export type TrackedTurn = {
 	readonly elapsedMs: number;
 	readonly toolCalls: number;
 	readonly outputTokens: number;
+	/** The last activity the gateway reported (tool name + intent, thinking, writing); operator-only detail. */
+	readonly activity?: ChatProgressPayload["activity"];
 	/**
 	 * True once at least one `chat.progress` heartbeat has been seen. A turn that
 	 * finishes inside the gateway's first 15s heartbeat window is only ever seen
@@ -70,6 +72,11 @@ export class TurnTracker {
 			elapsedMs: payload.elapsedMs,
 			toolCalls: payload.toolCalls,
 			outputTokens: payload.outputTokens,
+			...(payload.activity
+				? { activity: payload.activity }
+				: existing?.activity
+					? { activity: existing.activity }
+					: {}),
 			observed: true,
 		});
 		return true;
@@ -88,6 +95,7 @@ export class TurnTracker {
 			elapsedMs: existing ? at - existing.startedAt : 0,
 			toolCalls: existing?.toolCalls ?? 0,
 			outputTokens: existing?.outputTokens ?? 0,
+			...(existing?.activity ? { activity: existing.activity } : {}),
 			observed: existing?.observed ?? false,
 			finishedAt: at,
 			outcome: outcomeOf(message),

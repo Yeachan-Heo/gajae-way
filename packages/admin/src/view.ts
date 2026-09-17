@@ -136,8 +136,16 @@ function turnRow(turn: TrackedTurn, state: "running" | "stalled" | "finished", n
 	// Evidence of work, not assertion of work. A turn that finished inside the
 	// gateway's first heartbeat window produced no counters at all, and printing
 	// its zeros would read as "it did nothing" rather than "we never saw".
+	// The chat surfaces only show a marker gradient; the tool name and its
+	// stated intent belong here, where the operator is.
+	const doing =
+		state !== "finished" && turn.activity
+			? turn.activity.kind === "tool"
+				? ` · ${turn.activity.label}${turn.activity.detail ? ` — ${turn.activity.detail}` : ""}`
+				: ` · ${turn.activity.label}…`
+			: "";
 	const evidence = turn.observed
-		? `${pluralise(turn.toolCalls, "tool call")} · ${formatCount(turn.outputTokens)} tokens out`
+		? `${pluralise(turn.toolCalls, "tool call")} · ${formatCount(turn.outputTokens)} tokens out${doing}`
 		: "no progress heartbeat was seen for this turn";
 	const elapsed = state === "finished" ? turn.elapsedMs : Math.max(turn.elapsedMs, now.getTime() - turn.startedAt);
 	const ceiling = formatDuration(TURN_CEILING_MS);
