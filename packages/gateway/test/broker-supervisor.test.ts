@@ -52,6 +52,42 @@ test("failed relay signals never turn an unconfirmed exit into clean shutdown", 
 	}
 }, 10_000);
 
+test("the stdio relay binds its agent directory through the environment, never a --agent-dir flag", async () => {
+	// gjc 0.16.7: `sdk serve` rejects --agent-dir ("unknown argument", exit 2
+	// right after the hello frame). A relay that dies in under a second is
+	// counted as a reopen failure; six of those declare the stream dead and hold
+	// the turn. The flag therefore silences every long turn (live, 2026-09-17).
+	const spawned: Array<{ cmd: readonly string[]; env: Record<string, string> }> = [];
+	let finish = (_code: number) => {};
+	const spawn = ((options: { cmd: readonly string[]; env: Record<string, string> }) => {
+		spawned.push(options);
+		const exited = new Promise<number>((resolve) => {
+			finish = resolve;
+		});
+		return {
+			exited,
+			stdout: new ReadableStream(),
+			kill() {
+				finish(0);
+			},
+		};
+	}) as unknown as SpawnFn;
+	const value = client({ spawn });
+	await value.start();
+	const relay = value.openStream("owned-session");
+	try {
+		expect(spawned).toHaveLength(1);
+		const { cmd, env } = spawned[0]!;
+		expect(cmd.slice(1)).toEqual(["sdk", "serve", "--stdio", "--session", "owned-session"]);
+		expect(cmd.some((arg) => arg.startsWith("--agent-dir"))).toBe(false);
+		// The binding still happens - through the trusted environment.
+		expect(env.GJC_CODING_AGENT_DIR).toBe(value.agentDir);
+		expect(env.PI_CODING_AGENT_DIR).toBe(value.agentDir);
+	} finally {
+		relay.close();
+	}
+});
+
 test("CLI timeout with unconfirmed termination fences client generation until observed exit", async () => {
 	let finish = (_code: number) => {};
 	const exited = new Promise<number>((resolve) => {
@@ -160,8 +196,19 @@ test("symlink profile aliases share canonical authority, CLI and relay environme
 	}
 	await linked.stop();
 	expect(invocations).toHaveLength(2);
+	const [cliInvocation, relayInvocation] = invocations as [(typeof invocations)[0], (typeof invocations)[0]];
+	// The CLI binds by flag; the relay (`sdk serve`) accepts no --agent-dir and
+	// binds by environment only. Both must resolve the alias to the same profile.
+	expect(cliInvocation.cmd[cliInvocation.cmd.indexOf("--agent-dir") + 1]).toBe(direct.agentDir);
+	expect(relayInvocation.cmd).toEqual([
+		relayInvocation.cmd[0],
+		"sdk",
+		"serve",
+		"--stdio",
+		"--session",
+		"owned-session",
+	]);
 	for (const invocation of invocations) {
-		expect(invocation.cmd[invocation.cmd.indexOf("--agent-dir") + 1]).toBe(direct.agentDir);
 		expect(invocation.env.GJC_CODING_AGENT_DIR).toBe(direct.agentDir);
 		expect(invocation.env.PI_CODING_AGENT_DIR).toBe(direct.agentDir);
 		expect(invocation.env.GJC_AGENT_DIR).toBe(direct.agentDir);

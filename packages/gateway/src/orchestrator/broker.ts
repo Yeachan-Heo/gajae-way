@@ -512,8 +512,14 @@ export class GlobalGjcClient {
 		this.#assertAgentDirIdentity();
 		if (!sessionId || sessionId.startsWith("-") || /[\r\n\0]/.test(sessionId)) throw new Error("invalid session ID");
 		if (this.#stopped || !this.#available) throw new GjcCliUnavailableError("broker unavailable");
+		// `gjc sdk serve` takes no `--agent-dir` (gjc 0.16.7: "unknown argument",
+		// exit 2 after the hello frame). It binds through GJC_CODING_AGENT_DIR,
+		// which #env already pins to this.agentDir. Passing the flag made every
+		// relay die in <1s, the runner counted six sub-5s reopens as a dead
+		// stream, declared a retention gap, and held the turn - the persona went
+		// mute on long turns and presence never advanced (live, 2026-09-17).
 		const child = this.#spawn({
-			cmd: [this.executable, ...bindAgentDir(["sdk", "serve", "--stdio", "--session", sessionId], this.agentDir)],
+			cmd: [this.executable, "sdk", "serve", "--stdio", "--session", sessionId],
 			cwd: this.#cwd,
 			env: this.#env,
 			stdin: "pipe",
