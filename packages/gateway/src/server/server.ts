@@ -34,7 +34,7 @@ import { parseLaneJobRecord } from "@gajaeway/subsession";
 import { type ConfigOverrides, type GatewayConfig, type ReloadResult, reloadConfig } from "../config";
 import { DeliveryService } from "../delivery/delivery";
 import { ReactionBudget } from "../delivery/reaction-budget";
-import { BotAudienceTurnGuard, decideEngagement } from "../engagement/policy";
+import { BotAudienceTurnGuard, decideEngagement, threadFollowUpEngaged } from "../engagement/policy";
 import { ACTION_GUARD_SYSTEM_NOTICE } from "../guard/action-guard";
 import { autolinkCorpus } from "../memory/autolink";
 import { MemoryClosureQueue } from "../memory/closure";
@@ -1247,7 +1247,12 @@ async function sendChat(
 			typeof params.engagement.authorId !== "string")
 	)
 		throw new ProtocolError("invalid_params", "non-loopback chat.send requires engagement");
-	const engagementDecision = decideEngagement(origin, params.engagement as never, runtime.config);
+	const engagementDecision = decideEngagement(
+		origin,
+		params.engagement as never,
+		runtime.config,
+		threadFollowUpEngaged(origin, key, options.database),
+	);
 	const authorIsBot = (params.engagement as { authorIsBot?: unknown } | undefined)?.authorIsBot === true;
 	if (!authorIsBot) runtime.botAudienceTurns.recordHumanMessage(key);
 	const engaged =
@@ -1384,7 +1389,12 @@ async function editChat(
 	}
 	// The recorded body now says what the message says now.
 	options.database.contextUpdateBody(key, params.messageId, params.text);
-	const engagementDecision = decideEngagement(origin, params.engagement as never, runtime.config);
+	const engagementDecision = decideEngagement(
+		origin,
+		params.engagement as never,
+		runtime.config,
+		threadFollowUpEngaged(origin, key, options.database),
+	);
 	const authorIsBot = (params.engagement as { authorIsBot?: unknown } | undefined)?.authorIsBot === true;
 	if (!authorIsBot) runtime.botAudienceTurns.recordHumanMessage(key);
 	if (

@@ -1163,6 +1163,34 @@ export class GatewayDatabase {
 		);
 	}
 
+	/**
+	 * True when this origin has ever driven a turn as the trigger. `turn_count` is
+	 * NOT usable for this: only monitor authoring increments it, so a conversation
+	 * that answered ten chat turns still reads zero (verified against a live
+	 * database, 2026-09-17). The trigger role on an inbound row is the durable
+	 * record of "the persona was asked here and bound a turn to it".
+	 */
+	originTriggeredTurn(originKey: string): boolean {
+		return (
+			this.#database
+				.query<{ n: number }, [string]>(
+					"SELECT 1 AS n FROM inbound_messages WHERE origin_key = ? AND turn_role = 'trigger' LIMIT 1",
+				)
+				.get(originKey) !== null
+		);
+	}
+
+	/** True when one specific message drove a turn in that origin. */
+	messageTriggeredTurn(originKey: string, messageId: string): boolean {
+		return (
+			this.#database
+				.query<{ n: number }, [string, string]>(
+					"SELECT 1 AS n FROM inbound_messages WHERE origin_key = ? AND message_id = ? AND turn_role = 'trigger' LIMIT 1",
+				)
+				.get(originKey, messageId) !== null
+		);
+	}
+
 	/** Completed turns in the current epoch, without mutating the counter. */
 	sessionTurnCount(originKey: string): number {
 		return (
