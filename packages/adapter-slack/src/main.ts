@@ -517,8 +517,12 @@ export class ReconnectingGateway implements GatewayClientLike {
 		const pending = this.#pendingSends.get(messageId);
 		// Joining an in-flight send shares its verdict; a second caller never claims
 		// its own "acked" for a send it did not make.
-		if (pending)
-			return (await pending).verdict === "unavailable" ? { verdict: "unavailable" } : { verdict: "duplicate" };
+		if (pending) {
+			const shared = await pending;
+			// A failed send is returned as-is so the joiner can classify it; only a
+			// successful send becomes "duplicate" for the second caller.
+			return shared.verdict === "unavailable" ? shared : { verdict: "duplicate" };
+		}
 		if (this.#inbound.has(messageId)) return { verdict: "duplicate" };
 		const attempt = (async (): Promise<RecoveredSend> => {
 			try {
@@ -937,15 +941,33 @@ export async function startSlackAdapter(
 				};
 			});
 			if (outcome.truncated) completed = false;
+			// A reply walk that hit its bound is drained per root on later passes,
+			// whether or not the persona engaged in anything fetched so far: the
+			// unread reply that mentions it may be exactly the one still unfetched.
+			for (const threadTs of outcome.truncatedThreads ?? []) {
+				completed = false;
+				await mutate((state) => ({
+					...state,
+					pendingThreads: {
+						...state.pendingThreads,
+						[slackMessageId(channel, threadTs)]: { since: new Date(nowMs).toISOString() },
+					},
+				}));
+			}
 		}
-		// Threads the persona took part in: their parents may be below the channel
-		// watermark by now, so each root is walked on its own bounded cursor.
-		for (const [threadKey, entry] of Object.entries(current().participatedThreads)) {
+		// Threads walked on their own bounded cursor: ones the persona took part in
+		// (their parents may be below the channel watermark by now) and ones whose
+		// reply walk was cut short above.
+		const threadKeys = new Set([
+			...Object.keys(current().participatedThreads),
+			...Object.keys(current().pendingThreads),
+		]);
+		for (const threadKey of threadKeys) {
 			const root = parseSlackMessageId(threadKey);
 			if (!root) continue;
 			if ((current().quarantined[root.channel]?.failures ?? 0) >= RECOVERY_UNREADABLE_QUARANTINE_ATTEMPTS) continue;
 			const outcome = await recoverThread(port, root.channel, root.ts, {
-				cursor: entry.through,
+				cursor: current().participatedThreads[threadKey]?.through,
 				nowMs,
 				botUserId: identity.botUserId,
 				deliver,
@@ -956,23 +978,30 @@ export async function startSlackAdapter(
 					// The thread is gone or unreadable: forget it rather than strike the channel.
 					await mutate((state) => {
 						const { [threadKey]: _gone, ...participatedThreads } = state.participatedThreads;
-						return { ...state, participatedThreads };
+						const { [threadKey]: _pending, ...pendingThreads } = state.pendingThreads;
+						return { ...state, participatedThreads, pendingThreads };
 					});
 				}
 				continue;
 			}
-			if (outcome.advancedTo)
-				await mutate((state) => ({
+			await mutate((state) => {
+				// Only `through` moves here, and only on an entry that still exists: a
+				// live message may have refreshed lastSeenAt (or the prune may have
+				// removed the entry) while this walk was in flight, and the captured
+				// snapshot must neither clobber that nor resurrect the entry.
+				const live = state.participatedThreads[threadKey];
+				const participatedThreads =
+					live && outcome.advancedTo
+						? { ...state.participatedThreads, [threadKey]: { ...live, through: outcome.advancedTo } }
+						: state.participatedThreads;
+				const { [threadKey]: _drained, ...pendingThreads } = state.pendingThreads;
+				return {
 					...state,
-					participatedThreads: {
-						...state.participatedThreads,
-						[threadKey]: {
-							...state.participatedThreads[threadKey],
-							lastSeenAt: entry.lastSeenAt,
-							through: outcome.advancedTo,
-						},
-					},
-				}));
+					participatedThreads,
+					// A truncated walk keeps its pending entry so the next pass continues.
+					pendingThreads: outcome.truncated ? state.pendingThreads : pendingThreads,
+				};
+			});
 			if (outcome.truncated) completed = false;
 		}
 		await cursorSaves;
@@ -992,13 +1021,23 @@ export async function startSlackAdapter(
 			);
 			return { ...state, quarantined };
 		});
+	// A reconnect requests a reprobe; the flag is consumed by the next scheduled
+	// pass (so a coalesced trigger cannot skip it) and NOT re-armed by the
+	// scheduler's own retries, otherwise strikes would reset on every retry and a
+	// channel could never actually reach quarantine.
+	let reprobeRequested = false;
 	const recovery = new RecoveryScheduler(async () => {
-		await reprobeQuarantined();
+		if (reprobeRequested) {
+			reprobeRequested = false;
+			await reprobeQuarantined();
+		}
 		return recoverMissedMessages();
 	});
-	// Recovery on reconnect is the scheduler's job; the reprobe rides inside each
-	// scheduled pass so it cannot be skipped by a coalesced trigger.
-	gateway.onConnected = () => recovery.trigger();
+	const reconnected = (): void => {
+		reprobeRequested = true;
+		recovery.trigger();
+	};
+	gateway.onConnected = reconnected;
 	await gateway.connect();
 	const socket = new SlackSocketMode(
 		() => api.connectionsOpen(config.appToken),
@@ -1007,7 +1046,7 @@ export async function startSlackAdapter(
 			onSlashCommand: handleSlashCommand,
 			onConnected: () => {
 				log.log("Slack adapter connected.");
-				recovery.trigger();
+				reconnected();
 			},
 			onDisconnected: (reason) => log.log(`Slack socket disconnected: ${reason}`),
 		},

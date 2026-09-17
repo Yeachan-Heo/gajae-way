@@ -83,7 +83,8 @@ test("RT-SLACK-21 mention-open engages and persona markup is escaped at Slack bo
 	expect((await f.adapter.requestInbound("C1:1.0", origin, "addressed", engagement))?.engaged).toBe(true);
 	await settle();
 	expect(f.turns).toHaveLength(1);
-	expect(f.posts).toEqual([["C1", "&lt;script&gt;&amp;", undefined]]);
+	// A channel mention is answered in a thread rooted at the triggering message.
+	expect(f.posts).toEqual([["C1", "&lt;script&gt;&amp;", "1.0"]]);
 	expect(f.database.deliveryRows()[0]?.state).toBe("confirmed");
 });
 
@@ -146,8 +147,11 @@ test("RT-SLACK-24 thread and channel isolate sessions and route replies", async 
 			.map((row) => JSON.parse(row.origin_ref_json ?? "{}").conversationId)
 			.sort(),
 	).toEqual(["C1", "C1:1.0"]);
-	expect(f.posts).toContainEqual(["C1", "answer", undefined]);
-	expect(f.posts).toContainEqual(["C1", "answer", "1.0"]);
+	// The channel turn (root 1.0) and the thread turn (thread C1:1.0) both land in thread 1.0.
+	expect(f.posts).toEqual([
+		["C1", "answer", "1.0"],
+		["C1", "answer", "1.0"],
+	]);
 	expect(f.database.deliveryRows().map((row) => row.state)).toEqual(["confirmed", "confirmed"]);
 });
 
@@ -176,11 +180,15 @@ for (const explicit of [false, true]) {
 	});
 }
 
-test("RT-SLACK-34 plain channel reply does not inherit a thread", async () => {
+test("RT-SLACK-34 plain channel reply threads under the triggering message; an explicit target wins", async () => {
 	const f = await fixture({ "slack:C1": { engagement: "mention-open" } }, "plain reply");
 	await f.adapter.requestInbound("C1:2.0", origin, "plain", engagement);
 	await settle();
-	expect(f.posts).toEqual([["C1", "plain reply", undefined]]);
+	expect(f.posts).toEqual([["C1", "plain reply", "2.0"]]);
+	const explicit = await fixture({ "slack:C1": { engagement: "mention-open" } }, "[REPLY:C1:9.0] elsewhere");
+	await explicit.adapter.requestInbound("C1:3.0", origin, "plain", engagement);
+	await settle();
+	expect(explicit.posts).toEqual([["C1", "elsewhere", "9.0"]]);
 });
 
 test("RT-SLACK-33 discord stale lock has exactly one winner under 20 concurrent reclaims", async () => {

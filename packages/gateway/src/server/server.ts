@@ -1567,15 +1567,24 @@ async function createInboundTurnLifecycle(
 			.map((part) => part.trim())
 			.filter((part) => part.length > 0 && !isSilenceToken(part) && !containsSilenceToken(part))
 			.slice(0, 5);
-		// A DM that arrived as a reply inside a thread keeps its DM session identity
-		// (the origin has no thread), so the thread root survives only in the
-		// trigger's engagement metadata. Answering at the DM's top level would put
-		// the reply outside the conversation the human is actually looking at, so
-		// it becomes the default reply target when the persona names none.
+		// Slack replies default INTO a thread when the persona names no target:
+		// - a channel mention is answered in a thread rooted at the triggering
+		//   message (the room stays readable; the conversation continues in the
+		//   thread, which is its own session);
+		// - a DM that arrived inside a thread keeps its DM session identity (the
+		//   origin has no thread), so the root survives only in the trigger's
+		//   engagement metadata and is reused here.
+		// Thread origins already carry their root; explicit [REPLY:…] always wins.
+		// Slack only: a Discord DM's reply metadata is an ordinary "replied to X"
+		// note whose delivery would otherwise turn into a quoted reply nobody asked for.
 		const inboundThreadRoot =
-			origin.kind === "dm" && typeof engagement?.replyTo?.messageId === "string" && engagement.replyTo.messageId
-				? engagement.replyTo.messageId
-				: undefined;
+			origin.platform !== "slack"
+				? undefined
+				: origin.kind === "channel" && nonLoopback && isPlatformMessageId(row.message_id)
+					? row.message_id
+					: origin.kind === "dm" && typeof engagement?.replyTo?.messageId === "string" && engagement.replyTo.messageId
+						? engagement.replyTo.messageId
+						: undefined;
 		const planned: Array<{ readonly body: string; readonly replyTo?: string }> = [];
 		for (const part of parts) {
 			if (planned.length >= maxTurnParts) break;
