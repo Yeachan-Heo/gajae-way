@@ -24,7 +24,12 @@ type Entry = {
 	/** True while the gradient is wanted at all; false once cleared (desired = nothing). */
 	wanted: boolean;
 	reconciling: boolean;
+	/** A change arrived while a pass was running; the loop re-diffs before it exits. */
+	pending: boolean;
 };
+
+/** Bound on re-diff passes in one reconcile run; retirement cleanup runs regardless. */
+const RECONCILE_MAX_PASSES = 8;
 
 /**
  * Presence as a reaction gradient on the triggering message.
@@ -86,6 +91,7 @@ export class WorkingStatus {
 			shown: new Set(),
 			wanted: true,
 			reconciling: false,
+			pending: false,
 		};
 		this.#entries.set(key, entry);
 		this.#armStale(key);
@@ -133,29 +139,39 @@ export class WorkingStatus {
 
 	/**
 	 * Drives `shown` towards the desired set. One loop per entry; a call that
-	 * finds the loop running returns immediately and the running loop re-diffs
-	 * after each pass until nothing is left to do.
+	 * finds the loop running marks a continuation and returns, and the running
+	 * loop re-diffs after each pass (and once more for any continuation) until
+	 * nothing is left to do. Retirement (`wanted=false`) is always driven to
+	 * completion: removals are attempted even after an add failed, and an entry
+	 * retired while a pass was in flight is cleaned by that same loop.
 	 */
 	async #reconcile(key: string, entry: Entry): Promise<void> {
-		if (entry.reconciling) return;
+		if (entry.reconciling) {
+			entry.pending = true;
+			return;
+		}
 		entry.reconciling = true;
 		try {
-			for (let pass = 0; pass < 8; pass++) {
+			for (let pass = 0; pass < RECONCILE_MAX_PASSES; pass++) {
+				entry.pending = false;
 				const desired = new Set(entry.wanted ? presenceMarkersFor(entry.state.snapshot).map((m) => m.slackName) : []);
 				const remove = [...entry.shown].filter((name) => !desired.has(name));
 				const add = [...desired].filter((name) => !entry.shown.has(name));
-				if (remove.length === 0 && add.length === 0) return;
+				if (remove.length === 0 && add.length === 0) {
+					if (!entry.pending) return;
+					continue;
+				}
 				for (const name of remove) {
 					try {
 						await this.api.removeReaction(entry.channel, entry.ts, name);
-						entry.shown.delete(name);
 					} catch (error) {
 						// Not fatal to anything - but a marker we could not remove is still
 						// on the message, and that is worth knowing about.
 						this.log.error(`Slack presence could not remove :${name}: on ${key}: ${errorText(error)}`);
-						entry.shown.delete(name);
 					}
+					entry.shown.delete(name);
 				}
+				let addFailed = false;
 				for (const name of add) {
 					if (!entry.wanted) break;
 					try {
@@ -163,10 +179,26 @@ export class WorkingStatus {
 						entry.shown.add(name);
 					} catch (error) {
 						this.log.error(`Slack presence could not add :${name}: on ${key}: ${errorText(error)}`);
-						// Leave it un-shown; a later pass may succeed. Stop this pass so a
-						// hard failure does not hammer the API for every marker.
-						return;
+						// Leave it un-shown; the next desired-state change retries. Stop
+						// adding so a hard failure does not hammer the API per marker.
+						addFailed = true;
+						break;
 					}
+				}
+				// A failed add ends the pass unless the entry was retired meanwhile, in
+				// which case the loop continues so the removals happen.
+				if (addFailed && entry.wanted && !entry.pending) return;
+			}
+			// Pass budget exhausted with work still pending: never leave a retired
+			// entry's markers behind, whatever else is outstanding.
+			if (!entry.wanted && entry.shown.size > 0) {
+				for (const name of [...entry.shown]) {
+					await this.api
+						.removeReaction(entry.channel, entry.ts, name)
+						.catch((error) =>
+							this.log.error(`Slack presence could not remove :${name}: on ${key}: ${errorText(error)}`),
+						);
+					entry.shown.delete(name);
 				}
 			}
 		} finally {

@@ -1,4 +1,4 @@
-const sourceHash = "sha256:412c90d6ba22fb5309c14d4fa2b67d655dddd1b234d49916e2de11c36637fe0d";
+const sourceHash = "sha256:afbb9a77cb5ff7da17c201a039f12fd78aa9b2660ed6ce4b1829566b98061917";
 const replayPath = "artifacts/slack-adapter-cli-replay.json";
 const before = await Bun.file(replayPath).arrayBuffer();
 async function run(command: string[], env = process.env) {
@@ -17,7 +17,7 @@ const spec = await Bun.file(replayPath).json();
 const replay = await run(spec.command, { ...process.env, ...spec.env });
 const after = await Bun.file(replayPath).arrayBuffer();
 const replayByteIdentical = Buffer.from(before).equals(Buffer.from(after));
-const receipt = { sourceHash, frozenCommit: "145fa8f", build, probes, replay, replayByteIdentical };
+const receipt = { sourceHash, frozenCommit: "5001727", build, probes, replay, replayByteIdentical };
 await Bun.write("artifacts/slack-adapter-frozen-verification.json", JSON.stringify(receipt, null, 2) + "\n");
 if (
 	!replayByteIdentical ||

@@ -58,59 +58,63 @@ export class AdapterLock {
 		// liveness probe cannot arbitrate that: the winner's fresh claim belongs to
 		// a process still booting, which a probe may not see yet.
 		//
-		// The election is a DIRECTORY. `mkdir` is the one primitive here that is
-		// both atomic and exclusive on every POSIX filesystem: exactly one caller
-		// creates it, everyone else gets EEXIST, and there is no read-then-act
-		// window to race (unlike link/rename of a marker file, which a delayed
-		// contender could move after another had inspected it). The directory
-		// records its owner's pid inside; a crashed owner's directory is reclaimed
-		// by renaming the whole directory away - one rename wins, the loser gets
-		// ENOENT - and re-electing through mkdir again.
+		// The election is a DIRECTORY that is fully prepared in private - owner
+		// file already written - and then `rename`d into place. Renaming a
+		// directory onto a path that is already a non-empty directory fails
+		// atomically (ENOTEMPTY/EEXIST), so exactly one contender's rename lands,
+		// and the winning election is never observable without its owner: there
+		// is no mkdir-then-write window in which a crash leaves an ownerless
+		// election behind. The elected directory's inode is remembered and
+		// re-verified right before the pidfile is replaced, so an election that
+		// was moved out from under us (by a stale reclaimer) is detected and the
+		// acquisition fails closed rather than admitting a second winner.
 		const election = `${path}.reclaim.d`;
+		const candidate = `${path}.${ports.pid}.${randomUUID()}.candidate`;
+		await mkdir(candidate, { mode: 0o700 });
+		await writeFile(join(candidate, "owner"), `${ports.pid}\n`, { mode: 0o600 });
+		const candidateInode = (await stat(candidate)).ino;
 		let elected = false;
 		try {
 			for (let attempt = 0; !elected; attempt++) {
 				try {
-					await mkdir(election);
-					try {
-						await writeFile(join(election, "owner"), `${ports.pid}\n`, { mode: 0o600 });
-					} catch {
-						// The directory moved between mkdir and the owner write: a stale
-						// reclaimer renamed it (and puts it back on seeing our inode). Not
-						// elected; go around again.
-						continue;
-					}
+					await rename(candidate, election);
 					elected = true;
+					break;
 				} catch (error) {
-					// EEXIST is the normal "someone else is electing"; anything else while
-					// contenders shuffle directories around (ENOENT/EINVAL from a rename
-					// landing mid-call) is transient and simply retried.
-					if ((error as NodeJS.ErrnoException).code === "EACCES") throw error;
-					if (attempt < RECLAIM_WAIT_ATTEMPTS) {
-						await new Promise((resolve) => setTimeout(resolve, RECLAIM_WAIT_STEP_MS));
-						continue;
-					}
-					// Waited the whole window. An election is abandoned only when it is
-					// OLDER than that window and its recorded owner is gone; the liveness
-					// probe alone is not enough, because a winner still booting may not be
-					// visible to it yet. Anything else fails closed.
-					const orphan = await orphanedElection(election, ports);
-					if (orphan !== undefined) {
-						await reclaimElection(election, orphan.inode, ports.pid).catch(() => {});
-						attempt = 0;
-						continue;
-					}
-					const live = await readHolder(path);
-					throw new AdapterAlreadyRunningError(
-						live !== undefined && live !== holder && live !== ports.pid
-							? live
-							: ((await readHolder(join(election, "owner"))) ?? 0),
-						path,
-					);
+					const code = (error as NodeJS.ErrnoException).code;
+					// EEXIST/ENOTEMPTY: someone else holds the election. Anything else
+					// is a real filesystem problem and is surfaced, not masked.
+					if (code !== "EEXIST" && code !== "ENOTEMPTY") throw error;
 				}
+				if (attempt < RECLAIM_WAIT_ATTEMPTS) {
+					await new Promise((resolve) => setTimeout(resolve, RECLAIM_WAIT_STEP_MS));
+					continue;
+				}
+				// Waited the whole window. An election is abandoned only when it is
+				// OLDER than that window and its recorded owner is gone; the liveness
+				// probe alone is not enough, because a winner still booting may not be
+				// visible to it yet. Anything else fails closed.
+				const orphan = await orphanedElection(election, ports);
+				if (orphan !== undefined) {
+					await reclaimElection(election, orphan.inode, ports.pid);
+					attempt = 0;
+					continue;
+				}
+				const live = await readHolder(path);
+				throw new AdapterAlreadyRunningError(
+					live !== undefined && live !== holder && live !== ports.pid
+						? live
+						: ((await readHolder(join(election, "owner"))) ?? 0),
+					path,
+				);
 			}
-			// Elected. The pidfile must still name the dead holder read above; any
-			// other pid is a claim an earlier winner made moments ago.
+			// Elected. The election must still be OURS (a stale reclaimer may have
+			// moved it) and the pidfile must still name the dead holder read above;
+			// any other pid is a claim an earlier winner made moments ago.
+			if ((await stat(election).catch(() => undefined))?.ino !== candidateInode) {
+				elected = false;
+				throw new AdapterAlreadyRunningError((await readHolder(path)) ?? 0, path);
+			}
 			const current = await readHolder(path);
 			if (current !== holder && current !== ports.pid) throw new AdapterAlreadyRunningError(current ?? 0, path);
 			const temporary = `${path}.${ports.pid}.${randomUUID()}.tmp`;
@@ -118,8 +122,10 @@ export class AdapterLock {
 			await rename(temporary, path);
 			return new AdapterLock(path, ports.pid);
 		} finally {
-			// Only the elected contender owns the directory; a loser never touches it.
-			if (elected) await rm(election, { recursive: true, force: true }).catch(() => {});
+			// Only the elected contender removes the election, and only while it is
+			// still the directory it installed (same inode).
+			if (elected) await removeIfInode(election, candidateInode);
+			await rm(candidate, { recursive: true, force: true });
 			// Tombstones of reclaimed elections are best-effort garbage.
 			await sweepTombstones(path);
 		}
@@ -167,8 +173,11 @@ async function orphanedElection(
 		return undefined;
 	}
 	const owner = await readHolder(join(dir, "owner"));
-	// A directory with no owner file yet is mid-creation; leave it alone.
-	if (owner === undefined) return undefined;
+	// Elections are prepared with their owner file BEFORE being renamed into
+	// place, so a live election always has one. An ownerless directory older
+	// than the wait window is debris (a hand-made or partially copied one) and
+	// is reclaimable; leaving it would lock every future start out.
+	if (owner === undefined) return { owner: 0, inode };
 	return owner !== ports.pid && !ports.alive(owner) ? { owner, inode } : undefined;
 }
 
@@ -196,7 +205,8 @@ async function reclaimElection(dir: string, expectedInode: number | bigint, pid:
 		return;
 	}
 	if (moved === expectedInode) {
-		await rm(tombstone, { recursive: true, force: true });
+		// Best-effort: a concurrent sweep may be removing the same tombstone.
+		await rm(tombstone, { recursive: true, force: true }).catch(() => {});
 		return;
 	}
 	// Wrong directory: a live election was in progress. Restore it if the slot
@@ -204,9 +214,23 @@ async function reclaimElection(dir: string, expectedInode: number | bigint, pid:
 	// directory as a tombstone for the sweep (its owner's writeFile will ENOENT
 	// and re-elect).
 	await rename(tombstone, dir).catch(async (cause: NodeJS.ErrnoException) => {
-		if (cause.code !== "EEXIST" && cause.code !== "ENOTEMPTY") throw cause;
-		await rm(tombstone, { recursive: true, force: true });
+		// EEXIST/ENOTEMPTY: the slot was re-taken meanwhile; ENOENT: another
+		// contender's sweep already removed this tombstone. Either way the
+		// displaced election is gone, and its owner fails closed on its inode
+		// check before it could touch the pidfile.
+		if (cause.code !== "EEXIST" && cause.code !== "ENOTEMPTY" && cause.code !== "ENOENT") throw cause;
+		await rm(tombstone, { recursive: true, force: true }).catch(() => {});
 	});
+}
+
+/** Removes the election directory only while it is still the inode we installed. */
+async function removeIfInode(dir: string, inode: number | bigint): Promise<void> {
+	try {
+		if ((await stat(dir)).ino !== inode) return;
+	} catch {
+		return;
+	}
+	await rm(dir, { recursive: true, force: true }).catch(() => {});
 }
 
 /** Removes `.dead` tombstones of reclaimed elections; failures are ignored. */

@@ -1,6 +1,7 @@
-import { expect, test, spyOn } from "bun:test";
-import { WorkingStatus, ReconnectingGateway, isPresenceReaction, type DiscordClientLike } from "../src/main";
+import { expect, spyOn, test } from "bun:test";
 import type { ChatProgressPayload } from "@gajaeway/protocol";
+import { type DiscordClientLike, isPresenceReaction, ReconnectingGateway, WorkingStatus } from "../src/main";
+
 async function flush() {
 	for (let i = 0; i < 100; i++) await Promise.resolve();
 }
@@ -152,4 +153,66 @@ test("RT-SLACK-55 Discord own presence event filtered but human presence emoji i
 		verb: "engagement.reaction",
 		params: { emoji: "✍️", engagement: { authorId: "HUMAN" } },
 	});
+});
+test("RT-SLACK-68 rejected message fetch logs without markers and later update retries", async () => {
+	let now = 0;
+	let fail = true;
+	let fetches = 0;
+	const errors: unknown[] = [];
+	const added: string[] = [];
+	const discord = {
+		channels: {
+			async fetch() {
+				return {
+					messages: {
+						async fetch() {
+							fetches++;
+							if (fail) throw new Error("message fetch denied");
+							return {
+								async react(emoji: string) {
+									added.push(emoji);
+								},
+								reactions: {
+									resolve() {
+										return { users: { async remove() {} } };
+									},
+								},
+							};
+						},
+					},
+				};
+			},
+		},
+	} as unknown as DiscordClientLike;
+	const status = new WorkingStatus(
+		discord,
+		{
+			error: (...args) => {
+				errors.push(args);
+			},
+		},
+		() => ({ id: "BOT" }),
+		() => now,
+	);
+	status.arm("C1", "123");
+	await flush();
+	expect(fetches).toBe(1);
+	expect(errors).toHaveLength(1);
+	expect(String(errors[0])).toContain("message fetch denied");
+	expect(added).toEqual([]);
+	fail = false;
+	now = 16000;
+	await status.update({
+		origin: { platform: "discord", kind: "channel", conversationId: "C1" },
+		turnId: "t",
+		elapsedMs: now,
+		toolCalls: 0,
+		outputTokens: 0,
+		final: false,
+		activity: { kind: "thinking", label: "thinking" },
+	});
+	expect(fetches).toBe(2);
+	expect(added.length).toBeGreaterThan(0);
+	expect(errors).toHaveLength(1);
+	await status.clear("C1");
 });

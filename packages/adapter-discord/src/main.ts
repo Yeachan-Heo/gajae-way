@@ -498,7 +498,12 @@ type PresenceEntry = {
 	readonly shown: Set<string>;
 	wanted: boolean;
 	reconciling: boolean;
+	/** A change arrived while a pass was running; the loop re-diffs before it exits. */
+	pending: boolean;
 };
+
+/** Bound on re-diff passes in one reconcile run; retirement cleanup runs regardless. */
+const RECONCILE_MAX_PASSES = 8;
 
 /**
  * Presence as a reaction gradient on the triggering message.
@@ -560,6 +565,7 @@ export class WorkingStatus {
 			shown: new Set(),
 			wanted: true,
 			reconciling: false,
+			pending: false,
 		};
 		this.#entries.set(conversationId, entry);
 		this.#armStale(conversationId);
@@ -614,18 +620,29 @@ export class WorkingStatus {
 		return fetched;
 	}
 
-	/** Drives `shown` towards the desired set; one loop per entry, re-diffing after every pass. */
+	/**
+	 * Drives `shown` towards the desired set; one loop per entry, re-diffing
+	 * after every pass and once more for any change that arrived mid-pass.
+	 * Retirement is always driven to completion, even after a failed add.
+	 */
 	async #reconcile(entry: PresenceEntry): Promise<void> {
-		if (entry.reconciling) return;
+		if (entry.reconciling) {
+			entry.pending = true;
+			return;
+		}
 		entry.reconciling = true;
 		try {
 			const botUser = this.#getBotUser() as { id?: unknown } | undefined;
 			const botId = typeof botUser?.id === "string" ? botUser.id : undefined;
-			for (let pass = 0; pass < 8; pass++) {
+			for (let pass = 0; pass < RECONCILE_MAX_PASSES; pass++) {
+				entry.pending = false;
 				const desired = new Set(entry.wanted ? presenceMarkersFor(entry.state.snapshot).map((m) => m.unicode) : []);
 				const remove = [...entry.shown].filter((unicode) => !desired.has(unicode));
 				const add = [...desired].filter((unicode) => !entry.shown.has(unicode));
-				if (remove.length === 0 && add.length === 0) return;
+				if (remove.length === 0 && add.length === 0) {
+					if (!entry.pending) return;
+					continue;
+				}
 				let message: PresenceMessageLike | undefined;
 				try {
 					message = await this.#resolve(entry);
@@ -637,14 +654,14 @@ export class WorkingStatus {
 				for (const unicode of remove) {
 					try {
 						if (message.reactions && botId) await message.reactions.resolve(unicode)?.users.remove(botId);
-						entry.shown.delete(unicode);
 					} catch (error) {
 						this.#log.error(
 							`Discord presence could not remove ${unicode} on ${entry.conversationId}: ${errorMessage(error)}`,
 						);
-						entry.shown.delete(unicode);
 					}
+					entry.shown.delete(unicode);
 				}
+				let addFailed = false;
 				for (const unicode of add) {
 					if (!entry.wanted) break;
 					try {
@@ -654,8 +671,24 @@ export class WorkingStatus {
 						this.#log.error(
 							`Discord presence could not add ${unicode} on ${entry.conversationId}: ${errorMessage(error)}`,
 						);
-						return;
+						addFailed = true;
+						break;
 					}
+				}
+				if (addFailed && entry.wanted && !entry.pending) return;
+			}
+			if (!entry.wanted && entry.shown.size > 0 && entry.message?.reactions && botId) {
+				const reactions = entry.message.reactions;
+				for (const unicode of [...entry.shown]) {
+					await reactions
+						.resolve(unicode)
+						?.users.remove(botId)
+						.catch((error: unknown) =>
+							this.#log.error(
+								`Discord presence could not remove ${unicode} on ${entry.conversationId}: ${errorMessage(error)}`,
+							),
+						);
+					entry.shown.delete(unicode);
 				}
 			}
 		} finally {
