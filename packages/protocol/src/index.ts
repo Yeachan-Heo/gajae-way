@@ -88,7 +88,11 @@ export {
 } from "./frames";
 export {
 	CATCH_ALL_EVENT_ORIGIN,
+	CHAT_PLATFORMS,
+	type ChatPlatform,
+	describeChatPlatforms,
 	eventTypeOrigin,
+	isChatPlatform,
 	LOOPBACK_ORIGIN,
 	ORIGIN_KINDS,
 	ORIGIN_PLATFORMS,

@@ -5,7 +5,7 @@
 For production, compile standalone binaries — no source checkout, node_modules, or Bun install is needed on the host:
 
 ```sh
-bun run build   # emits dist/gajaeway-gateway, dist/gajaeway-discord, dist/gajaeway-telegram, dist/gajaeway
+bun run build   # emits dist/gajaeway-gateway, dist/gajaeway-discord, dist/gajaeway-telegram, dist/gajaeway-slack, dist/gajaeway
 dist/gajaeway-gateway daemon
 ```
 
@@ -76,7 +76,7 @@ Periodic recovery also visits origins whose only remaining work is an uncertain 
 
 ## Adapters and engagement
 
-Create separate credential files for Discord and Telegram tokens, then reference them as `credentials.discord` and `credentials.telegram`. Discord channel engagement is exactly `open`, `mention-open`, or `closed`; select `all`, `human-only`, or `bot-only` independently with `audience`. Omitted audience is safely `human-only`. `mention-open` wakes only for a real mention or a native reply to this bot, while `closed` also requires owner/allowlist authorization. Parent channel policy applies to Discord threads unless a thread entry overrides it. Verify adapter connectivity from its service logs and use `gajaeway sessions list` to confirm accepted traffic.
+Create separate credential files for Discord and Telegram tokens, then reference them as `credentials.discord` and `credentials.telegram`. Slack needs two: a bot token (`xoxb-…`) and a Socket Mode app-level token (`xapp-…`), referenced from `adapter-slack.json` as `botTokenFile` and `appTokenFile`; gateway channel policies for Slack are keyed `slack:<channelId>`. See the Slack section of the deployment guide for the app manifest (scopes, events, slash commands). Discord channel engagement is exactly `open`, `mention-open`, or `closed`; select `all`, `human-only`, or `bot-only` independently with `audience`. Omitted audience is safely `human-only`. `mention-open` wakes only for a real mention or a native reply to this bot, while `closed` also requires owner/allowlist authorization. Parent channel policy applies to Discord threads unless a thread entry overrides it. Verify adapter connectivity from its service logs and use `gajaeway sessions list` to confirm accepted traffic.
 
 ### Emoji reactions
 
@@ -87,6 +87,7 @@ A reaction refused *before* it is attempted is a different case and deliberately
 Operator prerequisites, per platform:
 
 - **Discord:** the adapter requests the `GuildMessageReactions` and `DirectMessageReactions` intents plus message/reaction/user partials. Without them Discord dispatches no reaction events at all, and reactions on messages posted before the last restart are dropped. Neither intent is privileged, so no portal approval is needed. Custom guild emoji are matched by name against the bounded allowlist and fall back to the unicode equivalent when the guild does not own one.
+- **Slack:** the bot token needs `reactions:read` and `reactions:write`, and the app must subscribe to `reaction_added` / `reaction_removed`. Slack reacts by emoji *name*, so every allowlist entry is mapped (`👍` → `+1`, `✅` → `white_check_mark`, `🦞` → `lobster`) and the whole allowlist is deliverable. An `already_reacted` answer counts as delivered; any other API error is a definitive delivery failure. A reaction on a threaded message is recorded against the parent channel origin because Slack's reaction event carries no `thread_ts`.
 - **Telegram:** inbound reactions require the bot to be an **administrator** in the chat, and the adapter must list `message_reaction` in `allowed_updates` (it does). Telegram never reports reactions set by bots. Outbound, Telegram accepts only its own 73 server-provided reaction emoji, so the three allowlist entries it cannot express (`✅`, `❌`, `🦞`) are never offered to the persona on a Telegram origin and are refused up front by `chat.react` with an error naming what Telegram does accept. If one reaches the adapter anyway — a redelivery recorded by an older build, say — it is reported as a definitive delivery failure rather than converted into a text message; that path is a backstop, not the normal one.
 
 ## Monitors

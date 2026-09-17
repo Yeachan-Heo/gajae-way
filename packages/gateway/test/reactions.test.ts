@@ -67,6 +67,7 @@ async function gateway(reply: string): Promise<Harness> {
 		channels: {
 			"chan-1": { engagement: "open" },
 			"telegram:chan-1": { engagement: "open" },
+			"slack:C1": { engagement: "open" },
 		},
 	};
 	const database = await GatewayDatabase.open(config.dbPath);
@@ -409,7 +410,7 @@ test("chat.react is not available on loopback, which has no messages to react to
 	});
 	await settle();
 	expect(client.frames.find((frame) => frame.type === "error" && frame.id === "k1").error.message).toContain(
-		"requires a discord or telegram origin",
+		"requires a discord, telegram or slack origin",
 	);
 });
 
@@ -441,7 +442,7 @@ test("the reaction verbs refuse an origin no chat adapter can settle", async () 
 	await settle();
 	for (const id of ["k1", "k2"])
 		expect(client.frames.find((frame) => frame.type === "error" && frame.id === id).error.message).toContain(
-			"requires a discord or telegram origin",
+			"requires a discord, telegram or slack origin",
 		);
 	expect(database.deliveryRows()).toHaveLength(0);
 });
@@ -537,4 +538,60 @@ test("a reaction token Telegram cannot express is skipped while the reply still 
 	const texts = textEvents(client.frames);
 	expect(texts).toHaveLength(1);
 	expect(texts[0].payload.text).toBe("처리했습니다");
+});
+
+test("a slack channel origin is a chat platform: send, react, and inbound reaction all land", async () => {
+	// Slack joins through the same chat-platform gate as Discord and Telegram: a
+	// namespaced `slack:<channel>` policy engages it, its full allowlist is
+	// deliverable, and the reaction verbs produce settleable ledger rows.
+	const { client, database, turns } = await gateway("[REACT:✅] 확인했습니다");
+	const slack = { platform: "slack", kind: "channel", conversationId: "C1" };
+	client.send({
+		v: "0.1",
+		type: "request",
+		id: "s1",
+		verb: "chat.send",
+		params: {
+			origin: slack,
+			text: "형님 이거 봐주세요",
+			messageId: "C1:1726543210.123456",
+			engagement: { mentioned: true, group: true, authorId: "U1", authorName: "형님" },
+		},
+	});
+	await settle();
+	expect(client.frames.find((frame) => frame.type === "response" && frame.id === "s1").result.engaged).toBe(true);
+	expect(turns).toHaveLength(1);
+	// ✅ is undeliverable on Telegram but Slack expresses the whole allowlist.
+	expect(reactionEvents(client.frames)).toHaveLength(1);
+	expect(reactionEvents(client.frames)[0].payload.reaction.targetMessageId).toBe("C1:1726543210.123456");
+	expect(textEvents(client.frames)[0].payload.text).toBe("확인했습니다");
+	client.send({
+		v: "0.1",
+		type: "request",
+		id: "s2",
+		verb: "chat.react",
+		params: { origin: slack, targetMessageId: "C1:1726543210.223456", emoji: "🦞" },
+	});
+	client.send({
+		v: "0.1",
+		type: "request",
+		id: "s3",
+		verb: "engagement.reaction",
+		params: {
+			origin: slack,
+			targetMessageId: "C1:1726543210.123456",
+			emoji: "👍",
+			action: "add",
+			engagement: { mentioned: false, group: true, authorId: "U1", authorName: "형님" },
+		},
+	});
+	await settle();
+	expect(client.frames.find((frame) => frame.type === "response" && frame.id === "s2").result.emoji).toBe("🦞");
+	expect(client.frames.find((frame) => frame.type === "response" && frame.id === "s3").result).toEqual({
+		recorded: true,
+		engaged: false,
+	});
+	// Text reply + reply reaction + explicit chat.react: three rows, all settleable.
+	expect(database.deliveryRows()).toHaveLength(3);
+	expect(turns).toHaveLength(1);
 });

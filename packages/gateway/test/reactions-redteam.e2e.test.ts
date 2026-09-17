@@ -389,7 +389,7 @@ test("RT-INBOUND-04 engagement.reaction rejects every malformed shape with a typ
 		["e15", { engagement: { authorId: 42 } }],
 		["e16", { engagement: undefined }],
 		["e17", { origin: LOOPBACK }],
-		["e18", { origin: { platform: "slack", kind: "channel", conversationId: "c" } }],
+		["e18", { origin: { platform: "matrix", kind: "channel", conversationId: "c" } }],
 		["e19", { origin: "discord/channel/chan-1" }],
 		["e20", { origin: { platform: "discord", kind: "dm", conversationId: "chan-1" } }],
 	];
@@ -508,7 +508,10 @@ test("RT-REACT-04 chat.react rejects malformed and unroutable origins", async ()
 		["o1", undefined],
 		["o2", { targetMessageId: "m1", emoji: "👍" }],
 		["o3", { origin: "discord/channel/chan-1", targetMessageId: "m1", emoji: "👍" }],
-		["o4", { origin: { platform: "slack", kind: "channel", conversationId: "c" }, targetMessageId: "m1", emoji: "👍" }],
+		[
+			"o4",
+			{ origin: { platform: "matrix", kind: "channel", conversationId: "c" }, targetMessageId: "m1", emoji: "👍" },
+		],
 		["o5", { origin: { platform: "discord", conversationId: "chan-1" }, targetMessageId: "m1", emoji: "👍" }],
 		[
 			"o6",
@@ -534,7 +537,7 @@ test("RT-REACT-04 chat.react rejects malformed and unroutable origins", async ()
 		const failure = errorFrame(client.frames, id);
 		expect(failure?.error.code).toBe("invalid_params");
 	}
-	expect(errorFrame(client.frames, "o9").error.message).toContain("requires a discord or telegram origin");
+	expect(errorFrame(client.frames, "o9").error.message).toContain("requires a discord, telegram or slack origin");
 	expect(database.deliveryRows()).toHaveLength(0);
 	// RT-REACT-04b (was a finding, now fixed): a `monitor` origin is a structurally
 	// valid OriginRef, but no chat adapter subscribes to it, so accepting one would
@@ -542,7 +545,7 @@ test("RT-REACT-04 chat.react rejects malformed and unroutable origins", async ()
 	// same way chat.send rejects non-chat platforms.
 	await request(client, "o10", "chat.react", { origin: MONITOR_ORIGIN, targetMessageId: "m1", emoji: "👍" });
 	await settle();
-	expect(errorFrame(client.frames, "o10")?.error.message).toContain("requires a discord or telegram origin");
+	expect(errorFrame(client.frames, "o10")?.error.message).toContain("requires a discord, telegram or slack origin");
 	expect(database.deliveryRows()).toHaveLength(0);
 });
 

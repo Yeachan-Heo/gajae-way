@@ -5,6 +5,7 @@ Use launchd kickstart, never bootout, for a managed restart:
 ```sh
 launchctl kickstart -k gui/$(id -u)/dev.gajaeway.gateway
 launchctl kickstart -k gui/$(id -u)/dev.gajaeway.adapter-discord
+launchctl kickstart -k gui/$(id -u)/dev.gajaeway.adapter-slack
 ```
 
 `launchctl bootout` removes the job and can leave the bot offline with no automatic recovery.
