@@ -48,7 +48,7 @@ import {
 	saveRecoveryCursors,
 } from "./recovery";
 import { type SlackSlashCommand, SlackSocketMode, type SocketModeOptions } from "./socket";
-import { WorkingStatus } from "./status";
+import { isPresenceReaction, WorkingStatus } from "./status";
 import { mentionedUserIds, normalizeSlackText } from "./text";
 
 export interface GatewayClientLike {
@@ -536,7 +536,7 @@ export class ReconnectingGateway implements GatewayClientLike {
 					...(receivedAt ? { receivedAt } : {}),
 				});
 				this.#inbound.addIfAbsent(messageId);
-				if (result?.engaged && addressedTurn(engagement)) this.status?.arm(origin);
+				if (result?.engaged && addressedTurn(engagement)) this.status?.arm(origin, messageId);
 				return { verdict: "acked", ...(result ? { result } : {}) };
 			} catch (error) {
 				console.error(`Slack chat.send failed: ${errorText(error)}`);
@@ -597,7 +597,7 @@ export class ReconnectingGateway implements GatewayClientLike {
 					}
 					try {
 						const result = await client.request<{ engaged?: boolean } | undefined>("chat.edit", edit);
-						if (result?.engaged && addressedTurn(edit.engagement)) this.status?.arm(edit.origin);
+						if (result?.engaged && addressedTurn(edit.engagement)) this.status?.arm(edit.origin, edit.messageId);
 						// A superseding edit queued during the request must drain in this pass too.
 						if (this.#editOutbox.get(edit.messageId) === edit) this.#editOutbox.delete(edit.messageId);
 					} catch (error) {
@@ -796,7 +796,11 @@ export async function startSlackAdapter(
 				if (result?.engaged) await rememberThread(admitted.origin);
 			});
 		} else if (event.type === "reaction_added" || event.type === "reaction_removed") {
-			const description = describeSlackReaction(event as unknown as SlackReactionEvent, identity.botUserId, directory);
+			const reaction = event as unknown as SlackReactionEvent;
+			// Our own presence markers are not engagement, even if the identity check
+			// ever misses (e.g. a legacy bot user id): never report them inbound.
+			if (reaction.user === identity.botUserId && isPresenceReaction(reaction.reaction)) return;
+			const description = describeSlackReaction(reaction, identity.botUserId, directory);
 			if (description) gateway.sendReaction(description);
 		}
 	};

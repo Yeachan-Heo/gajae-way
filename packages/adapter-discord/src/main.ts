@@ -1,11 +1,17 @@
 import { join } from "node:path";
-import type {
-	ChannelEngagementPolicy,
-	ChatMessagePayload,
-	ChatProgressPayload,
-	EngagementContext,
-	OriginRef,
-	ReactionAction,
+import {
+	type ChannelEngagementPolicy,
+	type ChatMessagePayload,
+	type ChatProgressPayload,
+	type EngagementContext,
+	type OriginRef,
+	PRESENCE_ALL_MARKERS,
+	type PresenceMarker,
+	type PresenceState,
+	presenceInitial,
+	presenceMarkersFor,
+	presenceTransition,
+	type ReactionAction,
 } from "@gajaeway/protocol";
 import { GajaewayClient } from "@gajaeway/sdk";
 import { AttachmentBuilder, Client, GatewayIntentBits, MessageFlags, Partials } from "discord.js";
@@ -470,102 +476,79 @@ export class TypingIndicator implements TypingPort {
 	}
 }
 
-/** A Discord message the adapter posted and can amend or remove; duck-typed from channel.send(). */
-interface EditableDiscordMessage {
-	edit(text: string): Promise<unknown>;
-	delete(): Promise<unknown>;
+/** The slice of a fetched Discord message presence needs: react, and remove our own reaction. */
+export interface PresenceMessageLike {
+	react(emoji: string): Promise<unknown>;
+	readonly reactions?: {
+		resolve(emoji: string): { users: { remove(userId: string): Promise<unknown> } } | null | undefined;
+	};
 }
 
-function isEditableMessage(value: unknown): value is EditableDiscordMessage {
-	return (
-		typeof value === "object" &&
-		value !== null &&
-		"edit" in value &&
-		typeof (value as EditableDiscordMessage).edit === "function" &&
-		"delete" in value &&
-		typeof (value as EditableDiscordMessage).delete === "function"
-	);
+function isPresenceMessage(value: unknown): value is PresenceMessageLike {
+	return typeof value === "object" && value !== null && "react" in value && typeof value.react === "function";
 }
 
-function formatElapsed(elapsedMs: number): string {
-	const total = Math.floor(elapsedMs / 1000);
-	const minutes = Math.floor(total / 60);
-	const seconds = total % 60;
-	return minutes > 0 ? `${minutes}m ${String(seconds).padStart(2, "0")}s` : `${seconds}s`;
-}
-
-function formatTokens(outputTokens: number): string {
-	return outputTokens >= 1000 ? `${(outputTokens / 1000).toFixed(1)}k tok` : `${outputTokens} tok`;
-}
+type PresenceEntry = {
+	readonly conversationId: string;
+	readonly messageId: string;
+	message?: PresenceMessageLike;
+	state: PresenceState;
+	/** Unicode markers we believe are on the message right now. */
+	readonly shown: Set<string>;
+	busy: boolean;
+};
 
 /**
- * The status shows only what the runtime actually reported. Counters come from
- * the live tail, and gjc 0.16.0 filters `tool_activity` for stdio clients (its
- * stdio transport cannot negotiate the capability), so on that path they stay
- * zero for the whole turn - "working… (4m 40s, 0 tools, 0 tok)" was two fields
- * of noise claiming the turn did nothing (live, 2026-09-03). Zero counters are
- * therefore omitted rather than displayed as facts.
- */
-export function workingStatusText(
-	progress: Pick<ChatProgressPayload, "elapsedMs" | "toolCalls" | "outputTokens" | "activity">,
-): string {
-	const parts = [formatElapsed(progress.elapsedMs)];
-	if (progress.toolCalls > 0) parts.push(`${progress.toolCalls} tool${progress.toolCalls === 1 ? "" : "s"}`);
-	if (progress.outputTokens > 0) parts.push(formatTokens(progress.outputTokens));
-	return `⏳ working… (${parts.join(", ")})${activitySuffix(progress.activity)}`;
-}
-
-/**
- * The "what" next to the "how long": `· bash — running the tests`. Label and
- * detail arrive bounded and single-line from the gateway; Discord markdown is
- * neutralised here because the text is posted verbatim.
- */
-export function activitySuffix(activity: ChatProgressPayload["activity"]): string {
-	if (!activity) return "";
-	const label = escapeMarkdown(activity.label);
-	if (activity.kind !== "tool") return ` · ${label}…`;
-	return activity.detail ? ` · \`${label}\` — ${escapeMarkdown(activity.detail)}` : ` · \`${label}\``;
-}
-
-function escapeMarkdown(text: string): string {
-	return text.replace(/([*_~`|>\\])/g, "\\$1");
-}
-
-/**
- * Renders a long-running turn as one temporary, amended status message per
- * conversation ("working… (2m 05s, 3 tools)") driven by gateway chat.progress
- * events, and removes it when the real reply is delivered. Best-effort only:
- * status failures never compete with delivery.
+ * Presence as a reaction gradient on the triggering message.
+ *
+ * Instead of posting and editing a "working…" message, the adapter reacts to
+ * the message it is answering: a phase marker (⏳ queued, 🔧 tool, 💭 thinking,
+ * ✍️ writing), a clock face that advances every minute, and an effort digit
+ * for tool calls / tokens. Markers are swapped only when their bucket changes
+ * and at most once per coalescing window, and every marker is removed when
+ * the reply lands (or the turn goes stale). Nothing is posted or edited. The
+ * typing indicator still runs alongside: it is free and Discord-native.
  */
 export class WorkingStatus {
 	readonly #discord: DiscordClientLike;
 	readonly #log: Pick<Console, "error">;
-	readonly #messages = new Map<string, EditableDiscordMessage | "pending">();
+	readonly #getBotUser: () => unknown;
+	readonly #now: () => number;
+	readonly #entries = new Map<string, PresenceEntry>();
 	readonly #staleTimers = new Map<string, ReturnType<typeof setTimeout>>();
-	/**
-	 * Conversations where the persona was ADDRESSED (a DM, an explicit mention,
-	 * or an `open` channel's promotion). Only these get the "working…" post.
-	 * In a public channel that merely *might* draw a reply, nothing is shown
-	 * until the reply itself lands: a spinner there is noise for everyone
-	 * present, most of the time for a turn that ends in silence.
-	 */
-	readonly #addressed = new Set<string>();
 
-	constructor(discord: DiscordClientLike, log: Pick<Console, "error"> = console) {
+	constructor(
+		discord: DiscordClientLike,
+		log: Pick<Console, "error"> = console,
+		getBotUser: () => unknown = () => undefined,
+		now: () => number = Date.now,
+	) {
 		this.#discord = discord;
 		this.#log = log;
-	}
-
-	/** Marks a conversation as one the persona was addressed in for the turn that just started. */
-	arm(conversationId: string): void {
-		this.#addressed.add(conversationId);
+		this.#getBotUser = getBotUser;
+		this.#now = now;
 	}
 
 	/**
-	 * A status that stops receiving progress (the turn wedged into a recovery
-	 * hold, or the gateway died) must not outlive the turn: after
-	 * WORKING_STATUS_STALE_MS without a tick it is removed.
+	 * An addressed turn was accepted for `messageId` in `conversationId`. The
+	 * queued marker goes on immediately; it is the room's only sign the message
+	 * was seen until the first progress tick. Best-effort, never awaited.
 	 */
+	arm(conversationId: string, messageId: string): void {
+		const prior = this.#entries.get(conversationId);
+		if (prior && prior.messageId !== messageId) void this.clear(conversationId);
+		const entry: PresenceEntry = {
+			conversationId,
+			messageId,
+			state: presenceInitial(this.#now()),
+			shown: new Set(),
+			busy: false,
+		};
+		this.#entries.set(conversationId, entry);
+		this.#armStale(conversationId);
+		void this.#apply(entry, [], presenceMarkersFor(entry.state.snapshot));
+	}
+
 	#armStale(conversationId: string): void {
 		const prior = this.#staleTimers.get(conversationId);
 		if (prior) clearTimeout(prior);
@@ -579,54 +562,81 @@ export class WorkingStatus {
 
 	async update(progress: ChatProgressPayload): Promise<void> {
 		if (progress.origin.platform !== "discord") return;
-		const conversationId = progress.origin.conversationId;
-		if (!this.#addressed.has(conversationId)) return;
-		this.#armStale(conversationId);
-		const text = workingStatusText(progress);
-		const existing = this.#messages.get(conversationId);
-		if (existing === "pending") return; // a send is already in flight; next tick edits
-		try {
-			if (existing) {
-				await existing.edit(text);
-				return;
-			}
-			this.#messages.set(conversationId, "pending");
-			const channel = await this.#discord.channels.fetch(conversationId);
-			if (!isDiscordTextChannel(channel)) {
-				this.#messages.delete(conversationId);
-				return;
-			}
-			const posted = await channel.send(text);
-			if (isEditableMessage(posted) && this.#messages.get(conversationId) === "pending") {
-				this.#messages.set(conversationId, posted);
-				return;
-			}
-			this.#messages.delete(conversationId);
-			// The reply was delivered (clear ran) while this send was in flight: the
-			// freshly posted status is already stale — remove it or it lingers forever.
-			if (isEditableMessage(posted)) await posted.delete().catch(() => {});
-		} catch (error) {
-			this.#messages.delete(conversationId);
-			this.#log.error(
-				`Discord working status failed for ${conversationId}: ${error instanceof Error ? error.message : String(error)}`,
-			);
-		}
+		const entry = this.#entries.get(progress.origin.conversationId);
+		if (!entry) return;
+		this.#armStale(progress.origin.conversationId);
+		const swap = presenceTransition(entry.state, progress, this.#now());
+		if (!swap) return;
+		entry.state = swap.state;
+		await this.#apply(entry, swap.remove, swap.add);
 	}
 
 	async clear(conversationId: string): Promise<void> {
-		this.#addressed.delete(conversationId);
 		const timer = this.#staleTimers.get(conversationId);
 		if (timer) clearTimeout(timer);
 		this.#staleTimers.delete(conversationId);
-		const existing = this.#messages.get(conversationId);
-		this.#messages.delete(conversationId);
-		if (!existing || existing === "pending") return;
+		const entry = this.#entries.get(conversationId);
+		if (!entry) return;
+		this.#entries.delete(conversationId);
+		await this.#removeAll(entry);
+	}
+
+	async #resolve(entry: PresenceEntry): Promise<PresenceMessageLike | undefined> {
+		if (entry.message) return entry.message;
+		const channel = await this.#discord.channels.fetch(entry.conversationId);
+		const fetched = await (channel as { messages?: { fetch(id: string): Promise<unknown> } }).messages?.fetch(
+			entry.messageId,
+		);
+		if (!isPresenceMessage(fetched)) return undefined;
+		entry.message = fetched;
+		return fetched;
+	}
+
+	async #remove(entry: PresenceEntry, unicode: string): Promise<void> {
+		const message = entry.message;
+		const botUser = this.#getBotUser() as { id?: unknown } | undefined;
+		const botId = typeof botUser?.id === "string" ? botUser.id : undefined;
+		if (!message?.reactions || !botId) return;
+		await message.reactions.resolve(unicode)?.users.remove(botId);
+		entry.shown.delete(unicode);
+	}
+
+	async #removeAll(entry: PresenceEntry): Promise<void> {
+		for (const unicode of [...entry.shown]) await this.#remove(entry, unicode).catch(() => {});
+		entry.shown.clear();
+	}
+
+	async #apply(entry: PresenceEntry, remove: readonly PresenceMarker[], add: readonly PresenceMarker[]): Promise<void> {
+		if (entry.busy) return;
+		entry.busy = true;
 		try {
-			await existing.delete();
-		} catch {
-			// the status message may already be gone; cosmetic either way
+			const message = await this.#resolve(entry);
+			if (!message) return;
+			for (const marker of remove) {
+				if (this.#entries.get(entry.conversationId) !== entry) return;
+				await this.#remove(entry, marker.unicode);
+			}
+			for (const marker of add) {
+				if (this.#entries.get(entry.conversationId) !== entry) return;
+				await message.react(marker.unicode);
+				entry.shown.add(marker.unicode);
+			}
+		} catch (error) {
+			this.#log.error(
+				`Discord presence failed for ${entry.conversationId}: ${error instanceof Error ? error.message : String(error)}`,
+			);
+		} finally {
+			entry.busy = false;
+			// Cleared while a swap was in flight: whatever landed must come off.
+			if (this.#entries.get(entry.conversationId) !== entry && entry.shown.size > 0) await this.#removeAll(entry);
 		}
 	}
+}
+
+/** True for a unicode reaction the adapter itself puts on messages as presence. */
+export function isPresenceReaction(unicode: string): boolean {
+	const bare = unicode.replace(/\uFE0F/g, "");
+	return PRESENCE_ALL_MARKERS.some((marker) => marker.unicode.replace(/\uFE0F/g, "") === bare);
 }
 
 export async function settleDiscordDelivery(
@@ -822,7 +832,7 @@ export async function startDiscordAdapter(config: LoadedDiscordAdapterConfig): P
 		partials: REQUIRED_PARTIALS,
 	});
 	const typing = new TypingIndicator(discord);
-	const status = new WorkingStatus(discord);
+	const status = new WorkingStatus(discord, console, () => discord.user);
 	const gateway = new ReconnectingGateway(
 		config.gatewaySocket ?? defaultGatewaySocket(),
 		discord,
@@ -1498,7 +1508,7 @@ export class ReconnectingGateway {
 					// was queued behind this one meanwhile.
 					if (this.#editOutbox.get(edit.messageId) === edit) this.#editOutbox.delete(edit.messageId);
 					if (result?.engaged && addressedTurn(edit.engagement)) {
-						this.status?.arm(edit.origin.conversationId);
+						this.status?.arm(edit.origin.conversationId, edit.messageId);
 						this.typing?.begin(edit.origin.conversationId);
 					}
 				} catch (error) {
@@ -1529,6 +1539,12 @@ export class ReconnectingGateway {
 		action: ReactionAction,
 		botUser: unknown,
 	): void {
+		// Our own presence markers are never engagement, even when the identity
+		// check that filters our reactions is not yet available on a cold start.
+		if (isPresenceReaction(String(reaction.emoji?.name ?? ""))) {
+			const botId = typeof botUser === "object" && botUser !== null && "id" in botUser ? String(botUser.id) : "";
+			if (!botId || String(user.id) === botId) return;
+		}
 		const described = describeInboundReaction(reaction, user, botUser, action);
 		if (!described) return;
 		const client = this.#client;
@@ -1580,7 +1596,7 @@ export class ReconnectingGateway {
 				// `mentioned` by the time engagement is built). A public channel the
 				// persona merely overhears shows nothing until the reply itself lands.
 				if (result?.engaged && addressedTurn(engagement)) {
-					this.status?.arm(origin.conversationId);
+					this.status?.arm(origin.conversationId, messageId);
 					this.typing?.begin(origin.conversationId);
 				}
 				return "acked";

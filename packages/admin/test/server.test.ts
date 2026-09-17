@@ -409,6 +409,19 @@ describe("event stream", () => {
 		expect(body.result.live.rows[0]?.fields.evidence).toBe("14 tool calls · 3,240 tokens out");
 		expect(body.result.live.rows[0]?.fields.elapsed).toBe("3m 12s / 5m");
 		expect(body.result.status.fields.working).toBe("1 working");
+		// The tool and its stated intent are operator detail: shown here, never in chat.
+		instance.emit("chat.progress", {
+			turnId: "turn-1",
+			origin: { platform: "discord", kind: "channel", conversationId: "1493635653441945762" },
+			elapsedMs: 200_000,
+			toolCalls: 15,
+			outputTokens: 3300,
+			activity: { kind: "tool", label: "bash", detail: "Running the tests" },
+		});
+		const detailed = (await (await instance.fetch("/api/snapshot")).json()) as typeof body;
+		expect(detailed.result.live.rows[0]?.fields.evidence).toBe(
+			"15 tool calls · 3,300 tokens out · bash — Running the tests",
+		);
 	});
 
 	test.each([

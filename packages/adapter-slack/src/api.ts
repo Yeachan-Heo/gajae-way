@@ -202,12 +202,27 @@ export class SlackWebApi {
 		return this.call("chat.delete", { channel, ts });
 	}
 
-	async addReaction(channel: string, timestamp: string, name: string): Promise<void> {
-		await this.limiter?.acquire(channel, "delivery");
+	async addReaction(
+		channel: string,
+		timestamp: string,
+		name: string,
+		priority: "delivery" | "cosmetic" = "delivery",
+	): Promise<void> {
+		await this.limiter?.acquire(channel, priority);
 		try {
 			await this.call("reactions.add", { channel, timestamp, name });
 		} catch (error) {
 			if (!(error instanceof SlackApiError) || error.code !== "already_reacted") throw error;
+		}
+	}
+
+	/** Removes our own reaction; one that is already gone counts as removed. */
+	async removeReaction(channel: string, timestamp: string, name: string): Promise<void> {
+		await this.limiter?.acquire(channel, "cosmetic");
+		try {
+			await this.call("reactions.remove", { channel, timestamp, name });
+		} catch (error) {
+			if (!(error instanceof SlackApiError) || error.code !== "no_reaction") throw error;
 		}
 	}
 

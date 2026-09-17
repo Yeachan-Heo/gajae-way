@@ -106,6 +106,25 @@ export {
 	validateOriginRef,
 } from "./origin";
 export {
+	PRESENCE_ALL_MARKERS,
+	PRESENCE_CLOCK_MARKERS,
+	PRESENCE_EFFORT_MARKERS,
+	PRESENCE_MIN_SWAP_MS,
+	PRESENCE_PHASE_MARKERS,
+	type PresenceMarker,
+	type PresencePhase,
+	type PresenceSnapshot,
+	type PresenceState,
+	type PresenceSwap,
+	presenceClockBucket,
+	presenceEffortBucket,
+	presenceInitial,
+	presenceMarkersFor,
+	presencePhaseFor,
+	presenceSnapshot,
+	presenceTransition,
+} from "./presence";
+export {
 	isPlatformMessageId,
 	parseReactionReply,
 	platformSupportsReaction,
