@@ -51,7 +51,7 @@ try {
 			{
 				schemaVersion: 1,
 				kind: "black-box-cli-api-receipt",
-				sourceHash: "sha256:a25e067e990803eb95171864c9574a6a48df0211eabba6852b4cecfd0c3c4582",
+				sourceHash: "sha256:042d2126b51914390a20c478dc58e04175f03d7b1d8737b7581e1556af3572b7",
 				probes,
 			},
 			null,

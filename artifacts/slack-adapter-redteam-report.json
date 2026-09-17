@@ -1,7 +1,7 @@
 {
   "schemaVersion": 1,
   "kind": "api-package-test-report",
-  "sourceHash": "sha256:a25e067e990803eb95171864c9574a6a48df0211eabba6852b4cecfd0c3c4582",
+  "sourceHash": "sha256:042d2126b51914390a20c478dc58e04175f03d7b1d8737b7581e1556af3572b7",
   "contractCoverage": [
     {
       "contractRef": "brief:5,20 Bun/TypeScript targeted tests and injected I/O",
@@ -341,7 +341,7 @@
         "RT-SLACK-29",
         "RT-SLACK-34"
       ],
-      "detail": "bun run build passed; service installation/boundary tests pass. Read-only doc audit found binary/config/scopes/events/commands/origins/recovery/no-voice in README.md:44-64, docs/deployment.md:76-104, docs/architecture.md:14-29, docs/runbooks/gajaeway-v1.md:79-90 and service-control.md:8.",
+      "detail": "Frozen worktree bun run build passed; service installation and SDK boundary supporting tests passed. Documentation is not re-audited by this execution lane.",
       "supportingEvidence": [
         "packages/cli/test/main.test.ts",
         "packages/conformance/test/sdk-boundary-dogfood.test.ts"
@@ -356,24 +356,45 @@
       "contractRef": "GUI/browser and live Slack workspace",
       "status": "not_applicable",
       "reason": "This assignment requires compiled CLI, package/API and local gateway surfaces with injected Slack transport; no GUI or credentialed external workspace is in scope."
+    },
+    {
+      "contractRef": "Generation 4 final boundary acceptance RT-SLACK-45 through 52",
+      "status": "blocked",
+      "caseIds": [
+        "RT-SLACK-45",
+        "RT-SLACK-46",
+        "RT-SLACK-47",
+        "RT-SLACK-48",
+        "RT-SLACK-49",
+        "RT-SLACK-50",
+        "RT-SLACK-51",
+        "RT-SLACK-52"
+      ],
+      "detail": "Frozen cbd4d1a exercised through real gateway sockets, adapter injected I/O, filesystem locks and compiled binary; failures retained as blockers.",
+      "supportingEvidence": [],
+      "artifactRefs": [
+        "artifacts/slack-adapter-redteam.junit.xml",
+        "artifacts/slack-adapter-cli-proof.json"
+      ]
     }
   ],
   "surfaceEvidence": [
     {
       "surface": "cli",
-      "invocation": "bun run build && bun artifacts/slack-adapter-cli-probes.ts",
+      "invocation": "bun artifacts/slack-adapter-frozen-verification.ts (runs bun run build, CLI probes and safe replay)",
       "verdict": "passed",
       "detail": "Fresh compiled Slack binary; four probes with real stdout/stderr/exit codes. Replay receipt checked via bun -e.",
       "artifactRefs": [
         "artifacts/slack-adapter-cli-proof.json",
-        "artifacts/slack-adapter-cli-replay.json"
+        "artifacts/slack-adapter-cli-replay.json",
+        "artifacts/slack-adapter-frozen-verification.json"
       ]
     },
     {
       "surface": "api",
       "invocation": "bun test packages/adapter-slack/test/redteam.test.ts packages/gateway/test/slack-adapter-redteam.e2e.test.ts packages/sdk/test/client-held-events.test.ts --reporter=junit --reporter-outfile=artifacts/slack-adapter-redteam.junit.xml",
       "verdict": "passed",
-      "detail": "All eight real gateway conversation tests pass, including three DM/channel routing cases; Discord lock package case is reported separately.",
+      "detail": "Real gateway channel/thread/DM routing, slash synthetic ids, platform isolation, redelivery, bounded activity and final event assertions.",
       "artifactRefs": [
         "artifacts/slack-adapter-redteam.junit.xml"
       ]
@@ -381,8 +402,8 @@
     {
       "surface": "package",
       "invocation": "bun test packages/adapter-slack/test/redteam.test.ts packages/gateway/test/slack-adapter-redteam.e2e.test.ts packages/sdk/test/client-held-events.test.ts --reporter=junit --reporter-outfile=artifacts/slack-adapter-redteam.junit.xml",
-      "verdict": "passed",
-      "detail": "44/44 tests pass, including both adapters' stale-lock elections and SDK same-chunk replay.",
+      "verdict": "failed",
+      "detail": "62/63 tests pass, including both adapters' stale-lock elections and SDK same-chunk replay.",
       "artifactRefs": [
         "artifacts/slack-adapter-redteam.junit.xml",
         "artifacts/slack-adapter-redteam-report.json"
@@ -392,16 +413,16 @@
       "surface": "package",
       "invocation": "bun test packages/adapter-slack/test/origin.test.ts packages/adapter-slack/test/text.test.ts packages/adapter-slack/test/mrkdwn.test.ts packages/adapter-slack/test/reactions.test.ts packages/adapter-slack/test/attachments.test.ts packages/adapter-slack/test/author.test.ts packages/adapter-slack/test/config.test.ts packages/adapter-slack/test/api.test.ts packages/adapter-slack/test/socket.test.ts packages/adapter-slack/test/status.test.ts packages/adapter-slack/test/recovery.test.ts packages/protocol/test/protocol.test.ts packages/protocol/test/reactions.test.ts packages/cli/test/main.test.ts packages/conformance/test/sdk-boundary-dogfood.test.ts --reporter=junit --reporter-outfile=artifacts/slack-adapter-supporting.junit.xml",
       "verdict": "passed",
-      "detail": "206 supporting tests across adapter, protocol, service installation and SDK boundary.",
+      "detail": "210 supporting tests across adapter, protocol, service installation and SDK boundary.",
       "artifactRefs": [
         "artifacts/slack-adapter-supporting.junit.xml"
       ]
     },
     {
       "surface": "package",
-      "invocation": "for i in {1..10}; do bun test packages/adapter-slack/test/redteam.test.ts packages/gateway/test/slack-adapter-redteam.e2e.test.ts -t RT-SLACK-33 --reporter=junit --reporter-outfile=artifacts/slack-adapter-lock-loop-${i}.junit.xml; done",
+      "invocation": "for i in {1..10}; do bun test packages/adapter-slack/test/redteam.test.ts packages/gateway/test/slack-adapter-redteam.e2e.test.ts -t 'RT-SLACK-(33|45)' --reporter=junit --reporter-outfile=artifacts/slack-adapter-lock-loop-${i}.junit.xml || exit 1; done",
       "verdict": "passed",
-      "detail": "10/10 iterations passed; Slack 10/10 and Discord 10/10, each with 20 simultaneous contenders.",
+      "detail": "10/10 iterations passed; six cases per iteration: 20-contender stale elections plus live/dead linked marker cases for Slack and Discord.",
       "artifactRefs": [
         "artifacts/slack-adapter-lock-loop-1.junit.xml",
         "artifacts/slack-adapter-lock-loop-2.junit.xml",
@@ -419,537 +440,613 @@
   "adversarialCases": [
     {
       "id": "RT-SLACK-01",
-      "sourceHash": "sha256:a25e067e990803eb95171864c9574a6a48df0211eabba6852b4cecfd0c3c4582",
+      "sourceHash": "sha256:042d2126b51914390a20c478dc58e04175f03d7b1d8737b7581e1556af3572b7",
       "scenario": "throwing handlers ack first, retries dedupe, malformed frames survive and disconnect reconnects",
       "expectedBehavior": "Ack before handlers; retry dedupe; malformed frames survive; disconnect reconnects.",
       "expected": "Ack before handlers; retry dedupe; malformed frames survive; disconnect reconnects.",
       "verdict": "passed",
-      "test": "packages/adapter-slack/test/redteam.test.ts:181",
+      "test": "packages/adapter-slack/test/redteam.test.ts:189",
+      "testSnapshot": "artifacts/slack-adapter-redteam.test.snapshot.txt:189",
       "subcases": [
         {
           "name": "RT-SLACK-01 throwing handlers ack first, retries dedupe, malformed frames survive and disconnect reconnects",
-          "test": "packages/adapter-slack/test/redteam.test.ts:181",
+          "test": "packages/adapter-slack/test/redteam.test.ts:189",
+          "testSnapshot": "artifacts/slack-adapter-redteam.test.snapshot.txt:189",
           "file": "packages/adapter-slack/test/redteam.test.ts",
           "verdict": "passed",
           "failure": ""
         }
       ],
       "artifactRefs": [
-        "artifacts/slack-adapter-redteam.junit.xml"
+        "artifacts/slack-adapter-redteam.junit.xml",
+        "artifacts/slack-adapter-redteam.test.snapshot.txt"
       ]
     },
     {
       "id": "RT-SLACK-02",
-      "sourceHash": "sha256:a25e067e990803eb95171864c9574a6a48df0211eabba6852b4cecfd0c3c4582",
+      "sourceHash": "sha256:042d2126b51914390a20c478dc58e04175f03d7b1d8737b7581e1556af3572b7",
       "scenario": "hostile timestamps never emit non-platform message ids",
       "expectedBehavior": "Reject hostile timestamps before chat.send and preserve channel-qualified valid ids.",
       "expected": "Reject hostile timestamps before chat.send and preserve channel-qualified valid ids.",
       "verdict": "passed",
-      "test": "packages/adapter-slack/test/redteam.test.ts:221",
+      "test": "packages/adapter-slack/test/redteam.test.ts:229",
+      "testSnapshot": "artifacts/slack-adapter-redteam.test.snapshot.txt:229",
       "subcases": [
         {
           "name": "RT-SLACK-02 hostile timestamps never emit non-platform message ids",
-          "test": "packages/adapter-slack/test/redteam.test.ts:221",
+          "test": "packages/adapter-slack/test/redteam.test.ts:229",
+          "testSnapshot": "artifacts/slack-adapter-redteam.test.snapshot.txt:229",
           "file": "packages/adapter-slack/test/redteam.test.ts",
           "verdict": "passed",
           "failure": ""
         }
       ],
       "artifactRefs": [
-        "artifacts/slack-adapter-redteam.junit.xml"
+        "artifacts/slack-adapter-redteam.junit.xml",
+        "artifacts/slack-adapter-redteam.test.snapshot.txt"
       ]
     },
     {
       "id": "RT-SLACK-03",
-      "sourceHash": "sha256:a25e067e990803eb95171864c9574a6a48df0211eabba6852b4cecfd0c3c4582",
+      "sourceHash": "sha256:042d2126b51914390a20c478dc58e04175f03d7b1d8737b7581e1556af3572b7",
       "scenario": "foreign reply target is a definitive delivery failure, never thread_ts",
       "expectedBehavior": "Foreign reply targets fail definitively before any Slack post.",
       "expected": "Foreign reply targets fail definitively before any Slack post.",
       "verdict": "passed",
-      "test": "packages/adapter-slack/test/redteam.test.ts:230",
+      "test": "packages/adapter-slack/test/redteam.test.ts:238",
+      "testSnapshot": "artifacts/slack-adapter-redteam.test.snapshot.txt:238",
       "subcases": [
         {
           "name": "RT-SLACK-03 foreign reply target is a definitive delivery failure, never thread_ts",
-          "test": "packages/adapter-slack/test/redteam.test.ts:230",
+          "test": "packages/adapter-slack/test/redteam.test.ts:238",
+          "testSnapshot": "artifacts/slack-adapter-redteam.test.snapshot.txt:238",
           "file": "packages/adapter-slack/test/redteam.test.ts",
           "verdict": "passed",
           "failure": ""
         }
       ],
       "artifactRefs": [
-        "artifacts/slack-adapter-redteam.junit.xml"
+        "artifacts/slack-adapter-redteam.junit.xml",
+        "artifacts/slack-adapter-redteam.test.snapshot.txt"
       ]
     },
     {
       "id": "RT-SLACK-04",
-      "sourceHash": "sha256:a25e067e990803eb95171864c9574a6a48df0211eabba6852b4cecfd0c3c4582",
+      "sourceHash": "sha256:042d2126b51914390a20c478dc58e04175f03d7b1d8737b7581e1556af3572b7",
       "scenario": "literal mentions in code count; entities decode once and broadcasts normalize",
       "expectedBehavior": "Literal mentions including code count; decode entities once and normalize broadcasts.",
       "expected": "Literal mentions including code count; decode entities once and normalize broadcasts.",
       "verdict": "passed",
-      "test": "packages/adapter-slack/test/redteam.test.ts:242",
+      "test": "packages/adapter-slack/test/redteam.test.ts:250",
+      "testSnapshot": "artifacts/slack-adapter-redteam.test.snapshot.txt:250",
       "subcases": [
         {
           "name": "RT-SLACK-04 literal mentions in code count; entities decode once and broadcasts normalize",
-          "test": "packages/adapter-slack/test/redteam.test.ts:242",
+          "test": "packages/adapter-slack/test/redteam.test.ts:250",
+          "testSnapshot": "artifacts/slack-adapter-redteam.test.snapshot.txt:250",
           "file": "packages/adapter-slack/test/redteam.test.ts",
           "verdict": "passed",
           "failure": ""
         }
       ],
       "artifactRefs": [
-        "artifacts/slack-adapter-redteam.junit.xml"
+        "artifacts/slack-adapter-redteam.junit.xml",
+        "artifacts/slack-adapter-redteam.test.snapshot.txt"
       ]
     },
     {
       "id": "RT-SLACK-05",
-      "sourceHash": "sha256:a25e067e990803eb95171864c9574a6a48df0211eabba6852b4cecfd0c3c4582",
+      "sourceHash": "sha256:042d2126b51914390a20c478dc58e04175f03d7b1d8737b7581e1556af3572b7",
       "scenario": "fifty-thousand-character fenced text has bounded balanced chunks",
       "expectedBehavior": "50k fenced text produces bounded, balanced chunks of at most 4000 characters.",
       "expected": "50k fenced text produces bounded, balanced chunks of at most 4000 characters.",
       "verdict": "passed",
-      "test": "packages/adapter-slack/test/redteam.test.ts:257",
+      "test": "packages/adapter-slack/test/redteam.test.ts:265",
+      "testSnapshot": "artifacts/slack-adapter-redteam.test.snapshot.txt:265",
       "subcases": [
         {
           "name": "RT-SLACK-05 fifty-thousand-character fenced text has bounded balanced chunks",
-          "test": "packages/adapter-slack/test/redteam.test.ts:257",
+          "test": "packages/adapter-slack/test/redteam.test.ts:265",
+          "testSnapshot": "artifacts/slack-adapter-redteam.test.snapshot.txt:265",
           "file": "packages/adapter-slack/test/redteam.test.ts",
           "verdict": "passed",
           "failure": ""
         }
       ],
       "artifactRefs": [
-        "artifacts/slack-adapter-redteam.junit.xml"
+        "artifacts/slack-adapter-redteam.junit.xml",
+        "artifacts/slack-adapter-redteam.test.snapshot.txt"
       ]
     },
     {
       "id": "RT-SLACK-06",
-      "sourceHash": "sha256:a25e067e990803eb95171864c9574a6a48df0211eabba6852b4cecfd0c3c4582",
+      "sourceHash": "sha256:042d2126b51914390a20c478dc58e04175f03d7b1d8737b7581e1556af3572b7",
       "scenario": "file-only body survives and empty body drops",
       "expectedBehavior": "File-only messages render attachments; empty bodies drop.",
       "expected": "File-only messages render attachments; empty bodies drop.",
       "verdict": "passed",
-      "test": "packages/adapter-slack/test/redteam.test.ts:266",
+      "test": "packages/adapter-slack/test/redteam.test.ts:274",
+      "testSnapshot": "artifacts/slack-adapter-redteam.test.snapshot.txt:274",
       "subcases": [
         {
           "name": "RT-SLACK-06 file-only body survives and empty body drops",
-          "test": "packages/adapter-slack/test/redteam.test.ts:266",
+          "test": "packages/adapter-slack/test/redteam.test.ts:274",
+          "testSnapshot": "artifacts/slack-adapter-redteam.test.snapshot.txt:274",
           "file": "packages/adapter-slack/test/redteam.test.ts",
           "verdict": "passed",
           "failure": ""
         }
       ],
       "artifactRefs": [
-        "artifacts/slack-adapter-redteam.junit.xml"
+        "artifacts/slack-adapter-redteam.junit.xml",
+        "artifacts/slack-adapter-redteam.test.snapshot.txt"
       ]
     },
     {
       "id": "RT-SLACK-07",
-      "sourceHash": "sha256:a25e067e990803eb95171864c9574a6a48df0211eabba6852b4cecfd0c3c4582",
+      "sourceHash": "sha256:042d2126b51914390a20c478dc58e04175f03d7b1d8737b7581e1556af3572b7",
       "scenario": "own, hidden, every skipped subtype, unchanged/empty edits and app_mention never send",
       "expectedBehavior": "Own, hidden, skipped subtype, unchanged/empty edit and duplicate app_mention events never send.",
       "expected": "Own, hidden, skipped subtype, unchanged/empty edit and duplicate app_mention events never send.",
       "verdict": "passed",
-      "test": "packages/adapter-slack/test/redteam.test.ts:278",
+      "test": "packages/adapter-slack/test/redteam.test.ts:286",
+      "testSnapshot": "artifacts/slack-adapter-redteam.test.snapshot.txt:286",
       "subcases": [
         {
           "name": "RT-SLACK-07 own, hidden, every skipped subtype, unchanged/empty edits and app_mention never send",
-          "test": "packages/adapter-slack/test/redteam.test.ts:278",
+          "test": "packages/adapter-slack/test/redteam.test.ts:286",
+          "testSnapshot": "artifacts/slack-adapter-redteam.test.snapshot.txt:286",
           "file": "packages/adapter-slack/test/redteam.test.ts",
           "verdict": "passed",
           "failure": ""
         }
       ],
       "artifactRefs": [
-        "artifacts/slack-adapter-redteam.junit.xml"
+        "artifacts/slack-adapter-redteam.junit.xml",
+        "artifacts/slack-adapter-redteam.test.snapshot.txt"
       ]
     },
     {
       "id": "RT-SLACK-08",
-      "sourceHash": "sha256:a25e067e990803eb95171864c9574a6a48df0211eabba6852b4cecfd0c3c4582",
+      "sourceHash": "sha256:042d2126b51914390a20c478dc58e04175f03d7b1d8737b7581e1556af3572b7",
       "scenario": "bot parent mentions; unknown parent omits fromSelf",
       "expectedBehavior": "Bot parent implies mention; absent parent metadata omits fromSelf.",
       "expected": "Bot parent implies mention; absent parent metadata omits fromSelf.",
       "verdict": "passed",
-      "test": "packages/adapter-slack/test/redteam.test.ts:296",
+      "test": "packages/adapter-slack/test/redteam.test.ts:304",
+      "testSnapshot": "artifacts/slack-adapter-redteam.test.snapshot.txt:304",
       "subcases": [
         {
           "name": "RT-SLACK-08 bot parent mentions; unknown parent omits fromSelf",
-          "test": "packages/adapter-slack/test/redteam.test.ts:296",
+          "test": "packages/adapter-slack/test/redteam.test.ts:304",
+          "testSnapshot": "artifacts/slack-adapter-redteam.test.snapshot.txt:304",
           "file": "packages/adapter-slack/test/redteam.test.ts",
           "verdict": "passed",
           "failure": ""
         }
       ],
       "artifactRefs": [
-        "artifacts/slack-adapter-redteam.junit.xml"
+        "artifacts/slack-adapter-redteam.junit.xml",
+        "artifacts/slack-adapter-redteam.test.snapshot.txt"
       ]
     },
     {
       "id": "RT-SLACK-09",
-      "sourceHash": "sha256:a25e067e990803eb95171864c9574a6a48df0211eabba6852b4cecfd0c3c4582",
+      "sourceHash": "sha256:042d2126b51914390a20c478dc58e04175f03d7b1d8737b7581e1556af3572b7",
       "scenario": "transport failure ambiguous, Slack API failure definitive",
       "expectedBehavior": "Transport failure is ambiguous; SlackApiError is definitive.",
       "expected": "Transport failure is ambiguous; SlackApiError is definitive.",
       "verdict": "passed",
-      "test": "packages/adapter-slack/test/redteam.test.ts:305",
+      "test": "packages/adapter-slack/test/redteam.test.ts:313",
+      "testSnapshot": "artifacts/slack-adapter-redteam.test.snapshot.txt:313",
       "subcases": [
         {
           "name": "RT-SLACK-09 transport failure ambiguous, Slack API failure definitive",
-          "test": "packages/adapter-slack/test/redteam.test.ts:305",
+          "test": "packages/adapter-slack/test/redteam.test.ts:313",
+          "testSnapshot": "artifacts/slack-adapter-redteam.test.snapshot.txt:313",
           "file": "packages/adapter-slack/test/redteam.test.ts",
           "verdict": "passed",
           "failure": ""
         }
       ],
       "artifactRefs": [
-        "artifacts/slack-adapter-redteam.junit.xml"
+        "artifacts/slack-adapter-redteam.junit.xml",
+        "artifacts/slack-adapter-redteam.test.snapshot.txt"
       ]
     },
     {
       "id": "RT-SLACK-10",
-      "sourceHash": "sha256:a25e067e990803eb95171864c9574a6a48df0211eabba6852b4cecfd0c3c4582",
+      "sourceHash": "sha256:042d2126b51914390a20c478dc58e04175f03d7b1d8737b7581e1556af3572b7",
       "scenario": "all three chunks keep thread and duplicate warning",
       "expectedBehavior": "All reply chunks retain thread routing and duplicate warning; delivery confirms once.",
       "expected": "All reply chunks retain thread routing and duplicate warning; delivery confirms once.",
       "verdict": "passed",
-      "test": "packages/adapter-slack/test/redteam.test.ts:325",
+      "test": "packages/adapter-slack/test/redteam.test.ts:333",
+      "testSnapshot": "artifacts/slack-adapter-redteam.test.snapshot.txt:333",
       "subcases": [
         {
           "name": "RT-SLACK-10 all three chunks keep thread and duplicate warning",
-          "test": "packages/adapter-slack/test/redteam.test.ts:325",
+          "test": "packages/adapter-slack/test/redteam.test.ts:333",
+          "testSnapshot": "artifacts/slack-adapter-redteam.test.snapshot.txt:333",
           "file": "packages/adapter-slack/test/redteam.test.ts",
           "verdict": "passed",
           "failure": ""
         }
       ],
       "artifactRefs": [
-        "artifacts/slack-adapter-redteam.junit.xml"
+        "artifacts/slack-adapter-redteam.junit.xml",
+        "artifacts/slack-adapter-redteam.test.snapshot.txt"
       ]
     },
     {
       "id": "RT-SLACK-11",
-      "sourceHash": "sha256:a25e067e990803eb95171864c9574a6a48df0211eabba6852b4cecfd0c3c4582",
+      "sourceHash": "sha256:042d2126b51914390a20c478dc58e04175f03d7b1d8737b7581e1556af3572b7",
       "scenario": "malformed and unknown reactions fail without API; already_reacted confirms",
       "expectedBehavior": "Malformed/unknown reactions fail definitively without API; already_reacted confirms.",
       "expected": "Malformed/unknown reactions fail definitively without API; already_reacted confirms.",
       "verdict": "passed",
-      "test": "packages/adapter-slack/test/redteam.test.ts:343",
+      "test": "packages/adapter-slack/test/redteam.test.ts:351",
+      "testSnapshot": "artifacts/slack-adapter-redteam.test.snapshot.txt:351",
       "subcases": [
         {
           "name": "RT-SLACK-11 malformed and unknown reactions fail without API; already_reacted confirms",
-          "test": "packages/adapter-slack/test/redteam.test.ts:343",
+          "test": "packages/adapter-slack/test/redteam.test.ts:351",
+          "testSnapshot": "artifacts/slack-adapter-redteam.test.snapshot.txt:351",
           "file": "packages/adapter-slack/test/redteam.test.ts",
           "verdict": "passed",
           "failure": ""
         }
       ],
       "artifactRefs": [
-        "artifacts/slack-adapter-redteam.junit.xml"
+        "artifacts/slack-adapter-redteam.junit.xml",
+        "artifacts/slack-adapter-redteam.test.snapshot.txt"
       ]
     },
     {
       "id": "RT-SLACK-12",
-      "sourceHash": "sha256:a25e067e990803eb95171864c9574a6a48df0211eabba6852b4cecfd0c3c4582",
+      "sourceHash": "sha256:042d2126b51914390a20c478dc58e04175f03d7b1d8737b7581e1556af3572b7",
       "scenario": "disconnected edit overflow retains newest 256 and replays ordered",
       "expectedBehavior": "Edit outbox keeps newest 256 of 300, records 44 evictions and replays in order.",
       "expected": "Edit outbox keeps newest 256 of 300, records 44 evictions and replays in order.",
       "verdict": "passed",
-      "test": "packages/adapter-slack/test/redteam.test.ts:367",
+      "test": "packages/adapter-slack/test/redteam.test.ts:375",
+      "testSnapshot": "artifacts/slack-adapter-redteam.test.snapshot.txt:375",
       "subcases": [
         {
           "name": "RT-SLACK-12 disconnected edit overflow retains newest 256 and replays ordered",
-          "test": "packages/adapter-slack/test/redteam.test.ts:367",
+          "test": "packages/adapter-slack/test/redteam.test.ts:375",
+          "testSnapshot": "artifacts/slack-adapter-redteam.test.snapshot.txt:375",
           "file": "packages/adapter-slack/test/redteam.test.ts",
           "verdict": "passed",
           "failure": ""
         }
       ],
       "artifactRefs": [
-        "artifacts/slack-adapter-redteam.junit.xml"
+        "artifacts/slack-adapter-redteam.junit.xml",
+        "artifacts/slack-adapter-redteam.test.snapshot.txt"
       ]
     },
     {
       "id": "RT-SLACK-13",
-      "sourceHash": "sha256:a25e067e990803eb95171864c9574a6a48df0211eabba6852b4cecfd0c3c4582",
+      "sourceHash": "sha256:042d2126b51914390a20c478dc58e04175f03d7b1d8737b7581e1556af3572b7",
       "scenario": "failed edit remains queued and reconnects for replay",
       "expectedBehavior": "Failed edit remains queued and replays on client adoption.",
       "expected": "Failed edit remains queued and replays on client adoption.",
       "verdict": "passed",
-      "test": "packages/adapter-slack/test/redteam.test.ts:385",
+      "test": "packages/adapter-slack/test/redteam.test.ts:393",
+      "testSnapshot": "artifacts/slack-adapter-redteam.test.snapshot.txt:393",
       "subcases": [
         {
           "name": "RT-SLACK-13 failed edit remains queued and reconnects for replay",
-          "test": "packages/adapter-slack/test/redteam.test.ts:385",
+          "test": "packages/adapter-slack/test/redteam.test.ts:393",
+          "testSnapshot": "artifacts/slack-adapter-redteam.test.snapshot.txt:393",
           "file": "packages/adapter-slack/test/redteam.test.ts",
           "verdict": "passed",
           "failure": ""
         }
       ],
       "artifactRefs": [
-        "artifacts/slack-adapter-redteam.junit.xml"
+        "artifacts/slack-adapter-redteam.junit.xml",
+        "artifacts/slack-adapter-redteam.test.snapshot.txt"
       ]
     },
     {
       "id": "RT-SLACK-14",
-      "sourceHash": "sha256:a25e067e990803eb95171864c9574a6a48df0211eabba6852b4cecfd0c3c4582",
+      "sourceHash": "sha256:042d2126b51914390a20c478dc58e04175f03d7b1d8737b7581e1556af3572b7",
       "scenario": "duplicate inbound dedupes but unavailable is forgotten",
       "expectedBehavior": "Acknowledged ids dedupe; unavailable ids remain retryable.",
       "expected": "Acknowledged ids dedupe; unavailable ids remain retryable.",
       "verdict": "passed",
-      "test": "packages/adapter-slack/test/redteam.test.ts:400",
+      "test": "packages/adapter-slack/test/redteam.test.ts:408",
+      "testSnapshot": "artifacts/slack-adapter-redteam.test.snapshot.txt:408",
       "subcases": [
         {
           "name": "RT-SLACK-14 duplicate inbound dedupes but unavailable is forgotten",
-          "test": "packages/adapter-slack/test/redteam.test.ts:400",
+          "test": "packages/adapter-slack/test/redteam.test.ts:408",
+          "testSnapshot": "artifacts/slack-adapter-redteam.test.snapshot.txt:408",
           "file": "packages/adapter-slack/test/redteam.test.ts",
           "verdict": "passed",
           "failure": ""
         }
       ],
       "artifactRefs": [
-        "artifacts/slack-adapter-redteam.junit.xml"
+        "artifacts/slack-adapter-redteam.junit.xml",
+        "artifacts/slack-adapter-redteam.test.snapshot.txt"
       ]
     },
     {
       "id": "RT-SLACK-15",
-      "sourceHash": "sha256:a25e067e990803eb95171864c9574a6a48df0211eabba6852b4cecfd0c3c4582",
+      "sourceHash": "sha256:042d2126b51914390a20c478dc58e04175f03d7b1d8737b7581e1556af3572b7",
       "scenario": "newest-first recovery delivers ascending and cannot cross unavailable",
       "expectedBehavior": "Newest-first recovery delivers ascending and cannot advance across unavailable sends.",
       "expected": "Newest-first recovery delivers ascending and cannot advance across unavailable sends.",
       "verdict": "passed",
-      "test": "packages/adapter-slack/test/redteam.test.ts:414",
+      "test": "packages/adapter-slack/test/redteam.test.ts:422",
+      "testSnapshot": "artifacts/slack-adapter-redteam.test.snapshot.txt:422",
       "subcases": [
         {
           "name": "RT-SLACK-15 newest-first recovery delivers ascending and cannot cross unavailable",
-          "test": "packages/adapter-slack/test/redteam.test.ts:414",
+          "test": "packages/adapter-slack/test/redteam.test.ts:422",
+          "testSnapshot": "artifacts/slack-adapter-redteam.test.snapshot.txt:422",
           "file": "packages/adapter-slack/test/redteam.test.ts",
           "verdict": "passed",
           "failure": ""
         }
       ],
       "artifactRefs": [
-        "artifacts/slack-adapter-redteam.junit.xml"
+        "artifacts/slack-adapter-redteam.junit.xml",
+        "artifacts/slack-adapter-redteam.test.snapshot.txt"
       ]
     },
     {
       "id": "RT-SLACK-16",
-      "sourceHash": "sha256:a25e067e990803eb95171864c9574a6a48df0211eabba6852b4cecfd0c3c4582",
+      "sourceHash": "sha256:042d2126b51914390a20c478dc58e04175f03d7b1d8737b7581e1556af3572b7",
       "scenario": "recovered replies retain thread origin",
       "expectedBehavior": "Recovered thread replies retain thread origin and parent channel.",
       "expected": "Recovered thread replies retain thread origin and parent channel.",
       "verdict": "passed",
-      "test": "packages/adapter-slack/test/redteam.test.ts:450",
+      "test": "packages/adapter-slack/test/redteam.test.ts:458",
+      "testSnapshot": "artifacts/slack-adapter-redteam.test.snapshot.txt:458",
       "subcases": [
         {
           "name": "RT-SLACK-16 recovered replies retain thread origin",
-          "test": "packages/adapter-slack/test/redteam.test.ts:450",
+          "test": "packages/adapter-slack/test/redteam.test.ts:458",
+          "testSnapshot": "artifacts/slack-adapter-redteam.test.snapshot.txt:458",
           "file": "packages/adapter-slack/test/redteam.test.ts",
           "verdict": "passed",
           "failure": ""
         }
       ],
       "artifactRefs": [
-        "artifacts/slack-adapter-redteam.junit.xml"
+        "artifacts/slack-adapter-redteam.junit.xml",
+        "artifacts/slack-adapter-redteam.test.snapshot.txt"
       ]
     },
     {
       "id": "RT-SLACK-17",
-      "sourceHash": "sha256:a25e067e990803eb95171864c9574a6a48df0211eabba6852b4cecfd0c3c4582",
+      "sourceHash": "sha256:042d2126b51914390a20c478dc58e04175f03d7b1d8737b7581e1556af3572b7",
       "scenario": "three-strike quarantine is re-probed after gateway reconnect",
       "expectedBehavior": "Three permanent failures quarantine; actual onConnected scheduler re-probes and clears quarantine.",
       "expected": "Three permanent failures quarantine; actual onConnected scheduler re-probes and clears quarantine.",
       "verdict": "passed",
-      "test": "packages/adapter-slack/test/redteam.test.ts:475",
+      "test": "packages/adapter-slack/test/redteam.test.ts:483",
+      "testSnapshot": "artifacts/slack-adapter-redteam.test.snapshot.txt:483",
       "subcases": [
         {
           "name": "RT-SLACK-17 three-strike quarantine is re-probed after gateway reconnect",
-          "test": "packages/adapter-slack/test/redteam.test.ts:475",
+          "test": "packages/adapter-slack/test/redteam.test.ts:483",
+          "testSnapshot": "artifacts/slack-adapter-redteam.test.snapshot.txt:483",
           "file": "packages/adapter-slack/test/redteam.test.ts",
           "verdict": "passed",
           "failure": ""
         }
       ],
       "artifactRefs": [
-        "artifacts/slack-adapter-redteam.junit.xml"
+        "artifacts/slack-adapter-redteam.junit.xml",
+        "artifacts/slack-adapter-redteam.test.snapshot.txt"
       ]
     },
     {
       "id": "RT-SLACK-18",
-      "sourceHash": "sha256:a25e067e990803eb95171864c9574a6a48df0211eabba6852b4cecfd0c3c4582",
+      "sourceHash": "sha256:042d2126b51914390a20c478dc58e04175f03d7b1d8737b7581e1556af3572b7",
       "scenario": "twenty recovery triggers remain single flight",
       "expectedBehavior": "Twenty recovery triggers coalesce without parallel passes.",
       "expected": "Twenty recovery triggers coalesce without parallel passes.",
       "verdict": "passed",
-      "test": "packages/adapter-slack/test/redteam.test.ts:489",
+      "test": "packages/adapter-slack/test/redteam.test.ts:497",
+      "testSnapshot": "artifacts/slack-adapter-redteam.test.snapshot.txt:497",
       "subcases": [
         {
           "name": "RT-SLACK-18 twenty recovery triggers remain single flight",
-          "test": "packages/adapter-slack/test/redteam.test.ts:489",
+          "test": "packages/adapter-slack/test/redteam.test.ts:497",
+          "testSnapshot": "artifacts/slack-adapter-redteam.test.snapshot.txt:497",
           "file": "packages/adapter-slack/test/redteam.test.ts",
           "verdict": "passed",
           "failure": ""
         }
       ],
       "artifactRefs": [
-        "artifacts/slack-adapter-redteam.junit.xml"
+        "artifacts/slack-adapter-redteam.junit.xml",
+        "artifacts/slack-adapter-redteam.test.snapshot.txt"
       ]
     },
     {
       "id": "RT-SLACK-19",
-      "sourceHash": "sha256:a25e067e990803eb95171864c9574a6a48df0211eabba6852b4cecfd0c3c4582",
+      "sourceHash": "sha256:042d2126b51914390a20c478dc58e04175f03d7b1d8737b7581e1556af3572b7",
       "scenario": "credential prefixes fail without secrets, relative files resolve and unknown channel keys reject",
       "expectedBehavior": "Credential prefixes reject without exposing secrets; relative paths resolve and policy keys validate.",
       "expected": "Credential prefixes reject without exposing secrets; relative paths resolve and policy keys validate.",
       "verdict": "passed",
-      "test": "packages/adapter-slack/test/redteam.test.ts:514",
+      "test": "packages/adapter-slack/test/redteam.test.ts:522",
+      "testSnapshot": "artifacts/slack-adapter-redteam.test.snapshot.txt:522",
       "subcases": [
         {
           "name": "RT-SLACK-19 credential prefixes fail without secrets, relative files resolve and unknown channel keys reject",
-          "test": "packages/adapter-slack/test/redteam.test.ts:514",
+          "test": "packages/adapter-slack/test/redteam.test.ts:522",
+          "testSnapshot": "artifacts/slack-adapter-redteam.test.snapshot.txt:522",
           "file": "packages/adapter-slack/test/redteam.test.ts",
           "verdict": "passed",
           "failure": ""
         }
       ],
       "artifactRefs": [
-        "artifacts/slack-adapter-redteam.junit.xml"
+        "artifacts/slack-adapter-redteam.junit.xml",
+        "artifacts/slack-adapter-redteam.test.snapshot.txt"
       ]
     },
     {
       "id": "RT-SLACK-20",
-      "sourceHash": "sha256:a25e067e990803eb95171864c9574a6a48df0211eabba6852b4cecfd0c3c4582",
+      "sourceHash": "sha256:042d2126b51914390a20c478dc58e04175f03d7b1d8737b7581e1556af3572b7",
       "scenario": "unconfigured unmentioned Slack channel is context only",
       "expectedBehavior": "Unconfigured unmentioned channel is context-only with no turn/delivery.",
       "expected": "Unconfigured unmentioned channel is context-only with no turn/delivery.",
       "verdict": "passed",
-      "test": "packages/gateway/test/slack-adapter-redteam.e2e.test.ts:71",
+      "test": "packages/gateway/test/slack-adapter-redteam.e2e.test.ts:73",
+      "testSnapshot": "artifacts/slack-adapter-gateway-redteam.test.snapshot.txt:73",
       "subcases": [
         {
           "name": "RT-SLACK-20 unconfigured unmentioned Slack channel is context only",
-          "test": "packages/gateway/test/slack-adapter-redteam.e2e.test.ts:71",
+          "test": "packages/gateway/test/slack-adapter-redteam.e2e.test.ts:73",
+          "testSnapshot": "artifacts/slack-adapter-gateway-redteam.test.snapshot.txt:73",
           "file": "packages/gateway/test/slack-adapter-redteam.e2e.test.ts",
           "verdict": "passed",
           "failure": ""
         }
       ],
       "artifactRefs": [
-        "artifacts/slack-adapter-redteam.junit.xml"
+        "artifacts/slack-adapter-redteam.junit.xml",
+        "artifacts/slack-adapter-gateway-redteam.test.snapshot.txt"
       ]
     },
     {
       "id": "RT-SLACK-21",
-      "sourceHash": "sha256:a25e067e990803eb95171864c9574a6a48df0211eabba6852b4cecfd0c3c4582",
+      "sourceHash": "sha256:042d2126b51914390a20c478dc58e04175f03d7b1d8737b7581e1556af3572b7",
       "scenario": "mention-open engages and persona markup is escaped at Slack boundary",
       "expectedBehavior": "Mention-open policy engages and persona markup is escaped at Slack boundary.",
       "expected": "Mention-open policy engages and persona markup is escaped at Slack boundary.",
       "verdict": "passed",
-      "test": "packages/gateway/test/slack-adapter-redteam.e2e.test.ts:81",
+      "test": "packages/gateway/test/slack-adapter-redteam.e2e.test.ts:83",
+      "testSnapshot": "artifacts/slack-adapter-gateway-redteam.test.snapshot.txt:83",
       "subcases": [
         {
           "name": "RT-SLACK-21 mention-open engages and persona markup is escaped at Slack boundary",
-          "test": "packages/gateway/test/slack-adapter-redteam.e2e.test.ts:81",
+          "test": "packages/gateway/test/slack-adapter-redteam.e2e.test.ts:83",
+          "testSnapshot": "artifacts/slack-adapter-gateway-redteam.test.snapshot.txt:83",
           "file": "packages/gateway/test/slack-adapter-redteam.e2e.test.ts",
           "verdict": "passed",
           "failure": ""
         }
       ],
       "artifactRefs": [
-        "artifacts/slack-adapter-redteam.junit.xml"
+        "artifacts/slack-adapter-redteam.junit.xml",
+        "artifacts/slack-adapter-gateway-redteam.test.snapshot.txt"
       ]
     },
     {
       "id": "RT-SLACK-22",
-      "sourceHash": "sha256:a25e067e990803eb95171864c9574a6a48df0211eabba6852b4cecfd0c3c4582",
+      "sourceHash": "sha256:042d2126b51914390a20c478dc58e04175f03d7b1d8737b7581e1556af3572b7",
       "scenario": "check reaction token delivers on Slack and is refused on Telegram",
       "expectedBehavior": "Check token maps to white_check_mark on Slack and is refused on Telegram.",
       "expected": "Check token maps to white_check_mark on Slack and is refused on Telegram.",
       "verdict": "passed",
-      "test": "packages/gateway/test/slack-adapter-redteam.e2e.test.ts:90",
+      "test": "packages/gateway/test/slack-adapter-redteam.e2e.test.ts:93",
+      "testSnapshot": "artifacts/slack-adapter-gateway-redteam.test.snapshot.txt:93",
       "subcases": [
         {
           "name": "RT-SLACK-22 check reaction token delivers on Slack and is refused on Telegram",
-          "test": "packages/gateway/test/slack-adapter-redteam.e2e.test.ts:90",
+          "test": "packages/gateway/test/slack-adapter-redteam.e2e.test.ts:93",
+          "testSnapshot": "artifacts/slack-adapter-gateway-redteam.test.snapshot.txt:93",
           "file": "packages/gateway/test/slack-adapter-redteam.e2e.test.ts",
           "verdict": "passed",
           "failure": ""
         }
       ],
       "artifactRefs": [
-        "artifacts/slack-adapter-redteam.junit.xml"
+        "artifacts/slack-adapter-redteam.junit.xml",
+        "artifacts/slack-adapter-gateway-redteam.test.snapshot.txt"
       ]
     },
     {
       "id": "RT-SLACK-23",
-      "sourceHash": "sha256:a25e067e990803eb95171864c9574a6a48df0211eabba6852b4cecfd0c3c4582",
+      "sourceHash": "sha256:042d2126b51914390a20c478dc58e04175f03d7b1d8737b7581e1556af3572b7",
       "scenario": "monitor and loopback cannot chat.react",
       "expectedBehavior": "Monitor and loopback cannot chat.react and create no deliveries.",
       "expected": "Monitor and loopback cannot chat.react and create no deliveries.",
       "verdict": "passed",
-      "test": "packages/gateway/test/slack-adapter-redteam.e2e.test.ts:121",
+      "test": "packages/gateway/test/slack-adapter-redteam.e2e.test.ts:124",
+      "testSnapshot": "artifacts/slack-adapter-gateway-redteam.test.snapshot.txt:124",
       "subcases": [
         {
           "name": "RT-SLACK-23 monitor and loopback cannot chat.react",
-          "test": "packages/gateway/test/slack-adapter-redteam.e2e.test.ts:121",
+          "test": "packages/gateway/test/slack-adapter-redteam.e2e.test.ts:124",
+          "testSnapshot": "artifacts/slack-adapter-gateway-redteam.test.snapshot.txt:124",
           "file": "packages/gateway/test/slack-adapter-redteam.e2e.test.ts",
           "verdict": "passed",
           "failure": ""
         }
       ],
       "artifactRefs": [
-        "artifacts/slack-adapter-redteam.junit.xml"
+        "artifacts/slack-adapter-redteam.junit.xml",
+        "artifacts/slack-adapter-gateway-redteam.test.snapshot.txt"
       ]
     },
     {
       "id": "RT-SLACK-24",
-      "sourceHash": "sha256:a25e067e990803eb95171864c9574a6a48df0211eabba6852b4cecfd0c3c4582",
+      "sourceHash": "sha256:042d2126b51914390a20c478dc58e04175f03d7b1d8737b7581e1556af3572b7",
       "scenario": "thread and channel isolate sessions and route replies",
       "expectedBehavior": "Channel/thread origins isolate sessions and route confirmed replies correctly.",
       "expected": "Channel/thread origins isolate sessions and route confirmed replies correctly.",
       "verdict": "passed",
-      "test": "packages/gateway/test/slack-adapter-redteam.e2e.test.ts:133",
+      "test": "packages/gateway/test/slack-adapter-redteam.e2e.test.ts:136",
+      "testSnapshot": "artifacts/slack-adapter-gateway-redteam.test.snapshot.txt:136",
       "subcases": [
         {
           "name": "RT-SLACK-24 thread and channel isolate sessions and route replies",
-          "test": "packages/gateway/test/slack-adapter-redteam.e2e.test.ts:133",
+          "test": "packages/gateway/test/slack-adapter-redteam.e2e.test.ts:136",
+          "testSnapshot": "artifacts/slack-adapter-gateway-redteam.test.snapshot.txt:136",
           "file": "packages/gateway/test/slack-adapter-redteam.e2e.test.ts",
           "verdict": "passed",
           "failure": ""
         }
       ],
       "artifactRefs": [
-        "artifacts/slack-adapter-redteam.junit.xml"
+        "artifacts/slack-adapter-redteam.junit.xml",
+        "artifacts/slack-adapter-gateway-redteam.test.snapshot.txt"
       ]
     },
     {
       "id": "RT-SLACK-25",
-      "sourceHash": "sha256:a25e067e990803eb95171864c9574a6a48df0211eabba6852b4cecfd0c3c4582",
+      "sourceHash": "sha256:042d2126b51914390a20c478dc58e04175f03d7b1d8737b7581e1556af3572b7",
       "scenario": "already_reacted Web API response confirms delivery",
       "expectedBehavior": "Actual already_reacted Web API response confirms delivery.",
       "expected": "Actual already_reacted Web API response confirms delivery.",
       "verdict": "passed",
-      "test": "packages/adapter-slack/test/redteam.test.ts:547",
+      "test": "packages/adapter-slack/test/redteam.test.ts:555",
+      "testSnapshot": "artifacts/slack-adapter-redteam.test.snapshot.txt:555",
       "subcases": [
         {
           "name": "RT-SLACK-25 already_reacted Web API response confirms delivery",
-          "test": "packages/adapter-slack/test/redteam.test.ts:547",
+          "test": "packages/adapter-slack/test/redteam.test.ts:555",
+          "testSnapshot": "artifacts/slack-adapter-redteam.test.snapshot.txt:555",
           "file": "packages/adapter-slack/test/redteam.test.ts",
           "verdict": "passed",
           "failure": ""
         }
       ],
       "artifactRefs": [
-        "artifacts/slack-adapter-redteam.junit.xml"
+        "artifacts/slack-adapter-redteam.junit.xml",
+        "artifacts/slack-adapter-redteam.test.snapshot.txt"
       ]
     },
     {
       "id": "RT-SLACK-26",
-      "sourceHash": "sha256:a25e067e990803eb95171864c9574a6a48df0211eabba6852b4cecfd0c3c4582",
+      "sourceHash": "sha256:042d2126b51914390a20c478dc58e04175f03d7b1d8737b7581e1556af3572b7",
       "scenario": "dist/gajaeway-slack --help",
       "expectedBehavior": "Compiled --help exits 0 with usage without booting.",
       "expected": "Compiled --help exits 0 with usage without booting.",
       "verdict": "passed",
       "test": "artifacts/slack-adapter-cli-probes.ts:8",
+      "testSnapshot": "",
       "subcases": [],
       "artifactRefs": [
         "artifacts/slack-adapter-cli-proof.json"
@@ -957,12 +1054,13 @@
     },
     {
       "id": "RT-SLACK-27",
-      "sourceHash": "sha256:a25e067e990803eb95171864c9574a6a48df0211eabba6852b4cecfd0c3c4582",
+      "sourceHash": "sha256:042d2126b51914390a20c478dc58e04175f03d7b1d8737b7581e1556af3572b7",
       "scenario": "dist/gajaeway-slack --version",
       "expectedBehavior": "Compiled --version exits 0 with semver.",
       "expected": "Compiled --version exits 0 with semver.",
       "verdict": "passed",
       "test": "artifacts/slack-adapter-cli-probes.ts:8",
+      "testSnapshot": "",
       "subcases": [],
       "artifactRefs": [
         "artifacts/slack-adapter-cli-proof.json"
@@ -970,12 +1068,13 @@
     },
     {
       "id": "RT-SLACK-28",
-      "sourceHash": "sha256:a25e067e990803eb95171864c9574a6a48df0211eabba6852b4cecfd0c3c4582",
+      "sourceHash": "sha256:042d2126b51914390a20c478dc58e04175f03d7b1d8737b7581e1556af3572b7",
       "scenario": "dist/gajaeway-slack --nope",
       "expectedBehavior": "Compiled unknown flag exits 2 with usage on stderr.",
       "expected": "Compiled unknown flag exits 2 with usage on stderr.",
       "verdict": "passed",
       "test": "artifacts/slack-adapter-cli-probes.ts:8",
+      "testSnapshot": "",
       "subcases": [],
       "artifactRefs": [
         "artifacts/slack-adapter-cli-proof.json"
@@ -983,12 +1082,13 @@
     },
     {
       "id": "RT-SLACK-29",
-      "sourceHash": "sha256:a25e067e990803eb95171864c9574a6a48df0211eabba6852b4cecfd0c3c4582",
+      "sourceHash": "sha256:042d2126b51914390a20c478dc58e04175f03d7b1d8737b7581e1556af3572b7",
       "scenario": "dist/gajaeway-slack",
       "expectedBehavior": "Compiled second instance exits 2 without overwriting a live pidfile.",
       "expected": "Compiled second instance exits 2 without overwriting a live pidfile.",
       "verdict": "passed",
       "test": "artifacts/slack-adapter-cli-probes.ts:8",
+      "testSnapshot": "",
       "subcases": [],
       "artifactRefs": [
         "artifacts/slack-adapter-cli-proof.json"
@@ -996,58 +1096,66 @@
     },
     {
       "id": "RT-SLACK-30",
-      "sourceHash": "sha256:a25e067e990803eb95171864c9574a6a48df0211eabba6852b4cecfd0c3c4582",
+      "sourceHash": "sha256:042d2126b51914390a20c478dc58e04175f03d7b1d8737b7581e1556af3572b7",
       "scenario": "pending sends share failure and survive client adoption",
       "expectedBehavior": "Recovered request joins pending live outcome, reports unavailable on failure, retries then dedupes; adoption while pending preserves outcome.",
       "expected": "Recovered request joins pending live outcome, reports unavailable on failure, retries then dedupes; adoption while pending preserves outcome.",
       "verdict": "passed",
-      "test": "packages/adapter-slack/test/redteam.test.ts:561",
+      "test": "packages/adapter-slack/test/redteam.test.ts:569",
+      "testSnapshot": "artifacts/slack-adapter-redteam.test.snapshot.txt:569",
       "subcases": [
         {
           "name": "RT-SLACK-30 pending sends share failure and survive client adoption",
-          "test": "packages/adapter-slack/test/redteam.test.ts:561",
+          "test": "packages/adapter-slack/test/redteam.test.ts:569",
+          "testSnapshot": "artifacts/slack-adapter-redteam.test.snapshot.txt:569",
           "file": "packages/adapter-slack/test/redteam.test.ts",
           "verdict": "passed",
           "failure": ""
         }
       ],
       "artifactRefs": [
-        "artifacts/slack-adapter-redteam.junit.xml"
+        "artifacts/slack-adapter-redteam.junit.xml",
+        "artifacts/slack-adapter-redteam.test.snapshot.txt"
       ]
     },
     {
       "id": "RT-SLACK-31",
-      "sourceHash": "sha256:a25e067e990803eb95171864c9574a6a48df0211eabba6852b4cecfd0c3c4582",
+      "sourceHash": "sha256:042d2126b51914390a20c478dc58e04175f03d7b1d8737b7581e1556af3572b7",
       "scenario": "unreadable success bodies are ambiguous but explicit refusal is definitive",
       "expectedBehavior": "200 {}, nonboolean ok and throwing body streams are unreadable/ambiguous; explicit ok:false is definitive.",
       "expected": "200 {}, nonboolean ok and throwing body streams are unreadable/ambiguous; explicit ok:false is definitive.",
       "verdict": "passed",
-      "test": "packages/adapter-slack/test/redteam.test.ts:587",
+      "test": "packages/adapter-slack/test/redteam.test.ts:595",
+      "testSnapshot": "artifacts/slack-adapter-redteam.test.snapshot.txt:595",
       "subcases": [
         {
           "name": "RT-SLACK-31 unreadable success bodies are ambiguous but explicit refusal is definitive",
-          "test": "packages/adapter-slack/test/redteam.test.ts:587",
+          "test": "packages/adapter-slack/test/redteam.test.ts:595",
+          "testSnapshot": "artifacts/slack-adapter-redteam.test.snapshot.txt:595",
           "file": "packages/adapter-slack/test/redteam.test.ts",
           "verdict": "passed",
           "failure": ""
         }
       ],
       "artifactRefs": [
-        "artifacts/slack-adapter-redteam.junit.xml"
+        "artifacts/slack-adapter-redteam.junit.xml",
+        "artifacts/slack-adapter-redteam.test.snapshot.txt"
       ]
     },
     {
       "id": "RT-SLACK-32",
-      "sourceHash": "sha256:a25e067e990803eb95171864c9574a6a48df0211eabba6852b4cecfd0c3c4582",
+      "sourceHash": "sha256:042d2126b51914390a20c478dc58e04175f03d7b1d8737b7581e1556af3572b7",
       "scenario": "first SDK subscriber receives newest held events in order (2); first SDK subscriber receives newest held events in order (1001)",
       "expectedBehavior": "Same-chunk negotiated and chat events reach first subscriber in order; second gets no replay; newest 1000 retained; internal events never held.",
       "expected": "Same-chunk negotiated and chat events reach first subscriber in order; second gets no replay; newest 1000 retained; internal events never held.",
       "verdict": "passed",
       "test": "packages/sdk/test/client-held-events.test.ts:6, packages/sdk/test/client-held-events.test.ts:6",
+      "testSnapshot": "artifacts/slack-adapter-sdk-held-events.test.snapshot.txt:6, artifacts/slack-adapter-sdk-held-events.test.snapshot.txt:6",
       "subcases": [
         {
           "name": "RT-SLACK-32 first SDK subscriber receives newest held events in order (2)",
           "test": "packages/sdk/test/client-held-events.test.ts:6",
+          "testSnapshot": "artifacts/slack-adapter-sdk-held-events.test.snapshot.txt:6",
           "file": "packages/sdk/test/client-held-events.test.ts",
           "verdict": "passed",
           "failure": ""
@@ -1055,286 +1163,609 @@
         {
           "name": "RT-SLACK-32 first SDK subscriber receives newest held events in order (1001)",
           "test": "packages/sdk/test/client-held-events.test.ts:6",
+          "testSnapshot": "artifacts/slack-adapter-sdk-held-events.test.snapshot.txt:6",
           "file": "packages/sdk/test/client-held-events.test.ts",
           "verdict": "passed",
           "failure": ""
         }
       ],
       "artifactRefs": [
-        "artifacts/slack-adapter-redteam.junit.xml"
+        "artifacts/slack-adapter-redteam.junit.xml",
+        "artifacts/slack-adapter-sdk-held-events.test.snapshot.txt"
       ]
     },
     {
       "id": "RT-SLACK-33",
-      "sourceHash": "sha256:a25e067e990803eb95171864c9574a6a48df0211eabba6852b4cecfd0c3c4582",
+      "sourceHash": "sha256:042d2126b51914390a20c478dc58e04175f03d7b1d8737b7581e1556af3572b7",
       "scenario": "slack stale lock has exactly one winner under 20 concurrent reclaims; discord stale lock has exactly one winner under 20 concurrent reclaims",
       "expectedBehavior": "Exactly one of 20 concurrent stale-pidfile reclaims succeeds; all others reject with AdapterAlreadyRunningError; pidfile matches winner, for Slack and Discord.",
       "expected": "Exactly one of 20 concurrent stale-pidfile reclaims succeeds; all others reject with AdapterAlreadyRunningError; pidfile matches winner, for Slack and Discord.",
       "verdict": "passed",
-      "test": "packages/adapter-slack/test/redteam.test.ts:624, packages/gateway/test/slack-adapter-redteam.e2e.test.ts:186",
+      "test": "packages/adapter-slack/test/redteam.test.ts:632, packages/gateway/test/slack-adapter-redteam.e2e.test.ts:196",
+      "testSnapshot": "artifacts/slack-adapter-redteam.test.snapshot.txt:632, artifacts/slack-adapter-gateway-redteam.test.snapshot.txt:196",
       "subcases": [
         {
           "name": "RT-SLACK-33 slack stale lock has exactly one winner under 20 concurrent reclaims",
-          "test": "packages/adapter-slack/test/redteam.test.ts:624",
+          "test": "packages/adapter-slack/test/redteam.test.ts:632",
+          "testSnapshot": "artifacts/slack-adapter-redteam.test.snapshot.txt:632",
           "file": "packages/adapter-slack/test/redteam.test.ts",
           "verdict": "passed",
           "failure": ""
         },
         {
           "name": "RT-SLACK-33 discord stale lock has exactly one winner under 20 concurrent reclaims",
-          "test": "packages/gateway/test/slack-adapter-redteam.e2e.test.ts:186",
+          "test": "packages/gateway/test/slack-adapter-redteam.e2e.test.ts:196",
+          "testSnapshot": "artifacts/slack-adapter-gateway-redteam.test.snapshot.txt:196",
           "file": "packages/gateway/test/slack-adapter-redteam.e2e.test.ts",
           "verdict": "passed",
           "failure": ""
         }
       ],
       "artifactRefs": [
-        "artifacts/slack-adapter-redteam.junit.xml"
+        "artifacts/slack-adapter-redteam.junit.xml",
+        "artifacts/slack-adapter-redteam.test.snapshot.txt",
+        "artifacts/slack-adapter-gateway-redteam.test.snapshot.txt"
       ]
     },
     {
       "id": "RT-SLACK-34",
-      "sourceHash": "sha256:a25e067e990803eb95171864c9574a6a48df0211eabba6852b4cecfd0c3c4582",
-      "scenario": "real gateway threaded DM chunks default to inbound root; real gateway threaded DM chunks explicit reply wins; plain channel reply does not inherit a thread",
-      "expectedBehavior": "Real gateway threaded DM defaults every chunk to inbound root; explicit REPLY target wins; plain channel has no thread_ts.",
-      "expected": "Real gateway threaded DM defaults every chunk to inbound root; explicit REPLY target wins; plain channel has no thread_ts.",
+      "sourceHash": "sha256:042d2126b51914390a20c478dc58e04175f03d7b1d8737b7581e1556af3572b7",
+      "scenario": "real gateway threaded DM chunks default to inbound root; real gateway threaded DM chunks explicit reply wins; plain channel reply threads under the triggering message; an explicit target wins",
+      "expectedBehavior": "Real gateway threaded DM defaults every chunk to inbound root; explicit REPLY target wins; plain Slack channel threads under triggering message.",
+      "expected": "Real gateway threaded DM defaults every chunk to inbound root; explicit REPLY target wins; plain Slack channel threads under triggering message.",
       "verdict": "passed",
-      "test": "packages/gateway/test/slack-adapter-redteam.e2e.test.ts:155, packages/gateway/test/slack-adapter-redteam.e2e.test.ts:155, packages/gateway/test/slack-adapter-redteam.e2e.test.ts:179",
+      "test": "packages/gateway/test/slack-adapter-redteam.e2e.test.ts:161, packages/gateway/test/slack-adapter-redteam.e2e.test.ts:161, packages/gateway/test/slack-adapter-redteam.e2e.test.ts:185",
+      "testSnapshot": "artifacts/slack-adapter-gateway-redteam.test.snapshot.txt:161, artifacts/slack-adapter-gateway-redteam.test.snapshot.txt:161, artifacts/slack-adapter-gateway-redteam.test.snapshot.txt:185",
       "subcases": [
         {
           "name": "RT-SLACK-34 real gateway threaded DM chunks default to inbound root",
-          "test": "packages/gateway/test/slack-adapter-redteam.e2e.test.ts:155",
+          "test": "packages/gateway/test/slack-adapter-redteam.e2e.test.ts:161",
+          "testSnapshot": "artifacts/slack-adapter-gateway-redteam.test.snapshot.txt:161",
           "file": "packages/gateway/test/slack-adapter-redteam.e2e.test.ts",
           "verdict": "passed",
           "failure": ""
         },
         {
           "name": "RT-SLACK-34 real gateway threaded DM chunks explicit reply wins",
-          "test": "packages/gateway/test/slack-adapter-redteam.e2e.test.ts:155",
+          "test": "packages/gateway/test/slack-adapter-redteam.e2e.test.ts:161",
+          "testSnapshot": "artifacts/slack-adapter-gateway-redteam.test.snapshot.txt:161",
           "file": "packages/gateway/test/slack-adapter-redteam.e2e.test.ts",
           "verdict": "passed",
           "failure": ""
         },
         {
-          "name": "RT-SLACK-34 plain channel reply does not inherit a thread",
-          "test": "packages/gateway/test/slack-adapter-redteam.e2e.test.ts:179",
+          "name": "RT-SLACK-34 plain channel reply threads under the triggering message; an explicit target wins",
+          "test": "packages/gateway/test/slack-adapter-redteam.e2e.test.ts:185",
+          "testSnapshot": "artifacts/slack-adapter-gateway-redteam.test.snapshot.txt:185",
           "file": "packages/gateway/test/slack-adapter-redteam.e2e.test.ts",
           "verdict": "passed",
           "failure": ""
         }
       ],
       "artifactRefs": [
-        "artifacts/slack-adapter-redteam.junit.xml"
+        "artifacts/slack-adapter-redteam.junit.xml",
+        "artifacts/slack-adapter-gateway-redteam.test.snapshot.txt"
       ]
     },
     {
       "id": "RT-SLACK-35",
-      "sourceHash": "sha256:a25e067e990803eb95171864c9574a6a48df0211eabba6852b4cecfd0c3c4582",
+      "sourceHash": "sha256:042d2126b51914390a20c478dc58e04175f03d7b1d8737b7581e1556af3572b7",
       "scenario": "bounded continuation closes the gap without losing newer arrivals",
       "expectedBehavior": "Two-page bounded pass retains continuation without advancing; next pass closes remaining gap; later arrival above through is not lost.",
       "expected": "Two-page bounded pass retains continuation without advancing; next pass closes remaining gap; later arrival above through is not lost.",
       "verdict": "passed",
-      "test": "packages/adapter-slack/test/redteam.test.ts:639",
+      "test": "packages/adapter-slack/test/redteam.test.ts:647",
+      "testSnapshot": "artifacts/slack-adapter-redteam.test.snapshot.txt:647",
       "subcases": [
         {
           "name": "RT-SLACK-35 bounded continuation closes the gap without losing newer arrivals",
-          "test": "packages/adapter-slack/test/redteam.test.ts:639",
+          "test": "packages/adapter-slack/test/redteam.test.ts:647",
+          "testSnapshot": "artifacts/slack-adapter-redteam.test.snapshot.txt:647",
           "file": "packages/adapter-slack/test/redteam.test.ts",
           "verdict": "passed",
           "failure": ""
         }
       ],
       "artifactRefs": [
-        "artifacts/slack-adapter-redteam.junit.xml"
+        "artifacts/slack-adapter-redteam.junit.xml",
+        "artifacts/slack-adapter-redteam.test.snapshot.txt"
       ]
     },
     {
       "id": "RT-SLACK-36",
-      "sourceHash": "sha256:a25e067e990803eb95171864c9574a6a48df0211eabba6852b4cecfd0c3c4582",
+      "sourceHash": "sha256:042d2126b51914390a20c478dc58e04175f03d7b1d8737b7581e1556af3572b7",
       "scenario": "participated threads recover without history and expire",
       "expectedBehavior": "Engaged thread root is durably remembered and revisited when history is empty; participated-thread TTL prunes it.",
       "expected": "Engaged thread root is durably remembered and revisited when history is empty; participated-thread TTL prunes it.",
       "verdict": "passed",
-      "test": "packages/adapter-slack/test/redteam.test.ts:685",
+      "test": "packages/adapter-slack/test/redteam.test.ts:693",
+      "testSnapshot": "artifacts/slack-adapter-redteam.test.snapshot.txt:693",
       "subcases": [
         {
           "name": "RT-SLACK-36 participated threads recover without history and expire",
-          "test": "packages/adapter-slack/test/redteam.test.ts:685",
+          "test": "packages/adapter-slack/test/redteam.test.ts:693",
+          "testSnapshot": "artifacts/slack-adapter-redteam.test.snapshot.txt:693",
           "file": "packages/adapter-slack/test/redteam.test.ts",
           "verdict": "passed",
           "failure": ""
         }
       ],
       "artifactRefs": [
-        "artifacts/slack-adapter-redteam.junit.xml"
+        "artifacts/slack-adapter-redteam.junit.xml",
+        "artifacts/slack-adapter-redteam.test.snapshot.txt"
       ]
     },
     {
       "id": "RT-SLACK-37",
-      "sourceHash": "sha256:a25e067e990803eb95171864c9574a6a48df0211eabba6852b4cecfd0c3c4582",
+      "sourceHash": "sha256:042d2126b51914390a20c478dc58e04175f03d7b1d8737b7581e1556af3572b7",
       "scenario": "only terminal refusals consume dead-letter budget",
       "expectedBehavior": "Three invalid_params refusals dead-letter with terminal-message classification/digest/watermark; intervening link failure does not count; repeated unknown failures never dead-letter.",
       "expected": "Three invalid_params refusals dead-letter with terminal-message classification/digest/watermark; intervening link failure does not count; repeated unknown failures never dead-letter.",
       "verdict": "passed",
-      "test": "packages/adapter-slack/test/redteam.test.ts:703",
+      "test": "packages/adapter-slack/test/redteam.test.ts:711",
+      "testSnapshot": "artifacts/slack-adapter-redteam.test.snapshot.txt:711",
       "subcases": [
         {
           "name": "RT-SLACK-37 only terminal refusals consume dead-letter budget",
-          "test": "packages/adapter-slack/test/redteam.test.ts:703",
+          "test": "packages/adapter-slack/test/redteam.test.ts:711",
+          "testSnapshot": "artifacts/slack-adapter-redteam.test.snapshot.txt:711",
           "file": "packages/adapter-slack/test/redteam.test.ts",
           "verdict": "passed",
           "failure": ""
         }
       ],
       "artifactRefs": [
-        "artifacts/slack-adapter-redteam.junit.xml"
+        "artifacts/slack-adapter-redteam.junit.xml",
+        "artifacts/slack-adapter-redteam.test.snapshot.txt"
       ]
     },
     {
       "id": "RT-SLACK-38",
-      "sourceHash": "sha256:a25e067e990803eb95171864c9574a6a48df0211eabba6852b4cecfd0c3c4582",
+      "sourceHash": "sha256:042d2126b51914390a20c478dc58e04175f03d7b1d8737b7581e1556af3572b7",
       "scenario": "unsaved recovery state prevents success until disk is restored",
       "expectedBehavior": "Failed cursor save makes pass incomplete; restoring isolated /tmp store allows persistence without resending acknowledged message.",
       "expected": "Failed cursor save makes pass incomplete; restoring isolated /tmp store allows persistence without resending acknowledged message.",
       "verdict": "passed",
-      "test": "packages/adapter-slack/test/redteam.test.ts:742",
+      "test": "packages/adapter-slack/test/redteam.test.ts:750",
+      "testSnapshot": "artifacts/slack-adapter-redteam.test.snapshot.txt:750",
       "subcases": [
         {
           "name": "RT-SLACK-38 unsaved recovery state prevents success until disk is restored",
-          "test": "packages/adapter-slack/test/redteam.test.ts:742",
+          "test": "packages/adapter-slack/test/redteam.test.ts:750",
+          "testSnapshot": "artifacts/slack-adapter-redteam.test.snapshot.txt:750",
           "file": "packages/adapter-slack/test/redteam.test.ts",
           "verdict": "passed",
           "failure": ""
         }
       ],
       "artifactRefs": [
-        "artifacts/slack-adapter-redteam.junit.xml"
+        "artifacts/slack-adapter-redteam.junit.xml",
+        "artifacts/slack-adapter-redteam.test.snapshot.txt"
       ]
     },
     {
       "id": "RT-SLACK-39",
-      "sourceHash": "sha256:a25e067e990803eb95171864c9574a6a48df0211eabba6852b4cecfd0c3c4582",
+      "sourceHash": "sha256:042d2126b51914390a20c478dc58e04175f03d7b1d8737b7581e1556af3572b7",
       "scenario": "slash acknowledgements reflect restart failure duplicates and unknown commands",
       "expectedBehavior": "Slash acks distinguish restart, unreachable gateway, duplicate trigger and unknown command.",
       "expected": "Slash acks distinguish restart, unreachable gateway, duplicate trigger and unknown command.",
       "verdict": "passed",
-      "test": "packages/adapter-slack/test/redteam.test.ts:757",
+      "test": "packages/adapter-slack/test/redteam.test.ts:765",
+      "testSnapshot": "artifacts/slack-adapter-redteam.test.snapshot.txt:765",
       "subcases": [
         {
           "name": "RT-SLACK-39 slash acknowledgements reflect restart failure duplicates and unknown commands",
-          "test": "packages/adapter-slack/test/redteam.test.ts:757",
+          "test": "packages/adapter-slack/test/redteam.test.ts:765",
+          "testSnapshot": "artifacts/slack-adapter-redteam.test.snapshot.txt:765",
           "file": "packages/adapter-slack/test/redteam.test.ts",
           "verdict": "passed",
           "failure": ""
         }
       ],
       "artifactRefs": [
-        "artifacts/slack-adapter-redteam.junit.xml"
+        "artifacts/slack-adapter-redteam.junit.xml",
+        "artifacts/slack-adapter-redteam.test.snapshot.txt"
       ]
     },
     {
       "id": "RT-SLACK-40",
-      "sourceHash": "sha256:a25e067e990803eb95171864c9574a6a48df0211eabba6852b4cecfd0c3c4582",
+      "sourceHash": "sha256:042d2126b51914390a20c478dc58e04175f03d7b1d8737b7581e1556af3572b7",
       "scenario": "addressed accepted turns post working status before any progress",
       "expectedBehavior": "Engaged addressed turn posts working status before progress; unmentioned group does not; thread status keeps thread_ts.",
       "expected": "Engaged addressed turn posts working status before progress; unmentioned group does not; thread status keeps thread_ts.",
       "verdict": "passed",
-      "test": "packages/adapter-slack/test/redteam.test.ts:783",
+      "test": "packages/adapter-slack/test/redteam.test.ts:791",
+      "testSnapshot": "artifacts/slack-adapter-redteam.test.snapshot.txt:791",
       "subcases": [
         {
           "name": "RT-SLACK-40 addressed accepted turns post working status before any progress",
-          "test": "packages/adapter-slack/test/redteam.test.ts:783",
+          "test": "packages/adapter-slack/test/redteam.test.ts:791",
+          "testSnapshot": "artifacts/slack-adapter-redteam.test.snapshot.txt:791",
           "file": "packages/adapter-slack/test/redteam.test.ts",
           "verdict": "passed",
           "failure": ""
         }
       ],
       "artifactRefs": [
-        "artifacts/slack-adapter-redteam.junit.xml"
+        "artifacts/slack-adapter-redteam.junit.xml",
+        "artifacts/slack-adapter-redteam.test.snapshot.txt"
       ]
     },
     {
       "id": "RT-SLACK-41",
-      "sourceHash": "sha256:a25e067e990803eb95171864c9574a6a48df0211eabba6852b4cecfd0c3c4582",
+      "sourceHash": "sha256:042d2126b51914390a20c478dc58e04175f03d7b1d8737b7581e1556af3572b7",
       "scenario": "unknown rocket reaction fails definitively without a Slack call",
       "expectedBehavior": "Unknown rocket emojiName fails definitively without addReaction.",
       "expected": "Unknown rocket emojiName fails definitively without addReaction.",
       "verdict": "passed",
-      "test": "packages/adapter-slack/test/redteam.test.ts:803",
+      "test": "packages/adapter-slack/test/redteam.test.ts:811",
+      "testSnapshot": "artifacts/slack-adapter-redteam.test.snapshot.txt:811",
       "subcases": [
         {
           "name": "RT-SLACK-41 unknown rocket reaction fails definitively without a Slack call",
-          "test": "packages/adapter-slack/test/redteam.test.ts:803",
+          "test": "packages/adapter-slack/test/redteam.test.ts:811",
+          "testSnapshot": "artifacts/slack-adapter-redteam.test.snapshot.txt:811",
           "file": "packages/adapter-slack/test/redteam.test.ts",
           "verdict": "passed",
           "failure": ""
         }
       ],
       "artifactRefs": [
-        "artifacts/slack-adapter-redteam.junit.xml"
+        "artifacts/slack-adapter-redteam.junit.xml",
+        "artifacts/slack-adapter-redteam.test.snapshot.txt"
       ]
     },
     {
       "id": "RT-SLACK-42",
-      "sourceHash": "sha256:a25e067e990803eb95171864c9574a6a48df0211eabba6852b4cecfd0c3c4582",
+      "sourceHash": "sha256:042d2126b51914390a20c478dc58e04175f03d7b1d8737b7581e1556af3572b7",
       "scenario": "orphaned reclaim marker permits acquisition within two seconds and is removed",
       "expectedBehavior": "A stale pidfile plus a dead reclaimer marker recovers within 2000ms and removes the marker.",
       "expected": "A stale pidfile plus a dead reclaimer marker recovers within 2000ms and removes the marker.",
       "verdict": "passed",
-      "test": "packages/adapter-slack/test/redteam.test.ts:818",
+      "test": "packages/adapter-slack/test/redteam.test.ts:826",
+      "testSnapshot": "artifacts/slack-adapter-redteam.test.snapshot.txt:826",
       "subcases": [
         {
           "name": "RT-SLACK-42 orphaned reclaim marker permits acquisition within two seconds and is removed",
-          "test": "packages/adapter-slack/test/redteam.test.ts:818",
+          "test": "packages/adapter-slack/test/redteam.test.ts:826",
+          "testSnapshot": "artifacts/slack-adapter-redteam.test.snapshot.txt:826",
           "file": "packages/adapter-slack/test/redteam.test.ts",
           "verdict": "passed",
           "failure": ""
         }
       ],
       "artifactRefs": [
-        "artifacts/slack-adapter-redteam.junit.xml"
+        "artifacts/slack-adapter-redteam.junit.xml",
+        "artifacts/slack-adapter-redteam.test.snapshot.txt"
       ]
     },
     {
       "id": "RT-SLACK-43",
-      "sourceHash": "sha256:a25e067e990803eb95171864c9574a6a48df0211eabba6852b4cecfd0c3c4582",
+      "sourceHash": "sha256:042d2126b51914390a20c478dc58e04175f03d7b1d8737b7581e1556af3572b7",
       "scenario": "live holder arriving during election is never replaced by waiting contenders",
       "expectedBehavior": "Twenty waiting contenders refuse a live holder that arrives mid-election without replacing its pidfile.",
       "expected": "Twenty waiting contenders refuse a live holder that arrives mid-election without replacing its pidfile.",
       "verdict": "passed",
-      "test": "packages/adapter-slack/test/redteam.test.ts:832",
+      "test": "packages/adapter-slack/test/redteam.test.ts:840",
+      "testSnapshot": "artifacts/slack-adapter-redteam.test.snapshot.txt:840",
       "subcases": [
         {
           "name": "RT-SLACK-43 live holder arriving during election is never replaced by waiting contenders",
-          "test": "packages/adapter-slack/test/redteam.test.ts:832",
+          "test": "packages/adapter-slack/test/redteam.test.ts:840",
+          "testSnapshot": "artifacts/slack-adapter-redteam.test.snapshot.txt:840",
           "file": "packages/adapter-slack/test/redteam.test.ts",
           "verdict": "passed",
           "failure": ""
         }
       ],
       "artifactRefs": [
-        "artifacts/slack-adapter-redteam.junit.xml"
+        "artifacts/slack-adapter-redteam.junit.xml",
+        "artifacts/slack-adapter-redteam.test.snapshot.txt"
       ]
     },
     {
       "id": "RT-SLACK-44",
-      "sourceHash": "sha256:a25e067e990803eb95171864c9574a6a48df0211eabba6852b4cecfd0c3c4582",
+      "sourceHash": "sha256:042d2126b51914390a20c478dc58e04175f03d7b1d8737b7581e1556af3572b7",
       "scenario": "release by a former holder after losing election preserves the winner pidfile",
       "expectedBehavior": "A former holder loses reacquisition; its release preserves the elected winner, whose own release removes the pidfile.",
       "expected": "A former holder loses reacquisition; its release preserves the elected winner, whose own release removes the pidfile.",
       "verdict": "passed",
-      "test": "packages/adapter-slack/test/redteam.test.ts:866",
+      "test": "packages/adapter-slack/test/redteam.test.ts:874",
+      "testSnapshot": "artifacts/slack-adapter-redteam.test.snapshot.txt:874",
       "subcases": [
         {
           "name": "RT-SLACK-44 release by a former holder after losing election preserves the winner pidfile",
-          "test": "packages/adapter-slack/test/redteam.test.ts:866",
+          "test": "packages/adapter-slack/test/redteam.test.ts:874",
+          "testSnapshot": "artifacts/slack-adapter-redteam.test.snapshot.txt:874",
           "file": "packages/adapter-slack/test/redteam.test.ts",
           "verdict": "passed",
           "failure": ""
         }
       ],
       "artifactRefs": [
-        "artifacts/slack-adapter-redteam.junit.xml"
+        "artifacts/slack-adapter-redteam.junit.xml",
+        "artifacts/slack-adapter-redteam.test.snapshot.txt"
+      ]
+    },
+    {
+      "id": "RT-SLACK-45",
+      "sourceHash": "sha256:042d2126b51914390a20c478dc58e04175f03d7b1d8737b7581e1556af3572b7",
+      "scenario": "live 0.9s marker survives timeout naming new holder; two waiters reclaim old dead marker with one winner; discord live marker survives and timeout names pidfile holder; discord dead marker elects one of two waiters",
+      "expectedBehavior": "Live 0.9s-old linked marker survives waiter timeout; old dead-owner marker is reclaimed by exactly one of two waiters; timeout names new live pidfile holder.",
+      "expected": "Live 0.9s-old linked marker survives waiter timeout; old dead-owner marker is reclaimed by exactly one of two waiters; timeout names new live pidfile holder.",
+      "verdict": "passed",
+      "test": "packages/adapter-slack/test/redteam.test.ts:898, packages/adapter-slack/test/redteam.test.ts:898, packages/gateway/test/slack-adapter-redteam.e2e.test.ts:304, packages/gateway/test/slack-adapter-redteam.e2e.test.ts:304",
+      "testSnapshot": "artifacts/slack-adapter-redteam.test.snapshot.txt:898, artifacts/slack-adapter-redteam.test.snapshot.txt:898, artifacts/slack-adapter-gateway-redteam.test.snapshot.txt:304, artifacts/slack-adapter-gateway-redteam.test.snapshot.txt:304",
+      "subcases": [
+        {
+          "name": "RT-SLACK-45 live 0.9s marker survives timeout naming new holder",
+          "test": "packages/adapter-slack/test/redteam.test.ts:898",
+          "testSnapshot": "artifacts/slack-adapter-redteam.test.snapshot.txt:898",
+          "file": "packages/adapter-slack/test/redteam.test.ts",
+          "verdict": "passed",
+          "failure": ""
+        },
+        {
+          "name": "RT-SLACK-45 two waiters reclaim old dead marker with one winner",
+          "test": "packages/adapter-slack/test/redteam.test.ts:898",
+          "testSnapshot": "artifacts/slack-adapter-redteam.test.snapshot.txt:898",
+          "file": "packages/adapter-slack/test/redteam.test.ts",
+          "verdict": "passed",
+          "failure": ""
+        },
+        {
+          "name": "RT-SLACK-45 discord live marker survives and timeout names pidfile holder",
+          "test": "packages/gateway/test/slack-adapter-redteam.e2e.test.ts:304",
+          "testSnapshot": "artifacts/slack-adapter-gateway-redteam.test.snapshot.txt:304",
+          "file": "packages/gateway/test/slack-adapter-redteam.e2e.test.ts",
+          "verdict": "passed",
+          "failure": ""
+        },
+        {
+          "name": "RT-SLACK-45 discord dead marker elects one of two waiters",
+          "test": "packages/gateway/test/slack-adapter-redteam.e2e.test.ts:304",
+          "testSnapshot": "artifacts/slack-adapter-gateway-redteam.test.snapshot.txt:304",
+          "file": "packages/gateway/test/slack-adapter-redteam.e2e.test.ts",
+          "verdict": "passed",
+          "failure": ""
+        }
+      ],
+      "artifactRefs": [
+        "artifacts/slack-adapter-redteam.junit.xml",
+        "artifacts/slack-adapter-redteam.test.snapshot.txt",
+        "artifacts/slack-adapter-gateway-redteam.test.snapshot.txt"
+      ]
+    },
+    {
+      "id": "RT-SLACK-46",
+      "sourceHash": "sha256:042d2126b51914390a20c478dc58e04175f03d7b1d8737b7581e1556af3572b7",
+      "scenario": "slack channel triggering root preserves platform routing on redelivery; discord channel triggering root preserves platform routing on redelivery; telegram channel triggering root preserves platform routing on redelivery; slash synthetic message id cannot become Slack thread root",
+      "expectedBehavior": "Real gateway Slack channel delivery and redelivery thread under triggering ts; slash synthetic id is unthreaded; Discord and Telegram have no reply target.",
+      "expected": "Real gateway Slack channel delivery and redelivery thread under triggering ts; slash synthetic id is unthreaded; Discord and Telegram have no reply target.",
+      "verdict": "passed",
+      "test": "packages/gateway/test/slack-adapter-redteam.e2e.test.ts:215, packages/gateway/test/slack-adapter-redteam.e2e.test.ts:215, packages/gateway/test/slack-adapter-redteam.e2e.test.ts:215, packages/gateway/test/slack-adapter-redteam.e2e.test.ts:231",
+      "testSnapshot": "artifacts/slack-adapter-gateway-redteam.test.snapshot.txt:215, artifacts/slack-adapter-gateway-redteam.test.snapshot.txt:215, artifacts/slack-adapter-gateway-redteam.test.snapshot.txt:215, artifacts/slack-adapter-gateway-redteam.test.snapshot.txt:231",
+      "subcases": [
+        {
+          "name": "RT-SLACK-46 slack channel triggering root preserves platform routing on redelivery",
+          "test": "packages/gateway/test/slack-adapter-redteam.e2e.test.ts:215",
+          "testSnapshot": "artifacts/slack-adapter-gateway-redteam.test.snapshot.txt:215",
+          "file": "packages/gateway/test/slack-adapter-redteam.e2e.test.ts",
+          "verdict": "passed",
+          "failure": ""
+        },
+        {
+          "name": "RT-SLACK-46 discord channel triggering root preserves platform routing on redelivery",
+          "test": "packages/gateway/test/slack-adapter-redteam.e2e.test.ts:215",
+          "testSnapshot": "artifacts/slack-adapter-gateway-redteam.test.snapshot.txt:215",
+          "file": "packages/gateway/test/slack-adapter-redteam.e2e.test.ts",
+          "verdict": "passed",
+          "failure": ""
+        },
+        {
+          "name": "RT-SLACK-46 telegram channel triggering root preserves platform routing on redelivery",
+          "test": "packages/gateway/test/slack-adapter-redteam.e2e.test.ts:215",
+          "testSnapshot": "artifacts/slack-adapter-gateway-redteam.test.snapshot.txt:215",
+          "file": "packages/gateway/test/slack-adapter-redteam.e2e.test.ts",
+          "verdict": "passed",
+          "failure": ""
+        },
+        {
+          "name": "RT-SLACK-46 slash synthetic message id cannot become Slack thread root",
+          "test": "packages/gateway/test/slack-adapter-redteam.e2e.test.ts:231",
+          "testSnapshot": "artifacts/slack-adapter-gateway-redteam.test.snapshot.txt:231",
+          "file": "packages/gateway/test/slack-adapter-redteam.e2e.test.ts",
+          "verdict": "passed",
+          "failure": ""
+        }
+      ],
+      "artifactRefs": [
+        "artifacts/slack-adapter-redteam.junit.xml",
+        "artifacts/slack-adapter-gateway-redteam.test.snapshot.txt"
+      ]
+    },
+    {
+      "id": "RT-SLACK-47",
+      "sourceHash": "sha256:042d2126b51914390a20c478dc58e04175f03d7b1d8737b7581e1556af3572b7",
+      "scenario": "rate-limit settlement 4 refusals Retry-After 2; rate-limit settlement 2 refusals Retry-After 2; rate-limit settlement 2 refusals Retry-After 99; rate-limit settlement 2 refusals Retry-After null",
+      "expectedBehavior": "429 x4 settles ambiguous without SlackApiError; 429 x2 then success confirms in three requests; Retry-After sleeps exact, capped at 30s and defaulting to 1s.",
+      "expected": "429 x4 settles ambiguous without SlackApiError; 429 x2 then success confirms in three requests; Retry-After sleeps exact, capped at 30s and defaulting to 1s.",
+      "verdict": "passed",
+      "test": "packages/adapter-slack/test/redteam.test.ts:944, packages/adapter-slack/test/redteam.test.ts:944, packages/adapter-slack/test/redteam.test.ts:944, packages/adapter-slack/test/redteam.test.ts:944",
+      "testSnapshot": "artifacts/slack-adapter-redteam.test.snapshot.txt:944, artifacts/slack-adapter-redteam.test.snapshot.txt:944, artifacts/slack-adapter-redteam.test.snapshot.txt:944, artifacts/slack-adapter-redteam.test.snapshot.txt:944",
+      "subcases": [
+        {
+          "name": "RT-SLACK-47 rate-limit settlement 4 refusals Retry-After 2",
+          "test": "packages/adapter-slack/test/redteam.test.ts:944",
+          "testSnapshot": "artifacts/slack-adapter-redteam.test.snapshot.txt:944",
+          "file": "packages/adapter-slack/test/redteam.test.ts",
+          "verdict": "passed",
+          "failure": ""
+        },
+        {
+          "name": "RT-SLACK-47 rate-limit settlement 2 refusals Retry-After 2",
+          "test": "packages/adapter-slack/test/redteam.test.ts:944",
+          "testSnapshot": "artifacts/slack-adapter-redteam.test.snapshot.txt:944",
+          "file": "packages/adapter-slack/test/redteam.test.ts",
+          "verdict": "passed",
+          "failure": ""
+        },
+        {
+          "name": "RT-SLACK-47 rate-limit settlement 2 refusals Retry-After 99",
+          "test": "packages/adapter-slack/test/redteam.test.ts:944",
+          "testSnapshot": "artifacts/slack-adapter-redteam.test.snapshot.txt:944",
+          "file": "packages/adapter-slack/test/redteam.test.ts",
+          "verdict": "passed",
+          "failure": ""
+        },
+        {
+          "name": "RT-SLACK-47 rate-limit settlement 2 refusals Retry-After null",
+          "test": "packages/adapter-slack/test/redteam.test.ts:944",
+          "testSnapshot": "artifacts/slack-adapter-redteam.test.snapshot.txt:944",
+          "file": "packages/adapter-slack/test/redteam.test.ts",
+          "verdict": "passed",
+          "failure": ""
+        }
+      ],
+      "artifactRefs": [
+        "artifacts/slack-adapter-redteam.junit.xml",
+        "artifacts/slack-adapter-redteam.test.snapshot.txt"
+      ]
+    },
+    {
+      "id": "RT-SLACK-48",
+      "sourceHash": "sha256:042d2126b51914390a20c478dc58e04175f03d7b1d8737b7581e1556af3572b7",
+      "scenario": "concurrent delivery queue drains before cosmetic without starvation across channels",
+      "expectedBehavior": "Five concurrent deliveries precede cosmetic, independent channels do not block, cosmetic completes when deliveries stop, pendingMs is zero after all settle.",
+      "expected": "Five concurrent deliveries precede cosmetic, independent channels do not block, cosmetic completes when deliveries stop, pendingMs is zero after all settle.",
+      "verdict": "failed",
+      "test": "packages/adapter-slack/test/redteam.test.ts:972",
+      "testSnapshot": "artifacts/slack-adapter-redteam.test.snapshot.txt:972",
+      "subcases": [
+        {
+          "name": "RT-SLACK-48 concurrent delivery queue drains before cosmetic without starvation across channels",
+          "test": "packages/adapter-slack/test/redteam.test.ts:972",
+          "testSnapshot": "artifacts/slack-adapter-redteam.test.snapshot.txt:972",
+          "file": "packages/adapter-slack/test/redteam.test.ts",
+          "verdict": "failed",
+          "failure": "AssertionError: expect(received).toBe(expected)\n\nExpected: 0\nReceived: 100\n\n      at packages/adapter-slack/test/redteam.test.ts:1003:34\n"
+        }
+      ],
+      "artifactRefs": [
+        "artifacts/slack-adapter-redteam.junit.xml",
+        "artifacts/slack-adapter-redteam.test.snapshot.txt"
+      ]
+    },
+    {
+      "id": "RT-SLACK-49",
+      "sourceHash": "sha256:042d2126b51914390a20c478dc58e04175f03d7b1d8737b7581e1556af3572b7",
+      "scenario": "status coalesces thirty ticks and activity-only changes while clear bypasses window",
+      "expectedBehavior": "Thirty ticks over 20s cause at most two updates; activity-only changes wait for 15s edit window; clear deletes exactly once within window.",
+      "expected": "Thirty ticks over 20s cause at most two updates; activity-only changes wait for 15s edit window; clear deletes exactly once within window.",
+      "verdict": "passed",
+      "test": "packages/adapter-slack/test/redteam.test.ts:1006",
+      "testSnapshot": "artifacts/slack-adapter-redteam.test.snapshot.txt:1006",
+      "subcases": [
+        {
+          "name": "RT-SLACK-49 status coalesces thirty ticks and activity-only changes while clear bypasses window",
+          "test": "packages/adapter-slack/test/redteam.test.ts:1006",
+          "testSnapshot": "artifacts/slack-adapter-redteam.test.snapshot.txt:1006",
+          "file": "packages/adapter-slack/test/redteam.test.ts",
+          "verdict": "passed",
+          "failure": ""
+        }
+      ],
+      "artifactRefs": [
+        "artifacts/slack-adapter-redteam.junit.xml",
+        "artifacts/slack-adapter-redteam.test.snapshot.txt"
+      ]
+    },
+    {
+      "id": "RT-SLACK-50",
+      "sourceHash": "sha256:042d2126b51914390a20c478dc58e04175f03d7b1d8737b7581e1556af3572b7",
+      "scenario": "real socket activity bounds burst details thinking writing and exactly one final",
+      "expectedBehavior": "Real gateway tool activity has kind/label/detail; ten-start burst emits at most two announcements; hostile intent single-line <=120 chars; end thinking, assistant writing, final exactly once.",
+      "expected": "Real gateway tool activity has kind/label/detail; ten-start burst emits at most two announcements; hostile intent single-line <=120 chars; end thinking, assistant writing, final exactly once.",
+      "verdict": "passed",
+      "test": "packages/gateway/test/slack-adapter-redteam.e2e.test.ts:244",
+      "testSnapshot": "artifacts/slack-adapter-gateway-redteam.test.snapshot.txt:244",
+      "subcases": [
+        {
+          "name": "RT-SLACK-50 real socket activity bounds burst details thinking writing and exactly one final",
+          "test": "packages/gateway/test/slack-adapter-redteam.e2e.test.ts:244",
+          "testSnapshot": "artifacts/slack-adapter-gateway-redteam.test.snapshot.txt:244",
+          "file": "packages/gateway/test/slack-adapter-redteam.e2e.test.ts",
+          "verdict": "passed",
+          "failure": ""
+        }
+      ],
+      "artifactRefs": [
+        "artifacts/slack-adapter-redteam.junit.xml",
+        "artifacts/slack-adapter-gateway-redteam.test.snapshot.txt"
+      ]
+    },
+    {
+      "id": "RT-SLACK-51",
+      "sourceHash": "sha256:042d2126b51914390a20c478dc58e04175f03d7b1d8737b7581e1556af3572b7",
+      "scenario": "unengaged truncated reply walks persist and drain pending roots without aging participation",
+      "expectedBehavior": "Truncated unengaged reply walk durably records pending root, next pass drains and clears it; participation lastSeenAt never regresses.",
+      "expected": "Truncated unengaged reply walk durably records pending root, next pass drains and clears it; participation lastSeenAt never regresses.",
+      "verdict": "passed",
+      "test": "packages/adapter-slack/test/redteam.test.ts:1053",
+      "testSnapshot": "artifacts/slack-adapter-redteam.test.snapshot.txt:1053",
+      "subcases": [
+        {
+          "name": "RT-SLACK-51 unengaged truncated reply walks persist and drain pending roots without aging participation",
+          "test": "packages/adapter-slack/test/redteam.test.ts:1053",
+          "testSnapshot": "artifacts/slack-adapter-redteam.test.snapshot.txt:1053",
+          "file": "packages/adapter-slack/test/redteam.test.ts",
+          "verdict": "passed",
+          "failure": ""
+        }
+      ],
+      "artifactRefs": [
+        "artifacts/slack-adapter-redteam.junit.xml",
+        "artifacts/slack-adapter-redteam.test.snapshot.txt"
+      ]
+    },
+    {
+      "id": "RT-SLACK-52",
+      "sourceHash": "sha256:042d2126b51914390a20c478dc58e04175f03d7b1d8737b7581e1556af3572b7",
+      "scenario": "recent clean recovery gate outage 2000 quarantine false; recent clean recovery gate outage 6000 quarantine false; recent clean recovery gate outage 2000 quarantine true",
+      "expectedBehavior": "Recent clean recovery skips history after 2s outage, but runs for quarantine or 6s outage.",
+      "expected": "Recent clean recovery skips history after 2s outage, but runs for quarantine or 6s outage.",
+      "verdict": "passed",
+      "test": "packages/adapter-slack/test/redteam.test.ts:1093, packages/adapter-slack/test/redteam.test.ts:1093, packages/adapter-slack/test/redteam.test.ts:1093",
+      "testSnapshot": "artifacts/slack-adapter-redteam.test.snapshot.txt:1093, artifacts/slack-adapter-redteam.test.snapshot.txt:1093, artifacts/slack-adapter-redteam.test.snapshot.txt:1093",
+      "subcases": [
+        {
+          "name": "RT-SLACK-52 recent clean recovery gate outage 2000 quarantine false",
+          "test": "packages/adapter-slack/test/redteam.test.ts:1093",
+          "testSnapshot": "artifacts/slack-adapter-redteam.test.snapshot.txt:1093",
+          "file": "packages/adapter-slack/test/redteam.test.ts",
+          "verdict": "passed",
+          "failure": ""
+        },
+        {
+          "name": "RT-SLACK-52 recent clean recovery gate outage 6000 quarantine false",
+          "test": "packages/adapter-slack/test/redteam.test.ts:1093",
+          "testSnapshot": "artifacts/slack-adapter-redteam.test.snapshot.txt:1093",
+          "file": "packages/adapter-slack/test/redteam.test.ts",
+          "verdict": "passed",
+          "failure": ""
+        },
+        {
+          "name": "RT-SLACK-52 recent clean recovery gate outage 2000 quarantine true",
+          "test": "packages/adapter-slack/test/redteam.test.ts:1093",
+          "testSnapshot": "artifacts/slack-adapter-redteam.test.snapshot.txt:1093",
+          "file": "packages/adapter-slack/test/redteam.test.ts",
+          "verdict": "passed",
+          "failure": ""
+        }
+      ],
+      "artifactRefs": [
+        "artifacts/slack-adapter-redteam.junit.xml",
+        "artifacts/slack-adapter-redteam.test.snapshot.txt"
       ]
     }
   ],
@@ -1344,6 +1775,10 @@
     "artifacts/slack-adapter-redteam.junit.xml",
     "artifacts/slack-adapter-redteam-report.json",
     "artifacts/slack-adapter-supporting.junit.xml",
+    "artifacts/slack-adapter-frozen-verification.json",
+    "artifacts/slack-adapter-redteam.test.snapshot.txt",
+    "artifacts/slack-adapter-gateway-redteam.test.snapshot.txt",
+    "artifacts/slack-adapter-sdk-held-events.test.snapshot.txt",
     "artifacts/slack-adapter-lock-loop-1.junit.xml",
     "artifacts/slack-adapter-lock-loop-2.junit.xml",
     "artifacts/slack-adapter-lock-loop-3.junit.xml",
@@ -1355,29 +1790,53 @@
     "artifacts/slack-adapter-lock-loop-9.junit.xml",
     "artifacts/slack-adapter-lock-loop-10.junit.xml"
   ],
-  "blockers": [],
-  "latestRunCommit": "25beba333c9ba68d78642aa792d9314c593407ca",
+  "blockers": [
+    {
+      "caseId": "RT-SLACK-48",
+      "contractRef": "Generation 4 acceptance RT-SLACK-48",
+      "test": "packages/adapter-slack/test/redteam.test.ts:972",
+      "testSnapshot": "artifacts/slack-adapter-redteam.test.snapshot.txt:972",
+      "observed": "AssertionError: expect(received).toBe(expected)\n\nExpected: 0\nReceived: 100\n\n      at packages/adapter-slack/test/redteam.test.ts:1003:34\n",
+      "scenario": "RT-SLACK-48 concurrent delivery queue drains before cosmetic without starvation across channels",
+      "source": "packages/adapter-slack/src/api.ts:OutboundLimiter.pendingMs",
+      "explanation": "Observed assertion failure; source deliberately left unchanged.",
+      "artifactRefs": [
+        "artifacts/slack-adapter-redteam.junit.xml",
+        "artifacts/slack-adapter-redteam.test.snapshot.txt"
+      ]
+    }
+  ],
+  "latestRunCommit": "cbd4d1aaf2332f0021cbef5ce6e80a3edcf43144",
+  "executionCwd": "/private/tmp/g4-frozen",
+  "sourceSnapshots": {
+    "packages/adapter-slack/test/redteam.test.ts": "artifacts/slack-adapter-redteam.test.snapshot.txt",
+    "packages/gateway/test/slack-adapter-redteam.e2e.test.ts": "artifacts/slack-adapter-gateway-redteam.test.snapshot.txt",
+    "packages/sdk/test/client-held-events.test.ts": "artifacts/slack-adapter-sdk-held-events.test.snapshot.txt"
+  },
+  "frozenRange": "6b29f7e..cbd4d1a",
+  "isolation": "Final JUnit, supporting suites, lock repetitions and CLI build/probes ran in detached /tmp/g4-frozen at cbd4d1a. Leader G009 work later replaced shared test files; byte-identical frozen snapshots are authoritative for every reported test line. Restore each sourceSnapshots entry to its original key in a clean cbd4d1a worktree to replay; shared G009 source and tests are excluded.",
   "sourceHashMethod": "Parent-confirmed Ultragoal quality-gate source-hash (integration base, merge base, paths, captured diff and untracked digest), not sha256 of raw git diff.",
   "counts": {
-    "tests": 44,
-    "passed": 44,
-    "failed": 0,
+    "tests": 63,
+    "passed": 62,
+    "failed": 1,
     "cliProbes": 4,
     "cliPassed": 4,
-    "stableCaseIds": 44,
-    "supportingTests": 206,
-    "supportingPassed": 206,
+    "stableCaseIds": 52,
+    "supportingTests": 210,
+    "supportingPassed": 210,
     "lockLoopIterations": 10,
     "lockLoopPassed": 10
   },
   "limitations": [
     "No credentialed external Slack API calls; injected platform ports and real local gateway socket used as required.",
-    "No source files changed; RT-SLACK-42 through 44 exercise Slack directly, while RT-SLACK-33 exercises both adapters.",
+    "No product source changed in the frozen worktree; RT-SLACK-33 and 45 exercise both adapters.",
     "Gateway teardown still emits invalid socket write count: -32 warnings; not suppressed.",
-    "RT-SLACK-44 models a former lock handle losing ownership and reacquisition; a rejected acquire itself returns no handle."
+    "RT-SLACK-44 models a former lock handle losing ownership and reacquisition; a rejected acquire itself returns no handle.",
+    "RT-SLACK-48 retains the requested zero-after-settle assertion: pendingMs reports the next reserved pacing slot and returns 100ms at the final completion with minIntervalMs=100. This is a contract mismatch; the failure is not softened into a pass."
   ],
   "executorQa": {
-    "sourceHash": "sha256:a25e067e990803eb95171864c9574a6a48df0211eabba6852b4cecfd0c3c4582",
+    "sourceHash": "sha256:042d2126b51914390a20c478dc58e04175f03d7b1d8737b7581e1556af3572b7",
     "contractCoverage": [
       {
         "contractRef": "brief:5,20 Bun/TypeScript targeted tests and injected I/O",
@@ -1717,7 +2176,7 @@
           "RT-SLACK-29",
           "RT-SLACK-34"
         ],
-        "detail": "bun run build passed; service installation/boundary tests pass. Read-only doc audit found binary/config/scopes/events/commands/origins/recovery/no-voice in README.md:44-64, docs/deployment.md:76-104, docs/architecture.md:14-29, docs/runbooks/gajaeway-v1.md:79-90 and service-control.md:8.",
+        "detail": "Frozen worktree bun run build passed; service installation and SDK boundary supporting tests passed. Documentation is not re-audited by this execution lane.",
         "supportingEvidence": [
           "packages/cli/test/main.test.ts",
           "packages/conformance/test/sdk-boundary-dogfood.test.ts"
@@ -1732,24 +2191,45 @@
         "contractRef": "GUI/browser and live Slack workspace",
         "status": "not_applicable",
         "reason": "This assignment requires compiled CLI, package/API and local gateway surfaces with injected Slack transport; no GUI or credentialed external workspace is in scope."
+      },
+      {
+        "contractRef": "Generation 4 final boundary acceptance RT-SLACK-45 through 52",
+        "status": "blocked",
+        "caseIds": [
+          "RT-SLACK-45",
+          "RT-SLACK-46",
+          "RT-SLACK-47",
+          "RT-SLACK-48",
+          "RT-SLACK-49",
+          "RT-SLACK-50",
+          "RT-SLACK-51",
+          "RT-SLACK-52"
+        ],
+        "detail": "Frozen cbd4d1a exercised through real gateway sockets, adapter injected I/O, filesystem locks and compiled binary; failures retained as blockers.",
+        "supportingEvidence": [],
+        "artifactRefs": [
+          "artifacts/slack-adapter-redteam.junit.xml",
+          "artifacts/slack-adapter-cli-proof.json"
+        ]
       }
     ],
     "surfaceEvidence": [
       {
         "surface": "cli",
-        "invocation": "bun run build && bun artifacts/slack-adapter-cli-probes.ts",
+        "invocation": "bun artifacts/slack-adapter-frozen-verification.ts (runs bun run build, CLI probes and safe replay)",
         "verdict": "passed",
         "detail": "Fresh compiled Slack binary; four probes with real stdout/stderr/exit codes. Replay receipt checked via bun -e.",
         "artifactRefs": [
           "artifacts/slack-adapter-cli-proof.json",
-          "artifacts/slack-adapter-cli-replay.json"
+          "artifacts/slack-adapter-cli-replay.json",
+          "artifacts/slack-adapter-frozen-verification.json"
         ]
       },
       {
         "surface": "api",
         "invocation": "bun test packages/adapter-slack/test/redteam.test.ts packages/gateway/test/slack-adapter-redteam.e2e.test.ts packages/sdk/test/client-held-events.test.ts --reporter=junit --reporter-outfile=artifacts/slack-adapter-redteam.junit.xml",
         "verdict": "passed",
-        "detail": "All eight real gateway conversation tests pass, including three DM/channel routing cases; Discord lock package case is reported separately.",
+        "detail": "Real gateway channel/thread/DM routing, slash synthetic ids, platform isolation, redelivery, bounded activity and final event assertions.",
         "artifactRefs": [
           "artifacts/slack-adapter-redteam.junit.xml"
         ]
@@ -1757,8 +2237,8 @@
       {
         "surface": "package",
         "invocation": "bun test packages/adapter-slack/test/redteam.test.ts packages/gateway/test/slack-adapter-redteam.e2e.test.ts packages/sdk/test/client-held-events.test.ts --reporter=junit --reporter-outfile=artifacts/slack-adapter-redteam.junit.xml",
-        "verdict": "passed",
-        "detail": "44/44 tests pass, including both adapters' stale-lock elections and SDK same-chunk replay.",
+        "verdict": "failed",
+        "detail": "62/63 tests pass, including both adapters' stale-lock elections and SDK same-chunk replay.",
         "artifactRefs": [
           "artifacts/slack-adapter-redteam.junit.xml",
           "artifacts/slack-adapter-redteam-report.json"
@@ -1768,16 +2248,16 @@
         "surface": "package",
         "invocation": "bun test packages/adapter-slack/test/origin.test.ts packages/adapter-slack/test/text.test.ts packages/adapter-slack/test/mrkdwn.test.ts packages/adapter-slack/test/reactions.test.ts packages/adapter-slack/test/attachments.test.ts packages/adapter-slack/test/author.test.ts packages/adapter-slack/test/config.test.ts packages/adapter-slack/test/api.test.ts packages/adapter-slack/test/socket.test.ts packages/adapter-slack/test/status.test.ts packages/adapter-slack/test/recovery.test.ts packages/protocol/test/protocol.test.ts packages/protocol/test/reactions.test.ts packages/cli/test/main.test.ts packages/conformance/test/sdk-boundary-dogfood.test.ts --reporter=junit --reporter-outfile=artifacts/slack-adapter-supporting.junit.xml",
         "verdict": "passed",
-        "detail": "206 supporting tests across adapter, protocol, service installation and SDK boundary.",
+        "detail": "210 supporting tests across adapter, protocol, service installation and SDK boundary.",
         "artifactRefs": [
           "artifacts/slack-adapter-supporting.junit.xml"
         ]
       },
       {
         "surface": "package",
-        "invocation": "for i in {1..10}; do bun test packages/adapter-slack/test/redteam.test.ts packages/gateway/test/slack-adapter-redteam.e2e.test.ts -t RT-SLACK-33 --reporter=junit --reporter-outfile=artifacts/slack-adapter-lock-loop-${i}.junit.xml; done",
+        "invocation": "for i in {1..10}; do bun test packages/adapter-slack/test/redteam.test.ts packages/gateway/test/slack-adapter-redteam.e2e.test.ts -t 'RT-SLACK-(33|45)' --reporter=junit --reporter-outfile=artifacts/slack-adapter-lock-loop-${i}.junit.xml || exit 1; done",
         "verdict": "passed",
-        "detail": "10/10 iterations passed; Slack 10/10 and Discord 10/10, each with 20 simultaneous contenders.",
+        "detail": "10/10 iterations passed; six cases per iteration: 20-contender stale elections plus live/dead linked marker cases for Slack and Discord.",
         "artifactRefs": [
           "artifacts/slack-adapter-lock-loop-1.junit.xml",
           "artifacts/slack-adapter-lock-loop-2.junit.xml",
@@ -1795,537 +2275,613 @@
     "adversarialCases": [
       {
         "id": "RT-SLACK-01",
-        "sourceHash": "sha256:a25e067e990803eb95171864c9574a6a48df0211eabba6852b4cecfd0c3c4582",
+        "sourceHash": "sha256:042d2126b51914390a20c478dc58e04175f03d7b1d8737b7581e1556af3572b7",
         "scenario": "throwing handlers ack first, retries dedupe, malformed frames survive and disconnect reconnects",
         "expectedBehavior": "Ack before handlers; retry dedupe; malformed frames survive; disconnect reconnects.",
         "expected": "Ack before handlers; retry dedupe; malformed frames survive; disconnect reconnects.",
         "verdict": "passed",
-        "test": "packages/adapter-slack/test/redteam.test.ts:181",
+        "test": "packages/adapter-slack/test/redteam.test.ts:189",
+        "testSnapshot": "artifacts/slack-adapter-redteam.test.snapshot.txt:189",
         "subcases": [
           {
             "name": "RT-SLACK-01 throwing handlers ack first, retries dedupe, malformed frames survive and disconnect reconnects",
-            "test": "packages/adapter-slack/test/redteam.test.ts:181",
+            "test": "packages/adapter-slack/test/redteam.test.ts:189",
+            "testSnapshot": "artifacts/slack-adapter-redteam.test.snapshot.txt:189",
             "file": "packages/adapter-slack/test/redteam.test.ts",
             "verdict": "passed",
             "failure": ""
           }
         ],
         "artifactRefs": [
-          "artifacts/slack-adapter-redteam.junit.xml"
+          "artifacts/slack-adapter-redteam.junit.xml",
+          "artifacts/slack-adapter-redteam.test.snapshot.txt"
         ]
       },
       {
         "id": "RT-SLACK-02",
-        "sourceHash": "sha256:a25e067e990803eb95171864c9574a6a48df0211eabba6852b4cecfd0c3c4582",
+        "sourceHash": "sha256:042d2126b51914390a20c478dc58e04175f03d7b1d8737b7581e1556af3572b7",
         "scenario": "hostile timestamps never emit non-platform message ids",
         "expectedBehavior": "Reject hostile timestamps before chat.send and preserve channel-qualified valid ids.",
         "expected": "Reject hostile timestamps before chat.send and preserve channel-qualified valid ids.",
         "verdict": "passed",
-        "test": "packages/adapter-slack/test/redteam.test.ts:221",
+        "test": "packages/adapter-slack/test/redteam.test.ts:229",
+        "testSnapshot": "artifacts/slack-adapter-redteam.test.snapshot.txt:229",
         "subcases": [
           {
             "name": "RT-SLACK-02 hostile timestamps never emit non-platform message ids",
-            "test": "packages/adapter-slack/test/redteam.test.ts:221",
+            "test": "packages/adapter-slack/test/redteam.test.ts:229",
+            "testSnapshot": "artifacts/slack-adapter-redteam.test.snapshot.txt:229",
             "file": "packages/adapter-slack/test/redteam.test.ts",
             "verdict": "passed",
             "failure": ""
           }
         ],
         "artifactRefs": [
-          "artifacts/slack-adapter-redteam.junit.xml"
+          "artifacts/slack-adapter-redteam.junit.xml",
+          "artifacts/slack-adapter-redteam.test.snapshot.txt"
         ]
       },
       {
         "id": "RT-SLACK-03",
-        "sourceHash": "sha256:a25e067e990803eb95171864c9574a6a48df0211eabba6852b4cecfd0c3c4582",
+        "sourceHash": "sha256:042d2126b51914390a20c478dc58e04175f03d7b1d8737b7581e1556af3572b7",
         "scenario": "foreign reply target is a definitive delivery failure, never thread_ts",
         "expectedBehavior": "Foreign reply targets fail definitively before any Slack post.",
         "expected": "Foreign reply targets fail definitively before any Slack post.",
         "verdict": "passed",
-        "test": "packages/adapter-slack/test/redteam.test.ts:230",
+        "test": "packages/adapter-slack/test/redteam.test.ts:238",
+        "testSnapshot": "artifacts/slack-adapter-redteam.test.snapshot.txt:238",
         "subcases": [
           {
             "name": "RT-SLACK-03 foreign reply target is a definitive delivery failure, never thread_ts",
-            "test": "packages/adapter-slack/test/redteam.test.ts:230",
+            "test": "packages/adapter-slack/test/redteam.test.ts:238",
+            "testSnapshot": "artifacts/slack-adapter-redteam.test.snapshot.txt:238",
             "file": "packages/adapter-slack/test/redteam.test.ts",
             "verdict": "passed",
             "failure": ""
           }
         ],
         "artifactRefs": [
-          "artifacts/slack-adapter-redteam.junit.xml"
+          "artifacts/slack-adapter-redteam.junit.xml",
+          "artifacts/slack-adapter-redteam.test.snapshot.txt"
         ]
       },
       {
         "id": "RT-SLACK-04",
-        "sourceHash": "sha256:a25e067e990803eb95171864c9574a6a48df0211eabba6852b4cecfd0c3c4582",
+        "sourceHash": "sha256:042d2126b51914390a20c478dc58e04175f03d7b1d8737b7581e1556af3572b7",
         "scenario": "literal mentions in code count; entities decode once and broadcasts normalize",
         "expectedBehavior": "Literal mentions including code count; decode entities once and normalize broadcasts.",
         "expected": "Literal mentions including code count; decode entities once and normalize broadcasts.",
         "verdict": "passed",
-        "test": "packages/adapter-slack/test/redteam.test.ts:242",
+        "test": "packages/adapter-slack/test/redteam.test.ts:250",
+        "testSnapshot": "artifacts/slack-adapter-redteam.test.snapshot.txt:250",
         "subcases": [
           {
             "name": "RT-SLACK-04 literal mentions in code count; entities decode once and broadcasts normalize",
-            "test": "packages/adapter-slack/test/redteam.test.ts:242",
+            "test": "packages/adapter-slack/test/redteam.test.ts:250",
+            "testSnapshot": "artifacts/slack-adapter-redteam.test.snapshot.txt:250",
             "file": "packages/adapter-slack/test/redteam.test.ts",
             "verdict": "passed",
             "failure": ""
           }
         ],
         "artifactRefs": [
-          "artifacts/slack-adapter-redteam.junit.xml"
+          "artifacts/slack-adapter-redteam.junit.xml",
+          "artifacts/slack-adapter-redteam.test.snapshot.txt"
         ]
       },
       {
         "id": "RT-SLACK-05",
-        "sourceHash": "sha256:a25e067e990803eb95171864c9574a6a48df0211eabba6852b4cecfd0c3c4582",
+        "sourceHash": "sha256:042d2126b51914390a20c478dc58e04175f03d7b1d8737b7581e1556af3572b7",
         "scenario": "fifty-thousand-character fenced text has bounded balanced chunks",
         "expectedBehavior": "50k fenced text produces bounded, balanced chunks of at most 4000 characters.",
         "expected": "50k fenced text produces bounded, balanced chunks of at most 4000 characters.",
         "verdict": "passed",
-        "test": "packages/adapter-slack/test/redteam.test.ts:257",
+        "test": "packages/adapter-slack/test/redteam.test.ts:265",
+        "testSnapshot": "artifacts/slack-adapter-redteam.test.snapshot.txt:265",
         "subcases": [
           {
             "name": "RT-SLACK-05 fifty-thousand-character fenced text has bounded balanced chunks",
-            "test": "packages/adapter-slack/test/redteam.test.ts:257",
+            "test": "packages/adapter-slack/test/redteam.test.ts:265",
+            "testSnapshot": "artifacts/slack-adapter-redteam.test.snapshot.txt:265",
             "file": "packages/adapter-slack/test/redteam.test.ts",
             "verdict": "passed",
             "failure": ""
           }
         ],
         "artifactRefs": [
-          "artifacts/slack-adapter-redteam.junit.xml"
+          "artifacts/slack-adapter-redteam.junit.xml",
+          "artifacts/slack-adapter-redteam.test.snapshot.txt"
         ]
       },
       {
         "id": "RT-SLACK-06",
-        "sourceHash": "sha256:a25e067e990803eb95171864c9574a6a48df0211eabba6852b4cecfd0c3c4582",
+        "sourceHash": "sha256:042d2126b51914390a20c478dc58e04175f03d7b1d8737b7581e1556af3572b7",
         "scenario": "file-only body survives and empty body drops",
         "expectedBehavior": "File-only messages render attachments; empty bodies drop.",
         "expected": "File-only messages render attachments; empty bodies drop.",
         "verdict": "passed",
-        "test": "packages/adapter-slack/test/redteam.test.ts:266",
+        "test": "packages/adapter-slack/test/redteam.test.ts:274",
+        "testSnapshot": "artifacts/slack-adapter-redteam.test.snapshot.txt:274",
         "subcases": [
           {
             "name": "RT-SLACK-06 file-only body survives and empty body drops",
-            "test": "packages/adapter-slack/test/redteam.test.ts:266",
+            "test": "packages/adapter-slack/test/redteam.test.ts:274",
+            "testSnapshot": "artifacts/slack-adapter-redteam.test.snapshot.txt:274",
             "file": "packages/adapter-slack/test/redteam.test.ts",
             "verdict": "passed",
             "failure": ""
           }
         ],
         "artifactRefs": [
-          "artifacts/slack-adapter-redteam.junit.xml"
+          "artifacts/slack-adapter-redteam.junit.xml",
+          "artifacts/slack-adapter-redteam.test.snapshot.txt"
         ]
       },
       {
         "id": "RT-SLACK-07",
-        "sourceHash": "sha256:a25e067e990803eb95171864c9574a6a48df0211eabba6852b4cecfd0c3c4582",
+        "sourceHash": "sha256:042d2126b51914390a20c478dc58e04175f03d7b1d8737b7581e1556af3572b7",
         "scenario": "own, hidden, every skipped subtype, unchanged/empty edits and app_mention never send",
         "expectedBehavior": "Own, hidden, skipped subtype, unchanged/empty edit and duplicate app_mention events never send.",
         "expected": "Own, hidden, skipped subtype, unchanged/empty edit and duplicate app_mention events never send.",
         "verdict": "passed",
-        "test": "packages/adapter-slack/test/redteam.test.ts:278",
+        "test": "packages/adapter-slack/test/redteam.test.ts:286",
+        "testSnapshot": "artifacts/slack-adapter-redteam.test.snapshot.txt:286",
         "subcases": [
           {
             "name": "RT-SLACK-07 own, hidden, every skipped subtype, unchanged/empty edits and app_mention never send",
-            "test": "packages/adapter-slack/test/redteam.test.ts:278",
+            "test": "packages/adapter-slack/test/redteam.test.ts:286",
+            "testSnapshot": "artifacts/slack-adapter-redteam.test.snapshot.txt:286",
             "file": "packages/adapter-slack/test/redteam.test.ts",
             "verdict": "passed",
             "failure": ""
           }
         ],
         "artifactRefs": [
-          "artifacts/slack-adapter-redteam.junit.xml"
+          "artifacts/slack-adapter-redteam.junit.xml",
+          "artifacts/slack-adapter-redteam.test.snapshot.txt"
         ]
       },
       {
         "id": "RT-SLACK-08",
-        "sourceHash": "sha256:a25e067e990803eb95171864c9574a6a48df0211eabba6852b4cecfd0c3c4582",
+        "sourceHash": "sha256:042d2126b51914390a20c478dc58e04175f03d7b1d8737b7581e1556af3572b7",
         "scenario": "bot parent mentions; unknown parent omits fromSelf",
         "expectedBehavior": "Bot parent implies mention; absent parent metadata omits fromSelf.",
         "expected": "Bot parent implies mention; absent parent metadata omits fromSelf.",
         "verdict": "passed",
-        "test": "packages/adapter-slack/test/redteam.test.ts:296",
+        "test": "packages/adapter-slack/test/redteam.test.ts:304",
+        "testSnapshot": "artifacts/slack-adapter-redteam.test.snapshot.txt:304",
         "subcases": [
           {
             "name": "RT-SLACK-08 bot parent mentions; unknown parent omits fromSelf",
-            "test": "packages/adapter-slack/test/redteam.test.ts:296",
+            "test": "packages/adapter-slack/test/redteam.test.ts:304",
+            "testSnapshot": "artifacts/slack-adapter-redteam.test.snapshot.txt:304",
             "file": "packages/adapter-slack/test/redteam.test.ts",
             "verdict": "passed",
             "failure": ""
           }
         ],
         "artifactRefs": [
-          "artifacts/slack-adapter-redteam.junit.xml"
+          "artifacts/slack-adapter-redteam.junit.xml",
+          "artifacts/slack-adapter-redteam.test.snapshot.txt"
         ]
       },
       {
         "id": "RT-SLACK-09",
-        "sourceHash": "sha256:a25e067e990803eb95171864c9574a6a48df0211eabba6852b4cecfd0c3c4582",
+        "sourceHash": "sha256:042d2126b51914390a20c478dc58e04175f03d7b1d8737b7581e1556af3572b7",
         "scenario": "transport failure ambiguous, Slack API failure definitive",
         "expectedBehavior": "Transport failure is ambiguous; SlackApiError is definitive.",
         "expected": "Transport failure is ambiguous; SlackApiError is definitive.",
         "verdict": "passed",
-        "test": "packages/adapter-slack/test/redteam.test.ts:305",
+        "test": "packages/adapter-slack/test/redteam.test.ts:313",
+        "testSnapshot": "artifacts/slack-adapter-redteam.test.snapshot.txt:313",
         "subcases": [
           {
             "name": "RT-SLACK-09 transport failure ambiguous, Slack API failure definitive",
-            "test": "packages/adapter-slack/test/redteam.test.ts:305",
+            "test": "packages/adapter-slack/test/redteam.test.ts:313",
+            "testSnapshot": "artifacts/slack-adapter-redteam.test.snapshot.txt:313",
             "file": "packages/adapter-slack/test/redteam.test.ts",
             "verdict": "passed",
             "failure": ""
           }
         ],
         "artifactRefs": [
-          "artifacts/slack-adapter-redteam.junit.xml"
+          "artifacts/slack-adapter-redteam.junit.xml",
+          "artifacts/slack-adapter-redteam.test.snapshot.txt"
         ]
       },
       {
         "id": "RT-SLACK-10",
-        "sourceHash": "sha256:a25e067e990803eb95171864c9574a6a48df0211eabba6852b4cecfd0c3c4582",
+        "sourceHash": "sha256:042d2126b51914390a20c478dc58e04175f03d7b1d8737b7581e1556af3572b7",
         "scenario": "all three chunks keep thread and duplicate warning",
         "expectedBehavior": "All reply chunks retain thread routing and duplicate warning; delivery confirms once.",
         "expected": "All reply chunks retain thread routing and duplicate warning; delivery confirms once.",
         "verdict": "passed",
-        "test": "packages/adapter-slack/test/redteam.test.ts:325",
+        "test": "packages/adapter-slack/test/redteam.test.ts:333",
+        "testSnapshot": "artifacts/slack-adapter-redteam.test.snapshot.txt:333",
         "subcases": [
           {
             "name": "RT-SLACK-10 all three chunks keep thread and duplicate warning",
-            "test": "packages/adapter-slack/test/redteam.test.ts:325",
+            "test": "packages/adapter-slack/test/redteam.test.ts:333",
+            "testSnapshot": "artifacts/slack-adapter-redteam.test.snapshot.txt:333",
             "file": "packages/adapter-slack/test/redteam.test.ts",
             "verdict": "passed",
             "failure": ""
           }
         ],
         "artifactRefs": [
-          "artifacts/slack-adapter-redteam.junit.xml"
+          "artifacts/slack-adapter-redteam.junit.xml",
+          "artifacts/slack-adapter-redteam.test.snapshot.txt"
         ]
       },
       {
         "id": "RT-SLACK-11",
-        "sourceHash": "sha256:a25e067e990803eb95171864c9574a6a48df0211eabba6852b4cecfd0c3c4582",
+        "sourceHash": "sha256:042d2126b51914390a20c478dc58e04175f03d7b1d8737b7581e1556af3572b7",
         "scenario": "malformed and unknown reactions fail without API; already_reacted confirms",
         "expectedBehavior": "Malformed/unknown reactions fail definitively without API; already_reacted confirms.",
         "expected": "Malformed/unknown reactions fail definitively without API; already_reacted confirms.",
         "verdict": "passed",
-        "test": "packages/adapter-slack/test/redteam.test.ts:343",
+        "test": "packages/adapter-slack/test/redteam.test.ts:351",
+        "testSnapshot": "artifacts/slack-adapter-redteam.test.snapshot.txt:351",
         "subcases": [
           {
             "name": "RT-SLACK-11 malformed and unknown reactions fail without API; already_reacted confirms",
-            "test": "packages/adapter-slack/test/redteam.test.ts:343",
+            "test": "packages/adapter-slack/test/redteam.test.ts:351",
+            "testSnapshot": "artifacts/slack-adapter-redteam.test.snapshot.txt:351",
             "file": "packages/adapter-slack/test/redteam.test.ts",
             "verdict": "passed",
             "failure": ""
           }
         ],
         "artifactRefs": [
-          "artifacts/slack-adapter-redteam.junit.xml"
+          "artifacts/slack-adapter-redteam.junit.xml",
+          "artifacts/slack-adapter-redteam.test.snapshot.txt"
         ]
       },
       {
         "id": "RT-SLACK-12",
-        "sourceHash": "sha256:a25e067e990803eb95171864c9574a6a48df0211eabba6852b4cecfd0c3c4582",
+        "sourceHash": "sha256:042d2126b51914390a20c478dc58e04175f03d7b1d8737b7581e1556af3572b7",
         "scenario": "disconnected edit overflow retains newest 256 and replays ordered",
         "expectedBehavior": "Edit outbox keeps newest 256 of 300, records 44 evictions and replays in order.",
         "expected": "Edit outbox keeps newest 256 of 300, records 44 evictions and replays in order.",
         "verdict": "passed",
-        "test": "packages/adapter-slack/test/redteam.test.ts:367",
+        "test": "packages/adapter-slack/test/redteam.test.ts:375",
+        "testSnapshot": "artifacts/slack-adapter-redteam.test.snapshot.txt:375",
         "subcases": [
           {
             "name": "RT-SLACK-12 disconnected edit overflow retains newest 256 and replays ordered",
-            "test": "packages/adapter-slack/test/redteam.test.ts:367",
+            "test": "packages/adapter-slack/test/redteam.test.ts:375",
+            "testSnapshot": "artifacts/slack-adapter-redteam.test.snapshot.txt:375",
             "file": "packages/adapter-slack/test/redteam.test.ts",
             "verdict": "passed",
             "failure": ""
           }
         ],
         "artifactRefs": [
-          "artifacts/slack-adapter-redteam.junit.xml"
+          "artifacts/slack-adapter-redteam.junit.xml",
+          "artifacts/slack-adapter-redteam.test.snapshot.txt"
         ]
       },
       {
         "id": "RT-SLACK-13",
-        "sourceHash": "sha256:a25e067e990803eb95171864c9574a6a48df0211eabba6852b4cecfd0c3c4582",
+        "sourceHash": "sha256:042d2126b51914390a20c478dc58e04175f03d7b1d8737b7581e1556af3572b7",
         "scenario": "failed edit remains queued and reconnects for replay",
         "expectedBehavior": "Failed edit remains queued and replays on client adoption.",
         "expected": "Failed edit remains queued and replays on client adoption.",
         "verdict": "passed",
-        "test": "packages/adapter-slack/test/redteam.test.ts:385",
+        "test": "packages/adapter-slack/test/redteam.test.ts:393",
+        "testSnapshot": "artifacts/slack-adapter-redteam.test.snapshot.txt:393",
         "subcases": [
           {
             "name": "RT-SLACK-13 failed edit remains queued and reconnects for replay",
-            "test": "packages/adapter-slack/test/redteam.test.ts:385",
+            "test": "packages/adapter-slack/test/redteam.test.ts:393",
+            "testSnapshot": "artifacts/slack-adapter-redteam.test.snapshot.txt:393",
             "file": "packages/adapter-slack/test/redteam.test.ts",
             "verdict": "passed",
             "failure": ""
           }
         ],
         "artifactRefs": [
-          "artifacts/slack-adapter-redteam.junit.xml"
+          "artifacts/slack-adapter-redteam.junit.xml",
+          "artifacts/slack-adapter-redteam.test.snapshot.txt"
         ]
       },
       {
         "id": "RT-SLACK-14",
-        "sourceHash": "sha256:a25e067e990803eb95171864c9574a6a48df0211eabba6852b4cecfd0c3c4582",
+        "sourceHash": "sha256:042d2126b51914390a20c478dc58e04175f03d7b1d8737b7581e1556af3572b7",
         "scenario": "duplicate inbound dedupes but unavailable is forgotten",
         "expectedBehavior": "Acknowledged ids dedupe; unavailable ids remain retryable.",
         "expected": "Acknowledged ids dedupe; unavailable ids remain retryable.",
         "verdict": "passed",
-        "test": "packages/adapter-slack/test/redteam.test.ts:400",
+        "test": "packages/adapter-slack/test/redteam.test.ts:408",
+        "testSnapshot": "artifacts/slack-adapter-redteam.test.snapshot.txt:408",
         "subcases": [
           {
             "name": "RT-SLACK-14 duplicate inbound dedupes but unavailable is forgotten",
-            "test": "packages/adapter-slack/test/redteam.test.ts:400",
+            "test": "packages/adapter-slack/test/redteam.test.ts:408",
+            "testSnapshot": "artifacts/slack-adapter-redteam.test.snapshot.txt:408",
             "file": "packages/adapter-slack/test/redteam.test.ts",
             "verdict": "passed",
             "failure": ""
           }
         ],
         "artifactRefs": [
-          "artifacts/slack-adapter-redteam.junit.xml"
+          "artifacts/slack-adapter-redteam.junit.xml",
+          "artifacts/slack-adapter-redteam.test.snapshot.txt"
         ]
       },
       {
         "id": "RT-SLACK-15",
-        "sourceHash": "sha256:a25e067e990803eb95171864c9574a6a48df0211eabba6852b4cecfd0c3c4582",
+        "sourceHash": "sha256:042d2126b51914390a20c478dc58e04175f03d7b1d8737b7581e1556af3572b7",
         "scenario": "newest-first recovery delivers ascending and cannot cross unavailable",
         "expectedBehavior": "Newest-first recovery delivers ascending and cannot advance across unavailable sends.",
         "expected": "Newest-first recovery delivers ascending and cannot advance across unavailable sends.",
         "verdict": "passed",
-        "test": "packages/adapter-slack/test/redteam.test.ts:414",
+        "test": "packages/adapter-slack/test/redteam.test.ts:422",
+        "testSnapshot": "artifacts/slack-adapter-redteam.test.snapshot.txt:422",
         "subcases": [
           {
             "name": "RT-SLACK-15 newest-first recovery delivers ascending and cannot cross unavailable",
-            "test": "packages/adapter-slack/test/redteam.test.ts:414",
+            "test": "packages/adapter-slack/test/redteam.test.ts:422",
+            "testSnapshot": "artifacts/slack-adapter-redteam.test.snapshot.txt:422",
             "file": "packages/adapter-slack/test/redteam.test.ts",
             "verdict": "passed",
             "failure": ""
           }
         ],
         "artifactRefs": [
-          "artifacts/slack-adapter-redteam.junit.xml"
+          "artifacts/slack-adapter-redteam.junit.xml",
+          "artifacts/slack-adapter-redteam.test.snapshot.txt"
         ]
       },
       {
         "id": "RT-SLACK-16",
-        "sourceHash": "sha256:a25e067e990803eb95171864c9574a6a48df0211eabba6852b4cecfd0c3c4582",
+        "sourceHash": "sha256:042d2126b51914390a20c478dc58e04175f03d7b1d8737b7581e1556af3572b7",
         "scenario": "recovered replies retain thread origin",
         "expectedBehavior": "Recovered thread replies retain thread origin and parent channel.",
         "expected": "Recovered thread replies retain thread origin and parent channel.",
         "verdict": "passed",
-        "test": "packages/adapter-slack/test/redteam.test.ts:450",
+        "test": "packages/adapter-slack/test/redteam.test.ts:458",
+        "testSnapshot": "artifacts/slack-adapter-redteam.test.snapshot.txt:458",
         "subcases": [
           {
             "name": "RT-SLACK-16 recovered replies retain thread origin",
-            "test": "packages/adapter-slack/test/redteam.test.ts:450",
+            "test": "packages/adapter-slack/test/redteam.test.ts:458",
+            "testSnapshot": "artifacts/slack-adapter-redteam.test.snapshot.txt:458",
             "file": "packages/adapter-slack/test/redteam.test.ts",
             "verdict": "passed",
             "failure": ""
           }
         ],
         "artifactRefs": [
-          "artifacts/slack-adapter-redteam.junit.xml"
+          "artifacts/slack-adapter-redteam.junit.xml",
+          "artifacts/slack-adapter-redteam.test.snapshot.txt"
         ]
       },
       {
         "id": "RT-SLACK-17",
-        "sourceHash": "sha256:a25e067e990803eb95171864c9574a6a48df0211eabba6852b4cecfd0c3c4582",
+        "sourceHash": "sha256:042d2126b51914390a20c478dc58e04175f03d7b1d8737b7581e1556af3572b7",
         "scenario": "three-strike quarantine is re-probed after gateway reconnect",
         "expectedBehavior": "Three permanent failures quarantine; actual onConnected scheduler re-probes and clears quarantine.",
         "expected": "Three permanent failures quarantine; actual onConnected scheduler re-probes and clears quarantine.",
         "verdict": "passed",
-        "test": "packages/adapter-slack/test/redteam.test.ts:475",
+        "test": "packages/adapter-slack/test/redteam.test.ts:483",
+        "testSnapshot": "artifacts/slack-adapter-redteam.test.snapshot.txt:483",
         "subcases": [
           {
             "name": "RT-SLACK-17 three-strike quarantine is re-probed after gateway reconnect",
-            "test": "packages/adapter-slack/test/redteam.test.ts:475",
+            "test": "packages/adapter-slack/test/redteam.test.ts:483",
+            "testSnapshot": "artifacts/slack-adapter-redteam.test.snapshot.txt:483",
             "file": "packages/adapter-slack/test/redteam.test.ts",
             "verdict": "passed",
             "failure": ""
           }
         ],
         "artifactRefs": [
-          "artifacts/slack-adapter-redteam.junit.xml"
+          "artifacts/slack-adapter-redteam.junit.xml",
+          "artifacts/slack-adapter-redteam.test.snapshot.txt"
         ]
       },
       {
         "id": "RT-SLACK-18",
-        "sourceHash": "sha256:a25e067e990803eb95171864c9574a6a48df0211eabba6852b4cecfd0c3c4582",
+        "sourceHash": "sha256:042d2126b51914390a20c478dc58e04175f03d7b1d8737b7581e1556af3572b7",
         "scenario": "twenty recovery triggers remain single flight",
         "expectedBehavior": "Twenty recovery triggers coalesce without parallel passes.",
         "expected": "Twenty recovery triggers coalesce without parallel passes.",
         "verdict": "passed",
-        "test": "packages/adapter-slack/test/redteam.test.ts:489",
+        "test": "packages/adapter-slack/test/redteam.test.ts:497",
+        "testSnapshot": "artifacts/slack-adapter-redteam.test.snapshot.txt:497",
         "subcases": [
           {
             "name": "RT-SLACK-18 twenty recovery triggers remain single flight",
-            "test": "packages/adapter-slack/test/redteam.test.ts:489",
+            "test": "packages/adapter-slack/test/redteam.test.ts:497",
+            "testSnapshot": "artifacts/slack-adapter-redteam.test.snapshot.txt:497",
             "file": "packages/adapter-slack/test/redteam.test.ts",
             "verdict": "passed",
             "failure": ""
           }
         ],
         "artifactRefs": [
-          "artifacts/slack-adapter-redteam.junit.xml"
+          "artifacts/slack-adapter-redteam.junit.xml",
+          "artifacts/slack-adapter-redteam.test.snapshot.txt"
         ]
       },
       {
         "id": "RT-SLACK-19",
-        "sourceHash": "sha256:a25e067e990803eb95171864c9574a6a48df0211eabba6852b4cecfd0c3c4582",
+        "sourceHash": "sha256:042d2126b51914390a20c478dc58e04175f03d7b1d8737b7581e1556af3572b7",
         "scenario": "credential prefixes fail without secrets, relative files resolve and unknown channel keys reject",
         "expectedBehavior": "Credential prefixes reject without exposing secrets; relative paths resolve and policy keys validate.",
         "expected": "Credential prefixes reject without exposing secrets; relative paths resolve and policy keys validate.",
         "verdict": "passed",
-        "test": "packages/adapter-slack/test/redteam.test.ts:514",
+        "test": "packages/adapter-slack/test/redteam.test.ts:522",
+        "testSnapshot": "artifacts/slack-adapter-redteam.test.snapshot.txt:522",
         "subcases": [
           {
             "name": "RT-SLACK-19 credential prefixes fail without secrets, relative files resolve and unknown channel keys reject",
-            "test": "packages/adapter-slack/test/redteam.test.ts:514",
+            "test": "packages/adapter-slack/test/redteam.test.ts:522",
+            "testSnapshot": "artifacts/slack-adapter-redteam.test.snapshot.txt:522",
             "file": "packages/adapter-slack/test/redteam.test.ts",
             "verdict": "passed",
             "failure": ""
           }
         ],
         "artifactRefs": [
-          "artifacts/slack-adapter-redteam.junit.xml"
+          "artifacts/slack-adapter-redteam.junit.xml",
+          "artifacts/slack-adapter-redteam.test.snapshot.txt"
         ]
       },
       {
         "id": "RT-SLACK-20",
-        "sourceHash": "sha256:a25e067e990803eb95171864c9574a6a48df0211eabba6852b4cecfd0c3c4582",
+        "sourceHash": "sha256:042d2126b51914390a20c478dc58e04175f03d7b1d8737b7581e1556af3572b7",
         "scenario": "unconfigured unmentioned Slack channel is context only",
         "expectedBehavior": "Unconfigured unmentioned channel is context-only with no turn/delivery.",
         "expected": "Unconfigured unmentioned channel is context-only with no turn/delivery.",
         "verdict": "passed",
-        "test": "packages/gateway/test/slack-adapter-redteam.e2e.test.ts:71",
+        "test": "packages/gateway/test/slack-adapter-redteam.e2e.test.ts:73",
+        "testSnapshot": "artifacts/slack-adapter-gateway-redteam.test.snapshot.txt:73",
         "subcases": [
           {
             "name": "RT-SLACK-20 unconfigured unmentioned Slack channel is context only",
-            "test": "packages/gateway/test/slack-adapter-redteam.e2e.test.ts:71",
+            "test": "packages/gateway/test/slack-adapter-redteam.e2e.test.ts:73",
+            "testSnapshot": "artifacts/slack-adapter-gateway-redteam.test.snapshot.txt:73",
             "file": "packages/gateway/test/slack-adapter-redteam.e2e.test.ts",
             "verdict": "passed",
             "failure": ""
           }
         ],
         "artifactRefs": [
-          "artifacts/slack-adapter-redteam.junit.xml"
+          "artifacts/slack-adapter-redteam.junit.xml",
+          "artifacts/slack-adapter-gateway-redteam.test.snapshot.txt"
         ]
       },
       {
         "id": "RT-SLACK-21",
-        "sourceHash": "sha256:a25e067e990803eb95171864c9574a6a48df0211eabba6852b4cecfd0c3c4582",
+        "sourceHash": "sha256:042d2126b51914390a20c478dc58e04175f03d7b1d8737b7581e1556af3572b7",
         "scenario": "mention-open engages and persona markup is escaped at Slack boundary",
         "expectedBehavior": "Mention-open policy engages and persona markup is escaped at Slack boundary.",
         "expected": "Mention-open policy engages and persona markup is escaped at Slack boundary.",
         "verdict": "passed",
-        "test": "packages/gateway/test/slack-adapter-redteam.e2e.test.ts:81",
+        "test": "packages/gateway/test/slack-adapter-redteam.e2e.test.ts:83",
+        "testSnapshot": "artifacts/slack-adapter-gateway-redteam.test.snapshot.txt:83",
         "subcases": [
           {
             "name": "RT-SLACK-21 mention-open engages and persona markup is escaped at Slack boundary",
-            "test": "packages/gateway/test/slack-adapter-redteam.e2e.test.ts:81",
+            "test": "packages/gateway/test/slack-adapter-redteam.e2e.test.ts:83",
+            "testSnapshot": "artifacts/slack-adapter-gateway-redteam.test.snapshot.txt:83",
             "file": "packages/gateway/test/slack-adapter-redteam.e2e.test.ts",
             "verdict": "passed",
             "failure": ""
           }
         ],
         "artifactRefs": [
-          "artifacts/slack-adapter-redteam.junit.xml"
+          "artifacts/slack-adapter-redteam.junit.xml",
+          "artifacts/slack-adapter-gateway-redteam.test.snapshot.txt"
         ]
       },
       {
         "id": "RT-SLACK-22",
-        "sourceHash": "sha256:a25e067e990803eb95171864c9574a6a48df0211eabba6852b4cecfd0c3c4582",
+        "sourceHash": "sha256:042d2126b51914390a20c478dc58e04175f03d7b1d8737b7581e1556af3572b7",
         "scenario": "check reaction token delivers on Slack and is refused on Telegram",
         "expectedBehavior": "Check token maps to white_check_mark on Slack and is refused on Telegram.",
         "expected": "Check token maps to white_check_mark on Slack and is refused on Telegram.",
         "verdict": "passed",
-        "test": "packages/gateway/test/slack-adapter-redteam.e2e.test.ts:90",
+        "test": "packages/gateway/test/slack-adapter-redteam.e2e.test.ts:93",
+        "testSnapshot": "artifacts/slack-adapter-gateway-redteam.test.snapshot.txt:93",
         "subcases": [
           {
             "name": "RT-SLACK-22 check reaction token delivers on Slack and is refused on Telegram",
-            "test": "packages/gateway/test/slack-adapter-redteam.e2e.test.ts:90",
+            "test": "packages/gateway/test/slack-adapter-redteam.e2e.test.ts:93",
+            "testSnapshot": "artifacts/slack-adapter-gateway-redteam.test.snapshot.txt:93",
             "file": "packages/gateway/test/slack-adapter-redteam.e2e.test.ts",
             "verdict": "passed",
             "failure": ""
           }
         ],
         "artifactRefs": [
-          "artifacts/slack-adapter-redteam.junit.xml"
+          "artifacts/slack-adapter-redteam.junit.xml",
+          "artifacts/slack-adapter-gateway-redteam.test.snapshot.txt"
         ]
       },
       {
         "id": "RT-SLACK-23",
-        "sourceHash": "sha256:a25e067e990803eb95171864c9574a6a48df0211eabba6852b4cecfd0c3c4582",
+        "sourceHash": "sha256:042d2126b51914390a20c478dc58e04175f03d7b1d8737b7581e1556af3572b7",
         "scenario": "monitor and loopback cannot chat.react",
         "expectedBehavior": "Monitor and loopback cannot chat.react and create no deliveries.",
         "expected": "Monitor and loopback cannot chat.react and create no deliveries.",
         "verdict": "passed",
-        "test": "packages/gateway/test/slack-adapter-redteam.e2e.test.ts:121",
+        "test": "packages/gateway/test/slack-adapter-redteam.e2e.test.ts:124",
+        "testSnapshot": "artifacts/slack-adapter-gateway-redteam.test.snapshot.txt:124",
         "subcases": [
           {
             "name": "RT-SLACK-23 monitor and loopback cannot chat.react",
-            "test": "packages/gateway/test/slack-adapter-redteam.e2e.test.ts:121",
+            "test": "packages/gateway/test/slack-adapter-redteam.e2e.test.ts:124",
+            "testSnapshot": "artifacts/slack-adapter-gateway-redteam.test.snapshot.txt:124",
             "file": "packages/gateway/test/slack-adapter-redteam.e2e.test.ts",
             "verdict": "passed",
             "failure": ""
           }
         ],
         "artifactRefs": [
-          "artifacts/slack-adapter-redteam.junit.xml"
+          "artifacts/slack-adapter-redteam.junit.xml",
+          "artifacts/slack-adapter-gateway-redteam.test.snapshot.txt"
         ]
       },
       {
         "id": "RT-SLACK-24",
-        "sourceHash": "sha256:a25e067e990803eb95171864c9574a6a48df0211eabba6852b4cecfd0c3c4582",
+        "sourceHash": "sha256:042d2126b51914390a20c478dc58e04175f03d7b1d8737b7581e1556af3572b7",
         "scenario": "thread and channel isolate sessions and route replies",
         "expectedBehavior": "Channel/thread origins isolate sessions and route confirmed replies correctly.",
         "expected": "Channel/thread origins isolate sessions and route confirmed replies correctly.",
         "verdict": "passed",
-        "test": "packages/gateway/test/slack-adapter-redteam.e2e.test.ts:133",
+        "test": "packages/gateway/test/slack-adapter-redteam.e2e.test.ts:136",
+        "testSnapshot": "artifacts/slack-adapter-gateway-redteam.test.snapshot.txt:136",
         "subcases": [
           {
             "name": "RT-SLACK-24 thread and channel isolate sessions and route replies",
-            "test": "packages/gateway/test/slack-adapter-redteam.e2e.test.ts:133",
+            "test": "packages/gateway/test/slack-adapter-redteam.e2e.test.ts:136",
+            "testSnapshot": "artifacts/slack-adapter-gateway-redteam.test.snapshot.txt:136",
             "file": "packages/gateway/test/slack-adapter-redteam.e2e.test.ts",
             "verdict": "passed",
             "failure": ""
           }
         ],
         "artifactRefs": [
-          "artifacts/slack-adapter-redteam.junit.xml"
+          "artifacts/slack-adapter-redteam.junit.xml",
+          "artifacts/slack-adapter-gateway-redteam.test.snapshot.txt"
         ]
       },
       {
         "id": "RT-SLACK-25",
-        "sourceHash": "sha256:a25e067e990803eb95171864c9574a6a48df0211eabba6852b4cecfd0c3c4582",
+        "sourceHash": "sha256:042d2126b51914390a20c478dc58e04175f03d7b1d8737b7581e1556af3572b7",
         "scenario": "already_reacted Web API response confirms delivery",
         "expectedBehavior": "Actual already_reacted Web API response confirms delivery.",
         "expected": "Actual already_reacted Web API response confirms delivery.",
         "verdict": "passed",
-        "test": "packages/adapter-slack/test/redteam.test.ts:547",
+        "test": "packages/adapter-slack/test/redteam.test.ts:555",
+        "testSnapshot": "artifacts/slack-adapter-redteam.test.snapshot.txt:555",
         "subcases": [
           {
             "name": "RT-SLACK-25 already_reacted Web API response confirms delivery",
-            "test": "packages/adapter-slack/test/redteam.test.ts:547",
+            "test": "packages/adapter-slack/test/redteam.test.ts:555",
+            "testSnapshot": "artifacts/slack-adapter-redteam.test.snapshot.txt:555",
             "file": "packages/adapter-slack/test/redteam.test.ts",
             "verdict": "passed",
             "failure": ""
           }
         ],
         "artifactRefs": [
-          "artifacts/slack-adapter-redteam.junit.xml"
+          "artifacts/slack-adapter-redteam.junit.xml",
+          "artifacts/slack-adapter-redteam.test.snapshot.txt"
         ]
       },
       {
         "id": "RT-SLACK-26",
-        "sourceHash": "sha256:a25e067e990803eb95171864c9574a6a48df0211eabba6852b4cecfd0c3c4582",
+        "sourceHash": "sha256:042d2126b51914390a20c478dc58e04175f03d7b1d8737b7581e1556af3572b7",
         "scenario": "dist/gajaeway-slack --help",
         "expectedBehavior": "Compiled --help exits 0 with usage without booting.",
         "expected": "Compiled --help exits 0 with usage without booting.",
         "verdict": "passed",
         "test": "artifacts/slack-adapter-cli-probes.ts:8",
+        "testSnapshot": "",
         "subcases": [],
         "artifactRefs": [
           "artifacts/slack-adapter-cli-proof.json"
@@ -2333,12 +2889,13 @@
       },
       {
         "id": "RT-SLACK-27",
-        "sourceHash": "sha256:a25e067e990803eb95171864c9574a6a48df0211eabba6852b4cecfd0c3c4582",
+        "sourceHash": "sha256:042d2126b51914390a20c478dc58e04175f03d7b1d8737b7581e1556af3572b7",
         "scenario": "dist/gajaeway-slack --version",
         "expectedBehavior": "Compiled --version exits 0 with semver.",
         "expected": "Compiled --version exits 0 with semver.",
         "verdict": "passed",
         "test": "artifacts/slack-adapter-cli-probes.ts:8",
+        "testSnapshot": "",
         "subcases": [],
         "artifactRefs": [
           "artifacts/slack-adapter-cli-proof.json"
@@ -2346,12 +2903,13 @@
       },
       {
         "id": "RT-SLACK-28",
-        "sourceHash": "sha256:a25e067e990803eb95171864c9574a6a48df0211eabba6852b4cecfd0c3c4582",
+        "sourceHash": "sha256:042d2126b51914390a20c478dc58e04175f03d7b1d8737b7581e1556af3572b7",
         "scenario": "dist/gajaeway-slack --nope",
         "expectedBehavior": "Compiled unknown flag exits 2 with usage on stderr.",
         "expected": "Compiled unknown flag exits 2 with usage on stderr.",
         "verdict": "passed",
         "test": "artifacts/slack-adapter-cli-probes.ts:8",
+        "testSnapshot": "",
         "subcases": [],
         "artifactRefs": [
           "artifacts/slack-adapter-cli-proof.json"
@@ -2359,12 +2917,13 @@
       },
       {
         "id": "RT-SLACK-29",
-        "sourceHash": "sha256:a25e067e990803eb95171864c9574a6a48df0211eabba6852b4cecfd0c3c4582",
+        "sourceHash": "sha256:042d2126b51914390a20c478dc58e04175f03d7b1d8737b7581e1556af3572b7",
         "scenario": "dist/gajaeway-slack",
         "expectedBehavior": "Compiled second instance exits 2 without overwriting a live pidfile.",
         "expected": "Compiled second instance exits 2 without overwriting a live pidfile.",
         "verdict": "passed",
         "test": "artifacts/slack-adapter-cli-probes.ts:8",
+        "testSnapshot": "",
         "subcases": [],
         "artifactRefs": [
           "artifacts/slack-adapter-cli-proof.json"
@@ -2372,58 +2931,66 @@
       },
       {
         "id": "RT-SLACK-30",
-        "sourceHash": "sha256:a25e067e990803eb95171864c9574a6a48df0211eabba6852b4cecfd0c3c4582",
+        "sourceHash": "sha256:042d2126b51914390a20c478dc58e04175f03d7b1d8737b7581e1556af3572b7",
         "scenario": "pending sends share failure and survive client adoption",
         "expectedBehavior": "Recovered request joins pending live outcome, reports unavailable on failure, retries then dedupes; adoption while pending preserves outcome.",
         "expected": "Recovered request joins pending live outcome, reports unavailable on failure, retries then dedupes; adoption while pending preserves outcome.",
         "verdict": "passed",
-        "test": "packages/adapter-slack/test/redteam.test.ts:561",
+        "test": "packages/adapter-slack/test/redteam.test.ts:569",
+        "testSnapshot": "artifacts/slack-adapter-redteam.test.snapshot.txt:569",
         "subcases": [
           {
             "name": "RT-SLACK-30 pending sends share failure and survive client adoption",
-            "test": "packages/adapter-slack/test/redteam.test.ts:561",
+            "test": "packages/adapter-slack/test/redteam.test.ts:569",
+            "testSnapshot": "artifacts/slack-adapter-redteam.test.snapshot.txt:569",
             "file": "packages/adapter-slack/test/redteam.test.ts",
             "verdict": "passed",
             "failure": ""
           }
         ],
         "artifactRefs": [
-          "artifacts/slack-adapter-redteam.junit.xml"
+          "artifacts/slack-adapter-redteam.junit.xml",
+          "artifacts/slack-adapter-redteam.test.snapshot.txt"
         ]
       },
       {
         "id": "RT-SLACK-31",
-        "sourceHash": "sha256:a25e067e990803eb95171864c9574a6a48df0211eabba6852b4cecfd0c3c4582",
+        "sourceHash": "sha256:042d2126b51914390a20c478dc58e04175f03d7b1d8737b7581e1556af3572b7",
         "scenario": "unreadable success bodies are ambiguous but explicit refusal is definitive",
         "expectedBehavior": "200 {}, nonboolean ok and throwing body streams are unreadable/ambiguous; explicit ok:false is definitive.",
         "expected": "200 {}, nonboolean ok and throwing body streams are unreadable/ambiguous; explicit ok:false is definitive.",
         "verdict": "passed",
-        "test": "packages/adapter-slack/test/redteam.test.ts:587",
+        "test": "packages/adapter-slack/test/redteam.test.ts:595",
+        "testSnapshot": "artifacts/slack-adapter-redteam.test.snapshot.txt:595",
         "subcases": [
           {
             "name": "RT-SLACK-31 unreadable success bodies are ambiguous but explicit refusal is definitive",
-            "test": "packages/adapter-slack/test/redteam.test.ts:587",
+            "test": "packages/adapter-slack/test/redteam.test.ts:595",
+            "testSnapshot": "artifacts/slack-adapter-redteam.test.snapshot.txt:595",
             "file": "packages/adapter-slack/test/redteam.test.ts",
             "verdict": "passed",
             "failure": ""
           }
         ],
         "artifactRefs": [
-          "artifacts/slack-adapter-redteam.junit.xml"
+          "artifacts/slack-adapter-redteam.junit.xml",
+          "artifacts/slack-adapter-redteam.test.snapshot.txt"
         ]
       },
       {
         "id": "RT-SLACK-32",
-        "sourceHash": "sha256:a25e067e990803eb95171864c9574a6a48df0211eabba6852b4cecfd0c3c4582",
+        "sourceHash": "sha256:042d2126b51914390a20c478dc58e04175f03d7b1d8737b7581e1556af3572b7",
         "scenario": "first SDK subscriber receives newest held events in order (2); first SDK subscriber receives newest held events in order (1001)",
         "expectedBehavior": "Same-chunk negotiated and chat events reach first subscriber in order; second gets no replay; newest 1000 retained; internal events never held.",
         "expected": "Same-chunk negotiated and chat events reach first subscriber in order; second gets no replay; newest 1000 retained; internal events never held.",
         "verdict": "passed",
         "test": "packages/sdk/test/client-held-events.test.ts:6, packages/sdk/test/client-held-events.test.ts:6",
+        "testSnapshot": "artifacts/slack-adapter-sdk-held-events.test.snapshot.txt:6, artifacts/slack-adapter-sdk-held-events.test.snapshot.txt:6",
         "subcases": [
           {
             "name": "RT-SLACK-32 first SDK subscriber receives newest held events in order (2)",
             "test": "packages/sdk/test/client-held-events.test.ts:6",
+            "testSnapshot": "artifacts/slack-adapter-sdk-held-events.test.snapshot.txt:6",
             "file": "packages/sdk/test/client-held-events.test.ts",
             "verdict": "passed",
             "failure": ""
@@ -2431,286 +2998,609 @@
           {
             "name": "RT-SLACK-32 first SDK subscriber receives newest held events in order (1001)",
             "test": "packages/sdk/test/client-held-events.test.ts:6",
+            "testSnapshot": "artifacts/slack-adapter-sdk-held-events.test.snapshot.txt:6",
             "file": "packages/sdk/test/client-held-events.test.ts",
             "verdict": "passed",
             "failure": ""
           }
         ],
         "artifactRefs": [
-          "artifacts/slack-adapter-redteam.junit.xml"
+          "artifacts/slack-adapter-redteam.junit.xml",
+          "artifacts/slack-adapter-sdk-held-events.test.snapshot.txt"
         ]
       },
       {
         "id": "RT-SLACK-33",
-        "sourceHash": "sha256:a25e067e990803eb95171864c9574a6a48df0211eabba6852b4cecfd0c3c4582",
+        "sourceHash": "sha256:042d2126b51914390a20c478dc58e04175f03d7b1d8737b7581e1556af3572b7",
         "scenario": "slack stale lock has exactly one winner under 20 concurrent reclaims; discord stale lock has exactly one winner under 20 concurrent reclaims",
         "expectedBehavior": "Exactly one of 20 concurrent stale-pidfile reclaims succeeds; all others reject with AdapterAlreadyRunningError; pidfile matches winner, for Slack and Discord.",
         "expected": "Exactly one of 20 concurrent stale-pidfile reclaims succeeds; all others reject with AdapterAlreadyRunningError; pidfile matches winner, for Slack and Discord.",
         "verdict": "passed",
-        "test": "packages/adapter-slack/test/redteam.test.ts:624, packages/gateway/test/slack-adapter-redteam.e2e.test.ts:186",
+        "test": "packages/adapter-slack/test/redteam.test.ts:632, packages/gateway/test/slack-adapter-redteam.e2e.test.ts:196",
+        "testSnapshot": "artifacts/slack-adapter-redteam.test.snapshot.txt:632, artifacts/slack-adapter-gateway-redteam.test.snapshot.txt:196",
         "subcases": [
           {
             "name": "RT-SLACK-33 slack stale lock has exactly one winner under 20 concurrent reclaims",
-            "test": "packages/adapter-slack/test/redteam.test.ts:624",
+            "test": "packages/adapter-slack/test/redteam.test.ts:632",
+            "testSnapshot": "artifacts/slack-adapter-redteam.test.snapshot.txt:632",
             "file": "packages/adapter-slack/test/redteam.test.ts",
             "verdict": "passed",
             "failure": ""
           },
           {
             "name": "RT-SLACK-33 discord stale lock has exactly one winner under 20 concurrent reclaims",
-            "test": "packages/gateway/test/slack-adapter-redteam.e2e.test.ts:186",
+            "test": "packages/gateway/test/slack-adapter-redteam.e2e.test.ts:196",
+            "testSnapshot": "artifacts/slack-adapter-gateway-redteam.test.snapshot.txt:196",
             "file": "packages/gateway/test/slack-adapter-redteam.e2e.test.ts",
             "verdict": "passed",
             "failure": ""
           }
         ],
         "artifactRefs": [
-          "artifacts/slack-adapter-redteam.junit.xml"
+          "artifacts/slack-adapter-redteam.junit.xml",
+          "artifacts/slack-adapter-redteam.test.snapshot.txt",
+          "artifacts/slack-adapter-gateway-redteam.test.snapshot.txt"
         ]
       },
       {
         "id": "RT-SLACK-34",
-        "sourceHash": "sha256:a25e067e990803eb95171864c9574a6a48df0211eabba6852b4cecfd0c3c4582",
-        "scenario": "real gateway threaded DM chunks default to inbound root; real gateway threaded DM chunks explicit reply wins; plain channel reply does not inherit a thread",
-        "expectedBehavior": "Real gateway threaded DM defaults every chunk to inbound root; explicit REPLY target wins; plain channel has no thread_ts.",
-        "expected": "Real gateway threaded DM defaults every chunk to inbound root; explicit REPLY target wins; plain channel has no thread_ts.",
+        "sourceHash": "sha256:042d2126b51914390a20c478dc58e04175f03d7b1d8737b7581e1556af3572b7",
+        "scenario": "real gateway threaded DM chunks default to inbound root; real gateway threaded DM chunks explicit reply wins; plain channel reply threads under the triggering message; an explicit target wins",
+        "expectedBehavior": "Real gateway threaded DM defaults every chunk to inbound root; explicit REPLY target wins; plain Slack channel threads under triggering message.",
+        "expected": "Real gateway threaded DM defaults every chunk to inbound root; explicit REPLY target wins; plain Slack channel threads under triggering message.",
         "verdict": "passed",
-        "test": "packages/gateway/test/slack-adapter-redteam.e2e.test.ts:155, packages/gateway/test/slack-adapter-redteam.e2e.test.ts:155, packages/gateway/test/slack-adapter-redteam.e2e.test.ts:179",
+        "test": "packages/gateway/test/slack-adapter-redteam.e2e.test.ts:161, packages/gateway/test/slack-adapter-redteam.e2e.test.ts:161, packages/gateway/test/slack-adapter-redteam.e2e.test.ts:185",
+        "testSnapshot": "artifacts/slack-adapter-gateway-redteam.test.snapshot.txt:161, artifacts/slack-adapter-gateway-redteam.test.snapshot.txt:161, artifacts/slack-adapter-gateway-redteam.test.snapshot.txt:185",
         "subcases": [
           {
             "name": "RT-SLACK-34 real gateway threaded DM chunks default to inbound root",
-            "test": "packages/gateway/test/slack-adapter-redteam.e2e.test.ts:155",
+            "test": "packages/gateway/test/slack-adapter-redteam.e2e.test.ts:161",
+            "testSnapshot": "artifacts/slack-adapter-gateway-redteam.test.snapshot.txt:161",
             "file": "packages/gateway/test/slack-adapter-redteam.e2e.test.ts",
             "verdict": "passed",
             "failure": ""
           },
           {
             "name": "RT-SLACK-34 real gateway threaded DM chunks explicit reply wins",
-            "test": "packages/gateway/test/slack-adapter-redteam.e2e.test.ts:155",
+            "test": "packages/gateway/test/slack-adapter-redteam.e2e.test.ts:161",
+            "testSnapshot": "artifacts/slack-adapter-gateway-redteam.test.snapshot.txt:161",
             "file": "packages/gateway/test/slack-adapter-redteam.e2e.test.ts",
             "verdict": "passed",
             "failure": ""
           },
           {
-            "name": "RT-SLACK-34 plain channel reply does not inherit a thread",
-            "test": "packages/gateway/test/slack-adapter-redteam.e2e.test.ts:179",
+            "name": "RT-SLACK-34 plain channel reply threads under the triggering message; an explicit target wins",
+            "test": "packages/gateway/test/slack-adapter-redteam.e2e.test.ts:185",
+            "testSnapshot": "artifacts/slack-adapter-gateway-redteam.test.snapshot.txt:185",
             "file": "packages/gateway/test/slack-adapter-redteam.e2e.test.ts",
             "verdict": "passed",
             "failure": ""
           }
         ],
         "artifactRefs": [
-          "artifacts/slack-adapter-redteam.junit.xml"
+          "artifacts/slack-adapter-redteam.junit.xml",
+          "artifacts/slack-adapter-gateway-redteam.test.snapshot.txt"
         ]
       },
       {
         "id": "RT-SLACK-35",
-        "sourceHash": "sha256:a25e067e990803eb95171864c9574a6a48df0211eabba6852b4cecfd0c3c4582",
+        "sourceHash": "sha256:042d2126b51914390a20c478dc58e04175f03d7b1d8737b7581e1556af3572b7",
         "scenario": "bounded continuation closes the gap without losing newer arrivals",
         "expectedBehavior": "Two-page bounded pass retains continuation without advancing; next pass closes remaining gap; later arrival above through is not lost.",
         "expected": "Two-page bounded pass retains continuation without advancing; next pass closes remaining gap; later arrival above through is not lost.",
         "verdict": "passed",
-        "test": "packages/adapter-slack/test/redteam.test.ts:639",
+        "test": "packages/adapter-slack/test/redteam.test.ts:647",
+        "testSnapshot": "artifacts/slack-adapter-redteam.test.snapshot.txt:647",
         "subcases": [
           {
             "name": "RT-SLACK-35 bounded continuation closes the gap without losing newer arrivals",
-            "test": "packages/adapter-slack/test/redteam.test.ts:639",
+            "test": "packages/adapter-slack/test/redteam.test.ts:647",
+            "testSnapshot": "artifacts/slack-adapter-redteam.test.snapshot.txt:647",
             "file": "packages/adapter-slack/test/redteam.test.ts",
             "verdict": "passed",
             "failure": ""
           }
         ],
         "artifactRefs": [
-          "artifacts/slack-adapter-redteam.junit.xml"
+          "artifacts/slack-adapter-redteam.junit.xml",
+          "artifacts/slack-adapter-redteam.test.snapshot.txt"
         ]
       },
       {
         "id": "RT-SLACK-36",
-        "sourceHash": "sha256:a25e067e990803eb95171864c9574a6a48df0211eabba6852b4cecfd0c3c4582",
+        "sourceHash": "sha256:042d2126b51914390a20c478dc58e04175f03d7b1d8737b7581e1556af3572b7",
         "scenario": "participated threads recover without history and expire",
         "expectedBehavior": "Engaged thread root is durably remembered and revisited when history is empty; participated-thread TTL prunes it.",
         "expected": "Engaged thread root is durably remembered and revisited when history is empty; participated-thread TTL prunes it.",
         "verdict": "passed",
-        "test": "packages/adapter-slack/test/redteam.test.ts:685",
+        "test": "packages/adapter-slack/test/redteam.test.ts:693",
+        "testSnapshot": "artifacts/slack-adapter-redteam.test.snapshot.txt:693",
         "subcases": [
           {
             "name": "RT-SLACK-36 participated threads recover without history and expire",
-            "test": "packages/adapter-slack/test/redteam.test.ts:685",
+            "test": "packages/adapter-slack/test/redteam.test.ts:693",
+            "testSnapshot": "artifacts/slack-adapter-redteam.test.snapshot.txt:693",
             "file": "packages/adapter-slack/test/redteam.test.ts",
             "verdict": "passed",
             "failure": ""
           }
         ],
         "artifactRefs": [
-          "artifacts/slack-adapter-redteam.junit.xml"
+          "artifacts/slack-adapter-redteam.junit.xml",
+          "artifacts/slack-adapter-redteam.test.snapshot.txt"
         ]
       },
       {
         "id": "RT-SLACK-37",
-        "sourceHash": "sha256:a25e067e990803eb95171864c9574a6a48df0211eabba6852b4cecfd0c3c4582",
+        "sourceHash": "sha256:042d2126b51914390a20c478dc58e04175f03d7b1d8737b7581e1556af3572b7",
         "scenario": "only terminal refusals consume dead-letter budget",
         "expectedBehavior": "Three invalid_params refusals dead-letter with terminal-message classification/digest/watermark; intervening link failure does not count; repeated unknown failures never dead-letter.",
         "expected": "Three invalid_params refusals dead-letter with terminal-message classification/digest/watermark; intervening link failure does not count; repeated unknown failures never dead-letter.",
         "verdict": "passed",
-        "test": "packages/adapter-slack/test/redteam.test.ts:703",
+        "test": "packages/adapter-slack/test/redteam.test.ts:711",
+        "testSnapshot": "artifacts/slack-adapter-redteam.test.snapshot.txt:711",
         "subcases": [
           {
             "name": "RT-SLACK-37 only terminal refusals consume dead-letter budget",
-            "test": "packages/adapter-slack/test/redteam.test.ts:703",
+            "test": "packages/adapter-slack/test/redteam.test.ts:711",
+            "testSnapshot": "artifacts/slack-adapter-redteam.test.snapshot.txt:711",
             "file": "packages/adapter-slack/test/redteam.test.ts",
             "verdict": "passed",
             "failure": ""
           }
         ],
         "artifactRefs": [
-          "artifacts/slack-adapter-redteam.junit.xml"
+          "artifacts/slack-adapter-redteam.junit.xml",
+          "artifacts/slack-adapter-redteam.test.snapshot.txt"
         ]
       },
       {
         "id": "RT-SLACK-38",
-        "sourceHash": "sha256:a25e067e990803eb95171864c9574a6a48df0211eabba6852b4cecfd0c3c4582",
+        "sourceHash": "sha256:042d2126b51914390a20c478dc58e04175f03d7b1d8737b7581e1556af3572b7",
         "scenario": "unsaved recovery state prevents success until disk is restored",
         "expectedBehavior": "Failed cursor save makes pass incomplete; restoring isolated /tmp store allows persistence without resending acknowledged message.",
         "expected": "Failed cursor save makes pass incomplete; restoring isolated /tmp store allows persistence without resending acknowledged message.",
         "verdict": "passed",
-        "test": "packages/adapter-slack/test/redteam.test.ts:742",
+        "test": "packages/adapter-slack/test/redteam.test.ts:750",
+        "testSnapshot": "artifacts/slack-adapter-redteam.test.snapshot.txt:750",
         "subcases": [
           {
             "name": "RT-SLACK-38 unsaved recovery state prevents success until disk is restored",
-            "test": "packages/adapter-slack/test/redteam.test.ts:742",
+            "test": "packages/adapter-slack/test/redteam.test.ts:750",
+            "testSnapshot": "artifacts/slack-adapter-redteam.test.snapshot.txt:750",
             "file": "packages/adapter-slack/test/redteam.test.ts",
             "verdict": "passed",
             "failure": ""
           }
         ],
         "artifactRefs": [
-          "artifacts/slack-adapter-redteam.junit.xml"
+          "artifacts/slack-adapter-redteam.junit.xml",
+          "artifacts/slack-adapter-redteam.test.snapshot.txt"
         ]
       },
       {
         "id": "RT-SLACK-39",
-        "sourceHash": "sha256:a25e067e990803eb95171864c9574a6a48df0211eabba6852b4cecfd0c3c4582",
+        "sourceHash": "sha256:042d2126b51914390a20c478dc58e04175f03d7b1d8737b7581e1556af3572b7",
         "scenario": "slash acknowledgements reflect restart failure duplicates and unknown commands",
         "expectedBehavior": "Slash acks distinguish restart, unreachable gateway, duplicate trigger and unknown command.",
         "expected": "Slash acks distinguish restart, unreachable gateway, duplicate trigger and unknown command.",
         "verdict": "passed",
-        "test": "packages/adapter-slack/test/redteam.test.ts:757",
+        "test": "packages/adapter-slack/test/redteam.test.ts:765",
+        "testSnapshot": "artifacts/slack-adapter-redteam.test.snapshot.txt:765",
         "subcases": [
           {
             "name": "RT-SLACK-39 slash acknowledgements reflect restart failure duplicates and unknown commands",
-            "test": "packages/adapter-slack/test/redteam.test.ts:757",
+            "test": "packages/adapter-slack/test/redteam.test.ts:765",
+            "testSnapshot": "artifacts/slack-adapter-redteam.test.snapshot.txt:765",
             "file": "packages/adapter-slack/test/redteam.test.ts",
             "verdict": "passed",
             "failure": ""
           }
         ],
         "artifactRefs": [
-          "artifacts/slack-adapter-redteam.junit.xml"
+          "artifacts/slack-adapter-redteam.junit.xml",
+          "artifacts/slack-adapter-redteam.test.snapshot.txt"
         ]
       },
       {
         "id": "RT-SLACK-40",
-        "sourceHash": "sha256:a25e067e990803eb95171864c9574a6a48df0211eabba6852b4cecfd0c3c4582",
+        "sourceHash": "sha256:042d2126b51914390a20c478dc58e04175f03d7b1d8737b7581e1556af3572b7",
         "scenario": "addressed accepted turns post working status before any progress",
         "expectedBehavior": "Engaged addressed turn posts working status before progress; unmentioned group does not; thread status keeps thread_ts.",
         "expected": "Engaged addressed turn posts working status before progress; unmentioned group does not; thread status keeps thread_ts.",
         "verdict": "passed",
-        "test": "packages/adapter-slack/test/redteam.test.ts:783",
+        "test": "packages/adapter-slack/test/redteam.test.ts:791",
+        "testSnapshot": "artifacts/slack-adapter-redteam.test.snapshot.txt:791",
         "subcases": [
           {
             "name": "RT-SLACK-40 addressed accepted turns post working status before any progress",
-            "test": "packages/adapter-slack/test/redteam.test.ts:783",
+            "test": "packages/adapter-slack/test/redteam.test.ts:791",
+            "testSnapshot": "artifacts/slack-adapter-redteam.test.snapshot.txt:791",
             "file": "packages/adapter-slack/test/redteam.test.ts",
             "verdict": "passed",
             "failure": ""
           }
         ],
         "artifactRefs": [
-          "artifacts/slack-adapter-redteam.junit.xml"
+          "artifacts/slack-adapter-redteam.junit.xml",
+          "artifacts/slack-adapter-redteam.test.snapshot.txt"
         ]
       },
       {
         "id": "RT-SLACK-41",
-        "sourceHash": "sha256:a25e067e990803eb95171864c9574a6a48df0211eabba6852b4cecfd0c3c4582",
+        "sourceHash": "sha256:042d2126b51914390a20c478dc58e04175f03d7b1d8737b7581e1556af3572b7",
         "scenario": "unknown rocket reaction fails definitively without a Slack call",
         "expectedBehavior": "Unknown rocket emojiName fails definitively without addReaction.",
         "expected": "Unknown rocket emojiName fails definitively without addReaction.",
         "verdict": "passed",
-        "test": "packages/adapter-slack/test/redteam.test.ts:803",
+        "test": "packages/adapter-slack/test/redteam.test.ts:811",
+        "testSnapshot": "artifacts/slack-adapter-redteam.test.snapshot.txt:811",
         "subcases": [
           {
             "name": "RT-SLACK-41 unknown rocket reaction fails definitively without a Slack call",
-            "test": "packages/adapter-slack/test/redteam.test.ts:803",
+            "test": "packages/adapter-slack/test/redteam.test.ts:811",
+            "testSnapshot": "artifacts/slack-adapter-redteam.test.snapshot.txt:811",
             "file": "packages/adapter-slack/test/redteam.test.ts",
             "verdict": "passed",
             "failure": ""
           }
         ],
         "artifactRefs": [
-          "artifacts/slack-adapter-redteam.junit.xml"
+          "artifacts/slack-adapter-redteam.junit.xml",
+          "artifacts/slack-adapter-redteam.test.snapshot.txt"
         ]
       },
       {
         "id": "RT-SLACK-42",
-        "sourceHash": "sha256:a25e067e990803eb95171864c9574a6a48df0211eabba6852b4cecfd0c3c4582",
+        "sourceHash": "sha256:042d2126b51914390a20c478dc58e04175f03d7b1d8737b7581e1556af3572b7",
         "scenario": "orphaned reclaim marker permits acquisition within two seconds and is removed",
         "expectedBehavior": "A stale pidfile plus a dead reclaimer marker recovers within 2000ms and removes the marker.",
         "expected": "A stale pidfile plus a dead reclaimer marker recovers within 2000ms and removes the marker.",
         "verdict": "passed",
-        "test": "packages/adapter-slack/test/redteam.test.ts:818",
+        "test": "packages/adapter-slack/test/redteam.test.ts:826",
+        "testSnapshot": "artifacts/slack-adapter-redteam.test.snapshot.txt:826",
         "subcases": [
           {
             "name": "RT-SLACK-42 orphaned reclaim marker permits acquisition within two seconds and is removed",
-            "test": "packages/adapter-slack/test/redteam.test.ts:818",
+            "test": "packages/adapter-slack/test/redteam.test.ts:826",
+            "testSnapshot": "artifacts/slack-adapter-redteam.test.snapshot.txt:826",
             "file": "packages/adapter-slack/test/redteam.test.ts",
             "verdict": "passed",
             "failure": ""
           }
         ],
         "artifactRefs": [
-          "artifacts/slack-adapter-redteam.junit.xml"
+          "artifacts/slack-adapter-redteam.junit.xml",
+          "artifacts/slack-adapter-redteam.test.snapshot.txt"
         ]
       },
       {
         "id": "RT-SLACK-43",
-        "sourceHash": "sha256:a25e067e990803eb95171864c9574a6a48df0211eabba6852b4cecfd0c3c4582",
+        "sourceHash": "sha256:042d2126b51914390a20c478dc58e04175f03d7b1d8737b7581e1556af3572b7",
         "scenario": "live holder arriving during election is never replaced by waiting contenders",
         "expectedBehavior": "Twenty waiting contenders refuse a live holder that arrives mid-election without replacing its pidfile.",
         "expected": "Twenty waiting contenders refuse a live holder that arrives mid-election without replacing its pidfile.",
         "verdict": "passed",
-        "test": "packages/adapter-slack/test/redteam.test.ts:832",
+        "test": "packages/adapter-slack/test/redteam.test.ts:840",
+        "testSnapshot": "artifacts/slack-adapter-redteam.test.snapshot.txt:840",
         "subcases": [
           {
             "name": "RT-SLACK-43 live holder arriving during election is never replaced by waiting contenders",
-            "test": "packages/adapter-slack/test/redteam.test.ts:832",
+            "test": "packages/adapter-slack/test/redteam.test.ts:840",
+            "testSnapshot": "artifacts/slack-adapter-redteam.test.snapshot.txt:840",
             "file": "packages/adapter-slack/test/redteam.test.ts",
             "verdict": "passed",
             "failure": ""
           }
         ],
         "artifactRefs": [
-          "artifacts/slack-adapter-redteam.junit.xml"
+          "artifacts/slack-adapter-redteam.junit.xml",
+          "artifacts/slack-adapter-redteam.test.snapshot.txt"
         ]
       },
       {
         "id": "RT-SLACK-44",
-        "sourceHash": "sha256:a25e067e990803eb95171864c9574a6a48df0211eabba6852b4cecfd0c3c4582",
+        "sourceHash": "sha256:042d2126b51914390a20c478dc58e04175f03d7b1d8737b7581e1556af3572b7",
         "scenario": "release by a former holder after losing election preserves the winner pidfile",
         "expectedBehavior": "A former holder loses reacquisition; its release preserves the elected winner, whose own release removes the pidfile.",
         "expected": "A former holder loses reacquisition; its release preserves the elected winner, whose own release removes the pidfile.",
         "verdict": "passed",
-        "test": "packages/adapter-slack/test/redteam.test.ts:866",
+        "test": "packages/adapter-slack/test/redteam.test.ts:874",
+        "testSnapshot": "artifacts/slack-adapter-redteam.test.snapshot.txt:874",
         "subcases": [
           {
             "name": "RT-SLACK-44 release by a former holder after losing election preserves the winner pidfile",
-            "test": "packages/adapter-slack/test/redteam.test.ts:866",
+            "test": "packages/adapter-slack/test/redteam.test.ts:874",
+            "testSnapshot": "artifacts/slack-adapter-redteam.test.snapshot.txt:874",
             "file": "packages/adapter-slack/test/redteam.test.ts",
             "verdict": "passed",
             "failure": ""
           }
         ],
         "artifactRefs": [
-          "artifacts/slack-adapter-redteam.junit.xml"
+          "artifacts/slack-adapter-redteam.junit.xml",
+          "artifacts/slack-adapter-redteam.test.snapshot.txt"
+        ]
+      },
+      {
+        "id": "RT-SLACK-45",
+        "sourceHash": "sha256:042d2126b51914390a20c478dc58e04175f03d7b1d8737b7581e1556af3572b7",
+        "scenario": "live 0.9s marker survives timeout naming new holder; two waiters reclaim old dead marker with one winner; discord live marker survives and timeout names pidfile holder; discord dead marker elects one of two waiters",
+        "expectedBehavior": "Live 0.9s-old linked marker survives waiter timeout; old dead-owner marker is reclaimed by exactly one of two waiters; timeout names new live pidfile holder.",
+        "expected": "Live 0.9s-old linked marker survives waiter timeout; old dead-owner marker is reclaimed by exactly one of two waiters; timeout names new live pidfile holder.",
+        "verdict": "passed",
+        "test": "packages/adapter-slack/test/redteam.test.ts:898, packages/adapter-slack/test/redteam.test.ts:898, packages/gateway/test/slack-adapter-redteam.e2e.test.ts:304, packages/gateway/test/slack-adapter-redteam.e2e.test.ts:304",
+        "testSnapshot": "artifacts/slack-adapter-redteam.test.snapshot.txt:898, artifacts/slack-adapter-redteam.test.snapshot.txt:898, artifacts/slack-adapter-gateway-redteam.test.snapshot.txt:304, artifacts/slack-adapter-gateway-redteam.test.snapshot.txt:304",
+        "subcases": [
+          {
+            "name": "RT-SLACK-45 live 0.9s marker survives timeout naming new holder",
+            "test": "packages/adapter-slack/test/redteam.test.ts:898",
+            "testSnapshot": "artifacts/slack-adapter-redteam.test.snapshot.txt:898",
+            "file": "packages/adapter-slack/test/redteam.test.ts",
+            "verdict": "passed",
+            "failure": ""
+          },
+          {
+            "name": "RT-SLACK-45 two waiters reclaim old dead marker with one winner",
+            "test": "packages/adapter-slack/test/redteam.test.ts:898",
+            "testSnapshot": "artifacts/slack-adapter-redteam.test.snapshot.txt:898",
+            "file": "packages/adapter-slack/test/redteam.test.ts",
+            "verdict": "passed",
+            "failure": ""
+          },
+          {
+            "name": "RT-SLACK-45 discord live marker survives and timeout names pidfile holder",
+            "test": "packages/gateway/test/slack-adapter-redteam.e2e.test.ts:304",
+            "testSnapshot": "artifacts/slack-adapter-gateway-redteam.test.snapshot.txt:304",
+            "file": "packages/gateway/test/slack-adapter-redteam.e2e.test.ts",
+            "verdict": "passed",
+            "failure": ""
+          },
+          {
+            "name": "RT-SLACK-45 discord dead marker elects one of two waiters",
+            "test": "packages/gateway/test/slack-adapter-redteam.e2e.test.ts:304",
+            "testSnapshot": "artifacts/slack-adapter-gateway-redteam.test.snapshot.txt:304",
+            "file": "packages/gateway/test/slack-adapter-redteam.e2e.test.ts",
+            "verdict": "passed",
+            "failure": ""
+          }
+        ],
+        "artifactRefs": [
+          "artifacts/slack-adapter-redteam.junit.xml",
+          "artifacts/slack-adapter-redteam.test.snapshot.txt",
+          "artifacts/slack-adapter-gateway-redteam.test.snapshot.txt"
+        ]
+      },
+      {
+        "id": "RT-SLACK-46",
+        "sourceHash": "sha256:042d2126b51914390a20c478dc58e04175f03d7b1d8737b7581e1556af3572b7",
+        "scenario": "slack channel triggering root preserves platform routing on redelivery; discord channel triggering root preserves platform routing on redelivery; telegram channel triggering root preserves platform routing on redelivery; slash synthetic message id cannot become Slack thread root",
+        "expectedBehavior": "Real gateway Slack channel delivery and redelivery thread under triggering ts; slash synthetic id is unthreaded; Discord and Telegram have no reply target.",
+        "expected": "Real gateway Slack channel delivery and redelivery thread under triggering ts; slash synthetic id is unthreaded; Discord and Telegram have no reply target.",
+        "verdict": "passed",
+        "test": "packages/gateway/test/slack-adapter-redteam.e2e.test.ts:215, packages/gateway/test/slack-adapter-redteam.e2e.test.ts:215, packages/gateway/test/slack-adapter-redteam.e2e.test.ts:215, packages/gateway/test/slack-adapter-redteam.e2e.test.ts:231",
+        "testSnapshot": "artifacts/slack-adapter-gateway-redteam.test.snapshot.txt:215, artifacts/slack-adapter-gateway-redteam.test.snapshot.txt:215, artifacts/slack-adapter-gateway-redteam.test.snapshot.txt:215, artifacts/slack-adapter-gateway-redteam.test.snapshot.txt:231",
+        "subcases": [
+          {
+            "name": "RT-SLACK-46 slack channel triggering root preserves platform routing on redelivery",
+            "test": "packages/gateway/test/slack-adapter-redteam.e2e.test.ts:215",
+            "testSnapshot": "artifacts/slack-adapter-gateway-redteam.test.snapshot.txt:215",
+            "file": "packages/gateway/test/slack-adapter-redteam.e2e.test.ts",
+            "verdict": "passed",
+            "failure": ""
+          },
+          {
+            "name": "RT-SLACK-46 discord channel triggering root preserves platform routing on redelivery",
+            "test": "packages/gateway/test/slack-adapter-redteam.e2e.test.ts:215",
+            "testSnapshot": "artifacts/slack-adapter-gateway-redteam.test.snapshot.txt:215",
+            "file": "packages/gateway/test/slack-adapter-redteam.e2e.test.ts",
+            "verdict": "passed",
+            "failure": ""
+          },
+          {
+            "name": "RT-SLACK-46 telegram channel triggering root preserves platform routing on redelivery",
+            "test": "packages/gateway/test/slack-adapter-redteam.e2e.test.ts:215",
+            "testSnapshot": "artifacts/slack-adapter-gateway-redteam.test.snapshot.txt:215",
+            "file": "packages/gateway/test/slack-adapter-redteam.e2e.test.ts",
+            "verdict": "passed",
+            "failure": ""
+          },
+          {
+            "name": "RT-SLACK-46 slash synthetic message id cannot become Slack thread root",
+            "test": "packages/gateway/test/slack-adapter-redteam.e2e.test.ts:231",
+            "testSnapshot": "artifacts/slack-adapter-gateway-redteam.test.snapshot.txt:231",
+            "file": "packages/gateway/test/slack-adapter-redteam.e2e.test.ts",
+            "verdict": "passed",
+            "failure": ""
+          }
+        ],
+        "artifactRefs": [
+          "artifacts/slack-adapter-redteam.junit.xml",
+          "artifacts/slack-adapter-gateway-redteam.test.snapshot.txt"
+        ]
+      },
+      {
+        "id": "RT-SLACK-47",
+        "sourceHash": "sha256:042d2126b51914390a20c478dc58e04175f03d7b1d8737b7581e1556af3572b7",
+        "scenario": "rate-limit settlement 4 refusals Retry-After 2; rate-limit settlement 2 refusals Retry-After 2; rate-limit settlement 2 refusals Retry-After 99; rate-limit settlement 2 refusals Retry-After null",
+        "expectedBehavior": "429 x4 settles ambiguous without SlackApiError; 429 x2 then success confirms in three requests; Retry-After sleeps exact, capped at 30s and defaulting to 1s.",
+        "expected": "429 x4 settles ambiguous without SlackApiError; 429 x2 then success confirms in three requests; Retry-After sleeps exact, capped at 30s and defaulting to 1s.",
+        "verdict": "passed",
+        "test": "packages/adapter-slack/test/redteam.test.ts:944, packages/adapter-slack/test/redteam.test.ts:944, packages/adapter-slack/test/redteam.test.ts:944, packages/adapter-slack/test/redteam.test.ts:944",
+        "testSnapshot": "artifacts/slack-adapter-redteam.test.snapshot.txt:944, artifacts/slack-adapter-redteam.test.snapshot.txt:944, artifacts/slack-adapter-redteam.test.snapshot.txt:944, artifacts/slack-adapter-redteam.test.snapshot.txt:944",
+        "subcases": [
+          {
+            "name": "RT-SLACK-47 rate-limit settlement 4 refusals Retry-After 2",
+            "test": "packages/adapter-slack/test/redteam.test.ts:944",
+            "testSnapshot": "artifacts/slack-adapter-redteam.test.snapshot.txt:944",
+            "file": "packages/adapter-slack/test/redteam.test.ts",
+            "verdict": "passed",
+            "failure": ""
+          },
+          {
+            "name": "RT-SLACK-47 rate-limit settlement 2 refusals Retry-After 2",
+            "test": "packages/adapter-slack/test/redteam.test.ts:944",
+            "testSnapshot": "artifacts/slack-adapter-redteam.test.snapshot.txt:944",
+            "file": "packages/adapter-slack/test/redteam.test.ts",
+            "verdict": "passed",
+            "failure": ""
+          },
+          {
+            "name": "RT-SLACK-47 rate-limit settlement 2 refusals Retry-After 99",
+            "test": "packages/adapter-slack/test/redteam.test.ts:944",
+            "testSnapshot": "artifacts/slack-adapter-redteam.test.snapshot.txt:944",
+            "file": "packages/adapter-slack/test/redteam.test.ts",
+            "verdict": "passed",
+            "failure": ""
+          },
+          {
+            "name": "RT-SLACK-47 rate-limit settlement 2 refusals Retry-After null",
+            "test": "packages/adapter-slack/test/redteam.test.ts:944",
+            "testSnapshot": "artifacts/slack-adapter-redteam.test.snapshot.txt:944",
+            "file": "packages/adapter-slack/test/redteam.test.ts",
+            "verdict": "passed",
+            "failure": ""
+          }
+        ],
+        "artifactRefs": [
+          "artifacts/slack-adapter-redteam.junit.xml",
+          "artifacts/slack-adapter-redteam.test.snapshot.txt"
+        ]
+      },
+      {
+        "id": "RT-SLACK-48",
+        "sourceHash": "sha256:042d2126b51914390a20c478dc58e04175f03d7b1d8737b7581e1556af3572b7",
+        "scenario": "concurrent delivery queue drains before cosmetic without starvation across channels",
+        "expectedBehavior": "Five concurrent deliveries precede cosmetic, independent channels do not block, cosmetic completes when deliveries stop, pendingMs is zero after all settle.",
+        "expected": "Five concurrent deliveries precede cosmetic, independent channels do not block, cosmetic completes when deliveries stop, pendingMs is zero after all settle.",
+        "verdict": "failed",
+        "test": "packages/adapter-slack/test/redteam.test.ts:972",
+        "testSnapshot": "artifacts/slack-adapter-redteam.test.snapshot.txt:972",
+        "subcases": [
+          {
+            "name": "RT-SLACK-48 concurrent delivery queue drains before cosmetic without starvation across channels",
+            "test": "packages/adapter-slack/test/redteam.test.ts:972",
+            "testSnapshot": "artifacts/slack-adapter-redteam.test.snapshot.txt:972",
+            "file": "packages/adapter-slack/test/redteam.test.ts",
+            "verdict": "failed",
+            "failure": "AssertionError: expect(received).toBe(expected)\n\nExpected: 0\nReceived: 100\n\n      at packages/adapter-slack/test/redteam.test.ts:1003:34\n"
+          }
+        ],
+        "artifactRefs": [
+          "artifacts/slack-adapter-redteam.junit.xml",
+          "artifacts/slack-adapter-redteam.test.snapshot.txt"
+        ]
+      },
+      {
+        "id": "RT-SLACK-49",
+        "sourceHash": "sha256:042d2126b51914390a20c478dc58e04175f03d7b1d8737b7581e1556af3572b7",
+        "scenario": "status coalesces thirty ticks and activity-only changes while clear bypasses window",
+        "expectedBehavior": "Thirty ticks over 20s cause at most two updates; activity-only changes wait for 15s edit window; clear deletes exactly once within window.",
+        "expected": "Thirty ticks over 20s cause at most two updates; activity-only changes wait for 15s edit window; clear deletes exactly once within window.",
+        "verdict": "passed",
+        "test": "packages/adapter-slack/test/redteam.test.ts:1006",
+        "testSnapshot": "artifacts/slack-adapter-redteam.test.snapshot.txt:1006",
+        "subcases": [
+          {
+            "name": "RT-SLACK-49 status coalesces thirty ticks and activity-only changes while clear bypasses window",
+            "test": "packages/adapter-slack/test/redteam.test.ts:1006",
+            "testSnapshot": "artifacts/slack-adapter-redteam.test.snapshot.txt:1006",
+            "file": "packages/adapter-slack/test/redteam.test.ts",
+            "verdict": "passed",
+            "failure": ""
+          }
+        ],
+        "artifactRefs": [
+          "artifacts/slack-adapter-redteam.junit.xml",
+          "artifacts/slack-adapter-redteam.test.snapshot.txt"
+        ]
+      },
+      {
+        "id": "RT-SLACK-50",
+        "sourceHash": "sha256:042d2126b51914390a20c478dc58e04175f03d7b1d8737b7581e1556af3572b7",
+        "scenario": "real socket activity bounds burst details thinking writing and exactly one final",
+        "expectedBehavior": "Real gateway tool activity has kind/label/detail; ten-start burst emits at most two announcements; hostile intent single-line <=120 chars; end thinking, assistant writing, final exactly once.",
+        "expected": "Real gateway tool activity has kind/label/detail; ten-start burst emits at most two announcements; hostile intent single-line <=120 chars; end thinking, assistant writing, final exactly once.",
+        "verdict": "passed",
+        "test": "packages/gateway/test/slack-adapter-redteam.e2e.test.ts:244",
+        "testSnapshot": "artifacts/slack-adapter-gateway-redteam.test.snapshot.txt:244",
+        "subcases": [
+          {
+            "name": "RT-SLACK-50 real socket activity bounds burst details thinking writing and exactly one final",
+            "test": "packages/gateway/test/slack-adapter-redteam.e2e.test.ts:244",
+            "testSnapshot": "artifacts/slack-adapter-gateway-redteam.test.snapshot.txt:244",
+            "file": "packages/gateway/test/slack-adapter-redteam.e2e.test.ts",
+            "verdict": "passed",
+            "failure": ""
+          }
+        ],
+        "artifactRefs": [
+          "artifacts/slack-adapter-redteam.junit.xml",
+          "artifacts/slack-adapter-gateway-redteam.test.snapshot.txt"
+        ]
+      },
+      {
+        "id": "RT-SLACK-51",
+        "sourceHash": "sha256:042d2126b51914390a20c478dc58e04175f03d7b1d8737b7581e1556af3572b7",
+        "scenario": "unengaged truncated reply walks persist and drain pending roots without aging participation",
+        "expectedBehavior": "Truncated unengaged reply walk durably records pending root, next pass drains and clears it; participation lastSeenAt never regresses.",
+        "expected": "Truncated unengaged reply walk durably records pending root, next pass drains and clears it; participation lastSeenAt never regresses.",
+        "verdict": "passed",
+        "test": "packages/adapter-slack/test/redteam.test.ts:1053",
+        "testSnapshot": "artifacts/slack-adapter-redteam.test.snapshot.txt:1053",
+        "subcases": [
+          {
+            "name": "RT-SLACK-51 unengaged truncated reply walks persist and drain pending roots without aging participation",
+            "test": "packages/adapter-slack/test/redteam.test.ts:1053",
+            "testSnapshot": "artifacts/slack-adapter-redteam.test.snapshot.txt:1053",
+            "file": "packages/adapter-slack/test/redteam.test.ts",
+            "verdict": "passed",
+            "failure": ""
+          }
+        ],
+        "artifactRefs": [
+          "artifacts/slack-adapter-redteam.junit.xml",
+          "artifacts/slack-adapter-redteam.test.snapshot.txt"
+        ]
+      },
+      {
+        "id": "RT-SLACK-52",
+        "sourceHash": "sha256:042d2126b51914390a20c478dc58e04175f03d7b1d8737b7581e1556af3572b7",
+        "scenario": "recent clean recovery gate outage 2000 quarantine false; recent clean recovery gate outage 6000 quarantine false; recent clean recovery gate outage 2000 quarantine true",
+        "expectedBehavior": "Recent clean recovery skips history after 2s outage, but runs for quarantine or 6s outage.",
+        "expected": "Recent clean recovery skips history after 2s outage, but runs for quarantine or 6s outage.",
+        "verdict": "passed",
+        "test": "packages/adapter-slack/test/redteam.test.ts:1093, packages/adapter-slack/test/redteam.test.ts:1093, packages/adapter-slack/test/redteam.test.ts:1093",
+        "testSnapshot": "artifacts/slack-adapter-redteam.test.snapshot.txt:1093, artifacts/slack-adapter-redteam.test.snapshot.txt:1093, artifacts/slack-adapter-redteam.test.snapshot.txt:1093",
+        "subcases": [
+          {
+            "name": "RT-SLACK-52 recent clean recovery gate outage 2000 quarantine false",
+            "test": "packages/adapter-slack/test/redteam.test.ts:1093",
+            "testSnapshot": "artifacts/slack-adapter-redteam.test.snapshot.txt:1093",
+            "file": "packages/adapter-slack/test/redteam.test.ts",
+            "verdict": "passed",
+            "failure": ""
+          },
+          {
+            "name": "RT-SLACK-52 recent clean recovery gate outage 6000 quarantine false",
+            "test": "packages/adapter-slack/test/redteam.test.ts:1093",
+            "testSnapshot": "artifacts/slack-adapter-redteam.test.snapshot.txt:1093",
+            "file": "packages/adapter-slack/test/redteam.test.ts",
+            "verdict": "passed",
+            "failure": ""
+          },
+          {
+            "name": "RT-SLACK-52 recent clean recovery gate outage 2000 quarantine true",
+            "test": "packages/adapter-slack/test/redteam.test.ts:1093",
+            "testSnapshot": "artifacts/slack-adapter-redteam.test.snapshot.txt:1093",
+            "file": "packages/adapter-slack/test/redteam.test.ts",
+            "verdict": "passed",
+            "failure": ""
+          }
+        ],
+        "artifactRefs": [
+          "artifacts/slack-adapter-redteam.junit.xml",
+          "artifacts/slack-adapter-redteam.test.snapshot.txt"
         ]
       }
     ],
@@ -2720,6 +3610,10 @@
       "artifacts/slack-adapter-redteam.junit.xml",
       "artifacts/slack-adapter-redteam-report.json",
       "artifacts/slack-adapter-supporting.junit.xml",
+      "artifacts/slack-adapter-frozen-verification.json",
+      "artifacts/slack-adapter-redteam.test.snapshot.txt",
+      "artifacts/slack-adapter-gateway-redteam.test.snapshot.txt",
+      "artifacts/slack-adapter-sdk-held-events.test.snapshot.txt",
       "artifacts/slack-adapter-lock-loop-1.junit.xml",
       "artifacts/slack-adapter-lock-loop-2.junit.xml",
       "artifacts/slack-adapter-lock-loop-3.junit.xml",
@@ -2731,6 +3625,21 @@
       "artifacts/slack-adapter-lock-loop-9.junit.xml",
       "artifacts/slack-adapter-lock-loop-10.junit.xml"
     ],
-    "blockers": []
+    "blockers": [
+      {
+        "caseId": "RT-SLACK-48",
+        "contractRef": "Generation 4 acceptance RT-SLACK-48",
+        "test": "packages/adapter-slack/test/redteam.test.ts:972",
+        "testSnapshot": "artifacts/slack-adapter-redteam.test.snapshot.txt:972",
+        "observed": "AssertionError: expect(received).toBe(expected)\n\nExpected: 0\nReceived: 100\n\n      at packages/adapter-slack/test/redteam.test.ts:1003:34\n",
+        "scenario": "RT-SLACK-48 concurrent delivery queue drains before cosmetic without starvation across channels",
+        "source": "packages/adapter-slack/src/api.ts:OutboundLimiter.pendingMs",
+        "explanation": "Observed assertion failure; source deliberately left unchanged.",
+        "artifactRefs": [
+          "artifacts/slack-adapter-redteam.junit.xml",
+          "artifacts/slack-adapter-redteam.test.snapshot.txt"
+        ]
+      }
+    ]
   }
 }
