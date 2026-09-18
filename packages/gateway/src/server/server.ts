@@ -1125,11 +1125,12 @@ async function sendChat(
 		throw new ProtocolError("invalid_params", "chat.send requires a valid origin");
 	}
 	const key = originKey(origin);
+	const threadFollowUp = origin.kind === "thread" && threadFollowUpEngaged(origin, key, options.database);
 	// `/model` is a privileged control path. Apply the same direct-message and
 	// group authorisation policy as ordinary engagement before inspecting or
 	// mutating the durable override.
 	if (userText === "/model" || userText.startsWith("/model ")) {
-		if (!commandAuthorised(origin, runtime.config, params.engagement)) {
+		if (!commandAuthorised(origin, runtime.config, params.engagement, threadFollowUp)) {
 			connection.write({
 				v: PROFILE_VERSION,
 				type: "response",
@@ -1176,7 +1177,11 @@ async function sendChat(
 		// and resume through recovery, so the persona keeps its transcript.
 		const owner = ownerPeerIdOf(runtime.config);
 		const authorId = (params.engagement as { authorId?: string } | undefined)?.authorId;
-		if (!commandAuthorised(origin, runtime.config, params.engagement) || owner === undefined || authorId !== owner) {
+		if (
+			!commandAuthorised(origin, runtime.config, params.engagement, threadFollowUp) ||
+			owner === undefined ||
+			authorId !== owner
+		) {
 			connection.write({
 				v: PROFILE_VERSION,
 				type: "response",
@@ -1228,7 +1233,7 @@ async function sendChat(
 	if (params.text === "/new" || params.text === "/reset") {
 		// Session resets are privileged control paths: an unauthorized DM must not
 		// erase the caller's session merely because commands bypass normal dispatch.
-		if (!commandAuthorised(origin, runtime.config, params.engagement)) {
+		if (!commandAuthorised(origin, runtime.config, params.engagement, threadFollowUp)) {
 			connection.write({
 				v: PROFILE_VERSION,
 				type: "response",
@@ -1275,7 +1280,6 @@ async function sendChat(
 			typeof params.engagement.authorId !== "string")
 	)
 		throw new ProtocolError("invalid_params", "non-loopback chat.send requires engagement");
-	const threadFollowUp = origin.kind === "thread" && threadFollowUpEngaged(origin, key, options.database);
 	const engagementDecision = decideEngagement(origin, params.engagement as never, runtime.config, threadFollowUp);
 	const authorIsBot = (params.engagement as { authorIsBot?: unknown } | undefined)?.authorIsBot === true;
 	if (!authorIsBot) runtime.botAudienceTurns.recordHumanMessage(key);
@@ -2068,6 +2072,7 @@ function commandAuthorised(
 	origin: Parameters<typeof decideEngagement>[0],
 	config: GatewayConfig,
 	engagement: unknown,
+	threadFollowUp: boolean,
 ): boolean {
-	return decideEngagement(origin, engagement as Parameters<typeof decideEngagement>[1], config).engaged;
+	return decideEngagement(origin, engagement as Parameters<typeof decideEngagement>[1], config, threadFollowUp).engaged;
 }
