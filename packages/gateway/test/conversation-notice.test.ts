@@ -1,5 +1,5 @@
 import { expect, test } from "bun:test";
-import type { OriginRef } from "@gajaeway/protocol";
+import type { OriginRef } from "@gajae-gateway/protocol";
 import { currentConversationNotice } from "../src/server/server";
 
 const slackDm: OriginRef = { platform: "slack", kind: "dm", conversationId: "D1", peerId: "U1" };
