@@ -15,6 +15,7 @@ import type {
 	SessionRequestResult,
 	SessionSendInput,
 	SessionSteerInput,
+	TerminateHostOutcome,
 	WorkerOutputInput,
 	WorkerOutputResult,
 } from "../src/orchestrator/session-port";
@@ -189,6 +190,14 @@ export class ScriptedSessionPort implements SessionPort {
 		this.closes.push(input);
 		const state = this.#sessionStates.get(input.sessionId);
 		if (state) this.#sessionStates.set(input.sessionId, { ...state, live: false });
+	}
+
+	/** Ends the host of a retired session; a live seeded session is "terminated", anything else "already_gone". */
+	async terminateHost(input: { sessionId: string; repo: string }): Promise<TerminateHostOutcome> {
+		const state = this.#sessionStates.get(input.sessionId);
+		if (!state || state.live === false) return { outcome: "already_gone" };
+		await this.close(input);
+		return { outcome: "terminated", pid: 40_000 + this.closes.length };
 	}
 
 	/** Broker liveness from the scripted state table; an unseeded id is disowned, like an id the broker never indexed. */

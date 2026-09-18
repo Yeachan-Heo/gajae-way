@@ -30,6 +30,12 @@ import type { TailAttachInput, TailHandle, TailRunner } from "./tail-runner";
  * operation-reference selection, and recovery policy; this port only binds,
  * sends, observes, and reads terminal output through the SDK CLI.
  */
+export type TerminateHostOutcome =
+	| { readonly outcome: "terminated"; readonly pid: number }
+	| { readonly outcome: "already_gone" }
+	| { readonly outcome: "not_a_host"; readonly pid: number; readonly command: string }
+	| { readonly outcome: "refused"; readonly reason: string };
+
 export interface SessionPort {
 	bind(input: SessionBindInput): Promise<SessionBinding>;
 	inspect(input: { sessionId: string; repo: string }): Promise<BrokerSession | undefined>;
@@ -39,6 +45,13 @@ export interface SessionPort {
 	}): Promise<{ readonly live: boolean | undefined; readonly disowned: boolean }>;
 	/** True when the session's prompt queue has no pending messages (queue.messages.list empty). */
 	queueEmpty?(input: { sessionId: string; repo: string }): Promise<boolean>;
+	/**
+	 * Ends the host process of a session this gateway created and has retired.
+	 * Ownership is the point: the shared GJC daemon and broker are never touched,
+	 * only a `session-host-internal` whose pid the broker reports for THIS
+	 * session id. Returns what it did so the caller can log it; never throws.
+	 */
+	terminateHost?(input: { sessionId: string; repo: string }): Promise<TerminateHostOutcome>;
 	/** Recognized current-session provider failure, never authorization to replay an operation. */
 	failedTurnEvidence?(input: FailedTurnEvidenceInput): Promise<FailedTurnEvidence | undefined>;
 	/** Restores a saved, non-deleted session through `session.resume`; it never creates a replacement. */
@@ -494,6 +507,58 @@ export class BrokerSessionPort implements SessionPort {
 	async inspect(input: { sessionId: string; repo: string }): Promise<BrokerSession | undefined> {
 		this.#assertOwned(input);
 		return await this.#safe(async () => await inspectSession(this.#controller(input.repo), input.sessionId));
+	}
+
+	/**
+	 * A retired session's host is this gateway's to end: the gateway created the
+	 * session, rebound away from it, and nothing else will ever prompt it again.
+	 * Left alone, every `/new`, `/reset` and session-gone rebind leaked one live
+	 * `session-host-internal` that kept polling the model provider (live,
+	 * 2026-09-18: 5 orphaned hosts of 31 live sessions sharing one API key,
+	 * every turn queued behind them). The SDK offers no close op
+	 * (`session.close` is prohibited through the session CLI), so the pid the
+	 * broker reports for the session is signalled directly - after proving it is
+	 * a session host and not the shared daemon/broker.
+	 */
+	async terminateHost(input: { sessionId: string; repo: string }): Promise<TerminateHostOutcome> {
+		this.#assertOwned(input);
+		let pid: number | undefined;
+		let live: boolean | undefined;
+		try {
+			const result = await this.#cli(["sdk", "session", "inspect", input.sessionId, "--repo", input.repo], {
+				timeoutMs: 10_000,
+			});
+			const envelope = JSON.parse(result.stdout) as {
+				ok?: unknown;
+				result?: { session?: { pid?: unknown; live?: unknown } };
+			};
+			if (envelope.ok !== true) return { outcome: "already_gone" };
+			const session = envelope.result?.session;
+			pid =
+				typeof session?.pid === "number" && Number.isSafeInteger(session.pid) && session.pid > 1
+					? session.pid
+					: undefined;
+			live = typeof session?.live === "boolean" ? session.live : undefined;
+		} catch (error) {
+			if (error instanceof BrokerAuthorityError) throw error;
+			return sdkErrorCode(error) === "session_unavailable"
+				? { outcome: "already_gone" }
+				: { outcome: "refused", reason: `inspect_failed:${sanitizeDiagnostic(String(error))}` };
+		}
+		if (pid === undefined || live === false) return { outcome: "already_gone" };
+		const command = await processCommand(pid);
+		if (command === undefined) return { outcome: "already_gone" };
+		// The only process shape this gateway may end. Broker (`broker-internal`),
+		// daemon (`daemon-internal`) and anything else are someone else's.
+		if (!/\bsdk session-host-internal\b/.test(command) || /\b(broker|daemon)-internal\b/.test(command))
+			return { outcome: "not_a_host", pid, command: command.slice(0, 160) };
+		try {
+			process.kill(pid, "SIGTERM");
+		} catch (error) {
+			if ((error as NodeJS.ErrnoException).code === "ESRCH") return { outcome: "already_gone" };
+			return { outcome: "refused", reason: `kill_failed:${(error as NodeJS.ErrnoException).code ?? "unknown"}` };
+		}
+		return { outcome: "terminated", pid };
 	}
 
 	async resume(input: { sessionId: string; repo: string; originKey: string; epoch: number }): Promise<SessionBinding> {
@@ -1209,6 +1274,18 @@ function normalizeSdkEnvelopeFailure(result: CliResult): CliResult {
 		// A process failure without a complete JSON error envelope remains one.
 	}
 	return result;
+}
+
+/** The command line of a live pid, or undefined when it is gone. `ps` is the portable read on macOS and Linux. */
+async function processCommand(pid: number): Promise<string | undefined> {
+	try {
+		const proc = Bun.spawn(["ps", "-o", "command=", "-p", String(pid)], { stdout: "pipe", stderr: "ignore" });
+		const out = (await new Response(proc.stdout).text()).trim();
+		await proc.exited;
+		return out.length > 0 ? out : undefined;
+	} catch {
+		return undefined;
+	}
 }
 
 function sdkErrorCode(error: unknown): string | undefined {

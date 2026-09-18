@@ -520,6 +520,10 @@ class OriginActor {
 
 	async reset(originRefJson: string, floorAt: string): Promise<void> {
 		const previous = this.#current;
+		// The binding being rotated away from. Read before bumpEpoch clears it: if
+		// no turn is in flight nothing will ever reconcile this session, so its host
+		// would live on idle forever unless ended here.
+		const previousSessionId = previous?.sessionId ?? this.#manager.database.getSessionRecord(this.originKey)?.sessionId;
 		let nextEpoch = 0;
 		let discarded: string[] = [];
 		this.#manager.database.withTransaction(() => {
@@ -551,6 +555,10 @@ class OriginActor {
 		}
 		this.#state = "idle";
 		this.#manager.log(`persona_new origin=${this.originKey} epoch=${nextEpoch} discarded_pending=${discarded.length}`);
+		// With a retired turn still pending, its reconcile ends the host once the
+		// answer is settled; #terminateRetiredSession sees it in #retired and waits.
+		// With nothing in flight, this is the only place that will ever do it.
+		if (previousSessionId) await this.#terminateRetiredSession(previousSessionId, "reset");
 		await this.#dispatchNext();
 	}
 
@@ -1114,6 +1122,9 @@ class OriginActor {
 				this.#manager.log(
 					`persona_send_session_gone origin=${this.originKey} epoch=${epoch} nextEpoch=${nextEpoch} opRef=${opRef} attempt=${attempts}`,
 				);
+				// The broker disowned it, but the host process may still be running
+				// (observed: fc41da9b, disowned yet live for hours). End it.
+				await this.#terminateRetiredSession(current.sessionId, "session_gone");
 				if (attempts < MAX_SEND_REBIND_ATTEMPTS) await this.#dispatchNext();
 				else {
 					if (attempts === MAX_SEND_REBIND_ATTEMPTS)
@@ -1808,6 +1819,7 @@ class OriginActor {
 		if (bound.retired) {
 			this.#retired.delete(retiredKey(bound));
 			this.#clearRetiredReattach(bound);
+			await this.#terminateRetiredSession(bound.sessionId, "retired_turn_reconciled");
 			return;
 		}
 		if (this.#current === bound) {
@@ -1833,6 +1845,7 @@ class OriginActor {
 		if (bound.retired) {
 			this.#retired.delete(retiredKey(bound));
 			this.#clearRetiredReattach(bound);
+			await this.#terminateRetiredSession(bound.sessionId, "retired_turn_unlanded");
 		} else if (this.#current === bound) {
 			this.#current = undefined;
 			this.#state = "idle";
@@ -1904,6 +1917,36 @@ class OriginActor {
 		const timer = this.#retiredReattachTimers.get(key);
 		if (timer !== undefined) this.#manager.cancel(timer);
 		this.#retiredReattachTimers.delete(key);
+	}
+
+	/**
+	 * A retired turn has just been reconciled (answer delivered, failed, or
+	 * provably never landed) and dropped from `#retired`. Nothing will prompt
+	 * its session again: this origin is bound to a newer epoch. End the host so
+	 * it stops occupying the model provider. Skipped when the session is still
+	 * the live binding (same epoch reused) or some other retired turn on this
+	 * origin still needs it; best-effort, logged, never fatal.
+	 */
+	async #terminateRetiredSession(sessionId: string, reason: string): Promise<void> {
+		const port = this.#manager.port;
+		if (!port.terminateHost) return;
+		if (this.#current?.sessionId === sessionId) return;
+		if (this.#manager.database.getSessionRecord(this.originKey)?.sessionId === sessionId) return;
+		for (const other of this.#retired.values()) if (other.sessionId === sessionId) return;
+		try {
+			const result = await port.terminateHost({ sessionId, repo: this.#manager.repo });
+			this.#manager.log(
+				`retired_session_host origin=${this.originKey} session=${sessionId} reason=${reason} outcome=${result.outcome}${
+					"pid" in result ? ` pid=${result.pid}` : ""
+				}${result.outcome === "refused" ? ` detail=${result.reason}` : ""}${
+					result.outcome === "not_a_host" ? ` command=${JSON.stringify(result.command)}` : ""
+				}`,
+			);
+		} catch (error) {
+			this.#manager.log(
+				`retired_session_host origin=${this.originKey} session=${sessionId} reason=${reason} outcome=error detail=${safeDiagnostic(error)}`,
+			);
+		}
 	}
 
 	#dispatchFloorMs(opRef: string): number | undefined {
