@@ -1,0 +1,13 @@
+{
+	"name": "@gajaeway/log",
+	"version": "0.1.0",
+	"private": true,
+	"type": "module",
+	"description": "Structured service log sink: per-line UTC timestamps, size-bounded rotation, repeated-event collapsing, liveness heartbeat.",
+	"exports": {
+		".": "./src/index.ts"
+	},
+	"scripts": {
+		"test": "bun test"
+	}
+}

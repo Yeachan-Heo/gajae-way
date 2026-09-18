@@ -7,9 +7,10 @@ import { join, relative } from "node:path";
  *
  * Every SDK-consumer package (owner CLI, platform adapters) must be
  * implementable by a third party: it may import ONLY the public packages
- * (@gajaeway/sdk, @gajaeway/protocol), Bun/node builtins, its own files, and
- * its declared platform library. Any import that reaches into the gateway's
- * internals (or the legacy tree) is a privileged import and fails this test.
+ * (@gajaeway/sdk, @gajaeway/protocol, @gajaeway/log), Bun/node builtins, its
+ * own files, and its declared platform library. Any import that reaches into
+ * the gateway's internals (or the legacy tree) is a privileged import and
+ * fails this test.
  */
 
 const ROOT = join(import.meta.dir, "..", "..", "..");
@@ -24,7 +25,10 @@ const CONSUMER_PACKAGES: Record<string, readonly string[]> = {
 	"packages/adapter-slack": [],
 };
 
-const PUBLIC_IMPORTS = ["@gajaeway/sdk", "@gajaeway/protocol"];
+// @gajaeway/log is public for the same reason as the protocol: it is an
+// unprivileged, dependency-free service sink (console + fs only) that a
+// third-party adapter needs in order to produce windowable logs at all.
+const PUBLIC_IMPORTS = ["@gajaeway/sdk", "@gajaeway/protocol", "@gajaeway/log"];
 
 const FORBIDDEN_PREFIXES = [
 	"@gajaeway/gateway",

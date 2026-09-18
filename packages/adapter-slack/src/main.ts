@@ -1,4 +1,5 @@
 import { join } from "node:path";
+import { installStructuredLogging } from "@gajaeway/log";
 import type {
 	ChannelEngagementPolicy,
 	ChatMessagePayload,
@@ -1211,17 +1212,23 @@ if (import.meta.main) {
 		console.error(argv.message);
 		process.exit(USAGE_EXIT_CODE);
 	} else {
+		const disposeLogging = installStructuredLogging({ path: join(adapterHome(), "adapter-slack.log") });
 		// Refuse a second instance before config or connections can affect the resident one.
 		AdapterLock.acquire(adapterHome())
 			.then(async (lock) => {
 				// Signal handlers suppress default termination, so release and exit explicitly.
-				const release = (): void => void lock.release().finally(() => process.exit(0));
+				const release = (): void =>
+					void lock.release().finally(() => {
+						disposeLogging();
+						process.exit(0);
+					});
 				process.once("SIGINT", release);
 				process.once("SIGTERM", release);
 				await startSlackAdapter(await loadSlackAdapterConfig());
 			})
 			.catch((error) => {
 				console.error(`Slack adapter startup failed: ${errorText(error)}`);
+				disposeLogging();
 				process.exitCode = error instanceof AdapterAlreadyRunningError ? USAGE_EXIT_CODE : 1;
 			});
 	}

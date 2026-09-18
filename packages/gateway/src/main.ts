@@ -1,4 +1,7 @@
+import { join } from "node:path";
+import { installStructuredLogging } from "@gajaeway/log";
 import { bootGateway } from "./boot";
+import { gatewayHome } from "./config";
 import { checkConfigFile, configCheckExitCode, defaultConfigPath, renderConfigCheck } from "./config-check";
 import { installExitReporter } from "./exit-report";
 import { sanitizeDiagnostic } from "./orchestrator/rebind";
@@ -14,6 +17,9 @@ if (command === "config" && args[0] === "check") {
 	console.error("usage: gajaeway-gateway daemon [--stdio] [--only-new] | config check [path]");
 	process.exitCode = 2;
 } else {
+	const disposeLogging = installStructuredLogging({
+		path: join(gatewayHome(), "gateway.log"),
+	});
 	// A refused config must exit with the reason, not an unhandled rejection
 	// stack: under a launchd KeepAlive an unreadable config would otherwise be a
 	// silent crash-loop.
@@ -27,7 +33,7 @@ if (command === "config" && args[0] === "check") {
 		const server = await bootGateway({ stdio: args.includes("--stdio"), onlyNew: args.includes("--only-new") });
 		const shutdown = (signal: NodeJS.Signals) => {
 			reporter.report("signal", signal, 0);
-			void server.stop("signal received");
+			void server.stop("signal received").finally(disposeLogging);
 		};
 		process.once("SIGINT", () => shutdown("SIGINT"));
 		process.once("SIGTERM", () => shutdown("SIGTERM"));
@@ -37,6 +43,7 @@ if (command === "config" && args[0] === "check") {
 			sanitizeDiagnostic(error instanceof Error ? error.message : String(error)) || "unknown_error",
 			1,
 		);
+		disposeLogging();
 		process.exit(1);
 	}
 }
