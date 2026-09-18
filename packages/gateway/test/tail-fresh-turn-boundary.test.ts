@@ -40,7 +40,23 @@ test("fresh-turn boundary discards historical turn_stream finals but preserves a
 				}),
 				stderr: "",
 			};
-		if (calls === 2) {
+		// beginTurn reads the ring's end with one bounded poll before it snapshots
+		// the turn floor; it must not be the one this test holds back.
+		if (calls === 2)
+			return {
+				exitCode: 0,
+				stdout: JSON.stringify({
+					ok: true,
+					result: {
+						items: [],
+						checkpoint: { revision: 1, generation: 1, seq: 1, idle: true },
+						cursor: "start-cursor",
+						terminal: true,
+					},
+				}),
+				stderr: "",
+			};
+		if (calls === 3) {
 			await currentMayArrive.wait;
 			return {
 				exitCode: 0,
@@ -73,7 +89,7 @@ test("fresh-turn boundary discards historical turn_stream finals but preserves a
 		currentMayArrive.release();
 		await eventually(() => delivered.length === 1, "current final was not delivered");
 		expect(delivered).toEqual(["current answer"]);
-		expect(cursors).toEqual(["old-cursor", "new-cursor"]);
+		expect(cursors).toEqual(["start-cursor", "new-cursor"]);
 	} finally {
 		await tail.close();
 	}
