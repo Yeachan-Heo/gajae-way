@@ -1293,7 +1293,11 @@ test("a rejected engagement.reaction is logged, never a reconnect (live: 313 rec
 		const failed = () => logs.some((line) => line.includes("engagement.reaction failed: unhealthy_failed_closed"));
 		for (let attempt = 0; attempt < 200 && !failed(); attempt++) await settle(5);
 		expect(failed()).toBe(true);
-		expect(reconnects.filter((line) => line.includes("reconnecting"))).toEqual([]);
+		// Only THIS adapter's reconnects count. console.log is process-global and
+		// the Slack adapter's unref'd 30 s monitor timer, left by an earlier test
+		// file in the same run, can fire into this window (CI, linux-x64:
+		// "Slack adapter gateway reconnecting in 36661ms.").
+		expect(reconnects.filter((line) => /^Discord .*reconnecting/.test(line))).toEqual([]);
 	} finally {
 		console.error = original;
 		console.log = originalLog;
