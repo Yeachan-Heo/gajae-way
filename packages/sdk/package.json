@@ -1,6 +1,6 @@
 {
 	"name": "@gajae-gateway/sdk",
-	"version": "0.1.0",
+	"version": "0.1.1",
 	"type": "module",
 	"description": "Client SDK for the gajaeway gateway's Unix-domain socket or stdio transport.",
 	"license": "AGPL-3.0-only",

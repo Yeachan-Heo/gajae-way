@@ -1,15 +1,19 @@
-gajae-way npm publish + clean-install verification (real registry)
-Generated: 2026-09-18T06:26:55Z
+gajae-way npm publish + clean-install verification (real registry, v0.1.1)
+Generated: 2026-09-18T06:39:50Z
 node v26.4.0 / npm 11.17.0 / bun 1.4.0
 
 === Published packages (registry.npmjs.org) ===
-@gajae-gateway/protocol ['0.1.0']
-@gajae-gateway/sdk ['0.1.0']
-@gajae-gateway/cli ['0.1.0']
+@gajae-gateway/protocol ['0.1.0', '0.1.1']
+@gajae-gateway/sdk ['0.1.0', '0.1.1']
+@gajae-gateway/cli ['0.1.0', '0.1.1']
 
-=== $ npm install @gajae-gateway/protocol @gajae-gateway/sdk @gajae-gateway/cli (clean /tmp project, real registry, no local tarballs) ===
+Note: 0.1.1 supersedes 0.1.0, which shipped 'types' pointing at ./dist/*.d.ts
+(an unbuilt dist made tsc --noEmit fail for workspace/source consumers). 0.1.1
+points 'types' at the real ./src/*.ts entry, matching upstream commit d3a6ce7.
 
-up to date in 95ms
+=== $ npm install @gajae-gateway/protocol@0.1.1 @gajae-gateway/sdk@0.1.1 @gajae-gateway/cli@0.1.1 (clean /tmp project, real registry) ===
+
+up to date in 94ms
 
 === $ node --input-type=module -e "import('@gajae-gateway/sdk')..." ===
 SDK OK ["GajaewayClient","LOOPBACK_ORIGIN"]
@@ -26,3 +30,6 @@ exit code: 0
 === $ node_modules/.bin/gajaeway --help ===
 usage: gajaeway [--socket PATH] status|shutdown|chat|daemon run|sessions list [--json] [--fields a,b,c] [--limit N] [--offset N]|sessions inspect <originKey-or-index>|memory audit|memory search <query>|monitors ...|work run|start <name> [--cwd DIR] [--resume] [--model ID|--preset NAME] [--notify originKey (start only)] <text>|work status <name>|work steer <name> <text>|work retire <name>|work jobs|ops backup <path>|ops cycle [--json]|ops integrity|ops restore <backupPath>|services install|repair --bin-dir DIR [--launch-agents-dir DIR] (work run waits for a response; caller timeout does not end the attempt)
 exit code: 2 (2 is expected: --help is not a recognized subcommand)
+
+=== $ cat node_modules/@gajae-gateway/protocol/package.json | python3 -c "...['types']" ===
+./src/index.ts

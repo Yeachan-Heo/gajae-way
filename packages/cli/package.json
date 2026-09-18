@@ -1,6 +1,6 @@
 {
 	"name": "@gajae-gateway/cli",
-	"version": "0.1.0",
+	"version": "0.1.1",
 	"type": "module",
 	"description": "Owner CLI for the gajaeway gateway: status, sessions, chat, monitors, and worker lanes over the gateway socket. Requires the Bun runtime (uses Bun.file/Bun.spawn).",
 	"license": "AGPL-3.0-only",
