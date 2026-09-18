@@ -55,6 +55,7 @@ import {
 	type PersonaTailFrameInput,
 	type PersonaTerminalInput,
 	type PersonaTurnLifecycle,
+	type PersonaTurnSettledInput,
 	type PersonaTurnStartInput,
 } from "../orchestrator/persona-session";
 import { formatFailureNotice, sanitizeDiagnostic } from "../orchestrator/rebind";
@@ -417,6 +418,7 @@ function createRuntime(options: GatewayServerOptions): Runtime {
 	const connections = new Set<Connection>();
 	const inbound = new Map<string, InboundContext>();
 	const delivery = new DeliveryService(new DeliveryLedger(options.database));
+	const botAudienceTurns = new BotAudienceTurnGuard(options.database);
 	const registry = new MonitorRegistry(options.database);
 	const memory = new MemoryClosureQueue(options.database, options.config.home);
 	let runtime!: Runtime;
@@ -555,7 +557,7 @@ function createRuntime(options: GatewayServerOptions): Runtime {
 		contextMaintenanceTimer,
 		...(stopBrokerGenerationListener ? { stopBrokerGenerationListener } : {}),
 		reactions: new ReactionBudget(),
-		botAudienceTurns: new BotAudienceTurnGuard(),
+		botAudienceTurns,
 		cycle: new RuntimeCycleProjector(options.database, memory, { maxLanes: lanes.maxLanes }),
 		lanes,
 		work,
@@ -652,6 +654,7 @@ async function handleRequest(
 					sessions: { active: options.database.activeSessionCount },
 					delivery: runtime.delivery.status(),
 					contextDiff: options.database.contextDiagnostics(),
+					engagement: { botAudienceDeclines: runtime.botAudienceTurns.botAudienceDeclines() },
 				},
 			});
 			return;
@@ -1247,16 +1250,21 @@ async function sendChat(
 			typeof params.engagement.authorId !== "string")
 	)
 		throw new ProtocolError("invalid_params", "non-loopback chat.send requires engagement");
-	const engagementDecision = decideEngagement(
-		origin,
-		params.engagement as never,
-		runtime.config,
-		threadFollowUpEngaged(origin, key, options.database),
-	);
+	const threadFollowUp = origin.kind === "thread" && threadFollowUpEngaged(origin, key, options.database);
+	const engagementDecision = decideEngagement(origin, params.engagement as never, runtime.config, threadFollowUp);
 	const authorIsBot = (params.engagement as { authorIsBot?: unknown } | undefined)?.authorIsBot === true;
 	if (!authorIsBot) runtime.botAudienceTurns.recordHumanMessage(key);
-	const engaged =
-		engagementDecision.engaged && (!engagementDecision.botAudienceAdmission || runtime.botAudienceTurns.canAdmit(key));
+	const engagement = params.engagement as { mentioned?: boolean; authorId?: string; authorName?: unknown } | undefined;
+	const botAudienceGuardSpent = engagementDecision.botAudienceAdmission && !runtime.botAudienceTurns.canAdmit(key);
+	const addressedBotAudienceDecline =
+		botAudienceGuardSpent && authorIsBot && (engagement?.mentioned === true || threadFollowUp);
+	if (addressedBotAudienceDecline) {
+		runtime.botAudienceTurns.recordBotAudienceDecline();
+		console.error(
+			`gateway bot audience admission declined origin=${key} message=${typeof params.messageId === "string" ? params.messageId : "unidentified"} reason=budget_spent declines=${runtime.botAudienceTurns.botAudienceDeclines()}`,
+		);
+	}
+	const engaged = engagementDecision.engaged && !botAudienceGuardSpent;
 	const inboundMessageId = typeof params.messageId === "string" && params.messageId ? params.messageId : undefined;
 	const receivedAt = parseReceivedAt(params.receivedAt);
 	// Declined messages are still context, never commands (protocol contract): every
@@ -1303,7 +1311,7 @@ async function sendChat(
 		});
 		return;
 	}
-	if (engagementDecision.botAudienceAdmission) runtime.botAudienceTurns.recordBotAdmission(key);
+	if (engagementDecision.botAudienceAdmission) runtime.botAudienceTurns.recordBotAdmission(key, messageId);
 	runtime.inbound.set(messageId, {
 		turnId,
 		requestId: request.id,
@@ -1389,18 +1397,19 @@ async function editChat(
 	}
 	// The recorded body now says what the message says now.
 	options.database.contextUpdateBody(key, params.messageId, params.text);
-	const engagementDecision = decideEngagement(
-		origin,
-		params.engagement as never,
-		runtime.config,
-		threadFollowUpEngaged(origin, key, options.database),
-	);
+	const threadFollowUp = origin.kind === "thread" && threadFollowUpEngaged(origin, key, options.database);
+	const engagementDecision = decideEngagement(origin, params.engagement as never, runtime.config, threadFollowUp);
 	const authorIsBot = (params.engagement as { authorIsBot?: unknown } | undefined)?.authorIsBot === true;
 	if (!authorIsBot) runtime.botAudienceTurns.recordHumanMessage(key);
-	if (
-		!engagementDecision.engaged ||
-		(engagementDecision.botAudienceAdmission && !runtime.botAudienceTurns.canAdmit(key))
-	) {
+	const engagement = params.engagement as { mentioned?: boolean } | undefined;
+	const botAudienceGuardSpent = engagementDecision.botAudienceAdmission && !runtime.botAudienceTurns.canAdmit(key);
+	if (botAudienceGuardSpent && authorIsBot && (engagement?.mentioned === true || threadFollowUp)) {
+		runtime.botAudienceTurns.recordBotAudienceDecline();
+		console.error(
+			`gateway bot audience admission declined origin=${key} message=${params.messageId} reason=budget_spent declines=${runtime.botAudienceTurns.botAudienceDeclines()}`,
+		);
+	}
+	if (!engagementDecision.engaged || botAudienceGuardSpent) {
 		declined();
 		return;
 	}
@@ -1419,7 +1428,7 @@ async function editChat(
 		connection.write({ v: PROFILE_VERSION, type: "response", id: request.id, result: { turnId: null, engaged: true } });
 		return;
 	}
-	if (engagementDecision.botAudienceAdmission) runtime.botAudienceTurns.recordBotAdmission(key);
+	if (engagementDecision.botAudienceAdmission) runtime.botAudienceTurns.recordBotAdmission(key, messageId);
 	runtime.inbound.set(messageId, { turnId, requestId: request.id, connection });
 	connection.write({ v: PROFILE_VERSION, type: "response", id: request.id, result: { turnId, engaged: true } });
 	await runtime.personaSessions.notifyInbound(key);
@@ -1446,6 +1455,7 @@ async function createInboundTurnLifecycle(
 				mentioned?: boolean;
 				group?: boolean;
 				authorId?: string;
+				authorIsBot?: boolean;
 				authorName?: string;
 				authorHandle?: string;
 				authorServerTag?: string;
@@ -1847,6 +1857,14 @@ async function createInboundTurnLifecycle(
 			endProgress();
 		}
 	};
+	const onSettled = ({ terminalDeliveryId }: PersonaTurnSettledInput) => {
+		if (engagement?.authorIsBot !== true || terminalDeliveryId !== null) return;
+		// A delivered `[turn failed]` notice is a diagnostic, not an answer: it is
+		// deliberately emitted under a different delivery/turn identity, so it does
+		// not claim this trigger's terminal reply slot. Refund from the durable slot
+		// state rather than from the diagnostic text.
+		runtime.botAudienceTurns.releaseUnansweredAdmission(key, input.turn.triggerMessageId);
+	};
 
 	return {
 		text: turnText,
@@ -1859,6 +1877,7 @@ async function createInboundTurnLifecycle(
 		onFrame,
 		onTerminal,
 		onFailure,
+		onSettled,
 		// Neither path ever reaches onTerminal/onFailure for THIS lifecycle: a
 		// `/new` retire fences the answer, a release re-dispatches the trigger
 		// under a new lifecycle. Without the final tick the 10s heartbeat kept
