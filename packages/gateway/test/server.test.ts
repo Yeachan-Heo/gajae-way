@@ -193,6 +193,128 @@ test("unauthorized direct messages cannot invoke /new or /model", async () => {
 	client.close();
 });
 
+test("a mention-less /new inside an engaged thread is authorised", async () => {
+	directory = await mkdtemp(join(tmpdir(), "gajaeway-server-command-thread-follow-up-"));
+	const config: GatewayConfig = {
+		schemaVersion: 1,
+		home: directory,
+		configPath: join(directory, "config.json"),
+		socketPath: join(directory, "gateway.sock"),
+		dbPath: join(directory, "gateway.db"),
+		logVerbosity: "info",
+		dmPolicy: "open" as const,
+		channels: { "slack:C1": { engagement: "mention-open" } },
+	};
+	const database = await GatewayDatabase.open(config.dbPath);
+	const sessionPort = new ScriptedSessionPort({ onBind: (input) => bindWorkFixture(input.originKey, input.epoch) });
+	attachTestBrokerOwnership(database, sessionPort, join(directory, "agent"));
+	const origin = {
+		platform: "slack" as const,
+		kind: "thread" as const,
+		conversationId: "C1:1700000000.000100",
+		parentId: "C1",
+	};
+	const originKey = "slack/thread/C1:1700000000.000100/parent=C1";
+	database.inboundEnqueue({
+		messageId: "thread-opening",
+		originKey,
+		originRefJson: JSON.stringify(origin),
+		body: "@persona start",
+	});
+	database.inboundBindTurn({
+		messageId: "thread-opening",
+		originKey,
+		epoch: 0,
+		opRef: "thread-opening-op",
+		sessionId: "thread-opening-session",
+	});
+	database.inboundTurnAccept("thread-opening-op");
+	expect(database.inboundTurnComplete("thread-opening-op")).toBe(1);
+	server = await startUnixServer({ config, database, sessionPort, onStop: () => database.close() });
+	const client = await connect(config.socketPath);
+	client.send({ v: "0.1", type: "hello", payload: { supportedVersions: ["0.1"] } });
+	await waitFor(client.frames, 1);
+	client.send({
+		v: "0.1",
+		type: "request",
+		id: "thread-new",
+		verb: "chat.send",
+		params: {
+			origin,
+			text: "/new",
+			engagement: { mentioned: false, group: true, authorId: "stranger" },
+		},
+	});
+	await waitFrame(client.frames, "thread-new");
+	expect(client.frames.find((frame) => frame.id === "thread-new")).toMatchObject({
+		type: "response",
+		result: { engaged: true },
+	});
+	client.close();
+});
+
+test("a mention-less /new at the channel root remains refused", async () => {
+	directory = await mkdtemp(join(tmpdir(), "gajaeway-server-command-channel-root-"));
+	const config: GatewayConfig = {
+		schemaVersion: 1,
+		home: directory,
+		configPath: join(directory, "config.json"),
+		socketPath: join(directory, "gateway.sock"),
+		dbPath: join(directory, "gateway.db"),
+		logVerbosity: "info",
+		dmPolicy: "open" as const,
+		mentionAllowlist: ["owner"],
+		channels: {
+			"slack:C1": { engagement: "mention-open" },
+			"slack:C2": { engagement: "closed" },
+		},
+	};
+	const database = await GatewayDatabase.open(config.dbPath);
+	const sessionPort = new ScriptedSessionPort({ onBind: (input) => bindWorkFixture(input.originKey, input.epoch) });
+	attachTestBrokerOwnership(database, sessionPort, join(directory, "agent"));
+	server = await startUnixServer({ config, database, sessionPort, onStop: () => database.close() });
+	const client = await connect(config.socketPath);
+	const origin = { platform: "slack" as const, kind: "channel" as const, conversationId: "C1" };
+	client.send({ v: "0.1", type: "hello", payload: { supportedVersions: ["0.1"] } });
+	await waitFor(client.frames, 1);
+	client.send({
+		v: "0.1",
+		type: "request",
+		id: "channel-new",
+		verb: "chat.send",
+		params: {
+			origin,
+			text: "/new",
+			engagement: { mentioned: false, group: true, authorId: "stranger" },
+		},
+	});
+	await waitFrame(client.frames, "channel-new");
+	expect(client.frames.find((frame) => frame.id === "channel-new")).toMatchObject({
+		type: "response",
+		result: { turnId: null, engaged: false },
+	});
+	expect(database.getSessionRecord("slack/channel/C1")).toBeUndefined();
+	const closedOrigin = { platform: "slack" as const, kind: "channel" as const, conversationId: "C2" };
+	client.send({
+		v: "0.1",
+		type: "request",
+		id: "closed-channel-new",
+		verb: "chat.send",
+		params: {
+			origin: closedOrigin,
+			text: "/new",
+			engagement: { mentioned: false, group: true, authorId: "stranger" },
+		},
+	});
+	await waitFrame(client.frames, "closed-channel-new");
+	expect(client.frames.find((frame) => frame.id === "closed-channel-new")).toMatchObject({
+		type: "response",
+		result: { turnId: null, engaged: false },
+	});
+	expect(database.getSessionRecord("slack/channel/C2")).toBeUndefined();
+	client.close();
+});
+
 test("a failed platform turn still delivers a visible ledgered failure notice", async () => {
 	directory = await mkdtemp(join(tmpdir(), "gajaeway-server-"));
 	const config: GatewayConfig = {
