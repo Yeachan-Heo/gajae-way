@@ -551,6 +551,71 @@ test("retired exact failure never resets the replacement binding", async () => {
 	expect(database!.getSessionRecord(KEY)?.epoch).toBe(1);
 });
 
+test("/new with nothing in flight ends the previous session's host at once", async () => {
+	const port = new ScriptedSessionPort({ onBind: (input) => `session-e${input.epoch}` });
+	const logs: string[] = [];
+	await harness(port, undefined, (line) => logs.push(line));
+	enqueue("first", "first");
+	await manager!.notifyInbound(KEY);
+	port.complete(port.sends[0]!.opRef, "answered");
+	await manager!.tick(KEY);
+	expect(port.closes).toEqual([]);
+	// Idle now. /new rotates the epoch; the old host has no reason to live.
+	await manager!.reset(KEY, JSON.stringify(ORIGIN));
+	await manager!.tick(KEY);
+	// The just-completed turn is still tracked as retired at /new time, so the
+	// host is ended by that turn's reconcile rather than by reset() itself -
+	// either way, exactly once, and only after nothing can still need it.
+	expect(logs.filter((l) => l.includes("retired_session_host") && l.includes("outcome=terminated"))).toHaveLength(1);
+	expect(port.closes.map((c) => c.sessionId)).toEqual(["session-e0"]);
+	// The replacement is untouched and answers the next message.
+	enqueue("second", "second");
+	await manager!.notifyInbound(KEY);
+	expect(port.sends.at(-1)?.sessionId).toBe("session-e1");
+	expect(port.closes).toHaveLength(1);
+});
+
+test("/new with a turn in flight ends the old host only after that turn is reconciled", async () => {
+	const port = new ScriptedSessionPort({ onBind: (input) => `session-e${input.epoch}` });
+	const logs2: string[] = [];
+	await harness(port, undefined, (line) => logs2.push(line));
+	enqueue("slow", "slow");
+	await manager!.notifyInbound(KEY);
+	const first = port.sends[0]!;
+	await manager!.reset(KEY, JSON.stringify(ORIGIN));
+	await manager!.tick(KEY);
+	// The retired turn may still deliver its answer: the host must stay up for it.
+	expect(port.closes).toEqual([]);
+	port.complete(first.opRef, "late answer");
+	for (let i = 0; i < 4; i++) await manager!.tick(KEY);
+	expect(port.closes.map((c) => c.sessionId)).toEqual(["session-e0"]);
+});
+
+test("a session the broker disowned mid-send has its host ended after the rebind", async () => {
+	class DisowningPort extends ScriptedSessionPort {
+		override async send(input: Parameters<ScriptedSessionPort["send"]>[0]) {
+			if (input.sessionId === "session-e0")
+				throw Object.assign(new Error("session_unavailable"), { code: "session_unavailable" });
+			return await super.send(input);
+		}
+	}
+	const port = new DisowningPort({
+		onBind: (input) => `session-e${input.epoch}`,
+		onSend: (input, scripted) => scripted.complete(input.opRef, "answered on the replacement"),
+	});
+	const logs3: string[] = [];
+	await harness(port, undefined, (line) => logs3.push(line));
+	enqueue("gone", "gone");
+	await manager!.notifyInbound(KEY);
+	for (let i = 0; i < 4; i++) await manager!.tick(KEY);
+	expect(logs3.some((l) => l.startsWith("persona_send_session_gone"))).toBe(true);
+	expect(logs3.some((l) => l.includes("retired_session_host") && l.includes("reason=session_gone"))).toBe(true);
+	// The broker said the old session is gone; its host is ended anyway (it can
+	// be disowned and still running), and the message lands on the replacement.
+	expect(port.closes.map((c) => c.sessionId)).toContain("session-e0");
+	expect(port.sends.at(-1)?.sessionId).toBe("session-e1");
+});
+
 for (const exact of [false, true])
 	test(`recovered failed terminal grace never resends its trigger (exact=${exact})`, async () => {
 		const port = new ScriptedSessionPort({ onBind: (input) => `session-e${input.epoch}` });
