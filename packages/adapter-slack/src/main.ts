@@ -205,10 +205,6 @@ export function describeMessageEdit(
 	};
 }
 
-export function addressedTurn(engagement: Pick<EngagementContext, "group" | "mentioned">): boolean {
-	return !engagement.group || engagement.mentioned;
-}
-
 /** Bounded inbound identity memory prevents replay/reconnect duplicate turns. */
 export class LruSet {
 	readonly #values = new Map<string, undefined>();
@@ -536,7 +532,10 @@ export class ReconnectingGateway implements GatewayClientLike {
 					...(receivedAt ? { receivedAt } : {}),
 				});
 				this.#inbound.addIfAbsent(messageId);
-				if (result?.engaged && addressedTurn(engagement)) this.status?.arm(origin, messageId);
+				// The gateway already decided engagement - including un-mentioned thread
+				// follow-ups - so every accepted turn shows presence. Gating on the mention
+				// here left thread replies silent until the answer landed (live, 2026-09-17).
+				if (result?.engaged) this.status?.arm(origin, messageId);
 				return { verdict: "acked", ...(result ? { result } : {}) };
 			} catch (error) {
 				console.error(`Slack chat.send failed: ${errorText(error)}`);
@@ -597,7 +596,7 @@ export class ReconnectingGateway implements GatewayClientLike {
 					}
 					try {
 						const result = await client.request<{ engaged?: boolean } | undefined>("chat.edit", edit);
-						if (result?.engaged && addressedTurn(edit.engagement)) this.status?.arm(edit.origin, edit.messageId);
+						if (result?.engaged) this.status?.arm(edit.origin, edit.messageId);
 						// A superseding edit queued during the request must drain in this pass too.
 						if (this.#editOutbox.get(edit.messageId) === edit) this.#editOutbox.delete(edit.messageId);
 					} catch (error) {

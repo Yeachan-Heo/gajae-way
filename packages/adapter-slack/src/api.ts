@@ -285,6 +285,18 @@ export class SlackWebApi {
 		}
 	}
 
+	/**
+	 * Slack's native "<App> <status>" line under a thread. Empty `status` clears
+	 * it; Slack also clears it when the app posts a reply, and expires it after
+	 * two minutes of silence. Works on any thread the bot can post in (channel
+	 * threads and DMs both verified live, 2026-09-17) without the app being an
+	 * Agent. Cosmetic: never allowed to crowd out a reply.
+	 */
+	async setThreadStatus(channel: string, threadTs: string, status: string): Promise<void> {
+		await this.limiter?.acquire(channel, "cosmetic");
+		await this.call("assistant.threads.setStatus", { channel_id: channel, thread_ts: threadTs, status });
+	}
+
 	/** Removes our own reaction; one that is already gone counts as removed. */
 	async removeReaction(channel: string, timestamp: string, name: string): Promise<void> {
 		await this.limiter?.acquire(channel, "cosmetic");
