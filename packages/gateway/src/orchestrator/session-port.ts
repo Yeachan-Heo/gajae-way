@@ -244,6 +244,12 @@ const SESSION_CREATE_READINESS_MS = 60_000;
 const SESSION_READY_TIMEOUT_MS = 60_000;
 const SESSION_READY_POLL_MS = 250;
 const SESSION_CREATE_RETRY_MS = 1_000;
+/** Maximum poisoned-create-key epoch rotations permitted per origin. */
+export const MAX_POISONED_CREATE_ROTATIONS = 3;
+
+function createRotationMetaKey(originKey: string): string {
+	return `create_rotation:${originKey}`;
+}
 
 /**
  * Production SessionPort implementation. The broker-bound CliRunner is the sole
@@ -333,8 +339,10 @@ export class BrokerSessionPort implements SessionPort {
 				if (error instanceof BrokerAuthorityError) throw error;
 				indexed = true;
 			}
-			if (indexed)
+			if (indexed) {
+				this.#resetCreateRotations(input.originKey);
 				return { sessionId: existing.sessionId, originKey: input.originKey, epoch: input.epoch, repo: input.repo };
+			}
 			const rebound = this.#database.rebindEpoch(input.originKey);
 			console.error(
 				`session_rebound origin=${input.originKey} epoch=${input.epoch} nextEpoch=${rebound} session=${existing.sessionId} reason=not_live_or_disowned_by_broker`,
@@ -348,6 +356,14 @@ export class BrokerSessionPort implements SessionPort {
 		} catch (error) {
 			if (error instanceof BrokerAuthorityError) throw error;
 			if (input.epochRecovery === false) throw error;
+			const rotations = this.#createRotations(input.originKey);
+			if (rotations >= MAX_POISONED_CREATE_ROTATIONS) {
+				console.error(
+					`session_create_rotation_capped origin=${input.originKey} rotations=${rotations} reason=poisoned_create_key_capped`,
+				);
+				throw error;
+			}
+			this.#database.metaSet(createRotationMetaKey(input.originKey), String(rotations + 1));
 			const nextEpoch = this.#database.rebindEpoch(input.originKey);
 			console.error(
 				`session_create_epoch_rotated origin=${input.originKey} epoch=${input.epoch} nextEpoch=${nextEpoch} reason=poisoned_create_key`,
@@ -378,6 +394,7 @@ export class BrokerSessionPort implements SessionPort {
 		// a moment later. A tail/send before that answers session_unavailable, so
 		// wait until the broker reports the id live before handing the binding out.
 		await this.#awaitIndexed(created.sessionId, input.repo);
+		this.#resetCreateRotations(input.originKey);
 		return {
 			sessionId: created.sessionId,
 			originKey: input.originKey,
@@ -385,6 +402,16 @@ export class BrokerSessionPort implements SessionPort {
 			repo: input.repo,
 			...(input.model ? { startupModelApplied: true } : {}),
 		};
+	}
+
+	#createRotations(originKey: string): number {
+		const raw = this.#database.metaGet(createRotationMetaKey(originKey));
+		const value = raw === undefined ? Number.NaN : Number(raw);
+		return Number.isSafeInteger(value) && value >= 0 ? value : 0;
+	}
+
+	#resetCreateRotations(originKey: string): void {
+		this.#database.metaSet(createRotationMetaKey(originKey), "0");
 	}
 
 	#createChain: Promise<unknown> = Promise.resolve();
@@ -585,6 +612,7 @@ export class BrokerSessionPort implements SessionPort {
 			if (!resumed || resumed.deleted || !resumed.live || resumed.repo !== input.repo)
 				throw new Error(`session.resume did not restore live authority for ${input.sessionId}`);
 		}
+		this.#resetCreateRotations(input.originKey);
 		return { sessionId: input.sessionId, originKey: input.originKey, epoch: input.epoch, repo: input.repo };
 	}
 
