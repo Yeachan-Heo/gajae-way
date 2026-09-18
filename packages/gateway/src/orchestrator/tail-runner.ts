@@ -288,13 +288,13 @@ export class TailRunner {
 		this.#waiters.shift()?.();
 	}
 
-	async poll(handle: ManagedTailHandle): Promise<void> {
+	async poll(handle: ManagedTailHandle, options?: { readonly checkpointOnly?: boolean }): Promise<void> {
 		// A poll alongside a running turn is a bounded observation, not a wait:
 		// with `--until-idle` the CLI cannot exit until the turn ends, so the
 		// window is what decides how soon mid-turn rows come back. The backfill
 		// poll (no turn running) keeps the long window so a quiet session is
 		// observed cheaply.
-		const windowMs = handle.turnRunning ? SIDE_POLL_WINDOW_MS : this.#pollTimeoutMs;
+		const windowMs = handle.turnRunning || options?.checkpointOnly ? SIDE_POLL_WINDOW_MS : this.#pollTimeoutMs;
 		const args = [
 			"sdk",
 			"session",
@@ -347,7 +347,11 @@ export class TailRunner {
 				`tail_poll session=${handle.sessionId} resumed=${handle.pollCursor ? 1 : 0} after=${handle.lastTranscriptId ?? "-"} frames=${decoded.frames.length} tools=${tools} kinds=${JSON.stringify(kinds)} cursor=${decoded.cursor ? 1 : 0}`,
 			);
 		}
-		await handle.receiveBatch(decoded.frames, decoded.cursor);
+		if (decoded.checkpoint) handle.noteRingCheckpoint(decoded.checkpoint);
+		// A checkpoint-only poll (turn start) wants the mark and the cursor, not
+		// the frames: they predate the turn by construction and would only be
+		// buffered and discarded.
+		await handle.receiveBatch(options?.checkpointOnly ? [] : decoded.frames, decoded.cursor);
 		// `terminal` here is the checkpoint's idle bit at the moment the CLI took
 		// it. It is NOT evidence the turn ended: a side poll ~500 ms after send
 		// runs before the persona has begun, reads idle, and marking the handle
@@ -475,8 +479,24 @@ class ManagedTailHandle implements TailHandle {
 
 	async beginTurn(opRef: string): Promise<void> {
 		if (this.#closed || this.#accepted) return;
-		this.#acceptedOpRef = opRef;
+		// Read the ring's end NOW, not as of the last poll: between turns no poll
+		// runs, and the previous answer may have arrived on the relay (which
+		// strips positions), so #ringHigh can sit below the previous turn's
+		// finalized frame. One bounded poll; a failure leaves the last mark.
+		if (!this.#polling) {
+			this.#polling = true;
+			try {
+				await this.#runner.poll(this, { checkpointOnly: true });
+			} catch {
+				// Best-effort: the mark from the last successful poll stands.
+			} finally {
+				this.#polling = false;
+			}
+		}
 		this.#preReceipt.splice(0);
+		// Everything the ring holds right now predates the prompt about to be sent.
+		this.#turnFloor = this.#ringHigh;
+		this.#acceptedOpRef = opRef;
 		await this.#commitPendingCursor();
 	}
 	async markAccepted(opRef: string): Promise<void> {
@@ -565,7 +585,15 @@ class ManagedTailHandle implements TailHandle {
 		if (this.#closed) return;
 		this.#lastEventAt = this.#runner.now();
 		this.#stallReported = false;
+		this.#noteRingPosition(frame);
 		if (frame.idle) this.setIdle();
+		if (this.#acceptedOpRef !== undefined && frame.rawKind !== "transcript" && this.#predatesTurnFloor(frame)) {
+			if (frame.assistantText)
+				this.#input.onDiagnostic?.(
+					`tail_frame_pre_floor session=${this.sessionId} kind=${frame.rawKind} at=${frame.generation}:${frame.seq} floor=${this.#turnFloor?.generation}:${this.#turnFloor?.seq}`,
+				);
+			return;
+		}
 		if (frame.kind === "unknown" && this.#unknownDiagnostics < UNKNOWN_KIND_DIAGNOSTIC_CAP) {
 			this.#unknownDiagnostics++;
 			this.#input.onDiagnostic?.(`unknown_runtime_event session=${this.sessionId} kind=${frame.rawKind}`);
@@ -629,6 +657,51 @@ class ManagedTailHandle implements TailHandle {
 
 	/** Frame ids already handed to the actor; a backfill after a stream reopen replays history and must never re-deliver. */
 	readonly #deliveredIds = new Set<string>();
+
+	/**
+	 * Highest event-ring position (generation, seq) observed through this handle,
+	 * and the position at the moment the current turn began. A ring event at or
+	 * below the turn floor was emitted BEFORE this turn's prompt was sent: it
+	 * belongs to an earlier turn, whatever a resumed poll replays. Transcript
+	 * rows are fenced by their host timestamp in the actor; ring events (the
+	 * finalized answer, lifecycle) carry no timestamp, only a position, and a
+	 * resume that replays the ring re-delivered eight earlier turns' finalized
+	 * answers into one (live, 2026-09-18). Live: 15 messages for 4 steers, 14 of
+	 * them earlier turns' answers.
+	 */
+	#ringHigh: { generation: number; seq: number } | undefined;
+	#turnFloor: { generation: number; seq: number } | undefined;
+
+	/**
+	 * The host's checkpoint is the ring's end at poll time and is the
+	 * authoritative high-water mark. Frames alone are not enough: the relay
+	 * strips (generation, seq) from the frames it forwards, so a finalized
+	 * answer that arrived on the relay never advanced the mark, the next turn's
+	 * floor sat below it, and a resumed poll re-delivered it as this turn's
+	 * interim (live, 2026-09-18: the previous answer posted twice, 66 s apart).
+	 */
+	noteRingCheckpoint(position: { generation: number; seq: number }): void {
+		const high = this.#ringHigh;
+		if (
+			!high ||
+			position.generation > high.generation ||
+			(position.generation === high.generation && position.seq > high.seq)
+		)
+			this.#ringHigh = { generation: position.generation, seq: position.seq };
+	}
+
+	#noteRingPosition(frame: TailFrame): void {
+		if (frame.generation === undefined || frame.seq === undefined) return;
+		const high = this.#ringHigh;
+		if (!high || frame.generation > high.generation || (frame.generation === high.generation && frame.seq > high.seq))
+			this.#ringHigh = { generation: frame.generation, seq: frame.seq };
+	}
+
+	#predatesTurnFloor(frame: TailFrame): boolean {
+		const floor = this.#turnFloor;
+		if (!floor || frame.generation === undefined || frame.seq === undefined) return false;
+		return frame.generation < floor.generation || (frame.generation === floor.generation && frame.seq <= floor.seq);
+	}
 
 	async #deliver(frame: TailFrame): Promise<void> {
 		// Finalized answers are also keyed by messageRef so a backfill transcript row
@@ -803,6 +876,8 @@ class ManagedTailHandle implements TailHandle {
 type DecodedTail = {
 	readonly frames: readonly TailFrame[];
 	readonly cursor?: string;
+	/** The event-ring position the host reported as current when this poll was taken. */
+	readonly checkpoint?: { readonly generation: number; readonly seq: number };
 	/** The host rejected our checkpoint cursor; the next poll must be cursorless. */
 	readonly invalidCursor?: true;
 	readonly terminal: boolean;
@@ -859,9 +934,15 @@ function decodeTailResult(result: CliResult): DecodedTail {
 	// A non-strict reply may carry BOTH a diagnostic gap (pre-checkpoint history
 	// dropped) and the live frames after the resync point. The poll decides
 	// whether the gap is a hold (strict, checkpointed) or a diagnostic.
+	const checkpoint = recordOf(payload.checkpoint);
+	const checkpointPosition =
+		typeof checkpoint?.generation === "number" && typeof checkpoint?.seq === "number"
+			? { generation: checkpoint.generation, seq: checkpoint.seq }
+			: undefined;
 	return {
 		frames: items.flatMap(normalizeTailFrame),
 		...(opaqueCursorOf(payload) ? { cursor: opaqueCursorOf(payload) } : {}),
+		...(checkpointPosition ? { checkpoint: checkpointPosition } : {}),
 		terminal: payload.terminal === true,
 		...(gap?.code === "retention_gap"
 			? { gap: { ...(opaqueCursorOf(payload) ? { cursor: opaqueCursorOf(payload) } : {}), resync: gap.resync } }

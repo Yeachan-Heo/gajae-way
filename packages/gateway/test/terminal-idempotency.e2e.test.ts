@@ -208,20 +208,20 @@ test("red-team I2/I5: [BREAK] parts own per-part terminal slots; a regenerated D
 	await eventually(() => messages(client).length === 3, "three parts were not delivered");
 	const rows = () => database!.deliveryRows().filter((row) => row.origin_key === "discord/channel/chan-1");
 	expect(rows().map((row) => JSON.parse(row.payload_json).text)).toEqual(["하나", "둘", "셋"]);
-	expect(rows().every((row) => row.delivery_id.startsWith("gw-t-"))).toBe(true);
-	// A second onTerminal for the SAME trigger with DIFFERENT text: the terminal
-	// id is text-independent, so every part collides with the existing slot and
-	// the ledger refuses the insert. Exercise the real ledger, not a computed id.
+	// Each part landed exactly once. The finalized text reached the gateway on
+	// the tail first, so the rows are the interim ones; the terminal path then
+	// ran and pointed every part's claim at them. Which id a part landed
+	// under is an implementation detail; the claim is the contract.
+	expect(rows()).toHaveLength(3);
+	// A second onTerminal for the SAME trigger with DIFFERENT text must post
+	// nothing: every part's slot is already owned, so a regenerated
+	// answer's claim returns the existing owner and the server skips the
+	// part. Exercise the real claim with the real op-ref.
 	for (let part = 0; part < 3; part++) {
-		const id = deterministicTerminalDeliveryId("discord/channel/chan-1", "m-b1", part);
-		expect(
-			database!.deliveryCreate({
-				id,
-				turnId: "regenerated",
-				originKey: "discord/channel/chan-1",
-				payloadJson: JSON.stringify({ text: "다른 답" }),
-			}),
-		).toBe(false);
+		const regenerated = deterministicTerminalDeliveryId("discord/channel/chan-1", "m-b1", part);
+		const owner = database!.inboundTurnClaimTerminal(send.opRef, part, regenerated);
+		expect(owner).not.toBe(regenerated);
+		expect(rows().some((row) => row.delivery_id === owner)).toBe(true);
 	}
 	expect(rows()).toHaveLength(3);
 });
@@ -308,7 +308,6 @@ test("red-team I4: two different id-less interim texts get distinct ids; the sam
 		config,
 		database,
 		sessionPort: port,
-		interimSpeech: { minGapMs: 0, maxPerTurn: 5 },
 		onStop: () => database?.close(),
 	});
 	const client = await connect(config.socketPath);

@@ -70,7 +70,7 @@ import { DeliveryLedger } from "../store/ledger";
 import { deriveActivity } from "./activity";
 import { ATTACHMENT_SCOPE_NOTICE, redactHistoricalAttachments } from "./attachment-scope";
 import { OrderedFrameWriter } from "./frame-writer";
-import { InterimSpeechGate, type InterimSpeechLimits } from "./interim-speech";
+import { InterimSpeechGate } from "./interim-speech";
 import { applyModelCommand } from "./model-command";
 import { composeSpeakerLabel, composeTurnHeader } from "./speaker";
 
@@ -131,7 +131,6 @@ export interface GatewayServerOptions {
 	/** Test seam for the persona tail stall heartbeat; production uses the 5s default. */
 	readonly stallCheckIntervalMs?: number;
 	/** Mid-work speech pacing (issue #71). */
-	readonly interimSpeech?: Partial<InterimSpeechLimits>;
 }
 interface InboundContext {
 	readonly turnId: string;
@@ -1573,14 +1572,23 @@ async function createInboundTurnLifecycle(
 	let assistantDeliveryStarted = false;
 	let reactionTokensSeen = false;
 	const maxTurnParts = 10;
-	const interimSpeech = new InterimSpeechGate(options.interimSpeech);
-	let lastDeliveredRaw: string | undefined;
+	const interimSpeech = new InterimSpeechGate();
+	/**
+	 * Raw messages whose reaction tokens have already been claimed this turn. The
+	 * terminal path re-runs over text the tail already shipped as interim (to
+	 * record the per-part terminal claim); its reactions were claimed on that
+	 * first pass and must not be claimed - or rejected as duplicates - again.
+	 */
+	const reactionsClaimedFor = new Set<string>();
 	const deliverAssistantText = (rawMessage: string, source: "interim" | "terminal") => {
 		if (!nonLoopback) return;
-		lastDeliveredRaw = rawMessage;
 		let message = rawMessage;
 		const reactionReply = parseReactionReply(message);
-		if (reactionReply) {
+		if (reactionReply && reactionsClaimedFor.has(rawMessage)) {
+			message = reactionReply.body;
+			if (!message) return;
+		} else if (reactionReply) {
+			reactionsClaimedFor.add(rawMessage);
 			reactionTokensSeen = true;
 			for (const wanted of reactionReply.reactions) {
 				if (!platformSupportsReaction(origin.platform, wanted.emojiName)) {
@@ -1749,7 +1757,7 @@ async function createInboundTurnLifecycle(
 				outputTokens: lastKnown.outputTokens + Math.ceil(frame.assistantText.length / 4),
 			};
 			try {
-				const decision = interimSpeech.admit(frame.assistantText, Date.now(), { toolCallsSoFar: lastKnown.toolCalls });
+				const decision = interimSpeech.admit(frame.assistantText);
 				if (!decision.deliver) console.error(`gateway mid-work speech suppressed (${turnId}, ${decision.reason}).`);
 				else deliverAssistantText(frame.assistantText, "interim");
 			} catch (error) {
@@ -1838,7 +1846,14 @@ async function createInboundTurnLifecycle(
 				return;
 			}
 			const capturedUser = speaker ? `${speaker} @ ${place}: ${userText}` : userText;
-			if (lastDeliveredRaw !== text) deliverAssistantText(text, "terminal");
+			// Always run the terminal path, even when the tail already shipped this
+			// exact text as an interim part. Its job here is not to re-send (the
+			// per-part claim points at the interim row and the send is skipped) but
+			// to RECORD that claim: without it a regenerated or reconciled second
+			// answer for the same trigger finds every slot unowned and posts. The
+			// former "same text → skip" shortcut left that hole whenever the
+			// finalized frame arrived on the tail before onTerminal.
+			deliverAssistantText(text, "terminal");
 			if (deliveredParts.length === 0) {
 				if (reactionTokensSeen)
 					runtime.memory.enqueue({
@@ -2014,7 +2029,7 @@ function deterministicBindHoldDeliveryId(originKey: string, triggerMessageId: st
  * tell which conversation it was in and imported other origins' memory as if
  * it had been said here).
  */
-function currentConversationNotice(origin: OriginRef): string {
+export function currentConversationNotice(origin: OriginRef): string {
 	const where =
 		origin.kind === "dm"
 			? `a PRIVATE direct-message conversation (${origin.platform} DM ${origin.conversationId}, peer ${origin.peerId})`
@@ -2033,6 +2048,15 @@ function currentConversationNotice(origin: OriginRef): string {
 		...(origin.kind !== "dm" && origin.kind !== "loopback"
 			? [
 					"To stay quiet on a message that is not for you, reply with exactly [SILENT] and nothing else — that suppresses delivery while the message stays recorded.",
+				]
+			: []),
+		// Reply-threading was implemented end to end (parser, ledger, Slack/Discord
+		// adapters) but never named in the session context, so the persona answered
+		// threaded messages at the conversation root and looked like it ignored the
+		// thread (live, slack DM, 2026-09-17).
+		...(isChatPlatform(origin.platform)
+			? [
+					"Threaded replies: start a reply part with [REPLY:<message id>] to answer that specific message; the token is routing metadata and never appears in the delivered text. Message ids are in each incoming message header (msg:<id>). When the message you are answering is itself inside a thread, target the thread's parent message id so your answer lands in that thread instead of the conversation root.",
 				]
 			: []),
 		// The third reply mode: acknowledge without speaking. Kept next to the silence

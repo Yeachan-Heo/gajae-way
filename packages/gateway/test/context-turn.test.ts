@@ -155,7 +155,11 @@ test("successful intentional silence advances the context cursor", async () => {
 	client.close();
 });
 
-test("suppressed pre-tool assistant text followed by failure keeps the selected context unread", async () => {
+test("a delivered intermediate reply followed by runtime failure consumes the selected context and posts no failure notice", async () => {
+	// The user saw an answer; the context it was written from is read, and a
+	// "[turn failed]" after a visible reply would only be noise. (Under the
+	// former mid-work gate this text was suppressed as pre-tool and the test
+	// asserted the opposite; the gate is gone - 2026-09-18.)
 	const gatewayConfig = await config();
 	const database = await GatewayDatabase.open(gatewayConfig.dbPath);
 	const sessionPort = sessionPortFromScript({
@@ -169,21 +173,14 @@ test("suppressed pre-tool assistant text followed by failure keeps the selected 
 		database.contextRecord({ messageId: "context-human", originKey: ORIGIN_KEY, body: "relevant context" });
 	});
 	send(client, "intermediate-trigger", "owner request");
-	await waitUntil(() =>
-		client.frames.some((frame) => frame.event === "chat.message" && frame.payload.text.startsWith("[turn failed]")),
-	);
-	expect(
-		database
-			.contextUnread(ORIGIN_KEY)
-			.map((row) => row.message_id)
-			.sort(),
-	).toEqual(["context-human", "intermediate-trigger"]);
+	await waitUntil(() => client.frames.some((frame) => frame.event === "chat.message"));
+	await waitUntil(() => database.contextUnread(ORIGIN_KEY).length === 0);
 	const messages = client.frames.filter((frame) => frame.event === "chat.message");
-	expect(messages.map((frame) => frame.payload.text)).toEqual(["[turn failed] runtime failed after visible reply"]);
+	expect(messages.map((frame) => frame.payload.text)).toEqual(["delivered intermediate reply"]);
 	client.close();
 });
 
-test("suppressed pre-tool reaction text followed by failure keeps the selected context unread", async () => {
+test("a delivered intermediate reaction followed by runtime failure consumes the selected context", async () => {
 	const gatewayConfig = await config();
 	const database = await GatewayDatabase.open(gatewayConfig.dbPath);
 	const sessionPort = sessionPortFromScript({
@@ -195,12 +192,11 @@ test("suppressed pre-tool reaction text followed by failure keeps the selected c
 	});
 	const { client } = await start(gatewayConfig, database, sessionPort);
 	send(client, "reaction-trigger", "owner request");
-	await waitUntil(() =>
-		client.frames.some((frame) => frame.event === "chat.message" && frame.payload.text.startsWith("[turn failed]")),
-	);
-	expect(database.contextUnread(ORIGIN_KEY).map((row) => row.message_id)).toEqual(["reaction-trigger"]);
+	await waitUntil(() => client.frames.some((frame) => frame.event === "chat.message"));
+	await waitUntil(() => database.contextUnread(ORIGIN_KEY).length === 0);
 	const messages = client.frames.filter((frame) => frame.event === "chat.message");
-	expect(messages.map((frame) => frame.payload.text)).toEqual(["[turn failed] runtime failed after visible reaction"]);
+	expect(messages).toHaveLength(1);
+	expect(messages[0]?.payload.reaction).toMatchObject({ targetMessageId: "reaction-trigger", emoji: "👍" });
 	client.close();
 });
 
@@ -353,9 +349,10 @@ test("intermediate delivery failure keeps bootstrap pending but consumes the bod
 	});
 	const { client } = await start(gatewayConfig, database, sessionPort);
 	send(client, "bootstrap-visible-fail", "body that must not replay");
-	await waitUntil(() =>
-		client.frames.some((frame) => frame.event === "chat.message" && frame.payload.text.startsWith("[turn failed]")),
-	);
+	// The visible answer ships (no mid-work gate); the failure after it posts no
+	// notice. The turn is over once the trigger row settles.
+	await waitUntil(() => client.frames.some((frame) => frame.event === "chat.message"));
+	await waitUntil(() => database.inboundPendingCount(ORIGIN_KEY) === 0);
 	expect(database.getSessionBootstrap(ORIGIN_KEY)?.lastBootstrappedEpoch).toBe(-1);
 	send(client, "bootstrap-visible-retry", "next body");
 	await waitUntil(() => attempts.length === 2);
