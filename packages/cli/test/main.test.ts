@@ -1,6 +1,6 @@
 import { Database } from "bun:sqlite";
 import { describe, expect, spyOn, test } from "bun:test";
-import { mkdtemp, readdir, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readdir, readFile, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { OpsCycleResult } from "@gajae-gateway/protocol";
@@ -15,6 +15,7 @@ import {
 	parseServicesArgs,
 	renderCycle,
 	restoreDatabase,
+	restoreTargetPath,
 	socketPath,
 	USAGE_EXIT_CODE,
 	usageFor,
@@ -386,6 +387,93 @@ describe("verifyBackupIntegrity", () => {
 	});
 });
 
+test("offline restore targets the configured dbPath, not the default gateway.db", async () => {
+	const home = await mkdtemp(join(tmpdir(), "gajaeway-cli-restore-dbpath-"));
+	const previousHome = process.env.GAJAEWAY_HOME;
+	process.env.GAJAEWAY_HOME = home;
+	try {
+		const databasePath = join(home, "custom", "live.db");
+		await mkdir(join(home, "custom"));
+		await writeFile(join(home, "config.json"), JSON.stringify({ schemaVersion: 1, dbPath: databasePath }));
+		await writeFile(databasePath, "configured database");
+		const backupPath = join(home, "backup.db");
+		writeSqlite(backupPath, "backup");
+		await restoreDatabase(join(home, "gateway.sock"), backupPath);
+		expect(await readFile(databasePath)).toEqual(await readFile(backupPath));
+		expect(await Bun.file(join(home, "gateway.db")).exists()).toBe(false);
+		const preserved = (
+			await Array.fromAsync(new Bun.Glob("live.db.pre-restore-*").scan({ cwd: join(home, "custom") }))
+		)[0];
+		expect(preserved).toBeString();
+		expect(await Bun.file(join(home, "custom", preserved as string)).text()).toBe("configured database");
+	} finally {
+		if (previousHome === undefined) delete process.env.GAJAEWAY_HOME;
+		else process.env.GAJAEWAY_HOME = previousHome;
+		await rm(home, { recursive: true, force: true });
+	}
+});
+
+describe("restoreTargetPath", () => {
+	async function withHome(run: (home: string) => Promise<void>): Promise<void> {
+		const home = await mkdtemp(join(tmpdir(), "gajaeway-cli-restore-target-"));
+		try {
+			await run(home);
+		} finally {
+			await rm(home, { recursive: true, force: true });
+		}
+	}
+
+	test("missing config.json falls back to <home>/gateway.db like gateway boot", async () => {
+		await withHome(async (home) => {
+			expect(await restoreTargetPath(home)).toBe(join(home, "gateway.db"));
+		});
+	});
+
+	test("config.json without dbPath falls back to <home>/gateway.db", async () => {
+		await withHome(async (home) => {
+			await writeFile(join(home, "config.json"), JSON.stringify({ schemaVersion: 1 }));
+			expect(await restoreTargetPath(home)).toBe(join(home, "gateway.db"));
+		});
+	});
+
+	test("malformed config.json refuses instead of guessing the default", async () => {
+		await withHome(async (home) => {
+			await writeFile(join(home, "config.json"), "{ not json");
+			await expect(restoreTargetPath(home)).rejects.toThrow(/Cannot parse .*config\.json; refusing restore/);
+		});
+	});
+
+	test("empty dbPath refuses with the gateway's non-empty-string rule", async () => {
+		await withHome(async (home) => {
+			await writeFile(join(home, "config.json"), JSON.stringify({ schemaVersion: 1, dbPath: "" }));
+			await expect(restoreTargetPath(home)).rejects.toThrow(/dbPath must be a non-empty string; refusing restore/);
+		});
+	});
+
+	test("config.json whose root is not an object refuses", async () => {
+		await withHome(async (home) => {
+			await writeFile(join(home, "config.json"), "[]");
+			await expect(restoreTargetPath(home)).rejects.toThrow(/config must be an object; refusing restore/);
+		});
+	});
+
+	test("a config.json that exists but cannot be read refuses instead of defaulting", async () => {
+		await withHome(async (home) => {
+			// A directory in place of the file: readFile fails with EISDIR, not ENOENT.
+			await mkdir(join(home, "config.json"));
+			await expect(restoreTargetPath(home)).rejects.toThrow(/Cannot read .*config\.json; refusing restore/);
+		});
+	});
+
+	test("a dangling config.json symlink is unreadable, not absent", async () => {
+		await withHome(async (home) => {
+			// readFile reports ENOENT here, exactly like a missing file; only lstat
+			// tells the two apart. The gateway refuses to boot on this layout.
+			await symlink(join(home, "moved-away.json"), join(home, "config.json"));
+			await expect(restoreTargetPath(home)).rejects.toThrow(/Cannot read .*config\.json; refusing restore/);
+		});
+	});
+});
 function cycleResult(overrides: Partial<OpsCycleResult> = {}): OpsCycleResult {
 	return {
 		phase: "idle",
