@@ -42,6 +42,22 @@ const RECLAIM_WAIT_STEP_MS = 5;
 const RECLAIM_WAIT_WINDOW_MS = RECLAIM_WAIT_ATTEMPTS * RECLAIM_WAIT_STEP_MS;
 const RECLAIM_HEARTBEAT_MS = Math.max(1, Math.floor(RECLAIM_WAIT_WINDOW_MS / 4));
 
+/**
+ * Refreshes an election's mtime so age means abandoned, not slow. The touch is
+ * ADVISORY: correctness comes from the ownership/pidfile compare-and-swap
+ * below, so a platform that rejects the call (darwin returned EINVAL under
+ * Bun) must lose availability, never an acquisition. Seconds, not Date: the
+ * numeric form is the portable one.
+ */
+async function touchElection(election: string): Promise<void> {
+	const seconds = Date.now() / 1000;
+	try {
+		await utimes(election, seconds, seconds);
+	} catch {
+		// Gone or unsupported; the inode checks decide who owns this election.
+	}
+}
+
 export class AdapterLock {
 	private constructor(
 		readonly path: string,
@@ -82,18 +98,11 @@ export class AdapterLock {
 		try {
 			for (let attempt = 0; !elected; attempt++) {
 				try {
-					await utimes(candidate, new Date(), new Date());
 					await rename(candidate, election);
-					try {
-						await utimes(election, new Date(), new Date());
-					} catch (error) {
-						if ((error as NodeJS.ErrnoException).code === "ENOENT")
-							throw new AdapterAlreadyRunningError((await readHolder(path)) ?? 0, path);
-						throw error;
-					}
+					await touchElection(election);
 					elected = true;
 					heartbeat = setInterval(() => {
-						void utimes(election, new Date(), new Date()).catch(() => {});
+						void touchElection(election);
 					}, RECLAIM_HEARTBEAT_MS);
 					heartbeat.unref?.();
 					break;
