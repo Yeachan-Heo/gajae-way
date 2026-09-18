@@ -14,6 +14,7 @@ import {
 } from "@gajaeway/subsession";
 import type { GjcModelSelection, GjcServiceTier } from "../config";
 import type { GatewayDatabase, InboundMessageRow, InboundTurn } from "../store/db";
+import { type BrokerLivenessProbe, type BrokerLivenessVerdict, describeBindHold } from "./broker-liveness";
 import type { FailedTurnEvidence } from "./failed-turn-evidence";
 import { sanitizeDiagnostic } from "./rebind";
 import type { SessionBinding, SessionPort } from "./session-port";
@@ -54,6 +55,8 @@ const DISPATCH_FAILURE_RETRY_MS = 2_000;
 const STEER_REPLAY_ATTEMPTS = 2;
 /** Bind failures back off exponentially from DISPATCH_FAILURE_RETRY_MS up to this ceiling. */
 const DISPATCH_FAILURE_RETRY_MAX_MS = 60_000;
+/** Identical bind failures before the broker's own discovery file is judged. */
+export const BIND_WEDGE_PROBE_STRIKES = 5;
 /** Consecutive recovery sweeps (60s apart) an unknown op on a live idle session is held before release. */
 const HOLD_RELEASE_SWEEPS = 2;
 
@@ -137,6 +140,14 @@ export interface PersonaTurnSettledInput extends PersonaTurnIdentity {
 	readonly terminalDeliveryId: string | null;
 }
 
+export interface PersonaBindHoldInput {
+	readonly originKey: string;
+	readonly trigger: InboundMessageRow;
+	readonly reason: string;
+	readonly notice: string;
+	readonly verdict: BrokerLivenessVerdict | undefined;
+}
+
 export interface PersonaSessionManagerOptions {
 	readonly database: GatewayDatabase;
 	readonly port: SessionPort;
@@ -177,6 +188,10 @@ export interface PersonaSessionManagerOptions {
 		row: InboundMessageRow;
 		opRef: string;
 	}) => void | Promise<void>;
+	/** Judges the SDK daemon from its discovery file after an identical bind-failure streak. */
+	readonly brokerLiveness?: BrokerLivenessProbe;
+	/** Emits a cause-bearing hold notice while the inbound trigger remains pending. */
+	readonly onBindHold?: (input: PersonaBindHoldInput) => void | Promise<void>;
 	readonly log?: (line: string) => void;
 }
 
@@ -202,6 +217,8 @@ export class PersonaSessionManager {
 	readonly #onSteerAccepted: PersonaSessionManagerOptions["onSteerAccepted"];
 	readonly #onHeldSteerAccepted: PersonaSessionManagerOptions["onHeldSteerAccepted"];
 	readonly #heldSteerContextMessageId: PersonaSessionManagerOptions["heldSteerContextMessageId"];
+	readonly #brokerLiveness: BrokerLivenessProbe | undefined;
+	readonly #onBindHold: PersonaSessionManagerOptions["onBindHold"];
 	readonly #log: (line: string) => void;
 	readonly #actors = new Map<string, OriginActor>();
 	#stopped = false;
@@ -224,6 +241,8 @@ export class PersonaSessionManager {
 		this.#onSteerAccepted = options.onSteerAccepted;
 		this.#onHeldSteerAccepted = options.onHeldSteerAccepted;
 		this.#heldSteerContextMessageId = options.heldSteerContextMessageId;
+		this.#brokerLiveness = options.brokerLiveness;
+		this.#onBindHold = options.onBindHold;
 		this.#log = options.log ?? ((line: string) => console.error(line));
 	}
 
@@ -419,6 +438,18 @@ export class PersonaSessionManager {
 		input: Parameters<NonNullable<PersonaSessionManagerOptions["onHeldSteerAccepted"]>>[0],
 	): Promise<void> {
 		await this.#onHeldSteerAccepted?.(input);
+	}
+
+	async emitBindHold(input: PersonaBindHoldInput): Promise<void> {
+		try {
+			await this.#onBindHold?.(input);
+		} catch (error) {
+			this.#log(`persona_bind_hold_notice_failed origin=${input.originKey} detail=${safeDiagnostic(error)}`);
+		}
+	}
+
+	get brokerLiveness(): BrokerLivenessProbe | undefined {
+		return this.#brokerLiveness;
 	}
 
 	log(line: string): void {
@@ -982,8 +1013,9 @@ class OriginActor {
 		let binding: SessionBinding;
 		try {
 			binding = await this.#ensureSession(epoch);
+			this.#clearBindWedgeProbe();
 		} catch (error) {
-			this.#noteBindFailure(trigger.message_id, epoch, error);
+			await this.#noteBindFailure(trigger, epoch, error);
 			return;
 		}
 		const bound = this.#manager.database.inboundBindTurn({
@@ -1102,6 +1134,7 @@ class OriginActor {
 			await tail.markAccepted(opRef);
 			this.#bindFailures = 0;
 			this.#bindEpochPoisoned = false;
+			this.#clearBindWedgeProbe();
 		} catch (error) {
 			// The Router disowning the session id is NOT ambiguous: it is proof the
 			// send never landed, so there is nothing to protect by holding. gjc is
@@ -1226,6 +1259,19 @@ class OriginActor {
 	#preSendFailures = 0;
 	/** A terminal_uncertain bind poisons this epoch's idempotency key; retries cannot make that key decidable. */
 	#bindEpochPoisoned = false;
+	#sameDetailBindFailures = 0;
+	#lastBindDetail: string | undefined;
+	#bindHoldProbed = false;
+	#bindWedged = false;
+	#lastBindHoldReason: string | undefined;
+
+	#clearBindWedgeProbe(): void {
+		this.#sameDetailBindFailures = 0;
+		this.#lastBindDetail = undefined;
+		this.#bindHoldProbed = false;
+		this.#bindWedged = false;
+		this.#lastBindHoldReason = undefined;
+	}
 
 	/**
 	 * A session could not be bound for the next turn (broker down, Router
@@ -1234,18 +1280,56 @@ class OriginActor {
 	 * the condition is logged as unrecoverable so an operator sees it - retries
 	 * continue at the ceiling because the broker may come back.
 	 */
-	#noteBindFailure(messageId: string, epoch: number, error: unknown): void {
+	async #noteBindFailure(trigger: InboundMessageRow, epoch: number, error: unknown): Promise<void> {
 		this.#bindFailures += 1;
 		const attempts = this.#bindFailures;
 		const detail = safeDiagnostic(error);
 		if (detail.includes("terminal_uncertain")) this.#bindEpochPoisoned = true;
+		if (detail === this.#lastBindDetail) this.#sameDetailBindFailures += 1;
+		else {
+			this.#lastBindDetail = detail;
+			this.#sameDetailBindFailures = 1;
+			this.#bindHoldProbed = false;
+			this.#bindWedged = false;
+			this.#lastBindHoldReason = undefined;
+		}
 		this.#manager.log(
-			`persona_bind_failed origin=${this.originKey} epoch=${epoch} message=${messageId} attempts=${attempts} detail=${detail}`,
+			`persona_bind_failed origin=${this.originKey} epoch=${epoch} message=${trigger.message_id} attempts=${attempts} detail=${detail}`,
 		);
 		if (attempts === MAX_SEND_REBIND_ATTEMPTS)
 			this.#manager.log(
-				`persona_send_unrecoverable origin=${this.originKey} message=${messageId} attempts=${attempts} reason=bind_failed`,
+				`persona_send_unrecoverable origin=${this.originKey} message=${trigger.message_id} attempts=${attempts} reason=bind_failed`,
 			);
+		if (this.#sameDetailBindFailures >= BIND_WEDGE_PROBE_STRIKES && !this.#bindHoldProbed) {
+			const probe = this.#manager.brokerLiveness;
+			if (probe) {
+				this.#bindHoldProbed = true;
+				let verdict: BrokerLivenessVerdict | undefined;
+				try {
+					verdict = await probe();
+				} catch (probeError) {
+					this.#manager.log(
+						`persona_bind_liveness_failed origin=${this.originKey} detail=${safeDiagnostic(probeError)}`,
+					);
+				}
+				const hold = describeBindHold(verdict, detail, this.#sameDetailBindFailures);
+				this.#bindWedged = verdict?.state === "wedged";
+				this.#manager.log(
+					`persona_bind_hold origin=${this.originKey} epoch=${epoch} message=${trigger.message_id} attempts=${this.#sameDetailBindFailures} reason=${hold.reason} detail=${detail}`,
+				);
+				if (hold.reason !== this.#lastBindHoldReason) {
+					this.#lastBindHoldReason = hold.reason;
+					await this.#manager.emitBindHold({ originKey: this.originKey, trigger, ...hold, verdict });
+				}
+			}
+		}
+		if (this.#bindWedged) {
+			// A dead/stale owner cannot be recovered by another poisoned epoch key.
+			// Keep the pending trigger held and retry only at the bounded ceiling.
+			this.#bindEpochPoisoned = false;
+			this.#scheduleDispatchRetry(DISPATCH_FAILURE_RETRY_MAX_MS);
+			return;
+		}
 		if (this.#bindEpochPoisoned && attempts >= MAX_SEND_REBIND_ATTEMPTS) {
 			// bind() failed BEFORE inboundBindTurn, so no prompt was sent and no
 			// operation belongs to this row. terminal_uncertain is attached to the
@@ -1255,7 +1339,7 @@ class OriginActor {
 			// pending and intact, then retry with the normal base delay.
 			const nextEpoch = this.#manager.database.rebindEpoch(this.originKey);
 			this.#manager.log(
-				`persona_bind_epoch_rotated origin=${this.originKey} epoch=${epoch} nextEpoch=${nextEpoch} message=${messageId} attempts=${attempts} reason=terminal_uncertain`,
+				`persona_bind_epoch_rotated origin=${this.originKey} epoch=${epoch} nextEpoch=${nextEpoch} message=${trigger.message_id} attempts=${attempts} reason=terminal_uncertain`,
 			);
 			this.#bindFailures = 0;
 			this.#bindEpochPoisoned = false;

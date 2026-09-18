@@ -49,6 +49,7 @@ import { RuntimeCycleProjector } from "../ops/cycle";
 import type { GlobalGjcClient } from "../orchestrator/broker";
 import { LaneGovernor } from "../orchestrator/lane-governor";
 import {
+	type PersonaBindHoldInput,
 	type PersonaFailureInput,
 	PersonaSessionManager,
 	type PersonaSteerInput,
@@ -430,6 +431,30 @@ function createRuntime(options: GatewayServerOptions): Runtime {
 		sessionModel: options.config.model,
 		stallTimeoutMs: options.config.stallTimeoutMs,
 		brokerGeneration: () => options.broker?.generation ?? 0,
+		brokerLiveness: options.broker ? () => options.broker!.judgeLiveness() : undefined,
+		onBindHold: ({ originKey, trigger, notice }: PersonaBindHoldInput) => {
+			let origin: OriginRef;
+			try {
+				origin = validateOriginRef(JSON.parse(trigger.origin_ref_json) as OriginRef);
+			} catch (error) {
+				console.error(`persona bind hold delivery skipped origin=${originKey} detail=${diagnostic(error)}`);
+				return;
+			}
+			if (origin.platform === "loopback") {
+				console.error(notice);
+				return;
+			}
+			const context = runtime.inbound.get(trigger.message_id);
+			const deliveryId = deterministicBindHoldDeliveryId(originKey, trigger.message_id);
+			const payload = runtime.delivery.prepare(
+				context?.turnId ?? crypto.randomUUID(),
+				origin,
+				notice,
+				undefined,
+				deliveryId,
+			);
+			if (payload) broadcastDelivery(runtime, payload);
+		},
 		onTurnStart: async (input) => await createInboundTurnLifecycle(input, options, runtime),
 		// A steer whose acceptance was learnt after its turn's lifecycle is gone
 		// (resolved at terminal or after a restart) is finalized exactly like a
@@ -1974,6 +1999,10 @@ function broadcastDelivery(runtime: Runtime, payload: ChatMessagePayload): void 
 	runtime.delivery.markInflight(payload.deliveryId as string);
 	for (const recipient of runtime.connections)
 		if (recipient.negotiated) recipient.write({ v: PROFILE_VERSION, type: "event", event: "chat.message", payload });
+}
+
+function deterministicBindHoldDeliveryId(originKey: string, triggerMessageId: string): string {
+	return `gw-h-${createHash("sha256").update(`${originKey}|${triggerMessageId}|bind_hold`).digest("hex").slice(0, 32)}`;
 }
 
 /**

@@ -1,24 +1,32 @@
 import { readFileSync, realpathSync } from "node:fs";
-import { readFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { basename, dirname, isAbsolute, join, normalize, resolve } from "node:path";
 import type { CliResult, CliRunner } from "@gajaeway/subsession";
+import {
+	type BrokerDiscovery,
+	type BrokerLivenessVerdict,
+	judgeBrokerLiveness,
+	type PidAliveProbe,
+	readBrokerDiscovery,
+} from "./broker-liveness";
 import { sanitizeDiagnostic } from "./rebind";
 
+export {
+	BROKER_HEARTBEAT_TTL_MS,
+	type BrokerDiscovery,
+	type BrokerLivenessVerdict,
+	describeBindHold,
+	judgeBrokerLiveness,
+	type PidAliveProbe,
+	readBrokerDiscovery,
+} from "./broker-liveness";
+
 export const MIN_GJC_VERSION = "0.15.6";
-export const BROKER_HEARTBEAT_TTL_MS = 15_000;
 const HEALTH_PROBE_SESSION_ID = "00000000-0000-4000-8000-000000000000";
 const COMMAND_TIMEOUT_MS = 30_000;
 export type SpawnFn = typeof Bun.spawn;
 export type GjcCommandRunner = CliRunner;
-export type PidAliveProbe = (pid: number) => boolean | Promise<boolean>;
 export type BrokerGenerationListener = (generation: number) => void;
-export type BrokerDiscovery = {
-	readonly pid: number;
-	readonly url: string;
-	readonly token: string;
-	readonly heartbeatAt: number;
-};
 export interface BrokerHealthContext {
 	readonly agentDir: string;
 	readonly cli: CliRunner;
@@ -72,39 +80,6 @@ export function isLoopbackWebSocketUrl(value: string): boolean {
 	} catch {
 		return false;
 	}
-}
-export async function readBrokerDiscovery(
-	discoveryPath: string,
-	isPidAlive: PidAliveProbe,
-	now = Date.now(),
-	ttlMs = BROKER_HEARTBEAT_TTL_MS,
-): Promise<BrokerDiscovery | undefined> {
-	let raw: unknown;
-	try {
-		raw = JSON.parse(await readFile(discoveryPath, "utf8"));
-	} catch {
-		return undefined;
-	}
-	if (typeof raw !== "object" || raw === null) return undefined;
-	const d = raw as Record<string, unknown>;
-	if (
-		d.protocolVersion !== 3 ||
-		d.host !== "127.0.0.1" ||
-		typeof d.url !== "string" ||
-		!isLoopbackWebSocketUrl(d.url) ||
-		typeof d.token !== "string" ||
-		!d.token ||
-		typeof d.pid !== "number" ||
-		!Number.isSafeInteger(d.pid) ||
-		d.pid <= 0 ||
-		typeof d.heartbeatAt !== "number" ||
-		!Number.isFinite(d.heartbeatAt) ||
-		now - d.heartbeatAt > ttlMs ||
-		d.heartbeatAt > now + ttlMs
-	)
-		return undefined;
-	if (!(await isPidAlive(d.pid))) return undefined;
-	return { pid: d.pid, url: d.url, token: d.token, heartbeatAt: d.heartbeatAt };
 }
 export function probeBrokerEndpoint(
 	discovery: BrokerDiscovery,
@@ -282,6 +257,10 @@ export class GlobalGjcClient {
 	}
 	get gjcVersion(): string | undefined {
 		return this.#gjcVersion;
+	}
+	/** Judges the daemon from its own discovery file, bypassing SDK transport. */
+	judgeLiveness(): Promise<BrokerLivenessVerdict> {
+		return judgeBrokerLiveness(this.discoveryPath, this.#options.isPidAlive ?? defaultPidAlive);
 	}
 	onGeneration(listener: BrokerGenerationListener): () => void {
 		this.#listeners.add(listener);
