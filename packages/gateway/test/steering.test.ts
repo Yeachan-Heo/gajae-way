@@ -2,7 +2,7 @@ import { afterEach, expect, test } from "bun:test";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { GjcCliError } from "@gajaeway/subsession";
+import { GjcCliError } from "@gajae-gateway/subsession";
 import { PersonaSessionManager } from "../src/orchestrator/persona-session";
 import { GatewayDatabase } from "../src/store/db";
 import { attachTestBrokerOwnership, ScriptedSessionPort, steerRefused } from "./session-port.fake";

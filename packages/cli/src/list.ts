@@ -1,5 +1,5 @@
-import type { MonitorRecord } from "@gajaeway/protocol";
-import { originKey } from "@gajaeway/protocol";
+import type { MonitorRecord } from "@gajae-gateway/protocol";
+import { originKey } from "@gajae-gateway/protocol";
 
 /**
  * Presentation layer for `gajaeway monitors list` / `sessions list`.

@@ -1,7 +1,7 @@
 import { chmod, mkdir, readFile, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join } from "node:path";
-import { parseRuntimeConfig, type RuntimeConfig, RuntimeConfigError } from "@gajaeway/protocol";
+import { parseRuntimeConfig, type RuntimeConfig, RuntimeConfigError } from "@gajae-gateway/protocol";
 
 const CONFIG_SCHEMA_VERSION = 1;
 

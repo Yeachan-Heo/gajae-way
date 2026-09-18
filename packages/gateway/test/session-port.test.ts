@@ -3,7 +3,7 @@ import { afterEach, expect, test } from "bun:test";
 import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { type CliRunner, GjcCliError } from "@gajaeway/subsession";
+import { type CliRunner, GjcCliError } from "@gajae-gateway/subsession";
 import { BrokerSessionPort } from "../src/orchestrator/session-port";
 import { TailRunner } from "../src/orchestrator/tail-runner";
 import { BrokerAuthorityError, GatewayDatabase } from "../src/store/db";

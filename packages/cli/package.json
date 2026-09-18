@@ -1,5 +1,5 @@
 {
-	"name": "@gajaeway/cli",
+	"name": "@gajae-gateway/cli",
 	"version": "0.1.0",
 	"type": "module",
 	"description": "Owner CLI for the gajaeway gateway: status, sessions, chat, monitors, and worker lanes over the gateway socket. Requires the Bun runtime (uses Bun.file/Bun.spawn).",
@@ -37,12 +37,12 @@
 		"access": "public"
 	},
 	"scripts": {
-		"build": "rm -rf dist && bun build src/main.ts --outdir dist --target bun --format esm --external @gajaeway/protocol --external @gajaeway/sdk && tsc -p tsconfig.build.json",
+		"build": "rm -rf dist && bun build src/main.ts --outdir dist --target bun --format esm --external @gajae-gateway/protocol --external @gajae-gateway/sdk && tsc -p tsconfig.build.json",
 		"prepublishOnly": "bun run build"
 	},
 	"dependencies": {
-		"@gajaeway/sdk": "workspace:*",
-		"@gajaeway/protocol": "workspace:*"
+		"@gajae-gateway/sdk": "workspace:*",
+		"@gajae-gateway/protocol": "workspace:*"
 	},
 	"engines": {
 		"bun": ">=1.4.0"

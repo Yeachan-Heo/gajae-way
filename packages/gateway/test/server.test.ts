@@ -2,7 +2,7 @@ import { afterEach, expect, test } from "bun:test";
 import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { MAX_STALLED_CONTINUATIONS, parseLaneJobRecord } from "@gajaeway/subsession";
+import { MAX_STALLED_CONTINUATIONS, parseLaneJobRecord } from "@gajae-gateway/subsession";
 import type { GatewayConfig } from "../src/config";
 import { memoryRoot } from "../src/memory/doctrine";
 import { deterministicTerminalDeliveryId } from "../src/orchestrator/tail-runner";

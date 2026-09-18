@@ -1,6 +1,6 @@
 import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
-import { type OriginRef, originKey } from "@gajaeway/protocol";
+import { type OriginRef, originKey } from "@gajae-gateway/protocol";
 
 interface PersistedRoute {
 	readonly chatId: string;

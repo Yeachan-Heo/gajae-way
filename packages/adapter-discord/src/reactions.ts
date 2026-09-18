@@ -1,4 +1,4 @@
-import type { ChatMessagePayload, EngagementContext, OriginRef, ReactionAction } from "@gajaeway/protocol";
+import type { ChatMessagePayload, EngagementContext, OriginRef, ReactionAction } from "@gajae-gateway/protocol";
 import { resolveDisplayName, resolveServerTag } from "./author";
 import { type DiscordClientLike, deliveryFailureIsAmbiguous, type GatewayClientLike } from "./main";
 import { type DiscordMessageOriginShape, discordMessageOrigin } from "./origin";

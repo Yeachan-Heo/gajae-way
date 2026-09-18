@@ -1,4 +1,4 @@
-import type { OriginRef } from "@gajaeway/protocol";
+import type { OriginRef } from "@gajae-gateway/protocol";
 
 export interface TelegramMessageOriginShape {
 	readonly chat: { readonly id: number | string; readonly type: string; readonly title?: string };

@@ -3,8 +3,8 @@ import { afterEach, describe, expect, test } from "bun:test";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { LOOPBACK_ORIGIN } from "@gajaeway/protocol";
-import { appendAttempt, closeAttempt, createLaneJobRecord, parseLaneJobRecord } from "@gajaeway/subsession";
+import { LOOPBACK_ORIGIN } from "@gajae-gateway/protocol";
+import { appendAttempt, closeAttempt, createLaneJobRecord, parseLaneJobRecord } from "@gajae-gateway/subsession";
 import { buildDeliveryPayload, DeliveryService } from "../src/delivery/delivery";
 import {
 	GatewayDatabase,

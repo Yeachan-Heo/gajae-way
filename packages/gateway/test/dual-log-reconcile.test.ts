@@ -2,7 +2,7 @@ import { expect, test } from "bun:test";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { eventTypeOrigin, originKey } from "@gajaeway/protocol";
+import { eventTypeOrigin, originKey } from "@gajae-gateway/protocol";
 import { DeliveryService } from "../src/delivery/delivery";
 import { MonitorPropagator } from "../src/monitors/propagate";
 import { MonitorRegistry } from "../src/monitors/registry";

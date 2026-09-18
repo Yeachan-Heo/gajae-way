@@ -2,7 +2,7 @@ import { expect, test } from "bun:test";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import type { CliRunner } from "@gajaeway/subsession";
+import type { CliRunner } from "@gajae-gateway/subsession";
 import { BrokerSessionPort } from "../src/orchestrator/session-port";
 import { TailRunner } from "../src/orchestrator/tail-runner";
 import { GatewayDatabase } from "../src/store/db";

@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import type { OriginRef } from "@gajaeway/protocol";
+import type { OriginRef } from "@gajae-gateway/protocol";
 import {
 	cronSummary,
 	formatCount,

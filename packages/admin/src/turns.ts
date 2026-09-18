@@ -13,7 +13,7 @@
  *   away from the desk.
  */
 
-import { type ChatMessagePayload, type ChatProgressPayload, isSilenceToken, type OriginRef } from "@gajaeway/protocol";
+import { type ChatMessagePayload, type ChatProgressPayload, isSilenceToken, type OriginRef } from "@gajae-gateway/protocol";
 
 /** Per-turn ceiling the gateway enforces on every `gjc` child. */
 export const TURN_CEILING_MS = 300_000;

@@ -3,7 +3,7 @@
  *
  * Every test here tries to BREAK one of the seven owner requirements through the
  * real API surface: a gateway daemon on a real unix socket with a real bun:sqlite
- * ledger, the `@gajaeway/protocol` verb catalog, and the two duck-typed platform
+ * ledger, the `@gajae-gateway/protocol` verb catalog, and the two duck-typed platform
  * adapters driven at unit level. Case ids (RT-*) are the rows of
  * artifacts/reactions-qa-api-report.json.
  *
@@ -27,7 +27,7 @@ import {
 	REACTIONS_PER_TURN_CAP,
 	resolveReactionEmoji,
 	VERBS_V01,
-} from "@gajaeway/protocol";
+} from "@gajae-gateway/protocol";
 import type { DiscordClientLike, GatewayClientLike } from "../../adapter-discord/src/main";
 import {
 	type DiscordGuildLike,

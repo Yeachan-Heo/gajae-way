@@ -1,5 +1,5 @@
 import { expect, test } from "bun:test";
-import { GjcCliError } from "@gajaeway/subsession";
+import { GjcCliError } from "@gajae-gateway/subsession";
 import { GjcCliUnavailableError } from "../src/orchestrator/broker";
 import type { WorkerOutputResult } from "../src/orchestrator/session-port";
 import { observeStatus, provesSharedSteer } from "./work-lane-live.e2e.test";

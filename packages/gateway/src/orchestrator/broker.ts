@@ -1,7 +1,7 @@
 import { readFileSync, realpathSync } from "node:fs";
 import { homedir } from "node:os";
 import { basename, dirname, isAbsolute, join, normalize, resolve } from "node:path";
-import type { CliResult, CliRunner } from "@gajaeway/subsession";
+import type { CliResult, CliRunner } from "@gajae-gateway/subsession";
 import {
 	type BrokerDiscovery,
 	type BrokerLivenessVerdict,

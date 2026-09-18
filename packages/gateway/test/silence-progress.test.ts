@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import type { ChatProgressPayload } from "@gajaeway/protocol";
+import type { ChatProgressPayload } from "@gajae-gateway/protocol";
 import { subscribeDiscordProgress } from "../../adapter-discord/src/main";
 
 /**

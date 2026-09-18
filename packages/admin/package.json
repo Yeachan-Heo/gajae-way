@@ -1,5 +1,5 @@
 {
-	"name": "@gajaeway/admin",
+	"name": "@gajae-gateway/admin",
 	"version": "0.1.0",
 	"private": true,
 	"type": "module",
@@ -7,7 +7,7 @@
 		".": "./src/index.ts"
 	},
 	"dependencies": {
-		"@gajaeway/protocol": "workspace:*",
-		"@gajaeway/sdk": "workspace:*"
+		"@gajae-gateway/protocol": "workspace:*",
+		"@gajae-gateway/sdk": "workspace:*"
 	}
 }

@@ -1,4 +1,4 @@
-import { type EngagementContext, type OriginRef, REACTION_ALLOWLIST, type ReactionRef } from "@gajaeway/protocol";
+import { type EngagementContext, type OriginRef, REACTION_ALLOWLIST, type ReactionRef } from "@gajae-gateway/protocol";
 import { SlackApiError } from "./api";
 import { slackMessageId, slackMessageOrigin } from "./origin";
 

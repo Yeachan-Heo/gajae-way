@@ -5,7 +5,7 @@ import {
 	OpRefRejectedError,
 	type SendReceipt,
 	type StatusReport,
-} from "@gajaeway/subsession";
+} from "@gajae-gateway/subsession";
 import type { GjcModelSelection, GjcServiceTier } from "../src/config";
 import type {
 	SessionBindInput,

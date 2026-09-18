@@ -1,10 +1,10 @@
 {
-	"name": "@gajaeway/conformance",
+	"name": "@gajae-gateway/conformance",
 	"version": "0.1.0",
 	"private": true,
 	"type": "module",
 	"description": "SDK boundary conformance: dogfood import-graph test and action/event coverage inventory. CI gates from P0 (plan drivers 1; spec fact 15).",
 	"dependencies": {
-		"@gajaeway/protocol": "workspace:*"
+		"@gajae-gateway/protocol": "workspace:*"
 	}
 }

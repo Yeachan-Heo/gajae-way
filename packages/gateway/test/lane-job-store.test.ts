@@ -12,7 +12,7 @@ import {
 	type LaneJobRecord,
 	parseLaneJobRecord,
 	planContinuation,
-} from "@gajaeway/subsession";
+} from "@gajae-gateway/subsession";
 import { GatewayDatabase } from "../src/store/db";
 
 const NOW = new Date("2026-08-27T13:00:00.000Z").toISOString();

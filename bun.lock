@@ -11,87 +11,87 @@
       },
     },
     "packages/adapter-discord": {
-      "name": "@gajaeway/adapter-discord",
+      "name": "@gajae-gateway/adapter-discord",
       "version": "0.1.0",
       "dependencies": {
-        "@gajaeway/log": "workspace:*",
-        "@gajaeway/protocol": "workspace:*",
-        "@gajaeway/sdk": "workspace:*",
+        "@gajae-gateway/log": "workspace:*",
+        "@gajae-gateway/protocol": "workspace:*",
+        "@gajae-gateway/sdk": "workspace:*",
         "discord.js": "^14.25.1",
       },
     },
     "packages/adapter-slack": {
-      "name": "@gajaeway/adapter-slack",
+      "name": "@gajae-gateway/adapter-slack",
       "version": "0.1.0",
       "dependencies": {
-        "@gajaeway/log": "workspace:*",
-        "@gajaeway/protocol": "workspace:*",
-        "@gajaeway/sdk": "workspace:*",
+        "@gajae-gateway/log": "workspace:*",
+        "@gajae-gateway/protocol": "workspace:*",
+        "@gajae-gateway/sdk": "workspace:*",
       },
     },
     "packages/adapter-telegram": {
-      "name": "@gajaeway/adapter-telegram",
+      "name": "@gajae-gateway/adapter-telegram",
       "version": "0.1.0",
       "dependencies": {
-        "@gajaeway/protocol": "workspace:*",
-        "@gajaeway/sdk": "workspace:*",
+        "@gajae-gateway/protocol": "workspace:*",
+        "@gajae-gateway/sdk": "workspace:*",
       },
     },
     "packages/admin": {
-      "name": "@gajaeway/admin",
+      "name": "@gajae-gateway/admin",
       "version": "0.1.0",
       "dependencies": {
-        "@gajaeway/protocol": "workspace:*",
-        "@gajaeway/sdk": "workspace:*",
+        "@gajae-gateway/protocol": "workspace:*",
+        "@gajae-gateway/sdk": "workspace:*",
       },
     },
     "packages/cli": {
-      "name": "@gajaeway/cli",
+      "name": "@gajae-gateway/cli",
       "version": "0.1.0",
       "bin": {
         "gajaeway": "./dist/main.js",
       },
       "dependencies": {
-        "@gajaeway/protocol": "workspace:*",
-        "@gajaeway/sdk": "workspace:*",
+        "@gajae-gateway/protocol": "workspace:*",
+        "@gajae-gateway/sdk": "workspace:*",
       },
     },
     "packages/conformance": {
-      "name": "@gajaeway/conformance",
+      "name": "@gajae-gateway/conformance",
       "version": "0.1.0",
       "dependencies": {
-        "@gajaeway/protocol": "workspace:*",
+        "@gajae-gateway/protocol": "workspace:*",
       },
     },
     "packages/gateway": {
-      "name": "@gajaeway/gateway",
+      "name": "@gajae-gateway/gateway",
       "version": "0.1.0",
       "bin": {
         "gajaeway-gateway": "./src/main.ts",
       },
       "dependencies": {
-        "@gajaeway/log": "workspace:*",
-        "@gajaeway/protocol": "workspace:*",
-        "@gajaeway/subsession": "workspace:*",
+        "@gajae-gateway/log": "workspace:*",
+        "@gajae-gateway/protocol": "workspace:*",
+        "@gajae-gateway/subsession": "workspace:*",
       },
     },
     "packages/log": {
-      "name": "@gajaeway/log",
+      "name": "@gajae-gateway/log",
       "version": "0.1.0",
     },
     "packages/protocol": {
-      "name": "@gajaeway/protocol",
+      "name": "@gajae-gateway/protocol",
       "version": "0.1.0",
     },
     "packages/sdk": {
-      "name": "@gajaeway/sdk",
+      "name": "@gajae-gateway/sdk",
       "version": "0.1.0",
       "dependencies": {
-        "@gajaeway/protocol": "workspace:*",
+        "@gajae-gateway/protocol": "workspace:*",
       },
     },
     "packages/subsession": {
-      "name": "@gajaeway/subsession",
+      "name": "@gajae-gateway/subsession",
       "version": "0.1.0",
     },
   },
@@ -126,27 +126,27 @@
 
     "@discordjs/ws": ["@discordjs/ws@1.2.3", "", { "dependencies": { "@discordjs/collection": "^2.1.0", "@discordjs/rest": "^2.5.1", "@discordjs/util": "^1.1.0", "@sapphire/async-queue": "^1.5.2", "@types/ws": "^8.5.10", "@vladfrangu/async_event_emitter": "^2.2.4", "discord-api-types": "^0.38.1", "tslib": "^2.6.2", "ws": "^8.17.0" } }, "sha512-wPlQDxEmlDg5IxhJPuxXr3Vy9AjYq5xCvFWGJyD7w7Np8ZGu+Mc+97LCoEc/+AYCo2IDpKioiH0/c/mj5ZR9Uw=="],
 
-    "@gajaeway/adapter-discord": ["@gajaeway/adapter-discord@workspace:packages/adapter-discord"],
+    "@gajae-gateway/adapter-discord": ["@gajae-gateway/adapter-discord@workspace:packages/adapter-discord"],
 
-    "@gajaeway/adapter-slack": ["@gajaeway/adapter-slack@workspace:packages/adapter-slack"],
+    "@gajae-gateway/adapter-slack": ["@gajae-gateway/adapter-slack@workspace:packages/adapter-slack"],
 
-    "@gajaeway/adapter-telegram": ["@gajaeway/adapter-telegram@workspace:packages/adapter-telegram"],
+    "@gajae-gateway/adapter-telegram": ["@gajae-gateway/adapter-telegram@workspace:packages/adapter-telegram"],
 
-    "@gajaeway/admin": ["@gajaeway/admin@workspace:packages/admin"],
+    "@gajae-gateway/admin": ["@gajae-gateway/admin@workspace:packages/admin"],
 
-    "@gajaeway/cli": ["@gajaeway/cli@workspace:packages/cli"],
+    "@gajae-gateway/cli": ["@gajae-gateway/cli@workspace:packages/cli"],
 
-    "@gajaeway/conformance": ["@gajaeway/conformance@workspace:packages/conformance"],
+    "@gajae-gateway/conformance": ["@gajae-gateway/conformance@workspace:packages/conformance"],
 
-    "@gajaeway/gateway": ["@gajaeway/gateway@workspace:packages/gateway"],
+    "@gajae-gateway/gateway": ["@gajae-gateway/gateway@workspace:packages/gateway"],
 
-    "@gajaeway/log": ["@gajaeway/log@workspace:packages/log"],
+    "@gajae-gateway/log": ["@gajae-gateway/log@workspace:packages/log"],
 
-    "@gajaeway/protocol": ["@gajaeway/protocol@workspace:packages/protocol"],
+    "@gajae-gateway/protocol": ["@gajae-gateway/protocol@workspace:packages/protocol"],
 
-    "@gajaeway/sdk": ["@gajaeway/sdk@workspace:packages/sdk"],
+    "@gajae-gateway/sdk": ["@gajae-gateway/sdk@workspace:packages/sdk"],
 
-    "@gajaeway/subsession": ["@gajaeway/subsession@workspace:packages/subsession"],
+    "@gajae-gateway/subsession": ["@gajae-gateway/subsession@workspace:packages/subsession"],
 
     "@sapphire/async-queue": ["@sapphire/async-queue@1.5.5", "", {}, "sha512-cvGzxbba6sav2zZkH8GPf2oGk9yYoD5qrNWdu9fRehifgnFZJMV+nuy2nON2roRO4yQQ+v7MK/Pktl/HgfsUXg=="],
 

@@ -1,4 +1,4 @@
-import type { GatewayStatusResult, MonitorEventRecord, MonitorRecord } from "@gajaeway/protocol";
+import type { GatewayStatusResult, MonitorEventRecord, MonitorRecord } from "@gajae-gateway/protocol";
 import type { AuditEntry } from "../src/gate";
 import { type AdminApp, type AdminServerOptions, createAdminApp, type GatewayRequest } from "../src/server";
 

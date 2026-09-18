@@ -1,5 +1,5 @@
 {
-	"name": "@gajaeway/adapter-telegram",
+	"name": "@gajae-gateway/adapter-telegram",
 	"version": "0.1.0",
 	"private": true,
 	"type": "module",
@@ -11,7 +11,7 @@
 		"test": "bun test"
 	},
 	"dependencies": {
-		"@gajaeway/protocol": "workspace:*",
-		"@gajaeway/sdk": "workspace:*"
+		"@gajae-gateway/protocol": "workspace:*",
+		"@gajae-gateway/sdk": "workspace:*"
 	}
 }

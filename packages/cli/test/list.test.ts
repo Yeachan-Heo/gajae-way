@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import type { MonitorRecord } from "@gajaeway/protocol";
+import type { MonitorRecord } from "@gajae-gateway/protocol";
 import {
 	columnNames,
 	MONITOR_COLUMNS,

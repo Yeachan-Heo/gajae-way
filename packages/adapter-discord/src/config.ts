@@ -1,7 +1,7 @@
 import { readFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { dirname, isAbsolute, join, resolve } from "node:path";
-import { type ChannelEngagementPolicy, ENGAGEMENT_AUDIENCES, ENGAGEMENT_MODES } from "@gajaeway/protocol";
+import { type ChannelEngagementPolicy, ENGAGEMENT_AUDIENCES, ENGAGEMENT_MODES } from "@gajae-gateway/protocol";
 
 /**
  * Inbound voice-message transcription.

@@ -29,8 +29,8 @@ import {
 	reactionAllowlistDescription,
 	resolveReactionEmoji,
 	validateOriginRef,
-} from "@gajaeway/protocol";
-import { parseLaneJobRecord } from "@gajaeway/subsession";
+} from "@gajae-gateway/protocol";
+import { parseLaneJobRecord } from "@gajae-gateway/subsession";
 import { type ConfigOverrides, type GatewayConfig, type ReloadResult, reloadConfig } from "../config";
 import { DeliveryService } from "../delivery/delivery";
 import { ReactionBudget } from "../delivery/reaction-budget";

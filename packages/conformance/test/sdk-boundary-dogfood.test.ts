@@ -7,7 +7,7 @@ import { join, relative } from "node:path";
  *
  * Every SDK-consumer package (owner CLI, platform adapters) must be
  * implementable by a third party: it may import ONLY the public packages
- * (@gajaeway/sdk, @gajaeway/protocol, @gajaeway/log), Bun/node builtins, its
+ * (@gajae-gateway/sdk, @gajae-gateway/protocol, @gajae-gateway/log), Bun/node builtins, its
  * own files, and its declared platform library. Any import that reaches into
  * the gateway's internals (or the legacy tree) is a privileged import and
  * fails this test.
@@ -25,13 +25,13 @@ const CONSUMER_PACKAGES: Record<string, readonly string[]> = {
 	"packages/adapter-slack": [],
 };
 
-// @gajaeway/log is public for the same reason as the protocol: it is an
+// @gajae-gateway/log is public for the same reason as the protocol: it is an
 // unprivileged, dependency-free service sink (console + fs only) that a
 // third-party adapter needs in order to produce windowable logs at all.
-const PUBLIC_IMPORTS = ["@gajaeway/sdk", "@gajaeway/protocol", "@gajaeway/log"];
+const PUBLIC_IMPORTS = ["@gajae-gateway/sdk", "@gajae-gateway/protocol", "@gajae-gateway/log"];
 
 const FORBIDDEN_PREFIXES = [
-	"@gajaeway/gateway",
+	"@gajae-gateway/gateway",
 	"../gateway",
 	"../../gateway",
 	"../../../gateway",
@@ -121,7 +121,7 @@ describe("sdk-boundary-dogfood", () => {
 		for (const file of files) {
 			for (const spec of importsOf(file)) {
 				if (isBuiltin(spec) || spec.startsWith("./") || spec.startsWith("../")) continue;
-				if (spec === "@gajaeway/protocol" || spec.startsWith("@gajaeway/protocol/")) continue;
+				if (spec === "@gajae-gateway/protocol" || spec.startsWith("@gajae-gateway/protocol/")) continue;
 				violations.push(`${relative(ROOT, file)} imports: ${spec}`);
 			}
 		}

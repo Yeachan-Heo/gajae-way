@@ -1,5 +1,5 @@
 import { join } from "node:path";
-import { installStructuredLogging } from "@gajaeway/log";
+import { installStructuredLogging } from "@gajae-gateway/log";
 import { bootGateway } from "./boot";
 import { gatewayHome } from "./config";
 import { checkConfigFile, configCheckExitCode, defaultConfigPath, renderConfigCheck } from "./config-check";

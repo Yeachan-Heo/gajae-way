@@ -1,4 +1,4 @@
-import { REACTIONS_PER_MESSAGE_CAP, REACTIONS_PER_TURN_CAP } from "@gajaeway/protocol";
+import { REACTIONS_PER_MESSAGE_CAP, REACTIONS_PER_TURN_CAP } from "@gajae-gateway/protocol";
 
 export type ReactionRejection =
 	| { readonly reason: "turn_cap"; readonly detail: string }

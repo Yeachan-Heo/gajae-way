@@ -11,7 +11,7 @@
  * has visibly failed to run.
  */
 
-import type { GatewayStatusResult, MonitorEventRecord, MonitorRecord } from "@gajaeway/protocol";
+import type { GatewayStatusResult, MonitorEventRecord, MonitorRecord } from "@gajae-gateway/protocol";
 import { formatDuration, pluralise, shortId } from "./format";
 
 /** A monitor event in a non-terminal stage is only an attention item past this age. */

@@ -1,5 +1,5 @@
-import { type LaneCapacityDetail, ProtocolError } from "@gajaeway/protocol";
-import { type LaneJobRecord, parseLaneJobRecord } from "@gajaeway/subsession";
+import { type LaneCapacityDetail, ProtocolError } from "@gajae-gateway/protocol";
+import { type LaneJobRecord, parseLaneJobRecord } from "@gajae-gateway/subsession";
 import { DEFAULT_WORK_IDLE_RETIRE_MS, DEFAULT_WORK_MAX_LANES } from "../config";
 import type { GatewayDatabase } from "../store/db";
 import { sanitizeDiagnostic } from "./rebind";

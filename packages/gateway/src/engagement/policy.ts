@@ -1,4 +1,4 @@
-import { type EngagementContext, evaluateChannelEngagement, type OriginRef, originKey } from "@gajaeway/protocol";
+import { type EngagementContext, evaluateChannelEngagement, type OriginRef, originKey } from "@gajae-gateway/protocol";
 import type { GatewayConfig } from "../config";
 
 export const MAX_CONSECUTIVE_BOT_AUDIENCE_TURNS = 1;

@@ -2,7 +2,7 @@ import { afterEach, expect, spyOn, test } from "bun:test";
 import { mkdir, mkdtemp, readdir, readFile, rename, rm, stat, utimes, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { type ChatMessagePayload, isPlatformMessageId } from "@gajaeway/protocol";
+import { type ChatMessagePayload, isPlatformMessageId } from "@gajae-gateway/protocol";
 import {
 	deliveryFailureIsAmbiguous,
 	OutboundLimiter,
@@ -1236,7 +1236,7 @@ test("RT-SLACK-54 cleanup errors are logged without blocking delivery confirmati
 });
 
 test("RT-SLACK-57 persona allowlist is disjoint and thumbs up leaves presence alone", async () => {
-	const { REACTION_ALLOWLIST } = await import("@gajaeway/protocol");
+	const { REACTION_ALLOWLIST } = await import("@gajae-gateway/protocol");
 	const { SLACK_REACTION_NAMES } = await import("../src/reactions");
 	const { isPresenceReaction } = await import("../src/status");
 	for (const { name } of REACTION_ALLOWLIST) expect(isPresenceReaction(SLACK_REACTION_NAMES[name]!)).toBe(false);

@@ -13,7 +13,7 @@
  * a live socket and prevents this package from reaching into gateway internals.
  */
 
-import type { ChatMessagePayload, ChatProgressPayload } from "@gajaeway/protocol";
+import type { ChatMessagePayload, ChatProgressPayload } from "@gajae-gateway/protocol";
 import { type AuditLog, memoryAuditLog } from "./audit";
 import { formatClockSeconds } from "./format";
 import { type GateOptions, MutationGate, type MutationOperation } from "./gate";

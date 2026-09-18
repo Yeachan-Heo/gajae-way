@@ -5,7 +5,7 @@ import {
 	OriginRefError,
 	type TriggerSpec,
 	validateOriginRef,
-} from "@gajaeway/protocol";
+} from "@gajae-gateway/protocol";
 import type { GatewayDatabase } from "../store/db";
 
 const BURST_POLICIES = new Set(["coalesce", "dedupe", "serialize", "drop"]);

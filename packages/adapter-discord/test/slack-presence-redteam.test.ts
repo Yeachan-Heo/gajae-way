@@ -1,5 +1,5 @@
 import { expect, spyOn, test } from "bun:test";
-import type { ChatProgressPayload } from "@gajaeway/protocol";
+import type { ChatProgressPayload } from "@gajae-gateway/protocol";
 import { type DiscordClientLike, isPresenceReaction, ReconnectingGateway, WorkingStatus } from "../src/main";
 
 async function flush() {

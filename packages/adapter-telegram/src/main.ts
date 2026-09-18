@@ -1,5 +1,5 @@
-import type { ChatMessagePayload, EngagementContext, OriginRef } from "@gajaeway/protocol";
-import { GajaewayClient } from "@gajaeway/sdk";
+import type { ChatMessagePayload, EngagementContext, OriginRef } from "@gajae-gateway/protocol";
+import { GajaewayClient } from "@gajae-gateway/sdk";
 import { type LoadedTelegramAdapterConfig, loadTelegramAdapterConfig } from "./config";
 import { type TelegramMessageOriginShape, telegramMessageOrigin } from "./origin";
 import { telegramReactionFor } from "./reactions";

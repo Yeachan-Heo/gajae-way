@@ -1,5 +1,5 @@
 import { expect, test } from "bun:test";
-import type { ChatMessagePayload } from "@gajaeway/protocol";
+import type { ChatMessagePayload } from "@gajae-gateway/protocol";
 import type { DiscordClientLike, GatewayClientLike } from "../src/main";
 import {
 	type DiscordInboundReaction,

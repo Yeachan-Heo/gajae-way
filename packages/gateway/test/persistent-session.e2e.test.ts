@@ -3,7 +3,7 @@ import { createHash } from "node:crypto";
 import { mkdir, mkdtemp, readFile, realpath, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { isAbsolute, join } from "node:path";
-import { isTerminalStatus } from "@gajaeway/subsession";
+import { isTerminalStatus } from "@gajae-gateway/subsession";
 import { GlobalGjcClient, readBrokerDiscovery } from "../src/orchestrator/broker";
 import { BrokerSessionPort, SessionTerminalError } from "../src/orchestrator/session-port";
 import { TailRunner } from "../src/orchestrator/tail-runner";

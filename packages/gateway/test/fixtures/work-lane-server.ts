@@ -3,7 +3,7 @@ import { appendFileSync, existsSync, readFileSync, writeFileSync } from "node:fs
 import { mkdtemp, rename, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
-import type { StatusReport } from "@gajaeway/subsession";
+import type { StatusReport } from "@gajae-gateway/subsession";
 import type {
 	SessionBindInput,
 	SessionSendInput,

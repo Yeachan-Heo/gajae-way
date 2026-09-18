@@ -2,7 +2,7 @@ import { afterEach, expect, test } from "bun:test";
 import { lstat, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import type { CliRunner } from "@gajaeway/subsession";
+import type { CliRunner } from "@gajae-gateway/subsession";
 import { bootGateway } from "../src/boot";
 import { MIN_GJC_VERSION } from "../src/orchestrator/broker";
 import {

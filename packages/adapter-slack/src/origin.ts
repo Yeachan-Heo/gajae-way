@@ -1,4 +1,4 @@
-import { isPlatformMessageId, type OriginRef } from "@gajaeway/protocol";
+import { isPlatformMessageId, type OriginRef } from "@gajae-gateway/protocol";
 
 /** Raw Slack fields keep routing independent of a platform SDK. */
 export interface SlackMessageOriginShape {

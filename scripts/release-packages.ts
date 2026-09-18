@@ -1,7 +1,7 @@
 #!/usr/bin/env bun
 /**
  * Root-level release workflow for the npm-publishable packages
- * (@gajaeway/protocol, @gajaeway/sdk, @gajaeway/cli), in dependency order.
+ * (@gajae-gateway/protocol, @gajae-gateway/sdk, @gajae-gateway/cli), in dependency order.
  *
  * Usage:
  *   bun scripts/release-packages.ts            # build + npm-pack-style dry run (default, safe)
@@ -67,7 +67,7 @@ async function main(): Promise<void> {
 		}
 	}
 
-	if (publish) console.log(`\nPublished, in order: ${RELEASE_ORDER.map((p) => `@gajaeway/${p}`).join(", ")}`);
+	if (publish) console.log(`\nPublished, in order: ${RELEASE_ORDER.map((p) => `@gajae-gateway/${p}`).join(", ")}`);
 	else console.log(`\nDry-run packed tarballs written to dist-packed/. Inspect them, then re-run with --publish.`);
 }
 

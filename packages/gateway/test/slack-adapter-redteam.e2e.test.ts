@@ -2,7 +2,7 @@ import { afterEach, expect, test } from "bun:test";
 import { mkdir, mkdtemp, readFile, rm, stat, utimes, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import type { ChatProgressPayload } from "@gajaeway/protocol";
+import type { ChatProgressPayload } from "@gajae-gateway/protocol";
 import { AdapterAlreadyRunningError, AdapterLock } from "../../adapter-discord/src/lock";
 import { ReconnectingGateway } from "../../adapter-slack/src/main";
 import { GajaewayClient } from "../../sdk/src/index";

@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import type { OriginRef } from "@gajaeway/protocol";
+import type { OriginRef } from "@gajae-gateway/protocol";
 import { type TrackedTurn, TURN_RETENTION_MS, TURN_STALL_MS, TurnTracker } from "../src/turns";
 
 const ORIGIN: OriginRef = { platform: "discord", kind: "channel", conversationId: "1493635653441945762" };

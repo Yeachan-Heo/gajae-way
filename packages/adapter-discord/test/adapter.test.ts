@@ -2,8 +2,8 @@ import { expect, test } from "bun:test";
 import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import type { ChatMessagePayload, ChatProgressPayload } from "@gajaeway/protocol";
-import { PRESENCE_MIN_SWAP_MS } from "@gajaeway/protocol";
+import type { ChatMessagePayload, ChatProgressPayload } from "@gajae-gateway/protocol";
+import { PRESENCE_MIN_SWAP_MS } from "@gajae-gateway/protocol";
 import { DiscordAdapterStartupError, loadDiscordAdapterConfig } from "../src/config";
 import {
 	addressedTurn,

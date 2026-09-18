@@ -2,7 +2,7 @@ import { expect, test } from "bun:test";
 import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import type { ChatMessagePayload } from "@gajaeway/protocol";
+import type { ChatMessagePayload } from "@gajae-gateway/protocol";
 import { loadTelegramAdapterConfig, TelegramAdapterStartupError } from "../src/config";
 import {
 	chunkTelegramMessage,

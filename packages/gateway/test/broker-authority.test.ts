@@ -3,7 +3,7 @@ import { afterEach, describe, expect, test } from "bun:test";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { appendAttempt, closeAttempt, createLaneJobRecord } from "@gajaeway/subsession";
+import { appendAttempt, closeAttempt, createLaneJobRecord } from "@gajae-gateway/subsession";
 import { type BrokerAuthority, GatewayDatabase, type WorkAttemptRuntime, workAttemptDeliveryId } from "../src/store/db";
 
 const GLOBAL: BrokerAuthority = { canonicalAgentDir: "/home/operator/.gjc/agent", identity: "global-user" };

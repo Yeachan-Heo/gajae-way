@@ -11,7 +11,7 @@
  * Kept free of any gateway/SDK import so the rules stay unit testable.
  */
 
-import type { ReplyContext } from "@gajaeway/protocol";
+import type { ReplyContext } from "@gajae-gateway/protocol";
 
 /** Referenced text is context, not the message being answered: keep the header readable. */
 const EXCERPT_LIMIT = 200;

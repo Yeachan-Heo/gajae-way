@@ -1,5 +1,5 @@
-import type { Frame } from "@gajaeway/protocol";
-import { encodeFrame } from "@gajaeway/protocol";
+import type { Frame } from "@gajae-gateway/protocol";
+import { encodeFrame } from "@gajae-gateway/protocol";
 
 export interface FrameWriterSink {
 	write(bytes: Uint8Array): number;

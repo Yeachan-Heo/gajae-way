@@ -6,7 +6,7 @@ import type {
 	OpsCycleResult,
 	WorkRunParams,
 	WorkRunResult,
-} from "@gajaeway/protocol";
+} from "@gajae-gateway/protocol";
 import {
 	type ChatMessagePayload,
 	type ChatProgressPayload,
@@ -17,7 +17,7 @@ import {
 	type OriginRef,
 	PROFILE_VERSION,
 	ProtocolError,
-} from "@gajaeway/protocol";
+} from "@gajae-gateway/protocol";
 
 type EventHandler = (payload: unknown, frame: Frame) => void;
 /** Held pre-subscription events per event name; a delivery replay is bounded by the ledger anyway. */
@@ -197,7 +197,7 @@ export class GajaewayClient {
 						type: "hello",
 						payload: {
 							supportedVersions: [PROFILE_VERSION],
-							clientInfo: { name: "@gajaeway/sdk" },
+							clientInfo: { name: "@gajae-gateway/sdk" },
 						},
 					}),
 				)

@@ -4,7 +4,7 @@ import { createHash } from "node:crypto";
 import { mkdir, mkdtemp, readFile, realpath, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { isAbsolute, join } from "node:path";
-import { type CliRunner, GjcCliError } from "@gajaeway/subsession";
+import { type CliRunner, GjcCliError } from "@gajae-gateway/subsession";
 import { GjcCliUnavailableError, GlobalGjcClient, readBrokerDiscovery } from "../src/orchestrator/broker";
 import { LaneGovernor } from "../src/orchestrator/lane-governor";
 import { BrokerSessionPort, isSteerAccepted } from "../src/orchestrator/session-port";

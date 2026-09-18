@@ -8,8 +8,8 @@ import {
 	type OriginRef,
 	originKey,
 	validateOriginRef,
-} from "@gajaeway/protocol";
-import { assertValidOpRef, type LaneJobRecord, type PromptStatusBody, parseLaneJobRecord } from "@gajaeway/subsession";
+} from "@gajae-gateway/protocol";
+import { assertValidOpRef, type LaneJobRecord, type PromptStatusBody, parseLaneJobRecord } from "@gajae-gateway/subsession";
 
 export interface BrokerAuthority {
 	readonly canonicalAgentDir: string;
@@ -3145,7 +3145,7 @@ SELECT 1 FROM dispatch_leases l WHERE l.event_id = monitor_events.event_id AND l
 		if (current < 10) {
 			this.withTransaction(() => {
 				// Issue #10: durable lane jobs. One row per job; the record JSON is the
-				// fail-closed authority (schema-validated on read by @gajaeway/subsession),
+				// fail-closed authority (schema-validated on read by @gajae-gateway/subsession),
 				// while the status column stays a plain indexed projection for operators.
 				this.#database.exec(
 					"CREATE TABLE lane_jobs (job_id TEXT PRIMARY KEY, lane_key TEXT NOT NULL UNIQUE, branch TEXT NOT NULL, worktree_path TEXT NOT NULL, state TEXT NOT NULL CHECK(state IN ('running','attempt_ended','awaiting_operator','stalled','done','aborted')), record_json TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL)",

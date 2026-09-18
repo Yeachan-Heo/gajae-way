@@ -7,7 +7,7 @@
  * its events out to browser clients, and binds loopback only.
  */
 
-import { GajaewayClient } from "@gajaeway/sdk";
+import { GajaewayClient } from "@gajae-gateway/sdk";
 import { jsonlAuditLog } from "./audit";
 import { ADMIN_USAGE, USAGE_EXIT_CODE, usageFor } from "./cli";
 import { startAdminServer } from "./server";

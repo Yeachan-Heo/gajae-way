@@ -4,7 +4,7 @@ A monitor turns an external or scheduled signal into a Gajae-authored event. It 
 
 ## MonitorSpec and triggers
 
-`gajaeway monitors add --json` accepts the `MonitorSpec` shape from `@gajaeway/protocol`:
+`gajaeway monitors add --json` accepts the `MonitorSpec` shape from `@gajae-gateway/protocol`:
 
 ```json
 {

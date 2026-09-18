@@ -1,5 +1,5 @@
 import { expect, spyOn, test } from "bun:test";
-import type { ChatMessagePayload, EngagementContext, OriginRef } from "@gajaeway/protocol";
+import type { ChatMessagePayload, EngagementContext, OriginRef } from "@gajae-gateway/protocol";
 import { SlackApiError, type SlackHistoryPage, SlackWebApi } from "../src/api";
 import {
 	decideInbound,

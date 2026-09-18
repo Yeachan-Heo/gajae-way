@@ -1,4 +1,4 @@
-import type { OriginRef } from "@gajaeway/protocol";
+import type { OriginRef } from "@gajae-gateway/protocol";
 
 /** The Discord message fields needed for origin normalization; intentionally discord.js-free. */
 export interface DiscordMessageOriginShape {

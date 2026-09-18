@@ -3,7 +3,7 @@ import { createHmac } from "node:crypto";
 import { chmod, mkdtemp, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { CATCH_ALL_EVENT_ORIGIN, originKey } from "@gajaeway/protocol";
+import { CATCH_ALL_EVENT_ORIGIN, originKey } from "@gajae-gateway/protocol";
 import { cronMatches, startCron } from "../src/monitors/triggers/cron";
 import { startScript } from "../src/monitors/triggers/script";
 import { startWatcher } from "../src/monitors/triggers/watcher";

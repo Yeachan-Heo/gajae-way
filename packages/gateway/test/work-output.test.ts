@@ -2,7 +2,7 @@ import { afterEach, expect, test } from "bun:test";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { type CliResult, type CliRunner, GjcCliError } from "@gajaeway/subsession";
+import { type CliResult, type CliRunner, GjcCliError } from "@gajae-gateway/subsession";
 import { BrokerSessionPort, parseWorkerOutputResponse, type WorkerOutputInput } from "../src/orchestrator/session-port";
 import { TailRunner } from "../src/orchestrator/tail-runner";
 import { GatewayDatabase } from "../src/store/db";

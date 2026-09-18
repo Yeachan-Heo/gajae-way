@@ -1,5 +1,5 @@
 {
-	"name": "@gajaeway/gateway",
+	"name": "@gajae-gateway/gateway",
 	"version": "0.1.0",
 	"private": true,
 	"type": "module",
@@ -7,8 +7,8 @@
 		"gajaeway-gateway": "./src/main.ts"
 	},
 	"dependencies": {
-		"@gajaeway/log": "workspace:*",
-		"@gajaeway/protocol": "workspace:*",
-		"@gajaeway/subsession": "workspace:*"
+		"@gajae-gateway/log": "workspace:*",
+		"@gajae-gateway/protocol": "workspace:*",
+		"@gajae-gateway/subsession": "workspace:*"
 	}
 }

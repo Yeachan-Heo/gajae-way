@@ -7,7 +7,7 @@ import {
 	presenceInitial,
 	presenceMarkersFor,
 	presenceTransition,
-} from "@gajaeway/protocol";
+} from "@gajae-gateway/protocol";
 import type { SlackWebApi } from "./api";
 import { parseSlackMessageId } from "./origin";
 

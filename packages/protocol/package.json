@@ -1,5 +1,5 @@
 {
-	"name": "@gajaeway/protocol",
+	"name": "@gajae-gateway/protocol",
 	"version": "0.1.0",
 	"type": "module",
 	"description": "gajaeway protocol profile v0.x: frames, negotiation, verbs, events, error codes, origin normalization. Zero runtime dependencies.",

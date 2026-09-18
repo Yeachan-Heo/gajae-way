@@ -1,5 +1,5 @@
 {
-	"name": "@gajaeway/adapter-discord",
+	"name": "@gajae-gateway/adapter-discord",
 	"version": "0.1.0",
 	"private": true,
 	"type": "module",
@@ -11,9 +11,9 @@
 		"test": "bun test"
 	},
 	"dependencies": {
-		"@gajaeway/log": "workspace:*",
-		"@gajaeway/protocol": "workspace:*",
-		"@gajaeway/sdk": "workspace:*",
+		"@gajae-gateway/log": "workspace:*",
+		"@gajae-gateway/protocol": "workspace:*",
+		"@gajae-gateway/sdk": "workspace:*",
 		"discord.js": "^14.25.1"
 	}
 }

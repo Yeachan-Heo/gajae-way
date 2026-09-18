@@ -5,7 +5,7 @@ import {
 	LOOPBACK_ORIGIN,
 	type OpsCycleResult,
 	validateOriginRef,
-} from "@gajaeway/protocol";
+} from "@gajae-gateway/protocol";
 import { DEFAULT_WORK_MAX_LANES } from "../config";
 import { WORK_LANE_PREFIX } from "../orchestrator/lane-governor";
 import type { GatewayDatabase } from "../store/db";

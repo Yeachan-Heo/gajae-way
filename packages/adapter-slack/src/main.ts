@@ -1,13 +1,13 @@
 import { join } from "node:path";
-import { installStructuredLogging } from "@gajaeway/log";
+import { installStructuredLogging } from "@gajae-gateway/log";
 import type {
 	ChannelEngagementPolicy,
 	ChatMessagePayload,
 	ChatProgressPayload,
 	EngagementContext,
 	OriginRef,
-} from "@gajaeway/protocol";
-import { GajaewayClient } from "@gajaeway/sdk";
+} from "@gajae-gateway/protocol";
+import { GajaewayClient } from "@gajae-gateway/sdk";
 import pkg from "../package.json";
 import { deliveryFailureIsAmbiguous, OutboundLimiter, SlackApiError, SlackWebApi } from "./api";
 import { describeInboundBody, type SlackFileCarrier } from "./attachments";

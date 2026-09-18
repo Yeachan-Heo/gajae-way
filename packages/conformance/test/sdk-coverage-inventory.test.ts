@@ -1,7 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import { readdirSync, readFileSync, statSync } from "node:fs";
 import { join } from "node:path";
-import { EVENTS_V01, VERBS_V01 } from "@gajaeway/protocol";
+import { EVENTS_V01, VERBS_V01 } from "@gajae-gateway/protocol";
 
 /**
  * Action/event coverage inventory (spec AC-4, plan driver 1).

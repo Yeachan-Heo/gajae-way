@@ -15,7 +15,7 @@
  * the gateway client's dependency tree.
  */
 
-import type { ReplyContext } from "@gajaeway/protocol";
+import type { ReplyContext } from "@gajae-gateway/protocol";
 import { type AuthorLike, resolveDisplayName } from "./author";
 
 /** `MessageReferenceType.Default`; type 1 is `Forward`, which is not a reply. */

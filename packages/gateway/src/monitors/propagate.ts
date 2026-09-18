@@ -7,7 +7,7 @@ import {
 	type MonitorRecord,
 	type OriginRef,
 	originKey,
-} from "@gajaeway/protocol";
+} from "@gajae-gateway/protocol";
 import type { GjcModelSelection, GjcServiceTier } from "../config";
 import type { DeliveryService } from "../delivery/delivery";
 import type { MemoryClosureQueue } from "../memory/closure";

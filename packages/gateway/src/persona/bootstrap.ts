@@ -1,7 +1,7 @@
 import type { Dirent } from "node:fs";
 import { lstat, open, readdir, readFile, realpath, stat } from "node:fs/promises";
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
-import { type OriginRef, originKey, validateOriginRef } from "@gajaeway/protocol";
+import { type OriginRef, originKey, validateOriginRef } from "@gajae-gateway/protocol";
 import type { GatewayConfig } from "../config";
 import { resolveChannelPolicy } from "../engagement/policy";
 import { captureRoot } from "../memory/doctrine";

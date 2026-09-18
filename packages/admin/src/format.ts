@@ -8,7 +8,7 @@
  * sent.
  */
 
-import { type OriginRef, originKey, type TriggerSpec } from "@gajaeway/protocol";
+import { type OriginRef, originKey, type TriggerSpec } from "@gajae-gateway/protocol";
 import { parseCron } from "./cron";
 
 /**

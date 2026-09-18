@@ -1,5 +1,5 @@
 import { expect, test } from "bun:test";
-import { encodeFrame, PROFILE_VERSION } from "@gajaeway/protocol";
+import { encodeFrame, PROFILE_VERSION } from "@gajae-gateway/protocol";
 import { GajaewayClient } from "../src/client";
 
 for (const count of [2, 1001]) {

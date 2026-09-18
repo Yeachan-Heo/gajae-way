@@ -2,8 +2,8 @@ import { expect, test } from "bun:test";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import type { ChatMessagePayload, ReactionRef } from "@gajaeway/protocol";
-import { platformSupportsReaction, REACTION_ALLOWLIST, reactionAllowlistFor } from "@gajaeway/protocol";
+import type { ChatMessagePayload, ReactionRef } from "@gajae-gateway/protocol";
+import { platformSupportsReaction, REACTION_ALLOWLIST, reactionAllowlistFor } from "@gajae-gateway/protocol";
 import {
 	describeTelegramReaction,
 	type GatewayClientLike,

@@ -1,5 +1,5 @@
 import { expect, test } from "bun:test";
-import type { CliRunner } from "@gajaeway/subsession";
+import type { CliRunner } from "@gajae-gateway/subsession";
 import { TailRunner } from "../src/orchestrator/tail-runner";
 
 type Deferred = {

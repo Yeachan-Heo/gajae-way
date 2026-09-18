@@ -4,7 +4,7 @@ import {
 	type OriginRef,
 	originKey,
 	type ReactionRef,
-} from "@gajaeway/protocol";
+} from "@gajae-gateway/protocol";
 import type { DeliveryLedger, LedgerOutcome } from "../store/ledger";
 
 /** Pure construction shared by ordinary dispatch and atomic work settlement. */

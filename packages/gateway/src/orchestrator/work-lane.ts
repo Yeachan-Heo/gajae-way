@@ -9,7 +9,7 @@ import {
 	type WorkStartResult,
 	type WorkStatusResult,
 	type WorkSteerResult,
-} from "@gajaeway/protocol";
+} from "@gajae-gateway/protocol";
 import {
 	acknowledgeHold,
 	appendAttempt,
@@ -23,7 +23,7 @@ import {
 	newOpRef,
 	OpRefRejectedError,
 	parseLaneJobRecord,
-} from "@gajaeway/subsession";
+} from "@gajae-gateway/subsession";
 import type { GjcModelSelection } from "../config";
 import { buildDeliveryPayload } from "../delivery/delivery";
 import {

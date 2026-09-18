@@ -1,4 +1,4 @@
-import type { CliResult, CliRunner } from "@gajaeway/subsession";
+import type { CliResult, CliRunner } from "@gajae-gateway/subsession";
 import type { GlobalGjcClientDependencies, SpawnFn } from "./broker";
 
 type StubOperation = {

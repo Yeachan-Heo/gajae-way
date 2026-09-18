@@ -2,7 +2,7 @@ import { afterEach, expect, test } from "bun:test";
 import { mkdtemp } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import type { OriginRef } from "@gajaeway/protocol";
+import type { OriginRef } from "@gajae-gateway/protocol";
 import type { GatewayConfig } from "../src/config";
 import { RuntimeCycleProjector } from "../src/ops/cycle";
 import { type GatewayServer, startUnixServer } from "../src/server/server";

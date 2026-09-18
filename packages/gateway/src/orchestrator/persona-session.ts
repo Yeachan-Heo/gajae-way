@@ -11,7 +11,7 @@ import {
 	OpRefRejectedError,
 	projectOpState,
 	type StatusReport,
-} from "@gajaeway/subsession";
+} from "@gajae-gateway/subsession";
 import type { GjcModelSelection, GjcServiceTier } from "../config";
 import type { GatewayDatabase, InboundMessageRow, InboundTurn } from "../store/db";
 import { type BrokerLivenessProbe, type BrokerLivenessVerdict, describeBindHold } from "./broker-liveness";

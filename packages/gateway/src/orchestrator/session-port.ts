@@ -18,7 +18,7 @@ import {
 	type StatusReport,
 	sendPrompt,
 	TranscriptIncompleteError,
-} from "@gajaeway/subsession";
+} from "@gajae-gateway/subsession";
 import type { GjcModelSelection, GjcServiceTier } from "../config";
 import { type BrokerAuthority, BrokerAuthorityError, type GatewayDatabase } from "../store/db";
 import { type FailedTurnEvidence, type FailedTurnEvidenceInput, readFailedTurnEvidence } from "./failed-turn-evidence";

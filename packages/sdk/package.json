@@ -1,5 +1,5 @@
 {
-	"name": "@gajaeway/sdk",
+	"name": "@gajae-gateway/sdk",
 	"version": "0.1.0",
 	"type": "module",
 	"description": "Client SDK for the gajaeway gateway's Unix-domain socket or stdio transport.",
@@ -35,11 +35,11 @@
 		"access": "public"
 	},
 	"scripts": {
-		"build": "rm -rf dist && bun build src/index.ts --outdir dist --target node --format esm --external @gajaeway/protocol && tsc -p tsconfig.build.json",
+		"build": "rm -rf dist && bun build src/index.ts --outdir dist --target node --format esm --external @gajae-gateway/protocol && tsc -p tsconfig.build.json",
 		"prepublishOnly": "bun run build"
 	},
 	"dependencies": {
-		"@gajaeway/protocol": "workspace:*"
+		"@gajae-gateway/protocol": "workspace:*"
 	},
 	"engines": {
 		"bun": ">=1.4.0"

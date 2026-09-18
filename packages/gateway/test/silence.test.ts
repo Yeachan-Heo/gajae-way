@@ -2,7 +2,7 @@ import { afterEach, expect, test } from "bun:test";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { isSilenceToken } from "@gajaeway/protocol";
+import { isSilenceToken } from "@gajae-gateway/protocol";
 import type { GatewayConfig } from "../src/config";
 import { type GatewayServer, startUnixServer } from "../src/server/server";
 import { GatewayDatabase } from "../src/store/db";

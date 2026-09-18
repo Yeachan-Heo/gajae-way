@@ -12,9 +12,9 @@ import {
 	type RuntimeConfig,
 	RuntimeConfigError,
 	validateOriginRef,
-} from "@gajaeway/protocol";
+} from "@gajae-gateway/protocol";
 
-export type { RuntimeConfig } from "@gajaeway/protocol";
+export type { RuntimeConfig } from "@gajae-gateway/protocol";
 export const CONFIG_SCHEMA_VERSION = 1;
 
 export interface CredentialFileReference {

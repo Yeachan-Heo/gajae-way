@@ -48,15 +48,15 @@ The Bun workspace under `packages/` is divided by responsibility:
 
 | Package | Responsibility |
 |---|---|
-| [`@gajaeway/protocol`](packages/protocol) | Versioned NDJSON frames, negotiation, verb/event catalogues, and canonical origins. |
-| [`@gajaeway/sdk`](packages/sdk) | Client for the gateway's Unix-domain socket or stdio transport. |
-| [`@gajaeway/cli`](packages/cli) | Owner commands over the gateway socket. |
-| `@gajaeway/gateway` | Daemon: configuration, SQLite state, sessions, delivery, memory, monitors, and the `gjc` boundary. |
-| `@gajaeway/adapter-discord` | Discord ingress and outbound delivery, including typing hints and the reaction-gradient presence. |
-| `@gajaeway/adapter-telegram` | Telegram ingress and outbound delivery. |
-| `@gajaeway/adapter-slack` | Slack ingress over Socket Mode, mrkdwn delivery, reactions, reaction-gradient working presence, and missed-message recovery. |
+| [`@gajae-gateway/protocol`](packages/protocol) | Versioned NDJSON frames, negotiation, verb/event catalogues, and canonical origins. |
+| [`@gajae-gateway/sdk`](packages/sdk) | Client for the gateway's Unix-domain socket or stdio transport. |
+| [`@gajae-gateway/cli`](packages/cli) | Owner commands over the gateway socket. |
+| `@gajae-gateway/gateway` | Daemon: configuration, SQLite state, sessions, delivery, memory, monitors, and the `gjc` boundary. |
+| `@gajae-gateway/adapter-discord` | Discord ingress and outbound delivery, including typing hints and the reaction-gradient presence. |
+| `@gajae-gateway/adapter-telegram` | Telegram ingress and outbound delivery. |
+| `@gajae-gateway/adapter-slack` | Slack ingress over Socket Mode, mrkdwn delivery, reactions, reaction-gradient working presence, and missed-message recovery. |
 
-`@gajaeway/protocol`, `@gajaeway/sdk`, and `@gajaeway/cli` are npm-publishable as standalone packages — see [Publishing packages](#publishing-packages) below for the release workflow. The gateway, adapters, admin console, and `@gajaeway/subsession` stay private application code and ship only as the compiled binaries below; `@gajaeway/conformance` is a private, unshipped CI/test-only package.
+`@gajae-gateway/protocol`, `@gajae-gateway/sdk`, and `@gajae-gateway/cli` are npm-publishable as standalone packages — see [Publishing packages](#publishing-packages) below for the release workflow. The gateway, adapters, admin console, and `@gajae-gateway/subsession` stay private application code and ship only as the compiled binaries below; `@gajae-gateway/conformance` is a private, unshipped CI/test-only package.
 
 For how memory, monitors, and the gateway work end to end, see [the documentation](docs/).
 
@@ -114,7 +114,7 @@ Production hosts run the compiled binaries, not this source checkout.
 
 ### Publishing packages
 
-`@gajaeway/protocol`, `@gajaeway/sdk`, and `@gajaeway/cli` are npm-publishable under the `@gajaeway` scope. Each has its own `build` step that bundles `src/` into a single Node-ESM-resolvable `dist/*.js` with Bun, then emits `.d.ts` declarations with `tsc` (`emitDeclarationOnly`), and a `prepublishOnly` script so a publish always ships current compiled output. The published tarball includes both `dist/` (resolved by `main`/`types`/the default export condition for non-Bun consumers) and `src/` (resolved by the `bun` export condition, so an installed Bun consumer imports source directly instead of the compiled build). `@gajaeway/protocol` has zero runtime dependencies. Publishing must go through Bun, not plain npm: `npm pack --dry-run` only lists a package's contents and does **not** rewrite dependencies — plain `npm pack`/`npm publish` leave `workspace:*` in the packed manifest, which a real npm consumer cannot resolve. `bun pm pack` and `bun publish` rewrite each published package's `workspace:*` dependency on `@gajaeway/protocol`/`@gajaeway/sdk` to the exact version being packed, producing a registry-valid manifest — verified by packing with `bun pm pack`, `npm install`-ing the tarballs into a scratch project, and running a real `node --input-type=module -e "import('@gajaeway/sdk')"` against the installed package (transcript: [`artifacts/ultragoal-npm-clean-install-verification.txt`](artifacts/ultragoal-npm-clean-install-verification.txt)).
+`@gajae-gateway/protocol`, `@gajae-gateway/sdk`, and `@gajae-gateway/cli` are npm-publishable under the `@gajae-gateway` scope. Each has its own `build` step that bundles `src/` into a single Node-ESM-resolvable `dist/*.js` with Bun, then emits `.d.ts` declarations with `tsc` (`emitDeclarationOnly`), and a `prepublishOnly` script so a publish always ships current compiled output. The published tarball includes both `dist/` (resolved by `main`/`types`/the default export condition for non-Bun consumers) and `src/` (resolved by the `bun` export condition, so an installed Bun consumer imports source directly instead of the compiled build). `@gajae-gateway/protocol` has zero runtime dependencies. Publishing must go through Bun, not plain npm: `npm pack --dry-run` only lists a package's contents and does **not** rewrite dependencies — plain `npm pack`/`npm publish` leave `workspace:*` in the packed manifest, which a real npm consumer cannot resolve. `bun pm pack` and `bun publish` rewrite each published package's `workspace:*` dependency on `@gajae-gateway/protocol`/`@gajae-gateway/sdk` to the exact version being packed, producing a registry-valid manifest — verified by packing with `bun pm pack`, `npm install`-ing the tarballs into a scratch project, and running a real `node --input-type=module -e "import('@gajae-gateway/sdk')"` against the installed package (transcript: [`artifacts/ultragoal-npm-clean-install-verification.txt`](artifacts/ultragoal-npm-clean-install-verification.txt)).
 
 `scripts/release-packages.ts` runs the whole release in the required dependency order (`protocol` → `sdk` → `cli`, since `sdk` and `cli` depend on the versions published before them):
 
@@ -123,7 +123,13 @@ bun run release:dry-run   # builds each package, then `bun pm pack`s it into dis
 bun run release:publish   # builds each package, then `bun publish`s it (add --tag <name> for a non-latest dist-tag)
 ```
 
-Inspect `dist-packed/*.tgz` from a dry run before ever running `release:publish`. `@gajaeway/sdk` and `@gajaeway/cli` depend on `@gajaeway/protocol`/`@gajaeway/sdk` being published first, which is why the script releases them in that order. Each package's `publishConfig` sets public npm access for the scoped name.
+Inspect `dist-packed/*.tgz` from a dry run before ever running `release:publish`. `@gajae-gateway/sdk` and `@gajae-gateway/cli` depend on `@gajae-gateway/protocol`/`@gajae-gateway/sdk` being published first, which is why the script releases them in that order. Each package's `publishConfig` sets public npm access for the scoped name.
+
+### CI/CD
+
+[`build.yml`](.github/workflows/build.yml) runs on every push and pull request: Biome, `tsc --noEmit`, `bun test packages/`, and the frozen-corpus benchmark gate, each across macOS arm64, Linux x64, and Linux arm64.
+
+[`release.yml`](.github/workflows/release.yml) runs on a `v*.*.*` tag push (or manually via `workflow_dispatch`, with an optional `npm_tag` input for a non-`latest` dist-tag). It re-runs the full `verify` matrix first, then only on green: publishes `@gajae-gateway/protocol`, `@gajae-gateway/sdk`, and `@gajae-gateway/cli` to npm in dependency order via `bun run release:publish`, builds and archives the six standalone binaries for each platform, and creates a GitHub release with the archives attached and auto-generated notes. Publishing needs an `NPM_TOKEN` repository secret for an account that can publish to the `@gajae-gateway` npm scope (create the `gajae-gateway` npm organization once at [npmjs.com/org/create](https://www.npmjs.com/org/create) if it does not exist yet, then add that account's token as the secret).
 
 ## License
 

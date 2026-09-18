@@ -3,6 +3,6 @@
 	"type": "hello",
 	"payload": {
 		"supportedVersions": ["0.1"],
-		"clientInfo": { "name": "@gajaeway/sdk", "version": "0.1.0" }
+		"clientInfo": { "name": "@gajae-gateway/sdk", "version": "0.1.0" }
 	}
 }

@@ -1,4 +1,4 @@
-import { REACTION_ALLOWLIST, type ReactionRef } from "@gajaeway/protocol";
+import { REACTION_ALLOWLIST, type ReactionRef } from "@gajae-gateway/protocol";
 
 /**
  * Telegram's reaction surface, mapped onto the protocol allowlist.

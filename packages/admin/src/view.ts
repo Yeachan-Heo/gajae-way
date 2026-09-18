@@ -19,7 +19,7 @@ import type {
 	MonitorRecord,
 	SessionListResult,
 	TriggerSpec,
-} from "@gajaeway/protocol";
+} from "@gajae-gateway/protocol";
 import {
 	ATTENTION_GAPS,
 	type AttentionItem,

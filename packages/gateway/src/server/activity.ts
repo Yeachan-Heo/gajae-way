@@ -1,4 +1,4 @@
-import type { ChatProgressActivity } from "@gajaeway/protocol";
+import type { ChatProgressActivity } from "@gajae-gateway/protocol";
 import type { TailFrame } from "../orchestrator/tail-runner";
 
 /**

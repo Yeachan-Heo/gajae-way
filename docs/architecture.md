@@ -6,13 +6,13 @@ The Bun workspace is divided into small packages:
 
 | Package | Responsibility |
 |---|---|
-| `@gajaeway/protocol` | Versioned NDJSON frames, negotiation, verb/event catalogues, and canonical origins. |
-| `@gajaeway/sdk` | Client for the gateway’s Unix-domain socket or stdio transport. |
-| `@gajaeway/gateway` | Daemon: configuration, SQLite state, sessions, delivery, memory, monitors, and the `gjc` boundary. |
-| `@gajaeway/adapter-discord` | Discord ingress and outbound delivery, including typing hints and the reaction-gradient presence. |
-| `@gajaeway/adapter-telegram` | Telegram ingress and outbound delivery. |
-| `@gajaeway/adapter-slack` | Slack ingress over Socket Mode, mrkdwn delivery, reactions, working-status presence, and missed-message recovery. |
-| `@gajaeway/cli` | Owner commands over the gateway socket. |
+| `@gajae-gateway/protocol` | Versioned NDJSON frames, negotiation, verb/event catalogues, and canonical origins. |
+| `@gajae-gateway/sdk` | Client for the gateway’s Unix-domain socket or stdio transport. |
+| `@gajae-gateway/gateway` | Daemon: configuration, SQLite state, sessions, delivery, memory, monitors, and the `gjc` boundary. |
+| `@gajae-gateway/adapter-discord` | Discord ingress and outbound delivery, including typing hints and the reaction-gradient presence. |
+| `@gajae-gateway/adapter-telegram` | Telegram ingress and outbound delivery. |
+| `@gajae-gateway/adapter-slack` | Slack ingress over Socket Mode, mrkdwn delivery, reactions, working-status presence, and missed-message recovery. |
+| `@gajae-gateway/cli` | Owner commands over the gateway socket. |
 
 `bun run build` compiles the gateway, Discord adapter, Telegram adapter, Slack adapter, and CLI into standalone executables. The gateway's `GlobalGjcClient` is only a client of the same global-user GJC executable, canonical agent directory, and broker used by the operator's normal SDK. Matching the executable alone is insufficient: the service must resolve the same user profile and broker authority. GJC owns daemon startup and lifecycle; the gateway neither seeds settings nor owns, reaps, repairs, or garbage-collects the shared runtime. Every persona, worker, and monitor operation uses `SessionPort`; no per-turn `gjc --resume` process is spawned. Normal shutdown closes only the gateway's own SDK calls and relays, never the shared user daemon or its session hosts.
 

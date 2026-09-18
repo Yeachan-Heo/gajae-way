@@ -2,9 +2,9 @@ import { describe, expect, spyOn, test } from "bun:test";
 import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import type { OpsCycleResult } from "@gajaeway/protocol";
-import { originKey, parseOriginKey } from "@gajaeway/protocol";
-import { GajaewayClient } from "@gajaeway/sdk";
+import type { OpsCycleResult } from "@gajae-gateway/protocol";
+import { originKey, parseOriginKey } from "@gajae-gateway/protocol";
+import { GajaewayClient } from "@gajae-gateway/sdk";
 import {
 	CLI_USAGE,
 	COMMANDS,

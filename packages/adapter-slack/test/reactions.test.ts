@@ -1,5 +1,5 @@
 import { expect, test } from "bun:test";
-import { REACTION_ALLOWLIST } from "@gajaeway/protocol";
+import { REACTION_ALLOWLIST } from "@gajae-gateway/protocol";
 import {
 	describeSlackReaction,
 	reactionFromSlackName,

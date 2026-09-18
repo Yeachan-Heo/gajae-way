@@ -1,5 +1,5 @@
 import { join } from "node:path";
-import { installStructuredLogging } from "@gajaeway/log";
+import { installStructuredLogging } from "@gajae-gateway/log";
 import {
 	type ChannelEngagementPolicy,
 	type ChatMessagePayload,
@@ -13,8 +13,8 @@ import {
 	presenceMarkersFor,
 	presenceTransition,
 	type ReactionAction,
-} from "@gajaeway/protocol";
-import { GajaewayClient } from "@gajaeway/sdk";
+} from "@gajae-gateway/protocol";
+import { GajaewayClient } from "@gajae-gateway/sdk";
 import { AttachmentBuilder, Client, GatewayIntentBits, MessageFlags, Partials } from "discord.js";
 import pkg from "../package.json";
 import { type AttachmentCarrier, describeInboundBody, firstVoiceMessage } from "./attachments";

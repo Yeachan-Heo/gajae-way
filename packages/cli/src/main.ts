@@ -12,9 +12,9 @@ import type {
 	WorkStartResult,
 	WorkStatusResult,
 	WorkSteerResult,
-} from "@gajaeway/protocol";
-import { LOOPBACK_ORIGIN, originKey, parseOriginKey } from "@gajaeway/protocol";
-import { GajaewayClient } from "@gajaeway/sdk";
+} from "@gajae-gateway/protocol";
+import { LOOPBACK_ORIGIN, originKey, parseOriginKey } from "@gajae-gateway/protocol";
+import { GajaewayClient } from "@gajae-gateway/sdk";
 import {
 	columnNames,
 	type ListOptions,

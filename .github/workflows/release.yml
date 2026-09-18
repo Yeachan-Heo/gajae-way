@@ -1,0 +1,121 @@
+name: release
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+  workflow_dispatch:
+    inputs:
+      npm_tag:
+        description: "npm dist-tag for the package publish (e.g. latest, next)"
+        required: false
+        default: "latest"
+
+jobs:
+  # Runs the same verification the build workflow runs before anything is
+  # published or released, so a red test/build never reaches the registry
+  # or GitHub releases.
+  verify:
+    name: verify-${{ matrix.platform }}-${{ matrix.arch }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - os: macos-14
+            platform: darwin
+            arch: arm64
+          - os: ubuntu-24.04
+            platform: linux
+            arch: x64
+          - os: ubuntu-24.04-arm
+            platform: linux
+            arch: arm64
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.4.0
+      - run: bun install --frozen-lockfile
+      - run: bunx biome ci packages/
+      - run: bunx tsc --noEmit -p tsconfig.json
+      - run: bun test packages/
+
+  publish-npm:
+    name: publish npm packages
+    needs: verify
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.4.0
+      - run: bun install --frozen-lockfile
+      # Publishes @gajae-gateway/protocol, @gajae-gateway/sdk, and @gajae-gateway/cli in
+      # dependency order via scripts/release-packages.ts --publish. The
+      # script never touches the registry unless --publish is explicit.
+      - name: Publish protocol, sdk, cli (dependency order)
+        env:
+          NPM_CONFIG_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          echo "//registry.npmjs.org/:_authToken=${NPM_CONFIG_TOKEN}" > ~/.npmrc
+          TAG="${{ github.event.inputs.npm_tag }}"
+          if [ -z "$TAG" ]; then TAG="latest"; fi
+          bun run release:publish -- --tag "$TAG"
+
+  build-binaries:
+    name: build-${{ matrix.platform }}-${{ matrix.arch }}
+    needs: verify
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-14
+            platform: darwin
+            arch: arm64
+          - os: ubuntu-24.04
+            platform: linux
+            arch: x64
+          - os: ubuntu-24.04-arm
+            platform: linux
+            arch: arm64
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.4.0
+      - run: bun install --frozen-lockfile
+      - run: bun run build
+      - name: Package binaries
+        run: |
+          mkdir -p release
+          tar -czf "release/gajaeway-${{ matrix.platform }}-${{ matrix.arch }}.tar.gz" -C dist .
+      - uses: actions/upload-artifact@v4
+        with:
+          name: gajaeway-${{ matrix.platform }}-${{ matrix.arch }}
+          path: release/*.tar.gz
+          if-no-files-found: error
+
+  github-release:
+    name: create GitHub release
+    needs: [publish-npm, build-binaries]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          path: release
+          merge-multiple: true
+      - name: Create release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: release/*.tar.gz
+          generate_release_notes: true
+          draft: false
+          prerelease: false

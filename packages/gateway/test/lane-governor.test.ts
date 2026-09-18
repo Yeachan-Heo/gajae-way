@@ -1,6 +1,6 @@
 import { afterEach, expect, setSystemTime, test } from "bun:test";
-import { ProtocolError } from "@gajaeway/protocol";
-import { appendAttempt, closeAttempt, createLaneJobRecord, type LaneJobRecord, newOpRef } from "@gajaeway/subsession";
+import { ProtocolError } from "@gajae-gateway/protocol";
+import { appendAttempt, closeAttempt, createLaneJobRecord, type LaneJobRecord, newOpRef } from "@gajae-gateway/subsession";
 import { LaneGovernor, laneJobIdentity } from "../src/orchestrator/lane-governor";
 import { GatewayDatabase } from "../src/store/db";
 import { ScriptedSessionPort } from "./session-port.fake";

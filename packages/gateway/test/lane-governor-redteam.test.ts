@@ -2,7 +2,7 @@ import { afterEach, expect, test } from "bun:test";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { appendAttempt, closeAttempt, createLaneJobRecord, newOpRef } from "@gajaeway/subsession";
+import { appendAttempt, closeAttempt, createLaneJobRecord, newOpRef } from "@gajae-gateway/subsession";
 import { LaneGovernor, laneJobIdentity } from "../src/orchestrator/lane-governor";
 import { type GatewayServer, startUnixServer } from "../src/server/server";
 import { GatewayDatabase } from "../src/store/db";

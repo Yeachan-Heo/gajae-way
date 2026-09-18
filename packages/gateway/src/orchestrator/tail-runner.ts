@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import type { CliResult, CliRunner } from "@gajaeway/subsession";
+import type { CliResult, CliRunner } from "@gajae-gateway/subsession";
 import { sanitizeDiagnostic } from "./rebind";
 
 /** The observed SDK-hosted top-level vocabulary from p2b §8. */

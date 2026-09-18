@@ -7,7 +7,7 @@ import {
 	presenceEffortBucket,
 	presenceMarkersFor,
 	presenceSnapshot,
-} from "@gajaeway/protocol";
+} from "@gajae-gateway/protocol";
 import { type GatewayClientLike, ReconnectingGateway, settleSlackDelivery, subscribeSlackProgress } from "../src/main";
 import { isPresenceReaction, presenceStatusText, WORKING_STATUS_STALE_MS, WorkingStatus } from "../src/status";
 
@@ -103,7 +103,7 @@ test("presence buckets: phase from activity, clock per minute, effort from tool 
 });
 
 test("presence markers never collide with the persona's reaction allowlist", async () => {
-	const { REACTION_ALLOWLIST } = await import("@gajaeway/protocol");
+	const { REACTION_ALLOWLIST } = await import("@gajae-gateway/protocol");
 	const { SLACK_REACTION_NAMES } = await import("../src/reactions");
 	for (const entry of REACTION_ALLOWLIST)
 		expect(isPresenceReaction(SLACK_REACTION_NAMES[entry.name] ?? "")).toBe(false);

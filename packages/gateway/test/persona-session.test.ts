@@ -3,7 +3,7 @@ import { createHash } from "node:crypto";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { GjcCliError } from "@gajaeway/subsession";
+import { GjcCliError } from "@gajae-gateway/subsession";
 import { PersonaSessionManager, personaTurnOpRef } from "../src/orchestrator/persona-session";
 import type { TailAttachInput } from "../src/orchestrator/tail-runner";
 import { GatewayDatabase } from "../src/store/db";
