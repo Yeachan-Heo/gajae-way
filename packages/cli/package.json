@@ -22,11 +22,11 @@
 		"src"
 	],
 	"main": "./dist/main.js",
-	"types": "./dist/main.d.ts",
+	"types": "./src/main.ts",
 	"exports": {
 		".": {
 			"bun": "./src/main.ts",
-			"types": "./dist/main.d.ts",
+			"types": "./src/main.ts",
 			"default": "./dist/main.js"
 		}
 	},
