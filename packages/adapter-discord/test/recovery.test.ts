@@ -1288,8 +1288,11 @@ test("a rejected engagement.reaction is logged, never a reconnect (live: 313 rec
 			"add",
 			bot,
 		);
-		await settle(20);
-		expect(logs.some((line) => line.includes("engagement.reaction failed: unhealthy_failed_closed"))).toBe(true);
+		// sendReaction is fire-and-forget; wait for the observable, not a fixed
+		// 20 ms (that lost the race on loaded CI runners - three PRs in a row).
+		const failed = () => logs.some((line) => line.includes("engagement.reaction failed: unhealthy_failed_closed"));
+		for (let attempt = 0; attempt < 200 && !failed(); attempt++) await settle(5);
+		expect(failed()).toBe(true);
 		expect(reconnects.filter((line) => line.includes("reconnecting"))).toEqual([]);
 	} finally {
 		console.error = original;
