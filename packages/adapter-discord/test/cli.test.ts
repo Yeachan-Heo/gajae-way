@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, readdir, readFile, rm, utimes, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { AdapterAlreadyRunningError, AdapterLock, processIsAlive } from "../src/lock";
@@ -102,6 +102,72 @@ describe("a second adapter instance refuses to boot", () => {
 			expect((await readFile(lock.path, "utf8")).trim()).toBe("5353");
 		});
 	});
+
+	test("a winner slower than the reclaim window keeps its election", async () => {
+		await withHome(async (home) => {
+			const path = join(home, "adapter-discord.pid");
+			await writeFile(path, "99999\n");
+			let reachedPidfileWrite = 0;
+			const results = await Promise.allSettled(
+				Array.from({ length: 20 }, (_, i) =>
+					AdapterLock.acquire(home, {
+						pid: i + 1,
+						alive: () => false,
+						beforePidfileWrite: async () => {
+							reachedPidfileWrite++;
+							await Bun.sleep(1250);
+						},
+					}),
+				),
+			);
+			const winners = results.filter((result) => result.status === "fulfilled");
+			expect(winners).toHaveLength(1);
+			// An election refreshed by its live owner is never reclaimable, so no
+			// second contender is ever elected into the pidfile write.
+			expect(reachedPidfileWrite).toBe(1);
+			for (const result of results)
+				if (result.status === "rejected") expect(result.reason).toBeInstanceOf(AdapterAlreadyRunningError);
+			const winner = winners[0]!.value;
+			expect(await readFile(path, "utf8")).toBe(`${winner.pid}\n`);
+			expect((await readdir(home)).filter((name) => name.includes(".reclaim.d") || name.endsWith(".dead"))).toEqual([]);
+			await winner.release();
+		});
+	}, 10000);
+
+	test("a displaced winner never overwrites the pidfile of the contender that replaced it", async () => {
+		await withHome(async (home) => {
+			const path = join(home, "adapter-discord.pid");
+			const election = `${path}.reclaim.d`;
+			await writeFile(path, "99999\n");
+			let backdated = false;
+			const results = await Promise.allSettled(
+				Array.from({ length: 20 }, (_, i) =>
+					AdapterLock.acquire(home, {
+						pid: i + 1,
+						alive: () => false,
+						beforePidfileWrite: async () => {
+							if (backdated) return;
+							backdated = true;
+							// Outrun this winner's own heartbeat so a waiting contender really
+							// does reclaim the election mid-critical-section.
+							for (let tick = 0; tick < 80; tick++) {
+								const aged = new Date(Date.now() - 5000);
+								await utimes(election, aged, aged).catch(() => {});
+								await Bun.sleep(50);
+							}
+						},
+					}),
+				),
+			);
+			const winners = results.filter((result) => result.status === "fulfilled");
+			expect(winners).toHaveLength(1);
+			for (const result of results)
+				if (result.status === "rejected") expect(result.reason).toBeInstanceOf(AdapterAlreadyRunningError);
+			const winner = winners[0]!.value;
+			expect(await readFile(path, "utf8")).toBe(`${winner.pid}\n`);
+			await winner.release();
+		});
+	}, 30000);
 
 	test("an unparseable pidfile is stale, not a live holder", async () => {
 		await withHome(async (home) => {

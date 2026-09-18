@@ -1452,6 +1452,87 @@ test("RT-SLACK-64 twenty contenders elect exactly one winner in twenty stale ele
 	}
 }, 60000);
 
+// A critical section longer than the 1s reclaim wait window is the live
+// incident shape (#213): under CI load the winner was judged abandoned and its
+// election was stolen while it was still installing the pidfile.
+test("RT-SLACK-64 a winner slower than the reclaim window keeps its election", async () => {
+	const home = await mkdtemp(join(tmpdir(), "slack-g6-slow-winner-"));
+	try {
+		const path = join(home, "adapter-slack.pid");
+		await writeFile(path, "99999\n");
+		let reachedPidfileWrite = 0;
+		const results = await Promise.allSettled(
+			Array.from({ length: 20 }, (_, i) =>
+				AdapterLock.acquire(home, {
+					pid: i + 1,
+					alive: () => false,
+					beforePidfileWrite: async () => {
+						reachedPidfileWrite++;
+						await Bun.sleep(1250);
+					},
+				}),
+			),
+		);
+		const winners = results.filter((result) => result.status === "fulfilled");
+		expect(winners).toHaveLength(1);
+		// The heartbeat is what makes this exact: an election refreshed by its live
+		// owner is never reclaimable, so no second contender is ever elected and
+		// only one acquisition ever reaches the pidfile write.
+		expect(reachedPidfileWrite).toBe(1);
+		for (const result of results)
+			if (result.status === "rejected") expect(result.reason).toBeInstanceOf(AdapterAlreadyRunningError);
+		const winner = winners[0]!.value;
+		expect(await readFile(path, "utf8")).toBe(`${winner.pid}\n`);
+		expect((await readdir(home)).filter((name) => name.includes(".reclaim.d") || name.endsWith(".dead"))).toEqual([]);
+		await winner.release();
+	} finally {
+		await rm(home, { recursive: true, force: true });
+	}
+}, 10000);
+
+// And when the election IS stolen anyway - a hostile or clock-skewed reclaimer
+// backdates it past the window - the displaced winner must fail closed instead
+// of overwriting the new holder's pidfile.
+test("RT-SLACK-64 a displaced winner never overwrites the pidfile of the contender that replaced it", async () => {
+	const home = await mkdtemp(join(tmpdir(), "slack-g6-displaced-winner-"));
+	try {
+		const path = join(home, "adapter-slack.pid");
+		const election = `${path}.reclaim.d`;
+		await writeFile(path, "99999\n");
+		let backdated = false;
+		const results = await Promise.allSettled(
+			Array.from({ length: 20 }, (_, i) =>
+				AdapterLock.acquire(home, {
+					pid: i + 1,
+					alive: () => false,
+					beforePidfileWrite: async () => {
+						// Only the first contender to get here is the original winner.
+						if (backdated) return;
+						backdated = true;
+						// Outrun the winner's own heartbeat: the election looks abandoned for
+						// the whole critical section, so a waiting contender really does
+						// reclaim it and get elected while this winner is still working.
+						for (let tick = 0; tick < 80; tick++) {
+							const aged = new Date(Date.now() - 5000);
+							await utimes(election, aged, aged).catch(() => {});
+							await Bun.sleep(50);
+						}
+					},
+				}),
+			),
+		);
+		const winners = results.filter((result) => result.status === "fulfilled");
+		expect(winners).toHaveLength(1);
+		for (const result of results)
+			if (result.status === "rejected") expect(result.reason).toBeInstanceOf(AdapterAlreadyRunningError);
+		const winner = winners[0]!.value;
+		expect(await readFile(path, "utf8")).toBe(`${winner.pid}\n`);
+		await winner.release();
+	} finally {
+		await rm(home, { recursive: true, force: true });
+	}
+}, 30000);
+
 test("RT-SLACK-65 aged ownerless election recovers within two seconds", async () => {
 	const home = await mkdtemp(join(tmpdir(), "slack-g6-ownerless-"));
 	cleanups.push(() => rm(home, { recursive: true, force: true }));
