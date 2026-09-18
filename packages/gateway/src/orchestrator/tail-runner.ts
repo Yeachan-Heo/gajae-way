@@ -477,6 +477,8 @@ class ManagedTailHandle implements TailHandle {
 		if (this.#closed || this.#accepted) return;
 		this.#acceptedOpRef = opRef;
 		this.#preReceipt.splice(0);
+		// Everything the ring holds right now predates the prompt about to be sent.
+		this.#turnFloor = this.#ringHigh;
 		await this.#commitPendingCursor();
 	}
 	async markAccepted(opRef: string): Promise<void> {
@@ -565,7 +567,15 @@ class ManagedTailHandle implements TailHandle {
 		if (this.#closed) return;
 		this.#lastEventAt = this.#runner.now();
 		this.#stallReported = false;
+		this.#noteRingPosition(frame);
 		if (frame.idle) this.setIdle();
+		if (this.#acceptedOpRef !== undefined && frame.rawKind !== "transcript" && this.#predatesTurnFloor(frame)) {
+			if (frame.assistantText)
+				this.#input.onDiagnostic?.(
+					`tail_frame_pre_floor session=${this.sessionId} kind=${frame.rawKind} at=${frame.generation}:${frame.seq} floor=${this.#turnFloor?.generation}:${this.#turnFloor?.seq}`,
+				);
+			return;
+		}
 		if (frame.kind === "unknown" && this.#unknownDiagnostics < UNKNOWN_KIND_DIAGNOSTIC_CAP) {
 			this.#unknownDiagnostics++;
 			this.#input.onDiagnostic?.(`unknown_runtime_event session=${this.sessionId} kind=${frame.rawKind}`);
@@ -629,6 +639,33 @@ class ManagedTailHandle implements TailHandle {
 
 	/** Frame ids already handed to the actor; a backfill after a stream reopen replays history and must never re-deliver. */
 	readonly #deliveredIds = new Set<string>();
+
+	/**
+	 * Highest event-ring position (generation, seq) observed through this handle,
+	 * and the position at the moment the current turn began. A ring event at or
+	 * below the turn floor was emitted BEFORE this turn's prompt was sent: it
+	 * belongs to an earlier turn, whatever a resumed poll replays. Transcript
+	 * rows are fenced by their host timestamp in the actor; ring events (the
+	 * finalized answer, lifecycle) carry no timestamp, only a position, and a
+	 * resume that replays the ring re-delivered eight earlier turns' finalized
+	 * answers into one (live, 2026-09-18). Live: 15 messages for 4 steers, 14 of
+	 * them earlier turns' answers.
+	 */
+	#ringHigh: { generation: number; seq: number } | undefined;
+	#turnFloor: { generation: number; seq: number } | undefined;
+
+	#noteRingPosition(frame: TailFrame): void {
+		if (frame.generation === undefined || frame.seq === undefined) return;
+		const high = this.#ringHigh;
+		if (!high || frame.generation > high.generation || (frame.generation === high.generation && frame.seq > high.seq))
+			this.#ringHigh = { generation: frame.generation, seq: frame.seq };
+	}
+
+	#predatesTurnFloor(frame: TailFrame): boolean {
+		const floor = this.#turnFloor;
+		if (!floor || frame.generation === undefined || frame.seq === undefined) return false;
+		return frame.generation < floor.generation || (frame.generation === floor.generation && frame.seq <= floor.seq);
+	}
 
 	async #deliver(frame: TailFrame): Promise<void> {
 		// Finalized answers are also keyed by messageRef so a backfill transcript row
