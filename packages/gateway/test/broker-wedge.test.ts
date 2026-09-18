@@ -1,5 +1,5 @@
 import { afterEach, expect, spyOn, test } from "bun:test";
-import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, realpath, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -103,7 +103,8 @@ test("the broker supervisor exposes a discovery-file liveness seam with an injec
 		cwd: home,
 		isPidAlive: (pid) => pid === 8123,
 	});
-	expect(broker.discoveryPath).toBe(discoveryPath);
+	// realpath: macOS resolves the temp dir through /private, so the raw strings differ.
+	expect(await realpath(broker.discoveryPath)).toBe(await realpath(discoveryPath));
 	expect(await broker.judgeLiveness()).toEqual({ state: "live", pid: 8123, heartbeatAt: now });
 	await writeFile(discoveryPath, JSON.stringify(discovery(8123, now - BROKER_HEARTBEAT_TTL_MS - 1)));
 	expect(await broker.judgeLiveness()).toMatchObject({ state: "wedged", reason: "heartbeat_stale" });
