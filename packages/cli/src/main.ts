@@ -1,5 +1,5 @@
 #!/usr/bin/env bun
-import { copyFile, stat } from "node:fs/promises";
+import { copyFile, lstat, readFile, stat } from "node:fs/promises";
 import { isAbsolute, join } from "node:path";
 import type {
 	MonitorRecord,
@@ -159,6 +159,47 @@ export function cycleExitCode(cycle: OpsCycleResult): number {
 	return cycle.gates.length > 0 ? 1 : 0;
 }
 
+/**
+ * The database the gateway actually opens: `config.json` `dbPath` when set,
+ * otherwise `<home>/gateway.db` — the same file-based resolution as the
+ * gateway's `loadConfig`. An absent `config.json` means defaults, exactly as
+ * at boot. A present-but-unreadable one (EACCES, EISDIR, or a dangling symlink,
+ * which reports ENOENT while the entry exists) refuses the restore instead of
+ * guessing, as boot refuses to start: copying a backup over the wrong file
+ * reports success while the live database stays broken.
+ *
+ * `schemaVersion` is deliberately not checked: `dbPath` is a version-independent
+ * string, and disaster recovery must not be blocked by an unrelated schema bump.
+ */
+export async function restoreTargetPath(home = gatewayHome()): Promise<string> {
+	const configPath = join(home, "config.json");
+	let raw: string | undefined;
+	try {
+		raw = await readFile(configPath, "utf8");
+	} catch (error) {
+		const code = (error as NodeJS.ErrnoException).code;
+		const entryExists = await lstat(configPath).then(
+			() => true,
+			() => false,
+		);
+		if (code !== "ENOENT" || entryExists) throw new Error(`Cannot read ${configPath}; refusing restore.`);
+	}
+	if (raw === undefined) return join(home, "gateway.db");
+	let parsed: unknown;
+	try {
+		parsed = JSON.parse(raw);
+	} catch {
+		throw new Error(`Cannot parse ${configPath}; refusing restore.`);
+	}
+	if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed))
+		throw new Error(`Invalid configuration ${configPath}: config must be an object; refusing restore.`);
+	const dbPath = (parsed as { dbPath?: unknown }).dbPath;
+	if (dbPath === undefined) return join(home, "gateway.db");
+	if (typeof dbPath !== "string" || dbPath.length === 0)
+		throw new Error(`Invalid configuration ${configPath}: dbPath must be a non-empty string; refusing restore.`);
+	return dbPath;
+}
+
 export async function restoreDatabase(socket: string, backupPath: string): Promise<void> {
 	if (!isAbsolute(backupPath)) throw new Error("ops restore requires an absolute backup path");
 	try {
@@ -177,7 +218,7 @@ export async function restoreDatabase(socket: string, backupPath: string): Promi
 	}
 	if (new TextDecoder().decode(header) !== "SQLite format 3\u0000")
 		throw new Error(`Backup is not a SQLite database: ${backupPath}`);
-	const databasePath = join(gatewayHome(), "gateway.db");
+	const databasePath = await restoreTargetPath();
 	const preservedPath = `${databasePath}.pre-restore-${new Date().toISOString().replace(/[:.]/g, "-")}`;
 	await copyFile(databasePath, preservedPath);
 	await copyFile(backupPath, databasePath);
