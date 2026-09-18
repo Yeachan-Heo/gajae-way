@@ -1,4 +1,5 @@
 import { join } from "node:path";
+import { installStructuredLogging } from "@gajaeway/log";
 import {
 	type ChannelEngagementPolicy,
 	type ChatMessagePayload,
@@ -1907,19 +1908,27 @@ if (import.meta.main) {
 		console.error(argv.message);
 		process.exit(USAGE_EXIT_CODE);
 	} else {
+		const disposeLogging = installStructuredLogging({
+			path: join(adapterHome(), "adapter-discord.log"),
+		});
 		// The lock is taken before the config is even read: refusing early keeps a
 		// stray start from touching the resident instance's gateway session.
 		AdapterLock.acquire(adapterHome())
 			.then(async (lock) => {
 				// Registering a signal handler suppresses the default terminate, so
 				// the lock is dropped and the exit is then performed by hand.
-				const release = (): void => void lock.release().finally(() => process.exit(0));
+				const release = (): void =>
+					void lock.release().finally(() => {
+						disposeLogging();
+						process.exit(0);
+					});
 				process.once("SIGINT", release);
 				process.once("SIGTERM", release);
 				await startDiscordAdapter(await loadDiscordAdapterConfig());
 			})
 			.catch((error) => {
 				console.error(error instanceof Error ? error.message : String(error));
+				disposeLogging();
 				process.exitCode = error instanceof AdapterAlreadyRunningError ? USAGE_EXIT_CODE : 1;
 			});
 	}

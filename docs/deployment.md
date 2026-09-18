@@ -156,10 +156,16 @@ A user agent can launch the gateway:
   <key>RunAtLoad</key><true/>
   <key>KeepAlive</key><true/>
   <key>ExitTimeOut</key><integer>30</integer>
-  <key>StandardOutPath</key><string>/Users/me/gajaeway/gateway.log</string>
-  <key>StandardErrorPath</key><string>/Users/me/gajaeway/gateway.log</string>
+  <key>StandardOutPath</key><string>/Users/me/gajaeway/gateway.stdout.log</string>
+  <key>StandardErrorPath</key><string>/Users/me/gajaeway/gateway.stderr.log</string>
 </dict></plist>
 ```
+
+### The service owns its own log sink
+
+Each daemon writes its own rotating sink under `$GAJAEWAY_HOME`: `gateway.log`, `adapter-discord.log`, `adapter-slack.log`. Every line begins with an ISO-8601 UTC timestamp and a level, identical consecutive events collapse into one `x<N> (identical, first=… last=…)` line, the live file rotates to `.1`…`.5` at 10 MB, and an hourly `service_alive uptime=…` line makes log silence distinguishable from service silence.
+
+The service manager's own stdout/stderr redirect must therefore NOT point at those paths - it would double-write every line. Point it at a separate file (as above) or leave it to the journal; the owned sink is the one to read during an incident.
 
 This launchd example is macOS-specific, not a deployment command for the systemd host reached on SSH port 24. Before installing it, set its executable and profile paths to the verified interactive user's values. A launchd job does not inherit your shell: supply the same canonical profile environment and required model-key variables through a protected mechanism. An already-running shared GJC daemon retains its own environment; restarting the gateway does not rotate that daemon's credentials. Protect the plist:
 

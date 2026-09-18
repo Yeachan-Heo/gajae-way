@@ -14,6 +14,7 @@
       "name": "@gajaeway/adapter-discord",
       "version": "0.1.0",
       "dependencies": {
+        "@gajaeway/log": "workspace:*",
         "@gajaeway/protocol": "workspace:*",
         "@gajaeway/sdk": "workspace:*",
         "discord.js": "^14.25.1",
@@ -23,6 +24,7 @@
       "name": "@gajaeway/adapter-slack",
       "version": "0.1.0",
       "dependencies": {
+        "@gajaeway/log": "workspace:*",
         "@gajaeway/protocol": "workspace:*",
         "@gajaeway/sdk": "workspace:*",
       },
@@ -68,9 +70,14 @@
         "gajaeway-gateway": "./src/main.ts",
       },
       "dependencies": {
+        "@gajaeway/log": "workspace:*",
         "@gajaeway/protocol": "workspace:*",
         "@gajaeway/subsession": "workspace:*",
       },
+    },
+    "packages/log": {
+      "name": "@gajaeway/log",
+      "version": "0.1.0",
     },
     "packages/protocol": {
       "name": "@gajaeway/protocol",
@@ -132,6 +139,8 @@
     "@gajaeway/conformance": ["@gajaeway/conformance@workspace:packages/conformance"],
 
     "@gajaeway/gateway": ["@gajaeway/gateway@workspace:packages/gateway"],
+
+    "@gajaeway/log": ["@gajaeway/log@workspace:packages/log"],
 
     "@gajaeway/protocol": ["@gajaeway/protocol@workspace:packages/protocol"],
 
