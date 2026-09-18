@@ -5,6 +5,7 @@ import { type OriginRef, originKey, validateOriginRef } from "@gajaeway/protocol
 import type { GatewayConfig } from "../config";
 import { resolveChannelPolicy } from "../engagement/policy";
 import { captureRoot } from "../memory/doctrine";
+import { NAVIGATION_SOURCE_MAX_BYTES } from "../memory/registry";
 import { redactSecrets } from "../orchestrator/rebind";
 
 export const SESSION_BOOTSTRAP_MAX_BYTES = 8 * 1024;
@@ -19,7 +20,6 @@ export const SESSION_BOOTSTRAP_MAX_BYTES = 8 * 1024;
  * ~6277B of the total budget went unused and `truncated` still reported 0
  * (issue #70).
  */
-const MAX_SOURCE_BYTES = 24 * 1024;
 /** Daily files may be large, but bootstrap never reads more than this bounded window. */
 const MAX_DAILY_SOURCE_READ_BYTES = 4 * 1024 * 1024;
 /** Rendered daily bodies reserve predictable shares of the fixed 8 KiB envelope. */
@@ -52,7 +52,7 @@ interface SourceSection {
 	readonly path: string;
 	readonly freshness: string;
 	readonly body: string;
-	/** Set when the source exceeded MAX_SOURCE_BYTES and only its tail is present. */
+	/** Set when the source exceeded NAVIGATION_SOURCE_MAX_BYTES and only its tail is present. */
 	readonly excerpt?: { readonly keptBytes: number; readonly totalBytes: number };
 }
 
@@ -276,8 +276,8 @@ async function readSection(
 ): Promise<SourceSection> {
 	const target = await confinedFile(root, relativePath, allowed);
 	const info = await stat(target);
-	if (info.size > MAX_SOURCE_BYTES) throw new SourceTooLargeError(info.size);
-	const body = transform(await readUtf8Bounded(target, MAX_SOURCE_BYTES, info.size)).trim();
+	if (info.size > NAVIGATION_SOURCE_MAX_BYTES) throw new SourceTooLargeError(info.size);
+	const body = transform(await readUtf8Bounded(target, NAVIGATION_SOURCE_MAX_BYTES, info.size)).trim();
 	if (!body) throw new Error("no_safe_content");
 	return { name, path: relativePath.replaceAll("\\", "/"), freshness: info.mtime.toISOString(), body };
 }
@@ -316,7 +316,7 @@ async function readNavigationSection(
 ): Promise<{ readonly section: SourceSection; readonly rejected: number }> {
 	const target = await confinedFile(root, relativePath, allowed);
 	const info = await stat(target);
-	if (info.size > MAX_SOURCE_BYTES) throw new Error("source_too_large");
+	if (info.size > NAVIGATION_SOURCE_MAX_BYTES) throw new Error("source_too_large");
 	const text = await readFile(target, "utf8");
 	const body = [`# ${name}`];
 	let rejected = 0;
@@ -487,7 +487,7 @@ export async function buildSessionBootstrap(input: {
 	try {
 		const mapPath = await confinedFile(resolved.memory, "MEMORY.md", resolved.allowed);
 		const mapInfo = await stat(mapPath);
-		if (mapInfo.size > MAX_SOURCE_BYTES) throw new Error("source_too_large");
+		if (mapInfo.size > NAVIGATION_SOURCE_MAX_BYTES) throw new Error("source_too_large");
 		mapText = await readFile(mapPath, "utf8");
 		const safeLinks = new Set<string>();
 		for (const path of links(mapText))
@@ -509,7 +509,7 @@ export async function buildSessionBootstrap(input: {
 				try {
 					const target = await confinedFile(resolved.memory, path, resolved.allowed);
 					const info = await stat(target);
-					if (info.size > MAX_SOURCE_BYTES) continue;
+					if (info.size > NAVIGATION_SOURCE_MAX_BYTES) continue;
 					const content = await readFile(target, "utf8");
 					if (metadataMatches(content, key) && publicApproved(content)) eligibleLinks.add(path);
 				} catch {
@@ -609,7 +609,7 @@ export async function buildSessionBootstrap(input: {
 			try {
 				const target = await confinedFile(resolved.memory, path, resolved.allowed);
 				const info = await stat(target);
-				if (info.size > MAX_SOURCE_BYTES) continue;
+				if (info.size > NAVIGATION_SOURCE_MAX_BYTES) continue;
 				const text = await readFile(target, "utf8");
 				if (metadataMatches(text, key) && (!group || publicApproved(text)))
 					pointerLines.push(`- [${basename(path, ".md")}](${path})`);

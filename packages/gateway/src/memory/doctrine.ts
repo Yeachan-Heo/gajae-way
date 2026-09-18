@@ -1,7 +1,14 @@
 import type { Dirent } from "node:fs";
 import { appendFile, mkdir, readdir, readFile, realpath, rename, stat, unlink, writeFile } from "node:fs/promises";
 import { isAbsolute, join, normalize, relative } from "node:path";
-import { type AxisDescriptor, type AxisRegistry, loadRegistry, RECENT_INDEX_CAP, TREE_INDEX_CAP } from "./registry";
+import {
+	type AxisDescriptor,
+	type AxisRegistry,
+	loadRegistry,
+	NAVIGATION_SOURCE_MAX_BYTES,
+	RECENT_INDEX_CAP,
+	TREE_INDEX_CAP,
+} from "./registry";
 
 export function memoryRoot(home: string): string {
 	return join(home, "memory");
@@ -267,37 +274,96 @@ export function mapListsAxis(map: string, axis: AxisDescriptor): boolean {
  * canonical tree. Each axis is indexed the way its descriptor asks: a `recent`
  * axis lists its newest entries, a `tree` axis lists its whole hierarchy grouped
  * by partition, so a routable axis stays navigable instead of scrolling off the
- * newest-20 window. No axis is special-cased by id.
+ * newest-20 window. Under the shared source ceiling, allowances shrink fairly
+ * and a trimmed axis points at an existing index when one is available. No axis
+ * is special-cased by id.
  */
 export async function regenerateMap(root: string, registry?: AxisRegistry): Promise<void> {
 	const axes = (registry ?? (await loadRegistry(root))).axes;
 	const files = await Promise.all(axes.map((axis) => axisEntries(root, axis)));
-	const lines = ["# Memory map", "", "Generated pointers; canonical facts live in axis files.", ""];
-	for (const [index, axis] of axes.entries()) {
-		lines.push(`## ${axis.id}`, "", `_${axis.displayName}_`, "");
-		// Promotion targets are navigation too: the writer canonicalising a daily
-		// capture or a reflection reads this map, so where a fact promotes to has to
-		// be visible here rather than only in the descriptor.
-		if (axis.promotesTo.length) lines.push(`_promotes to: ${axis.promotesTo.join(", ")}_`, "");
-		if (axis.index === "recent") {
-			for (const path of files[index].slice(-RECENT_INDEX_CAP).reverse()) lines.push(`- [${path}](${path})`);
-		} else {
-			let group = "";
-			for (const path of files[index].slice(0, TREE_INDEX_CAP)) {
-				const branch = path
-					.slice(axis.root.length + 1)
-					.split("/")
-					.slice(0, -1)
-					.join("/");
-				if (branch !== group) {
-					group = branch;
-					lines.push("", `### ${branch || axis.root}`, "");
+	const indexed = axes.map((axis, index) => {
+		const entries =
+			axis.index === "recent" ? files[index].slice(-RECENT_INDEX_CAP).reverse() : files[index].slice(0, TREE_INDEX_CAP);
+		// An index is an existing corpus file, never a path invented by the map.
+		// Prefer the axis root's conventional index and accept a nested index when
+		// that is the only one available (for example ops/rules/index.md).
+		const indexPath =
+			files[index].find((path) => path === `${axis.root}/index.md`) ??
+			files[index].find((path) => path.endsWith("/index.md"));
+		return { axis, allFiles: files[index], entries, indexPath };
+	});
+
+	const render = (allowances: readonly number[], compact: boolean): string => {
+		const lines = compact
+			? ["# Memory map"]
+			: ["# Memory map", "", "Generated pointers; canonical facts live in axis files.", ""];
+		for (const [index, descriptor] of indexed.entries()) {
+			const { axis, allFiles, entries, indexPath } = descriptor;
+			if (compact) lines.push(`## ${axis.id}`);
+			else lines.push(`## ${axis.id}`, "", `_${axis.displayName}_`, "");
+			// Promotion targets are navigation too: the writer canonicalising a daily
+			// capture or a reflection reads this map, so where a fact promotes to has to
+			// be visible here rather than only in the descriptor.
+			if (!compact && axis.promotesTo.length) lines.push(`_promotes to: ${axis.promotesTo.join(", ")}_`, "");
+			const allowance = allowances[index] ?? 0;
+			if (axis.index === "recent") {
+				for (const path of entries.slice(0, allowance)) lines.push(`- [${path}](${path})`);
+			} else {
+				let group = "";
+				for (const path of entries.slice(0, allowance)) {
+					const branch = path
+						.slice(axis.root.length + 1)
+						.split("/")
+						.slice(0, -1)
+						.join("/");
+					if (branch !== group) {
+						group = branch;
+						lines.push("", `### ${branch || axis.root}`, "");
+					}
+					lines.push(`- [${path}](${path})`);
 				}
-				lines.push(`- [${path}](${path})`);
 			}
+			const omitted = allFiles.length - allowance;
+			if (allowance < entries.length) {
+				const noun = omitted === 1 ? "entry" : "entries";
+				if (indexPath) {
+					lines.push(`_${omitted} ${noun} omitted; see ${indexPath}_`);
+					lines.push(`- [${indexPath}](${indexPath})`);
+				} else lines.push(`_${omitted} ${noun} omitted; no index entry found_`);
+			}
+			if (!compact) lines.push("");
 		}
-		lines.push("");
-	}
+		return `${lines.join("\n")}\n`;
+	};
+
+	const fit = (compact: boolean): string => {
+		const allowances = indexed.map(({ entries }) => entries.length);
+		let map = render(allowances, compact);
+		if (Buffer.byteLength(map, "utf8") <= NAVIGATION_SOURCE_MAX_BYTES) return map;
+		// Shrink the highest per-axis allowance first. Once caps converge, ties are
+		// reduced round-robin, so pressure cannot make one registered axis disappear
+		// while later axes retain their full allowance.
+		outer: while (Buffer.byteLength(map, "utf8") > NAVIGATION_SOURCE_MAX_BYTES) {
+			let reduced = false;
+			const highest = allowances.reduce((max, allowance) => Math.max(max, allowance), 0);
+			for (const index of allowances.keys()) {
+				if (allowances[index] !== highest || highest === 0) continue;
+				allowances[index]--;
+				reduced = true;
+				map = render(allowances, compact);
+				if (Buffer.byteLength(map, "utf8") <= NAVIGATION_SOURCE_MAX_BYTES) break outer;
+			}
+			if (!reduced) break;
+		}
+		return map;
+	};
+
+	let map = fit(false);
+	// The normal renderer is byte-compatible with the historical small-corpus map.
+	// If even empty sections cannot fit because a deployment registered unusually
+	// long labels, retry with the same headings and compact section scaffolding.
+	if (Buffer.byteLength(map, "utf8") > NAVIGATION_SOURCE_MAX_BYTES) map = fit(true);
+	if (Buffer.byteLength(map, "utf8") > NAVIGATION_SOURCE_MAX_BYTES) throw new Error("memory_map_exceeds_byte_budget");
 	// Written through a temp file and renamed, because `memory.audit` and
 	// `memory.search` both read the map on request paths that can run while a
 	// capture regenerates it: a truncate-then-write would let a reader observe a
@@ -305,7 +371,7 @@ export async function regenerateMap(root: string, registry?: AxisRegistry): Prom
 	// temp name deliberately does not end in `.md`, so no walker ever indexes it.
 	const target = join(root, "MEMORY.md");
 	const staging = `${target}.staging`;
-	await writeFile(staging, `${lines.join("\n")}\n`);
+	await writeFile(staging, map);
 	await rename(staging, target);
 }
 
