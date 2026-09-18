@@ -16,7 +16,8 @@ import { loadRegistry } from "./registry";
  * - Every note gets the FIRST plain-text occurrence of each alias wrapped in a
  *   relative Markdown link (one link per alias per file, longest alias first).
  * - Protected regions are never rewritten: YAML frontmatter, fenced code
- *   blocks, inline code, existing links, and headings.
+ *   blocks, inline code, existing links, headings, and HTML comments. Files
+ *   marked with a non-empty `generated_by` frontmatter value are skipped.
  *
  * The model's job shrinks to supplying good aliases/tags metadata; the wiring
  * itself is reproducible and idempotent.
@@ -70,6 +71,23 @@ export function frontmatterList(text: string, key: string): string[] {
 	return items;
 }
 
+/** Scalar frontmatter value, using the same block boundary as `frontmatterList`. */
+function frontmatterValue(text: string, key: string): string | undefined {
+	const end = frontmatterEnd(text);
+	if (!end) return undefined;
+	const escaped = key.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+	const match = text.slice(0, end).match(new RegExp(`^${escaped}:[ \\t]*([^\\r\\n]*)`, "m"));
+	const value = match?.[1]
+		?.trim()
+		.replace(/^["']|["']$/g, "")
+		.trim();
+	return value || undefined;
+}
+
+function isGeneratedFile(text: string): boolean {
+	return frontmatterValue(text, "generated_by") !== undefined;
+}
+
 function headingTitle(text: string): string | undefined {
 	const match = text.slice(frontmatterEnd(text)).match(/^#\s+(.+?)\s*$/m);
 	return match?.[1];
@@ -119,6 +137,31 @@ function protectedRanges(text: string): Array<[number, number]> {
 	for (const match of text.matchAll(/\[[^\]\n]*\]\([^)\n]*\)/g))
 		ranges.push([match.index, match.index + match[0].length]);
 	for (const match of text.matchAll(/^#{1,6}\s.*$/gm)) ranges.push([match.index, match.index + match[0].length]);
+	for (const match of text.matchAll(/<!--[\s\S]*?(?:-->|$)/g))
+		ranges.push([match.index, match.index + match[0].length]);
+
+	// A generated region is the span between matching start/end marker comments.
+	// Pair each start with the matching end at the same nesting depth; an
+	// unterminated start conservatively protects the rest of the file.
+	const markers = [...text.matchAll(/<!--[ \t]*([a-z0-9][a-z0-9._-]*):(start|end)[ \t]*-->/g)];
+	for (let index = 0; index < markers.length; index++) {
+		const marker = markers[index] as RegExpMatchArray;
+		if (marker[2] !== "start") continue;
+		const name = marker[1] as string;
+		let depth = 0;
+		let close: RegExpMatchArray | undefined;
+		for (let candidate = index + 1; candidate < markers.length; candidate++) {
+			const next = markers[candidate] as RegExpMatchArray;
+			if (next[1] !== name) continue;
+			if (next[2] === "start") depth++;
+			else if (depth === 0) {
+				close = next;
+				break;
+			} else depth--;
+		}
+		const end = close ? (close.index as number) + close[0].length : text.length;
+		ranges.push([marker.index as number, end]);
+	}
 	return ranges;
 }
 
@@ -131,6 +174,7 @@ export function autolinkText(
 	selfPath: string,
 	index: readonly AliasEntry[],
 ): { text: string; added: number } {
+	if (isGeneratedFile(text)) return { text, added: 0 };
 	// Single pass over the file: protected ranges are computed ONCE and edits are
 	// collected first, then applied back-to-front so offsets stay valid. The
 	// original per-alias rescan was O(aliases x text) and blocked the gateway
@@ -183,11 +227,15 @@ export async function autolinkCorpus(root: string): Promise<AutolinkReport> {
 			// A mapped file may already be gone; the audit reports that separately.
 		}
 	}
-	const index = await buildAliasIndex(root, files, texts);
+	const writableFiles = files.filter((path) => {
+		const text = texts.get(path);
+		return text !== undefined && !isGeneratedFile(text);
+	});
+	const index = await buildAliasIndex(root, writableFiles, texts);
 	let filesChanged = 0;
 	let linksAdded = 0;
-	for (let position = 0; position < files.length; position++) {
-		const path = files[position] as string;
+	for (let position = 0; position < writableFiles.length; position++) {
+		const path = writableFiles[position] as string;
 		const text = texts.get(path);
 		if (text === undefined) continue;
 		const { text: rewritten, added } = autolinkText(text, path, index);
