@@ -77,7 +77,10 @@ function frontmatterValue(text: string, key: string): string | undefined {
 	if (!end) return undefined;
 	const escaped = key.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 	const match = text.slice(0, end).match(new RegExp(`^${escaped}:[ \\t]*([^\\r\\n]*)`, "m"));
-	const value = match?.[1]?.trim().replace(/^["']|["']$/g, "").trim();
+	const value = match?.[1]
+		?.trim()
+		.replace(/^["']|["']$/g, "")
+		.trim();
 	return value || undefined;
 }
 
@@ -134,7 +137,8 @@ function protectedRanges(text: string): Array<[number, number]> {
 	for (const match of text.matchAll(/\[[^\]\n]*\]\([^)\n]*\)/g))
 		ranges.push([match.index, match.index + match[0].length]);
 	for (const match of text.matchAll(/^#{1,6}\s.*$/gm)) ranges.push([match.index, match.index + match[0].length]);
-	for (const match of text.matchAll(/<!--[\s\S]*?(?:-->|$)/g)) ranges.push([match.index, match.index + match[0].length]);
+	for (const match of text.matchAll(/<!--[\s\S]*?(?:-->|$)/g))
+		ranges.push([match.index, match.index + match[0].length]);
 
 	// A generated region is the span between matching start/end marker comments.
 	// Pair each start with the matching end at the same nesting depth; an
