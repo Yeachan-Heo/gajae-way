@@ -283,9 +283,7 @@ export async function regenerateMap(root: string, registry?: AxisRegistry): Prom
 	const files = await Promise.all(axes.map((axis) => axisEntries(root, axis)));
 	const indexed = axes.map((axis, index) => {
 		const entries =
-			axis.index === "recent"
-				? files[index].slice(-RECENT_INDEX_CAP).reverse()
-				: files[index].slice(0, TREE_INDEX_CAP);
+			axis.index === "recent" ? files[index].slice(-RECENT_INDEX_CAP).reverse() : files[index].slice(0, TREE_INDEX_CAP);
 		// An index is an existing corpus file, never a path invented by the map.
 		// Prefer the axis root's conventional index and accept a nested index when
 		// that is the only one available (for example ops/rules/index.md).
@@ -296,7 +294,9 @@ export async function regenerateMap(root: string, registry?: AxisRegistry): Prom
 	});
 
 	const render = (allowances: readonly number[], compact: boolean): string => {
-		const lines = compact ? ["# Memory map"] : ["# Memory map", "", "Generated pointers; canonical facts live in axis files.", ""];
+		const lines = compact
+			? ["# Memory map"]
+			: ["# Memory map", "", "Generated pointers; canonical facts live in axis files.", ""];
 		for (const [index, descriptor] of indexed.entries()) {
 			const { axis, allFiles, entries, indexPath } = descriptor;
 			if (compact) lines.push(`## ${axis.id}`);
@@ -363,8 +363,7 @@ export async function regenerateMap(root: string, registry?: AxisRegistry): Prom
 	// If even empty sections cannot fit because a deployment registered unusually
 	// long labels, retry with the same headings and compact section scaffolding.
 	if (Buffer.byteLength(map, "utf8") > NAVIGATION_SOURCE_MAX_BYTES) map = fit(true);
-	if (Buffer.byteLength(map, "utf8") > NAVIGATION_SOURCE_MAX_BYTES)
-		throw new Error("memory_map_exceeds_byte_budget");
+	if (Buffer.byteLength(map, "utf8") > NAVIGATION_SOURCE_MAX_BYTES) throw new Error("memory_map_exceeds_byte_budget");
 	// Written through a temp file and renamed, because `memory.audit` and
 	// `memory.search` both read the map on request paths that can run while a
 	// capture regenerates it: a truncate-then-write would let a reader observe a

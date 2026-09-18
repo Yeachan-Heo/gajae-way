@@ -10,6 +10,15 @@ import {
 	NAVIGATION_SOURCE_MAX_BYTES,
 } from "../src/memory/registry";
 
+// A registry holding exactly one axis: createRegistry() would also seed every
+// built-in, and this test asserts the byte-for-byte rendering of a single axis.
+const singleAxisRegistry = (axis: AxisDescriptor): AxisRegistry => ({
+	axes: [axis],
+	byPriority: [axis],
+	byId: (id) => (id === axis.id ? axis : undefined),
+	axisForPath: (path) => (path === axis.root || path.startsWith(`${axis.root}/`) ? axis : undefined),
+});
+
 let home = "";
 afterEach(async () => {
 	if (home) await rm(home, { recursive: true, force: true });
@@ -159,7 +168,7 @@ test("a small map keeps the historical rendering byte-for-byte", async () => {
 		appendOnly: false,
 		promotesTo: [],
 	};
-	await regenerateMap(root, { axes: [axis] } as AxisRegistry);
+	await regenerateMap(root, singleAxisRegistry(axis));
 	expect(await readFile(join(root, "MEMORY.md"), "utf8")).toBe(
 		"# Memory map\n\nGenerated pointers; canonical facts live in axis files.\n\n## probe\n\n_Probe_\n\n- [probe/entry.md](probe/entry.md)\n\n",
 	);
@@ -167,8 +176,7 @@ test("a small map keeps the historical rendering byte-for-byte", async () => {
 
 test("map trimming never emits a partial markdown link line", async () => {
 	const { map } = await largeMap();
-	for (const line of map.split("\n"))
-		if (line.includes("](")) expect(line).toMatch(/^- \[[^\]]+\]\([^)]+\)$/);
+	for (const line of map.split("\n")) if (line.includes("](")) expect(line).toMatch(/^- \[[^\]]+\]\([^)]+\)$/);
 });
 
 test("concurrent add+commit pairs on one corpus serialize instead of colliding on index.lock", async () => {
