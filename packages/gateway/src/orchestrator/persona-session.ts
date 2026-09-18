@@ -1549,6 +1549,58 @@ class OriginActor {
 		});
 	}
 
+	/**
+	 * "Unobservable" is not "failed". A session whose tail returns nothing and
+	 * whose status reads `unknown` can still have answered: the persona keeps
+	 * working and writes its reply to the transcript, and only the gateway's
+	 * view is dark (wedged event ring - gajae-code#5681, or a pin-exhausted
+	 * host). Releasing such a turn as unlanded posted `[turn failed]` to the room
+	 * 5-6 minutes in, while the answer sat in the transcript (4 of 4 such
+	 * failures on 2026-09-17/18 had a written answer). Before releasing, read the
+	 * transcript directly: an assistant row written after this turn dispatched,
+	 * on a session that is live and idle, is this turn's answer. Deliver it and
+	 * settle the turn as terminal_ok. Returns true when it did.
+	 */
+	async #deliverUnobservedAnswer(bound: BoundTurn, sweeps: number): Promise<boolean> {
+		const port = this.#manager.port;
+		if (!port.fetchAssistantSince || bound.dispatchedAtMs === undefined) return false;
+		if (bound.retired && !bound.answerWanted) return false;
+		let found: Awaited<ReturnType<NonNullable<typeof port.fetchAssistantSince>>>;
+		try {
+			found = await port.fetchAssistantSince({
+				sessionId: bound.sessionId,
+				repo: this.#manager.repo,
+				notBeforeMs: bound.dispatchedAtMs,
+			});
+		} catch (error) {
+			this.#manager.log(
+				`unobserved_answer_probe_failed origin=${this.originKey} epoch=${bound.epoch} opRef=${bound.turn.opRef} detail=${safeDiagnostic(error)}`,
+			);
+			return false;
+		}
+		const text = found?.text?.trim();
+		if (!text) return false;
+		this.#manager.log(
+			`unobserved_answer_delivered origin=${this.originKey} epoch=${bound.epoch} opRef=${bound.turn.opRef} session=${bound.sessionId} sweeps=${sweeps} chars=${text.length}`,
+		);
+		const status = {
+			operationRef: bound.turn.opRef,
+			status: { status: "terminal_ok", receiptState: "present" },
+			summary: { completed: true },
+			summaryCompleted: true,
+		} as unknown as StatusReport;
+		await bound.lifecycle.onTerminal?.({ ...bound, text, status });
+		this.#holdSweeps.delete(bound.turn.opRef);
+		// Accept then complete, as the ordinary terminal path does; each is its own
+		// statement (onTerminal may already hold a transaction for the delivery).
+		if (this.#manager.database.inboundTurnRow(bound.turn.opRef)?.turn_state === "bound")
+			this.#manager.database.inboundTurnAccept(bound.turn.opRef);
+		this.#manager.database.inboundTurnComplete(bound.turn.opRef);
+		await this.#notifySettled(bound);
+		await this.#settleAfterTerminal(bound);
+		return true;
+	}
+
 	async #onRetentionGap(
 		sessionId: string,
 		epoch: number,
@@ -1578,7 +1630,13 @@ class OriginActor {
 		frame: TailFrame,
 	): Promise<void> {
 		const bound = this.#findBound(sessionId, epoch, brokerGeneration);
-		if (!bound) return;
+		if (!bound) {
+			if (frame.payload.toolCallStarted === true || frame.assistantText)
+				this.#manager.log(
+					`tail_frame_unbound origin=${this.originKey} epoch=${epoch} session=${sessionId} kind=${frame.rawKind} event=${frame.eventId ?? "unidentified"}`,
+				);
+			return;
+		}
 		if (this.#predatesTurn(bound, frame)) {
 			// A cursorless tail re-attach (tail_gap_nonstrict resync=null) replays
 			// transcript rows from BEFORE this turn. They carry no opRef, so the
@@ -1716,6 +1774,7 @@ class OriginActor {
 				}
 				const dead = live === false || disowned;
 				const liveIdle = live === true && (await this.#queueIsEmpty(bound.sessionId));
+				if (liveIdle && (await this.#deliverUnobservedAnswer(bound, count))) return;
 				if (dead || liveIdle) {
 					await this.#releaseUnlanded(
 						bound,
@@ -1876,19 +1935,7 @@ class OriginActor {
 		// Read the terminal slot from the durable trigger row AFTER completion. A
 		// failure diagnostic may have been delivered under another turn identity;
 		// only this row's claim satisfies the trigger's answer slot.
-		const settledTrigger = this.#manager.database.inboundTurnRow(bound.turn.opRef);
-		if (settledTrigger?.turn_state === "done") {
-			try {
-				await bound.lifecycle.onSettled?.({
-					...bound,
-					terminalDeliveryId: settledTrigger.terminal_delivery_id,
-				});
-			} catch (error) {
-				this.#manager.log(
-					`persona_turn_settled_hook_failed origin=${this.originKey} opRef=${bound.turn.opRef} detail=${safeDiagnostic(error)}`,
-				);
-			}
-		}
+		await this.#notifySettled(bound);
 		if (completed === 0) return;
 		// A steer issued into this turn whose answer tore: try the clientRef one
 		// more time now that the turn is over (the runtime still holds the
@@ -1915,6 +1962,31 @@ class OriginActor {
 				}
 			}
 		}
+		await this.#settleAfterTerminal(bound, resetApplied);
+	}
+
+	/**
+	 * The last mile of a settled turn: settled hook, tail closed, and either the
+	 * retired binding dropped (host ended) or the current binding freed for the
+	 * next dispatch. Shared by ordinary terminal delivery and by the
+	 * unobserved-answer path, so both settle a turn the same way.
+	 */
+	async #notifySettled(bound: BoundTurn): Promise<void> {
+		const settledTrigger = this.#manager.database.inboundTurnRow(bound.turn.opRef);
+		if (settledTrigger?.turn_state !== "done") return;
+		try {
+			await bound.lifecycle.onSettled?.({
+				...bound,
+				terminalDeliveryId: settledTrigger.terminal_delivery_id,
+			});
+		} catch (error) {
+			this.#manager.log(
+				`persona_turn_settled_hook_failed origin=${this.originKey} opRef=${bound.turn.opRef} detail=${safeDiagnostic(error)}`,
+			);
+		}
+	}
+
+	async #settleAfterTerminal(bound: BoundTurn, resetApplied = false): Promise<void> {
 		bound.tail?.setTurnRunning(false);
 		try {
 			await bound.tail?.close();
